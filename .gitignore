@@ -42,3 +42,5 @@ data-dev/agents/dispatch-queue.json
 data-dev/agents/execution-runs.jsonl
 data-dev/agents/threads.json
 data-dev/tasks.json.bak-*
+.vercel/
+.vercel
