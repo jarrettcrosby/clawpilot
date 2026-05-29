@@ -2,15 +2,14 @@
 
 ## Current Posture
 
-ClawPilot is now shaped for a GitHub -> Vercel/Railway project workflow, but publishing is intentionally not complete in this pass.
+ClawPilot now has a GitHub -> Vercel/Railway project workflow with Railway running the serverful app and Postgres-backed app state.
 
-Current blockers before first remote push/deploy:
+Current known platform gaps:
 
-- GitHub CLI token on this Mac is invalid and needs `gh auth login`.
-- Railway CLI token is invalid and needs `railway login`.
-- Vercel CLI is not installed, although GitHub-connected Vercel can still be configured from the Vercel dashboard.
-- Runtime data is still present in legacy local git history.
-- Railway Postgres is selected as the durable cloud target, but only the first migration/refactor slice is in place.
+- GitHub branch protection on the private repo requires GitHub Pro or a public repo.
+- Vercel deployment protection returns `401` for unauthenticated direct preview curls.
+- Runtime data remains present in legacy local git history, but the GitHub repo was created from a clean import.
+- Execution JSONL routes and pipeline projection/outbox writes still need Postgres repository adapters.
 
 ## GitHub Setup
 
@@ -68,15 +67,22 @@ Use Railway for:
 - healthchecked preview service
 - durable app-owned state through Railway Postgres
 
-Before production Railway use:
+Current Railway production setup:
 
-- provision a Postgres service
-- set `DATABASE_URL`
-- set `CLAWPILOT_STORAGE=postgres` only after migrations pass
-- run `npm run db:migrate`
-- run `npm run db:import:tasks` and `npm run db:import:threads` for the initial app-state seed
+- project: `clawpilot`
+- app service: `clawpilot`
+- database service: `Postgres`
+- app URL: `https://clawpilot-production-52a1.up.railway.app`
+- `DATABASE_URL=${{Postgres.DATABASE_URL}}`
+- `PGSSLMODE=require`
+- `CLAWPILOT_STORAGE=postgres`
+- initial 4002 dev-lane import: 43 tasks, 2 assignments, 13 threads, 26 messages
+
+Before broader production use:
+
 - configure auth/secrets management
-- configure backup policy
+- configure Railway Postgres backup/export policy
+- add deployed-runtime smoke checks for Postgres-backed reads/writes
 
 Google Sheets remains the operator-owned writable table for pipeline data. Postgres stores app-owned objects, sync bookkeeping, and pipeline projections. See `docs/architecture/data-ownership-and-postgres-plan.md`.
 

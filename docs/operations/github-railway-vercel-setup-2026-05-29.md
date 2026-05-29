@@ -10,6 +10,11 @@
 - Clean local working copy: `/Users/agentsuburbiasandwich/Desktop/clawpilot-clean-github`
 - Original local dev lane remains at `/Users/agentsuburbiasandwich/Desktop/clawd-app-dev`
 - Original local prod lane remains at `/Users/agentsuburbiasandwich/Desktop/clawd-app`
+- Railway project: `clawpilot`
+- Railway app service: `clawpilot`
+- Railway Postgres service: `Postgres`
+- Railway app URL: `https://clawpilot-production-52a1.up.railway.app`
+- Vercel project: `clawpilot`
 
 The GitHub repository was created from a clean import so legacy tracked runtime data was not pushed. Only `data/README.md` and `data-dev/README.md` are included from runtime data directories.
 
@@ -21,14 +26,23 @@ The GitHub repository was created from a clean import so legacy tracked runtime 
 - Pushed `stable/4001` from a sanitized 4001/prod source copy.
 - Verified GitHub Actions CI passed on `main` and `dev`.
 - Verified local clean import with `npm run check`.
+- Linked Railway project and deployed the `clawpilot` service.
+- Provisioned Railway Postgres with a ready `postgres-volume`.
+- Applied `db/migrations/0001_initial_railway_postgres.sql`.
+- Imported 4002 dev-lane app state:
+  - 43 tasks
+  - 2 projected assignments
+  - 13 agent threads
+  - 26 thread messages
+- Set Railway app storage to `CLAWPILOT_STORAGE=postgres`.
+- Verified live Railway `/api/persistence/status` returns `driver: postgres` and `database: reachable`.
+- Connected Vercel to GitHub with Root Directory `app_src`; Vercel preview checks pass.
 
 ## Blocked
 
 - GitHub branch protection on a private repository returned:
   - `Upgrade to GitHub Pro or make this repository public to enable this feature.`
-- Railway CLI is installed but the local token is expired:
-  - run `railway login`
-- Vercel CLI is not installed and no `VERCEL_TOKEN` is available.
+- Vercel direct public preview requests return `401` while deployment protection is enabled. Authenticated `vercel curl` works.
 
 ## Recommended Setup Order
 
@@ -36,37 +50,31 @@ The GitHub repository was created from a clean import so legacy tracked runtime 
 2. Treat `dev` as the active development branch.
 3. Treat `stable/4001` as the sanitized local-prod reference branch.
 4. Use pull requests into `main` for promotion once branch protection is available.
-5. Provision Railway Postgres before enabling `CLAWPILOT_STORAGE=postgres`.
-6. Connect Vercel after GitHub is stable and the environment variables are ready.
+5. Keep Railway as the writable serverful runtime while Postgres-backed state is expanded.
+6. Keep Vercel for preview/build confidence until all durable writes are outside the Vercel filesystem.
 
 ## Railway Steps
 
-Run these from the clean working copy:
+Current Railway status can be checked from the clean working copy:
 
 ```bash
 cd /Users/agentsuburbiasandwich/Desktop/clawpilot-clean-github
-railway login
-railway init
-railway add --database postgres
-railway variable set CLAWPILOT_STORAGE=postgres
-railway variable set APP_AUTH_REQUIRED=1
-railway up
+railway status
+railway service list
 ```
 
-After Railway provides `DATABASE_URL`, run:
+The app service should have these variables:
 
-```bash
-railway run npm run db:migrate
-railway run npm run db:import:tasks
-railway run npm run db:import:threads
-railway run npm run verify:predeploy
+```text
+CLAWPILOT_STORAGE=postgres
+DATABASE_URL=${{Postgres.DATABASE_URL}}
+PGSSLMODE=require
 ```
 
-Then check:
+For one-time local migrations/imports against Railway Postgres, use the Postgres service public URL variable without printing it:
 
 ```bash
-railway domain
-railway logs
+railway run --service Postgres --environment production -- sh -lc 'DATABASE_URL="$DATABASE_PUBLIC_URL" PGSSLMODE=require npm run db:migrate'
 ```
 
 Expected smoke routes:
@@ -125,9 +133,7 @@ Validate deployed URLs:
 
 ## Next Implementation Slice
 
-After Railway Postgres is live:
-
-1. Run migrations and imports.
-2. Validate Postgres mode with `CLAWPILOT_STORAGE=postgres`.
-3. Add repository adapters for execution runs/results.
-4. Add pipeline sync outbox and projection workers.
+1. Add repository adapters for execution runs/results.
+2. Add pipeline sync outbox and projection workers.
+3. Add backup/export runbook for Railway Postgres.
+4. Decide whether to rename the Railway database service from `Postgres` to `clawpilot-postgres` in the dashboard, then update the `DATABASE_URL` service reference if renamed.

@@ -57,22 +57,32 @@ The first runtime slice is intentionally conservative: file mode still behaves a
 - `npm run verify:dev`: passed with `VERIFY_OK`.
 - `npm run verify:regression`: passed with `REGRESSION_ALL_OK`.
 - `npm run check`: passed after the docs and scripts were added.
+- Railway Postgres was provisioned after GitHub/Railway/Vercel setup:
+  - project: `clawpilot`
+  - app service: `clawpilot`
+  - database service: `Postgres`
+  - volume: `postgres-volume`, state `READY`
+- Live Railway Postgres migration/import validation:
+  - `schema_migrations`: 1
+  - `tasks`: 43
+  - `agent_assignments`: 2
+  - `agent_threads`: 13
+  - `agent_thread_messages`: 26
+- Live Railway app validation:
+  - `/api/persistence/status`: `driver: postgres`, `database: reachable`
+  - `/api/tasks`: returned 11 visible active tasks from the imported task set
+  - `/api/agents/threads`: returned 13 threads
 
 ## Not Done
 
-- No Railway database was provisioned from this environment.
-- No `DATABASE_URL` was available, so migrations were syntax-checked but not applied to a live database.
-- No GitHub remote was pushed.
-- No Vercel or Railway deployment was linked.
 - Execution JSONL routes still need repository adapters.
 - Pipeline remains file-cache plus Maton/Sheets writeback; the Postgres projection/outbox worker is planned but not implemented yet.
+- Railway Postgres backup/export policy still needs to be documented.
+- Vercel deployment protection still blocks unauthenticated public curl checks.
 
 ## Next Slice
 
-1. Provision Railway Postgres.
-2. Run `npm run db:migrate`.
-3. Run `npm run db:import:tasks` and `npm run db:import:threads`.
-4. Start a preview runtime with `CLAWPILOT_STORAGE=postgres`.
-5. Validate `/api/persistence/status`, `/api/tasks`, `/api/agents/assignments`, and `/api/agents/threads`.
-6. Add repository adapters for execution runs/results.
-7. Add sync outbox tables to the pipeline writeback path.
+1. Add repository adapters for execution runs/results.
+2. Add sync outbox tables to the pipeline writeback path.
+3. Add Railway Postgres backup/export runbook.
+4. Add a focused deployed-runtime smoke check for Postgres-backed task and thread reads.
