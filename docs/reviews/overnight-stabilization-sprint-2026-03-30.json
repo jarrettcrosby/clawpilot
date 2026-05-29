@@ -1,0 +1,39 @@
+{
+  "date": "2026-03-30",
+  "status": "in_progress",
+  "slices": [
+    {
+      "name": "projects_card_scanability_and_quick_advance",
+      "status": "done",
+      "files": [
+        "app_src/components/projects/KanbanCard.tsx",
+        "PRODUCT_REQUIREMENTS.md",
+        "REQUIREMENTS_TRACEABILITY.md",
+        "USER_GUIDE.md"
+      ],
+      "regression": "REGRESSION_ALL_OK"
+    },
+    {
+      "name": "agents_default_focus_mode",
+      "status": "done",
+      "files": [
+        "app_src/components/agents/AgentsSection.tsx",
+        "PRODUCT_REQUIREMENTS.md",
+        "REQUIREMENTS_TRACEABILITY.md",
+        "USER_GUIDE.md"
+      ],
+      "regression": "REGRESSION_ALL_OK"
+    }
+  ],
+  "finalRegression": "in_progress",
+  "remainingBlockers": [
+    "High stale in-progress density reduces board trust.",
+    "Projects still has some card-level cognitive load in dense columns.",
+    "Agents and Dashboard need further alignment on action-first next steps."
+  ],
+  "nextCandidateScope": [
+    "Projects stale-triage quick actions with minimal clicks",
+    "Further card-density reduction without loss of critical signals",
+    "Agents response quality tightening for repetitive patterns"
+  ]
+}

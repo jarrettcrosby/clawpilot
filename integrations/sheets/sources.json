@@ -1,0 +1,26 @@
+{
+  "updatedAt": "2026-03-04T01:32:00-05:00",
+  "notes": "Primary pipeline and schema sources provided by Jarrett. Keep IDs stable even if tab names change.",
+  "sources": [
+    {
+      "name": "pipeline_primary",
+      "sheetId": "1sp-eLYEEGera1acBoze_GvR4263dunlmaOUyBej-iqY",
+      "url": "https://docs.google.com/spreadsheets/d/1sp-eLYEEGera1acBoze_GvR4263dunlmaOUyBej-iqY/edit?gid=1259528031#gid=1259528031",
+      "gid": "1259528031",
+      "purpose": "Sales pipeline source for app Pipeline section"
+    },
+    {
+      "name": "schema_legacy_or_current",
+      "sheetId": "1S82yOa9TfdPOb8g5Tm1pBKJawIhxCuOYi_PIO1ghVxE",
+      "url": "https://docs.google.com/spreadsheets/d/1S82yOa9TfdPOb8g5Tm1pBKJawIhxCuOYi_PIO1ghVxE/edit?gid=0#gid=0",
+      "gid": "0",
+      "purpose": "Data schema reference (verify current vs legacy during mapping)"
+    },
+    {
+      "name": "agent_operations_source",
+      "sheetId": "1znHwQiYTQM1ebZrObxD-RG9uJ3p1vDl0G25lAHXdeQI",
+      "url": "https://docs.google.com/spreadsheets/d/1znHwQiYTQM1ebZrObxD-RG9uJ3p1vDl0G25lAHXdeQI/edit?usp=drive_link",
+      "purpose": "Agent/workflow data source for ClawPilot + agent operations"
+    }
+  ]
+}

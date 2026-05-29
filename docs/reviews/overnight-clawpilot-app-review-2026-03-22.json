@@ -1,0 +1,76 @@
+{
+  "status": "in_progress",
+  "scope": "4002-dev-only",
+  "date": "2026-03-22",
+  "artifacts": {
+    "report": "docs/reviews/overnight-clawpilot-app-review-2026-03-22.md",
+    "evidence_index": "docs/reviews/overnight-evidence-index-2026-03-22.md"
+  },
+  "completed": [
+    "executive_summary_draft",
+    "vision_reconstruction",
+    "deep_build_review",
+    "ui_acceptance_results_partial",
+    "regression_results_partial",
+    "dev_test_artifact_cleanup_recorded",
+    "recommendations_draft",
+    "7_day_plan_draft"
+  ],
+  "pending": [
+    "ui_acceptance_full_module_matrix",
+    "final_gap_validation",
+    "final_edit_pass",
+    "final_consistency_readback"
+  ],
+  "testsRun": [
+    {
+      "command": "./scripts/ui-acceptance.sh",
+      "result": "pass",
+      "summary": "Playwright 1 passed"
+    },
+    {
+      "command": "./scripts/regression-all.sh",
+      "result": "pass",
+      "summary": "REGRESSION_ALL_OK"
+    },
+    {
+      "command": "./scripts/dev-verify.sh",
+      "result": "pass",
+      "summary": "VERIFY_OK"
+    },
+    {
+      "command": "bash ./scripts/runtime-verify-all.sh",
+      "result": "pass",
+      "summary": "RUNTIME_VERIFY_ALL_OK"
+    },
+    {
+      "command": "bash ./scripts/critical-path-acceptance.sh",
+      "result": "pass",
+      "summary": "CRITICAL_PATH_ACCEPTANCE_OK"
+    },
+    {
+      "command": "bash ./scripts/smoke-tests.sh",
+      "result": "pass",
+      "summary": "SMOKE TESTS COMPLETED"
+    }
+  ],
+  "knownFindings": [
+    {
+      "id": "routing-doc-code-drift",
+      "severity": "medium",
+      "detail": "AGENT_ROUTING_MODEL.md maps clawpilot to clawpilot-exec while routing.ts maps clawpilot to main"
+    },
+    {
+      "id": "smoke-artifact-leakage",
+      "severity": "medium",
+      "detail": "Smoke test cards leaked into dev board; cleaned with backup"
+    }
+  ],
+  "cleanup": {
+    "target": "SC Smoke Valid Task",
+    "before": 64,
+    "removed": 10,
+    "after": 54,
+    "backup": "data-dev/backups/tasks-before-smoke-cleanup-20260322-020106.json"
+  }
+}

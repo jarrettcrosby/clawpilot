@@ -1,0 +1,195 @@
+{
+  "date": "2026-03-30",
+  "repo": "/Users/agentsuburbiasandwich/Desktop/clawd-app-dev",
+  "lane": "dev",
+  "port": 4002,
+  "guardrails": {
+    "productionPushes": false,
+    "promotionWork": false,
+    "infraChanges": false
+  },
+  "slicesCompleted": [
+    {
+      "id": "slice-1",
+      "time": "2026-03-30T10:35:00-04:00",
+      "title": "Agents task-chat auto-binding and context retention",
+      "filesChanged": [
+        "app_src/components/agents/AgentsSection.tsx"
+      ],
+      "regression": "REGRESSION_ALL_OK",
+      "blockers": []
+    },
+    {
+      "id": "slice-2",
+      "time": "2026-03-30T10:36:00-04:00",
+      "title": "Dashboard execution snapshot refresh action",
+      "filesChanged": [
+        "app_src/components/dashboard/DashboardSection.tsx",
+        "app_src/components/projects/KanbanCard.tsx"
+      ],
+      "regression": "REGRESSION_ALL_OK",
+      "blockers": []
+    },
+    {
+      "id": "slice-3",
+      "time": "2026-03-30T11:26:00-04:00",
+      "title": "Projects card scanability freshness chip (Active/Aging/Stale)",
+      "filesChanged": [
+        "app_src/components/projects/KanbanCard.tsx"
+      ],
+      "regression": "REGRESSION_ALL_OK",
+      "blockers": []
+    },
+    {
+      "id": "slice-4",
+      "time": "2026-03-30T11:51:00-04:00",
+      "title": "Dashboard stale in-progress signal + escalation CTA",
+      "filesChanged": [
+        "app_src/components/dashboard/DashboardSection.tsx"
+      ],
+      "regression": "REGRESSION_ALL_OK",
+      "blockers": []
+    },
+    {
+      "id": "slice-5",
+      "time": "2026-03-30T12:01:00-04:00",
+      "title": "Agents task-chat stale continuation prioritization + active-card-only targeting",
+      "filesChanged": [
+        "app_src/components/agents/AgentsSection.tsx"
+      ],
+      "regression": "REGRESSION_ALL_OK",
+      "blockers": []
+    },
+    {
+      "id": "slice-6",
+      "time": "2026-03-30T12:26:00-04:00",
+      "title": "Board cleanliness / real-work visibility: explicit needs-owner signal on active unassigned cards",
+      "filesChanged": [
+        "app_src/components/projects/KanbanCard.tsx"
+      ],
+      "regression": "REGRESSION_ALL_OK",
+      "blockers": []
+    },
+    {
+      "id": "slice-7",
+      "time": "2026-03-30T12:51:00-04:00",
+      "title": "Projects scanability/card usefulness: reduced low-signal card metadata (hide default ClawPilot category + low-priority chips)",
+      "filesChanged": [
+        "app_src/components/projects/KanbanCard.tsx"
+      ],
+      "regression": "REGRESSION_ALL_OK",
+      "blockers": []
+    },
+    {
+      "id": "slice-8",
+      "time": "2026-03-30T13:01:00-04:00",
+      "title": "Dashboard trust/actionability follow-up: clarified stale escalation cue with owner context, dynamic action label, and quick stale-list jump from Execution & Nightly",
+      "filesChanged": [
+        "app_src/components/dashboard/DashboardSection.tsx"
+      ],
+      "regression": "REGRESSION_ALL_OK",
+      "blockers": []
+    },
+    {
+      "id": "slice-9",
+      "time": "2026-03-30T13:25:00-04:00",
+      "title": "Board cleanliness / real-work visibility follow-up: highlighted active stale cards with stronger stale border + Needs update chip for faster triage in Projects board views",
+      "filesChanged": [
+        "app_src/components/projects/KanbanCard.tsx"
+      ],
+      "regression": "REGRESSION_ALL_OK",
+      "blockers": []
+    },
+    {
+      "id": "slice-10",
+      "time": "2026-03-30T13:51:00-04:00",
+      "title": "Agents task-chat usability follow-up: one-click unassigned stale card chat affordance + preserved unassigned chat context",
+      "filesChanged": [
+        "app_src/components/agents/AgentsSection.tsx"
+      ],
+      "regression": "REGRESSION_ALL_OK",
+      "blockers": []
+    },
+    {
+      "id": "slice-11",
+      "time": "2026-03-30T14:02:00-04:00",
+      "title": "Dashboard trust/actionability follow-up: verification confidence cue with Verified/Needs verify chip + last successful verification timestamp",
+      "filesChanged": [
+        "app_src/components/dashboard/DashboardSection.tsx"
+      ],
+      "regression": "REGRESSION_ALL_OK",
+      "blockers": []
+    },
+    {
+      "id": "slice-12",
+      "time": "2026-03-30T14:25:00-04:00",
+      "title": "Projects scanability/card usefulness follow-up: removed redundant low-signal metadata tag chips (needs-quality, stale-again) where dedicated visual cues already exist",
+      "filesChanged": [
+        "app_src/components/projects/KanbanCard.tsx"
+      ],
+      "regression": "REGRESSION_ALL_OK",
+      "blockers": []
+    },
+    {
+      "id": "slice-13",
+      "time": "2026-03-30T14:52:00-04:00",
+      "title": "Agents task-chat usability follow-up: reduced conversation target picker noise via top-12 relevant card cap (selected unassigned first, stale-first, recency tie-break) plus hidden-count hint",
+      "filesChanged": [
+        "app_src/components/agents/AgentsSection.tsx"
+      ],
+      "regression": "REGRESSION_ALL_OK",
+      "blockers": []
+    },
+    {
+      "id": "slice-14",
+      "time": "2026-03-30T15:01:00-04:00",
+      "title": "Dashboard trust/actionability follow-up: added View verification evidence quick-link to Docs promotion-reports context",
+      "filesChanged": [
+        "app_src/components/dashboard/DashboardSection.tsx"
+      ],
+      "regression": "REGRESSION_ALL_OK",
+      "blockers": []
+    },
+    {
+      "id": "slice-15",
+      "time": "2026-03-30T15:26:00-04:00",
+      "title": "Projects scanability/card usefulness follow-up: reduced metadata-row noise by showing one high-signal freeform tag and collapsing extras into a muted +N tags indicator",
+      "filesChanged": [
+        "app_src/components/projects/KanbanCard.tsx"
+      ],
+      "regression": "REGRESSION_ALL_OK",
+      "blockers": []
+    },
+    {
+      "id": "slice-16",
+      "time": "2026-03-30T15:50:00-04:00",
+      "title": "Board cleanliness / real-work visibility follow-up: filtered low-signal system/assignment tags (projects, pipeline, docs, calendar, jarrett, clawpilot) from card metadata chips so active views emphasize actionable tags",
+      "filesChanged": [
+        "app_src/components/projects/KanbanCard.tsx"
+      ],
+      "regression": "REGRESSION_ALL_OK",
+      "blockers": []
+    }
+  ],
+  "latestSlice": {
+    "time": "2026-03-30T15:50:00-04:00",
+    "sliceCompleted": "Board cleanliness/real-work visibility follow-up \u2014 filtered low-signal system/assignment tags (projects, pipeline, docs, calendar, jarrett, clawpilot) from card metadata chips so active views keep actionable tags visible",
+    "filesChanged": [
+      "app_src/components/projects/KanbanCard.tsx"
+    ],
+    "regressionResult": "REGRESSION_ALL_OK",
+    "remainingBlockers": [],
+    "nextSlice": "Dashboard trust/actionability follow-up (add latest verification report timestamp near View verification evidence for faster trust checks)"
+  },
+  "latestRegression": {
+    "command": "./scripts/regression-all.sh",
+    "result": "REGRESSION_ALL_OK",
+    "time": "2026-03-30T15:50:00-04:00"
+  },
+  "remainingBlockers": [],
+  "nextPrioritySlices": [
+    "Dashboard trust/actionability follow-up (assess whether verification evidence link should include direct latest report timestamp)",
+    "Agents task-chat follow-up (only if conversation picker relevance regresses after additional board/dashboard signal changes)",
+    "Board cleanliness spot-check (confirm no future low-signal/system tags reappear in active card metadata rows)"
+  ]
+}

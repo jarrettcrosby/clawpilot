@@ -1,0 +1,68 @@
+# Environments
+
+## Local Dev
+
+- Branch: `dev`
+- Worktree: `/Users/agentsuburbiasandwich/Desktop/clawd-app-dev`
+- Port: `4002`
+- Data root: `data-dev/`
+- Start: `bash scripts/dev-start.sh`
+- Status: `bash scripts/dev-status.sh`
+
+Use this lane for all normal Codex and developer work.
+
+## Local Stable / Prod
+
+- Branch: `stable/4001`
+- Worktree: `/Users/agentsuburbiasandwich/Desktop/clawd-app`
+- Port: `4001`
+- Data root: `data/`
+
+This lane is protected. Do not mutate it without explicit operator approval.
+
+## GitHub
+
+Recommended setup:
+
+- Repository visibility: private.
+- Default branch after initial setup: `main`.
+- Active development branch: `dev`.
+- Protected branch: `main`.
+- Required checks: GitHub Actions `CI`.
+
+Important: the legacy local git history contains tracked runtime data. Do not push this repository as-is to a shared remote unless the repository is private and the data exposure has been accepted. Best practice is a clean import containing source, docs, scripts, config, and safe fixtures only.
+
+## Vercel
+
+Vercel is configured from repository root via `vercel.json`.
+
+- Install command: `npm --prefix app_src install`
+- Build command: `npm run build`
+- Output directory: `app_src/.next`
+
+Vercel is suitable for web preview/build validation. Because the current app writes local files, production Vercel use should wait until durable state is moved out of the local filesystem or write paths are limited to read-only/demo behavior.
+
+## Railway
+
+Railway is configured from repository root via `railway.json`.
+
+- Build command: `npm --prefix app_src install && npm run build`
+- Start command: `npm run start:railway`
+- Healthcheck: `/api/health`
+
+Railway is the better fit for a long-running Node service if the app needs server-side runtime behavior. Durable data still needs an explicit database or persistent volume plan before production use.
+
+## Required Local Env
+
+Use `.env.example` as the starting point. The important dev-lane variables are:
+
+- `PORT=4002`
+- `RUNTIME_LANE=dev`
+- `RUNTIME_PORT=4002`
+- `TASKS_PATH`
+- `PIPELINE_NORMALIZED_PATH`
+- `PIPELINE_LOG_PATH`
+- `AGENT_THREADS_PATH`
+- `AGENT_ASSIGNMENTS_PATH`
+
+The `scripts/dev-start.sh` path remains the canonical local dev startup because it sets lane-specific runtime isolation.

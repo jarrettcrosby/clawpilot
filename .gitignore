@@ -1,0 +1,44 @@
+node_modules/
+.next/
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.log
+.DS_Store
+.vercel/
+.railway/
+coverage/
+dist/
+*.tsbuildinfo
+
+# Local test/build artifacts
+app_src/test-results/
+app_src/.next/
+app_src/node_modules/
+app_src/playwright-report/
+app_src/coverage/
+
+# Runtime data, snapshots, backups, and logs.
+#
+# These paths may contain live operator data, customer/pipeline data, local
+# runtime state, generated agent messages, and backup archives. They should not
+# be introduced to a public or shared GitHub remote. Some files are still
+# tracked from legacy local history; sanitize or rebuild a clean repo before the
+# first push.
+data/*
+data-dev/*
+!data/README.md
+!data-dev/README.md
+
+# Legacy dev-lane generated state snapshots and logs
+data-dev/backups/
+data-dev/logs/
+data-dev/pipeline/
+data-dev/task-creation-audit.jsonl
+
+# Dev-lane ephemeral runtime agent/task artifacts
+data-dev/agents/dispatch-queue.json
+data-dev/agents/execution-runs.jsonl
+data-dev/agents/threads.json
+data-dev/tasks.json.bak-*

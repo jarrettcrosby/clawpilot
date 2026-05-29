@@ -1,0 +1,26 @@
+{
+  "name": "clawpilot",
+  "private": true,
+  "version": "0.1.0",
+  "description": "ClawPilot command center web app and local operating surface.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "npm --prefix app_src run dev -- --hostname 0.0.0.0 --port ${PORT:-4002}",
+    "start": "npm --prefix app_src run start -- --hostname 0.0.0.0 --port ${PORT:-4002}",
+    "start:railway": "npm run start",
+    "lint": "npm --prefix app_src run lint",
+    "build": "npm --prefix app_src run build",
+    "test": "npm run test:threads",
+    "test:threads": "npm --prefix app_src run test:threads",
+    "check:nightly": "npm --prefix app_src run check:nightly",
+    "verify:dev": "bash scripts/dev-verify.sh",
+    "verify:regression": "bash scripts/regression-all.sh",
+    "verify:predeploy": "node scripts/verify-predeploy.mjs",
+    "db:migrate": "node scripts/db-migrate.mjs",
+    "db:import:tasks": "node scripts/db-import-tasks.mjs",
+    "db:import:threads": "node scripts/db-import-threads.mjs",
+    "check": "npm run lint && npm run build && npm run test && npm run verify:predeploy"
+  }
+}
