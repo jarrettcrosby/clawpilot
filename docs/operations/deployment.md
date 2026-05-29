@@ -4,10 +4,10 @@
 
 ClawPilot now has a GitHub -> Vercel/Railway project workflow with Railway running the serverful app and Postgres-backed app state.
 
-Current known platform gaps:
+Current known platform notes:
 
-- GitHub branch protection on the private repo requires GitHub Pro or a public repo.
-- Vercel deployment protection returns `401` for unauthenticated direct preview curls.
+- GitHub branch protection on the private repo requires GitHub Pro or a public repo, but it is not required while this remains a private single-operator repository.
+- Vercel deployment protection returns `401` for unauthenticated direct preview curls, which is acceptable for private previews. Use authenticated `vercel curl` for checks.
 - Runtime data remains present in legacy local git history, but the GitHub repo was created from a clean import.
 - Execution JSONL routes and pipeline projection/outbox writes still need Postgres repository adapters.
 

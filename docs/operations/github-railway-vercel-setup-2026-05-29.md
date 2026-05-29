@@ -7,7 +7,8 @@
 - Default branch: `main`
 - Development branch: `dev`
 - Local stable branch: `stable/4001`
-- Clean local working copy: `/Users/agentsuburbiasandwich/Desktop/clawpilot-clean-github`
+- Canonical local working copy: `/Users/agentsuburbiasandwich/Desktop/clawpilot`
+- Compatibility symlink: `/Users/agentsuburbiasandwich/Desktop/clawpilot-clean-github` -> `/Users/agentsuburbiasandwich/Desktop/clawpilot`
 - Original local dev lane remains at `/Users/agentsuburbiasandwich/Desktop/clawd-app-dev`
 - Original local prod lane remains at `/Users/agentsuburbiasandwich/Desktop/clawd-app`
 - Railway project: `clawpilot`
@@ -38,11 +39,14 @@ The GitHub repository was created from a clean import so legacy tracked runtime 
 - Verified live Railway `/api/persistence/status` returns `driver: postgres` and `database: reachable`.
 - Connected Vercel to GitHub with Root Directory `app_src`; Vercel preview checks pass.
 
-## Blocked
+## Non-Blocking Private-Project Notes
 
-- GitHub branch protection on a private repository returned:
+- GitHub branch protection on this private repository returned:
   - `Upgrade to GitHub Pro or make this repository public to enable this feature.`
-- Vercel direct public preview requests return `401` while deployment protection is enabled. Authenticated `vercel curl` works.
+- This is not a blocker while the repository is private and single-operator. Keep PR discipline and green CI as the practical guardrail.
+- Vercel direct public preview requests return `401` while deployment protection is enabled.
+- This is not a blocker for private previews. Authenticated `vercel curl` works for validation.
+- Railway database service is still named `Postgres`. That is functional. Rename to `clawpilot-postgres` only if the dashboard flow is available, then update `DATABASE_URL` from `${{Postgres.DATABASE_URL}}` to the new service reference.
 
 ## Recommended Setup Order
 
@@ -58,7 +62,7 @@ The GitHub repository was created from a clean import so legacy tracked runtime 
 Current Railway status can be checked from the clean working copy:
 
 ```bash
-cd /Users/agentsuburbiasandwich/Desktop/clawpilot-clean-github
+cd /Users/agentsuburbiasandwich/Desktop/clawpilot
 railway status
 railway service list
 ```

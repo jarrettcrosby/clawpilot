@@ -3,13 +3,15 @@
 ## Local Dev
 
 - Branch: `dev`
-- Worktree: `/Users/agentsuburbiasandwich/Desktop/clawd-app-dev`
+- Worktree: `/Users/agentsuburbiasandwich/Desktop/clawpilot`
 - Port: `4002`
 - Data root: `data-dev/`
 - Start: `bash scripts/dev-start.sh`
 - Status: `bash scripts/dev-status.sh`
 
 Use this lane for all normal Codex and developer work.
+
+The original OpenClaw dev lane remains at `/Users/agentsuburbiasandwich/Desktop/clawd-app-dev` as a historical reference and data import source. Do not use it as the default Codex working folder.
 
 ## Local Stable / Prod
 
@@ -27,7 +29,7 @@ Recommended setup:
 - Repository visibility: private.
 - Default branch after initial setup: `main`.
 - Active development branch: `dev`.
-- Protected branch: `main`.
+- Protected branch: optional while the repository remains private and single-operator.
 - Required checks: GitHub Actions `CI`.
 
 Important: the legacy local git history contains tracked runtime data. Do not push this repository as-is to a shared remote unless the repository is private and the data exposure has been accepted. Best practice is a clean import containing source, docs, scripts, config, and safe fixtures only.
@@ -53,7 +55,7 @@ Railway is configured from repository root via `railway.json`.
 - Start command: `npm run start:railway`
 - Healthcheck: `/api/health`
 
-Railway is the better fit for a long-running Node service if the app needs server-side runtime behavior. Durable data still needs an explicit database or persistent volume plan before production use.
+Railway is the long-running serverful runtime. Railway Postgres is active for app-owned tasks, assignments, and agent threads.
 
 ## Required Local Env
 

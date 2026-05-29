@@ -8,8 +8,9 @@ The web application lives in `app_src/` and is built with Next.js, React, TypeSc
 
 | Purpose | Branch | Worktree | Port | Notes |
 |---|---|---|---|---|
-| Active development | `dev` | `/Users/agentsuburbiasandwich/Desktop/clawd-app-dev` | `4002` | Default branch for Codex and developer work |
-| Stable/prod local lane | `stable/4001` | `/Users/agentsuburbiasandwich/Desktop/clawd-app` | `4001` | Protected. Do not mutate without explicit approval |
+| Active ClawPilot project | `dev` | `/Users/agentsuburbiasandwich/Desktop/clawpilot` | `4002` | Default folder for Codex and developer work |
+| Legacy dev source reference | local only | `/Users/agentsuburbiasandwich/Desktop/clawd-app-dev` | `4002` | Historical OpenClaw lane. Read-only unless explicitly needed |
+| Legacy stable/prod source reference | `stable/4001` | `/Users/agentsuburbiasandwich/Desktop/clawd-app` | `4001` | Protected. Do not mutate without explicit approval |
 
 Baseline tags:
 
