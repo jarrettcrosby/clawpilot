@@ -34,11 +34,14 @@ Important: the legacy local git history contains tracked runtime data. Do not pu
 
 ## Vercel
 
-Vercel is configured from repository root via `vercel.json`.
+Vercel is connected to GitHub with project Root Directory set to `app_src`.
+The root `vercel.json` intentionally uses commands relative to that Vercel root.
 
-- Install command: `npm --prefix app_src install`
+- Root directory: `app_src`
+- Framework preset: Next.js
+- Install command: `npm ci`
 - Build command: `npm run build`
-- Output directory: `app_src/.next`
+- Output directory: `.next`
 
 Vercel is suitable for web preview/build validation. Because the current app writes local files, production Vercel use should wait until durable state is moved out of the local filesystem or write paths are limited to read-only/demo behavior.
 

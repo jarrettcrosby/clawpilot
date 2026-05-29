@@ -47,7 +47,9 @@ The full runtime regression gate remains local for now because it requires the l
 
 ## Vercel
 
-Root `vercel.json` mirrors the Eigen Racing pattern of declaring build behavior at the repository root.
+Vercel is connected to GitHub with project Root Directory set to `app_src`.
+Root `vercel.json` documents the build behavior relative to that Vercel root:
+`npm ci`, `npm run build`, and output directory `.next`.
 
 Use Vercel for:
 

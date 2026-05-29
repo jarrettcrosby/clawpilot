@@ -49,16 +49,20 @@ if (!existsSync(resolve(root, 'railway.json'))) {
 }
 
 const vercel = readJson('vercel.json')
-if (String(vercel.installCommand || '') !== 'npm --prefix app_src install') {
-  fail('vercel.json installCommand must be "npm --prefix app_src install"')
+if (String(vercel.installCommand || '') !== 'npm ci') {
+  fail('vercel.json installCommand must be "npm ci"')
 }
 
 if (String(vercel.buildCommand || '') !== 'npm run build') {
   fail('vercel.json buildCommand must be "npm run build"')
 }
 
-if (String(vercel.outputDirectory || '') !== 'app_src/.next') {
-  fail('vercel.json outputDirectory must be "app_src/.next"')
+if (String(vercel.outputDirectory || '') !== '.next') {
+  fail('vercel.json outputDirectory must be ".next"')
+}
+
+if (!existsSync(resolve(root, 'app_src/package-lock.json'))) {
+  fail('missing app_src/package-lock.json required by Vercel npm ci')
 }
 
 const railway = readJson('railway.json')

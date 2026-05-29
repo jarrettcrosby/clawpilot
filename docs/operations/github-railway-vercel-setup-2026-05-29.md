@@ -90,10 +90,11 @@ Use GitHub import for:
 
 - Repository: `jarrettcrosby/clawpilot`
 - Production branch: `main`
+- Root directory: `app_src`
 - Framework preset: Next.js
-- Install command: `npm --prefix app_src install`
+- Install command: `npm ci`
 - Build command: `npm run build`
-- Output directory: `app_src/.next`
+- Output directory: `.next`
 
 Required environment variables should match Railway where applicable:
 
@@ -130,4 +131,3 @@ After Railway Postgres is live:
 2. Validate Postgres mode with `CLAWPILOT_STORAGE=postgres`.
 3. Add repository adapters for execution runs/results.
 4. Add pipeline sync outbox and projection workers.
-
