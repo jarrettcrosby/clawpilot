@@ -1,0 +1,14 @@
+node_modules/
+.next/
+.env.local
+*.log
+.DS_Store
+
+# Local test/build artifacts
+app_src/test-results/
+
+# Dev-lane generated state snapshots and logs
+data-dev/backups/
+data-dev/logs/
+data-dev/pipeline/
+data-dev/task-creation-audit.jsonl

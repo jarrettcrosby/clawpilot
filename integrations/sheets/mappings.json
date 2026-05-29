@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "updatedAt": "2026-03-04T01:34:00-05:00",
+  "pipelinePrimary": {
+    "sheetId": "1sp-eLYEEGera1acBoze_GvR4263dunlmaOUyBej-iqY",
+    "entities": {
+      "organizations": { "range": "Organizations!A:ZZ", "headerRow": 1 },
+      "contacts": { "range": "Contacts!A:ZZ", "headerRow": 1 },
+      "opportunities": { "range": "Opportunities!A:ZZ", "headerRow": 1 },
+      "interactions": { "range": "Interactions!A:ZZ", "headerRow": 1 }
+    }
+  },
+  "schemaReference": {
+    "sheetId": "1S82yOa9TfdPOb8g5Tm1pBKJawIhxCuOYi_PIO1ghVxE",
+    "entities": {
+      "tasks": { "range": "Tasks!A:ZZ", "headerRow": 1 },
+      "activityLog": { "range": "Activity Log!A:ZZ", "headerRow": 1 },
+      "docs": { "range": "Docs!A:ZZ", "headerRow": 1 },
+      "users": { "range": "Users!A:ZZ", "headerRow": 1 },
+      "pipeline": { "range": "Pipeline (CRM)!A:ZZ", "headerRow": 1 },
+      "versions": { "range": "Versions!A:ZZ", "headerRow": 1 },
+      "schemaReference": { "range": "Schema Reference!A:ZZ", "headerRow": 1 }
+    }
+  }
+}
