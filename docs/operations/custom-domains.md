@@ -34,7 +34,7 @@ For each hostname:
 4. Run the authenticated deployed smoke gate.
 5. Confirm production reports `main` and development reports `dev` through `/api/runtime` or deployment metadata.
 
-The operator login password is stored in macOS Keychain under service `clawpilot-login` and account `jarrett`:
+The primary login path emails a short-lived code to the approved `APP_LOGIN_EMAIL`. The emergency operator password is stored in macOS Keychain under service `clawpilot-login` and account `jarrett`:
 
 ```bash
 security find-generic-password -a jarrett -s clawpilot-login -w

@@ -66,11 +66,17 @@ export async function GET() {
     if (String(process.env.APP_LOGIN_PASSWORD || '').length < 16) {
       errors.push('Hosted runtime login password is missing or too short.')
     }
+    if (!String(process.env.APP_LOGIN_EMAIL || '').includes('@')) {
+      errors.push('Hosted runtime operator email is not configured.')
+    }
     if (String(process.env.APP_SESSION_SECRET || process.env.NEXTAUTH_SECRET || '').length < 32) {
       errors.push('Hosted runtime session secret is missing or too short.')
     }
     if (String(process.env.MATON_API_KEY || '').length < 16) {
       errors.push('Hosted runtime Maton credential is missing or too short.')
+    }
+    if (String(process.env.MATON_GMAIL_CONNECTION_ID || '').length < 8) {
+      errors.push('Hosted runtime Maton Gmail connection is not configured.')
     }
     if (String(process.env.PIPELINE_SHEET_ID || '').length < 20) {
       errors.push('Hosted runtime pipeline Sheet is not configured.')
@@ -84,7 +90,11 @@ export async function GET() {
 
     if (storage === 'postgres') {
       try {
-        const result = await query<{ now: string; worker_migration_applied: boolean }>(
+        const result = await query<{
+          now: string
+          worker_migration_applied: boolean
+          auth_migration_applied: boolean
+        }>(
           `
             SELECT
               now()::text AS now,
@@ -92,16 +102,23 @@ export async function GET() {
                 SELECT 1
                 FROM schema_migrations
                 WHERE filename = '0002_pipeline_outbox_worker.sql'
-              ) AS worker_migration_applied
+              ) AS worker_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0003_auth_magic_codes.sql'
+              ) AS auth_migration_applied
           `,
         )
         const row = result.rows[0]
         database = {
           status: 'reachable',
           checkedAt: row?.now || new Date(checkedAt).toISOString(),
-          migrationsCurrent: Boolean(row?.worker_migration_applied),
+          migrationsCurrent: Boolean(row?.worker_migration_applied && row?.auth_migration_applied),
         }
-        if (!row?.worker_migration_applied) errors.push('Required database migrations are not applied.')
+        if (!row?.worker_migration_applied || !row?.auth_migration_applied) {
+          errors.push('Required database migrations are not applied.')
+        }
 
         if (cloudProvider === 'railway') {
           const heartbeat = await readPipelineOutboxWorkerHeartbeatFromPostgres()
