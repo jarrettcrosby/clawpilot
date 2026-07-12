@@ -1,18 +1,23 @@
 'use client'
 
 import { FormEvent, useState } from 'react'
-import LockOutlined from '@mui/icons-material/LockOutlined'
 import LoginRounded from '@mui/icons-material/LoginRounded'
+import VisibilityOffRounded from '@mui/icons-material/VisibilityOffRounded'
+import VisibilityRounded from '@mui/icons-material/VisibilityRounded'
 import {
   Alert,
+  Avatar,
   Box,
   Button,
   CircularProgress,
   CssBaseline,
+  IconButton,
+  InputAdornment,
   Paper,
   TextField,
   Typography,
 } from '@mui/material'
+import { BrandIcon } from '@/lib/icons'
 
 function nextPath() {
   const requested = new URLSearchParams(window.location.search).get('next') || '/'
@@ -21,6 +26,7 @@ function nextPath() {
 
 export default function LoginPage() {
   const [password, setPassword] = useState('')
+  const [showPassword, setShowPassword] = useState(false)
   const [error, setError] = useState('')
   const [submitting, setSubmitting] = useState(false)
 
@@ -54,8 +60,8 @@ export default function LoginPage() {
         placeItems: 'center',
         px: 2,
         py: 4,
-        bgcolor: '#101116',
-        color: '#f4f5f7',
+        bgcolor: '#0F0F13',
+        color: '#E4E1EC',
       }}
     >
       <CssBaseline />
@@ -67,31 +73,28 @@ export default function LoginPage() {
           width: 'min(100%, 380px)',
           p: { xs: 3, sm: 4 },
           borderRadius: 1,
-          border: '1px solid rgba(255,255,255,0.12)',
-          bgcolor: '#191b22',
+          border: '1px solid rgba(255,255,255,0.08)',
+          bgcolor: '#1A1A23',
           color: 'inherit',
         }}
       >
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.25, mb: 3 }}>
-          <Box
+          <Avatar
             sx={{
               width: 38,
               height: 38,
-              display: 'grid',
-              placeItems: 'center',
-              borderRadius: 1,
-              bgcolor: '#d7ff5f',
-              color: '#101116',
+              bgcolor: '#A8C7FA',
+              color: '#001D36',
             }}
           >
-            <LockOutlined fontSize="small" />
-          </Box>
+            <BrandIcon sx={{ fontSize: 20 }} />
+          </Avatar>
           <Box>
             <Typography component="h1" variant="h5" sx={{ fontWeight: 750 }}>
               ClawPilot
             </Typography>
-            <Typography variant="body2" sx={{ color: 'rgba(244,245,247,0.62)' }}>
-              Sign in
+            <Typography variant="body2" color="text.secondary">
+              Operator sign in
             </Typography>
           </Box>
         </Box>
@@ -102,18 +105,39 @@ export default function LoginPage() {
           autoFocus
           fullWidth
           required
-          type="password"
-          label="Password"
+          id="password"
+          name="password"
+          type={showPassword ? 'text' : 'password'}
+          label="Operator password"
           value={password}
           onChange={(event) => setPassword(event.target.value)}
           autoComplete="current-password"
+          slotProps={{
+            input: {
+              endAdornment: (
+                <InputAdornment position="end">
+                  <IconButton
+                    aria-label={showPassword ? 'Hide password' : 'Show password'}
+                    edge="end"
+                    onClick={() => setShowPassword((visible) => !visible)}
+                    sx={{ color: 'text.secondary' }}
+                  >
+                    {showPassword ? <VisibilityOffRounded /> : <VisibilityRounded />}
+                  </IconButton>
+                </InputAdornment>
+              ),
+            },
+          }}
           sx={{
             mb: 2,
-            '& .MuiInputLabel-root': { color: 'rgba(244,245,247,0.62)' },
+            '& .MuiInputLabel-root': { color: 'text.secondary' },
             '& .MuiOutlinedInput-root': {
-              color: '#f4f5f7',
-              '& fieldset': { borderColor: 'rgba(255,255,255,0.2)' },
-              '&:hover fieldset': { borderColor: 'rgba(255,255,255,0.38)' },
+              color: 'text.primary',
+              bgcolor: '#232330',
+              borderRadius: 1,
+              '& fieldset': { borderColor: 'rgba(255,255,255,0.14)' },
+              '&:hover fieldset': { borderColor: 'rgba(255,255,255,0.28)' },
+              '&.Mui-focused fieldset': { borderColor: '#A8C7FA' },
             },
           }}
         />
@@ -127,10 +151,10 @@ export default function LoginPage() {
           sx={{
             minHeight: 44,
             borderRadius: 1,
-            bgcolor: '#d7ff5f',
-            color: '#101116',
+            bgcolor: '#A8C7FA',
+            color: '#001D36',
             fontWeight: 750,
-            '&:hover': { bgcolor: '#c4ee4f' },
+            '&:hover': { bgcolor: '#BDD4FB' },
           }}
         >
           Sign in
