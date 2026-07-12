@@ -78,15 +78,19 @@ Current Railway production setup:
 - `CLAWPILOT_STORAGE=postgres`
 - `CLAWPILOT_DB_FALLBACK_TO_FILE=false`
 - `APP_AUTH_REQUIRED=1`
+- `APP_LOGIN_EMAIL=<approved operator email>`
 - `APP_LOGIN_PASSWORD=<secret>`
 - `APP_SESSION_SECRET=<secret>`
 - `MATON_API_KEY=<secret>`
+- `MATON_GMAIL_CONNECTION_ID=<active Google Mail connection id>`
 - `PIPELINE_SHEET_ID=<environment-specific Sheet id>`
 - `PIPELINE_OUTBOX_WORKER_SECRET=<secret>`
 - `CLAWPILOT_EXECUTION_ENABLED=0`
 
 Railway applies pending SQL migrations as a pre-deploy command, then starts the Next.js app and the pipeline outbox poller together. The worker uses leased `sync_outbox` rows with retries and dead-letter handling.
 - initial 4002 dev-lane import: 43 tasks, 2 assignments, 13 threads, 26 messages
+
+The primary hosted sign-in sends a six-digit, 15-minute code to `APP_LOGIN_EMAIL` through the configured Maton Google Mail connection. Challenges are HMAC-protected, attempt-limited, single-use Postgres records. `APP_LOGIN_PASSWORD` remains an emergency operator fallback and should stay synchronized with the local Keychain entry.
 
 Hosted OpenClaw CLI execution is intentionally disabled with `CLAWPILOT_EXECUTION_ENABLED=0`. The web application, Postgres state, pipeline reads, and queued Google Sheets writes remain active. Re-enable execution only after a durable hosted execution provider and queue are configured; Railway containers do not carry the operator's local OpenClaw installation.
 

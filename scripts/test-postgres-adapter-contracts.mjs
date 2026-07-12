@@ -29,6 +29,11 @@ for (const column of ['idempotency_key', 'locked_at', 'lock_token', 'updated_at'
   assertIncludes(outboxMigration, column, 'pipeline outbox worker migration')
 }
 
+const authMigration = read('db/migrations/0003_auth_magic_codes.sql')
+for (const column of ['code_digest', 'attempts', 'expires_at', 'consumed_at']) {
+  assertIncludes(authMigration, column, 'auth magic-code migration')
+}
+
 const executionAdapter = read('app_src/lib/persistence/execution.ts')
 assertIncludes(executionAdapter, 'INSERT INTO execution_runs', 'execution adapter')
 assertIncludes(executionAdapter, 'INSERT INTO execution_results', 'execution adapter')
@@ -71,11 +76,13 @@ for (const requiredVariable of [
   'CLAWPILOT_STORAGE',
   'CLAWPILOT_DB_FALLBACK_TO_FILE',
   'CLAWPILOT_EXECUTION_ENABLED',
-  'APP_AUTH_REQUIRED',
-  'APP_LOGIN_PASSWORD',
-  'APP_SESSION_SECRET',
-  'DATABASE_URL',
-  'MATON_API_KEY',
+    'APP_AUTH_REQUIRED',
+    'APP_LOGIN_EMAIL',
+    'APP_LOGIN_PASSWORD',
+    'APP_SESSION_SECRET',
+    'DATABASE_URL',
+    'MATON_API_KEY',
+    'MATON_GMAIL_CONNECTION_ID',
   'PIPELINE_SHEET_ID',
   'PIPELINE_OUTBOX_WORKER_SECRET',
 ]) {
@@ -92,6 +99,14 @@ const loginRoute = read('app_src/app/api/auth/login/route.ts')
 assertIncludes(loginRoute, 'MAX_ATTEMPTS', 'login rate limit')
 assertIncludes(loginRoute, 'timingSafeEqual', 'login password comparison')
 
+const magicRequestRoute = read('app_src/app/api/auth/magic/request/route.ts')
+assertIncludes(magicRequestRoute, 'requestAuthMagicCode', 'magic-code request route')
+assertIncludes(magicRequestRoute, 'MAX_REQUESTS', 'magic-code request rate limit')
+
+const magicVerifyRoute = read('app_src/app/api/auth/magic/verify/route.ts')
+assertIncludes(magicVerifyRoute, 'verifyAuthMagicCode', 'magic-code verify route')
+assertIncludes(magicVerifyRoute, 'createSessionToken', 'magic-code session issuance')
+
 const autoPickupRoute = read('app_src/app/api/auto-pickup/execute-once/route.ts')
 assertIncludes(autoPickupRoute, 'readTasksFromPostgres', 'auto-pickup task persistence')
 assertIncludes(autoPickupRoute, 'isOpenClawExecutionEnabled', 'auto-pickup hosted execution guard')
@@ -102,5 +117,6 @@ assertIncludes(dispatchBridge, 'execution succeeded but completion telemetry cou
 const healthRoute = read('app_src/app/api/health/route.ts')
 assertIncludes(healthRoute, 'readPipelineOutboxWorkerHeartbeatFromPostgres', 'hosted worker health')
 assertIncludes(healthRoute, '0002_pipeline_outbox_worker.sql', 'hosted migration health')
+assertIncludes(healthRoute, '0003_auth_magic_codes.sql', 'hosted auth migration health')
 
 console.log('PASS test-postgres-adapter-contracts')
