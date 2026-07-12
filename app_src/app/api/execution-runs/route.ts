@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server'
 import fs from 'fs'
 import path from 'path'
+import { shouldFallbackToFileOnDatabaseError } from '@/lib/persistence/config'
+import { isPostgresExecutionStoreEnabled, listExecutionRunsFromPostgres } from '@/lib/persistence/execution'
 
 const DEV_TASKS_FILE = path.join(process.cwd(), '..', 'data-dev', 'tasks.json')
 const PROD_TASKS_FILE = path.join(process.cwd(), '..', 'data', 'tasks.json')
@@ -35,14 +37,26 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: 'taskId or runId required' }, { status: 400 })
   }
 
-  const entries = readJsonl(EXECUTION_RUNS_FILE)
-    .filter((entry) => {
-      if (runId && entry.runId === runId) return true
-      if (taskId && entry.taskId === taskId) return true
-      return false
-    })
-    .slice(-limit)
-    .reverse()
+  let entries: JsonLineRecord[] | null = null
+  if (isPostgresExecutionStoreEnabled()) {
+    try {
+      entries = await listExecutionRunsFromPostgres({ taskId, runId, limit })
+    } catch (error) {
+      if (!shouldFallbackToFileOnDatabaseError()) throw error
+      console.warn('[execution-runs] Postgres read failed; falling back to file store', error)
+    }
+  }
+
+  if (!entries) {
+    entries = readJsonl(EXECUTION_RUNS_FILE)
+      .filter((entry) => {
+        if (runId && entry.runId === runId) return true
+        if (taskId && entry.taskId === taskId) return true
+        return false
+      })
+      .slice(-limit)
+      .reverse()
+  }
 
   return NextResponse.json({ taskId, runId, entries })
 }

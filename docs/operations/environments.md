@@ -3,13 +3,15 @@
 ## Local Dev
 
 - Branch: `dev`
-- Worktree: `/Users/agentsuburbiasandwich/Desktop/clawd-app-dev`
+- Worktree: `/Users/agentsuburbiasandwich/Desktop/clawpilot`
 - Port: `4002`
 - Data root: `data-dev/`
 - Start: `bash scripts/dev-start.sh`
 - Status: `bash scripts/dev-status.sh`
 
 Use this lane for all normal Codex and developer work.
+
+`scripts/dev-start.sh` now runs directly from the canonical ClawPilot repository and seeds ignored `data-dev/` state once from the historical OpenClaw lanes when needed. The old `/Users/agentsuburbiasandwich/Desktop/clawd-app-dev` checkout remains a read-only import source, not the active runtime.
 
 ## Local Stable / Prod
 
@@ -27,18 +29,21 @@ Recommended setup:
 - Repository visibility: private.
 - Default branch after initial setup: `main`.
 - Active development branch: `dev`.
-- Protected branch: `main`.
+- Protected branch: optional while the repository remains private and single-operator.
 - Required checks: GitHub Actions `CI`.
 
 Important: the legacy local git history contains tracked runtime data. Do not push this repository as-is to a shared remote unless the repository is private and the data exposure has been accepted. Best practice is a clean import containing source, docs, scripts, config, and safe fixtures only.
 
 ## Vercel
 
-Vercel is configured from repository root via `vercel.json`.
+Vercel is connected to GitHub with project Root Directory set to `app_src`.
+The root `vercel.json` intentionally uses commands relative to that Vercel root.
 
-- Install command: `npm --prefix app_src install`
+- Root directory: `app_src`
+- Framework preset: Next.js
+- Install command: `npm ci`
 - Build command: `npm run build`
-- Output directory: `app_src/.next`
+- Output directory: `.next`
 
 Vercel is suitable for web preview/build validation. Because the current app writes local files, production Vercel use should wait until durable state is moved out of the local filesystem or write paths are limited to read-only/demo behavior.
 
@@ -50,7 +55,14 @@ Railway is configured from repository root via `railway.json`.
 - Start command: `npm run start:railway`
 - Healthcheck: `/api/health`
 
-Railway is the better fit for a long-running Node service if the app needs server-side runtime behavior. Durable data still needs an explicit database or persistent volume plan before production use.
+Railway is the long-running serverful runtime. Railway Postgres is active for app-owned tasks, assignments, agent threads, execution logs, pipeline projections, dropdown cache, and the Google Sheets sync outbox. The Railway start command runs the app and an outbox poller in the same service.
+
+Production and development use separate Railway environments, Postgres services/volumes, and Google Sheets. Both set `CLAWPILOT_DB_FALLBACK_TO_FILE=false`; a database failure must be visible instead of creating ephemeral container state. Hosted OpenClaw CLI execution remains disabled with `CLAWPILOT_EXECUTION_ENABLED=0` until a durable hosted execution provider is configured.
+
+| Lane | Branch | Railway environment | Pipeline Sheet |
+|---|---|---|---|
+| Production | `main` | `production` | Existing operator production workbook |
+| Development | `dev` | `development` | `ClawPilot Development Pipeline - Isolated` (`1VBF61ZtkgvKUp2-iIFUYeInrXqtXXx35Vc45tpuMG-E`) |
 
 ## Required Local Env
 
@@ -62,7 +74,10 @@ Use `.env.example` as the starting point. The important dev-lane variables are:
 - `TASKS_PATH`
 - `PIPELINE_NORMALIZED_PATH`
 - `PIPELINE_LOG_PATH`
+- `PIPELINE_DROPDOWN_CACHE_PATH`
 - `AGENT_THREADS_PATH`
 - `AGENT_ASSIGNMENTS_PATH`
 
 The `scripts/dev-start.sh` path remains the canonical local dev startup because it sets lane-specific runtime isolation.
+
+Railway Postgres mode also requires `PIPELINE_OUTBOX_WORKER_SECRET`. Pipeline Sheet pull/write operations require `MATON_API_KEY`.

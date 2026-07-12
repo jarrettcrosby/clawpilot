@@ -6,12 +6,14 @@
     "watchPatterns": [
       "/app_src/**",
       "/scripts/**",
+      "/db/**",
       "/package.json",
       "/railway.json"
     ]
   },
   "deploy": {
     "startCommand": "npm run start:railway",
+    "preDeployCommand": "npm run db:migrate",
     "healthcheckPath": "/api/health",
     "healthcheckTimeout": 300,
     "restartPolicyType": "ON_FAILURE",

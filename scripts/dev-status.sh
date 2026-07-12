@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CONTROL_REPO="/Users/agentsuburbiasandwich/Desktop/clawd-app"
-DEV_REPO="/Users/agentsuburbiasandwich/Desktop/clawd-app-dev"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+DEV_REPO="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 PID_FILE="/tmp/clawd-app-dev.pid"
 BUILD_STAMP="/tmp/clawd-app-dev.build"
 PORT="4002"
@@ -84,11 +84,6 @@ PY
   if [[ -z "$EXPECTED_COMMIT" ]] && [[ -d "$DEV_REPO/.git" ]]; then
     EXPECTED_COMMIT="$(git -C "$DEV_REPO" rev-parse HEAD 2>/dev/null || true)"
     EXPECTED_SOURCE="dev-worktree"
-  fi
-
-  if [[ -z "$EXPECTED_COMMIT" ]]; then
-    EXPECTED_COMMIT="$(git -C "$CONTROL_REPO" rev-parse HEAD 2>/dev/null || true)"
-    EXPECTED_SOURCE="control-repo"
   fi
 
   HEALTH_JSON="$(curl -s --max-time 2 "http://127.0.0.1:${PORT}/api/health" || true)"

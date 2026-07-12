@@ -8,8 +8,9 @@ The web application lives in `app_src/` and is built with Next.js, React, TypeSc
 
 | Purpose | Branch | Worktree | Port | Notes |
 |---|---|---|---|---|
-| Active development | `dev` | `/Users/agentsuburbiasandwich/Desktop/clawd-app-dev` | `4002` | Default branch for Codex and developer work |
-| Stable/prod local lane | `stable/4001` | `/Users/agentsuburbiasandwich/Desktop/clawd-app` | `4001` | Protected. Do not mutate without explicit approval |
+| Active ClawPilot project | `dev` | `/Users/agentsuburbiasandwich/Desktop/clawpilot` | `4002` | Default folder for Codex and developer work |
+| Legacy dev source reference | local only | `/Users/agentsuburbiasandwich/Desktop/clawd-app-dev` | `4002` | Historical OpenClaw lane. Read-only unless explicitly needed |
+| Legacy stable/prod source reference | `stable/4001` | `/Users/agentsuburbiasandwich/Desktop/clawd-app` | `4001` | Protected. Do not mutate without explicit approval |
 
 Baseline tags:
 
@@ -96,4 +97,6 @@ The current local history contains legacy tracked data. Before publishing to Git
 - [Data ownership and Postgres plan](docs/architecture/data-ownership-and-postgres-plan.md)
 - [Environments](docs/operations/environments.md)
 - [Deployment](docs/operations/deployment.md)
+- [Railway Postgres backups](docs/operations/railway-postgres-backups.md)
+- [Custom domains](docs/operations/custom-domains.md)
 - [Codex baseline](docs/operations/codex-baseline-2026-05-28.md)

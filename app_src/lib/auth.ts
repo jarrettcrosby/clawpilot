@@ -33,6 +33,7 @@ export function verifySessionToken(token?: string | null) {
   const [encoded, sig] = token.split('.', 2)
   if (!encoded || !sig) return { ok: false as const }
   const expected = sign(encoded)
+  if (sig.length !== expected.length) return { ok: false as const }
   const okSig = crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))
   if (!okSig) return { ok: false as const }
   try {

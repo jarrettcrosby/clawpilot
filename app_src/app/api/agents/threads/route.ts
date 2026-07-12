@@ -9,7 +9,7 @@ import { buildExecutionCommentText, buildExecutionCommentActivity } from '@/lib/
 import { spawn } from 'child_process'
 import type { Task, Comment } from '@/lib/types'
 import { buildCanonicalWorkItem, canonicalizeTasks } from '@/lib/workItemModel'
-import { shouldFallbackToFileOnDatabaseError } from '@/lib/persistence/config'
+import { isOpenClawExecutionEnabled, shouldFallbackToFileOnDatabaseError } from '@/lib/persistence/config'
 import { isPostgresTaskStoreEnabled, readTasksFromPostgres, replaceTasksInPostgres } from '@/lib/persistence/tasks'
 import { getThreadFromPostgres, listThreadsFromPostgres, upsertThreadMessageInPostgres } from '@/lib/persistence/agentThreads'
 const SECOND_BRAIN = process.env.SECOND_BRAIN_PATH || '/Users/agentsuburbiasandwich/.openclaw/workspace/second-brain'
@@ -183,6 +183,9 @@ async function writeDocsLog(agentId: string, text: string) {
 }
 
 async function runOpenClawAgent(agentId: string, message: string) {
+  if (!isOpenClawExecutionEnabled()) {
+    throw new Error('OpenClaw execution is disabled for this runtime')
+  }
   const args = [
     'agent',
     '--agent', agentId,
@@ -527,6 +530,13 @@ export async function POST(req: NextRequest) {
   const routedResponderId = resolveResponderId(executionAgentId)
   const useRealExecution = normalizedAgentId !== 'clawpilot'
   let executedViaAgent = false
+
+  if (useRealExecution && !isOpenClawExecutionEnabled()) {
+    return NextResponse.json({
+      ok: false,
+      error: 'OpenClaw execution is disabled for this hosted runtime.',
+    }, { status: 503 })
+  }
 
   // 1) persist user message first
   await upsertPersistedThreadMessage({

@@ -2,6 +2,8 @@ import { NextResponse } from 'next/server'
 import fs from 'fs'
 import path from 'path'
 import readline from 'readline'
+import { shouldFallbackToFileOnDatabaseError } from '@/lib/persistence/config'
+import { isPostgresExecutionStoreEnabled, summarizeExecutionResultsFromPostgres } from '@/lib/persistence/execution'
 
 const DEV_TASKS_FILE = path.join(process.cwd(), '..', 'data-dev', 'tasks.json')
 const PROD_TASKS_FILE = path.join(process.cwd(), '..', 'data', 'tasks.json')
@@ -37,6 +39,15 @@ async function summarizeJsonl(filePath: string) {
 }
 
 export async function GET() {
+  if (isPostgresExecutionStoreEnabled()) {
+    try {
+      return NextResponse.json(await summarizeExecutionResultsFromPostgres())
+    } catch (error) {
+      if (!shouldFallbackToFileOnDatabaseError()) throw error
+      console.warn('[execution-results-summary] Postgres read failed; falling back to file store', error)
+    }
+  }
+
   const { count, last } = await summarizeJsonl(EXECUTION_RESULTS_FILE)
   return NextResponse.json({ count, last })
 }

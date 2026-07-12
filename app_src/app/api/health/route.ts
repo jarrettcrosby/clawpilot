@@ -1,5 +1,8 @@
 import { NextResponse } from 'next/server'
 import fs from 'fs'
+import { getStorageDriver, isHostedRuntime } from '@/lib/persistence/config'
+import { query } from '@/lib/persistence/postgres'
+import { readPipelineOutboxWorkerHeartbeatFromPostgres } from '@/lib/persistence/pipeline'
 
 const DEV_LOG_PATH = '/tmp/clawd-app-dev.log'
 const FALLBACK_LOG_PATH = '/tmp/clawd-app.log'
@@ -39,6 +42,110 @@ function readLogTailUtf8(path: string, bytes: number): string {
 
 export async function GET() {
   const checkedAt = Date.now()
+  const railwayRuntime = Boolean(
+    process.env.RAILWAY_ENVIRONMENT_NAME
+    || process.env.RAILWAY_ENVIRONMENT_ID
+    || process.env.RAILWAY_PROJECT_ID
+    || process.env.RAILWAY_ENVIRONMENT,
+  )
+  const cloudProvider = railwayRuntime ? 'railway' : process.env.VERCEL ? 'vercel' : null
+
+  if (isHostedRuntime()) {
+    const errors: string[] = []
+    const warnings: string[] = []
+    const storage = getStorageDriver()
+    let database: Record<string, unknown> = { status: 'not-configured' }
+    let worker: Record<string, unknown> = { status: 'not-owned' }
+
+    if (cloudProvider === 'railway' && storage !== 'postgres') {
+      errors.push('Railway runtime requires Postgres storage.')
+    }
+    if (process.env.APP_AUTH_REQUIRED !== '1') {
+      errors.push('Hosted runtime authentication is not enabled.')
+    }
+    if (String(process.env.APP_LOGIN_PASSWORD || '').length < 16) {
+      errors.push('Hosted runtime login password is missing or too short.')
+    }
+    if (String(process.env.APP_SESSION_SECRET || process.env.NEXTAUTH_SECRET || '').length < 32) {
+      errors.push('Hosted runtime session secret is missing or too short.')
+    }
+    if (String(process.env.MATON_API_KEY || '').length < 16) {
+      errors.push('Hosted runtime Maton credential is missing or too short.')
+    }
+    if (String(process.env.PIPELINE_SHEET_ID || '').length < 20) {
+      errors.push('Hosted runtime pipeline Sheet is not configured.')
+    }
+    if (cloudProvider === 'railway' && String(process.env.PIPELINE_OUTBOX_WORKER_SECRET || '').length < 32) {
+      errors.push('Pipeline outbox worker credential is missing or too short.')
+    }
+    if (cloudProvider === 'railway' && process.env.CLAWPILOT_DB_FALLBACK_TO_FILE !== 'false') {
+      errors.push('Railway database fallback must be disabled.')
+    }
+
+    if (storage === 'postgres') {
+      try {
+        const result = await query<{ now: string; worker_migration_applied: boolean }>(
+          `
+            SELECT
+              now()::text AS now,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0002_pipeline_outbox_worker.sql'
+              ) AS worker_migration_applied
+          `,
+        )
+        const row = result.rows[0]
+        database = {
+          status: 'reachable',
+          checkedAt: row?.now || new Date(checkedAt).toISOString(),
+          migrationsCurrent: Boolean(row?.worker_migration_applied),
+        }
+        if (!row?.worker_migration_applied) errors.push('Required database migrations are not applied.')
+
+        if (cloudProvider === 'railway') {
+          const heartbeat = await readPipelineOutboxWorkerHeartbeatFromPostgres()
+          const heartbeatAt = Date.parse(String(heartbeat?.checkedAt || ''))
+          const pollMs = Math.max(1000, Math.min(Number(process.env.PIPELINE_OUTBOX_POLL_MS || 10000), 300000))
+          const maxHeartbeatAgeMs = Math.max(90_000, pollMs * 3)
+          const ageMs = Number.isFinite(heartbeatAt) ? checkedAt - heartbeatAt : null
+          worker = {
+            status: ageMs !== null && ageMs <= maxHeartbeatAgeMs ? 'reachable' : 'stale',
+            heartbeatAt: heartbeat?.checkedAt || null,
+            phase: heartbeat?.phase || null,
+            ageMs,
+          }
+          if (ageMs === null || ageMs > maxHeartbeatAgeMs) {
+            errors.push('Pipeline outbox worker heartbeat is missing or stale.')
+          }
+        }
+      } catch (error) {
+        database = {
+          status: 'unreachable',
+        }
+        console.error('[health] Postgres health check failed', error)
+        errors.push('Postgres is unreachable.')
+      }
+    } else {
+      errors.push('Hosted runtime database is not configured.')
+    }
+
+    return NextResponse.json({
+      status: errors.length > 0 ? 'error' : 'ok',
+      errors,
+      warnings,
+      runtime: cloudProvider || 'hosted',
+      environment: process.env.RAILWAY_ENVIRONMENT_NAME || process.env.VERCEL_ENV || null,
+      storage,
+      database,
+      worker,
+      capabilities: {
+        openClawExecution: process.env.CLAWPILOT_EXECUTION_ENABLED === '1',
+      },
+      checkedAt,
+    }, { status: errors.length > 0 ? 503 : 200 })
+  }
+
   const logSource = resolveLogPath()
 
   try {

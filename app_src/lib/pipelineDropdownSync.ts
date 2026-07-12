@@ -3,6 +3,14 @@ import path from 'path'
 import crypto from 'crypto'
 import { matonFetch } from '@/lib/maton'
 import { logPipelineEvent } from '@/lib/pipelineLog'
+import { shouldFallbackToFileOnDatabaseError } from '@/lib/persistence/config'
+import {
+  isPostgresPipelineStoreEnabled,
+  readPipelineDropdownCatalogFromPostgres,
+  upsertPipelineDropdownCatalogInPostgres,
+  type PipelineDropdownCatalog,
+  type PipelineDropdownOption,
+} from '@/lib/persistence/pipeline'
 
 const SHEET_ID = process.env.PIPELINE_SHEET_ID || '1sp-eLYEEGera1acBoze_GvR4263dunlmaOUyBej-iqY'
 const DROPDOWN_TAB = process.env.PIPELINE_DROPDOWN_TAB || 'Dropdowns'
@@ -15,16 +23,11 @@ const START_COL_LETTER = process.env.PIPELINE_DROPDOWN_START_COL || 'B'
 const END_COL_LETTER = process.env.PIPELINE_DROPDOWN_END_COL || 'ZZ'
 
 const READ_RANGE = `${DROPDOWN_TAB}!${START_COL_LETTER}${HEADER_ROW}:${END_COL_LETTER}2000`
-const CACHE_FILE = path.join(process.cwd(), '..', 'data', 'pipeline', 'dropdowns', 'catalog.json')
+const CACHE_FILE = process.env.PIPELINE_DROPDOWN_CACHE_PATH
+  || path.join(process.cwd(), '..', 'data', 'pipeline', 'dropdowns', 'catalog.json')
 
-type CatalogOption = { value: string; label: string; active: boolean; sort_order: number }
 type SheetMeta = { sheets?: Array<{ properties?: { title?: string; sheetId?: number } }> }
 type SheetValuesResponse = { values?: string[][] }
-type DropdownCatalog = {
-  syncedAt: string
-  source: 'app' | 'sheet'
-  dropdowns: Record<string, CatalogOption[]>
-}
 
 function nowIso() {
   return new Date().toISOString()
@@ -47,9 +50,47 @@ function ensureCacheDir() {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
 }
 
-function writeCache(catalog: DropdownCatalog) {
+function writeFileCache(catalog: PipelineDropdownCatalog) {
   ensureCacheDir()
   fs.writeFileSync(CACHE_FILE, JSON.stringify(catalog, null, 2), 'utf-8')
+}
+
+function readFileCache(): PipelineDropdownCatalog | null {
+  try {
+    if (!fs.existsSync(CACHE_FILE)) return null
+    const parsed = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'))
+    return parsed && typeof parsed === 'object' ? parsed as PipelineDropdownCatalog : null
+  } catch {
+    return null
+  }
+}
+
+async function persistCatalog(catalog: PipelineDropdownCatalog) {
+  if (isPostgresPipelineStoreEnabled()) {
+    try {
+      return await upsertPipelineDropdownCatalogInPostgres(catalog)
+    } catch (error) {
+      if (!shouldFallbackToFileOnDatabaseError()) throw error
+      console.warn('[pipeline-dropdown-sync] Postgres catalog write failed; using file fallback', error)
+    }
+  }
+
+  writeFileCache(catalog)
+  return catalog
+}
+
+async function readPersistedCatalog(): Promise<PipelineDropdownCatalog | null> {
+  if (isPostgresPipelineStoreEnabled()) {
+    try {
+      const catalog = await readPipelineDropdownCatalogFromPostgres()
+      if (catalog) return catalog
+    } catch (error) {
+      if (!shouldFallbackToFileOnDatabaseError()) throw error
+      console.warn('[pipeline-dropdown-sync] Postgres catalog read failed; using file fallback', error)
+    }
+  }
+
+  return readFileCache()
 }
 
 async function sheetGet(pathname: string) {
@@ -111,17 +152,17 @@ async function getSheetIdByTitle(title: string): Promise<number> {
   return Number(sheet.properties.sheetId)
 }
 
-function parseColumnarValues(values: string[][]): DropdownCatalog {
+function parseColumnarValues(values: string[][]): PipelineDropdownCatalog {
   // values is a matrix from B4:ZZ2000 where first row is header names per column
   const headerRow = values?.[0] || []
-  const dropdowns: Record<string, CatalogOption[]> = {}
+  const dropdowns: Record<string, PipelineDropdownOption[]> = {}
 
   for (let col = 0; col < headerRow.length; col++) {
     const headerRaw = String(headerRow[col] || '').trim()
     if (!headerRaw) continue
 
     const dropdownKey = normalizeKey(headerRaw) || `col_${col}`
-    const options: CatalogOption[] = []
+    const options: PipelineDropdownOption[] = []
 
     for (let row = 1; row < (values?.length || 0); row++) {
       const cell = String(values[row]?.[col] || '').trim()
@@ -151,7 +192,7 @@ function parseColumnarValues(values: string[][]): DropdownCatalog {
   }
 }
 
-function toColumnarRows(catalog: DropdownCatalog) {
+function toColumnarRows(catalog: PipelineDropdownCatalog) {
   const keys = Object.keys(catalog.dropdowns || {}).sort((a, b) => a.localeCompare(b))
   const headers = keys.map((k) => k)
   const columns = keys.map((k) => {
@@ -179,14 +220,17 @@ function toColumnarRows(catalog: DropdownCatalog) {
   return { keys, rows }
 }
 
+async function fetchDropdownsFromSheet() {
+  const encoded = encodeURIComponent(READ_RANGE)
+  const data = await sheetGet(`/google-sheets/v4/spreadsheets/${SHEET_ID}/values/${encoded}`) as SheetValuesResponse
+  return parseColumnarValues(data.values || [])
+}
+
 export async function pullDropdownsFromSheet() {
   const runId = `pull-${Date.now()}`
   try {
-    const encoded = encodeURIComponent(READ_RANGE)
-    const data = await sheetGet(`/google-sheets/v4/spreadsheets/${SHEET_ID}/values/${encoded}`) as SheetValuesResponse
-    const catalog = parseColumnarValues(data.values || [])
-
-    writeCache(catalog)
+    const catalog = await fetchDropdownsFromSheet()
+    await persistCatalog(catalog)
     logPipelineEvent({
       module: 'pipeline-dropdown-sync',
       action: 'pull',
@@ -201,17 +245,44 @@ export async function pullDropdownsFromSheet() {
   }
 }
 
-export async function pushDropdownsToSheet(input: DropdownCatalog) {
+export async function getDropdownCatalog(input: { forceRefresh?: boolean; maxAgeMs?: number } = {}) {
+  const cached = await readPersistedCatalog()
+  const maxAgeMs = Math.max(0, Number(input.maxAgeMs ?? process.env.PIPELINE_DROPDOWN_CACHE_MAX_AGE_MS ?? 300_000))
+  const cachedAt = cached?.syncedAt ? Date.parse(cached.syncedAt) : Number.NaN
+  const fresh = cached && Number.isFinite(cachedAt) && Date.now() - cachedAt <= maxAgeMs
+
+  if (!input.forceRefresh && fresh) {
+    return { runId: 'cache', catalog: cached, storage: isPostgresPipelineStoreEnabled() ? 'postgres' : 'file', stale: false }
+  }
+
+  try {
+    const pulled = await pullDropdownsFromSheet()
+    return { ...pulled, storage: isPostgresPipelineStoreEnabled() ? 'postgres' : 'file', stale: false }
+  } catch (error) {
+    if (!input.forceRefresh && cached) {
+      return {
+        runId: 'cache-stale',
+        catalog: cached,
+        storage: isPostgresPipelineStoreEnabled() ? 'postgres' : 'file',
+        stale: true,
+        warning: String(error),
+      }
+    }
+    throw error
+  }
+}
+
+export async function pushDropdownsToSheet(input: PipelineDropdownCatalog) {
   const runId = `push-${Date.now()}`
   try {
     const sheetId = await getSheetIdByTitle(DROPDOWN_TAB)
 
     // Pull current first to preserve unknown/manually-added columns
-    const existing = await pullDropdownsFromSheet()
-    const merged: DropdownCatalog = {
+    const existing = await fetchDropdownsFromSheet()
+    const merged: PipelineDropdownCatalog = {
       syncedAt: nowIso(),
       source: 'app',
-      dropdowns: { ...(existing.catalog?.dropdowns || {}), ...(input?.dropdowns || {}) },
+      dropdowns: { ...(existing.dropdowns || {}), ...(input?.dropdowns || {}) },
     }
 
     const { keys, rows } = toColumnarRows(merged)
@@ -288,7 +359,7 @@ export async function pushDropdownsToSheet(input: DropdownCatalog) {
     // lightweight metadata hashes in log only (no secret output)
     const hashes = keys.map((k) => ({ key: k, hash: hashCatalogEntry(k, (merged.dropdowns[k] || []).map((x) => x.value)) }))
 
-    writeCache(merged)
+    await persistCatalog(merged)
     logPipelineEvent({
       module: 'pipeline-dropdown-sync',
       action: 'push',

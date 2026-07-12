@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server'
 import fs from 'fs'
 import path from 'path'
+import { shouldFallbackToFileOnDatabaseError } from '@/lib/persistence/config'
+import { inspectExecutionTablesFromPostgres, isPostgresExecutionStoreEnabled } from '@/lib/persistence/execution'
 
 const DEV_TASKS_FILE = path.join(process.cwd(), '..', 'data-dev', 'tasks.json')
 const PROD_TASKS_FILE = path.join(process.cwd(), '..', 'data', 'tasks.json')
@@ -32,7 +34,17 @@ function inspect(filePath: string) {
 }
 
 export async function GET(_req: NextRequest) {
+  if (isPostgresExecutionStoreEnabled()) {
+    try {
+      const summary = await inspectExecutionTablesFromPostgres()
+      return NextResponse.json({ ...summary, driver: 'postgres' })
+    } catch (error) {
+      if (!shouldFallbackToFileOnDatabaseError()) throw error
+      console.warn('[execution-log-integrity] Postgres read failed; falling back to file store', error)
+    }
+  }
+
   const runs = inspect(path.join(LOG_DIR, 'execution-runs.jsonl'))
   const results = inspect(path.join(LOG_DIR, 'execution-results.jsonl'))
-  return NextResponse.json({ runs, results })
+  return NextResponse.json({ runs, results, driver: 'file' })
 }

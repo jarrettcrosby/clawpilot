@@ -20,7 +20,7 @@
     "@mui/icons-material": "^7.3.8",
     "@mui/material": "^7.3.8",
     "gray-matter": "^4.0.3",
-    "next": "16.1.6",
+    "next": "16.2.10",
     "pg": "^8.21.0",
     "react": "19.2.3",
     "react-dom": "19.2.3",
@@ -34,7 +34,7 @@
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "eslint": "^9",
-    "eslint-config-next": "16.1.6",
+    "eslint-config-next": "16.2.10",
     "typescript": "^5"
   }
 }

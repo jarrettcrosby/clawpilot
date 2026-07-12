@@ -88,7 +88,15 @@ export default function AppHeader({ activeSection, title, onShortcutsOpen, showN
   const [healthAnchor, setHealthAnchor] = useState<null | HTMLElement>(null)
   const [buildInfo, setBuildInfo] = useState<{ short: string; hash: string; subject: string; date: string; dirty: boolean; dirtyCount: number } | null>(null)
   const [buildOpen, setBuildOpen] = useState(false)
-  const [runtimeInfo, setRuntimeInfo] = useState<{ lane: string; port: string; commit: string; repoPath: string; appDir: string } | null>(null)
+  const [runtimeInfo, setRuntimeInfo] = useState<{
+    lane: string
+    port: string
+    commit: string
+    branch?: string | null
+    environment?: string | null
+    provider?: string
+    repoPath?: string
+  } | null>(null)
   const [runtimeAnchor, setRuntimeAnchor] = useState<null | HTMLElement>(null)
   const [freezeState, setFreezeState] = useState<{ frozen: boolean; reason?: string | null } | null>(null)
 
@@ -370,7 +378,8 @@ export default function AppHeader({ activeSection, title, onShortcutsOpen, showN
         <Typography variant="caption" color="text.secondary" display="block">Lane: {runtimeInfo?.lane || 'unknown'}</Typography>
         <Typography variant="caption" color="text.secondary" display="block">Port: {runtimeInfo?.port || 'unknown'}</Typography>
         <Typography variant="caption" color="text.secondary" display="block">Commit: {runtimeInfo?.commit?.slice(0,7) || 'unknown'}</Typography>
-        <Typography variant="caption" color="text.secondary" display="block" sx={{ maxWidth: 280, wordBreak: 'break-all' }}>Repo: {runtimeInfo?.repoPath || 'unknown'}</Typography>
+        <Typography variant="caption" color="text.secondary" display="block">Environment: {runtimeInfo?.environment || runtimeInfo?.lane || 'unknown'}</Typography>
+        <Typography variant="caption" color="text.secondary" display="block">Branch: {runtimeInfo?.branch || 'local'}</Typography>
       </Popover>
 
       {/* Shortcuts modal */}

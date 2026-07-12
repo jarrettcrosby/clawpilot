@@ -8,13 +8,23 @@ import { dispatchToOpenClaw } from '@/lib/dispatchBridge'
 import { buildAssignmentActivity, buildAssignmentCommentText, buildExecutionCommentActivity, buildExecutionCommentText } from '@/lib/executionWriteback'
 import { normalizeProductAgentId } from '@/lib/agents/routing'
 import { withFileLock } from '@/lib/fileLock'
+import {
+  isOpenClawExecutionEnabled,
+  shouldFallbackToFileOnDatabaseError,
+} from '@/lib/persistence/config'
+import { appendExecutionResultToPostgres, isPostgresExecutionStoreEnabled } from '@/lib/persistence/execution'
+import {
+  isPostgresTaskStoreEnabled,
+  readTasksFromPostgres,
+  replaceTasksInPostgres,
+} from '@/lib/persistence/tasks'
 
 const DEV_TASKS_FILE = path.join(process.cwd(), '..', 'data-dev', 'tasks.json')
 const PROD_TASKS_FILE = path.join(process.cwd(), '..', 'data', 'tasks.json')
 const TASKS_FILE = process.env.TASKS_PATH || ((process.env.NODE_ENV === 'development' && fs.existsSync(DEV_TASKS_FILE)) ? DEV_TASKS_FILE : PROD_TASKS_FILE)
 const EXECUTION_LOG_FILE = process.env.EXECUTION_RESULTS_PATH || path.join(path.dirname(TASKS_FILE), 'agents', 'execution-results.jsonl')
 
-function readTasks(): Task[] {
+function readTasksFromFile(): Task[] {
   try {
     const raw = JSON.parse(fs.readFileSync(TASKS_FILE, 'utf-8'))
     return Array.isArray(raw) ? raw : []
@@ -23,7 +33,29 @@ function readTasks(): Task[] {
   }
 }
 
+async function readTasks(): Promise<Task[]> {
+  if (isPostgresTaskStoreEnabled()) {
+    try {
+      return await readTasksFromPostgres()
+    } catch (error) {
+      if (!shouldFallbackToFileOnDatabaseError()) throw error
+      console.warn('[auto-pickup] Postgres task read failed; falling back to file store', error)
+    }
+  }
+  return readTasksFromFile()
+}
+
 async function writeTasks(tasks: Task[]) {
+  if (isPostgresTaskStoreEnabled()) {
+    try {
+      await replaceTasksInPostgres(tasks)
+      return
+    } catch (error) {
+      if (!shouldFallbackToFileOnDatabaseError()) throw error
+      console.warn('[auto-pickup] Postgres task write failed; falling back to file store', error)
+    }
+  }
+
   const lockPath = `${TASKS_FILE}.lock`
   await withFileLock(lockPath, () => {
     fs.writeFileSync(TASKS_FILE, JSON.stringify(tasks, null, 2))
@@ -31,6 +63,16 @@ async function writeTasks(tasks: Task[]) {
 }
 
 async function appendExecutionLog(entry: Record<string, unknown>) {
+  if (isPostgresExecutionStoreEnabled()) {
+    try {
+      await appendExecutionResultToPostgres(entry)
+      return
+    } catch (error) {
+      if (!shouldFallbackToFileOnDatabaseError()) throw error
+      console.warn('[auto-pickup] Postgres execution result append failed; falling back to file store', error)
+    }
+  }
+
   const dir = path.dirname(EXECUTION_LOG_FILE)
   fs.mkdirSync(dir, { recursive: true })
   const tempPath = path.join(dir, `.tmp-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.jsonl`)
@@ -46,7 +88,14 @@ async function appendExecutionLog(entry: Record<string, unknown>) {
 }
 
 export async function POST() {
-  const tasks = readTasks()
+  if (!isOpenClawExecutionEnabled()) {
+    return NextResponse.json({
+      ok: false,
+      error: 'OpenClaw execution is disabled for this hosted runtime.',
+    }, { status: 503 })
+  }
+
+  const tasks = await readTasks()
   const reconciled = reconcileAssignments(tasks)
   if (reconciled.changed) await writeTasks(reconciled.tasks)
   const plan = buildAutoPickupPlan(reconciled.tasks)

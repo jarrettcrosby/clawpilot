@@ -2,15 +2,14 @@
 
 ## Current Posture
 
-ClawPilot is now shaped for a GitHub -> Vercel/Railway project workflow, but publishing is intentionally not complete in this pass.
+ClawPilot now has a GitHub -> Vercel/Railway project workflow with Railway running the serverful app and Postgres-backed app state.
 
-Current blockers before first remote push/deploy:
+Current known platform notes:
 
-- GitHub CLI token on this Mac is invalid and needs `gh auth login`.
-- Railway CLI token is invalid and needs `railway login`.
-- Vercel CLI is not installed, although GitHub-connected Vercel can still be configured from the Vercel dashboard.
-- Runtime data is still present in legacy local git history.
-- Railway Postgres is selected as the durable cloud target, but only the first migration/refactor slice is in place.
+- GitHub branch protection on the private repo requires GitHub Pro or a public repo, but it is not required while this remains a private single-operator repository.
+- Vercel deployment protection returns `401` for unauthenticated direct preview curls, which is acceptable for private previews. Use authenticated `vercel curl` for checks.
+- Runtime data remains present in legacy local git history, but the GitHub repo was created from a clean import.
+- Execution runs/results, pipeline projections, dropdown cache, and the Sheet sync outbox have Postgres repository adapters behind `CLAWPILOT_STORAGE=postgres`.
 
 ## GitHub Setup
 
@@ -47,7 +46,9 @@ The full runtime regression gate remains local for now because it requires the l
 
 ## Vercel
 
-Root `vercel.json` mirrors the Eigen Racing pattern of declaring build behavior at the repository root.
+Vercel is connected to GitHub with project Root Directory set to `app_src`.
+Root `vercel.json` documents the build behavior relative to that Vercel root:
+`npm ci`, `npm run build`, and output directory `.next`.
 
 Use Vercel for:
 
@@ -66,17 +67,46 @@ Use Railway for:
 - healthchecked preview service
 - durable app-owned state through Railway Postgres
 
-Before production Railway use:
+Current Railway production setup:
 
-- provision a Postgres service
-- set `DATABASE_URL`
-- set `CLAWPILOT_STORAGE=postgres` only after migrations pass
-- run `npm run db:migrate`
-- run `npm run db:import:tasks` and `npm run db:import:threads` for the initial app-state seed
-- configure auth/secrets management
-- configure backup policy
+- project: `clawpilot`
+- app service: `clawpilot`
+- database service: `Postgres`
+- app URL: `https://clawpilot-production-52a1.up.railway.app`
+- `DATABASE_URL=${{Postgres.DATABASE_URL}}`
+- `PGSSLMODE=require`
+- `CLAWPILOT_STORAGE=postgres`
+- `CLAWPILOT_DB_FALLBACK_TO_FILE=false`
+- `APP_AUTH_REQUIRED=1`
+- `APP_LOGIN_PASSWORD=<secret>`
+- `APP_SESSION_SECRET=<secret>`
+- `MATON_API_KEY=<secret>`
+- `PIPELINE_SHEET_ID=<environment-specific Sheet id>`
+- `PIPELINE_OUTBOX_WORKER_SECRET=<secret>`
+- `CLAWPILOT_EXECUTION_ENABLED=0`
+
+Railway applies pending SQL migrations as a pre-deploy command, then starts the Next.js app and the pipeline outbox poller together. The worker uses leased `sync_outbox` rows with retries and dead-letter handling.
+- initial 4002 dev-lane import: 43 tasks, 2 assignments, 13 threads, 26 messages
+
+Hosted OpenClaw CLI execution is intentionally disabled with `CLAWPILOT_EXECUTION_ENABLED=0`. The web application, Postgres state, pipeline reads, and queued Google Sheets writes remain active. Re-enable execution only after a durable hosted execution provider and queue are configured; Railway containers do not carry the operator's local OpenClaw installation.
+
+Operational requirements:
+
+- enable Railway Postgres daily/weekly backup schedules described in `docs/operations/railway-postgres-backups.md`
+- run the authenticated deployed smoke gate after every deployment
 
 Google Sheets remains the operator-owned writable table for pipeline data. Postgres stores app-owned objects, sync bookkeeping, and pipeline projections. See `docs/architecture/data-ownership-and-postgres-plan.md`.
+
+Use the read-only deployed smoke gate after each deployment:
+
+```bash
+CLAWPILOT_BASE_URL=https://clawpilot-production-52a1.up.railway.app \
+CLAWPILOT_EXPECT_STORAGE=postgres \
+CLAWPILOT_EXPECT_PIPELINE=1 \
+CLAWPILOT_EXPECT_BRANCH=main \
+CLAWPILOT_EXPECT_ENVIRONMENT=production \
+npm run verify:deployed
+```
 
 ## Release Gate
 
