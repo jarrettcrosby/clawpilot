@@ -68,6 +68,10 @@ type Deal = {
 
 type LooseRecord = Record<string, unknown>
 type DropdownOption = { active?: boolean; sort_order?: number; label?: string; value?: string }
+
+function pipelineMutationKey() {
+  return globalThis.crypto?.randomUUID?.() || `pipeline-${Date.now()}-${Math.random().toString(16).slice(2)}`
+}
 type DateInputWithPicker = HTMLInputElement & { showPicker?: () => void }
 
 function normalizeDeal(d: Deal): Deal {
@@ -722,10 +726,11 @@ export default function PipelineSection() {
     const nextIdx = idx + direction
     if (nextIdx < 0 || nextIdx >= stageOptions.length) return
     const nextStage = stageOptions[nextIdx]
+    const mutationKey = pipelineMutationKey()
 
     const res = await fetch(`/api/pipeline/opportunity/${deal.id}`, {
       method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'Idempotency-Key': mutationKey },
       body: JSON.stringify({ expectedUpdatedAt: deal.updatedAt, stage: nextStage }),
     })
     const out = await res.json()
@@ -735,11 +740,12 @@ export default function PipelineSection() {
 
   const patchOpportunityWithRetry = async (deal: Deal, body: Record<string, unknown>) => {
     let localDeal = { ...deal }
+    const mutationKey = pipelineMutationKey()
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
         const res = await fetch(`/api/pipeline/opportunity/${localDeal.id}`, {
           method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', 'Idempotency-Key': mutationKey },
           body: JSON.stringify({ ...body, expectedUpdatedAt: localDeal.updatedAt }),
         })
         const out = await res.json()
@@ -944,9 +950,10 @@ export default function PipelineSection() {
           setSelectedDeal(out.opportunity ? { ...out.opportunity, closeDate: toInputDate(out.opportunity.closeDate || out.opportunity.expectedClose || '') } : null)
         }}
         onComment={async (id, comment) => {
+          const mutationKey = pipelineMutationKey()
           const res = await fetch(`/api/pipeline/opportunity/${id}`, {
             method: 'PATCH',
-            headers: { 'Content-Type': 'application/json' },
+            headers: { 'Content-Type': 'application/json', 'Idempotency-Key': mutationKey },
             body: JSON.stringify({ appendComment: comment, actor: 'Jarrett', expectedUpdatedAt: selectedDeal?.updatedAt }),
           })
           const out = await res.json()

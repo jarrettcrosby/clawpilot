@@ -1,6 +1,6 @@
 # Data Ownership and Postgres Plan
 
-Status: proposed implementation baseline  
+Status: implemented baseline
 Date: 2026-05-29
 
 ## Decision
@@ -12,22 +12,23 @@ ClawPilot will use two persistence systems with explicit ownership boundaries:
 
 The existing local JSON files stay as the local fallback during the transition. They are no longer the target architecture.
 
-## Current State
+## Implemented State
 
-The pipeline integration is already writable through Maton:
+The pipeline integration is writable through Maton and durable through Postgres:
 
-- `scripts/maton_sync_pipeline.py` pulls Google Sheets data into local normalized JSON.
-- `app_src/app/api/pipeline/opportunity/[id]/route.ts` writes opportunity updates back to the `Opportunities` tab and appends interactions to the `Interactions` tab.
-- `app_src/lib/pipelineDropdownSync.ts` pulls and pushes dropdown catalogs with the `Dropdowns` tab.
+- `app_src/lib/pipelineSync.ts` pulls Google Sheets data into a Postgres projection or local fallback.
+- `app_src/app/api/pipeline/opportunity/[id]/route.ts` commits opportunity projections and queues Sheet updates/interactions.
+- `app_src/lib/pipelineOutboxWorker.ts` performs queued Maton writes with retries and dead-letter handling.
+- `app_src/lib/pipelineDropdownSync.ts` pulls and pushes dropdown catalogs while Postgres stores the durable cache.
 
-The rest of the app still relies heavily on local files:
+Local files remain the development fallback and compatibility import source:
 
-- `data-dev/tasks.json` and `data/tasks.json` hold task/work-item state.
-- `agents/assignments.json` is a task assignment projection.
-- `agents/threads.json` stores agent conversations.
-- `agents/*.jsonl` files store execution runs/results.
-- `pipeline/normalized/current.json` is the local pipeline projection cache.
-- `logs/*.jsonl` files store runtime and pipeline events.
+- `data-dev/tasks.json` and `data/tasks.json` hold file-mode task/work-item state.
+- `agents/assignments.json` is the file-mode assignment projection.
+- `agents/threads.json` stores file-mode agent conversations.
+- `agents/*.jsonl` files store file-mode execution runs/results.
+- `pipeline/normalized/current.json` is the file-mode pipeline projection cache.
+- `logs/*.jsonl` files store file-mode runtime and pipeline events.
 
 ## Ownership Map
 
@@ -69,7 +70,7 @@ Postgres projection rows must keep stable Sheet metadata:
 - `last_synced_at`
 - `last_sheet_updated_at` when available
 
-Current opportunity row resolution falls back to name/org/owner matching. That is useful for bootstrap, but it is not durable enough for long-term conflict handling.
+The normalized projection stores `sheetRowNumber`; legacy file-mode writes retain name/org/owner matching as a compatibility fallback.
 
 ## Migration Sequence
 
@@ -81,7 +82,7 @@ Current opportunity row resolution falls back to name/org/owner matching. That i
 6. Migrate agent threads/messages.
 7. Migrate execution runs/results and audit events.
 8. Store pipeline rows as a Postgres projection while keeping Sheets as the operator-owned table.
-9. Add sync outbox workers for Sheet writes.
+9. Add sync outbox workers for Sheet writes. Completed with Railway polling, leased claims, retries, and dead-letter handling.
 10. Remove local JSON writes after parity checks pass.
 
 ## Non-Goals

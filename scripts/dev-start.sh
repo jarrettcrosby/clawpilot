@@ -1,74 +1,86 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CONTROL_REPO_DEFAULT="/Users/agentsuburbiasandwich/Desktop/clawd-app"
-DEV_REPO="/Users/agentsuburbiasandwich/Desktop/clawd-app-dev"
-APP_DIR="$DEV_REPO/app_src"
 PORT="4002"
 LOG_FILE="/tmp/clawd-app-dev.log"
 LOG_ROTATE_BYTES=$((5 * 1024 * 1024))
 PID_FILE="/tmp/clawd-app-dev.pid"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+DEV_REPO="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+APP_DIR="$DEV_REPO/app_src"
+LEGACY_DEV_REPO="${CLAWPILOT_LEGACY_DEV_ROOT:-/Users/agentsuburbiasandwich/Desktop/clawd-app-dev}"
+LEGACY_STABLE_REPO="${CLAWPILOT_LEGACY_STABLE_ROOT:-/Users/agentsuburbiasandwich/Desktop/clawd-app}"
 
-if [[ "$REPO_ROOT" == "$CONTROL_REPO_DEFAULT" ]]; then
-  CONTROL_REPO="$CONTROL_REPO_DEFAULT"
-elif [[ "$REPO_ROOT" == "$DEV_REPO" ]]; then
-  CONTROL_REPO="$DEV_REPO"
-else
-  echo "Refusing to start dev app from unexpected root: $REPO_ROOT"
-  echo "Expected one of: $CONTROL_REPO_DEFAULT or $DEV_REPO"
-  exit 1
-fi
-
-if [[ ! -e "$DEV_REPO/.git" ]]; then
-  echo "Dev worktree missing at $DEV_REPO"
-  echo "Create with: git -C $CONTROL_REPO worktree add -b dev $DEV_REPO main"
+if ! git -C "$DEV_REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "ClawPilot repository missing at $DEV_REPO"
   exit 1
 fi
 
 DEV_DATA_ROOT="$DEV_REPO/data-dev"
 mkdir -p "$DEV_DATA_ROOT/pipeline/normalized" "$DEV_DATA_ROOT/pipeline/dropdowns" "$DEV_DATA_ROOT/logs" "$DEV_DATA_ROOT/agents"
 
-seed_once() {
-  local src="$1"
-  local dest="$2"
-  local fallback_content="${3:-}"
-
+seed_from_candidates() {
+  local dest="$1"
+  shift
   if [[ -f "$dest" ]]; then
     return 0
   fi
 
-  if [[ -n "$fallback_content" ]]; then
-    printf "%s\n" "$fallback_content" > "$dest"
-    return 0
-  fi
-
-  if [[ ! -f "$src" ]]; then
-    echo "Required seed source missing: $src"
-    echo "Cannot initialize dev runtime data safely."
-    exit 1
-  fi
-
-  cp "$src" "$dest"
+  local src
+  for src in "$@"; do
+    if [[ -f "$src" ]]; then
+      cp "$src" "$dest"
+      echo "Seeded ${dest#$DEV_REPO/} from historical runtime source"
+      return 0
+    fi
+  done
+  return 1
 }
 
-# seed high-risk writable files once (non-destructive)
-seed_once "$DEV_REPO/data/tasks.json" "$DEV_DATA_ROOT/tasks.json"
-seed_once "$DEV_REPO/data/pipeline/normalized/current.json" "$DEV_DATA_ROOT/pipeline/normalized/current.json"
-seed_once "$DEV_REPO/data/pipeline/dropdowns/catalog.json" "$DEV_DATA_ROOT/pipeline/dropdowns/catalog.json"
-seed_once "$DEV_REPO/data/logs/pipeline-events.jsonl" "$DEV_DATA_ROOT/logs/pipeline-events.jsonl"
-seed_once "$DEV_REPO/data/agents/threads.json" "$DEV_DATA_ROOT/agents/threads.json"
+seed_from_candidates "$DEV_DATA_ROOT/tasks.json" \
+  "$DEV_REPO/data/tasks.json" \
+  "$LEGACY_DEV_REPO/data-dev/tasks.json" \
+  "$LEGACY_DEV_REPO/data/tasks.json" \
+  "$LEGACY_STABLE_REPO/data/tasks.json" \
+  || { echo "No task seed is available"; exit 1; }
+seed_from_candidates "$DEV_DATA_ROOT/pipeline/normalized/current.json" \
+  "$DEV_REPO/data/pipeline/normalized/current.json" \
+  "$LEGACY_DEV_REPO/data-dev/pipeline/normalized/current.json" \
+  "$LEGACY_DEV_REPO/data/pipeline/normalized/current.json" \
+  "$LEGACY_STABLE_REPO/data/pipeline/normalized/current.json" \
+  || { echo "No pipeline seed is available"; exit 1; }
+seed_from_candidates "$DEV_DATA_ROOT/pipeline/dropdowns/catalog.json" \
+  "$DEV_REPO/data/pipeline/dropdowns/catalog.json" \
+  "$LEGACY_DEV_REPO/data-dev/pipeline/dropdowns/catalog.json" \
+  "$LEGACY_DEV_REPO/data/pipeline/dropdowns/catalog.json" \
+  "$LEGACY_STABLE_REPO/data/pipeline/dropdowns/catalog.json" \
+  || { echo "No pipeline dropdown seed is available"; exit 1; }
+seed_from_candidates "$DEV_DATA_ROOT/agents/threads.json" \
+  "$DEV_REPO/data/agents/threads.json" \
+  "$LEGACY_DEV_REPO/data-dev/agents/threads.json" \
+  "$LEGACY_DEV_REPO/data/agents/threads.json" \
+  "$LEGACY_STABLE_REPO/data/agents/threads.json" \
+  || { echo "No agent thread seed is available"; exit 1; }
 
-if [[ -f "$DEV_REPO/data/agents/assignments.json" ]]; then
-  seed_once "$DEV_REPO/data/agents/assignments.json" "$DEV_DATA_ROOT/agents/assignments.json"
-else
-  seed_once "" "$DEV_DATA_ROOT/agents/assignments.json" "[]"
+if ! seed_from_candidates "$DEV_DATA_ROOT/agents/assignments.json" \
+  "$DEV_REPO/data/agents/assignments.json" \
+  "$LEGACY_DEV_REPO/data-dev/agents/assignments.json" \
+  "$LEGACY_DEV_REPO/data/agents/assignments.json" \
+  "$LEGACY_STABLE_REPO/data/agents/assignments.json"; then
+  printf '[]\n' > "$DEV_DATA_ROOT/agents/assignments.json"
+fi
+
+if ! seed_from_candidates "$DEV_DATA_ROOT/logs/pipeline-events.jsonl" \
+  "$DEV_REPO/data/logs/pipeline-events.jsonl" \
+  "$LEGACY_DEV_REPO/data-dev/logs/pipeline-events.jsonl" \
+  "$LEGACY_DEV_REPO/data/logs/pipeline-events.jsonl" \
+  "$LEGACY_STABLE_REPO/data/logs/pipeline-events.jsonl"; then
+  : > "$DEV_DATA_ROOT/logs/pipeline-events.jsonl"
 fi
 
 echo "Stopping dev runtime if running..."
-"$CONTROL_REPO/scripts/dev-stop.sh" || true
+"$DEV_REPO/scripts/dev-stop.sh" || true
 
 assert_port_free() {
   if python3 - <<'PY' "$PORT"
@@ -122,15 +134,12 @@ rotate_dev_log_if_needed() {
 rotate_dev_log_if_needed
 
 echo "====================================="
-echo "CLAWD DEV RUNTIME"
+echo "CLAWPILOT DEV RUNTIME"
 echo "Port: 4002"
-echo "Root: clawd-app-dev"
+echo "Root: $DEV_REPO"
 echo "Data root: data-dev/"
 echo "Logs: /tmp/clawd-app-dev.log"
 echo "====================================="
-
-echo "Running memory preflight (workspace memory path + date files)..."
-"$DEV_REPO/scripts/memory-preflight.sh"
 
 echo "Cleaning stale Next.js build artifacts..."
 cd "$APP_DIR"
@@ -148,9 +157,16 @@ BUILD_STAMP="/tmp/clawd-app-dev.build"
 echo "commit=$BUILD_COMMIT" > "$BUILD_STAMP"
 echo "built_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> "$BUILD_STAMP"
 
+PORT="$PORT" \
+RUNTIME_LANE="dev" \
+RUNTIME_PORT="$PORT" \
+CLAWPILOT_REPO_ROOT="$DEV_REPO" \
+CLAWPILOT_STORAGE="file" \
+APP_AUTH_REQUIRED="0" \
 TASKS_PATH="$DEV_DATA_ROOT/tasks.json" \
 PIPELINE_NORMALIZED_PATH="$DEV_DATA_ROOT/pipeline/normalized/current.json" \
 PIPELINE_LOG_PATH="$DEV_DATA_ROOT/logs/pipeline-events.jsonl" \
+PIPELINE_DROPDOWN_CACHE_PATH="$DEV_DATA_ROOT/pipeline/dropdowns/catalog.json" \
 AGENT_THREADS_PATH="$DEV_DATA_ROOT/agents/threads.json" \
 AGENT_ASSIGNMENTS_PATH="$DEV_DATA_ROOT/agents/assignments.json" \
 nohup npm run start -- --port "$PORT" --hostname 0.0.0.0 > "$LOG_FILE" 2>&1 &

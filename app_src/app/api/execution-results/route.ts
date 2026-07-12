@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server'
 import fs from 'fs'
 import path from 'path'
+import { shouldFallbackToFileOnDatabaseError } from '@/lib/persistence/config'
+import { isPostgresExecutionStoreEnabled, listExecutionResultsFromPostgres } from '@/lib/persistence/execution'
 
 const DEV_TASKS_FILE = path.join(process.cwd(), '..', 'data-dev', 'tasks.json')
 const PROD_TASKS_FILE = path.join(process.cwd(), '..', 'data', 'tasks.json')
@@ -31,10 +33,22 @@ export async function GET(req: NextRequest) {
   const limit = Math.min(Number(searchParams.get('limit') || 5), 20)
   if (!taskId) return NextResponse.json({ error: 'taskId required' }, { status: 400 })
 
-  const entries = readJsonl(EXECUTION_LOG_FILE)
-    .filter((entry) => entry.taskId === taskId)
-    .slice(-limit)
-    .reverse()
+  let entries: JsonLineRecord[] | null = null
+  if (isPostgresExecutionStoreEnabled()) {
+    try {
+      entries = await listExecutionResultsFromPostgres({ taskId, limit })
+    } catch (error) {
+      if (!shouldFallbackToFileOnDatabaseError()) throw error
+      console.warn('[execution-results] Postgres read failed; falling back to file store', error)
+    }
+  }
+
+  if (!entries) {
+    entries = readJsonl(EXECUTION_LOG_FILE)
+      .filter((entry) => entry.taskId === taskId)
+      .slice(-limit)
+      .reverse()
+  }
 
   return NextResponse.json({ taskId, entries })
 }

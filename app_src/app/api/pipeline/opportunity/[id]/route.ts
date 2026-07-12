@@ -1,11 +1,21 @@
 import { NextRequest, NextResponse } from 'next/server'
+import crypto from 'crypto'
 import fs from 'fs'
 import path from 'path'
 import { matonFetch } from '@/lib/maton'
 import { logPipelineEvent } from '@/lib/pipelineLog'
 import { getErrorMessage } from '@/lib/errorUtils'
+import { shouldFallbackToFileOnDatabaseError } from '@/lib/persistence/config'
+import {
+  DEFAULT_PIPELINE_SHEET_ID,
+  enqueuePipelineSyncOutboxInPostgres,
+  isPostgresPipelineStoreEnabled,
+  readPipelineProjectionFromPostgres,
+  upsertPipelineProjectionAndEnqueueInPostgres,
+  upsertPipelineProjectionInPostgres,
+} from '@/lib/persistence/pipeline'
 
-const SHEET_ID = '1sp-eLYEEGera1acBoze_GvR4263dunlmaOUyBej-iqY'
+const SHEET_ID = DEFAULT_PIPELINE_SHEET_ID
 const PIPELINE_FILE = process.env.PIPELINE_NORMALIZED_PATH || path.join(process.cwd(), '..', 'data', 'pipeline', 'normalized', 'current.json')
 
 async function getSheetValues(range: string) {
@@ -15,6 +25,65 @@ async function getSheetValues(range: string) {
 }
 
 type OpportunityRecord = Record<string, unknown>
+
+async function readPipelineData(): Promise<{ data: Record<string, unknown>; source: 'postgres' | 'file' }> {
+  if (isPostgresPipelineStoreEnabled()) {
+    try {
+      const projection = await readPipelineProjectionFromPostgres()
+      if (projection) return { data: projection as unknown as Record<string, unknown>, source: 'postgres' }
+    } catch (error) {
+      if (!shouldFallbackToFileOnDatabaseError()) throw error
+      console.warn('[pipeline-opportunity] Postgres projection read failed; falling back to file store', error)
+    }
+  }
+
+  if (!fs.existsSync(PIPELINE_FILE)) {
+    throw new Error('Pipeline data not synced yet')
+  }
+
+  return {
+    data: JSON.parse(fs.readFileSync(PIPELINE_FILE, 'utf-8')),
+    source: 'file',
+  }
+}
+
+async function persistPipelineData(data: Record<string, unknown>, source: 'postgres' | 'file') {
+  if (source === 'postgres' || isPostgresPipelineStoreEnabled()) {
+    try {
+      await upsertPipelineProjectionInPostgres(data)
+      return
+    } catch (error) {
+      if (!shouldFallbackToFileOnDatabaseError()) throw error
+      console.warn('[pipeline-opportunity] Postgres projection write failed; falling back to file store', error)
+    }
+  }
+
+  fs.writeFileSync(PIPELINE_FILE, JSON.stringify(data, null, 2))
+}
+
+function idempotencyKey(req: NextRequest) {
+  const provided = String(req.headers.get('idempotency-key') || '').trim()
+  return (provided || crypto.randomUUID()).slice(0, 200)
+}
+
+function projectedRowNumber(opportunity: OpportunityRecord, fallbackRow: number) {
+  const explicit = Number(opportunity.sheetRowNumber || opportunity.rowNumber || opportunity._rowNumber)
+  return Number.isFinite(explicit) && explicit >= 5 ? Math.trunc(explicit) : fallbackRow
+}
+
+function refreshPipelineSummary(data: Record<string, unknown>, rows: OpportunityRecord[]) {
+  const existing = data.summary && typeof data.summary === 'object'
+    ? data.summary as Record<string, unknown>
+    : {}
+  const closed = new Set(['abandoned', 'loss', 'closed', 'closed-lost'])
+  data.summary = {
+    ...existing,
+    opportunities: rows.length,
+    totalOpenValue: Math.round(rows
+      .filter((opportunity) => !closed.has(String(opportunity.status || '').toLowerCase()))
+      .reduce((total, opportunity) => total + toFiniteNumber(opportunity.value, 0), 0) * 100) / 100,
+  }
+}
 
 async function resolveOpportunityRow(current: OpportunityRecord, fallbackRow: number): Promise<number> {
   try {
@@ -94,8 +163,15 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
       return NextResponse.json({ error: 'Unsupported action' }, { status: 400 })
     }
 
-    if (!fs.existsSync(PIPELINE_FILE)) return NextResponse.json({ error: 'Pipeline data not synced yet' }, { status: 400 })
-    const data = JSON.parse(fs.readFileSync(PIPELINE_FILE, 'utf-8'))
+    let data: Record<string, unknown>
+    try {
+      data = (await readPipelineData()).data
+    } catch (error) {
+      if (getErrorMessage(error) === 'Pipeline data not synced yet') {
+        return NextResponse.json({ error: 'Pipeline data not synced yet' }, { status: 400 })
+      }
+      throw error
+    }
     const rows = Array.isArray(data.opportunities) ? data.opportunities : []
     const opp = rows.find((r: OpportunityRecord) => r.id === id)
     if (!opp) return NextResponse.json({ error: 'Opportunity not found' }, { status: 404 })
@@ -112,9 +188,26 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
       String(body.notes || ''),
     ]]
 
+    if (isPostgresPipelineStoreEnabled()) {
+      const outbox = await enqueuePipelineSyncOutboxInPostgres({
+        aggregateType: 'pipeline_interaction',
+        aggregateId: id,
+        operation: 'append_interaction',
+        payload: { range, values, opportunity: opp },
+        actor: String(body.agent || 'ClawPilot'),
+        idempotencyKey: idempotencyKey(req),
+      })
+      logPipelineEvent({ module: 'pipeline-interaction', action: 'queue', recordId: id, result: 'ok' })
+      const syncStatus = outbox.status === 'succeeded' ? 'succeeded' : 'queued'
+      return NextResponse.json(
+        { ok: true, syncStatus, outboxId: outbox.id },
+        { status: syncStatus === 'queued' ? 202 : 200 },
+      )
+    }
+
     await writeSheet(range, values, 3, 'append')
     logPipelineEvent({ module: 'pipeline-interaction', action: 'append', recordId: id, result: 'ok' })
-    return NextResponse.json({ ok: true })
+    return NextResponse.json({ ok: true, syncStatus: 'succeeded' })
   } catch (e: unknown) {
     logPipelineEvent({ module: 'pipeline-interaction', action: 'append', result: 'error', detail: String(e) })
     return NextResponse.json({ error: String(e) }, { status: 500 })
@@ -123,7 +216,11 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
 
 export async function PATCH(req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
   try {
-    if (!fs.existsSync(PIPELINE_FILE)) {
+    let loaded: { data: Record<string, unknown>; source: 'postgres' | 'file' }
+    try {
+      loaded = await readPipelineData()
+    } catch (error) {
+      if (getErrorMessage(error) !== 'Pipeline data not synced yet') throw error
       logPipelineEvent({ module: 'pipeline-opportunity', action: 'patch', result: 'error', detail: 'pipeline not synced' })
       return NextResponse.json({ error: 'Pipeline data not synced yet' }, { status: 400 })
     }
@@ -131,7 +228,7 @@ export async function PATCH(req: NextRequest, ctx: { params: Promise<{ id: strin
     const { id } = await ctx.params
     const updates = await req.json()
 
-    const data = JSON.parse(fs.readFileSync(PIPELINE_FILE, 'utf-8'))
+    const data = loaded.data
     const rows = Array.isArray(data.opportunities) ? data.opportunities : []
     const idx = rows.findIndex((r: OpportunityRecord) => r.id === id)
     if (idx === -1) return NextResponse.json({ error: 'Opportunity not found' }, { status: 404 })
@@ -165,9 +262,19 @@ export async function PATCH(req: NextRequest, ctx: { params: Promise<{ id: strin
       }
     }
 
+    const {
+      expectedUpdatedAt: _expectedUpdatedAt,
+      appendComment: _appendComment,
+      actor: _actor,
+      ...persistedUpdates
+    } = updates
+    void _expectedUpdatedAt
+    void _appendComment
+    void _actor
+
     const merged = {
       ...current,
-      ...updates,
+      ...persistedUpdates,
       notes: nextNotes,
       value: updates.value !== undefined
         ? toFiniteNumber(updates.value, toFiniteNumber(current.value, 0))
@@ -193,8 +300,25 @@ export async function PATCH(req: NextRequest, ctx: { params: Promise<{ id: strin
     }
 
     const fallbackRow = 4 + Number(String(id).replace('opp_', ''))
-    const rowNum = await resolveOpportunityRow(current, fallbackRow)
+    const rowNum = isPostgresPipelineStoreEnabled()
+      ? projectedRowNumber(current, fallbackRow)
+      : await resolveOpportunityRow(current, fallbackRow)
     const range = `Opportunities!B${rowNum}:M${rowNum}`
+
+    const beforeValues = [[
+      current.priority || '',
+      current.name || '',
+      current.owner || '',
+      current.organization || current.org || '',
+      current.status || '',
+      current.stage || '',
+      current.lossReason || '',
+      current.source || '',
+      current.valueRaw !== undefined ? current.valueRaw : money(current.value),
+      current.probabilityRaw !== undefined ? current.probabilityRaw : pct(current.probability),
+      current.closeDate || current.expectedClose || '',
+      current.notes || '',
+    ]]
 
     const values = [[
       merged.priority || '',
@@ -211,16 +335,42 @@ export async function PATCH(req: NextRequest, ctx: { params: Promise<{ id: strin
       merged.notes || '',
     ]]
 
-    try {
-      await writeSheet(range, values, 3)
-    } catch (e: unknown) {
-      logPipelineEvent({ module: 'pipeline-opportunity', action: 'patch', recordId: id, result: 'error', detail: String(e) })
-      return NextResponse.json({ error: 'Sheet write failed', detail: String(e).slice(0, 4000) }, { status: 500 })
-    }
-
     rows[idx] = merged
     data.opportunities = rows
-    fs.writeFileSync(PIPELINE_FILE, JSON.stringify(data, null, 2))
+    refreshPipelineSummary(data, rows)
+    let outboxId: string | null = null
+    let syncStatus: 'queued' | 'succeeded' = 'succeeded'
+
+    if (isPostgresPipelineStoreEnabled()) {
+      try {
+        const queued = await upsertPipelineProjectionAndEnqueueInPostgres({
+          projection: data,
+          outbox: {
+            aggregateType: 'pipeline_opportunity',
+            aggregateId: id,
+            operation: 'update_opportunity',
+            payload: { range, values, beforeValues, before: current, after: merged },
+            actor,
+            idempotencyKey: idempotencyKey(req),
+          },
+        })
+        outboxId = queued.outboxId
+        syncStatus = queued.outboxStatus === 'succeeded' ? 'succeeded' : 'queued'
+      } catch (error) {
+        if (!shouldFallbackToFileOnDatabaseError()) throw error
+        console.warn('[pipeline-opportunity] Postgres projection/outbox write failed; using synchronous fallback', error)
+        await writeSheet(range, values, 3)
+        await persistPipelineData(data, loaded.source)
+      }
+    } else {
+      try {
+        await writeSheet(range, values, 3)
+        await persistPipelineData(data, loaded.source)
+      } catch (e: unknown) {
+        logPipelineEvent({ module: 'pipeline-opportunity', action: 'patch', recordId: id, result: 'error', detail: String(e) })
+        return NextResponse.json({ error: 'Sheet write failed', detail: String(e).slice(0, 4000) }, { status: 500 })
+      }
+    }
 
     logPipelineEvent({ module: 'pipeline-opportunity', action: 'patch', recordId: id, result: 'ok' })
 
@@ -258,7 +408,10 @@ export async function PATCH(req: NextRequest, ctx: { params: Promise<{ id: strin
       }
     }
 
-    return NextResponse.json({ ok: true, opportunity: merged })
+    return NextResponse.json(
+      { ok: true, opportunity: merged, syncStatus, outboxId },
+      { status: syncStatus === 'queued' ? 202 : 200 },
+    )
   } catch (error: unknown) {
     const detail = getErrorMessage(error)
     logPipelineEvent({ module: 'pipeline-opportunity', action: 'patch', result: 'error', detail })

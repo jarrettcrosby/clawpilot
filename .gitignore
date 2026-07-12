@@ -10,6 +10,7 @@ node_modules/
 .railway/
 coverage/
 dist/
+backups/
 *.tsbuildinfo
 
 # Local test/build artifacts

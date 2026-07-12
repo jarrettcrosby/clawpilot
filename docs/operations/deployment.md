@@ -9,7 +9,7 @@ Current known platform notes:
 - GitHub branch protection on the private repo requires GitHub Pro or a public repo, but it is not required while this remains a private single-operator repository.
 - Vercel deployment protection returns `401` for unauthenticated direct preview curls, which is acceptable for private previews. Use authenticated `vercel curl` for checks.
 - Runtime data remains present in legacy local git history, but the GitHub repo was created from a clean import.
-- Execution JSONL routes and pipeline projection/outbox writes still need Postgres repository adapters.
+- Execution runs/results, pipeline projections, dropdown cache, and the Sheet sync outbox have Postgres repository adapters behind `CLAWPILOT_STORAGE=postgres`.
 
 ## GitHub Setup
 
@@ -76,15 +76,37 @@ Current Railway production setup:
 - `DATABASE_URL=${{Postgres.DATABASE_URL}}`
 - `PGSSLMODE=require`
 - `CLAWPILOT_STORAGE=postgres`
+- `CLAWPILOT_DB_FALLBACK_TO_FILE=false`
+- `APP_AUTH_REQUIRED=1`
+- `APP_LOGIN_PASSWORD=<secret>`
+- `APP_SESSION_SECRET=<secret>`
+- `MATON_API_KEY=<secret>`
+- `PIPELINE_SHEET_ID=<environment-specific Sheet id>`
+- `PIPELINE_OUTBOX_WORKER_SECRET=<secret>`
+- `CLAWPILOT_EXECUTION_ENABLED=0`
+
+Railway applies pending SQL migrations as a pre-deploy command, then starts the Next.js app and the pipeline outbox poller together. The worker uses leased `sync_outbox` rows with retries and dead-letter handling.
 - initial 4002 dev-lane import: 43 tasks, 2 assignments, 13 threads, 26 messages
 
-Before broader production use:
+Hosted OpenClaw CLI execution is intentionally disabled with `CLAWPILOT_EXECUTION_ENABLED=0`. The web application, Postgres state, pipeline reads, and queued Google Sheets writes remain active. Re-enable execution only after a durable hosted execution provider and queue are configured; Railway containers do not carry the operator's local OpenClaw installation.
 
-- configure auth/secrets management
-- configure Railway Postgres backup/export policy
-- add deployed-runtime smoke checks for Postgres-backed reads/writes
+Operational requirements:
+
+- enable Railway Postgres daily/weekly backup schedules described in `docs/operations/railway-postgres-backups.md`
+- run the authenticated deployed smoke gate after every deployment
 
 Google Sheets remains the operator-owned writable table for pipeline data. Postgres stores app-owned objects, sync bookkeeping, and pipeline projections. See `docs/architecture/data-ownership-and-postgres-plan.md`.
+
+Use the read-only deployed smoke gate after each deployment:
+
+```bash
+CLAWPILOT_BASE_URL=https://clawpilot-production-52a1.up.railway.app \
+CLAWPILOT_EXPECT_STORAGE=postgres \
+CLAWPILOT_EXPECT_PIPELINE=1 \
+CLAWPILOT_EXPECT_BRANCH=main \
+CLAWPILOT_EXPECT_ENVIRONMENT=production \
+npm run verify:deployed
+```
 
 ## Release Gate
 

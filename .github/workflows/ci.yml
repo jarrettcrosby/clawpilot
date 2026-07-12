@@ -34,7 +34,7 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: Thread store tests
+      - name: Tests
         run: npm run test
 
       - name: Predeploy verification

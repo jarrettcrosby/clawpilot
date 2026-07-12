@@ -74,6 +74,23 @@ if (!String(railway?.deploy?.startCommand || '').includes('npm run start:railway
   fail('railway.json deploy.startCommand must use "npm run start:railway"')
 }
 
+if (String(railway?.deploy?.preDeployCommand || '') !== 'npm run db:migrate') {
+  fail('railway.json deploy.preDeployCommand must run "npm run db:migrate"')
+}
+
+for (const requiredPath of [
+  'db/migrations/0002_pipeline_outbox_worker.sql',
+  'scripts/start-railway.sh',
+  'scripts/pipeline-outbox-poller.mjs',
+  'scripts/smoke-deployed-runtime.mjs',
+  'app_src/proxy.ts',
+  'app_src/app/api/pipeline/sync/outbox/process/route.ts',
+]) {
+  if (!existsSync(resolve(root, requiredPath))) {
+    fail(`missing deployment runtime file: ${requiredPath}`)
+  }
+}
+
 run('npm', ['run', 'build'])
 
 if (!existsSync(resolve(root, 'app_src/.next/BUILD_ID'))) {

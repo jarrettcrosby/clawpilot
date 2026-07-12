@@ -32,4 +32,8 @@ npm run db:import:tasks
 npm run db:import:threads
 ```
 
-The first app areas to move are task persistence and agent thread persistence. The migration keeps compatibility payloads in `jsonb` while adding extracted columns for durable querying.
+The first app areas moved are task persistence, agent thread persistence, execution run/result append logs, and the opportunity pipeline projection/outbox path. Migration `0002_pipeline_outbox_worker.sql` adds idempotency, worker leases, retry scheduling, and dead-letter support. The migrations keep compatibility payloads in `jsonb` while adding extracted columns for durable querying.
+
+Pipeline ownership remains split: Google Sheets is still the writable operator table, while Postgres stores the app projection, dropdown cache, and sync outbox/audit rows. The Railway worker drains queued Sheet updates and retries failed operations.
+
+See `docs/operations/railway-postgres-backups.md` for the backup and restore policy.

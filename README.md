@@ -97,4 +97,6 @@ The current local history contains legacy tracked data. Before publishing to Git
 - [Data ownership and Postgres plan](docs/architecture/data-ownership-and-postgres-plan.md)
 - [Environments](docs/operations/environments.md)
 - [Deployment](docs/operations/deployment.md)
+- [Railway Postgres backups](docs/operations/railway-postgres-backups.md)
+- [Custom domains](docs/operations/custom-domains.md)
 - [Codex baseline](docs/operations/codex-baseline-2026-05-28.md)

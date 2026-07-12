@@ -13,6 +13,8 @@ function buildPool(): Pool {
   return new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: sslMode === 'require' || sslMode === 'true' ? { rejectUnauthorized: false } : undefined,
+    connectionTimeoutMillis: 5000,
+    query_timeout: 10000,
   })
 }
 
@@ -45,4 +47,3 @@ export async function withTransaction<T>(fn: (client: PoolClient) => Promise<T>)
     client.release()
   }
 }
-

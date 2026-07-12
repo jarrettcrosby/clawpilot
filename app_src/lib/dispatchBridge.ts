@@ -6,6 +6,8 @@ import path from 'path'
 import crypto from 'crypto'
 import { withFileLock } from '@/lib/fileLock'
 import { getErrorMessage } from '@/lib/errorUtils'
+import { isOpenClawExecutionEnabled, shouldFallbackToFileOnDatabaseError } from '@/lib/persistence/config'
+import { appendExecutionRunToPostgres, isPostgresExecutionStoreEnabled } from '@/lib/persistence/execution'
 
 const execFileAsync = promisify(execFile)
 
@@ -145,6 +147,16 @@ function normalizeResult(result: Partial<DispatchResult> | null, fallbackSummary
 }
 
 async function appendExecutionRun(entry: Record<string, unknown>) {
+  if (isPostgresExecutionStoreEnabled()) {
+    try {
+      await appendExecutionRunToPostgres(entry)
+      return
+    } catch (error) {
+      if (!shouldFallbackToFileOnDatabaseError()) throw error
+      console.warn('[dispatch-bridge] Postgres execution run append failed; falling back to file store', error)
+    }
+  }
+
   const lockPath = `${EXECUTION_RUNS_FILE}.lock`
   await withFileLock(lockPath, () => appendJsonlAtomic(EXECUTION_RUNS_FILE, entry))
 }
@@ -178,6 +190,13 @@ type PersistedQueueItem = {
 type QueueAttemptResult = {
   result: DispatchResult
   queueStatus: QueueRunStatus
+}
+
+type OpenClawOutput = {
+  reply?: { text?: unknown; model?: unknown }
+  message?: { text?: unknown; model?: unknown }
+  output?: unknown
+  model?: unknown
 }
 
 const dispatchQueue: QueueItem[] = []
@@ -296,8 +315,9 @@ async function runDispatchAttempt(item: QueueItem): Promise<QueueAttemptResult> 
     prompt: item.prompt,
   })
 
+  let stdout: string
   try {
-    const { stdout } = await execFileAsync('openclaw', [
+    const execution = await execFileAsync('openclaw', [
       'agent',
       '--agent',
       item.agentId,
@@ -305,24 +325,73 @@ async function runDispatchAttempt(item: QueueItem): Promise<QueueAttemptResult> 
       item.prompt,
       '--json',
     ], { timeout: 600000 })
-
+    stdout = String(execution.stdout || '')
+  } catch (error: unknown) {
     const completedAt = new Date().toISOString()
-    const parsed = stdout ? JSON.parse(stdout) : null
-    const replyText = parsed?.reply?.text || parsed?.message?.text || parsed?.output || ''
-    const model = parsed?.model || parsed?.reply?.model || parsed?.message?.model || undefined
+    const message = getErrorMessage(error)
+    const errorCode = typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : ''
+    const isTimeout = message.toLowerCase().includes('timeout') || errorCode === 'ETIMEDOUT'
+    const status: QueueRunStatus = isTimeout ? 'timed_out' : 'failed'
 
-    let result: DispatchResult
-    if (replyText) {
-      try {
-        const replyJson = typeof replyText === 'string' ? JSON.parse(replyText) : replyText
-        result = normalizeResult(replyJson, 'Agent reply received.', { runId: item.runId, model, startedAt, completedAt }, parsed)
-      } catch {
-        result = normalizeResult(null, String(replyText).slice(0, 180) || 'Agent reply received.', { runId: item.runId, model, startedAt, completedAt }, parsed)
-      }
-    } else {
-      result = normalizeResult(null, 'Agent run completed without reply text.', { runId: item.runId, model, startedAt, completedAt }, parsed)
+    try {
+      await appendExecutionRun({
+        runId: item.runId,
+        idempotencyKey: item.idempotencyKey,
+        taskId: item.task.id,
+        taskTitle: item.task.title,
+        agentId: item.agentId,
+        model: undefined,
+        startedAt,
+        completedAt,
+        status,
+        attempt: item.attempt,
+        maxRetries: item.maxRetries,
+        payload: item.payload,
+        prompt: item.prompt,
+        response: null,
+        error: message || 'Unknown error',
+      })
+    } catch (telemetryError) {
+      console.error('[dispatch-bridge] unable to persist failed execution telemetry', telemetryError)
     }
 
+    return {
+      result: {
+        runId: item.runId,
+        status: 'failed',
+        summary: 'OpenClaw dispatch failed.',
+        blockedReason: message || 'Unknown error',
+        startedAt,
+        completedAt,
+      },
+      queueStatus: status,
+    }
+  }
+
+  const completedAt = new Date().toISOString()
+  let parsed: OpenClawOutput | null = null
+  try {
+    parsed = stdout ? JSON.parse(stdout) as OpenClawOutput : null
+  } catch {
+    parsed = stdout ? { output: stdout } : null
+  }
+  const replyText = parsed?.reply?.text || parsed?.message?.text || parsed?.output || ''
+  const modelValue = parsed?.model || parsed?.reply?.model || parsed?.message?.model
+  const model = modelValue === undefined || modelValue === null ? undefined : String(modelValue)
+
+  let result: DispatchResult
+  if (replyText) {
+    try {
+      const replyJson = typeof replyText === 'string' ? JSON.parse(replyText) : replyText
+      result = normalizeResult(replyJson, 'Agent reply received.', { runId: item.runId, model, startedAt, completedAt }, parsed)
+    } catch {
+      result = normalizeResult(null, String(replyText).slice(0, 180) || 'Agent reply received.', { runId: item.runId, model, startedAt, completedAt }, parsed)
+    }
+  } else {
+    result = normalizeResult(null, 'Agent run completed without reply text.', { runId: item.runId, model, startedAt, completedAt }, parsed)
+  }
+
+  try {
     await appendExecutionRun({
       runId: item.runId,
       idempotencyKey: item.idempotencyKey,
@@ -341,45 +410,11 @@ async function runDispatchAttempt(item: QueueItem): Promise<QueueAttemptResult> 
       raw: parsed,
       resultStatus: result.status,
     })
-
-    return { result, queueStatus: 'completed' }
-  } catch (error: unknown) {
-    const completedAt = new Date().toISOString()
-    const message = getErrorMessage(error)
-    const errorCode = typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : ''
-    const isTimeout = message.toLowerCase().includes('timeout') || errorCode === 'ETIMEDOUT'
-    const status: QueueRunStatus = isTimeout ? 'timed_out' : 'failed'
-
-    await appendExecutionRun({
-      runId: item.runId,
-      idempotencyKey: item.idempotencyKey,
-      taskId: item.task.id,
-      taskTitle: item.task.title,
-      agentId: item.agentId,
-      model: undefined,
-      startedAt,
-      completedAt,
-      status,
-      attempt: item.attempt,
-      maxRetries: item.maxRetries,
-      payload: item.payload,
-      prompt: item.prompt,
-      response: null,
-      error: message || 'Unknown error',
-    })
-
-    return {
-      result: {
-        runId: item.runId,
-        status: 'failed',
-        summary: 'OpenClaw dispatch failed.',
-        blockedReason: message || 'Unknown error',
-        startedAt,
-        completedAt,
-      },
-      queueStatus: status,
-    }
+  } catch (telemetryError) {
+    console.error('[dispatch-bridge] execution succeeded but completion telemetry could not be persisted', telemetryError)
   }
+
+  return { result, queueStatus: 'completed' }
 }
 
 async function processQueue() {
@@ -440,6 +475,9 @@ async function processQueue() {
 }
 
 export async function dispatchToOpenClaw(task: Task, agentId: string): Promise<DispatchResult> {
+  if (!isOpenClawExecutionEnabled()) {
+    throw new Error('OpenClaw execution is disabled for this runtime')
+  }
   const payload = buildDispatchPayload(task)
   const prompt = buildAgentPrompt(payload)
   const idempotencyKey = computeIdempotencyKey(task, agentId, payload)
