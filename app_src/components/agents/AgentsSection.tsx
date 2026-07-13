@@ -340,11 +340,7 @@ export default function AgentsSection() {
     setPopupBlocked(false)
     setCodeCopied(false)
 
-    let popup: Window | null = null
     try {
-      popup = window.open('about:blank', '_blank')
-      if (popup) popup.opener = null
-
       const response = await fetch('/api/agents/auth', { method: 'POST' })
       const payload = asRecord(await response.json().catch(() => null))
       if (!response.ok) throw new Error(payloadMessage(payload, 'Unable to start ChatGPT authorization.'))
@@ -358,34 +354,28 @@ export default function AgentsSection() {
       }
 
       setDeviceLogin({ loginId, verificationUrl, userCode, expiresAt })
-      if (!popup || popup.closed) {
-        setPopupBlocked(true)
-      } else {
-        try {
-          popup.location.replace(verificationUrl)
-        } catch {
-          popup.close()
-          setPopupBlocked(true)
-        }
-      }
     } catch (error) {
-      if (popup && !popup.closed) popup.close()
       setNotice(error instanceof Error ? error.message : 'Unable to start ChatGPT authorization.')
     } finally {
       setAuthStarting(false)
     }
   }
 
-  function openVerificationUrl() {
+  async function copyAndOpenVerificationUrl() {
     if (!deviceLogin) return
+    const copyPromise = copyText(deviceLogin.userCode)
     const popup = window.open(deviceLogin.verificationUrl, '_blank')
     if (!popup) {
       setPopupBlocked(true)
       setAuthError('The verification page could not be opened. Allow popups and try again.')
-      return
+    } else {
+      popup.opener = null
+      setPopupBlocked(false)
     }
-    popup.opener = null
-    setPopupBlocked(false)
+
+    const copied = await copyPromise
+    setCodeCopied(copied)
+    setNotice(copied ? 'Device code copied.' : 'Unable to copy the device code.')
   }
 
   async function copyDeviceCode() {
@@ -617,7 +607,7 @@ export default function AgentsSection() {
         <DialogContent>
           {popupBlocked && (
             <Alert severity="warning" sx={{ mb: 1.5, borderRadius: 1 }}>
-              The verification popup was blocked. Open it below to continue.
+              The verification page was blocked. Allow popups, then try again below.
             </Alert>
           )}
 
@@ -655,8 +645,8 @@ export default function AgentsSection() {
         <DialogActions sx={{ px: 3, pb: 2, flexWrap: 'wrap' }}>
           <Button onClick={closeAuthDialog} sx={{ color: 'text.secondary', textTransform: 'none' }}>Close</Button>
           {authPhase === 'waiting' ? (
-            <Button startIcon={<OpenInNewRounded />} onClick={openVerificationUrl} variant="contained" sx={{ textTransform: 'none' }}>
-              Open ChatGPT
+            <Button startIcon={<OpenInNewRounded />} onClick={copyAndOpenVerificationUrl} variant="contained" sx={{ textTransform: 'none' }}>
+              Copy code and open ChatGPT
             </Button>
           ) : (
             <Button startIcon={<RefreshRounded />} onClick={() => { closeAuthDialog(); void startChatGPTAuth() }} variant="contained" sx={{ textTransform: 'none' }}>
