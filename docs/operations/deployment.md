@@ -86,13 +86,16 @@ Current Railway production setup:
 - `PIPELINE_SHEET_ID=<environment-specific Sheet id>`
 - `PIPELINE_OUTBOX_WORKER_SECRET=<secret>`
 - `CLAWPILOT_EXECUTION_ENABLED=0`
+- `CLAWPILOT_AGENT_PROVIDER=openai` when hosted agent execution is enabled
+- `OPENAI_API_KEY=<server API key>` when hosted agent execution is enabled
+- `OPENAI_AGENT_MODEL=gpt-5-mini` (or another approved Responses API model)
 
 Railway applies pending SQL migrations as a pre-deploy command, then starts the Next.js app and the pipeline outbox poller together. The worker uses leased `sync_outbox` rows with retries and dead-letter handling.
 - initial 4002 dev-lane import: 43 tasks, 2 assignments, 13 threads, 26 messages
 
 The primary hosted sign-in sends a six-digit, 15-minute code to `APP_LOGIN_EMAIL` through the configured Maton Google Mail connection. Challenges are HMAC-protected, attempt-limited, single-use Postgres records. `APP_LOGIN_PASSWORD` remains an emergency operator fallback and should stay synchronized with the local Keychain entry.
 
-Hosted OpenClaw CLI execution is intentionally disabled with `CLAWPILOT_EXECUTION_ENABLED=0`. The web application, Postgres state, pipeline reads, and queued Google Sheets writes remain active. Re-enable execution only after a durable hosted execution provider and queue are configured; Railway containers do not carry the operator's local OpenClaw installation.
+Hosted OpenClaw CLI execution remains disabled with `CLAWPILOT_EXECUTION_ENABLED=0`; Railway containers do not carry the operator's local OpenClaw installation. Agent threads use the OpenAI Responses API only when `CLAWPILOT_AGENT_PROVIDER=openai` and a valid server-side `OPENAI_API_KEY` are configured. Without a provider, the Agents screen reports `not connected` and does not create synthetic replies.
 
 Operational requirements:
 

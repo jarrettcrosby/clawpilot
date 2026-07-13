@@ -111,9 +111,10 @@ export async function GET() {
 export async function PUT(req: NextRequest) {
   const body = await req.json()
   const taskId = String(body?.taskId || '')
-  const agentId = normalizeAgentId(String(body?.agentId || ''))
-  if (!taskId || !agentId) {
-    return NextResponse.json({ ok: false, error: 'taskId and agentId required' }, { status: 400 })
+  const requestedAgentId = String(body?.agentId || '').trim()
+  const agentId = requestedAgentId ? normalizeAgentId(requestedAgentId) : ''
+  if (!taskId || (requestedAgentId && !agentId)) {
+    return NextResponse.json({ ok: false, error: 'taskId and a valid agentId are required' }, { status: 400 })
   }
 
   const now = new Date().toISOString()
@@ -123,7 +124,7 @@ export async function PUT(req: NextRequest) {
     return NextResponse.json({ ok: false, error: 'task not found' }, { status: 404 })
   }
 
-  tasks[idx] = { ...tasks[idx], assignedAgent: agentId, updatedAt: now }
+  tasks[idx] = { ...tasks[idx], assignedAgent: agentId || undefined, updatedAt: now }
   await writeTasks(tasks)
 
   const assignments = await readAssignments()

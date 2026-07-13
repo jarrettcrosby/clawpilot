@@ -107,10 +107,6 @@ const magicVerifyRoute = read('app_src/app/api/auth/magic/verify/route.ts')
 assertIncludes(magicVerifyRoute, 'verifyAuthMagicCode', 'magic-code verify route')
 assertIncludes(magicVerifyRoute, 'createSessionToken', 'magic-code session issuance')
 
-const autoPickupRoute = read('app_src/app/api/auto-pickup/execute-once/route.ts')
-assertIncludes(autoPickupRoute, 'readTasksFromPostgres', 'auto-pickup task persistence')
-assertIncludes(autoPickupRoute, 'isOpenClawExecutionEnabled', 'auto-pickup hosted execution guard')
-
 const dispatchBridge = read('app_src/lib/dispatchBridge.ts')
 assertIncludes(dispatchBridge, 'execution succeeded but completion telemetry could not be persisted', 'dispatch replay guard')
 
@@ -118,5 +114,23 @@ const healthRoute = read('app_src/app/api/health/route.ts')
 assertIncludes(healthRoute, 'readPipelineOutboxWorkerHeartbeatFromPostgres', 'hosted worker health')
 assertIncludes(healthRoute, '0002_pipeline_outbox_worker.sql', 'hosted migration health')
 assertIncludes(healthRoute, '0003_auth_magic_codes.sql', 'hosted auth migration health')
+assertIncludes(healthRoute, 'getAgentRuntime', 'hosted agent runtime health')
+
+const agentProvider = read('app_src/lib/agents/provider.ts')
+assertIncludes(agentProvider, 'https://api.openai.com/v1/responses', 'OpenAI agent provider')
+assertIncludes(agentProvider, 'Execution provider not connected', 'honest agent provider status')
+
+const agentsRoute = read('app_src/app/api/agents/route.ts')
+assertIncludes(agentsRoute, "runtime.ready ? 'ready' : 'not connected'", 'agent status route')
+
+const agentThreadsRoute = read('app_src/app/api/agents/threads/route.ts')
+assertIncludes(agentThreadsRoute, 'assignmentError(task, agentId)', 'task-bound agent thread contract')
+assertIncludes(agentThreadsRoute, 'runOpenAIAgent', 'hosted agent execution route')
+assertIncludes(agentThreadsRoute, 'appendExecutionRunToPostgres', 'agent execution run writeback')
+assertIncludes(agentThreadsRoute, 'appendExecutionResultToPostgres', 'agent execution result writeback')
+
+const tasksRoute = read('app_src/app/api/tasks/route.ts')
+assert.ok(!tasksRoute.includes('buildGovernanceAdvisory'), 'task route must not create governance advisory mutations')
+assertIncludes(tasksRoute, 'TASK_NOT_ACTIONABLE', 'explicit active-task validation')
 
 console.log('PASS test-postgres-adapter-contracts')

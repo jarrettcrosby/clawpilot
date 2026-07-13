@@ -124,7 +124,16 @@ export default function Navigation({ activeSection, onNavigate, collapsed, onTog
                 color: 'rgba(255,255,255,0.4)',
                 '&.Mui-selected': { color: '#A8C7FA' },
                 minWidth: 0,
-                fontSize: '0.7rem',
+                maxWidth: 'none',
+                flex: '1 1 0',
+                px: 0.25,
+                '& .MuiSvgIcon-root': { fontSize: 21 },
+                '& .MuiBottomNavigationAction-label': {
+                  fontSize: '0.6rem',
+                  letterSpacing: 0,
+                  whiteSpace: 'nowrap',
+                },
+                '& .MuiBottomNavigationAction-label.Mui-selected': { fontSize: '0.6rem' },
               }}
             />
           ))}
