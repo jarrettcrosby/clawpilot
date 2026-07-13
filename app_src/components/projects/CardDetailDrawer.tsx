@@ -718,7 +718,7 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
                 <Stack direction="row" spacing={1} alignItems="center" mb={0.75}>
                   {PersonAvatar({ personId: c.author, size: 28 }) || (
                     <Box sx={{ width: 28, height: 28, borderRadius: '50%', backgroundColor: 'rgba(255,255,255,0.06)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
-                      <Typography variant="caption" sx={{ color: 'text.disabled', fontWeight: 700, fontSize: '0.72rem' }}>?</Typography>
+                      <Typography variant="caption" sx={{ color: 'text.disabled', fontWeight: 700, fontSize: '0.72rem' }}>{String(c.author || '?').slice(0, 1).toUpperCase()}</Typography>
                     </Box>
                   )}
                   <Box sx={{ flex: 1 }}>
