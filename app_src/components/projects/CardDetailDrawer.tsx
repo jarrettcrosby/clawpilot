@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useCallback, useRef, useEffect } from 'react'
+import { useState, useCallback, useRef } from 'react'
 import useMediaQuery from '@mui/material/useMediaQuery'
 import Drawer from '@mui/material/Drawer'
 import Box from '@mui/material/Box'
@@ -22,6 +22,7 @@ import MenuItem from '@mui/material/MenuItem'
 import Select from '@mui/material/Select'
 import Checkbox from '@mui/material/Checkbox'
 import LinearProgress from '@mui/material/LinearProgress'
+import Alert from '@mui/material/Alert'
 import CloseRounded from '@mui/icons-material/CloseRounded'
 import ArchiveRounded from '@mui/icons-material/ArchiveRounded'
 import FlagRounded from '@mui/icons-material/FlagRounded'
@@ -44,10 +45,8 @@ import SmartToyRounded from '@mui/icons-material/SmartToyRounded'
 import CalendarTodayRounded from '@mui/icons-material/CalendarTodayRounded'
 import CheckBoxOutlined from '@mui/icons-material/CheckBoxOutlined'
 import type { Task, ChecklistItem, Comment } from '@/lib/types'
-import { validateMilestone } from '@/lib/governance/milestone'
 import { ASSIGNABLE_PRODUCT_AGENT_IDS, PRIORITY_COLORS, PRIORITY_LABELS, STATUS_LABELS, AVAILABLE_LABELS, COLUMNS, PEOPLE, CATEGORY_OPTIONS } from '@/lib/types'
 import { displayCategory } from '@/lib/format'
-import { deriveNextActionGuidance, deriveStateTruth } from '@/lib/workItemModel'
 
 type Props = {
   task: Task | null
@@ -55,14 +54,11 @@ type Props = {
   onClose: () => void
   onUpdate?: (t: Task) => void
   onArchive?: (t: Task) => void
-  actionabilityHint?: { message: string; missing: string[] } | null
 }
 
 type NavigatorShare = Navigator & { share?: (data: { text: string; title?: string }) => Promise<void> }
 type NextActionEditorProps = {
   initialValue: string
-  highlight: boolean
-  inputRef: React.RefObject<HTMLInputElement | null>
   onSave: (value: string) => void
 }
 
@@ -125,13 +121,12 @@ const selectSx = {
 }
 const menuPaper = { PaperProps: { sx: { backgroundColor: '#232330', border: '1px solid rgba(255,255,255,0.08)', borderRadius: 2, mt: 0.5 } } }
 
-function NextActionEditor({ initialValue, highlight, inputRef, onSave }: NextActionEditorProps) {
+function NextActionEditor({ initialValue, onSave }: NextActionEditorProps) {
   const [value, setValue] = useState(initialValue)
 
   return (
     <Stack direction="row" spacing={1} alignItems="center" sx={{ flex: 1 }}>
       <TextField
-        inputRef={inputRef}
         size="small"
         value={value}
         onChange={(e) => setValue(e.target.value)}
@@ -148,9 +143,7 @@ function NextActionEditor({ initialValue, highlight, inputRef, onSave }: NextAct
             backgroundColor: '#232330',
             borderRadius: 2,
             fontSize: '0.78rem',
-            ...(highlight ? { boxShadow: '0 0 0 2px rgba(255,167,38,0.2)' } : {}),
           },
-          ...(highlight ? { '& .MuiOutlinedInput-notchedOutline': { borderColor: '#FFA726' } } : {}),
         }}
       />
       <Button
@@ -205,7 +198,7 @@ function renderCommentText(text: string) {
   )
 }
 
-export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArchive, actionabilityHint }: Props) {
+export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArchive }: Props) {
   const [editingTitle, setEditingTitle] = useState(false)
   const [titleVal, setTitleVal] = useState('')
   const [editingDesc, setEditingDesc] = useState(false)
@@ -218,6 +211,7 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
   const [expandedJson, setExpandedJson] = useState<string | null>(null)
   const [copyFallbackText, setCopyFallbackText] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
+  const [patchError, setPatchError] = useState('')
   const [newCheckItem, setNewCheckItem] = useState('')
   const [checkItemAssignee, setCheckItemAssignee] = useState('')
   const [checkItemDue, setCheckItemDue] = useState('')
@@ -226,38 +220,24 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
   const [editCheckText, setEditCheckText] = useState('')
   const [editCheckAssignee, setEditCheckAssignee] = useState('')
   const [editCheckDue, setEditCheckDue] = useState('')
-  const [showRemediate, setShowRemediate] = useState(false)
-  const [remOwner, setRemOwner] = useState('')
-  const nextActionInputRef = useRef<HTMLInputElement | null>(null)
-  const [remWorkstream, setRemWorkstream] = useState('')
-  const [remOutcome, setRemOutcome] = useState('')
-  const [remAcceptance, setRemAcceptance] = useState('')
   const commentRef = useRef<HTMLInputElement>(null)
   const touchLandscape = useMediaQuery('(orientation: landscape) and (pointer: coarse)')
 
   const patch = useCallback(async (payload: Record<string, unknown>) => {
     if (!task) return
     setSaving(true)
-    const r = await fetch('/api/tasks', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: task.id, _actor: 'Jarrett', ...payload }) })
-    const updated: Task = await r.json()
-    setSaving(false)
-    onUpdate?.(updated)
+    setPatchError('')
+    try {
+      const response = await fetch('/api/tasks', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: task.id, _actor: 'Jarrett', ...payload }) })
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.operatorMessage || result.error || 'Unable to update task.')
+      onUpdate?.(result as Task)
+    } catch (error) {
+      setPatchError(error instanceof Error ? error.message : 'Unable to update task.')
+    } finally {
+      setSaving(false)
+    }
   }, [task, onUpdate])
-
-  useEffect(() => {
-    const missing = new Set((actionabilityHint?.missing || []).map((m) => String(m).toLowerCase()))
-    const shouldFocusNextAction = Boolean(
-      open
-      && missing.has('next action')
-      && !String(task?.workItem?.nextAction || '').trim(),
-    )
-    if (!shouldFocusNextAction) return
-    const t = setTimeout(() => {
-      nextActionInputRef.current?.focus()
-      nextActionInputRef.current?.select()
-    }, 30)
-    return () => clearTimeout(t)
-  }, [open, actionabilityHint, task?.workItem?.nextAction])
 
   async function archiveCard() {
     if (!task) return
@@ -272,46 +252,6 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
   }
 
   if (!task) return null
-
-  const hintMissing = new Set((actionabilityHint?.missing || []).map((m) => String(m).toLowerCase()))
-  const ownerMissingByState = !String(task.assignedAgent || '').trim()
-  const nextActionMissingByState = !String(task.workItem?.nextAction || '').trim()
-  const highlightOwner = hintMissing.has('owner') && ownerMissingByState
-  const highlightNextAction = hintMissing.has('next action') && nextActionMissingByState
-  const showActionabilityHint = Boolean(actionabilityHint && (highlightOwner || highlightNextAction))
-
-  // Determine if this card should be treated as a milestone for advisory validation.
-  const isMilestone = (task.tags || []).includes('milestone') || /\b(Milestone|Phase)\b/i.test(task.title)
-  // Compute advisory guidance (non-blocking)
-  const milestoneData = {
-    title: task.title,
-    owner: task.assignedAgent,
-    workstream: task.category,
-    category: task.category,
-    outcomeStatement: task.desc,
-    acceptanceCriteria: (task.checklist || []).map(c => c.text),
-    priority: task.priority,
-    linkedAgents: (task.tags || []).filter(t => ['projects', 'pipeline', 'docs', 'calendar'].includes(t))
-  }
-  const advisory = isMilestone ? validateMilestone(milestoneData) : { valid: true, errors: [] }
-  const stateTruth = deriveStateTruth({
-    workItem: task.workItem,
-    checklist: task.checklist,
-    executionStatus: task.execution?.executionStatus,
-    executionUpdatedAt: task.execution?.lastUpdatedAt,
-    updatedAt: task.updatedAt,
-    createdAt: task.createdAt,
-  })
-  const nextGuidance = deriveNextActionGuidance({
-    stateTruth,
-    workItem: task.workItem,
-    checklist: task.checklist,
-    executionStatus: task.execution?.executionStatus,
-    executionUpdatedAt: task.execution?.lastUpdatedAt,
-    updatedAt: task.updatedAt,
-    createdAt: task.createdAt,
-  })
-  const stateColor = stateTruth.stateLabel === 'Blocked' ? '#EF5350' : stateTruth.stateLabel === 'Waiting' ? '#FFA726' : stateTruth.stateLabel === 'Ready to close' ? '#66BB6A' : '#A8C7FA'
 
   const saveTitle = () => { if (titleVal.trim() && titleVal !== task.title) patch({ title: titleVal.trim() }); setEditingTitle(false) }
   const saveDesc = () => { if (descVal !== task.desc) patch({ desc: descVal }); setEditingDesc(false) }
@@ -367,14 +307,7 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
   const doneCount = (task.checklist || []).filter(c => c.done).length
   const totalCount = (task.checklist || []).length
   const progress = totalCount > 0 ? Math.round((doneCount / totalCount) * 100) : 0
-
-  const routeAgents = Array.from(new Set([...(task.tags || []), task.assignedAgent].filter(Boolean) as string[]))
-    .filter(id => {
-      const person = PEOPLE.find(p => p.id === id)
-      if (!person) return false
-      if (person.id === 'jarrett' || person.id === 'clawpilot') return false
-      return ['projects', 'pipeline', 'docs', 'calendar'].includes(person.id)
-    })
+  const visibleLabels = (task.tags || []).filter((tag) => AVAILABLE_LABELS.some((label) => label.id === tag))
 
   return (
     <Drawer anchor="right" open={open} onClose={onClose} PaperProps={{
@@ -399,7 +332,7 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
             <Tooltip title="Archive card">
               <IconButton onClick={archiveCard} sx={{ color: 'text.disabled', mt: -0.5 }}><ArchiveRounded sx={{ fontSize: 20 }} /></IconButton>
             </Tooltip>
-            <IconButton onClick={onClose} sx={{ color: 'text.disabled', mt: -0.5 }}><CloseRounded /></IconButton>
+            <IconButton aria-label="Close drawer" onClick={onClose} sx={{ color: 'text.disabled', mt: -0.5 }}><CloseRounded /></IconButton>
           </Box>
         </Box>
         {editingTitle ? (
@@ -413,79 +346,20 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
           <Box sx={{ display: 'flex', gap: 1, cursor: 'pointer', '&:hover .ei': { opacity: 1 } }} onClick={() => { setTitleVal(task.title); setEditingTitle(true) }}>
             <Typography variant="h6" fontWeight={700} color="text.primary" sx={{ lineHeight: 1.3, flex: 1 }}>{task.title}</Typography>
             <EditRounded className="ei" sx={{ fontSize: 16, color: 'text.disabled', opacity: 0, transition: 'opacity 0.15s', mt: 0.5, flexShrink: 0 }} />
-            {isMilestone && advisory.errors.some(e => e.path === 'title') && (
-              <Typography variant="caption" color="warning.main" sx={{ mt: 0.5 }}>{advisory.errors.find(e => e.path === 'title')?.message}</Typography>
-            )}
           </Box>
 
         )}
       </Box>
 
-        {/* Governance banner: show when server-side flagged as needing quality */}
-        {(task.tags || []).includes('needs-quality') && (
-          <Box sx={{ backgroundColor: '#3A2632', border: '1px solid rgba(239,83,80,0.14)', p: 1, borderRadius: 1, mb: 1 }}>
-            <Typography variant="body2" sx={{ color: '#FFB4B4', fontWeight: 700 }}>Governance flag: needs-quality</Typography>
-            <Typography variant="caption" sx={{ color: 'text.secondary', mb: 1, display: 'block' }}>
-              This card was automatically flagged by governance as missing recommended fields (title, description, or acceptance criteria). Please improve the card — it is visible to owners and agents.
-            </Typography>
-
-            {/* Improve card action */}
-            <Box sx={{ display: 'flex', gap: 1, mt: 1 }}>
-              <Button size="small" variant="contained" onClick={() => setShowRemediate(v => !v)} sx={{ textTransform: 'none', backgroundColor: '#FFB4B4', color: '#2A1A1A' }}>Improve card</Button>
-              <Button size="small" variant="outlined" onClick={() => { patch({ tags: (task.tags||[]).filter(t=>t!=='needs-quality'&&t!=='governance-flag') }); }} sx={{ textTransform: 'none' }}>Dismiss flag</Button>
-            </Box>
-
-            <Collapse in={showRemediate} sx={{ mt: 1 }}>
-              <Box sx={{ mt: 1, p: 1, borderRadius: 1, backgroundColor: '#242634' }}>
-                <Typography variant="caption" color="text.secondary">Quick remediation — fill the important fields below and Save (advisory only)</Typography>
-                <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1, mt: 1 }}>
-                  <Select size="small" value={remOwner} onChange={e => setRemOwner(e.target.value)} sx={{ ...selectSx }} MenuProps={menuPaper} displayEmpty>
-                    <MenuItem value="">Unassigned</MenuItem>
-                    {PEOPLE.filter(p => ASSIGNABLE_PRODUCT_AGENT_IDS.includes(p.id as typeof ASSIGNABLE_PRODUCT_AGENT_IDS[number])).map(p => <MenuItem key={p.id} value={p.id}>{p.name}</MenuItem>)}
-                  </Select>
-                  <TextField size="small" placeholder="Workstream (e.g., product, infra)" value={remWorkstream} onChange={e => setRemWorkstream(e.target.value)} sx={{ '& .MuiOutlinedInput-root': { backgroundColor: '#232330' } }} />
-                  <TextField size="small" placeholder="Outcome statement" multiline minRows={2} value={remOutcome} onChange={e => setRemOutcome(e.target.value)} sx={{ '& .MuiOutlinedInput-root': { backgroundColor: '#232330' } }} />
-                  <TextField size="small" placeholder="Acceptance criteria (one per line)" multiline minRows={2} value={remAcceptance} onChange={e => setRemAcceptance(e.target.value)} sx={{ '& .MuiOutlinedInput-root': { backgroundColor: '#232330' } }} />
-                  <Box sx={{ display: 'flex', gap: 1, justifyContent: 'flex-end' }}>
-                    <Button size="small" onClick={() => setShowRemediate(false)} sx={{ textTransform: 'none' }}>Cancel</Button>
-                    <Button size="small" variant="contained" onClick={async () => {
-                      const ac = remAcceptance.split(/\r?\n/).map(s => s.trim()).filter(Boolean)
-                      await patch({ assignedAgent: remOwner || '', workstream: remWorkstream || '', outcomeStatement: remOutcome || '', acceptanceCriteria: ac })
-                      // after save, hide remediation UI; next load will reflect governance changes
-                      setShowRemediate(false)
-                    }} sx={{ textTransform: 'none', backgroundColor: '#A8C7FA', color: '#001D36' }}>Save</Button>
-                  </Box>
-                </Box>
-              </Box>
-            </Collapse>
-          </Box>
-        )}
-
-        {/* Advisory banner (non-blocking): show when this looks like a milestone and validation is not satisfied */}
-        {isMilestone && !advisory.valid && (
-          <Box sx={{ backgroundColor: '#263244', border: '1px solid rgba(168,199,250,0.06)', p: 1, borderRadius: 1, mb: 1 }}>
-            <Typography variant="body2" sx={{ color: 'text.primary', fontWeight: 600 }}>Milestone advisory</Typography>
-            <Typography variant="caption" sx={{ color: 'text.secondary' }}>
-              This milestone is missing recommended fields — filling them improves clarity. This is advisory only and will not block saving.
-            </Typography>
-          </Box>
-        )}
 
       <Box sx={{ flex: 1, minHeight: 0, overflow: 'auto', px: { xs: 2, sm: 3 }, py: 2.5, pb: 'calc(env(safe-area-inset-bottom) + 20px)', display: 'flex', flexDirection: 'column', gap: 2.5, WebkitOverflowScrolling: 'touch' }}>
+
+        {patchError && <Alert severity="warning" onClose={() => setPatchError('')} sx={{ borderRadius: 1 }}>{patchError}</Alert>}
 
         {/* Details */}
         <Box>
           <Typography variant="overline" color="text.disabled" sx={{ fontSize: '0.65rem', letterSpacing: 1.5, display: 'block', mb: 1.5 }}>DETAILS</Typography>
           <Stack spacing={1.25}>
-            <Stack direction="row" alignItems="center" spacing={1} sx={{ ml: '80px' }}>
-              <Chip
-                size="small"
-                label={stateTruth.stateLabel}
-                sx={{ height: 22, fontSize: '0.68rem', borderRadius: 1.2, backgroundColor: `${stateColor}22`, color: stateColor, border: 'none' }}
-              />
-              <Typography variant="caption" color="text.secondary">— {stateTruth.reason}</Typography>
-            </Stack>
-            <Typography variant="caption" color="text.secondary" sx={{ ml: '80px', display: 'block' }}>👉 Next: {nextGuidance}</Typography>
             <Stack direction="row" alignItems="center" spacing={2}>
               <Typography variant="body2" color="text.disabled" sx={{ minWidth: 80, fontSize: '0.8rem' }}>Status</Typography>
               <Select size="small" value={task.status} onChange={e => patch({ status: e.target.value })} sx={selectSx} MenuProps={menuPaper}>
@@ -522,7 +396,7 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
             </Stack>
             <Stack direction="row" alignItems="center" spacing={2}>
               <Typography variant="body2" color="text.disabled" sx={{ minWidth: 80, fontSize: '0.8rem' }}>Assignee</Typography>
-              <Select size="small" value={task.assignedAgent || ''} onChange={e => patch({ assignedAgent: e.target.value })} sx={{ ...selectSx, ...(highlightOwner ? { '& .MuiOutlinedInput-notchedOutline': { borderColor: '#FFA726' }, boxShadow: '0 0 0 2px rgba(255,167,38,0.2)' } : {}) }} MenuProps={menuPaper} displayEmpty renderValue={v => v ? (
+              <Select size="small" value={task.assignedAgent || ''} onChange={e => patch({ assignedAgent: e.target.value })} sx={selectSx} MenuProps={menuPaper} displayEmpty renderValue={v => v ? (
                 <Stack direction="row" spacing={1} alignItems="center">
                   <PersonAvatar personId={v as string} size={20} />
                   <span>{PEOPLE.find(p => p.id === v)?.name || PEOPLE.find(p => p.name === v)?.name || v as string}</span>
@@ -539,32 +413,14 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
                 ))}
               </Select>
             </Stack>
-            {task.execution?.assignedAgent && (
-              <Stack direction="row" alignItems="center" spacing={2}>
-                <Typography variant="body2" color="text.disabled" sx={{ minWidth: 80, fontSize: '0.8rem' }}>Execution</Typography>
-                <Stack direction="row" spacing={1} alignItems="center">
-                  <PersonAvatar personId={task.execution.assignedAgent} size={20} />
-                  <Typography variant="body2" sx={{ fontSize: '0.8rem' }}>
-                    {PEOPLE.find(p => p.id === task.execution?.assignedAgent)?.name || task.execution.assignedAgent}
-                  </Typography>
-                </Stack>
-              </Stack>
-            )}
             <Stack direction="row" alignItems="center" spacing={2}>
               <Typography variant="body2" color="text.disabled" sx={{ minWidth: 80, fontSize: '0.8rem' }}>Next action</Typography>
               <NextActionEditor
                 key={`${task.id}:${task.workItem?.nextAction || ''}`}
                 initialValue={task.workItem?.nextAction || ''}
-                highlight={highlightNextAction}
-                inputRef={nextActionInputRef}
                 onSave={(value) => patch({ nextAction: value })}
               />
             </Stack>
-            {showActionabilityHint && (
-              <Typography variant="caption" sx={{ ml: '80px', color: '#FFA726', display: 'block' }}>
-                👉 {actionabilityHint?.message}
-              </Typography>
-            )}
             {(task.workItem?.lastConcreteAction || task.workItem?.waitingOn) && (
               <Box sx={{ ml: '80px', p: 1, borderRadius: 1.5, backgroundColor: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.06)' }}>
                 {task.workItem?.lastConcreteAction && (
@@ -614,8 +470,8 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
             </IconButton>
           </Box>
           <Stack direction="row" flexWrap="wrap" gap={0.75}>
-            {(task.tags || []).length === 0 && <Typography variant="caption" color="text.disabled">No labels — tap + to add</Typography>}
-            {(task.tags || []).map(tag => {
+            {visibleLabels.length === 0 && <Typography variant="caption" color="text.disabled">No labels — tap + to add</Typography>}
+            {visibleLabels.map(tag => {
               const def = AVAILABLE_LABELS.find(l => l.id === tag)
               return <Chip key={tag} size="small" label={def?.label || tag} onDelete={() => { const next = (task.tags||[]).filter(t=>t!==tag); patch({ tags: next }) }}
                 sx={{ height: 24, fontSize: '0.7rem', borderRadius: 1.5, border: 'none', backgroundColor: (def?.color||'#A8C7FA')+'22', color: def?.color||'#A8C7FA', '& .MuiChip-deleteIcon': { fontSize: 14, color: def?.color||'#A8C7FA', opacity: 0.7 } }} />
@@ -633,30 +489,6 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
             </Stack>
           </Popover>
         </Box>
-
-        <Divider sx={{ borderColor: 'rgba(255,255,255,0.06)' }} />
-
-        {/* Routing */}
-        {routeAgents.length > 0 && (
-          <Box>
-            <Typography variant="overline" color="text.disabled" sx={{ fontSize: '0.65rem', letterSpacing: 1.5, display: 'block', mb: 1 }}>ROUTING</Typography>
-            <Stack direction="row" spacing={1} flexWrap="wrap">
-              {routeAgents.map(id => {
-                const person = PEOPLE.find(p => p.id === id)
-                if (!person) return null
-                return (
-                  <Chip
-                    key={id}
-                    size="small"
-                    icon={<SmartToyRounded sx={{ fontSize: 14, color: person.color }} />}
-                    label={person.name}
-                    sx={{ height: 24, fontSize: '0.7rem', borderRadius: 1.5, border: 'none', backgroundColor: person.color + '22', color: person.color }}
-                  />
-                )
-              })}
-            </Stack>
-          </Box>
-        )}
 
         <Divider sx={{ borderColor: 'rgba(255,255,255,0.06)' }} />
 

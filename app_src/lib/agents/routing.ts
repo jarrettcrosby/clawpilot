@@ -13,11 +13,11 @@ export const PRODUCT_TO_EXECUTION: Record<ProductAgentId, string> = {
 }
 
 export const PRODUCT_AGENTS = [
-  { id: 'projects' as const, name: 'Projects', owner: 'Execution', kind: 'product' as const, executionAgentId: PRODUCT_TO_EXECUTION.projects, summary: 'Monitors open cards, due dates, and recommends priority sequencing.' },
-  { id: 'pipeline' as const, name: 'Pipeline', owner: 'Revenue', kind: 'product' as const, executionAgentId: PRODUCT_TO_EXECUTION.pipeline, summary: 'Maintains pipeline hygiene, reminders, and follow-up nudges.' },
-  { id: 'docs' as const, name: 'Docs', owner: 'Knowledge', kind: 'product' as const, executionAgentId: PRODUCT_TO_EXECUTION.docs, summary: 'Maintains ClawPilot daily journal and business sections in the document module.' },
-  { id: 'calendar' as const, name: 'Calendar', owner: 'Scheduling', kind: 'product' as const, executionAgentId: PRODUCT_TO_EXECUTION.calendar, summary: 'Manages calendars, detects conflicts, proposes reschedules, and drafts invite replies.' },
-  { id: 'clawpilot' as const, name: 'ClawPilot', owner: 'Orchestrator', kind: 'orchestrator' as const, executionAgentId: PRODUCT_TO_EXECUTION.clawpilot, summary: 'Reviews task context, decides the next move, and delegates execution to a product agent when needed.' },
+  { id: 'projects' as const, name: 'Projects', owner: 'Execution', kind: 'product' as const, executionAgentId: PRODUCT_TO_EXECUTION.projects, summary: 'Plans and sequences assigned project work.' },
+  { id: 'pipeline' as const, name: 'Pipeline', owner: 'Revenue', kind: 'product' as const, executionAgentId: PRODUCT_TO_EXECUTION.pipeline, summary: 'Reviews assigned pipeline work and drafts follow-up.' },
+  { id: 'docs' as const, name: 'Docs', owner: 'Knowledge', kind: 'product' as const, executionAgentId: PRODUCT_TO_EXECUTION.docs, summary: 'Drafts task-linked working documentation.' },
+  { id: 'calendar' as const, name: 'Calendar', owner: 'Scheduling', kind: 'product' as const, executionAgentId: PRODUCT_TO_EXECUTION.calendar, summary: 'Reviews scheduling work and drafts proposed changes.' },
+  { id: 'clawpilot' as const, name: 'ClawPilot', owner: 'Orchestrator', kind: 'orchestrator' as const, executionAgentId: PRODUCT_TO_EXECUTION.clawpilot, summary: 'Reviews task context and proposes the next concrete move.' },
 ]
 
 const LEGACY_PRODUCT_MAP: Record<string, ProductAgentId> = {

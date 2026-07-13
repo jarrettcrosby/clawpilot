@@ -10,26 +10,19 @@ import Tooltip from '@mui/material/Tooltip'
 import Popover from '@mui/material/Popover'
 import MenuItem from '@mui/material/MenuItem'
 import ButtonBase from '@mui/material/ButtonBase'
-import FlagRounded from '@mui/icons-material/FlagRounded'
 import OpenInFullRounded from '@mui/icons-material/OpenInFullRounded'
 import DragIndicatorRounded from '@mui/icons-material/DragIndicatorRounded'
 import PersonAddAlt1Rounded from '@mui/icons-material/PersonAddAlt1Rounded'
 import CalendarTodayRounded from '@mui/icons-material/CalendarTodayRounded'
-import SmartToyRounded from '@mui/icons-material/SmartToyRounded'
 import ForumRounded from '@mui/icons-material/ForumRounded'
-import ArrowForwardRounded from '@mui/icons-material/ArrowForwardRounded'
 import { useSortable } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
 import type { Task } from '@/lib/types'
 import { ASSIGNABLE_PRODUCT_AGENT_IDS, PRIORITY_COLORS, PRIORITY_LABELS, PEOPLE } from '@/lib/types'
 import { useBoardContext } from './KanbanBoard'
 import { displayCategory } from '@/lib/format'
-import { deriveNextActionGuidance, deriveStateTruth } from '@/lib/workItemModel'
-import { deriveLiveState, formatLiveActivityAge } from '@/lib/liveState'
 
 type Props = { task: Task }
-
-const STATUS_ORDER: Task['status'][] = ['backlog', 'todo', 'in-progress', 'review', 'done']
 
 export default function KanbanCard({ task }: Props) {
   const { focusedTaskId, setFocusedTaskId, openDrawer, updateTask } = useBoardContext()
@@ -37,54 +30,8 @@ export default function KanbanCard({ task }: Props) {
   const isFocused = focusedTaskId === task.id
   const isTouch = useMediaQuery('(pointer: coarse)')
 
-  const routeAgents = Array.from(new Set([...(task.tags || []), task.assignedAgent].filter(Boolean) as string[]))
-    .filter(id => {
-      const person = PEOPLE.find(p => p.id === id)
-      if (!person) return false
-      if (person.id === 'jarrett' || person.id === 'clawpilot') return false
-      return ['projects', 'pipeline', 'docs', 'calendar'].includes(person.id)
-    })
-
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: task.id })
-  const stateTruth = deriveStateTruth({
-    workItem: task.workItem,
-    checklist: task.checklist,
-    executionStatus: task.execution?.executionStatus,
-    executionUpdatedAt: task.execution?.lastUpdatedAt,
-    updatedAt: task.updatedAt,
-    createdAt: task.createdAt,
-  })
-  const nextGuidance = deriveNextActionGuidance({
-    stateTruth,
-    workItem: task.workItem,
-    checklist: task.checklist,
-    executionStatus: task.execution?.executionStatus,
-    executionUpdatedAt: task.execution?.lastUpdatedAt,
-    updatedAt: task.updatedAt,
-    createdAt: task.createdAt,
-  })
-  const stateColor = stateTruth.stateLabel === 'Blocked' ? '#EF5350' : stateTruth.stateLabel === 'Waiting' ? '#FFA726' : stateTruth.stateLabel === 'Ready to close' ? '#66BB6A' : '#A8C7FA'
-  const liveState = deriveLiveState(task)
-  const freshnessMeta = liveState.freshnessState === 'active'
-    ? { label: 'Active', color: '#66BB6A', bg: 'rgba(102,187,106,0.2)' }
-    : liveState.freshnessState === 'aging'
-      ? { label: 'Aging', color: '#FFA726', bg: 'rgba(255,167,38,0.2)' }
-      : { label: 'Stale', color: '#EF5350', bg: 'rgba(239,83,80,0.2)' }
-  const needsOwner = !task.archived && task.status !== 'done' && !task.assignedAgent
-  const isActiveStale = !task.archived && task.status !== 'done' && liveState.freshnessState === 'stale'
   const showCategoryChip = Boolean(task.category) && task.category !== 'clawpilot'
-  const showPriorityChip = task.priority !== 'low'
-  const lowSignalMetadataTags = new Set([
-    'agents',
-    'needs-quality',
-    'stale-again',
-    ...ASSIGNABLE_PRODUCT_AGENT_IDS,
-    'jarrett',
-    'clawpilot',
-  ])
-  const metadataTags = (task.tags || []).filter(tag => !lowSignalMetadataTags.has(tag))
-  const visibleTagChips = metadataTags.slice(0, 1)
-  const hiddenTagCount = Math.max(0, metadataTags.length - visibleTagChips.length)
 
   const style = {
     transform: CSS.Transform.toString(transform),
@@ -111,19 +58,6 @@ export default function KanbanCard({ task }: Props) {
     }, 120)
   }
 
-  async function moveToNextStatus() {
-    const idx = STATUS_ORDER.indexOf(task.status)
-    if (idx < 0 || idx >= STATUS_ORDER.length - 1) return
-    const nextStatus = STATUS_ORDER[idx + 1]
-    const r = await fetch('/api/tasks', {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id: task.id, status: nextStatus, _actor: 'ClawPilot' }),
-    })
-    const updated = await r.json()
-    if (r.ok) updateTask(updated)
-  }
-
   return (
     <div ref={setNodeRef} style={style}>
       <Box
@@ -139,15 +73,13 @@ export default function KanbanCard({ task }: Props) {
             ? 'rgba(168,199,250,0.4)'
             : isFocused
               ? 'rgba(168,199,250,0.6)'
-              : isActiveStale
-                ? 'rgba(239,83,80,0.45)'
-                : 'rgba(255,255,255,0.06)',
+              : 'rgba(255,255,255,0.06)',
           boxShadow: isFocused
             ? '0 0 0 2px rgba(168,199,250,0.15)'
             : isDragging
               ? '0 8px 24px rgba(0,0,0,0.4)'
               : 'none',
-          borderRadius: 3, p: 1.75, mb: 1.25, userSelect: 'none',
+          borderRadius: 1, p: 1.75, mb: 1.25, userSelect: 'none',
           touchAction: 'auto',
           cursor: 'pointer',
           transition: 'border-color 0.15s, box-shadow 0.15s',
@@ -169,13 +101,7 @@ export default function KanbanCard({ task }: Props) {
               <DragIndicatorRounded sx={{ fontSize: { xs: 22, md: 18 } }} />
             </Box>
           </Tooltip>
-          <FlagRounded sx={{ fontSize: 14, color: PRIORITY_COLORS[task.priority] }} />
           <Box sx={{ flex: 1 }} />
-
-          {/* Governance indicator */}
-          {(task.tags || []).includes('needs-quality') && (
-            <Box sx={{ width: 10, height: 10, borderRadius: '50%', backgroundColor: '#EF5350', mr: 0.5 }} />
-          )}
 
           {/* Expand — opens drawer */}
           <Tooltip title="Open detail (Enter)">
@@ -199,81 +125,24 @@ export default function KanbanCard({ task }: Props) {
           {task.desc}
         </Typography>
 
-        <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.6, mb: 0.35 }}>
-          <Chip
-            size="small"
-            label={stateTruth.stateLabel}
-            sx={{ height: 20, fontSize: '0.62rem', borderRadius: 1, backgroundColor: `${stateColor}22`, color: stateColor, border: 'none' }}
-          />
-          <Typography variant="caption" color="text.secondary" sx={{ fontSize: '0.68rem', lineHeight: 1.2 }}>— {stateTruth.reason}</Typography>
-        </Box>
-        <Typography variant="caption" color="text.secondary" sx={{ display: 'block', fontSize: '0.66rem', mb: 0.6 }}>👉 Next: {nextGuidance}</Typography>
-
-        <Box sx={{ mt: 0.25, mb: 0.6 }}>
-          <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, flexWrap: 'wrap' }}>
-            <Typography variant="caption" color="text.secondary" sx={{ fontSize: '0.64rem' }}>
-              {liveState.owner} · {formatLiveActivityAge(liveState.lastActivityAt)}
-            </Typography>
-            <Chip
-              size="small"
-              label={freshnessMeta.label}
-              sx={{ height: 18, fontSize: '0.58rem', backgroundColor: freshnessMeta.bg, color: freshnessMeta.color, border: 'none' }}
-            />
-          </Box>
-          {isActiveStale && (
-            <Chip size="small" label="Needs update" sx={{ mt: 0.4, height: 18, fontSize: '0.6rem', backgroundColor: 'rgba(239,83,80,0.22)', color: '#EF9A9A' }} />
-          )}
-          {liveState.staleAgain && (
-            <Chip size="small" label="Stale again" sx={{ mt: 0.4, height: 18, fontSize: '0.6rem', backgroundColor: 'rgba(255,167,38,0.2)', color: '#FFA726' }} />
-          )}
-          {needsOwner && (
-            <Chip size="small" label="Needs owner" sx={{ mt: 0.4, height: 18, fontSize: '0.6rem', backgroundColor: 'rgba(244,67,54,0.16)', color: '#EF9A9A' }} />
-          )}
-        </Box>
+        {task.workItem?.nextAction && (
+          <Typography variant="caption" color="text.secondary" sx={{ display: '-webkit-box', WebkitLineClamp: 1, WebkitBoxOrient: 'vertical', overflow: 'hidden', fontSize: '0.66rem', mb: 0.75 }}>
+            Next: {task.workItem.nextAction}
+          </Typography>
+        )}
 
         <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5, mt: 1 }}>
           {showCategoryChip && (
             <Chip size="small" label={displayCategory(task.category)} variant="outlined"
               sx={{ height: 20, fontSize: '0.65rem', borderColor: 'rgba(255,255,255,0.1)', color: 'text.disabled', borderRadius: 1 }} />
           )}
-          {showPriorityChip && (
-            <Chip size="small" label={PRIORITY_LABELS[task.priority]}
-              sx={{ height: 20, fontSize: '0.65rem', borderRadius: 1, backgroundColor: PRIORITY_COLORS[task.priority] + '22', color: PRIORITY_COLORS[task.priority], border: 'none' }} />
-          )}
-          {visibleTagChips.map(tag => (
-            <Chip key={tag} size="small" label={tag}
-              sx={{ height: 20, fontSize: '0.65rem', borderRadius: 1, backgroundColor: 'rgba(168,199,250,0.08)', color: '#A8C7FA', border: 'none' }} />
-          ))}
-          {hiddenTagCount > 0 && (
-            <Chip
-              size="small"
-              label={`+${hiddenTagCount} tag${hiddenTagCount === 1 ? '' : 's'}`}
-              variant="outlined"
-              sx={{ height: 20, fontSize: '0.62rem', borderRadius: 1, borderColor: 'rgba(255,255,255,0.12)', color: 'text.disabled' }}
-            />
-          )}
+          <Chip size="small" label={PRIORITY_LABELS[task.priority]}
+            sx={{ height: 20, fontSize: '0.65rem', borderRadius: 1, backgroundColor: PRIORITY_COLORS[task.priority] + '22', color: PRIORITY_COLORS[task.priority], border: 'none' }} />
         </Box>
 
-        {routeAgents.length > 0 && (
-          <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, mt: 0.75 }}>
-            <SmartToyRounded sx={{ fontSize: 12, color: '#CFC6EA' }} />
-            {routeAgents.slice(0, 2).map(id => {
-              const person = PEOPLE.find(p => p.id === id)
-              if (!person) return null
-              return (
-                <Typography key={id} variant="caption" sx={{ color: person.color, fontSize: '0.65rem' }}>{person.name}</Typography>
-              )
-            })}
-            {routeAgents.length > 2 && (
-              <Typography variant="caption" sx={{ color: 'text.disabled', fontSize: '0.65rem' }}>+{routeAgents.length - 2}</Typography>
-            )}
-          </Box>
-        )}
-
         {/* Assignee + Due Date */}
-        {(task.assignedAgent || task.dueDate) && (
-          <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mt: 1, pt: 1, borderTop: '1px solid rgba(255,255,255,0.05)' }}>
-            {task.assignedAgent ? (() => {
+        <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mt: 1, pt: 1, borderTop: '1px solid rgba(255,255,255,0.05)' }}>
+          {task.assignedAgent ? (() => {
               const assigned = task.assignedAgent
               const p = PEOPLE.find(x => x.id === assigned || x.name === assigned)
               const color = p?.color || '#A8C7FA'
@@ -287,14 +156,14 @@ export default function KanbanCard({ task }: Props) {
                   <Typography variant="caption" sx={{ color: 'text.disabled', fontSize: '0.68rem' }}>{label}</Typography>
                 </Box>
               )
-            })() : (
-              <Tooltip title="Assign task">
-                <IconButton size="small" onClick={(e) => { e.stopPropagation(); setAssignAnchor(e.currentTarget) }} sx={{ p: 0.3, color: 'rgba(255,255,255,0.45)', '&:hover': { color: '#A8C7FA', backgroundColor: 'rgba(168,199,250,0.08)' } }}>
-                  <PersonAddAlt1Rounded sx={{ fontSize: 15 }} />
-                </IconButton>
-              </Tooltip>
-            )}
-            {task.dueDate && (() => {
+          })() : (
+            <Tooltip title="Assign task">
+              <IconButton size="small" onClick={(e) => { e.stopPropagation(); setAssignAnchor(e.currentTarget) }} sx={{ p: 0.3, color: 'rgba(255,255,255,0.45)', '&:hover': { color: '#A8C7FA', backgroundColor: 'rgba(168,199,250,0.08)' } }}>
+                <PersonAddAlt1Rounded sx={{ fontSize: 15 }} />
+              </IconButton>
+            </Tooltip>
+          )}
+          {task.dueDate && (() => {
               const due = new Date(task.dueDate + 'T12:00:00')
               const now = new Date()
               const isOverdue = due < now
@@ -307,25 +176,10 @@ export default function KanbanCard({ task }: Props) {
                   <Typography variant="caption" sx={{ color, fontSize: '0.68rem', fontWeight: isOverdue || isSoon ? 600 : 400 }}>{label}</Typography>
                 </Box>
               )
-            })()}
-          </Box>
-        )}
+          })()}
+        </Box>
 
         <Box sx={{ display: 'flex', justifyContent: 'flex-end', gap: 0.6, mt: 0.6 }}>
-          {task.status !== 'done' && (
-            <ButtonBase
-              onClick={(e) => { e.stopPropagation(); moveToNextStatus() }}
-              sx={{
-                display: 'inline-flex', alignItems: 'center', gap: 0.5,
-                px: 0.75, py: 0.35, borderRadius: 1,
-                border: '1px solid rgba(255,255,255,0.2)', color: 'rgba(255,255,255,0.75)',
-                fontSize: '0.66rem', '&:hover': { backgroundColor: 'rgba(255,255,255,0.06)' },
-              }}
-            >
-              <ArrowForwardRounded sx={{ fontSize: 12 }} />
-              Next
-            </ButtonBase>
-          )}
           {task.assignedAgent && (
             <ButtonBase
               onClick={(e) => { e.stopPropagation(); openAgentChat() }}

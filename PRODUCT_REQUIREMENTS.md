@@ -340,3 +340,13 @@ Define runtime-true requirements for agent routing, assignment, execution, write
 - When stale in-progress cards are detected, Projects must provide a one-click `Focus stale only` toggle in the stale banner.
 - Enabling stale focus temporarily filters the board to only stale in-progress candidates, so owners can triage stale work without manual multi-filter setup.
 - Stale focus must auto-reset when no stale candidates remain.
+
+## PR-027 Simplified Operational Workflow (supersedes PR-019 through PR-026)
+- Projects is one kanban workflow: create, search/filter, assign, edit, drag status, review, complete, and archive.
+- Cards show only title, description, priority/category, assigned agent, due date, next action, checklist progress, and a task-linked chat action.
+- Governance flags, legends, consolidation proposals, now-working panels, stale detection, startability filters, auto-pickup, execute-once, dispatch audits, and quick-advance controls are removed from Projects.
+- Reading tasks must never mutate, hide, retag, or move cards. An attempted active-state move that lacks an owner or next action is rejected explicitly and leaves the card unchanged.
+- Backlog creation requires only a meaningful title. Acceptance criteria supplied by an API client are stored as checklist items when no checklist is provided.
+- A task has one product-agent assignment. Agent threads must match that assignment and persist messages and result writeback against the task.
+- Agent status reflects the hosted provider truthfully. OpenAI Responses API is used only with a valid server-side API key; otherwise messaging is disabled and no synthetic reply is generated.
+- Custom GPTs are not treated as an externally callable runtime. ChatGPT-side Actions or MCP integration is a separate reverse-integration path.

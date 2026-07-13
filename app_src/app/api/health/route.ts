@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server'
 import fs from 'fs'
+import { getAgentRuntime } from '@/lib/agents/provider'
 import { getStorageDriver, isHostedRuntime } from '@/lib/persistence/config'
 import { query } from '@/lib/persistence/postgres'
 import { readPipelineOutboxWorkerHeartbeatFromPostgres } from '@/lib/persistence/pipeline'
@@ -158,6 +159,7 @@ export async function GET() {
       worker,
       capabilities: {
         openClawExecution: process.env.CLAWPILOT_EXECUTION_ENABLED === '1',
+        agentRuntime: getAgentRuntime(),
       },
       checkedAt,
     }, { status: errors.length > 0 ? 503 : 200 })

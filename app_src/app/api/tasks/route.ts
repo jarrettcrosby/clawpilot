@@ -3,7 +3,6 @@ import fs from 'fs'
 import path from 'path'
 import type { Task, ActivityEntry, Comment, ChecklistItem } from '@/lib/types'
 import { ensureNotFrozen } from '@/lib/freeze'
-import { buildGovernanceAdvisory } from '@/lib/governanceAdvisory'
 import { normalizeProductAgentId } from '@/lib/agents/routing'
 import { normalizeExecutionStatus } from '@/lib/taskState'
 import type { ExecutionStatus } from '@/lib/taskState'
@@ -374,45 +373,6 @@ function hasMeaningfulTitle(input: unknown): boolean {
   return meaningful.length >= 3
 }
 
-function isTaskQualityInvalid(task: Partial<Task> & { acceptanceCriteria?: unknown }): boolean {
-  const title = String(task.title || '').trim()
-  const desc = String(task.desc || '')
-  const acceptanceCriteria = normalizeAcceptanceCriteria(task.acceptanceCriteria)
-  const checklistCount = Array.isArray(task.checklist) ? task.checklist.filter((x) => String((x as ChecklistItem)?.text || '').trim()).length : 0
-
-  if (!hasMeaningfulTitle(title)) return true
-  if (!desc.trim() || isPlaceholderValue(desc)) return true
-  if (isPlaceholderValue(title)) return true
-  if (acceptanceCriteria.length === 0 && checklistCount === 0) return true
-
-  return false
-}
-
-// Tiered gating: hard-block only obvious junk. Governance labels alone remain visible.
-function isHardBlockTask(task: Partial<Task> & { acceptanceCriteria?: unknown }): boolean {
-  const title = String(task.title || '').trim()
-  const desc = String(task.desc || '').trim()
-  const acceptanceCriteria = normalizeAcceptanceCriteria(task.acceptanceCriteria)
-  const checklistCount = Array.isArray(task.checklist) ? task.checklist.filter((x) => String((x as ChecklistItem)?.text || '').trim()).length : 0
-  const hasAcceptance = acceptanceCriteria.length > 0 || checklistCount > 0
-
-  const badTitle = !title || isPlaceholderValue(title) || !hasMeaningfulTitle(title)
-  const badDesc = !desc || isPlaceholderValue(desc)
-
-  // Obvious junk threshold: placeholder/empty title, OR no meaningful desc + no acceptance criteria.
-  return badTitle || (badDesc && !hasAcceptance)
-}
-
-function parseAgentFromText(text: string): string | null {
-  const t = text.toLowerCase()
-  if (/\bprojects?\b/.test(t)) return 'projects'
-  if (/\bpipeline\b/.test(t)) return 'pipeline'
-  if (/\bdocs?\b/.test(t)) return 'docs'
-  if (/\bcalendar\b/.test(t)) return 'calendar'
-  if (/\bclawpilot\b/.test(t)) return 'clawpilot'
-  return null
-}
-
 function parseChecklistFromDirective(text: string): { text: string; done?: boolean }[] {
   return String(text || '')
     .split(/\r?\n/)
@@ -437,13 +397,12 @@ function buildTaskIntent(body: TaskBody): TaskIntent {
   ])]
 
   const assignedAgentId = normalizeProductAgentId(body.assignedAgent ? String(body.assignedAgent).trim() : '')
-    || parseAgentFromText(`${title}\n${directive}`)
     || ''
   const assignedAgentIdFinal = assignedAgentId || null
 
-  const status = toStatus(body.status || (directive ? 'in-progress' : 'backlog'))
-  const priority = toPriority(body.priority || (directive ? 'high' : 'medium'))
-  const category = toCategory(body.category || (directive ? 'clawpilot' : 'clawpilot'))
+  const status = toStatus(body.status || 'backlog')
+  const priority = toPriority(body.priority || 'medium')
+  const category = toCategory(body.category || 'clawpilot')
   const dueDate = body.dueDate ? String(body.dueDate) : null
 
   return { title, description, status, priority, category, labels, checklist, assignedAgentId: assignedAgentIdFinal, dueDate }
@@ -452,83 +411,8 @@ function buildTaskIntent(body: TaskBody): TaskIntent {
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url)
   const includeArchived = searchParams.get('includeArchived') === 'true'
-  const includeQuarantined = searchParams.get('includeQuarantined') === 'true'
   const tasks = await readTasks()
-
-  const now = new Date().toISOString()
-  let mutated = false
-  const repaired = tasks.map((task) => {
-    let nextTask = { ...task }
-
-    if (isActiveColumnStatus(nextTask.status)) {
-      const missing = deriveMissingActionableFields(nextTask)
-      if (missing.length > 0) {
-        nextTask = {
-          ...nextTask,
-          status: 'backlog',
-          updatedAt: now,
-          activity: [
-            ...(nextTask.activity || []),
-            {
-              type: 'updated',
-              message: `Actionable Intake Guard: kept in backlog. Missing: ${missing.join(' and ')}`,
-              timestamp: now,
-              actor: 'Governance',
-              taskId: nextTask.id,
-              taskTitle: nextTask.title,
-            },
-          ],
-        }
-        mutated = true
-      }
-    }
-
-    if (!isHardBlockTask(nextTask)) return nextTask
-
-    let taskChanged = false
-    const tags = Array.isArray(nextTask.tags) ? [...nextTask.tags] : []
-    if (!tags.includes('governance-flag')) { tags.push('governance-flag'); taskChanged = true }
-    if (!tags.includes('needs-quality')) { tags.push('needs-quality'); taskChanged = true }
-
-    const hasBlockActivity = Array.isArray(nextTask.activity)
-      ? nextTask.activity.some((a) => String(a?.message || '').includes('Task blocked due to missing required fields'))
-      : false
-
-    const activity = Array.isArray(nextTask.activity) ? [...nextTask.activity] : []
-    if (!hasBlockActivity) {
-      activity.push({
-        type: 'updated',
-        message: 'Task blocked due to missing required fields',
-        timestamp: now,
-        actor: 'Governance',
-        taskId: nextTask.id,
-        taskTitle: nextTask.title,
-      })
-      taskChanged = true
-    }
-
-    if (taskChanged) mutated = true
-
-    return {
-      ...nextTask,
-      tags,
-      activity,
-      updatedAt: taskChanged ? now : nextTask.updatedAt,
-    }
-  })
-
-  if (mutated) await writeTasks(repaired)
-
-  const base = includeArchived ? repaired : repaired.filter(t => !t.archived)
-  if (includeQuarantined) return NextResponse.json(base)
-
-  // Tiered gating: hide only hard-block backlog/todo junk; keep governance-warning cards visible.
-  const filtered = base.filter((task) => {
-    const hardBlocked = isHardBlockTask(task)
-    if (!hardBlocked) return true
-    return !['backlog', 'todo'].includes(task.status)
-  })
-  return NextResponse.json(filtered)
+  return NextResponse.json(includeArchived ? tasks : tasks.filter((task) => !task.archived))
 }
 
 export async function POST(req: NextRequest) {
@@ -616,79 +500,54 @@ export async function POST(req: NextRequest) {
   const workstream = body.workstream ? String(body.workstream).toLowerCase() : undefined
   const outcomeStatement = body.outcomeStatement ? String(body.outcomeStatement).trim() : undefined
   const acceptanceCriteria = normalizeAcceptanceCriteria(body.acceptanceCriteria)
-
-  const qualityInvalid = (
-    !hasMeaningfulTitle(title)
-    || !String(desc || '').trim()
-    || isPlaceholderValue(desc)
-    || isPlaceholderValue(title)
-    || (acceptanceCriteria.length === 0 && intent.checklist.length === 0)
-  )
-
-  if (qualityInvalid) {
-    return NextResponse.json({
-      error: 'Task quality validation failed',
-      blocked: true,
-      policyCode: 'TASK_INVALID_QUALITY',
-      operatorMessage: 'Task must include meaningful title, description, and acceptance criteria.',
-    }, { status: 400 })
-  }
-
-  const governance = buildGovernanceAdvisory({
-    title,
-    description: desc,
-    checklistCount: intent.checklist.length,
-    assignee: intent.assignedAgentId || undefined,
-    category,
-    workstream,
-    outcomeStatement,
-    acceptanceCriteria,
-  }, tasks)
-
-
-  // Option 1 mapping: keep primary assignee on task, track extra delegated work in checklist/tags
-  const delegatedAgents = normalizeTags(body.delegatedAgents)
-    .map((agentId) => normalizeProductAgentId(agentId) || agentId)
-  const assignedAgent = intent.assignedAgentId || undefined
   const explicitNextAction = String(
     body.nextAction
     || ((body.workItem && typeof body.workItem === 'object') ? (body.workItem as Record<string, unknown>).nextAction : '')
     || '',
   ).trim()
 
-  const checklist = intent.checklist.map((c, i) => ({ id: `${id}-ck-${i}`, text: c.text, done: !!c.done })) as ChecklistItem[]
+  if (!hasMeaningfulTitle(title)) {
+    return NextResponse.json({
+      error: 'Task quality validation failed',
+      blocked: true,
+      policyCode: 'TASK_INVALID_QUALITY',
+      operatorMessage: 'Task must include a meaningful title.',
+    }, { status: 400 })
+  }
+
+  const assignedAgent = intent.assignedAgentId || undefined
+
+  const checklistInput = intent.checklist.length > 0
+    ? intent.checklist
+    : acceptanceCriteria.map((text) => ({ text, done: false }))
+  const checklist = checklistInput.map((c, i) => ({ id: `${id}-ck-${i}`, text: c.text, done: !!c.done })) as ChecklistItem[]
+
+  const activeMissing = isActiveColumnStatus(status)
+    ? [
+        ...(!String(desc || '').trim() || isPlaceholderValue(desc) ? ['description'] : []),
+        ...(!assignedAgent ? ['owner'] : []),
+        ...(!explicitNextAction ? ['next action'] : []),
+      ]
+    : []
+  if (activeMissing.length > 0) {
+    return NextResponse.json({
+      error: 'Active task is missing required operating context',
+      blocked: true,
+      policyCode: 'TASK_NOT_ACTIONABLE',
+      operatorMessage: `Add ${activeMissing.join(', ')} before moving this task into active work.`,
+      missing: activeMissing,
+    }, { status: 400 })
+  }
 
   const activity: ActivityEntry[] = [
     { type: 'created', message: 'Card created', timestamp: now, actor, taskId: id, taskTitle: title },
   ]
   const comments: Comment[] = []
 
-  // If governance advisory found missing milestone-quality fields, mark the task with triage tags
-  try {
-    if (governance?.missingMilestoneFields && Array.isArray(governance.missingMilestoneFields) && governance.missingMilestoneFields.length > 0) {
-      if (!tags.includes('needs-quality')) tags.push('needs-quality')
-      if (!tags.includes('governance-flag')) tags.push('governance-flag')
-      const govMsg = `Governance: missing fields: ${governance.missingMilestoneFields.join(', ')}`
-      comments.push({ id: `${id}-gov-1`, text: govMsg, createdAt: now, timestamp: now, author: 'Governance' })
-      activity.push({ type: 'comment', message: govMsg, timestamp: now, actor: 'Governance' })
-    }
-  } catch {
-    // non-destructive — ignore governance errors
-  }
-
   const initialComment = String(body.initialComment || '').trim()
   if (initialComment) {
     comments.push({ id: `${id}-c1`, text: initialComment, createdAt: now, timestamp: now, author: actor })
     activity.push({ type: 'comment', message: `Commented: "${initialComment.slice(0, 60)}${initialComment.length > 60 ? '...' : ''}"`, timestamp: now, actor, taskId: id, taskTitle: title })
-  }
-
-  if (delegatedAgents.length) {
-    for (const [i, a] of delegatedAgents.entries()) {
-      if (!tags.includes(a)) tags.push(a)
-      if (!tags.includes('agents')) tags.push('agents')
-      if (!tags.includes('clawpilot')) tags.push('clawpilot')
-      checklist.push({ id: `${id}-deleg-${i}`, text: `Delegate ${a} scope`, done: false, agentId: a, assignee: 'clawpilot' })
-    }
   }
 
   const taskObj: Task = {
@@ -703,15 +562,6 @@ export async function POST(req: NextRequest) {
     dueDate,
     workstream: workstream || undefined,
     outcomeStatement,
-    governance: {
-      intent: governance.intent,
-      healthScore: governance.healthScore,
-      healthReasons: governance.healthReasons,
-      advisoryMode: true,
-      recommendedAction: governance.recommendedAction,
-      recommendedParentMilestoneId: governance.recommendedParentMilestoneId,
-      missingMilestoneFields: governance.missingMilestoneFields,
-    },
     execution: explicitNextAction ? {
       executionStatus: 'queued',
       startedAt: now,
@@ -727,24 +577,6 @@ export async function POST(req: NextRequest) {
   }
 
   const actionableCandidate = applyCanonicalWorkItem(taskObj)
-  if (isActiveColumnStatus(actionableCandidate.status)) {
-    const missing = deriveMissingActionableFields(actionableCandidate)
-    if (missing.length > 0) {
-      actionableCandidate.status = 'backlog'
-      actionableCandidate.activity = [
-        ...(actionableCandidate.activity || []),
-        {
-          type: 'updated',
-          message: `Actionable Intake Guard: kept in backlog. Missing: ${missing.join(' and ')}`,
-          timestamp: now,
-          actor: 'Governance',
-          taskId: actionableCandidate.id,
-          taskTitle: actionableCandidate.title,
-        },
-      ]
-      actionableCandidate.updatedAt = now
-    }
-  }
 
   tasks.push(actionableCandidate)
   await writeTasks(tasks)
@@ -886,66 +718,6 @@ export async function PATCH(req: NextRequest) {
     const comment: Comment = { id: Date.now().toString(), text: _comment, createdAt: now, timestamp: now, author: actor }
     comments.push(comment)
     activity.push({ type: 'comment', message: `Commented: "${_comment.slice(0, 60)}${_comment.length > 60 ? '...' : ''}"`, timestamp: now, ...base })
-
-    // In-app mention auto-reply (ClawPilot + named agents)
-    const text = String(_comment || '')
-    const mentionedClawPilot = /@\s*clawpilot\b/i.test(text)
-    const mentionedCalendar = /@\s*(calendar|calendar-agent)\b/i.test(text)
-    const mentionedDocs = /@\s*(docs|docs-agent)\b/i.test(text)
-    const mentionedPipeline = /@\s*(pipeline|pipeline-agent)\b/i.test(text)
-    const mentionedProjects = /@\s*(projects|projects-agent)\b/i.test(text)
-
-    if (actor !== 'ClawPilot' && (mentionedClawPilot || mentionedCalendar || mentionedDocs || mentionedPipeline || mentionedProjects)) {
-      const targets = [
-        mentionedClawPilot ? 'ClawPilot' : null,
-        mentionedCalendar ? 'Calendar Agent' : null,
-        mentionedDocs ? 'Docs Agent' : null,
-        mentionedPipeline ? 'Pipeline Agent' : null,
-        mentionedProjects ? 'Projects Agent' : null,
-      ].filter(Boolean).join(', ')
-
-      const goalText = text
-        .replace(/@\s*clawpilot\b/ig, '')
-        .replace(/@\s*(calendar|calendar-agent)\b/ig, '')
-        .replace(/@\s*(docs|docs-agent)\b/ig, '')
-        .replace(/@\s*(pipeline|pipeline-agent)\b/ig, '')
-        .replace(/@\s*(projects|projects-agent)\b/ig, '')
-        .replace(/\s+/g, ' ')
-        .trim()
-
-      const cleanGoal = goalText
-        .replace(/\bbaed\b/ig, 'based')
-        .replace(/\brelate\.\.\.\b/ig, 'related tasks')
-        .replace(/[\s,;:.!-]+$/g, '')
-
-      const goal = cleanGoal
-        ? (cleanGoal.length > 120 ? `${cleanGoal.slice(0, 117)}...` : cleanGoal)
-        : 'No explicit goal text found'
-
-      const autoNow = new Date().toISOString()
-      const autoText = [
-        `Received for ${targets}.`,
-        `Goal: ${goal}.`,
-        `Next: I will post a concrete status update on this card after execution evidence is available.`,
-      ].join(' ')
-
-      const autoComment: Comment = {
-        id: (Date.now() + 1).toString(),
-        text: autoText,
-        createdAt: autoNow,
-        timestamp: autoNow,
-        author: 'ClawPilot',
-      }
-      comments.push(autoComment)
-      activity.push({
-        type: 'comment',
-        message: `ClawPilot processed @mention with goal + next step`,
-        timestamp: autoNow,
-        taskId: id,
-        taskTitle: prev.title,
-        actor: 'ClawPilot',
-      })
-    }
   }
   if (_checklistAdd) {
     const item: ChecklistItem = {
@@ -1137,33 +909,17 @@ export async function PATCH(req: NextRequest) {
   if (isActiveColumnStatus(nextTask.status)) {
     const missing = deriveMissingActionableFields(nextTask)
     if (missing.length > 0) {
-      nextTask = {
-        ...nextTask,
-        status: 'backlog',
-        updatedAt: now,
-        activity: [
-          ...(nextTask.activity || []),
-          {
-            type: 'updated',
-            message: `Actionable Intake Guard: kept in backlog. Missing: ${missing.join(' and ')}`,
-            timestamp: now,
-            actor,
-            taskId: nextTask.id,
-            taskTitle: nextTask.title,
-          },
-        ],
-      }
-      nextTask = applyCanonicalWorkItem(nextTask)
-      tasks[idx] = nextTask
-      await writeTasks(tasks)
       return NextResponse.json({
-        ...nextTask,
+        error: 'Active task is missing required operating context',
+        blocked: true,
+        policyCode: 'TASK_NOT_ACTIONABLE',
+        operatorMessage: `Add ${missing.join(', ')} before moving this task into active work.`,
         actionabilityGuard: {
           blocked: true,
-          message: `Missing: ${missing.join(' and ')}`,
+          message: `Missing: ${missing.join(', ')}`,
           missing,
         },
-      })
+      }, { status: 409 })
     }
   }
 
