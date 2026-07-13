@@ -116,11 +116,18 @@ async function resolveOperator(req: NextRequest): Promise<string | null> {
 }
 
 function deriveNextAction(summary: string): string {
-  const explicit = String(summary || '')
+  const lines = String(summary || '')
     .split(/\r?\n/)
     .map((line) => line.trim())
-    .find((line) => /^remaining\s*:/i.test(line) || /^next (action|step)\s*:/i.test(line))
-  return explicit?.replace(/^[^:]+:/, '').trim() || 'Review the agent result and choose the next concrete step.'
+  const explicit = lines.find((line) => /^remaining\s*:/i.test(line) || /^next (action|step)\s*:/i.test(line))
+  const explicitValue = explicit?.replace(/^[^:]+:/, '').trim()
+  if (explicitValue) return explicitValue
+
+  const remainingIndex = lines.findIndex((line) => /^remaining\s*:?$/i.test(line))
+  const firstRemaining = remainingIndex >= 0
+    ? lines.slice(remainingIndex + 1).find((line) => /^[-*]\s+\S/.test(line))
+    : undefined
+  return firstRemaining?.replace(/^[-*]\s+/, '').trim() || 'Review the agent result and choose the next concrete step.'
 }
 
 async function recordAgentResult(taskId: string, agentId: string, summary: string) {
