@@ -19,6 +19,8 @@ import RadioButtonUncheckedRounded from '@mui/icons-material/RadioButtonUnchecke
 import FlagRounded from '@mui/icons-material/FlagRounded'
 import WbSunnyRounded from '@mui/icons-material/WbSunnyRounded'
 import type { Task } from '@/lib/types'
+import { queueAgentTaskOpen } from '@/lib/agents/navigation'
+import { assignmentKickoffText, triggerAgentTurn } from '@/lib/agents/client'
 import { PRIORITY_COLORS } from '@/lib/types'
 import { deriveTaskRealityState } from '@/lib/taskRealityState'
 import { deriveNextActionGuidance, deriveStateTruth } from '@/lib/workItemModel'
@@ -331,6 +333,7 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter }: P
   }
 
   function openAgentChat(taskId: string, agentId?: string) {
+    queueAgentTaskOpen(taskId, agentId || '')
     onNavigate('agents')
     setTimeout(() => {
       window.dispatchEvent(new CustomEvent('open-agent-task', { detail: { taskId, agentId: agentId || '' } }))
@@ -369,6 +372,7 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter }: P
     const updated = await r.json()
     if (!updated?.id) return
     setTasks((prev) => prev.map((task) => (task.id === updated.id ? updated : task)))
+    await triggerAgentTurn({ taskId, agentId, text: assignmentKickoffText() }).catch(() => {})
   }
 
   if (loading) return (
