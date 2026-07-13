@@ -46,6 +46,13 @@ assertIncludes(usersAdapter, 'canInviteUsers', 'app users adapter')
 assertIncludes(usersAdapter, "current?.status === 'disabled' && !canManageUserAccess(actor)", 'disabled user restore authorization')
 assertIncludes(usersAdapter, 'updateAppUserProfile', 'app users adapter')
 assertIncludes(usersAdapter, 'updateAppUserAccess', 'app users adapter')
+assertIncludes(usersAdapter, 'AppUserAuthorizationError', 'app user authorization errors')
+assertIncludes(usersAdapter, 'AppUserNotFoundError', 'app user not-found errors')
+
+const usersRoute = read('app_src/app/api/users/route.ts')
+assertIncludes(usersRoute, 'userMutationErrorStatus', 'app user mutation status mapping')
+assertIncludes(usersRoute, 'return 403', 'app user authorization HTTP status')
+assertIncludes(usersRoute, 'return 404', 'app user not-found HTTP status')
 
 const tenancyMigration = read('db/migrations/0007_multi_tenant_workspaces.sql')
 for (const table of ['project_boards', 'project_board_members', 'pipeline_spaces', 'pipeline_space_members']) {

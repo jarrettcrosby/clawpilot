@@ -4,6 +4,8 @@ import { disconnectChatGPT } from '@/lib/agents/chatgptAuth'
 import { ensureDefaultResourcesForUser } from '@/lib/tenancy'
 import { sessionEmail } from '@/lib/requestUser'
 import {
+  AppUserAuthorizationError,
+  AppUserNotFoundError,
   canInviteUsers,
   canManageUserAccess,
   inviteAppUser,
@@ -12,6 +14,12 @@ import {
   updateAppUserAccess,
   updateAppUserProfile,
 } from '@/lib/users'
+
+function userMutationErrorStatus(error: unknown): number {
+  if (error instanceof AppUserAuthorizationError) return 403
+  if (error instanceof AppUserNotFoundError) return 404
+  return 400
+}
 
 export async function GET(req: NextRequest) {
   const email = sessionEmail(req)
@@ -49,7 +57,7 @@ export async function POST(req: NextRequest) {
     })
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unable to invite user'
-    return NextResponse.json({ ok: false, error: message }, { status: 400 })
+    return NextResponse.json({ ok: false, error: message }, { status: userMutationErrorStatus(error) })
   }
 }
 
@@ -85,6 +93,6 @@ export async function PATCH(req: NextRequest) {
     return NextResponse.json({ ok: true, user })
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unable to update user'
-    return NextResponse.json({ ok: false, error: message }, { status: 400 })
+    return NextResponse.json({ ok: false, error: message }, { status: userMutationErrorStatus(error) })
   }
 }

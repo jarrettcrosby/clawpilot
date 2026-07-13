@@ -5,6 +5,20 @@ const EMAIL_PATTERN = /^[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9](?:[A-Z0-9-]{0,61}
 export type AppUserRole = 'owner' | 'admin' | 'member'
 export type AppUserStatus = 'invited' | 'active' | 'disabled'
 
+export class AppUserAuthorizationError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'AppUserAuthorizationError'
+  }
+}
+
+export class AppUserNotFoundError extends Error {
+  constructor(message = 'User was not found') {
+    super(message)
+    this.name = 'AppUserNotFoundError'
+  }
+}
+
 export type AppUserPermissions = {
   inviteUsers: boolean
   manageUserAccess: boolean
@@ -162,7 +176,7 @@ export async function listAppUsers(actorEmailValue: unknown): Promise<{ actor: A
 
 export async function inviteAppUser(input: { actorEmail: unknown; email: unknown }): Promise<AppUser> {
   const actor = await requireActiveAppUser(input.actorEmail)
-  if (!canInviteUsers(actor)) throw new Error('You do not have permission to invite users')
+  if (!canInviteUsers(actor)) throw new AppUserAuthorizationError('You do not have permission to invite users')
   const email = normalizeUserEmail(input.email)
   if (email === actor.email) return actor
 
@@ -170,9 +184,9 @@ export async function inviteAppUser(input: { actorEmail: unknown; email: unknown
     const existing = await client.query<AppUserRow>('SELECT * FROM app_users WHERE email = $1 FOR UPDATE', [email])
     const current = existing.rows[0]
     if (current?.role === 'owner') throw new Error('The owner already has access')
-    if (current?.role === 'admin' && actor.role !== 'owner') throw new Error('Only the owner can invite administrators')
+    if (current?.role === 'admin' && actor.role !== 'owner') throw new AppUserAuthorizationError('Only the owner can invite administrators')
     if (current?.status === 'disabled' && !canManageUserAccess(actor)) {
-      throw new Error('You do not have permission to restore disabled users')
+      throw new AppUserAuthorizationError('You do not have permission to restore disabled users')
     }
     if (current?.status === 'active') return toAppUser(current)
 
@@ -201,14 +215,14 @@ export async function setAppUserStatus(input: {
   status: 'active' | 'disabled'
 }): Promise<AppUser> {
   const actor = await requireActiveAppUser(input.actorEmail)
-  if (!canManageUserAccess(actor)) throw new Error('You do not have permission to manage users')
+  if (!canManageUserAccess(actor)) throw new AppUserAuthorizationError('You do not have permission to manage users')
   const email = normalizeUserEmail(input.email)
-  if (email === actor.email && input.status === 'disabled') throw new Error('You cannot disable your own account')
+  if (email === actor.email && input.status === 'disabled') throw new AppUserAuthorizationError('You cannot disable your own account')
 
   const target = await getAppUser(email)
-  if (!target) throw new Error('User was not found')
-  if (target.role === 'owner') throw new Error('The owner account cannot be changed')
-  if (actor.role !== 'owner' && target.role !== 'member') throw new Error('Only the owner can manage administrators')
+  if (!target) throw new AppUserNotFoundError()
+  if (target.role === 'owner') throw new AppUserAuthorizationError('The owner account cannot be changed')
+  if (actor.role !== 'owner' && target.role !== 'member') throw new AppUserAuthorizationError('Only the owner can manage administrators')
 
   const result = await query<AppUserRow>(
     `
@@ -222,7 +236,7 @@ export async function setAppUserStatus(input: {
     `,
     [email, input.status],
   )
-  if (!result.rows[0]) throw new Error('User was not found')
+  if (!result.rows[0]) throw new AppUserNotFoundError()
   return toAppUser(result.rows[0])
 }
 
@@ -288,13 +302,13 @@ export async function updateAppUserAccess(input: {
   permissions?: Partial<AppUserPermissions>
 }): Promise<AppUser> {
   const actor = await requireActiveAppUser(input.actorEmail)
-  if (!canManageUserAccess(actor)) throw new Error('You do not have permission to manage users')
+  if (!canManageUserAccess(actor)) throw new AppUserAuthorizationError('You do not have permission to manage users')
   const email = normalizeUserEmail(input.email)
   const target = await getAppUser(email)
-  if (!target) throw new Error('User was not found')
-  if (target.role === 'owner') throw new Error('The owner account cannot be changed')
+  if (!target) throw new AppUserNotFoundError()
+  if (target.role === 'owner') throw new AppUserAuthorizationError('The owner account cannot be changed')
   if (actor.role !== 'owner' && (target.role !== 'member' || input.role === 'admin')) {
-    throw new Error('Only the owner can manage administrators')
+    throw new AppUserAuthorizationError('Only the owner can manage administrators')
   }
 
   const role = input.role || target.role
