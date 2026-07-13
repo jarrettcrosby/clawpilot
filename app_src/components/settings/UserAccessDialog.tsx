@@ -48,6 +48,8 @@ type UserPermissions = {
   manageUserAccess: boolean
   createBoards: boolean
   createPipelines: boolean
+  viewFullReleaseHistory: boolean
+  manageBackups: boolean
 }
 
 type AppUser = {
@@ -170,6 +172,8 @@ const PERMISSIONS: Array<{ key: PermissionKey; label: string; adminOnly?: boolea
   { key: 'manageUserAccess', label: 'Manage access', adminOnly: true },
   { key: 'createBoards', label: 'Create boards' },
   { key: 'createPipelines', label: 'Create pipelines' },
+  { key: 'viewFullReleaseHistory', label: 'View full release history', adminOnly: true },
+  { key: 'manageBackups', label: 'Manage data checkpoints', adminOnly: true },
 ]
 
 const panelSx = {
@@ -865,8 +869,8 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
                             onChange={(event) => {
                               const role = event.target.value as EditableRole
                               const permissions = role === 'admin'
-                                ? { ...user.permissions, inviteUsers: true, manageUserAccess: true }
-                                : { ...user.permissions, inviteUsers: false, manageUserAccess: false }
+                                ? { ...user.permissions, inviteUsers: true, manageUserAccess: true, viewFullReleaseHistory: true, manageBackups: true }
+                                : { ...user.permissions, inviteUsers: false, manageUserAccess: false, viewFullReleaseHistory: false, manageBackups: false }
                               void updateAccess(user, role, permissions)
                             }}
                             disabled={busy}

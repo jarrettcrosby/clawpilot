@@ -32,8 +32,13 @@ require_value AGENT_CREDENTIAL_ENCRYPTION_KEY 32
 require_value AGENT_CREDENTIAL_DATABASE_URL 16
 require_value MATON_API_KEY 16
 require_value MATON_GMAIL_CONNECTION_ID 8
+require_value CLAWPILOT_MAIL_FROM 5
+require_value CLAWPILOT_PUBLIC_URL 16
 require_value PIPELINE_SHEET_ID 20
 require_value PIPELINE_OUTBOX_WORKER_SECRET 32
+
+[[ "$CLAWPILOT_MAIL_FROM" == *@* ]] || fail "CLAWPILOT_MAIL_FROM must be an email address"
+[[ "$CLAWPILOT_PUBLIC_URL" == https://* ]] || fail "CLAWPILOT_PUBLIC_URL must use HTTPS"
 
 cleanup() {
   [[ -n "$WORKER_PID" ]] && kill "$WORKER_PID" 2>/dev/null || true
@@ -46,6 +51,21 @@ APP_PID=$!
 
 node scripts/pipeline-outbox-poller.mjs &
 WORKER_PID=$!
+
+HEALTH_URL="http://127.0.0.1:${PORT:-4002}/api/health"
+HEALTHY=0
+for _attempt in $(seq 1 120); do
+  kill -0 "$APP_PID" 2>/dev/null || fail "application exited before health validation"
+  kill -0 "$WORKER_PID" 2>/dev/null || fail "pipeline outbox poller exited before health validation"
+  if node -e 'fetch(process.argv[1], { signal: AbortSignal.timeout(3000) }).then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))' "$HEALTH_URL"; then
+    HEALTHY=1
+    break
+  fi
+  sleep 1
+done
+[[ "$HEALTHY" == "1" ]] || fail "application did not pass health validation within 120 seconds"
+
+npm run release:record
 
 while kill -0 "$APP_PID" 2>/dev/null; do
   if [[ -n "$WORKER_PID" ]] && ! kill -0 "$WORKER_PID" 2>/dev/null; then

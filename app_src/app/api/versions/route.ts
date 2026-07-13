@@ -1,47 +1,59 @@
-import { NextResponse } from 'next/server'
+import { NextRequest, NextResponse } from 'next/server'
+import { requireRequestUser } from '@/lib/requestUser'
+import { isHostedRuntime, isPostgresStorageEnabled } from '@/lib/persistence/config'
+import {
+  createDataCheckpoint,
+  getReleaseOverview,
+  getLocalReleaseOverview,
+  releaseAccessFor,
+  ReleasePermissionError,
+  ReleaseRequestError,
+} from '@/lib/releases'
 
 export const dynamic = 'force-dynamic'
 export const revalidate = 0
-import { exec } from 'child_process'
-import { promisify } from 'util'
-import fs from 'fs'
-import path from 'path'
-import { getErrorMessage } from '@/lib/errorUtils'
+export const runtime = 'nodejs'
 
-const execAsync = promisify(exec)
-const REPO = path.resolve(process.cwd(), '..')
-const DATA_DIR = REPO.includes('clawd-app-dev') ? 'data-dev' : 'data'
-const BACKUP_DIR = path.join(REPO, DATA_DIR, 'backups')
+function errorResponse(error: unknown) {
+  const message = error instanceof Error ? error.message : 'Release request failed'
 
-export async function GET() {
+  if (message === 'Unauthorized' || message === 'User access is not active') {
+    return NextResponse.json({ ok: false, error: 'Unauthorized' }, { status: 401 })
+  }
+  if (error instanceof ReleasePermissionError) {
+    return NextResponse.json({ ok: false, error: message }, { status: 403 })
+  }
+  if (error instanceof ReleaseRequestError || error instanceof SyntaxError) {
+    return NextResponse.json({ ok: false, error: message }, { status: 400 })
+  }
+  return NextResponse.json({ ok: false, error: 'Release request failed' }, { status: 500 })
+}
+
+export async function GET(req: NextRequest) {
   try {
-    // Git log
-    const { stdout } = await execAsync(
-      `git -C ${REPO} log --pretty=format:"%H|%s|%at|%an" -30`
-    )
-    const commits = stdout.trim().split('\n').filter(Boolean).map(line => {
-      const [hash, subject, epoch, author] = line.split('|')
-      const ts = parseInt(epoch || '0', 10)
-      const isoDate = ts ? new Date(ts * 1000).toISOString() : null
-      return { hash, subject, date: isoDate, author, short: hash.slice(0, 7) }
-    })
-
-    // Data backups
-    let backups: { name: string; timestamp: string }[] = []
-    if (fs.existsSync(BACKUP_DIR)) {
-      backups = fs.readdirSync(BACKUP_DIR)
-        .filter(f => f.endsWith('.json'))
-        .sort()
-        .reverse()
-        .slice(0, 20)
-        .map(name => ({
-          name,
-          timestamp: name.replace('tasks_', '').replace('.json', '').replace('_', ' '),
-        }))
+    if (!isPostgresStorageEnabled()) {
+      if (isHostedRuntime()) throw new Error('Postgres storage is required in hosted environments')
+      return NextResponse.json({ ok: true, ...getLocalReleaseOverview() })
     }
+    const user = await requireRequestUser(req)
+    return NextResponse.json({ ok: true, ...await getReleaseOverview(user) })
+  } catch (error) {
+    return errorResponse(error)
+  }
+}
 
-    return NextResponse.json({ commits, backups })
-  } catch (error: unknown) {
-    return NextResponse.json({ error: getErrorMessage(error) }, { status: 500 })
+export async function POST(req: NextRequest) {
+  try {
+    if (!isPostgresStorageEnabled()) {
+      throw new ReleaseRequestError('Data checkpoints require Postgres storage')
+    }
+    const user = await requireRequestUser(req)
+    if (!releaseAccessFor(user).manageBackups) {
+      throw new ReleasePermissionError('Data checkpoint management requires manageBackups access')
+    }
+    const checkpoint = await createDataCheckpoint(user, await req.json())
+    return NextResponse.json({ ok: true, checkpoint }, { status: 201 })
+  } catch (error) {
+    return errorResponse(error)
   }
 }

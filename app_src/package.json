@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build --webpack",
+    "build:vercel": "node ../scripts/vercel-build.mjs",
     "start": "next start",
     "lint": "eslint",
     "test:threads": "node ../scripts/test-agent-thread-store.mjs",
@@ -26,6 +27,9 @@
     "react-dom": "19.2.3",
     "react-markdown": "^10.1.0",
     "remark-gfm": "^4.0.1"
+  },
+  "overrides": {
+    "postcss": "8.5.10"
   },
   "devDependencies": {
     "@playwright/test": "^1.53.0",

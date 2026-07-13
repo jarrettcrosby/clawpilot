@@ -1,24 +1,16 @@
 import fs from 'fs'
-import os from 'os'
-import path from 'path'
 
 const DEFAULT_BASE = 'https://gateway.maton.ai'
 
 function readKey(): string {
-  const candidates = [
-    path.join(os.homedir(), '.openclaw', 'workspace', 'credentials', 'maton_api_key.txt'),
-    path.join(process.cwd(), '..', 'credentials', 'maton_api_key.txt'),
-  ]
-
-  for (const p of candidates) {
-    if (fs.existsSync(p)) {
-      const key = fs.readFileSync(p, 'utf-8').trim()
-      if (key) return key
-    }
-  }
-
   const fromEnv = process.env.MATON_API_KEY?.trim()
   if (fromEnv) return fromEnv
+
+  const configuredPath = process.env.MATON_API_KEY_FILE?.trim()
+  if (configuredPath && fs.existsSync(configuredPath)) {
+    const key = fs.readFileSync(configuredPath, 'utf8').trim()
+    if (key) return key
+  }
 
   throw new Error('MATON_API_KEY not configured')
 }
@@ -32,5 +24,9 @@ export async function matonFetch(pathname: string, init?: RequestInit) {
   if (!headers.has('Authorization')) headers.set('Authorization', `Bearer ${key}`)
   if (!headers.has('Accept')) headers.set('Accept', 'application/json')
 
-  return fetch(url, { ...init, headers })
+  return fetch(url, {
+    ...init,
+    headers,
+    signal: init?.signal || AbortSignal.timeout(15000),
+  })
 }

@@ -17,7 +17,18 @@ import StarRounded from '@mui/icons-material/StarRounded'
 import RadioButtonCheckedRounded from '@mui/icons-material/RadioButtonCheckedRounded'
 import ArrowForwardRounded from '@mui/icons-material/ArrowForwardRounded'
 
-type Doc = { id: string; title: string; date: string; tags: string[]; category: string; content: string }
+type Doc = {
+  id: string
+  title: string
+  date: string
+  tags: string[]
+  category: string
+  content: string
+  kind?: string
+  status?: string
+  source?: string
+  sourcePath?: string | null
+}
 type Props = { doc: Doc | null; loading?: boolean }
 
 function stripLeadingMarkdownTitle(content: string, title: string): string {
@@ -29,6 +40,25 @@ function stripLeadingMarkdownTitle(content: string, title: string): string {
   if (heading !== normalizedTitle) return content
 
   return content.slice(match[0].length)
+}
+
+function repositoryLink(doc: Doc, href: string | undefined): string | undefined {
+  if (!href || !doc.sourcePath || /^(?:https?:|mailto:|#|\/)/i.test(href)) return href
+  const [target] = href.split('#', 1)
+  if (!target.toLowerCase().endsWith('.md')) return href
+  const base = doc.sourcePath.split('/').slice(0, -1)
+  for (const part of target.split('/')) {
+    if (!part || part === '.') continue
+    if (part === '..') base.pop()
+    else base.push(part)
+  }
+  const slug = `repo-${base.join('-')}`
+    .toLowerCase()
+    .replace(/\.md$/i, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 180)
+  return `/?doc=${encodeURIComponent(slug)}#docs`
 }
 
 const EMOJI_ICONS: Record<string, { icon: React.ElementType; color: string }> = {
@@ -96,7 +126,7 @@ export default function DocViewer({ doc, loading }: Props) {
     <Box sx={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', backgroundColor: '#0F0F13', gap: 2 }}>
       <InsertDriveFileRounded sx={{ fontSize: 56, color: 'rgba(255,255,255,0.1)' }} />
       <Typography variant="h6" color="text.secondary" fontWeight={500}>Select a document</Typography>
-      <Typography variant="body2" color="text.disabled">Your second brain is ready</Typography>
+      <Typography variant="body2" color="text.disabled">Your document workspace is ready</Typography>
     </Box>
   )
 
@@ -110,7 +140,7 @@ export default function DocViewer({ doc, loading }: Props) {
     <Box sx={{ display: 'flex', flexDirection: 'column', height: '100%', backgroundColor: '#0F0F13', overflow: 'hidden' }}>
 
       <Box sx={{
-        px: { xs: 3, md: 5 }, pt: { xs: 8, md: 4 }, pb: 3, pl: { xs: 7, md: 5 },
+        px: { xs: 2, sm: 3, md: 5 }, pt: { xs: 2.5, md: 4 }, pb: 3,
         backgroundColor: 'rgba(15,15,19,0.96)',
         backdropFilter: 'blur(12px)',
         borderBottom: '1px solid rgba(255,255,255,0.06)',
@@ -124,6 +154,14 @@ export default function DocViewer({ doc, loading }: Props) {
         </Typography>
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, flexWrap: 'wrap' }}>
           <Typography variant="caption" sx={{ color: 'text.disabled', fontSize: '0.75rem' }}>{doc!.date}</Typography>
+          {doc!.status && (
+            <Chip label={doc!.status} size="small" variant="outlined"
+              sx={{ height: 22, fontSize: '0.7rem', borderColor: 'rgba(255,255,255,0.12)', color: 'text.secondary', borderRadius: 1.5 }} />
+          )}
+          {doc!.source && (
+            <Chip label={doc!.source === 'repository' ? 'ClawPilot knowledge' : doc!.source} size="small" variant="outlined"
+              sx={{ height: 22, fontSize: '0.7rem', borderColor: 'rgba(255,255,255,0.12)', color: 'text.secondary', borderRadius: 1.5 }} />
+          )}
           {doc!.tags.map(tag => (
             <Chip key={tag} label={tag} size="small" variant="outlined"
               sx={{ height: 22, fontSize: '0.7rem', borderColor: 'rgba(255,255,255,0.12)', color: 'text.secondary', borderRadius: 1.5 }} />
@@ -131,7 +169,7 @@ export default function DocViewer({ doc, loading }: Props) {
         </Box>
       </Box>
 
-      <Box sx={{ flex: 1, overflow: 'auto', px: { xs: 3, md: 5 }, py: 4 }}>
+      <Box sx={{ flex: 1, overflow: 'auto', px: { xs: 2, sm: 3, md: 5 }, py: { xs: 3, md: 4 } }}>
         <Box sx={{ maxWidth: 740 }}>
           <ReactMarkdown
             remarkPlugins={[remarkGfm]}
@@ -167,7 +205,7 @@ export default function DocViewer({ doc, loading }: Props) {
               thead: ({ children }) => <Box component="thead" sx={{ '& th': { borderBottom: '2px solid rgba(255,255,255,0.1)', pb: 1, pr: 3, textAlign: 'left', color: 'text.secondary', fontWeight: 600, fontSize: '0.75rem', textTransform: 'uppercase', letterSpacing: '0.06em' } }}>{children}</Box>,
               td: ({ children }) => <Box component="td" sx={{ py: 1.5, pr: 3, borderBottom: '1px solid rgba(255,255,255,0.05)', color: 'rgba(228,225,236,0.75)', verticalAlign: 'top' }}>{applyIcons(children as ReactNode)}</Box>,
               hr: () => <Divider sx={{ my: 3.5, borderColor: 'rgba(255,255,255,0.07)' }} />,
-              a: ({ href, children }) => <Box component="a" href={href} sx={{ color: '#A8C7FA', textDecoration: 'none', borderBottom: '1px solid rgba(168,199,250,0.3)', '&:hover': { borderBottomColor: '#A8C7FA' } }}>{children}</Box>,
+              a: ({ href, children }) => <Box component="a" href={repositoryLink(doc!, href)} sx={{ color: '#A8C7FA', textDecoration: 'none', borderBottom: '1px solid rgba(168,199,250,0.3)', '&:hover': { borderBottomColor: '#A8C7FA' } }}>{children}</Box>,
             }}
           >
             {stripLeadingMarkdownTitle(doc!.content, doc!.title).trimStart()}

@@ -21,11 +21,13 @@ if (process.env.CLAWPILOT_SMOKE_COOKIE) {
 
 async function authenticate() {
   const password = process.env.CLAWPILOT_SMOKE_PASSWORD
+  const operatorSecret = process.env.CLAWPILOT_SMOKE_OPERATOR_SECRET || process.env.PIPELINE_OUTBOX_WORKER_SECRET
   if (!password || headers.Cookie) return
+  if (!operatorSecret) throw new Error('smoke operator secret is required for password authentication')
 
   const response = await fetch(`${baseUrl}/api/auth/login`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', 'X-ClawPilot-Operator-Secret': operatorSecret },
     body: JSON.stringify({ password }),
   })
   if (!response.ok) throw new Error(`authentication failed with HTTP ${response.status}`)

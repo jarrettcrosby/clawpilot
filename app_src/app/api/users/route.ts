@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { requestAuthMagicCode } from '@/lib/authMagicCode'
 import { disconnectChatGPT } from '@/lib/agents/chatgptAuth'
+import { createUserInvitation } from '@/lib/invitations'
 import { ensureDefaultResourcesForUser } from '@/lib/tenancy'
 import { sessionEmail } from '@/lib/requestUser'
 import {
@@ -8,7 +8,6 @@ import {
   AppUserNotFoundError,
   canInviteUsers,
   canManageUserAccess,
-  inviteAppUser,
   listAppUsers,
   setAppUserStatus,
   updateAppUserAccess,
@@ -18,6 +17,7 @@ import {
 function userMutationErrorStatus(error: unknown): number {
   if (error instanceof AppUserAuthorizationError) return 403
   if (error instanceof AppUserNotFoundError) return 404
+  if (error instanceof Error && error.message.includes('already being sent')) return 409
   return 400
 }
 
@@ -48,12 +48,12 @@ export async function POST(req: NextRequest) {
 
   try {
     const body = await req.json()
-    const user = await inviteAppUser({ actorEmail, email: body?.email })
-    const delivery = await requestAuthMagicCode({ email: user.email })
+    const invitation = await createUserInvitation({ actorEmail, email: body?.email })
     return NextResponse.json({
       ok: true,
-      user,
-      delivery: delivery.status === 'sent' ? 'sent' : delivery.status,
+      user: invitation.user,
+      delivery: invitation.delivery,
+      expiresAt: invitation.expiresAt,
     })
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unable to invite user'

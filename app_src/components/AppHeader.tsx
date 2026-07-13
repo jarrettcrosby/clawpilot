@@ -75,12 +75,21 @@ type Props = {
   activeSection: string
   title?: string
   onShortcutsOpen?: () => void
-  showNavToggle?: boolean
-  navOpen?: boolean
-  onToggleNav?: () => void
+  desktopNavCollapsed: boolean
+  mobileNavOpen: boolean
+  onToggleDesktopNav: () => void
+  onOpenMobileNav: () => void
 }
 
-export default function AppHeader({ activeSection, title, onShortcutsOpen, showNavToggle, navOpen, onToggleNav }: Props) {
+export default function AppHeader({
+  activeSection,
+  title,
+  onShortcutsOpen,
+  desktopNavCollapsed,
+  mobileNavOpen,
+  onToggleDesktopNav,
+  onOpenMobileNav,
+}: Props) {
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [tasks, setTasks] = useState<Task[]>([])
   const [pipelineEntries, setPipelineEntries] = useState<PipelineActivityEntry[]>([])
@@ -178,7 +187,7 @@ export default function AppHeader({ activeSection, title, onShortcutsOpen, showN
           </Typography>
         </Box>
       )}
-      <Box sx={{
+      <Box data-testid="app-header" sx={{
         display: 'flex', alignItems: 'center', justifyContent: 'space-between',
         px: { xs: 2, md: 3 }, py: 1.25,
         pt: { xs: 'calc(env(safe-area-inset-top) + 10px)', md: 1.25 },
@@ -186,17 +195,46 @@ export default function AppHeader({ activeSection, title, onShortcutsOpen, showN
         flexShrink: 0,
         minHeight: { xs: 'calc(env(safe-area-inset-top) + 52px)', md: 52 },
       }}>
-        <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, minWidth: 0 }}>
-          {showNavToggle && (
-            <Tooltip title={navOpen ? 'Hide sidebar' : 'Show sidebar'}>
-              <IconButton
-                onClick={onToggleNav}
-                sx={{ color: 'rgba(255,255,255,0.55)', p: { xs: 1.25, md: 1 }, minWidth: 48, minHeight: 48, '&:hover': { color: '#A8C7FA', backgroundColor: 'rgba(168,199,250,0.08)' } }}
-              >
-                <MenuRounded sx={{ fontSize: 22 }} />
-              </IconButton>
-            </Tooltip>
-          )}
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, minWidth: 0, flex: 1, overflow: 'hidden' }}>
+          <Tooltip title="Open navigation">
+            <IconButton
+              data-testid="mobile-navigation-toggle"
+              aria-label="Open navigation menu"
+              aria-controls="mobile-navigation-drawer"
+              aria-expanded={mobileNavOpen}
+              aria-haspopup="dialog"
+              onClick={onOpenMobileNav}
+              sx={{
+                display: { xs: 'inline-flex', md: 'none' },
+                color: 'rgba(255,255,255,0.55)',
+                p: 1,
+                minWidth: 48,
+                minHeight: 48,
+                '&:hover': { color: '#A8C7FA', backgroundColor: 'rgba(168,199,250,0.08)' },
+              }}
+            >
+              <MenuRounded sx={{ fontSize: 22 }} />
+            </IconButton>
+          </Tooltip>
+          <Tooltip title={desktopNavCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}>
+            <IconButton
+              data-testid="desktop-navigation-toggle"
+              aria-label={desktopNavCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+              aria-controls="desktop-navigation-drawer"
+              aria-expanded={!desktopNavCollapsed}
+              onClick={onToggleDesktopNav}
+              sx={{
+                display: { xs: 'none', md: 'inline-flex' },
+                color: 'rgba(255,255,255,0.55)',
+                p: 1,
+                minWidth: 48,
+                minHeight: 48,
+                '&:hover': { color: '#A8C7FA', backgroundColor: 'rgba(168,199,250,0.08)' },
+              }}
+            >
+              <MenuRounded sx={{ fontSize: 22 }} />
+            </IconButton>
+          </Tooltip>
           <Typography variant="subtitle1" fontWeight={600} color="text.primary" sx={{ fontSize: '0.95rem', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
             {label}
           </Typography>
@@ -206,10 +244,11 @@ export default function AppHeader({ activeSection, title, onShortcutsOpen, showN
           {runtimeInfo && (
             <Tooltip title={`Lane: ${runtimeInfo.lane} • Port: ${runtimeInfo.port} • Commit: ${runtimeInfo.commit.slice(0,7)}`}>
               <Chip
+                data-testid="runtime-chip"
                 size="small"
                 label={`${runtimeInfo.lane}:${runtimeInfo.port}`}
                 onClick={(e) => setRuntimeAnchor(e.currentTarget)}
-                sx={{ height: 22, fontSize: '0.65rem', borderRadius: 1, backgroundColor: 'rgba(168,199,250,0.12)', color: '#A8C7FA', border: '1px solid rgba(168,199,250,0.3)' }}
+                sx={{ display: { xs: 'none', sm: 'inline-flex' }, height: 22, fontSize: '0.65rem', borderRadius: 1, backgroundColor: 'rgba(168,199,250,0.12)', color: '#A8C7FA', border: '1px solid rgba(168,199,250,0.3)' }}
               />
             </Tooltip>
           )}

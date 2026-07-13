@@ -4,28 +4,25 @@ import { FormEvent, useEffect, useState } from 'react'
 import ArrowBackRounded from '@mui/icons-material/ArrowBackRounded'
 import LoginRounded from '@mui/icons-material/LoginRounded'
 import MailOutlineRounded from '@mui/icons-material/MailOutlineRounded'
-import PasswordRounded from '@mui/icons-material/PasswordRounded'
-import VisibilityOffRounded from '@mui/icons-material/VisibilityOffRounded'
-import VisibilityRounded from '@mui/icons-material/VisibilityRounded'
 import {
   Alert,
-  Avatar,
   Box,
   Button,
   CircularProgress,
   CssBaseline,
-  IconButton,
   InputAdornment,
   Paper,
   Stack,
   TextField,
   Typography,
 } from '@mui/material'
-import { BrandIcon } from '@/lib/icons'
+import BrandMark from '@/components/BrandMark'
 
-type LoginMode = 'email' | 'code' | 'password'
-type PendingAction = 'request' | 'verify' | 'password' | null
-type AuthResponse = { ok?: boolean; error?: string; message?: string }
+type LoginMode = 'email' | 'code'
+type PendingAction = 'request' | 'verify' | null
+type AuthResponse = { ok?: boolean; error?: string; message?: string; email?: string }
+
+const INVITATION_TOKEN_STORAGE_KEY = 'clawpilot.invitationToken'
 
 function nextPath() {
   const requested = new URLSearchParams(window.location.search).get('next') || '/'
@@ -37,12 +34,26 @@ export default function LoginPage() {
   const [email, setEmail] = useState('')
   const [sentEmail, setSentEmail] = useState('')
   const [code, setCode] = useState('')
-  const [password, setPassword] = useState('')
-  const [showPassword, setShowPassword] = useState(false)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [pending, setPending] = useState<PendingAction>(null)
   const [resendSeconds, setResendSeconds] = useState(0)
+  const [invitedFlow, setInvitedFlow] = useState(false)
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search)
+    const prefilledEmail = String(params.get('email') || '').trim().toLowerCase()
+    const codeSent = params.get('sent') === '1'
+    const fromWelcome = params.get('welcome') === '1'
+    if (prefilledEmail.includes('@')) setEmail(prefilledEmail)
+    if (fromWelcome) setInvitedFlow(true)
+    if (prefilledEmail.includes('@') && codeSent) {
+      setSentEmail(prefilledEmail)
+      setMode('code')
+      setResendSeconds(60)
+      setNotice('Your one-time sign-in code is on the way.')
+    }
+  }, [])
 
   useEffect(() => {
     if (resendSeconds <= 0) return
@@ -58,15 +69,26 @@ export default function LoginPage() {
     setError('')
     setNotice('')
     try {
-      const response = await fetch('/api/auth/magic/request', {
+      const invitationToken = invitedFlow
+        ? window.sessionStorage.getItem(INVITATION_TOKEN_STORAGE_KEY) || ''
+        : ''
+      if (invitedFlow && !invitationToken) {
+        throw new Error('Return to your ClawPilot welcome link to request another code')
+      }
+      const response = await fetch(invitedFlow ? '/api/invitations/accept' : '/api/auth/magic/request', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: normalizedEmail }),
+        body: JSON.stringify(invitedFlow
+          ? { action: 'code', token: invitationToken }
+          : { email: normalizedEmail }),
       })
       const result = (await response.json().catch(() => ({}))) as AuthResponse
       if (!response.ok || !result.ok) throw new Error(result.error || 'Unable to send a sign-in code')
-      setEmail(normalizedEmail)
-      setSentEmail(normalizedEmail)
+      const responseEmail = invitedFlow && 'email' in result
+        ? String(result.email || '').trim().toLowerCase()
+        : normalizedEmail
+      setEmail(responseEmail)
+      setSentEmail(responseEmail)
       setCode('')
       setMode('code')
       setResendSeconds(60)
@@ -92,30 +114,10 @@ export default function LoginPage() {
       })
       const result = (await response.json().catch(() => ({}))) as AuthResponse
       if (!response.ok || !result.ok) throw new Error(result.error || 'The code is invalid or expired')
+      if (invitedFlow) window.sessionStorage.removeItem(INVITATION_TOKEN_STORAGE_KEY)
       window.location.replace(nextPath())
     } catch (verifyError) {
       setError(verifyError instanceof Error ? verifyError.message : 'The code is invalid or expired')
-      setPending(null)
-    }
-  }
-
-  const signInWithPassword = async () => {
-    if (!password || pending) return
-
-    setPending('password')
-    setError('')
-    setNotice('')
-    try {
-      const response = await fetch('/api/auth/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password }),
-      })
-      const result = (await response.json().catch(() => ({}))) as AuthResponse
-      if (!response.ok || !result.ok) throw new Error(result.error || 'Sign in failed')
-      window.location.replace(nextPath())
-    } catch (submitError) {
-      setError(submitError instanceof Error ? submitError.message : 'Sign in failed')
       setPending(null)
     }
   }
@@ -124,10 +126,13 @@ export default function LoginPage() {
     event.preventDefault()
     if (mode === 'email') await requestCode()
     if (mode === 'code') await verifyCode()
-    if (mode === 'password') await signInWithPassword()
   }
 
   const resetEmail = () => {
+    if (invitedFlow) {
+      window.location.replace('/welcome')
+      return
+    }
     setMode('email')
     setCode('')
     setSentEmail('')
@@ -135,7 +140,7 @@ export default function LoginPage() {
     setNotice('')
   }
 
-  const primaryLabel = mode === 'email' ? 'Email sign-in code' : mode === 'code' ? 'Verify and sign in' : 'Sign in'
+  const primaryLabel = mode === 'email' ? 'Email sign-in code' : 'Verify and sign in'
   const primaryIcon = pending
     ? <CircularProgress size={16} color="inherit" />
     : mode === 'email'
@@ -144,7 +149,6 @@ export default function LoginPage() {
   const primaryDisabled = Boolean(pending)
     || (mode === 'email' && !email.trim().includes('@'))
     || (mode === 'code' && code.length !== 6)
-    || (mode === 'password' && !password)
 
   return (
     <Box
@@ -174,15 +178,13 @@ export default function LoginPage() {
         }}
       >
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.25, mb: 3 }}>
-          <Avatar sx={{ width: 38, height: 38, bgcolor: '#A8C7FA', color: '#001D36' }}>
-            <BrandIcon sx={{ fontSize: 20 }} />
-          </Avatar>
+          <BrandMark size={42} />
           <Box>
             <Typography component="h1" variant="h5" sx={{ fontWeight: 750 }}>
               ClawPilot
             </Typography>
             <Typography variant="body2" color="text.secondary">
-              Operator sign in
+              {invitedFlow ? 'Complete your sign in' : 'Operator sign in'}
             </Typography>
           </Box>
         </Box>
@@ -244,38 +246,6 @@ export default function LoginPage() {
           </>
         ) : null}
 
-        {mode === 'password' ? (
-          <TextField
-            autoFocus
-            fullWidth
-            required
-            id="password"
-            name="password"
-            type={showPassword ? 'text' : 'password'}
-            label="Operator password"
-            value={password}
-            onChange={(event) => setPassword(event.target.value)}
-            autoComplete="current-password"
-            slotProps={{
-              input: {
-                endAdornment: (
-                  <InputAdornment position="end">
-                    <IconButton
-                      aria-label={showPassword ? 'Hide password' : 'Show password'}
-                      edge="end"
-                      onClick={() => setShowPassword((visible) => !visible)}
-                      sx={{ color: 'text.secondary' }}
-                    >
-                      {showPassword ? <VisibilityOffRounded /> : <VisibilityRounded />}
-                    </IconButton>
-                  </InputAdornment>
-                ),
-              },
-            }}
-            sx={fieldSx}
-          />
-        ) : null}
-
         <Button
           fullWidth
           type="submit"
@@ -297,7 +267,7 @@ export default function LoginPage() {
         {mode === 'code' ? (
           <Stack direction="row" justifyContent="space-between" sx={{ mt: 1.5 }}>
             <Button size="small" startIcon={<ArrowBackRounded />} onClick={resetEmail} disabled={Boolean(pending)}>
-              Change email
+              {invitedFlow ? 'Back to welcome' : 'Change email'}
             </Button>
             <Button
               size="small"
@@ -309,22 +279,6 @@ export default function LoginPage() {
           </Stack>
         ) : null}
 
-        {mode !== 'code' ? (
-          <Button
-            fullWidth
-            size="small"
-            startIcon={mode === 'password' ? <MailOutlineRounded /> : <PasswordRounded />}
-            onClick={() => {
-              setMode(mode === 'password' ? 'email' : 'password')
-              setError('')
-              setNotice('')
-            }}
-            disabled={Boolean(pending)}
-            sx={{ mt: 1.5, color: 'text.secondary' }}
-          >
-            {mode === 'password' ? 'Use email code instead' : 'Use operator password instead'}
-          </Button>
-        ) : null}
       </Paper>
     </Box>
   )

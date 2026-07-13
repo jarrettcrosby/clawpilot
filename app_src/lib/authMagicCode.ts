@@ -1,11 +1,12 @@
 import crypto from 'crypto'
 import { query, withTransaction } from '@/lib/persistence/postgres'
 import { sendAuthMagicCodeEmail } from '@/lib/matonMail'
-import { getAppUser, markAppUserSignedIn, normalizeUserEmail } from '@/lib/users'
+import { getAppUser, normalizeUserEmail } from '@/lib/users'
 
 const RESEND_COOLDOWN_SECONDS = 60
 const MAX_ATTEMPTS = 5
 const DIGEST_CONTEXT = 'clawpilot-auth-magic-code:v1'
+const AUTHORIZATION_CHANGED = 'AUTHORIZATION_CHANGED'
 
 export type RequestAuthMagicCodeInput = {
   email: string
@@ -38,6 +39,8 @@ type CooldownRow = {
 type VerificationRow = {
   status: 'verified' | 'invalid' | 'locked' | 'expired' | 'consumed'
   attempts: number
+  purpose: 'sign_in' | 'invitation'
+  invitation_id: string | null
 }
 
 function sessionSecret(): string {
@@ -63,18 +66,12 @@ function normalizeIso(value: string): string {
   return new Date(parsed).toISOString()
 }
 
-export async function requestAuthMagicCode(
-  input: RequestAuthMagicCodeInput,
-): Promise<RequestAuthMagicCodeResult> {
-  let requestedEmail: string
-  try {
-    requestedEmail = normalizeUserEmail(input.email)
-  } catch {
-    return { status: 'not-authorized' }
-  }
-  const user = await getAppUser(requestedEmail)
-  if (!user || user.status === 'disabled') return { status: 'not-authorized' }
-
+async function issueAuthMagicCode(input: {
+  email: string
+  purpose: 'sign_in' | 'invitation'
+  invitationId?: string | null
+}): Promise<RequestAuthMagicCodeResult> {
+  const requestedEmail = input.email
   const code = generateCode()
   const digest = digestCode(requestedEmail, code)
   const issuance = await withTransaction(async (client) => {
@@ -89,7 +86,9 @@ export async function requestAuthMagicCode(
           updated_at,
           expires_at,
           last_attempt_at,
-          consumed_at
+          consumed_at,
+          purpose,
+          invitation_id
         )
         VALUES (
           gen_random_uuid(),
@@ -100,7 +99,9 @@ export async function requestAuthMagicCode(
           now(),
           now() + interval '15 minutes',
           NULL,
-          NULL
+          NULL,
+          $3,
+          $4::uuid
         )
         ON CONFLICT (email) DO UPDATE SET
           id = EXCLUDED.id,
@@ -110,11 +111,13 @@ export async function requestAuthMagicCode(
           updated_at = EXCLUDED.updated_at,
           expires_at = EXCLUDED.expires_at,
           last_attempt_at = NULL,
-          consumed_at = NULL
+          consumed_at = NULL,
+          purpose = EXCLUDED.purpose,
+          invitation_id = EXCLUDED.invitation_id
         WHERE auth_magic_codes.created_at <= now() - interval '60 seconds'
         RETURNING id::text AS id, expires_at::text AS expires_at
       `,
-      [requestedEmail, digest],
+      [requestedEmail, digest, input.purpose, input.invitationId || null],
     )
 
     const row = issued.rows[0]
@@ -164,6 +167,49 @@ export async function requestAuthMagicCode(
   }
 }
 
+export async function requestAuthMagicCode(
+  input: RequestAuthMagicCodeInput,
+): Promise<RequestAuthMagicCodeResult> {
+  let requestedEmail: string
+  try {
+    requestedEmail = normalizeUserEmail(input.email)
+  } catch {
+    return { status: 'not-authorized' }
+  }
+  const user = await getAppUser(requestedEmail)
+  if (!user || user.status !== 'active') return { status: 'not-authorized' }
+  return issueAuthMagicCode({ email: requestedEmail, purpose: 'sign_in' })
+}
+
+export async function requestInvitationAuthMagicCode(input: {
+  email: string
+  invitationId: string
+}): Promise<RequestAuthMagicCodeResult> {
+  let requestedEmail: string
+  try {
+    requestedEmail = normalizeUserEmail(input.email)
+  } catch {
+    return { status: 'not-authorized' }
+  }
+  const invitation = await query<{ id: string }>(
+    `
+      SELECT invitation.id::text
+      FROM app_user_invitations invitation
+      INNER JOIN app_users user_record ON user_record.email = invitation.email
+      WHERE invitation.id = $1::uuid
+        AND invitation.email = $2
+        AND invitation.revoked_at IS NULL
+        AND invitation.accepted_at IS NULL
+        AND invitation.expires_at > now()
+        AND user_record.status IN ('invited', 'active')
+      LIMIT 1
+    `,
+    [input.invitationId, requestedEmail],
+  )
+  if (!invitation.rows[0]) return { status: 'not-authorized' }
+  return issueAuthMagicCode({ email: requestedEmail, purpose: 'invitation', invitationId: invitation.rows[0].id })
+}
+
 export async function verifyAuthMagicCode(
   input: VerifyAuthMagicCodeInput,
 ): Promise<VerifyAuthMagicCodeResult> {
@@ -178,8 +224,10 @@ export async function verifyAuthMagicCode(
 
   const submittedCode = String(input.code || '').trim().slice(0, 128)
   const submittedDigest = digestCode(requestedEmail, submittedCode)
-  const result = await withTransaction(async (client) => client.query<VerificationRow>(
-    `
+  let row: VerificationRow | undefined
+  try {
+    row = await withTransaction(async (client) => {
+      const result = await client.query<VerificationRow>(`
       WITH candidate AS (
         SELECT
           id,
@@ -187,7 +235,9 @@ export async function verifyAuthMagicCode(
           attempts,
           expires_at,
           last_attempt_at,
-          consumed_at
+          consumed_at,
+          purpose,
+          invitation_id
         FROM auth_magic_codes
         WHERE email = $1
         FOR UPDATE
@@ -230,17 +280,71 @@ export async function verifyAuthMagicCode(
         WHERE codes.id = outcome.id
         RETURNING codes.id
       )
-      SELECT outcome.status, outcome.next_attempts::integer AS attempts
+      SELECT
+        outcome.status,
+        outcome.next_attempts::integer AS attempts,
+        outcome.purpose,
+        outcome.invitation_id::text
       FROM outcome
       INNER JOIN updated ON updated.id = outcome.id
     `,
-    [requestedEmail, submittedDigest],
-  ))
+      [requestedEmail, submittedDigest],
+      )
 
-  const row = result.rows[0]
+      const verified = result.rows[0]
+      if (verified?.status !== 'verified') return verified
+      if (verified.purpose === 'invitation') {
+        const invitation = await client.query(
+          `
+            UPDATE app_user_invitations
+            SET accepted_at = now(), updated_at = now()
+            WHERE id = $1::uuid
+              AND email = $2
+              AND accepted_at IS NULL
+              AND revoked_at IS NULL
+              AND code_requested_at IS NOT NULL
+              AND expires_at > now()
+            RETURNING id
+          `,
+          [verified.invitation_id, requestedEmail],
+        )
+        if (!invitation.rows[0]) throw new Error(AUTHORIZATION_CHANGED)
+        const activated = await client.query(
+          `
+            UPDATE app_users
+            SET status = 'active',
+                activated_at = COALESCE(activated_at, now()),
+                last_login_at = now(),
+                updated_at = now()
+            WHERE email = $1
+              AND status IN ('invited', 'active')
+            RETURNING email
+          `,
+          [requestedEmail],
+        )
+        if (!activated.rows[0]) throw new Error(AUTHORIZATION_CHANGED)
+      } else {
+        const signedIn = await client.query(
+          `
+            UPDATE app_users
+            SET last_login_at = now(), updated_at = now()
+            WHERE email = $1
+              AND status = 'active'
+            RETURNING email
+          `,
+          [requestedEmail],
+        )
+        if (!signedIn.rows[0]) throw new Error(AUTHORIZATION_CHANGED)
+      }
+      return verified
+    })
+  } catch (error) {
+    if (error instanceof Error && error.message === AUTHORIZATION_CHANGED) return { status: 'not-authorized' }
+    throw error
+  }
+
   if (!row) return { status: 'not-found' }
   if (row.status === 'verified') {
-    await markAppUserSignedIn(requestedEmail)
     return { status: 'verified', email: requestedEmail }
   }
   if (row.status === 'invalid') {

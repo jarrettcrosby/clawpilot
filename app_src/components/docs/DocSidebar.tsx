@@ -9,60 +9,90 @@ import Typography from '@mui/material/Typography'
 import TextField from '@mui/material/TextField'
 import InputAdornment from '@mui/material/InputAdornment'
 import Collapse from '@mui/material/Collapse'
+import IconButton from '@mui/material/IconButton'
+import Tooltip from '@mui/material/Tooltip'
 import SearchRounded from '@mui/icons-material/SearchRounded'
+import RefreshRounded from '@mui/icons-material/RefreshRounded'
 import ExpandLess from '@mui/icons-material/ExpandLess'
 import ExpandMore from '@mui/icons-material/ExpandMore'
 import ArticleRounded from '@mui/icons-material/ArticleRounded'
-import CalendarMonthRounded from '@mui/icons-material/CalendarMonthRounded'
-import BusinessCenterRounded from '@mui/icons-material/BusinessCenterRounded'
-import StorefrontRounded from '@mui/icons-material/StorefrontRounded'
-import RocketLaunchRounded from '@mui/icons-material/RocketLaunchRounded'
-import SportsMotorsportsRounded from '@mui/icons-material/SportsMotorsportsRounded'
-import LightbulbRounded from '@mui/icons-material/LightbulbRounded'
-import GavelRounded from '@mui/icons-material/GavelRounded'
+import AssessmentRounded from '@mui/icons-material/AssessmentRounded'
+import ViewKanbanRounded from '@mui/icons-material/ViewKanbanRounded'
+import TrendingUpRounded from '@mui/icons-material/TrendingUpRounded'
+import TravelExploreRounded from '@mui/icons-material/TravelExploreRounded'
+import NewReleasesRounded from '@mui/icons-material/NewReleasesRounded'
+import AccountTreeRounded from '@mui/icons-material/AccountTreeRounded'
+import SettingsRounded from '@mui/icons-material/SettingsRounded'
+import IntegrationInstructionsRounded from '@mui/icons-material/IntegrationInstructionsRounded'
+import LibraryBooksRounded from '@mui/icons-material/LibraryBooksRounded'
+import ArchiveRounded from '@mui/icons-material/ArchiveRounded'
 import type { SvgIconComponent } from '@mui/icons-material'
 
-type Doc = { id: string; title: string; date: string; tags: string[]; category: string; slug: string }
+type Doc = { id: string; title: string; date: string; tags: string[]; category: string; slug: string; excerpt?: string }
 
 const CATEGORIES: { key: string; label: string; Icon: SvgIconComponent }[] = [
-  { key: 'governance', label: 'SOP / Governance', Icon: GavelRounded },
-  { key: 'daily',      label: 'Daily Journal',   Icon: CalendarMonthRounded },
-  { key: 'epi',        label: 'EPI',             Icon: BusinessCenterRounded },
-  { key: 'suburbia',   label: 'Suburbia',        Icon: StorefrontRounded },
-  { key: 'clawpilot',  label: 'ClawPilot',       Icon: RocketLaunchRounded },
-  { key: 'p9ine',      label: 'P9INE',           Icon: SportsMotorsportsRounded },
-  { key: 'concepts',   label: 'Concepts',        Icon: LightbulbRounded },
+  { key: 'briefings', label: 'Briefings', Icon: AssessmentRounded },
+  { key: 'projects', label: 'Projects', Icon: ViewKanbanRounded },
+  { key: 'pipeline', label: 'Pipeline', Icon: TrendingUpRounded },
+  { key: 'radar', label: 'AI & Opportunity Radar', Icon: TravelExploreRounded },
+  { key: 'releases', label: 'Releases', Icon: NewReleasesRounded },
+  { key: 'architecture', label: 'Architecture', Icon: AccountTreeRounded },
+  { key: 'operations', label: 'Operations', Icon: SettingsRounded },
+  { key: 'integrations', label: 'Integrations', Icon: IntegrationInstructionsRounded },
+  { key: 'knowledge', label: 'Knowledge', Icon: LibraryBooksRounded },
+  { key: 'archive', label: 'Archive', Icon: ArchiveRounded },
 ]
 
-type Props = { docs: Doc[]; selectedId: string | null; onSelect: (id: string) => void }
+type Props = {
+  docs: Doc[]
+  selectedId: string | null
+  onSelect: (id: string) => void
+  onRefresh?: () => void
+  refreshing?: boolean
+  search: string
+  onSearch: (value: string) => void
+}
 
-export default function DocSidebar({ docs, selectedId, onSelect }: Props) {
-  const [search, setSearch] = useState('')
+export default function DocSidebar({ docs, selectedId, onSelect, onRefresh, refreshing = false, search, onSearch }: Props) {
   const [expanded, setExpanded] = useState<Record<string, boolean>>(
     Object.fromEntries(CATEGORIES.map(c => [c.key, true]))
   )
 
-  const toggle = (key: string) => setExpanded(p => ({ ...p, [key]: !p[key] }))
+  const toggle = (key: string) => setExpanded(p => ({ ...p, [key]: !(p[key] ?? true) }))
 
-  const filtered = docs.filter(d => d.title.toLowerCase().includes(search.toLowerCase()))
-  const groups = CATEGORIES
-    .map(c => ({ ...c, docs: filtered.filter(d => d.category === c.key) }))
+  const knownKeys = new Set(CATEGORIES.map(category => category.key))
+  const additional = Array.from(new Set(docs.map(doc => doc.category).filter(category => !knownKeys.has(category))))
+    .sort()
+    .map(key => ({ key, label: key.replace(/(^|[-_])\w/g, value => value.replace(/[-_]/, ' ').toUpperCase()), Icon: ArticleRounded }))
+  const groups = [...CATEGORIES, ...additional]
+    .map(category => ({ ...category, docs: docs.filter(doc => doc.category === category.key) }))
     .filter(g => g.docs.length > 0)
 
   return (
-    <Box sx={{ display: 'flex', flexDirection: 'column', height: '100%', width: 260, backgroundColor: '#12141C', borderRight: '1px solid rgba(255,255,255,0.06)', flexShrink: 0 }}>
+    <Box sx={{ display: 'flex', flexDirection: 'column', height: '100%', width: '100%', minWidth: 0, backgroundColor: '#12141C', flexShrink: 0 }}>
       
       {/* Header */}
       <Box sx={{ px: 2, pt: 2.5, pb: 1.5 }}>
-        <Typography variant="overline" sx={{ color: 'text.disabled', fontSize: '0.65rem', letterSpacing: 1.5, display: 'block', mb: 1 }}>
-          DOCUMENTS
-        </Typography>
+        <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: 1 }}>
+          <Typography variant="overline" sx={{ color: 'text.disabled', fontSize: '0.65rem', letterSpacing: 1.5 }}>
+            {docs.length} DOCUMENTS
+          </Typography>
+          {onRefresh && (
+            <Tooltip title="Refresh document briefs">
+              <span>
+                <IconButton aria-label="Refresh document briefs" size="small" disabled={refreshing} onClick={onRefresh} sx={{ color: 'text.secondary' }}>
+                  <RefreshRounded fontSize="small" />
+                </IconButton>
+              </span>
+            </Tooltip>
+          )}
+        </Box>
         <TextField
           size="small"
           fullWidth
           placeholder="Search..."
           value={search}
-          onChange={e => setSearch(e.target.value)}
+          onChange={e => onSearch(e.target.value)}
           InputProps={{
             startAdornment: (
               <InputAdornment position="start">
@@ -100,12 +130,12 @@ export default function DocSidebar({ docs, selectedId, onSelect }: Props) {
                   primary={group.label}
                   primaryTypographyProps={{ fontSize: '0.8rem', fontWeight: 600, color: 'text.secondary' }}
                 />
-                {expanded[group.key]
+                {(expanded[group.key] ?? true)
                   ? <ExpandLess sx={{ fontSize: 16, color: 'action.disabled' }} />
                   : <ExpandMore sx={{ fontSize: 16, color: 'action.disabled' }} />}
               </ListItemButton>
 
-              <Collapse in={expanded[group.key]} timeout="auto">
+              <Collapse in={expanded[group.key] ?? true} timeout="auto">
                 {group.docs.map(doc => (
                   <ListItemButton
                     key={doc.id}

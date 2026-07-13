@@ -7,13 +7,14 @@
       "/app_src/**",
       "/scripts/**",
       "/db/**",
+      "/docs/**",
       "/package.json",
       "/railway.json"
     ]
   },
   "deploy": {
     "startCommand": "npm run start:railway",
-    "preDeployCommand": "npm run db:migrate",
+    "preDeployCommand": "npm run mail:verify && npm run db:migrate",
     "healthcheckPath": "/api/health",
     "healthcheckTimeout": 300,
     "restartPolicyType": "ON_FAILURE",

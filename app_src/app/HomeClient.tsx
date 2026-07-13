@@ -11,12 +11,12 @@ import PipelineSection from '@/components/pipeline/PipelineSection'
 import AgentsSection from '@/components/agents/AgentsSection'
 import ShortcutsModal from '@/components/help/ShortcutsModal'
 import { Box } from '@mui/material'
-import useMediaQuery from '@mui/material/useMediaQuery'
-import { useTheme } from '@mui/material/styles'
 import type { BoardFilter } from '@/components/projects/FilterBar'
 import { emptyFilter } from '@/components/projects/FilterBar'
 
 const SECTIONS = ['dashboard', 'docs', 'projects', 'pipeline', 'agents', 'versions']
+const DESKTOP_NAV_COLLAPSED_KEY = 'clawpilot_desktop_nav_collapsed'
+const DESKTOP_NAV_PREFERENCE_EVENT = 'clawpilot:desktop-nav-preference'
 
 function getSectionFromHash(): string {
   if (typeof window === 'undefined') return 'dashboard'
@@ -29,45 +29,40 @@ function subscribeToHashChange(onStoreChange: () => void) {
   return () => window.removeEventListener('hashchange', onStoreChange)
 }
 
-function detectTouchDevice(): boolean {
-  if (typeof window === 'undefined') return false
+function getDesktopNavCollapsed(): boolean {
   try {
-    return (navigator.maxTouchPoints || 0) > 0 || 'ontouchstart' in window
+    return localStorage.getItem(DESKTOP_NAV_COLLAPSED_KEY) === 'true'
   } catch {
     return false
   }
 }
 
-export default function HomeClient() {
-  const theme = useTheme()
-  const isMdUp = useMediaQuery(theme.breakpoints.up('md'))
-  const desktopLikeInput = useMediaQuery('(hover: hover) and (pointer: fine)')
-  const isLandscape = useMediaQuery('(orientation: landscape)')
+function subscribeToDesktopNavPreference(onStoreChange: () => void) {
+  window.addEventListener('storage', onStoreChange)
+  window.addEventListener(DESKTOP_NAV_PREFERENCE_EVENT, onStoreChange)
+  return () => {
+    window.removeEventListener('storage', onStoreChange)
+    window.removeEventListener(DESKTOP_NAV_PREFERENCE_EVENT, onStoreChange)
+  }
+}
 
+export default function HomeClient() {
   // Always init 'dashboard' to match SSR. useEffect corrects to real hash post-hydration.
   const activeSection = useSyncExternalStore(subscribeToHashChange, getSectionFromHash, () => 'dashboard')
+  const desktopNavCollapsed = useSyncExternalStore(
+    subscribeToDesktopNavPreference,
+    getDesktopNavCollapsed,
+    () => false,
+  )
   const [shortcutsOpen, setShortcutsOpen] = useState(false)
-  const [desktopNavOpen] = useState(true)
-  const [desktopNavCollapsed, setDesktopNavCollapsed] = useState(false)
+  const [mobileNavOpen, setMobileNavOpen] = useState(false)
   const [boardFilter, setBoardFilter] = useState<BoardFilter>(emptyFilter())
-  const [isTouchDevice] = useState<boolean>(() => detectTouchDevice())
-  const [appRole, setAppRole] = useState<'owner' | 'admin' | 'member' | null>(null)
-  const canManageVersions = appRole === 'owner'
 
-  // iPhone/iPad touch landscape should stay in mobile-nav mode for maneuverability.
-  const tallEnoughForDesktopNav = useMediaQuery('(min-height: 600px)')
-  const touchLandscape = isLandscape && !desktopLikeInput
-  const showDesktopNav = isMdUp && tallEnoughForDesktopNav && desktopLikeInput && !touchLandscape && !isTouchDevice
-
-  useEffect(() => {
-    let active = true
-    fetch('/api/auth/session')
-      .then((response) => response.json())
-      .then((result) => {
-        if (active && result?.ok && ['owner', 'admin', 'member'].includes(result.role)) setAppRole(result.role)
-      })
-      .catch(() => undefined)
-    return () => { active = false }
+  const toggleDesktopNav = useCallback(() => {
+    try {
+      localStorage.setItem(DESKTOP_NAV_COLLAPSED_KEY, String(!getDesktopNavCollapsed()))
+      window.dispatchEvent(new Event(DESKTOP_NAV_PREFERENCE_EVENT))
+    } catch {}
   }, [])
 
   function navigateWithFilter(section: string, filter?: BoardFilter) {
@@ -120,6 +115,7 @@ export default function HomeClient() {
 
   // Navigate and push to browser history
   const navigate = useCallback((section: string) => {
+    setMobileNavOpen(false)
     window.location.hash = section
   }, [])
 
@@ -139,38 +135,45 @@ export default function HomeClient() {
         case '3': navigate('projects'); break
         case '4': navigate('pipeline'); break
         case '5': navigate('agents'); break
-        case '6': if (canManageVersions) navigate('versions'); break
+        case '6': navigate('versions'); break
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [navigate, canManageVersions])
-
-  useEffect(() => {
-    if (appRole && activeSection === 'versions' && !canManageVersions) navigate('dashboard')
-  }, [activeSection, appRole, canManageVersions, navigate])
+  }, [navigate])
 
   const section = activeSection
 
   return (
-    <Box display="flex" height="100dvh" sx={{ backgroundColor: '#0F0F13', overflow: 'hidden' }}>
-      {showDesktopNav && desktopNavOpen && (
-        <Box>
-          <Navigation
-            activeSection={section}
-            onNavigate={navigate}
-            collapsed={desktopNavCollapsed}
-            onToggleCollapse={() => setDesktopNavCollapsed(c => !c)}
-            showVersions={canManageVersions}
-          />
-        </Box>
-      )}
-      <Box flex={1} display="flex" flexDirection="column" overflow="hidden" minWidth={0}>
+    <Box
+      data-testid="app-shell"
+      display="flex"
+      height="100dvh"
+      width="100%"
+      sx={{ maxWidth: '100vw', backgroundColor: '#0F0F13', overflow: 'hidden' }}
+    >
+      <Navigation
+        activeSection={section}
+        onNavigate={navigate}
+        collapsed={desktopNavCollapsed}
+        mobileOpen={mobileNavOpen}
+        onMobileOpen={() => setMobileNavOpen(true)}
+        onMobileClose={() => setMobileNavOpen(false)}
+      />
+      <Box
+        data-testid="app-content"
+        flex={1}
+        display="flex"
+        flexDirection="column"
+        overflow="hidden"
+        minWidth={0}
+      >
         <AppHeader
           activeSection={section}
-          showNavToggle={showDesktopNav}
-          navOpen={!desktopNavCollapsed}
-          onToggleNav={() => setDesktopNavCollapsed(c => !c)}
+          desktopNavCollapsed={desktopNavCollapsed}
+          mobileNavOpen={mobileNavOpen}
+          onToggleDesktopNav={toggleDesktopNav}
+          onOpenMobileNav={() => setMobileNavOpen(true)}
         />
         <Box
           sx={{
@@ -201,7 +204,7 @@ export default function HomeClient() {
               <PipelineSection />
             </Box>
           )}
-          {section === 'versions' && canManageVersions && (
+          {section === 'versions' && (
             <Box sx={{ height: '100%', overflow: 'auto' }}>
               <VersionsSection />
             </Box>
@@ -212,11 +215,6 @@ export default function HomeClient() {
             </Box>
           )}
         </Box>
-        {!showDesktopNav && (
-          <Box>
-            <Navigation activeSection={section} onNavigate={navigate} showVersions={canManageVersions} />
-          </Box>
-        )}
       </Box>
 
       <ShortcutsModal open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />

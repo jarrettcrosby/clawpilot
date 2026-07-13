@@ -98,6 +98,15 @@ export async function GET() {
     if (String(process.env.MATON_GMAIL_CONNECTION_ID || '').length < 8) {
       errors.push('Hosted runtime Maton Gmail connection is not configured.')
     }
+    if (!String(process.env.CLAWPILOT_MAIL_FROM || '').includes('@')) {
+      errors.push('Hosted runtime ClawPilot mail sender is not configured.')
+    }
+    try {
+      const publicUrl = new URL(String(process.env.CLAWPILOT_PUBLIC_URL || ''))
+      if (publicUrl.protocol !== 'https:') errors.push('Hosted runtime public URL must use HTTPS.')
+    } catch {
+      errors.push('Hosted runtime public URL is not configured.')
+    }
     if (String(process.env.PIPELINE_SHEET_ID || '').length < 20) {
       errors.push('Hosted runtime pipeline Sheet is not configured.')
     }
@@ -120,6 +129,12 @@ export async function GET() {
           workspaces_migration_applied: boolean
           workspace_security_migration_applied: boolean
           agent_dispatch_migration_applied: boolean
+          invitation_migration_applied: boolean
+          knowledge_migration_applied: boolean
+          hardening_migration_applied: boolean
+          invitation_delivery_migration_applied: boolean
+          invitation_pending_migration_applied: boolean
+          migration_checksums_present: boolean
         }>(
           `
             SELECT
@@ -163,7 +178,37 @@ export async function GET() {
                 SELECT 1
                 FROM schema_migrations
                 WHERE filename = '0009_agent_dispatch_outbox.sql'
-              ) AS agent_dispatch_migration_applied
+              ) AS agent_dispatch_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0010_user_invitations.sql'
+              ) AS invitation_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0011_knowledge_releases_checkpoints.sql'
+              ) AS knowledge_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0012_invitation_release_hardening.sql'
+              ) AS hardening_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0013_invitation_delivery_coordination.sql'
+              ) AS invitation_delivery_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0014_invitation_delivery_pending.sql'
+              ) AS invitation_pending_migration_applied,
+              NOT EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE checksum IS NULL OR checksum !~ '^[0-9a-f]{64}$'
+              ) AS migration_checksums_present
           `,
         )
         const row = result.rows[0]
@@ -179,6 +224,12 @@ export async function GET() {
             && row?.workspaces_migration_applied
             && row?.workspace_security_migration_applied
             && row?.agent_dispatch_migration_applied
+            && row?.invitation_migration_applied
+            && row?.knowledge_migration_applied
+            && row?.hardening_migration_applied
+            && row?.invitation_delivery_migration_applied
+            && row?.invitation_pending_migration_applied
+            && row?.migration_checksums_present
           ),
         }
         if (
@@ -190,6 +241,12 @@ export async function GET() {
           || !row?.workspaces_migration_applied
           || !row?.workspace_security_migration_applied
           || !row?.agent_dispatch_migration_applied
+          || !row?.invitation_migration_applied
+          || !row?.knowledge_migration_applied
+          || !row?.hardening_migration_applied
+          || !row?.invitation_delivery_migration_applied
+          || !row?.invitation_pending_migration_applied
+          || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')
         }

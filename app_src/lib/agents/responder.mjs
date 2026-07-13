@@ -3,7 +3,7 @@ export class AgentResponder {
     this.id = id
   }
 
-  async respond(_input) {
+  async respond() {
     throw new Error('Not implemented')
   }
 }

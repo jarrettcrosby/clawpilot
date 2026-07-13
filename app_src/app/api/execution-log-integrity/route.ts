@@ -1,4 +1,4 @@
-import { NextRequest, NextResponse } from 'next/server'
+import { NextResponse } from 'next/server'
 import fs from 'fs'
 import path from 'path'
 import { shouldFallbackToFileOnDatabaseError } from '@/lib/persistence/config'
@@ -33,7 +33,7 @@ function inspect(filePath: string) {
   }
 }
 
-export async function GET(_req: NextRequest) {
+export async function GET() {
   if (isPostgresExecutionStoreEnabled()) {
     try {
       const summary = await inspectExecutionTablesFromPostgres()
