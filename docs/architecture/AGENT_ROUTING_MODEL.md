@@ -1,8 +1,8 @@
 # AGENT_ROUTING_MODEL.md
 
-## Canonical Product -> Execution Routing
+## Canonical Product Profiles
 
-Current runtime mapping (must match `app_src/lib/agents/routing.ts`):
+Current profile mapping (must match `app_src/lib/agents/routing.ts`):
 
 - `projects` -> `projects`
 - `pipeline` -> `pipeline`
@@ -20,10 +20,13 @@ Accepted aliases are normalized to canonical product IDs, including:
 - `builder` -> `pipeline`
 
 ## Execution Thread Behavior
-- API: `POST /api/agents/threads`
-- Required payload: `agentId`, `taskId`, `text`
-- Non-`clawpilot` product agents execute real OpenClaw turns.
-- `clawpilot` executes orchestration logic and can delegate.
+
+- Direct thread API: `POST /api/agents/threads` with `agentId`, `taskId`, and `text`.
+- Automated triggers: a new assignment or an explicit card `@Agent` comment.
+- Automated work is inserted into `sync_outbox` as `agent_runtime` / `agent_task` and claimed with a Postgres lease.
+- Each run uses the initiating app user's own connected ChatGPT/Codex credential and private thread history.
+- The profile changes instructions and routing context; it does not create or invoke a separate Custom GPT object.
+- OpenClaw remains an optional local provider and is not required for the hosted runtime.
 
 ## Writeback
 After successful execution, task receives:
@@ -32,3 +35,4 @@ After successful execution, task receives:
 - `execution.latestExecutionNote`
 - `execution.lastResult` summary metadata
 - execution comment + activity log entry
+- `execution.agentDispatch` queue/running/success/failure state

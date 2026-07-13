@@ -161,12 +161,12 @@ export function writeStoreQueued(mutator, file = DEFAULT_FILE) {
   return writeQueue
 }
 
-export function upsertThreadMessage({ agentId, text, role = 'user', taskId, status, tags, routing, meta }, file = DEFAULT_FILE) {
+export function upsertThreadMessage({ messageId, agentId, text, role = 'user', taskId, status, tags, routing, meta }, file = DEFAULT_FILE) {
   const safeRole = (role === 'agent' || role === 'system' || role === 'tool') ? role : 'user'
   const now = nowIso()
   const normalizedStatus = (status === 'pending' || status === 'failed') ? status : 'committed'
   const message = {
-    id: `${Date.now()}-${rand()}`,
+    id: String(messageId || `${Date.now()}-${rand()}`),
     role: safeRole,
     text: String(text || '').trim(),
     createdAt: now,
@@ -201,7 +201,11 @@ export function upsertThreadMessage({ agentId, text, role = 'user', taskId, stat
       })
     } else {
       const t = threads[idx]
-      const messages = [...(t.messages || []), message]
+      const currentMessages = t.messages || []
+      const messageIndex = currentMessages.findIndex(entry => entry.id === message.id)
+      const messages = messageIndex >= 0
+        ? currentMessages.map((entry, index) => index === messageIndex ? message : entry)
+        : [...currentMessages, message]
       t.messages = messages
       t.updatedAt = now
       t.lastMessageAt = now

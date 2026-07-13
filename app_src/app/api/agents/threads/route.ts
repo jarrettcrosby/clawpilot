@@ -102,6 +102,7 @@ async function upsertPersistedThreadMessage(input: Parameters<typeof upsertThrea
     }
   }
   return upsertFileThreadMessage({
+    messageId: input.messageId,
     agentId: input.agentId,
     text: input.text,
     role: input.role,
@@ -121,6 +122,17 @@ async function resolveOperator(req: NextRequest): Promise<string | null> {
   } catch {
     return null
   }
+}
+
+function authorizedWorkerDispatch(req: NextRequest): boolean {
+  if (req.headers.get('x-clawpilot-worker') !== 'agent-dispatch') return false
+  const expected = String(process.env.PIPELINE_OUTBOX_WORKER_SECRET || '')
+  const provided = String(req.headers.get('authorization') || '').replace(/^Bearer\s+/i, '')
+  if (!expected || !provided) return false
+  const expectedBuffer = Buffer.from(expected)
+  const providedBuffer = Buffer.from(provided)
+  return expectedBuffer.length === providedBuffer.length
+    && crypto.timingSafeEqual(expectedBuffer, providedBuffer)
 }
 
 async function resolveAgentBoard(req: NextRequest, operatorId: string, requireEdit = false): Promise<ProjectBoard | null> {
@@ -151,7 +163,7 @@ function deriveNextAction(summary: string): string {
   return firstRemaining?.replace(/^[-*]\s+/, '').trim() || 'Review the agent result and choose the next concrete step.'
 }
 
-async function recordAgentResult(taskId: string, agentId: string, summary: string, boardId?: string) {
+async function recordAgentResult(taskId: string, agentId: string, summary: string, boardId?: string, dispatchId?: string) {
   const tasks = await readTasks(boardId)
   const index = tasks.findIndex((task) => String(task.id) === taskId)
   if (index === -1) return
@@ -159,17 +171,44 @@ async function recordAgentResult(taskId: string, agentId: string, summary: strin
   const task = tasks[index]
   const now = new Date().toISOString()
   const nextAction = deriveNextAction(summary)
+  const commentId = dispatchId ? `agent-dispatch-${dispatchId}` : Date.now().toString()
   const comment: Comment = {
-    id: Date.now().toString(),
+    id: commentId,
     text: `Agent: ${agentId}\n\n${summary}`,
     createdAt: now,
     timestamp: now,
     author: agentId,
   }
+  const existingCommentIndex = (task.comments || []).findIndex((entry) => entry.id === commentId)
+  const comments = existingCommentIndex >= 0
+    ? (task.comments || []).map((entry, entryIndex) => entryIndex === existingCommentIndex ? comment : entry)
+    : [...(task.comments || []), comment]
+  const currentDispatch = task.execution?.agentDispatch
+  const updatesCurrentDispatch = !dispatchId || !currentDispatch || currentDispatch.id === dispatchId
+  const execution = updatesCurrentDispatch
+    ? {
+        ...(task.execution || {}),
+        executionStatus: 'completed',
+        lastUpdatedAt: now,
+        latestExecutionNote: summary,
+        lastResult: { type: 'agent-thread-result', agentId, summary, nextAction, recordedAt: now },
+        agentDispatch: dispatchId
+          ? {
+              id: dispatchId,
+              trigger: currentDispatch?.trigger || 'assignment' as const,
+              status: 'succeeded' as const,
+              attempts: currentDispatch?.attempts || 1,
+              queuedAt: currentDispatch?.queuedAt || now,
+              updatedAt: now,
+            }
+          : currentDispatch,
+      }
+    : task.execution
+  const activityAlreadyRecorded = (task.activity || []).some((entry) => entry.commentId === commentId)
   tasks[index] = {
     ...task,
-    comments: [...(task.comments || []), comment],
-    activity: [
+    comments,
+    activity: activityAlreadyRecorded ? task.activity : [
       ...(task.activity || []),
       {
         type: 'comment',
@@ -178,15 +217,10 @@ async function recordAgentResult(taskId: string, agentId: string, summary: strin
         actor: agentId,
         taskId: task.id,
         taskTitle: task.title,
-        commentId: comment.id,
+        commentId,
       },
     ],
-    execution: {
-      ...(task.execution || {}),
-      lastUpdatedAt: now,
-      latestExecutionNote: summary,
-      lastResult: { type: 'agent-thread-result', agentId, summary, nextAction, recordedAt: now },
-    },
+    execution,
     updatedAt: now,
   }
   await writeTasks(tasks, boardId)
@@ -346,6 +380,15 @@ export async function POST(req: NextRequest) {
   const text = String(body?.text || '').trim()
   const taskId = String(body?.taskId || '').trim()
   const tags = Array.isArray(body?.tags) ? body.tags.map(String) : undefined
+  const requestedDispatchId = String(body?.dispatchId || '').trim()
+  if (requestedDispatchId && !authorizedWorkerDispatch(req)) {
+    return NextResponse.json({ ok: false, error: 'Agent dispatch metadata requires worker authorization' }, { status: 403 })
+  }
+  const dispatchId = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(requestedDispatchId)
+    ? requestedDispatchId.toLowerCase()
+    : undefined
+  const dispatchAttempt = Math.max(0, Math.trunc(Number(body?.dispatchAttempt) || 0))
+  const messageSource = dispatchId ? 'dispatch' : 'api'
   if (!agentId || !text || !taskId) {
     return NextResponse.json({ ok: false, error: 'valid agentId, taskId and text required' }, { status: 400 })
   }
@@ -355,17 +398,80 @@ export async function POST(req: NextRequest) {
   const mismatch = assignmentError(task, agentId)
   if (mismatch) return NextResponse.json({ ok: false, error: mismatch }, { status: 409 })
 
-  const runtime = await getAgentRuntimeForOperator(operatorId)
-  if (!runtime.ready) return NextResponse.json({ ok: false, error: runtime.label, runtime }, { status: 503 })
-
   const executionAgentId = resolveExecutionAgentForControlAgent(agentId)
   if (!executionAgentId) return NextResponse.json({ ok: false, error: 'execution route missing for product agent' }, { status: 400 })
+  const [runtime, beforeThread] = await Promise.all([
+    getAgentRuntimeForOperator(operatorId),
+    getPersistedThread({ operatorId, agentId, taskId }),
+  ])
   const responderId = runtime.provider === 'openclaw' ? resolveResponderId(executionAgentId) : agentId
   const routing = { responder: responderId, channel: 'internal', priority: 'normal' }
-  const runId = crypto.randomUUID()
+  const requestMessageId = dispatchId ? `agent-dispatch-${dispatchId}-request` : undefined
+  const resultMessageId = dispatchId ? `agent-dispatch-${dispatchId}-result` : undefined
+  const beforeMessages = (Array.isArray(beforeThread?.messages) ? beforeThread.messages : []) as Array<{
+    id: string
+    role: string
+    text: string
+    meta?: Record<string, unknown>
+  }>
+  const existingResponse = dispatchId
+    ? beforeMessages.find((message) => message.role === 'agent' && message.meta?.dispatchId === dispatchId)
+    : null
+  if (existingResponse) {
+    return NextResponse.json({
+      ok: true,
+      deduplicated: true,
+      thread: beforeThread,
+      userMessage: beforeMessages.find((message) => message.id === requestMessageId) || null,
+      agentMessage: existingResponse,
+      runtime,
+      canonicalWorkItem: buildCanonicalWorkItem(task),
+    })
+  }
+
+  const resultCommentId = dispatchId ? `agent-dispatch-${dispatchId}` : ''
+  const existingResultComment = resultCommentId
+    ? (task.comments || []).find((comment) => comment.id === resultCommentId)
+    : null
+  if (existingResultComment) {
+    const recoveredText = existingResultComment.text.replace(/^Agent:\s*[^\n]+\n\n/i, '').trim()
+    await upsertPersistedThreadMessage({
+      messageId: resultMessageId,
+      operatorId,
+      agentId,
+      text: recoveredText || existingResultComment.text,
+      role: 'agent',
+      taskId,
+      status: 'active',
+      tags,
+      routing,
+      meta: { source: messageSource, phase: 'response', dispatchId, recovered: true, responder: responderId, executionAgentId, provider: runtime.provider },
+    })
+    const recoveredThread = await getPersistedThread({ operatorId, agentId, taskId })
+    const recoveredMessages = (Array.isArray(recoveredThread?.messages) ? recoveredThread.messages : []) as Array<{
+      id: string
+      role: string
+      text: string
+    }>
+    return NextResponse.json({
+      ok: true,
+      deduplicated: true,
+      recovered: true,
+      thread: recoveredThread,
+      userMessage: recoveredMessages.find((message) => message.id === requestMessageId) || null,
+      agentMessage: recoveredMessages.find((message) => message.id === resultMessageId) || null,
+      runtime,
+      canonicalWorkItem: buildCanonicalWorkItem(task),
+    })
+  }
+
+  if (!runtime.ready) return NextResponse.json({ ok: false, error: runtime.label, runtime }, { status: 503 })
+
+  const runId = dispatchId || crypto.randomUUID()
   const startedAt = new Date().toISOString()
 
   await upsertPersistedThreadMessage({
+    messageId: requestMessageId,
     operatorId,
     agentId,
     text,
@@ -374,12 +480,22 @@ export async function POST(req: NextRequest) {
     status: 'resolving',
     tags,
     routing,
-    meta: { source: 'api', phase: 'request', executionAgentId, provider: runtime.provider },
+    meta: { source: messageSource, phase: 'request', dispatchId, dispatchAttempt, executionAgentId, provider: runtime.provider },
   })
 
   const afterUser = await getPersistedThread({ operatorId, agentId, taskId })
-  const userMessage = afterUser?.messages?.[afterUser.messages.length - 1] || null
-  const messages = (Array.isArray(afterUser?.messages) ? afterUser.messages : []) as Array<{ role: string; text: string }>
+  const messages = (Array.isArray(afterUser?.messages) ? afterUser.messages : []) as Array<{
+    id: string
+    role: string
+    text: string
+    meta?: Record<string, unknown>
+  }>
+  const userMessage = requestMessageId
+    ? messages.find((message) => message.id === requestMessageId) || null
+    : messages[messages.length - 1] || null
+  const conversation = messages
+    .filter((message) => dispatchId ? message.meta?.dispatchId !== dispatchId : message.id !== userMessage?.id)
+    .map((message) => ({ role: message.role, text: message.text }))
   const taskContext = buildTaskContext(task, agentId)
 
   let responseText = ''
@@ -389,7 +505,7 @@ export async function POST(req: NextRequest) {
         agentId,
         taskContext,
         userText: text,
-        conversation: messages.slice(0, -1).map((message) => ({ role: message.role, text: message.text })),
+        conversation,
       })
     } else if (runtime.provider === 'openai-codex') {
       responseText = await runChatGPTAgent({
@@ -398,7 +514,7 @@ export async function POST(req: NextRequest) {
         agentId,
         taskContext,
         userText: text,
-        conversation: messages.slice(0, -1).map((message) => ({ role: message.role, text: message.text })),
+        conversation,
       })
     } else {
       responseText = await runOpenClawAgent(executionAgentId, `${taskContext}\n\nOperator request:\n${text}`)
@@ -416,8 +532,11 @@ export async function POST(req: NextRequest) {
       startedAt,
       completedAt: new Date().toISOString(),
       error: message,
+      dispatchId,
+      dispatchAttempt,
     })
     await upsertPersistedThreadMessage({
+      messageId: resultMessageId,
       operatorId,
       agentId,
       text: `Execution failed: ${message}`,
@@ -426,13 +545,13 @@ export async function POST(req: NextRequest) {
       status: 'blocked',
       tags,
       routing,
-      meta: { source: 'api', phase: 'failure', executionAgentId, provider: runtime.provider },
+      meta: { source: messageSource, phase: 'failure', dispatchId, dispatchAttempt, executionAgentId, provider: runtime.provider },
     })
     return NextResponse.json({ ok: false, error: message, runtime, thread: await getPersistedThread({ operatorId, agentId, taskId }) }, { status: 502 })
   }
 
   const completedAt = new Date().toISOString()
-  await recordAgentResult(taskId, agentId, responseText, board?.id)
+  await recordAgentResult(taskId, agentId, responseText, board?.id, dispatchId)
   await recordExecutionTelemetry({
     runId,
     operatorId,
@@ -444,9 +563,12 @@ export async function POST(req: NextRequest) {
     startedAt,
     completedAt,
     summary: responseText,
+    dispatchId,
+    dispatchAttempt,
   }, true)
   await writeDocsLog(agentId, responseText)
   await upsertPersistedThreadMessage({
+    messageId: resultMessageId,
     operatorId,
     agentId,
     text: responseText,
@@ -455,16 +577,19 @@ export async function POST(req: NextRequest) {
     status: 'active',
     tags,
     routing,
-    meta: { source: 'api', phase: 'response', responder: responderId, executionAgentId, provider: runtime.provider },
+    meta: { source: messageSource, phase: 'response', dispatchId, dispatchAttempt, responder: responderId, executionAgentId, provider: runtime.provider },
   })
 
   const thread = await getPersistedThread({ operatorId, agentId, taskId })
+  const threadMessages = (Array.isArray(thread?.messages) ? thread.messages : []) as Array<{ id: string }>
   const updatedTask = (await readTasks(board?.id)).find((entry) => String(entry.id) === taskId)
   return NextResponse.json({
     ok: true,
     thread,
     userMessage,
-    agentMessage: thread?.messages?.[thread.messages.length - 1] || null,
+    agentMessage: resultMessageId
+      ? threadMessages.find((message) => message.id === resultMessageId) || null
+      : threadMessages[threadMessages.length - 1] || null,
     runtime,
     canonicalWorkItem: updatedTask ? buildCanonicalWorkItem(updatedTask) : null,
   })

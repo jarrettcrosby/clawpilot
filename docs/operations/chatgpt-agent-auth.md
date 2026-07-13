@@ -5,11 +5,11 @@ ClawPilot can run its product-agent conversations with a signed-in user's ChatGP
 ## Account Boundary
 
 - `APP_LOGIN_EMAIL` is bootstrapped as the ClawPilot owner.
-- The owner can invite or disable members from Settings > User access.
+- The owner can invite or disable members from Settings > People.
 - Each member signs in with their own email magic code.
 - Each member must connect their own ChatGPT account from Agents.
 - OAuth credentials and agent threads are scoped to the normalized ClawPilot email.
-- Project and pipeline records remain shared collaboration data. Agent conversation transcripts are private to the initiating user; results intentionally written back to a shared task remain visible on that task.
+- Project boards and pipelines are private to their owner unless explicitly shared. Agent conversation transcripts are private to the initiating user; results intentionally written back to a shared task remain visible to collaborators on that board.
 
 ## Device Flow
 
@@ -18,7 +18,7 @@ ClawPilot can run its product-agent conversations with a signed-in user's ChatGP
 3. ClawPilot polls the device authorization endpoint and exchanges the approved code for access and refresh tokens.
 4. Tokens are encrypted with AES-256-GCM before being stored in Postgres.
 5. Agent requests use the Codex Responses backend and the connected account ID.
-6. Refresh-token rotation is serialized with a Postgres row lock.
+6. Hosted dev and production read the same restricted credential rows, and refresh-token rotation is serialized with a Postgres row lock.
 7. Disconnect performs best-effort upstream revocation and always removes local credentials.
 
 ## Required Environment
@@ -26,13 +26,20 @@ ClawPilot can run its product-agent conversations with a signed-in user's ChatGP
 ```bash
 CLAWPILOT_AGENT_PROVIDER=openai-codex
 AGENT_CREDENTIAL_ENCRYPTION_KEY=<at-least-32-random-characters>
+AGENT_CREDENTIAL_DATABASE_URL=<restricted-shared-Postgres-URL>
 OPENAI_CODEX_AGENT_MODEL=gpt-5.4
 ```
 
-Use the same credential encryption key anywhere the same Postgres credential rows must be readable. Rotate it only with a planned credential reset; existing ciphertext cannot be decrypted after an uncoordinated key change.
+Use the same credential database URL and encryption key in both hosted lanes. The database role should have only `SELECT`, `INSERT`, `UPDATE`, and `DELETE` on `agent_chatgpt_credentials` and `agent_chatgpt_pending_logins`. This keeps app data isolated by environment while preventing a second device login or refresh from invalidating another lane. Rotate the key only with a planned credential reset; existing ciphertext cannot be decrypted after an uncoordinated key change.
 
 ## Operational Notes
 
 The ChatGPT/Codex authorization path is distinct from the public OpenAI API-key path. Model entitlements and usage limits come from the connected user's ChatGPT plan. A user whose authorization expires must reconnect.
 
 The Codex backend and OAuth client behavior must be regression-tested during OpenAI/Codex upgrades because they do not have the same compatibility guarantees as the public API-key Responses endpoint.
+
+## Product Agent Mapping
+
+ClawPilot defines five product profiles: Projects, Pipeline, Docs, Calendar, and ClawPilot. Each profile contributes a distinct instruction and routing context, but all five use the initiating ClawPilot user's connected ChatGPT/Codex authorization. They are not separate Custom GPT objects in the user's ChatGPT sidebar.
+
+Task assignment and explicit `@Agent` card comments enqueue durable Postgres dispatch records. The Railway worker restores the initiating user's session and selected board, executes against that user's credential, retries transient failures, and writes the result to both the user's private task thread and the shared card.

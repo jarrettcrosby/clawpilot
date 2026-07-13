@@ -79,6 +79,7 @@ function isPublicApi(pathname: string) {
     normalizedPath === '/api/version' ||
     normalizedPath === '/api/client-error' ||
     normalizedPath === '/api/pipeline/sync/outbox/process' ||
+    normalizedPath === '/api/agents/dispatch/process' ||
     normalizedPath.startsWith('/api/auth/')
   )
 }

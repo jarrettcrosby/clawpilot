@@ -1,7 +1,7 @@
 import crypto from 'crypto'
 import type { PoolClient } from 'pg'
 import { isHostedRuntime } from '@/lib/persistence/config'
-import { query, withTransaction } from '@/lib/persistence/postgres'
+import { query, withTransaction } from '@/lib/persistence/agentCredentials'
 
 const PROVIDER = 'openai-codex'
 const AUTH_BASE_URL = 'https://auth.openai.com'

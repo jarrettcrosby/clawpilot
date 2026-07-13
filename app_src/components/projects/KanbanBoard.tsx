@@ -30,7 +30,6 @@ import ArchivedCardsView from './ArchivedCardsView'
 import DeletedCardsView from './DeletedCardsView'
 import type { Task } from '@/lib/types'
 import { ASSIGNABLE_PRODUCT_AGENT_IDS, COLUMNS, PEOPLE } from '@/lib/types'
-import { assignmentKickoffText, triggerAgentTurn } from '@/lib/agents/client'
 import WorkspaceSelector from '@/components/workspaces/WorkspaceSelector'
 
 type BoardCtx = {
@@ -98,6 +97,9 @@ export default function KanbanBoard({ externalFilter, onFilterChange }: Props = 
 
   const filter = externalFilter && isFilterActive(externalFilter) ? externalFilter : internalFilter
   const drawerTask = tasks.find(task => task.id === drawerTaskId) || null
+  const hasActiveAgentDispatch = tasks.some(task => (
+    task.execution?.agentDispatch?.status === 'queued' || task.execution?.agentDispatch?.status === 'running'
+  ))
 
   useEffect(() => {
     if (!archiveMode) setArchiveView('archived')
@@ -124,6 +126,26 @@ export default function KanbanBoard({ externalFilter, onFilterChange }: Props = 
       controller.abort()
     }
   }, [])
+
+  useEffect(() => {
+    if (!hasActiveAgentDispatch) return
+    let active = true
+    const refresh = async () => {
+      try {
+        const response = await fetch('/api/tasks')
+        if (!response.ok) return
+        const taskData = await response.json()
+        if (active && Array.isArray(taskData)) setTasks(taskData)
+      } catch {
+        // Keep the current board state and retry on the next interval.
+      }
+    }
+    const timer = setInterval(() => { void refresh() }, 3000)
+    return () => {
+      active = false
+      clearInterval(timer)
+    }
+  }, [hasActiveAgentDispatch])
 
   const updateTask = useCallback((updated: Task) => {
     setTasks(previous => previous.map(task => task.id === updated.id ? updated : task))
@@ -280,13 +302,6 @@ export default function KanbanBoard({ externalFilter, onFilterChange }: Props = 
       setNewTask(EMPTY_NEW_TASK)
       setNewTaskOpen(false)
       openDrawer(String(created.id))
-      if (created.assignedAgent) {
-        try {
-          await triggerAgentTurn({ taskId: created.id, agentId: created.assignedAgent, text: assignmentKickoffText() })
-        } catch (error) {
-          setMoveError(error instanceof Error ? `Task created, but agent kickoff failed: ${error.message}` : 'Task created, but agent kickoff failed.')
-        }
-      }
     } catch (error) {
       setCreateError(error instanceof Error ? error.message : 'Unable to create task.')
     } finally {

@@ -140,6 +140,31 @@ async function run() {
   assert.ok(taskThread.tags.includes('task-tag'))
   assert.ok(!generalThread.tags.includes('task-tag'))
 
+  // Dispatch retries replace deterministic messages instead of duplicating them.
+  await upsertThreadMessage({
+    messageId: 'agent-dispatch-123-result',
+    agentId: 'builder-agent',
+    taskId: 'CP-900',
+    text: 'first attempt failed',
+    role: 'system',
+    status: 'failed',
+    meta: { dispatchId: '123', phase: 'failure' },
+  }, file)
+  await upsertThreadMessage({
+    messageId: 'agent-dispatch-123-result',
+    agentId: 'builder-agent',
+    taskId: 'CP-900',
+    text: 'retry succeeded',
+    role: 'agent',
+    status: 'committed',
+    meta: { dispatchId: '123', phase: 'response' },
+  }, file)
+  const retriedThread = getThread({ agentId: 'builder-agent', taskId: 'CP-900' }, file)
+  const dispatchMessages = retriedThread.messages.filter(message => message.id === 'agent-dispatch-123-result')
+  assert.equal(dispatchMessages.length, 1)
+  assert.equal(dispatchMessages[0].role, 'agent')
+  assert.equal(dispatchMessages[0].text, 'retry succeeded')
+
   console.log('PASS test-agent-thread-store')
 }
 

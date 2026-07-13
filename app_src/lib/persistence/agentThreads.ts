@@ -38,6 +38,7 @@ export type PersistedAgentThread = {
 }
 
 type UpsertThreadMessageInput = {
+  messageId?: string
   operatorId: string
   agentId: string
   text: string
@@ -208,7 +209,7 @@ export async function upsertThreadMessageInPostgres(input: UpsertThreadMessageIn
   const threadId = toThreadId(operatorId, agentId, taskId)
   const createdAt = nowIso()
   const message: PersistedThreadMessage = {
-    id: `${Date.now()}-${rand()}`,
+    id: String(input.messageId || `${Date.now()}-${rand()}`),
     role: normalizeMessageRole(input.role),
     text,
     createdAt,
@@ -224,7 +225,11 @@ export async function upsertThreadMessageInPostgres(input: UpsertThreadMessageIn
     )
 
     const current = normalizeThreadPayload(existing.rows[0]?.payload, existing.rows[0]?.operator_id)
-    const messages = [...(current?.messages || []), message]
+    const previousMessages = current?.messages || []
+    const messageIndex = previousMessages.findIndex((entry) => entry.id === message.id)
+    const messages = messageIndex >= 0
+      ? previousMessages.map((entry, index) => index === messageIndex ? message : entry)
+      : [...previousMessages, message]
     const contextSnapshot = message.meta?.taskContext && typeof message.meta.taskContext === 'object'
       ? message.meta.taskContext as Record<string, unknown>
       : current?.contextSnapshot || null
