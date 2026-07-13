@@ -1055,9 +1055,10 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
                             </>
                           ) : null}
 
-                          <Divider sx={{ borderColor: 'rgba(255,255,255,0.07)' }} />
+                          {owned ? <>
+                            <Divider sx={{ borderColor: 'rgba(255,255,255,0.07)' }} />
 
-                          <Box sx={{ px: { xs: 1.5, sm: 2 }, py: 0.5 }}>
+                            <Box sx={{ px: { xs: 1.5, sm: 2 }, py: 0.5 }}>
                             {resource.members.length > 0 ? resource.members.map((member, index) => (
                               <Box
                                 key={member.email}
@@ -1129,7 +1130,8 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
                                 No shared access
                               </Typography>
                             )}
-                          </Box>
+                            </Box>
+                          </> : null}
                         </Box>
                       )
                     })}
