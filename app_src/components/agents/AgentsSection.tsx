@@ -3,10 +3,15 @@
 import { useEffect, useMemo, useState } from 'react'
 import Alert from '@mui/material/Alert'
 import Box from '@mui/material/Box'
+import Button from '@mui/material/Button'
 import ButtonBase from '@mui/material/ButtonBase'
 import Card from '@mui/material/Card'
 import Chip from '@mui/material/Chip'
 import CircularProgress from '@mui/material/CircularProgress'
+import Dialog from '@mui/material/Dialog'
+import DialogActions from '@mui/material/DialogActions'
+import DialogContent from '@mui/material/DialogContent'
+import DialogTitle from '@mui/material/DialogTitle'
 import Divider from '@mui/material/Divider'
 import FormControl from '@mui/material/FormControl'
 import IconButton from '@mui/material/IconButton'
@@ -18,6 +23,12 @@ import Stack from '@mui/material/Stack'
 import TextField from '@mui/material/TextField'
 import Tooltip from '@mui/material/Tooltip'
 import Typography from '@mui/material/Typography'
+import CheckRounded from '@mui/icons-material/CheckRounded'
+import ContentCopyRounded from '@mui/icons-material/ContentCopyRounded'
+import LinkOffRounded from '@mui/icons-material/LinkOffRounded'
+import LoginRounded from '@mui/icons-material/LoginRounded'
+import OpenInNewRounded from '@mui/icons-material/OpenInNewRounded'
+import RefreshRounded from '@mui/icons-material/RefreshRounded'
 import SendRounded from '@mui/icons-material/SendRounded'
 import type { Task } from '@/lib/types'
 
@@ -32,12 +43,27 @@ type Agent = {
 }
 
 type Runtime = {
-  provider: 'openai' | 'openclaw' | 'none'
+  provider: 'openai' | 'openai-codex' | 'openclaw' | 'none'
   ready: boolean
   status: 'ready' | 'not-configured'
   label: string
   model?: string
+  auth?: {
+    connected: boolean
+    email?: string
+    planType?: string
+    expiresAt?: string
+  }
 }
+
+type DeviceLogin = {
+  loginId: string
+  verificationUrl: string
+  userCode: string
+  expiresAt: string
+}
+
+type AuthPhase = 'waiting' | 'expired' | 'failed'
 
 type ThreadMessage = {
   id: string
@@ -53,6 +79,44 @@ function formatTimestamp(value: string | undefined) {
   return Number.isNaN(date.getTime()) ? '' : date.toLocaleString()
 }
 
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' ? value as Record<string, unknown> : {}
+}
+
+function payloadMessage(payload: Record<string, unknown>, fallback: string) {
+  if (typeof payload.error === 'string' && payload.error.trim()) return payload.error
+  const error = asRecord(payload.error)
+  if (typeof error.message === 'string' && error.message.trim()) return error.message
+  if (typeof payload.message === 'string' && payload.message.trim()) return payload.message
+  return fallback
+}
+
+async function copyText(text: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text)
+      return true
+    }
+  } catch {
+    // Fall through for browsers that block clipboard access outside secure contexts.
+  }
+
+  try {
+    const textarea = document.createElement('textarea')
+    textarea.value = text
+    textarea.setAttribute('readonly', '')
+    textarea.style.position = 'fixed'
+    textarea.style.opacity = '0'
+    document.body.appendChild(textarea)
+    textarea.select()
+    const copied = document.execCommand('copy')
+    document.body.removeChild(textarea)
+    return copied
+  } catch {
+    return false
+  }
+}
+
 export default function AgentsSection() {
   const [agents, setAgents] = useState<Agent[]>([])
   const [runtime, setRuntime] = useState<Runtime | null>(null)
@@ -63,6 +127,13 @@ export default function AgentsSection() {
   const [composer, setComposer] = useState('')
   const [sending, setSending] = useState(false)
   const [notice, setNotice] = useState('')
+  const [authStarting, setAuthStarting] = useState(false)
+  const [authDisconnecting, setAuthDisconnecting] = useState(false)
+  const [deviceLogin, setDeviceLogin] = useState<DeviceLogin | null>(null)
+  const [authPhase, setAuthPhase] = useState<AuthPhase>('waiting')
+  const [authError, setAuthError] = useState('')
+  const [popupBlocked, setPopupBlocked] = useState(false)
+  const [codeCopied, setCodeCopied] = useState(false)
 
   async function loadWorkspace() {
     const [agentResponse, taskResponse] = await Promise.all([
@@ -85,6 +156,76 @@ export default function AgentsSection() {
   useEffect(() => {
     loadWorkspace().catch(() => setNotice('Unable to load agent workspace.'))
   }, [])
+
+  useEffect(() => {
+    if (!deviceLogin) return
+
+    const activeLogin = deviceLogin
+    let cancelled = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const controller = new AbortController()
+    const expiresAt = new Date(activeLogin.expiresAt).getTime()
+
+    function expireLogin() {
+      setAuthPhase('expired')
+      setAuthError('This device code has expired. Start a new connection to continue.')
+    }
+
+    async function poll() {
+      if (cancelled) return
+      if (Number.isFinite(expiresAt) && Date.now() >= expiresAt) {
+        expireLogin()
+        return
+      }
+
+      try {
+        const response = await fetch('/api/agents/auth/poll', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ loginId: activeLogin.loginId }),
+          signal: controller.signal,
+        })
+        const payload = asRecord(await response.json().catch(() => null))
+        const auth = asRecord(payload.auth)
+        const status = String(payload.status || payload.state || '').trim().toLowerCase()
+        const completed = payload.completed === true
+          || payload.connected === true
+          || auth.connected === true
+          || ['complete', 'completed', 'connected', 'success'].includes(status)
+        const expired = payload.expired === true
+          || response.status === 410
+          || ['expired', 'code_expired'].includes(status)
+        const failed = ['failed', 'error', 'denied', 'access_denied', 'cancelled', 'canceled'].includes(status)
+
+        if (completed) {
+          setDeviceLogin(null)
+          setNotice('ChatGPT connected.')
+          await loadWorkspace().catch(() => setNotice('ChatGPT connected, but the workspace could not be refreshed.'))
+          return
+        }
+        if (expired) {
+          expireLogin()
+          return
+        }
+        if (!response.ok || failed) {
+          throw new Error(payloadMessage(payload, 'ChatGPT authorization failed.'))
+        }
+
+        timer = setTimeout(poll, 3000)
+      } catch (error) {
+        if (cancelled || controller.signal.aborted) return
+        setAuthPhase('failed')
+        setAuthError(error instanceof Error ? error.message : 'ChatGPT authorization failed.')
+      }
+    }
+
+    timer = setTimeout(poll, 3000)
+    return () => {
+      cancelled = true
+      if (timer) clearTimeout(timer)
+      controller.abort()
+    }
+  }, [deviceLogin])
 
   const openTasks = useMemo(
     () => tasks.filter((task) => task.status !== 'done' && !task.archived && !task.deletedAt),
@@ -183,6 +324,101 @@ export default function AgentsSection() {
     }
   }
 
+  function closeAuthDialog() {
+    setDeviceLogin(null)
+    setAuthPhase('waiting')
+    setAuthError('')
+    setPopupBlocked(false)
+    setCodeCopied(false)
+  }
+
+  async function startChatGPTAuth() {
+    if (authStarting) return
+    setAuthStarting(true)
+    setAuthPhase('waiting')
+    setAuthError('')
+    setPopupBlocked(false)
+    setCodeCopied(false)
+
+    let popup: Window | null = null
+    try {
+      popup = window.open('about:blank', '_blank')
+      if (popup) popup.opener = null
+
+      const response = await fetch('/api/agents/auth', { method: 'POST' })
+      const payload = asRecord(await response.json().catch(() => null))
+      if (!response.ok) throw new Error(payloadMessage(payload, 'Unable to start ChatGPT authorization.'))
+
+      const loginId = typeof payload.loginId === 'string' ? payload.loginId : ''
+      const verificationUrl = typeof payload.verificationUrl === 'string' ? payload.verificationUrl : ''
+      const userCode = typeof payload.userCode === 'string' ? payload.userCode : ''
+      const expiresAt = typeof payload.expiresAt === 'string' ? payload.expiresAt : ''
+      if (!loginId || !verificationUrl || !userCode || !expiresAt) {
+        throw new Error('ChatGPT authorization returned an incomplete device login.')
+      }
+
+      setDeviceLogin({ loginId, verificationUrl, userCode, expiresAt })
+      if (!popup || popup.closed) {
+        setPopupBlocked(true)
+      } else {
+        try {
+          popup.location.replace(verificationUrl)
+        } catch {
+          popup.close()
+          setPopupBlocked(true)
+        }
+      }
+    } catch (error) {
+      if (popup && !popup.closed) popup.close()
+      setNotice(error instanceof Error ? error.message : 'Unable to start ChatGPT authorization.')
+    } finally {
+      setAuthStarting(false)
+    }
+  }
+
+  function openVerificationUrl() {
+    if (!deviceLogin) return
+    const popup = window.open(deviceLogin.verificationUrl, '_blank')
+    if (!popup) {
+      setPopupBlocked(true)
+      setAuthError('The verification page could not be opened. Allow popups and try again.')
+      return
+    }
+    popup.opener = null
+    setPopupBlocked(false)
+  }
+
+  async function copyDeviceCode() {
+    if (!deviceLogin) return
+    const copied = await copyText(deviceLogin.userCode)
+    setCodeCopied(copied)
+    setNotice(copied ? 'Device code copied.' : 'Unable to copy the device code.')
+  }
+
+  async function disconnectChatGPT() {
+    if (authDisconnecting) return
+    setAuthDisconnecting(true)
+    try {
+      const response = await fetch('/api/agents/auth', { method: 'DELETE' })
+      const payload = asRecord(await response.json().catch(() => null))
+      if (!response.ok) throw new Error(payloadMessage(payload, 'Unable to disconnect ChatGPT.'))
+      setNotice('ChatGPT disconnected.')
+      await loadWorkspace()
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'Unable to disconnect ChatGPT.')
+    } finally {
+      setAuthDisconnecting(false)
+    }
+  }
+
+  const codexAuth = runtime?.provider === 'openai-codex' ? runtime.auth : undefined
+  const codexConnected = Boolean(codexAuth?.connected)
+  const codexAccountDetails = [
+    codexAuth?.email,
+    codexAuth?.planType,
+    codexAuth?.expiresAt ? `Expires ${formatTimestamp(codexAuth.expiresAt)}` : '',
+  ].filter(Boolean).join(' | ')
+
   return (
     <Box p={{ xs: 2, md: 3 }}>
       <Stack direction={{ xs: 'column', sm: 'row' }} justifyContent="space-between" spacing={1.5} mb={2}>
@@ -193,17 +429,51 @@ export default function AgentsSection() {
         <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap">
           <Chip size="small" label={`${agents.length} agents`} />
           <Chip size="small" label={`${assignedCount}/${openTasks.length} assigned`} />
-          <Chip
-            size="small"
-            color={runtime?.ready ? 'success' : 'default'}
-            label={runtime?.label || 'Checking provider'}
-          />
+          <Tooltip title={codexConnected ? codexAccountDetails || 'ChatGPT connected' : ''}>
+            <Chip
+              size="small"
+              color={runtime?.ready ? 'success' : 'default'}
+              label={runtime?.label || 'Checking provider'}
+              sx={{ maxWidth: { xs: 190, sm: 280 }, '& .MuiChip-label': { overflow: 'hidden', textOverflow: 'ellipsis' } }}
+            />
+          </Tooltip>
+          {codexConnected && (
+            <Tooltip title={`Disconnect ChatGPT${codexAuth?.email ? ` for ${codexAuth.email}` : ''}`}>
+              <span>
+                <IconButton
+                  size="small"
+                  aria-label="Disconnect ChatGPT"
+                  onClick={disconnectChatGPT}
+                  disabled={authDisconnecting}
+                  sx={{ width: 28, height: 28, color: 'text.secondary' }}
+                >
+                  {authDisconnecting ? <CircularProgress size={16} /> : <LinkOffRounded sx={{ fontSize: 17 }} />}
+                </IconButton>
+              </span>
+            </Tooltip>
+          )}
         </Stack>
       </Stack>
 
       {runtime && !runtime.ready && (
-        <Alert severity="warning" sx={{ mb: 2, borderRadius: 1 }}>
-          {runtime.label}. Assignments and task history remain available; agent messages are disabled.
+        <Alert severity="warning" sx={{ mb: 2, borderRadius: 1, '& .MuiAlert-message': { width: '100%', minWidth: 0 } }}>
+          <Stack direction={{ xs: 'column', sm: 'row' }} alignItems={{ xs: 'flex-start', sm: 'center' }} justifyContent="space-between" spacing={1} minWidth={0}>
+            <Typography variant="body2" sx={{ minWidth: 0, overflowWrap: 'anywhere' }}>
+              {runtime.label}. Assignments and task history remain available; agent messages are disabled.
+            </Typography>
+            {runtime.provider === 'openai-codex' && !codexConnected && (
+              <Button
+                size="small"
+                variant="outlined"
+                startIcon={authStarting ? <CircularProgress size={14} /> : <LoginRounded />}
+                onClick={startChatGPTAuth}
+                disabled={authStarting}
+                sx={{ flexShrink: 0, textTransform: 'none', whiteSpace: 'nowrap' }}
+              >
+                {authStarting ? 'Connecting' : 'Connect ChatGPT'}
+              </Button>
+            )}
+          </Stack>
         </Alert>
       )}
 
@@ -335,6 +605,66 @@ export default function AgentsSection() {
           </Box>
         ))}
       </Stack>
+
+      <Dialog
+        open={Boolean(deviceLogin)}
+        onClose={closeAuthDialog}
+        maxWidth="xs"
+        fullWidth
+        PaperProps={{ sx: { mx: 2, borderRadius: 1, backgroundColor: '#1A1A23', border: '1px solid rgba(255,255,255,0.08)' } }}
+      >
+        <DialogTitle sx={{ pb: 1, color: 'text.primary', fontWeight: 700 }}>Connect ChatGPT</DialogTitle>
+        <DialogContent>
+          {popupBlocked && (
+            <Alert severity="warning" sx={{ mb: 1.5, borderRadius: 1 }}>
+              The verification popup was blocked. Open it below to continue.
+            </Alert>
+          )}
+
+          <Typography variant="caption" color="text.secondary" display="block" mb={0.5}>Device code</Typography>
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, minWidth: 0, px: 1.25, py: 1, borderRadius: 1, backgroundColor: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.08)' }}>
+            <Typography
+              component="code"
+              sx={{ flex: 1, minWidth: 0, color: 'text.primary', fontFamily: 'monospace', fontSize: '1.35rem', fontWeight: 700, lineHeight: 1.3, overflowWrap: 'anywhere' }}
+            >
+              {deviceLogin?.userCode}
+            </Typography>
+            <Tooltip title={codeCopied ? 'Copied' : 'Copy device code'}>
+              <IconButton size="small" aria-label="Copy device code" onClick={copyDeviceCode} sx={{ flexShrink: 0 }}>
+                {codeCopied ? <CheckRounded fontSize="small" color="success" /> : <ContentCopyRounded fontSize="small" />}
+              </IconButton>
+            </Tooltip>
+          </Box>
+
+          {authPhase === 'waiting' ? (
+            <Stack direction="row" alignItems="center" spacing={1} mt={1.5} minWidth={0}>
+              <CircularProgress size={15} />
+              <Box minWidth={0}>
+                <Typography variant="body2" color="text.secondary">Waiting for authorization</Typography>
+                <Typography variant="caption" color="text.disabled" sx={{ overflowWrap: 'anywhere' }}>
+                  Expires {formatTimestamp(deviceLogin?.expiresAt)}
+                </Typography>
+              </Box>
+            </Stack>
+          ) : (
+            <Alert severity="error" sx={{ mt: 1.5, borderRadius: 1, '& .MuiAlert-message': { minWidth: 0, overflowWrap: 'anywhere' } }}>
+              {authError}
+            </Alert>
+          )}
+        </DialogContent>
+        <DialogActions sx={{ px: 3, pb: 2, flexWrap: 'wrap' }}>
+          <Button onClick={closeAuthDialog} sx={{ color: 'text.secondary', textTransform: 'none' }}>Close</Button>
+          {authPhase === 'waiting' ? (
+            <Button startIcon={<OpenInNewRounded />} onClick={openVerificationUrl} variant="contained" sx={{ textTransform: 'none' }}>
+              Open ChatGPT
+            </Button>
+          ) : (
+            <Button startIcon={<RefreshRounded />} onClick={() => { closeAuthDialog(); void startChatGPTAuth() }} variant="contained" sx={{ textTransform: 'none' }}>
+              Try again
+            </Button>
+          )}
+        </DialogActions>
+      </Dialog>
 
       <Snackbar open={Boolean(notice)} autoHideDuration={4000} onClose={() => setNotice('')} anchorOrigin={{ vertical: 'top', horizontal: 'center' }}>
         <Alert severity="info" variant="filled" onClose={() => setNotice('')}>{notice}</Alert>

@@ -73,6 +73,9 @@ export async function GET() {
     if (String(process.env.APP_SESSION_SECRET || process.env.NEXTAUTH_SECRET || '').length < 32) {
       errors.push('Hosted runtime session secret is missing or too short.')
     }
+    if (String(process.env.AGENT_CREDENTIAL_ENCRYPTION_KEY || '').length < 32) {
+      errors.push('Hosted runtime agent credential encryption key is missing or too short.')
+    }
     if (String(process.env.MATON_API_KEY || '').length < 16) {
       errors.push('Hosted runtime Maton credential is missing or too short.')
     }
@@ -95,6 +98,9 @@ export async function GET() {
           now: string
           worker_migration_applied: boolean
           auth_migration_applied: boolean
+          agent_auth_migration_applied: boolean
+          users_migration_applied: boolean
+          attribution_migration_applied: boolean
         }>(
           `
             SELECT
@@ -108,16 +114,43 @@ export async function GET() {
                 SELECT 1
                 FROM schema_migrations
                 WHERE filename = '0003_auth_magic_codes.sql'
-              ) AS auth_migration_applied
+              ) AS auth_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0004_agent_chatgpt_auth.sql'
+              ) AS agent_auth_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0005_app_users.sql'
+              ) AS users_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0006_agent_user_attribution.sql'
+              ) AS attribution_migration_applied
           `,
         )
         const row = result.rows[0]
         database = {
           status: 'reachable',
           checkedAt: row?.now || new Date(checkedAt).toISOString(),
-          migrationsCurrent: Boolean(row?.worker_migration_applied && row?.auth_migration_applied),
+          migrationsCurrent: Boolean(
+            row?.worker_migration_applied
+            && row?.auth_migration_applied
+            && row?.agent_auth_migration_applied
+            && row?.users_migration_applied
+            && row?.attribution_migration_applied
+          ),
         }
-        if (!row?.worker_migration_applied || !row?.auth_migration_applied) {
+        if (
+          !row?.worker_migration_applied
+          || !row?.auth_migration_applied
+          || !row?.agent_auth_migration_applied
+          || !row?.users_migration_applied
+          || !row?.attribution_migration_applied
+        ) {
           errors.push('Required database migrations are not applied.')
         }
 

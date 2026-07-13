@@ -149,9 +149,26 @@ try {
     },
   }
 
+  const usersMock = {
+    normalizeUserEmail(value) {
+      const email = String(value || '').trim().toLowerCase()
+      if (!email.includes('@')) throw new Error('invalid email')
+      return email
+    },
+    async getAppUser(email) {
+      return email === 'operator@example.com'
+        ? { email, role: 'owner', status: 'active' }
+        : null
+    },
+    async markAppUserSignedIn(email) {
+      return { email, role: 'owner', status: 'active' }
+    },
+  }
+
   const authModule = loadTypeScriptModule('app_src/lib/authMagicCode.ts', {
     '@/lib/matonMail': mailMock,
     '@/lib/persistence/postgres': persistenceMock,
+    '@/lib/users': usersMock,
   })
   const { requestAuthMagicCode, verifyAuthMagicCode } = authModule.exports
 

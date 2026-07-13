@@ -28,6 +28,7 @@ require_value DATABASE_URL 16
 require_value APP_LOGIN_PASSWORD 16
 require_value APP_LOGIN_EMAIL 5
 require_value APP_SESSION_SECRET 32
+require_value AGENT_CREDENTIAL_ENCRYPTION_KEY 32
 require_value MATON_API_KEY 16
 require_value MATON_GMAIL_CONNECTION_ID 8
 require_value PIPELINE_SHEET_ID 20

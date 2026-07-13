@@ -25,8 +25,10 @@ import SettingsRounded from '@mui/icons-material/SettingsRounded'
 import KeyboardRounded from '@mui/icons-material/KeyboardRounded'
 import InfoRounded from '@mui/icons-material/InfoRounded'
 import LogoutRounded from '@mui/icons-material/LogoutRounded'
+import GroupRounded from '@mui/icons-material/GroupRounded'
 import ActivityLogPage from '@/components/activity/ActivityLogPage'
 import ShortcutsModal from '@/components/help/ShortcutsModal'
+import UserAccessDialog from '@/components/settings/UserAccessDialog'
 import type { Task } from '@/lib/types'
 
 type PipelineActivityEntry = {
@@ -88,6 +90,7 @@ export default function AppHeader({ activeSection, title, onShortcutsOpen, showN
   const [healthAnchor, setHealthAnchor] = useState<null | HTMLElement>(null)
   const [buildInfo, setBuildInfo] = useState<{ short: string; hash: string; subject: string; date: string; dirty: boolean; dirtyCount: number } | null>(null)
   const [buildOpen, setBuildOpen] = useState(false)
+  const [userAccessOpen, setUserAccessOpen] = useState(false)
   const [runtimeInfo, setRuntimeInfo] = useState<{
     lane: string
     port: string
@@ -323,6 +326,21 @@ export default function AppHeader({ activeSection, title, onShortcutsOpen, showN
           />
         </MenuItem>
 
+        <MenuItem
+          onClick={() => { setHelpAnchor(null); setUserAccessOpen(true) }}
+          sx={{ py: 1.25, '&:hover': { backgroundColor: 'rgba(255,255,255,0.05)' } }}
+        >
+          <ListItemIcon sx={{ minWidth: 36 }}>
+            <GroupRounded sx={{ fontSize: 18, color: 'text.secondary' }} />
+          </ListItemIcon>
+          <ListItemText
+            primary="User access"
+            secondary="Accounts and invitations"
+            primaryTypographyProps={{ variant: 'body2', color: 'text.primary' }}
+            secondaryTypographyProps={{ variant: 'caption', color: 'text.disabled' }}
+          />
+        </MenuItem>
+
         <Divider sx={{ borderColor: 'rgba(255,255,255,0.08)' }} />
 
         <MenuItem onClick={async () => {
@@ -366,6 +384,8 @@ export default function AppHeader({ activeSection, title, onShortcutsOpen, showN
           <Button onClick={() => setBuildOpen(false)} sx={{ color: 'text.secondary' }}>Close</Button>
         </DialogActions>
       </Dialog>
+
+      <UserAccessDialog open={userAccessOpen} onClose={() => setUserAccessOpen(false)} />
 
       <Popover
         open={Boolean(runtimeAnchor)}

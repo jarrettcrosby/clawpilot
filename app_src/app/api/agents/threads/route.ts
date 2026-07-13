@@ -3,7 +3,8 @@ import crypto from 'crypto'
 import fs from 'fs'
 import path from 'path'
 import { NextRequest, NextResponse } from 'next/server'
-import { getAgentRuntime, runOpenAIAgent } from '@/lib/agents/provider'
+import { getCookieName, verifySessionToken } from '@/lib/auth'
+import { getAgentRuntimeForOperator, runChatGPTAgent, runOpenAIAgent } from '@/lib/agents/provider'
 import { resolveResponderId } from '@/lib/agents/responder.mjs'
 import { getThread as getFileThread, listThreads as listFileThreads, upsertThreadMessage as upsertFileThreadMessage } from '@/lib/agents/threadStore.mjs'
 import { normalizeProductAgentId, resolveExecutionAgentForControlAgent } from '@/lib/agents/routing'
@@ -14,6 +15,7 @@ import { isOpenClawExecutionEnabled, shouldFallbackToFileOnDatabaseError } from 
 import { getThreadFromPostgres, listThreadsFromPostgres, upsertThreadMessageInPostgres } from '@/lib/persistence/agentThreads'
 import { appendExecutionResultToPostgres, appendExecutionRunToPostgres, isPostgresExecutionStoreEnabled } from '@/lib/persistence/execution'
 import { isPostgresTaskStoreEnabled, readTasksFromPostgres, replaceTasksInPostgres } from '@/lib/persistence/tasks'
+import { requireActiveAppUser } from '@/lib/users'
 
 const SECOND_BRAIN = process.env.SECOND_BRAIN_PATH || '/Users/agentsuburbiasandwich/.openclaw/workspace/second-brain'
 const DEV_TASKS_FILE = path.join(process.cwd(), '..', 'data-dev', 'tasks.json')
@@ -58,10 +60,10 @@ async function writeTasks(tasks: Task[]) {
   })
 }
 
-async function listPersistedThreads() {
+async function listPersistedThreads(operatorId: string) {
   if (isPostgresTaskStoreEnabled()) {
     try {
-      return await listThreadsFromPostgres()
+      return await listThreadsFromPostgres({ operatorId })
     } catch (error) {
       if (!shouldFallbackToFileOnDatabaseError()) throw error
       console.warn('[agent-threads] Postgres thread list failed; falling back to file store', error)
@@ -70,7 +72,7 @@ async function listPersistedThreads() {
   return listFileThreads()
 }
 
-async function getPersistedThread(input: { agentId: string; taskId: string }) {
+async function getPersistedThread(input: { operatorId: string; agentId: string; taskId: string }) {
   if (isPostgresTaskStoreEnabled()) {
     try {
       return await getThreadFromPostgres(input)
@@ -101,6 +103,16 @@ async function upsertPersistedThreadMessage(input: Parameters<typeof upsertThrea
     routing: input.routing || {},
     meta: input.meta || {},
   })
+}
+
+async function resolveOperator(req: NextRequest): Promise<string | null> {
+  const session = verifySessionToken(req.cookies.get(getCookieName())?.value)
+  if (!session.ok) return null
+  try {
+    return (await requireActiveAppUser(session.user)).email
+  } catch {
+    return null
+  }
 }
 
 function deriveNextAction(summary: string): string {
@@ -242,9 +254,11 @@ function assignmentError(task: Task, agentId: string): string | null {
 }
 
 export async function GET(req: NextRequest) {
+  const operatorId = await resolveOperator(req)
+  if (!operatorId) return NextResponse.json({ ok: false, error: 'Unauthorized' }, { status: 401 })
   const { searchParams } = new URL(req.url)
   const requestedAgentId = String(searchParams.get('agentId') || '')
-  if (!requestedAgentId) return NextResponse.json(await listPersistedThreads())
+  if (!requestedAgentId) return NextResponse.json(await listPersistedThreads(operatorId))
 
   const agentId = normalizeProductAgentId(requestedAgentId)
   const taskId = String(searchParams.get('taskId') || '').trim()
@@ -256,7 +270,8 @@ export async function GET(req: NextRequest) {
   const mismatch = assignmentError(task, agentId)
   if (mismatch) return NextResponse.json({ ok: false, error: mismatch }, { status: 409 })
 
-  const thread = await getPersistedThread({ agentId, taskId })
+  const thread = await getPersistedThread({ operatorId, agentId, taskId })
+  const runtime = await getAgentRuntimeForOperator(operatorId)
   return NextResponse.json({
     ...(thread || {
       threadId: `thread_${agentId}_${taskId}`,
@@ -272,11 +287,13 @@ export async function GET(req: NextRequest) {
       messages: [],
     }),
     canonicalWorkItem: buildCanonicalWorkItem(task),
-    runtime: getAgentRuntime(),
+    runtime,
   })
 }
 
 export async function POST(req: NextRequest) {
+  const operatorId = await resolveOperator(req)
+  if (!operatorId) return NextResponse.json({ ok: false, error: 'Unauthorized' }, { status: 401 })
   const body = await req.json()
   const agentId = normalizeProductAgentId(String(body?.agentId || ''))
   const text = String(body?.text || '').trim()
@@ -291,7 +308,7 @@ export async function POST(req: NextRequest) {
   const mismatch = assignmentError(task, agentId)
   if (mismatch) return NextResponse.json({ ok: false, error: mismatch }, { status: 409 })
 
-  const runtime = getAgentRuntime()
+  const runtime = await getAgentRuntimeForOperator(operatorId)
   if (!runtime.ready) return NextResponse.json({ ok: false, error: runtime.label, runtime }, { status: 503 })
 
   const executionAgentId = resolveExecutionAgentForControlAgent(agentId)
@@ -302,6 +319,7 @@ export async function POST(req: NextRequest) {
   const startedAt = new Date().toISOString()
 
   await upsertPersistedThreadMessage({
+    operatorId,
     agentId,
     text,
     role: 'user',
@@ -312,7 +330,7 @@ export async function POST(req: NextRequest) {
     meta: { source: 'api', phase: 'request', executionAgentId, provider: runtime.provider },
   })
 
-  const afterUser = await getPersistedThread({ agentId, taskId })
+  const afterUser = await getPersistedThread({ operatorId, agentId, taskId })
   const userMessage = afterUser?.messages?.[afterUser.messages.length - 1] || null
   const messages = (Array.isArray(afterUser?.messages) ? afterUser.messages : []) as Array<{ role: string; text: string }>
   const taskContext = buildTaskContext(task, agentId)
@@ -326,6 +344,15 @@ export async function POST(req: NextRequest) {
         userText: text,
         conversation: messages.slice(0, -1).map((message) => ({ role: message.role, text: message.text })),
       })
+    } else if (runtime.provider === 'openai-codex') {
+      responseText = await runChatGPTAgent({
+        operatorId,
+        taskId,
+        agentId,
+        taskContext,
+        userText: text,
+        conversation: messages.slice(0, -1).map((message) => ({ role: message.role, text: message.text })),
+      })
     } else {
       responseText = await runOpenClawAgent(executionAgentId, `${taskContext}\n\nOperator request:\n${text}`)
     }
@@ -333,6 +360,7 @@ export async function POST(req: NextRequest) {
     const message = error instanceof Error ? error.message : 'Agent execution failed'
     await recordExecutionTelemetry({
       runId,
+      operatorId,
       taskId,
       agentId,
       provider: runtime.provider,
@@ -343,6 +371,7 @@ export async function POST(req: NextRequest) {
       error: message,
     })
     await upsertPersistedThreadMessage({
+      operatorId,
       agentId,
       text: `Execution failed: ${message}`,
       role: 'system',
@@ -352,13 +381,14 @@ export async function POST(req: NextRequest) {
       routing,
       meta: { source: 'api', phase: 'failure', executionAgentId, provider: runtime.provider },
     })
-    return NextResponse.json({ ok: false, error: message, runtime, thread: await getPersistedThread({ agentId, taskId }) }, { status: 502 })
+    return NextResponse.json({ ok: false, error: message, runtime, thread: await getPersistedThread({ operatorId, agentId, taskId }) }, { status: 502 })
   }
 
   const completedAt = new Date().toISOString()
   await recordAgentResult(taskId, agentId, responseText)
   await recordExecutionTelemetry({
     runId,
+    operatorId,
     taskId,
     agentId,
     provider: runtime.provider,
@@ -370,6 +400,7 @@ export async function POST(req: NextRequest) {
   }, true)
   await writeDocsLog(agentId, responseText)
   await upsertPersistedThreadMessage({
+    operatorId,
     agentId,
     text: responseText,
     role: 'agent',
@@ -380,7 +411,7 @@ export async function POST(req: NextRequest) {
     meta: { source: 'api', phase: 'response', responder: responderId, executionAgentId, provider: runtime.provider },
   })
 
-  const thread = await getPersistedThread({ agentId, taskId })
+  const thread = await getPersistedThread({ operatorId, agentId, taskId })
   const updatedTask = (await readTasks()).find((entry) => String(entry.id) === taskId)
   return NextResponse.json({
     ok: true,
