@@ -60,6 +60,7 @@ export async function appendExecutionRunToPostgres(entry: ExecutionLogRecord): P
   await query(
     `
       INSERT INTO execution_runs (
+        operator_id,
         task_id,
         agent_id,
         status,
@@ -68,9 +69,10 @@ export async function appendExecutionRunToPostgres(entry: ExecutionLogRecord): P
         payload,
         created_at
       )
-      VALUES ($1, $2, $3, $4::timestamptz, $5::timestamptz, $6::jsonb, $7::timestamptz)
+      VALUES ($1, $2, $3, $4, $5::timestamptz, $6::timestamptz, $7::jsonb, $8::timestamptz)
     `,
     [
+      cleanString(entry.operatorId),
       cleanString(entry.taskId),
       cleanString(entry.agentId),
       statusFor(entry),
@@ -86,15 +88,17 @@ export async function appendExecutionResultToPostgres(entry: ExecutionLogRecord)
   await query(
     `
       INSERT INTO execution_results (
+        operator_id,
         task_id,
         agent_id,
         result_type,
         payload,
         created_at
       )
-      VALUES ($1, $2, $3, $4::jsonb, $5::timestamptz)
+      VALUES ($1, $2, $3, $4, $5::jsonb, $6::timestamptz)
     `,
     [
+      cleanString(entry.operatorId),
       cleanString(entry.taskId),
       cleanString(entry.agentId),
       resultTypeFor(entry),

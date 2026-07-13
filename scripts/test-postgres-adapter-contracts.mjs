@@ -34,6 +34,16 @@ for (const column of ['code_digest', 'attempts', 'expires_at', 'consumed_at']) {
   assertIncludes(authMigration, column, 'auth magic-code migration')
 }
 
+const usersMigration = read('db/migrations/0005_app_users.sql')
+for (const column of ['email text PRIMARY KEY', 'role text NOT NULL', 'status text NOT NULL', 'invited_by text']) {
+  assertIncludes(usersMigration, column, 'app users migration')
+}
+
+const usersAdapter = read('app_src/lib/users.ts')
+assertIncludes(usersAdapter, 'ensureOwnerUser', 'app users adapter')
+assertIncludes(usersAdapter, 'inviteAppUser', 'app users adapter')
+assertIncludes(usersAdapter, 'Only an owner can invite users', 'app users adapter')
+
 const executionAdapter = read('app_src/lib/persistence/execution.ts')
 assertIncludes(executionAdapter, 'INSERT INTO execution_runs', 'execution adapter')
 assertIncludes(executionAdapter, 'INSERT INTO execution_results', 'execution adapter')
@@ -79,7 +89,8 @@ for (const requiredVariable of [
     'APP_AUTH_REQUIRED',
     'APP_LOGIN_EMAIL',
     'APP_LOGIN_PASSWORD',
-    'APP_SESSION_SECRET',
+  'APP_SESSION_SECRET',
+  'AGENT_CREDENTIAL_ENCRYPTION_KEY',
     'DATABASE_URL',
     'MATON_API_KEY',
     'MATON_GMAIL_CONNECTION_ID',
@@ -114,6 +125,9 @@ const healthRoute = read('app_src/app/api/health/route.ts')
 assertIncludes(healthRoute, 'readPipelineOutboxWorkerHeartbeatFromPostgres', 'hosted worker health')
 assertIncludes(healthRoute, '0002_pipeline_outbox_worker.sql', 'hosted migration health')
 assertIncludes(healthRoute, '0003_auth_magic_codes.sql', 'hosted auth migration health')
+assertIncludes(healthRoute, '0004_agent_chatgpt_auth.sql', 'hosted agent auth migration health')
+assertIncludes(healthRoute, '0005_app_users.sql', 'hosted users migration health')
+assertIncludes(healthRoute, '0006_agent_user_attribution.sql', 'hosted attribution migration health')
 assertIncludes(healthRoute, 'getAgentRuntime', 'hosted agent runtime health')
 
 const agentProvider = read('app_src/lib/agents/provider.ts')

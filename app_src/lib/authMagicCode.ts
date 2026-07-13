@@ -1,12 +1,11 @@
 import crypto from 'crypto'
 import { query, withTransaction } from '@/lib/persistence/postgres'
 import { sendAuthMagicCodeEmail } from '@/lib/matonMail'
+import { getAppUser, markAppUserSignedIn, normalizeUserEmail } from '@/lib/users'
 
 const RESEND_COOLDOWN_SECONDS = 60
 const MAX_ATTEMPTS = 5
 const DIGEST_CONTEXT = 'clawpilot-auth-magic-code:v1'
-
-const EMAIL_PATTERN = /^[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+$/i
 
 export type RequestAuthMagicCodeInput = {
   email: string
@@ -41,18 +40,6 @@ type VerificationRow = {
   attempts: number
 }
 
-function normalizeEmail(value: unknown): string {
-  return String(value || '').trim().toLowerCase()
-}
-
-function authorizedEmail(): string {
-  const email = normalizeEmail(process.env.APP_LOGIN_EMAIL)
-  if (!email || email.length > 254 || !EMAIL_PATTERN.test(email) || !/^[\x21-\x7e]+$/.test(email)) {
-    throw new Error('APP_LOGIN_EMAIL must contain one valid ASCII email address')
-  }
-  return email
-}
-
 function sessionSecret(): string {
   const secret = String(process.env.APP_SESSION_SECRET || '')
   if (secret.length < 32) throw new Error('APP_SESSION_SECRET must contain at least 32 characters')
@@ -79,12 +66,17 @@ function normalizeIso(value: string): string {
 export async function requestAuthMagicCode(
   input: RequestAuthMagicCodeInput,
 ): Promise<RequestAuthMagicCodeResult> {
-  const expectedEmail = authorizedEmail()
-  const requestedEmail = normalizeEmail(input.email)
-  if (requestedEmail !== expectedEmail) return { status: 'not-authorized' }
+  let requestedEmail: string
+  try {
+    requestedEmail = normalizeUserEmail(input.email)
+  } catch {
+    return { status: 'not-authorized' }
+  }
+  const user = await getAppUser(requestedEmail)
+  if (!user || user.status === 'disabled') return { status: 'not-authorized' }
 
   const code = generateCode()
-  const digest = digestCode(expectedEmail, code)
+  const digest = digestCode(requestedEmail, code)
   const issuance = await withTransaction(async (client) => {
     const issued = await client.query<IssuedRow>(
       `
@@ -122,7 +114,7 @@ export async function requestAuthMagicCode(
         WHERE auth_magic_codes.created_at <= now() - interval '60 seconds'
         RETURNING id::text AS id, expires_at::text AS expires_at
       `,
-      [expectedEmail, digest],
+      [requestedEmail, digest],
     )
 
     const row = issued.rows[0]
@@ -137,7 +129,7 @@ export async function requestAuthMagicCode(
         FROM auth_magic_codes
         WHERE email = $1
       `,
-      [expectedEmail],
+      [requestedEmail],
     )
 
     return {
@@ -151,7 +143,7 @@ export async function requestAuthMagicCode(
   }
 
   try {
-    await sendAuthMagicCodeEmail({ to: expectedEmail, code })
+    await sendAuthMagicCodeEmail({ to: requestedEmail, code })
   } catch {
     await query(
       `
@@ -161,7 +153,7 @@ export async function requestAuthMagicCode(
           AND code_digest = $3
           AND consumed_at IS NULL
       `,
-      [issuance.row.id, expectedEmail, digest],
+      [issuance.row.id, requestedEmail, digest],
     ).catch(() => undefined)
     throw new Error('Unable to deliver sign-in code')
   }
@@ -175,12 +167,17 @@ export async function requestAuthMagicCode(
 export async function verifyAuthMagicCode(
   input: VerifyAuthMagicCodeInput,
 ): Promise<VerifyAuthMagicCodeResult> {
-  const expectedEmail = authorizedEmail()
-  const requestedEmail = normalizeEmail(input.email)
-  if (requestedEmail !== expectedEmail) return { status: 'not-authorized' }
+  let requestedEmail: string
+  try {
+    requestedEmail = normalizeUserEmail(input.email)
+  } catch {
+    return { status: 'not-authorized' }
+  }
+  const user = await getAppUser(requestedEmail)
+  if (!user || user.status === 'disabled') return { status: 'not-authorized' }
 
   const submittedCode = String(input.code || '').trim().slice(0, 128)
-  const submittedDigest = digestCode(expectedEmail, submittedCode)
+  const submittedDigest = digestCode(requestedEmail, submittedCode)
   const result = await withTransaction(async (client) => client.query<VerificationRow>(
     `
       WITH candidate AS (
@@ -237,12 +234,15 @@ export async function verifyAuthMagicCode(
       FROM outcome
       INNER JOIN updated ON updated.id = outcome.id
     `,
-    [expectedEmail, submittedDigest],
+    [requestedEmail, submittedDigest],
   ))
 
   const row = result.rows[0]
   if (!row) return { status: 'not-found' }
-  if (row.status === 'verified') return { status: 'verified', email: expectedEmail }
+  if (row.status === 'verified') {
+    await markAppUserSignedIn(requestedEmail)
+    return { status: 'verified', email: requestedEmail }
+  }
   if (row.status === 'invalid') {
     return { status: 'invalid', attemptsRemaining: Math.max(0, MAX_ATTEMPTS - Number(row.attempts || 0)) }
   }
