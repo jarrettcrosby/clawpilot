@@ -21,11 +21,13 @@ import type { Task } from '@/lib/types'
 import { ASSIGNABLE_PRODUCT_AGENT_IDS, PRIORITY_COLORS, PRIORITY_LABELS, PEOPLE } from '@/lib/types'
 import { useBoardContext } from './KanbanBoard'
 import { displayCategory } from '@/lib/format'
+import { queueAgentTaskOpen } from '@/lib/agents/navigation'
+import { assignmentKickoffText, triggerAgentTurn } from '@/lib/agents/client'
 
 type Props = { task: Task }
 
 export default function KanbanCard({ task }: Props) {
-  const { focusedTaskId, setFocusedTaskId, openDrawer, updateTask } = useBoardContext()
+  const { focusedTaskId, setFocusedTaskId, openDrawer, updateTask, notify } = useBoardContext()
   const [assignAnchor, setAssignAnchor] = useState<HTMLElement | null>(null)
   const isFocused = focusedTaskId === task.id
   const isTouch = useMediaQuery('(pointer: coarse)')
@@ -47,11 +49,21 @@ export default function KanbanCard({ task }: Props) {
       body: JSON.stringify({ id: task.id, assignedAgent: personId, _actor: 'Jarrett' }),
     })
     const updated = await r.json()
-    if (r.ok) updateTask(updated)
+    if (!r.ok) {
+      notify(updated?.error || 'Unable to assign task.')
+      return
+    }
+    updateTask(updated)
+    try {
+      await triggerAgentTurn({ taskId: task.id, agentId: personId, text: assignmentKickoffText() })
+    } catch (error) {
+      notify(error instanceof Error ? `Task assigned, but agent kickoff failed: ${error.message}` : 'Task assigned, but agent kickoff failed.')
+    }
   }
 
   function openAgentChat() {
     const agentId = task.assignedAgent || ''
+    queueAgentTaskOpen(task.id, agentId)
     window.location.hash = 'agents'
     window.setTimeout(() => {
       window.dispatchEvent(new CustomEvent('open-agent-task', { detail: { taskId: task.id, agentId } }))
@@ -64,7 +76,7 @@ export default function KanbanCard({ task }: Props) {
         id={'kanban-card-' + task.id}
         onClick={() => {
           setFocusedTaskId(task.id)
-          if (isTouch) openDrawer(task.id)
+          openDrawer(task.id)
         }}
         sx={{
           backgroundColor: '#1A1A23',

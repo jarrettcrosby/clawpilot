@@ -10,6 +10,8 @@ import { withFileLock } from '@/lib/fileLock'
 import { applyCanonicalWorkItem, canonicalizeTasks } from '@/lib/workItemModel'
 import { shouldFallbackToFileOnDatabaseError } from '@/lib/persistence/config'
 import { isPostgresTaskStoreEnabled, readTasksFromPostgres, replaceTasksInPostgres } from '@/lib/persistence/tasks'
+import { getCookieName, verifySessionToken } from '@/lib/auth'
+import { requireActiveAppUser } from '@/lib/users'
 
 const DEV_TASKS_FILE = path.join(process.cwd(), '..', 'data-dev', 'tasks.json')
 const PROD_TASKS_FILE = path.join(process.cwd(), '..', 'data', 'tasks.json')
@@ -298,6 +300,18 @@ function isActiveColumnStatus(status: Task['status']): boolean {
   return status === 'todo' || status === 'in-progress' || status === 'review'
 }
 
+async function resolveRequestActor(req: NextRequest, fallback: string): Promise<string> {
+  const session = verifySessionToken(req.cookies.get(getCookieName())?.value)
+  if (session.ok) {
+    try {
+      return (await requireActiveAppUser(session.user)).email
+    } catch {
+      // Preserve local and internal callers when app-user persistence is unavailable.
+    }
+  }
+  return fallback.trim()
+}
+
 function deriveMissingActionableFields(task: Partial<Task>): string[] {
   const missing: string[] = []
   const owner = String(task.assignedAgent || '').trim()
@@ -424,7 +438,7 @@ export async function POST(req: NextRequest) {
   const now = new Date().toISOString()
   const id = Date.now().toString()
   const actorRaw = String(body._actor || '').trim()
-  const actor = actorRaw
+  const actor = await resolveRequestActor(req, actorRaw)
   const createSource = String(body._createSource || req.headers.get('x-claw-task-create-source') || '').toLowerCase().trim()
 
   // canonical task-creation policy: explicit source metadata + default-deny automation
@@ -627,7 +641,7 @@ export async function PATCH(req: NextRequest) {
   const tasks = await readTasks()
   const body = await req.json() as TaskPatchBody
   const { id, _comment, _editCommentId, _editCommentText, _deleteCommentId, _restoreCommentId, _checklistAdd, _checklistToggle, _checklistDelete, _checklistUpdate, _execution, _suggestionAction, _actor, _deleteReason, ...rawUpdates } = body
-  const actor = _actor || 'Jarrett'
+  const actor = await resolveRequestActor(req, String(_actor || 'Jarrett')) || 'Jarrett'
 
   const idx = tasks.findIndex(t => t.id === id)
   if (idx === -1) return NextResponse.json({ error: 'Not found' }, { status: 404 })

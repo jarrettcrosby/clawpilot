@@ -30,12 +30,14 @@ import ArchivedCardsView from './ArchivedCardsView'
 import DeletedCardsView from './DeletedCardsView'
 import type { Task } from '@/lib/types'
 import { ASSIGNABLE_PRODUCT_AGENT_IDS, COLUMNS, PEOPLE } from '@/lib/types'
+import { assignmentKickoffText, triggerAgentTurn } from '@/lib/agents/client'
 
 type BoardCtx = {
   updateTask: (task: Task) => void
   focusedTaskId: string | null
   setFocusedTaskId: (id: string) => void
   openDrawer: (id: string) => void
+  notify: (message: string) => void
 }
 
 export const BoardContext = createContext<BoardCtx>({
@@ -43,6 +45,7 @@ export const BoardContext = createContext<BoardCtx>({
   focusedTaskId: null,
   setFocusedTaskId: () => {},
   openDrawer: () => {},
+  notify: () => {},
 })
 export const useBoardContext = () => useContext(BoardContext)
 
@@ -273,6 +276,13 @@ export default function KanbanBoard({ externalFilter, onFilterChange }: Props = 
       setNewTask(EMPTY_NEW_TASK)
       setNewTaskOpen(false)
       openDrawer(String(created.id))
+      if (created.assignedAgent) {
+        try {
+          await triggerAgentTurn({ taskId: created.id, agentId: created.assignedAgent, text: assignmentKickoffText() })
+        } catch (error) {
+          setMoveError(error instanceof Error ? `Task created, but agent kickoff failed: ${error.message}` : 'Task created, but agent kickoff failed.')
+        }
+      }
     } catch (error) {
       setCreateError(error instanceof Error ? error.message : 'Unable to create task.')
     } finally {
@@ -289,7 +299,7 @@ export default function KanbanBoard({ externalFilter, onFilterChange }: Props = 
   }
 
   return (
-    <BoardContext.Provider value={{ updateTask, focusedTaskId, setFocusedTaskId, openDrawer }}>
+    <BoardContext.Provider value={{ updateTask, focusedTaskId, setFocusedTaskId, openDrawer, notify: setMoveError }}>
       <Box sx={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, backgroundColor: '#0F0F13', overflowY: { xs: 'auto', md: 'hidden' }, overflowX: 'hidden', WebkitOverflowScrolling: 'touch' }}>
         <Box sx={{ px: { xs: 2, md: 4 }, pt: { xs: 2, md: 3 }, pb: 2, flexShrink: 0, borderBottom: '1px solid rgba(255,255,255,0.06)' }}>
           <Stack spacing={1.5}>

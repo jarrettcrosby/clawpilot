@@ -47,6 +47,7 @@ import CheckBoxOutlined from '@mui/icons-material/CheckBoxOutlined'
 import type { Task, ChecklistItem, Comment } from '@/lib/types'
 import { ASSIGNABLE_PRODUCT_AGENT_IDS, PRIORITY_COLORS, PRIORITY_LABELS, STATUS_LABELS, AVAILABLE_LABELS, COLUMNS, PEOPLE, CATEGORY_OPTIONS } from '@/lib/types'
 import { displayCategory } from '@/lib/format'
+import { assignmentKickoffText, triggerAgentTurn } from '@/lib/agents/client'
 
 type Props = {
   task: Task | null
@@ -198,6 +199,13 @@ function renderCommentText(text: string) {
   )
 }
 
+function mentionsAgent(text: string, agentId: string) {
+  const person = PEOPLE.find((entry) => entry.id === agentId || entry.name === agentId)
+  const aliases = [agentId, person?.name].filter(Boolean).map((value) => String(value).toLowerCase())
+  const normalized = text.toLowerCase()
+  return aliases.some((alias) => normalized.includes(`@${alias}`))
+}
+
 export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArchive }: Props) {
   const [editingTitle, setEditingTitle] = useState(false)
   const [titleVal, setTitleVal] = useState('')
@@ -211,6 +219,7 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
   const [expandedJson, setExpandedJson] = useState<string | null>(null)
   const [copyFallbackText, setCopyFallbackText] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
+  const [agentResponding, setAgentResponding] = useState(false)
   const [patchError, setPatchError] = useState('')
   const [newCheckItem, setNewCheckItem] = useState('')
   const [checkItemAssignee, setCheckItemAssignee] = useState('')
@@ -232,8 +241,10 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
       const result = await response.json()
       if (!response.ok) throw new Error(result.operatorMessage || result.error || 'Unable to update task.')
       onUpdate?.(result as Task)
+      return result as Task
     } catch (error) {
       setPatchError(error instanceof Error ? error.message : 'Unable to update task.')
+      return null
     } finally {
       setSaving(false)
     }
@@ -263,10 +274,42 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submitComment() }
   }
 
-  const submitComment = () => {
-    if (!commentText.trim()) return
-    patch({ _comment: commentText.trim() })
+  async function refreshTask() {
+    if (!task) return
+    const response = await fetch('/api/tasks')
+    if (!response.ok) return
+    const tasks = await response.json()
+    const refreshed = Array.isArray(tasks) ? tasks.find((entry: Task) => entry.id === task.id) : null
+    if (refreshed) onUpdate?.(refreshed)
+  }
+
+  async function runAssignedAgent(agentId: string, text: string) {
+    if (!task) return
+    setAgentResponding(true)
+    try {
+      await triggerAgentTurn({ taskId: task.id, agentId, text })
+      await refreshTask()
+    } catch (error) {
+      setPatchError(error instanceof Error ? `Task updated, but agent response failed: ${error.message}` : 'Task updated, but agent response failed.')
+    } finally {
+      setAgentResponding(false)
+    }
+  }
+
+  const submitComment = async () => {
+    const text = commentText.trim()
+    if (!text) return
     setCommentText('')
+    const updated = await patch({ _comment: text })
+    const assignedAgent = updated?.assignedAgent || ''
+    if (assignedAgent && mentionsAgent(text, assignedAgent)) {
+      await runAssignedAgent(assignedAgent, text)
+    }
+  }
+
+  async function assignTask(agentId: string) {
+    const updated = await patch({ assignedAgent: agentId })
+    if (updated && agentId) await runAssignedAgent(agentId, assignmentKickoffText())
   }
 
   const saveEditedComment = () => {
@@ -396,7 +439,7 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
             </Stack>
             <Stack direction="row" alignItems="center" spacing={2}>
               <Typography variant="body2" color="text.disabled" sx={{ minWidth: 80, fontSize: '0.8rem' }}>Assignee</Typography>
-              <Select size="small" value={task.assignedAgent || ''} onChange={e => patch({ assignedAgent: e.target.value })} sx={selectSx} MenuProps={menuPaper} displayEmpty renderValue={v => v ? (
+              <Select size="small" value={task.assignedAgent || ''} onChange={e => { void assignTask(String(e.target.value)) }} sx={selectSx} MenuProps={menuPaper} displayEmpty renderValue={v => v ? (
                 <Stack direction="row" spacing={1} alignItems="center">
                   <PersonAvatar personId={v as string} size={20} />
                   <span>{PEOPLE.find(p => p.id === v)?.name || PEOPLE.find(p => p.name === v)?.name || v as string}</span>
@@ -644,10 +687,15 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
             <TextField inputRef={commentRef} multiline maxRows={4} fullWidth placeholder="Write a comment... (@ to mention)" size="small"
               value={commentText} onChange={e => setCommentText(e.target.value)} onKeyDown={handleCommentKey}
               sx={{ '& .MuiOutlinedInput-root': { fontSize: '0.875rem', backgroundColor: '#232330', borderRadius: 2, '& fieldset': { borderColor: 'rgba(255,255,255,0.08)' }, '&.Mui-focused fieldset': { borderColor: '#A8C7FA' } } }} />
-            <IconButton onClick={submitComment} disabled={!commentText.trim()||saving} sx={{ color: commentText.trim()?'#A8C7FA':'text.disabled', mb: 0.25 }}>
+            <IconButton onClick={() => { void submitComment() }} disabled={!commentText.trim()||saving||agentResponding} sx={{ color: commentText.trim()?'#A8C7FA':'text.disabled', mb: 0.25 }}>
               <SendRounded sx={{ fontSize: 20 }} />
             </IconButton>
           </Box>
+          {agentResponding && (
+            <Alert severity="info" sx={{ mb: 2, borderRadius: 1 }}>
+              {PEOPLE.find((person) => person.id === task.assignedAgent)?.name || 'Agent'} is responding.
+            </Alert>
+          )}
           {/* @ mention picker */}
           <Popover open={Boolean(mentionAnchor)} anchorEl={mentionAnchor} onClose={() => setMentionAnchor(null)} anchorOrigin={{ vertical: 'top', horizontal: 'left' }}
             PaperProps={{ sx: { backgroundColor: '#232330', border: '1px solid rgba(255,255,255,0.08)', borderRadius: 2, p: 0.5, minWidth: 180 } }}>
@@ -670,7 +718,7 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
                 <Stack direction="row" spacing={1} alignItems="center" mb={0.75}>
                   {PersonAvatar({ personId: c.author, size: 28 }) || (
                     <Box sx={{ width: 28, height: 28, borderRadius: '50%', backgroundColor: 'rgba(255,255,255,0.06)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
-                      <Typography variant="caption" sx={{ color: 'text.disabled', fontWeight: 700, fontSize: '0.72rem' }}>?</Typography>
+                      <Typography variant="caption" sx={{ color: 'text.disabled', fontWeight: 700, fontSize: '0.72rem' }}>{String(c.author || '?').slice(0, 1).toUpperCase()}</Typography>
                     </Box>
                   )}
                   <Box sx={{ flex: 1 }}>

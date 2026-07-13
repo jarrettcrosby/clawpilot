@@ -31,6 +31,8 @@ import OpenInNewRounded from '@mui/icons-material/OpenInNewRounded'
 import RefreshRounded from '@mui/icons-material/RefreshRounded'
 import SendRounded from '@mui/icons-material/SendRounded'
 import type { Task } from '@/lib/types'
+import { consumeAgentTaskOpen } from '@/lib/agents/navigation'
+import { assignmentKickoffText, triggerAgentTurn } from '@/lib/agents/client'
 
 type Agent = {
   id: string
@@ -147,6 +149,15 @@ export default function AgentsSection() {
     setRuntime(agentPayload?.runtime || null)
     const nextTasks = Array.isArray(taskPayload) ? taskPayload : []
     setTasks(nextTasks)
+    const pendingOpen = consumeAgentTaskOpen()
+    const pendingTask = pendingOpen
+      ? nextTasks.find((task: Task) => task.id === pendingOpen.taskId && task.assignedAgent === pendingOpen.agentId)
+      : null
+    if (pendingTask && pendingOpen) {
+      setSelectedAgentId(pendingOpen.agentId)
+      setSelectedTaskId(pendingTask.id)
+      return
+    }
     const firstAssignedAgent = nextAgents.find((agent: Agent) => nextTasks.some((task: Task) => (
       task.assignedAgent === agent.id && task.status !== 'done' && !task.archived && !task.deletedAt
     )))
@@ -232,8 +243,10 @@ export default function AgentsSection() {
     [tasks],
   )
   const assignedTasks = useMemo(
-    () => openTasks.filter((task) => task.assignedAgent === selectedAgentId),
-    [openTasks, selectedAgentId],
+    () => tasks.filter((task) => (
+      task.assignedAgent === selectedAgentId && !task.archived && !task.deletedAt
+    )),
+    [tasks, selectedAgentId],
   )
   const selectedAgent = agents.find((agent) => agent.id === selectedAgentId) || null
   const selectedTask = tasks.find((task) => task.id === selectedTaskId) || null
@@ -294,6 +307,15 @@ export default function AgentsSection() {
       task.id === taskId ? { ...task, assignedAgent: agentId || undefined, updatedAt: new Date().toISOString() } : task
     )))
     if (taskId === selectedTaskId && agentId !== selectedAgentId) setSelectedTaskId('')
+    if (agentId) {
+      try {
+        await triggerAgentTurn({ taskId, agentId, text: assignmentKickoffText() })
+        setNotice('Task assigned and agent kickoff completed.')
+        await loadWorkspace()
+      } catch (error) {
+        setNotice(error instanceof Error ? `Task assigned, but agent kickoff failed: ${error.message}` : 'Task assigned, but agent kickoff failed.')
+      }
+    }
   }
 
   async function sendMessage() {
