@@ -76,7 +76,7 @@ export default function KanbanCard({ task }: Props) {
         id={'kanban-card-' + task.id}
         onClick={() => {
           setFocusedTaskId(task.id)
-          if (isTouch) openDrawer(task.id)
+          openDrawer(task.id)
         }}
         sx={{
           backgroundColor: '#1A1A23',
