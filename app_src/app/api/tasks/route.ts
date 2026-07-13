@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import fs from 'fs'
 import path from 'path'
+import crypto from 'crypto'
 import type { Task, ActivityEntry, Comment, ChecklistItem } from '@/lib/types'
 import { ensureNotFrozen } from '@/lib/freeze'
 import { normalizeProductAgentId } from '@/lib/agents/routing'
@@ -12,6 +13,13 @@ import { shouldFallbackToFileOnDatabaseError } from '@/lib/persistence/config'
 import { isPostgresTaskStoreEnabled, readTasksFromPostgres, replaceTasksInPostgres } from '@/lib/persistence/tasks'
 import { getCookieName, verifySessionToken } from '@/lib/auth'
 import { requireActiveAppUser } from '@/lib/users'
+import { requireRequestUser } from '@/lib/requestUser'
+import {
+  BOARD_SELECTION_COOKIE,
+  requireResourceEditor,
+  resolveProjectBoardAccess,
+  type ProjectBoard,
+} from '@/lib/tenancy'
 
 const DEV_TASKS_FILE = path.join(process.cwd(), '..', 'data-dev', 'tasks.json')
 const PROD_TASKS_FILE = path.join(process.cwd(), '..', 'data', 'tasks.json')
@@ -174,6 +182,7 @@ function normalizeTasks(tasks: unknown): Task[] {
     const rawDeletedComments = Array.isArray(t.deletedComments) ? t.deletedComments : []
     const normalizedTask: Task = {
       id: taskId,
+      boardId: typeof t.boardId === 'string' ? t.boardId : undefined,
       title: taskTitle,
       desc: typeof t.desc === 'string' ? t.desc : '',
       status: typeof t.status === 'string' ? toStatus(t.status) : 'backlog',
@@ -221,10 +230,11 @@ function readTasksFromFile(): Task[] {
   }
 }
 
-async function readTasks(): Promise<Task[]> {
+async function readTasks(boardId?: string): Promise<Task[]> {
   if (isPostgresTaskStoreEnabled()) {
+    if (!boardId) throw new Error('Project board context is required')
     try {
-      return normalizeTasks(await readTasksFromPostgres())
+      return normalizeTasks(await readTasksFromPostgres({ boardId }))
     } catch (error) {
       if (!shouldFallbackToFileOnDatabaseError()) throw error
       console.warn('[task-store] Postgres read failed; falling back to file store', error)
@@ -245,11 +255,12 @@ function projectAssignmentsFromTasks(tasks: Task[]) {
     .filter((row) => Boolean(row.agentId))
 }
 
-async function writeTasks(tasks: Task[]) {
+async function writeTasks(tasks: Task[], boardId?: string) {
   const canonical = canonicalizeTasks(tasks)
   if (isPostgresTaskStoreEnabled()) {
+    if (!boardId) throw new Error('Project board context is required')
     try {
-      await replaceTasksInPostgres(canonical)
+      await replaceTasksInPostgres(canonical, { boardId })
       return
     } catch (error) {
       if (!shouldFallbackToFileOnDatabaseError()) throw error
@@ -263,6 +274,22 @@ async function writeTasks(tasks: Task[]) {
     fs.mkdirSync(path.dirname(ASSIGNMENTS_FILE), { recursive: true })
     fs.writeFileSync(ASSIGNMENTS_FILE, JSON.stringify(projectAssignmentsFromTasks(canonical), null, 2))
   })
+}
+
+async function resolveTaskBoard(req: NextRequest, requireEdit = false): Promise<ProjectBoard | null> {
+  if (!isPostgresTaskStoreEnabled()) return null
+  const actor = await requireRequestUser(req)
+  const explicit = new URL(req.url).searchParams.get('boardId')
+  const selected = explicit || req.cookies.get(BOARD_SELECTION_COOKIE)?.value || undefined
+  let board: ProjectBoard
+  try {
+    board = await resolveProjectBoardAccess({ actorEmail: actor.email, boardId: selected })
+  } catch (error) {
+    if (explicit) throw error
+    board = await resolveProjectBoardAccess({ actorEmail: actor.email })
+  }
+  if (requireEdit) requireResourceEditor(board)
+  return board
 }
 
 export type TaskIntent = {
@@ -423,20 +450,33 @@ function buildTaskIntent(body: TaskBody): TaskIntent {
 }
 
 export async function GET(req: NextRequest) {
-  const { searchParams } = new URL(req.url)
-  const includeArchived = searchParams.get('includeArchived') === 'true'
-  const tasks = await readTasks()
-  return NextResponse.json(includeArchived ? tasks : tasks.filter((task) => !task.archived))
+  try {
+    const { searchParams } = new URL(req.url)
+    const includeArchived = searchParams.get('includeArchived') === 'true'
+    const board = await resolveTaskBoard(req)
+    const tasks = await readTasks(board?.id)
+    return NextResponse.json(includeArchived ? tasks : tasks.filter((task) => !task.archived))
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Unable to load tasks'
+    return NextResponse.json({ error: message }, { status: message === 'Unauthorized' ? 401 : 403 })
+  }
 }
 
 export async function POST(req: NextRequest) {
   const freeze = ensureNotFrozen()
   if (freeze) return NextResponse.json(freeze, { status: 423 })
 
-  const tasks = await readTasks()
+  let board: ProjectBoard | null
+  try {
+    board = await resolveTaskBoard(req, true)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Project board access denied'
+    return NextResponse.json({ error: message }, { status: message === 'Unauthorized' ? 401 : 403 })
+  }
+  const tasks = await readTasks(board?.id)
   const body = await req.json() as TaskBody
   const now = new Date().toISOString()
-  const id = Date.now().toString()
+  const id = crypto.randomUUID()
   const actorRaw = String(body._actor || '').trim()
   const actor = await resolveRequestActor(req, actorRaw)
   const createSource = String(body._createSource || req.headers.get('x-claw-task-create-source') || '').toLowerCase().trim()
@@ -566,6 +606,7 @@ export async function POST(req: NextRequest) {
 
   const taskObj: Task = {
     id,
+    boardId: board?.id,
     title,
     desc,
     status,
@@ -593,7 +634,7 @@ export async function POST(req: NextRequest) {
   const actionableCandidate = applyCanonicalWorkItem(taskObj)
 
   tasks.push(actionableCandidate)
-  await writeTasks(tasks)
+  await writeTasks(tasks, board?.id)
 
   const existingAudit = readTaskCreationAuditEntries()
   const oneMinuteAgo = Date.now() - 60 * 1000
@@ -638,7 +679,14 @@ export async function PATCH(req: NextRequest) {
   const freeze = ensureNotFrozen()
   if (freeze) return NextResponse.json(freeze, { status: 423 })
 
-  const tasks = await readTasks()
+  let board: ProjectBoard | null
+  try {
+    board = await resolveTaskBoard(req, true)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Project board access denied'
+    return NextResponse.json({ error: message }, { status: message === 'Unauthorized' ? 401 : 403 })
+  }
+  const tasks = await readTasks(board?.id)
   const body = await req.json() as TaskPatchBody
   const { id, _comment, _editCommentId, _editCommentText, _deleteCommentId, _restoreCommentId, _checklistAdd, _checklistToggle, _checklistDelete, _checklistUpdate, _execution, _suggestionAction, _actor, _deleteReason, ...rawUpdates } = body
   const actor = await resolveRequestActor(req, String(_actor || 'Jarrett')) || 'Jarrett'
@@ -888,12 +936,12 @@ export async function PATCH(req: NextRequest) {
 
   if (body._archive) {
     tasks[idx] = { ...prev, ...updates, execution, archived: true, archivedAt: now, comments, deletedComments, checklist, activity: [...activity, { type: 'archived', message: 'Card archived', timestamp: now, ...base }], updatedAt: now }
-    await writeTasks(tasks)
+    await writeTasks(tasks, board?.id)
     return NextResponse.json(tasks[idx])
   }
   if (body._unarchive) {
     tasks[idx] = { ...prev, ...updates, execution, archived: false, archivedAt: undefined, comments, deletedComments, checklist, activity: [...activity, { type: 'unarchived', message: 'Card restored to board', timestamp: now, ...base }], updatedAt: now }
-    await writeTasks(tasks)
+    await writeTasks(tasks, board?.id)
     return NextResponse.json(tasks[idx])
   }
   if (body._deletePermanent) {
@@ -901,6 +949,7 @@ export async function PATCH(req: NextRequest) {
     const deleteReason = String(_deleteReason || '').trim() || 'No reason provided'
     const deletedEntry = {
       id: prev.id,
+      boardId: board?.id || prev.boardId || null,
       title: prev.title,
       category: prev.category,
       deletedAt: now,
@@ -914,7 +963,7 @@ export async function PATCH(req: NextRequest) {
     nextDeleted.push(deletedEntry)
     fs.writeFileSync(DELETED_TASKS_FILE, JSON.stringify(nextDeleted, null, 2))
     const remaining = tasks.filter(t => t.id !== id)
-    await writeTasks(remaining)
+    await writeTasks(remaining, board?.id)
     return NextResponse.json({ ok: true })
   }
   let nextTask: Task = { ...prev, ...updates, execution, comments, deletedComments, checklist, activity, updatedAt: now }
@@ -938,6 +987,6 @@ export async function PATCH(req: NextRequest) {
   }
 
   tasks[idx] = nextTask
-  await writeTasks(tasks)
+  await writeTasks(tasks, board?.id)
   return NextResponse.json(tasks[idx])
 }

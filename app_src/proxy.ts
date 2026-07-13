@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { query } from '@/lib/persistence/postgres'
 
 const COOKIE_NAME = 'clawpilot_session'
 const HOSTED_RUNTIME = Boolean(
@@ -18,13 +19,13 @@ function base64UrlBytes(value: string) {
   return Uint8Array.from(decoded, (character) => character.charCodeAt(0))
 }
 
-async function hasValidSession(token?: string | null) {
+async function validSession(token?: string | null): Promise<{ ok: true; user: string } | { ok: false }> {
   const secret = process.env.APP_SESSION_SECRET || process.env.NEXTAUTH_SECRET || ''
-  if (!secret || !token || !token.includes('.')) return false
+  if (!secret || !token || !token.includes('.')) return { ok: false }
 
   try {
     const [encoded, signature] = token.split('.', 2)
-    if (!encoded || !signature) return false
+    if (!encoded || !signature) return { ok: false }
     const encoder = new TextEncoder()
     const key = await crypto.subtle.importKey(
       'raw',
@@ -39,13 +40,19 @@ async function hasValidSession(token?: string | null) {
       base64UrlBytes(signature),
       encoder.encode(encoded),
     )
-    if (!validSignature) return false
+    if (!validSignature) return { ok: false }
 
-    const payload = JSON.parse(new TextDecoder().decode(base64UrlBytes(encoded))) as { exp?: number }
-    return Boolean(payload.exp && payload.exp >= Math.floor(Date.now() / 1000))
+    const payload = JSON.parse(new TextDecoder().decode(base64UrlBytes(encoded))) as { u?: string; exp?: number }
+    if (!payload.u || !payload.exp || payload.exp < Math.floor(Date.now() / 1000)) return { ok: false }
+    return { ok: true, user: payload.u.toLowerCase() }
   } catch {
-    return false
+    return { ok: false }
   }
+}
+
+async function activeSessionUser(email: string): Promise<boolean> {
+  const result = await query<{ status: string }>('SELECT status FROM app_users WHERE email = $1', [email])
+  return result.rows[0]?.status === 'active'
 }
 
 function missingDevIsolationEnv(req: NextRequest) {
@@ -93,13 +100,24 @@ export async function proxy(req: NextRequest) {
   if (pathname.startsWith('/api/') && isPublicApi(pathname)) return NextResponse.next()
 
   const token = req.cookies.get(COOKIE_NAME)?.value
-  const sessionOk = await hasValidSession(token)
-
-  if (pathname === '/login') {
-    return sessionOk ? NextResponse.redirect(new URL('/', req.url)) : NextResponse.next()
+  const session = await validSession(token)
+  let sessionActive = false
+  if (session.ok) {
+    try {
+      sessionActive = await activeSessionUser(session.user)
+    } catch {
+      if (pathname.startsWith('/api/')) {
+        return NextResponse.json({ ok: false, error: 'Access validation unavailable' }, { status: 503 })
+      }
+      return new NextResponse('Access validation unavailable', { status: 503 })
+    }
   }
 
-  if (sessionOk) return NextResponse.next()
+  if (pathname === '/login') {
+    return sessionActive ? NextResponse.redirect(new URL('/', req.url)) : NextResponse.next()
+  }
+
+  if (sessionActive) return NextResponse.next()
 
   if (!pathname.startsWith('/api/')) {
     const loginUrl = new URL('/login', req.url)

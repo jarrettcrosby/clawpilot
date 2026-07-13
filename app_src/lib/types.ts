@@ -55,6 +55,7 @@ export type CanonicalWorkItem = {
 
 export type Task = {
   id: string
+  boardId?: string
   title: string
   desc: string
   status: 'backlog' | 'todo' | 'in-progress' | 'review' | 'done'

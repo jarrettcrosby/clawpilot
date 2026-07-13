@@ -1,0 +1,435 @@
+import { query, withTransaction } from '@/lib/persistence/postgres'
+import {
+  DEFAULT_PIPELINE_SHEET_ID,
+  type PipelineProjection,
+  readPipelineProjectionFromPostgres,
+} from '@/lib/persistence/pipeline'
+import {
+  effectiveUserPermissions,
+  getAppUser,
+  normalizeUserEmail,
+  requireActiveAppUser,
+  type AppUserStatus,
+} from '@/lib/users'
+
+export const BOARD_SELECTION_COOKIE = 'clawpilot_board_id'
+export const PIPELINE_SELECTION_COOKIE = 'clawpilot_pipeline_id'
+
+export type ResourceAccessRole = 'owner' | 'editor' | 'viewer'
+export type SharedResourceMember = {
+  email: string
+  displayName: string | null
+  status: AppUserStatus
+  accessRole: 'editor' | 'viewer'
+}
+
+export type ProjectBoard = {
+  id: string
+  name: string
+  ownerEmail: string
+  isDefault: boolean
+  accessRole: ResourceAccessRole
+  members: SharedResourceMember[]
+  createdAt: string
+  updatedAt: string
+}
+
+export type PipelineSpace = {
+  id: string
+  name: string
+  ownerEmail: string
+  isDefault: boolean
+  accessRole: ResourceAccessRole
+  members: SharedResourceMember[]
+  sheetBacked: boolean
+  syncEnabled: boolean
+  sheetId: string | null
+  projection: PipelineProjection
+  createdAt: string
+  updatedAt: string
+}
+
+type ResourceMemberRow = {
+  email?: string
+  displayName?: string | null
+  status?: AppUserStatus
+  accessRole?: 'editor' | 'viewer'
+}
+
+type ProjectBoardRow = {
+  id: string
+  name: string
+  owner_email: string
+  is_default: boolean
+  access_role: ResourceAccessRole
+  members: ResourceMemberRow[] | null
+  created_at: string
+  updated_at: string
+}
+
+type PipelineSpaceRow = {
+  id: string
+  name: string
+  owner_email: string
+  is_default: boolean
+  access_role: ResourceAccessRole
+  members: ResourceMemberRow[] | null
+  sheet_id: string | null
+  sync_enabled: boolean
+  projection: PipelineProjection
+  created_at: string
+  updated_at: string
+}
+
+const EMPTY_PIPELINE: PipelineProjection = {
+  syncedAt: null,
+  source: 'app',
+  summary: { opportunities: 0, organizations: 0, contacts: 0, totalOpenValue: 0 },
+  opportunities: [],
+}
+
+function normalizeMembers(value: ResourceMemberRow[] | null): SharedResourceMember[] {
+  return (Array.isArray(value) ? value : []).flatMap((member) => {
+    if (!member?.email || (member.accessRole !== 'editor' && member.accessRole !== 'viewer')) return []
+    return [{
+      email: member.email,
+      displayName: member.displayName || null,
+      status: member.status || 'invited',
+      accessRole: member.accessRole,
+    }]
+  })
+}
+
+function toProjectBoard(row: ProjectBoardRow): ProjectBoard {
+  return {
+    id: row.id,
+    name: row.name,
+    ownerEmail: row.owner_email,
+    isDefault: row.is_default,
+    accessRole: row.access_role,
+    members: normalizeMembers(row.members),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  }
+}
+
+function toPipelineSpace(row: PipelineSpaceRow): PipelineSpace {
+  return {
+    id: row.id,
+    name: row.name,
+    ownerEmail: row.owner_email,
+    isDefault: row.is_default,
+    accessRole: row.access_role,
+    members: normalizeMembers(row.members),
+    sheetBacked: Boolean(row.sheet_id),
+    syncEnabled: row.sync_enabled,
+    sheetId: row.sheet_id,
+    projection: row.projection || { ...EMPTY_PIPELINE },
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  }
+}
+
+function cleanResourceName(value: unknown, fallback: string): string {
+  const name = String(value || '').trim() || fallback
+  if (name.length > 100) throw new Error('Name must be 100 characters or fewer')
+  return name
+}
+
+export async function ensureDefaultResourcesForUser(emailValue: unknown): Promise<{
+  boardId: string
+  pipelineId: string
+}> {
+  const user = await requireActiveAppUser(emailValue)
+  const ownerEmail = normalizeUserEmail(user.email)
+  const configuredOwner = normalizeUserEmail(process.env.APP_LOGIN_EMAIL)
+  const isConfiguredOwner = ownerEmail === configuredOwner
+
+  return withTransaction(async (client) => {
+    await client.query(
+      `
+        INSERT INTO project_boards (name, owner_email, is_default)
+        VALUES ($1, $2, true)
+        ON CONFLICT (owner_email) WHERE is_default DO NOTHING
+      `,
+      [isConfiguredOwner ? 'ClawPilot board' : 'My board', ownerEmail],
+    )
+    const board = await client.query<{ id: string }>(
+      'SELECT id::text FROM project_boards WHERE owner_email = $1 AND is_default LIMIT 1',
+      [ownerEmail],
+    )
+    if (!board.rows[0]) throw new Error('Unable to provision a project board')
+
+    await client.query(
+      `
+        INSERT INTO pipeline_spaces (name, owner_email, is_default, sheet_id, sync_enabled)
+        VALUES ($1, $2, true, $3, $4)
+        ON CONFLICT (owner_email) WHERE is_default DO NOTHING
+      `,
+      [isConfiguredOwner ? 'Sales pipeline' : 'My pipeline', ownerEmail, isConfiguredOwner ? DEFAULT_PIPELINE_SHEET_ID : null, isConfiguredOwner],
+    )
+    const pipeline = await client.query<{ id: string }>(
+      'SELECT id::text FROM pipeline_spaces WHERE owner_email = $1 AND is_default LIMIT 1',
+      [ownerEmail],
+    )
+    if (!pipeline.rows[0]) throw new Error('Unable to provision a pipeline')
+
+    if (isConfiguredOwner) {
+      await client.query('UPDATE tasks SET board_id = $1::uuid WHERE board_id IS NULL', [board.rows[0].id])
+      await client.query(
+        `
+          UPDATE pipeline_spaces
+          SET sheet_id = $2,
+              sync_enabled = true,
+              projection = COALESCE(
+                (SELECT value FROM app_settings WHERE key = 'pipeline.normalized.current'),
+                pipeline_spaces.projection
+              ),
+              updated_at = now()
+          WHERE id = $1::uuid
+        `,
+        [pipeline.rows[0].id, DEFAULT_PIPELINE_SHEET_ID],
+      )
+    }
+
+    return { boardId: board.rows[0].id, pipelineId: pipeline.rows[0].id }
+  })
+}
+
+export async function listProjectBoards(actorEmailValue: unknown): Promise<ProjectBoard[]> {
+  const actor = await requireActiveAppUser(actorEmailValue)
+  await ensureDefaultResourcesForUser(actor.email)
+  const result = await query<ProjectBoardRow>(
+    `
+      SELECT
+        board.id::text,
+        board.name,
+        board.owner_email,
+        board.is_default,
+        CASE WHEN board.owner_email = $1 THEN 'owner' ELSE membership.access_role END AS access_role,
+        CASE WHEN board.owner_email = $1 THEN COALESCE((
+          SELECT jsonb_agg(jsonb_build_object(
+            'email', member.user_email,
+            'displayName', app_user.display_name,
+            'status', app_user.status,
+            'accessRole', member.access_role
+          ) ORDER BY member.created_at ASC)
+          FROM project_board_members member
+          JOIN app_users app_user ON app_user.email = member.user_email
+          WHERE member.board_id = board.id
+        ), '[]'::jsonb) ELSE '[]'::jsonb END AS members,
+        board.created_at::text,
+        board.updated_at::text
+      FROM project_boards board
+      LEFT JOIN project_board_members membership
+        ON membership.board_id = board.id
+       AND membership.user_email = $1
+      WHERE board.owner_email = $1 OR membership.user_email = $1
+      ORDER BY
+        CASE WHEN board.owner_email = $1 AND board.is_default THEN 0 WHEN board.owner_email = $1 THEN 1 ELSE 2 END,
+        board.created_at ASC
+    `,
+    [actor.email],
+  )
+  return result.rows.map(toProjectBoard)
+}
+
+export async function listPipelineSpaces(actorEmailValue: unknown): Promise<PipelineSpace[]> {
+  const actor = await requireActiveAppUser(actorEmailValue)
+  await ensureDefaultResourcesForUser(actor.email)
+  const result = await query<PipelineSpaceRow>(
+    `
+      SELECT
+        pipeline.id::text,
+        pipeline.name,
+        pipeline.owner_email,
+        pipeline.is_default,
+        CASE WHEN pipeline.owner_email = $1 THEN 'owner' ELSE membership.access_role END AS access_role,
+        CASE WHEN pipeline.owner_email = $1 THEN COALESCE((
+          SELECT jsonb_agg(jsonb_build_object(
+            'email', member.user_email,
+            'displayName', app_user.display_name,
+            'status', app_user.status,
+            'accessRole', member.access_role
+          ) ORDER BY member.created_at ASC)
+          FROM pipeline_space_members member
+          JOIN app_users app_user ON app_user.email = member.user_email
+          WHERE member.pipeline_id = pipeline.id
+        ), '[]'::jsonb) ELSE '[]'::jsonb END AS members,
+        pipeline.sheet_id,
+        pipeline.sync_enabled,
+        pipeline.projection,
+        pipeline.created_at::text,
+        pipeline.updated_at::text
+      FROM pipeline_spaces pipeline
+      LEFT JOIN pipeline_space_members membership
+        ON membership.pipeline_id = pipeline.id
+       AND membership.user_email = $1
+      WHERE pipeline.owner_email = $1 OR membership.user_email = $1
+      ORDER BY
+        CASE WHEN pipeline.owner_email = $1 AND pipeline.is_default THEN 0 WHEN pipeline.owner_email = $1 THEN 1 ELSE 2 END,
+        pipeline.created_at ASC
+    `,
+    [actor.email],
+  )
+  return result.rows.map(toPipelineSpace)
+}
+
+export async function resolveProjectBoardAccess(input: {
+  actorEmail: unknown
+  boardId?: unknown
+}): Promise<ProjectBoard> {
+  const boards = await listProjectBoards(input.actorEmail)
+  const requested = String(input.boardId || '').trim()
+  if (requested) {
+    const board = boards.find((candidate) => candidate.id === requested)
+    if (!board) throw new Error('Project board access denied')
+    return board
+  }
+  const actor = normalizeUserEmail(input.actorEmail)
+  const fallback = boards.find((board) => board.ownerEmail === actor && board.isDefault) || boards[0]
+  if (!fallback) throw new Error('No project board is available')
+  return fallback
+}
+
+export async function resolvePipelineSpaceAccess(input: {
+  actorEmail: unknown
+  pipelineId?: unknown
+}): Promise<PipelineSpace> {
+  const pipelines = await listPipelineSpaces(input.actorEmail)
+  const requested = String(input.pipelineId || '').trim()
+  if (requested) {
+    const pipeline = pipelines.find((candidate) => candidate.id === requested)
+    if (!pipeline) throw new Error('Pipeline access denied')
+    return pipeline
+  }
+  const actor = normalizeUserEmail(input.actorEmail)
+  const fallback = pipelines.find((pipeline) => pipeline.ownerEmail === actor && pipeline.isDefault) || pipelines[0]
+  if (!fallback) throw new Error('No pipeline is available')
+  return fallback
+}
+
+export function requireResourceEditor(resource: Pick<ProjectBoard | PipelineSpace, 'accessRole'>): void {
+  if (resource.accessRole === 'viewer') throw new Error('This resource is view-only')
+}
+
+export async function createProjectBoard(input: { actorEmail: unknown; name: unknown }): Promise<ProjectBoard> {
+  const actor = await requireActiveAppUser(input.actorEmail)
+  if (!effectiveUserPermissions(actor).createBoards) throw new Error('You do not have permission to create boards')
+  const name = cleanResourceName(input.name, 'New board')
+  const result = await query<{ id: string }>(
+    'INSERT INTO project_boards (name, owner_email) VALUES ($1, $2) RETURNING id::text',
+    [name, actor.email],
+  )
+  return resolveProjectBoardAccess({ actorEmail: actor.email, boardId: result.rows[0].id })
+}
+
+export async function createPipelineSpace(input: { actorEmail: unknown; name: unknown }): Promise<PipelineSpace> {
+  const actor = await requireActiveAppUser(input.actorEmail)
+  if (!effectiveUserPermissions(actor).createPipelines) throw new Error('You do not have permission to create pipelines')
+  const name = cleanResourceName(input.name, 'New pipeline')
+  const result = await query<{ id: string }>(
+    'INSERT INTO pipeline_spaces (name, owner_email) VALUES ($1, $2) RETURNING id::text',
+    [name, actor.email],
+  )
+  return resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: result.rows[0].id })
+}
+
+async function validateShareTarget(actorEmail: string, targetEmailValue: unknown) {
+  const targetEmail = normalizeUserEmail(targetEmailValue)
+  if (targetEmail === actorEmail) throw new Error('The owner already has access')
+  const target = await getAppUser(targetEmail)
+  if (!target || target.status === 'disabled') throw new Error('Invite or restore this user before sharing')
+  return target
+}
+
+function normalizeShareRole(value: unknown): 'editor' | 'viewer' {
+  return value === 'editor' ? 'editor' : 'viewer'
+}
+
+export async function shareProjectBoard(input: {
+  actorEmail: unknown
+  boardId: unknown
+  userEmail: unknown
+  accessRole: unknown
+}): Promise<ProjectBoard> {
+  const actor = await requireActiveAppUser(input.actorEmail)
+  const board = await resolveProjectBoardAccess({ actorEmail: actor.email, boardId: input.boardId })
+  if (board.ownerEmail !== actor.email) throw new Error('Only the board owner can share it')
+  const target = await validateShareTarget(actor.email, input.userEmail)
+  await query(
+    `
+      INSERT INTO project_board_members (board_id, user_email, access_role, shared_by, updated_at)
+      VALUES ($1::uuid, $2, $3, $4, now())
+      ON CONFLICT (board_id, user_email) DO UPDATE SET
+        access_role = EXCLUDED.access_role,
+        shared_by = EXCLUDED.shared_by,
+        updated_at = now()
+    `,
+    [board.id, target.email, normalizeShareRole(input.accessRole), actor.email],
+  )
+  return resolveProjectBoardAccess({ actorEmail: actor.email, boardId: board.id })
+}
+
+export async function sharePipelineSpace(input: {
+  actorEmail: unknown
+  pipelineId: unknown
+  userEmail: unknown
+  accessRole: unknown
+}): Promise<PipelineSpace> {
+  const actor = await requireActiveAppUser(input.actorEmail)
+  const pipeline = await resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: input.pipelineId })
+  if (pipeline.ownerEmail !== actor.email) throw new Error('Only the pipeline owner can share it')
+  const target = await validateShareTarget(actor.email, input.userEmail)
+  await query(
+    `
+      INSERT INTO pipeline_space_members (pipeline_id, user_email, access_role, shared_by, updated_at)
+      VALUES ($1::uuid, $2, $3, $4, now())
+      ON CONFLICT (pipeline_id, user_email) DO UPDATE SET
+        access_role = EXCLUDED.access_role,
+        shared_by = EXCLUDED.shared_by,
+        updated_at = now()
+    `,
+    [pipeline.id, target.email, normalizeShareRole(input.accessRole), actor.email],
+  )
+  return resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: pipeline.id })
+}
+
+export async function removeProjectBoardShare(input: {
+  actorEmail: unknown
+  boardId: unknown
+  userEmail: unknown
+}): Promise<ProjectBoard> {
+  const actor = await requireActiveAppUser(input.actorEmail)
+  const board = await resolveProjectBoardAccess({ actorEmail: actor.email, boardId: input.boardId })
+  if (board.ownerEmail !== actor.email) throw new Error('Only the board owner can change sharing')
+  await query('DELETE FROM project_board_members WHERE board_id = $1::uuid AND user_email = $2', [board.id, normalizeUserEmail(input.userEmail)])
+  return resolveProjectBoardAccess({ actorEmail: actor.email, boardId: board.id })
+}
+
+export async function removePipelineShare(input: {
+  actorEmail: unknown
+  pipelineId: unknown
+  userEmail: unknown
+}): Promise<PipelineSpace> {
+  const actor = await requireActiveAppUser(input.actorEmail)
+  const pipeline = await resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: input.pipelineId })
+  if (pipeline.ownerEmail !== actor.email) throw new Error('Only the pipeline owner can change sharing')
+  await query('DELETE FROM pipeline_space_members WHERE pipeline_id = $1::uuid AND user_email = $2', [pipeline.id, normalizeUserEmail(input.userEmail)])
+  return resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: pipeline.id })
+}
+
+export async function readPipelineProjectionForSpace(space: PipelineSpace): Promise<PipelineProjection> {
+  if (space.syncEnabled && space.sheetId === DEFAULT_PIPELINE_SHEET_ID) {
+    return (await readPipelineProjectionFromPostgres()) || space.projection || { ...EMPTY_PIPELINE }
+  }
+  return space.projection || { ...EMPTY_PIPELINE }
+}
+
+export async function writeAppPipelineProjection(space: PipelineSpace, projection: PipelineProjection): Promise<void> {
+  if (space.syncEnabled) throw new Error('Sheet-backed pipelines must use the sync outbox')
+  await query(
+    'UPDATE pipeline_spaces SET projection = $2::jsonb, updated_at = now() WHERE id = $1::uuid',
+    [space.id, JSON.stringify(projection)],
+  )
+}

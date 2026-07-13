@@ -46,6 +46,10 @@ function hashPayload(payload) {
 if (!process.env.DATABASE_URL) {
   fail('DATABASE_URL is required')
 }
+const targetBoardId = String(process.env.TARGET_BOARD_ID || '').trim()
+if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(targetBoardId)) {
+  fail('TARGET_BOARD_ID must identify the board receiving this import')
+}
 
 const sourcePath = process.env.TASKS_PATH || defaultTasksPath()
 if (!existsSync(sourcePath)) {
@@ -80,10 +84,11 @@ async function main() {
       const archivedAt = task.archivedAt ? safeIso(task.archivedAt, updatedAt) : null
       const deletedAt = task.deletedAt ? safeIso(task.deletedAt, updatedAt) : null
 
-      await client.query(
+      const upsert = await client.query(
         `
           INSERT INTO tasks (
             id,
+            board_id,
             title,
             status,
             priority,
@@ -99,8 +104,9 @@ async function main() {
             payload_hash,
             source
           )
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8::timestamptz, $9::timestamptz, $10, $11::timestamptz, $12::timestamptz, $13::jsonb, $14, 'json-import')
+          VALUES ($1, $2::uuid, $3, $4, $5, $6, $7, $8, $9::timestamptz, $10::timestamptz, $11, $12::timestamptz, $13::timestamptz, $14::jsonb, $15, 'json-import')
           ON CONFLICT (id) DO UPDATE SET
+            board_id = EXCLUDED.board_id,
             title = EXCLUDED.title,
             status = EXCLUDED.status,
             priority = EXCLUDED.priority,
@@ -115,9 +121,11 @@ async function main() {
             payload = EXCLUDED.payload,
             payload_hash = EXCLUDED.payload_hash,
             source = EXCLUDED.source
+          WHERE tasks.board_id = EXCLUDED.board_id
         `,
         [
           id,
+          targetBoardId,
           String(task.title || 'Untitled task'),
           safeStatus(task.status),
           safePriority(task.priority),
@@ -129,13 +137,17 @@ async function main() {
           Boolean(task.archived),
           archivedAt,
           deletedAt,
-          JSON.stringify(task),
-          hashPayload(task),
+          JSON.stringify({ ...task, boardId: targetBoardId }),
+          hashPayload({ ...task, boardId: targetBoardId }),
         ],
       )
+      if (upsert.rowCount !== 1) throw new Error(`task id collision outside target board: ${id}`)
     }
 
-    await client.query('DELETE FROM agent_assignments')
+    await client.query(
+      'DELETE FROM agent_assignments assignment USING tasks task WHERE assignment.task_id = task.id AND task.board_id = $1::uuid',
+      [targetBoardId],
+    )
     for (const task of tasks) {
       if (!task.id || !task.assignedAgent || task.archived || task.deletedAt) continue
       await client.query(
@@ -155,7 +167,7 @@ async function main() {
     }
 
     if (ids.length > 0) {
-      await client.query('DELETE FROM tasks WHERE NOT (id = ANY($1::text[]))', [ids])
+      await client.query('DELETE FROM tasks WHERE board_id = $1::uuid AND NOT (id = ANY($2::text[]))', [targetBoardId, ids])
     }
 
     await client.query('COMMIT')
@@ -163,6 +175,7 @@ async function main() {
       ok: true,
       sourcePath,
       taskCount: tasks.length,
+      targetBoardId,
       dataDir: dirname(sourcePath),
       assignmentsProjected: tasks.filter((task) => task.id && task.assignedAgent && !task.archived && !task.deletedAt).length,
     }, null, 2))

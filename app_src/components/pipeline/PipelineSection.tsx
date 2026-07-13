@@ -16,6 +16,10 @@ import TextField from '@mui/material/TextField'
 import MenuItem from '@mui/material/MenuItem'
 import Button from '@mui/material/Button'
 import Alert from '@mui/material/Alert'
+import Dialog from '@mui/material/Dialog'
+import DialogActions from '@mui/material/DialogActions'
+import DialogContent from '@mui/material/DialogContent'
+import DialogTitle from '@mui/material/DialogTitle'
 import InputAdornment from '@mui/material/InputAdornment'
 import Autocomplete from '@mui/material/Autocomplete'
 import CloseRounded from '@mui/icons-material/CloseRounded'
@@ -23,9 +27,11 @@ import ViewColumnRounded from '@mui/icons-material/ViewColumnRounded'
 import TableRowsRounded from '@mui/icons-material/TableRowsRounded'
 import CallRounded from '@mui/icons-material/CallRounded'
 import EmailRounded from '@mui/icons-material/EmailRounded'
+import AddRounded from '@mui/icons-material/AddRounded'
 import Tabs from '@mui/material/Tabs'
 import Tab from '@mui/material/Tab'
 import useMediaQuery from '@mui/material/useMediaQuery'
+import WorkspaceSelector from '@/components/workspaces/WorkspaceSelector'
 
 type Contact = {
   id: string
@@ -279,6 +285,7 @@ function DealDrawer({
   owners,
   lossReasons,
   products,
+  readOnly,
 }: {
   deal: Deal | null
   onClose: () => void
@@ -291,6 +298,7 @@ function DealDrawer({
   owners: string[]
   lossReasons: string[]
   products: string[]
+  readOnly?: boolean
 }) {
   const [form, setForm] = useState<Deal | null>(null)
   const [saving, setSaving] = useState(false)
@@ -327,6 +335,7 @@ function DealDrawer({
 
         <Stack spacing={1.5}>
           <Autocomplete
+            disabled={readOnly}
             multiple
             freeSolo
             options={products}
@@ -339,20 +348,21 @@ function DealDrawer({
             }
             renderInput={(params) => <TextField {...params} label="Product" size="small" placeholder="Type to search/select" />}
           />
-          <TextField label="Priority" select size="small" value={form.priority || ''} onChange={e => setForm({ ...form, priority: e.target.value })}>
+          <TextField disabled={readOnly} label="Priority" select size="small" value={form.priority || ''} onChange={e => setForm({ ...form, priority: e.target.value })}>
             {priorities.map(p => <MenuItem key={p} value={p}>{p}</MenuItem>)}
           </TextField>
-          <TextField label="Status" select size="small" value={form.status || ''} onChange={e => setForm({ ...form, status: e.target.value })}>
+          <TextField disabled={readOnly} label="Status" select size="small" value={form.status || ''} onChange={e => setForm({ ...form, status: e.target.value })}>
             {statuses.map(s => <MenuItem key={s} value={s}>{s}</MenuItem>)}
           </TextField>
-          <TextField label="Stage" select size="small" value={form.stage || ''} onChange={e => setForm({ ...form, stage: e.target.value })}>
+          <TextField disabled={readOnly} label="Stage" select size="small" value={form.stage || ''} onChange={e => setForm({ ...form, stage: e.target.value })}>
             {stages.map(s => <MenuItem key={s} value={s}>{s}</MenuItem>)}
           </TextField>
-          <TextField label="Owner" select size="small" value={form.owner || ''} onChange={e => setForm({ ...form, owner: e.target.value })}>
+          <TextField disabled={readOnly} label="Owner" select size="small" value={form.owner || ''} onChange={e => setForm({ ...form, owner: e.target.value })}>
             {owners.map(o => <MenuItem key={o} value={o}>{o}</MenuItem>)}
           </TextField>
           <TextField
             label="Expected Close"
+            disabled={readOnly}
             size="small"
             type="date"
             value={form.closeDate || ''}
@@ -384,6 +394,7 @@ function DealDrawer({
           />
           <TextField
             label="Value"
+            disabled={readOnly}
             size="small"
             type="text"
             value={fmtIntInput(form.value || 0)}
@@ -396,6 +407,7 @@ function DealDrawer({
           />
           <TextField
             label="Probability"
+            disabled={readOnly}
             size="small"
             type="text"
             value={Number(form.probability || 0).toLocaleString('en-US', { minimumFractionDigits: 1, maximumFractionDigits: 1 })}
@@ -407,15 +419,15 @@ function DealDrawer({
             }}
             slotProps={{ input: { endAdornment: <InputAdornment position="end">%</InputAdornment> } }}
           />
-          <TextField label="Source" select size="small" value={form.source || ''} onChange={e => setForm({ ...form, source: e.target.value })}>
+          <TextField disabled={readOnly} label="Source" select size="small" value={form.source || ''} onChange={e => setForm({ ...form, source: e.target.value })}>
             {sources.map(s => <MenuItem key={s} value={s}>{s}</MenuItem>)}
           </TextField>
-          <TextField label="Loss Reason" select size="small" value={form.lossReason || ''} onChange={e => setForm({ ...form, lossReason: e.target.value })}>
+          <TextField disabled={readOnly} label="Loss Reason" select size="small" value={form.lossReason || ''} onChange={e => setForm({ ...form, lossReason: e.target.value })}>
             {lossReasons.map(l => <MenuItem key={l} value={l}>{l}</MenuItem>)}
           </TextField>
         </Stack>
 
-        <Stack direction="row" spacing={1} mt={2}>
+        {!readOnly ? <Stack direction="row" spacing={1} mt={2}>
           <Button variant="contained" disabled={saving} onClick={async () => {
             try {
               setSaving(true)
@@ -426,8 +438,8 @@ function DealDrawer({
             } finally {
               setSaving(false)
             }
-          }}>Save to Sheet</Button>
-        </Stack>
+          }}>Save</Button>
+        </Stack> : null}
 
         <Divider sx={{ my: 2, borderColor: 'rgba(255,255,255,0.08)' }} />
 
@@ -514,7 +526,7 @@ function DealDrawer({
 
         <Divider sx={{ my: 2, borderColor: 'rgba(255,255,255,0.08)' }} />
 
-        <Typography variant="subtitle2" mb={1}>Add Comment (appends to Notes)</Typography>
+        {!readOnly ? <><Typography variant="subtitle2" mb={1}>Add comment</Typography>
         <TextField multiline minRows={3} fullWidth value={comment} onChange={e => setComment(e.target.value)} placeholder="Write a comment..." />
         <Stack direction="row" spacing={1} mt={1}>
           <Button variant="outlined" disabled={saving || !comment.trim()} onClick={async () => {
@@ -529,7 +541,7 @@ function DealDrawer({
               setSaving(false)
             }
           }}>Append to Notes</Button>
-        </Stack>
+        </Stack></> : null}
 
         {form.notes && (
           <>
@@ -563,9 +575,20 @@ export default function PipelineSection() {
   const [activeStage, setActiveStage] = useState<string>(DEFAULT_STAGES[0])
   const [syncSurface, setSyncSurface] = useState<SyncSurface>({ state: 'unknown', lastSyncedAt: null, summary: null })
   const [syncingNow, setSyncingNow] = useState(false)
+  const [pipelineAccess, setPipelineAccess] = useState<'owner' | 'editor' | 'viewer' | null>(null)
+  const [pipelineSyncEnabled, setPipelineSyncEnabled] = useState(true)
+  const [newOpportunityOpen, setNewOpportunityOpen] = useState(false)
+  const [creatingOpportunity, setCreatingOpportunity] = useState(false)
+  const [newOpportunityError, setNewOpportunityError] = useState('')
+  const [newOpportunity, setNewOpportunity] = useState({ organization: '', name: '', priority: 'C', stage: 'Identified Lead', value: '', probability: '' })
+  const canEdit = pipelineAccess !== 'viewer'
 
   const load = async () => {
     const data = await fetch('/api/pipeline').then(r => r.json())
+    if (data?.pipeline) {
+      setPipelineAccess(data.pipeline.accessRole || null)
+      setPipelineSyncEnabled(data.pipeline.syncEnabled === true)
+    }
     const rows = Array.isArray(data) ? data : (Array.isArray(data.opportunities) ? data.opportunities : [])
     const mapped: Deal[] = rows.map((row: LooseRecord, i: number) => ({
       id: String(row.id ?? i),
@@ -623,7 +646,7 @@ export default function PipelineSection() {
   }
 
   const runManualSync = async () => {
-    if (syncingNow) return
+    if (syncingNow || !canEdit || !pipelineSyncEnabled) return
 
     setSyncingNow(true)
     setSyncSurface((prev) => ({ ...prev, state: 'syncing', error: undefined, feedback: 'Manual sync in progress…' }))
@@ -721,6 +744,7 @@ export default function PipelineSection() {
   )
 
   const moveDealStage = async (deal: Deal, direction: -1 | 1) => {
+    if (!canEdit) return
     const idx = stageOptions.findIndex(s => s === deal.stage)
     if (idx < 0) return
     const nextIdx = idx + direction
@@ -739,6 +763,7 @@ export default function PipelineSection() {
   }
 
   const patchOpportunityWithRetry = async (deal: Deal, body: Record<string, unknown>) => {
+    if (!canEdit) throw new Error('This pipeline is view-only')
     let localDeal = { ...deal }
     const mutationKey = pipelineMutationKey()
     for (let attempt = 0; attempt < 2; attempt++) {
@@ -774,6 +799,35 @@ export default function PipelineSection() {
     throw new Error('Save failed after retry')
   }
 
+  const createOpportunity = async () => {
+    if (!newOpportunity.organization.trim() || !newOpportunity.name.trim() || creatingOpportunity) return
+    setCreatingOpportunity(true)
+    setNewOpportunityError('')
+    try {
+      const response = await fetch('/api/pipeline', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          organization: newOpportunity.organization.trim(),
+          name: newOpportunity.name.trim(),
+          priority: newOpportunity.priority,
+          stage: newOpportunity.stage,
+          value: Number(newOpportunity.value || 0),
+          probability: Number(newOpportunity.probability || 0),
+        }),
+      })
+      const result = await response.json().catch(() => ({}))
+      if (!response.ok || !result.ok) throw new Error(result.error || 'Unable to create opportunity')
+      await load()
+      setNewOpportunity({ organization: '', name: '', priority: 'C', stage: 'Identified Lead', value: '', probability: '' })
+      setNewOpportunityOpen(false)
+    } catch (createError) {
+      setNewOpportunityError(createError instanceof Error ? createError.message : 'Unable to create opportunity')
+    } finally {
+      setCreatingOpportunity(false)
+    }
+  }
+
   if (loading) return <Box sx={{ p: 3 }}>{[1, 2, 3].map(i => <Skeleton key={i} variant="rounded" height={80} sx={{ mb: 2 }} />)}</Box>
   if (error) return <Box sx={{ p: 3 }}><Alert severity="error">{error}</Alert></Box>
 
@@ -792,12 +846,12 @@ export default function PipelineSection() {
           <Box><Typography variant="caption" color="text.disabled">Closed</Typography><Typography variant="h6" fontWeight={700}>{closedDeals.length}</Typography></Box>
 
           <Stack spacing={0.45} sx={{ minWidth: { xs: '100%', sm: 260 }, maxWidth: { xs: '100%', md: 460 } }}>
-            <Typography variant="caption" sx={{ color: '#A8C7FA', fontWeight: 700 }}>Pipeline Sync (Manual V1)</Typography>
+            <Typography variant="caption" sx={{ color: '#A8C7FA', fontWeight: 700 }}>{pipelineSyncEnabled ? 'Pipeline sync' : 'Pipeline storage'}</Typography>
             <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
               <Typography variant="caption" color="text.disabled">Sync status</Typography>
               <Chip
                 size="small"
-                label={syncSurface.state === 'syncing' ? 'Syncing…' : syncSurface.state === 'ok' ? 'In sync' : syncSurface.state === 'error' ? 'Sync error' : 'Unknown'}
+                label={!pipelineSyncEnabled ? 'App managed' : syncSurface.state === 'syncing' ? 'Syncing…' : syncSurface.state === 'ok' ? 'In sync' : syncSurface.state === 'error' ? 'Sync error' : 'Unknown'}
                 sx={{
                   height: 20,
                   fontSize: '0.65rem',
@@ -812,7 +866,7 @@ export default function PipelineSection() {
                 }}
               />
             </Stack>
-            <Typography variant="caption" color="text.secondary">Last synced timestamp: {fmtSyncTime(syncSurface.lastSyncedAt)}</Typography>
+            <Typography variant="caption" color="text.secondary">{pipelineSyncEnabled ? 'Last synced' : 'Last saved'}: {fmtSyncTime(syncSurface.lastSyncedAt)}</Typography>
             {syncSurface.feedback && (
               <Typography
                 variant="caption"
@@ -821,28 +875,37 @@ export default function PipelineSection() {
                 {syncSurface.feedback}
               </Typography>
             )}
-            {syncSurface.state === 'error' && syncSurface.error && (
+            {pipelineSyncEnabled && syncSurface.state === 'error' && syncSurface.error && (
               <Typography variant="caption" color="error.main">{syncSurface.error}</Typography>
-            )}
-            {syncSurface.state === 'error' && (
-              <Typography variant="caption" sx={{ color: '#FFA726', fontWeight: 600 }}>
-                Retry: click “Sync now” to pull fresh sheet data manually.
-              </Typography>
             )}
           </Stack>
 
           <Box sx={{ flex: 1 }} />
-          <Stack direction="row" spacing={1} sx={{ width: { xs: '100%', sm: 'auto' }, justifyContent: { xs: 'flex-start', sm: 'flex-end' } }}>
-            <Button
-              variant={syncSurface.state === 'error' ? 'contained' : 'outlined'}
-              color={syncSurface.state === 'error' ? 'warning' : 'primary'}
-              size="small"
-              onClick={runManualSync}
-              disabled={syncingNow}
-              sx={{ minHeight: 38, minWidth: 112 }}
-            >
-              {syncingNow ? 'Syncing…' : syncSurface.state === 'error' ? 'Retry sync now' : 'Sync now'}
-            </Button>
+          <Stack
+            direction="row"
+            spacing={1}
+            flexWrap="wrap"
+            useFlexGap
+            sx={{ width: { xs: '100%', sm: 'auto' }, justifyContent: { xs: 'flex-start', sm: 'flex-end' } }}
+          >
+            <WorkspaceSelector kind="pipeline" onAccessChange={(resource) => setPipelineAccess(resource?.accessRole || null)} />
+            {!pipelineSyncEnabled && canEdit ? (
+              <Button variant="contained" size="small" startIcon={<AddRounded />} onClick={() => setNewOpportunityOpen(true)} sx={{ minHeight: 38, whiteSpace: 'nowrap' }}>
+                New opportunity
+              </Button>
+            ) : null}
+            {pipelineSyncEnabled && canEdit ? (
+              <Button
+                variant={syncSurface.state === 'error' ? 'contained' : 'outlined'}
+                color={syncSurface.state === 'error' ? 'warning' : 'primary'}
+                size="small"
+                onClick={runManualSync}
+                disabled={syncingNow}
+                sx={{ minHeight: 38, minWidth: 112 }}
+              >
+                {syncingNow ? 'Syncing…' : syncSurface.state === 'error' ? 'Retry sync now' : 'Sync now'}
+              </Button>
+            ) : null}
             <ToggleButtonGroup size="small" value={filterStatus} exclusive onChange={(_, v) => v && setFilterStatus(v)}>
               <ToggleButton value="all">All</ToggleButton>
               <ToggleButton value="open">Open</ToggleButton>
@@ -924,8 +987,44 @@ export default function PipelineSection() {
         )}
       </Box>
 
+      <Dialog
+        open={newOpportunityOpen}
+        onClose={creatingOpportunity ? undefined : () => setNewOpportunityOpen(false)}
+        fullWidth
+        maxWidth="sm"
+        PaperProps={{ sx: { backgroundColor: '#1A1A23', border: '1px solid rgba(255,255,255,0.08)', borderRadius: 1 } }}
+      >
+        <DialogTitle sx={{ fontWeight: 700 }}>New opportunity</DialogTitle>
+        <DialogContent>
+          {newOpportunityError ? <Alert severity="error" sx={{ mb: 2 }}>{newOpportunityError}</Alert> : null}
+          <Stack spacing={1.5} mt={0.5}>
+            <TextField autoFocus label="Organization" value={newOpportunity.organization} onChange={(event) => setNewOpportunity((current) => ({ ...current, organization: event.target.value }))} />
+            <TextField label="Opportunity" value={newOpportunity.name} onChange={(event) => setNewOpportunity((current) => ({ ...current, name: event.target.value }))} />
+            <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.5}>
+              <TextField select fullWidth label="Priority" value={newOpportunity.priority} onChange={(event) => setNewOpportunity((current) => ({ ...current, priority: event.target.value }))}>
+                {priorityOptions.map((priority) => <MenuItem key={priority} value={priority}>{priority}</MenuItem>)}
+              </TextField>
+              <TextField select fullWidth label="Stage" value={newOpportunity.stage} onChange={(event) => setNewOpportunity((current) => ({ ...current, stage: event.target.value }))}>
+                {stageOptions.map((stage) => <MenuItem key={stage} value={stage}>{stage}</MenuItem>)}
+              </TextField>
+            </Stack>
+            <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.5}>
+              <TextField fullWidth label="Value" inputMode="decimal" value={newOpportunity.value} onChange={(event) => setNewOpportunity((current) => ({ ...current, value: event.target.value.replace(/[^0-9.]/g, '') }))} />
+              <TextField fullWidth label="Probability" inputMode="decimal" value={newOpportunity.probability} onChange={(event) => setNewOpportunity((current) => ({ ...current, probability: event.target.value.replace(/[^0-9.]/g, '') }))} />
+            </Stack>
+          </Stack>
+        </DialogContent>
+        <DialogActions sx={{ px: 3, pb: 2 }}>
+          <Button onClick={() => setNewOpportunityOpen(false)} disabled={creatingOpportunity}>Cancel</Button>
+          <Button variant="contained" onClick={createOpportunity} disabled={creatingOpportunity || !newOpportunity.organization.trim() || !newOpportunity.name.trim()}>
+            {creatingOpportunity ? 'Creating...' : 'Create'}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
       <DealDrawer
         deal={selectedDeal}
+        readOnly={!canEdit}
         onClose={() => setSelectedDeal(null)}
         priorities={priorityOptions}
         statuses={statusOptions}

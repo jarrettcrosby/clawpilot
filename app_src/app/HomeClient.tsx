@@ -51,11 +51,24 @@ export default function HomeClient() {
   const [desktopNavCollapsed, setDesktopNavCollapsed] = useState(false)
   const [boardFilter, setBoardFilter] = useState<BoardFilter>(emptyFilter())
   const [isTouchDevice] = useState<boolean>(() => detectTouchDevice())
+  const [appRole, setAppRole] = useState<'owner' | 'admin' | 'member' | null>(null)
+  const canManageVersions = appRole === 'owner'
 
   // iPhone/iPad touch landscape should stay in mobile-nav mode for maneuverability.
   const tallEnoughForDesktopNav = useMediaQuery('(min-height: 600px)')
   const touchLandscape = isLandscape && !desktopLikeInput
   const showDesktopNav = isMdUp && tallEnoughForDesktopNav && desktopLikeInput && !touchLandscape && !isTouchDevice
+
+  useEffect(() => {
+    let active = true
+    fetch('/api/auth/session')
+      .then((response) => response.json())
+      .then((result) => {
+        if (active && result?.ok && ['owner', 'admin', 'member'].includes(result.role)) setAppRole(result.role)
+      })
+      .catch(() => undefined)
+    return () => { active = false }
+  }, [])
 
   function navigateWithFilter(section: string, filter?: BoardFilter) {
     navigate(section)
@@ -126,12 +139,16 @@ export default function HomeClient() {
         case '3': navigate('projects'); break
         case '4': navigate('pipeline'); break
         case '5': navigate('agents'); break
-        case '6': navigate('versions'); break
+        case '6': if (canManageVersions) navigate('versions'); break
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [navigate])
+  }, [navigate, canManageVersions])
+
+  useEffect(() => {
+    if (appRole && activeSection === 'versions' && !canManageVersions) navigate('dashboard')
+  }, [activeSection, appRole, canManageVersions, navigate])
 
   const section = activeSection
 
@@ -144,6 +161,7 @@ export default function HomeClient() {
             onNavigate={navigate}
             collapsed={desktopNavCollapsed}
             onToggleCollapse={() => setDesktopNavCollapsed(c => !c)}
+            showVersions={canManageVersions}
           />
         </Box>
       )}
@@ -183,7 +201,7 @@ export default function HomeClient() {
               <PipelineSection />
             </Box>
           )}
-          {section === 'versions' && (
+          {section === 'versions' && canManageVersions && (
             <Box sx={{ height: '100%', overflow: 'auto' }}>
               <VersionsSection />
             </Box>
@@ -196,7 +214,7 @@ export default function HomeClient() {
         </Box>
         {!showDesktopNav && (
           <Box>
-            <Navigation activeSection={section} onNavigate={navigate} />
+            <Navigation activeSection={section} onNavigate={navigate} showVersions={canManageVersions} />
           </Box>
         )}
       </Box>

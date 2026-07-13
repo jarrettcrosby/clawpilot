@@ -18,10 +18,12 @@ type NavigationProps = {
   onNavigate: (s: string) => void
   collapsed?: boolean
   onToggleCollapse?: () => void
+  showVersions?: boolean
 }
 
-export default function Navigation({ activeSection, onNavigate, collapsed, onToggleCollapse }: NavigationProps) {
+export default function Navigation({ activeSection, onNavigate, collapsed, onToggleCollapse, showVersions = false }: NavigationProps) {
   const width = collapsed ? 76 : 220
+  const visibleItems = showVersions ? NAV_ITEMS : NAV_ITEMS.filter((item) => item.id !== 'versions')
   return (
     <>
       <Drawer
@@ -60,7 +62,7 @@ export default function Navigation({ activeSection, onNavigate, collapsed, onTog
         </Box>
         <Divider sx={{ borderColor: 'rgba(255,255,255,0.06)', mb: 1 }} />
         <List sx={{ px: 1.5, flex: 1 }}>
-          {NAV_ITEMS.map((item) => (
+          {visibleItems.map((item) => (
             <ListItem key={item.id} disablePadding>
               <ListItemButton
                 selected={activeSection === item.id}
@@ -114,7 +116,7 @@ export default function Navigation({ activeSection, onNavigate, collapsed, onTog
           }}
           showLabels
         >
-          {MOBILE_NAV_ITEMS.map((item) => (
+          {(showVersions ? MOBILE_NAV_ITEMS : MOBILE_NAV_ITEMS.filter((item) => item.id !== 'versions')).map((item) => (
             <BottomNavigationAction
               key={item.id}
               value={item.id}

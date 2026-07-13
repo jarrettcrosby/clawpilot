@@ -3,6 +3,8 @@ import fs from 'fs'
 import path from 'path'
 import { shouldFallbackToFileOnDatabaseError } from '@/lib/persistence/config'
 import { isPostgresExecutionStoreEnabled, listExecutionResultsFromPostgres } from '@/lib/persistence/execution'
+import { requireRequestUser } from '@/lib/requestUser'
+import { BOARD_SELECTION_COOKIE, resolveProjectBoardAccess } from '@/lib/tenancy'
 
 const DEV_TASKS_FILE = path.join(process.cwd(), '..', 'data-dev', 'tasks.json')
 const PROD_TASKS_FILE = path.join(process.cwd(), '..', 'data', 'tasks.json')
@@ -36,7 +38,11 @@ export async function GET(req: NextRequest) {
   let entries: JsonLineRecord[] | null = null
   if (isPostgresExecutionStoreEnabled()) {
     try {
-      entries = await listExecutionResultsFromPostgres({ taskId, limit })
+      const actor = await requireRequestUser(req)
+      const selected = req.cookies.get(BOARD_SELECTION_COOKIE)?.value || undefined
+      const board = await resolveProjectBoardAccess({ actorEmail: actor.email, boardId: selected })
+        .catch(() => resolveProjectBoardAccess({ actorEmail: actor.email }))
+      entries = await listExecutionResultsFromPostgres({ operatorId: actor.email, boardId: board.id, taskId, limit })
     } catch (error) {
       if (!shouldFallbackToFileOnDatabaseError()) throw error
       console.warn('[execution-results] Postgres read failed; falling back to file store', error)

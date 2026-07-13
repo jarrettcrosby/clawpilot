@@ -1,9 +1,11 @@
-import { NextResponse } from 'next/server'
+import { NextRequest, NextResponse } from 'next/server'
 import fs from 'fs'
 import path from 'path'
 import readline from 'readline'
 import { shouldFallbackToFileOnDatabaseError } from '@/lib/persistence/config'
 import { isPostgresExecutionStoreEnabled, summarizeExecutionResultsFromPostgres } from '@/lib/persistence/execution'
+import { requireRequestUser } from '@/lib/requestUser'
+import { BOARD_SELECTION_COOKIE, resolveProjectBoardAccess } from '@/lib/tenancy'
 
 const DEV_TASKS_FILE = path.join(process.cwd(), '..', 'data-dev', 'tasks.json')
 const PROD_TASKS_FILE = path.join(process.cwd(), '..', 'data', 'tasks.json')
@@ -38,10 +40,14 @@ async function summarizeJsonl(filePath: string) {
   return { count, last }
 }
 
-export async function GET() {
+export async function GET(req: NextRequest) {
   if (isPostgresExecutionStoreEnabled()) {
     try {
-      return NextResponse.json(await summarizeExecutionResultsFromPostgres())
+      const actor = await requireRequestUser(req)
+      const selected = req.cookies.get(BOARD_SELECTION_COOKIE)?.value || undefined
+      const board = await resolveProjectBoardAccess({ actorEmail: actor.email, boardId: selected })
+        .catch(() => resolveProjectBoardAccess({ actorEmail: actor.email }))
+      return NextResponse.json(await summarizeExecutionResultsFromPostgres({ operatorId: actor.email, boardId: board.id }))
     } catch (error) {
       if (!shouldFallbackToFileOnDatabaseError()) throw error
       console.warn('[execution-results-summary] Postgres read failed; falling back to file store', error)

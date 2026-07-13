@@ -31,6 +31,7 @@ import DeletedCardsView from './DeletedCardsView'
 import type { Task } from '@/lib/types'
 import { ASSIGNABLE_PRODUCT_AGENT_IDS, COLUMNS, PEOPLE } from '@/lib/types'
 import { assignmentKickoffText, triggerAgentTurn } from '@/lib/agents/client'
+import WorkspaceSelector from '@/components/workspaces/WorkspaceSelector'
 
 type BoardCtx = {
   updateTask: (task: Task) => void
@@ -91,7 +92,9 @@ export default function KanbanBoard({ externalFilter, onFilterChange }: Props = 
   const [creatingTask, setCreatingTask] = useState(false)
   const [createError, setCreateError] = useState('')
   const [moveError, setMoveError] = useState('')
+  const [boardAccess, setBoardAccess] = useState<'owner' | 'editor' | 'viewer' | null>(null)
   const isTouch = useMediaQuery('(pointer: coarse)')
+  const canEdit = boardAccess !== 'viewer'
 
   const filter = externalFilter && isFilterActive(externalFilter) ? externalFilter : internalFilter
   const drawerTask = tasks.find(task => task.id === drawerTaskId) || null
@@ -196,6 +199,7 @@ export default function KanbanBoard({ externalFilter, onFilterChange }: Props = 
 
   async function handleDragEnd(event: DragEndEvent) {
     setActiveTask(null)
+    if (!canEdit) return
     const { active, over } = event
     if (!over) return
 
@@ -310,17 +314,20 @@ export default function KanbanBoard({ externalFilter, onFilterChange }: Props = 
                   {archiveMode ? 'Archive' : `${visibleTasks.length} task${visibleTasks.length === 1 ? '' : 's'}${isFilterActive(filter) ? ' (filtered)' : ''}`}
                 </Typography>
               </Box>
-              {!archiveMode && (
-                <Button
-                  size="small"
-                  variant="contained"
-                  startIcon={<AddRounded />}
-                  onClick={() => setNewTaskOpen(true)}
-                  sx={{ textTransform: 'none', backgroundColor: '#A8C7FA', color: '#001D36', '&:hover': { backgroundColor: '#C2D7FA' } }}
-                >
-                  New task
-                </Button>
-              )}
+              <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} sx={{ width: { xs: '100%', sm: 'auto' } }}>
+                <WorkspaceSelector kind="board" onAccessChange={(resource) => setBoardAccess(resource?.accessRole || null)} />
+                {!archiveMode && canEdit ? (
+                  <Button
+                    size="small"
+                    variant="contained"
+                    startIcon={<AddRounded />}
+                    onClick={() => setNewTaskOpen(true)}
+                    sx={{ textTransform: 'none', backgroundColor: '#A8C7FA', color: '#001D36', '&:hover': { backgroundColor: '#C2D7FA' }, whiteSpace: 'nowrap' }}
+                  >
+                    New task
+                  </Button>
+                ) : null}
+              </Stack>
             </Box>
 
             <SearchBar
@@ -353,7 +360,7 @@ export default function KanbanBoard({ externalFilter, onFilterChange }: Props = 
           )
         ) : (
           <DndContext
-            sensors={sensors}
+            sensors={canEdit ? sensors : []}
             collisionDetection={closestCorners}
             onDragStart={handleDragStart}
             onDragEnd={handleDragEnd}
@@ -471,6 +478,7 @@ export default function KanbanBoard({ externalFilter, onFilterChange }: Props = 
           task={drawerTask}
           open={drawerTaskId !== null}
           onClose={() => setDrawerTaskId(null)}
+          readOnly={!canEdit}
           onUpdate={updateTask}
           onArchive={handleArchiveCard}
         />

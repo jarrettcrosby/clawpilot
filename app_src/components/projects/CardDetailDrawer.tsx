@@ -55,6 +55,7 @@ type Props = {
   onClose: () => void
   onUpdate?: (t: Task) => void
   onArchive?: (t: Task) => void
+  readOnly?: boolean
 }
 
 type NavigatorShare = Navigator & { share?: (data: { text: string; title?: string }) => Promise<void> }
@@ -206,7 +207,7 @@ function mentionsAgent(text: string, agentId: string) {
   return aliases.some((alias) => normalized.includes(`@${alias}`))
 }
 
-export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArchive }: Props) {
+export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArchive, readOnly = false }: Props) {
   const [editingTitle, setEditingTitle] = useState(false)
   const [titleVal, setTitleVal] = useState('')
   const [editingDesc, setEditingDesc] = useState(false)
@@ -234,6 +235,10 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
 
   const patch = useCallback(async (payload: Record<string, unknown>) => {
     if (!task) return
+    if (readOnly) {
+      setPatchError('This board is view-only.')
+      return null
+    }
     setSaving(true)
     setPatchError('')
     try {
@@ -248,10 +253,10 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
     } finally {
       setSaving(false)
     }
-  }, [task, onUpdate])
+  }, [task, onUpdate, readOnly])
 
   async function archiveCard() {
-    if (!task) return
+    if (!task || readOnly) return
     const res = await fetch('/api/tasks', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
@@ -372,9 +377,9 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
             <Typography variant="overline" sx={{ color: PRIORITY_COLORS[task.priority], fontSize: '0.65rem', letterSpacing: 1.5 }}>{PRIORITY_LABELS[task.priority]}</Typography>
           </Stack>
           <Box sx={{ display: 'flex', gap: 0.5 }}>
-            <Tooltip title="Archive card">
+            {!readOnly ? <Tooltip title="Archive card">
               <IconButton onClick={archiveCard} sx={{ color: 'text.disabled', mt: -0.5 }}><ArchiveRounded sx={{ fontSize: 20 }} /></IconButton>
-            </Tooltip>
+            </Tooltip> : null}
             <IconButton aria-label="Close drawer" onClick={onClose} sx={{ color: 'text.disabled', mt: -0.5 }}><CloseRounded /></IconButton>
           </Box>
         </Box>
@@ -386,7 +391,7 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
             <IconButton size="small" onClick={saveTitle} sx={{ color: '#66BB6A' }}><CheckRounded /></IconButton>
           </Box>
         ) : (
-          <Box sx={{ display: 'flex', gap: 1, cursor: 'pointer', '&:hover .ei': { opacity: 1 } }} onClick={() => { setTitleVal(task.title); setEditingTitle(true) }}>
+          <Box sx={{ display: 'flex', gap: 1, cursor: readOnly ? 'default' : 'pointer', '&:hover .ei': { opacity: readOnly ? 0 : 1 } }} onClick={() => { if (!readOnly) { setTitleVal(task.title); setEditingTitle(true) } }}>
             <Typography variant="h6" fontWeight={700} color="text.primary" sx={{ lineHeight: 1.3, flex: 1 }}>{task.title}</Typography>
             <EditRounded className="ei" sx={{ fontSize: 16, color: 'text.disabled', opacity: 0, transition: 'opacity 0.15s', mt: 0.5, flexShrink: 0 }} />
           </Box>
@@ -405,7 +410,7 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
           <Stack spacing={1.25}>
             <Stack direction="row" alignItems="center" spacing={2}>
               <Typography variant="body2" color="text.disabled" sx={{ minWidth: 80, fontSize: '0.8rem' }}>Status</Typography>
-              <Select size="small" value={task.status} onChange={e => patch({ status: e.target.value })} sx={selectSx} MenuProps={menuPaper}>
+              <Select disabled={readOnly} size="small" value={task.status} onChange={e => patch({ status: e.target.value })} sx={selectSx} MenuProps={menuPaper}>
                 {COLUMNS.map(c => (
                   <MenuItem key={c.status} value={c.status} sx={{ fontSize: '0.8rem', '&:hover': { backgroundColor: 'rgba(168,199,250,0.08)' } }}>
                     <Stack direction="row" spacing={1} alignItems="center">
@@ -418,7 +423,7 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
             </Stack>
             <Stack direction="row" alignItems="center" spacing={2}>
               <Typography variant="body2" color="text.disabled" sx={{ minWidth: 80, fontSize: '0.8rem' }}>Priority</Typography>
-              <Select size="small" value={task.priority} onChange={e => patch({ priority: e.target.value })} sx={selectSx} MenuProps={menuPaper}>
+              <Select disabled={readOnly} size="small" value={task.priority} onChange={e => patch({ priority: e.target.value })} sx={selectSx} MenuProps={menuPaper}>
                 {(['high','medium','low'] as const).map(p => (
                   <MenuItem key={p} value={p} sx={{ fontSize: '0.8rem', '&:hover': { backgroundColor: 'rgba(168,199,250,0.08)' } }}>
                     <Stack direction="row" spacing={1} alignItems="center">
@@ -431,7 +436,7 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
             </Stack>
             <Stack direction="row" alignItems="center" spacing={2}>
               <Typography variant="body2" color="text.disabled" sx={{ minWidth: 80, fontSize: '0.8rem' }}>Category</Typography>
-              <Select size="small" value={task.category} onChange={e => patch({ category: e.target.value })} sx={selectSx} MenuProps={menuPaper}>
+              <Select disabled={readOnly} size="small" value={task.category} onChange={e => patch({ category: e.target.value })} sx={selectSx} MenuProps={menuPaper}>
                 {CATEGORY_OPTIONS.map(c => (
                   <MenuItem key={c} value={c} sx={{ fontSize: '0.8rem', '&:hover': { backgroundColor: 'rgba(168,199,250,0.08)' } }}>{displayCategory(c)}</MenuItem>
                 ))}
@@ -439,7 +444,7 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
             </Stack>
             <Stack direction="row" alignItems="center" spacing={2}>
               <Typography variant="body2" color="text.disabled" sx={{ minWidth: 80, fontSize: '0.8rem' }}>Assignee</Typography>
-              <Select size="small" value={task.assignedAgent || ''} onChange={e => { void assignTask(String(e.target.value)) }} sx={selectSx} MenuProps={menuPaper} displayEmpty renderValue={v => v ? (
+              <Select disabled={readOnly} size="small" value={task.assignedAgent || ''} onChange={e => { void assignTask(String(e.target.value)) }} sx={selectSx} MenuProps={menuPaper} displayEmpty renderValue={v => v ? (
                 <Stack direction="row" spacing={1} alignItems="center">
                   <PersonAvatar personId={v as string} size={20} />
                   <span>{PEOPLE.find(p => p.id === v)?.name || PEOPLE.find(p => p.name === v)?.name || v as string}</span>
@@ -482,7 +487,7 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
               <Typography variant="body2" color="text.disabled" sx={{ minWidth: 80, fontSize: '0.8rem' }}>Due Date</Typography>
               <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
                 <Box sx={{ position: 'relative' }}>
-                  <Box component="input" type="date" value={task.dueDate || ''} onChange={(e: React.ChangeEvent<HTMLInputElement>) => patch({ dueDate: e.target.value })}
+                  <Box component="input" disabled={readOnly} type="date" value={task.dueDate || ''} onChange={(e: React.ChangeEvent<HTMLInputElement>) => patch({ dueDate: e.target.value })}
                     sx={{ backgroundColor: '#232330', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 2, color: 'white', px: 1.25, py: 0.75, fontSize: '0.8rem', outline: 'none', cursor: 'pointer', minWidth: 150,
                       '&::-webkit-calendar-picker-indicator': { filter: 'invert(0.6)', cursor: 'pointer' },
                       '&:hover': { borderColor: 'rgba(255,255,255,0.24)' } }} />
@@ -493,7 +498,7 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
                   )}
                 </Box>
                 {task.dueDate && (
-                  <IconButton size="small" onClick={() => patch({ dueDate: '' })} sx={{ p: 0.25, color: 'text.disabled', '&:hover': { color: '#EF5350' } }}>
+                  <IconButton disabled={readOnly} size="small" onClick={() => patch({ dueDate: '' })} sx={{ p: 0.25, color: 'text.disabled', '&:hover': { color: '#EF5350' } }}>
                     <CloseRounded sx={{ fontSize: 14 }} />
                   </IconButton>
                 )}
@@ -508,7 +513,7 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
         <Box>
           <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: 1 }}>
             <Typography variant="overline" color="text.disabled" sx={{ fontSize: '0.65rem', letterSpacing: 1.5 }}>LABELS</Typography>
-            <IconButton size="small" onClick={e => setLabelAnchor(e.currentTarget)} sx={{ color: 'text.disabled', '&:hover': { color: '#A8C7FA' } }}>
+            <IconButton disabled={readOnly} size="small" onClick={e => setLabelAnchor(e.currentTarget)} sx={{ color: 'text.disabled', '&:hover': { color: '#A8C7FA' } }}>
               <AddRounded sx={{ fontSize: 16 }} />
             </IconButton>
           </Box>
@@ -550,8 +555,8 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
               </Stack>
             </Box>
           ) : (
-            <Box onClick={() => { setDescVal(task.desc); setEditingDesc(true) }}
-              sx={{ cursor: 'pointer', p: 1.5, borderRadius: 2, border: '1px solid transparent', transition: 'border-color 0.15s', '&:hover': { borderColor: 'rgba(255,255,255,0.1)', backgroundColor: 'rgba(255,255,255,0.02)' } }}>
+            <Box onClick={() => { if (!readOnly) { setDescVal(task.desc); setEditingDesc(true) } }}
+              sx={{ cursor: readOnly ? 'default' : 'pointer', p: 1.5, borderRadius: 2, border: '1px solid transparent', transition: 'border-color 0.15s', '&:hover': { borderColor: readOnly ? 'transparent' : 'rgba(255,255,255,0.1)', backgroundColor: readOnly ? 'transparent' : 'rgba(255,255,255,0.02)' } }}>
               <Typography variant="body2" color={task.desc ? 'text.secondary' : 'text.disabled'} sx={{ lineHeight: 1.7 }}>
                 {task.desc || 'Click to add a description...'}
               </Typography>
@@ -570,9 +575,9 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
                 CHECKLIST
               </Typography>
             </Stack>
-            <Button size="small" onClick={() => setShowCheckAdd(v => !v)} sx={{ textTransform: 'none', fontSize: '0.72rem', color: '#A8C7FA' }}>
+            {!readOnly ? <Button size="small" onClick={() => setShowCheckAdd(v => !v)} sx={{ textTransform: 'none', fontSize: '0.72rem', color: '#A8C7FA' }}>
               {showCheckAdd ? 'Cancel' : 'Add item'}
-            </Button>
+            </Button> : null}
           </Box>
 
           {totalCount > 0 && (
@@ -615,7 +620,7 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
           <Stack spacing={0.5}>
             {(task.checklist || []).map(it => (
               <Box key={it.id} sx={{ display: 'flex', alignItems: 'flex-start', gap: 1, py: 0.5, px: 0.5, borderRadius: 1, backgroundColor: 'rgba(255,255,255,0.02)' }}>
-                <Checkbox size="small" checked={!!it.done} onChange={() => patch({ _checklistToggle: it.id })} sx={{ p: 0.5 }} />
+                <Checkbox disabled={readOnly} size="small" checked={!!it.done} onChange={() => patch({ _checklistToggle: it.id })} sx={{ p: 0.5 }} />
                 <Box sx={{ flex: 1 }}>
                   {editingChecklistId === it.id ? (
                     <Box>
@@ -657,7 +662,7 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
                     </Box>
                   )}
                 </Box>
-                {editingChecklistId !== it.id && (
+                {editingChecklistId !== it.id && !readOnly && (
                   <Stack direction="row" spacing={0.25}>
                     <Tooltip title="Edit item">
                       <IconButton size="small" onClick={() => startEditChecklist(it)} sx={{ p: 0.25, color: 'rgba(255,255,255,0.2)', '&:hover': { color: '#A8C7FA' } }}>
@@ -684,10 +689,10 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
             COMMENTS ({(task.comments||[]).length})
           </Typography>
           <Box sx={{ display: 'flex', gap: 1, mb: 2.5, alignItems: 'flex-end' }}>
-            <TextField inputRef={commentRef} multiline maxRows={4} fullWidth placeholder="Write a comment... (@ to mention)" size="small"
+            <TextField disabled={readOnly} inputRef={commentRef} multiline maxRows={4} fullWidth placeholder={readOnly ? 'View-only board' : 'Write a comment... (@ to mention)'} size="small"
               value={commentText} onChange={e => setCommentText(e.target.value)} onKeyDown={handleCommentKey}
               sx={{ '& .MuiOutlinedInput-root': { fontSize: '0.875rem', backgroundColor: '#232330', borderRadius: 2, '& fieldset': { borderColor: 'rgba(255,255,255,0.08)' }, '&.Mui-focused fieldset': { borderColor: '#A8C7FA' } } }} />
-            <IconButton onClick={() => { void submitComment() }} disabled={!commentText.trim()||saving||agentResponding} sx={{ color: commentText.trim()?'#A8C7FA':'text.disabled', mb: 0.25 }}>
+            <IconButton onClick={() => { void submitComment() }} disabled={readOnly||!commentText.trim()||saving||agentResponding} sx={{ color: commentText.trim()?'#A8C7FA':'text.disabled', mb: 0.25 }}>
               <SendRounded sx={{ fontSize: 20 }} />
             </IconButton>
           </Box>
@@ -726,13 +731,13 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
                     <Typography variant="caption" color="text.disabled" sx={{ ml: 1 }}>{formatDate((c as Comment).timestamp || (c as Comment).createdAt || task.updatedAt)}</Typography>
                   </Box>
                   <Tooltip title="Edit comment">
-                    <IconButton size="small" onClick={() => { setEditingCommentId(c.id); setEditingCommentText(c.text || '') }}
+                    <IconButton disabled={readOnly} size="small" onClick={() => { setEditingCommentId(c.id); setEditingCommentText(c.text || '') }}
                       sx={{ p: 0.5, color: 'rgba(255,255,255,0.2)', '&:hover': { color: '#A8C7FA' } }}>
                       <EditRounded sx={{ fontSize: 14 }} />
                     </IconButton>
                   </Tooltip>
                   <Tooltip title="Delete comment">
-                    <IconButton size="small" onClick={() => patch({ _deleteCommentId: c.id })}
+                    <IconButton disabled={readOnly} size="small" onClick={() => patch({ _deleteCommentId: c.id })}
                       sx={{ p: 0.5, color: 'rgba(255,255,255,0.2)', '&:hover': { color: '#EF5350' } }}>
                       <DeleteOutlineRounded sx={{ fontSize: 14 }} />
                     </IconButton>

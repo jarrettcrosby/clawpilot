@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import fs from 'fs'
 import path from 'path'
+import { isPostgresExecutionStoreEnabled } from '@/lib/persistence/execution'
 
 const DEV_TASKS_FILE = path.join(process.cwd(), '..', 'data-dev', 'tasks.json')
 const PROD_TASKS_FILE = path.join(process.cwd(), '..', 'data', 'tasks.json')
@@ -26,6 +27,9 @@ function readJsonl(filePath: string): JsonLineRecord[] {
 }
 
 export async function GET(req: NextRequest) {
+  if (isPostgresExecutionStoreEnabled()) {
+    return NextResponse.json({ error: 'Legacy execution threads are disabled; use task agent threads' }, { status: 410 })
+  }
   const { searchParams } = new URL(req.url)
   const taskId = searchParams.get('taskId')
   const limit = Math.min(Number(searchParams.get('limit') || 3), 10)

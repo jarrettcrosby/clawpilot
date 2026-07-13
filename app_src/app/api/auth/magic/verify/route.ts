@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { createSessionToken, getCookieName } from '@/lib/auth'
 import { verifyAuthMagicCode } from '@/lib/authMagicCode'
+import { ensureDefaultResourcesForUser } from '@/lib/tenancy'
 
 export async function POST(req: NextRequest) {
   try {
@@ -15,6 +16,8 @@ export async function POST(req: NextRequest) {
     if (result.status !== 'verified') {
       return NextResponse.json({ ok: false, error: 'The code is invalid or expired.' }, { status: 401 })
     }
+
+    await ensureDefaultResourcesForUser(result.email)
 
     const response = NextResponse.json({ ok: true })
     response.cookies.set({

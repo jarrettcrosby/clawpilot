@@ -16,6 +16,12 @@ import { getThreadFromPostgres, listThreadsFromPostgres, upsertThreadMessageInPo
 import { appendExecutionResultToPostgres, appendExecutionRunToPostgres, isPostgresExecutionStoreEnabled } from '@/lib/persistence/execution'
 import { isPostgresTaskStoreEnabled, readTasksFromPostgres, replaceTasksInPostgres } from '@/lib/persistence/tasks'
 import { requireActiveAppUser } from '@/lib/users'
+import {
+  BOARD_SELECTION_COOKIE,
+  requireResourceEditor,
+  resolveProjectBoardAccess,
+  type ProjectBoard,
+} from '@/lib/tenancy'
 
 const SECOND_BRAIN = process.env.SECOND_BRAIN_PATH || '/Users/agentsuburbiasandwich/.openclaw/workspace/second-brain'
 const DEV_TASKS_FILE = path.join(process.cwd(), '..', 'data-dev', 'tasks.json')
@@ -31,10 +37,11 @@ function readTasksFromFile(): Task[] {
   }
 }
 
-async function readTasks(): Promise<Task[]> {
+async function readTasks(boardId?: string): Promise<Task[]> {
   if (isPostgresTaskStoreEnabled()) {
+    if (!boardId) throw new Error('Project board context is required')
     try {
-      return await readTasksFromPostgres()
+      return await readTasksFromPostgres({ boardId })
     } catch (error) {
       if (!shouldFallbackToFileOnDatabaseError()) throw error
       console.warn('[agent-threads] Postgres task read failed; falling back to file store', error)
@@ -43,11 +50,12 @@ async function readTasks(): Promise<Task[]> {
   return readTasksFromFile()
 }
 
-async function writeTasks(tasks: Task[]) {
+async function writeTasks(tasks: Task[], boardId?: string) {
   const canonical = canonicalizeTasks(tasks)
   if (isPostgresTaskStoreEnabled()) {
+    if (!boardId) throw new Error('Project board context is required')
     try {
-      await replaceTasksInPostgres(canonical)
+      await replaceTasksInPostgres(canonical, { boardId })
       return
     } catch (error) {
       if (!shouldFallbackToFileOnDatabaseError()) throw error
@@ -115,6 +123,19 @@ async function resolveOperator(req: NextRequest): Promise<string | null> {
   }
 }
 
+async function resolveAgentBoard(req: NextRequest, operatorId: string, requireEdit = false): Promise<ProjectBoard | null> {
+  if (!isPostgresTaskStoreEnabled()) return null
+  const selected = req.cookies.get(BOARD_SELECTION_COOKIE)?.value || undefined
+  let board: ProjectBoard
+  try {
+    board = await resolveProjectBoardAccess({ actorEmail: operatorId, boardId: selected })
+  } catch {
+    board = await resolveProjectBoardAccess({ actorEmail: operatorId })
+  }
+  if (requireEdit) requireResourceEditor(board)
+  return board
+}
+
 function deriveNextAction(summary: string): string {
   const lines = String(summary || '')
     .split(/\r?\n/)
@@ -130,8 +151,8 @@ function deriveNextAction(summary: string): string {
   return firstRemaining?.replace(/^[-*]\s+/, '').trim() || 'Review the agent result and choose the next concrete step.'
 }
 
-async function recordAgentResult(taskId: string, agentId: string, summary: string) {
-  const tasks = await readTasks()
+async function recordAgentResult(taskId: string, agentId: string, summary: string, boardId?: string) {
+  const tasks = await readTasks(boardId)
   const index = tasks.findIndex((task) => String(task.id) === taskId)
   if (index === -1) return
 
@@ -168,7 +189,7 @@ async function recordAgentResult(taskId: string, agentId: string, summary: strin
     },
     updatedAt: now,
   }
-  await writeTasks(tasks)
+  await writeTasks(tasks, boardId)
 }
 
 async function recordExecutionTelemetry(entry: Record<string, unknown>, includeResult = false) {
@@ -263,16 +284,29 @@ function assignmentError(task: Task, agentId: string): string | null {
 export async function GET(req: NextRequest) {
   const operatorId = await resolveOperator(req)
   if (!operatorId) return NextResponse.json({ ok: false, error: 'Unauthorized' }, { status: 401 })
+  let board: ProjectBoard | null
+  try {
+    board = await resolveAgentBoard(req, operatorId)
+  } catch (error) {
+    return NextResponse.json({ ok: false, error: error instanceof Error ? error.message : 'Board access denied' }, { status: 403 })
+  }
   const { searchParams } = new URL(req.url)
   const requestedAgentId = String(searchParams.get('agentId') || '')
-  if (!requestedAgentId) return NextResponse.json(await listPersistedThreads(operatorId))
+  if (!requestedAgentId) {
+    const taskIds = new Set((await readTasks(board?.id)).map((task) => String(task.id)))
+    const collection = await listPersistedThreads(operatorId) as { threads?: Array<{ taskId?: string }> }
+    return NextResponse.json({
+      ...collection,
+      threads: (collection.threads || []).filter((thread) => taskIds.has(String(thread.taskId || ''))),
+    })
+  }
 
   const agentId = normalizeProductAgentId(requestedAgentId)
   const taskId = String(searchParams.get('taskId') || '').trim()
   if (!agentId) return NextResponse.json({ ok: false, error: 'invalid product agent' }, { status: 400 })
   if (!taskId) return NextResponse.json({ ok: false, error: 'taskId required' }, { status: 400 })
 
-  const task = (await readTasks()).find((entry) => String(entry.id) === taskId)
+  const task = (await readTasks(board?.id)).find((entry) => String(entry.id) === taskId)
   if (!task) return NextResponse.json({ ok: false, error: 'task not found' }, { status: 404 })
   const mismatch = assignmentError(task, agentId)
   if (mismatch) return NextResponse.json({ ok: false, error: mismatch }, { status: 409 })
@@ -301,6 +335,12 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   const operatorId = await resolveOperator(req)
   if (!operatorId) return NextResponse.json({ ok: false, error: 'Unauthorized' }, { status: 401 })
+  let board: ProjectBoard | null
+  try {
+    board = await resolveAgentBoard(req, operatorId, true)
+  } catch (error) {
+    return NextResponse.json({ ok: false, error: error instanceof Error ? error.message : 'Board edit access denied' }, { status: 403 })
+  }
   const body = await req.json()
   const agentId = normalizeProductAgentId(String(body?.agentId || ''))
   const text = String(body?.text || '').trim()
@@ -310,7 +350,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ ok: false, error: 'valid agentId, taskId and text required' }, { status: 400 })
   }
 
-  const task = (await readTasks()).find((entry) => String(entry.id) === taskId)
+  const task = (await readTasks(board?.id)).find((entry) => String(entry.id) === taskId)
   if (!task) return NextResponse.json({ ok: false, error: 'task not found' }, { status: 404 })
   const mismatch = assignmentError(task, agentId)
   if (mismatch) return NextResponse.json({ ok: false, error: mismatch }, { status: 409 })
@@ -392,7 +432,7 @@ export async function POST(req: NextRequest) {
   }
 
   const completedAt = new Date().toISOString()
-  await recordAgentResult(taskId, agentId, responseText)
+  await recordAgentResult(taskId, agentId, responseText, board?.id)
   await recordExecutionTelemetry({
     runId,
     operatorId,
@@ -419,7 +459,7 @@ export async function POST(req: NextRequest) {
   })
 
   const thread = await getPersistedThread({ operatorId, agentId, taskId })
-  const updatedTask = (await readTasks()).find((entry) => String(entry.id) === taskId)
+  const updatedTask = (await readTasks(board?.id)).find((entry) => String(entry.id) === taskId)
   return NextResponse.json({
     ok: true,
     thread,

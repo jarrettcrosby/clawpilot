@@ -109,12 +109,17 @@ export async function appendExecutionResultToPostgres(entry: ExecutionLogRecord)
 }
 
 export async function listExecutionRunsFromPostgres(input: {
+  operatorId: string
+  boardId: string
   taskId?: string | null
   runId?: string | null
   limit?: number
 }): Promise<ExecutionLogRecord[]> {
-  const clauses: string[] = []
-  const values: unknown[] = []
+  const clauses: string[] = [
+    'operator_id = $1',
+    'task_id IN (SELECT id FROM tasks WHERE board_id = $2::uuid)',
+  ]
+  const values: unknown[] = [cleanString(input.operatorId), input.boardId]
 
   if (cleanString(input.runId)) {
     values.push(cleanString(input.runId))
@@ -126,14 +131,12 @@ export async function listExecutionRunsFromPostgres(input: {
     clauses.push(`task_id = $${values.length}`)
   }
 
-  if (clauses.length === 0) return []
-
   values.push(limitFor(input.limit))
   const result = await query<PayloadRow>(
     `
       SELECT payload
       FROM execution_runs
-      WHERE ${clauses.join(' OR ')}
+      WHERE ${clauses.join(' AND ')}
       ORDER BY created_at DESC, id DESC
       LIMIT $${values.length}
     `,
@@ -144,6 +147,8 @@ export async function listExecutionRunsFromPostgres(input: {
 }
 
 export async function listExecutionResultsFromPostgres(input: {
+  operatorId: string
+  boardId: string
   taskId: string
   limit?: number
 }): Promise<ExecutionLogRecord[]> {
@@ -151,25 +156,36 @@ export async function listExecutionResultsFromPostgres(input: {
     `
       SELECT payload
       FROM execution_results
-      WHERE task_id = $1
+      WHERE operator_id = $1
+        AND task_id = $2
+        AND task_id IN (SELECT id FROM tasks WHERE board_id = $3::uuid)
       ORDER BY created_at DESC, id DESC
-      LIMIT $2
+      LIMIT $4
     `,
-    [input.taskId, limitFor(input.limit)],
+    [cleanString(input.operatorId), input.taskId, input.boardId, limitFor(input.limit)],
   )
 
   return result.rows.map((row) => row.payload)
 }
 
-async function summarize(tableName: 'execution_runs' | 'execution_results') {
-  const countResult = await query<CountRow>(`SELECT COUNT(*)::text AS count FROM ${tableName}`)
+async function summarize(
+  tableName: 'execution_runs' | 'execution_results',
+  scope?: { operatorId: string; boardId: string },
+) {
+  const where = scope
+    ? 'WHERE operator_id = $1 AND task_id IN (SELECT id FROM tasks WHERE board_id = $2::uuid)'
+    : ''
+  const values = scope ? [cleanString(scope.operatorId), scope.boardId] : []
+  const countResult = await query<CountRow>(`SELECT COUNT(*)::text AS count FROM ${tableName} ${where}`, values)
   const lastResult = await query<PayloadRow>(
     `
       SELECT payload
       FROM ${tableName}
+      ${where}
       ORDER BY created_at DESC, id DESC
       LIMIT 1
     `,
+    values,
   )
 
   return {
@@ -178,12 +194,12 @@ async function summarize(tableName: 'execution_runs' | 'execution_results') {
   }
 }
 
-export async function summarizeExecutionRunsFromPostgres() {
-  return summarize('execution_runs')
+export async function summarizeExecutionRunsFromPostgres(scope?: { operatorId: string; boardId: string }) {
+  return summarize('execution_runs', scope)
 }
 
-export async function summarizeExecutionResultsFromPostgres() {
-  return summarize('execution_results')
+export async function summarizeExecutionResultsFromPostgres(scope?: { operatorId: string; boardId: string }) {
+  return summarize('execution_results', scope)
 }
 
 export async function inspectExecutionTablesFromPostgres(): Promise<{

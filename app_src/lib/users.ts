@@ -2,13 +2,39 @@ import { query, withTransaction } from '@/lib/persistence/postgres'
 
 const EMAIL_PATTERN = /^[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+$/i
 
-export type AppUserRole = 'owner' | 'member'
+export type AppUserRole = 'owner' | 'admin' | 'member'
 export type AppUserStatus = 'invited' | 'active' | 'disabled'
+
+export type AppUserPermissions = {
+  inviteUsers: boolean
+  manageUserAccess: boolean
+  createBoards: boolean
+  createPipelines: boolean
+}
+
+export const MEMBER_PERMISSIONS: AppUserPermissions = {
+  inviteUsers: false,
+  manageUserAccess: false,
+  createBoards: true,
+  createPipelines: true,
+}
+
+export const OWNER_PERMISSIONS: AppUserPermissions = {
+  inviteUsers: true,
+  manageUserAccess: true,
+  createBoards: true,
+  createPipelines: true,
+}
 
 export type AppUser = {
   email: string
   role: AppUserRole
   status: AppUserStatus
+  displayName: string | null
+  jobTitle: string | null
+  timezone: string
+  locale: string
+  permissions: AppUserPermissions
   invitedBy: string | null
   invitedAt: string | null
   activatedAt: string | null
@@ -21,6 +47,11 @@ type AppUserRow = {
   email: string
   role: AppUserRole
   status: AppUserStatus
+  display_name: string | null
+  job_title: string | null
+  timezone: string
+  locale: string
+  permissions: unknown
   invited_by: string | null
   invited_at: string | null
   activated_at: string | null
@@ -41,11 +72,38 @@ export function configuredOwnerEmail(): string {
   return normalizeUserEmail(process.env.APP_LOGIN_EMAIL)
 }
 
+function normalizePermissions(value: unknown): AppUserPermissions {
+  const input = value && typeof value === 'object' ? value as Record<string, unknown> : {}
+  return {
+    inviteUsers: input.inviteUsers === true,
+    manageUserAccess: input.manageUserAccess === true,
+    createBoards: input.createBoards !== false,
+    createPipelines: input.createPipelines !== false,
+  }
+}
+
+export function effectiveUserPermissions(user: Pick<AppUser, 'role' | 'permissions'>): AppUserPermissions {
+  return user.role === 'owner' ? { ...OWNER_PERMISSIONS } : normalizePermissions(user.permissions)
+}
+
+export function canInviteUsers(user: Pick<AppUser, 'role' | 'permissions'>): boolean {
+  return effectiveUserPermissions(user).inviteUsers
+}
+
+export function canManageUserAccess(user: Pick<AppUser, 'role' | 'permissions'>): boolean {
+  return effectiveUserPermissions(user).manageUserAccess
+}
+
 function toAppUser(row: AppUserRow): AppUser {
   return {
     email: row.email,
     role: row.role,
     status: row.status,
+    displayName: row.display_name,
+    jobTitle: row.job_title,
+    timezone: row.timezone || 'America/New_York',
+    locale: row.locale || 'en-US',
+    permissions: row.role === 'owner' ? { ...OWNER_PERMISSIONS } : normalizePermissions(row.permissions),
     invitedBy: row.invited_by,
     invitedAt: row.invited_at,
     activatedAt: row.activated_at,
@@ -60,17 +118,18 @@ export async function ensureOwnerUser(): Promise<AppUser> {
   const result = await query<AppUserRow>(
     `
       INSERT INTO app_users (
-        email, role, status, activated_at, created_at, updated_at
+        email, role, status, permissions, activated_at, created_at, updated_at
       )
-      VALUES ($1, 'owner', 'active', now(), now(), now())
+      VALUES ($1, 'owner', 'active', $2::jsonb, now(), now(), now())
       ON CONFLICT (email) DO UPDATE SET
         role = 'owner',
         status = CASE WHEN app_users.status = 'disabled' THEN 'disabled' ELSE 'active' END,
+        permissions = $2::jsonb,
         activated_at = COALESCE(app_users.activated_at, now()),
         updated_at = now()
       RETURNING *
     `,
-    [email],
+    [email, JSON.stringify(OWNER_PERMISSIONS)],
   )
   return toAppUser(result.rows[0])
 }
@@ -90,6 +149,7 @@ export async function requireActiveAppUser(emailValue: unknown): Promise<AppUser
 
 export async function listAppUsers(actorEmailValue: unknown): Promise<{ actor: AppUser; users: AppUser[] }> {
   const actor = await requireActiveAppUser(actorEmailValue)
+  if (!canInviteUsers(actor) && !canManageUserAccess(actor)) return { actor, users: [actor] }
   const result = await query<AppUserRow>(
     `
       SELECT *
@@ -102,31 +162,34 @@ export async function listAppUsers(actorEmailValue: unknown): Promise<{ actor: A
 
 export async function inviteAppUser(input: { actorEmail: unknown; email: unknown }): Promise<AppUser> {
   const actor = await requireActiveAppUser(input.actorEmail)
-  if (actor.role !== 'owner') throw new Error('Only an owner can invite users')
+  if (!canInviteUsers(actor)) throw new Error('You do not have permission to invite users')
   const email = normalizeUserEmail(input.email)
   if (email === actor.email) return actor
 
   return withTransaction(async (client) => {
     const existing = await client.query<AppUserRow>('SELECT * FROM app_users WHERE email = $1 FOR UPDATE', [email])
     const current = existing.rows[0]
-    if (current?.role === 'owner') return toAppUser(current)
+    if (current?.role === 'owner') throw new Error('The owner already has access')
+    if (current?.role === 'admin' && actor.role !== 'owner') throw new Error('Only the owner can invite administrators')
+    if (current?.status === 'disabled' && !canManageUserAccess(actor)) {
+      throw new Error('You do not have permission to restore disabled users')
+    }
     if (current?.status === 'active') return toAppUser(current)
 
     const result = await client.query<AppUserRow>(
       `
         INSERT INTO app_users (
-          email, role, status, invited_by, invited_at, created_at, updated_at
+          email, role, status, permissions, invited_by, invited_at, created_at, updated_at
         )
-        VALUES ($1, 'member', 'invited', $2, now(), now(), now())
+        VALUES ($1, 'member', 'invited', $3::jsonb, $2, now(), now(), now())
         ON CONFLICT (email) DO UPDATE SET
-          role = 'member',
           status = 'invited',
           invited_by = EXCLUDED.invited_by,
           invited_at = now(),
           updated_at = now()
         RETURNING *
       `,
-      [email, actor.email],
+      [email, actor.email, JSON.stringify(MEMBER_PERMISSIONS)],
     )
     return toAppUser(result.rows[0])
   })
@@ -138,9 +201,14 @@ export async function setAppUserStatus(input: {
   status: 'active' | 'disabled'
 }): Promise<AppUser> {
   const actor = await requireActiveAppUser(input.actorEmail)
-  if (actor.role !== 'owner') throw new Error('Only an owner can manage users')
+  if (!canManageUserAccess(actor)) throw new Error('You do not have permission to manage users')
   const email = normalizeUserEmail(input.email)
-  if (email === actor.email && input.status === 'disabled') throw new Error('The owner account cannot disable itself')
+  if (email === actor.email && input.status === 'disabled') throw new Error('You cannot disable your own account')
+
+  const target = await getAppUser(email)
+  if (!target) throw new Error('User was not found')
+  if (target.role === 'owner') throw new Error('The owner account cannot be changed')
+  if (actor.role !== 'owner' && target.role !== 'member') throw new Error('Only the owner can manage administrators')
 
   const result = await query<AppUserRow>(
     `
@@ -155,6 +223,97 @@ export async function setAppUserStatus(input: {
     [email, input.status],
   )
   if (!result.rows[0]) throw new Error('User was not found')
+  return toAppUser(result.rows[0])
+}
+
+function cleanOptionalText(value: unknown, maxLength: number): string | null {
+  const text = String(value || '').trim()
+  if (!text) return null
+  if (text.length > maxLength) throw new Error(`Value must be ${maxLength} characters or fewer`)
+  return text
+}
+
+function normalizeTimezone(value: unknown): string {
+  const timezone = String(value || '').trim() || 'America/New_York'
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: timezone }).format()
+  } catch {
+    throw new Error('A valid timezone is required')
+  }
+  return timezone
+}
+
+function normalizeLocale(value: unknown): string {
+  const locale = String(value || '').trim() || 'en-US'
+  try {
+    return Intl.getCanonicalLocales(locale)[0] || 'en-US'
+  } catch {
+    throw new Error('A valid locale is required')
+  }
+}
+
+export async function updateAppUserProfile(input: {
+  actorEmail: unknown
+  displayName: unknown
+  jobTitle?: unknown
+  timezone?: unknown
+  locale?: unknown
+}): Promise<AppUser> {
+  const actor = await requireActiveAppUser(input.actorEmail)
+  const displayName = cleanOptionalText(input.displayName, 100)
+  if (!displayName) throw new Error('Name is required')
+  const jobTitle = cleanOptionalText(input.jobTitle, 120)
+  const timezone = normalizeTimezone(input.timezone)
+  const locale = normalizeLocale(input.locale)
+  const result = await query<AppUserRow>(
+    `
+      UPDATE app_users
+      SET display_name = $2,
+          job_title = $3,
+          timezone = $4,
+          locale = $5,
+          updated_at = now()
+      WHERE email = $1
+      RETURNING *
+    `,
+    [actor.email, displayName, jobTitle, timezone, locale],
+  )
+  return toAppUser(result.rows[0])
+}
+
+export async function updateAppUserAccess(input: {
+  actorEmail: unknown
+  email: unknown
+  role?: 'admin' | 'member'
+  permissions?: Partial<AppUserPermissions>
+}): Promise<AppUser> {
+  const actor = await requireActiveAppUser(input.actorEmail)
+  if (!canManageUserAccess(actor)) throw new Error('You do not have permission to manage users')
+  const email = normalizeUserEmail(input.email)
+  const target = await getAppUser(email)
+  if (!target) throw new Error('User was not found')
+  if (target.role === 'owner') throw new Error('The owner account cannot be changed')
+  if (actor.role !== 'owner' && (target.role !== 'member' || input.role === 'admin')) {
+    throw new Error('Only the owner can manage administrators')
+  }
+
+  const role = input.role || target.role
+  const base = input.role && input.role !== target.role
+    ? role === 'admin' ? { ...OWNER_PERMISSIONS } : { ...MEMBER_PERMISSIONS }
+    : target.permissions
+  const requested = input.permissions && typeof input.permissions === 'object' ? input.permissions : {}
+  const permissions = normalizePermissions({ ...base, ...requested })
+  const result = await query<AppUserRow>(
+    `
+      UPDATE app_users
+      SET role = $2,
+          permissions = $3::jsonb,
+          updated_at = now()
+      WHERE email = $1
+      RETURNING *
+    `,
+    [email, role, JSON.stringify(permissions)],
+  )
   return toAppUser(result.rows[0])
 }
 

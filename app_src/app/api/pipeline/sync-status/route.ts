@@ -1,32 +1,38 @@
-import { NextResponse } from 'next/server'
+import { NextRequest, NextResponse } from 'next/server'
 import fs from 'fs'
 import path from 'path'
 import { logPipelineEvent } from '@/lib/pipelineLog'
 import { shouldFallbackToFileOnDatabaseError } from '@/lib/persistence/config'
 import {
   isPostgresPipelineStoreEnabled,
-  readPipelineProjectionFromPostgres,
   readPipelineSyncDiagnosticsFromPostgres,
 } from '@/lib/persistence/pipeline'
+import { requireRequestUser } from '@/lib/requestUser'
+import { PIPELINE_SELECTION_COOKIE, readPipelineProjectionForSpace, resolvePipelineSpaceAccess } from '@/lib/tenancy'
 
 const ROOT = path.join(process.cwd(), '..')
 const NORM = process.env.PIPELINE_NORMALIZED_PATH || path.join(ROOT, 'data', 'pipeline', 'normalized', 'current.json')
 const RAW = process.env.PIPELINE_RAW_PATH || path.join(path.dirname(path.dirname(NORM)), 'raw', 'last-sync.json')
 
-export async function GET() {
+export async function GET(req: NextRequest) {
   try {
     if (isPostgresPipelineStoreEnabled()) {
       try {
-        const projection = await readPipelineProjectionFromPostgres()
-        const diagnostics = await readPipelineSyncDiagnosticsFromPostgres()
+        const actor = await requireRequestUser(req)
+        const selected = req.cookies.get(PIPELINE_SELECTION_COOKIE)?.value || undefined
+        const pipeline = await resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: selected })
+          .catch(() => resolvePipelineSpaceAccess({ actorEmail: actor.email }))
+        const projection = await readPipelineProjectionForSpace(pipeline)
+        const diagnostics = pipeline.syncEnabled ? await readPipelineSyncDiagnosticsFromPostgres() : { outbox: {}, oldestPendingAt: null }
 
-        logPipelineEvent({ module: 'pipeline-sync', action: 'status', result: 'ok' })
+        logPipelineEvent({ module: 'pipeline-sync', action: 'status', result: 'ok', actor: actor.email, pipelineId: pipeline.id })
         return NextResponse.json({
           ok: true,
           syncedAt: projection?.syncedAt || null,
           summary: projection?.summary || null,
           diagnostics,
           storage: 'postgres',
+          pipeline: { id: pipeline.id, name: pipeline.name, accessRole: pipeline.accessRole, syncEnabled: pipeline.syncEnabled },
         })
       } catch (error) {
         if (!shouldFallbackToFileOnDatabaseError()) throw error

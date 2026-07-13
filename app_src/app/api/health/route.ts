@@ -101,6 +101,8 @@ export async function GET() {
           agent_auth_migration_applied: boolean
           users_migration_applied: boolean
           attribution_migration_applied: boolean
+          workspaces_migration_applied: boolean
+          workspace_security_migration_applied: boolean
         }>(
           `
             SELECT
@@ -129,7 +131,17 @@ export async function GET() {
                 SELECT 1
                 FROM schema_migrations
                 WHERE filename = '0006_agent_user_attribution.sql'
-              ) AS attribution_migration_applied
+              ) AS attribution_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0007_multi_tenant_workspaces.sql'
+              ) AS workspaces_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0008_workspace_security_hardening.sql'
+              ) AS workspace_security_migration_applied
           `,
         )
         const row = result.rows[0]
@@ -142,6 +154,8 @@ export async function GET() {
             && row?.agent_auth_migration_applied
             && row?.users_migration_applied
             && row?.attribution_migration_applied
+            && row?.workspaces_migration_applied
+            && row?.workspace_security_migration_applied
           ),
         }
         if (
@@ -150,6 +164,8 @@ export async function GET() {
           || !row?.agent_auth_migration_applied
           || !row?.users_migration_applied
           || !row?.attribution_migration_applied
+          || !row?.workspaces_migration_applied
+          || !row?.workspace_security_migration_applied
         ) {
           errors.push('Required database migrations are not applied.')
         }

@@ -5,6 +5,8 @@ import {
   isPostgresPipelineStoreEnabled,
   upsertPipelineDropdownCatalogAndEnqueueInPostgres,
 } from '@/lib/persistence/pipeline'
+import { requireRequestUser } from '@/lib/requestUser'
+import { PIPELINE_SELECTION_COOKIE, requireResourceEditor, resolvePipelineSpaceAccess } from '@/lib/tenancy'
 
 function idempotencyKey(req: NextRequest) {
   return (String(req.headers.get('idempotency-key') || '').trim() || crypto.randomUUID()).slice(0, 200)
@@ -13,6 +15,16 @@ function idempotencyKey(req: NextRequest) {
 export async function GET(req: NextRequest) {
   try {
     const forceRefresh = req.nextUrl.searchParams.get('refresh') === '1'
+    if (isPostgresPipelineStoreEnabled()) {
+      const actor = await requireRequestUser(req)
+      const selected = req.cookies.get(PIPELINE_SELECTION_COOKIE)?.value || undefined
+      const pipeline = await resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: selected })
+        .catch(() => resolvePipelineSpaceAccess({ actorEmail: actor.email }))
+      if (!pipeline.syncEnabled) {
+        return NextResponse.json({ ok: true, catalog: { syncedAt: null, source: 'app', dropdowns: {} } })
+      }
+      if (forceRefresh) requireResourceEditor(pipeline)
+    }
     const out = await getDropdownCatalog({ forceRefresh })
     return NextResponse.json({ ok: true, ...out })
   } catch (e: unknown) {
@@ -24,6 +36,14 @@ export async function PUT(req: NextRequest) {
   try {
     const body = await req.json()
     if (isPostgresPipelineStoreEnabled()) {
+      const actor = await requireRequestUser(req)
+      const selected = req.cookies.get(PIPELINE_SELECTION_COOKIE)?.value || undefined
+      const pipeline = await resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: selected })
+        .catch(() => resolvePipelineSpaceAccess({ actorEmail: actor.email }))
+      requireResourceEditor(pipeline)
+      if (!pipeline.syncEnabled) {
+        return NextResponse.json({ ok: false, error: 'Custom dropdown editing is not available for app-managed pipelines yet' }, { status: 400 })
+      }
       const catalog = {
         ...body,
         source: 'app',
@@ -36,7 +56,7 @@ export async function PUT(req: NextRequest) {
           aggregateId: 'default',
           operation: 'replace_dropdowns',
           payload: {},
-          actor: 'ClawPilot',
+          actor: actor.email,
           idempotencyKey: idempotencyKey(req),
         },
       })
