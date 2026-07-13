@@ -335,9 +335,6 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter }: P
   function openAgentChat(taskId: string, agentId?: string) {
     queueAgentTaskOpen(taskId, agentId || '')
     onNavigate('agents')
-    setTimeout(() => {
-      window.dispatchEvent(new CustomEvent('open-agent-task', { detail: { taskId, agentId: agentId || '' } }))
-    }, 120)
   }
 
   function openVerificationEvidence() {
