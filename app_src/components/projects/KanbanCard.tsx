@@ -65,9 +65,6 @@ export default function KanbanCard({ task }: Props) {
     const agentId = task.assignedAgent || ''
     queueAgentTaskOpen(task.id, agentId)
     window.location.hash = 'agents'
-    window.setTimeout(() => {
-      window.dispatchEvent(new CustomEvent('open-agent-task', { detail: { taskId: task.id, agentId } }))
-    }, 120)
   }
 
   return (
