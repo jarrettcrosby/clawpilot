@@ -5,12 +5,14 @@ import crypto from 'crypto'
 import type { Task, ActivityEntry, Comment, ChecklistItem } from '@/lib/types'
 import { ensureNotFrozen } from '@/lib/freeze'
 import { normalizeProductAgentId } from '@/lib/agents/routing'
+import { assignmentKickoffText, commentTargetsAssignedAgent, prepareAgentDispatch } from '@/lib/agents/dispatch'
 import { normalizeExecutionStatus } from '@/lib/taskState'
 import type { ExecutionStatus } from '@/lib/taskState'
 import { withFileLock } from '@/lib/fileLock'
 import { applyCanonicalWorkItem, canonicalizeTasks } from '@/lib/workItemModel'
 import { shouldFallbackToFileOnDatabaseError } from '@/lib/persistence/config'
 import { isPostgresTaskStoreEnabled, readTasksFromPostgres, replaceTasksInPostgres } from '@/lib/persistence/tasks'
+import type { AgentDispatchEnqueueInput } from '@/lib/persistence/agentDispatch'
 import { getCookieName, verifySessionToken } from '@/lib/auth'
 import { requireActiveAppUser } from '@/lib/users'
 import { requireRequestUser } from '@/lib/requestUser'
@@ -64,6 +66,12 @@ type TaskPatchBody = TaskBody & {
   _checklistDelete?: string
   _checklistUpdate?: Partial<ChecklistItem> & { id?: string }
   _execution?: Partial<NonNullable<Task['execution']>>
+  _agentDispatchState?: {
+    id?: string
+    status?: 'queued' | 'running' | 'succeeded' | 'failed'
+    attempts?: number
+    error?: string
+  }
   _suggestionAction?: {
     action?: string
     suggestion?: {
@@ -111,6 +119,17 @@ function isAgentActor(actor: string) {
   if (!normalized) return false
   if (BLOCKED_AGENT_ACTORS.has(normalized)) return true
   return /\b(agent|clawpilot)\b/i.test(normalized)
+}
+
+function authorizedWorkerMutation(req: NextRequest): boolean {
+  if (req.headers.get('x-clawpilot-worker') !== 'agent-dispatch') return false
+  const expected = String(process.env.PIPELINE_OUTBOX_WORKER_SECRET || '')
+  const provided = String(req.headers.get('authorization') || '').replace(/^Bearer\s+/i, '')
+  if (!expected || !provided) return false
+  const expectedBuffer = Buffer.from(expected)
+  const providedBuffer = Buffer.from(provided)
+  return expectedBuffer.length === providedBuffer.length
+    && crypto.timingSafeEqual(expectedBuffer, providedBuffer)
 }
 
 function appendTaskCreationAudit(entry: Record<string, unknown>) {
@@ -255,12 +274,12 @@ function projectAssignmentsFromTasks(tasks: Task[]) {
     .filter((row) => Boolean(row.agentId))
 }
 
-async function writeTasks(tasks: Task[], boardId?: string) {
+async function writeTasks(tasks: Task[], boardId?: string, agentDispatches: AgentDispatchEnqueueInput[] = []) {
   const canonical = canonicalizeTasks(tasks)
   if (isPostgresTaskStoreEnabled()) {
     if (!boardId) throw new Error('Project board context is required')
     try {
-      await replaceTasksInPostgres(canonical, { boardId })
+      await replaceTasksInPostgres(canonical, { boardId, agentDispatches })
       return
     } catch (error) {
       if (!shouldFallbackToFileOnDatabaseError()) throw error
@@ -631,10 +650,25 @@ export async function POST(req: NextRequest) {
     checklist,
   }
 
-  const actionableCandidate = applyCanonicalWorkItem(taskObj)
+  let actionableCandidate = applyCanonicalWorkItem(taskObj)
+  const agentDispatches: AgentDispatchEnqueueInput[] = []
+  if (board && assignedAgent && isPostgresTaskStoreEnabled()) {
+    const prepared = prepareAgentDispatch({
+      operatorId: actor,
+      boardId: board.id,
+      task: actionableCandidate,
+      agentId: assignedAgent,
+      text: assignmentKickoffText(),
+      trigger: 'assignment',
+      eventId: id,
+      queuedAt: now,
+    })
+    actionableCandidate = applyCanonicalWorkItem(prepared.task)
+    agentDispatches.push(prepared.dispatch)
+  }
 
   tasks.push(actionableCandidate)
-  await writeTasks(tasks, board?.id)
+  await writeTasks(tasks, board?.id, agentDispatches)
 
   const existingAudit = readTaskCreationAuditEntries()
   const oneMinuteAgo = Date.now() - 60 * 1000
@@ -688,7 +722,10 @@ export async function PATCH(req: NextRequest) {
   }
   const tasks = await readTasks(board?.id)
   const body = await req.json() as TaskPatchBody
-  const { id, _comment, _editCommentId, _editCommentText, _deleteCommentId, _restoreCommentId, _checklistAdd, _checklistToggle, _checklistDelete, _checklistUpdate, _execution, _suggestionAction, _actor, _deleteReason, ...rawUpdates } = body
+  const { id, _comment, _editCommentId, _editCommentText, _deleteCommentId, _restoreCommentId, _checklistAdd, _checklistToggle, _checklistDelete, _checklistUpdate, _execution, _agentDispatchState, _suggestionAction, _actor, _deleteReason, ...rawUpdates } = body
+  if (_agentDispatchState && !authorizedWorkerMutation(req)) {
+    return NextResponse.json({ error: 'Agent dispatch state updates require worker authorization' }, { status: 403 })
+  }
   const actor = await resolveRequestActor(req, String(_actor || 'Jarrett')) || 'Jarrett'
 
   const idx = tasks.findIndex(t => t.id === id)
@@ -747,6 +784,7 @@ export async function PATCH(req: NextRequest) {
   let comments: Comment[] = [...(prev.comments || [])]
   let deletedComments: Comment[] = [...(prev.deletedComments || [])]
   let checklist: ChecklistItem[] = [...(prev.checklist || [])]
+  let addedComment: Comment | null = null
   const base = { taskId: id, taskTitle: prev.title, actor }
 
   if (_editCommentId) {
@@ -777,8 +815,9 @@ export async function PATCH(req: NextRequest) {
     }
   }
   if (_comment) {
-    const comment: Comment = { id: Date.now().toString(), text: _comment, createdAt: now, timestamp: now, author: actor }
+    const comment: Comment = { id: crypto.randomUUID(), text: _comment, createdAt: now, timestamp: now, author: actor }
     comments.push(comment)
+    addedComment = comment
     activity.push({ type: 'comment', message: `Commented: "${_comment.slice(0, 60)}${_comment.length > 60 ? '...' : ''}"`, timestamp: now, ...base })
   }
   if (_checklistAdd) {
@@ -913,6 +952,48 @@ export async function PATCH(req: NextRequest) {
       activity.push({ type: 'updated', message: `Execution status: ${nextStatus}`, timestamp: now, ...base })
     }
   }
+  if (_agentDispatchState && execution?.agentDispatch?.id === String(_agentDispatchState.id || '')) {
+    const dispatchStatus = _agentDispatchState.status
+    if (dispatchStatus && ['queued', 'running', 'succeeded', 'failed'].includes(dispatchStatus)) {
+      const previousDispatchStatus = execution.agentDispatch.status
+      const error = String(_agentDispatchState.error || '').trim().slice(0, 1000) || undefined
+      const executionStatus = dispatchStatus === 'running'
+        ? 'running'
+        : dispatchStatus === 'succeeded'
+          ? 'completed'
+          : dispatchStatus === 'failed'
+            ? 'blocked'
+            : 'queued'
+      const note = dispatchStatus === 'running'
+        ? 'Agent run is processing.'
+        : dispatchStatus === 'failed'
+          ? `Agent run failed: ${error || 'Unknown execution error'}`
+          : dispatchStatus === 'queued' && error
+            ? `Agent run retry scheduled: ${error}`
+            : undefined
+      execution = {
+        ...execution,
+        executionStatus,
+        lastUpdatedAt: now,
+        ...(note ? { latestExecutionNote: note } : {}),
+        agentDispatch: {
+          ...execution.agentDispatch,
+          status: dispatchStatus,
+          attempts: Math.max(execution.agentDispatch.attempts, Math.trunc(Number(_agentDispatchState.attempts) || 0)),
+          updatedAt: now,
+          ...(error ? { error } : { error: undefined }),
+        },
+      }
+      if (dispatchStatus !== previousDispatchStatus) {
+        activity.push({
+          type: 'updated',
+          message: `Agent dispatch ${dispatchStatus}.`,
+          timestamp: now,
+          ...base,
+        })
+      }
+    }
+  }
   if (updates.status && updates.status !== prev.status)
     activity.push({ type: 'moved', from: prev.status, to: updates.status, message: `Moved from ${({'backlog':'Backlog','todo':'To Do','in-progress':'In Progress','review':'Review','done':'Done'} as Record<string,string>)[prev.status]||prev.status} to ${({'backlog':'Backlog','todo':'To Do','in-progress':'In Progress','review':'Review','done':'Done'} as Record<string,string>)[updates.status]||updates.status}`, timestamp: now, ...base })
   if (updates.title && updates.title !== prev.title)
@@ -986,7 +1067,39 @@ export async function PATCH(req: NextRequest) {
     }
   }
 
-  tasks[idx] = nextTask
-  await writeTasks(tasks, board?.id)
+  const agentDispatches: AgentDispatchEnqueueInput[] = []
+  if (board && isPostgresTaskStoreEnabled()) {
+    const targetAgent = String(nextTask.assignedAgent || '')
+    if (hasAssignedAgentUpdate && targetAgent && targetAgent !== prevAssigned) {
+      const prepared = prepareAgentDispatch({
+        operatorId: actor,
+        boardId: board.id,
+        task: nextTask,
+        agentId: targetAgent,
+        text: assignmentKickoffText(),
+        trigger: 'assignment',
+        queuedAt: now,
+      })
+      nextTask = prepared.task
+      agentDispatches.push(prepared.dispatch)
+    }
+    if (addedComment && targetAgent && commentTargetsAssignedAgent(addedComment.text, targetAgent)) {
+      const prepared = prepareAgentDispatch({
+        operatorId: actor,
+        boardId: board.id,
+        task: nextTask,
+        agentId: targetAgent,
+        text: addedComment.text,
+        trigger: 'comment',
+        eventId: addedComment.id,
+        queuedAt: now,
+      })
+      nextTask = prepared.task
+      agentDispatches.push(prepared.dispatch)
+    }
+  }
+
+  tasks[idx] = applyCanonicalWorkItem(nextTask)
+  await writeTasks(tasks, board?.id, agentDispatches)
   return NextResponse.json(tasks[idx])
 }

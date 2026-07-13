@@ -55,6 +55,9 @@ for (const table of ['project_boards', 'project_board_members', 'pipeline_spaces
 const workspaceSecurityMigration = read('db/migrations/0008_workspace_security_hardening.sql')
 assertIncludes(workspaceSecurityMigration, 'idx_pipeline_spaces_single_sync_source', 'workspace security migration')
 assertIncludes(workspaceSecurityMigration, 'app_users_permissions_object', 'workspace security migration')
+const agentDispatchMigration = read('db/migrations/0009_agent_dispatch_outbox.sql')
+assertIncludes(agentDispatchMigration, 'idx_sync_outbox_agent_dispatch_due', 'agent dispatch migration')
+assertIncludes(agentDispatchMigration, "target_system = 'agent_runtime'", 'agent dispatch migration')
 for (const field of ['display_name', 'permissions jsonb', 'board_id uuid']) {
   assertIncludes(tenancyMigration, field, 'multi-tenant migration')
 }
@@ -69,6 +72,14 @@ assertIncludes(tenancyAdapter, 'Only the pipeline owner can share it', 'tenancy 
 const taskAdapter = read('app_src/lib/persistence/tasks.ts')
 assertIncludes(taskAdapter, 'WHERE board_id = $1::uuid', 'board-scoped task reads')
 assertIncludes(taskAdapter, 'DELETE FROM tasks WHERE board_id = $1::uuid', 'board-scoped task writes')
+assertIncludes(taskAdapter, 'insertAgentDispatchOutbox', 'atomic task and agent dispatch writes')
+
+const agentDispatchAdapter = read('app_src/lib/persistence/agentDispatch.ts')
+assertIncludes(agentDispatchAdapter, "const TARGET_SYSTEM = 'agent_runtime'", 'agent dispatch adapter')
+assertIncludes(agentDispatchAdapter, 'ON CONFLICT (target_system, idempotency_key)', 'agent dispatch idempotency')
+assertIncludes(agentDispatchAdapter, 'FOR UPDATE SKIP LOCKED', 'agent dispatch leased claims')
+assertIncludes(agentDispatchAdapter, 'agent worker lease expired', 'agent dispatch lease recovery')
+assertIncludes(agentDispatchAdapter, 'agent.dispatch.worker.heartbeat', 'agent dispatch worker heartbeat')
 
 const executionAdapter = read('app_src/lib/persistence/execution.ts')
 assertIncludes(executionAdapter, 'INSERT INTO execution_runs', 'execution adapter')
@@ -107,11 +118,20 @@ assertIncludes(outboxWorker, "item.operation === 'replace_dropdowns'", 'pipeline
 assertIncludes(outboxWorker, 'Opportunity Sheet row changed', 'pipeline outbox worker optimistic check')
 assertIncludes(outboxWorker, '[ClawPilot sync:', 'pipeline outbox worker append idempotency')
 
+const agentDispatchWorker = read('app_src/lib/agentDispatchWorker.ts')
+assertIncludes(agentDispatchWorker, 'claimAgentDispatchOutboxInPostgres', 'agent dispatch worker')
+assertIncludes(agentDispatchWorker, "path: '/api/agents/threads'", 'agent dispatch execution route')
+assertIncludes(agentDispatchWorker, 'createSessionToken(item.operatorId)', 'per-user agent dispatch session')
+assertIncludes(agentDispatchWorker, "status === 'dead' ? 'failed' : 'queued'", 'agent dispatch retry visibility')
+
 const pullRoute = read('app_src/app/api/pipeline/sync/pull/route.ts')
 assertIncludes(pullRoute, 'syncPipelineFromSheets', 'pipeline pull route')
 
 const railwayStart = read('scripts/start-railway.sh')
 assertIncludes(railwayStart, 'pipeline-outbox-poller.mjs', 'Railway start script')
+const outboxPoller = read('scripts/pipeline-outbox-poller.mjs')
+assertIncludes(outboxPoller, '/api/agents/dispatch/process', 'Railway agent dispatch polling')
+assertIncludes(outboxPoller, 'Promise.all', 'independent outbox polling loops')
 for (const requiredVariable of [
   'CLAWPILOT_STORAGE',
   'CLAWPILOT_DB_FALLBACK_TO_FILE',
@@ -135,6 +155,7 @@ assertIncludes(authProxy, 'validSession', 'auth proxy')
 assertIncludes(authProxy, 'activeSessionUser', 'disabled-session revocation')
 assertIncludes(authProxy, '_next/static', 'auth proxy matcher')
 assertIncludes(authProxy, '/api/pipeline/sync/outbox/process', 'auth proxy public worker route')
+assertIncludes(authProxy, '/api/agents/dispatch/process', 'auth proxy public agent worker route')
 assertIncludes(authProxy, 'HOSTED_RUNTIME', 'auth proxy fail-closed hosted mode')
 
 const loginRoute = read('app_src/app/api/auth/login/route.ts')
@@ -161,6 +182,8 @@ assertIncludes(healthRoute, '0005_app_users.sql', 'hosted users migration health
 assertIncludes(healthRoute, '0006_agent_user_attribution.sql', 'hosted attribution migration health')
 assertIncludes(healthRoute, '0007_multi_tenant_workspaces.sql', 'hosted workspace migration health')
 assertIncludes(healthRoute, '0008_workspace_security_hardening.sql', 'hosted workspace security migration health')
+assertIncludes(healthRoute, '0009_agent_dispatch_outbox.sql', 'hosted agent dispatch migration health')
+assertIncludes(healthRoute, 'readAgentDispatchWorkerHeartbeatFromPostgres', 'hosted agent worker health')
 assertIncludes(healthRoute, 'getAgentRuntime', 'hosted agent runtime health')
 
 const agentProvider = read('app_src/lib/agents/provider.ts')
@@ -175,9 +198,20 @@ assertIncludes(agentThreadsRoute, 'assignmentError(task, agentId)', 'task-bound 
 assertIncludes(agentThreadsRoute, 'runOpenAIAgent', 'hosted agent execution route')
 assertIncludes(agentThreadsRoute, 'appendExecutionRunToPostgres', 'agent execution run writeback')
 assertIncludes(agentThreadsRoute, 'appendExecutionResultToPostgres', 'agent execution result writeback')
+assertIncludes(agentThreadsRoute, 'agent-dispatch-${dispatchId}-result', 'idempotent dispatched thread result')
 
 const tasksRoute = read('app_src/app/api/tasks/route.ts')
 assert.ok(!tasksRoute.includes('buildGovernanceAdvisory'), 'task route must not create governance advisory mutations')
 assertIncludes(tasksRoute, 'TASK_NOT_ACTIONABLE', 'explicit active-task validation')
+assertIncludes(tasksRoute, 'prepareAgentDispatch', 'task agent dispatch enqueue')
+assertIncludes(tasksRoute, '_agentDispatchState', 'worker-owned dispatch state updates')
+
+const assignmentsRoute = read('app_src/app/api/agents/assignments/route.ts')
+assertIncludes(assignmentsRoute, 'prepareAgentDispatch', 'assignment agent dispatch enqueue')
+assertIncludes(assignmentsRoute, 'task: tasks[idx]', 'assignment UI task refresh')
+
+const agentsSection = read('app_src/components/agents/AgentsSection.tsx')
+assertIncludes(agentsSection, 'setSelectedAgentId(agentId)', 'new assignment agent focus')
+assertIncludes(agentsSection, 'setSelectedTaskId(taskId)', 'new assignment task focus')
 
 console.log('PASS test-postgres-adapter-contracts')

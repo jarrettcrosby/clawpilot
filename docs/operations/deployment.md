@@ -9,7 +9,7 @@ Current known platform notes:
 - GitHub branch protection on the private repo requires GitHub Pro or a public repo, but it is not required while this remains a private single-operator repository.
 - Vercel deployment protection returns `401` for unauthenticated direct preview curls, which is acceptable for private previews. Use authenticated `vercel curl` for checks.
 - Runtime data remains present in legacy local git history, but the GitHub repo was created from a clean import.
-- Execution runs/results, pipeline projections, dropdown cache, and the Sheet sync outbox have Postgres repository adapters behind `CLAWPILOT_STORAGE=postgres`.
+- Execution runs/results, pipeline projections, dropdown cache, Sheet sync work, and agent dispatch work have Postgres repository adapters behind `CLAWPILOT_STORAGE=postgres`.
 
 ## GitHub Setup
 
@@ -72,7 +72,8 @@ Current Railway production setup:
 - project: `clawpilot`
 - app service: `clawpilot`
 - database service: `Postgres`
-- app URL: `https://clawpilot-production-52a1.up.railway.app`
+- production URL: `https://aiapp.eigenracing.com`
+- development URL: `https://dev.aiapp.eigenracing.com`
 - `DATABASE_URL=${{Postgres.DATABASE_URL}}`
 - `PGSSLMODE=require`
 - `CLAWPILOT_STORAGE=postgres`
@@ -85,12 +86,13 @@ Current Railway production setup:
 - `MATON_GMAIL_CONNECTION_ID=<active Google Mail connection id>`
 - `PIPELINE_SHEET_ID=<environment-specific Sheet id>`
 - `PIPELINE_OUTBOX_WORKER_SECRET=<secret>`
+- `AGENT_DISPATCH_POLL_MS=5000` (optional; defaults to 5 seconds)
 - `CLAWPILOT_EXECUTION_ENABLED=0`
 - `CLAWPILOT_AGENT_PROVIDER=openai` when hosted agent execution is enabled
 - `OPENAI_API_KEY=<server API key>` when hosted agent execution is enabled
 - `OPENAI_AGENT_MODEL=gpt-5-mini` (or another approved Responses API model)
 
-Railway applies pending SQL migrations as a pre-deploy command, then starts the Next.js app and the pipeline outbox poller together. The worker uses leased `sync_outbox` rows with retries and dead-letter handling.
+Railway applies pending SQL migrations as a pre-deploy command, then starts the Next.js app and independent pipeline/agent polling loops together. Both use leased `sync_outbox` rows with retries and dead-letter handling; agent dispatch restores the initiating user's app session so OAuth credentials and thread history remain user-scoped.
 - initial 4002 dev-lane import: 43 tasks, 2 assignments, 13 threads, 26 messages
 
 The primary hosted sign-in sends a six-digit, 15-minute code to `APP_LOGIN_EMAIL` through the configured Maton Google Mail connection. Challenges are HMAC-protected, attempt-limited, single-use Postgres records. `APP_LOGIN_PASSWORD` remains an emergency operator fallback and should stay synchronized with the local Keychain entry.

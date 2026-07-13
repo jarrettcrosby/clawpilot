@@ -87,6 +87,15 @@ export type Task = {
     latestExecutionNote?: string
     lastResult?: unknown
     suggestions?: unknown[]
+    agentDispatch?: {
+      id: string
+      trigger: 'assignment' | 'comment'
+      status: 'queued' | 'running' | 'succeeded' | 'failed'
+      attempts: number
+      queuedAt: string
+      updatedAt: string
+      error?: string
+    }
   }
   workItem?: CanonicalWorkItem
 }

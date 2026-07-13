@@ -22,7 +22,6 @@ import { ASSIGNABLE_PRODUCT_AGENT_IDS, PRIORITY_COLORS, PRIORITY_LABELS, PEOPLE 
 import { useBoardContext } from './KanbanBoard'
 import { displayCategory } from '@/lib/format'
 import { queueAgentTaskOpen } from '@/lib/agents/navigation'
-import { assignmentKickoffText, triggerAgentTurn } from '@/lib/agents/client'
 
 type Props = { task: Task }
 
@@ -54,11 +53,7 @@ export default function KanbanCard({ task }: Props) {
       return
     }
     updateTask(updated)
-    try {
-      await triggerAgentTurn({ taskId: task.id, agentId: personId, text: assignmentKickoffText() })
-    } catch (error) {
-      notify(error instanceof Error ? `Task assigned, but agent kickoff failed: ${error.message}` : 'Task assigned, but agent kickoff failed.')
-    }
+    notify('Task assigned. Agent run queued.')
   }
 
   function openAgentChat() {

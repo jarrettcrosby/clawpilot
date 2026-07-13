@@ -47,7 +47,6 @@ import CheckBoxOutlined from '@mui/icons-material/CheckBoxOutlined'
 import type { Task, ChecklistItem, Comment } from '@/lib/types'
 import { ASSIGNABLE_PRODUCT_AGENT_IDS, PRIORITY_COLORS, PRIORITY_LABELS, STATUS_LABELS, AVAILABLE_LABELS, COLUMNS, PEOPLE, CATEGORY_OPTIONS } from '@/lib/types'
 import { displayCategory } from '@/lib/format'
-import { assignmentKickoffText, triggerAgentTurn } from '@/lib/agents/client'
 
 type Props = {
   task: Task | null
@@ -200,13 +199,6 @@ function renderCommentText(text: string) {
   )
 }
 
-function mentionsAgent(text: string, agentId: string) {
-  const person = PEOPLE.find((entry) => entry.id === agentId || entry.name === agentId)
-  const aliases = [agentId, person?.name].filter(Boolean).map((value) => String(value).toLowerCase())
-  const normalized = text.toLowerCase()
-  return aliases.some((alias) => normalized.includes(`@${alias}`))
-}
-
 export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArchive, readOnly = false }: Props) {
   const [editingTitle, setEditingTitle] = useState(false)
   const [titleVal, setTitleVal] = useState('')
@@ -220,7 +212,6 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
   const [expandedJson, setExpandedJson] = useState<string | null>(null)
   const [copyFallbackText, setCopyFallbackText] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
-  const [agentResponding, setAgentResponding] = useState(false)
   const [patchError, setPatchError] = useState('')
   const [newCheckItem, setNewCheckItem] = useState('')
   const [checkItemAssignee, setCheckItemAssignee] = useState('')
@@ -268,6 +259,8 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
   }
 
   if (!task) return null
+  const agentDispatch = task.execution?.agentDispatch
+  const agentResponding = agentDispatch?.status === 'queued' || agentDispatch?.status === 'running'
 
   const saveTitle = () => { if (titleVal.trim() && titleVal !== task.title) patch({ title: titleVal.trim() }); setEditingTitle(false) }
   const saveDesc = () => { if (descVal !== task.desc) patch({ desc: descVal }); setEditingDesc(false) }
@@ -279,42 +272,15 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submitComment() }
   }
 
-  async function refreshTask() {
-    if (!task) return
-    const response = await fetch('/api/tasks')
-    if (!response.ok) return
-    const tasks = await response.json()
-    const refreshed = Array.isArray(tasks) ? tasks.find((entry: Task) => entry.id === task.id) : null
-    if (refreshed) onUpdate?.(refreshed)
-  }
-
-  async function runAssignedAgent(agentId: string, text: string) {
-    if (!task) return
-    setAgentResponding(true)
-    try {
-      await triggerAgentTurn({ taskId: task.id, agentId, text })
-      await refreshTask()
-    } catch (error) {
-      setPatchError(error instanceof Error ? `Task updated, but agent response failed: ${error.message}` : 'Task updated, but agent response failed.')
-    } finally {
-      setAgentResponding(false)
-    }
-  }
-
   const submitComment = async () => {
     const text = commentText.trim()
     if (!text) return
     setCommentText('')
-    const updated = await patch({ _comment: text })
-    const assignedAgent = updated?.assignedAgent || ''
-    if (assignedAgent && mentionsAgent(text, assignedAgent)) {
-      await runAssignedAgent(assignedAgent, text)
-    }
+    await patch({ _comment: text })
   }
 
   async function assignTask(agentId: string) {
-    const updated = await patch({ assignedAgent: agentId })
-    if (updated && agentId) await runAssignedAgent(agentId, assignmentKickoffText())
+    await patch({ assignedAgent: agentId })
   }
 
   const saveEditedComment = () => {
@@ -692,13 +658,20 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
             <TextField disabled={readOnly} inputRef={commentRef} multiline maxRows={4} fullWidth placeholder={readOnly ? 'View-only board' : 'Write a comment... (@ to mention)'} size="small"
               value={commentText} onChange={e => setCommentText(e.target.value)} onKeyDown={handleCommentKey}
               sx={{ '& .MuiOutlinedInput-root': { fontSize: '0.875rem', backgroundColor: '#232330', borderRadius: 2, '& fieldset': { borderColor: 'rgba(255,255,255,0.08)' }, '&.Mui-focused fieldset': { borderColor: '#A8C7FA' } } }} />
-            <IconButton onClick={() => { void submitComment() }} disabled={readOnly||!commentText.trim()||saving||agentResponding} sx={{ color: commentText.trim()?'#A8C7FA':'text.disabled', mb: 0.25 }}>
+            <IconButton onClick={() => { void submitComment() }} disabled={readOnly||!commentText.trim()||saving} sx={{ color: commentText.trim()?'#A8C7FA':'text.disabled', mb: 0.25 }}>
               <SendRounded sx={{ fontSize: 20 }} />
             </IconButton>
           </Box>
           {agentResponding && (
             <Alert severity="info" sx={{ mb: 2, borderRadius: 1 }}>
-              {PEOPLE.find((person) => person.id === task.assignedAgent)?.name || 'Agent'} is responding.
+              {agentDispatch?.status === 'queued'
+                ? `${PEOPLE.find((person) => person.id === task.assignedAgent)?.name || 'Agent'} is queued.`
+                : `${PEOPLE.find((person) => person.id === task.assignedAgent)?.name || 'Agent'} is responding.`}
+            </Alert>
+          )}
+          {agentDispatch?.status === 'failed' && (
+            <Alert severity="error" sx={{ mb: 2, borderRadius: 1 }}>
+              {task.execution?.latestExecutionNote || 'Agent execution failed.'}
             </Alert>
           )}
           {/* @ mention picker */}

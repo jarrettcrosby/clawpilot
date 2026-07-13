@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import Alert from '@mui/material/Alert'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
@@ -32,7 +32,6 @@ import RefreshRounded from '@mui/icons-material/RefreshRounded'
 import SendRounded from '@mui/icons-material/SendRounded'
 import type { Task } from '@/lib/types'
 import { consumeAgentTaskOpen } from '@/lib/agents/navigation'
-import { assignmentKickoffText, triggerAgentTurn } from '@/lib/agents/client'
 
 type Agent = {
   id: string
@@ -137,7 +136,7 @@ export default function AgentsSection() {
   const [popupBlocked, setPopupBlocked] = useState(false)
   const [codeCopied, setCodeCopied] = useState(false)
 
-  async function loadWorkspace() {
+  const loadWorkspace = useCallback(async () => {
     const [agentResponse, taskResponse] = await Promise.all([
       fetch('/api/agents'),
       fetch('/api/tasks'),
@@ -162,11 +161,11 @@ export default function AgentsSection() {
       task.assignedAgent === agent.id && task.status !== 'done' && !task.archived && !task.deletedAt
     )))
     setSelectedAgentId((current) => current || firstAssignedAgent?.id || nextAgents[0]?.id || '')
-  }
+  }, [])
 
   useEffect(() => {
     loadWorkspace().catch(() => setNotice('Unable to load agent workspace.'))
-  }, [])
+  }, [loadWorkspace])
 
   useEffect(() => {
     if (!deviceLogin) return
@@ -236,20 +235,21 @@ export default function AgentsSection() {
       if (timer) clearTimeout(timer)
       controller.abort()
     }
-  }, [deviceLogin])
+  }, [deviceLogin, loadWorkspace])
 
   const openTasks = useMemo(
     () => tasks.filter((task) => task.status !== 'done' && !task.archived && !task.deletedAt),
     [tasks],
   )
   const assignedTasks = useMemo(
-    () => tasks.filter((task) => (
-      task.assignedAgent === selectedAgentId && !task.archived && !task.deletedAt
+    () => openTasks.filter((task) => (
+      task.assignedAgent === selectedAgentId
     )),
-    [tasks, selectedAgentId],
+    [openTasks, selectedAgentId],
   )
   const selectedAgent = agents.find((agent) => agent.id === selectedAgentId) || null
   const selectedTask = tasks.find((task) => task.id === selectedTaskId) || null
+  const selectedDispatchStatus = selectedTask?.execution?.agentDispatch?.status
   const assignedCount = openTasks.filter((task) => Boolean(task.assignedAgent)).length
 
   useEffect(() => {
@@ -275,6 +275,27 @@ export default function AgentsSection() {
         setNotice(error instanceof Error ? error.message : 'Unable to load task thread.')
       })
   }, [selectedAgentId, selectedTaskId])
+
+  useEffect(() => {
+    if (selectedDispatchStatus !== 'queued' && selectedDispatchStatus !== 'running') return
+    let active = true
+    const refresh = async () => {
+      try {
+        await loadWorkspace()
+        const params = new URLSearchParams({ agentId: selectedAgentId, taskId: selectedTaskId })
+        const response = await fetch(`/api/agents/threads?${params.toString()}`)
+        const payload = await response.json()
+        if (active && response.ok) setMessages(Array.isArray(payload?.messages) ? payload.messages : [])
+      } catch {
+        // The next polling interval will retry while the dispatch remains active.
+      }
+    }
+    const timer = setInterval(() => { void refresh() }, 3000)
+    return () => {
+      active = false
+      clearInterval(timer)
+    }
+  }, [loadWorkspace, selectedAgentId, selectedDispatchStatus, selectedTaskId])
 
   useEffect(() => {
     function onOpenAgentTask(event: Event) {
@@ -303,18 +324,15 @@ export default function AgentsSection() {
       setNotice(payload?.error || 'Assignment failed.')
       return
     }
-    setTasks((current) => current.map((task) => (
-      task.id === taskId ? { ...task, assignedAgent: agentId || undefined, updatedAt: new Date().toISOString() } : task
-    )))
+    const updatedTask = payload?.task as Task | undefined
+    setTasks((current) => current.map((task) => task.id === taskId
+      ? updatedTask || { ...task, assignedAgent: agentId || undefined, updatedAt: new Date().toISOString() }
+      : task))
     if (taskId === selectedTaskId && agentId !== selectedAgentId) setSelectedTaskId('')
     if (agentId) {
-      try {
-        await triggerAgentTurn({ taskId, agentId, text: assignmentKickoffText() })
-        setNotice('Task assigned and agent kickoff completed.')
-        await loadWorkspace()
-      } catch (error) {
-        setNotice(error instanceof Error ? `Task assigned, but agent kickoff failed: ${error.message}` : 'Task assigned, but agent kickoff failed.')
-      }
+      setSelectedAgentId(agentId)
+      setSelectedTaskId(taskId)
+      setNotice('Task assigned. Agent run queued.')
     }
   }
 
@@ -532,6 +550,13 @@ export default function AgentsSection() {
               <Stack direction="row" spacing={1} flexWrap="wrap" mb={0.5}>
                 <Chip size="small" label={selectedTask.status} />
                 <Chip size="small" label={selectedTask.priority} />
+                {selectedDispatchStatus && (
+                  <Chip
+                    size="small"
+                    color={selectedDispatchStatus === 'failed' ? 'error' : selectedDispatchStatus === 'succeeded' ? 'success' : 'info'}
+                    label={`Agent ${selectedDispatchStatus}`}
+                  />
+                )}
                 {selectedTask.dueDate && <Chip size="small" label={`Due ${selectedTask.dueDate}`} />}
               </Stack>
               {selectedTask.desc && <Typography variant="body2" color="text.secondary">{selectedTask.desc}</Typography>}

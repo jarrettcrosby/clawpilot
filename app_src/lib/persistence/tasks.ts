@@ -2,6 +2,7 @@ import crypto from 'crypto'
 import type { Task } from '@/lib/types'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import { query, withTransaction } from '@/lib/persistence/postgres'
+import { insertAgentDispatchOutbox, type AgentDispatchEnqueueInput } from '@/lib/persistence/agentDispatch'
 
 type TaskRow = {
   payload: Task
@@ -10,6 +11,7 @@ type TaskRow = {
 
 type TaskStoreScope = {
   boardId: string
+  agentDispatches?: AgentDispatchEnqueueInput[]
 }
 
 function safeIso(value: unknown, fallback: string): string {
@@ -139,6 +141,10 @@ export async function replaceTasksInPostgres(tasks: Task[], scope: TaskStoreScop
         `,
         [assignment.taskId, assignment.agentId, assignment.updatedAt],
       )
+    }
+
+    for (const dispatch of scope.agentDispatches || []) {
+      await insertAgentDispatchOutbox(client, dispatch)
     }
   })
 }

@@ -3,10 +3,12 @@ import fs from 'fs'
 import path from 'path'
 import type { Task } from '@/lib/types'
 import { normalizeProductAgentId } from '@/lib/agents/routing'
+import { assignmentKickoffText, prepareAgentDispatch } from '@/lib/agents/dispatch'
 import { withFileLock } from '@/lib/fileLock'
-import { canonicalizeTasks } from '@/lib/workItemModel'
+import { applyCanonicalWorkItem, canonicalizeTasks } from '@/lib/workItemModel'
 import { shouldFallbackToFileOnDatabaseError } from '@/lib/persistence/config'
 import { isPostgresTaskStoreEnabled, readTasksFromPostgres, replaceTasksInPostgres } from '@/lib/persistence/tasks'
+import type { AgentDispatchEnqueueInput } from '@/lib/persistence/agentDispatch'
 import { requireRequestUser } from '@/lib/requestUser'
 import { BOARD_SELECTION_COOKIE, requireResourceEditor, resolveProjectBoardAccess, type ProjectBoard } from '@/lib/tenancy'
 
@@ -89,12 +91,12 @@ async function readTasks(boardId?: string): Promise<Task[]> {
   return readTasksFromFile()
 }
 
-async function writeTasks(tasks: Task[], boardId?: string) {
+async function writeTasks(tasks: Task[], boardId?: string, agentDispatches: AgentDispatchEnqueueInput[] = []) {
   const canonical = canonicalizeTasks(tasks)
   if (isPostgresTaskStoreEnabled()) {
     if (!boardId) throw new Error('Project board context is required')
     try {
-      await replaceTasksInPostgres(canonical, { boardId })
+      await replaceTasksInPostgres(canonical, { boardId, agentDispatches })
       return
     } catch (error) {
       if (!shouldFallbackToFileOnDatabaseError()) throw error
@@ -108,8 +110,11 @@ async function writeTasks(tasks: Task[], boardId?: string) {
   })
 }
 
-async function resolveAssignmentBoard(req: NextRequest, requireEdit = false): Promise<ProjectBoard | null> {
-  if (!isPostgresTaskStoreEnabled()) return null
+async function resolveAssignmentBoard(req: NextRequest, requireEdit = false): Promise<{
+  board: ProjectBoard | null
+  actorEmail: string
+}> {
+  if (!isPostgresTaskStoreEnabled()) return { board: null, actorEmail: 'Operator' }
   const actor = await requireRequestUser(req)
   const selected = req.cookies.get(BOARD_SELECTION_COOKIE)?.value || undefined
   let board: ProjectBoard
@@ -119,12 +124,12 @@ async function resolveAssignmentBoard(req: NextRequest, requireEdit = false): Pr
     board = await resolveProjectBoardAccess({ actorEmail: actor.email })
   }
   if (requireEdit) requireResourceEditor(board)
-  return board
+  return { board, actorEmail: actor.email }
 }
 
 export async function GET(req: NextRequest) {
   try {
-    const board = await resolveAssignmentBoard(req)
+    const { board } = await resolveAssignmentBoard(req)
     return NextResponse.json({ assignments: await readAssignments(board?.id) })
   } catch (error) {
     return NextResponse.json({ ok: false, error: error instanceof Error ? error.message : 'Unable to load assignments' }, { status: 403 })
@@ -133,8 +138,11 @@ export async function GET(req: NextRequest) {
 
 export async function PUT(req: NextRequest) {
   let board: ProjectBoard | null
+  let actorEmail = 'Operator'
   try {
-    board = await resolveAssignmentBoard(req, true)
+    const context = await resolveAssignmentBoard(req, true)
+    board = context.board
+    actorEmail = context.actorEmail
   } catch (error) {
     return NextResponse.json({ ok: false, error: error instanceof Error ? error.message : 'Assignment access denied' }, { status: 403 })
   }
@@ -153,9 +161,42 @@ export async function PUT(req: NextRequest) {
     return NextResponse.json({ ok: false, error: 'task not found' }, { status: 404 })
   }
 
-  tasks[idx] = { ...tasks[idx], assignedAgent: agentId || undefined, updatedAt: now }
-  await writeTasks(tasks, board?.id)
+  const previous = tasks[idx]
+  let updated: Task = {
+    ...previous,
+    assignedAgent: agentId || undefined,
+    updatedAt: now,
+    activity: agentId !== String(previous.assignedAgent || '')
+      ? [
+          ...(previous.activity || []),
+          {
+            type: 'updated',
+            message: agentId ? `Assigned to ${agentId}` : 'Assignment cleared',
+            timestamp: now,
+            actor: actorEmail,
+            taskId: previous.id,
+            taskTitle: previous.title,
+          },
+        ]
+      : previous.activity,
+  }
+  const agentDispatches: AgentDispatchEnqueueInput[] = []
+  if (board && agentId && agentId !== String(previous.assignedAgent || '')) {
+    const prepared = prepareAgentDispatch({
+      operatorId: actorEmail,
+      boardId: board.id,
+      task: updated,
+      agentId,
+      text: assignmentKickoffText(),
+      trigger: 'assignment',
+      queuedAt: now,
+    })
+    updated = prepared.task
+    agentDispatches.push(prepared.dispatch)
+  }
+  tasks[idx] = applyCanonicalWorkItem(updated)
+  await writeTasks(tasks, board?.id, agentDispatches)
 
   const assignments = await readAssignments(board?.id)
-  return NextResponse.json({ ok: true, assignments })
+  return NextResponse.json({ ok: true, assignments, task: tasks[idx] })
 }

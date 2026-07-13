@@ -5,7 +5,7 @@ ClawPilot can run its product-agent conversations with a signed-in user's ChatGP
 ## Account Boundary
 
 - `APP_LOGIN_EMAIL` is bootstrapped as the ClawPilot owner.
-- The owner can invite or disable members from Settings > User access.
+- The owner can invite or disable members from Settings > People.
 - Each member signs in with their own email magic code.
 - Each member must connect their own ChatGPT account from Agents.
 - OAuth credentials and agent threads are scoped to the normalized ClawPilot email.
@@ -36,3 +36,9 @@ Use the same credential encryption key anywhere the same Postgres credential row
 The ChatGPT/Codex authorization path is distinct from the public OpenAI API-key path. Model entitlements and usage limits come from the connected user's ChatGPT plan. A user whose authorization expires must reconnect.
 
 The Codex backend and OAuth client behavior must be regression-tested during OpenAI/Codex upgrades because they do not have the same compatibility guarantees as the public API-key Responses endpoint.
+
+## Product Agent Mapping
+
+ClawPilot defines five product profiles: Projects, Pipeline, Docs, Calendar, and ClawPilot. Each profile contributes a distinct instruction and routing context, but all five use the initiating ClawPilot user's connected ChatGPT/Codex authorization. They are not separate Custom GPT objects in the user's ChatGPT sidebar.
+
+Task assignment and explicit `@Agent` card comments enqueue durable Postgres dispatch records. The Railway worker restores the initiating user's session and selected board, executes against that user's credential, retries transient failures, and writes the result to both the user's private task thread and the shared card.

@@ -4,6 +4,7 @@ import { getAgentRuntime } from '@/lib/agents/provider'
 import { getStorageDriver, isHostedRuntime } from '@/lib/persistence/config'
 import { query } from '@/lib/persistence/postgres'
 import { readPipelineOutboxWorkerHeartbeatFromPostgres } from '@/lib/persistence/pipeline'
+import { readAgentDispatchWorkerHeartbeatFromPostgres } from '@/lib/persistence/agentDispatch'
 
 const DEV_LOG_PATH = '/tmp/clawd-app-dev.log'
 const FALLBACK_LOG_PATH = '/tmp/clawd-app.log'
@@ -57,6 +58,7 @@ export async function GET() {
     const storage = getStorageDriver()
     let database: Record<string, unknown> = { status: 'not-configured' }
     let worker: Record<string, unknown> = { status: 'not-owned' }
+    let agentWorker: Record<string, unknown> = { status: 'not-owned' }
 
     if (cloudProvider === 'railway' && storage !== 'postgres') {
       errors.push('Railway runtime requires Postgres storage.')
@@ -103,6 +105,7 @@ export async function GET() {
           attribution_migration_applied: boolean
           workspaces_migration_applied: boolean
           workspace_security_migration_applied: boolean
+          agent_dispatch_migration_applied: boolean
         }>(
           `
             SELECT
@@ -141,7 +144,12 @@ export async function GET() {
                 SELECT 1
                 FROM schema_migrations
                 WHERE filename = '0008_workspace_security_hardening.sql'
-              ) AS workspace_security_migration_applied
+              ) AS workspace_security_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0009_agent_dispatch_outbox.sql'
+              ) AS agent_dispatch_migration_applied
           `,
         )
         const row = result.rows[0]
@@ -156,6 +164,7 @@ export async function GET() {
             && row?.attribution_migration_applied
             && row?.workspaces_migration_applied
             && row?.workspace_security_migration_applied
+            && row?.agent_dispatch_migration_applied
           ),
         }
         if (
@@ -166,6 +175,7 @@ export async function GET() {
           || !row?.attribution_migration_applied
           || !row?.workspaces_migration_applied
           || !row?.workspace_security_migration_applied
+          || !row?.agent_dispatch_migration_applied
         ) {
           errors.push('Required database migrations are not applied.')
         }
@@ -184,6 +194,21 @@ export async function GET() {
           }
           if (ageMs === null || ageMs > maxHeartbeatAgeMs) {
             errors.push('Pipeline outbox worker heartbeat is missing or stale.')
+          }
+
+          const agentHeartbeat = await readAgentDispatchWorkerHeartbeatFromPostgres()
+          const agentHeartbeatAt = Date.parse(String(agentHeartbeat?.checkedAt || ''))
+          const agentPollMs = Math.max(1000, Math.min(Number(process.env.AGENT_DISPATCH_POLL_MS || 5000), 300000))
+          const maxAgentHeartbeatAgeMs = Math.max(240_000, agentPollMs * 3)
+          const agentAgeMs = Number.isFinite(agentHeartbeatAt) ? checkedAt - agentHeartbeatAt : null
+          agentWorker = {
+            status: agentAgeMs !== null && agentAgeMs <= maxAgentHeartbeatAgeMs ? 'reachable' : 'stale',
+            heartbeatAt: agentHeartbeat?.checkedAt || null,
+            phase: agentHeartbeat?.phase || null,
+            ageMs: agentAgeMs,
+          }
+          if (agentAgeMs === null || agentAgeMs > maxAgentHeartbeatAgeMs) {
+            errors.push('Agent dispatch worker heartbeat is missing or stale.')
           }
         }
       } catch (error) {
@@ -206,6 +231,7 @@ export async function GET() {
       storage,
       database,
       worker,
+      agentWorker,
       capabilities: {
         openClawExecution: process.env.CLAWPILOT_EXECUTION_ENABLED === '1',
         agentRuntime: getAgentRuntime(),

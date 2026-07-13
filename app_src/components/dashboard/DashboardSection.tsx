@@ -20,7 +20,6 @@ import FlagRounded from '@mui/icons-material/FlagRounded'
 import WbSunnyRounded from '@mui/icons-material/WbSunnyRounded'
 import type { Task } from '@/lib/types'
 import { queueAgentTaskOpen } from '@/lib/agents/navigation'
-import { assignmentKickoffText, triggerAgentTurn } from '@/lib/agents/client'
 import { PRIORITY_COLORS } from '@/lib/types'
 import { deriveTaskRealityState } from '@/lib/taskRealityState'
 import { deriveNextActionGuidance, deriveStateTruth } from '@/lib/workItemModel'
@@ -369,7 +368,6 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter }: P
     const updated = await r.json()
     if (!updated?.id) return
     setTasks((prev) => prev.map((task) => (task.id === updated.id ? updated : task)))
-    await triggerAgentTurn({ taskId, agentId, text: assignmentKickoffText() }).catch(() => {})
   }
 
   if (loading) return (
