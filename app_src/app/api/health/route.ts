@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 import fs from 'fs'
 import { getAgentRuntime } from '@/lib/agents/provider'
 import { getStorageDriver, isHostedRuntime } from '@/lib/persistence/config'
+import { query as queryAgentCredentials } from '@/lib/persistence/agentCredentials'
 import { query } from '@/lib/persistence/postgres'
 import { readPipelineOutboxWorkerHeartbeatFromPostgres } from '@/lib/persistence/pipeline'
 import { readAgentDispatchWorkerHeartbeatFromPostgres } from '@/lib/persistence/agentDispatch'
@@ -57,6 +58,7 @@ export async function GET() {
     const warnings: string[] = []
     const storage = getStorageDriver()
     let database: Record<string, unknown> = { status: 'not-configured' }
+    let credentialStore: Record<string, unknown> = { status: 'not-configured' }
     let worker: Record<string, unknown> = { status: 'not-owned' }
     let agentWorker: Record<string, unknown> = { status: 'not-owned' }
 
@@ -77,6 +79,18 @@ export async function GET() {
     }
     if (String(process.env.AGENT_CREDENTIAL_ENCRYPTION_KEY || '').length < 32) {
       errors.push('Hosted runtime agent credential encryption key is missing or too short.')
+    }
+    if (String(process.env.AGENT_CREDENTIAL_DATABASE_URL || '').length < 16) {
+      errors.push('Hosted runtime agent credential database is not configured.')
+    } else {
+      try {
+        await queryAgentCredentials('SELECT operator_id FROM agent_chatgpt_credentials LIMIT 1')
+        credentialStore = { status: 'reachable', shared: true }
+      } catch (error) {
+        credentialStore = { status: 'unreachable', shared: true }
+        console.error('[health] Agent credential store health check failed', error)
+        errors.push('Agent credential store is unreachable.')
+      }
     }
     if (String(process.env.MATON_API_KEY || '').length < 16) {
       errors.push('Hosted runtime Maton credential is missing or too short.')
@@ -230,6 +244,7 @@ export async function GET() {
       environment: process.env.RAILWAY_ENVIRONMENT_NAME || process.env.VERCEL_ENV || null,
       storage,
       database,
+      credentialStore,
       worker,
       agentWorker,
       capabilities: {

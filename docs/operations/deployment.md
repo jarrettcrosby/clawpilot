@@ -82,15 +82,16 @@ Current Railway production setup:
 - `APP_LOGIN_EMAIL=<approved operator email>`
 - `APP_LOGIN_PASSWORD=<secret>`
 - `APP_SESSION_SECRET=<secret>`
+- `AGENT_CREDENTIAL_DATABASE_URL=<restricted shared credential Postgres URL>`
+- `AGENT_CREDENTIAL_ENCRYPTION_KEY=<shared credential encryption secret>`
 - `MATON_API_KEY=<secret>`
 - `MATON_GMAIL_CONNECTION_ID=<active Google Mail connection id>`
 - `PIPELINE_SHEET_ID=<environment-specific Sheet id>`
 - `PIPELINE_OUTBOX_WORKER_SECRET=<secret>`
 - `AGENT_DISPATCH_POLL_MS=5000` (optional; defaults to 5 seconds)
 - `CLAWPILOT_EXECUTION_ENABLED=0`
-- `CLAWPILOT_AGENT_PROVIDER=openai` when hosted agent execution is enabled
-- `OPENAI_API_KEY=<server API key>` when hosted agent execution is enabled
-- `OPENAI_AGENT_MODEL=gpt-5-mini` (or another approved Responses API model)
+- `CLAWPILOT_AGENT_PROVIDER=openai-codex`
+- `OPENAI_CODEX_AGENT_MODEL=gpt-5.4`
 
 Railway applies pending SQL migrations as a pre-deploy command, then starts the Next.js app and independent pipeline/agent polling loops together. Both use leased `sync_outbox` rows with retries and dead-letter handling; agent dispatch restores the initiating user's app session so OAuth credentials and thread history remain user-scoped.
 - initial 4002 dev-lane import: 43 tasks, 2 assignments, 13 threads, 26 messages

@@ -86,6 +86,7 @@ try {
     if (health?.runtime === 'railway') {
       check(health?.worker?.status === 'reachable', 'pipeline outbox worker heartbeat is fresh')
       check(health?.agentWorker?.status === 'reachable', 'agent dispatch worker heartbeat is fresh')
+      check(health?.credentialStore?.status === 'reachable', 'shared agent credential store is reachable')
     }
   }
 

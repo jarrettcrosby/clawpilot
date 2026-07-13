@@ -68,10 +68,22 @@ for (const fragment of [
   '/oauth/token',
   '/oauth/revoke',
   'FOR UPDATE',
+  '@/lib/persistence/agentCredentials',
 ]) {
   assert.ok(authSource.includes(fragment), `agent auth adapter missing ${fragment}`)
 }
 assert.ok(!authSource.includes('console.'))
+
+const credentialStoreSource = read('app_src/lib/persistence/agentCredentials.ts')
+for (const fragment of [
+  'AGENT_CREDENTIAL_DATABASE_URL',
+  '__clawpilotAgentCredentialPgPool',
+  "await client.query('BEGIN')",
+  "await client.query('COMMIT')",
+  "await client.query('ROLLBACK')",
+]) {
+  assert.ok(credentialStoreSource.includes(fragment), `shared agent credential store missing ${fragment}`)
+}
 
 const requests = []
 const responseModule = loadTypeScriptModule('app_src/lib/agents/chatgptResponses.ts', {

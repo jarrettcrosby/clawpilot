@@ -141,6 +141,7 @@ for (const requiredVariable of [
     'APP_LOGIN_PASSWORD',
   'APP_SESSION_SECRET',
   'AGENT_CREDENTIAL_ENCRYPTION_KEY',
+  'AGENT_CREDENTIAL_DATABASE_URL',
     'DATABASE_URL',
     'MATON_API_KEY',
     'MATON_GMAIL_CONNECTION_ID',
@@ -183,6 +184,7 @@ assertIncludes(healthRoute, '0006_agent_user_attribution.sql', 'hosted attributi
 assertIncludes(healthRoute, '0007_multi_tenant_workspaces.sql', 'hosted workspace migration health')
 assertIncludes(healthRoute, '0008_workspace_security_hardening.sql', 'hosted workspace security migration health')
 assertIncludes(healthRoute, '0009_agent_dispatch_outbox.sql', 'hosted agent dispatch migration health')
+assertIncludes(healthRoute, 'queryAgentCredentials', 'shared agent credential store health')
 assertIncludes(healthRoute, 'readAgentDispatchWorkerHeartbeatFromPostgres', 'hosted agent worker health')
 assertIncludes(healthRoute, 'getAgentRuntime', 'hosted agent runtime health')
 
