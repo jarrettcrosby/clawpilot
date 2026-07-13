@@ -5,6 +5,11 @@ import { query, withTransaction } from '@/lib/persistence/postgres'
 
 type TaskRow = {
   payload: Task
+  board_id: string
+}
+
+type TaskStoreScope = {
+  boardId: string
 }
 
 function safeIso(value: unknown, fallback: string): string {
@@ -26,14 +31,15 @@ export function isPostgresTaskStoreEnabled(): boolean {
   return isPostgresStorageEnabled()
 }
 
-export async function readTasksFromPostgres(): Promise<Task[]> {
+export async function readTasksFromPostgres(scope: TaskStoreScope): Promise<Task[]> {
   const result = await query<TaskRow>(
-    'SELECT payload FROM tasks ORDER BY updated_at DESC, created_at DESC, id ASC',
+    'SELECT payload, board_id::text FROM tasks WHERE board_id = $1::uuid ORDER BY updated_at DESC, created_at DESC, id ASC',
+    [scope.boardId],
   )
-  return result.rows.map((row) => row.payload)
+  return result.rows.map((row) => ({ ...row.payload, boardId: row.board_id }))
 }
 
-export async function replaceTasksInPostgres(tasks: Task[]): Promise<void> {
+export async function replaceTasksInPostgres(tasks: Task[], scope: TaskStoreScope): Promise<void> {
   await withTransaction(async (client) => {
     const ids = tasks.map((task) => String(task.id))
 
@@ -44,10 +50,11 @@ export async function replaceTasksInPostgres(tasks: Task[]): Promise<void> {
       const archivedAt = task.archivedAt ? safeIso(task.archivedAt, updatedAt) : null
       const deletedAt = task.deletedAt ? safeIso(task.deletedAt, updatedAt) : null
 
-      await client.query(
+      const upsert = await client.query(
         `
           INSERT INTO tasks (
             id,
+            board_id,
             title,
             status,
             priority,
@@ -63,8 +70,9 @@ export async function replaceTasksInPostgres(tasks: Task[]): Promise<void> {
             payload_hash,
             source
           )
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8::timestamptz, $9::timestamptz, $10, $11::timestamptz, $12::timestamptz, $13::jsonb, $14, 'app')
+          VALUES ($1, $2::uuid, $3, $4, $5, $6, $7, $8, $9::timestamptz, $10::timestamptz, $11, $12::timestamptz, $13::timestamptz, $14::jsonb, $15, 'app')
           ON CONFLICT (id) DO UPDATE SET
+            board_id = EXCLUDED.board_id,
             title = EXCLUDED.title,
             status = EXCLUDED.status,
             priority = EXCLUDED.priority,
@@ -79,9 +87,11 @@ export async function replaceTasksInPostgres(tasks: Task[]): Promise<void> {
             payload = EXCLUDED.payload,
             payload_hash = EXCLUDED.payload_hash,
             source = EXCLUDED.source
+          WHERE tasks.board_id = EXCLUDED.board_id
         `,
         [
           String(task.id),
+          scope.boardId,
           String(task.title || 'Untitled task'),
           task.status,
           task.priority,
@@ -93,19 +103,23 @@ export async function replaceTasksInPostgres(tasks: Task[]): Promise<void> {
           Boolean(task.archived),
           archivedAt,
           deletedAt,
-          JSON.stringify(task),
-          payloadHash(task),
+          JSON.stringify({ ...task, boardId: scope.boardId }),
+          payloadHash({ ...task, boardId: scope.boardId }),
         ],
       )
+      if (upsert.rowCount !== 1) throw new Error(`Task id collision across project boards: ${task.id}`)
     }
 
     if (ids.length > 0) {
-      await client.query('DELETE FROM tasks WHERE NOT (id = ANY($1::text[]))', [ids])
+      await client.query('DELETE FROM tasks WHERE board_id = $1::uuid AND NOT (id = ANY($2::text[]))', [scope.boardId, ids])
     } else {
-      await client.query('DELETE FROM tasks')
+      await client.query('DELETE FROM tasks WHERE board_id = $1::uuid', [scope.boardId])
     }
 
-    await client.query('DELETE FROM agent_assignments')
+    await client.query(
+      'DELETE FROM agent_assignments assignment USING tasks task WHERE assignment.task_id = task.id AND task.board_id = $1::uuid',
+      [scope.boardId],
+    )
     const assignments = tasks
       .filter((task) => task.assignedAgent && !task.archived && !task.deletedAt)
       .map((task) => ({
@@ -128,4 +142,3 @@ export async function replaceTasksInPostgres(tasks: Task[]): Promise<void> {
     }
   })
 }
-

@@ -2,6 +2,7 @@ import crypto from 'crypto'
 import { NextRequest, NextResponse } from 'next/server'
 import { createSessionToken, getCookieName, getLoginPassword } from '@/lib/auth'
 import { configuredOwnerEmail, ensureOwnerUser, markAppUserSignedIn } from '@/lib/users'
+import { ensureDefaultResourcesForUser } from '@/lib/tenancy'
 
 const WINDOW_MS = 15 * 60 * 1000
 const MAX_ATTEMPTS = 5
@@ -83,6 +84,7 @@ export async function POST(req: NextRequest) {
     await ensureOwnerUser()
     const ownerEmail = configuredOwnerEmail()
     await markAppUserSignedIn(ownerEmail)
+    await ensureDefaultResourcesForUser(ownerEmail)
     const token = createSessionToken(ownerEmail)
     const res = NextResponse.json({ ok: true })
     res.cookies.set({

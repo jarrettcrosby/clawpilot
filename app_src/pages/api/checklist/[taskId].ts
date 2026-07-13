@@ -19,6 +19,9 @@ function writeJsonFileSafe(p: string, obj: unknown) {
 }
 
 export default function handler(req: NextApiRequest, res: NextApiResponse) {
+  if (process.env.CLAWPILOT_STORAGE === 'postgres' && process.env.DATABASE_URL) {
+    return res.status(410).json({ error: 'Legacy checklist route is disabled; use the task API' })
+  }
   const { taskId } = req.query
   const TASKS_PATH = process.env.TASKS_PATH || path.resolve(process.cwd(), '../../data-dev/tasks.json')
   const PERSIST = (process.env.CHECKLIST_PERSIST_DEV || '').toLowerCase() === 'true'

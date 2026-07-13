@@ -334,8 +334,8 @@ export default function AppHeader({ activeSection, title, onShortcutsOpen, showN
             <GroupRounded sx={{ fontSize: 18, color: 'text.secondary' }} />
           </ListItemIcon>
           <ListItemText
-            primary="User access"
-            secondary="Accounts and invitations"
+            primary="Workspace settings"
+            secondary="Profile, access and sharing"
             primaryTypographyProps={{ variant: 'body2', color: 'text.primary' }}
             secondaryTypographyProps={{ variant: 'caption', color: 'text.disabled' }}
           />

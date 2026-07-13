@@ -7,6 +7,7 @@ type PipelineLogEvent = {
   module: string
   action: string
   recordId?: string
+  pipelineId?: string
   result: 'ok' | 'error' | 'conflict'
   actor?: string
   activityType?: 'updated' | 'moved' | 'comment'

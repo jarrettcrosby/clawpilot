@@ -1,13 +1,17 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { getCookieName, verifySessionToken } from '@/lib/auth'
 import { requestAuthMagicCode } from '@/lib/authMagicCode'
 import { disconnectChatGPT } from '@/lib/agents/chatgptAuth'
-import { inviteAppUser, listAppUsers, setAppUserStatus } from '@/lib/users'
-
-function sessionEmail(req: NextRequest): string | null {
-  const session = verifySessionToken(req.cookies.get(getCookieName())?.value)
-  return session.ok ? session.user : null
-}
+import { ensureDefaultResourcesForUser } from '@/lib/tenancy'
+import { sessionEmail } from '@/lib/requestUser'
+import {
+  canInviteUsers,
+  canManageUserAccess,
+  inviteAppUser,
+  listAppUsers,
+  setAppUserStatus,
+  updateAppUserAccess,
+  updateAppUserProfile,
+} from '@/lib/users'
 
 export async function GET(req: NextRequest) {
   const email = sessionEmail(req)
@@ -15,10 +19,13 @@ export async function GET(req: NextRequest) {
 
   try {
     const { actor, users } = await listAppUsers(email)
+    await ensureDefaultResourcesForUser(actor.email)
     return NextResponse.json({
       ok: true,
       currentUser: actor,
-      canInvite: actor.role === 'owner',
+      isAdmin: actor.role === 'owner' || actor.role === 'admin',
+      canInvite: canInviteUsers(actor),
+      canManageUserAccess: canManageUserAccess(actor),
       users,
     })
   } catch (error) {
@@ -52,6 +59,25 @@ export async function PATCH(req: NextRequest) {
 
   try {
     const body = await req.json()
+    if (body?.action === 'profile') {
+      const user = await updateAppUserProfile({
+        actorEmail,
+        displayName: body.displayName,
+        jobTitle: body.jobTitle,
+        timezone: body.timezone,
+        locale: body.locale,
+      })
+      return NextResponse.json({ ok: true, user })
+    }
+    if (body?.action === 'access') {
+      const user = await updateAppUserAccess({
+        actorEmail,
+        email: body.email,
+        role: body.role === 'admin' ? 'admin' : body.role === 'member' ? 'member' : undefined,
+        permissions: body.permissions,
+      })
+      return NextResponse.json({ ok: true, user })
+    }
     const status = body?.status === 'active' ? 'active' : body?.status === 'disabled' ? 'disabled' : null
     if (!status) return NextResponse.json({ ok: false, error: 'Valid status required' }, { status: 400 })
     const user = await setAppUserStatus({ actorEmail, email: body?.email, status })

@@ -1,6 +1,9 @@
-import { NextResponse } from 'next/server'
+import { NextRequest, NextResponse } from 'next/server'
 import fs from 'fs'
 import path from 'path'
+import { isPostgresTaskStoreEnabled, readTasksFromPostgres } from '@/lib/persistence/tasks'
+import { requireRequestUser } from '@/lib/requestUser'
+import { BOARD_SELECTION_COOKIE, resolveProjectBoardAccess } from '@/lib/tenancy'
 
 type AuditEntry = {
   type?: string
@@ -32,7 +35,35 @@ function readEntries(): AuditEntry[] {
     .filter(Boolean) as AuditEntry[]
 }
 
-export async function GET() {
+export async function GET(req: NextRequest) {
+  if (isPostgresTaskStoreEnabled()) {
+    try {
+      const actor = await requireRequestUser(req)
+      const selected = req.cookies.get(BOARD_SELECTION_COOKIE)?.value || undefined
+      const board = await resolveProjectBoardAccess({ actorEmail: actor.email, boardId: selected })
+        .catch(() => resolveProjectBoardAccess({ actorEmail: actor.email }))
+      const tasks = await readTasksFromPostgres({ boardId: board.id })
+      const dayAgoMs = Date.now() - (24 * 60 * 60 * 1000)
+      const ordered = [...tasks].sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt))
+      const last = ordered.at(-1) || null
+      const createdActivity = last?.activity?.find((entry) => entry.type === 'created')
+      return NextResponse.json({
+        created24h: tasks.filter((task) => Date.parse(task.createdAt) >= dayAgoMs).length,
+        lastCreated: last ? {
+          timestamp: last.createdAt,
+          source: 'app',
+          actor: createdActivity?.actor || null,
+          taskId: last.id,
+          title: last.title,
+          anomaly: false,
+          recentCreatesInLastMinute: 0,
+        } : null,
+      })
+    } catch (error) {
+      return NextResponse.json({ error: error instanceof Error ? error.message : 'Unable to load task audit' }, { status: 403 })
+    }
+  }
+
   const entries = readEntries()
   const nowMs = Date.now()
   const dayAgoMs = nowMs - (24 * 60 * 60 * 1000)

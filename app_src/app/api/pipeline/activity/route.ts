@@ -1,8 +1,11 @@
-import { NextResponse } from 'next/server'
+import { NextRequest, NextResponse } from 'next/server'
 import fs from 'fs'
 import path from 'path'
+import { isPostgresPipelineStoreEnabled } from '@/lib/persistence/pipeline'
+import { requireRequestUser } from '@/lib/requestUser'
+import { PIPELINE_SELECTION_COOKIE, resolvePipelineSpaceAccess } from '@/lib/tenancy'
 
-const LOG_FILE = path.join(process.cwd(), '..', 'data', 'logs', 'pipeline-events.jsonl')
+const LOG_FILE = process.env.PIPELINE_LOG_PATH || path.join(process.cwd(), '..', 'data', 'logs', 'pipeline-events.jsonl')
 
 type PipelineActivity = {
   id: string
@@ -25,8 +28,18 @@ function normalizeType(v: unknown): PipelineActivity['type'] | null {
   return null
 }
 
-export async function GET() {
+export async function GET(req: NextRequest) {
   try {
+    let selectedPipelineId = ''
+    let includeLegacyEvents = true
+    if (isPostgresPipelineStoreEnabled()) {
+      const actor = await requireRequestUser(req)
+      const selected = req.cookies.get(PIPELINE_SELECTION_COOKIE)?.value || undefined
+      const pipeline = await resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: selected })
+        .catch(() => resolvePipelineSpaceAccess({ actorEmail: actor.email }))
+      selectedPipelineId = pipeline.id
+      includeLegacyEvents = pipeline.sheetBacked
+    }
     if (!fs.existsSync(LOG_FILE)) return NextResponse.json([])
 
     const raw = fs.readFileSync(LOG_FILE, 'utf-8')
@@ -37,6 +50,9 @@ export async function GET() {
       const line = lines[i]
       try {
         const row = JSON.parse(line)
+        const eventPipelineId = String(row?.pipelineId || '')
+        if (selectedPipelineId && eventPipelineId && eventPipelineId !== selectedPipelineId) continue
+        if (selectedPipelineId && !eventPipelineId && !includeLegacyEvents) continue
         const activityType = normalizeType(row?.activityType)
         if (!activityType) continue
 

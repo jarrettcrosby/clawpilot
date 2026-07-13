@@ -4,6 +4,7 @@ import path from 'path'
 import type { Task } from '@/lib/types'
 import { normalizeProductAgentId } from '@/lib/agents/routing'
 import { withFileLock } from '@/lib/fileLock'
+import { isPostgresTaskStoreEnabled } from '@/lib/persistence/tasks'
 
 const DEV_TASKS_FILE = path.join(process.cwd(), '..', 'data-dev', 'tasks.json')
 const PROD_TASKS_FILE = path.join(process.cwd(), '..', 'data', 'tasks.json')
@@ -26,6 +27,9 @@ async function writeTasks(tasks: Task[]) {
 }
 
 export async function POST() {
+  if (isPostgresTaskStoreEnabled()) {
+    return NextResponse.json({ ok: false, error: 'Legacy assignment backfill is disabled for Postgres workspaces' }, { status: 410 })
+  }
   const tasks = readTasks()
   let changed = 0
   const updated = tasks.map(task => {

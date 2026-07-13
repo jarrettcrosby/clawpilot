@@ -6,6 +6,7 @@ import { ensureNotFrozen } from '@/lib/freeze'
 import { getAutoPickupEligibility } from '@/lib/taskState'
 import { normalizeProductAgentId, resolveExecutionAgentForControlAgent } from '@/lib/agents/routing'
 import { withFileLock } from '@/lib/fileLock'
+import { isPostgresTaskStoreEnabled } from '@/lib/persistence/tasks'
 
 const DEV_TASKS_FILE = path.join(process.cwd(), '..', 'data-dev', 'tasks.json')
 const PROD_TASKS_FILE = path.join(process.cwd(), '..', 'data', 'tasks.json')
@@ -28,6 +29,9 @@ async function writeTasks(tasks: Task[]) {
 }
 
 export async function POST(req: NextRequest, ctx: { params: Promise<{ taskId: string }> }) {
+  if (isPostgresTaskStoreEnabled()) {
+    return NextResponse.json({ ok: false, error: 'Legacy task claiming is disabled; use agent assignment' }, { status: 410 })
+  }
   const freeze = ensureNotFrozen()
   if (freeze) return NextResponse.json(freeze, { status: 423 })
 

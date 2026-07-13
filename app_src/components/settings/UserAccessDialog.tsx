@@ -1,177 +1,1151 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState, type FormEvent } from 'react'
 import Alert from '@mui/material/Alert'
+import Avatar from '@mui/material/Avatar'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
 import Chip from '@mui/material/Chip'
 import CircularProgress from '@mui/material/CircularProgress'
 import Dialog from '@mui/material/Dialog'
-import DialogActions from '@mui/material/DialogActions'
 import DialogContent from '@mui/material/DialogContent'
-import DialogTitle from '@mui/material/DialogTitle'
+import Divider from '@mui/material/Divider'
+import FormControlLabel from '@mui/material/FormControlLabel'
 import IconButton from '@mui/material/IconButton'
+import MenuItem from '@mui/material/MenuItem'
 import Stack from '@mui/material/Stack'
+import Switch from '@mui/material/Switch'
+import Tab from '@mui/material/Tab'
+import Tabs from '@mui/material/Tabs'
 import TextField from '@mui/material/TextField'
 import Tooltip from '@mui/material/Tooltip'
 import Typography from '@mui/material/Typography'
+import useMediaQuery from '@mui/material/useMediaQuery'
+import { useTheme } from '@mui/material/styles'
+import AccountCircleRounded from '@mui/icons-material/AccountCircleRounded'
+import AddRounded from '@mui/icons-material/AddRounded'
+import CloseRounded from '@mui/icons-material/CloseRounded'
+import DeleteOutlineRounded from '@mui/icons-material/DeleteOutlineRounded'
+import GroupRounded from '@mui/icons-material/GroupRounded'
 import PersonAddRounded from '@mui/icons-material/PersonAddRounded'
 import PersonOffRounded from '@mui/icons-material/PersonOffRounded'
-import PersonRounded from '@mui/icons-material/PersonRounded'
 import RestoreRounded from '@mui/icons-material/RestoreRounded'
+import SaveRounded from '@mui/icons-material/SaveRounded'
+import ShareRounded from '@mui/icons-material/ShareRounded'
+import TableChartRounded from '@mui/icons-material/TableChartRounded'
+import ViewKanbanRounded from '@mui/icons-material/ViewKanbanRounded'
+
+type UserRole = 'owner' | 'admin' | 'member'
+type UserStatus = 'invited' | 'active' | 'disabled'
+type EditableRole = Exclude<UserRole, 'owner'>
+type PermissionKey = keyof UserPermissions
+type ResourceAccessRole = 'owner' | 'editor' | 'viewer'
+type ShareAccessRole = Exclude<ResourceAccessRole, 'owner'>
+type ResourceKind = 'board' | 'pipeline'
+
+type UserPermissions = {
+  inviteUsers: boolean
+  manageUserAccess: boolean
+  createBoards: boolean
+  createPipelines: boolean
+}
 
 type AppUser = {
   email: string
-  role: 'owner' | 'member'
-  status: 'invited' | 'active' | 'disabled'
+  role: UserRole
+  status: UserStatus
+  displayName: string | null
+  jobTitle: string | null
+  timezone: string
+  locale: string
+  permissions: UserPermissions
   lastLoginAt?: string | null
 }
 
-type UsersPayload = {
+type ApiPayload = {
   ok?: boolean
   error?: string
+}
+
+type UsersPayload = ApiPayload & {
   currentUser?: AppUser
+  isAdmin?: boolean
   canInvite?: boolean
+  canManageUserAccess?: boolean
   users?: AppUser[]
 }
 
+type UserMutationPayload = ApiPayload & {
+  user?: AppUser
+  delivery?: string
+}
+
+type SharedResourceMember = {
+  email: string
+  displayName: string | null
+  status: UserStatus
+  accessRole: ShareAccessRole
+}
+
+type WorkspaceResource = {
+  id: string
+  name: string
+  ownerEmail: string
+  isDefault: boolean
+  accessRole: ResourceAccessRole
+  members: SharedResourceMember[]
+}
+
+type PipelineResource = WorkspaceResource & {
+  sheetBacked: boolean
+  syncEnabled: boolean
+}
+
+type WorkspacesPayload = ApiPayload & {
+  boards?: WorkspaceResource[]
+  pipelines?: PipelineResource[]
+  selectedBoardId?: string | null
+  selectedPipelineId?: string | null
+}
+
+type ProfileForm = {
+  displayName: string
+  jobTitle: string
+  timezone: string
+  locale: string
+}
+
+type ShareDraft = {
+  email: string
+  accessRole: ShareAccessRole
+}
+
+const EMPTY_PROFILE: ProfileForm = {
+  displayName: '',
+  jobTitle: '',
+  timezone: 'America/New_York',
+  locale: 'en-US',
+}
+
+const EMPTY_SHARE_DRAFT: ShareDraft = { email: '', accessRole: 'viewer' }
+
+const TIMEZONES = [
+  'UTC',
+  'America/New_York',
+  'America/Chicago',
+  'America/Denver',
+  'America/Los_Angeles',
+  'America/Anchorage',
+  'Pacific/Honolulu',
+  'America/Toronto',
+  'America/Vancouver',
+  'America/Mexico_City',
+  'America/Sao_Paulo',
+  'Europe/London',
+  'Europe/Paris',
+  'Europe/Berlin',
+  'Africa/Johannesburg',
+  'Asia/Dubai',
+  'Asia/Kolkata',
+  'Asia/Singapore',
+  'Asia/Tokyo',
+  'Australia/Sydney',
+]
+
+const LOCALES = [
+  'en-US',
+  'en-GB',
+  'en-CA',
+  'es-ES',
+  'es-MX',
+  'fr-FR',
+  'de-DE',
+  'pt-BR',
+  'ja-JP',
+  'zh-CN',
+]
+
+const PERMISSIONS: Array<{ key: PermissionKey; label: string; adminOnly?: boolean }> = [
+  { key: 'inviteUsers', label: 'Invite users', adminOnly: true },
+  { key: 'manageUserAccess', label: 'Manage access', adminOnly: true },
+  { key: 'createBoards', label: 'Create boards' },
+  { key: 'createPipelines', label: 'Create pipelines' },
+]
+
+const panelSx = {
+  border: '1px solid rgba(255,255,255,0.09)',
+  borderRadius: '8px',
+  backgroundColor: 'rgba(255,255,255,0.025)',
+}
+
+const compactButtonSx = {
+  minHeight: 36,
+  borderRadius: '8px',
+  px: 1.5,
+  whiteSpace: 'nowrap',
+}
+
+const fieldSx = {
+  '& .MuiOutlinedInput-root': {
+    borderRadius: '8px',
+    backgroundColor: '#20202A',
+  },
+}
+
+async function requestJson<T extends ApiPayload>(url: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(url, init)
+  const result = await response.json().catch(() => ({})) as T
+  if (!response.ok || !result.ok) throw new Error(result.error || 'Request failed')
+  return result
+}
+
+function messageFrom(error: unknown, fallback: string) {
+  return error instanceof Error ? error.message : fallback
+}
+
+function profileFrom(user: AppUser): ProfileForm {
+  return {
+    displayName: user.displayName || '',
+    jobTitle: user.jobTitle || '',
+    timezone: user.timezone || 'America/New_York',
+    locale: user.locale || 'en-US',
+  }
+}
+
+function roleLabel(role: UserRole) {
+  if (role === 'owner') return 'Owner / admin'
+  return role === 'admin' ? 'Admin' : 'Member'
+}
+
+function statusLabel(status: UserStatus) {
+  return status.charAt(0).toUpperCase() + status.slice(1)
+}
+
+function initials(user: Pick<AppUser, 'displayName' | 'email'>) {
+  const source = user.displayName?.trim() || user.email.split('@')[0]
+  return source
+    .split(/\s+/)
+    .slice(0, 2)
+    .map((part) => part.charAt(0).toUpperCase())
+    .join('')
+}
+
+function isEmail(value: string) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim())
+}
+
 export default function UserAccessDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
-  const [payload, setPayload] = useState<UsersPayload>({})
-  const [email, setEmail] = useState('')
-  const [pending, setPending] = useState(false)
+  const theme = useTheme()
+  const fullScreen = useMediaQuery(theme.breakpoints.down('sm'))
+  const [activeTab, setActiveTab] = useState(0)
+  const [usersPayload, setUsersPayload] = useState<UsersPayload | null>(null)
+  const [workspacesPayload, setWorkspacesPayload] = useState<WorkspacesPayload | null>(null)
+  const [profile, setProfile] = useState<ProfileForm>(EMPTY_PROFILE)
+  const [inviteEmail, setInviteEmail] = useState('')
+  const [createNames, setCreateNames] = useState({ board: '', pipeline: '' })
+  const [shareDrafts, setShareDrafts] = useState<Record<string, ShareDraft>>({})
+  const [loading, setLoading] = useState(false)
+  const [pendingAction, setPendingAction] = useState<string | null>(null)
   const [notice, setNotice] = useState('')
   const [error, setError] = useState('')
 
-  async function loadUsers() {
-    const response = await fetch('/api/users')
-    const result = await response.json().catch(() => ({})) as UsersPayload
-    if (!response.ok || !result.ok) throw new Error(result.error || 'Unable to load users')
-    setPayload(result)
-  }
+  const currentUser = usersPayload?.currentUser
+  const busy = pendingAction !== null
+
+  const displayedUsers = useMemo(() => {
+    if (!currentUser) return []
+    if (!usersPayload?.isAdmin) return [currentUser]
+    return usersPayload.users || [currentUser]
+  }, [currentUser, usersPayload])
+
+  const eligibleShareEmails = useMemo(() => {
+    return (usersPayload?.users || [])
+      .filter((user) => user.status !== 'disabled' && user.email !== currentUser?.email)
+      .map((user) => user.email)
+  }, [currentUser?.email, usersPayload?.users])
+
+  const timezoneOptions = useMemo(
+    () => Array.from(new Set([profile.timezone, ...TIMEZONES])).filter(Boolean),
+    [profile.timezone],
+  )
+  const localeOptions = useMemo(
+    () => Array.from(new Set([profile.locale, ...LOCALES])).filter(Boolean),
+    [profile.locale],
+  )
+
+  const persistedProfile = currentUser ? profileFrom(currentUser) : EMPTY_PROFILE
+  const profileDirty = currentUser
+    ? profile.displayName.trim() !== persistedProfile.displayName
+      || profile.jobTitle.trim() !== persistedProfile.jobTitle
+      || profile.timezone !== persistedProfile.timezone
+      || profile.locale !== persistedProfile.locale
+    : false
 
   useEffect(() => {
     if (!open) return
-    setError('')
+
+    let active = true
+    setActiveTab(0)
+    setUsersPayload(null)
+    setWorkspacesPayload(null)
+    setProfile(EMPTY_PROFILE)
+    setInviteEmail('')
+    setCreateNames({ board: '', pipeline: '' })
+    setShareDrafts({})
     setNotice('')
-    loadUsers().catch((loadError) => setError(loadError instanceof Error ? loadError.message : 'Unable to load users'))
+    setError('')
+    setLoading(true)
+
+    Promise.allSettled([
+      requestJson<UsersPayload>('/api/users'),
+      requestJson<WorkspacesPayload>('/api/workspaces'),
+    ]).then(([usersResult, workspacesResult]) => {
+      if (!active) return
+      const loadErrors: string[] = []
+
+      if (usersResult.status === 'fulfilled') {
+        setUsersPayload(usersResult.value)
+        if (usersResult.value.currentUser) setProfile(profileFrom(usersResult.value.currentUser))
+      } else {
+        loadErrors.push(messageFrom(usersResult.reason, 'Unable to load users'))
+      }
+
+      if (workspacesResult.status === 'fulfilled') {
+        setWorkspacesPayload(workspacesResult.value)
+      } else {
+        loadErrors.push(messageFrom(workspacesResult.reason, 'Unable to load workspaces'))
+      }
+
+      setError(Array.from(new Set(loadErrors)).join(' '))
+      setLoading(false)
+    })
+
+    return () => { active = false }
   }, [open])
 
-  async function invite() {
-    const normalized = email.trim().toLowerCase()
-    if (!normalized.includes('@') || pending) return
-    setPending(true)
+  function startAction(key: string) {
+    setPendingAction(key)
     setError('')
     setNotice('')
+  }
+
+  function finishAction() {
+    setPendingAction(null)
+  }
+
+  function upsertUser(user: AppUser) {
+    setUsersPayload((current) => {
+      if (!current) return current
+      const existing = current.users || []
+      const users = existing.some((candidate) => candidate.email === user.email)
+        ? existing.map((candidate) => candidate.email === user.email ? user : candidate)
+        : [...existing, user]
+      return {
+        ...current,
+        currentUser: current.currentUser?.email === user.email ? user : current.currentUser,
+        users,
+      }
+    })
+    setWorkspacesPayload((current) => current ? {
+      ...current,
+      boards: current.boards?.map((resource) => ({
+        ...resource,
+        members: resource.members.map((member) => member.email === user.email
+          ? { ...member, displayName: user.displayName, status: user.status }
+          : member),
+      })),
+      pipelines: current.pipelines?.map((resource) => ({
+        ...resource,
+        members: resource.members.map((member) => member.email === user.email
+          ? { ...member, displayName: user.displayName, status: user.status }
+          : member),
+      })),
+    } : current)
+  }
+
+  async function saveProfile(event: FormEvent) {
+    event.preventDefault()
+    if (busy || !profile.displayName.trim()) return
+    startAction('profile')
     try {
-      const response = await fetch('/api/users', {
-        method: 'POST',
+      const result = await requestJson<UserMutationPayload>('/api/users', {
+        method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: normalized }),
+        body: JSON.stringify({
+          action: 'profile',
+          displayName: profile.displayName.trim(),
+          jobTitle: profile.jobTitle.trim(),
+          timezone: profile.timezone,
+          locale: profile.locale,
+        }),
       })
-      const result = await response.json().catch(() => ({})) as UsersPayload
-      if (!response.ok || !result.ok) throw new Error(result.error || 'Unable to invite user')
-      setEmail('')
-      setNotice(`Invitation sign-in code sent to ${normalized}.`)
-      await loadUsers()
-    } catch (inviteError) {
-      setError(inviteError instanceof Error ? inviteError.message : 'Unable to invite user')
+      if (!result.user) throw new Error('Profile response was incomplete')
+      upsertUser(result.user)
+      setProfile(profileFrom(result.user))
+      setNotice('Profile saved.')
+    } catch (saveError) {
+      setError(messageFrom(saveError, 'Unable to save profile'))
     } finally {
-      setPending(false)
+      finishAction()
     }
   }
 
-  async function updateStatus(user: AppUser) {
-    if (pending || user.role === 'owner') return
-    setPending(true)
-    setError('')
-    setNotice('')
-    const status = user.status === 'disabled' ? 'active' : 'disabled'
+  async function inviteUser(event: FormEvent) {
+    event.preventDefault()
+    const email = inviteEmail.trim().toLowerCase()
+    if (busy || !isEmail(email)) return
+    startAction('invite')
     try {
-      const response = await fetch('/api/users', {
+      const result = await requestJson<UserMutationPayload>('/api/users', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email }),
+      })
+      if (result.user) upsertUser(result.user)
+      setInviteEmail('')
+      setNotice(result.delivery === 'sent' ? `Invitation sent to ${email}.` : `${email} invited.`)
+    } catch (inviteError) {
+      setError(messageFrom(inviteError, 'Unable to invite user'))
+    } finally {
+      finishAction()
+    }
+  }
+
+  function canManageUser(user: AppUser) {
+    if (!usersPayload?.canManageUserAccess || !currentUser || user.role === 'owner') return false
+    if (currentUser.role === 'owner') return true
+    return currentUser.role === 'admin' && user.role === 'member' && user.email !== currentUser.email
+  }
+
+  async function updateStatus(user: AppUser) {
+    if (busy || !canManageUser(user)) return
+    const status: UserStatus = user.status === 'disabled' ? 'active' : 'disabled'
+    startAction(`status:${user.email}`)
+    try {
+      const result = await requestJson<UserMutationPayload>('/api/users', {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email: user.email, status }),
       })
-      const result = await response.json().catch(() => ({})) as UsersPayload
-      if (!response.ok || !result.ok) throw new Error(result.error || 'Unable to update user')
+      if (!result.user) throw new Error('User response was incomplete')
+      upsertUser(result.user)
       setNotice(status === 'active' ? `${user.email} restored.` : `${user.email} disabled.`)
-      await loadUsers()
     } catch (updateError) {
-      setError(updateError instanceof Error ? updateError.message : 'Unable to update user')
+      setError(messageFrom(updateError, 'Unable to update user'))
     } finally {
-      setPending(false)
+      finishAction()
     }
   }
+
+  async function updateAccess(user: AppUser, role: EditableRole, permissions: UserPermissions) {
+    if (busy || !canManageUser(user)) return
+    startAction(`access:${user.email}`)
+    try {
+      const result = await requestJson<UserMutationPayload>('/api/users', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'access', email: user.email, role, permissions }),
+      })
+      if (!result.user) throw new Error('User response was incomplete')
+      upsertUser(result.user)
+      setNotice(`Access updated for ${result.user.displayName || result.user.email}.`)
+    } catch (updateError) {
+      setError(messageFrom(updateError, 'Unable to update access'))
+    } finally {
+      finishAction()
+    }
+  }
+
+  async function mutateWorkspace(body: Record<string, unknown>, key: string, successMessage: string) {
+    if (busy) return false
+    startAction(key)
+    try {
+      const result = await requestJson<WorkspacesPayload>('/api/workspaces', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      setWorkspacesPayload(result)
+      setNotice(successMessage)
+      return true
+    } catch (workspaceError) {
+      setError(messageFrom(workspaceError, 'Unable to update sharing'))
+      return false
+    } finally {
+      finishAction()
+    }
+  }
+
+  async function createResource(kind: ResourceKind) {
+    const name = createNames[kind].trim()
+    if (!name) return
+    const created = await mutateWorkspace(
+      { action: kind === 'board' ? 'create-board' : 'create-pipeline', name },
+      `create:${kind}`,
+      `${kind === 'board' ? 'Board' : 'Pipeline'} created.`,
+    )
+    if (created) setCreateNames((current) => ({ ...current, [kind]: '' }))
+  }
+
+  function shareDraftKey(kind: ResourceKind, resourceId: string) {
+    return `${kind}:${resourceId}`
+  }
+
+  function shareDraft(kind: ResourceKind, resourceId: string) {
+    return shareDrafts[shareDraftKey(kind, resourceId)] || EMPTY_SHARE_DRAFT
+  }
+
+  function updateShareDraft(kind: ResourceKind, resourceId: string, patch: Partial<ShareDraft>) {
+    const key = shareDraftKey(kind, resourceId)
+    setShareDrafts((current) => ({
+      ...current,
+      [key]: { ...(current[key] || EMPTY_SHARE_DRAFT), ...patch },
+    }))
+  }
+
+  async function shareResource(kind: ResourceKind, resource: WorkspaceResource) {
+    const draft = shareDraft(kind, resource.id)
+    const email = draft.email.trim().toLowerCase()
+    if (!isEmail(email)) return
+    const shared = await mutateWorkspace(
+      {
+        action: kind === 'board' ? 'share-board' : 'share-pipeline',
+        [`${kind}Id`]: resource.id,
+        email,
+        accessRole: draft.accessRole,
+      },
+      `share:${kind}:${resource.id}`,
+      `${resource.name} shared with ${email}.`,
+    )
+    if (shared) updateShareDraft(kind, resource.id, { email: '', accessRole: 'viewer' })
+  }
+
+  async function changeShareRole(
+    kind: ResourceKind,
+    resource: WorkspaceResource,
+    member: SharedResourceMember,
+    accessRole: ShareAccessRole,
+  ) {
+    await mutateWorkspace(
+      {
+        action: kind === 'board' ? 'share-board' : 'share-pipeline',
+        [`${kind}Id`]: resource.id,
+        email: member.email,
+        accessRole,
+      },
+      `share-role:${kind}:${resource.id}:${member.email}`,
+      `Access updated for ${member.displayName || member.email}.`,
+    )
+  }
+
+  async function removeShare(kind: ResourceKind, resource: WorkspaceResource, member: SharedResourceMember) {
+    await mutateWorkspace(
+      {
+        action: kind === 'board' ? 'remove-board-share' : 'remove-pipeline-share',
+        [`${kind}Id`]: resource.id,
+        email: member.email,
+      },
+      `remove-share:${kind}:${resource.id}:${member.email}`,
+      `${member.email} removed from ${resource.name}.`,
+    )
+  }
+
+  const canCreateBoards = currentUser?.role === 'owner' || Boolean(currentUser?.permissions.createBoards)
+  const canCreatePipelines = currentUser?.role === 'owner' || Boolean(currentUser?.permissions.createPipelines)
+
+  const workspaceSections: Array<{
+    kind: ResourceKind
+    title: string
+    resources: WorkspaceResource[]
+    selectedId: string | null
+    canCreate: boolean
+  }> = [
+    {
+      kind: 'board',
+      title: 'Boards',
+      resources: workspacesPayload?.boards || [],
+      selectedId: workspacesPayload?.selectedBoardId || null,
+      canCreate: canCreateBoards,
+    },
+    {
+      kind: 'pipeline',
+      title: 'Pipelines',
+      resources: workspacesPayload?.pipelines || [],
+      selectedId: workspacesPayload?.selectedPipelineId || null,
+      canCreate: canCreatePipelines,
+    },
+  ]
 
   return (
     <Dialog
       open={open}
-      onClose={pending ? undefined : onClose}
+      onClose={() => { if (!busy) onClose() }}
+      aria-labelledby="settings-dialog-title"
       fullWidth
-      maxWidth="sm"
-      PaperProps={{ sx: { backgroundColor: '#1A1A23', border: '1px solid rgba(255,255,255,0.08)', borderRadius: 1 } }}
+      fullScreen={fullScreen}
+      maxWidth="md"
+      PaperProps={{
+        sx: {
+          width: '100%',
+          height: { xs: '100%', sm: 'min(780px, calc(100vh - 48px))' },
+          maxHeight: { xs: '100%', sm: 'calc(100vh - 48px)' },
+          backgroundColor: '#1A1A23',
+          backgroundImage: 'none',
+          border: '1px solid rgba(255,255,255,0.09)',
+          borderRadius: { xs: 0, sm: '8px' },
+          overflow: 'hidden',
+        },
+      }}
     >
-      <DialogTitle sx={{ color: 'text.primary', fontWeight: 700 }}>User access</DialogTitle>
-      <DialogContent>
-        {error ? <Alert severity="error" sx={{ mb: 2 }}>{error}</Alert> : null}
-        {notice ? <Alert severity="success" sx={{ mb: 2 }}>{notice}</Alert> : null}
-
-        {payload.canInvite ? (
-          <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} mb={2}>
-            <TextField
-              size="small"
-              type="email"
-              label="Email"
-              value={email}
-              onChange={(event) => setEmail(event.target.value)}
-              disabled={pending}
-              fullWidth
-            />
-            <Button
-              variant="contained"
-              startIcon={pending ? <CircularProgress size={16} color="inherit" /> : <PersonAddRounded />}
-              onClick={invite}
-              disabled={pending || !email.trim().includes('@')}
-              sx={{ whiteSpace: 'nowrap' }}
-            >
-              Invite user
-            </Button>
+      <Box sx={{ px: { xs: 2, sm: 3 }, pt: { xs: 1.5, sm: 2.25 }, pb: 1.5 }}>
+        <Box display="flex" alignItems="center" justifyContent="space-between" gap={2} mb={1.5}>
+          <Box minWidth={0}>
+            <Typography id="settings-dialog-title" variant="h6" color="text.primary" fontWeight={700}>Settings</Typography>
+            {currentUser ? (
+              <Typography variant="caption" color="text.disabled" sx={{ display: 'block', overflowWrap: 'anywhere' }}>
+                {currentUser.email}
+              </Typography>
+            ) : null}
+          </Box>
+          <Stack direction="row" spacing={0.5} alignItems="center">
+            {busy ? <CircularProgress size={18} /> : null}
+            <Tooltip title="Close settings">
+              <span>
+                <IconButton
+                  aria-label="Close settings"
+                  size="small"
+                  onClick={onClose}
+                  disabled={busy}
+                  sx={{ color: 'text.secondary' }}
+                >
+                  <CloseRounded fontSize="small" />
+                </IconButton>
+              </span>
+            </Tooltip>
           </Stack>
+        </Box>
+
+        <Tabs
+          value={activeTab}
+          onChange={(_, value: number) => setActiveTab(value)}
+          aria-label="Settings sections"
+          variant="fullWidth"
+          sx={{
+            minHeight: 42,
+            p: '3px',
+            borderRadius: '8px',
+            backgroundColor: '#232330',
+            '& .MuiTabs-indicator': { display: 'none' },
+            '& .MuiTab-root': {
+              minHeight: 36,
+              minWidth: 0,
+              borderRadius: '6px',
+              color: 'text.secondary',
+              textTransform: 'none',
+              fontWeight: 600,
+              fontSize: { xs: '0.78rem', sm: '0.875rem' },
+              gap: { xs: 0.5, sm: 0.75 },
+              px: { xs: 0.5, sm: 1.5 },
+            },
+            '& .MuiTab-root.Mui-selected': {
+              color: 'text.primary',
+              backgroundColor: 'rgba(168,199,250,0.12)',
+            },
+          }}
+        >
+          <Tab icon={<AccountCircleRounded sx={{ fontSize: 18 }} />} iconPosition="start" label="Profile" id="settings-tab-0" aria-controls="settings-panel-0" />
+          <Tab icon={<GroupRounded sx={{ fontSize: 18 }} />} iconPosition="start" label="People" id="settings-tab-1" aria-controls="settings-panel-1" />
+          <Tab icon={<ShareRounded sx={{ fontSize: 18 }} />} iconPosition="start" label="Sharing" id="settings-tab-2" aria-controls="settings-panel-2" />
+        </Tabs>
+      </Box>
+
+      <Divider sx={{ borderColor: 'rgba(255,255,255,0.07)' }} />
+
+      <DialogContent sx={{ px: { xs: 2, sm: 3 }, py: { xs: 2, sm: 2.5 } }}>
+        {error ? <Alert severity="error" onClose={() => setError('')} sx={{ mb: 2, borderRadius: '8px' }}>{error}</Alert> : null}
+        {notice ? <Alert severity="success" onClose={() => setNotice('')} sx={{ mb: 2, borderRadius: '8px' }}>{notice}</Alert> : null}
+
+        {loading ? (
+          <Box display="grid" sx={{ minHeight: 360, placeItems: 'center' }}>
+            <CircularProgress size={28} />
+          </Box>
         ) : null}
 
-        <Stack spacing={0}>
-          {(payload.users || []).map((user) => (
-            <Box
-              key={user.email}
-              sx={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto', alignItems: 'center', gap: 1, py: 1.25, borderBottom: '1px solid rgba(255,255,255,0.07)' }}
-            >
-              <Box minWidth={0}>
-                <Stack direction="row" spacing={0.75} alignItems="center" flexWrap="wrap">
-                  <PersonRounded sx={{ fontSize: 18, color: 'text.secondary' }} />
-                  <Typography variant="body2" color="text.primary" sx={{ overflowWrap: 'anywhere' }}>{user.email}</Typography>
-                  <Chip size="small" label={user.role} />
-                  <Chip size="small" color={user.status === 'active' ? 'success' : 'default'} label={user.status} />
+        {!loading && activeTab === 0 ? (
+          <Box
+            component="form"
+            role="tabpanel"
+            id="settings-panel-0"
+            aria-labelledby="settings-tab-0"
+            onSubmit={saveProfile}
+            sx={{ maxWidth: 720, mx: 'auto' }}
+          >
+            {currentUser ? (
+              <>
+                <Stack direction="row" spacing={1.5} alignItems="center" mb={2.5}>
+                  <Avatar sx={{ width: 44, height: 44, bgcolor: 'rgba(168,199,250,0.16)', color: 'primary.main', fontWeight: 700 }}>
+                    {initials(currentUser)}
+                  </Avatar>
+                  <Box minWidth={0}>
+                    <Typography variant="subtitle1" color="text.primary" fontWeight={700} noWrap>
+                      {currentUser.displayName || 'Profile'}
+                    </Typography>
+                    <Typography variant="body2" color="text.secondary" sx={{ overflowWrap: 'anywhere' }}>
+                      {roleLabel(currentUser.role)}
+                    </Typography>
+                  </Box>
                 </Stack>
-                {user.lastLoginAt ? (
-                  <Typography variant="caption" color="text.disabled">Last sign-in {new Date(user.lastLoginAt).toLocaleString()}</Typography>
-                ) : null}
+
+                <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', sm: '1fr 1fr' }, gap: 2 }}>
+                  <TextField
+                    required
+                    size="small"
+                    label="Display name"
+                    value={profile.displayName}
+                    onChange={(event) => setProfile((current) => ({ ...current, displayName: event.target.value }))}
+                    disabled={busy}
+                    inputProps={{ maxLength: 100 }}
+                    sx={fieldSx}
+                  />
+                  <TextField
+                    size="small"
+                    label="Job title"
+                    value={profile.jobTitle}
+                    onChange={(event) => setProfile((current) => ({ ...current, jobTitle: event.target.value }))}
+                    disabled={busy}
+                    inputProps={{ maxLength: 120 }}
+                    sx={fieldSx}
+                  />
+                  <TextField
+                    select
+                    size="small"
+                    label="Timezone"
+                    value={profile.timezone}
+                    onChange={(event) => setProfile((current) => ({ ...current, timezone: event.target.value }))}
+                    disabled={busy}
+                    sx={fieldSx}
+                  >
+                    {timezoneOptions.map((timezone) => <MenuItem key={timezone} value={timezone}>{timezone}</MenuItem>)}
+                  </TextField>
+                  <TextField
+                    select
+                    size="small"
+                    label="Locale"
+                    value={profile.locale}
+                    onChange={(event) => setProfile((current) => ({ ...current, locale: event.target.value }))}
+                    disabled={busy}
+                    sx={fieldSx}
+                  >
+                    {localeOptions.map((locale) => <MenuItem key={locale} value={locale}>{locale}</MenuItem>)}
+                  </TextField>
+                  <TextField
+                    size="small"
+                    label="Email"
+                    value={currentUser.email}
+                    disabled
+                    sx={{ ...fieldSx, gridColumn: { sm: '1 / -1' } }}
+                  />
+                </Box>
+
+                <Box display="flex" justifyContent="flex-end" mt={3}>
+                  <Button
+                    type="submit"
+                    variant="contained"
+                    startIcon={pendingAction === 'profile' ? <CircularProgress size={16} color="inherit" /> : <SaveRounded />}
+                    disabled={busy || !profile.displayName.trim() || !profileDirty}
+                    sx={compactButtonSx}
+                  >
+                    Save profile
+                  </Button>
+                </Box>
+              </>
+            ) : (
+              <Typography color="text.secondary">Profile unavailable.</Typography>
+            )}
+          </Box>
+        ) : null}
+
+        {!loading && activeTab === 1 ? (
+          <Box role="tabpanel" id="settings-panel-1" aria-labelledby="settings-tab-1">
+            {usersPayload?.isAdmin && usersPayload.canInvite ? (
+              <Box component="form" onSubmit={inviteUser} mb={2.5}>
+                <Typography variant="subtitle2" color="text.primary" fontWeight={700} mb={1}>Invite</Typography>
+                <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1}>
+                  <TextField
+                    required
+                    fullWidth
+                    size="small"
+                    type="email"
+                    label="Email"
+                    value={inviteEmail}
+                    onChange={(event) => setInviteEmail(event.target.value)}
+                    disabled={busy}
+                    sx={fieldSx}
+                  />
+                  <Button
+                    type="submit"
+                    variant="contained"
+                    startIcon={pendingAction === 'invite' ? <CircularProgress size={16} color="inherit" /> : <PersonAddRounded />}
+                    disabled={busy || !isEmail(inviteEmail)}
+                    sx={compactButtonSx}
+                  >
+                    Invite
+                  </Button>
+                </Stack>
               </Box>
-              {payload.canInvite && user.role !== 'owner' ? (
-                <Tooltip title={user.status === 'disabled' ? 'Restore access' : 'Disable access'}>
-                  <span>
-                    <IconButton size="small" onClick={() => updateStatus(user)} disabled={pending}>
-                      {user.status === 'disabled' ? <RestoreRounded /> : <PersonOffRounded />}
-                    </IconButton>
-                  </span>
-                </Tooltip>
+            ) : null}
+
+            <Stack spacing={1.5}>
+              {displayedUsers.map((user) => {
+                const manageable = canManageUser(user)
+                const canChangeRole = manageable && currentUser?.role === 'owner'
+                const userPending = pendingAction === `status:${user.email}` || pendingAction === `access:${user.email}`
+
+                return (
+                  <Box key={user.email} sx={panelSx}>
+                    <Box sx={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto', gap: 1.5, alignItems: 'start', p: { xs: 1.5, sm: 2 } }}>
+                      <Stack direction="row" spacing={1.25} alignItems="center" minWidth={0}>
+                        <Avatar sx={{ width: 38, height: 38, bgcolor: '#2D3442', color: 'primary.main', fontSize: '0.8rem', fontWeight: 700 }}>
+                          {initials(user)}
+                        </Avatar>
+                        <Box minWidth={0}>
+                          <Stack direction="row" spacing={0.75} alignItems="center" flexWrap="wrap" useFlexGap>
+                            <Typography variant="body2" color="text.primary" fontWeight={700} sx={{ overflowWrap: 'anywhere' }}>
+                              {user.displayName || user.email.split('@')[0]}
+                            </Typography>
+                            <Chip size="small" label={roleLabel(user.role)} sx={{ height: 24, minHeight: 24, fontSize: '0.7rem' }} />
+                            <Chip
+                              size="small"
+                              color={user.status === 'active' ? 'success' : user.status === 'invited' ? 'warning' : 'default'}
+                              label={statusLabel(user.status)}
+                              sx={{ height: 24, minHeight: 24, fontSize: '0.7rem' }}
+                            />
+                          </Stack>
+                          <Typography variant="caption" color="text.secondary" sx={{ display: 'block', overflowWrap: 'anywhere' }}>
+                            {user.email}
+                          </Typography>
+                          {user.jobTitle || user.lastLoginAt ? (
+                            <Typography variant="caption" color="text.disabled" sx={{ display: 'block' }}>
+                              {user.jobTitle || `Last sign-in ${new Date(user.lastLoginAt as string).toLocaleString()}`}
+                            </Typography>
+                          ) : null}
+                        </Box>
+                      </Stack>
+
+                      {manageable ? (
+                        <Tooltip title={user.status === 'disabled' ? 'Restore access' : 'Disable access'}>
+                          <span>
+                            <IconButton
+                              aria-label={user.status === 'disabled' ? `Restore ${user.email}` : `Disable ${user.email}`}
+                              size="small"
+                              onClick={() => { void updateStatus(user) }}
+                              disabled={busy}
+                              sx={{ color: user.status === 'disabled' ? 'primary.main' : 'text.secondary' }}
+                            >
+                              {pendingAction === `status:${user.email}`
+                                ? <CircularProgress size={18} />
+                                : user.status === 'disabled' ? <RestoreRounded fontSize="small" /> : <PersonOffRounded fontSize="small" />}
+                            </IconButton>
+                          </span>
+                        </Tooltip>
+                      ) : userPending ? <CircularProgress size={18} /> : null}
+                    </Box>
+
+                    <Divider sx={{ borderColor: 'rgba(255,255,255,0.07)' }} />
+
+                    <Box sx={{ p: { xs: 1.5, sm: 2 }, pt: { xs: 1.25, sm: 1.5 } }}>
+                      <Box display="flex" alignItems="center" justifyContent="space-between" gap={1.5} mb={0.75}>
+                        <Typography variant="caption" color="text.disabled" fontWeight={700}>Permissions</Typography>
+                        {canChangeRole ? (
+                          <TextField
+                            select
+                            size="small"
+                            label="Role"
+                            value={user.role === 'owner' ? 'admin' : user.role}
+                            onChange={(event) => {
+                              const role = event.target.value as EditableRole
+                              const permissions = role === 'admin'
+                                ? { ...user.permissions, inviteUsers: true, manageUserAccess: true }
+                                : { ...user.permissions, inviteUsers: false, manageUserAccess: false }
+                              void updateAccess(user, role, permissions)
+                            }}
+                            disabled={busy}
+                            sx={{ ...fieldSx, width: 132 }}
+                          >
+                            <MenuItem value="admin">Admin</MenuItem>
+                            <MenuItem value="member">Member</MenuItem>
+                          </TextField>
+                        ) : null}
+                      </Box>
+
+                      <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', sm: '1fr 1fr' }, columnGap: 2, rowGap: 0 }}>
+                        {PERMISSIONS.map((permission) => {
+                          const permissionEditable = manageable && (!permission.adminOnly || user.role === 'admin')
+                          return (
+                            <FormControlLabel
+                              key={permission.key}
+                              label={permission.label}
+                              labelPlacement="start"
+                              control={(
+                                <Switch
+                                  size="small"
+                                  checked={Boolean(user.permissions[permission.key])}
+                                  onChange={(event) => {
+                                    void updateAccess(user, user.role as EditableRole, {
+                                      ...user.permissions,
+                                      [permission.key]: event.target.checked,
+                                    })
+                                  }}
+                                  disabled={busy || !permissionEditable}
+                                  inputProps={{ 'aria-label': `${permission.label} for ${user.email}` }}
+                                />
+                              )}
+                              sx={{
+                                m: 0,
+                                minHeight: 38,
+                                justifyContent: 'space-between',
+                                gap: 1,
+                                '& .MuiFormControlLabel-label': { fontSize: '0.82rem', color: 'text.secondary' },
+                              }}
+                            />
+                          )
+                        })}
+                      </Box>
+                    </Box>
+                  </Box>
+                )
+              })}
+
+              {displayedUsers.length === 0 ? (
+                <Typography variant="body2" color="text.secondary">Account unavailable.</Typography>
               ) : null}
-            </Box>
-          ))}
-        </Stack>
+            </Stack>
+          </Box>
+        ) : null}
+
+        {!loading && activeTab === 2 ? (
+          <Box role="tabpanel" id="settings-panel-2" aria-labelledby="settings-tab-2">
+            <Stack spacing={3}>
+              {workspaceSections.map((section) => (
+                <Box component="section" key={section.kind}>
+                  <Box display="flex" alignItems="center" justifyContent="space-between" gap={2} mb={1.25}>
+                    <Stack direction="row" spacing={0.75} alignItems="center">
+                      {section.kind === 'board'
+                        ? <ViewKanbanRounded sx={{ fontSize: 19, color: 'text.secondary' }} />
+                        : <TableChartRounded sx={{ fontSize: 19, color: 'text.secondary' }} />}
+                      <Typography variant="subtitle2" color="text.primary" fontWeight={700}>{section.title}</Typography>
+                    </Stack>
+                  </Box>
+
+                  {section.canCreate ? (
+                    <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} mb={1.5}>
+                      <TextField
+                        fullWidth
+                        size="small"
+                        label={section.kind === 'board' ? 'Board name' : 'Pipeline name'}
+                        value={createNames[section.kind]}
+                        onChange={(event) => setCreateNames((current) => ({ ...current, [section.kind]: event.target.value }))}
+                        onKeyDown={(event) => {
+                          if (event.key === 'Enter') {
+                            event.preventDefault()
+                            void createResource(section.kind)
+                          }
+                        }}
+                        disabled={busy}
+                        inputProps={{ maxLength: 100 }}
+                        sx={fieldSx}
+                      />
+                      <Button
+                        variant="outlined"
+                        startIcon={pendingAction === `create:${section.kind}` ? <CircularProgress size={16} /> : <AddRounded />}
+                        onClick={() => { void createResource(section.kind) }}
+                        disabled={busy || !createNames[section.kind].trim()}
+                        sx={compactButtonSx}
+                      >
+                        Create
+                      </Button>
+                    </Stack>
+                  ) : null}
+
+                  <Stack spacing={1.25}>
+                    {section.resources.map((resource) => {
+                      const owned = resource.ownerEmail === currentUser?.email && resource.accessRole === 'owner'
+                      const draft = shareDraft(section.kind, resource.id)
+                      const pipeline = 'sheetBacked' in resource ? resource as PipelineResource : null
+                      const suggestions = eligibleShareEmails.filter((email) => !resource.members.some((member) => member.email === email))
+                      const shareKey = `share:${section.kind}:${resource.id}`
+
+                      return (
+                        <Box key={resource.id} sx={panelSx}>
+                          <Box sx={{ p: { xs: 1.5, sm: 2 } }}>
+                            <Box sx={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto', gap: 1, alignItems: 'start' }}>
+                              <Box minWidth={0}>
+                                <Stack direction="row" spacing={0.75} alignItems="center" flexWrap="wrap" useFlexGap>
+                                  <Typography variant="body2" color="text.primary" fontWeight={700} sx={{ overflowWrap: 'anywhere' }}>
+                                    {resource.name}
+                                  </Typography>
+                                  {section.selectedId === resource.id ? <Chip size="small" label="Current" color="primary" sx={{ height: 24, minHeight: 24, fontSize: '0.7rem' }} /> : null}
+                                  {resource.isDefault ? <Chip size="small" label="Default" sx={{ height: 24, minHeight: 24, fontSize: '0.7rem' }} /> : null}
+                                  <Chip size="small" label={resource.accessRole.charAt(0).toUpperCase() + resource.accessRole.slice(1)} sx={{ height: 24, minHeight: 24, fontSize: '0.7rem' }} />
+                                </Stack>
+                                <Typography variant="caption" color="text.disabled" sx={{ display: 'block', overflowWrap: 'anywhere' }}>
+                                  Owner · {resource.ownerEmail}
+                                </Typography>
+                              </Box>
+                              {pendingAction?.includes(`:${section.kind}:${resource.id}`) ? <CircularProgress size={18} /> : null}
+                            </Box>
+
+                            {pipeline ? (
+                              <Stack direction="row" spacing={0.75} mt={1} flexWrap="wrap" useFlexGap>
+                                <Chip size="small" variant="outlined" label={pipeline.sheetBacked ? 'Sheet-backed' : 'App data'} sx={{ height: 24, minHeight: 24, fontSize: '0.7rem' }} />
+                                <Chip size="small" variant="outlined" label={pipeline.syncEnabled ? 'Sync on' : 'Sync off'} sx={{ height: 24, minHeight: 24, fontSize: '0.7rem' }} />
+                              </Stack>
+                            ) : null}
+                          </Box>
+
+                          {owned ? (
+                            <>
+                              <Divider sx={{ borderColor: 'rgba(255,255,255,0.07)' }} />
+                              <Box sx={{ p: { xs: 1.5, sm: 2 } }}>
+                                <Typography variant="caption" color="text.disabled" fontWeight={700}>Share</Typography>
+                                <Box
+                                  sx={{
+                                    display: 'grid',
+                                    gridTemplateColumns: { xs: '1fr', sm: 'minmax(0, 1fr) 132px auto' },
+                                    gap: 1,
+                                    mt: 1,
+                                  }}
+                                >
+                                  <TextField
+                                    size="small"
+                                    type="email"
+                                    label="User email"
+                                    value={draft.email}
+                                    onChange={(event) => updateShareDraft(section.kind, resource.id, { email: event.target.value })}
+                                    disabled={busy}
+                                    inputProps={{ list: `share-users-${resource.id}` }}
+                                    sx={fieldSx}
+                                  />
+                                  <datalist id={`share-users-${resource.id}`}>
+                                    {suggestions.map((email) => <option key={email} value={email} />)}
+                                  </datalist>
+                                  <TextField
+                                    select
+                                    size="small"
+                                    label="Access"
+                                    value={draft.accessRole}
+                                    onChange={(event) => updateShareDraft(section.kind, resource.id, { accessRole: event.target.value as ShareAccessRole })}
+                                    disabled={busy}
+                                    sx={fieldSx}
+                                  >
+                                    <MenuItem value="viewer">Viewer</MenuItem>
+                                    <MenuItem value="editor">Editor</MenuItem>
+                                  </TextField>
+                                  <Button
+                                    variant="contained"
+                                    startIcon={pendingAction === shareKey ? <CircularProgress size={16} color="inherit" /> : <ShareRounded />}
+                                    onClick={() => { void shareResource(section.kind, resource) }}
+                                    disabled={busy || !isEmail(draft.email)}
+                                    sx={compactButtonSx}
+                                  >
+                                    Share
+                                  </Button>
+                                </Box>
+                              </Box>
+                            </>
+                          ) : null}
+
+                          {owned ? <>
+                            <Divider sx={{ borderColor: 'rgba(255,255,255,0.07)' }} />
+
+                            <Box sx={{ px: { xs: 1.5, sm: 2 }, py: 0.5 }}>
+                            {resource.members.length > 0 ? resource.members.map((member, index) => (
+                              <Box
+                                key={member.email}
+                                sx={{
+                                  display: 'grid',
+                                  gridTemplateColumns: owned
+                                    ? { xs: 'minmax(0, 1fr) auto', sm: 'minmax(0, 1fr) 120px auto' }
+                                    : 'minmax(0, 1fr) auto',
+                                  gridTemplateAreas: owned
+                                    ? { xs: '"identity identity" "access remove"', sm: '"identity access remove"' }
+                                    : '"identity access"',
+                                  alignItems: 'center',
+                                  gap: 1,
+                                  py: 1.25,
+                                  borderTop: index === 0 ? 0 : '1px solid rgba(255,255,255,0.06)',
+                                }}
+                              >
+                                <Box minWidth={0} sx={{ gridArea: 'identity' }}>
+                                  <Typography variant="body2" color="text.primary" sx={{ overflowWrap: 'anywhere' }}>
+                                    {member.displayName || member.email}
+                                  </Typography>
+                                  <Typography variant="caption" color="text.disabled" sx={{ display: 'block', overflowWrap: 'anywhere' }}>
+                                    {member.displayName ? member.email : statusLabel(member.status)}
+                                    {member.displayName ? ` · ${statusLabel(member.status)}` : ''}
+                                  </Typography>
+                                </Box>
+
+                                {owned ? (
+                                  <TextField
+                                    select
+                                    size="small"
+                                    aria-label={`Access for ${member.email}`}
+                                    value={member.accessRole}
+                                    onChange={(event) => { void changeShareRole(section.kind, resource, member, event.target.value as ShareAccessRole) }}
+                                    disabled={busy || member.status === 'disabled'}
+                                    sx={{ ...fieldSx, minWidth: 110, gridArea: 'access' }}
+                                  >
+                                    <MenuItem value="viewer">Viewer</MenuItem>
+                                    <MenuItem value="editor">Editor</MenuItem>
+                                  </TextField>
+                                ) : (
+                                  <Chip
+                                    size="small"
+                                    label={member.accessRole === 'editor' ? 'Editor' : 'Viewer'}
+                                    sx={{ height: 24, minHeight: 24, fontSize: '0.7rem', justifySelf: 'end', gridArea: 'access' }}
+                                  />
+                                )}
+
+                                {owned ? (
+                                  <Tooltip title="Remove access">
+                                    <Box component="span" sx={{ gridArea: 'remove' }}>
+                                      <IconButton
+                                        aria-label={`Remove ${member.email} from ${resource.name}`}
+                                        size="small"
+                                        onClick={() => { void removeShare(section.kind, resource, member) }}
+                                        disabled={busy}
+                                        sx={{ color: 'text.secondary' }}
+                                      >
+                                        {pendingAction === `remove-share:${section.kind}:${resource.id}:${member.email}`
+                                          ? <CircularProgress size={17} />
+                                          : <DeleteOutlineRounded fontSize="small" />}
+                                      </IconButton>
+                                    </Box>
+                                  </Tooltip>
+                                ) : null}
+                              </Box>
+                            )) : (
+                              <Typography variant="body2" color="text.disabled" sx={{ py: 1.25 }}>
+                                No shared access
+                              </Typography>
+                            )}
+                            </Box>
+                          </> : null}
+                        </Box>
+                      )
+                    })}
+
+                    {section.resources.length === 0 ? (
+                      <Typography variant="body2" color="text.secondary">No {section.title.toLowerCase()} available.</Typography>
+                    ) : null}
+                  </Stack>
+                </Box>
+              ))}
+            </Stack>
+          </Box>
+        ) : null}
       </DialogContent>
-      <DialogActions sx={{ px: 3, pb: 2 }}>
-        <Button onClick={onClose} disabled={pending} sx={{ color: 'text.secondary' }}>Close</Button>
-      </DialogActions>
     </Dialog>
   )
 }

@@ -84,6 +84,8 @@ for (const requiredPath of [
   'db/migrations/0004_agent_chatgpt_auth.sql',
   'db/migrations/0005_app_users.sql',
   'db/migrations/0006_agent_user_attribution.sql',
+  'db/migrations/0007_multi_tenant_workspaces.sql',
+  'db/migrations/0008_workspace_security_hardening.sql',
   'scripts/start-railway.sh',
   'scripts/pipeline-outbox-poller.mjs',
   'scripts/smoke-deployed-runtime.mjs',
