@@ -18,7 +18,6 @@ const DROPDOWN_TAB = process.env.PIPELINE_DROPDOWN_TAB || 'Dropdowns'
 // Jarrett-confirmed layout (column-per-dropdown):
 // headers on row 4, options start on row 5
 const HEADER_ROW = Number(process.env.PIPELINE_DROPDOWN_HEADER_ROW || 4)
-const OPTIONS_START_ROW = Number(process.env.PIPELINE_DROPDOWN_OPTIONS_START_ROW || 5)
 const START_COL_LETTER = process.env.PIPELINE_DROPDOWN_START_COL || 'B'
 const END_COL_LETTER = process.env.PIPELINE_DROPDOWN_END_COL || 'ZZ'
 

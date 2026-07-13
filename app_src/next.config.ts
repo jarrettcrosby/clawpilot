@@ -1,6 +1,20 @@
 import type { NextConfig } from "next";
+import path from "path";
 
 const nextConfig: NextConfig = {
+  outputFileTracingRoot: path.resolve(process.cwd(), '..'),
+  outputFileTracingIncludes: {
+    '/api/docs': [
+      '../docs/**/*.md',
+      '../README.md',
+      '../CONTRIBUTING.md',
+      '../PRODUCT_REQUIREMENTS.md',
+      '../REQUIREMENTS_TRACEABILITY.md',
+      '../USER_GUIDE.md',
+      '../SPEC.md',
+      '../AGENT_MEMORY.md',
+    ],
+  },
   allowedDevOrigins: [
     '192.168.4.48',
     '192.168.4.*',

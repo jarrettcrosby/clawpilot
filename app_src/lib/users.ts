@@ -24,6 +24,8 @@ export type AppUserPermissions = {
   manageUserAccess: boolean
   createBoards: boolean
   createPipelines: boolean
+  viewFullReleaseHistory: boolean
+  manageBackups: boolean
 }
 
 export const MEMBER_PERMISSIONS: AppUserPermissions = {
@@ -31,6 +33,8 @@ export const MEMBER_PERMISSIONS: AppUserPermissions = {
   manageUserAccess: false,
   createBoards: true,
   createPipelines: true,
+  viewFullReleaseHistory: false,
+  manageBackups: false,
 }
 
 export const OWNER_PERMISSIONS: AppUserPermissions = {
@@ -38,6 +42,8 @@ export const OWNER_PERMISSIONS: AppUserPermissions = {
   manageUserAccess: true,
   createBoards: true,
   createPipelines: true,
+  viewFullReleaseHistory: true,
+  manageBackups: true,
 }
 
 export type AppUser = {
@@ -55,6 +61,11 @@ export type AppUser = {
   lastLoginAt: string | null
   createdAt: string
   updatedAt: string
+}
+
+export type InviteAppUserResult = {
+  user: AppUser
+  created: boolean
 }
 
 type AppUserRow = {
@@ -93,19 +104,33 @@ function normalizePermissions(value: unknown): AppUserPermissions {
     manageUserAccess: input.manageUserAccess === true,
     createBoards: input.createBoards !== false,
     createPipelines: input.createPipelines !== false,
+    viewFullReleaseHistory: input.viewFullReleaseHistory === true,
+    manageBackups: input.manageBackups === true,
   }
 }
 
+function permissionsForRole(role: AppUserRole, value: unknown): AppUserPermissions {
+  if (role === 'owner') return { ...OWNER_PERMISSIONS }
+  const permissions = normalizePermissions(value)
+  if (role === 'member') {
+    permissions.inviteUsers = false
+    permissions.manageUserAccess = false
+    permissions.viewFullReleaseHistory = false
+    permissions.manageBackups = false
+  }
+  return permissions
+}
+
 export function effectiveUserPermissions(user: Pick<AppUser, 'role' | 'permissions'>): AppUserPermissions {
-  return user.role === 'owner' ? { ...OWNER_PERMISSIONS } : normalizePermissions(user.permissions)
+  return permissionsForRole(user.role, user.permissions)
 }
 
 export function canInviteUsers(user: Pick<AppUser, 'role' | 'permissions'>): boolean {
-  return effectiveUserPermissions(user).inviteUsers
+  return (user.role === 'owner' || user.role === 'admin') && effectiveUserPermissions(user).inviteUsers
 }
 
 export function canManageUserAccess(user: Pick<AppUser, 'role' | 'permissions'>): boolean {
-  return effectiveUserPermissions(user).manageUserAccess
+  return (user.role === 'owner' || user.role === 'admin') && effectiveUserPermissions(user).manageUserAccess
 }
 
 function toAppUser(row: AppUserRow): AppUser {
@@ -117,7 +142,7 @@ function toAppUser(row: AppUserRow): AppUser {
     jobTitle: row.job_title,
     timezone: row.timezone || 'America/New_York',
     locale: row.locale || 'en-US',
-    permissions: row.role === 'owner' ? { ...OWNER_PERMISSIONS } : normalizePermissions(row.permissions),
+    permissions: permissionsForRole(row.role, row.permissions),
     invitedBy: row.invited_by,
     invitedAt: row.invited_at,
     activatedAt: row.activated_at,
@@ -174,21 +199,25 @@ export async function listAppUsers(actorEmailValue: unknown): Promise<{ actor: A
   return { actor, users: result.rows.map(toAppUser) }
 }
 
-export async function inviteAppUser(input: { actorEmail: unknown; email: unknown }): Promise<AppUser> {
+export async function inviteAppUser(input: { actorEmail: unknown; email: unknown }): Promise<InviteAppUserResult> {
   const actor = await requireActiveAppUser(input.actorEmail)
   if (!canInviteUsers(actor)) throw new AppUserAuthorizationError('You do not have permission to invite users')
   const email = normalizeUserEmail(input.email)
-  if (email === actor.email) return actor
+  if (email === actor.email) return { user: actor, created: false }
 
   return withTransaction(async (client) => {
     const existing = await client.query<AppUserRow>('SELECT * FROM app_users WHERE email = $1 FOR UPDATE', [email])
     const current = existing.rows[0]
     if (current?.role === 'owner') throw new Error('The owner already has access')
     if (current?.role === 'admin' && actor.role !== 'owner') throw new AppUserAuthorizationError('Only the owner can invite administrators')
-    if (current?.status === 'disabled' && !canManageUserAccess(actor)) {
-      throw new AppUserAuthorizationError('You do not have permission to restore disabled users')
+    if (current?.status === 'disabled') {
+      if (!canManageUserAccess(actor)) {
+        throw new AppUserAuthorizationError('You do not have permission to restore disabled users')
+      }
+      throw new AppUserAuthorizationError('Restore the disabled user before sending a new invitation')
     }
-    if (current?.status === 'active') return toAppUser(current)
+    if (current?.status === 'active') return { user: toAppUser(current), created: false }
+    if (current?.status === 'invited') return { user: toAppUser(current), created: false }
 
     const result = await client.query<AppUserRow>(
       `
@@ -205,7 +234,7 @@ export async function inviteAppUser(input: { actorEmail: unknown; email: unknown
       `,
       [email, actor.email, JSON.stringify(MEMBER_PERMISSIONS)],
     )
-    return toAppUser(result.rows[0])
+    return { user: toAppUser(result.rows[0]), created: !current }
   })
 }
 
@@ -223,6 +252,9 @@ export async function setAppUserStatus(input: {
   if (!target) throw new AppUserNotFoundError()
   if (target.role === 'owner') throw new AppUserAuthorizationError('The owner account cannot be changed')
   if (actor.role !== 'owner' && target.role !== 'member') throw new AppUserAuthorizationError('Only the owner can manage administrators')
+  if (input.status === 'active' && target.status === 'invited') {
+    throw new AppUserAuthorizationError('Invited users must accept their welcome link before activation')
+  }
 
   const result = await query<AppUserRow>(
     `
@@ -316,7 +348,7 @@ export async function updateAppUserAccess(input: {
     ? role === 'admin' ? { ...OWNER_PERMISSIONS } : { ...MEMBER_PERMISSIONS }
     : target.permissions
   const requested = input.permissions && typeof input.permissions === 'object' ? input.permissions : {}
-  const permissions = normalizePermissions({ ...base, ...requested })
+  const permissions = permissionsForRole(role, { ...base, ...requested })
   const result = await query<AppUserRow>(
     `
       UPDATE app_users

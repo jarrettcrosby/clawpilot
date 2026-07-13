@@ -40,25 +40,25 @@ if (!existsSync(resolve(root, 'app_src/package.json'))) {
   fail('missing app_src/package.json')
 }
 
-if (!existsSync(resolve(root, 'vercel.json'))) {
-  fail('missing vercel.json')
+if (!existsSync(resolve(root, 'app_src/vercel.json'))) {
+  fail('missing app_src/vercel.json')
 }
 
 if (!existsSync(resolve(root, 'railway.json'))) {
   fail('missing railway.json')
 }
 
-const vercel = readJson('vercel.json')
+const vercel = readJson('app_src/vercel.json')
 if (String(vercel.installCommand || '') !== 'npm ci') {
-  fail('vercel.json installCommand must be "npm ci"')
+  fail('app_src/vercel.json installCommand must be "npm ci"')
 }
 
-if (String(vercel.buildCommand || '') !== 'npm run build') {
-  fail('vercel.json buildCommand must be "npm run build"')
+if (String(vercel.buildCommand || '') !== 'npm run build:vercel') {
+  fail('app_src/vercel.json buildCommand must be "npm run build:vercel"')
 }
 
 if (String(vercel.outputDirectory || '') !== '.next') {
-  fail('vercel.json outputDirectory must be ".next"')
+  fail('app_src/vercel.json outputDirectory must be ".next"')
 }
 
 if (!existsSync(resolve(root, 'app_src/package-lock.json'))) {
@@ -74,8 +74,23 @@ if (!String(railway?.deploy?.startCommand || '').includes('npm run start:railway
   fail('railway.json deploy.startCommand must use "npm run start:railway"')
 }
 
-if (String(railway?.deploy?.preDeployCommand || '') !== 'npm run db:migrate') {
+if (!String(railway?.deploy?.preDeployCommand || '').includes('npm run db:migrate')) {
   fail('railway.json deploy.preDeployCommand must run "npm run db:migrate"')
+}
+
+if (!String(railway?.deploy?.preDeployCommand || '').includes('npm run mail:verify')) {
+  fail('railway.json deploy.preDeployCommand must verify the configured mail sender')
+}
+
+const railwayStart = readFileSync(resolve(root, 'scripts/start-railway.sh'), 'utf8')
+if (!railwayStart.includes('npm run release:record')) {
+  fail('scripts/start-railway.sh must record a release after runtime health validation')
+}
+
+const healthGatePosition = railwayStart.indexOf('[[ "$HEALTHY" == "1" ]]')
+const releaseRecordPosition = railwayStart.indexOf('npm run release:record')
+if (healthGatePosition < 0 || releaseRecordPosition < healthGatePosition) {
+  fail('scripts/start-railway.sh must record releases only after runtime health validation')
 }
 
 for (const requiredPath of [
@@ -87,9 +102,19 @@ for (const requiredPath of [
   'db/migrations/0006_agent_user_attribution.sql',
   'db/migrations/0007_multi_tenant_workspaces.sql',
   'db/migrations/0008_workspace_security_hardening.sql',
+  'db/migrations/0010_user_invitations.sql',
+  'db/migrations/0011_knowledge_releases_checkpoints.sql',
+  'db/migrations/0012_invitation_release_hardening.sql',
+  'db/migrations/0013_invitation_delivery_coordination.sql',
+  'db/migrations/0014_invitation_delivery_pending.sql',
   'scripts/start-railway.sh',
   'scripts/pipeline-outbox-poller.mjs',
   'scripts/smoke-deployed-runtime.mjs',
+  'scripts/record-release.mjs',
+  'scripts/vercel-build.mjs',
+  'scripts/verify-mail-sender.mjs',
+  'docs/index.md',
+  'docs/releases/catalog.json',
   'app_src/proxy.ts',
   'app_src/app/api/auth/magic/request/route.ts',
   'app_src/app/api/auth/magic/verify/route.ts',
@@ -98,6 +123,9 @@ for (const requiredPath of [
   'app_src/app/api/agents/dispatch/process/route.ts',
   'app_src/lib/agentDispatchWorker.ts',
   'app_src/app/api/users/route.ts',
+  'app_src/app/api/invitations/accept/route.ts',
+  'app_src/app/api/docs/route.ts',
+  'app_src/app/api/versions/route.ts',
   'app_src/app/api/pipeline/sync/outbox/process/route.ts',
 ]) {
   if (!existsSync(resolve(root, requiredPath))) {

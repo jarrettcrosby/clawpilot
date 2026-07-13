@@ -1,334 +1,184 @@
 'use client'
 
 import { useEffect, useMemo, useState } from 'react'
-import useMediaQuery from '@mui/material/useMediaQuery'
-import { useTheme } from '@mui/material/styles'
 import Box from '@mui/material/Box'
-import Typography from '@mui/material/Typography'
-import Stack from '@mui/material/Stack'
+import Button from '@mui/material/Button'
+import ButtonBase from '@mui/material/ButtonBase'
 import Chip from '@mui/material/Chip'
 import CircularProgress from '@mui/material/CircularProgress'
 import Divider from '@mui/material/Divider'
-import Button from '@mui/material/Button'
-import ButtonBase from '@mui/material/ButtonBase'
-import ViewKanbanRounded from '@mui/icons-material/ViewKanbanRounded'
-import DescriptionRounded from '@mui/icons-material/DescriptionRounded'
-import TrendingUpRounded from '@mui/icons-material/TrendingUpRounded'
+import Stack from '@mui/material/Stack'
+import Typography from '@mui/material/Typography'
 import CheckCircleRounded from '@mui/icons-material/CheckCircleRounded'
+import DescriptionRounded from '@mui/icons-material/DescriptionRounded'
+import PriorityHighRounded from '@mui/icons-material/PriorityHighRounded'
 import RadioButtonUncheckedRounded from '@mui/icons-material/RadioButtonUncheckedRounded'
-import FlagRounded from '@mui/icons-material/FlagRounded'
+import SmartToyRounded from '@mui/icons-material/SmartToyRounded'
+import TrendingUpRounded from '@mui/icons-material/TrendingUpRounded'
+import ViewKanbanRounded from '@mui/icons-material/ViewKanbanRounded'
 import WbSunnyRounded from '@mui/icons-material/WbSunnyRounded'
-import type { Task } from '@/lib/types'
 import { queueAgentTaskOpen } from '@/lib/agents/navigation'
-import { PRIORITY_COLORS } from '@/lib/types'
-import { deriveTaskRealityState } from '@/lib/taskRealityState'
-import { deriveNextActionGuidance, deriveStateTruth } from '@/lib/workItemModel'
 import { deriveLiveState, formatLiveActivityAge } from '@/lib/liveState'
 import { deriveNowWorking } from '@/lib/nowWorking'
+import type { Task } from '@/lib/types'
+import { deriveNextActionGuidance, deriveStateTruth } from '@/lib/workItemModel'
 
-type DocMeta = { id: string; title: string; category: string; date: string }
-type ExecutionSummary = { count: number; last: { status?: string; name?: string } | null }
-type NightlyStatusSummary = {
-  run: { status?: string } | null
-  briefing: { name?: string } | null
+type DocMeta = {
+  id: string
+  title: string
+  category: string
+  date: string
+  slug: string
 }
 
-type TaskCreationAuditSummary = {
-  created24h: number
-  lastCreated: {
-    timestamp: string | null
-    source: string | null
-    actor: string | null
-    taskId: string | null
-    title: string | null
-    anomaly: boolean
-    recentCreatesInLastMinute?: number
-  } | null
+type ExecutionSummary = { count: number }
+type UserSummary = { displayName?: string | null; email?: string }
+type Filter = { priority: string[]; status: string[]; labels: string[] }
+type Props = {
+  onNavigate: (section: string) => void
+  onNavigateWithFilter?: (section: string, filter?: Filter) => void
 }
 
-const STATUS_ORDER = ['in-progress', 'todo', 'review', 'backlog', 'done']
 const STATUS_LABELS: Record<string, string> = {
+  backlog: 'Backlog',
+  todo: 'To Do',
   'in-progress': 'In Progress',
-  'todo': 'To Do',
-  'review': 'Review',
-  'backlog': 'Backlog',
-  'done': 'Done',
+  review: 'Review',
+  done: 'Done',
 }
+
+const STATUS_ORDER = ['in-progress', 'todo', 'review', 'backlog']
 const STATUS_COLORS: Record<string, string> = {
   'in-progress': '#A8C7FA',
-  'todo': '#CFC6EA',
-  'review': '#FFA726',
-  'backlog': 'rgba(255,255,255,0.3)',
-  'done': '#66BB6A',
+  todo: '#CFC6EA',
+  review: '#FFA726',
+  backlog: 'rgba(255,255,255,0.35)',
 }
 
-const BOARD_RANK: Record<string, number> = {
-  'in-progress': 40,
-  'todo': 30,
-  'review': 20,
-  'backlog': 10,
-  'done': 0,
-}
-const PRIORITY_RANK: Record<string, number> = { high: 35, medium: 20, low: 10 }
-const EXECUTION_RANK: Record<string, number> = {
-  blocked: 35,
-  awaiting_input: 30,
-  queued: 22,
-  running: 18,
-  completed: 6,
+function greeting() {
+  const hour = new Date().getHours()
+  if (hour < 12) return { text: 'Good morning', color: '#FDD663' }
+  if (hour < 17) return { text: 'Good afternoon', color: '#FFA726' }
+  return { text: 'Good evening', color: '#CFC6EA' }
 }
 
-function dueScore(dueDate?: string) {
-  if (!dueDate) return 0
-  const today = new Date()
-  const due = new Date(`${dueDate}T23:59:59`)
-  const days = Math.floor((due.getTime() - today.getTime()) / (24 * 60 * 60 * 1000))
-  if (days <= 0) return 35
-  if (days <= 2) return 24
-  if (days <= 7) return 15
-  return 6
-}
-
-function assignedLabel(agent?: string) {
+function ownerLabel(agent?: string) {
   if (!agent) return 'Unassigned'
   return agent.charAt(0).toUpperCase() + agent.slice(1)
 }
 
-function formatAgeSince(timestamp: string | null) {
-  if (!timestamp) return null
-  const ms = Date.now() - new Date(timestamp).getTime()
-  if (!Number.isFinite(ms) || ms < 0) return null
-  const minutes = Math.floor(ms / (60 * 1000))
-  if (minutes < 1) return 'just now'
-  if (minutes < 60) return `${minutes}m ago`
-  const hours = Math.floor(minutes / 60)
-  if (hours < 24) return `${hours}h ago`
-  const days = Math.floor(hours / 24)
-  return `${days}d ago`
+async function fetchJson(url: string, signal: AbortSignal): Promise<unknown> {
+  const response = await fetch(url, { cache: 'no-store', signal })
+  if (!response.ok) throw new Error(`${url} returned ${response.status}`)
+  return response.json()
 }
-
-const QUICK_ASSIGN_ORDER = ['projects', 'pipeline', 'docs', 'calendar', 'clawpilot']
-
-function getGreeting() {
-  const h = new Date().getHours()
-  if (h < 12) return { text: 'Good morning', color: '#FDD663' }
-  if (h < 17) return { text: 'Good afternoon', color: '#FFA726' }
-  return { text: 'Good evening', color: '#CFC6EA' }
-}
-
-type Props = { onNavigate: (s: string) => void; onNavigateWithFilter?: (s: string, filter?: { priority: string[]; status: string[]; labels: string[] }) => void }
 
 export default function DashboardSection({ onNavigate, onNavigateWithFilter }: Props) {
-  const theme = useTheme()
-  const isXs = useMediaQuery(theme.breakpoints.down('sm'))
-  const isLandscape = useMediaQuery('(orientation: landscape)')
-  const compactMobile = isXs && isLandscape
-
   const [tasks, setTasks] = useState<Task[]>([])
   const [docs, setDocs] = useState<DocMeta[]>([])
-  const [loading, setLoading] = useState(true)
-  const [greeting] = useState<{ text: string; color: string }>(() => getGreeting())
-  const [snapshotTime, setSnapshotTime] = useState(0)
-  const [promotionReport, setPromotionReport] = useState<{
-    status: string
-    timestamp: string | null
-    timestampIso: string | null
-    runtime: { lane?: string; port?: string; commit?: string; repoPath?: string } | null
-    blockers: string[]
-    reason?: string
-  } | null>(null)
-  const [runtimeLane, setRuntimeLane] = useState<string | null>(null)
-  const [executionRuns, setExecutionRuns] = useState<ExecutionSummary | null>(null)
   const [executionResults, setExecutionResults] = useState<ExecutionSummary | null>(null)
-  const [nightlyStatus, setNightlyStatus] = useState<NightlyStatusSummary | null>(null)
-  const [taskCreationAudit, setTaskCreationAudit] = useState<TaskCreationAuditSummary | null>(null)
+  const [user, setUser] = useState<UserSummary | null>(null)
+  const [snapshotTime, setSnapshotTime] = useState(0)
+  const [loading, setLoading] = useState(true)
+  const [loadWarning, setLoadWarning] = useState(false)
+  const [salutation] = useState(() => greeting())
 
   useEffect(() => {
-    let mounted = true
+    let active = true
 
-    async function loadSnapshot() {
+    async function load() {
       const controller = new AbortController()
-      const timeout = setTimeout(() => controller.abort(), 8000)
-      try {
-        const [t, d, p, runtime, runs, results, nightly, taskCreateAudit] = await Promise.all([
-          fetch('/api/tasks', { signal: controller.signal }).then(r => r.json()),
-          fetch('/api/docs', { signal: controller.signal }).then(r => r.json()),
-          fetch('/api/promotion-report', { signal: controller.signal }).then(r => r.json()),
-          fetch('/api/runtime', { signal: controller.signal }).then(r => r.json()),
-          fetch('/api/execution-runs/summary', { signal: controller.signal }).then(r => r.json()),
-          fetch('/api/execution-results/summary', { signal: controller.signal }).then(r => r.json()),
-          fetch('/api/nightly-status', { signal: controller.signal }).then(r => r.json()),
-          fetch('/api/task-creation-audit/summary', { signal: controller.signal }).then(r => r.json()),
-        ])
-        if (!mounted) return
-        setTasks(Array.isArray(t) ? t : [])
-        setDocs(Array.isArray(d) ? d : [])
-        setSnapshotTime(Date.now())
-        setPromotionReport(p && typeof p === 'object' ? p : null)
-        setRuntimeLane(runtime?.lane || null)
-        setExecutionRuns(runs && typeof runs === 'object' ? runs : null)
-        setExecutionResults(results && typeof results === 'object' ? results : null)
-        setNightlyStatus(nightly && typeof nightly === 'object' ? nightly : null)
-        setTaskCreationAudit(taskCreateAudit && typeof taskCreateAudit === 'object' ? taskCreateAudit : null)
-      } catch {
-        if (!mounted) return
-        setTasks([])
-        setDocs([])
-        setSnapshotTime(Date.now())
-        setPromotionReport(null)
-        setRuntimeLane(null)
-        setExecutionRuns(null)
-        setExecutionResults(null)
-        setNightlyStatus(null)
-        setTaskCreationAudit(null)
-      } finally {
-        clearTimeout(timeout)
-        if (mounted) setLoading(false)
+      const timeout = setTimeout(() => controller.abort(), 10_000)
+      const results = await Promise.allSettled([
+        fetchJson('/api/tasks', controller.signal),
+        fetchJson('/api/docs', controller.signal),
+        fetchJson('/api/execution-results/summary', controller.signal),
+        fetchJson('/api/users', controller.signal),
+      ])
+      clearTimeout(timeout)
+      if (!active) return
+
+      const [tasksResult, docsResult, executionResult, usersResult] = results
+      if (tasksResult.status === 'fulfilled') setTasks(Array.isArray(tasksResult.value) ? tasksResult.value as Task[] : [])
+      if (docsResult.status === 'fulfilled') setDocs(Array.isArray(docsResult.value) ? docsResult.value as DocMeta[] : [])
+      if (executionResult.status === 'fulfilled' && executionResult.value && typeof executionResult.value === 'object') {
+        setExecutionResults(executionResult.value as ExecutionSummary)
       }
+      if (usersResult.status === 'fulfilled' && usersResult.value && typeof usersResult.value === 'object') {
+        const currentUser = (usersResult.value as { currentUser?: UserSummary }).currentUser
+        if (currentUser) setUser(currentUser)
+      }
+      setLoadWarning(results.slice(0, 2).some(result => result.status === 'rejected'))
+      setSnapshotTime(Date.now())
+      setLoading(false)
     }
 
-    void loadSnapshot()
-    const interval = setInterval(() => { void loadSnapshot() }, 20000)
-
+    void load()
+    const interval = setInterval(() => { void load() }, 30_000)
     return () => {
-      mounted = false
+      active = false
       clearInterval(interval)
     }
   }, [])
 
-  const activeTasks = tasks.filter(t => t.status !== 'done')
-  const inProgress = tasks.filter(t => t.status === 'in-progress')
-  const highPriority = activeTasks.filter(t => t.priority === 'high')
-  const doneTasks = tasks.filter(t => t.status === 'done')
-  const staleInProgress = inProgress.filter(t => {
-    const ts = t.updatedAt || t.createdAt
-    if (!ts) return false
-    const ageMs = snapshotTime - new Date(ts).getTime()
-    return ageMs > 3 * 24 * 60 * 60 * 1000
-  })
-  const oldestStaleInProgress = useMemo(() => {
-    if (!staleInProgress.length) return null
-    return [...staleInProgress].sort((a, b) => {
-      const aTs = new Date(a.updatedAt || a.createdAt || 0).getTime()
-      const bTs = new Date(b.updatedAt || b.createdAt || 0).getTime()
-      return aTs - bTs
-    })[0]
-  }, [staleInProgress])
+  const activeTasks = useMemo(() => tasks.filter(task => task.status !== 'done' && !task.archived), [tasks])
+  const inProgress = useMemo(() => activeTasks.filter(task => task.status === 'in-progress'), [activeTasks])
+  const highPriority = useMemo(() => activeTasks.filter(task => task.priority === 'high'), [activeTasks])
+  const done = useMemo(() => tasks.filter(task => task.status === 'done' && !task.archived), [tasks])
+  const referenceTime = snapshotTime || 1
+  const nowWorking = useMemo(() => deriveNowWorking(tasks, referenceTime), [referenceTime, tasks])
 
-  const nowWorking = useMemo(() => deriveNowWorking(tasks, snapshotTime || Date.now()), [tasks, snapshotTime])
-
-  const topActions = useMemo(() => {
-    const nowMs = Date.now()
-    const actionable = tasks.filter((task) => !task.archived)
-
-    const ranked = actionable.map((task) => {
-      const executionStatus = String(task.execution?.executionStatus || '').toLowerCase()
-      const note = String(task.execution?.latestExecutionNote || '')
-      const lastResult = (task.execution?.lastResult || {}) as { nextAction?: string; blockedReason?: string }
-      const explicitBlocker = (lastResult.blockedReason || '').trim() || ((note.match(/^Blocker\s*:\s*(.+)$/im) || [])[1] || '').trim() || ((note.match(/^Blocked reason\s*:\s*(.+)$/im) || [])[1] || '').trim()
-      const unassigned = !task.assignedAgent
-      const realityState = deriveTaskRealityState(task, nowMs)
-
-      const baseScore =
-        (PRIORITY_RANK[task.priority] || 0) +
-        dueScore(task.dueDate) +
-        (EXECUTION_RANK[executionStatus] || 0) +
-        (BOARD_RANK[task.status] || 0) +
-        (unassigned ? 28 : 0)
-
-      const score = baseScore + (realityState === 'DONE_UNCONFIRMED' ? -32 : 0)
-
-      let whyNow = 'This can move immediately and unlock visible progress today.'
-      if (realityState === 'DONE_UNCONFIRMED') whyNow = 'Execution looks complete, but closure still needs confirmation.'
-      else if (unassigned) whyNow = 'No owner is set, so this work is stalled right now.'
-      else if (explicitBlocker || realityState === 'BLOCKED') whyNow = 'A blocker is actively stopping delivery on this task.'
-      else if (task.priority === 'high') whyNow = 'High-priority work: moving this now protects momentum.'
-      else if (task.dueDate) whyNow = `Due ${task.dueDate}, so this needs action now to avoid slip.`
-
-      const fallbackAction = realityState === 'DONE_UNCONFIRMED'
-        ? 'Confirm completion now: close the task if accepted, or post the missing follow-up needed to finish.'
-        : unassigned
-          ? 'Assign an owner now, then send a task-linked kickoff with exact scope and deadline.'
-          : task.status === 'backlog' || task.status === 'todo'
-            ? `Move this to in-progress and send ${assignedLabel(task.assignedAgent)} the exact deliverable and deadline.`
-            : (explicitBlocker || realityState === 'BLOCKED')
-              ? `Provide this missing input now: ${explicitBlocker || 'clarify the blocker details'}.`
-              : `Send ${assignedLabel(task.assignedAgent)} one clear instruction with scope, deadline, and expected output.`
-
-      const nextActionRaw = String(lastResult.nextAction || '').trim()
-      const nextAction = nextActionRaw || fallbackAction
-
-      const stateTruth = deriveStateTruth({
-        workItem: task.workItem,
-        checklist: task.checklist,
-        executionStatus: task.execution?.executionStatus,
-        executionUpdatedAt: task.execution?.lastUpdatedAt,
-        updatedAt: task.updatedAt,
-        createdAt: task.createdAt,
-        nowMs,
+  const nextActions = useMemo(() => {
+    const now = referenceTime
+    const priorityRank: Record<string, number> = { high: 30, medium: 20, low: 10 }
+    const statusRank: Record<string, number> = { 'in-progress': 40, review: 30, todo: 20, backlog: 10 }
+    return activeTasks
+      .map(task => {
+        const stateTruth = deriveStateTruth({
+          workItem: task.workItem,
+          checklist: task.checklist,
+          executionStatus: task.execution?.executionStatus,
+          executionUpdatedAt: task.execution?.lastUpdatedAt,
+          updatedAt: task.updatedAt,
+          createdAt: task.createdAt,
+          nowMs: now,
+        })
+        const guidance = deriveNextActionGuidance({
+          stateTruth,
+          workItem: task.workItem,
+          checklist: task.checklist,
+          executionStatus: task.execution?.executionStatus,
+          executionUpdatedAt: task.execution?.lastUpdatedAt,
+          updatedAt: task.updatedAt,
+          createdAt: task.createdAt,
+          nowMs: now,
+        })
+        const latest = task.execution?.lastResult as { blockedReason?: string } | undefined
+        const score = (priorityRank[task.priority] || 0)
+          + (statusRank[task.status] || 0)
+          + (task.assignedAgent ? 0 : 18)
+          + (latest?.blockedReason ? 15 : 0)
+        return { task, guidance, blocker: latest?.blockedReason || '', score, live: deriveLiveState(task, now) }
       })
-      const nextGuidance = deriveNextActionGuidance({
-        stateTruth,
-        workItem: task.workItem,
-        checklist: task.checklist,
-        executionStatus: task.execution?.executionStatus,
-        executionUpdatedAt: task.execution?.lastUpdatedAt,
-        updatedAt: task.updatedAt,
-        createdAt: task.createdAt,
-        nowMs,
-      })
+      .sort((left, right) => right.score - left.score)
+      .slice(0, 3)
+  }, [activeTasks, referenceTime])
 
-      const liveState = deriveLiveState(task, nowMs)
-      return {
-        task,
-        score,
-        whyNow,
-        blocker: explicitBlocker || (unassigned ? 'No assigned agent.' : ''),
-        nextAction,
-        nextGuidance,
-        assigned: liveState.owner,
-        liveState,
-        realityState,
-        stateTruth,
-      }
-    })
+  const displayName = user?.displayName?.trim() || user?.email?.split('@')[0] || 'there'
+  const docsByCategory = useMemo(() => docs.reduce<Record<string, number>>((counts, doc) => {
+    counts[doc.category] = (counts[doc.category] || 0) + 1
+    return counts
+  }, {}), [docs])
+  const recentDocs = useMemo(() => [...docs].sort((left, right) => right.date.localeCompare(left.date)).slice(0, 4), [docs])
 
-    return ranked
-      .filter((item) => item.realityState !== 'DONE_CONFIRMED')
-      .sort((a, b) => b.score - a.score)
-      .slice(0, 5)
-  }, [tasks])
-
-  const statusCounts = STATUS_ORDER.reduce((acc, s) => {
-    acc[s] = tasks.filter(t => t.status === s).length
-    return acc
-  }, {} as Record<string, number>)
-
-  const docsByCategory = docs.reduce((acc, d) => {
-    acc[d.category] = (acc[d.category] || 0) + 1
-    return acc
-  }, {} as Record<string, number>)
-
-  const recentDocs = [...docs].sort((a, b) => b.date.localeCompare(a.date)).slice(0, 3)
-
-  const promoStatus = promotionReport?.status || 'unknown'
-  const promoReady = promoStatus === 'ready'
-  const promoTimestamp = promotionReport?.timestampIso || promotionReport?.timestamp || 'unknown'
-  const promoRuntime = promotionReport?.runtime
-  const promoBlockers = promotionReport?.blockers || []
-  const promoLane = promoRuntime?.lane
-  const promoDisabled = promoStatus === 'disabled' || promotionReport?.reason === 'not-dev'
-  const showPromotion = (runtimeLane === 'dev' || promoLane === 'dev') && !promoDisabled
-  const verificationLabel = promoReady ? 'Verified' : 'Needs verify'
-  const verificationColor = promoReady ? '#66BB6A' : '#FFA726'
-  const verificationTimestamp = promotionReport?.timestampIso || promotionReport?.timestamp || null
-  const verificationAge = formatAgeSince(verificationTimestamp)
+  function navigateToProjects(filter: Filter) {
+    if (onNavigateWithFilter) onNavigateWithFilter('projects', filter)
+    else onNavigate('projects')
+  }
 
   function openTask(taskId: string) {
     onNavigate('projects')
-    setTimeout(() => {
-      window.dispatchEvent(new CustomEvent('open-task', { detail: { id: taskId } }))
-    }, 120)
+    setTimeout(() => window.dispatchEvent(new CustomEvent('open-task', { detail: { id: taskId } })), 120)
   }
 
   function openAgentChat(taskId: string, agentId?: string) {
@@ -336,395 +186,170 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter }: P
     onNavigate('agents')
   }
 
-  function openVerificationEvidence() {
-    try {
-      const url = new URL(window.location.href)
-      url.searchParams.set('doc', 'promotion-reports')
-      window.history.replaceState(null, '', `${url.pathname}${url.search}${url.hash}`)
-    } catch {
-      // Fail open: still navigate to Docs even if URL mutation fails.
-    }
+  function openDoc(doc: DocMeta) {
+    const url = new URL(window.location.href)
+    url.searchParams.set('doc', doc.slug || doc.id)
+    window.history.replaceState(null, '', `${url.pathname}${url.search}#docs`)
     onNavigate('docs')
   }
 
-  async function quickAssign(taskId: string, agentId: string) {
-    const nowIso = new Date().toISOString()
-    const r = await fetch('/api/tasks', {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        id: taskId,
-        assignedAgent: agentId,
-        _execution: {
-          assignedAgent: agentId,
-          executionStatus: 'queued',
-          lastUpdatedAt: nowIso,
-          latestExecutionNote: `Assigned from Do This Now panel to ${agentId}.`,
-        },
-        _actor: 'ClawPilot',
-      }),
-    })
-    if (!r.ok) return
-    const updated = await r.json()
-    if (!updated?.id) return
-    setTasks((prev) => prev.map((task) => (task.id === updated.id ? updated : task)))
+  if (loading) {
+    return <Box display="flex" justifyContent="center" pt={8}><CircularProgress size={28} /></Box>
   }
 
-  if (loading) return (
-    <Box display="flex" justifyContent="center" pt={8}><CircularProgress size={28} /></Box>
-  )
+  const metrics = [
+    { label: 'In progress', value: inProgress.length, Icon: TrendingUpRounded, color: '#A8C7FA', action: () => navigateToProjects({ priority: [], status: ['in-progress'], labels: [] }) },
+    { label: 'High priority', value: highPriority.length, Icon: PriorityHighRounded, color: '#FFA726', action: () => navigateToProjects({ priority: ['high'], status: [], labels: [] }) },
+    { label: 'Open tasks', value: activeTasks.length, Icon: RadioButtonUncheckedRounded, color: '#CFC6EA', action: () => navigateToProjects({ priority: [], status: STATUS_ORDER, labels: [] }) },
+    { label: 'Completed', value: done.length, Icon: CheckCircleRounded, color: '#66BB6A', action: () => navigateToProjects({ priority: [], status: ['done'], labels: [] }) },
+    { label: 'Agent results', value: executionResults?.count || 0, Icon: SmartToyRounded, color: '#4FD1B8', action: () => onNavigate('agents') },
+  ]
 
   return (
-    <Box p={{ xs: compactMobile ? 1.5 : 2, sm: 3 }} pt={{ xs: compactMobile ? 2 : 3, sm: 4 }} maxWidth={800} sx={{ width: '100%', overflowX: 'hidden' }}>
-      {/* Greeting */}
-      <Stack direction="row" alignItems="center" spacing={1.2} mb={0.5}>
-        <WbSunnyRounded sx={{ color: greeting.color, fontSize: compactMobile ? 22 : 28 }} />
-        <Typography variant="h4" fontWeight={700} color="text.primary" sx={{ fontSize: { xs: compactMobile ? '1.25rem' : '1.5rem', sm: '2.125rem' } }}>
-          {greeting.text}, Jarrett
+    <Box sx={{ width: '100%', maxWidth: 1120, mx: 'auto', px: { xs: 2, sm: 3 }, py: { xs: 3, sm: 4 }, overflowX: 'hidden' }}>
+      <Stack direction="row" alignItems="center" spacing={1.25} mb={0.5}>
+        <WbSunnyRounded sx={{ color: salutation.color, fontSize: 26 }} />
+        <Typography variant="h4" fontWeight={700} color="text.primary" sx={{ fontSize: { xs: '1.5rem', sm: '2rem' }, overflowWrap: 'anywhere' }}>
+          {salutation.text}, {displayName}
         </Typography>
       </Stack>
-      <Typography variant="body1" color="text.secondary" ml={{ xs: compactMobile ? 0 : 4, sm: 5 }} mb={{ xs: compactMobile ? 2.5 : 4, sm: 4 }} sx={{ fontSize: { xs: '0.9rem', sm: '1rem' } }}>
-        Here&apos;s your command center.
+      <Typography variant="body2" color="text.secondary" mb={3.5} ml={{ sm: 5 }}>
+        Current work, agent activity, and workspace knowledge.
       </Typography>
 
-      {showPromotion && (
-        <Box sx={{ backgroundColor: '#16161E', border: `1px solid ${promoReady ? 'rgba(102,187,106,0.5)' : 'rgba(255,167,38,0.5)'}`, borderRadius: 3, p: { xs: compactMobile ? 1.5 : 2, sm: 2.5 }, mb: { xs: compactMobile ? 2.5 : 3, sm: 3.5 } }}>
-          <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.5} alignItems={{ xs: 'flex-start', sm: 'center' }} justifyContent="space-between">
-            <Stack direction="row" spacing={1} alignItems="center">
-              <Typography variant="subtitle2" fontWeight={700} color="text.primary">Promotion Readiness</Typography>
-              <Chip
-                label={promoReady ? 'READY' : promoStatus.replace(/_/g, ' ').toUpperCase()}
-                size="small"
-                sx={{ backgroundColor: promoReady ? 'rgba(102,187,106,0.2)' : 'rgba(255,167,38,0.2)', color: promoReady ? '#66BB6A' : '#FFA726', fontWeight: 600 }}
-              />
-            </Stack>
-            <Typography variant="caption" color="text.secondary">Latest report: {promoTimestamp}</Typography>
-          </Stack>
-
-          <Divider sx={{ borderColor: 'rgba(255,255,255,0.06)', my: 1.5 }} />
-
-          <Stack spacing={0.75}>
-            <Typography variant="caption" color="text.disabled">Runtime</Typography>
-            <Typography variant="body2" color="text.primary">
-              {promoRuntime ? `${promoRuntime.lane || 'unknown'}:${promoRuntime.port || 'unknown'} • ${promoRuntime.commit ? promoRuntime.commit.slice(0, 7) : 'unknown'} • ${promoRuntime.repoPath || 'unknown'}` : 'Unavailable'}
-            </Typography>
-          </Stack>
-
-          <Divider sx={{ borderColor: 'rgba(255,255,255,0.06)', my: 1.5 }} />
-
-          <Typography variant="caption" color="text.disabled" display="block" mb={0.75}>Blockers</Typography>
-          {promoBlockers.length === 0 ? (
-            <Typography variant="body2" color={promoReady ? '#66BB6A' : 'text.secondary'}>No blockers detected</Typography>
-          ) : (
-            <Stack spacing={0.5}>
-              {promoBlockers.map((blocker, i) => (
-                <Typography key={`${blocker}-${i}`} variant="body2" color="#FFA726">• {blocker}</Typography>
-              ))}
-            </Stack>
-          )}
+      {loadWarning && (
+        <Box sx={{ borderLeft: '3px solid #FFA726', px: 1.5, py: 1, mb: 2.5, bgcolor: 'rgba(255,167,38,0.06)' }}>
+          <Typography variant="body2" color="text.secondary">Some workspace data is temporarily unavailable. Available sections remain usable.</Typography>
         </Box>
       )}
 
-      <Box sx={{ backgroundColor: '#15151D', border: '1px solid rgba(255,255,255,0.06)', borderRadius: 3, p: { xs: compactMobile ? 1.5 : 2, sm: 2.5 }, mb: { xs: compactMobile ? 2.5 : 3, sm: 3.5 } }}>
-        <Stack direction="row" alignItems="center" justifyContent="space-between" mb={1}>
-          <Typography variant="subtitle2" fontWeight={700} color="text.primary">Execution & Nightly</Typography>
-          <Stack direction="row" spacing={1} alignItems="center">
-            <Chip
-              size="small"
-              label={verificationLabel}
-              sx={{
-                height: 22,
-                backgroundColor: promoReady ? 'rgba(102,187,106,0.18)' : 'rgba(255,167,38,0.2)',
-                color: verificationColor,
-                fontWeight: 600,
-              }}
-            />
-            <Button size="small" variant="text" sx={{ textTransform: 'none' }} onClick={() => window.location.reload()}>
-              Refresh snapshot
-            </Button>
-          </Stack>
-        </Stack>
-        <Stack direction={{ xs: 'column', sm: 'row' }} spacing={0.8} alignItems={{ xs: 'flex-start', sm: 'center' }} mb={1}>
-          <Typography variant="caption" color="text.secondary">
-            Last successful verification: {promoReady && verificationTimestamp ? new Date(verificationTimestamp).toLocaleString() : 'not available'}
-          </Typography>
-          <Typography variant="caption" color="text.secondary">
-            Latest report: {verificationTimestamp ? new Date(verificationTimestamp).toLocaleString() : 'not available'}{verificationAge ? ` (${verificationAge})` : ''}
-          </Typography>
-          <Button
-            size="small"
-            variant="text"
-            sx={{ textTransform: 'none', minHeight: 24, px: 0.5, color: '#A8C7FA' }}
-            onClick={openVerificationEvidence}
-          >
-            View verification evidence
-          </Button>
-        </Stack>
-        <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2} alignItems={{ xs: 'flex-start', sm: 'center' }}>
-          <Stack spacing={0.5}>
-            <Typography variant="caption" color="text.disabled">Execution runs</Typography>
-            <Typography variant="body2" color="text.primary">{executionRuns?.count ?? 0}</Typography>
-          </Stack>
-          <Stack spacing={0.5}>
-            <Typography variant="caption" color="text.disabled">Execution results</Typography>
-            <Typography variant="body2" color="text.primary">{executionResults?.count ?? 0}</Typography>
-          </Stack>
-          <Stack spacing={0.5}>
-            <Typography variant="caption" color="text.disabled">Nightly status</Typography>
-            <Typography variant="body2" color="text.primary">{nightlyStatus?.run?.status || 'unknown'}</Typography>
-          </Stack>
-          <Stack spacing={0.5}>
-            <Typography variant="caption" color="text.disabled">Latest briefing</Typography>
-            <Typography variant="body2" color="text.primary">{nightlyStatus?.briefing?.name || 'none'}</Typography>
-          </Stack>
-          <Stack spacing={0.5}>
-            <Typography variant="caption" color="text.disabled">Tasks created (24h)</Typography>
-            <Typography variant="body2" color="text.primary">{taskCreationAudit?.created24h ?? 0}</Typography>
-          </Stack>
-          <Stack spacing={0.5}>
-            <Typography variant="caption" color="text.disabled">Stale in-progress (3d+)</Typography>
-            <Typography variant="body2" color={staleInProgress.length > 0 ? '#FFA726' : 'text.primary'}>{staleInProgress.length}</Typography>
-          </Stack>
-          <Stack spacing={0.5}>
-            <Typography variant="caption" color="text.disabled">Last task created</Typography>
-            <Typography variant="body2" color="text.primary">
-              {taskCreationAudit?.lastCreated ? `${taskCreationAudit.lastCreated.actor || 'unknown'} via ${taskCreationAudit.lastCreated.source || 'unknown'}` : 'none'}
-            </Typography>
-            {taskCreationAudit?.lastCreated?.anomaly && (
-              <Typography variant="caption" color="#FFA726">Anomaly flagged: {taskCreationAudit.lastCreated.recentCreatesInLastMinute || 0} tasks in &lt;1m</Typography>
-            )}
-          </Stack>
-        </Stack>
-        {oldestStaleInProgress && (
-          <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} mt={1.5} alignItems={{ xs: 'flex-start', sm: 'center' }}>
-            <Typography variant="caption" color="#FFA726">
-              Oldest stale: {oldestStaleInProgress.title} · Owner: {assignedLabel(oldestStaleInProgress.assignedAgent)}
-            </Typography>
-            <Button
-              size="small"
-              variant="outlined"
-              sx={{ textTransform: 'none', minHeight: 28, borderColor: 'rgba(255,167,38,0.45)', color: '#FFA726' }}
-              onClick={() => oldestStaleInProgress.assignedAgent ? openAgentChat(oldestStaleInProgress.id, oldestStaleInProgress.assignedAgent) : openTask(oldestStaleInProgress.id)}
-            >
-              {oldestStaleInProgress.assignedAgent ? 'Escalate in Agents' : 'Open stale task'}
-            </Button>
-            <Button
-              size="small"
-              variant="text"
-              sx={{ textTransform: 'none', minHeight: 28, color: '#A8C7FA' }}
-              onClick={() => onNavigateWithFilter ? onNavigateWithFilter('projects', { priority: [], status: ['in-progress'], labels: [] }) : onNavigate('projects')}
-            >
-              View stale list
-            </Button>
-          </Stack>
-        )}
-      </Box>
-
-      <Box sx={{ backgroundColor: '#15151D', border: '1px solid rgba(255,255,255,0.06)', borderRadius: 3, p: { xs: compactMobile ? 1.5 : 2, sm: 2.5 }, mb: { xs: compactMobile ? 2.5 : 3, sm: 3.5 } }}>
-        <Stack direction="row" alignItems="center" justifyContent="space-between" mb={1}>
-          <Typography variant="subtitle2" fontWeight={700} color="text.primary">Now Working</Typography>
-          <Chip size="small" label={nowWorking?.label || 'No recent run'} sx={{ backgroundColor: nowWorking?.state === 'now_working' ? 'rgba(102,187,106,0.2)' : nowWorking?.state === 'waiting_on' ? 'rgba(255,167,38,0.2)' : 'rgba(255,255,255,0.08)', color: nowWorking?.state === 'now_working' ? '#66BB6A' : nowWorking?.state === 'waiting_on' ? '#FFA726' : 'text.secondary' }} />
-        </Stack>
-        {nowWorking ? (
-          nowWorking.state === 'no_recent_run' ? (
-            <Stack spacing={0.5}>
-              <Typography variant="body2" color="text.disabled">No recent execution activity from product agents.</Typography>
-              <Typography variant="caption" color="text.disabled">Now Working will populate automatically when a real run or agent reply occurs.</Typography>
-            </Stack>
-          ) : (
-            <Stack spacing={0.45}>
-              <Typography variant="body2" color="text.primary" fontWeight={700}>{nowWorking.taskTitle}</Typography>
-              <Typography variant="caption" color="text.secondary">Agent: {assignedLabel(nowWorking.agentId)}</Typography>
-              <Typography variant="caption" color="text.secondary">
-                Latest evidence: {nowWorking.latestTimestamp ? new Date(nowWorking.latestTimestamp).toLocaleString() : 'none'} ({nowWorking.latestSource})
-              </Typography>
-              <Stack direction="row" spacing={0.8} mt={0.5}>
-                <Button size="small" variant="outlined" onClick={() => openAgentChat(nowWorking.taskId, nowWorking.agentId)} sx={{ textTransform: 'none', minHeight: 28 }}>
-                  Continue in Agents
-                </Button>
-                <Button size="small" variant="outlined" onClick={() => openTask(nowWorking.taskId)} sx={{ textTransform: 'none', minHeight: 28 }}>
-                  Open task
-                </Button>
-              </Stack>
-            </Stack>
-          )
-        ) : (
-          <Typography variant="body2" color="text.disabled">No eligible assigned task with execution evidence.</Typography>
-        )}
-      </Box>
-
-      <Box sx={{ backgroundColor: '#15151D', border: '1px solid rgba(255,255,255,0.06)', borderRadius: 3, p: { xs: compactMobile ? 1.5 : 2, sm: 2.5 }, mb: { xs: compactMobile ? 2.5 : 3, sm: 3.5 } }}>
-        <Stack direction="row" alignItems="center" justifyContent="space-between" mb={1.5}>
-          <Typography variant="subtitle2" fontWeight={700} color="text.primary">Do This Now</Typography>
-          <Typography variant="caption" color="text.secondary">Top {Math.min(topActions.length, 5)} actions</Typography>
-        </Stack>
-
-        {topActions.length === 0 ? (
-          <Typography variant="body2" color="text.disabled">No active tasks to prioritize right now.</Typography>
-        ) : (
-          <Stack spacing={1.25}>
-            {topActions.map(({ task, whyNow, blocker, nextGuidance, assigned, stateTruth, liveState }, idx) => (
-              <Box key={`top-action-${task.id}`} sx={{ p: 1.25, borderRadius: 2, backgroundColor: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.08)' }}>
-                <Stack direction={{ xs: 'column', sm: 'row' }} spacing={0.75} justifyContent="space-between" alignItems={{ sm: 'center' }}>
-                  <Typography variant="body2" color="text.primary" fontWeight={700}>{idx + 1}. {task.title}</Typography>
-                  <Chip size="small" label={`Owner: ${assigned}`} sx={{ backgroundColor: task.assignedAgent ? 'rgba(168,199,250,0.15)' : 'rgba(255,167,38,0.18)', color: task.assignedAgent ? '#A8C7FA' : '#FFA726' }} />
-                </Stack>
-                <Typography variant="caption" color="text.secondary" display="block" mt={0.6}>[{stateTruth.stateLabel}] — {stateTruth.reason}</Typography>
-                <Typography variant="caption" color="text.secondary" display="block" mt={0.4}>Last activity: {formatLiveActivityAge(liveState.lastActivityAt)} · Source: {liveState.activitySource}</Typography>
-                <Typography variant="caption" color="text.secondary" display="block" mt={0.4}>Why now: {whyNow}</Typography>
-                {liveState.staleAgain && <Typography variant="caption" color="#FFA726" display="block" mt={0.4}>[Stale again]</Typography>}
-                {blocker && (
-                  <Typography variant="caption" color="#FFA726" display="block" mt={0.45}>Blocker: {blocker}</Typography>
-                )}
-                <Typography variant="caption" color="#66BB6A" display="block" mt={0.45}>👉 Next: {nextGuidance}</Typography>
-
-                <Stack direction="row" spacing={0.8} flexWrap="wrap" mt={1}>
-                  <Button size="small" variant="outlined" onClick={() => openTask(task.id)} sx={{ textTransform: 'none', minHeight: 28 }}>
-                    Open task
-                  </Button>
-                  {task.assignedAgent ? (
-                    <Button size="small" variant="outlined" onClick={() => openAgentChat(task.id, task.assignedAgent)} sx={{ textTransform: 'none', minHeight: 28 }}>
-                      Open agent chat
-                    </Button>
-                  ) : (
-                    QUICK_ASSIGN_ORDER.map((agentId) => (
-                      <Button key={`${task.id}-${agentId}`} size="small" variant="outlined" onClick={() => quickAssign(task.id, agentId)} sx={{ textTransform: 'none', minHeight: 28 }}>
-                        Assign {assignedLabel(agentId)}
-                      </Button>
-                    ))
-                  )}
-                </Stack>
-              </Box>
-            ))}
-          </Stack>
-        )}
-      </Box>
-
-      {/* Stat cards */}
       <Box
-        display="grid"
-        gridTemplateColumns={{ xs: '1fr 1fr', sm: '1fr 1fr', md: 'repeat(5, minmax(0, 1fr))' }}
-        gap={{ xs: compactMobile ? 1 : 1.25, sm: 2 }}
-        mb={{ xs: compactMobile ? 2.5 : 4, sm: 4 }}
-        sx={{ width: '100%' }}
+        aria-label="Workspace pulse"
+        sx={{
+          display: 'grid',
+          gridTemplateColumns: { xs: 'repeat(2, minmax(0, 1fr))', sm: 'repeat(5, minmax(0, 1fr))' },
+          borderTop: '1px solid rgba(255,255,255,0.08)',
+          borderBottom: '1px solid rgba(255,255,255,0.08)',
+          mb: 3.5,
+        }}
       >
-        {[
-          { label: 'In Progress', value: inProgress.length, icon: <TrendingUpRounded sx={{ fontSize: 20, color: '#A8C7FA' }} />, filter: { priority: [], status: ['in-progress'], labels: [] } },
-          { label: 'High Priority', value: highPriority.length, icon: <FlagRounded sx={{ fontSize: 20, color: '#EF5350' }} />, filter: { priority: ['high'], status: [], labels: [] } },
-          { label: 'Open Tasks', value: activeTasks.length, icon: <RadioButtonUncheckedRounded sx={{ fontSize: 20, color: '#CFC6EA' }} />, filter: { priority: [], status: ['todo', 'in-progress', 'review', 'backlog'], labels: [] } },
-          { label: 'Done', value: doneTasks.length, icon: <CheckCircleRounded sx={{ fontSize: 20, color: '#66BB6A' }} />, filter: { priority: [], status: ['done'], labels: [] } },
-          { label: 'Stale (3d+)', value: staleInProgress.length, icon: <FlagRounded sx={{ fontSize: 20, color: '#FFA726' }} />, filter: { priority: [], status: ['in-progress'], labels: [] } },
-        ].map(card => (
-          <ButtonBase key={card.label} onClick={() => onNavigateWithFilter ? onNavigateWithFilter('projects', card.filter) : onNavigate('projects')} sx={{ borderRadius: 3, display: 'block', textAlign: 'left', width: '100%', minWidth: 0 }}>
-            <Box sx={{ backgroundColor: '#1A1A23', border: '1px solid rgba(255,255,255,0.06)', borderRadius: 3, p: { xs: compactMobile ? 1.25 : 1.75, sm: 2 }, minHeight: { xs: compactMobile ? 88 : 104, sm: 112 }, transition: 'border-color 0.15s', '&:hover': { borderColor: 'rgba(255,255,255,0.15)' } }}>
-              <Box mb={{ xs: 0.5, sm: 1 }}>{card.icon}</Box>
-              <Typography variant="h4" fontWeight={700} color="text.primary" lineHeight={1} sx={{ fontSize: { xs: compactMobile ? '1.15rem' : '1.4rem', sm: '2rem' } }}>{card.value}</Typography>
-              <Typography variant="caption" color="text.secondary" mt={0.5} display="block" sx={{ fontSize: { xs: compactMobile ? '0.66rem' : '0.72rem', sm: '0.75rem' } }}>{card.label}</Typography>
+        {metrics.map(({ label, value, Icon, color, action }) => (
+          <ButtonBase key={label} onClick={action} sx={{ minWidth: 0, minHeight: 88, px: 1.5, py: 1.25, justifyContent: 'flex-start', textAlign: 'left', borderRadius: 0, '&:hover': { bgcolor: 'rgba(255,255,255,0.035)' } }}>
+            <Box minWidth={0}>
+              <Icon sx={{ color, fontSize: 19, mb: 0.75 }} />
+              <Typography variant="h5" fontWeight={700} color="text.primary" lineHeight={1}>{value}</Typography>
+              <Typography variant="caption" color="text.secondary" display="block" mt={0.6}>{label}</Typography>
             </Box>
           </ButtonBase>
         ))}
       </Box>
 
-      <Box display="grid" gridTemplateColumns={{ xs: '1fr', md: '1fr 1fr' }} gap={3}>
-
-        {/* Active tasks panel */}
-        <Box sx={{ backgroundColor: '#1A1A23', border: '1px solid rgba(255,255,255,0.06)', borderRadius: 3, p: 2.5 }}>
-          <Box display="flex" alignItems="center" justifyContent="space-between" mb={2}>
-            <Stack direction="row" alignItems="center" spacing={1}>
-              <ViewKanbanRounded sx={{ fontSize: 18, color: '#A8C7FA' }} />
-              <Typography variant="subtitle2" fontWeight={600} color="text.primary">Active Tasks</Typography>
+      <Box sx={{ border: '1px solid rgba(255,255,255,0.08)', borderRadius: 1, p: { xs: 1.75, sm: 2.25 }, mb: 3 }}>
+        <Stack direction="row" alignItems="center" justifyContent="space-between" gap={1.5} mb={1}>
+          <Typography variant="subtitle2" fontWeight={700} color="text.primary">Current Agent Activity</Typography>
+          <Chip
+            size="small"
+            label={nowWorking?.label || 'No recent run'}
+            sx={{ height: 24, borderRadius: 1, bgcolor: nowWorking?.state === 'now_working' ? 'rgba(79,209,184,0.14)' : 'rgba(255,255,255,0.07)', color: nowWorking?.state === 'now_working' ? '#4FD1B8' : 'text.secondary' }}
+          />
+        </Stack>
+        {nowWorking && nowWorking.state !== 'no_recent_run' ? (
+          <Stack spacing={0.65}>
+            <Typography variant="body2" color="text.primary" fontWeight={700}>{nowWorking.taskTitle}</Typography>
+            <Typography variant="caption" color="text.secondary">
+              {ownerLabel(nowWorking.agentId)} · {formatLiveActivityAge(nowWorking.latestTimestamp || '', referenceTime)}
+            </Typography>
+            <Stack direction="row" spacing={1} mt={0.5}>
+              <Button size="small" variant="outlined" onClick={() => openAgentChat(nowWorking.taskId, nowWorking.agentId)}>Open thread</Button>
+              <Button size="small" variant="text" onClick={() => openTask(nowWorking.taskId)}>Open task</Button>
             </Stack>
-            <ButtonBase onClick={() => onNavigate('projects')} sx={{ borderRadius: 1.5 }}>
-              <Typography variant="caption" color="#A8C7FA" sx={{ px: 1, py: 0.5 }}>View all →</Typography>
-            </ButtonBase>
-          </Box>
+          </Stack>
+        ) : (
+          <Typography variant="body2" color="text.secondary">No agent is currently reporting task activity.</Typography>
+        )}
+      </Box>
 
-          {STATUS_ORDER.filter(s => s !== 'done').map(s => (
-            <ButtonBase key={s} onClick={() => onNavigateWithFilter ? onNavigateWithFilter('projects', { priority: [], status: [s], labels: [] }) : onNavigate('projects')} sx={{ width: '100%', borderRadius: 1.5, display: 'block' }}>
-              <Box display="flex" alignItems="center" justifyContent="space-between" py={0.75} px={0.5} sx={{ '&:hover': { backgroundColor: 'rgba(255,255,255,0.04)', borderRadius: 1.5 } }}>
-                <Stack direction="row" alignItems="center" spacing={1}>
-                  <Box sx={{ width: 8, height: 8, borderRadius: '50%', backgroundColor: STATUS_COLORS[s] }} />
-                  <Typography variant="body2" color="text.secondary">{STATUS_LABELS[s]}</Typography>
+      <Box sx={{ border: '1px solid rgba(255,255,255,0.08)', borderRadius: 1, px: { xs: 1.75, sm: 2.25 }, py: 1, mb: 3 }}>
+        <Typography variant="subtitle2" fontWeight={700} color="text.primary" py={1.25}>Next Actions</Typography>
+        {nextActions.length === 0 ? (
+          <Typography variant="body2" color="text.secondary" pb={1.5}>No active work needs attention.</Typography>
+        ) : nextActions.map(({ task, guidance, blocker, live }, index) => (
+          <Box key={task.id}>
+            {index > 0 && <Divider sx={{ borderColor: 'rgba(255,255,255,0.07)' }} />}
+            <Box sx={{ py: 1.5 }}>
+              <Stack direction={{ xs: 'column', sm: 'row' }} alignItems={{ sm: 'center' }} justifyContent="space-between" gap={1}>
+                <Box minWidth={0}>
+                  <Typography variant="body2" color="text.primary" fontWeight={700} sx={{ overflowWrap: 'anywhere' }}>{task.title}</Typography>
+                  <Typography variant="caption" color="text.secondary" display="block" mt={0.4} sx={{ overflowWrap: 'anywhere' }}>{guidance}</Typography>
+                  <Typography variant="caption" color="text.disabled" display="block" mt={0.35}>
+                    {ownerLabel(task.assignedAgent)} · {formatLiveActivityAge(live.lastActivityAt, referenceTime)}
+                  </Typography>
+                  {blocker && <Typography variant="caption" color="#FFA726" display="block" mt={0.35}>Waiting on: {blocker}</Typography>}
+                </Box>
+                <Stack direction="row" spacing={0.75} flexShrink={0}>
+                  <Button size="small" variant="text" onClick={() => openTask(task.id)}>Open task</Button>
+                  {task.assignedAgent && <Button size="small" variant="outlined" onClick={() => openAgentChat(task.id, task.assignedAgent)}>Open thread</Button>}
                 </Stack>
-                <Typography variant="body2" fontWeight={600} color="text.primary">{statusCounts[s] || 0}</Typography>
-              </Box>
-            </ButtonBase>
-          ))}
-
-          <Divider sx={{ borderColor: 'rgba(255,255,255,0.06)', my: 2 }} />
-
-          <Typography variant="caption" color="text.disabled" display="block" mb={1.25}>In Progress</Typography>
-          {inProgress.length === 0 ? (
-            <Typography variant="body2" color="text.disabled">Nothing in progress</Typography>
-          ) : inProgress.map(t => {
-            const live = deriveLiveState(t, snapshotTime || Date.now())
-            return (
-            <ButtonBase key={t.id} onClick={() => onNavigateWithFilter ? onNavigateWithFilter('projects', { priority: [], status: ['in-progress'], labels: [] }) : onNavigate('projects')} sx={{ width: '100%', borderRadius: 1.5, display: 'block', textAlign: 'left' }}>
-              <Box display="flex" alignItems="flex-start" gap={1} mb={1.25} px={0.5} py={0.25} sx={{ '&:hover': { backgroundColor: 'rgba(255,255,255,0.04)', borderRadius: 1.5 } }}>
-                <FlagRounded sx={{ fontSize: 14, color: PRIORITY_COLORS[t.priority], mt: 0.3, flexShrink: 0 }} />
-                <Box minWidth={0}>
-                  <Typography variant="body2" color="text.primary" fontWeight={500} noWrap>{t.title}</Typography>
-                  <Typography variant="caption" color="text.disabled">Owner: {live.owner} · Last activity: {formatLiveActivityAge(live.lastActivityAt, snapshotTime || Date.now())}</Typography>
-                  <Typography variant="caption" color="text.disabled" display="block">Source: {live.activitySource}</Typography>
-                  {live.staleAgain && <Typography variant="caption" color="#FFA726" display="block">[Stale again]</Typography>}
-                </Box>
-              </Box>
-            </ButtonBase>
-          )})}
-
-          <Divider sx={{ borderColor: 'rgba(255,255,255,0.06)', my: 2 }} />
-
-          <Typography variant="caption" color="text.disabled" display="block" mb={1.25}>Needs Attention (stale 3d+)</Typography>
-          {staleInProgress.length === 0 ? (
-            <Typography variant="body2" color="text.disabled">No stale in-progress cards</Typography>
-          ) : staleInProgress.slice(0, 3).map(t => (
-            <ButtonBase key={`stale-${t.id}`} onClick={() => onNavigateWithFilter ? onNavigateWithFilter('projects', { priority: [], status: ['in-progress'], labels: [] }) : onNavigate('projects')} sx={{ width: '100%', borderRadius: 1.5, display: 'block', textAlign: 'left' }}>
-              <Box display="flex" alignItems="flex-start" gap={1} mb={1.25} px={0.5} py={0.25} sx={{ '&:hover': { backgroundColor: 'rgba(255,255,255,0.04)', borderRadius: 1.5 } }}>
-                <FlagRounded sx={{ fontSize: 14, color: '#FFA726', mt: 0.3, flexShrink: 0 }} />
-                <Box minWidth={0}>
-                  <Typography variant="body2" color="text.primary" fontWeight={500} noWrap>{t.title}</Typography>
-                  <Typography variant="caption" color="text.disabled">Last update: {(t.updatedAt || t.createdAt || '').slice(0, 10)}</Typography>
-                </Box>
-              </Box>
-            </ButtonBase>
-          ))}
-        </Box>
-
-        {/* Docs panel */}
-        <Box sx={{ backgroundColor: '#1A1A23', border: '1px solid rgba(255,255,255,0.06)', borderRadius: 3, p: 2.5 }}>
-          <Box display="flex" alignItems="center" justifyContent="space-between" mb={2}>
-            <Stack direction="row" alignItems="center" spacing={1}>
-              <DescriptionRounded sx={{ fontSize: 18, color: '#CFC6EA' }} />
-              <Typography variant="subtitle2" fontWeight={600} color="text.primary">Docs</Typography>
-            </Stack>
-            <ButtonBase onClick={() => onNavigate('docs')} sx={{ borderRadius: 1.5 }}>
-              <Typography variant="caption" color="#A8C7FA" sx={{ px: 1, py: 0.5 }}>View all →</Typography>
-            </ButtonBase>
-          </Box>
-
-          <Box display="flex" flexWrap="wrap" gap={1} mb={2.5}>
-            {Object.entries(docsByCategory).map(([cat, count]) => (
-              <Chip key={cat} label={`${cat} · ${count}`} size="small"
-                sx={{ backgroundColor: 'rgba(207,198,234,0.1)', color: '#CFC6EA', fontSize: '0.72rem', height: 24, borderRadius: 1.5 }} />
-            ))}
-            {Object.keys(docsByCategory).length === 0 && (
-              <Typography variant="body2" color="text.disabled">No docs yet</Typography>
-            )}
-          </Box>
-
-          <Divider sx={{ borderColor: 'rgba(255,255,255,0.06)', mb: 2 }} />
-
-          <Typography variant="caption" color="text.disabled" display="block" mb={1.25}>Recent</Typography>
-          {recentDocs.length === 0 ? (
-            <Typography variant="body2" color="text.disabled">No docs yet</Typography>
-          ) : recentDocs.map((doc, i) => (
-            <Box key={doc.id} mb={i < recentDocs.length - 1 ? 1.25 : 0}>
-              <Typography variant="body2" color="text.primary" fontWeight={500} noWrap>{doc.title}</Typography>
-              <Typography variant="caption" color="text.disabled">{doc.category} · {doc.date}</Typography>
+              </Stack>
             </Box>
+          </Box>
+        ))}
+      </Box>
+
+      <Box sx={{ display: 'grid', gridTemplateColumns: { xs: 'minmax(0, 1fr)', md: 'repeat(2, minmax(0, 1fr))' }, gap: 2.5 }}>
+        <Box sx={{ border: '1px solid rgba(255,255,255,0.08)', borderRadius: 1, p: 2 }}>
+          <Stack direction="row" alignItems="center" justifyContent="space-between" mb={1.5}>
+            <Stack direction="row" alignItems="center" spacing={1}>
+              <ViewKanbanRounded sx={{ fontSize: 19, color: '#A8C7FA' }} />
+              <Typography variant="subtitle2" fontWeight={700} color="text.primary">Project Board</Typography>
+            </Stack>
+            <Button size="small" variant="text" onClick={() => onNavigate('projects')}>View board</Button>
+          </Stack>
+          {STATUS_ORDER.map(status => (
+            <ButtonBase key={status} onClick={() => navigateToProjects({ priority: [], status: [status], labels: [] })} sx={{ width: '100%', minHeight: 40, px: 0.5, borderRadius: 1, justifyContent: 'space-between', '&:hover': { bgcolor: 'rgba(255,255,255,0.035)' } }}>
+              <Stack direction="row" alignItems="center" spacing={1}>
+                <Box sx={{ width: 8, height: 8, borderRadius: '50%', bgcolor: STATUS_COLORS[status] }} />
+                <Typography variant="body2" color="text.secondary">{STATUS_LABELS[status]}</Typography>
+              </Stack>
+              <Typography variant="body2" color="text.primary" fontWeight={700}>{activeTasks.filter(task => task.status === status).length}</Typography>
+            </ButtonBase>
+          ))}
+          {inProgress.slice(0, 4).length > 0 && <Divider sx={{ borderColor: 'rgba(255,255,255,0.07)', my: 1.5 }} />}
+          {inProgress.slice(0, 4).map(task => (
+            <ButtonBase key={task.id} onClick={() => openTask(task.id)} sx={{ width: '100%', minHeight: 42, px: 0.5, borderRadius: 1, justifyContent: 'flex-start', textAlign: 'left', '&:hover': { bgcolor: 'rgba(255,255,255,0.035)' } }}>
+              <Box minWidth={0}>
+                <Typography variant="body2" color="text.primary" noWrap>{task.title}</Typography>
+                <Typography variant="caption" color="text.disabled">{ownerLabel(task.assignedAgent)}</Typography>
+              </Box>
+            </ButtonBase>
           ))}
         </Box>
 
+        <Box sx={{ border: '1px solid rgba(255,255,255,0.08)', borderRadius: 1, p: 2 }}>
+          <Stack direction="row" alignItems="center" justifyContent="space-between" mb={1.5}>
+            <Stack direction="row" alignItems="center" spacing={1}>
+              <DescriptionRounded sx={{ fontSize: 19, color: '#CFC6EA' }} />
+              <Typography variant="subtitle2" fontWeight={700} color="text.primary">Documents</Typography>
+            </Stack>
+            <Button size="small" variant="text" onClick={() => onNavigate('docs')}>View docs</Button>
+          </Stack>
+          <Stack direction="row" spacing={0.75} flexWrap="wrap" useFlexGap mb={1.5}>
+            {Object.entries(docsByCategory).slice(0, 6).map(([category, count]) => (
+              <Chip key={category} size="small" label={`${category} ${count}`} sx={{ height: 24, borderRadius: 1, bgcolor: 'rgba(207,198,234,0.09)', color: '#CFC6EA' }} />
+            ))}
+          </Stack>
+          <Divider sx={{ borderColor: 'rgba(255,255,255,0.07)', mb: 0.75 }} />
+          {recentDocs.length === 0 ? (
+            <Typography variant="body2" color="text.secondary" py={1}>No documents yet.</Typography>
+          ) : recentDocs.map(doc => (
+            <ButtonBase key={doc.id} onClick={() => openDoc(doc)} sx={{ width: '100%', minHeight: 48, px: 0.5, borderRadius: 1, justifyContent: 'flex-start', textAlign: 'left', '&:hover': { bgcolor: 'rgba(255,255,255,0.035)' } }}>
+              <Box minWidth={0}>
+                <Typography variant="body2" color="text.primary" noWrap>{doc.title}</Typography>
+                <Typography variant="caption" color="text.disabled">{doc.category}{doc.date ? ` · ${doc.date}` : ''}</Typography>
+              </Box>
+            </ButtonBase>
+          ))}
+        </Box>
       </Box>
     </Box>
   )

@@ -1,0 +1,567 @@
+import crypto from 'crypto'
+import fs from 'fs/promises'
+import path from 'path'
+import matter from 'gray-matter'
+import { query } from '@/lib/persistence/postgres'
+import { MEMBER_RELEASE_HISTORY_DAYS, releaseAccessFor } from '@/lib/releases'
+import {
+  readPipelineProjectionForSpace,
+  resolvePipelineSpaceAccess,
+  resolveProjectBoardAccess,
+} from '@/lib/tenancy'
+import { configuredOwnerEmail, normalizeUserEmail, type AppUser } from '@/lib/users'
+
+export type AppDocument = {
+  id: string
+  title: string
+  date: string
+  tags: string[]
+  category: string
+  slug: string
+  content: string
+  excerpt: string
+  kind: string
+  status: string
+  source: string
+  sourcePath: string | null
+}
+
+type DocumentRow = {
+  id: string
+  title: string
+  document_date: string
+  tags: string[] | null
+  category: string
+  slug: string
+  content: string
+  excerpt: string
+  kind: string
+  status: string
+  source: string
+  source_path: string | null
+}
+
+type TaskBriefRow = {
+  title: string
+  status: string
+  priority: string
+  updated_at: string
+  next_action: string | null
+  category: string
+}
+
+type ReleaseBriefRow = {
+  title: string
+  summary: string
+  deployed_at: string
+  features: string[] | null
+  fixes: string[] | null
+}
+
+export type DocumentBriefSelection = {
+  boardId?: string | null
+  pipelineId?: string | null
+}
+
+type RepositorySyncGlobal = typeof globalThis & {
+  __clawpilotRepositoryDocsSynced?: Set<string>
+}
+
+function sha256(value: string): string {
+  return crypto.createHash('sha256').update(value).digest('hex')
+}
+
+function singleLine(value: unknown): string {
+  return String(value || '').replace(/\s+/g, ' ').trim()
+}
+
+function excerptFor(content: string): string {
+  return content
+    .replace(/^---[\s\S]*?---\s*/m, '')
+    .replace(/^#+\s+/gm, '')
+    .replace(/[`*_>[\]#|]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 180)
+}
+
+function titleFromMarkdown(content: string, fallback: string): string {
+  const heading = content.split('\n').find((line) => /^#\s+\S/.test(line))
+  return singleLine(heading?.replace(/^#\s+/, '') || fallback)
+}
+
+function safeSlug(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/\.md$/i, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 180) || 'document'
+}
+
+function markdownList(items: string[], empty: string): string {
+  return items.length > 0 ? items.map((item) => `- ${singleLine(item)}`).join('\n') : `- ${empty}`
+}
+
+function money(value: number): string {
+  return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(value || 0)
+}
+
+async function upsertDocument(input: {
+  ownerEmail: string
+  sourceKey: string
+  source: 'system' | 'repository' | 'user' | 'agent'
+  kind: string
+  status: 'draft' | 'active' | 'superseded' | 'historical' | 'generated'
+  title: string
+  slug: string
+  category: string
+  content: string
+  tags: string[]
+  sourcePath?: string | null
+  boardId?: string | null
+  pipelineId?: string | null
+  generatedAt?: string | null
+}) {
+  const content = input.content.trim()
+  const contentHash = sha256(content)
+  await query(
+    `
+      INSERT INTO app_documents (
+        owner_email, source_key, source, kind, status, title, slug, category,
+        content, excerpt, tags, source_path, content_hash, board_id, pipeline_id,
+        generated_at, created_at, updated_at
+      )
+      VALUES (
+        $1, $2, $3, $4, $5, $6, $7, $8,
+        $9, $10, $11::text[], $12, $13, $14::uuid, $15::uuid,
+        $16::timestamptz, now(), now()
+      )
+      ON CONFLICT (owner_email, source_key) DO UPDATE SET
+        source = EXCLUDED.source,
+        kind = EXCLUDED.kind,
+        status = EXCLUDED.status,
+        title = EXCLUDED.title,
+        slug = EXCLUDED.slug,
+        category = EXCLUDED.category,
+        content = EXCLUDED.content,
+        excerpt = EXCLUDED.excerpt,
+        tags = EXCLUDED.tags,
+        source_path = EXCLUDED.source_path,
+        content_hash = EXCLUDED.content_hash,
+        board_id = EXCLUDED.board_id,
+        pipeline_id = EXCLUDED.pipeline_id,
+        generated_at = EXCLUDED.generated_at,
+        updated_at = now()
+      WHERE app_documents.content_hash <> EXCLUDED.content_hash
+         OR app_documents.source IS DISTINCT FROM EXCLUDED.source
+         OR app_documents.kind IS DISTINCT FROM EXCLUDED.kind
+         OR app_documents.status <> EXCLUDED.status
+         OR app_documents.title <> EXCLUDED.title
+         OR app_documents.slug <> EXCLUDED.slug
+         OR app_documents.category <> EXCLUDED.category
+         OR app_documents.excerpt IS DISTINCT FROM EXCLUDED.excerpt
+         OR app_documents.tags IS DISTINCT FROM EXCLUDED.tags
+         OR app_documents.source_path IS DISTINCT FROM EXCLUDED.source_path
+         OR app_documents.board_id IS DISTINCT FROM EXCLUDED.board_id
+         OR app_documents.pipeline_id IS DISTINCT FROM EXCLUDED.pipeline_id
+         OR app_documents.generated_at IS DISTINCT FROM EXCLUDED.generated_at
+    `,
+    [
+      input.ownerEmail,
+      input.sourceKey,
+      input.source,
+      input.kind,
+      input.status,
+      input.title,
+      input.slug,
+      input.category,
+      content,
+      excerptFor(content),
+      input.tags,
+      input.sourcePath || null,
+      contentHash,
+      input.boardId || null,
+      input.pipelineId || null,
+      input.generatedAt || null,
+    ],
+  )
+}
+
+export async function refreshUserBriefs(
+  user: AppUser,
+  selection: DocumentBriefSelection = {},
+): Promise<void> {
+  const ownerEmail = normalizeUserEmail(user.email)
+  const [board, pipeline] = await Promise.all([
+    resolveProjectBoardAccess({ actorEmail: ownerEmail, boardId: selection.boardId })
+      .catch((error) => selection.boardId
+        ? resolveProjectBoardAccess({ actorEmail: ownerEmail })
+        : Promise.reject(error)),
+    resolvePipelineSpaceAccess({ actorEmail: ownerEmail, pipelineId: selection.pipelineId })
+      .catch((error) => selection.pipelineId
+        ? resolvePipelineSpaceAccess({ actorEmail: ownerEmail })
+        : Promise.reject(error)),
+  ])
+  const releaseAccess = releaseAccessFor(user)
+  const [tasksResult, pipelineProjection, releasesResult] = await Promise.all([
+    query<TaskBriefRow>(
+      `
+        SELECT
+          title,
+          status,
+          priority,
+          updated_at::text,
+          NULLIF(payload->>'nextAction', '') AS next_action,
+          category
+        FROM tasks
+        WHERE board_id = $1::uuid
+          AND archived = false
+          AND deleted_at IS NULL
+        ORDER BY
+          CASE priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
+          updated_at DESC
+      `,
+      [board.id],
+    ),
+    readPipelineProjectionForSpace(pipeline),
+    query<ReleaseBriefRow>(
+      `
+        SELECT title, summary, deployed_at::text, features, fixes
+        FROM release_entries
+        WHERE $1::boolean
+          OR deployed_at >= now() - ($2::integer * interval '1 day')
+        ORDER BY deployed_at DESC
+        LIMIT 5
+      `,
+      [releaseAccess.historyScope === 'full', MEMBER_RELEASE_HISTORY_DAYS],
+    ),
+  ])
+
+  const now = new Date().toISOString()
+  const tasks = tasksResult.rows
+  const openTasks = tasks.filter((task) => task.status !== 'done')
+  const statusCounts = ['backlog', 'todo', 'in-progress', 'review', 'done'].map((status) => ({
+    status,
+    count: tasks.filter((task) => task.status === status).length,
+  }))
+  const latestRelease = releasesResult.rows[0]
+  const buildContent = [
+    '# Build Brief',
+    '',
+    `Updated: ${now}`,
+    '',
+    '## Current Release',
+    latestRelease
+      ? `**${singleLine(latestRelease.title)}** - ${singleLine(latestRelease.summary) || 'Release recorded.'}`
+      : 'No deployment release has been recorded yet.',
+    '',
+    '## Workspace Workload',
+    `- Open tasks: ${openTasks.length}`,
+    `- In progress: ${tasks.filter((task) => task.status === 'in-progress').length}`,
+    `- In review: ${tasks.filter((task) => task.status === 'review').length}`,
+    `- Completed: ${tasks.filter((task) => task.status === 'done').length}`,
+    '',
+    '## Recent Releases',
+    markdownList(releasesResult.rows.map((release) => `${new Date(release.deployed_at).toLocaleDateString('en-US')} - ${release.title}`), 'No releases recorded.'),
+  ].join('\n')
+
+  const projectContent = [
+    '# Project Board Brief',
+    '',
+    `Updated: ${now}`,
+    '',
+    '## Board Summary',
+    `Board: ${singleLine(board.name)}`,
+    ...statusCounts.map(({ status, count }) => `- ${status}: ${count}`),
+    '',
+    '## Priority Work',
+    markdownList(openTasks.slice(0, 10).map((task) => `${task.title} (${task.status}, ${task.priority})${task.next_action ? ` - Next: ${task.next_action}` : ''}`), 'No open work.'),
+  ].join('\n')
+
+  const summary = pipelineProjection.summary || {}
+  const opportunities = Array.isArray(pipelineProjection.opportunities) ? pipelineProjection.opportunities : []
+  const pipelineContent = [
+    '# Pipeline Brief',
+    '',
+    `Updated: ${now}`,
+    '',
+    `Pipeline: ${singleLine(pipeline.name || 'My pipeline')}`,
+    `Source: ${singleLine(pipelineProjection.source || 'app')}`,
+    `Last synchronized: ${singleLine(pipelineProjection.syncedAt || 'Not synchronized')}`,
+    '',
+    '## Summary',
+    `- Opportunities: ${Number(summary.opportunities || 0)}`,
+    `- Organizations: ${Number(summary.organizations || 0)}`,
+    `- Contacts: ${Number(summary.contacts || 0)}`,
+    `- Open value: ${money(Number(summary.totalOpenValue || 0))}`,
+    '',
+    '## Current Opportunities',
+    markdownList(opportunities.slice(0, 10).map((item) => `${item.name || 'Untitled'} - ${item.stage || 'No stage'} - ${money(Number(item.value || 0))}${item.organization ? ` - ${item.organization}` : ''}`), 'No opportunities recorded.'),
+  ].join('\n')
+
+  const researchTasks = tasks.filter((task) => task.category === 'research')
+  const radarContent = [
+    '# AI and Opportunity Radar',
+    '',
+    `Updated: ${now}`,
+    '',
+    '## Research Queue',
+    markdownList(researchTasks.map((task) => `${task.title} (${task.status})${task.next_action ? ` - Next: ${task.next_action}` : ''}`), 'No research items are queued.'),
+    '',
+    '## Intake Standard',
+    '- Record the source and publication date.',
+    '- State the relevant ClawPilot module, project, or pipeline opportunity.',
+    '- Separate verified capability from a proposed experiment.',
+    '- End with one concrete evaluation action.',
+  ].join('\n')
+
+  await Promise.all([
+    upsertDocument({ ownerEmail, sourceKey: 'system:build-brief', source: 'system', kind: 'build-brief', status: 'generated', title: 'Build Brief', slug: 'build-brief', category: 'briefings', content: buildContent, tags: ['build', 'releases'], generatedAt: now }),
+    upsertDocument({ ownerEmail, sourceKey: 'system:project-brief', source: 'system', kind: 'project-report', status: 'generated', title: 'Project Board Brief', slug: 'project-board-brief', category: 'projects', content: projectContent, tags: ['projects', 'tasks'], boardId: board.id, generatedAt: now }),
+    upsertDocument({ ownerEmail, sourceKey: 'system:pipeline-brief', source: 'system', kind: 'pipeline-report', status: 'generated', title: 'Pipeline Brief', slug: 'pipeline-brief', category: 'pipeline', content: pipelineContent, tags: ['pipeline', 'report'], pipelineId: pipeline.id, generatedAt: now }),
+    upsertDocument({ ownerEmail, sourceKey: 'system:ai-opportunity-radar', source: 'system', kind: 'research-radar', status: 'generated', title: 'AI and Opportunity Radar', slug: 'ai-opportunity-radar', category: 'radar', content: radarContent, tags: ['ai', 'research', 'opportunities'], generatedAt: now }),
+  ])
+}
+
+const GENERATED_BRIEF_KEYS = [
+  'system:build-brief',
+  'system:project-brief',
+  'system:pipeline-brief',
+  'system:ai-opportunity-radar',
+]
+
+export async function ensureUserBriefs(
+  user: AppUser,
+  selection: DocumentBriefSelection = {},
+): Promise<void> {
+  const ownerEmail = normalizeUserEmail(user.email)
+  const [board, pipeline] = await Promise.all([
+    resolveProjectBoardAccess({ actorEmail: ownerEmail, boardId: selection.boardId })
+      .catch((error) => selection.boardId
+        ? resolveProjectBoardAccess({ actorEmail: ownerEmail })
+        : Promise.reject(error)),
+    resolvePipelineSpaceAccess({ actorEmail: ownerEmail, pipelineId: selection.pipelineId })
+      .catch((error) => selection.pipelineId
+        ? resolvePipelineSpaceAccess({ actorEmail: ownerEmail })
+        : Promise.reject(error)),
+  ])
+  const existing = await query<{ source_key: string; board_id: string | null; pipeline_id: string | null }>(
+    `
+      SELECT source_key, board_id::text, pipeline_id::text
+      FROM app_documents
+      WHERE owner_email = $1
+        AND source_key = ANY($2::text[])
+    `,
+    [ownerEmail, GENERATED_BRIEF_KEYS],
+  )
+  const byKey = new Map(existing.rows.map((row) => [row.source_key, row]))
+  const complete = GENERATED_BRIEF_KEYS.every((key) => byKey.has(key))
+    && byKey.get('system:project-brief')?.board_id === board.id
+    && byKey.get('system:pipeline-brief')?.pipeline_id === pipeline.id
+  if (!complete) {
+    await refreshUserBriefs(user, { boardId: board.id, pipelineId: pipeline.id })
+  }
+}
+
+async function repositoryDocsRoot(): Promise<string | null> {
+  const candidates = [
+    process.env.CLAWPILOT_REPO_ROOT || '',
+    process.cwd(),
+    path.resolve(process.cwd(), '..'),
+  ].filter(Boolean)
+  for (const candidate of candidates) {
+    try {
+      if ((await fs.stat(path.join(candidate, 'docs'))).isDirectory()) return candidate
+    } catch {
+      // Try the next runtime layout.
+    }
+  }
+  return null
+}
+
+async function markdownFiles(root: string): Promise<string[]> {
+  const entries = await fs.readdir(root, { withFileTypes: true })
+  const nested = await Promise.all(entries.map(async (entry) => {
+    const filePath = path.join(root, entry.name)
+    if (entry.isDirectory()) {
+      if (['.git', '.next', 'node_modules', 'data', 'data-dev', 'credentials'].includes(entry.name)) return []
+      return markdownFiles(filePath)
+    }
+    if (path.dirname(filePath) === root && entry.name === 'AGENTS.md') return []
+    return entry.isFile() && entry.name.toLowerCase().endsWith('.md') ? [filePath] : []
+  }))
+  return nested.flat().sort()
+}
+
+function repositoryClassification(relativePath: string, metadata: Record<string, unknown>) {
+  const normalized = relativePath.replace(/\\/g, '/')
+  const logicalPath = normalized.replace(/^docs\//, '')
+  const explicitStatus = String(metadata.status || '')
+  const currentRootDocument = normalized === 'README.md'
+  const historical = (!explicitStatus && !currentRootDocument)
+    || /(^|\/)(reviews|incidents|history)(\/|$)/.test(logicalPath)
+    || /2026-0[3-5]/.test(logicalPath)
+    || /audit|worklog|stabilization-report/i.test(logicalPath)
+  const status = ['draft', 'active', 'superseded', 'historical', 'generated'].includes(explicitStatus)
+    ? explicitStatus as 'draft' | 'active' | 'superseded' | 'historical' | 'generated'
+    : historical ? 'historical' : 'active'
+  const folder = logicalPath.split('/')[0]
+  const category = status === 'historical'
+    ? 'archive'
+    : folder === 'architecture' ? 'architecture'
+      : folder === 'operations' || folder === 'governance' ? 'operations'
+        : folder === 'integrations' ? 'integrations'
+          : folder === 'releases' ? 'releases'
+            : 'knowledge'
+  return { status, category }
+}
+
+export async function syncRepositoryDocuments(
+  user: AppUser,
+  options: { force?: boolean } = {},
+): Promise<void> {
+  if (normalizeUserEmail(user.email) !== configuredOwnerEmail()) return
+  const runtime = globalThis as RepositorySyncGlobal
+  if (!runtime.__clawpilotRepositoryDocsSynced) runtime.__clawpilotRepositoryDocsSynced = new Set()
+  if (!options.force && runtime.__clawpilotRepositoryDocsSynced.has(user.email)) return
+  const root = await repositoryDocsRoot()
+  if (!root) return
+  const files = await markdownFiles(root)
+  const repositoryDocuments = (await Promise.all(files.map(async (filePath) => {
+    const raw = await fs.readFile(filePath, 'utf8')
+    const parsed = matter(raw)
+    if (parsed.data.app_visible === false) return null
+    const relativePath = path.relative(root, filePath).replace(/\\/g, '/')
+    const classification = repositoryClassification(relativePath, parsed.data)
+    const title = singleLine(parsed.data.title) || titleFromMarkdown(parsed.content, path.basename(filePath, '.md'))
+    const tags = Array.isArray(parsed.data.tags) ? parsed.data.tags.map(singleLine).filter(Boolean) : []
+    return {
+      ownerEmail: user.email,
+      sourceKey: `repository:${relativePath}`,
+      source: 'repository' as const,
+      kind: singleLine(parsed.data.kind) || classification.category,
+      status: classification.status,
+      title,
+      slug: `repo-${safeSlug(relativePath)}`,
+      category: classification.category,
+      content: parsed.content || raw,
+      tags: Array.from(new Set(['clawpilot', ...tags])),
+      sourcePath: relativePath,
+    }
+  }))).filter((document): document is NonNullable<typeof document> => document !== null)
+  await Promise.all(repositoryDocuments.map((document) => upsertDocument(document)))
+  await query(
+    `
+      DELETE FROM app_documents
+      WHERE owner_email = $1
+        AND source = 'repository'
+        AND NOT (source_key = ANY($2::text[]))
+    `,
+    [user.email, repositoryDocuments.map((document) => document.sourceKey)],
+  )
+  runtime.__clawpilotRepositoryDocsSynced.add(user.email)
+}
+
+export async function listLocalRepositoryDocuments(searchValue?: unknown): Promise<AppDocument[]> {
+  const root = await repositoryDocsRoot()
+  if (!root) return []
+  const search = singleLine(searchValue).toLowerCase()
+  const files = await markdownFiles(root)
+  const documents = (await Promise.all(files.map(async (filePath): Promise<AppDocument | null> => {
+    const raw = await fs.readFile(filePath, 'utf8')
+    const parsed = matter(raw)
+    if (parsed.data.app_visible === false) return null
+    const relativePath = path.relative(root, filePath).replace(/\\/g, '/')
+    const classification = repositoryClassification(relativePath, parsed.data)
+    const title = singleLine(parsed.data.title) || titleFromMarkdown(parsed.content, path.basename(filePath, '.md'))
+    const tags = Array.isArray(parsed.data.tags) ? parsed.data.tags.map(singleLine).filter(Boolean) : []
+    const dateValue = parsed.data.date instanceof Date
+      ? parsed.data.date.toISOString().slice(0, 10)
+      : singleLine(parsed.data.date).slice(0, 10)
+    const document: AppDocument = {
+      id: `repository:${relativePath}`,
+      title,
+      date: dateValue,
+      tags: Array.from(new Set(['clawpilot', ...tags])),
+      category: classification.category,
+      slug: `repo-${safeSlug(relativePath)}`,
+      content: parsed.content || raw,
+      excerpt: excerptFor(parsed.content || raw),
+      kind: singleLine(parsed.data.kind) || classification.category,
+      status: classification.status,
+      source: 'repository',
+      sourcePath: relativePath,
+    }
+    if (search && ![document.title, document.category, document.excerpt, document.content, ...document.tags]
+      .some(value => value.toLowerCase().includes(search))) return null
+    return document
+  }))).filter((document): document is AppDocument => document !== null)
+
+  return documents.sort((left, right) => {
+    const statusOrder = (status: string) => status === 'active' ? 0 : status === 'generated' ? 1 : status === 'draft' ? 2 : 3
+    return statusOrder(left.status) - statusOrder(right.status)
+      || right.date.localeCompare(left.date)
+      || left.title.localeCompare(right.title)
+  })
+}
+
+function toDocument(row: DocumentRow): AppDocument {
+  return {
+    id: row.id,
+    title: row.title,
+    date: row.document_date ? new Date(row.document_date).toISOString().slice(0, 10) : '',
+    tags: Array.isArray(row.tags) ? row.tags : [],
+    category: row.category,
+    slug: row.slug,
+    content: row.content,
+    excerpt: row.excerpt,
+    kind: row.kind,
+    status: row.status,
+    source: row.source,
+    sourcePath: row.source_path,
+  }
+}
+
+export async function listUserDocuments(emailValue: unknown, searchValue?: unknown): Promise<AppDocument[]> {
+  const ownerEmail = normalizeUserEmail(emailValue)
+  const search = singleLine(searchValue).slice(0, 200)
+  const result = await query<DocumentRow>(
+    `
+      SELECT
+        id::text,
+        title,
+        COALESCE(generated_at, updated_at)::text AS document_date,
+        tags,
+        category,
+        slug,
+        content,
+        excerpt,
+        kind,
+        status,
+        source,
+        source_path
+      FROM app_documents
+      WHERE owner_email = $1
+        AND (
+          $2 = ''
+          OR search_vector @@ websearch_to_tsquery('english'::regconfig, $2)
+          OR title ILIKE '%' || $2 || '%'
+          OR array_to_string(tags, ' ') ILIKE '%' || $2 || '%'
+        )
+      ORDER BY
+        CASE source_key
+          WHEN 'system:build-brief' THEN 0
+          WHEN 'system:project-brief' THEN 1
+          WHEN 'system:pipeline-brief' THEN 2
+          WHEN 'system:ai-opportunity-radar' THEN 3
+          ELSE 4
+        END,
+        CASE status WHEN 'active' THEN 0 WHEN 'generated' THEN 1 WHEN 'draft' THEN 2 ELSE 3 END,
+        updated_at DESC,
+        title ASC
+    `,
+    [ownerEmail, search],
+  )
+  return result.rows.map(toDocument)
+}

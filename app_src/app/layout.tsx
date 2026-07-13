@@ -6,7 +6,7 @@ function assertDevIsolationEnv() {
   if (process.env.NEXT_PHASE === 'phase-production-build') return
 
   const cwd = process.cwd()
-  const isDevWorktreeRuntime = cwd.includes('/clawd-app-dev/app_src')
+  const isDevWorktreeRuntime = cwd.endsWith('/Desktop/clawpilot/app_src')
   if (!isDevWorktreeRuntime) return
 
   const required = [
@@ -22,7 +22,7 @@ function assertDevIsolationEnv() {
 
   throw new Error(
     `Dev runtime requires isolated data env vars. Missing: ${missing.join(', ')}. ` +
-    `Start dev via scripts/dev-start.sh (from /Users/agentsuburbiasandwich/Desktop/clawd-app).`
+    `Start dev via scripts/dev-start.sh from the canonical ClawPilot repository.`
   )
 }
 
@@ -33,8 +33,12 @@ export const viewport = {
 }
 
 export const metadata: Metadata = {
-  title: '🛩️ ClawPilot',
+  title: 'ClawPilot',
   description: 'ClawPilot Command Center',
+  icons: {
+    icon: '/brand/clawpilot-mark.svg',
+    apple: '/brand/email/clawpilot-mark-email.png',
+  },
 };
 
 export default function RootLayout({ children }: { children: ReactNode }) {

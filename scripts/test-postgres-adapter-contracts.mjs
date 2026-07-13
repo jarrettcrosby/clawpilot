@@ -43,7 +43,8 @@ const usersAdapter = read('app_src/lib/users.ts')
 assertIncludes(usersAdapter, 'ensureOwnerUser', 'app users adapter')
 assertIncludes(usersAdapter, 'inviteAppUser', 'app users adapter')
 assertIncludes(usersAdapter, 'canInviteUsers', 'app users adapter')
-assertIncludes(usersAdapter, "current?.status === 'disabled' && !canManageUserAccess(actor)", 'disabled user restore authorization')
+assertIncludes(usersAdapter, "current?.status === 'disabled'", 'disabled user restore authorization')
+assertIncludes(usersAdapter, 'Restore the disabled user before sending a new invitation', 'disabled user invitation boundary')
 assertIncludes(usersAdapter, 'updateAppUserProfile', 'app users adapter')
 assertIncludes(usersAdapter, 'updateAppUserAccess', 'app users adapter')
 assertIncludes(usersAdapter, 'AppUserAuthorizationError', 'app user authorization errors')
@@ -68,6 +69,48 @@ assertIncludes(agentDispatchMigration, "target_system = 'agent_runtime'", 'agent
 for (const field of ['display_name', 'permissions jsonb', 'board_id uuid']) {
   assertIncludes(tenancyMigration, field, 'multi-tenant migration')
 }
+
+const invitationMigration = read('db/migrations/0010_user_invitations.sql')
+assertIncludes(invitationMigration, 'CREATE TABLE IF NOT EXISTS app_user_invitations', 'invitation migration')
+assertIncludes(invitationMigration, "purpose text NOT NULL DEFAULT 'sign_in'", 'invitation-purpose auth migration')
+assertIncludes(invitationMigration, 'invitation_id uuid REFERENCES app_user_invitations', 'invitation-bound auth migration')
+
+const knowledgeMigration = read('db/migrations/0011_knowledge_releases_checkpoints.sql')
+for (const table of ['app_documents', 'release_entries', 'data_checkpoints']) {
+  assertIncludes(knowledgeMigration, `CREATE TABLE IF NOT EXISTS ${table}`, 'knowledge and release migration')
+}
+assertIncludes(knowledgeMigration, 'search_vector tsvector GENERATED ALWAYS', 'document search migration')
+
+const hardeningMigration = read('db/migrations/0012_invitation_release_hardening.sql')
+assertIncludes(hardeningMigration, 'idx_app_user_invitations_one_active', 'single active invitation migration')
+assertIncludes(hardeningMigration, 'ADD COLUMN IF NOT EXISTS release_key', 'release deployment identity migration')
+assertIncludes(hardeningMigration, 'idx_release_entries_environment_key', 'release deployment identity migration')
+const invitationDeliveryMigration = read('db/migrations/0013_invitation_delivery_coordination.sql')
+assertIncludes(invitationDeliveryMigration, 'supersedes_id', 'invitation delivery coordination migration')
+const invitationPendingMigration = read('db/migrations/0014_invitation_delivery_pending.sql')
+assertIncludes(invitationPendingMigration, 'delivery_pending_at', 'invitation pending delivery migration')
+assertIncludes(invitationPendingMigration, 'idx_app_user_invitations_one_delivery_pending', 'single pending invitation delivery')
+
+const invitationAdapter = read('app_src/lib/invitations.ts')
+assertIncludes(invitationAdapter, 'requestInvitationAuthMagicCode', 'invitation adapter')
+assertIncludes(invitationAdapter, 'revoked_at IS NULL', 'invitation revocation contract')
+assertIncludes(invitationAdapter, 'FOR UPDATE', 'invitation issuance serialization')
+assertIncludes(invitationAdapter, 'INVITATION_DELIVERY_STALE_MINUTES', 'invitation delivery serialization')
+assertIncludes(invitationAdapter, 'supersedes_id', 'invitation rollback chain')
+assertIncludes(invitationAdapter, 'delivery_pending_at', 'invitation two-phase delivery')
+assertIncludes(invitationAdapter, 'markInvitationDelivered', 'invitation activation after delivery')
+const magicCodeAdapter = read('app_src/lib/authMagicCode.ts')
+assertIncludes(magicCodeAdapter, "user.status !== 'active'", 'ordinary sign-in active-user requirement')
+assertIncludes(magicCodeAdapter, 'requestInvitationAuthMagicCode', 'invitation-purpose sign-in')
+assertIncludes(magicCodeAdapter, 'UPDATE app_user_invitations', 'atomic invitation acceptance')
+assertIncludes(magicCodeAdapter, 'AUTHORIZATION_CHANGED', 'invitation authorization rollback')
+
+const documentsAdapter = read('app_src/lib/documents.ts')
+assertIncludes(documentsAdapter, 'WHERE owner_email = $1', 'user-scoped document reads')
+assertIncludes(documentsAdapter, "sourceKey: 'system:build-brief'", 'generated build brief')
+assertIncludes(documentsAdapter, "sourceKey: 'system:project-brief'", 'generated project brief')
+assertIncludes(documentsAdapter, "sourceKey: 'system:pipeline-brief'", 'generated pipeline brief')
+assertIncludes(documentsAdapter, 'document.content', 'local full-document search')
 
 const tenancyAdapter = read('app_src/lib/tenancy.ts')
 assertIncludes(tenancyAdapter, 'ensureDefaultResourcesForUser', 'tenancy adapter')
@@ -152,6 +195,8 @@ for (const requiredVariable of [
     'DATABASE_URL',
     'MATON_API_KEY',
     'MATON_GMAIL_CONNECTION_ID',
+    'CLAWPILOT_MAIL_FROM',
+    'CLAWPILOT_PUBLIC_URL',
   'PIPELINE_SHEET_ID',
   'PIPELINE_OUTBOX_WORKER_SECRET',
 ]) {
@@ -169,6 +214,8 @@ assertIncludes(authProxy, 'HOSTED_RUNTIME', 'auth proxy fail-closed hosted mode'
 const loginRoute = read('app_src/app/api/auth/login/route.ts')
 assertIncludes(loginRoute, 'MAX_ATTEMPTS', 'login rate limit')
 assertIncludes(loginRoute, 'timingSafeEqual', 'login password comparison')
+assertIncludes(loginRoute, 'x-clawpilot-operator-secret', 'login automation secret boundary')
+assertIncludes(loginRoute, "return NextResponse.json({ ok: false, error: 'Not found' }, { status: 404 })", 'login automation hidden boundary')
 
 const magicRequestRoute = read('app_src/app/api/auth/magic/request/route.ts')
 assertIncludes(magicRequestRoute, 'requestAuthMagicCode', 'magic-code request route')
@@ -191,6 +238,12 @@ assertIncludes(healthRoute, '0006_agent_user_attribution.sql', 'hosted attributi
 assertIncludes(healthRoute, '0007_multi_tenant_workspaces.sql', 'hosted workspace migration health')
 assertIncludes(healthRoute, '0008_workspace_security_hardening.sql', 'hosted workspace security migration health')
 assertIncludes(healthRoute, '0009_agent_dispatch_outbox.sql', 'hosted agent dispatch migration health')
+assertIncludes(healthRoute, '0010_user_invitations.sql', 'hosted invitation migration health')
+assertIncludes(healthRoute, '0011_knowledge_releases_checkpoints.sql', 'hosted knowledge migration health')
+assertIncludes(healthRoute, '0012_invitation_release_hardening.sql', 'hosted release hardening migration health')
+assertIncludes(healthRoute, '0013_invitation_delivery_coordination.sql', 'hosted invitation delivery migration health')
+assertIncludes(healthRoute, '0014_invitation_delivery_pending.sql', 'hosted invitation pending migration health')
+assertIncludes(healthRoute, 'migration_checksums_present', 'hosted migration checksum health')
 assertIncludes(healthRoute, 'queryAgentCredentials', 'shared agent credential store health')
 assertIncludes(healthRoute, 'readAgentDispatchWorkerHeartbeatFromPostgres', 'hosted agent worker health')
 assertIncludes(healthRoute, 'getAgentRuntime', 'hosted agent runtime health')
@@ -222,5 +275,24 @@ assertIncludes(assignmentsRoute, 'task: tasks[idx]', 'assignment UI task refresh
 const agentsSection = read('app_src/components/agents/AgentsSection.tsx')
 assertIncludes(agentsSection, 'setSelectedAgentId(agentId)', 'new assignment agent focus')
 assertIncludes(agentsSection, 'setSelectedTaskId(taskId)', 'new assignment task focus')
+
+const migrator = read('scripts/db-migrate.mjs')
+assertIncludes(migrator, "pg_advisory_lock(hashtext('clawpilot-schema-migrations'))", 'serialized database migrations')
+assertIncludes(migrator, "createHash('sha256')", 'migration checksums')
+assertIncludes(migrator, 'migration checksum mismatch', 'migration drift detection')
+
+const vercelConfig = read('app_src/vercel.json')
+assertIncludes(vercelConfig, 'npm run build:vercel', 'Vercel deployment migration gate')
+const vercelBuild = read('scripts/vercel-build.mjs')
+assertIncludes(vercelBuild, "if (environment === 'production')", 'production Vercel deployment gate')
+assertIncludes(vercelBuild, "if (branch !== 'main')", 'production Vercel fail-closed branch gate')
+assertIncludes(vercelBuild, "environment === 'preview' && branch === 'dev'", 'development Vercel deployment gate')
+assertIncludes(vercelBuild, "run('npm', ['run', 'build'], appRoot)", 'Vercel compile-before-migrate ordering')
+
+const versionsRoute = read('app_src/app/api/versions/route.ts')
+assertIncludes(versionsRoute, 'getLocalReleaseOverview', 'local release history')
+
+assertIncludes(usersAdapter, "target.status === 'invited'", 'invitation-only user activation')
+assertIncludes(usersAdapter, "role === 'member'", 'member permission sanitization')
 
 console.log('PASS test-postgres-adapter-contracts')

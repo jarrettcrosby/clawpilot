@@ -78,6 +78,7 @@ function isPublicApi(pathname: string) {
     normalizedPath === '/api/health' ||
     normalizedPath === '/api/version' ||
     normalizedPath === '/api/client-error' ||
+    normalizedPath === '/api/invitations/accept' ||
     normalizedPath === '/api/pipeline/sync/outbox/process' ||
     normalizedPath === '/api/agents/dispatch/process' ||
     normalizedPath.startsWith('/api/auth/')
@@ -99,6 +100,15 @@ export async function proxy(req: NextRequest) {
   if (!AUTH_REQUIRED) return NextResponse.next()
 
   if (pathname.startsWith('/api/') && isPublicApi(pathname)) return NextResponse.next()
+
+  if (pathname === '/welcome') {
+    const response = NextResponse.next()
+    response.headers.set('Cache-Control', 'no-store')
+    response.headers.set('Referrer-Policy', 'no-referrer')
+    response.headers.set('X-Robots-Tag', 'noindex, nofollow')
+    return response
+  }
+  if (pathname.startsWith('/brand/')) return NextResponse.next()
 
   const token = req.cookies.get(COOKIE_NAME)?.value
   const session = await validSession(token)

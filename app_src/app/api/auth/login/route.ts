@@ -54,6 +54,11 @@ function secureEqual(provided: string, expected: string) {
 
 export async function POST(req: NextRequest) {
   try {
+    const operatorSecret = String(req.headers.get('x-clawpilot-operator-secret') || '')
+    const expectedOperatorSecret = String(process.env.PIPELINE_OUTBOX_WORKER_SECRET || '')
+    if (expectedOperatorSecret.length < 32 || !secureEqual(operatorSecret, expectedOperatorSecret)) {
+      return NextResponse.json({ ok: false, error: 'Not found' }, { status: 404 })
+    }
     const now = Date.now()
     pruneAttempts(now)
     const key = clientKey(req)
