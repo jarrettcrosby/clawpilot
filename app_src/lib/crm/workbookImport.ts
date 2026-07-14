@@ -123,6 +123,7 @@ export async function inspectCrmWorkbook(context: PipelineSheetContext) {
   return {
     tabs,
     counts: Object.fromEntries(TABS.map((tab) => [tab.toLowerCase(), tabs[tab].length])) as Record<string, number>,
+    headers: Object.fromEntries(TABS.map((tab) => [tab.toLowerCase(), Object.keys(tabs[tab][0]?.raw || {})])) as Record<string, string[]>,
   }
 }
 

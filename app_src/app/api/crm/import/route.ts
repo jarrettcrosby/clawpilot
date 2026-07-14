@@ -30,7 +30,7 @@ export async function GET(req: NextRequest) {
   try {
     const { sheetContext } = await context(req)
     const inspected = await inspectCrmWorkbook(sheetContext)
-    return NextResponse.json({ ok: true, counts: inspected.counts })
+    return NextResponse.json({ ok: true, counts: inspected.counts, headers: inspected.headers })
   } catch (error) {
     return responseError(error)
   }

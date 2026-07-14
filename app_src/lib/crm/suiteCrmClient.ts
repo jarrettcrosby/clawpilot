@@ -59,6 +59,22 @@ async function readJson(response: Response): Promise<unknown> {
   }
 }
 
+function responseErrorDetail(parsed: unknown) {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return ''
+  const errors = (parsed as { errors?: unknown }).errors
+  if (!Array.isArray(errors)) return ''
+  return errors
+    .slice(0, 3)
+    .map((error) => {
+      if (!error || typeof error !== 'object' || Array.isArray(error)) return ''
+      const item = error as Record<string, unknown>
+      return String(item.detail || item.title || item.message || item.code || '').replace(/[\r\n]+/g, ' ').trim()
+    })
+    .filter(Boolean)
+    .join('; ')
+    .slice(0, 500)
+}
+
 async function accessToken(fetchImpl: typeof fetch) {
   if (cachedToken && cachedToken.expiresAt > Date.now() + 30_000) return cachedToken.value
   const response = await fetchImpl(`${suiteCrmBaseUrl()}/Api/access_token`, {
@@ -75,7 +91,10 @@ async function accessToken(fetchImpl: typeof fetch) {
   })
   const parsed = await readJson(response) as SuiteCrmToken
   const token = String(parsed.access_token || '').trim()
-  if (!response.ok || !token) throw new Error(`SuiteCRM authentication failed (${response.status})`)
+  if (!response.ok || !token) {
+    const detail = responseErrorDetail(parsed)
+    throw new Error(`SuiteCRM authentication failed (${response.status})${detail ? `: ${detail}` : ''}`)
+  }
   const ttl = Math.max(60, Math.min(Number(parsed.expires_in) || 3600, 86_400))
   cachedToken = { value: token, expiresAt: Date.now() + ttl * 1000 }
   return token
@@ -102,7 +121,10 @@ async function request(
   })
   if (allowNotFound && response.status === 404) return null
   const parsed = await readJson(response)
-  if (!response.ok) throw new Error(`SuiteCRM request failed (${response.status})`)
+  if (!response.ok) {
+    const detail = responseErrorDetail(parsed)
+    throw new Error(`SuiteCRM request failed (${response.status})${detail ? `: ${detail}` : ''}`)
+  }
   return parsed
 }
 
