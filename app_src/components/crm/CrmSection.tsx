@@ -8,6 +8,10 @@ import {
   Chip,
   CircularProgress,
   Divider,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogTitle,
   Drawer,
   IconButton,
   InputAdornment,
@@ -70,6 +74,8 @@ type CrmPayload = {
   hierarchy?: WorkspaceOrganization[]
   canManageHierarchy?: boolean
   suiteCrmPunchoutUrl?: string | null
+  suiteCrmUsername?: string | null
+  suiteCrmAdminPortalUrl?: string | null
 }
 
 const ENTITY_LABELS: Record<CrmEntity, string> = {
@@ -168,6 +174,9 @@ export default function CrmSection() {
   const [workspaceHierarchy, setWorkspaceHierarchy] = useState<WorkspaceOrganization[]>([])
   const [canManageHierarchy, setCanManageHierarchy] = useState(false)
   const [suiteCrmPunchoutUrl, setSuiteCrmPunchoutUrl] = useState<string | null>(null)
+  const [suiteCrmUsername, setSuiteCrmUsername] = useState<string | null>(null)
+  const [suiteCrmAdminPortalUrl, setSuiteCrmAdminPortalUrl] = useState<string | null>(null)
+  const [suiteCrmAccessOpen, setSuiteCrmAccessOpen] = useState(false)
   const [hierarchyOpen, setHierarchyOpen] = useState(false)
 
   const load = useCallback(async (nextEntity: CrmEntity, nextQuery: string) => {
@@ -184,6 +193,8 @@ export default function CrmSection() {
       setWorkspaceHierarchy(payload.workspaceHierarchy || [])
       setCanManageHierarchy(payload.canManageHierarchy === true)
       setSuiteCrmPunchoutUrl(payload.suiteCrmPunchoutUrl || null)
+      setSuiteCrmUsername(payload.suiteCrmUsername || null)
+      setSuiteCrmAdminPortalUrl(payload.suiteCrmAdminPortalUrl || null)
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : 'Unable to load CRM records')
       setRecords([])
@@ -301,14 +312,11 @@ export default function CrmSection() {
             )}
             {suiteCrmPunchoutUrl && (
               <Button
-                component="a"
-                href={suiteCrmPunchoutUrl}
-                target="_blank"
-                rel="noopener noreferrer"
                 startIcon={<OpenInNewRounded />}
                 variant="outlined"
+                onClick={() => setSuiteCrmAccessOpen(true)}
               >
-                SuiteCRM
+                Open SuiteCRM
               </Button>
             )}
           </Stack>
@@ -410,6 +418,56 @@ export default function CrmSection() {
           </Table>
         )}
       </TableContainer>
+
+      <Dialog
+        open={suiteCrmAccessOpen}
+        onClose={() => setSuiteCrmAccessOpen(false)}
+        fullWidth
+        maxWidth="xs"
+        PaperProps={{ sx: { backgroundColor: '#1A1A23', backgroundImage: 'none', borderRadius: '8px' } }}
+      >
+        <DialogTitle>SuiteCRM sign in</DialogTitle>
+        <DialogContent>
+          <Stack spacing={1.5} mt={0.5}>
+            <TextField
+              label="Username"
+              value={suiteCrmUsername || 'admin'}
+              size="small"
+              fullWidth
+              InputProps={{ readOnly: true }}
+            />
+            <TextField
+              label="Password"
+              value="SUITECRM_ADMIN_PASSWORD"
+              size="small"
+              fullWidth
+              InputProps={{ readOnly: true }}
+            />
+            <Typography variant="caption" color="text.secondary">
+              The password is a protected Railway secret and is never returned to the browser.
+            </Typography>
+          </Stack>
+        </DialogContent>
+        <DialogActions sx={{ px: 3, pb: 2.5 }}>
+          <Button onClick={() => setSuiteCrmAccessOpen(false)}>Cancel</Button>
+          {suiteCrmAdminPortalUrl ? (
+            <Button component="a" href={suiteCrmAdminPortalUrl} target="_blank" rel="noopener noreferrer">
+              Password settings
+            </Button>
+          ) : null}
+          <Button
+            component="a"
+            href={suiteCrmPunchoutUrl || '#'}
+            target="_blank"
+            rel="noopener noreferrer"
+            variant="contained"
+            startIcon={<OpenInNewRounded />}
+            onClick={() => setSuiteCrmAccessOpen(false)}
+          >
+            Open SuiteCRM
+          </Button>
+        </DialogActions>
+      </Dialog>
 
       <Drawer
         anchor="right"

@@ -31,6 +31,8 @@ ClawPilot service:
 - `CRM_ENABLED=1`
 - `SUITECRM_BASE_URL=http://suitecrm.railway.internal:<port>`
 - the same exact `SUITECRM_PUBLIC_URL`
+- the same `SUITECRM_ADMIN_USER`
+- `SUITECRM_ADMIN_PORTAL_URL`, pointing to that environment's Railway `suitecrm` Variables page
 - the same `SUITECRM_CLIENT_ID` and `SUITECRM_CLIENT_SECRET`
 
 Credentials must remain Railway secrets. The container hashes the OAuth client secret before upserting it into SuiteCRM and never prints the secret.
@@ -48,6 +50,8 @@ Migration `0021` consolidates existing organization/contact duplicates, remaps d
 ## Native Punchout
 
 `GET /api/crm/punchout` requires an active ClawPilot session and an `owner` or `admin` role. It accepts no query parameters or caller-provided destination. A successful request returns a temporary redirect to `SUITECRM_PUBLIC_URL` with `Cache-Control: no-store`; no SuiteCRM API URL, OAuth credential, or user-selected URL is exposed.
+
+The CRM access dialog shows the non-secret native username and links administrators to the protected Railway variable that holds `SUITECRM_ADMIN_PASSWORD`. The password is never returned by a ClawPilot API or rendered in the browser. After signing in, change the native password from the SuiteCRM user profile when a rotation is required, then update the Railway secret to the same value so service recovery remains accurate.
 
 The punchout opens SuiteCRM's native login/session surface. PHP sessions are cookie-only with `Secure`, `HttpOnly`, `SameSite=Lax`, and strict mode enabled. This slice does not establish cross-application SSO.
 

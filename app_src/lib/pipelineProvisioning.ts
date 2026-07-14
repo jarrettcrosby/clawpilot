@@ -259,6 +259,14 @@ export async function queuePipelineProvisioning(input: { actorEmail: unknown; pi
     && !pipeline.googleServiceAccountEmail
     && !pipeline.googleSharedDriveId
   ) {
+    const shortLinkId = await ensurePipelineShortLink(pipeline, pipeline.sheetId)
+    if (pipeline.shortLinkId !== shortLinkId) {
+      await storePipelineShortLinkIdInPostgres({
+        pipelineId: pipeline.id,
+        expectedShortLinkId: pipeline.shortLinkId,
+        shortLinkId,
+      })
+    }
     return {
       outboxId: null,
       outboxStatus: 'succeeded',
@@ -1040,6 +1048,14 @@ export async function provisionPipelineGoogleResources(pipelineId: string) {
       const runtime = await runtimeForPipeline(pipeline)
       if (pipeline.provisioningStatus === 'ready' && pipeline.sheetId && pipeline.syncEnabled) {
         await reconcilePipelineGooglePermissionsUnlocked(pipeline.id, runtime)
+        const shortLinkId = await ensurePipelineShortLink(pipeline, pipeline.sheetId)
+        if (pipeline.shortLinkId !== shortLinkId) {
+          await storePipelineShortLinkIdInPostgres({
+            pipelineId: pipeline.id,
+            expectedShortLinkId: pipeline.shortLinkId,
+            shortLinkId,
+          })
+        }
         return { pipelineId: pipeline.id, provisioningStatus: 'ready' as const }
       }
 

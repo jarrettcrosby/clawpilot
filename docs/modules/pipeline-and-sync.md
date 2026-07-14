@@ -37,6 +37,7 @@ Provide a user-owned pipeline workspace while preserving the Opportunities Sheet
 - Column A contains protected record identity. Google protected ranges allow user edits only in `Opportunities!B5:M`.
 - Opportunity pulls stage SuiteCRM records through the CRM outbox. Organizations, Contacts, Interactions, Calculations, and Dashboard are regenerated from the CRM projection.
 - A ClawPilot short link points to the private Sheet. Creating the link does not change Google permissions.
+- The Pipeline header always presents the Sheet state: `Open Sheet` for a ready link, `Create Sheet` for an app-only owner pipeline, a stable in-progress state during provisioning, or a retry/repair command after failure or missing-link recovery.
 - The managed folder grants direct user access to the pipeline owner and active app members: `editor` maps to `writer`, and `viewer` maps to `reader`. The reconciler never creates `anyone`, domain, group, or public permissions and only mutates exact users or permissions tracked by ClawPilot.
 - Shared Drive governing and inherited permissions are preserved. Direct broad permissions are rejected for operator review; selecting a Shared Drive therefore carries the visibility implied by that drive's governing membership.
 - Provisioning and permission reconciliation are serialized per pipeline and processed as idempotent `google_workspace` outbox operations.
@@ -44,6 +45,8 @@ Provide a user-owned pipeline workspace while preserving the Opportunities Sheet
 ## Lifecycle
 
 `pipeline_spaces.provisioning_status` is one of `not_requested`, `queued`, `provisioning`, `ready`, or `failed`. Sanitized failures and request, attempt, start, and completion timestamps remain durable so retries can continue from partial external state without duplicating resources.
+
+Migration `0022_pipeline_sheet_access_links.sql` backfills an active short link for every ready Sheet-backed pipeline and fails closed if any ready pipeline remains inaccessible. Runtime provisioning performs the same repair for a ready pipeline whose link was removed or never attached.
 
 The configured owner's historical default pipeline remains on the environment Sheet and global Maton/environment credential during migration. Managed pipelines resolve their validated pipeline, Sheet, service-account, and Shared Drive binding and never fall back to that credential or accept caller-provided Google resource IDs.
 

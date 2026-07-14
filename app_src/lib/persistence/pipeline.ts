@@ -1191,7 +1191,6 @@ export async function storePipelineShortLinkIdInPostgres(input: {
       SET short_link_id = $3::uuid,
           updated_at = now()
       WHERE id = $1::uuid
-        AND provisioning_status <> 'ready'
         AND short_link_id IS NOT DISTINCT FROM $2::uuid
     `,
     [pipelineId, expectedShortLinkId, shortLinkId],

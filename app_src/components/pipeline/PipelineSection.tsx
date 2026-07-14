@@ -6,6 +6,7 @@ import Typography from '@mui/material/Typography'
 import Chip from '@mui/material/Chip'
 import Stack from '@mui/material/Stack'
 import Skeleton from '@mui/material/Skeleton'
+import CircularProgress from '@mui/material/CircularProgress'
 import Drawer from '@mui/material/Drawer'
 import IconButton from '@mui/material/IconButton'
 import Divider from '@mui/material/Divider'
@@ -28,7 +29,9 @@ import TableRowsRounded from '@mui/icons-material/TableRowsRounded'
 import CallRounded from '@mui/icons-material/CallRounded'
 import EmailRounded from '@mui/icons-material/EmailRounded'
 import AddRounded from '@mui/icons-material/AddRounded'
+import AddToDriveRounded from '@mui/icons-material/AddToDriveRounded'
 import OpenInNewRounded from '@mui/icons-material/OpenInNewRounded'
+import ReplayRounded from '@mui/icons-material/ReplayRounded'
 import Tabs from '@mui/material/Tabs'
 import Tab from '@mui/material/Tab'
 import useMediaQuery from '@mui/material/useMediaQuery'
@@ -75,6 +78,7 @@ type Deal = {
 
 type LooseRecord = Record<string, unknown>
 type DropdownOption = { active?: boolean; sort_order?: number; label?: string; value?: string }
+type PipelineProvisioningStatus = 'not_requested' | 'queued' | 'provisioning' | 'ready' | 'failed'
 
 function pipelineMutationKey() {
   return globalThis.crypto?.randomUUID?.() || `pipeline-${Date.now()}-${Math.random().toString(16).slice(2)}`
@@ -577,8 +581,13 @@ export default function PipelineSection() {
   const [syncSurface, setSyncSurface] = useState<SyncSurface>({ state: 'unknown', lastSyncedAt: null, summary: null })
   const [syncingNow, setSyncingNow] = useState(false)
   const [pipelineAccess, setPipelineAccess] = useState<'owner' | 'editor' | 'viewer' | null>(null)
+  const [pipelineId, setPipelineId] = useState<string | null>(null)
   const [pipelineSyncEnabled, setPipelineSyncEnabled] = useState(true)
   const [pipelineShortLink, setPipelineShortLink] = useState<string | null>(null)
+  const [pipelineProvisioningStatus, setPipelineProvisioningStatus] = useState<PipelineProvisioningStatus>('not_requested')
+  const [pipelineProvisioningError, setPipelineProvisioningError] = useState('')
+  const [pipelineSheetDialogOpen, setPipelineSheetDialogOpen] = useState(false)
+  const [pipelineSheetBusy, setPipelineSheetBusy] = useState(false)
   const [newOpportunityOpen, setNewOpportunityOpen] = useState(false)
   const [creatingOpportunity, setCreatingOpportunity] = useState(false)
   const [newOpportunityError, setNewOpportunityError] = useState('')
@@ -588,9 +597,12 @@ export default function PipelineSection() {
   const load = async () => {
     const data = await fetch('/api/pipeline').then(r => r.json())
     if (data?.pipeline) {
+      setPipelineId(typeof data.pipeline.id === 'string' ? data.pipeline.id : null)
       setPipelineAccess(data.pipeline.accessRole || null)
       setPipelineSyncEnabled(data.pipeline.syncEnabled === true)
       setPipelineShortLink(typeof data.pipeline.shortLinkUrl === 'string' ? data.pipeline.shortLinkUrl : null)
+      setPipelineProvisioningStatus(data.pipeline.provisioningStatus || 'not_requested')
+      setPipelineProvisioningError(String(data.pipeline.provisioningError || ''))
     }
     const rows = Array.isArray(data) ? data : (Array.isArray(data.opportunities) ? data.opportunities : [])
     const mapped: Deal[] = rows.map((row: LooseRecord, i: number) => ({
@@ -723,6 +735,12 @@ export default function PipelineSection() {
   }, [])
 
   useEffect(() => {
+    if (pipelineProvisioningStatus !== 'queued' && pipelineProvisioningStatus !== 'provisioning') return
+    const interval = window.setInterval(() => { void load() }, 2500)
+    return () => window.clearInterval(interval)
+  }, [pipelineProvisioningStatus])
+
+  useEffect(() => {
     if (!stageOptions.length) return
     if (!stageOptions.includes(activeStage)) setActiveStage(stageOptions[0])
   }, [stageOptions, activeStage])
@@ -831,6 +849,29 @@ export default function PipelineSection() {
     }
   }
 
+  const createOrRepairPipelineSheet = async () => {
+    if (!pipelineId || pipelineAccess !== 'owner' || pipelineSheetBusy) return
+    setPipelineSheetBusy(true)
+    setPipelineProvisioningError('')
+    try {
+      const response = await fetch('/api/workspaces', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'provision-pipeline', pipelineId }),
+      })
+      const result = await response.json().catch(() => ({}))
+      if (!response.ok || !result.ok) throw new Error(result.error || 'Unable to prepare the pipeline Sheet')
+      const nextStatus = result.actionResult?.provisioningStatus
+      if (nextStatus) setPipelineProvisioningStatus(nextStatus)
+      setPipelineSheetDialogOpen(false)
+      await load()
+    } catch (sheetError) {
+      setPipelineProvisioningError(sheetError instanceof Error ? sheetError.message : 'Unable to prepare the pipeline Sheet')
+    } finally {
+      setPipelineSheetBusy(false)
+    }
+  }
+
   if (loading) return <Box sx={{ p: 3 }}>{[1, 2, 3].map(i => <Skeleton key={i} variant="rounded" height={80} sx={{ mb: 2 }} />)}</Box>
   if (error) return <Box sx={{ p: 3 }}><Alert severity="error">{error}</Alert></Box>
 
@@ -903,7 +944,28 @@ export default function PipelineSection() {
                 startIcon={<OpenInNewRounded />}
                 sx={{ minHeight: 38, whiteSpace: 'nowrap' }}
               >
-                Sheet
+                Open Sheet
+              </Button>
+            ) : pipelineAccess === 'owner' ? (
+              <Button
+                variant="outlined"
+                size="small"
+                startIcon={pipelineProvisioningStatus === 'queued' || pipelineProvisioningStatus === 'provisioning'
+                  ? <CircularProgress size={16} />
+                  : pipelineProvisioningStatus === 'failed' || pipelineProvisioningStatus === 'ready'
+                    ? <ReplayRounded />
+                    : <AddToDriveRounded />}
+                onClick={() => setPipelineSheetDialogOpen(true)}
+                disabled={pipelineSheetBusy || pipelineProvisioningStatus === 'queued' || pipelineProvisioningStatus === 'provisioning'}
+                sx={{ minHeight: 38, whiteSpace: 'nowrap' }}
+              >
+                {pipelineProvisioningStatus === 'queued' || pipelineProvisioningStatus === 'provisioning'
+                  ? 'Creating Sheet'
+                  : pipelineProvisioningStatus === 'ready'
+                    ? 'Restore Sheet Link'
+                    : pipelineProvisioningStatus === 'failed'
+                      ? 'Retry Sheet'
+                      : 'Create Sheet'}
               </Button>
             ) : null}
             {!pipelineSyncEnabled && canEdit ? (
@@ -1003,6 +1065,41 @@ export default function PipelineSection() {
           </Box>
         )}
       </Box>
+
+      <Dialog
+        open={pipelineSheetDialogOpen}
+        onClose={pipelineSheetBusy ? undefined : () => setPipelineSheetDialogOpen(false)}
+        fullWidth
+        maxWidth="xs"
+        PaperProps={{ sx: { backgroundColor: '#1A1A23', border: '1px solid rgba(255,255,255,0.08)', borderRadius: 1 } }}
+      >
+        <DialogTitle sx={{ fontWeight: 700 }}>
+          {pipelineProvisioningStatus === 'ready'
+            ? 'Restore Sheet link?'
+            : pipelineProvisioningStatus === 'failed'
+              ? 'Retry Sheet setup?'
+              : 'Create private Sheet?'}
+        </DialogTitle>
+        <DialogContent>
+          {pipelineProvisioningError ? <Alert severity="error" sx={{ mb: 1.5 }}>{pipelineProvisioningError}</Alert> : null}
+          <Typography variant="body2" color="text.secondary">
+            {pipelineProvisioningStatus === 'ready'
+              ? 'ClawPilot will restore the short link for the existing private Google Sheet.'
+              : 'ClawPilot will create the private Drive folder, Google Sheet, sharing permissions, and short link for this pipeline.'}
+          </Typography>
+        </DialogContent>
+        <DialogActions sx={{ px: 3, pb: 2 }}>
+          <Button onClick={() => setPipelineSheetDialogOpen(false)} disabled={pipelineSheetBusy}>Cancel</Button>
+          <Button
+            variant="contained"
+            onClick={() => { void createOrRepairPipelineSheet() }}
+            disabled={pipelineSheetBusy}
+            startIcon={pipelineSheetBusy ? <CircularProgress size={16} color="inherit" /> : pipelineProvisioningStatus === 'ready' ? <ReplayRounded /> : <AddToDriveRounded />}
+          >
+            {pipelineProvisioningStatus === 'ready' ? 'Restore link' : pipelineProvisioningStatus === 'failed' ? 'Retry' : 'Create Sheet'}
+          </Button>
+        </DialogActions>
+      </Dialog>
 
       <Dialog
         open={newOpportunityOpen}
