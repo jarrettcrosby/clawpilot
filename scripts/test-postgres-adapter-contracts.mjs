@@ -292,6 +292,7 @@ assert.ok(
 assertIncludes(crmAdapter, 'FOR UPDATE SKIP LOCKED', 'SuiteCRM leased outbox claims')
 assertIncludes(crmAdapter, 'pipeline_id = $1::uuid', 'pipeline-scoped CRM reads')
 assertIncludes(crmAdapter, 'readCrmWorkbookProjectionReadiness', 'reconciliation-gated CRM workbook projection')
+assertIncludes(crmAdapter, "importStatus === 'succeeded'", 'successful source reconciliation projection gate')
 
 const suiteCrmClient = read('app_src/lib/crm/suiteCrmClient.ts')
 assertIncludes(suiteCrmClient, '/Api/access_token', 'SuiteCRM OAuth client credentials')
@@ -310,6 +311,8 @@ assertIncludes(crmWorkbookImport, 'Full Name (First, Last)', 'legacy contact nam
 assertIncludes(crmWorkbookImport, 'CRM workbook import was incomplete', 'CRM import count reconciliation')
 assertIncludes(crmWorkbookImport, 'uniqueSourceRecords', 'CRM source duplicate consolidation')
 assertIncludes(crmWorkbookImport, 'duplicatesSkipped', 'CRM import duplicate evidence')
+assertIncludes(crmWorkbookImport, 'registerReferencedOrganization', 'referenced organization derivation')
+assertIncludes(crmWorkbookImport, 'sourceCounts.organizations += derivedOrganizations.size', 'derived organization reconciliation')
 
 const crmWorker = read('app_src/lib/crm/worker.ts')
 assertIncludes(crmWorker, 'upsertSuiteCrmRecord', 'SuiteCRM outbox worker')
