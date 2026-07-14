@@ -253,6 +253,9 @@ assertIncludes(pipelineProvisioning, 'nextPageToken,permissions', 'permission pa
 assertIncludes(pipelineProvisioning, "['anyone', 'domain', 'group']", 'direct broad permission rejection')
 assertIncludes(pipelineProvisioning, 'permissionIsInherited', 'Shared Drive governing permission preservation')
 
+const legacyPipelineWorkbook = read('app_src/lib/pipelineLegacyWorkbook.ts')
+assertIncludes(legacyPipelineWorkbook, 'configurePipelineTabsWithRequest', 'legacy Maton workbook layout parity')
+
 const pipelineSync = read('app_src/lib/pipelineSync.ts')
 assertIncludes(pipelineSync, 'resolvePipelineSheetBindingInPostgres', 'pipeline pull binding resolution')
 assertIncludes(pipelineSync, 'resolveManagedGoogleWorkspaceRuntime', 'pipeline pull native binding resolution')

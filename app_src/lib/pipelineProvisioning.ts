@@ -97,6 +97,14 @@ type SpreadsheetMetadata = {
   }>
 }
 
+export type SheetsRequestInput = {
+  method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
+  body?: unknown
+  idempotent?: boolean
+}
+
+export type SheetsJsonRequest = <T>(pathname: string, input?: SheetsRequestInput) => Promise<T>
+
 const GENERATED_TABS = EXPECTED_TABS.filter((title) => title !== 'Opportunities')
 const IDENTIFIER_TABS = ['Organizations', 'Contacts', 'Opportunities', 'Interactions'] as const
 const PROTECTION_PREFIX = 'ClawPilot managed:'
@@ -549,9 +557,8 @@ async function ensurePipelineSheet(
   }
 }
 
-async function spreadsheetMetadata(runtime: GoogleWorkspaceRuntime, sheetId: string) {
-  const metadata = await googleSheetsJson<SpreadsheetMetadata>(
-    runtime,
+async function spreadsheetMetadata(request: SheetsJsonRequest, sheetId: string) {
+  const metadata = await request<SpreadsheetMetadata>(
     `/v4/spreadsheets/${sheetId}?fields=spreadsheetId,sheets(properties,protectedRanges(protectedRangeId,description))`,
   )
   if (validResourceId(metadata.spreadsheetId, 'Managed pipeline Sheet ID') !== sheetId) {
@@ -564,8 +571,12 @@ async function spreadsheetMetadata(runtime: GoogleWorkspaceRuntime, sheetId: str
   return metadata
 }
 
-export async function configurePipelineTabs(runtime: GoogleWorkspaceRuntime, sheetId: string) {
-  let metadata = await spreadsheetMetadata(runtime, sheetId)
+export async function configurePipelineTabsWithRequest(
+  request: SheetsJsonRequest,
+  sheetId: string,
+  protectionEditor?: string,
+) {
+  let metadata = await spreadsheetMetadata(request, sheetId)
   const current = metadata.sheets || []
   const currentTitles = new Set(current.map((sheet) => sheet.properties?.title).filter(Boolean))
   const requests: unknown[] = []
@@ -589,14 +600,14 @@ export async function configurePipelineTabs(runtime: GoogleWorkspaceRuntime, she
     if (!currentTitles.has(title)) requests.push({ addSheet: { properties: { title } } })
   }
   if (requests.length > 0) {
-    await googleSheetsJson(runtime, `/v4/spreadsheets/${sheetId}:batchUpdate`, {
+    await request(`/v4/spreadsheets/${sheetId}:batchUpdate`, {
       method: 'POST',
       body: { requests, includeSpreadsheetInResponse: false },
       idempotent: false,
     })
   }
 
-  await googleSheetsJson(runtime, `/v4/spreadsheets/${sheetId}/values:batchUpdate`, {
+  await request(`/v4/spreadsheets/${sheetId}/values:batchUpdate`, {
     method: 'POST',
     body: {
       valueInputOption: 'USER_ENTERED',
@@ -617,7 +628,7 @@ export async function configurePipelineTabs(runtime: GoogleWorkspaceRuntime, she
     idempotent: true,
   })
 
-  metadata = await spreadsheetMetadata(runtime, sheetId)
+  metadata = await spreadsheetMetadata(request, sheetId)
   const managedSheets = (metadata.sheets || []).filter((sheet) => (
     typeof sheet.properties?.sheetId === 'number'
     && EXPECTED_TABS.includes(sheet.properties?.title as (typeof EXPECTED_TABS)[number])
@@ -674,7 +685,7 @@ export async function configurePipelineTabs(runtime: GoogleWorkspaceRuntime, she
             description: `${PROTECTION_PREFIX} generated ${title}`,
             range: { sheetId: sheetIdValue },
             warningOnly: false,
-            editors: { users: [runtime.serviceAccountEmail] },
+            ...(protectionEditor ? { editors: { users: [protectionEditor] } } : {}),
           },
         },
       })
@@ -685,7 +696,7 @@ export async function configurePipelineTabs(runtime: GoogleWorkspaceRuntime, she
             description: `${PROTECTION_PREFIX} opportunity identifiers and headers`,
             range: { sheetId: sheetIdValue, startRowIndex: 0, endRowIndex: 4 },
             warningOnly: false,
-            editors: { users: [runtime.serviceAccountEmail] },
+            ...(protectionEditor ? { editors: { users: [protectionEditor] } } : {}),
           },
         },
       })
@@ -695,14 +706,14 @@ export async function configurePipelineTabs(runtime: GoogleWorkspaceRuntime, she
             description: `${PROTECTION_PREFIX} opportunity identifiers`,
             range: { sheetId: sheetIdValue, startColumnIndex: 0, endColumnIndex: 1 },
             warningOnly: false,
-            editors: { users: [runtime.serviceAccountEmail] },
+            ...(protectionEditor ? { editors: { users: [protectionEditor] } } : {}),
           },
         },
       })
     }
   })
   if (formattingRequests.length > 0) {
-    await googleSheetsJson(runtime, `/v4/spreadsheets/${sheetId}:batchUpdate`, {
+    await request(`/v4/spreadsheets/${sheetId}:batchUpdate`, {
       method: 'POST',
       body: { requests: formattingRequests, includeSpreadsheetInResponse: false },
       idempotent: false,
@@ -710,8 +721,14 @@ export async function configurePipelineTabs(runtime: GoogleWorkspaceRuntime, she
   }
 }
 
+export async function configurePipelineTabs(runtime: GoogleWorkspaceRuntime, sheetId: string) {
+  const request: SheetsJsonRequest = (pathname, input) => googleSheetsJson(runtime, pathname, input)
+  return configurePipelineTabsWithRequest(request, sheetId, runtime.serviceAccountEmail)
+}
+
 async function verifyPipelineTabsAndHeaders(runtime: GoogleWorkspaceRuntime, sheetId: string) {
-  const metadata = await spreadsheetMetadata(runtime, sheetId)
+  const request: SheetsJsonRequest = (pathname, input) => googleSheetsJson(runtime, pathname, input)
+  const metadata = await spreadsheetMetadata(request, sheetId)
   const titles = (metadata.sheets || [])
     .map((sheet) => sheet.properties?.title)
     .filter((title): title is string => Boolean(title))
