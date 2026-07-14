@@ -131,6 +131,13 @@ for (const contract of [
 assert.ok(!managedPipelineMigration.includes('maton_drive_connection_id'), 'managed pipeline migration must not bind Maton Drive')
 assert.ok(!managedPipelineMigration.includes('maton_sheets_connection_id'), 'managed pipeline migration must not bind Maton Sheets')
 
+const crmMigration = read('db/migrations/0020_crm_gateway_and_reporting.sql')
+for (const table of ['crm_organizations', 'crm_contacts', 'crm_opportunities', 'crm_interactions', 'crm_sync_runs']) {
+  assertIncludes(crmMigration, `CREATE TABLE IF NOT EXISTS ${table}`, 'CRM gateway migration')
+}
+assertIncludes(crmMigration, "target_system = 'suitecrm'", 'SuiteCRM outbox migration')
+assertIncludes(crmMigration, 'crm_projection_version', 'CRM workbook projection version')
+
 const invitationAdapter = read('app_src/lib/invitations.ts')
 assertIncludes(invitationAdapter, 'requestInvitationAuthMagicCode', 'invitation adapter')
 assertIncludes(invitationAdapter, 'revoked_at IS NULL', 'invitation revocation contract')
@@ -234,18 +241,55 @@ assertIncludes(pipelineProvisioning, "includeItemsFromAllDrives: 'true'", 'Share
 assertIncludes(pipelineProvisioning, "supportsAllDrives: 'true'", 'Shared Drive request support')
 assertIncludes(pipelineProvisioning, "idempotent: false", 'non-retried ambiguous Google creates')
 assertIncludes(pipelineProvisioning, "const EXPECTED_TABS", 'managed pipeline tab contract')
-assertIncludes(pipelineProvisioning, "range: `${title}!B4`", 'managed pipeline B4 headers')
+assertIncludes(pipelineProvisioning, "range: `'${title}'!B4`", 'managed pipeline B4 headers')
+for (const tab of ['Start Here', 'Calculations', 'Dashboard']) {
+  assertIncludes(pipelineProvisioning, `'${tab}'`, 'managed CRM workbook tab contract')
+}
+assertIncludes(pipelineProvisioning, 'addProtectedRange', 'managed CRM workbook protections')
+assertIncludes(pipelineProvisioning, "title !== 'Opportunities'", 'Opportunities-only workbook input boundary')
 assertIncludes(pipelineProvisioning, 'createShortLink', 'managed pipeline short link')
 assertIncludes(pipelineProvisioning, 'reconcilePipelineGooglePermissions', 'managed Google permission reconciliation')
 assertIncludes(pipelineProvisioning, 'nextPageToken,permissions', 'permission pagination')
 assertIncludes(pipelineProvisioning, "['anyone', 'domain', 'group']", 'direct broad permission rejection')
 assertIncludes(pipelineProvisioning, 'permissionIsInherited', 'Shared Drive governing permission preservation')
 
+const legacyPipelineWorkbook = read('app_src/lib/pipelineLegacyWorkbook.ts')
+assertIncludes(legacyPipelineWorkbook, 'configurePipelineTabsWithRequest', 'legacy Maton workbook layout parity')
+
 const pipelineSync = read('app_src/lib/pipelineSync.ts')
 assertIncludes(pipelineSync, 'resolvePipelineSheetBindingInPostgres', 'pipeline pull binding resolution')
 assertIncludes(pipelineSync, 'resolveManagedGoogleWorkspaceRuntime', 'pipeline pull native binding resolution')
 assertIncludes(pipelineSync, 'googleSheetsJson', 'pipeline pull native Sheets transport')
 assertIncludes(pipelineSync, 'binding.legacyOwnerFallback', 'pipeline pull legacy transport boundary')
+assertIncludes(pipelineSync, "opportunities: 'Opportunities!A5:M2000'", 'stable opportunity record identifiers')
+assertIncludes(pipelineSync, 'stageCrmRecordInPostgres', 'opportunity Sheet to CRM staging')
+
+const crmAdapter = read('app_src/lib/persistence/crm.ts')
+assertIncludes(crmAdapter, 'stageCrmRecordInPostgres', 'CRM projection adapter')
+assertIncludes(crmAdapter, "target_system, payload", 'CRM outbox persistence')
+assertIncludes(crmAdapter, "'upsert_record', 'suitecrm'", 'SuiteCRM outbox target')
+assertIncludes(crmAdapter, 'FOR UPDATE SKIP LOCKED', 'SuiteCRM leased outbox claims')
+assertIncludes(crmAdapter, 'pipeline_id = $1::uuid', 'pipeline-scoped CRM reads')
+assertIncludes(crmAdapter, 'readCrmWorkbookProjectionReadiness', 'reconciliation-gated CRM workbook projection')
+
+const suiteCrmClient = read('app_src/lib/crm/suiteCrmClient.ts')
+assertIncludes(suiteCrmClient, '/Api/access_token', 'SuiteCRM OAuth client credentials')
+assertIncludes(suiteCrmClient, '/Api/V8/module', 'SuiteCRM JSON API')
+assertIncludes(suiteCrmClient, "hostname.endsWith('.railway.internal')", 'private Railway SuiteCRM transport')
+
+const crmWorkbookProjection = read('app_src/lib/crm/workbookProjection.ts')
+assertIncludes(crmWorkbookProjection, 'projectCrmWorkbook', 'CRM workbook projection')
+assertIncludes(crmWorkbookProjection, "'Organizations', 'Contacts', 'Opportunities', 'Interactions'", 'CRM workbook projections')
+assertIncludes(crmWorkbookProjection, "'UPDATE pipeline_spaces SET crm_last_synced_at", 'CRM projection checkpoint')
+assertIncludes(crmWorkbookProjection, 'waiting for reconciliation', 'CRM projection completeness gate')
+
+const crmWorkbookImport = read('app_src/lib/crm/workbookImport.ts')
+assertIncludes(crmWorkbookImport, 'Full Name (First, Last)', 'legacy contact name header mapping')
+assertIncludes(crmWorkbookImport, 'CRM workbook import was incomplete', 'CRM import count reconciliation')
+
+const crmWorker = read('app_src/lib/crm/worker.ts')
+assertIncludes(crmWorker, 'upsertSuiteCrmRecord', 'SuiteCRM outbox worker')
+assertIncludes(crmWorker, "operation: 'project_crm_workbook'", 'CRM to workbook projection enqueue')
 
 const pipelineDropdownSync = read('app_src/lib/pipelineDropdownSync.ts')
 assertIncludes(pipelineDropdownSync, 'resolvePipelineSheetBindingInPostgres', 'dropdown binding resolution')
@@ -268,6 +312,7 @@ assertIncludes(outboxWorker, 'claimPipelineSyncOutboxInPostgres', 'pipeline outb
 assertIncludes(outboxWorker, "item.operation === 'update_opportunity'", 'pipeline outbox worker')
 assertIncludes(outboxWorker, "item.operation === 'append_interaction'", 'pipeline outbox worker')
 assertIncludes(outboxWorker, "item.operation === 'replace_dropdowns'", 'pipeline outbox worker')
+assertIncludes(outboxWorker, "item.operation === 'project_crm_workbook'", 'CRM projection worker dispatch')
 assertIncludes(outboxWorker, 'Opportunity Sheet row changed', 'pipeline outbox worker optimistic check')
 assertIncludes(outboxWorker, '[ClawPilot sync:', 'pipeline outbox worker append idempotency')
 assertIncludes(outboxWorker, "item.operation === 'provision_pipeline'", 'pipeline provisioning worker dispatch')
@@ -427,6 +472,10 @@ for (const requiredVariable of [
     'CLAWPILOT_PUBLIC_URL',
   'PIPELINE_SHEET_ID',
   'PIPELINE_OUTBOX_WORKER_SECRET',
+  'CRM_ENABLED',
+  'SUITECRM_BASE_URL',
+  'SUITECRM_CLIENT_ID',
+  'SUITECRM_CLIENT_SECRET',
 ]) {
   assertIncludes(railwayStart, requiredVariable, 'Railway startup validation')
 }
@@ -475,6 +524,8 @@ assertIncludes(healthRoute, '0015_short_links.sql', 'hosted short-links migratio
 assertIncludes(healthRoute, '0016_document_vectors_and_ai_radar.sql', 'hosted vector knowledge migration health')
 assertIncludes(healthRoute, '0016_z_short_link_destination_preflight.sql', 'hosted short-link preflight migration health')
 assertIncludes(healthRoute, '0017_short_link_destination_hardening.sql', 'hosted short-link hardening migration health')
+assertIncludes(healthRoute, '0020_crm_gateway_and_reporting.sql', 'hosted CRM gateway migration health')
+assertIncludes(healthRoute, 'readSuiteCrmWorkerHeartbeat', 'hosted SuiteCRM worker health')
 assertIncludes(healthRoute, 'migration_checksums_present', 'hosted migration checksum health')
 assertIncludes(healthRoute, 'queryAgentCredentials', 'shared agent credential store health')
 assertIncludes(healthRoute, 'readAgentDispatchWorkerHeartbeatFromPostgres', 'hosted agent worker health')

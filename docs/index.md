@@ -16,6 +16,7 @@ This repository is the canonical source for ClawPilot product, engineering, and 
 - [User integrations and credentials](modules/user-integrations.md)
 - [Projects and tenancy](modules/projects-and-tenancy.md)
 - [Pipeline and synchronization](modules/pipeline-and-sync.md)
+- [CRM and workbook reporting](modules/crm-and-reporting.md)
 - [Agents and execution](modules/agents-and-execution.md)
 - [Knowledge, releases, and checkpoints](modules/knowledge-releases-and-checkpoints.md)
 - [Shared short links](modules/short-links.md)

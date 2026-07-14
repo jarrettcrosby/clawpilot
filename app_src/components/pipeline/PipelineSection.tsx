@@ -28,6 +28,7 @@ import TableRowsRounded from '@mui/icons-material/TableRowsRounded'
 import CallRounded from '@mui/icons-material/CallRounded'
 import EmailRounded from '@mui/icons-material/EmailRounded'
 import AddRounded from '@mui/icons-material/AddRounded'
+import OpenInNewRounded from '@mui/icons-material/OpenInNewRounded'
 import Tabs from '@mui/material/Tabs'
 import Tab from '@mui/material/Tab'
 import useMediaQuery from '@mui/material/useMediaQuery'
@@ -577,6 +578,7 @@ export default function PipelineSection() {
   const [syncingNow, setSyncingNow] = useState(false)
   const [pipelineAccess, setPipelineAccess] = useState<'owner' | 'editor' | 'viewer' | null>(null)
   const [pipelineSyncEnabled, setPipelineSyncEnabled] = useState(true)
+  const [pipelineShortLink, setPipelineShortLink] = useState<string | null>(null)
   const [newOpportunityOpen, setNewOpportunityOpen] = useState(false)
   const [creatingOpportunity, setCreatingOpportunity] = useState(false)
   const [newOpportunityError, setNewOpportunityError] = useState('')
@@ -588,6 +590,7 @@ export default function PipelineSection() {
     if (data?.pipeline) {
       setPipelineAccess(data.pipeline.accessRole || null)
       setPipelineSyncEnabled(data.pipeline.syncEnabled === true)
+      setPipelineShortLink(typeof data.pipeline.shortLinkUrl === 'string' ? data.pipeline.shortLinkUrl : null)
     }
     const rows = Array.isArray(data) ? data : (Array.isArray(data.opportunities) ? data.opportunities : [])
     const mapped: Deal[] = rows.map((row: LooseRecord, i: number) => ({
@@ -889,6 +892,20 @@ export default function PipelineSection() {
             sx={{ width: { xs: '100%', sm: 'auto' }, justifyContent: { xs: 'flex-start', sm: 'flex-end' } }}
           >
             <WorkspaceSelector kind="pipeline" onAccessChange={(resource) => setPipelineAccess(resource?.accessRole || null)} />
+            {pipelineShortLink ? (
+              <Button
+                component="a"
+                href={pipelineShortLink}
+                target="_blank"
+                rel="noreferrer"
+                variant="outlined"
+                size="small"
+                startIcon={<OpenInNewRounded />}
+                sx={{ minHeight: 38, whiteSpace: 'nowrap' }}
+              >
+                Sheet
+              </Button>
+            ) : null}
             {!pipelineSyncEnabled && canEdit ? (
               <Button variant="contained" size="small" startIcon={<AddRounded />} onClick={() => setNewOpportunityOpen(true)} sx={{ minHeight: 38, whiteSpace: 'nowrap' }}>
                 New opportunity

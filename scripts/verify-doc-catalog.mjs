@@ -10,6 +10,7 @@ const requiredCurrentDocuments = [
   'docs/modules/application-shell-and-access.md',
   'docs/modules/projects-and-tenancy.md',
   'docs/modules/pipeline-and-sync.md',
+  'docs/modules/crm-and-reporting.md',
   'docs/modules/agents-and-execution.md',
   'docs/modules/knowledge-releases-and-checkpoints.md',
   'docs/modules/short-links.md',

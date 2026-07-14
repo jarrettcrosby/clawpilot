@@ -8,6 +8,8 @@ import { readPipelineOutboxWorkerHeartbeatFromPostgres } from '@/lib/persistence
 import { readAgentDispatchWorkerHeartbeatFromPostgres } from '@/lib/persistence/agentDispatch'
 import { documentEmbeddingConfiguration } from '@/lib/documentEmbeddings'
 import { validateShortLinkConfiguration } from '@/lib/shortlinks'
+import { readSuiteCrmWorkerHeartbeat } from '@/lib/persistence/crm'
+import { suiteCrmBaseUrl } from '@/lib/crm/suiteCrmClient'
 
 const DEV_LOG_PATH = '/tmp/clawd-app-dev.log'
 const FALLBACK_LOG_PATH = '/tmp/clawd-app.log'
@@ -63,6 +65,7 @@ export async function GET() {
     let credentialStore: Record<string, unknown> = { status: 'not-configured' }
     let worker: Record<string, unknown> = { status: 'not-owned' }
     let agentWorker: Record<string, unknown> = { status: 'not-owned' }
+    let crm: Record<string, unknown> = { status: 'disabled' }
     let knowledgeWorkers: Array<Record<string, unknown>> = []
 
     if (cloudProvider === 'railway' && storage !== 'postgres') {
@@ -119,6 +122,18 @@ export async function GET() {
     if (cloudProvider === 'railway' && process.env.CLAWPILOT_DB_FALLBACK_TO_FILE !== 'false') {
       errors.push('Railway database fallback must be disabled.')
     }
+    const crmEnabled = process.env.CRM_ENABLED === '1'
+    if (crmEnabled) {
+      try {
+        suiteCrmBaseUrl()
+        if (String(process.env.SUITECRM_CLIENT_ID || '').length < 16) throw new Error('SuiteCRM client ID is missing or too short.')
+        if (String(process.env.SUITECRM_CLIENT_SECRET || '').length < 32) throw new Error('SuiteCRM client secret is missing or too short.')
+        crm = { status: 'configured' }
+      } catch (error) {
+        crm = { status: 'misconfigured' }
+        errors.push(error instanceof Error ? error.message : 'SuiteCRM configuration is invalid.')
+      }
+    }
     try {
       validateShortLinkConfiguration({ requireServiceClient: true, requirePublicOrigin: true })
     } catch (error) {
@@ -154,6 +169,7 @@ export async function GET() {
           shortlink_hardening_migration_applied: boolean
           maton_credentials_migration_applied: boolean
           managed_pipeline_resources_migration_applied: boolean
+          crm_gateway_migration_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -254,6 +270,11 @@ export async function GET() {
                 FROM schema_migrations
                 WHERE filename = '0019_managed_pipeline_google_resources.sql'
               ) AS managed_pipeline_resources_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0020_crm_gateway_and_reporting.sql'
+              ) AS crm_gateway_migration_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -285,6 +306,7 @@ export async function GET() {
             && row?.shortlink_hardening_migration_applied
             && row?.maton_credentials_migration_applied
             && row?.managed_pipeline_resources_migration_applied
+            && row?.crm_gateway_migration_applied
             && row?.migration_checksums_present
           ),
         }
@@ -308,6 +330,7 @@ export async function GET() {
           || !row?.shortlink_hardening_migration_applied
           || !row?.maton_credentials_migration_applied
           || !row?.managed_pipeline_resources_migration_applied
+          || !row?.crm_gateway_migration_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')
@@ -327,6 +350,21 @@ export async function GET() {
           }
           if (ageMs === null || ageMs > maxHeartbeatAgeMs) {
             errors.push('Pipeline outbox worker heartbeat is missing or stale.')
+          }
+
+          if (crmEnabled) {
+            const crmHeartbeat = await readSuiteCrmWorkerHeartbeat()
+            const crmHeartbeatAt = Date.parse(String(crmHeartbeat?.checkedAt || ''))
+            const crmAgeMs = Number.isFinite(crmHeartbeatAt) ? checkedAt - crmHeartbeatAt : null
+            crm = {
+              status: crmAgeMs !== null && crmAgeMs <= maxHeartbeatAgeMs ? 'reachable' : 'stale',
+              heartbeatAt: crmHeartbeat?.checkedAt || null,
+              phase: crmHeartbeat?.phase || null,
+              ageMs: crmAgeMs,
+            }
+            if (crmAgeMs === null || crmAgeMs > maxHeartbeatAgeMs) {
+              errors.push('SuiteCRM outbox worker heartbeat is missing or stale.')
+            }
           }
 
           const agentHeartbeat = await readAgentDispatchWorkerHeartbeatFromPostgres()
@@ -411,6 +449,7 @@ export async function GET() {
       credentialStore,
       worker,
       agentWorker,
+      crm,
       knowledgeWorkers,
       capabilities: {
         openClawExecution: process.env.CLAWPILOT_EXECUTION_ENABLED === '1',
@@ -419,6 +458,7 @@ export async function GET() {
         vectorDocumentSearch: true,
         aiRadar: process.env.AI_RADAR_ENABLED !== 'false',
         shortLinks: true,
+        crm: process.env.CRM_ENABLED === '1',
       },
       checkedAt,
     }, { status: errors.length > 0 ? 503 : 200 })

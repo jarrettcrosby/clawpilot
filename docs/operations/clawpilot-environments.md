@@ -19,10 +19,10 @@ app_visible: true
 
 - Development: `https://dev.aiapp.eigenracing.com`
 - Production: `https://aiapp.eigenracing.com`
-- Railway runs the application worker and the environment-specific Postgres service.
+- Railway runs the application worker, environment-specific Postgres, private SuiteCRM service, and dedicated SuiteCRM MariaDB.
 - Vercel provides protected Next.js previews and an independent deployment/build surface. It uses the matching Railway Postgres public proxy and does not replace the Railway background worker.
 
-Development and production use separate databases, user records, credentials, boards, pipelines, documents, releases, and checkpoints. Code is promoted as the same reviewed commit; runtime data is not copied between environments.
+Development and production use separate Postgres and MariaDB databases, SuiteCRM volumes, user records, credentials, boards, pipelines, workbooks, documents, releases, and checkpoints. Code is promoted as the same reviewed commit; runtime data is not copied between environments.
 
 ## Release Contract
 
@@ -32,6 +32,8 @@ Development and production use separate databases, user records, credentials, bo
 4. Wait for the local `/api/health` contract to pass.
 5. Record the release in Postgres only after that health check succeeds.
 6. Verify the custom domain endpoints and protected Vercel deployment.
+
+SuiteCRM is deployed from `services/suitecrm`, is reachable from ClawPilot over Railway's private network, and persists its application files on a separate volume. See the [SuiteCRM Railway runbook](suitecrm.md).
 
 Vercel runs database gates only for `dev` and `main`. Other preview branches compile without mutating the shared development database.
 

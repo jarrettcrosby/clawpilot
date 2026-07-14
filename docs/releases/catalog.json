@@ -3,20 +3,20 @@
   "releases": {
     "default": {
       "oncePerEnvironment": true,
-      "title": "Private integrations and managed pipeline Sheets",
-      "summary": "ClawPilot separates encrypted per-user Maton settings from an owner-managed Google Workspace service account, adds private managed pipeline Sheets, and enforces pipeline-level sync isolation.",
+      "title": "CRM gateway and controlled reporting workbooks",
+      "summary": "ClawPilot adds a tenant-scoped SuiteCRM gateway, makes Organizations, Contacts, and Interactions manageable in the app, and turns each pipeline workbook into a protected opportunity input and CRM reporting surface.",
       "features": [
-        "Separate Settings panels for per-user Maton accounts and the owner-managed Google API key, service account, and Shared Drive",
-        "Private per-user folders and operator Sheets in the selected Shared Drive, with durable Postgres projections and exact environment separation",
-        "Automatic eigenracing.com short links for managed pipeline Sheets without weakening Google file permissions",
-        "Pipeline sharing that mirrors viewer and editor membership into reader and writer permissions on the managed Google folder"
+        "A CRM workspace for Organizations, Contacts, Opportunities, and Interactions scoped to the selected user pipeline",
+        "A SuiteCRM OAuth gateway with durable Postgres projections and retriable CRM and Google outboxes",
+        "Eight-tab managed workbooks with protected CRM projections, calculations, dashboard reporting, and stable record identities",
+        "Direct workbook access from Pipeline and CRM through each pipeline's private eigenracing.com short link"
       ],
       "fixes": [
-        "Bound every pipeline pull, write, dropdown update, and queued operation to its authorized pipeline and Sheet pair",
-        "Made Maton key set and rotation validate the candidate key and refresh connection metadata atomically",
-        "Moved runtime platform mail to the encrypted owner Maton credential while retaining a bootstrap environment fallback",
-        "Kept managed tenant pipeline Google access on native service-account OAuth instead of a global Maton connection",
-        "Extended Railway backup policy checks to require daily, weekly, and monthly schedules in both environments"
+        "Stopped treating Organizations and Contacts workbook tabs as independent writable CRM sources",
+        "Protected every generated workbook tab and limited operator edits to Opportunities rows",
+        "Added stable source identities so opportunity row movement does not create duplicate CRM records after projection",
+        "Separated SuiteCRM records, worker leases, and reporting refreshes into independently retriable operations",
+        "Preserved the source workbook and raw row payloads for additive migration and reconciliation"
       ]
     }
   }
