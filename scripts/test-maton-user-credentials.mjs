@@ -349,7 +349,14 @@ const persistenceMock = {
     state.keyVersion = 1
     state.keyRotatedAt = NOW
     state.createdAt = NOW
-    return syncState({ ...input, replaceRemote: true })
+    syncState({ ...input, replaceRemote: true })
+    for (const connectionId of input.selectedConnectionIds || []) {
+      const target = state.connections.find((connection) => connection.connectionId === connectionId)
+      for (const connection of state.connections) {
+        if (connection.app === target?.app) connection.selected = connection.connectionId === connectionId
+      }
+    }
+    return clone(state)
   },
   async selectMatonConnectionInPostgres(input) {
     calls.selects.push(input)
@@ -587,6 +594,7 @@ await assert.rejects(
 
 process.env.APP_LOGIN_EMAIL = 'owner@example.com'
 process.env.MATON_API_KEY = 'maton-platform-api-key-22222222-IJKL'
+process.env.MATON_GMAIL_CONNECTION_ID = 'platform-mail-connection'
 const ownerState = await serviceModule.getMatonCredentialState('owner@example.com')
 assert.equal(serviceModule.platformCredentialAvailable('owner@example.com', ownerState), true)
 assert.equal(serviceModule.platformCredentialAvailable('admin@example.com', emptyState()), false)
@@ -594,13 +602,28 @@ await assert.rejects(
   serviceModule.importPlatformMatonCredential('admin@example.com'),
   (error) => error?.status === 403,
 )
-remoteConnections = [{
-  connectionId: 'sheet-connection-1', name: 'google-sheets', app: 'google-sheets', status: 'ACTIVE', method: 'oauth2',
-  accountEmail: 'owner@example.com', source: 'maton', remoteCreatedAt: NOW, remoteUpdatedAt: NOW,
-}]
+remoteConnections = [
+  {
+    connectionId: 'sheet-connection-1', name: 'google-sheets', app: 'google-sheets', status: 'ACTIVE', method: 'oauth2',
+    accountEmail: 'owner@example.com', source: 'maton', remoteCreatedAt: NOW, remoteUpdatedAt: NOW,
+  },
+  {
+    connectionId: 'newer-mail-connection', name: 'google-mail', app: 'google-mail', status: 'ACTIVE', method: 'oauth2',
+    accountEmail: 'personal@example.com', source: 'maton', remoteCreatedAt: NOW, remoteUpdatedAt: NOW,
+  },
+  {
+    connectionId: 'platform-mail-connection', name: 'google-mail', app: 'google-mail', status: 'ACTIVE', method: 'oauth2',
+    accountEmail: 'owner@example.com', source: 'maton', remoteCreatedAt: NOW, remoteUpdatedAt: NOW,
+  },
+]
 const imported = await serviceModule.importPlatformMatonCredential('owner@example.com')
 assert.equal(imported.keyLastFour, 'IJKL')
-assert.equal(imported.connections.length, 1)
+assert.equal(imported.connections.length, 3)
+assert.equal(
+  imported.connections.find((connection) => connection.connectionId === 'platform-mail-connection').selected,
+  true,
+)
+assert.equal(JSON.stringify(calls.imports.at(-1).selectedConnectionIds), '["platform-mail-connection"]')
 assert.ok(!JSON.stringify(imported).includes(process.env.MATON_API_KEY))
 assert.equal(serviceModule.platformCredentialAvailable('owner@example.com', imported), false)
 

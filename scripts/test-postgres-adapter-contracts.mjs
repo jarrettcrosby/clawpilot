@@ -153,8 +153,12 @@ assertIncludes(documentsAdapter, "sourceKey: 'system:pipeline-brief'", 'generate
 assertIncludes(documentsAdapter, 'document.content', 'local full-document search')
 assertIncludes(documentsAdapter, 'document_embedding_jobs', 'document embedding enqueue')
 assertIncludes(documentsAdapter, 'listAiRadarItems', 'AI Radar generated brief')
+assertIncludes(documentsAdapter, 'pipelineSourceLabel', 'human-readable pipeline brief source')
 assertIncludes(documentsAdapter, 'embedding <=> $3::vector', 'hybrid semantic document search')
 assertIncludes(documentsAdapter, 'embedding_model = $4', 'same-model semantic document search')
+
+const matonCredentialAdapter = read('app_src/lib/persistence/matonCredentials.ts')
+assertIncludes(matonCredentialAdapter, 'selectedConnectionIds', 'platform Maton connection preservation')
 
 const embeddingsAdapter = read('app_src/lib/documentEmbeddings.ts')
 assertIncludes(embeddingsAdapter, "model: config.model", 'embedding model reporting')

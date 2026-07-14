@@ -573,6 +573,7 @@ export async function importPlatformMatonCredentialInPostgres(input: {
   ownerEmail: string
   apiKey: ApiKeyWrite
   connections: MatonConnectionWrite[]
+  selectedConnectionIds?: string[]
 }): Promise<MatonCredentialState> {
   return withTransaction(async (client) => {
     await client.query(
@@ -596,6 +597,51 @@ export async function importPlatformMatonCredentialInPostgres(input: {
     })
     await client.query('DELETE FROM user_maton_connections WHERE owner_email = $1', [input.ownerEmail])
     await syncRemoteConnections(client, input.ownerEmail, input.connections, true)
+    const selectedConnectionIds = Array.from(new Set(input.selectedConnectionIds || []))
+    if (selectedConnectionIds.length > 0) {
+      const selectedConnections = await client.query<{ connection_id: string; app: string }>(
+        `
+          SELECT connection_id, app
+          FROM user_maton_connections
+          WHERE owner_email = $1
+            AND connection_id = ANY($2::text[])
+            AND source = 'maton'
+            AND status = 'ACTIVE'
+          FOR UPDATE
+        `,
+        [input.ownerEmail, selectedConnectionIds],
+      )
+      const selectedApps = selectedConnections.rows.map((connection) => connection.app)
+      if (
+        selectedConnections.rows.length !== selectedConnectionIds.length
+        || new Set(selectedApps).size !== selectedApps.length
+      ) {
+        throw new Error('Preferred Maton connection selection is invalid')
+      }
+      await client.query(
+        `
+          UPDATE user_maton_connections
+          SET is_selected = false,
+              updated_at = now()
+          WHERE owner_email = $1
+            AND app = ANY($2::text[])
+            AND is_selected
+        `,
+        [input.ownerEmail, selectedApps],
+      )
+      await client.query(
+        `
+          UPDATE user_maton_connections
+          SET is_selected = true,
+              updated_at = now()
+          WHERE owner_email = $1
+            AND connection_id = ANY($2::text[])
+            AND source = 'maton'
+            AND status = 'ACTIVE'
+        `,
+        [input.ownerEmail, selectedConnectionIds],
+      )
+    }
     await audit(client, input.ownerEmail, 'maton.credential.platform_imported', {
       connectionCount: input.connections.length,
       apps: Array.from(new Set(input.connections.map((connection) => connection.app))).sort(),
