@@ -3,20 +3,20 @@
   "releases": {
     "default": {
       "oncePerEnvironment": true,
-      "title": "Private workspaces, reliable navigation, and visible releases",
-      "summary": "ClawPilot now separates user workspaces and credentials, gives administrators a complete access surface, and records product changes in durable Postgres-backed release notes.",
+      "title": "Shared short links and organized knowledge retrieval",
+      "summary": "ClawPilot adds a user-scoped short-link service for ClawPilot and Eigen Racing, a structured Obsidian knowledge vault, verified AI Radar intake, and durable hybrid document-search infrastructure.",
       "features": [
-        "Branded welcome invitations from ClawPilot Stewards with invitation-bound magic-code activation",
-        "User-specific documents with generated build, project, pipeline, and AI opportunity briefs",
-        "Admin-controlled full release history and logical data checkpoints",
-        "Persistent desktop sidebar collapse, mobile navigation drawer, and compact bottom navigation",
-        "ClawPilot product mark across the application, browser icon, welcome flow, and email"
+        "User-scoped short links with custom or generated slugs, tags, expiry, click limits, status controls, and destination or slug search",
+        "Canonical eigenracing.com short URLs with trusted server-to-server access for Eigen Racing applications",
+        "Portable Obsidian vault navigation that separates current contracts, release evidence, and historical notes",
+        "Official-source AI Radar updates in each user's generated research brief",
+        "Queued pgvector document embeddings with local hybrid retrieval by default and explicit, separately credentialed OpenAI semantic search when enabled"
       ],
       "fixes": [
-        "Prevented the desktop sidebar from overlaying and cropping page content on touch-width layouts",
-        "Prevented expired or revoked invitations from bypassing activation through normal sign-in",
-        "Replaced hosted Git and local-file backup discovery with durable release and checkpoint records",
-        "Removed stale promotion and cross-project document categories from the Docs experience"
+        "Made public short-link redirects bypass application sign-in while retaining API-level management authorization",
+        "Bound cross-application credentials to a declared source application and restricted production destinations to HTTPS",
+        "Added worker and migration visibility to hosted health checks",
+        "Added a read-only Railway backup audit that distinguishes logical checkpoints from provider snapshots"
       ]
     }
   }

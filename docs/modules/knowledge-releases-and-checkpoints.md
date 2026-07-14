@@ -19,6 +19,9 @@ Turn operating data into private, readable briefs and make shipped changes visib
 - The configured owner also receives the curated repository knowledge catalog.
 - Status and source distinguish current contracts from historical evidence.
 - Postgres full-text search indexes titles and content; tags remain searchable.
+- Every changed document queues a pgvector embedding job. Hybrid search combines 256-dimension vector similarity with deterministic full-text ranking.
+- The worker defaults to a deterministic local hashing vector without external credentials. OpenAI semantic vectors require an explicit provider opt-in and dedicated embedding key; an agent-provider key never enables document export.
+- The AI Opportunity Radar ingests bounded official OpenAI, GitHub, Vercel, and Railway feeds and refreshes each active user's private research brief.
 
 ## Releases
 

@@ -1,0 +1,9 @@
+workspace.json
+workspace-mobile.json
+workspace-*.json
+cache/
+plugins/
+themes/
+snippets/
+community-plugins.json
+hotkeys.json

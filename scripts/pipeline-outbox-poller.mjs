@@ -10,6 +10,8 @@ const port = String(process.env.PORT || 4002)
 const baseUrl = String(process.env.PIPELINE_OUTBOX_URL || `http://127.0.0.1:${port}`).replace(/\/$/, '')
 const pipelineIntervalMs = Math.max(1000, Math.min(Number(process.env.PIPELINE_OUTBOX_POLL_MS || 10000), 300000))
 const agentIntervalMs = Math.max(1000, Math.min(Number(process.env.AGENT_DISPATCH_POLL_MS || 5000), 300000))
+const embeddingIntervalMs = Math.max(5000, Math.min(Number(process.env.DOCUMENT_EMBEDDING_POLL_MS || 15000), 300000))
+const radarIntervalMs = Math.max(60000, Math.min(Number(process.env.AI_RADAR_POLL_MS || 3600000), 86400000))
 let running = true
 
 process.on('SIGINT', () => { running = false })
@@ -32,22 +34,26 @@ async function poll(name, path, limit) {
     const text = await response.text()
     if (!response.ok) throw new Error(`HTTP ${response.status}: ${text.slice(0, 500)}`)
     const result = text ? JSON.parse(text) : {}
-    if (Number(result.claimed || 0) > 0) {
-      console.log(`[${name}] claimed=${result.claimed} succeeded=${result.succeeded} failed=${result.failed} dead=${result.dead}`)
+    if (Number(result.claimed || 0) > 0 || Number(result.ingested || 0) > 0) {
+      console.log(`[${name}] ${JSON.stringify(result)}`)
     }
+    return true
   } catch (error) {
     console.warn(`[${name}] poll failed: ${error instanceof Error ? error.message : String(error)}`)
+    return false
   }
 }
 
 async function runLoop(name, path, limit, intervalMs) {
   while (running) {
-    await poll(name, path, limit)
-    if (running) await wait(intervalMs)
+    const succeeded = await poll(name, path, limit)
+    if (running) await wait(succeeded ? intervalMs : Math.min(intervalMs, 5000))
   }
 }
 
 await Promise.all([
   runLoop('pipeline-outbox', '/api/pipeline/sync/outbox/process', 10, pipelineIntervalMs),
   runLoop('agent-dispatch', '/api/agents/dispatch/process', 1, agentIntervalMs),
+  runLoop('document-embeddings', '/api/docs/embeddings/process', 12, embeddingIntervalMs),
+  runLoop('ai-radar', '/api/ai-radar/process', 1, radarIntervalMs),
 ])

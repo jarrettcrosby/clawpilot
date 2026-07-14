@@ -6,6 +6,8 @@ import { query as queryAgentCredentials } from '@/lib/persistence/agentCredentia
 import { query } from '@/lib/persistence/postgres'
 import { readPipelineOutboxWorkerHeartbeatFromPostgres } from '@/lib/persistence/pipeline'
 import { readAgentDispatchWorkerHeartbeatFromPostgres } from '@/lib/persistence/agentDispatch'
+import { documentEmbeddingConfiguration } from '@/lib/documentEmbeddings'
+import { validateShortLinkConfiguration } from '@/lib/shortlinks'
 
 const DEV_LOG_PATH = '/tmp/clawd-app-dev.log'
 const FALLBACK_LOG_PATH = '/tmp/clawd-app.log'
@@ -61,6 +63,7 @@ export async function GET() {
     let credentialStore: Record<string, unknown> = { status: 'not-configured' }
     let worker: Record<string, unknown> = { status: 'not-owned' }
     let agentWorker: Record<string, unknown> = { status: 'not-owned' }
+    let knowledgeWorkers: Array<Record<string, unknown>> = []
 
     if (cloudProvider === 'railway' && storage !== 'postgres') {
       errors.push('Railway runtime requires Postgres storage.')
@@ -116,6 +119,17 @@ export async function GET() {
     if (cloudProvider === 'railway' && process.env.CLAWPILOT_DB_FALLBACK_TO_FILE !== 'false') {
       errors.push('Railway database fallback must be disabled.')
     }
+    try {
+      validateShortLinkConfiguration({ requireServiceClient: true, requirePublicOrigin: true })
+    } catch (error) {
+      errors.push(error instanceof Error ? error.message : 'Short-link configuration is invalid.')
+    }
+    let embeddingProvider: 'local' | 'openai' = 'local'
+    try {
+      embeddingProvider = documentEmbeddingConfiguration().provider
+    } catch (error) {
+      errors.push(error instanceof Error ? error.message : 'Document embedding configuration is invalid.')
+    }
 
     if (storage === 'postgres') {
       try {
@@ -134,6 +148,9 @@ export async function GET() {
           hardening_migration_applied: boolean
           invitation_delivery_migration_applied: boolean
           invitation_pending_migration_applied: boolean
+          shortlinks_migration_applied: boolean
+          vector_knowledge_migration_applied: boolean
+          shortlink_hardening_migration_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -204,6 +221,21 @@ export async function GET() {
                 FROM schema_migrations
                 WHERE filename = '0014_invitation_delivery_pending.sql'
               ) AS invitation_pending_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0015_short_links.sql'
+              ) AS shortlinks_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0016_document_vectors_and_ai_radar.sql'
+              ) AS vector_knowledge_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0017_short_link_destination_hardening.sql'
+              ) AS shortlink_hardening_migration_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -229,6 +261,9 @@ export async function GET() {
             && row?.hardening_migration_applied
             && row?.invitation_delivery_migration_applied
             && row?.invitation_pending_migration_applied
+            && row?.shortlinks_migration_applied
+            && row?.vector_knowledge_migration_applied
+            && row?.shortlink_hardening_migration_applied
             && row?.migration_checksums_present
           ),
         }
@@ -246,6 +281,9 @@ export async function GET() {
           || !row?.hardening_migration_applied
           || !row?.invitation_delivery_migration_applied
           || !row?.invitation_pending_migration_applied
+          || !row?.shortlinks_migration_applied
+          || !row?.vector_knowledge_migration_applied
+          || !row?.shortlink_hardening_migration_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')
@@ -281,6 +319,40 @@ export async function GET() {
           if (agentAgeMs === null || agentAgeMs > maxAgentHeartbeatAgeMs) {
             errors.push('Agent dispatch worker heartbeat is missing or stale.')
           }
+
+          const knowledgeResult = await query<{
+            worker_name: string
+            checked_at: string
+            phase: string
+            details: Record<string, unknown>
+          }>(
+            `SELECT worker_name, checked_at::text, phase, details FROM knowledge_worker_heartbeat ORDER BY worker_name`,
+          )
+          const radarPollMs = Math.max(60_000, Math.min(Number(process.env.AI_RADAR_POLL_MS || 3_600_000), 86_400_000))
+          const embeddingPollMs = Math.max(5_000, Math.min(Number(process.env.DOCUMENT_EMBEDDING_POLL_MS || 15_000), 300_000))
+          knowledgeWorkers = knowledgeResult.rows.map((row) => {
+            const ageMs = checkedAt - Date.parse(row.checked_at)
+            const maxAgeMs = row.worker_name === 'ai-radar'
+              ? Math.max(120_000, radarPollMs * 2)
+              : Math.max(90_000, embeddingPollMs * 3)
+            const fresh = Number.isFinite(ageMs) && ageMs <= maxAgeMs
+            return {
+              name: row.worker_name,
+              status: fresh ? 'reachable' : 'stale',
+              phase: row.phase,
+              heartbeatAt: row.checked_at,
+              ageMs: Number.isFinite(ageMs) ? ageMs : null,
+              maxAgeMs,
+              details: row.details,
+            }
+          })
+          for (const expectedWorker of ['ai-radar', 'document-embeddings']) {
+            const workerStatus = knowledgeWorkers.find((entry) => entry.name === expectedWorker)
+            if (!workerStatus) errors.push(`${expectedWorker} worker heartbeat is missing.`)
+            else if (workerStatus.status === 'stale') errors.push(`${expectedWorker} worker heartbeat is stale.`)
+            else if (workerStatus.phase === 'failed') errors.push(`${expectedWorker} worker reported a failure.`)
+            else if (workerStatus.phase === 'degraded') warnings.push(`${expectedWorker} worker is degraded.`)
+          }
         }
       } catch (error) {
         database = {
@@ -304,9 +376,14 @@ export async function GET() {
       credentialStore,
       worker,
       agentWorker,
+      knowledgeWorkers,
       capabilities: {
         openClawExecution: process.env.CLAWPILOT_EXECUTION_ENABLED === '1',
         agentRuntime: getAgentRuntime(),
+        semanticDocumentSearch: embeddingProvider === 'openai',
+        vectorDocumentSearch: true,
+        aiRadar: process.env.AI_RADAR_ENABLED !== 'false',
+        shortLinks: true,
       },
       checkedAt,
     }, { status: errors.length > 0 ? 503 : 200 })

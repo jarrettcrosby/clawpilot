@@ -9,12 +9,13 @@ import VersionsSection from '@/components/versions/VersionsSection'
 import DashboardSection from '@/components/dashboard/DashboardSection'
 import PipelineSection from '@/components/pipeline/PipelineSection'
 import AgentsSection from '@/components/agents/AgentsSection'
+import ShortLinksSection from '@/components/links/ShortLinksSection'
 import ShortcutsModal from '@/components/help/ShortcutsModal'
 import { Box } from '@mui/material'
 import type { BoardFilter } from '@/components/projects/FilterBar'
 import { emptyFilter } from '@/components/projects/FilterBar'
 
-const SECTIONS = ['dashboard', 'docs', 'projects', 'pipeline', 'agents', 'versions']
+const SECTIONS = ['dashboard', 'docs', 'projects', 'pipeline', 'links', 'agents', 'versions']
 const DESKTOP_NAV_COLLAPSED_KEY = 'clawpilot_desktop_nav_collapsed'
 const DESKTOP_NAV_PREFERENCE_EVENT = 'clawpilot:desktop-nav-preference'
 
@@ -46,7 +47,7 @@ function subscribeToDesktopNavPreference(onStoreChange: () => void) {
   }
 }
 
-export default function HomeClient() {
+export default function HomeClient({ shortLinksEnabled }: { shortLinksEnabled: boolean }) {
   // Always init 'dashboard' to match SSR. useEffect corrects to real hash post-hydration.
   const activeSection = useSyncExternalStore(subscribeToHashChange, getSectionFromHash, () => 'dashboard')
   const desktopNavCollapsed = useSyncExternalStore(
@@ -119,6 +120,10 @@ export default function HomeClient() {
     window.location.hash = section
   }, [])
 
+  useEffect(() => {
+    if (!shortLinksEnabled && activeSection === 'links') navigate('dashboard')
+  }, [activeSection, navigate, shortLinksEnabled])
+
   // Global keyboard shortcuts
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
@@ -159,6 +164,7 @@ export default function HomeClient() {
         mobileOpen={mobileNavOpen}
         onMobileOpen={() => setMobileNavOpen(true)}
         onMobileClose={() => setMobileNavOpen(false)}
+        showLinks={shortLinksEnabled}
       />
       <Box
         data-testid="app-content"
@@ -202,6 +208,11 @@ export default function HomeClient() {
           {section === 'pipeline' && (
             <Box sx={{ height: '100%', overflow: 'hidden' }}>
               <PipelineSection />
+            </Box>
+          )}
+          {shortLinksEnabled && section === 'links' && (
+            <Box sx={{ height: '100%', overflow: 'auto' }}>
+              <ShortLinksSection />
             </Box>
           )}
           {section === 'versions' && (

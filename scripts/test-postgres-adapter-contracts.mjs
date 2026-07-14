@@ -91,6 +91,23 @@ const invitationPendingMigration = read('db/migrations/0014_invitation_delivery_
 assertIncludes(invitationPendingMigration, 'delivery_pending_at', 'invitation pending delivery migration')
 assertIncludes(invitationPendingMigration, 'idx_app_user_invitations_one_delivery_pending', 'single pending invitation delivery')
 
+const shortLinksMigration = read('db/migrations/0015_short_links.sql')
+for (const table of ['short_links', 'short_link_clicks']) {
+  assertIncludes(shortLinksMigration, `CREATE TABLE IF NOT EXISTS ${table}`, 'short-link migration')
+}
+assertIncludes(shortLinksMigration, "destination_url ~ '^https://'", 'HTTPS-only short-link destinations')
+assertIncludes(shortLinksMigration, 'max_clicks', 'short-link click limits')
+
+const vectorKnowledgeMigration = read('db/migrations/0016_document_vectors_and_ai_radar.sql')
+for (const table of ['document_embedding_jobs', 'ai_radar_items', 'knowledge_worker_heartbeat']) {
+  assertIncludes(vectorKnowledgeMigration, `CREATE TABLE IF NOT EXISTS ${table}`, 'vector knowledge migration')
+}
+const shortLinkHardeningMigration = read('db/migrations/0017_short_link_destination_hardening.sql')
+assertIncludes(shortLinkHardeningMigration, "destination_url ~ '^https://'", 'HTTPS-only short-link destination migration')
+assertIncludes(shortLinkHardeningMigration, "WHERE status = 'processing'", 'stale embedding lease index')
+assertIncludes(vectorKnowledgeMigration, 'CREATE EXTENSION IF NOT EXISTS vector', 'pgvector extension')
+assertIncludes(vectorKnowledgeMigration, 'embedding vector(256)', 'document vectors')
+
 const invitationAdapter = read('app_src/lib/invitations.ts')
 assertIncludes(invitationAdapter, 'requestInvitationAuthMagicCode', 'invitation adapter')
 assertIncludes(invitationAdapter, 'revoked_at IS NULL', 'invitation revocation contract')
@@ -111,6 +128,25 @@ assertIncludes(documentsAdapter, "sourceKey: 'system:build-brief'", 'generated b
 assertIncludes(documentsAdapter, "sourceKey: 'system:project-brief'", 'generated project brief')
 assertIncludes(documentsAdapter, "sourceKey: 'system:pipeline-brief'", 'generated pipeline brief')
 assertIncludes(documentsAdapter, 'document.content', 'local full-document search')
+assertIncludes(documentsAdapter, 'document_embedding_jobs', 'document embedding enqueue')
+assertIncludes(documentsAdapter, 'listAiRadarItems', 'AI Radar generated brief')
+assertIncludes(documentsAdapter, 'embedding <=> $3::vector', 'hybrid semantic document search')
+assertIncludes(documentsAdapter, 'embedding_model = $4', 'same-model semantic document search')
+
+const embeddingsAdapter = read('app_src/lib/documentEmbeddings.ts')
+assertIncludes(embeddingsAdapter, "model: config.model", 'embedding model reporting')
+assertIncludes(embeddingsAdapter, 'FOR UPDATE SKIP LOCKED', 'embedding job leases')
+assertIncludes(embeddingsAdapter, 'clawpilot-hash-vector-v1', 'default local vector model')
+assertIncludes(embeddingsAdapter, 'ensureJobsForModel', 'embedding model upgrade queue')
+assertIncludes(embeddingsAdapter, 'OPENAI_EMBEDDING_API_KEY', 'dedicated external embedding credential')
+assertIncludes(embeddingsAdapter, "jobs.status = 'processing'", 'stale embedding job recovery')
+assertIncludes(embeddingsAdapter, 'jobs.locked_at = $5::timestamptz', 'embedding lease ownership')
+
+const shortLinksAdapter = read('app_src/lib/shortlinks.ts')
+assertIncludes(shortLinksAdapter, 'SHORTLINK_SERVICE_CLIENTS_JSON', 'source-bound short-link service clients')
+assertIncludes(shortLinksAdapter, "url.protocol !== 'https:'", 'short-link destination transport security')
+assertIncludes(shortLinksAdapter, 'FOR UPDATE', 'atomic short-link click limits')
+assertIncludes(shortLinksAdapter, 'NOT $4::boolean OR source_app = $5', 'service source isolation')
 
 const tenancyAdapter = read('app_src/lib/tenancy.ts')
 assertIncludes(tenancyAdapter, 'ensureDefaultResourcesForUser', 'tenancy adapter')
@@ -243,6 +279,9 @@ assertIncludes(healthRoute, '0011_knowledge_releases_checkpoints.sql', 'hosted k
 assertIncludes(healthRoute, '0012_invitation_release_hardening.sql', 'hosted release hardening migration health')
 assertIncludes(healthRoute, '0013_invitation_delivery_coordination.sql', 'hosted invitation delivery migration health')
 assertIncludes(healthRoute, '0014_invitation_delivery_pending.sql', 'hosted invitation pending migration health')
+assertIncludes(healthRoute, '0015_short_links.sql', 'hosted short-links migration health')
+assertIncludes(healthRoute, '0016_document_vectors_and_ai_radar.sql', 'hosted vector knowledge migration health')
+assertIncludes(healthRoute, '0017_short_link_destination_hardening.sql', 'hosted short-link hardening migration health')
 assertIncludes(healthRoute, 'migration_checksums_present', 'hosted migration checksum health')
 assertIncludes(healthRoute, 'queryAgentCredentials', 'shared agent credential store health')
 assertIncludes(healthRoute, 'readAgentDispatchWorkerHeartbeatFromPostgres', 'hosted agent worker health')
