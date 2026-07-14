@@ -36,9 +36,17 @@ require_value CLAWPILOT_MAIL_FROM 5
 require_value CLAWPILOT_PUBLIC_URL 16
 require_value PIPELINE_SHEET_ID 20
 require_value PIPELINE_OUTBOX_WORKER_SECRET 32
+require_value SHORTLINK_PUBLIC_ORIGIN 16
+
+SHORTLINK_CLIENTS_VALUE="${SHORTLINK_SERVICE_CLIENTS_JSON:-}"
+SHORTLINK_SECRET_VALUE="${SHORTLINK_SERVICE_SECRET:-}"
+if (( ${#SHORTLINK_CLIENTS_VALUE} < 32 )) && (( ${#SHORTLINK_SECRET_VALUE} < 32 )); then
+  fail "SHORTLINK_SERVICE_CLIENTS_JSON or SHORTLINK_SERVICE_SECRET must be configured"
+fi
 
 [[ "$CLAWPILOT_MAIL_FROM" == *@* ]] || fail "CLAWPILOT_MAIL_FROM must be an email address"
 [[ "$CLAWPILOT_PUBLIC_URL" == https://* ]] || fail "CLAWPILOT_PUBLIC_URL must use HTTPS"
+node scripts/validate-runtime-config.mjs
 
 cleanup() {
   [[ -n "$WORKER_PID" ]] && kill "$WORKER_PID" 2>/dev/null || true
@@ -49,14 +57,25 @@ trap cleanup EXIT INT TERM
 npm run start &
 APP_PID=$!
 
+HEALTH_URL="http://127.0.0.1:${PORT:-4002}/api/health"
+READY=0
+for _attempt in $(seq 1 120); do
+  kill -0 "$APP_PID" 2>/dev/null || fail "application exited before readiness validation"
+  if node -e 'fetch(process.argv[1], { signal: AbortSignal.timeout(3000) }).then(() => process.exit(0)).catch(() => process.exit(1))' "$HEALTH_URL"; then
+    READY=1
+    break
+  fi
+  sleep 1
+done
+[[ "$READY" == "1" ]] || fail "application did not become reachable within 120 seconds"
+
 node scripts/pipeline-outbox-poller.mjs &
 WORKER_PID=$!
 
-HEALTH_URL="http://127.0.0.1:${PORT:-4002}/api/health"
 HEALTHY=0
 for _attempt in $(seq 1 120); do
   kill -0 "$APP_PID" 2>/dev/null || fail "application exited before health validation"
-  kill -0 "$WORKER_PID" 2>/dev/null || fail "pipeline outbox poller exited before health validation"
+  kill -0 "$WORKER_PID" 2>/dev/null || fail "runtime worker exited before health validation"
   if node -e 'fetch(process.argv[1], { signal: AbortSignal.timeout(3000) }).then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))' "$HEALTH_URL"; then
     HEALTHY=1
     break

@@ -26,6 +26,7 @@ export type AppUserPermissions = {
   createPipelines: boolean
   viewFullReleaseHistory: boolean
   manageBackups: boolean
+  manageLinks: boolean
 }
 
 export const MEMBER_PERMISSIONS: AppUserPermissions = {
@@ -35,6 +36,7 @@ export const MEMBER_PERMISSIONS: AppUserPermissions = {
   createPipelines: true,
   viewFullReleaseHistory: false,
   manageBackups: false,
+  manageLinks: false,
 }
 
 export const OWNER_PERMISSIONS: AppUserPermissions = {
@@ -44,6 +46,7 @@ export const OWNER_PERMISSIONS: AppUserPermissions = {
   createPipelines: true,
   viewFullReleaseHistory: true,
   manageBackups: true,
+  manageLinks: true,
 }
 
 export type AppUser = {
@@ -106,6 +109,7 @@ function normalizePermissions(value: unknown): AppUserPermissions {
     createPipelines: input.createPipelines !== false,
     viewFullReleaseHistory: input.viewFullReleaseHistory === true,
     manageBackups: input.manageBackups === true,
+    manageLinks: input.manageLinks === true,
   }
 }
 
@@ -117,6 +121,7 @@ function permissionsForRole(role: AppUserRole, value: unknown): AppUserPermissio
     permissions.manageUserAccess = false
     permissions.viewFullReleaseHistory = false
     permissions.manageBackups = false
+    permissions.manageLinks = false
   }
   return permissions
 }

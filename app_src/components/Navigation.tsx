@@ -16,6 +16,7 @@ import {
   Typography,
 } from '@mui/material'
 import CloseRounded from '@mui/icons-material/CloseRounded'
+import LinkRounded from '@mui/icons-material/LinkRounded'
 import MoreHorizRounded from '@mui/icons-material/MoreHorizRounded'
 import BrandMark from '@/components/BrandMark'
 import { DashboardIcon, DocsIcon, ProjectsIcon, PipelineIcon, AgentsIcon, VersionsIcon } from '@/lib/icons'
@@ -25,6 +26,7 @@ const NAV_ITEMS = [
   { id: 'docs', label: 'Docs', Icon: DocsIcon },
   { id: 'projects', label: 'Projects', Icon: ProjectsIcon },
   { id: 'pipeline', label: 'Pipeline', Icon: PipelineIcon },
+  { id: 'links', label: 'Links', Icon: LinkRounded },
   { id: 'agents', label: 'Agents', Icon: AgentsIcon },
   { id: 'versions', label: 'Versions', Icon: VersionsIcon },
 ]
@@ -39,6 +41,7 @@ type NavigationProps = {
   mobileOpen: boolean
   onMobileOpen: () => void
   onMobileClose: () => void
+  showLinks?: boolean
 }
 
 type NavigationListProps = {
@@ -46,12 +49,14 @@ type NavigationListProps = {
   collapsed?: boolean
   onSelect: (section: string) => void
   surface: 'desktop' | 'mobile'
+  showLinks: boolean
 }
 
-function NavigationList({ activeSection, collapsed = false, onSelect, surface }: NavigationListProps) {
+function NavigationList({ activeSection, collapsed = false, onSelect, surface, showLinks }: NavigationListProps) {
+  const items = showLinks ? NAV_ITEMS : NAV_ITEMS.filter((item) => item.id !== 'links')
   return (
     <List sx={{ px: collapsed ? 1.25 : 1.5, py: 1, flex: 1 }}>
-      {NAV_ITEMS.map((item) => (
+      {items.map((item) => (
         <Tooltip
           key={item.id}
           title={collapsed ? item.label : ''}
@@ -113,6 +118,7 @@ export default function Navigation({
   mobileOpen,
   onMobileOpen,
   onMobileClose,
+  showLinks = true,
 }: NavigationProps) {
   const desktopWidth = collapsed ? 76 : 220
 
@@ -178,6 +184,7 @@ export default function Navigation({
             collapsed={collapsed}
             onSelect={onNavigate}
             surface="desktop"
+            showLinks={showLinks}
           />
         </Box>
       </Drawer>
@@ -234,6 +241,7 @@ export default function Navigation({
             activeSection={activeSection}
             onSelect={navigateFromMobile}
             surface="mobile"
+            showLinks={showLinks}
           />
         </Box>
       </Drawer>

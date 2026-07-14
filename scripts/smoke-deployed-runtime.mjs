@@ -49,6 +49,9 @@ async function verifyAuthenticationBoundary() {
     redirect: 'manual',
   })
   check(api.status === 401, 'unauthenticated API request is rejected')
+
+  const missingShortLink = await fetch(`${baseUrl}/s/clawpilot-smoke-route-not-found`, { redirect: 'manual' })
+  check(missingShortLink.status === 404, 'public short-link resolver bypasses login and returns not found')
 }
 
 function check(condition, message) {
@@ -89,6 +92,14 @@ try {
       check(health?.worker?.status === 'reachable', 'pipeline outbox worker heartbeat is fresh')
       check(health?.agentWorker?.status === 'reachable', 'agent dispatch worker heartbeat is fresh')
       check(health?.credentialStore?.status === 'reachable', 'shared agent credential store is reachable')
+      const knowledgeWorkers = Array.isArray(health?.knowledgeWorkers) ? health.knowledgeWorkers : []
+      const aiRadar = knowledgeWorkers.find((entry) => entry?.name === 'ai-radar')
+      const documentEmbeddings = knowledgeWorkers.find((entry) => entry?.name === 'document-embeddings')
+      check(aiRadar?.status === 'reachable' && aiRadar?.phase !== 'failed', 'AI Radar worker heartbeat is fresh')
+      check(
+        documentEmbeddings?.status === 'reachable' && documentEmbeddings?.phase !== 'failed',
+        'document embedding worker heartbeat is fresh',
+      )
     }
   }
 
@@ -103,6 +114,9 @@ try {
 
   const threads = await getJson('/api/agents/threads')
   check(Array.isArray(threads?.threads), 'agent threads endpoint returns a thread array')
+
+  const shortLinks = await getJson('/api/shortlinks')
+  check(Array.isArray(shortLinks?.links), 'short-link endpoint returns a link array')
 
   const runs = await getJson('/api/execution-runs/summary')
   const results = await getJson('/api/execution-results/summary')

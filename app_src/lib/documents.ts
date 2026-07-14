@@ -2,6 +2,8 @@ import crypto from 'crypto'
 import fs from 'fs/promises'
 import path from 'path'
 import matter from 'gray-matter'
+import { listAiRadarItems } from '@/lib/aiRadar'
+import { embedSearchQuery } from '@/lib/documentEmbeddings'
 import { query } from '@/lib/persistence/postgres'
 import { MEMBER_RELEASE_HISTORY_DAYS, releaseAccessFor } from '@/lib/releases'
 import {
@@ -9,7 +11,7 @@ import {
   resolvePipelineSpaceAccess,
   resolveProjectBoardAccess,
 } from '@/lib/tenancy'
-import { configuredOwnerEmail, normalizeUserEmail, type AppUser } from '@/lib/users'
+import { configuredOwnerEmail, getAppUser, normalizeUserEmail, type AppUser } from '@/lib/users'
 
 export type AppDocument = {
   id: string
@@ -127,45 +129,60 @@ async function upsertDocument(input: {
   const contentHash = sha256(content)
   await query(
     `
-      INSERT INTO app_documents (
-        owner_email, source_key, source, kind, status, title, slug, category,
-        content, excerpt, tags, source_path, content_hash, board_id, pipeline_id,
-        generated_at, created_at, updated_at
+      WITH changed_document AS (
+        INSERT INTO app_documents (
+          owner_email, source_key, source, kind, status, title, slug, category,
+          content, excerpt, tags, source_path, content_hash, board_id, pipeline_id,
+          generated_at, created_at, updated_at
+        )
+        VALUES (
+          $1, $2, $3, $4, $5, $6, $7, $8,
+          $9, $10, $11::text[], $12, $13, $14::uuid, $15::uuid,
+          $16::timestamptz, now(), now()
+        )
+        ON CONFLICT (owner_email, source_key) DO UPDATE SET
+          source = EXCLUDED.source,
+          kind = EXCLUDED.kind,
+          status = EXCLUDED.status,
+          title = EXCLUDED.title,
+          slug = EXCLUDED.slug,
+          category = EXCLUDED.category,
+          content = EXCLUDED.content,
+          excerpt = EXCLUDED.excerpt,
+          tags = EXCLUDED.tags,
+          source_path = EXCLUDED.source_path,
+          content_hash = EXCLUDED.content_hash,
+          board_id = EXCLUDED.board_id,
+          pipeline_id = EXCLUDED.pipeline_id,
+          generated_at = EXCLUDED.generated_at,
+          updated_at = now()
+        WHERE app_documents.content_hash <> EXCLUDED.content_hash
+           OR app_documents.source IS DISTINCT FROM EXCLUDED.source
+           OR app_documents.kind IS DISTINCT FROM EXCLUDED.kind
+           OR app_documents.status <> EXCLUDED.status
+           OR app_documents.title <> EXCLUDED.title
+           OR app_documents.slug <> EXCLUDED.slug
+           OR app_documents.category <> EXCLUDED.category
+           OR app_documents.excerpt IS DISTINCT FROM EXCLUDED.excerpt
+           OR app_documents.tags IS DISTINCT FROM EXCLUDED.tags
+           OR app_documents.source_path IS DISTINCT FROM EXCLUDED.source_path
+           OR app_documents.board_id IS DISTINCT FROM EXCLUDED.board_id
+           OR app_documents.pipeline_id IS DISTINCT FROM EXCLUDED.pipeline_id
+           OR app_documents.generated_at IS DISTINCT FROM EXCLUDED.generated_at
+        RETURNING id, owner_email, content_hash
       )
-      VALUES (
-        $1, $2, $3, $4, $5, $6, $7, $8,
-        $9, $10, $11::text[], $12, $13, $14::uuid, $15::uuid,
-        $16::timestamptz, now(), now()
-      )
-      ON CONFLICT (owner_email, source_key) DO UPDATE SET
-        source = EXCLUDED.source,
-        kind = EXCLUDED.kind,
-        status = EXCLUDED.status,
-        title = EXCLUDED.title,
-        slug = EXCLUDED.slug,
-        category = EXCLUDED.category,
-        content = EXCLUDED.content,
-        excerpt = EXCLUDED.excerpt,
-        tags = EXCLUDED.tags,
-        source_path = EXCLUDED.source_path,
+      INSERT INTO document_embedding_jobs (document_id, owner_email, content_hash)
+      SELECT id, owner_email, content_hash
+      FROM changed_document
+      ON CONFLICT (document_id) DO UPDATE SET
+        owner_email = EXCLUDED.owner_email,
         content_hash = EXCLUDED.content_hash,
-        board_id = EXCLUDED.board_id,
-        pipeline_id = EXCLUDED.pipeline_id,
-        generated_at = EXCLUDED.generated_at,
+        status = 'pending',
+        attempts = 0,
+        available_at = now(),
+        locked_at = NULL,
+        last_error = NULL,
         updated_at = now()
-      WHERE app_documents.content_hash <> EXCLUDED.content_hash
-         OR app_documents.source IS DISTINCT FROM EXCLUDED.source
-         OR app_documents.kind IS DISTINCT FROM EXCLUDED.kind
-         OR app_documents.status <> EXCLUDED.status
-         OR app_documents.title <> EXCLUDED.title
-         OR app_documents.slug <> EXCLUDED.slug
-         OR app_documents.category <> EXCLUDED.category
-         OR app_documents.excerpt IS DISTINCT FROM EXCLUDED.excerpt
-         OR app_documents.tags IS DISTINCT FROM EXCLUDED.tags
-         OR app_documents.source_path IS DISTINCT FROM EXCLUDED.source_path
-         OR app_documents.board_id IS DISTINCT FROM EXCLUDED.board_id
-         OR app_documents.pipeline_id IS DISTINCT FROM EXCLUDED.pipeline_id
-         OR app_documents.generated_at IS DISTINCT FROM EXCLUDED.generated_at
     `,
     [
       input.ownerEmail,
@@ -204,7 +221,7 @@ export async function refreshUserBriefs(
         : Promise.reject(error)),
   ])
   const releaseAccess = releaseAccessFor(user)
-  const [tasksResult, pipelineProjection, releasesResult] = await Promise.all([
+  const [tasksResult, pipelineProjection, releasesResult, radarItems] = await Promise.all([
     query<TaskBriefRow>(
       `
         SELECT
@@ -236,6 +253,7 @@ export async function refreshUserBriefs(
       `,
       [releaseAccess.historyScope === 'full', MEMBER_RELEASE_HISTORY_DAYS],
     ),
+    listAiRadarItems(12),
   ])
 
   const now = new Date().toISOString()
@@ -301,10 +319,19 @@ export async function refreshUserBriefs(
   ].join('\n')
 
   const researchTasks = tasks.filter((task) => task.category === 'research')
+  const radarUpdates = radarItems.map((item) => {
+    const published = new Date(item.publishedAt).toLocaleDateString('en-US')
+    const title = item.title.replace(/[\[\]]/g, '')
+    const summary = singleLine(item.summary).slice(0, 220)
+    return `[${title}](${item.itemUrl}) - ${item.sourceName}, ${published}${summary ? ` - ${summary}` : ''}`
+  })
   const radarContent = [
     '# AI and Opportunity Radar',
     '',
     `Updated: ${now}`,
+    '',
+    '## Verified Platform Updates',
+    markdownList(radarUpdates, 'No verified platform updates have been collected yet.'),
     '',
     '## Research Queue',
     markdownList(researchTasks.map((task) => `${task.title} (${task.status})${task.next_action ? ` - Next: ${task.next_action}` : ''}`), 'No research items are queued.'),
@@ -322,6 +349,21 @@ export async function refreshUserBriefs(
     upsertDocument({ ownerEmail, sourceKey: 'system:pipeline-brief', source: 'system', kind: 'pipeline-report', status: 'generated', title: 'Pipeline Brief', slug: 'pipeline-brief', category: 'pipeline', content: pipelineContent, tags: ['pipeline', 'report'], pipelineId: pipeline.id, generatedAt: now }),
     upsertDocument({ ownerEmail, sourceKey: 'system:ai-opportunity-radar', source: 'system', kind: 'research-radar', status: 'generated', title: 'AI and Opportunity Radar', slug: 'ai-opportunity-radar', category: 'radar', content: radarContent, tags: ['ai', 'research', 'opportunities'], generatedAt: now }),
   ])
+}
+
+export async function refreshActiveUserBriefs(): Promise<{ refreshed: number; errors: string[] }> {
+  const activeUsers = await query<{ email: string }>(
+    `SELECT email FROM app_users WHERE status = 'active' ORDER BY email`,
+  )
+  const users = (await Promise.all(activeUsers.rows.map((row) => getAppUser(row.email))))
+    .filter((user): user is AppUser => user !== null)
+  const settled = await Promise.allSettled(users.map((user) => refreshUserBriefs(user)))
+  return {
+    refreshed: settled.filter((result) => result.status === 'fulfilled').length,
+    errors: settled.flatMap((result) => result.status === 'rejected'
+      ? [(result.reason instanceof Error ? result.reason.message : String(result.reason)).slice(0, 500)]
+      : []),
+  }
 }
 
 const GENERATED_BRIEF_KEYS = [
@@ -526,6 +568,7 @@ function toDocument(row: DocumentRow): AppDocument {
 export async function listUserDocuments(emailValue: unknown, searchValue?: unknown): Promise<AppDocument[]> {
   const ownerEmail = normalizeUserEmail(emailValue)
   const search = singleLine(searchValue).slice(0, 200)
+  const semantic = search ? await embedSearchQuery(search) : null
   const result = await query<DocumentRow>(
     `
       SELECT
@@ -548,8 +591,23 @@ export async function listUserDocuments(emailValue: unknown, searchValue?: unkno
           OR search_vector @@ websearch_to_tsquery('english'::regconfig, $2)
           OR title ILIKE '%' || $2 || '%'
           OR array_to_string(tags, ' ') ILIKE '%' || $2 || '%'
+          OR (
+            embedding IS NOT NULL
+            AND $3::vector IS NOT NULL
+            AND embedding_model = $4
+            AND 1 - (embedding <=> $3::vector) >= 0.35
+          )
         )
       ORDER BY
+        CASE WHEN $2 = '' THEN 0 ELSE GREATEST(
+          ts_rank_cd(search_vector, websearch_to_tsquery('english'::regconfig, $2)) * 1.2,
+          CASE WHEN title ILIKE '%' || $2 || '%' THEN 0.8 ELSE 0 END,
+          CASE
+            WHEN embedding IS NOT NULL AND $3::vector IS NOT NULL AND embedding_model = $4
+            THEN 1 - (embedding <=> $3::vector)
+            ELSE 0
+          END
+        ) END DESC,
         CASE source_key
           WHEN 'system:build-brief' THEN 0
           WHEN 'system:project-brief' THEN 1
@@ -561,7 +619,7 @@ export async function listUserDocuments(emailValue: unknown, searchValue?: unkno
         updated_at DESC,
         title ASC
     `,
-    [ownerEmail, search],
+    [ownerEmail, search, semantic?.vector || null, semantic?.model || ''],
   )
   return result.rows.map(toDocument)
 }

@@ -206,6 +206,31 @@ const SNAPSHOT_DATASETS: SnapshotDataset[] = [
     `,
   },
   {
+    key: 'shortLinks',
+    table: 'short_links',
+    optional: true,
+    sql: `
+      SELECT
+        id, owner_email, source_app, slug, destination_url, title, tags,
+        max_clicks, click_count, expires_at, disabled_at, last_clicked_at,
+        created_at, updated_at, deleted_at
+      FROM short_links
+      ORDER BY id
+    `,
+  },
+  {
+    key: 'aiRadarItems',
+    table: 'ai_radar_items',
+    optional: true,
+    sql: `
+      SELECT
+        id, source_key, source_name, source_url, item_url, title, summary,
+        category, tags, published_at, discovered_at, updated_at
+      FROM ai_radar_items
+      ORDER BY id
+    `,
+  },
+  {
     key: 'executionRuns',
     table: 'execution_runs',
     sql: `
