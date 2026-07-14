@@ -4,6 +4,7 @@ import {
   completeSuiteCrmOutboxInPostgres,
   failSuiteCrmOutboxInPostgres,
   readCrmWorkbookProjectionContext,
+  readCrmWorkbookProjectionReadiness,
   writeSuiteCrmWorkerHeartbeat,
 } from '@/lib/persistence/crm'
 import { enqueuePipelineSyncOutboxInPostgres } from '@/lib/persistence/pipeline'
@@ -32,6 +33,8 @@ export async function processSuiteCrmOutbox(input: { limit?: number; maxAttempts
   }
   let projectionsQueued = 0
   for (const [pipelineId, triggerId] of projectedPipelines) {
+    const readiness = await readCrmWorkbookProjectionReadiness(pipelineId)
+    if (!readiness.ready) continue
     const context = await readCrmWorkbookProjectionContext(pipelineId)
     if (!context) continue
     await enqueuePipelineSyncOutboxInPostgres({

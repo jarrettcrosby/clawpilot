@@ -725,6 +725,35 @@ export async function readCrmWorkbookProjectionContext(pipelineId: string) {
   return row ? { pipelineId: row.id, sheetId: row.sheet_id, ownerEmail: row.owner_email } : null
 }
 
+export async function readCrmWorkbookProjectionReadiness(pipelineId: string) {
+  const result = await query<{ unresolved: string; import_status: string | null }>(
+    `SELECT
+       (
+         SELECT count(*)::text
+         FROM sync_outbox
+         WHERE target_system = 'suitecrm'
+           AND payload->>'pipelineId' = $1::text
+           AND status <> 'succeeded'
+       ) AS unresolved,
+       (
+         SELECT status
+         FROM crm_sync_runs
+         WHERE pipeline_id = $1::uuid AND direction = 'sheet_to_crm'
+         ORDER BY started_at DESC, id DESC
+         LIMIT 1
+       ) AS import_status`,
+    [pipelineId],
+  )
+  const row = result.rows[0]
+  const unresolved = Number(row?.unresolved || 0)
+  const importStatus = row?.import_status || null
+  return {
+    ready: unresolved === 0 && importStatus !== 'running' && importStatus !== 'failed',
+    unresolved,
+    importStatus,
+  }
+}
+
 export async function beginCrmSyncRun(input: {
   pipelineId: string
   direction: 'sheet_to_crm' | 'crm_to_sheet' | 'reconcile'

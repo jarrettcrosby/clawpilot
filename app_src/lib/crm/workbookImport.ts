@@ -145,7 +145,7 @@ export async function importCrmWorkbook(input: {
   })
   const counts = { organizations: 0, contacts: 0, opportunities: 0, interactions: 0 }
   try {
-    const { tabs } = await inspectCrmWorkbook(input.context)
+    const { tabs, counts: sourceCounts } = await inspectCrmWorkbook(input.context)
     const organizations = new Map<string, { id: string; suiteCrmId: string }>()
     const contacts = new Map<string, { id: string; suiteCrmId: string }>()
     const opportunities = new Map<string, { id: string; suiteCrmId: string }>()
@@ -174,7 +174,7 @@ export async function importCrmWorkbook(input: {
     }
 
     for (const record of tabs.Contacts) {
-      const fullName = pick(record, 'Name', 'Contact', 'Contact Name', 'Full Name')
+      const fullName = pick(record, 'Name', 'Contact', 'Contact Name', 'Full Name', 'Full Name (First, Last)')
       if (!fullName) continue
       const organizationName = pick(record, 'Organization', 'Account', 'Company')
       const organization = organizations.get(normalizedName(organizationName))
@@ -253,6 +253,13 @@ export async function importCrmWorkbook(input: {
       counts.interactions += 1
     }
 
+    const incomplete = Object.entries(counts).flatMap(([entity, imported]) => {
+      const source = Number(sourceCounts[entity] || 0)
+      return imported === source ? [] : [`${entity}: ${imported}/${source}`]
+    })
+    if (incomplete.length > 0) {
+      throw new Error(`CRM workbook import was incomplete (${incomplete.join(', ')})`)
+    }
     await finishCrmSyncRun({ id: runId, status: 'succeeded', counts })
     return { runId, counts, queued: Object.values(counts).reduce((total, value) => total + value, 0) }
   } catch (error) {

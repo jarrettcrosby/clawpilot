@@ -6,6 +6,7 @@ import {
   beginCrmSyncRun,
   finishCrmSyncRun,
   listCrmRecordsInPostgres,
+  readCrmWorkbookProjectionReadiness,
 } from '@/lib/persistence/crm'
 import {
   resolvePipelineSheetBindingInPostgres,
@@ -105,6 +106,10 @@ export async function projectCrmWorkbook(input: {
   context: PipelineSheetContext
   actorEmail: string
 }) {
+  const readiness = await readCrmWorkbookProjectionReadiness(input.context.pipelineId)
+  if (!readiness.ready) {
+    throw new Error(`CRM workbook projection is waiting for reconciliation (${readiness.unresolved} unresolved records)`)
+  }
   const binding = await resolvePipelineSheetBindingInPostgres(input.context)
   const runtime = binding.legacyOwnerFallback
     ? null
