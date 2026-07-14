@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from 'next/server'
 import crypto from 'crypto'
 import fs from 'fs'
 import path from 'path'
+import { resolveManagedGoogleWorkspaceRuntime } from '@/lib/integrations/googleWorkspace'
+import { googleSheetsJson, type GoogleWorkspaceRuntime } from '@/lib/integrations/googleWorkspaceClient'
 import { matonFetch } from '@/lib/maton'
 import { logPipelineEvent } from '@/lib/pipelineLog'
 import { getErrorMessage } from '@/lib/errorUtils'
@@ -9,26 +11,46 @@ import { shouldFallbackToFileOnDatabaseError } from '@/lib/persistence/config'
 import {
   DEFAULT_PIPELINE_SHEET_ID,
   type PipelineProjection,
+  type PipelineSheetContext,
   enqueuePipelineSyncOutboxInPostgres,
   isPostgresPipelineStoreEnabled,
+  resolvePipelineSheetBindingInPostgres,
   upsertPipelineProjectionAndEnqueueInPostgres,
   upsertPipelineProjectionInPostgres,
 } from '@/lib/persistence/pipeline'
 import { requireRequestUser } from '@/lib/requestUser'
 import {
   PIPELINE_SELECTION_COOKIE,
+  isLegacyOwnerSheetPipeline,
   readPipelineProjectionForSpace,
+  requirePipelineSheetContext,
   requireResourceEditor,
   resolvePipelineSpaceAccess,
   writeAppPipelineProjection,
   type PipelineSpace,
 } from '@/lib/tenancy'
 
-const SHEET_ID = DEFAULT_PIPELINE_SHEET_ID
 const PIPELINE_FILE = process.env.PIPELINE_NORMALIZED_PATH || path.join(process.cwd(), '..', 'data', 'pipeline', 'normalized', 'current.json')
 
-async function getSheetValues(range: string) {
-  const res = await matonFetch(`/google-sheets/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(range)}`)
+async function managedRuntimeForPipelineSheet(
+  sheetContext: PipelineSheetContext,
+): Promise<GoogleWorkspaceRuntime | null> {
+  const binding = await resolvePipelineSheetBindingInPostgres(sheetContext)
+  if (binding.legacyOwnerFallback) return null
+  if (!binding.googleServiceAccountEmail || !binding.googleSharedDriveId) {
+    throw new Error('Managed pipeline is missing its native Google Workspace binding')
+  }
+  return resolveManagedGoogleWorkspaceRuntime({
+    serviceAccountEmail: binding.googleServiceAccountEmail,
+    sharedDriveId: binding.googleSharedDriveId,
+  })
+}
+
+async function getSheetValues(sheetId: string, range: string, sheetContext?: PipelineSheetContext) {
+  const managedRuntime = sheetContext ? await managedRuntimeForPipelineSheet(sheetContext) : null
+  const pathname = `/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(range)}`
+  if (managedRuntime) return googleSheetsJson<Record<string, unknown>>(managedRuntime, pathname)
+  const res = await matonFetch(`/google-sheets${pathname}`)
   if (!res.ok) throw new Error(await res.text())
   return await res.json()
 }
@@ -36,6 +58,10 @@ async function getSheetValues(range: string) {
 type OpportunityRecord = Record<string, unknown>
 
 type PipelineDataSource = 'postgres-sheet' | 'postgres-app' | 'file'
+
+function sheetContextForPipeline(pipeline: PipelineSpace | null): PipelineSheetContext | null {
+  return pipeline ? requirePipelineSheetContext(pipeline) : null
+}
 
 async function resolvePipelineContext(req: NextRequest): Promise<{ actorEmail: string; pipeline: PipelineSpace | null }> {
   if (!isPostgresPipelineStoreEnabled()) {
@@ -61,7 +87,7 @@ async function readPipelineData(pipeline: PipelineSpace | null): Promise<{ data:
         }
       }
     } catch (error) {
-      if (!shouldFallbackToFileOnDatabaseError()) throw error
+      if (!shouldFallbackToFileOnDatabaseError() || !isLegacyOwnerSheetPipeline(pipeline)) throw error
       console.warn('[pipeline-opportunity] Postgres projection read failed; falling back to file store', error)
     }
   }
@@ -81,13 +107,13 @@ async function persistPipelineData(data: Record<string, unknown>, source: Pipeli
     if (!pipeline) throw new Error('Pipeline context is required')
     try {
       if (pipeline.syncEnabled) {
-        await upsertPipelineProjectionInPostgres(data)
+        await upsertPipelineProjectionInPostgres({ ...requirePipelineSheetContext(pipeline), projection: data })
       } else {
         await writeAppPipelineProjection(pipeline, data as unknown as PipelineProjection)
       }
       return
     } catch (error) {
-      if (!shouldFallbackToFileOnDatabaseError()) throw error
+      if (!shouldFallbackToFileOnDatabaseError() || !isLegacyOwnerSheetPipeline(pipeline)) throw error
       console.warn('[pipeline-opportunity] Postgres projection write failed; falling back to file store', error)
     }
   }
@@ -125,9 +151,14 @@ function refreshPipelineSummary(data: Record<string, unknown>, rows: Opportunity
   }
 }
 
-async function resolveOpportunityRow(current: OpportunityRecord, fallbackRow: number): Promise<number> {
+async function resolveOpportunityRow(
+  current: OpportunityRecord,
+  fallbackRow: number,
+  sheetId: string = DEFAULT_PIPELINE_SHEET_ID,
+  sheetContext?: PipelineSheetContext,
+): Promise<number> {
   try {
-    const out = await getSheetValues('Opportunities!B5:M2000')
+    const out = await getSheetValues(sheetId, 'Opportunities!B5:M2000', sheetContext)
     const rows = Array.isArray(out?.values) ? out.values : []
     const targetName = String(current?.name || '').trim().toLowerCase()
     const targetOrg = String(current?.organization || current?.org || '').trim().toLowerCase()
@@ -172,12 +203,33 @@ function pct(v: number | string | undefined) {
   return `${clamped.toFixed(1)}%`
 }
 
-async function writeSheet(range: string, values: unknown[][], retries = 3, mode: 'update' | 'append' = 'update') {
+async function writeSheet(
+  sheetId: string,
+  range: string,
+  values: unknown[][],
+  retries = 3,
+  mode: 'update' | 'append' = 'update',
+  sheetContext?: PipelineSheetContext,
+) {
+  const managedRuntime = sheetContext ? await managedRuntimeForPipelineSheet(sheetContext) : null
   let lastErr = ''
   for (let attempt = 1; attempt <= retries; attempt++) {
     const endpoint = mode === 'append'
-      ? `/google-sheets/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(range)}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`
-      : `/google-sheets/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(range)}?valueInputOption=USER_ENTERED`
+      ? `/google-sheets/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(range)}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`
+      : `/google-sheets/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(range)}?valueInputOption=USER_ENTERED`
+
+    if (managedRuntime) {
+      await googleSheetsJson<Record<string, unknown>>(
+        managedRuntime,
+        endpoint.slice('/google-sheets'.length),
+        {
+          method: mode === 'append' ? 'POST' : 'PUT',
+          body: { range, majorDimension: 'ROWS', values },
+          idempotent: mode !== 'append',
+        },
+      )
+      return
+    }
 
     const res = await matonFetch(endpoint, {
       method: mode === 'append' ? 'POST' : 'PUT',
@@ -245,11 +297,14 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     }
 
     if (isPostgresPipelineStoreEnabled()) {
+      const sheetContext = sheetContextForPipeline(context.pipeline)
+      if (!sheetContext) throw new Error('Pipeline Sheet context is required')
       const outbox = await enqueuePipelineSyncOutboxInPostgres({
+        ...sheetContext,
         aggregateType: 'pipeline_interaction',
         aggregateId: id,
         operation: 'append_interaction',
-        payload: { range, values, opportunity: opp, pipelineId: context.pipeline?.id },
+        payload: { range, values, opportunity: opp },
         actor: context.actorEmail,
         idempotencyKey: idempotencyKey(req),
       })
@@ -261,7 +316,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
       )
     }
 
-    await writeSheet(range, values, 3, 'append')
+    await writeSheet(DEFAULT_PIPELINE_SHEET_ID, range, values, 3, 'append')
     logPipelineEvent({ module: 'pipeline-interaction', action: 'append', recordId: id, result: 'ok' })
     return NextResponse.json({ ok: true, syncStatus: 'succeeded' })
   } catch (e: unknown) {
@@ -361,7 +416,7 @@ export async function PATCH(req: NextRequest, ctx: { params: Promise<{ id: strin
     const fallbackRow = 4 + Number(String(id).replace('opp_', ''))
     const rowNum = context.pipeline
       ? projectedRowNumber(current, fallbackRow)
-      : await resolveOpportunityRow(current, fallbackRow)
+      : await resolveOpportunityRow(current, fallbackRow, DEFAULT_PIPELINE_SHEET_ID)
     const range = `Opportunities!B${rowNum}:M${rowNum}`
 
     const beforeValues = [[
@@ -401,14 +456,16 @@ export async function PATCH(req: NextRequest, ctx: { params: Promise<{ id: strin
     let syncStatus: 'queued' | 'succeeded' = 'succeeded'
 
     if (isPostgresPipelineStoreEnabled() && context.pipeline?.syncEnabled) {
+      const sheetContext = requirePipelineSheetContext(context.pipeline)
       try {
         const queued = await upsertPipelineProjectionAndEnqueueInPostgres({
+          ...sheetContext,
           projection: data,
           outbox: {
             aggregateType: 'pipeline_opportunity',
             aggregateId: id,
             operation: 'update_opportunity',
-            payload: { range, values, beforeValues, before: current, after: merged, pipelineId: context.pipeline.id },
+            payload: { range, values, beforeValues, before: current, after: merged },
             actor,
             idempotencyKey: idempotencyKey(req),
           },
@@ -416,16 +473,16 @@ export async function PATCH(req: NextRequest, ctx: { params: Promise<{ id: strin
         outboxId = queued.outboxId
         syncStatus = queued.outboxStatus === 'succeeded' ? 'succeeded' : 'queued'
       } catch (error) {
-        if (!shouldFallbackToFileOnDatabaseError()) throw error
+        if (!shouldFallbackToFileOnDatabaseError() || !isLegacyOwnerSheetPipeline(context.pipeline)) throw error
         console.warn('[pipeline-opportunity] Postgres projection/outbox write failed; using synchronous fallback', error)
-        await writeSheet(range, values, 3)
+        await writeSheet(sheetContext.sheetId, range, values, 3, 'update', sheetContext)
         await persistPipelineData(data, loaded.source, context.pipeline)
       }
     } else if (isPostgresPipelineStoreEnabled() && context.pipeline) {
       await persistPipelineData(data, loaded.source, context.pipeline)
     } else {
       try {
-        await writeSheet(range, values, 3)
+        await writeSheet(DEFAULT_PIPELINE_SHEET_ID, range, values, 3)
         await persistPipelineData(data, loaded.source, context.pipeline)
       } catch (e: unknown) {
         logPipelineEvent({ module: 'pipeline-opportunity', action: 'patch', recordId: id, result: 'error', detail: String(e) })

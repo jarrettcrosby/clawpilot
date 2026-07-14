@@ -3,20 +3,20 @@
   "releases": {
     "default": {
       "oncePerEnvironment": true,
-      "title": "Shared short links and organized knowledge retrieval",
-      "summary": "ClawPilot adds a user-scoped short-link service for ClawPilot and Eigen Racing, a structured Obsidian knowledge vault, verified AI Radar intake, and durable hybrid document-search infrastructure.",
+      "title": "Private integrations and managed pipeline Sheets",
+      "summary": "ClawPilot separates encrypted per-user Maton settings from an owner-managed Google Workspace service account, adds private managed pipeline Sheets, and enforces pipeline-level sync isolation.",
       "features": [
-        "User-scoped short links with custom or generated slugs, tags, expiry, click limits, status controls, and destination or slug search",
-        "Canonical eigenracing.com short URLs with trusted server-to-server access for Eigen Racing applications",
-        "Portable Obsidian vault navigation that separates current contracts, release evidence, and historical notes",
-        "Official-source AI Radar updates in each user's generated research brief",
-        "Queued pgvector document embeddings with local hybrid retrieval by default and explicit, separately credentialed OpenAI semantic search when enabled"
+        "Separate Settings panels for per-user Maton accounts and the owner-managed Google API key, service account, and Shared Drive",
+        "Private per-user folders and operator Sheets in the selected Shared Drive, with durable Postgres projections and exact environment separation",
+        "Automatic eigenracing.com short links for managed pipeline Sheets without weakening Google file permissions",
+        "Pipeline sharing that mirrors viewer and editor membership into reader and writer permissions on the managed Google folder"
       ],
       "fixes": [
-        "Made public short-link redirects bypass application sign-in while retaining API-level management authorization",
-        "Bound cross-application credentials to a declared source application and restricted production destinations to HTTPS",
-        "Added worker and migration visibility to hosted health checks",
-        "Added a read-only Railway backup audit that distinguishes logical checkpoints from provider snapshots"
+        "Bound every pipeline pull, write, dropdown update, and queued operation to its authorized pipeline and Sheet pair",
+        "Made Maton key set and rotation validate the candidate key and refresh connection metadata atomically",
+        "Moved runtime platform mail to the encrypted owner Maton credential while retaining a bootstrap environment fallback",
+        "Kept managed tenant pipeline Google access on native service-account OAuth instead of a global Maton connection",
+        "Extended Railway backup policy checks to require daily, weekly, and monthly schedules in both environments"
       ]
     }
   }

@@ -11,10 +11,11 @@ Both the `development` and `production` Postgres volume instances must have:
 
 - `DAILY` backups, retained by Railway for 6 days.
 - `WEEKLY` backups, retained by Railway for 1 month.
+- `MONTHLY` backups, retained by Railway for 3 months.
 - At least one completed provider backup no more than 30 hours old.
 - A manual provider backup immediately before destructive or high-risk database work.
 
-Railway also offers `MONTHLY` backups retained for 3 months. Provider backups are incremental, Copy-on-Write volume snapshots and are billed as volume storage. Railway limits a manual backup to 50% of the volume's total capacity.
+Provider backups are incremental, Copy-on-Write volume snapshots and are billed as volume storage. Railway limits a manual backup to 50% of the volume's total capacity.
 
 Current Railway references, checked on 2026-07-13 EDT:
 
@@ -34,25 +35,24 @@ The final read-only Railway GraphQL audit at `2026-07-14T00:39:54.682Z` returned
 
 Both instances were `READY`, mounted at `/var/lib/postgresql/data`, and attached to the shared Railway service definition `Postgres` (`bc62c97a-e87f-43fa-8c87-a7503d5565e9`). The volumes are isolated by environment even though Railway reports the same logical volume and service IDs.
 
-**Status: provider backups are not configured or verified in either environment.** Do not describe either environment as provider-backed until Railway returns both required schedules and a completed backup record.
+That GraphQL result is the pre-configuration baseline. The authenticated dashboard evidence below supersedes its backup and schedule columns: both environments now have a verified manual provider snapshot and active daily, weekly, and monthly schedules.
 
-### Configuration Blocker
+### CLI Limitation And Dashboard Resolution
 
 The authenticated Railway CLI session could read both volume instances, schedule lists, and backup lists. Attempts to configure `DAILY` + `WEEKLY` schedules through `volumeInstanceBackupScheduleUpdate` and to create a manual development backup through `volumeInstanceBackupCreate` were rejected by Railway with `Not Authorized`. The manual-backup rejection was an HTTP 200 GraphQL error with trace ID `8509242877894352621`.
 
-No backup policy or snapshot was created by those attempts. A subsequent read returned the same empty state shown above. The current Railway CLI exposes volume management but no backup subcommand, and the CLI OAuth token does not have the write authorization needed for the backup mutations.
+No backup policy or snapshot was created by those CLI attempts. The current Railway CLI exposes volume management but no backup subcommand, and the CLI OAuth token does not have the write authorization needed for the backup mutations. An operator-authenticated Railway dashboard session subsequently created and verified both manual snapshots.
 
-Resolve this in an operator-authenticated Railway dashboard session:
+The operator-authenticated Railway dashboard was used to complete the policy:
 
-1. Open project `clawpilot`, environment `production`, service `Postgres`, then **Backups**.
-2. Enable **Daily** and **Weekly** schedules.
-3. Trigger a manual backup and wait until Railway lists a completed snapshot.
-4. Repeat the same steps in environment `development`.
-5. Run the audit below with an account or workspace API token that can read the project.
+1. `production`: **Daily**, **Weekly**, and **Monthly** schedules are checked; the manual backup is listed.
+2. `development`: **Daily**, **Weekly**, and **Monthly** schedules are checked; the manual backup is listed.
+3. The persisted checkbox state was reopened and verified in both environments on `2026-07-14`.
+4. The read-only API audit remains the repeatable machine gate when an account or workspace API token is available.
 
 ## Repeatable Audit
 
-`scripts/railway-backup-audit.mjs` is read-only. It queries Railway's public GraphQL API and exits nonzero unless both named environments have `DAILY` + `WEEKLY` schedules and a provider backup no more than 30 hours old.
+`scripts/railway-backup-audit.mjs` is read-only. It queries Railway's public GraphQL API and exits nonzero unless both named environments have `DAILY` + `WEEKLY` + `MONTHLY` schedules and a provider backup no more than 30 hours old.
 
 Use an account or workspace API token supplied through the environment. Do not commit or print the token.
 
@@ -82,6 +82,28 @@ Validate the export without restoring it:
 pg_restore --list backups/postgres/clawpilot-YYYYMMDDTHHMMSSZ.dump >/dev/null
 ```
 
+### Verified Logical Snapshots
+
+Before the managed pipeline and credential migrations, PostgreSQL 18 custom-format dumps were created and validated on `2026-07-14T14:02:54Z`:
+
+| Environment | Local ignored artifact | Size | SHA-256 |
+|---|---|---:|---|
+| `development` | `backups/postgres/clawpilot-development-20260714T140254Z.dump` | 572,419 bytes | `5f99f0fa64bed167cfbb3c8631237f3f599ac236013bedafbced235a0fece42b` |
+| `production` | `backups/postgres/clawpilot-production-20260714T140254Z.dump` | 461,712 bytes | `1f17d0777ac0ca90796aacbb71fe7dc36959ceecea24959b1f6a0f2338c2fda6` |
+
+These artifacts are local logical recovery points, not Railway provider snapshots. They remain outside Git under the ignored `backups/` directory.
+
+### Verified Railway Provider Snapshots
+
+Manual Railway volume backups were created and confirmed in the authenticated Railway dashboard on `2026-07-14` before the credential and managed-pipeline migrations:
+
+| Environment | Railway timestamp | Reported size | Trigger |
+|---|---|---:|---|
+| `production` | `2026-07-14 14:28 UTC` | 227 MB | manual backup |
+| `development` | `2026-07-14 14:30 UTC` | 225 MB | manual backup |
+
+Daily, weekly, and monthly schedules were then enabled and their persisted checked state was verified in both environments. The required Railway volume-backup policy is active.
+
 ## Restore Drill
 
 For a Railway volume restore:
@@ -103,19 +125,19 @@ Railway point-in-time recovery is a separate feature. Enabling it creates a stor
 
 ### Live Routing Evidence
 
-As of `2026-07-14T00:31Z`:
+Baseline observed at `2026-07-14T00:31Z`, before the current cross-application routing release:
 
 - `eigenracing.com` resolves to `216.198.79.1` and Vercel returns `307` to `https://www.eigenracing.com`, preserving the request path.
 - `www.eigenracing.com` is a CNAME to `ce2788e7ac79f119.vercel-dns-017.com`.
 - Vercel project `eigenracing-web` (`prj_KhJEIzrjBjaY91CTijziDdyMM58A`) owns both `eigenracing.com` and `www.eigenracing.com`.
-- `https://www.eigenracing.com/s/clawpilot-routing-probe-404` returns Vercel `404`; no `/s/{slug}` route exists in the deployed application.
+- `https://www.eigenracing.com/s/clawpilot-routing-probe-404` returned Vercel `404`; the Eigen Racing Vercel project did not yet proxy `/s/{slug}` to ClawPilot.
 - ClawPilot's `aiapp.eigenracing.com` and `dev.aiapp.eigenracing.com` remain separate Railway CNAMEs.
 
 ### Recommended Ownership
 
 Keep the apex and `www` records on the existing `eigenracing-web` Vercel project. DNS selects a host, not a URL path, so DNS cannot route only `/s/{slug}` to ClawPilot or another service. Moving either existing record would move the entire Eigen Racing site.
 
-The current workspace has an uncommitted ClawPilot implementation in `app_src/app/s/[slug]/route.ts`, `app_src/app/api/shortlinks/route.ts`, `app_src/lib/shortlinks.ts`, and `db/migrations/0015_short_links.sql`. It uses ClawPilot Postgres as one shared short-link store and exposes a bearer-authenticated management API for another application. It is not deployed platform evidence.
+ClawPilot implements the canonical lookup and management paths in `app_src/app/s/[slug]/route.ts`, `app_src/app/api/shortlinks/route.ts`, `app_src/lib/shortlinks.ts`, and `db/migrations/0015_short_links.sql`. The implementation uses ClawPilot Postgres as the shared short-link store and exposes a scoped service-authenticated management API for another application.
 
 Given that implementation, the lowest-change production routing shape is:
 
@@ -134,11 +156,11 @@ The public lookup endpoint should accept only strict URL-safe slugs and `GET`/`H
 - The public proxy exemption, service-authenticated API path, HTTPS-only destination constraint, and source-bound client credentials are implemented in the current short-link release.
 - Eigen Racing owns the user-facing `/app/links` and `/s/:slug` routes. Its server proxy fixes the source to `eigenracing`, binds the owner to the signed-in email, and keeps the service credential out of browser bundles.
 - Development and production use separate service secrets and public origins.
-- **Open platform control:** the ClawPilot production database still has no Railway backup schedule or provider snapshot. The short-link store does not meet the provider-backup requirement until the Backups tab or a write-capable platform token enables and verifies the schedule.
+- The ClawPilot production database has active daily, weekly, and monthly Railway volume-backup schedules and a verified manual provider snapshot from `2026-07-14 14:28 UTC`.
 
 ### External Work Required
 
-- **Required platform configuration:** enable and verify Railway Postgres backups using an operator-authorized dashboard session or write-capable token.
+- **Required release verification:** confirm the deployed Eigen Racing Vercel rewrite preserves `/s/:slug` while proxying to ClawPilot production.
 - **Not required:** no change to the `eigenracing.com` apex A record, the `www` CNAME, or either ClawPilot custom-domain record.
 - **Optional:** a future dedicated `links.eigenracing.com` origin would require the exact CNAME and ownership-verification TXT records Railway provides. It is not needed for the current `aiapp.eigenracing.com` rewrite design.
 

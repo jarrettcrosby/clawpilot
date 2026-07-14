@@ -9,13 +9,13 @@ const options = parseArgs([
   '--environment',
   'development,production,development',
   '--required-schedules',
-  'daily,weekly',
+  'daily,weekly,monthly',
   '--max-age-hours',
   '30',
 ], {})
 
 assert.deepEqual(options.environments, ['development', 'production'])
-assert.deepEqual(options.requiredSchedules, ['DAILY', 'WEEKLY'])
+assert.deepEqual(options.requiredSchedules, ['DAILY', 'WEEKLY', 'MONTHLY'])
 assert.equal(options.maxAgeHours, 30)
 assert.equal(options.projectId, 'project-1')
 
@@ -33,6 +33,7 @@ const baseVolume = {
   schedules: [
     { id: 'daily', kind: 'DAILY' },
     { id: 'weekly', kind: 'WEEKLY' },
+    { id: 'monthly', kind: 'MONTHLY' },
   ],
   backups: [
     { id: 'backup-1', createdAt: '2026-07-13T12:00:00.000Z' },
@@ -70,7 +71,7 @@ const unhealthy = evaluateBackupState({
 
 assert.equal(unhealthy.healthy, false)
 assert.deepEqual(unhealthy.environments[0].violations, [
-  'Missing schedules: WEEKLY',
+  'Missing schedules: WEEKLY, MONTHLY',
   'No Railway provider backup record exists',
 ])
 assert.deepEqual(unhealthy.environments[1].violations, [

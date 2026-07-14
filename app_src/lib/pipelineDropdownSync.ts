@@ -1,18 +1,22 @@
 import fs from 'fs'
 import path from 'path'
 import crypto from 'crypto'
+import { resolveManagedGoogleWorkspaceRuntime } from '@/lib/integrations/googleWorkspace'
+import { googleSheetsJson, type GoogleWorkspaceRuntime } from '@/lib/integrations/googleWorkspaceClient'
 import { matonFetch } from '@/lib/maton'
 import { logPipelineEvent } from '@/lib/pipelineLog'
 import { shouldFallbackToFileOnDatabaseError } from '@/lib/persistence/config'
 import {
+  DEFAULT_PIPELINE_SHEET_ID,
   isPostgresPipelineStoreEnabled,
   readPipelineDropdownCatalogFromPostgres,
+  resolvePipelineSheetBindingInPostgres,
   upsertPipelineDropdownCatalogInPostgres,
   type PipelineDropdownCatalog,
   type PipelineDropdownOption,
+  type PipelineSheetContext,
 } from '@/lib/persistence/pipeline'
 
-const SHEET_ID = process.env.PIPELINE_SHEET_ID || '1sp-eLYEEGera1acBoze_GvR4263dunlmaOUyBej-iqY'
 const DROPDOWN_TAB = process.env.PIPELINE_DROPDOWN_TAB || 'Dropdowns'
 
 // Jarrett-confirmed layout (column-per-dropdown):
@@ -27,9 +31,39 @@ const CACHE_FILE = process.env.PIPELINE_DROPDOWN_CACHE_PATH
 
 type SheetMeta = { sheets?: Array<{ properties?: { title?: string; sheetId?: number } }> }
 type SheetValuesResponse = { values?: string[][] }
+type PipelineDropdownSyncContext = Partial<PipelineSheetContext> & {
+  legacyOwnerFallback?: boolean
+}
+type ResolvedDropdownSyncContext = {
+  pipelineId: string | null
+  sheetId: string
+  postgresContext: PipelineSheetContext | null
+  legacyOwnerFallback: boolean
+  managedRuntime?: Promise<GoogleWorkspaceRuntime | null>
+}
 
 function nowIso() {
   return new Date().toISOString()
+}
+
+function resolveDropdownSyncContext(input: PipelineDropdownSyncContext = {}): ResolvedDropdownSyncContext {
+  const pipelineId = String(input.pipelineId || '').trim() || null
+  const sheetId = String(input.sheetId || '').trim() || DEFAULT_PIPELINE_SHEET_ID
+  const legacyOwnerFallback = input.legacyOwnerFallback === true
+
+  if (isPostgresPipelineStoreEnabled() && (!pipelineId || !input.sheetId)) {
+    throw new Error('Pipeline and Sheet context are required for dropdown sync')
+  }
+  if (legacyOwnerFallback && (!pipelineId && sheetId !== DEFAULT_PIPELINE_SHEET_ID)) {
+    throw new Error('Legacy pipeline dropdown sync cannot target a non-default Sheet')
+  }
+
+  return {
+    pipelineId,
+    sheetId,
+    postgresContext: pipelineId && input.sheetId ? { pipelineId, sheetId } : null,
+    legacyOwnerFallback,
+  }
 }
 
 function normalizeKey(input: string) {
@@ -64,12 +98,16 @@ function readFileCache(): PipelineDropdownCatalog | null {
   }
 }
 
-async function persistCatalog(catalog: PipelineDropdownCatalog) {
+async function persistCatalog(catalog: PipelineDropdownCatalog, context: ResolvedDropdownSyncContext) {
   if (isPostgresPipelineStoreEnabled()) {
+    if (!context.postgresContext) {
+      if (context.legacyOwnerFallback) return catalog
+      throw new Error('Pipeline and Sheet context are required for dropdown persistence')
+    }
     try {
-      return await upsertPipelineDropdownCatalogInPostgres(catalog)
+      return await upsertPipelineDropdownCatalogInPostgres({ ...context.postgresContext, catalog })
     } catch (error) {
-      if (!shouldFallbackToFileOnDatabaseError()) throw error
+      if (!shouldFallbackToFileOnDatabaseError() || !context.legacyOwnerFallback) throw error
       console.warn('[pipeline-dropdown-sync] Postgres catalog write failed; using file fallback', error)
     }
   }
@@ -78,13 +116,17 @@ async function persistCatalog(catalog: PipelineDropdownCatalog) {
   return catalog
 }
 
-async function readPersistedCatalog(): Promise<PipelineDropdownCatalog | null> {
+async function readPersistedCatalog(context: ResolvedDropdownSyncContext): Promise<PipelineDropdownCatalog | null> {
   if (isPostgresPipelineStoreEnabled()) {
+    if (!context.postgresContext) {
+      if (context.legacyOwnerFallback) return null
+      throw new Error('Pipeline and Sheet context are required for dropdown persistence')
+    }
     try {
-      const catalog = await readPipelineDropdownCatalogFromPostgres()
+      const catalog = await readPipelineDropdownCatalogFromPostgres(context.postgresContext)
       if (catalog) return catalog
     } catch (error) {
-      if (!shouldFallbackToFileOnDatabaseError()) throw error
+      if (!shouldFallbackToFileOnDatabaseError() || !context.legacyOwnerFallback) throw error
       console.warn('[pipeline-dropdown-sync] Postgres catalog read failed; using file fallback', error)
     }
   }
@@ -92,16 +134,58 @@ async function readPersistedCatalog(): Promise<PipelineDropdownCatalog | null> {
   return readFileCache()
 }
 
-async function sheetGet(pathname: string) {
+async function dropdownManagedRuntime(context: ResolvedDropdownSyncContext) {
+  if (!isPostgresPipelineStoreEnabled()) return null
+  if (!context.postgresContext) throw new Error('Pipeline and Sheet context are required for dropdown sync')
+  if (!context.managedRuntime) {
+    context.managedRuntime = (async () => {
+      const binding = await resolvePipelineSheetBindingInPostgres(context.postgresContext as PipelineSheetContext)
+      if (binding.legacyOwnerFallback) return null
+      if (!binding.googleServiceAccountEmail || !binding.googleSharedDriveId) {
+        throw new Error('Managed pipeline is missing its native Google Workspace binding')
+      }
+      return resolveManagedGoogleWorkspaceRuntime({
+        serviceAccountEmail: binding.googleServiceAccountEmail,
+        sharedDriveId: binding.googleSharedDriveId,
+      })
+    })()
+  }
+  return context.managedRuntime
+}
+
+function nativeSheetsPath(pathname: string) {
+  if (!pathname.startsWith('/google-sheets/v4/')) {
+    throw new Error('Managed Google Sheets request path is invalid')
+  }
+  return pathname.slice('/google-sheets'.length)
+}
+
+async function sheetGet(pathname: string, context: ResolvedDropdownSyncContext) {
+  const managedRuntime = await dropdownManagedRuntime(context)
+  if (managedRuntime) {
+    return googleSheetsJson<Record<string, unknown>>(managedRuntime, nativeSheetsPath(pathname))
+  }
   const res = await matonFetch(pathname)
   const text = await res.text()
   let data: Record<string, unknown> = {}
-  try { data = text ? JSON.parse(text) : {} } catch { data = { raw: text.slice(0, 2000) } }
+  try {
+    data = text ? JSON.parse(text) : {}
+  } catch {
+    data = { raw: text.slice(0, 2000) }
+  }
   if (!res.ok) throw new Error(`Sheets GET failed (${res.status})`)
   return data
 }
 
-async function sheetPost(pathname: string, body: unknown) {
+async function sheetPost(pathname: string, body: unknown, context: ResolvedDropdownSyncContext) {
+  const managedRuntime = await dropdownManagedRuntime(context)
+  if (managedRuntime) {
+    return googleSheetsJson<Record<string, unknown>>(managedRuntime, nativeSheetsPath(pathname), {
+      method: 'POST',
+      body,
+      idempotent: false,
+    })
+  }
   const res = await matonFetch(pathname, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -109,12 +193,30 @@ async function sheetPost(pathname: string, body: unknown) {
   })
   const text = await res.text()
   let data: Record<string, unknown> = {}
-  try { data = text ? JSON.parse(text) : {} } catch { data = { raw: text.slice(0, 2000) } }
+  try {
+    data = text ? JSON.parse(text) : {}
+  } catch {
+    data = { raw: text.slice(0, 2000) }
+  }
   if (!res.ok) throw new Error(`Sheets POST failed (${res.status})`)
   return data
 }
 
-async function sheetWrite(pathname: string, method: 'POST' | 'PUT', body: unknown) {
+async function sheetWrite(
+  pathname: string,
+  method: 'POST' | 'PUT',
+  body: unknown,
+  context: ResolvedDropdownSyncContext,
+) {
+  const managedRuntime = await dropdownManagedRuntime(context)
+  if (managedRuntime) {
+    await googleSheetsJson<Record<string, unknown>>(managedRuntime, nativeSheetsPath(pathname), {
+      method,
+      body,
+      idempotent: method === 'PUT',
+    })
+    return
+  }
   const res = await matonFetch(pathname, {
     method,
     headers: { 'Content-Type': 'application/json' },
@@ -144,8 +246,15 @@ function indexToColLetter(index: number) {
   return out
 }
 
-async function getSheetIdByTitle(title: string): Promise<number> {
-  const meta = await sheetGet(`/google-sheets/v4/spreadsheets/${SHEET_ID}?fields=sheets.properties`) as SheetMeta
+async function getSheetIdByTitle(
+  spreadsheetId: string,
+  title: string,
+  context: ResolvedDropdownSyncContext,
+): Promise<number> {
+  const meta = await sheetGet(
+    `/google-sheets/v4/spreadsheets/${spreadsheetId}?fields=sheets.properties`,
+    context,
+  ) as SheetMeta
   const sheet = (meta.sheets || []).find((entry) => entry?.properties?.title === title)
   if (!sheet?.properties?.sheetId && sheet?.properties?.sheetId !== 0) throw new Error(`Sheet tab not found: ${title}`)
   return Number(sheet.properties.sheetId)
@@ -219,33 +328,47 @@ function toColumnarRows(catalog: PipelineDropdownCatalog) {
   return { keys, rows }
 }
 
-async function fetchDropdownsFromSheet() {
+async function fetchDropdownsFromSheet(spreadsheetId: string, context: ResolvedDropdownSyncContext) {
   const encoded = encodeURIComponent(READ_RANGE)
-  const data = await sheetGet(`/google-sheets/v4/spreadsheets/${SHEET_ID}/values/${encoded}`) as SheetValuesResponse
+  const data = await sheetGet(
+    `/google-sheets/v4/spreadsheets/${spreadsheetId}/values/${encoded}`,
+    context,
+  ) as SheetValuesResponse
   return parseColumnarValues(data.values || [])
 }
 
-export async function pullDropdownsFromSheet() {
+export async function pullDropdownsFromSheet(input: PipelineDropdownSyncContext = {}) {
+  const context = resolveDropdownSyncContext(input)
   const runId = `pull-${Date.now()}`
   try {
-    const catalog = await fetchDropdownsFromSheet()
-    await persistCatalog(catalog)
+    const catalog = await fetchDropdownsFromSheet(context.sheetId, context)
+    await persistCatalog(catalog, context)
     logPipelineEvent({
       module: 'pipeline-dropdown-sync',
       action: 'pull',
       result: 'ok',
+      pipelineId: context.pipelineId || undefined,
       detail: { runId, dropdownCount: Object.keys(catalog.dropdowns).length },
     })
 
     return { runId, catalog }
   } catch (e: unknown) {
-    logPipelineEvent({ module: 'pipeline-dropdown-sync', action: 'pull', result: 'error', detail: { runId, error: String(e) } })
+    logPipelineEvent({
+      module: 'pipeline-dropdown-sync',
+      action: 'pull',
+      result: 'error',
+      pipelineId: context.pipelineId || undefined,
+      detail: { runId, error: String(e) },
+    })
     throw e
   }
 }
 
-export async function getDropdownCatalog(input: { forceRefresh?: boolean; maxAgeMs?: number } = {}) {
-  const cached = await readPersistedCatalog()
+export async function getDropdownCatalog(
+  input: PipelineDropdownSyncContext & { forceRefresh?: boolean; maxAgeMs?: number } = {},
+) {
+  const context = resolveDropdownSyncContext(input)
+  const cached = await readPersistedCatalog(context)
   const maxAgeMs = Math.max(0, Number(input.maxAgeMs ?? process.env.PIPELINE_DROPDOWN_CACHE_MAX_AGE_MS ?? 300_000))
   const cachedAt = cached?.syncedAt ? Date.parse(cached.syncedAt) : Number.NaN
   const fresh = cached && Number.isFinite(cachedAt) && Date.now() - cachedAt <= maxAgeMs
@@ -255,7 +378,7 @@ export async function getDropdownCatalog(input: { forceRefresh?: boolean; maxAge
   }
 
   try {
-    const pulled = await pullDropdownsFromSheet()
+    const pulled = await pullDropdownsFromSheet(input)
     return { ...pulled, storage: isPostgresPipelineStoreEnabled() ? 'postgres' : 'file', stale: false }
   } catch (error) {
     if (!input.forceRefresh && cached) {
@@ -271,13 +394,17 @@ export async function getDropdownCatalog(input: { forceRefresh?: boolean; maxAge
   }
 }
 
-export async function pushDropdownsToSheet(input: PipelineDropdownCatalog) {
+export async function pushDropdownsToSheet(
+  input: PipelineDropdownCatalog,
+  contextInput: PipelineDropdownSyncContext = {},
+) {
+  const context = resolveDropdownSyncContext(contextInput)
   const runId = `push-${Date.now()}`
   try {
-    const sheetId = await getSheetIdByTitle(DROPDOWN_TAB)
+    const sheetId = await getSheetIdByTitle(context.sheetId, DROPDOWN_TAB, context)
 
     // Pull current first to preserve unknown/manually-added columns
-    const existing = await fetchDropdownsFromSheet()
+    const existing = await fetchDropdownsFromSheet(context.sheetId, context)
     const merged: PipelineDropdownCatalog = {
       syncedAt: nowIso(),
       source: 'app',
@@ -296,19 +423,21 @@ export async function pushDropdownsToSheet(input: PipelineDropdownCatalog) {
 
     // value update
     await sheetWrite(
-      `/google-sheets/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(clearRangeA1)}:clear`,
+      `/google-sheets/v4/spreadsheets/${context.sheetId}/values/${encodeURIComponent(clearRangeA1)}:clear`,
       'POST',
       {},
+      context,
     )
 
     await sheetWrite(
-      `/google-sheets/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(rangeA1)}?valueInputOption=USER_ENTERED`,
+      `/google-sheets/v4/spreadsheets/${context.sheetId}/values/${encodeURIComponent(rangeA1)}?valueInputOption=USER_ENTERED`,
       'PUT',
       { range: rangeA1, majorDimension: 'ROWS', values: rows },
+      context,
     )
 
     // copy formatting + validation from first dropdown column template
-    await sheetPost(`/google-sheets/v4/spreadsheets/${SHEET_ID}:batchUpdate`, {
+    await sheetPost(`/google-sheets/v4/spreadsheets/${context.sheetId}:batchUpdate`, {
       requests: [
         {
           copyPaste: {
@@ -353,22 +482,29 @@ export async function pushDropdownsToSheet(input: PipelineDropdownCatalog) {
       ],
       includeSpreadsheetInResponse: false,
       responseIncludeGridData: false,
-    })
+    }, context)
 
     // lightweight metadata hashes in log only (no secret output)
     const hashes = keys.map((k) => ({ key: k, hash: hashCatalogEntry(k, (merged.dropdowns[k] || []).map((x) => x.value)) }))
 
-    await persistCatalog(merged)
+    await persistCatalog(merged, context)
     logPipelineEvent({
       module: 'pipeline-dropdown-sync',
       action: 'push',
       result: 'ok',
+      pipelineId: context.pipelineId || undefined,
       detail: { runId, dropdownCount: keys.length, hashes },
     })
 
     return { runId, catalog: merged }
   } catch (e: unknown) {
-    logPipelineEvent({ module: 'pipeline-dropdown-sync', action: 'push', result: 'error', detail: { runId, error: String(e) } })
+    logPipelineEvent({
+      module: 'pipeline-dropdown-sync',
+      action: 'push',
+      result: 'error',
+      pipelineId: context.pipelineId || undefined,
+      detail: { runId, error: String(e) },
+    })
     throw e
   }
 }

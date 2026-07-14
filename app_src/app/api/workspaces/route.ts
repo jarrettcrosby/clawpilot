@@ -1,6 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireRequestUser } from '@/lib/requestUser'
 import {
+  PipelineProvisioningRequestError,
+  queuePipelineProvisioning,
+} from '@/lib/pipelineProvisioning'
+import {
   BOARD_SELECTION_COOKIE,
   PIPELINE_SELECTION_COOKIE,
   createPipelineSpace,
@@ -41,8 +45,10 @@ async function workspacePayload(actorEmail: string, req: NextRequest, selected?:
     ok: true,
     boards,
     pipelines: pipelines.map((pipeline) => {
-      const { projection, ...summary } = pipeline
+      const { projection, sheetId, shortLinkId, ...summary } = pipeline
       void projection
+      void sheetId
+      void shortLinkId
       return summary
     }),
     selectedBoardId: selectedBoard?.id || null,
@@ -52,7 +58,13 @@ async function workspacePayload(actorEmail: string, req: NextRequest, selected?:
 
 function errorResponse(error: unknown) {
   const message = error instanceof Error ? error.message : 'Workspace request failed'
-  const status = message === 'Unauthorized' ? 401 : /denied|view-only|Only the/i.test(message) ? 403 : 400
+  const status = error instanceof PipelineProvisioningRequestError
+    ? error.status
+    : message === 'Unauthorized'
+      ? 401
+      : /denied|view-only|Only the/i.test(message)
+        ? 403
+        : 400
   return NextResponse.json({ ok: false, error: message }, { status })
 }
 
@@ -72,6 +84,7 @@ export async function POST(req: NextRequest) {
     const action = String(body?.action || '')
     let selectedBoardId: string | undefined
     let selectedPipelineId: string | undefined
+    let actionResult: Record<string, unknown> | undefined
 
     if (action === 'create-board') {
       selectedBoardId = (await createProjectBoard({ actorEmail: actor.email, name: body?.name })).id
@@ -81,6 +94,20 @@ export async function POST(req: NextRequest) {
       selectedBoardId = (await resolveProjectBoardAccess({ actorEmail: actor.email, boardId: body?.boardId })).id
     } else if (action === 'select-pipeline') {
       selectedPipelineId = (await resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: body?.pipelineId })).id
+    } else if (action === 'provision-pipeline') {
+      const unsupported = Object.keys(body || {}).find((field) => !['action', 'pipelineId'].includes(field))
+      if (unsupported) {
+        throw new PipelineProvisioningRequestError(
+          'Managed Google resource and credential fields are selected by ClawPilot',
+          400,
+          'PIPELINE_PROVISIONING_FIELDS_INVALID',
+        )
+      }
+      const pipeline = await resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: body?.pipelineId })
+      if (pipeline.ownerEmail !== actor.email || pipeline.accessRole !== 'owner') {
+        throw new PipelineProvisioningRequestError('Only the pipeline owner can provision it', 403)
+      }
+      actionResult = await queuePipelineProvisioning({ actorEmail: actor.email, pipelineId: pipeline.id })
     } else if (action === 'share-board') {
       await shareProjectBoard({
         actorEmail: actor.email,
@@ -103,10 +130,11 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: false, error: 'Unsupported workspace action' }, { status: 400 })
     }
 
-    const response = NextResponse.json(await workspacePayload(actor.email, req, {
+    const payload = await workspacePayload(actor.email, req, {
       boardId: selectedBoardId,
       pipelineId: selectedPipelineId,
-    }))
+    })
+    const response = NextResponse.json(actionResult ? { ...payload, actionResult } : payload)
     if (selectedBoardId) response.cookies.set(BOARD_SELECTION_COOKIE, selectedBoardId, COOKIE_OPTIONS)
     if (selectedPipelineId) response.cookies.set(PIPELINE_SELECTION_COOKIE, selectedPipelineId, COOKIE_OPTIONS)
     return response

@@ -11,6 +11,7 @@ import { requireRequestUser } from '@/lib/requestUser'
 import {
   BOARD_SELECTION_COOKIE,
   PIPELINE_SELECTION_COOKIE,
+  isLegacyOwnerSheetPipeline,
   readPipelineProjectionForSpace,
   requireResourceEditor,
   resolvePipelineSpaceAccess,
@@ -95,7 +96,7 @@ export async function GET(req: NextRequest) {
           })
         }
       } catch (error) {
-        if (!shouldFallbackToFileOnDatabaseError()) throw error
+        if (!shouldFallbackToFileOnDatabaseError() || !isLegacyOwnerSheetPipeline(selectedPipeline)) throw error
         console.warn('[pipeline] Postgres projection read failed; falling back to file store', error)
       }
     }

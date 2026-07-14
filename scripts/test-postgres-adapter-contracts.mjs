@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict'
+import { generateKeyPairSync } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
+import { pathToFileURL } from 'node:url'
 
 const root = process.cwd()
 
@@ -110,6 +112,25 @@ assertIncludes(shortLinkHardeningMigration, "WHERE status = 'processing'", 'stal
 assertIncludes(vectorKnowledgeMigration, 'CREATE EXTENSION IF NOT EXISTS vector', 'pgvector extension')
 assertIncludes(vectorKnowledgeMigration, 'embedding vector(256)', 'document vectors')
 
+const managedPipelineMigration = read('db/migrations/0019_managed_pipeline_google_resources.sql')
+for (const contract of [
+  'DROP INDEX IF EXISTS idx_pipeline_spaces_single_sync_source',
+  'idx_pipeline_spaces_sheet_id_unique',
+  'CREATE TABLE IF NOT EXISTS google_workspace_integration',
+  'api_key_ciphertext',
+  'service_account_ciphertext',
+  'google_service_account_email',
+  'google_shared_drive_id',
+  'provisioning_status',
+  'drive_folder_id',
+  'short_link_id',
+  'CREATE TABLE IF NOT EXISTS pipeline_google_permissions',
+]) {
+  assertIncludes(managedPipelineMigration, contract, 'managed pipeline Google resources migration')
+}
+assert.ok(!managedPipelineMigration.includes('maton_drive_connection_id'), 'managed pipeline migration must not bind Maton Drive')
+assert.ok(!managedPipelineMigration.includes('maton_sheets_connection_id'), 'managed pipeline migration must not bind Maton Sheets')
+
 const invitationAdapter = read('app_src/lib/invitations.ts')
 assertIncludes(invitationAdapter, 'requestInvitationAuthMagicCode', 'invitation adapter')
 assertIncludes(invitationAdapter, 'revoked_at IS NULL', 'invitation revocation contract')
@@ -188,6 +209,44 @@ assertIncludes(pipelineAdapter, 'worker lease expired', 'pipeline adapter')
 assertIncludes(pipelineAdapter, 'superseded by newer outbox item', 'pipeline adapter')
 assertIncludes(pipelineAdapter, 'upsertPipelineDropdownCatalogAndEnqueueInPostgres', 'pipeline adapter')
 assertIncludes(pipelineAdapter, 'pipeline.outbox.worker.heartbeat', 'pipeline adapter')
+assertIncludes(pipelineAdapter, "'provision_pipeline', 'google_workspace'", 'pipeline provisioning outbox')
+assertIncludes(pipelineAdapter, "'sync_pipeline_permissions'", 'pipeline permission outbox')
+assertIncludes(pipelineAdapter, 'google_service_account_email = COALESCE', 'immutable service-account binding')
+assertIncludes(pipelineAdapter, 'google_shared_drive_id = COALESCE', 'immutable Shared Drive binding')
+assertIncludes(pipelineAdapter, 'Pipeline Google Workspace binding cannot be changed', 'managed binding immutability')
+assertIncludes(pipelineAdapter, 'FROM google_workspace_integration', 'queue-time platform integration validation')
+assertIncludes(pipelineAdapter, 'FOR SHARE', 'queue-time credential and binding serialization')
+assertIncludes(pipelineAdapter, "target_system IN ('google_sheets', 'google_workspace')", 'managed workspace outbox claims')
+assertIncludes(pipelineAdapter, 'resolvePipelineSheetBindingInPostgres', 'validated pipeline Sheet binding resolver')
+assertIncludes(pipelineAdapter, 'pipeline.owner_email !== configuredOwner', 'configured-owner legacy fallback boundary')
+assertIncludes(pipelineAdapter, 'AND sheet_id = $2', 'pipeline and Sheet pair isolation')
+
+const pipelineProvisioning = read('app_src/lib/pipelineProvisioning.ts')
+assert.ok(!pipelineProvisioning.includes('maton'), 'managed provisioning must not use Maton')
+assertIncludes(pipelineProvisioning, 'resolveManagedGoogleWorkspaceRuntime', 'native managed binding validation')
+assertIncludes(pipelineProvisioning, "appPropertyClause", 'Drive appProperties discovery')
+assertIncludes(pipelineProvisioning, "corpora: 'drive'", 'Shared Drive scoped file search')
+assertIncludes(pipelineProvisioning, "includeItemsFromAllDrives: 'true'", 'Shared Drive file inclusion')
+assertIncludes(pipelineProvisioning, "supportsAllDrives: 'true'", 'Shared Drive request support')
+assertIncludes(pipelineProvisioning, "idempotent: false", 'non-retried ambiguous Google creates')
+assertIncludes(pipelineProvisioning, "const EXPECTED_TABS", 'managed pipeline tab contract')
+assertIncludes(pipelineProvisioning, "range: `${title}!B4`", 'managed pipeline B4 headers')
+assertIncludes(pipelineProvisioning, 'createShortLink', 'managed pipeline short link')
+assertIncludes(pipelineProvisioning, 'reconcilePipelineGooglePermissions', 'managed Google permission reconciliation')
+assertIncludes(pipelineProvisioning, 'nextPageToken,permissions', 'permission pagination')
+assertIncludes(pipelineProvisioning, "['anyone', 'domain', 'group']", 'direct broad permission rejection')
+assertIncludes(pipelineProvisioning, 'permissionIsInherited', 'Shared Drive governing permission preservation')
+
+const pipelineSync = read('app_src/lib/pipelineSync.ts')
+assertIncludes(pipelineSync, 'resolvePipelineSheetBindingInPostgres', 'pipeline pull binding resolution')
+assertIncludes(pipelineSync, 'resolveManagedGoogleWorkspaceRuntime', 'pipeline pull native binding resolution')
+assertIncludes(pipelineSync, 'googleSheetsJson', 'pipeline pull native Sheets transport')
+assertIncludes(pipelineSync, 'binding.legacyOwnerFallback', 'pipeline pull legacy transport boundary')
+
+const pipelineDropdownSync = read('app_src/lib/pipelineDropdownSync.ts')
+assertIncludes(pipelineDropdownSync, 'resolvePipelineSheetBindingInPostgres', 'dropdown binding resolution')
+assertIncludes(pipelineDropdownSync, 'resolveManagedGoogleWorkspaceRuntime', 'dropdown native binding resolution')
+assertIncludes(pipelineDropdownSync, 'googleSheetsJson', 'dropdown native Sheets transport')
 
 const opportunityRoute = read('app_src/app/api/pipeline/opportunity/[id]/route.ts')
 assertIncludes(opportunityRoute, 'enqueuePipelineSyncOutboxInPostgres', 'opportunity route')
@@ -197,6 +256,8 @@ assertIncludes(opportunityRoute, "operation: 'update_opportunity'", 'opportunity
 assertIncludes(opportunityRoute, 'beforeValues', 'opportunity optimistic write contract')
 assertIncludes(opportunityRoute, 'resolvePipelineSpaceAccess', 'opportunity tenancy contract')
 assertIncludes(opportunityRoute, 'requireResourceEditor', 'opportunity edit access contract')
+assertIncludes(opportunityRoute, 'managedRuntimeForPipelineSheet', 'opportunity direct Sheet binding resolution')
+assertIncludes(opportunityRoute, 'googleSheetsJson', 'opportunity direct native Sheet transport')
 
 const outboxWorker = read('app_src/lib/pipelineOutboxWorker.ts')
 assertIncludes(outboxWorker, 'claimPipelineSyncOutboxInPostgres', 'pipeline outbox worker')
@@ -205,6 +266,131 @@ assertIncludes(outboxWorker, "item.operation === 'append_interaction'", 'pipelin
 assertIncludes(outboxWorker, "item.operation === 'replace_dropdowns'", 'pipeline outbox worker')
 assertIncludes(outboxWorker, 'Opportunity Sheet row changed', 'pipeline outbox worker optimistic check')
 assertIncludes(outboxWorker, '[ClawPilot sync:', 'pipeline outbox worker append idempotency')
+assertIncludes(outboxWorker, "item.operation === 'provision_pipeline'", 'pipeline provisioning worker dispatch')
+assertIncludes(outboxWorker, "item.operation === 'sync_pipeline_permissions'", 'pipeline permission worker dispatch')
+assertIncludes(outboxWorker, 'resolveManagedGoogleWorkspaceRuntime', 'bound managed pipeline runtime resolution')
+assertIncludes(outboxWorker, 'googleSheetsJson', 'bound managed pipeline Sheet writes')
+assert.ok(
+  outboxWorker.indexOf("item.operation === 'provision_pipeline'")
+    < outboxWorker.indexOf('resolvePipelineOutboxSheetContextInPostgres(item)'),
+  'pipeline provisioning must dispatch before normal Sheet-context resolution',
+)
+
+const workspacesRoute = read('app_src/app/api/workspaces/route.ts')
+assertIncludes(workspacesRoute, "action === 'provision-pipeline'", 'owner-confirmed pipeline provisioning action')
+assertIncludes(workspacesRoute, "pipeline.accessRole !== 'owner'", 'pipeline provisioning owner access')
+assert.ok(!workspacesRoute.includes('driveConnectionId: body'), 'workspace route must not accept a Drive connection binding')
+assert.ok(!workspacesRoute.includes('sheetsConnectionId: body'), 'workspace route must not accept a Sheets connection binding')
+assertIncludes(workspacesRoute, 'const { projection, sheetId, shortLinkId, ...summary }', 'workspace pipeline resource ID redaction')
+assertIncludes(tenancyAdapter, 'enqueuePipelinePermissionSyncWithClient', 'pipeline membership permission synchronization')
+
+const googleWorkspaceCrypto = read('app_src/lib/integrations/googleWorkspaceCrypto.ts')
+for (const optionalField of [
+  'auth_uri',
+  'auth_provider_x509_cert_url',
+  'client_x509_cert_url',
+  'universe_domain',
+]) {
+  assertIncludes(googleWorkspaceCrypto, `'${optionalField}'`, 'downloaded service-account JSON support')
+}
+assertIncludes(googleWorkspaceCrypto, 'aes-256-gcm', 'Google Workspace secret encryption')
+assertIncludes(googleWorkspaceCrypto, 'clawpilot:google-workspace:platform:', 'stable Google Workspace encryption AAD')
+assertIncludes(googleWorkspaceCrypto, 'Unsupported service-account field:', 'unknown service-account field rejection')
+
+const googleWorkspacePersistence = read('app_src/lib/persistence/googleWorkspace.ts')
+assertIncludes(googleWorkspacePersistence, 'expectedVersion', 'Google Workspace optimistic persistence')
+assertIncludes(googleWorkspacePersistence, 'google_service_account_email IS DISTINCT FROM $1', 'service-account binding immutability')
+assertIncludes(googleWorkspacePersistence, 'Disconnect is blocked while managed pipelines are bound', 'managed binding disconnect guard')
+assertIncludes(googleWorkspacePersistence, 'WHERE google_service_account_email IS NOT NULL', 'managed pipeline disconnect check')
+
+const googleWorkspaceClient = read('app_src/lib/integrations/googleWorkspaceClient.ts')
+assertIncludes(googleWorkspaceClient, "url.searchParams.set('key', apiKey)", 'Google API key quota attribution')
+assertIncludes(googleWorkspaceClient, 'Authorization: `Bearer ${token}`', 'service-account OAuth authorization')
+assertIncludes(googleWorkspaceClient, "redirect: 'error'", 'native Google redirect rejection')
+assertIncludes(googleWorkspaceClient, "cache: 'no-store'", 'native Google cache bypass')
+assertIncludes(googleWorkspaceClient, 'readBoundedResponse', 'bounded Google response reading')
+assertIncludes(googleWorkspaceClient, "'/discovery/v1/apis/drive/v3/rest'", 'independent API key validation')
+assertIncludes(googleWorkspaceClient, 'validateGoogleServiceAccount', 'OAuth Drive service-account validation')
+assertIncludes(googleWorkspaceClient, 'capabilities(canAddChildren,canShare)', 'Shared Drive capability validation')
+assertIncludes(googleWorkspaceClient, 'GOOGLE_SHARED_DRIVE_INSUFFICIENT_ACCESS', 'actionable Shared Drive role error')
+assertIncludes(googleWorkspaceClient, 'nextPageToken', 'Shared Drive pagination')
+
+const googleWorkspaceIntegration = read('app_src/lib/integrations/googleWorkspace.ts')
+const integrationStateBlock = googleWorkspaceIntegration.slice(
+  googleWorkspaceIntegration.indexOf('export type GoogleWorkspaceIntegrationState'),
+  googleWorkspaceIntegration.indexOf('export class GoogleWorkspaceRequestError'),
+)
+for (const field of [
+  'configured',
+  'ready',
+  'apiKeyConfigured',
+  'apiKeyLastFour',
+  'serviceAccountConfigured',
+  'projectId',
+  'serviceAccountEmail',
+  'privateKeyId',
+  'credentialVersion',
+  'sharedDriveConfigured',
+  'sharedDriveName',
+  'verifiedAt',
+  'updatedAt',
+]) {
+  assertIncludes(integrationStateBlock, field, 'sanitized Google Workspace state')
+}
+for (const forbiddenField of ['apiKey:', 'privateKey:', 'selectedSharedDriveId', 'serviceAccountSecret']) {
+  assert.ok(!integrationStateBlock.includes(forbiddenField), `sanitized integration state must omit ${forbiddenField}`)
+}
+assertIncludes(
+  googleWorkspaceIntegration,
+  'apiKeyConfigured && serviceAccountConfigured && sharedDriveConfigured && Boolean(record.verifiedAt)',
+  'complete Google Workspace readiness contract',
+)
+for (const prerequisiteCode of [
+  'GOOGLE_API_KEY_REQUIRED',
+  'GOOGLE_SERVICE_ACCOUNT_REQUIRED',
+  'GOOGLE_SHARED_DRIVE_REQUIRED',
+  'GOOGLE_WORKSPACE_VALIDATION_REQUIRED',
+]) {
+  assertIncludes(googleWorkspaceIntegration, prerequisiteCode, 'managed provisioning prerequisite error')
+}
+const updateCredentialBody = googleWorkspaceIntegration.slice(
+  googleWorkspaceIntegration.indexOf('export async function updateGoogleWorkspaceCredential'),
+  googleWorkspaceIntegration.indexOf('async function configuredRuntime'),
+)
+assert.ok(
+  updateCredentialBody.indexOf('await validateGoogleApiKey')
+    < updateCredentialBody.indexOf('await writeGoogleWorkspaceCredentialInPostgres'),
+  'API key candidate must validate before persistence',
+)
+assert.ok(
+  updateCredentialBody.indexOf('await validateGoogleServiceAccount')
+    < updateCredentialBody.indexOf('await writeGoogleWorkspaceCredentialInPostgres'),
+  'service-account candidate must validate before persistence',
+)
+assertIncludes(updateCredentialBody, ': current.apiKeySecret', 'untouched API key ciphertext preservation')
+assertIncludes(updateCredentialBody, ': current.serviceAccountSecret', 'untouched service-account ciphertext preservation')
+assertIncludes(
+  updateCredentialBody,
+  'else if (input.setApiKey && effectiveServiceAccount)',
+  'API key rotation must revalidate the stored service account and Shared Drive',
+)
+
+const googleWorkspaceRoute = read('app_src/app/api/integrations/google-workspace/route.ts')
+assertIncludes(googleWorkspaceRoute, "actor.role !== 'owner'", 'owner-only Google Workspace administration')
+assertIncludes(googleWorkspaceRoute, 'MAX_REQUEST_BYTES', 'bounded Google Workspace API body')
+for (const action of [
+  'update-credential',
+  'refresh-shared-drives',
+  'select-shared-drive',
+  'test-connection',
+  'disconnect',
+]) {
+  assertIncludes(googleWorkspaceRoute, `'${action}'`, 'Google Workspace API action')
+}
+assertIncludes(googleWorkspaceRoute, '{ ok: true, integration', 'Google Workspace success envelope')
+assertIncludes(googleWorkspaceRoute, '{ ok: false, error: error.message, code: error.code }', 'Google Workspace error envelope')
+assertIncludes(googleWorkspaceRoute, 'requireOnlyFields', 'strict Google Workspace API fields')
+assert.ok(!workspacesRoute.includes('googleSharedDriveId'), 'workspace payload must not expose Shared Drive IDs')
 
 const agentDispatchWorker = read('app_src/lib/agentDispatchWorker.ts')
 assertIncludes(agentDispatchWorker, 'claimAgentDispatchOutboxInPostgres', 'agent dispatch worker')
@@ -336,5 +522,75 @@ assertIncludes(versionsRoute, 'getLocalReleaseOverview', 'local release history'
 
 assertIncludes(usersAdapter, "target.status === 'invited'", 'invitation-only user activation')
 assertIncludes(usersAdapter, "role === 'member'", 'member permission sanitization')
+
+const typescriptModule = await import(pathToFileURL(resolve(root, 'app_src/node_modules/typescript/lib/typescript.js')).href)
+const typescript = typescriptModule.default || typescriptModule
+const transpiledCrypto = typescript.transpileModule(googleWorkspaceCrypto, {
+  compilerOptions: {
+    module: typescript.ModuleKind.ESNext,
+    target: typescript.ScriptTarget.ES2022,
+    esModuleInterop: true,
+  },
+}).outputText
+const cryptoContract = await import(`data:text/javascript;base64,${Buffer.from(transpiledCrypto).toString('base64')}#google-workspace-contract`)
+const previousEncryptionKey = process.env.AGENT_CREDENTIAL_ENCRYPTION_KEY
+process.env.AGENT_CREDENTIAL_ENCRYPTION_KEY = 'google-workspace-contract-encryption-key'
+try {
+  const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 })
+  const clientEmail = 'clawpilot-drive@logical-bird-344400.iam.gserviceaccount.com'
+  const downloadedCredential = {
+    type: 'service_account',
+    project_id: 'logical-bird-344400',
+    private_key_id: '0123456789abcdef0123456789abcdef01234567',
+    private_key: privateKey.export({ type: 'pkcs8', format: 'pem' }).toString(),
+    client_email: clientEmail,
+    client_id: '123456789012345678901',
+    auth_uri: 'https://accounts.google.com/o/oauth2/auth',
+    token_uri: 'https://oauth2.googleapis.com/token',
+    auth_provider_x509_cert_url: 'https://www.googleapis.com/oauth2/v1/certs',
+    client_x509_cert_url: `https://www.googleapis.com/robot/v1/metadata/x509/${encodeURIComponent(clientEmail)}`,
+    universe_domain: 'googleapis.com',
+  }
+  const normalized = cryptoContract.normalizeGoogleServiceAccount(downloadedCredential)
+  assert.deepEqual(
+    Object.keys(normalized).sort(),
+    ['client_email', 'client_id', 'private_key', 'private_key_id', 'project_id', 'token_uri', 'type'],
+    'normalized service-account credential must discard validated optional metadata',
+  )
+  assert.throws(
+    () => cryptoContract.normalizeGoogleServiceAccount({ ...downloadedCredential, arbitrary_endpoint: 'https://example.com' }),
+    /Unsupported service-account field/,
+  )
+  assert.throws(
+    () => cryptoContract.normalizeGoogleServiceAccount({
+      ...downloadedCredential,
+      client_x509_cert_url: 'https://example.com/robot/v1/metadata/x509/account',
+    }),
+    /client_x509_cert_url is invalid/,
+  )
+
+  const apiKey = 'AIzaSyContractTestKey0123456789'
+  const encryptedApiKey = cryptoContract.encryptGoogleApiKey(apiKey)
+  assert.equal(cryptoContract.decryptGoogleApiKey(encryptedApiKey), apiKey, 'Google API key encryption round trip')
+  const encryptedServiceAccount = cryptoContract.encryptGoogleServiceAccount(downloadedCredential)
+  assert.equal(
+    cryptoContract.decryptGoogleServiceAccount(encryptedServiceAccount).client_email,
+    clientEmail,
+    'Google service-account encryption round trip',
+  )
+  const tampered = {
+    ...encryptedApiKey,
+    ciphertext: Buffer.from(encryptedApiKey.ciphertext),
+  }
+  tampered.ciphertext[0] ^= 1
+  assert.throws(() => cryptoContract.decryptGoogleApiKey(tampered), /could not be decrypted/)
+  assert.throws(() => cryptoContract.decryptGoogleApiKey(encryptedServiceAccount), /could not be decrypted/)
+} finally {
+  if (previousEncryptionKey === undefined) delete process.env.AGENT_CREDENTIAL_ENCRYPTION_KEY
+  else process.env.AGENT_CREDENTIAL_ENCRYPTION_KEY = previousEncryptionKey
+}
+
+await import('./test-maton-user-credentials.mjs')
+await import('./test-maton-runtime-credentials.mjs')
 
 console.log('PASS test-postgres-adapter-contracts')
