@@ -284,6 +284,11 @@ assertIncludes(crmAdapter, "'upsert_record', 'suitecrm'", 'SuiteCRM outbox targe
 assertIncludes(crmAdapter, "operation IN ('upsert_record', 'delete_record')", 'SuiteCRM deletion outbox claims')
 assertIncludes(crmAdapter, 'ensurePipelineCrmHierarchy', 'workspace organization CRM hierarchy')
 assertIncludes(crmAdapter, 'ON CONFLICT (pipeline_id, identity_key)', 'natural CRM identity upserts')
+assertIncludes(crmAdapter, "$23, $24::jsonb, $25,\n        'pending', NULL, $26, $26", 'CRM contact insert bindings')
+assert.ok(
+  !crmAdapter.includes("$24, $25::jsonb, $26,\n        'pending', NULL, $27, $27"),
+  'CRM contact insert must not provide more expressions than target columns',
+)
 assertIncludes(crmAdapter, 'FOR UPDATE SKIP LOCKED', 'SuiteCRM leased outbox claims')
 assertIncludes(crmAdapter, 'pipeline_id = $1::uuid', 'pipeline-scoped CRM reads')
 assertIncludes(crmAdapter, 'readCrmWorkbookProjectionReadiness', 'reconciliation-gated CRM workbook projection')

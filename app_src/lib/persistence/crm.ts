@@ -393,8 +393,8 @@ async function stageContact(
       )
       VALUES (
         $1::uuid, $2::uuid, $3, $4, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-        $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25::jsonb, $26,
-        'pending', NULL, $27, $27
+        $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24::jsonb, $25,
+        'pending', NULL, $26, $26
       )
       ON CONFLICT (pipeline_id, identity_key) DO UPDATE SET
         organization_id = EXCLUDED.organization_id,

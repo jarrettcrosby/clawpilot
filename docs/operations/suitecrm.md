@@ -12,7 +12,7 @@ app_visible: false
 
 Each Railway environment has a `suitecrm` service, a dedicated MariaDB service, and a SuiteCRM volume mounted at `/var/lib/suitecrm`. SuiteCRM does not share ClawPilot's Postgres database. The ClawPilot service reaches the API through the private `http://suitecrm.railway.internal:<port>` base URL and OAuth2 client credentials. Owner/admin browser access uses SuiteCRM's separate public HTTPS origin.
 
-`SUITECRM_BASE_URL` is backend-only and must remain on Railway's private network. Never place it in a browser response or public environment variable. `SUITECRM_PUBLIC_URL` is the only browser destination and must be the exact canonical origin, for example `https://crm.example.com`, with no trailing slash, path, credentials, query, or fragment.
+`SUITECRM_BASE_URL` is backend-only and must remain on Railway's private network. Never place it in a browser response or public environment variable. `SUITECRM_PUBLIC_URL` is the only browser destination and must be the exact canonical origin, with no trailing slash, path, credentials, query, or fragment. ClawPilot uses `https://crm.eigenracing.com` in production and `https://dev.crm.eigenracing.com` in development. SuiteCRM is a standalone service and must not be nested under the ClawPilot `aiapp` hostname.
 
 The image is built from `services/suitecrm/`. It verifies the official SuiteCRM 8.10.1 release digest, serves `public/` with Apache, runs the legacy scheduler every minute, and continuously restarts the Symfony Messenger worker.
 

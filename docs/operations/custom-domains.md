@@ -7,6 +7,15 @@
 | Production | `main` | `production` | `aiapp.eigenracing.com` | Production `Postgres` volume |
 | Development | `dev` | `development` | `dev.aiapp.eigenracing.com` | Isolated development `Postgres` volume |
 
+Standalone platform services use their own hostname namespace instead of being nested under the ClawPilot `aiapp` namespace:
+
+| Service | Production | Development |
+|---|---|---|
+| ClawPilot | `aiapp.eigenracing.com` | `dev.aiapp.eigenracing.com` |
+| SuiteCRM | `crm.eigenracing.com` | `dev.crm.eigenracing.com` |
+
+Apply the environment marker as the leftmost `dev.` label. New standalone applications should follow the same pattern: `<service>.eigenracing.com` in production and `dev.<service>.eigenracing.com` in development.
+
 Both named runtimes are hosted on Railway so the Next.js app and pipeline outbox worker run together. Vercel remains a protected preview/build check and is not the durable runtime behind either custom domain.
 
 The persistent `development` Railway environment was created from production configuration, rebound to the `dev` branch, and given its own empty Postgres instance. It is seeded from canonical `data-dev` task/thread state and uses the isolated development pipeline workbook. Secrets for sessions, the outbox worker, and Postgres are distinct from production.
