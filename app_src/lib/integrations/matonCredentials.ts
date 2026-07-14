@@ -410,6 +410,23 @@ export async function importPlatformMatonCredential(
   } catch (error) {
     throw clientError(error)
   }
+  const platformGmailConnectionId = String(process.env.MATON_GMAIL_CONNECTION_ID || '').trim()
+  const selectedConnectionIds: string[] = []
+  if (platformGmailConnectionId) {
+    const configuredSenderConnection = connections.find((connection) => (
+      connection.connectionId === platformGmailConnectionId
+      && connection.app === 'google-mail'
+      && connection.status === 'ACTIVE'
+    ))
+    if (!configuredSenderConnection) {
+      throw new MatonCredentialRequestError(
+        'The verified platform Gmail connection is not available to the imported Maton key',
+        503,
+        'MATON_CONFIGURATION_ERROR',
+      )
+    }
+    selectedConnectionIds.push(configuredSenderConnection.connectionId)
+  }
   let encrypted: ReturnType<typeof encryptMatonApiKey>
   try {
     encrypted = encryptMatonApiKey(apiKey, ownerEmail)
@@ -425,6 +442,7 @@ export async function importPlatformMatonCredential(
       ownerEmail,
       apiKey: { ...encrypted, lastFour: apiKey.slice(-4) },
       connections: connections.map(connectionWrite),
+      selectedConnectionIds,
     })
   } catch (error) {
     if (error instanceof Error && error.message === 'A per-user Maton credential is already configured') {

@@ -24,7 +24,7 @@ Keep user-owned Maton accounts separate from the platform Google Workspace crede
 ## Runtime Credential Selection
 
 - User-owned Maton operations resolve the signed-in user's encrypted credential and an `ACTIVE` connection for the requested Maton application.
-- Platform email prefers the configured owner's stored Maton credential. Railway environment variables remain a bootstrap fallback until the owner imports the existing platform key in each environment.
+- Platform email prefers the configured owner's stored Maton credential. Importing the Railway bootstrap key preserves the verified `MATON_GMAIL_CONNECTION_ID`, so system mail continues to use the approved ClawPilot Stewards sender instead of whichever Gmail connection was created most recently.
 - Development and production store user integration records in their own Railway Postgres environments. Import or configure the platform owner in both environments; do not copy database rows between environments.
 
 ## Google Workspace Contract

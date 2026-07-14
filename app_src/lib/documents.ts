@@ -77,6 +77,16 @@ function singleLine(value: unknown): string {
   return String(value || '').replace(/\s+/g, ' ').trim()
 }
 
+function pipelineSourceLabel(value: unknown): string {
+  if (typeof value === 'string') return singleLine(value) || 'app'
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return 'app'
+
+  const provider = singleLine((value as Record<string, unknown>).provider)
+  if (provider === 'native-google-sheets') return 'Managed Google Sheets'
+  if (provider === 'maton-google-sheets') return 'Google Sheets via Maton'
+  return provider || 'app'
+}
+
 function excerptFor(content: string): string {
   return content
     .replace(/^---[\s\S]*?---\s*/m, '')
@@ -305,7 +315,7 @@ export async function refreshUserBriefs(
     `Updated: ${now}`,
     '',
     `Pipeline: ${singleLine(pipeline.name || 'My pipeline')}`,
-    `Source: ${singleLine(pipelineProjection.source || 'app')}`,
+    `Source: ${pipelineSourceLabel(pipelineProjection.source)}`,
     `Last synchronized: ${singleLine(pipelineProjection.syncedAt || 'Not synchronized')}`,
     '',
     '## Summary',
