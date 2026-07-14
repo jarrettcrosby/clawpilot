@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { disconnectChatGPT } from '@/lib/agents/chatgptAuth'
 import { createUserInvitation } from '@/lib/invitations'
+import { ensurePrimaryWorkspaceOrganization, updatePrimaryWorkspaceOrganization } from '@/lib/organizations'
 import { ensureDefaultResourcesForUser } from '@/lib/tenancy'
 import { sessionEmail } from '@/lib/requestUser'
 import {
@@ -26,8 +27,9 @@ export async function GET(req: NextRequest) {
   if (!email) return NextResponse.json({ ok: false, error: 'Unauthorized' }, { status: 401 })
 
   try {
+    await ensurePrimaryWorkspaceOrganization(email)
+    await ensureDefaultResourcesForUser(email)
     const { actor, users } = await listAppUsers(email)
-    await ensureDefaultResourcesForUser(actor.email)
     return NextResponse.json({
       ok: true,
       currentUser: actor,
@@ -68,10 +70,12 @@ export async function PATCH(req: NextRequest) {
   try {
     const body = await req.json()
     if (body?.action === 'profile') {
+      await updatePrimaryWorkspaceOrganization({ actorEmail, name: body.organizationName })
       const user = await updateAppUserProfile({
         actorEmail,
         displayName: body.displayName,
         jobTitle: body.jobTitle,
+        organizationName: body.organizationName,
         timezone: body.timezone,
         locale: body.locale,
       })

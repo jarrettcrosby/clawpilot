@@ -10,7 +10,9 @@ app_visible: false
 
 ## Topology
 
-Each Railway environment has a private `suitecrm` service, a dedicated MariaDB service, and a SuiteCRM volume mounted at `/var/lib/suitecrm`. SuiteCRM does not share ClawPilot's Postgres database. The ClawPilot service reaches SuiteCRM through `http://suitecrm.railway.internal:<port>` and OAuth2 client credentials.
+Each Railway environment has a `suitecrm` service, a dedicated MariaDB service, and a SuiteCRM volume mounted at `/var/lib/suitecrm`. SuiteCRM does not share ClawPilot's Postgres database. The ClawPilot service reaches the API through the private `http://suitecrm.railway.internal:<port>` base URL and OAuth2 client credentials. Owner/admin browser access uses SuiteCRM's separate public HTTPS origin.
+
+`SUITECRM_BASE_URL` is backend-only and must remain on Railway's private network. Never place it in a browser response or public environment variable. `SUITECRM_PUBLIC_URL` is the only browser destination and must be the exact canonical origin, for example `https://crm.example.com`, with no trailing slash, path, credentials, query, or fragment.
 
 The image is built from `services/suitecrm/`. It verifies the official SuiteCRM 8.10.1 release digest, serves `public/` with Apache, runs the legacy scheduler every minute, and continuously restarts the Symfony Messenger worker.
 
@@ -20,27 +22,56 @@ SuiteCRM service:
 
 - `SUITECRM_DB_HOST`, `SUITECRM_DB_PORT`, `SUITECRM_DB_NAME`
 - `SUITECRM_DB_USER`, `SUITECRM_DB_PASSWORD`
-- `SUITECRM_SITE_URL`
+- `SUITECRM_PUBLIC_URL`
 - `SUITECRM_ADMIN_USER`, `SUITECRM_ADMIN_PASSWORD`
 - `SUITECRM_CLIENT_ID`, `SUITECRM_CLIENT_SECRET`
 
 ClawPilot service:
 
 - `CRM_ENABLED=1`
-- `SUITECRM_BASE_URL`
+- `SUITECRM_BASE_URL=http://suitecrm.railway.internal:<port>`
+- the same exact `SUITECRM_PUBLIC_URL`
 - the same `SUITECRM_CLIENT_ID` and `SUITECRM_CLIENT_SECRET`
 
 Credentials must remain Railway secrets. The container hashes the OAuth client secret before upserting it into SuiteCRM and never prints the secret.
+
+## Organization Hierarchy
+
+Railway Postgres is authoritative for ClawPilot users, pipeline ownership, CRM identities, and organization relationships. SuiteCRM is the native CRM projection of those records; Google Sheets is the controlled reporting and Opportunities input surface.
+
+Each user has one workspace organization. The configured owner organization is the root, invited users receive member organizations beneath their inviter, and every pipeline belongs to its owner's workspace organization. Customer organizations are children of that pipeline organization, and contacts reference their customer organization. Owner/admin users can inspect and reparent member organizations from the CRM hierarchy panel.
+
+Set `CLAWPILOT_ROOT_ORGANIZATION_NAME` to the same company name in development and production before migration `0021_crm_identity_and_organization_hierarchy.sql` is applied. Workspace accounts use global deterministic SuiteCRM IDs. Customer organizations use normalized names within a pipeline; contacts use normalized email, or normalized name plus organization when email is absent. Workbook row numbers are not identities.
+
+Migration `0021` consolidates existing organization/contact duplicates, remaps dependent records, and queues idempotent SuiteCRM deletions for the redundant native records. It deliberately does not deduplicate opportunities or interactions because repeated deals and touchpoints may be valid.
+
+## Native Punchout
+
+`GET /api/crm/punchout` requires an active ClawPilot session and an `owner` or `admin` role. It accepts no query parameters or caller-provided destination. A successful request returns a temporary redirect to `SUITECRM_PUBLIC_URL` with `Cache-Control: no-store`; no SuiteCRM API URL, OAuth credential, or user-selected URL is exposed.
+
+The punchout opens SuiteCRM's native login/session surface. PHP sessions are cookie-only with `Secure`, `HttpOnly`, `SameSite=Lax`, and strict mode enabled. This slice does not establish cross-application SSO.
+
+## Boot Configuration Refresh
+
+The SuiteCRM volume persists application configuration across deploys. On every container boot, the entrypoint validates `SUITECRM_PUBLIC_URL` before starting SuiteCRM and atomically refreshes a ClawPilot-managed block in `public/legacy/config_override.php`:
+
+- `site_url` is set to the exact public HTTPS origin.
+- `trusted_hosts` is replaced with anchored expressions for the public hostname and `suitecrm.railway.internal`.
+- unrelated persisted override settings remain unchanged.
+
+The managed block is inserted last so stale installer values cannot override it. Startup fails closed if the existing override is unreadable, has an incomplete managed block, contains non-whitespace after its closing PHP tag, or cannot be replaced with `www-data:www-data` ownership and mode `0640`.
 
 ## First Install
 
 1. Create MariaDB and the SuiteCRM service in development.
 2. Attach the SuiteCRM volume at `/var/lib/suitecrm` before the first deployment.
-3. Set all variables and deploy the service.
-4. Verify the SuiteCRM root, token endpoint, scheduler, and Messenger logs.
+3. Create the SuiteCRM public Railway domain, set its exact HTTPS origin as `SUITECRM_PUBLIC_URL` on both services, and set the private service URL only as ClawPilot's `SUITECRM_BASE_URL`.
+4. Deploy and verify the public SuiteCRM root, private token endpoint, scheduler, Messenger logs, and persisted runtime override.
 5. Enable CRM variables on the ClawPilot development service and apply migration `0020_crm_gateway_and_reporting.sql`.
 6. Inspect and import the source workbook, drain the SuiteCRM and Google outboxes, then compare entity counts and pipeline totals before projecting the controlled workbook.
 7. Repeat in production only after development reconciliation succeeds.
+
+After a public-domain change, update `SUITECRM_PUBLIC_URL` on both services and redeploy SuiteCRM before ClawPilot. Confirm the managed `site_url` and trusted-host entries, then test `/api/crm/punchout` as an owner/admin and confirm a member receives `403`.
 
 ## Upgrade Rule
 

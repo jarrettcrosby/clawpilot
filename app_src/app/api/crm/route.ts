@@ -2,11 +2,13 @@ import crypto from 'node:crypto'
 import { NextRequest, NextResponse } from 'next/server'
 import { CRM_ENTITIES, type CrmEntity } from '@/lib/crm/types'
 import {
+  ensurePipelineCrmHierarchy,
   listCrmRecordsInPostgres,
   readCrmRecordReference,
   readCrmSummaryFromPostgres,
   stageCrmRecordInPostgres,
 } from '@/lib/persistence/crm'
+import { listWorkspaceOrganizationHierarchy } from '@/lib/organizations'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import { requireRequestUser } from '@/lib/requestUser'
 import {
@@ -64,7 +66,8 @@ export async function GET(req: NextRequest) {
     const actor = await requireRequestUser(req)
     const pipeline = await selectedPipeline(req, actor.email)
     const entity = entityValue(req.nextUrl.searchParams.get('entity') || 'organizations')
-    const [records, summary] = await Promise.all([
+    await ensurePipelineCrmHierarchy({ pipelineId: pipeline.id, actorEmail: actor.email })
+    const [records, summary, workspaceHierarchy] = await Promise.all([
       listCrmRecordsInPostgres({
         pipelineId: pipeline.id,
         entity,
@@ -72,6 +75,7 @@ export async function GET(req: NextRequest) {
         limit: Number(req.nextUrl.searchParams.get('limit') || 250),
       }),
       readCrmSummaryFromPostgres(pipeline.id),
+      listWorkspaceOrganizationHierarchy(actor.email),
     ])
     return NextResponse.json({
       ok: true,
@@ -82,9 +86,13 @@ export async function GET(req: NextRequest) {
         id: pipeline.id,
         name: pipeline.name,
         ownerEmail: pipeline.ownerEmail,
+        workspaceOrganizationId: pipeline.workspaceOrganizationId,
         accessRole: pipeline.accessRole,
         shortLinkUrl: pipeline.shortLinkUrl,
       },
+      workspaceHierarchy,
+      canManageHierarchy: actor.role === 'owner' || actor.role === 'admin',
+      suiteCrmPunchoutUrl: actor.role === 'owner' || actor.role === 'admin' ? '/api/crm/punchout' : null,
     })
   } catch (error) {
     return errorResponse(error)
@@ -97,22 +105,28 @@ export async function POST(req: NextRequest) {
     const actor = await requireRequestUser(req)
     const pipeline = await selectedPipeline(req, actor.email)
     requireResourceEditor(pipeline)
+    const hierarchy = await ensurePipelineCrmHierarchy({ pipelineId: pipeline.id, actorEmail: actor.email })
     const body = await req.json()
     const entity = entityValue(body?.entity)
     const fields = objectValue(body?.fields)
     let sourceKey = `app:${entity}:${crypto.randomUUID()}`
+    let current: Awaited<ReturnType<typeof readCrmRecordReference>> | null = null
     if (body?.id) {
-      const current = await readCrmRecordReference({ pipelineId: pipeline.id, entity, id: String(body.id) })
+      current = await readCrmRecordReference({ pipelineId: pipeline.id, entity, id: String(body.id) })
       sourceKey = current.sourceKey
     }
 
     if (entity === 'organizations') {
+      if (current?.workspaceOrganizationId) throw new Error('Workspace organizations are managed in the hierarchy')
       const name = stringValue(fields.name, 250)
       if (!name) throw new Error('Organization name is required')
       const staged = await stageCrmRecordInPostgres({
-        entity, pipelineId: pipeline.id, sourceKey, actorEmail: actor.email,
+        entity, pipelineId: pipeline.id, localId: current?.id, sourceKey, actorEmail: actor.email,
         sourcePayload: { source: 'clawpilot' },
         fields: {
+          parentOrganizationId: hierarchy.customerParent.id,
+          parentOrganizationSuiteCrmId: hierarchy.customerParent.suiteCrmId,
+          relationshipType: 'customer',
           name, priority: stringValue(fields.priority, 50), accountType: stringValue(fields.accountType, 100),
           accountManager: stringValue(fields.accountManager, 200), website: stringValue(fields.website, 500),
           linkedinUrl: stringValue(fields.linkedinUrl, 500), phone: stringValue(fields.phone, 100),
@@ -133,7 +147,7 @@ export async function POST(req: NextRequest) {
       const fullName = stringValue(fields.fullName, 250)
       if (!fullName) throw new Error('Contact name is required')
       const staged = await stageCrmRecordInPostgres({
-        entity, pipelineId: pipeline.id, sourceKey, actorEmail: actor.email,
+        entity, pipelineId: pipeline.id, localId: current?.id, sourceKey, actorEmail: actor.email,
         sourcePayload: { source: 'clawpilot' },
         fields: {
           organizationId: organization?.id || null, organizationSuiteCrmId: organization?.suiteCrmId || null,

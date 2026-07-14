@@ -55,6 +55,8 @@ export type AppUser = {
   status: AppUserStatus
   displayName: string | null
   jobTitle: string | null
+  organizationId: string | null
+  organizationName: string | null
   timezone: string
   locale: string
   permissions: AppUserPermissions
@@ -77,6 +79,8 @@ type AppUserRow = {
   status: AppUserStatus
   display_name: string | null
   job_title: string | null
+  organization_id: string | null
+  organization_name: string | null
   timezone: string
   locale: string
   permissions: unknown
@@ -145,6 +149,8 @@ function toAppUser(row: AppUserRow): AppUser {
     status: row.status,
     displayName: row.display_name,
     jobTitle: row.job_title,
+    organizationId: row.organization_id,
+    organizationName: row.organization_name,
     timezone: row.timezone || 'America/New_York',
     locale: row.locale || 'en-US',
     permissions: permissionsForRole(row.role, row.permissions),
@@ -307,6 +313,7 @@ export async function updateAppUserProfile(input: {
   actorEmail: unknown
   displayName: unknown
   jobTitle?: unknown
+  organizationName?: unknown
   timezone?: unknown
   locale?: unknown
 }): Promise<AppUser> {
@@ -314,6 +321,8 @@ export async function updateAppUserProfile(input: {
   const displayName = cleanOptionalText(input.displayName, 100)
   if (!displayName) throw new Error('Name is required')
   const jobTitle = cleanOptionalText(input.jobTitle, 120)
+  const organizationName = cleanOptionalText(input.organizationName, 200)
+  if (!organizationName) throw new Error('Organization name is required')
   const timezone = normalizeTimezone(input.timezone)
   const locale = normalizeLocale(input.locale)
   const result = await query<AppUserRow>(
@@ -321,13 +330,14 @@ export async function updateAppUserProfile(input: {
       UPDATE app_users
       SET display_name = $2,
           job_title = $3,
-          timezone = $4,
-          locale = $5,
+          organization_name = $4,
+          timezone = $5,
+          locale = $6,
           updated_at = now()
       WHERE email = $1
       RETURNING *
     `,
-    [actor.email, displayName, jobTitle, timezone, locale],
+    [actor.email, displayName, jobTitle, organizationName, timezone, locale],
   )
   return toAppUser(result.rows[0])
 }

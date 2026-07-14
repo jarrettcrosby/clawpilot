@@ -1,6 +1,12 @@
 import crypto from 'node:crypto'
 import type { PoolClient } from 'pg'
-import { crmSourceHash, stableSuiteCrmId } from '@/lib/crm/stableId'
+import {
+  contactIdentityKey,
+  crmSourceHash,
+  organizationIdentityKey,
+  stableGlobalSuiteCrmId,
+  stableSuiteCrmId,
+} from '@/lib/crm/stableId'
 import type {
   CrmContact,
   CrmEntity,
@@ -12,6 +18,10 @@ import type {
   SuiteCrmOutboxRecord,
 } from '@/lib/crm/types'
 import { query, withTransaction } from '@/lib/persistence/postgres'
+import {
+  ensurePrimaryWorkspaceOrganization,
+  workspaceOrganizationAncestors,
+} from '@/lib/organizations'
 
 const ENTITY_TABLE: Record<CrmEntity, string> = {
   organizations: 'crm_organizations',
@@ -22,6 +32,7 @@ const ENTITY_TABLE: Record<CrmEntity, string> = {
 
 type CommonStageInput = {
   pipelineId: string
+  localId?: string | null
   sourceKey: string
   sourceSheetId?: string | null
   sourceRowNumber?: number | null
@@ -32,6 +43,10 @@ type CommonStageInput = {
 export type StageOrganizationInput = CommonStageInput & {
   entity: 'organizations'
   fields: {
+    parentOrganizationId?: string | null
+    parentOrganizationSuiteCrmId?: string | null
+    workspaceOrganizationId?: string | null
+    relationshipType?: 'workspace_root' | 'workspace_member' | 'customer'
     priority?: string
     name: string
     accountType?: string
@@ -118,6 +133,7 @@ export type CrmOutboxItem = {
   id: string
   aggregateType: string
   aggregateId: string
+  operation: 'upsert_record' | 'delete_record'
   payload: SuiteCrmOutboxRecord
   attempts: number
   lockToken: string
@@ -159,6 +175,7 @@ function suiteCrmAttributes(input: StageCrmRecordInput) {
       billing_address_state: clean(fields.state),
       billing_address_postalcode: clean(fields.postalCode),
       billing_address_country: clean(fields.country),
+      parent_id: clean(fields.parentOrganizationSuiteCrmId),
       description: clean(fields.description),
     }
   }
@@ -231,25 +248,67 @@ async function enqueueSuiteCrmRecord(
   )
 }
 
-async function stageOrganization(client: PoolClient, input: StageOrganizationInput, suiteCrmId: string, sourceHash: string) {
+async function stageOrganization(
+  client: PoolClient,
+  input: StageOrganizationInput,
+  suiteCrmId: string,
+  sourceHash: string,
+  identityKey: string,
+) {
   const fields = input.fields
+  const relationshipType = fields.relationshipType || 'customer'
+  if (input.localId) {
+    const updated = await client.query<{ id: string; suitecrm_id: string }>(
+      `UPDATE crm_organizations SET
+         suitecrm_id = COALESCE(suitecrm_id, $3), source_key = $4, identity_key = $4,
+         parent_organization_id = $5::uuid, workspace_organization_id = $6::uuid,
+         relationship_type = $7, source_sheet_id = COALESCE($8, source_sheet_id),
+         source_row_number = COALESCE($9, source_row_number), priority = $10, name = $11,
+         account_type = $12, account_manager = $13, website = $14, linkedin_url = $15,
+         phone = $16, billing_address_street = $17, billing_address_city = $18,
+         billing_address_state = $19, billing_address_postal_code = $20,
+         billing_address_country = $21, description = $22, source_payload = $23::jsonb,
+         sync_status = CASE WHEN source_hash IS DISTINCT FROM $24 THEN 'pending' ELSE sync_status END,
+         sync_error = CASE WHEN source_hash IS DISTINCT FROM $24 THEN NULL ELSE sync_error END,
+         source_hash = $24, updated_by = $25, updated_at = now()
+       WHERE pipeline_id = $1::uuid AND id = $2::uuid
+       RETURNING id::text, suitecrm_id`,
+      [
+        input.pipelineId, input.localId, suiteCrmId, identityKey,
+        fields.parentOrganizationId || null, fields.workspaceOrganizationId || null, relationshipType,
+        input.sourceSheetId || null, input.sourceRowNumber || null, nullable(fields.priority), clean(fields.name),
+        nullable(fields.accountType), nullable(fields.accountManager), nullable(fields.website), nullable(fields.linkedinUrl),
+        nullable(fields.phone), nullable(fields.address), nullable(fields.city), nullable(fields.state),
+        nullable(fields.postalCode), nullable(fields.country), nullable(fields.description),
+        JSON.stringify(input.sourcePayload || {}), sourceHash, input.actorEmail,
+      ],
+    )
+    if (!updated.rows[0]) throw new Error('CRM organization was not found')
+    return updated.rows[0]
+  }
   const result = await client.query<{ id: string; suitecrm_id: string }>(
     `
       INSERT INTO crm_organizations (
-        pipeline_id, suitecrm_id, source_key, source_sheet_id, source_row_number,
+        pipeline_id, suitecrm_id, source_key, identity_key, parent_organization_id,
+        workspace_organization_id, relationship_type, source_sheet_id, source_row_number,
         priority, name, account_type, account_manager, website, linkedin_url, phone,
         billing_address_street, billing_address_city, billing_address_state,
         billing_address_postal_code, billing_address_country, description,
         source_payload, source_hash, sync_status, sync_error, created_by, updated_by
       )
       VALUES (
-        $1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-        $13, $14, $15, $16, $17, $18, $19::jsonb, $20, 'pending', NULL, $21, $21
+        $1::uuid, $2, $3, $3, $4::uuid, $5::uuid, $6, $7, $8, $9, $10, $11,
+        $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22::jsonb, $23,
+        'pending', NULL, $24, $24
       )
-      ON CONFLICT (pipeline_id, source_key) DO UPDATE SET
+      ON CONFLICT (pipeline_id, identity_key) DO UPDATE SET
         suitecrm_id = COALESCE(crm_organizations.suitecrm_id, EXCLUDED.suitecrm_id),
-        source_sheet_id = EXCLUDED.source_sheet_id,
-        source_row_number = EXCLUDED.source_row_number,
+        source_key = EXCLUDED.source_key,
+        parent_organization_id = EXCLUDED.parent_organization_id,
+        workspace_organization_id = EXCLUDED.workspace_organization_id,
+        relationship_type = EXCLUDED.relationship_type,
+        source_sheet_id = COALESCE(EXCLUDED.source_sheet_id, crm_organizations.source_sheet_id),
+        source_row_number = COALESCE(EXCLUDED.source_row_number, crm_organizations.source_row_number),
         priority = EXCLUDED.priority,
         name = EXCLUDED.name,
         account_type = EXCLUDED.account_type,
@@ -272,22 +331,60 @@ async function stageOrganization(client: PoolClient, input: StageOrganizationInp
       RETURNING id::text, suitecrm_id
     `,
     [
-      input.pipelineId, suiteCrmId, input.sourceKey, input.sourceSheetId || null, input.sourceRowNumber || null,
-      nullable(fields.priority), clean(fields.name), nullable(fields.accountType), nullable(fields.accountManager), nullable(fields.website),
-      nullable(fields.linkedinUrl), nullable(fields.phone), nullable(fields.address), nullable(fields.city), nullable(fields.state),
-      nullable(fields.postalCode), nullable(fields.country), nullable(fields.description), JSON.stringify(input.sourcePayload || {}),
-      sourceHash, input.actorEmail,
+      input.pipelineId, suiteCrmId, identityKey, fields.parentOrganizationId || null,
+      fields.workspaceOrganizationId || null, relationshipType, input.sourceSheetId || null,
+      input.sourceRowNumber || null, nullable(fields.priority), clean(fields.name), nullable(fields.accountType),
+      nullable(fields.accountManager), nullable(fields.website), nullable(fields.linkedinUrl), nullable(fields.phone),
+      nullable(fields.address), nullable(fields.city), nullable(fields.state), nullable(fields.postalCode),
+      nullable(fields.country), nullable(fields.description), JSON.stringify(input.sourcePayload || {}), sourceHash,
+      input.actorEmail,
     ],
   )
   return result.rows[0]
 }
 
-async function stageContact(client: PoolClient, input: StageContactInput, suiteCrmId: string, sourceHash: string) {
+async function stageContact(
+  client: PoolClient,
+  input: StageContactInput,
+  suiteCrmId: string,
+  sourceHash: string,
+  identityKey: string,
+) {
   const fields = input.fields
+  if (input.localId) {
+    const updated = await client.query<{ id: string; suitecrm_id: string }>(
+      `UPDATE crm_contacts SET
+         organization_id = $3::uuid, suitecrm_id = COALESCE(suitecrm_id, $4),
+         source_key = $5, identity_key = $5, source_sheet_id = COALESCE($6, source_sheet_id),
+         source_row_number = COALESCE($7, source_row_number), priority = $8,
+         first_name = $9, last_name = $10, full_name = $11, contact_type = $12,
+         account_manager = $13, job_title = $14, email = $15, linkedin_url = $16,
+         phone_work = $17, phone_mobile = $18, primary_address_street = $19,
+         primary_address_city = $20, primary_address_state = $21,
+         primary_address_postal_code = $22, primary_address_country = $23,
+         description = $24, source_payload = $25::jsonb,
+         sync_status = CASE WHEN source_hash IS DISTINCT FROM $26 THEN 'pending' ELSE sync_status END,
+         sync_error = CASE WHEN source_hash IS DISTINCT FROM $26 THEN NULL ELSE sync_error END,
+         source_hash = $26, updated_by = $27, updated_at = now()
+       WHERE pipeline_id = $1::uuid AND id = $2::uuid
+       RETURNING id::text, suitecrm_id`,
+      [
+        input.pipelineId, input.localId, fields.organizationId || null, suiteCrmId, identityKey,
+        input.sourceSheetId || null, input.sourceRowNumber || null, nullable(fields.priority),
+        nullable(fields.firstName), nullable(fields.lastName), clean(fields.fullName), nullable(fields.contactType),
+        nullable(fields.accountManager), nullable(fields.jobTitle), nullable(fields.email), nullable(fields.linkedinUrl),
+        nullable(fields.phoneWork), nullable(fields.phoneMobile), nullable(fields.address), nullable(fields.city),
+        nullable(fields.state), nullable(fields.postalCode), nullable(fields.country), nullable(fields.description),
+        JSON.stringify(input.sourcePayload || {}), sourceHash, input.actorEmail,
+      ],
+    )
+    if (!updated.rows[0]) throw new Error('CRM contact was not found')
+    return updated.rows[0]
+  }
   const result = await client.query<{ id: string; suitecrm_id: string }>(
     `
       INSERT INTO crm_contacts (
-        pipeline_id, organization_id, suitecrm_id, source_key, source_sheet_id, source_row_number,
+        pipeline_id, organization_id, suitecrm_id, source_key, identity_key, source_sheet_id, source_row_number,
         priority, first_name, last_name, full_name, contact_type, account_manager, job_title,
         email, linkedin_url, phone_work, phone_mobile, primary_address_street,
         primary_address_city, primary_address_state, primary_address_postal_code,
@@ -295,15 +392,16 @@ async function stageContact(client: PoolClient, input: StageContactInput, suiteC
         sync_status, sync_error, created_by, updated_by
       )
       VALUES (
-        $1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-        $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24::jsonb, $25,
-        'pending', NULL, $26, $26
+        $1::uuid, $2::uuid, $3, $4, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+        $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25::jsonb, $26,
+        'pending', NULL, $27, $27
       )
-      ON CONFLICT (pipeline_id, source_key) DO UPDATE SET
+      ON CONFLICT (pipeline_id, identity_key) DO UPDATE SET
         organization_id = EXCLUDED.organization_id,
         suitecrm_id = COALESCE(crm_contacts.suitecrm_id, EXCLUDED.suitecrm_id),
-        source_sheet_id = EXCLUDED.source_sheet_id,
-        source_row_number = EXCLUDED.source_row_number,
+        source_key = EXCLUDED.source_key,
+        source_sheet_id = COALESCE(EXCLUDED.source_sheet_id, crm_contacts.source_sheet_id),
+        source_row_number = COALESCE(EXCLUDED.source_row_number, crm_contacts.source_row_number),
         priority = EXCLUDED.priority,
         first_name = EXCLUDED.first_name,
         last_name = EXCLUDED.last_name,
@@ -330,7 +428,7 @@ async function stageContact(client: PoolClient, input: StageContactInput, suiteC
       RETURNING id::text, suitecrm_id
     `,
     [
-      input.pipelineId, fields.organizationId || null, suiteCrmId, input.sourceKey, input.sourceSheetId || null,
+      input.pipelineId, fields.organizationId || null, suiteCrmId, identityKey, input.sourceSheetId || null,
       input.sourceRowNumber || null, nullable(fields.priority), nullable(fields.firstName), nullable(fields.lastName),
       clean(fields.fullName), nullable(fields.contactType), nullable(fields.accountManager), nullable(fields.jobTitle),
       nullable(fields.email), nullable(fields.linkedinUrl), nullable(fields.phoneWork), nullable(fields.phoneMobile),
@@ -436,15 +534,22 @@ async function stageInteraction(client: PoolClient, input: StageInteractionInput
 }
 
 export async function stageCrmRecordInPostgres(input: StageCrmRecordInput) {
-  const sourceKey = clean(input.sourceKey)
+  const identityKey = input.entity === 'organizations'
+    ? organizationIdentityKey(input.fields)
+    : input.entity === 'contacts'
+      ? contactIdentityKey(input.fields)
+      : null
+  const sourceKey = identityKey || clean(input.sourceKey)
   if (!sourceKey || sourceKey.length > 500) throw new Error('CRM source key is invalid')
-  const suiteCrmId = stableSuiteCrmId(input.pipelineId, input.entity, sourceKey)
+  const suiteCrmId = input.entity === 'organizations' && input.fields.workspaceOrganizationId
+    ? stableGlobalSuiteCrmId(input.entity, sourceKey)
+    : stableSuiteCrmId(input.pipelineId, input.entity, sourceKey)
   const sourceHash = crmSourceHash({ fields: input.fields, sourcePayload: input.sourcePayload || {} })
   return withTransaction(async (client) => {
     const row = input.entity === 'organizations'
-      ? await stageOrganization(client, input, suiteCrmId, sourceHash)
+      ? await stageOrganization(client, input, suiteCrmId, sourceHash, sourceKey)
       : input.entity === 'contacts'
-        ? await stageContact(client, input, suiteCrmId, sourceHash)
+        ? await stageContact(client, input, suiteCrmId, sourceHash, sourceKey)
         : input.entity === 'opportunities'
           ? await stageOpportunity(client, input, suiteCrmId, sourceHash)
           : await stageInteraction(client, input, suiteCrmId, sourceHash)
@@ -458,9 +563,113 @@ export async function stageCrmRecordInPostgres(input: StageCrmRecordInput) {
   })
 }
 
+export async function ensurePipelineCrmHierarchy(input: {
+  pipelineId: string
+  actorEmail: string
+}) {
+  const pipelineResult = await query<{
+    owner_email: string
+    workspace_organization_id: string | null
+  }>(
+    `SELECT owner_email, workspace_organization_id::text
+     FROM pipeline_spaces
+     WHERE id = $1::uuid
+     LIMIT 1`,
+    [input.pipelineId],
+  )
+  const pipeline = pipelineResult.rows[0]
+  if (!pipeline) throw new Error('Pipeline was not found')
+
+  let workspaceOrganizationId = pipeline.workspace_organization_id
+  if (!workspaceOrganizationId) {
+    const organization = await ensurePrimaryWorkspaceOrganization(pipeline.owner_email)
+    workspaceOrganizationId = organization.id
+    await query(
+      `UPDATE pipeline_spaces
+       SET workspace_organization_id = $2::uuid, updated_at = now()
+       WHERE id = $1::uuid`,
+      [input.pipelineId, workspaceOrganizationId],
+    )
+  }
+
+  const lineage = await workspaceOrganizationAncestors(workspaceOrganizationId)
+  if (lineage.length === 0) throw new Error('Pipeline organization hierarchy was not found')
+  const staged: Array<{
+    id: string
+    suiteCrmId: string
+    workspaceOrganizationId: string
+    name: string
+  }> = []
+  let parent: { id: string; suiteCrmId: string } | null = null
+  for (const organization of lineage) {
+    const row = await stageCrmRecordInPostgres({
+      entity: 'organizations',
+      pipelineId: input.pipelineId,
+      sourceKey: `workspace:${organization.id}`,
+      actorEmail: input.actorEmail,
+      sourcePayload: { source: 'clawpilot_workspace', workspaceOrganizationId: organization.id },
+      fields: {
+        name: organization.name,
+        workspaceOrganizationId: organization.id,
+        parentOrganizationId: parent?.id || null,
+        parentOrganizationSuiteCrmId: parent?.suiteCrmId || null,
+        relationshipType: organization.organizationType === 'root' ? 'workspace_root' : 'workspace_member',
+        accountType: organization.organizationType === 'root' ? 'Parent organization' : 'Member organization',
+      },
+    })
+    parent = row
+    staged.push({ ...row, workspaceOrganizationId: organization.id, name: organization.name })
+  }
+  const customerParent = staged[staged.length - 1]
+  const customers = await query<Record<string, unknown>>(
+    `SELECT *
+     FROM crm_organizations
+     WHERE pipeline_id = $1::uuid
+       AND relationship_type = 'customer'
+       AND parent_organization_id IS DISTINCT FROM $2::uuid`,
+    [input.pipelineId, customerParent.id],
+  )
+  for (const customer of customers.rows) {
+    await stageCrmRecordInPostgres({
+      entity: 'organizations',
+      pipelineId: input.pipelineId,
+      localId: String(customer.id),
+      sourceKey: String(customer.source_key),
+      sourceSheetId: nullable(customer.source_sheet_id),
+      sourceRowNumber: customer.source_row_number === null ? null : Number(customer.source_row_number),
+      sourcePayload: customer.source_payload as Record<string, unknown>,
+      actorEmail: input.actorEmail,
+      fields: {
+        parentOrganizationId: customerParent.id,
+        parentOrganizationSuiteCrmId: customerParent.suiteCrmId,
+        relationshipType: 'customer',
+        priority: clean(customer.priority),
+        name: clean(customer.name),
+        accountType: clean(customer.account_type),
+        accountManager: clean(customer.account_manager),
+        website: clean(customer.website),
+        linkedinUrl: clean(customer.linkedin_url),
+        phone: clean(customer.phone),
+        address: clean(customer.billing_address_street),
+        city: clean(customer.billing_address_city),
+        state: clean(customer.billing_address_state),
+        postalCode: clean(customer.billing_address_postal_code),
+        country: clean(customer.billing_address_country),
+        description: clean(customer.description),
+      },
+    })
+  }
+  return { lineage: staged, customerParent }
+}
+
 function organizationFromRow(row: Record<string, unknown>): CrmOrganization {
   return {
-    id: String(row.id), pipelineId: String(row.pipeline_id), suiteCrmId: nullable(row.suitecrm_id),
+    id: String(row.id), pipelineId: String(row.pipeline_id),
+    parentOrganizationId: nullable(row.parent_organization_id),
+    parentOrganizationName: clean(row.parent_organization_name),
+    workspaceOrganizationId: nullable(row.workspace_organization_id),
+    relationshipType: (row.relationship_type || 'customer') as CrmOrganization['relationshipType'],
+    suiteCrmId: nullable(row.suitecrm_id),
     sourceKey: String(row.source_key), sourceRowNumber: row.source_row_number === null ? null : Number(row.source_row_number),
     priority: clean(row.priority), name: clean(row.name), accountType: clean(row.account_type), accountManager: clean(row.account_manager),
     website: clean(row.website), linkedinUrl: clean(row.linkedin_url), phone: clean(row.phone), address: clean(row.billing_address_street),
@@ -517,9 +726,17 @@ export async function listCrmRecordsInPostgres(input: {
   const limit = Math.max(1, Math.min(Math.trunc(Number(input.limit) || 250), 1000))
   if (input.entity === 'organizations') {
     const result = await query<Record<string, unknown>>(
-      `SELECT * FROM crm_organizations
-       WHERE pipeline_id = $1::uuid AND ($2 = '' OR name ILIKE '%' || $2 || '%' OR account_type ILIKE '%' || $2 || '%')
-       ORDER BY name, id LIMIT $3`,
+      `SELECT organization.*, parent.name AS parent_organization_name
+       FROM crm_organizations organization
+       LEFT JOIN crm_organizations parent ON parent.id = organization.parent_organization_id
+       WHERE organization.pipeline_id = $1::uuid
+         AND ($2 = '' OR organization.name ILIKE '%' || $2 || '%'
+           OR organization.account_type ILIKE '%' || $2 || '%'
+           OR parent.name ILIKE '%' || $2 || '%')
+       ORDER BY
+         CASE organization.relationship_type WHEN 'workspace_root' THEN 0 WHEN 'workspace_member' THEN 1 ELSE 2 END,
+         organization.name, organization.id
+       LIMIT $3`,
       [input.pipelineId, search, limit],
     )
     return result.rows.map(organizationFromRow)
@@ -594,7 +811,10 @@ export async function readCrmRecordReference(input: {
   const result = await query<Record<string, unknown>>(
     `SELECT id::text, source_key, suitecrm_id,
        COALESCE(to_jsonb(record)->>'name', to_jsonb(record)->>'full_name', to_jsonb(record)->>'subject') AS display_name,
-       COALESCE(to_jsonb(record)->>'organization_name', '') AS organization_name
+       COALESCE(to_jsonb(record)->>'organization_name', '') AS organization_name,
+       to_jsonb(record)->>'workspace_organization_id' AS workspace_organization_id,
+       to_jsonb(record)->>'parent_organization_id' AS parent_organization_id,
+       COALESCE(to_jsonb(record)->>'relationship_type', '') AS relationship_type
      FROM ${table} record WHERE pipeline_id = $1::uuid AND id = $2::uuid LIMIT 1`,
     [input.pipelineId, input.id],
   )
@@ -606,6 +826,9 @@ export async function readCrmRecordReference(input: {
     suiteCrmId: nullable(row.suitecrm_id),
     name: clean(row.display_name),
     organizationName: clean(row.organization_name),
+    workspaceOrganizationId: nullable(row.workspace_organization_id),
+    parentOrganizationId: nullable(row.parent_organization_id),
+    relationshipType: clean(row.relationship_type),
   }
 }
 
@@ -625,24 +848,31 @@ export async function claimSuiteCrmOutboxInPostgres(input: { limit?: number; max
     const result = await client.query<Record<string, unknown>>(
       `WITH candidates AS (
          SELECT id FROM sync_outbox
-         WHERE target_system = 'suitecrm' AND operation = 'upsert_record'
+         WHERE target_system = 'suitecrm' AND operation IN ('upsert_record', 'delete_record')
            AND status IN ('queued', 'failed') AND attempts < $1 AND available_at <= now()
          ORDER BY available_at, created_at FOR UPDATE SKIP LOCKED LIMIT $2
        )
        UPDATE sync_outbox outbox SET status = 'processing', attempts = outbox.attempts + 1,
          locked_at = now(), lock_token = $3, updated_at = now()
        FROM candidates WHERE outbox.id = candidates.id
-       RETURNING outbox.id::text, outbox.aggregate_type, outbox.aggregate_id, outbox.payload, outbox.attempts, outbox.lock_token`,
+       RETURNING outbox.id::text, outbox.aggregate_type, outbox.aggregate_id, outbox.operation,
+         outbox.payload, outbox.attempts, outbox.lock_token`,
       [maxAttempts, limit, lockToken],
     )
     for (const row of result.rows) {
       const entity = String(row.aggregate_type).replace(/^crm_/, '') as CrmEntity
       const table = ENTITY_TABLE[entity]
-      if (table) await client.query(`UPDATE ${table} SET sync_status = 'syncing', sync_error = NULL, updated_at = now() WHERE id = $1::uuid`, [row.aggregate_id])
+      if (table && row.operation === 'upsert_record') {
+        await client.query(
+          `UPDATE ${table} SET sync_status = 'syncing', sync_error = NULL, updated_at = now() WHERE id = $1::uuid`,
+          [row.aggregate_id],
+        )
+      }
     }
     return result.rows.map((row) => ({
       id: String(row.id), aggregateType: String(row.aggregate_type), aggregateId: String(row.aggregate_id),
-      payload: row.payload as SuiteCrmOutboxRecord, attempts: Number(row.attempts), lockToken: String(row.lock_token),
+      operation: row.operation as CrmOutboxItem['operation'], payload: row.payload as SuiteCrmOutboxRecord,
+      attempts: Number(row.attempts), lockToken: String(row.lock_token),
     } satisfies CrmOutboxItem))
   })
 }
@@ -662,7 +892,7 @@ export async function completeSuiteCrmOutboxInPostgres(item: CrmOutboxItem) {
     )
     if (!completed.rows[0]) throw new Error('SuiteCRM outbox lease was lost')
     const table = tableForAggregate(item.aggregateType)
-    if (table) {
+    if (table && item.operation === 'upsert_record') {
       await client.query(
         `UPDATE ${table} SET sync_status = 'synced', sync_error = NULL, suitecrm_synced_at = now(), updated_at = now() WHERE id = $1::uuid`,
         [item.aggregateId],
@@ -671,6 +901,11 @@ export async function completeSuiteCrmOutboxInPostgres(item: CrmOutboxItem) {
         `UPDATE pipeline_spaces SET crm_last_synced_at = now(), updated_at = now()
          WHERE id = (SELECT pipeline_id FROM ${table} WHERE id = $1::uuid)`,
         [item.aggregateId],
+      )
+    } else if (item.operation === 'delete_record') {
+      await client.query(
+        `UPDATE pipeline_spaces SET crm_last_synced_at = now(), updated_at = now() WHERE id = $1::uuid`,
+        [item.payload.pipelineId],
       )
     }
   })
@@ -691,7 +926,7 @@ export async function failSuiteCrmOutboxInPostgres(input: { item: CrmOutboxItem;
     )
     if (!result.rows[0]) throw new Error('SuiteCRM outbox lease was lost')
     const table = tableForAggregate(input.item.aggregateType)
-    if (table) {
+    if (table && input.item.operation === 'upsert_record') {
       await client.query(`UPDATE ${table} SET sync_status = 'failed', sync_error = $2, updated_at = now() WHERE id = $1::uuid`, [input.item.aggregateId, message])
     }
     return result.rows[0].status

@@ -19,12 +19,42 @@ require_value() {
   fi
 }
 
-for name in SUITECRM_DB_HOST SUITECRM_DB_PORT SUITECRM_DB_NAME SUITECRM_DB_USER SUITECRM_DB_PASSWORD SUITECRM_SITE_URL SUITECRM_ADMIN_USER; do
+for name in SUITECRM_DB_HOST SUITECRM_DB_PORT SUITECRM_DB_NAME SUITECRM_DB_USER SUITECRM_DB_PASSWORD SUITECRM_PUBLIC_URL SUITECRM_ADMIN_USER; do
   require_value "$name"
 done
 require_value SUITECRM_ADMIN_PASSWORD 16
 require_value SUITECRM_CLIENT_ID 36
 require_value SUITECRM_CLIENT_SECRET 32
+
+SUITECRM_PUBLIC_HOST="$(php <<'PHP'
+<?php
+$value = getenv('SUITECRM_PUBLIC_URL') ?: '';
+$parts = parse_url($value);
+$host = is_array($parts) ? ($parts['host'] ?? '') : '';
+$port = is_array($parts) ? ($parts['port'] ?? null) : null;
+$origin = 'https://' . $host . ($port !== null ? ':' . $port : '');
+$valid = filter_var($value, FILTER_VALIDATE_URL) !== false
+    && is_array($parts)
+    && ($parts['scheme'] ?? '') === 'https'
+    && $host !== ''
+    && $host === strtolower($host)
+    && !array_key_exists('user', $parts)
+    && !array_key_exists('pass', $parts)
+    && !array_key_exists('path', $parts)
+    && !array_key_exists('query', $parts)
+    && !array_key_exists('fragment', $parts)
+    && $port !== 443
+    && hash_equals($origin, $value);
+
+if (!$valid) {
+    fwrite(STDERR, "[suitecrm] SUITECRM_PUBLIC_URL must be an exact pathless HTTPS origin\n");
+    exit(1);
+}
+
+fwrite(STDOUT, $host);
+PHP
+)"
+export SUITECRM_PUBLIC_HOST
 
 if [[ ! -f "$VERSION_MARKER" ]]; then
   if [[ -e "$APP_ROOT/public/legacy/config.php" ]]; then
@@ -57,8 +87,79 @@ if [[ ! -e "$APP_ROOT/public/legacy/config.php" ]]; then
     -u \"$SUITECRM_ADMIN_USER\" -p \"$SUITECRM_ADMIN_PASSWORD\" \
     -U \"$SUITECRM_DB_USER\" -P \"$SUITECRM_DB_PASSWORD\" \
     -H \"$SUITECRM_DB_HOST\" -Z \"$SUITECRM_DB_PORT\" -N \"$SUITECRM_DB_NAME\" \
-    -S \"$SUITECRM_SITE_URL\" -d no -W true"
+    -S \"$SUITECRM_PUBLIC_URL\" -d no -W true"
 fi
+
+SUITECRM_CONFIG_PATH="$APP_ROOT/public/legacy/config_override.php" php <<'PHP'
+<?php
+declare(strict_types=1);
+
+function runtimeConfigFailure(string $message): never
+{
+    fwrite(STDERR, "[suitecrm] {$message}\n");
+    exit(1);
+}
+
+$configPath = getenv('SUITECRM_CONFIG_PATH') ?: '';
+$publicUrl = getenv('SUITECRM_PUBLIC_URL') ?: '';
+$publicHost = getenv('SUITECRM_PUBLIC_HOST') ?: '';
+if ($configPath === '' || $publicUrl === '' || $publicHost === '') {
+    runtimeConfigFailure('runtime URL configuration is incomplete');
+}
+
+$existing = is_file($configPath) ? file_get_contents($configPath) : "<?php\n\n?>\n";
+if ($existing === false || !preg_match('/^\s*<\?php\b/', $existing)) {
+    runtimeConfigFailure('persisted config_override.php is not a readable PHP configuration file');
+}
+
+$startMarker = '/***CLAWPILOT_RUNTIME_BEGIN***/';
+$endMarker = '/***CLAWPILOT_RUNTIME_END***/';
+$managedBlockCount = substr_count($existing, $startMarker);
+if ($managedBlockCount !== substr_count($existing, $endMarker)) {
+    runtimeConfigFailure('persisted config_override.php contains an incomplete ClawPilot runtime block');
+}
+
+$pattern = '/\R?\/\*\*\*CLAWPILOT_RUNTIME_BEGIN\*\*\*\/.*?\/\*\*\*CLAWPILOT_RUNTIME_END\*\*\*\/\R?/s';
+$base = preg_replace($pattern, "\n", $existing, -1, $removedBlockCount);
+if ($base === null || $removedBlockCount !== $managedBlockCount) {
+    runtimeConfigFailure('persisted config_override.php contains a malformed ClawPilot runtime block');
+}
+
+$closeTag = strrpos($base, '?>');
+if ($closeTag === false) {
+    $prefix = rtrim($base);
+} else {
+    if (trim(substr($base, $closeTag + 2)) !== '') {
+        runtimeConfigFailure('persisted config_override.php has content after its closing PHP tag');
+    }
+    $prefix = rtrim(substr($base, 0, $closeTag));
+}
+
+$trustedHosts = [
+    '^' . preg_quote($publicHost, '/') . '$',
+    '^suitecrm\\.railway\\.internal$',
+];
+$managed = $startMarker . "\n"
+    . '$sugar_config[\'site_url\'] = ' . var_export($publicUrl, true) . ";\n"
+    . '$sugar_config[\'trusted_hosts\'] = ' . var_export($trustedHosts, true) . ";\n"
+    . $endMarker;
+$updated = $prefix . "\n\n" . $managed . "\n?>\n";
+
+$directory = dirname($configPath);
+$temporary = tempnam($directory, '.clawpilot-config-');
+if ($temporary === false) runtimeConfigFailure('could not create a temporary SuiteCRM configuration file');
+
+if (
+    file_put_contents($temporary, $updated, LOCK_EX) === false
+    || !chmod($temporary, 0640)
+    || !chown($temporary, 'www-data')
+    || !chgrp($temporary, 'www-data')
+    || !rename($temporary, $configPath)
+) {
+    @unlink($temporary);
+    runtimeConfigFailure('could not atomically replace SuiteCRM runtime configuration');
+}
+PHP
 
 KEY_DIR="$APP_ROOT/public/legacy/Api/V8/OAuth2"
 mkdir -p "$KEY_DIR"

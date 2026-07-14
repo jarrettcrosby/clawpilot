@@ -18,6 +18,32 @@ export function stableSuiteCrmId(pipelineId: string, entity: string, sourceKey: 
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
 }
 
+export function stableGlobalSuiteCrmId(entity: string, identityKey: string) {
+  return stableSuiteCrmId('global', entity, identityKey)
+}
+
+export function normalizedCrmIdentityText(value: unknown) {
+  return String(value ?? '').trim().toLowerCase().replace(/\s+/g, ' ')
+}
+
+export function organizationIdentityKey(input: {
+  name: unknown
+  workspaceOrganizationId?: string | null
+}) {
+  if (input.workspaceOrganizationId) return `workspace:${input.workspaceOrganizationId}`
+  return `customer:name:${normalizedCrmIdentityText(input.name)}`
+}
+
+export function contactIdentityKey(input: {
+  email?: unknown
+  fullName: unknown
+  organizationId?: string | null
+}) {
+  const email = normalizedCrmIdentityText(input.email)
+  if (email) return `contact:email:${email}`
+  return `contact:name:${normalizedCrmIdentityText(input.fullName)}:organization:${input.organizationId || 'none'}`
+}
+
 export function crmSourceHash(value: unknown) {
   return crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex')
 }

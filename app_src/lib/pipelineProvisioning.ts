@@ -47,6 +47,7 @@ const TAB_HEADERS: Record<(typeof EXPECTED_TABS)[number], string[]> = {
   Organizations: [
     'Priority', 'Organization', 'Owner', 'Type', 'Status', 'Industry',
     'Website', 'Phone', 'Address', 'City', 'State', 'Notes',
+    'Parent Organization', 'Relationship',
   ],
   Contacts: [
     'Priority', 'Contact', 'Owner', 'Organization', 'Title', 'Email',

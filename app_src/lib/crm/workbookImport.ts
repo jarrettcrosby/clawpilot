@@ -3,6 +3,7 @@ import { googleSheetsJson, type GoogleWorkspaceRuntime } from '@/lib/integration
 import { matonFetch } from '@/lib/maton'
 import {
   beginCrmSyncRun,
+  ensurePipelineCrmHierarchy,
   finishCrmSyncRun,
   stageCrmRecordInPostgres,
 } from '@/lib/persistence/crm'
@@ -131,6 +132,27 @@ function sourceKey(sheetId: string, tab: ImportTab, record: SourceRecord) {
   return pick(record, 'ClawPilot Record ID') || `sheet:${sheetId}:${tab.toLowerCase()}:${record.rowNumber}`
 }
 
+function uniqueSourceRecords(records: SourceRecord[], identity: (record: SourceRecord) => string) {
+  const unique = new Map<string, SourceRecord>()
+  for (const record of records) {
+    const key = identity(record)
+    if (key) unique.set(key, record)
+  }
+  return [...unique.values()]
+}
+
+function organizationSourceIdentity(record: SourceRecord) {
+  return normalizedName(pick(record, 'Name', 'Organization', 'Organization Name'))
+}
+
+function contactSourceIdentity(record: SourceRecord) {
+  const email = normalizedName(pick(record, 'Email', 'Email Address'))
+  if (email) return `email:${email}`
+  const name = normalizedName(pick(record, 'Name', 'Contact', 'Contact Name', 'Full Name', 'Full Name (First, Last)'))
+  const organization = normalizedName(pick(record, 'Organization', 'Account', 'Company'))
+  return name ? `name:${name}:organization:${organization || 'none'}` : ''
+}
+
 export async function importCrmWorkbook(input: {
   context: PipelineSheetContext
   actorEmail: string
@@ -145,20 +167,51 @@ export async function importCrmWorkbook(input: {
   })
   const counts = { organizations: 0, contacts: 0, opportunities: 0, interactions: 0 }
   try {
-    const { tabs, counts: sourceCounts } = await inspectCrmWorkbook(input.context)
+    const { tabs } = await inspectCrmWorkbook(input.context)
+    const importTabs = {
+      ...tabs,
+      Organizations: uniqueSourceRecords(tabs.Organizations, organizationSourceIdentity),
+      Contacts: uniqueSourceRecords(tabs.Contacts, contactSourceIdentity),
+    }
+    const sourceCounts = Object.fromEntries(
+      TABS.map((tab) => [tab.toLowerCase(), importTabs[tab].length]),
+    ) as Record<string, number>
+    const duplicatesSkipped = {
+      organizations: tabs.Organizations.length - importTabs.Organizations.length,
+      contacts: tabs.Contacts.length - importTabs.Contacts.length,
+    }
+    const hierarchy = await ensurePipelineCrmHierarchy({
+      pipelineId: input.context.pipelineId,
+      actorEmail: input.actorEmail,
+    })
     const organizations = new Map<string, { id: string; suiteCrmId: string }>()
     const contacts = new Map<string, { id: string; suiteCrmId: string }>()
     const opportunities = new Map<string, { id: string; suiteCrmId: string }>()
 
-    for (const record of tabs.Organizations) {
+    for (const organization of hierarchy.lineage) {
+      organizations.set(normalizedName(organization.name), {
+        id: organization.id,
+        suiteCrmId: organization.suiteCrmId,
+      })
+    }
+
+    for (const record of importTabs.Organizations) {
       const name = pick(record, 'Name', 'Organization', 'Organization Name')
       if (!name) continue
+      const hierarchyOrganization = organizations.get(normalizedName(name))
+      if (hierarchyOrganization) {
+        counts.organizations += 1
+        continue
+      }
       const staged = await stageCrmRecordInPostgres({
         entity: 'organizations', pipelineId: input.context.pipelineId,
         sourceKey: sourceKey(input.context.sheetId, 'Organizations', record),
         sourceSheetId: input.context.sheetId, sourceRowNumber: record.rowNumber,
         sourcePayload: record.raw, actorEmail: input.actorEmail,
         fields: {
+          parentOrganizationId: hierarchy.customerParent.id,
+          parentOrganizationSuiteCrmId: hierarchy.customerParent.suiteCrmId,
+          relationshipType: 'customer',
           priority: pick(record, 'Priority'), name,
           accountType: pick(record, 'Type', 'Account Type'),
           accountManager: pick(record, 'Acct. Manager', 'Account Manager', 'Owner'),
@@ -173,7 +226,7 @@ export async function importCrmWorkbook(input: {
       counts.organizations += 1
     }
 
-    for (const record of tabs.Contacts) {
+    for (const record of importTabs.Contacts) {
       const fullName = pick(record, 'Name', 'Contact', 'Contact Name', 'Full Name', 'Full Name (First, Last)')
       if (!fullName) continue
       const organizationName = pick(record, 'Organization', 'Account', 'Company')
@@ -204,7 +257,7 @@ export async function importCrmWorkbook(input: {
       counts.contacts += 1
     }
 
-    for (const record of tabs.Opportunities) {
+    for (const record of importTabs.Opportunities) {
       const name = pick(record, 'Name', 'Opportunity', 'Opportunity Name')
       const organizationName = pick(record, 'Organization', 'Account', 'Company')
       if (!name || !organizationName) continue
@@ -227,7 +280,7 @@ export async function importCrmWorkbook(input: {
       counts.opportunities += 1
     }
 
-    for (const record of tabs.Interactions) {
+    for (const record of importTabs.Interactions) {
       const interactionType = pick(record, 'Interaction', 'Type', 'Interaction Type')
       const notes = pick(record, 'Notes', 'Description')
       const subject = pick(record, 'Subject', 'Name') || interactionType || notes.slice(0, 100) || `Interaction ${record.rowNumber}`
@@ -261,7 +314,12 @@ export async function importCrmWorkbook(input: {
       throw new Error(`CRM workbook import was incomplete (${incomplete.join(', ')})`)
     }
     await finishCrmSyncRun({ id: runId, status: 'succeeded', counts })
-    return { runId, counts, queued: Object.values(counts).reduce((total, value) => total + value, 0) }
+    return {
+      runId,
+      counts,
+      duplicatesSkipped,
+      queued: Object.values(counts).reduce((total, value) => total + value, 0) + hierarchy.lineage.length,
+    }
   } catch (error) {
     await finishCrmSyncRun({
       id: runId,

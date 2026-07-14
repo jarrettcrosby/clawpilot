@@ -68,6 +68,8 @@ type AppUser = {
   status: UserStatus
   displayName: string | null
   jobTitle: string | null
+  organizationId: string | null
+  organizationName: string | null
   timezone: string
   locale: string
   permissions: UserPermissions
@@ -130,6 +132,7 @@ type WorkspacesPayload = ApiPayload & {
 type ProfileForm = {
   displayName: string
   jobTitle: string
+  organizationName: string
   timezone: string
   locale: string
 }
@@ -142,6 +145,7 @@ type ShareDraft = {
 const EMPTY_PROFILE: ProfileForm = {
   displayName: '',
   jobTitle: '',
+  organizationName: '',
   timezone: 'America/New_York',
   locale: 'en-US',
 }
@@ -229,6 +233,7 @@ function profileFrom(user: AppUser): ProfileForm {
   return {
     displayName: user.displayName || '',
     jobTitle: user.jobTitle || '',
+    organizationName: user.organizationName || '',
     timezone: user.timezone || 'America/New_York',
     locale: user.locale || 'en-US',
   }
@@ -324,6 +329,7 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
   const profileDirty = currentUser
     ? profile.displayName.trim() !== persistedProfile.displayName
       || profile.jobTitle.trim() !== persistedProfile.jobTitle
+      || profile.organizationName.trim() !== persistedProfile.organizationName
       || profile.timezone !== persistedProfile.timezone
       || profile.locale !== persistedProfile.locale
     : false
@@ -439,7 +445,7 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
 
   async function saveProfile(event: FormEvent) {
     event.preventDefault()
-    if (busy || !profile.displayName.trim()) return
+    if (busy || !profile.displayName.trim() || !profile.organizationName.trim()) return
     startAction('profile')
     try {
       const result = await requestJson<UserMutationPayload>('/api/users', {
@@ -449,6 +455,7 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
           action: 'profile',
           displayName: profile.displayName.trim(),
           jobTitle: profile.jobTitle.trim(),
+          organizationName: profile.organizationName.trim(),
           timezone: profile.timezone,
           locale: profile.locale,
         }),
@@ -826,6 +833,17 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
                     sx={fieldSx}
                   />
                   <TextField
+                    required
+                    size="small"
+                    label="Organization name"
+                    value={profile.organizationName}
+                    onChange={(event) => setProfile((current) => ({ ...current, organizationName: event.target.value }))}
+                    disabled={busy}
+                    autoComplete="organization"
+                    inputProps={{ maxLength: 200 }}
+                    sx={{ ...fieldSx, gridColumn: { sm: '1 / -1' } }}
+                  />
+                  <TextField
                     select
                     size="small"
                     label="Timezone"
@@ -861,7 +879,7 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
                     type="submit"
                     variant="contained"
                     startIcon={pendingAction === 'profile' ? <CircularProgress size={16} color="inherit" /> : <SaveRounded />}
-                    disabled={busy || !profile.displayName.trim() || !profileDirty}
+                    disabled={busy || !profile.displayName.trim() || !profile.organizationName.trim() || !profileDirty}
                     sx={compactButtonSx}
                   >
                     Save profile

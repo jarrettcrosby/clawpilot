@@ -13,6 +13,7 @@ import {
   type PipelineProjection,
 } from '@/lib/persistence/pipeline'
 import {
+  ensurePipelineCrmHierarchy,
   listCrmRecordsInPostgres,
   readCrmSummaryFromPostgres,
   stageCrmRecordInPostgres,
@@ -101,6 +102,10 @@ function normalizedName(value: unknown) {
 
 async function stageOpportunityRows(input: PipelineSyncContext, opportunities: ReturnType<typeof mapOpportunity>[]) {
   if (!input.actorEmail) throw new Error('Signed-in user context is required for CRM synchronization')
+  const hierarchy = await ensurePipelineCrmHierarchy({
+    pipelineId: input.pipelineId,
+    actorEmail: input.actorEmail,
+  })
   const existingOrganizations = await listCrmRecordsInPostgres({
     pipelineId: input.pipelineId,
     entity: 'organizations',
@@ -120,7 +125,12 @@ async function stageOpportunityRows(input: PipelineSyncContext, opportunities: R
         sourceSheetId: input.sheetId,
         sourcePayload: { source: 'opportunities-sheet', organization: organizationName },
         actorEmail: input.actorEmail,
-        fields: { name: organizationName },
+        fields: {
+          name: organizationName,
+          parentOrganizationId: hierarchy.customerParent.id,
+          parentOrganizationSuiteCrmId: hierarchy.customerParent.suiteCrmId,
+          relationshipType: 'customer',
+        },
       })
       organization = {
         id: staged.id,
