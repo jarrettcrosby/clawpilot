@@ -94,6 +94,7 @@ export async function GET(req: NextRequest) {
               syncEnabled: selectedPipeline.syncEnabled,
               shortLinkUrl: selectedPipeline.shortLinkUrl,
               provisioningStatus: selectedPipeline.provisioningStatus,
+              provisioningError: selectedPipeline.provisioningError,
             } : null,
           })
         }

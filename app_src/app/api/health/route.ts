@@ -171,6 +171,7 @@ export async function GET() {
           managed_pipeline_resources_migration_applied: boolean
           crm_gateway_migration_applied: boolean
           crm_identity_hierarchy_migration_applied: boolean
+          pipeline_sheet_links_migration_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -281,6 +282,11 @@ export async function GET() {
                 FROM schema_migrations
                 WHERE filename = '0021_crm_identity_and_organization_hierarchy.sql'
               ) AS crm_identity_hierarchy_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0022_pipeline_sheet_access_links.sql'
+              ) AS pipeline_sheet_links_migration_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -314,6 +320,7 @@ export async function GET() {
             && row?.managed_pipeline_resources_migration_applied
             && row?.crm_gateway_migration_applied
             && row?.crm_identity_hierarchy_migration_applied
+            && row?.pipeline_sheet_links_migration_applied
             && row?.migration_checksums_present
           ),
         }
@@ -339,6 +346,7 @@ export async function GET() {
           || !row?.managed_pipeline_resources_migration_applied
           || !row?.crm_gateway_migration_applied
           || !row?.crm_identity_hierarchy_migration_applied
+          || !row?.pipeline_sheet_links_migration_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')

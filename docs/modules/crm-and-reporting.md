@@ -37,7 +37,7 @@ The managed workbook requires `Start Here`, `Organizations`, `Contacts`, `Opport
 
 Google protected ranges permit user edits only in `Opportunities!B5:M`. All other tabs, the opportunity headers, and record identifiers are generated and protected. `Calculations` and `Dashboard` derive reporting values from the projected CRM data.
 
-The pipeline and CRM surfaces expose the workbook through its ClawPilot short link. That link does not bypass Google access controls.
+The pipeline and CRM surfaces expose the workbook through its ClawPilot short link. The Pipeline header also creates, retries, or repairs the managed Sheet when the current owner has no usable link. That link does not bypass Google access controls.
 
 ## Synchronization
 

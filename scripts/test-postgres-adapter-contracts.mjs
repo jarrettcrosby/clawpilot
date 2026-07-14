@@ -151,6 +151,16 @@ for (const contract of [
   assertIncludes(crmIdentityHierarchyMigration, contract, 'CRM identity and organization hierarchy migration')
 }
 
+const pipelineSheetLinksMigration = read('db/migrations/0022_pipeline_sheet_access_links.sql')
+for (const contract of [
+  "'https://docs.google.com/spreadsheets/d/'",
+  "ARRAY['pipeline', 'google-sheet']",
+  "'pipeline.sheet_link.backfilled'",
+  'A ready pipeline is missing its Sheet short link',
+]) {
+  assertIncludes(pipelineSheetLinksMigration, contract, 'pipeline Sheet access-link migration')
+}
+
 const invitationAdapter = read('app_src/lib/invitations.ts')
 assertIncludes(invitationAdapter, 'requestInvitationAuthMagicCode', 'invitation adapter')
 assertIncludes(invitationAdapter, 'revoked_at IS NULL', 'invitation revocation contract')
@@ -253,6 +263,7 @@ assertIncludes(pipelineProvisioning, "corpora: 'drive'", 'Shared Drive scoped fi
 assertIncludes(pipelineProvisioning, "includeItemsFromAllDrives: 'true'", 'Shared Drive file inclusion')
 assertIncludes(pipelineProvisioning, "supportsAllDrives: 'true'", 'Shared Drive request support')
 assertIncludes(pipelineProvisioning, "idempotent: false", 'non-retried ambiguous Google creates')
+assertIncludes(pipelineProvisioning, 'ensurePipelineShortLink(pipeline, pipeline.sheetId)', 'ready pipeline Sheet-link repair')
 assertIncludes(pipelineProvisioning, "const EXPECTED_TABS", 'managed pipeline tab contract')
 assertIncludes(pipelineProvisioning, "range: `'${title}'!B4`", 'managed pipeline B4 headers')
 for (const tab of ['Start Here', 'Calculations', 'Dashboard']) {
@@ -323,6 +334,19 @@ const crmPunchoutRoute = read('app_src/app/api/crm/punchout/route.ts')
 assertIncludes(crmPunchoutRoute, "actor.role !== 'owner' && actor.role !== 'admin'", 'admin-only native CRM punchout')
 assertIncludes(crmPunchoutRoute, 'suiteCrmPublicUrl()', 'validated native CRM destination')
 assertIncludes(crmPunchoutRoute, "'Cache-Control': 'no-store'", 'native CRM punchout cache boundary')
+
+const crmRoute = read('app_src/app/api/crm/route.ts')
+assertIncludes(crmRoute, 'suiteCrmAdminUsername()', 'admin native CRM username guidance')
+assertIncludes(crmRoute, 'suiteCrmAdminPortalUrl()', 'admin native CRM password-management link')
+
+const crmUi = read('app_src/components/crm/CrmSection.tsx')
+assertIncludes(crmUi, 'SuiteCRM sign in', 'native CRM access dialog')
+assertIncludes(crmUi, 'SUITECRM_ADMIN_PASSWORD', 'native CRM protected password guidance')
+
+const pipelineUi = read('app_src/components/pipeline/PipelineSection.tsx')
+assertIncludes(pipelineUi, 'Open Sheet', 'pipeline Sheet command')
+assertIncludes(pipelineUi, 'Create Sheet', 'pipeline Sheet setup command')
+assertIncludes(pipelineUi, 'Restore Sheet Link', 'pipeline Sheet-link repair command')
 
 const crmHierarchyRoute = read('app_src/app/api/crm/hierarchy/route.ts')
 assertIncludes(crmHierarchyRoute, 'updateWorkspaceOrganizationParent', 'admin-managed organization hierarchy')
@@ -397,6 +421,8 @@ assertIncludes(googleWorkspaceClient, "cache: 'no-store'", 'native Google cache 
 assertIncludes(googleWorkspaceClient, 'readBoundedResponse', 'bounded Google response reading')
 assertIncludes(googleWorkspaceClient, "'/discovery/v1/apis/drive/v3/rest'", 'independent API key validation')
 assertIncludes(googleWorkspaceClient, 'validateGoogleServiceAccount', 'OAuth Drive service-account validation')
+assertIncludes(googleWorkspaceClient, 'clawpilot_google_sheets_api_probe', 'Google Sheets API access validation')
+assertIncludes(googleWorkspaceClient, 'GOOGLE_SHEETS_ACCESS_DENIED', 'actionable Google Sheets configuration error')
 assertIncludes(googleWorkspaceClient, 'capabilities(canAddChildren,canShare)', 'Shared Drive capability validation')
 assertIncludes(googleWorkspaceClient, 'GOOGLE_SHARED_DRIVE_INSUFFICIENT_ACCESS', 'actionable Shared Drive role error')
 assertIncludes(googleWorkspaceClient, 'nextPageToken', 'Shared Drive pagination')
@@ -453,6 +479,11 @@ assert.ok(
     < updateCredentialBody.indexOf('await writeGoogleWorkspaceCredentialInPostgres'),
   'service-account candidate must validate before persistence',
 )
+assert.ok(
+  updateCredentialBody.indexOf('validateGoogleSheetsAccess')
+    < updateCredentialBody.indexOf('await writeGoogleWorkspaceCredentialInPostgres'),
+  'Google Sheets access must validate before persistence',
+)
 assertIncludes(updateCredentialBody, ': current.apiKeySecret', 'untouched API key ciphertext preservation')
 assertIncludes(updateCredentialBody, ': current.serviceAccountSecret', 'untouched service-account ciphertext preservation')
 assertIncludes(
@@ -460,6 +491,7 @@ assertIncludes(
   'else if (input.setApiKey && effectiveServiceAccount)',
   'API key rotation must revalidate the stored service account and Shared Drive',
 )
+assertIncludes(pipelineProvisioning, 'await validateGoogleSheetsAccess(runtime)', 'pipeline Sheets preflight')
 
 const googleWorkspaceRoute = read('app_src/app/api/integrations/google-workspace/route.ts')
 assertIncludes(googleWorkspaceRoute, "actor.role !== 'owner'", 'owner-only Google Workspace administration')
@@ -563,6 +595,7 @@ assertIncludes(healthRoute, '0016_z_short_link_destination_preflight.sql', 'host
 assertIncludes(healthRoute, '0017_short_link_destination_hardening.sql', 'hosted short-link hardening migration health')
 assertIncludes(healthRoute, '0020_crm_gateway_and_reporting.sql', 'hosted CRM gateway migration health')
 assertIncludes(healthRoute, '0021_crm_identity_and_organization_hierarchy.sql', 'hosted CRM identity hierarchy migration health')
+assertIncludes(healthRoute, '0022_pipeline_sheet_access_links.sql', 'hosted pipeline Sheet access-link migration health')
 assertIncludes(healthRoute, 'readSuiteCrmWorkerHeartbeat', 'hosted SuiteCRM worker health')
 assertIncludes(healthRoute, 'migration_checksums_present', 'hosted migration checksum health')
 assertIncludes(healthRoute, 'queryAgentCredentials', 'shared agent credential store health')

@@ -9,6 +9,7 @@ import {
   stageCrmRecordInPostgres,
 } from '@/lib/persistence/crm'
 import { listWorkspaceOrganizationHierarchy } from '@/lib/organizations'
+import { suiteCrmAdminPortalUrl, suiteCrmAdminUsername } from '@/lib/crm/suiteCrmPublicUrl'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import { requireRequestUser } from '@/lib/requestUser'
 import {
@@ -66,6 +67,7 @@ export async function GET(req: NextRequest) {
     const actor = await requireRequestUser(req)
     const pipeline = await selectedPipeline(req, actor.email)
     const entity = entityValue(req.nextUrl.searchParams.get('entity') || 'organizations')
+    const canOpenSuiteCrm = actor.role === 'owner' || actor.role === 'admin'
     await ensurePipelineCrmHierarchy({ pipelineId: pipeline.id, actorEmail: actor.email })
     const [records, summary, workspaceHierarchy] = await Promise.all([
       listCrmRecordsInPostgres({
@@ -92,7 +94,9 @@ export async function GET(req: NextRequest) {
       },
       workspaceHierarchy,
       canManageHierarchy: actor.role === 'owner' || actor.role === 'admin',
-      suiteCrmPunchoutUrl: actor.role === 'owner' || actor.role === 'admin' ? '/api/crm/punchout' : null,
+      suiteCrmPunchoutUrl: canOpenSuiteCrm ? '/api/crm/punchout' : null,
+      suiteCrmUsername: canOpenSuiteCrm ? suiteCrmAdminUsername() : null,
+      suiteCrmAdminPortalUrl: canOpenSuiteCrm ? suiteCrmAdminPortalUrl() : null,
     })
   } catch (error) {
     return errorResponse(error)
