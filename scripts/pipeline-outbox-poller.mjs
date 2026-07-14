@@ -53,6 +53,7 @@ async function runLoop(name, path, limit, intervalMs) {
 
 await Promise.all([
   runLoop('pipeline-outbox', '/api/pipeline/sync/outbox/process', 10, pipelineIntervalMs),
+  runLoop('crm-outbox', '/api/crm/outbox/process', 10, pipelineIntervalMs),
   runLoop('agent-dispatch', '/api/agents/dispatch/process', 1, agentIntervalMs),
   runLoop('document-embeddings', '/api/docs/embeddings/process', 12, embeddingIntervalMs),
   runLoop('ai-radar', '/api/ai-radar/process', 1, radarIntervalMs),

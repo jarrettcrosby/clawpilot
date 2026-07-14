@@ -41,8 +41,8 @@ Keep user-owned Maton accounts separate from the platform Google Workspace crede
 
 - Provisioning is an explicit pipeline-owner command.
 - ClawPilot creates `ClawPilot Data/<environment>/Users/<email>/Pipelines/<pipeline>/` in the configured Shared Drive.
-- The private Sheet contains the Opportunities, Organizations, Contacts, Interactions, and Dropdowns tabs expected by the sync adapters.
-- Postgres remains the durable normalized projection, membership, audit, outbox, and conflict store. Google Sheets remains the writable operator table.
+- The private workbook contains the CRM input, generated entity projections, calculations, dashboard, and dropdown tabs expected by the sync adapters.
+- Postgres remains the durable normalized projection, membership, audit, outbox, and conflict store. Only the Opportunities table is writable; SuiteCRM owns the other CRM entities.
 - The generated short link resolves to the private Sheet but does not bypass Google permissions.
 - Pipeline sharing reconciles the managed folder to the exact ClawPilot membership: editors receive Google writer access, viewers receive reader access, and public, domain, group, or anyone permissions are rejected.
 - Existing owner-only legacy Sheets can continue through the legacy Maton path until migrated. New managed tenant pipelines never fall back to a global Maton credential.

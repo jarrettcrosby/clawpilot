@@ -31,13 +31,19 @@ import { normalizeUserEmail } from '@/lib/users'
 
 const DRIVE_FOLDER_MIME_TYPE = 'application/vnd.google-apps.folder'
 const SHEET_MIME_TYPE = 'application/vnd.google-apps.spreadsheet'
-const EXPECTED_TABS = ['Opportunities', 'Organizations', 'Contacts', 'Interactions', 'Dropdowns'] as const
+const EXPECTED_TABS = [
+  'Start Here',
+  'Organizations',
+  'Contacts',
+  'Opportunities',
+  'Interactions',
+  'Calculations',
+  'Dashboard',
+  'Dropdowns',
+] as const
 
 const TAB_HEADERS: Record<(typeof EXPECTED_TABS)[number], string[]> = {
-  Opportunities: [
-    'Priority', 'Opportunity', 'Owner', 'Organization', 'Status', 'Stage',
-    'Loss Reason', 'Source', 'Value', 'Probability', 'Expected Close', 'Notes',
-  ],
+  'Start Here': ['Section', 'Details'],
   Organizations: [
     'Priority', 'Organization', 'Owner', 'Type', 'Status', 'Industry',
     'Website', 'Phone', 'Address', 'City', 'State', 'Notes',
@@ -46,7 +52,13 @@ const TAB_HEADERS: Record<(typeof EXPECTED_TABS)[number], string[]> = {
     'Priority', 'Contact', 'Owner', 'Organization', 'Title', 'Email',
     'Phone', 'Status', 'Source', 'Last Contact', 'Next Action', 'Notes',
   ],
+  Opportunities: [
+    'Priority', 'Opportunity', 'Owner', 'Organization', 'Status', 'Stage',
+    'Loss Reason', 'Source', 'Value', 'Probability', 'Expected Close', 'Notes',
+  ],
   Interactions: ['Priority', 'Interaction', 'Owner', 'Agent', 'Date', 'Opportunity', 'Contact', 'Notes'],
+  Calculations: ['Metric', 'Value'],
+  Dashboard: ['Metric', 'Value'],
   Dropdowns: [
     'Priority', 'Type', 'Acct Manager', 'Stage', 'Loss Reason',
     'Source', 'Interaction', 'Status', 'State', 'Product',
@@ -79,7 +91,39 @@ type DrivePermission = {
 
 type SpreadsheetMetadata = {
   spreadsheetId?: string
-  sheets?: Array<{ properties?: { sheetId?: number; title?: string; index?: number } }>
+  sheets?: Array<{
+    properties?: { sheetId?: number; title?: string; index?: number }
+    protectedRanges?: Array<{ protectedRangeId?: number; description?: string }>
+  }>
+}
+
+const GENERATED_TABS = EXPECTED_TABS.filter((title) => title !== 'Opportunities')
+const IDENTIFIER_TABS = ['Organizations', 'Contacts', 'Opportunities', 'Interactions'] as const
+const PROTECTION_PREFIX = 'ClawPilot managed:'
+
+const INITIAL_TAB_ROWS: Partial<Record<(typeof EXPECTED_TABS)[number], unknown[][]>> = {
+  'Start Here': [
+    ['Opportunity updates', 'Edit rows on the Opportunities tab. ClawPilot syncs those changes into the CRM.'],
+    ['CRM records', 'Organizations, Contacts, and Interactions are generated from the CRM and are read-only here.'],
+    ['Reporting', 'Calculations and Dashboard are generated from the CRM projection.'],
+  ],
+  Calculations: [
+    ['Total opportunities', '=COUNTA(Opportunities!C5:C)'],
+    ['Open pipeline', '=SUMIFS(Opportunities!J5:J,Opportunities!F5:F,"<>Closed",Opportunities!F5:F,"<>Lost",Opportunities!F5:F,"<>Abandoned")'],
+    ['Weighted pipeline', '=SUMPRODUCT(Opportunities!J5:J,Opportunities!K5:K/100,--(Opportunities!F5:F<>"Closed"),--(Opportunities!F5:F<>"Lost"),--(Opportunities!F5:F<>"Abandoned"))'],
+    ['Won value', '=SUMIF(Opportunities!F5:F,"Won",Opportunities!J5:J)'],
+    ['Organizations', '=COUNTA(Organizations!C5:C)'],
+    ['Contacts', '=COUNTA(Contacts!C5:C)'],
+    ['Interactions', '=COUNTA(Interactions!C5:C)'],
+  ],
+  Dashboard: [
+    ['Open pipeline', '=Calculations!C6'],
+    ['Weighted pipeline', '=Calculations!C7'],
+    ['Won value', '=Calculations!C8'],
+    ['Opportunities', '=Calculations!C5'],
+    ['Organizations', '=Calculations!C9'],
+    ['Contacts', '=Calculations!C10'],
+  ],
 }
 
 export class PipelineProvisioningRequestError extends Error {
@@ -508,7 +552,7 @@ async function ensurePipelineSheet(
 async function spreadsheetMetadata(runtime: GoogleWorkspaceRuntime, sheetId: string) {
   const metadata = await googleSheetsJson<SpreadsheetMetadata>(
     runtime,
-    `/v4/spreadsheets/${sheetId}?fields=spreadsheetId,sheets.properties`,
+    `/v4/spreadsheets/${sheetId}?fields=spreadsheetId,sheets(properties,protectedRanges(protectedRangeId,description))`,
   )
   if (validResourceId(metadata.spreadsheetId, 'Managed pipeline Sheet ID') !== sheetId) {
     throw new PipelineProvisioningRequestError(
@@ -520,7 +564,7 @@ async function spreadsheetMetadata(runtime: GoogleWorkspaceRuntime, sheetId: str
   return metadata
 }
 
-async function configurePipelineTabs(runtime: GoogleWorkspaceRuntime, sheetId: string) {
+export async function configurePipelineTabs(runtime: GoogleWorkspaceRuntime, sheetId: string) {
   let metadata = await spreadsheetMetadata(runtime, sheetId)
   const current = metadata.sheets || []
   const currentTitles = new Set(current.map((sheet) => sheet.properties?.title).filter(Boolean))
@@ -552,34 +596,118 @@ async function configurePipelineTabs(runtime: GoogleWorkspaceRuntime, sheetId: s
     })
   }
 
-  metadata = await spreadsheetMetadata(runtime, sheetId)
-  const unexpected = (metadata.sheets || []).filter((sheet) => (
-    typeof sheet.properties?.sheetId === 'number'
-    && !EXPECTED_TABS.includes(sheet.properties?.title as (typeof EXPECTED_TABS)[number])
-  ))
-  if (unexpected.length > 0) {
-    await googleSheetsJson(runtime, `/v4/spreadsheets/${sheetId}:batchUpdate`, {
-      method: 'POST',
-      body: {
-        requests: unexpected.map((sheet) => ({ deleteSheet: { sheetId: sheet.properties?.sheetId } })),
-        includeSpreadsheetInResponse: false,
-      },
-      idempotent: false,
-    })
-  }
-
   await googleSheetsJson(runtime, `/v4/spreadsheets/${sheetId}/values:batchUpdate`, {
     method: 'POST',
     body: {
-      valueInputOption: 'RAW',
-      data: EXPECTED_TABS.map((title) => ({
-        range: `${title}!B4`,
+      valueInputOption: 'USER_ENTERED',
+      data: EXPECTED_TABS.flatMap((title) => [...(IDENTIFIER_TABS.includes(title as (typeof IDENTIFIER_TABS)[number]) ? [{
+        range: `'${title}'!A4`,
+        majorDimension: 'ROWS' as const,
+        values: [['ClawPilot Record ID']],
+      }] : []), {
+        range: `'${title}'!B4`,
         majorDimension: 'ROWS',
         values: [TAB_HEADERS[title]],
-      })),
+      }, ...(INITIAL_TAB_ROWS[title] ? [{
+        range: `'${title}'!B5`,
+        majorDimension: 'ROWS' as const,
+        values: INITIAL_TAB_ROWS[title],
+      }] : [])]),
     },
     idempotent: true,
   })
+
+  metadata = await spreadsheetMetadata(runtime, sheetId)
+  const managedSheets = (metadata.sheets || []).filter((sheet) => (
+    typeof sheet.properties?.sheetId === 'number'
+    && EXPECTED_TABS.includes(sheet.properties?.title as (typeof EXPECTED_TABS)[number])
+  ))
+  const formattingRequests: unknown[] = []
+  managedSheets.forEach((sheet) => {
+    const sheetIdValue = sheet.properties?.sheetId
+    const title = sheet.properties?.title as (typeof EXPECTED_TABS)[number]
+    if (sheetIdValue === undefined) return
+    for (const range of sheet.protectedRanges || []) {
+      if (range.protectedRangeId !== undefined && String(range.description || '').startsWith(PROTECTION_PREFIX)) {
+        formattingRequests.push({ deleteProtectedRange: { protectedRangeId: range.protectedRangeId } })
+      }
+    }
+    formattingRequests.push({
+      updateSheetProperties: {
+        properties: {
+          sheetId: sheetIdValue,
+          index: EXPECTED_TABS.indexOf(title),
+          gridProperties: { frozenRowCount: 4, frozenColumnCount: 1 },
+        },
+        fields: 'index,gridProperties.frozenRowCount,gridProperties.frozenColumnCount',
+      },
+    })
+    formattingRequests.push({
+      updateDimensionProperties: {
+        range: { sheetId: sheetIdValue, dimension: 'COLUMNS', startIndex: 0, endIndex: 1 },
+        properties: { hiddenByUser: true },
+        fields: 'hiddenByUser',
+      },
+    })
+    formattingRequests.push({
+      repeatCell: {
+        range: { sheetId: sheetIdValue, startRowIndex: 3, endRowIndex: 4, startColumnIndex: 1, endColumnIndex: 1 + TAB_HEADERS[title].length },
+        cell: {
+          userEnteredFormat: {
+            backgroundColor: { red: 0.12, green: 0.14, blue: 0.18 },
+            textFormat: { foregroundColor: { red: 1, green: 1, blue: 1 }, bold: true },
+            horizontalAlignment: 'LEFT',
+          },
+        },
+        fields: 'userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)',
+      },
+    })
+    formattingRequests.push({
+      autoResizeDimensions: {
+        dimensions: { sheetId: sheetIdValue, dimension: 'COLUMNS', startIndex: 1, endIndex: 1 + TAB_HEADERS[title].length },
+      },
+    })
+    if (GENERATED_TABS.includes(title as (typeof GENERATED_TABS)[number])) {
+      formattingRequests.push({
+        addProtectedRange: {
+          protectedRange: {
+            description: `${PROTECTION_PREFIX} generated ${title}`,
+            range: { sheetId: sheetIdValue },
+            warningOnly: false,
+            editors: { users: [runtime.serviceAccountEmail] },
+          },
+        },
+      })
+    } else {
+      formattingRequests.push({
+        addProtectedRange: {
+          protectedRange: {
+            description: `${PROTECTION_PREFIX} opportunity identifiers and headers`,
+            range: { sheetId: sheetIdValue, startRowIndex: 0, endRowIndex: 4 },
+            warningOnly: false,
+            editors: { users: [runtime.serviceAccountEmail] },
+          },
+        },
+      })
+      formattingRequests.push({
+        addProtectedRange: {
+          protectedRange: {
+            description: `${PROTECTION_PREFIX} opportunity identifiers`,
+            range: { sheetId: sheetIdValue, startColumnIndex: 0, endColumnIndex: 1 },
+            warningOnly: false,
+            editors: { users: [runtime.serviceAccountEmail] },
+          },
+        },
+      })
+    }
+  })
+  if (formattingRequests.length > 0) {
+    await googleSheetsJson(runtime, `/v4/spreadsheets/${sheetId}:batchUpdate`, {
+      method: 'POST',
+      body: { requests: formattingRequests, includeSpreadsheetInResponse: false },
+      idempotent: false,
+    })
+  }
 }
 
 async function verifyPipelineTabsAndHeaders(runtime: GoogleWorkspaceRuntime, sheetId: string) {
@@ -587,7 +715,7 @@ async function verifyPipelineTabsAndHeaders(runtime: GoogleWorkspaceRuntime, she
   const titles = (metadata.sheets || [])
     .map((sheet) => sheet.properties?.title)
     .filter((title): title is string => Boolean(title))
-  if (titles.length !== EXPECTED_TABS.length || EXPECTED_TABS.some((title) => !titles.includes(title))) {
+  if (EXPECTED_TABS.some((title) => !titles.includes(title))) {
     throw new PipelineProvisioningRequestError(
       'Managed pipeline Sheet tabs did not verify',
       409,
@@ -597,7 +725,7 @@ async function verifyPipelineTabsAndHeaders(runtime: GoogleWorkspaceRuntime, she
   const parameters = new URLSearchParams({ majorDimension: 'ROWS' })
   for (const title of EXPECTED_TABS) {
     const endColumn = String.fromCharCode('A'.charCodeAt(0) + TAB_HEADERS[title].length)
-    parameters.append('ranges', `${title}!B4:${endColumn}4`)
+    parameters.append('ranges', `'${title}'!B4:${endColumn}4`)
   }
   const values = await googleSheetsJson<{ valueRanges?: Array<{ values?: unknown[][] }> }>(
     runtime,

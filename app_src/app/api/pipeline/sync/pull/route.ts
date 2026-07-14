@@ -32,6 +32,7 @@ export async function POST(req: NextRequest) {
     const result = await syncPipelineFromSheets(pipeline ? {
       ...requirePipelineSheetContext(pipeline),
       legacyOwnerFallback: isLegacyOwnerSheetPipeline(pipeline),
+      actorEmail,
     } : undefined)
     logPipelineEvent({ module: 'pipeline-sync', action: 'pull', result: 'ok', detail: result.summary, actor: actorEmail, pipelineId })
     return NextResponse.json({ ok: true, result, projectionStorage: result.projectionStorage })

@@ -92,6 +92,8 @@ export async function GET(req: NextRequest) {
               accessRole: selectedPipeline.accessRole,
               sheetBacked: selectedPipeline.sheetBacked,
               syncEnabled: selectedPipeline.syncEnabled,
+              shortLinkUrl: selectedPipeline.shortLinkUrl,
+              provisioningStatus: selectedPipeline.provisioningStatus,
             } : null,
           })
         }

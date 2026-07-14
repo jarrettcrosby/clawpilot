@@ -10,12 +10,13 @@ import DashboardSection from '@/components/dashboard/DashboardSection'
 import PipelineSection from '@/components/pipeline/PipelineSection'
 import AgentsSection from '@/components/agents/AgentsSection'
 import ShortLinksSection from '@/components/links/ShortLinksSection'
+import CrmSection from '@/components/crm/CrmSection'
 import ShortcutsModal from '@/components/help/ShortcutsModal'
 import { Box } from '@mui/material'
 import type { BoardFilter } from '@/components/projects/FilterBar'
 import { emptyFilter } from '@/components/projects/FilterBar'
 
-const SECTIONS = ['dashboard', 'docs', 'projects', 'pipeline', 'links', 'agents', 'versions']
+const SECTIONS = ['dashboard', 'docs', 'projects', 'pipeline', 'crm', 'links', 'agents', 'versions']
 const DESKTOP_NAV_COLLAPSED_KEY = 'clawpilot_desktop_nav_collapsed'
 const DESKTOP_NAV_PREFERENCE_EVENT = 'clawpilot:desktop-nav-preference'
 
@@ -184,8 +185,8 @@ export default function HomeClient({ shortLinksEnabled }: { shortLinksEnabled: b
         <Box
           sx={{
             flex: 1,
-            overflow: ['docs', 'projects', 'pipeline'].includes(section) ? 'hidden' : 'auto',
-            pb: ['docs', 'projects', 'pipeline'].includes(section)
+            overflow: ['docs', 'projects', 'pipeline', 'crm'].includes(section) ? 'hidden' : 'auto',
+            pb: ['docs', 'projects', 'pipeline', 'crm'].includes(section)
               ? { xs: 'calc(64px + env(safe-area-inset-bottom) + 8px)', md: 0 }
               : { xs: 'calc(64px + env(safe-area-inset-bottom) + 16px)', md: 2 },
           }}
@@ -208,6 +209,11 @@ export default function HomeClient({ shortLinksEnabled }: { shortLinksEnabled: b
           {section === 'pipeline' && (
             <Box sx={{ height: '100%', overflow: 'hidden' }}>
               <PipelineSection />
+            </Box>
+          )}
+          {section === 'crm' && (
+            <Box sx={{ height: '100%', overflow: 'hidden' }}>
+              <CrmSection />
             </Box>
           )}
           {shortLinksEnabled && section === 'links' && (

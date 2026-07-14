@@ -2,6 +2,7 @@ import { getErrorMessage } from '@/lib/errorUtils'
 import { resolveManagedGoogleWorkspaceRuntime } from '@/lib/integrations/googleWorkspace'
 import { googleSheetsJson, type GoogleWorkspaceRuntime } from '@/lib/integrations/googleWorkspaceClient'
 import { matonFetch } from '@/lib/maton'
+import { projectCrmWorkbook } from '@/lib/crm/workbookProjection'
 import {
   provisionPipelineGoogleResources,
   reconcilePipelineGooglePermissions,
@@ -126,6 +127,16 @@ async function executeOutboxItem(
   context: ResolvedPipelineOutboxSheetContext,
   managedRuntime: GoogleWorkspaceRuntime | null,
 ) {
+  if (item.operation === 'project_crm_workbook') {
+    if (!context.pipelineId || !context.ownerEmail) {
+      throw new PermanentOutboxError('CRM projection is missing its pipeline owner context')
+    }
+    await projectCrmWorkbook({
+      context: { pipelineId: context.pipelineId, sheetId: context.sheetId },
+      actorEmail: context.ownerEmail,
+    })
+    return
+  }
   if (item.operation === 'update_opportunity') {
     const { range, values } = readRangeAndValues(item)
     if (!/^Opportunities!B(\d+):M\1$/.test(range)) {
