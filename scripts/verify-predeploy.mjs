@@ -113,6 +113,7 @@ for (const requiredPath of [
   'db/migrations/0017_short_link_destination_hardening.sql',
   'db/migrations/0018_user_maton_credentials.sql',
   'db/migrations/0019_managed_pipeline_google_resources.sql',
+  'db/migrations/0021_crm_identity_and_organization_hierarchy.sql',
   'scripts/start-railway.sh',
   'scripts/pipeline-outbox-poller.mjs',
   'scripts/validate-runtime-config.mjs',

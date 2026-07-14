@@ -8,6 +8,7 @@ import {
   readPipelineProjectionFromPostgres,
 } from '@/lib/persistence/pipeline'
 import { shortLinkUrl } from '@/lib/shortlinks'
+import { ensurePrimaryWorkspaceOrganization } from '@/lib/organizations'
 import {
   effectiveUserPermissions,
   getAppUser,
@@ -42,6 +43,7 @@ export type PipelineSpace = {
   id: string
   name: string
   ownerEmail: string
+  workspaceOrganizationId: string | null
   isDefault: boolean
   accessRole: ResourceAccessRole
   members: SharedResourceMember[]
@@ -83,6 +85,7 @@ type PipelineSpaceRow = {
   id: string
   name: string
   owner_email: string
+  workspace_organization_id: string | null
   is_default: boolean
   access_role: ResourceAccessRole
   members: ResourceMemberRow[] | null
@@ -149,6 +152,7 @@ function toPipelineSpace(row: PipelineSpaceRow): PipelineSpace {
     id: row.id,
     name: row.name,
     ownerEmail: row.owner_email,
+    workspaceOrganizationId: row.workspace_organization_id,
     isDefault: row.is_default,
     accessRole: row.access_role,
     members: normalizeMembers(row.members),
@@ -180,6 +184,7 @@ export async function ensureDefaultResourcesForUser(emailValue: unknown): Promis
   pipelineId: string
 }> {
   const user = await requireActiveAppUser(emailValue)
+  const organization = await ensurePrimaryWorkspaceOrganization(user.email)
   const ownerEmail = normalizeUserEmail(user.email)
   const configuredOwner = normalizeUserEmail(process.env.APP_LOGIN_EMAIL)
   const isConfiguredOwner = ownerEmail === configuredOwner
@@ -201,17 +206,32 @@ export async function ensureDefaultResourcesForUser(emailValue: unknown): Promis
 
     await client.query(
       `
-        INSERT INTO pipeline_spaces (name, owner_email, is_default, sheet_id, sync_enabled)
-        VALUES ($1, $2, true, $3, $4)
+        INSERT INTO pipeline_spaces (
+          name, owner_email, workspace_organization_id, is_default, sheet_id, sync_enabled
+        )
+        VALUES ($1, $2, $3::uuid, true, $4, $5)
         ON CONFLICT (owner_email) WHERE is_default DO NOTHING
       `,
-      [isConfiguredOwner ? 'Sales pipeline' : 'My pipeline', ownerEmail, isConfiguredOwner ? DEFAULT_PIPELINE_SHEET_ID : null, isConfiguredOwner],
+      [
+        isConfiguredOwner ? 'Sales pipeline' : 'My pipeline',
+        ownerEmail,
+        organization.id,
+        isConfiguredOwner ? DEFAULT_PIPELINE_SHEET_ID : null,
+        isConfiguredOwner,
+      ],
     )
     const pipeline = await client.query<{ id: string }>(
       'SELECT id::text FROM pipeline_spaces WHERE owner_email = $1 AND is_default LIMIT 1',
       [ownerEmail],
     )
     if (!pipeline.rows[0]) throw new Error('Unable to provision a pipeline')
+
+    await client.query(
+      `UPDATE pipeline_spaces
+       SET workspace_organization_id = $2::uuid, updated_at = now()
+       WHERE id = $1::uuid AND workspace_organization_id IS DISTINCT FROM $2::uuid`,
+      [pipeline.rows[0].id, organization.id],
+    )
 
     if (isConfiguredOwner) {
       await client.query('UPDATE tasks SET board_id = $1::uuid WHERE board_id IS NULL', [board.rows[0].id])
@@ -285,6 +305,7 @@ export async function listPipelineSpaces(actorEmailValue: unknown): Promise<Pipe
         pipeline.id::text,
         pipeline.name,
         pipeline.owner_email,
+        pipeline.workspace_organization_id::text,
         pipeline.is_default,
         CASE WHEN pipeline.owner_email = $1 THEN 'owner' ELSE membership.access_role END AS access_role,
         CASE WHEN pipeline.owner_email = $1 THEN COALESCE((
@@ -413,9 +434,12 @@ export async function createPipelineSpace(input: { actorEmail: unknown; name: un
   const actor = await requireActiveAppUser(input.actorEmail)
   if (!effectiveUserPermissions(actor).createPipelines) throw new Error('You do not have permission to create pipelines')
   const name = cleanResourceName(input.name, 'New pipeline')
+  const organization = await ensurePrimaryWorkspaceOrganization(actor.email)
   const result = await query<{ id: string }>(
-    'INSERT INTO pipeline_spaces (name, owner_email) VALUES ($1, $2) RETURNING id::text',
-    [name, actor.email],
+    `INSERT INTO pipeline_spaces (name, owner_email, workspace_organization_id)
+     VALUES ($1, $2, $3::uuid)
+     RETURNING id::text`,
+    [name, actor.email, organization.id],
   )
   return resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: result.rows[0].id })
 }

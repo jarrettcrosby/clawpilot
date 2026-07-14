@@ -65,7 +65,47 @@ function validateEmbeddingConfiguration() {
   return provider
 }
 
+function validateExactHttpsOrigin(name) {
+  const configured = String(process.env[name] || '')
+  try {
+    const parsed = new URL(configured)
+    if (parsed.protocol !== 'https:' || configured !== parsed.origin) {
+      fail(`${name} must be an exact pathless HTTPS origin`)
+    }
+    return parsed.origin
+  } catch {
+    fail(`${name} must be a valid exact pathless HTTPS origin`)
+  }
+}
+
+function validateSuiteCrmConfiguration() {
+  const enabled = String(process.env.CRM_ENABLED || '0')
+  if (enabled !== '0' && enabled !== '1') fail('CRM_ENABLED must be 0 or 1')
+  if (enabled === '0') return 'disabled'
+
+  const base = String(process.env.SUITECRM_BASE_URL || '')
+  try {
+    const parsed = new URL(base)
+    if (
+      parsed.protocol !== 'http:'
+      || parsed.hostname !== 'suitecrm.railway.internal'
+      || parsed.username
+      || parsed.password
+      || parsed.search
+      || parsed.hash
+    ) {
+      fail('SUITECRM_BASE_URL must use the private http://suitecrm.railway.internal service URL')
+    }
+  } catch {
+    fail('SUITECRM_BASE_URL must be a valid private Railway service URL')
+  }
+
+  validateExactHttpsOrigin('SUITECRM_PUBLIC_URL')
+  return 'enabled'
+}
+
 const origin = validateShortLinkOrigin()
 const clients = validateServiceClients()
 const embeddingProvider = validateEmbeddingConfiguration()
-console.log(`[runtime-config] valid shortLinkOrigin=${origin} clients=${clients} embeddingProvider=${embeddingProvider}`)
+const suiteCrm = validateSuiteCrmConfiguration()
+console.log(`[runtime-config] valid shortLinkOrigin=${origin} clients=${clients} embeddingProvider=${embeddingProvider} suiteCrm=${suiteCrm}`)

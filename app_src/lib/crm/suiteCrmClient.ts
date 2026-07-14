@@ -161,3 +161,16 @@ export async function upsertSuiteCrmRecord(
   if (id !== record.suiteCrmId) throw new Error('SuiteCRM returned an unexpected record ID')
   return id
 }
+
+export async function deleteSuiteCrmRecord(
+  record: SuiteCrmOutboxRecord,
+  fetchImpl: typeof fetch = fetch,
+) {
+  const moduleName = ENTITY_MODULE[record.entity]
+  await request(
+    `/Api/V8/module/${moduleName}/${encodeURIComponent(record.suiteCrmId)}`,
+    { method: 'DELETE' },
+    fetchImpl,
+    true,
+  )
+}

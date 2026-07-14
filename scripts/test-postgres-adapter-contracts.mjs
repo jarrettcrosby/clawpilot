@@ -138,6 +138,19 @@ for (const table of ['crm_organizations', 'crm_contacts', 'crm_opportunities', '
 assertIncludes(crmMigration, "target_system = 'suitecrm'", 'SuiteCRM outbox migration')
 assertIncludes(crmMigration, 'crm_projection_version', 'CRM workbook projection version')
 
+const crmIdentityHierarchyMigration = read('db/migrations/0021_crm_identity_and_organization_hierarchy.sql')
+for (const contract of [
+  'CREATE TABLE IF NOT EXISTS workspace_organizations',
+  'ADD COLUMN IF NOT EXISTS organization_id uuid REFERENCES workspace_organizations',
+  'ADD COLUMN IF NOT EXISTS workspace_organization_id uuid REFERENCES workspace_organizations',
+  'ADD COLUMN IF NOT EXISTS identity_key text',
+  'ADD COLUMN IF NOT EXISTS parent_organization_id uuid REFERENCES crm_organizations',
+  'idx_crm_organizations_identity',
+  'idx_crm_contacts_identity',
+]) {
+  assertIncludes(crmIdentityHierarchyMigration, contract, 'CRM identity and organization hierarchy migration')
+}
+
 const invitationAdapter = read('app_src/lib/invitations.ts')
 assertIncludes(invitationAdapter, 'requestInvitationAuthMagicCode', 'invitation adapter')
 assertIncludes(invitationAdapter, 'revoked_at IS NULL', 'invitation revocation contract')
@@ -268,6 +281,14 @@ const crmAdapter = read('app_src/lib/persistence/crm.ts')
 assertIncludes(crmAdapter, 'stageCrmRecordInPostgres', 'CRM projection adapter')
 assertIncludes(crmAdapter, "target_system, payload", 'CRM outbox persistence')
 assertIncludes(crmAdapter, "'upsert_record', 'suitecrm'", 'SuiteCRM outbox target')
+assertIncludes(crmAdapter, "operation IN ('upsert_record', 'delete_record')", 'SuiteCRM deletion outbox claims')
+assertIncludes(crmAdapter, 'ensurePipelineCrmHierarchy', 'workspace organization CRM hierarchy')
+assertIncludes(crmAdapter, 'ON CONFLICT (pipeline_id, identity_key)', 'natural CRM identity upserts')
+assertIncludes(crmAdapter, "$23, $24::jsonb, $25,\n        'pending', NULL, $26, $26", 'CRM contact insert bindings')
+assert.ok(
+  !crmAdapter.includes("$24, $25::jsonb, $26,\n        'pending', NULL, $27, $27"),
+  'CRM contact insert must not provide more expressions than target columns',
+)
 assertIncludes(crmAdapter, 'FOR UPDATE SKIP LOCKED', 'SuiteCRM leased outbox claims')
 assertIncludes(crmAdapter, 'pipeline_id = $1::uuid', 'pipeline-scoped CRM reads')
 assertIncludes(crmAdapter, 'readCrmWorkbookProjectionReadiness', 'reconciliation-gated CRM workbook projection')
@@ -275,6 +296,7 @@ assertIncludes(crmAdapter, 'readCrmWorkbookProjectionReadiness', 'reconciliation
 const suiteCrmClient = read('app_src/lib/crm/suiteCrmClient.ts')
 assertIncludes(suiteCrmClient, '/Api/access_token', 'SuiteCRM OAuth client credentials')
 assertIncludes(suiteCrmClient, '/Api/V8/module', 'SuiteCRM JSON API')
+assertIncludes(suiteCrmClient, 'deleteSuiteCrmRecord', 'SuiteCRM duplicate deletion')
 assertIncludes(suiteCrmClient, "hostname.endsWith('.railway.internal')", 'private Railway SuiteCRM transport')
 
 const crmWorkbookProjection = read('app_src/lib/crm/workbookProjection.ts')
@@ -286,10 +308,22 @@ assertIncludes(crmWorkbookProjection, 'waiting for reconciliation', 'CRM project
 const crmWorkbookImport = read('app_src/lib/crm/workbookImport.ts')
 assertIncludes(crmWorkbookImport, 'Full Name (First, Last)', 'legacy contact name header mapping')
 assertIncludes(crmWorkbookImport, 'CRM workbook import was incomplete', 'CRM import count reconciliation')
+assertIncludes(crmWorkbookImport, 'uniqueSourceRecords', 'CRM source duplicate consolidation')
+assertIncludes(crmWorkbookImport, 'duplicatesSkipped', 'CRM import duplicate evidence')
 
 const crmWorker = read('app_src/lib/crm/worker.ts')
 assertIncludes(crmWorker, 'upsertSuiteCrmRecord', 'SuiteCRM outbox worker')
+assertIncludes(crmWorker, 'deleteSuiteCrmRecord', 'SuiteCRM deletion worker')
 assertIncludes(crmWorker, "operation: 'project_crm_workbook'", 'CRM to workbook projection enqueue')
+
+const crmPunchoutRoute = read('app_src/app/api/crm/punchout/route.ts')
+assertIncludes(crmPunchoutRoute, "actor.role !== 'owner' && actor.role !== 'admin'", 'admin-only native CRM punchout')
+assertIncludes(crmPunchoutRoute, 'suiteCrmPublicUrl()', 'validated native CRM destination')
+assertIncludes(crmPunchoutRoute, "'Cache-Control': 'no-store'", 'native CRM punchout cache boundary')
+
+const crmHierarchyRoute = read('app_src/app/api/crm/hierarchy/route.ts')
+assertIncludes(crmHierarchyRoute, 'updateWorkspaceOrganizationParent', 'admin-managed organization hierarchy')
+assertIncludes(crmHierarchyRoute, 'ensurePipelineCrmHierarchy', 'hierarchy propagation to CRM pipelines')
 
 const pipelineDropdownSync = read('app_src/lib/pipelineDropdownSync.ts')
 assertIncludes(pipelineDropdownSync, 'resolvePipelineSheetBindingInPostgres', 'dropdown binding resolution')
@@ -525,6 +559,7 @@ assertIncludes(healthRoute, '0016_document_vectors_and_ai_radar.sql', 'hosted ve
 assertIncludes(healthRoute, '0016_z_short_link_destination_preflight.sql', 'hosted short-link preflight migration health')
 assertIncludes(healthRoute, '0017_short_link_destination_hardening.sql', 'hosted short-link hardening migration health')
 assertIncludes(healthRoute, '0020_crm_gateway_and_reporting.sql', 'hosted CRM gateway migration health')
+assertIncludes(healthRoute, '0021_crm_identity_and_organization_hierarchy.sql', 'hosted CRM identity hierarchy migration health')
 assertIncludes(healthRoute, 'readSuiteCrmWorkerHeartbeat', 'hosted SuiteCRM worker health')
 assertIncludes(healthRoute, 'migration_checksums_present', 'hosted migration checksum health')
 assertIncludes(healthRoute, 'queryAgentCredentials', 'shared agent credential store health')

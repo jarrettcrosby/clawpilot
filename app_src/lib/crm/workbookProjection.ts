@@ -70,7 +70,7 @@ function organizationRow(record: CrmOrganization): unknown[] {
   return [
     record.sourceKey, record.priority, record.name, record.accountManager, record.accountType,
     record.syncStatus, '', record.website, record.phone, record.address, record.city, record.state,
-    record.description,
+    record.description, record.parentOrganizationName, record.relationshipType,
   ]
 }
 

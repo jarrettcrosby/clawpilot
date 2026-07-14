@@ -39,6 +39,7 @@ require_value PIPELINE_OUTBOX_WORKER_SECRET 32
 require_value SHORTLINK_PUBLIC_ORIGIN 16
 if [[ "${CRM_ENABLED:-0}" == "1" ]]; then
   require_value SUITECRM_BASE_URL 16
+  require_value SUITECRM_PUBLIC_URL 16
   require_value SUITECRM_CLIENT_ID 16
   require_value SUITECRM_CLIENT_SECRET 32
 fi

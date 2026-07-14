@@ -170,6 +170,7 @@ export async function GET() {
           maton_credentials_migration_applied: boolean
           managed_pipeline_resources_migration_applied: boolean
           crm_gateway_migration_applied: boolean
+          crm_identity_hierarchy_migration_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -275,6 +276,11 @@ export async function GET() {
                 FROM schema_migrations
                 WHERE filename = '0020_crm_gateway_and_reporting.sql'
               ) AS crm_gateway_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0021_crm_identity_and_organization_hierarchy.sql'
+              ) AS crm_identity_hierarchy_migration_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -307,6 +313,7 @@ export async function GET() {
             && row?.maton_credentials_migration_applied
             && row?.managed_pipeline_resources_migration_applied
             && row?.crm_gateway_migration_applied
+            && row?.crm_identity_hierarchy_migration_applied
             && row?.migration_checksums_present
           ),
         }
@@ -331,6 +338,7 @@ export async function GET() {
           || !row?.maton_credentials_migration_applied
           || !row?.managed_pipeline_resources_migration_applied
           || !row?.crm_gateway_migration_applied
+          || !row?.crm_identity_hierarchy_migration_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')

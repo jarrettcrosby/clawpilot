@@ -6,6 +6,10 @@ export type CrmSyncStatus = 'pending' | 'syncing' | 'synced' | 'failed'
 export type CrmOrganization = {
   id: string
   pipelineId: string
+  parentOrganizationId: string | null
+  parentOrganizationName: string
+  workspaceOrganizationId: string | null
+  relationshipType: 'workspace_root' | 'workspace_member' | 'customer'
   suiteCrmId: string | null
   sourceKey: string
   sourceRowNumber: number | null
