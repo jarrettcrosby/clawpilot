@@ -983,7 +983,7 @@ export async function readCrmWorkbookProjectionReadiness(pipelineId: string) {
   const unresolved = Number(row?.unresolved || 0)
   const importStatus = row?.import_status || null
   return {
-    ready: unresolved === 0 && importStatus !== 'running' && importStatus !== 'failed',
+    ready: unresolved === 0 && importStatus === 'succeeded',
     unresolved,
     importStatus,
   }

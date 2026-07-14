@@ -195,6 +195,22 @@ export async function importCrmWorkbook(input: {
       })
     }
 
+    const knownOrganizationNames = new Set([
+      ...organizations.keys(),
+      ...importTabs.Organizations.map(organizationSourceIdentity).filter(Boolean),
+    ])
+    const derivedOrganizations = new Map<string, { name: string; record: SourceRecord; sourceTab: ImportTab }>()
+    const registerReferencedOrganization = (sourceTab: ImportTab, record: SourceRecord) => {
+      const name = pick(record, 'Organization', 'Account', 'Company')
+      const key = normalizedName(name)
+      if (!key || knownOrganizationNames.has(key) || derivedOrganizations.has(key)) return
+      derivedOrganizations.set(key, { name, record, sourceTab })
+    }
+    importTabs.Contacts.forEach((record) => registerReferencedOrganization('Contacts', record))
+    importTabs.Opportunities.forEach((record) => registerReferencedOrganization('Opportunities', record))
+    importTabs.Interactions.forEach((record) => registerReferencedOrganization('Interactions', record))
+    sourceCounts.organizations += derivedOrganizations.size
+
     for (const record of importTabs.Organizations) {
       const name = pick(record, 'Name', 'Organization', 'Organization Name')
       if (!name) continue
@@ -223,6 +239,25 @@ export async function importCrmWorkbook(input: {
         },
       })
       organizations.set(normalizedName(name), { id: staged.id, suiteCrmId: staged.suiteCrmId })
+      counts.organizations += 1
+    }
+
+    for (const [key, derived] of derivedOrganizations) {
+      const staged = await stageCrmRecordInPostgres({
+        entity: 'organizations', pipelineId: input.context.pipelineId,
+        sourceKey: `derived:organization:${key}`,
+        sourceSheetId: input.context.sheetId, sourceRowNumber: derived.record.rowNumber,
+        sourcePayload: { ...derived.record.raw, _clawpilotDerivedFrom: derived.sourceTab },
+        actorEmail: input.actorEmail,
+        fields: {
+          parentOrganizationId: hierarchy.customerParent.id,
+          parentOrganizationSuiteCrmId: hierarchy.customerParent.suiteCrmId,
+          relationshipType: 'customer',
+          name: derived.name,
+          accountManager: pick(derived.record, 'Acct. Manager', 'Account Manager', 'Deal Owner', 'Owner'),
+        },
+      })
+      organizations.set(key, { id: staged.id, suiteCrmId: staged.suiteCrmId })
       counts.organizations += 1
     }
 
