@@ -119,7 +119,9 @@ async function request(
     redirect: 'error',
     signal: AbortSignal.timeout(20_000),
   })
-  if (allowNotFound && response.status === 404) return null
+  // SuiteCRM V8 reports a valid module/id lookup with no matching bean as 400.
+  // This compatibility path is used only by the deterministic upsert preflight.
+  if (allowNotFound && (response.status === 400 || response.status === 404)) return null
   const parsed = await readJson(response)
   if (!response.ok) {
     const detail = responseErrorDetail(parsed)
