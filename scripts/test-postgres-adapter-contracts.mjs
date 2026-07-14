@@ -103,6 +103,8 @@ for (const table of ['document_embedding_jobs', 'ai_radar_items', 'knowledge_wor
   assertIncludes(vectorKnowledgeMigration, `CREATE TABLE IF NOT EXISTS ${table}`, 'vector knowledge migration')
 }
 const shortLinkHardeningMigration = read('db/migrations/0017_short_link_destination_hardening.sql')
+const shortLinkPreflightMigration = read('db/migrations/0016_z_short_link_destination_preflight.sql')
+assertIncludes(shortLinkPreflightMigration, "destination_url !~ '^https://'", 'legacy short-link destination preflight')
 assertIncludes(shortLinkHardeningMigration, "destination_url ~ '^https://'", 'HTTPS-only short-link destination migration')
 assertIncludes(shortLinkHardeningMigration, "WHERE status = 'processing'", 'stale embedding lease index')
 assertIncludes(vectorKnowledgeMigration, 'CREATE EXTENSION IF NOT EXISTS vector', 'pgvector extension')
@@ -281,6 +283,7 @@ assertIncludes(healthRoute, '0013_invitation_delivery_coordination.sql', 'hosted
 assertIncludes(healthRoute, '0014_invitation_delivery_pending.sql', 'hosted invitation pending migration health')
 assertIncludes(healthRoute, '0015_short_links.sql', 'hosted short-links migration health')
 assertIncludes(healthRoute, '0016_document_vectors_and_ai_radar.sql', 'hosted vector knowledge migration health')
+assertIncludes(healthRoute, '0016_z_short_link_destination_preflight.sql', 'hosted short-link preflight migration health')
 assertIncludes(healthRoute, '0017_short_link_destination_hardening.sql', 'hosted short-link hardening migration health')
 assertIncludes(healthRoute, 'migration_checksums_present', 'hosted migration checksum health')
 assertIncludes(healthRoute, 'queryAgentCredentials', 'shared agent credential store health')

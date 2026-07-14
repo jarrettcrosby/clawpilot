@@ -150,6 +150,7 @@ export async function GET() {
           invitation_pending_migration_applied: boolean
           shortlinks_migration_applied: boolean
           vector_knowledge_migration_applied: boolean
+          shortlink_preflight_migration_applied: boolean
           shortlink_hardening_migration_applied: boolean
           migration_checksums_present: boolean
         }>(
@@ -234,6 +235,11 @@ export async function GET() {
               EXISTS (
                 SELECT 1
                 FROM schema_migrations
+                WHERE filename = '0016_z_short_link_destination_preflight.sql'
+              ) AS shortlink_preflight_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
                 WHERE filename = '0017_short_link_destination_hardening.sql'
               ) AS shortlink_hardening_migration_applied,
               NOT EXISTS (
@@ -263,6 +269,7 @@ export async function GET() {
             && row?.invitation_pending_migration_applied
             && row?.shortlinks_migration_applied
             && row?.vector_knowledge_migration_applied
+            && row?.shortlink_preflight_migration_applied
             && row?.shortlink_hardening_migration_applied
             && row?.migration_checksums_present
           ),
@@ -283,6 +290,7 @@ export async function GET() {
           || !row?.invitation_pending_migration_applied
           || !row?.shortlinks_migration_applied
           || !row?.vector_knowledge_migration_applied
+          || !row?.shortlink_preflight_migration_applied
           || !row?.shortlink_hardening_migration_applied
           || !row?.migration_checksums_present
         ) {
@@ -352,6 +360,17 @@ export async function GET() {
             else if (workerStatus.status === 'stale') errors.push(`${expectedWorker} worker heartbeat is stale.`)
             else if (workerStatus.phase === 'failed') errors.push(`${expectedWorker} worker reported a failure.`)
             else if (workerStatus.phase === 'degraded') warnings.push(`${expectedWorker} worker is degraded.`)
+            if (expectedWorker === 'document-embeddings') {
+              const details = workerStatus?.details && typeof workerStatus.details === 'object'
+                ? workerStatus.details as Record<string, unknown>
+                : {}
+              const backlog = details.backlog && typeof details.backlog === 'object'
+                ? details.backlog as Record<string, unknown>
+                : {}
+              if (Number(backlog.terminalFailed || 0) > 0 && workerStatus?.phase !== 'failed') {
+                errors.push('document-embeddings worker has terminal failed jobs.')
+              }
+            }
           }
         }
       } catch (error) {

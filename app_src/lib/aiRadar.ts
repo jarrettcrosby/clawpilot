@@ -1,6 +1,9 @@
 import crypto from 'node:crypto'
 import { lookup } from 'node:dns/promises'
+import https from 'node:https'
 import { isIP } from 'node:net'
+import type { IncomingMessage } from 'node:http'
+import type { LookupFunction } from 'node:net'
 import { XMLParser } from 'fast-xml-parser'
 import { query } from '@/lib/persistence/postgres'
 
@@ -84,7 +87,7 @@ const parser = new XMLParser({
 })
 
 function isPublicIpAddress(address: string): boolean {
-  const normalized = address.toLowerCase().split('%')[0]
+  const normalized = address.toLowerCase().split('%')[0].replace(/^\[|\]$/g, '')
   if (isIP(normalized) === 4) {
     const [a, b, c] = normalized.split('.').map(Number)
     return !(
@@ -103,11 +106,10 @@ function isPublicIpAddress(address: string): boolean {
     )
   }
   if (isIP(normalized) !== 6) return false
-  const mappedIpv4 = normalized.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/)?.[1]
+  const mappedIpv4 = normalized.match(/^::(?:ffff:)?(\d+\.\d+\.\d+\.\d+)$/)?.[1]
   if (mappedIpv4) return isPublicIpAddress(mappedIpv4)
   return !(
-    normalized === '::'
-    || normalized === '::1'
+    normalized.startsWith('::')
     || normalized.startsWith('fc')
     || normalized.startsWith('fd')
     || /^fe[89ab]/.test(normalized)
@@ -116,60 +118,84 @@ function isPublicIpAddress(address: string): boolean {
   )
 }
 
-async function validatedFeedUrl(value: string): Promise<URL> {
+async function validatedFeedUrl(value: string) {
   const url = new URL(value)
-  const hostname = url.hostname.toLowerCase()
+  const hostname = url.hostname.toLowerCase().replace(/^\[|\]$/g, '')
   if (url.protocol !== 'https:' || url.username || url.password) {
     throw new Error('AI Radar feeds and redirects must use HTTPS without embedded credentials')
   }
   if (hostname === 'localhost' || hostname.endsWith('.localhost') || hostname.endsWith('.local') || hostname.endsWith('.internal')) {
     throw new Error(`AI Radar feed host ${hostname} is not public`)
   }
-  const addresses = isIP(hostname)
-    ? [{ address: hostname }]
+  const literalFamily = isIP(hostname)
+  const addresses = literalFamily
+    ? [{ address: hostname, family: literalFamily }]
     : await lookup(hostname, { all: true, verbatim: true })
   if (addresses.length === 0 || addresses.some((entry) => !isPublicIpAddress(entry.address))) {
     throw new Error(`AI Radar feed host ${hostname} resolves to a non-public address`)
   }
-  return url
+  return { url, addresses }
 }
 
-async function fetchFeedResponse(source: RadarSource): Promise<Response> {
+function pinnedHttpsRequest(url: URL, address: { address: string; family: number }): Promise<IncomingMessage> {
+  const pinnedLookup = ((
+    _hostname: string,
+    options: unknown,
+    callback: (...args: unknown[]) => void,
+  ) => {
+    if (options && typeof options === 'object' && 'all' in options && options.all) {
+      callback(null, [{ address: address.address, family: address.family }])
+      return
+    }
+    callback(null, address.address, address.family)
+  }) as unknown as LookupFunction
+  return new Promise((resolve, reject) => {
+    const request = https.request(url, {
+      method: 'GET',
+      headers: { Accept: 'application/atom+xml, application/rss+xml, application/xml, text/xml', 'User-Agent': 'ClawPilot-AI-Radar/1.0' },
+      lookup: pinnedLookup,
+    }, resolve)
+    request.setTimeout(15_000, () => request.destroy(new Error(`AI Radar request to ${url.hostname} timed out`)))
+    request.on('error', reject)
+    request.end()
+  })
+}
+
+function responseHeader(response: IncomingMessage, name: string): string | null {
+  const value = response.headers[name]
+  return Array.isArray(value) ? value[0] || null : value || null
+}
+
+async function fetchFeedResponse(source: RadarSource): Promise<IncomingMessage> {
   let currentUrl = source.url
   for (let redirect = 0; redirect <= MAX_REDIRECTS; redirect += 1) {
     const validated = await validatedFeedUrl(currentUrl)
-    const response = await fetch(validated, {
-      headers: { Accept: 'application/atom+xml, application/rss+xml, application/xml, text/xml', 'User-Agent': 'ClawPilot-AI-Radar/1.0' },
-      redirect: 'manual',
-      signal: AbortSignal.timeout(15_000),
-    })
-    if (![301, 302, 303, 307, 308].includes(response.status)) return response
-    const location = response.headers.get('location')
+    const response = await pinnedHttpsRequest(validated.url, validated.addresses[0])
+    const status = response.statusCode || 0
+    if (![301, 302, 303, 307, 308].includes(status)) return response
+    const location = responseHeader(response, 'location')
     if (!location || redirect === MAX_REDIRECTS) throw new Error(`${source.name} exceeded the redirect limit`)
-    await response.body?.cancel()
-    currentUrl = new URL(location, validated).toString()
+    response.resume()
+    currentUrl = new URL(location, validated.url).toString()
   }
   throw new Error(`${source.name} exceeded the redirect limit`)
 }
 
-async function readBoundedFeed(response: Response, sourceName: string): Promise<string> {
-  const declaredLength = Number(response.headers.get('content-length') || 0)
+async function readBoundedFeed(response: IncomingMessage, sourceName: string): Promise<string> {
+  const declaredLength = Number(responseHeader(response, 'content-length') || 0)
   if (declaredLength > MAX_FEED_BYTES) throw new Error(`${sourceName} feed exceeds ${MAX_FEED_BYTES} bytes`)
-  if (!response.body) return ''
-  const reader = response.body.getReader()
-  const chunks: Uint8Array[] = []
+  const chunks: Buffer[] = []
   let bytes = 0
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
-    bytes += value.byteLength
+  for await (const value of response) {
+    const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value)
+    bytes += chunk.byteLength
     if (bytes > MAX_FEED_BYTES) {
-      await reader.cancel()
+      response.destroy()
       throw new Error(`${sourceName} feed exceeds ${MAX_FEED_BYTES} bytes`)
     }
-    chunks.push(value)
+    chunks.push(chunk)
   }
-  return Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString('utf8')
+  return Buffer.concat(chunks).toString('utf8')
 }
 
 function asArray<T>(value: T | T[] | null | undefined): T[] {
@@ -277,7 +303,10 @@ function configuredSources(): RadarSource[] {
 
 async function fetchFeed(source: RadarSource) {
   const response = await fetchFeedResponse(source)
-  if (!response.ok) throw new Error(`${source.name} returned HTTP ${response.status}`)
+  if ((response.statusCode || 0) < 200 || (response.statusCode || 0) >= 300) {
+    response.resume()
+    throw new Error(`${source.name} returned HTTP ${response.statusCode || 0}`)
+  }
   const xml = await readBoundedFeed(response, source.name)
   const root = parser.parse(xml) as Record<string, unknown>
   const rssChannel = root.rss && typeof root.rss === 'object'

@@ -105,6 +105,32 @@ async function recordHeartbeat(phase: string, details: Record<string, unknown>) 
   )
 }
 
+async function readEmbeddingBacklog() {
+  const result = await query<{
+    pending: string
+    retrying: string
+    processing: string
+    terminal_failed: string
+  }>(
+    `
+      SELECT
+        count(*) FILTER (WHERE status = 'pending')::text AS pending,
+        count(*) FILTER (WHERE status = 'failed' AND attempts < $1)::text AS retrying,
+        count(*) FILTER (WHERE status = 'processing')::text AS processing,
+        count(*) FILTER (WHERE status = 'failed' AND attempts >= $1)::text AS terminal_failed
+      FROM document_embedding_jobs
+    `,
+    [MAX_ATTEMPTS],
+  )
+  const row = result.rows[0]
+  return {
+    pending: Number(row?.pending || 0),
+    retrying: Number(row?.retrying || 0),
+    processing: Number(row?.processing || 0),
+    terminalFailed: Number(row?.terminal_failed || 0),
+  }
+}
+
 async function ensureJobsForModel(model: string) {
   await query(
     `
@@ -221,8 +247,17 @@ export async function processDocumentEmbeddingJobs(limitValue: unknown = 12) {
   const limit = Math.max(1, Math.min(Math.trunc(Number(limitValue) || 12), MAX_BATCH_SIZE))
   const jobs = await claimJobs(limit)
   if (jobs.length === 0) {
-    await recordHeartbeat('idle', { model: config.model, claimed: 0 })
-    return { enabled: true, provider: config.provider, claimed: 0, completed: 0, failed: 0, model: config.model }
+    const backlog = await readEmbeddingBacklog()
+    await recordHeartbeat(backlog.terminalFailed > 0 ? 'failed' : 'idle', { model: config.model, claimed: 0, backlog })
+    return {
+      enabled: true,
+      provider: config.provider,
+      claimed: 0,
+      completed: 0,
+      failed: backlog.terminalFailed,
+      model: config.model,
+      backlog,
+    }
   }
   await recordHeartbeat('running', { model: config.model, claimed: jobs.length })
   try {
@@ -261,13 +296,23 @@ export async function processDocumentEmbeddingJobs(limitValue: unknown = 12) {
       )
       completed += result.rowCount || 0
     }
-    await recordHeartbeat('completed', {
+    const backlog = await readEmbeddingBacklog()
+    await recordHeartbeat(backlog.terminalFailed > 0 ? 'failed' : 'completed', {
       model,
       provider,
       claimed: jobs.length,
       completed,
+      backlog,
     })
-    return { enabled: true, provider, claimed: jobs.length, completed, failed: jobs.length - completed, model }
+    return {
+      enabled: true,
+      provider,
+      claimed: jobs.length,
+      completed,
+      failed: jobs.length - completed + backlog.terminalFailed,
+      model,
+      backlog,
+    }
   } catch (error) {
     await markFailed(jobs, error)
     await recordHeartbeat('failed', {
