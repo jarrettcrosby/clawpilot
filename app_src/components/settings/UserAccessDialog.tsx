@@ -8,7 +8,9 @@ import Button from '@mui/material/Button'
 import Chip from '@mui/material/Chip'
 import CircularProgress from '@mui/material/CircularProgress'
 import Dialog from '@mui/material/Dialog'
+import DialogActions from '@mui/material/DialogActions'
 import DialogContent from '@mui/material/DialogContent'
+import DialogTitle from '@mui/material/DialogTitle'
 import Divider from '@mui/material/Divider'
 import FormControlLabel from '@mui/material/FormControlLabel'
 import IconButton from '@mui/material/IconButton'
@@ -23,17 +25,23 @@ import Typography from '@mui/material/Typography'
 import useMediaQuery from '@mui/material/useMediaQuery'
 import { useTheme } from '@mui/material/styles'
 import AccountCircleRounded from '@mui/icons-material/AccountCircleRounded'
+import AddToDriveRounded from '@mui/icons-material/AddToDriveRounded'
 import AddRounded from '@mui/icons-material/AddRounded'
 import CloseRounded from '@mui/icons-material/CloseRounded'
 import DeleteOutlineRounded from '@mui/icons-material/DeleteOutlineRounded'
+import ErrorOutlineRounded from '@mui/icons-material/ErrorOutlineRounded'
 import GroupRounded from '@mui/icons-material/GroupRounded'
+import IntegrationInstructionsRounded from '@mui/icons-material/IntegrationInstructionsRounded'
+import OpenInNewRounded from '@mui/icons-material/OpenInNewRounded'
 import PersonAddRounded from '@mui/icons-material/PersonAddRounded'
 import PersonOffRounded from '@mui/icons-material/PersonOffRounded'
+import ReplayRounded from '@mui/icons-material/ReplayRounded'
 import RestoreRounded from '@mui/icons-material/RestoreRounded'
 import SaveRounded from '@mui/icons-material/SaveRounded'
 import ShareRounded from '@mui/icons-material/ShareRounded'
 import TableChartRounded from '@mui/icons-material/TableChartRounded'
 import ViewKanbanRounded from '@mui/icons-material/ViewKanbanRounded'
+import IntegrationSettingsPanel from './IntegrationSettingsPanel'
 
 type UserRole = 'owner' | 'admin' | 'member'
 type UserStatus = 'invited' | 'active' | 'disabled'
@@ -42,6 +50,7 @@ type PermissionKey = keyof UserPermissions
 type ResourceAccessRole = 'owner' | 'editor' | 'viewer'
 type ShareAccessRole = Exclude<ResourceAccessRole, 'owner'>
 type ResourceKind = 'board' | 'pipeline'
+type PipelineProvisioningStatus = 'not_requested' | 'queued' | 'provisioning' | 'ready' | 'failed'
 
 type UserPermissions = {
   inviteUsers: boolean
@@ -100,6 +109,13 @@ type WorkspaceResource = {
 }
 
 type PipelineResource = WorkspaceResource & {
+  provisioningStatus: PipelineProvisioningStatus
+  provisioningError: string | null
+  provisioningRequestedAt: string | null
+  provisioningStartedAt: string | null
+  provisioningLastAttemptedAt: string | null
+  provisioningCompletedAt: string | null
+  shortLinkUrl: string | null
   sheetBacked: boolean
   syncEnabled: boolean
 }
@@ -240,6 +256,27 @@ function isEmail(value: string) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim())
 }
 
+function httpsUrl(value: string | null | undefined) {
+  const candidate = String(value || '').trim()
+  if (!candidate) return null
+  try {
+    return new URL(candidate).protocol === 'https:' ? candidate : null
+  } catch {
+    return null
+  }
+}
+
+function safeProvisioningError(value: string | null | undefined) {
+  const sanitized = String(value || '')
+    .replace(/https?:\/\/\S+/gi, '[link removed]')
+    .replace(/\b(?:sheet|connection|folder|file)\s+id\s*[:=]?\s*[A-Za-z0-9_-]+/gi, 'managed resource')
+    .replace(/\b[A-Za-z0-9_-]{24,}\b/g, '[identifier removed]')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 240)
+  return sanitized || 'Google Workspace provisioning failed.'
+}
+
 export default function UserAccessDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
   const theme = useTheme()
   const fullScreen = useMediaQuery(theme.breakpoints.down('sm'))
@@ -250,6 +287,7 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
   const [inviteEmail, setInviteEmail] = useState('')
   const [createNames, setCreateNames] = useState({ board: '', pipeline: '' })
   const [shareDrafts, setShareDrafts] = useState<Record<string, ShareDraft>>({})
+  const [provisioningPipeline, setProvisioningPipeline] = useState<PipelineResource | null>(null)
   const [loading, setLoading] = useState(false)
   const [pendingAction, setPendingAction] = useState<string | null>(null)
   const [notice, setNotice] = useState('')
@@ -257,6 +295,9 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
 
   const currentUser = usersPayload?.currentUser
   const busy = pendingAction !== null
+  const hasActivePipelineProvisioning = Boolean(workspacesPayload?.pipelines?.some((pipeline) => (
+    pipeline.provisioningStatus === 'queued' || pipeline.provisioningStatus === 'provisioning'
+  )))
 
   const displayedUsers = useMemo(() => {
     if (!currentUser) return []
@@ -298,6 +339,7 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
     setInviteEmail('')
     setCreateNames({ board: '', pipeline: '' })
     setShareDrafts({})
+    setProvisioningPipeline(null)
     setNotice('')
     setError('')
     setLoading(true)
@@ -328,6 +370,32 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
 
     return () => { active = false }
   }, [open])
+
+  useEffect(() => {
+    if (!open || busy || !hasActivePipelineProvisioning) return
+
+    let active = true
+    let controller: AbortController | null = null
+    let timeoutId: number | undefined
+    const pollWorkspaces = async () => {
+      controller = new AbortController()
+      try {
+        const result = await requestJson<WorkspacesPayload>('/api/workspaces', { signal: controller.signal })
+        if (active) setWorkspacesPayload(result)
+      } catch {
+        // Keep the last known provisioning state and retry on the next interval.
+      } finally {
+        if (active) timeoutId = window.setTimeout(pollWorkspaces, 3000)
+      }
+    }
+
+    timeoutId = window.setTimeout(pollWorkspaces, 3000)
+    return () => {
+      active = false
+      controller?.abort()
+      if (timeoutId !== undefined) window.clearTimeout(timeoutId)
+    }
+  }, [busy, hasActivePipelineProvisioning, open])
 
   function startAction(key: string) {
     setPendingAction(key)
@@ -462,7 +530,12 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
     }
   }
 
-  async function mutateWorkspace(body: Record<string, unknown>, key: string, successMessage: string) {
+  async function mutateWorkspace(
+    body: Record<string, unknown>,
+    key: string,
+    successMessage: string,
+    failureMessage = 'Unable to update sharing',
+  ) {
     if (busy) return false
     startAction(key)
     try {
@@ -475,7 +548,7 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
       setNotice(successMessage)
       return true
     } catch (workspaceError) {
-      setError(messageFrom(workspaceError, 'Unable to update sharing'))
+      setError(messageFrom(workspaceError, failureMessage))
       return false
     } finally {
       finishAction()
@@ -491,6 +564,34 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
       `${kind === 'board' ? 'Board' : 'Pipeline'} created.`,
     )
     if (created) setCreateNames((current) => ({ ...current, [kind]: '' }))
+  }
+
+  function requestPipelineProvisioning(pipeline: PipelineResource) {
+    const owned = pipeline.ownerEmail === currentUser?.email && pipeline.accessRole === 'owner'
+    const active = pipeline.provisioningStatus === 'queued' || pipeline.provisioningStatus === 'provisioning'
+    if (busy || !owned || pipeline.sheetBacked || active) return
+    setError('')
+    setNotice('')
+    setProvisioningPipeline(pipeline)
+  }
+
+  async function confirmPipelineProvisioning() {
+    const pipeline = provisioningPipeline
+    if (!pipeline || busy) return
+    await mutateWorkspace(
+      { action: 'provision-pipeline', pipelineId: pipeline.id },
+      `provision:pipeline:${pipeline.id}`,
+      `${pipeline.name} Sheet provisioning queued.`,
+      `Unable to provision a Sheet for ${pipeline.name}`,
+    )
+    setProvisioningPipeline(null)
+  }
+
+  function openPipelineSheet(pipeline: PipelineResource) {
+    const url = httpsUrl(pipeline.shortLinkUrl)
+    if (!url) return
+    const opened = window.open(url, '_blank', 'noopener,noreferrer')
+    if (opened) opened.opener = null
   }
 
   function shareDraftKey(kind: ResourceKind, resourceId: string) {
@@ -603,7 +704,7 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
         },
       }}
     >
-      <Box sx={{ px: { xs: 2, sm: 3 }, pt: { xs: 1.5, sm: 2.25 }, pb: 1.5 }}>
+      <Box sx={{ px: { xs: 2, sm: 3 }, pt: { xs: 'calc(env(safe-area-inset-top) + 12px)', sm: 2.25 }, pb: 1.5 }}>
         <Box display="flex" alignItems="center" justifyContent="space-between" gap={2} mb={1.5}>
           <Box minWidth={0}>
             <Typography id="settings-dialog-title" variant="h6" color="text.primary" fontWeight={700}>Settings</Typography>
@@ -635,7 +736,8 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
           value={activeTab}
           onChange={(_, value: number) => setActiveTab(value)}
           aria-label="Settings sections"
-          variant="fullWidth"
+          variant={fullScreen ? 'scrollable' : 'fullWidth'}
+          scrollButtons={false}
           sx={{
             minHeight: 42,
             p: '3px',
@@ -644,14 +746,14 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
             '& .MuiTabs-indicator': { display: 'none' },
             '& .MuiTab-root': {
               minHeight: 36,
-              minWidth: 0,
+              minWidth: { xs: 'auto', sm: 0 },
               borderRadius: '6px',
               color: 'text.secondary',
               textTransform: 'none',
               fontWeight: 600,
               fontSize: { xs: '0.78rem', sm: '0.875rem' },
               gap: { xs: 0.5, sm: 0.75 },
-              px: { xs: 0.5, sm: 1.5 },
+              px: { xs: 1.25, sm: 1.5 },
             },
             '& .MuiTab-root.Mui-selected': {
               color: 'text.primary',
@@ -662,12 +764,13 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
           <Tab icon={<AccountCircleRounded sx={{ fontSize: 18 }} />} iconPosition="start" label="Profile" id="settings-tab-0" aria-controls="settings-panel-0" />
           <Tab icon={<GroupRounded sx={{ fontSize: 18 }} />} iconPosition="start" label="People" id="settings-tab-1" aria-controls="settings-panel-1" />
           <Tab icon={<ShareRounded sx={{ fontSize: 18 }} />} iconPosition="start" label="Sharing" id="settings-tab-2" aria-controls="settings-panel-2" />
+          <Tab icon={<IntegrationInstructionsRounded sx={{ fontSize: 18 }} />} iconPosition="start" label="Integrations" id="settings-tab-3" aria-controls="settings-panel-3" />
         </Tabs>
       </Box>
 
       <Divider sx={{ borderColor: 'rgba(255,255,255,0.07)' }} />
 
-      <DialogContent sx={{ px: { xs: 2, sm: 3 }, py: { xs: 2, sm: 2.5 } }}>
+      <DialogContent sx={{ px: { xs: 2, sm: 3 }, pt: { xs: 2, sm: 2.5 }, pb: { xs: 'calc(env(safe-area-inset-bottom) + 20px)', sm: 2.5 } }}>
         {error ? <Alert severity="error" onClose={() => setError('')} sx={{ mb: 2, borderRadius: '8px' }}>{error}</Alert> : null}
         {notice ? <Alert severity="success" onClose={() => setNotice('')} sx={{ mb: 2, borderRadius: '8px' }}>{notice}</Alert> : null}
 
@@ -980,6 +1083,26 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
                       const pipeline = 'sheetBacked' in resource ? resource as PipelineResource : null
                       const suggestions = eligibleShareEmails.filter((email) => !resource.members.some((member) => member.email === email))
                       const shareKey = `share:${section.kind}:${resource.id}`
+                      const provisionKey = `provision:pipeline:${resource.id}`
+                      const provisioningActive = pipeline?.provisioningStatus === 'queued' || pipeline?.provisioningStatus === 'provisioning'
+                      const provisioningFailed = pipeline?.provisioningStatus === 'failed'
+                      const sheetUrl = httpsUrl(pipeline?.shortLinkUrl)
+                      const openSheetCommand = pipeline?.shortLinkUrl ? (
+                        <Tooltip title={sheetUrl ? `Open ${resource.name} Sheet` : 'Sheet link is unavailable'}>
+                          <Box component="span" sx={{ width: { xs: '100%', sm: 'auto' } }}>
+                            <Button
+                              variant="outlined"
+                              startIcon={<OpenInNewRounded />}
+                              aria-label={`Open Sheet for ${resource.name}`}
+                              onClick={() => openPipelineSheet(pipeline)}
+                              disabled={busy || !sheetUrl}
+                              sx={{ ...compactButtonSx, width: { xs: '100%', sm: 'auto' } }}
+                            >
+                              Open Sheet
+                            </Button>
+                          </Box>
+                        </Tooltip>
+                      ) : null
 
                       return (
                         <Box key={resource.id} sx={panelSx}>
@@ -1002,10 +1125,85 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
                             </Box>
 
                             {pipeline ? (
-                              <Stack direction="row" spacing={0.75} mt={1} flexWrap="wrap" useFlexGap>
-                                <Chip size="small" variant="outlined" label={pipeline.sheetBacked ? 'Sheet-backed' : 'App data'} sx={{ height: 24, minHeight: 24, fontSize: '0.7rem' }} />
-                                <Chip size="small" variant="outlined" label={pipeline.syncEnabled ? 'Sync on' : 'Sync off'} sx={{ height: 24, minHeight: 24, fontSize: '0.7rem' }} />
-                              </Stack>
+                              <>
+                                <Stack direction="row" spacing={0.75} mt={1} flexWrap="wrap" useFlexGap>
+                                  <Chip size="small" variant="outlined" label={pipeline.sheetBacked ? 'Sheet-backed' : 'App data'} sx={{ height: 24, minHeight: 24, fontSize: '0.7rem' }} />
+                                  <Chip size="small" variant="outlined" label={pipeline.syncEnabled ? 'Sync on' : 'Sync off'} sx={{ height: 24, minHeight: 24, fontSize: '0.7rem' }} />
+                                </Stack>
+
+                                {provisioningActive ? (
+                                  <Stack
+                                    direction={{ xs: 'column', sm: 'row' }}
+                                    alignItems={{ xs: 'stretch', sm: 'center' }}
+                                    justifyContent="space-between"
+                                    spacing={1}
+                                    mt={1.25}
+                                    sx={{ minHeight: 40 }}
+                                  >
+                                    <Stack
+                                      direction="row"
+                                      alignItems="center"
+                                      spacing={1}
+                                      role="status"
+                                      aria-live="polite"
+                                      sx={{ minWidth: { sm: 220 }, minHeight: 40 }}
+                                    >
+                                      <CircularProgress size={18} />
+                                      <Typography variant="body2" color="text.secondary" fontWeight={600}>
+                                        {pipeline.provisioningStatus === 'queued' ? 'Sheet creation queued' : 'Creating private Sheet'}
+                                      </Typography>
+                                    </Stack>
+                                    {openSheetCommand}
+                                  </Stack>
+                                ) : provisioningFailed ? (
+                                  <Box mt={1.25} sx={{ minHeight: 64 }}>
+                                    <Stack
+                                      direction={{ xs: 'column', sm: 'row' }}
+                                      alignItems={{ xs: 'stretch', sm: 'center' }}
+                                      justifyContent="space-between"
+                                      spacing={1}
+                                      sx={{ minHeight: 40 }}
+                                    >
+                                      <Stack direction="row" alignItems="center" spacing={0.75} sx={{ minHeight: 40 }}>
+                                        <ErrorOutlineRounded color="error" sx={{ fontSize: 20, flexShrink: 0 }} />
+                                        <Typography variant="body2" color="error.light" fontWeight={700}>Sheet setup failed</Typography>
+                                      </Stack>
+                                      <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1}>
+                                        {owned && !pipeline.sheetBacked ? (
+                                          <Button
+                                            variant="outlined"
+                                            startIcon={pendingAction === provisionKey ? <CircularProgress size={16} /> : <ReplayRounded />}
+                                            onClick={() => requestPipelineProvisioning(pipeline)}
+                                            disabled={busy}
+                                            sx={{ ...compactButtonSx, width: { xs: '100%', sm: 'auto' } }}
+                                          >
+                                            Retry
+                                          </Button>
+                                        ) : null}
+                                        {openSheetCommand}
+                                      </Stack>
+                                    </Stack>
+                                    <Typography variant="caption" color="error.light" sx={{ display: 'block', mt: 0.5, overflowWrap: 'anywhere' }}>
+                                      {safeProvisioningError(pipeline.provisioningError)}
+                                    </Typography>
+                                  </Box>
+                                ) : owned && !pipeline.sheetBacked ? (
+                                  <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} mt={1.25} sx={{ minHeight: 40 }}>
+                                    <Button
+                                      variant="outlined"
+                                      startIcon={pendingAction === provisionKey ? <CircularProgress size={16} /> : <AddToDriveRounded />}
+                                      onClick={() => requestPipelineProvisioning(pipeline)}
+                                      disabled={busy}
+                                      sx={{ ...compactButtonSx, width: { xs: '100%', sm: 'auto' } }}
+                                    >
+                                      Create private Sheet
+                                    </Button>
+                                    {openSheetCommand}
+                                  </Stack>
+                                ) : openSheetCommand ? (
+                                  <Stack direction="row" mt={1.25} sx={{ minHeight: 40 }}>{openSheetCommand}</Stack>
+                                ) : null}
+                              </>
                             ) : null}
                           </Box>
 
@@ -1151,7 +1349,49 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
             </Stack>
           </Box>
         ) : null}
+
+        {!loading && activeTab === 3 ? <IntegrationSettingsPanel isOwner={currentUser?.role === 'owner'} /> : null}
       </DialogContent>
+
+      <Dialog
+        open={Boolean(provisioningPipeline)}
+        onClose={() => { if (!busy) setProvisioningPipeline(null) }}
+        aria-labelledby="provision-pipeline-title"
+        aria-describedby="provision-pipeline-description"
+        fullWidth
+        maxWidth="xs"
+        PaperProps={{
+          sx: {
+            backgroundColor: '#1A1A23',
+            backgroundImage: 'none',
+            border: '1px solid rgba(255,255,255,0.09)',
+            borderRadius: '8px',
+          },
+        }}
+      >
+        <DialogTitle id="provision-pipeline-title" fontWeight={700}>
+          {provisioningPipeline?.provisioningStatus === 'failed' ? 'Retry private Sheet setup?' : 'Create private Sheet?'}
+        </DialogTitle>
+        <DialogContent>
+          <Typography id="provision-pipeline-description" variant="body2" color="text.secondary">
+            This creates a managed Google Drive folder, a private Google Sheet, and a ClawPilot short link for{' '}
+            <Box component="span" color="text.primary" fontWeight={700}>{provisioningPipeline?.name}</Box>.
+          </Typography>
+        </DialogContent>
+        <DialogActions sx={{ px: 3, pb: 2.5 }}>
+          <Button onClick={() => setProvisioningPipeline(null)} disabled={busy}>Cancel</Button>
+          <Button
+            variant="contained"
+            startIcon={pendingAction?.startsWith('provision:pipeline:')
+              ? <CircularProgress size={16} color="inherit" />
+              : provisioningPipeline?.provisioningStatus === 'failed' ? <ReplayRounded /> : <AddToDriveRounded />}
+            onClick={() => { void confirmPipelineProvisioning() }}
+            disabled={busy || !provisioningPipeline}
+          >
+            {provisioningPipeline?.provisioningStatus === 'failed' ? 'Retry' : 'Create private Sheet'}
+          </Button>
+        </DialogActions>
+      </Dialog>
     </Dialog>
   )
 }

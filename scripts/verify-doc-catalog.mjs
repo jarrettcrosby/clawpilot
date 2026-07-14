@@ -13,6 +13,7 @@ const requiredCurrentDocuments = [
   'docs/modules/agents-and-execution.md',
   'docs/modules/knowledge-releases-and-checkpoints.md',
   'docs/modules/short-links.md',
+  'docs/modules/user-integrations.md',
   'docs/operations/clawpilot-environments.md',
   'docs/operations/knowledge-vault-organization.md',
   'docs/releases/README.md',

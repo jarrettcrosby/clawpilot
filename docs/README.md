@@ -17,6 +17,7 @@ Current behavior is defined only by documents with `status: active` and `app_vis
 ### Modules
 
 - [Application shell and access](modules/application-shell-and-access.md)
+- [User integrations and credentials](modules/user-integrations.md)
 - [Projects and tenancy](modules/projects-and-tenancy.md)
 - [Pipeline and synchronization](modules/pipeline-and-sync.md)
 - [Agents and execution](modules/agents-and-execution.md)
@@ -27,6 +28,7 @@ Current behavior is defined only by documents with `status: active` and `app_vis
 
 - [ClawPilot environments and deployment](operations/clawpilot-environments.md)
 - [Knowledge vault organization](operations/knowledge-vault-organization.md)
+- [Google Workspace integration](operations/google-workspace-integration.md)
 - [Release documentation contract](releases/README.md)
 - [ClawPilot identity](brand/clawpilot-identity.md)
 

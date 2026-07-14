@@ -336,7 +336,7 @@ try {
   assert.equal(matonCalls.length, 1)
   assert.equal(matonCalls[0].pathname, '/google-mail/gmail/v1/users/me/messages/send')
   assert.equal(matonCalls[0].init.method, 'POST')
-  assert.equal(matonCalls[0].init.headers['Maton-Connection'], 'test-gmail-connection')
+  assert.equal(matonCalls[0].init.headers['Maton-Connection'], undefined)
   const mailPayload = JSON.parse(matonCalls[0].init.body)
   const decodedMessage = decodeBase64Url(mailPayload.raw)
   assert.match(decodedMessage, /Content-Type: multipart\/alternative/)

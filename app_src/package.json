@@ -21,6 +21,7 @@
     "@mui/icons-material": "^7.3.8",
     "@mui/material": "^7.3.8",
     "fast-xml-parser": "5.10.0",
+    "google-auth-library": "^10.9.0",
     "gray-matter": "^4.0.3",
     "next": "16.2.10",
     "pg": "^8.21.0",

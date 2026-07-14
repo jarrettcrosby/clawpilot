@@ -3,10 +3,17 @@ import { NextRequest, NextResponse } from 'next/server'
 import { getDropdownCatalog, pushDropdownsToSheet } from '@/lib/pipelineDropdownSync'
 import {
   isPostgresPipelineStoreEnabled,
+  type PipelineSheetContext,
   upsertPipelineDropdownCatalogAndEnqueueInPostgres,
 } from '@/lib/persistence/pipeline'
 import { requireRequestUser } from '@/lib/requestUser'
-import { PIPELINE_SELECTION_COOKIE, requireResourceEditor, resolvePipelineSpaceAccess } from '@/lib/tenancy'
+import {
+  PIPELINE_SELECTION_COOKIE,
+  isLegacyOwnerSheetPipeline,
+  requirePipelineSheetContext,
+  requireResourceEditor,
+  resolvePipelineSpaceAccess,
+} from '@/lib/tenancy'
 
 function idempotencyKey(req: NextRequest) {
   return (String(req.headers.get('idempotency-key') || '').trim() || crypto.randomUUID()).slice(0, 200)
@@ -15,6 +22,7 @@ function idempotencyKey(req: NextRequest) {
 export async function GET(req: NextRequest) {
   try {
     const forceRefresh = req.nextUrl.searchParams.get('refresh') === '1'
+    let context: (PipelineSheetContext & { legacyOwnerFallback: boolean }) | undefined
     if (isPostgresPipelineStoreEnabled()) {
       const actor = await requireRequestUser(req)
       const selected = req.cookies.get(PIPELINE_SELECTION_COOKIE)?.value || undefined
@@ -24,8 +32,12 @@ export async function GET(req: NextRequest) {
         return NextResponse.json({ ok: true, catalog: { syncedAt: null, source: 'app', dropdowns: {} } })
       }
       if (forceRefresh) requireResourceEditor(pipeline)
+      context = {
+        ...requirePipelineSheetContext(pipeline),
+        legacyOwnerFallback: isLegacyOwnerSheetPipeline(pipeline),
+      }
     }
-    const out = await getDropdownCatalog({ forceRefresh })
+    const out = await getDropdownCatalog({ ...context, forceRefresh })
     return NextResponse.json({ ok: true, ...out })
   } catch (e: unknown) {
     return NextResponse.json({ ok: false, error: String(e) }, { status: 500 })
@@ -44,16 +56,18 @@ export async function PUT(req: NextRequest) {
       if (!pipeline.syncEnabled) {
         return NextResponse.json({ ok: false, error: 'Custom dropdown editing is not available for app-managed pipelines yet' }, { status: 400 })
       }
+      const context = requirePipelineSheetContext(pipeline)
       const catalog = {
         ...body,
         source: 'app',
         syncedAt: new Date().toISOString(),
       }
       const queued = await upsertPipelineDropdownCatalogAndEnqueueInPostgres({
+        ...context,
         catalog,
         outbox: {
           aggregateType: 'pipeline_dropdowns',
-          aggregateId: 'default',
+          aggregateId: pipeline.id,
           operation: 'replace_dropdowns',
           payload: {},
           actor: actor.email,

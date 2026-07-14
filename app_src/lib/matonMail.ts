@@ -16,14 +16,6 @@ export type SendInvitationEmailInput = {
   expiresAt: string
 }
 
-function requiredConnectionId(): string {
-  const connectionId = String(process.env.MATON_GMAIL_CONNECTION_ID || '').trim()
-  if (!connectionId || /[\r\n]/.test(connectionId)) {
-    throw new Error('MATON_GMAIL_CONNECTION_ID is required')
-  }
-  return connectionId
-}
-
 function assertEmail(value: string): string {
   const email = String(value || '').trim()
   if (!email || /[\r\n]/.test(email) || !/^[\x21-\x7e]+$/.test(email)) {
@@ -95,14 +87,12 @@ function buildMessage(input: { to: string; subject: string; text: string; html: 
 }
 
 async function sendMessage(input: { to: string; subject: string; text: string; html: string }) {
-  const connectionId = requiredConnectionId()
   const to = assertEmail(input.to)
   const raw = base64Url(buildMessage({ ...input, to }))
   const response = await matonFetch(GMAIL_SEND_PATH, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'Maton-Connection': connectionId,
     },
     body: JSON.stringify({ raw }),
   })

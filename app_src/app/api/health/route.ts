@@ -152,6 +152,8 @@ export async function GET() {
           vector_knowledge_migration_applied: boolean
           shortlink_preflight_migration_applied: boolean
           shortlink_hardening_migration_applied: boolean
+          maton_credentials_migration_applied: boolean
+          managed_pipeline_resources_migration_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -242,6 +244,16 @@ export async function GET() {
                 FROM schema_migrations
                 WHERE filename = '0017_short_link_destination_hardening.sql'
               ) AS shortlink_hardening_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0018_user_maton_credentials.sql'
+              ) AS maton_credentials_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0019_managed_pipeline_google_resources.sql'
+              ) AS managed_pipeline_resources_migration_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -271,6 +283,8 @@ export async function GET() {
             && row?.vector_knowledge_migration_applied
             && row?.shortlink_preflight_migration_applied
             && row?.shortlink_hardening_migration_applied
+            && row?.maton_credentials_migration_applied
+            && row?.managed_pipeline_resources_migration_applied
             && row?.migration_checksums_present
           ),
         }
@@ -292,6 +306,8 @@ export async function GET() {
           || !row?.vector_knowledge_migration_applied
           || !row?.shortlink_preflight_migration_applied
           || !row?.shortlink_hardening_migration_applied
+          || !row?.maton_credentials_migration_applied
+          || !row?.managed_pipeline_resources_migration_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')

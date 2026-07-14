@@ -4,7 +4,7 @@ import { pathToFileURL } from 'node:url'
 
 const DEFAULT_ENDPOINT = 'https://backboard.railway.com/graphql/v2'
 const DEFAULT_ENVIRONMENTS = ['development', 'production']
-const DEFAULT_REQUIRED_SCHEDULES = ['DAILY', 'WEEKLY']
+const DEFAULT_REQUIRED_SCHEDULES = ['DAILY', 'WEEKLY', 'MONTHLY']
 const DEFAULT_MAX_AGE_HOURS = 30
 const VALID_SCHEDULES = new Set(['DAILY', 'WEEKLY', 'MONTHLY'])
 
@@ -272,7 +272,7 @@ Environment:
 Options:
   --environment <names>           Comma-separated names (default: development,production)
   --service <name>                Database service name (default: Postgres)
-  --required-schedules <kinds>    Comma-separated kinds (default: DAILY,WEEKLY)
+  --required-schedules <kinds>    Comma-separated kinds (default: DAILY,WEEKLY,MONTHLY)
   --max-age-hours <hours>         Maximum provider backup age (default: 30)
   --help                          Show this help
 `

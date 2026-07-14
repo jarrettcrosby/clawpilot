@@ -1,9 +1,13 @@
 import { query, withTransaction } from '@/lib/persistence/postgres'
 import {
   DEFAULT_PIPELINE_SHEET_ID,
+  enqueuePipelinePermissionSyncWithClient,
+  type PipelineProvisioningStatus,
+  type PipelineSheetContext,
   type PipelineProjection,
   readPipelineProjectionFromPostgres,
 } from '@/lib/persistence/pipeline'
+import { shortLinkUrl } from '@/lib/shortlinks'
 import {
   effectiveUserPermissions,
   getAppUser,
@@ -44,6 +48,14 @@ export type PipelineSpace = {
   sheetBacked: boolean
   syncEnabled: boolean
   sheetId: string | null
+  provisioningStatus: PipelineProvisioningStatus
+  provisioningError: string | null
+  provisioningRequestedAt: string | null
+  provisioningStartedAt: string | null
+  provisioningLastAttemptedAt: string | null
+  provisioningCompletedAt: string | null
+  shortLinkId: string | null
+  shortLinkUrl: string | null
   projection: PipelineProjection
   createdAt: string
   updatedAt: string
@@ -76,6 +88,14 @@ type PipelineSpaceRow = {
   members: ResourceMemberRow[] | null
   sheet_id: string | null
   sync_enabled: boolean
+  provisioning_status: PipelineProvisioningStatus
+  provisioning_error: string | null
+  provisioning_requested_at: string | null
+  provisioning_started_at: string | null
+  provisioning_last_attempted_at: string | null
+  provisioning_completed_at: string | null
+  short_link_id: string | null
+  short_link_slug: string | null
   projection: PipelineProjection
   created_at: string
   updated_at: string
@@ -113,6 +133,17 @@ function toProjectBoard(row: ProjectBoardRow): ProjectBoard {
   }
 }
 
+function hostedShortLinkUrl(slug: string | null) {
+  if (!slug) return null
+  try {
+    const url = new URL(shortLinkUrl(slug))
+    if (url.protocol !== 'https:' || url.username || url.password) return null
+    return url.toString()
+  } catch {
+    return null
+  }
+}
+
 function toPipelineSpace(row: PipelineSpaceRow): PipelineSpace {
   return {
     id: row.id,
@@ -124,6 +155,14 @@ function toPipelineSpace(row: PipelineSpaceRow): PipelineSpace {
     sheetBacked: Boolean(row.sheet_id),
     syncEnabled: row.sync_enabled,
     sheetId: row.sheet_id,
+    provisioningStatus: row.provisioning_status,
+    provisioningError: row.provisioning_error,
+    provisioningRequestedAt: row.provisioning_requested_at,
+    provisioningStartedAt: row.provisioning_started_at,
+    provisioningLastAttemptedAt: row.provisioning_last_attempted_at,
+    provisioningCompletedAt: row.provisioning_completed_at,
+    shortLinkId: row.short_link_id,
+    shortLinkUrl: hostedShortLinkUrl(row.short_link_slug),
     projection: row.projection || { ...EMPTY_PIPELINE },
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -181,6 +220,9 @@ export async function ensureDefaultResourcesForUser(emailValue: unknown): Promis
           UPDATE pipeline_spaces
           SET sheet_id = $2,
               sync_enabled = true,
+              provisioning_status = 'ready',
+              provisioning_error = NULL,
+              provisioning_completed_at = COALESCE(provisioning_completed_at, now()),
               projection = COALESCE(
                 (SELECT value FROM app_settings WHERE key = 'pipeline.normalized.current'),
                 pipeline_spaces.projection
@@ -258,6 +300,22 @@ export async function listPipelineSpaces(actorEmailValue: unknown): Promise<Pipe
         ), '[]'::jsonb) ELSE '[]'::jsonb END AS members,
         pipeline.sheet_id,
         pipeline.sync_enabled,
+        pipeline.provisioning_status,
+        pipeline.provisioning_error,
+        pipeline.provisioning_requested_at::text,
+        pipeline.provisioning_started_at::text,
+        pipeline.provisioning_last_attempted_at::text,
+        pipeline.provisioning_completed_at::text,
+        pipeline.short_link_id::text,
+        CASE
+          WHEN short_link.id IS NOT NULL
+            AND short_link.deleted_at IS NULL
+            AND short_link.disabled_at IS NULL
+            AND (short_link.expires_at IS NULL OR short_link.expires_at > now())
+            AND (short_link.max_clicks IS NULL OR short_link.click_count < short_link.max_clicks)
+          THEN short_link.slug
+          ELSE NULL
+        END AS short_link_slug,
         pipeline.projection,
         pipeline.created_at::text,
         pipeline.updated_at::text
@@ -265,6 +323,8 @@ export async function listPipelineSpaces(actorEmailValue: unknown): Promise<Pipe
       LEFT JOIN pipeline_space_members membership
         ON membership.pipeline_id = pipeline.id
        AND membership.user_email = $1
+      LEFT JOIN short_links short_link
+        ON short_link.id = pipeline.short_link_id
       WHERE pipeline.owner_email = $1 OR membership.user_email = $1
       ORDER BY
         CASE WHEN pipeline.owner_email = $1 AND pipeline.is_default THEN 0 WHEN pipeline.owner_email = $1 THEN 1 ELSE 2 END,
@@ -311,6 +371,31 @@ export async function resolvePipelineSpaceAccess(input: {
 
 export function requireResourceEditor(resource: Pick<ProjectBoard | PipelineSpace, 'accessRole'>): void {
   if (resource.accessRole === 'viewer') throw new Error('This resource is view-only')
+}
+
+export function requirePipelineSheetContext(
+  space: Pick<PipelineSpace, 'id' | 'sheetId' | 'syncEnabled'>,
+): PipelineSheetContext {
+  if (!space.syncEnabled || !space.sheetId) {
+    throw new Error('This pipeline has no external Sheet sync source')
+  }
+  if (!/^[A-Za-z0-9_-]{1,256}$/.test(space.sheetId)) {
+    throw new Error('This pipeline has an invalid external Sheet source')
+  }
+  return { pipelineId: space.id, sheetId: space.sheetId }
+}
+
+export function isLegacyOwnerSheetPipeline(
+  space: Pick<PipelineSpace, 'ownerEmail' | 'isDefault' | 'sheetId'> | null,
+): boolean {
+  const configuredOwner = String(process.env.APP_LOGIN_EMAIL || '').trim().toLowerCase()
+  return Boolean(
+    space
+    && configuredOwner
+    && space.isDefault
+    && space.ownerEmail.toLowerCase() === configuredOwner
+    && space.sheetId === DEFAULT_PIPELINE_SHEET_ID,
+  )
 }
 
 export async function createProjectBoard(input: { actorEmail: unknown; name: unknown }): Promise<ProjectBoard> {
@@ -381,17 +466,20 @@ export async function sharePipelineSpace(input: {
   const pipeline = await resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: input.pipelineId })
   if (pipeline.ownerEmail !== actor.email) throw new Error('Only the pipeline owner can share it')
   const target = await validateShareTarget(actor.email, input.userEmail)
-  await query(
-    `
-      INSERT INTO pipeline_space_members (pipeline_id, user_email, access_role, shared_by, updated_at)
-      VALUES ($1::uuid, $2, $3, $4, now())
-      ON CONFLICT (pipeline_id, user_email) DO UPDATE SET
-        access_role = EXCLUDED.access_role,
-        shared_by = EXCLUDED.shared_by,
-        updated_at = now()
-    `,
-    [pipeline.id, target.email, normalizeShareRole(input.accessRole), actor.email],
-  )
+  await withTransaction(async (client) => {
+    await client.query(
+      `
+        INSERT INTO pipeline_space_members (pipeline_id, user_email, access_role, shared_by, updated_at)
+        VALUES ($1::uuid, $2, $3, $4, now())
+        ON CONFLICT (pipeline_id, user_email) DO UPDATE SET
+          access_role = EXCLUDED.access_role,
+          shared_by = EXCLUDED.shared_by,
+          updated_at = now()
+      `,
+      [pipeline.id, target.email, normalizeShareRole(input.accessRole), actor.email],
+    )
+    await enqueuePipelinePermissionSyncWithClient(client, { pipelineId: pipeline.id, actor: actor.email })
+  })
   return resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: pipeline.id })
 }
 
@@ -415,13 +503,20 @@ export async function removePipelineShare(input: {
   const actor = await requireActiveAppUser(input.actorEmail)
   const pipeline = await resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: input.pipelineId })
   if (pipeline.ownerEmail !== actor.email) throw new Error('Only the pipeline owner can change sharing')
-  await query('DELETE FROM pipeline_space_members WHERE pipeline_id = $1::uuid AND user_email = $2', [pipeline.id, normalizeUserEmail(input.userEmail)])
+  await withTransaction(async (client) => {
+    await client.query(
+      'DELETE FROM pipeline_space_members WHERE pipeline_id = $1::uuid AND user_email = $2',
+      [pipeline.id, normalizeUserEmail(input.userEmail)],
+    )
+    await enqueuePipelinePermissionSyncWithClient(client, { pipelineId: pipeline.id, actor: actor.email })
+  })
   return resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: pipeline.id })
 }
 
 export async function readPipelineProjectionForSpace(space: PipelineSpace): Promise<PipelineProjection> {
-  if (space.syncEnabled && space.sheetId === DEFAULT_PIPELINE_SHEET_ID) {
-    return (await readPipelineProjectionFromPostgres()) || space.projection || { ...EMPTY_PIPELINE }
+  if (space.syncEnabled) {
+    const context = requirePipelineSheetContext(space)
+    return (await readPipelineProjectionFromPostgres(context)) || space.projection || { ...EMPTY_PIPELINE }
   }
   return space.projection || { ...EMPTY_PIPELINE }
 }

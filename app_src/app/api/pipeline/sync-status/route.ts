@@ -8,7 +8,14 @@ import {
   readPipelineSyncDiagnosticsFromPostgres,
 } from '@/lib/persistence/pipeline'
 import { requireRequestUser } from '@/lib/requestUser'
-import { PIPELINE_SELECTION_COOKIE, readPipelineProjectionForSpace, resolvePipelineSpaceAccess } from '@/lib/tenancy'
+import {
+  PIPELINE_SELECTION_COOKIE,
+  isLegacyOwnerSheetPipeline,
+  readPipelineProjectionForSpace,
+  requirePipelineSheetContext,
+  resolvePipelineSpaceAccess,
+  type PipelineSpace,
+} from '@/lib/tenancy'
 
 const ROOT = path.join(process.cwd(), '..')
 const NORM = process.env.PIPELINE_NORMALIZED_PATH || path.join(ROOT, 'data', 'pipeline', 'normalized', 'current.json')
@@ -17,13 +24,20 @@ const RAW = process.env.PIPELINE_RAW_PATH || path.join(path.dirname(path.dirname
 export async function GET(req: NextRequest) {
   try {
     if (isPostgresPipelineStoreEnabled()) {
+      let selectedPipeline: PipelineSpace | null = null
       try {
         const actor = await requireRequestUser(req)
         const selected = req.cookies.get(PIPELINE_SELECTION_COOKIE)?.value || undefined
         const pipeline = await resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: selected })
           .catch(() => resolvePipelineSpaceAccess({ actorEmail: actor.email }))
+        selectedPipeline = pipeline
         const projection = await readPipelineProjectionForSpace(pipeline)
-        const diagnostics = pipeline.syncEnabled ? await readPipelineSyncDiagnosticsFromPostgres() : { outbox: {}, oldestPendingAt: null }
+        const diagnostics = pipeline.syncEnabled
+          ? await readPipelineSyncDiagnosticsFromPostgres({
+              ...requirePipelineSheetContext(pipeline),
+              includeLegacyOwnerItems: isLegacyOwnerSheetPipeline(pipeline),
+            })
+          : { outbox: {}, oldestPendingAt: null }
 
         logPipelineEvent({ module: 'pipeline-sync', action: 'status', result: 'ok', actor: actor.email, pipelineId: pipeline.id })
         return NextResponse.json({
@@ -35,7 +49,7 @@ export async function GET(req: NextRequest) {
           pipeline: { id: pipeline.id, name: pipeline.name, accessRole: pipeline.accessRole, syncEnabled: pipeline.syncEnabled },
         })
       } catch (error) {
-        if (!shouldFallbackToFileOnDatabaseError()) throw error
+        if (!shouldFallbackToFileOnDatabaseError() || !isLegacyOwnerSheetPipeline(selectedPipeline)) throw error
         console.warn('[pipeline-sync-status] Postgres read failed; falling back to file store', error)
       }
     }

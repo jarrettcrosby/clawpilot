@@ -1,15 +1,33 @@
 import { getErrorMessage } from '@/lib/errorUtils'
+import { resolveManagedGoogleWorkspaceRuntime } from '@/lib/integrations/googleWorkspace'
+import { googleSheetsJson, type GoogleWorkspaceRuntime } from '@/lib/integrations/googleWorkspaceClient'
 import { matonFetch } from '@/lib/maton'
+import {
+  provisionPipelineGoogleResources,
+  reconcilePipelineGooglePermissions,
+  replaceManagedPipelineDropdowns,
+  sanitizePipelineProvisioningError,
+} from '@/lib/pipelineProvisioning'
 import {
   claimPipelineSyncOutboxInPostgres,
   completePipelineSyncOutboxInPostgres,
-  DEFAULT_PIPELINE_SHEET_ID,
   failPipelineSyncOutboxInPostgres,
+  InvalidPipelineOutboxContextError,
+  resolvePipelineOutboxSheetContextInPostgres,
   type PipelineDropdownCatalog,
   type PipelineOutboxItem,
+  type ResolvedPipelineOutboxSheetContext,
 } from '@/lib/persistence/pipeline'
 
 class PermanentOutboxError extends Error {}
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+
+function workspacePipelineId(item: PipelineOutboxItem) {
+  const pipelineId = String(item.pipelineId || item.payload.pipelineId || item.aggregateId || '').trim()
+  if (!UUID_PATTERN.test(pipelineId)) throw new PermanentOutboxError('Managed pipeline operation has an invalid pipeline ID')
+  return pipelineId
+}
 
 function readRangeAndValues(item: PipelineOutboxItem): { range: string; values: unknown[][] } {
   const range = String(item.payload.range || '').trim()
@@ -20,9 +38,33 @@ function readRangeAndValues(item: PipelineOutboxItem): { range: string; values: 
   return { range, values: values as unknown[][] }
 }
 
-async function readValues(range: string): Promise<unknown[][]> {
+function hasManagedSheetsBinding(context: ResolvedPipelineOutboxSheetContext): context is ResolvedPipelineOutboxSheetContext & {
+  ownerEmail: string
+  googleServiceAccountEmail: string
+  googleSharedDriveId: string
+} {
+  return Boolean(
+    context.ownerEmail
+    && context.googleServiceAccountEmail
+    && context.googleSharedDriveId
+    && !context.legacyOwnerFallback,
+  )
+}
+
+async function readValues(
+  context: ResolvedPipelineOutboxSheetContext,
+  range: string,
+  managedRuntime: GoogleWorkspaceRuntime | null,
+): Promise<unknown[][]> {
+  if (managedRuntime) {
+    const parsed = await googleSheetsJson<{ values?: unknown[][] }>(
+      managedRuntime,
+      `/v4/spreadsheets/${context.sheetId}/values/${encodeURIComponent(range)}`,
+    )
+    return Array.isArray(parsed.values) ? parsed.values : []
+  }
   const response = await matonFetch(
-    `/google-sheets/v4/spreadsheets/${DEFAULT_PIPELINE_SHEET_ID}/values/${encodeURIComponent(range)}`,
+    `/google-sheets/v4/spreadsheets/${context.sheetId}/values/${encodeURIComponent(range)}`,
   )
   const text = await response.text()
   if (!response.ok) {
@@ -49,13 +91,24 @@ function rowsMatch(actual: unknown[] | undefined, expected: unknown[] | undefine
 }
 
 async function writeValues(input: {
+  context: ResolvedPipelineOutboxSheetContext
   range: string
   values: unknown[][]
   mode: 'update' | 'append'
+  managedRuntime: GoogleWorkspaceRuntime | null
 }) {
   const endpoint = input.mode === 'append'
-    ? `/google-sheets/v4/spreadsheets/${DEFAULT_PIPELINE_SHEET_ID}/values/${encodeURIComponent(input.range)}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`
-    : `/google-sheets/v4/spreadsheets/${DEFAULT_PIPELINE_SHEET_ID}/values/${encodeURIComponent(input.range)}?valueInputOption=USER_ENTERED`
+    ? `/google-sheets/v4/spreadsheets/${input.context.sheetId}/values/${encodeURIComponent(input.range)}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`
+    : `/google-sheets/v4/spreadsheets/${input.context.sheetId}/values/${encodeURIComponent(input.range)}?valueInputOption=USER_ENTERED`
+
+  if (input.managedRuntime) {
+    await googleSheetsJson(input.managedRuntime, endpoint.slice('/google-sheets'.length), {
+      method: input.mode === 'append' ? 'POST' : 'PUT',
+      body: { range: input.range, majorDimension: 'ROWS', values: input.values },
+      idempotent: input.mode === 'update',
+    })
+    return
+  }
 
   const response = await matonFetch(endpoint, {
     method: input.mode === 'append' ? 'POST' : 'PUT',
@@ -68,7 +121,11 @@ async function writeValues(input: {
   }
 }
 
-async function executeOutboxItem(item: PipelineOutboxItem) {
+async function executeOutboxItem(
+  item: PipelineOutboxItem,
+  context: ResolvedPipelineOutboxSheetContext,
+  managedRuntime: GoogleWorkspaceRuntime | null,
+) {
   if (item.operation === 'update_opportunity') {
     const { range, values } = readRangeAndValues(item)
     if (!/^Opportunities!B(\d+):M\1$/.test(range)) {
@@ -79,14 +136,14 @@ async function executeOutboxItem(item: PipelineOutboxItem) {
       throw new PermanentOutboxError('Opportunity update is missing its expected Sheet row')
     }
 
-    const current = (await readValues(range))[0] || []
+    const current = (await readValues(context, range, managedRuntime))[0] || []
     if (rowsMatch(current, values[0])) return
     if (!rowsMatch(current, beforeValues[0] as unknown[])) {
       throw new PermanentOutboxError(
         `Opportunity Sheet row changed before outbox item ${item.id}; refresh before retrying`,
       )
     }
-    await writeValues({ range, values, mode: 'update' })
+    await writeValues({ context, range, values, mode: 'update', managedRuntime })
     return
   }
 
@@ -96,7 +153,7 @@ async function executeOutboxItem(item: PipelineOutboxItem) {
       throw new PermanentOutboxError('Interaction append has an invalid Sheet range')
     }
     const marker = `[ClawPilot sync:${item.id}]`
-    const existing = await readValues(range)
+    const existing = await readValues(context, range, managedRuntime)
     if (existing.some((row) => row.some((cell) => String(cell || '').includes(marker)))) return
 
     const markedValues = values.map((row) => {
@@ -106,7 +163,7 @@ async function executeOutboxItem(item: PipelineOutboxItem) {
       next[7] = notes ? `${notes}\n${marker}` : marker
       return next
     })
-    await writeValues({ range, values: markedValues, mode: 'append' })
+    await writeValues({ context, range, values: markedValues, mode: 'append', managedRuntime })
     return
   }
 
@@ -115,8 +172,20 @@ async function executeOutboxItem(item: PipelineOutboxItem) {
     if (!catalog || typeof catalog !== 'object') {
       throw new PermanentOutboxError('Dropdown replacement is missing a catalog')
     }
+    if (managedRuntime) {
+      await replaceManagedPipelineDropdowns({
+        runtime: managedRuntime,
+        sheetId: context.sheetId,
+        catalog,
+      })
+      return
+    }
     const { pushDropdownsToSheet } = await import('@/lib/pipelineDropdownSync')
-    await pushDropdownsToSheet(catalog)
+    await pushDropdownsToSheet(catalog, {
+      pipelineId: context.pipelineId || undefined,
+      sheetId: context.sheetId,
+      legacyOwnerFallback: context.legacyOwnerFallback,
+    })
     return
   }
 
@@ -133,14 +202,43 @@ export async function processPipelineSyncOutbox(input: {
 
   for (const item of items) {
     try {
-      await executeOutboxItem(item)
+      if (item.operation === 'provision_pipeline') {
+        const pipelineId = workspacePipelineId(item)
+        item.pipelineId = pipelineId
+        await provisionPipelineGoogleResources(pipelineId)
+        await completePipelineSyncOutboxInPostgres(item)
+        results.push({ id: item.id, operation: item.operation, status: 'succeeded' })
+        continue
+      }
+      if (item.operation === 'sync_pipeline_permissions') {
+        const pipelineId = workspacePipelineId(item)
+        item.pipelineId = pipelineId
+        await reconcilePipelineGooglePermissions(pipelineId)
+        await completePipelineSyncOutboxInPostgres(item)
+        results.push({ id: item.id, operation: item.operation, status: 'succeeded' })
+        continue
+      }
+      const context = await resolvePipelineOutboxSheetContextInPostgres(item)
+      item.pipelineId = context.pipelineId
+      item.sheetId = context.sheetId
+      const managedRuntime = hasManagedSheetsBinding(context)
+        ? await resolveManagedGoogleWorkspaceRuntime({
+            serviceAccountEmail: context.googleServiceAccountEmail,
+            sharedDriveId: context.googleSharedDriveId,
+          })
+        : null
+      await executeOutboxItem(item, context, managedRuntime)
       await completePipelineSyncOutboxInPostgres(item)
       results.push({ id: item.id, operation: item.operation, status: 'succeeded' })
     } catch (error) {
+      const managedWorkspaceOperation = item.operation === 'provision_pipeline'
+        || item.operation === 'sync_pipeline_permissions'
       const status = await failPipelineSyncOutboxInPostgres({
         item,
-        error: getErrorMessage(error),
-        maxAttempts: error instanceof PermanentOutboxError ? item.attempts : maxAttempts,
+        error: managedWorkspaceOperation ? sanitizePipelineProvisioningError(error) : getErrorMessage(error),
+        maxAttempts: error instanceof PermanentOutboxError || error instanceof InvalidPipelineOutboxContextError
+          ? item.attempts
+          : maxAttempts,
       })
       results.push({ id: item.id, operation: item.operation, status })
     }
