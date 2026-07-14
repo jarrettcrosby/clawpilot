@@ -47,13 +47,13 @@ export function suiteCrmBaseUrl(value = process.env.SUITECRM_BASE_URL) {
   }
 }
 
-async function readJson(response: Response): Promise<Record<string, unknown>> {
+async function readJson(response: Response): Promise<unknown> {
   const raw = await response.text()
   if (Buffer.byteLength(raw, 'utf8') > 2 * 1024 * 1024) throw new Error('SuiteCRM returned an oversized response')
   try {
     const parsed = raw ? JSON.parse(raw) : {}
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not an object')
-    return parsed as Record<string, unknown>
+    if (!parsed || typeof parsed !== 'object') throw new Error('not a JSON container')
+    return parsed
   } catch {
     throw new Error(`SuiteCRM returned an invalid response (${response.status})`)
   }
@@ -101,7 +101,7 @@ async function request(
     signal: AbortSignal.timeout(20_000),
   })
   if (allowNotFound && response.status === 404) return null
-  const parsed = await readJson(response) as JsonApiResponse
+  const parsed = await readJson(response)
   if (!response.ok) throw new Error(`SuiteCRM request failed (${response.status})`)
   return parsed
 }
@@ -132,7 +132,7 @@ export async function upsertSuiteCrmRecord(
   const response = await request('/Api/V8/module', {
     method: existing ? 'PATCH' : 'POST',
     body: JSON.stringify(body),
-  }, fetchImpl)
+  }, fetchImpl) as JsonApiResponse
   const id = String(response?.data?.id || record.suiteCrmId)
   if (id !== record.suiteCrmId) throw new Error('SuiteCRM returned an unexpected record ID')
   return id
