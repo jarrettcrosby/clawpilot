@@ -138,6 +138,7 @@ if ($closeTag === false) {
 $trustedHosts = [
     '^' . preg_quote($publicHost, '/') . '$',
     '^suitecrm\\.railway\\.internal$',
+    '^healthcheck\\.railway\\.app$',
 ];
 $managed = $startMarker . "\n"
     . '$sugar_config[\'site_url\'] = ' . var_export($publicUrl, true) . ";\n"

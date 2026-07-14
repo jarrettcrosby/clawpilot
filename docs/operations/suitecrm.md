@@ -56,7 +56,7 @@ The punchout opens SuiteCRM's native login/session surface. PHP sessions are coo
 The SuiteCRM volume persists application configuration across deploys. On every container boot, the entrypoint validates `SUITECRM_PUBLIC_URL` before starting SuiteCRM and atomically refreshes a ClawPilot-managed block in `public/legacy/config_override.php`:
 
 - `site_url` is set to the exact public HTTPS origin.
-- `trusted_hosts` is replaced with anchored expressions for the public hostname and `suitecrm.railway.internal`.
+- `trusted_hosts` is replaced with anchored expressions for the public hostname, `suitecrm.railway.internal`, and Railway's `healthcheck.railway.app` probe host.
 - unrelated persisted override settings remain unchanged.
 
 The managed block is inserted last so stale installer values cannot override it. Startup fails closed if the existing override is unreadable, has an incomplete managed block, contains non-whitespace after its closing PHP tag, or cannot be replaced with `www-data:www-data` ownership and mode `0640`.
