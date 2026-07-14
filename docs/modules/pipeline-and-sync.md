@@ -41,6 +41,7 @@ Provide a user-owned pipeline workspace while preserving the Opportunities Sheet
 - The managed folder grants direct user access to the pipeline owner and active app members: `editor` maps to `writer`, and `viewer` maps to `reader`. The reconciler never creates `anyone`, domain, group, or public permissions and only mutates exact users or permissions tracked by ClawPilot.
 - Shared Drive governing and inherited permissions are preserved. Direct broad permissions are rejected for operator review; selecting a Shared Drive therefore carries the visibility implied by that drive's governing membership.
 - Provisioning and permission reconciliation are serialized per pipeline and processed as idempotent `google_workspace` outbox operations.
+- Credential testing and every provisioning attempt preflight both the Google Sheets API service and the API key restriction. A missing or blocked Sheets API fails before ClawPilot creates new Drive resources.
 
 ## Lifecycle
 

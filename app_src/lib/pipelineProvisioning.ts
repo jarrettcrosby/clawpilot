@@ -8,6 +8,7 @@ import {
   GoogleWorkspaceClientError,
   googleDriveJson,
   googleSheetsJson,
+  validateGoogleSheetsAccess,
   type GoogleWorkspaceRuntime,
 } from '@/lib/integrations/googleWorkspaceClient'
 import {
@@ -279,6 +280,7 @@ export async function queuePipelineProvisioning(input: { actorEmail: unknown; pi
     const runtime = pipeline.googleServiceAccountEmail || pipeline.googleSharedDriveId
       ? await runtimeForPipeline(pipeline)
       : await resolveGoogleWorkspaceProvisioningRuntime()
+    await validateGoogleSheetsAccess(runtime)
     const queued = await enqueuePipelineProvisioningInPostgres({
       pipelineId: pipeline.id,
       ownerEmail: pipeline.ownerEmail,
@@ -1046,6 +1048,7 @@ export async function provisionPipelineGoogleResources(pipelineId: string) {
     return await withPipelineGoogleLock(pipelineId, async () => {
       let pipeline = await markPipelineProvisioningStartedInPostgres(pipelineId)
       const runtime = await runtimeForPipeline(pipeline)
+      await validateGoogleSheetsAccess(runtime)
       if (pipeline.provisioningStatus === 'ready' && pipeline.sheetId && pipeline.syncEnabled) {
         await reconcilePipelineGooglePermissionsUnlocked(pipeline.id, runtime)
         const shortLinkId = await ensurePipelineShortLink(pipeline, pipeline.sheetId)

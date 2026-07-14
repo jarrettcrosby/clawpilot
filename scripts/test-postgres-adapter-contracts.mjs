@@ -421,6 +421,8 @@ assertIncludes(googleWorkspaceClient, "cache: 'no-store'", 'native Google cache 
 assertIncludes(googleWorkspaceClient, 'readBoundedResponse', 'bounded Google response reading')
 assertIncludes(googleWorkspaceClient, "'/discovery/v1/apis/drive/v3/rest'", 'independent API key validation')
 assertIncludes(googleWorkspaceClient, 'validateGoogleServiceAccount', 'OAuth Drive service-account validation')
+assertIncludes(googleWorkspaceClient, 'clawpilot_google_sheets_api_probe', 'Google Sheets API access validation')
+assertIncludes(googleWorkspaceClient, 'GOOGLE_SHEETS_ACCESS_DENIED', 'actionable Google Sheets configuration error')
 assertIncludes(googleWorkspaceClient, 'capabilities(canAddChildren,canShare)', 'Shared Drive capability validation')
 assertIncludes(googleWorkspaceClient, 'GOOGLE_SHARED_DRIVE_INSUFFICIENT_ACCESS', 'actionable Shared Drive role error')
 assertIncludes(googleWorkspaceClient, 'nextPageToken', 'Shared Drive pagination')
@@ -477,6 +479,11 @@ assert.ok(
     < updateCredentialBody.indexOf('await writeGoogleWorkspaceCredentialInPostgres'),
   'service-account candidate must validate before persistence',
 )
+assert.ok(
+  updateCredentialBody.indexOf('validateGoogleSheetsAccess')
+    < updateCredentialBody.indexOf('await writeGoogleWorkspaceCredentialInPostgres'),
+  'Google Sheets access must validate before persistence',
+)
 assertIncludes(updateCredentialBody, ': current.apiKeySecret', 'untouched API key ciphertext preservation')
 assertIncludes(updateCredentialBody, ': current.serviceAccountSecret', 'untouched service-account ciphertext preservation')
 assertIncludes(
@@ -484,6 +491,7 @@ assertIncludes(
   'else if (input.setApiKey && effectiveServiceAccount)',
   'API key rotation must revalidate the stored service account and Shared Drive',
 )
+assertIncludes(pipelineProvisioning, 'await validateGoogleSheetsAccess(runtime)', 'pipeline Sheets preflight')
 
 const googleWorkspaceRoute = read('app_src/app/api/integrations/google-workspace/route.ts')
 assertIncludes(googleWorkspaceRoute, "actor.role !== 'owner'", 'owner-only Google Workspace administration')

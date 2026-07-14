@@ -5,6 +5,7 @@ const DRIVE_ORIGIN = 'https://www.googleapis.com'
 const SHEETS_ORIGIN = 'https://sheets.googleapis.com'
 const DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive'
 const SHEETS_SCOPE = 'https://www.googleapis.com/auth/spreadsheets'
+const SHEETS_ACCESS_PROBE_ID = 'clawpilot_google_sheets_api_probe'
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 const REQUEST_TIMEOUT_MS = 20_000
 const RETRYABLE_STATUSES = new Set([408, 429, 500, 502, 503, 504])
@@ -340,6 +341,34 @@ export async function validateGoogleServiceAccount(runtime: GoogleWorkspaceRunti
       422,
       'GOOGLE_SERVICE_ACCOUNT_IDENTITY_MISMATCH',
     )
+  }
+}
+
+export async function validateGoogleSheetsAccess(runtime: GoogleWorkspaceRuntime) {
+  const parameters = new URLSearchParams({ fields: 'spreadsheetId' })
+  try {
+    await googleSheetsJson(
+      runtime,
+      `/v4/spreadsheets/${SHEETS_ACCESS_PROBE_ID}?${parameters.toString()}`,
+    )
+  } catch (error) {
+    if (
+      error instanceof GoogleWorkspaceClientError
+      && error.code === 'GOOGLE_RESOURCE_NOT_FOUND'
+    ) {
+      return
+    }
+    if (
+      error instanceof GoogleWorkspaceClientError
+      && error.code === 'GOOGLE_ACCESS_DENIED'
+    ) {
+      throw new GoogleWorkspaceClientError(
+        'Enable Google Sheets API and allow it in the configured Google API key restrictions',
+        422,
+        'GOOGLE_SHEETS_ACCESS_DENIED',
+      )
+    }
+    throw error
   }
 }
 

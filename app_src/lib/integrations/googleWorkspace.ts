@@ -11,6 +11,7 @@ import {
   GoogleWorkspaceClientError,
   listAccessibleGoogleSharedDrives,
   validateGoogleApiKey,
+  validateGoogleSheetsAccess,
   validateGoogleServiceAccount,
   verifyAccessibleGoogleSharedDrive,
   type GoogleSharedDrive,
@@ -188,7 +189,10 @@ export async function updateGoogleWorkspaceCredential(input: {
         apiKey: candidateApiKey,
         credentialVersion: current.credentialVersion + 1,
       })
-      await validateGoogleServiceAccount(candidateRuntime)
+      await Promise.all([
+        validateGoogleServiceAccount(candidateRuntime),
+        validateGoogleSheetsAccess(candidateRuntime),
+      ])
       if (current.selectedSharedDriveId) {
         try {
           const selected = await verifyAccessibleGoogleSharedDrive(candidateRuntime, current.selectedSharedDriveId)
@@ -208,7 +212,10 @@ export async function updateGoogleWorkspaceCredential(input: {
         sharedDriveId: current.selectedSharedDriveId,
         sharedDriveName: current.selectedSharedDriveName,
       })
-      await validateGoogleServiceAccount(candidateRuntime)
+      await Promise.all([
+        validateGoogleServiceAccount(candidateRuntime),
+        validateGoogleSheetsAccess(candidateRuntime),
+      ])
       if (current.selectedSharedDriveId) {
         const selected = await verifyAccessibleGoogleSharedDrive(candidateRuntime, current.selectedSharedDriveId)
         selectedSharedDriveId = selected.id
@@ -305,7 +312,10 @@ export async function testGoogleWorkspaceConnection(input: { actorEmail: string 
   try {
     const current = await readGoogleWorkspaceIntegrationRecordInPostgres()
     const resolvedRuntime = await configuredRuntime(current)
-    await validateGoogleServiceAccount(resolvedRuntime)
+    await Promise.all([
+      validateGoogleServiceAccount(resolvedRuntime),
+      validateGoogleSheetsAccess(resolvedRuntime),
+    ])
     if (current.selectedSharedDriveId) {
       await verifyAccessibleGoogleSharedDrive(resolvedRuntime, current.selectedSharedDriveId)
     }
