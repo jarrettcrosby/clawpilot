@@ -27,7 +27,9 @@ import {
   type PipelineProvisioningRecord,
 } from '@/lib/persistence/pipeline'
 import { getPostgresPool } from '@/lib/persistence/postgres'
+import { syncAppUserProfileToCrm } from '@/lib/persistence/crm'
 import { createShortLink, listShortLinks, type ShortLinkActor } from '@/lib/shortlinks'
+import { workspaceOrganizationRootId } from '@/lib/organizations'
 import { normalizeUserEmail } from '@/lib/users'
 
 const DRIVE_FOLDER_MIME_TYPE = 'application/vnd.google-apps.folder'
@@ -151,18 +153,18 @@ function delay(milliseconds: number) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds))
 }
 
-function pipelineLockKey(pipelineId: string) {
-  return `clawpilot:pipeline-google:${pipelineId}`
+function pipelineLockKey(scope: string) {
+  return `clawpilot:pipeline-google:${scope}`
 }
 
-async function withPipelineGoogleLock<T>(pipelineId: string, callback: () => Promise<T>): Promise<T> {
+async function withPipelineGoogleLock<T>(scope: string, callback: () => Promise<T>): Promise<T> {
   const client = await getPostgresPool().connect()
   try {
-    await client.query('SELECT pg_advisory_lock(hashtext($1)::bigint)', [pipelineLockKey(pipelineId)])
+    await client.query('SELECT pg_advisory_lock(hashtext($1)::bigint)', [pipelineLockKey(scope)])
     return await callback()
   } finally {
     try {
-      await client.query('SELECT pg_advisory_unlock(hashtext($1)::bigint)', [pipelineLockKey(pipelineId)])
+      await client.query('SELECT pg_advisory_unlock(hashtext($1)::bigint)', [pipelineLockKey(scope)])
     } finally {
       client.release()
     }
@@ -409,6 +411,45 @@ async function getDriveFile(runtime: GoogleWorkspaceRuntime, resourceId: string)
   return googleDriveJson<DriveFile>(runtime, `/drive/v3/files/${resourceId}?${parameters.toString()}`)
 }
 
+async function driveFolderHasChildren(runtime: GoogleWorkspaceRuntime, folderId: string) {
+  const parameters = new URLSearchParams({
+    q: `trashed = false and '${driveQueryLiteral(folderId)}' in parents`,
+    corpora: 'drive',
+    driveId: runtimeSharedDriveId(runtime),
+    includeItemsFromAllDrives: 'true',
+    supportsAllDrives: 'true',
+    spaces: 'drive',
+    pageSize: '1',
+    fields: 'files(id)',
+  })
+  const response = await googleDriveJson<{ files?: Array<{ id?: string }> }>(
+    runtime,
+    `/drive/v3/files?${parameters.toString()}`,
+  )
+  return Boolean(response.files?.length)
+}
+
+async function cleanupLegacyFolderChain(runtime: GoogleWorkspaceRuntime, folderId: string | undefined) {
+  const legacyResources = new Set(['pipelines-root', 'user-root', 'users-root'])
+  let current = folderId
+  for (let depth = 0; current && depth < 3; depth += 1) {
+    const folder = await getDriveFile(runtime, current)
+    if (
+      folder.mimeType !== DRIVE_FOLDER_MIME_TYPE
+      || folder.appProperties?.clawpilotManaged !== 'true'
+      || !legacyResources.has(String(folder.appProperties?.clawpilotResource || ''))
+      || await driveFolderHasChildren(runtime, current)
+    ) return
+    const parent = folder.parents?.[0]
+    const parameters = new URLSearchParams({ supportsAllDrives: 'true' })
+    await googleDriveJson(runtime, `/drive/v3/files/${current}?${parameters.toString()}`, {
+      method: 'DELETE',
+      idempotent: true,
+    })
+    current = parent
+  }
+}
+
 function verifyPipelineFolder(
   file: DriveFile,
   pipelineId: string,
@@ -453,7 +494,17 @@ function verifyPipelineFile(
   }
 }
 
-async function ensurePipelineFolder(runtime: GoogleWorkspaceRuntime, pipeline: PipelineProvisioningRecord) {
+type PipelineCrmIdentity = Awaited<ReturnType<typeof syncAppUserProfileToCrm>>
+
+function pipelineDriveName(pipeline: PipelineProvisioningRecord, identity: PipelineCrmIdentity) {
+  return cleanDriveName(`${identity.contactReferenceCode} ${pipeline.name}`, 'Pipeline')
+}
+
+async function ensurePipelineFolder(
+  runtime: GoogleWorkspaceRuntime,
+  pipeline: PipelineProvisioningRecord,
+  identity: PipelineCrmIdentity,
+) {
   const sharedDriveId = runtimeSharedDriveId(runtime)
   const environment = managedEnvironmentName()
   const ownerKey = ownerPropertyKey(pipeline.ownerEmail)
@@ -469,42 +520,76 @@ async function ensurePipelineFolder(runtime: GoogleWorkspaceRuntime, pipeline: P
     name: environment,
     appProperties: fileProperties('environment-root', { environment: environment.toLowerCase() }),
   })
-  const usersFolder = await ensureManagedFolder({
+  const organizationsFolder = await ensureManagedFolder({
     runtime,
     parentId: environmentFolder,
-    name: 'Users',
-    appProperties: fileProperties('users-root', { environment: environment.toLowerCase() }),
+    name: 'Organizations',
+    appProperties: fileProperties('organizations-root', { environment: environment.toLowerCase() }),
   })
-  const userFolder = await ensureManagedFolder({
+  const organizationFolder = await ensureManagedFolder({
     runtime,
-    parentId: usersFolder,
-    name: cleanDriveName(pipeline.ownerEmail, 'User'),
-    appProperties: fileProperties('user-root', { ownerKey }),
+    parentId: organizationsFolder,
+    name: cleanDriveName(
+      `${identity.organizationReferenceCode} ${identity.organizationName}`,
+      'Organization',
+    ),
+    appProperties: fileProperties('organization-root', {
+      workspaceOrganizationId: identity.workspaceOrganizationId,
+      organizationReferenceCode: identity.organizationReferenceCode,
+    }),
+  })
+  const contactsFolder = await ensureManagedFolder({
+    runtime,
+    parentId: organizationFolder,
+    name: 'Contacts',
+    appProperties: fileProperties('contacts-root', {
+      workspaceOrganizationId: identity.workspaceOrganizationId,
+    }),
+  })
+  const contactFolder = await ensureManagedFolder({
+    runtime,
+    parentId: contactsFolder,
+    name: cleanDriveName(
+      `${identity.contactReferenceCode} ${identity.displayName}`,
+      'Contact',
+    ),
+    appProperties: fileProperties('contact-root', {
+      ownerKey,
+      appUserReferenceCode: identity.contactReferenceCode,
+    }),
   })
   const pipelinesFolder = await ensureManagedFolder({
     runtime,
-    parentId: userFolder,
+    parentId: contactFolder,
     name: 'Pipelines',
     appProperties: fileProperties('pipelines-root', { ownerKey }),
   })
-  const pipelineName = cleanDriveName(pipeline.name, 'Pipeline')
+  const pipelineName = pipelineDriveName(pipeline, identity)
   if (pipeline.driveFolderId) {
     const folder = await getDriveFile(runtime, pipeline.driveFolderId)
     verifyPipelineFolder(folder, pipeline.id, sharedDriveId)
-    if (!folder.parents?.includes(pipelinesFolder)) {
-      throw new PipelineProvisioningRequestError(
-        'Managed pipeline folder is outside its expected Shared Drive path',
-        409,
-        'GOOGLE_PIPELINE_FOLDER_PATH_INVALID',
-      )
-    }
-    if (folder.name !== pipelineName) {
-      const parameters = new URLSearchParams({ supportsAllDrives: 'true', fields: 'id' })
+    const moveRequired = !folder.parents?.includes(pipelinesFolder)
+    if (moveRequired || folder.name !== pipelineName) {
+      const parameters = new URLSearchParams({ supportsAllDrives: 'true', fields: 'id,parents,name' })
+      if (moveRequired) {
+        parameters.set('addParents', pipelinesFolder)
+        if (folder.parents?.length) parameters.set('removeParents', folder.parents.join(','))
+      }
       await googleDriveJson(runtime, `/drive/v3/files/${pipeline.driveFolderId}?${parameters.toString()}`, {
         method: 'PATCH',
         body: { name: pipelineName },
         idempotent: true,
       })
+      const moved = await getDriveFile(runtime, pipeline.driveFolderId)
+      verifyPipelineFolder(moved, pipeline.id, sharedDriveId)
+      if (moved.name !== pipelineName || !moved.parents?.includes(pipelinesFolder)) {
+        throw new PipelineProvisioningRequestError(
+          'Managed pipeline folder move did not verify',
+          409,
+          'GOOGLE_PIPELINE_FOLDER_MOVE_UNVERIFIED',
+        )
+      }
+      if (moveRequired) await cleanupLegacyFolderChain(runtime, folder.parents?.[0])
     }
     return pipeline.driveFolderId
   }
@@ -520,12 +605,22 @@ async function ensurePipelineSheet(
   runtime: GoogleWorkspaceRuntime,
   pipeline: PipelineProvisioningRecord,
   folderId: string,
+  pipelineName: string,
 ) {
   const sharedDriveId = runtimeSharedDriveId(runtime)
-  if (pipeline.provisioningSheetId) {
-    const file = await getDriveFile(runtime, pipeline.provisioningSheetId)
+  const boundSheetId = pipeline.provisioningSheetId || pipeline.sheetId
+  if (boundSheetId) {
+    const file = await getDriveFile(runtime, boundSheetId)
     verifyPipelineFile(file, pipeline.id, folderId, sharedDriveId)
-    return pipeline.provisioningSheetId
+    if (file.name !== pipelineName) {
+      const parameters = new URLSearchParams({ supportsAllDrives: 'true', fields: 'id,name' })
+      await googleDriveJson(runtime, `/drive/v3/files/${boundSheetId}?${parameters.toString()}`, {
+        method: 'PATCH',
+        body: { name: pipelineName },
+        idempotent: true,
+      })
+    }
+    return boundSheetId
   }
   const appProperties = fileProperties('pipeline-sheet', { pipelineId: pipeline.id })
   const existing = await listManagedFiles({
@@ -548,7 +643,7 @@ async function ensurePipelineSheet(
     const created = await googleDriveJson<DriveFile>(runtime, `/drive/v3/files?${parameters.toString()}`, {
       method: 'POST',
       body: {
-        name: cleanDriveName(pipeline.name, 'Pipeline'),
+        name: pipelineName,
         mimeType: SHEET_MIME_TYPE,
         parents: [folderId],
         appProperties,
@@ -779,16 +874,17 @@ async function verifyPipelineTabsAndHeaders(runtime: GoogleWorkspaceRuntime, she
   })
 }
 
-const shortLinkActor = (ownerEmail: string): ShortLinkActor => ({
+const shortLinkActor = async (ownerEmail: string): Promise<ShortLinkActor> => ({
   ownerEmail,
+  organizationRootId: await workspaceOrganizationRootId(ownerEmail),
   sourceApp: 'clawpilot',
-  manageAll: false,
+  manageOrganization: false,
   service: false,
 })
 
 async function ensurePipelineShortLink(pipeline: PipelineProvisioningRecord, sheetId: string) {
   const destinationUrl = `https://docs.google.com/spreadsheets/d/${sheetId}/edit`
-  const actor = shortLinkActor(pipeline.ownerEmail)
+  const actor = await shortLinkActor(pipeline.ownerEmail)
   const existing = (await listShortLinks(actor, {
     query: destinationUrl,
     status: 'active',
@@ -1045,24 +1141,17 @@ export function sanitizePipelineProvisioningError(error: unknown) {
 
 export async function provisionPipelineGoogleResources(pipelineId: string) {
   try {
-    return await withPipelineGoogleLock(pipelineId, async () => {
+    return await withPipelineGoogleLock(`hierarchy:${managedEnvironmentName()}`, async () => {
       let pipeline = await markPipelineProvisioningStartedInPostgres(pipelineId)
+      const identity = await syncAppUserProfileToCrm({
+        email: pipeline.ownerEmail,
+        pipelineId: pipeline.id,
+      })
       const runtime = await runtimeForPipeline(pipeline)
       await validateGoogleSheetsAccess(runtime)
-      if (pipeline.provisioningStatus === 'ready' && pipeline.sheetId && pipeline.syncEnabled) {
-        await reconcilePipelineGooglePermissionsUnlocked(pipeline.id, runtime)
-        const shortLinkId = await ensurePipelineShortLink(pipeline, pipeline.sheetId)
-        if (pipeline.shortLinkId !== shortLinkId) {
-          await storePipelineShortLinkIdInPostgres({
-            pipelineId: pipeline.id,
-            expectedShortLinkId: pipeline.shortLinkId,
-            shortLinkId,
-          })
-        }
-        return { pipelineId: pipeline.id, provisioningStatus: 'ready' as const }
-      }
+      const alreadyReady = pipeline.provisioningStatus === 'ready' && Boolean(pipeline.sheetId && pipeline.syncEnabled)
 
-      const folderId = await ensurePipelineFolder(runtime, pipeline)
+      const folderId = await ensurePipelineFolder(runtime, pipeline, identity)
       if (pipeline.driveFolderId && pipeline.driveFolderId !== folderId) {
         throw new PipelineProvisioningRequestError(
           'Managed pipeline folder binding did not verify',
@@ -1072,7 +1161,7 @@ export async function provisionPipelineGoogleResources(pipelineId: string) {
       }
       const folderFile = await getDriveFile(runtime, folderId)
       verifyPipelineFolder(folderFile, pipeline.id, runtimeSharedDriveId(runtime))
-      if (!pipeline.driveFolderId) {
+      if (!pipeline.driveFolderId && !alreadyReady) {
         pipeline = await storePipelineDriveFolderIdInPostgres({
           pipelineId: pipeline.id,
           expectedFolderId: null,
@@ -1080,15 +1169,33 @@ export async function provisionPipelineGoogleResources(pipelineId: string) {
         })
       }
 
-      const sheetId = await ensurePipelineSheet(runtime, pipeline, folderId)
+      const sheetId = await ensurePipelineSheet(
+        runtime,
+        pipeline,
+        folderId,
+        pipelineDriveName(pipeline, identity),
+      )
       const stagedSheetFile = await getDriveFile(runtime, sheetId)
       verifyPipelineFile(stagedSheetFile, pipeline.id, folderId, runtimeSharedDriveId(runtime))
-      if (!pipeline.provisioningSheetId) {
+      if (!pipeline.provisioningSheetId && !alreadyReady) {
         pipeline = await storePipelineProvisioningSheetIdInPostgres({
           pipelineId: pipeline.id,
           expectedSheetId: null,
           sheetId,
         })
+      }
+
+      if (alreadyReady) {
+        await reconcilePipelineGooglePermissionsUnlocked(pipeline.id, runtime)
+        const shortLinkId = await ensurePipelineShortLink(pipeline, sheetId)
+        if (pipeline.shortLinkId !== shortLinkId) {
+          await storePipelineShortLinkIdInPostgres({
+            pipelineId: pipeline.id,
+            expectedShortLinkId: pipeline.shortLinkId,
+            shortLinkId,
+          })
+        }
+        return { pipelineId: pipeline.id, provisioningStatus: 'ready' as const }
       }
 
       await configurePipelineTabs(runtime, sheetId)

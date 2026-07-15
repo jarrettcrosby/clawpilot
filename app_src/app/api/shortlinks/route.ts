@@ -40,7 +40,12 @@ export async function GET(req: NextRequest) {
       status: params.get('status'),
       sourceApp: params.get('source'),
     })
-    return NextResponse.json({ ok: true, links })
+    return NextResponse.json({
+      ok: true,
+      links,
+      currentOwnerEmail: actor.ownerEmail,
+      canManageOrganization: actor.manageOrganization,
+    })
   } catch (error) {
     return errorResponse(error)
   }

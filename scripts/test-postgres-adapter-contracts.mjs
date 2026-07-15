@@ -48,6 +48,8 @@ assertIncludes(usersAdapter, 'canInviteUsers', 'app users adapter')
 assertIncludes(usersAdapter, "current?.status === 'disabled'", 'disabled user restore authorization')
 assertIncludes(usersAdapter, 'Restore the disabled user before sending a new invitation', 'disabled user invitation boundary')
 assertIncludes(usersAdapter, 'updateAppUserProfile', 'app users adapter')
+assertIncludes(usersAdapter, "UPDATE workspace_organizations", 'atomic profile organization update')
+assertIncludes(usersAdapter, "'pipeline:' || pipeline.id::text || ':provision'", 'profile Drive reconciliation enqueue')
 assertIncludes(usersAdapter, 'updateAppUserAccess', 'app users adapter')
 assertIncludes(usersAdapter, 'AppUserAuthorizationError', 'app user authorization errors')
 assertIncludes(usersAdapter, 'AppUserNotFoundError', 'app user not-found errors')
@@ -204,6 +206,9 @@ assertIncludes(shortLinksAdapter, 'SHORTLINK_SERVICE_CLIENTS_JSON', 'source-boun
 assertIncludes(shortLinksAdapter, "url.protocol !== 'https:'", 'short-link destination transport security')
 assertIncludes(shortLinksAdapter, 'FOR UPDATE', 'atomic short-link click limits')
 assertIncludes(shortLinksAdapter, 'NOT $4::boolean OR source_app = $5', 'service source isolation')
+assertIncludes(shortLinksAdapter, 'organization_root_id = $10::uuid', 'organization-scoped short-link visibility')
+assertIncludes(shortLinksAdapter, '$2::boolean OR NOT $8::boolean', 'same-organization interactive link visibility')
+assertIncludes(shortLinksAdapter, 'workspaceOrganizationRootId', 'short-link tenant root resolution')
 
 const tenancyAdapter = read('app_src/lib/tenancy.ts')
 assertIncludes(tenancyAdapter, 'ensureDefaultResourcesForUser', 'tenancy adapter')
@@ -276,6 +281,10 @@ assertIncludes(pipelineProvisioning, 'reconcilePipelineGooglePermissions', 'mana
 assertIncludes(pipelineProvisioning, 'nextPageToken,permissions', 'permission pagination')
 assertIncludes(pipelineProvisioning, "['anyone', 'domain', 'group']", 'direct broad permission rejection')
 assertIncludes(pipelineProvisioning, 'permissionIsInherited', 'Shared Drive governing permission preservation')
+assertIncludes(pipelineProvisioning, "`hierarchy:${managedEnvironmentName()}`", 'serialized Drive hierarchy reconciliation')
+assertIncludes(pipelineProvisioning, 'workspaceOrganizationId: identity.workspaceOrganizationId', 'canonical Drive organization identity')
+assertIncludes(pipelineProvisioning, 'appUserReferenceCode: identity.contactReferenceCode', 'canonical Drive contact identity')
+assertIncludes(pipelineProvisioning, 'GOOGLE_PIPELINE_FOLDER_MOVE_UNVERIFIED', 'verified Drive folder moves')
 
 const legacyPipelineWorkbook = read('app_src/lib/pipelineLegacyWorkbook.ts')
 assertIncludes(legacyPipelineWorkbook, 'configurePipelineTabsWithRequest', 'legacy Maton workbook layout parity')
@@ -295,15 +304,62 @@ assertIncludes(crmAdapter, "'upsert_record', 'suitecrm'", 'SuiteCRM outbox targe
 assertIncludes(crmAdapter, "operation IN ('upsert_record', 'delete_record')", 'SuiteCRM deletion outbox claims')
 assertIncludes(crmAdapter, 'ensurePipelineCrmHierarchy', 'workspace organization CRM hierarchy')
 assertIncludes(crmAdapter, 'ON CONFLICT (pipeline_id, identity_key)', 'natural CRM identity upserts')
-assertIncludes(crmAdapter, "$23, $24::jsonb, $25,\n        'pending', NULL, $26, $26", 'CRM contact insert bindings')
+assertIncludes(crmAdapter, "$23, $24, $25::jsonb, $26,\n        'pending', NULL, $27, $27", 'CRM contact insert bindings')
 assert.ok(
-  !crmAdapter.includes("$24, $25::jsonb, $26,\n        'pending', NULL, $27, $27"),
+  !crmAdapter.includes("$24, $25, $26::jsonb, $27,\n        'pending', NULL, $28, $28"),
   'CRM contact insert must not provide more expressions than target columns',
 )
 assertIncludes(crmAdapter, 'FOR UPDATE SKIP LOCKED', 'SuiteCRM leased outbox claims')
 assertIncludes(crmAdapter, 'pipeline_id = $1::uuid', 'pipeline-scoped CRM reads')
 assertIncludes(crmAdapter, 'readCrmWorkbookProjectionReadiness', 'reconciliation-gated CRM workbook projection')
 assertIncludes(crmAdapter, "importStatus === 'succeeded'", 'successful source reconciliation projection gate')
+assertIncludes(crmAdapter, 'syncAppUserProfileToOwnedPipelines', 'all owned pipeline profile projection')
+assertIncludes(crmAdapter, 'CRM profile synchronization requires an owned pipeline', 'profile projection ownership boundary')
+assertIncludes(crmAdapter, 'appUserReferenceCode: user.referenceCode', 'canonical app-user CRM contact identity')
+
+const crmModulesMigration = read('db/migrations/0023_crm_modules_references_and_integrations.sql')
+assertIncludes(crmModulesMigration, 'workspace_organizations_reference_code_unique', 'canonical workspace organization reference')
+assertIncludes(crmModulesMigration, 'app_users_reference_code_unique', 'canonical app user reference')
+assertIncludes(crmModulesMigration, 'UNIQUE (pipeline_id, reference_code)', 'pipeline projection reference uniqueness')
+assertIncludes(crmModulesMigration, 'idx_crm_contacts_pipeline_app_user', 'one user contact projection per pipeline')
+for (const table of [
+  'crm_leads',
+  'crm_meetings',
+  'crm_campaigns',
+  'crm_integration_actions',
+  'crm_integration_action_attempts',
+  'crm_inbound_messages',
+  'crm_inbound_message_links',
+]) {
+  assertIncludes(crmModulesMigration, `CREATE TABLE IF NOT EXISTS ${table}`, 'CRM module and integration migration')
+}
+
+const crmIntegrationActions = read('app_src/lib/crm/integrationActions.ts')
+for (const action of ['send_email', 'create_calendar_event', 'log_call', 'send_campaign']) {
+  assertIncludes(crmIntegrationActions, `'${action}'`, 'CRM integration action')
+}
+assertIncludes(crmIntegrationActions, 'FOR UPDATE SKIP LOCKED', 'leased CRM integration actions')
+assertIncludes(crmIntegrationActions, 'appendTextReplyMarker', 'outbound CRM reply marker')
+assertIncludes(crmIntegrationActions, 'appendHtmlReplyMarker', 'outbound CRM HTML reply marker')
+assertIncludes(crmIntegrationActions, '`%gslt${normalizeReference(referenceCode)}`', 'exact outbound CRM marker syntax')
+assertIncludes(crmIntegrationActions, 'crm_campaign_recipients', 'campaign recipient deduplication')
+
+const crmEmailIngestion = read('app_src/lib/crm/emailIngestion.ts')
+assertIncludes(crmEmailIngestion, 'export function truncateEmailImportContent', 'email import boundary')
+assertIncludes(crmEmailIngestion, 'content.search(/%xx/i)', 'case-insensitive email import boundary')
+assertIncludes(crmEmailIngestion, '/%gslt(g[aciklmo][0-9]{7})(?![A-Za-z0-9_])/gi', 'exact inbound CRM marker syntax')
+assertIncludes(crmEmailIngestion, 'if (seen.has(reference)) continue', 'quoted-thread marker deduplication')
+assertIncludes(crmEmailIngestion, 'ON CONFLICT (owner_email, external_message_id) DO NOTHING', 'Gmail message deduplication')
+assertIncludes(crmEmailIngestion, 'ownedPipelines', 'cross-owned-pipeline marker resolution')
+assertIncludes(crmEmailIngestion, 'pipelineId: input.target.pipelineId', 'matched-pipeline interaction staging')
+
+const crmIntegrationWorkerRoute = read('app_src/app/api/crm/integrations/process/route.ts')
+assertIncludes(crmIntegrationWorkerRoute, 'processDueCrmIntegrationActions', 'CRM action retry worker')
+assertIncludes(crmIntegrationWorkerRoute, 'processInboundGmailIngestion', 'inbound Gmail worker')
+
+const crmActionsRoute = read('app_src/app/api/crm/actions/route.ts')
+assertIncludes(crmActionsRoute, 'requireResourceEditor', 'CRM action editor authorization')
+assertIncludes(crmActionsRoute, 'idempotency-key', 'CRM action idempotency header')
 
 const suiteCrmClient = read('app_src/lib/crm/suiteCrmClient.ts')
 assertIncludes(suiteCrmClient, '/Api/access_token', 'SuiteCRM OAuth client credentials')
@@ -590,6 +646,7 @@ assertIncludes(healthRoute, '0012_invitation_release_hardening.sql', 'hosted rel
 assertIncludes(healthRoute, '0013_invitation_delivery_coordination.sql', 'hosted invitation delivery migration health')
 assertIncludes(healthRoute, '0014_invitation_delivery_pending.sql', 'hosted invitation pending migration health')
 assertIncludes(healthRoute, '0015_short_links.sql', 'hosted short-links migration health')
+assertIncludes(healthRoute, '0023_crm_modules_references_and_integrations.sql', 'hosted CRM integrations migration health')
 assertIncludes(healthRoute, '0016_document_vectors_and_ai_radar.sql', 'hosted vector knowledge migration health')
 assertIncludes(healthRoute, '0016_z_short_link_destination_preflight.sql', 'hosted short-link preflight migration health')
 assertIncludes(healthRoute, '0017_short_link_destination_hardening.sql', 'hosted short-link hardening migration health')

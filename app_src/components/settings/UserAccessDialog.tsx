@@ -64,6 +64,7 @@ type UserPermissions = {
 
 type AppUser = {
   email: string
+  referenceCode: string
   role: UserRole
   status: UserStatus
   displayName: string | null
@@ -83,6 +84,11 @@ type ApiPayload = {
 
 type UsersPayload = ApiPayload & {
   currentUser?: AppUser
+  currentOrganization?: {
+    id: string
+    referenceCode: string
+    name: string
+  }
   isAdmin?: boolean
   canInvite?: boolean
   canManageUserAccess?: boolean
@@ -195,7 +201,7 @@ const PERMISSIONS: Array<{ key: PermissionKey; label: string; adminOnly?: boolea
   { key: 'createPipelines', label: 'Create pipelines' },
   { key: 'viewFullReleaseHistory', label: 'View full release history', adminOnly: true },
   { key: 'manageBackups', label: 'Manage data checkpoints', adminOnly: true },
-  { key: 'manageLinks', label: 'Manage all short links', adminOnly: true },
+  { key: 'manageLinks', label: 'Manage organization short links', adminOnly: true },
 ]
 
 const panelSx = {
@@ -871,6 +877,20 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
                     value={currentUser.email}
                     disabled
                     sx={{ ...fieldSx, gridColumn: { sm: '1 / -1' } }}
+                  />
+                  <TextField
+                    size="small"
+                    label="CRM contact"
+                    value={currentUser.referenceCode}
+                    disabled
+                    sx={fieldSx}
+                  />
+                  <TextField
+                    size="small"
+                    label="CRM organization"
+                    value={usersPayload?.currentOrganization?.referenceCode || ''}
+                    disabled
+                    sx={fieldSx}
                   />
                 </Box>
 

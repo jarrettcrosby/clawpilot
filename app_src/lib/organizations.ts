@@ -9,6 +9,7 @@ import {
 
 export type WorkspaceOrganization = {
   id: string
+  referenceCode: string
   parentId: string | null
   parentName: string | null
   name: string
@@ -24,6 +25,7 @@ export type WorkspaceOrganization = {
 
 type WorkspaceOrganizationRow = {
   id: string
+  reference_code: string
   parent_id: string | null
   parent_name?: string | null
   name: string
@@ -60,6 +62,7 @@ function defaultOrganizationName(input: {
 function toWorkspaceOrganization(row: WorkspaceOrganizationRow): WorkspaceOrganization {
   return {
     id: row.id,
+    referenceCode: row.reference_code,
     parentId: row.parent_id,
     parentName: row.parent_name || null,
     name: row.name,
@@ -71,7 +74,8 @@ function toWorkspaceOrganization(row: WorkspaceOrganizationRow): WorkspaceOrgani
 
 async function organizationById(id: string) {
   const result = await query<WorkspaceOrganizationRow>(
-    `SELECT organization.id::text, organization.parent_id::text, parent.name AS parent_name,
+    `SELECT organization.id::text, organization.reference_code,
+       organization.parent_id::text, parent.name AS parent_name,
        organization.name, organization.organization_type
      FROM workspace_organizations organization
      LEFT JOIN workspace_organizations parent ON parent.id = organization.parent_id
@@ -105,7 +109,7 @@ export async function ensurePrimaryWorkspaceOrganization(
           `UPDATE workspace_organizations
            SET parent_id = $2::uuid, organization_type = 'member', updated_by = $3, updated_at = now()
            WHERE id = $1::uuid AND parent_id IS NULL
-           RETURNING id::text, parent_id::text, name, organization_type`,
+           RETURNING id::text, reference_code, parent_id::text, name, organization_type`,
           [current.id, parent.id, email],
         )
         if (repaired.rows[0]) {
@@ -145,7 +149,8 @@ export async function ensurePrimaryWorkspaceOrganization(
     if (!locked.rows[0]) throw new Error('User was not found')
     if (locked.rows[0].organization_id) {
       const existing = await client.query<WorkspaceOrganizationRow>(
-        `SELECT organization.id::text, organization.parent_id::text, parent.name AS parent_name,
+        `SELECT organization.id::text, organization.reference_code,
+           organization.parent_id::text, parent.name AS parent_name,
            organization.name, organization.organization_type
          FROM workspace_organizations organization
          LEFT JOIN workspace_organizations parent ON parent.id = organization.parent_id
@@ -160,7 +165,7 @@ export async function ensurePrimaryWorkspaceOrganization(
          parent_id, name, organization_type, created_by, updated_by, created_at, updated_at
        )
        VALUES ($1::uuid, $2, $3, $4, $4, now(), now())
-       RETURNING id::text, parent_id::text, name, organization_type`,
+       RETURNING id::text, reference_code, parent_id::text, name, organization_type`,
       [parent?.id || null, name, organizationType, email],
     )
     const organization = created.rows[0]
@@ -191,7 +196,7 @@ export async function updatePrimaryWorkspaceOrganization(input: {
       `UPDATE workspace_organizations
        SET name = $2, updated_by = $3, updated_at = now()
        WHERE id = $1::uuid
-       RETURNING id::text, parent_id::text, name, organization_type`,
+       RETURNING id::text, reference_code, parent_id::text, name, organization_type`,
       [organization.id, name, actor.email],
     )
     await client.query(
@@ -219,18 +224,18 @@ export async function listWorkspaceOrganizationHierarchy(actorEmailValue: unknow
   const result = await query<WorkspaceOrganizationRow>(
     canViewAll
       ? `WITH RECURSIVE organization_tree AS (
-           SELECT organization.id, organization.parent_id, organization.name,
+           SELECT organization.id, organization.reference_code, organization.parent_id, organization.name,
              organization.organization_type, 0 AS depth, ARRAY[organization.id] AS path
            FROM workspace_organizations organization
            WHERE organization.parent_id IS NULL
            UNION ALL
-           SELECT child.id, child.parent_id, child.name, child.organization_type,
+           SELECT child.id, child.reference_code, child.parent_id, child.name, child.organization_type,
              tree.depth + 1, tree.path || child.id
            FROM workspace_organizations child
            JOIN organization_tree tree ON child.parent_id = tree.id
            WHERE NOT child.id = ANY(tree.path)
          )
-         SELECT tree.id::text, tree.parent_id::text, parent.name AS parent_name,
+         SELECT tree.id::text, tree.reference_code, tree.parent_id::text, parent.name AS parent_name,
            tree.name, tree.organization_type, tree.depth,
            COALESCE((
              SELECT jsonb_agg(jsonb_build_object(
@@ -245,18 +250,19 @@ export async function listWorkspaceOrganizationHierarchy(actorEmailValue: unknow
          LEFT JOIN workspace_organizations parent ON parent.id = tree.parent_id
          ORDER BY tree.path`
       : `WITH RECURSIVE ancestors AS (
-           SELECT organization.id, organization.parent_id, organization.name,
+           SELECT organization.id, organization.reference_code, organization.parent_id, organization.name,
              organization.organization_type, 0 AS distance, ARRAY[organization.id] AS path
            FROM workspace_organizations organization
            WHERE organization.id = $1::uuid
            UNION ALL
-           SELECT parent.id, parent.parent_id, parent.name, parent.organization_type,
+           SELECT parent.id, parent.reference_code, parent.parent_id, parent.name, parent.organization_type,
              ancestor.distance + 1, ancestor.path || parent.id
            FROM workspace_organizations parent
            JOIN ancestors ancestor ON ancestor.parent_id = parent.id
            WHERE NOT parent.id = ANY(ancestor.path)
          )
-         SELECT ancestor.id::text, ancestor.parent_id::text, parent.name AS parent_name,
+         SELECT ancestor.id::text, ancestor.reference_code,
+           ancestor.parent_id::text, parent.name AS parent_name,
            ancestor.name, ancestor.organization_type,
            max(ancestor.distance) OVER () - ancestor.distance AS depth,
            COALESCE((
@@ -279,24 +285,30 @@ export async function listWorkspaceOrganizationHierarchy(actorEmailValue: unknow
 export async function workspaceOrganizationAncestors(organizationId: string) {
   const result = await query<WorkspaceOrganizationRow>(
     `WITH RECURSIVE ancestors AS (
-       SELECT organization.id, organization.parent_id, organization.name,
+       SELECT organization.id, organization.reference_code, organization.parent_id, organization.name,
          organization.organization_type, 0 AS distance, ARRAY[organization.id] AS path
        FROM workspace_organizations organization
        WHERE organization.id = $1::uuid
        UNION ALL
-       SELECT parent.id, parent.parent_id, parent.name, parent.organization_type,
+       SELECT parent.id, parent.reference_code, parent.parent_id, parent.name, parent.organization_type,
          ancestor.distance + 1, ancestor.path || parent.id
        FROM workspace_organizations parent
        JOIN ancestors ancestor ON ancestor.parent_id = parent.id
        WHERE NOT parent.id = ANY(ancestor.path)
      )
-     SELECT id::text, parent_id::text, name, organization_type,
+     SELECT id::text, reference_code, parent_id::text, name, organization_type,
        max(distance) OVER () - distance AS depth
      FROM ancestors
      ORDER BY depth`,
     [organizationId],
   )
   return result.rows.map(toWorkspaceOrganization)
+}
+
+export async function workspaceOrganizationRootId(emailValue: unknown) {
+  const organization = await ensurePrimaryWorkspaceOrganization(emailValue)
+  const ancestors = await workspaceOrganizationAncestors(organization.id)
+  return (ancestors.find((candidate) => candidate.parentId === null) || organization).id
 }
 
 export async function updateWorkspaceOrganizationParent(input: {

@@ -51,6 +51,7 @@ export const OWNER_PERMISSIONS: AppUserPermissions = {
 
 export type AppUser = {
   email: string
+  referenceCode: string
   role: AppUserRole
   status: AppUserStatus
   displayName: string | null
@@ -75,6 +76,7 @@ export type InviteAppUserResult = {
 
 type AppUserRow = {
   email: string
+  reference_code: string
   role: AppUserRole
   status: AppUserStatus
   display_name: string | null
@@ -145,6 +147,7 @@ export function canManageUserAccess(user: Pick<AppUser, 'role' | 'permissions'>)
 function toAppUser(row: AppUserRow): AppUser {
   return {
     email: row.email,
+    referenceCode: row.reference_code,
     role: row.role,
     status: row.status,
     displayName: row.display_name,
@@ -325,21 +328,72 @@ export async function updateAppUserProfile(input: {
   if (!organizationName) throw new Error('Organization name is required')
   const timezone = normalizeTimezone(input.timezone)
   const locale = normalizeLocale(input.locale)
-  const result = await query<AppUserRow>(
-    `
-      UPDATE app_users
-      SET display_name = $2,
-          job_title = $3,
-          organization_name = $4,
-          timezone = $5,
-          locale = $6,
-          updated_at = now()
-      WHERE email = $1
-      RETURNING *
-    `,
-    [actor.email, displayName, jobTitle, organizationName, timezone, locale],
-  )
-  return toAppUser(result.rows[0])
+  const row = await withTransaction(async (client) => {
+    const locked = await client.query<{ organization_id: string | null }>(
+      `SELECT organization_id::text
+       FROM app_users
+       WHERE email = $1
+       FOR UPDATE`,
+      [actor.email],
+    )
+    const organizationId = locked.rows[0]?.organization_id
+    if (!organizationId) throw new Error('User organization is not configured')
+
+    await client.query(
+      `UPDATE workspace_organizations
+       SET name = $2, updated_by = $3, updated_at = now()
+       WHERE id = $1::uuid`,
+      [organizationId, organizationName, actor.email],
+    )
+    await client.query(
+      `UPDATE app_users
+       SET organization_name = $2, updated_at = now()
+       WHERE organization_id = $1::uuid`,
+      [organizationId, organizationName],
+    )
+    const updated = await client.query<AppUserRow>(
+      `UPDATE app_users
+       SET display_name = $2,
+           job_title = $3,
+           organization_name = $4,
+           timezone = $5,
+           locale = $6,
+           updated_at = now()
+       WHERE email = $1
+       RETURNING *`,
+      [actor.email, displayName, jobTitle, organizationName, timezone, locale],
+    )
+
+    await client.query(
+      `INSERT INTO sync_outbox (
+         aggregate_type, aggregate_id, operation, target_system, payload,
+         status, attempts, idempotency_key, created_at, available_at, updated_at
+       )
+       SELECT 'pipeline_space', pipeline.id::text, 'provision_pipeline', 'google_workspace',
+         jsonb_build_object('pipelineId', pipeline.id::text), 'queued', 0,
+         'pipeline:' || pipeline.id::text || ':provision', now(), now(), now()
+       FROM pipeline_spaces pipeline
+       WHERE pipeline.owner_email = $1
+         AND pipeline.google_service_account_email IS NOT NULL
+         AND pipeline.google_shared_drive_id IS NOT NULL
+       ON CONFLICT (target_system, idempotency_key)
+       WHERE idempotency_key IS NOT NULL
+       DO UPDATE SET status = 'queued', attempts = 0, last_error = NULL,
+         available_at = now(), processed_at = NULL, locked_at = NULL,
+         lock_token = NULL, updated_at = now()`,
+      [actor.email],
+    )
+    await client.query(
+      `UPDATE pipeline_spaces
+       SET provisioning_status = 'queued', provisioning_error = NULL, updated_at = now()
+       WHERE owner_email = $1
+         AND google_service_account_email IS NOT NULL
+         AND google_shared_drive_id IS NOT NULL`,
+      [actor.email],
+    )
+    return updated.rows[0]
+  })
+  return toAppUser(row)
 }
 
 export async function updateAppUserAccess(input: {

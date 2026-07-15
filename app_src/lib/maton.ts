@@ -15,6 +15,11 @@ export type MatonFetchContext = {
   boundConnectionId?: string
 }
 
+type GatewayCredential = {
+  apiKey: string
+  connectionId?: string
+}
+
 function cleanHeaderCredential(value: unknown, label: string, maxLength: number): string {
   const credential = typeof value === 'string' ? value.trim() : ''
   if (!credential || credential.length > maxLength || !/^[\x21-\x7e]+$/.test(credential)) {
@@ -70,8 +75,10 @@ export function resolveMatonGatewayBaseUrl(value = process.env.MATON_BASE_URL): 
 export function inferMatonGatewayApp(pathname: string): string | null {
   const path = String(pathname || '').split(/[?#]/, 1)[0]
   if (path === '/google-mail' || path.startsWith('/google-mail/')) return 'google-mail'
+  if (path === '/google-calendar' || path.startsWith('/google-calendar/')) return 'google-calendar'
   if (path === '/google-sheets' || path.startsWith('/google-sheets/')) return 'google-sheets'
   if (path === '/google-drive' || path.startsWith('/google-drive/')) return 'google-drive'
+  if (path === '/quickbooks' || path.startsWith('/quickbooks/')) return 'quickbooks'
   return null
 }
 
@@ -120,13 +127,22 @@ async function requestCredential(
 
 export async function matonFetch(pathname: string, init?: RequestInit, context?: MatonFetchContext) {
   const base = resolveMatonGatewayBaseUrl()
-  const url = requestUrl(pathname, base)
   const { app, credential } = await requestCredential(pathname, context)
+  return gatewayFetch(pathname, init, base, app, credential || undefined)
+}
 
+async function gatewayFetch(
+  pathname: string,
+  init: RequestInit | undefined,
+  base: string,
+  app: string | null,
+  credential?: GatewayCredential,
+) {
+  const url = requestUrl(pathname, base)
   const headers = new Headers(init?.headers || {})
   if (credential) {
     headers.set('Authorization', `Bearer ${credential.apiKey}`)
-    headers.set('Maton-Connection', credential.connectionId)
+    if (credential.connectionId) headers.set('Maton-Connection', credential.connectionId)
   } else {
     if (!headers.has('Authorization')) headers.set('Authorization', `Bearer ${readKey()}`)
     if (app === 'google-mail' && !headers.has('Maton-Connection')) {
@@ -154,4 +170,14 @@ export async function matonFetch(pathname: string, init?: RequestInit, context?:
     clearTimeout(timeout)
     init?.signal?.removeEventListener('abort', abort)
   }
+}
+
+export async function matonPlatformMailFetch(pathname: string, init?: RequestInit) {
+  const app = inferMatonGatewayApp(pathname)
+  if (app !== 'google-mail') throw new Error('Platform mail requests must use the Google Mail gateway')
+  const base = resolveMatonGatewayBaseUrl()
+  return gatewayFetch(pathname, init, base, app, {
+    apiKey: readKey(),
+    connectionId: readGmailConnectionId(),
+  })
 }

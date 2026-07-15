@@ -3,20 +3,20 @@
   "releases": {
     "default": {
       "oncePerEnvironment": true,
-      "title": "CRM gateway and controlled reporting workbooks",
-      "summary": "ClawPilot adds a tenant-scoped SuiteCRM gateway, makes Organizations, Contacts, and Interactions manageable in the app, and turns each pipeline workbook into a protected opportunity input and CRM reporting surface.",
+      "title": "Connected CRM actions and organization-based workspaces",
+      "summary": "ClawPilot now connects user profiles, CRM records, provider actions, short links, and managed pipeline workbooks through stable organization and contact identities.",
       "features": [
-        "A CRM workspace for Organizations, Contacts, Opportunities, and Interactions scoped to the selected user pipeline",
-        "A SuiteCRM OAuth gateway with durable Postgres projections and retriable CRM and Google outboxes",
-        "Eight-tab managed workbooks with protected CRM projections, calculations, dashboard reporting, and stable record identities",
-        "Direct workbook access from Pipeline and CRM through each pipeline's private eigenracing.com short link"
+        "Organizations, Contacts, Leads, Opportunities, Meetings, Interactions, and Campaigns in one pipeline-scoped CRM workspace",
+        "Email, calendar invitations, logged calls, and mail-merged campaigns through each user's selected provider connections",
+        "Stable ga, gc, gl, go, gm, gi, and gk CRM links plus same-organization short-link discovery",
+        "Managed Drive folders nested by organization, user contact, and pipeline with direct Open Sheet access"
       ],
       "fixes": [
-        "Stopped treating Organizations and Contacts workbook tabs as independent writable CRM sources",
-        "Protected every generated workbook tab and limited operator edits to Opportunities rows",
-        "Added stable source identities so opportunity row movement does not create duplicate CRM records after projection",
-        "Separated SuiteCRM records, worker leases, and reporting refreshes into independently retriable operations",
-        "Preserved the source workbook and raw row payloads for additive migration and reconciliation"
+        "Prevents one user from receiving different CRM organization or contact identities across owned pipelines",
+        "Synchronizes profile changes into CRM and requeues managed Drive naming without creating replacement Sheets",
+        "Pins sign-in and invitation mail to the verified ClawPilot Stewards Gmail connection instead of a personal selected account",
+        "Deduplicates repeated CRM markers in email threads and stops imported content at the first %xx marker",
+        "Restricts short-link discovery to the user's organization tree and mutations to link owners or authorized administrators"
       ]
     }
   }

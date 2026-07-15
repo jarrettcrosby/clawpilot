@@ -144,6 +144,8 @@ export default function ShortLinksSection() {
   const [editing, setEditing] = useState<ShortLinkRecord | null>(null)
   const [deleting, setDeleting] = useState<ShortLinkRecord | null>(null)
   const [mutation, setMutation] = useState<string | null>(null)
+  const [currentOwnerEmail, setCurrentOwnerEmail] = useState('')
+  const [canManageOrganization, setCanManageOrganization] = useState(false)
   const requestSequence = useRef(0)
 
   useEffect(() => {
@@ -175,7 +177,12 @@ export default function ShortLinksSection() {
       .then(async (response) => {
         const payload = await response.json().catch(() => ({}))
         if (!response.ok) throw new Error(errorMessage(payload as Record<string, unknown>, 'Unable to load short links'))
-        if (sequence === requestSequence.current) setRecords(payloadRecords(payload))
+        if (sequence === requestSequence.current) {
+          setRecords(payloadRecords(payload))
+          const data = payload && typeof payload === 'object' ? payload as Record<string, unknown> : {}
+          setCurrentOwnerEmail(String(data.currentOwnerEmail || '').toLowerCase())
+          setCanManageOrganization(data.canManageOrganization === true)
+        }
       })
       .catch((loadError: unknown) => {
         if (loadError instanceof DOMException && loadError.name === 'AbortError') return
@@ -408,6 +415,7 @@ export default function ShortLinksSection() {
           const statusView = statusPresentation(recordStatus)
           const recordUsage = usage(record)
           const recordBusy = mutation?.endsWith(`:${record.id}`) === true
+          const canMutate = canManageOrganization || String(record.ownerEmail || '').toLowerCase() === currentOwnerEmail
           const terminal = recordStatus === 'expired' || recordStatus === 'exhausted'
           const enable = recordStatus === 'disabled'
           const toggleLabel = terminal
@@ -521,13 +529,13 @@ export default function ShortLinksSection() {
                   </IconButton>
                 </Tooltip>
                 <Tooltip title="Edit short link">
-                  <IconButton aria-label={`Edit ${record.title || record.slug}`} onClick={() => openEdit(record)} disabled={recordBusy} sx={iconButtonSx}>
+                  <IconButton aria-label={`Edit ${record.title || record.slug}`} onClick={() => openEdit(record)} disabled={recordBusy || !canMutate} sx={iconButtonSx}>
                     <EditRounded sx={{ fontSize: 20 }} />
                   </IconButton>
                 </Tooltip>
                 <Tooltip title={toggleLabel}>
                   <span style={{ display: 'inline-flex' }}>
-                    <IconButton aria-label={toggleLabel} onClick={() => void toggleLink(record)} disabled={recordBusy || terminal} sx={iconButtonSx}>
+                    <IconButton aria-label={toggleLabel} onClick={() => void toggleLink(record)} disabled={recordBusy || terminal || !canMutate} sx={iconButtonSx}>
                       {recordBusy && mutation?.startsWith('toggle:')
                         ? <CircularProgress size={18} />
                         : enable ? <CheckCircleOutlineRounded sx={{ fontSize: 20 }} /> : <BlockRounded sx={{ fontSize: 20 }} />}
@@ -538,7 +546,7 @@ export default function ShortLinksSection() {
                   <IconButton
                     aria-label={`Delete ${record.title || record.slug}`}
                     onClick={() => setDeleting(record)}
-                    disabled={recordBusy}
+                    disabled={recordBusy || !canMutate}
                     sx={{ ...iconButtonSx, '&:hover': { color: '#FFB4AB', backgroundColor: 'rgba(255,180,171,0.08)' } }}
                   >
                     <DeleteOutlineRounded sx={{ fontSize: 20 }} />
