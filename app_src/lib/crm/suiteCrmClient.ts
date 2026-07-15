@@ -32,9 +32,10 @@ export type SuiteCrmRecordSnapshot = {
 }
 
 export type SuiteCrmMeetingSnapshot = SuiteCrmRecordSnapshot
+export type SuiteCrmNoteSnapshot = SuiteCrmRecordSnapshot
 export type SuiteCrmAccountContactModule = 'Accounts' | 'Contacts'
 
-type SuiteCrmIncrementalListInput = {
+export type SuiteCrmIncrementalListInput = {
   updatedSince: string
   page: number
   pageSize?: number
@@ -158,7 +159,7 @@ export async function testSuiteCrmConnection(fetchImpl: typeof fetch = fetch) {
 }
 
 async function listSuiteCrmModuleRecordsUpdatedSince(
-  moduleName: 'Accounts' | 'Contacts' | 'Meetings',
+  moduleName: 'Accounts' | 'Contacts' | 'Meetings' | 'Notes',
   recordLabel: string,
   input: SuiteCrmIncrementalListInput,
   fetchImpl: typeof fetch,
@@ -229,6 +230,14 @@ export async function listSuiteCrmMeetingsUpdatedSince(
 ) {
   const response = await listSuiteCrmModuleRecordsUpdatedSince('Meetings', 'meeting', input, fetchImpl)
   return { meetings: response.records, totalPages: response.totalPages }
+}
+
+export async function listSuiteCrmNotesUpdatedSince(
+  input: SuiteCrmIncrementalListInput,
+  fetchImpl: typeof fetch = fetch,
+) {
+  const response = await listSuiteCrmModuleRecordsUpdatedSince('Notes', 'note', input, fetchImpl)
+  return { notes: response.records, totalPages: response.totalPages }
 }
 
 export async function upsertSuiteCrmRecord(

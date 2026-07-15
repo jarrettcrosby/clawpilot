@@ -1,7 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { disconnectChatGPT } from '@/lib/agents/chatgptAuth'
 import { createUserInvitation } from '@/lib/invitations'
-import { ensurePrimaryWorkspaceOrganization } from '@/lib/organizations'
+import {
+  ensurePrimaryWorkspaceOrganization,
+  listWorkspaceOrganizationHierarchy,
+} from '@/lib/organizations'
 import { ensureDefaultResourcesForUser } from '@/lib/tenancy'
 import { syncAppUserProfileToOwnedPipelines } from '@/lib/persistence/crm'
 import { sessionEmail } from '@/lib/requestUser'
@@ -31,6 +34,7 @@ export async function GET(req: NextRequest) {
     const currentOrganization = await ensurePrimaryWorkspaceOrganization(email)
     await ensureDefaultResourcesForUser(email)
     const { actor, users } = await listAppUsers(email)
+    const workspaceOrganizations = await listWorkspaceOrganizationHierarchy(email)
     return NextResponse.json({
       ok: true,
       currentUser: actor,
@@ -39,6 +43,7 @@ export async function GET(req: NextRequest) {
       canInvite: canInviteUsers(actor),
       canManageUserAccess: canManageUserAccess(actor),
       users,
+      workspaceOrganizations,
     })
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unable to load users'
@@ -52,7 +57,14 @@ export async function POST(req: NextRequest) {
 
   try {
     const body = await req.json()
-    const invitation = await createUserInvitation({ actorEmail, email: body?.email })
+    const invitation = await createUserInvitation({
+      actorEmail,
+      email: body?.email,
+      organizationId: body?.organizationId,
+      createOrganization: body?.createOrganization === true,
+      organizationName: body?.organizationName,
+      parentOrganizationId: body?.parentOrganizationId,
+    })
     return NextResponse.json({
       ok: true,
       user: invitation.user,

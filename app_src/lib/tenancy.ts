@@ -182,6 +182,7 @@ function cleanResourceName(value: unknown, fallback: string): string {
 export async function ensureDefaultResourcesForUser(emailValue: unknown): Promise<{
   boardId: string
   pipelineId: string
+  crmBoardId: string
 }> {
   const user = await requireActiveAppUser(emailValue)
   const organization = await ensurePrimaryWorkspaceOrganization(user.email)
@@ -190,6 +191,9 @@ export async function ensureDefaultResourcesForUser(emailValue: unknown): Promis
   const isConfiguredOwner = ownerEmail === configuredOwner
 
   return withTransaction(async (client) => {
+    await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [organization.id])
+    await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 1))', [ownerEmail])
+
     await client.query(
       `
         INSERT INTO project_boards (name, owner_email, is_default)
@@ -204,34 +208,105 @@ export async function ensureDefaultResourcesForUser(emailValue: unknown): Promis
     )
     if (!board.rows[0]) throw new Error('Unable to provision a project board')
 
-    await client.query(
-      `
-        INSERT INTO pipeline_spaces (
-          name, owner_email, workspace_organization_id, is_default, sheet_id, sync_enabled
-        )
-        VALUES ($1, $2, $3::uuid, true, $4, $5)
-        ON CONFLICT (owner_email) WHERE is_default DO NOTHING
-      `,
-      [
-        isConfiguredOwner ? 'Sales pipeline' : 'My pipeline',
-        ownerEmail,
-        organization.id,
-        isConfiguredOwner ? DEFAULT_PIPELINE_SHEET_ID : null,
-        isConfiguredOwner,
-      ],
+    let pipeline = await client.query<{ id: string; owner_email: string }>(
+      `SELECT pipeline.id::text, pipeline.owner_email
+       FROM pipeline_spaces pipeline
+       WHERE pipeline.workspace_organization_id = $1::uuid
+       ORDER BY
+         EXISTS (
+           SELECT 1 FROM crm_board_projections projection
+           WHERE projection.pipeline_id = pipeline.id
+             AND projection.workspace_organization_id = $1::uuid
+         ) DESC,
+         pipeline.is_default DESC,
+         pipeline.created_at,
+         pipeline.id
+       LIMIT 1
+       FOR UPDATE OF pipeline`,
+      [organization.id],
     )
-    const pipeline = await client.query<{ id: string }>(
-      'SELECT id::text FROM pipeline_spaces WHERE owner_email = $1 AND is_default LIMIT 1',
-      [ownerEmail],
-    )
+
+    if (!pipeline.rows[0]) {
+      const ownedDefault = await client.query<{ present: boolean }>(
+        'SELECT EXISTS(SELECT 1 FROM pipeline_spaces WHERE owner_email = $1 AND is_default) AS present',
+        [ownerEmail],
+      )
+      pipeline = await client.query<{ id: string; owner_email: string }>(
+        `INSERT INTO pipeline_spaces (
+           name, owner_email, workspace_organization_id, is_default, sheet_id, sync_enabled
+         )
+         VALUES ($1, $2, $3::uuid, $4, $5, $6)
+         RETURNING id::text, owner_email`,
+        [
+          isConfiguredOwner ? 'Sales pipeline' : `${organization.name} pipeline`,
+          ownerEmail,
+          organization.id,
+          !ownedDefault.rows[0]?.present,
+          isConfiguredOwner ? DEFAULT_PIPELINE_SHEET_ID : null,
+          isConfiguredOwner,
+        ],
+      )
+    }
     if (!pipeline.rows[0]) throw new Error('Unable to provision a pipeline')
 
     await client.query(
-      `UPDATE pipeline_spaces
-       SET workspace_organization_id = $2::uuid, updated_at = now()
-       WHERE id = $1::uuid AND workspace_organization_id IS DISTINCT FROM $2::uuid`,
-      [pipeline.rows[0].id, organization.id],
+      `INSERT INTO project_boards (name, owner_email, is_default, created_at, updated_at)
+       SELECT 'CRM Board', $1, false, now(), now()
+       WHERE NOT EXISTS (
+         SELECT 1 FROM project_boards
+         WHERE owner_email = $1 AND lower(btrim(name)) = 'crm board'
+       )`,
+      [ownerEmail],
     )
+    const crmBoard = await client.query<{ id: string }>(
+      `SELECT id::text
+       FROM project_boards
+       WHERE owner_email = $1 AND lower(btrim(name)) = 'crm board'
+       ORDER BY created_at, id
+       LIMIT 1
+       FOR UPDATE`,
+      [ownerEmail],
+    )
+    if (!crmBoard.rows[0]) throw new Error('Unable to provision a CRM board')
+
+    const previousBinding = await client.query<{ pipeline_id: string }>(
+      'SELECT pipeline_id::text FROM crm_board_projections WHERE board_id = $1::uuid FOR UPDATE',
+      [crmBoard.rows[0].id],
+    )
+    if (previousBinding.rows[0] && previousBinding.rows[0].pipeline_id !== pipeline.rows[0].id) {
+      await client.query(
+        `DELETE FROM tasks task
+         USING crm_board_cards card
+         WHERE card.board_id = $1::uuid
+           AND card.task_id = task.id
+           AND task.source = 'crm-projection'`,
+        [crmBoard.rows[0].id],
+      )
+    }
+
+    await client.query(
+      `INSERT INTO crm_board_projections (
+         board_id, pipeline_id, workspace_organization_id, created_at, updated_at
+       )
+       VALUES ($1::uuid, $2::uuid, $3::uuid, now(), now())
+       ON CONFLICT (board_id) DO UPDATE SET
+         pipeline_id = EXCLUDED.pipeline_id,
+         workspace_organization_id = EXCLUDED.workspace_organization_id,
+         updated_at = now()`,
+      [crmBoard.rows[0].id, pipeline.rows[0].id, organization.id],
+    )
+
+    if (pipeline.rows[0].owner_email !== ownerEmail) {
+      await client.query(
+        `INSERT INTO pipeline_space_members (
+           pipeline_id, user_email, access_role, shared_by, created_at, updated_at
+         )
+         VALUES ($1::uuid, $2, 'editor', $3, now(), now())
+         ON CONFLICT (pipeline_id, user_email) DO UPDATE SET
+           access_role = 'editor', shared_by = EXCLUDED.shared_by, updated_at = now()`,
+        [pipeline.rows[0].id, ownerEmail, pipeline.rows[0].owner_email],
+      )
+    }
 
     if (isConfiguredOwner) {
       await client.query('UPDATE tasks SET board_id = $1::uuid WHERE board_id IS NULL', [board.rows[0].id])
@@ -254,7 +329,11 @@ export async function ensureDefaultResourcesForUser(emailValue: unknown): Promis
       )
     }
 
-    return { boardId: board.rows[0].id, pipelineId: pipeline.rows[0].id }
+    return {
+      boardId: board.rows[0].id,
+      pipelineId: pipeline.rows[0].id,
+      crmBoardId: crmBoard.rows[0].id,
+    }
   })
 }
 
@@ -348,7 +427,19 @@ export async function listPipelineSpaces(actorEmailValue: unknown): Promise<Pipe
         ON short_link.id = pipeline.short_link_id
       WHERE pipeline.owner_email = $1 OR membership.user_email = $1
       ORDER BY
-        CASE WHEN pipeline.owner_email = $1 AND pipeline.is_default THEN 0 WHEN pipeline.owner_email = $1 THEN 1 ELSE 2 END,
+        CASE
+          WHEN EXISTS (
+            SELECT 1
+            FROM crm_board_projections crm_projection
+            JOIN project_boards crm_board ON crm_board.id = crm_projection.board_id
+            WHERE crm_projection.pipeline_id = pipeline.id
+              AND crm_board.owner_email = $1
+              AND lower(btrim(crm_board.name)) = 'crm board'
+          ) THEN 0
+          WHEN pipeline.owner_email = $1 AND pipeline.is_default THEN 1
+          WHEN pipeline.owner_email = $1 THEN 2
+          ELSE 3
+        END,
         pipeline.created_at ASC
     `,
     [actor.email],
@@ -384,8 +475,7 @@ export async function resolvePipelineSpaceAccess(input: {
     if (!pipeline) throw new Error('Pipeline access denied')
     return pipeline
   }
-  const actor = normalizeUserEmail(input.actorEmail)
-  const fallback = pipelines.find((pipeline) => pipeline.ownerEmail === actor && pipeline.isDefault) || pipelines[0]
+  const fallback = pipelines[0]
   if (!fallback) throw new Error('No pipeline is available')
   return fallback
 }

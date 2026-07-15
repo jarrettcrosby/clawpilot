@@ -96,7 +96,7 @@ function interactionRow(
   opportunities: Map<string, string>,
 ): unknown[] {
   return [
-    record.sourceKey, '', record.subject, '', record.agentName, record.occurredAt || '',
+    record.sourceKey, '', record.subject, '', record.organizationName, record.agentName, record.occurredAt || '',
     record.opportunityId ? opportunities.get(record.opportunityId) || '' : '',
     record.contactId ? contacts.get(record.contactId) || '' : '',
     record.description,

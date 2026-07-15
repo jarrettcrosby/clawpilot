@@ -108,6 +108,7 @@ export type CrmInteraction = {
   shortUrl: string | null
   pipelineId: string
   organizationId: string | null
+  organizationName: string
   contactId: string | null
   opportunityId: string | null
   leadId: string | null

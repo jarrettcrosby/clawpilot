@@ -1008,24 +1008,11 @@ async function ensureCrmReferenceShortLink(
 ) {
   const destinationUrl = crmReferenceDestination(input.referenceCode)
   if (!destinationUrl) return null
-  const owner = await client.query<{ owner_email: string; organization_root_id: string }>(
-    `WITH RECURSIVE ancestors AS (
-       SELECT organization.id, organization.parent_id, ARRAY[organization.id] AS path
-       FROM pipeline_spaces pipeline
-       JOIN workspace_organizations organization ON organization.id = pipeline.workspace_organization_id
-       WHERE pipeline.id = $1::uuid
-       UNION ALL
-       SELECT parent.id, parent.parent_id, ancestor.path || parent.id
-       FROM ancestors ancestor
-       JOIN workspace_organizations parent ON parent.id = ancestor.parent_id
-       WHERE NOT parent.id = ANY(ancestor.path)
-     )
-     SELECT pipeline.owner_email, root.id::text AS organization_root_id
+  const owner = await client.query<{ owner_email: string; organization_id: string }>(
+    `SELECT pipeline.owner_email, pipeline.workspace_organization_id::text AS organization_id
      FROM pipeline_spaces pipeline
-     JOIN LATERAL (
-       SELECT id FROM ancestors ORDER BY (parent_id IS NULL) DESC LIMIT 1
-     ) root ON true
      WHERE pipeline.id = $1::uuid
+       AND pipeline.workspace_organization_id IS NOT NULL
      LIMIT 1`,
     [input.pipelineId],
   )
@@ -1048,7 +1035,7 @@ async function ensureCrmReferenceShortLink(
      RETURNING slug`,
     [
       owner.rows[0].owner_email,
-      owner.rows[0].organization_root_id,
+      owner.rows[0].organization_id,
       input.referenceCode,
       destinationUrl,
       input.title.slice(0, 200),
@@ -1058,7 +1045,10 @@ async function ensureCrmReferenceShortLink(
   return inserted.rows[0] ? crmReferenceShortUrl(input.referenceCode) : null
 }
 
-function normalizeStageCrmRecordInput(input: StageCrmRecordInput): StageCrmRecordInput {
+async function normalizeStageCrmRecordInput(
+  client: PoolClient,
+  input: StageCrmRecordInput,
+): Promise<StageCrmRecordInput> {
   if (input.entity === 'meetings') {
     const timezone = clean(input.fields.timezone) || 'America/New_York'
     const startsAt = zonedDateTimeToIso(input.fields.startsAt, timezone)
@@ -1068,11 +1058,52 @@ function normalizeStageCrmRecordInput(input: StageCrmRecordInput): StageCrmRecor
     }
     return { ...input, fields: { ...input.fields, startsAt, endsAt, timezone } }
   }
+  if (input.entity === 'interactions') {
+    const fields = input.fields
+    const relationship = await client.query<{
+      organization_id: string | null
+      organization_suitecrm_id: string | null
+    }>(
+      `WITH resolved AS (
+         SELECT COALESCE(
+           $2::uuid,
+           (SELECT organization_id FROM crm_contacts WHERE pipeline_id = $1::uuid AND id = $3::uuid),
+           (SELECT organization_id FROM crm_leads WHERE pipeline_id = $1::uuid AND id = $4::uuid),
+           (SELECT organization_id FROM crm_opportunities WHERE pipeline_id = $1::uuid AND id = $5::uuid),
+           (SELECT organization_id FROM crm_meetings WHERE pipeline_id = $1::uuid AND id = $6::uuid)
+         ) AS organization_id
+       )
+       SELECT organization.id::text AS organization_id,
+         organization.suitecrm_id AS organization_suitecrm_id
+       FROM resolved
+       LEFT JOIN crm_organizations organization
+         ON organization.pipeline_id = $1::uuid
+        AND organization.id = resolved.organization_id`,
+      [
+        input.pipelineId,
+        fields.organizationId || null,
+        fields.contactId || null,
+        fields.leadId || null,
+        fields.opportunityId || null,
+        fields.meetingId || null,
+      ],
+    )
+    const organization = relationship.rows[0]
+    return {
+      ...input,
+      fields: {
+        ...fields,
+        organizationId: organization?.organization_id || null,
+        parentSuiteCrmId: organization?.organization_suitecrm_id || fields.parentSuiteCrmId || null,
+        parentSuiteCrmType: organization?.organization_suitecrm_id ? 'Accounts' : fields.parentSuiteCrmType,
+      },
+    }
+  }
   return input
 }
 
 export async function stageCrmRecordWithClient(client: PoolClient, rawInput: StageCrmRecordInput) {
-  const input = normalizeStageCrmRecordInput(rawInput)
+  const input = await normalizeStageCrmRecordInput(client, rawInput)
   const identityKey = input.entity === 'organizations'
     ? organizationIdentityKey(input.fields)
     : input.entity === 'contacts'
@@ -1301,35 +1332,126 @@ export async function ensurePipelineCrmHierarchy(input: {
     workspaceOrganizationId: string
     name: string
   }> = []
-  let parent: { id: string; suiteCrmId: string } | null = null
-  for (const organization of lineage) {
-    const row = await stageCrmRecordInPostgres({
+  const stagedByWorkspaceOrganization = new Map<string, { id: string; suiteCrmId: string }>()
+
+  async function stageWorkspaceOrganization(inputOrganization: {
+    id: string
+    referenceCode: string
+    name: string
+    organizationType: 'root' | 'member'
+  }, parentRecord: { id: string; suiteCrmId: string } | null) {
+    const existing = await query<Record<string, unknown>>(
+      `SELECT *
+       FROM crm_organizations
+       WHERE pipeline_id = $1::uuid AND reference_code = $2
+       LIMIT 1`,
+      [input.pipelineId, inputOrganization.referenceCode],
+    )
+    const current = existing.rows[0]
+    const sourcePayload = current?.source_payload && typeof current.source_payload === 'object'
+      ? current.source_payload as Record<string, unknown>
+      : {}
+    return stageCrmRecordInPostgres({
       entity: 'organizations',
       pipelineId: input.pipelineId,
-      sourceKey: `workspace:${organization.id}`,
+      localId: current ? String(current.id) : null,
+      sourceKey: `workspace:${inputOrganization.id}`,
+      sourceSheetId: nullable(current?.source_sheet_id),
+      sourceRowNumber: current?.source_row_number === null || current?.source_row_number === undefined
+        ? null
+        : Number(current.source_row_number),
       actorEmail: input.actorEmail,
-      sourcePayload: { source: 'clawpilot_workspace', workspaceOrganizationId: organization.id },
+      sourcePayload: {
+        ...sourcePayload,
+        source: 'clawpilot_workspace',
+        workspaceOrganizationId: inputOrganization.id,
+      },
       fields: {
-        name: organization.name,
-        workspaceOrganizationId: organization.id,
-        workspaceOrganizationReferenceCode: organization.referenceCode,
-        parentOrganizationId: parent?.id || null,
-        parentOrganizationSuiteCrmId: parent?.suiteCrmId || null,
-        relationshipType: organization.organizationType === 'root' ? 'workspace_root' : 'workspace_member',
-        accountType: organization.organizationType === 'root' ? 'Parent organization' : 'Member organization',
+        name: inputOrganization.name,
+        workspaceOrganizationId: inputOrganization.id,
+        workspaceOrganizationReferenceCode: inputOrganization.referenceCode,
+        parentOrganizationId: parentRecord?.id || null,
+        parentOrganizationSuiteCrmId: parentRecord?.suiteCrmId || null,
+        relationshipType: inputOrganization.organizationType === 'root' ? 'workspace_root' : 'workspace_member',
+        accountType: clean(current?.account_type)
+          || (inputOrganization.organizationType === 'root' ? 'Parent organization' : 'Member organization'),
+        priority: clean(current?.priority),
+        accountManager: clean(current?.account_manager),
+        website: clean(current?.website),
+        linkedinUrl: clean(current?.linkedin_url),
+        phone: clean(current?.phone),
+        email: clean(current?.email),
+        emailOptOut: current?.email_opt_out === true,
+        address: clean(current?.billing_address_street),
+        city: clean(current?.billing_address_city),
+        state: clean(current?.billing_address_state),
+        postalCode: clean(current?.billing_address_postal_code),
+        country: clean(current?.billing_address_country),
+        description: clean(current?.description),
       },
     })
+  }
+
+  let parent: { id: string; suiteCrmId: string } | null = null
+  for (const organization of lineage) {
+    const row = await stageWorkspaceOrganization(organization, parent)
     parent = row
+    stagedByWorkspaceOrganization.set(organization.id, row)
     staged.push({ ...row, workspaceOrganizationId: organization.id, name: organization.name })
   }
   const customerParent = staged[staged.length - 1]
+
+  const descendants = await query<{
+    id: string
+    reference_code: string
+    parent_id: string
+    name: string
+    organization_type: 'root' | 'member'
+  }>(
+    `WITH RECURSIVE descendants AS (
+       SELECT organization.id, organization.reference_code, organization.parent_id,
+         organization.name, organization.organization_type, 1 AS depth,
+         ARRAY[$1::uuid, organization.id] AS path
+       FROM workspace_organizations organization
+       WHERE organization.parent_id = $1::uuid
+       UNION ALL
+       SELECT child.id, child.reference_code, child.parent_id,
+         child.name, child.organization_type, parent.depth + 1,
+         parent.path || child.id
+       FROM workspace_organizations child
+       JOIN descendants parent ON child.parent_id = parent.id
+       WHERE NOT child.id = ANY(parent.path)
+     )
+     SELECT id::text, reference_code, parent_id::text, name, organization_type
+     FROM descendants
+     ORDER BY depth, lower(name), id`,
+    [workspaceOrganizationId],
+  )
+  const stagedDescendants: typeof staged = []
+  for (const organization of descendants.rows) {
+    const descendantParent = stagedByWorkspaceOrganization.get(organization.parent_id)
+    if (!descendantParent) throw new Error('Workspace descendant hierarchy is incomplete')
+    const row = await stageWorkspaceOrganization({
+      id: organization.id,
+      referenceCode: organization.reference_code,
+      name: organization.name,
+      organizationType: organization.organization_type,
+    }, descendantParent)
+    stagedByWorkspaceOrganization.set(organization.id, row)
+    stagedDescendants.push({
+      ...row,
+      workspaceOrganizationId: organization.id,
+      name: organization.name,
+    })
+  }
+
   const customers = await query<Record<string, unknown>>(
     `SELECT *
      FROM crm_organizations
      WHERE pipeline_id = $1::uuid
        AND relationship_type = 'customer'
-       AND parent_organization_id IS DISTINCT FROM $2::uuid`,
-    [input.pipelineId, customerParent.id],
+       AND parent_organization_id IS NULL`,
+    [input.pipelineId],
   )
   for (const customer of customers.rows) {
     await stageCrmRecordInPostgres({
@@ -1361,7 +1483,7 @@ export async function ensurePipelineCrmHierarchy(input: {
       },
     })
   }
-  return { lineage: staged, customerParent }
+  return { lineage: staged, descendants: stagedDescendants, customerParent }
 }
 
 export async function syncAppUserProfileToCrm(input: {
@@ -1369,14 +1491,16 @@ export async function syncAppUserProfileToCrm(input: {
   pipelineId: string
 }) {
   const user = await requireActiveAppUser(input.email)
-  const ownedPipeline = await query<{ id: string }>(
-    `SELECT id::text
-     FROM pipeline_spaces
-     WHERE id = $1::uuid AND owner_email = $2
+  const organizationPipeline = await query<{ id: string }>(
+    `SELECT pipeline.id::text
+     FROM pipeline_spaces pipeline
+     JOIN app_users app_user ON app_user.email = $2
+     WHERE pipeline.id = $1::uuid
+       AND pipeline.workspace_organization_id = app_user.organization_id
      LIMIT 1`,
     [input.pipelineId, user.email],
   )
-  if (!ownedPipeline.rows[0]) throw new Error('CRM profile synchronization requires an owned pipeline')
+  if (!organizationPipeline.rows[0]) throw new Error('CRM profile synchronization requires an organization pipeline')
   const displayName = clean(user.displayName) || user.email.split('@')[0]
   const workspaceOrganization = await ensurePrimaryWorkspaceOrganization(user.email)
   const hierarchy = await ensurePipelineCrmHierarchy({
@@ -1438,10 +1562,11 @@ export async function syncPipelineOwnerProfileToCrm(pipelineId: string) {
 export async function syncAppUserProfileToOwnedPipelines(email: string) {
   const user = await requireActiveAppUser(email)
   const pipelines = await query<{ id: string }>(
-    `SELECT id::text
-     FROM pipeline_spaces
-     WHERE owner_email = $1
-     ORDER BY created_at, id`,
+    `SELECT pipeline.id::text
+     FROM pipeline_spaces pipeline
+     JOIN app_users app_user ON app_user.email = $1
+     WHERE pipeline.workspace_organization_id = app_user.organization_id
+     ORDER BY pipeline.created_at, pipeline.id`,
     [user.email],
   )
   const profiles = []
@@ -1502,7 +1627,8 @@ function opportunityFromRow(row: Record<string, unknown>): CrmOpportunity {
 function interactionFromRow(row: Record<string, unknown>): CrmInteraction {
   return {
     id: String(row.id), referenceCode: clean(row.reference_code), shortUrl: crmReferenceShortUrl(row.reference_code),
-    pipelineId: String(row.pipeline_id), organizationId: nullable(row.organization_id), contactId: nullable(row.contact_id),
+    pipelineId: String(row.pipeline_id), organizationId: nullable(row.organization_id), organizationName: clean(row.organization_name),
+    contactId: nullable(row.contact_id),
     opportunityId: nullable(row.opportunity_id), leadId: nullable(row.lead_id), meetingId: nullable(row.meeting_id),
     campaignId: nullable(row.campaign_id), suiteCrmId: nullable(row.suitecrm_id), sourceKey: String(row.source_key),
     sourceRowNumber: row.source_row_number === null ? null : Number(row.source_row_number), interactionType: clean(row.interaction_type),
@@ -1643,9 +1769,25 @@ export async function listCrmRecordsInPostgres(input: {
     return result.rows.map(campaignFromRow)
   }
   const result = await query<Record<string, unknown>>(
-    `SELECT * FROM crm_interactions
-     WHERE pipeline_id = $1::uuid AND ($2 = '' OR reference_code ILIKE '%' || $2 || '%' OR subject ILIKE '%' || $2 || '%' OR description ILIKE '%' || $2 || '%')
-     ORDER BY occurred_at DESC NULLS LAST, updated_at DESC, id LIMIT $3`,
+    `SELECT interaction.*,
+       COALESCE(interaction.organization_id, contact.organization_id, lead.organization_id,
+         opportunity.organization_id, meeting.organization_id) AS organization_id,
+       organization.name AS organization_name
+     FROM crm_interactions interaction
+     LEFT JOIN crm_contacts contact ON contact.id = interaction.contact_id
+     LEFT JOIN crm_leads lead ON lead.id = interaction.lead_id
+     LEFT JOIN crm_opportunities opportunity ON opportunity.id = interaction.opportunity_id
+     LEFT JOIN crm_meetings meeting ON meeting.id = interaction.meeting_id
+     LEFT JOIN crm_organizations organization ON organization.id = COALESCE(
+       interaction.organization_id, contact.organization_id, lead.organization_id,
+       opportunity.organization_id, meeting.organization_id
+     )
+     WHERE interaction.pipeline_id = $1::uuid
+       AND ($2 = '' OR interaction.reference_code ILIKE '%' || $2 || '%'
+         OR interaction.subject ILIKE '%' || $2 || '%'
+         OR interaction.description ILIKE '%' || $2 || '%'
+         OR organization.name ILIKE '%' || $2 || '%')
+     ORDER BY interaction.occurred_at DESC NULLS LAST, interaction.updated_at DESC, interaction.id LIMIT $3`,
     [input.pipelineId, search, limit],
   )
   return result.rows.map(interactionFromRow)
@@ -1705,6 +1847,11 @@ export async function readCrmRecordReference(input: {
        COALESCE(to_jsonb(record)->>'name', to_jsonb(record)->>'full_name', to_jsonb(record)->>'subject') AS display_name,
        COALESCE(to_jsonb(record)->>'organization_name', '') AS organization_name,
        to_jsonb(record)->>'organization_id' AS organization_id,
+       to_jsonb(record)->>'contact_id' AS contact_id,
+       to_jsonb(record)->>'lead_id' AS lead_id,
+       to_jsonb(record)->>'opportunity_id' AS opportunity_id,
+       to_jsonb(record)->>'meeting_id' AS meeting_id,
+       to_jsonb(record)->>'campaign_id' AS campaign_id,
        COALESCE(to_jsonb(record)->>'email', '') AS email,
        COALESCE(to_jsonb(record)->>'phone_mobile', to_jsonb(record)->>'phone_work', to_jsonb(record)->>'phone', '') AS phone,
        COALESCE(to_jsonb(record)->>'email_opt_out', 'false') AS email_opt_out,
@@ -1732,6 +1879,11 @@ export async function readCrmRecordReference(input: {
     name: clean(row.display_name),
     organizationName: clean(row.organization_name),
     organizationId: nullable(row.organization_id),
+    contactId: nullable(row.contact_id),
+    leadId: nullable(row.lead_id),
+    opportunityId: nullable(row.opportunity_id),
+    meetingId: nullable(row.meeting_id),
+    campaignId: nullable(row.campaign_id),
     email: clean(row.email),
     phone: clean(row.phone),
     emailOptOut: row.email_opt_out === true || clean(row.email_opt_out) === 'true',
@@ -1844,23 +1996,11 @@ export async function ensurePipelineCrmReferenceLinks(pipelineId: string) {
        UNION ALL SELECT reference_code, subject, 'meetings', NULL::text FROM crm_meetings WHERE pipeline_id = $1::uuid
        UNION ALL SELECT reference_code, subject, 'interactions', NULL::text FROM crm_interactions WHERE pipeline_id = $1::uuid
        UNION ALL SELECT reference_code, name, 'campaigns', NULL::text FROM crm_campaigns WHERE pipeline_id = $1::uuid
-     ), ancestors AS (
-       SELECT organization.id, organization.parent_id, ARRAY[organization.id] AS path
-       FROM pipeline_spaces pipeline
-       JOIN workspace_organizations organization ON organization.id = pipeline.workspace_organization_id
-       WHERE pipeline.id = $1::uuid
-       UNION ALL
-       SELECT parent.id, parent.parent_id, ancestor.path || parent.id
-       FROM ancestors ancestor
-       JOIN workspace_organizations parent ON parent.id = ancestor.parent_id
-       WHERE NOT parent.id = ANY(ancestor.path)
      ), owner AS (
-       SELECT pipeline.owner_email, root.id AS organization_root_id
+       SELECT pipeline.owner_email, pipeline.workspace_organization_id AS organization_id
        FROM pipeline_spaces pipeline
-       JOIN LATERAL (
-         SELECT id FROM ancestors ORDER BY (parent_id IS NULL) DESC LIMIT 1
-       ) root ON true
        WHERE pipeline.id = $1::uuid
+         AND pipeline.workspace_organization_id IS NOT NULL
      ), links AS (
        SELECT records.reference_code AS slug,
          $2 || '/crm/' || records.reference_code AS destination_url,
@@ -1879,7 +2019,7 @@ export async function ensurePipelineCrmReferenceLinks(pipelineId: string) {
      INSERT INTO short_links (
        owner_email, organization_root_id, source_app, slug, destination_url, title, tags, created_at, updated_at
      )
-     SELECT owner.owner_email, owner.organization_root_id, 'clawpilot-crm', links.slug,
+     SELECT owner.owner_email, owner.organization_id, 'clawpilot-crm', links.slug,
        links.destination_url, left(links.title, 200), links.tags, now(), now()
      FROM links CROSS JOIN owner
      ON CONFLICT (slug) DO UPDATE SET

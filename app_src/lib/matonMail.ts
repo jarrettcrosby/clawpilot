@@ -14,6 +14,7 @@ export type SendAuthMagicCodeEmailInput = {
 export type SendInvitationEmailInput = {
   to: string
   inviterName: string
+  organizationName: string
   welcomeUrl: string
   expiresAt: string
 }
@@ -166,6 +167,7 @@ export async function sendAuthMagicCodeEmail(
 export async function sendInvitationEmail(input: SendInvitationEmailInput): Promise<{ messageId: string | null }> {
   const to = assertEmail(input.to)
   const inviterName = String(input.inviterName || 'A ClawPilot administrator').trim().slice(0, 100)
+  const organizationName = String(input.organizationName || 'your organization').trim().slice(0, 200)
   const welcomeUrl = new URL(input.welcomeUrl)
   if (welcomeUrl.protocol !== 'https:' && welcomeUrl.hostname !== 'localhost') {
     throw new Error('Invitation URL must use HTTPS')
@@ -176,7 +178,7 @@ export async function sendInvitationEmail(input: SendInvitationEmailInput): Prom
   const text = [
     'Welcome to ClawPilot',
     '',
-    `${inviterName} invited you to ClawPilot, a private workspace for project boards, pipeline tracking, documents, and task-linked AI agents.`,
+    `${inviterName} invited you to join ${organizationName} in ClawPilot, a private workspace for project boards, pipeline tracking, documents, and task-linked AI agents.`,
     '',
     `Accept your invitation: ${welcomeUrl.toString()}`,
     '',
@@ -192,7 +194,7 @@ export async function sendInvitationEmail(input: SendInvitationEmailInput): Prom
     '<div style="max-width:560px;margin:0 auto;padding:28px;background:#1a1a23;border:1px solid #343741;border-radius:8px">',
     `<img src="${escapeHtml(logoUrl)}" width="56" height="56" alt="" style="display:block;margin:0 0 18px">`,
     '<h1 style="margin:0 0 12px;font-size:26px;line-height:1.2">Welcome to ClawPilot</h1>',
-    `<p style="margin:0 0 18px;line-height:1.6;color:#c7c9d1">${escapeHtml(inviterName)} invited you to a private workspace for project boards, pipeline tracking, documents, and task-linked AI agents.</p>`,
+    `<p style="margin:0 0 18px;line-height:1.6;color:#c7c9d1">${escapeHtml(inviterName)} invited you to join <strong>${escapeHtml(organizationName)}</strong> in a private workspace for project boards, pipeline tracking, documents, and task-linked AI agents.</p>`,
     `<p style="margin:0 0 22px"><a href="${escapeHtml(welcomeUrl.toString())}" style="display:inline-block;padding:12px 18px;border-radius:6px;background:#7eabff;color:#061a2f;text-decoration:none;font-weight:700">Accept invitation</a></p>`,
     '<p style="margin:0 0 8px;line-height:1.6">After you accept, ClawPilot will email a six-digit, one-time sign-in code. You do not need to create a password.</p>',
     `<p style="margin:0 0 8px;color:#a9adb8;line-height:1.6">This welcome link expires on ${escapeHtml(expiryLabel)}.</p>`,

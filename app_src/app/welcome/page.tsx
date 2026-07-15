@@ -18,6 +18,7 @@ import BrandMark from '@/components/BrandMark'
 type Invitation = {
   email: string
   inviterName: string
+  organizationName: string
   expiresAt: string
 }
 
@@ -97,7 +98,7 @@ export default function WelcomePage() {
         ) : invitation ? (
           <>
             <Typography color="text.secondary" sx={{ lineHeight: 1.65, mb: 2.5, overflowWrap: 'anywhere' }}>
-              {invitation.inviterName} invited <Box component="span" color="text.primary" sx={{ overflowWrap: 'anywhere' }}>{invitation.email}</Box> to a private ClawPilot workspace.
+              {invitation.inviterName} invited <Box component="span" color="text.primary" sx={{ overflowWrap: 'anywhere' }}>{invitation.email}</Box> to join <Box component="span" color="text.primary">{invitation.organizationName}</Box> in ClawPilot.
             </Typography>
             <Stack spacing={1.5} sx={{ mb: 3 }}>
               {[

@@ -15,6 +15,7 @@ const CRM_BOARD_NAME = 'crm board'
 type CrmBoardBinding = {
   board_id: string
   pipeline_id: string
+  workspace_organization_id: string
   owner_email: string
 }
 
@@ -123,10 +124,15 @@ function newCrmTask(boardId: string, record: CrmBoardRecord, now: string): Task 
 
 export async function resolveCrmBoardBinding(boardId: string): Promise<CrmBoardBinding | null> {
   return withTransaction(async (client) => {
-    const selected = await client.query<CrmBoardBinding & { board_name: string }>(
-      `SELECT board.id::text AS board_id, projection.pipeline_id::text, board.owner_email,
-         board.name AS board_name
+    const selected = await client.query<CrmBoardBinding & {
+      board_name: string
+      owner_organization_id: string | null
+    }>(
+      `SELECT board.id::text AS board_id, projection.pipeline_id::text,
+         projection.workspace_organization_id::text, board.owner_email,
+         app_user.organization_id::text AS owner_organization_id, board.name AS board_name
        FROM project_boards board
+       JOIN app_users app_user ON app_user.email = board.owner_email
        LEFT JOIN crm_board_projections projection ON projection.board_id = board.id
        WHERE board.id = $1::uuid
        FOR UPDATE OF board`,
@@ -134,42 +140,85 @@ export async function resolveCrmBoardBinding(boardId: string): Promise<CrmBoardB
     )
     const board = selected.rows[0]
     if (!board || board.board_name.trim().toLowerCase() !== CRM_BOARD_NAME) return null
-    if (board.pipeline_id) return board
+    if (!board.owner_organization_id) return null
+    if (
+      board.pipeline_id
+      && board.workspace_organization_id === board.owner_organization_id
+    ) return board
 
-    const pipeline = await client.query<{ id: string }>(
-      `SELECT id::text
+    const pipeline = await client.query<{ id: string; owner_email: string }>(
+      `SELECT id::text, owner_email
        FROM pipeline_spaces
-       WHERE owner_email = $1
-       ORDER BY is_default DESC, created_at, id
+       WHERE workspace_organization_id = $1::uuid
+       ORDER BY
+         EXISTS (
+           SELECT 1 FROM crm_board_projections existing
+           WHERE existing.pipeline_id = pipeline_spaces.id
+             AND existing.workspace_organization_id = $1::uuid
+         ) DESC,
+         is_default DESC, created_at, id
        LIMIT 1`,
-      [board.owner_email],
+      [board.owner_organization_id],
     )
     if (!pipeline.rows[0]) return null
-    const inserted = await client.query<{ pipeline_id: string }>(
-      `INSERT INTO crm_board_projections (board_id, pipeline_id, created_at, updated_at)
-       VALUES ($1::uuid, $2::uuid, now(), now())
-       ON CONFLICT DO NOTHING
-       RETURNING pipeline_id::text`,
-      [board.board_id, pipeline.rows[0].id],
+    const inserted = await client.query<{
+      pipeline_id: string
+      workspace_organization_id: string
+    }>(
+      `INSERT INTO crm_board_projections (
+         board_id, pipeline_id, workspace_organization_id, created_at, updated_at
+       )
+       VALUES ($1::uuid, $2::uuid, $3::uuid, now(), now())
+       ON CONFLICT (board_id) DO UPDATE SET
+         pipeline_id = EXCLUDED.pipeline_id,
+         workspace_organization_id = EXCLUDED.workspace_organization_id,
+         updated_at = now()
+       RETURNING pipeline_id::text, workspace_organization_id::text`,
+      [board.board_id, pipeline.rows[0].id, board.owner_organization_id],
     )
-    const pipelineId = inserted.rows[0]?.pipeline_id
-      || (await client.query<{ pipeline_id: string }>(
-        'SELECT pipeline_id::text FROM crm_board_projections WHERE board_id = $1::uuid',
-        [board.board_id],
-      )).rows[0]?.pipeline_id
-    return pipelineId ? { board_id: board.board_id, pipeline_id: pipelineId, owner_email: board.owner_email } : null
+    if (pipeline.rows[0].owner_email !== board.owner_email) {
+      await client.query(
+        `INSERT INTO pipeline_space_members (
+           pipeline_id, user_email, access_role, shared_by, created_at, updated_at
+         )
+         VALUES ($1::uuid, $2, 'editor', $3, now(), now())
+         ON CONFLICT (pipeline_id, user_email) DO UPDATE SET
+           access_role = 'editor', shared_by = EXCLUDED.shared_by, updated_at = now()`,
+        [pipeline.rows[0].id, board.owner_email, pipeline.rows[0].owner_email],
+      )
+    }
+    return {
+      board_id: board.board_id,
+      pipeline_id: inserted.rows[0].pipeline_id,
+      workspace_organization_id: inserted.rows[0].workspace_organization_id,
+      owner_email: board.owner_email,
+    }
   })
 }
 
-async function readCrmBoardRecords(pipelineId: string): Promise<CrmBoardRecord[]> {
+async function readCrmBoardRecords(
+  pipelineId: string,
+  workspaceOrganizationId: string,
+): Promise<CrmBoardRecord[]> {
   const result = await query<CrmBoardRecord>(
-    `SELECT 'organizations'::text AS entity_type, organization.id::text AS entity_id,
+    `WITH RECURSIVE visible_organizations AS (
+       SELECT organization.*, ARRAY[organization.id] AS graph_path
+       FROM crm_organizations organization
+       WHERE organization.pipeline_id = $1::uuid
+         AND organization.workspace_organization_id = $2::uuid
+       UNION ALL
+       SELECT child.*, parent.graph_path || child.id
+       FROM crm_organizations child
+       JOIN visible_organizations parent ON child.parent_organization_id = parent.id
+       WHERE child.pipeline_id = $1::uuid
+         AND NOT child.id = ANY(parent.graph_path)
+     )
+     SELECT 'organizations'::text AS entity_type, organization.id::text AS entity_id,
        organization.pipeline_id::text, organization.reference_code,
        organization.name AS record_name, organization.name AS account_name,
        organization.reference_code AS account_reference_code, organization.email,
        organization.description, organization.updated_at::text
-     FROM crm_organizations organization
-     WHERE organization.pipeline_id = $1::uuid
+     FROM visible_organizations organization
      UNION ALL
      SELECT 'contacts'::text AS entity_type, contact.id::text AS entity_id,
        contact.pipeline_id::text, contact.reference_code,
@@ -177,10 +226,10 @@ async function readCrmBoardRecords(pipelineId: string): Promise<CrmBoardRecord[]
        organization.reference_code AS account_reference_code, contact.email,
        contact.description, contact.updated_at::text
      FROM crm_contacts contact
-     JOIN crm_organizations organization ON organization.id = contact.organization_id
+     JOIN visible_organizations organization ON organization.id = contact.organization_id
      WHERE contact.pipeline_id = $1::uuid
      ORDER BY entity_type, record_name, reference_code`,
-    [pipelineId],
+    [pipelineId, workspaceOrganizationId],
   )
   return result.rows
 }
@@ -273,7 +322,7 @@ export async function reconcileCrmBoardProjection(input: { boardId: string }): P
   if (!binding) return { projected: false, pipelineId: null, cards: 0, conflicts: 0 }
   await ensurePipelineCrmReferenceLinks(binding.pipeline_id)
   const [records, existingCards] = await Promise.all([
-    readCrmBoardRecords(binding.pipeline_id),
+    readCrmBoardRecords(binding.pipeline_id, binding.workspace_organization_id),
     readCrmBoardCards(binding.board_id),
   ])
   const cardsByRecord = new Map(existingCards.map((card) => [`${card.entity_type}:${card.entity_id}`, card]))
@@ -299,7 +348,18 @@ export async function reconcileCrmBoardProjection(input: { boardId: string }): P
     })
   }
 
+  const visibleRecordKeys = new Set(records.map((record) => `${record.entity_type}:${record.entity_id}`))
+  const hiddenCards = existingCards.filter((card) => !visibleRecordKeys.has(`${card.entity_type}:${card.entity_id}`))
+
   await withTransaction(async (client) => {
+    for (const card of hiddenCards) {
+      await client.query(
+        `DELETE FROM tasks
+         WHERE id = $1 AND board_id = $2::uuid AND source = 'crm-projection'`,
+        [card.task_id, binding.board_id],
+      )
+    }
+
     for (const card of prepared) {
       await upsertTaskWithClient(client, card.task, binding.board_id, 'crm-projection')
       await client.query(

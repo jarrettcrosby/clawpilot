@@ -187,7 +187,8 @@ function columns(entity: CrmEntity) {
     ['referenceCode', 'ID'], ['name', 'Campaign'], ['status', 'Status'], ['recipientCount', 'Recipients'], ['sentCount', 'Sent'],
   ] as const
   return [
-    ['referenceCode', 'ID'], ['subject', 'Interaction'], ['interactionType', 'Type'], ['occurredAt', 'Date'], ['agentName', 'Agent'],
+    ['referenceCode', 'ID'], ['subject', 'Interaction'], ['organizationName', 'Organization'], ['interactionType', 'Type'],
+    ['occurredAt', 'Date'], ['agentName', 'Agent'],
   ] as const
 }
 
@@ -253,9 +254,19 @@ function initialFields(entity: CrmEntity, record: RecordValue | null, userTimeZo
   }
   return {
     subject: textValue(source, 'subject'), organizationId: textValue(source, 'organizationId'),
+    contactId: textValue(source, 'contactId'), leadId: textValue(source, 'leadId'),
+    opportunityId: textValue(source, 'opportunityId'), meetingId: textValue(source, 'meetingId'),
+    campaignId: textValue(source, 'campaignId'),
     interactionType: textValue(source, 'interactionType'), occurredAt: dateTimeLocalValue(source.occurredAt, userTimeZone),
     agentName: textValue(source, 'agentName'), description: textValue(source, 'description'),
   }
+}
+
+async function loadCrmOptions(entity: CrmEntity): Promise<RecordValue[]> {
+  const response = await fetch(`/api/crm?entity=${entity}&limit=1000`)
+  const payload = await response.json().catch(() => ({})) as CrmPayload
+  if (!response.ok || !payload.ok) throw new Error(payload.error || `Unable to load ${entity}`)
+  return payload.records || []
 }
 
 export default function CrmSection() {
@@ -374,6 +385,37 @@ export default function CrmSection() {
     if (routeReady) void load(entity, routeQuery)
   }, [entity, load, routeQuery, routeReady])
 
+  useEffect(() => {
+    if (editorRecord === undefined) return
+    let cancelled = false
+    const loadEditorOptions = async () => {
+      try {
+        if (['contacts', 'leads', 'meetings', 'interactions'].includes(entity)) {
+          const organizationRecords = await loadCrmOptions('organizations')
+          if (!cancelled) setOrganizations(organizationRecords)
+        }
+        if (entity === 'meetings') {
+          const [contactRecords, leadRecords, opportunityRecords] = await Promise.all([
+            loadCrmOptions('contacts'),
+            loadCrmOptions('leads'),
+            loadCrmOptions('opportunities'),
+          ])
+          if (!cancelled) {
+            setContacts(contactRecords)
+            setLeads(leadRecords)
+            setOpportunities(opportunityRecords)
+          }
+        }
+      } catch (optionsError) {
+        if (!cancelled) {
+          setError(optionsError instanceof Error ? optionsError.message : 'Unable to load CRM relationship options')
+        }
+      }
+    }
+    void loadEditorOptions()
+    return () => { cancelled = true }
+  }, [editorRecord, entity])
+
   const editable = Boolean(pipeline && pipeline.accessRole !== 'viewer' && entity !== 'opportunities')
   const recordEditable = editable && !editorRecord?.workspaceOrganizationId
   const tableColumns = useMemo(() => columns(entity), [entity])
@@ -391,21 +433,6 @@ export default function CrmSection() {
     if (!record && !editable) return
     setEditorRecord(record)
     setFields(initialFields(entity, record, dateTimeSettings.timeZone))
-    if (['contacts', 'leads', 'meetings', 'interactions'].includes(entity) && organizations.length === 0) {
-      const response = await fetch('/api/crm?entity=organizations&limit=1000')
-      const payload = await response.json().catch(() => ({})) as CrmPayload
-      if (response.ok && payload.ok) setOrganizations(payload.records || [])
-    }
-    if (entity === 'meetings') {
-      const [contactResponse, leadResponse, opportunityResponse] = await Promise.all([
-        contacts.length === 0 ? fetch('/api/crm?entity=contacts&limit=1000') : null,
-        leads.length === 0 ? fetch('/api/crm?entity=leads&limit=1000') : null,
-        opportunities.length === 0 ? fetch('/api/crm?entity=opportunities&limit=1000') : null,
-      ])
-      if (contactResponse?.ok) setContacts(((await contactResponse.json()) as CrmPayload).records || [])
-      if (leadResponse?.ok) setLeads(((await leadResponse.json()) as CrmPayload).records || [])
-      if (opportunityResponse?.ok) setOpportunities(((await opportunityResponse.json()) as CrmPayload).records || [])
-    }
   }
 
   async function saveRecord() {
@@ -962,6 +989,9 @@ export default function CrmSection() {
           {entity === 'contacts' && <>
             <TextField disabled={!recordEditable} label="Contact" value={fields.fullName || ''} onChange={(event) => setFields({ ...fields, fullName: event.target.value })} required />
             <TextField disabled={!recordEditable} select required label="Organization" value={fields.organizationId || ''} onChange={(event) => setFields({ ...fields, organizationId: event.target.value })}>
+              {fields.organizationId && !organizations.some((record) => textValue(record, 'id') === fields.organizationId) ? (
+                <MenuItem value={fields.organizationId}>{(editorRecord ? textValue(editorRecord, 'organizationName') : '') || 'Current organization'}</MenuItem>
+              ) : null}
               {organizations.map((record) => <MenuItem key={textValue(record, 'id')} value={textValue(record, 'id')}>{textValue(record, 'name')}</MenuItem>)}
             </TextField>
             <TextField disabled={!recordEditable} label="Title" value={fields.jobTitle || ''} onChange={(event) => setFields({ ...fields, jobTitle: event.target.value })} />
@@ -977,6 +1007,9 @@ export default function CrmSection() {
             <TextField disabled={!recordEditable} label="Lead" value={fields.fullName || ''} onChange={(event) => setFields({ ...fields, fullName: event.target.value })} required />
             <TextField disabled={!recordEditable} select label="Organization" value={fields.organizationId || ''} onChange={(event) => setFields({ ...fields, organizationId: event.target.value })}>
               <MenuItem value="">Unlinked</MenuItem>
+              {fields.organizationId && !organizations.some((record) => textValue(record, 'id') === fields.organizationId) ? (
+                <MenuItem value={fields.organizationId}>{(editorRecord ? textValue(editorRecord, 'organizationName') : '') || 'Current organization'}</MenuItem>
+              ) : null}
               {organizations.map((record) => <MenuItem key={textValue(record, 'id')} value={textValue(record, 'id')}>{textValue(record, 'name')}</MenuItem>)}
             </TextField>
             <TextField disabled={!recordEditable} label="Company" value={fields.companyName || ''} onChange={(event) => setFields({ ...fields, companyName: event.target.value })} />
@@ -1003,6 +1036,9 @@ export default function CrmSection() {
             <TextField disabled={!recordEditable} label="Meeting" value={fields.subject || ''} onChange={(event) => setFields({ ...fields, subject: event.target.value })} required />
             <TextField disabled={!recordEditable} select label="Organization" value={fields.organizationId || ''} onChange={(event) => setFields({ ...fields, organizationId: event.target.value })}>
               <MenuItem value="">Unlinked</MenuItem>
+              {fields.organizationId && !organizations.some((record) => textValue(record, 'id') === fields.organizationId) ? (
+                <MenuItem value={fields.organizationId}>{(editorRecord ? textValue(editorRecord, 'organizationName') : '') || 'Current organization'}</MenuItem>
+              ) : null}
               {organizations.map((record) => <MenuItem key={textValue(record, 'id')} value={textValue(record, 'id')}>{textValue(record, 'name')}</MenuItem>)}
             </TextField>
             <TextField disabled={!recordEditable} select label="Contact" value={fields.contactId || ''} onChange={(event) => setFields({ ...fields, contactId: event.target.value })}>
@@ -1027,6 +1063,9 @@ export default function CrmSection() {
             <TextField disabled={!recordEditable} label="Subject" value={fields.subject || ''} onChange={(event) => setFields({ ...fields, subject: event.target.value })} required />
             <TextField disabled={!recordEditable} select label="Organization" value={fields.organizationId || ''} onChange={(event) => setFields({ ...fields, organizationId: event.target.value })}>
               <MenuItem value="">None</MenuItem>
+              {fields.organizationId && !organizations.some((record) => textValue(record, 'id') === fields.organizationId) ? (
+                <MenuItem value={fields.organizationId}>{(editorRecord ? textValue(editorRecord, 'organizationName') : '') || 'Current organization'}</MenuItem>
+              ) : null}
               {organizations.map((record) => <MenuItem key={textValue(record, 'id')} value={textValue(record, 'id')}>{textValue(record, 'name')}</MenuItem>)}
             </TextField>
             <TextField disabled={!recordEditable} label="Type" value={fields.interactionType || ''} onChange={(event) => setFields({ ...fields, interactionType: event.target.value })} />

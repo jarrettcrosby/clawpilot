@@ -4,6 +4,7 @@ import { processCalendarIngestion } from '@/lib/crm/calendarIngestion'
 import { processInboundGmailIngestion } from '@/lib/crm/emailIngestion'
 import { processDueCrmIntegrationActions } from '@/lib/crm/integrationActions'
 import { processSuiteCrmAccountContactIngestion } from '@/lib/crm/suiteCrmAccountContactIngestion'
+import { processSuiteCrmInteractionIngestion } from '@/lib/crm/suiteCrmInteractionIngestion'
 import { processSuiteCrmMeetingIngestion } from '@/lib/crm/suiteCrmMeetingIngestion'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 
@@ -41,6 +42,7 @@ export async function POST(req: NextRequest) {
     const body = await req.json().catch(() => ({})) as { limit?: unknown }
     const suiteCrmAccountContactIngestion = await processSuiteCrmAccountContactIngestion()
     const suiteCrmMeetingIngestion = await processSuiteCrmMeetingIngestion()
+    const suiteCrmInteractionIngestion = await processSuiteCrmInteractionIngestion()
     const results = await processDueCrmIntegrationActions({ limit: boundedLimit(body.limit) })
     const actions = {
       claimed: results.length,
@@ -59,6 +61,7 @@ export async function POST(req: NextRequest) {
       calendarIngestion,
       suiteCrmAccountContactIngestion,
       suiteCrmMeetingIngestion,
+      suiteCrmInteractionIngestion,
     })
   } catch {
     return NextResponse.json(

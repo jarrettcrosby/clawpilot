@@ -193,7 +193,24 @@ async function mockCrmRecords(page: Page) {
     }],
     leads: [],
     opportunities: [],
-    interactions: [],
+    interactions: [{
+      id: '00000000-0000-4000-8000-000000000104',
+      referenceCode: 'gi7654321',
+      shortUrl: null,
+      subject: 'Acceptance Interaction',
+      organizationId: '00000000-0000-4000-8000-000000000101',
+      organizationName: 'Acceptance Organization',
+      contactId: '00000000-0000-4000-8000-000000000102',
+      opportunityId: null,
+      leadId: null,
+      meetingId: null,
+      campaignId: null,
+      interactionType: 'Call',
+      occurredAt: '2026-07-15T14:00:00.000Z',
+      agentName: 'Mobile Operator',
+      description: 'Acceptance interaction notes',
+      syncStatus: 'synced',
+    }],
     campaigns: [],
   }
 
@@ -218,7 +235,7 @@ async function mockCrmRecords(page: Page) {
           leads: 0,
           opportunities: 0,
           meetings: 1,
-          interactions: 0,
+          interactions: 1,
           campaigns: 0,
           openPipelineValue: 0,
           weightedPipelineValue: 0,
@@ -425,6 +442,30 @@ for (const viewport of MOBILE_VIEWPORTS) {
       await expect(drawer.getByText(reference, { exact: true })).toBeVisible()
       await closeEditor.click()
       await expect(activeSection(page).getByRole('heading', { name: 'CRM', exact: true })).toBeVisible()
+      await expectNoDocumentOverflow(page)
+    })
+
+    test('CRM interaction deep link hydrates its organization relationship', async ({ page }) => {
+      const warnings: string[] = []
+      let organizationRequests = 0
+      page.on('console', (message) => {
+        if (message.type() === 'warning' || message.type() === 'error') warnings.push(message.text())
+      })
+      page.on('request', (request) => {
+        const url = new URL(request.url())
+        if (url.pathname === '/api/crm' && url.searchParams.get('entity') === 'organizations') {
+          organizationRequests += 1
+        }
+      })
+      await mockCrmRecords(page)
+      await gotoApp(page, '/crm/gi7654321')
+
+      const drawer = page.getByRole('button', { name: 'Close editor' })
+        .locator('xpath=ancestor::*[contains(@class,"MuiDrawer-paper")][1]')
+      await expectUsableGeometry(drawer, 'Interaction editor drawer', 160, 280)
+      await expect(drawer.getByRole('combobox', { name: 'Organization' })).toContainText('Acceptance Organization')
+      await expect.poll(() => organizationRequests).toBeGreaterThan(0)
+      expect(warnings.filter((warning) => /out-of-range value/i.test(warning))).toEqual([])
       await expectNoDocumentOverflow(page)
     })
 
