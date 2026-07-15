@@ -497,6 +497,12 @@ assertIncludes(suiteCrmGlobalIdBootstrap, "const CLAWPILOT_GLOBAL_ID_FIELD = 'gl
 assertIncludes(suiteCrmGlobalIdBootstrap, '$field->unified_search = 1', 'native SuiteCRM Global ID unified search')
 assertIncludes(suiteCrmGlobalIdBootstrap, "'Meetings'", 'SuiteCRM meeting Global ID field')
 assertIncludes(suiteCrmGlobalIdBootstrap, 'expose_global_id_in_detail_view', 'SuiteCRM Global ID detail layout')
+assertIncludes(suiteCrmGlobalIdBootstrap, 'expose_global_id_in_list_view', 'SuiteCRM Global ID list layout')
+assertIncludes(suiteCrmGlobalIdBootstrap, "expose_global_id_in_search_view($module, 'basic_search')", 'SuiteCRM Global ID basic search layout')
+assertIncludes(suiteCrmGlobalIdBootstrap, "expose_global_id_in_search_view($module, 'advanced_search')", 'SuiteCRM Global ID advanced search layout')
+assertIncludes(suiteCrmGlobalIdBootstrap, 'ensure_global_id_search_field', 'SuiteCRM Global ID search field metadata')
+assertIncludes(suiteCrmGlobalIdBootstrap, 'rebuild_and_verify_global_search', 'SuiteCRM Global ID search cache verification')
+assertIncludes(suiteCrmGlobalIdBootstrap, "sugar_cached('modules/unified_search_modules.php')", 'SuiteCRM unified search cache invalidation')
 
 const suiteCrmGlobalIdBackfill = read('scripts/backfill-suitecrm-global-ids.mjs')
 assertIncludes(suiteCrmGlobalIdBackfill, 'global_id_c: row.reference_code', 'existing SuiteCRM Global ID backfill')
