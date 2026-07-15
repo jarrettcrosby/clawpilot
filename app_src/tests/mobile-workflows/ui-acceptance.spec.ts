@@ -283,7 +283,9 @@ for (const viewport of MOBILE_VIEWPORTS) {
     test('Links is covered when enabled and explicitly limited for local file storage', async ({ page }, testInfo) => {
       await gotoApp(page, '/#links')
 
-      const linksHeading = page.getByRole('heading', { name: 'Short Links', exact: true })
+      const linksHeading = page
+        .getByTestId('short-links-section')
+        .getByRole('heading', { name: 'Short Links', exact: true })
       const outcome = await Promise.race([
         linksHeading.waitFor({ state: 'visible', timeout: 5000 }).then(() => 'links' as const),
         page.waitForURL(/#dashboard$/, { timeout: 5000 }).then(() => 'dashboard' as const),
