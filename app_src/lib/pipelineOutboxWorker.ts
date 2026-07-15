@@ -227,6 +227,7 @@ export async function processPipelineSyncOutbox(input: {
         || item.operation === 'reconcile_pipeline_hierarchy_v2'
         || item.operation === 'reconcile_pipeline_hierarchy_v3'
         || item.operation === 'reconcile_pipeline_hierarchy_v4'
+        || item.operation === 'reconcile_pipeline_hierarchy_v5'
       ) {
         const pipelineId = workspacePipelineId(item)
         item.pipelineId = pipelineId
@@ -260,6 +261,7 @@ export async function processPipelineSyncOutbox(input: {
         || item.operation === 'reconcile_pipeline_hierarchy_v2'
         || item.operation === 'reconcile_pipeline_hierarchy_v3'
         || item.operation === 'reconcile_pipeline_hierarchy_v4'
+        || item.operation === 'reconcile_pipeline_hierarchy_v5'
         || item.operation === 'sync_pipeline_permissions'
       const status = await failPipelineSyncOutboxInPostgres({
         item,

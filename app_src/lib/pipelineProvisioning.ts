@@ -411,9 +411,10 @@ async function getDriveFile(runtime: GoogleWorkspaceRuntime, resourceId: string)
   return googleDriveJson<DriveFile>(runtime, `/drive/v3/files/${resourceId}?${parameters.toString()}`)
 }
 
-async function driveFolderHasVerifiedChildren(runtime: GoogleWorkspaceRuntime, folderId: string) {
+async function listVerifiedDriveFolderChildren(runtime: GoogleWorkspaceRuntime, folderId: string) {
   let pageToken: string | undefined
   const seenPageTokens = new Set<string>()
+  const children: string[] = []
 
   do {
     const parameters = new URLSearchParams({
@@ -442,7 +443,7 @@ async function driveFolderHasVerifiedChildren(runtime: GoogleWorkspaceRuntime, f
           'GOOGLE_RESPONSE_INVALID',
         )
       }
-      return true
+      children.push(child.id)
     }
 
     pageToken = response.nextPageToken
@@ -456,7 +457,25 @@ async function driveFolderHasVerifiedChildren(runtime: GoogleWorkspaceRuntime, f
     if (pageToken) seenPageTokens.add(pageToken)
   } while (pageToken)
 
-  return false
+  return children
+}
+
+async function waitForDriveChildRemoval(
+  runtime: GoogleWorkspaceRuntime,
+  parentId: string,
+  childId: string,
+) {
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const children = await listVerifiedDriveFolderChildren(runtime, parentId)
+    if (!children.includes(childId)) return
+    await delay(250 * (2 ** attempt))
+  }
+  throw new GoogleWorkspaceClientError(
+    'Google Drive folder deletion is still converging',
+    503,
+    'GOOGLE_DRIVE_DELETE_UNVERIFIED',
+    true,
+  )
 }
 
 async function cleanupLegacyFolderChain(runtime: GoogleWorkspaceRuntime, folderId: string | undefined) {
@@ -474,7 +493,7 @@ async function cleanupLegacyFolderChain(runtime: GoogleWorkspaceRuntime, folderI
       folder.mimeType !== DRIVE_FOLDER_MIME_TYPE
       || folder.appProperties?.clawpilotManaged !== 'true'
       || !legacyResources.has(String(folder.appProperties?.clawpilotResource || ''))
-      || await driveFolderHasVerifiedChildren(runtime, current)
+      || (await listVerifiedDriveFolderChildren(runtime, current)).length > 0
     ) return
     const parent = folder.parents?.[0]
     const parameters = new URLSearchParams({ supportsAllDrives: 'true' })
@@ -486,6 +505,7 @@ async function cleanupLegacyFolderChain(runtime: GoogleWorkspaceRuntime, folderI
     } catch (error) {
       if (!(error instanceof GoogleWorkspaceClientError) || error.code !== 'GOOGLE_RESOURCE_NOT_FOUND') throw error
     }
+    if (parent) await waitForDriveChildRemoval(runtime, parent, current)
     current = parent
   }
 }
@@ -518,16 +538,13 @@ async function cleanupLegacyOwnerHierarchy(input: {
         mimeType: DRIVE_FOLDER_MIME_TYPE,
         appProperties: fileProperties('pipelines-root', { ownerKey: input.ownerKey }),
       })
-      if (pipelineRoots.length === 0) {
-        await cleanupLegacyFolderChain(input.runtime, userFolderId)
-        continue
-      }
       for (const pipelineRoot of pipelineRoots) {
         await cleanupLegacyFolderChain(
           input.runtime,
           validResourceId(pipelineRoot.id, 'Legacy pipelines folder ID'),
         )
       }
+      await cleanupLegacyFolderChain(input.runtime, userFolderId)
     }
     await cleanupLegacyFolderChain(input.runtime, usersRootId)
   }

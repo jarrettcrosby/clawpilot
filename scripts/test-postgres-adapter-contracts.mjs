@@ -257,7 +257,7 @@ assertIncludes(pipelineAdapter, 'FROM google_workspace_integration', 'queue-time
 assertIncludes(pipelineAdapter, 'FOR SHARE', 'queue-time credential and binding serialization')
 assertIncludes(
   pipelineAdapter,
-  "target_system IN ('google_sheets', 'google_workspace', 'google_workspace_v2', 'google_workspace_v3', 'google_workspace_v4', 'pipeline_internal_v1')",
+  "target_system IN ('google_sheets', 'google_workspace', 'google_workspace_v2', 'google_workspace_v3', 'google_workspace_v4', 'google_workspace_v5', 'pipeline_internal_v1')",
   'managed workspace outbox claims',
 )
 assertIncludes(pipelineAdapter, 'resolvePipelineSheetBindingInPostgres', 'validated pipeline Sheet binding resolver')
@@ -358,6 +358,11 @@ const verifiedDriveCleanupMigration = read('db/migrations/0027_verified_legacy_d
 assertIncludes(verifiedDriveCleanupMigration, "'reconcile_pipeline_hierarchy_v4'", 'verified Drive cleanup operation')
 assertIncludes(verifiedDriveCleanupMigration, "'google_workspace_v4'", 'verified Drive cleanup worker target')
 assertIncludes(verifiedDriveCleanupMigration, "'layoutVersion', 4", 'verified Drive cleanup payload')
+
+const eventualDriveCleanupMigration = read('db/migrations/0028_eventual_drive_cleanup_reconciliation.sql')
+assertIncludes(eventualDriveCleanupMigration, "'reconcile_pipeline_hierarchy_v5'", 'eventual Drive cleanup operation')
+assertIncludes(eventualDriveCleanupMigration, "'google_workspace_v5'", 'eventual Drive cleanup worker target')
+assertIncludes(eventualDriveCleanupMigration, "'layoutVersion', 5", 'eventual Drive cleanup payload')
 
 const crmIntegrationActions = read('app_src/lib/crm/integrationActions.ts')
 for (const action of ['send_email', 'create_calendar_event', 'log_call', 'send_campaign']) {
@@ -462,6 +467,7 @@ assertIncludes(outboxWorker, "item.operation === 'provision_pipeline'", 'pipelin
 assertIncludes(outboxWorker, "item.operation === 'reconcile_pipeline_hierarchy_v2'", 'versioned Drive hierarchy worker dispatch')
 assertIncludes(outboxWorker, "item.operation === 'reconcile_pipeline_hierarchy_v3'", 'legacy Drive cleanup worker dispatch')
 assertIncludes(outboxWorker, "item.operation === 'reconcile_pipeline_hierarchy_v4'", 'verified Drive cleanup worker dispatch')
+assertIncludes(outboxWorker, "item.operation === 'reconcile_pipeline_hierarchy_v5'", 'eventual Drive cleanup worker dispatch')
 assertIncludes(outboxWorker, "item.operation === 'sync_pipeline_permissions'", 'pipeline permission worker dispatch')
 assertIncludes(outboxWorker, 'resolveManagedGoogleWorkspaceRuntime', 'bound managed pipeline runtime resolution')
 assertIncludes(outboxWorker, 'googleSheetsJson', 'bound managed pipeline Sheet writes')
@@ -497,6 +503,8 @@ assertIncludes(pipelineProvisioning, "fileProperties('users-root'", 'environment
 assertIncludes(pipelineProvisioning, 'fields: \'nextPageToken,files(id,parents)\'', 'verified Drive child response shape')
 assertIncludes(pipelineProvisioning, 'child.id === folderId', 'Drive folder self-reference rejection')
 assertIncludes(pipelineProvisioning, 'child.parents?.includes(folderId)', 'Drive child parent verification')
+assertIncludes(pipelineProvisioning, 'waitForDriveChildRemoval', 'eventual Drive deletion verification')
+assertIncludes(pipelineProvisioning, 'GOOGLE_DRIVE_DELETE_UNVERIFIED', 'retryable Drive deletion convergence error')
 
 const googleWorkspacePersistence = read('app_src/lib/persistence/googleWorkspace.ts')
 assertIncludes(googleWorkspacePersistence, 'expectedVersion', 'Google Workspace optimistic persistence')

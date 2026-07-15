@@ -121,6 +121,7 @@ for (const requiredPath of [
   'db/migrations/0025_profile_crm_projection_backfill.sql',
   'db/migrations/0026_legacy_drive_hierarchy_cleanup.sql',
   'db/migrations/0027_verified_legacy_drive_cleanup.sql',
+  'db/migrations/0028_eventual_drive_cleanup_reconciliation.sql',
   'scripts/start-railway.sh',
   'scripts/pipeline-outbox-poller.mjs',
   'scripts/validate-runtime-config.mjs',
