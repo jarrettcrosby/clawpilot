@@ -340,6 +340,21 @@ for (const table of [
   assertIncludes(crmModulesMigration, `CREATE TABLE IF NOT EXISTS ${table}`, 'CRM module and integration migration')
 }
 
+const randomCrmReferencesMigration = read('db/migrations/0030_random_crm_references_and_organization_email.sql')
+assertIncludes(randomCrmReferencesMigration, 'CREATE TABLE IF NOT EXISTS crm_reference_registry', 'permanent CRM reference registry')
+assertIncludes(randomCrmReferencesMigration, 'allocate_crm_reference', 'random CRM reference allocator')
+assertIncludes(randomCrmReferencesMigration, "1000000 + floor(random() * 9000000)", 'seven-digit random CRM suffix')
+assertIncludes(randomCrmReferencesMigration, "status = 'alias'", 'legacy CRM reference aliases')
+assertIncludes(randomCrmReferencesMigration, 'protect_crm_reference_registry_delete', 'non-reusable CRM reference allocations')
+assertIncludes(randomCrmReferencesMigration, 'ADD COLUMN IF NOT EXISTS email text', 'organization email delivery field')
+
+const globalCrmReferenceNumbersMigration = read('db/migrations/0031_global_crm_reference_number_registry.sql')
+assertIncludes(globalCrmReferenceNumbersMigration, 'CREATE TABLE IF NOT EXISTS crm_reference_number_registry', 'permanent CRM number registry')
+assertIncludes(globalCrmReferenceNumbersMigration, 'ON CONFLICT (number_value) DO NOTHING', 'concurrent CRM number allocation')
+assertIncludes(globalCrmReferenceNumbersMigration, 'protect_crm_reference_number_registry_delete', 'immutable CRM number allocation')
+assertIncludes(globalCrmReferenceNumbersMigration, 'enforce_crm_reference_number_exclusive_insert', 'cross-module CRM number exclusivity')
+assertIncludes(globalCrmReferenceNumbersMigration, 'Current CRM records contain duplicate numeric reference values', 'current CRM number collision guard')
+
 const driveHierarchyMigration = read('db/migrations/0024_versioned_drive_hierarchy_reconciliation.sql')
 assertIncludes(driveHierarchyMigration, "'reconcile_pipeline_hierarchy_v2'", 'versioned Drive hierarchy operation')
 assertIncludes(driveHierarchyMigration, "'google_workspace_v2'", 'versioned Drive hierarchy worker target')
@@ -380,6 +395,12 @@ assertIncludes(crmIntegrationActions, 'appendTextReplyMarker', 'outbound CRM rep
 assertIncludes(crmIntegrationActions, 'appendHtmlReplyMarker', 'outbound CRM HTML reply marker')
 assertIncludes(crmIntegrationActions, '`%gslt${normalizeReference(referenceCode)}`', 'exact outbound CRM marker syntax')
 assertIncludes(crmIntegrationActions, 'crm_campaign_recipients', 'campaign recipient deduplication')
+assertIncludes(crmIntegrationActions, "target.entity !== 'organizations'", 'organization email actions')
+assertIncludes(crmIntegrationActions, 'recipientEmail: normalizeEmail(target.email', 'queued CRM recipient snapshot')
+assertIncludes(crmIntegrationActions, 'calendarEventIdForAction', 'deterministic Google Calendar event identity')
+assertIncludes(crmIntegrationActions, "method: 'PATCH'", 'Google Calendar reschedule update')
+assertIncludes(crmIntegrationActions, 'sendUpdates=all', 'Google Calendar attendee notifications')
+assertIncludes(crmIntegrationActions, 'parentSuiteCrmType: parentSuiteCrmType || undefined', 'SuiteCRM meeting parent projection')
 
 const crmEmailIngestion = read('app_src/lib/crm/emailIngestion.ts')
 assertIncludes(crmEmailIngestion, 'export function truncateEmailImportContent', 'email import boundary')
@@ -389,6 +410,8 @@ assertIncludes(crmEmailIngestion, 'if (seen.has(reference)) continue', 'quoted-t
 assertIncludes(crmEmailIngestion, 'ON CONFLICT (owner_email, external_message_id) DO NOTHING', 'Gmail message deduplication')
 assertIncludes(crmEmailIngestion, 'ownedPipelines', 'cross-owned-pipeline marker resolution')
 assertIncludes(crmEmailIngestion, 'pipelineId: input.target.pipelineId', 'matched-pipeline interaction staging')
+assertIncludes(crmEmailIngestion, "organizations: 'Accounts'", 'organization marker SuiteCRM relationship')
+assertIncludes(crmEmailIngestion, "contacts: 'Contacts'", 'contact marker SuiteCRM relationship')
 
 const crmIntegrationWorkerRoute = read('app_src/app/api/crm/integrations/process/route.ts')
 assertIncludes(crmIntegrationWorkerRoute, 'processDueCrmIntegrationActions', 'CRM action retry worker')
@@ -397,6 +420,15 @@ assertIncludes(crmIntegrationWorkerRoute, 'processInboundGmailIngestion', 'inbou
 const crmActionsRoute = read('app_src/app/api/crm/actions/route.ts')
 assertIncludes(crmActionsRoute, 'requireResourceEditor', 'CRM action editor authorization')
 assertIncludes(crmActionsRoute, 'idempotency-key', 'CRM action idempotency header')
+
+const crmReferenceRoute = read('app_src/app/crm/[reference]/route.ts')
+assertIncludes(crmReferenceRoute, "new URL('/', appPublicUrl())", 'trusted public CRM reference redirect origin')
+assertIncludes(crmReferenceRoute, 'resolveCrmReferenceCode', 'legacy CRM reference alias resolution')
+assertIncludes(crmReferenceRoute, "destination.searchParams.set('pipeline', pipelineId)", 'CRM reference owning pipeline handoff')
+
+const zonedDateTime = read('app_src/lib/zonedDateTime.ts')
+assertIncludes(zonedDateTime, 'export function zonedDateTimeToIso', 'timezone-aware CRM meeting conversion')
+assertIncludes(zonedDateTime, 'export function dateTimeLocalValue', 'timezone-aware CRM meeting editor value')
 
 const suiteCrmClient = read('app_src/lib/crm/suiteCrmClient.ts')
 assertIncludes(suiteCrmClient, '/Api/access_token', 'SuiteCRM OAuth client credentials')

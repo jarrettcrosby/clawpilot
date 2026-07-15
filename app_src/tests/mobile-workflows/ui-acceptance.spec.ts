@@ -141,6 +141,108 @@ function note(testInfo: TestInfo, description: string) {
   testInfo.annotations.push({ type: 'limitation', description })
 }
 
+async function mockCrmRecords(page: Page) {
+  const recordsByEntity: Record<string, Array<Record<string, unknown>>> = {
+    organizations: [{
+      id: '00000000-0000-4000-8000-000000000101',
+      referenceCode: 'ga7654321',
+      shortUrl: null,
+      name: 'Acceptance Organization',
+      parentOrganizationName: 'Acceptance Workspace',
+      relationshipType: 'customer',
+      workspaceOrganizationId: null,
+      accountManager: 'Mobile Operator',
+      phone: '+1 555 0101',
+      email: 'organization@example.test',
+      emailOptOut: false,
+      syncStatus: 'synced',
+    }],
+    contacts: [{
+      id: '00000000-0000-4000-8000-000000000102',
+      referenceCode: 'gc7654321',
+      shortUrl: null,
+      fullName: 'Acceptance Contact',
+      organizationId: '00000000-0000-4000-8000-000000000101',
+      organizationName: 'Acceptance Organization',
+      jobTitle: 'Mobile Lead',
+      email: 'contact@example.test',
+      emailOptOut: true,
+      syncStatus: 'synced',
+    }],
+    meetings: [{
+      id: '00000000-0000-4000-8000-000000000103',
+      referenceCode: 'gm7654321',
+      shortUrl: null,
+      subject: 'Acceptance Meeting',
+      organizationId: '00000000-0000-4000-8000-000000000101',
+      organizationName: 'Acceptance Organization',
+      contactId: '00000000-0000-4000-8000-000000000102',
+      contactName: 'Acceptance Contact',
+      leadId: null,
+      leadName: '',
+      opportunityId: null,
+      opportunityName: '',
+      startsAt: '2026-07-15T13:00:00.000Z',
+      endsAt: '2026-07-15T13:30:00.000Z',
+      timezone: 'America/New_York',
+      location: 'Mobile Room',
+      attendeeEmails: ['contact@example.test'],
+      status: 'scheduled',
+      provider: 'maton',
+      syncStatus: 'synced',
+    }],
+    leads: [],
+    opportunities: [],
+    interactions: [],
+    campaigns: [],
+  }
+
+  await page.route((url) => url.pathname === '/api/crm', async (route) => {
+    if (route.request().method() !== 'GET') {
+      await route.continue()
+      return
+    }
+
+    const requestUrl = new URL(route.request().url())
+    const entity = requestUrl.searchParams.get('entity') || 'organizations'
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        ok: true,
+        entity,
+        records: recordsByEntity[entity] || [],
+        summary: {
+          organizations: 1,
+          contacts: 1,
+          leads: 0,
+          opportunities: 0,
+          meetings: 1,
+          interactions: 0,
+          campaigns: 0,
+          openPipelineValue: 0,
+          weightedPipelineValue: 0,
+          pendingSync: 0,
+          failedSync: 0,
+        },
+        pipeline: {
+          id: '00000000-0000-4000-8000-000000000100',
+          name: 'Mobile Acceptance Pipeline',
+          ownerEmail: 'operator@example.test',
+          workspaceOrganizationId: null,
+          accessRole: 'owner',
+          shortLinkUrl: null,
+        },
+        workspaceHierarchy: [],
+        canManageHierarchy: false,
+        suiteCrmPunchoutUrl: null,
+        suiteCrmUsername: null,
+        suiteCrmAdminPortalUrl: null,
+      }),
+    })
+  })
+}
+
 for (const viewport of MOBILE_VIEWPORTS) {
   test.describe(`mobile workflows: ${viewport.name} ${viewport.width}x${viewport.height}`, () => {
     test.beforeEach(async ({ page }) => {
@@ -239,6 +341,87 @@ for (const viewport of MOBILE_VIEWPORTS) {
         note(testInfo, 'CRM is view-only, so the editor drawer was not opened')
       }
 
+      await expectNoDocumentOverflow(page)
+    })
+
+    test('CRM reference redirect opens the CRM section without losing the reference', async ({ page }) => {
+      const reference = 'ga7654321'
+      await mockCrmRecords(page)
+      await gotoApp(page, `/crm/${reference}`)
+
+      await expect.poll(() => {
+        const current = new URL(page.url())
+        return `${current.pathname}|${current.searchParams.get('crm')}|${current.hash}`
+      }).toBe(`/|${reference}|#crm`)
+      const closeEditor = page.getByRole('button', { name: 'Close editor' })
+      const drawer = closeEditor.locator('xpath=ancestor::*[contains(@class,"MuiDrawer-paper")][1]')
+      await expectUsableGeometry(drawer, 'CRM reference drawer', 160, 280)
+      await expect(drawer.getByText(reference, { exact: true })).toBeVisible()
+      await closeEditor.click()
+      await expect(activeSection(page).getByRole('heading', { name: 'CRM', exact: true })).toBeVisible()
+      await expectNoDocumentOverflow(page)
+    })
+
+    test('CRM email controls and meeting scheduler remain usable without submitting actions', async ({ page }) => {
+      await mockCrmRecords(page)
+      await gotoApp(page, '/#crm')
+
+      await page.getByRole('cell', { name: 'Acceptance Organization', exact: true }).click()
+      let closeEditor = page.getByRole('button', { name: 'Close editor' })
+      let drawer = closeEditor.locator('xpath=ancestor::*[contains(@class,"MuiDrawer-paper")][1]')
+      await expectUsableGeometry(drawer, 'Organization editor drawer', 160, 280)
+      await expect(drawer.getByRole('textbox', { name: 'Email', exact: true })).toHaveValue('organization@example.test')
+      await expect(drawer.getByRole('checkbox', { name: 'Do not email' })).not.toBeChecked()
+
+      await drawer.getByRole('button', { name: 'Email', exact: true }).click()
+      const emailDialog = page.getByRole('dialog', { name: 'Send email' })
+      await expectUsableGeometry(emailDialog, 'Organization email composer', 160, 280)
+      await expect(emailDialog.getByLabel('Subject')).toHaveValue('Follow-up: Acceptance Organization')
+      await expect(emailDialog.getByLabel('Message')).toBeVisible()
+      await emailDialog.getByRole('button', { name: 'Cancel' }).click()
+
+      await drawer.getByRole('button', { name: 'Schedule', exact: true }).click()
+      const organizationScheduleDialog = page.getByRole('dialog', { name: 'Schedule meeting' })
+      await expectUsableGeometry(organizationScheduleDialog, 'Organization meeting scheduler', 160, 280)
+      await expect(organizationScheduleDialog.getByLabel('Meeting')).toHaveValue('Meeting with Acceptance Organization')
+      await expect(organizationScheduleDialog.getByLabel('Timezone')).toHaveValue('America/New_York')
+      await organizationScheduleDialog.getByRole('button', { name: 'Cancel' }).click()
+      await closeEditor.click()
+
+      await page.getByRole('tab', { name: 'Contacts' }).click()
+      await page.getByRole('cell', { name: 'Acceptance Contact', exact: true }).click()
+      closeEditor = page.getByRole('button', { name: 'Close editor' })
+      drawer = closeEditor.locator('xpath=ancestor::*[contains(@class,"MuiDrawer-paper")][1]')
+      await expectUsableGeometry(drawer, 'Contact editor drawer', 160, 280)
+      await expect(drawer.getByRole('textbox', { name: 'Email', exact: true })).toHaveValue('contact@example.test')
+      await expect(drawer.getByRole('checkbox', { name: 'Do not email' })).toBeChecked()
+      await drawer.getByRole('button', { name: 'Email', exact: true }).click()
+      const contactEmailDialog = page.getByRole('dialog', { name: 'Send email' })
+      await expectUsableGeometry(contactEmailDialog, 'Contact email composer', 160, 280)
+      await expect(contactEmailDialog.getByLabel('Subject')).toHaveValue('Follow-up: Acceptance Contact')
+      await contactEmailDialog.getByRole('button', { name: 'Cancel' }).click()
+      await closeEditor.click()
+
+      await page.getByRole('tab', { name: 'Meetings' }).click()
+      await page.getByRole('cell', { name: 'Acceptance Meeting', exact: true }).click()
+      closeEditor = page.getByRole('button', { name: 'Close editor' })
+      drawer = closeEditor.locator('xpath=ancestor::*[contains(@class,"MuiDrawer-paper")][1]')
+      await expectUsableGeometry(drawer, 'Meeting editor drawer', 160, 280)
+      await expect(drawer.getByLabel('Starts')).toHaveValue('2026-07-15T09:00')
+      await expect(drawer.getByLabel('Ends')).toHaveValue('2026-07-15T09:30')
+      await expect(drawer.getByLabel('Timezone')).toHaveValue('America/New_York')
+      await expect(drawer.getByLabel('Attendee emails')).toHaveValue('contact@example.test')
+
+      await drawer.getByRole('button', { name: 'Schedule', exact: true }).click()
+      const meetingScheduleDialog = page.getByRole('dialog', { name: 'Schedule meeting' })
+      await expectUsableGeometry(meetingScheduleDialog, 'Meeting scheduling dialog', 160, 280)
+      await expect(meetingScheduleDialog.getByLabel('Meeting')).toHaveValue('Acceptance Meeting')
+      await expect(meetingScheduleDialog.getByLabel('Starts')).toHaveValue('2026-07-15T09:00')
+      await expect(meetingScheduleDialog.getByLabel('Ends')).toHaveValue('2026-07-15T09:30')
+      await expect(meetingScheduleDialog.getByLabel('Timezone')).toHaveValue('America/New_York')
+      await expect(meetingScheduleDialog.getByLabel('Attendee emails')).toHaveValue('contact@example.test')
+      await meetingScheduleDialog.getByRole('button', { name: 'Cancel' }).click()
+      await closeEditor.click()
       await expectNoDocumentOverflow(page)
     })
 

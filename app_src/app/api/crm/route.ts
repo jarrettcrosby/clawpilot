@@ -46,7 +46,7 @@ function numberValue(value: unknown, min = 0, max = Number.MAX_SAFE_INTEGER) {
 function validEmail(value: unknown) {
   const email = stringValue(value, 254).toLowerCase()
   if (email && !/^[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9.-]+\.[A-Z]{2,}$/i.test(email)) {
-    throw new Error('Contact email is invalid')
+    throw new Error('CRM email is invalid')
   }
   return email
 }
@@ -153,6 +153,7 @@ export async function POST(req: NextRequest) {
           name, priority: stringValue(fields.priority, 50), accountType: stringValue(fields.accountType, 100),
           accountManager: stringValue(fields.accountManager, 200), website: stringValue(fields.website, 500),
           linkedinUrl: stringValue(fields.linkedinUrl, 500), phone: stringValue(fields.phone, 100),
+          email: validEmail(fields.email), emailOptOut: fields.emailOptOut === true,
           address: stringValue(fields.address, 500), city: stringValue(fields.city, 150), state: stringValue(fields.state, 150),
           postalCode: stringValue(fields.postalCode, 50), country: stringValue(fields.country, 100),
           description: stringValue(fields.description, 10_000),
@@ -251,6 +252,20 @@ export async function POST(req: NextRequest) {
       const resolvedOrganization = resolvedOrganizationId
         ? await readCrmRecordReference({ pipelineId: pipeline.id, entity: 'organizations', id: resolvedOrganizationId })
         : null
+      const parentSuiteCrmId = opportunity?.suiteCrmId
+        || contact?.suiteCrmId
+        || lead?.suiteCrmId
+        || resolvedOrganization?.suiteCrmId
+        || null
+      const parentSuiteCrmType = opportunity?.suiteCrmId
+        ? 'Opportunities' as const
+        : contact?.suiteCrmId
+          ? 'Contacts' as const
+          : lead?.suiteCrmId
+            ? 'Leads' as const
+            : resolvedOrganization?.suiteCrmId
+              ? 'Accounts' as const
+              : undefined
       const staged = await stageCrmRecordInPostgres({
         entity, pipelineId: pipeline.id, localId: current?.id, sourceKey, actorEmail: actor.email,
         sourcePayload: { source: 'clawpilot' },
@@ -258,7 +273,7 @@ export async function POST(req: NextRequest) {
           organizationId: resolvedOrganization?.id || null,
           organizationSuiteCrmId: resolvedOrganization?.suiteCrmId || null,
           contactId: contact?.id || null, leadId: lead?.id || null, opportunityId: opportunity?.id || null,
-          parentSuiteCrmId: opportunity?.suiteCrmId || null, subject,
+          parentSuiteCrmId, parentSuiteCrmType, subject,
           description: stringValue(fields.description, 10_000), startsAt, endsAt,
           timezone: timezoneValue(fields.timezone), location: stringValue(fields.location, 500),
           attendeeEmails: emailList(fields.attendeeEmails),
@@ -293,13 +308,27 @@ export async function POST(req: NextRequest) {
 
     const subject = stringValue(fields.subject, 250)
     if (!subject) throw new Error('Interaction subject is required')
+    const parentSuiteCrmId = opportunity?.suiteCrmId
+      || contact?.suiteCrmId
+      || lead?.suiteCrmId
+      || organization?.suiteCrmId
+      || null
+    const parentSuiteCrmType = opportunity?.suiteCrmId
+      ? 'Opportunities' as const
+      : contact?.suiteCrmId
+        ? 'Contacts' as const
+        : lead?.suiteCrmId
+          ? 'Leads' as const
+          : organization?.suiteCrmId
+            ? 'Accounts' as const
+            : undefined
     const staged = await stageCrmRecordInPostgres({
       entity, pipelineId: pipeline.id, sourceKey, actorEmail: actor.email,
       sourcePayload: { source: 'clawpilot' },
       fields: {
         organizationId: organization?.id || contact?.organizationId || lead?.organizationId || null,
         contactId: contact?.id || null, leadId: lead?.id || null, opportunityId: opportunity?.id || null,
-        parentSuiteCrmId: opportunity?.suiteCrmId || null, interactionType: stringValue(fields.interactionType, 100),
+        parentSuiteCrmId, parentSuiteCrmType, interactionType: stringValue(fields.interactionType, 100),
         subject, agentName: stringValue(fields.agentName, 200), occurredAt: stringValue(fields.occurredAt, 50) || null,
         description: stringValue(fields.description, 10_000),
         direction: ['inbound', 'outbound', 'internal'].includes(String(fields.direction))

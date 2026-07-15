@@ -638,6 +638,14 @@ async function referenceTargets(input: {
 }
 
 function interactionRelations(record: CrmReferenceRecord) {
+  const parentSuiteCrmType = ({
+    organizations: 'Accounts',
+    contacts: 'Contacts',
+    leads: 'Leads',
+    opportunities: 'Opportunities',
+    meetings: 'Meetings',
+    campaigns: 'Campaigns',
+  } as const)[record.entity as Exclude<CrmReferenceRecord['entity'], 'interactions'>] || null
   return {
     organizationId: record.entity === 'organizations' ? record.id : record.organizationId,
     contactId: record.entity === 'contacts' ? record.id : null,
@@ -645,7 +653,8 @@ function interactionRelations(record: CrmReferenceRecord) {
     opportunityId: record.entity === 'opportunities' ? record.id : null,
     meetingId: record.entity === 'meetings' ? record.id : null,
     campaignId: record.entity === 'campaigns' ? record.id : null,
-    parentSuiteCrmId: record.entity === 'opportunities' ? record.suiteCrmId : null,
+    parentSuiteCrmId: parentSuiteCrmType ? record.suiteCrmId : null,
+    parentSuiteCrmType: parentSuiteCrmType || undefined,
   }
 }
 

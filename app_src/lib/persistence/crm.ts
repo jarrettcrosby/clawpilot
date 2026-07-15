@@ -20,6 +20,7 @@ import type {
   CrmSummary,
   SuiteCrmOutboxRecord,
 } from '@/lib/crm/types'
+import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import { query, withTransaction } from '@/lib/persistence/postgres'
 import { appPublicUrl } from '@/lib/publicUrl'
 import { shortLinkUrl } from '@/lib/shortlinks'
@@ -28,6 +29,7 @@ import {
   workspaceOrganizationAncestors,
 } from '@/lib/organizations'
 import { requireActiveAppUser } from '@/lib/users'
+import { zonedDateTimeToIso } from '@/lib/zonedDateTime'
 
 const ENTITY_TABLE: Record<CrmEntity, string> = {
   organizations: 'crm_organizations',
@@ -64,6 +66,8 @@ export type StageOrganizationInput = CommonStageInput & {
     website?: string
     linkedinUrl?: string
     phone?: string
+    email?: string
+    emailOptOut?: boolean
     address?: string
     city?: string
     state?: string
@@ -153,6 +157,7 @@ export type StageMeetingInput = CommonStageInput & {
     leadId?: string | null
     opportunityId?: string | null
     parentSuiteCrmId?: string | null
+    parentSuiteCrmType?: 'Accounts' | 'Contacts' | 'Leads' | 'Opportunities'
     subject: string
     description?: string
     startsAt: string
@@ -193,6 +198,7 @@ export type StageInteractionInput = CommonStageInput & {
     meetingId?: string | null
     campaignId?: string | null
     parentSuiteCrmId?: string | null
+    parentSuiteCrmType?: 'Accounts' | 'Contacts' | 'Leads' | 'Opportunities' | 'Meetings' | 'Campaigns'
     interactionType?: string
     subject: string
     agentName?: string
@@ -266,6 +272,7 @@ function suiteCrmAttributes(input: StageCrmRecordInput) {
       name: clean(fields.name),
       account_type: clean(fields.accountType),
       website: clean(fields.website),
+      email1: clean(fields.email),
       phone_office: clean(fields.phone),
       billing_address_street: clean(fields.address),
       billing_address_city: clean(fields.city),
@@ -336,7 +343,7 @@ function suiteCrmAttributes(input: StageCrmRecordInput) {
       duration_minutes: duration % 60,
       status: clean(fields.status) === 'completed' ? 'Held' : clean(fields.status) === 'cancelled' ? 'Not Held' : 'Planned',
       location: clean(fields.location),
-      parent_type: fields.parentSuiteCrmId ? 'Opportunities' : '',
+      parent_type: fields.parentSuiteCrmId ? clean(fields.parentSuiteCrmType) : '',
       parent_id: clean(fields.parentSuiteCrmId),
       description: clean(fields.description),
     }
@@ -357,7 +364,7 @@ function suiteCrmAttributes(input: StageCrmRecordInput) {
   const fields = input.fields
   return {
     name: clean(fields.subject),
-    parent_type: fields.parentSuiteCrmId ? 'Opportunities' : '',
+    parent_type: fields.parentSuiteCrmId ? clean(fields.parentSuiteCrmType) : '',
     parent_id: clean(fields.parentSuiteCrmId),
     description: clean(fields.description),
   }
@@ -446,12 +453,13 @@ async function stageOrganization(
          relationship_type = $7, source_sheet_id = COALESCE($8, source_sheet_id),
          source_row_number = COALESCE($9, source_row_number), priority = $10, name = $11,
          account_type = $12, account_manager = $13, website = $14, linkedin_url = $15,
-         phone = $16, billing_address_street = $17, billing_address_city = $18,
-         billing_address_state = $19, billing_address_postal_code = $20,
-         billing_address_country = $21, description = $22, source_payload = $23::jsonb,
-         sync_status = CASE WHEN source_hash IS DISTINCT FROM $24 THEN 'pending' ELSE sync_status END,
-         sync_error = CASE WHEN source_hash IS DISTINCT FROM $24 THEN NULL ELSE sync_error END,
-         source_hash = $24, updated_by = $25, updated_at = now()
+         phone = $16, email = $17, email_opt_out = $18,
+         billing_address_street = $19, billing_address_city = $20,
+         billing_address_state = $21, billing_address_postal_code = $22,
+         billing_address_country = $23, description = $24, source_payload = $25::jsonb,
+         sync_status = CASE WHEN source_hash IS DISTINCT FROM $26 THEN 'pending' ELSE sync_status END,
+         sync_error = CASE WHEN source_hash IS DISTINCT FROM $26 THEN NULL ELSE sync_error END,
+         source_hash = $26, updated_by = $27, updated_at = now()
        WHERE pipeline_id = $1::uuid AND id = $2::uuid
        RETURNING id::text, suitecrm_id, reference_code`,
       [
@@ -459,9 +467,10 @@ async function stageOrganization(
         fields.parentOrganizationId || null, fields.workspaceOrganizationId || null, relationshipType,
         input.sourceSheetId || null, input.sourceRowNumber || null, nullable(fields.priority), clean(fields.name),
         nullable(fields.accountType), nullable(fields.accountManager), nullable(fields.website), nullable(fields.linkedinUrl),
-        nullable(fields.phone), nullable(fields.address), nullable(fields.city), nullable(fields.state),
-        nullable(fields.postalCode), nullable(fields.country), nullable(fields.description),
-        JSON.stringify(input.sourcePayload || {}), sourceHash, input.actorEmail,
+        nullable(fields.phone), nullable(fields.email), fields.emailOptOut === true,
+        nullable(fields.address), nullable(fields.city), nullable(fields.state), nullable(fields.postalCode),
+        nullable(fields.country), nullable(fields.description), JSON.stringify(input.sourcePayload || {}),
+        sourceHash, input.actorEmail,
       ],
     )
     if (!updated.rows[0]) throw new Error('CRM organization was not found')
@@ -474,17 +483,19 @@ async function stageOrganization(
   const result = await client.query<{ id: string; suitecrm_id: string; reference_code: string }>(
     `
       INSERT INTO crm_organizations (
-        pipeline_id, suitecrm_id, source_key, identity_key, parent_organization_id,
+        pipeline_id, suitecrm_id, source_key, identity_key, reference_code, parent_organization_id,
         workspace_organization_id, relationship_type, source_sheet_id, source_row_number,
-        priority, name, account_type, account_manager, website, linkedin_url, phone,
+        priority, name, account_type, account_manager, website, linkedin_url, phone, email, email_opt_out,
         billing_address_street, billing_address_city, billing_address_state,
         billing_address_postal_code, billing_address_country, description,
         source_payload, source_hash, sync_status, sync_error, created_by, updated_by
       )
       VALUES (
-        $1::uuid, $2, $3, $3, $4::uuid, $5::uuid, $6, $7, $8, $9, $10, $11,
-        $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22::jsonb, $23,
-        'pending', NULL, $24, $24
+        $1::uuid, $2, $3, $3,
+        COALESCE((SELECT reference_code FROM crm_organizations WHERE pipeline_id = $1::uuid AND identity_key = $3), allocate_crm_reference('ga')),
+        $4::uuid, $5::uuid, $6, $7, $8, $9, $10, $11,
+        $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24::jsonb, $25,
+        'pending', NULL, $26, $26
       )
       ON CONFLICT (pipeline_id, identity_key) DO UPDATE SET
         suitecrm_id = COALESCE(crm_organizations.suitecrm_id, EXCLUDED.suitecrm_id),
@@ -501,6 +512,8 @@ async function stageOrganization(
         website = EXCLUDED.website,
         linkedin_url = EXCLUDED.linkedin_url,
         phone = EXCLUDED.phone,
+        email = EXCLUDED.email,
+        email_opt_out = EXCLUDED.email_opt_out,
         billing_address_street = EXCLUDED.billing_address_street,
         billing_address_city = EXCLUDED.billing_address_city,
         billing_address_state = EXCLUDED.billing_address_state,
@@ -520,9 +533,9 @@ async function stageOrganization(
       fields.workspaceOrganizationId || null, relationshipType, input.sourceSheetId || null,
       input.sourceRowNumber || null, nullable(fields.priority), clean(fields.name), nullable(fields.accountType),
       nullable(fields.accountManager), nullable(fields.website), nullable(fields.linkedinUrl), nullable(fields.phone),
-      nullable(fields.address), nullable(fields.city), nullable(fields.state), nullable(fields.postalCode),
-      nullable(fields.country), nullable(fields.description), JSON.stringify(input.sourcePayload || {}), sourceHash,
-      input.actorEmail,
+      nullable(fields.email), fields.emailOptOut === true, nullable(fields.address), nullable(fields.city),
+      nullable(fields.state), nullable(fields.postalCode), nullable(fields.country), nullable(fields.description),
+      JSON.stringify(input.sourcePayload || {}), sourceHash, input.actorEmail,
     ],
   )
   return applyWorkspaceOrganizationIdentity(
@@ -581,7 +594,7 @@ async function stageContact(
   const result = await client.query<{ id: string; suitecrm_id: string; reference_code: string }>(
     `
       INSERT INTO crm_contacts (
-        pipeline_id, organization_id, suitecrm_id, source_key, identity_key, source_sheet_id, source_row_number,
+        pipeline_id, organization_id, suitecrm_id, source_key, identity_key, reference_code, source_sheet_id, source_row_number,
         priority, first_name, last_name, full_name, contact_type, account_manager, job_title,
         email, linkedin_url, phone_work, phone_mobile, primary_address_street,
         primary_address_city, primary_address_state, primary_address_postal_code,
@@ -589,7 +602,9 @@ async function stageContact(
         sync_status, sync_error, created_by, updated_by
       )
       VALUES (
-        $1::uuid, $2::uuid, $3, $4, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+        $1::uuid, $2::uuid, $3, $4, $4,
+        COALESCE((SELECT reference_code FROM crm_contacts WHERE pipeline_id = $1::uuid AND identity_key = $4), allocate_crm_reference('gc')),
+        $5, $6, $7, $8, $9, $10, $11, $12, $13,
         $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25::jsonb, $26,
         'pending', NULL, $27, $27
       )
@@ -648,13 +663,15 @@ async function stageLead(client: PoolClient, input: StageLeadInput, suiteCrmId: 
     `
       INSERT INTO crm_leads (
         pipeline_id, organization_id, converted_contact_id, converted_opportunity_id,
-        suitecrm_id, source_key, first_name, last_name, full_name, company_name,
+        suitecrm_id, source_key, reference_code, first_name, last_name, full_name, company_name,
         job_title, email, phone_work, phone_mobile, status, lead_source, assigned_to,
         description, email_opt_out, source_payload, source_hash, sync_status,
         sync_error, created_by, updated_by
       )
       VALUES (
-        $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7, $8, $9, $10,
+        $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6,
+        COALESCE((SELECT reference_code FROM crm_leads WHERE pipeline_id = $1::uuid AND source_key = $6), allocate_crm_reference('gl')),
+        $7, $8, $9, $10,
         $11, $12, $13, $14, $15, $16, $17, $18, $19, $20::jsonb, $21,
         'pending', NULL, $22, $22
       )
@@ -701,13 +718,15 @@ async function stageOpportunity(client: PoolClient, input: StageOpportunityInput
   const result = await client.query<{ id: string; suitecrm_id: string; reference_code: string }>(
     `
       INSERT INTO crm_opportunities (
-        pipeline_id, organization_id, suitecrm_id, source_key, source_sheet_id, source_row_number,
+        pipeline_id, organization_id, suitecrm_id, source_key, reference_code, source_sheet_id, source_row_number,
         priority, name, owner_name, organization_name, status, stage, loss_reason, lead_source,
         amount, probability, expected_close, description, source_payload, source_hash,
         sync_status, sync_error, created_by, updated_by
       )
       VALUES (
-        $1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+        $1::uuid, $2::uuid, $3, $4,
+        COALESCE((SELECT reference_code FROM crm_opportunities WHERE pipeline_id = $1::uuid AND source_key = $4), allocate_crm_reference('go')),
+        $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
         $15, $16, $17::date, $18, $19::jsonb, $20, 'pending', NULL, $21, $21
       )
       ON CONFLICT (pipeline_id, source_key) DO UPDATE SET
@@ -755,12 +774,14 @@ async function stageMeeting(client: PoolClient, input: StageMeetingInput, suiteC
     `
       INSERT INTO crm_meetings (
         pipeline_id, organization_id, contact_id, lead_id, opportunity_id, suitecrm_id,
-        source_key, subject, description, starts_at, ends_at, timezone, location,
+        source_key, reference_code, subject, description, starts_at, ends_at, timezone, location,
         attendee_emails, status, provider, external_event_id, external_event_url,
         join_url, source_payload, source_hash, sync_status, sync_error, created_by, updated_by
       )
       VALUES (
-        $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6, $7, $8, $9,
+        $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6, $7,
+        COALESCE((SELECT reference_code FROM crm_meetings WHERE pipeline_id = $1::uuid AND source_key = $7), allocate_crm_reference('gm')),
+        $8, $9,
         $10::timestamptz, $11::timestamptz, $12, $13, $14::text[], $15, $16,
         $17, $18, $19, $20::jsonb, $21, 'pending', NULL, $22, $22
       )
@@ -807,12 +828,14 @@ async function stageCampaign(client: PoolClient, input: StageCampaignInput, suit
   const result = await client.query<{ id: string; suitecrm_id: string; reference_code: string }>(
     `
       INSERT INTO crm_campaigns (
-        pipeline_id, suitecrm_id, source_key, name, campaign_type, status,
+        pipeline_id, suitecrm_id, source_key, reference_code, name, campaign_type, status,
         start_date, end_date, subject_template, body_template, sender_email,
         description, source_payload, source_hash, sync_status, sync_error, created_by, updated_by
       )
       VALUES (
-        $1::uuid, $2, $3, $4, $5, $6, $7::date, $8::date, $9, $10, $11,
+        $1::uuid, $2, $3,
+        COALESCE((SELECT reference_code FROM crm_campaigns WHERE pipeline_id = $1::uuid AND source_key = $3), allocate_crm_reference('gk')),
+        $4, $5, $6, $7::date, $8::date, $9, $10, $11,
         $12, $13::jsonb, $14, 'pending', NULL, $15, $15
       )
       ON CONFLICT (pipeline_id, source_key) DO UPDATE SET
@@ -850,14 +873,16 @@ async function stageInteraction(client: PoolClient, input: StageInteractionInput
     `
       INSERT INTO crm_interactions (
         pipeline_id, organization_id, contact_id, lead_id, opportunity_id, meeting_id,
-        campaign_id, suitecrm_id, source_key, source_sheet_id, source_row_number,
+        campaign_id, suitecrm_id, source_key, reference_code, source_sheet_id, source_row_number,
         interaction_type, subject, agent_name, occurred_at, description, direction,
         delivery_status, provider_message_id, provider_thread_id, metadata,
         source_payload, source_hash, sync_status, sync_error, created_by, updated_by
       )
       VALUES (
         $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6::uuid, $7::uuid,
-        $8, $9, $10, $11, $12, $13, $14, $15::timestamptz, $16, $17, $18,
+        $8, $9,
+        COALESCE((SELECT reference_code FROM crm_interactions WHERE pipeline_id = $1::uuid AND source_key = $9), allocate_crm_reference('gi')),
+        $10, $11, $12, $13, $14, $15::timestamptz, $16, $17, $18,
         $19, $20, $21::jsonb, $22::jsonb, $23, 'pending', NULL, $24, $24
       )
       ON CONFLICT (pipeline_id, source_key) DO UPDATE SET
@@ -901,10 +926,12 @@ async function stageInteraction(client: PoolClient, input: StageInteractionInput
   return result.rows[0]
 }
 
-function crmReferenceDestination(referenceCode: string) {
+function crmReferenceDestination(referenceCode: string, pipelineId: string) {
   const origin = appPublicUrl()
   if (!origin.startsWith('https://')) return null
-  return `${origin}/crm/${encodeURIComponent(referenceCode)}`
+  const destination = new URL(`/crm/${encodeURIComponent(referenceCode)}`, origin)
+  destination.searchParams.set('pipeline', pipelineId)
+  return destination.toString()
 }
 
 function crmReferenceShortUrl(referenceCode: unknown) {
@@ -922,7 +949,7 @@ async function ensureCrmReferenceShortLink(
   client: PoolClient,
   input: { pipelineId: string; entity: CrmEntity; referenceCode: string; title: string },
 ) {
-  const destinationUrl = crmReferenceDestination(input.referenceCode)
+  const destinationUrl = crmReferenceDestination(input.referenceCode, input.pipelineId)
   if (!destinationUrl) return null
   const owner = await client.query<{ owner_email: string; organization_root_id: string }>(
     `WITH RECURSIVE ancestors AS (
@@ -975,6 +1002,15 @@ async function ensureCrmReferenceShortLink(
 }
 
 export async function stageCrmRecordInPostgres(input: StageCrmRecordInput) {
+  if (input.entity === 'meetings') {
+    const timezone = clean(input.fields.timezone) || 'America/New_York'
+    const startsAt = zonedDateTimeToIso(input.fields.startsAt, timezone)
+    const endsAt = zonedDateTimeToIso(input.fields.endsAt, timezone)
+    if (!startsAt || !endsAt || Date.parse(endsAt) <= Date.parse(startsAt)) {
+      throw new Error('CRM meeting time is invalid for the selected timezone')
+    }
+    input = { ...input, fields: { ...input.fields, startsAt, endsAt, timezone } }
+  }
   const identityKey = input.entity === 'organizations'
     ? organizationIdentityKey(input.fields)
     : input.entity === 'contacts'
@@ -1239,7 +1275,8 @@ function organizationFromRow(row: Record<string, unknown>): CrmOrganization {
     suiteCrmId: nullable(row.suitecrm_id),
     sourceKey: String(row.source_key), sourceRowNumber: row.source_row_number === null ? null : Number(row.source_row_number),
     priority: clean(row.priority), name: clean(row.name), accountType: clean(row.account_type), accountManager: clean(row.account_manager),
-    website: clean(row.website), linkedinUrl: clean(row.linkedin_url), phone: clean(row.phone), address: clean(row.billing_address_street),
+    website: clean(row.website), linkedinUrl: clean(row.linkedin_url), phone: clean(row.phone),
+    email: clean(row.email), emailOptOut: row.email_opt_out === true, address: clean(row.billing_address_street),
     city: clean(row.billing_address_city), state: clean(row.billing_address_state), postalCode: clean(row.billing_address_postal_code),
     country: clean(row.billing_address_country), description: clean(row.description), syncStatus: row.sync_status as CrmOrganization['syncStatus'],
     syncError: nullable(row.sync_error), updatedAt: String(row.updated_at),
@@ -1523,11 +1560,27 @@ export function crmEntityForReferenceCode(referenceValue: unknown): CrmEntity | 
   } as Record<string, CrmEntity>)[prefix] || null
 }
 
+export async function resolveCrmReferenceCode(referenceValue: unknown): Promise<string> {
+  const referenceCode = clean(referenceValue).toLowerCase()
+  if (!/^g[aciklmo][0-9]{7}$/.test(referenceCode)) throw new Error('CRM reference is invalid')
+  if (!isPostgresStorageEnabled()) return referenceCode
+  try {
+    const result = await query<{ canonical_code: string }>(
+      `SELECT canonical_code FROM crm_reference_registry WHERE reference_code = $1 LIMIT 1`,
+      [referenceCode],
+    )
+    return clean(result.rows[0]?.canonical_code) || referenceCode
+  } catch (error) {
+    if ((error as { code?: string })?.code === '42P01') return referenceCode
+    throw error
+  }
+}
+
 export async function readCrmRecordByReference(input: {
   pipelineId: string
   referenceCode: unknown
 }) {
-  const referenceCode = clean(input.referenceCode).toLowerCase()
+  const referenceCode = await resolveCrmReferenceCode(input.referenceCode)
   const entity = crmEntityForReferenceCode(referenceCode)
   if (!entity || !/^g[aciklmo][0-9]{7}$/.test(referenceCode)) throw new Error('CRM reference is invalid')
   const table = ENTITY_TABLE[entity]
@@ -1576,7 +1629,7 @@ export async function ensurePipelineCrmReferenceLinks(pipelineId: string) {
        owner_email, organization_root_id, source_app, slug, destination_url, title, tags, created_at, updated_at
      )
      SELECT owner.owner_email, owner.organization_root_id, 'clawpilot-crm', records.reference_code,
-       $2 || '/crm/' || records.reference_code, left(records.title, 200),
+       $2 || '/crm/' || records.reference_code || '?pipeline=' || $1::text, left(records.title, 200),
        ARRAY['crm', records.entity, records.reference_code]::text[], now(), now()
      FROM records CROSS JOIN owner
      ON CONFLICT (slug) DO UPDATE SET
