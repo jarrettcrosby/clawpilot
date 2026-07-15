@@ -278,13 +278,13 @@ function normalizeTags(value: unknown): string[] {
   return tags
 }
 
-function normalizeSlug(value: unknown): string {
+function normalizeSlug(value: unknown, options: { allowCrmReference?: boolean } = {}): string {
   const slug = String(value || '').trim().toLowerCase()
   if (!SLUG_PATTERN.test(slug)) {
     throw new ShortLinkRequestError('Slug must be 3-64 lowercase letters, numbers, hyphens, or underscores')
   }
   if (RESERVED_SLUGS.has(slug)) throw new ShortLinkRequestError('This slug is reserved')
-  if (CRM_REFERENCE_SLUG_PATTERN.test(slug)) {
+  if (!options.allowCrmReference && CRM_REFERENCE_SLUG_PATTERN.test(slug)) {
     throw new ShortLinkRequestError('CRM reference slugs are reserved for CRM records')
   }
   return slug
@@ -606,7 +606,7 @@ export async function resolveShortLink(input: {
   if (getStorageDriver() !== 'postgres') return { status: 'not-found' }
   let slug: string
   try {
-    slug = normalizeSlug(input.slug)
+    slug = normalizeSlug(input.slug, { allowCrmReference: true })
   } catch {
     return { status: 'not-found' }
   }

@@ -426,6 +426,10 @@ assertIncludes(crmReferenceRoute, "new URL('/', appPublicUrl())", 'trusted publi
 assertIncludes(crmReferenceRoute, 'resolveCrmReferenceCode', 'legacy CRM reference alias resolution')
 assertIncludes(crmReferenceRoute, "destination.searchParams.set('pipeline', pipelineId)", 'CRM reference owning pipeline handoff')
 
+const shortLinks = read('app_src/lib/shortlinks.ts')
+assertIncludes(shortLinks, 'normalizeSlug(input.slug, { allowCrmReference: true })', 'public CRM short-link resolution')
+assertIncludes(shortLinks, '!options.allowCrmReference && CRM_REFERENCE_SLUG_PATTERN.test(slug)', 'creation-only CRM slug reservation')
+
 const zonedDateTime = read('app_src/lib/zonedDateTime.ts')
 assertIncludes(zonedDateTime, 'export function zonedDateTimeToIso', 'timezone-aware CRM meeting conversion')
 assertIncludes(zonedDateTime, 'export function dateTimeLocalValue', 'timezone-aware CRM meeting editor value')
