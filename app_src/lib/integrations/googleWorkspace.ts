@@ -406,6 +406,46 @@ export async function resolveGoogleWorkspaceProvisioningRuntime() {
   }
 }
 
+export async function resolveGoogleWorkspaceProvisioningBinding() {
+  try {
+    const current = await readGoogleWorkspaceIntegrationRecordInPostgres()
+    if (!current.apiKeySecret) {
+      throw new GoogleWorkspaceRequestError(
+        'Configure the Google API key before provisioning managed pipelines',
+        409,
+        'GOOGLE_API_KEY_REQUIRED',
+      )
+    }
+    if (!current.serviceAccountSecret || !current.serviceAccountEmail) {
+      throw new GoogleWorkspaceRequestError(
+        'Upload and validate a Google service-account credential before provisioning managed pipelines',
+        409,
+        'GOOGLE_SERVICE_ACCOUNT_REQUIRED',
+      )
+    }
+    if (!current.selectedSharedDriveId) {
+      throw new GoogleWorkspaceRequestError(
+        'Select an accessible Shared Drive before provisioning managed pipelines',
+        409,
+        'GOOGLE_SHARED_DRIVE_REQUIRED',
+      )
+    }
+    if (!current.verifiedAt) {
+      throw new GoogleWorkspaceRequestError(
+        'Test the Google Workspace integration before provisioning managed pipelines',
+        409,
+        'GOOGLE_WORKSPACE_VALIDATION_REQUIRED',
+      )
+    }
+    return {
+      serviceAccountEmail: current.serviceAccountEmail,
+      sharedDriveId: current.selectedSharedDriveId,
+    }
+  } catch (error) {
+    throw requestError(error)
+  }
+}
+
 export function sanitizedGoogleWorkspaceError(error: unknown) {
   return requestError(error)
 }

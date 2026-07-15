@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { createSessionToken, getCookieName } from '@/lib/auth'
 import { verifyAuthMagicCode } from '@/lib/authMagicCode'
+import { queuePipelineProvisioning } from '@/lib/pipelineProvisioning'
 import { syncAppUserProfileToOwnedPipelines } from '@/lib/persistence/crm'
 import { ensureDefaultResourcesForUser } from '@/lib/tenancy'
 
@@ -18,10 +19,15 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: false, error: 'The code is invalid or expired.' }, { status: 401 })
     }
 
-    await ensureDefaultResourcesForUser(result.email)
+    const resources = await ensureDefaultResourcesForUser(result.email)
     await syncAppUserProfileToOwnedPipelines(result.email).catch((error) => {
       console.error('[auth] CRM profile projection deferred', error instanceof Error ? error.message : 'unknown error')
     })
+    if (resources.pipelineProvisioningRequired) {
+      await queuePipelineProvisioning({ actorEmail: result.email, pipelineId: resources.pipelineId }).catch((error) => {
+        console.error('[auth] Personal pipeline Sheet provisioning deferred', error instanceof Error ? error.message : 'unknown error')
+      })
+    }
 
     const response = NextResponse.json({ ok: true })
     response.cookies.set({

@@ -131,6 +131,7 @@ for (const requiredPath of [
   'scripts/start-railway.sh',
   'scripts/test-suitecrm-interaction-ingestion.mjs',
   'scripts/pipeline-outbox-poller.mjs',
+  'scripts/verify-tenancy-provisioning.mjs',
   'scripts/validate-runtime-config.mjs',
   'scripts/smoke-deployed-runtime.mjs',
   'scripts/record-release.mjs',
