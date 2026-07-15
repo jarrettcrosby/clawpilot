@@ -1,7 +1,7 @@
 import crypto from 'node:crypto'
 import {
   GoogleWorkspaceRequestError,
-  resolveGoogleWorkspaceProvisioningRuntime,
+  resolveGoogleWorkspaceProvisioningBinding,
   resolveManagedGoogleWorkspaceRuntime,
 } from '@/lib/integrations/googleWorkspace'
 import {
@@ -255,13 +255,7 @@ export async function queuePipelineProvisioning(input: { actorEmail: unknown; pi
       'PIPELINE_OWNER_REQUIRED',
     )
   }
-  if (
-    pipeline.provisioningStatus === 'ready'
-    && pipeline.sheetId
-    && pipeline.syncEnabled
-    && !pipeline.googleServiceAccountEmail
-    && !pipeline.googleSharedDriveId
-  ) {
+  if (pipeline.provisioningStatus === 'ready' && pipeline.sheetId && pipeline.syncEnabled) {
     const shortLinkId = await ensurePipelineShortLink(pipeline, pipeline.sheetId)
     if (pipeline.shortLinkId !== shortLinkId) {
       await storePipelineShortLinkIdInPostgres({
@@ -279,16 +273,18 @@ export async function queuePipelineProvisioning(input: { actorEmail: unknown; pi
   }
 
   try {
-    const runtime = pipeline.googleServiceAccountEmail || pipeline.googleSharedDriveId
-      ? await runtimeForPipeline(pipeline)
-      : await resolveGoogleWorkspaceProvisioningRuntime()
-    await validateGoogleSheetsAccess(runtime)
+    const binding = pipeline.googleServiceAccountEmail && pipeline.googleSharedDriveId
+      ? {
+        serviceAccountEmail: pipeline.googleServiceAccountEmail,
+        sharedDriveId: pipeline.googleSharedDriveId,
+      }
+      : await resolveGoogleWorkspaceProvisioningBinding()
     const queued = await enqueuePipelineProvisioningInPostgres({
       pipelineId: pipeline.id,
       ownerEmail: pipeline.ownerEmail,
       actor: actorEmail,
-      serviceAccountEmail: runtime.serviceAccountEmail,
-      sharedDriveId: runtimeSharedDriveId(runtime),
+      serviceAccountEmail: binding.serviceAccountEmail,
+      sharedDriveId: binding.sharedDriveId,
     })
     return {
       outboxId: queued.outboxId,

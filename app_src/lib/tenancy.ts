@@ -183,6 +183,7 @@ export async function ensureDefaultResourcesForUser(emailValue: unknown): Promis
   boardId: string
   pipelineId: string
   crmBoardId: string
+  pipelineProvisioningRequired: boolean
 }> {
   const user = await requireActiveAppUser(emailValue)
   const organization = await ensurePrimaryWorkspaceOrganization(user.email)
@@ -208,7 +209,42 @@ export async function ensureDefaultResourcesForUser(emailValue: unknown): Promis
     )
     if (!board.rows[0]) throw new Error('Unable to provision a project board')
 
-    let pipeline = await client.query<{ id: string; owner_email: string }>(
+    type PipelineResourceRow = {
+      id: string
+      owner_email: string
+      provisioning_status: string
+      sheet_id: string | null
+      short_link_id: string | null
+      sync_enabled: boolean
+    }
+    let personalPipeline = await client.query<PipelineResourceRow>(
+      `SELECT id::text, owner_email, provisioning_status, sheet_id, short_link_id::text, sync_enabled
+       FROM pipeline_spaces
+       WHERE owner_email = $1 AND is_default
+       LIMIT 1
+       FOR UPDATE`,
+      [ownerEmail],
+    )
+
+    if (!personalPipeline.rows[0]) {
+      personalPipeline = await client.query<PipelineResourceRow>(
+        `INSERT INTO pipeline_spaces (
+           name, owner_email, workspace_organization_id, is_default, sheet_id, sync_enabled
+         )
+         VALUES ($1, $2, $3::uuid, true, $4, $5)
+         RETURNING id::text, owner_email, provisioning_status, sheet_id, short_link_id::text, sync_enabled`,
+        [
+          isConfiguredOwner ? 'Sales pipeline' : 'My pipeline',
+          ownerEmail,
+          organization.id,
+          isConfiguredOwner ? DEFAULT_PIPELINE_SHEET_ID : null,
+          isConfiguredOwner,
+        ],
+      )
+    }
+    if (!personalPipeline.rows[0]) throw new Error('Unable to provision a personal pipeline')
+
+    const crmPipeline = await client.query<{ id: string; owner_email: string }>(
       `SELECT pipeline.id::text, pipeline.owner_email
        FROM pipeline_spaces pipeline
        WHERE pipeline.workspace_organization_id = $1::uuid
@@ -218,36 +254,14 @@ export async function ensureDefaultResourcesForUser(emailValue: unknown): Promis
            WHERE projection.pipeline_id = pipeline.id
              AND projection.workspace_organization_id = $1::uuid
          ) DESC,
-         pipeline.is_default DESC,
+         (pipeline.owner_email = $2) DESC,
          pipeline.created_at,
          pipeline.id
        LIMIT 1
        FOR UPDATE OF pipeline`,
-      [organization.id],
+      [organization.id, configuredOwner],
     )
-
-    if (!pipeline.rows[0]) {
-      const ownedDefault = await client.query<{ present: boolean }>(
-        'SELECT EXISTS(SELECT 1 FROM pipeline_spaces WHERE owner_email = $1 AND is_default) AS present',
-        [ownerEmail],
-      )
-      pipeline = await client.query<{ id: string; owner_email: string }>(
-        `INSERT INTO pipeline_spaces (
-           name, owner_email, workspace_organization_id, is_default, sheet_id, sync_enabled
-         )
-         VALUES ($1, $2, $3::uuid, $4, $5, $6)
-         RETURNING id::text, owner_email`,
-        [
-          isConfiguredOwner ? 'Sales pipeline' : `${organization.name} pipeline`,
-          ownerEmail,
-          organization.id,
-          !ownedDefault.rows[0]?.present,
-          isConfiguredOwner ? DEFAULT_PIPELINE_SHEET_ID : null,
-          isConfiguredOwner,
-        ],
-      )
-    }
-    if (!pipeline.rows[0]) throw new Error('Unable to provision a pipeline')
+    if (!crmPipeline.rows[0]) throw new Error('Unable to provision an organization CRM pipeline')
 
     await client.query(
       `INSERT INTO project_boards (name, owner_email, is_default, created_at, updated_at)
@@ -273,7 +287,7 @@ export async function ensureDefaultResourcesForUser(emailValue: unknown): Promis
       'SELECT pipeline_id::text FROM crm_board_projections WHERE board_id = $1::uuid FOR UPDATE',
       [crmBoard.rows[0].id],
     )
-    if (previousBinding.rows[0] && previousBinding.rows[0].pipeline_id !== pipeline.rows[0].id) {
+    if (previousBinding.rows[0] && previousBinding.rows[0].pipeline_id !== crmPipeline.rows[0].id) {
       await client.query(
         `DELETE FROM tasks task
          USING crm_board_cards card
@@ -293,10 +307,10 @@ export async function ensureDefaultResourcesForUser(emailValue: unknown): Promis
          pipeline_id = EXCLUDED.pipeline_id,
          workspace_organization_id = EXCLUDED.workspace_organization_id,
          updated_at = now()`,
-      [crmBoard.rows[0].id, pipeline.rows[0].id, organization.id],
+      [crmBoard.rows[0].id, crmPipeline.rows[0].id, organization.id],
     )
 
-    if (pipeline.rows[0].owner_email !== ownerEmail) {
+    if (crmPipeline.rows[0].owner_email !== ownerEmail) {
       await client.query(
         `INSERT INTO pipeline_space_members (
            pipeline_id, user_email, access_role, shared_by, created_at, updated_at
@@ -304,7 +318,7 @@ export async function ensureDefaultResourcesForUser(emailValue: unknown): Promis
          VALUES ($1::uuid, $2, 'editor', $3, now(), now())
          ON CONFLICT (pipeline_id, user_email) DO UPDATE SET
            access_role = 'editor', shared_by = EXCLUDED.shared_by, updated_at = now()`,
-        [pipeline.rows[0].id, ownerEmail, pipeline.rows[0].owner_email],
+        [crmPipeline.rows[0].id, ownerEmail, crmPipeline.rows[0].owner_email],
       )
     }
 
@@ -325,14 +339,20 @@ export async function ensureDefaultResourcesForUser(emailValue: unknown): Promis
               updated_at = now()
           WHERE id = $1::uuid
         `,
-        [pipeline.rows[0].id, DEFAULT_PIPELINE_SHEET_ID],
+        [personalPipeline.rows[0].id, DEFAULT_PIPELINE_SHEET_ID],
       )
     }
 
     return {
       boardId: board.rows[0].id,
-      pipelineId: pipeline.rows[0].id,
+      pipelineId: personalPipeline.rows[0].id,
       crmBoardId: crmBoard.rows[0].id,
+      pipelineProvisioningRequired: (
+        personalPipeline.rows[0].provisioning_status !== 'ready'
+        || !personalPipeline.rows[0].sheet_id
+        || !personalPipeline.rows[0].short_link_id
+        || !personalPipeline.rows[0].sync_enabled
+      ),
     }
   })
 }

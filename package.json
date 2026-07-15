@@ -26,6 +26,7 @@
     "verify:regression": "bash scripts/regression-all.sh",
     "verify:predeploy": "npm run verify:docs && node scripts/verify-predeploy.mjs",
     "verify:deployed": "node scripts/smoke-deployed-runtime.mjs",
+    "verify:tenancy-data": "node scripts/verify-tenancy-provisioning.mjs",
     "db:migrate": "node scripts/db-migrate.mjs",
     "db:inspect": "node scripts/db-inspect-persistence.mjs",
     "db:import:tasks": "node scripts/db-import-tasks.mjs",
