@@ -43,6 +43,7 @@ for (const column of ['email text PRIMARY KEY', 'role text NOT NULL', 'status te
 
 const usersAdapter = read('app_src/lib/users.ts')
 assertIncludes(usersAdapter, 'ensureOwnerUser', 'app users adapter')
+assertIncludes(usersAdapter, "COALESCE((SELECT reference_code FROM app_users WHERE email = $1), allocate_crm_reference('gc'))", 'side-effect-free app user upsert')
 assertIncludes(usersAdapter, 'inviteAppUser', 'app users adapter')
 assertIncludes(usersAdapter, 'canInviteUsers', 'app users adapter')
 assertIncludes(usersAdapter, "current?.status === 'disabled'", 'disabled user restore authorization')
@@ -354,6 +355,10 @@ assertIncludes(globalCrmReferenceNumbersMigration, 'ON CONFLICT (number_value) D
 assertIncludes(globalCrmReferenceNumbersMigration, 'protect_crm_reference_number_registry_delete', 'immutable CRM number allocation')
 assertIncludes(globalCrmReferenceNumbersMigration, 'enforce_crm_reference_number_exclusive_insert', 'cross-module CRM number exclusivity')
 assertIncludes(globalCrmReferenceNumbersMigration, 'Current CRM records contain duplicate numeric reference values', 'current CRM number collision guard')
+
+const referenceAllocationCleanupMigration = read('db/migrations/0032_reference_allocation_leak_cleanup.sql')
+assertIncludes(referenceAllocationCleanupMigration, "SET status = 'retired'", 'orphan CRM allocation retirement')
+assertIncludes(referenceAllocationCleanupMigration, 'Unreferenced active CRM allocations remain after cleanup', 'active CRM allocation integrity guard')
 
 const driveHierarchyMigration = read('db/migrations/0024_versioned_drive_hierarchy_reconciliation.sql')
 assertIncludes(driveHierarchyMigration, "'reconcile_pipeline_hierarchy_v2'", 'versioned Drive hierarchy operation')
