@@ -538,6 +538,7 @@ assertIncludes(suiteCrmClient, 'alreadyLinked', 'idempotent SuiteCRM relationshi
 assertIncludes(suiteCrmClient, "'filter[date_modified][gte]'", 'incremental SuiteCRM meeting polling')
 assertIncludes(suiteCrmClient, 'listSuiteCrmAccountContactRecordsUpdatedSince', 'incremental SuiteCRM account/contact polling')
 assertIncludes(suiteCrmClient, "'Accounts' | 'Contacts'", 'bounded SuiteCRM account/contact modules')
+assertIncludes(suiteCrmClient, 'type !== moduleName && type !== recordType', 'SuiteCRM singular JSON API record types')
 
 const suiteCrmGlobalIdBootstrap = read('services/suitecrm/bootstrap-global-id.php')
 assertIncludes(suiteCrmGlobalIdBootstrap, "const CLAWPILOT_GLOBAL_ID_FIELD = 'global_id_c'", 'native SuiteCRM Global ID field')

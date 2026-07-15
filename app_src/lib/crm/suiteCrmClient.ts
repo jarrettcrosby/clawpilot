@@ -187,6 +187,7 @@ async function listSuiteCrmModuleRecordsUpdatedSince(
     meta?: { 'total-pages'?: unknown }
   }
   if (!Array.isArray(response.data)) throw new Error(`SuiteCRM returned an invalid ${recordLabel} collection`)
+  const recordType = moduleName.slice(0, -1)
   const records = response.data.map((record) => {
     const id = String(record?.id || '').trim()
     const type = String(record?.type || '').trim()
@@ -194,7 +195,7 @@ async function listSuiteCrmModuleRecordsUpdatedSince(
     if (
       !id
       || id.length > 64
-      || (type && type !== moduleName)
+      || (type && type !== moduleName && type !== recordType)
       || !attributes
       || typeof attributes !== 'object'
       || Array.isArray(attributes)
