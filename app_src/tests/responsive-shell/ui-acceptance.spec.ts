@@ -107,6 +107,80 @@ test('responsive shell: 900x599 is desktop regardless of height or touch input',
   await expectNoHorizontalOverflow(page)
 })
 
+test('dashboard links open their target section and selected document', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 })
+  await page.route('**/api/tasks', (route) => route.fulfill({
+    json: [{
+      id: 'dashboard-task',
+      title: 'Dashboard task',
+      desc: 'Opened from dashboard navigation acceptance.',
+      status: 'todo',
+      priority: 'high',
+      category: 'clawpilot',
+      tags: [],
+      createdAt: '2026-07-15T12:00:00.000Z',
+      updatedAt: '2026-07-15T12:00:00.000Z',
+      activity: [{
+        type: 'comment',
+        message: 'Dashboard activity',
+        timestamp: '2026-07-15T12:00:00.000Z',
+        actor: 'Test User',
+      }],
+      comments: [],
+      checklist: [],
+    }],
+  }))
+  await page.route('**/api/pipeline/activity', (route) => route.fulfill({ json: [] }))
+  await page.route('**/api/docs**', (route) => route.fulfill({
+    json: [{
+      id: 'dashboard-document',
+      title: 'Dashboard document',
+      category: 'Build',
+      date: '2026-07-15',
+      slug: 'dashboard-document',
+      tags: [],
+      content: '# Dashboard document\n\nSelected from the dashboard.',
+    }],
+  }))
+  await page.route('**/api/execution-results/summary', (route) => route.fulfill({ json: { count: 0 } }))
+  await page.route('**/api/users', (route) => route.fulfill({ json: { currentUser: { displayName: 'Test User' } } }))
+  await gotoApp(page, '/#dashboard')
+
+  await page.getByRole('button', { name: 'Open task', exact: true }).click()
+  const closeTaskDrawer = page.getByRole('button', { name: 'Close drawer' })
+  await expect(closeTaskDrawer).toBeVisible()
+  await closeTaskDrawer.click()
+  await page.waitForTimeout(250)
+  await expect(closeTaskDrawer).toBeHidden()
+
+  await page.evaluate(() => { window.location.hash = 'dashboard' })
+  await page.getByRole('button', { name: 'Activity log' }).click()
+  const activityDrawer = page.locator('.MuiDrawer-paper').filter({ hasText: 'Activity Log' })
+  await activityDrawer.getByText('Projects', { exact: true }).click()
+  await activityDrawer.getByText('Dashboard activity', { exact: true }).click()
+  await expect(closeTaskDrawer).toBeVisible()
+  await closeTaskDrawer.click()
+  await page.waitForTimeout(250)
+  await expect(closeTaskDrawer).toBeHidden()
+
+  await page.evaluate(() => { window.location.hash = 'dashboard' })
+  await page.getByText('Dashboard document', { exact: true }).click()
+  await expect(page).toHaveURL(/\?doc=dashboard-document#docs$/)
+  await expect(page.getByText('Selected from the dashboard.')).toBeVisible()
+
+  await page.evaluate(() => { window.location.hash = 'dashboard' })
+  await expect(page.getByRole('button', { name: 'View board' })).toBeVisible()
+  await page.getByRole('button', { name: 'View board' }).click()
+  await expect(page).toHaveURL(/#projects$/)
+  await expect(page.getByPlaceholder('Search cards...')).toBeVisible()
+
+  await page.evaluate(() => { window.location.hash = 'dashboard' })
+  await expect(page.getByRole('button', { name: /Agent results/ })).toBeVisible()
+  await page.getByRole('button', { name: /Agent results/ }).click()
+  await expect(page).toHaveURL(/#agents$/)
+  await expect(page.getByRole('heading', { name: 'Agents', exact: true, level: 5 })).toBeVisible()
+})
+
 test('responsive shell: 390x844 exposes compact navigation and dismissible drawers', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 })
   await gotoApp(page, '/#dashboard')
@@ -173,8 +247,53 @@ test('responsive shell: 390x844 exposes compact navigation and dismissible drawe
   await expectNoHorizontalOverflow(page)
 })
 
+test('projects workspace actions stay fully visible on narrow portrait screens', async ({ page }) => {
+  await page.route('**/api/workspaces', (route) => route.fulfill({
+    json: {
+      ok: true,
+      boards: [{
+        id: 'clawpilot-board',
+        name: 'ClawPilot board',
+        ownerEmail: 'test@example.com',
+        accessRole: 'owner',
+      }],
+      pipelines: [],
+      selectedBoardId: 'clawpilot-board',
+      selectedPipelineId: null,
+    },
+  }))
+
+  for (const viewport of [{ width: 320, height: 568 }, { width: 360, height: 800 }]) {
+    await page.setViewportSize(viewport)
+    await gotoApp(page, '/#projects')
+    const workspaceActions = page.getByTestId('projects-workspace-actions')
+    const boardLabel = workspaceActions.locator('label', { hasText: 'Board' })
+    const newTask = workspaceActions.getByRole('button', { name: 'New task' })
+    await expect(boardLabel).toBeVisible()
+    await expect(newTask).toBeVisible()
+    await expect.poll(async () => workspaceActions.evaluate((element) => (
+      element.scrollWidth - element.clientWidth
+    ))).toBeLessThanOrEqual(1)
+    await expectNoHorizontalOverflow(page)
+  }
+})
+
 test('responsive shell: 844x390 keeps mobile navigation usable without covering active content', async ({ page }) => {
   await page.setViewportSize({ width: 844, height: 390 })
+  await page.route('**/api/workspaces', (route) => route.fulfill({
+    json: {
+      ok: true,
+      boards: [{
+        id: 'clawpilot-board',
+        name: 'ClawPilot board',
+        ownerEmail: 'test@example.com',
+        accessRole: 'owner',
+      }],
+      pipelines: [],
+      selectedBoardId: 'clawpilot-board',
+      selectedPipelineId: null,
+    },
+  }))
   await gotoApp(page, '/#dashboard')
 
   const desktopNavigation = page.getByTestId('desktop-navigation')
@@ -205,5 +324,16 @@ test('responsive shell: 844x390 keeps mobile navigation usable without covering 
   await page.getByTestId('nav-bottom-projects').click()
   await expect(page).toHaveURL(/#projects$/)
   await expect(page.getByPlaceholder('Search cards...')).toBeVisible()
+  const workspaceActions = page.getByTestId('projects-workspace-actions')
+  const boardLabel = workspaceActions.locator('label', { hasText: 'Board' })
+  await expect(boardLabel).toBeVisible()
+  await expect.poll(async () => {
+    const [actionsBox, labelBox] = await Promise.all([
+      workspaceActions.boundingBox(),
+      boardLabel.boundingBox(),
+    ])
+    if (!actionsBox || !labelBox) return false
+    return labelBox.y >= actionsBox.y - 1
+  }).toBe(true)
   await expectNoHorizontalOverflow(page)
 })

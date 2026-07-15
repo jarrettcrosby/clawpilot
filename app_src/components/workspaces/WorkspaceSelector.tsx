@@ -80,7 +80,11 @@ export default function WorkspaceSelector({
       value={selectedId}
       onChange={(event) => select(event.target.value)}
       disabled={pending}
-      sx={{ width: { xs: '100%', sm: 260 }, '& .MuiInputBase-root': { borderRadius: 1 } }}
+      sx={{
+        width: { xs: 'min(220px, calc(100vw - 146px))', sm: 260 },
+        maxWidth: '100%',
+        '& .MuiInputBase-root': { borderRadius: 1 },
+      }}
     >
       {resources.map((resource) => (
         <MenuItem key={resource.id} value={resource.id}>

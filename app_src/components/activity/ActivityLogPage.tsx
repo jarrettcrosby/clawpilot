@@ -27,6 +27,7 @@ import CheckBoxRounded from '@mui/icons-material/CheckBoxRounded'
 import EditRounded from '@mui/icons-material/EditRounded'
 import { PEOPLE } from '@/lib/types'
 import type { Task } from '@/lib/types'
+import { queueProjectTaskOpen } from '@/lib/projects/navigation'
 
 const READ_KEY = 'clawpilot_read_log'
 function getReadIds(): Set<string> {
@@ -183,6 +184,7 @@ export default function ActivityLogPage({ tasks, pipelineEntries = [], defaultMo
         setMissingTarget(`Card not found: ${entry._taskTitle}`)
         return
       }
+      queueProjectTaskOpen(entry._taskId)
       navigateToSection('projects')
       window.dispatchEvent(new CustomEvent('open-task', { detail: { id: entry._taskId } }))
       onClose?.()

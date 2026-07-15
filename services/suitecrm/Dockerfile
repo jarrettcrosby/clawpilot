@@ -29,6 +29,7 @@ COPY suitecrm.ini /usr/local/etc/php/conf.d/99-suitecrm.ini
 COPY supervisord.conf /etc/supervisor/conf.d/suitecrm.conf
 COPY entrypoint.sh scheduler-loop.sh messenger-loop.sh /usr/local/bin/
 COPY bootstrap-client.php /opt/clawpilot/bootstrap-client.php
+COPY bootstrap-global-id.php /opt/clawpilot/bootstrap-global-id.php
 
 RUN chmod 0755 /usr/local/bin/entrypoint.sh /usr/local/bin/scheduler-loop.sh /usr/local/bin/messenger-loop.sh \
   && mkdir -p /var/lib/suitecrm /var/log/supervisor \

@@ -16,6 +16,8 @@ Each Railway environment has a `suitecrm` service, a dedicated MariaDB service, 
 
 The image is built from `services/suitecrm/`. It verifies the official SuiteCRM 8.10.1 release digest, serves `public/` with Apache, runs the legacy scheduler every minute, and continuously restarts the Symfony Messenger worker.
 
+Container boot also idempotently installs the ClawPilot `Global ID` custom field on Accounts, Contacts, Leads, Opportunities, Meetings, Notes, and Campaigns. The field is named `global_id_c` in SuiteCRM metadata, labeled `Global ID`, added to native detail layouts, and enabled for reporting and unified search.
+
 ## Required Variables
 
 SuiteCRM service:
@@ -74,6 +76,14 @@ The managed block is inserted last so stale installer values cannot override it.
 5. Enable CRM variables on the ClawPilot development service and apply migration `0020_crm_gateway_and_reporting.sql`.
 6. Inspect and import the source workbook, drain the SuiteCRM and Google outboxes, then compare entity counts and pipeline totals before projecting the controlled workbook.
 7. Repeat in production only after development reconciliation succeeds.
+
+After the Global ID metadata is live, refresh historical records and meeting subpanel links from each environment's ClawPilot service shell:
+
+```bash
+CLAWPILOT_BACKFILL_CONFIRM=global-id-v1 npm run crm:backfill-suitecrm
+```
+
+Drain `/api/crm/outbox/process`, then verify an exact V8 filter on `global_id_c` and inspect a meeting's Contacts and Accounts subpanels. The backfill is transactionally queued and may be rerun; unchanged payloads are not duplicated.
 
 After a public-domain change, update `SUITECRM_PUBLIC_URL` on both services and redeploy SuiteCRM before ClawPilot. Confirm the managed `site_url` and trusted-host entries, then test `/api/crm/punchout` as an owner/admin and confirm a member receives `403`.
 

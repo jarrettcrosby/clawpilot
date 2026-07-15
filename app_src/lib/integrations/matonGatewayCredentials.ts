@@ -6,6 +6,7 @@ import { normalizeUserEmail } from '@/lib/users'
 export type MatonGatewayCredential = {
   apiKey: string
   connectionId: string
+  accountEmail: string | null
 }
 
 export class MatonGatewayCredentialError extends Error {
@@ -76,6 +77,7 @@ async function resolveStoredCredential(input: {
     return {
       apiKey: decryptMatonApiKey(lookup.credential, ownerEmail),
       connectionId: lookup.connectionId,
+      accountEmail: lookup.accountEmail,
     }
   } catch {
     throw new MatonGatewayCredentialError('Stored Maton credential is unavailable', 'unavailable')

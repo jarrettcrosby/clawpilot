@@ -21,6 +21,16 @@ type JsonApiResponse = {
   errors?: unknown
 }
 
+type JsonApiCollectionResponse = {
+  data?: Array<{ id?: string; type?: string }>
+  errors?: unknown
+}
+
+export type SuiteCrmMeetingSnapshot = {
+  id: string
+  attributes: Record<string, unknown>
+}
+
 let cachedToken: { value: string; expiresAt: number } | null = null
 
 function requiredCredential(name: 'SUITECRM_CLIENT_ID' | 'SUITECRM_CLIENT_SECRET') {
@@ -138,6 +148,50 @@ export async function testSuiteCrmConnection(fetchImpl: typeof fetch = fetch) {
   return Boolean(response)
 }
 
+export async function listSuiteCrmMeetingsUpdatedSince(input: {
+  updatedSince: string
+  page: number
+  pageSize?: number
+}, fetchImpl: typeof fetch = fetch) {
+  const updatedSince = new Date(input.updatedSince)
+  if (!Number.isFinite(updatedSince.getTime())) throw new Error('SuiteCRM meeting cursor is invalid')
+  const requestedPage = Number(input.page)
+  const requestedPageSize = Number(input.pageSize || 100)
+  if (!Number.isFinite(requestedPage) || !Number.isFinite(requestedPageSize)) {
+    throw new Error('SuiteCRM meeting pagination is invalid')
+  }
+  const page = Math.max(1, Math.min(Math.trunc(requestedPage), 10_000))
+  const pageSize = Math.max(1, Math.min(Math.trunc(requestedPageSize), 250))
+  const parameters = new URLSearchParams({
+    'filter[date_modified][gte]': updatedSince.toISOString(),
+    'page[number]': String(page),
+    'page[size]': String(pageSize),
+    sort: 'date_modified',
+  })
+  const response = await request(
+    `/Api/V8/module/Meetings?${parameters}`,
+    { method: 'GET' },
+    fetchImpl,
+  ) as {
+    data?: Array<{ id?: unknown; attributes?: unknown }>
+    meta?: { 'total-pages'?: unknown }
+  }
+  if (!Array.isArray(response.data)) throw new Error('SuiteCRM returned an invalid meeting collection')
+  const meetings = response.data.map((record) => {
+    const id = String(record?.id || '').trim()
+    const attributes = record?.attributes
+    if (!id || id.length > 64 || !attributes || typeof attributes !== 'object' || Array.isArray(attributes)) {
+      throw new Error('SuiteCRM returned an invalid meeting')
+    }
+    return { id, attributes: attributes as Record<string, unknown> } satisfies SuiteCrmMeetingSnapshot
+  })
+  const totalPages = Number(response.meta?.['total-pages'])
+  return {
+    meetings,
+    totalPages: Number.isSafeInteger(totalPages) && totalPages > 0 ? totalPages : page,
+  }
+}
+
 export async function upsertSuiteCrmRecord(
   record: SuiteCrmOutboxRecord,
   fetchImpl: typeof fetch = fetch,
@@ -162,6 +216,30 @@ export async function upsertSuiteCrmRecord(
   }, fetchImpl) as JsonApiResponse
   const id = String(response?.data?.id || record.suiteCrmId)
   if (id !== record.suiteCrmId) throw new Error('SuiteCRM returned an unexpected record ID')
+  for (const relationship of record.relationships || []) {
+    const linkFieldName = relationship.linkFieldName
+    if (!['accounts', 'contacts', 'leads', 'opportunity'].includes(linkFieldName)) {
+      throw new Error('SuiteCRM relationship link field is invalid')
+    }
+    const path = `/Api/V8/module/${moduleName}/${encodeURIComponent(record.suiteCrmId)}/relationships/${linkFieldName}`
+    const existingRelationships = await request(
+      `${path}?page[size]=200&page[number]=1`,
+      { method: 'GET' },
+      fetchImpl,
+    ) as JsonApiCollectionResponse
+    const alreadyLinked = Array.isArray(existingRelationships.data)
+      && existingRelationships.data.some((related) => related?.id === relationship.relatedBeanId)
+    if (alreadyLinked) continue
+    await request(path, {
+      method: 'POST',
+      body: JSON.stringify({
+        data: {
+          type: relationship.relatedModuleName,
+          id: relationship.relatedBeanId,
+        },
+      }),
+    }, fetchImpl)
+  }
   return id
 }
 

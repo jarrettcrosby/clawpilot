@@ -244,4 +244,9 @@ export type SuiteCrmOutboxRecord = {
   localId: string
   suiteCrmId: string
   attributes: Record<string, unknown>
+  relationships?: Array<{
+    linkFieldName: 'accounts' | 'contacts' | 'leads' | 'opportunity'
+    relatedModuleName: 'Accounts' | 'Contacts' | 'Leads' | 'Opportunities'
+    relatedBeanId: string
+  }>
 }

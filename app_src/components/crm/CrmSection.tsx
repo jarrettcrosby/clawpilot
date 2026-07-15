@@ -95,6 +95,10 @@ type CrmPayload = {
   suiteCrmPunchoutUrl?: string | null
   suiteCrmUsername?: string | null
   suiteCrmAdminPortalUrl?: string | null
+  providerIdentities?: {
+    googleMail?: string | null
+    googleCalendar?: string | null
+  }
 }
 
 const ENTITY_LABELS: Record<CrmEntity, string> = {
@@ -255,6 +259,10 @@ export default function CrmSection() {
   const [suiteCrmPunchoutUrl, setSuiteCrmPunchoutUrl] = useState<string | null>(null)
   const [suiteCrmUsername, setSuiteCrmUsername] = useState<string | null>(null)
   const [suiteCrmAdminPortalUrl, setSuiteCrmAdminPortalUrl] = useState<string | null>(null)
+  const [providerIdentities, setProviderIdentities] = useState({
+    googleMail: null as string | null,
+    googleCalendar: null as string | null,
+  })
   const [suiteCrmAccessOpen, setSuiteCrmAccessOpen] = useState(false)
   const [hierarchyOpen, setHierarchyOpen] = useState(false)
   const [actionComposer, setActionComposer] = useState<{ type: CrmActionType; record: RecordValue } | null>(null)
@@ -279,6 +287,10 @@ export default function CrmSection() {
       setSuiteCrmPunchoutUrl(payload.suiteCrmPunchoutUrl || null)
       setSuiteCrmUsername(payload.suiteCrmUsername || null)
       setSuiteCrmAdminPortalUrl(payload.suiteCrmAdminPortalUrl || null)
+      setProviderIdentities({
+        googleMail: payload.providerIdentities?.googleMail || null,
+        googleCalendar: payload.providerIdentities?.googleCalendar || null,
+      })
       const reference = new URLSearchParams(window.location.search).get('crm')?.trim().toLowerCase() || ''
       const matched = reference && entityForReference(reference) === nextEntity
         ? (payload.records || []).find((record) => textValue(record, 'referenceCode') === reference)
@@ -742,6 +754,7 @@ export default function CrmSection() {
         <DialogContent>
           <Stack spacing={2} mt={0.5}>
             {actionComposer?.type === 'send_email' && <>
+              <TextField disabled label="From" value={providerIdentities.googleMail || 'Select Google Mail in Settings'} />
               <TextField label="Subject" required value={actionFields.subject || ''} onChange={(event) => setActionFields({ ...actionFields, subject: event.target.value })} />
               <TextField label="Message" required multiline minRows={8} value={actionFields.text || ''} onChange={(event) => setActionFields({ ...actionFields, text: event.target.value })} />
             </>}
@@ -750,6 +763,7 @@ export default function CrmSection() {
               <TextField label="Call notes" multiline minRows={5} value={actionFields.notes || ''} onChange={(event) => setActionFields({ ...actionFields, notes: event.target.value })} />
             </>}
             {actionComposer?.type === 'create_calendar_event' && <>
+              <TextField disabled label="Calendar organizer" value={providerIdentities.googleCalendar || 'Select Google Calendar in Settings'} />
               <TextField label="Meeting" required value={actionFields.subject || ''} onChange={(event) => setActionFields({ ...actionFields, subject: event.target.value })} />
               <Stack direction={{ xs: 'column', sm: 'row' }} gap={1.5}>
                 <TextField fullWidth label="Starts" type="datetime-local" required value={actionFields.startsAt || ''} onChange={(event) => setActionFields({ ...actionFields, startsAt: event.target.value })} InputLabelProps={{ shrink: true }} />
@@ -761,6 +775,7 @@ export default function CrmSection() {
               <TextField label="Description" multiline minRows={4} value={actionFields.description || ''} onChange={(event) => setActionFields({ ...actionFields, description: event.target.value })} />
             </>}
             {actionComposer?.type === 'send_campaign' && <>
+              <TextField disabled label="From" value={providerIdentities.googleMail || 'Select Google Mail in Settings'} />
               <TextField label="Recipient CRM IDs" required value={actionFields.recipientReferences || ''} onChange={(event) => setActionFields({ ...actionFields, recipientReferences: event.target.value })} helperText="Use gc or gl IDs, separated by commas or spaces" />
               <TextField label="Subject template" required value={actionFields.subject || ''} onChange={(event) => setActionFields({ ...actionFields, subject: event.target.value })} />
               <TextField label="Message template" required multiline minRows={8} value={actionFields.text || ''} onChange={(event) => setActionFields({ ...actionFields, text: event.target.value })} helperText="Merge fields: {{firstName}}, {{lastName}}, {{name}}, {{email}}, {{referenceCode}}" />

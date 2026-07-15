@@ -25,7 +25,7 @@ Keep user-owned Maton accounts separate from the platform Google Workspace crede
 
 - User-owned Maton operations resolve the signed-in user's encrypted credential and an `ACTIVE` connection for the requested Maton application.
 - Sign-in and invitation email is a platform operation. It always uses the Railway `MATON_API_KEY` plus exact `MATON_GMAIL_CONNECTION_ID`, verifies that `stewards@eigenracing.com` is an accepted Gmail send-as identity, and never falls back to a user's selected personal connection.
-- CRM sales email and calendar actions are user operations. They use the signed-in user's encrypted Maton credential and selected `google-mail` or `google-calendar` connection, so another ClawPilot user must authorize their own providers.
+- CRM sales email and calendar actions are user operations. They use the signed-in user's encrypted Maton credential and selected `google-mail` or `google-calendar` connection, so another ClawPilot user must authorize their own providers. CRM action dialogs show the selected account email before submission, and provider attempt summaries retain the verified Gmail sender or selected Calendar organizer for audit.
 - Development and production store user integration records in their own Railway Postgres environments. Import or configure the platform owner in both environments; do not copy database rows between environments.
 
 ## Google Workspace Contract
