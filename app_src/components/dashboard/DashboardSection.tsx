@@ -18,6 +18,7 @@ import TrendingUpRounded from '@mui/icons-material/TrendingUpRounded'
 import ViewKanbanRounded from '@mui/icons-material/ViewKanbanRounded'
 import WbSunnyRounded from '@mui/icons-material/WbSunnyRounded'
 import { queueAgentTaskOpen } from '@/lib/agents/navigation'
+import { queueProjectTaskOpen } from '@/lib/projects/navigation'
 import { deriveLiveState, formatLiveActivityAge } from '@/lib/liveState'
 import { deriveNowWorking } from '@/lib/nowWorking'
 import type { Task } from '@/lib/types'
@@ -177,8 +178,9 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter }: P
   }
 
   function openTask(taskId: string) {
+    queueProjectTaskOpen(taskId)
     onNavigate('projects')
-    setTimeout(() => window.dispatchEvent(new CustomEvent('open-task', { detail: { id: taskId } })), 120)
+    window.dispatchEvent(new CustomEvent('open-task', { detail: { id: taskId } }))
   }
 
   function openAgentChat(taskId: string, agentId?: string) {
@@ -187,10 +189,12 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter }: P
   }
 
   function openDoc(doc: DocMeta) {
+    const oldURL = window.location.href
     const url = new URL(window.location.href)
     url.searchParams.set('doc', doc.slug || doc.id)
-    window.history.replaceState(null, '', `${url.pathname}${url.search}#docs`)
-    onNavigate('docs')
+    url.hash = 'docs'
+    window.history.replaceState(null, '', `${url.pathname}${url.search}${url.hash}`)
+    window.dispatchEvent(new HashChangeEvent('hashchange', { oldURL, newURL: url.toString() }))
   }
 
   if (loading) {

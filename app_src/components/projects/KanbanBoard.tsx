@@ -31,6 +31,7 @@ import DeletedCardsView from './DeletedCardsView'
 import type { Task } from '@/lib/types'
 import { ASSIGNABLE_PRODUCT_AGENT_IDS, COLUMNS, PEOPLE } from '@/lib/types'
 import WorkspaceSelector from '@/components/workspaces/WorkspaceSelector'
+import { consumeProjectTaskOpen } from '@/lib/projects/navigation'
 
 type BoardCtx = {
   updateTask: (task: Task) => void
@@ -158,9 +159,15 @@ export default function KanbanBoard({ externalFilter, onFilterChange }: Props = 
   }, [])
 
   useEffect(() => {
+    const queuedTaskId = consumeProjectTaskOpen()
+    if (queuedTaskId) setPendingOpenId(queuedTaskId)
+
     function onOpenTask(event: Event) {
       const id = (event as OpenTaskEvent).detail?.id
-      if (id) setPendingOpenId(String(id))
+      if (id) {
+        consumeProjectTaskOpen()
+        setPendingOpenId(String(id))
+      }
     }
 
     window.addEventListener('open-task', onOpenTask)
@@ -330,7 +337,20 @@ export default function KanbanBoard({ externalFilter, onFilterChange }: Props = 
                   {archiveMode ? 'Archive' : `${visibleTasks.length} task${visibleTasks.length === 1 ? '' : 's'}${isFilterActive(filter) ? ' (filtered)' : ''}`}
                 </Typography>
               </Box>
-              <Stack direction="row" spacing={1} sx={{ width: shortLandscape ? 'auto' : { xs: '100%', sm: 'auto' }, flexShrink: 0, overflowX: 'auto' }}>
+              <Stack
+                data-testid="projects-workspace-actions"
+                direction="row"
+                spacing={1}
+                sx={{
+                  width: shortLandscape ? 'auto' : { xs: '100%', sm: 'auto' },
+                  flexShrink: 0,
+                  overflowX: 'auto',
+                  pt: 1.25,
+                  pb: 0.25,
+                  px: 0.125,
+                  '& > *': { flexShrink: 0 },
+                }}
+              >
                 <WorkspaceSelector kind="board" onAccessChange={(resource) => setBoardAccess(resource?.accessRole || null)} />
                 {!archiveMode && canEdit ? (
                   <Button

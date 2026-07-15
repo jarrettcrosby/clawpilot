@@ -47,6 +47,7 @@ export type MatonGatewayCredentialLookup =
       status: 'resolved'
       credential: MatonEncryptedCredentialRecord
       connectionId: string
+      accountEmail: string | null
     }
 
 type MatonGatewayCredentialRow = {
@@ -54,6 +55,7 @@ type MatonGatewayCredentialRow = {
   api_key_iv: Buffer | null
   api_key_tag: Buffer | null
   connection_id: string | null
+  account_email: string | null
 }
 
 export type MatonConnectionWrite = {
@@ -466,10 +468,11 @@ export async function resolveMatonGatewayCredentialFromPostgres(input: {
         credential.api_key_ciphertext,
         credential.api_key_iv,
         credential.api_key_tag,
-        active_connection.connection_id
+        active_connection.connection_id,
+        active_connection.account_email
       FROM user_maton_credentials credential
       LEFT JOIN LATERAL (
-        SELECT connection.connection_id
+        SELECT connection.connection_id, connection.account_email
         FROM user_maton_connections connection
         WHERE connection.owner_email = credential.owner_email
           AND connection.app = $2
@@ -496,6 +499,7 @@ export async function resolveMatonGatewayCredentialFromPostgres(input: {
       tag: row.api_key_tag,
     },
     connectionId: row.connection_id,
+    accountEmail: row.account_email,
   }
 }
 

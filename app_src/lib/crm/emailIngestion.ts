@@ -16,6 +16,8 @@ const POLL_OVERLAP_MS = 5 * 60 * 1000
 const MAX_INTERACTION_DESCRIPTION_CHARS = 50_000
 const MAX_SUBJECT_CHARS = 500
 const MAX_SNIPPET_CHARS = 2_000
+const DEFAULT_ARCHIVE_EMAIL = 'archive@eigenracing.com'
+const EMAIL_PATTERN = /^[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+$/i
 
 export type GmailHeader = {
   name?: string
@@ -72,6 +74,8 @@ export type EmailIngestionCounts = {
   markerReferences: number
   invalidReferences: number
   senderMatches: number
+  archiveMessages: number
+  archiveMatches: number
   unmatchedMessages: number
   interactions: number
   links: number
@@ -81,6 +85,7 @@ export type EmailIngestionCounts = {
 type SelectedMailbox = {
   owner_email: string
   connection_id: string
+  account_email: string | null
 }
 
 type OwnedPipeline = {
@@ -109,7 +114,7 @@ type CrmReferenceRecord = Awaited<ReturnType<typeof readCrmRecordByReference>>
 type ReferenceTarget = {
   record: CrmReferenceRecord
   pipelineId: string
-  matchedBy: 'marker' | 'sender-email'
+  matchedBy: 'marker' | 'sender-email' | 'archive-email'
 }
 
 type MessageProcessResult = {
@@ -117,6 +122,8 @@ type MessageProcessResult = {
   markerReferences: number
   invalidReferences: number
   senderMatches: number
+  archiveMessage: boolean
+  archiveMatches: number
   unmatched: boolean
   interactions: number
   links: number
@@ -141,6 +148,11 @@ function cleanSingleLine(value: unknown, maxLength: number): string {
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, maxLength)
+}
+
+export function archiveMailboxEmail(): string {
+  const configured = String(process.env.CLAWPILOT_ARCHIVE_EMAIL || '').trim().toLowerCase()
+  return EMAIL_PATTERN.test(configured) ? configured : DEFAULT_ARCHIVE_EMAIL
 }
 
 function safeIdentifier(value: unknown, required: boolean): string | null {
@@ -307,7 +319,7 @@ export function parseGmailMessage(message: GmailMessage): ParsedGmailMessage {
   const externalMessageId = safeIdentifier(message?.id, true) as string
   const senderValues = ['from', 'sender', 'reply-to', 'return-path']
     .flatMap((name) => headerValues(message.payload, name))
-  const recipientValues = ['to', 'cc', 'delivered-to', 'x-original-to']
+  const recipientValues = ['to', 'cc', 'bcc', 'delivered-to', 'x-original-to', 'x-forwarded-to', 'resent-to']
     .flatMap((name) => headerValues(message.payload, name))
   const decodedBodyText = extractGmailMessageBody(message.payload)
   const bodyText = truncateEmailImportContent(decodedBodyText)
@@ -410,7 +422,7 @@ async function writeCursor(input: {
 
 async function selectedMailboxes(): Promise<SelectedMailbox[]> {
   const result = await query<SelectedMailbox>(
-    `SELECT app_user.email AS owner_email, connection.connection_id
+    `SELECT app_user.email AS owner_email, connection.connection_id, connection.account_email
      FROM app_users app_user
      JOIN user_maton_connections connection ON connection.owner_email = app_user.email
      WHERE app_user.status = 'active'
@@ -476,7 +488,7 @@ async function listGmailPage(mailbox: SelectedMailbox, state: PollCursor) {
   const after = Math.max(0, Math.floor(new Date(state.since).getTime() / 1000))
   const parameters = new URLSearchParams({
     maxResults: String(GMAIL_PAGE_SIZE),
-    q: `after:${after} -in:sent -in:drafts`,
+    q: `after:${after} -in:drafts (-in:sent OR to:${archiveMailboxEmail()})`,
   })
   if (state.pageToken) parameters.set('pageToken', state.pageToken)
   const payload = await gmailJson(mailbox, `${GMAIL_LIST_PATH}?${parameters}`, 'list')
@@ -506,6 +518,8 @@ async function storeInboundMessage(input: {
     historyId: message.historyId,
     labelIds: message.labelIds,
     sizeEstimate: message.sizeEstimate,
+    archiveIntake: isArchiveMessage(message),
+    archiveAddress: isArchiveMessage(message) ? archiveMailboxEmail() : null,
   }
   const inserted = await query<{ id: string; pipeline_id: string }>(
     `INSERT INTO crm_inbound_messages (
@@ -584,6 +598,92 @@ async function senderEmailTarget(pipelineId: string, senderEmail: string): Promi
   }]
 }
 
+function isArchiveMessage(message: ParsedGmailMessage): boolean {
+  const archiveEmail = archiveMailboxEmail()
+  return message.recipientEmails.some((email) => email.toLowerCase() === archiveEmail)
+}
+
+export function archiveCandidateAddresses(
+  message: ParsedGmailMessage,
+  ownerEmail: string,
+  mailboxEmail?: string | null,
+): string[] {
+  const excluded = new Set([
+    archiveMailboxEmail(),
+    ownerEmail.trim().toLowerCase(),
+    String(mailboxEmail || '').trim().toLowerCase(),
+  ].filter(Boolean))
+  const candidates = [
+    message.senderEmail,
+    ...message.recipientEmails,
+    ...extractEmailAddresses(message.bodyText),
+    ...extractEmailAddresses(message.snippet),
+  ]
+  return Array.from(new Set(candidates.map((email) => email.toLowerCase())))
+    .filter((email) => EMAIL_PATTERN.test(email) && !excluded.has(email))
+}
+
+async function archiveEmailTargets(input: {
+  ownerEmail: string
+  mailboxEmail?: string | null
+  defaultPipelineId: string
+  ownedPipelines: OwnedPipeline[]
+  message: ParsedGmailMessage
+}): Promise<ReferenceTarget[]> {
+  const emails = archiveCandidateAddresses(input.message, input.ownerEmail, input.mailboxEmail)
+  if (emails.length === 0) return []
+  const matches = await query<{
+    pipeline_id: string
+    reference_code: string
+    email: string
+  }>(
+    `SELECT pipeline_id::text, reference_code, lower(btrim(email)) AS email
+     FROM (
+       SELECT pipeline_id, reference_code, email FROM crm_contacts
+       UNION ALL
+       SELECT pipeline_id, reference_code, email FROM crm_leads
+       UNION ALL
+       SELECT pipeline_id, reference_code, email FROM crm_organizations
+     ) candidate
+     WHERE pipeline_id = ANY($1::uuid[])
+       AND lower(btrim(email)) = ANY($2::text[])
+     ORDER BY email ASC,
+       CASE WHEN pipeline_id = $3::uuid THEN 0 ELSE 1 END,
+       reference_code ASC`,
+    [input.ownedPipelines.map((pipeline) => pipeline.id), emails, input.defaultPipelineId],
+  )
+
+  const rowsByEmail = new Map<string, typeof matches.rows>()
+  for (const row of matches.rows) {
+    const rows = rowsByEmail.get(row.email) || []
+    rows.push(row)
+    rowsByEmail.set(row.email, rows)
+  }
+
+  const targets: ReferenceTarget[] = []
+  const seen = new Set<string>()
+  for (const email of emails) {
+    const rows = rowsByEmail.get(email) || []
+    const references = Array.from(new Set(rows.map((row) => row.reference_code)))
+    if (references.length !== 1) continue
+    const referenceCode = references[0]
+    const row = rows.find((candidate) => candidate.pipeline_id === input.defaultPipelineId) || rows[0]
+    if (!row) continue
+    const key = `${row.pipeline_id}:${referenceCode}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    targets.push({
+      record: await readCrmRecordByReference({
+        pipelineId: row.pipeline_id,
+        referenceCode,
+      }),
+      pipelineId: row.pipeline_id,
+      matchedBy: 'archive-email',
+    })
+  }
+  return targets
+}
+
 async function explicitReferenceTarget(input: {
   defaultPipelineId: string
   ownedPipelines: OwnedPipeline[]
@@ -614,13 +714,38 @@ async function explicitReferenceTarget(input: {
 }
 
 async function referenceTargets(input: {
+  ownerEmail: string
+  mailboxEmail?: string | null
   defaultPipelineId: string
   ownedPipelines: OwnedPipeline[]
   message: ParsedGmailMessage
-}): Promise<{ targets: ReferenceTarget[]; invalidReferences: number; senderMatches: number }> {
+}): Promise<{
+  targets: ReferenceTarget[]
+  invalidReferences: number
+  senderMatches: number
+  archiveMessage: boolean
+  archiveMatches: number
+}> {
+  const archiveMessage = isArchiveMessage(input.message)
   if (input.message.markerReferences.length === 0) {
+    if (archiveMessage) {
+      const targets = await archiveEmailTargets(input)
+      return {
+        targets,
+        invalidReferences: 0,
+        senderMatches: 0,
+        archiveMessage: true,
+        archiveMatches: targets.length,
+      }
+    }
     const targets = await senderEmailTarget(input.defaultPipelineId, input.message.senderEmail)
-    return { targets, invalidReferences: 0, senderMatches: targets.length }
+    return {
+      targets,
+      invalidReferences: 0,
+      senderMatches: targets.length,
+      archiveMessage: false,
+      archiveMatches: 0,
+    }
   }
 
   const targets: ReferenceTarget[] = []
@@ -634,7 +759,13 @@ async function referenceTargets(input: {
     if (target) targets.push(target)
     else invalidReferences += 1
   }
-  return { targets, invalidReferences, senderMatches: 0 }
+  return {
+    targets,
+    invalidReferences,
+    senderMatches: 0,
+    archiveMessage,
+    archiveMatches: 0,
+  }
 }
 
 function interactionRelations(record: CrmReferenceRecord) {
@@ -669,14 +800,52 @@ function interactionSourceKey(ownerEmail: string, messageId: string, referenceCo
   return `gmail:inbound:${digest}`
 }
 
-async function completedLinks(inboundMessageId: string): Promise<Set<string>> {
+async function completedLinks(inboundMessageId: string): Promise<Map<string, string>> {
   const result = await query<{ reference_code: string; interaction_id: string | null }>(
     `SELECT reference_code, interaction_id::text
      FROM crm_inbound_message_links
      WHERE inbound_message_id = $1::uuid`,
     [inboundMessageId],
   )
-  return new Set(result.rows.filter((row) => row.interaction_id).map((row) => row.reference_code))
+  return new Map(result.rows.flatMap((row) => (
+    row.interaction_id ? [[row.reference_code, row.interaction_id] as const] : []
+  )))
+}
+
+type ReferenceTargetGroup = {
+  primary: ReferenceTarget
+  targets: ReferenceTarget[]
+}
+
+const TARGET_PRIORITY: Record<CrmReferenceRecord['entity'], number> = {
+  contacts: 0,
+  leads: 1,
+  opportunities: 2,
+  meetings: 3,
+  campaigns: 4,
+  organizations: 5,
+  interactions: 6,
+}
+
+function groupReferenceTargets(targets: ReferenceTarget[]): ReferenceTargetGroup[] {
+  const unique = Array.from(new Map(targets.map((target) => (
+    [`${target.pipelineId}:${target.record.referenceCode}`, target] as const
+  ))).values())
+  const organizations = unique.filter((target) => target.record.entity === 'organizations')
+  const groups = unique
+    .filter((target) => target.record.entity !== 'organizations')
+    .sort((left, right) => TARGET_PRIORITY[left.record.entity] - TARGET_PRIORITY[right.record.entity])
+    .map((primary) => ({ primary, targets: [primary] }))
+
+  for (const organization of organizations) {
+    const related = groups.filter((group) => (
+      group.primary.pipelineId === organization.pipelineId
+      && group.primary.record.organizationId === organization.record.id
+    ))
+    if (related.length === 1) related[0].targets.push(organization)
+    else groups.push({ primary: organization, targets: [organization] })
+  }
+  return groups
 }
 
 async function stageInboundInteraction(input: {
@@ -684,7 +853,8 @@ async function stageInboundInteraction(input: {
   inboundMessage: StoredInboundMessage
   message: ParsedGmailMessage
   target: ReferenceTarget
-}): Promise<{ interactionId: string; linked: number }> {
+  relatedReferences: string[]
+}): Promise<string> {
   const referenceCode = input.target.record.referenceCode
   const relations = interactionRelations(input.target.record)
   const description = (input.message.bodyText || input.message.snippet || 'Inbound email received.')
@@ -698,6 +868,7 @@ async function stageInboundInteraction(input: {
       source: 'gmail-inbound',
       matchedBy: input.target.matchedBy,
       referenceCode,
+      relatedReferences: input.relatedReferences,
     },
     fields: {
       ...relations,
@@ -715,10 +886,20 @@ async function stageInboundInteraction(input: {
         inboundMessageId: input.inboundMessage.id,
         matchedBy: input.target.matchedBy,
         referenceCode,
+        relatedReferences: input.relatedReferences,
       },
     },
   })
 
+  return staged.id
+}
+
+async function linkInboundTarget(input: {
+  inboundMessageId: string
+  target: ReferenceTarget
+  interactionId: string
+}): Promise<number> {
+  const referenceCode = input.target.record.referenceCode
   const aggregateType = `crm_${input.target.record.entity}`
   const linked = await query(
     `INSERT INTO crm_inbound_message_links (
@@ -738,29 +919,37 @@ async function stageInboundInteraction(input: {
        EXCLUDED.aggregate_id,
        EXCLUDED.interaction_id
      )`,
-    [input.inboundMessage.id, referenceCode, aggregateType, input.target.record.id, staged.id],
+    [input.inboundMessageId, referenceCode, aggregateType, input.target.record.id, input.interactionId],
   )
+  return linked.rowCount || 0
+}
 
+async function updateInboundMessagePrimary(input: {
+  inboundMessageId: string
+  interactionId: string
+  target: ReferenceTarget
+}): Promise<void> {
+  const relations = interactionRelations(input.target.record)
   await query(
     `UPDATE crm_inbound_messages SET
        interaction_id = COALESCE(interaction_id, $2::uuid),
-       organization_id = CASE WHEN interaction_id IS NULL THEN $3::uuid ELSE organization_id END,
-       contact_id = CASE WHEN interaction_id IS NULL THEN $4::uuid ELSE contact_id END,
-       lead_id = CASE WHEN interaction_id IS NULL THEN $5::uuid ELSE lead_id END
+       organization_id = COALESCE(organization_id, $3::uuid),
+       contact_id = COALESCE(contact_id, $4::uuid),
+       lead_id = COALESCE(lead_id, $5::uuid)
      WHERE id = $1::uuid`,
     [
-      input.inboundMessage.id,
-      staged.id,
+      input.inboundMessageId,
+      input.interactionId,
       relations.organizationId,
       relations.contactId,
       relations.leadId,
     ],
   )
-  return { interactionId: staged.id, linked: linked.rowCount || 0 }
 }
 
 async function processMessage(input: {
   ownerEmail: string
+  mailboxEmail?: string | null
   defaultPipelineId: string
   ownedPipelines: OwnedPipeline[]
   message: ParsedGmailMessage
@@ -771,6 +960,8 @@ async function processMessage(input: {
     message: input.message,
   })
   const resolved = await referenceTargets({
+    ownerEmail: input.ownerEmail,
+    mailboxEmail: input.mailboxEmail,
     defaultPipelineId: input.defaultPipelineId,
     ownedPipelines: input.ownedPipelines,
     message: input.message,
@@ -779,17 +970,33 @@ async function processMessage(input: {
   let interactions = 0
   let links = 0
 
-  for (const target of resolved.targets) {
-    if (existingLinks.has(target.record.referenceCode)) continue
-    const result = await stageInboundInteraction({
+  for (const group of groupReferenceTargets(resolved.targets)) {
+    const relatedReferences = group.targets.map((target) => target.record.referenceCode)
+    const existingInteractionId = relatedReferences
+      .map((referenceCode) => existingLinks.get(referenceCode))
+      .find((interactionId): interactionId is string => Boolean(interactionId))
+    const interactionId = existingInteractionId || await stageInboundInteraction({
       ownerEmail: input.ownerEmail,
       inboundMessage,
       message: input.message,
-      target,
+      target: group.primary,
+      relatedReferences,
     })
-    interactions += 1
-    links += result.linked
-    existingLinks.add(target.record.referenceCode)
+    if (!existingInteractionId) interactions += 1
+    await updateInboundMessagePrimary({
+      inboundMessageId: inboundMessage.id,
+      interactionId,
+      target: group.primary,
+    })
+    for (const target of group.targets) {
+      if (existingLinks.has(target.record.referenceCode)) continue
+      links += await linkInboundTarget({
+        inboundMessageId: inboundMessage.id,
+        target,
+        interactionId,
+      })
+      existingLinks.set(target.record.referenceCode, interactionId)
+    }
   }
 
   return {
@@ -797,6 +1004,8 @@ async function processMessage(input: {
     markerReferences: input.message.markerReferences.length,
     invalidReferences: resolved.invalidReferences,
     senderMatches: resolved.senderMatches,
+    archiveMessage: resolved.archiveMessage,
+    archiveMatches: resolved.archiveMatches,
     unmatched: resolved.targets.length === 0,
     interactions,
     links,
@@ -829,6 +1038,8 @@ function newCounts(activeMailboxes: number): EmailIngestionCounts {
     markerReferences: 0,
     invalidReferences: 0,
     senderMatches: 0,
+    archiveMessages: 0,
+    archiveMatches: 0,
     unmatchedMessages: 0,
     interactions: 0,
     links: 0,
@@ -877,6 +1088,7 @@ async function pollMailbox(mailbox: SelectedMailbox, counts: EmailIngestionCount
         counts.messagesFetched += 1
         const processed = await processMessage({
           ownerEmail: mailbox.owner_email,
+          mailboxEmail: mailbox.account_email,
           defaultPipelineId: pipeline.id,
           ownedPipelines: pipelines,
           message,
@@ -886,6 +1098,8 @@ async function pollMailbox(mailbox: SelectedMailbox, counts: EmailIngestionCount
         counts.markerReferences += processed.markerReferences
         counts.invalidReferences += processed.invalidReferences
         counts.senderMatches += processed.senderMatches
+        if (processed.archiveMessage) counts.archiveMessages += 1
+        counts.archiveMatches += processed.archiveMatches
         if (processed.unmatched) counts.unmatchedMessages += 1
         counts.interactions += processed.interactions
         counts.links += processed.links

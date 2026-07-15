@@ -755,13 +755,16 @@ async function bindAttemptConnection(action: LeasedCrmIntegrationAction, connect
   if (result.rowCount !== 1) throw new Error('CRM action lease was lost')
 }
 
-async function selectedMatonConnection(action: LeasedCrmIntegrationAction, app: string): Promise<string> {
-  const { connectionId } = await resolveUserMatonGatewayCredential({
+async function selectedMatonConnection(
+  action: LeasedCrmIntegrationAction,
+  app: string,
+): Promise<{ connectionId: string; accountEmail: string | null }> {
+  const { connectionId, accountEmail } = await resolveUserMatonGatewayCredential({
     ownerEmail: action.actorEmail,
     app,
   })
   await bindAttemptConnection(action, connectionId)
-  return connectionId
+  return { connectionId, accountEmail }
 }
 
 async function recordAttemptSucceeded(
@@ -945,24 +948,28 @@ function encodedHeader(value: string): string {
   return `=?UTF-8?B?${Buffer.from(value, 'utf8').toString('base64')}?=`
 }
 
-function crmReplyMarker(referenceCode: string): string {
-  return `%gslt${normalizeReference(referenceCode)}`
+function crmReplyMarkers(referenceCodes: string[]): string[] {
+  return Array.from(new Set(referenceCodes.map((referenceCode) => (
+    `%gslt${normalizeReference(referenceCode)}`
+  ))))
 }
 
-function appendTextReplyMarker(value: string, referenceCode: string): string {
-  const marker = crmReplyMarker(referenceCode)
+function appendTextReplyMarkers(value: string, referenceCodes: string[]): string {
+  const markers = crmReplyMarkers(referenceCodes)
   const withoutDuplicates = value
     .replace(CRM_REPLY_MARKER_PATTERN, '')
     .trimEnd()
-  return `${withoutDuplicates}${withoutDuplicates ? '\r\n\r\n' : ''}${marker}`
+  return `${withoutDuplicates}${withoutDuplicates ? '\r\n\r\n' : ''}${markers.join('\r\n')}`
 }
 
-function appendHtmlReplyMarker(value: string, referenceCode: string): string {
-  const marker = crmReplyMarker(referenceCode)
+function appendHtmlReplyMarkers(value: string, referenceCodes: string[]): string {
+  const references = Array.from(new Set(referenceCodes.map(normalizeReference)))
   const withoutDuplicates = value
     .replace(CRM_REPLY_MARKER_PATTERN, '')
     .trimEnd()
-  const markerElement = `<div data-clawpilot-crm-reference="${normalizeReference(referenceCode)}">${marker}</div>`
+  const markerElement = references.map((referenceCode) => (
+    `<div data-clawpilot-crm-reference="${referenceCode}">%gslt${referenceCode}</div>`
+  )).join('')
   const closingBody = withoutDuplicates.match(/<\/body\s*>/i)
   if (!closingBody || closingBody.index === undefined) {
     const closingHtml = withoutDuplicates.match(/<\/html\s*>/i)
@@ -972,6 +979,27 @@ function appendHtmlReplyMarker(value: string, referenceCode: string): string {
     return `${withoutDuplicates}${withoutDuplicates ? '\n' : ''}${markerElement}`
   }
   return `${withoutDuplicates.slice(0, closingBody.index)}${markerElement}\n${withoutDuplicates.slice(closingBody.index)}`
+}
+
+async function outboundEmailReferenceCodes(
+  action: LeasedCrmIntegrationAction,
+  target: CrmReferenceRecord,
+): Promise<string[]> {
+  const references = [normalizeReference(target.referenceCode)]
+  if (target.entity !== 'contacts' || !target.organizationId) return references
+  const organization = await query<{ reference_code: string }>(
+    `SELECT reference_code
+     FROM crm_organizations
+     WHERE pipeline_id = $1::uuid AND id = $2::uuid
+     LIMIT 1`,
+    [action.pipelineId, target.organizationId],
+  )
+  const organizationReference = organization.rows[0]?.reference_code
+  if (!organizationReference) {
+    throw new PermanentCrmIntegrationActionError('Contact organization is no longer available')
+  }
+  references.push(normalizeReference(organizationReference))
+  return Array.from(new Set(references))
 }
 
 function gmailMessage(input: {
@@ -1110,14 +1138,17 @@ async function sendEmailAction(action: LeasedCrmIntegrationAction, target: CrmRe
   const subject = requiredString(action.payload.subject, 300, 'Email subject')
   const text = requiredString(action.payload.text, 100_000, 'Email body')
   const html = cleanString(action.payload.html, 100_000, 'Email HTML body') || undefined
-  const referenceCode = normalizeReference(action.referenceCode)
-  const messageText = appendTextReplyMarker(text, referenceCode)
-  const messageHtml = html ? appendHtmlReplyMarker(html, referenceCode) : undefined
+  const markerReferences = await outboundEmailReferenceCodes(action, target)
+  const messageText = appendTextReplyMarkers(text, markerReferences)
+  const messageHtml = html ? appendHtmlReplyMarkers(html, markerReferences) : undefined
 
   let messageId = action.externalId
   let threadId = typeof action.responseSummary.threadId === 'string' ? action.responseSummary.threadId : null
+  let senderEmail = typeof action.responseSummary.senderEmail === 'string'
+    ? normalizeEmail(action.responseSummary.senderEmail, 'Recorded Gmail sender')
+    : null
   if (!messageId) {
-    const connectionId = await selectedMatonConnection(action, 'google-mail')
+    const { connectionId } = await selectedMatonConnection(action, 'google-mail')
     const profile = await matonJson(
       action,
       'google-mail',
@@ -1125,7 +1156,7 @@ async function sendEmailAction(action: LeasedCrmIntegrationAction, target: CrmRe
       '/google-mail/gmail/v1/users/me/profile',
       { headers: { Accept: 'application/json' } },
     )
-    const sender = normalizeEmail(profile.emailAddress, 'Selected Gmail profile')
+    senderEmail = normalizeEmail(profile.emailAddress, 'Selected Gmail profile')
     const delivered = await matonJson(
       action,
       'google-mail',
@@ -1136,7 +1167,7 @@ async function sendEmailAction(action: LeasedCrmIntegrationAction, target: CrmRe
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           raw: base64Url(gmailMessage({
-            sender,
+            sender: senderEmail,
             recipient,
             subject,
             text: messageText,
@@ -1150,7 +1181,7 @@ async function sendEmailAction(action: LeasedCrmIntegrationAction, target: CrmRe
     if (!messageId) throw new Error('google-mail provider returned no message ID')
     threadId = cleanString(delivered.threadId, 1000, 'Gmail thread ID') || null
   }
-  const summary = { messageId, threadId }
+  const summary = { messageId, threadId, senderEmail, markerReferences }
   await recordAttemptSucceeded(action, messageId, summary)
   await stageActionInteraction({
     action,
@@ -1168,7 +1199,8 @@ async function sendEmailAction(action: LeasedCrmIntegrationAction, target: CrmRe
 async function stageCalendarMeeting(
   action: LeasedCrmIntegrationAction,
   target: CrmReferenceRecord,
-  result: { eventId: string; eventUrl: string | null; joinUrl: string | null },
+  result: { eventId: string | null; eventUrl: string | null; joinUrl: string | null },
+  status: 'queued' | 'scheduled',
 ) {
   let organizationId = target.entity === 'organizations' ? target.id : target.organizationId
   let contactId = target.entity === 'contacts' ? target.id : null
@@ -1266,7 +1298,7 @@ async function stageCalendarMeeting(
       timezone: normalizeTimezone(action.payload.timezone),
       location: cleanString(action.payload.location, 1000, 'Calendar event location'),
       attendeeEmails: normalizeEmailList(action.payload.attendeeEmails),
-      status: 'scheduled',
+      status,
       provider: 'maton',
       externalEventId: result.eventId,
       externalEventUrl: result.eventUrl,
@@ -1275,8 +1307,20 @@ async function stageCalendarMeeting(
   })
 }
 
-function calendarEventIdForAction(actionId: string): string {
-  return actionId.replace(/-/g, '').toLowerCase()
+function calendarEventIdForMeeting(referenceCode: string): string {
+  const normalized = normalizeReference(referenceCode)
+  if (!/^gm[0-9]{7}$/.test(normalized)) {
+    throw new PermanentCrmIntegrationActionError('Calendar event requires a meeting reference')
+  }
+  return normalized
+}
+
+function meetingCalendarDescription(description: string, referenceCode: string, shortUrl: string): string {
+  const managedBoundary = '\n\n---\nClawPilot meeting:'
+  const existingBoundary = description.indexOf(managedBoundary)
+  const operatorDescription = (existingBoundary >= 0 ? description.slice(0, existingBoundary) : description).trimEnd()
+  const footer = `ClawPilot meeting: ${shortUrl}\nClawPilot ID: ${normalizeReference(referenceCode)}`
+  return `${operatorDescription}${operatorDescription ? '\n\n---\n' : ''}${footer}`
 }
 
 async function existingCalendarEvent(pipelineId: string, target: CrmReferenceRecord) {
@@ -1303,22 +1347,55 @@ async function createCalendarEventAction(action: LeasedCrmIntegrationAction, tar
   const location = cleanString(action.payload.location, 1000, 'Calendar event location')
   const attendeeEmails = normalizeEmailList(action.payload.attendeeEmails)
 
-  const currentEvent = await existingCalendarEvent(action.pipelineId, target)
+  const provisionalMeeting = await stageCalendarMeeting(
+    action,
+    target,
+    { eventId: null, eventUrl: null, joinUrl: null },
+    'queued',
+  )
+  const meetingTarget = await readCrmRecordByReference({
+    pipelineId: action.pipelineId,
+    referenceCode: provisionalMeeting.referenceCode,
+  })
+  const meetingUrl = safeHttpsUrl(provisionalMeeting.shortUrl)
+  if (!meetingUrl) throw new PermanentCrmIntegrationActionError('CRM meeting short link is unavailable')
+  const currentEvent = await existingCalendarEvent(action.pipelineId, meetingTarget)
   let eventId = action.externalId
   let eventUrl = safeHttpsUrl(action.responseSummary.eventUrl) || safeHttpsUrl(currentEvent?.external_event_url)
   let joinUrl = safeHttpsUrl(action.responseSummary.joinUrl) || safeHttpsUrl(currentEvent?.join_url)
+  let organizerEmail = typeof action.responseSummary.organizerEmail === 'string'
+    ? normalizeEmail(action.responseSummary.organizerEmail, 'Recorded Calendar organizer')
+    : null
   if (!eventId) {
-    const connectionId = await selectedMatonConnection(action, 'google-calendar')
+    const selectedConnection = await selectedMatonConnection(action, 'google-calendar')
+    const { connectionId } = selectedConnection
+    organizerEmail = selectedConnection.accountEmail
+      ? normalizeEmail(selectedConnection.accountEmail, 'Selected Calendar account')
+      : null
     const existingEventId = cleanString(currentEvent?.external_event_id, 1000, 'Calendar event ID')
-    const requestedEventId = existingEventId || calendarEventIdForAction(action.id)
+    const requestedEventId = existingEventId || calendarEventIdForMeeting(provisionalMeeting.referenceCode)
     const eventBody = {
-      ...(!existingEventId ? { id: requestedEventId } : {}),
+      ...(!existingEventId ? {
+        id: requestedEventId,
+        conferenceData: {
+          createRequest: {
+            requestId: `clawpilot-${provisionalMeeting.referenceCode}`,
+            conferenceSolutionKey: { type: 'hangoutsMeet' },
+          },
+        },
+      } : {}),
       summary: subject,
-      description: description || undefined,
+      description: meetingCalendarDescription(description, provisionalMeeting.referenceCode, meetingUrl),
       location: location || undefined,
       start: { dateTime: startsAt, timeZone: timezone },
       end: { dateTime: endsAt, timeZone: timezone },
       attendees: attendeeEmails.map((email) => ({ email })),
+      extendedProperties: {
+        private: {
+          clawpilotMeetingReference: provisionalMeeting.referenceCode,
+          clawpilotPipelineId: action.pipelineId,
+        },
+      },
     }
     let delivered: JsonObject
     if (existingEventId) {
@@ -1326,7 +1403,7 @@ async function createCalendarEventAction(action: LeasedCrmIntegrationAction, tar
         action,
         'google-calendar',
         connectionId,
-        `/google-calendar/calendar/v3/calendars/primary/events/${encodeURIComponent(existingEventId)}?sendUpdates=all`,
+        `/google-calendar/calendar/v3/calendars/primary/events/${encodeURIComponent(existingEventId)}?conferenceDataVersion=1&sendUpdates=all`,
         {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
@@ -1339,7 +1416,7 @@ async function createCalendarEventAction(action: LeasedCrmIntegrationAction, tar
           action,
           'google-calendar',
           connectionId,
-          '/google-calendar/calendar/v3/calendars/primary/events?sendUpdates=all',
+          '/google-calendar/calendar/v3/calendars/primary/events?conferenceDataVersion=1&sendUpdates=all',
           {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -1362,9 +1439,21 @@ async function createCalendarEventAction(action: LeasedCrmIntegrationAction, tar
     eventUrl = safeHttpsUrl(delivered.htmlLink) || eventUrl
     joinUrl = safeHttpsUrl(delivered.hangoutLink) || joinUrl
   }
-  const summary = { eventId, eventUrl, joinUrl }
+  const summary = {
+    eventId,
+    eventUrl,
+    joinUrl,
+    meetingReferenceCode: provisionalMeeting.referenceCode,
+    meetingUrl,
+    organizerEmail,
+  }
   await recordAttemptSucceeded(action, eventId, summary)
-  const meeting = await stageCalendarMeeting(action, target, { eventId, eventUrl, joinUrl })
+  const meeting = await stageCalendarMeeting(
+    action,
+    meetingTarget,
+    { eventId, eventUrl, joinUrl },
+    'scheduled',
+  )
   await stageActionInteraction({
     action,
     target,

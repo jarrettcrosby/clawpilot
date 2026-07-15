@@ -1,7 +1,9 @@
 import crypto from 'node:crypto'
 import { NextRequest, NextResponse } from 'next/server'
+import { processCalendarIngestion } from '@/lib/crm/calendarIngestion'
 import { processInboundGmailIngestion } from '@/lib/crm/emailIngestion'
 import { processDueCrmIntegrationActions } from '@/lib/crm/integrationActions'
+import { processSuiteCrmMeetingIngestion } from '@/lib/crm/suiteCrmMeetingIngestion'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 
 export const dynamic = 'force-dynamic'
@@ -36,6 +38,7 @@ export async function POST(req: NextRequest) {
   }
   try {
     const body = await req.json().catch(() => ({})) as { limit?: unknown }
+    const suiteCrmMeetingIngestion = await processSuiteCrmMeetingIngestion()
     const results = await processDueCrmIntegrationActions({ limit: boundedLimit(body.limit) })
     const actions = {
       claimed: results.length,
@@ -46,7 +49,14 @@ export async function POST(req: NextRequest) {
       cancelled: results.filter((action) => action.status === 'cancelled').length,
     }
     const ingestion = await processInboundGmailIngestion()
-    return NextResponse.json({ ok: true, actions, ingestion })
+    const calendarIngestion = await processCalendarIngestion()
+    return NextResponse.json({
+      ok: true,
+      actions,
+      ingestion,
+      calendarIngestion,
+      suiteCrmMeetingIngestion,
+    })
   } catch {
     return NextResponse.json(
       { ok: false, error: 'CRM integration processing failed' },

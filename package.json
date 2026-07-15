@@ -29,6 +29,7 @@
     "db:inspect": "node scripts/db-inspect-persistence.mjs",
     "db:import:tasks": "node scripts/db-import-tasks.mjs",
     "db:import:threads": "node scripts/db-import-threads.mjs",
+    "crm:backfill-suitecrm": "node scripts/backfill-suitecrm-global-ids.mjs",
     "release:record": "node scripts/record-release.mjs",
     "mail:verify": "node scripts/verify-mail-sender.mjs",
     "check": "npm run lint && npm run build && npm run test && npm run verify:predeploy"

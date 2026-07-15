@@ -1,6 +1,7 @@
 import crypto from 'node:crypto'
 import { NextRequest, NextResponse } from 'next/server'
 import { CRM_ENTITIES, type CrmEntity } from '@/lib/crm/types'
+import { enqueueCrmIntegrationAction } from '@/lib/crm/integrationActions'
 import {
   ensurePipelineCrmHierarchy,
   ensurePipelineCrmReferenceLinks,
@@ -13,6 +14,7 @@ import {
 import { listWorkspaceOrganizationHierarchy } from '@/lib/organizations'
 import { suiteCrmAdminPortalUrl, suiteCrmAdminUsername } from '@/lib/crm/suiteCrmPublicUrl'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
+import { readMatonCredentialStateFromPostgres } from '@/lib/persistence/matonCredentials'
 import { requireRequestUser } from '@/lib/requestUser'
 import {
   PIPELINE_SELECTION_COOKIE,
@@ -88,7 +90,7 @@ export async function GET(req: NextRequest) {
     const canOpenSuiteCrm = actor.role === 'owner' || actor.role === 'admin'
     await syncAppUserProfileToCrm({ email: pipeline.ownerEmail, pipelineId: pipeline.id })
     await ensurePipelineCrmReferenceLinks(pipeline.id)
-    const [records, summary, workspaceHierarchy] = await Promise.all([
+    const [records, summary, workspaceHierarchy, matonCredential] = await Promise.all([
       listCrmRecordsInPostgres({
         pipelineId: pipeline.id,
         entity,
@@ -97,7 +99,13 @@ export async function GET(req: NextRequest) {
       }),
       readCrmSummaryFromPostgres(pipeline.id),
       listWorkspaceOrganizationHierarchy(actor.email),
+      readMatonCredentialStateFromPostgres(actor.email),
     ])
+    const selectedProviderEmail = (app: string) => matonCredential.connections.find((connection) => (
+      connection.app === app
+      && connection.status === 'ACTIVE'
+      && connection.selected
+    ))?.accountEmail || null
     return NextResponse.json({
       ok: true,
       entity,
@@ -113,6 +121,10 @@ export async function GET(req: NextRequest) {
       },
       workspaceHierarchy,
       canManageHierarchy: actor.role === 'owner' || actor.role === 'admin',
+      providerIdentities: {
+        googleMail: selectedProviderEmail('google-mail'),
+        googleCalendar: selectedProviderEmail('google-calendar'),
+      },
       suiteCrmPunchoutUrl: canOpenSuiteCrm ? '/api/crm/punchout' : null,
       suiteCrmUsername: canOpenSuiteCrm ? suiteCrmAdminUsername() : null,
       suiteCrmAdminPortalUrl: canOpenSuiteCrm ? suiteCrmAdminPortalUrl() : null,
@@ -266,6 +278,11 @@ export async function POST(req: NextRequest) {
             : resolvedOrganization?.suiteCrmId
               ? 'Accounts' as const
               : undefined
+      const meetingTimezone = timezoneValue(fields.timezone)
+      const meetingAttendees = emailList(fields.attendeeEmails)
+      const meetingStatus = ['planned', 'queued', 'scheduled', 'completed', 'cancelled', 'failed'].includes(String(fields.status))
+        ? fields.status as 'planned' | 'queued' | 'scheduled' | 'completed' | 'cancelled' | 'failed'
+        : 'planned'
       const staged = await stageCrmRecordInPostgres({
         entity, pipelineId: pipeline.id, localId: current?.id, sourceKey, actorEmail: actor.email,
         sourcePayload: { source: 'clawpilot' },
@@ -275,16 +292,37 @@ export async function POST(req: NextRequest) {
           contactId: contact?.id || null, leadId: lead?.id || null, opportunityId: opportunity?.id || null,
           parentSuiteCrmId, parentSuiteCrmType, subject,
           description: stringValue(fields.description, 10_000), startsAt, endsAt,
-          timezone: timezoneValue(fields.timezone), location: stringValue(fields.location, 500),
-          attendeeEmails: emailList(fields.attendeeEmails),
-          status: ['planned', 'queued', 'scheduled', 'completed', 'cancelled', 'failed'].includes(String(fields.status))
-            ? fields.status as 'planned' | 'queued' | 'scheduled' | 'completed' | 'cancelled' | 'failed'
-            : 'planned',
+          timezone: meetingTimezone, location: stringValue(fields.location, 500),
+          attendeeEmails: meetingAttendees,
+          status: meetingStatus,
           provider: stringValue(fields.provider, 100), externalEventId: stringValue(fields.externalEventId, 500) || null,
           externalEventUrl: stringValue(fields.externalEventUrl, 2000) || null, joinUrl: stringValue(fields.joinUrl, 2000) || null,
         },
       })
-      return NextResponse.json({ ok: true, queued: true, record: staged }, { status: body?.id ? 200 : 201 })
+      const calendarAction = meetingStatus === 'cancelled'
+        ? null
+        : await enqueueCrmIntegrationAction({
+          pipelineId: pipeline.id,
+          actorEmail: actor.email,
+          actionType: 'create_calendar_event',
+          referenceCode: staged.referenceCode,
+          payload: {
+            subject,
+            description: stringValue(fields.description, 10_000),
+            startsAt,
+            endsAt,
+            timezone: meetingTimezone,
+            location: stringValue(fields.location, 500),
+            attendeeEmails: meetingAttendees,
+          },
+          idempotencyKey: `crm:meeting-calendar-sync:${staged.referenceCode}:${staged.sourceHash}`,
+        })
+      return NextResponse.json({
+        ok: true,
+        queued: true,
+        record: staged,
+        calendarAction: calendarAction?.action || null,
+      }, { status: body?.id ? 200 : 201 })
     }
 
     if (entity === 'campaigns') {

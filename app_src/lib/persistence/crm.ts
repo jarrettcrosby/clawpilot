@@ -265,10 +265,12 @@ function suiteCrmDateTime(value: unknown) {
   return isoTimestamp(value)?.replace('T', ' ').replace(/\.\d{3}Z$/, '') || null
 }
 
-function suiteCrmAttributes(input: StageCrmRecordInput) {
+function suiteCrmAttributes(input: StageCrmRecordInput, referenceCode: string) {
+  const globalId = { global_id_c: referenceCode }
   if (input.entity === 'organizations') {
     const fields = input.fields
     return {
+      ...globalId,
       name: clean(fields.name),
       account_type: clean(fields.accountType),
       website: clean(fields.website),
@@ -286,6 +288,7 @@ function suiteCrmAttributes(input: StageCrmRecordInput) {
   if (input.entity === 'contacts') {
     const fields = input.fields
     return {
+      ...globalId,
       first_name: clean(fields.firstName),
       last_name: clean(fields.lastName) || clean(fields.fullName),
       title: clean(fields.jobTitle),
@@ -304,6 +307,7 @@ function suiteCrmAttributes(input: StageCrmRecordInput) {
   if (input.entity === 'leads') {
     const fields = input.fields
     return {
+      ...globalId,
       first_name: clean(fields.firstName),
       last_name: clean(fields.lastName) || clean(fields.fullName),
       account_name: clean(fields.companyName),
@@ -319,6 +323,7 @@ function suiteCrmAttributes(input: StageCrmRecordInput) {
   if (input.entity === 'opportunities') {
     const fields = input.fields
     return {
+      ...globalId,
       name: clean(fields.name),
       account_id: clean(fields.organizationSuiteCrmId),
       sales_stage: clean(fields.stage),
@@ -337,6 +342,7 @@ function suiteCrmAttributes(input: StageCrmRecordInput) {
       ? Math.max(1, Math.round((endsAt.getTime() - startsAt.getTime()) / 60_000))
       : 30
     return {
+      ...globalId,
       name: clean(fields.subject),
       date_start: suiteCrmDateTime(fields.startsAt),
       duration_hours: Math.floor(duration / 60),
@@ -352,6 +358,7 @@ function suiteCrmAttributes(input: StageCrmRecordInput) {
     const fields = input.fields
     const status = clean(fields.status)
     return {
+      ...globalId,
       name: clean(fields.name),
       campaign_type: 'Email',
       status: status === 'sent' ? 'Complete' : status === 'draft' ? 'Planning' : status === 'paused' ? 'Inactive' : 'Active',
@@ -363,6 +370,7 @@ function suiteCrmAttributes(input: StageCrmRecordInput) {
   }
   const fields = input.fields
   return {
+    ...globalId,
     name: clean(fields.subject),
     parent_type: fields.parentSuiteCrmId ? clean(fields.parentSuiteCrmType) : '',
     parent_id: clean(fields.parentSuiteCrmId),
@@ -370,19 +378,63 @@ function suiteCrmAttributes(input: StageCrmRecordInput) {
   }
 }
 
+async function suiteCrmRelationships(
+  client: PoolClient,
+  input: StageCrmRecordInput,
+): Promise<NonNullable<SuiteCrmOutboxRecord['relationships']>> {
+  if (input.entity !== 'meetings') return []
+  const fields = input.fields
+  const result = await client.query<{
+    link_field_name: 'accounts' | 'contacts' | 'leads' | 'opportunity'
+    related_module_name: 'Accounts' | 'Contacts' | 'Leads' | 'Opportunities'
+    related_bean_id: string
+  }>(
+    `SELECT 'accounts'::text AS link_field_name, 'Accounts'::text AS related_module_name, suitecrm_id AS related_bean_id
+     FROM crm_organizations
+     WHERE pipeline_id = $1::uuid AND id = $2::uuid AND suitecrm_id IS NOT NULL
+     UNION ALL
+     SELECT 'contacts', 'Contacts', suitecrm_id
+     FROM crm_contacts
+     WHERE pipeline_id = $1::uuid AND id = $3::uuid AND suitecrm_id IS NOT NULL
+     UNION ALL
+     SELECT 'leads', 'Leads', suitecrm_id
+     FROM crm_leads
+     WHERE pipeline_id = $1::uuid AND id = $4::uuid AND suitecrm_id IS NOT NULL
+     UNION ALL
+     SELECT 'opportunity', 'Opportunities', suitecrm_id
+     FROM crm_opportunities
+     WHERE pipeline_id = $1::uuid AND id = $5::uuid AND suitecrm_id IS NOT NULL`,
+    [
+      input.pipelineId,
+      fields.organizationId || null,
+      fields.contactId || null,
+      fields.leadId || null,
+      fields.opportunityId || null,
+    ],
+  )
+  return result.rows.map((row) => ({
+    linkFieldName: row.link_field_name,
+    relatedModuleName: row.related_module_name,
+    relatedBeanId: row.related_bean_id,
+  }))
+}
+
 async function enqueueSuiteCrmRecord(
   client: PoolClient,
   input: StageCrmRecordInput,
   localId: string,
   suiteCrmId: string,
+  referenceCode: string,
   sourceHash: string,
 ) {
+  const relationships = await suiteCrmRelationships(client, input)
   const payload: SuiteCrmOutboxRecord = {
     entity: input.entity,
     pipelineId: input.pipelineId,
     localId,
     suiteCrmId,
-    attributes: suiteCrmAttributes(input),
+    attributes: suiteCrmAttributes(input, referenceCode),
+    ...(relationships.length > 0 ? { relationships } : {}),
   }
   await client.query(
     `
@@ -395,7 +447,12 @@ async function enqueueSuiteCrmRecord(
       WHERE idempotency_key IS NOT NULL
       DO UPDATE SET updated_at = sync_outbox.updated_at
     `,
-    [`crm_${input.entity}`, localId, JSON.stringify(payload), `crm:${input.entity}:${localId}:${sourceHash}`],
+    [
+      `crm_${input.entity}`,
+      localId,
+      JSON.stringify(payload),
+      `crm:${input.entity}:v3:${localId}:${sourceHash}`,
+    ],
   )
 }
 
@@ -1051,7 +1108,7 @@ export async function stageCrmRecordInPostgres(input: StageCrmRecordInput) {
         row = await stageInteraction(client, input, suiteCrmId, sourceHash)
         break
     }
-    await enqueueSuiteCrmRecord(client, input, row.id, row.suitecrm_id, sourceHash)
+    await enqueueSuiteCrmRecord(client, input, row.id, row.suitecrm_id, row.reference_code, sourceHash)
     const title = clean('name' in input.fields ? input.fields.name : 'fullName' in input.fields
       ? input.fields.fullName : 'subject' in input.fields ? input.fields.subject : row.reference_code)
     const shortUrl = await ensureCrmReferenceShortLink(client, {
