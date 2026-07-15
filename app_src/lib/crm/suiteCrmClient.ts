@@ -266,7 +266,7 @@ export async function upsertSuiteCrmRecord(
   if (id !== record.suiteCrmId) throw new Error('SuiteCRM returned an unexpected record ID')
   for (const relationship of record.relationships || []) {
     const linkFieldName = relationship.linkFieldName
-    if (!['accounts', 'contacts', 'leads', 'opportunity'].includes(linkFieldName)) {
+    if (!['accounts', 'contact', 'contacts', 'leads', 'opportunity'].includes(linkFieldName)) {
       throw new Error('SuiteCRM relationship link field is invalid')
     }
     const path = `/Api/V8/module/${moduleName}/${encodeURIComponent(record.suiteCrmId)}/relationships/${linkFieldName}`

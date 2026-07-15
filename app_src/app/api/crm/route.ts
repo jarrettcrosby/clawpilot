@@ -98,6 +98,7 @@ export async function GET(req: NextRequest) {
         entity,
         query: req.nextUrl.searchParams.get('query') || '',
         limit: Number(req.nextUrl.searchParams.get('limit') || 250),
+        needsReview: req.nextUrl.searchParams.get('needsReview') === 'true',
       }),
       readCrmSummaryFromPostgres(pipeline.id),
       listWorkspaceOrganizationHierarchy(actor.email),

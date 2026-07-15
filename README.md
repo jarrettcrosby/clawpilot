@@ -1,6 +1,6 @@
 # ClawPilot
 
-ClawPilot is a private command center for project boards, pipeline activity, working documents, releases, and task-linked AI agents.
+ClawPilot is a private command center for project boards, CRM and pipeline activity, working documents, releases, short links, integrations, and task-linked AI agents.
 
 - Canonical repository: `jarrettcrosby/clawpilot`
 - Active development branch: `dev`
@@ -40,7 +40,7 @@ npm run build
 npm run test
 ```
 
-Use the full local gate before promotion or any GitHub push candidate:
+Use the full local gate before a promotion candidate:
 
 ```bash
 npm run verify:regression
@@ -50,6 +50,12 @@ CI-safe predeploy verification:
 
 ```bash
 npm run verify:predeploy
+```
+
+Documentation catalog verification:
+
+```bash
+npm run verify:docs
 ```
 
 Run Railway Postgres migrations after `DATABASE_URL` is configured:
@@ -63,9 +69,14 @@ npm run db:migrate
 - `app_src/` - Next.js application, API routes, components, and shared libraries.
 - `scripts/` - runtime, migration, verification, release, and deployment scripts.
 - `db/migrations/` - append-only Postgres schema history.
-- `docs/index.md` - current module, deployment, release, and brand contracts.
+- `docs/index.md` - canonical product, module, deployment, release, and brand contracts.
+- `docs/README.md` - Obsidian vault map and operator-only runbooks.
 
-Older `clawd-app` folders and dated operations notes are historical import evidence only. They are not active runtime or deployment contracts.
+The old `clawd-app` folders and deleted dated notes remain available through Git history only. They are not active runtime or deployment contracts.
+
+## Documentation Contract
+
+Every implementation that changes user-facing, operational, data, integration, or architectural behavior must update its owning active contract during the same slice without waiting for an operator prompt. Every promoted deployment must also add user-facing release copy. A change is not complete while its current contract or release record is stale.
 
 ## Data Safety
 

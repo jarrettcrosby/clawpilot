@@ -1,4 +1,14 @@
+---
+title: 2026-03-20 Stable Build Integrity Outage
+status: historical
+kind: incident
+tags: [incident, build, deployment, rollback]
+app_visible: true
+---
+
 # Incident Postmortem — 2026-03-20 Stable Build Integrity Outage
+
+This incident occurred in the retired local `4001` lane. Its committed-files-only build control remains applicable to hosted releases and is retained as operational evidence; the old lane topology is not a current deployment contract.
 
 ## Summary
 Stable runtime (4001) experienced outage during rollback/redeploy attempts after stable code deploy encountered missing module errors. Deploy attempts revealed target commits were not clean-buildable from committed files only.

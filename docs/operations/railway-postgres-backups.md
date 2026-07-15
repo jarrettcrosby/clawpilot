@@ -1,3 +1,11 @@
+---
+title: Railway Postgres Backups
+status: active
+kind: operations-runbook
+tags: [railway, postgres, backups, restore, pitr]
+app_visible: false
+---
+
 # Railway Postgres Backups
 
 ## Required Policy
@@ -121,47 +129,4 @@ For a logical restore, provision a separate Postgres database first. Restore int
 
 Railway point-in-time recovery is a separate feature. Enabling it creates a storage bucket, adds WAL archive variables, and redeploys Postgres. It was not enabled or verified during this review.
 
-## Shared `/s/{slug}` Routing
-
-### Live Routing Evidence
-
-Baseline observed at `2026-07-14T00:31Z`, before the current cross-application routing release:
-
-- `eigenracing.com` resolves to `216.198.79.1` and Vercel returns `307` to `https://www.eigenracing.com`, preserving the request path.
-- `www.eigenracing.com` is a CNAME to `ce2788e7ac79f119.vercel-dns-017.com`.
-- Vercel project `eigenracing-web` (`prj_KhJEIzrjBjaY91CTijziDdyMM58A`) owns both `eigenracing.com` and `www.eigenracing.com`.
-- `https://www.eigenracing.com/s/clawpilot-routing-probe-404` returned Vercel `404`; the Eigen Racing Vercel project did not yet proxy `/s/{slug}` to ClawPilot.
-- ClawPilot's `aiapp.eigenracing.com` and `dev.aiapp.eigenracing.com` remain separate Railway CNAMEs.
-
-### Recommended Ownership
-
-Keep the apex and `www` records on the existing `eigenracing-web` Vercel project. DNS selects a host, not a URL path, so DNS cannot route only `/s/{slug}` to ClawPilot or another service. Moving either existing record would move the entire Eigen Racing site.
-
-ClawPilot implements the canonical lookup and management paths in `app_src/app/s/[slug]/route.ts`, `app_src/app/api/shortlinks/route.ts`, `app_src/lib/shortlinks.ts`, and `db/migrations/0015_short_links.sql`. The implementation uses ClawPilot Postgres as the shared short-link store and exposes a scoped service-authenticated management API for another application.
-
-Given that implementation, the lowest-change production routing shape is:
-
-1. Treat ClawPilot production as the canonical short-link API and data owner.
-2. Serve the public lookup at `https://aiapp.eigenracing.com/s/:slug`, which uses an existing verified Railway custom domain.
-3. Add an external Vercel rewrite in `eigenracing-web` from `/s/:slug` to `https://aiapp.eigenracing.com/s/:slug`.
-4. Set ClawPilot production's public short-link origin to `https://eigenracing.com` so generated URLs use the requested public host.
-5. Give the Eigen Racing application a scoped service credential for link management and keep browser/operator access session-authenticated.
-
-Vercel documents external rewrites as a reverse proxy that preserves the browser URL: [Rewrites on Vercel](https://vercel.com/docs/routing/rewrites). Rewrites to external origins are not cached by default; leave redirect lookups uncached until invalidation and abuse controls are proven.
-
-The public lookup endpoint should accept only strict URL-safe slugs and `GET`/`HEAD`, return `404` for unknown links and `410` for disabled, expired, or exhausted links, and issue a temporary `302` or `307` for mutable links. Link creation and mutation must use authenticated service credentials with issuer identity, idempotency, audit records, rate limits, and absolute `https:` destination validation. Never accept a destination from the public lookup request.
-
-### Implementation Status
-
-- The public proxy exemption, service-authenticated API path, HTTPS-only destination constraint, and source-bound client credentials are implemented in the current short-link release.
-- Eigen Racing owns the user-facing `/app/links` and `/s/:slug` routes. Its server proxy fixes the source to `eigenracing`, binds the owner to the signed-in email, and keeps the service credential out of browser bundles.
-- Development and production use separate service secrets and public origins.
-- The ClawPilot production database has active daily, weekly, and monthly Railway volume-backup schedules and a verified manual provider snapshot from `2026-07-14 14:28 UTC`.
-
-### External Work Required
-
-- **Required release verification:** confirm the deployed Eigen Racing Vercel rewrite preserves `/s/:slug` while proxying to ClawPilot production.
-- **Not required:** no change to the `eigenracing.com` apex A record, the `www` CNAME, or either ClawPilot custom-domain record.
-- **Optional:** a future dedicated `links.eigenracing.com` origin would require the exact CNAME and ownership-verification TXT records Railway provides. It is not needed for the current `aiapp.eigenracing.com` rewrite design.
-
-Do not create a DNS record named `/s`; DNS labels cannot contain or route HTTP paths.
+Use [ClawPilot environments and deployment](clawpilot-environments.md) for release sequencing and [Shared short links](../modules/short-links.md) for public link routing. Backup evidence must remain focused on recovery controls.

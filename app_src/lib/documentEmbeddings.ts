@@ -8,6 +8,7 @@ const MAX_ATTEMPTS = 5
 const MAX_BATCH_SIZE = 24
 const MAX_DOCUMENT_CHARACTERS = 24_000
 const JOB_LEASE_MINUTES = 5
+const EMBEDDING_SETTINGS_KEY = 'documents.embedding.configuration'
 
 type EmbeddingJob = {
   document_id: string
@@ -24,8 +25,8 @@ type EmbeddingResponse = {
   error?: { message?: string }
 }
 
-export function documentEmbeddingConfiguration() {
-  const providerValue = String(process.env.DOCUMENT_EMBEDDINGS_PROVIDER || 'local').trim().toLowerCase()
+export function documentEmbeddingConfiguration(providerOverride?: unknown) {
+  const providerValue = String(providerOverride || process.env.DOCUMENT_EMBEDDINGS_PROVIDER || 'local').trim().toLowerCase()
   if (!['local', 'openai'].includes(providerValue)) {
     throw new Error('DOCUMENT_EMBEDDINGS_PROVIDER must be local or openai')
   }
@@ -38,6 +39,36 @@ export function documentEmbeddingConfiguration() {
     return { apiKey, model: openAiModel, provider: 'openai' as const, sendsDocumentContentExternally: true }
   }
   return { apiKey: '', model: LOCAL_MODEL, provider: 'local' as const, sendsDocumentContentExternally: false }
+}
+
+async function readDocumentEmbeddingProviderPreference() {
+  const result = await query<{ value: unknown }>(
+    'SELECT value FROM app_settings WHERE key = $1 LIMIT 1',
+    [EMBEDDING_SETTINGS_KEY],
+  )
+  const value = result.rows[0]?.value
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const provider = String((value as Record<string, unknown>).provider || '').trim().toLowerCase()
+  return provider === 'local' || provider === 'openai' ? provider : undefined
+}
+
+export async function effectiveDocumentEmbeddingConfiguration() {
+  return documentEmbeddingConfiguration(await readDocumentEmbeddingProviderPreference())
+}
+
+export async function readDocumentEmbeddingSettings() {
+  const provider = await readDocumentEmbeddingProviderPreference()
+    || String(process.env.DOCUMENT_EMBEDDINGS_PROVIDER || 'local').trim().toLowerCase()
+  const keyConfigured = String(process.env.OPENAI_EMBEDDING_API_KEY || '').trim().length >= 20
+  return {
+    provider: provider === 'openai' ? 'openai' as const : 'local' as const,
+    model: provider === 'openai'
+      ? String(process.env.OPENAI_EMBEDDING_MODEL || DEFAULT_MODEL).trim() || DEFAULT_MODEL
+      : LOCAL_MODEL,
+    keyConfigured,
+    sendsDocumentContentExternally: provider === 'openai',
+    valid: provider !== 'openai' || keyConfigured,
+  }
 }
 
 function vectorLiteral(values: number[]): string {
@@ -242,7 +273,7 @@ async function markFailed(jobs: EmbeddingJob[], error: unknown) {
 }
 
 export async function processDocumentEmbeddingJobs(limitValue: unknown = 12) {
-  const config = documentEmbeddingConfiguration()
+  const config = await effectiveDocumentEmbeddingConfiguration()
   await ensureJobsForModel(config.model)
   const limit = Math.max(1, Math.min(Math.trunc(Number(limitValue) || 12), MAX_BATCH_SIZE))
   const jobs = await claimJobs(limit)
@@ -326,7 +357,7 @@ export async function processDocumentEmbeddingJobs(limitValue: unknown = 12) {
 
 export async function embedSearchQuery(value: string): Promise<{ vector: string; model: string } | null> {
   const search = value.replace(/\s+/g, ' ').trim().slice(0, 500)
-  const config = documentEmbeddingConfiguration()
+  const config = await effectiveDocumentEmbeddingConfiguration()
   if (!search) return null
   if (config.provider === 'local') return { vector: vectorLiteral(localEmbedding(search)), model: config.model }
   try {

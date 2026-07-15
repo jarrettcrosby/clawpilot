@@ -194,6 +194,7 @@ export type StageInteractionInput = CommonStageInput & {
   fields: {
     organizationId?: string | null
     contactId?: string | null
+    contactSuiteCrmId?: string | null
     opportunityId?: string | null
     leadId?: string | null
     meetingId?: string | null
@@ -375,6 +376,7 @@ function suiteCrmAttributes(input: StageCrmRecordInput, referenceCode: string) {
     name: clean(fields.subject),
     parent_type: fields.parentSuiteCrmId ? clean(fields.parentSuiteCrmType) : '',
     parent_id: clean(fields.parentSuiteCrmId),
+    contact_id: clean(fields.contactSuiteCrmId),
     description: clean(fields.description),
   }
 }
@@ -383,6 +385,24 @@ async function suiteCrmRelationships(
   client: PoolClient,
   input: StageCrmRecordInput,
 ): Promise<NonNullable<SuiteCrmOutboxRecord['relationships']>> {
+  if (input.entity === 'interactions') {
+    const result = await client.query<{
+      link_field_name: 'contact'
+      related_module_name: 'Contacts'
+      related_bean_id: string
+    }>(
+      `SELECT 'contact'::text AS link_field_name, 'Contacts'::text AS related_module_name,
+         suitecrm_id AS related_bean_id
+       FROM crm_contacts
+       WHERE pipeline_id = $1::uuid AND id = $2::uuid AND suitecrm_id IS NOT NULL`,
+      [input.pipelineId, input.fields.contactId || null],
+    )
+    return result.rows.map((row) => ({
+      linkFieldName: row.link_field_name,
+      relatedModuleName: row.related_module_name,
+      relatedBeanId: row.related_bean_id,
+    }))
+  }
   if (input.entity !== 'meetings') return []
   const fields = input.fields
   const result = await client.query<{
@@ -1063,6 +1083,7 @@ async function normalizeStageCrmRecordInput(
     const relationship = await client.query<{
       organization_id: string | null
       organization_suitecrm_id: string | null
+      contact_suitecrm_id: string | null
     }>(
       `WITH resolved AS (
          SELECT COALESCE(
@@ -1074,11 +1095,15 @@ async function normalizeStageCrmRecordInput(
          ) AS organization_id
        )
        SELECT organization.id::text AS organization_id,
-         organization.suitecrm_id AS organization_suitecrm_id
+         organization.suitecrm_id AS organization_suitecrm_id,
+         contact.suitecrm_id AS contact_suitecrm_id
        FROM resolved
        LEFT JOIN crm_organizations organization
          ON organization.pipeline_id = $1::uuid
-        AND organization.id = resolved.organization_id`,
+        AND organization.id = resolved.organization_id
+       LEFT JOIN crm_contacts contact
+         ON contact.pipeline_id = $1::uuid
+        AND contact.id = $3::uuid`,
       [
         input.pipelineId,
         fields.organizationId || null,
@@ -1094,6 +1119,7 @@ async function normalizeStageCrmRecordInput(
       fields: {
         ...fields,
         organizationId: organization?.organization_id || null,
+        contactSuiteCrmId: organization?.contact_suitecrm_id || null,
         parentSuiteCrmId: organization?.organization_suitecrm_id || fields.parentSuiteCrmId || null,
         parentSuiteCrmType: organization?.organization_suitecrm_id ? 'Accounts' : fields.parentSuiteCrmType,
       },
@@ -1696,6 +1722,7 @@ export async function listCrmRecordsInPostgres(input: {
   entity: CrmEntity
   query?: string
   limit?: number
+  needsReview?: boolean
 }): Promise<CrmRecord[]> {
   const search = clean(input.query).slice(0, 200)
   const limit = Math.max(1, Math.min(Math.trunc(Number(input.limit) || 250), 1000))
@@ -1791,12 +1818,16 @@ export async function listCrmRecordsInPostgres(input: {
        opportunity.organization_id, meeting.organization_id
      )
      WHERE interaction.pipeline_id = $1::uuid
+       AND (NOT $3::boolean OR COALESCE(
+         interaction.organization_id, contact.organization_id, lead.organization_id,
+         opportunity.organization_id, meeting.organization_id
+       ) IS NULL)
        AND ($2 = '' OR interaction.reference_code ILIKE '%' || $2 || '%'
          OR interaction.subject ILIKE '%' || $2 || '%'
          OR interaction.description ILIKE '%' || $2 || '%'
          OR organization.name ILIKE '%' || $2 || '%')
-     ORDER BY interaction.occurred_at DESC NULLS LAST, interaction.updated_at DESC, interaction.id LIMIT $3`,
-    [input.pipelineId, search, limit],
+     ORDER BY interaction.occurred_at DESC NULLS LAST, interaction.updated_at DESC, interaction.id LIMIT $4`,
+    [input.pipelineId, search, input.needsReview === true, limit],
   )
   return result.rows.map(interactionFromRow)
 }
@@ -1811,6 +1842,17 @@ export async function readCrmSummaryFromPostgres(pipelineId: string): Promise<Cr
         (SELECT count(*) FROM crm_opportunities WHERE pipeline_id = $1::uuid)::text AS opportunities,
         (SELECT count(*) FROM crm_meetings WHERE pipeline_id = $1::uuid)::text AS meetings,
         (SELECT count(*) FROM crm_interactions WHERE pipeline_id = $1::uuid)::text AS interactions,
+        (SELECT count(*)
+         FROM crm_interactions interaction
+         LEFT JOIN crm_contacts contact ON contact.id = interaction.contact_id
+         LEFT JOIN crm_leads lead ON lead.id = interaction.lead_id
+         LEFT JOIN crm_opportunities opportunity ON opportunity.id = interaction.opportunity_id
+         LEFT JOIN crm_meetings meeting ON meeting.id = interaction.meeting_id
+         WHERE interaction.pipeline_id = $1::uuid
+           AND COALESCE(
+             interaction.organization_id, contact.organization_id, lead.organization_id,
+             opportunity.organization_id, meeting.organization_id
+           ) IS NULL)::text AS needs_review_interactions,
         (SELECT count(*) FROM crm_campaigns WHERE pipeline_id = $1::uuid)::text AS campaigns,
         (SELECT COALESCE(sum(amount), 0) FROM crm_opportunities WHERE pipeline_id = $1::uuid AND lower(COALESCE(status, '')) NOT IN ('won', 'lost', 'closed', 'abandoned'))::text AS open_pipeline_value,
         (SELECT COALESCE(sum(amount * probability / 100), 0) FROM crm_opportunities WHERE pipeline_id = $1::uuid AND lower(COALESCE(status, '')) NOT IN ('won', 'lost', 'closed', 'abandoned'))::text AS weighted_pipeline_value,
@@ -1841,6 +1883,7 @@ export async function readCrmSummaryFromPostgres(pipelineId: string): Promise<Cr
     opportunities: finite(row.opportunities), meetings: finite(row.meetings), interactions: finite(row.interactions),
     campaigns: finite(row.campaigns), openPipelineValue: finite(row.open_pipeline_value),
     weightedPipelineValue: finite(row.weighted_pipeline_value), pendingSync: finite(row.pending_sync), failedSync: finite(row.failed_sync),
+    needsReviewInteractions: finite(row.needs_review_interactions),
   }
 }
 

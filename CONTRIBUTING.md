@@ -2,9 +2,9 @@
 
 ## Branch Policy
 
-- `dev` is the active development branch for `4002`.
-- `main` should represent production-ready code once GitHub is initialized.
-- `stable/4001` captures the current local stable/prod baseline.
+- `dev` is the active development branch and local `4002` lane.
+- `main` is the production branch.
+- `stable/4001` is a historical stable reference, not the hosted promotion target.
 - Use short-lived feature branches from `dev` for larger changes.
 - Do not mutate `4001` or stable/prod state without explicit operator approval.
 
@@ -14,7 +14,15 @@
 - Read relevant docs before broad refactors.
 - Preserve user/runtime data unless the task explicitly says to migrate or clean it.
 - Do not commit secrets, live customer data, runtime logs, backups, or generated agent state.
-- Behavior changes require docs updates when the behavior is user-facing, operational, or architectural.
+- Behavior changes require proactive documentation updates in the same slice when the behavior is user-facing, operational, data-related, integration-related, or architectural. Do not wait for the operator to request documentation.
+
+## Documentation Definition Of Done
+
+1. Update the owning active module or operations contract; do not create a new progress log.
+2. Remove or correct superseded statements in that contract.
+3. Add release copy when the change is promoted or changes observable behavior in a deployed environment.
+4. Create a dated incident or audit only when its evidence will still be useful after the immediate work is complete.
+5. Run `npm run verify:docs` before handoff.
 
 ## Required Checks
 
@@ -25,6 +33,7 @@ npm run lint
 npm run build
 npm run test
 npm run verify:dev
+npm run verify:docs
 ```
 
 Before a promotion candidate or GitHub push:
@@ -42,6 +51,7 @@ A good PR should include:
 - Files or areas changed.
 - User-facing behavior changes.
 - Data/runtime impact.
+- Active contract and release-copy impact.
 - Verification commands and results.
 - Screenshots for meaningful UI changes.
 - Known risks and rollback notes.

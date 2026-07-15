@@ -237,6 +237,7 @@ export type CrmSummary = {
   weightedPipelineValue: number
   pendingSync: number
   failedSync: number
+  needsReviewInteractions: number
 }
 
 export type SuiteCrmOutboxRecord = {
@@ -246,7 +247,7 @@ export type SuiteCrmOutboxRecord = {
   suiteCrmId: string
   attributes: Record<string, unknown>
   relationships?: Array<{
-    linkFieldName: 'accounts' | 'contacts' | 'leads' | 'opportunity'
+    linkFieldName: 'accounts' | 'contact' | 'contacts' | 'leads' | 'opportunity'
     relatedModuleName: 'Accounts' | 'Contacts' | 'Leads' | 'Opportunities'
     relatedBeanId: string
   }>

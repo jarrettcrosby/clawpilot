@@ -1,3 +1,11 @@
+---
+title: ChatGPT Agent Authorization
+status: active
+kind: operations-runbook
+tags: [chatgpt, codex, oauth, credentials, agents]
+app_visible: false
+---
+
 # ChatGPT Agent Authorization
 
 ClawPilot can run its product-agent conversations with a signed-in user's ChatGPT/Codex authorization. OpenClaw is not required at runtime.

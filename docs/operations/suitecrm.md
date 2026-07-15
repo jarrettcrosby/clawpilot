@@ -85,6 +85,26 @@ CLAWPILOT_BACKFILL_CONFIRM=global-id-v1 npm run crm:backfill-suitecrm
 
 Drain `/api/crm/outbox/process`, then verify an exact V8 filter on `global_id_c` and inspect a meeting's Contacts and Accounts subpanels. The backfill is transactionally queued and may be rerun; unchanged payloads are not duplicated.
 
+After deploying the native Note-to-Contact relationship contract, queue the historical Note repair from each environment using an explicit audit actor:
+
+```bash
+CLAWPILOT_BACKFILL_CONFIRM=interaction-contacts-v1 \
+CLAWPILOT_BACKFILL_ACTOR=jarrett@suburbiasandwichco.com \
+npm run crm:backfill-suitecrm-interaction-contacts
+```
+
+The repair keeps the Account as the Note parent and adds both SuiteCRM's native `contact_id` and `contact` relationship. Drain `/api/crm/outbox/process`, then confirm the Contact field and relationship subpanel on a historical Note.
+
+The operator-approved unresolved interaction cleanup is deliberately limited to two production Global IDs and their verified development source fingerprints. Run it only with the explicit deletion guard:
+
+```bash
+CLAWPILOT_DELETE_CONFIRM=unresolved-interactions-v1 \
+CLAWPILOT_DELETE_ACTOR=jarrett@suburbiasandwichco.com \
+npm run crm:delete-unresolved-interactions
+```
+
+The cleanup cancels stale upserts, queues native SuiteCRM deletion, removes active Postgres records and generated workbook projections, disables their short links, and retires every matched Global ID so it can never be allocated again.
+
 After a public-domain change, update `SUITECRM_PUBLIC_URL` on both services and redeploy SuiteCRM before ClawPilot. Confirm the managed `site_url` and trusted-host entries, then test `/api/crm/punchout` as an owner/admin and confirm a member receives `403`.
 
 ## Upgrade Rule

@@ -87,6 +87,8 @@ The SuiteCRM integration worker also polls Accounts and Contacts by `date_modifi
 
 Interactions always materialize their related organization in Postgres. When an interaction names only a Contact, Lead, Opportunity, or Meeting, the gateway derives the Account from that relationship, displays it in ClawPilot, and sends the Account parent to SuiteCRM. Migration `0034_account_membership_crm_board_scope.sql` performs the same deterministic repair for historical interactions and queues one idempotent SuiteCRM Note update per repaired record.
 
+When an interaction names a Contact, its SuiteCRM Note also carries the native `contact_id` and `contact` relationship. The Account remains the Note parent while the Contact appears in the native Contact field and relationship subpanels.
+
 Native SuiteCRM Note polling performs a full historical scan on first activation and then advances a resumable cursor with a five-minute overlap. It matches by SuiteCRM ID or permanent `gi` Global ID within each pipeline, resolves Account, Contact, Lead, Opportunity, and Meeting parents conservatively, and stages inbound changes without echoing them back to SuiteCRM. Ambiguous or unknown records remain unmatched rather than crossing a pipeline boundary.
 
 All persisted timestamps remain UTC ISO values. ClawPilot renders dates, activity, releases, agent messages, CRM interactions, pipeline sync times, integration status, and link updates in the signed-in user's profile timezone and locale. Changing the profile timezone updates the active UI without rewriting historical data.
