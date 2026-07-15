@@ -93,9 +93,11 @@ export default function KanbanBoard({ externalFilter, onFilterChange }: Props = 
   const [createError, setCreateError] = useState('')
   const [moveError, setMoveError] = useState('')
   const [boardAccess, setBoardAccess] = useState<'owner' | 'editor' | 'viewer' | null>(null)
+  const [selectedBoardName, setSelectedBoardName] = useState('')
   const isTouch = useMediaQuery('(pointer: coarse)')
   const shortLandscape = useMediaQuery('(orientation: landscape) and (max-height: 500px) and (max-width: 899.95px)')
-  const canEdit = boardAccess !== 'viewer'
+  const canEdit = boardAccess !== null && boardAccess !== 'viewer'
+  const isCrmBoard = selectedBoardName.trim().toLowerCase() === 'crm board'
 
   const filter = externalFilter && isFilterActive(externalFilter) ? externalFilter : internalFilter
   const drawerTask = tasks.find(task => task.id === drawerTaskId) || null
@@ -334,7 +336,7 @@ export default function KanbanBoard({ externalFilter, onFilterChange }: Props = 
               <Box sx={{ display: 'flex', alignItems: 'baseline', gap: 2 }}>
                 <Typography variant="h5" fontWeight={700} color="text.primary" sx={shortLandscape ? { fontSize: '1rem' } : undefined}>Projects</Typography>
                 <Typography variant="body2" color="text.disabled">
-                  {archiveMode ? 'Archive' : `${visibleTasks.length} task${visibleTasks.length === 1 ? '' : 's'}${isFilterActive(filter) ? ' (filtered)' : ''}`}
+                  {archiveMode ? 'Archive' : `${visibleTasks.length} ${isCrmBoard ? 'card' : 'task'}${visibleTasks.length === 1 ? '' : 's'}${isFilterActive(filter) ? ' (filtered)' : ''}`}
                 </Typography>
               </Box>
               <Stack
@@ -351,8 +353,14 @@ export default function KanbanBoard({ externalFilter, onFilterChange }: Props = 
                   '& > *': { flexShrink: 0 },
                 }}
               >
-                <WorkspaceSelector kind="board" onAccessChange={(resource) => setBoardAccess(resource?.accessRole || null)} />
-                {!archiveMode && canEdit ? (
+                <WorkspaceSelector
+                  kind="board"
+                  onAccessChange={(resource) => {
+                    setBoardAccess(resource?.accessRole || null)
+                    setSelectedBoardName(resource?.name || '')
+                  }}
+                />
+                {!archiveMode && canEdit && !isCrmBoard ? (
                   <Button
                     size="small"
                     variant="contained"

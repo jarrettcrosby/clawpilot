@@ -30,9 +30,10 @@ export default function KanbanCard({ task }: Props) {
   const [assignAnchor, setAssignAnchor] = useState<HTMLElement | null>(null)
   const isFocused = focusedTaskId === task.id
   const isTouch = useMediaQuery('(pointer: coarse)')
+  const isCrmCard = Boolean(task.crm)
 
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: task.id })
-  const showCategoryChip = Boolean(task.category) && task.category !== 'clawpilot'
+  const showCategoryChip = !isCrmCard && Boolean(task.category) && task.category !== 'clawpilot'
 
   const style = {
     transform: CSS.Transform.toString(transform),
@@ -136,16 +137,22 @@ export default function KanbanCard({ task }: Props) {
         )}
 
         <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5, mt: 1 }}>
+          {task.crm && (
+            <Chip size="small" label={task.crm.entity === 'organizations' ? 'Organization' : 'Contact'} variant="outlined"
+              sx={{ height: 20, fontSize: '0.65rem', borderColor: 'rgba(168,199,250,0.3)', color: '#A8C7FA', borderRadius: 1 }} />
+          )}
           {showCategoryChip && (
             <Chip size="small" label={displayCategory(task.category)} variant="outlined"
               sx={{ height: 20, fontSize: '0.65rem', borderColor: 'rgba(255,255,255,0.1)', color: 'text.disabled', borderRadius: 1 }} />
           )}
-          <Chip size="small" label={PRIORITY_LABELS[task.priority]}
-            sx={{ height: 20, fontSize: '0.65rem', borderRadius: 1, backgroundColor: PRIORITY_COLORS[task.priority] + '22', color: PRIORITY_COLORS[task.priority], border: 'none' }} />
+          {!isCrmCard && (
+            <Chip size="small" label={PRIORITY_LABELS[task.priority]}
+              sx={{ height: 20, fontSize: '0.65rem', borderRadius: 1, backgroundColor: PRIORITY_COLORS[task.priority] + '22', color: PRIORITY_COLORS[task.priority], border: 'none' }} />
+          )}
         </Box>
 
         {/* Assignee + Due Date */}
-        <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mt: 1, pt: 1, borderTop: '1px solid rgba(255,255,255,0.05)' }}>
+        {!isCrmCard && <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mt: 1, pt: 1, borderTop: '1px solid rgba(255,255,255,0.05)' }}>
           {task.assignedAgent ? (() => {
               const assigned = task.assignedAgent
               const p = PEOPLE.find(x => x.id === assigned || x.name === assigned)
@@ -181,7 +188,7 @@ export default function KanbanCard({ task }: Props) {
                 </Box>
               )
           })()}
-        </Box>
+        </Box>}
 
         <Box sx={{ display: 'flex', justifyContent: 'flex-end', gap: 0.6, mt: 0.6 }}>
           {task.assignedAgent && (
@@ -222,7 +229,7 @@ export default function KanbanCard({ task }: Props) {
         })()}
       </Box>
 
-      <Popover
+      {!isCrmCard && <Popover
         open={Boolean(assignAnchor)}
         anchorEl={assignAnchor}
         onClose={() => setAssignAnchor(null)}
@@ -232,7 +239,7 @@ export default function KanbanCard({ task }: Props) {
         {PEOPLE.filter((p) => ASSIGNABLE_PRODUCT_AGENT_IDS.includes(p.id as typeof ASSIGNABLE_PRODUCT_AGENT_IDS[number])).map((p) => (
           <MenuItem key={p.id} onClick={() => assignTo(p.id)} sx={{ fontSize: '0.8rem' }}>{p.name}</MenuItem>
         ))}
-      </Popover>
+      </Popover>}
     </div>
   )
 }
