@@ -117,6 +117,7 @@ for (const requiredPath of [
   'db/migrations/0021_crm_identity_and_organization_hierarchy.sql',
   'db/migrations/0022_pipeline_sheet_access_links.sql',
   'db/migrations/0023_crm_modules_references_and_integrations.sql',
+  'db/migrations/0024_versioned_drive_hierarchy_reconciliation.sql',
   'scripts/start-railway.sh',
   'scripts/pipeline-outbox-poller.mjs',
   'scripts/validate-runtime-config.mjs',

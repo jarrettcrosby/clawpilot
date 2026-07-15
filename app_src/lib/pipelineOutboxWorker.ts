@@ -213,7 +213,10 @@ export async function processPipelineSyncOutbox(input: {
 
   for (const item of items) {
     try {
-      if (item.operation === 'provision_pipeline') {
+      if (
+        item.operation === 'provision_pipeline'
+        || item.operation === 'reconcile_pipeline_hierarchy_v2'
+      ) {
         const pipelineId = workspacePipelineId(item)
         item.pipelineId = pipelineId
         await provisionPipelineGoogleResources(pipelineId)
@@ -243,6 +246,7 @@ export async function processPipelineSyncOutbox(input: {
       results.push({ id: item.id, operation: item.operation, status: 'succeeded' })
     } catch (error) {
       const managedWorkspaceOperation = item.operation === 'provision_pipeline'
+        || item.operation === 'reconcile_pipeline_hierarchy_v2'
         || item.operation === 'sync_pipeline_permissions'
       const status = await failPipelineSyncOutboxInPostgres({
         item,

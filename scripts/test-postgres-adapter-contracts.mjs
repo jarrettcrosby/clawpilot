@@ -255,7 +255,11 @@ assertIncludes(pipelineAdapter, 'google_shared_drive_id = COALESCE', 'immutable 
 assertIncludes(pipelineAdapter, 'Pipeline Google Workspace binding cannot be changed', 'managed binding immutability')
 assertIncludes(pipelineAdapter, 'FROM google_workspace_integration', 'queue-time platform integration validation')
 assertIncludes(pipelineAdapter, 'FOR SHARE', 'queue-time credential and binding serialization')
-assertIncludes(pipelineAdapter, "target_system IN ('google_sheets', 'google_workspace')", 'managed workspace outbox claims')
+assertIncludes(
+  pipelineAdapter,
+  "target_system IN ('google_sheets', 'google_workspace', 'google_workspace_v2')",
+  'managed workspace outbox claims',
+)
 assertIncludes(pipelineAdapter, 'resolvePipelineSheetBindingInPostgres', 'validated pipeline Sheet binding resolver')
 assertIncludes(pipelineAdapter, 'pipeline.owner_email !== configuredOwner', 'configured-owner legacy fallback boundary')
 assertIncludes(pipelineAdapter, 'AND sheet_id = $2', 'pipeline and Sheet pair isolation')
@@ -333,6 +337,11 @@ for (const table of [
 ]) {
   assertIncludes(crmModulesMigration, `CREATE TABLE IF NOT EXISTS ${table}`, 'CRM module and integration migration')
 }
+
+const driveHierarchyMigration = read('db/migrations/0024_versioned_drive_hierarchy_reconciliation.sql')
+assertIncludes(driveHierarchyMigration, "'reconcile_pipeline_hierarchy_v2'", 'versioned Drive hierarchy operation')
+assertIncludes(driveHierarchyMigration, "'google_workspace_v2'", 'versioned Drive hierarchy worker target')
+assertIncludes(driveHierarchyMigration, "'layoutVersion', 2", 'versioned Drive hierarchy payload')
 
 const crmIntegrationActions = read('app_src/lib/crm/integrationActions.ts')
 for (const action of ['send_email', 'create_calendar_event', 'log_call', 'send_campaign']) {
@@ -433,6 +442,7 @@ assertIncludes(outboxWorker, "item.operation === 'project_crm_workbook'", 'CRM p
 assertIncludes(outboxWorker, 'Opportunity Sheet row changed', 'pipeline outbox worker optimistic check')
 assertIncludes(outboxWorker, '[ClawPilot sync:', 'pipeline outbox worker append idempotency')
 assertIncludes(outboxWorker, "item.operation === 'provision_pipeline'", 'pipeline provisioning worker dispatch')
+assertIncludes(outboxWorker, "item.operation === 'reconcile_pipeline_hierarchy_v2'", 'versioned Drive hierarchy worker dispatch')
 assertIncludes(outboxWorker, "item.operation === 'sync_pipeline_permissions'", 'pipeline permission worker dispatch')
 assertIncludes(outboxWorker, 'resolveManagedGoogleWorkspaceRuntime', 'bound managed pipeline runtime resolution')
 assertIncludes(outboxWorker, 'googleSheetsJson', 'bound managed pipeline Sheet writes')
