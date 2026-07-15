@@ -45,9 +45,11 @@ import PhoneRounded from '@mui/icons-material/PhoneRounded'
 import RefreshRounded from '@mui/icons-material/RefreshRounded'
 import SearchRounded from '@mui/icons-material/SearchRounded'
 import UploadFileRounded from '@mui/icons-material/UploadFileRounded'
+import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import WorkspaceSelector from '@/components/workspaces/WorkspaceSelector'
 import type { CrmEntity, CrmSummary } from '@/lib/crm/types'
-import { dateTimeLocalValue } from '@/lib/zonedDateTime'
+import { formatUserDateTime, type UserDateTimeSettings } from '@/lib/userDateTime'
+import { dateTimeLocalValue, zonedDateTimeToIso } from '@/lib/zonedDateTime'
 
 type RecordValue = Record<string, unknown>
 type CrmActionType = 'send_email' | 'create_calendar_event' | 'log_call' | 'send_campaign'
@@ -129,6 +131,19 @@ function textValue(record: RecordValue, key: string) {
   return String(record[key] ?? '')
 }
 
+function displayValue(record: RecordValue, key: string, settings: UserDateTimeSettings) {
+  if (key === 'startsAt' || key === 'occurredAt') {
+    return formatUserDateTime(textValue(record, key), settings, {
+      year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', fallback: '—',
+    })
+  }
+  return textValue(record, key) || '—'
+}
+
+function emailOptedOut(record: RecordValue) {
+  return record.emailOptOut === true || textValue(record, 'emailOptOut').toLowerCase() === 'true'
+}
+
 function money(value: unknown) {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 })
     .format(Number(value) || 0)
@@ -184,18 +199,24 @@ function entityForReference(reference: string): CrmEntity | null {
   } as Record<string, CrmEntity>)[prefix] || null
 }
 
-function initialFields(entity: CrmEntity, record: RecordValue | null): Record<string, string> {
+function initialFields(entity: CrmEntity, record: RecordValue | null, userTimeZone: string): Record<string, string> {
   const source = record || {}
   if (entity === 'organizations') return {
-    name: textValue(source, 'name'), accountType: textValue(source, 'accountType'),
+    name: textValue(source, 'name'), priority: textValue(source, 'priority'), accountType: textValue(source, 'accountType'),
     accountManager: textValue(source, 'accountManager'), website: textValue(source, 'website'),
-    phone: textValue(source, 'phone'), email: textValue(source, 'email'),
+    linkedinUrl: textValue(source, 'linkedinUrl'), phone: textValue(source, 'phone'), email: textValue(source, 'email'),
+    address: textValue(source, 'address'), city: textValue(source, 'city'), state: textValue(source, 'state'),
+    postalCode: textValue(source, 'postalCode'), country: textValue(source, 'country'),
     emailOptOut: textValue(source, 'emailOptOut') || 'false', description: textValue(source, 'description'),
   }
   if (entity === 'contacts') return {
     fullName: textValue(source, 'fullName'), organizationId: textValue(source, 'organizationId'),
-    jobTitle: textValue(source, 'jobTitle'), email: textValue(source, 'email'),
+    firstName: textValue(source, 'firstName'), lastName: textValue(source, 'lastName'), priority: textValue(source, 'priority'),
+    contactType: textValue(source, 'contactType'), accountManager: textValue(source, 'accountManager'),
+    jobTitle: textValue(source, 'jobTitle'), email: textValue(source, 'email'), linkedinUrl: textValue(source, 'linkedinUrl'),
     phoneWork: textValue(source, 'phoneWork'), phoneMobile: textValue(source, 'phoneMobile'),
+    address: textValue(source, 'address'), city: textValue(source, 'city'), state: textValue(source, 'state'),
+    postalCode: textValue(source, 'postalCode'), country: textValue(source, 'country'),
     emailOptOut: textValue(source, 'emailOptOut') || 'false', description: textValue(source, 'description'),
   }
   if (entity === 'leads') return {
@@ -232,12 +253,13 @@ function initialFields(entity: CrmEntity, record: RecordValue | null): Record<st
   }
   return {
     subject: textValue(source, 'subject'), organizationId: textValue(source, 'organizationId'),
-    interactionType: textValue(source, 'interactionType'), occurredAt: textValue(source, 'occurredAt').slice(0, 16),
+    interactionType: textValue(source, 'interactionType'), occurredAt: dateTimeLocalValue(source.occurredAt, userTimeZone),
     agentName: textValue(source, 'agentName'), description: textValue(source, 'description'),
   }
 }
 
 export default function CrmSection() {
+  const dateTimeSettings = useUserDateTime()
   const shortLandscape = useMediaQuery('(orientation: landscape) and (max-height: 500px) and (max-width: 899.95px)')
   const [entity, setEntity] = useState<CrmEntity>('organizations')
   const [records, setRecords] = useState<RecordValue[]>([])
@@ -298,7 +320,21 @@ export default function CrmSection() {
       if (matched && !deepLinkOpened.current) {
         deepLinkOpened.current = true
         setEditorRecord(matched)
-        setFields(initialFields(nextEntity, matched))
+        setFields(initialFields(nextEntity, matched, dateTimeSettings.timeZone))
+        if (new URLSearchParams(window.location.search).get('crmAction') === 'compose-email') {
+          if (!textValue(matched, 'email')) {
+            setError('This CRM record has no primary email address.')
+          } else if (emailOptedOut(matched)) {
+            setError('This CRM record is marked Do not email.')
+          } else if (payload.pipeline?.accessRole === 'viewer') {
+            setError('This CRM record is view-only.')
+          } else {
+            const recordName = textValue(matched, 'fullName') || textValue(matched, 'name')
+              || textValue(matched, 'referenceCode')
+            setActionFields({ subject: `Follow-up: ${recordName}`, text: '' })
+            setActionComposer({ type: 'send_email', record: matched })
+          }
+        }
       }
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : 'Unable to load CRM records')
@@ -306,7 +342,7 @@ export default function CrmSection() {
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [dateTimeSettings.timeZone])
 
   useEffect(() => {
     let cancelled = false
@@ -354,7 +390,7 @@ export default function CrmSection() {
   async function openEditor(record: RecordValue | null) {
     if (!record && !editable) return
     setEditorRecord(record)
-    setFields(initialFields(entity, record))
+    setFields(initialFields(entity, record, dateTimeSettings.timeZone))
     if (['contacts', 'leads', 'meetings', 'interactions'].includes(entity) && organizations.length === 0) {
       const response = await fetch('/api/crm?entity=organizations&limit=1000')
       const payload = await response.json().catch(() => ({})) as CrmPayload
@@ -377,6 +413,12 @@ export default function CrmSection() {
     setBusy(true)
     setError('')
     try {
+      const occurredAt = entity === 'interactions' && fields.occurredAt
+        ? zonedDateTimeToIso(fields.occurredAt, dateTimeSettings.timeZone)
+        : null
+      if (entity === 'interactions' && fields.occurredAt && !occurredAt) {
+        throw new Error('Interaction date is invalid in your profile timezone')
+      }
       const response = await fetch('/api/crm', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -385,9 +427,11 @@ export default function CrmSection() {
           id: editorRecord?.id,
           fields: entity === 'meetings'
             ? { ...fields, attendeeEmails: fields.attendeeEmails?.split(',').map((email) => email.trim()).filter(Boolean) || [] }
-            : ['organizations', 'contacts', 'leads'].includes(entity)
-              ? { ...fields, emailOptOut: fields.emailOptOut === 'true' }
-              : fields,
+            : entity === 'interactions'
+              ? { ...fields, occurredAt }
+              : ['organizations', 'contacts', 'leads'].includes(entity)
+                ? { ...fields, emailOptOut: fields.emailOptOut === 'true' }
+                : fields,
         }),
       })
       const payload = await response.json().catch(() => ({})) as CrmPayload
@@ -406,6 +450,7 @@ export default function CrmSection() {
     const recordName = textValue(record, 'fullName') || textValue(record, 'name')
       || textValue(record, 'subject') || textValue(record, 'referenceCode')
     if (type === 'send_email') {
+      if (!textValue(record, 'email') || emailOptedOut(record)) return
       setActionFields({ subject: `Follow-up: ${recordName}`, text: '' })
     } else if (type === 'create_calendar_event') {
       const timezone = textValue(record, 'timezone') || 'America/New_York'
@@ -666,7 +711,7 @@ export default function CrmSection() {
                         >
                           {textValue(record, key)}
                         </Link>
-                      ) : entity === 'opportunities' && key === 'value' ? money(record[key]) : textValue(record, key) || '—'}
+                      ) : entity === 'opportunities' && key === 'value' ? money(record[key]) : displayValue(record, key, dateTimeSettings)}
                     </TableCell>
                   ))}
                   <TableCell>
@@ -881,7 +926,7 @@ export default function CrmSection() {
           {editorRecord && editable && (
             <Stack direction="row" gap={1} flexWrap="wrap">
               {['organizations', 'contacts', 'leads'].includes(entity) && Boolean(editorRecord.email) && (
-                <Button startIcon={<EmailRounded />} variant="outlined" onClick={() => openAction('send_email', editorRecord)}>
+                <Button disabled={emailOptedOut(editorRecord)} startIcon={<EmailRounded />} variant="outlined" onClick={() => openAction('send_email', editorRecord)}>
                   Email
                 </Button>
               )}
@@ -1001,7 +1046,7 @@ export default function CrmSection() {
             <TextField disabled={!recordEditable} label="Subject template" value={fields.subjectTemplate || ''} onChange={(event) => setFields({ ...fields, subjectTemplate: event.target.value })} />
             <TextField disabled={!recordEditable} label="Message template" value={fields.bodyTemplate || ''} onChange={(event) => setFields({ ...fields, bodyTemplate: event.target.value })} multiline minRows={8} />
           </>}
-          <TextField disabled={!recordEditable} label="Notes" value={fields.description || fields.notes || ''} onChange={(event) => setFields({ ...fields, description: event.target.value, notes: event.target.value })} multiline minRows={4} />
+          <TextField disabled={!recordEditable} label="Description" value={fields.description || fields.notes || ''} onChange={(event) => setFields({ ...fields, description: event.target.value, notes: event.target.value })} multiline minRows={4} />
           {recordEditable && <Button variant="contained" onClick={saveRecord} disabled={busy}>{busy ? 'Saving…' : 'Save'}</Button>}
         </Stack>
       </Drawer>

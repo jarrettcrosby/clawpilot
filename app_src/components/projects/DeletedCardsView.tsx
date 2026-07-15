@@ -9,6 +9,8 @@ import ListItemText from '@mui/material/ListItemText'
 import Chip from '@mui/material/Chip'
 import CircularProgress from '@mui/material/CircularProgress'
 import DeleteForeverRounded from '@mui/icons-material/DeleteForeverRounded'
+import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
+import { formatUserDateTime, type UserDateTimeSettings } from '@/lib/userDateTime'
 
 type DeletedCard = {
   id: string
@@ -22,8 +24,10 @@ type DeletedCard = {
 
 type Props = { query: string }
 
-function formatDate(iso: string) {
-  return new Date(iso).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+function formatDate(iso: string, settings: UserDateTimeSettings) {
+  return formatUserDateTime(iso, settings, {
+    month: 'short', day: 'numeric', year: 'numeric', fallback: 'Unknown date',
+  })
 }
 
 const CATEGORY_COLORS: Record<string, string> = {
@@ -33,6 +37,7 @@ const CATEGORY_COLORS: Record<string, string> = {
 }
 
 export default function DeletedCardsView({ query }: Props) {
+  const dateTimeSettings = useUserDateTime()
   const [items, setItems] = useState<DeletedCard[]>([])
   const [loading, setLoading] = useState(true)
 
@@ -107,7 +112,7 @@ export default function DeletedCardsView({ query }: Props) {
                         />
                       )}
                       <Typography variant="caption" color="text.disabled">
-                        Deleted {formatDate(task.deletedAt)}
+                        Deleted {formatDate(task.deletedAt, dateTimeSettings)}
                       </Typography>
                       {task.actor && (
                         <Typography variant="caption" color="text.disabled">

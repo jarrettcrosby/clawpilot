@@ -41,6 +41,8 @@ import SaveRounded from '@mui/icons-material/SaveRounded'
 import ShareRounded from '@mui/icons-material/ShareRounded'
 import TableChartRounded from '@mui/icons-material/TableChartRounded'
 import ViewKanbanRounded from '@mui/icons-material/ViewKanbanRounded'
+import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
+import { announceUserDateTimeSettings, formatUserDateTime } from '@/lib/userDateTime'
 import IntegrationSettingsPanel from './IntegrationSettingsPanel'
 
 type UserRole = 'owner' | 'admin' | 'member'
@@ -289,6 +291,7 @@ function safeProvisioningError(value: string | null | undefined) {
 }
 
 export default function UserAccessDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
+  const dateTimeSettings = useUserDateTime()
   const theme = useTheme()
   const narrowScreen = useMediaQuery(theme.breakpoints.down('sm'))
   const shortViewport = useMediaQuery('(max-height: 500px)')
@@ -471,6 +474,7 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
       if (!result.user) throw new Error('Profile response was incomplete')
       upsertUser(result.user)
       setProfile(profileFrom(result.user))
+      announceUserDateTimeSettings(result.user)
       setNotice('Profile saved.')
     } catch (saveError) {
       setError(messageFrom(saveError, 'Unable to save profile'))
@@ -976,7 +980,9 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
                           </Typography>
                           {user.jobTitle || user.lastLoginAt ? (
                             <Typography variant="caption" color="text.disabled" sx={{ display: 'block' }}>
-                              {user.jobTitle || `Last sign-in ${new Date(user.lastLoginAt as string).toLocaleString()}`}
+                              {user.jobTitle || `Last sign-in ${formatUserDateTime(user.lastLoginAt, dateTimeSettings, {
+                                year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', fallback: 'Unknown date',
+                              })}`}
                             </Typography>
                           ) : null}
                         </Box>

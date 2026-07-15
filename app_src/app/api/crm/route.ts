@@ -2,6 +2,7 @@ import crypto from 'node:crypto'
 import { NextRequest, NextResponse } from 'next/server'
 import { CRM_ENTITIES, type CrmEntity } from '@/lib/crm/types'
 import { enqueueCrmIntegrationAction } from '@/lib/crm/integrationActions'
+import { reconcileCrmBoardProjectionsForPipeline } from '@/lib/crm/boardProjection'
 import {
   ensurePipelineCrmHierarchy,
   ensurePipelineCrmReferenceLinks,
@@ -171,6 +172,7 @@ export async function POST(req: NextRequest) {
           description: stringValue(fields.description, 10_000),
         },
       })
+      await reconcileCrmBoardProjectionsForPipeline({ pipelineId: pipeline.id })
       return NextResponse.json({ ok: true, queued: true, record: staged }, { status: body?.id ? 200 : 201 })
     }
 
@@ -199,6 +201,7 @@ export async function POST(req: NextRequest) {
           emailOptOut: fields.emailOptOut === true,
         },
       })
+      await reconcileCrmBoardProjectionsForPipeline({ pipelineId: pipeline.id })
       return NextResponse.json({ ok: true, queued: true, record: staged }, { status: body?.id ? 200 : 201 })
     }
 

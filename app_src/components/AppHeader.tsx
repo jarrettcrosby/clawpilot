@@ -29,7 +29,9 @@ import GroupRounded from '@mui/icons-material/GroupRounded'
 import ActivityLogPage from '@/components/activity/ActivityLogPage'
 import ShortcutsModal from '@/components/help/ShortcutsModal'
 import UserAccessDialog from '@/components/settings/UserAccessDialog'
+import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import type { Task } from '@/lib/types'
+import { formatUserDateTime } from '@/lib/userDateTime'
 
 type PipelineActivityEntry = {
   id: string
@@ -92,6 +94,7 @@ export default function AppHeader({
   onToggleDesktopNav,
   onOpenMobileNav,
 }: Props) {
+  const dateTimeSettings = useUserDateTime()
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [tasks, setTasks] = useState<Task[]>([])
   const [pipelineEntries, setPipelineEntries] = useState<PipelineActivityEntry[]>([])
@@ -426,7 +429,9 @@ export default function AppHeader({
           {buildInfo && (
             <Typography variant="caption" color="text.disabled" display="block" mt={1} sx={{ fontFamily: 'monospace' }}>
               {buildInfo.hash}
-              {'\n'}{buildInfo.date}
+              {'\n'}{formatUserDateTime(buildInfo.date, dateTimeSettings, {
+                year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', fallback: buildInfo.date,
+              })}
             </Typography>
           )}
         </DialogContent>

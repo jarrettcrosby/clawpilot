@@ -26,6 +26,8 @@ import PowerSettingsNewRounded from '@mui/icons-material/PowerSettingsNewRounded
 import RefreshRounded from '@mui/icons-material/RefreshRounded'
 import SaveRounded from '@mui/icons-material/SaveRounded'
 import UploadFileRounded from '@mui/icons-material/UploadFileRounded'
+import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
+import { formatUserDateTime, type UserDateTimeSettings } from '@/lib/userDateTime'
 
 type GoogleIntegrationState = {
   configured: boolean
@@ -123,10 +125,10 @@ async function requestGoogleWorkspace(init?: RequestInit): Promise<GoogleIntegra
   return result
 }
 
-function formattedDate(value: string | null) {
-  if (!value) return null
-  const date = new Date(value)
-  return Number.isNaN(date.getTime()) ? null : date.toLocaleString()
+function formattedDate(value: string | null, settings: UserDateTimeSettings) {
+  return formatUserDateTime(value, settings, {
+    year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
+  }) || null
 }
 
 function errorMessage(error: unknown, fallback: string) {
@@ -142,6 +144,7 @@ function readinessLabel(integration: GoogleIntegrationState) {
 }
 
 export default function GoogleWorkspaceIntegrationPanel() {
+  const dateTimeSettings = useUserDateTime()
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const [integration, setIntegration] = useState<GoogleIntegrationState>(EMPTY_INTEGRATION)
   const [apiKey, setApiKey] = useState('')
@@ -307,7 +310,7 @@ export default function GoogleWorkspaceIntegrationPanel() {
     )
   }
 
-  const verifiedAt = formattedDate(integration.verifiedAt)
+  const verifiedAt = formattedDate(integration.verifiedAt, dateTimeSettings)
 
   return (
     <Box sx={{ maxWidth: 720, mx: 'auto' }}>

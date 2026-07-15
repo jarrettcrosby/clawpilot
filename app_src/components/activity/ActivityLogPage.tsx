@@ -25,9 +25,11 @@ import ChatBubbleOutlineRounded from '@mui/icons-material/ChatBubbleOutlineRound
 import AccessTimeRounded from '@mui/icons-material/AccessTimeRounded'
 import CheckBoxRounded from '@mui/icons-material/CheckBoxRounded'
 import EditRounded from '@mui/icons-material/EditRounded'
+import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import { PEOPLE } from '@/lib/types'
 import type { Task } from '@/lib/types'
 import { queueProjectTaskOpen } from '@/lib/projects/navigation'
+import { formatUserDateTime, type UserDateTimeSettings } from '@/lib/userDateTime'
 
 const READ_KEY = 'clawpilot_read_log'
 function getReadIds(): Set<string> {
@@ -88,8 +90,10 @@ function ActorBadge({ actor }: { actor: string }) {
   )
 }
 
-function fmt(iso: string) {
-  return new Date(iso).toLocaleString('en-US', { month:'short', day:'numeric', hour:'numeric', minute:'2-digit' })
+function fmt(iso: string, settings: UserDateTimeSettings) {
+  return formatUserDateTime(iso, settings, {
+    month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', fallback: 'Unknown date',
+  })
 }
 
 type PipelineActivityEntry = {
@@ -108,6 +112,7 @@ type PipelineActivityEntry = {
 type Props = { tasks: Task[]; pipelineEntries?: PipelineActivityEntry[]; defaultModule?: string; onClose?: () => void }
 
 export default function ActivityLogPage({ tasks, pipelineEntries = [], defaultModule, onClose }: Props) {
+  const dateTimeSettings = useUserDateTime()
   const [readIds, setReadIds] = useState<Set<string>>(() => getReadIds())
   const [search, setSearch] = useState('')
   const [filterModule, setFilterModule] = useState(defaultModule || 'all')
@@ -166,12 +171,14 @@ export default function ActivityLogPage({ tasks, pipelineEntries = [], defaultMo
   const grouped = useMemo(() => {
     const g: Record<string, LogEntry[]> = {}
     for (const e of filtered) {
-      const day = new Date(e.timestamp).toLocaleDateString('en-US', { weekday:'long', month:'long', day:'numeric' })
+      const day = formatUserDateTime(e.timestamp, dateTimeSettings, {
+        weekday: 'long', month: 'long', day: 'numeric', fallback: 'Unknown date',
+      })
       if (!g[day]) g[day] = []
       g[day].push(e)
     }
     return g
-  }, [filtered])
+  }, [dateTimeSettings, filtered])
 
   const markRead = (id: string) => setReadIds(prev => { const n=new Set([...prev,id]); saveReadIds(n); return n })
   const markAllRead = () => { const n=new Set(allEntries.map(e=>e._id)); saveReadIds(n); setReadIds(n) }
@@ -319,7 +326,7 @@ export default function ActivityLogPage({ tasks, pipelineEntries = [], defaultMo
                       </Typography>
                     </Stack>
                     <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" gap={0.5}>
-                      <Typography variant="caption" color="text.disabled" sx={{ fontSize:'0.68rem' }}>{fmt(entry.timestamp)}</Typography>
+                      <Typography variant="caption" color="text.disabled" sx={{ fontSize:'0.68rem' }}>{fmt(entry.timestamp, dateTimeSettings)}</Typography>
                       <Chip size="small" label={TYPE_LABELS[entry.type]||entry.type}
                         sx={{ height:16, fontSize:'0.6rem', borderRadius:1, backgroundColor:(TYPE_COLORS[entry.type]||'#A8C7FA')+'18', color:TYPE_COLORS[entry.type]||'#A8C7FA', border:'none' }} />
                       <Typography variant="caption" sx={{ fontSize:'0.68rem', color:'rgba(255,255,255,0.3)', overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap', maxWidth:160 }}>
@@ -328,7 +335,7 @@ export default function ActivityLogPage({ tasks, pipelineEntries = [], defaultMo
                     </Stack>
                   </Box>
                   {/* Time */}
-                  <Typography variant="caption" color="text.disabled" sx={{ fontSize:'0.68rem', flexShrink:0, display:{xs:'none',sm:'block'} }}>{fmt(entry.timestamp)}</Typography>
+                  <Typography variant="caption" color="text.disabled" sx={{ fontSize:'0.68rem', flexShrink:0, display:{xs:'none',sm:'block'} }}>{fmt(entry.timestamp, dateTimeSettings)}</Typography>
                 </Box>
               )
             })}

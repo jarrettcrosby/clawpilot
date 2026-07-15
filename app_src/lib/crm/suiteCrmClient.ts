@@ -26,9 +26,18 @@ type JsonApiCollectionResponse = {
   errors?: unknown
 }
 
-export type SuiteCrmMeetingSnapshot = {
+export type SuiteCrmRecordSnapshot = {
   id: string
   attributes: Record<string, unknown>
+}
+
+export type SuiteCrmMeetingSnapshot = SuiteCrmRecordSnapshot
+export type SuiteCrmAccountContactModule = 'Accounts' | 'Contacts'
+
+type SuiteCrmIncrementalListInput = {
+  updatedSince: string
+  page: number
+  pageSize?: number
 }
 
 let cachedToken: { value: string; expiresAt: number } | null = null
@@ -148,17 +157,18 @@ export async function testSuiteCrmConnection(fetchImpl: typeof fetch = fetch) {
   return Boolean(response)
 }
 
-export async function listSuiteCrmMeetingsUpdatedSince(input: {
-  updatedSince: string
-  page: number
-  pageSize?: number
-}, fetchImpl: typeof fetch = fetch) {
+async function listSuiteCrmModuleRecordsUpdatedSince(
+  moduleName: 'Accounts' | 'Contacts' | 'Meetings',
+  recordLabel: string,
+  input: SuiteCrmIncrementalListInput,
+  fetchImpl: typeof fetch,
+) {
   const updatedSince = new Date(input.updatedSince)
-  if (!Number.isFinite(updatedSince.getTime())) throw new Error('SuiteCRM meeting cursor is invalid')
+  if (!Number.isFinite(updatedSince.getTime())) throw new Error(`SuiteCRM ${recordLabel} cursor is invalid`)
   const requestedPage = Number(input.page)
   const requestedPageSize = Number(input.pageSize || 100)
   if (!Number.isFinite(requestedPage) || !Number.isFinite(requestedPageSize)) {
-    throw new Error('SuiteCRM meeting pagination is invalid')
+    throw new Error(`SuiteCRM ${recordLabel} pagination is invalid`)
   }
   const page = Math.max(1, Math.min(Math.trunc(requestedPage), 10_000))
   const pageSize = Math.max(1, Math.min(Math.trunc(requestedPageSize), 250))
@@ -169,27 +179,55 @@ export async function listSuiteCrmMeetingsUpdatedSince(input: {
     sort: 'date_modified',
   })
   const response = await request(
-    `/Api/V8/module/Meetings?${parameters}`,
+    `/Api/V8/module/${moduleName}?${parameters}`,
     { method: 'GET' },
     fetchImpl,
   ) as {
-    data?: Array<{ id?: unknown; attributes?: unknown }>
+    data?: Array<{ id?: unknown; type?: unknown; attributes?: unknown }>
     meta?: { 'total-pages'?: unknown }
   }
-  if (!Array.isArray(response.data)) throw new Error('SuiteCRM returned an invalid meeting collection')
-  const meetings = response.data.map((record) => {
+  if (!Array.isArray(response.data)) throw new Error(`SuiteCRM returned an invalid ${recordLabel} collection`)
+  const records = response.data.map((record) => {
     const id = String(record?.id || '').trim()
+    const type = String(record?.type || '').trim()
     const attributes = record?.attributes
-    if (!id || id.length > 64 || !attributes || typeof attributes !== 'object' || Array.isArray(attributes)) {
-      throw new Error('SuiteCRM returned an invalid meeting')
+    if (
+      !id
+      || id.length > 64
+      || (type && type !== moduleName)
+      || !attributes
+      || typeof attributes !== 'object'
+      || Array.isArray(attributes)
+    ) {
+      throw new Error(`SuiteCRM returned an invalid ${recordLabel}`)
     }
-    return { id, attributes: attributes as Record<string, unknown> } satisfies SuiteCrmMeetingSnapshot
+    return { id, attributes: attributes as Record<string, unknown> } satisfies SuiteCrmRecordSnapshot
   })
   const totalPages = Number(response.meta?.['total-pages'])
   return {
-    meetings,
+    records,
     totalPages: Number.isSafeInteger(totalPages) && totalPages > 0 ? totalPages : page,
   }
+}
+
+export async function listSuiteCrmAccountContactRecordsUpdatedSince(
+  input: SuiteCrmIncrementalListInput & { module: SuiteCrmAccountContactModule },
+  fetchImpl: typeof fetch = fetch,
+) {
+  return listSuiteCrmModuleRecordsUpdatedSince(
+    input.module,
+    input.module === 'Accounts' ? 'account' : 'contact',
+    input,
+    fetchImpl,
+  )
+}
+
+export async function listSuiteCrmMeetingsUpdatedSince(
+  input: SuiteCrmIncrementalListInput,
+  fetchImpl: typeof fetch = fetch,
+) {
+  const response = await listSuiteCrmModuleRecordsUpdatedSince('Meetings', 'meeting', input, fetchImpl)
+  return { meetings: response.records, totalPages: response.totalPages }
 }
 
 export async function upsertSuiteCrmRecord(

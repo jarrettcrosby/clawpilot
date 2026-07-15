@@ -31,8 +31,10 @@ import LoginRounded from '@mui/icons-material/LoginRounded'
 import OpenInNewRounded from '@mui/icons-material/OpenInNewRounded'
 import RefreshRounded from '@mui/icons-material/RefreshRounded'
 import SendRounded from '@mui/icons-material/SendRounded'
+import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import type { Task } from '@/lib/types'
 import { consumeAgentTaskOpen } from '@/lib/agents/navigation'
+import { formatUserDateTime, type UserDateTimeSettings } from '@/lib/userDateTime'
 
 type Agent = {
   id: string
@@ -75,10 +77,10 @@ type ThreadMessage = {
   taskId?: string
 }
 
-function formatTimestamp(value: string | undefined) {
-  if (!value) return ''
-  const date = new Date(value)
-  return Number.isNaN(date.getTime()) ? '' : date.toLocaleString()
+function formatTimestamp(value: string | undefined, settings: UserDateTimeSettings) {
+  return formatUserDateTime(value, settings, {
+    year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
+  })
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -120,6 +122,7 @@ async function copyText(text: string): Promise<boolean> {
 }
 
 export default function AgentsSection() {
+  const dateTimeSettings = useUserDateTime()
   const shortLandscape = useMediaQuery('(orientation: landscape) and (max-height: 500px) and (max-width: 899.95px)')
   const [agents, setAgents] = useState<Agent[]>([])
   const [runtime, setRuntime] = useState<Runtime | null>(null)
@@ -448,7 +451,7 @@ export default function AgentsSection() {
   const codexAccountDetails = [
     codexAuth?.email,
     codexAuth?.planType,
-    codexAuth?.expiresAt ? `Expires ${formatTimestamp(codexAuth.expiresAt)}` : '',
+    codexAuth?.expiresAt ? `Expires ${formatTimestamp(codexAuth.expiresAt, dateTimeSettings)}` : '',
   ].filter(Boolean).join(' | ')
 
   return (
@@ -586,7 +589,7 @@ export default function AgentsSection() {
                 <Box sx={{ px: 1.2, py: 0.9, borderRadius: 1, backgroundColor: message.role === 'user' ? 'rgba(168,199,250,0.2)' : message.role === 'system' ? 'rgba(239,83,80,0.12)' : 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.08)' }}>
                   <Typography variant="body2" color="text.primary" sx={{ whiteSpace: 'pre-wrap', lineHeight: 1.45, overflowWrap: 'anywhere' }}>{message.text}</Typography>
                 </Box>
-                <Typography variant="caption" color="text.disabled" sx={{ px: 0.5 }}>{formatTimestamp(message.createdAt)}</Typography>
+                <Typography variant="caption" color="text.disabled" sx={{ px: 0.5 }}>{formatTimestamp(message.createdAt, dateTimeSettings)}</Typography>
               </Box>
             ))}
           </Stack>
@@ -686,7 +689,7 @@ export default function AgentsSection() {
               <Box minWidth={0}>
                 <Typography variant="body2" color="text.secondary">Waiting for authorization</Typography>
                 <Typography variant="caption" color="text.disabled" sx={{ overflowWrap: 'anywhere' }}>
-                  Expires {formatTimestamp(deviceLogin?.expiresAt)}
+                  Expires {formatTimestamp(deviceLogin?.expiresAt, dateTimeSettings)}
                 </Typography>
               </Box>
             </Stack>

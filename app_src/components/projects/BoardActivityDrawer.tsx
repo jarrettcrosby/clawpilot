@@ -19,13 +19,22 @@ import CheckBoxRounded from '@mui/icons-material/CheckBoxRounded'
 import EditRounded from '@mui/icons-material/EditRounded'
 import type { Task, ActivityEntry } from '@/lib/types'
 import { PEOPLE, STATUS_LABELS } from '@/lib/types'
+import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
+import { formatUserDateTime, type UserDateTimeSettings } from '@/lib/userDateTime'
 
 type Props = { open: boolean; onClose: () => void; tasks: Task[] }
 
 type FlatEntry = ActivityEntry & { _taskTitle: string; _taskId: string }
 
-function formatDate(iso: string) {
-  return new Date(iso).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
+function formatDate(iso: string, settings: UserDateTimeSettings) {
+  return formatUserDateTime(iso, settings, {
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    timeZoneName: 'short',
+    fallback: 'Unknown time',
+  })
 }
 
 function ActorAvatar({ actor }: { actor: string }) {
@@ -58,6 +67,7 @@ function ActivityIcon({ type }: { type: string }) {
 }
 
 export default function BoardActivityDrawer({ open, onClose, tasks }: Props) {
+  const dateTimeSettings = useUserDateTime()
   const allActivity = useMemo<FlatEntry[]>(() => {
     const entries: FlatEntry[] = []
     for (const task of tasks) {
@@ -72,12 +82,17 @@ export default function BoardActivityDrawer({ open, onClose, tasks }: Props) {
   const grouped = useMemo(() => {
     const groups: Record<string, FlatEntry[]> = {}
     for (const entry of allActivity) {
-      const day = new Date(entry.timestamp).toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' })
+      const day = formatUserDateTime(entry.timestamp, dateTimeSettings, {
+        weekday: 'long',
+        month: 'long',
+        day: 'numeric',
+        fallback: 'Unknown date',
+      })
       if (!groups[day]) groups[day] = []
       groups[day].push(entry)
     }
     return groups
-  }, [allActivity])
+  }, [allActivity, dateTimeSettings])
 
   return (
     <Drawer anchor="right" open={open} onClose={onClose} PaperProps={{
@@ -130,7 +145,7 @@ export default function BoardActivityDrawer({ open, onClose, tasks }: Props) {
                       {/* Card reference */}
                       <Stack direction="row" spacing={1} alignItems="center">
                         <Typography variant="caption" color="text.disabled" sx={{ fontSize: '0.68rem' }}>
-                          {formatDate(entry.timestamp)}
+                          {formatDate(entry.timestamp, dateTimeSettings)}
                         </Typography>
                         <Typography variant="caption" sx={{ fontSize: '0.68rem', color: 'rgba(168,199,250,0.5)' }}>·</Typography>
                         <Typography variant="caption" sx={{ fontSize: '0.68rem', color: '#A8C7FA', opacity: 0.7, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 180 }}>

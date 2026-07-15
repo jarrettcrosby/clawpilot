@@ -15,12 +15,16 @@ import DialogContent from '@mui/material/DialogContent'
 import DialogActions from '@mui/material/DialogActions'
 import InboxRounded from '@mui/icons-material/InboxRounded'
 import UnarchiveRounded from '@mui/icons-material/UnarchiveRounded'
+import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import type { Task } from '@/lib/types'
+import { formatUserDateTime, type UserDateTimeSettings } from '@/lib/userDateTime'
 
 type Props = { query: string; onRestored: (t: Task) => void }
 
-function formatDate(iso: string) {
-  return new Date(iso).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+function formatDate(iso: string, settings: UserDateTimeSettings) {
+  return formatUserDateTime(iso, settings, {
+    month: 'short', day: 'numeric', year: 'numeric', fallback: 'Unknown date',
+  })
 }
 
 const CATEGORY_COLORS: Record<string, string> = {
@@ -30,6 +34,7 @@ const CATEGORY_COLORS: Record<string, string> = {
 }
 
 export default function ArchivedCardsView({ query, onRestored }: Props) {
+  const dateTimeSettings = useUserDateTime()
   const [tasks, setTasks] = useState<Task[]>([])
   const [loading, setLoading] = useState(true)
   const [restoring, setRestoring] = useState<string | null>(null)
@@ -132,7 +137,7 @@ export default function ArchivedCardsView({ query, onRestored }: Props) {
                     />
                     {task.archivedAt && (
                       <Typography variant="caption" color="text.disabled">
-                        Archived {formatDate(task.archivedAt)}
+                        Archived {formatDate(task.archivedAt, dateTimeSettings)}
                       </Typography>
                     )}
                   </Box>

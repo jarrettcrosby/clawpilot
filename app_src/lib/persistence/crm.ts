@@ -49,6 +49,7 @@ type CommonStageInput = {
   sourceRowNumber?: number | null
   sourcePayload?: Record<string, unknown>
   actorEmail: string
+  emitSuiteCrmOutbox?: boolean
 }
 
 export type StageOrganizationInput = CommonStageInput & {
@@ -983,11 +984,10 @@ async function stageInteraction(client: PoolClient, input: StageInteractionInput
   return result.rows[0]
 }
 
-function crmReferenceDestination(referenceCode: string, pipelineId: string) {
+function crmReferenceDestination(referenceCode: string) {
   const origin = appPublicUrl()
   if (!origin.startsWith('https://')) return null
   const destination = new URL(`/crm/${encodeURIComponent(referenceCode)}`, origin)
-  destination.searchParams.set('pipeline', pipelineId)
   return destination.toString()
 }
 
@@ -1006,7 +1006,7 @@ async function ensureCrmReferenceShortLink(
   client: PoolClient,
   input: { pipelineId: string; entity: CrmEntity; referenceCode: string; title: string },
 ) {
-  const destinationUrl = crmReferenceDestination(input.referenceCode, input.pipelineId)
+  const destinationUrl = crmReferenceDestination(input.referenceCode)
   if (!destinationUrl) return null
   const owner = await client.query<{ owner_email: string; organization_root_id: string }>(
     `WITH RECURSIVE ancestors AS (
@@ -1058,7 +1058,7 @@ async function ensureCrmReferenceShortLink(
   return inserted.rows[0] ? crmReferenceShortUrl(input.referenceCode) : null
 }
 
-export async function stageCrmRecordInPostgres(input: StageCrmRecordInput) {
+function normalizeStageCrmRecordInput(input: StageCrmRecordInput): StageCrmRecordInput {
   if (input.entity === 'meetings') {
     const timezone = clean(input.fields.timezone) || 'America/New_York'
     const startsAt = zonedDateTimeToIso(input.fields.startsAt, timezone)
@@ -1066,8 +1066,13 @@ export async function stageCrmRecordInPostgres(input: StageCrmRecordInput) {
     if (!startsAt || !endsAt || Date.parse(endsAt) <= Date.parse(startsAt)) {
       throw new Error('CRM meeting time is invalid for the selected timezone')
     }
-    input = { ...input, fields: { ...input.fields, startsAt, endsAt, timezone } }
+    return { ...input, fields: { ...input.fields, startsAt, endsAt, timezone } }
   }
+  return input
+}
+
+export async function stageCrmRecordWithClient(client: PoolClient, rawInput: StageCrmRecordInput) {
+  const input = normalizeStageCrmRecordInput(rawInput)
   const identityKey = input.entity === 'organizations'
     ? organizationIdentityKey(input.fields)
     : input.entity === 'contacts'
@@ -1083,53 +1088,178 @@ export async function stageCrmRecordInPostgres(input: StageCrmRecordInput) {
     ? stableGlobalSuiteCrmId(input.entity, sourceKey)
     : stableSuiteCrmId(input.pipelineId, input.entity, sourceKey)
   const sourceHash = crmSourceHash({ fields: input.fields, sourcePayload: input.sourcePayload || {} })
-  return withTransaction(async (client) => {
-    let row: { id: string; suitecrm_id: string; reference_code: string }
-    switch (input.entity) {
-      case 'organizations':
-        row = await stageOrganization(client, input, suiteCrmId, sourceHash, sourceKey)
-        break
-      case 'contacts':
-        row = await stageContact(client, input, suiteCrmId, sourceHash, sourceKey)
-        break
-      case 'leads':
-        row = await stageLead(client, input, suiteCrmId, sourceHash)
-        break
-      case 'opportunities':
-        row = await stageOpportunity(client, input, suiteCrmId, sourceHash)
-        break
-      case 'meetings':
-        row = await stageMeeting(client, input, suiteCrmId, sourceHash)
-        break
-      case 'campaigns':
-        row = await stageCampaign(client, input, suiteCrmId, sourceHash)
-        break
-      case 'interactions':
-        row = await stageInteraction(client, input, suiteCrmId, sourceHash)
-        break
-    }
+  let row: { id: string; suitecrm_id: string; reference_code: string }
+  switch (input.entity) {
+    case 'organizations':
+      row = await stageOrganization(client, input, suiteCrmId, sourceHash, sourceKey)
+      break
+    case 'contacts':
+      row = await stageContact(client, input, suiteCrmId, sourceHash, sourceKey)
+      break
+    case 'leads':
+      row = await stageLead(client, input, suiteCrmId, sourceHash)
+      break
+    case 'opportunities':
+      row = await stageOpportunity(client, input, suiteCrmId, sourceHash)
+      break
+    case 'meetings':
+      row = await stageMeeting(client, input, suiteCrmId, sourceHash)
+      break
+    case 'campaigns':
+      row = await stageCampaign(client, input, suiteCrmId, sourceHash)
+      break
+    case 'interactions':
+      row = await stageInteraction(client, input, suiteCrmId, sourceHash)
+      break
+  }
+  if (input.emitSuiteCrmOutbox !== false) {
     await enqueueSuiteCrmRecord(client, input, row.id, row.suitecrm_id, row.reference_code, sourceHash)
-    const title = clean('name' in input.fields ? input.fields.name : 'fullName' in input.fields
-      ? input.fields.fullName : 'subject' in input.fields ? input.fields.subject : row.reference_code)
-    const shortUrl = await ensureCrmReferenceShortLink(client, {
-      pipelineId: input.pipelineId,
-      entity: input.entity,
-      referenceCode: row.reference_code,
-      title: title || row.reference_code,
-    })
-    await client.query(
-      `INSERT INTO audit_events (actor, event_type, aggregate_type, aggregate_id, payload)
-       VALUES ($1, 'crm.record.staged', $2, $3, $4::jsonb)`,
-      [input.actorEmail, `crm_${input.entity}`, row.id, JSON.stringify({ pipelineId: input.pipelineId, sourceKey })],
-    )
-    return {
-      id: row.id,
-      suiteCrmId: row.suitecrm_id,
-      referenceCode: row.reference_code,
-      shortUrl,
-      sourceHash,
-    }
+  }
+  const title = clean('name' in input.fields ? input.fields.name : 'fullName' in input.fields
+    ? input.fields.fullName : 'subject' in input.fields ? input.fields.subject : row.reference_code)
+  const shortUrl = await ensureCrmReferenceShortLink(client, {
+    pipelineId: input.pipelineId,
+    entity: input.entity,
+    referenceCode: row.reference_code,
+    title: title || row.reference_code,
   })
+  await client.query(
+    `INSERT INTO audit_events (actor, event_type, aggregate_type, aggregate_id, payload)
+     VALUES ($1, 'crm.record.staged', $2, $3, $4::jsonb)`,
+    [input.actorEmail, `crm_${input.entity}`, row.id, JSON.stringify({ pipelineId: input.pipelineId, sourceKey })],
+  )
+  return {
+    id: row.id,
+    suiteCrmId: row.suitecrm_id,
+    referenceCode: row.reference_code,
+    shortUrl,
+    sourceHash,
+  }
+}
+
+export async function stageCrmRecordInPostgres(input: StageCrmRecordInput) {
+  return withTransaction((client) => stageCrmRecordWithClient(client, input))
+}
+
+export function normalizeCrmDescription(value: unknown): string {
+  const normalized = String(value ?? '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '')
+    .trim()
+  if (normalized.length > 10_000) throw new Error('CRM description must be 10,000 characters or fewer')
+  return normalized
+}
+
+export type UpdateCrmDescriptionInput = {
+  pipelineId: string
+  entity: 'organizations' | 'contacts'
+  id: string
+  description: unknown
+  actorEmail: string
+}
+
+export async function updateCrmDescriptionWithClient(client: PoolClient, input: UpdateCrmDescriptionInput) {
+  const description = normalizeCrmDescription(input.description)
+  if (input.entity === 'organizations') {
+    const result = await client.query<Record<string, unknown>>(
+      `SELECT organization.*, parent.suitecrm_id AS parent_suitecrm_id
+       FROM crm_organizations organization
+       LEFT JOIN crm_organizations parent ON parent.id = organization.parent_organization_id
+       WHERE organization.pipeline_id = $1::uuid AND organization.id = $2::uuid
+       LIMIT 1`,
+      [input.pipelineId, input.id],
+    )
+    const row = result.rows[0]
+    if (!row) throw new Error('CRM organization was not found')
+    const sourcePayload = row.source_payload && typeof row.source_payload === 'object' && !Array.isArray(row.source_payload)
+      ? row.source_payload as Record<string, unknown>
+      : {}
+    return stageCrmRecordWithClient(client, {
+      entity: 'organizations',
+      pipelineId: input.pipelineId,
+      localId: input.id,
+      sourceKey: clean(row.source_key),
+      sourceSheetId: nullable(row.source_sheet_id),
+      sourceRowNumber: row.source_row_number === null ? null : Number(row.source_row_number),
+      sourcePayload,
+      actorEmail: input.actorEmail,
+      fields: {
+        parentOrganizationId: nullable(row.parent_organization_id),
+        parentOrganizationSuiteCrmId: nullable(row.parent_suitecrm_id),
+        workspaceOrganizationId: nullable(row.workspace_organization_id),
+        relationshipType: (row.relationship_type || 'customer') as StageOrganizationInput['fields']['relationshipType'],
+        priority: clean(row.priority),
+        name: clean(row.name),
+        accountType: clean(row.account_type),
+        accountManager: clean(row.account_manager),
+        website: clean(row.website),
+        linkedinUrl: clean(row.linkedin_url),
+        phone: clean(row.phone),
+        email: clean(row.email),
+        emailOptOut: row.email_opt_out === true,
+        address: clean(row.billing_address_street),
+        city: clean(row.billing_address_city),
+        state: clean(row.billing_address_state),
+        postalCode: clean(row.billing_address_postal_code),
+        country: clean(row.billing_address_country),
+        description,
+      },
+    })
+  }
+
+  const result = await client.query<Record<string, unknown>>(
+    `SELECT contact.*, organization.suitecrm_id AS organization_suitecrm_id,
+       app_user.reference_code AS app_user_reference_code
+     FROM crm_contacts contact
+     JOIN crm_organizations organization ON organization.id = contact.organization_id
+     LEFT JOIN app_users app_user ON app_user.email = contact.app_user_email
+     WHERE contact.pipeline_id = $1::uuid AND contact.id = $2::uuid
+     LIMIT 1`,
+    [input.pipelineId, input.id],
+  )
+  const row = result.rows[0]
+  if (!row) throw new Error('CRM contact was not found')
+  const sourcePayload = row.source_payload && typeof row.source_payload === 'object' && !Array.isArray(row.source_payload)
+    ? row.source_payload as Record<string, unknown>
+    : {}
+  return stageCrmRecordWithClient(client, {
+    entity: 'contacts',
+    pipelineId: input.pipelineId,
+    localId: input.id,
+    sourceKey: clean(row.source_key),
+    sourceSheetId: nullable(row.source_sheet_id),
+    sourceRowNumber: row.source_row_number === null ? null : Number(row.source_row_number),
+    sourcePayload,
+    actorEmail: input.actorEmail,
+    fields: {
+      organizationId: clean(row.organization_id),
+      organizationSuiteCrmId: clean(row.organization_suitecrm_id),
+      appUserEmail: nullable(row.app_user_email),
+      appUserReferenceCode: nullable(row.app_user_reference_code),
+      priority: clean(row.priority),
+      firstName: clean(row.first_name),
+      lastName: clean(row.last_name),
+      fullName: clean(row.full_name),
+      contactType: clean(row.contact_type),
+      accountManager: clean(row.account_manager),
+      jobTitle: clean(row.job_title),
+      email: clean(row.email),
+      linkedinUrl: clean(row.linkedin_url),
+      phoneWork: clean(row.phone_work),
+      phoneMobile: clean(row.phone_mobile),
+      address: clean(row.primary_address_street),
+      city: clean(row.primary_address_city),
+      state: clean(row.primary_address_state),
+      postalCode: clean(row.primary_address_postal_code),
+      country: clean(row.primary_address_country),
+      description,
+      emailOptOut: row.email_opt_out === true,
+    },
+  })
+}
+
+export async function updateCrmDescriptionInPostgres(input: UpdateCrmDescriptionInput) {
+  return withTransaction((client) => updateCrmDescriptionWithClient(client, input))
 }
 
 export async function ensurePipelineCrmHierarchy(input: {
@@ -1643,14 +1773,38 @@ export async function resolveCrmReferenceCode(referenceValue: unknown): Promise<
   }
 }
 
-export async function resolveCrmReferenceRoute(referenceValue: unknown) {
+export async function resolveCrmReferenceRoute(referenceValue: unknown, options: {
+  actorEmail?: unknown
+  requestedPipelineId?: unknown
+} = {}) {
   const referenceCode = await resolveCrmReferenceCode(referenceValue)
   const entity = crmEntityForReferenceCode(referenceCode)
   if (!entity || !isPostgresStorageEnabled()) return { referenceCode, pipelineId: null }
+  const actorEmail = clean(options.actorEmail).toLowerCase()
+  const requestedPipelineId = /^[0-9a-f-]{36}$/i.test(clean(options.requestedPipelineId))
+    ? clean(options.requestedPipelineId)
+    : ''
   try {
     const result = await query<{ pipeline_id: string }>(
-      `SELECT pipeline_id::text FROM ${ENTITY_TABLE[entity]} WHERE reference_code = $1 LIMIT 1`,
-      [referenceCode],
+      `SELECT pipeline.id::text AS pipeline_id
+       FROM ${ENTITY_TABLE[entity]} record
+       JOIN pipeline_spaces pipeline ON pipeline.id = record.pipeline_id
+       LEFT JOIN pipeline_space_members membership
+         ON membership.pipeline_id = pipeline.id AND membership.user_email = $2
+       WHERE record.reference_code = $1
+         AND ($2 = '' OR pipeline.owner_email = $2 OR membership.user_email = $2)
+       ORDER BY
+         CASE
+           WHEN pipeline.id::text = $3 THEN 0
+           WHEN pipeline.owner_email = $2 THEN 1
+           WHEN membership.user_email = $2 THEN 2
+           ELSE 3
+         END,
+         pipeline.is_default DESC,
+         pipeline.created_at,
+         pipeline.id
+       LIMIT 1`,
+      [referenceCode, actorEmail, requestedPipelineId],
     )
     return { referenceCode, pipelineId: result.rows[0]?.pipeline_id || null }
   } catch (error) {
@@ -1683,13 +1837,13 @@ export async function ensurePipelineCrmReferenceLinks(pipelineId: string) {
   if (!origin.startsWith('https://')) return 0
   const result = await query(
     `WITH RECURSIVE records AS (
-       SELECT reference_code, name AS title, 'organizations'::text AS entity FROM crm_organizations WHERE pipeline_id = $1::uuid
-       UNION ALL SELECT reference_code, full_name, 'contacts' FROM crm_contacts WHERE pipeline_id = $1::uuid
-       UNION ALL SELECT reference_code, full_name, 'leads' FROM crm_leads WHERE pipeline_id = $1::uuid
-       UNION ALL SELECT reference_code, name, 'opportunities' FROM crm_opportunities WHERE pipeline_id = $1::uuid
-       UNION ALL SELECT reference_code, subject, 'meetings' FROM crm_meetings WHERE pipeline_id = $1::uuid
-       UNION ALL SELECT reference_code, subject, 'interactions' FROM crm_interactions WHERE pipeline_id = $1::uuid
-       UNION ALL SELECT reference_code, name, 'campaigns' FROM crm_campaigns WHERE pipeline_id = $1::uuid
+       SELECT reference_code, name AS title, 'organizations'::text AS entity, email FROM crm_organizations WHERE pipeline_id = $1::uuid
+       UNION ALL SELECT reference_code, full_name, 'contacts', email FROM crm_contacts WHERE pipeline_id = $1::uuid
+       UNION ALL SELECT reference_code, full_name, 'leads', email FROM crm_leads WHERE pipeline_id = $1::uuid
+       UNION ALL SELECT reference_code, name, 'opportunities', NULL::text FROM crm_opportunities WHERE pipeline_id = $1::uuid
+       UNION ALL SELECT reference_code, subject, 'meetings', NULL::text FROM crm_meetings WHERE pipeline_id = $1::uuid
+       UNION ALL SELECT reference_code, subject, 'interactions', NULL::text FROM crm_interactions WHERE pipeline_id = $1::uuid
+       UNION ALL SELECT reference_code, name, 'campaigns', NULL::text FROM crm_campaigns WHERE pipeline_id = $1::uuid
      ), ancestors AS (
        SELECT organization.id, organization.parent_id, ARRAY[organization.id] AS path
        FROM pipeline_spaces pipeline
@@ -1707,14 +1861,27 @@ export async function ensurePipelineCrmReferenceLinks(pipelineId: string) {
          SELECT id FROM ancestors ORDER BY (parent_id IS NULL) DESC LIMIT 1
        ) root ON true
        WHERE pipeline.id = $1::uuid
+     ), links AS (
+       SELECT records.reference_code AS slug,
+         $2 || '/crm/' || records.reference_code AS destination_url,
+         records.title,
+         ARRAY['crm', records.entity, records.reference_code]::text[] AS tags
+       FROM records
+       UNION ALL
+       SELECT 'mail-' || records.reference_code,
+         $2 || '/crm/' || records.reference_code || '?action=compose-email',
+         'Email ' || records.title,
+         ARRAY['crm', 'email', records.entity, records.reference_code]::text[]
+       FROM records
+       WHERE records.entity IN ('organizations', 'contacts')
+         AND NULLIF(btrim(records.email), '') IS NOT NULL
      )
      INSERT INTO short_links (
        owner_email, organization_root_id, source_app, slug, destination_url, title, tags, created_at, updated_at
      )
-     SELECT owner.owner_email, owner.organization_root_id, 'clawpilot-crm', records.reference_code,
-       $2 || '/crm/' || records.reference_code || '?pipeline=' || $1::text, left(records.title, 200),
-       ARRAY['crm', records.entity, records.reference_code]::text[], now(), now()
-     FROM records CROSS JOIN owner
+     SELECT owner.owner_email, owner.organization_root_id, 'clawpilot-crm', links.slug,
+       links.destination_url, left(links.title, 200), links.tags, now(), now()
+     FROM links CROSS JOIN owner
      ON CONFLICT (slug) DO UPDATE SET
        organization_root_id = EXCLUDED.organization_root_id,
        destination_url = EXCLUDED.destination_url,
