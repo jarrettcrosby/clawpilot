@@ -10,6 +10,7 @@ import {
   type StageMeetingInput,
 } from '@/lib/persistence/crm'
 import { query } from '@/lib/persistence/postgres'
+import { normalizeUserEmail } from '@/lib/users'
 
 const CURSOR_KEY = 'crm.suitecrm.meeting_ingestion.cursor'
 const INITIAL_LOOKBACK_MS = 24 * 60 * 60 * 1000
@@ -272,6 +273,7 @@ async function reconcileMeeting(snapshot: SuiteCrmMeetingSnapshot): Promise<{
     return { matched: true, staged: false, calendarActionQueued: false }
   }
   const dateModified = suiteTimestamp(snapshot.attributes.date_modified, 'modified time')
+  const calendarOwnerEmail = await meetingCalendarOwnerEmail(meeting)
   const staged = await stageCrmRecordInPostgres({
     entity: 'meetings',
     pipelineId: meeting.pipeline_id,
@@ -281,13 +283,11 @@ async function reconcileMeeting(snapshot: SuiteCrmMeetingSnapshot): Promise<{
       ...(meeting.source_payload || {}),
       source: 'suitecrm-inbound',
       suiteCrmDateModified: dateModified,
+      calendarOwnerEmail,
     },
     actorEmail: meeting.owner_email,
     fields,
   })
-  if (fields.status === 'cancelled' || fields.status === 'completed') {
-    return { matched: true, staged: true, calendarActionQueued: false }
-  }
   const revision = crypto.createHash('sha256')
     .update(snapshot.id)
     .update('\u0000')
@@ -296,7 +296,7 @@ async function reconcileMeeting(snapshot: SuiteCrmMeetingSnapshot): Promise<{
     .slice(0, 24)
   const queued = await enqueueCrmIntegrationAction({
     pipelineId: meeting.pipeline_id,
-    actorEmail: meeting.owner_email,
+    actorEmail: calendarOwnerEmail,
     actionType: 'create_calendar_event',
     referenceCode: staged.referenceCode,
     payload: {
@@ -307,10 +307,33 @@ async function reconcileMeeting(snapshot: SuiteCrmMeetingSnapshot): Promise<{
       timezone: fields.timezone,
       location: fields.location,
       attendeeEmails: fields.attendeeEmails,
+      meetingStatus: fields.status,
     },
     idempotencyKey: `crm:suitecrm-meeting-calendar:${staged.referenceCode}:${revision}`,
   })
   return { matched: true, staged: true, calendarActionQueued: queued.created }
+}
+
+async function meetingCalendarOwnerEmail(meeting: MeetingRow): Promise<string> {
+  const stored = meeting.source_payload?.calendarOwnerEmail
+  if (typeof stored === 'string') {
+    try {
+      return normalizeUserEmail(stored)
+    } catch {
+      // Fall through to historical action attribution.
+    }
+  }
+  const historical = await query<{ actor_email: string }>(
+    `SELECT actor_email
+     FROM crm_integration_actions
+     WHERE pipeline_id = $1::uuid
+       AND reference_code = $2
+       AND app = 'google-calendar'
+     ORDER BY (external_id IS NOT NULL) DESC, created_at ASC
+     LIMIT 1`,
+    [meeting.pipeline_id, meeting.reference_code],
+  )
+  return normalizeUserEmail(historical.rows[0]?.actor_email || meeting.owner_email)
 }
 
 export function sanitizeSuiteCrmMeetingIngestionError(error: unknown): string {

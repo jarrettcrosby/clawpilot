@@ -283,9 +283,15 @@ export async function POST(req: NextRequest) {
       const meetingStatus = ['planned', 'queued', 'scheduled', 'completed', 'cancelled', 'failed'].includes(String(fields.status))
         ? fields.status as 'planned' | 'queued' | 'scheduled' | 'completed' | 'cancelled' | 'failed'
         : 'planned'
+      const storedCalendarOwner = validEmail(current?.sourcePayload?.calendarOwnerEmail)
+      const calendarOwnerEmail = storedCalendarOwner || actor.email
       const staged = await stageCrmRecordInPostgres({
         entity, pipelineId: pipeline.id, localId: current?.id, sourceKey, actorEmail: actor.email,
-        sourcePayload: { source: 'clawpilot' },
+        sourcePayload: {
+          ...(current?.sourcePayload || {}),
+          source: 'clawpilot',
+          calendarOwnerEmail,
+        },
         fields: {
           organizationId: resolvedOrganization?.id || null,
           organizationSuiteCrmId: resolvedOrganization?.suiteCrmId || null,
@@ -299,11 +305,9 @@ export async function POST(req: NextRequest) {
           externalEventUrl: stringValue(fields.externalEventUrl, 2000) || null, joinUrl: stringValue(fields.joinUrl, 2000) || null,
         },
       })
-      const calendarAction = meetingStatus === 'cancelled'
-        ? null
-        : await enqueueCrmIntegrationAction({
+      const calendarAction = await enqueueCrmIntegrationAction({
           pipelineId: pipeline.id,
-          actorEmail: actor.email,
+          actorEmail: calendarOwnerEmail,
           actionType: 'create_calendar_event',
           referenceCode: staged.referenceCode,
           payload: {
@@ -314,6 +318,7 @@ export async function POST(req: NextRequest) {
             timezone: meetingTimezone,
             location: stringValue(fields.location, 500),
             attendeeEmails: meetingAttendees,
+            meetingStatus,
           },
           idempotencyKey: `crm:meeting-calendar-sync:${staged.referenceCode}:${staged.sourceHash}`,
         })

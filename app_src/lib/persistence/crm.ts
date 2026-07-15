@@ -1580,12 +1580,19 @@ export async function readCrmRecordReference(input: {
        COALESCE(to_jsonb(record)->>'email_opt_out', 'false') AS email_opt_out,
        to_jsonb(record)->>'workspace_organization_id' AS workspace_organization_id,
        to_jsonb(record)->>'parent_organization_id' AS parent_organization_id,
-       COALESCE(to_jsonb(record)->>'relationship_type', '') AS relationship_type
+       COALESCE(to_jsonb(record)->>'relationship_type', '') AS relationship_type,
+       COALESCE(to_jsonb(record)->'source_payload', '{}'::jsonb) AS source_payload,
+       to_jsonb(record)->>'external_event_id' AS external_event_id,
+       COALESCE(to_jsonb(record)->>'status', '') AS record_status
      FROM ${table} record WHERE pipeline_id = $1::uuid AND id = $2::uuid LIMIT 1`,
     [input.pipelineId, input.id],
   )
   const row = result.rows[0]
   if (!row) throw new Error('CRM record not found')
+  const sourcePayload = row.source_payload && typeof row.source_payload === 'object'
+    && !Array.isArray(row.source_payload)
+    ? row.source_payload as Record<string, unknown>
+    : {}
   return {
     id: String(row.id),
     referenceCode: clean(row.reference_code),
@@ -1601,6 +1608,9 @@ export async function readCrmRecordReference(input: {
     workspaceOrganizationId: nullable(row.workspace_organization_id),
     parentOrganizationId: nullable(row.parent_organization_id),
     relationshipType: clean(row.relationship_type),
+    sourcePayload,
+    externalEventId: nullable(row.external_event_id),
+    status: clean(row.record_status),
   }
 }
 

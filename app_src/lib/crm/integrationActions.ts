@@ -8,6 +8,7 @@ import {
   stageCrmRecordInPostgres,
 } from '@/lib/persistence/crm'
 import { query, withTransaction } from '@/lib/persistence/postgres'
+import type { CrmMeeting } from '@/lib/crm/types'
 import { normalizeUserEmail } from '@/lib/users'
 import { zonedDateTimeToIso } from '@/lib/zonedDateTime'
 
@@ -371,7 +372,7 @@ async function normalizePayload(
   if (actionType === 'create_calendar_event') {
     assertOnlyFields(payload, [
       'subject', 'title', 'description', 'startsAt', 'start', 'endsAt', 'end',
-      'timezone', 'location', 'attendeeEmails',
+      'timezone', 'location', 'attendeeEmails', 'meetingStatus',
     ])
     if (target.entity === 'interactions' || target.entity === 'campaigns') {
       throw new CrmIntegrationActionError('Calendar actions cannot target this CRM record type')
@@ -387,6 +388,7 @@ async function normalizePayload(
     }
     const attendeeEmails = normalizeEmailList(payload.attendeeEmails)
     if (target.email && EMAIL_PATTERN.test(target.email)) attendeeEmails.unshift(target.email.toLowerCase())
+    const meetingStatus = normalizeMeetingStatus(payload.meetingStatus)
     return {
       subject,
       description: cleanString(payload.description, 50_000, 'Calendar event description'),
@@ -395,6 +397,7 @@ async function normalizePayload(
       timezone,
       location: cleanString(payload.location, 1000, 'Calendar event location'),
       attendeeEmails: Array.from(new Set(attendeeEmails)),
+      meetingStatus,
     }
   }
 
@@ -1200,7 +1203,7 @@ async function stageCalendarMeeting(
   action: LeasedCrmIntegrationAction,
   target: CrmReferenceRecord,
   result: { eventId: string | null; eventUrl: string | null; joinUrl: string | null },
-  status: 'queued' | 'scheduled',
+  status: CrmMeeting['status'],
 ) {
   let organizationId = target.entity === 'organizations' ? target.id : target.organizationId
   let contactId = target.entity === 'contacts' ? target.id : null
@@ -1208,6 +1211,7 @@ async function stageCalendarMeeting(
   let opportunityId = target.entity === 'opportunities' ? target.id : null
   let sourceKey = `crm-action:${action.id}:meeting`
   let localId: string | null = null
+  let existingSourcePayload: JsonObject = {}
 
   if (target.entity === 'meetings') {
     const current = await query<{
@@ -1216,9 +1220,10 @@ async function stageCalendarMeeting(
       lead_id: string | null
       opportunity_id: string | null
       source_key: string
+      source_payload: JsonObject | null
     }>(
       `SELECT organization_id::text, contact_id::text, lead_id::text,
-         opportunity_id::text, source_key
+         opportunity_id::text, source_key, source_payload
        FROM crm_meetings WHERE pipeline_id = $1::uuid AND id = $2::uuid LIMIT 1`,
       [action.pipelineId, target.id],
     )
@@ -1230,6 +1235,10 @@ async function stageCalendarMeeting(
     opportunityId = meeting.opportunity_id
     sourceKey = meeting.source_key
     localId = target.id
+    existingSourcePayload = meeting.source_payload && typeof meeting.source_payload === 'object'
+      && !Array.isArray(meeting.source_payload)
+      ? meeting.source_payload
+      : {}
   }
 
   let organizationSuiteCrmId: string | null = null
@@ -1278,9 +1287,11 @@ async function stageCalendarMeeting(
     localId,
     sourceKey,
     sourcePayload: {
+      ...existingSourcePayload,
       source: 'crm-integration-action',
       actionId: action.id,
       provider: action.provider,
+      calendarOwnerEmail: action.actorEmail,
     },
     actorEmail: action.actorEmail,
     fields: {
@@ -1305,6 +1316,15 @@ async function stageCalendarMeeting(
       joinUrl: result.joinUrl,
     },
   })
+}
+
+function normalizeMeetingStatus(value: unknown): CrmMeeting['status'] {
+  const status = cleanString(value, 32, 'Meeting status').toLowerCase()
+  if (!status) return 'scheduled'
+  if (['planned', 'queued', 'scheduled', 'completed', 'cancelled', 'failed'].includes(status)) {
+    return status as CrmMeeting['status']
+  }
+  throw new PermanentCrmIntegrationActionError('Calendar action meeting status is invalid')
 }
 
 function calendarEventIdForMeeting(referenceCode: string): string {
@@ -1346,12 +1366,19 @@ async function createCalendarEventAction(action: LeasedCrmIntegrationAction, tar
   const description = cleanString(action.payload.description, 50_000, 'Calendar event description')
   const location = cleanString(action.payload.location, 1000, 'Calendar event location')
   const attendeeEmails = normalizeEmailList(action.payload.attendeeEmails)
+  const desiredMeetingStatus = normalizeMeetingStatus(action.payload.meetingStatus)
+  const provisionalStatus: CrmMeeting['status'] = ['completed', 'cancelled', 'failed'].includes(desiredMeetingStatus)
+    ? desiredMeetingStatus
+    : 'queued'
+  const finalMeetingStatus: CrmMeeting['status'] = ['planned', 'queued'].includes(desiredMeetingStatus)
+    ? 'scheduled'
+    : desiredMeetingStatus
 
   const provisionalMeeting = await stageCalendarMeeting(
     action,
     target,
     { eventId: null, eventUrl: null, joinUrl: null },
-    'queued',
+    provisionalStatus,
   )
   const meetingTarget = await readCrmRecordByReference({
     pipelineId: action.pipelineId,
@@ -1366,6 +1393,57 @@ async function createCalendarEventAction(action: LeasedCrmIntegrationAction, tar
   let organizerEmail = typeof action.responseSummary.organizerEmail === 'string'
     ? normalizeEmail(action.responseSummary.organizerEmail, 'Recorded Calendar organizer')
     : null
+
+  if (desiredMeetingStatus === 'cancelled') {
+    eventId = eventId || cleanString(currentEvent?.external_event_id, 1000, 'Calendar event ID') || null
+    if (eventId) {
+      const selectedConnection = await selectedMatonConnection(action, 'google-calendar')
+      organizerEmail = selectedConnection.accountEmail
+        ? normalizeEmail(selectedConnection.accountEmail, 'Selected Calendar account')
+        : organizerEmail
+      const response = await matonFetch(
+        `/google-calendar/calendar/v3/calendars/primary/events/${encodeURIComponent(eventId)}?sendUpdates=all`,
+        { method: 'DELETE' },
+        {
+          ownerEmail: action.actorEmail,
+          app: 'google-calendar',
+          boundConnectionId: selectedConnection.connectionId,
+        },
+      )
+      if (!response.ok && response.status !== 404 && response.status !== 410) {
+        throw new Error(`google-calendar provider request failed with status ${response.status}`)
+      }
+    }
+    const summary = {
+      eventId,
+      eventUrl,
+      joinUrl,
+      meetingReferenceCode: provisionalMeeting.referenceCode,
+      meetingUrl,
+      organizerEmail,
+      meetingStatus: 'cancelled',
+    }
+    await recordAttemptSucceeded(action, eventId, summary)
+    const meeting = await stageCalendarMeeting(
+      action,
+      meetingTarget,
+      { eventId, eventUrl, joinUrl },
+      'cancelled',
+    )
+    await stageActionInteraction({
+      action,
+      target,
+      subject,
+      description,
+      interactionType: 'meeting',
+      deliveryStatus: 'cancelled',
+      providerMessageId: eventId,
+      meetingId: meeting.id,
+    })
+    await completeAction(action, eventId, summary)
+    return
+  }
+
   if (!eventId) {
     const selectedConnection = await selectedMatonConnection(action, 'google-calendar')
     const { connectionId } = selectedConnection
@@ -1446,13 +1524,14 @@ async function createCalendarEventAction(action: LeasedCrmIntegrationAction, tar
     meetingReferenceCode: provisionalMeeting.referenceCode,
     meetingUrl,
     organizerEmail,
+    meetingStatus: finalMeetingStatus,
   }
   await recordAttemptSucceeded(action, eventId, summary)
   const meeting = await stageCalendarMeeting(
     action,
     meetingTarget,
     { eventId, eventUrl, joinUrl },
-    'scheduled',
+    finalMeetingStatus,
   )
   await stageActionInteraction({
     action,

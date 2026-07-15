@@ -349,7 +349,10 @@ async function ownedMeetingForEvent(input: {
        ON lead.pipeline_id = meeting.pipeline_id AND lead.id = meeting.lead_id
      LEFT JOIN crm_opportunities opportunity
        ON opportunity.pipeline_id = meeting.pipeline_id AND opportunity.id = meeting.opportunity_id
-     WHERE pipeline.owner_email = $1
+     WHERE lower(COALESCE(
+         NULLIF(meeting.source_payload->>'calendarOwnerEmail', ''),
+         pipeline.owner_email
+       )) = $1
        AND (
          meeting.external_event_id = $2
          OR ($3::text IS NOT NULL AND meeting.reference_code = $3)
@@ -577,7 +580,10 @@ async function reconcileEvent(input: {
     pipelineId: meeting.pipeline_id,
     localId: meeting.id,
     sourceKey: meeting.source_key,
-    sourcePayload: asRecord(meeting.source_payload) || {},
+    sourcePayload: {
+      ...(asRecord(meeting.source_payload) || {}),
+      calendarOwnerEmail: input.ownerEmail,
+    },
     actorEmail: input.ownerEmail,
     fields: {
       organizationId: meeting.organization_id,
