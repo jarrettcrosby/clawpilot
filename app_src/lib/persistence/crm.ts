@@ -1145,6 +1145,14 @@ export async function stageCrmRecordWithClient(client: PoolClient, rawInput: Sta
   }
   if (input.emitSuiteCrmOutbox !== false) {
     await enqueueSuiteCrmRecord(client, input, row.id, row.suitecrm_id, row.reference_code, sourceHash)
+  } else {
+    const table = ENTITY_TABLE[input.entity]
+    await client.query(
+      `UPDATE ${table}
+       SET sync_status = 'synced', sync_error = NULL, suitecrm_synced_at = now(), updated_at = now()
+       WHERE id = $1::uuid`,
+      [row.id],
+    )
   }
   const title = clean('name' in input.fields ? input.fields.name : 'fullName' in input.fields
     ? input.fields.fullName : 'subject' in input.fields ? input.fields.subject : row.reference_code)

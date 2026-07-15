@@ -325,6 +325,7 @@ const crmAdapter = read('app_src/lib/persistence/crm.ts')
 assertIncludes(crmAdapter, 'stageCrmRecordInPostgres', 'CRM projection adapter')
 assertIncludes(crmAdapter, "target_system, payload", 'CRM outbox persistence')
 assertIncludes(crmAdapter, "'upsert_record', 'suitecrm'", 'SuiteCRM outbox target')
+assertIncludes(crmAdapter, "SET sync_status = 'synced', sync_error = NULL, suitecrm_synced_at = now()", 'SuiteCRM inbound records marked synced')
 assertIncludes(crmAdapter, "operation IN ('upsert_record', 'delete_record')", 'SuiteCRM deletion outbox claims')
 assertIncludes(crmAdapter, 'ensurePipelineCrmHierarchy', 'workspace organization CRM hierarchy')
 assertIncludes(crmAdapter, 'WITH RECURSIVE descendants AS', 'descendant organization CRM hierarchy')
@@ -424,6 +425,16 @@ for (const contract of [
   'CREATE TRIGGER trg_validate_crm_board_card_scope',
 ]) {
   assertIncludes(accountMembershipMigration, contract, 'account membership and CRM board scope migration')
+}
+
+const suiteCrmInboundSyncMigration = read('db/migrations/0035_suitecrm_inbound_sync_status.sql')
+for (const contract of [
+  "source_payload ? 'suiteCrmInbound'",
+  "outbox.status <> 'succeeded'",
+  "aggregate_type = 'crm_interactions'",
+  "sync_status = 'synced'",
+]) {
+  assertIncludes(suiteCrmInboundSyncMigration, contract, 'SuiteCRM inbound sync status migration')
 }
 
 const crmWorkbookOrganizationProjection = read('app_src/lib/crm/workbookProjection.ts')
@@ -932,6 +943,7 @@ assertIncludes(healthRoute, '0020_crm_gateway_and_reporting.sql', 'hosted CRM ga
 assertIncludes(healthRoute, '0021_crm_identity_and_organization_hierarchy.sql', 'hosted CRM identity hierarchy migration health')
 assertIncludes(healthRoute, '0022_pipeline_sheet_access_links.sql', 'hosted pipeline Sheet access-link migration health')
 assertIncludes(healthRoute, '0033_crm_board_projection_and_legacy_alias_cleanup.sql', 'hosted CRM board projection migration health')
+assertIncludes(healthRoute, '0035_suitecrm_inbound_sync_status.sql', 'hosted SuiteCRM inbound sync migration health')
 assertIncludes(healthRoute, 'readSuiteCrmWorkerHeartbeat', 'hosted SuiteCRM worker health')
 assertIncludes(healthRoute, 'migration_checksums_present', 'hosted migration checksum health')
 assertIncludes(healthRoute, 'queryAgentCredentials', 'shared agent credential store health')

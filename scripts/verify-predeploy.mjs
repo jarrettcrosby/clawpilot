@@ -128,6 +128,7 @@ for (const requiredPath of [
   'db/migrations/0032_reference_allocation_leak_cleanup.sql',
   'db/migrations/0033_crm_board_projection_and_legacy_alias_cleanup.sql',
   'db/migrations/0034_account_membership_crm_board_scope.sql',
+  'db/migrations/0035_suitecrm_inbound_sync_status.sql',
   'scripts/start-railway.sh',
   'scripts/test-suitecrm-interaction-ingestion.mjs',
   'scripts/pipeline-outbox-poller.mjs',
