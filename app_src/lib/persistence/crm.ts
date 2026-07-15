@@ -1576,6 +1576,22 @@ export async function resolveCrmReferenceCode(referenceValue: unknown): Promise<
   }
 }
 
+export async function resolveCrmReferenceRoute(referenceValue: unknown) {
+  const referenceCode = await resolveCrmReferenceCode(referenceValue)
+  const entity = crmEntityForReferenceCode(referenceCode)
+  if (!entity || !isPostgresStorageEnabled()) return { referenceCode, pipelineId: null }
+  try {
+    const result = await query<{ pipeline_id: string }>(
+      `SELECT pipeline_id::text FROM ${ENTITY_TABLE[entity]} WHERE reference_code = $1 LIMIT 1`,
+      [referenceCode],
+    )
+    return { referenceCode, pipelineId: result.rows[0]?.pipeline_id || null }
+  } catch (error) {
+    if ((error as { code?: string })?.code === '42P01') return { referenceCode, pipelineId: null }
+    throw error
+  }
+}
+
 export async function readCrmRecordByReference(input: {
   pipelineId: string
   referenceCode: unknown

@@ -428,7 +428,8 @@ assertIncludes(crmActionsRoute, 'idempotency-key', 'CRM action idempotency heade
 
 const crmReferenceRoute = read('app_src/app/crm/[reference]/route.ts')
 assertIncludes(crmReferenceRoute, "new URL('/', appPublicUrl())", 'trusted public CRM reference redirect origin')
-assertIncludes(crmReferenceRoute, 'resolveCrmReferenceCode', 'legacy CRM reference alias resolution')
+assertIncludes(crmReferenceRoute, 'resolveCrmReferenceRoute', 'legacy CRM reference alias and pipeline resolution')
+assertIncludes(crmReferenceRoute, 'resolved.pipelineId', 'CRM reference inferred owning pipeline handoff')
 assertIncludes(crmReferenceRoute, "destination.searchParams.set('pipeline', pipelineId)", 'CRM reference owning pipeline handoff')
 
 const shortLinks = read('app_src/lib/shortlinks.ts')
