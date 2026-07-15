@@ -3,6 +3,7 @@ import { resolveManagedGoogleWorkspaceRuntime } from '@/lib/integrations/googleW
 import { googleSheetsJson, type GoogleWorkspaceRuntime } from '@/lib/integrations/googleWorkspaceClient'
 import { matonFetch } from '@/lib/maton'
 import { projectCrmWorkbook } from '@/lib/crm/workbookProjection'
+import { syncPipelineOwnerProfileToCrm } from '@/lib/persistence/crm'
 import {
   provisionPipelineGoogleResources,
   reconcilePipelineGooglePermissions,
@@ -213,6 +214,14 @@ export async function processPipelineSyncOutbox(input: {
 
   for (const item of items) {
     try {
+      if (item.operation === 'sync_pipeline_owner_profile_v1') {
+        const pipelineId = workspacePipelineId(item)
+        item.pipelineId = pipelineId
+        await syncPipelineOwnerProfileToCrm(pipelineId)
+        await completePipelineSyncOutboxInPostgres(item)
+        results.push({ id: item.id, operation: item.operation, status: 'succeeded' })
+        continue
+      }
       if (
         item.operation === 'provision_pipeline'
         || item.operation === 'reconcile_pipeline_hierarchy_v2'

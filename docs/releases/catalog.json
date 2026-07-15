@@ -17,7 +17,8 @@
         "Pins sign-in and invitation mail to the verified ClawPilot Stewards Gmail connection instead of a personal selected account",
         "Deduplicates repeated CRM markers in email threads and stops imported content at the first %xx marker",
         "Restricts short-link discovery to the user's organization tree and mutations to link owners or authorized administrators",
-        "Prevents an outgoing deployment worker from acknowledging Drive hierarchy reconciliation with the legacy folder layout"
+        "Prevents an outgoing deployment worker from acknowledging Drive hierarchy reconciliation with the legacy folder layout",
+        "Backfills each historical pipeline owner's user settings into the matching CRM organization and contact records"
       ]
     }
   }

@@ -17,7 +17,7 @@ Use ClawPilot as the customer-work interface, SuiteCRM as the canonical CRM, Rai
 - SuiteCRM owns Organizations, Contacts, Leads, Opportunities, Meetings, Interactions, Campaigns, CRM relationships, and CRM record history.
 - ClawPilot is the primary user interface for those modules. Administrators may open the native SuiteCRM surface for configuration and inspection.
 - A workspace organization owns one durable `ga` identity and an app user owns one durable `gc` identity. Their pipeline records are projections of those identities, not new accounts or contacts.
-- Saving a user profile updates the app user and workspace organization atomically, projects the user into every pipeline they own, and queues CRM and Drive reconciliation. Shared pipelines are excluded from profile projection.
+- Saving a user profile updates the app user and workspace organization atomically, projects the user into every pipeline they own, and queues CRM and Drive reconciliation. Shared pipelines are excluded from profile projection. Migration `0025_profile_crm_projection_backfill.sql` applies the same projection to historical pipelines whose owner contact predates this workflow.
 - The selected pipeline's `Opportunities` Sheet table is the only writable workbook input. Sheet pulls stage those changes into the same CRM gateway used by ClawPilot writes.
 - Railway Postgres stores tenant-scoped CRM projections, source identity, synchronization status, reconciliation runs, and outbox leases. It is not a second independent CRM authority.
 - Development and production use separate SuiteCRM, MariaDB, Postgres, Google workbook, and user data.

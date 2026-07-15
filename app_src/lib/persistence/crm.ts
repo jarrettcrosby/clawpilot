@@ -1199,6 +1199,19 @@ export async function syncAppUserProfileToCrm(input: {
   }
 }
 
+export async function syncPipelineOwnerProfileToCrm(pipelineId: string) {
+  const pipeline = await query<{ owner_email: string }>(
+    `SELECT owner_email
+     FROM pipeline_spaces
+     WHERE id = $1::uuid
+     LIMIT 1`,
+    [pipelineId],
+  )
+  const ownerEmail = pipeline.rows[0]?.owner_email
+  if (!ownerEmail) throw new Error('Pipeline was not found')
+  return syncAppUserProfileToCrm({ email: ownerEmail, pipelineId })
+}
+
 export async function syncAppUserProfileToOwnedPipelines(email: string) {
   const user = await requireActiveAppUser(email)
   const pipelines = await query<{ id: string }>(

@@ -257,7 +257,7 @@ assertIncludes(pipelineAdapter, 'FROM google_workspace_integration', 'queue-time
 assertIncludes(pipelineAdapter, 'FOR SHARE', 'queue-time credential and binding serialization')
 assertIncludes(
   pipelineAdapter,
-  "target_system IN ('google_sheets', 'google_workspace', 'google_workspace_v2')",
+  "target_system IN ('google_sheets', 'google_workspace', 'google_workspace_v2', 'pipeline_internal_v1')",
   'managed workspace outbox claims',
 )
 assertIncludes(pipelineAdapter, 'resolvePipelineSheetBindingInPostgres', 'validated pipeline Sheet binding resolver')
@@ -318,6 +318,7 @@ assertIncludes(crmAdapter, 'pipeline_id = $1::uuid', 'pipeline-scoped CRM reads'
 assertIncludes(crmAdapter, 'readCrmWorkbookProjectionReadiness', 'reconciliation-gated CRM workbook projection')
 assertIncludes(crmAdapter, "importStatus === 'succeeded'", 'successful source reconciliation projection gate')
 assertIncludes(crmAdapter, 'syncAppUserProfileToOwnedPipelines', 'all owned pipeline profile projection')
+assertIncludes(crmAdapter, 'syncPipelineOwnerProfileToCrm', 'pipeline owner profile backfill projection')
 assertIncludes(crmAdapter, 'CRM profile synchronization requires an owned pipeline', 'profile projection ownership boundary')
 assertIncludes(crmAdapter, 'appUserReferenceCode: user.referenceCode', 'canonical app-user CRM contact identity')
 
@@ -342,6 +343,11 @@ const driveHierarchyMigration = read('db/migrations/0024_versioned_drive_hierarc
 assertIncludes(driveHierarchyMigration, "'reconcile_pipeline_hierarchy_v2'", 'versioned Drive hierarchy operation')
 assertIncludes(driveHierarchyMigration, "'google_workspace_v2'", 'versioned Drive hierarchy worker target')
 assertIncludes(driveHierarchyMigration, "'layoutVersion', 2", 'versioned Drive hierarchy payload')
+
+const profileProjectionMigration = read('db/migrations/0025_profile_crm_projection_backfill.sql')
+assertIncludes(profileProjectionMigration, "'sync_pipeline_owner_profile_v1'", 'owner profile projection operation')
+assertIncludes(profileProjectionMigration, "'pipeline_internal_v1'", 'versioned internal pipeline target')
+assertIncludes(profileProjectionMigration, "owner.status = 'active'", 'active owner profile projection boundary')
 
 const crmIntegrationActions = read('app_src/lib/crm/integrationActions.ts')
 for (const action of ['send_email', 'create_calendar_event', 'log_call', 'send_campaign']) {
@@ -439,6 +445,7 @@ assertIncludes(outboxWorker, "item.operation === 'update_opportunity'", 'pipelin
 assertIncludes(outboxWorker, "item.operation === 'append_interaction'", 'pipeline outbox worker')
 assertIncludes(outboxWorker, "item.operation === 'replace_dropdowns'", 'pipeline outbox worker')
 assertIncludes(outboxWorker, "item.operation === 'project_crm_workbook'", 'CRM projection worker dispatch')
+assertIncludes(outboxWorker, "item.operation === 'sync_pipeline_owner_profile_v1'", 'owner profile projection worker dispatch')
 assertIncludes(outboxWorker, 'Opportunity Sheet row changed', 'pipeline outbox worker optimistic check')
 assertIncludes(outboxWorker, '[ClawPilot sync:', 'pipeline outbox worker append idempotency')
 assertIncludes(outboxWorker, "item.operation === 'provision_pipeline'", 'pipeline provisioning worker dispatch')
