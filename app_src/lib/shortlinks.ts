@@ -8,6 +8,7 @@ import { workspaceOrganizationRootId } from '@/lib/organizations'
 import { effectiveUserPermissions, normalizeUserEmail } from '@/lib/users'
 
 const SLUG_PATTERN = /^[a-z0-9][a-z0-9_-]{2,63}$/
+const CRM_REFERENCE_SLUG_PATTERN = /^g[aciklmo][0-9]{7}$/
 const SOURCE_PATTERN = /^[a-z][a-z0-9-]{1,39}$/
 const SLUG_ALPHABET = '23456789abcdefghjkmnpqrstuvwxyz'
 const RESERVED_SLUGS = new Set(['admin', 'api', 'app', 'auth', 'new', 'privacy', 'settings'])
@@ -277,19 +278,26 @@ function normalizeTags(value: unknown): string[] {
   return tags
 }
 
-function normalizeSlug(value: unknown): string {
+function normalizeSlug(value: unknown, options: { allowCrmReference?: boolean } = {}): string {
   const slug = String(value || '').trim().toLowerCase()
   if (!SLUG_PATTERN.test(slug)) {
     throw new ShortLinkRequestError('Slug must be 3-64 lowercase letters, numbers, hyphens, or underscores')
   }
   if (RESERVED_SLUGS.has(slug)) throw new ShortLinkRequestError('This slug is reserved')
+  if (!options.allowCrmReference && CRM_REFERENCE_SLUG_PATTERN.test(slug)) {
+    throw new ShortLinkRequestError('CRM reference slugs are reserved for CRM records')
+  }
   return slug
 }
 
 function generatedSlug(lengthValue: unknown): string {
   const length = valueOrDefaultInteger(lengthValue, 7, 4, 32, 'Slug length')
-  const bytes = crypto.randomBytes(length)
-  return Array.from(bytes, (byte) => SLUG_ALPHABET[byte % SLUG_ALPHABET.length]).join('')
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const bytes = crypto.randomBytes(length)
+    const slug = Array.from(bytes, (byte) => SLUG_ALPHABET[byte % SLUG_ALPHABET.length]).join('')
+    if (!CRM_REFERENCE_SLUG_PATTERN.test(slug)) return slug
+  }
+  throw new ShortLinkRequestError('Unable to generate a non-reserved slug. Try again.', 409)
 }
 
 function valueOrDefaultInteger(value: unknown, fallback: number, min: number, max: number, label: string): number {
@@ -598,7 +606,7 @@ export async function resolveShortLink(input: {
   if (getStorageDriver() !== 'postgres') return { status: 'not-found' }
   let slug: string
   try {
-    slug = normalizeSlug(input.slug)
+    slug = normalizeSlug(input.slug, { allowCrmReference: true })
   } catch {
     return { status: 'not-found' }
   }

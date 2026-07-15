@@ -333,6 +333,7 @@ export async function importCrmWorkbook(input: {
         fields: {
           organizationId: organization?.id || null, contactId: contact?.id || null,
           opportunityId: opportunity?.id || null, parentSuiteCrmId: opportunity?.suiteCrmId || null,
+          parentSuiteCrmType: opportunity?.suiteCrmId ? 'Opportunities' : undefined,
           interactionType, subject, agentName: pick(record, 'Agent', 'Owner'),
           occurredAt: dateTimeValue(pick(record, 'Date', 'Occurred At', 'Timestamp')),
           description: notes,

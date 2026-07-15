@@ -171,9 +171,13 @@ export async function ensureOwnerUser(): Promise<AppUser> {
   const result = await query<AppUserRow>(
     `
       INSERT INTO app_users (
-        email, role, status, permissions, activated_at, created_at, updated_at
+        email, reference_code, role, status, permissions, activated_at, created_at, updated_at
       )
-      VALUES ($1, 'owner', 'active', $2::jsonb, now(), now(), now())
+      VALUES (
+        $1,
+        COALESCE((SELECT reference_code FROM app_users WHERE email = $1), allocate_crm_reference('gc')),
+        'owner', 'active', $2::jsonb, now(), now(), now()
+      )
       ON CONFLICT (email) DO UPDATE SET
         role = 'owner',
         status = CASE WHEN app_users.status = 'disabled' THEN 'disabled' ELSE 'active' END,
@@ -236,9 +240,13 @@ export async function inviteAppUser(input: { actorEmail: unknown; email: unknown
     const result = await client.query<AppUserRow>(
       `
         INSERT INTO app_users (
-          email, role, status, permissions, invited_by, invited_at, created_at, updated_at
+          email, reference_code, role, status, permissions, invited_by, invited_at, created_at, updated_at
         )
-        VALUES ($1, 'member', 'invited', $3::jsonb, $2, now(), now(), now())
+        VALUES (
+          $1,
+          COALESCE((SELECT reference_code FROM app_users WHERE email = $1), allocate_crm_reference('gc')),
+          'member', 'invited', $3::jsonb, $2, now(), now(), now()
+        )
         ON CONFLICT (email) DO UPDATE SET
           status = 'invited',
           invited_by = EXCLUDED.invited_by,

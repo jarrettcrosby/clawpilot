@@ -4,10 +4,12 @@ import { resolveUserMatonGatewayCredential } from '@/lib/integrations/matonGatew
 import { matonFetch } from '@/lib/maton'
 import {
   readCrmRecordByReference,
+  resolveCrmReferenceCode,
   stageCrmRecordInPostgres,
 } from '@/lib/persistence/crm'
 import { query, withTransaction } from '@/lib/persistence/postgres'
 import { normalizeUserEmail } from '@/lib/users'
+import { zonedDateTimeToIso } from '@/lib/zonedDateTime'
 
 export const CRM_INTEGRATION_ACTION_TYPES = [
   'send_email',
@@ -150,6 +152,17 @@ const AGGREGATE_TYPES: Record<CrmReferenceRecord['entity'], string> = {
   meetings: 'crm_meeting',
   interactions: 'crm_interaction',
   campaigns: 'crm_campaign',
+}
+
+function suiteCrmParentType(entity: CrmReferenceRecord['entity']) {
+  return ({
+    organizations: 'Accounts',
+    contacts: 'Contacts',
+    leads: 'Leads',
+    opportunities: 'Opportunities',
+    meetings: 'Meetings',
+    campaigns: 'Campaigns',
+  } as const)[entity as Exclude<CrmReferenceRecord['entity'], 'interactions'>] || null
 }
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
@@ -338,8 +351,8 @@ async function normalizePayload(
 
   if (actionType === 'send_email') {
     assertOnlyFields(payload, ['subject', 'text', 'body', 'html'])
-    if (target.entity !== 'contacts' && target.entity !== 'leads') {
-      throw new CrmIntegrationActionError('Email actions require a contact or lead reference')
+    if (target.entity !== 'organizations' && target.entity !== 'contacts' && target.entity !== 'leads') {
+      throw new CrmIntegrationActionError('Email actions require an organization, contact, or lead reference')
     }
     if (!target.email) throw new CrmIntegrationActionError('The referenced CRM record has no email address')
     normalizeEmail(target.email, 'CRM recipient email')
@@ -347,7 +360,12 @@ async function normalizePayload(
     const subject = requiredString(payload.subject, 300, 'Email subject')
     const text = requiredString(payload.text ?? payload.body, 100_000, 'Email body')
     const html = cleanString(payload.html, 100_000, 'Email HTML body')
-    return { subject, text, ...(html ? { html } : {}) }
+    return {
+      subject,
+      text,
+      recipientEmail: normalizeEmail(target.email, 'CRM recipient email'),
+      ...(html ? { html } : {}),
+    }
   }
 
   if (actionType === 'create_calendar_event') {
@@ -359,8 +377,11 @@ async function normalizePayload(
       throw new CrmIntegrationActionError('Calendar actions cannot target this CRM record type')
     }
     const subject = requiredString(payload.subject ?? payload.title, 300, 'Calendar event subject')
-    const startsAt = normalizeDateTime(payload.startsAt ?? payload.start, 'Calendar event start')
-    const endsAt = normalizeDateTime(payload.endsAt ?? payload.end, 'Calendar event end')
+    const timezone = normalizeTimezone(payload.timezone)
+    const startsAt = zonedDateTimeToIso(payload.startsAt ?? payload.start, timezone)
+    const endsAt = zonedDateTimeToIso(payload.endsAt ?? payload.end, timezone)
+    if (!startsAt) throw new CrmIntegrationActionError('Calendar event start is invalid for the selected timezone')
+    if (!endsAt) throw new CrmIntegrationActionError('Calendar event end is invalid for the selected timezone')
     if (Date.parse(endsAt) <= Date.parse(startsAt)) {
       throw new CrmIntegrationActionError('Calendar event end must be after its start')
     }
@@ -371,7 +392,7 @@ async function normalizePayload(
       description: cleanString(payload.description, 50_000, 'Calendar event description'),
       startsAt,
       endsAt,
-      timezone: normalizeTimezone(payload.timezone),
+      timezone,
       location: cleanString(payload.location, 1000, 'Calendar event location'),
       attendeeEmails: Array.from(new Set(attendeeEmails)),
     }
@@ -396,13 +417,16 @@ async function normalizePayload(
   if (payload.recipientReferences.length > MAX_CAMPAIGN_RECIPIENTS) {
     throw new CrmIntegrationActionError(`Campaigns support no more than ${MAX_CAMPAIGN_RECIPIENTS} recipient references per action`)
   }
-  const recipientReferences = Array.from(new Set(payload.recipientReferences.map((value) => {
+  const requestedRecipientReferences = payload.recipientReferences.map((value) => {
     const reference = normalizeReference(value)
     if (!CAMPAIGN_RECIPIENT_PATTERN.test(reference)) {
       throw new CrmIntegrationActionError('Campaign recipients must be gc or gl references')
     }
     return reference
-  })))
+  })
+  const recipientReferences = Array.from(new Set(await Promise.all(
+    requestedRecipientReferences.map(resolveCrmReferenceCode),
+  )))
   await readCampaignTargets(pipelineId, recipientReferences)
   const campaign = await query<{ name: string; subject_template: string | null; body_template: string | null }>(
     `SELECT name, subject_template, body_template
@@ -454,7 +478,7 @@ async function prepareAction(input: {
     actionType,
     aggregateType: AGGREGATE_TYPES[target.entity],
     aggregateId: target.id,
-    referenceCode,
+    referenceCode: target.referenceCode,
     payload: await normalizePayload(actionType, input.payload, target, pipelineId),
     idempotencyKey: normalizeIdempotencyKey(input.idempotencyKey, actionType),
   }
@@ -1033,6 +1057,7 @@ async function stageActionInteraction(input: {
   meetingId?: string | null
 }) {
   const links = interactionLinks(input.target, input.meetingId)
+  const parentSuiteCrmType = suiteCrmParentType(input.target.entity)
   const campaignId = typeof input.action.payload.campaignId === 'string' && UUID_PATTERN.test(input.action.payload.campaignId)
     ? input.action.payload.campaignId
     : links.campaignId
@@ -1050,7 +1075,8 @@ async function stageActionInteraction(input: {
     fields: {
       ...links,
       campaignId,
-      parentSuiteCrmId: input.target.suiteCrmId,
+      parentSuiteCrmId: parentSuiteCrmType ? input.target.suiteCrmId : null,
+      parentSuiteCrmType: parentSuiteCrmType || undefined,
       interactionType: input.interactionType,
       subject: input.subject,
       agentName: input.action.actorEmail,
@@ -1070,8 +1096,8 @@ async function stageActionInteraction(input: {
 }
 
 async function sendEmailAction(action: LeasedCrmIntegrationAction, target: CrmReferenceRecord) {
-  if (target.entity !== 'contacts' && target.entity !== 'leads') {
-    throw new PermanentCrmIntegrationActionError('Email action target is no longer a contact or lead')
+  if (target.entity !== 'organizations' && target.entity !== 'contacts' && target.entity !== 'leads') {
+    throw new PermanentCrmIntegrationActionError('Email action target is no longer an organization, contact, or lead')
   }
   if (target.emailOptOut) throw new PermanentCrmIntegrationActionError('CRM recipient is suppressed from email')
   const recipient = normalizeEmail(target.email, 'CRM recipient email')
@@ -1184,6 +1210,7 @@ async function stageCalendarMeeting(
     organizationSuiteCrmId = organization.rows[0]?.suitecrm_id || null
   }
   let parentSuiteCrmId: string | null = null
+  let parentSuiteCrmType: 'Accounts' | 'Contacts' | 'Leads' | 'Opportunities' | null = null
   if (opportunityId) {
     const opportunity = await query<{ suitecrm_id: string | null }>(
       `SELECT suitecrm_id FROM crm_opportunities
@@ -1191,6 +1218,26 @@ async function stageCalendarMeeting(
       [action.pipelineId, opportunityId],
     )
     parentSuiteCrmId = opportunity.rows[0]?.suitecrm_id || null
+    parentSuiteCrmType = parentSuiteCrmId ? 'Opportunities' : null
+  } else if (contactId) {
+    const contact = await query<{ suitecrm_id: string | null }>(
+      `SELECT suitecrm_id FROM crm_contacts
+       WHERE pipeline_id = $1::uuid AND id = $2::uuid LIMIT 1`,
+      [action.pipelineId, contactId],
+    )
+    parentSuiteCrmId = contact.rows[0]?.suitecrm_id || null
+    parentSuiteCrmType = parentSuiteCrmId ? 'Contacts' : null
+  } else if (leadId) {
+    const lead = await query<{ suitecrm_id: string | null }>(
+      `SELECT suitecrm_id FROM crm_leads
+       WHERE pipeline_id = $1::uuid AND id = $2::uuid LIMIT 1`,
+      [action.pipelineId, leadId],
+    )
+    parentSuiteCrmId = lead.rows[0]?.suitecrm_id || null
+    parentSuiteCrmType = parentSuiteCrmId ? 'Leads' : null
+  } else if (organizationSuiteCrmId) {
+    parentSuiteCrmId = organizationSuiteCrmId
+    parentSuiteCrmType = 'Accounts'
   }
 
   return stageCrmRecordInPostgres({
@@ -1211,6 +1258,7 @@ async function stageCalendarMeeting(
       leadId,
       opportunityId,
       parentSuiteCrmId,
+      parentSuiteCrmType: parentSuiteCrmType || undefined,
       subject: requiredString(action.payload.subject, 300, 'Calendar event subject'),
       description: cleanString(action.payload.description, 50_000, 'Calendar event description'),
       startsAt: normalizeDateTime(action.payload.startsAt, 'Calendar event start'),
@@ -1227,6 +1275,25 @@ async function stageCalendarMeeting(
   })
 }
 
+function calendarEventIdForAction(actionId: string): string {
+  return actionId.replace(/-/g, '').toLowerCase()
+}
+
+async function existingCalendarEvent(pipelineId: string, target: CrmReferenceRecord) {
+  if (target.entity !== 'meetings') return null
+  const result = await query<{
+    external_event_id: string | null
+    external_event_url: string | null
+    join_url: string | null
+  }>(
+    `SELECT external_event_id, external_event_url, join_url
+     FROM crm_meetings WHERE pipeline_id = $1::uuid AND id = $2::uuid LIMIT 1`,
+    [pipelineId, target.id],
+  )
+  const row = result.rows[0]
+  return row?.external_event_id ? row : null
+}
+
 async function createCalendarEventAction(action: LeasedCrmIntegrationAction, target: CrmReferenceRecord) {
   const subject = requiredString(action.payload.subject, 300, 'Calendar event subject')
   const startsAt = normalizeDateTime(action.payload.startsAt, 'Calendar event start')
@@ -1236,33 +1303,64 @@ async function createCalendarEventAction(action: LeasedCrmIntegrationAction, tar
   const location = cleanString(action.payload.location, 1000, 'Calendar event location')
   const attendeeEmails = normalizeEmailList(action.payload.attendeeEmails)
 
+  const currentEvent = await existingCalendarEvent(action.pipelineId, target)
   let eventId = action.externalId
-  let eventUrl = safeHttpsUrl(action.responseSummary.eventUrl)
-  let joinUrl = safeHttpsUrl(action.responseSummary.joinUrl)
+  let eventUrl = safeHttpsUrl(action.responseSummary.eventUrl) || safeHttpsUrl(currentEvent?.external_event_url)
+  let joinUrl = safeHttpsUrl(action.responseSummary.joinUrl) || safeHttpsUrl(currentEvent?.join_url)
   if (!eventId) {
     const connectionId = await selectedMatonConnection(action, 'google-calendar')
-    const created = await matonJson(
-      action,
-      'google-calendar',
-      connectionId,
-      '/google-calendar/calendar/v3/calendars/primary/events',
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          summary: subject,
-          description: description || undefined,
-          location: location || undefined,
-          start: { dateTime: startsAt, timeZone: timezone },
-          end: { dateTime: endsAt, timeZone: timezone },
-          attendees: attendeeEmails.map((email) => ({ email })),
-        }),
-      },
-    )
-    eventId = cleanString(created.id, 1000, 'Calendar event ID')
+    const existingEventId = cleanString(currentEvent?.external_event_id, 1000, 'Calendar event ID')
+    const requestedEventId = existingEventId || calendarEventIdForAction(action.id)
+    const eventBody = {
+      ...(!existingEventId ? { id: requestedEventId } : {}),
+      summary: subject,
+      description: description || undefined,
+      location: location || undefined,
+      start: { dateTime: startsAt, timeZone: timezone },
+      end: { dateTime: endsAt, timeZone: timezone },
+      attendees: attendeeEmails.map((email) => ({ email })),
+    }
+    let delivered: JsonObject
+    if (existingEventId) {
+      delivered = await matonJson(
+        action,
+        'google-calendar',
+        connectionId,
+        `/google-calendar/calendar/v3/calendars/primary/events/${encodeURIComponent(existingEventId)}?sendUpdates=all`,
+        {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(eventBody),
+        },
+      )
+    } else {
+      try {
+        delivered = await matonJson(
+          action,
+          'google-calendar',
+          connectionId,
+          '/google-calendar/calendar/v3/calendars/primary/events?sendUpdates=all',
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(eventBody),
+          },
+        )
+      } catch (error) {
+        if (!(error instanceof Error) || !/status 409\b/.test(error.message)) throw error
+        delivered = await matonJson(
+          action,
+          'google-calendar',
+          connectionId,
+          `/google-calendar/calendar/v3/calendars/primary/events/${encodeURIComponent(requestedEventId)}`,
+          { headers: { Accept: 'application/json' } },
+        )
+      }
+    }
+    eventId = cleanString(delivered.id, 1000, 'Calendar event ID') || requestedEventId
     if (!eventId) throw new Error('google-calendar provider returned no event ID')
-    eventUrl = safeHttpsUrl(created.htmlLink)
-    joinUrl = safeHttpsUrl(created.hangoutLink)
+    eventUrl = safeHttpsUrl(delivered.htmlLink) || eventUrl
+    joinUrl = safeHttpsUrl(delivered.hangoutLink) || joinUrl
   }
   const summary = { eventId, eventUrl, joinUrl }
   await recordAttemptSucceeded(action, eventId, summary)

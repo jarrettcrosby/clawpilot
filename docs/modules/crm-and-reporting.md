@@ -26,21 +26,23 @@ Use ClawPilot as the customer-work interface, SuiteCRM as the canonical CRM, Rai
 
 | ClawPilot | SuiteCRM | Workbook |
 |---|---|---|
-| `ga5999999` Organization | Account | Generated `Organizations` projection |
-| `gc5999999` Contact | Contact | Generated `Contacts` projection |
-| `gl5999999` Lead | Lead | CRM only |
-| `go5999999` Opportunity | Opportunity | Writable `Opportunities` input and canonical projection |
-| `gm5999999` Meeting | Meeting | CRM only |
-| `gi5999999` Interaction | Note | Generated `Interactions` projection |
-| `gk5999999` Campaign | Campaign | CRM only |
+| `ga4827316` Organization | Account | Generated `Organizations` projection |
+| `gc8172045` Contact | Contact | Generated `Contacts` projection |
+| `gl3549182` Lead | Lead | CRM only |
+| `go7402631` Opportunity | Opportunity | Writable `Opportunities` input and canonical projection |
+| `gm1968457` Meeting | Meeting | CRM only |
+| `gi6253094` Interaction | Note | Generated `Interactions` projection |
+| `gk9035718` Campaign | Campaign | CRM only |
 
 Every migrated record preserves its source workbook payload, source row, stable source key, deterministic SuiteCRM identifier, last synchronization state, and error details. Imports are additive and idempotent; they do not delete the source workbook.
 
-Each reference code has an organization-scoped short link. A signed-in user resolves the reference against the selected pipeline; canonical organization and user codes remain stable when the same identity is projected into another owned pipeline.
+The two-letter module prefix is fixed and the seven-digit suffix is randomly allocated. The permanent registries reserve both the full code and the numeric suffix globally across modules, prevent concurrent collisions, and never release either value after deletion or archival. Sequential codes issued before this contract remain reserved aliases that resolve to the replacement code and can never be reissued.
+
+Each reference code has an organization-scoped short link. The link selects its owning pipeline after access is verified, then opens the record in ClawPilot; canonical organization and user codes remain stable when the same identity is projected into another owned pipeline.
 
 ## Customer Actions
 
-- Contact and lead records can send email through the signed-in user's selected Maton `google-mail` connection. ClawPilot verifies the authenticated Gmail profile and does not accept a caller-supplied From identity.
+- Organization, contact, and lead records with an email address can send through the signed-in user's selected Maton `google-mail` connection. ClawPilot verifies the authenticated Gmail profile and does not accept a caller-supplied From identity.
 - Organization, contact, lead, opportunity, and meeting records can create Google Calendar invitations through that user's selected `google-calendar` connection.
 - Records with a phone number expose a call command. It records the interaction before returning a validated `tel:` URL to the device.
 - Campaigns accept `gc` and `gl` recipients, support `{{firstName}}`, `{{lastName}}`, `{{name}}`, `{{email}}`, and `{{referenceCode}}` merge fields, deduplicate recipients by email, and suppress opted-out recipients.
@@ -48,7 +50,7 @@ Each reference code has an organization-scoped short link. A signed-in user reso
 
 ## Email Association
 
-Outbound CRM email appends exactly one `%gslt<reference>` marker, such as `%gsltga5999999`. There is no space between `gslt` and the reference.
+Outbound CRM email appends exactly one `%gslt<reference>` marker, such as `%gsltga4827316`. There is no space between `gslt` and the reference.
 
 Inbound Gmail polling runs per active user's selected connection. It follows these rules:
 

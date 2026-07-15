@@ -30,6 +30,8 @@ export type CrmOrganization = {
   website: string
   linkedinUrl: string
   phone: string
+  email: string
+  emailOptOut: boolean
   address: string
   city: string
   state: string
