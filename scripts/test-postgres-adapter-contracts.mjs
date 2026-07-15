@@ -257,7 +257,7 @@ assertIncludes(pipelineAdapter, 'FROM google_workspace_integration', 'queue-time
 assertIncludes(pipelineAdapter, 'FOR SHARE', 'queue-time credential and binding serialization')
 assertIncludes(
   pipelineAdapter,
-  "target_system IN ('google_sheets', 'google_workspace', 'google_workspace_v2', 'pipeline_internal_v1')",
+  "target_system IN ('google_sheets', 'google_workspace', 'google_workspace_v2', 'google_workspace_v3', 'pipeline_internal_v1')",
   'managed workspace outbox claims',
 )
 assertIncludes(pipelineAdapter, 'resolvePipelineSheetBindingInPostgres', 'validated pipeline Sheet binding resolver')
@@ -348,6 +348,11 @@ const profileProjectionMigration = read('db/migrations/0025_profile_crm_projecti
 assertIncludes(profileProjectionMigration, "'sync_pipeline_owner_profile_v1'", 'owner profile projection operation')
 assertIncludes(profileProjectionMigration, "'pipeline_internal_v1'", 'versioned internal pipeline target')
 assertIncludes(profileProjectionMigration, "owner.status = 'active'", 'active owner profile projection boundary')
+
+const driveCleanupMigration = read('db/migrations/0026_legacy_drive_hierarchy_cleanup.sql')
+assertIncludes(driveCleanupMigration, "'reconcile_pipeline_hierarchy_v3'", 'legacy Drive cleanup operation')
+assertIncludes(driveCleanupMigration, "'google_workspace_v3'", 'legacy Drive cleanup worker target')
+assertIncludes(driveCleanupMigration, "'layoutVersion', 3", 'legacy Drive cleanup payload')
 
 const crmIntegrationActions = read('app_src/lib/crm/integrationActions.ts')
 for (const action of ['send_email', 'create_calendar_event', 'log_call', 'send_campaign']) {
@@ -450,6 +455,7 @@ assertIncludes(outboxWorker, 'Opportunity Sheet row changed', 'pipeline outbox w
 assertIncludes(outboxWorker, '[ClawPilot sync:', 'pipeline outbox worker append idempotency')
 assertIncludes(outboxWorker, "item.operation === 'provision_pipeline'", 'pipeline provisioning worker dispatch')
 assertIncludes(outboxWorker, "item.operation === 'reconcile_pipeline_hierarchy_v2'", 'versioned Drive hierarchy worker dispatch')
+assertIncludes(outboxWorker, "item.operation === 'reconcile_pipeline_hierarchy_v3'", 'legacy Drive cleanup worker dispatch')
 assertIncludes(outboxWorker, "item.operation === 'sync_pipeline_permissions'", 'pipeline permission worker dispatch')
 assertIncludes(outboxWorker, 'resolveManagedGoogleWorkspaceRuntime', 'bound managed pipeline runtime resolution')
 assertIncludes(outboxWorker, 'googleSheetsJson', 'bound managed pipeline Sheet writes')
@@ -479,6 +485,9 @@ for (const optionalField of [
 assertIncludes(googleWorkspaceCrypto, 'aes-256-gcm', 'Google Workspace secret encryption')
 assertIncludes(googleWorkspaceCrypto, 'clawpilot:google-workspace:platform:', 'stable Google Workspace encryption AAD')
 assertIncludes(googleWorkspaceCrypto, 'Unsupported service-account field:', 'unknown service-account field rejection')
+
+assertIncludes(pipelineProvisioning, 'cleanupLegacyOwnerHierarchy', 'legacy Drive hierarchy discovery cleanup')
+assertIncludes(pipelineProvisioning, "fileProperties('users-root'", 'environment-scoped legacy Drive cleanup')
 
 const googleWorkspacePersistence = read('app_src/lib/persistence/googleWorkspace.ts')
 assertIncludes(googleWorkspacePersistence, 'expectedVersion', 'Google Workspace optimistic persistence')

@@ -119,6 +119,7 @@ for (const requiredPath of [
   'db/migrations/0023_crm_modules_references_and_integrations.sql',
   'db/migrations/0024_versioned_drive_hierarchy_reconciliation.sql',
   'db/migrations/0025_profile_crm_projection_backfill.sql',
+  'db/migrations/0026_legacy_drive_hierarchy_cleanup.sql',
   'scripts/start-railway.sh',
   'scripts/pipeline-outbox-poller.mjs',
   'scripts/validate-runtime-config.mjs',

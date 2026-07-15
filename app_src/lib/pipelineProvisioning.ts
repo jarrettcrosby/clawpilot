@@ -433,7 +433,13 @@ async function cleanupLegacyFolderChain(runtime: GoogleWorkspaceRuntime, folderI
   const legacyResources = new Set(['pipelines-root', 'user-root', 'users-root'])
   let current = folderId
   for (let depth = 0; current && depth < 3; depth += 1) {
-    const folder = await getDriveFile(runtime, current)
+    let folder: DriveFile
+    try {
+      folder = await getDriveFile(runtime, current)
+    } catch (error) {
+      if (error instanceof GoogleWorkspaceClientError && error.code === 'GOOGLE_RESOURCE_NOT_FOUND') return
+      throw error
+    }
     if (
       folder.mimeType !== DRIVE_FOLDER_MIME_TYPE
       || folder.appProperties?.clawpilotManaged !== 'true'
@@ -442,11 +448,58 @@ async function cleanupLegacyFolderChain(runtime: GoogleWorkspaceRuntime, folderI
     ) return
     const parent = folder.parents?.[0]
     const parameters = new URLSearchParams({ supportsAllDrives: 'true' })
-    await googleDriveJson(runtime, `/drive/v3/files/${current}?${parameters.toString()}`, {
-      method: 'DELETE',
-      idempotent: true,
-    })
+    try {
+      await googleDriveJson(runtime, `/drive/v3/files/${current}?${parameters.toString()}`, {
+        method: 'DELETE',
+        idempotent: true,
+      })
+    } catch (error) {
+      if (!(error instanceof GoogleWorkspaceClientError) || error.code !== 'GOOGLE_RESOURCE_NOT_FOUND') throw error
+    }
     current = parent
+  }
+}
+
+async function cleanupLegacyOwnerHierarchy(input: {
+  runtime: GoogleWorkspaceRuntime
+  environmentFolderId: string
+  environment: string
+  ownerKey: string
+}) {
+  const usersRoots = await listManagedFiles({
+    runtime: input.runtime,
+    parentId: input.environmentFolderId,
+    mimeType: DRIVE_FOLDER_MIME_TYPE,
+    appProperties: fileProperties('users-root', { environment: input.environment.toLowerCase() }),
+  })
+  for (const usersRoot of usersRoots) {
+    const usersRootId = validResourceId(usersRoot.id, 'Legacy users folder ID')
+    const userFolders = await listManagedFiles({
+      runtime: input.runtime,
+      parentId: usersRootId,
+      mimeType: DRIVE_FOLDER_MIME_TYPE,
+      appProperties: fileProperties('user-root', { ownerKey: input.ownerKey }),
+    })
+    for (const userFolder of userFolders) {
+      const userFolderId = validResourceId(userFolder.id, 'Legacy user folder ID')
+      const pipelineRoots = await listManagedFiles({
+        runtime: input.runtime,
+        parentId: userFolderId,
+        mimeType: DRIVE_FOLDER_MIME_TYPE,
+        appProperties: fileProperties('pipelines-root', { ownerKey: input.ownerKey }),
+      })
+      if (pipelineRoots.length === 0) {
+        await cleanupLegacyFolderChain(input.runtime, userFolderId)
+        continue
+      }
+      for (const pipelineRoot of pipelineRoots) {
+        await cleanupLegacyFolderChain(
+          input.runtime,
+          validResourceId(pipelineRoot.id, 'Legacy pipelines folder ID'),
+        )
+      }
+    }
+    await cleanupLegacyFolderChain(input.runtime, usersRootId)
   }
 }
 
@@ -565,6 +618,7 @@ async function ensurePipelineFolder(
     appProperties: fileProperties('pipelines-root', { ownerKey }),
   })
   const pipelineName = pipelineDriveName(pipeline, identity)
+  let pipelineFolderId: string
   if (pipeline.driveFolderId) {
     const folder = await getDriveFile(runtime, pipeline.driveFolderId)
     verifyPipelineFolder(folder, pipeline.id, sharedDriveId)
@@ -591,14 +645,23 @@ async function ensurePipelineFolder(
       }
       if (moveRequired) await cleanupLegacyFolderChain(runtime, folder.parents?.[0])
     }
-    return pipeline.driveFolderId
+    pipelineFolderId = pipeline.driveFolderId
+  } else {
+    pipelineFolderId = await ensureManagedFolder({
+      runtime,
+      parentId: pipelinesFolder,
+      name: pipelineName,
+      appProperties: fileProperties('pipeline-folder', { pipelineId: pipeline.id }),
+    })
   }
-  return ensureManagedFolder({
+
+  await cleanupLegacyOwnerHierarchy({
     runtime,
-    parentId: pipelinesFolder,
-    name: pipelineName,
-    appProperties: fileProperties('pipeline-folder', { pipelineId: pipeline.id }),
+    environmentFolderId: environmentFolder,
+    environment,
+    ownerKey,
   })
+  return pipelineFolderId
 }
 
 async function ensurePipelineSheet(
