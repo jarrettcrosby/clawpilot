@@ -257,10 +257,11 @@ assertIncludes(pipelineAdapter, 'FROM google_workspace_integration', 'queue-time
 assertIncludes(pipelineAdapter, 'FOR SHARE', 'queue-time credential and binding serialization')
 assertIncludes(
   pipelineAdapter,
-  "target_system IN ('google_sheets', 'google_workspace', 'google_workspace_v2', 'google_workspace_v3', 'google_workspace_v4', 'google_workspace_v5', 'pipeline_internal_v1')",
+  "target_system IN ('google_sheets', 'google_workspace', 'google_workspace_v2', 'google_workspace_v3', 'google_workspace_v4', 'google_workspace_v5', 'google_workspace_v6', 'pipeline_internal_v1')",
   'managed workspace outbox claims',
 )
 assertIncludes(pipelineAdapter, 'resolvePipelineSheetBindingInPostgres', 'validated pipeline Sheet binding resolver')
+assertIncludes(pipelineAdapter, "item.operation === 'reconcile_pipeline_hierarchy_v6'", 'superseded Drive cleanup finalization')
 assertIncludes(pipelineAdapter, 'pipeline.owner_email !== configuredOwner', 'configured-owner legacy fallback boundary')
 assertIncludes(pipelineAdapter, 'AND sheet_id = $2', 'pipeline and Sheet pair isolation')
 
@@ -363,6 +364,12 @@ const eventualDriveCleanupMigration = read('db/migrations/0028_eventual_drive_cl
 assertIncludes(eventualDriveCleanupMigration, "'reconcile_pipeline_hierarchy_v5'", 'eventual Drive cleanup operation')
 assertIncludes(eventualDriveCleanupMigration, "'google_workspace_v5'", 'eventual Drive cleanup worker target')
 assertIncludes(eventualDriveCleanupMigration, "'layoutVersion', 5", 'eventual Drive cleanup payload')
+
+const verifiedDriveTrashMigration = read('db/migrations/0029_verified_drive_trash_reconciliation.sql')
+assertIncludes(verifiedDriveTrashMigration, "'reconcile_pipeline_hierarchy_v6'", 'verified Drive trash operation')
+assertIncludes(verifiedDriveTrashMigration, "'google_workspace_v6'", 'verified Drive trash worker target')
+assertIncludes(verifiedDriveTrashMigration, "'layoutVersion', 6", 'verified Drive trash payload')
+assertIncludes(verifiedDriveTrashMigration, "status = 'succeeded'", 'superseded Drive cleanup terminal state')
 
 const crmIntegrationActions = read('app_src/lib/crm/integrationActions.ts')
 for (const action of ['send_email', 'create_calendar_event', 'log_call', 'send_campaign']) {
@@ -468,6 +475,7 @@ assertIncludes(outboxWorker, "item.operation === 'reconcile_pipeline_hierarchy_v
 assertIncludes(outboxWorker, "item.operation === 'reconcile_pipeline_hierarchy_v3'", 'legacy Drive cleanup worker dispatch')
 assertIncludes(outboxWorker, "item.operation === 'reconcile_pipeline_hierarchy_v4'", 'verified Drive cleanup worker dispatch')
 assertIncludes(outboxWorker, "item.operation === 'reconcile_pipeline_hierarchy_v5'", 'eventual Drive cleanup worker dispatch')
+assertIncludes(outboxWorker, "item.operation === 'reconcile_pipeline_hierarchy_v6'", 'verified Drive trash worker dispatch')
 assertIncludes(outboxWorker, "item.operation === 'sync_pipeline_permissions'", 'pipeline permission worker dispatch')
 assertIncludes(outboxWorker, 'resolveManagedGoogleWorkspaceRuntime', 'bound managed pipeline runtime resolution')
 assertIncludes(outboxWorker, 'googleSheetsJson', 'bound managed pipeline Sheet writes')
@@ -503,8 +511,10 @@ assertIncludes(pipelineProvisioning, "fileProperties('users-root'", 'environment
 assertIncludes(pipelineProvisioning, 'fields: \'nextPageToken,files(id,parents)\'', 'verified Drive child response shape')
 assertIncludes(pipelineProvisioning, 'child.id === folderId', 'Drive folder self-reference rejection')
 assertIncludes(pipelineProvisioning, 'child.parents?.includes(folderId)', 'Drive child parent verification')
-assertIncludes(pipelineProvisioning, 'waitForDriveChildRemoval', 'eventual Drive deletion verification')
-assertIncludes(pipelineProvisioning, 'GOOGLE_DRIVE_DELETE_UNVERIFIED', 'retryable Drive deletion convergence error')
+assertIncludes(pipelineProvisioning, 'waitForDriveChildRemoval', 'eventual Drive cleanup verification')
+assertIncludes(pipelineProvisioning, 'trashLegacyDriveFolder', 'Shared Drive legacy folder trashing')
+assertIncludes(pipelineProvisioning, "body: { trashed: true }", 'verified Shared Drive trash state')
+assertIncludes(pipelineProvisioning, 'GOOGLE_DRIVE_TRASH_UNVERIFIED', 'retryable Drive trash verification error')
 
 const googleWorkspacePersistence = read('app_src/lib/persistence/googleWorkspace.ts')
 assertIncludes(googleWorkspacePersistence, 'expectedVersion', 'Google Workspace optimistic persistence')

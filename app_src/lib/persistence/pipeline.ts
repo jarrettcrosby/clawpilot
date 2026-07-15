@@ -1403,7 +1403,7 @@ export async function claimPipelineSyncOutboxInPostgres(input: {
             locked_at = NULL,
             lock_token = NULL,
             updated_at = now()
-        WHERE target_system IN ('google_sheets', 'google_workspace', 'google_workspace_v2', 'google_workspace_v3', 'google_workspace_v4', 'google_workspace_v5', 'pipeline_internal_v1')
+        WHERE target_system IN ('google_sheets', 'google_workspace', 'google_workspace_v2', 'google_workspace_v3', 'google_workspace_v4', 'google_workspace_v5', 'google_workspace_v6', 'pipeline_internal_v1')
           AND aggregate_type LIKE 'pipeline%'
           AND status = 'processing'
           AND (
@@ -1419,7 +1419,7 @@ export async function claimPipelineSyncOutboxInPostgres(input: {
         WITH candidates AS (
           SELECT id
           FROM sync_outbox
-          WHERE target_system IN ('google_sheets', 'google_workspace', 'google_workspace_v2', 'google_workspace_v3', 'google_workspace_v4', 'google_workspace_v5', 'pipeline_internal_v1')
+          WHERE target_system IN ('google_sheets', 'google_workspace', 'google_workspace_v2', 'google_workspace_v3', 'google_workspace_v4', 'google_workspace_v5', 'google_workspace_v6', 'pipeline_internal_v1')
             AND aggregate_type LIKE 'pipeline%'
             AND status IN ('queued', 'failed')
             AND attempts < $2
@@ -1600,6 +1600,30 @@ export async function completePipelineSyncOutboxInPostgres(item: PipelineOutboxI
     )
     if (result.rowCount !== 1) throw new Error(`Pipeline outbox lease lost for ${item.id}`)
 
+    if (item.operation === 'reconcile_pipeline_hierarchy_v6') {
+      await client.query(
+        `
+          UPDATE sync_outbox
+          SET status = 'succeeded',
+              last_error = NULL,
+              processed_at = COALESCE(processed_at, now()),
+              locked_at = NULL,
+              lock_token = NULL,
+              updated_at = now()
+          WHERE aggregate_type = $1
+            AND aggregate_id = $2
+            AND operation IN (
+              'reconcile_pipeline_hierarchy_v2',
+              'reconcile_pipeline_hierarchy_v3',
+              'reconcile_pipeline_hierarchy_v4',
+              'reconcile_pipeline_hierarchy_v5'
+            )
+            AND status IN ('queued', 'failed', 'dead')
+        `,
+        [item.aggregateType, item.aggregateId],
+      )
+    }
+
     await client.query(
       `
         INSERT INTO audit_events (event_type, aggregate_type, aggregate_id, payload)
@@ -1689,7 +1713,7 @@ export async function readPipelineSyncDiagnosticsFromPostgres(
         SELECT status, COUNT(*)::text AS count
         FROM sync_outbox
         WHERE aggregate_type LIKE 'pipeline%'
-          AND target_system IN ('google_sheets', 'google_workspace', 'google_workspace_v2', 'google_workspace_v3', 'google_workspace_v4', 'google_workspace_v5', 'pipeline_internal_v1')
+          AND target_system IN ('google_sheets', 'google_workspace', 'google_workspace_v2', 'google_workspace_v3', 'google_workspace_v4', 'google_workspace_v5', 'google_workspace_v6', 'pipeline_internal_v1')
           AND (
             (
               payload->>'pipelineId' = $1
@@ -1710,7 +1734,7 @@ export async function readPipelineSyncDiagnosticsFromPostgres(
         SELECT MIN(created_at)::text AS oldest_pending_at
         FROM sync_outbox
         WHERE aggregate_type LIKE 'pipeline%'
-          AND target_system IN ('google_sheets', 'google_workspace', 'google_workspace_v2', 'google_workspace_v3', 'google_workspace_v4', 'google_workspace_v5', 'pipeline_internal_v1')
+          AND target_system IN ('google_sheets', 'google_workspace', 'google_workspace_v2', 'google_workspace_v3', 'google_workspace_v4', 'google_workspace_v5', 'google_workspace_v6', 'pipeline_internal_v1')
           AND status IN ('queued', 'failed', 'processing')
           AND (
             (

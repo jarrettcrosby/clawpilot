@@ -471,11 +471,31 @@ async function waitForDriveChildRemoval(
     await delay(250 * (2 ** attempt))
   }
   throw new GoogleWorkspaceClientError(
-    'Google Drive folder deletion is still converging',
+    'Google Drive folder cleanup is still converging',
     503,
-    'GOOGLE_DRIVE_DELETE_UNVERIFIED',
+    'GOOGLE_DRIVE_TRASH_UNVERIFIED',
     true,
   )
+}
+
+async function trashLegacyDriveFolder(runtime: GoogleWorkspaceRuntime, folderId: string) {
+  const parameters = new URLSearchParams({
+    supportsAllDrives: 'true',
+    fields: 'id,name,mimeType,parents,driveId,appProperties,trashed',
+  })
+  const trashed = await googleDriveJson<DriveFile>(runtime, `/drive/v3/files/${folderId}?${parameters.toString()}`, {
+    method: 'PATCH',
+    body: { trashed: true },
+    idempotent: true,
+  })
+  if (trashed.id !== folderId || trashed.trashed !== true) {
+    throw new GoogleWorkspaceClientError(
+      'Google Drive did not verify the legacy folder cleanup',
+      503,
+      'GOOGLE_DRIVE_TRASH_UNVERIFIED',
+      true,
+    )
+  }
 }
 
 async function cleanupLegacyFolderChain(runtime: GoogleWorkspaceRuntime, folderId: string | undefined) {
@@ -489,19 +509,19 @@ async function cleanupLegacyFolderChain(runtime: GoogleWorkspaceRuntime, folderI
       if (error instanceof GoogleWorkspaceClientError && error.code === 'GOOGLE_RESOURCE_NOT_FOUND') return
       throw error
     }
+    const parent = folder.parents?.[0]
+    if (folder.trashed) {
+      current = parent
+      continue
+    }
     if (
       folder.mimeType !== DRIVE_FOLDER_MIME_TYPE
       || folder.appProperties?.clawpilotManaged !== 'true'
       || !legacyResources.has(String(folder.appProperties?.clawpilotResource || ''))
       || (await listVerifiedDriveFolderChildren(runtime, current)).length > 0
     ) return
-    const parent = folder.parents?.[0]
-    const parameters = new URLSearchParams({ supportsAllDrives: 'true' })
     try {
-      await googleDriveJson(runtime, `/drive/v3/files/${current}?${parameters.toString()}`, {
-        method: 'DELETE',
-        idempotent: true,
-      })
+      await trashLegacyDriveFolder(runtime, current)
     } catch (error) {
       if (!(error instanceof GoogleWorkspaceClientError) || error.code !== 'GOOGLE_RESOURCE_NOT_FOUND') throw error
     }
