@@ -411,22 +411,52 @@ async function getDriveFile(runtime: GoogleWorkspaceRuntime, resourceId: string)
   return googleDriveJson<DriveFile>(runtime, `/drive/v3/files/${resourceId}?${parameters.toString()}`)
 }
 
-async function driveFolderHasChildren(runtime: GoogleWorkspaceRuntime, folderId: string) {
-  const parameters = new URLSearchParams({
-    q: `trashed = false and '${driveQueryLiteral(folderId)}' in parents`,
-    corpora: 'drive',
-    driveId: runtimeSharedDriveId(runtime),
-    includeItemsFromAllDrives: 'true',
-    supportsAllDrives: 'true',
-    spaces: 'drive',
-    pageSize: '1',
-    fields: 'files(id)',
-  })
-  const response = await googleDriveJson<{ files?: Array<{ id?: string }> }>(
-    runtime,
-    `/drive/v3/files?${parameters.toString()}`,
-  )
-  return Boolean(response.files?.length)
+async function driveFolderHasVerifiedChildren(runtime: GoogleWorkspaceRuntime, folderId: string) {
+  let pageToken: string | undefined
+  const seenPageTokens = new Set<string>()
+
+  do {
+    const parameters = new URLSearchParams({
+      q: `trashed = false and '${driveQueryLiteral(folderId)}' in parents`,
+      corpora: 'drive',
+      driveId: runtimeSharedDriveId(runtime),
+      includeItemsFromAllDrives: 'true',
+      supportsAllDrives: 'true',
+      spaces: 'drive',
+      pageSize: '100',
+      fields: 'nextPageToken,files(id,parents)',
+    })
+    if (pageToken) parameters.set('pageToken', pageToken)
+    const response = await googleDriveJson<{
+      files?: Array<{ id?: string; parents?: string[] }>
+      nextPageToken?: string
+    }>(runtime, `/drive/v3/files?${parameters.toString()}`)
+
+    for (const child of response.files || []) {
+      // Drive can echo the queried folder in this response. It cannot be its own child.
+      if (child.id === folderId) continue
+      if (!child.id || !child.parents?.includes(folderId)) {
+        throw new GoogleWorkspaceClientError(
+          'Google Drive returned an unverifiable folder child',
+          502,
+          'GOOGLE_RESPONSE_INVALID',
+        )
+      }
+      return true
+    }
+
+    pageToken = response.nextPageToken
+    if (pageToken && seenPageTokens.has(pageToken)) {
+      throw new GoogleWorkspaceClientError(
+        'Google Drive returned a repeated page token',
+        502,
+        'GOOGLE_RESPONSE_INVALID',
+      )
+    }
+    if (pageToken) seenPageTokens.add(pageToken)
+  } while (pageToken)
+
+  return false
 }
 
 async function cleanupLegacyFolderChain(runtime: GoogleWorkspaceRuntime, folderId: string | undefined) {
@@ -444,7 +474,7 @@ async function cleanupLegacyFolderChain(runtime: GoogleWorkspaceRuntime, folderI
       folder.mimeType !== DRIVE_FOLDER_MIME_TYPE
       || folder.appProperties?.clawpilotManaged !== 'true'
       || !legacyResources.has(String(folder.appProperties?.clawpilotResource || ''))
-      || await driveFolderHasChildren(runtime, current)
+      || await driveFolderHasVerifiedChildren(runtime, current)
     ) return
     const parent = folder.parents?.[0]
     const parameters = new URLSearchParams({ supportsAllDrives: 'true' })

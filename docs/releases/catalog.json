@@ -19,7 +19,7 @@
         "Restricts short-link discovery to the user's organization tree and mutations to link owners or authorized administrators",
         "Prevents an outgoing deployment worker from acknowledging Drive hierarchy reconciliation with the legacy folder layout",
         "Backfills each historical pipeline owner's user settings into the matching CRM organization and contact records",
-        "Removes empty managed legacy Drive folders only after the organization and contact hierarchy verifies"
+        "Removes empty managed legacy Drive folders only after the organization, contact, and direct-child relationships verify"
       ]
     }
   }

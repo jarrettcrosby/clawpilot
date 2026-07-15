@@ -1403,7 +1403,7 @@ export async function claimPipelineSyncOutboxInPostgres(input: {
             locked_at = NULL,
             lock_token = NULL,
             updated_at = now()
-        WHERE target_system IN ('google_sheets', 'google_workspace', 'google_workspace_v2', 'google_workspace_v3', 'pipeline_internal_v1')
+        WHERE target_system IN ('google_sheets', 'google_workspace', 'google_workspace_v2', 'google_workspace_v3', 'google_workspace_v4', 'pipeline_internal_v1')
           AND aggregate_type LIKE 'pipeline%'
           AND status = 'processing'
           AND (
@@ -1419,7 +1419,7 @@ export async function claimPipelineSyncOutboxInPostgres(input: {
         WITH candidates AS (
           SELECT id
           FROM sync_outbox
-          WHERE target_system IN ('google_sheets', 'google_workspace', 'google_workspace_v2', 'google_workspace_v3', 'pipeline_internal_v1')
+          WHERE target_system IN ('google_sheets', 'google_workspace', 'google_workspace_v2', 'google_workspace_v3', 'google_workspace_v4', 'pipeline_internal_v1')
             AND aggregate_type LIKE 'pipeline%'
             AND status IN ('queued', 'failed')
             AND attempts < $2
@@ -1689,7 +1689,7 @@ export async function readPipelineSyncDiagnosticsFromPostgres(
         SELECT status, COUNT(*)::text AS count
         FROM sync_outbox
         WHERE aggregate_type LIKE 'pipeline%'
-          AND target_system IN ('google_sheets', 'google_workspace', 'google_workspace_v2', 'google_workspace_v3', 'pipeline_internal_v1')
+          AND target_system IN ('google_sheets', 'google_workspace', 'google_workspace_v2', 'google_workspace_v3', 'google_workspace_v4', 'pipeline_internal_v1')
           AND (
             (
               payload->>'pipelineId' = $1
@@ -1710,7 +1710,7 @@ export async function readPipelineSyncDiagnosticsFromPostgres(
         SELECT MIN(created_at)::text AS oldest_pending_at
         FROM sync_outbox
         WHERE aggregate_type LIKE 'pipeline%'
-          AND target_system IN ('google_sheets', 'google_workspace', 'google_workspace_v2', 'google_workspace_v3', 'pipeline_internal_v1')
+          AND target_system IN ('google_sheets', 'google_workspace', 'google_workspace_v2', 'google_workspace_v3', 'google_workspace_v4', 'pipeline_internal_v1')
           AND status IN ('queued', 'failed', 'processing')
           AND (
             (
