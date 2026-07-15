@@ -1,5 +1,7 @@
 import crypto from 'node:crypto'
 import type { Task, CrmTaskContext } from '@/lib/types'
+import { normalizeCrmBoardCard } from '@/lib/crm/boardCard.mjs'
+import { decodeHtmlEntities } from '@/lib/htmlEntities.mjs'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import {
   ensurePipelineCrmReferenceLinks,
@@ -7,7 +9,6 @@ import {
   updateCrmDescriptionWithClient,
 } from '@/lib/persistence/crm'
 import { query, withTransaction } from '@/lib/persistence/postgres'
-import { upsertTaskWithClient } from '@/lib/persistence/tasks'
 import { shortLinkUrl } from '@/lib/shortlinks'
 
 const CRM_BOARD_NAME = 'crm board'
@@ -34,7 +35,7 @@ type CrmBoardRecord = {
 
 type CrmBoardCardRow = {
   board_id: string
-  task_id: string
+  card_id: string
   pipeline_id: string
   entity_type: 'organizations' | 'contacts'
   entity_id: string
@@ -92,24 +93,24 @@ function crmTaskContext(record: CrmBoardRecord, description: string, syncStatus:
   }
 }
 
-function newCrmTask(boardId: string, record: CrmBoardRecord, now: string): Task {
+function newCrmCard(boardId: string, record: CrmBoardRecord, now: string): Task {
   const description = normalizeCrmDescription(record.description)
   const title = `${record.reference_code} - ${record.record_name}`
   const taskId = taskIdFor(boardId, record.entity_type, record.entity_id)
-  return {
+  return normalizeCrmBoardCard({
     id: taskId,
     boardId,
     title,
     desc: description,
     status: 'backlog',
     priority: 'medium',
-    category: 'pipeline',
+    category: 'crm',
     tags: ['crm', record.entity_type === 'organizations' ? 'account' : 'contact'],
     createdAt: now,
     updatedAt: now,
     activity: [{
       type: 'created',
-      message: 'CRM card created in Backlog',
+      message: 'CRM record added to Backlog',
       timestamp: now,
       actor: 'ClawPilot CRM',
       taskId,
@@ -119,7 +120,7 @@ function newCrmTask(boardId: string, record: CrmBoardRecord, now: string): Task 
     checklist: [],
     entityType: record.entity_type === 'organizations' ? 'crm-account' : 'crm-contact',
     crm: crmTaskContext(record, description, 'synced'),
-  }
+  }) as Task
 }
 
 export async function resolveCrmBoardBinding(boardId: string): Promise<CrmBoardBinding | null> {
@@ -231,17 +232,20 @@ async function readCrmBoardRecords(
      ORDER BY entity_type, record_name, reference_code`,
     [pipelineId, workspaceOrganizationId],
   )
-  return result.rows
+  return result.rows.map((row) => ({
+    ...row,
+    record_name: decodeHtmlEntities(row.record_name),
+    account_name: decodeHtmlEntities(row.account_name),
+  }))
 }
 
 async function readCrmBoardCards(boardId: string): Promise<CrmBoardCardRow[]> {
   const result = await query<CrmBoardCardRow>(
-    `SELECT card.board_id::text, card.task_id, card.pipeline_id::text, card.entity_type,
+    `SELECT card.board_id::text, card.card_id, card.pipeline_id::text, card.entity_type,
        card.entity_id::text, card.reference_code, card.last_synced_description,
        card.last_common_hash, card.card_description_hash, card.crm_description_hash,
-       card.sync_status, task.payload
+       card.sync_status, card.payload
      FROM crm_board_cards card
-     JOIN tasks task ON task.id = card.task_id AND task.board_id = card.board_id
      WHERE card.board_id = $1::uuid`,
     [boardId],
   )
@@ -288,21 +292,22 @@ async function prepareExistingCard(
       taskTitle: title,
     })
   }
+  const normalizedCard = normalizeCrmBoardCard({
+    ...previous,
+    boardId: binding.board_id,
+    title,
+    desc: nextDescription,
+    tags,
+    archived: false,
+    archivedAt: undefined,
+    entityType: record.entity_type === 'organizations' ? 'crm-account' : 'crm-contact',
+    crm: context,
+    activity,
+    updatedAt: projectionChanged || conflictResolved ? now : previous.updatedAt,
+  }) as Task
   return {
     record,
-    task: {
-      ...previous,
-      boardId: binding.board_id,
-      title,
-      desc: nextDescription,
-      tags,
-      archived: false,
-      archivedAt: undefined,
-      entityType: record.entity_type === 'organizations' ? 'crm-account' : 'crm-contact',
-      crm: context,
-      activity,
-      updatedAt: projectionChanged || conflictResolved ? now : previous.updatedAt,
-    },
+    task: normalizedCard,
     commonDescription: nextCommonDescription,
     commonHash: nextCommonHash,
     cardHash,
@@ -335,7 +340,7 @@ export async function reconcileCrmBoardProjection(input: { boardId: string }): P
       prepared.push(await prepareExistingCard(binding, record, existing, now))
       continue
     }
-    const task = newCrmTask(binding.board_id, record, now)
+    const task = newCrmCard(binding.board_id, record, now)
     const hash = descriptionHash(task.desc)
     prepared.push({
       record,
@@ -354,26 +359,25 @@ export async function reconcileCrmBoardProjection(input: { boardId: string }): P
   await withTransaction(async (client) => {
     for (const card of hiddenCards) {
       await client.query(
-        `DELETE FROM tasks
-         WHERE id = $1 AND board_id = $2::uuid AND source = 'crm-projection'`,
-        [card.task_id, binding.board_id],
+        'DELETE FROM crm_board_cards WHERE card_id = $1 AND board_id = $2::uuid',
+        [card.card_id, binding.board_id],
       )
     }
 
     for (const card of prepared) {
-      await upsertTaskWithClient(client, card.task, binding.board_id, 'crm-projection')
       await client.query(
         `INSERT INTO crm_board_cards (
-           board_id, task_id, pipeline_id, entity_type, entity_id, reference_code,
+           board_id, card_id, pipeline_id, entity_type, entity_id, reference_code, payload,
            last_synced_description, last_common_hash, card_description_hash,
            crm_description_hash, sync_status, conflict_at, created_at, updated_at
          )
-         VALUES ($1::uuid, $2, $3::uuid, $4, $5::uuid, $6, $7, $8, $9, $10, $11,
-           CASE WHEN $11 = 'conflict' THEN now() ELSE NULL END, now(), now())
+         VALUES ($1::uuid, $2, $3::uuid, $4, $5::uuid, $6, $7::jsonb, $8, $9, $10, $11, $12,
+           CASE WHEN $12 = 'conflict' THEN now() ELSE NULL END, now(), now())
          ON CONFLICT (board_id, entity_type, entity_id) DO UPDATE SET
-           task_id = EXCLUDED.task_id,
+           card_id = EXCLUDED.card_id,
            pipeline_id = EXCLUDED.pipeline_id,
            reference_code = EXCLUDED.reference_code,
+           payload = EXCLUDED.payload,
            last_synced_description = EXCLUDED.last_synced_description,
            last_common_hash = EXCLUDED.last_common_hash,
            card_description_hash = EXCLUDED.card_description_hash,
@@ -391,6 +395,7 @@ export async function reconcileCrmBoardProjection(input: { boardId: string }): P
           card.record.entity_type,
           card.record.entity_id,
           card.record.reference_code,
+          JSON.stringify(normalizeCrmBoardCard(card.task)),
           card.commonDescription,
           card.commonHash,
           card.cardHash,
@@ -449,14 +454,13 @@ export async function updateCrmBoardTaskDescription(input: {
 
   return withTransaction(async (client) => {
     const selected = await client.query<CrmBoardCardRow>(
-      `SELECT card.board_id::text, card.task_id, card.pipeline_id::text, card.entity_type,
+      `SELECT card.board_id::text, card.card_id, card.pipeline_id::text, card.entity_type,
          card.entity_id::text, card.reference_code, card.last_synced_description,
          card.last_common_hash, card.card_description_hash, card.crm_description_hash,
-         card.sync_status, task.payload
+         card.sync_status, card.payload
        FROM crm_board_cards card
-       JOIN tasks task ON task.id = card.task_id AND task.board_id = card.board_id
-       WHERE card.board_id = $1::uuid AND card.task_id = $2
-       FOR UPDATE OF card, task`,
+       WHERE card.board_id = $1::uuid AND card.card_id = $2
+       FOR UPDATE OF card`,
       [input.boardId, input.taskId],
     )
     const card = selected.rows[0]
@@ -501,15 +505,14 @@ export async function updateCrmBoardTaskDescription(input: {
         },
       ],
     }
-    await upsertTaskWithClient(client, updated, input.boardId, 'crm-projection')
     const hash = descriptionHash(description)
     await client.query(
       `UPDATE crm_board_cards
-       SET last_synced_description = $3, last_common_hash = $4,
-         card_description_hash = $4, crm_description_hash = $4,
+       SET payload = $3::jsonb, last_synced_description = $4, last_common_hash = $5,
+         card_description_hash = $5, crm_description_hash = $5,
          sync_status = 'synced', conflict_at = NULL, updated_at = now()
-       WHERE board_id = $1::uuid AND task_id = $2`,
-      [input.boardId, input.taskId, description, hash],
+       WHERE board_id = $1::uuid AND card_id = $2`,
+      [input.boardId, input.taskId, JSON.stringify(normalizeCrmBoardCard(updated)), description, hash],
     )
     return updated
   })

@@ -6,6 +6,7 @@ import type { Task, ActivityEntry, Comment, ChecklistItem } from '@/lib/types'
 import { ensureNotFrozen } from '@/lib/freeze'
 import { normalizeProductAgentId } from '@/lib/agents/routing'
 import { assignmentKickoffText, commentTargetsAssignedAgent, prepareAgentDispatch } from '@/lib/agents/dispatch'
+import { isCrmBoardCard, normalizeCrmBoardCard } from '@/lib/crm/boardCard.mjs'
 import { normalizeExecutionStatus } from '@/lib/taskState'
 import type { ExecutionStatus } from '@/lib/taskState'
 import { withFileLock } from '@/lib/fileLock'
@@ -202,8 +203,9 @@ function normalizeTasks(tasks: unknown): Task[] {
       } satisfies ActivityEntry
     })
 
+    const crmCard = isCrmBoardCard(t)
     const assignedAgent = typeof t.assignedAgent === 'string' ? t.assignedAgent : undefined
-    const mappedAssigned = normalizeProductAgentId(assignedAgent, {
+    const mappedAssigned = crmCard ? undefined : normalizeProductAgentId(assignedAgent, {
       category: typeof t.category === 'string' ? t.category : undefined,
       tags: Array.isArray(t.tags) ? t.tags.map((tag) => String(tag)) : [],
     })
@@ -246,7 +248,9 @@ function normalizeTasks(tasks: unknown): Task[] {
       governance: typeof t.governance === 'object' && t.governance !== null ? t.governance as Task['governance'] : undefined,
       execution: typeof t.execution === 'object' && t.execution !== null ? t.execution as Task['execution'] : undefined,
     }
-    return applyCanonicalWorkItem(normalizedTask)
+    return crmCard
+      ? normalizeCrmBoardCard(normalizedTask) as Task
+      : applyCanonicalWorkItem(normalizedTask)
   })
 }
 
@@ -259,11 +263,11 @@ function readTasksFromFile(): Task[] {
   }
 }
 
-async function readTasks(boardId?: string): Promise<Task[]> {
+async function readTasks(boardId?: string, includeCrmCards = false): Promise<Task[]> {
   if (isPostgresTaskStoreEnabled()) {
     if (!boardId) throw new Error('Project board context is required')
     try {
-      return normalizeTasks(await readTasksFromPostgres({ boardId }))
+      return normalizeTasks(await readTasksFromPostgres({ boardId, includeCrmCards }))
     } catch (error) {
       if (!shouldFallbackToFileOnDatabaseError()) throw error
       console.warn('[task-store] Postgres read failed; falling back to file store', error)
@@ -482,6 +486,7 @@ export async function GET(req: NextRequest) {
   try {
     const { searchParams } = new URL(req.url)
     const includeArchived = searchParams.get('includeArchived') === 'true'
+    const includeCrmCards = searchParams.get('includeCrmCards') === 'true'
     const board = await resolveTaskBoard(req)
     if (board) {
       const binding = await resolveCrmBoardBinding(board.id)
@@ -491,7 +496,7 @@ export async function GET(req: NextRequest) {
       }
       await reconcileCrmBoardProjection({ boardId: board.id })
     }
-    const tasks = await readTasks(board?.id)
+    const tasks = (await readTasks(board?.id, includeCrmCards)).filter((task) => includeCrmCards || !isCrmBoardCard(task))
     return NextResponse.json(includeArchived ? tasks : tasks.filter((task) => !task.archived))
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unable to load tasks'
@@ -749,7 +754,7 @@ export async function PATCH(req: NextRequest) {
       requireResourceEditor(pipeline)
     }
   }
-  const tasks = await readTasks(board?.id)
+  const tasks = await readTasks(board?.id, true)
   const body = await req.json() as TaskPatchBody
   const { id, crmDescription, crmDescriptionHash, _comment, _editCommentId, _editCommentText, _deleteCommentId, _restoreCommentId, _checklistAdd, _checklistToggle, _checklistDelete, _checklistUpdate, _execution, _agentDispatchState, _suggestionAction, _actor, _deleteReason, ...rawUpdates } = body
   if (_agentDispatchState && !authorizedWorkerMutation(req)) {
@@ -762,6 +767,7 @@ export async function PATCH(req: NextRequest) {
 
   const now = new Date().toISOString()
   const prev = tasks[idx]
+  const crmCard = isCrmBoardCard(prev)
   const hasCrmDescriptionUpdate = Boolean(prev.crm) && (
     Object.prototype.hasOwnProperty.call(body, 'crmDescription')
     || Object.prototype.hasOwnProperty.call(rawUpdates, 'desc')
@@ -785,6 +791,19 @@ export async function PATCH(req: NextRequest) {
   const hasAssignedAgentUpdate = Object.prototype.hasOwnProperty.call(rawUpdates, 'assignedAgent')
   const hasNextActionUpdate = Object.prototype.hasOwnProperty.call(rawUpdates, 'nextAction')
     || Object.prototype.hasOwnProperty.call(rawUpdates, 'workItem')
+  if (crmCard && hasAssignedAgentUpdate) {
+    return NextResponse.json({ error: 'CRM board cards cannot be assigned to agents' }, { status: 409 })
+  }
+  if (crmCard && (
+    hasNextActionUpdate
+    || Object.prototype.hasOwnProperty.call(rawUpdates, 'dueDate')
+    || Object.prototype.hasOwnProperty.call(rawUpdates, 'workstream')
+    || Object.prototype.hasOwnProperty.call(rawUpdates, 'outcomeStatement')
+    || Boolean(_checklistAdd || _checklistToggle || _checklistDelete || _checklistUpdate)
+    || Boolean(_execution || _agentDispatchState || _suggestionAction)
+  )) {
+    return NextResponse.json({ error: 'CRM board cards do not participate in task execution workflows' }, { status: 409 })
+  }
   const updates: Partial<Task> = {}
 
   if (Object.prototype.hasOwnProperty.call(rawUpdates, 'title') && typeof rawUpdates.title === 'string') {
@@ -1099,9 +1118,11 @@ export async function PATCH(req: NextRequest) {
     return NextResponse.json({ ok: true })
   }
   let nextTask: Task = { ...prev, ...updates, execution, comments, deletedComments, checklist, activity, updatedAt: now }
-  nextTask = applyCanonicalWorkItem(nextTask)
+  nextTask = crmCard
+    ? normalizeCrmBoardCard(nextTask) as Task
+    : applyCanonicalWorkItem(nextTask)
 
-  if (isActiveColumnStatus(nextTask.status)) {
+  if (!crmCard && isActiveColumnStatus(nextTask.status)) {
     const missing = deriveMissingActionableFields(nextTask)
     if (missing.length > 0) {
       return NextResponse.json({
@@ -1119,7 +1140,7 @@ export async function PATCH(req: NextRequest) {
   }
 
   const agentDispatches: AgentDispatchEnqueueInput[] = []
-  if (board && isPostgresTaskStoreEnabled()) {
+  if (board && isPostgresTaskStoreEnabled() && !crmCard) {
     const targetAgent = String(nextTask.assignedAgent || '')
     if (hasAssignedAgentUpdate && targetAgent && targetAgent !== prevAssigned) {
       const prepared = prepareAgentDispatch({
@@ -1150,7 +1171,9 @@ export async function PATCH(req: NextRequest) {
     }
   }
 
-  tasks[idx] = applyCanonicalWorkItem(nextTask)
+  tasks[idx] = crmCard
+    ? normalizeCrmBoardCard(nextTask) as Task
+    : applyCanonicalWorkItem(nextTask)
   await writeTasks(tasks, board?.id, agentDispatches)
   return NextResponse.json(tasks[idx])
 }

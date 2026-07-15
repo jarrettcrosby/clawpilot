@@ -356,8 +356,17 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
       <Box sx={{ px: shortLandscape ? 1.5 : 3, pt: shortLandscape ? 1 : 3, pb: shortLandscape ? 1 : 2, borderBottom: '1px solid rgba(255,255,255,0.06)', flexShrink: 0 }}>
         <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
           <Stack direction="row" spacing={1} alignItems="center" mb={1.5}>
-            <FlagRounded sx={{ fontSize: 16, color: PRIORITY_COLORS[task.priority] }} />
-            <Typography variant="overline" sx={{ color: PRIORITY_COLORS[task.priority], fontSize: '0.65rem', letterSpacing: 1.5 }}>{PRIORITY_LABELS[task.priority]}</Typography>
+            {generatedCrmCard ? (
+              <>
+                <CodeRounded sx={{ fontSize: 16, color: '#A8C7FA' }} />
+                <Typography variant="overline" sx={{ color: '#A8C7FA', fontSize: '0.65rem', letterSpacing: 1.5 }}>CRM RECORD</Typography>
+              </>
+            ) : (
+              <>
+                <FlagRounded sx={{ fontSize: 16, color: PRIORITY_COLORS[task.priority] }} />
+                <Typography variant="overline" sx={{ color: PRIORITY_COLORS[task.priority], fontSize: '0.65rem', letterSpacing: 1.5 }}>{PRIORITY_LABELS[task.priority]}</Typography>
+              </>
+            )}
           </Stack>
           <Box sx={{ display: 'flex', gap: 0.5 }}>
             {!readOnly ? <Tooltip title={generatedCrmCard ? 'CRM cards remain available while the CRM record is active' : 'Archive card'}>
@@ -404,6 +413,8 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
                 ))}
               </Select>
             </Stack>
+            {!generatedCrmCard && (
+              <>
             <Stack direction="row" alignItems="center" spacing={2}>
               <Typography variant="body2" color="text.disabled" sx={{ minWidth: 80, fontSize: '0.8rem' }}>Priority</Typography>
               <Select disabled={readOnly} size="small" value={task.priority} onChange={e => patch({ priority: e.target.value })} sx={selectSx} MenuProps={menuPaper}>
@@ -487,6 +498,8 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
                 )}
               </Box>
             </Stack>
+              </>
+            )}
           </Stack>
         </Box>
 
@@ -579,8 +592,10 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
 
         <Divider sx={{ borderColor: 'rgba(255,255,255,0.06)' }} />
 
-        {/* Checklist */}
-        <Box>
+        {!generatedCrmCard && (
+          <>
+          {/* Checklist */}
+          <Box>
           <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: 1 }}>
             <Stack direction="row" spacing={1} alignItems="center">
               <CheckBoxOutlined sx={{ fontSize: 16, color: 'text.disabled' }} />
@@ -692,9 +707,11 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
               </Box>
             ))}
           </Stack>
-        </Box>
+          </Box>
 
-        <Divider sx={{ borderColor: 'rgba(255,255,255,0.06)' }} />
+          <Divider sx={{ borderColor: 'rgba(255,255,255,0.06)' }} />
+          </>
+        )}
 
         {/* Comments */}
         <Box>

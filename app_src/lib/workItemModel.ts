@@ -1,4 +1,5 @@
 import type { Task, ActivityEntry, ChecklistItem } from '@/lib/types'
+import { isCrmBoardCard, normalizeCrmBoardCard } from '@/lib/crm/boardCard.mjs'
 
 export type CanonicalWorkItem = {
   status: Task['status']
@@ -212,6 +213,7 @@ export function buildCanonicalWorkItem(task: Task): CanonicalWorkItem {
 }
 
 export function applyCanonicalWorkItem(task: Task): Task {
+  if (isCrmBoardCard(task)) return normalizeCrmBoardCard(task) as Task
   const canonical = buildCanonicalWorkItem(task)
   return {
     ...task,

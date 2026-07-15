@@ -111,7 +111,7 @@ export default function KanbanBoard({ externalFilter, onFilterChange }: Props = 
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), 8000)
 
-    fetch('/api/tasks', { signal: controller.signal })
+    fetch('/api/tasks?includeCrmCards=true', { signal: controller.signal })
       .then(async response => {
         if (!response.ok) throw new Error('Unable to load tasks')
         return response.json()
@@ -134,7 +134,7 @@ export default function KanbanBoard({ externalFilter, onFilterChange }: Props = 
     let active = true
     const refresh = async () => {
       try {
-        const response = await fetch('/api/tasks')
+        const response = await fetch('/api/tasks?includeCrmCards=true')
         if (!response.ok) return
         const taskData = await response.json()
         if (active && Array.isArray(taskData)) setTasks(taskData)

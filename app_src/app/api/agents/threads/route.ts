@@ -8,6 +8,7 @@ import { getAgentRuntimeForOperator, runChatGPTAgent, runOpenAIAgent } from '@/l
 import { resolveResponderId } from '@/lib/agents/responder.mjs'
 import { getThread as getFileThread, listThreads as listFileThreads, upsertThreadMessage as upsertFileThreadMessage } from '@/lib/agents/threadStore.mjs'
 import { normalizeProductAgentId, resolveExecutionAgentForControlAgent } from '@/lib/agents/routing'
+import { isCrmBoardCard } from '@/lib/crm/boardCard.mjs'
 import { withFileLock } from '@/lib/fileLock'
 import type { Comment, Task } from '@/lib/types'
 import { buildCanonicalWorkItem, canonicalizeTasks } from '@/lib/workItemModel'
@@ -41,13 +42,13 @@ async function readTasks(boardId?: string): Promise<Task[]> {
   if (isPostgresTaskStoreEnabled()) {
     if (!boardId) throw new Error('Project board context is required')
     try {
-      return await readTasksFromPostgres({ boardId })
+      return (await readTasksFromPostgres({ boardId })).filter((task) => !isCrmBoardCard(task))
     } catch (error) {
       if (!shouldFallbackToFileOnDatabaseError()) throw error
       console.warn('[agent-threads] Postgres task read failed; falling back to file store', error)
     }
   }
-  return readTasksFromFile()
+  return readTasksFromFile().filter((task) => !isCrmBoardCard(task))
 }
 
 async function writeTasks(tasks: Task[], boardId?: string) {

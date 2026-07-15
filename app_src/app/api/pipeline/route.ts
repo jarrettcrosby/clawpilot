@@ -3,6 +3,7 @@ import crypto from 'crypto'
 import fs from 'fs'
 import path from 'path'
 import type { Task } from '@/lib/types'
+import { isCrmBoardCard } from '@/lib/crm/boardCard.mjs'
 import { buildCanonicalWorkItem } from '@/lib/workItemModel'
 import { shouldFallbackToFileOnDatabaseError } from '@/lib/persistence/config'
 import { isPostgresTaskStoreEnabled, readTasksFromPostgres } from '@/lib/persistence/tasks'
@@ -46,6 +47,7 @@ async function readTasks(boardId?: string): Promise<Task[]> {
 
 function pipelineWorkItemsFromTasks(tasks: Task[]) {
   return tasks
+    .filter((task) => !isCrmBoardCard(task))
     .filter((task) => {
       const tags = Array.isArray(task.tags) ? task.tags.map((t) => String(t).toLowerCase()) : []
       return String(task.category || '').toLowerCase() === 'pipeline' || tags.includes('pipeline')

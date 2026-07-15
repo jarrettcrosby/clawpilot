@@ -243,6 +243,7 @@ export async function refreshUserBriefs(
           category
         FROM tasks
         WHERE board_id = $1::uuid
+          AND source <> 'crm-projection'
           AND archived = false
           AND deleted_at IS NULL
         ORDER BY

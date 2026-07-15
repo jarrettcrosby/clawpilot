@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
+import { decodeHtmlEntities } from '../app_src/lib/htmlEntities.mjs'
+
+globalThis.__decodeHtmlEntities = decodeHtmlEntities
 
 const require = createRequire(new URL('../app_src/package.json', import.meta.url))
 const ts = require('typescript')
@@ -21,6 +24,7 @@ async function importTypeScript(relativePath, { injectRuntime = false } = {}) {
 const listSuiteCrmNotesUpdatedSince = (...args) => globalThis.__suiteCrmInteractionTest.list(...args)
 const stageCrmRecordInPostgres = (...args) => globalThis.__suiteCrmInteractionTest.stage(...args)
 const query = (...args) => globalThis.__suiteCrmInteractionTest.query(...args)
+const decodeHtmlEntities = (value) => globalThis.__decodeHtmlEntities(value)
 ${output}`
   }
   const encoded = Buffer.from(output).toString('base64')
@@ -138,7 +142,7 @@ const changedNote = {
   id: 'note-changed',
   attributes: {
     global_id_c: 'GI0000001',
-    name: 'Updated subject',
+    name: 'Updated &quot;subject&quot;',
     description: 'Updated description',
     date_entered: '2026-07-15T10:30:00Z',
     date_modified: '2026-07-15T11:30:00Z',
@@ -289,7 +293,7 @@ assert.deepEqual(staged[0].fields, {
   parentSuiteCrmId: 'contact-suitecrm-id',
   parentSuiteCrmType: 'Contacts',
   interactionType: 'email',
-  subject: 'Updated subject',
+  subject: 'Updated "subject"',
   agentName: 'owner@example.com',
   occurredAt: '2026-07-15T10:30:00.000Z',
   description: 'Updated description',

@@ -42,7 +42,7 @@ export default function ArchivedCardsView({ query, onRestored }: Props) {
   const [deleting, setDeleting] = useState(false)
 
   useEffect(() => {
-    fetch('/api/tasks?includeArchived=true')
+    fetch('/api/tasks?includeArchived=true&includeCrmCards=true')
       .then(r => r.json())
       .then((data: Task[]) => {
         setTasks(data.filter(t => t.archived))

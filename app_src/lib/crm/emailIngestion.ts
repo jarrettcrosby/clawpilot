@@ -1,4 +1,5 @@
 import crypto from 'node:crypto'
+import { decodeHtmlEntities } from '@/lib/htmlEntities.mjs'
 import { matonFetch } from '@/lib/maton'
 import {
   readCrmRecordByReference,
@@ -207,36 +208,6 @@ export function extractEmailAddresses(value: unknown): string[] {
   const input = typeof value === 'string' ? value : ''
   const matches = input.match(/[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+/gi) || []
   return Array.from(new Set(matches.map((email) => email.toLowerCase())))
-}
-
-function decodeHtmlEntities(value: string): string {
-  const named: Record<string, string> = {
-    amp: '&',
-    apos: "'",
-    gt: '>',
-    hellip: '...',
-    lt: '<',
-    mdash: '-',
-    nbsp: ' ',
-    ndash: '-',
-    quot: '"',
-  }
-  return value.replace(/&(#x[0-9a-f]+|#[0-9]+|[a-z][a-z0-9]+);/gi, (encoded, entity: string) => {
-    const normalized = entity.toLowerCase()
-    if (normalized.startsWith('#')) {
-      const radix = normalized.startsWith('#x') ? 16 : 10
-      const digits = normalized.slice(radix === 16 ? 2 : 1)
-      const codePoint = Number.parseInt(digits, radix)
-      if (
-        !Number.isFinite(codePoint)
-        || codePoint <= 0
-        || codePoint > 0x10ffff
-        || (codePoint >= 0xd800 && codePoint <= 0xdfff)
-      ) return '\uFFFD'
-      return String.fromCodePoint(codePoint)
-    }
-    return named[normalized] ?? encoded
-  })
 }
 
 export function stripHtmlToText(value: unknown): string {
