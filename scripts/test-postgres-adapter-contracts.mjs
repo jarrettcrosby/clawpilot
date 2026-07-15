@@ -501,8 +501,13 @@ assertIncludes(suiteCrmGlobalIdBootstrap, 'expose_global_id_in_list_view', 'Suit
 assertIncludes(suiteCrmGlobalIdBootstrap, "expose_global_id_in_search_view($module, 'basic_search')", 'SuiteCRM Global ID basic search layout')
 assertIncludes(suiteCrmGlobalIdBootstrap, "expose_global_id_in_search_view($module, 'advanced_search')", 'SuiteCRM Global ID advanced search layout')
 assertIncludes(suiteCrmGlobalIdBootstrap, 'ensure_global_id_search_field', 'SuiteCRM Global ID search field metadata')
+assertIncludes(suiteCrmGlobalIdBootstrap, "'force_unifiedsearch' => true", 'SuiteCRM immediate unified search inclusion')
 assertIncludes(suiteCrmGlobalIdBootstrap, 'rebuild_and_verify_global_search', 'SuiteCRM Global ID search cache verification')
 assertIncludes(suiteCrmGlobalIdBootstrap, "sugar_cached('modules/unified_search_modules.php')", 'SuiteCRM unified search cache invalidation')
+
+const suiteCrmEntrypoint = read('services/suitecrm/entrypoint.sh')
+assertIncludes(suiteCrmEntrypoint, 'APP_ENV=prod php bin/console cache:clear --no-warmup', 'strict SuiteCRM application cache clear')
+assertIncludes(suiteCrmEntrypoint, 'APP_ENV=prod php bin/console cache:warmup', 'SuiteCRM application cache warmup')
 
 const suiteCrmGlobalIdBackfill = read('scripts/backfill-suitecrm-global-ids.mjs')
 assertIncludes(suiteCrmGlobalIdBackfill, 'global_id_c: row.reference_code', 'existing SuiteCRM Global ID backfill')

@@ -24,7 +24,7 @@ function layout_contains_global_id($value): bool
     if (!is_array($value)) {
         return false;
     }
-    if (isset($value['name']) && strtolower((string) $value['name']) === CLAWPILOT_GLOBAL_ID_FIELD) {
+    if (isset($value['name']) && is_string($value['name']) && strtolower($value['name']) === CLAWPILOT_GLOBAL_ID_FIELD) {
         return true;
     }
     foreach ($value as $key => $child) {
@@ -101,9 +101,29 @@ function expose_global_id_in_search_view(string $module, string $view): void
 function ensure_global_id_search_field(string $module): void
 {
     $parser = new ParserSearchFields($module);
-    if (!isset($parser->searchFields[$module][CLAWPILOT_GLOBAL_ID_FIELD])) {
-        $parser->addSearchField(CLAWPILOT_GLOBAL_ID_FIELD, ['query_type' => 'default']);
+    $definition = $parser->searchFields[$module][CLAWPILOT_GLOBAL_ID_FIELD] ?? [];
+    if (
+        !is_array($definition)
+        || ($definition['query_type'] ?? null) !== 'default'
+        || empty($definition['force_unifiedsearch'])
+    ) {
+        $parser->addSearchField(CLAWPILOT_GLOBAL_ID_FIELD, [
+            'query_type' => 'default',
+            // Dynamic vardefs written in this process are not reloaded until the
+            // next request. This keeps the rebuilt native search cache correct now.
+            'force_unifiedsearch' => true,
+        ]);
         $parser->saveSearchFields($parser->searchFields);
+    }
+
+    $parser = new ParserSearchFields($module);
+    $definition = $parser->searchFields[$module][CLAWPILOT_GLOBAL_ID_FIELD] ?? [];
+    if (
+        !is_array($definition)
+        || ($definition['query_type'] ?? null) !== 'default'
+        || empty($definition['force_unifiedsearch'])
+    ) {
+        throw new RuntimeException("Global ID is missing from {$module} search fields");
     }
 }
 
