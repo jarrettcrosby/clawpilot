@@ -9,6 +9,8 @@ require_once 'include/entryPoint.php';
 require_once 'modules/DynamicFields/DynamicField.php';
 require_once 'modules/DynamicFields/FieldCases.php';
 require_once 'modules/ModuleBuilder/parsers/ParserFactory.php';
+require_once 'modules/ModuleBuilder/parsers/parser.searchfields.php';
+require_once 'lib/Search/SearchModules.php';
 
 const CLAWPILOT_GLOBAL_ID_FIELD = 'global_id_c';
 const CLAWPILOT_GLOBAL_ID_LABEL = 'LBL_GLOBAL_ID';
@@ -22,10 +24,13 @@ function layout_contains_global_id($value): bool
     if (!is_array($value)) {
         return false;
     }
-    if (isset($value['name']) && strtolower((string) $value['name']) === CLAWPILOT_GLOBAL_ID_FIELD) {
+    if (isset($value['name']) && is_string($value['name']) && strtolower($value['name']) === CLAWPILOT_GLOBAL_ID_FIELD) {
         return true;
     }
-    foreach ($value as $child) {
+    foreach ($value as $key => $child) {
+        if (is_string($key) && strtolower($key) === CLAWPILOT_GLOBAL_ID_FIELD) {
+            return true;
+        }
         if (layout_contains_global_id($child)) {
             return true;
         }
@@ -35,22 +40,90 @@ function layout_contains_global_id($value): bool
 
 function expose_global_id_in_detail_view(string $module): void
 {
-    try {
-        $parser = ParserFactory::getParser('detailview', $module);
-        if (!$parser || layout_contains_global_id($parser->getLayout())) {
-            return;
-        }
+    $parser = ParserFactory::getParser('detailview', $module);
+    if (!$parser) {
+        throw new RuntimeException("SuiteCRM detail layout for {$module} is unavailable");
+    }
+    if (!layout_contains_global_id($parser->getLayout())) {
         $parser->addField([
             'name' => CLAWPILOT_GLOBAL_ID_FIELD,
             'label' => CLAWPILOT_GLOBAL_ID_LABEL,
         ]);
         $parser->handleSave(false);
-    } catch (Throwable $error) {
-        fwrite(STDERR, sprintf(
-            "[suitecrm] warning: could not add Global ID to the %s detail layout: %s\n",
-            $module,
-            $error->getMessage(),
-        ));
+        $parser = ParserFactory::getParser('detailview', $module);
+    }
+    if (!$parser || !layout_contains_global_id($parser->getLayout())) {
+        throw new RuntimeException("Global ID is missing from the {$module} detail layout");
+    }
+}
+
+function expose_global_id_in_list_view(string $module): void
+{
+    $parser = ParserFactory::getParser('listview', $module);
+    if (!$parser) {
+        throw new RuntimeException("SuiteCRM list layout for {$module} is unavailable");
+    }
+    if (!layout_contains_global_id($parser->getLayout())) {
+        $parser->_viewdefs[CLAWPILOT_GLOBAL_ID_FIELD] = [
+            'width' => '10%',
+            'label' => CLAWPILOT_GLOBAL_ID_LABEL,
+            'default' => true,
+            'sortable' => true,
+        ];
+        $parser->handleSave(false);
+        $parser = ParserFactory::getParser('listview', $module);
+    }
+    if (!$parser || !layout_contains_global_id($parser->getLayout())) {
+        throw new RuntimeException("Global ID is missing from the {$module} list layout");
+    }
+}
+
+function expose_global_id_in_search_view(string $module, string $view): void
+{
+    $parser = ParserFactory::getParser($view, $module);
+    if (!$parser) {
+        throw new RuntimeException("SuiteCRM {$view} layout for {$module} is unavailable");
+    }
+    if (!layout_contains_global_id($parser->getLayout())) {
+        $parser->_viewdefs[CLAWPILOT_GLOBAL_ID_FIELD] = [
+            'name' => CLAWPILOT_GLOBAL_ID_FIELD,
+            'label' => CLAWPILOT_GLOBAL_ID_LABEL,
+            'default' => true,
+        ];
+        $parser->handleSave(false);
+        $parser = ParserFactory::getParser($view, $module);
+    }
+    if (!$parser || !layout_contains_global_id($parser->getLayout())) {
+        throw new RuntimeException("Global ID is missing from the {$module} {$view} layout");
+    }
+}
+
+function ensure_global_id_search_field(string $module): void
+{
+    $parser = new ParserSearchFields($module);
+    $definition = $parser->searchFields[$module][CLAWPILOT_GLOBAL_ID_FIELD] ?? [];
+    if (
+        !is_array($definition)
+        || ($definition['query_type'] ?? null) !== 'default'
+        || empty($definition['force_unifiedsearch'])
+    ) {
+        $parser->addSearchField(CLAWPILOT_GLOBAL_ID_FIELD, [
+            'query_type' => 'default',
+            // Dynamic vardefs written in this process are not reloaded until the
+            // next request. This keeps the rebuilt native search cache correct now.
+            'force_unifiedsearch' => true,
+        ]);
+        $parser->saveSearchFields($parser->searchFields);
+    }
+
+    $parser = new ParserSearchFields($module);
+    $definition = $parser->searchFields[$module][CLAWPILOT_GLOBAL_ID_FIELD] ?? [];
+    if (
+        !is_array($definition)
+        || ($definition['query_type'] ?? null) !== 'default'
+        || empty($definition['force_unifiedsearch'])
+    ) {
+        throw new RuntimeException("Global ID is missing from {$module} search fields");
     }
 }
 
@@ -106,7 +179,28 @@ function ensure_global_id_field(string $module): void
     }
 
     $dynamic->setLabel('en_us', CLAWPILOT_GLOBAL_ID_LABEL, 'Global ID');
+    ensure_global_id_search_field($module);
     expose_global_id_in_detail_view($module);
+    expose_global_id_in_list_view($module);
+    expose_global_id_in_search_view($module, 'basic_search');
+    expose_global_id_in_search_view($module, 'advanced_search');
+}
+
+/** @param list<string> $modules */
+function rebuild_and_verify_global_search(array $modules): void
+{
+    $cachePath = sugar_cached('modules/unified_search_modules.php');
+    if (is_file($cachePath) && !unlink($cachePath)) {
+        throw new RuntimeException('Could not invalidate SuiteCRM unified-search metadata');
+    }
+
+    \SuiteCRM\Search\SearchModules::buildCache();
+    $searchModules = \SuiteCRM\Search\SearchModules::getUnifiedSearchModules();
+    foreach ($modules as $module) {
+        if (empty($searchModules[$module]['fields'][CLAWPILOT_GLOBAL_ID_FIELD])) {
+            throw new RuntimeException("Global ID is missing from {$module} unified search");
+        }
+    }
 }
 
 $modules = [
@@ -123,4 +217,6 @@ foreach ($modules as $module) {
     ensure_global_id_field($module);
 }
 
-fwrite(STDOUT, "SuiteCRM Global ID fields are ready\n");
+rebuild_and_verify_global_search($modules);
+
+fwrite(STDOUT, "SuiteCRM Global ID fields, layouts, and search metadata are ready\n");
