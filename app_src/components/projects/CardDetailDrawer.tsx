@@ -23,6 +23,7 @@ import Select from '@mui/material/Select'
 import Checkbox from '@mui/material/Checkbox'
 import LinearProgress from '@mui/material/LinearProgress'
 import Alert from '@mui/material/Alert'
+import Link from '@mui/material/Link'
 import CloseRounded from '@mui/icons-material/CloseRounded'
 import ArchiveRounded from '@mui/icons-material/ArchiveRounded'
 import FlagRounded from '@mui/icons-material/FlagRounded'
@@ -44,9 +45,12 @@ import PersonRounded from '@mui/icons-material/PersonRounded'
 import SmartToyRounded from '@mui/icons-material/SmartToyRounded'
 import CalendarTodayRounded from '@mui/icons-material/CalendarTodayRounded'
 import CheckBoxOutlined from '@mui/icons-material/CheckBoxOutlined'
+import OpenInNewRounded from '@mui/icons-material/OpenInNewRounded'
+import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import type { Task, ChecklistItem, Comment } from '@/lib/types'
 import { ASSIGNABLE_PRODUCT_AGENT_IDS, PRIORITY_COLORS, PRIORITY_LABELS, STATUS_LABELS, AVAILABLE_LABELS, COLUMNS, PEOPLE, CATEGORY_OPTIONS } from '@/lib/types'
 import { displayCategory } from '@/lib/format'
+import { formatUserDateTime, type UserDateTimeSettings } from '@/lib/userDateTime'
 
 type Props = {
   task: Task | null
@@ -63,8 +67,10 @@ type NextActionEditorProps = {
   onSave: (value: string) => void
 }
 
-function formatDate(iso: string) {
-  return new Date(iso).toLocaleString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' })
+function formatDate(iso: string, settings: UserDateTimeSettings) {
+  return formatUserDateTime(iso, settings, {
+    month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit', fallback: 'Unknown date',
+  })
 }
 
 function ActivityIcon({ type }: { type: string }) {
@@ -200,6 +206,7 @@ function renderCommentText(text: string) {
 }
 
 export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArchive, readOnly = false }: Props) {
+  const dateTimeSettings = useUserDateTime()
   const [editingTitle, setEditingTitle] = useState(false)
   const [titleVal, setTitleVal] = useState('')
   const [editingDesc, setEditingDesc] = useState(false)
@@ -262,9 +269,18 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
   if (!task) return null
   const agentDispatch = task.execution?.agentDispatch
   const agentResponding = agentDispatch?.status === 'queued' || agentDispatch?.status === 'running'
+  const generatedCrmCard = Boolean(task.crm)
+  const displayedDescription = task.crm?.description ?? task.desc
 
   const saveTitle = () => { if (titleVal.trim() && titleVal !== task.title) patch({ title: titleVal.trim() }); setEditingTitle(false) }
-  const saveDesc = () => { if (descVal !== task.desc) patch({ desc: descVal }); setEditingDesc(false) }
+  const saveDesc = () => {
+    if (descVal !== displayedDescription) {
+      patch(task.crm
+        ? { crmDescription: descVal, crmDescriptionHash: task.crm.descriptionHash }
+        : { desc: descVal })
+    }
+    setEditingDesc(false)
+  }
 
   const handleCommentKey = (e: React.KeyboardEvent<HTMLDivElement>) => {
     if (e.key === '@') {
@@ -344,8 +360,8 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
             <Typography variant="overline" sx={{ color: PRIORITY_COLORS[task.priority], fontSize: '0.65rem', letterSpacing: 1.5 }}>{PRIORITY_LABELS[task.priority]}</Typography>
           </Stack>
           <Box sx={{ display: 'flex', gap: 0.5 }}>
-            {!readOnly ? <Tooltip title="Archive card">
-              <IconButton onClick={archiveCard} sx={{ color: 'text.disabled', mt: -0.5 }}><ArchiveRounded sx={{ fontSize: 20 }} /></IconButton>
+            {!readOnly ? <Tooltip title={generatedCrmCard ? 'CRM cards remain available while the CRM record is active' : 'Archive card'}>
+              <span><IconButton disabled={generatedCrmCard} onClick={archiveCard} sx={{ color: 'text.disabled', mt: -0.5 }}><ArchiveRounded sx={{ fontSize: 20 }} /></IconButton></span>
             </Tooltip> : null}
             <IconButton aria-label="Close drawer" onClick={onClose} sx={{ color: 'text.disabled', mt: -0.5 }}><CloseRounded /></IconButton>
           </Box>
@@ -358,7 +374,7 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
             <IconButton size="small" onClick={saveTitle} sx={{ color: '#66BB6A' }}><CheckRounded /></IconButton>
           </Box>
         ) : (
-          <Box sx={{ display: 'flex', gap: 1, cursor: readOnly ? 'default' : 'pointer', '&:hover .ei': { opacity: readOnly ? 0 : 1 } }} onClick={() => { if (!readOnly) { setTitleVal(task.title); setEditingTitle(true) } }}>
+          <Box sx={{ display: 'flex', gap: 1, cursor: readOnly || generatedCrmCard ? 'default' : 'pointer', '&:hover .ei': { opacity: readOnly || generatedCrmCard ? 0 : 1 } }} onClick={() => { if (!readOnly && !generatedCrmCard) { setTitleVal(task.title); setEditingTitle(true) } }}>
             <Typography variant="h6" fontWeight={700} color="text.primary" sx={{ lineHeight: 1.3, flex: 1 }}>{task.title}</Typography>
             <EditRounded className="ei" sx={{ fontSize: 16, color: 'text.disabled', opacity: 0, transition: 'opacity 0.15s', mt: 0.5, flexShrink: 0 }} />
           </Box>
@@ -509,6 +525,36 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
 
         {/* Description */}
         <Box>
+          {task.crm && (
+            <Stack spacing={1.1} sx={{ mb: 2, p: 1.5, border: '1px solid rgba(168,199,250,0.18)', borderRadius: 2, backgroundColor: 'rgba(168,199,250,0.035)' }}>
+              <Typography variant="overline" color="text.disabled" sx={{ fontSize: '0.65rem', letterSpacing: 1.5 }}>CRM RECORD</Typography>
+              <Stack direction={{ xs: 'column', sm: 'row' }} gap={{ xs: 0.25, sm: 1 }}>
+                <Typography variant="caption" color="text.disabled" sx={{ minWidth: 104 }}>Global ID</Typography>
+                <Link href={task.crm.recordUrl} target="_blank" rel="noreferrer" underline="hover" sx={{ display: 'inline-flex', alignItems: 'center', gap: 0.5, fontSize: '0.82rem' }}>
+                  {task.crm.referenceCode}<OpenInNewRounded sx={{ fontSize: 14 }} />
+                </Link>
+              </Stack>
+              {task.crm.entity === 'contacts' && (
+                <Stack direction={{ xs: 'column', sm: 'row' }} gap={{ xs: 0.25, sm: 1 }}>
+                  <Typography variant="caption" color="text.disabled" sx={{ minWidth: 104 }}>Contact</Typography>
+                  <Link href={task.crm.recordUrl} target="_blank" rel="noreferrer" underline="hover" sx={{ fontSize: '0.82rem' }}>{task.crm.recordName}</Link>
+                </Stack>
+              )}
+              <Stack direction={{ xs: 'column', sm: 'row' }} gap={{ xs: 0.25, sm: 1 }}>
+                <Typography variant="caption" color="text.disabled" sx={{ minWidth: 104 }}>Account Name</Typography>
+                <Link href={task.crm.accountUrl} target="_blank" rel="noreferrer" underline="hover" sx={{ fontSize: '0.82rem' }}>{task.crm.accountName}</Link>
+              </Stack>
+              <Stack direction={{ xs: 'column', sm: 'row' }} gap={{ xs: 0.25, sm: 1 }}>
+                <Typography variant="caption" color="text.disabled" sx={{ minWidth: 104 }}>Email</Typography>
+                {task.crm.email && task.crm.emailUrl ? (
+                  <Link href={task.crm.emailUrl} target="_blank" rel="noreferrer" underline="hover" sx={{ fontSize: '0.82rem', overflowWrap: 'anywhere' }}>{task.crm.email}</Link>
+                ) : <Typography variant="body2" color="text.disabled">Not set</Typography>}
+              </Stack>
+              {task.crm.syncStatus === 'conflict' && (
+                <Alert severity="warning" sx={{ mt: 0.5 }}>Card and CRM descriptions both changed. Neither version was overwritten.</Alert>
+              )}
+            </Stack>
+          )}
           <Typography variant="overline" color="text.disabled" sx={{ fontSize: '0.65rem', letterSpacing: 1.5, display: 'block', mb: 1 }}>DESCRIPTION</Typography>
           {editingDesc ? (
             <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
@@ -522,10 +568,10 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
               </Stack>
             </Box>
           ) : (
-            <Box onClick={() => { if (!readOnly) { setDescVal(task.desc); setEditingDesc(true) } }}
+            <Box onClick={() => { if (!readOnly) { setDescVal(displayedDescription); setEditingDesc(true) } }}
               sx={{ cursor: readOnly ? 'default' : 'pointer', p: 1.5, borderRadius: 2, border: '1px solid transparent', transition: 'border-color 0.15s', '&:hover': { borderColor: readOnly ? 'transparent' : 'rgba(255,255,255,0.1)', backgroundColor: readOnly ? 'transparent' : 'rgba(255,255,255,0.02)' } }}>
-              <Typography variant="body2" color={task.desc ? 'text.secondary' : 'text.disabled'} sx={{ lineHeight: 1.7 }}>
-                {task.desc || 'Click to add a description...'}
+              <Typography variant="body2" color={displayedDescription ? 'text.secondary' : 'text.disabled'} sx={{ lineHeight: 1.7, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>
+                {displayedDescription || 'Click to add a description...'}
               </Typography>
             </Box>
           )}
@@ -702,7 +748,7 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
                   )}
                   <Box sx={{ flex: 1 }}>
                     <Typography variant="caption" color="text.primary" fontWeight={600}>{c.author}</Typography>
-                    <Typography variant="caption" color="text.disabled" sx={{ ml: 1 }}>{formatDate((c as Comment).timestamp || (c as Comment).createdAt || task.updatedAt)}</Typography>
+                    <Typography variant="caption" color="text.disabled" sx={{ ml: 1 }}>{formatDate((c as Comment).timestamp || (c as Comment).createdAt || task.updatedAt, dateTimeSettings)}</Typography>
                   </Box>
                   <Tooltip title="Edit comment">
                     <IconButton disabled={readOnly} size="small" onClick={() => { setEditingCommentId(c.id); setEditingCommentText(c.text || '') }}
@@ -771,7 +817,7 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
                       </IconButton>
                     </Tooltip>
                   </Box>
-                  <Typography variant="caption" color="text.disabled" display="block" mt={0.25}>{formatDate(entry.timestamp)}</Typography>
+                  <Typography variant="caption" color="text.disabled" display="block" mt={0.25}>{formatDate(entry.timestamp, dateTimeSettings)}</Typography>
                   {entry.from && entry.to && (
                     <Stack direction="row" spacing={0.75} alignItems="center" mt={0.75}>
                       <Chip size="small" label={STATUS_LABELS[entry.from as Task['status']]||entry.from} variant="outlined" sx={{ height: 20, fontSize: '0.65rem', borderColor: 'rgba(255,255,255,0.1)', color: 'text.disabled', borderRadius: 1 }} />

@@ -19,6 +19,8 @@ import Tooltip from '@mui/material/Tooltip'
 import Typography from '@mui/material/Typography'
 import useMediaQuery from '@mui/material/useMediaQuery'
 import AddRounded from '@mui/icons-material/AddRounded'
+import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
+import { formatUserDateTime, type UserDateTimeSettings } from '@/lib/userDateTime'
 
 type ReleaseEntry = {
   id: string
@@ -77,15 +79,14 @@ async function loadReleasePayload(signal: AbortSignal): Promise<ReleasePayload> 
   return data as ReleasePayload
 }
 
-function formatDate(value: string): string {
-  const date = new Date(value)
-  if (Number.isNaN(date.getTime())) return 'Unknown date'
-  return date.toLocaleString(undefined, {
+function formatDate(value: string, settings: UserDateTimeSettings): string {
+  return formatUserDateTime(value, settings, {
     year: 'numeric',
     month: 'short',
     day: 'numeric',
     hour: 'numeric',
     minute: '2-digit',
+    fallback: 'Unknown date',
   })
 }
 
@@ -127,6 +128,7 @@ function ReleaseChangeList({ title, items }: { title: string; items: string[] })
 }
 
 export default function VersionsSection() {
+  const dateTimeSettings = useUserDateTime()
   const shortLandscape = useMediaQuery('(orientation: landscape) and (max-height: 500px) and (max-width: 899.95px)')
   const [tab, setTab] = useState<'releases' | 'checkpoints'>('releases')
   const [payload, setPayload] = useState<ReleasePayload | null>(null)
@@ -289,7 +291,7 @@ export default function VersionsSection() {
                   <Box data-testid="release-entry" sx={{ py: 2.5 }}>
                     <Box display="flex" alignItems="center" gap={1} flexWrap="wrap" mb={1}>
                       <Typography variant="caption" color="text.secondary">
-                        {formatDate(release.deployedAt)}
+                        {formatDate(release.deployedAt, dateTimeSettings)}
                       </Typography>
                       <Chip
                         label={release.environment}
@@ -395,7 +397,7 @@ export default function VersionsSection() {
                   <Box data-testid="data-checkpoint-entry" sx={{ py: 2.25 }}>
                     <Box display="flex" alignItems="center" gap={1} flexWrap="wrap" mb={0.75}>
                       <Typography variant="caption" color="text.secondary">
-                        {formatDate(checkpoint.createdAt)}
+                        {formatDate(checkpoint.createdAt, dateTimeSettings)}
                       </Typography>
                       <Chip
                         label={checkpoint.providerBackupStatus === 'verified' ? 'Provider verified' : checkpoint.providerBackupStatus === 'failed' ? 'Provider check failed' : 'Provider not verified'}

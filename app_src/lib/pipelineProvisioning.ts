@@ -29,7 +29,7 @@ import {
 import { getPostgresPool } from '@/lib/persistence/postgres'
 import { syncAppUserProfileToCrm } from '@/lib/persistence/crm'
 import { createShortLink, listShortLinks, type ShortLinkActor } from '@/lib/shortlinks'
-import { workspaceOrganizationRootId } from '@/lib/organizations'
+import { ensurePrimaryWorkspaceOrganization } from '@/lib/organizations'
 import { normalizeUserEmail } from '@/lib/users'
 
 const DRIVE_FOLDER_MIME_TYPE = 'application/vnd.google-apps.folder'
@@ -60,7 +60,7 @@ const TAB_HEADERS: Record<(typeof EXPECTED_TABS)[number], string[]> = {
     'Priority', 'Opportunity', 'Owner', 'Organization', 'Status', 'Stage',
     'Loss Reason', 'Source', 'Value', 'Probability', 'Expected Close', 'Notes',
   ],
-  Interactions: ['Priority', 'Interaction', 'Owner', 'Agent', 'Date', 'Opportunity', 'Contact', 'Notes'],
+  Interactions: ['Priority', 'Interaction', 'Owner', 'Organization', 'Agent', 'Date', 'Opportunity', 'Contact', 'Notes'],
   Calculations: ['Metric', 'Value'],
   Dashboard: ['Metric', 'Value'],
   Dropdowns: [
@@ -1006,7 +1006,7 @@ async function verifyPipelineTabsAndHeaders(runtime: GoogleWorkspaceRuntime, she
 
 const shortLinkActor = async (ownerEmail: string): Promise<ShortLinkActor> => ({
   ownerEmail,
-  organizationRootId: await workspaceOrganizationRootId(ownerEmail),
+  organizationId: (await ensurePrimaryWorkspaceOrganization(ownerEmail)).id,
   sourceApp: 'clawpilot',
   manageOrganization: false,
   service: false,

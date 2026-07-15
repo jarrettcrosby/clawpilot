@@ -32,6 +32,8 @@ import RefreshRounded from '@mui/icons-material/RefreshRounded'
 import SearchRounded from '@mui/icons-material/SearchRounded'
 import ShortLinkFormDialog from './ShortLinkFormDialog'
 import type { ShortLinkRecord, ShortLinkWriteInput } from './types'
+import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
+import { formatUserDateTime, type UserDateTimeSettings } from '@/lib/userDateTime'
 
 type StatusKey = 'active' | 'disabled' | 'expired' | 'exhausted'
 
@@ -101,10 +103,15 @@ function formatRelativeDate(value: string | null): string {
   return new Intl.RelativeTimeFormat(undefined, { numeric: 'auto' }).format(amount, unit)
 }
 
-function formatDate(value: string) {
-  const date = new Date(value)
-  if (Number.isNaN(date.getTime())) return 'Unknown update time'
-  return date.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
+function formatDate(value: string, settings: UserDateTimeSettings) {
+  return formatUserDateTime(value, settings, {
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    timeZoneName: 'short',
+    fallback: 'Unknown update time',
+  })
 }
 
 function usage(record: ShortLinkRecord) {
@@ -132,6 +139,7 @@ async function copyText(value: string) {
 }
 
 export default function ShortLinksSection() {
+  const dateTimeSettings = useUserDateTime()
   const shortLandscape = useMediaQuery('(orientation: landscape) and (max-height: 500px) and (max-width: 899.95px)')
   const [records, setRecords] = useState<ShortLinkRecord[]>([])
   const [search, setSearch] = useState('')
@@ -487,7 +495,7 @@ export default function ShortLinksSection() {
                   </Typography>
                 ) : null}
                 <Typography variant="caption" color="text.disabled" display="block" mt={0.25}>
-                  Updated {formatDate(record.updatedAt)}
+                  Updated {formatDate(record.updatedAt, dateTimeSettings)}
                 </Typography>
               </Box>
 

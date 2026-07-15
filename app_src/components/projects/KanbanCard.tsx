@@ -126,7 +126,7 @@ export default function KanbanCard({ task }: Props) {
         <Typography variant="caption" color="text.disabled" sx={{
           display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden', lineHeight: 1.5, mb: 1,
         }}>
-          {task.desc}
+          {task.crm?.description ?? task.desc}
         </Typography>
 
         {task.workItem?.nextAction && (

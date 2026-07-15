@@ -4,11 +4,12 @@ import type { QueryResultRow } from 'pg'
 import { getStorageDriver } from '@/lib/persistence/config'
 import { query, withTransaction } from '@/lib/persistence/postgres'
 import { requireRequestUser } from '@/lib/requestUser'
-import { workspaceOrganizationRootId } from '@/lib/organizations'
+import { ensurePrimaryWorkspaceOrganization } from '@/lib/organizations'
 import { effectiveUserPermissions, normalizeUserEmail } from '@/lib/users'
 
 const SLUG_PATTERN = /^[a-z0-9][a-z0-9_-]{2,63}$/
 const CRM_REFERENCE_SLUG_PATTERN = /^g[aciklmo][0-9]{7}$/
+const CRM_ACTION_SLUG_PATTERN = /^mail-g[ac][0-9]{7}$/
 const SOURCE_PATTERN = /^[a-z][a-z0-9-]{1,39}$/
 const SLUG_ALPHABET = '23456789abcdefghjkmnpqrstuvwxyz'
 const RESERVED_SLUGS = new Set(['admin', 'api', 'app', 'auth', 'new', 'privacy', 'settings'])
@@ -55,7 +56,7 @@ type ShortLinkRow = QueryResultRow & {
 
 export type ShortLinkActor = {
   ownerEmail: string
-  organizationRootId: string
+  organizationId: string
   sourceApp: string
   manageOrganization: boolean
   service: boolean
@@ -241,15 +242,15 @@ export async function resolveShortLinkActor(req: NextRequest): Promise<ShortLink
     if (client.ownerDomain && ownerEmail.split('@')[1] !== client.ownerDomain) {
       throw new ShortLinkRequestError('Authenticated user is outside the allowed domain', 403)
     }
-    let organizationRootId: string
+    let organizationId: string
     try {
-      organizationRootId = await workspaceOrganizationRootId(ownerEmail)
+      organizationId = (await ensurePrimaryWorkspaceOrganization(ownerEmail)).id
     } catch {
       throw new ShortLinkRequestError('Authenticated user has no active ClawPilot organization', 403)
     }
     return {
       ownerEmail,
-      organizationRootId,
+      organizationId,
       sourceApp: client.sourceApp,
       manageOrganization: false,
       service: true,
@@ -260,7 +261,7 @@ export async function resolveShortLinkActor(req: NextRequest): Promise<ShortLink
   const permissions = effectiveUserPermissions(user)
   return {
     ownerEmail: user.email,
-    organizationRootId: await workspaceOrganizationRootId(user.email),
+    organizationId: (await ensurePrimaryWorkspaceOrganization(user.email)).id,
     sourceApp: 'clawpilot',
     manageOrganization: (user.role === 'owner' || user.role === 'admin') && permissions.manageLinks,
     service: false,
@@ -284,8 +285,8 @@ function normalizeSlug(value: unknown, options: { allowCrmReference?: boolean } 
     throw new ShortLinkRequestError('Slug must be 3-64 lowercase letters, numbers, hyphens, or underscores')
   }
   if (RESERVED_SLUGS.has(slug)) throw new ShortLinkRequestError('This slug is reserved')
-  if (!options.allowCrmReference && CRM_REFERENCE_SLUG_PATTERN.test(slug)) {
-    throw new ShortLinkRequestError('CRM reference slugs are reserved for CRM records')
+  if (!options.allowCrmReference && (CRM_REFERENCE_SLUG_PATTERN.test(slug) || CRM_ACTION_SLUG_PATTERN.test(slug))) {
+    throw new ShortLinkRequestError('CRM reference and action slugs are reserved for CRM records')
   }
   return slug
 }
@@ -423,7 +424,7 @@ export async function listShortLinks(actor: ShortLinkActor, filters: {
       sourceApp,
       actor.service,
       actor.sourceApp,
-      actor.organizationRootId,
+      actor.organizationId,
       MAX_LIST_RESULTS,
     ],
   )
@@ -463,7 +464,7 @@ export async function createShortLink(actor: ShortLinkActor, value: unknown): Pr
         `,
         [
           actor.ownerEmail,
-          actor.organizationRootId,
+          actor.organizationId,
           actor.sourceApp,
           slug,
           destinationUrl,
@@ -515,7 +516,7 @@ export async function updateShortLink(actor: ShortLinkActor, value: unknown): Pr
           actor.manageOrganization,
           actor.service,
           actor.sourceApp,
-          actor.organizationRootId,
+          actor.organizationId,
         ],
       )
       const current = selected.rows[0]
@@ -584,7 +585,7 @@ export async function deleteShortLink(actor: ShortLinkActor, idValue: unknown): 
       actor.manageOrganization,
       actor.service,
       actor.sourceApp,
-      actor.organizationRootId,
+      actor.organizationId,
     ],
   )
   if (result.rowCount !== 1) throw new ShortLinkRequestError('Short link was not found', 404)

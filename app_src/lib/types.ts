@@ -53,6 +53,24 @@ export type CanonicalWorkItem = {
   activity: ActivityEntry[]
 }
 
+export type CrmTaskContext = {
+  projectionVersion: 1
+  entity: 'organizations' | 'contacts'
+  entityId: string
+  pipelineId: string
+  referenceCode: string
+  recordName: string
+  recordUrl: string
+  accountName: string
+  accountReferenceCode?: string
+  accountUrl: string
+  email: string
+  emailUrl?: string
+  description: string
+  descriptionHash: string
+  syncStatus: 'synced' | 'conflict'
+}
+
 export type Task = {
   id: string
   boardId?: string
@@ -77,6 +95,7 @@ export type Task = {
   workstream?: string
   outcomeStatement?: string
   entityType?: string
+  crm?: CrmTaskContext
   governance?: GovernanceInfo
   execution?: {
     assignedAgent?: string

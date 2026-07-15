@@ -41,6 +41,8 @@ import SaveRounded from '@mui/icons-material/SaveRounded'
 import ShareRounded from '@mui/icons-material/ShareRounded'
 import TableChartRounded from '@mui/icons-material/TableChartRounded'
 import ViewKanbanRounded from '@mui/icons-material/ViewKanbanRounded'
+import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
+import { announceUserDateTimeSettings, formatUserDateTime } from '@/lib/userDateTime'
 import IntegrationSettingsPanel from './IntegrationSettingsPanel'
 
 type UserRole = 'owner' | 'admin' | 'member'
@@ -93,6 +95,17 @@ type UsersPayload = ApiPayload & {
   canInvite?: boolean
   canManageUserAccess?: boolean
   users?: AppUser[]
+  workspaceOrganizations?: WorkspaceOrganization[]
+}
+
+type WorkspaceOrganization = {
+  id: string
+  referenceCode: string
+  parentId: string | null
+  parentName: string | null
+  name: string
+  organizationType: 'root' | 'member'
+  depth: number
 }
 
 type UserMutationPayload = ApiPayload & {
@@ -157,6 +170,7 @@ const EMPTY_PROFILE: ProfileForm = {
 }
 
 const EMPTY_SHARE_DRAFT: ShareDraft = { email: '', accessRole: 'viewer' }
+const NEW_ORGANIZATION = '__new__'
 
 const TIMEZONES = [
   'UTC',
@@ -289,6 +303,7 @@ function safeProvisioningError(value: string | null | undefined) {
 }
 
 export default function UserAccessDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
+  const dateTimeSettings = useUserDateTime()
   const theme = useTheme()
   const narrowScreen = useMediaQuery(theme.breakpoints.down('sm'))
   const shortViewport = useMediaQuery('(max-height: 500px)')
@@ -298,6 +313,9 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
   const [workspacesPayload, setWorkspacesPayload] = useState<WorkspacesPayload | null>(null)
   const [profile, setProfile] = useState<ProfileForm>(EMPTY_PROFILE)
   const [inviteEmail, setInviteEmail] = useState('')
+  const [inviteOrganizationId, setInviteOrganizationId] = useState('')
+  const [newOrganizationName, setNewOrganizationName] = useState('')
+  const [newOrganizationParentId, setNewOrganizationParentId] = useState('')
   const [createNames, setCreateNames] = useState({ board: '', pipeline: '' })
   const [shareDrafts, setShareDrafts] = useState<Record<string, ShareDraft>>({})
   const [provisioningPipeline, setProvisioningPipeline] = useState<PipelineResource | null>(null)
@@ -351,6 +369,9 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
     setWorkspacesPayload(null)
     setProfile(EMPTY_PROFILE)
     setInviteEmail('')
+    setInviteOrganizationId('')
+    setNewOrganizationName('')
+    setNewOrganizationParentId('')
     setCreateNames({ board: '', pipeline: '' })
     setShareDrafts({})
     setProvisioningPipeline(null)
@@ -367,7 +388,12 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
 
       if (usersResult.status === 'fulfilled') {
         setUsersPayload(usersResult.value)
-        if (usersResult.value.currentUser) setProfile(profileFrom(usersResult.value.currentUser))
+        if (usersResult.value.currentUser) {
+          setProfile(profileFrom(usersResult.value.currentUser))
+          const organizationId = usersResult.value.currentUser.organizationId || ''
+          setInviteOrganizationId(organizationId)
+          setNewOrganizationParentId(organizationId)
+        }
       } else {
         loadErrors.push(messageFrom(usersResult.reason, 'Unable to load users'))
       }
@@ -471,6 +497,7 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
       if (!result.user) throw new Error('Profile response was incomplete')
       upsertUser(result.user)
       setProfile(profileFrom(result.user))
+      announceUserDateTimeSettings(result.user)
       setNotice('Profile saved.')
     } catch (saveError) {
       setError(messageFrom(saveError, 'Unable to save profile'))
@@ -482,16 +509,33 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
   async function inviteUser(event: FormEvent) {
     event.preventDefault()
     const email = inviteEmail.trim().toLowerCase()
-    if (busy || !isEmail(email)) return
+    const creatingOrganization = inviteOrganizationId === NEW_ORGANIZATION
+    if (
+      busy
+      || !isEmail(email)
+      || (!creatingOrganization && !inviteOrganizationId)
+      || (creatingOrganization && (!newOrganizationName.trim() || !newOrganizationParentId))
+    ) return
     startAction('invite')
     try {
       const result = await requestJson<UserMutationPayload>('/api/users', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email }),
+        body: JSON.stringify({
+          email,
+          organizationId: creatingOrganization ? undefined : inviteOrganizationId,
+          createOrganization: creatingOrganization,
+          organizationName: creatingOrganization ? newOrganizationName.trim() : undefined,
+          parentOrganizationId: creatingOrganization ? newOrganizationParentId : undefined,
+        }),
       })
       if (result.user) upsertUser(result.user)
+      const refreshed = await requestJson<UsersPayload>('/api/users')
+      setUsersPayload(refreshed)
       setInviteEmail('')
+      setInviteOrganizationId(refreshed.currentUser?.organizationId || '')
+      setNewOrganizationName('')
+      setNewOrganizationParentId(refreshed.currentUser?.organizationId || '')
       setNotice(result.delivery === 'sent' ? `Invitation sent to ${email}.` : `${email} invited.`)
     } catch (inviteError) {
       setError(messageFrom(inviteError, 'Unable to invite user'))
@@ -847,7 +891,7 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
                     label="Organization name"
                     value={profile.organizationName}
                     onChange={(event) => setProfile((current) => ({ ...current, organizationName: event.target.value }))}
-                    disabled={busy}
+                    disabled={busy || !usersPayload?.canManageUserAccess}
                     autoComplete="organization"
                     inputProps={{ maxLength: 200 }}
                     sx={{ ...fieldSx, gridColumn: { sm: '1 / -1' } }}
@@ -920,7 +964,7 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
             {usersPayload?.isAdmin && usersPayload.canInvite ? (
               <Box component="form" onSubmit={inviteUser} mb={2.5}>
                 <Typography variant="subtitle2" color="text.primary" fontWeight={700} mb={1}>Invite</Typography>
-                <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1}>
+                <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', sm: 'minmax(0, 1fr) minmax(0, 1fr) auto' }, gap: 1 }}>
                   <TextField
                     required
                     fullWidth
@@ -932,16 +976,75 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
                     disabled={busy}
                     sx={fieldSx}
                   />
+                  <TextField
+                    select
+                    required
+                    fullWidth
+                    size="small"
+                    label="Organization"
+                    value={inviteOrganizationId}
+                    onChange={(event) => {
+                      const value = event.target.value
+                      setInviteOrganizationId(value)
+                      if (value !== NEW_ORGANIZATION) setNewOrganizationName('')
+                    }}
+                    disabled={busy}
+                    sx={fieldSx}
+                  >
+                    {(usersPayload.workspaceOrganizations || []).map((organization) => (
+                      <MenuItem key={organization.id} value={organization.id}>
+                        {'  '.repeat(Math.max(0, organization.depth))}{organization.name} ({organization.referenceCode})
+                      </MenuItem>
+                    ))}
+                    <Divider />
+                    <MenuItem value={NEW_ORGANIZATION}>Create child organization</MenuItem>
+                  </TextField>
                   <Button
                     type="submit"
                     variant="contained"
                     startIcon={pendingAction === 'invite' ? <CircularProgress size={16} color="inherit" /> : <PersonAddRounded />}
-                    disabled={busy || !isEmail(inviteEmail)}
+                    disabled={busy
+                      || !isEmail(inviteEmail)
+                      || (!inviteOrganizationId)
+                      || (inviteOrganizationId === NEW_ORGANIZATION
+                        && (!newOrganizationName.trim() || !newOrganizationParentId))}
                     sx={compactButtonSx}
                   >
                     Invite
                   </Button>
-                </Stack>
+                  {inviteOrganizationId === NEW_ORGANIZATION ? (
+                    <>
+                      <TextField
+                        required
+                        fullWidth
+                        size="small"
+                        label="New organization name"
+                        value={newOrganizationName}
+                        onChange={(event) => setNewOrganizationName(event.target.value)}
+                        disabled={busy}
+                        inputProps={{ maxLength: 200 }}
+                        sx={{ ...fieldSx, gridColumn: { sm: '1 / 2' } }}
+                      />
+                      <TextField
+                        select
+                        required
+                        fullWidth
+                        size="small"
+                        label="Parent organization"
+                        value={newOrganizationParentId}
+                        onChange={(event) => setNewOrganizationParentId(event.target.value)}
+                        disabled={busy}
+                        sx={{ ...fieldSx, gridColumn: { sm: '2 / 3' } }}
+                      >
+                        {(usersPayload.workspaceOrganizations || []).map((organization) => (
+                          <MenuItem key={organization.id} value={organization.id}>
+                            {'  '.repeat(Math.max(0, organization.depth))}{organization.name} ({organization.referenceCode})
+                          </MenuItem>
+                        ))}
+                      </TextField>
+                    </>
+                  ) : null}
+                </Box>
               </Box>
             ) : null}
 
@@ -974,9 +1077,14 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
                           <Typography variant="caption" color="text.secondary" sx={{ display: 'block', overflowWrap: 'anywhere' }}>
                             {user.email}
                           </Typography>
+                          <Typography variant="caption" color="text.disabled" sx={{ display: 'block', overflowWrap: 'anywhere' }}>
+                            {user.organizationName || 'Organization not assigned'}
+                          </Typography>
                           {user.jobTitle || user.lastLoginAt ? (
                             <Typography variant="caption" color="text.disabled" sx={{ display: 'block' }}>
-                              {user.jobTitle || `Last sign-in ${new Date(user.lastLoginAt as string).toLocaleString()}`}
+                              {user.jobTitle || `Last sign-in ${formatUserDateTime(user.lastLoginAt, dateTimeSettings, {
+                                year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', fallback: 'Unknown date',
+                              })}`}
                             </Typography>
                           ) : null}
                         </Box>

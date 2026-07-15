@@ -15,9 +15,10 @@ Use ClawPilot as the customer-work interface, SuiteCRM as the canonical CRM, Rai
 ## Ownership Contract
 
 - SuiteCRM owns Organizations, Contacts, Leads, Opportunities, Meetings, Interactions, Campaigns, CRM relationships, and CRM record history.
-- ClawPilot is the primary user interface for those modules. Administrators may open the native SuiteCRM surface for configuration and inspection.
+- ClawPilot is the primary user interface for those modules. Only root-organization owners and administrators may open the global native SuiteCRM surface for configuration and inspection; child-organization administrators remain scoped to their ClawPilot account subtree.
 - A workspace organization owns one durable `ga` identity and an app user owns one durable `gc` identity. Their pipeline records are projections of those identities, not new accounts or contacts.
-- Saving a user profile updates the app user and workspace organization atomically, projects the user into every pipeline they own, and queues CRM and Drive reconciliation. Shared pipelines are excluded from profile projection. Migration `0025_profile_crm_projection_backfill.sql` applies the same projection to historical pipelines whose owner contact predates this workflow.
+- Saving a user profile updates the app user and its CRM Contact projection. Administrators may rename the shared workspace organization; ordinary members cannot rename it from their personal profile. The user Contact is projected into the primary pipeline for the user's assigned organization, including when that pipeline is shared with other members of the same company.
+- Invitations assign a user to an explicit workspace organization. An administrator may select the current organization, select a descendant organization, or create a child organization from an existing CRM Account while preserving its permanent `ga` identity. Child administrators can manage only their own organization subtree.
 - The selected pipeline's `Opportunities` Sheet table is the only writable workbook input. Sheet pulls stage those changes into the same CRM gateway used by ClawPilot writes.
 - Railway Postgres stores tenant-scoped CRM projections, source identity, synchronization status, reconciliation runs, and outbox leases. It is not a second independent CRM authority.
 - Development and production use separate SuiteCRM, MariaDB, Postgres, Google workbook, and user data.
@@ -38,9 +39,11 @@ Every migrated record preserves its source workbook payload, source row, stable 
 
 Every SuiteCRM module in the table has a native custom field labeled `Global ID`. Its API name is `global_id_c`; it is visible on the native detail layout, reportable, audited, available to unified search, and populated from the permanent ClawPilot reference. Existing projections are refreshed with `npm run crm:backfill-suitecrm` after the SuiteCRM metadata deployment.
 
-The two-letter module prefix is fixed and the seven-digit suffix is randomly allocated. The permanent registries reserve both the full code and the numeric suffix globally across modules, prevent concurrent collisions, and never release either value after deletion or archival. Sequential codes issued before this contract remain reserved aliases that resolve to the replacement code and can never be reissued.
+The two-letter module prefix is fixed and the seven-digit suffix is randomly allocated. The permanent registries reserve both the full code and the numeric suffix globally across modules, prevent concurrent collisions, and never release either value after deletion or archival. Sequential codes issued before this contract remain permanently reserved and can never be reissued. Their obsolete public short links are disabled and removed from user-visible link results; the immutable registries retain the historical allocation and canonical replacement for audit integrity.
 
-Each reference code has an organization-scoped short link. The link selects its owning pipeline after access is verified, then opens the record in ClawPilot; canonical organization and user codes remain stable when the same identity is projected into another owned pipeline.
+Each reference code has a stable short link. The redirect enters the authenticated ClawPilot CRM route, which selects a pipeline the user can access before opening the record; canonical organization and user codes remain stable when the same identity is projected into another authorized pipeline. User-created links remain visible and manageable only inside the exact organization that owns them.
+
+Organization and Contact records are also projected into the owner's managed `CRM Board`. Titles use `<Global ID> - <record name>`. The card record block renders the Global ID and name as links to the ClawPilot CRM editor, renders the primary email as an organization-scoped link to the ClawPilot email composer, and maps the editable card Description directly to the native CRM description. The projection uses the CRM row UUID for durable one-card identity, not the visible reference string.
 
 ## Customer Actions
 
@@ -79,6 +82,14 @@ The pipeline and CRM surfaces expose the workbook through its ClawPilot short li
 2. The SuiteCRM worker claims records with a lease, uses OAuth2 client credentials against the private Railway service, and records success or a retriable failure.
 3. A successful SuiteCRM batch queues a `project_crm_workbook` Google outbox operation.
 4. The Google worker regenerates the protected workbook projections and records a reconciliation run.
+
+The SuiteCRM integration worker also polls Accounts and Contacts by `date_modified`. It matches native records by SuiteCRM ID or Global ID within each pipeline, stages only meaningful changes without echoing them back to SuiteCRM, and reconciles every bound CRM Board so newly deployed boards and native CRM edits appear without requiring a browser refresh to initiate the backfill.
+
+Interactions always materialize their related organization in Postgres. When an interaction names only a Contact, Lead, Opportunity, or Meeting, the gateway derives the Account from that relationship, displays it in ClawPilot, and sends the Account parent to SuiteCRM. Migration `0034_account_membership_crm_board_scope.sql` performs the same deterministic repair for historical interactions and queues one idempotent SuiteCRM Note update per repaired record.
+
+Native SuiteCRM Note polling performs a full historical scan on first activation and then advances a resumable cursor with a five-minute overlap. It matches by SuiteCRM ID or permanent `gi` Global ID within each pipeline, resolves Account, Contact, Lead, Opportunity, and Meeting parents conservatively, and stages inbound changes without echoing them back to SuiteCRM. Ambiguous or unknown records remain unmatched rather than crossing a pipeline boundary.
+
+All persisted timestamps remain UTC ISO values. ClawPilot renders dates, activity, releases, agent messages, CRM interactions, pipeline sync times, integration status, and link updates in the signed-in user's profile timezone and locale. Changing the profile timezone updates the active UI without rewriting historical data.
 
 Meeting time synchronization is bidirectional among the ClawPilot CRM surface, native SuiteCRM, and the original organizer's selected Google Calendar. Saving a meeting queues an idempotent Calendar create, update, or cancellation; new events request a unique Google Meet conference. The organizer identity is persisted with the meeting, so later edits by a shared-pipeline collaborator or through native SuiteCRM still target the calendar that owns the event. Calendar polling correlates events by provider event ID or the private `clawpilotMeetingReference`, applies changed time and event fields to the Postgres/SuiteCRM projection, preserves completed and cancelled terminal states, and ignores provider echoes whose meaningful fields already match. Native SuiteCRM polling applies changed meeting time, subject, status, location, and description to Postgres and queues the corresponding Calendar update. Cancellation from ClawPilot, Google, or native SuiteCRM cancels the Google event and keeps the CRM meeting cancelled; a later Calendar restore returns it to scheduled.
 

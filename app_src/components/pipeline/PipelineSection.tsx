@@ -36,6 +36,8 @@ import Tabs from '@mui/material/Tabs'
 import Tab from '@mui/material/Tab'
 import useMediaQuery from '@mui/material/useMediaQuery'
 import WorkspaceSelector from '@/components/workspaces/WorkspaceSelector'
+import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
+import { formatUserDateTime, type UserDateTimeSettings } from '@/lib/userDateTime'
 
 type Contact = {
   id: string
@@ -142,11 +144,11 @@ function fmtPct(n: number) {
   return `${Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: 1, maximumFractionDigits: 1 })}%`
 }
 
-function fmtSyncTime(iso: string | null) {
+function fmtSyncTime(iso: string | null, settings: UserDateTimeSettings) {
   if (!iso) return 'Never'
-  const d = new Date(iso)
-  if (Number.isNaN(d.getTime())) return 'Unknown'
-  return d.toLocaleString('en-US', { timeZone: 'America/New_York', hour12: true })
+  return formatUserDateTime(iso, settings, {
+    year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', fallback: 'Unknown',
+  })
 }
 
 function fmtIntInput(n: number) {
@@ -561,6 +563,7 @@ function DealDrawer({
 }
 
 export default function PipelineSection() {
+  const dateTimeSettings = useUserDateTime()
   const [deals, setDeals] = useState<Deal[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -922,7 +925,7 @@ export default function PipelineSection() {
                 }}
               />
             </Stack>
-            {!compactLandscapeBoard && <Typography variant="caption" color="text.secondary">{pipelineSyncEnabled ? 'Last synced' : 'Last saved'}: {fmtSyncTime(syncSurface.lastSyncedAt)}</Typography>}
+            {!compactLandscapeBoard && <Typography variant="caption" color="text.secondary">{pipelineSyncEnabled ? 'Last synced' : 'Last saved'}: {fmtSyncTime(syncSurface.lastSyncedAt, dateTimeSettings)}</Typography>}
             {syncSurface.feedback && (
               <Typography
                 variant="caption"

@@ -2,6 +2,7 @@ import crypto from 'node:crypto'
 import { NextRequest, NextResponse } from 'next/server'
 import { CRM_ENTITIES, type CrmEntity } from '@/lib/crm/types'
 import { enqueueCrmIntegrationAction } from '@/lib/crm/integrationActions'
+import { reconcileCrmBoardProjectionsForPipeline } from '@/lib/crm/boardProjection'
 import {
   ensurePipelineCrmHierarchy,
   ensurePipelineCrmReferenceLinks,
@@ -11,7 +12,7 @@ import {
   stageCrmRecordInPostgres,
   syncAppUserProfileToCrm,
 } from '@/lib/persistence/crm'
-import { listWorkspaceOrganizationHierarchy } from '@/lib/organizations'
+import { ensurePrimaryWorkspaceOrganization, listWorkspaceOrganizationHierarchy } from '@/lib/organizations'
 import { suiteCrmAdminPortalUrl, suiteCrmAdminUsername } from '@/lib/crm/suiteCrmPublicUrl'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import { readMatonCredentialStateFromPostgres } from '@/lib/persistence/matonCredentials'
@@ -87,8 +88,9 @@ export async function GET(req: NextRequest) {
     const actor = await requireRequestUser(req)
     const pipeline = await selectedPipeline(req, actor.email)
     const entity = entityValue(req.nextUrl.searchParams.get('entity') || 'organizations')
-    const canOpenSuiteCrm = actor.role === 'owner' || actor.role === 'admin'
-    await syncAppUserProfileToCrm({ email: pipeline.ownerEmail, pipelineId: pipeline.id })
+    const currentOrganization = await ensurePrimaryWorkspaceOrganization(actor.email)
+    const canOpenSuiteCrm = (actor.role === 'owner' || actor.role === 'admin') && currentOrganization.parentId === null
+    await syncAppUserProfileToCrm({ email: actor.email, pipelineId: pipeline.id })
     await ensurePipelineCrmReferenceLinks(pipeline.id)
     const [records, summary, workspaceHierarchy, matonCredential] = await Promise.all([
       listCrmRecordsInPostgres({
@@ -171,6 +173,7 @@ export async function POST(req: NextRequest) {
           description: stringValue(fields.description, 10_000),
         },
       })
+      await reconcileCrmBoardProjectionsForPipeline({ pipelineId: pipeline.id })
       return NextResponse.json({ ok: true, queued: true, record: staged }, { status: body?.id ? 200 : 201 })
     }
 
@@ -199,6 +202,7 @@ export async function POST(req: NextRequest) {
           emailOptOut: fields.emailOptOut === true,
         },
       })
+      await reconcileCrmBoardProjectionsForPipeline({ pipelineId: pipeline.id })
       return NextResponse.json({ ok: true, queued: true, record: staged }, { status: body?.id ? 200 : 201 })
     }
 
@@ -241,17 +245,20 @@ export async function POST(req: NextRequest) {
 
 
     let contact: Awaited<ReturnType<typeof readCrmRecordReference>> | null = null
-    if (fields.contactId) {
-      contact = await readCrmRecordReference({ pipelineId: pipeline.id, entity: 'contacts', id: String(fields.contactId) })
+    const contactId = fields.contactId || current?.contactId || null
+    if (contactId) {
+      contact = await readCrmRecordReference({ pipelineId: pipeline.id, entity: 'contacts', id: String(contactId) })
     }
     let lead: Awaited<ReturnType<typeof readCrmRecordReference>> | null = null
-    if (fields.leadId) {
-      lead = await readCrmRecordReference({ pipelineId: pipeline.id, entity: 'leads', id: String(fields.leadId) })
+    const leadId = fields.leadId || current?.leadId || null
+    if (leadId) {
+      lead = await readCrmRecordReference({ pipelineId: pipeline.id, entity: 'leads', id: String(leadId) })
     }
 
     let opportunity: Awaited<ReturnType<typeof readCrmRecordReference>> | null = null
-    if (fields.opportunityId) {
-      opportunity = await readCrmRecordReference({ pipelineId: pipeline.id, entity: 'opportunities', id: String(fields.opportunityId) })
+    const opportunityId = fields.opportunityId || current?.opportunityId || null
+    if (opportunityId) {
+      opportunity = await readCrmRecordReference({ pipelineId: pipeline.id, entity: 'opportunities', id: String(opportunityId) })
     }
 
     if (entity === 'meetings') {
@@ -366,11 +373,13 @@ export async function POST(req: NextRequest) {
             ? 'Accounts' as const
             : undefined
     const staged = await stageCrmRecordInPostgres({
-      entity, pipelineId: pipeline.id, sourceKey, actorEmail: actor.email,
-      sourcePayload: { source: 'clawpilot' },
+      entity, pipelineId: pipeline.id, localId: current?.id, sourceKey, actorEmail: actor.email,
+      sourcePayload: { ...(current?.sourcePayload || {}), source: 'clawpilot' },
       fields: {
-        organizationId: organization?.id || contact?.organizationId || lead?.organizationId || null,
+        organizationId: organization?.id || contact?.organizationId || lead?.organizationId || current?.organizationId || null,
         contactId: contact?.id || null, leadId: lead?.id || null, opportunityId: opportunity?.id || null,
+        meetingId: stringValue(fields.meetingId || current?.meetingId) || null,
+        campaignId: stringValue(fields.campaignId || current?.campaignId) || null,
         parentSuiteCrmId, parentSuiteCrmType, interactionType: stringValue(fields.interactionType, 100),
         subject, agentName: stringValue(fields.agentName, 200), occurredAt: stringValue(fields.occurredAt, 50) || null,
         description: stringValue(fields.description, 10_000),

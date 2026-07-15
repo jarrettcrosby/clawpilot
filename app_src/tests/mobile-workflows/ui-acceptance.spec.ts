@@ -193,7 +193,24 @@ async function mockCrmRecords(page: Page) {
     }],
     leads: [],
     opportunities: [],
-    interactions: [],
+    interactions: [{
+      id: '00000000-0000-4000-8000-000000000104',
+      referenceCode: 'gi7654321',
+      shortUrl: null,
+      subject: 'Acceptance Interaction',
+      organizationId: '00000000-0000-4000-8000-000000000101',
+      organizationName: 'Acceptance Organization',
+      contactId: '00000000-0000-4000-8000-000000000102',
+      opportunityId: null,
+      leadId: null,
+      meetingId: null,
+      campaignId: null,
+      interactionType: 'Call',
+      occurredAt: '2026-07-15T14:00:00.000Z',
+      agentName: 'Mobile Operator',
+      description: 'Acceptance interaction notes',
+      syncStatus: 'synced',
+    }],
     campaigns: [],
   }
 
@@ -218,7 +235,7 @@ async function mockCrmRecords(page: Page) {
           leads: 0,
           opportunities: 0,
           meetings: 1,
-          interactions: 0,
+          interactions: 1,
           campaigns: 0,
           openPipelineValue: 0,
           weightedPipelineValue: 0,
@@ -306,6 +323,72 @@ for (const viewport of MOBILE_VIEWPORTS) {
       await expectScrollableWorkspace(page, activeSection(page), 'x', 'Projects board')
     })
 
+    test('Managed CRM card links and write-through description remain usable', async ({ page }) => {
+      const initialHash = 'a'.repeat(64)
+      let patchBody: Record<string, unknown> | null = null
+      const task = {
+        id: 'crm-acceptance-card',
+        title: 'gc7654321 - Acceptance Contact',
+        desc: 'Initial CRM description',
+        status: 'backlog',
+        priority: 'medium',
+        category: 'pipeline',
+        tags: ['crm', 'contact'],
+        createdAt: '2026-07-15T13:00:00.000Z',
+        updatedAt: '2026-07-15T13:00:00.000Z',
+        activity: [],
+        comments: [],
+        checklist: [],
+        crm: {
+          projectionVersion: 1,
+          entity: 'contacts',
+          entityId: '00000000-0000-4000-8000-000000000102',
+          pipelineId: '00000000-0000-4000-8000-000000000100',
+          referenceCode: 'gc7654321',
+          recordName: 'Acceptance Contact',
+          recordUrl: 'https://eigenracing.com/s/gc7654321',
+          accountName: 'Acceptance Organization',
+          accountReferenceCode: 'ga7654321',
+          accountUrl: 'https://eigenracing.com/s/ga7654321',
+          email: 'contact@example.test',
+          emailUrl: 'https://eigenracing.com/s/mail-gc7654321',
+          description: 'Initial CRM description',
+          descriptionHash: initialHash,
+          syncStatus: 'synced',
+        },
+      }
+      await page.route((url) => url.pathname === '/api/tasks', async (route) => {
+        if (route.request().method() === 'PATCH') {
+          patchBody = route.request().postDataJSON() as Record<string, unknown>
+          const description = String(patchBody.crmDescription || task.desc)
+          await route.fulfill({ json: {
+            ...task,
+            desc: description,
+            crm: { ...task.crm, description, descriptionHash: 'b'.repeat(64) },
+          } })
+          return
+        }
+        await route.fulfill({ json: [task] })
+      })
+
+      await gotoApp(page, '/#projects')
+      await page.getByText(task.title, { exact: true }).click()
+      const closeDrawer = page.getByRole('button', { name: 'Close drawer' })
+      const drawer = closeDrawer.locator('xpath=ancestor::*[contains(@class,"MuiDrawer-paper")][1]')
+      await expectUsableGeometry(drawer, 'Managed CRM card drawer', 160, 280)
+      await expect(drawer.getByRole('link', { name: /gc7654321/ })).toHaveAttribute('href', task.crm.recordUrl)
+      await expect(drawer.getByRole('link', { name: 'Acceptance Organization' })).toHaveAttribute('href', task.crm.accountUrl)
+      await expect(drawer.getByRole('link', { name: 'contact@example.test' })).toHaveAttribute('href', task.crm.emailUrl)
+
+      await drawer.getByText('Initial CRM description', { exact: true }).click()
+      await drawer.getByPlaceholder('Add a description...').fill('Updated from the CRM card')
+      await drawer.getByRole('button', { name: 'Save', exact: true }).click()
+      await expect.poll(() => patchBody?.crmDescription).toBe('Updated from the CRM card')
+      expect(patchBody?.crmDescriptionHash).toBe(initialHash)
+      await closeDrawer.click()
+      await expectNoDocumentOverflow(page)
+    })
+
     test('Pipeline board and view selector retain a working viewport', async ({ page }) => {
       await gotoApp(page, '/#pipeline')
       await expect(page.getByText('Pipeline Value', { exact: true })).toBeVisible()
@@ -362,6 +445,30 @@ for (const viewport of MOBILE_VIEWPORTS) {
       await expectNoDocumentOverflow(page)
     })
 
+    test('CRM interaction deep link hydrates its organization relationship', async ({ page }) => {
+      const warnings: string[] = []
+      let organizationRequests = 0
+      page.on('console', (message) => {
+        if (message.type() === 'warning' || message.type() === 'error') warnings.push(message.text())
+      })
+      page.on('request', (request) => {
+        const url = new URL(request.url())
+        if (url.pathname === '/api/crm' && url.searchParams.get('entity') === 'organizations') {
+          organizationRequests += 1
+        }
+      })
+      await mockCrmRecords(page)
+      await gotoApp(page, '/crm/gi7654321')
+
+      const drawer = page.getByRole('button', { name: 'Close editor' })
+        .locator('xpath=ancestor::*[contains(@class,"MuiDrawer-paper")][1]')
+      await expectUsableGeometry(drawer, 'Interaction editor drawer', 160, 280)
+      await expect(drawer.getByRole('combobox', { name: 'Organization' })).toContainText('Acceptance Organization')
+      await expect.poll(() => organizationRequests).toBeGreaterThan(0)
+      expect(warnings.filter((warning) => /out-of-range value/i.test(warning))).toEqual([])
+      await expectNoDocumentOverflow(page)
+    })
+
     test('CRM email controls and meeting scheduler remain usable without submitting actions', async ({ page }) => {
       await mockCrmRecords(page)
       await gotoApp(page, '/#crm')
@@ -395,11 +502,7 @@ for (const viewport of MOBILE_VIEWPORTS) {
       await expectUsableGeometry(drawer, 'Contact editor drawer', 160, 280)
       await expect(drawer.getByRole('textbox', { name: 'Email', exact: true })).toHaveValue('contact@example.test')
       await expect(drawer.getByRole('checkbox', { name: 'Do not email' })).toBeChecked()
-      await drawer.getByRole('button', { name: 'Email', exact: true }).click()
-      const contactEmailDialog = page.getByRole('dialog', { name: 'Send email' })
-      await expectUsableGeometry(contactEmailDialog, 'Contact email composer', 160, 280)
-      await expect(contactEmailDialog.getByLabel('Subject')).toHaveValue('Follow-up: Acceptance Contact')
-      await contactEmailDialog.getByRole('button', { name: 'Cancel' }).click()
+      await expect(drawer.getByRole('button', { name: 'Email', exact: true })).toBeDisabled()
       await closeEditor.click()
 
       await page.getByRole('tab', { name: 'Meetings' }).click()

@@ -304,6 +304,9 @@ export async function verifyAuthMagicCode(
               AND revoked_at IS NULL
               AND code_requested_at IS NOT NULL
               AND expires_at > now()
+              AND workspace_organization_id = (
+                SELECT organization_id FROM app_users WHERE email = $2
+              )
             RETURNING id
           `,
           [verified.invitation_id, requestedEmail],

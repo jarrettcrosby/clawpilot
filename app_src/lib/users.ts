@@ -72,6 +72,8 @@ export type AppUser = {
 export type InviteAppUserResult = {
   user: AppUser
   created: boolean
+  previousOrganizationId: string | null
+  previousInvitedBy: string | null
 }
 
 type AppUserRow = {
@@ -144,6 +146,26 @@ export function canManageUserAccess(user: Pick<AppUser, 'role' | 'permissions'>)
   return (user.role === 'owner' || user.role === 'admin') && effectiveUserPermissions(user).manageUserAccess
 }
 
+async function requireOrganizationInActorScope(actor: AppUser, organizationId: string | null) {
+  if (!actor.organizationId || !organizationId) {
+    throw new AppUserAuthorizationError('User organization is outside your managed account graph')
+  }
+  const result = await query<{ allowed: boolean }>(
+    `WITH RECURSIVE managed AS (
+       SELECT id FROM workspace_organizations WHERE id = $1::uuid
+       UNION ALL
+       SELECT child.id
+       FROM workspace_organizations child
+       JOIN managed parent ON child.parent_id = parent.id
+     )
+     SELECT EXISTS(SELECT 1 FROM managed WHERE id = $2::uuid) AS allowed`,
+    [actor.organizationId, organizationId],
+  )
+  if (!result.rows[0]?.allowed) {
+    throw new AppUserAuthorizationError('User organization is outside your managed account graph')
+  }
+}
+
 function toAppUser(row: AppUserRow): AppUser {
   return {
     email: row.email,
@@ -207,23 +229,66 @@ export async function requireActiveAppUser(emailValue: unknown): Promise<AppUser
 export async function listAppUsers(actorEmailValue: unknown): Promise<{ actor: AppUser; users: AppUser[] }> {
   const actor = await requireActiveAppUser(actorEmailValue)
   if (!canInviteUsers(actor) && !canManageUserAccess(actor)) return { actor, users: [actor] }
+  if (!actor.organizationId) return { actor, users: [actor] }
   const result = await query<AppUserRow>(
     `
-      SELECT *
-      FROM app_users
-      ORDER BY CASE role WHEN 'owner' THEN 0 ELSE 1 END, created_at ASC, email ASC
+      WITH RECURSIVE managed AS (
+        SELECT id FROM workspace_organizations WHERE id = $1::uuid
+        UNION ALL
+        SELECT child.id
+        FROM workspace_organizations child
+        JOIN managed parent ON child.parent_id = parent.id
+      )
+      SELECT app_user.*
+      FROM app_users app_user
+      JOIN managed ON managed.id = app_user.organization_id
+      ORDER BY CASE app_user.role WHEN 'owner' THEN 0 ELSE 1 END, app_user.created_at ASC, app_user.email ASC
     `,
+    [actor.organizationId],
   )
   return { actor, users: result.rows.map(toAppUser) }
 }
 
-export async function inviteAppUser(input: { actorEmail: unknown; email: unknown }): Promise<InviteAppUserResult> {
+export async function inviteAppUser(input: {
+  actorEmail: unknown
+  email: unknown
+  organizationId: unknown
+}): Promise<InviteAppUserResult> {
   const actor = await requireActiveAppUser(input.actorEmail)
   if (!canInviteUsers(actor)) throw new AppUserAuthorizationError('You do not have permission to invite users')
   const email = normalizeUserEmail(input.email)
-  if (email === actor.email) return { user: actor, created: false }
+  const organizationId = String(input.organizationId || '').trim()
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(organizationId)) {
+    throw new Error('A valid invitation organization is required')
+  }
+  if (email === actor.email) {
+    if (actor.organizationId !== organizationId) throw new AppUserAuthorizationError('Your own organization cannot be changed by invitation')
+    return {
+      user: actor,
+      created: false,
+      previousOrganizationId: actor.organizationId,
+      previousInvitedBy: actor.invitedBy,
+    }
+  }
 
   return withTransaction(async (client) => {
+    if (!actor.organizationId) throw new AppUserAuthorizationError('Your organization is not configured')
+    const organization = await client.query<{ id: string; name: string }>(
+      `WITH RECURSIVE managed AS (
+         SELECT id FROM workspace_organizations WHERE id = $2::uuid
+         UNION ALL
+         SELECT child.id
+         FROM workspace_organizations child
+         JOIN managed parent ON child.parent_id = parent.id
+       )
+       SELECT organization.id::text, organization.name
+       FROM workspace_organizations organization
+       JOIN managed ON managed.id = organization.id
+       WHERE organization.id = $1::uuid
+       FOR SHARE`,
+      [organizationId, actor.organizationId],
+    )
+    if (!organization.rows[0]) throw new Error('Invitation organization was not found')
     const existing = await client.query<AppUserRow>('SELECT * FROM app_users WHERE email = $1 FOR UPDATE', [email])
     const current = existing.rows[0]
     if (current?.role === 'owner') throw new Error('The owner already has access')
@@ -234,29 +299,71 @@ export async function inviteAppUser(input: { actorEmail: unknown; email: unknown
       }
       throw new AppUserAuthorizationError('Restore the disabled user before sending a new invitation')
     }
-    if (current?.status === 'active') return { user: toAppUser(current), created: false }
-    if (current?.status === 'invited') return { user: toAppUser(current), created: false }
+    if (current?.status === 'active') {
+      if (current.organization_id !== organizationId) {
+        throw new AppUserAuthorizationError('Active users must be moved by an administrator before reinviting')
+      }
+      return {
+        user: toAppUser(current),
+        created: false,
+        previousOrganizationId: current.organization_id,
+        previousInvitedBy: current.invited_by,
+      }
+    }
 
     const result = await client.query<AppUserRow>(
       `
         INSERT INTO app_users (
-          email, reference_code, role, status, permissions, invited_by, invited_at, created_at, updated_at
+          email, reference_code, role, status, permissions, invited_by, invited_at,
+          organization_id, organization_name, created_at, updated_at
         )
         VALUES (
           $1,
           COALESCE((SELECT reference_code FROM app_users WHERE email = $1), allocate_crm_reference('gc')),
-          'member', 'invited', $3::jsonb, $2, now(), now(), now()
+          'member', 'invited', $3::jsonb, $2, now(), $4::uuid, $5, now(), now()
         )
         ON CONFLICT (email) DO UPDATE SET
           status = 'invited',
           invited_by = EXCLUDED.invited_by,
           invited_at = now(),
+          organization_id = EXCLUDED.organization_id,
+          organization_name = EXCLUDED.organization_name,
           updated_at = now()
         RETURNING *
       `,
-      [email, actor.email, JSON.stringify(MEMBER_PERMISSIONS)],
+      [email, actor.email, JSON.stringify(MEMBER_PERMISSIONS), organizationId, organization.rows[0].name],
     )
-    return { user: toAppUser(result.rows[0]), created: !current }
+    return {
+      user: toAppUser(result.rows[0]),
+      created: !current,
+      previousOrganizationId: current?.organization_id || null,
+      previousInvitedBy: current?.invited_by || null,
+    }
+  })
+}
+
+export async function restoreInvitedUserAssignment(input: {
+  email: unknown
+  organizationId: string | null
+  invitedBy: string | null
+}): Promise<void> {
+  const email = normalizeUserEmail(input.email)
+  await withTransaction(async (client) => {
+    const organization = input.organizationId
+      ? await client.query<{ name: string }>(
+        'SELECT name FROM workspace_organizations WHERE id = $1::uuid',
+        [input.organizationId],
+      )
+      : null
+    await client.query(
+      `UPDATE app_users
+       SET organization_id = $2::uuid,
+           organization_name = $3,
+           invited_by = $4,
+           updated_at = now()
+       WHERE email = $1 AND status = 'invited'`,
+      [email, input.organizationId, organization?.rows[0]?.name || null, input.invitedBy],
+    )
   })
 }
 
@@ -272,6 +379,7 @@ export async function setAppUserStatus(input: {
 
   const target = await getAppUser(email)
   if (!target) throw new AppUserNotFoundError()
+  await requireOrganizationInActorScope(actor, target.organizationId)
   if (target.role === 'owner') throw new AppUserAuthorizationError('The owner account cannot be changed')
   if (actor.role !== 'owner' && target.role !== 'member') throw new AppUserAuthorizationError('Only the owner can manage administrators')
   if (input.status === 'active' && target.status === 'invited') {
@@ -332,33 +440,42 @@ export async function updateAppUserProfile(input: {
   const displayName = cleanOptionalText(input.displayName, 100)
   if (!displayName) throw new Error('Name is required')
   const jobTitle = cleanOptionalText(input.jobTitle, 120)
-  const organizationName = cleanOptionalText(input.organizationName, 200)
-  if (!organizationName) throw new Error('Organization name is required')
+  const requestedOrganizationName = cleanOptionalText(input.organizationName, 200)
+  if (!requestedOrganizationName) throw new Error('Organization name is required')
   const timezone = normalizeTimezone(input.timezone)
   const locale = normalizeLocale(input.locale)
   const row = await withTransaction(async (client) => {
-    const locked = await client.query<{ organization_id: string | null }>(
-      `SELECT organization_id::text
-       FROM app_users
-       WHERE email = $1
-       FOR UPDATE`,
+    const locked = await client.query<{ organization_id: string | null; organization_name: string }>(
+      `SELECT app_user.organization_id::text, organization.name AS organization_name
+       FROM app_users app_user
+       LEFT JOIN workspace_organizations organization ON organization.id = app_user.organization_id
+       WHERE app_user.email = $1
+       FOR UPDATE OF app_user`,
       [actor.email],
     )
     const organizationId = locked.rows[0]?.organization_id
     if (!organizationId) throw new Error('User organization is not configured')
+    const organizationName = canManageUserAccess(actor)
+      ? requestedOrganizationName
+      : locked.rows[0].organization_name
+    if (!canManageUserAccess(actor) && requestedOrganizationName !== organizationName) {
+      throw new AppUserAuthorizationError('Only an administrator can rename a shared organization')
+    }
 
-    await client.query(
-      `UPDATE workspace_organizations
-       SET name = $2, updated_by = $3, updated_at = now()
-       WHERE id = $1::uuid`,
-      [organizationId, organizationName, actor.email],
-    )
-    await client.query(
-      `UPDATE app_users
-       SET organization_name = $2, updated_at = now()
-       WHERE organization_id = $1::uuid`,
-      [organizationId, organizationName],
-    )
+    if (canManageUserAccess(actor)) {
+      await client.query(
+        `UPDATE workspace_organizations
+         SET name = $2, updated_by = $3, updated_at = now()
+         WHERE id = $1::uuid`,
+        [organizationId, organizationName, actor.email],
+      )
+      await client.query(
+        `UPDATE app_users
+         SET organization_name = $2, updated_at = now()
+         WHERE organization_id = $1::uuid`,
+        [organizationId, organizationName],
+      )
+    }
     const updated = await client.query<AppUserRow>(
       `UPDATE app_users
        SET display_name = $2,
@@ -415,6 +532,7 @@ export async function updateAppUserAccess(input: {
   const email = normalizeUserEmail(input.email)
   const target = await getAppUser(email)
   if (!target) throw new AppUserNotFoundError()
+  await requireOrganizationInActorScope(actor, target.organizationId)
   if (target.role === 'owner') throw new AppUserAuthorizationError('The owner account cannot be changed')
   if (actor.role !== 'owner' && (target.role !== 'member' || input.role === 'admin')) {
     throw new AppUserAuthorizationError('Only the owner can manage administrators')

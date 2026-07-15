@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { createSessionToken, getCookieName } from '@/lib/auth'
 import { verifyAuthMagicCode } from '@/lib/authMagicCode'
+import { syncAppUserProfileToOwnedPipelines } from '@/lib/persistence/crm'
 import { ensureDefaultResourcesForUser } from '@/lib/tenancy'
 
 export async function POST(req: NextRequest) {
@@ -18,6 +19,9 @@ export async function POST(req: NextRequest) {
     }
 
     await ensureDefaultResourcesForUser(result.email)
+    await syncAppUserProfileToOwnedPipelines(result.email).catch((error) => {
+      console.error('[auth] CRM profile projection deferred', error instanceof Error ? error.message : 'unknown error')
+    })
 
     const response = NextResponse.json({ ok: true })
     response.cookies.set({

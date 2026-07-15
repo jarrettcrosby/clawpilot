@@ -15,6 +15,8 @@ import Divider from '@mui/material/Divider'
 import Stack from '@mui/material/Stack'
 import TextField from '@mui/material/TextField'
 import Typography from '@mui/material/Typography'
+import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
+import { formatUserDateTime, type UserDateTimeSettings } from '@/lib/userDateTime'
 import AddRounded from '@mui/icons-material/AddRounded'
 import CloudRounded from '@mui/icons-material/CloudRounded'
 import CheckRounded from '@mui/icons-material/CheckRounded'
@@ -204,10 +206,10 @@ function isEmail(value: string) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim())
 }
 
-function formatUpdatedAt(value: string | null | undefined) {
-  if (!value) return null
-  const date = new Date(value)
-  return Number.isNaN(date.getTime()) ? null : date.toLocaleString()
+function formatUpdatedAt(value: string | null | undefined, settings: UserDateTimeSettings) {
+  return formatUserDateTime(value, settings, {
+    year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
+  }) || null
 }
 
 function definitionForConnection(connection: MatonConnection) {
@@ -260,6 +262,7 @@ export default function MatonIntegrationPanel({
   isOwner: boolean
   embedded?: boolean
 }) {
+  const dateTimeSettings = useUserDateTime()
   const [integration, setIntegration] = useState<MatonIntegration | null>(null)
   const [loginEmail, setLoginEmail] = useState('')
   const [apiKey, setApiKey] = useState('')
@@ -478,9 +481,9 @@ export default function MatonIntegrationPanel({
                 sx={{ height: 26, minHeight: 26 }}
               />
             </Stack>
-            {formatUpdatedAt(integration?.updatedAt) ? (
+            {formatUpdatedAt(integration?.updatedAt, dateTimeSettings) ? (
               <Typography variant="caption" color="text.disabled">
-                Updated {formatUpdatedAt(integration?.updatedAt)}
+                Updated {formatUpdatedAt(integration?.updatedAt, dateTimeSettings)}
               </Typography>
             ) : null}
           </Box>
@@ -641,7 +644,7 @@ export default function MatonIntegrationPanel({
                 const Icon = definition?.Icon || CloudRounded
                 const appLabel = definition?.label || connection.label || connection.app || connection.provider || 'Maton connection'
                 const status = connection.status || 'Not connected'
-                const updatedAt = formatUpdatedAt(connection.updatedAt)
+                const updatedAt = formatUpdatedAt(connection.updatedAt, dateTimeSettings)
                 const selectKey = `select-connection:${connection.connectionId}`
                 return (
                   <Box key={`${connection.app}:${connection.connectionId}:${index}`}>

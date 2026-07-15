@@ -19,9 +19,16 @@ import { requireRequestUser } from '@/lib/requestUser'
 import {
   BOARD_SELECTION_COOKIE,
   requireResourceEditor,
+  resolvePipelineSpaceAccess,
   resolveProjectBoardAccess,
   type ProjectBoard,
 } from '@/lib/tenancy'
+import {
+  CrmDescriptionConflictError,
+  reconcileCrmBoardProjection,
+  resolveCrmBoardBinding,
+  updateCrmBoardTaskDescription,
+} from '@/lib/crm/boardProjection'
 
 const DEV_TASKS_FILE = path.join(process.cwd(), '..', 'data-dev', 'tasks.json')
 const PROD_TASKS_FILE = path.join(process.cwd(), '..', 'data', 'tasks.json')
@@ -56,6 +63,8 @@ type TaskBody = Record<string, unknown> & {
 }
 type TaskPatchBody = TaskBody & {
   id?: string
+  crmDescription?: string
+  crmDescriptionHash?: string
   _comment?: string
   _editCommentId?: string
   _editCommentText?: string
@@ -233,6 +242,7 @@ function normalizeTasks(tasks: unknown): Task[] {
       workstream: typeof t.workstream === 'string' ? t.workstream : undefined,
       outcomeStatement: typeof t.outcomeStatement === 'string' ? t.outcomeStatement : undefined,
       entityType: typeof t.entityType === 'string' ? t.entityType : undefined,
+      crm: typeof t.crm === 'object' && t.crm !== null ? t.crm as Task['crm'] : undefined,
       governance: typeof t.governance === 'object' && t.governance !== null ? t.governance as Task['governance'] : undefined,
       execution: typeof t.execution === 'object' && t.execution !== null ? t.execution as Task['execution'] : undefined,
     }
@@ -473,6 +483,14 @@ export async function GET(req: NextRequest) {
     const { searchParams } = new URL(req.url)
     const includeArchived = searchParams.get('includeArchived') === 'true'
     const board = await resolveTaskBoard(req)
+    if (board) {
+      const binding = await resolveCrmBoardBinding(board.id)
+      if (binding) {
+        const actor = await requireRequestUser(req)
+        await resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: binding.pipeline_id })
+      }
+      await reconcileCrmBoardProjection({ boardId: board.id })
+    }
     const tasks = await readTasks(board?.id)
     return NextResponse.json(includeArchived ? tasks : tasks.filter((task) => !task.archived))
   } catch (error) {
@@ -491,6 +509,9 @@ export async function POST(req: NextRequest) {
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Project board access denied'
     return NextResponse.json({ error: message }, { status: message === 'Unauthorized' ? 401 : 403 })
+  }
+  if (board && await resolveCrmBoardBinding(board.id)) {
+    return NextResponse.json({ error: 'CRM cards are created from CRM accounts and contacts' }, { status: 409 })
   }
   const tasks = await readTasks(board?.id)
   const body = await req.json() as TaskBody
@@ -720,9 +741,17 @@ export async function PATCH(req: NextRequest) {
     const message = error instanceof Error ? error.message : 'Project board access denied'
     return NextResponse.json({ error: message }, { status: message === 'Unauthorized' ? 401 : 403 })
   }
+  if (board) {
+    const binding = await resolveCrmBoardBinding(board.id)
+    if (binding) {
+      const signedIn = await requireRequestUser(req)
+      const pipeline = await resolvePipelineSpaceAccess({ actorEmail: signedIn.email, pipelineId: binding.pipeline_id })
+      requireResourceEditor(pipeline)
+    }
+  }
   const tasks = await readTasks(board?.id)
   const body = await req.json() as TaskPatchBody
-  const { id, _comment, _editCommentId, _editCommentText, _deleteCommentId, _restoreCommentId, _checklistAdd, _checklistToggle, _checklistDelete, _checklistUpdate, _execution, _agentDispatchState, _suggestionAction, _actor, _deleteReason, ...rawUpdates } = body
+  const { id, crmDescription, crmDescriptionHash, _comment, _editCommentId, _editCommentText, _deleteCommentId, _restoreCommentId, _checklistAdd, _checklistToggle, _checklistDelete, _checklistUpdate, _execution, _agentDispatchState, _suggestionAction, _actor, _deleteReason, ...rawUpdates } = body
   if (_agentDispatchState && !authorizedWorkerMutation(req)) {
     return NextResponse.json({ error: 'Agent dispatch state updates require worker authorization' }, { status: 403 })
   }
@@ -733,13 +762,33 @@ export async function PATCH(req: NextRequest) {
 
   const now = new Date().toISOString()
   const prev = tasks[idx]
+  const hasCrmDescriptionUpdate = Boolean(prev.crm) && (
+    Object.prototype.hasOwnProperty.call(body, 'crmDescription')
+    || Object.prototype.hasOwnProperty.call(rawUpdates, 'desc')
+  )
+  if (hasCrmDescriptionUpdate) {
+    if (!board) return NextResponse.json({ error: 'CRM board context is required' }, { status: 409 })
+    try {
+      const updated = await updateCrmBoardTaskDescription({
+        boardId: board.id,
+        taskId: prev.id,
+        description: Object.prototype.hasOwnProperty.call(body, 'crmDescription') ? crmDescription : rawUpdates.desc,
+        expectedDescriptionHash: crmDescriptionHash,
+        actorEmail: actor,
+      })
+      return NextResponse.json(updated)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unable to update CRM description'
+      return NextResponse.json({ error: message }, { status: error instanceof CrmDescriptionConflictError ? 409 : 400 })
+    }
+  }
   const hasAssignedAgentUpdate = Object.prototype.hasOwnProperty.call(rawUpdates, 'assignedAgent')
   const hasNextActionUpdate = Object.prototype.hasOwnProperty.call(rawUpdates, 'nextAction')
     || Object.prototype.hasOwnProperty.call(rawUpdates, 'workItem')
   const updates: Partial<Task> = {}
 
   if (Object.prototype.hasOwnProperty.call(rawUpdates, 'title') && typeof rawUpdates.title === 'string') {
-    updates.title = rawUpdates.title
+    if (!prev.crm) updates.title = rawUpdates.title
   }
   if (Object.prototype.hasOwnProperty.call(rawUpdates, 'desc') && typeof rawUpdates.desc === 'string') {
     updates.desc = rawUpdates.desc
@@ -767,7 +816,6 @@ export async function PATCH(req: NextRequest) {
   if (Object.prototype.hasOwnProperty.call(rawUpdates, 'outcomeStatement') && typeof rawUpdates.outcomeStatement === 'string') {
     updates.outcomeStatement = rawUpdates.outcomeStatement
   }
-
   if (hasAssignedAgentUpdate) {
     updates.assignedAgent = rawUpdates.assignedAgent === '' || rawUpdates.assignedAgent === null
       ? undefined
@@ -1015,6 +1063,9 @@ export async function PATCH(req: NextRequest) {
   if (updates.category && updates.category !== prev.category)
     activity.push({ type: 'updated', message: `Category changed to ${updates.category}`, timestamp: now, ...base })
 
+  if (prev.crm && (body._archive || body._unarchive || body._deletePermanent)) {
+    return NextResponse.json({ error: 'CRM cards follow the lifecycle of their CRM record' }, { status: 409 })
+  }
   if (body._archive) {
     tasks[idx] = { ...prev, ...updates, execution, archived: true, archivedAt: now, comments, deletedComments, checklist, activity: [...activity, { type: 'archived', message: 'Card archived', timestamp: now, ...base }], updatedAt: now }
     await writeTasks(tasks, board?.id)

@@ -1,9 +1,20 @@
 import crypto from 'crypto'
 import { requestInvitationAuthMagicCode } from '@/lib/authMagicCode'
 import { sendInvitationEmail, mailFromAddress } from '@/lib/matonMail'
+import {
+  resolveInvitationWorkspaceOrganization,
+  retireUnusedWorkspaceOrganization,
+} from '@/lib/organizations'
 import { query, withTransaction } from '@/lib/persistence/postgres'
 import { appPublicUrl } from '@/lib/publicUrl'
-import { getAppUser, inviteAppUser, normalizeUserEmail, requireActiveAppUser, type AppUser } from '@/lib/users'
+import {
+  getAppUser,
+  inviteAppUser,
+  normalizeUserEmail,
+  requireActiveAppUser,
+  restoreInvitedUserAssignment,
+  type AppUser,
+} from '@/lib/users'
 
 const INVITATION_LIFETIME_DAYS = 7
 const INVITATION_DELIVERY_STALE_MINUTES = 2
@@ -12,6 +23,7 @@ type InvitationRow = {
   id: string
   email: string
   inviter_name: string | null
+  organization_name: string | null
   expires_at: string
 }
 
@@ -24,6 +36,7 @@ type IssuedInvitationRow = {
 export type PublicInvitation = {
   email: string
   inviterName: string
+  organizationName: string
   expiresAt: string
 }
 
@@ -36,6 +49,7 @@ async function claimInvitation(input: {
   actorEmail: string
   digest: string
   fromAddress: string
+  organizationId: string
 }): Promise<IssuedInvitationRow> {
   return withTransaction(async (client) => {
     await client.query('SELECT email FROM app_users WHERE email = $1 FOR UPDATE', [input.email])
@@ -79,11 +93,11 @@ async function claimInvitation(input: {
     const issued = await client.query<IssuedInvitationRow>(
       `
         INSERT INTO app_user_invitations (
-          email, invited_by, token_digest, from_address, expires_at, supersedes_id,
+          email, invited_by, workspace_organization_id, token_digest, from_address, expires_at, supersedes_id,
           delivery_pending_at, revoked_at, created_at, updated_at
         )
         VALUES (
-          $1, $2, $3, $4, now() + ($5::text || ' days')::interval, $6::uuid,
+          $1, $2, $3::uuid, $4, $5, now() + ($6::text || ' days')::interval, $7::uuid,
           now(), now(), now(), now()
         )
         RETURNING id::text, expires_at::text, supersedes_id::text
@@ -91,6 +105,7 @@ async function claimInvitation(input: {
       [
         input.email,
         input.actorEmail,
+        input.organizationId,
         input.digest,
         input.fromAddress,
         String(INVITATION_LIFETIME_DAYS),
@@ -189,9 +204,11 @@ async function invitationByToken(tokenValue: unknown): Promise<InvitationRow | n
         invitation.id::text,
         invitation.email,
         inviter.display_name AS inviter_name,
+        organization.name AS organization_name,
         invitation.expires_at::text
       FROM app_user_invitations invitation
       LEFT JOIN app_users inviter ON inviter.email = invitation.invited_by
+      LEFT JOIN workspace_organizations organization ON organization.id = invitation.workspace_organization_id
       WHERE invitation.token_digest = $1
         AND invitation.revoked_at IS NULL
         AND invitation.expires_at > now()
@@ -206,27 +223,53 @@ async function invitationByToken(tokenValue: unknown): Promise<InvitationRow | n
 export async function createUserInvitation(input: {
   actorEmail: unknown
   email: unknown
+  organizationId?: unknown
+  createOrganization?: unknown
+  organizationName?: unknown
+  parentOrganizationId?: unknown
 }): Promise<{ user: AppUser; delivery: 'sent'; expiresAt: string }> {
   const actor = await requireActiveAppUser(input.actorEmail)
   const email = normalizeUserEmail(input.email)
+  const assignment = await resolveInvitationWorkspaceOrganization({
+    actorEmail: actor.email,
+    organizationId: input.organizationId,
+    createOrganization: input.createOrganization,
+    organizationName: input.organizationName,
+    parentOrganizationId: input.parentOrganizationId,
+  })
   let user: AppUser | null = null
   let userCreated = false
+  let previousOrganizationId: string | null = null
+  let previousInvitedBy: string | null = null
   let invitation: IssuedInvitationRow | null = null
   try {
-    const invited = await inviteAppUser({ actorEmail: actor.email, email })
+    const invited = await inviteAppUser({
+      actorEmail: actor.email,
+      email,
+      organizationId: assignment.organization.id,
+    })
     user = invited.user
     userCreated = invited.created
+    previousOrganizationId = invited.previousOrganizationId
+    previousInvitedBy = invited.previousInvitedBy
     const token = crypto.randomBytes(32).toString('base64url')
     const digest = tokenDigest(token)
     const fromAddress = mailFromAddress()
     const publicUrl = appPublicUrl()
-    invitation = await claimInvitation({ email: user.email, actorEmail: actor.email, digest, fromAddress })
+    invitation = await claimInvitation({
+      email: user.email,
+      actorEmail: actor.email,
+      digest,
+      fromAddress,
+      organizationId: assignment.organization.id,
+    })
     const welcomeUrl = new URL('/welcome', publicUrl)
     welcomeUrl.hash = `token=${encodeURIComponent(token)}`
 
     const sent = await sendInvitationEmail({
       to: user.email,
       inviterName: actor.displayName || actor.email,
+      organizationName: assignment.organization.name,
       welcomeUrl: welcomeUrl.toString(),
       expiresAt: invitation.expires_at,
     })
@@ -245,6 +288,14 @@ export async function createUserInvitation(input: {
     }
   } catch (error) {
     if (user) await rollbackInvitation({ invitation, email: user.email, deleteUser: userCreated })
+    if (user && !userCreated) {
+      await restoreInvitedUserAssignment({
+        email: user.email,
+        organizationId: previousOrganizationId,
+        invitedBy: previousInvitedBy,
+      })
+    }
+    if (assignment.created) await retireUnusedWorkspaceOrganization(assignment.organization.id)
     throw error
   }
 }
@@ -259,6 +310,7 @@ export async function openUserInvitation(tokenValue: unknown): Promise<PublicInv
   return {
     email: normalizeUserEmail(row.email),
     inviterName: row.inviter_name || 'A ClawPilot administrator',
+    organizationName: row.organization_name || 'your organization',
     expiresAt: new Date(row.expires_at).toISOString(),
   }
 }

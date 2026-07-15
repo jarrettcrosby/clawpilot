@@ -17,11 +17,13 @@ import SmartToyRounded from '@mui/icons-material/SmartToyRounded'
 import TrendingUpRounded from '@mui/icons-material/TrendingUpRounded'
 import ViewKanbanRounded from '@mui/icons-material/ViewKanbanRounded'
 import WbSunnyRounded from '@mui/icons-material/WbSunnyRounded'
+import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import { queueAgentTaskOpen } from '@/lib/agents/navigation'
 import { queueProjectTaskOpen } from '@/lib/projects/navigation'
 import { deriveLiveState, formatLiveActivityAge } from '@/lib/liveState'
 import { deriveNowWorking } from '@/lib/nowWorking'
 import type { Task } from '@/lib/types'
+import { hourInUserTimeZone } from '@/lib/userDateTime'
 import { deriveNextActionGuidance, deriveStateTruth } from '@/lib/workItemModel'
 
 type DocMeta = {
@@ -56,8 +58,8 @@ const STATUS_COLORS: Record<string, string> = {
   backlog: 'rgba(255,255,255,0.35)',
 }
 
-function greeting() {
-  const hour = new Date().getHours()
+function greeting(timeZone: string) {
+  const hour = hourInUserTimeZone(new Date(), timeZone)
   if (hour < 12) return { text: 'Good morning', color: '#FDD663' }
   if (hour < 17) return { text: 'Good afternoon', color: '#FFA726' }
   return { text: 'Good evening', color: '#CFC6EA' }
@@ -75,6 +77,7 @@ async function fetchJson(url: string, signal: AbortSignal): Promise<unknown> {
 }
 
 export default function DashboardSection({ onNavigate, onNavigateWithFilter }: Props) {
+  const { timeZone } = useUserDateTime()
   const [tasks, setTasks] = useState<Task[]>([])
   const [docs, setDocs] = useState<DocMeta[]>([])
   const [executionResults, setExecutionResults] = useState<ExecutionSummary | null>(null)
@@ -82,7 +85,7 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter }: P
   const [snapshotTime, setSnapshotTime] = useState(0)
   const [loading, setLoading] = useState(true)
   const [loadWarning, setLoadWarning] = useState(false)
-  const [salutation] = useState(() => greeting())
+  const salutation = useMemo(() => greeting(timeZone), [timeZone])
 
   useEffect(() => {
     let active = true

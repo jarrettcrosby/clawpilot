@@ -45,7 +45,11 @@ const usersAdapter = read('app_src/lib/users.ts')
 assertIncludes(usersAdapter, 'ensureOwnerUser', 'app users adapter')
 assertIncludes(usersAdapter, "COALESCE((SELECT reference_code FROM app_users WHERE email = $1), allocate_crm_reference('gc'))", 'side-effect-free app user upsert')
 assertIncludes(usersAdapter, 'inviteAppUser', 'app users adapter')
+assertIncludes(usersAdapter, 'organization_id = EXCLUDED.organization_id', 'invitation organization assignment')
+assertIncludes(usersAdapter, 'restoreInvitedUserAssignment', 'failed invitation assignment rollback')
 assertIncludes(usersAdapter, 'canInviteUsers', 'app users adapter')
+assertIncludes(usersAdapter, 'requireOrganizationInActorScope', 'organization-subtree user administration')
+assertIncludes(usersAdapter, 'JOIN managed ON managed.id = app_user.organization_id', 'organization-subtree user listing')
 assertIncludes(usersAdapter, "current?.status === 'disabled'", 'disabled user restore authorization')
 assertIncludes(usersAdapter, 'Restore the disabled user before sending a new invitation', 'disabled user invitation boundary')
 assertIncludes(usersAdapter, 'updateAppUserProfile', 'app users adapter')
@@ -172,11 +176,14 @@ assertIncludes(invitationAdapter, 'INVITATION_DELIVERY_STALE_MINUTES', 'invitati
 assertIncludes(invitationAdapter, 'supersedes_id', 'invitation rollback chain')
 assertIncludes(invitationAdapter, 'delivery_pending_at', 'invitation two-phase delivery')
 assertIncludes(invitationAdapter, 'markInvitationDelivered', 'invitation activation after delivery')
+assertIncludes(invitationAdapter, 'resolveInvitationWorkspaceOrganization', 'explicit invitation organization selection')
+assertIncludes(invitationAdapter, 'workspace_organization_id', 'organization-bound invitation token')
 const magicCodeAdapter = read('app_src/lib/authMagicCode.ts')
 assertIncludes(magicCodeAdapter, "user.status !== 'active'", 'ordinary sign-in active-user requirement')
 assertIncludes(magicCodeAdapter, 'requestInvitationAuthMagicCode', 'invitation-purpose sign-in')
 assertIncludes(magicCodeAdapter, 'UPDATE app_user_invitations', 'atomic invitation acceptance')
 assertIncludes(magicCodeAdapter, 'AUTHORIZATION_CHANGED', 'invitation authorization rollback')
+assertIncludes(magicCodeAdapter, 'workspace_organization_id = (', 'invitation organization acceptance boundary')
 
 const documentsAdapter = read('app_src/lib/documents.ts')
 assertIncludes(documentsAdapter, 'WHERE owner_email = $1', 'user-scoped document reads')
@@ -207,21 +214,28 @@ assertIncludes(shortLinksAdapter, 'SHORTLINK_SERVICE_CLIENTS_JSON', 'source-boun
 assertIncludes(shortLinksAdapter, "url.protocol !== 'https:'", 'short-link destination transport security')
 assertIncludes(shortLinksAdapter, 'FOR UPDATE', 'atomic short-link click limits')
 assertIncludes(shortLinksAdapter, 'NOT $4::boolean OR source_app = $5', 'service source isolation')
-assertIncludes(shortLinksAdapter, 'organization_root_id = $10::uuid', 'organization-scoped short-link visibility')
+assertIncludes(shortLinksAdapter, 'organization_root_id = $10::uuid', 'exact organization-scoped short-link visibility')
 assertIncludes(shortLinksAdapter, '$2::boolean OR NOT $8::boolean', 'same-organization interactive link visibility')
-assertIncludes(shortLinksAdapter, 'workspaceOrganizationRootId', 'short-link tenant root resolution')
+assertIncludes(shortLinksAdapter, 'ensurePrimaryWorkspaceOrganization', 'short-link exact organization resolution')
 
 const tenancyAdapter = read('app_src/lib/tenancy.ts')
 assertIncludes(tenancyAdapter, 'ensureDefaultResourcesForUser', 'tenancy adapter')
 assertIncludes(tenancyAdapter, 'resolveProjectBoardAccess', 'tenancy adapter')
 assertIncludes(tenancyAdapter, 'resolvePipelineSpaceAccess', 'tenancy adapter')
+assertIncludes(tenancyAdapter, "SELECT 'CRM Board'", 'per-user CRM board provisioning')
+assertIncludes(tenancyAdapter, 'workspace_organization_id = $1::uuid', 'organization-primary CRM pipeline selection')
 assertIncludes(tenancyAdapter, 'Only the board owner can share it', 'tenancy adapter')
 assertIncludes(tenancyAdapter, 'Only the pipeline owner can share it', 'tenancy adapter')
+
+const organizationAdapter = read('app_src/lib/organizations.ts')
+assertIncludes(organizationAdapter, 'WHERE organization.id = $1::uuid`,', 'member hierarchy exact organization boundary')
 
 const taskAdapter = read('app_src/lib/persistence/tasks.ts')
 assertIncludes(taskAdapter, 'WHERE board_id = $1::uuid', 'board-scoped task reads')
 assertIncludes(taskAdapter, 'DELETE FROM tasks WHERE board_id = $1::uuid', 'board-scoped task writes')
 assertIncludes(taskAdapter, 'insertAgentDispatchOutbox', 'atomic task and agent dispatch writes')
+assertIncludes(taskAdapter, "source <> 'crm-projection'", 'CRM projection snapshot deletion guard')
+assertIncludes(taskAdapter, "WHEN tasks.source = 'crm-projection'", 'CRM projection source preservation')
 
 const agentDispatchAdapter = read('app_src/lib/persistence/agentDispatch.ts')
 assertIncludes(agentDispatchAdapter, "const TARGET_SYSTEM = 'agent_runtime'", 'agent dispatch adapter')
@@ -309,6 +323,9 @@ assertIncludes(crmAdapter, "target_system, payload", 'CRM outbox persistence')
 assertIncludes(crmAdapter, "'upsert_record', 'suitecrm'", 'SuiteCRM outbox target')
 assertIncludes(crmAdapter, "operation IN ('upsert_record', 'delete_record')", 'SuiteCRM deletion outbox claims')
 assertIncludes(crmAdapter, 'ensurePipelineCrmHierarchy', 'workspace organization CRM hierarchy')
+assertIncludes(crmAdapter, 'WITH RECURSIVE descendants AS', 'descendant organization CRM hierarchy')
+assertIncludes(crmAdapter, "relationship_type = 'customer'\n       AND parent_organization_id IS NULL", 'existing nested CRM customer hierarchy preservation')
+assertIncludes(crmAdapter, 'pipeline.workspace_organization_id = app_user.organization_id', 'same-organization profile projection')
 assertIncludes(crmAdapter, 'ON CONFLICT (pipeline_id, identity_key)', 'natural CRM identity upserts')
 assertIncludes(crmAdapter, "$23, $24, $25::jsonb, $26,\n        'pending', NULL, $27, $27", 'CRM contact insert bindings')
 assert.ok(
@@ -319,15 +336,28 @@ assertIncludes(crmAdapter, 'FOR UPDATE SKIP LOCKED', 'SuiteCRM leased outbox cla
 assertIncludes(crmAdapter, 'pipeline_id = $1::uuid', 'pipeline-scoped CRM reads')
 assertIncludes(crmAdapter, 'readCrmWorkbookProjectionReadiness', 'reconciliation-gated CRM workbook projection')
 assertIncludes(crmAdapter, "importStatus === 'succeeded'", 'successful source reconciliation projection gate')
-assertIncludes(crmAdapter, 'syncAppUserProfileToOwnedPipelines', 'all owned pipeline profile projection')
+assertIncludes(crmAdapter, 'syncAppUserProfileToOwnedPipelines', 'all organization pipeline profile projection')
 assertIncludes(crmAdapter, 'syncPipelineOwnerProfileToCrm', 'pipeline owner profile backfill projection')
-assertIncludes(crmAdapter, 'CRM profile synchronization requires an owned pipeline', 'profile projection ownership boundary')
+assertIncludes(crmAdapter, 'CRM profile synchronization requires an organization pipeline', 'profile projection organization boundary')
 assertIncludes(crmAdapter, 'appUserReferenceCode: user.referenceCode', 'canonical app-user CRM contact identity')
+assertIncludes(crmAdapter, 'COALESCE(\n           $2::uuid,', 'interaction organization relationship normalization')
+assertIncludes(crmAdapter, 'organizationName: clean(row.organization_name)', 'interaction organization API projection')
+assertIncludes(crmAdapter, "to_jsonb(record)->>'contact_id' AS contact_id", 'interaction relationship edit hydration')
+assertIncludes(crmAdapter, 'OR organization.name ILIKE', 'interaction organization search')
 assertIncludes(crmAdapter, 'suiteCrmRelationships', 'SuiteCRM meeting subpanel relationships')
 assertIncludes(crmAdapter, "'accounts'::text AS link_field_name", 'SuiteCRM meeting account relationship')
 assertIncludes(crmAdapter, "SELECT 'contacts', 'Contacts', suitecrm_id", 'SuiteCRM meeting contact relationship')
 assertIncludes(crmAdapter, 'global_id_c: referenceCode', 'SuiteCRM Global ID projection')
 assertIncludes(crmAdapter, '`crm:${input.entity}:v3:', 'versioned SuiteCRM Global ID outbox contract')
+
+const rootCrmPunchoutRoute = read('app_src/app/api/crm/punchout/route.ts')
+assertIncludes(rootCrmPunchoutRoute, 'organization.parentId !== null', 'root-only native SuiteCRM punchout')
+
+const suiteCrmInteractionIngestion = read('app_src/lib/crm/suiteCrmInteractionIngestion.ts')
+assertIncludes(suiteCrmInteractionIngestion, "FULL_HISTORY_START = '1970-01-01T00:00:00.000Z'", 'SuiteCRM Note historical first scan')
+assertIncludes(suiteCrmInteractionIngestion, 'SUITE_CRM_INTERACTION_POLL_OVERLAP_MS', 'SuiteCRM Note poll overlap')
+assertIncludes(suiteCrmInteractionIngestion, 'emitSuiteCrmOutbox: false', 'SuiteCRM Note inbound echo prevention')
+assertIncludes(suiteCrmInteractionIngestion, "| 'Meetings'", 'SuiteCRM Note parent relationship coverage')
 
 const crmModulesMigration = read('db/migrations/0023_crm_modules_references_and_integrations.sql')
 assertIncludes(crmModulesMigration, 'workspace_organizations_reference_code_unique', 'canonical workspace organization reference')
@@ -364,6 +394,37 @@ assertIncludes(globalCrmReferenceNumbersMigration, 'Current CRM records contain 
 const referenceAllocationCleanupMigration = read('db/migrations/0032_reference_allocation_leak_cleanup.sql')
 assertIncludes(referenceAllocationCleanupMigration, "SET status = 'retired'", 'orphan CRM allocation retirement')
 assertIncludes(referenceAllocationCleanupMigration, 'Unreferenced active CRM allocations remain after cleanup', 'active CRM allocation integrity guard')
+
+const crmBoardProjectionMigration = read('db/migrations/0033_crm_board_projection_and_legacy_alias_cleanup.sql')
+for (const contract of [
+  'CREATE TABLE IF NOT EXISTS crm_board_projections',
+  'CREATE TABLE IF NOT EXISTS crm_board_cards',
+  'validate_crm_board_projection_scope',
+  'validate_crm_board_card_scope',
+  "registry.status = 'alias'",
+]) {
+  assertIncludes(crmBoardProjectionMigration, contract, 'CRM board projection migration')
+}
+
+const accountMembershipMigration = read('db/migrations/0034_account_membership_crm_board_scope.sql')
+for (const contract of [
+  'ADD COLUMN IF NOT EXISTS workspace_organization_id uuid',
+  'idx_project_boards_owner_crm_board',
+  'idx_app_user_invitations_organization',
+  'organization_root_id = app_user.organization_id',
+  'resolved_interactions AS',
+  'crm:interactions:organization-backfill:v1:',
+  'DELETE FROM tasks task',
+  'validate_crm_board_projection_scope',
+  'validate_crm_board_card_scope',
+  'CREATE TRIGGER trg_validate_crm_board_card_scope',
+]) {
+  assertIncludes(accountMembershipMigration, contract, 'account membership and CRM board scope migration')
+}
+
+const crmWorkbookOrganizationProjection = read('app_src/lib/crm/workbookProjection.ts')
+assertIncludes(crmWorkbookOrganizationProjection, 'record.organizationName, record.agentName', 'interaction workbook organization projection')
+assertIncludes(pipelineProvisioning, "Interactions: ['Priority', 'Interaction', 'Owner', 'Organization'", 'interaction workbook organization header')
 
 const driveHierarchyMigration = read('db/migrations/0024_versioned_drive_hierarchy_reconciliation.sql')
 assertIncludes(driveHierarchyMigration, "'reconcile_pipeline_hierarchy_v2'", 'versioned Drive hierarchy operation')
@@ -444,6 +505,7 @@ const crmIntegrationWorkerRoute = read('app_src/app/api/crm/integrations/process
 assertIncludes(crmIntegrationWorkerRoute, 'processDueCrmIntegrationActions', 'CRM action retry worker')
 assertIncludes(crmIntegrationWorkerRoute, 'processInboundGmailIngestion', 'inbound Gmail worker')
 assertIncludes(crmIntegrationWorkerRoute, 'processCalendarIngestion', 'Google Calendar reconciliation worker')
+assertIncludes(crmIntegrationWorkerRoute, 'processSuiteCrmAccountContactIngestion', 'SuiteCRM account/contact reconciliation worker')
 assertIncludes(crmIntegrationWorkerRoute, 'processSuiteCrmMeetingIngestion', 'SuiteCRM meeting reconciliation worker')
 
 const crmCalendarIngestion = read('app_src/lib/crm/calendarIngestion.ts')
@@ -458,6 +520,30 @@ assertIncludes(crmSuiteCrmMeetingIngestion, 'listSuiteCrmMeetingsUpdatedSince', 
 assertIncludes(crmSuiteCrmMeetingIngestion, 'hasMeaningfulChanges', 'SuiteCRM meeting echo prevention')
 assertIncludes(crmSuiteCrmMeetingIngestion, 'crm:suitecrm-meeting-calendar:', 'SuiteCRM to Calendar update idempotency')
 assertIncludes(crmSuiteCrmMeetingIngestion, 'meetingCalendarOwnerEmail', 'original Calendar organizer routing')
+
+const crmSuiteCrmAccountContactIngestion = read('app_src/lib/crm/suiteCrmAccountContactIngestion.ts')
+assertIncludes(crmSuiteCrmAccountContactIngestion, 'crm.suitecrm.account_contact_ingestion.cursor', 'SuiteCRM account/contact cursor')
+assertIncludes(crmSuiteCrmAccountContactIngestion, 'snapshot.attributes.global_id_c', 'SuiteCRM Global ID correlation')
+assertIncludes(crmSuiteCrmAccountContactIngestion, 'organization.suitecrm_id = $1', 'SuiteCRM account ID correlation')
+assertIncludes(crmSuiteCrmAccountContactIngestion, 'contact.suitecrm_id = $1', 'SuiteCRM contact ID correlation')
+assertIncludes(crmSuiteCrmAccountContactIngestion, 'AND organization.pipeline_id = contact.pipeline_id', 'tenant-scoped contact account correlation')
+assertIncludes(crmSuiteCrmAccountContactIngestion, 'hasMeaningfulOrganizationChanges', 'SuiteCRM account echo prevention')
+assertIncludes(crmSuiteCrmAccountContactIngestion, 'hasMeaningfulContactChanges', 'SuiteCRM contact echo prevention')
+assertIncludes(crmSuiteCrmAccountContactIngestion, 'emitSuiteCrmOutbox: false', 'SuiteCRM inbound outbox suppression')
+assertIncludes(crmSuiteCrmAccountContactIngestion, 'stagedPipelineIds.add(row.pipeline_id)', 'post-stage CRM-card pipeline collection')
+assertIncludes(crmSuiteCrmAccountContactIngestion, 'workspaceOrganizationId', 'SuiteCRM account app-only field preservation')
+assertIncludes(crmSuiteCrmAccountContactIngestion, 'appUserEmail', 'SuiteCRM contact app-only field preservation')
+assertIncludes(crmSuiteCrmAccountContactIngestion, 'SELECT DISTINCT pipeline_id::text', 'bound CRM-board pipeline backfill')
+assertIncludes(crmSuiteCrmAccountContactIngestion, 'const projectionPipelineIds = new Set(await boundCrmBoardPipelineIds())', 'deduplicated CRM-board pipeline reconciliation')
+assertIncludes(crmSuiteCrmAccountContactIngestion, 'reconcileCrmBoardProjectionsForPipeline', 'SuiteCRM CRM-card projection reconciliation')
+assertIncludes(crmSuiteCrmAccountContactIngestion, 'suiteCrmSnapshotIsDeleted', 'non-destructive SuiteCRM deletion handling')
+assertIncludes(crmSuiteCrmAccountContactIngestion, 'deletedRecordsIgnored', 'audited ignored SuiteCRM deletions')
+const noEchoStageProjectionBlocks = crmSuiteCrmAccountContactIngestion.match(
+  /await stageCrmRecordInPostgres\(\{[\s\S]*?emitSuiteCrmOutbox: false,[\s\S]*?\n    \}\)\n    staged \+= 1\n    stagedPipelineIds\.add\(row\.pipeline_id\)/g,
+) || []
+assert.equal(noEchoStageProjectionBlocks.length, 2, 'Account and Contact pipelines must be projected only after successful no-echo staging')
+assert.ok(!crmSuiteCrmAccountContactIngestion.includes('deleteSuiteCrmRecord'), 'SuiteCRM inbound reconciliation must not delete provider records')
+assert.ok(!crmSuiteCrmAccountContactIngestion.includes('DELETE FROM crm_'), 'SuiteCRM inbound reconciliation must not delete local CRM records')
 
 const crmActionsRoute = read('app_src/app/api/crm/actions/route.ts')
 assertIncludes(crmActionsRoute, 'requireResourceEditor', 'CRM action editor authorization')
@@ -474,10 +560,27 @@ assertIncludes(crmReferenceRoute, "new URL('/', appPublicUrl())", 'trusted publi
 assertIncludes(crmReferenceRoute, 'resolveCrmReferenceRoute', 'legacy CRM reference alias and pipeline resolution')
 assertIncludes(crmReferenceRoute, 'resolved.pipelineId', 'CRM reference inferred owning pipeline handoff')
 assertIncludes(crmReferenceRoute, "destination.searchParams.set('pipeline', pipelineId)", 'CRM reference owning pipeline handoff')
+assertIncludes(crmReferenceRoute, "crmAction', 'compose-email'", 'CRM email action deep link')
+
+const crmBoardProjection = read('app_src/lib/crm/boardProjection.ts')
+assertIncludes(crmBoardProjection, 'updateCrmDescriptionWithClient', 'transactional CRM card description write-through')
+assertIncludes(crmBoardProjection, 'expectedDescriptionHash', 'CRM card optimistic concurrency')
+assertIncludes(crmBoardProjection, 'FOR UPDATE OF card, task', 'CRM card write lock')
+assertIncludes(crmBoardProjection, "binding.board_id, 'crm-projection'", 'CRM card durable source identity')
+assertIncludes(crmBoardProjection, 'WITH RECURSIVE visible_organizations', 'CRM board account-subtree scope')
+assertIncludes(crmBoardProjection, 'DELETE FROM tasks', 'stale CRM projection removal')
+
+const organizationsAdapter = read('app_src/lib/organizations.ts')
+assertIncludes(organizationsAdapter, 'resolveInvitationWorkspaceOrganization', 'invitation membership resolver')
+assertIncludes(organizationsAdapter, 'outside your managed account graph', 'invitation organization subtree boundary')
+assertIncludes(organizationsAdapter, 'WHERE organization.id = $1::uuid', 'organization hierarchy scoped root')
+assertIncludes(organizationsAdapter, 'defines your admin scope', 'organization reparenting scope boundary')
+assertIncludes(organizationsAdapter, "relationship_type = 'workspace_member'", 'CRM customer account promotion')
+assertIncludes(organizationsAdapter, 'retireUnusedWorkspaceOrganization', 'failed child organization cleanup')
 
 const shortLinks = read('app_src/lib/shortlinks.ts')
 assertIncludes(shortLinks, 'normalizeSlug(input.slug, { allowCrmReference: true })', 'public CRM short-link resolution')
-assertIncludes(shortLinks, '!options.allowCrmReference && CRM_REFERENCE_SLUG_PATTERN.test(slug)', 'creation-only CRM slug reservation')
+assertIncludes(shortLinks, '!options.allowCrmReference && (CRM_REFERENCE_SLUG_PATTERN.test(slug) || CRM_ACTION_SLUG_PATTERN.test(slug))', 'creation-only CRM slug reservation')
 
 const zonedDateTime = read('app_src/lib/zonedDateTime.ts')
 assertIncludes(zonedDateTime, 'export function zonedDateTimeToIso', 'timezone-aware CRM meeting conversion')
@@ -491,6 +594,9 @@ assertIncludes(suiteCrmClient, "hostname.endsWith('.railway.internal')", 'privat
 assertIncludes(suiteCrmClient, '/relationships/${linkFieldName}', 'SuiteCRM subpanel relationship endpoint')
 assertIncludes(suiteCrmClient, 'alreadyLinked', 'idempotent SuiteCRM relationship creation')
 assertIncludes(suiteCrmClient, "'filter[date_modified][gte]'", 'incremental SuiteCRM meeting polling')
+assertIncludes(suiteCrmClient, 'listSuiteCrmAccountContactRecordsUpdatedSince', 'incremental SuiteCRM account/contact polling')
+assertIncludes(suiteCrmClient, "'Accounts' | 'Contacts'", 'bounded SuiteCRM account/contact modules')
+assertIncludes(suiteCrmClient, 'type !== moduleName && type !== recordType', 'SuiteCRM singular JSON API record types')
 
 const suiteCrmGlobalIdBootstrap = read('services/suitecrm/bootstrap-global-id.php')
 assertIncludes(suiteCrmGlobalIdBootstrap, "const CLAWPILOT_GLOBAL_ID_FIELD = 'global_id_c'", 'native SuiteCRM Global ID field')
@@ -815,6 +921,7 @@ assertIncludes(healthRoute, '0017_short_link_destination_hardening.sql', 'hosted
 assertIncludes(healthRoute, '0020_crm_gateway_and_reporting.sql', 'hosted CRM gateway migration health')
 assertIncludes(healthRoute, '0021_crm_identity_and_organization_hierarchy.sql', 'hosted CRM identity hierarchy migration health')
 assertIncludes(healthRoute, '0022_pipeline_sheet_access_links.sql', 'hosted pipeline Sheet access-link migration health')
+assertIncludes(healthRoute, '0033_crm_board_projection_and_legacy_alias_cleanup.sql', 'hosted CRM board projection migration health')
 assertIncludes(healthRoute, 'readSuiteCrmWorkerHeartbeat', 'hosted SuiteCRM worker health')
 assertIncludes(healthRoute, 'migration_checksums_present', 'hosted migration checksum health')
 assertIncludes(healthRoute, 'queryAgentCredentials', 'shared agent credential store health')
@@ -840,6 +947,9 @@ assert.ok(!tasksRoute.includes('buildGovernanceAdvisory'), 'task route must not 
 assertIncludes(tasksRoute, 'TASK_NOT_ACTIONABLE', 'explicit active-task validation')
 assertIncludes(tasksRoute, 'prepareAgentDispatch', 'task agent dispatch enqueue')
 assertIncludes(tasksRoute, '_agentDispatchState', 'worker-owned dispatch state updates')
+assertIncludes(tasksRoute, 'CRM cards are created from CRM accounts and contacts', 'managed CRM board creation guard')
+assertIncludes(tasksRoute, 'resolvePipelineSpaceAccess', 'CRM board and pipeline access intersection')
+assertIncludes(tasksRoute, 'CrmDescriptionConflictError', 'stale CRM card update rejection')
 
 const assignmentsRoute = read('app_src/app/api/agents/assignments/route.ts')
 assertIncludes(assignmentsRoute, 'prepareAgentDispatch', 'assignment agent dispatch enqueue')
