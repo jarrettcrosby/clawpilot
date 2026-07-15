@@ -1,6 +1,7 @@
 import crypto from 'crypto'
 import type { PoolClient } from 'pg'
 import type { Task } from '@/lib/types'
+import { isCrmBoardCard, normalizeCrmBoardCard } from '@/lib/crm/boardCard.mjs'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import { query, withTransaction } from '@/lib/persistence/postgres'
 import { insertAgentDispatchOutbox, type AgentDispatchEnqueueInput } from '@/lib/persistence/agentDispatch'
@@ -12,6 +13,7 @@ type TaskRow = {
 
 type TaskStoreScope = {
   boardId: string
+  includeCrmCards?: boolean
   agentDispatches?: AgentDispatchEnqueueInput[]
 }
 
@@ -39,7 +41,19 @@ export async function readTasksFromPostgres(scope: TaskStoreScope): Promise<Task
     'SELECT payload, board_id::text FROM tasks WHERE board_id = $1::uuid ORDER BY updated_at DESC, created_at DESC, id ASC',
     [scope.boardId],
   )
-  return result.rows.map((row) => ({ ...row.payload, boardId: row.board_id }))
+  const tasks = result.rows.map((row) => ({ ...row.payload, boardId: row.board_id }))
+  if (!scope.includeCrmCards) return tasks
+  const cards = await query<TaskRow>(
+    `SELECT payload, board_id::text
+     FROM crm_board_cards
+     WHERE board_id = $1::uuid
+     ORDER BY updated_at DESC, created_at DESC, card_id ASC`,
+    [scope.boardId],
+  )
+  return [
+    ...tasks,
+    ...cards.rows.map((row) => normalizeCrmBoardCard({ ...row.payload, boardId: row.board_id }) as Task),
+  ]
 }
 
 export async function upsertTaskWithClient(
@@ -105,10 +119,22 @@ export async function upsertTaskWithClient(
 
 export async function replaceTasksInPostgres(tasks: Task[], scope: TaskStoreScope): Promise<void> {
   await withTransaction(async (client) => {
-    const ids = tasks.map((task) => String(task.id))
+    const appTasks = tasks.filter((task) => !isCrmBoardCard(task))
+    const crmCards = tasks.filter((task) => isCrmBoardCard(task))
+    const ids = appTasks.map((task) => String(task.id))
 
-    for (const task of tasks) {
+    for (const task of appTasks) {
       await upsertTaskWithClient(client, task, scope.boardId)
+    }
+
+    for (const task of crmCards) {
+      const result = await client.query(
+        `UPDATE crm_board_cards
+         SET payload = $3::jsonb, updated_at = now()
+         WHERE board_id = $1::uuid AND card_id = $2`,
+        [scope.boardId, String(task.id), JSON.stringify(normalizeCrmBoardCard(task))],
+      )
+      if (result.rowCount !== 1) throw new Error(`CRM board card was not found: ${task.id}`)
     }
 
     if (ids.length > 0) {
@@ -128,7 +154,7 @@ export async function replaceTasksInPostgres(tasks: Task[], scope: TaskStoreScop
          AND (task.source <> 'crm-projection' OR task.id = ANY($2::text[]))`,
       [scope.boardId, ids],
     )
-    const assignments = tasks
+    const assignments = appTasks
       .filter((task) => task.assignedAgent && !task.archived && !task.deletedAt)
       .map((task) => ({
         taskId: String(task.id),

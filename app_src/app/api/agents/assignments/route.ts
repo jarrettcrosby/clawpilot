@@ -4,6 +4,7 @@ import path from 'path'
 import type { Task } from '@/lib/types'
 import { normalizeProductAgentId } from '@/lib/agents/routing'
 import { assignmentKickoffText, prepareAgentDispatch } from '@/lib/agents/dispatch'
+import { isCrmBoardCard } from '@/lib/crm/boardCard.mjs'
 import { withFileLock } from '@/lib/fileLock'
 import { applyCanonicalWorkItem, canonicalizeTasks } from '@/lib/workItemModel'
 import { shouldFallbackToFileOnDatabaseError } from '@/lib/persistence/config'
@@ -43,6 +44,7 @@ function isTestingRecord(task: Task): boolean {
 
 function projectAssignmentsFromTasks(tasks: Task[]): Assignment[] {
   return tasks
+    .filter((task) => !isCrmBoardCard(task))
     .filter((task) => Boolean(task?.assignedAgent))
     .filter((task) => !task?.archived && !task?.deletedAt)
     .filter((task) => !isTestingRecord(task))
@@ -162,6 +164,9 @@ export async function PUT(req: NextRequest) {
   }
 
   const previous = tasks[idx]
+  if (isCrmBoardCard(previous)) {
+    return NextResponse.json({ ok: false, error: 'CRM board cards cannot be assigned to agents' }, { status: 409 })
+  }
   let updated: Task = {
     ...previous,
     assignedAgent: agentId || undefined,

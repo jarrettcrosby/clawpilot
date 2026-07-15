@@ -437,6 +437,17 @@ for (const contract of [
   assertIncludes(suiteCrmInboundSyncMigration, contract, 'SuiteCRM inbound sync status migration')
 }
 
+const crmDisplayTextMigration = read('db/migrations/0036_crm_display_text_and_card_semantics.sql')
+for (const contract of [
+  'decode_clawpilot_display_text',
+  "WHERE source = 'crm-projection'",
+  "'category', 'crm'",
+  'DELETE FROM agent_assignments',
+  'DELETE FROM tasks',
+]) {
+  assertIncludes(crmDisplayTextMigration, contract, 'CRM display text and card semantics migration')
+}
+
 const crmWorkbookOrganizationProjection = read('app_src/lib/crm/workbookProjection.ts')
 assertIncludes(crmWorkbookOrganizationProjection, 'record.organizationName, record.agentName', 'interaction workbook organization projection')
 assertIncludes(pipelineProvisioning, "Interactions: ['Priority', 'Interaction', 'Owner', 'Organization'", 'interaction workbook organization header')
@@ -580,10 +591,10 @@ assertIncludes(crmReferenceRoute, "crmAction', 'compose-email'", 'CRM email acti
 const crmBoardProjection = read('app_src/lib/crm/boardProjection.ts')
 assertIncludes(crmBoardProjection, 'updateCrmDescriptionWithClient', 'transactional CRM card description write-through')
 assertIncludes(crmBoardProjection, 'expectedDescriptionHash', 'CRM card optimistic concurrency')
-assertIncludes(crmBoardProjection, 'FOR UPDATE OF card, task', 'CRM card write lock')
-assertIncludes(crmBoardProjection, "binding.board_id, 'crm-projection'", 'CRM card durable source identity')
+assertIncludes(crmBoardProjection, 'FOR UPDATE OF card', 'CRM card write lock')
+assertIncludes(crmBoardProjection, 'card.payload', 'CRM card dedicated payload storage')
 assertIncludes(crmBoardProjection, 'WITH RECURSIVE visible_organizations', 'CRM board account-subtree scope')
-assertIncludes(crmBoardProjection, 'DELETE FROM tasks', 'stale CRM projection removal')
+assertIncludes(crmBoardProjection, 'DELETE FROM crm_board_cards', 'stale CRM projection removal')
 
 const organizationsAdapter = read('app_src/lib/organizations.ts')
 assertIncludes(organizationsAdapter, 'resolveInvitationWorkspaceOrganization', 'invitation membership resolver')
@@ -944,6 +955,7 @@ assertIncludes(healthRoute, '0021_crm_identity_and_organization_hierarchy.sql', 
 assertIncludes(healthRoute, '0022_pipeline_sheet_access_links.sql', 'hosted pipeline Sheet access-link migration health')
 assertIncludes(healthRoute, '0033_crm_board_projection_and_legacy_alias_cleanup.sql', 'hosted CRM board projection migration health')
 assertIncludes(healthRoute, '0035_suitecrm_inbound_sync_status.sql', 'hosted SuiteCRM inbound sync migration health')
+assertIncludes(healthRoute, '0036_crm_display_text_and_card_semantics.sql', 'hosted CRM display text migration health')
 assertIncludes(healthRoute, 'readSuiteCrmWorkerHeartbeat', 'hosted SuiteCRM worker health')
 assertIncludes(healthRoute, 'migration_checksums_present', 'hosted migration checksum health')
 assertIncludes(healthRoute, 'queryAgentCredentials', 'shared agent credential store health')

@@ -289,11 +289,7 @@ export async function ensureDefaultResourcesForUser(emailValue: unknown): Promis
     )
     if (previousBinding.rows[0] && previousBinding.rows[0].pipeline_id !== crmPipeline.rows[0].id) {
       await client.query(
-        `DELETE FROM tasks task
-         USING crm_board_cards card
-         WHERE card.board_id = $1::uuid
-           AND card.task_id = task.id
-           AND task.source = 'crm-projection'`,
+        'DELETE FROM crm_board_cards WHERE board_id = $1::uuid',
         [crmBoard.rows[0].id],
       )
     }

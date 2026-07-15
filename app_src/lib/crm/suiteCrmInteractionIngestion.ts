@@ -2,6 +2,7 @@ import {
   listSuiteCrmNotesUpdatedSince,
   type SuiteCrmNoteSnapshot,
 } from '@/lib/crm/suiteCrmClient'
+import { decodeHtmlEntities } from '@/lib/htmlEntities.mjs'
 import {
   stageCrmRecordInPostgres,
   type StageInteractionInput,
@@ -127,7 +128,7 @@ function hasAttribute(attributes: Record<string, unknown>, key: string): boolean
 }
 
 function cleanString(value: unknown, maxLength: number, label: string): string {
-  const normalized = String(value ?? '')
+  const normalized = decodeHtmlEntities(value)
     .replace(/[\u0000-\u001f\u007f]+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim()
@@ -138,7 +139,7 @@ function cleanString(value: unknown, maxLength: number, label: string): string {
 }
 
 function cleanMultiline(value: unknown, maxLength: number, label: string): string {
-  const normalized = String(value ?? '').replace(/\u0000/g, '').replace(/\r\n?/g, '\n').trim()
+  const normalized = decodeHtmlEntities(value).replace(/\u0000/g, '').replace(/\r\n?/g, '\n').trim()
   if (normalized.length > maxLength || /[\u0001-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(normalized)) {
     throw new SafeSuiteCrmInteractionIngestionError(`SuiteCRM ${label} is invalid`)
   }
