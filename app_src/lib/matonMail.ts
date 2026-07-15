@@ -1,9 +1,11 @@
 import crypto from 'crypto'
-import { matonFetch } from '@/lib/maton'
+import { matonPlatformMailFetch } from '@/lib/maton'
 import { appPublicUrl } from '@/lib/publicUrl'
 import { isHostedRuntime } from '@/lib/persistence/config'
 
 const GMAIL_SEND_PATH = '/google-mail/gmail/v1/users/me/messages/send'
+const SENDER_VERIFICATION_TTL_MS = 5 * 60 * 1000
+let verifiedSender: { email: string; expiresAt: number } | null = null
 export type SendAuthMagicCodeEmailInput = {
   to: string
   code: string
@@ -88,8 +90,9 @@ function buildMessage(input: { to: string; subject: string; text: string; html: 
 
 async function sendMessage(input: { to: string; subject: string; text: string; html: string }) {
   const to = assertEmail(input.to)
+  await verifyPlatformSender()
   const raw = base64Url(buildMessage({ ...input, to }))
-  const response = await matonFetch(GMAIL_SEND_PATH, {
+  const response = await matonPlatformMailFetch(GMAIL_SEND_PATH, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -103,6 +106,27 @@ async function sendMessage(input: { to: string; subject: string; text: string; h
     message?: { id?: unknown }
   }
   return { messageId: String(data.id || data.message?.id || '').trim() || null }
+}
+
+async function verifyPlatformSender() {
+  const sender = mailFromAddress()
+  if (verifiedSender?.email === sender && verifiedSender.expiresAt > Date.now()) return
+  const response = await matonPlatformMailFetch(
+    `/google-mail/gmail/v1/users/me/settings/sendAs/${encodeURIComponent(sender)}`,
+    { headers: { Accept: 'application/json' } },
+  )
+  if (!response.ok) throw new Error('ClawPilot mail sender is not available')
+  const data = await response.json().catch(() => ({})) as {
+    sendAsEmail?: unknown
+    verificationStatus?: unknown
+  }
+  if (
+    String(data.sendAsEmail || '').trim().toLowerCase() !== sender
+    || String(data.verificationStatus || '').trim().toLowerCase() !== 'accepted'
+  ) {
+    throw new Error('ClawPilot mail sender is not verified')
+  }
+  verifiedSender = { email: sender, expiresAt: Date.now() + SENDER_VERIFICATION_TTL_MS }
 }
 
 function authMagicCodeContent(to: string, code: string) {

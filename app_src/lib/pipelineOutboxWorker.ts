@@ -3,6 +3,7 @@ import { resolveManagedGoogleWorkspaceRuntime } from '@/lib/integrations/googleW
 import { googleSheetsJson, type GoogleWorkspaceRuntime } from '@/lib/integrations/googleWorkspaceClient'
 import { matonFetch } from '@/lib/maton'
 import { projectCrmWorkbook } from '@/lib/crm/workbookProjection'
+import { syncPipelineOwnerProfileToCrm } from '@/lib/persistence/crm'
 import {
   provisionPipelineGoogleResources,
   reconcilePipelineGooglePermissions,
@@ -213,7 +214,22 @@ export async function processPipelineSyncOutbox(input: {
 
   for (const item of items) {
     try {
-      if (item.operation === 'provision_pipeline') {
+      if (item.operation === 'sync_pipeline_owner_profile_v1') {
+        const pipelineId = workspacePipelineId(item)
+        item.pipelineId = pipelineId
+        await syncPipelineOwnerProfileToCrm(pipelineId)
+        await completePipelineSyncOutboxInPostgres(item)
+        results.push({ id: item.id, operation: item.operation, status: 'succeeded' })
+        continue
+      }
+      if (
+        item.operation === 'provision_pipeline'
+        || item.operation === 'reconcile_pipeline_hierarchy_v2'
+        || item.operation === 'reconcile_pipeline_hierarchy_v3'
+        || item.operation === 'reconcile_pipeline_hierarchy_v4'
+        || item.operation === 'reconcile_pipeline_hierarchy_v5'
+        || item.operation === 'reconcile_pipeline_hierarchy_v6'
+      ) {
         const pipelineId = workspacePipelineId(item)
         item.pipelineId = pipelineId
         await provisionPipelineGoogleResources(pipelineId)
@@ -243,6 +259,11 @@ export async function processPipelineSyncOutbox(input: {
       results.push({ id: item.id, operation: item.operation, status: 'succeeded' })
     } catch (error) {
       const managedWorkspaceOperation = item.operation === 'provision_pipeline'
+        || item.operation === 'reconcile_pipeline_hierarchy_v2'
+        || item.operation === 'reconcile_pipeline_hierarchy_v3'
+        || item.operation === 'reconcile_pipeline_hierarchy_v4'
+        || item.operation === 'reconcile_pipeline_hierarchy_v5'
+        || item.operation === 'reconcile_pipeline_hierarchy_v6'
         || item.operation === 'sync_pipeline_permissions'
       const status = await failPipelineSyncOutboxInPostgres({
         item,

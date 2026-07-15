@@ -48,6 +48,8 @@ assertIncludes(usersAdapter, 'canInviteUsers', 'app users adapter')
 assertIncludes(usersAdapter, "current?.status === 'disabled'", 'disabled user restore authorization')
 assertIncludes(usersAdapter, 'Restore the disabled user before sending a new invitation', 'disabled user invitation boundary')
 assertIncludes(usersAdapter, 'updateAppUserProfile', 'app users adapter')
+assertIncludes(usersAdapter, "UPDATE workspace_organizations", 'atomic profile organization update')
+assertIncludes(usersAdapter, "'pipeline:' || pipeline.id::text || ':provision'", 'profile Drive reconciliation enqueue')
 assertIncludes(usersAdapter, 'updateAppUserAccess', 'app users adapter')
 assertIncludes(usersAdapter, 'AppUserAuthorizationError', 'app user authorization errors')
 assertIncludes(usersAdapter, 'AppUserNotFoundError', 'app user not-found errors')
@@ -204,6 +206,9 @@ assertIncludes(shortLinksAdapter, 'SHORTLINK_SERVICE_CLIENTS_JSON', 'source-boun
 assertIncludes(shortLinksAdapter, "url.protocol !== 'https:'", 'short-link destination transport security')
 assertIncludes(shortLinksAdapter, 'FOR UPDATE', 'atomic short-link click limits')
 assertIncludes(shortLinksAdapter, 'NOT $4::boolean OR source_app = $5', 'service source isolation')
+assertIncludes(shortLinksAdapter, 'organization_root_id = $10::uuid', 'organization-scoped short-link visibility')
+assertIncludes(shortLinksAdapter, '$2::boolean OR NOT $8::boolean', 'same-organization interactive link visibility')
+assertIncludes(shortLinksAdapter, 'workspaceOrganizationRootId', 'short-link tenant root resolution')
 
 const tenancyAdapter = read('app_src/lib/tenancy.ts')
 assertIncludes(tenancyAdapter, 'ensureDefaultResourcesForUser', 'tenancy adapter')
@@ -250,8 +255,13 @@ assertIncludes(pipelineAdapter, 'google_shared_drive_id = COALESCE', 'immutable 
 assertIncludes(pipelineAdapter, 'Pipeline Google Workspace binding cannot be changed', 'managed binding immutability')
 assertIncludes(pipelineAdapter, 'FROM google_workspace_integration', 'queue-time platform integration validation')
 assertIncludes(pipelineAdapter, 'FOR SHARE', 'queue-time credential and binding serialization')
-assertIncludes(pipelineAdapter, "target_system IN ('google_sheets', 'google_workspace')", 'managed workspace outbox claims')
+assertIncludes(
+  pipelineAdapter,
+  "target_system IN ('google_sheets', 'google_workspace', 'google_workspace_v2', 'google_workspace_v3', 'google_workspace_v4', 'google_workspace_v5', 'google_workspace_v6', 'pipeline_internal_v1')",
+  'managed workspace outbox claims',
+)
 assertIncludes(pipelineAdapter, 'resolvePipelineSheetBindingInPostgres', 'validated pipeline Sheet binding resolver')
+assertIncludes(pipelineAdapter, "item.operation === 'reconcile_pipeline_hierarchy_v6'", 'superseded Drive cleanup finalization')
 assertIncludes(pipelineAdapter, 'pipeline.owner_email !== configuredOwner', 'configured-owner legacy fallback boundary')
 assertIncludes(pipelineAdapter, 'AND sheet_id = $2', 'pipeline and Sheet pair isolation')
 
@@ -276,6 +286,10 @@ assertIncludes(pipelineProvisioning, 'reconcilePipelineGooglePermissions', 'mana
 assertIncludes(pipelineProvisioning, 'nextPageToken,permissions', 'permission pagination')
 assertIncludes(pipelineProvisioning, "['anyone', 'domain', 'group']", 'direct broad permission rejection')
 assertIncludes(pipelineProvisioning, 'permissionIsInherited', 'Shared Drive governing permission preservation')
+assertIncludes(pipelineProvisioning, "`hierarchy:${managedEnvironmentName()}`", 'serialized Drive hierarchy reconciliation')
+assertIncludes(pipelineProvisioning, 'workspaceOrganizationId: identity.workspaceOrganizationId', 'canonical Drive organization identity')
+assertIncludes(pipelineProvisioning, 'appUserReferenceCode: identity.contactReferenceCode', 'canonical Drive contact identity')
+assertIncludes(pipelineProvisioning, 'GOOGLE_PIPELINE_FOLDER_MOVE_UNVERIFIED', 'verified Drive folder moves')
 
 const legacyPipelineWorkbook = read('app_src/lib/pipelineLegacyWorkbook.ts')
 assertIncludes(legacyPipelineWorkbook, 'configurePipelineTabsWithRequest', 'legacy Maton workbook layout parity')
@@ -295,15 +309,94 @@ assertIncludes(crmAdapter, "'upsert_record', 'suitecrm'", 'SuiteCRM outbox targe
 assertIncludes(crmAdapter, "operation IN ('upsert_record', 'delete_record')", 'SuiteCRM deletion outbox claims')
 assertIncludes(crmAdapter, 'ensurePipelineCrmHierarchy', 'workspace organization CRM hierarchy')
 assertIncludes(crmAdapter, 'ON CONFLICT (pipeline_id, identity_key)', 'natural CRM identity upserts')
-assertIncludes(crmAdapter, "$23, $24::jsonb, $25,\n        'pending', NULL, $26, $26", 'CRM contact insert bindings')
+assertIncludes(crmAdapter, "$23, $24, $25::jsonb, $26,\n        'pending', NULL, $27, $27", 'CRM contact insert bindings')
 assert.ok(
-  !crmAdapter.includes("$24, $25::jsonb, $26,\n        'pending', NULL, $27, $27"),
+  !crmAdapter.includes("$24, $25, $26::jsonb, $27,\n        'pending', NULL, $28, $28"),
   'CRM contact insert must not provide more expressions than target columns',
 )
 assertIncludes(crmAdapter, 'FOR UPDATE SKIP LOCKED', 'SuiteCRM leased outbox claims')
 assertIncludes(crmAdapter, 'pipeline_id = $1::uuid', 'pipeline-scoped CRM reads')
 assertIncludes(crmAdapter, 'readCrmWorkbookProjectionReadiness', 'reconciliation-gated CRM workbook projection')
 assertIncludes(crmAdapter, "importStatus === 'succeeded'", 'successful source reconciliation projection gate')
+assertIncludes(crmAdapter, 'syncAppUserProfileToOwnedPipelines', 'all owned pipeline profile projection')
+assertIncludes(crmAdapter, 'syncPipelineOwnerProfileToCrm', 'pipeline owner profile backfill projection')
+assertIncludes(crmAdapter, 'CRM profile synchronization requires an owned pipeline', 'profile projection ownership boundary')
+assertIncludes(crmAdapter, 'appUserReferenceCode: user.referenceCode', 'canonical app-user CRM contact identity')
+
+const crmModulesMigration = read('db/migrations/0023_crm_modules_references_and_integrations.sql')
+assertIncludes(crmModulesMigration, 'workspace_organizations_reference_code_unique', 'canonical workspace organization reference')
+assertIncludes(crmModulesMigration, 'app_users_reference_code_unique', 'canonical app user reference')
+assertIncludes(crmModulesMigration, 'UNIQUE (pipeline_id, reference_code)', 'pipeline projection reference uniqueness')
+assertIncludes(crmModulesMigration, 'idx_crm_contacts_pipeline_app_user', 'one user contact projection per pipeline')
+for (const table of [
+  'crm_leads',
+  'crm_meetings',
+  'crm_campaigns',
+  'crm_integration_actions',
+  'crm_integration_action_attempts',
+  'crm_inbound_messages',
+  'crm_inbound_message_links',
+]) {
+  assertIncludes(crmModulesMigration, `CREATE TABLE IF NOT EXISTS ${table}`, 'CRM module and integration migration')
+}
+
+const driveHierarchyMigration = read('db/migrations/0024_versioned_drive_hierarchy_reconciliation.sql')
+assertIncludes(driveHierarchyMigration, "'reconcile_pipeline_hierarchy_v2'", 'versioned Drive hierarchy operation')
+assertIncludes(driveHierarchyMigration, "'google_workspace_v2'", 'versioned Drive hierarchy worker target')
+assertIncludes(driveHierarchyMigration, "'layoutVersion', 2", 'versioned Drive hierarchy payload')
+
+const profileProjectionMigration = read('db/migrations/0025_profile_crm_projection_backfill.sql')
+assertIncludes(profileProjectionMigration, "'sync_pipeline_owner_profile_v1'", 'owner profile projection operation')
+assertIncludes(profileProjectionMigration, "'pipeline_internal_v1'", 'versioned internal pipeline target')
+assertIncludes(profileProjectionMigration, "owner.status = 'active'", 'active owner profile projection boundary')
+
+const driveCleanupMigration = read('db/migrations/0026_legacy_drive_hierarchy_cleanup.sql')
+assertIncludes(driveCleanupMigration, "'reconcile_pipeline_hierarchy_v3'", 'legacy Drive cleanup operation')
+assertIncludes(driveCleanupMigration, "'google_workspace_v3'", 'legacy Drive cleanup worker target')
+assertIncludes(driveCleanupMigration, "'layoutVersion', 3", 'legacy Drive cleanup payload')
+
+const verifiedDriveCleanupMigration = read('db/migrations/0027_verified_legacy_drive_cleanup.sql')
+assertIncludes(verifiedDriveCleanupMigration, "'reconcile_pipeline_hierarchy_v4'", 'verified Drive cleanup operation')
+assertIncludes(verifiedDriveCleanupMigration, "'google_workspace_v4'", 'verified Drive cleanup worker target')
+assertIncludes(verifiedDriveCleanupMigration, "'layoutVersion', 4", 'verified Drive cleanup payload')
+
+const eventualDriveCleanupMigration = read('db/migrations/0028_eventual_drive_cleanup_reconciliation.sql')
+assertIncludes(eventualDriveCleanupMigration, "'reconcile_pipeline_hierarchy_v5'", 'eventual Drive cleanup operation')
+assertIncludes(eventualDriveCleanupMigration, "'google_workspace_v5'", 'eventual Drive cleanup worker target')
+assertIncludes(eventualDriveCleanupMigration, "'layoutVersion', 5", 'eventual Drive cleanup payload')
+
+const verifiedDriveTrashMigration = read('db/migrations/0029_verified_drive_trash_reconciliation.sql')
+assertIncludes(verifiedDriveTrashMigration, "'reconcile_pipeline_hierarchy_v6'", 'verified Drive trash operation')
+assertIncludes(verifiedDriveTrashMigration, "'google_workspace_v6'", 'verified Drive trash worker target')
+assertIncludes(verifiedDriveTrashMigration, "'layoutVersion', 6", 'verified Drive trash payload')
+assertIncludes(verifiedDriveTrashMigration, "status = 'succeeded'", 'superseded Drive cleanup terminal state')
+
+const crmIntegrationActions = read('app_src/lib/crm/integrationActions.ts')
+for (const action of ['send_email', 'create_calendar_event', 'log_call', 'send_campaign']) {
+  assertIncludes(crmIntegrationActions, `'${action}'`, 'CRM integration action')
+}
+assertIncludes(crmIntegrationActions, 'FOR UPDATE SKIP LOCKED', 'leased CRM integration actions')
+assertIncludes(crmIntegrationActions, 'appendTextReplyMarker', 'outbound CRM reply marker')
+assertIncludes(crmIntegrationActions, 'appendHtmlReplyMarker', 'outbound CRM HTML reply marker')
+assertIncludes(crmIntegrationActions, '`%gslt${normalizeReference(referenceCode)}`', 'exact outbound CRM marker syntax')
+assertIncludes(crmIntegrationActions, 'crm_campaign_recipients', 'campaign recipient deduplication')
+
+const crmEmailIngestion = read('app_src/lib/crm/emailIngestion.ts')
+assertIncludes(crmEmailIngestion, 'export function truncateEmailImportContent', 'email import boundary')
+assertIncludes(crmEmailIngestion, 'content.search(/%xx/i)', 'case-insensitive email import boundary')
+assertIncludes(crmEmailIngestion, '/%gslt(g[aciklmo][0-9]{7})(?![A-Za-z0-9_])/gi', 'exact inbound CRM marker syntax')
+assertIncludes(crmEmailIngestion, 'if (seen.has(reference)) continue', 'quoted-thread marker deduplication')
+assertIncludes(crmEmailIngestion, 'ON CONFLICT (owner_email, external_message_id) DO NOTHING', 'Gmail message deduplication')
+assertIncludes(crmEmailIngestion, 'ownedPipelines', 'cross-owned-pipeline marker resolution')
+assertIncludes(crmEmailIngestion, 'pipelineId: input.target.pipelineId', 'matched-pipeline interaction staging')
+
+const crmIntegrationWorkerRoute = read('app_src/app/api/crm/integrations/process/route.ts')
+assertIncludes(crmIntegrationWorkerRoute, 'processDueCrmIntegrationActions', 'CRM action retry worker')
+assertIncludes(crmIntegrationWorkerRoute, 'processInboundGmailIngestion', 'inbound Gmail worker')
+
+const crmActionsRoute = read('app_src/app/api/crm/actions/route.ts')
+assertIncludes(crmActionsRoute, 'requireResourceEditor', 'CRM action editor authorization')
+assertIncludes(crmActionsRoute, 'idempotency-key', 'CRM action idempotency header')
 
 const suiteCrmClient = read('app_src/lib/crm/suiteCrmClient.ts')
 assertIncludes(suiteCrmClient, '/Api/access_token', 'SuiteCRM OAuth client credentials')
@@ -374,9 +467,15 @@ assertIncludes(outboxWorker, "item.operation === 'update_opportunity'", 'pipelin
 assertIncludes(outboxWorker, "item.operation === 'append_interaction'", 'pipeline outbox worker')
 assertIncludes(outboxWorker, "item.operation === 'replace_dropdowns'", 'pipeline outbox worker')
 assertIncludes(outboxWorker, "item.operation === 'project_crm_workbook'", 'CRM projection worker dispatch')
+assertIncludes(outboxWorker, "item.operation === 'sync_pipeline_owner_profile_v1'", 'owner profile projection worker dispatch')
 assertIncludes(outboxWorker, 'Opportunity Sheet row changed', 'pipeline outbox worker optimistic check')
 assertIncludes(outboxWorker, '[ClawPilot sync:', 'pipeline outbox worker append idempotency')
 assertIncludes(outboxWorker, "item.operation === 'provision_pipeline'", 'pipeline provisioning worker dispatch')
+assertIncludes(outboxWorker, "item.operation === 'reconcile_pipeline_hierarchy_v2'", 'versioned Drive hierarchy worker dispatch')
+assertIncludes(outboxWorker, "item.operation === 'reconcile_pipeline_hierarchy_v3'", 'legacy Drive cleanup worker dispatch')
+assertIncludes(outboxWorker, "item.operation === 'reconcile_pipeline_hierarchy_v4'", 'verified Drive cleanup worker dispatch')
+assertIncludes(outboxWorker, "item.operation === 'reconcile_pipeline_hierarchy_v5'", 'eventual Drive cleanup worker dispatch')
+assertIncludes(outboxWorker, "item.operation === 'reconcile_pipeline_hierarchy_v6'", 'verified Drive trash worker dispatch')
 assertIncludes(outboxWorker, "item.operation === 'sync_pipeline_permissions'", 'pipeline permission worker dispatch')
 assertIncludes(outboxWorker, 'resolveManagedGoogleWorkspaceRuntime', 'bound managed pipeline runtime resolution')
 assertIncludes(outboxWorker, 'googleSheetsJson', 'bound managed pipeline Sheet writes')
@@ -406,6 +505,16 @@ for (const optionalField of [
 assertIncludes(googleWorkspaceCrypto, 'aes-256-gcm', 'Google Workspace secret encryption')
 assertIncludes(googleWorkspaceCrypto, 'clawpilot:google-workspace:platform:', 'stable Google Workspace encryption AAD')
 assertIncludes(googleWorkspaceCrypto, 'Unsupported service-account field:', 'unknown service-account field rejection')
+
+assertIncludes(pipelineProvisioning, 'cleanupLegacyOwnerHierarchy', 'legacy Drive hierarchy discovery cleanup')
+assertIncludes(pipelineProvisioning, "fileProperties('users-root'", 'environment-scoped legacy Drive cleanup')
+assertIncludes(pipelineProvisioning, 'fields: \'nextPageToken,files(id,parents)\'', 'verified Drive child response shape')
+assertIncludes(pipelineProvisioning, 'child.id === folderId', 'Drive folder self-reference rejection')
+assertIncludes(pipelineProvisioning, 'child.parents?.includes(folderId)', 'Drive child parent verification')
+assertIncludes(pipelineProvisioning, 'waitForDriveChildRemoval', 'eventual Drive cleanup verification')
+assertIncludes(pipelineProvisioning, 'trashLegacyDriveFolder', 'Shared Drive legacy folder trashing')
+assertIncludes(pipelineProvisioning, "body: { trashed: true }", 'verified Shared Drive trash state')
+assertIncludes(pipelineProvisioning, 'GOOGLE_DRIVE_TRASH_UNVERIFIED', 'retryable Drive trash verification error')
 
 const googleWorkspacePersistence = read('app_src/lib/persistence/googleWorkspace.ts')
 assertIncludes(googleWorkspacePersistence, 'expectedVersion', 'Google Workspace optimistic persistence')
@@ -590,6 +699,7 @@ assertIncludes(healthRoute, '0012_invitation_release_hardening.sql', 'hosted rel
 assertIncludes(healthRoute, '0013_invitation_delivery_coordination.sql', 'hosted invitation delivery migration health')
 assertIncludes(healthRoute, '0014_invitation_delivery_pending.sql', 'hosted invitation pending migration health')
 assertIncludes(healthRoute, '0015_short_links.sql', 'hosted short-links migration health')
+assertIncludes(healthRoute, '0023_crm_modules_references_and_integrations.sql', 'hosted CRM integrations migration health')
 assertIncludes(healthRoute, '0016_document_vectors_and_ai_radar.sql', 'hosted vector knowledge migration health')
 assertIncludes(healthRoute, '0016_z_short_link_destination_preflight.sql', 'hosted short-link preflight migration health')
 assertIncludes(healthRoute, '0017_short_link_destination_hardening.sql', 'hosted short-link hardening migration health')

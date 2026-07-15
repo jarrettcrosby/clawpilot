@@ -312,8 +312,17 @@ try {
   const matonCalls = []
   const mailModule = loadTypeScriptModule('app_src/lib/matonMail.ts', {
     '@/lib/maton': {
-      async matonFetch(pathname, init) {
+      async matonPlatformMailFetch(pathname, init) {
         matonCalls.push({ pathname, init })
+        if (pathname.includes('/settings/sendAs/')) {
+          return new Response(JSON.stringify({
+            sendAsEmail: 'stewards@eigenracing.com',
+            verificationStatus: 'accepted',
+          }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
         return new Response(JSON.stringify({ id: 'gmail-message-id' }), {
           status: 200,
           headers: { 'Content-Type': 'application/json' },
@@ -333,11 +342,12 @@ try {
   })
   assert.equal(mailResult.messageId, 'gmail-message-id')
   assert.ok(!Object.hasOwn(mailResult, 'code'))
-  assert.equal(matonCalls.length, 1)
-  assert.equal(matonCalls[0].pathname, '/google-mail/gmail/v1/users/me/messages/send')
-  assert.equal(matonCalls[0].init.method, 'POST')
-  assert.equal(matonCalls[0].init.headers['Maton-Connection'], undefined)
-  const mailPayload = JSON.parse(matonCalls[0].init.body)
+  assert.equal(matonCalls.length, 2)
+  assert.match(matonCalls[0].pathname, /\/settings\/sendAs\/stewards%40eigenracing\.com$/)
+  assert.equal(matonCalls[1].pathname, '/google-mail/gmail/v1/users/me/messages/send')
+  assert.equal(matonCalls[1].init.method, 'POST')
+  assert.equal(matonCalls[1].init.headers['Maton-Connection'], undefined)
+  const mailPayload = JSON.parse(matonCalls[1].init.body)
   const decodedMessage = decodeBase64Url(mailPayload.raw)
   assert.match(decodedMessage, /Content-Type: multipart\/alternative/)
   assert.match(decodedMessage, /Content-Type: text\/plain/)
@@ -354,8 +364,8 @@ try {
     welcomeUrl: 'https://aiapp.eigenracing.com/welcome#token=test-token',
     expiresAt: '2026-07-20T12:00:00.000Z',
   })
-  assert.equal(matonCalls.length, 2)
-  const invitationPayload = JSON.parse(matonCalls[1].init.body)
+  assert.equal(matonCalls.length, 3)
+  const invitationPayload = JSON.parse(matonCalls[2].init.body)
   const invitationMessage = decodeBase64Url(invitationPayload.raw)
   assert.match(invitationMessage, /Welcome to ClawPilot/)
   assert.match(invitationMessage, /Accept invitation/)

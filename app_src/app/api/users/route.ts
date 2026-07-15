@@ -1,8 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { disconnectChatGPT } from '@/lib/agents/chatgptAuth'
 import { createUserInvitation } from '@/lib/invitations'
-import { ensurePrimaryWorkspaceOrganization, updatePrimaryWorkspaceOrganization } from '@/lib/organizations'
+import { ensurePrimaryWorkspaceOrganization } from '@/lib/organizations'
 import { ensureDefaultResourcesForUser } from '@/lib/tenancy'
+import { syncAppUserProfileToOwnedPipelines } from '@/lib/persistence/crm'
 import { sessionEmail } from '@/lib/requestUser'
 import {
   AppUserAuthorizationError,
@@ -27,12 +28,13 @@ export async function GET(req: NextRequest) {
   if (!email) return NextResponse.json({ ok: false, error: 'Unauthorized' }, { status: 401 })
 
   try {
-    await ensurePrimaryWorkspaceOrganization(email)
+    const currentOrganization = await ensurePrimaryWorkspaceOrganization(email)
     await ensureDefaultResourcesForUser(email)
     const { actor, users } = await listAppUsers(email)
     return NextResponse.json({
       ok: true,
       currentUser: actor,
+      currentOrganization,
       isAdmin: actor.role === 'owner' || actor.role === 'admin',
       canInvite: canInviteUsers(actor),
       canManageUserAccess: canManageUserAccess(actor),
@@ -70,7 +72,8 @@ export async function PATCH(req: NextRequest) {
   try {
     const body = await req.json()
     if (body?.action === 'profile') {
-      await updatePrimaryWorkspaceOrganization({ actorEmail, name: body.organizationName })
+      await ensurePrimaryWorkspaceOrganization(actorEmail)
+      await ensureDefaultResourcesForUser(actorEmail)
       const user = await updateAppUserProfile({
         actorEmail,
         displayName: body.displayName,
@@ -79,7 +82,14 @@ export async function PATCH(req: NextRequest) {
         timezone: body.timezone,
         locale: body.locale,
       })
-      return NextResponse.json({ ok: true, user })
+      let crmProfiles: Awaited<ReturnType<typeof syncAppUserProfileToOwnedPipelines>> = []
+      let crmSync: 'synced' | 'queued' = 'synced'
+      try {
+        crmProfiles = await syncAppUserProfileToOwnedPipelines(user.email)
+      } catch {
+        crmSync = 'queued'
+      }
+      return NextResponse.json({ ok: true, user, crmProfiles, crmSync })
     }
     if (body?.action === 'access') {
       const user = await updateAppUserAccess({

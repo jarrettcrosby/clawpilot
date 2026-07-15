@@ -3,8 +3,11 @@ import type { CrmEntity, SuiteCrmOutboxRecord } from '@/lib/crm/types'
 const ENTITY_MODULE: Record<CrmEntity, string> = {
   organizations: 'Accounts',
   contacts: 'Contacts',
+  leads: 'Leads',
   opportunities: 'Opportunities',
+  meetings: 'Meetings',
   interactions: 'Notes',
+  campaigns: 'Campaigns',
 }
 
 type SuiteCrmToken = {

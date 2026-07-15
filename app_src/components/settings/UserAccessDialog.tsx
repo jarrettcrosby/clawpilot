@@ -64,6 +64,7 @@ type UserPermissions = {
 
 type AppUser = {
   email: string
+  referenceCode: string
   role: UserRole
   status: UserStatus
   displayName: string | null
@@ -83,6 +84,11 @@ type ApiPayload = {
 
 type UsersPayload = ApiPayload & {
   currentUser?: AppUser
+  currentOrganization?: {
+    id: string
+    referenceCode: string
+    name: string
+  }
   isAdmin?: boolean
   canInvite?: boolean
   canManageUserAccess?: boolean
@@ -195,7 +201,7 @@ const PERMISSIONS: Array<{ key: PermissionKey; label: string; adminOnly?: boolea
   { key: 'createPipelines', label: 'Create pipelines' },
   { key: 'viewFullReleaseHistory', label: 'View full release history', adminOnly: true },
   { key: 'manageBackups', label: 'Manage data checkpoints', adminOnly: true },
-  { key: 'manageLinks', label: 'Manage all short links', adminOnly: true },
+  { key: 'manageLinks', label: 'Manage organization short links', adminOnly: true },
 ]
 
 const panelSx = {
@@ -284,7 +290,9 @@ function safeProvisioningError(value: string | null | undefined) {
 
 export default function UserAccessDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
   const theme = useTheme()
-  const fullScreen = useMediaQuery(theme.breakpoints.down('sm'))
+  const narrowScreen = useMediaQuery(theme.breakpoints.down('sm'))
+  const shortViewport = useMediaQuery('(max-height: 500px)')
+  const fullScreen = narrowScreen || shortViewport
   const [activeTab, setActiveTab] = useState(0)
   const [usersPayload, setUsersPayload] = useState<UsersPayload | null>(null)
   const [workspacesPayload, setWorkspacesPayload] = useState<WorkspacesPayload | null>(null)
@@ -699,14 +707,15 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
       fullScreen={fullScreen}
       maxWidth="md"
       PaperProps={{
+        'data-testid': 'settings-dialog',
         sx: {
           width: '100%',
-          height: { xs: '100%', sm: 'min(780px, calc(100vh - 48px))' },
-          maxHeight: { xs: '100%', sm: 'calc(100vh - 48px)' },
+          height: fullScreen ? '100%' : 'min(780px, calc(100vh - 48px))',
+          maxHeight: fullScreen ? '100%' : 'calc(100vh - 48px)',
           backgroundColor: '#1A1A23',
           backgroundImage: 'none',
           border: '1px solid rgba(255,255,255,0.09)',
-          borderRadius: { xs: 0, sm: '8px' },
+          borderRadius: fullScreen ? 0 : '8px',
           overflow: 'hidden',
         },
       }}
@@ -871,6 +880,20 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
                     value={currentUser.email}
                     disabled
                     sx={{ ...fieldSx, gridColumn: { sm: '1 / -1' } }}
+                  />
+                  <TextField
+                    size="small"
+                    label="CRM contact"
+                    value={currentUser.referenceCode}
+                    disabled
+                    sx={fieldSx}
+                  />
+                  <TextField
+                    size="small"
+                    label="CRM organization"
+                    value={usersPayload?.currentOrganization?.referenceCode || ''}
+                    disabled
+                    sx={fieldSx}
                   />
                 </Box>
 
@@ -1377,13 +1400,14 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
         aria-labelledby="provision-pipeline-title"
         aria-describedby="provision-pipeline-description"
         fullWidth
+        fullScreen={fullScreen}
         maxWidth="xs"
         PaperProps={{
           sx: {
             backgroundColor: '#1A1A23',
             backgroundImage: 'none',
             border: '1px solid rgba(255,255,255,0.09)',
-            borderRadius: '8px',
+            borderRadius: fullScreen ? 0 : '8px',
           },
         }}
       >

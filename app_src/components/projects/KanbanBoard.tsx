@@ -93,6 +93,7 @@ export default function KanbanBoard({ externalFilter, onFilterChange }: Props = 
   const [moveError, setMoveError] = useState('')
   const [boardAccess, setBoardAccess] = useState<'owner' | 'editor' | 'viewer' | null>(null)
   const isTouch = useMediaQuery('(pointer: coarse)')
+  const shortLandscape = useMediaQuery('(orientation: landscape) and (max-height: 500px) and (max-width: 899.95px)')
   const canEdit = boardAccess !== 'viewer'
 
   const filter = externalFilter && isFilterActive(externalFilter) ? externalFilter : internalFilter
@@ -319,17 +320,17 @@ export default function KanbanBoard({ externalFilter, onFilterChange }: Props = 
 
   return (
     <BoardContext.Provider value={{ updateTask, focusedTaskId, setFocusedTaskId, openDrawer, notify: setMoveError }}>
-      <Box sx={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, backgroundColor: '#0F0F13', overflowY: { xs: 'auto', md: 'hidden' }, overflowX: 'hidden', WebkitOverflowScrolling: 'touch' }}>
-        <Box sx={{ px: { xs: 2, md: 4 }, pt: { xs: 2, md: 3 }, pb: 2, flexShrink: 0, borderBottom: '1px solid rgba(255,255,255,0.06)' }}>
-          <Stack spacing={1.5}>
-            <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 1 }}>
+      <Box sx={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, backgroundColor: '#0F0F13', overflowY: shortLandscape ? 'hidden' : { xs: 'auto', md: 'hidden' }, overflowX: 'hidden', WebkitOverflowScrolling: 'touch' }}>
+        <Box sx={{ px: shortLandscape ? 1 : { xs: 2, md: 4 }, pt: shortLandscape ? 0.5 : { xs: 2, md: 3 }, pb: shortLandscape ? 0.5 : 2, flexShrink: 0, borderBottom: '1px solid rgba(255,255,255,0.06)' }}>
+          <Stack spacing={shortLandscape ? 0.5 : 1.5}>
+            <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: shortLandscape ? 'nowrap' : 'wrap', gap: 1, minWidth: 0 }}>
               <Box sx={{ display: 'flex', alignItems: 'baseline', gap: 2 }}>
-                <Typography variant="h5" fontWeight={700} color="text.primary">Projects</Typography>
+                <Typography variant="h5" fontWeight={700} color="text.primary" sx={shortLandscape ? { fontSize: '1rem' } : undefined}>Projects</Typography>
                 <Typography variant="body2" color="text.disabled">
                   {archiveMode ? 'Archive' : `${visibleTasks.length} task${visibleTasks.length === 1 ? '' : 's'}${isFilterActive(filter) ? ' (filtered)' : ''}`}
                 </Typography>
               </Box>
-              <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} sx={{ width: { xs: '100%', sm: 'auto' } }}>
+              <Stack direction="row" spacing={1} sx={{ width: shortLandscape ? 'auto' : { xs: '100%', sm: 'auto' }, flexShrink: 0, overflowX: 'auto' }}>
                 <WorkspaceSelector kind="board" onAccessChange={(resource) => setBoardAccess(resource?.accessRole || null)} />
                 {!archiveMode && canEdit ? (
                   <Button
@@ -345,25 +346,29 @@ export default function KanbanBoard({ externalFilter, onFilterChange }: Props = 
               </Stack>
             </Box>
 
-            <SearchBar
-              query={searchQuery}
-              onSearch={setSearchQuery}
-              archiveMode={archiveMode}
-              onToggleArchive={() => setArchiveMode(current => !current)}
-            />
+            <Stack direction={shortLandscape ? 'row' : 'column'} spacing={shortLandscape ? 0.75 : 1.5} sx={shortLandscape ? { minWidth: 0, overflowX: 'auto', '& > *': { flexShrink: 0 } } : undefined}>
+              <Box sx={shortLandscape ? { width: 300 } : undefined}>
+                <SearchBar
+                  query={searchQuery}
+                  onSearch={setSearchQuery}
+                  archiveMode={archiveMode}
+                  onToggleArchive={() => setArchiveMode(current => !current)}
+                />
+              </Box>
 
-            {archiveMode ? (
-              <Stack direction="row" spacing={1}>
-                <Button size="small" variant={archiveView === 'archived' ? 'contained' : 'outlined'} onClick={() => setArchiveView('archived')} sx={{ textTransform: 'none' }}>
-                  Archived cards
-                </Button>
-                <Button size="small" variant={archiveView === 'deleted' ? 'contained' : 'outlined'} onClick={() => setArchiveView('deleted')} sx={{ textTransform: 'none' }}>
-                  Deleted cards
-                </Button>
-              </Stack>
-            ) : (
-              <FilterBar filter={filter} onChange={handleFilterChange} onClear={clearFilter} />
-            )}
+              {archiveMode ? (
+                <Stack direction="row" spacing={1}>
+                  <Button size="small" variant={archiveView === 'archived' ? 'contained' : 'outlined'} onClick={() => setArchiveView('archived')} sx={{ textTransform: 'none' }}>
+                    Archived cards
+                  </Button>
+                  <Button size="small" variant={archiveView === 'deleted' ? 'contained' : 'outlined'} onClick={() => setArchiveView('deleted')} sx={{ textTransform: 'none' }}>
+                    Deleted cards
+                  </Button>
+                </Stack>
+              ) : (
+                <FilterBar filter={filter} onChange={handleFilterChange} onClear={clearFilter} />
+              )}
+            </Stack>
           </Stack>
         </Box>
 
@@ -380,7 +385,7 @@ export default function KanbanBoard({ externalFilter, onFilterChange }: Props = 
             onDragStart={handleDragStart}
             onDragEnd={handleDragEnd}
           >
-            <Box sx={{ px: { xs: 1.5, md: 4 }, pt: 2.5, pb: 1, flex: { xs: '0 0 auto', md: 1 }, minHeight: { xs: 300, md: 0 }, display: 'flex' }}>
+            <Box data-testid="projects-board" sx={{ px: shortLandscape ? 1 : { xs: 1.5, md: 4 }, pt: shortLandscape ? 0.75 : 2.5, pb: shortLandscape ? 0 : 1, flex: shortLandscape ? 1 : { xs: '0 0 auto', md: 1 }, minHeight: shortLandscape ? 120 : { xs: 300, md: 0 }, display: 'flex' }}>
               <Box sx={{
                 display: 'flex', gap: 2, flex: 1, minHeight: 0,
                 overflowX: 'auto', overflowY: 'hidden', pb: 2,
@@ -406,7 +411,7 @@ export default function KanbanBoard({ externalFilter, onFilterChange }: Props = 
         )}
       </Box>
 
-      <Dialog open={newTaskOpen} onClose={closeNewTask} maxWidth="sm" fullWidth>
+      <Dialog open={newTaskOpen} onClose={closeNewTask} maxWidth="sm" fullWidth fullScreen={shortLandscape}>
         <Box component="form" onSubmit={handleCreateTask}>
           <DialogTitle sx={{ pb: 1 }}>New task</DialogTitle>
           <DialogContent>

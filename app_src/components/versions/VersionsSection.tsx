@@ -17,6 +17,7 @@ import Tabs from '@mui/material/Tabs'
 import TextField from '@mui/material/TextField'
 import Tooltip from '@mui/material/Tooltip'
 import Typography from '@mui/material/Typography'
+import useMediaQuery from '@mui/material/useMediaQuery'
 import AddRounded from '@mui/icons-material/AddRounded'
 
 type ReleaseEntry = {
@@ -126,6 +127,7 @@ function ReleaseChangeList({ title, items }: { title: string; items: string[] })
 }
 
 export default function VersionsSection() {
+  const shortLandscape = useMediaQuery('(orientation: landscape) and (max-height: 500px) and (max-width: 899.95px)')
   const [tab, setTab] = useState<'releases' | 'checkpoints'>('releases')
   const [payload, setPayload] = useState<ReleasePayload | null>(null)
   const [loading, setLoading] = useState(true)
@@ -447,11 +449,12 @@ export default function VersionsSection() {
         }}
         maxWidth="sm"
         fullWidth
+        fullScreen={shortLandscape}
         PaperProps={{
           sx: {
             backgroundColor: '#1A1A23',
             border: '1px solid rgba(255,255,255,0.08)',
-            borderRadius: 1,
+            borderRadius: shortLandscape ? 0 : 1,
           },
         }}
       >

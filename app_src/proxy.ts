@@ -81,6 +81,7 @@ function isPublicApi(pathname: string) {
     normalizedPath === '/api/invitations/accept' ||
     normalizedPath === '/api/pipeline/sync/outbox/process' ||
     normalizedPath === '/api/crm/outbox/process' ||
+    normalizedPath === '/api/crm/integrations/process' ||
     normalizedPath === '/api/agents/dispatch/process' ||
     normalizedPath === '/api/docs/embeddings/process' ||
     normalizedPath === '/api/ai-radar/process' ||

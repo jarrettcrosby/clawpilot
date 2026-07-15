@@ -4,6 +4,7 @@ import type { QueryResultRow } from 'pg'
 import { getStorageDriver } from '@/lib/persistence/config'
 import { query, withTransaction } from '@/lib/persistence/postgres'
 import { requireRequestUser } from '@/lib/requestUser'
+import { workspaceOrganizationRootId } from '@/lib/organizations'
 import { effectiveUserPermissions, normalizeUserEmail } from '@/lib/users'
 
 const SLUG_PATTERN = /^[a-z0-9][a-z0-9_-]{2,63}$/
@@ -53,8 +54,9 @@ type ShortLinkRow = QueryResultRow & {
 
 export type ShortLinkActor = {
   ownerEmail: string
+  organizationRootId: string
   sourceApp: string
-  manageAll: boolean
+  manageOrganization: boolean
   service: boolean
 }
 
@@ -238,10 +240,17 @@ export async function resolveShortLinkActor(req: NextRequest): Promise<ShortLink
     if (client.ownerDomain && ownerEmail.split('@')[1] !== client.ownerDomain) {
       throw new ShortLinkRequestError('Authenticated user is outside the allowed domain', 403)
     }
+    let organizationRootId: string
+    try {
+      organizationRootId = await workspaceOrganizationRootId(ownerEmail)
+    } catch {
+      throw new ShortLinkRequestError('Authenticated user has no active ClawPilot organization', 403)
+    }
     return {
       ownerEmail,
+      organizationRootId,
       sourceApp: client.sourceApp,
-      manageAll: false,
+      manageOrganization: false,
       service: true,
     }
   }
@@ -250,8 +259,9 @@ export async function resolveShortLinkActor(req: NextRequest): Promise<ShortLink
   const permissions = effectiveUserPermissions(user)
   return {
     ownerEmail: user.email,
+    organizationRootId: await workspaceOrganizationRootId(user.email),
     sourceApp: 'clawpilot',
-    manageAll: (user.role === 'owner' || user.role === 'admin') && permissions.manageLinks,
+    manageOrganization: (user.role === 'owner' || user.role === 'admin') && permissions.manageLinks,
     service: false,
   }
 }
@@ -374,7 +384,10 @@ export async function listShortLinks(actor: ShortLinkActor, filters: {
         created_at::text, updated_at::text
       FROM short_links
       WHERE deleted_at IS NULL
-        AND ($2::boolean OR owner_email = $1)
+        AND (
+          owner_email = $1
+          OR (($2::boolean OR NOT $8::boolean) AND organization_root_id = $10::uuid)
+        )
         AND (NOT $8::boolean OR source_app = $9)
         AND (
           $3 = ''
@@ -390,11 +403,11 @@ export async function listShortLinks(actor: ShortLinkActor, filters: {
         AND ($6 = '' OR (${statusSql}) = $6)
         AND ($7 = '' OR source_app = $7)
       ORDER BY updated_at DESC, id DESC
-      LIMIT $10
+      LIMIT $11
     `,
     [
       actor.ownerEmail,
-      actor.manageAll,
+      actor.manageOrganization,
       search,
       slugSearch,
       tag,
@@ -402,6 +415,7 @@ export async function listShortLinks(actor: ShortLinkActor, filters: {
       sourceApp,
       actor.service,
       actor.sourceApp,
+      actor.organizationRootId,
       MAX_LIST_RESULTS,
     ],
   )
@@ -429,17 +443,27 @@ export async function createShortLink(actor: ShortLinkActor, value: unknown): Pr
       const result = await query<ShortLinkRow>(
         `
           INSERT INTO short_links (
-            owner_email, source_app, slug, destination_url, title, tags,
+            owner_email, organization_root_id, source_app, slug, destination_url, title, tags,
             max_clicks, expires_at, created_at, updated_at
           )
-          VALUES ($1, $2, $3, $4, $5, $6::text[], $7, $8::timestamptz, now(), now())
+          VALUES ($1, $2::uuid, $3, $4, $5, $6, $7::text[], $8, $9::timestamptz, now(), now())
           RETURNING
             id::text, owner_email, source_app, slug, destination_url, title, tags,
             ${statusSql} AS link_status,
             expires_at::text, max_clicks, click_count, last_clicked_at::text,
             created_at::text, updated_at::text
         `,
-        [actor.ownerEmail, actor.sourceApp, slug, destinationUrl, title, tags, maxClicks, expiresAt],
+        [
+          actor.ownerEmail,
+          actor.organizationRootId,
+          actor.sourceApp,
+          slug,
+          destinationUrl,
+          title,
+          tags,
+          maxClicks,
+          expiresAt,
+        ],
       )
       return toShortLink(result.rows[0])
     } catch (error) {
@@ -470,11 +494,21 @@ export async function updateShortLink(actor: ShortLinkActor, value: unknown): Pr
           FROM short_links
           WHERE id = $1::uuid
             AND deleted_at IS NULL
-            AND ($3::boolean OR owner_email = $2)
+            AND (
+              owner_email = $2
+              OR ($3::boolean AND organization_root_id = $6::uuid)
+            )
             AND (NOT $4::boolean OR source_app = $5)
           FOR UPDATE
         `,
-        [id, actor.ownerEmail, actor.manageAll, actor.service, actor.sourceApp],
+        [
+          id,
+          actor.ownerEmail,
+          actor.manageOrganization,
+          actor.service,
+          actor.sourceApp,
+          actor.organizationRootId,
+        ],
       )
       const current = selected.rows[0]
       if (!current) throw new ShortLinkRequestError('Short link was not found', 404)
@@ -530,10 +564,20 @@ export async function deleteShortLink(actor: ShortLinkActor, idValue: unknown): 
       SET deleted_at = now(), updated_at = now()
       WHERE id = $1::uuid
         AND deleted_at IS NULL
-        AND ($3::boolean OR owner_email = $2)
+        AND (
+          owner_email = $2
+          OR ($3::boolean AND organization_root_id = $6::uuid)
+        )
         AND (NOT $4::boolean OR source_app = $5)
     `,
-    [id, actor.ownerEmail, actor.manageAll, actor.service, actor.sourceApp],
+    [
+      id,
+      actor.ownerEmail,
+      actor.manageOrganization,
+      actor.service,
+      actor.sourceApp,
+      actor.organizationRootId,
+    ],
   )
   if (result.rowCount !== 1) throw new ShortLinkRequestError('Short link was not found', 404)
 }

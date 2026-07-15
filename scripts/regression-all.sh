@@ -11,9 +11,6 @@ npm run test
 npm run verify:predeploy
 ./scripts/dev-start.sh
 bash scripts/dev-verify.sh
-(
-  cd app_src
-  npx playwright test --config=playwright.ui.config.ts tests/responsive-shell/ui-acceptance.spec.ts
-)
+UI_REUSE_RUNNING_SERVER=1 bash scripts/ui-acceptance.sh
 
 echo "REGRESSION_ALL_OK"

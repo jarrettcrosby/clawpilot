@@ -24,7 +24,8 @@ Keep user-owned Maton accounts separate from the platform Google Workspace crede
 ## Runtime Credential Selection
 
 - User-owned Maton operations resolve the signed-in user's encrypted credential and an `ACTIVE` connection for the requested Maton application.
-- Platform email prefers the configured owner's stored Maton credential. Importing the Railway bootstrap key preserves the verified `MATON_GMAIL_CONNECTION_ID`, so system mail continues to use the approved ClawPilot Stewards sender instead of whichever Gmail connection was created most recently.
+- Sign-in and invitation email is a platform operation. It always uses the Railway `MATON_API_KEY` plus exact `MATON_GMAIL_CONNECTION_ID`, verifies that `stewards@eigenracing.com` is an accepted Gmail send-as identity, and never falls back to a user's selected personal connection.
+- CRM sales email and calendar actions are user operations. They use the signed-in user's encrypted Maton credential and selected `google-mail` or `google-calendar` connection, so another ClawPilot user must authorize their own providers.
 - Development and production store user integration records in their own Railway Postgres environments. Import or configure the platform owner in both environments; do not copy database rows between environments.
 
 ## Google Workspace Contract
@@ -40,7 +41,7 @@ Keep user-owned Maton accounts separate from the platform Google Workspace crede
 ## Managed Pipeline Resources
 
 - Provisioning is an explicit pipeline-owner command.
-- ClawPilot creates `ClawPilot Data/<environment>/Users/<email>/Pipelines/<pipeline>/` in the configured Shared Drive.
+- ClawPilot creates `ClawPilot Data/<environment>/Organizations/<ga organization>/Contacts/<gc user>/Pipelines/<gc pipeline>/` in the configured Shared Drive.
 - The private workbook contains the CRM input, generated entity projections, calculations, dashboard, and dropdown tabs expected by the sync adapters.
 - Postgres remains the durable normalized projection, membership, audit, outbox, and conflict store. Only the Opportunities table is writable; SuiteCRM owns the other CRM entities.
 - The generated short link resolves to the private Sheet but does not bypass Google permissions.

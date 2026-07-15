@@ -196,6 +196,12 @@ export default function AppHeader({
         borderBottom: '1px solid rgba(255,255,255,0.06)',
         flexShrink: 0,
         minHeight: { xs: 'calc(env(safe-area-inset-top) + 52px)', md: 52 },
+        '@media (orientation: landscape) and (max-height: 500px) and (max-width: 899.95px)': {
+          px: 1,
+          py: 0.25,
+          pt: 'max(env(safe-area-inset-top), 2px)',
+          minHeight: 'calc(env(safe-area-inset-top) + 44px)',
+        },
       }}>
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, minWidth: 0, flex: 1, overflow: 'hidden' }}>
           <Tooltip title="Open navigation">
@@ -258,6 +264,7 @@ export default function AppHeader({
           <Tooltip title={health.status === 'ok' ? 'App healthy' : `${health.errors.length} recent error${health.errors.length !== 1 ? 's' : ''} — tap to view`}>
             <IconButton
               onClick={e => setHealthAnchor(e.currentTarget)}
+              aria-label="App health"
               sx={{ p: { xs: 1.5, md: 1 }, minWidth: 48, minHeight: 48 }}
             >
               <Box sx={{
@@ -277,6 +284,7 @@ export default function AppHeader({
           <Tooltip title="Settings">
             <IconButton
               onClick={(e) => setHelpAnchor(e.currentTarget)}
+              aria-label="Settings"
               sx={{ color: 'rgba(255,255,255,0.45)', p: { xs: 1.5, md: 1 }, minWidth: 48, minHeight: 48, '&:hover': { color: '#CFC6EA', backgroundColor: 'rgba(207,198,234,0.08)' } }}
             >
               <SettingsRounded sx={{ fontSize: 22 }} />
@@ -287,6 +295,7 @@ export default function AppHeader({
           <Tooltip title="Activity log">
             <IconButton
               onClick={() => setDrawerOpen(true)}
+              aria-label="Activity log"
               sx={{ color: unreadCount > 0 ? '#A8C7FA' : 'rgba(255,255,255,0.60)', p: { xs: 1.5, md: 1 }, minWidth: 48, minHeight: 48, '&:hover': { color: '#A8C7FA', backgroundColor: 'rgba(168,199,250,0.08)' } }}
             >
               <Badge

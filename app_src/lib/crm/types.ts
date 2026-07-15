@@ -1,10 +1,20 @@
-export const CRM_ENTITIES = ['organizations', 'contacts', 'opportunities', 'interactions'] as const
+export const CRM_ENTITIES = [
+  'organizations',
+  'contacts',
+  'leads',
+  'opportunities',
+  'meetings',
+  'interactions',
+  'campaigns',
+] as const
 
 export type CrmEntity = (typeof CRM_ENTITIES)[number]
 export type CrmSyncStatus = 'pending' | 'syncing' | 'synced' | 'failed'
 
 export type CrmOrganization = {
   id: string
+  referenceCode: string
+  shortUrl: string | null
   pipelineId: string
   parentOrganizationId: string | null
   parentOrganizationName: string
@@ -33,6 +43,8 @@ export type CrmOrganization = {
 
 export type CrmContact = {
   id: string
+  referenceCode: string
+  shortUrl: string | null
   pipelineId: string
   organizationId: string | null
   organizationName: string
@@ -56,6 +68,7 @@ export type CrmContact = {
   postalCode: string
   country: string
   description: string
+  emailOptOut: boolean
   syncStatus: CrmSyncStatus
   syncError: string | null
   updatedAt: string
@@ -63,6 +76,8 @@ export type CrmContact = {
 
 export type CrmOpportunity = {
   id: string
+  referenceCode: string
+  shortUrl: string | null
   pipelineId: string
   organizationId: string | null
   suiteCrmId: string | null
@@ -87,10 +102,15 @@ export type CrmOpportunity = {
 
 export type CrmInteraction = {
   id: string
+  referenceCode: string
+  shortUrl: string | null
   pipelineId: string
   organizationId: string | null
   contactId: string | null
   opportunityId: string | null
+  leadId: string | null
+  meetingId: string | null
+  campaignId: string | null
   suiteCrmId: string | null
   sourceKey: string
   sourceRowNumber: number | null
@@ -99,18 +119,117 @@ export type CrmInteraction = {
   agentName: string
   occurredAt: string | null
   description: string
+  direction: 'inbound' | 'outbound' | 'internal'
+  deliveryStatus: string
+  providerMessageId: string | null
+  providerThreadId: string | null
   syncStatus: CrmSyncStatus
   syncError: string | null
   updatedAt: string
 }
 
-export type CrmRecord = CrmOrganization | CrmContact | CrmOpportunity | CrmInteraction
+export type CrmLead = {
+  id: string
+  referenceCode: string
+  shortUrl: string | null
+  pipelineId: string
+  organizationId: string | null
+  organizationName: string
+  convertedContactId: string | null
+  convertedOpportunityId: string | null
+  suiteCrmId: string | null
+  sourceKey: string
+  firstName: string
+  lastName: string
+  fullName: string
+  companyName: string
+  jobTitle: string
+  email: string
+  phoneWork: string
+  phoneMobile: string
+  status: string
+  source: string
+  assignedTo: string
+  description: string
+  emailOptOut: boolean
+  syncStatus: CrmSyncStatus
+  syncError: string | null
+  updatedAt: string
+}
+
+export type CrmMeeting = {
+  id: string
+  referenceCode: string
+  shortUrl: string | null
+  pipelineId: string
+  organizationId: string | null
+  organizationName: string
+  contactId: string | null
+  contactName: string
+  leadId: string | null
+  leadName: string
+  opportunityId: string | null
+  opportunityName: string
+  suiteCrmId: string | null
+  sourceKey: string
+  subject: string
+  description: string
+  startsAt: string
+  endsAt: string
+  timezone: string
+  location: string
+  attendeeEmails: string[]
+  status: 'planned' | 'queued' | 'scheduled' | 'completed' | 'cancelled' | 'failed'
+  provider: string
+  externalEventId: string | null
+  externalEventUrl: string | null
+  joinUrl: string | null
+  syncStatus: CrmSyncStatus
+  syncError: string | null
+  updatedAt: string
+}
+
+export type CrmCampaign = {
+  id: string
+  referenceCode: string
+  shortUrl: string | null
+  pipelineId: string
+  suiteCrmId: string | null
+  sourceKey: string
+  name: string
+  campaignType: 'email'
+  status: 'draft' | 'queued' | 'sending' | 'sent' | 'paused' | 'failed'
+  startDate: string
+  endDate: string
+  subjectTemplate: string
+  bodyTemplate: string
+  senderEmail: string
+  description: string
+  recipientCount: number
+  sentCount: number
+  failedCount: number
+  syncStatus: CrmSyncStatus
+  syncError: string | null
+  updatedAt: string
+}
+
+export type CrmRecord =
+  | CrmOrganization
+  | CrmContact
+  | CrmLead
+  | CrmOpportunity
+  | CrmMeeting
+  | CrmInteraction
+  | CrmCampaign
 
 export type CrmSummary = {
   organizations: number
   contacts: number
+  leads: number
   opportunities: number
+  meetings: number
   interactions: number
+  campaigns: number
   openPipelineValue: number
   weightedPipelineValue: number
   pendingSync: number

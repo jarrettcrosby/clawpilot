@@ -265,11 +265,15 @@ export default function Navigation({
           right: 0,
           width: '100%',
           maxWidth: '100vw',
-          height: 'calc(64px + env(safe-area-inset-bottom))',
+          height: 'calc(var(--mobile-navigation-height, 64px) + env(safe-area-inset-bottom))',
           paddingBottom: 'env(safe-area-inset-bottom)',
           backgroundColor: '#12141C',
           borderTop: '1px solid rgba(255,255,255,0.06)',
           zIndex: 1100,
+          '@media (orientation: landscape) and (max-height: 500px) and (max-width: 899.95px)': {
+            '& .MuiBottomNavigationAction-root': { py: 0.25 },
+            '& .MuiSvgIcon-root': { fontSize: 19 },
+          },
         }}
       >
         {MOBILE_DIRECT_ITEMS.map((item) => (

@@ -95,6 +95,7 @@ const mailSource = read('app_src/lib/matonMail.ts')
 assert.ok(!mailSource.includes('MATON_GMAIL_CONNECTION_ID'))
 assert.ok(!mailSource.includes("'Maton-Connection'"))
 assert.ok(mailSource.includes('mailFromAddress'))
+assert.ok(mailSource.includes('matonPlatformMailFetch'))
 
 const originalEnv = {
   APP_LOGIN_EMAIL: process.env.APP_LOGIN_EMAIL,
@@ -230,6 +231,9 @@ try {
   process.env.MATON_GMAIL_CONNECTION_ID = 'legacy-gmail-connection'
   delete process.env.MATON_API_KEY_FILE
 
+  assert.equal(matonModule.inferMatonGatewayApp('/google-calendar/calendar/v3/calendars/primary/events'), 'google-calendar')
+  assert.equal(matonModule.inferMatonGatewayApp('/quickbooks/v3/company/1/invoice'), 'quickbooks')
+
   await matonModule.matonFetch(
     '/google-sheets/v4/spreadsheets/sheet-1',
     { method: 'GET' },
@@ -255,6 +259,12 @@ try {
   assert.equal(fetchCalls.at(-1).init.headers.get('Authorization'), 'Bearer legacy-platform-key')
   assert.equal(fetchCalls.at(-1).init.headers.get('Maton-Connection'), 'legacy-gmail-connection')
 
+  platformCredential = { apiKey: 'wrong-stored-mail-key', connectionId: 'wrong-personal-gmail' }
+  await matonModule.matonPlatformMailFetch('/google-mail/gmail/v1/users/me/messages/send', { method: 'POST' })
+  assert.equal(fetchCalls.at(-1).init.headers.get('Authorization'), 'Bearer legacy-platform-key')
+  assert.equal(fetchCalls.at(-1).init.headers.get('Maton-Connection'), 'legacy-gmail-connection')
+
+  platformCredential = null
   await matonModule.matonFetch('/google-sheets/v4/spreadsheets/sheet-2')
   assert.equal(fetchCalls.at(-1).init.headers.get('Authorization'), 'Bearer legacy-platform-key')
   assert.equal(fetchCalls.at(-1).init.headers.get('Maton-Connection'), null)

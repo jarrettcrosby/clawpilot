@@ -193,6 +193,11 @@ export default function DocsSection() {
             px: 1.5,
             flexShrink: 0,
             borderBottom: '1px solid rgba(255,255,255,0.06)',
+            '@media (orientation: landscape) and (max-height: 500px) and (max-width: 899.95px)': {
+              minHeight: 44,
+              px: 0.75,
+              gap: 0.5,
+            },
           }}
         >
           <IconButton
@@ -207,6 +212,10 @@ export default function DocsSection() {
               width: 44,
               height: 44,
               '&:hover': { backgroundColor: 'rgba(168,199,250,0.08)' },
+              '@media (orientation: landscape) and (max-height: 500px) and (max-width: 899.95px)': {
+                width: 36,
+                height: 36,
+              },
             }}
           >
             <MenuRounded />

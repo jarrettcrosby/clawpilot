@@ -52,6 +52,16 @@ Repeat these steps in `https://dev.aiapp.eigenracing.com` and `https://aiapp.eig
 
 The API never returns either secret. The UI shows only masked key metadata, the service-account email and project, connection status, and the selected Shared Drive name.
 
+## Managed Folder Contract
+
+The expected path is:
+
+`ClawPilot Data/<Production|Development>/Organizations/<ga code + organization name>/Contacts/<gc code + user name>/Pipelines/<gc code + pipeline name>/`
+
+The workbook has the same `gc code + pipeline name`. Profile or organization-name changes enqueue reconciliation. Existing managed folders are identified by Google resource ID and ClawPilot `appProperties`, moved in place, and verified before empty legacy folders are removed. Do not manually duplicate a managed folder to correct its name; use profile save, pipeline retry, or the provisioning worker.
+
+After a hierarchy migration, verify the Pipeline **Open Sheet** link, the exact Google parent path, and the direct user permission before considering reconciliation complete.
+
 ## Rotation
 
 Rotate the API key and service-account private key independently through Settings. A service-account key rotation is safe when the service-account email remains unchanged. ClawPilot refuses to replace or disconnect a service account while managed pipelines remain bound to a different or missing account.

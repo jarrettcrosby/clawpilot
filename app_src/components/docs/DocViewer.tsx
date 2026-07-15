@@ -145,14 +145,42 @@ export default function DocViewer({ doc, loading }: Props) {
         backdropFilter: 'blur(12px)',
         borderBottom: '1px solid rgba(255,255,255,0.06)',
         flexShrink: 0,
+        '@media (orientation: landscape) and (max-height: 500px) and (max-width: 899.95px)': {
+          px: 1.5,
+          pt: 0.5,
+          pb: 0.75,
+        },
       }}>
-        <Typography variant="overline" sx={{ color: '#A8C7FA', fontSize: '0.65rem', letterSpacing: 2, fontWeight: 600 }}>
+        <Typography variant="overline" sx={{
+          color: '#A8C7FA', fontSize: '0.65rem', letterSpacing: 2, fontWeight: 600,
+          '@media (orientation: landscape) and (max-height: 500px) and (max-width: 899.95px)': { display: 'none' },
+        }}>
           {doc!.category.toUpperCase()}
         </Typography>
-        <Typography variant="h3" fontWeight={700} color="text.primary" sx={{ mt: 0.5, mb: 2, lineHeight: 1.2, fontSize: { xs: '1.5rem', md: '2rem' } }}>
+        <Typography variant="h3" fontWeight={700} color="text.primary" sx={{
+          mt: 0.5, mb: 2, lineHeight: 1.2, fontSize: { xs: '1.5rem', md: '2rem' }, overflowWrap: 'anywhere',
+          '@media (orientation: landscape) and (max-height: 500px) and (max-width: 899.95px)': {
+            mt: 0,
+            mb: 0.5,
+            fontSize: '1rem',
+            lineHeight: 1.15,
+            whiteSpace: 'nowrap',
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+          },
+        }}>
           {doc!.title}
         </Typography>
-        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, flexWrap: 'wrap' }}>
+        <Box sx={{
+          display: 'flex', alignItems: 'center', gap: 1.5, flexWrap: 'wrap',
+          '@media (orientation: landscape) and (max-height: 500px) and (max-width: 899.95px)': {
+            gap: 0.5,
+            flexWrap: 'nowrap',
+            overflowX: 'auto',
+            WebkitOverflowScrolling: 'touch',
+            '& > *': { flexShrink: 0 },
+          },
+        }}>
           <Typography variant="caption" sx={{ color: 'text.disabled', fontSize: '0.75rem' }}>{doc!.date}</Typography>
           {doc!.status && (
             <Chip label={doc!.status} size="small" variant="outlined"
@@ -169,7 +197,13 @@ export default function DocViewer({ doc, loading }: Props) {
         </Box>
       </Box>
 
-      <Box sx={{ flex: 1, overflow: 'auto', px: { xs: 2, sm: 3, md: 5 }, py: { xs: 3, md: 4 } }}>
+      <Box
+        data-testid="docs-reader"
+        sx={{
+          flex: 1, minHeight: 0, overflow: 'auto', px: { xs: 2, sm: 3, md: 5 }, py: { xs: 3, md: 4 },
+          '@media (orientation: landscape) and (max-height: 500px) and (max-width: 899.95px)': { px: 1.5, py: 1 },
+        }}
+      >
         <Box sx={{ maxWidth: 740 }}>
           <ReactMarkdown
             remarkPlugins={[remarkGfm]}

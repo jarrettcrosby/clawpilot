@@ -3,10 +3,12 @@ import { NextRequest, NextResponse } from 'next/server'
 import { CRM_ENTITIES, type CrmEntity } from '@/lib/crm/types'
 import {
   ensurePipelineCrmHierarchy,
+  ensurePipelineCrmReferenceLinks,
   listCrmRecordsInPostgres,
   readCrmRecordReference,
   readCrmSummaryFromPostgres,
   stageCrmRecordInPostgres,
+  syncAppUserProfileToCrm,
 } from '@/lib/persistence/crm'
 import { listWorkspaceOrganizationHierarchy } from '@/lib/organizations'
 import { suiteCrmAdminPortalUrl, suiteCrmAdminUsername } from '@/lib/crm/suiteCrmPublicUrl'
@@ -49,6 +51,22 @@ function validEmail(value: unknown) {
   return email
 }
 
+function emailList(value: unknown) {
+  if (value === undefined || value === null || value === '') return []
+  if (!Array.isArray(value)) throw new Error('Meeting attendees must be a list')
+  return Array.from(new Set(value.map(validEmail).filter(Boolean))).slice(0, 200)
+}
+
+function timezoneValue(value: unknown) {
+  const timezone = stringValue(value, 100) || 'America/New_York'
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: timezone }).format()
+    return timezone
+  } catch {
+    throw new Error('Meeting timezone is invalid')
+  }
+}
+
 async function selectedPipeline(req: NextRequest, actorEmail: string) {
   const selected = req.cookies.get(PIPELINE_SELECTION_COOKIE)?.value || undefined
   return resolvePipelineSpaceAccess({ actorEmail, pipelineId: selected })
@@ -68,7 +86,8 @@ export async function GET(req: NextRequest) {
     const pipeline = await selectedPipeline(req, actor.email)
     const entity = entityValue(req.nextUrl.searchParams.get('entity') || 'organizations')
     const canOpenSuiteCrm = actor.role === 'owner' || actor.role === 'admin'
-    await ensurePipelineCrmHierarchy({ pipelineId: pipeline.id, actorEmail: actor.email })
+    await syncAppUserProfileToCrm({ email: pipeline.ownerEmail, pipelineId: pipeline.id })
+    await ensurePipelineCrmReferenceLinks(pipeline.id)
     const [records, summary, workspaceHierarchy] = await Promise.all([
       listCrmRecordsInPostgres({
         pipelineId: pipeline.id,
@@ -150,11 +169,12 @@ export async function POST(req: NextRequest) {
     if (entity === 'contacts') {
       const fullName = stringValue(fields.fullName, 250)
       if (!fullName) throw new Error('Contact name is required')
+      if (!organization) throw new Error('Contact organization is required')
       const staged = await stageCrmRecordInPostgres({
         entity, pipelineId: pipeline.id, localId: current?.id, sourceKey, actorEmail: actor.email,
         sourcePayload: { source: 'clawpilot' },
         fields: {
-          organizationId: organization?.id || null, organizationSuiteCrmId: organization?.suiteCrmId || null,
+          organizationId: organization.id, organizationSuiteCrmId: organization.suiteCrmId,
           fullName, firstName: stringValue(fields.firstName, 100), lastName: stringValue(fields.lastName, 150),
           priority: stringValue(fields.priority, 50), contactType: stringValue(fields.contactType, 100),
           accountManager: stringValue(fields.accountManager, 200), jobTitle: stringValue(fields.jobTitle, 250),
@@ -163,6 +183,26 @@ export async function POST(req: NextRequest) {
           address: stringValue(fields.address, 500), city: stringValue(fields.city, 150), state: stringValue(fields.state, 150),
           postalCode: stringValue(fields.postalCode, 50), country: stringValue(fields.country, 100),
           description: stringValue(fields.description, 10_000),
+          emailOptOut: fields.emailOptOut === true,
+        },
+      })
+      return NextResponse.json({ ok: true, queued: true, record: staged }, { status: body?.id ? 200 : 201 })
+    }
+
+    if (entity === 'leads') {
+      const fullName = stringValue(fields.fullName, 250)
+      if (!fullName) throw new Error('Lead name is required')
+      const staged = await stageCrmRecordInPostgres({
+        entity, pipelineId: pipeline.id, localId: current?.id, sourceKey, actorEmail: actor.email,
+        sourcePayload: { source: 'clawpilot' },
+        fields: {
+          organizationId: organization?.id || null, organizationSuiteCrmId: organization?.suiteCrmId || null,
+          firstName: stringValue(fields.firstName, 100), lastName: stringValue(fields.lastName, 150), fullName,
+          companyName: organization?.name || stringValue(fields.companyName, 250), jobTitle: stringValue(fields.jobTitle, 250),
+          email: validEmail(fields.email), phoneWork: stringValue(fields.phoneWork, 100),
+          phoneMobile: stringValue(fields.phoneMobile, 100), status: stringValue(fields.status, 100),
+          source: stringValue(fields.source, 150), assignedTo: stringValue(fields.assignedTo, 200),
+          description: stringValue(fields.description, 10_000), emailOptOut: fields.emailOptOut === true,
         },
       })
       return NextResponse.json({ ok: true, queued: true, record: staged }, { status: body?.id ? 200 : 201 })
@@ -186,20 +226,86 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: true, queued: true, record: staged }, { status: body?.id ? 200 : 201 })
     }
 
+
+    let contact: Awaited<ReturnType<typeof readCrmRecordReference>> | null = null
+    if (fields.contactId) {
+      contact = await readCrmRecordReference({ pipelineId: pipeline.id, entity: 'contacts', id: String(fields.contactId) })
+    }
+    let lead: Awaited<ReturnType<typeof readCrmRecordReference>> | null = null
+    if (fields.leadId) {
+      lead = await readCrmRecordReference({ pipelineId: pipeline.id, entity: 'leads', id: String(fields.leadId) })
+    }
+
     let opportunity: Awaited<ReturnType<typeof readCrmRecordReference>> | null = null
     if (fields.opportunityId) {
       opportunity = await readCrmRecordReference({ pipelineId: pipeline.id, entity: 'opportunities', id: String(fields.opportunityId) })
     }
+
+    if (entity === 'meetings') {
+      const subject = stringValue(fields.subject, 250)
+      if (!subject) throw new Error('Meeting subject is required')
+      const startsAt = stringValue(fields.startsAt, 50)
+      const endsAt = stringValue(fields.endsAt, 50)
+      if (!startsAt || !endsAt) throw new Error('Meeting start and end are required')
+      const resolvedOrganizationId = organization?.id || contact?.organizationId || lead?.organizationId || null
+      const resolvedOrganization = resolvedOrganizationId
+        ? await readCrmRecordReference({ pipelineId: pipeline.id, entity: 'organizations', id: resolvedOrganizationId })
+        : null
+      const staged = await stageCrmRecordInPostgres({
+        entity, pipelineId: pipeline.id, localId: current?.id, sourceKey, actorEmail: actor.email,
+        sourcePayload: { source: 'clawpilot' },
+        fields: {
+          organizationId: resolvedOrganization?.id || null,
+          organizationSuiteCrmId: resolvedOrganization?.suiteCrmId || null,
+          contactId: contact?.id || null, leadId: lead?.id || null, opportunityId: opportunity?.id || null,
+          parentSuiteCrmId: opportunity?.suiteCrmId || null, subject,
+          description: stringValue(fields.description, 10_000), startsAt, endsAt,
+          timezone: timezoneValue(fields.timezone), location: stringValue(fields.location, 500),
+          attendeeEmails: emailList(fields.attendeeEmails),
+          status: ['planned', 'queued', 'scheduled', 'completed', 'cancelled', 'failed'].includes(String(fields.status))
+            ? fields.status as 'planned' | 'queued' | 'scheduled' | 'completed' | 'cancelled' | 'failed'
+            : 'planned',
+          provider: stringValue(fields.provider, 100), externalEventId: stringValue(fields.externalEventId, 500) || null,
+          externalEventUrl: stringValue(fields.externalEventUrl, 2000) || null, joinUrl: stringValue(fields.joinUrl, 2000) || null,
+        },
+      })
+      return NextResponse.json({ ok: true, queued: true, record: staged }, { status: body?.id ? 200 : 201 })
+    }
+
+    if (entity === 'campaigns') {
+      const name = stringValue(fields.name, 250)
+      if (!name) throw new Error('Campaign name is required')
+      const staged = await stageCrmRecordInPostgres({
+        entity, pipelineId: pipeline.id, localId: current?.id, sourceKey, actorEmail: actor.email,
+        sourcePayload: { source: 'clawpilot' },
+        fields: {
+          name, campaignType: 'email',
+          status: ['draft', 'queued', 'sending', 'sent', 'paused', 'failed'].includes(String(fields.status))
+            ? fields.status as 'draft' | 'queued' | 'sending' | 'sent' | 'paused' | 'failed'
+            : 'draft',
+          startDate: stringValue(fields.startDate, 20) || null, endDate: stringValue(fields.endDate, 20) || null,
+          subjectTemplate: stringValue(fields.subjectTemplate, 500), bodyTemplate: stringValue(fields.bodyTemplate, 50_000),
+          senderEmail: validEmail(fields.senderEmail), description: stringValue(fields.description, 10_000),
+        },
+      })
+      return NextResponse.json({ ok: true, queued: true, record: staged }, { status: body?.id ? 200 : 201 })
+    }
+
     const subject = stringValue(fields.subject, 250)
     if (!subject) throw new Error('Interaction subject is required')
     const staged = await stageCrmRecordInPostgres({
       entity, pipelineId: pipeline.id, sourceKey, actorEmail: actor.email,
       sourcePayload: { source: 'clawpilot' },
       fields: {
-        organizationId: organization?.id || null, opportunityId: opportunity?.id || null,
+        organizationId: organization?.id || contact?.organizationId || lead?.organizationId || null,
+        contactId: contact?.id || null, leadId: lead?.id || null, opportunityId: opportunity?.id || null,
         parentSuiteCrmId: opportunity?.suiteCrmId || null, interactionType: stringValue(fields.interactionType, 100),
         subject, agentName: stringValue(fields.agentName, 200), occurredAt: stringValue(fields.occurredAt, 50) || null,
         description: stringValue(fields.description, 10_000),
+        direction: ['inbound', 'outbound', 'internal'].includes(String(fields.direction))
+          ? fields.direction as 'inbound' | 'outbound' | 'internal'
+          : 'internal',
+        deliveryStatus: stringValue(fields.deliveryStatus, 100),
       },
     })
     return NextResponse.json({ ok: true, queued: true, record: staged }, { status: body?.id ? 200 : 201 })
