@@ -96,8 +96,8 @@ export default function WelcomePage() {
           <Alert severity="error" sx={{ my: 2 }}>{error}</Alert>
         ) : invitation ? (
           <>
-            <Typography color="text.secondary" sx={{ lineHeight: 1.65, mb: 2.5 }}>
-              {invitation.inviterName} invited <Box component="span" color="text.primary">{invitation.email}</Box> to a private ClawPilot workspace.
+            <Typography color="text.secondary" sx={{ lineHeight: 1.65, mb: 2.5, overflowWrap: 'anywhere' }}>
+              {invitation.inviterName} invited <Box component="span" color="text.primary" sx={{ overflowWrap: 'anywhere' }}>{invitation.email}</Box> to a private ClawPilot workspace.
             </Typography>
             <Stack spacing={1.5} sx={{ mb: 3 }}>
               {[

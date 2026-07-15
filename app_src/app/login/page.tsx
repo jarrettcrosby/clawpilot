@@ -221,8 +221,8 @@ export default function LoginPage() {
 
         {mode === 'code' ? (
           <>
-            <Typography variant="body2" color="text.secondary" sx={{ mb: 1.5 }}>
-              Enter the code sent to <Box component="span" color="text.primary">{sentEmail}</Box>.
+            <Typography variant="body2" color="text.secondary" sx={{ mb: 1.5, overflowWrap: 'anywhere' }}>
+              Enter the code sent to <Box component="span" color="text.primary" sx={{ overflowWrap: 'anywhere' }}>{sentEmail}</Box>.
             </Typography>
             <TextField
               autoFocus

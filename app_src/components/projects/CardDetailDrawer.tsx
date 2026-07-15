@@ -223,6 +223,7 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
   const [editCheckDue, setEditCheckDue] = useState('')
   const commentRef = useRef<HTMLInputElement>(null)
   const touchLandscape = useMediaQuery('(orientation: landscape) and (pointer: coarse)')
+  const shortLandscape = useMediaQuery('(orientation: landscape) and (max-height: 500px) and (max-width: 899.95px)')
 
   const patch = useCallback(async (payload: Record<string, unknown>) => {
     if (!task) return
@@ -326,7 +327,7 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
   return (
     <Drawer anchor="right" open={open} onClose={onClose} PaperProps={{
       sx: {
-        width: touchLandscape ? { xs: '96vw', sm: 520 } : { xs: '100vw', sm: 480 },
+        width: shortLandscape ? '100vw' : touchLandscape ? { xs: '96vw', sm: 520 } : { xs: '100vw', sm: 480 },
         maxWidth: '100vw',
         height: '100dvh',
         backgroundColor: '#1A1A23',
@@ -336,7 +337,7 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
       }
     }}>
       {/* Header */}
-      <Box sx={{ px: 3, pt: 3, pb: 2, borderBottom: '1px solid rgba(255,255,255,0.06)', flexShrink: 0 }}>
+      <Box sx={{ px: shortLandscape ? 1.5 : 3, pt: shortLandscape ? 1 : 3, pb: shortLandscape ? 1 : 2, borderBottom: '1px solid rgba(255,255,255,0.06)', flexShrink: 0 }}>
         <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
           <Stack direction="row" spacing={1} alignItems="center" mb={1.5}>
             <FlagRounded sx={{ fontSize: 16, color: PRIORITY_COLORS[task.priority] }} />
@@ -366,7 +367,7 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
       </Box>
 
 
-      <Box sx={{ flex: 1, minHeight: 0, overflow: 'auto', px: { xs: 2, sm: 3 }, py: 2.5, pb: 'calc(env(safe-area-inset-bottom) + 20px)', display: 'flex', flexDirection: 'column', gap: 2.5, WebkitOverflowScrolling: 'touch' }}>
+      <Box sx={{ flex: 1, minHeight: 0, overflow: 'auto', px: shortLandscape ? 1.5 : { xs: 2, sm: 3 }, py: shortLandscape ? 1.25 : 2.5, pb: 'calc(env(safe-area-inset-bottom) + 20px)', display: 'flex', flexDirection: 'column', gap: shortLandscape ? 1.5 : 2.5, WebkitOverflowScrolling: 'touch' }}>
 
         {patchError && <Alert severity="warning" onClose={() => setPatchError('')} sx={{ borderRadius: 1 }}>{patchError}</Alert>}
 
@@ -560,8 +561,8 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
             <Box sx={{ p: 1.25, mb: 1, borderRadius: 2, backgroundColor: '#232330', border: '1px solid rgba(255,255,255,0.08)' }}>
               <TextField size="small" fullWidth placeholder="Add checklist item" value={newCheckItem} onChange={e => setNewCheckItem(e.target.value)}
                 sx={{ mb: 1, '& .MuiOutlinedInput-root': { backgroundColor: '#1A1A23', borderRadius: 2, fontSize: '0.85rem' } }} />
-              <Stack direction="row" spacing={1} alignItems="center" mb={1}>
-                <Select size="small" value={checkItemAssignee} onChange={e => setCheckItemAssignee(e.target.value)} displayEmpty sx={{ ...selectSx, minWidth: 160 }} MenuProps={menuPaper}
+              <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} alignItems={{ xs: 'stretch', sm: 'center' }} mb={1}>
+                <Select size="small" value={checkItemAssignee} onChange={e => setCheckItemAssignee(e.target.value)} displayEmpty sx={{ ...selectSx, minWidth: { xs: 0, sm: 160 }, width: { xs: '100%', sm: 'auto' } }} MenuProps={menuPaper}
                   renderValue={v => v ? (PEOPLE.find(p => p.id === v)?.name || v as string) : 'Assignee (optional)'}>
                   <MenuItem value="">Unassigned</MenuItem>
                   {PEOPLE.filter(p => ASSIGNABLE_PRODUCT_AGENT_IDS.includes(p.id as typeof ASSIGNABLE_PRODUCT_AGENT_IDS[number])).map(p => (
@@ -569,7 +570,7 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
                   ))}
                 </Select>
                 <Box component="input" type="date" value={checkItemDue} onChange={(e: React.ChangeEvent<HTMLInputElement>) => setCheckItemDue(e.target.value)}
-                  sx={{ backgroundColor: '#1A1A23', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 2, color: 'white', px: 1.25, py: 0.75, fontSize: '0.75rem', outline: 'none', cursor: 'pointer', minWidth: 150,
+                  sx={{ backgroundColor: '#1A1A23', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 2, color: 'white', px: 1.25, py: 0.75, fontSize: '0.75rem', outline: 'none', cursor: 'pointer', minWidth: { xs: 0, sm: 150 }, width: { xs: '100%', sm: 'auto' }, boxSizing: 'border-box',
                     '&::-webkit-calendar-picker-indicator': { filter: 'invert(0.6)', cursor: 'pointer' } }} />
               </Stack>
               <Box sx={{ display: 'flex', justifyContent: 'flex-end', gap: 1 }}>
@@ -592,8 +593,8 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
                     <Box>
                       <TextField size="small" fullWidth value={editCheckText} onChange={(e) => setEditCheckText(e.target.value)}
                         sx={{ mb: 1, '& .MuiOutlinedInput-root': { backgroundColor: '#1A1A23', borderRadius: 2, fontSize: '0.85rem' } }} />
-                      <Stack direction="row" spacing={1} alignItems="center" mb={1}>
-                        <Select size="small" value={editCheckAssignee} onChange={e => setEditCheckAssignee(e.target.value)} displayEmpty sx={{ ...selectSx, minWidth: 160 }} MenuProps={menuPaper}
+                      <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} alignItems={{ xs: 'stretch', sm: 'center' }} mb={1}>
+                        <Select size="small" value={editCheckAssignee} onChange={e => setEditCheckAssignee(e.target.value)} displayEmpty sx={{ ...selectSx, minWidth: { xs: 0, sm: 160 }, width: { xs: '100%', sm: 'auto' } }} MenuProps={menuPaper}
                           renderValue={v => v ? (PEOPLE.find(p => p.id === v)?.name || v as string) : 'Assignee (optional)'}>
                           <MenuItem value="">Unassigned</MenuItem>
                           {PEOPLE.filter(p => ASSIGNABLE_PRODUCT_AGENT_IDS.includes(p.id as typeof ASSIGNABLE_PRODUCT_AGENT_IDS[number])).map(p => (
@@ -601,7 +602,7 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
                           ))}
                         </Select>
                         <Box component="input" type="date" value={editCheckDue} onChange={(e: React.ChangeEvent<HTMLInputElement>) => setEditCheckDue(e.target.value)}
-                          sx={{ backgroundColor: '#1A1A23', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 2, color: 'white', px: 1.25, py: 0.75, fontSize: '0.75rem', outline: 'none', cursor: 'pointer', minWidth: 150,
+                          sx={{ backgroundColor: '#1A1A23', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 2, color: 'white', px: 1.25, py: 0.75, fontSize: '0.75rem', outline: 'none', cursor: 'pointer', minWidth: { xs: 0, sm: 150 }, width: { xs: '100%', sm: 'auto' }, boxSizing: 'border-box',
                             '&::-webkit-calendar-picker-indicator': { filter: 'invert(0.6)', cursor: 'pointer' } }} />
                       </Stack>
                       <Stack direction="row" spacing={1}>

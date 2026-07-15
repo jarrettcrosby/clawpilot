@@ -86,7 +86,13 @@ function FilterControls({ filter, onChange, onClear }: Props) {
   }
 
   return (
-    <Box sx={{ display: 'flex', gap: 1, alignItems: 'center', overflowX: isXs ? 'auto' : 'visible', pb: isXs ? 0.25 : 0, '&::-webkit-scrollbar': { display: 'none' }, scrollbarWidth: 'none' }}>
+    <Box sx={{
+      display: 'flex', gap: 1, alignItems: 'center', overflowX: isXs ? 'auto' : 'visible', pb: isXs ? 0.5 : 0,
+      WebkitOverflowScrolling: 'touch',
+      '&::-webkit-scrollbar': { height: 4 },
+      '&::-webkit-scrollbar-thumb': { backgroundColor: 'rgba(255,255,255,0.18)', borderRadius: 2 },
+      scrollbarWidth: isXs ? 'thin' : 'auto',
+    }}>
       {/* Priority */}
       <FormControl size="small" sx={{ flex: { xs: '0 0 auto', sm: '1 1 0' }, minWidth: { xs: 160, sm: 180 } }}>
         <InputLabel sx={labelSx}>Priority</InputLabel>
@@ -201,7 +207,7 @@ export default function FilterBar({ filter, onChange, onClear }: Props) {
   // In landscape (short viewport), collapse filters into a bottom-sheet to preserve vertical space.
   if (smallHeight) {
     return (
-      <Box sx={{ mt: 1.5 }}>
+      <Box sx={{ mt: 0 }}>
         <Button
           onClick={() => setOpen(true)}
           startIcon={<TuneRounded />}

@@ -47,6 +47,7 @@ export default function SearchBar({ query, onSearch, archiveMode, onToggleArchiv
       />
       <Tooltip title={archiveMode ? 'Back to board' : 'View archived cards'}>
         <IconButton
+          aria-label={archiveMode ? 'Back to board' : 'View archived cards'}
           onClick={onToggleArchive}
           sx={{
             width: 40, height: 40,

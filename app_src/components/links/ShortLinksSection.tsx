@@ -19,6 +19,7 @@ import Snackbar from '@mui/material/Snackbar'
 import TextField from '@mui/material/TextField'
 import Tooltip from '@mui/material/Tooltip'
 import Typography from '@mui/material/Typography'
+import useMediaQuery from '@mui/material/useMediaQuery'
 import AddLinkRounded from '@mui/icons-material/AddLinkRounded'
 import BlockRounded from '@mui/icons-material/BlockRounded'
 import CheckCircleOutlineRounded from '@mui/icons-material/CheckCircleOutlineRounded'
@@ -131,6 +132,7 @@ async function copyText(value: string) {
 }
 
 export default function ShortLinksSection() {
+  const shortLandscape = useMediaQuery('(orientation: landscape) and (max-height: 500px) and (max-width: 899.95px)')
   const [records, setRecords] = useState<ShortLinkRecord[]>([])
   const [search, setSearch] = useState('')
   const [tag, setTag] = useState('')
@@ -569,8 +571,9 @@ export default function ShortLinksSection() {
       <Dialog
         open={Boolean(deleting)}
         onClose={() => { if (!mutation) setDeleting(null) }}
+        fullScreen={shortLandscape}
         aria-labelledby="delete-short-link-title"
-        PaperProps={{ sx: { width: 'min(92vw, 440px)', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.09)', backgroundColor: '#1A1A23' } }}
+        PaperProps={{ sx: { width: shortLandscape ? '100%' : 'min(92vw, 440px)', borderRadius: shortLandscape ? 0 : '8px', border: '1px solid rgba(255,255,255,0.09)', backgroundColor: '#1A1A23' } }}
       >
         <DialogTitle id="delete-short-link-title" sx={{ fontSize: '1.05rem', fontWeight: 700 }}>Delete short link?</DialogTitle>
         <DialogContent>

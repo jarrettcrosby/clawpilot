@@ -23,6 +23,7 @@ import Stack from '@mui/material/Stack'
 import TextField from '@mui/material/TextField'
 import Tooltip from '@mui/material/Tooltip'
 import Typography from '@mui/material/Typography'
+import useMediaQuery from '@mui/material/useMediaQuery'
 import CheckRounded from '@mui/icons-material/CheckRounded'
 import ContentCopyRounded from '@mui/icons-material/ContentCopyRounded'
 import LinkOffRounded from '@mui/icons-material/LinkOffRounded'
@@ -119,6 +120,7 @@ async function copyText(text: string): Promise<boolean> {
 }
 
 export default function AgentsSection() {
+  const shortLandscape = useMediaQuery('(orientation: landscape) and (max-height: 500px) and (max-width: 899.95px)')
   const [agents, setAgents] = useState<Agent[]>([])
   const [runtime, setRuntime] = useState<Runtime | null>(null)
   const [tasks, setTasks] = useState<Task[]>([])
@@ -450,13 +452,13 @@ export default function AgentsSection() {
   ].filter(Boolean).join(' | ')
 
   return (
-    <Box p={{ xs: 2, md: 3 }}>
-      <Stack direction={{ xs: 'column', sm: 'row' }} justifyContent="space-between" spacing={1.5} mb={2}>
+    <Box p={shortLandscape ? 1 : { xs: 2, md: 3 }}>
+      <Stack direction="row" justifyContent="space-between" spacing={shortLandscape ? 0.75 : 1.5} mb={shortLandscape ? 0.75 : 2} alignItems="center">
         <Box>
-          <Typography variant="h5" fontWeight={700} color="text.primary">Agents</Typography>
-          <Typography variant="body2" color="text.secondary">Task ownership and execution threads</Typography>
+          <Typography variant="h5" fontWeight={700} color="text.primary" sx={shortLandscape ? { fontSize: '1rem' } : undefined}>Agents</Typography>
+          {!shortLandscape && <Typography variant="body2" color="text.secondary">Task ownership and execution threads</Typography>}
         </Box>
-        <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap">
+        <Stack direction="row" spacing={shortLandscape ? 0.5 : 1} alignItems="center" flexWrap={shortLandscape ? 'nowrap' : 'wrap'} sx={{ overflowX: 'auto', minWidth: 0 }}>
           <Chip size="small" label={`${agents.length} agents`} />
           <Chip size="small" label={`${assignedCount}/${openTasks.length} assigned`} />
           <Tooltip title={codexConnected ? codexAccountDetails || 'ChatGPT connected' : ''}>
@@ -507,8 +509,12 @@ export default function AgentsSection() {
         </Alert>
       )}
 
-      <Box display="grid" gridTemplateColumns={{ xs: '1fr', md: '280px minmax(0, 1fr)' }} gap={2}>
-        <Stack spacing={1}>
+      <Box display="grid" gridTemplateColumns={{ xs: '1fr', md: '280px minmax(0, 1fr)' }} gap={shortLandscape ? 1 : 2}>
+        <Stack
+          direction={shortLandscape ? 'row' : 'column'}
+          spacing={1}
+          sx={shortLandscape ? { overflowX: 'auto', WebkitOverflowScrolling: 'touch', pb: 0.25 } : undefined}
+        >
           {agents.map((agent) => {
             const active = agent.id === selectedAgentId
             const taskCount = openTasks.filter((task) => task.assignedAgent === agent.id).length
@@ -516,7 +522,7 @@ export default function AgentsSection() {
               <ButtonBase
                 key={agent.id}
                 onClick={() => setSelectedAgentId(agent.id)}
-                sx={{ width: '100%', textAlign: 'left', borderRadius: 1 }}
+                sx={{ width: shortLandscape ? 180 : '100%', minWidth: shortLandscape ? 180 : 0, textAlign: 'left', borderRadius: 1, flexShrink: 0 }}
               >
                 <Card sx={{ width: '100%', p: 1.25, borderRadius: 1, backgroundColor: active ? 'rgba(168,199,250,0.12)' : '#1A1A23', border: active ? '1px solid rgba(168,199,250,0.5)' : '1px solid rgba(255,255,255,0.08)' }}>
                   <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={1}>
@@ -524,20 +530,20 @@ export default function AgentsSection() {
                     <Chip size="small" label={taskCount} />
                   </Stack>
                   <Typography variant="caption" color="text.secondary">{agent.owner} | {agent.status}</Typography>
-                  <Typography variant="body2" color="text.secondary" mt={0.5}>{agent.summary}</Typography>
+                  {!shortLandscape && <Typography variant="body2" color="text.secondary" mt={0.5}>{agent.summary}</Typography>}
                 </Card>
               </ButtonBase>
             )
           })}
         </Stack>
 
-        <Card sx={{ minHeight: 520, p: 1.5, borderRadius: 1, backgroundColor: '#15151D', border: '1px solid rgba(255,255,255,0.08)', display: 'flex', flexDirection: 'column' }}>
-          <Stack direction={{ xs: 'column', sm: 'row' }} justifyContent="space-between" spacing={1} mb={1.25}>
+        <Card data-testid="agents-thread" sx={{ minHeight: shortLandscape ? 200 : 520, p: shortLandscape ? 1 : 1.5, borderRadius: 1, backgroundColor: '#15151D', border: '1px solid rgba(255,255,255,0.08)', display: 'flex', flexDirection: 'column' }}>
+          <Stack direction={shortLandscape ? 'row' : { xs: 'column', sm: 'row' }} justifyContent="space-between" spacing={1} mb={shortLandscape ? 0.75 : 1.25}>
             <Box minWidth={0}>
               <Typography variant="subtitle1" fontWeight={700}>{selectedAgent?.name || 'Agent thread'}</Typography>
               <Typography variant="caption" color="text.secondary">{selectedTask?.title || 'No assigned task selected'}</Typography>
             </Box>
-            <FormControl size="small" sx={{ minWidth: { xs: '100%', sm: 260 } }}>
+            <FormControl size="small" sx={{ minWidth: shortLandscape ? 280 : { xs: '100%', sm: 260 } }}>
               <InputLabel>Task</InputLabel>
               <Select label="Task" value={selectedTaskId} onChange={(event) => setSelectedTaskId(String(event.target.value))}>
                 {assignedTasks.map((task) => <MenuItem key={task.id} value={task.id}>{task.title}</MenuItem>)}
@@ -546,7 +552,7 @@ export default function AgentsSection() {
           </Stack>
 
           {selectedTask && (
-            <Box sx={{ px: 1.25, py: 1, mb: 1.25, borderRadius: 1, backgroundColor: 'rgba(255,255,255,0.04)' }}>
+            <Box sx={{ px: shortLandscape ? 0.75 : 1.25, py: shortLandscape ? 0.5 : 1, mb: shortLandscape ? 0.75 : 1.25, maxHeight: shortLandscape ? 48 : 'none', overflow: shortLandscape ? 'auto' : 'visible', borderRadius: 1, backgroundColor: 'rgba(255,255,255,0.04)' }}>
               <Stack direction="row" spacing={1} flexWrap="wrap" mb={0.5}>
                 <Chip size="small" label={selectedTask.status} />
                 <Chip size="small" label={selectedTask.priority} />
@@ -559,7 +565,7 @@ export default function AgentsSection() {
                 )}
                 {selectedTask.dueDate && <Chip size="small" label={`Due ${selectedTask.dueDate}`} />}
               </Stack>
-              {selectedTask.desc && <Typography variant="body2" color="text.secondary">{selectedTask.desc}</Typography>}
+              {selectedTask.desc && !shortLandscape && <Typography variant="body2" color="text.secondary" sx={{ overflowWrap: 'anywhere' }}>{selectedTask.desc}</Typography>}
               {selectedTask.workItem?.nextAction && (
                 <Typography variant="caption" color="text.primary" display="block" mt={0.75}>Next: {selectedTask.workItem.nextAction}</Typography>
               )}
@@ -569,8 +575,8 @@ export default function AgentsSection() {
             </Box>
           )}
 
-          <Divider sx={{ borderColor: 'rgba(255,255,255,0.08)', mb: 1.25 }} />
-          <Stack spacing={1} sx={{ flex: 1, minHeight: 220, maxHeight: 380, overflowY: 'auto', pr: 0.5 }}>
+          <Divider sx={{ borderColor: 'rgba(255,255,255,0.08)', mb: shortLandscape ? 0.75 : 1.25 }} />
+          <Stack spacing={1} sx={{ flex: 1, minHeight: shortLandscape ? 40 : 220, maxHeight: shortLandscape ? 72 : 380, overflowY: 'auto', pr: 0.5 }}>
             {!selectedTaskId ? (
               <Typography variant="body2" color="text.disabled">No open tasks assigned to this agent.</Typography>
             ) : messages.length === 0 ? (
@@ -578,14 +584,14 @@ export default function AgentsSection() {
             ) : messages.map((message) => (
               <Box key={message.id} sx={{ alignSelf: message.role === 'user' ? 'flex-end' : 'flex-start', maxWidth: '88%' }}>
                 <Box sx={{ px: 1.2, py: 0.9, borderRadius: 1, backgroundColor: message.role === 'user' ? 'rgba(168,199,250,0.2)' : message.role === 'system' ? 'rgba(239,83,80,0.12)' : 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.08)' }}>
-                  <Typography variant="body2" color="text.primary" sx={{ whiteSpace: 'pre-wrap', lineHeight: 1.45 }}>{message.text}</Typography>
+                  <Typography variant="body2" color="text.primary" sx={{ whiteSpace: 'pre-wrap', lineHeight: 1.45, overflowWrap: 'anywhere' }}>{message.text}</Typography>
                 </Box>
                 <Typography variant="caption" color="text.disabled" sx={{ px: 0.5 }}>{formatTimestamp(message.createdAt)}</Typography>
               </Box>
             ))}
           </Stack>
 
-          <Stack direction="row" spacing={1} mt={1.25} alignItems="flex-end">
+          <Stack direction="row" spacing={1} mt={shortLandscape ? 0.75 : 1.25} alignItems="flex-end">
             <TextField
               size="small"
               placeholder={selectedTask ? `Message ${selectedAgent?.name || 'agent'} about this task` : 'Assign a task to start a thread'}
@@ -648,7 +654,8 @@ export default function AgentsSection() {
         onClose={closeAuthDialog}
         maxWidth="xs"
         fullWidth
-        PaperProps={{ sx: { mx: 2, borderRadius: 1, backgroundColor: '#1A1A23', border: '1px solid rgba(255,255,255,0.08)' } }}
+        fullScreen={shortLandscape}
+        PaperProps={{ sx: { mx: shortLandscape ? 0 : 2, borderRadius: shortLandscape ? 0 : 1, backgroundColor: '#1A1A23', border: '1px solid rgba(255,255,255,0.08)' } }}
       >
         <DialogTitle sx={{ pb: 1, color: 'text.primary', fontWeight: 700 }}>Connect ChatGPT</DialogTitle>
         <DialogContent>

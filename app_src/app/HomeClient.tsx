@@ -156,7 +156,15 @@ export default function HomeClient({ shortLinksEnabled }: { shortLinksEnabled: b
       display="flex"
       height="100dvh"
       width="100%"
-      sx={{ maxWidth: '100vw', backgroundColor: '#0F0F13', overflow: 'hidden' }}
+      sx={{
+        '--mobile-navigation-height': '64px',
+        '@media (orientation: landscape) and (max-height: 500px) and (max-width: 899.95px)': {
+          '--mobile-navigation-height': '52px',
+        },
+        maxWidth: '100vw',
+        backgroundColor: '#0F0F13',
+        overflow: 'hidden',
+      }}
     >
       <Navigation
         activeSection={section}
@@ -187,8 +195,8 @@ export default function HomeClient({ shortLinksEnabled }: { shortLinksEnabled: b
             flex: 1,
             overflow: ['docs', 'projects', 'pipeline', 'crm'].includes(section) ? 'hidden' : 'auto',
             pb: ['docs', 'projects', 'pipeline', 'crm'].includes(section)
-              ? { xs: 'calc(64px + env(safe-area-inset-bottom) + 8px)', md: 0 }
-              : { xs: 'calc(64px + env(safe-area-inset-bottom) + 16px)', md: 2 },
+              ? { xs: 'calc(var(--mobile-navigation-height) + env(safe-area-inset-bottom) + 8px)', md: 0 }
+              : { xs: 'calc(var(--mobile-navigation-height) + env(safe-area-inset-bottom) + 16px)', md: 2 },
           }}
         >
           {section === 'dashboard' && (

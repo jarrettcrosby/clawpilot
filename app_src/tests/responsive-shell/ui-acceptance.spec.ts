@@ -3,6 +3,26 @@ import type { Locator, Page } from '@playwright/test'
 
 test.use({ hasTouch: true })
 
+const authPassword = process.env.UI_AUTH_PASSWORD
+const operatorSecret = process.env.UI_OPERATOR_SECRET
+
+async function gotoApp(page: Page, path: string) {
+  if (authPassword && operatorSecret) {
+    const response = await page.request.post('/api/auth/login', {
+      data: { password: authPassword },
+      headers: { 'x-clawpilot-operator-secret': operatorSecret },
+      failOnStatusCode: false,
+    })
+    expect(response.ok(), `UI authentication failed with HTTP ${response.status()}`).toBeTruthy()
+  }
+
+  await page.goto(path)
+  if (new URL(page.url()).pathname === '/login') {
+    throw new Error('Target requires authentication; set UI_AUTH_PASSWORD and UI_OPERATOR_SECRET together')
+  }
+  await expect(page.getByTestId('app-shell')).toBeVisible()
+}
+
 async function expectWidth(locator: Locator, width: number) {
   await expect.poll(async () => Math.round((await locator.boundingBox())?.width ?? 0)).toBe(width)
 }
@@ -20,17 +40,28 @@ async function expectContentBesideNavigation(page: Page, navigationWidth: number
 }
 
 async function expectNoHorizontalOverflow(page: Page) {
-  const dimensions = await page.evaluate(() => ({
-    viewportWidth: window.innerWidth,
-    documentWidth: document.documentElement.scrollWidth,
-  }))
+  await expect.poll(async () => page.evaluate(() => (
+    document.documentElement.scrollWidth - window.innerWidth
+  ))).toBeLessThanOrEqual(1)
+}
 
-  expect(dimensions.documentWidth).toBeLessThanOrEqual(dimensions.viewportWidth)
+async function expectVisibleAboveBottomNavigation(page: Page, locator: Locator, minimumHeight: number) {
+  await expect(locator).toBeVisible()
+  await expect.poll(async () => {
+    const [box, navigationBox] = await Promise.all([
+      locator.boundingBox(),
+      page.getByTestId('mobile-bottom-navigation').boundingBox(),
+    ])
+    if (!box) return 0
+    const viewportHeight = page.viewportSize()?.height ?? 0
+    const visibleBottom = Math.min(box.y + box.height, navigationBox?.y ?? viewportHeight, viewportHeight)
+    return Math.max(0, visibleBottom - Math.max(0, box.y))
+  }).toBeGreaterThanOrEqual(minimumHeight)
 }
 
 test('responsive shell: 1366x768 touch input keeps a real desktop drawer sibling', async ({ page }) => {
   await page.setViewportSize({ width: 1366, height: 768 })
-  await page.goto('/#dashboard')
+  await gotoApp(page, '/#dashboard')
 
   expect(await page.evaluate(() => navigator.maxTouchPoints)).toBeGreaterThan(0)
 
@@ -62,7 +93,7 @@ test('responsive shell: 1366x768 touch input keeps a real desktop drawer sibling
 
 test('responsive shell: 900x599 is desktop regardless of height or touch input', async ({ page }) => {
   await page.setViewportSize({ width: 900, height: 599 })
-  await page.goto('/#dashboard')
+  await gotoApp(page, '/#dashboard')
 
   const desktopNavigation = page.getByTestId('desktop-navigation')
 
@@ -78,7 +109,7 @@ test('responsive shell: 900x599 is desktop regardless of height or touch input',
 
 test('responsive shell: 390x844 exposes compact navigation and dismissible drawers', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 })
-  await page.goto('/#dashboard')
+  await gotoApp(page, '/#dashboard')
 
   const desktopNavigation = page.getByTestId('desktop-navigation')
   const mobileToggle = page.getByTestId('mobile-navigation-toggle')
@@ -139,5 +170,40 @@ test('responsive shell: 390x844 exposes compact navigation and dismissible drawe
   expect(Math.round(docsToolbarBox?.y ?? 0)).toBeGreaterThanOrEqual(
     Math.round((headerBox?.y ?? 0) + (headerBox?.height ?? 0)),
   )
+  await expectNoHorizontalOverflow(page)
+})
+
+test('responsive shell: 844x390 keeps mobile navigation usable without covering active content', async ({ page }) => {
+  await page.setViewportSize({ width: 844, height: 390 })
+  await gotoApp(page, '/#dashboard')
+
+  const desktopNavigation = page.getByTestId('desktop-navigation')
+  const mobileToggle = page.getByTestId('mobile-navigation-toggle')
+  const mobileDrawer = page.getByTestId('mobile-navigation-drawer')
+  const bottomNavigation = page.getByTestId('mobile-bottom-navigation')
+
+  await expect(desktopNavigation).toBeHidden()
+  await expect(mobileToggle).toBeVisible()
+  await expect(bottomNavigation).toBeVisible()
+  await expect(bottomNavigation.getByRole('button')).toHaveCount(5)
+
+  const navigationBox = await bottomNavigation.boundingBox()
+  expect(navigationBox).not.toBeNull()
+  expect(Math.round(navigationBox?.width ?? 0)).toBe(844)
+  expect(Math.round((navigationBox?.y ?? 0) + (navigationBox?.height ?? 0))).toBe(390)
+
+  const sectionHost = page.getByTestId('app-header').locator('xpath=following-sibling::*[1]')
+  const activeSection = sectionHost.locator(':scope > div').first()
+  await expectVisibleAboveBottomNavigation(page, activeSection, 96)
+
+  await page.getByTestId('nav-bottom-more').click()
+  await expect(mobileDrawer).toBeVisible()
+  await expectWidth(mobileDrawer, Math.round(Math.min(320, 844 * 0.86)))
+  await page.getByTestId('mobile-navigation-close').click()
+  await expect(mobileDrawer).toBeHidden()
+
+  await page.getByTestId('nav-bottom-projects').click()
+  await expect(page).toHaveURL(/#projects$/)
+  await expect(page.getByPlaceholder('Search cards...')).toBeVisible()
   await expectNoHorizontalOverflow(page)
 })

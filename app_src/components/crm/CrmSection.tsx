@@ -29,6 +29,7 @@ import {
   TextField,
   Tooltip,
   Typography,
+  useMediaQuery,
 } from '@mui/material'
 import AddRounded from '@mui/icons-material/AddRounded'
 import AccountTreeRounded from '@mui/icons-material/AccountTreeRounded'
@@ -226,6 +227,7 @@ function initialFields(entity: CrmEntity, record: RecordValue | null): Record<st
 }
 
 export default function CrmSection() {
+  const shortLandscape = useMediaQuery('(orientation: landscape) and (max-height: 500px) and (max-width: 899.95px)')
   const [entity, setEntity] = useState<CrmEntity>('organizations')
   const [records, setRecords] = useState<RecordValue[]>([])
   const [summary, setSummary] = useState<CrmSummary>(EMPTY_SUMMARY)
@@ -481,13 +483,18 @@ export default function CrmSection() {
 
   return (
     <Box sx={{ height: '100%', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-      <Box sx={{ px: { xs: 2, md: 3 }, pt: 2.5, pb: 1.5, flexShrink: 0 }}>
-        <Stack direction={{ xs: 'column', lg: 'row' }} justifyContent="space-between" gap={1.5}>
-          <Box>
-            <Typography variant="h5" fontWeight={700}>CRM</Typography>
-            <Typography variant="body2" color="text.secondary">{pipeline?.name || 'Customer records'}</Typography>
+      <Box sx={{ px: shortLandscape ? 1 : { xs: 2, md: 3 }, pt: shortLandscape ? 0.5 : 2.5, pb: shortLandscape ? 0.5 : 1.5, flexShrink: 0 }}>
+        <Stack direction={shortLandscape ? 'row' : { xs: 'column', lg: 'row' }} justifyContent="space-between" gap={shortLandscape ? 1 : 1.5} alignItems={shortLandscape ? 'center' : undefined}>
+          <Box sx={{ flexShrink: 0 }}>
+            <Typography variant="h5" fontWeight={700} sx={shortLandscape ? { fontSize: '1rem' } : undefined}>CRM</Typography>
+            {!shortLandscape && <Typography variant="body2" color="text.secondary">{pipeline?.name || 'Customer records'}</Typography>}
           </Box>
-          <Stack direction={{ xs: 'column', sm: 'row' }} gap={1} alignItems={{ sm: 'center' }}>
+          <Stack
+            direction="row"
+            gap={shortLandscape ? 0.5 : 1}
+            alignItems="center"
+            sx={shortLandscape ? { minWidth: 0, overflowX: 'auto', WebkitOverflowScrolling: 'touch', '& > *': { flexShrink: 0 } } : undefined}
+          >
             <WorkspaceSelector kind="pipeline" />
             {workspaceHierarchy.length > 0 && (
               <Button
@@ -521,71 +528,73 @@ export default function CrmSection() {
             )}
           </Stack>
         </Stack>
-        <Stack direction="row" gap={1} mt={2} sx={{ overflowX: 'auto', pb: 0.5 }}>
-          <Chip label={`${summary.organizations} organizations`} />
-          <Chip label={`${summary.contacts} contacts`} />
-          <Chip label={`${summary.leads} leads`} />
-          <Chip label={`${summary.opportunities} opportunities`} />
-          <Chip label={`${summary.meetings} meetings`} />
-          <Chip label={`${summary.interactions} interactions`} />
-          <Chip label={`${summary.campaigns} campaigns`} />
-          <Chip label={money(summary.openPipelineValue)} color="primary" variant="outlined" />
-          {summary.pendingSync > 0 && <Chip label={`${summary.pendingSync} syncing`} color="warning" />}
-          {summary.failedSync > 0 && <Chip label={`${summary.failedSync} failed`} color="error" />}
+        <Stack direction="row" gap={shortLandscape ? 0.5 : 1} mt={shortLandscape ? 0.5 : 2} sx={{ overflowX: 'auto', pb: shortLandscape ? 0 : 0.5, scrollbarWidth: 'thin' }}>
+          <Chip size={shortLandscape ? 'small' : 'medium'} label={`${summary.organizations} organizations`} />
+          <Chip size={shortLandscape ? 'small' : 'medium'} label={`${summary.contacts} contacts`} />
+          <Chip size={shortLandscape ? 'small' : 'medium'} label={`${summary.leads} leads`} />
+          <Chip size={shortLandscape ? 'small' : 'medium'} label={`${summary.opportunities} opportunities`} />
+          <Chip size={shortLandscape ? 'small' : 'medium'} label={`${summary.meetings} meetings`} />
+          <Chip size={shortLandscape ? 'small' : 'medium'} label={`${summary.interactions} interactions`} />
+          <Chip size={shortLandscape ? 'small' : 'medium'} label={`${summary.campaigns} campaigns`} />
+          <Chip size={shortLandscape ? 'small' : 'medium'} label={money(summary.openPipelineValue)} color="primary" variant="outlined" />
+          {summary.pendingSync > 0 && <Chip size={shortLandscape ? 'small' : 'medium'} label={`${summary.pendingSync} syncing`} color="warning" />}
+          {summary.failedSync > 0 && <Chip size={shortLandscape ? 'small' : 'medium'} label={`${summary.failedSync} failed`} color="error" />}
         </Stack>
       </Box>
       <Divider />
-      <Box sx={{ px: { xs: 2, md: 3 }, pt: 1.25, flexShrink: 0 }}>
+      <Box sx={{ px: shortLandscape ? 1 : { xs: 2, md: 3 }, pt: shortLandscape ? 0.25 : 1.25, flexShrink: 0 }}>
         {error && <Alert severity="error" onClose={() => setError('')} sx={{ mb: 1 }}>{error}</Alert>}
         {notice && <Alert severity="success" onClose={() => setNotice('')} sx={{ mb: 1 }}>{notice}</Alert>}
-        <Stack direction={{ xs: 'column', md: 'row' }} justifyContent="space-between" gap={1} alignItems={{ md: 'center' }}>
-          <Tabs value={entity} onChange={(_, value: CrmEntity) => {
-            deepLinkOpened.current = true
-            setEntity(value)
-            setQuery('')
-            setRouteQuery('')
-          }} variant="scrollable">
-            {(Object.keys(ENTITY_LABELS) as CrmEntity[]).map((value) => (
-              <Tab key={value} value={value} label={ENTITY_LABELS[value]} />
-            ))}
-          </Tabs>
-          <Stack direction="row" gap={0.75} alignItems="center">
-            {pipeline?.accessRole === 'owner' && (
-              <>
-                <Tooltip title="Import the connected workbook into CRM">
-                  <IconButton aria-label="Import workbook" disabled={busy} onClick={() => runWorkbookAction('/api/crm/import', 'Workbook imported and queued for CRM sync')}>
-                    <UploadFileRounded />
-                  </IconButton>
-                </Tooltip>
-                <Tooltip title="Refresh workbook from CRM">
-                  <IconButton aria-label="Refresh workbook" disabled={busy} onClick={() => runWorkbookAction('/api/crm/workbook', 'Workbook refreshed from CRM')}>
-                    <RefreshRounded />
-                  </IconButton>
-                </Tooltip>
-              </>
-            )}
-            {editable && (
-              <Button variant="contained" startIcon={<AddRounded />} onClick={() => openEditor(null)}>
-                Add
-              </Button>
-            )}
+        <Stack direction={shortLandscape ? 'row' : 'column'} gap={shortLandscape ? 0.75 : 0} alignItems={shortLandscape ? 'center' : 'stretch'} sx={shortLandscape ? { overflowX: 'auto', WebkitOverflowScrolling: 'touch' } : undefined}>
+          <Stack direction="row" justifyContent="space-between" gap={1} alignItems="center" sx={{ minWidth: 0, flexShrink: 0 }}>
+            <Tabs value={entity} onChange={(_, value: CrmEntity) => {
+              deepLinkOpened.current = true
+              setEntity(value)
+              setQuery('')
+              setRouteQuery('')
+            }} variant="scrollable" sx={shortLandscape ? { minHeight: 36, maxWidth: 420, '& .MuiTab-root': { minHeight: 36, py: 0.5 } } : undefined}>
+              {(Object.keys(ENTITY_LABELS) as CrmEntity[]).map((value) => (
+                <Tab key={value} value={value} label={ENTITY_LABELS[value]} />
+              ))}
+            </Tabs>
+            <Stack direction="row" gap={0.75} alignItems="center" sx={{ flexShrink: 0 }}>
+              {pipeline?.accessRole === 'owner' && (
+                <>
+                  <Tooltip title="Import the connected workbook into CRM">
+                    <IconButton aria-label="Import workbook" disabled={busy} onClick={() => runWorkbookAction('/api/crm/import', 'Workbook imported and queued for CRM sync')}>
+                      <UploadFileRounded />
+                    </IconButton>
+                  </Tooltip>
+                  <Tooltip title="Refresh workbook from CRM">
+                    <IconButton aria-label="Refresh workbook" disabled={busy} onClick={() => runWorkbookAction('/api/crm/workbook', 'Workbook refreshed from CRM')}>
+                      <RefreshRounded />
+                    </IconButton>
+                  </Tooltip>
+                </>
+              )}
+              {editable && (
+                <Button variant="contained" startIcon={<AddRounded />} onClick={() => openEditor(null)}>
+                  Add
+                </Button>
+              )}
+            </Stack>
           </Stack>
+          <TextField
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            onKeyDown={(event) => { if (event.key === 'Enter') void load(entity, query) }}
+            placeholder={`Search ${ENTITY_LABELS[entity].toLowerCase()}`}
+            size="small"
+            fullWidth={!shortLandscape}
+            sx={{ mt: shortLandscape ? 0 : 1.25, mb: shortLandscape ? 0.25 : 1, width: shortLandscape ? 220 : undefined, flexShrink: 0 }}
+            InputProps={{
+              startAdornment: <InputAdornment position="start"><SearchRounded fontSize="small" /></InputAdornment>,
+              endAdornment: query ? <InputAdornment position="end"><IconButton size="small" aria-label="Run search" onClick={() => load(entity, query)}><SearchRounded fontSize="small" /></IconButton></InputAdornment> : undefined,
+            }}
+          />
         </Stack>
-        <TextField
-          value={query}
-          onChange={(event) => setQuery(event.target.value)}
-          onKeyDown={(event) => { if (event.key === 'Enter') void load(entity, query) }}
-          placeholder={`Search ${ENTITY_LABELS[entity].toLowerCase()}`}
-          size="small"
-          fullWidth
-          sx={{ mt: 1.25, mb: 1 }}
-          InputProps={{
-            startAdornment: <InputAdornment position="start"><SearchRounded fontSize="small" /></InputAdornment>,
-            endAdornment: query ? <InputAdornment position="end"><IconButton size="small" aria-label="Run search" onClick={() => load(entity, query)}><SearchRounded fontSize="small" /></IconButton></InputAdornment> : undefined,
-          }}
-        />
       </Box>
-      <TableContainer sx={{ flex: 1, minHeight: 0, px: { xs: 0, md: 3 } }}>
+      <TableContainer data-testid="crm-records" sx={{ flex: 1, minHeight: shortLandscape ? 96 : 0, px: { xs: 0, md: 3 }, overflow: 'auto' }}>
         {loading ? (
           <Box display="grid" sx={{ placeItems: 'center', height: 240 }}><CircularProgress size={28} /></Box>
         ) : (
@@ -640,6 +649,7 @@ export default function CrmSection() {
       <Dialog
         open={suiteCrmAccessOpen}
         onClose={() => setSuiteCrmAccessOpen(false)}
+        fullScreen={shortLandscape}
         fullWidth
         maxWidth="xs"
         PaperProps={{ sx: { backgroundColor: '#1A1A23', backgroundImage: 'none', borderRadius: '8px' } }}
@@ -666,7 +676,7 @@ export default function CrmSection() {
             </Typography>
           </Stack>
         </DialogContent>
-        <DialogActions sx={{ px: 3, pb: 2.5 }}>
+        <DialogActions sx={{ px: shortLandscape ? 1.5 : 3, pb: shortLandscape ? 1.5 : 2.5, flexWrap: 'wrap' }}>
           <Button onClick={() => setSuiteCrmAccessOpen(false)}>Cancel</Button>
           {suiteCrmAdminPortalUrl ? (
             <Button component="a" href={suiteCrmAdminPortalUrl} target="_blank" rel="noopener noreferrer">
@@ -690,6 +700,7 @@ export default function CrmSection() {
       <Dialog
         open={Boolean(actionComposer)}
         onClose={() => { if (!busy) setActionComposer(null) }}
+        fullScreen={shortLandscape}
         fullWidth
         maxWidth="sm"
       >

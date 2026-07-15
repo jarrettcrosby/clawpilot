@@ -111,7 +111,9 @@ function sameTags(left: string[], right: string[]) {
 
 export default function ShortLinkFormDialog({ open, record, busy, onClose, onSubmit }: Props) {
   const theme = useTheme()
-  const fullScreen = useMediaQuery(theme.breakpoints.down('sm'))
+  const narrowScreen = useMediaQuery(theme.breakpoints.down('sm'))
+  const shortViewport = useMediaQuery('(max-height: 500px)')
+  const fullScreen = narrowScreen || shortViewport
   const [values, setValues] = useState<FormValues>(EMPTY_FORM)
   const [initialValues, setInitialValues] = useState<FormValues>(EMPTY_FORM)
   const [error, setError] = useState('')
@@ -185,7 +187,7 @@ export default function ShortLinkFormDialog({ open, record, busy, onClose, onSub
       aria-labelledby="short-link-form-title"
       PaperProps={{
         sx: {
-          borderRadius: { xs: 0, sm: '8px' },
+          borderRadius: fullScreen ? 0 : '8px',
           backgroundColor: '#1A1A23',
           border: { sm: '1px solid rgba(255,255,255,0.09)' },
         },

@@ -574,9 +574,7 @@ export default function PipelineSection() {
   const [ownerOptions, setOwnerOptions] = useState<string[]>(DEFAULT_OWNERS)
   const [lossReasonOptions, setLossReasonOptions] = useState<string[]>(DEFAULT_LOSS_REASONS)
   const [productOptions, setProductOptions] = useState<string[]>(DEFAULT_PRODUCTS)
-  const touchLandscape = useMediaQuery('(orientation: landscape) and (pointer: coarse)')
-  const tabletOrSmaller = useMediaQuery('(max-width: 1024px)')
-  const compactLandscapeBoard = touchLandscape && tabletOrSmaller
+  const compactLandscapeBoard = useMediaQuery('(orientation: landscape) and (max-height: 500px) and (max-width: 899.95px)')
   const [activeStage, setActiveStage] = useState<string>(DEFAULT_STAGES[0])
   const [syncSurface, setSyncSurface] = useState<SyncSurface>({ state: 'unknown', lastSyncedAt: null, summary: null })
   const [syncingNow, setSyncingNow] = useState(false)
@@ -877,19 +875,33 @@ export default function PipelineSection() {
 
   return (
     <Box sx={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
-      <Box sx={{ px: { xs: 2, md: 3 }, py: 2, borderBottom: '1px solid rgba(255,255,255,0.06)', flexShrink: 0 }}>
-        <Stack direction="row" spacing={3} alignItems="center" flexWrap="wrap" gap={1.25}>
-          <Box><Typography variant="caption" color="text.disabled">Pipeline Value</Typography><Typography variant="h6" fontWeight={700} color="#66BB6A">{fmt$(totalValue)}</Typography></Box>
+      <Box sx={{ px: compactLandscapeBoard ? 1 : { xs: 2, md: 3 }, py: compactLandscapeBoard ? 0.75 : 2, borderBottom: '1px solid rgba(255,255,255,0.06)', flexShrink: 0 }}>
+        <Stack
+          direction="row"
+          spacing={compactLandscapeBoard ? 1.5 : 3}
+          alignItems="center"
+          flexWrap={compactLandscapeBoard ? 'nowrap' : 'wrap'}
+          gap={compactLandscapeBoard ? 0 : 1.25}
+          sx={compactLandscapeBoard ? {
+            maxWidth: '100%',
+            overflowX: 'auto',
+            overflowY: 'hidden',
+            WebkitOverflowScrolling: 'touch',
+            scrollbarWidth: 'thin',
+            '& > *': { flexShrink: 0 },
+          } : undefined}
+        >
+          <Box><Typography variant="caption" color="text.disabled">Pipeline Value</Typography><Typography variant="h6" fontWeight={700} lineHeight={1.15} color="#66BB6A">{fmt$(totalValue)}</Typography></Box>
           <Box>
             <Typography variant="caption" color="text.disabled">Weighted Value</Typography>
-            <Typography variant="h6" fontWeight={700} color="#A8C7FA">{fmt$(weightedPipelineValue)}</Typography>
-            <Typography variant="caption" color="text.secondary">Σ(value × win probability)</Typography>
+            <Typography variant="h6" fontWeight={700} lineHeight={1.15} color="#A8C7FA">{fmt$(weightedPipelineValue)}</Typography>
+            {!compactLandscapeBoard && <Typography variant="caption" color="text.secondary">Σ(value × win probability)</Typography>}
           </Box>
-          <Box><Typography variant="caption" color="text.disabled">Open</Typography><Typography variant="h6" fontWeight={700}>{openDeals.length}</Typography></Box>
-          <Box><Typography variant="caption" color="text.disabled">High Priority Open</Typography><Typography variant="h6" fontWeight={700}>{highPriorityOpenDeals.length}</Typography></Box>
-          <Box><Typography variant="caption" color="text.disabled">Closed</Typography><Typography variant="h6" fontWeight={700}>{closedDeals.length}</Typography></Box>
+          <Box><Typography variant="caption" color="text.disabled">Open</Typography><Typography variant="h6" fontWeight={700} lineHeight={1.15}>{openDeals.length}</Typography></Box>
+          <Box><Typography variant="caption" color="text.disabled">High Priority</Typography><Typography variant="h6" fontWeight={700} lineHeight={1.15}>{highPriorityOpenDeals.length}</Typography></Box>
+          <Box><Typography variant="caption" color="text.disabled">Closed</Typography><Typography variant="h6" fontWeight={700} lineHeight={1.15}>{closedDeals.length}</Typography></Box>
 
-          <Stack spacing={0.45} sx={{ minWidth: { xs: '100%', sm: 260 }, maxWidth: { xs: '100%', md: 460 } }}>
+          <Stack spacing={0.45} sx={{ minWidth: compactLandscapeBoard ? 170 : { xs: '100%', sm: 260 }, maxWidth: compactLandscapeBoard ? 220 : { xs: '100%', md: 460 } }}>
             <Typography variant="caption" sx={{ color: '#A8C7FA', fontWeight: 700 }}>{pipelineSyncEnabled ? 'Pipeline sync' : 'Pipeline storage'}</Typography>
             <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
               <Typography variant="caption" color="text.disabled">Sync status</Typography>
@@ -910,7 +922,7 @@ export default function PipelineSection() {
                 }}
               />
             </Stack>
-            <Typography variant="caption" color="text.secondary">{pipelineSyncEnabled ? 'Last synced' : 'Last saved'}: {fmtSyncTime(syncSurface.lastSyncedAt)}</Typography>
+            {!compactLandscapeBoard && <Typography variant="caption" color="text.secondary">{pipelineSyncEnabled ? 'Last synced' : 'Last saved'}: {fmtSyncTime(syncSurface.lastSyncedAt)}</Typography>}
             {syncSurface.feedback && (
               <Typography
                 variant="caption"
@@ -924,13 +936,13 @@ export default function PipelineSection() {
             )}
           </Stack>
 
-          <Box sx={{ flex: 1 }} />
+          {!compactLandscapeBoard && <Box sx={{ flex: 1 }} />}
           <Stack
             direction="row"
             spacing={1}
-            flexWrap="wrap"
+            flexWrap={compactLandscapeBoard ? 'nowrap' : 'wrap'}
             useFlexGap
-            sx={{ width: { xs: '100%', sm: 'auto' }, justifyContent: { xs: 'flex-start', sm: 'flex-end' } }}
+            sx={{ width: compactLandscapeBoard ? 'auto' : { xs: '100%', sm: 'auto' }, justifyContent: { xs: 'flex-start', sm: 'flex-end' } }}
           >
             <WorkspaceSelector kind="pipeline" onAccessChange={(resource) => setPipelineAccess(resource?.accessRole || null)} />
             {pipelineShortLink ? (
@@ -998,7 +1010,10 @@ export default function PipelineSection() {
         </Stack>
       </Box>
 
-      <Box sx={{ flex: 1, overflow: 'auto', px: { xs: 1, md: 2 }, py: 2 }}>
+      <Box
+        data-testid="pipeline-results"
+        sx={{ flex: 1, minHeight: 0, overflow: 'auto', px: { xs: 1, md: 2 }, py: compactLandscapeBoard ? 0.5 : 2 }}
+      >
         {view === 'board' ? (
           compactLandscapeBoard ? (
             <Box sx={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 }}>
@@ -1069,9 +1084,10 @@ export default function PipelineSection() {
       <Dialog
         open={pipelineSheetDialogOpen}
         onClose={pipelineSheetBusy ? undefined : () => setPipelineSheetDialogOpen(false)}
+        fullScreen={compactLandscapeBoard}
         fullWidth
         maxWidth="xs"
-        PaperProps={{ sx: { backgroundColor: '#1A1A23', border: '1px solid rgba(255,255,255,0.08)', borderRadius: 1 } }}
+        PaperProps={{ sx: { backgroundColor: '#1A1A23', border: '1px solid rgba(255,255,255,0.08)', borderRadius: compactLandscapeBoard ? 0 : 1 } }}
       >
         <DialogTitle sx={{ fontWeight: 700 }}>
           {pipelineProvisioningStatus === 'ready'
@@ -1104,9 +1120,10 @@ export default function PipelineSection() {
       <Dialog
         open={newOpportunityOpen}
         onClose={creatingOpportunity ? undefined : () => setNewOpportunityOpen(false)}
+        fullScreen={compactLandscapeBoard}
         fullWidth
         maxWidth="sm"
-        PaperProps={{ sx: { backgroundColor: '#1A1A23', border: '1px solid rgba(255,255,255,0.08)', borderRadius: 1 } }}
+        PaperProps={{ sx: { backgroundColor: '#1A1A23', border: '1px solid rgba(255,255,255,0.08)', borderRadius: compactLandscapeBoard ? 0 : 1 } }}
       >
         <DialogTitle sx={{ fontWeight: 700 }}>New opportunity</DialogTitle>
         <DialogContent>
