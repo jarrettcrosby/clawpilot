@@ -199,6 +199,47 @@ const retried = execution.applyAgentTaskExecutionPlan({
 })
 assert.equal(retried.task.checklist.length, 2, 'dispatch retry must not duplicate checklist entries')
 
+const overlappingPlan = execution.parseAgentTaskExecutionPlan(JSON.stringify({
+  status: 'triaged',
+  summary: 'Refined the accepted architecture without creating duplicate work.',
+  nextAction: 'Create the first implementation task.',
+  waitingOn: '',
+  blocker: '',
+  descriptionUpdate: '',
+  checklistAdd: [
+    'Document hybrid architecture and system-of-record rules for accounting vs workflow entities',
+    'Define workspace-to-realm tenant binding and external ID mapping schema',
+    'Specify inbox/outbox, idempotency, retry, and sync journal requirements',
+    'Add phased milestones and acceptance criteria for read sync, sandbox writes, bidirectional sync, and receipts',
+    'Require sandbox validation and explicit operator approval before enabling production QuickBooks writes',
+    'Define reviewed receipt posting gate with extraction, approval, attachment, and audit requirements',
+  ],
+  learned: 'Keep repeated planning passes idempotent.',
+}))
+const overlappingChecklistTask = {
+  ...baseTask,
+  desc: 'Detailed QuickBooks integration context.',
+  checklist: [
+    { id: 'ck-1', text: 'Define system-of-record rules for Customers, Items, Invoices, and receipt workflows', done: false },
+    { id: 'ck-2', text: 'Design tenant-scoped external ID mapping, sync journal, inbox/outbox, and idempotency keys', done: false },
+    { id: 'ck-3', text: 'Sequence implementation phases from read-sync MVP through bidirectional invoices', done: false },
+    { id: 'ck-4', text: 'Define reviewed receipt-posting workflow with extraction, approval, and attachment handling', done: false },
+  ],
+}
+const overlappingResult = execution.applyAgentTaskExecutionPlan({
+  task: overlappingChecklistTask,
+  plan: overlappingPlan,
+  agentId: 'projects',
+  dispatchId: 'dispatch-2',
+  timestamp: '2026-07-16T12:02:15.000Z',
+})
+assert.equal(overlappingResult.task.checklist.length, 5, 'semantically overlapping checklist entries must be skipped')
+assert.equal(
+  overlappingResult.task.checklist.at(-1).text,
+  'Require sandbox validation and explicit operator approval before enabling production QuickBooks writes',
+  'a distinct release gate should remain actionable',
+)
+
 const substantiveDescription = [
   'Preserve this operator-authored implementation brief exactly, including punctuation and line breaks.',
   '',
