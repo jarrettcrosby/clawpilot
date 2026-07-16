@@ -11,12 +11,14 @@ import {
   createProjectBoard,
   listPipelineSpaces,
   listProjectBoards,
+  readWorkspacePreferences,
   removePipelineShare,
   removeProjectBoardShare,
   resolvePipelineSpaceAccess,
   resolveProjectBoardAccess,
   sharePipelineSpace,
   shareProjectBoard,
+  saveWorkspacePreferences,
 } from '@/lib/tenancy'
 
 const COOKIE_OPTIONS = {
@@ -27,19 +29,31 @@ const COOKIE_OPTIONS = {
   maxAge: 60 * 60 * 24 * 365,
 }
 
-async function workspacePayload(actorEmail: string, req: NextRequest, selected?: { boardId?: string; pipelineId?: string }) {
-  const [boards, pipelines] = await Promise.all([
+async function workspacePayload(
+  actorEmail: string,
+  req: NextRequest,
+  selected?: { boardId?: string; pipelineId?: string },
+  preferDefaults = false,
+) {
+  const [boards, pipelines, preferences] = await Promise.all([
     listProjectBoards(actorEmail),
     listPipelineSpaces(actorEmail),
+    readWorkspacePreferences(actorEmail),
   ])
   const requestedBoardId = selected?.boardId || req.cookies.get(BOARD_SELECTION_COOKIE)?.value || ''
   const requestedPipelineId = selected?.pipelineId || req.cookies.get(PIPELINE_SELECTION_COOKIE)?.value || ''
-  const selectedBoard = boards.find((board) => board.id === requestedBoardId)
+  const defaultBoard = boards.find((board) => board.id === preferences.defaultBoardId)
     || boards.find((board) => board.ownerEmail === actorEmail && board.isDefault)
     || boards[0]
-  const selectedPipeline = pipelines.find((pipeline) => pipeline.id === requestedPipelineId)
+  const defaultPipeline = pipelines.find((pipeline) => pipeline.id === preferences.defaultPipelineId)
     || pipelines.find((pipeline) => pipeline.ownerEmail === actorEmail && pipeline.isDefault)
     || pipelines[0]
+  const selectedBoard = preferDefaults
+    ? defaultBoard
+    : boards.find((board) => board.id === requestedBoardId) || defaultBoard
+  const selectedPipeline = preferDefaults
+    ? defaultPipeline
+    : pipelines.find((pipeline) => pipeline.id === requestedPipelineId) || defaultPipeline
 
   return {
     ok: true,
@@ -53,6 +67,8 @@ async function workspacePayload(actorEmail: string, req: NextRequest, selected?:
     }),
     selectedBoardId: selectedBoard?.id || null,
     selectedPipelineId: selectedPipeline?.id || null,
+    defaultBoardId: defaultBoard?.id || null,
+    defaultPipelineId: defaultPipeline?.id || null,
   }
 }
 
@@ -71,7 +87,16 @@ function errorResponse(error: unknown) {
 export async function GET(req: NextRequest) {
   try {
     const actor = await requireRequestUser(req)
-    return NextResponse.json(await workspacePayload(actor.email, req))
+    const dashboard = req.nextUrl.searchParams.get('dashboard') === 'true'
+    const payload = await workspacePayload(actor.email, req, undefined, dashboard)
+    const response = NextResponse.json(payload)
+    if (dashboard && payload.selectedBoardId) {
+      response.cookies.set(BOARD_SELECTION_COOKIE, payload.selectedBoardId, COOKIE_OPTIONS)
+    }
+    if (dashboard && payload.selectedPipelineId) {
+      response.cookies.set(PIPELINE_SELECTION_COOKIE, payload.selectedPipelineId, COOKIE_OPTIONS)
+    }
+    return response
   } catch (error) {
     return errorResponse(error)
   }
@@ -128,6 +153,14 @@ export async function POST(req: NextRequest) {
       await removePipelineShare({ actorEmail: actor.email, pipelineId: body?.pipelineId, userEmail: body?.email })
     } else {
       return NextResponse.json({ ok: false, error: 'Unsupported workspace action' }, { status: 400 })
+    }
+
+    if (body?.setDefault === true && (selectedBoardId || selectedPipelineId)) {
+      await saveWorkspacePreferences({
+        actorEmail: actor.email,
+        ...(selectedBoardId ? { boardId: selectedBoardId } : {}),
+        ...(selectedPipelineId ? { pipelineId: selectedPipelineId } : {}),
+      })
     }
 
     const payload = await workspacePayload(actor.email, req, {

@@ -67,12 +67,18 @@ export async function GET(req: NextRequest) {
     let selectedPipeline: PipelineSpace | null = null
     if (isPostgresPipelineStoreEnabled()) {
       const actor = await requireRequestUser(req)
-      const selectedBoardId = req.cookies.get(BOARD_SELECTION_COOKIE)?.value || undefined
-      const selectedPipelineId = req.cookies.get(PIPELINE_SELECTION_COOKIE)?.value || undefined
-      const board = await resolveProjectBoardAccess({ actorEmail: actor.email, boardId: selectedBoardId })
-        .catch(() => resolveProjectBoardAccess({ actorEmail: actor.email }))
-      selectedPipeline = await resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: selectedPipelineId })
-        .catch(() => resolvePipelineSpaceAccess({ actorEmail: actor.email }))
+      const explicitBoardId = req.nextUrl.searchParams.get('boardId') || undefined
+      const explicitPipelineId = req.nextUrl.searchParams.get('pipelineId') || undefined
+      const selectedBoardId = explicitBoardId || req.cookies.get(BOARD_SELECTION_COOKIE)?.value || undefined
+      const selectedPipelineId = explicitPipelineId || req.cookies.get(PIPELINE_SELECTION_COOKIE)?.value || undefined
+      const board = explicitBoardId
+        ? await resolveProjectBoardAccess({ actorEmail: actor.email, boardId: explicitBoardId })
+        : await resolveProjectBoardAccess({ actorEmail: actor.email, boardId: selectedBoardId })
+          .catch(() => resolveProjectBoardAccess({ actorEmail: actor.email }))
+      selectedPipeline = explicitPipelineId
+        ? await resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: explicitPipelineId })
+        : await resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: selectedPipelineId })
+          .catch(() => resolvePipelineSpaceAccess({ actorEmail: actor.email }))
       boardId = board.id
     }
     workItems = pipelineWorkItemsFromTasks(await readTasks(boardId))

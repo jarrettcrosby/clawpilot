@@ -1,11 +1,11 @@
 ---
 id: cp-module-shell-access
 title: Application Shell and Access
-summary: Authentication, invitations, user profiles, roles, permissions, navigation, activity history, and responsive shell behavior.
+summary: Authentication, invitations, user profiles, roles, permissions, dashboard workspace defaults, navigation, activity history, and responsive shell behavior.
 status: active
 kind: module-contract
 area: access
-tags: [shell, authentication, invitations, users]
+tags: [shell, authentication, invitations, users, dashboard, workspaces]
 app_visible: true
 ---
 
@@ -18,6 +18,10 @@ Provide a responsive, authenticated ClawPilot workspace with clear user identity
 ## Current Contract
 
 - Dashboard, Docs, Projects, Pipeline, CRM, Links, Agents, and Versions are authenticated workspace surfaces. Dashboard links open the corresponding record or module rather than acting as static summaries.
+- The dashboard board and pipeline selectors are independent per-user defaults. Selecting either resource persists it for the signed-in user, refreshes only the scoped dashboard data, and does not reload the full application.
+- Dashboard project-board status counts request the selected board explicitly and include CRM-projected cards. Operational task and agent metrics continue to exclude CRM reference cards.
+- The pipeline selector loads the selected pipeline explicitly and presents its opportunity, organization, contact, and open-value summary alongside the selected project board.
+- Initial dashboard loading uses a stable Skeleton shell that reserves the final layout while workspace preferences, board tasks, and pipeline summary data resolve.
 - Desktop navigation is a sibling layout track and can collapse without covering or shifting page content incorrectly.
 - Mobile navigation uses a temporary drawer plus compact bottom navigation; secondary modules remain reachable through More in portrait and landscape layouts.
 - Existing active users sign in with a six-digit one-time code.
@@ -44,6 +48,7 @@ Provide a responsive, authenticated ClawPilot workspace with clear user identity
 - `app_user_invitations`
 - `auth_magic_codes`
 - `app_sessions`
+- `app_user_workspace_preferences`, keyed by user email with nullable foreign keys to the default project board and pipeline
 - `app_users.organization_id`, organization hierarchy, global role, and explicit permissions
 - `audit_events.subject`, `audit_events.organization_id`, `audit_events.is_system`, and idempotent event keys
 - separate encrypted agent credential database
@@ -56,4 +61,4 @@ Provide a responsive, authenticated ClawPilot workspace with clear user identity
 
 ## Security Boundary
 
-An invited account is not a normal active account. Ordinary sign-in rejects invited, disabled, expired, or revoked access. Invitation activation consumes the code and invitation in one database transaction. Settings and administration endpoints enforce both the global privilege and organization boundary instead of trusting client-selected organization IDs. Background agent workers use a separate bearer-secret channel with validated operator and board claims; they never create or reuse browser sessions.
+An invited account is not a normal active account. Ordinary sign-in rejects invited, disabled, expired, or revoked access. Invitation activation consumes the code and invitation in one database transaction. Settings and administration endpoints enforce both the global privilege and organization boundary instead of trusting client-selected organization IDs. Dashboard defaults are saved only after access to the selected board or pipeline is resolved for the signed-in user. Background agent workers use a separate bearer-secret channel with validated operator and board claims; they never create or reuse browser sessions.

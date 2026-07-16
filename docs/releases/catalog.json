@@ -3,15 +3,18 @@
   "releases": {
     "default": {
       "oncePerEnvironment": true,
-      "title": "Revocable browser sessions and root support mode",
-      "summary": "ClawPilot now gives every browser an independently revocable Postgres session, records both the real administrator and viewed user during root support mode, and keeps background workers separate from human authentication.",
+      "title": "Secure sessions and personalized dashboard workspaces",
+      "summary": "ClawPilot now provides independently revocable browser sessions and audited root support mode while remembering each user's dashboard board and pipeline with complete, stable scoped summaries.",
       "features": [
         "A Security settings view listing active browsers with current-session identification, last activity, and individual revocation",
         "A one-command control to sign out every other browser without interrupting the current session",
         "Root support mode for viewing the application as an active non-owner user for up to 30 minutes",
         "A persistent support-mode banner showing both the root administrator and the effective user",
         "Role-aware idle limits with a 24-hour absolute browser-session lifetime and explicit activity renewal",
-        "Automatic upgrade of existing signed browser cookies to durable sessions during rollout"
+        "Automatic upgrade of existing signed browser cookies to durable sessions during rollout",
+        "Independent board and pipeline selectors on the dashboard with durable defaults for each signed-in user",
+        "A selected-pipeline summary covering opportunities, organizations, contacts, and total open value",
+        "A stable Skeleton loading shell that reserves the dashboard layout while scoped workspace data resolves"
       ],
       "fixes": [
         "Stores only keyed token hashes in Postgres rather than reusable browser credentials",
@@ -20,7 +23,10 @@
         "Rotates browser credentials when entering or leaving support mode",
         "Blocks user-access, workspace, integration, agent-authorization, and backup mutations while viewing as another user",
         "Authenticates the agent dispatch worker with dedicated signed headers instead of fabricating a human browser cookie",
-        "Redirects expired browser tabs to sign-in without treating transient network failures as logout events"
+        "Redirects expired browser tabs to sign-in without treating transient network failures as logout events",
+        "Includes CRM-projected cards in dashboard project-board status counts without treating reference cards as agent tasks",
+        "Scopes dashboard task and pipeline reads to explicit selected workspace IDs",
+        "Refreshes dashboard selections in place instead of reloading the full application"
       ]
     }
   }

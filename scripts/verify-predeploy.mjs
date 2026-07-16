@@ -134,6 +134,7 @@ for (const requiredPath of [
   'db/migrations/0038_dedupe_crm_stage_audit.sql',
   'db/migrations/0039_agent_context_memory.sql',
   'db/migrations/0040_browser_sessions_and_impersonation.sql',
+  'db/migrations/0041_dashboard_workspace_preferences.sql',
   'scripts/start-railway.sh',
   'scripts/test-suitecrm-interaction-ingestion.mjs',
   'scripts/pipeline-outbox-poller.mjs',
