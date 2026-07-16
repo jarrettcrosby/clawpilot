@@ -9,6 +9,7 @@
         "A New opportunity workflow available to pipeline owners and editors",
         "Tenant-scoped selection of existing CRM customer organizations",
         "Inline customer organization creation without leaving the opportunity workflow",
+        "Configured product selection for new and existing opportunities",
         "Immediate CRM-backed opportunity visibility while SuiteCRM and workbook synchronization continues",
         "Expected close date and notes fields during opportunity creation",
         "Visible pending and failed CRM synchronization counts",
@@ -22,6 +23,8 @@
         "Makes assignment retries idempotent so generated checklist items are not duplicated",
         "Requires idempotency keys for opportunity creation to prevent duplicate CRM records after network retries",
         "Makes opportunity creates and edits replay-safe so delayed retries cannot overwrite newer CRM changes",
+        "Displays persisted expected-close dates correctly when PostgreSQL returns date columns as JavaScript Date values",
+        "Persists product changes made from the opportunity drawer",
         "Preserves blocked, awaiting-input, and triaged agent outcomes across worker retries and ignores stale dispatch results",
         "Removes direct guessed Google Sheet row writes from opportunity creation and editing"
       ]

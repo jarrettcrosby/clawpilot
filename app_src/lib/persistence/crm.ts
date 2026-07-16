@@ -7,6 +7,7 @@ import {
   stableGlobalSuiteCrmId,
   stableSuiteCrmId,
 } from '@/lib/crm/stableId'
+import { crmDateOnly } from '@/lib/crm/dateOnly.mjs'
 import type {
   CrmContact,
   CrmCampaign,
@@ -1833,7 +1834,7 @@ function opportunityFromRow(row: Record<string, unknown>): CrmOpportunity {
     sourceKey: String(row.source_key), sourceRowNumber: row.source_row_number === null ? null : Number(row.source_row_number),
     priority: clean(row.priority), name: clean(row.name), owner: clean(row.owner_name), organization: clean(row.organization_name),
     status: clean(row.status), stage: clean(row.stage), lossReason: clean(row.loss_reason), source: clean(row.lead_source),
-    value: finite(row.amount), probability: finite(row.probability), expectedClose: row.expected_close ? String(row.expected_close).slice(0, 10) : '',
+    value: finite(row.amount), probability: finite(row.probability), expectedClose: crmDateOnly(row.expected_close),
     notes: clean(row.description), syncStatus: row.sync_status as CrmOpportunity['syncStatus'], syncError: nullable(row.sync_error),
     updatedAt: String(row.updated_at),
   }
@@ -1890,8 +1891,8 @@ function campaignFromRow(row: Record<string, unknown>): CrmCampaign {
     id: String(row.id), referenceCode: clean(row.reference_code), shortUrl: crmReferenceShortUrl(row.reference_code),
     pipelineId: String(row.pipeline_id), suiteCrmId: nullable(row.suitecrm_id), sourceKey: String(row.source_key),
     name: clean(row.name), campaignType: (row.campaign_type || 'email') as CrmCampaign['campaignType'],
-    status: row.status as CrmCampaign['status'], startDate: row.start_date ? String(row.start_date).slice(0, 10) : '',
-    endDate: row.end_date ? String(row.end_date).slice(0, 10) : '', subjectTemplate: clean(row.subject_template),
+    status: row.status as CrmCampaign['status'], startDate: crmDateOnly(row.start_date),
+    endDate: crmDateOnly(row.end_date), subjectTemplate: clean(row.subject_template),
     bodyTemplate: clean(row.body_template), senderEmail: clean(row.sender_email), description: clean(row.description),
     recipientCount: finite(row.recipient_count), sentCount: finite(row.sent_count), failedCount: finite(row.failed_count),
     syncStatus: row.sync_status as CrmCampaign['syncStatus'], syncError: nullable(row.sync_error), updatedAt: String(row.updated_at),

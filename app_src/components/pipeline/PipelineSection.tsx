@@ -100,7 +100,7 @@ type OrganizationOption = {
 
 const EMPTY_OPPORTUNITY = {
   organizationId: '',
-  name: '',
+  products: [] as string[],
   priority: 'C',
   stage: 'Identified Lead',
   value: '',
@@ -371,7 +371,6 @@ function DealDrawer({
           <Autocomplete
             disabled={readOnly}
             multiple
-            freeSolo
             options={products}
             value={(form.name || '').split(',').map(s => s.trim()).filter(Boolean)}
             onChange={(_, values) => setForm({ ...form, name: (values || []).map(v => String(v).trim()).filter(Boolean).join(', ') })}
@@ -462,7 +461,7 @@ function DealDrawer({
         </Stack>
 
         {!readOnly ? <Stack direction="row" spacing={1} mt={2}>
-          <Button variant="contained" disabled={saving} onClick={async () => {
+          <Button variant="contained" disabled={saving || !form.name.trim()} onClick={async () => {
             try {
               setSaving(true)
               setError('')
@@ -754,7 +753,7 @@ export default function PipelineSection() {
     setSourceOptions(pick('source', DEFAULT_SOURCES))
     setOwnerOptions(pick('owner', DEFAULT_OWNERS))
     setLossReasonOptions(pick('loss_reason', DEFAULT_LOSS_REASONS))
-    setProductOptions(pick('product', DEFAULT_PRODUCTS))
+    setProductOptions(pick('product', DEFAULT_PRODUCTS).filter((product) => !product.includes(',')))
   }
 
   useEffect(() => {
@@ -863,7 +862,7 @@ export default function PipelineSection() {
   }
 
   const createOpportunity = async () => {
-    if (!newOpportunity.organizationId || !newOpportunity.name.trim() || creatingOpportunity) return
+    if (!newOpportunity.organizationId || newOpportunity.products.length === 0 || creatingOpportunity) return
     setCreatingOpportunity(true)
     setNewOpportunityError('')
     try {
@@ -875,7 +874,7 @@ export default function PipelineSection() {
         },
         body: JSON.stringify({
           organizationId: newOpportunity.organizationId,
-          name: newOpportunity.name.trim(),
+          products: newOpportunity.products,
           priority: newOpportunity.priority,
           stage: newOpportunity.stage,
           value: Number(newOpportunity.value || 0),
@@ -1290,7 +1289,20 @@ export default function PipelineSection() {
                 </Stack>
               </Box>
             ) : null}
-            <TextField label="Opportunity" value={newOpportunity.name} onChange={(event) => setNewOpportunity((current) => ({ ...current, name: event.target.value }))} />
+            <Autocomplete
+              multiple
+              options={productOptions}
+              value={newOpportunity.products}
+              onChange={(_, products) => setNewOpportunity((current) => ({ ...current, products }))}
+              renderTags={(value: readonly string[], getTagProps) =>
+                value.map((product, index) => (
+                  <Chip variant="outlined" size="small" label={product} {...getTagProps({ index })} key={product} />
+                ))
+              }
+              renderInput={(params) => (
+                <TextField {...params} required label="Product" helperText="Select one or more configured pipeline products" />
+              )}
+            />
             <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.5}>
               <TextField select fullWidth label="Priority" value={newOpportunity.priority} onChange={(event) => setNewOpportunity((current) => ({ ...current, priority: event.target.value }))}>
                 {priorityOptions.map((priority) => <MenuItem key={priority} value={priority}>{priority}</MenuItem>)}
@@ -1319,7 +1331,7 @@ export default function PipelineSection() {
             setNewOpportunityOpen(false)
             setNewOpportunityMutationKey('')
           }} disabled={creatingOpportunity}>Cancel</Button>
-          <Button variant="contained" onClick={createOpportunity} disabled={creatingOpportunity || !newOpportunity.organizationId || !newOpportunity.name.trim()}>
+          <Button variant="contained" onClick={createOpportunity} disabled={creatingOpportunity || !newOpportunity.organizationId || newOpportunity.products.length === 0}>
             {creatingOpportunity ? 'Creating...' : 'Create'}
           </Button>
         </DialogActions>
@@ -1338,6 +1350,7 @@ export default function PipelineSection() {
         products={productOptions}
         onSave={async (deal) => {
           const out = await patchOpportunityWithRetry(deal, {
+            products: deal.name.split(',').map((product) => product.trim()).filter(Boolean),
             priority: deal.priority,
             status: deal.status,
             stage: deal.stage,

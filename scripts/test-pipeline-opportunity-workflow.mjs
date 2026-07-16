@@ -2,6 +2,7 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
+import { crmDateOnly } from '../app_src/lib/crm/dateOnly.mjs'
 
 const root = process.cwd()
 const read = (relativePath) => readFileSync(resolve(root, relativePath), 'utf8')
@@ -14,6 +15,8 @@ for (const fragment of [
   "relationshipType !== 'customer'",
   "entity: 'opportunities'",
   'createCrmOpportunityInPostgres',
+  'opportunityProducts(body?.products ?? body?.name)',
+  "join(', ')",
 ]) {
   assert.ok(route.includes(fragment), `pipeline opportunity route missing ${fragment}`)
 }
@@ -26,6 +29,8 @@ assert.match(mutationRoute, /stageCrmRecordInPostgres/)
 assert.match(mutationRoute, /appendCrmOpportunityCommentInPostgres/)
 assert.match(mutationRoute, /updateCrmOpportunityInPostgres/)
 assert.match(mutationRoute, /expectedUpdatedAt/)
+assert.match(mutationRoute, /opportunityProductName\(updates\.products \?\? updates\.name\)/)
+assert.match(mutationRoute, /At least one product is required/)
 assert.doesNotMatch(mutationRoute, /sourceRowNumber\s*[-+]/, 'opportunity edits must not derive a Sheet row number')
 assert.doesNotMatch(mutationRoute, /upsertPipelineProjectionInPostgres/)
 
@@ -46,6 +51,11 @@ assert.doesNotMatch(mutationRoute, /resolvePipelineSpaceAccess\(\{ actorEmail: a
 
 const component = read('app_src/components/pipeline/PipelineSection.tsx')
 assert.match(component, /New opportunity/)
+assert.match(component, /newOpportunity\.products/)
+assert.match(component, /Select one or more configured pipeline products/)
+assert.match(component, /products: deal\.name\.split/)
+assert.match(component, /filter\(\(product\) => !product\.includes\(','\)\)/)
+assert.doesNotMatch(component, /multiple\s+freeSolo\s+options=\{products\}/)
 assert.match(component, /Select an organization already in CRM/)
 assert.match(component, /Add organization/)
 assert.match(component, /record\.relationshipType === 'customer'/)
@@ -53,6 +63,11 @@ assert.match(component, /'Idempotency-Key': newOpportunityMutationKey/)
 assert.doesNotMatch(component, /actor: 'Jarrett'/)
 assert.match(component, /pipelineAccess === 'owner' \|\| pipelineAccess === 'editor'/)
 assert.doesNotMatch(component, /canEdit\s*=\s*!pipelineSyncEnabled/, 'Sheet sync must not control CRM edit access')
+
+assert.equal(crmDateOnly('2026-08-14'), '2026-08-14')
+assert.equal(crmDateOnly('2026-08-14T00:00:00.000Z'), '2026-08-14')
+assert.equal(crmDateOnly(new Date(2026, 7, 14)), '2026-08-14')
+assert.equal(crmDateOnly('Fri Aug 14'), '')
 
 const syncStatus = read('app_src/app/api/pipeline/sync-status/route.ts')
 assert.match(syncStatus, /readCrmSummaryFromPostgres/)
