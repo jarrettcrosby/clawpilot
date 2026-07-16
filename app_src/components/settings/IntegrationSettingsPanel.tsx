@@ -6,6 +6,8 @@ import Tab from '@mui/material/Tab'
 import Tabs from '@mui/material/Tabs'
 import CloudRounded from '@mui/icons-material/CloudRounded'
 import HubRounded from '@mui/icons-material/HubRounded'
+import ManageSearchRounded from '@mui/icons-material/ManageSearchRounded'
+import EmbeddingSettingsPanel from './EmbeddingSettingsPanel'
 import GoogleWorkspaceIntegrationPanel from './GoogleWorkspaceIntegrationPanel'
 import MatonIntegrationPanel from './MatonIntegrationPanel'
 
@@ -53,6 +55,13 @@ export default function IntegrationSettingsPanel({ isOwner }: { isOwner: boolean
           id="integration-tab-1"
           aria-controls="integration-panel-1"
         />
+        <Tab
+          icon={<ManageSearchRounded sx={{ fontSize: 18 }} />}
+          iconPosition="start"
+          label="Knowledge"
+          id="integration-tab-2"
+          aria-controls="integration-panel-2"
+        />
       </Tabs>
 
       {activeIntegration === 0 ? (
@@ -63,6 +72,11 @@ export default function IntegrationSettingsPanel({ isOwner }: { isOwner: boolean
       {activeIntegration === 1 ? (
         <Box role="tabpanel" id="integration-panel-1" aria-labelledby="integration-tab-1">
           <MatonIntegrationPanel isOwner embedded />
+        </Box>
+      ) : null}
+      {activeIntegration === 2 ? (
+        <Box role="tabpanel" id="integration-panel-2" aria-labelledby="integration-tab-2">
+          <EmbeddingSettingsPanel />
         </Box>
       ) : null}
     </Box>

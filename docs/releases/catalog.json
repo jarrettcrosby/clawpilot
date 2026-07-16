@@ -3,23 +3,23 @@
   "releases": {
     "default": {
       "oncePerEnvironment": true,
-      "title": "Connected CRM actions and organization-based workspaces",
-      "summary": "ClawPilot now connects user profiles, CRM records, provider actions, short links, and managed pipeline workbooks through stable organization and contact identities.",
+      "title": "Scoped activity history and complete CRM relationships",
+      "summary": "ClawPilot now provides project-independent activity history, complete organization and contact editing, reliable SuiteCRM relationship projections, and explicit tenant-safe administrator controls.",
       "features": [
-        "Organizations, Contacts, Leads, Opportunities, Meetings, Interactions, and Campaigns in one pipeline-scoped CRM workspace",
-        "Email, calendar invitations, logged calls, and mail-merged campaigns through each user's selected provider connections",
-        "Stable ga, gc, gl, go, gm, gi, and gk CRM links plus same-organization short-link discovery",
-        "Managed Drive folders nested by organization, user contact, and pipeline with direct Open Sheet access"
+        "One Activity drawer for account, project, pipeline, CRM, agent, integration, and release events regardless of the selected board",
+        "My activity, organization-subtree, and global-system scopes controlled by explicit administrator permissions",
+        "Successful and failed sign-ins, magic-code requests, sign-outs, user access changes, sharing changes, and task history in the durable audit stream",
+        "Editable CRM metadata and related-contact subpanels for organizations and contacts",
+        "Owner-controlled local or external document embeddings with local processing as the default"
       ],
       "fixes": [
-        "Prevents one user from receiving different CRM organization or contact identities across owned pipelines",
-        "Synchronizes profile changes into CRM and requeues managed Drive naming without creating replacement Sheets",
-        "Pins sign-in and invitation mail to the verified ClawPilot Stewards Gmail connection instead of a personal selected account",
-        "Deduplicates repeated CRM markers in email threads and stops imported content at the first %xx marker",
-        "Restricts short-link discovery to the user's organization tree and mutations to link owners or authorized administrators",
-        "Prevents an outgoing deployment worker from acknowledging Drive hierarchy reconciliation with the legacy folder layout",
-        "Backfills each historical pipeline owner's user settings into the matching CRM organization and contact records",
-        "Removes empty managed legacy Drive folders only after organization, contact, direct-child, and Shared Drive trash states verify"
+        "Snapshots organization scope when each audit event is written so later membership or sharing changes do not rewrite history",
+        "Excludes tenant records and tenant resource discovery from the global-system activity scope",
+        "Redacts secrets, credentials, raw network addresses, cookies, and authentication codes from activity responses",
+        "Backfills SuiteCRM Note relationships so interactions appear under their related Contacts as well as Accounts",
+        "Retires the two rejected interaction identifiers without allowing either Global ID to be reused",
+        "Preserves Nick's Organization and Nick's approved global administrator access while retaining child-organization data scope",
+        "Adds Needs Review discovery for incomplete CRM records and consolidates current operational documentation"
       ]
     }
   }

@@ -18,6 +18,9 @@ import {
   InputAdornment,
   FormControlLabel,
   Link,
+  List,
+  ListItemButton,
+  ListItemText,
   MenuItem,
   Stack,
   Tab,
@@ -35,8 +38,10 @@ import {
 } from '@mui/material'
 import AddRounded from '@mui/icons-material/AddRounded'
 import AccountTreeRounded from '@mui/icons-material/AccountTreeRounded'
+import ArrowBackRounded from '@mui/icons-material/ArrowBackRounded'
 import BusinessRounded from '@mui/icons-material/BusinessRounded'
 import CampaignRounded from '@mui/icons-material/CampaignRounded'
+import ChevronRightRounded from '@mui/icons-material/ChevronRightRounded'
 import CloseRounded from '@mui/icons-material/CloseRounded'
 import EmailRounded from '@mui/icons-material/EmailRounded'
 import EventRounded from '@mui/icons-material/EventRounded'
@@ -102,6 +107,11 @@ type CrmPayload = {
     googleCalendar?: string | null
   }
 }
+type EditorHistoryItem = {
+  entity: CrmEntity
+  record: RecordValue
+  fields: Record<string, string>
+}
 
 const ENTITY_LABELS: Record<CrmEntity, string> = {
   organizations: 'Organizations',
@@ -125,6 +135,7 @@ const EMPTY_SUMMARY: CrmSummary = {
   weightedPipelineValue: 0,
   pendingSync: 0,
   failedSync: 0,
+  needsReviewInteractions: 0,
 }
 
 function textValue(record: RecordValue, key: string) {
@@ -277,11 +288,14 @@ export default function CrmSection() {
   const [summary, setSummary] = useState<CrmSummary>(EMPTY_SUMMARY)
   const [pipeline, setPipeline] = useState<PipelineInfo | null>(null)
   const [query, setQuery] = useState('')
+  const [needsReviewOnly, setNeedsReviewOnly] = useState(false)
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [editorRecord, setEditorRecord] = useState<RecordValue | null | undefined>(undefined)
+  const [editorEntity, setEditorEntity] = useState<CrmEntity>('organizations')
+  const [editorHistory, setEditorHistory] = useState<EditorHistoryItem[]>([])
   const [fields, setFields] = useState<Record<string, string>>({})
   const [organizations, setOrganizations] = useState<RecordValue[]>([])
   const [contacts, setContacts] = useState<RecordValue[]>([])
@@ -298,17 +312,19 @@ export default function CrmSection() {
   })
   const [suiteCrmAccessOpen, setSuiteCrmAccessOpen] = useState(false)
   const [hierarchyOpen, setHierarchyOpen] = useState(false)
+  const [relatedContactsLoading, setRelatedContactsLoading] = useState(false)
   const [actionComposer, setActionComposer] = useState<{ type: CrmActionType; record: RecordValue } | null>(null)
   const [actionFields, setActionFields] = useState<Record<string, string>>({})
   const [routeQuery, setRouteQuery] = useState('')
   const [routeReady, setRouteReady] = useState(false)
   const deepLinkOpened = useRef(false)
 
-  const load = useCallback(async (nextEntity: CrmEntity, nextQuery: string) => {
+  const load = useCallback(async (nextEntity: CrmEntity, nextQuery: string, nextNeedsReview = false) => {
     setLoading(true)
     setError('')
     try {
       const parameters = new URLSearchParams({ entity: nextEntity, query: nextQuery, limit: '1000' })
+      if (nextEntity === 'interactions' && nextNeedsReview) parameters.set('needsReview', 'true')
       const response = await fetch(`/api/crm?${parameters}`)
       const payload = await response.json().catch(() => ({})) as CrmPayload
       if (!response.ok || !payload.ok) throw new Error(payload.error || 'Unable to load CRM records')
@@ -330,6 +346,8 @@ export default function CrmSection() {
         : null
       if (matched && !deepLinkOpened.current) {
         deepLinkOpened.current = true
+        setEditorEntity(nextEntity)
+        setEditorHistory([])
         setEditorRecord(matched)
         setFields(initialFields(nextEntity, matched, dateTimeSettings.timeZone))
         if (new URLSearchParams(window.location.search).get('crmAction') === 'compose-email') {
@@ -382,19 +400,25 @@ export default function CrmSection() {
   }, [])
 
   useEffect(() => {
-    if (routeReady) void load(entity, routeQuery)
-  }, [entity, load, routeQuery, routeReady])
+    if (routeReady) void load(entity, routeQuery, needsReviewOnly)
+  }, [entity, load, needsReviewOnly, routeQuery, routeReady])
 
   useEffect(() => {
     if (editorRecord === undefined) return
     let cancelled = false
     const loadEditorOptions = async () => {
+      const loadingRelatedContacts = editorEntity === 'organizations' && Boolean(editorRecord)
+      setRelatedContactsLoading(loadingRelatedContacts)
       try {
-        if (['contacts', 'leads', 'meetings', 'interactions'].includes(entity)) {
+        if (loadingRelatedContacts) {
+          const contactRecords = await loadCrmOptions('contacts')
+          if (!cancelled) setContacts(contactRecords)
+        }
+        if (['contacts', 'leads', 'meetings', 'interactions'].includes(editorEntity)) {
           const organizationRecords = await loadCrmOptions('organizations')
           if (!cancelled) setOrganizations(organizationRecords)
         }
-        if (entity === 'meetings') {
+        if (editorEntity === 'meetings') {
           const [contactRecords, leadRecords, opportunityRecords] = await Promise.all([
             loadCrmOptions('contacts'),
             loadCrmOptions('leads'),
@@ -410,15 +434,27 @@ export default function CrmSection() {
         if (!cancelled) {
           setError(optionsError instanceof Error ? optionsError.message : 'Unable to load CRM relationship options')
         }
+      } finally {
+        if (!cancelled && loadingRelatedContacts) setRelatedContactsLoading(false)
       }
     }
     void loadEditorOptions()
     return () => { cancelled = true }
-  }, [editorRecord, entity])
+  }, [editorEntity, editorRecord])
 
   const editable = Boolean(pipeline && pipeline.accessRole !== 'viewer' && entity !== 'opportunities')
-  const recordEditable = editable && !editorRecord?.workspaceOrganizationId
+  const editorEditable = Boolean(pipeline && pipeline.accessRole !== 'viewer' && editorEntity !== 'opportunities')
+  const recordEditable = editorEditable && !editorRecord?.workspaceOrganizationId
   const tableColumns = useMemo(() => columns(entity), [entity])
+  const relatedContacts = useMemo(() => {
+    const organizationId = editorEntity === 'organizations' && editorRecord
+      ? textValue(editorRecord, 'id')
+      : ''
+    if (!organizationId) return []
+    return contacts
+      .filter((contact) => textValue(contact, 'organizationId') === organizationId)
+      .sort((left, right) => textValue(left, 'fullName').localeCompare(textValue(right, 'fullName')))
+  }, [contacts, editorEntity, editorRecord])
   const actionReady = Boolean(actionComposer && (
     actionComposer.type === 'send_email'
       ? actionFields.subject?.trim() && actionFields.text?.trim()
@@ -429,10 +465,53 @@ export default function CrmSection() {
           : actionFields.recipientReferences?.trim() && actionFields.subject?.trim() && actionFields.text?.trim()
   ))
 
-  async function openEditor(record: RecordValue | null) {
+  function openEditor(record: RecordValue | null) {
     if (!record && !editable) return
+    setEditorEntity(entity)
+    setEditorHistory([])
     setEditorRecord(record)
     setFields(initialFields(entity, record, dateTimeSettings.timeZone))
+    setRelatedContactsLoading(entity === 'organizations' && Boolean(record))
+  }
+
+  function showNeedsReviewInteractions() {
+    deepLinkOpened.current = true
+    setEntity('interactions')
+    setNeedsReviewOnly(true)
+    setQuery('')
+    setRouteQuery('')
+  }
+
+  function clearNeedsReviewFilter() {
+    setNeedsReviewOnly(false)
+    setQuery('')
+    setRouteQuery('')
+  }
+
+  function openRelatedContact(record: RecordValue) {
+    if (!editorRecord) return
+    setEditorHistory((history) => [...history, { entity: editorEntity, record: editorRecord, fields }])
+    setEditorEntity('contacts')
+    setEditorRecord(record)
+    setFields(initialFields('contacts', record, dateTimeSettings.timeZone))
+    setRelatedContactsLoading(false)
+  }
+
+  function returnToPreviousEditor() {
+    const previous = editorHistory[editorHistory.length - 1]
+    if (!previous) return
+    setEditorHistory(editorHistory.slice(0, -1))
+    setEditorEntity(previous.entity)
+    setEditorRecord(previous.record)
+    setFields(previous.fields)
+    setRelatedContactsLoading(previous.entity === 'organizations')
+  }
+
+  function closeEditor() {
+    if (busy) return
+    setEditorRecord(undefined)
+    setEditorHistory([])
+    setRelatedContactsLoading(false)
   }
 
   async function saveRecord() {
@@ -440,23 +519,23 @@ export default function CrmSection() {
     setBusy(true)
     setError('')
     try {
-      const occurredAt = entity === 'interactions' && fields.occurredAt
+      const occurredAt = editorEntity === 'interactions' && fields.occurredAt
         ? zonedDateTimeToIso(fields.occurredAt, dateTimeSettings.timeZone)
         : null
-      if (entity === 'interactions' && fields.occurredAt && !occurredAt) {
+      if (editorEntity === 'interactions' && fields.occurredAt && !occurredAt) {
         throw new Error('Interaction date is invalid in your profile timezone')
       }
       const response = await fetch('/api/crm', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          entity,
+          entity: editorEntity,
           id: editorRecord?.id,
-          fields: entity === 'meetings'
+          fields: editorEntity === 'meetings'
             ? { ...fields, attendeeEmails: fields.attendeeEmails?.split(',').map((email) => email.trim()).filter(Boolean) || [] }
-            : entity === 'interactions'
+            : editorEntity === 'interactions'
               ? { ...fields, occurredAt }
-              : ['organizations', 'contacts', 'leads'].includes(entity)
+              : ['organizations', 'contacts', 'leads'].includes(editorEntity)
                 ? { ...fields, emailOptOut: fields.emailOptOut === 'true' }
                 : fields,
         }),
@@ -464,8 +543,9 @@ export default function CrmSection() {
       const payload = await response.json().catch(() => ({})) as CrmPayload
       if (!response.ok || !payload.ok) throw new Error(payload.error || 'Unable to save CRM record')
       setEditorRecord(undefined)
+      setEditorHistory([])
       setNotice('Saved and queued for CRM sync')
-      await load(entity, query)
+      await load(entity, query, needsReviewOnly)
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : 'Unable to save CRM record')
     } finally {
@@ -548,7 +628,7 @@ export default function CrmSection() {
       setActionComposer(null)
       setNotice(result.action?.status === 'succeeded' ? 'CRM action completed and logged' : 'CRM action queued')
       if (actionComposer.type === 'log_call' && /^tel:[0-9+*#,;]+$/.test(telUrl)) window.location.href = telUrl
-      if (entity === 'interactions' || entity === 'meetings' || entity === 'campaigns') await load(entity, query)
+      if (entity === 'interactions' || entity === 'meetings' || entity === 'campaigns') await load(entity, query, needsReviewOnly)
     } catch (actionError) {
       setError(actionError instanceof Error ? actionError.message : 'CRM action failed')
     } finally {
@@ -565,7 +645,7 @@ export default function CrmSection() {
       const payload = await response.json().catch(() => ({})) as CrmPayload
       if (!response.ok || !payload.ok) throw new Error(payload.error || 'Workbook action failed')
       setNotice(success)
-      await load(entity, query)
+      await load(entity, query, needsReviewOnly)
     } catch (actionError) {
       setError(actionError instanceof Error ? actionError.message : 'Workbook action failed')
     } finally {
@@ -586,7 +666,7 @@ export default function CrmSection() {
       if (!response.ok || !payload.ok) throw new Error(payload.error || 'Unable to update organization hierarchy')
       setWorkspaceHierarchy(payload.workspaceHierarchy || payload.hierarchy || [])
       setNotice('Organization hierarchy updated')
-      await load(entity, query)
+      await load(entity, query, needsReviewOnly)
     } catch (updateError) {
       setError(updateError instanceof Error ? updateError.message : 'Unable to update organization hierarchy')
     } finally {
@@ -648,6 +728,17 @@ export default function CrmSection() {
           <Chip size={shortLandscape ? 'small' : 'medium'} label={`${summary.opportunities} opportunities`} />
           <Chip size={shortLandscape ? 'small' : 'medium'} label={`${summary.meetings} meetings`} />
           <Chip size={shortLandscape ? 'small' : 'medium'} label={`${summary.interactions} interactions`} />
+          {summary.needsReviewInteractions > 0 && (
+            <Chip
+              size={shortLandscape ? 'small' : 'medium'}
+              label={`${summary.needsReviewInteractions} needs review`}
+              color="warning"
+              variant={needsReviewOnly ? 'filled' : 'outlined'}
+              clickable
+              onClick={showNeedsReviewInteractions}
+              sx={{ flexShrink: 0 }}
+            />
+          )}
           <Chip size={shortLandscape ? 'small' : 'medium'} label={`${summary.campaigns} campaigns`} />
           <Chip size={shortLandscape ? 'small' : 'medium'} label={money(summary.openPipelineValue)} color="primary" variant="outlined" />
           {summary.pendingSync > 0 && <Chip size={shortLandscape ? 'small' : 'medium'} label={`${summary.pendingSync} syncing`} color="warning" />}
@@ -663,6 +754,7 @@ export default function CrmSection() {
             <Tabs value={entity} onChange={(_, value: CrmEntity) => {
               deepLinkOpened.current = true
               setEntity(value)
+              setNeedsReviewOnly(false)
               setQuery('')
               setRouteQuery('')
             }} variant="scrollable" sx={shortLandscape ? { minHeight: 36, maxWidth: 420, '& .MuiTab-root': { minHeight: 36, py: 0.5 } } : undefined}>
@@ -692,17 +784,27 @@ export default function CrmSection() {
               )}
             </Stack>
           </Stack>
+          {entity === 'interactions' && needsReviewOnly && (
+            <Chip
+              label="Needs review only"
+              color="warning"
+              variant="outlined"
+              size="small"
+              onDelete={clearNeedsReviewFilter}
+              sx={{ alignSelf: 'flex-start', mt: shortLandscape ? 0 : 1.25, flexShrink: 0 }}
+            />
+          )}
           <TextField
             value={query}
             onChange={(event) => setQuery(event.target.value)}
-            onKeyDown={(event) => { if (event.key === 'Enter') void load(entity, query) }}
+            onKeyDown={(event) => { if (event.key === 'Enter') void load(entity, query, needsReviewOnly) }}
             placeholder={`Search ${ENTITY_LABELS[entity].toLowerCase()}`}
             size="small"
             fullWidth={!shortLandscape}
             sx={{ mt: shortLandscape ? 0 : 1.25, mb: shortLandscape ? 0.25 : 1, width: shortLandscape ? 220 : undefined, flexShrink: 0 }}
             InputProps={{
               startAdornment: <InputAdornment position="start"><SearchRounded fontSize="small" /></InputAdornment>,
-              endAdornment: query ? <InputAdornment position="end"><IconButton size="small" aria-label="Run search" onClick={() => load(entity, query)}><SearchRounded fontSize="small" /></IconButton></InputAdornment> : undefined,
+              endAdornment: query ? <InputAdornment position="end"><IconButton size="small" aria-label="Run search" onClick={() => load(entity, query, needsReviewOnly)}><SearchRounded fontSize="small" /></IconButton></InputAdornment> : undefined,
             }}
           />
         </Stack>
@@ -924,15 +1026,26 @@ export default function CrmSection() {
       <Drawer
         anchor="right"
         open={editorRecord !== undefined}
-        onClose={() => { if (!busy) setEditorRecord(undefined) }}
-        PaperProps={{ sx: { width: { xs: '100%', sm: 460 }, maxWidth: '100vw' } }}
+        onClose={closeEditor}
+        PaperProps={{ sx: { width: { xs: '100%', sm: 460 }, maxWidth: '100vw', overflowX: 'hidden' } }}
       >
-        <Box sx={{ p: 2.5, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-          <Typography variant="h6" fontWeight={700}>{editorRecord ? 'Edit' : 'Add'} {ENTITY_LABELS[entity].slice(0, -1)}</Typography>
-          <IconButton aria-label="Close editor" onClick={() => setEditorRecord(undefined)} disabled={busy}><CloseRounded /></IconButton>
+        <Box sx={{ p: shortLandscape ? 1.5 : 2.5, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 1, minWidth: 0 }}>
+          <Stack direction="row" alignItems="center" gap={0.5} sx={{ minWidth: 0 }}>
+            {editorHistory.length > 0 && (
+              <Tooltip title="Back to organization">
+                <IconButton aria-label="Back to organization" onClick={returnToPreviousEditor} disabled={busy}>
+                  <ArrowBackRounded />
+                </IconButton>
+              </Tooltip>
+            )}
+            <Typography variant="h6" fontWeight={700} sx={{ overflowWrap: 'anywhere' }}>
+              {editorRecord ? 'Edit' : 'Add'} {ENTITY_LABELS[editorEntity].slice(0, -1)}
+            </Typography>
+          </Stack>
+          <IconButton aria-label="Close editor" onClick={closeEditor} disabled={busy}><CloseRounded /></IconButton>
         </Box>
         <Divider />
-        <Stack spacing={2} sx={{ p: 2.5, overflowY: 'auto' }}>
+        <Stack spacing={2} sx={{ p: shortLandscape ? 1.5 : 2.5, overflowY: 'auto', overflowX: 'hidden', minWidth: 0 }}>
           {editorRecord && Boolean(editorRecord.referenceCode) && (
             <Stack direction="row" gap={1} alignItems="center">
               <Chip label={textValue(editorRecord, 'referenceCode')} color="primary" variant="outlined" />
@@ -950,9 +1063,9 @@ export default function CrmSection() {
               ) : null}
             </Stack>
           )}
-          {editorRecord && editable && (
+          {editorRecord && editorEditable && (
             <Stack direction="row" gap={1} flexWrap="wrap">
-              {['organizations', 'contacts', 'leads'].includes(entity) && Boolean(editorRecord.email) && (
+              {['organizations', 'contacts', 'leads'].includes(editorEntity) && Boolean(editorRecord.email) && (
                 <Button disabled={emailOptedOut(editorRecord)} startIcon={<EmailRounded />} variant="outlined" onClick={() => openAction('send_email', editorRecord)}>
                   Email
                 </Button>
@@ -962,48 +1075,84 @@ export default function CrmSection() {
                   Call
                 </Button>
               )}
-              {!['interactions', 'campaigns'].includes(entity) && (
+              {!['interactions', 'campaigns'].includes(editorEntity) && (
                 <Button startIcon={<EventRounded />} variant="outlined" onClick={() => openAction('create_calendar_event', editorRecord)}>
                   Schedule
                 </Button>
               )}
-              {entity === 'campaigns' && (
+              {editorEntity === 'campaigns' && (
                 <Button startIcon={<CampaignRounded />} variant="outlined" onClick={() => openAction('send_campaign', editorRecord)}>
                   Send campaign
                 </Button>
               )}
             </Stack>
           )}
-          {entity === 'organizations' && <>
+          {editorEntity === 'organizations' && <>
             <TextField disabled={!recordEditable} label="Organization" value={fields.name || ''} onChange={(event) => setFields({ ...fields, name: event.target.value })} required />
-            <TextField disabled={!recordEditable} label="Type" value={fields.accountType || ''} onChange={(event) => setFields({ ...fields, accountType: event.target.value })} />
+            <Stack direction={{ xs: 'column', sm: 'row' }} gap={2} sx={{ minWidth: 0 }}>
+              <TextField fullWidth disabled={!recordEditable} label="Priority" value={fields.priority || ''} onChange={(event) => setFields({ ...fields, priority: event.target.value })} />
+              <TextField fullWidth disabled={!recordEditable} label="Type" value={fields.accountType || ''} onChange={(event) => setFields({ ...fields, accountType: event.target.value })} />
+            </Stack>
             <TextField disabled={!recordEditable} label="Owner" value={fields.accountManager || ''} onChange={(event) => setFields({ ...fields, accountManager: event.target.value })} />
-            <TextField disabled={!recordEditable} label="Website" value={fields.website || ''} onChange={(event) => setFields({ ...fields, website: event.target.value })} />
-            <TextField disabled={!recordEditable} label="Phone" value={fields.phone || ''} onChange={(event) => setFields({ ...fields, phone: event.target.value })} />
-            <TextField disabled={!recordEditable} label="Email" type="email" value={fields.email || ''} onChange={(event) => setFields({ ...fields, email: event.target.value })} />
+            <TextField disabled={!recordEditable} label="Website" type="url" value={fields.website || ''} onChange={(event) => setFields({ ...fields, website: event.target.value })} />
+            <TextField disabled={!recordEditable} label="LinkedIn URL" type="url" value={fields.linkedinUrl || ''} onChange={(event) => setFields({ ...fields, linkedinUrl: event.target.value })} />
+            <Stack direction={{ xs: 'column', sm: 'row' }} gap={2} sx={{ minWidth: 0 }}>
+              <TextField fullWidth disabled={!recordEditable} label="Phone" type="tel" value={fields.phone || ''} onChange={(event) => setFields({ ...fields, phone: event.target.value })} />
+              <TextField fullWidth disabled={!recordEditable} label="Email" type="email" value={fields.email || ''} onChange={(event) => setFields({ ...fields, email: event.target.value })} />
+            </Stack>
             <FormControlLabel
               control={<Checkbox disabled={!recordEditable} checked={fields.emailOptOut === 'true'} onChange={(event) => setFields({ ...fields, emailOptOut: String(event.target.checked) })} />}
               label="Do not email"
             />
+            <TextField disabled={!recordEditable} label="Address" value={fields.address || ''} onChange={(event) => setFields({ ...fields, address: event.target.value })} />
+            <Stack direction={{ xs: 'column', sm: 'row' }} gap={2} sx={{ minWidth: 0 }}>
+              <TextField fullWidth disabled={!recordEditable} label="City" value={fields.city || ''} onChange={(event) => setFields({ ...fields, city: event.target.value })} />
+              <TextField fullWidth disabled={!recordEditable} label="State" value={fields.state || ''} onChange={(event) => setFields({ ...fields, state: event.target.value })} />
+            </Stack>
+            <Stack direction={{ xs: 'column', sm: 'row' }} gap={2} sx={{ minWidth: 0 }}>
+              <TextField fullWidth disabled={!recordEditable} label="Postal code" value={fields.postalCode || ''} onChange={(event) => setFields({ ...fields, postalCode: event.target.value })} />
+              <TextField fullWidth disabled={!recordEditable} label="Country" value={fields.country || ''} onChange={(event) => setFields({ ...fields, country: event.target.value })} />
+            </Stack>
           </>}
-          {entity === 'contacts' && <>
+          {editorEntity === 'contacts' && <>
             <TextField disabled={!recordEditable} label="Contact" value={fields.fullName || ''} onChange={(event) => setFields({ ...fields, fullName: event.target.value })} required />
+            <Stack direction={{ xs: 'column', sm: 'row' }} gap={2} sx={{ minWidth: 0 }}>
+              <TextField fullWidth disabled={!recordEditable} label="First name" value={fields.firstName || ''} onChange={(event) => setFields({ ...fields, firstName: event.target.value })} />
+              <TextField fullWidth disabled={!recordEditable} label="Last name" value={fields.lastName || ''} onChange={(event) => setFields({ ...fields, lastName: event.target.value })} />
+            </Stack>
             <TextField disabled={!recordEditable} select required label="Organization" value={fields.organizationId || ''} onChange={(event) => setFields({ ...fields, organizationId: event.target.value })}>
               {fields.organizationId && !organizations.some((record) => textValue(record, 'id') === fields.organizationId) ? (
                 <MenuItem value={fields.organizationId}>{(editorRecord ? textValue(editorRecord, 'organizationName') : '') || 'Current organization'}</MenuItem>
               ) : null}
               {organizations.map((record) => <MenuItem key={textValue(record, 'id')} value={textValue(record, 'id')}>{textValue(record, 'name')}</MenuItem>)}
             </TextField>
+            <Stack direction={{ xs: 'column', sm: 'row' }} gap={2} sx={{ minWidth: 0 }}>
+              <TextField fullWidth disabled={!recordEditable} label="Priority" value={fields.priority || ''} onChange={(event) => setFields({ ...fields, priority: event.target.value })} />
+              <TextField fullWidth disabled={!recordEditable} label="Type" value={fields.contactType || ''} onChange={(event) => setFields({ ...fields, contactType: event.target.value })} />
+            </Stack>
+            <TextField disabled={!recordEditable} label="Owner" value={fields.accountManager || ''} onChange={(event) => setFields({ ...fields, accountManager: event.target.value })} />
             <TextField disabled={!recordEditable} label="Title" value={fields.jobTitle || ''} onChange={(event) => setFields({ ...fields, jobTitle: event.target.value })} />
             <TextField disabled={!recordEditable} label="Email" type="email" value={fields.email || ''} onChange={(event) => setFields({ ...fields, email: event.target.value })} />
+            <TextField disabled={!recordEditable} label="LinkedIn URL" type="url" value={fields.linkedinUrl || ''} onChange={(event) => setFields({ ...fields, linkedinUrl: event.target.value })} />
             <FormControlLabel
               control={<Checkbox disabled={!recordEditable} checked={fields.emailOptOut === 'true'} onChange={(event) => setFields({ ...fields, emailOptOut: String(event.target.checked) })} />}
               label="Do not email"
             />
-            <TextField disabled={!recordEditable} label="Work phone" value={fields.phoneWork || ''} onChange={(event) => setFields({ ...fields, phoneWork: event.target.value })} />
-            <TextField disabled={!recordEditable} label="Mobile" value={fields.phoneMobile || ''} onChange={(event) => setFields({ ...fields, phoneMobile: event.target.value })} />
+            <Stack direction={{ xs: 'column', sm: 'row' }} gap={2} sx={{ minWidth: 0 }}>
+              <TextField fullWidth disabled={!recordEditable} label="Work phone" type="tel" value={fields.phoneWork || ''} onChange={(event) => setFields({ ...fields, phoneWork: event.target.value })} />
+              <TextField fullWidth disabled={!recordEditable} label="Mobile" type="tel" value={fields.phoneMobile || ''} onChange={(event) => setFields({ ...fields, phoneMobile: event.target.value })} />
+            </Stack>
+            <TextField disabled={!recordEditable} label="Address" value={fields.address || ''} onChange={(event) => setFields({ ...fields, address: event.target.value })} />
+            <Stack direction={{ xs: 'column', sm: 'row' }} gap={2} sx={{ minWidth: 0 }}>
+              <TextField fullWidth disabled={!recordEditable} label="City" value={fields.city || ''} onChange={(event) => setFields({ ...fields, city: event.target.value })} />
+              <TextField fullWidth disabled={!recordEditable} label="State" value={fields.state || ''} onChange={(event) => setFields({ ...fields, state: event.target.value })} />
+            </Stack>
+            <Stack direction={{ xs: 'column', sm: 'row' }} gap={2} sx={{ minWidth: 0 }}>
+              <TextField fullWidth disabled={!recordEditable} label="Postal code" value={fields.postalCode || ''} onChange={(event) => setFields({ ...fields, postalCode: event.target.value })} />
+              <TextField fullWidth disabled={!recordEditable} label="Country" value={fields.country || ''} onChange={(event) => setFields({ ...fields, country: event.target.value })} />
+            </Stack>
           </>}
-          {entity === 'leads' && <>
+          {editorEntity === 'leads' && <>
             <TextField disabled={!recordEditable} label="Lead" value={fields.fullName || ''} onChange={(event) => setFields({ ...fields, fullName: event.target.value })} required />
             <TextField disabled={!recordEditable} select label="Organization" value={fields.organizationId || ''} onChange={(event) => setFields({ ...fields, organizationId: event.target.value })}>
               <MenuItem value="">Unlinked</MenuItem>
@@ -1024,7 +1173,7 @@ export default function CrmSection() {
             <TextField disabled={!recordEditable} label="Status" value={fields.status || ''} onChange={(event) => setFields({ ...fields, status: event.target.value })} />
             <TextField disabled={!recordEditable} label="Source" value={fields.source || ''} onChange={(event) => setFields({ ...fields, source: event.target.value })} />
           </>}
-          {entity === 'opportunities' && <>
+          {editorEntity === 'opportunities' && <>
             <TextField disabled label="Opportunity" value={fields.name || ''} />
             <TextField disabled label="Stage" value={fields.stage || ''} />
             <TextField disabled label="Status" value={fields.status || ''} />
@@ -1032,7 +1181,7 @@ export default function CrmSection() {
             <TextField disabled label="Probability" value={fields.probability || ''} />
             <TextField disabled label="Expected close" value={fields.expectedClose || ''} />
           </>}
-          {entity === 'meetings' && <>
+          {editorEntity === 'meetings' && <>
             <TextField disabled={!recordEditable} label="Meeting" value={fields.subject || ''} onChange={(event) => setFields({ ...fields, subject: event.target.value })} required />
             <TextField disabled={!recordEditable} select label="Organization" value={fields.organizationId || ''} onChange={(event) => setFields({ ...fields, organizationId: event.target.value })}>
               <MenuItem value="">Unlinked</MenuItem>
@@ -1059,7 +1208,7 @@ export default function CrmSection() {
             <TextField disabled={!recordEditable} label="Location" value={fields.location || ''} onChange={(event) => setFields({ ...fields, location: event.target.value })} />
             <TextField disabled={!recordEditable} label="Attendee emails" value={fields.attendeeEmails || ''} onChange={(event) => setFields({ ...fields, attendeeEmails: event.target.value })} helperText="Separate addresses with commas" />
           </>}
-          {entity === 'interactions' && <>
+          {editorEntity === 'interactions' && <>
             <TextField disabled={!recordEditable} label="Subject" value={fields.subject || ''} onChange={(event) => setFields({ ...fields, subject: event.target.value })} required />
             <TextField disabled={!recordEditable} select label="Organization" value={fields.organizationId || ''} onChange={(event) => setFields({ ...fields, organizationId: event.target.value })}>
               <MenuItem value="">None</MenuItem>
@@ -1072,7 +1221,7 @@ export default function CrmSection() {
             <TextField disabled={!recordEditable} label="Date" type="datetime-local" value={fields.occurredAt || ''} onChange={(event) => setFields({ ...fields, occurredAt: event.target.value })} InputLabelProps={{ shrink: true }} />
             <TextField disabled={!recordEditable} label="Agent" value={fields.agentName || ''} onChange={(event) => setFields({ ...fields, agentName: event.target.value })} />
           </>}
-          {entity === 'campaigns' && <>
+          {editorEntity === 'campaigns' && <>
             <TextField disabled={!recordEditable} label="Campaign" value={fields.name || ''} onChange={(event) => setFields({ ...fields, name: event.target.value })} required />
             <TextField disabled={!recordEditable} select label="Status" value={fields.status || 'draft'} onChange={(event) => setFields({ ...fields, status: event.target.value })}>
               {['draft', 'queued', 'sending', 'sent', 'paused', 'failed'].map((status) => <MenuItem key={status} value={status}>{status}</MenuItem>)}
@@ -1086,6 +1235,57 @@ export default function CrmSection() {
             <TextField disabled={!recordEditable} label="Message template" value={fields.bodyTemplate || ''} onChange={(event) => setFields({ ...fields, bodyTemplate: event.target.value })} multiline minRows={8} />
           </>}
           <TextField disabled={!recordEditable} label="Description" value={fields.description || fields.notes || ''} onChange={(event) => setFields({ ...fields, description: event.target.value, notes: event.target.value })} multiline minRows={4} />
+          {editorEntity === 'organizations' && editorRecord && (
+            <Box component="section" sx={{ minWidth: 0 }}>
+              <Stack direction="row" justifyContent="space-between" alignItems="center" gap={1}>
+                <Typography variant="subtitle2" fontWeight={700}>Contacts</Typography>
+                {!relatedContactsLoading && (
+                  <Typography variant="caption" color="text.secondary">{relatedContacts.length}</Typography>
+                )}
+              </Stack>
+              <Divider sx={{ mt: 1 }} />
+              {relatedContactsLoading ? (
+                <Box sx={{ py: 2.5, display: 'grid', placeItems: 'center' }}>
+                  <CircularProgress size={22} />
+                </Box>
+              ) : relatedContacts.length > 0 ? (
+                <List disablePadding>
+                  {relatedContacts.map((contact, index) => {
+                    const name = textValue(contact, 'fullName')
+                      || [textValue(contact, 'firstName'), textValue(contact, 'lastName')].filter(Boolean).join(' ')
+                      || textValue(contact, 'referenceCode')
+                    const detail = [
+                      textValue(contact, 'jobTitle'),
+                      textValue(contact, 'email'),
+                      textValue(contact, 'phoneWork') || textValue(contact, 'phoneMobile'),
+                      textValue(contact, 'referenceCode'),
+                    ].filter(Boolean).join(' · ')
+                    return (
+                      <ListItemButton
+                        key={textValue(contact, 'id')}
+                        divider={index < relatedContacts.length - 1}
+                        onClick={() => openRelatedContact(contact)}
+                        sx={{ px: 0, py: 1.25, alignItems: 'flex-start', minWidth: 0 }}
+                      >
+                        <ListItemText
+                          primary={name}
+                          secondary={detail || 'Contact'}
+                          primaryTypographyProps={{ fontWeight: 600, sx: { overflowWrap: 'anywhere' } }}
+                          secondaryTypographyProps={{ sx: { mt: 0.25, whiteSpace: 'normal', overflowWrap: 'anywhere' } }}
+                          sx={{ minWidth: 0, my: 0 }}
+                        />
+                        <ChevronRightRounded color="action" sx={{ mt: 0.5, ml: 1, flexShrink: 0 }} />
+                      </ListItemButton>
+                    )
+                  })}
+                </List>
+              ) : (
+                <Typography variant="body2" color="text.secondary" sx={{ py: 2 }}>
+                  No related contacts
+                </Typography>
+              )}
+            </Box>
+          )}
           {recordEditable && <Button variant="contained" onClick={saveRecord} disabled={busy}>{busy ? 'Saving…' : 'Save'}</Button>}
         </Stack>
       </Drawer>

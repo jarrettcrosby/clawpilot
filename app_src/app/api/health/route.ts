@@ -6,7 +6,7 @@ import { query as queryAgentCredentials } from '@/lib/persistence/agentCredentia
 import { query } from '@/lib/persistence/postgres'
 import { readPipelineOutboxWorkerHeartbeatFromPostgres } from '@/lib/persistence/pipeline'
 import { readAgentDispatchWorkerHeartbeatFromPostgres } from '@/lib/persistence/agentDispatch'
-import { documentEmbeddingConfiguration } from '@/lib/documentEmbeddings'
+import { effectiveDocumentEmbeddingConfiguration } from '@/lib/documentEmbeddings'
 import { validateShortLinkConfiguration } from '@/lib/shortlinks'
 import { readSuiteCrmWorkerHeartbeat } from '@/lib/persistence/crm'
 import { suiteCrmBaseUrl } from '@/lib/crm/suiteCrmClient'
@@ -141,7 +141,7 @@ export async function GET() {
     }
     let embeddingProvider: 'local' | 'openai' = 'local'
     try {
-      embeddingProvider = documentEmbeddingConfiguration().provider
+      embeddingProvider = (await effectiveDocumentEmbeddingConfiguration()).provider
     } catch (error) {
       errors.push(error instanceof Error ? error.message : 'Document embedding configuration is invalid.')
     }

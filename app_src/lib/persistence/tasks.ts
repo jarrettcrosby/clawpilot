@@ -5,6 +5,7 @@ import { isCrmBoardCard, normalizeCrmBoardCard } from '@/lib/crm/boardCard.mjs'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import { query, withTransaction } from '@/lib/persistence/postgres'
 import { insertAgentDispatchOutbox, type AgentDispatchEnqueueInput } from '@/lib/persistence/agentDispatch'
+import { recordAuditEvent } from '@/lib/auditWriter'
 
 type TaskRow = {
   payload: Task
@@ -122,9 +123,65 @@ export async function replaceTasksInPostgres(tasks: Task[], scope: TaskStoreScop
     const appTasks = tasks.filter((task) => !isCrmBoardCard(task))
     const crmCards = tasks.filter((task) => isCrmBoardCard(task))
     const ids = appTasks.map((task) => String(task.id))
+    const previous = await client.query<{ id: string; payload: Task }>(
+      `SELECT id, payload FROM tasks WHERE board_id = $1::uuid AND source <> 'crm-projection' FOR UPDATE`,
+      [scope.boardId],
+    )
+    const previousById = new Map(previous.rows.map((row) => [row.id, row.payload]))
+    const boardOrganization = await client.query<{ organization_id: string | null }>(
+      `SELECT app_user.organization_id::text
+       FROM project_boards board
+       JOIN app_users app_user ON app_user.email = board.owner_email
+       WHERE board.id = $1::uuid`,
+      [scope.boardId],
+    )
+    const organizationId = boardOrganization.rows[0]?.organization_id || null
 
     for (const task of appTasks) {
       await upsertTaskWithClient(client, task, scope.boardId)
+      const activity = Array.isArray(task.activity) ? task.activity : []
+      for (let index = 0; index < activity.length; index += 1) {
+        const event = activity[index]
+        const timestamp = safeIso(event.timestamp, safeIso(task.updatedAt, new Date().toISOString()))
+        await recordAuditEvent({
+          actor: String(event.actor || 'system'),
+          eventType: `project.task.${String(event.type || 'updated').replaceAll(' ', '_')}`,
+          aggregateType: 'project_task',
+          aggregateId: String(task.id),
+          organizationId,
+          eventKey: `project-task:${scope.boardId}:${task.id}:${index}`,
+          payload: {
+            boardId: scope.boardId,
+            taskId: String(task.id),
+            taskTitle: String(task.title || 'Untitled task'),
+            activityOrdinal: index + 1,
+            occurredAt: timestamp,
+            message: event.message,
+            from: event.from,
+            to: event.to,
+            commentId: event.commentId,
+          },
+        }, client)
+      }
+    }
+
+    for (const [taskId, previousTask] of previousById) {
+      if (ids.includes(taskId)) continue
+      const lastActor = [...(previousTask.activity || [])].reverse().find((event) => event.actor)?.actor || 'system'
+      await recordAuditEvent({
+        actor: String(lastActor),
+        eventType: 'project.task.deleted',
+        aggregateType: 'project_task',
+        aggregateId: taskId,
+        organizationId,
+        eventKey: `project-task:${scope.boardId}:${taskId}:deleted`,
+        payload: {
+          boardId: scope.boardId,
+          taskId,
+          taskTitle: previousTask.title,
+          message: 'Card permanently deleted',
+        },
+      }, client)
     }
 
     for (const task of crmCards) {

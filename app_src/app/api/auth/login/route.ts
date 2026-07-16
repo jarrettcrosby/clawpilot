@@ -1,6 +1,7 @@
 import crypto from 'crypto'
 import { NextRequest, NextResponse } from 'next/server'
 import { createSessionToken, getCookieName, getLoginPassword } from '@/lib/auth'
+import { recordAuthActivity } from '@/lib/authAudit'
 import { configuredOwnerEmail, ensureOwnerUser, markAppUserSignedIn } from '@/lib/users'
 import { ensureDefaultResourcesForUser } from '@/lib/tenancy'
 
@@ -82,6 +83,13 @@ export async function POST(req: NextRequest) {
         count: (current?.count || 0) + 1,
         resetAt: current?.resetAt || now + WINDOW_MS,
       })
+      await recordAuthActivity({
+        req,
+        email: configuredOwnerEmail(),
+        eventType: 'auth.login.failed',
+        method: 'operator_password',
+        reason: 'invalid_password',
+      }).catch(() => undefined)
       return NextResponse.json({ ok: false, error: 'Invalid password' }, { status: 401 })
     }
 
@@ -101,6 +109,7 @@ export async function POST(req: NextRequest) {
       path: '/',
       maxAge: 60 * 60 * 12,
     })
+    await recordAuthActivity({ req, email: ownerEmail, eventType: 'auth.login.succeeded', method: 'operator_password' }).catch(() => undefined)
     return res
   } catch (e: unknown) {
     return NextResponse.json({ ok: false, error: String(e) }, { status: 500 })

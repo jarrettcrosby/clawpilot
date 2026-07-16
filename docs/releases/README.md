@@ -8,6 +8,8 @@ app_visible: true
 
 # Release Documentation Contract
 
+Release documentation is part of deployment work and does not require a separate operator request. The implementation slice updates its owning module or operations contract; promotion adds the environment-specific release entry below. Promotion is incomplete if either layer is stale.
+
 Each promoted deployment must create one idempotent release entry containing:
 
 - commit hash and branch

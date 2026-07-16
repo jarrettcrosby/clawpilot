@@ -62,6 +62,8 @@ type UserPermissions = {
   viewFullReleaseHistory: boolean
   manageBackups: boolean
   manageLinks: boolean
+  viewOrganizationAudit: boolean
+  viewSystemAudit: boolean
 }
 
 type AppUser = {
@@ -216,6 +218,8 @@ const PERMISSIONS: Array<{ key: PermissionKey; label: string; adminOnly?: boolea
   { key: 'viewFullReleaseHistory', label: 'View full release history', adminOnly: true },
   { key: 'manageBackups', label: 'Manage data checkpoints', adminOnly: true },
   { key: 'manageLinks', label: 'Manage organization short links', adminOnly: true },
+  { key: 'viewOrganizationAudit', label: 'View organization activity', adminOnly: true },
+  { key: 'viewSystemAudit', label: 'View global system activity', adminOnly: true },
 ]
 
 const panelSx = {
@@ -1123,8 +1127,8 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
                             onChange={(event) => {
                               const role = event.target.value as EditableRole
                               const permissions = role === 'admin'
-                                ? { ...user.permissions, inviteUsers: true, manageUserAccess: true, viewFullReleaseHistory: true, manageBackups: true, manageLinks: true }
-                                : { ...user.permissions, inviteUsers: false, manageUserAccess: false, viewFullReleaseHistory: false, manageBackups: false, manageLinks: false }
+                                ? { ...user.permissions, inviteUsers: true, manageUserAccess: true, viewFullReleaseHistory: true, manageBackups: true, manageLinks: true, viewOrganizationAudit: true, viewSystemAudit: true }
+                                : { ...user.permissions, inviteUsers: false, manageUserAccess: false, viewFullReleaseHistory: false, manageBackups: false, manageLinks: false, viewOrganizationAudit: false, viewSystemAudit: false }
                               void updateAccess(user, role, permissions)
                             }}
                             disabled={busy}

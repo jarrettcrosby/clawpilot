@@ -12,7 +12,7 @@ Open the repository root, not the `docs/` folder, as the Obsidian vault. Start w
 
 ## Current Contracts
 
-Current behavior is defined only by documents with `status: active` and `app_visible: true`.
+Current product behavior is defined by active module and operating contracts. Operator-only runbooks also use `status: active` but set `app_visible: false` so provider procedures and infrastructure details remain in the repository/Obsidian vault rather than the in-app catalog.
 
 ### Modules
 
@@ -29,14 +29,16 @@ Current behavior is defined only by documents with `status: active` and `app_vis
 
 - [ClawPilot environments and deployment](operations/clawpilot-environments.md)
 - [Knowledge vault organization](operations/knowledge-vault-organization.md)
+- [ChatGPT agent authorization](operations/chatgpt-agent-auth.md)
 - [Google Workspace integration](operations/google-workspace-integration.md)
+- [Railway Postgres backups](operations/railway-postgres-backups.md)
 - [SuiteCRM Railway runbook](operations/suitecrm.md)
 - [Release documentation contract](releases/README.md)
 - [ClawPilot identity](brand/clawpilot-identity.md)
 
-### Architecture
+### Authority
 
-The active module contracts above are the current architecture surface. Files under `docs/architecture/` have no active metadata and remain transition decisions or historical references until an owner deliberately refreshes and promotes them. This prevents an older file-backed or OpenClaw design from silently becoming authoritative.
+The active module contracts above are the current product and architecture surface. Operator runbooks contain provider procedures but do not redefine product behavior. Deleted file-backed and OpenClaw designs remain available in Git history and must not be treated as current requirements.
 
 ## Build And Release Trail
 
@@ -50,12 +52,12 @@ Use this order to understand progress without reconstructing it from dated workl
 
 ## Historical Archive
 
-Unclassified notes and dated audits remain searchable evidence, not current requirements. The main archive areas are `docs/architecture/`, `docs/incidents/`, `docs/integrations/`, `docs/operations/`, `docs/ops/`, and `docs/reviews/`. Do not mass-edit these files merely to make them appear current. Promote useful conclusions into an active module or operations contract and preserve the original note as evidence.
+Retain historical Markdown only when the event itself has continuing operational value. The [stable-build integrity incident](incidents/2026-03-20-stable-build-integrity-outage.md) remains searchable because it explains a release-safety control. Provider backup evidence remains in the Railway backup runbook. Superseded plans, reviews, requirements matrices, and setup handoffs are removed after their useful conclusions are incorporated into active contracts; Git history preserves their original wording.
 
 ## App Search Flow
 
-The configured owner receives the repository catalog in ClawPilot Docs; other users receive only their own generated and user-owned documents. A changed repository note is stored in Postgres, indexed for full-text search, and queued for a 256-dimension vector. The worker defaults to a deterministic local vector. External OpenAI embeddings require an explicit provider opt-in and dedicated embedding credential. See [Knowledge vault organization](operations/knowledge-vault-organization.md) for the complete flow.
+The configured owner receives the repository catalog in ClawPilot Docs; other users receive only their own generated and user-owned documents. A changed repository note is stored in Postgres, indexed for full-text search, and queued for a 256-dimension vector. Knowledge defaults to Local with no external content transfer or embedding-provider cost. The owner can select External in **Settings > Integrations > Knowledge** only after a dedicated `OPENAI_EMBEDDING_API_KEY` is configured; external mode sends document content and semantic search input to OpenAI. See [Knowledge vault organization](operations/knowledge-vault-organization.md) for the complete flow.
 
 ## Authoring Rule
 
-Update the owning module contract and release copy instead of creating another top-level progress log. Add a dated incident or review only when the event itself is useful evidence. Run `npm run verify:docs` before committing documentation changes.
+Every implementation and release updates its owning active contract and release copy as part of the work, without waiting for an operator prompt. Do not create another top-level progress log. Add a dated incident or audit only when the evidence will remain useful. Run `npm run verify:docs` before committing documentation changes.

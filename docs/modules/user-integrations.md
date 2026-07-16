@@ -48,6 +48,14 @@ Keep user-owned Maton accounts separate from the platform Google Workspace crede
 - Pipeline sharing reconciles the managed folder to the exact ClawPilot membership: editors receive Google writer access, viewers receive reader access, and public, domain, group, or anyone permissions are rejected.
 - Existing owner-only legacy Sheets can continue through the legacy Maton path until migrated. New managed tenant pipelines never fall back to a global Maton credential.
 
+## Knowledge Embeddings Contract
+
+- **Settings > Integrations > Knowledge** is an owner-controlled platform setting. Members and non-owner administrators cannot change the embedding provider.
+- `Local` is the default and keeps document content inside ClawPilot. `External` is an explicit opt-in for improved semantic retrieval when its expected value justifies external processing and usage cost.
+- External mode is disabled until the server environment has a dedicated `OPENAI_EMBEDDING_API_KEY`. Settings stores only the selected provider and audit metadata; it never stores or returns the key.
+- External mode sends document content and semantic search input to OpenAI's embedding endpoint. The agent API key, Maton key, Google credential, and user ChatGPT/Codex authorization are never substituted for the dedicated embedding key.
+- `DOCUMENT_EMBEDDINGS_PROVIDER` supplies the bootstrap default when no database preference exists. A valid owner selection in Settings becomes the effective provider for later document jobs and semantic queries.
+
 ## Operational Checks
 
 Use the [Google Workspace integration runbook](../operations/google-workspace-integration.md) for Cloud credential, Shared Drive, environment setup, and rotation steps.
@@ -56,4 +64,5 @@ Use the [Google Workspace integration runbook](../operations/google-workspace-in
 2. Confirm each user who needs Maton reports a configured key and the required selected `ACTIVE` connections.
 3. Confirm pipeline provisioning reaches `ready`, exposes its short link, and enables Sheet sync.
 4. Check `/api/pipeline/sync-status` and the worker heartbeat after a pull or queued write.
-5. Rotate credentials through Settings; never add plaintext keys, private keys, OAuth tokens, or full connection IDs to documentation, logs, or release copy.
+5. Confirm Knowledge remains `Local` unless the owner deliberately enables `External` and the dedicated key is configured.
+6. Rotate credentials through Settings or the owning server environment as appropriate; never add plaintext keys, private keys, OAuth tokens, or full connection IDs to documentation, logs, or release copy.

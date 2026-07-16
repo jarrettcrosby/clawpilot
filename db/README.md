@@ -2,40 +2,41 @@
 
 ClawPilot uses Railway Postgres for durable app-owned state. Google Sheets remains the operator-owned writable table for the pipeline workflow unless a later product decision changes that.
 
-## Local Default
+## Runtime Modes
 
-Local development continues to use the existing file-backed state unless explicitly configured:
+Hosted development and production require Railway Postgres and fail closed rather than writing ephemeral container files:
+
+```bash
+CLAWPILOT_STORAGE=postgres
+DATABASE_URL=postgresql://...
+CLAWPILOT_DB_FALLBACK_TO_FILE=false
+```
+
+The canonical local `./scripts/dev-start.sh` path uses isolated file-backed compatibility state unless Postgres is explicitly configured:
 
 ```bash
 CLAWPILOT_STORAGE=file
 ```
 
-## Railway/Postgres Mode
+## Migrations
 
-Set:
-
-```bash
-DATABASE_URL=postgresql://...
-CLAWPILOT_STORAGE=postgres
-```
-
-Then run migrations:
+Migrations are append-only and run before the Railway application starts:
 
 ```bash
 npm run db:migrate
 ```
 
-Seed tasks from the current JSON lane:
+Legacy import commands remain available for controlled one-time migrations:
 
 ```bash
 npm run db:import:tasks
 npm run db:import:threads
 ```
 
-The first app areas moved are task persistence, agent thread persistence, execution run/result append logs, and the opportunity pipeline projection/outbox path. Migration `0002_pipeline_outbox_worker.sql` adds idempotency, worker leases, retry scheduling, and dead-letter support. Later migrations add multi-user access, encrypted per-user ChatGPT/Codex credentials, and user-scoped agent conversations. The migrations keep compatibility payloads in `jsonb` while adding extracted columns for durable querying.
+Postgres owns ClawPilot users and access, organizations, boards and tasks, CRM projections, short links, documents and releases, agent threads and execution evidence, pipeline definitions and projections, credentials metadata, outboxes, and audit events. Google Sheets remains the controlled writable Opportunities table, and SuiteCRM remains the native CRM projection.
 
 Hosted ChatGPT credentials require a dedicated `AGENT_CREDENTIAL_ENCRYPTION_KEY` with at least 32 random characters. Tokens are encrypted before they are written to Postgres. Every invited ClawPilot user signs in with their own email and completes their own ChatGPT device authorization.
 
-Pipeline ownership remains split: Google Sheets is still the writable operator table, while Postgres stores the app projection, dropdown cache, and sync outbox/audit rows. The Railway worker drains queued Sheet updates and retries failed operations.
+The Railway worker drains leased Google, CRM, agent, and document jobs with retries and dead-letter handling. Never edit a previously applied migration; add a new migration and validate development before production.
 
-See `docs/operations/railway-postgres-backups.md` for the backup and restore policy.
+See [Railway Postgres backups](../docs/operations/railway-postgres-backups.md) for recovery policy and [Pipeline and synchronization](../docs/modules/pipeline-and-sync.md) for the Sheets/Postgres ownership boundary.

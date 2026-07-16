@@ -199,6 +199,9 @@ const permissionsDefaults = {
   createPipelines: true,
   viewFullReleaseHistory: false,
   manageBackups: false,
+  manageLinks: false,
+  viewOrganizationAudit: false,
+  viewSystemAudit: false,
 }
 
 const persistenceMock = {
@@ -217,7 +220,7 @@ const persistenceMock = {
 const usersMock = {
   effectiveUserPermissions(user) {
     if (user.role === 'owner') {
-      return { ...permissionsDefaults, viewFullReleaseHistory: true, manageBackups: true }
+      return { ...permissionsDefaults, viewFullReleaseHistory: true, manageBackups: true, manageLinks: true, viewOrganizationAudit: true, viewSystemAudit: true }
     }
     return { ...permissionsDefaults, ...user.permissions }
   },
