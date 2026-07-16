@@ -753,7 +753,7 @@ export default function PipelineSection() {
     setSourceOptions(pick('source', DEFAULT_SOURCES))
     setOwnerOptions(pick('owner', DEFAULT_OWNERS))
     setLossReasonOptions(pick('loss_reason', DEFAULT_LOSS_REASONS))
-    setProductOptions(pick('product', DEFAULT_PRODUCTS))
+    setProductOptions(pick('product', DEFAULT_PRODUCTS).filter((product) => !product.includes(',')))
   }
 
   useEffect(() => {
