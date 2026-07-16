@@ -176,8 +176,8 @@ export async function createBrowserSession(input: {
          idle_timeout_seconds, idle_expires_at, absolute_expires_at
        ) VALUES (
          $1, $2, $2, $3, $4, $5, $6, $6, $7,
-         now() + ($7 * interval '1 second'),
-         now() + ($8 * interval '1 second')
+         now() + ($7::integer * interval '1 second'),
+         now() + ($8::integer * interval '1 second')
        ) RETURNING *
      )
      ${SESSION_SELECT.replace('FROM app_sessions session', 'FROM inserted session')}`,
@@ -497,7 +497,7 @@ export async function startImpersonation(input: {
       `WITH changed AS (
          UPDATE app_sessions SET token_hash = $2, effective_user_email = $3,
            impersonation_started_at = now(),
-           impersonation_expires_at = now() + ($4 * interval '1 second'),
+           impersonation_expires_at = now() + ($4::integer * interval '1 second'),
            last_seen_at = now()
          WHERE id = $1::uuid AND revoked_at IS NULL
          RETURNING *
