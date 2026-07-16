@@ -142,6 +142,23 @@ function note(testInfo: TestInfo, description: string) {
 }
 
 async function mockCrmRecords(page: Page) {
+  await page.route((url) => url.pathname === '/api/workspaces', async (route) => {
+    await route.fulfill({
+      json: {
+        ok: true,
+        boards: [],
+        pipelines: [{
+          id: '00000000-0000-4000-8000-000000000100',
+          name: 'Mobile Acceptance Pipeline',
+          ownerEmail: 'operator@example.test',
+          accessRole: 'owner',
+        }],
+        selectedBoardId: null,
+        selectedPipelineId: '00000000-0000-4000-8000-000000000100',
+      },
+    })
+  })
+
   const recordsByEntity: Record<string, Array<Record<string, unknown>>> = {
     organizations: [{
       id: '00000000-0000-4000-8000-000000000101',
@@ -248,13 +265,21 @@ async function mockCrmRecords(page: Page) {
           ownerEmail: 'operator@example.test',
           workspaceOrganizationId: null,
           accessRole: 'owner',
-          shortLinkUrl: null,
+          shortLinkUrl: 'https://eigenracing.com/s/mobile-workbook',
         },
-        workspaceHierarchy: [],
+        workspaceHierarchy: [{
+          id: '00000000-0000-4000-8000-000000000105',
+          parentId: null,
+          parentName: null,
+          name: 'Acceptance Workspace',
+          organizationType: 'root',
+          depth: 0,
+          members: [],
+        }],
         canManageHierarchy: false,
-        suiteCrmPunchoutUrl: null,
-        suiteCrmUsername: null,
-        suiteCrmAdminPortalUrl: null,
+        suiteCrmPunchoutUrl: 'https://crm.eigenracing.com',
+        suiteCrmUsername: 'admin',
+        suiteCrmAdminPortalUrl: 'https://railway.com/project/clawpilot',
       }),
     })
   })
@@ -370,6 +395,22 @@ for (const viewport of MOBILE_VIEWPORTS) {
         }
         await route.fulfill({ json: [task] })
       })
+      await page.route((url) => url.pathname === '/api/workspaces', async (route) => {
+        await route.fulfill({
+          json: {
+            ok: true,
+            boards: [{
+              id: '00000000-0000-4000-8000-000000000106',
+              name: 'CRM Acceptance Board',
+              ownerEmail: 'operator@example.test',
+              accessRole: 'owner',
+            }],
+            pipelines: [],
+            selectedBoardId: '00000000-0000-4000-8000-000000000106',
+            selectedPipelineId: null,
+          },
+        })
+      })
 
       await gotoApp(page, '/#projects')
       await page.getByText(task.title, { exact: true }).click()
@@ -404,8 +445,21 @@ for (const viewport of MOBILE_VIEWPORTS) {
     })
 
     test('CRM tabs, records, and optional editor remain usable', async ({ page }, testInfo) => {
+      await mockCrmRecords(page)
       await gotoApp(page, '/#crm')
       await expect(activeSection(page).getByRole('heading', { name: 'CRM', exact: true })).toBeVisible()
+      const primaryActions = page.getByTestId('crm-primary-actions')
+      const summaryStrip = page.getByTestId('crm-summary-strip')
+      const recordTabs = page.getByRole('tablist', { name: 'CRM record types' })
+      await expectUsableGeometry(primaryActions, 'CRM primary actions', 40, 280)
+      await expectUsableGeometry(summaryStrip, 'CRM summary strip', 32, 280)
+      await expectUsableGeometry(recordTabs, 'CRM record tabs', viewport.name === 'landscape' ? 36 : 40, 280)
+      if (viewport.name === 'portrait') {
+        await expect.poll(async () => primaryActions.evaluate((element) => element.scrollWidth - element.clientWidth)).toBeLessThanOrEqual(1)
+        await expect(primaryActions.getByRole('button', { name: 'Organization hierarchy' })).toBeVisible()
+        await expect(primaryActions.getByRole('link', { name: 'Open workbook' })).toBeVisible()
+        await expect(primaryActions.getByRole('button', { name: 'Open SuiteCRM' })).toBeVisible()
+      }
       await page.getByRole('tab', { name: 'Contacts' }).click()
       await expect(page.getByPlaceholder('Search contacts')).toBeVisible()
 
@@ -500,9 +554,19 @@ for (const viewport of MOBILE_VIEWPORTS) {
       closeEditor = page.getByRole('button', { name: 'Close editor' })
       drawer = closeEditor.locator('xpath=ancestor::*[contains(@class,"MuiDrawer-paper")][1]')
       await expectUsableGeometry(drawer, 'Contact editor drawer', 160, 280)
+      const relatedOrganization = drawer.getByRole('button', { name: 'Open organization Acceptance Organization' })
+      await expect(relatedOrganization).toBeVisible()
+      await expect(relatedOrganization).toContainText('Acceptance Organization')
+      await expect(relatedOrganization).toContainText('ga7654321')
       await expect(drawer.getByRole('textbox', { name: 'Email', exact: true })).toHaveValue('contact@example.test')
       await expect(drawer.getByRole('checkbox', { name: 'Do not email' })).toBeChecked()
       await expect(drawer.getByRole('button', { name: 'Email', exact: true })).toBeDisabled()
+      await relatedOrganization.click()
+      await expect(drawer.getByRole('heading', { name: 'Edit Organization' })).toBeVisible()
+      await expect(drawer.getByRole('textbox', { name: 'Organization', exact: true })).toHaveValue('Acceptance Organization')
+      await drawer.getByRole('button', { name: 'Back to contact' }).click()
+      await expect(drawer.getByRole('heading', { name: 'Edit Contact' })).toBeVisible()
+      await expect(drawer.getByRole('button', { name: 'Open organization Acceptance Organization' })).toBeVisible()
       await closeEditor.click()
 
       await page.getByRole('tab', { name: 'Meetings' }).click()
@@ -545,6 +609,17 @@ for (const viewport of MOBILE_VIEWPORTS) {
     })
 
     test('Settings tabs and activity drawer remain contained', async ({ page }) => {
+      await page.route((url) => url.pathname === '/api/activity', async (route) => {
+        await route.fulfill({
+          json: {
+            ok: true,
+            events: [],
+            nextCursor: null,
+            scope: 'self',
+            capabilities: { canViewOrganization: false, canViewGlobal: false, defaultScope: 'self' },
+          },
+        })
+      })
       await gotoApp(page, '/#dashboard')
       await page.getByRole('button', { name: 'Settings' }).click()
       await page.getByRole('menuitem', { name: /Workspace settings/ }).click()
@@ -559,7 +634,8 @@ for (const viewport of MOBILE_VIEWPORTS) {
       await settings.getByRole('button', { name: 'Close settings' }).click()
 
       await page.getByRole('button', { name: 'Activity log' }).click()
-      const activityDrawer = page.locator('.MuiDrawer-paper').filter({ hasText: 'Activity Log' })
+      const activityDrawer = page.getByRole('heading', { name: 'Activity', exact: true })
+        .locator('xpath=ancestor::*[contains(@class,"MuiDrawer-paper")][1]')
       await expectUsableGeometry(activityDrawer, 'Activity drawer', 160, 280)
       await page.keyboard.press('Escape')
       await expect(activityDrawer).toBeHidden()
