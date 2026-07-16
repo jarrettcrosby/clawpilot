@@ -430,7 +430,7 @@ export async function pushDropdownsToSheet(
     )
 
     await sheetWrite(
-      `/google-sheets/v4/spreadsheets/${context.sheetId}/values/${encodeURIComponent(rangeA1)}?valueInputOption=USER_ENTERED`,
+      `/google-sheets/v4/spreadsheets/${context.sheetId}/values/${encodeURIComponent(rangeA1)}?valueInputOption=RAW`,
       'PUT',
       { range: rangeA1, majorDimension: 'ROWS', values: rows },
       context,

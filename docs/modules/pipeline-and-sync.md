@@ -20,7 +20,10 @@ Provide a user-owned pipeline workspace while preserving the Opportunities Sheet
 - Every active user receives a default pipeline space.
 - A pipeline owner can share view or edit access with another active user.
 - Railway Postgres stores ClawPilot-owned pipeline definitions, normalized rows, projections, sync outbox entries, and audit events.
-- Pipeline editors can create an opportunity from the Pipeline surface by selecting an existing customer organization or creating that customer organization inline. Products are selected from the pipeline's configured atomic product catalog, with one or more selections mapped to the CRM opportunity name. Legacy comma-delimited combination options are excluded from the selector because the UI composes multi-product opportunities itself. The opportunity is immediately written to the tenant-scoped CRM tables in Postgres and queued for SuiteCRM synchronization.
+- Pipeline editors can create an opportunity from the Pipeline surface by selecting an existing customer organization or creating that customer organization inline. Products are selected from active, tenant-scoped CRM Product records and are stored as durable relationships rather than inferred only from a display string. Legacy opportunity names remain readable during migration, while unambiguous existing product names are attached to their new Product records. The opportunity is immediately written to the tenant-scoped CRM tables in Postgres and queued for SuiteCRM synchronization.
+- The Pipeline setup surface owns three scoped catalogs: People, Products, and Workflow. People includes active ClawPilot members from the selected organization plus explicitly marked CRM-only team Contacts. A CRM-only person can own pipeline work but receives no application login, invitation, role, session, or implicit data access.
+- Product records carry permanent `gp` references, SKU, type, category, status, price, cost, currency, description, and active state. Product and CRM-only-person intake supports individual editing and CSV import. Imports are idempotent inside the selected tenant and report rejected rows without granting access.
+- Stage, priority, status, source, and loss-reason choices are editable per pipeline. App-managed pipelines persist the catalog in Postgres. Sheet-backed pipelines send field-scoped patches through the durable outbox: workflow edits update only workflow columns, while active product and owner projections update only their owned columns after merging against a fresh Sheet snapshot. Desired and applied product-catalog revisions remain separate so failed or dead deliveries are retried instead of being reported as synchronized.
 - CRM date-only fields are serialized as `YYYY-MM-DD` whether PostgreSQL returns a string or JavaScript `Date`, so expected-close and campaign dates survive the Postgres, API, and browser-form round trip without timezone conversion.
 - ClawPilot opportunity creation and editing require caller-stable idempotency keys. Creates return the existing record without overwriting later edits, and edits use an atomic version check plus a durable replay receipt so concurrent writers cannot silently replace one another.
 - Opportunity edits and comments update the CRM record by its Postgres UUID. They never infer or increment a Google Sheet row number.
@@ -35,6 +38,7 @@ Provide a user-owned pipeline workspace while preserving the Opportunities Sheet
 - Private Drive and Sheets requests use service-account OAuth. The stored API key is also attached for Google project and quota attribution.
 - At queue time ClawPilot binds the service-account email and selected Shared Drive ID to the pipeline. Key rotation for that same service account is supported; changing the service-account identity fails closed while managed pipelines remain bound.
 - Raw credentials, Sheet IDs, folder IDs, Shared Drive IDs, and internal short-link IDs are not returned in workspace payloads. The owner settings endpoint may return Shared Drive IDs only in the authorized selection list.
+- Loading Pipeline setup is read-only for viewers. Catalog bootstrap, CRM projection, and Sheet synchronization run only for pipeline editors or system workers.
 
 ## Managed Google Resources
 
@@ -69,9 +73,10 @@ The configured owner's historical default pipeline remains on the environment Sh
 - `pipeline_google_permissions`
 - `pipeline_sheet_rows`
 - `pipeline_source_state`
+- `pipeline_dropdown_catalogs`
 - `sync_outbox`
 - `audit_events`
-- `crm_organizations`, `crm_contacts`, `crm_leads`, `crm_opportunities`, `crm_meetings`, `crm_interactions`, `crm_campaigns`
+- `crm_organizations`, `crm_contacts`, `crm_products`, `crm_leads`, `crm_opportunities`, `crm_opportunity_products`, `crm_meetings`, `crm_interactions`, `crm_campaigns`
 - `crm_integration_actions`, `crm_integration_action_attempts`, `crm_inbound_messages`
 - `crm_sync_runs`
 

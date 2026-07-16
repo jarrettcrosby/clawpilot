@@ -10,15 +10,22 @@ export async function GET() {
   try {
     const appDir = process.cwd()
     const repoPath = path.resolve(appDir, '..')
-    const hostedCommit = process.env.RAILWAY_GIT_COMMIT_SHA || process.env.VERCEL_GIT_COMMIT_SHA
-    const hostedBranch = process.env.RAILWAY_GIT_BRANCH || process.env.VERCEL_GIT_COMMIT_REF
+    const hostedCommit = process.env.RAILWAY_GIT_COMMIT_SHA
+      || process.env.VERCEL_GIT_COMMIT_SHA
+      || process.env.RELEASE_COMMIT
+    const hostedBranch = process.env.RAILWAY_GIT_BRANCH
+      || process.env.VERCEL_GIT_COMMIT_REF
+      || process.env.RELEASE_BRANCH
     const hostedEnvironment = process.env.RAILWAY_ENVIRONMENT_NAME || process.env.VERCEL_ENV
     const hosted = Boolean(hostedCommit || hostedEnvironment)
     let commit = hostedCommit || ''
 
-    if (!commit) {
+    if (!commit && !hosted) {
       const { stdout } = await execFileAsync('git', ['-C', repoPath, 'rev-parse', 'HEAD'])
       commit = stdout.trim()
+    }
+    if (!commit) {
+      return NextResponse.json({ error: 'Hosted build identity is not configured' }, { status: 503 })
     }
 
     const port = process.env.PORT || process.env.RUNTIME_PORT || 'unknown'

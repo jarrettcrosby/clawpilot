@@ -5,6 +5,7 @@ import { getErrorMessage } from '@/lib/errorUtils'
 import { logPipelineEvent } from '@/lib/pipelineLog'
 import {
   appendCrmOpportunityCommentInPostgres,
+  readPipelineCatalogInPostgres,
   readCrmOpportunityInPostgres,
   stageCrmRecordInPostgres,
   updateCrmOpportunityInPostgres,
@@ -73,6 +74,19 @@ function opportunityContactIds(value: unknown, fallback: string[]) {
   if (value === undefined) return fallback
   if (!Array.isArray(value)) throw new Error('Opportunity contacts must be a list')
   return [...new Set(value.map((id) => String(id || '').trim()).filter(Boolean))]
+}
+
+function uniqueOwnerByName(
+  people: Array<{ id: string; active: boolean; displayName: string }>,
+  name: string,
+  currentOwnerContactId: string | null,
+) {
+  const matches = people.filter((person) => (
+    person.displayName.trim().toLowerCase() === name
+    && (person.active || currentOwnerContactId === person.id)
+  ))
+  if (matches.length > 1) throw new Error('Opportunity owner name is ambiguous; select the person by ID')
+  return matches[0]
 }
 
 function displayOpportunity(opportunity: CrmOpportunity) {
@@ -210,11 +224,49 @@ export async function PATCH(req: NextRequest, ctx: { params: Promise<{ id: strin
     }
 
     const notes = updates.notes !== undefined ? String(updates.notes || '') : current.notes
-    const name = updates.products !== undefined || updates.name !== undefined
-      ? opportunityProductName(updates.products ?? updates.name)
-      : current.name
+    const catalog = await readPipelineCatalogInPostgres({ pipelineId: context.pipeline.id, actorEmail: context.actor.email })
+    const requestedProductIds = Array.isArray(updates.productIds)
+      ? [...new Set(updates.productIds.map((productId) => String(productId || '').trim()).filter(Boolean))]
+      : []
+    const requestedProductNames = updates.products !== undefined || updates.name !== undefined
+      ? opportunityProductName(updates.products ?? updates.name).split(',').map((name) => name.trim()).filter(Boolean)
+      : []
+    const productsChanged = updates.productIds !== undefined || updates.products !== undefined || updates.name !== undefined
+    const selectedProducts = !productsChanged
+      ? current.products
+      : requestedProductIds.length > 0
+        ? requestedProductIds.map((productId) => catalog.products.find((product) => (
+            product.id === productId && (product.active || current.productIds.includes(productId))
+          )))
+        : requestedProductNames.map((name) => {
+            const matches = catalog.products.filter((product) => (
+              (product.active || current.productIds.includes(product.id))
+              && product.name.trim().toLowerCase() === name.toLowerCase()
+            ))
+            return matches.length === 1 ? matches[0] : undefined
+          })
+    if (selectedProducts.some((product) => !product)) {
+      throw new Error('Opportunity products must belong to Pipeline setup')
+    }
+    const products = selectedProducts.filter((product): product is NonNullable<typeof product> => Boolean(product))
+    const name = products.map((product) => product.name).join(', ')
     if (!name) {
       return NextResponse.json({ error: 'At least one product is required' }, { status: 400 })
+    }
+
+    const ownerChanged = updates.ownerContactId !== undefined || updates.owner !== undefined
+    const requestedOwnerId = updates.ownerContactId === null ? '' : String(updates.ownerContactId || '').trim()
+    const requestedOwnerName = String(updates.owner || '').trim().toLowerCase()
+    const selectedOwner = !ownerChanged
+      ? null
+      : requestedOwnerId
+        ? catalog.people.find((person) => person.id === requestedOwnerId && (person.active || current.ownerContactId === requestedOwnerId))
+        : requestedOwnerName
+          ? uniqueOwnerByName(catalog.people, requestedOwnerName, current.ownerContactId)
+          : null
+    const preservingLegacyOwner = ownerChanged && !selectedOwner && requestedOwnerName === current.owner.trim().toLowerCase()
+    if (ownerChanged && (requestedOwnerId || requestedOwnerName) && !selectedOwner && !preservingLegacyOwner) {
+      throw new Error('Opportunity owner must belong to Pipeline setup')
     }
 
     const result = await updateCrmOpportunityInPostgres({
@@ -226,10 +278,14 @@ export async function PATCH(req: NextRequest, ctx: { params: Promise<{ id: strin
       fields: {
         organizationId: current.organizationId,
         contactIds: opportunityContactIds(updates.contactIds, current.contactIds),
+        productIds: products.map((product) => product.id),
+        ownerContactId: ownerChanged
+          ? selectedOwner?.id || (preservingLegacyOwner ? current.ownerContactId : null)
+          : current.ownerContactId,
         name,
         organization: current.organization,
         priority: updates.priority !== undefined ? String(updates.priority || '') : current.priority,
-        owner: updates.owner !== undefined ? String(updates.owner || '') : current.owner,
+        owner: ownerChanged ? selectedOwner?.displayName || (preservingLegacyOwner ? current.owner : '') : current.owner,
         status: updates.status !== undefined ? String(updates.status || '') : current.status,
         stage: updates.stage !== undefined ? String(updates.stage || '') : current.stage,
         lossReason: updates.lossReason !== undefined ? String(updates.lossReason || '') : current.lossReason,

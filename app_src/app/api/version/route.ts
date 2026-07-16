@@ -29,12 +29,14 @@ async function resolveRepoPath() {
 
 export async function GET() {
   try {
-    const hostedHash = process.env.RAILWAY_GIT_COMMIT_SHA || process.env.VERCEL_GIT_COMMIT_SHA
+    const hostedHash = process.env.RAILWAY_GIT_COMMIT_SHA
+      || process.env.VERCEL_GIT_COMMIT_SHA
+      || process.env.RELEASE_COMMIT
     if (hostedHash) {
       return NextResponse.json({
         hash: hostedHash,
         short: hostedHash.slice(0, 7),
-        subject: process.env.RAILWAY_GIT_COMMIT_MESSAGE || 'Deployed build',
+        subject: process.env.RAILWAY_GIT_COMMIT_MESSAGE || process.env.RELEASE_TITLE || 'Deployed build',
         date: '',
         dirty: false,
         dirtyCount: 0,

@@ -3,6 +3,7 @@ import type { CrmEntity, SuiteCrmOutboxRecord } from '@/lib/crm/types'
 const ENTITY_MODULE: Record<CrmEntity, string> = {
   organizations: 'Accounts',
   contacts: 'Contacts',
+  products: 'AOS_Products',
   leads: 'Leads',
   opportunities: 'Opportunities',
   meetings: 'Meetings',

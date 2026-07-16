@@ -148,6 +148,7 @@ const ACTION_RUNTIME: Record<CrmIntegrationActionType, {
 const AGGREGATE_TYPES: Record<CrmReferenceRecord['entity'], string> = {
   organizations: 'crm_organization',
   contacts: 'crm_contact',
+  products: 'crm_product',
   leads: 'crm_lead',
   opportunities: 'crm_opportunity',
   meetings: 'crm_meeting',
@@ -163,7 +164,7 @@ function suiteCrmParentType(entity: CrmReferenceRecord['entity']) {
     opportunities: 'Opportunities',
     meetings: 'Meetings',
     campaigns: 'Campaigns',
-  } as const)[entity as Exclude<CrmReferenceRecord['entity'], 'interactions'>] || null
+  } as const)[entity as Exclude<CrmReferenceRecord['entity'], 'interactions' | 'products'>] || null
 }
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i

@@ -3,6 +3,7 @@ import type { NextRequest, NextResponse } from 'next/server'
 import { getCookieName, getCookieNames, verifySessionToken } from '@/lib/auth'
 import { recordAuditEvent } from '@/lib/auditWriter'
 import { query, withTransaction } from '@/lib/persistence/postgres'
+import { observedRequestIpAddress } from '@/lib/requestIpAddress'
 
 const ABSOLUTE_TTL_SECONDS = 24 * 60 * 60
 const ADMIN_IDLE_TTL_SECONDS = 60 * 60
@@ -24,6 +25,8 @@ type SessionRow = {
   auth_method: SessionAuthMethod
   device_label: string
   user_agent: string | null
+  initial_ip_address: string | null
+  last_ip_address: string | null
   created_at: string
   last_seen_at: string
   last_user_activity_at: string
@@ -46,6 +49,8 @@ export type BrowserSession = {
   authMethod: SessionAuthMethod
   deviceLabel: string
   userAgent: string | null
+  initialIpAddress: string | null
+  lastIpAddress: string | null
   createdAt: string
   lastSeenAt: string
   lastUserActivityAt: string
@@ -80,17 +85,10 @@ function newToken(): string {
   return crypto.randomBytes(32).toString('base64url')
 }
 
-function requestAddress(headers: Headers): string {
-  return String(headers.get('x-forwarded-for') || headers.get('x-real-ip') || 'unknown')
-    .split(',')[0]
-    .trim()
-    .slice(0, 200)
-}
-
 function networkFingerprint(headers: Headers): string {
   return crypto
     .createHmac('sha256', sessionSecret())
-    .update(`clawpilot-network:v1\n${requestAddress(headers)}`)
+    .update(`clawpilot-network:v1\n${observedRequestIpAddress(headers) || 'unknown'}`)
     .digest('hex')
     .slice(0, 24)
 }
@@ -124,6 +122,8 @@ function fromRow(row: SessionRow): BrowserSession {
     authMethod: row.auth_method,
     deviceLabel: row.device_label,
     userAgent: row.user_agent,
+    initialIpAddress: row.initial_ip_address,
+    lastIpAddress: row.last_ip_address,
     createdAt: row.created_at,
     lastSeenAt: row.last_seen_at,
     lastUserActivityAt: row.last_user_activity_at,
@@ -140,7 +140,9 @@ const SESSION_SELECT = `SELECT session.id::text, session.authenticated_user_emai
   session.effective_user_email, authenticated.role AS authenticated_role,
   effective.role AS effective_role, authenticated.status AS authenticated_status,
   effective.status AS effective_status, session.auth_method, session.device_label,
-  session.user_agent, session.created_at::text, session.last_seen_at::text,
+  session.user_agent, host(session.initial_ip_address) AS initial_ip_address,
+  host(session.last_ip_address) AS last_ip_address,
+  session.created_at::text, session.last_seen_at::text,
   session.last_user_activity_at::text, session.last_authenticated_at::text,
   session.idle_timeout_seconds, session.idle_expires_at::text,
   session.absolute_expires_at::text, session.revoked_at::text,
@@ -168,16 +170,18 @@ export async function createBrowserSession(input: {
   const token = newToken()
   const idleSeconds = idleTtl(user.rows[0].role)
   const fingerprint = networkFingerprint(input.headers)
+  const ipAddress = observedRequestIpAddress(input.headers)
   const result = await query<SessionRow>(
     `WITH inserted AS (
        INSERT INTO app_sessions (
          token_hash, authenticated_user_email, effective_user_email, auth_method,
          device_label, user_agent, initial_network_fingerprint, last_network_fingerprint,
-         idle_timeout_seconds, idle_expires_at, absolute_expires_at
+         initial_ip_address, last_ip_address, idle_timeout_seconds,
+         idle_expires_at, absolute_expires_at
        ) VALUES (
-         $1, $2, $2, $3, $4, $5, $6, $6, $7,
-         now() + ($7::integer * interval '1 second'),
-         now() + ($8::integer * interval '1 second')
+         $1, $2, $2, $3, $4, $5, $6, $6, $7::inet, $7::inet, $8,
+         now() + ($8::integer * interval '1 second'),
+         now() + ($9::integer * interval '1 second')
        ) RETURNING *
      )
      ${SESSION_SELECT.replace('FROM app_sessions session', 'FROM inserted session')}`,
@@ -188,6 +192,7 @@ export async function createBrowserSession(input: {
       deviceLabel(input.headers),
       String(input.headers.get('user-agent') || '').slice(0, 512) || null,
       fingerprint,
+      ipAddress,
       idleSeconds,
       ABSOLUTE_TTL_SECONDS,
     ],
@@ -291,6 +296,8 @@ export async function resolveRequestSession(req: NextRequest): Promise<BrowserSe
         authMethod: 'legacy_upgrade',
         deviceLabel: deviceLabel(req.headers),
         userAgent: String(req.headers.get('user-agent') || '').slice(0, 512) || null,
+        initialIpAddress: observedRequestIpAddress(req.headers),
+        lastIpAddress: observedRequestIpAddress(req.headers),
         createdAt: new Date().toISOString(),
         lastSeenAt: new Date().toISOString(),
         lastUserActivityAt: new Date().toISOString(),
@@ -354,10 +361,10 @@ export async function touchBrowserSessionActivity(session: BrowserSession, heade
   if (!result.rows[0]) return null
   await query(
     `UPDATE app_sessions SET last_seen_at = now(), last_user_activity_at = now(),
-       last_network_fingerprint = $2,
+       last_network_fingerprint = $2, last_ip_address = $3::inet,
        idle_expires_at = LEAST(absolute_expires_at, now() + (idle_timeout_seconds * interval '1 second'))
      WHERE id = $1::uuid AND revoked_at IS NULL`,
-    [session.id, networkFingerprint(headers)],
+    [session.id, networkFingerprint(headers), observedRequestIpAddress(headers)],
   )
   const refreshed = await query<SessionRow>(`${SESSION_SELECT} WHERE session.id = $1::uuid`, [session.id])
   return refreshed.rows[0] ? fromRow(refreshed.rows[0]) : null

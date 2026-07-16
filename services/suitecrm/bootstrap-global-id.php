@@ -303,6 +303,7 @@ function rebuild_and_verify_global_search(array $modules): void
 $modules = [
     'Accounts',
     'Contacts',
+    'AOS_Products',
     'Leads',
     'Opportunities',
     'Meetings',

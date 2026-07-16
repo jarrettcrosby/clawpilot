@@ -168,6 +168,24 @@ for (const contract of [
   assertIncludes(crmInteractionUserMappingMigration, contract, 'CRM interaction user mapping migration')
 }
 
+const pipelineCatalogMigration = read('db/migrations/0045_pipeline_people_products_and_dropdown_catalogs.sql')
+for (const contract of [
+  'ADD COLUMN IF NOT EXISTS pipeline_user boolean',
+  "allocate_crm_reference('gp')",
+  'CREATE TABLE IF NOT EXISTS crm_products',
+  'CREATE TABLE IF NOT EXISTS crm_opportunity_products',
+  'CREATE TABLE IF NOT EXISTS pipeline_dropdown_catalogs',
+  'idx_crm_products_pipeline_name_unique',
+  'idx_crm_products_pipeline_sku_unique',
+  'ADD COLUMN IF NOT EXISTS desired_revision bigint',
+  'ADD COLUMN IF NOT EXISTS applied_revision bigint',
+  'REFERENCES crm_contacts (pipeline_id, id) ON DELETE RESTRICT',
+  'REFERENCES crm_products (pipeline_id, id) ON DELETE RESTRICT',
+  "reference_code ~ '^gp[0-9]{7}$'",
+]) {
+  assertIncludes(pipelineCatalogMigration, contract, 'pipeline people and products migration')
+}
+
 const crmIdentityHierarchyMigration = read('db/migrations/0021_crm_identity_and_organization_hierarchy.sql')
 for (const contract of [
   'CREATE TABLE IF NOT EXISTS workspace_organizations',
@@ -430,6 +448,12 @@ assertIncludes(crmAdapter, '`crm:${input.entity}:v3:', 'versioned SuiteCRM Globa
 assertIncludes(crmAdapter, "WHERE sync_outbox.status IN ('succeeded', 'dead')", 'replayed SuiteCRM content revision requeue')
 assertIncludes(crmAdapter, 'RETURNING idempotency_key', 'idempotent SuiteCRM outbox insertion or requeue result')
 assertIncludes(crmAdapter, 'if (suiteCrmOutboxKey)', 'SuiteCRM audit noise suppression')
+assertIncludes(crmAdapter, 'readPipelineCatalogInPostgres', 'tenant pipeline catalog read')
+assertIncludes(crmAdapter, 'upsertPipelineCatalogPersonInPostgres', 'CRM-only pipeline person persistence')
+assertIncludes(crmAdapter, 'upsertPipelineCatalogProductInPostgres', 'pipeline product persistence')
+assertIncludes(crmAdapter, 'This email belongs to a ClawPilot app user and cannot be CRM-only', 'app user and CRM-only identity separation')
+assertIncludes(crmAdapter, 'FROM crm_opportunity_products relationship', 'opportunity product relationship hydration')
+assertIncludes(crmAdapter, "products: 'crm_products'", 'product global-reference mapping')
 
 const rootCrmPunchoutRoute = read('app_src/app/api/crm/punchout/route.ts')
 assertIncludes(rootCrmPunchoutRoute, 'organization.parentId !== null', 'root-only native SuiteCRM punchout')
@@ -663,6 +687,7 @@ assertIncludes(crmReferenceRoute, 'resolveCrmReferenceRoute', 'legacy CRM refere
 assertIncludes(crmReferenceRoute, 'resolved.pipelineId', 'CRM reference inferred owning pipeline handoff')
 assertIncludes(crmReferenceRoute, "destination.searchParams.set('pipeline', pipelineId)", 'CRM reference owning pipeline handoff')
 assertIncludes(crmReferenceRoute, "crmAction', 'compose-email'", 'CRM email action deep link')
+assertIncludes(crmReferenceRoute, "|p)[0-9]{7}$", 'product Global ID deep link')
 
 const crmBoardProjection = read('app_src/lib/crm/boardProjection.ts')
 assertIncludes(crmBoardProjection, 'updateCrmDescriptionWithClient', 'transactional CRM card description write-through')
@@ -683,6 +708,7 @@ assertIncludes(organizationsAdapter, 'retireUnusedWorkspaceOrganization', 'faile
 const shortLinks = read('app_src/lib/shortlinks.ts')
 assertIncludes(shortLinks, 'normalizeSlug(input.slug, { allowCrmReference: true })', 'public CRM short-link resolution')
 assertIncludes(shortLinks, '!options.allowCrmReference && (CRM_REFERENCE_SLUG_PATTERN.test(slug) || CRM_ACTION_SLUG_PATTERN.test(slug))', 'creation-only CRM slug reservation')
+assertIncludes(shortLinks, 'g[aciklmop][0-9]{7}', 'product Global ID short-link reservation')
 
 const zonedDateTime = read('app_src/lib/zonedDateTime.ts')
 assertIncludes(zonedDateTime, 'export function zonedDateTimeToIso', 'timezone-aware CRM meeting conversion')
@@ -703,6 +729,7 @@ assertIncludes(suiteCrmClient, "'filter[date_modified][gte]'", 'incremental Suit
 assertIncludes(suiteCrmClient, 'listSuiteCrmAccountContactRecordsUpdatedSince', 'incremental SuiteCRM account/contact polling')
 assertIncludes(suiteCrmClient, 'findSuiteCrmUser', 'SuiteCRM app-user mapping lookup')
 assertIncludes(suiteCrmClient, '/Api/V8/module/Users', 'SuiteCRM active user module lookup')
+assertIncludes(suiteCrmClient, "products: 'AOS_Products'", 'SuiteCRM product module mapping')
 assertIncludes(suiteCrmInteractionContactBackfill, "CLAWPILOT_BACKFILL_CONFIRM !== 'interaction-contacts-v1'", 'guarded SuiteCRM interaction contact backfill')
 assertIncludes(suiteCrmInteractionContactBackfill, "linkFieldName: 'contact'", 'SuiteCRM Note contact backfill relationship')
 assertIncludes(suiteCrmInteractionContactBackfill, 'contact_id: row.contact_suitecrm_id', 'SuiteCRM Note contact backfill field')
@@ -723,6 +750,7 @@ assertIncludes(suiteCrmGlobalIdBootstrap, "const CLAWPILOT_GLOBAL_ID_FIELD = 'gl
 assertIncludes(suiteCrmGlobalIdBootstrap, "const CLAWPILOT_NOTE_OCCURRED_AT_FIELD = 'occurred_at_c'", 'native SuiteCRM interaction occurrence field')
 assertIncludes(suiteCrmGlobalIdBootstrap, '$field->unified_search = 1', 'native SuiteCRM Global ID unified search')
 assertIncludes(suiteCrmGlobalIdBootstrap, "'Meetings'", 'SuiteCRM meeting Global ID field')
+assertIncludes(suiteCrmGlobalIdBootstrap, "'AOS_Products'", 'SuiteCRM product Global ID field')
 assertIncludes(suiteCrmGlobalIdBootstrap, 'expose_global_id_in_detail_view', 'SuiteCRM Global ID detail layout')
 assertIncludes(suiteCrmGlobalIdBootstrap, 'expose_global_id_in_list_view', 'SuiteCRM Global ID list layout')
 assertIncludes(suiteCrmGlobalIdBootstrap, "expose_global_id_in_search_view($module, 'basic_search')", 'SuiteCRM Global ID basic search layout')
@@ -809,6 +837,14 @@ const pipelineDropdownSync = read('app_src/lib/pipelineDropdownSync.ts')
 assertIncludes(pipelineDropdownSync, 'resolvePipelineSheetBindingInPostgres', 'dropdown binding resolution')
 assertIncludes(pipelineDropdownSync, 'resolveManagedGoogleWorkspaceRuntime', 'dropdown native binding resolution')
 assertIncludes(pipelineDropdownSync, 'googleSheetsJson', 'dropdown native Sheets transport')
+const pipelinePersistence = read('app_src/lib/persistence/pipeline.ts')
+assertIncludes(pipelinePersistence, 'syncPipelineProductDropdownCatalogInPostgres', 'generated product and owner dropdown synchronization')
+assertIncludes(pipelinePersistence, 'ownerNames?: string[]', 'tenant owner dropdown input')
+assertIncludes(pipelinePersistence, 'pipeline_dropdown_catalogs', 'app-managed dropdown persistence')
+assertIncludes(pipelinePersistence, "operation: 'patch_dropdowns'", 'Sheet-backed dropdown patch outbox')
+assertIncludes(pipelinePersistence, 'desired_revision = desired_revision + 1', 'monotonic dropdown desired revision')
+assertIncludes(pipelinePersistence, 'applied_revision = GREATEST', 'successful dropdown applied revision')
+assertIncludes(pipelinePersistence, "status IN ('failed', 'dead')", 'terminal dropdown delivery requeue')
 
 const opportunityRoute = read('app_src/app/api/pipeline/opportunity/[id]/route.ts')
 assertIncludes(opportunityRoute, 'readCrmOpportunityInPostgres', 'CRM-authoritative opportunity route')
@@ -817,6 +853,8 @@ assertIncludes(opportunityRoute, "entity: 'interactions'", 'CRM interaction writ
 assertIncludes(opportunityRoute, 'updateCrmOpportunityInPostgres', 'atomic CRM opportunity writeback')
 assertIncludes(crmAdapter, "entity: 'opportunities'", 'CRM opportunity persistence writeback')
 assertIncludes(opportunityRoute, 'expectedUpdatedAt', 'opportunity optimistic write contract')
+assertIncludes(crmAdapter, 'different opportunity update', 'payload-bound opportunity update idempotency')
+assertIncludes(crmAdapter, 'different opportunity comment', 'payload-bound opportunity comment idempotency')
 assertIncludes(opportunityRoute, 'resolvePipelineSpaceAccess', 'opportunity tenancy contract')
 assertIncludes(opportunityRoute, 'requireResourceEditor', 'opportunity edit access contract')
 assert.ok(!opportunityRoute.includes('upsertPipelineProjectionInPostgres'), 'opportunity route must not bypass CRM authority')
@@ -827,6 +865,7 @@ assertIncludes(outboxWorker, 'claimPipelineSyncOutboxInPostgres', 'pipeline outb
 assertIncludes(outboxWorker, "item.operation === 'update_opportunity'", 'pipeline outbox worker')
 assertIncludes(outboxWorker, "item.operation === 'append_interaction'", 'pipeline outbox worker')
 assertIncludes(outboxWorker, "item.operation === 'replace_dropdowns'", 'pipeline outbox worker')
+assertIncludes(outboxWorker, "item.operation === 'patch_dropdowns'", 'pipeline dropdown patch worker')
 assertIncludes(outboxWorker, "item.operation === 'project_crm_workbook'", 'CRM projection worker dispatch')
 assertIncludes(outboxWorker, "item.operation === 'sync_pipeline_owner_profile_v1'", 'owner profile projection worker dispatch')
 assertIncludes(outboxWorker, 'Opportunity Sheet row changed', 'pipeline outbox worker optimistic check')
@@ -1080,6 +1119,7 @@ assertIncludes(healthRoute, '0033_crm_board_projection_and_legacy_alias_cleanup.
 assertIncludes(healthRoute, '0035_suitecrm_inbound_sync_status.sql', 'hosted SuiteCRM inbound sync migration health')
 assertIncludes(healthRoute, '0036_crm_display_text_and_card_semantics.sql', 'hosted CRM display text migration health')
 assertIncludes(healthRoute, '0040_browser_sessions_and_impersonation.sql', 'hosted browser session migration health')
+assertIncludes(healthRoute, '0045_pipeline_people_products_and_dropdown_catalogs.sql', 'hosted pipeline catalog migration health')
 assertIncludes(healthRoute, 'readSuiteCrmWorkerHeartbeat', 'hosted SuiteCRM worker health')
 assertIncludes(healthRoute, 'migration_checksums_present', 'hosted migration checksum health')
 assertIncludes(healthRoute, 'queryAgentCredentials', 'shared agent credential store health')

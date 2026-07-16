@@ -10,6 +10,7 @@ import { shouldFallbackToFileOnDatabaseError } from '@/lib/persistence/config'
 import {
   createCrmOpportunityInPostgres,
   listCrmRecordsInPostgres,
+  readPipelineCatalogInPostgres,
   readCrmRecordReference,
   readCrmSummaryFromPostgres,
 } from '@/lib/persistence/crm'
@@ -96,6 +97,14 @@ function opportunityIdempotencyKey(req: NextRequest, pipelineId: string, actorEm
 function opportunityProducts(value: unknown) {
   const products = Array.isArray(value) ? value : String(value || '').split(',')
   return [...new Set(products.map((product) => String(product || '').trim()).filter(Boolean))]
+}
+
+function uniqueActivePersonByName<T extends { active: boolean; displayName: string }>(people: T[], name: string) {
+  const matches = people.filter((person) => (
+    person.active && person.displayName.trim().toLowerCase() === name
+  ))
+  if (matches.length > 1) throw new Error('Opportunity owner name is ambiguous; select the person by ID')
+  return matches[0]
 }
 
 export async function GET(req: NextRequest) {
@@ -211,8 +220,22 @@ export async function POST(req: NextRequest) {
     requireResourceEditor(pipeline)
 
     const body = await req.json()
-    const products = opportunityProducts(body?.products ?? body?.name)
-    const name = products.join(', ')
+    const catalog = await readPipelineCatalogInPostgres({ pipelineId: pipeline.id, actorEmail: actor.email })
+    const requestedProductIds = Array.isArray(body?.productIds)
+      ? [...new Set(body.productIds.map((id: unknown) => String(id || '').trim()).filter(Boolean))]
+      : []
+    const requestedProductNames = opportunityProducts(body?.products ?? body?.name)
+    const selectedProducts = requestedProductIds.length > 0
+      ? requestedProductIds.map((id) => catalog.products.find((product) => product.id === id && product.active))
+      : requestedProductNames.map((name) => {
+          const matches = catalog.products.filter((product) => product.active && product.name.trim().toLowerCase() === name.toLowerCase())
+          return matches.length === 1 ? matches[0] : undefined
+        })
+    if (selectedProducts.some((product) => !product)) {
+      throw new Error('Opportunity products must be active products in Pipeline setup')
+    }
+    const products = selectedProducts.filter((product): product is NonNullable<typeof product> => Boolean(product))
+    const name = products.map((product) => product.name).join(', ')
     const organizationId = String(body?.organizationId || '').trim()
     if (!name || !organizationId) {
       return NextResponse.json({ ok: false, error: 'At least one product and a CRM organization are required' }, { status: 400 })
@@ -231,7 +254,17 @@ export async function POST(req: NextRequest) {
       : 0
     const sourceKey = opportunityIdempotencyKey(req, pipeline.id, actor.email)
     const priority = String(body?.priority || 'C')
-    const owner = String(body?.owner || actor.displayName || actor.email)
+    const requestedOwnerContactId = String(body?.ownerContactId || '').trim()
+    const requestedOwnerName = String(body?.owner || '').trim().toLowerCase()
+    const ownerPerson = requestedOwnerContactId
+      ? catalog.people.find((person) => person.id === requestedOwnerContactId && person.active)
+      : requestedOwnerName
+        ? uniqueActivePersonByName(catalog.people, requestedOwnerName)
+        : catalog.people.find((person) => person.active && person.email.toLowerCase() === actor.email.toLowerCase())
+    if ((requestedOwnerContactId || requestedOwnerName) && !ownerPerson) {
+      throw new Error('Opportunity owner must be an active person in Pipeline setup')
+    }
+    const owner = ownerPerson?.displayName || actor.displayName || actor.email
     const status = String(body?.status || 'Open')
     const stage = String(body?.stage || 'Identified Lead')
     const source = String(body?.source || '')
@@ -251,6 +284,8 @@ export async function POST(req: NextRequest) {
         organizationId: organizationRecord.id,
         organizationSuiteCrmId: organizationRecord.suiteCrmId,
         contactIds,
+        productIds: products.map((product) => product.id),
+        ownerContactId: ownerPerson?.id || null,
         name,
         organization,
         priority,

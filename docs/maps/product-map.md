@@ -28,7 +28,7 @@ The [ClawPilot Identity](../brand/clawpilot-identity.md) contract keeps those su
 
 ## Cross-Module Paths
 
-- CRM organization or contact -> Global ID -> short link -> ClawPilot editor -> SuiteCRM projection.
+- CRM organization, contact, or product -> Global ID -> short link -> ClawPilot editor -> SuiteCRM projection.
 - Pipeline opportunity -> Postgres projection -> Google Sheet operator row -> CRM opportunity and reporting.
 - Project card -> assigned app agent -> user ChatGPT authorization -> execution log and result -> task thread.
 - User profile -> organization membership -> CRM account/contact -> Drive folder and pipeline resource scope.

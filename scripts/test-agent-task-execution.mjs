@@ -56,6 +56,21 @@ function loadExecutionModule(workItem) {
   return module.exports
 }
 
+function loadTaskDocumentModule() {
+  const path = 'app_src/lib/agents/taskDocument.ts'
+  const module = { exports: {} }
+  const sandbox = {
+    console,
+    exports: module.exports,
+    module,
+    require(specifier) {
+      throw new Error(`Unexpected import: ${specifier}`)
+    },
+  }
+  vm.runInNewContext(transpile(path), sandbox, { filename: path })
+  return module.exports
+}
+
 function mockResponse(status, payload) {
   return {
     ok: status >= 200 && status < 300,
@@ -127,6 +142,7 @@ function loadDispatchWorker({ failBeforeResult = false, failSucceededState = fal
 
 const workItem = loadWorkItemModule()
 const execution = loadExecutionModule(workItem)
+const taskDocument = loadTaskDocumentModule()
 const plan = execution.parseAgentTaskExecutionPlan(JSON.stringify({
   status: 'triaged',
   summary: 'Converted the request into durable task context and acceptance steps.',
@@ -230,6 +246,85 @@ assert.equal(iterativeResult.task.checklist[1].done, false)
 assert.equal(iterativeResult.task.execution.executionStatus, 'running')
 assert.equal(iterativeResult.task.execution.lastResult.deliverable, iterativePlan.deliverable)
 assert.deepEqual(Array.from(iterativeResult.task.execution.lastResult.completedChecklistIds), ['ck-run-1'])
+
+const checklistTextResult = execution.applyAgentTaskExecutionPlan({
+  task: {
+    ...baseTask,
+    checklist: [{ id: 'ck-run-2', text: 'Design the synchronization journal', done: false }],
+  },
+  plan: execution.parseAgentTaskExecutionPlan(JSON.stringify({
+    status: 'running',
+    summary: 'Designed the synchronization journal.',
+    deliverable: 'The journal records tenant, realm, entity, direction, cursor, attempt, and terminal state.',
+    nextAction: 'Review the persisted design.',
+    waitingOn: '',
+    blocker: '',
+    descriptionUpdate: '',
+    checklistAdd: [],
+    checklistComplete: ['Design the synchronization journal'],
+    learned: 'Resolve an exact checklist label without completing adjacent work.',
+  })),
+  agentId: 'projects',
+  dispatchId: 'dispatch-1',
+  timestamp: '2026-07-16T12:02:10.000Z',
+})
+assert.equal(checklistTextResult.task.checklist[0].done, true, 'an exact checklist label should resolve to its stable ID')
+
+const firstDocument = taskDocument.buildAgentTaskDocument({
+  taskId: 'task-1',
+  taskTitle: 'QuickBooks Integration',
+  boardId: 'board-1',
+  agentId: 'projects',
+  resultId: 'dispatch-1',
+  status: 'running',
+  summary: 'Defined the system-of-record contract.',
+  deliverable: 'QuickBooks owns posted accounting records.',
+  changes: ['checklist completed: "Define system-of-record rules"'],
+  nextAction: 'Design the synchronization journal.',
+  waitingOn: '',
+  recordedAt: '2026-07-16T12:02:10.000Z',
+  displayTimestamp: 'Jul 16, 2026, 8:02 AM',
+})
+assert.equal(firstDocument.title, 'QuickBooks Integration - Projects Research')
+assert.equal(firstDocument.appended, true)
+assert.match(firstDocument.content, /QuickBooks owns posted accounting records/)
+const duplicateDocument = taskDocument.buildAgentTaskDocument({
+  existingContent: firstDocument.content,
+  taskId: 'task-1',
+  taskTitle: 'QuickBooks Integration',
+  boardId: 'board-1',
+  agentId: 'projects',
+  resultId: 'dispatch-1',
+  status: 'running',
+  summary: 'Defined the system-of-record contract.',
+  deliverable: 'QuickBooks owns posted accounting records.',
+  changes: [],
+  nextAction: 'Design the synchronization journal.',
+  waitingOn: '',
+  recordedAt: '2026-07-16T12:02:10.000Z',
+  displayTimestamp: 'Jul 16, 2026, 8:02 AM',
+})
+assert.equal(duplicateDocument.appended, false, 'dispatch retries must not duplicate document work-log entries')
+assert.equal(duplicateDocument.content, firstDocument.content)
+const continuedDocument = taskDocument.buildAgentTaskDocument({
+  existingContent: firstDocument.content,
+  taskId: 'task-1',
+  taskTitle: 'QuickBooks Integration',
+  boardId: 'board-1',
+  agentId: 'projects',
+  resultId: 'dispatch-2',
+  status: 'running',
+  summary: 'Designed the synchronization journal.',
+  deliverable: 'The journal records each replay-safe synchronization attempt.',
+  changes: ['checklist completed: "Design the synchronization journal"'],
+  nextAction: 'Define conflict handling.',
+  waitingOn: '',
+  recordedAt: '2026-07-16T12:04:10.000Z',
+  displayTimestamp: 'Jul 16, 2026, 8:04 AM',
+})
+assert.match(continuedDocument.content, /agent-result:dispatch-2/)
+assert.match(continuedDocument.content, /agent-result:dispatch-1/)
+assert.ok(continuedDocument.content.indexOf('agent-result:dispatch-2') < continuedDocument.content.indexOf('agent-result:dispatch-1'))
 
 const overlappingPlan = execution.parseAgentTaskExecutionPlan(JSON.stringify({
   status: 'triaged',
@@ -447,6 +542,8 @@ assert.match(threadRoute, /restorePersistedDispatchOutcome/)
 assert.match(threadRoute, /evidence:\s*recorded\.evidence\?\.changes/)
 assert.match(threadRoute, /trigger:\s*'continuation'/)
 assert.match(threadRoute, /continuationDepth < 8/)
+assert.match(threadRoute, /Next checklist item ID:/)
+assert.match(threadRoute, /appendAgentTaskDocument/)
 assert.doesNotMatch(threadRoute, /executionStatus:\s*'completed'/)
 
 console.log('agent task execution behavioral tests passed')

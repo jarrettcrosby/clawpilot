@@ -25,7 +25,7 @@ app_visible: true
 ## Identity Graph
 
 - Workspace organizations and app users have permanent random Global IDs.
-- CRM accounts, contacts, leads, opportunities, meetings, interactions, and campaigns use module-specific Global IDs.
+- CRM accounts, contacts, products, leads, opportunities, meetings, interactions, and campaigns use module-specific Global IDs.
 - Global IDs are never reused after archive or deletion.
 - Organization membership defines data scope; global application permissions are a separate control.
 - See [Organization-Rooted Tenancy](../decisions/0002-organization-rooted-tenancy.md) and [CRM Global Identity and Synchronization](../decisions/0003-crm-global-identity-and-sync.md).

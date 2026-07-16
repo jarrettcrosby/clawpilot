@@ -45,6 +45,7 @@ import ChevronRightRounded from '@mui/icons-material/ChevronRightRounded'
 import CloseRounded from '@mui/icons-material/CloseRounded'
 import EmailRounded from '@mui/icons-material/EmailRounded'
 import EventRounded from '@mui/icons-material/EventRounded'
+import Inventory2Rounded from '@mui/icons-material/Inventory2Rounded'
 import OpenInNewRounded from '@mui/icons-material/OpenInNewRounded'
 import PhoneRounded from '@mui/icons-material/PhoneRounded'
 import RefreshRounded from '@mui/icons-material/RefreshRounded'
@@ -139,6 +140,7 @@ const ENTITY_LABELS: Record<CrmEntity, string> = {
   contacts: 'Contacts',
   leads: 'Leads',
   opportunities: 'Opportunities',
+  products: 'Products',
   meetings: 'Meetings',
   interactions: 'Interactions',
   campaigns: 'Campaigns',
@@ -149,6 +151,7 @@ const EMPTY_SUMMARY: CrmSummary = {
   contacts: 0,
   leads: 0,
   opportunities: 0,
+  products: 0,
   meetings: 0,
   interactions: 0,
   campaigns: 0,
@@ -176,9 +179,13 @@ function emailOptedOut(record: RecordValue) {
   return record.emailOptOut === true || textValue(record, 'emailOptOut').toLowerCase() === 'true'
 }
 
-function money(value: unknown) {
-  return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 })
-    .format(Number(value) || 0)
+function money(value: unknown, currency = 'USD') {
+  try {
+    return new Intl.NumberFormat('en-US', { style: 'currency', currency, maximumFractionDigits: 2 })
+      .format(Number(value) || 0)
+  } catch {
+    return `${currency} ${(Number(value) || 0).toLocaleString('en-US', { maximumFractionDigits: 2 })}`
+  }
 }
 
 function hierarchyDescendants(hierarchy: WorkspaceOrganization[], organizationId: string) {
@@ -212,6 +219,9 @@ function columns(entity: CrmEntity) {
   if (entity === 'opportunities') return [
     ['referenceCode', 'ID'], ['name', 'Opportunity'], ['organization', 'Organization'], ['stage', 'Stage'], ['value', 'Value'],
   ] as const
+  if (entity === 'products') return [
+    ['referenceCode', 'ID'], ['name', 'Product'], ['sku', 'SKU'], ['category', 'Category'], ['status', 'Status'], ['price', 'Price'],
+  ] as const
   if (entity === 'meetings') return [
     ['referenceCode', 'ID'], ['subject', 'Meeting'], ['startsAt', 'Starts'], ['status', 'Status'], ['contactName', 'Contact'],
   ] as const
@@ -227,7 +237,7 @@ function columns(entity: CrmEntity) {
 function entityForReference(reference: string): CrmEntity | null {
   const prefix = reference.slice(0, 2).toLowerCase()
   return ({
-    ga: 'organizations', gc: 'contacts', gl: 'leads', go: 'opportunities',
+    ga: 'organizations', gc: 'contacts', gl: 'leads', go: 'opportunities', gp: 'products',
     gm: 'meetings', gi: 'interactions', gk: 'campaigns',
   } as Record<string, CrmEntity>)[prefix] || null
 }
@@ -265,6 +275,12 @@ function initialFields(entity: CrmEntity, record: RecordValue | null, userTimeZo
     stage: textValue(source, 'stage'), status: textValue(source, 'status'), value: textValue(source, 'value'),
     probability: textValue(source, 'probability'), expectedClose: textValue(source, 'expectedClose'),
     notes: textValue(source, 'notes'),
+  }
+  if (entity === 'products') return {
+    name: textValue(source, 'name'), sku: textValue(source, 'sku'), productType: textValue(source, 'productType') || 'Good',
+    category: textValue(source, 'category'), status: textValue(source, 'status') || 'Active',
+    price: textValue(source, 'price'), cost: textValue(source, 'cost'), currency: textValue(source, 'currency') || 'USD',
+    url: textValue(source, 'url'), active: textValue(source, 'active') || 'true', description: textValue(source, 'description'),
   }
   if (entity === 'meetings') {
     const timezone = textValue(source, 'timezone') || 'America/New_York'
@@ -500,7 +516,7 @@ export default function CrmSection() {
 
   const editable = Boolean(pipeline && pipeline.accessRole !== 'viewer' && entity !== 'opportunities')
   const editorEditable = Boolean(pipeline && pipeline.accessRole !== 'viewer' && editorEntity !== 'opportunities')
-  const recordEditable = editorEditable && !editorRecord?.workspaceOrganizationId
+  const recordEditable = editorEditable && (editorEntity === 'products' || !editorRecord?.workspaceOrganizationId)
   const tableColumns = useMemo(() => columns(entity), [entity])
   const relatedContacts = useMemo(() => {
     const organizationId = editorEntity === 'organizations' && editorRecord
@@ -635,6 +651,13 @@ export default function CrmSection() {
             ? { ...fields, attendeeEmails: fields.attendeeEmails?.split(',').map((email) => email.trim()).filter(Boolean) || [] }
             : editorEntity === 'interactions'
               ? { ...fields, agentEmail: interactionAgentEmail, occurredAt }
+              : editorEntity === 'products'
+                ? {
+                    ...fields,
+                    active: fields.active !== 'false',
+                    price: Number(fields.price || 0),
+                    cost: Number(fields.cost || 0),
+                  }
               : ['organizations', 'contacts', 'leads'].includes(editorEntity)
                 ? { ...fields, emailOptOut: fields.emailOptOut === 'true' }
                 : fields,
@@ -878,6 +901,7 @@ export default function CrmSection() {
           <Chip size={shortLandscape ? 'small' : 'medium'} label={`${summary.contacts} contacts`} />
           <Chip size={shortLandscape ? 'small' : 'medium'} label={`${summary.leads} leads`} />
           <Chip size={shortLandscape ? 'small' : 'medium'} label={`${summary.opportunities} opportunities`} />
+          <Chip size={shortLandscape ? 'small' : 'medium'} label={`${summary.products} products`} />
           <Chip size={shortLandscape ? 'small' : 'medium'} label={`${summary.meetings} meetings`} />
           <Chip size={shortLandscape ? 'small' : 'medium'} label={`${summary.interactions} interactions`} />
           {summary.needsReviewInteractions > 0 && (
@@ -1010,7 +1034,9 @@ export default function CrmSection() {
                         >
                           {textValue(record, key)}
                         </Link>
-                      ) : entity === 'opportunities' && key === 'value' ? money(record[key]) : displayValue(record, key, dateTimeSettings)}
+                      ) : (entity === 'opportunities' && key === 'value') || (entity === 'products' && key === 'price')
+                        ? money(record[key], entity === 'products' ? textValue(record, 'currency') || 'USD' : 'USD')
+                        : displayValue(record, key, dateTimeSettings)}
                     </TableCell>
                   ))}
                   <TableCell>
@@ -1245,7 +1271,7 @@ export default function CrmSection() {
                   Call
                 </Button>
               )}
-              {!['interactions', 'campaigns'].includes(editorEntity) && (
+              {!['interactions', 'campaigns', 'products'].includes(editorEntity) && (
                 <Button startIcon={<EventRounded />} variant="outlined" onClick={() => openAction('create_calendar_event', editorRecord)}>
                   Schedule
                 </Button>
@@ -1372,6 +1398,33 @@ export default function CrmSection() {
             <TextField disabled label="Value" value={fields.value || ''} />
             <TextField disabled label="Probability" value={fields.probability || ''} />
             <TextField disabled label="Expected close" value={fields.expectedClose || ''} />
+          </>}
+          {editorEntity === 'products' && <>
+            <Stack direction="row" gap={1} alignItems="center">
+              <Inventory2Rounded color="primary" />
+              <Typography variant="subtitle2" fontWeight={700}>Product catalog record</Typography>
+            </Stack>
+            <TextField disabled={!recordEditable} label="Product name" value={fields.name || ''} onChange={(event) => setFields({ ...fields, name: event.target.value })} required />
+            <Stack direction={{ xs: 'column', sm: 'row' }} gap={2} sx={{ minWidth: 0 }}>
+              <TextField fullWidth disabled={!recordEditable} label="SKU" value={fields.sku || ''} inputProps={{ maxLength: 25 }} onChange={(event) => setFields({ ...fields, sku: event.target.value.slice(0, 25) })} helperText="Up to 25 characters" />
+              <TextField fullWidth disabled={!recordEditable} label="Type" value={fields.productType || ''} onChange={(event) => setFields({ ...fields, productType: event.target.value })} />
+            </Stack>
+            <Stack direction={{ xs: 'column', sm: 'row' }} gap={2} sx={{ minWidth: 0 }}>
+              <TextField fullWidth disabled={!recordEditable} label="Category" value={fields.category || ''} onChange={(event) => setFields({ ...fields, category: event.target.value })} />
+              <TextField fullWidth disabled={!recordEditable} label="Status" value={fields.status || ''} onChange={(event) => setFields({ ...fields, status: event.target.value })} />
+            </Stack>
+            <Stack direction={{ xs: 'column', sm: 'row' }} gap={2} sx={{ minWidth: 0 }}>
+              <TextField fullWidth disabled={!recordEditable} label="Price" type="number" inputProps={{ min: 0, step: '0.01' }} value={fields.price || ''} onChange={(event) => setFields({ ...fields, price: event.target.value })} />
+              <TextField fullWidth disabled={!recordEditable} label="Cost" type="number" inputProps={{ min: 0, step: '0.01' }} value={fields.cost || ''} onChange={(event) => setFields({ ...fields, cost: event.target.value })} />
+            </Stack>
+            <Stack direction={{ xs: 'column', sm: 'row' }} gap={2} sx={{ minWidth: 0 }}>
+              <TextField fullWidth disabled={!recordEditable} label="Currency" value={fields.currency || ''} onChange={(event) => setFields({ ...fields, currency: event.target.value.toUpperCase().slice(0, 3) })} />
+              <TextField fullWidth disabled={!recordEditable} select label="Availability" value={fields.active || 'true'} onChange={(event) => setFields({ ...fields, active: event.target.value })}>
+                <MenuItem value="true">Active</MenuItem>
+                <MenuItem value="false">Inactive</MenuItem>
+              </TextField>
+            </Stack>
+            <TextField disabled={!recordEditable} label="Product URL" type="url" value={fields.url || ''} onChange={(event) => setFields({ ...fields, url: event.target.value })} />
           </>}
           {editorEntity === 'meetings' && <>
             <TextField disabled={!recordEditable} label="Meeting" value={fields.subject || ''} onChange={(event) => setFields({ ...fields, subject: event.target.value })} required />

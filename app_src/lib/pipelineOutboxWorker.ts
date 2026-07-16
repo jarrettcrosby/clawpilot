@@ -179,7 +179,7 @@ async function executeOutboxItem(
     return
   }
 
-  if (item.operation === 'replace_dropdowns') {
+  if (item.operation === 'replace_dropdowns' || item.operation === 'patch_dropdowns') {
     const catalog = item.payload.catalog as PipelineDropdownCatalog | undefined
     if (!catalog || typeof catalog !== 'object') {
       throw new PermanentOutboxError('Dropdown replacement is missing a catalog')

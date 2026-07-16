@@ -419,6 +419,18 @@ for (const fragment of [
 }
 assert.ok(!recorderSource.includes('requestUser'))
 assert.ok(!recorderSource.includes('APP_SESSION_SECRET'))
+assert.ok(
+  recorderSource.indexOf("'RAILWAY_GIT_COMMIT_SHA'") < recorderSource.indexOf("'RELEASE_COMMIT'"),
+  'Railway commit metadata must take precedence over direct-upload release metadata',
+)
+
+const runtimeRouteSource = read('app_src/app/api/runtime/route.ts')
+const versionRouteSource = read('app_src/app/api/version/route.ts')
+for (const [label, source] of [['runtime', runtimeRouteSource], ['version', versionRouteSource]]) {
+  assert.ok(source.includes('process.env.RELEASE_COMMIT'), `${label} endpoint missing direct-upload release identity`)
+}
+assert.ok(runtimeRouteSource.includes('Hosted build identity is not configured'))
+assert.ok(runtimeRouteSource.includes('!commit && !hosted'))
 
 const railwayConfig = JSON.parse(read('railway.json'))
 assert.equal(railwayConfig.deploy.preDeployCommand, 'npm run mail:verify && npm run db:migrate')

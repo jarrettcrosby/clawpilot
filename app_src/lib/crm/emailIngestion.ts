@@ -747,7 +747,7 @@ function interactionRelations(record: CrmReferenceRecord) {
     opportunities: 'Opportunities',
     meetings: 'Meetings',
     campaigns: 'Campaigns',
-  } as const)[record.entity as Exclude<CrmReferenceRecord['entity'], 'interactions'>] || null
+  } as const)[record.entity as Exclude<CrmReferenceRecord['entity'], 'interactions' | 'products'>] || null
   return {
     organizationId: record.entity === 'organizations' ? record.id : record.organizationId,
     contactId: record.entity === 'contacts' ? record.id : null,
@@ -796,6 +796,7 @@ const TARGET_PRIORITY: Record<CrmReferenceRecord['entity'], number> = {
   campaigns: 4,
   organizations: 5,
   interactions: 6,
+  products: 7,
 }
 
 function groupReferenceTargets(targets: ReferenceTarget[]): ReferenceTargetGroup[] {
