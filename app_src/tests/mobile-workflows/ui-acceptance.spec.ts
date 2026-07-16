@@ -630,17 +630,52 @@ for (const viewport of MOBILE_VIEWPORTS) {
           },
         })
       })
+      await page.route((url) => url.pathname === '/api/auth/sessions', async (route) => {
+        await route.fulfill({
+          json: {
+            ok: true,
+            currentSessionId: '11111111-1111-4111-8111-111111111111',
+            sessions: [{
+              id: '11111111-1111-4111-8111-111111111111',
+              authenticatedUser: 'security@example.com',
+              effectiveUser: 'security@example.com',
+              deviceLabel: 'Safari on iPhone',
+              initialIpAddress: '198.51.100.8',
+              lastIpAddress: '203.0.113.17',
+              createdAt: '2026-07-16T12:00:00.000Z',
+              lastSeenAt: '2026-07-16T13:00:00.000Z',
+              idleExpiresAt: '2026-07-16T14:00:00.000Z',
+              absoluteExpiresAt: '2026-07-17T12:00:00.000Z',
+              current: true,
+              impersonating: false,
+            }],
+          },
+        })
+      })
+      await page.route((url) => url.pathname === '/api/auth/impersonation', async (route) => {
+        await route.fulfill({
+          json: {
+            isRootAdmin: false,
+            impersonation: { active: false },
+            targets: [],
+          },
+        })
+      })
       await gotoApp(page, '/#dashboard')
       await page.getByRole('button', { name: 'Settings' }).click()
       await page.getByRole('menuitem', { name: /Workspace settings/ }).click()
 
       const settings = page.getByRole('dialog', { name: 'Settings' })
       await expectUsableGeometry(settings, 'Settings dialog', 160, 280)
-      for (const tabName of ['Profile', 'People', 'Sharing', 'Integrations']) {
+      for (const tabName of ['Profile', 'People', 'Sharing', 'Integrations', 'Security']) {
         const tab = settings.getByRole('tab', { name: tabName })
         await tab.click()
         await expect(tab).toHaveAttribute('aria-selected', 'true')
       }
+      await expect(settings.getByText('Signed in as security@example.com')).toBeVisible()
+      await expect(settings.getByText('Last observed IP 203.0.113.17')).toBeVisible()
+      await expect(settings.getByText('Sign-in IP 198.51.100.8')).toBeVisible()
+      await expectNoDocumentOverflow(page)
       await settings.getByRole('button', { name: 'Close settings' }).click()
 
       await page.getByRole('button', { name: 'Activity log' }).click()

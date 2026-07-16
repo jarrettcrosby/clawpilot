@@ -20,14 +20,27 @@ for (const fragment of [
   'app_sessions_impersonation_state',
 ]) assert.ok(migration.includes(fragment), `browser-session migration missing ${fragment}`)
 
+const ipMigration = read('db/migrations/0044_browser_session_ip_attribution.sql')
+for (const fragment of ['initial_ip_address inet', 'last_ip_address inet', 'hosting edge']) {
+  assert.ok(ipMigration.includes(fragment), `browser-session IP migration missing ${fragment}`)
+}
+
+const requestIp = read('app_src/lib/requestIpAddress.ts')
+for (const fragment of ["from 'node:net'", 'normalizeIpAddress', 'observedRequestIpAddress', 'x-vercel-forwarded-for', 'x-forwarded-for']) {
+  assert.ok(requestIp.includes(fragment), `request IP normalization missing ${fragment}`)
+}
+
 const sessions = read('app_src/lib/authSessions.ts')
 for (const fragment of [
   "crypto.randomBytes(32).toString('base64url')",
   'clawpilot-browser-session:v1',
   'token_hash',
   'last_user_activity_at',
-  "$7::integer * interval '1 second'",
+  'host(session.initial_ip_address) AS initial_ip_address',
+  'host(session.last_ip_address) AS last_ip_address',
+  '$7::inet',
   "$8::integer * interval '1 second'",
+  "$9::integer * interval '1 second'",
   'absolute_timeout',
   'idle_timeout',
   'RECENT_AUTH_SECONDS',
@@ -54,6 +67,9 @@ const writer = read('app_src/lib/auditWriter.ts')
 for (const fragment of ['verifyAuthAttributionHeaders', 'authenticatedUser', 'effectiveUser', 'impersonated: true']) {
   assert.ok(writer.includes(fragment), `audit impersonation attribution missing ${fragment}`)
 }
+const authAudit = read('app_src/lib/authAudit.ts')
+assert.ok(authAudit.includes('observedRequestIpAddress(req.headers)'), 'auth audit must fingerprint only validated observed addresses')
+assert.ok(!authAudit.includes('ipAddress:'), 'general auth audit payload must not persist raw IP addresses')
 
 const proxy = read('app_src/proxy.ts')
 for (const fragment of [
@@ -74,7 +90,16 @@ const settings = read('app_src/components/settings/UserAccessDialog.tsx')
 assert.ok(settings.includes('SessionSecurityPanel'))
 assert.ok(settings.includes('label="Security"'))
 const securityPanel = read('app_src/components/settings/SessionSecurityPanel.tsx')
-for (const fragment of ['Browser sessions', 'Sign out others', 'Root support mode', 'View as user']) {
+for (const fragment of [
+  'Browser sessions',
+  'Sign out others',
+  'Root support mode',
+  'View as user',
+  'authenticatedUser',
+  'effectiveUser',
+  'Last observed IP',
+  'Sign-in IP',
+]) {
   assert.ok(securityPanel.includes(fragment), `security UI missing ${fragment}`)
 }
 const shell = read('app_src/app/HomeClient.tsx')

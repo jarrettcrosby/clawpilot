@@ -23,7 +23,11 @@ import { formatUserDateTime } from '@/lib/userDateTime'
 
 type BrowserSession = {
   id: string
+  authenticatedUser: string
+  effectiveUser: string
   deviceLabel: string
+  initialIpAddress: string | null
+  lastIpAddress: string | null
   createdAt: string
   lastSeenAt: string
   idleExpiresAt: string
@@ -206,6 +210,19 @@ export default function SessionSecurityPanel() {
                   <Typography variant="body2" color="text.primary" fontWeight={700}>{session.deviceLabel}</Typography>
                   {session.current ? <Chip size="small" color="primary" label="Current" sx={{ height: 22, minHeight: 22, fontSize: '0.68rem' }} /> : null}
                 </Stack>
+                <Typography variant="caption" color="text.secondary" display="block">
+                  {session.impersonating
+                    ? `Signed in as ${session.authenticatedUser} · Viewing as ${session.effectiveUser}`
+                    : `Signed in as ${session.authenticatedUser}`}
+                </Typography>
+                <Typography variant="caption" color="text.secondary" display="block" sx={{ overflowWrap: 'anywhere' }}>
+                  Last observed IP {session.lastIpAddress || 'Unavailable'}
+                </Typography>
+                {session.initialIpAddress && session.initialIpAddress !== session.lastIpAddress ? (
+                  <Typography variant="caption" color="text.disabled" display="block" sx={{ overflowWrap: 'anywhere' }}>
+                    Sign-in IP {session.initialIpAddress}
+                  </Typography>
+                ) : null}
                 <Typography variant="caption" color="text.secondary" display="block">
                   Last active {formatUserDateTime(session.lastSeenAt, dateTimeSettings, {
                     month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', fallback: 'Unknown',

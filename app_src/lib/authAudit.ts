@@ -1,6 +1,7 @@
 import crypto from 'crypto'
 import type { NextRequest } from 'next/server'
 import { recordAuditEvent } from '@/lib/auditWriter'
+import { observedRequestIpAddress } from '@/lib/requestIpAddress'
 import { normalizeUserEmail } from '@/lib/users'
 
 function normalizedEmail(value: unknown): string | null {
@@ -11,16 +12,12 @@ function normalizedEmail(value: unknown): string | null {
   }
 }
 
-function requestAddress(req: NextRequest): string {
-  return String(req.headers.get('x-forwarded-for') || req.headers.get('x-real-ip') || 'unknown')
-    .split(',')[0]
-    .trim()
-    .slice(0, 200)
-}
-
 function networkFingerprint(req: NextRequest): string {
   const key = String(process.env.APP_SESSION_SECRET || 'clawpilot-audit-fallback')
-  return crypto.createHmac('sha256', key).update(requestAddress(req)).digest('hex').slice(0, 16)
+  return crypto.createHmac('sha256', key)
+    .update(observedRequestIpAddress(req.headers) || 'unknown')
+    .digest('hex')
+    .slice(0, 16)
 }
 
 function clientSummary(req: NextRequest): string {
