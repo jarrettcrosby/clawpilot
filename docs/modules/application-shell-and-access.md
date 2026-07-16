@@ -36,6 +36,7 @@ Provide a responsive, authenticated ClawPilot workspace with clear user identity
 - Timestamps are stored in UTC and rendered in the signed-in user's timezone and locale.
 - ChatGPT/Codex authorization is stored per ClawPilot user. One user's credential cannot authorize another user's agent execution.
 - Activity is independent from the selected board or pipeline. Every user can review events they performed and security events targeting their account.
+- Opening an activity target first resolves and selects the event's owning board or pipeline, including CRM pipeline records, and then opens the referenced task, document, Global ID, or module. The target action must never depend on whichever project or pipeline happened to be selected before the Activity drawer opened.
 - Administrators with `viewOrganizationAudit` can review the immutable event-time history for their assigned organization subtree. Moving a user or changing a share does not retroactively reclassify an event.
 - Administrators with `viewSystemAudit` can review global platform and worker activity. That scope excludes tenant board, pipeline, CRM, document, and short-link records.
 - Successful and failed sign-ins, code requests, and sign-outs are audited without storing magic codes, raw IP addresses, cookies, credentials, or provider tokens.

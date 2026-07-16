@@ -17,6 +17,7 @@ for (const fragment of [
   'createCrmOpportunityInPostgres',
   'opportunityProducts(body?.products ?? body?.name)',
   "join(', ')",
+  'contactIds',
 ]) {
   assert.ok(route.includes(fragment), `pipeline opportunity route missing ${fragment}`)
 }
@@ -57,6 +58,9 @@ assert.match(component, /products: deal\.name\.split/)
 assert.match(component, /filter\(\(product\) => !product\.includes\(','\)\)/)
 assert.doesNotMatch(component, /multiple\s+freeSolo\s+options=\{products\}/)
 assert.match(component, /Select an organization already in CRM/)
+assert.match(component, /Associated contacts/)
+assert.match(component, /contactIds: newOpportunity\.contactIds/)
+assert.match(component, /contactIds: deal\.contactIds/)
 assert.match(component, /Add organization/)
 assert.match(component, /record\.relationshipType === 'customer'/)
 assert.match(component, /'Idempotency-Key': newOpportunityMutationKey/)

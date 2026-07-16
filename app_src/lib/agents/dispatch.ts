@@ -27,6 +27,7 @@ export function prepareAgentDispatch(input: {
   agentId: string
   text: string
   trigger: AgentDispatchTrigger
+  continuationDepth?: number
   eventId?: string
   queuedAt?: string
 }): { task: Task; dispatch: AgentDispatchEnqueueInput } {
@@ -42,9 +43,10 @@ export function prepareAgentDispatch(input: {
     agentId: input.agentId,
     text: input.text,
     trigger: input.trigger,
+    continuationDepth: input.continuationDepth || 0,
     queuedAt,
   }
-  const label = input.trigger === 'assignment' ? 'assignment' : 'comment'
+  const label = input.trigger === 'assignment' ? 'assignment' : input.trigger === 'comment' ? 'comment' : 'continued work'
   const nextTask: Task = {
     ...input.task,
     execution: {
@@ -59,6 +61,7 @@ export function prepareAgentDispatch(input: {
         trigger: input.trigger,
         status: 'queued',
         attempts: 0,
+        continuationDepth: input.continuationDepth || 0,
         queuedAt,
         updatedAt: queuedAt,
       },

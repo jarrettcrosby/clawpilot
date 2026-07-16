@@ -6,7 +6,7 @@ const TARGET_SYSTEM = 'agent_runtime'
 const AGGREGATE_TYPE = 'agent_task'
 const WORKER_HEARTBEAT_KEY = 'agent.dispatch.worker.heartbeat'
 
-export type AgentDispatchTrigger = 'assignment' | 'comment'
+export type AgentDispatchTrigger = 'assignment' | 'comment' | 'continuation'
 export type AgentDispatchStatus = 'queued' | 'processing' | 'succeeded' | 'failed' | 'dead'
 
 export type AgentDispatchEnqueueInput = {
@@ -18,6 +18,7 @@ export type AgentDispatchEnqueueInput = {
   agentId: string
   text: string
   trigger: AgentDispatchTrigger
+  continuationDepth?: number
   queuedAt: string
 }
 
@@ -58,14 +59,26 @@ function requireDispatchInput(input: AgentDispatchEnqueueInput): AgentDispatchEn
   const taskId = clean(input.taskId)
   const agentId = clean(input.agentId)
   const text = clean(input.text)
+  const continuationDepth = Math.max(0, Math.min(Math.trunc(Number(input.continuationDepth) || 0), 8))
   const queuedAt = clean(input.queuedAt) || new Date().toISOString()
   if (!dispatchId || !idempotencyKey || !operatorId || !boardId || !taskId || !agentId || !text) {
     throw new Error('Agent dispatch requires dispatch, operator, board, task, agent, and text values')
   }
-  if (input.trigger !== 'assignment' && input.trigger !== 'comment') {
+  if (!['assignment', 'comment', 'continuation'].includes(input.trigger)) {
     throw new Error('Agent dispatch trigger is invalid')
   }
-  return { dispatchId, idempotencyKey, operatorId, boardId, taskId, agentId, text, trigger: input.trigger, queuedAt }
+  return {
+    dispatchId,
+    idempotencyKey,
+    operatorId,
+    boardId,
+    taskId,
+    agentId,
+    text,
+    trigger: input.trigger,
+    continuationDepth,
+    queuedAt,
+  }
 }
 
 function payloadFor(input: AgentDispatchEnqueueInput) {
@@ -78,6 +91,7 @@ function payloadFor(input: AgentDispatchEnqueueInput) {
     agentId: input.agentId,
     text: input.text,
     trigger: input.trigger,
+    continuationDepth: input.continuationDepth || 0,
     queuedAt: input.queuedAt,
   }
 }
@@ -206,6 +220,7 @@ export async function claimAgentDispatchOutboxInPostgres(input: {
         agentId: String(row.payload.agentId || ''),
         text: String(row.payload.text || ''),
         trigger: row.payload.trigger as AgentDispatchTrigger,
+        continuationDepth: Number(row.payload.continuationDepth || 0),
         queuedAt: String(row.payload.queuedAt || ''),
       })
       return { ...normalized, attempts: row.attempts, lockToken: row.lock_token }

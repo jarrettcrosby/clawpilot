@@ -50,7 +50,13 @@ function subscribeToDesktopNavPreference(onStoreChange: () => void) {
   }
 }
 
-export default function HomeClient({ shortLinksEnabled }: { shortLinksEnabled: boolean }) {
+export default function HomeClient({
+  shortLinksEnabled,
+  sessionGuardEnabled,
+}: {
+  shortLinksEnabled: boolean
+  sessionGuardEnabled: boolean
+}) {
   // Always init 'dashboard' to match SSR. useEffect corrects to real hash post-hydration.
   const activeSection = useSyncExternalStore(subscribeToHashChange, getSectionFromHash, () => 'dashboard')
   const desktopNavCollapsed = useSyncExternalStore(
@@ -185,7 +191,7 @@ export default function HomeClient({ shortLinksEnabled }: { shortLinksEnabled: b
         overflow="hidden"
         minWidth={0}
       >
-        <SessionGuard />
+        <SessionGuard enabled={sessionGuardEnabled} />
         <AppHeader
           activeSection={section}
           desktopNavCollapsed={desktopNavCollapsed}

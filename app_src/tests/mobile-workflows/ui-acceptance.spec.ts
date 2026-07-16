@@ -224,6 +224,7 @@ async function mockCrmRecords(page: Page) {
       campaignId: null,
       interactionType: 'Call',
       occurredAt: '2026-07-15T14:00:00.000Z',
+      agentEmail: 'operator@example.test',
       agentName: 'Mobile Operator',
       description: 'Acceptance interaction notes',
       syncStatus: 'synced',
@@ -277,6 +278,12 @@ async function mockCrmRecords(page: Page) {
           members: [],
         }],
         canManageHierarchy: false,
+        pipelineUsers: [{
+          email: 'operator@example.test',
+          displayName: 'Mobile Operator',
+          suiteCrmMapped: true,
+          suiteCrmUsername: 'operator',
+        }],
         suiteCrmPunchoutUrl: 'https://crm.eigenracing.com',
         suiteCrmUsername: 'admin',
         suiteCrmAdminPortalUrl: 'https://railway.com/project/clawpilot',
@@ -518,6 +525,9 @@ for (const viewport of MOBILE_VIEWPORTS) {
         .locator('xpath=ancestor::*[contains(@class,"MuiDrawer-paper")][1]')
       await expectUsableGeometry(drawer, 'Interaction editor drawer', 160, 280)
       await expect(drawer.getByRole('combobox', { name: 'Organization' })).toContainText('Acceptance Organization')
+      await expect(drawer.getByRole('combobox', { name: 'Contact' })).toContainText('Acceptance Contact')
+      await expect(drawer.getByRole('combobox', { name: 'Type' })).toContainText('Call')
+      await expect(drawer.getByRole('combobox', { name: 'Agent' })).toContainText('Mobile Operator')
       await expect.poll(() => organizationRequests).toBeGreaterThan(0)
       expect(warnings.filter((warning) => /out-of-range value/i.test(warning))).toEqual([])
       await expectNoDocumentOverflow(page)

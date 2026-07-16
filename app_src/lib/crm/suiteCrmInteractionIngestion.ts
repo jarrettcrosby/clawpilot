@@ -47,6 +47,7 @@ type InteractionRow = {
   campaign_id: string | null
   interaction_type: string | null
   subject: string
+  agent_email: string | null
   agent_name: string | null
   occurred_at: TimestampValue | null
   description: string | null
@@ -258,7 +259,7 @@ async function localInteractions(snapshot: SuiteCrmNoteSnapshot): Promise<Intera
        interaction.source_sheet_id, interaction.source_row_number, interaction.source_payload,
        interaction.organization_id::text, interaction.contact_id::text, interaction.lead_id::text,
        interaction.opportunity_id::text, interaction.meeting_id::text, interaction.campaign_id::text,
-       interaction.interaction_type, interaction.subject, interaction.agent_name,
+       interaction.interaction_type, interaction.subject, interaction.agent_email, interaction.agent_name,
        interaction.occurred_at, interaction.description, interaction.direction,
        interaction.delivery_status, interaction.provider_message_id,
        interaction.provider_thread_id, interaction.metadata
@@ -433,13 +434,16 @@ function interactionFields(
     ? cleanMultiline(attributes.description, 50_000, 'note description')
     : currentDescription
   const currentOccurredAt = validDate(row.occurred_at)?.toISOString() || null
-  const occurredAt = hasAttribute(attributes, 'date_entered') && storedString(attributes.date_entered)
-    ? suiteTimestamp(attributes.date_entered, 'created time')
-    : currentOccurredAt
+  const occurredAt = hasAttribute(attributes, 'occurred_at_c') && storedString(attributes.occurred_at_c)
+    ? suiteTimestamp(attributes.occurred_at_c, 'occurred time')
+    : currentOccurredAt || (hasAttribute(attributes, 'date_entered') && storedString(attributes.date_entered)
+      ? suiteTimestamp(attributes.date_entered, 'created time')
+      : null)
   return {
     ...interactionRelations(row, parent),
     interactionType: cleanString(row.interaction_type, 100, 'stored interaction type'),
     subject: inboundSubject || currentSubject,
+    agentEmail: nullableStoredString(row.agent_email),
     agentName: cleanString(row.agent_name, 300, 'stored interaction agent'),
     occurredAt,
     description,

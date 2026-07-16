@@ -103,10 +103,24 @@ function saveReadIds(ids: Set<string>) {
   try { localStorage.setItem(READ_KEY, JSON.stringify([...ids].slice(-5000))) } catch {}
 }
 
-function navigateToSection(section: string) {
-  const nextUrl = `${window.location.pathname}${window.location.search}#${section}`
-  window.history.pushState({}, '', nextUrl)
-  window.dispatchEvent(new HashChangeEvent('hashchange'))
+function activityTargetUrl(target: NonNullable<ActivityEvent['target']>) {
+  const url = new URL(window.location.href)
+  for (const parameter of ['board', 'pipeline', 'crm', 'crmAction', 'doc']) url.searchParams.delete(parameter)
+  if (target.resourceId && target.section === 'projects') url.searchParams.set('board', target.resourceId)
+  if (target.resourceId && (target.section === 'pipeline' || target.section === 'crm')) {
+    url.searchParams.set('pipeline', target.resourceId)
+  }
+  if (target.id && target.section === 'crm') url.searchParams.set('crm', target.id)
+  if (target.id && target.section === 'docs') url.searchParams.set('doc', target.id)
+  url.hash = target.section
+  return url
+}
+
+function navigateToTarget(target: NonNullable<ActivityEvent['target']>) {
+  const oldURL = window.location.href
+  const nextUrl = activityTargetUrl(target)
+  window.history.pushState({}, '', `${nextUrl.pathname}${nextUrl.search}${nextUrl.hash}`)
+  window.dispatchEvent(new HashChangeEvent('hashchange', { oldURL, newURL: nextUrl.toString() }))
 }
 
 function displayType(type: string) {
@@ -266,7 +280,7 @@ export default function ActivityLogPage({ onClose }: Props) {
   }
 
   async function selectResource(target: NonNullable<ActivityEvent['target']>) {
-    if (!target.resourceId || (target.section !== 'projects' && target.section !== 'pipeline')) return
+    if (!target.resourceId || !['projects', 'pipeline', 'crm'].includes(target.section)) return
     const kind = target.section === 'projects' ? 'board' : 'pipeline'
     const response = await fetch('/api/workspaces', {
       method: 'POST',
@@ -288,11 +302,13 @@ export default function ActivityLogPage({ onClose }: Props) {
     try {
       await selectResource(event.target)
       if (event.target.section === 'projects' && event.target.id) queueProjectTaskOpen(event.target.id)
-      if (event.target.resourceId && (event.target.section === 'projects' || event.target.section === 'pipeline')) {
-        window.location.href = `${window.location.pathname}${window.location.search}#${event.target.section}`
+      if (event.target.resourceId && ['projects', 'pipeline', 'crm'].includes(event.target.section)) {
+        const nextUrl = activityTargetUrl(event.target)
+        onClose?.()
+        window.location.assign(nextUrl.toString())
         return
       }
-      navigateToSection(event.target.section)
+      navigateToTarget(event.target)
       onClose?.()
     } catch (navigationFailure) {
       setNavigationError(navigationFailure instanceof Error ? navigationFailure.message : 'Unable to open activity target')

@@ -199,6 +199,38 @@ const retried = execution.applyAgentTaskExecutionPlan({
 })
 assert.equal(retried.task.checklist.length, 2, 'dispatch retry must not duplicate checklist entries')
 
+const iterativePlan = execution.parseAgentTaskExecutionPlan(JSON.stringify({
+  status: 'running',
+  summary: 'Produced the system-of-record decision table.',
+  deliverable: 'QuickBooks owns posted accounting records. ClawPilot owns workflow state and records external accounting IDs.',
+  nextAction: 'Define the tenant-scoped external ID and synchronization journal schema.',
+  waitingOn: '',
+  blocker: '',
+  descriptionUpdate: '',
+  checklistAdd: [],
+  checklistComplete: ['ck-run-1'],
+  learned: 'Complete only checklist work supported by a persisted deliverable.',
+}))
+const iterativeResult = execution.applyAgentTaskExecutionPlan({
+  task: {
+    ...baseTask,
+    desc: 'Research and design the accounting integration.',
+    checklist: [
+      { id: 'ck-run-1', text: 'Define system-of-record rules', done: false },
+      { id: 'ck-run-2', text: 'Design the synchronization journal', done: false },
+    ],
+  },
+  plan: iterativePlan,
+  agentId: 'projects',
+  dispatchId: 'dispatch-1',
+  timestamp: '2026-07-16T12:02:05.000Z',
+})
+assert.equal(iterativeResult.task.checklist[0].done, true)
+assert.equal(iterativeResult.task.checklist[1].done, false)
+assert.equal(iterativeResult.task.execution.executionStatus, 'running')
+assert.equal(iterativeResult.task.execution.lastResult.deliverable, iterativePlan.deliverable)
+assert.deepEqual(Array.from(iterativeResult.task.execution.lastResult.completedChecklistIds), ['ck-run-1'])
+
 const overlappingPlan = execution.parseAgentTaskExecutionPlan(JSON.stringify({
   status: 'triaged',
   summary: 'Refined the accepted architecture without creating duplicate work.',
@@ -405,12 +437,16 @@ const provider = read('app_src/lib/agents/provider.ts')
 assert.match(provider, /mode\?: 'conversation' \| 'task-execution'/)
 assert.match(provider, /Do not report a planned or suggested action as completed work/)
 assert.match(provider, /You cannot edit repository files/)
+assert.match(provider, /complete one existing checklist item/)
+assert.match(provider, /checklistComplete/)
 
 const threadRoute = read('app_src/app/api/agents/threads/route.ts')
 assert.match(threadRoute, /parseAgentTaskExecutionPlan\(responseText\)/)
 assert.match(threadRoute, /applyAgentTaskExecutionPlanForDispatch/)
 assert.match(threadRoute, /restorePersistedDispatchOutcome/)
 assert.match(threadRoute, /evidence:\s*recorded\.evidence\?\.changes/)
+assert.match(threadRoute, /trigger:\s*'continuation'/)
+assert.match(threadRoute, /continuationDepth < 8/)
 assert.doesNotMatch(threadRoute, /executionStatus:\s*'completed'/)
 
 console.log('agent task execution behavioral tests passed')

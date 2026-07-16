@@ -78,7 +78,12 @@ for (const fragment of ['Browser sessions', 'Sign out others', 'Root support mod
   assert.ok(securityPanel.includes(fragment), `security UI missing ${fragment}`)
 }
 const shell = read('app_src/app/HomeClient.tsx')
-assert.ok(shell.includes('<SessionGuard />'))
+assert.ok(shell.includes('<SessionGuard enabled={sessionGuardEnabled} />'))
 assert.ok(shell.includes('<ImpersonationBanner />'))
+const sessionGuard = read('app_src/components/auth/SessionGuard.tsx')
+assert.ok(sessionGuard.includes('if (!enabled) return'), 'local auth-disabled runtime must not redirect through SessionGuard')
+const page = read('app_src/app/page.tsx')
+assert.ok(page.includes("process.env.APP_AUTH_REQUIRED === '1'"), 'server shell must pass the hosted auth requirement')
+assert.ok(page.includes('sessionGuardEnabled={sessionGuardEnabled}'), 'server auth decision must reach the client guard')
 
 console.log('PASS test-browser-session-security')

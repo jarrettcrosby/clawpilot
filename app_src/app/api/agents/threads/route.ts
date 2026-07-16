@@ -3,6 +3,7 @@ import crypto from 'crypto'
 import fs from 'fs'
 import path from 'path'
 import { NextRequest, NextResponse } from 'next/server'
+import { prepareAgentDispatch } from '@/lib/agents/dispatch'
 import { getAgentRuntimeForOperator, runChatGPTAgent, runOpenAIAgent } from '@/lib/agents/provider'
 import {
   captureAgentLearning,
@@ -27,6 +28,7 @@ import { buildCanonicalWorkItem, canonicalizeTasks } from '@/lib/workItemModel'
 import { isOpenClawExecutionEnabled, shouldFallbackToFileOnDatabaseError } from '@/lib/persistence/config'
 import { getThreadFromPostgres, listThreadsFromPostgres, upsertThreadMessageInPostgres } from '@/lib/persistence/agentThreads'
 import { appendExecutionResultToPostgres, appendExecutionRunToPostgres, isPostgresExecutionStoreEnabled } from '@/lib/persistence/execution'
+import type { AgentDispatchEnqueueInput } from '@/lib/persistence/agentDispatch'
 import { isPostgresTaskStoreEnabled, readTasksFromPostgres, replaceTasksInPostgres } from '@/lib/persistence/tasks'
 import { requireRequestUser } from '@/lib/requestUser'
 import { resolveAgentDispatchWorker, type AgentDispatchWorkerContext } from '@/lib/workerAuth'
@@ -64,12 +66,12 @@ async function readTasks(boardId?: string): Promise<Task[]> {
   return readTasksFromFile().filter((task) => !isCrmBoardCard(task))
 }
 
-async function writeTasks(tasks: Task[], boardId?: string) {
+async function writeTasks(tasks: Task[], boardId?: string, agentDispatches: AgentDispatchEnqueueInput[] = []) {
   const canonical = canonicalizeTasks(tasks)
   if (isPostgresTaskStoreEnabled()) {
     if (!boardId) throw new Error('Project board context is required')
     try {
-      await replaceTasksInPostgres(canonical, { boardId })
+      await replaceTasksInPostgres(canonical, { boardId, agentDispatches })
       return
     } catch (error) {
       if (!shouldFallbackToFileOnDatabaseError()) throw error
@@ -201,15 +203,17 @@ async function restorePersistedDispatchOutcome(input: {
 async function recordAgentResult(input: {
   taskId: string
   agentId: string
+  operatorId: string
   summary: string
   boardId?: string
   dispatchId?: string
+  dispatchContinuationDepth?: number
   plan?: AgentTaskExecutionPlan
-}): Promise<{ evidence: AgentTaskExecutionEvidence | null; summary: string; applied: boolean }> {
-  const { taskId, agentId, summary, boardId, dispatchId, plan } = input
+}): Promise<{ evidence: AgentTaskExecutionEvidence | null; summary: string; applied: boolean; continuationQueued: boolean }> {
+  const { taskId, agentId, operatorId, summary, boardId, dispatchId, plan } = input
   const tasks = await readTasks(boardId)
   const index = tasks.findIndex((task) => String(task.id) === taskId)
-  if (index === -1) return { evidence: null, summary, applied: false }
+  if (index === -1) return { evidence: null, summary, applied: false, continuationQueued: false }
 
   const now = new Date().toISOString()
   let task = tasks[index]
@@ -223,7 +227,7 @@ async function recordAgentResult(input: {
     evidence = applied.evidence
     planApplied = applied.applied
     resultSummary = formatAgentTaskExecutionResult(agentId, evidence)
-    if (!planApplied) return { evidence, summary: resultSummary, applied: false }
+    if (!planApplied) return { evidence, summary: resultSummary, applied: false, continuationQueued: false }
   }
   const nextAction = evidence?.nextAction || deriveNextAction(resultSummary)
   const commentId = dispatchId ? `agent-dispatch-${dispatchId}` : Date.now().toString()
@@ -287,8 +291,44 @@ async function recordAgentResult(input: {
     execution,
     updatedAt: now,
   }
-  await writeTasks(tasks, boardId)
-  return { evidence, summary: resultSummary, applied: planApplied }
+
+  const dispatches: AgentDispatchEnqueueInput[] = []
+  const continuationDepth = Math.max(0, Math.trunc(Number(input.dispatchContinuationDepth) || 0))
+  const progressedChecklist = Boolean(evidence?.completedChecklistIds.length)
+    || Boolean(evidence?.changes.some((change) => /checklist item.*added/i.test(change)))
+  const nextChecklistItem = tasks[index].checklist.find((item) => !item.done)
+  if (
+    boardId
+    && dispatchId
+    && planApplied
+    && evidence?.status === 'running'
+    && progressedChecklist
+    && nextChecklistItem
+    && continuationDepth < 8
+    && isPostgresTaskStoreEnabled()
+  ) {
+    const prepared = prepareAgentDispatch({
+      operatorId,
+      boardId,
+      task: tasks[index],
+      agentId,
+      trigger: 'continuation',
+      continuationDepth: continuationDepth + 1,
+      eventId: dispatchId,
+      queuedAt: now,
+      text: `Continue autonomous execution. Produce the actual deliverable for the next unchecked checklist item, complete only that evidenced item, and stop for one specific operator decision if required. Next item: ${nextChecklistItem.text}`,
+    })
+    tasks[index] = prepared.task
+    dispatches.push(prepared.dispatch)
+  }
+
+  await writeTasks(tasks, boardId, dispatches)
+  return {
+    evidence,
+    summary: resultSummary,
+    applied: planApplied,
+    continuationQueued: dispatches.length > 0,
+  }
 }
 
 async function recordExecutionTelemetry(entry: Record<string, unknown>, includeResult = false) {
@@ -360,7 +400,9 @@ async function runOpenClawAgent(agentId: string, message: string): Promise<strin
 }
 
 function buildTaskContext(task: Task, agentId: string, durableContext?: string | null): string {
-  const checklist = (task.checklist || []).map((item) => `- [${item.done ? 'x' : ' '}] ${item.text}`).join('\n')
+  const checklist = (task.checklist || [])
+    .map((item) => `- [${item.done ? 'x' : ' '}] ${item.text} (id: ${item.id})`)
+    .join('\n')
   const nextAction = String(task.workItem?.nextAction || '').trim()
   const recentComments = (task.comments || [])
     .filter((comment) => !comment.deletedAt)
@@ -471,6 +513,7 @@ export async function POST(req: NextRequest) {
     ? requestedDispatchId.toLowerCase()
     : undefined
   const dispatchAttempt = Math.max(0, Math.trunc(Number(body?.dispatchAttempt) || 0))
+  const dispatchContinuationDepth = Math.max(0, Math.min(Math.trunc(Number(body?.dispatchContinuationDepth) || 0), 8))
   const messageSource = dispatchId ? 'dispatch' : 'api'
   if (!agentId || !text || !taskId) {
     return NextResponse.json({ ok: false, error: 'valid agentId, taskId and text required' }, { status: 400 })
@@ -634,7 +677,7 @@ export async function POST(req: NextRequest) {
       })
     } else {
       const executionContract = mode === 'task-execution'
-        ? '\n\nReturn one JSON object with status, summary, nextAction, waitingOn, blocker, descriptionUpdate, checklistAdd, and learned. Status must be triaged, awaiting_input, or blocked. Do not claim unavailable external work.'
+        ? '\n\nReturn one JSON object with status, summary, deliverable, nextAction, waitingOn, blocker, descriptionUpdate, checklistAdd, checklistComplete, and learned. Status must be running, completed, awaiting_input, or blocked. Complete at most one exact checklist item ID and only when the deliverable supports it. Do not claim unavailable external work.'
         : ''
       responseText = await runOpenClawAgent(executionAgentId, `${taskContext}\n\nOperator request:\n${text}${executionContract}`)
     }
@@ -643,10 +686,12 @@ export async function POST(req: NextRequest) {
       responseText = formatAgentTaskExecutionResult(agentId, {
         status: executionPlan.status,
         summary: executionPlan.summary,
+        deliverable: executionPlan.deliverable,
         nextAction: executionPlan.nextAction,
         waitingOn: executionPlan.waitingOn,
         blocker: executionPlan.blocker,
         changes: [],
+        completedChecklistIds: [],
         learned: executionPlan.learned,
       })
     }
@@ -685,9 +730,11 @@ export async function POST(req: NextRequest) {
   const recorded = await recordAgentResult({
     taskId,
     agentId,
+    operatorId,
     summary: responseText,
     boardId: board?.id,
     dispatchId,
+    dispatchContinuationDepth,
     plan: executionPlan,
   })
   responseText = recorded.summary
@@ -737,6 +784,7 @@ export async function POST(req: NextRequest) {
       executionStatus: recorded.applied ? recorded.evidence?.status || 'responded' : 'stale',
       executionApplied: recorded.applied,
       evidence: recorded.evidence?.changes || [],
+      continuationQueued: recorded.continuationQueued,
     },
   })
 
@@ -752,5 +800,6 @@ export async function POST(req: NextRequest) {
       : threadMessages[threadMessages.length - 1] || null,
     runtime,
     canonicalWorkItem: updatedTask ? buildCanonicalWorkItem(updatedTask) : null,
+    continuationQueued: recorded.continuationQueued,
   })
 }

@@ -42,6 +42,8 @@ import { formatUserDateTime, type UserDateTimeSettings } from '@/lib/userDateTim
 type Contact = {
   id: string
   name: string
+  organizationId?: string
+  referenceCode?: string
   phone?: string
   email?: string
   title?: string
@@ -65,6 +67,8 @@ type SyncSurface = {
 
 type Deal = {
   id: string
+  organizationId?: string
+  contactIds?: string[]
   priority: string
   name: string
   owner: string
@@ -100,6 +104,7 @@ type OrganizationOption = {
 
 const EMPTY_OPPORTUNITY = {
   organizationId: '',
+  contactIds: [] as string[],
   products: [] as string[],
   priority: 'C',
   stage: 'Identified Lead',
@@ -233,10 +238,41 @@ function contactFromLooseShape(input: unknown, fallbackId: string): Contact | nu
 
   return {
     id: String(record.id || fallbackId),
+    organizationId: String(record.organizationId || '') || undefined,
+    referenceCode: String(record.referenceCode || '') || undefined,
     name: name || 'Unnamed Contact',
     phone: phone || undefined,
     email: email || undefined,
     title: title || undefined,
+  }
+}
+
+function dealFromLooseShape(row: LooseRecord, index = 0): Deal {
+  return {
+    id: String(row.id ?? index),
+    organizationId: String(row.organizationId || '') || undefined,
+    contactIds: Array.isArray(row.contactIds) ? row.contactIds.map(String) : [],
+    priority: String(row.priority || ''),
+    name: String(row.name || ''),
+    owner: String(row.owner || ''),
+    org: String(row.org || row.organization || ''),
+    status: String(row.status || ''),
+    stage: String(row.stage || ''),
+    lossReason: String(row.lossReason || ''),
+    source: String(row.source || ''),
+    value: Math.round(Number(row.value || 0)),
+    valueRaw: String(row.valueRaw || ''),
+    probability: Math.round(Number(row.probability || 0) * 10) / 10,
+    closeDate: toInputDate(String(row.closeDate || row.expectedClose || '')),
+    notes: String(row.notes || ''),
+    updatedAt: typeof row.updatedAt === 'string' ? row.updatedAt : undefined,
+    contacts: Array.isArray(row.contacts)
+      ? row.contacts.map((contact, contactIndex) => contactFromLooseShape(contact, `contact-${contactIndex}`)).filter((contact): contact is Contact => Boolean(contact))
+      : undefined,
+    contactName: String(row.contactName || row.primaryContactName || ''),
+    contactPhone: String(row.contactPhone || row.primaryContactPhone || ''),
+    contactEmail: String(row.contactEmail || row.primaryContactEmail || ''),
+    contactTitle: String(row.contactTitle || row.primaryContactTitle || ''),
   }
 }
 
@@ -319,6 +355,7 @@ function DealDrawer({
   owners,
   lossReasons,
   products,
+  contactOptions,
   readOnly,
 }: {
   deal: Deal | null
@@ -332,6 +369,7 @@ function DealDrawer({
   owners: string[]
   lossReasons: string[]
   products: string[]
+  contactOptions: Contact[]
   readOnly?: boolean
 }) {
   const [form, setForm] = useState<Deal | null>(null)
@@ -380,6 +418,28 @@ function DealDrawer({
               ))
             }
             renderInput={(params) => <TextField {...params} label="Product" size="small" placeholder="Type to search/select" />}
+          />
+          <Autocomplete
+            disabled={readOnly}
+            multiple
+            options={contactOptions.filter((contact) => !form.organizationId || contact.organizationId === form.organizationId)}
+            value={contactOptions.filter((contact) => (form.contactIds || []).includes(contact.id))}
+            getOptionLabel={(contact) => contact.name}
+            isOptionEqualToValue={(option, value) => option.id === value.id}
+            onChange={(_, contacts) => setForm({
+              ...form,
+              contactIds: contacts.map((contact) => contact.id),
+              contacts,
+            })}
+            renderOption={(props, contact) => (
+              <Box component="li" {...props} key={contact.id}>
+                <Box sx={{ minWidth: 0 }}>
+                  <Typography variant="body2" noWrap>{contact.name}</Typography>
+                  <Typography variant="caption" color="text.secondary">{contact.title || contact.email || contact.referenceCode}</Typography>
+                </Box>
+              </Box>
+            )}
+            renderInput={(params) => <TextField {...params} label="Associated contacts" size="small" placeholder="Select contacts" />}
           />
           <TextField disabled={readOnly} label="Priority" select size="small" value={form.priority || ''} onChange={e => setForm({ ...form, priority: e.target.value })}>
             {priorities.map(p => <MenuItem key={p} value={p}>{p}</MenuItem>)}
@@ -622,6 +682,8 @@ export default function PipelineSection() {
   const [newOpportunityMutationKey, setNewOpportunityMutationKey] = useState('')
   const [organizations, setOrganizations] = useState<OrganizationOption[]>([])
   const [organizationsLoading, setOrganizationsLoading] = useState(false)
+  const [contactOptions, setContactOptions] = useState<Contact[]>([])
+  const [contactsLoading, setContactsLoading] = useState(false)
   const [newOrganizationOpen, setNewOrganizationOpen] = useState(false)
   const [creatingOrganization, setCreatingOrganization] = useState(false)
   const [newOrganization, setNewOrganization] = useState({ name: '', email: '', phone: '', description: '' })
@@ -638,28 +700,7 @@ export default function PipelineSection() {
       setPipelineProvisioningError(String(data.pipeline.provisioningError || ''))
     }
     const rows = Array.isArray(data) ? data : (Array.isArray(data.opportunities) ? data.opportunities : [])
-    const mapped: Deal[] = rows.map((row: LooseRecord, i: number) => ({
-      id: String(row.id ?? i),
-      priority: String(row.priority || ''),
-      name: String(row.name || ''),
-      owner: String(row.owner || ''),
-      org: String(row.org || row.organization || ''),
-      status: String(row.status || ''),
-      stage: String(row.stage || ''),
-      lossReason: String(row.lossReason || ''),
-      source: String(row.source || ''),
-      value: Math.round(Number(row.value || 0)),
-      valueRaw: String(row.valueRaw || ''),
-      probability: Math.round(Number(row.probability || 0) * 10) / 10,
-      closeDate: toInputDate(String(row.closeDate || row.expectedClose || '')),
-      notes: String(row.notes || ''),
-      updatedAt: typeof row.updatedAt === 'string' ? row.updatedAt : undefined,
-      contacts: Array.isArray(row.contacts) ? row.contacts as Contact[] : undefined,
-      contactName: String(row.contactName || row.primaryContactName || ''),
-      contactPhone: String(row.contactPhone || row.primaryContactPhone || ''),
-      contactEmail: String(row.contactEmail || row.primaryContactEmail || ''),
-      contactTitle: String(row.contactTitle || row.primaryContactTitle || ''),
-    }))
+    const mapped: Deal[] = rows.map((row: LooseRecord, i: number) => dealFromLooseShape(row, i))
     setDeals(mapped)
   }
 
@@ -782,9 +823,10 @@ export default function PipelineSection() {
   }, [stageOptions, activeStage])
 
   useEffect(() => {
-    if (!newOpportunityOpen || organizations.length > 0 || organizationsLoading) return
-    void loadOrganizations()
-  }, [newOpportunityOpen, organizations.length, organizationsLoading])
+    if (!newOpportunityOpen && !selectedDeal) return
+    if (newOpportunityOpen && organizations.length === 0 && !organizationsLoading) void loadOrganizations()
+    if (contactOptions.length === 0 && !contactsLoading) void loadContacts()
+  }, [contactOptions.length, contactsLoading, newOpportunityOpen, organizations.length, organizationsLoading, selectedDeal])
 
   const filtered = useMemo(() => {
     const scoped = filterStatus === 'open'
@@ -874,6 +916,7 @@ export default function PipelineSection() {
         },
         body: JSON.stringify({
           organizationId: newOpportunity.organizationId,
+          contactIds: newOpportunity.contactIds,
           products: newOpportunity.products,
           priority: newOpportunity.priority,
           stage: newOpportunity.stage,
@@ -921,6 +964,24 @@ export default function PipelineSection() {
       setNewOpportunityError(organizationError instanceof Error ? organizationError.message : 'Unable to load organizations')
     } finally {
       setOrganizationsLoading(false)
+    }
+  }
+
+  const loadContacts = async () => {
+    setContactsLoading(true)
+    try {
+      const response = await fetch('/api/crm?entity=contacts&limit=1000')
+      const result = await response.json().catch(() => ({}))
+      if (!response.ok || !result.ok) throw new Error(result.error || 'Unable to load contacts')
+      const nextContacts = (Array.isArray(result.records) ? result.records : [])
+        .map((record: LooseRecord, index: number) => contactFromLooseShape(record, `crm-contact-${index}`))
+        .filter((contact: Contact | null): contact is Contact => Boolean(contact?.id && contact.organizationId))
+        .sort((left: Contact, right: Contact) => left.name.localeCompare(right.name))
+      setContactOptions(nextContacts)
+    } catch (contactsError) {
+      setNewOpportunityError(contactsError instanceof Error ? contactsError.message : 'Unable to load contacts')
+    } finally {
+      setContactsLoading(false)
     }
   }
 
@@ -1253,7 +1314,11 @@ export default function PipelineSection() {
               value={organizations.find((organization) => organization.id === newOpportunity.organizationId) || null}
               getOptionLabel={(organization) => organization.name}
               isOptionEqualToValue={(option, value) => option.id === value.id}
-              onChange={(_, organization) => setNewOpportunity((current) => ({ ...current, organizationId: organization?.id || '' }))}
+              onChange={(_, organization) => setNewOpportunity((current) => ({
+                ...current,
+                organizationId: organization?.id || '',
+                contactIds: [],
+              }))}
               renderOption={(props, organization) => (
                 <Box component="li" {...props} key={organization.id}>
                   <Box sx={{ minWidth: 0 }}>
@@ -1289,6 +1354,30 @@ export default function PipelineSection() {
                 </Stack>
               </Box>
             ) : null}
+            <Autocomplete
+              multiple
+              disabled={!newOpportunity.organizationId}
+              loading={contactsLoading}
+              options={contactOptions.filter((contact) => contact.organizationId === newOpportunity.organizationId)}
+              value={contactOptions.filter((contact) => newOpportunity.contactIds.includes(contact.id))}
+              getOptionLabel={(contact) => contact.name}
+              isOptionEqualToValue={(option, value) => option.id === value.id}
+              onChange={(_, contacts) => setNewOpportunity((current) => ({
+                ...current,
+                contactIds: contacts.map((contact) => contact.id),
+              }))}
+              renderOption={(props, contact) => (
+                <Box component="li" {...props} key={contact.id}>
+                  <Box sx={{ minWidth: 0 }}>
+                    <Typography variant="body2" noWrap>{contact.name}</Typography>
+                    <Typography variant="caption" color="text.secondary">{contact.title || contact.email || contact.referenceCode}</Typography>
+                  </Box>
+                </Box>
+              )}
+              renderInput={(params) => (
+                <TextField {...params} label="Associated contacts" helperText="Optional: select contacts involved in this opportunity" />
+              )}
+            />
             <Autocomplete
               multiple
               options={productOptions}
@@ -1348,6 +1437,7 @@ export default function PipelineSection() {
         owners={ownerOptions}
         lossReasons={lossReasonOptions}
         products={productOptions}
+        contactOptions={contactOptions}
         onSave={async (deal) => {
           const out = await patchOpportunityWithRetry(deal, {
             products: deal.name.split(',').map((product) => product.trim()).filter(Boolean),
@@ -1360,9 +1450,10 @@ export default function PipelineSection() {
             probability: Math.round(Number(deal.probability || 0) * 10) / 10,
             source: deal.source,
             lossReason: deal.lossReason,
+            contactIds: deal.contactIds || [],
           })
           await load()
-          setSelectedDeal(out.opportunity ? { ...out.opportunity, closeDate: toInputDate(out.opportunity.closeDate || out.opportunity.expectedClose || '') } : null)
+          setSelectedDeal(out.opportunity ? dealFromLooseShape(out.opportunity) : null)
         }}
         onComment={async (id, comment) => {
           const mutationKey = pipelineMutationKey()
@@ -1374,7 +1465,7 @@ export default function PipelineSection() {
           const out = await res.json()
           if (!res.ok) throw new Error(out?.error || 'comment failed')
           await load()
-          setSelectedDeal(out.opportunity ? { ...out.opportunity, closeDate: toInputDate(out.opportunity.closeDate || out.opportunity.expectedClose || '') } : null)
+          setSelectedDeal(out.opportunity ? dealFromLooseShape(out.opportunity) : null)
         }}
       />
     </Box>

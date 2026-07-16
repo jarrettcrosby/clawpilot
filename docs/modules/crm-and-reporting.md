@@ -48,6 +48,8 @@ Each reference code has a stable short link. The redirect enters the authenticat
 
 Organization and Contact records are also projected into the owner's managed `CRM Board`. Titles use `<Global ID> - <record name>`. The card record block renders the Global ID and name as links to the ClawPilot CRM editor, renders the primary email as an organization-scoped link to the ClawPilot email composer, and maps the editable card Description directly to the native CRM description. The projection uses the CRM row UUID for durable one-card identity, not the visible reference string.
 
+An Opportunity owns one permanent `go` reference, one required Organization relationship, and an exact set of related Contacts. Every selected Contact must belong to that Organization. The gateway writes both the native SuiteCRM Account relationship and Contact relationship collection so the same people appear in ClawPilot and the native Opportunity subpanels. Opportunity reads resolve the Organization name through its durable Organization ID; renaming an Organization therefore updates pipeline cards and generated workbook projections without rewriting every Opportunity row.
+
 ## Customer Actions
 
 - Organization, contact, and lead records with an email address can send through the signed-in user's selected Maton `google-mail` connection. ClawPilot displays the selected sender before submission, verifies the authenticated Gmail profile, records the actual sender in the provider attempt, and does not accept a caller-supplied From identity.
@@ -56,6 +58,10 @@ Organization and Contact records are also projected into the owner's managed `CR
 - Records with a phone number expose a call command. It records the interaction before returning a validated `tel:` URL to the device.
 - Campaigns accept `gc` and `gl` recipients, support `{{firstName}}`, `{{lastName}}`, `{{name}}`, `{{email}}`, and `{{referenceCode}}` merge fields, deduplicate recipients by email, and suppress opted-out recipients.
 - Every action is a durable intent with an idempotency key, leased provider attempt, retry state, audit event, and resulting CRM interaction. The worker handles failed retries and campaign child messages.
+
+The interaction editor requires a controlled interaction type and offers only active ClawPilot users who can access the selected pipeline as the Agent. Administrators can map each ClawPilot user to one active native SuiteCRM username; the gateway then assigns the Note to that SuiteCRM user while preserving the ClawPilot email as the durable actor identity. Contact selection is scoped to the selected Organization and is optional only when the interaction is genuinely account-level.
+
+Completed interactions project to SuiteCRM Notes and therefore appear under native **History**, not the open **Activities** subpanel. The Account remains the Note parent and a selected Contact is written to the native Contact field and relationship. The user-entered business timestamp is stored in the native Note `Occurred At` field (`occurred_at_c`); SuiteCRM's system `date_entered` remains the record creation audit timestamp and cannot replace it during reconciliation. Scheduled Meetings and open Calls are activity records; a completed email or call log must not be misrepresented as open work merely to place it in the Activities panel.
 
 ## Email Association
 

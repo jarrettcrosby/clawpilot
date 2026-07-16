@@ -1,26 +1,30 @@
 import type { ChecklistItem, Task } from '@/lib/types'
 import { applyCanonicalWorkItem } from '@/lib/workItemModel'
 
-export type AgentTaskExecutionStatus = 'triaged' | 'awaiting_input' | 'blocked'
+export type AgentTaskExecutionStatus = 'running' | 'completed' | 'triaged' | 'awaiting_input' | 'blocked'
 
 export type AgentTaskExecutionPlan = {
   status: AgentTaskExecutionStatus
   summary: string
+  deliverable: string
   nextAction: string
   waitingOn: string
   blocker: string
   descriptionUpdate: string
   checklistAdd: string[]
+  checklistComplete: string[]
   learned: string
 }
 
 export type AgentTaskExecutionEvidence = {
   status: AgentTaskExecutionStatus
   summary: string
+  deliverable: string
   nextAction: string
   waitingOn: string
   blocker: string
   changes: string[]
+  completedChecklistIds: string[]
   learned: string
 }
 
@@ -31,7 +35,7 @@ export type AgentTaskExecutionApplication = {
 }
 
 const GENERIC_DESCRIPTION = 'Task created from directive. See checklist/comments for execution details.'
-const VALID_STATUS = new Set<AgentTaskExecutionStatus>(['triaged', 'awaiting_input', 'blocked'])
+const VALID_STATUS = new Set<AgentTaskExecutionStatus>(['running', 'completed', 'triaged', 'awaiting_input', 'blocked'])
 const CHECKLIST_STOP_WORDS = new Set([
   'a',
   'an',
@@ -127,6 +131,7 @@ export function parseAgentTaskExecutionPlan(value: unknown): AgentTaskExecutionP
   if (!VALID_STATUS.has(status)) throw new Error('Agent execution returned an invalid status')
 
   const summary = cleanText(input.summary, 1200)
+  const deliverable = cleanText(input.deliverable, 10_000)
   const nextAction = cleanText(input.nextAction, 500)
   const waitingOn = cleanText(input.waitingOn, 500)
   const blocker = cleanText(input.blocker, 500)
@@ -136,21 +141,31 @@ export function parseAgentTaskExecutionPlan(value: unknown): AgentTaskExecutionP
       .map((item) => cleanText(item, 240))
       .filter(Boolean),
   )).slice(0, 12)
+  const checklistComplete = Array.from(new Set(
+    (Array.isArray(input.checklistComplete) ? input.checklistComplete : [])
+      .map((item) => cleanText(item, 240))
+      .filter(Boolean),
+  )).slice(0, 1)
   const learned = cleanText(input.learned, 280)
 
   if (!summary) throw new Error('Agent execution summary is required')
   if (!nextAction) throw new Error('Agent execution nextAction is required')
+  if ((status === 'running' || status === 'completed') && !deliverable) {
+    throw new Error('Agent execution deliverable is required for substantive progress')
+  }
   if (status === 'blocked' && !blocker) throw new Error('Blocked agent execution requires a specific blocker')
   if (status === 'awaiting_input' && !waitingOn) throw new Error('Awaiting-input execution requires a specific request')
 
   return {
     status,
     summary,
+    deliverable,
     nextAction,
     waitingOn,
     blocker,
     descriptionUpdate,
     checklistAdd,
+    checklistComplete,
     learned,
   }
 }
@@ -160,14 +175,20 @@ function canRepairDescription(task: Task) {
   return !description || description === GENERIC_DESCRIPTION
 }
 
-function evidenceFromPlan(plan: AgentTaskExecutionPlan, changes: string[]): AgentTaskExecutionEvidence {
+function evidenceFromPlan(
+  plan: AgentTaskExecutionPlan,
+  changes: string[],
+  completedChecklistIds: string[] = [],
+): AgentTaskExecutionEvidence {
   return {
     status: plan.status,
     summary: plan.summary,
+    deliverable: plan.deliverable,
     nextAction: plan.nextAction,
     waitingOn: plan.waitingOn,
     blocker: plan.blocker,
     changes,
+    completedChecklistIds,
     learned: plan.learned,
   }
 }
@@ -202,29 +223,49 @@ export function applyAgentTaskExecutionPlan(input: {
   }
   if (addedChecklist.length > 0) changes.push(`${addedChecklist.length} checklist item${addedChecklist.length === 1 ? '' : 's'} added`)
 
+  const completedChecklistIds: string[] = []
+  const requestedChecklistIds = new Set(plan.checklistComplete)
+  const updatedChecklist = existingChecklist.map((item) => {
+    if (item.done || !requestedChecklistIds.has(item.id)) return item
+    completedChecklistIds.push(item.id)
+    changes.push(`checklist completed: "${item.text}"`)
+    return { ...item, done: true }
+  })
+  const checklist = [...updatedChecklist, ...addedChecklist]
+  const hasRemainingChecklist = checklist.some((item) => !item.done)
+  const effectiveStatus: AgentTaskExecutionStatus = plan.status === 'completed' && hasRemainingChecklist
+    ? 'running'
+    : plan.status === 'running' && !hasRemainingChecklist
+      ? 'completed'
+      : plan.status
+  const effectivePlan = effectiveStatus === plan.status ? plan : { ...plan, status: effectiveStatus }
+
   const previousNextAction = String(task.workItem?.nextAction || '').trim()
   if (plan.nextAction !== previousNextAction) changes.push('next action updated')
-  if (plan.blocker) changes.push('specific blocker recorded')
-  else if (plan.waitingOn) changes.push('required input recorded')
+  if (effectivePlan.blocker) changes.push('specific blocker recorded')
+  else if (effectivePlan.waitingOn) changes.push('required input recorded')
 
   const note = [
-    `Status: ${plan.status}`,
-    `Summary: ${plan.summary}`,
-    `Next action: ${plan.nextAction}`,
-    `Waiting on: ${plan.waitingOn || 'none'}`,
-    `Blocker: ${plan.blocker || 'none'}`,
+    `Status: ${effectivePlan.status}`,
+    `Summary: ${effectivePlan.summary}`,
+    effectivePlan.deliverable ? `Deliverable: ${effectivePlan.deliverable}` : null,
+    `Next action: ${effectivePlan.nextAction}`,
+    `Waiting on: ${effectivePlan.waitingOn || 'none'}`,
+    `Blocker: ${effectivePlan.blocker || 'none'}`,
     `Evidence: ${changes.length > 0 ? changes.join('; ') : 'No task artifact changed'}`,
-  ].join('\n')
+  ].filter(Boolean).join('\n')
   const lastResult = {
     type: 'agent-task-execution',
-    status: plan.status,
-    summary: plan.summary,
+    status: effectivePlan.status,
+    summary: effectivePlan.summary,
+    deliverable: effectivePlan.deliverable || undefined,
     whatWasDone: changes.length > 0 ? changes.join('; ') : undefined,
-    nextAction: plan.nextAction,
-    waitingOn: plan.waitingOn || undefined,
-    blockedReason: plan.blocker || undefined,
+    nextAction: effectivePlan.nextAction,
+    waitingOn: effectivePlan.waitingOn || undefined,
+    blockedReason: effectivePlan.blocker || undefined,
     evidence: changes,
-    learned: plan.learned || undefined,
+    completedChecklistIds,
+    learned: effectivePlan.learned || undefined,
     dispatchId,
     recordedAt: timestamp,
   }
@@ -234,7 +275,7 @@ export function applyAgentTaskExecutionPlan(input: {
       type: 'updated' as const,
       message: changes.length > 0
         ? `Agent ${agentId} applied task-scoped changes: ${changes.join(', ')}.`
-        : `Agent ${agentId} reported ${plan.status} without changing a task artifact.`,
+        : `Agent ${agentId} reported ${effectivePlan.status} without changing a task artifact.`,
       timestamp,
       actor: agentId,
       taskId: task.id,
@@ -244,11 +285,11 @@ export function applyAgentTaskExecutionPlan(input: {
   const nextTask = applyCanonicalWorkItem({
     ...task,
     desc: description,
-    checklist: [...existingChecklist, ...addedChecklist],
+    checklist,
     activity,
     execution: {
       ...(task.execution || {}),
-      executionStatus: plan.status,
+      executionStatus: effectivePlan.status,
       lastUpdatedAt: timestamp,
       latestExecutionNote: note,
       lastResult,
@@ -257,7 +298,7 @@ export function applyAgentTaskExecutionPlan(input: {
   })
   return {
     task: nextTask,
-    evidence: evidenceFromPlan(plan, changes),
+    evidence: evidenceFromPlan(effectivePlan, changes, completedChecklistIds),
   }
 }
 
@@ -299,11 +340,16 @@ export function readPersistedAgentTaskExecutionEvidence(
   return {
     status,
     summary,
+    deliverable: cleanText(record.deliverable, 10_000),
     nextAction,
     waitingOn: cleanText(record.waitingOn, 500),
     blocker: cleanText(record.blockedReason, 500),
     changes: (Array.isArray(record.evidence) ? record.evidence : [])
       .map((change) => cleanText(change, 240))
+      .filter(Boolean)
+      .slice(0, 20),
+    completedChecklistIds: (Array.isArray(record.completedChecklistIds) ? record.completedChecklistIds : [])
+      .map((id) => cleanText(id, 240))
       .filter(Boolean)
       .slice(0, 20),
     learned: cleanText(record.learned, 280),
@@ -351,7 +397,8 @@ export function formatAgentTaskExecutionResult(agentId: string, evidence: AgentT
     `Status: ${evidence.status}`,
     '',
     `Summary: ${evidence.summary}`,
-    `Changed: ${evidence.changes.length > 0 ? evidence.changes.join('; ') : 'No deliverable changed.'}`,
+    evidence.deliverable ? `Deliverable:\n${evidence.deliverable}` : 'Deliverable: No substantive deliverable was produced.',
+    `Changed: ${evidence.changes.length > 0 ? evidence.changes.join('; ') : 'No task artifact changed.'}`,
     `Evidence: ${evidence.changes.length > 0 ? evidence.changes.join('; ') : 'No persisted task mutation.'}`,
     `Remaining: ${evidence.nextAction}`,
     `Waiting on: ${evidence.blocker || evidence.waitingOn || 'none'}`,

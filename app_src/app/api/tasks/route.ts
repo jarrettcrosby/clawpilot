@@ -1021,7 +1021,7 @@ export async function PATCH(req: NextRequest) {
       const previousDispatchStatus = execution.agentDispatch.status
       const error = String(_agentDispatchState.error || '').trim().slice(0, 1000) || undefined
       const semanticStatus = String(execution.executionStatus || '') as ExecutionStatus
-      const preservedSuccessStatus = ['triaged', 'responded', 'blocked', 'awaiting_input', 'completed'].includes(semanticStatus)
+      const preservedSuccessStatus = ['running', 'triaged', 'responded', 'blocked', 'awaiting_input', 'completed'].includes(semanticStatus)
         ? semanticStatus
         : 'responded'
       const executionStatus = dispatchStatus === 'running'

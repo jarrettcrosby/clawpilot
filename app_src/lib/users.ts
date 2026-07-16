@@ -65,6 +65,8 @@ export type AppUser = {
   jobTitle: string | null
   organizationId: string | null
   organizationName: string | null
+  suiteCrmUserId: string | null
+  suiteCrmUsername: string | null
   timezone: string
   locale: string
   permissions: AppUserPermissions
@@ -92,6 +94,8 @@ type AppUserRow = {
   job_title: string | null
   organization_id: string | null
   organization_name: string | null
+  suitecrm_user_id: string | null
+  suitecrm_username: string | null
   timezone: string
   locale: string
   permissions: unknown
@@ -195,6 +199,8 @@ function toAppUser(row: AppUserRow): AppUser {
     jobTitle: row.job_title,
     organizationId: row.organization_id,
     organizationName: row.organization_name,
+    suiteCrmUserId: row.suitecrm_user_id,
+    suiteCrmUsername: row.suitecrm_username,
     timezone: row.timezone || 'America/New_York',
     locale: row.locale || 'en-US',
     permissions: permissionsForRole(row.role, row.permissions),
@@ -443,6 +449,58 @@ export async function setAppUserStatus(input: {
     return result.rows[0]
   })
   return toAppUser(row)
+}
+
+export async function updateAppUserSuiteCrmMapping(input: {
+  actorEmail: unknown
+  email: unknown
+  suiteCrmUserId: unknown
+  suiteCrmUsername: unknown
+}): Promise<AppUser> {
+  const actor = await requireActiveAppUser(input.actorEmail)
+  if (!canManageUserAccess(actor)) {
+    throw new AppUserAuthorizationError('You do not have permission to manage CRM user mappings')
+  }
+  const email = normalizeUserEmail(input.email)
+  const target = await getAppUser(email)
+  if (!target) throw new AppUserNotFoundError()
+  await requireOrganizationInActorScope(actor, target.organizationId)
+  if (target.role === 'owner' && target.email !== actor.email) {
+    throw new AppUserAuthorizationError('Only the owner can update the owner CRM mapping')
+  }
+  if (actor.role !== 'owner' && target.role === 'admin' && target.email !== actor.email) {
+    throw new AppUserAuthorizationError('Only the owner can update another administrator CRM mapping')
+  }
+  const suiteCrmUserId = String(input.suiteCrmUserId || '').trim().toLowerCase()
+  const suiteCrmUsername = String(input.suiteCrmUsername || '').trim()
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(suiteCrmUserId)) {
+    throw new Error('SuiteCRM user ID is invalid')
+  }
+  if (!/^[A-Za-z0-9._@+-]{1,128}$/.test(suiteCrmUsername)) {
+    throw new Error('SuiteCRM username is invalid')
+  }
+  return withTransaction(async (client) => {
+    const result = await client.query<AppUserRow>(
+      `UPDATE app_users
+       SET suitecrm_user_id = $2,
+           suitecrm_username = $3,
+           updated_at = now()
+       WHERE email = $1
+       RETURNING *`,
+      [email, suiteCrmUserId, suiteCrmUsername],
+    )
+    if (!result.rows[0]) throw new AppUserNotFoundError()
+    await recordAuditEvent({
+      actor: actor.email,
+      eventType: 'user.crm_mapping.updated',
+      aggregateType: 'app_user',
+      aggregateId: email,
+      subject: target.displayName || email,
+      organizationId: target.organizationId,
+      payload: { suiteCrmUsername },
+    }, client)
+    return toAppUser(result.rows[0])
+  })
 }
 
 function cleanOptionalText(value: unknown, maxLength: number): string | null {

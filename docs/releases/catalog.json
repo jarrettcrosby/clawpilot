@@ -3,8 +3,8 @@
   "releases": {
     "default": {
       "oncePerEnvironment": true,
-      "title": "CRM opportunity workflow and truthful agent execution",
-      "summary": "Pipeline editors can now create CRM-backed opportunities from existing or newly added customer organizations, while agent dispatches preserve full task context and report only persisted evidence, specific blockers, or required input.",
+      "title": "Iterative agents and exact CRM relationships",
+      "summary": "Agents can now continue bounded checklist work into a concrete research or design deliverable, while CRM opportunities and interactions preserve exact account, contact, user, and navigation relationships across ClawPilot, SuiteCRM, and pipeline reporting.",
       "features": [
         "A New opportunity workflow available to pipeline owners and editors",
         "Tenant-scoped selection of existing CRM customer organizations",
@@ -13,7 +13,10 @@
         "Immediate CRM-backed opportunity visibility while SuiteCRM and workbook synchronization continues",
         "Expected close date and notes fields during opportunity creation",
         "Visible pending and failed CRM synchronization counts",
-        "Structured autonomous agent triage that can repair task context, add acceptance steps, set a next action, and record a specific blocker"
+        "Bounded autonomous agent continuations that produce a persisted research or design deliverable and complete only evidenced checklist work",
+        "Exact many-to-many Contact relationships for Opportunities in ClawPilot and SuiteCRM",
+        "Organization-scoped Contact, controlled Type, and active ClawPilot Agent selectors for interactions",
+        "Administrator mapping from ClawPilot users to native SuiteCRM users"
       ],
       "fixes": [
         "Preserves meaningful card descriptions up to 10,000 characters instead of replacing detailed scope with generic text",
@@ -26,7 +29,12 @@
         "Displays persisted expected-close dates correctly when PostgreSQL returns date columns as JavaScript Date values",
         "Persists product changes made from the opportunity drawer",
         "Preserves blocked, awaiting-input, and triaged agent outcomes across worker retries and ignores stale dispatch results",
-        "Removes direct guessed Google Sheet row writes from opportunity creation and editing"
+        "Removes direct guessed Google Sheet row writes from opportunity creation and editing",
+        "Propagates Organization renames to pipeline opportunities and generated workbook projections through the canonical Organization relationship",
+        "Writes interaction Account and Contact relationships to SuiteCRM History while assigning the mapped native CRM user",
+        "Preserves past interaction dates through SuiteCRM synchronization by separating the Occurred At business timestamp from the Note creation timestamp",
+        "Opens Activity targets in the event's owning board or pipeline instead of the currently selected workspace resource",
+        "Keeps local development usable when hosted browser-session authentication is disabled"
       ]
     }
   }
