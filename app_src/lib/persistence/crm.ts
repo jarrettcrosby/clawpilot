@@ -1855,6 +1855,21 @@ export async function listCrmRecordsInPostgres(input: {
   return result.rows.map(interactionFromRow)
 }
 
+export async function readCrmOpportunityInPostgres(input: {
+  pipelineId: string
+  id: string
+}): Promise<CrmOpportunity> {
+  const result = await query<Record<string, unknown>>(
+    `SELECT * FROM crm_opportunities
+     WHERE pipeline_id = $1::uuid AND id = $2::uuid
+     LIMIT 1`,
+    [input.pipelineId, input.id],
+  )
+  const row = result.rows[0]
+  if (!row) throw new Error('Opportunity not found')
+  return opportunityFromRow(row)
+}
+
 export async function readCrmSummaryFromPostgres(pipelineId: string): Promise<CrmSummary> {
   const result = await query<Record<string, string>>(
     `

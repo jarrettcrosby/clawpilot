@@ -379,20 +379,18 @@ function deriveMissingActionableFields(task: Partial<Task>): string[] {
 }
 
 function shortDesc(v: unknown): string {
-  const s = String(v || '').trim()
-  if (!s) return ''
-
-  // collapse noisy repeated characters (e.g., xxxxxxxxx...) and whitespace
-  const compact = s
-    .replace(/\s+/g, ' ')
-    .replace(/(.)\1{12,}/g, '$1$1$1$1$1')
+  const normalized = String(v || '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '')
     .trim()
+  if (!normalized) return ''
 
-  // if content still looks like a raw dump, provide a clean UX-safe summary
-  const noisy = compact.length > 280 || /directive body/i.test(compact) || /(x){20,}/i.test(compact)
-  if (noisy) return 'Task created from directive. See checklist/comments for execution details.'
+  const withoutWhitespace = normalized.replace(/\s+/g, '')
+  const repeatedNoise = withoutWhitespace.length >= 80
+    && (/^(.)\1+$/.test(withoutWhitespace) || new Set(withoutWhitespace.toLowerCase()).size <= 2)
+  if (repeatedNoise) return 'Task created from directive. See checklist/comments for execution details.'
 
-  return compact.length > 180 ? `${compact.slice(0, 177)}...` : compact
+  return normalized.slice(0, 10_000)
 }
 
 function normalizeChecklist(input: unknown): ChecklistItem[] {
@@ -1022,10 +1020,14 @@ export async function PATCH(req: NextRequest) {
     if (dispatchStatus && ['queued', 'running', 'succeeded', 'failed'].includes(dispatchStatus)) {
       const previousDispatchStatus = execution.agentDispatch.status
       const error = String(_agentDispatchState.error || '').trim().slice(0, 1000) || undefined
+      const semanticStatus = String(execution.executionStatus || '') as ExecutionStatus
+      const preservedSuccessStatus = ['triaged', 'responded', 'blocked', 'awaiting_input', 'completed'].includes(semanticStatus)
+        ? semanticStatus
+        : 'responded'
       const executionStatus = dispatchStatus === 'running'
         ? 'running'
         : dispatchStatus === 'succeeded'
-          ? 'completed'
+          ? preservedSuccessStatus
           : dispatchStatus === 'failed'
             ? 'blocked'
             : 'queued'
@@ -1035,7 +1037,9 @@ export async function PATCH(req: NextRequest) {
           ? `Agent run failed: ${error || 'Unknown execution error'}`
           : dispatchStatus === 'queued' && error
             ? `Agent run retry scheduled: ${error}`
-            : undefined
+            : dispatchStatus === 'succeeded' && !execution.latestExecutionNote
+              ? 'Agent response recorded; no completion evidence was reported.'
+              : undefined
       execution = {
         ...execution,
         executionStatus,

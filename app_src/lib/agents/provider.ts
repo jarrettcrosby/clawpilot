@@ -116,6 +116,7 @@ type AgentTurnInput = {
   taskContext: string
   userText: string
   conversation?: Array<{ role: string; text: string }>
+  mode?: 'conversation' | 'task-execution'
 }
 
 export function stableAgentProfileId(operatorId: string, agentId: ProductAgentId): string {
@@ -132,14 +133,27 @@ function buildAgentPrompt(input: AgentTurnInput): string {
     .slice(-8)
     .map((message) => `${message.role}: ${message.text}`)
     .join('\n')
-  return [
+  const context = [
     `Task context:\n${input.taskContext}`,
     history ? `Recent task thread:\n${history}` : null,
     `Operator request:\n${input.userText}`,
+  ].filter(Boolean)
+  if (input.mode === 'task-execution') {
+    return [
+      ...context,
+      'This is an autonomous task dispatch with a deliberately bounded toolset. You may only propose a repair for a missing/generic description, add checklist items, set the next action, or record a blocker/input request. You cannot edit repository files, create a Git branch or pull request, deploy code, browse the web, send email, schedule calendar events, change CRM records, or claim any other external action in this run.',
+      'Return exactly one JSON object with keys: status, summary, nextAction, waitingOn, blocker, descriptionUpdate, checklistAdd, learned.',
+      'status must be triaged, awaiting_input, or blocked. Use blocked when completing the requested deliverable requires any unavailable capability. Use awaiting_input only when one specific operator decision or datum is required. Use triaged only when task-scoped planning or context repair is itself meaningful progress.',
+      'checklistAdd must be an array of concise strings. Use empty strings and an empty array when a field does not apply. learned must be one generic reusable operating lesson or "none" and must exclude names, organizations, emails, IDs, URLs, customer data, and task-specific facts.',
+      'Do not wrap the JSON in Markdown. Do not report a planned or suggested action as completed work.',
+    ].join('\n\n')
+  }
+  return [
+    ...context,
     'Reply using exactly these headings: Changed, Remaining, Waiting on, Learned.',
     'Learned must contain one reusable operating lesson from this work, or "none". Keep it generic and exclude names, organizations, emails, IDs, URLs, customer data, and task-specific facts.',
     'Use "none" when there is no blocker. Do not claim an external action unless the supplied context proves it occurred.',
-  ].filter(Boolean).join('\n\n')
+  ].join('\n\n')
 }
 
 export async function runOpenAIAgent(input: AgentTurnInput): Promise<string> {

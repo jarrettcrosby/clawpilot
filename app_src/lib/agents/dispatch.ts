@@ -11,7 +11,7 @@ const AGENT_NAMES: Record<string, string> = {
 }
 
 export function assignmentKickoffText() {
-  return 'This task was just assigned to you. Review the task context and identify the next concrete step. Do not claim work that has not been completed.'
+  return 'This task was assigned to you for autonomous execution. Use the available task-scoped tools now, persist concrete changes, and record evidence. If the requested deliverable requires a capability that is not available in this run, record that exact blocker instead of reporting the work as complete.'
 }
 
 export function commentTargetsAssignedAgent(text: string, agentId: string): boolean {

@@ -7,6 +7,7 @@ import {
   isPostgresPipelineStoreEnabled,
   readPipelineSyncDiagnosticsFromPostgres,
 } from '@/lib/persistence/pipeline'
+import { readCrmSummaryFromPostgres } from '@/lib/persistence/crm'
 import { requireRequestUser } from '@/lib/requestUser'
 import {
   PIPELINE_SELECTION_COOKIE,
@@ -31,20 +32,35 @@ export async function GET(req: NextRequest) {
         const pipeline = await resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: selected })
           .catch(() => resolvePipelineSpaceAccess({ actorEmail: actor.email }))
         selectedPipeline = pipeline
-        const projection = await readPipelineProjectionForSpace(pipeline)
-        const diagnostics = pipeline.syncEnabled
-          ? await readPipelineSyncDiagnosticsFromPostgres({
-              ...requirePipelineSheetContext(pipeline),
-              includeLegacyOwnerItems: isLegacyOwnerSheetPipeline(pipeline),
-            })
-          : { outbox: {}, oldestPendingAt: null }
+        const [projection, diagnostics, crmSummary] = await Promise.all([
+          readPipelineProjectionForSpace(pipeline),
+          pipeline.syncEnabled
+            ? readPipelineSyncDiagnosticsFromPostgres({
+                ...requirePipelineSheetContext(pipeline),
+                includeLegacyOwnerItems: isLegacyOwnerSheetPipeline(pipeline),
+              })
+            : Promise.resolve({ outbox: {}, oldestPendingAt: null }),
+          readCrmSummaryFromPostgres(pipeline.id),
+        ])
 
         logPipelineEvent({ module: 'pipeline-sync', action: 'status', result: 'ok', actor: actor.email, pipelineId: pipeline.id })
         return NextResponse.json({
           ok: true,
           syncedAt: projection?.syncedAt || null,
-          summary: projection?.summary || null,
-          diagnostics,
+          summary: {
+            ...(projection?.summary || {}),
+            opportunities: crmSummary.opportunities,
+            organizations: crmSummary.organizations,
+            contacts: crmSummary.contacts,
+            totalOpenValue: crmSummary.openPipelineValue,
+            weightedPipelineValue: crmSummary.weightedPipelineValue,
+            pendingSync: crmSummary.pendingSync,
+            failedSync: crmSummary.failedSync,
+          },
+          diagnostics: {
+            ...diagnostics,
+            crm: { pending: crmSummary.pendingSync, failed: crmSummary.failedSync },
+          },
           storage: 'postgres',
           pipeline: { id: pipeline.id, name: pipeline.name, accessRole: pipeline.accessRole, syncEnabled: pipeline.syncEnabled },
         })

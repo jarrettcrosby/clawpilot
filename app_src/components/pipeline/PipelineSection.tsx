@@ -50,7 +50,15 @@ type Contact = {
 type SyncSurface = {
   state: 'unknown' | 'syncing' | 'ok' | 'error'
   lastSyncedAt: string | null
-  summary?: { opportunities?: number; organizations?: number; contacts?: number; totalOpenValue?: number } | null
+  summary?: {
+    opportunities?: number
+    organizations?: number
+    contacts?: number
+    totalOpenValue?: number
+    weightedPipelineValue?: number
+    pendingSync?: number
+    failedSync?: number
+  } | null
   error?: string
   feedback?: string
 }
@@ -81,6 +89,25 @@ type Deal = {
 type LooseRecord = Record<string, unknown>
 type DropdownOption = { active?: boolean; sort_order?: number; label?: string; value?: string }
 type PipelineProvisioningStatus = 'not_requested' | 'queued' | 'provisioning' | 'ready' | 'failed'
+type OrganizationOption = {
+  id: string
+  name: string
+  referenceCode: string
+  email: string
+  phone: string
+  relationshipType: string
+}
+
+const EMPTY_OPPORTUNITY = {
+  organizationId: '',
+  name: '',
+  priority: 'C',
+  stage: 'Identified Lead',
+  value: '',
+  probability: '',
+  expectedClose: '',
+  notes: '',
+}
 
 function pipelineMutationKey() {
   return globalThis.crypto?.randomUUID?.() || `pipeline-${Date.now()}-${Math.random().toString(16).slice(2)}`
@@ -592,8 +619,14 @@ export default function PipelineSection() {
   const [newOpportunityOpen, setNewOpportunityOpen] = useState(false)
   const [creatingOpportunity, setCreatingOpportunity] = useState(false)
   const [newOpportunityError, setNewOpportunityError] = useState('')
-  const [newOpportunity, setNewOpportunity] = useState({ organization: '', name: '', priority: 'C', stage: 'Identified Lead', value: '', probability: '' })
-  const canEdit = pipelineAccess !== 'viewer'
+  const [newOpportunity, setNewOpportunity] = useState(EMPTY_OPPORTUNITY)
+  const [newOpportunityMutationKey, setNewOpportunityMutationKey] = useState('')
+  const [organizations, setOrganizations] = useState<OrganizationOption[]>([])
+  const [organizationsLoading, setOrganizationsLoading] = useState(false)
+  const [newOrganizationOpen, setNewOrganizationOpen] = useState(false)
+  const [creatingOrganization, setCreatingOrganization] = useState(false)
+  const [newOrganization, setNewOrganization] = useState({ name: '', email: '', phone: '', description: '' })
+  const canEdit = pipelineAccess === 'owner' || pipelineAccess === 'editor'
 
   const load = async () => {
     const data = await fetch('/api/pipeline').then(r => r.json())
@@ -645,11 +678,14 @@ export default function PipelineSection() {
         return
       }
 
+      const pendingSync = Number(out?.summary?.pendingSync || 0)
+      const failedSync = Number(out?.summary?.failedSync || 0)
       setSyncSurface({
-        state: 'ok',
+        state: failedSync > 0 ? 'error' : pendingSync > 0 ? 'syncing' : 'ok',
         lastSyncedAt: out?.syncedAt || null,
         summary: out?.summary || null,
-        feedback: undefined,
+        error: failedSync > 0 ? `${failedSync} CRM record${failedSync === 1 ? '' : 's'} failed to synchronize.` : undefined,
+        feedback: pendingSync > 0 ? `${pendingSync} CRM record${pendingSync === 1 ? '' : 's'} synchronizing.` : undefined,
       })
     } catch (error: unknown) {
       setSyncSurface({
@@ -746,6 +782,11 @@ export default function PipelineSection() {
     if (!stageOptions.includes(activeStage)) setActiveStage(stageOptions[0])
   }, [stageOptions, activeStage])
 
+  useEffect(() => {
+    if (!newOpportunityOpen || organizations.length > 0 || organizationsLoading) return
+    void loadOrganizations()
+  }, [newOpportunityOpen, organizations.length, organizationsLoading])
+
   const filtered = useMemo(() => {
     const scoped = filterStatus === 'open'
       ? deals.filter(d => (d.status || '').toLowerCase() === 'open')
@@ -822,31 +863,96 @@ export default function PipelineSection() {
   }
 
   const createOpportunity = async () => {
-    if (!newOpportunity.organization.trim() || !newOpportunity.name.trim() || creatingOpportunity) return
+    if (!newOpportunity.organizationId || !newOpportunity.name.trim() || creatingOpportunity) return
     setCreatingOpportunity(true)
     setNewOpportunityError('')
     try {
       const response = await fetch('/api/pipeline', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': newOpportunityMutationKey || pipelineMutationKey(),
+        },
         body: JSON.stringify({
-          organization: newOpportunity.organization.trim(),
+          organizationId: newOpportunity.organizationId,
           name: newOpportunity.name.trim(),
           priority: newOpportunity.priority,
           stage: newOpportunity.stage,
           value: Number(newOpportunity.value || 0),
           probability: Number(newOpportunity.probability || 0),
+          expectedClose: newOpportunity.expectedClose,
+          notes: newOpportunity.notes.trim(),
         }),
       })
       const result = await response.json().catch(() => ({}))
       if (!response.ok || !result.ok) throw new Error(result.error || 'Unable to create opportunity')
       await load()
-      setNewOpportunity({ organization: '', name: '', priority: 'C', stage: 'Identified Lead', value: '', probability: '' })
+      setNewOpportunity(EMPTY_OPPORTUNITY)
+      setNewOpportunityMutationKey('')
       setNewOpportunityOpen(false)
     } catch (createError) {
       setNewOpportunityError(createError instanceof Error ? createError.message : 'Unable to create opportunity')
     } finally {
       setCreatingOpportunity(false)
+    }
+  }
+
+  const loadOrganizations = async (preferredId?: string) => {
+    setOrganizationsLoading(true)
+    try {
+      const response = await fetch('/api/crm?entity=organizations&limit=500')
+      const result = await response.json().catch(() => ({}))
+      if (!response.ok || !result.ok) throw new Error(result.error || 'Unable to load organizations')
+      const nextOrganizations = (Array.isArray(result.records) ? result.records : [])
+        .map((record: LooseRecord) => ({
+          id: String(record.id || ''),
+          name: String(record.name || ''),
+          referenceCode: String(record.referenceCode || ''),
+          email: String(record.email || ''),
+          phone: String(record.phone || ''),
+          relationshipType: String(record.relationshipType || ''),
+        }))
+        .filter((record: OrganizationOption) => record.id && record.name && record.relationshipType === 'customer')
+        .sort((left: OrganizationOption, right: OrganizationOption) => left.name.localeCompare(right.name))
+      setOrganizations(nextOrganizations)
+      if (preferredId && nextOrganizations.some((record: OrganizationOption) => record.id === preferredId)) {
+        setNewOpportunity((current) => ({ ...current, organizationId: preferredId }))
+      }
+    } catch (organizationError) {
+      setNewOpportunityError(organizationError instanceof Error ? organizationError.message : 'Unable to load organizations')
+    } finally {
+      setOrganizationsLoading(false)
+    }
+  }
+
+  const createOrganization = async () => {
+    if (!newOrganization.name.trim() || creatingOrganization) return
+    setCreatingOrganization(true)
+    setNewOpportunityError('')
+    try {
+      const response = await fetch('/api/crm', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          entity: 'organizations',
+          fields: {
+            name: newOrganization.name.trim(),
+            email: newOrganization.email.trim(),
+            phone: newOrganization.phone.trim(),
+            description: newOrganization.description.trim(),
+          },
+        }),
+      })
+      const result = await response.json().catch(() => ({}))
+      if (!response.ok || !result.ok) throw new Error(result.error || 'Unable to create organization')
+      const createdId = String(result.record?.id || '')
+      await loadOrganizations(createdId)
+      setNewOrganization({ name: '', email: '', phone: '', description: '' })
+      setNewOrganizationOpen(false)
+    } catch (organizationError) {
+      setNewOpportunityError(organizationError instanceof Error ? organizationError.message : 'Unable to create organization')
+    } finally {
+      setCreatingOrganization(false)
     }
   }
 
@@ -983,8 +1089,18 @@ export default function PipelineSection() {
                       : 'Create Sheet'}
               </Button>
             ) : null}
-            {!pipelineSyncEnabled && canEdit ? (
-              <Button variant="contained" size="small" startIcon={<AddRounded />} onClick={() => setNewOpportunityOpen(true)} sx={{ minHeight: 38, whiteSpace: 'nowrap' }}>
+            {canEdit ? (
+              <Button
+                variant="contained"
+                size="small"
+                startIcon={<AddRounded />}
+                onClick={() => {
+                  setNewOpportunityMutationKey(pipelineMutationKey())
+                  setNewOpportunityError('')
+                  setNewOpportunityOpen(true)
+                }}
+                sx={{ minHeight: 38, whiteSpace: 'nowrap' }}
+              >
                 New opportunity
               </Button>
             ) : null}
@@ -1132,7 +1248,48 @@ export default function PipelineSection() {
         <DialogContent>
           {newOpportunityError ? <Alert severity="error" sx={{ mb: 2 }}>{newOpportunityError}</Alert> : null}
           <Stack spacing={1.5} mt={0.5}>
-            <TextField autoFocus label="Organization" value={newOpportunity.organization} onChange={(event) => setNewOpportunity((current) => ({ ...current, organization: event.target.value }))} />
+            <Autocomplete
+              options={organizations}
+              loading={organizationsLoading}
+              value={organizations.find((organization) => organization.id === newOpportunity.organizationId) || null}
+              getOptionLabel={(organization) => organization.name}
+              isOptionEqualToValue={(option, value) => option.id === value.id}
+              onChange={(_, organization) => setNewOpportunity((current) => ({ ...current, organizationId: organization?.id || '' }))}
+              renderOption={(props, organization) => (
+                <Box component="li" {...props} key={organization.id}>
+                  <Box sx={{ minWidth: 0 }}>
+                    <Typography variant="body2" noWrap>{organization.name}</Typography>
+                    <Typography variant="caption" color="text.secondary">{organization.referenceCode || organization.email || organization.phone}</Typography>
+                  </Box>
+                </Box>
+              )}
+              renderInput={(params) => <TextField {...params} autoFocus required label="Organization" helperText="Select an organization already in CRM" />}
+            />
+            <Button
+              variant="text"
+              size="small"
+              startIcon={<AddRounded />}
+              onClick={() => setNewOrganizationOpen((open) => !open)}
+              sx={{ alignSelf: 'flex-start' }}
+            >
+              {newOrganizationOpen ? 'Cancel new organization' : 'Add organization'}
+            </Button>
+            {newOrganizationOpen ? (
+              <Box sx={{ border: '1px solid rgba(255,255,255,0.1)', borderRadius: 1, p: 1.5 }}>
+                <Stack spacing={1.5}>
+                  <Typography variant="subtitle2">New CRM organization</Typography>
+                  <TextField required label="Organization name" value={newOrganization.name} onChange={(event) => setNewOrganization((current) => ({ ...current, name: event.target.value }))} />
+                  <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.5}>
+                    <TextField fullWidth label="Primary email" type="email" value={newOrganization.email} onChange={(event) => setNewOrganization((current) => ({ ...current, email: event.target.value }))} />
+                    <TextField fullWidth label="Phone" value={newOrganization.phone} onChange={(event) => setNewOrganization((current) => ({ ...current, phone: event.target.value }))} />
+                  </Stack>
+                  <TextField multiline minRows={2} label="Description" value={newOrganization.description} onChange={(event) => setNewOrganization((current) => ({ ...current, description: event.target.value }))} />
+                  <Button variant="outlined" onClick={() => { void createOrganization() }} disabled={creatingOrganization || !newOrganization.name.trim()}>
+                    {creatingOrganization ? 'Adding...' : 'Add to CRM'}
+                  </Button>
+                </Stack>
+              </Box>
+            ) : null}
             <TextField label="Opportunity" value={newOpportunity.name} onChange={(event) => setNewOpportunity((current) => ({ ...current, name: event.target.value }))} />
             <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.5}>
               <TextField select fullWidth label="Priority" value={newOpportunity.priority} onChange={(event) => setNewOpportunity((current) => ({ ...current, priority: event.target.value }))}>
@@ -1146,11 +1303,23 @@ export default function PipelineSection() {
               <TextField fullWidth label="Value" inputMode="decimal" value={newOpportunity.value} onChange={(event) => setNewOpportunity((current) => ({ ...current, value: event.target.value.replace(/[^0-9.]/g, '') }))} />
               <TextField fullWidth label="Probability" inputMode="decimal" value={newOpportunity.probability} onChange={(event) => setNewOpportunity((current) => ({ ...current, probability: event.target.value.replace(/[^0-9.]/g, '') }))} />
             </Stack>
+            <TextField
+              fullWidth
+              type="date"
+              label="Expected close"
+              value={newOpportunity.expectedClose}
+              onChange={(event) => setNewOpportunity((current) => ({ ...current, expectedClose: event.target.value }))}
+              slotProps={{ inputLabel: { shrink: true } }}
+            />
+            <TextField multiline minRows={3} label="Notes" value={newOpportunity.notes} onChange={(event) => setNewOpportunity((current) => ({ ...current, notes: event.target.value }))} />
           </Stack>
         </DialogContent>
         <DialogActions sx={{ px: 3, pb: 2 }}>
-          <Button onClick={() => setNewOpportunityOpen(false)} disabled={creatingOpportunity}>Cancel</Button>
-          <Button variant="contained" onClick={createOpportunity} disabled={creatingOpportunity || !newOpportunity.organization.trim() || !newOpportunity.name.trim()}>
+          <Button onClick={() => {
+            setNewOpportunityOpen(false)
+            setNewOpportunityMutationKey('')
+          }} disabled={creatingOpportunity}>Cancel</Button>
+          <Button variant="contained" onClick={createOpportunity} disabled={creatingOpportunity || !newOpportunity.organizationId || !newOpportunity.name.trim()}>
             {creatingOpportunity ? 'Creating...' : 'Create'}
           </Button>
         </DialogActions>
