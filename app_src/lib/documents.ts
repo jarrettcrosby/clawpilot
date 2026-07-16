@@ -2,9 +2,11 @@ import crypto from 'crypto'
 import fs from 'fs/promises'
 import path from 'path'
 import matter from 'gray-matter'
+import type { PoolClient } from 'pg'
 import { listAiRadarItems } from '@/lib/aiRadar'
+import { buildAgentTaskDocument } from '@/lib/agents/taskDocument'
 import { embedSearchQuery } from '@/lib/documentEmbeddings'
-import { query } from '@/lib/persistence/postgres'
+import { query, withTransaction } from '@/lib/persistence/postgres'
 import { MEMBER_RELEASE_HISTORY_DAYS, releaseAccessFor } from '@/lib/releases'
 import {
   readPipelineProjectionForSpace,
@@ -146,11 +148,10 @@ async function upsertDocument(input: {
   boardId?: string | null
   pipelineId?: string | null
   generatedAt?: string | null
-}): Promise<string | null> {
+}, client?: PoolClient): Promise<string | null> {
   const content = input.content.trim()
   const contentHash = sha256(content)
-  const result = await query<{ document_id: string }>(
-    `
+  const sql = `
       WITH changed_document AS (
         INSERT INTO app_documents (
           owner_email, source_key, source, kind, status, title, slug, category,
@@ -206,27 +207,135 @@ async function upsertDocument(input: {
         last_error = NULL,
         updated_at = now()
       RETURNING document_id::text
-    `,
-    [
-      input.ownerEmail,
-      input.sourceKey,
-      input.source,
-      input.kind,
-      input.status,
-      input.title,
-      input.slug,
-      input.category,
-      content,
-      excerptFor(content),
-      input.tags,
-      input.sourcePath || null,
-      contentHash,
-      input.boardId || null,
-      input.pipelineId || null,
-      input.generatedAt || null,
-    ],
-  )
+    `
+  const parameters = [
+    input.ownerEmail,
+    input.sourceKey,
+    input.source,
+    input.kind,
+    input.status,
+    input.title,
+    input.slug,
+    input.category,
+    content,
+    excerptFor(content),
+    input.tags,
+    input.sourcePath || null,
+    contentHash,
+    input.boardId || null,
+    input.pipelineId || null,
+    input.generatedAt || null,
+  ]
+  const result = client
+    ? await client.query<{ document_id: string }>(sql, parameters)
+    : await query<{ document_id: string }>(sql, parameters)
   return result.rows[0]?.document_id || null
+}
+
+export type AgentTaskDocumentReference = {
+  id: string
+  title: string
+  slug: string
+  url: string
+  created: boolean
+  appended: boolean
+}
+
+type ExistingAgentTaskDocumentRow = {
+  id: string
+  title: string
+  slug: string
+  content: string
+}
+
+export async function appendAgentTaskDocument(input: {
+  ownerEmail: string
+  boardId: string
+  taskId: string
+  taskTitle: string
+  agentId: string
+  resultId: string
+  status: string
+  summary: string
+  deliverable: string
+  changes: string[]
+  nextAction: string
+  waitingOn: string
+  recordedAt: string
+}): Promise<AgentTaskDocumentReference> {
+  const ownerEmail = normalizeUserEmail(input.ownerEmail)
+  const agentId = singleLine(input.agentId).toLowerCase() || 'agent'
+  const sourceKey = `agent-task:${input.taskId}:${agentId}`
+  const user = await getAppUser(ownerEmail)
+  const recordedAt = Number.isFinite(Date.parse(input.recordedAt))
+    ? new Date(input.recordedAt)
+    : new Date()
+  const displayTimestamp = new Intl.DateTimeFormat(user?.locale || 'en-US', {
+    timeZone: user?.timezone || 'UTC',
+    dateStyle: 'medium',
+    timeStyle: 'short',
+  }).format(recordedAt)
+  return withTransaction(async (client) => {
+    await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`${ownerEmail}:${sourceKey}`])
+    const existing = await client.query<ExistingAgentTaskDocumentRow>(
+      `
+        SELECT id::text, title, slug, content
+        FROM app_documents
+        WHERE owner_email = $1 AND source_key = $2
+        LIMIT 1
+      `,
+      [ownerEmail, sourceKey],
+    )
+    const current = existing.rows[0] || null
+    const built = buildAgentTaskDocument({
+      existingContent: current?.content,
+      taskId: input.taskId,
+      taskTitle: input.taskTitle,
+      boardId: input.boardId,
+      agentId,
+      resultId: input.resultId,
+      status: input.status,
+      summary: input.summary,
+      deliverable: input.deliverable,
+      changes: input.changes,
+      nextAction: input.nextAction,
+      waitingOn: input.waitingOn,
+      recordedAt: recordedAt.toISOString(),
+      displayTimestamp,
+    })
+    const slug = current?.slug || [
+      'agent',
+      safeSlug(input.taskTitle).slice(0, 100),
+      sha256(`${input.taskId}:${agentId}`).slice(0, 10),
+      safeSlug(agentId),
+    ].join('-')
+    let id = current?.id || null
+    if (built.appended || !current || current.title !== built.title) {
+      id = await upsertDocument({
+        ownerEmail,
+        sourceKey,
+        source: 'agent',
+        kind: 'agent-task-deliverable',
+        status: 'active',
+        title: built.title,
+        slug,
+        category: agentId === 'projects' ? 'projects' : agentId,
+        content: built.content,
+        tags: Array.from(new Set(['agent', 'task-linked', agentId, `task:${input.taskId}`])),
+        boardId: input.boardId,
+        generatedAt: recordedAt.toISOString(),
+      }, client) || id
+    }
+    if (!id) throw new Error('Agent task document could not be persisted')
+    return {
+      id,
+      title: built.title,
+      slug,
+      url: `/?doc=${encodeURIComponent(slug)}#docs`,
+      created: !current,
+      appended: built.appended,
+    }
+  })
 }
 
 export async function refreshUserBriefs(

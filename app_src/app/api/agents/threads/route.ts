@@ -22,6 +22,7 @@ import {
   type AgentTaskExecutionPlan,
 } from '@/lib/agents/taskExecution'
 import { isCrmBoardCard } from '@/lib/crm/boardCard.mjs'
+import { appendAgentTaskDocument, type AgentTaskDocumentReference } from '@/lib/documents'
 import { withFileLock } from '@/lib/fileLock'
 import type { Comment, Task } from '@/lib/types'
 import { buildCanonicalWorkItem, canonicalizeTasks } from '@/lib/workItemModel'
@@ -177,6 +178,35 @@ function deriveNextAction(summary: string): string {
   return firstRemaining?.replace(/^[-*]\s+/, '').trim() || 'Review the agent result and choose the next concrete step.'
 }
 
+function conciseAgentSummary(value: string) {
+  const firstContentLine = String(value || '')
+    .split(/\r?\n/)
+    .map((line) => line.replace(/^(?:summary|changed)\s*:\s*/i, '').trim())
+    .find(Boolean)
+  return String(firstContentLine || 'Agent work was recorded.').replace(/\s+/g, ' ').slice(0, 320)
+}
+
+function formatAgentDocumentComment(input: {
+  agentId: string
+  status: string
+  summary: string
+  changes: string[]
+  nextAction: string
+  waitingOn: string
+  document: AgentTaskDocumentReference
+}) {
+  return [
+    `Agent: ${input.agentId}`,
+    `Status: ${input.status}`,
+    '',
+    `${input.document.created ? 'Created' : 'Updated'} document: [${input.document.title}](${input.document.url})`,
+    `Summary: ${conciseAgentSummary(input.summary)}`,
+    `Changed: ${input.changes.length > 0 ? input.changes.join('; ') : 'Working document updated'}`,
+    `Remaining: ${input.nextAction}`,
+    `Waiting on: ${input.waitingOn || 'none'}`,
+  ].join('\n')
+}
+
 async function restorePersistedDispatchOutcome(input: {
   taskId: string
   agentId: string
@@ -231,9 +261,53 @@ async function recordAgentResult(input: {
   }
   const nextAction = evidence?.nextAction || deriveNextAction(resultSummary)
   const commentId = dispatchId ? `agent-dispatch-${dispatchId}` : Date.now().toString()
+  const substantiveDeliverable = evidence?.deliverable
+    || (!plan && (resultSummary.length >= 600 || resultSummary.split(/\r?\n/).length >= 10) ? resultSummary : '')
+  let document: AgentTaskDocumentReference | null = null
+  if (boardId && substantiveDeliverable && isPostgresTaskStoreEnabled()) {
+    try {
+      document = await appendAgentTaskDocument({
+        ownerEmail: operatorId,
+        boardId,
+        taskId,
+        taskTitle: task.title,
+        agentId,
+        resultId: dispatchId || commentId,
+        status: evidence?.status || 'responded',
+        summary: evidence?.summary || conciseAgentSummary(resultSummary),
+        deliverable: substantiveDeliverable,
+        changes: evidence?.changes || [],
+        nextAction,
+        waitingOn: evidence?.blocker || evidence?.waitingOn || '',
+        recordedAt: now,
+      })
+      const lastResult = task.execution?.lastResult
+      task = {
+        ...task,
+        execution: {
+          ...(task.execution || {}),
+          lastResult: lastResult && typeof lastResult === 'object' && !Array.isArray(lastResult)
+            ? { ...lastResult, document }
+            : lastResult,
+        },
+      }
+    } catch (error) {
+      console.error('[agent-threads] task document write failed; preserving full card comment', error)
+    }
+  }
   const comment: Comment = {
     id: commentId,
-    text: /^Agent\s*:/i.test(resultSummary) ? resultSummary : `Agent: ${agentId}\n\n${resultSummary}`,
+    text: document
+      ? formatAgentDocumentComment({
+          agentId,
+          status: evidence?.status || 'responded',
+          summary: evidence?.summary || resultSummary,
+          changes: evidence?.changes || [],
+          nextAction,
+          waitingOn: evidence?.blocker || evidence?.waitingOn || '',
+          document,
+        })
+      : /^Agent\s*:/i.test(resultSummary) ? resultSummary : `Agent: ${agentId}\n\n${resultSummary}`,
     createdAt: now,
     timestamp: now,
     author: agentId,
@@ -316,7 +390,7 @@ async function recordAgentResult(input: {
       continuationDepth: continuationDepth + 1,
       eventId: dispatchId,
       queuedAt: now,
-      text: `Continue autonomous execution. Produce the actual deliverable for the next unchecked checklist item, complete only that evidenced item, and stop for one specific operator decision if required. Next item: ${nextChecklistItem.text}`,
+      text: `Continue autonomous execution. Produce the actual deliverable for the next unchecked checklist item, complete only that evidenced item, and stop for one specific operator decision if required. Next checklist item ID: ${nextChecklistItem.id}. Next checklist item text: ${nextChecklistItem.text}. When the deliverable fully supports this item, checklistComplete must be exactly ["${nextChecklistItem.id}"]. Otherwise leave checklistComplete empty and use awaiting_input or blocked with one specific reason.`,
     })
     tasks[index] = prepared.task
     dispatches.push(prepared.dispatch)

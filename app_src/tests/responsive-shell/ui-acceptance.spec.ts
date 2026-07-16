@@ -203,6 +203,65 @@ test('dashboard links open their target section and selected document', async ({
   await expect(page.getByRole('heading', { name: 'Agents', exact: true, level: 5 })).toBeVisible()
 })
 
+test('agent card comments open the linked task working document', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 })
+  const documentTitle = 'QuickBooks Integration - Projects Research'
+  const documentSlug = 'agent-quickbooks-integration-test-projects'
+  await page.route((url) => url.pathname === '/api/workspaces', (route) => route.fulfill({
+    json: {
+      ok: true,
+      boards: [{ id: 'board-1', name: 'ClawPilot board', ownerEmail: 'test@example.com', accessRole: 'owner' }],
+      pipelines: [],
+      selectedBoardId: 'board-1',
+      selectedPipelineId: null,
+    },
+  }))
+  await page.route((url) => url.pathname === '/api/tasks', (route) => route.fulfill({
+    json: [{
+      id: 'agent-document-task',
+      title: 'QuickBooks Integration',
+      desc: 'Research the accounting integration.',
+      status: 'backlog',
+      priority: 'high',
+      category: 'clawpilot',
+      tags: ['research'],
+      assignedAgent: 'projects',
+      createdAt: '2026-07-16T12:00:00.000Z',
+      updatedAt: '2026-07-16T12:05:00.000Z',
+      activity: [],
+      comments: [{
+        id: 'agent-dispatch-test',
+        author: 'projects',
+        createdAt: '2026-07-16T12:05:00.000Z',
+        text: `Agent: projects\nStatus: running\n\nUpdated document: [${documentTitle}](/?doc=${documentSlug}#docs)\nSummary: Defined the accounting system of record.\nRemaining: Design synchronization.\nWaiting on: none`,
+      }],
+      checklist: [],
+    }],
+  }))
+  await page.route((url) => url.pathname === '/api/docs', (route) => route.fulfill({
+    json: [{
+      id: 'agent-document',
+      title: documentTitle,
+      category: 'projects',
+      date: '2026-07-16',
+      slug: documentSlug,
+      tags: ['agent', 'task-linked', 'projects'],
+      status: 'active',
+      source: 'agent',
+      content: '# QuickBooks Integration - Projects Research\n\n## Current status\n\nThe task-linked working document is open.',
+    }],
+  }))
+
+  await gotoApp(page, '/#projects')
+  await page.locator('#kanban-card-agent-document-task').click()
+  const documentLink = page.getByRole('link', { name: documentTitle })
+  await expect(documentLink).toBeVisible()
+  await documentLink.click()
+
+  await expect(page).toHaveURL(new RegExp(`\\?doc=${documentSlug}#docs$`))
+  await expect(page.getByText('The task-linked working document is open.')).toBeVisible()
+})
+
 test('responsive shell: 390x844 exposes compact navigation and dismissible drawers', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 })
   await gotoApp(page, '/#dashboard')

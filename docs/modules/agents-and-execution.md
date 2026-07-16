@@ -48,7 +48,9 @@ These are application roles, not separately created ChatGPT custom agents. Each 
 - Autonomous task work is a bounded continuation sequence rather than a single prose reply. Each successful step receives the prior persisted deliverable and checklist evidence, may complete at most one evidenced checklist item, and queues the next step only while concrete unchecked work remains. A task stops after eight continuations, on completion, on a specific operator decision, or on a real capability blocker.
 - Research and design work must persist the actual comparison, recommendation, specification, or decision brief as its deliverable. A summary that only says research should happen is not substantive progress and cannot complete a checklist item.
 - A substantive user-authored description is immutable to agent execution. Dispatch retries restore the already-persisted semantic result, and a stale dispatch cannot mutate a task after a newer assignment or comment has been queued.
-- The agent reply and the exact persisted mutations are appended to the task thread as evidence. A provider response with no mutation is reported as no deliverable changed.
+- Substantive research, comparison, design, and specification output is written to one task-and-agent working document. Each continuation prepends an idempotent, timestamped work-log entry to that same document; dispatch retries cannot duplicate an entry.
+- The card receives a concise agent comment with status, persisted changes, next action, waiting state, and a clickable link to the working document. Full deliverables remain in the agent thread, execution result, and working document instead of being split across long card comments.
+- The exact persisted task mutations are appended to the task thread as evidence. A provider response with no mutation is reported as no deliverable changed.
 - A concrete `nextAction` from the structured result becomes the task `nextAction`.
 - Every successful role response uses `Changed`, `Remaining`, `Waiting on`, and `Learned`. `Learned` contains one reusable operating lesson or `none`.
 - Users can only see tasks and threads on boards they can access.
@@ -77,6 +79,7 @@ The shared layer is deliberately an operating-principle layer, not a shared tran
 - `agent_dispatch_outbox`
 - `execution_runs`
 - `execution_results`
+- task-linked agent working documents in `app_documents`
 - `agent_context_memories`
 - `agent_context_memory_evidence`
 - encrypted per-user agent credential records in the credential database

@@ -16,7 +16,8 @@
         "Bounded autonomous agent continuations that produce a persisted research or design deliverable and complete only evidenced checklist work",
         "Exact many-to-many Contact relationships for Opportunities in ClawPilot and SuiteCRM",
         "Organization-scoped Contact, controlled Type, and active ClawPilot Agent selectors for interactions",
-        "Administrator mapping from ClawPilot users to native SuiteCRM users"
+        "Administrator mapping from ClawPilot users to native SuiteCRM users",
+        "Task-linked agent working documents that consolidate research and design output behind concise card-comment links"
       ],
       "fixes": [
         "Preserves meaningful card descriptions up to 10,000 characters instead of replacing detailed scope with generic text",
@@ -34,7 +35,8 @@
         "Writes interaction Account and Contact relationships to SuiteCRM History while assigning the mapped native CRM user",
         "Preserves past interaction dates through SuiteCRM synchronization by separating the Occurred At business timestamp from the Note creation timestamp",
         "Opens Activity targets in the event's owning board or pipeline instead of the currently selected workspace resource",
-        "Keeps local development usable when hosted browser-session authentication is disabled"
+        "Keeps local development usable when hosted browser-session authentication is disabled",
+        "Prevents continuation runs from repeating checklist work by supplying the exact next item ID and accepting an exact legacy item label"
       ]
     }
   }

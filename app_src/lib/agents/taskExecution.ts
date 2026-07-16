@@ -224,9 +224,11 @@ export function applyAgentTaskExecutionPlan(input: {
   if (addedChecklist.length > 0) changes.push(`${addedChecklist.length} checklist item${addedChecklist.length === 1 ? '' : 's'} added`)
 
   const completedChecklistIds: string[] = []
-  const requestedChecklistIds = new Set(plan.checklistComplete)
+  const requestedChecklistValues = new Set(plan.checklistComplete.map((value) => value.trim().toLowerCase()))
   const updatedChecklist = existingChecklist.map((item) => {
-    if (item.done || !requestedChecklistIds.has(item.id)) return item
+    const requested = requestedChecklistValues.has(item.id.trim().toLowerCase())
+      || requestedChecklistValues.has(item.text.trim().toLowerCase())
+    if (item.done || !requested) return item
     completedChecklistIds.push(item.id)
     changes.push(`checklist completed: "${item.text}"`)
     return { ...item, done: true }

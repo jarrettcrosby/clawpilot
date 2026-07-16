@@ -11,6 +11,7 @@ import IconButton from '@mui/material/IconButton'
 import Stack from '@mui/material/Stack'
 import TextField from '@mui/material/TextField'
 import Button from '@mui/material/Button'
+import Link from '@mui/material/Link'
 import Tooltip from '@mui/material/Tooltip'
 import Popover from '@mui/material/Popover'
 import Collapse from '@mui/material/Collapse'
@@ -23,7 +24,6 @@ import Select from '@mui/material/Select'
 import Checkbox from '@mui/material/Checkbox'
 import LinearProgress from '@mui/material/LinearProgress'
 import Alert from '@mui/material/Alert'
-import Link from '@mui/material/Link'
 import CloseRounded from '@mui/icons-material/CloseRounded'
 import ArchiveRounded from '@mui/icons-material/ArchiveRounded'
 import FlagRounded from '@mui/icons-material/FlagRounded'
@@ -197,12 +197,25 @@ async function tryCopyToClipboard(text: string): Promise<boolean> {
 
 // Highlight @mentions in comment text
 function renderCommentText(text: string) {
-  const parts = text.split(/(@\w[\w\s-]*)/g)
-  return parts.map((part, i) =>
-    part.startsWith('@') ? (
+  const parts = text.split(/(\[[^\]\n]+\]\(\/[^)\s]+\)|@\w[\w -]*)/g)
+  return parts.map((part, i) => {
+    const documentLink = part.match(/^\[([^\]]+)\]\((\/[^)\s]+)\)$/)
+    if (documentLink) {
+      return (
+        <Link
+          key={i}
+          href={documentLink[2]}
+          underline="hover"
+          sx={{ color: '#A8C7FA', fontWeight: 600, overflowWrap: 'anywhere' }}
+        >
+          {documentLink[1]}
+        </Link>
+      )
+    }
+    return part.startsWith('@') ? (
       <Box key={i} component="span" sx={{ color: '#A8C7FA', fontWeight: 600, backgroundColor: 'rgba(168,199,250,0.1)', borderRadius: 0.5, px: 0.4 }}>{part}</Box>
     ) : part
-  )
+  })
 }
 
 export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArchive, readOnly = false }: Props) {
