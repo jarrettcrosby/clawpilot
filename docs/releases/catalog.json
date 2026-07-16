@@ -3,23 +3,25 @@
   "releases": {
     "default": {
       "oncePerEnvironment": true,
-      "title": "Scoped activity history and complete CRM relationships",
-      "summary": "ClawPilot now provides project-independent activity history, complete organization and contact editing, reliable SuiteCRM relationship projections, and explicit tenant-safe administrator controls.",
+      "title": "Durable agent context, generated briefs, and a connected knowledge map",
+      "summary": "ClawPilot now provides stable per-user agent roles with private and privacy-gated shared context, on-demand document snapshots, clean CRM queue activity, and a verified Map-of-Content second brain.",
       "features": [
-        "One Activity drawer for account, project, pipeline, CRM, agent, integration, and release events regardless of the selected board",
-        "My activity, organization-subtree, and global-system scopes controlled by explicit administrator permissions",
-        "Successful and failed sign-ins, magic-code requests, sign-outs, user access changes, sharing changes, and task history in the durable audit stream",
-        "Editable CRM metadata and related-contact subpanels for organizations and contacts",
-        "Owner-controlled local or external document embeddings with local processing as the default"
+        "Stable Projects, Pipeline, Docs, Calendar, and ClawPilot profile identities are provisioned automatically for every connected user's own ChatGPT authorization",
+        "Layered agent context combines repository-owned role instructions, the selected task thread, private user memory, and vetted shared role principles",
+        "New document generation creates user-scoped Build, Project Board, Pipeline, or AI Opportunity snapshots from current accessible data",
+        "A root ClawPilot Context Map plus product, platform/data, operations, evolution, and decision Maps of Content",
+        "Accepted decision records for data authority, organization-rooted tenancy, CRM identity and synchronization, and local-first knowledge retrieval",
+        "Stable note IDs, summaries, areas, tags, reusable Obsidian templates, and automated inbound-link and MOC coverage checks",
+        "An intentional owner knowledge catalog that vectors only notes explicitly marked for in-app visibility"
       ],
       "fixes": [
-        "Snapshots organization scope when each audit event is written so later membership or sharing changes do not rewrite history",
-        "Excludes tenant records and tenant resource discovery from the global-system activity scope",
-        "Redacts secrets, credentials, raw network addresses, cookies, and authentication codes from activity responses",
-        "Backfills SuiteCRM Note relationships so interactions appear under their related Contacts as well as Accounts",
-        "Retires the two rejected interaction identifiers without allowing either Global ID to be reused",
-        "Preserves Nick's Organization and Nick's approved global administrator access while retaining child-organization data scope",
-        "Adds Needs Review discovery for incomplete CRM records and consolidates current operational documentation"
+        "Stops unchanged CRM page reads from writing duplicate synchronization activity after the outbox rejects duplicate work",
+        "Gives each real CRM queue event the same deterministic identity boundary as its idempotent outbox operation",
+        "Removes historical no-op CRM activity only when no matching SuiteCRM outbox creation exists",
+        "Keeps user agent lessons private and requires matching evidence from two independent organizations before a generic lesson can enter shared role context",
+        "Rebuilds agent context on every stateless provider request instead of treating a session key as durable memory",
+        "Prevents unclassified repository READMEs and compatibility pointers from polluting the vector knowledge catalog",
+        "Enforces broken-link, orphan-note, duplicate-ID, metadata, and Map-of-Content density checks before deployment"
       ]
     }
   }

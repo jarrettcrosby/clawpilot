@@ -1,7 +1,10 @@
 ---
+id: cp-module-shell-access
 title: Application Shell and Access
+summary: Authentication, invitations, user profiles, roles, permissions, navigation, activity history, and responsive shell behavior.
 status: active
 kind: module-contract
+area: access
 tags: [shell, authentication, invitations, users]
 app_visible: true
 ---
@@ -29,6 +32,7 @@ Provide a responsive, authenticated ClawPilot workspace with clear user identity
 - Administrators with `viewOrganizationAudit` can review the immutable event-time history for their assigned organization subtree. Moving a user or changing a share does not retroactively reclassify an event.
 - Administrators with `viewSystemAudit` can review global platform and worker activity. That scope excludes tenant board, pipeline, CRM, document, and short-link records.
 - Successful and failed sign-ins, code requests, and sign-outs are audited without storing magic codes, raw IP addresses, cookies, credentials, or provider tokens.
+- CRM queue activity is recorded only when a new idempotent SuiteCRM outbox item is inserted. Re-reading an unchanged CRM screen does not produce another audit row, and historical no-op rows are removed by matching them against actual outbox creation evidence.
 
 ## Durable Data
 

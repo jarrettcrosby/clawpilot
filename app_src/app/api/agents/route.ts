@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getCookieName, verifySessionToken } from '@/lib/auth'
 import { PRODUCT_AGENTS } from '@/lib/agents/routing'
-import { getAgentRuntimeForOperator } from '@/lib/agents/provider'
+import { getAgentRuntimeForOperator, stableAgentProfileId } from '@/lib/agents/provider'
 import { requireActiveAppUser } from '@/lib/users'
 
 export async function GET(req: NextRequest) {
@@ -17,6 +17,7 @@ export async function GET(req: NextRequest) {
   return NextResponse.json({
     agents: PRODUCT_AGENTS.map((agent) => ({
       ...agent,
+      profileId: stableAgentProfileId(operatorId, agent.id),
       status: runtime.ready ? 'ready' : 'not connected',
     })),
     runtime,

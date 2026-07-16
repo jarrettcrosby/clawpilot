@@ -1,7 +1,10 @@
 ---
+id: cp-module-knowledge-releases
 title: Knowledge, Releases, and Checkpoints
+summary: Private documents, repository knowledge, hybrid search, release history, checkpoints, and AI opportunity briefs.
 status: active
 kind: module-contract
+area: knowledge
 tags: [docs, releases, backups, search]
 app_visible: true
 ---
@@ -16,9 +19,13 @@ Turn operating data into private, readable briefs and make shipped changes visib
 
 - Documents are owned by a user and never listed across owners.
 - ClawPilot generates Build, Project Board, Pipeline, and AI Opportunity briefs for that user's currently selected accessible board and pipeline.
+- A user can tap **New document**, choose the brief type, and select an accessible board or pipeline when that document needs a resource. ClawPilot refreshes the source data and creates a uniquely named point-in-time snapshot instead of overwriting an earlier user-generated report.
+- On-demand snapshots use the user's locale and timezone in the title, retain the selected resource relationship, and are tagged `generated-on-demand`. The API rechecks signed-user board and pipeline access before generation.
 - The configured owner also receives the curated repository knowledge catalog.
 - Status and source distinguish current contracts from historical evidence.
 - Repository contracts explain current behavior; pull requests and Git history retain implementation detail. Superseded progress notes are not kept in the active catalog after their durable conclusions are consolidated.
+- Maps of Content connect product, platform/data, operations, decisions, and evolution without duplicating notes across folders. Stable metadata creates consistent vector and full-text retrieval clusters.
+- Only repository notes explicitly marked `app_visible: true` enter the configured owner's catalog. Vault-only templates, provider runbooks, and compatibility pointers remain available in Obsidian without polluting in-app search.
 - Postgres full-text search indexes titles and content; tags remain searchable.
 - Every changed document queues a pgvector embedding job. Hybrid search combines 256-dimension vector similarity with deterministic full-text ranking.
 - Knowledge embeddings default to `Local`, a deterministic hashing vector that requires no external credential, sends no document content outside ClawPilot, and incurs no embedding-provider cost.

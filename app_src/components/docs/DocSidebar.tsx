@@ -13,6 +13,7 @@ import IconButton from '@mui/material/IconButton'
 import Tooltip from '@mui/material/Tooltip'
 import SearchRounded from '@mui/icons-material/SearchRounded'
 import RefreshRounded from '@mui/icons-material/RefreshRounded'
+import AddRounded from '@mui/icons-material/AddRounded'
 import ExpandLess from '@mui/icons-material/ExpandLess'
 import ExpandMore from '@mui/icons-material/ExpandMore'
 import ArticleRounded from '@mui/icons-material/ArticleRounded'
@@ -48,12 +49,13 @@ type Props = {
   selectedId: string | null
   onSelect: (id: string) => void
   onRefresh?: () => void
+  onCreate?: () => void
   refreshing?: boolean
   search: string
   onSearch: (value: string) => void
 }
 
-export default function DocSidebar({ docs, selectedId, onSelect, onRefresh, refreshing = false, search, onSearch }: Props) {
+export default function DocSidebar({ docs, selectedId, onSelect, onRefresh, onCreate, refreshing = false, search, onSearch }: Props) {
   const [expanded, setExpanded] = useState<Record<string, boolean>>(
     Object.fromEntries(CATEGORIES.map(c => [c.key, true]))
   )
@@ -77,15 +79,26 @@ export default function DocSidebar({ docs, selectedId, onSelect, onRefresh, refr
           <Typography variant="overline" sx={{ color: 'text.disabled', fontSize: '0.65rem', letterSpacing: 1.5 }}>
             {docs.length} DOCUMENTS
           </Typography>
-          {onRefresh && (
-            <Tooltip title="Refresh document briefs">
-              <span>
-                <IconButton aria-label="Refresh document briefs" size="small" disabled={refreshing} onClick={onRefresh} sx={{ color: 'text.secondary' }}>
-                  <RefreshRounded fontSize="small" />
-                </IconButton>
-              </span>
-            </Tooltip>
-          )}
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.25 }}>
+            {onCreate && (
+              <Tooltip title="New document">
+                <span>
+                  <IconButton aria-label="New document" size="small" disabled={refreshing} onClick={onCreate} sx={{ color: 'text.secondary' }}>
+                    <AddRounded fontSize="small" />
+                  </IconButton>
+                </span>
+              </Tooltip>
+            )}
+            {onRefresh && (
+              <Tooltip title="Refresh document briefs">
+                <span>
+                  <IconButton aria-label="Refresh document briefs" size="small" disabled={refreshing} onClick={onRefresh} sx={{ color: 'text.secondary' }}>
+                    <RefreshRounded fontSize="small" />
+                  </IconButton>
+                </span>
+              </Tooltip>
+            )}
+          </Box>
         </Box>
         <TextField
           size="small"

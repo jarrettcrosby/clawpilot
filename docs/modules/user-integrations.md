@@ -1,7 +1,10 @@
 ---
+id: cp-module-user-integrations
 title: User Integrations and Credentials
+summary: Per-user Maton connections, Google Workspace administration, managed resources, credential storage, and knowledge provider controls.
 status: active
 kind: module-contract
+area: integrations
 tags: [integrations, maton, google-workspace, credentials, tenancy]
 app_visible: true
 ---

@@ -65,6 +65,18 @@ export type DocumentBriefSelection = {
   pipelineId?: string | null
 }
 
+export type GeneratedDocumentKind = 'build-brief' | 'project-report' | 'pipeline-report' | 'research-radar'
+
+type GeneratedDocumentTemplateRow = {
+  kind: GeneratedDocumentKind
+  title: string
+  category: string
+  content: string
+  tags: string[]
+  board_id: string | null
+  pipeline_id: string | null
+}
+
 type RepositorySyncGlobal = typeof globalThis & {
   __clawpilotRepositoryDocsSynced?: Set<string>
 }
@@ -134,10 +146,10 @@ async function upsertDocument(input: {
   boardId?: string | null
   pipelineId?: string | null
   generatedAt?: string | null
-}) {
+}): Promise<string | null> {
   const content = input.content.trim()
   const contentHash = sha256(content)
-  await query(
+  const result = await query<{ document_id: string }>(
     `
       WITH changed_document AS (
         INSERT INTO app_documents (
@@ -193,6 +205,7 @@ async function upsertDocument(input: {
         locked_at = NULL,
         last_error = NULL,
         updated_at = now()
+      RETURNING document_id::text
     `,
     [
       input.ownerEmail,
@@ -213,6 +226,7 @@ async function upsertDocument(input: {
       input.generatedAt || null,
     ],
   )
+  return result.rows[0]?.document_id || null
 }
 
 export async function refreshUserBriefs(
@@ -377,6 +391,70 @@ export async function refreshActiveUserBriefs(): Promise<{ refreshed: number; er
   }
 }
 
+const GENERATED_SOURCE_KEYS: Record<GeneratedDocumentKind, string> = {
+  'build-brief': 'system:build-brief',
+  'project-report': 'system:project-brief',
+  'pipeline-report': 'system:pipeline-brief',
+  'research-radar': 'system:ai-opportunity-radar',
+}
+
+export async function generateUserDocument(input: {
+  user: AppUser
+  kind: GeneratedDocumentKind
+  boardId?: string | null
+  pipelineId?: string | null
+}): Promise<{ id: string; title: string; slug: string }> {
+  const ownerEmail = normalizeUserEmail(input.user.email)
+  if (!Object.hasOwn(GENERATED_SOURCE_KEYS, input.kind)) throw new Error('Unsupported document type')
+
+  const [board, pipeline] = await Promise.all([
+    resolveProjectBoardAccess({ actorEmail: ownerEmail, boardId: input.boardId }),
+    resolvePipelineSpaceAccess({ actorEmail: ownerEmail, pipelineId: input.pipelineId }),
+  ])
+  await refreshUserBriefs(input.user, { boardId: board.id, pipelineId: pipeline.id })
+
+  const template = await query<GeneratedDocumentTemplateRow>(
+    `
+      SELECT kind, title, category, content, tags, board_id::text, pipeline_id::text
+      FROM app_documents
+      WHERE owner_email = $1
+        AND source_key = $2
+      LIMIT 1
+    `,
+    [ownerEmail, GENERATED_SOURCE_KEYS[input.kind]],
+  )
+  const source = template.rows[0]
+  if (!source) throw new Error('Document source could not be prepared')
+
+  const now = new Date()
+  const generatedAt = now.toISOString()
+  const displayTimestamp = new Intl.DateTimeFormat(input.user.locale || 'en-US', {
+    timeZone: input.user.timezone || 'UTC',
+    dateStyle: 'medium',
+    timeStyle: 'short',
+  }).format(now)
+  const suffix = crypto.randomUUID().slice(0, 8)
+  const title = `${source.title} - ${displayTimestamp}`
+  const slug = `${safeSlug(source.title)}-${now.toISOString().slice(0, 10)}-${suffix}`
+  const id = await upsertDocument({
+    ownerEmail,
+    sourceKey: `user-generated:${input.kind}:${crypto.randomUUID()}`,
+    source: 'user',
+    kind: source.kind,
+    status: 'generated',
+    title,
+    slug,
+    category: source.category,
+    content: source.content,
+    tags: Array.from(new Set([...source.tags, 'generated-on-demand'])),
+    boardId: source.board_id,
+    pipelineId: source.pipeline_id,
+    generatedAt,
+  })
+  if (!id) throw new Error('Document was not created')
+  return { id, title, slug }
+}
+
 const GENERATED_BRIEF_KEYS = [
   'system:build-brief',
   'system:project-brief',
@@ -460,13 +538,20 @@ function repositoryClassification(relativePath: string, metadata: Record<string,
     ? explicitStatus as 'draft' | 'active' | 'superseded' | 'historical' | 'generated'
     : historical ? 'historical' : 'active'
   const folder = logicalPath.split('/')[0]
+  const categoryByFolder: Record<string, string> = {
+    maps: 'maps',
+    modules: 'modules',
+    decisions: 'decisions',
+    brand: 'brand',
+    architecture: 'architecture',
+    operations: 'operations',
+    governance: 'operations',
+    integrations: 'integrations',
+    releases: 'releases',
+  }
   const category = status === 'historical'
     ? 'archive'
-    : folder === 'architecture' ? 'architecture'
-      : folder === 'operations' || folder === 'governance' ? 'operations'
-        : folder === 'integrations' ? 'integrations'
-          : folder === 'releases' ? 'releases'
-            : 'knowledge'
+    : categoryByFolder[folder] || 'knowledge'
   return { status, category }
 }
 
@@ -484,11 +569,12 @@ export async function syncRepositoryDocuments(
   const repositoryDocuments = (await Promise.all(files.map(async (filePath) => {
     const raw = await fs.readFile(filePath, 'utf8')
     const parsed = matter(raw)
-    if (parsed.data.app_visible === false) return null
+    if (parsed.data.app_visible !== true) return null
     const relativePath = path.relative(root, filePath).replace(/\\/g, '/')
     const classification = repositoryClassification(relativePath, parsed.data)
     const title = singleLine(parsed.data.title) || titleFromMarkdown(parsed.content, path.basename(filePath, '.md'))
     const tags = Array.isArray(parsed.data.tags) ? parsed.data.tags.map(singleLine).filter(Boolean) : []
+    const area = singleLine(parsed.data.area)
     return {
       ownerEmail: user.email,
       sourceKey: `repository:${relativePath}`,
@@ -499,7 +585,7 @@ export async function syncRepositoryDocuments(
       slug: `repo-${safeSlug(relativePath)}`,
       category: classification.category,
       content: parsed.content || raw,
-      tags: Array.from(new Set(['clawpilot', ...tags])),
+      tags: Array.from(new Set(['clawpilot', area, ...tags].filter(Boolean))),
       sourcePath: relativePath,
     }
   }))).filter((document): document is NonNullable<typeof document> => document !== null)
@@ -524,11 +610,12 @@ export async function listLocalRepositoryDocuments(searchValue?: unknown): Promi
   const documents = (await Promise.all(files.map(async (filePath): Promise<AppDocument | null> => {
     const raw = await fs.readFile(filePath, 'utf8')
     const parsed = matter(raw)
-    if (parsed.data.app_visible === false) return null
+    if (parsed.data.app_visible !== true) return null
     const relativePath = path.relative(root, filePath).replace(/\\/g, '/')
     const classification = repositoryClassification(relativePath, parsed.data)
     const title = singleLine(parsed.data.title) || titleFromMarkdown(parsed.content, path.basename(filePath, '.md'))
     const tags = Array.isArray(parsed.data.tags) ? parsed.data.tags.map(singleLine).filter(Boolean) : []
+    const area = singleLine(parsed.data.area)
     const dateValue = parsed.data.date instanceof Date
       ? parsed.data.date.toISOString().slice(0, 10)
       : singleLine(parsed.data.date).slice(0, 10)
@@ -536,7 +623,7 @@ export async function listLocalRepositoryDocuments(searchValue?: unknown): Promi
       id: `repository:${relativePath}`,
       title,
       date: dateValue,
-      tags: Array.from(new Set(['clawpilot', ...tags])),
+      tags: Array.from(new Set(['clawpilot', area, ...tags].filter(Boolean))),
       category: classification.category,
       slug: `repo-${safeSlug(relativePath)}`,
       content: parsed.content || raw,

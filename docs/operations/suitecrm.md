@@ -1,7 +1,10 @@
 ---
+id: cp-ops-suitecrm
 title: SuiteCRM Railway Runbook
+summary: SuiteCRM service topology, credentials, Global ID fields, hierarchy, scheduler, upgrades, rollback, and native administration.
 status: active
 kind: operations-runbook
+area: operations
 tags: [suitecrm, railway, mariadb, oauth, migration]
 app_visible: false
 ---

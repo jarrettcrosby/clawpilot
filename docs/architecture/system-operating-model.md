@@ -1,7 +1,10 @@
 ---
+id: cp-legacy-system-operating-model
 title: Historical System Operating Model Pointer
+summary: Compatibility pointer from the retired local operating model to the current environment contract.
 status: superseded
 kind: compatibility-pointer
+area: archive
 tags: [historical, compatibility, operations]
 app_visible: false
 ---

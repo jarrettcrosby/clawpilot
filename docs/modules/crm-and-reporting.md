@@ -1,7 +1,10 @@
 ---
+id: cp-module-crm-reporting
 title: CRM and Workbook Reporting
+summary: CRM entities, Global IDs, SuiteCRM projections, provider actions, email markers, meetings, and workbook reporting.
 status: active
 kind: module-contract
+area: crm
 tags: [crm, suitecrm, organizations, contacts, opportunities, reporting]
 app_visible: true
 ---
@@ -82,6 +85,8 @@ The pipeline and CRM surfaces expose the workbook through its ClawPilot short li
 2. The SuiteCRM worker claims records with a lease, uses OAuth2 client credentials against the private Railway service, and records success or a retriable failure.
 3. A successful SuiteCRM batch queues a `project_crm_workbook` Google outbox operation.
 4. The Google worker regenerates the protected workbook projections and records a reconciliation run.
+
+The gateway emits `crm.record.staged` activity only when the outbox accepts a new idempotency key. Idempotent hierarchy or profile reads may refresh local projections and short links, but they do not create duplicate queue history when no SuiteCRM work was added.
 
 The SuiteCRM integration worker also polls Accounts and Contacts by `date_modified`. It matches native records by SuiteCRM ID or Global ID within each pipeline, stages only meaningful changes without echoing them back to SuiteCRM, and reconciles every bound CRM Board so newly deployed boards and native CRM edits appear without requiring a browser refresh to initiate the backfill.
 

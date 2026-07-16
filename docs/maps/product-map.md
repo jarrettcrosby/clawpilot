@@ -1,0 +1,39 @@
+---
+id: cp-map-product
+title: Product Map
+summary: User-facing workflows and the module contracts that define the ClawPilot product.
+status: active
+kind: map-of-content
+area: product
+tags: [clawpilot, moc, product, workflows, modules]
+app_visible: true
+---
+
+# Product Map
+
+ClawPilot is a private operating workspace that connects work boards, pipeline data, CRM relationships, documents, and authenticated AI execution without collapsing user or organization boundaries.
+
+## User Journey
+
+1. [Application Shell and Access](../modules/application-shell-and-access.md) authenticates the user and applies role and permission boundaries.
+2. [Projects and Tenancy](../modules/projects-and-tenancy.md) provides personal and shared boards, including account-scoped CRM boards.
+3. [Pipeline and Synchronization](../modules/pipeline-and-sync.md) provides the sales operating view and its managed Google Sheet.
+4. [CRM and Workbook Reporting](../modules/crm-and-reporting.md) connects organizations, contacts, opportunities, meetings, interactions, campaigns, SuiteCRM, and reporting.
+5. [Agents and Execution](../modules/agents-and-execution.md) routes task-linked conversations to authenticated user agents and preserves results.
+6. [Knowledge, Releases, and Checkpoints](../modules/knowledge-releases-and-checkpoints.md) provides private briefs, hybrid search, releases, and recovery checkpoints.
+7. [Shared Short Links](../modules/short-links.md) exposes controlled organization-scoped links to records and managed resources.
+8. [User Integrations and Credentials](../modules/user-integrations.md) lets each user connect the external services used by those workflows.
+
+The [ClawPilot Identity](../brand/clawpilot-identity.md) contract keeps those surfaces visually and verbally consistent.
+
+## Cross-Module Paths
+
+- CRM organization or contact -> Global ID -> short link -> ClawPilot editor -> SuiteCRM projection.
+- Pipeline opportunity -> Postgres projection -> Google Sheet operator row -> CRM opportunity and reporting.
+- Project card -> assigned app agent -> user ChatGPT authorization -> execution log and result -> task thread.
+- User profile -> organization membership -> CRM account/contact -> Drive folder and pipeline resource scope.
+- Release -> Versions entry -> Build Brief -> searchable knowledge catalog.
+
+## Product Authority
+
+The module contracts above define current behavior. Proposed ideas belong on a project board until accepted; they do not become product truth merely because they appear in a conversation or old note.

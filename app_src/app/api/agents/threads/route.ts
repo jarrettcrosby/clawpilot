@@ -5,6 +5,11 @@ import path from 'path'
 import { NextRequest, NextResponse } from 'next/server'
 import { getCookieName, verifySessionToken } from '@/lib/auth'
 import { getAgentRuntimeForOperator, runChatGPTAgent, runOpenAIAgent } from '@/lib/agents/provider'
+import {
+  captureAgentLearning,
+  formatAgentContextMemories,
+  readAgentContextMemories,
+} from '@/lib/agents/contextMemory'
 import { resolveResponderId } from '@/lib/agents/responder.mjs'
 import { getThread as getFileThread, listThreads as listFileThreads, upsertThreadMessage as upsertFileThreadMessage } from '@/lib/agents/threadStore.mjs'
 import { normalizeProductAgentId, resolveExecutionAgentForControlAgent } from '@/lib/agents/routing'
@@ -295,7 +300,7 @@ async function runOpenClawAgent(agentId: string, message: string): Promise<strin
   }
 }
 
-function buildTaskContext(task: Task, agentId: string): string {
+function buildTaskContext(task: Task, agentId: string, durableContext?: string | null): string {
   const checklist = (task.checklist || []).map((item) => `- [${item.done ? 'x' : ' '}] ${item.text}`).join('\n')
   const nextAction = String(task.workItem?.nextAction || '').trim()
   return [
@@ -306,6 +311,7 @@ function buildTaskContext(task: Task, agentId: string): string {
     `Assigned agent: ${agentId}`,
     nextAction ? `Next action: ${nextAction}` : null,
     checklist ? `Checklist:\n${checklist}` : null,
+    durableContext ? `Durable agent context:\n${durableContext}` : null,
   ].filter(Boolean).join('\n')
 }
 
@@ -497,7 +503,18 @@ export async function POST(req: NextRequest) {
   const conversation = messages
     .filter((message) => dispatchId ? message.meta?.dispatchId !== dispatchId : message.id !== userMessage?.id)
     .map((message) => ({ role: message.role, text: message.text }))
-  const taskContext = buildTaskContext(task, agentId)
+  let durableAgentContext: string | null = null
+  if (isPostgresTaskStoreEnabled()) {
+    try {
+      durableAgentContext = formatAgentContextMemories(await readAgentContextMemories({
+        operatorId,
+        agentId,
+      }))
+    } catch (error) {
+      console.error('[agent-threads] durable context read failed', error)
+    }
+  }
+  const taskContext = buildTaskContext(task, agentId, durableAgentContext)
 
   let responseText = ''
   try {
@@ -552,6 +569,13 @@ export async function POST(req: NextRequest) {
   }
 
   const completedAt = new Date().toISOString()
+  if (isPostgresTaskStoreEnabled()) {
+    try {
+      await captureAgentLearning({ operatorId, agentId, responseText })
+    } catch (error) {
+      console.error('[agent-threads] durable context write failed', error)
+    }
+  }
   await recordAgentResult(taskId, agentId, responseText, board?.id, dispatchId)
   await recordExecutionTelemetry({
     runId,
