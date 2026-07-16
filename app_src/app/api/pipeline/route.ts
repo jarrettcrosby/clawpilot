@@ -99,6 +99,11 @@ function opportunityIdempotencyKey(req: NextRequest, pipelineId: string, actorEm
   return `app:opportunities:${digest}`
 }
 
+function opportunityProducts(value: unknown) {
+  const products = Array.isArray(value) ? value : String(value || '').split(',')
+  return [...new Set(products.map((product) => String(product || '').trim()).filter(Boolean))]
+}
+
 export async function GET(req: NextRequest) {
   let workItems: ReturnType<typeof pipelineWorkItemsFromTasks> = []
   try {
@@ -224,10 +229,11 @@ export async function POST(req: NextRequest) {
     requireResourceEditor(pipeline)
 
     const body = await req.json()
-    const name = String(body?.name || '').trim()
+    const products = opportunityProducts(body?.products ?? body?.name)
+    const name = products.join(', ')
     const organizationId = String(body?.organizationId || '').trim()
     if (!name || !organizationId) {
-      return NextResponse.json({ ok: false, error: 'Opportunity name and a CRM organization are required' }, { status: 400 })
+      return NextResponse.json({ ok: false, error: 'At least one product and a CRM organization are required' }, { status: 400 })
     }
     const organizationRecord = await readCrmRecordReference({
       pipelineId: pipeline.id,

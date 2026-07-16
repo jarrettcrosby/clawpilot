@@ -64,6 +64,11 @@ function finiteNumber(value: unknown, fallback = 0) {
   return Number.isFinite(number) ? number : fallback
 }
 
+function opportunityProductName(value: unknown) {
+  const products = Array.isArray(value) ? value : String(value || '').split(',')
+  return [...new Set(products.map((product) => String(product || '').trim()).filter(Boolean))].join(', ')
+}
+
 function displayOpportunity(opportunity: CrmOpportunity) {
   return {
     ...opportunity,
@@ -199,6 +204,12 @@ export async function PATCH(req: NextRequest, ctx: { params: Promise<{ id: strin
     }
 
     const notes = updates.notes !== undefined ? String(updates.notes || '') : current.notes
+    const name = updates.products !== undefined || updates.name !== undefined
+      ? opportunityProductName(updates.products ?? updates.name)
+      : current.name
+    if (!name) {
+      return NextResponse.json({ error: 'At least one product is required' }, { status: 400 })
+    }
 
     const result = await updateCrmOpportunityInPostgres({
       pipelineId: context.pipeline.id,
@@ -208,7 +219,7 @@ export async function PATCH(req: NextRequest, ctx: { params: Promise<{ id: strin
       actorEmail: context.actor.email,
       fields: {
         organizationId: current.organizationId,
-        name: updates.name !== undefined ? String(updates.name || '').trim() : current.name,
+        name,
         organization: current.organization,
         priority: updates.priority !== undefined ? String(updates.priority || '') : current.priority,
         owner: updates.owner !== undefined ? String(updates.owner || '') : current.owner,
