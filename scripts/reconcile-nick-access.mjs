@@ -14,6 +14,8 @@ const ADMIN_PERMISSIONS = {
   viewFullReleaseHistory: true,
   manageBackups: true,
   manageLinks: true,
+  viewOrganizationAudit: true,
+  viewSystemAudit: true,
 }
 
 function fail(message) {
@@ -71,6 +73,7 @@ async function main() {
       `INSERT INTO audit_events (actor, event_type, aggregate_type, aggregate_id, payload)
        VALUES ($1, 'user.admin_access.reconciled', 'app_user', $2, $3::jsonb)`,
       [actor, NICK_EMAIL, JSON.stringify({
+        subject: NICK_EMAIL,
         organizationId: current.rows[0].organization_id,
         organizationName: ORGANIZATION_NAME,
         previousOrganizationName: current.rows[0].organization_name,

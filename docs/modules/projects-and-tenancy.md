@@ -19,6 +19,7 @@ Give every user a private project board while allowing deliberate collaboration.
 - The selected board is explicit and persisted independently of another user's selection.
 - Task reads and writes resolve through board access before touching durable task data.
 - Comments use the signed-in user as the actor. Agent assignment and task-thread routing retain that attribution.
+- Project activity is promoted into the append-only audit stream with the owning board organization's event-time scope. The global Activity drawer reads all authorized boards rather than the board currently selected; the card drawer remains the resource-local history.
 - Archived and deleted work is excluded from the current board but retained according to the task lifecycle policy.
 - Ordinary project work follows one kanban lifecycle: Backlog, Todo, In Progress, Review, and Done. Creating, editing, moving, assigning, commenting, completing, archiving, and restoring all use explicit user actions.
 - Reading a board never creates, retags, assigns, moves, hides, or archives work. A rejected move leaves the card unchanged and returns an actionable reason.

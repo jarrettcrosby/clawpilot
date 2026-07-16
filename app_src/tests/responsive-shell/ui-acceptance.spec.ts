@@ -131,6 +131,7 @@ test('dashboard links open their target section and selected document', async ({
     }],
   }))
   await page.route('**/api/pipeline/activity', (route) => route.fulfill({ json: [] }))
+  await page.route('**/api/activity**', (route) => route.fulfill({ json: { ok: true, events: [], nextCursor: null, scope: 'self', capabilities: { canViewOrganization: false, canViewGlobal: false, defaultScope: 'self' } } }))
   await page.route('**/api/docs**', (route) => route.fulfill({
     json: [{
       id: 'dashboard-document',

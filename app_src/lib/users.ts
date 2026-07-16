@@ -1,4 +1,5 @@
 import { query, withTransaction } from '@/lib/persistence/postgres'
+import { recordAuditEvent } from '@/lib/auditWriter'
 
 const EMAIL_PATTERN = /^[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+$/i
 
@@ -27,6 +28,8 @@ export type AppUserPermissions = {
   viewFullReleaseHistory: boolean
   manageBackups: boolean
   manageLinks: boolean
+  viewOrganizationAudit: boolean
+  viewSystemAudit: boolean
 }
 
 export const MEMBER_PERMISSIONS: AppUserPermissions = {
@@ -37,6 +40,8 @@ export const MEMBER_PERMISSIONS: AppUserPermissions = {
   viewFullReleaseHistory: false,
   manageBackups: false,
   manageLinks: false,
+  viewOrganizationAudit: false,
+  viewSystemAudit: false,
 }
 
 export const OWNER_PERMISSIONS: AppUserPermissions = {
@@ -47,6 +52,8 @@ export const OWNER_PERMISSIONS: AppUserPermissions = {
   viewFullReleaseHistory: true,
   manageBackups: true,
   manageLinks: true,
+  viewOrganizationAudit: true,
+  viewSystemAudit: true,
 }
 
 export type AppUser = {
@@ -118,6 +125,8 @@ function normalizePermissions(value: unknown): AppUserPermissions {
     viewFullReleaseHistory: input.viewFullReleaseHistory === true,
     manageBackups: input.manageBackups === true,
     manageLinks: input.manageLinks === true,
+    viewOrganizationAudit: input.viewOrganizationAudit === true,
+    viewSystemAudit: input.viewSystemAudit === true,
   }
 }
 
@@ -130,6 +139,8 @@ function permissionsForRole(role: AppUserRole, value: unknown): AppUserPermissio
     permissions.viewFullReleaseHistory = false
     permissions.manageBackups = false
     permissions.manageLinks = false
+    permissions.viewOrganizationAudit = false
+    permissions.viewSystemAudit = false
   }
   return permissions
 }
@@ -333,6 +344,20 @@ export async function inviteAppUser(input: {
       `,
       [email, actor.email, JSON.stringify(MEMBER_PERMISSIONS), organizationId, organization.rows[0].name],
     )
+    await recordAuditEvent({
+      actor: actor.email,
+      eventType: 'user.invited',
+      aggregateType: 'app_user',
+      aggregateId: email,
+      subject: email,
+      organizationId,
+      payload: {
+        organizationId,
+        organizationName: organization.rows[0].name,
+        previousOrganizationId: current?.organization_id || null,
+        reinvited: Boolean(current),
+      },
+    }, client)
     return {
       user: toAppUser(result.rows[0]),
       created: !current,
@@ -386,20 +411,30 @@ export async function setAppUserStatus(input: {
     throw new AppUserAuthorizationError('Invited users must accept their welcome link before activation')
   }
 
-  const result = await query<AppUserRow>(
-    `
-      UPDATE app_users
-      SET status = $2,
-          activated_at = CASE WHEN $2 = 'active' THEN COALESCE(activated_at, now()) ELSE activated_at END,
-          updated_at = now()
-      WHERE email = $1
-        AND role <> 'owner'
-      RETURNING *
-    `,
-    [email, input.status],
-  )
-  if (!result.rows[0]) throw new AppUserNotFoundError()
-  return toAppUser(result.rows[0])
+  const row = await withTransaction(async (client) => {
+    const result = await client.query<AppUserRow>(
+      `UPDATE app_users
+       SET status = $2,
+           activated_at = CASE WHEN $2 = 'active' THEN COALESCE(activated_at, now()) ELSE activated_at END,
+           updated_at = now()
+       WHERE email = $1
+         AND role <> 'owner'
+       RETURNING *`,
+      [email, input.status],
+    )
+    if (!result.rows[0]) throw new AppUserNotFoundError()
+    await recordAuditEvent({
+      actor: actor.email,
+      eventType: 'user.status.updated',
+      aggregateType: 'app_user',
+      aggregateId: email,
+      subject: email,
+      organizationId: target.organizationId,
+      payload: { previousStatus: target.status, status: input.status, organizationId: target.organizationId },
+    }, client)
+    return result.rows[0]
+  })
+  return toAppUser(row)
 }
 
 function cleanOptionalText(value: unknown, maxLength: number): string | null {
@@ -489,6 +524,19 @@ export async function updateAppUserProfile(input: {
       [actor.email, displayName, jobTitle, organizationName, timezone, locale],
     )
 
+    await recordAuditEvent({
+      actor: actor.email,
+      eventType: 'user.profile.updated',
+      aggregateType: 'app_user',
+      aggregateId: actor.email,
+      subject: actor.email,
+      organizationId,
+      payload: {
+        organizationId,
+        fields: ['displayName', 'jobTitle', 'organizationName', 'timezone', 'locale'],
+      },
+    }, client)
+
     await client.query(
       `INSERT INTO sync_outbox (
          aggregate_type, aggregate_id, operation, target_system, payload,
@@ -544,18 +592,33 @@ export async function updateAppUserAccess(input: {
     : target.permissions
   const requested = input.permissions && typeof input.permissions === 'object' ? input.permissions : {}
   const permissions = permissionsForRole(role, { ...base, ...requested })
-  const result = await query<AppUserRow>(
-    `
-      UPDATE app_users
-      SET role = $2,
-          permissions = $3::jsonb,
-          updated_at = now()
-      WHERE email = $1
-      RETURNING *
-    `,
-    [email, role, JSON.stringify(permissions)],
-  )
-  return toAppUser(result.rows[0])
+  const row = await withTransaction(async (client) => {
+    const result = await client.query<AppUserRow>(
+      `UPDATE app_users
+       SET role = $2,
+           permissions = $3::jsonb,
+           updated_at = now()
+       WHERE email = $1
+       RETURNING *`,
+      [email, role, JSON.stringify(permissions)],
+    )
+    await recordAuditEvent({
+      actor: actor.email,
+      eventType: 'user.access.updated',
+      aggregateType: 'app_user',
+      aggregateId: email,
+      subject: email,
+      organizationId: target.organizationId,
+      payload: {
+        organizationId: target.organizationId,
+        previousRole: target.role,
+        role,
+        permissions,
+      },
+    }, client)
+    return result.rows[0]
+  })
+  return toAppUser(row)
 }
 
 export async function markAppUserSignedIn(emailValue: unknown): Promise<AppUser> {

@@ -1191,7 +1191,13 @@ export async function stageCrmRecordWithClient(client: PoolClient, rawInput: Sta
   await client.query(
     `INSERT INTO audit_events (actor, event_type, aggregate_type, aggregate_id, payload)
      VALUES ($1, 'crm.record.staged', $2, $3, $4::jsonb)`,
-    [input.actorEmail, `crm_${input.entity}`, row.id, JSON.stringify({ pipelineId: input.pipelineId, sourceKey })],
+    [input.actorEmail, `crm_${input.entity}`, row.id, JSON.stringify({
+      pipelineId: input.pipelineId,
+      sourceKey,
+      referenceCode: row.reference_code,
+      recordTitle: title || row.reference_code,
+      message: `${title || row.reference_code} queued for CRM synchronization`,
+    })],
   )
   return {
     id: row.id,

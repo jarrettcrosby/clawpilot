@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requestAuthMagicCode } from '@/lib/authMagicCode'
+import { recordAuthActivity } from '@/lib/authAudit'
 
 const WINDOW_MS = 15 * 60 * 1000
 const MAX_REQUESTS = 5
@@ -70,6 +71,13 @@ export async function POST(req: NextRequest) {
 
     const result = await requestAuthMagicCode({ email })
     if (result.status === 'sent' || result.status === 'cooldown' || result.status === 'not-authorized') {
+      await recordAuthActivity({
+        req,
+        email,
+        eventType: result.status === 'not-authorized' ? 'auth.code.request.denied' : 'auth.code.requested',
+        method: 'magic_code',
+        reason: result.status,
+      }).catch(() => undefined)
       return NextResponse.json({ ok: true, message: GENERIC_MESSAGE })
     }
 

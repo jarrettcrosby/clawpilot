@@ -41,6 +41,7 @@ async function mockTimezoneWorkspace(page: Page, onCrmSave: (occurredAt: string)
   await page.route((url) => url.pathname === '/api/docs', (route) => route.fulfill({ json: [] }))
   await page.route((url) => url.pathname === '/api/execution-results/summary', (route) => route.fulfill({ json: { count: 0 } }))
   await page.route((url) => url.pathname === '/api/pipeline/activity', (route) => route.fulfill({ json: [] }))
+  await page.route((url) => url.pathname === '/api/activity', (route) => route.fulfill({ json: { ok: true, events: [], nextCursor: null, scope: 'self', capabilities: { canViewOrganization: false, canViewGlobal: false, defaultScope: 'self' } } }))
   await page.route((url) => url.pathname === '/api/pipeline', (route) => route.fulfill({
     json: {
       pipeline: {

@@ -1,4 +1,5 @@
 import { query, withTransaction } from '@/lib/persistence/postgres'
+import { recordAuditEvent } from '@/lib/auditWriter'
 import {
   DEFAULT_PIPELINE_SHEET_ID,
   enqueuePipelinePermissionSyncWithClient,
@@ -529,11 +530,22 @@ export async function createProjectBoard(input: { actorEmail: unknown; name: unk
   const actor = await requireActiveAppUser(input.actorEmail)
   if (!effectiveUserPermissions(actor).createBoards) throw new Error('You do not have permission to create boards')
   const name = cleanResourceName(input.name, 'New board')
-  const result = await query<{ id: string }>(
-    'INSERT INTO project_boards (name, owner_email) VALUES ($1, $2) RETURNING id::text',
-    [name, actor.email],
-  )
-  return resolveProjectBoardAccess({ actorEmail: actor.email, boardId: result.rows[0].id })
+  const boardId = await withTransaction(async (client) => {
+    const result = await client.query<{ id: string }>(
+      'INSERT INTO project_boards (name, owner_email) VALUES ($1, $2) RETURNING id::text',
+      [name, actor.email],
+    )
+    await recordAuditEvent({
+      actor: actor.email,
+      eventType: 'project.board.created',
+      aggregateType: 'project_board',
+      aggregateId: result.rows[0].id,
+      organizationId: actor.organizationId,
+      payload: { name, organizationId: actor.organizationId },
+    }, client)
+    return result.rows[0].id
+  })
+  return resolveProjectBoardAccess({ actorEmail: actor.email, boardId })
 }
 
 export async function createPipelineSpace(input: { actorEmail: unknown; name: unknown }): Promise<PipelineSpace> {
@@ -541,13 +553,24 @@ export async function createPipelineSpace(input: { actorEmail: unknown; name: un
   if (!effectiveUserPermissions(actor).createPipelines) throw new Error('You do not have permission to create pipelines')
   const name = cleanResourceName(input.name, 'New pipeline')
   const organization = await ensurePrimaryWorkspaceOrganization(actor.email)
-  const result = await query<{ id: string }>(
-    `INSERT INTO pipeline_spaces (name, owner_email, workspace_organization_id)
-     VALUES ($1, $2, $3::uuid)
-     RETURNING id::text`,
-    [name, actor.email, organization.id],
-  )
-  return resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: result.rows[0].id })
+  const pipelineId = await withTransaction(async (client) => {
+    const result = await client.query<{ id: string }>(
+      `INSERT INTO pipeline_spaces (name, owner_email, workspace_organization_id)
+       VALUES ($1, $2, $3::uuid)
+       RETURNING id::text`,
+      [name, actor.email, organization.id],
+    )
+    await recordAuditEvent({
+      actor: actor.email,
+      eventType: 'pipeline.space.created',
+      aggregateType: 'pipeline_space',
+      aggregateId: result.rows[0].id,
+      organizationId: organization.id,
+      payload: { name, pipelineId: result.rows[0].id, organizationId: organization.id },
+    }, client)
+    return result.rows[0].id
+  })
+  return resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId })
 }
 
 async function validateShareTarget(actorEmail: string, targetEmailValue: unknown) {
@@ -572,17 +595,26 @@ export async function shareProjectBoard(input: {
   const board = await resolveProjectBoardAccess({ actorEmail: actor.email, boardId: input.boardId })
   if (board.ownerEmail !== actor.email) throw new Error('Only the board owner can share it')
   const target = await validateShareTarget(actor.email, input.userEmail)
-  await query(
-    `
-      INSERT INTO project_board_members (board_id, user_email, access_role, shared_by, updated_at)
-      VALUES ($1::uuid, $2, $3, $4, now())
-      ON CONFLICT (board_id, user_email) DO UPDATE SET
-        access_role = EXCLUDED.access_role,
-        shared_by = EXCLUDED.shared_by,
-        updated_at = now()
-    `,
-    [board.id, target.email, normalizeShareRole(input.accessRole), actor.email],
-  )
+  const accessRole = normalizeShareRole(input.accessRole)
+  await withTransaction(async (client) => {
+    await client.query(
+      `INSERT INTO project_board_members (board_id, user_email, access_role, shared_by, updated_at)
+       VALUES ($1::uuid, $2, $3, $4, now())
+       ON CONFLICT (board_id, user_email) DO UPDATE SET
+         access_role = EXCLUDED.access_role,
+         shared_by = EXCLUDED.shared_by,
+         updated_at = now()`,
+      [board.id, target.email, accessRole, actor.email],
+    )
+    await recordAuditEvent({
+      actor: actor.email,
+      eventType: 'project.board.shared',
+      aggregateType: 'project_board',
+      aggregateId: board.id,
+      organizationId: actor.organizationId,
+      payload: { userEmail: target.email, accessRole, organizationId: actor.organizationId },
+    }, client)
+  })
   return resolveProjectBoardAccess({ actorEmail: actor.email, boardId: board.id })
 }
 
@@ -596,6 +628,7 @@ export async function sharePipelineSpace(input: {
   const pipeline = await resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: input.pipelineId })
   if (pipeline.ownerEmail !== actor.email) throw new Error('Only the pipeline owner can share it')
   const target = await validateShareTarget(actor.email, input.userEmail)
+  const accessRole = normalizeShareRole(input.accessRole)
   await withTransaction(async (client) => {
     await client.query(
       `
@@ -606,9 +639,17 @@ export async function sharePipelineSpace(input: {
           shared_by = EXCLUDED.shared_by,
           updated_at = now()
       `,
-      [pipeline.id, target.email, normalizeShareRole(input.accessRole), actor.email],
+      [pipeline.id, target.email, accessRole, actor.email],
     )
     await enqueuePipelinePermissionSyncWithClient(client, { pipelineId: pipeline.id, actor: actor.email })
+    await recordAuditEvent({
+      actor: actor.email,
+      eventType: 'pipeline.space.shared',
+      aggregateType: 'pipeline_space',
+      aggregateId: pipeline.id,
+      organizationId: pipeline.workspaceOrganizationId,
+      payload: { pipelineId: pipeline.id, userEmail: target.email, accessRole, organizationId: pipeline.workspaceOrganizationId },
+    }, client)
   })
   return resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: pipeline.id })
 }
@@ -621,7 +662,18 @@ export async function removeProjectBoardShare(input: {
   const actor = await requireActiveAppUser(input.actorEmail)
   const board = await resolveProjectBoardAccess({ actorEmail: actor.email, boardId: input.boardId })
   if (board.ownerEmail !== actor.email) throw new Error('Only the board owner can change sharing')
-  await query('DELETE FROM project_board_members WHERE board_id = $1::uuid AND user_email = $2', [board.id, normalizeUserEmail(input.userEmail)])
+  const userEmail = normalizeUserEmail(input.userEmail)
+  await withTransaction(async (client) => {
+    await client.query('DELETE FROM project_board_members WHERE board_id = $1::uuid AND user_email = $2', [board.id, userEmail])
+    await recordAuditEvent({
+      actor: actor.email,
+      eventType: 'project.board.share.removed',
+      aggregateType: 'project_board',
+      aggregateId: board.id,
+      organizationId: actor.organizationId,
+      payload: { userEmail, organizationId: actor.organizationId },
+    }, client)
+  })
   return resolveProjectBoardAccess({ actorEmail: actor.email, boardId: board.id })
 }
 
@@ -633,12 +685,21 @@ export async function removePipelineShare(input: {
   const actor = await requireActiveAppUser(input.actorEmail)
   const pipeline = await resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: input.pipelineId })
   if (pipeline.ownerEmail !== actor.email) throw new Error('Only the pipeline owner can change sharing')
+  const userEmail = normalizeUserEmail(input.userEmail)
   await withTransaction(async (client) => {
     await client.query(
       'DELETE FROM pipeline_space_members WHERE pipeline_id = $1::uuid AND user_email = $2',
-      [pipeline.id, normalizeUserEmail(input.userEmail)],
+      [pipeline.id, userEmail],
     )
     await enqueuePipelinePermissionSyncWithClient(client, { pipelineId: pipeline.id, actor: actor.email })
+    await recordAuditEvent({
+      actor: actor.email,
+      eventType: 'pipeline.space.share.removed',
+      aggregateType: 'pipeline_space',
+      aggregateId: pipeline.id,
+      organizationId: pipeline.workspaceOrganizationId,
+      payload: { pipelineId: pipeline.id, userEmail, organizationId: pipeline.workspaceOrganizationId },
+    }, client)
   })
   return resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: pipeline.id })
 }

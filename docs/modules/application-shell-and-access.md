@@ -25,6 +25,10 @@ Provide a responsive, authenticated ClawPilot workspace with clear user identity
 - Each user manages name, job title, organization, timezone, locale, integrations, and sharing in Settings. Profile changes update that user's CRM Contact and organization membership projection.
 - Timestamps are stored in UTC and rendered in the signed-in user's timezone and locale.
 - ChatGPT/Codex authorization is stored per ClawPilot user. One user's credential cannot authorize another user's agent execution.
+- Activity is independent from the selected board or pipeline. Every user can review events they performed and security events targeting their account.
+- Administrators with `viewOrganizationAudit` can review the immutable event-time history for their assigned organization subtree. Moving a user or changing a share does not retroactively reclassify an event.
+- Administrators with `viewSystemAudit` can review global platform and worker activity. That scope excludes tenant board, pipeline, CRM, document, and short-link records.
+- Successful and failed sign-ins, code requests, and sign-outs are audited without storing magic codes, raw IP addresses, cookies, credentials, or provider tokens.
 
 ## Durable Data
 
@@ -32,6 +36,7 @@ Provide a responsive, authenticated ClawPilot workspace with clear user identity
 - `app_user_invitations`
 - `auth_magic_codes`
 - `app_users.organization_id`, organization hierarchy, global role, and explicit permissions
+- `audit_events.subject`, `audit_events.organization_id`, `audit_events.is_system`, and idempotent event keys
 - separate encrypted agent credential database
 
 ## Confirmed Nick Access

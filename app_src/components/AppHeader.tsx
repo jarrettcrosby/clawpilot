@@ -30,37 +30,15 @@ import ActivityLogPage from '@/components/activity/ActivityLogPage'
 import ShortcutsModal from '@/components/help/ShortcutsModal'
 import UserAccessDialog from '@/components/settings/UserAccessDialog'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
-import type { Task } from '@/lib/types'
 import { formatUserDateTime } from '@/lib/userDateTime'
 
-type PipelineActivityEntry = {
-  id: string
-  module: 'pipeline'
-  type: string
-  message: string
-  timestamp: string
-  actor: string
-  opportunityName?: string
-  organization?: string
-  fromStage?: string
-  toStage?: string
-}
+type ActivityPreview = { id: string }
 
 const READ_KEY = 'clawpilot_read_log'
-function getReadCount(tasks: Task[], pipelineEntries: PipelineActivityEntry[] = []): number {
+function getReadCount(events: ActivityPreview[]): number {
   try {
     const read = new Set(JSON.parse(localStorage.getItem(READ_KEY) || '[]'))
-    let unread = 0
-    for (const task of tasks) {
-      for (const e of task.activity || []) {
-        const id = `${task.id}-${e.timestamp}-${e.type}`
-        if (!read.has(id)) unread++
-      }
-    }
-    for (const e of pipelineEntries) {
-      if (!read.has(e.id)) unread++
-    }
-    return unread
+    return events.filter((event) => !read.has(event.id)).length
   } catch { return 0 }
 }
 
@@ -96,8 +74,7 @@ export default function AppHeader({
 }: Props) {
   const dateTimeSettings = useUserDateTime()
   const [drawerOpen, setDrawerOpen] = useState(false)
-  const [tasks, setTasks] = useState<Task[]>([])
-  const [pipelineEntries, setPipelineEntries] = useState<PipelineActivityEntry[]>([])
+  const [activityEvents, setActivityEvents] = useState<ActivityPreview[]>([])
   const [helpAnchor, setHelpAnchor] = useState<null | HTMLElement>(null)
   const [shortcutsOpen, setShortcutsOpen] = useState(false)
   const [health, setHealth] = useState<{ status: string; errors: string[] }>({ status: 'ok', errors: [] })
@@ -118,34 +95,18 @@ export default function AppHeader({
   const [freezeState, setFreezeState] = useState<{ frozen: boolean; reason?: string | null } | null>(null)
 
   const unreadCount = useMemo(() => (
-    drawerOpen ? 0 : getReadCount(tasks, pipelineEntries)
-  ), [drawerOpen, tasks, pipelineEntries])
+    drawerOpen ? 0 : getReadCount(activityEvents)
+  ), [activityEvents, drawerOpen])
 
   useEffect(() => {
-    Promise.all([
-      fetch('/api/tasks')
-        .then(async (r) => {
-          if (!r.ok) return [] as Task[]
-          const data = await r.json()
-          return Array.isArray(data) ? data as Task[] : []
-        })
-        .catch(() => [] as Task[]),
-      fetch('/api/pipeline/activity')
-        .then(async (r) => {
-          if (!r.ok) return [] as PipelineActivityEntry[]
-          const data = await r.json()
-          return Array.isArray(data) ? data as PipelineActivityEntry[] : []
-        })
-        .catch(() => [] as PipelineActivityEntry[]),
-    ])
-      .then(([taskData, pipelineData]) => {
-        setTasks(taskData)
-        setPipelineEntries(pipelineData)
+    fetch('/api/activity?limit=100', { cache: 'no-store' })
+      .then(async (response) => {
+        if (!response.ok) return [] as ActivityPreview[]
+        const payload = await response.json() as { events?: ActivityPreview[] }
+        return Array.isArray(payload.events) ? payload.events : []
       })
-      .catch(() => {
-        setTasks([])
-        setPipelineEntries([])
-      })
+      .then(setActivityEvents)
+      .catch(() => setActivityEvents([]))
   }, [drawerOpen])
 
   useEffect(() => {
@@ -476,9 +437,6 @@ export default function AppHeader({
         }}
       >
         <ActivityLogPage
-          tasks={tasks}
-          pipelineEntries={pipelineEntries}
-          defaultModule={activeSection}
           onClose={() => setDrawerOpen(false)}
         />
       </Drawer>
