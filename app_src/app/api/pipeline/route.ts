@@ -8,11 +8,10 @@ import type { CrmContact, CrmOpportunity } from '@/lib/crm/types'
 import { buildCanonicalWorkItem } from '@/lib/workItemModel'
 import { shouldFallbackToFileOnDatabaseError } from '@/lib/persistence/config'
 import {
+  createCrmOpportunityInPostgres,
   listCrmRecordsInPostgres,
-  readCrmOpportunityInPostgres,
   readCrmRecordReference,
   readCrmSummaryFromPostgres,
-  stageCrmRecordInPostgres,
 } from '@/lib/persistence/crm'
 import { isPostgresTaskStoreEnabled, readTasksFromPostgres } from '@/lib/persistence/tasks'
 import { isPostgresPipelineStoreEnabled } from '@/lib/persistence/pipeline'
@@ -219,8 +218,9 @@ export async function POST(req: NextRequest) {
   try {
     const actor = await requireRequestUser(req)
     const selected = req.cookies.get(PIPELINE_SELECTION_COOKIE)?.value || undefined
-    const pipeline = await resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: selected })
-      .catch(() => resolvePipelineSpaceAccess({ actorEmail: actor.email }))
+    const pipeline = selected
+      ? await resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: selected })
+      : await resolvePipelineSpaceAccess({ actorEmail: actor.email })
     requireResourceEditor(pipeline)
 
     const body = await req.json()
@@ -252,7 +252,7 @@ export async function POST(req: NextRequest) {
     if (organizationRecord.relationshipType !== 'customer') {
       throw new Error('Opportunities must be linked to a customer organization')
     }
-    const staged = await stageCrmRecordInPostgres({
+    const staged = await createCrmOpportunityInPostgres({
       entity: 'opportunities',
       pipelineId: pipeline.id,
       sourceKey,
@@ -274,13 +274,17 @@ export async function POST(req: NextRequest) {
         notes,
       },
     })
-    const opportunity = await readCrmOpportunityInPostgres({ pipelineId: pipeline.id, id: staged.id })
     return NextResponse.json({
       ok: true,
-      queued: true,
-      opportunity: crmOpportunityForPipeline(opportunity, new Map()),
-      crm: { id: staged.id, referenceCode: staged.referenceCode, syncStatus: 'pending' },
-    }, { status: 201 })
+      queued: staged.created,
+      replayed: !staged.created,
+      opportunity: crmOpportunityForPipeline(staged.opportunity, new Map()),
+      crm: {
+        id: staged.opportunity.id,
+        referenceCode: staged.opportunity.referenceCode,
+        syncStatus: staged.opportunity.syncStatus,
+      },
+    }, { status: staged.created ? 201 : 200 })
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unable to create opportunity'
     const status = message === 'Unauthorized' ? 401 : /denied|view-only/i.test(message) ? 403 : 400

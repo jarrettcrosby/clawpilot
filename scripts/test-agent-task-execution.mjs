@@ -10,9 +10,8 @@ const requireFromApp = createRequire(new URL('../app_src/package.json', import.m
 const ts = requireFromApp('typescript')
 const read = (relativePath) => readFileSync(resolve(root, relativePath), 'utf8')
 
-function loadExecutionModule() {
-  const path = 'app_src/lib/agents/taskExecution.ts'
-  const output = ts.transpileModule(read(path), {
+function transpile(path) {
+  return ts.transpileModule(read(path), {
     compilerOptions: {
       module: ts.ModuleKind.CommonJS,
       target: ts.ScriptTarget.ES2022,
@@ -20,6 +19,29 @@ function loadExecutionModule() {
     },
     fileName: path,
   }).outputText
+}
+
+function loadWorkItemModule() {
+  const path = 'app_src/lib/workItemModel.ts'
+  const module = { exports: {} }
+  const sandbox = {
+    console,
+    exports: module.exports,
+    module,
+    require(specifier) {
+      if (specifier !== '@/lib/crm/boardCard.mjs') throw new Error(`Unexpected import: ${specifier}`)
+      return {
+        isCrmBoardCard: () => false,
+        normalizeCrmBoardCard: (task) => task,
+      }
+    },
+  }
+  vm.runInNewContext(transpile(path), sandbox, { filename: path })
+  return module.exports
+}
+
+function loadExecutionModule(workItem) {
+  const path = 'app_src/lib/agents/taskExecution.ts'
   const module = { exports: {} }
   const sandbox = {
     console,
@@ -27,30 +49,84 @@ function loadExecutionModule() {
     module,
     require(specifier) {
       if (specifier !== '@/lib/workItemModel') throw new Error(`Unexpected import: ${specifier}`)
-      return {
-        applyCanonicalWorkItem(task) {
-          const result = task.execution?.lastResult || {}
-          return {
-            ...task,
-            workItem: {
-              status: task.status,
-              assignedAgent: task.assignedAgent,
-              nextAction: result.nextAction,
-              blocker: result.blockedReason,
-              waitingOn: result.waitingOn,
-              lastConcreteAction: result.whatWasDone,
-              activity: task.activity || [],
-            },
-          }
-        },
-      }
+      return workItem
     },
   }
-  vm.runInNewContext(output, sandbox, { filename: path })
+  vm.runInNewContext(transpile(path), sandbox, { filename: path })
   return module.exports
 }
 
-const execution = loadExecutionModule()
+function mockResponse(status, payload) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    text: async () => JSON.stringify(payload),
+  }
+}
+
+function loadDispatchWorker({ failBeforeResult = false, failSucceededState = false } = {}) {
+  const path = 'app_src/lib/agentDispatchWorker.ts'
+  const module = { exports: {} }
+  const taskStates = []
+  const failedItems = []
+  const item = {
+    dispatchId: '11111111-1111-4111-8111-111111111111',
+    idempotencyKey: 'agent:board:task:assignment:event',
+    operatorId: 'owner@example.com',
+    boardId: '22222222-2222-4222-8222-222222222222',
+    taskId: 'task-1',
+    agentId: 'projects',
+    text: 'Execute the task.',
+    trigger: 'assignment',
+    queuedAt: '2026-07-16T12:00:00.000Z',
+    attempts: 1,
+    lockToken: 'lock-1',
+  }
+  const persistence = {
+    claimAgentDispatchOutboxInPostgres: async () => [item],
+    completeAgentDispatchOutboxInPostgres: async () => undefined,
+    failAgentDispatchOutboxInPostgres: async (input) => {
+      failedItems.push(input)
+      return 'failed'
+    },
+  }
+  const fetch = async (url, init) => {
+    const body = JSON.parse(String(init.body || '{}'))
+    if (String(url).endsWith('/api/tasks')) {
+      const status = String(body?._agentDispatchState?.status || '')
+      taskStates.push(status)
+      if (failSucceededState && status === 'succeeded') {
+        return mockResponse(500, { error: 'task state write failed' })
+      }
+      return mockResponse(200, { ok: true })
+    }
+    if (String(url).endsWith('/api/agents/threads')) {
+      return failBeforeResult
+        ? mockResponse(502, { error: 'provider failed' })
+        : mockResponse(200, { ok: true })
+    }
+    throw new Error(`Unexpected URL: ${url}`)
+  }
+  const sandbox = {
+    AbortController,
+    clearTimeout,
+    console,
+    exports: module.exports,
+    fetch,
+    module,
+    process: { env: { PORT: '4002', PIPELINE_OUTBOX_WORKER_SECRET: 'test-secret' } },
+    require(specifier) {
+      if (specifier !== '@/lib/persistence/agentDispatch') throw new Error(`Unexpected import: ${specifier}`)
+      return persistence
+    },
+    setTimeout,
+  }
+  vm.runInNewContext(transpile(path), sandbox, { filename: path })
+  return { worker: module.exports, taskStates, failedItems }
+}
+
+const workItem = loadWorkItemModule()
+const execution = loadExecutionModule(workItem)
 const plan = execution.parseAgentTaskExecutionPlan(JSON.stringify({
   status: 'triaged',
   summary: 'Converted the request into durable task context and acceptance steps.',
@@ -85,7 +161,17 @@ const baseTask = {
   activity: [],
   comments: [],
   checklist: [],
-  execution: { executionStatus: 'running' },
+  execution: {
+    executionStatus: 'running',
+    agentDispatch: {
+      id: 'dispatch-1',
+      trigger: 'assignment',
+      status: 'running',
+      attempts: 1,
+      queuedAt: '2026-07-16T12:00:00.000Z',
+      updatedAt: '2026-07-16T12:00:00.000Z',
+    },
+  },
 }
 const first = execution.applyAgentTaskExecutionPlan({
   task: baseTask,
@@ -113,6 +199,157 @@ const retried = execution.applyAgentTaskExecutionPlan({
 })
 assert.equal(retried.task.checklist.length, 2, 'dispatch retry must not duplicate checklist entries')
 
+const substantiveDescription = [
+  'Preserve this operator-authored implementation brief exactly, including punctuation and line breaks.',
+  '',
+  'Acceptance criteria:',
+  '- Keep tenant boundaries explicit for every read and write.',
+  '- Preserve retry idempotency after partial persistence.',
+  '- Record evidence without claiming work that did not occur.',
+  '',
+  'This context is intentionally longer than a compact generated summary so dispatch cannot replace it.',
+].join('\n')
+const preservedDescription = execution.applyAgentTaskExecutionPlan({
+  task: { ...baseTask, desc: substantiveDescription },
+  plan,
+  agentId: 'projects',
+  dispatchId: 'dispatch-1',
+  timestamp: '2026-07-16T12:02:30.000Z',
+})
+assert.equal(
+  preservedDescription.task.desc,
+  substantiveDescription,
+  'agent descriptionUpdate must not replace a substantive user-authored task description',
+)
+assert.equal(Buffer.from(preservedDescription.task.desc).equals(Buffer.from(substantiveDescription)), true)
+
+const newerDispatchTask = {
+  ...first.task,
+  execution: {
+    ...first.task.execution,
+    executionStatus: 'queued',
+    agentDispatch: {
+      id: 'dispatch-2',
+      trigger: 'comment',
+      status: 'queued',
+      attempts: 0,
+      queuedAt: '2026-07-16T12:03:00.000Z',
+      updatedAt: '2026-07-16T12:03:00.000Z',
+    },
+  },
+}
+const stale = execution.applyAgentTaskExecutionPlanForDispatch({
+  task: newerDispatchTask,
+  plan,
+  agentId: 'projects',
+  dispatchId: 'dispatch-1',
+  timestamp: '2026-07-16T12:04:00.000Z',
+})
+assert.equal(stale.applied, false)
+assert.equal(stale.task, newerDispatchTask, 'a stale plan must return the current task unchanged')
+assert.deepEqual(Array.from(stale.evidence.changes), [])
+
+const missingDispatch = execution.applyAgentTaskExecutionPlanForDispatch({
+  task: { ...baseTask, execution: { executionStatus: 'running' } },
+  plan,
+  agentId: 'projects',
+  dispatchId: 'dispatch-1',
+  timestamp: '2026-07-16T12:04:30.000Z',
+})
+assert.equal(missingDispatch.applied, false, 'a plan without a matching canonical dispatch must be stale')
+
+const awaitingPlan = execution.parseAgentTaskExecutionPlan(JSON.stringify({
+  status: 'awaiting_input',
+  summary: 'The task needs one operator decision before work can continue.',
+  nextAction: 'Provide the target environment.',
+  waitingOn: 'the target environment',
+  blocker: '',
+  descriptionUpdate: '',
+  checklistAdd: [],
+  learned: 'Record the exact missing input.',
+}))
+const awaitingResult = execution.applyAgentTaskExecutionPlan({
+  task: baseTask,
+  plan: awaitingPlan,
+  agentId: 'projects',
+  dispatchId: 'dispatch-1',
+  timestamp: '2026-07-16T12:05:00.000Z',
+})
+const overwrittenByRetry = workItem.applyCanonicalWorkItem({
+  ...awaitingResult.task,
+  execution: {
+    ...awaitingResult.task.execution,
+    executionStatus: 'running',
+    latestExecutionNote: 'Agent run is processing.',
+    agentDispatch: {
+      ...awaitingResult.task.execution.agentDispatch,
+      status: 'running',
+      updatedAt: '2026-07-16T12:06:00.000Z',
+    },
+  },
+})
+assert.equal(overwrittenByRetry.workItem.waitingOn, undefined, 'the simulated transport overwrite should remove derived waiting state')
+const restored = execution.restorePersistedAgentTaskExecutionOutcome({
+  task: overwrittenByRetry,
+  agentId: 'projects',
+  dispatchId: 'dispatch-1',
+  timestamp: '2026-07-16T12:07:00.000Z',
+})
+assert.ok(restored, 'a persisted outcome should be recoverable by dispatch ID')
+assert.equal(restored.task.execution.executionStatus, 'awaiting_input')
+assert.equal(restored.task.execution.agentDispatch.status, 'succeeded')
+assert.equal(restored.task.workItem.waitingOn, 'the target environment')
+assert.match(restored.task.execution.latestExecutionNote, /Status: awaiting_input/)
+
+const noEvidencePlan = execution.parseAgentTaskExecutionPlan(JSON.stringify({
+  status: 'triaged',
+  summary: 'No additional task artifact was required.',
+  nextAction: 'Keep the existing next action.',
+  waitingOn: '',
+  blocker: '',
+  descriptionUpdate: '',
+  checklistAdd: [],
+  learned: 'Do not equate a response with concrete progress.',
+}))
+const noEvidence = execution.applyAgentTaskExecutionPlan({
+  task: {
+    ...baseTask,
+    desc: 'Detailed implementation context.',
+    workItem: {
+      status: 'backlog',
+      assignedAgent: 'projects',
+      nextAction: 'Keep the existing next action.',
+      activity: [],
+    },
+  },
+  plan: noEvidencePlan,
+  agentId: 'projects',
+  dispatchId: 'dispatch-1',
+  timestamp: '2026-07-16T12:08:00.000Z',
+})
+assert.deepEqual(Array.from(noEvidence.evidence.changes), [])
+assert.equal(noEvidence.task.execution.lastResult.whatWasDone, undefined)
+assert.equal(noEvidence.task.workItem.lastConcreteAction, undefined)
+assert.equal(workItem.deriveStateTruth({
+  workItem: noEvidence.task.workItem,
+  checklist: noEvidence.task.checklist,
+  executionStatus: noEvidence.task.execution.executionStatus,
+  executionUpdatedAt: noEvidence.task.execution.lastUpdatedAt,
+  nowMs: Date.parse('2026-07-16T12:09:00.000Z'),
+}).stateLabel, 'Waiting')
+
+const postResultFailure = loadDispatchWorker({ failSucceededState: true })
+const postResultSummary = await postResultFailure.worker.processAgentDispatchOutbox()
+assert.equal(postResultSummary.failed, 1)
+assert.deepEqual(postResultFailure.taskStates, ['running', 'succeeded'])
+assert.equal(postResultFailure.failedItems.length, 1)
+
+const preResultFailure = loadDispatchWorker({ failBeforeResult: true })
+const preResultSummary = await preResultFailure.worker.processAgentDispatchOutbox()
+assert.equal(preResultSummary.failed, 1)
+assert.deepEqual(preResultFailure.taskStates, ['running', 'queued'])
+assert.equal(preResultFailure.failedItems.length, 1)
+
 const taskRoute = read('app_src/app/api/tasks/route.ts')
 assert.match(taskRoute, /return normalized\.slice\(0, 10_000\)/, 'long task descriptions must be preserved')
 assert.doesNotMatch(taskRoute, /compact\.length\s*>\s*280/, 'task descriptions must not be replaced at 280 characters')
@@ -130,8 +367,9 @@ assert.match(provider, /You cannot edit repository files/)
 
 const threadRoute = read('app_src/app/api/agents/threads/route.ts')
 assert.match(threadRoute, /parseAgentTaskExecutionPlan\(responseText\)/)
-assert.match(threadRoute, /applyAgentTaskExecutionPlan/)
+assert.match(threadRoute, /applyAgentTaskExecutionPlanForDispatch/)
+assert.match(threadRoute, /restorePersistedDispatchOutcome/)
 assert.match(threadRoute, /evidence:\s*recorded\.evidence\?\.changes/)
 assert.doesNotMatch(threadRoute, /executionStatus:\s*'completed'/)
 
-console.log('agent task execution contract tests passed')
+console.log('agent task execution behavioral tests passed')

@@ -1356,7 +1356,7 @@ export default function PipelineSection() {
           const res = await fetch(`/api/pipeline/opportunity/${id}`, {
             method: 'PATCH',
             headers: { 'Content-Type': 'application/json', 'Idempotency-Key': mutationKey },
-            body: JSON.stringify({ appendComment: comment, actor: 'Jarrett', expectedUpdatedAt: selectedDeal?.updatedAt }),
+            body: JSON.stringify({ appendComment: comment, expectedUpdatedAt: selectedDeal?.updatedAt }),
           })
           const out = await res.json()
           if (!res.ok) throw new Error(out?.error || 'comment failed')

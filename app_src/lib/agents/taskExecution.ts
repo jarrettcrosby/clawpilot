@@ -24,6 +24,12 @@ export type AgentTaskExecutionEvidence = {
   learned: string
 }
 
+export type AgentTaskExecutionApplication = {
+  task: Task
+  evidence: AgentTaskExecutionEvidence
+  applied: boolean
+}
+
 const GENERIC_DESCRIPTION = 'Task created from directive. See checklist/comments for execution details.'
 const VALID_STATUS = new Set<AgentTaskExecutionStatus>(['triaged', 'awaiting_input', 'blocked'])
 
@@ -86,6 +92,18 @@ function canRepairDescription(task: Task) {
   return !description || description === GENERIC_DESCRIPTION
 }
 
+function evidenceFromPlan(plan: AgentTaskExecutionPlan, changes: string[]): AgentTaskExecutionEvidence {
+  return {
+    status: plan.status,
+    summary: plan.summary,
+    nextAction: plan.nextAction,
+    waitingOn: plan.waitingOn,
+    blocker: plan.blocker,
+    changes,
+    learned: plan.learned,
+  }
+}
+
 export function applyAgentTaskExecutionPlan(input: {
   task: Task
   plan: AgentTaskExecutionPlan
@@ -133,11 +151,12 @@ export function applyAgentTaskExecutionPlan(input: {
     type: 'agent-task-execution',
     status: plan.status,
     summary: plan.summary,
-    whatWasDone: changes.length > 0 ? changes.join('; ') : 'No task artifact changed',
+    whatWasDone: changes.length > 0 ? changes.join('; ') : undefined,
     nextAction: plan.nextAction,
     waitingOn: plan.waitingOn || undefined,
     blockedReason: plan.blocker || undefined,
     evidence: changes,
+    learned: plan.learned || undefined,
     dispatchId,
     recordedAt: timestamp,
   }
@@ -170,16 +189,92 @@ export function applyAgentTaskExecutionPlan(input: {
   })
   return {
     task: nextTask,
-    evidence: {
-      status: plan.status,
-      summary: plan.summary,
-      nextAction: plan.nextAction,
-      waitingOn: plan.waitingOn,
-      blocker: plan.blocker,
-      changes,
-      learned: plan.learned,
-    },
+    evidence: evidenceFromPlan(plan, changes),
   }
+}
+
+export function applyAgentTaskExecutionPlanForDispatch(input: {
+  task: Task
+  plan: AgentTaskExecutionPlan
+  agentId: string
+  dispatchId: string
+  timestamp: string
+}): AgentTaskExecutionApplication {
+  const currentDispatchId = String(input.task.execution?.agentDispatch?.id || '')
+  if (currentDispatchId !== input.dispatchId) {
+    return {
+      task: input.task,
+      evidence: evidenceFromPlan(input.plan, []),
+      applied: false,
+    }
+  }
+
+  const applied = applyAgentTaskExecutionPlan(input)
+  return { ...applied, applied: true }
+}
+
+export function readPersistedAgentTaskExecutionEvidence(
+  task: Task,
+  dispatchId: string,
+): AgentTaskExecutionEvidence | null {
+  const result = task.execution?.lastResult
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return null
+  const record = result as Record<string, unknown>
+  if (cleanText(record.type, 80) !== 'agent-task-execution') return null
+  if (cleanText(record.dispatchId, 100) !== dispatchId) return null
+
+  const status = cleanText(record.status, 40).toLowerCase() as AgentTaskExecutionStatus
+  const summary = cleanText(record.summary, 1200)
+  const nextAction = cleanText(record.nextAction, 500)
+  if (!VALID_STATUS.has(status) || !summary || !nextAction) return null
+
+  return {
+    status,
+    summary,
+    nextAction,
+    waitingOn: cleanText(record.waitingOn, 500),
+    blocker: cleanText(record.blockedReason, 500),
+    changes: (Array.isArray(record.evidence) ? record.evidence : [])
+      .map((change) => cleanText(change, 240))
+      .filter(Boolean)
+      .slice(0, 20),
+    learned: cleanText(record.learned, 280),
+  }
+}
+
+export function restorePersistedAgentTaskExecutionOutcome(input: {
+  task: Task
+  agentId: string
+  dispatchId: string
+  timestamp: string
+}): { task: Task; evidence: AgentTaskExecutionEvidence; summary: string } | null {
+  const currentDispatch = input.task.execution?.agentDispatch
+  if (!currentDispatch || currentDispatch.id !== input.dispatchId) return null
+
+  const evidence = readPersistedAgentTaskExecutionEvidence(input.task, input.dispatchId)
+  if (!evidence) return null
+
+  const result = input.task.execution?.lastResult as Record<string, unknown>
+  const recordedAtValue = cleanText(result.recordedAt, 100)
+  const recordedAt = Number.isFinite(Date.parse(recordedAtValue)) ? recordedAtValue : input.timestamp
+  const summary = formatAgentTaskExecutionResult(input.agentId, evidence)
+  const task = applyCanonicalWorkItem({
+    ...input.task,
+    execution: {
+      ...(input.task.execution || {}),
+      executionStatus: evidence.status,
+      lastUpdatedAt: recordedAt,
+      latestExecutionNote: summary,
+      agentDispatch: {
+        ...currentDispatch,
+        status: 'succeeded',
+        updatedAt: input.timestamp,
+        error: undefined,
+      },
+    },
+    updatedAt: input.timestamp,
+  })
+  return { task, evidence, summary }
 }
 
 export function formatAgentTaskExecutionResult(agentId: string, evidence: AgentTaskExecutionEvidence) {

@@ -45,6 +45,7 @@ These are application roles, not separately created ChatGPT custom agents. Each 
 - Assignment creates durable dispatch work. A later signed-user card comment creates another dispatch only when it explicitly addresses the assigned agent.
 - The Railway worker claims dispatches, runs the selected role through the user's own ChatGPT/Codex authorization, and persists execution runs/results.
 - Autonomous dispatch uses a structured task-execution contract. The role can repair a missing or generic task description, add deduplicated checklist items, set the next action, and record a specific blocker or required operator input.
+- A substantive user-authored description is immutable to agent execution. Dispatch retries restore the already-persisted semantic result, and a stale dispatch cannot mutate a task after a newer assignment or comment has been queued.
 - The agent reply and the exact persisted mutations are appended to the task thread as evidence. A provider response with no mutation is reported as no deliverable changed.
 - A concrete `nextAction` from the structured result becomes the task `nextAction`.
 - Every successful role response uses `Changed`, `Remaining`, `Waiting on`, and `Learned`. `Learned` contains one reusable operating lesson or `none`.

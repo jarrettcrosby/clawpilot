@@ -13,9 +13,10 @@ import { resolveResponderId } from '@/lib/agents/responder.mjs'
 import { getThread as getFileThread, listThreads as listFileThreads, upsertThreadMessage as upsertFileThreadMessage } from '@/lib/agents/threadStore.mjs'
 import { normalizeProductAgentId, resolveExecutionAgentForControlAgent } from '@/lib/agents/routing'
 import {
-  applyAgentTaskExecutionPlan,
+  applyAgentTaskExecutionPlanForDispatch,
   formatAgentTaskExecutionResult,
   parseAgentTaskExecutionPlan,
+  restorePersistedAgentTaskExecutionOutcome,
   type AgentTaskExecutionEvidence,
   type AgentTaskExecutionPlan,
 } from '@/lib/agents/taskExecution'
@@ -174,6 +175,29 @@ function deriveNextAction(summary: string): string {
   return firstRemaining?.replace(/^[-*]\s+/, '').trim() || 'Review the agent result and choose the next concrete step.'
 }
 
+async function restorePersistedDispatchOutcome(input: {
+  taskId: string
+  agentId: string
+  dispatchId: string
+  boardId?: string
+}) {
+  const tasks = await readTasks(input.boardId)
+  const index = tasks.findIndex((task) => String(task.id) === input.taskId)
+  if (index === -1) return null
+
+  const restored = restorePersistedAgentTaskExecutionOutcome({
+    task: tasks[index],
+    agentId: input.agentId,
+    dispatchId: input.dispatchId,
+    timestamp: new Date().toISOString(),
+  })
+  if (!restored) return null
+
+  tasks[index] = restored.task
+  await writeTasks(tasks, input.boardId)
+  return restored
+}
+
 async function recordAgentResult(input: {
   taskId: string
   agentId: string
@@ -181,22 +205,25 @@ async function recordAgentResult(input: {
   boardId?: string
   dispatchId?: string
   plan?: AgentTaskExecutionPlan
-}): Promise<{ evidence: AgentTaskExecutionEvidence | null; summary: string }> {
+}): Promise<{ evidence: AgentTaskExecutionEvidence | null; summary: string; applied: boolean }> {
   const { taskId, agentId, summary, boardId, dispatchId, plan } = input
   const tasks = await readTasks(boardId)
   const index = tasks.findIndex((task) => String(task.id) === taskId)
-  if (index === -1) return { evidence: null, summary }
+  if (index === -1) return { evidence: null, summary, applied: false }
 
   const now = new Date().toISOString()
   let task = tasks[index]
   let evidence: AgentTaskExecutionEvidence | null = null
   let resultSummary = summary
+  let planApplied = true
   if (plan) {
     if (!dispatchId) throw new Error('Task execution plan requires a dispatch ID')
-    const applied = applyAgentTaskExecutionPlan({ task, plan, agentId, dispatchId, timestamp: now })
+    const applied = applyAgentTaskExecutionPlanForDispatch({ task, plan, agentId, dispatchId, timestamp: now })
     task = applied.task
     evidence = applied.evidence
+    planApplied = applied.applied
     resultSummary = formatAgentTaskExecutionResult(agentId, evidence)
+    if (!planApplied) return { evidence, summary: resultSummary, applied: false }
   }
   const nextAction = evidence?.nextAction || deriveNextAction(resultSummary)
   const commentId = dispatchId ? `agent-dispatch-${dispatchId}` : Date.now().toString()
@@ -261,7 +288,7 @@ async function recordAgentResult(input: {
     updatedAt: now,
   }
   await writeTasks(tasks, boardId)
-  return { evidence, summary: resultSummary }
+  return { evidence, summary: resultSummary, applied: planApplied }
 }
 
 async function recordExecutionTelemetry(entry: Record<string, unknown>, includeResult = false) {
@@ -474,6 +501,9 @@ export async function POST(req: NextRequest) {
     ? beforeMessages.find((message) => message.role === 'agent' && message.meta?.dispatchId === dispatchId)
     : null
   if (existingResponse) {
+    const restored = dispatchId
+      ? await restorePersistedDispatchOutcome({ taskId, agentId, dispatchId, boardId: board?.id })
+      : null
     return NextResponse.json({
       ok: true,
       deduplicated: true,
@@ -481,7 +511,7 @@ export async function POST(req: NextRequest) {
       userMessage: beforeMessages.find((message) => message.id === requestMessageId) || null,
       agentMessage: existingResponse,
       runtime,
-      canonicalWorkItem: buildCanonicalWorkItem(task),
+      canonicalWorkItem: buildCanonicalWorkItem(restored?.task || task),
     })
   }
 
@@ -490,18 +520,33 @@ export async function POST(req: NextRequest) {
     ? (task.comments || []).find((comment) => comment.id === resultCommentId)
     : null
   if (existingResultComment) {
+    const restored = dispatchId
+      ? await restorePersistedDispatchOutcome({ taskId, agentId, dispatchId, boardId: board?.id })
+      : null
     const recoveredText = existingResultComment.text.replace(/^Agent:\s*[^\n]+\n\n/i, '').trim()
+    const responseText = restored?.summary || recoveredText || existingResultComment.text
+    const executionStatus = restored?.evidence.status || 'responded'
     await upsertPersistedThreadMessage({
       messageId: resultMessageId,
       operatorId,
       agentId,
-      text: recoveredText || existingResultComment.text,
+      text: responseText,
       role: 'agent',
       taskId,
-      status: 'active',
+      status: executionStatus === 'blocked' || executionStatus === 'awaiting_input' ? 'blocked' : 'active',
       tags,
       routing,
-      meta: { source: messageSource, phase: 'response', dispatchId, recovered: true, responder: responderId, executionAgentId, provider: runtime.provider },
+      meta: {
+        source: messageSource,
+        phase: 'response',
+        dispatchId,
+        recovered: true,
+        responder: responderId,
+        executionAgentId,
+        provider: runtime.provider,
+        executionStatus,
+        evidence: restored?.evidence.changes || [],
+      },
     })
     const recoveredThread = await getPersistedThread({ operatorId, agentId, taskId })
     const recoveredMessages = (Array.isArray(recoveredThread?.messages) ? recoveredThread.messages : []) as Array<{
@@ -517,7 +562,7 @@ export async function POST(req: NextRequest) {
       userMessage: recoveredMessages.find((message) => message.id === requestMessageId) || null,
       agentMessage: recoveredMessages.find((message) => message.id === resultMessageId) || null,
       runtime,
-      canonicalWorkItem: buildCanonicalWorkItem(task),
+      canonicalWorkItem: buildCanonicalWorkItem(restored?.task || task),
     })
   }
 
@@ -660,7 +705,7 @@ export async function POST(req: NextRequest) {
     agentId,
     provider: runtime.provider,
     model: runtime.model,
-    status: recorded.evidence?.status || 'responded',
+    status: recorded.applied ? recorded.evidence?.status || 'responded' : 'stale',
     startedAt,
     completedAt,
     summary: responseText,
@@ -676,7 +721,7 @@ export async function POST(req: NextRequest) {
     text: responseText,
     role: 'agent',
     taskId,
-    status: recorded.evidence?.status === 'blocked' || recorded.evidence?.status === 'awaiting_input'
+    status: recorded.applied && (recorded.evidence?.status === 'blocked' || recorded.evidence?.status === 'awaiting_input')
       ? 'blocked'
       : 'active',
     tags,
@@ -689,7 +734,8 @@ export async function POST(req: NextRequest) {
       responder: responderId,
       executionAgentId,
       provider: runtime.provider,
-      executionStatus: recorded.evidence?.status || 'responded',
+      executionStatus: recorded.applied ? recorded.evidence?.status || 'responded' : 'stale',
+      executionApplied: recorded.applied,
       evidence: recorded.evidence?.changes || [],
     },
   })

@@ -21,6 +21,8 @@
         "Keeps autonomous work triaged, awaiting input, or blocked until separate completion evidence exists",
         "Makes assignment retries idempotent so generated checklist items are not duplicated",
         "Requires idempotency keys for opportunity creation to prevent duplicate CRM records after network retries",
+        "Makes opportunity creates and edits replay-safe so delayed retries cannot overwrite newer CRM changes",
+        "Preserves blocked, awaiting-input, and triaged agent outcomes across worker retries and ignores stale dispatch results",
         "Removes direct guessed Google Sheet row writes from opportunity creation and editing"
       ]
     }

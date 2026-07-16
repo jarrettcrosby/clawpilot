@@ -4,9 +4,10 @@ import type { CrmOpportunity } from '@/lib/crm/types'
 import { getErrorMessage } from '@/lib/errorUtils'
 import { logPipelineEvent } from '@/lib/pipelineLog'
 import {
+  appendCrmOpportunityCommentInPostgres,
   readCrmOpportunityInPostgres,
-  readCrmRecordReference,
   stageCrmRecordInPostgres,
+  updateCrmOpportunityInPostgres,
 } from '@/lib/persistence/crm'
 import { isPostgresPipelineStoreEnabled } from '@/lib/persistence/pipeline'
 import { requireRequestUser } from '@/lib/requestUser'
@@ -34,22 +35,28 @@ async function resolvePipelineContext(req: NextRequest): Promise<PipelineContext
   if (!isPostgresPipelineStoreEnabled()) throw new Error('Pipeline changes require Postgres storage')
   const actor = await requireRequestUser(req)
   const selected = req.cookies.get(PIPELINE_SELECTION_COOKIE)?.value || undefined
-  const pipeline = await resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: selected })
-    .catch(() => resolvePipelineSpaceAccess({ actorEmail: actor.email }))
+  const pipeline = selected
+    ? await resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: selected })
+    : await resolvePipelineSpaceAccess({ actorEmail: actor.email })
   requireResourceEditor(pipeline)
   return { actor, pipeline }
 }
 
-function stableInteractionSourceKey(req: NextRequest, context: PipelineContext, opportunityId: string) {
+function stableMutationSourceKey(
+  req: NextRequest,
+  context: PipelineContext,
+  opportunityId: string,
+  namespace: 'interactions' | 'comments' | 'updates',
+) {
   const provided = String(req.headers.get('idempotency-key') || '').trim()
-  if (!provided) throw new Error('Idempotency-Key is required for interaction creation')
+  if (!provided) throw new Error('Idempotency-Key is required for opportunity mutations')
   if (provided.length > 200) throw new Error('Idempotency-Key must be 200 characters or fewer')
   const digest = crypto
     .createHash('sha256')
-    .update(`${context.pipeline.id}\n${context.actor.email}\n${opportunityId}\n${provided}`)
+    .update(`${namespace}\n${context.pipeline.id}\n${context.actor.email.toLowerCase()}\n${opportunityId}\n${provided}`)
     .digest('hex')
     .slice(0, 40)
-  return `app:interactions:${digest}`
+  return `app:pipeline-opportunity-${namespace}:${digest}`
 }
 
 function finiteNumber(value: unknown, fallback = 0) {
@@ -99,7 +106,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     const staged = await stageCrmRecordInPostgres({
       entity: 'interactions',
       pipelineId: context.pipeline.id,
-      sourceKey: stableInteractionSourceKey(req, context, opportunity.id),
+      sourceKey: stableMutationSourceKey(req, context, opportunity.id, 'interactions'),
       sourcePayload: { source: 'clawpilot-pipeline', opportunityId: opportunity.id },
       actorEmail: context.actor.email,
       fields: {
@@ -142,40 +149,65 @@ export async function PATCH(req: NextRequest, ctx: { params: Promise<{ id: strin
     const context = await resolvePipelineContext(req)
     const { id } = await ctx.params
     const updates = await req.json() as Record<string, unknown>
-    const current = await readCrmOpportunityInPostgres({ pipelineId: context.pipeline.id, id })
-    const organization = current.organizationId
-      ? await readCrmRecordReference({
-          pipelineId: context.pipeline.id,
-          entity: 'organizations',
-          id: current.organizationId,
-        })
-      : null
-
-    if (updates.expectedUpdatedAt && current.updatedAt && updates.expectedUpdatedAt !== current.updatedAt) {
-      return NextResponse.json({
-        error: 'Conflict: record changed since load',
-        conflict: true,
-        current: displayOpportunity(current),
-      }, { status: 409 })
+    const expectedUpdatedAt = String(updates.expectedUpdatedAt || '').trim()
+    if (!expectedUpdatedAt) {
+      return NextResponse.json({ error: 'expectedUpdatedAt is required for opportunity mutations' }, { status: 400 })
     }
+    const current = await readCrmOpportunityInPostgres({ pipelineId: context.pipeline.id, id })
 
-    let notes = updates.notes !== undefined ? String(updates.notes || '') : current.notes
     const appendedComment = String(updates.appendComment || '').trim()
     if (appendedComment) {
       const line = `[${actorTimestamp(context.actor)}] [${context.actor.email}] ${appendedComment}`
-      notes = notes ? `${notes}\n${line}` : line
+      const result = await appendCrmOpportunityCommentInPostgres({
+        pipelineId: context.pipeline.id,
+        opportunityId: current.id,
+        sourceKey: stableMutationSourceKey(req, context, current.id, 'comments'),
+        expectedUpdatedAt,
+        actorEmail: context.actor.email,
+        actorName: context.actor.displayName || context.actor.email,
+        occurredAt: new Date().toISOString(),
+        comment: appendedComment,
+        commentLine: line,
+      })
+      if (result.conflict) {
+        return NextResponse.json({
+          error: 'Conflict: record changed since load',
+          conflict: true,
+          current: displayOpportunity(result.opportunity),
+        }, { status: 409 })
+      }
+      if (result.created) {
+        logPipelineEvent({
+          module: 'pipeline-opportunity',
+          action: 'comment',
+          activityType: 'comment',
+          recordId: id,
+          result: 'ok',
+          actor: context.actor.email,
+          pipelineId: context.pipeline.id,
+          opportunityName: result.opportunity.name,
+          organization: result.opportunity.organization,
+          message: `Note added: "${appendedComment.slice(0, 80)}"`,
+        })
+      }
+      return NextResponse.json({
+        ok: true,
+        duplicate: !result.created,
+        opportunity: displayOpportunity(result.opportunity),
+        syncStatus: result.opportunity.syncStatus === 'synced' ? 'succeeded' : 'queued',
+      }, { status: result.opportunity.syncStatus === 'synced' ? 200 : 202 })
     }
 
-    await stageCrmRecordInPostgres({
-      entity: 'opportunities',
+    const notes = updates.notes !== undefined ? String(updates.notes || '') : current.notes
+
+    const result = await updateCrmOpportunityInPostgres({
       pipelineId: context.pipeline.id,
-      localId: current.id,
-      sourceKey: current.sourceKey,
-      sourcePayload: { source: 'clawpilot-pipeline' },
+      opportunityId: current.id,
+      mutationKey: stableMutationSourceKey(req, context, current.id, 'updates'),
+      expectedUpdatedAt,
       actorEmail: context.actor.email,
       fields: {
         organizationId: current.organizationId,
-        organizationSuiteCrmId: organization?.suiteCrmId || null,
         name: updates.name !== undefined ? String(updates.name || '').trim() : current.name,
         organization: current.organization,
         priority: updates.priority !== undefined ? String(updates.priority || '') : current.priority,
@@ -194,9 +226,16 @@ export async function PATCH(req: NextRequest, ctx: { params: Promise<{ id: strin
         notes,
       },
     })
-    const updated = await readCrmOpportunityInPostgres({ pipelineId: context.pipeline.id, id })
+    if (result.conflict) {
+      return NextResponse.json({
+        error: 'Conflict: record changed since load',
+        conflict: true,
+        current: displayOpportunity(result.opportunity),
+      }, { status: 409 })
+    }
+    const updated = result.opportunity
 
-    if (updates.stage !== undefined && String(updates.stage) !== current.stage) {
+    if (result.applied && updates.stage !== undefined && String(updates.stage) !== current.stage) {
       logPipelineEvent({
         module: 'pipeline',
         action: 'stage-change',
@@ -212,21 +251,24 @@ export async function PATCH(req: NextRequest, ctx: { params: Promise<{ id: strin
         message: `Stage changed from ${current.stage || '—'} to ${updated.stage || '—'}`,
       })
     }
-    logPipelineEvent({
-      module: 'pipeline-opportunity',
-      action: appendedComment ? 'comment' : 'update',
-      activityType: appendedComment ? 'comment' : 'updated',
-      recordId: id,
-      result: 'ok',
-      actor: context.actor.email,
-      pipelineId: context.pipeline.id,
-      opportunityName: updated.name,
-      organization: updated.organization,
-      message: appendedComment ? `Note added: "${appendedComment.slice(0, 80)}"` : 'Opportunity updated',
-    })
+    if (result.applied) {
+      logPipelineEvent({
+        module: 'pipeline-opportunity',
+        action: 'update',
+        activityType: 'updated',
+        recordId: id,
+        result: 'ok',
+        actor: context.actor.email,
+        pipelineId: context.pipeline.id,
+        opportunityName: updated.name,
+        organization: updated.organization,
+        message: 'Opportunity updated',
+      })
+    }
 
     return NextResponse.json({
       ok: true,
+      duplicate: result.replayed,
       opportunity: displayOpportunity(updated),
       syncStatus: updated.syncStatus === 'synced' ? 'succeeded' : 'queued',
     }, { status: updated.syncStatus === 'synced' ? 200 : 202 })

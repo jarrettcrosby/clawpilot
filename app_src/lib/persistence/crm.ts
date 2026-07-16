@@ -468,7 +468,17 @@ async function enqueueSuiteCrmRecord(
       VALUES ($1, $2, 'upsert_record', 'suitecrm', $3::jsonb, 'queued', $4, now(), now(), now())
       ON CONFLICT (target_system, idempotency_key)
       WHERE idempotency_key IS NOT NULL
-      DO NOTHING
+      DO UPDATE SET
+        payload = EXCLUDED.payload,
+        status = 'queued',
+        attempts = 0,
+        last_error = NULL,
+        available_at = now(),
+        processed_at = NULL,
+        locked_at = NULL,
+        lock_token = NULL,
+        updated_at = now()
+      WHERE sync_outbox.status IN ('succeeded', 'dead')
       RETURNING idempotency_key
     `,
     [
@@ -1229,6 +1239,154 @@ export async function stageCrmRecordInPostgres(input: StageCrmRecordInput) {
   return withTransaction((client) => stageCrmRecordWithClient(client, input))
 }
 
+async function lockCrmMutation(client: PoolClient, key: string) {
+  await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [key])
+}
+
+export async function createCrmOpportunityInPostgres(input: StageOpportunityInput): Promise<{
+  opportunity: CrmOpportunity
+  created: boolean
+}> {
+  return withTransaction(async (client) => {
+    const mutationKey = `crm-opportunity-create:${input.pipelineId}:${clean(input.sourceKey)}`
+    const requestFingerprint = crmSourceHash({ fields: input.fields, sourcePayload: input.sourcePayload || {} })
+    await lockCrmMutation(client, mutationKey)
+    const receipt = await client.query<{ aggregate_id: string; request_fingerprint: string | null }>(
+      `SELECT aggregate_id, payload->>'requestFingerprint' AS request_fingerprint
+       FROM audit_events WHERE event_key = $1 LIMIT 1`,
+      [mutationKey],
+    )
+    if (receipt.rows[0]) {
+      if (receipt.rows[0].request_fingerprint && receipt.rows[0].request_fingerprint !== requestFingerprint) {
+        throw new Error('Idempotency-Key was already used with a different opportunity payload')
+      }
+      const replayed = await client.query<Record<string, unknown>>(
+        `SELECT * FROM crm_opportunities
+         WHERE pipeline_id = $1::uuid AND id = $2::uuid
+         LIMIT 1`,
+        [input.pipelineId, receipt.rows[0].aggregate_id],
+      )
+      if (!replayed.rows[0]) throw new Error('Opportunity not found')
+      return { opportunity: opportunityFromRow(replayed.rows[0]), created: false }
+    }
+
+    const existing = await client.query<Record<string, unknown>>(
+      `SELECT * FROM crm_opportunities
+       WHERE pipeline_id = $1::uuid AND source_key = $2
+       LIMIT 1`,
+      [input.pipelineId, clean(input.sourceKey)],
+    )
+    if (existing.rows[0]) {
+      await recordAuditEvent({
+        actor: input.actorEmail,
+        eventType: 'pipeline.opportunity.created',
+        aggregateType: 'crm_opportunity',
+        aggregateId: String(existing.rows[0].id),
+        eventKey: mutationKey,
+        organizationId: nullable(existing.rows[0].organization_id),
+        payload: { pipelineId: input.pipelineId, requestFingerprint: null, recoveredReceipt: true },
+      }, client)
+      return { opportunity: opportunityFromRow(existing.rows[0]), created: false }
+    }
+
+    const staged = await stageCrmRecordWithClient(client, input)
+    const created = await client.query<Record<string, unknown>>(
+      `SELECT * FROM crm_opportunities
+       WHERE pipeline_id = $1::uuid AND id = $2::uuid
+       LIMIT 1`,
+      [input.pipelineId, staged.id],
+    )
+    await recordAuditEvent({
+      actor: input.actorEmail,
+      eventType: 'pipeline.opportunity.created',
+      aggregateType: 'crm_opportunity',
+      aggregateId: staged.id,
+      eventKey: mutationKey,
+      organizationId: input.fields.organizationId || null,
+      payload: { pipelineId: input.pipelineId, requestFingerprint },
+    }, client)
+    return { opportunity: opportunityFromRow(created.rows[0]), created: true }
+  })
+}
+
+export async function updateCrmOpportunityInPostgres(input: {
+  pipelineId: string
+  opportunityId: string
+  mutationKey: string
+  expectedUpdatedAt: string
+  actorEmail: string
+  fields: StageOpportunityInput['fields']
+}): Promise<{
+  opportunity: CrmOpportunity
+  applied: boolean
+  replayed: boolean
+  conflict: boolean
+}> {
+  return withTransaction(async (client) => {
+    const receiptKey = `pipeline-opportunity-update:${input.mutationKey}`
+    await lockCrmMutation(client, receiptKey)
+    const receipt = await client.query(
+      'SELECT 1 FROM audit_events WHERE event_key = $1 LIMIT 1',
+      [receiptKey],
+    )
+    if (receipt.rowCount) {
+      const replayed = await client.query<Record<string, unknown>>(
+        `SELECT * FROM crm_opportunities
+         WHERE pipeline_id = $1::uuid AND id = $2::uuid
+         LIMIT 1`,
+        [input.pipelineId, input.opportunityId],
+      )
+      if (!replayed.rows[0]) throw new Error('Opportunity not found')
+      return { opportunity: opportunityFromRow(replayed.rows[0]), applied: false, replayed: true, conflict: false }
+    }
+
+    const locked = await client.query<Record<string, unknown>>(
+      `SELECT opportunity.*, organization.suitecrm_id AS organization_suitecrm_id
+       FROM crm_opportunities opportunity
+       LEFT JOIN crm_organizations organization ON organization.id = opportunity.organization_id
+       WHERE opportunity.pipeline_id = $1::uuid AND opportunity.id = $2::uuid
+       FOR UPDATE OF opportunity`,
+      [input.pipelineId, input.opportunityId],
+    )
+    const row = locked.rows[0]
+    if (!row) throw new Error('Opportunity not found')
+    const current = opportunityFromRow(row)
+    if (current.updatedAt !== input.expectedUpdatedAt) {
+      return { opportunity: current, applied: false, replayed: false, conflict: true }
+    }
+
+    await stageCrmRecordWithClient(client, {
+      entity: 'opportunities',
+      pipelineId: input.pipelineId,
+      localId: current.id,
+      sourceKey: current.sourceKey,
+      sourcePayload: { source: 'clawpilot-pipeline' },
+      actorEmail: input.actorEmail,
+      fields: {
+        ...input.fields,
+        organizationId: current.organizationId,
+        organizationSuiteCrmId: nullable(row.organization_suitecrm_id),
+      },
+    })
+    await recordAuditEvent({
+      actor: input.actorEmail,
+      eventType: 'pipeline.opportunity.updated',
+      aggregateType: 'crm_opportunity',
+      aggregateId: current.id,
+      eventKey: receiptKey,
+      organizationId: current.organizationId,
+      payload: { pipelineId: input.pipelineId, opportunityId: current.id },
+    }, client)
+    const updated = await client.query<Record<string, unknown>>(
+      `SELECT * FROM crm_opportunities
+       WHERE pipeline_id = $1::uuid AND id = $2::uuid
+       LIMIT 1`,
+      [input.pipelineId, input.opportunityId],
+    )
+    return { opportunity: opportunityFromRow(updated.rows[0]), applied: true, replayed: false, conflict: false }
+  })
+}
+
 export function normalizeCrmDescription(value: unknown): string {
   const normalized = String(value ?? '')
     .replace(/\r\n?/g, '\n')
@@ -1868,6 +2026,96 @@ export async function readCrmOpportunityInPostgres(input: {
   const row = result.rows[0]
   if (!row) throw new Error('Opportunity not found')
   return opportunityFromRow(row)
+}
+
+export async function appendCrmOpportunityCommentInPostgres(input: {
+  pipelineId: string
+  opportunityId: string
+  sourceKey: string
+  expectedUpdatedAt: string
+  actorEmail: string
+  actorName: string
+  occurredAt: string
+  comment: string
+  commentLine: string
+}): Promise<{ opportunity: CrmOpportunity; created: boolean; conflict: boolean }> {
+  return withTransaction(async (client) => {
+    const locked = await client.query<Record<string, unknown>>(
+      `SELECT opportunity.*, organization.suitecrm_id AS organization_suitecrm_id
+       FROM crm_opportunities opportunity
+       LEFT JOIN crm_organizations organization ON organization.id = opportunity.organization_id
+       WHERE opportunity.pipeline_id = $1::uuid AND opportunity.id = $2::uuid
+       FOR UPDATE OF opportunity`,
+      [input.pipelineId, input.opportunityId],
+    )
+    const row = locked.rows[0]
+    if (!row) throw new Error('Opportunity not found')
+    const current = opportunityFromRow(row)
+
+    const existing = await client.query(
+      `SELECT 1 FROM crm_interactions
+       WHERE pipeline_id = $1::uuid AND source_key = $2
+       LIMIT 1`,
+      [input.pipelineId, input.sourceKey],
+    )
+    if (existing.rowCount) return { opportunity: current, created: false, conflict: false }
+    if (current.updatedAt !== input.expectedUpdatedAt) {
+      return { opportunity: current, created: false, conflict: true }
+    }
+
+    const notes = current.notes ? `${current.notes}\n${input.commentLine}` : input.commentLine
+    await stageCrmRecordWithClient(client, {
+      entity: 'opportunities',
+      pipelineId: input.pipelineId,
+      localId: current.id,
+      sourceKey: current.sourceKey,
+      sourcePayload: { source: 'clawpilot-pipeline' },
+      actorEmail: input.actorEmail,
+      fields: {
+        organizationId: current.organizationId,
+        organizationSuiteCrmId: nullable(row.organization_suitecrm_id),
+        name: current.name,
+        organization: current.organization,
+        priority: current.priority,
+        owner: current.owner,
+        status: current.status,
+        stage: current.stage,
+        lossReason: current.lossReason,
+        source: current.source,
+        value: current.value,
+        probability: current.probability,
+        expectedClose: current.expectedClose || null,
+        notes,
+      },
+    })
+    await stageCrmRecordWithClient(client, {
+      entity: 'interactions',
+      pipelineId: input.pipelineId,
+      sourceKey: input.sourceKey,
+      sourcePayload: { source: 'clawpilot-pipeline-comment', opportunityId: current.id },
+      actorEmail: input.actorEmail,
+      fields: {
+        organizationId: current.organizationId,
+        opportunityId: current.id,
+        parentSuiteCrmId: current.suiteCrmId,
+        parentSuiteCrmType: 'Opportunities',
+        interactionType: 'Note',
+        subject: `Note: ${current.name}`,
+        agentName: input.actorName,
+        occurredAt: input.occurredAt,
+        description: input.comment,
+        direction: 'internal',
+      },
+    })
+
+    const updated = await client.query<Record<string, unknown>>(
+      `SELECT * FROM crm_opportunities
+       WHERE pipeline_id = $1::uuid AND id = $2::uuid
+       LIMIT 1`,
+      [input.pipelineId, input.opportunityId],
+    )
+    return { opportunity: opportunityFromRow(updated.rows[0]), created: true, conflict: false }
+  })
 }
 
 export async function readCrmSummaryFromPostgres(pipelineId: string): Promise<CrmSummary> {

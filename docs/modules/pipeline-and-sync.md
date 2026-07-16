@@ -21,7 +21,7 @@ Provide a user-owned pipeline workspace while preserving the Opportunities Sheet
 - A pipeline owner can share view or edit access with another active user.
 - Railway Postgres stores ClawPilot-owned pipeline definitions, normalized rows, projections, sync outbox entries, and audit events.
 - Pipeline editors can create an opportunity from the Pipeline surface by selecting an existing customer organization or creating that customer organization inline. The opportunity is immediately written to the tenant-scoped CRM tables in Postgres and queued for SuiteCRM synchronization.
-- ClawPilot opportunity creation requires a caller-stable idempotency key. A network retry therefore returns the same CRM opportunity instead of creating a duplicate.
+- ClawPilot opportunity creation and editing require caller-stable idempotency keys. Creates return the existing record without overwriting later edits, and edits use an atomic version check plus a durable replay receipt so concurrent writers cannot silently replace one another.
 - Opportunity edits and comments update the CRM record by its Postgres UUID. They never infer or increment a Google Sheet row number.
 - Only `Opportunities!B5:M` remains an operator-facing writable workbook table. CRM and reporting tabs are generated projections.
 - SuiteCRM/Postgres is the entity authority for app-created opportunities. Google Sheets remains an operator-editable input and reporting surface; synchronization projects changes in both directions through durable outboxes rather than competing direct writes.

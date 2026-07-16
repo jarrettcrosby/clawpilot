@@ -13,8 +13,7 @@ for (const fragment of [
   "entity: 'organizations'",
   "relationshipType !== 'customer'",
   "entity: 'opportunities'",
-  'stageCrmRecordInPostgres',
-  'readCrmOpportunityInPostgres',
+  'createCrmOpportunityInPostgres',
 ]) {
   assert.ok(route.includes(fragment), `pipeline opportunity route missing ${fragment}`)
 }
@@ -24,9 +23,26 @@ assert.doesNotMatch(route, /appendPipelineSheetRow/, 'the UI must not write a gu
 const mutationRoute = read('app_src/app/api/pipeline/opportunity/[id]/route.ts')
 assert.match(mutationRoute, /readCrmOpportunityInPostgres/)
 assert.match(mutationRoute, /stageCrmRecordInPostgres/)
+assert.match(mutationRoute, /appendCrmOpportunityCommentInPostgres/)
+assert.match(mutationRoute, /updateCrmOpportunityInPostgres/)
 assert.match(mutationRoute, /expectedUpdatedAt/)
 assert.doesNotMatch(mutationRoute, /sourceRowNumber\s*[-+]/, 'opportunity edits must not derive a Sheet row number')
 assert.doesNotMatch(mutationRoute, /upsertPipelineProjectionInPostgres/)
+
+const crmPersistence = read('app_src/lib/persistence/crm.ts')
+assert.match(crmPersistence, /appendCrmOpportunityCommentInPostgres/)
+assert.match(crmPersistence, /createCrmOpportunityInPostgres/)
+assert.match(crmPersistence, /updateCrmOpportunityInPostgres/)
+assert.match(crmPersistence, /pg_advisory_xact_lock/)
+assert.match(crmPersistence, /FOR UPDATE OF opportunity/)
+assert.match(crmPersistence, /source: 'clawpilot-pipeline-comment'/)
+assert.match(crmPersistence, /pipeline-opportunity-update:/)
+assert.match(crmPersistence, /crm-opportunity-create:/)
+assert.match(crmPersistence, /requestFingerprint/)
+assert.match(crmPersistence, /Idempotency-Key was already used with a different opportunity payload/)
+
+assert.doesNotMatch(route, /resolvePipelineSpaceAccess\(\{ actorEmail: actor\.email, pipelineId: selected \}\)\s*\.catch/)
+assert.doesNotMatch(mutationRoute, /resolvePipelineSpaceAccess\(\{ actorEmail: actor\.email, pipelineId: selected \}\)\s*\.catch/)
 
 const component = read('app_src/components/pipeline/PipelineSection.tsx')
 assert.match(component, /New opportunity/)
@@ -34,6 +50,7 @@ assert.match(component, /Select an organization already in CRM/)
 assert.match(component, /Add organization/)
 assert.match(component, /record\.relationshipType === 'customer'/)
 assert.match(component, /'Idempotency-Key': newOpportunityMutationKey/)
+assert.doesNotMatch(component, /actor: 'Jarrett'/)
 assert.match(component, /pipelineAccess === 'owner' \|\| pipelineAccess === 'editor'/)
 assert.doesNotMatch(component, /canEdit\s*=\s*!pipelineSyncEnabled/, 'Sheet sync must not control CRM edit access')
 
