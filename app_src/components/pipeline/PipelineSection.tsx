@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import Box from '@mui/material/Box'
 import Typography from '@mui/material/Typography'
 import Chip from '@mui/material/Chip'
@@ -32,10 +32,16 @@ import AddRounded from '@mui/icons-material/AddRounded'
 import AddToDriveRounded from '@mui/icons-material/AddToDriveRounded'
 import OpenInNewRounded from '@mui/icons-material/OpenInNewRounded'
 import ReplayRounded from '@mui/icons-material/ReplayRounded'
+import TuneRounded from '@mui/icons-material/TuneRounded'
 import Tabs from '@mui/material/Tabs'
 import Tab from '@mui/material/Tab'
 import useMediaQuery from '@mui/material/useMediaQuery'
 import WorkspaceSelector from '@/components/workspaces/WorkspaceSelector'
+import PipelineCatalogDialog, {
+  type PipelineCatalogPerson,
+  type PipelineCatalogProduct,
+  type PipelineCatalogSnapshot,
+} from '@/components/pipeline/PipelineCatalogDialog'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import { formatUserDateTime, type UserDateTimeSettings } from '@/lib/userDateTime'
 
@@ -69,6 +75,8 @@ type Deal = {
   id: string
   organizationId?: string
   contactIds?: string[]
+  productIds?: string[]
+  ownerContactId?: string
   priority: string
   name: string
   owner: string
@@ -105,7 +113,8 @@ type OrganizationOption = {
 const EMPTY_OPPORTUNITY = {
   organizationId: '',
   contactIds: [] as string[],
-  products: [] as string[],
+  productIds: [] as string[],
+  ownerContactId: '',
   priority: 'C',
   stage: 'Identified Lead',
   value: '',
@@ -131,9 +140,7 @@ const DEFAULT_STAGES = ['Identified Lead', 'Qualified Lead', 'Needs Analysis', '
 const DEFAULT_PRIORITIES = ['A+', 'A', 'B', 'C', 'D']
 const DEFAULT_STATUSES = ['Open', 'Abandoned', 'Closed', 'Won', 'Lost']
 const DEFAULT_SOURCES = ['Inbound', 'Outbound', 'Referral', 'Website', 'Partner']
-const DEFAULT_OWNERS = ['Jarrett Crosby']
 const DEFAULT_LOSS_REASONS = ['No Decision', 'Budget', 'Competition', 'Not a Fit']
-const DEFAULT_PRODUCTS = ['CAO']
 
 const PRIORITY_COLORS: Record<string, string> = {
   'A+': '#66BB6A', A: '#A8C7FA', B: '#CFC6EA', C: '#FDD663', D: '#EF5350',
@@ -252,6 +259,8 @@ function dealFromLooseShape(row: LooseRecord, index = 0): Deal {
     id: String(row.id ?? index),
     organizationId: String(row.organizationId || '') || undefined,
     contactIds: Array.isArray(row.contactIds) ? row.contactIds.map(String) : [],
+    productIds: Array.isArray(row.productIds) ? row.productIds.map(String) : [],
+    ownerContactId: String(row.ownerContactId || '') || undefined,
     priority: String(row.priority || ''),
     name: String(row.name || ''),
     owner: String(row.owner || ''),
@@ -366,9 +375,9 @@ function DealDrawer({
   statuses: string[]
   stages: string[]
   sources: string[]
-  owners: string[]
+  owners: PipelineCatalogPerson[]
   lossReasons: string[]
-  products: string[]
+  products: PipelineCatalogProduct[]
   contactOptions: Contact[]
   readOnly?: boolean
 }) {
@@ -389,6 +398,41 @@ function DealDrawer({
   if (!form) return null
 
   const associatedContacts = normalizeContactsForActionability(getAssociatedContacts(form))
+  const legacyProductNames = (form.name || '').split(',').map((value) => value.trim()).filter(Boolean)
+  const selectableProducts = products.filter((product) => product.active)
+  const selectedProducts = products.filter((product) => (form.productIds || []).includes(product.id))
+  const selectedProductNames = new Set(selectedProducts.map((product) => product.name.trim().toLowerCase()))
+  const displayedProducts = [
+    ...selectedProducts,
+    ...legacyProductNames.filter((name) => !selectedProductNames.has(name.toLowerCase())).map((name, index) => ({
+        id: `legacy-${index}-${name}`,
+        referenceCode: '',
+        name,
+        sku: '',
+        productType: '',
+        category: '',
+        status: 'Legacy',
+        price: 0,
+        cost: 0,
+        currency: 'USD',
+        url: '',
+        description: '',
+        active: true,
+      })),
+  ]
+  const selectedOwner = owners.find((owner) => owner.id === form.ownerContactId)
+    || (form.owner ? {
+      id: `legacy-${form.owner}`,
+      referenceCode: '',
+      displayName: form.owner,
+      email: '',
+      jobTitle: '',
+      source: 'external' as const,
+      appAccess: false,
+      status: 'Legacy',
+      active: true,
+    } : null)
+  const selectableOwners = owners.filter((owner) => owner.active)
 
   return (
     <Drawer anchor="right" open={!!deal} onClose={onClose} PaperProps={{ sx: { width: touchLandscape ? { xs: '96vw', sm: 600 } : { xs: '100vw', sm: 520 }, maxWidth: '100vw', height: '100dvh', backgroundColor: '#0F0F13', borderLeft: '1px solid rgba(255,255,255,0.08)', display: 'flex', flexDirection: 'column' } }}>
@@ -409,15 +453,21 @@ function DealDrawer({
           <Autocomplete
             disabled={readOnly}
             multiple
-            options={products}
-            value={(form.name || '').split(',').map(s => s.trim()).filter(Boolean)}
-            onChange={(_, values) => setForm({ ...form, name: (values || []).map(v => String(v).trim()).filter(Boolean).join(', ') })}
-            renderTags={(value: readonly string[], getTagProps) =>
-              value.map((option: string, index: number) => (
-                <Chip variant="outlined" size="small" label={option} {...getTagProps({ index })} key={`${option}-${index}`} />
+            options={selectableProducts}
+            value={displayedProducts}
+            getOptionLabel={(product) => product.name}
+            isOptionEqualToValue={(option, value) => option.id === value.id}
+            onChange={(_, values) => setForm({
+              ...form,
+              productIds: values.filter((product) => !product.id.startsWith('legacy-')).map((product) => product.id),
+              name: values.map((product) => product.name.trim()).filter(Boolean).join(', '),
+            })}
+            renderTags={(value: readonly PipelineCatalogProduct[], getTagProps) =>
+              value.map((option, index) => (
+                <Chip variant="outlined" size="small" label={option.name} {...getTagProps({ index })} key={`${option.id}-${index}`} />
               ))
             }
-            renderInput={(params) => <TextField {...params} label="Product" size="small" placeholder="Type to search/select" />}
+            renderInput={(params) => <TextField {...params} label="Product" size="small" placeholder="Select configured products" helperText={products.length ? undefined : 'Add products in Pipeline setup.'} />}
           />
           <Autocomplete
             disabled={readOnly}
@@ -450,9 +500,19 @@ function DealDrawer({
           <TextField disabled={readOnly} label="Stage" select size="small" value={form.stage || ''} onChange={e => setForm({ ...form, stage: e.target.value })}>
             {stages.map(s => <MenuItem key={s} value={s}>{s}</MenuItem>)}
           </TextField>
-          <TextField disabled={readOnly} label="Owner" select size="small" value={form.owner || ''} onChange={e => setForm({ ...form, owner: e.target.value })}>
-            {owners.map(o => <MenuItem key={o} value={o}>{o}</MenuItem>)}
-          </TextField>
+          <Autocomplete
+            disabled={readOnly}
+            options={selectableOwners}
+            value={selectedOwner}
+            getOptionLabel={(owner) => owner.displayName}
+            isOptionEqualToValue={(option, value) => option.id === value.id}
+            onChange={(_, owner) => setForm({
+              ...form,
+              ownerContactId: owner && !owner.id.startsWith('legacy-') ? owner.id : undefined,
+              owner: owner?.displayName || '',
+            })}
+            renderInput={(params) => <TextField {...params} label="Owner" size="small" helperText="Organization users and CRM-only team members" />}
+          />
           <TextField
             label="Expected Close"
             disabled={readOnly}
@@ -660,9 +720,10 @@ export default function PipelineSection() {
   const [priorityOptions, setPriorityOptions] = useState<string[]>(DEFAULT_PRIORITIES)
   const [statusOptions, setStatusOptions] = useState<string[]>(DEFAULT_STATUSES)
   const [sourceOptions, setSourceOptions] = useState<string[]>(DEFAULT_SOURCES)
-  const [ownerOptions, setOwnerOptions] = useState<string[]>(DEFAULT_OWNERS)
   const [lossReasonOptions, setLossReasonOptions] = useState<string[]>(DEFAULT_LOSS_REASONS)
-  const [productOptions, setProductOptions] = useState<string[]>(DEFAULT_PRODUCTS)
+  const [catalogPeople, setCatalogPeople] = useState<PipelineCatalogPerson[]>([])
+  const [catalogProducts, setCatalogProducts] = useState<PipelineCatalogProduct[]>([])
+  const [catalogOpen, setCatalogOpen] = useState(false)
   const compactLandscapeBoard = useMediaQuery('(orientation: landscape) and (max-height: 500px) and (max-width: 899.95px)')
   const [activeStage, setActiveStage] = useState<string>(DEFAULT_STAGES[0])
   const [syncSurface, setSyncSurface] = useState<SyncSurface>({ state: 'unknown', lastSyncedAt: null, summary: null })
@@ -688,6 +749,14 @@ export default function PipelineSection() {
   const [creatingOrganization, setCreatingOrganization] = useState(false)
   const [newOrganization, setNewOrganization] = useState({ name: '', email: '', phone: '', description: '' })
   const canEdit = pipelineAccess === 'owner' || pipelineAccess === 'editor'
+  const ownerOptions = useMemo(() => catalogPeople.filter((person) => person.active), [catalogPeople])
+  const productOptions = useMemo(() => catalogProducts.filter((product) => product.active), [catalogProducts])
+
+  const applyCatalog = useCallback((catalog: PipelineCatalogSnapshot) => {
+    setCatalogPeople(catalog.people)
+    setCatalogProducts(catalog.products)
+    if (catalog.pipelineId) setPipelineId((current) => current || catalog.pipelineId)
+  }, [])
 
   const load = async () => {
     const data = await fetch('/api/pipeline').then(r => r.json())
@@ -792,9 +861,19 @@ export default function PipelineSection() {
     setPriorityOptions(pick('priority', DEFAULT_PRIORITIES))
     setStatusOptions(pick('status', DEFAULT_STATUSES))
     setSourceOptions(pick('source', DEFAULT_SOURCES))
-    setOwnerOptions(pick('owner', DEFAULT_OWNERS))
     setLossReasonOptions(pick('loss_reason', DEFAULT_LOSS_REASONS))
-    setProductOptions(pick('product', DEFAULT_PRODUCTS).filter((product) => !product.includes(',')))
+  }
+
+  const loadCatalog = async () => {
+    const response = await fetch('/api/pipeline/catalog', { cache: 'no-store' })
+    const payload = await response.json().catch(() => ({}))
+    if (!response.ok || payload?.ok === false) throw new Error(payload?.error || 'Unable to load pipeline setup')
+    applyCatalog({
+      pipelineId: String(payload.pipelineId || ''),
+      canEdit: payload.canEdit === true,
+      people: Array.isArray(payload.people) ? payload.people : [],
+      products: Array.isArray(payload.products) ? payload.products : [],
+    })
   }
 
   useEffect(() => {
@@ -803,12 +882,14 @@ export default function PipelineSection() {
       if (!done) setLoading(false)
     }, 12000)
 
-    Promise.all([load(), loadDropdowns(), loadSyncStatus()])
+    Promise.all([load(), loadDropdowns(), loadCatalog(), loadSyncStatus()])
       .then(() => { done = true; setLoading(false) })
       .catch(e => { done = true; setError(String(e)); setLoading(false) })
       .finally(() => clearTimeout(failsafe))
 
     return () => clearTimeout(failsafe)
+    // Initial workspace selection is restored by the API cookies on mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   useEffect(() => {
@@ -904,7 +985,7 @@ export default function PipelineSection() {
   }
 
   const createOpportunity = async () => {
-    if (!newOpportunity.organizationId || newOpportunity.products.length === 0 || creatingOpportunity) return
+    if (!newOpportunity.organizationId || newOpportunity.productIds.length === 0 || creatingOpportunity) return
     setCreatingOpportunity(true)
     setNewOpportunityError('')
     try {
@@ -917,7 +998,11 @@ export default function PipelineSection() {
         body: JSON.stringify({
           organizationId: newOpportunity.organizationId,
           contactIds: newOpportunity.contactIds,
-          products: newOpportunity.products,
+          productIds: newOpportunity.productIds,
+          products: productOptions
+            .filter((product) => newOpportunity.productIds.includes(product.id))
+            .map((product) => product.name),
+          ownerContactId: newOpportunity.ownerContactId || null,
           priority: newOpportunity.priority,
           stage: newOpportunity.stage,
           value: Number(newOpportunity.value || 0),
@@ -1149,6 +1234,18 @@ export default function PipelineSection() {
                       : 'Create Sheet'}
               </Button>
             ) : null}
+            <Tooltip title="Pipeline setup">
+              <span>
+                <IconButton
+                  aria-label="Open pipeline setup"
+                  onClick={() => setCatalogOpen(true)}
+                  disabled={!pipelineId}
+                  sx={{ minWidth: 38, minHeight: 38, border: '1px solid rgba(168,199,250,0.45)', color: '#A8C7FA', borderRadius: 1 }}
+                >
+                  <TuneRounded fontSize="small" />
+                </IconButton>
+              </span>
+            </Tooltip>
             {canEdit ? (
               <Button
                 variant="contained"
@@ -1381,16 +1478,42 @@ export default function PipelineSection() {
             <Autocomplete
               multiple
               options={productOptions}
-              value={newOpportunity.products}
-              onChange={(_, products) => setNewOpportunity((current) => ({ ...current, products }))}
-              renderTags={(value: readonly string[], getTagProps) =>
+              value={productOptions.filter((product) => newOpportunity.productIds.includes(product.id))}
+              getOptionLabel={(product) => product.name}
+              isOptionEqualToValue={(option, value) => option.id === value.id}
+              onChange={(_, products) => setNewOpportunity((current) => ({ ...current, productIds: products.map((product) => product.id) }))}
+              renderOption={(props, product) => (
+                <Box component="li" {...props} key={product.id}>
+                  <Box sx={{ minWidth: 0 }}>
+                    <Typography variant="body2" noWrap>{product.name}</Typography>
+                    <Typography variant="caption" color="text.secondary">{product.sku || product.referenceCode}{product.category ? ` · ${product.category}` : ''}</Typography>
+                  </Box>
+                </Box>
+              )}
+              renderTags={(value: readonly PipelineCatalogProduct[], getTagProps) =>
                 value.map((product, index) => (
-                  <Chip variant="outlined" size="small" label={product} {...getTagProps({ index })} key={product} />
+                  <Chip variant="outlined" size="small" label={product.name} {...getTagProps({ index })} key={product.id} />
                 ))
               }
               renderInput={(params) => (
-                <TextField {...params} required label="Product" helperText="Select one or more configured pipeline products" />
+                <TextField {...params} required label="Product" helperText={productOptions.length ? 'Select one or more products owned by this organization' : 'Add products in Pipeline setup first'} />
               )}
+            />
+            <Autocomplete
+              options={ownerOptions}
+              value={ownerOptions.find((person) => person.id === newOpportunity.ownerContactId) || null}
+              getOptionLabel={(person) => person.displayName}
+              isOptionEqualToValue={(option, value) => option.id === value.id}
+              onChange={(_, person) => setNewOpportunity((current) => ({ ...current, ownerContactId: person?.id || '' }))}
+              renderOption={(props, person) => (
+                <Box component="li" {...props} key={person.id}>
+                  <Box sx={{ minWidth: 0 }}>
+                    <Typography variant="body2" noWrap>{person.displayName}</Typography>
+                    <Typography variant="caption" color="text.secondary">{person.appAccess ? 'ClawPilot user' : 'CRM-only team member'}{person.jobTitle ? ` · ${person.jobTitle}` : ''}</Typography>
+                  </Box>
+                </Box>
+              )}
+              renderInput={(params) => <TextField {...params} label="Owner" helperText="Optional: organization user or CRM-only team member" />}
             />
             <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.5}>
               <TextField select fullWidth label="Priority" value={newOpportunity.priority} onChange={(event) => setNewOpportunity((current) => ({ ...current, priority: event.target.value }))}>
@@ -1420,11 +1543,17 @@ export default function PipelineSection() {
             setNewOpportunityOpen(false)
             setNewOpportunityMutationKey('')
           }} disabled={creatingOpportunity}>Cancel</Button>
-          <Button variant="contained" onClick={createOpportunity} disabled={creatingOpportunity || !newOpportunity.organizationId || newOpportunity.products.length === 0}>
+          <Button variant="contained" onClick={createOpportunity} disabled={creatingOpportunity || !newOpportunity.organizationId || newOpportunity.productIds.length === 0}>
             {creatingOpportunity ? 'Creating...' : 'Create'}
           </Button>
         </DialogActions>
       </Dialog>
+
+      <PipelineCatalogDialog
+        open={catalogOpen}
+        onClose={() => setCatalogOpen(false)}
+        onCatalogChange={applyCatalog}
+      />
 
       <DealDrawer
         deal={selectedDeal}
@@ -1434,17 +1563,19 @@ export default function PipelineSection() {
         statuses={statusOptions}
         stages={stageOptions}
         sources={sourceOptions}
-        owners={ownerOptions}
+        owners={catalogPeople}
         lossReasons={lossReasonOptions}
-        products={productOptions}
+        products={catalogProducts}
         contactOptions={contactOptions}
         onSave={async (deal) => {
           const out = await patchOpportunityWithRetry(deal, {
             products: deal.name.split(',').map((product) => product.trim()).filter(Boolean),
+            productIds: deal.productIds || [],
             priority: deal.priority,
             status: deal.status,
             stage: deal.stage,
             owner: deal.owner,
+            ownerContactId: deal.ownerContactId || null,
             closeDate: fromInputDate(deal.closeDate),
             value: Math.round(Number(deal.value || 0)),
             probability: Math.round(Number(deal.probability || 0) * 10) / 10,

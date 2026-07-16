@@ -210,6 +210,22 @@ async function mockCrmRecords(page: Page) {
     }],
     leads: [],
     opportunities: [],
+    products: [{
+      id: '00000000-0000-4000-8000-000000000106',
+      referenceCode: 'gp7654321',
+      shortUrl: null,
+      name: 'Acceptance Product',
+      sku: 'ACCEPT-01',
+      productType: 'Service',
+      category: 'Acceptance',
+      status: 'Active',
+      price: 250,
+      cost: 50,
+      currency: 'USD',
+      url: 'https://example.test/product',
+      active: true,
+      syncStatus: 'synced',
+    }],
     interactions: [{
       id: '00000000-0000-4000-8000-000000000104',
       referenceCode: 'gi7654321',
@@ -252,6 +268,7 @@ async function mockCrmRecords(page: Page) {
           contacts: 1,
           leads: 0,
           opportunities: 0,
+          products: 1,
           meetings: 1,
           interactions: 1,
           campaigns: 0,
@@ -438,8 +455,51 @@ for (const viewport of MOBILE_VIEWPORTS) {
     })
 
     test('Pipeline board and view selector retain a working viewport', async ({ page }) => {
+      await page.route((url) => url.pathname === '/api/pipeline/catalog', async (route) => {
+        await route.fulfill({ json: {
+          ok: true,
+          pipelineId: '00000000-0000-4000-8000-000000000100',
+          canEdit: true,
+          people: [{
+            id: '00000000-0000-4000-8000-000000000107',
+            referenceCode: 'gc1234567',
+            displayName: 'Mobile Operator',
+            email: 'operator@example.test',
+            jobTitle: 'Owner',
+            source: 'app_user',
+            appAccess: true,
+            status: 'active',
+            active: true,
+          }],
+          products: [{
+            id: '00000000-0000-4000-8000-000000000108',
+            referenceCode: 'gp1234568',
+            name: 'Acceptance Product',
+            sku: 'ACCEPT-01',
+            productType: 'Service',
+            category: 'Acceptance',
+            status: 'Active',
+            price: 125,
+            cost: 25,
+            currency: 'USD',
+            url: 'https://example.test/acceptance',
+            description: '',
+            active: true,
+          }],
+        } })
+      })
       await gotoApp(page, '/#pipeline')
       await expect(page.getByText('Pipeline Value', { exact: true })).toBeVisible()
+
+      await page.getByRole('button', { name: 'Open pipeline setup' }).click()
+      const setupDialog = page.getByRole('dialog', { name: /Pipeline setup/ })
+      await expectUsableGeometry(setupDialog, 'Pipeline setup', 160, 280)
+      await expect(setupDialog.getByText('Mobile Operator', { exact: true })).toBeVisible()
+      await setupDialog.getByRole('tab', { name: /Products/ }).click()
+      await expect(setupDialog.getByText('Acceptance Product', { exact: true })).toBeVisible()
+      await setupDialog.getByRole('tab', { name: 'Workflow', exact: true }).click()
+      await expect(setupDialog.getByRole('textbox', { name: 'Stages' })).toBeVisible()
+      await setupDialog.getByRole('button', { name: 'Close pipeline setup' }).click()
 
       const viewButtons = activeSection(page).locator('.MuiToggleButtonGroup-root').last().getByRole('button')
       await expect(viewButtons).toHaveCount(2)
@@ -467,6 +527,14 @@ for (const viewport of MOBILE_VIEWPORTS) {
         await expect(primaryActions.getByRole('link', { name: 'Open workbook' })).toBeVisible()
         await expect(primaryActions.getByRole('button', { name: 'Open SuiteCRM' })).toBeVisible()
       }
+      await page.getByRole('tab', { name: 'Products' }).click()
+      await expect(page.getByPlaceholder('Search products')).toBeVisible()
+      await page.getByRole('cell', { name: 'Acceptance Product', exact: true }).click()
+      const productDrawer = page.getByRole('button', { name: 'Close editor' }).locator('xpath=ancestor::*[contains(@class,"MuiDrawer-paper")][1]')
+      await expectUsableGeometry(productDrawer, 'CRM product editor drawer', 160, 280)
+      await expect(productDrawer.getByLabel('Product name')).toHaveValue('Acceptance Product')
+      await page.getByRole('button', { name: 'Close editor' }).click()
+
       await page.getByRole('tab', { name: 'Contacts' }).click()
       await expect(page.getByPlaceholder('Search contacts')).toBeVisible()
 

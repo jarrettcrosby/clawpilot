@@ -138,6 +138,11 @@ type OutboxInsertRow = {
   status: string
 }
 
+type PipelineDropdownRevisionRow = {
+  desired_revision: string
+  applied_revision: string
+}
+
 type PendingOutboxRow = OutboxInsertRow & {
   payload: Record<string, unknown>
 }
@@ -374,15 +379,21 @@ function normalizeProjection(input: unknown): PipelineProjection {
 function normalizeDropdownCatalog(input: unknown): PipelineDropdownCatalog {
   const data = input && typeof input === 'object' ? input as Partial<PipelineDropdownCatalog> : {}
   const rawDropdowns = data.dropdowns && typeof data.dropdowns === 'object' ? data.dropdowns : {}
-  const dropdowns = Object.fromEntries(Object.entries(rawDropdowns).map(([key, options]) => {
+  const entries = Object.entries(rawDropdowns)
+  if (entries.length > 100) throw new Error('Pipeline dropdown catalog has too many fields')
+  const dropdowns = Object.fromEntries(entries.map(([key, options]) => {
+    if (!/^[a-z][a-z0-9_]{0,63}$/.test(key)) throw new Error('Pipeline dropdown field name is invalid')
+    if (Array.isArray(options) && options.length > 1000) throw new Error(`Pipeline dropdown ${key} has too many options`)
     const normalized = Array.isArray(options)
       ? options.map((option, index) => {
           const value = cleanString(option?.value) || cleanString(option?.label) || ''
+          const label = cleanString(option?.label) || value
+          if (value.length > 250 || label.length > 250) throw new Error(`Pipeline dropdown ${key} option is too long`)
           return {
             value,
-            label: cleanString(option?.label) || value,
+            label,
             active: option?.active !== false,
-            sort_order: toFiniteNumber(option?.sort_order, index),
+            sort_order: Math.max(0, Math.trunc(toFiniteNumber(option?.sort_order, index))),
           }
         }).filter((option) => option.value)
       : []
@@ -527,6 +538,11 @@ async function upsertPipelineProjection(
 
 async function insertPipelineOutbox(client: PoolClient, input: PipelineOutboxEnqueueInput): Promise<OutboxInsertRow> {
   const context = await assertPipelineSheetContext(client, input)
+  let payload: Record<string, unknown> = {
+    ...input.payload,
+    pipelineId: context.pipelineId,
+    sheetId: context.sheetId,
+  }
   const rawIdempotencyKey = cleanString(input.idempotencyKey)
   const idempotencyKey = rawIdempotencyKey
     ? `pipeline:${context.pipelineId}:${rawIdempotencyKey}`
@@ -542,14 +558,30 @@ async function insertPipelineOutbox(client: PoolClient, input: PipelineOutboxEnq
       `,
       [idempotencyKey],
     )
-    if (existing.rows[0]) return existing.rows[0]
+    if (existing.rows[0]) {
+      if (existing.rows[0].status === 'failed' || existing.rows[0].status === 'dead') {
+        const requeued = await client.query<OutboxInsertRow>(
+          `UPDATE sync_outbox
+           SET payload = $2::jsonb,
+               status = 'queued',
+               attempts = 0,
+               available_at = now(),
+               processed_at = NULL,
+               last_error = NULL,
+               locked_at = NULL,
+               lock_token = NULL,
+               updated_at = now()
+           WHERE id = $1::uuid
+             AND status IN ('failed', 'dead')
+           RETURNING id::text, status`,
+          [existing.rows[0].id, JSON.stringify(payload)],
+        )
+        if (requeued.rows[0]) return requeued.rows[0]
+      }
+      return existing.rows[0]
+    }
   }
 
-  let payload: Record<string, unknown> = {
-    ...input.payload,
-    pipelineId: context.pipelineId,
-    sheetId: context.sheetId,
-  }
   let supersededIds: string[] = []
   const targetRange = cleanString(input.payload.range)
   if (input.operation === 'update_opportunity' && targetRange) {
@@ -747,14 +779,35 @@ export async function upsertPipelineDropdownCatalogInPostgres(
 ): Promise<PipelineDropdownCatalog> {
   const context = requirePipelineSheetContext(input)
   const catalog = normalizeDropdownCatalog(input.catalog)
-  await withTransaction((client) => upsertPipelineDropdownCatalog(client, context, catalog))
+  await withTransaction((client) => upsertPipelineDropdownCatalog(client, context, catalog, null))
   return catalog
+}
+
+async function upsertPipelineDropdownCatalogRow(
+  client: PoolClient,
+  pipelineId: string,
+  catalog: PipelineDropdownCatalog,
+  actorEmail: string | null,
+) {
+  await client.query(
+    `INSERT INTO pipeline_dropdown_catalogs (
+       pipeline_id, catalog, source, updated_by, created_at, updated_at
+     ) VALUES ($1::uuid, $2::jsonb, $3, $4, now(), now())
+     ON CONFLICT (pipeline_id) DO UPDATE SET
+       catalog = EXCLUDED.catalog,
+       source = EXCLUDED.source,
+       updated_by = EXCLUDED.updated_by,
+       updated_at = now()`,
+    [pipelineId, JSON.stringify(catalog), catalog.source, actorEmail],
+  )
+  await upsertSetting(client, dropdownSettingKey(pipelineId), catalog)
 }
 
 async function upsertPipelineDropdownCatalog(
   client: PoolClient,
   input: PipelineSheetContext,
   catalog: PipelineDropdownCatalog,
+  actorEmail: string | null,
 ) {
   const context = await assertPipelineSheetContext(client, input)
   await client.query(
@@ -776,7 +829,7 @@ async function upsertPipelineDropdownCatalog(
     `,
     [`pipeline:${context.pipelineId}:dropdowns`, context.sheetId, DROPDOWNS_TAB],
   )
-  await upsertSetting(client, dropdownSettingKey(context.pipelineId), catalog)
+  await upsertPipelineDropdownCatalogRow(client, context.pipelineId, catalog, actorEmail)
   if (context.sheetId === DEFAULT_PIPELINE_SHEET_ID) {
     await upsertSetting(client, DROPDOWN_SETTING_KEY, catalog)
   }
@@ -788,15 +841,237 @@ export async function upsertPipelineDropdownCatalogAndEnqueueInPostgres(input: P
 }): Promise<{ catalog: PipelineDropdownCatalog; outboxId: string; outboxStatus: string }> {
   const context = requirePipelineSheetContext(input)
   const catalog = normalizeDropdownCatalog(input.catalog)
+  const catalogPatch = normalizeDropdownCatalog(input.outbox.payload.catalogPatch || catalog)
+  const outboxPayload = { ...input.outbox.payload }
+  delete outboxPayload.catalogPatch
   const outbox = await withTransaction(async (client) => {
-    await upsertPipelineDropdownCatalog(client, context, catalog)
+    await upsertPipelineDropdownCatalog(client, context, catalog, cleanString(input.outbox.actor))
     return insertPipelineOutbox(client, {
       ...input.outbox,
       ...context,
-      payload: { ...input.outbox.payload, catalog },
+      operation: 'patch_dropdowns',
+      payload: { ...outboxPayload, catalog: catalogPatch },
     })
   })
   return { catalog, outboxId: outbox.id, outboxStatus: outbox.status }
+}
+
+export async function upsertAppManagedPipelineDropdownCatalogInPostgres(input: {
+  pipelineId: string
+  catalog: unknown
+  actorEmail: string
+}): Promise<PipelineDropdownCatalog> {
+  const pipelineId = requirePipelineId(input.pipelineId)
+  const catalog = normalizeDropdownCatalog(input.catalog)
+  return withTransaction(async (client) => {
+    const pipeline = await client.query(
+      `SELECT 1
+       FROM pipeline_spaces
+       WHERE id = $1::uuid
+         AND (sync_enabled = false OR sheet_id IS NULL)
+       LIMIT 1
+       FOR UPDATE`,
+      [pipelineId],
+    )
+    if (!pipeline.rowCount) throw new Error('App-managed pipeline was not found')
+    await upsertPipelineDropdownCatalogRow(client, pipelineId, catalog, input.actorEmail)
+    await client.query(
+      `INSERT INTO audit_events (
+         actor, event_type, aggregate_type, aggregate_id, payload
+       ) VALUES ($1, 'pipeline.dropdown_catalog.updated', 'pipeline_space', $2, $3::jsonb)`,
+      [input.actorEmail, pipelineId, JSON.stringify({
+        pipelineId,
+        source: 'app',
+        dropdownKeys: Object.keys(catalog.dropdowns).sort(),
+      })],
+    )
+    return catalog
+  })
+}
+
+export async function readPipelineDropdownCatalogForSpaceInPostgres(
+  pipelineIdValue: string,
+): Promise<PipelineDropdownCatalog | null> {
+  const pipelineId = requirePipelineId(pipelineIdValue)
+  return withTransaction(async (client) => {
+    const pipeline = await client.query(
+      `SELECT 1 FROM pipeline_spaces WHERE id = $1::uuid LIMIT 1`,
+      [pipelineId],
+    )
+    if (!pipeline.rowCount) throw new Error('Pipeline was not found')
+    const result = await client.query<{ catalog: PipelineDropdownCatalog }>(
+      `SELECT catalog FROM pipeline_dropdown_catalogs WHERE pipeline_id = $1::uuid LIMIT 1`,
+      [pipelineId],
+    )
+    if (result.rows[0]?.catalog) return normalizeDropdownCatalog(result.rows[0].catalog)
+    const legacy = await client.query<SettingRow<PipelineDropdownCatalog>>(
+      'SELECT value FROM app_settings WHERE key = $1',
+      [dropdownSettingKey(pipelineId)],
+    )
+    return legacy.rows[0]?.value ? normalizeDropdownCatalog(legacy.rows[0].value) : null
+  })
+}
+
+export type PipelineProductDropdownSyncResult = {
+  changed: boolean
+  catalog: PipelineDropdownCatalog
+  syncStatus: 'succeeded' | 'queued'
+  outboxId: string | null
+}
+
+export async function syncPipelineProductDropdownCatalogInPostgres(input: {
+  pipelineId: string
+  actorEmail: string
+  ownerNames?: string[]
+}): Promise<PipelineProductDropdownSyncResult> {
+  const pipelineId = requirePipelineId(input.pipelineId)
+  return withTransaction(async (client) => {
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`pipeline-product-dropdown:${pipelineId}`])
+    const pipeline = await client.query<{
+      sheet_id: string | null
+      sync_enabled: boolean
+    }>(
+      `SELECT sheet_id, sync_enabled
+       FROM pipeline_spaces
+       WHERE id = $1::uuid
+       LIMIT 1
+       FOR UPDATE`,
+      [pipelineId],
+    )
+    const currentPipeline = pipeline.rows[0]
+    if (!currentPipeline) throw new Error('Pipeline was not found')
+
+    const stored = await client.query<{ catalog: PipelineDropdownCatalog } & PipelineDropdownRevisionRow>(
+      `SELECT catalog, desired_revision::text, applied_revision::text
+       FROM pipeline_dropdown_catalogs
+       WHERE pipeline_id = $1::uuid
+       LIMIT 1`,
+      [pipelineId],
+    )
+    const legacy = stored.rows[0]?.catalog
+      ? null
+      : await client.query<SettingRow<PipelineDropdownCatalog>>(
+          'SELECT value FROM app_settings WHERE key = $1 LIMIT 1',
+          [dropdownSettingKey(pipelineId)],
+        )
+    const currentCatalog = normalizeDropdownCatalog(stored.rows[0]?.catalog || legacy?.rows[0]?.value || {
+      source: 'app',
+      dropdowns: {},
+    })
+    const productRows = await client.query<{ name: string; updated_at: string }>(
+      `SELECT name, updated_at::text
+       FROM crm_products
+       WHERE pipeline_id = $1::uuid AND active = true
+       ORDER BY lower(name), name, id`,
+      [pipelineId],
+    )
+    const seen = new Set<string>()
+    const names = productRows.rows
+      .map((row) => cleanString(row.name) || '')
+      .filter((name) => {
+        if (!name) return false
+        const key = name.toLowerCase().replace(/\s+/g, ' ')
+        if (seen.has(key)) return false
+        seen.add(key)
+        return true
+      })
+    const productOptions = names.map((name, index) => ({
+      value: name,
+      label: name,
+      active: true,
+      sort_order: index,
+    }))
+    const ownerNames = input.ownerNames === undefined
+      ? null
+      : Array.from(new Map(input.ownerNames
+          .map((name) => cleanString(name) || '')
+          .filter(Boolean)
+          .map((name) => [name.toLowerCase().replace(/\s+/g, ' '), name])).values())
+          .sort((left, right) => left.localeCompare(right))
+    const ownerOptions = ownerNames?.map((name, index) => ({
+      value: name,
+      label: name,
+      active: true,
+      sort_order: index,
+    })) || null
+    const productsUnchanged = JSON.stringify(currentCatalog.dropdowns.product || []) === JSON.stringify(productOptions)
+    const ownersUnchanged = ownerOptions === null
+      || JSON.stringify(currentCatalog.dropdowns.owner || []) === JSON.stringify(ownerOptions)
+    const sheetBacked = currentPipeline.sync_enabled && Boolean(currentPipeline.sheet_id)
+    const currentDesiredRevision = Number(stored.rows[0]?.desired_revision || 0)
+    const currentAppliedRevision = Number(stored.rows[0]?.applied_revision || 0)
+    const catalogPatch = normalizeDropdownCatalog({
+      syncedAt: nowIso(),
+      source: 'app',
+      dropdowns: {
+        product: productOptions,
+        ...(ownerOptions === null ? {} : { owner: ownerOptions }),
+      },
+    })
+    if (productsUnchanged && ownersUnchanged && (
+      !sheetBacked || currentAppliedRevision >= currentDesiredRevision
+    )) {
+      return {
+        changed: false,
+        catalog: currentCatalog,
+        syncStatus: 'succeeded',
+        outboxId: null,
+      }
+    }
+
+    const catalog = normalizeDropdownCatalog({
+      ...currentCatalog,
+      syncedAt: nowIso(),
+      source: 'app',
+      dropdowns: {
+        ...currentCatalog.dropdowns,
+        product: productOptions,
+        ...(ownerOptions === null ? {} : { owner: ownerOptions }),
+      },
+    })
+    if (sheetBacked) {
+      const context = {
+        pipelineId,
+        sheetId: currentPipeline.sheet_id as string,
+      }
+      await upsertPipelineDropdownCatalog(client, context, catalog, input.actorEmail)
+      const revision = productsUnchanged && ownersUnchanged
+        ? currentDesiredRevision
+        : Number((await client.query<{ desired_revision: string }>(
+            `UPDATE pipeline_dropdown_catalogs
+             SET desired_revision = desired_revision + 1,
+                 updated_at = now()
+             WHERE pipeline_id = $1::uuid
+             RETURNING desired_revision::text`,
+            [pipelineId],
+          )).rows[0]?.desired_revision || 0)
+      if (revision < 1) throw new Error('Pipeline dropdown revision could not be allocated')
+      const outbox = await insertPipelineOutbox(client, {
+        ...context,
+        aggregateType: 'pipeline_dropdowns',
+        aggregateId: pipelineId,
+        operation: 'patch_dropdowns',
+        payload: { catalog: catalogPatch, catalogRevision: revision },
+        actor: input.actorEmail,
+        idempotencyKey: `pipeline-product-catalog:${revision}`,
+      })
+      return {
+        changed: true,
+        catalog,
+        syncStatus: outbox.status === 'succeeded' ? 'succeeded' : 'queued',
+        outboxId: outbox.id,
+      }
+    }
+
+    await upsertPipelineDropdownCatalogRow(client, pipelineId, catalog, input.actorEmail)
+    await client.query(
+      `INSERT INTO audit_events (
+         actor, event_type, aggregate_type, aggregate_id, payload
+       ) VALUES ($1, 'pipeline.product_dropdown_catalog.updated', 'pipeline_space', $2, $3::jsonb)`,
+      [input.actorEmail, pipelineId, JSON.stringify({ pipelineId, productNames: names, ownerNames })],
+    )
+    return { changed: true, catalog, syncStatus: 'succeeded', outboxId: null }
+  })
 }
 
 export async function readPipelineDropdownCatalogFromPostgres(
@@ -805,11 +1080,16 @@ export async function readPipelineDropdownCatalogFromPostgres(
   const context = requirePipelineSheetContext(input)
   return withTransaction(async (client) => {
     await assertPipelineSheetContext(client, context)
-    const result = await client.query<SettingRow<PipelineDropdownCatalog>>(
+    const result = await client.query<{ catalog: PipelineDropdownCatalog }>(
+      `SELECT catalog FROM pipeline_dropdown_catalogs WHERE pipeline_id = $1::uuid LIMIT 1`,
+      [context.pipelineId],
+    )
+    if (result.rows[0]?.catalog) return normalizeDropdownCatalog(result.rows[0].catalog)
+    const pipelineSetting = await client.query<SettingRow<PipelineDropdownCatalog>>(
       'SELECT value FROM app_settings WHERE key = $1',
       [dropdownSettingKey(context.pipelineId)],
     )
-    if (result.rows[0]?.value) return result.rows[0].value
+    if (pipelineSetting.rows[0]?.value) return normalizeDropdownCatalog(pipelineSetting.rows[0].value)
     if (context.sheetId !== DEFAULT_PIPELINE_SHEET_ID) return null
 
     const legacy = await client.query<SettingRow<PipelineDropdownCatalog>>(
@@ -1599,6 +1879,24 @@ export async function completePipelineSyncOutboxInPostgres(item: PipelineOutboxI
       [item.id, item.lockToken],
     )
     if (result.rowCount !== 1) throw new Error(`Pipeline outbox lease lost for ${item.id}`)
+
+    const catalogRevision = Math.trunc(Number(item.payload.catalogRevision || 0))
+    const pipelineId = cleanString(item.pipelineId) || cleanString(item.payload.pipelineId)
+    if (
+      item.operation === 'patch_dropdowns'
+      && catalogRevision > 0
+      && pipelineId
+      && UUID_PATTERN.test(pipelineId)
+    ) {
+      await client.query(
+        `UPDATE pipeline_dropdown_catalogs
+         SET applied_revision = GREATEST(applied_revision, $2),
+             updated_at = now()
+         WHERE pipeline_id = $1::uuid
+           AND desired_revision >= $2`,
+        [pipelineId, catalogRevision],
+      )
+    }
 
     if (item.operation === 'reconcile_pipeline_hierarchy_v6') {
       await client.query(

@@ -20,6 +20,7 @@
     "@emotion/styled": "^11.14.1",
     "@mui/icons-material": "^7.3.8",
     "@mui/material": "^7.3.8",
+    "csv-parse": "^7.0.1",
     "fast-xml-parser": "5.10.0",
     "google-auth-library": "^10.9.0",
     "gray-matter": "^4.0.3",

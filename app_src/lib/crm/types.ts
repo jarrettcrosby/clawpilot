@@ -1,6 +1,7 @@
 export const CRM_ENTITIES = [
   'organizations',
   'contacts',
+  'products',
   'leads',
   'opportunities',
   'meetings',
@@ -71,9 +72,45 @@ export type CrmContact = {
   country: string
   description: string
   emailOptOut: boolean
+  pipelineUser: boolean
   syncStatus: CrmSyncStatus
   syncError: string | null
   updatedAt: string
+}
+
+export type CrmProduct = {
+  id: string
+  referenceCode: string
+  shortUrl: string | null
+  pipelineId: string
+  suiteCrmId: string | null
+  sourceKey: string
+  sourceRowNumber: number | null
+  name: string
+  sku: string
+  productType: string
+  category: string
+  status: string
+  price: number
+  cost: number
+  currency: string
+  url: string
+  description: string
+  active: boolean
+  syncStatus: CrmSyncStatus
+  syncError: string | null
+  updatedAt: string
+}
+
+export type CrmOpportunityContact = {
+  id: string
+  referenceCode: string
+  fullName: string
+  email: string
+  phoneWork: string
+  phoneMobile: string
+  jobTitle: string
+  isPrimary: boolean
 }
 
 export type CrmOpportunity = {
@@ -98,16 +135,11 @@ export type CrmOpportunity = {
   expectedClose: string
   notes: string
   contactIds: string[]
-  contacts: Array<{
-    id: string
-    referenceCode: string
-    fullName: string
-    email: string
-    phoneWork: string
-    phoneMobile: string
-    jobTitle: string
-    isPrimary: boolean
-  }>
+  contacts: CrmOpportunityContact[]
+  ownerContactId: string | null
+  ownerContact: CrmOpportunityContact | null
+  productIds: string[]
+  products: CrmProduct[]
   syncStatus: CrmSyncStatus
   syncError: string | null
   updatedAt: string
@@ -231,6 +263,7 @@ export type CrmCampaign = {
 export type CrmRecord =
   | CrmOrganization
   | CrmContact
+  | CrmProduct
   | CrmLead
   | CrmOpportunity
   | CrmMeeting
@@ -240,6 +273,7 @@ export type CrmRecord =
 export type CrmSummary = {
   organizations: number
   contacts: number
+  products: number
   leads: number
   opportunities: number
   meetings: number

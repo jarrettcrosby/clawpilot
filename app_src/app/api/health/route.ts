@@ -179,6 +179,7 @@ export async function GET() {
           crm_display_text_migration_applied: boolean
           browser_sessions_migration_applied: boolean
           workspace_preferences_migration_applied: boolean
+          pipeline_catalog_migration_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -329,6 +330,11 @@ export async function GET() {
                 FROM schema_migrations
                 WHERE filename = '0041_dashboard_workspace_preferences.sql'
               ) AS workspace_preferences_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0045_pipeline_people_products_and_dropdown_catalogs.sql'
+              ) AS pipeline_catalog_migration_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -370,6 +376,7 @@ export async function GET() {
             && row?.crm_display_text_migration_applied
             && row?.browser_sessions_migration_applied
             && row?.workspace_preferences_migration_applied
+            && row?.pipeline_catalog_migration_applied
             && row?.migration_checksums_present
           ),
         }
@@ -403,6 +410,7 @@ export async function GET() {
           || !row?.crm_display_text_migration_applied
           || !row?.browser_sessions_migration_applied
           || !row?.workspace_preferences_migration_applied
+          || !row?.pipeline_catalog_migration_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')

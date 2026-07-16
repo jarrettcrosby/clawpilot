@@ -1430,7 +1430,7 @@ export async function replaceManagedPipelineDropdowns(input: {
   const writeRange = `Dropdowns!B4:${endColumn}${3 + rows.length}`
   await googleSheetsJson(
     input.runtime,
-    `/v4/spreadsheets/${input.sheetId}/values/${encodeURIComponent(writeRange)}?valueInputOption=USER_ENTERED`,
+    `/v4/spreadsheets/${input.sheetId}/values/${encodeURIComponent(writeRange)}?valueInputOption=RAW`,
     {
       method: 'PUT',
       body: { range: writeRange, majorDimension: 'ROWS', values: rows },

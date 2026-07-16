@@ -256,7 +256,7 @@ export default function AppHeader({
           </Tooltip>
 
           {/* Bell */}
-          <Tooltip title="Activity log">
+          <Tooltip title="Activity log" disableInteractive>
             <IconButton
               onClick={() => setDrawerOpen(true)}
               aria-label="Activity log"

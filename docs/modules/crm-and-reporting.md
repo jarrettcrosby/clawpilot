@@ -17,11 +17,12 @@ Use ClawPilot as the customer-work interface, SuiteCRM as the canonical CRM, Rai
 
 ## Ownership Contract
 
-- SuiteCRM owns Organizations, Contacts, Leads, Opportunities, Meetings, Interactions, Campaigns, CRM relationships, and CRM record history.
+- SuiteCRM owns Organizations, Contacts, Products, Leads, Opportunities, Meetings, Interactions, Campaigns, CRM relationships, and CRM record history.
 - ClawPilot is the primary user interface for those modules. Only root-organization owners and administrators may open the global native SuiteCRM surface for configuration and inspection; child-organization administrators remain scoped to their ClawPilot account subtree.
 - A workspace organization owns one durable `ga` identity and an app user owns one durable `gc` identity. Their pipeline records are projections of those identities, not new accounts or contacts.
 - Saving a user profile updates the app user and its CRM Contact projection. Administrators may rename the shared workspace organization; ordinary members cannot rename it from their personal profile. The user Contact is projected into the primary pipeline for the user's assigned organization, including when that pipeline is shared with other members of the same company.
 - Invitations assign a user to an explicit workspace organization. An administrator may select the current organization, select a descendant organization, or create a child organization from an existing CRM Account while preserving its permanent `ga` identity. Child administrators can manage only their own organization subtree.
+- Pipeline ownership choices are not application-access lists. Active ClawPilot members are projected to CRM Contacts and remain governed by their application role. An administrator may separately mark a tenant Contact as a CRM-only pipeline person; that record may own opportunities but cannot authenticate to ClawPilot until it completes the normal invitation and activation flow.
 - The selected pipeline's `Opportunities` Sheet table is the only writable workbook input. Sheet pulls stage those changes into the same CRM gateway used by ClawPilot writes.
 - Railway Postgres stores tenant-scoped CRM projections, source identity, synchronization status, reconciliation runs, and outbox leases. It is not a second independent CRM authority.
 - Development and production use separate SuiteCRM, MariaDB, Postgres, Google workbook, and user data.
@@ -32,6 +33,7 @@ Use ClawPilot as the customer-work interface, SuiteCRM as the canonical CRM, Rai
 |---|---|---|
 | `ga4827316` Organization | Account | Generated `Organizations` projection |
 | `gc8172045` Contact | Contact | Generated `Contacts` projection |
+| `gp4286157` Product | AOS Product | `Dropdowns` validation and opportunity relationships |
 | `gl3549182` Lead | Lead | CRM only |
 | `go7402631` Opportunity | Opportunity | Writable `Opportunities` input and canonical projection |
 | `gm1968457` Meeting | Meeting | CRM only |
@@ -48,7 +50,7 @@ Each reference code has a stable short link. The redirect enters the authenticat
 
 Organization and Contact records are also projected into the owner's managed `CRM Board`. Titles use `<Global ID> - <record name>`. The card record block renders the Global ID and name as links to the ClawPilot CRM editor, renders the primary email as an organization-scoped link to the ClawPilot email composer, and maps the editable card Description directly to the native CRM description. The projection uses the CRM row UUID for durable one-card identity, not the visible reference string.
 
-An Opportunity owns one permanent `go` reference, one required Organization relationship, and an exact set of related Contacts. Every selected Contact must belong to that Organization. The gateway writes both the native SuiteCRM Account relationship and Contact relationship collection so the same people appear in ClawPilot and the native Opportunity subpanels. Opportunity reads resolve the Organization name through its durable Organization ID; renaming an Organization therefore updates pipeline cards and generated workbook projections without rewriting every Opportunity row.
+An Opportunity owns one permanent `go` reference, one required Organization relationship, an exact set of related Contacts, an optional tenant team owner, and an exact set of related Products. Every selected Contact and Product must belong to the selected tenant boundary. Product records map to native SuiteCRM AOS Products, while the exact Opportunity-to-Product selection remains authoritative in the ClawPilot Postgres join until a verified native SuiteCRM relationship is provisioned; the gateway does not guess a relationship field. Account and Contact relationships are written to their verified native links. Opportunity reads resolve the Organization name through its durable Organization ID; renaming an Organization therefore updates pipeline cards and generated workbook projections without rewriting every Opportunity row.
 
 ## Customer Actions
 

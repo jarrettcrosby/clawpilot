@@ -258,6 +258,38 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: true, queued: true, record: staged }, { status: body?.id ? 200 : 201 })
     }
 
+    if (entity === 'products') {
+      const name = stringValue(fields.name, 250)
+      if (!name) throw new Error('Product name is required')
+      const sku = stringValue(fields.sku, 25)
+      const currency = (stringValue(fields.currency, 3) || 'USD').toUpperCase()
+      if (!/^[A-Z]{3}$/.test(currency)) throw new Error('Product currency must be a three-letter code')
+      const url = stringValue(fields.url, 2_000)
+      if (url && !/^https?:\/\//i.test(url)) throw new Error('Product URL must use http or https')
+      const staged = await stageCrmRecordInPostgres({
+        entity,
+        pipelineId: pipeline.id,
+        localId: current?.id,
+        sourceKey,
+        actorEmail: actor.email,
+        sourcePayload: { ...(current?.sourcePayload || {}), source: 'clawpilot' },
+        fields: {
+          name,
+          sku,
+          productType: stringValue(fields.productType, 100) || 'Good',
+          category: stringValue(fields.category, 100),
+          status: stringValue(fields.status, 100) || 'Active',
+          price: numberValue(fields.price),
+          cost: numberValue(fields.cost),
+          currency,
+          url,
+          description: stringValue(fields.description, 10_000),
+          active: fields.active !== false,
+        },
+      })
+      return NextResponse.json({ ok: true, queued: true, record: staged }, { status: body?.id ? 200 : 201 })
+    }
+
 
     let contact: Awaited<ReturnType<typeof readCrmRecordReference>> | null = null
     const contactId = fields.contactId || current?.contactId || null

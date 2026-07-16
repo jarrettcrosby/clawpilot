@@ -3,7 +3,7 @@ import { resolveCrmReferenceRoute } from '@/lib/persistence/crm'
 import { appPublicUrl } from '@/lib/publicUrl'
 import { sessionEmail } from '@/lib/requestUser'
 
-const CRM_REFERENCE_PATTERN = /^g(?:a|c|i|k|l|m|o)[0-9]{7}$/
+const CRM_REFERENCE_PATTERN = /^g(?:a|c|i|k|l|m|o|p)[0-9]{7}$/
 const CRM_PIPELINE_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
 export async function GET(req: NextRequest, context: { params: Promise<{ reference: string }> }) {

@@ -8,7 +8,7 @@ import { ensurePrimaryWorkspaceOrganization } from '@/lib/organizations'
 import { effectiveUserPermissions, normalizeUserEmail } from '@/lib/users'
 
 const SLUG_PATTERN = /^[a-z0-9][a-z0-9_-]{2,63}$/
-const CRM_REFERENCE_SLUG_PATTERN = /^g[aciklmo][0-9]{7}$/
+const CRM_REFERENCE_SLUG_PATTERN = /^g[aciklmop][0-9]{7}$/
 const CRM_ACTION_SLUG_PATTERN = /^mail-g[ac][0-9]{7}$/
 const SOURCE_PATTERN = /^[a-z][a-z0-9-]{1,39}$/
 const SLUG_ALPHABET = '23456789abcdefghjkmnpqrstuvwxyz'
