@@ -14,9 +14,8 @@ import { applyCanonicalWorkItem, canonicalizeTasks } from '@/lib/workItemModel'
 import { shouldFallbackToFileOnDatabaseError } from '@/lib/persistence/config'
 import { isPostgresTaskStoreEnabled, readTasksFromPostgres, replaceTasksInPostgres } from '@/lib/persistence/tasks'
 import type { AgentDispatchEnqueueInput } from '@/lib/persistence/agentDispatch'
-import { getCookieName, verifySessionToken } from '@/lib/auth'
-import { requireActiveAppUser } from '@/lib/users'
 import { requireRequestUser } from '@/lib/requestUser'
+import { resolveAgentDispatchWorker, type AgentDispatchWorkerContext } from '@/lib/workerAuth'
 import {
   BOARD_SELECTION_COOKIE,
   requireResourceEditor,
@@ -129,17 +128,6 @@ function isAgentActor(actor: string) {
   if (!normalized) return false
   if (BLOCKED_AGENT_ACTORS.has(normalized)) return true
   return /\b(agent|clawpilot)\b/i.test(normalized)
-}
-
-function authorizedWorkerMutation(req: NextRequest): boolean {
-  if (req.headers.get('x-clawpilot-worker') !== 'agent-dispatch') return false
-  const expected = String(process.env.PIPELINE_OUTBOX_WORKER_SECRET || '')
-  const provided = String(req.headers.get('authorization') || '').replace(/^Bearer\s+/i, '')
-  if (!expected || !provided) return false
-  const expectedBuffer = Buffer.from(expected)
-  const providedBuffer = Buffer.from(provided)
-  return expectedBuffer.length === providedBuffer.length
-    && crypto.timingSafeEqual(expectedBuffer, providedBuffer)
 }
 
 function appendTaskCreationAudit(entry: Record<string, unknown>) {
@@ -309,17 +297,23 @@ async function writeTasks(tasks: Task[], boardId?: string, agentDispatches: Agen
   })
 }
 
-async function resolveTaskBoard(req: NextRequest, requireEdit = false): Promise<ProjectBoard | null> {
+async function resolveTaskBoard(
+  req: NextRequest,
+  requireEdit = false,
+  workerContext?: AgentDispatchWorkerContext | null,
+): Promise<ProjectBoard | null> {
   if (!isPostgresTaskStoreEnabled()) return null
-  const actor = await requireRequestUser(req)
+  const worker = workerContext === undefined ? await resolveAgentDispatchWorker(req) : workerContext
+  const actorEmail = worker?.operatorId || (await requireRequestUser(req)).email
   const explicit = new URL(req.url).searchParams.get('boardId')
-  const selected = explicit || req.cookies.get(BOARD_SELECTION_COOKIE)?.value || undefined
+  if (worker && explicit && explicit !== worker.boardId) throw new Error('Worker board claim mismatch')
+  const selected = worker?.boardId || explicit || req.cookies.get(BOARD_SELECTION_COOKIE)?.value || undefined
   let board: ProjectBoard
   try {
-    board = await resolveProjectBoardAccess({ actorEmail: actor.email, boardId: selected })
+    board = await resolveProjectBoardAccess({ actorEmail, boardId: selected })
   } catch (error) {
-    if (explicit) throw error
-    board = await resolveProjectBoardAccess({ actorEmail: actor.email })
+    if (explicit || worker) throw error
+    board = await resolveProjectBoardAccess({ actorEmail })
   }
   if (requireEdit) requireResourceEditor(board)
   return board
@@ -360,14 +354,17 @@ function isActiveColumnStatus(status: Task['status']): boolean {
   return status === 'todo' || status === 'in-progress' || status === 'review'
 }
 
-async function resolveRequestActor(req: NextRequest, fallback: string): Promise<string> {
-  const session = verifySessionToken(req.cookies.get(getCookieName())?.value)
-  if (session.ok) {
-    try {
-      return (await requireActiveAppUser(session.user)).email
-    } catch {
-      // Preserve local and internal callers when app-user persistence is unavailable.
-    }
+async function resolveRequestActor(
+  req: NextRequest,
+  fallback: string,
+  workerContext?: AgentDispatchWorkerContext | null,
+): Promise<string> {
+  const worker = workerContext === undefined ? await resolveAgentDispatchWorker(req) : workerContext
+  if (worker) return worker.operatorId
+  try {
+    return (await requireRequestUser(req)).email
+  } catch {
+    // Preserve local callers when app-user persistence is unavailable.
   }
   return fallback.trim()
 }
@@ -739,9 +736,10 @@ export async function PATCH(req: NextRequest) {
   const freeze = ensureNotFrozen()
   if (freeze) return NextResponse.json(freeze, { status: 423 })
 
+  const workerContext = await resolveAgentDispatchWorker(req).catch(() => null)
   let board: ProjectBoard | null
   try {
-    board = await resolveTaskBoard(req, true)
+    board = await resolveTaskBoard(req, true, workerContext)
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Project board access denied'
     return NextResponse.json({ error: message }, { status: message === 'Unauthorized' ? 401 : 403 })
@@ -749,18 +747,18 @@ export async function PATCH(req: NextRequest) {
   if (board) {
     const binding = await resolveCrmBoardBinding(board.id)
     if (binding) {
-      const signedIn = await requireRequestUser(req)
-      const pipeline = await resolvePipelineSpaceAccess({ actorEmail: signedIn.email, pipelineId: binding.pipeline_id })
+      const actorEmail = workerContext?.operatorId || (await requireRequestUser(req)).email
+      const pipeline = await resolvePipelineSpaceAccess({ actorEmail, pipelineId: binding.pipeline_id })
       requireResourceEditor(pipeline)
     }
   }
   const tasks = await readTasks(board?.id, true)
   const body = await req.json() as TaskPatchBody
   const { id, crmDescription, crmDescriptionHash, _comment, _editCommentId, _editCommentText, _deleteCommentId, _restoreCommentId, _checklistAdd, _checklistToggle, _checklistDelete, _checklistUpdate, _execution, _agentDispatchState, _suggestionAction, _actor, _deleteReason, ...rawUpdates } = body
-  if (_agentDispatchState && !authorizedWorkerMutation(req)) {
+  if (_agentDispatchState && !workerContext) {
     return NextResponse.json({ error: 'Agent dispatch state updates require worker authorization' }, { status: 403 })
   }
-  const actor = await resolveRequestActor(req, String(_actor || 'Jarrett')) || 'Jarrett'
+  const actor = await resolveRequestActor(req, String(_actor || 'Jarrett'), workerContext) || 'Jarrett'
 
   const idx = tasks.findIndex(t => t.id === id)
   if (idx === -1) return NextResponse.json({ error: 'Not found' }, { status: 404 })

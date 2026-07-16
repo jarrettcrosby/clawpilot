@@ -1,6 +1,7 @@
 import crypto from 'crypto'
 
-const COOKIE_NAME = 'clawpilot_session'
+const LEGACY_COOKIE_NAME = 'clawpilot_session'
+const HOST_COOKIE_NAME = '__Host-clawpilot_session'
 const SESSION_TTL_SECONDS = 60 * 60 * 12 // 12h
 
 function getSecret() {
@@ -47,7 +48,11 @@ export function verifySessionToken(token?: string | null) {
 }
 
 export function getCookieName() {
-  return COOKIE_NAME
+  return process.env.NODE_ENV === 'production' ? HOST_COOKIE_NAME : LEGACY_COOKIE_NAME
+}
+
+export function getCookieNames() {
+  return Array.from(new Set([getCookieName(), LEGACY_COOKIE_NAME]))
 }
 
 export function getLoginPassword() {

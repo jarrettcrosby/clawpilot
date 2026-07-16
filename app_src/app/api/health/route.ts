@@ -177,6 +177,7 @@ export async function GET() {
           account_membership_migration_applied: boolean
           suitecrm_inbound_sync_migration_applied: boolean
           crm_display_text_migration_applied: boolean
+          browser_sessions_migration_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -317,6 +318,11 @@ export async function GET() {
                 FROM schema_migrations
                 WHERE filename = '0036_crm_display_text_and_card_semantics.sql'
               ) AS crm_display_text_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0040_browser_sessions_and_impersonation.sql'
+              ) AS browser_sessions_migration_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -356,6 +362,7 @@ export async function GET() {
             && row?.account_membership_migration_applied
             && row?.suitecrm_inbound_sync_migration_applied
             && row?.crm_display_text_migration_applied
+            && row?.browser_sessions_migration_applied
             && row?.migration_checksums_present
           ),
         }
@@ -387,6 +394,7 @@ export async function GET() {
           || !row?.account_membership_migration_applied
           || !row?.suitecrm_inbound_sync_migration_applied
           || !row?.crm_display_text_migration_applied
+          || !row?.browser_sessions_migration_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')

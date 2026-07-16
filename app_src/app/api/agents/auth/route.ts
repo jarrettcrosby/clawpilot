@@ -1,13 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { getCookieName, verifySessionToken } from '@/lib/auth'
 import { disconnectChatGPT, getChatGPTConnection, startChatGPTDeviceLogin } from '@/lib/agents/chatgptAuth'
-import { requireActiveAppUser } from '@/lib/users'
+import { requireRequestUser } from '@/lib/requestUser'
 
 async function operatorEmail(req: NextRequest): Promise<string | null> {
-  const session = verifySessionToken(req.cookies.get(getCookieName())?.value)
-  if (!session.ok) return null
   try {
-    return (await requireActiveAppUser(session.user)).email
+    return (await requireRequestUser(req)).email
   } catch {
     return null
   }

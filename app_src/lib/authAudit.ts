@@ -47,6 +47,8 @@ export async function recordAuthActivity(input: {
   eventType: 'auth.code.requested' | 'auth.code.request.denied' | 'auth.login.succeeded' | 'auth.login.failed' | 'auth.logout.succeeded'
   method: 'magic_code' | 'operator_password' | 'session'
   reason?: string
+  effectiveUser?: string
+  sessionId?: string
 }): Promise<void> {
   const email = normalizedEmail(input.email)
   const authenticatedActor = input.eventType === 'auth.login.succeeded' || input.eventType === 'auth.logout.succeeded'
@@ -63,6 +65,8 @@ export async function recordAuthActivity(input: {
       client: clientSummary(input.req),
       networkFingerprint: networkFingerprint(input.req),
       requestId: input.req.headers.get('x-request-id') || input.req.headers.get('x-vercel-id') || undefined,
+      effectiveUser: input.effectiveUser,
+      sessionId: input.sessionId,
     },
   })
 }

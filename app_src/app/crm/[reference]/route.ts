@@ -14,7 +14,7 @@ export async function GET(req: NextRequest, context: { params: Promise<{ referen
   }
   const requestedPipelineId = req.nextUrl.searchParams.get('pipeline')?.trim() || ''
   const resolved = await resolveCrmReferenceRoute(normalized, {
-    actorEmail: sessionEmail(req),
+    actorEmail: await sessionEmail(req),
     requestedPipelineId,
   })
   const destination = new URL('/', appPublicUrl())

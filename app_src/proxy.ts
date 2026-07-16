@@ -1,7 +1,18 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { query } from '@/lib/persistence/postgres'
+import {
+  AUTH_CONTEXT_HEADER,
+  AUTH_CONTEXT_PROOF_HEADER,
+  createAuthAttributionHeaders,
+} from '@/lib/authAttribution'
+import {
+  createBrowserSession,
+  resolveRequestSession,
+  setBrowserSessionCookie,
+  type BrowserSession,
+  type IssuedBrowserSession,
+} from '@/lib/authSessions'
+import { resolveAgentDispatchWorker } from '@/lib/workerAuth'
 
-const COOKIE_NAME = 'clawpilot_session'
 const HOSTED_RUNTIME = Boolean(
   process.env.RAILWAY_ENVIRONMENT_NAME
   || process.env.RAILWAY_ENVIRONMENT_ID
@@ -11,49 +22,6 @@ const HOSTED_RUNTIME = Boolean(
 )
 const AUTH_REQUIRED = process.env.APP_AUTH_REQUIRED === '1' || HOSTED_RUNTIME
 const DEV_START_ROOT_HINT = process.env.CLAWPILOT_REPO_ROOT ?? '/Users/agentsuburbiasandwich/Desktop/clawpilot'
-
-function base64UrlBytes(value: string) {
-  const normalized = value.replace(/-/g, '+').replace(/_/g, '/')
-  const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, '=')
-  const decoded = atob(padded)
-  return Uint8Array.from(decoded, (character) => character.charCodeAt(0))
-}
-
-async function validSession(token?: string | null): Promise<{ ok: true; user: string } | { ok: false }> {
-  const secret = process.env.APP_SESSION_SECRET || process.env.NEXTAUTH_SECRET || ''
-  if (!secret || !token || !token.includes('.')) return { ok: false }
-
-  try {
-    const [encoded, signature] = token.split('.', 2)
-    if (!encoded || !signature) return { ok: false }
-    const encoder = new TextEncoder()
-    const key = await crypto.subtle.importKey(
-      'raw',
-      encoder.encode(secret),
-      { name: 'HMAC', hash: 'SHA-256' },
-      false,
-      ['verify'],
-    )
-    const validSignature = await crypto.subtle.verify(
-      'HMAC',
-      key,
-      base64UrlBytes(signature),
-      encoder.encode(encoded),
-    )
-    if (!validSignature) return { ok: false }
-
-    const payload = JSON.parse(new TextDecoder().decode(base64UrlBytes(encoded))) as { u?: string; exp?: number }
-    if (!payload.u || !payload.exp || payload.exp < Math.floor(Date.now() / 1000)) return { ok: false }
-    return { ok: true, user: payload.u.toLowerCase() }
-  } catch {
-    return { ok: false }
-  }
-}
-
-async function activeSessionUser(email: string): Promise<boolean> {
-  const result = await query<{ status: string }>('SELECT status FROM app_users WHERE email = $1', [email])
-  return result.rows[0]?.status === 'active'
-}
 
 function missingDevIsolationEnv(req: NextRequest) {
   const isDevRuntimePort = req.nextUrl.port === '4002' || req.headers.get('host')?.endsWith(':4002')
@@ -68,26 +36,66 @@ function missingDevIsolationEnv(req: NextRequest) {
     'AGENT_ASSIGNMENTS_PATH',
   ]
 
-  return required.filter((k) => !process.env[k])
+  return required.filter((key) => !process.env[key])
 }
 
 function isPublicApi(pathname: string) {
   const normalizedPath = pathname.endsWith('/') && pathname.length > 1 ? pathname.slice(0, -1) : pathname
 
   return (
-    normalizedPath === '/api/health' ||
-    normalizedPath === '/api/version' ||
-    normalizedPath === '/api/client-error' ||
-    normalizedPath === '/api/invitations/accept' ||
-    normalizedPath === '/api/pipeline/sync/outbox/process' ||
-    normalizedPath === '/api/crm/outbox/process' ||
-    normalizedPath === '/api/crm/integrations/process' ||
-    normalizedPath === '/api/agents/dispatch/process' ||
-    normalizedPath === '/api/docs/embeddings/process' ||
-    normalizedPath === '/api/ai-radar/process' ||
-    normalizedPath === '/api/shortlinks' ||
-    normalizedPath.startsWith('/api/auth/')
+    normalizedPath === '/api/health'
+    || normalizedPath === '/api/version'
+    || normalizedPath === '/api/client-error'
+    || normalizedPath === '/api/invitations/accept'
+    || normalizedPath === '/api/pipeline/sync/outbox/process'
+    || normalizedPath === '/api/crm/outbox/process'
+    || normalizedPath === '/api/crm/integrations/process'
+    || normalizedPath === '/api/agents/dispatch/process'
+    || normalizedPath === '/api/docs/embeddings/process'
+    || normalizedPath === '/api/ai-radar/process'
+    || normalizedPath === '/api/shortlinks'
+    || normalizedPath.startsWith('/api/auth/')
   )
+}
+
+function sensitiveMutationDuringImpersonation(req: NextRequest, session: BrowserSession): boolean {
+  if (!session.impersonating || ['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return false
+  const path = req.nextUrl.pathname
+  return [
+    '/api/users',
+    '/api/workspaces',
+    '/api/settings/',
+    '/api/integrations/',
+    '/api/agents/auth',
+    '/api/railway-backups',
+  ].some((prefix) => path === prefix || path.startsWith(prefix))
+}
+
+async function authorizedWorkerRequest(req: NextRequest): Promise<boolean> {
+  const routeAllowed = (req.method === 'POST' && req.nextUrl.pathname === '/api/agents/threads')
+    || (req.method === 'PATCH' && req.nextUrl.pathname === '/api/tasks')
+  if (!routeAllowed || req.headers.get('x-clawpilot-worker') !== 'agent-dispatch') return false
+  return Boolean(await resolveAgentDispatchWorker(req).catch(() => null))
+}
+
+async function durableSession(req: NextRequest): Promise<{
+  session: BrowserSession | null
+  issued: IssuedBrowserSession | null
+}> {
+  const session = await resolveRequestSession(req)
+  if (!session) return { session: null, issued: null }
+  if (!session.legacy) return { session, issued: null }
+  const issued = await createBrowserSession({
+    email: session.authenticatedUser,
+    authMethod: 'legacy_upgrade',
+    headers: req.headers,
+  })
+  return { session: issued.session, issued }
+}
+
+function responseWithSessionCookie(response: NextResponse, issued: IssuedBrowserSession | null) {
+  if (issued) setBrowserSessionCookie(response, issued)
+  return response
 }
 
 export async function proxy(req: NextRequest) {
@@ -103,9 +111,7 @@ export async function proxy(req: NextRequest) {
   }
 
   if (!AUTH_REQUIRED) return NextResponse.next()
-
   if (pathname.startsWith('/api/') && isPublicApi(pathname)) return NextResponse.next()
-
   if (pathname.startsWith('/s/')) return NextResponse.next()
 
   if (pathname === '/welcome') {
@@ -117,25 +123,47 @@ export async function proxy(req: NextRequest) {
   }
   if (pathname.startsWith('/brand/')) return NextResponse.next()
 
-  const token = req.cookies.get(COOKIE_NAME)?.value
-  const session = await validSession(token)
-  let sessionActive = false
-  if (session.ok) {
-    try {
-      sessionActive = await activeSessionUser(session.user)
-    } catch {
-      if (pathname.startsWith('/api/')) {
-        return NextResponse.json({ ok: false, error: 'Access validation unavailable' }, { status: 503 })
-      }
-      return new NextResponse('Access validation unavailable', { status: 503 })
+  if (await authorizedWorkerRequest(req)) return NextResponse.next()
+
+  let session: BrowserSession | null = null
+  let issued: IssuedBrowserSession | null = null
+  try {
+    const resolved = await durableSession(req)
+    session = resolved.session
+    issued = resolved.issued
+  } catch {
+    if (pathname.startsWith('/api/')) {
+      return NextResponse.json({ ok: false, error: 'Access validation unavailable' }, { status: 503 })
     }
+    return new NextResponse('Access validation unavailable', { status: 503 })
   }
 
   if (pathname === '/login') {
-    return sessionActive ? NextResponse.redirect(new URL('/', req.url)) : NextResponse.next()
+    return session
+      ? responseWithSessionCookie(NextResponse.redirect(new URL('/', req.url)), issued)
+      : NextResponse.next()
   }
 
-  if (sessionActive) return NextResponse.next()
+  if (session) {
+    if (sensitiveMutationDuringImpersonation(req, session)) {
+      return NextResponse.json(
+        { ok: false, error: 'Exit user view before changing account access, integrations, or security settings.' },
+        { status: 403 },
+      )
+    }
+    const requestHeaders = new Headers(req.headers)
+    requestHeaders.delete(AUTH_CONTEXT_HEADER)
+    requestHeaders.delete(AUTH_CONTEXT_PROOF_HEADER)
+    const attribution = createAuthAttributionHeaders({
+      sessionId: session.id,
+      authenticatedUser: session.authenticatedUser,
+      effectiveUser: session.effectiveUser,
+      impersonating: session.impersonating,
+    })
+    for (const [key, value] of Object.entries(attribution)) requestHeaders.set(key, value)
+    const response = NextResponse.next({ request: { headers: requestHeaders } })
+    return responseWithSessionCookie(response, issued)
+  }
 
   if (!pathname.startsWith('/api/')) {
     const loginUrl = new URL('/login', req.url)

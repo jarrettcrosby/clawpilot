@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { disconnectChatGPT } from '@/lib/agents/chatgptAuth'
+import { revokeAllBrowserSessionsForUser } from '@/lib/authSessions'
 import { createUserInvitation } from '@/lib/invitations'
 import {
   ensurePrimaryWorkspaceOrganization,
@@ -27,7 +28,7 @@ function userMutationErrorStatus(error: unknown): number {
 }
 
 export async function GET(req: NextRequest) {
-  const email = sessionEmail(req)
+  const email = await sessionEmail(req)
   if (!email) return NextResponse.json({ ok: false, error: 'Unauthorized' }, { status: 401 })
 
   try {
@@ -52,7 +53,7 @@ export async function GET(req: NextRequest) {
 }
 
 export async function POST(req: NextRequest) {
-  const actorEmail = sessionEmail(req)
+  const actorEmail = await sessionEmail(req)
   if (!actorEmail) return NextResponse.json({ ok: false, error: 'Unauthorized' }, { status: 401 })
 
   try {
@@ -78,7 +79,7 @@ export async function POST(req: NextRequest) {
 }
 
 export async function PATCH(req: NextRequest) {
-  const actorEmail = sessionEmail(req)
+  const actorEmail = await sessionEmail(req)
   if (!actorEmail) return NextResponse.json({ ok: false, error: 'Unauthorized' }, { status: 401 })
 
   try {
@@ -110,12 +111,26 @@ export async function PATCH(req: NextRequest) {
         role: body.role === 'admin' ? 'admin' : body.role === 'member' ? 'member' : undefined,
         permissions: body.permissions,
       })
+      await revokeAllBrowserSessionsForUser({
+        userEmail: user.email,
+        actor: actorEmail,
+        reason: 'access_changed',
+      })
       return NextResponse.json({ ok: true, user })
     }
     const status = body?.status === 'active' ? 'active' : body?.status === 'disabled' ? 'disabled' : null
     if (!status) return NextResponse.json({ ok: false, error: 'Valid status required' }, { status: 400 })
     const user = await setAppUserStatus({ actorEmail, email: body?.email, status })
-    if (status === 'disabled') await disconnectChatGPT(user.email).catch(() => undefined)
+    if (status === 'disabled') {
+      await Promise.all([
+        disconnectChatGPT(user.email).catch(() => undefined),
+        revokeAllBrowserSessionsForUser({
+          userEmail: user.email,
+          actor: actorEmail,
+          reason: 'account_disabled',
+        }),
+      ])
+    }
     return NextResponse.json({ ok: true, user })
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unable to update user'

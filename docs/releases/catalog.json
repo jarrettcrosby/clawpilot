@@ -3,25 +3,24 @@
   "releases": {
     "default": {
       "oncePerEnvironment": true,
-      "title": "Durable agent context, generated briefs, and a connected knowledge map",
-      "summary": "ClawPilot now provides stable per-user agent roles with private and privacy-gated shared context, on-demand document snapshots, clean CRM queue activity, and a verified Map-of-Content second brain.",
+      "title": "Revocable browser sessions and root support mode",
+      "summary": "ClawPilot now gives every browser an independently revocable Postgres session, records both the real administrator and viewed user during root support mode, and keeps background workers separate from human authentication.",
       "features": [
-        "Stable Projects, Pipeline, Docs, Calendar, and ClawPilot profile identities are provisioned automatically for every connected user's own ChatGPT authorization",
-        "Layered agent context combines repository-owned role instructions, the selected task thread, private user memory, and vetted shared role principles",
-        "New document generation creates user-scoped Build, Project Board, Pipeline, or AI Opportunity snapshots from current accessible data",
-        "A root ClawPilot Context Map plus product, platform/data, operations, evolution, and decision Maps of Content",
-        "Accepted decision records for data authority, organization-rooted tenancy, CRM identity and synchronization, and local-first knowledge retrieval",
-        "Stable note IDs, summaries, areas, tags, reusable Obsidian templates, and automated inbound-link and MOC coverage checks",
-        "An intentional owner knowledge catalog that vectors only notes explicitly marked for in-app visibility"
+        "A Security settings view listing active browsers with current-session identification, last activity, and individual revocation",
+        "A one-command control to sign out every other browser without interrupting the current session",
+        "Root support mode for viewing the application as an active non-owner user for up to 30 minutes",
+        "A persistent support-mode banner showing both the root administrator and the effective user",
+        "Role-aware idle limits with a 24-hour absolute browser-session lifetime and explicit activity renewal",
+        "Automatic upgrade of existing signed browser cookies to durable sessions during rollout"
       ],
       "fixes": [
-        "Stops unchanged CRM page reads from writing duplicate synchronization activity after the outbox rejects duplicate work",
-        "Gives each real CRM queue event the same deterministic identity boundary as its idempotent outbox operation",
-        "Removes historical no-op CRM activity only when no matching SuiteCRM outbox creation exists",
-        "Keeps user agent lessons private and requires matching evidence from two independent organizations before a generic lesson can enter shared role context",
-        "Rebuilds agent context on every stateless provider request instead of treating a session key as durable memory",
-        "Prevents unclassified repository READMEs and compatibility pointers from polluting the vector knowledge catalog",
-        "Enforces broken-link, orphan-note, duplicate-ID, metadata, and Map-of-Content density checks before deployment"
+        "Stores only keyed token hashes in Postgres rather than reusable browser credentials",
+        "Revokes active browser sessions when a user is disabled or their access changes",
+        "Records authenticated administrator, effective user, session, and impersonation state on support-mode activity",
+        "Rotates browser credentials when entering or leaving support mode",
+        "Blocks user-access, workspace, integration, agent-authorization, and backup mutations while viewing as another user",
+        "Authenticates the agent dispatch worker with dedicated signed headers instead of fabricating a human browser cookie",
+        "Redirects expired browser tabs to sign-in without treating transient network failures as logout events"
       ]
     }
   }

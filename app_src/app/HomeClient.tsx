@@ -12,6 +12,8 @@ import AgentsSection from '@/components/agents/AgentsSection'
 import ShortLinksSection from '@/components/links/ShortLinksSection'
 import CrmSection from '@/components/crm/CrmSection'
 import ShortcutsModal from '@/components/help/ShortcutsModal'
+import SessionGuard from '@/components/auth/SessionGuard'
+import ImpersonationBanner from '@/components/auth/ImpersonationBanner'
 import { Box } from '@mui/material'
 import type { BoardFilter } from '@/components/projects/FilterBar'
 import { emptyFilter } from '@/components/projects/FilterBar'
@@ -183,6 +185,7 @@ export default function HomeClient({ shortLinksEnabled }: { shortLinksEnabled: b
         overflow="hidden"
         minWidth={0}
       >
+        <SessionGuard />
         <AppHeader
           activeSection={section}
           desktopNavCollapsed={desktopNavCollapsed}
@@ -190,6 +193,7 @@ export default function HomeClient({ shortLinksEnabled }: { shortLinksEnabled: b
           onToggleDesktopNav={toggleDesktopNav}
           onOpenMobileNav={() => setMobileNavOpen(true)}
         />
+        <ImpersonationBanner />
         <Box
           sx={{
             flex: 1,

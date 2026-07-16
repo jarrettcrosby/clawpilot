@@ -1,15 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { getCookieName, verifySessionToken } from '@/lib/auth'
 import { PRODUCT_AGENTS } from '@/lib/agents/routing'
 import { getAgentRuntimeForOperator, stableAgentProfileId } from '@/lib/agents/provider'
-import { requireActiveAppUser } from '@/lib/users'
+import { requireRequestUser } from '@/lib/requestUser'
 
 export async function GET(req: NextRequest) {
-  const session = verifySessionToken(req.cookies.get(getCookieName())?.value)
-  if (!session.ok) return NextResponse.json({ ok: false, error: 'Unauthorized' }, { status: 401 })
   let operatorId: string
   try {
-    operatorId = (await requireActiveAppUser(session.user)).email
+    operatorId = (await requireRequestUser(req)).email
   } catch {
     return NextResponse.json({ ok: false, error: 'Unauthorized' }, { status: 401 })
   }

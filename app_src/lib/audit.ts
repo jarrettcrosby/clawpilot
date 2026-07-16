@@ -17,6 +17,9 @@ const SAFE_DETAIL_KEYS = new Set([
   'reinvited', 'previousOrganizationId', 'dispatchId', 'agentId', 'trigger', 'sourceKey',
   'recordTitle',
   'eligible', 'queued', 'deletedReferenceCodes', 'matchedReferenceCodes', 'suiteCrmDeletesQueued',
+  'sessionId', 'deviceLabel', 'authMethod', 'idleExpiresAt', 'absoluteExpiresAt',
+  'revokeReason', 'revokedCount', 'authenticatedUser', 'effectiveUser', 'impersonated',
+  'impersonationExpiresAt',
 ])
 
 export type ActivityScope = 'self' | 'organization' | 'global'
@@ -155,6 +158,13 @@ function auditMessage(row: AuditRow): string {
   if (row.event_type === 'auth.login.succeeded') return `${method} sign-in completed`
   if (row.event_type === 'auth.login.failed') return `${method} sign-in failed`
   if (row.event_type === 'auth.logout.succeeded') return 'Signed out'
+  if (row.event_type === 'auth.session.created') return 'Browser session created'
+  if (row.event_type === 'auth.session.revoked') return 'Browser session revoked'
+  if (row.event_type === 'auth.sessions.revoked') return 'Browser sessions revoked'
+  if (row.event_type === 'auth.session.expired') return 'Browser session expired'
+  if (row.event_type === 'auth.impersonation.started') return `Started user view for ${String(payload.effectiveUser || row.aggregate_id || 'user')}`
+  if (row.event_type === 'auth.impersonation.ended') return `Exited user view for ${String(payload.effectiveUser || row.aggregate_id || 'user')}`
+  if (row.event_type === 'auth.impersonation.expired') return `User view expired for ${String(payload.effectiveUser || row.aggregate_id || 'user')}`
   if (row.event_type === 'auth.code.requested') return 'Sign-in code requested'
   if (row.event_type === 'auth.code.request.denied') return 'Sign-in code request denied'
   if (row.event_type === 'crm.record.staged') return 'CRM record queued for synchronization'
@@ -297,7 +307,9 @@ async function readAuditRows(scope: ActivityScope, context: ScopeContext, snapsh
       module: activityModule,
       type: eventTypeGroup(row.event_type),
       eventType: row.event_type,
-      message: auditMessage(row),
+      message: row.payload?.impersonated && typeof row.payload.effectiveUser === 'string'
+        ? `${auditMessage(row)} as ${row.payload.effectiveUser}`
+        : auditMessage(row),
       timestamp: new Date(row.created_at).toISOString(),
       actor: row.actor || 'system',
       actorName: row.actor_name,
