@@ -41,7 +41,26 @@ async function mockTimezoneWorkspace(page: Page, onCrmSave: (occurredAt: string)
   await page.route((url) => url.pathname === '/api/docs', (route) => route.fulfill({ json: [] }))
   await page.route((url) => url.pathname === '/api/execution-results/summary', (route) => route.fulfill({ json: { count: 0 } }))
   await page.route((url) => url.pathname === '/api/pipeline/activity', (route) => route.fulfill({ json: [] }))
-  await page.route((url) => url.pathname === '/api/activity', (route) => route.fulfill({ json: { ok: true, events: [], nextCursor: null, scope: 'self', capabilities: { canViewOrganization: false, canViewGlobal: false, defaultScope: 'self' } } }))
+  await page.route((url) => url.pathname === '/api/activity', (route) => route.fulfill({
+    json: {
+      ok: true,
+      events: [{
+        id: 'timezone-activity',
+        module: 'projects',
+        type: 'updated',
+        eventType: 'task.updated',
+        message: 'Timezone boundary activity',
+        timestamp: UTC_TIMESTAMP,
+        actor: 'timezone@example.test',
+        actorName: 'Timezone Tester',
+        target: null,
+        details: {},
+      }],
+      nextCursor: null,
+      scope: 'self',
+      capabilities: { canViewOrganization: false, canViewGlobal: false, defaultScope: 'self' },
+    },
+  }))
   await page.route((url) => url.pathname === '/api/pipeline', (route) => route.fulfill({
     json: {
       pipeline: {
@@ -146,7 +165,7 @@ test('signed-in profile timezone controls visible timestamps while UTC source va
   await expect(page.getByText('Good evening, Timezone Tester', { exact: true })).toBeVisible()
 
   await page.getByRole('button', { name: 'Activity log' }).click()
-  const activityDrawer = page.locator('.MuiDrawer-paper').filter({ hasText: 'Activity Log' })
+  const activityDrawer = page.locator('.MuiDrawer-paper').filter({ hasText: 'Activity' })
   await activityDrawer.getByText('Projects', { exact: true }).click()
   await expect(activityDrawer.getByText('Tuesday, July 14', { exact: true })).toBeVisible()
   await expect(activityDrawer.getByText('Jul 14, 6:30 PM', { exact: true }).first()).toBeVisible()
@@ -162,8 +181,9 @@ test('signed-in profile timezone controls visible timestamps while UTC source va
   await expect(crmRecords.getByText('Jul 14, 2026, 6:30 PM', { exact: true })).toBeVisible()
   await crmRecords.getByRole('row').filter({ hasText: 'Timezone interaction' }).click()
   await expect(page.getByLabel('Date', { exact: true })).toHaveValue('2026-07-14T18:30')
+  await page.getByLabel('Date', { exact: true }).fill('2026-06-10T08:45')
   await page.getByRole('button', { name: 'Save', exact: true }).click()
-  await expect.poll(() => savedCrmTimestamp).toBe(UTC_TIMESTAMP)
+  await expect.poll(() => savedCrmTimestamp).toBe('2026-06-10T15:45:00.000Z')
 
   await page.evaluate(() => { window.location.hash = 'pipeline' })
   await expect(page.getByText('Last synced: Jul 14, 2026, 6:30 PM', { exact: true })).toBeVisible()

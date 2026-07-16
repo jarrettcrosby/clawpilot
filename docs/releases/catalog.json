@@ -32,6 +32,7 @@
         "Removes direct guessed Google Sheet row writes from opportunity creation and editing",
         "Propagates Organization renames to pipeline opportunities and generated workbook projections through the canonical Organization relationship",
         "Writes interaction Account and Contact relationships to SuiteCRM History while assigning the mapped native CRM user",
+        "Preserves past interaction dates through SuiteCRM synchronization by separating the Occurred At business timestamp from the Note creation timestamp",
         "Opens Activity targets in the event's owning board or pipeline instead of the currently selected workspace resource",
         "Keeps local development usable when hosted browser-session authentication is disabled"
       ]

@@ -385,6 +385,7 @@ function suiteCrmAttributes(input: StageCrmRecordInput, referenceCode: string) {
   return {
     ...globalId,
     name: clean(fields.subject),
+    occurred_at_c: suiteCrmDateTime(fields.occurredAt),
     parent_type: fields.parentSuiteCrmId ? clean(fields.parentSuiteCrmType) : '',
     parent_id: clean(fields.parentSuiteCrmId),
     contact_id: clean(fields.contactSuiteCrmId),

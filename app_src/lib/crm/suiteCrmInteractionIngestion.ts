@@ -434,9 +434,11 @@ function interactionFields(
     ? cleanMultiline(attributes.description, 50_000, 'note description')
     : currentDescription
   const currentOccurredAt = validDate(row.occurred_at)?.toISOString() || null
-  const occurredAt = hasAttribute(attributes, 'date_entered') && storedString(attributes.date_entered)
-    ? suiteTimestamp(attributes.date_entered, 'created time')
-    : currentOccurredAt
+  const occurredAt = hasAttribute(attributes, 'occurred_at_c') && storedString(attributes.occurred_at_c)
+    ? suiteTimestamp(attributes.occurred_at_c, 'occurred time')
+    : currentOccurredAt || (hasAttribute(attributes, 'date_entered') && storedString(attributes.date_entered)
+      ? suiteTimestamp(attributes.date_entered, 'created time')
+      : null)
   return {
     ...interactionRelations(row, parent),
     interactionType: cleanString(row.interaction_type, 100, 'stored interaction type'),

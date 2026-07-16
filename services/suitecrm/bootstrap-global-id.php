@@ -14,28 +14,36 @@ require_once 'lib/Search/SearchModules.php';
 
 const CLAWPILOT_GLOBAL_ID_FIELD = 'global_id_c';
 const CLAWPILOT_GLOBAL_ID_LABEL = 'LBL_GLOBAL_ID';
+const CLAWPILOT_NOTE_OCCURRED_AT_FIELD = 'occurred_at_c';
+const CLAWPILOT_NOTE_OCCURRED_AT_LABEL = 'LBL_OCCURRED_AT';
 
 /** @param mixed $value */
-function layout_contains_global_id($value): bool
+function layout_contains_field($value, string $fieldName): bool
 {
     if (is_string($value)) {
-        return strtolower($value) === CLAWPILOT_GLOBAL_ID_FIELD;
+        return strtolower($value) === strtolower($fieldName);
     }
     if (!is_array($value)) {
         return false;
     }
-    if (isset($value['name']) && is_string($value['name']) && strtolower($value['name']) === CLAWPILOT_GLOBAL_ID_FIELD) {
+    if (isset($value['name']) && is_string($value['name']) && strtolower($value['name']) === strtolower($fieldName)) {
         return true;
     }
     foreach ($value as $key => $child) {
-        if (is_string($key) && strtolower($key) === CLAWPILOT_GLOBAL_ID_FIELD) {
+        if (is_string($key) && strtolower($key) === strtolower($fieldName)) {
             return true;
         }
-        if (layout_contains_global_id($child)) {
+        if (layout_contains_field($child, $fieldName)) {
             return true;
         }
     }
     return false;
+}
+
+/** @param mixed $value */
+function layout_contains_global_id($value): bool
+{
+    return layout_contains_field($value, CLAWPILOT_GLOBAL_ID_FIELD);
 }
 
 function expose_global_id_in_detail_view(string $module): void
@@ -186,6 +194,95 @@ function ensure_global_id_field(string $module): void
     expose_global_id_in_search_view($module, 'advanced_search');
 }
 
+function expose_note_occurred_at_in_view(string $view): void
+{
+    $parser = ParserFactory::getParser($view, 'Notes');
+    if (!$parser) {
+        throw new RuntimeException("SuiteCRM {$view} layout for Notes is unavailable");
+    }
+    if (!layout_contains_field($parser->getLayout(), CLAWPILOT_NOTE_OCCURRED_AT_FIELD)) {
+        $parser->addField([
+            'name' => CLAWPILOT_NOTE_OCCURRED_AT_FIELD,
+            'label' => CLAWPILOT_NOTE_OCCURRED_AT_LABEL,
+        ]);
+        $parser->handleSave(false);
+        $parser = ParserFactory::getParser($view, 'Notes');
+    }
+    if (!$parser || !layout_contains_field($parser->getLayout(), CLAWPILOT_NOTE_OCCURRED_AT_FIELD)) {
+        throw new RuntimeException("Occurred At is missing from the Notes {$view} layout");
+    }
+}
+
+function expose_note_occurred_at_in_list_view(): void
+{
+    $parser = ParserFactory::getParser('listview', 'Notes');
+    if (!$parser) {
+        throw new RuntimeException('SuiteCRM list layout for Notes is unavailable');
+    }
+    if (!layout_contains_field($parser->getLayout(), CLAWPILOT_NOTE_OCCURRED_AT_FIELD)) {
+        $parser->_viewdefs[CLAWPILOT_NOTE_OCCURRED_AT_FIELD] = [
+            'width' => '12%',
+            'label' => CLAWPILOT_NOTE_OCCURRED_AT_LABEL,
+            'default' => true,
+            'sortable' => true,
+        ];
+        $parser->handleSave(false);
+        $parser = ParserFactory::getParser('listview', 'Notes');
+    }
+    if (!$parser || !layout_contains_field($parser->getLayout(), CLAWPILOT_NOTE_OCCURRED_AT_FIELD)) {
+        throw new RuntimeException('Occurred At is missing from the Notes list layout');
+    }
+}
+
+/** @param array<string, mixed> $definition */
+function note_occurred_at_definition_is_current(array $definition): bool
+{
+    return ($definition['vname'] ?? '') === CLAWPILOT_NOTE_OCCURRED_AT_LABEL
+        && in_array(($definition['type'] ?? ''), ['datetime', 'datetimecombo'], true)
+        && !empty($definition['audited'])
+        && !empty($definition['reportable']);
+}
+
+function ensure_note_occurred_at_field(): void
+{
+    $bean = BeanFactory::newBean('Notes');
+    if (!$bean) {
+        throw new RuntimeException('SuiteCRM Notes module is unavailable');
+    }
+
+    $dynamic = new DynamicField('Notes');
+    $dynamic->setup($bean);
+    $definition = isset($bean->field_defs[CLAWPILOT_NOTE_OCCURRED_AT_FIELD])
+        && is_array($bean->field_defs[CLAWPILOT_NOTE_OCCURRED_AT_FIELD])
+        ? $bean->field_defs[CLAWPILOT_NOTE_OCCURRED_AT_FIELD]
+        : [];
+    $existing = $dynamic->getFieldWidget('Notes', CLAWPILOT_NOTE_OCCURRED_AT_FIELD);
+
+    if (!$existing || !note_occurred_at_definition_is_current($definition)) {
+        $field = $existing ?: get_widget('datetimecombo');
+        $field->name = $existing ? CLAWPILOT_NOTE_OCCURRED_AT_FIELD : 'occurred_at';
+        $field->label = CLAWPILOT_NOTE_OCCURRED_AT_LABEL;
+        $field->vname = CLAWPILOT_NOTE_OCCURRED_AT_LABEL;
+        $field->label_value = 'Occurred At';
+        $field->required = false;
+        $field->default = null;
+        $field->default_value = null;
+        $field->audited = 1;
+        $field->inline_edit = 1;
+        $field->massupdate = 0;
+        $field->importable = 'true';
+        $field->duplicate_merge = 'disabled';
+        $field->reportable = true;
+        $field->comment = 'Business occurrence time for the ClawPilot interaction. Managed by ClawPilot.';
+        $field->save($dynamic);
+    }
+
+    $dynamic->setLabel('en_us', CLAWPILOT_NOTE_OCCURRED_AT_LABEL, 'Occurred At');
+    expose_note_occurred_at_in_view('detailview');
+    expose_note_occurred_at_in_view('editview');
+    expose_note_occurred_at_in_list_view();
+}
+
 /** @param list<string> $modules */
 function rebuild_and_verify_global_search(array $modules): void
 {
@@ -216,6 +313,8 @@ $modules = [
 foreach ($modules as $module) {
     ensure_global_id_field($module);
 }
+
+ensure_note_occurred_at_field();
 
 rebuild_and_verify_global_search($modules);
 

@@ -425,6 +425,7 @@ assertIncludes(crmAdapter, 'Interaction contact must belong to the selected orga
 assertIncludes(crmAdapter, 'listCrmPipelineUsersInPostgres', 'interaction agent user catalog')
 assertIncludes(crmAdapter, 'contact_id: clean(fields.contactSuiteCrmId)', 'SuiteCRM Note contact field')
 assertIncludes(crmAdapter, 'global_id_c: referenceCode', 'SuiteCRM Global ID projection')
+assertIncludes(crmAdapter, 'occurred_at_c: suiteCrmDateTime(fields.occurredAt)', 'SuiteCRM interaction occurrence-time projection')
 assertIncludes(crmAdapter, '`crm:${input.entity}:v3:', 'versioned SuiteCRM Global ID outbox contract')
 assertIncludes(crmAdapter, "WHERE sync_outbox.status IN ('succeeded', 'dead')", 'replayed SuiteCRM content revision requeue')
 assertIncludes(crmAdapter, 'RETURNING idempotency_key', 'idempotent SuiteCRM outbox insertion or requeue result')
@@ -719,6 +720,7 @@ assertIncludes(suiteCrmClient, 'type !== moduleName && type !== recordType', 'Su
 
 const suiteCrmGlobalIdBootstrap = read('services/suitecrm/bootstrap-global-id.php')
 assertIncludes(suiteCrmGlobalIdBootstrap, "const CLAWPILOT_GLOBAL_ID_FIELD = 'global_id_c'", 'native SuiteCRM Global ID field')
+assertIncludes(suiteCrmGlobalIdBootstrap, "const CLAWPILOT_NOTE_OCCURRED_AT_FIELD = 'occurred_at_c'", 'native SuiteCRM interaction occurrence field')
 assertIncludes(suiteCrmGlobalIdBootstrap, '$field->unified_search = 1', 'native SuiteCRM Global ID unified search')
 assertIncludes(suiteCrmGlobalIdBootstrap, "'Meetings'", 'SuiteCRM meeting Global ID field')
 assertIncludes(suiteCrmGlobalIdBootstrap, 'expose_global_id_in_detail_view', 'SuiteCRM Global ID detail layout')
@@ -729,6 +731,7 @@ assertIncludes(suiteCrmGlobalIdBootstrap, 'ensure_global_id_search_field', 'Suit
 assertIncludes(suiteCrmGlobalIdBootstrap, "'force_unifiedsearch' => true", 'SuiteCRM immediate unified search inclusion')
 assertIncludes(suiteCrmGlobalIdBootstrap, 'rebuild_and_verify_global_search', 'SuiteCRM Global ID search cache verification')
 assertIncludes(suiteCrmGlobalIdBootstrap, "sugar_cached('modules/unified_search_modules.php')", 'SuiteCRM unified search cache invalidation')
+assertIncludes(suiteCrmGlobalIdBootstrap, 'ensure_note_occurred_at_field', 'SuiteCRM Note occurrence field bootstrap')
 
 const suiteCrmEntrypoint = read('services/suitecrm/entrypoint.sh')
 assertIncludes(suiteCrmEntrypoint, 'APP_ENV=prod php bin/console cache:clear --no-warmup', 'strict SuiteCRM application cache clear')

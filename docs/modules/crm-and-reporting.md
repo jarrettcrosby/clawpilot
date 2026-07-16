@@ -61,7 +61,7 @@ An Opportunity owns one permanent `go` reference, one required Organization rela
 
 The interaction editor requires a controlled interaction type and offers only active ClawPilot users who can access the selected pipeline as the Agent. Administrators can map each ClawPilot user to one active native SuiteCRM username; the gateway then assigns the Note to that SuiteCRM user while preserving the ClawPilot email as the durable actor identity. Contact selection is scoped to the selected Organization and is optional only when the interaction is genuinely account-level.
 
-Completed interactions project to SuiteCRM Notes and therefore appear under native **History**, not the open **Activities** subpanel. The Account remains the Note parent and a selected Contact is written to the native Contact field and relationship. Scheduled Meetings and open Calls are activity records; a completed email or call log must not be misrepresented as open work merely to place it in the Activities panel.
+Completed interactions project to SuiteCRM Notes and therefore appear under native **History**, not the open **Activities** subpanel. The Account remains the Note parent and a selected Contact is written to the native Contact field and relationship. The user-entered business timestamp is stored in the native Note `Occurred At` field (`occurred_at_c`); SuiteCRM's system `date_entered` remains the record creation audit timestamp and cannot replace it during reconciliation. Scheduled Meetings and open Calls are activity records; a completed email or call log must not be misrepresented as open work merely to place it in the Activities panel.
 
 ## Email Association
 
