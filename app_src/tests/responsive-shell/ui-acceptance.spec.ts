@@ -109,7 +109,7 @@ test('responsive shell: 900x599 is desktop regardless of height or touch input',
 
 test('dashboard links open their target section and selected document', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 })
-  await page.route('**/api/tasks', (route) => route.fulfill({
+  await page.route((url) => url.pathname === '/api/tasks', (route) => route.fulfill({
     json: [{
       id: 'dashboard-task',
       title: 'Dashboard task',
@@ -131,7 +131,26 @@ test('dashboard links open their target section and selected document', async ({
     }],
   }))
   await page.route('**/api/pipeline/activity', (route) => route.fulfill({ json: [] }))
-  await page.route('**/api/activity**', (route) => route.fulfill({ json: { ok: true, events: [], nextCursor: null, scope: 'self', capabilities: { canViewOrganization: false, canViewGlobal: false, defaultScope: 'self' } } }))
+  await page.route('**/api/activity**', (route) => route.fulfill({
+    json: {
+      ok: true,
+      events: [{
+        id: 'dashboard-activity',
+        module: 'projects',
+        type: 'comment',
+        eventType: 'project.task.comment',
+        message: 'Dashboard activity',
+        timestamp: '2026-07-15T12:00:00.000Z',
+        actor: 'test@example.com',
+        actorName: 'Test User',
+        target: { section: 'projects', id: 'dashboard-task', label: 'Dashboard task' },
+        details: {},
+      }],
+      nextCursor: null,
+      scope: 'self',
+      capabilities: { canViewOrganization: false, canViewGlobal: false, defaultScope: 'self' },
+    },
+  }))
   await page.route('**/api/docs**', (route) => route.fulfill({
     json: [{
       id: 'dashboard-document',
@@ -156,7 +175,8 @@ test('dashboard links open their target section and selected document', async ({
 
   await page.evaluate(() => { window.location.hash = 'dashboard' })
   await page.getByRole('button', { name: 'Activity log' }).click()
-  const activityDrawer = page.locator('.MuiDrawer-paper').filter({ hasText: 'Activity Log' })
+  const activityDrawer = page.getByRole('heading', { name: 'Activity', exact: true })
+    .locator('xpath=ancestor::*[contains(@class,"MuiDrawer-paper")][1]')
   await activityDrawer.getByText('Projects', { exact: true }).click()
   await activityDrawer.getByText('Dashboard activity', { exact: true }).click()
   await expect(closeTaskDrawer).toBeVisible()

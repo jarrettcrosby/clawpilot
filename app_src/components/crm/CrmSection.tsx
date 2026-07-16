@@ -282,6 +282,7 @@ async function loadCrmOptions(entity: CrmEntity): Promise<RecordValue[]> {
 
 export default function CrmSection() {
   const dateTimeSettings = useUserDateTime()
+  const narrowMobile = useMediaQuery('(max-width:599.95px)')
   const shortLandscape = useMediaQuery('(orientation: landscape) and (max-height: 500px) and (max-width: 899.95px)')
   const [entity, setEntity] = useState<CrmEntity>('organizations')
   const [records, setRecords] = useState<RecordValue[]>([])
@@ -455,6 +456,10 @@ export default function CrmSection() {
       .filter((contact) => textValue(contact, 'organizationId') === organizationId)
       .sort((left, right) => textValue(left, 'fullName').localeCompare(textValue(right, 'fullName')))
   }, [contacts, editorEntity, editorRecord])
+  const relatedOrganization = useMemo(() => {
+    if (editorEntity !== 'contacts' || !fields.organizationId) return null
+    return organizations.find((organization) => textValue(organization, 'id') === fields.organizationId) || null
+  }, [editorEntity, fields.organizationId, organizations])
   const actionReady = Boolean(actionComposer && (
     actionComposer.type === 'send_email'
       ? actionFields.subject?.trim() && actionFields.text?.trim()
@@ -495,6 +500,20 @@ export default function CrmSection() {
     setEditorRecord(record)
     setFields(initialFields('contacts', record, dateTimeSettings.timeZone))
     setRelatedContactsLoading(false)
+  }
+
+  function openRelatedOrganization(record: RecordValue) {
+    if (!editorRecord) return
+    const previous = editorHistory[editorHistory.length - 1]
+    if (previous?.entity === 'organizations' && textValue(previous.record, 'id') === textValue(record, 'id')) {
+      returnToPreviousEditor()
+      return
+    }
+    setEditorHistory((history) => [...history, { entity: editorEntity, record: editorRecord, fields }])
+    setEditorEntity('organizations')
+    setEditorRecord(record)
+    setFields(initialFields('organizations', record, dateTimeSettings.timeZone))
+    setRelatedContactsLoading(true)
   }
 
   function returnToPreviousEditor() {
@@ -686,42 +705,94 @@ export default function CrmSection() {
             direction="row"
             gap={shortLandscape ? 0.5 : 1}
             alignItems="center"
-            sx={shortLandscape ? { minWidth: 0, overflowX: 'auto', WebkitOverflowScrolling: 'touch', '& > *': { flexShrink: 0 } } : undefined}
+            data-testid="crm-primary-actions"
+            sx={{
+              width: { xs: '100%', lg: 'auto' },
+              minWidth: 0,
+              ...(shortLandscape ? { overflowX: 'auto', WebkitOverflowScrolling: 'touch' } : {}),
+              ...(!narrowMobile ? { '& > *': { flexShrink: 0 } } : {}),
+            }}
           >
-            <WorkspaceSelector kind="pipeline" />
+            <Box sx={narrowMobile ? { flex: '1 1 0', minWidth: 0, '& .MuiFormControl-root': { width: '100%', maxWidth: '100%' } } : undefined}>
+              <WorkspaceSelector kind="pipeline" />
+            </Box>
             {workspaceHierarchy.length > 0 && (
-              <Button
-                startIcon={<AccountTreeRounded />}
-                variant="outlined"
-                onClick={() => setHierarchyOpen(true)}
-              >
-                Hierarchy
-              </Button>
+              narrowMobile ? (
+                <Tooltip title="Organization hierarchy">
+                  <IconButton aria-label="Organization hierarchy" color="primary" onClick={() => setHierarchyOpen(true)}>
+                    <AccountTreeRounded />
+                  </IconButton>
+                </Tooltip>
+              ) : (
+                <Button
+                  startIcon={<AccountTreeRounded />}
+                  variant="outlined"
+                  onClick={() => setHierarchyOpen(true)}
+                >
+                  Hierarchy
+                </Button>
+              )
             )}
             {pipeline?.shortLinkUrl && (
-              <Button
-                component="a"
-                href={pipeline.shortLinkUrl}
-                target="_blank"
-                rel="noreferrer"
-                startIcon={<OpenInNewRounded />}
-                variant="outlined"
-              >
-                Workbook
-              </Button>
+              narrowMobile ? (
+                <Tooltip title="Open workbook">
+                  <IconButton
+                    component="a"
+                    href={pipeline.shortLinkUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    aria-label="Open workbook"
+                    color="primary"
+                  >
+                    <OpenInNewRounded />
+                  </IconButton>
+                </Tooltip>
+              ) : (
+                <Button
+                  component="a"
+                  href={pipeline.shortLinkUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  startIcon={<OpenInNewRounded />}
+                  variant="outlined"
+                >
+                  Workbook
+                </Button>
+              )
             )}
             {suiteCrmPunchoutUrl && (
-              <Button
-                startIcon={<OpenInNewRounded />}
-                variant="outlined"
-                onClick={() => setSuiteCrmAccessOpen(true)}
-              >
-                Open SuiteCRM
-              </Button>
+              narrowMobile ? (
+                <Tooltip title="Open SuiteCRM">
+                  <IconButton aria-label="Open SuiteCRM" color="primary" onClick={() => setSuiteCrmAccessOpen(true)}>
+                    <OpenInNewRounded />
+                  </IconButton>
+                </Tooltip>
+              ) : (
+                <Button
+                  startIcon={<OpenInNewRounded />}
+                  variant="outlined"
+                  onClick={() => setSuiteCrmAccessOpen(true)}
+                >
+                  Open SuiteCRM
+                </Button>
+              )
             )}
           </Stack>
         </Stack>
-        <Stack direction="row" gap={shortLandscape ? 0.5 : 1} mt={shortLandscape ? 0.5 : 2} sx={{ overflowX: 'auto', pb: shortLandscape ? 0 : 0.5, scrollbarWidth: 'thin' }}>
+        <Stack
+          direction="row"
+          gap={shortLandscape ? 0.5 : 1}
+          mt={shortLandscape ? 0.5 : 2}
+          data-testid="crm-summary-strip"
+          sx={{
+            maxWidth: '100%',
+            overflowX: 'auto',
+            pb: shortLandscape ? 0 : 0.5,
+            scrollbarWidth: 'thin',
+            WebkitOverflowScrolling: 'touch',
+            '& .MuiChip-root': { flexShrink: 0 },
+          }}
+        >
           <Chip size={shortLandscape ? 'small' : 'medium'} label={`${summary.organizations} organizations`} />
           <Chip size={shortLandscape ? 'small' : 'medium'} label={`${summary.contacts} contacts`} />
           <Chip size={shortLandscape ? 'small' : 'medium'} label={`${summary.leads} leads`} />
@@ -750,19 +821,27 @@ export default function CrmSection() {
         {error && <Alert severity="error" onClose={() => setError('')} sx={{ mb: 1 }}>{error}</Alert>}
         {notice && <Alert severity="success" onClose={() => setNotice('')} sx={{ mb: 1 }}>{notice}</Alert>}
         <Stack direction={shortLandscape ? 'row' : 'column'} gap={shortLandscape ? 0.75 : 0} alignItems={shortLandscape ? 'center' : 'stretch'} sx={shortLandscape ? { overflowX: 'auto', WebkitOverflowScrolling: 'touch' } : undefined}>
-          <Stack direction="row" justifyContent="space-between" gap={1} alignItems="center" sx={{ minWidth: 0, flexShrink: 0 }}>
-            <Tabs value={entity} onChange={(_, value: CrmEntity) => {
+          <Stack
+            direction={shortLandscape ? 'row' : { xs: 'column', sm: 'row' }}
+            justifyContent="space-between"
+            gap={shortLandscape ? 1 : { xs: 0.5, sm: 1 }}
+            alignItems={shortLandscape ? 'center' : { xs: 'stretch', sm: 'center' }}
+            sx={{ minWidth: 0, flexShrink: 0 }}
+          >
+            <Tabs value={entity} aria-label="CRM record types" onChange={(_, value: CrmEntity) => {
               deepLinkOpened.current = true
               setEntity(value)
               setNeedsReviewOnly(false)
               setQuery('')
               setRouteQuery('')
-            }} variant="scrollable" sx={shortLandscape ? { minHeight: 36, maxWidth: 420, '& .MuiTab-root': { minHeight: 36, py: 0.5 } } : undefined}>
+            }} variant="scrollable" sx={shortLandscape
+              ? { minHeight: 36, maxWidth: 420, '& .MuiTab-root': { minHeight: 36, py: 0.5 } }
+              : { width: { xs: '100%', sm: 'auto' }, maxWidth: '100%' }}>
               {(Object.keys(ENTITY_LABELS) as CrmEntity[]).map((value) => (
                 <Tab key={value} value={value} label={ENTITY_LABELS[value]} />
               ))}
             </Tabs>
-            <Stack direction="row" gap={0.75} alignItems="center" sx={{ flexShrink: 0 }}>
+            <Stack data-testid="crm-record-actions" direction="row" gap={0.75} alignItems="center" sx={{ flexShrink: 0, alignSelf: { xs: 'flex-end', sm: 'auto' } }}>
               {pipeline?.accessRole === 'owner' && (
                 <>
                   <Tooltip title="Import the connected workbook into CRM">
@@ -809,11 +888,21 @@ export default function CrmSection() {
           />
         </Stack>
       </Box>
-      <TableContainer data-testid="crm-records" sx={{ flex: 1, minHeight: shortLandscape ? 96 : 0, px: { xs: 0, md: 3 }, overflow: 'auto' }}>
+      <TableContainer data-testid="crm-records" tabIndex={0} aria-label="CRM records" sx={{ flex: 1, minHeight: shortLandscape ? 96 : 0, px: { xs: 0, md: 3 }, overflow: 'auto' }}>
         {loading ? (
           <Box display="grid" sx={{ placeItems: 'center', height: 240 }}><CircularProgress size={28} /></Box>
         ) : (
-          <Table stickyHeader size="small" sx={{ minWidth: 720 }}>
+          <Table stickyHeader size="small" sx={{
+            minWidth: 720,
+            '& th:first-of-type, & td:first-of-type': {
+              position: 'sticky',
+              left: 0,
+              zIndex: 2,
+              backgroundColor: 'background.paper',
+              boxShadow: '1px 0 0 0 rgba(255, 255, 255, 0.12)',
+            },
+            '& th:first-of-type': { zIndex: 4 },
+          }}>
             <TableHead>
               <TableRow>
                 {tableColumns.map(([, label]) => <TableCell key={label}>{label}</TableCell>)}
@@ -1032,8 +1121,8 @@ export default function CrmSection() {
         <Box sx={{ p: shortLandscape ? 1.5 : 2.5, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 1, minWidth: 0 }}>
           <Stack direction="row" alignItems="center" gap={0.5} sx={{ minWidth: 0 }}>
             {editorHistory.length > 0 && (
-              <Tooltip title="Back to organization">
-                <IconButton aria-label="Back to organization" onClick={returnToPreviousEditor} disabled={busy}>
+              <Tooltip title={`Back to ${ENTITY_LABELS[editorHistory[editorHistory.length - 1].entity].slice(0, -1).toLowerCase()}`}>
+                <IconButton aria-label={`Back to ${ENTITY_LABELS[editorHistory[editorHistory.length - 1].entity].slice(0, -1).toLowerCase()}`} onClick={returnToPreviousEditor} disabled={busy}>
                   <ArrowBackRounded />
                 </IconButton>
               </Tooltip>
@@ -1126,6 +1215,28 @@ export default function CrmSection() {
               ) : null}
               {organizations.map((record) => <MenuItem key={textValue(record, 'id')} value={textValue(record, 'id')}>{textValue(record, 'name')}</MenuItem>)}
             </TextField>
+            {editorRecord && fields.organizationId && (
+              <Box component="section" aria-label="Related organization" sx={{ minWidth: 0 }}>
+                <Typography variant="subtitle2" fontWeight={700}>Related organization</Typography>
+                <Divider sx={{ mt: 1 }} />
+                <ListItemButton
+                  aria-label={`Open organization ${relatedOrganization ? textValue(relatedOrganization, 'name') : textValue(editorRecord, 'organizationName')}`}
+                  disabled={!relatedOrganization}
+                  onClick={() => { if (relatedOrganization) openRelatedOrganization(relatedOrganization) }}
+                  sx={{ px: 0, py: 1.25, minWidth: 0 }}
+                >
+                  <BusinessRounded color="primary" sx={{ mr: 1.25, flexShrink: 0 }} />
+                  <ListItemText
+                    primary={relatedOrganization ? textValue(relatedOrganization, 'name') : textValue(editorRecord, 'organizationName') || 'Current organization'}
+                    secondary={relatedOrganization ? textValue(relatedOrganization, 'referenceCode') || 'Organization' : 'Organization record loading'}
+                    primaryTypographyProps={{ fontWeight: 600, sx: { overflowWrap: 'anywhere' } }}
+                    secondaryTypographyProps={{ sx: { mt: 0.25, overflowWrap: 'anywhere' } }}
+                    sx={{ minWidth: 0, my: 0 }}
+                  />
+                  {relatedOrganization ? <ChevronRightRounded color="action" sx={{ ml: 1, flexShrink: 0 }} /> : <CircularProgress size={18} sx={{ ml: 1, flexShrink: 0 }} />}
+                </ListItemButton>
+              </Box>
+            )}
             <Stack direction={{ xs: 'column', sm: 'row' }} gap={2} sx={{ minWidth: 0 }}>
               <TextField fullWidth disabled={!recordEditable} label="Priority" value={fields.priority || ''} onChange={(event) => setFields({ ...fields, priority: event.target.value })} />
               <TextField fullWidth disabled={!recordEditable} label="Type" value={fields.contactType || ''} onChange={(event) => setFields({ ...fields, contactType: event.target.value })} />
