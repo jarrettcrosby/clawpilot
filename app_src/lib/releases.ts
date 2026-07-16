@@ -604,10 +604,10 @@ function runtimeEnvironment(): string {
 }
 
 function runtimeCommit(): string | null {
-  const value = process.env.RELEASE_COMMIT
-    || process.env.RAILWAY_GIT_COMMIT_SHA
+  const value = process.env.RAILWAY_GIT_COMMIT_SHA
     || process.env.VERCEL_GIT_COMMIT_SHA
     || process.env.GITHUB_SHA
+    || process.env.RELEASE_COMMIT
     || ''
   return value.trim().length >= 7 ? value.trim().toLowerCase() : null
 }

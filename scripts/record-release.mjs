@@ -161,11 +161,11 @@ const environment = normalizedEnvironment(firstEnvironmentValue(
   'NODE_ENV',
 ))
 const commitHash = String(firstEnvironmentValue(
-  'RELEASE_COMMIT',
   'RAILWAY_GIT_COMMIT_SHA',
   'VERCEL_GIT_COMMIT_SHA',
   'GITHUB_SHA',
   'BUILD_COMMIT',
+  'RELEASE_COMMIT',
 ) || '').trim().toLowerCase()
 if (commitHash.length < 7) fail('release commit must contain at least 7 characters')
 
@@ -177,10 +177,10 @@ const fixes = envFixes ?? parseList(catalog?.fixes, 'catalog fixes') ?? []
 const title = textValue(process.env.RELEASE_TITLE, catalog?.title || `Release ${commitHash.slice(0, 7)}`, 'title', 240)
 const summary = textValue(process.env.RELEASE_SUMMARY, catalog?.summary || '', 'summary', 5000)
 const branch = optionalText(firstEnvironmentValue(
-  'RELEASE_BRANCH',
   'RAILWAY_GIT_BRANCH',
   'VERCEL_GIT_COMMIT_REF',
   'GITHUB_REF_NAME',
+  'RELEASE_BRANCH',
 ) || catalog?.branch, 240, 'branch')
 const deploymentId = optionalText(firstEnvironmentValue(
   'RELEASE_DEPLOYMENT_ID',
