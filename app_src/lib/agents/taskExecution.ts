@@ -32,6 +32,38 @@ export type AgentTaskExecutionApplication = {
 
 const GENERIC_DESCRIPTION = 'Task created from directive. See checklist/comments for execution details.'
 const VALID_STATUS = new Set<AgentTaskExecutionStatus>(['triaged', 'awaiting_input', 'blocked'])
+const CHECKLIST_STOP_WORDS = new Set([
+  'a',
+  'an',
+  'and',
+  'as',
+  'before',
+  'for',
+  'from',
+  'in',
+  'into',
+  'of',
+  'on',
+  'or',
+  'the',
+  'through',
+  'to',
+  'vs',
+  'with',
+  'add',
+  'choose',
+  'create',
+  'define',
+  'design',
+  'document',
+  'ensure',
+  'implement',
+  'require',
+  'sequence',
+  'specify',
+  'validate',
+  'verify',
+])
 
 function cleanText(value: unknown, limit: number) {
   return String(value || '')
@@ -39,6 +71,42 @@ function cleanText(value: unknown, limit: number) {
     .replace(/\r\n?/g, '\n')
     .trim()
     .slice(0, limit)
+}
+
+function normalizeChecklistToken(token: string) {
+  if (token === 'phased') return 'phase'
+  if (token.endsWith('ies') && token.length > 4) return `${token.slice(0, -3)}y`
+  if (token.endsWith('s') && token.length > 4 && !token.endsWith('ss')) return token.slice(0, -1)
+  return token
+}
+
+function checklistConceptTokens(value: string) {
+  return new Set(
+    value
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, ' ')
+      .split(/\s+/)
+      .map(normalizeChecklistToken)
+      .filter((token) => token.length > 1 && !CHECKLIST_STOP_WORDS.has(token)),
+  )
+}
+
+function overlapsExistingChecklist(candidate: string, existing: string[]) {
+  const candidateTokens = checklistConceptTokens(candidate)
+  if (candidateTokens.size === 0) return false
+
+  return existing.some((text) => {
+    if (candidate.trim().toLowerCase() === text.trim().toLowerCase()) return true
+    const existingTokens = checklistConceptTokens(text)
+    if (existingTokens.size === 0) return false
+    let intersection = 0
+    for (const token of candidateTokens) {
+      if (existingTokens.has(token)) intersection += 1
+    }
+    const containment = intersection / Math.min(candidateTokens.size, existingTokens.size)
+    return (intersection >= 4 && containment >= 0.5)
+      || (intersection >= 3 && containment >= 0.75)
+  })
 }
 
 function extractJsonObject(value: unknown) {
@@ -120,11 +188,11 @@ export function applyAgentTaskExecutionPlan(input: {
   }
 
   const existingChecklist = Array.isArray(task.checklist) ? task.checklist : []
-  const existingChecklistText = new Set(existingChecklist.map((item) => item.text.trim().toLowerCase()))
+  const acceptedChecklistText = existingChecklist.map((item) => item.text)
   const addedChecklist: ChecklistItem[] = []
   for (const item of plan.checklistAdd) {
-    if (existingChecklistText.has(item.toLowerCase())) continue
-    existingChecklistText.add(item.toLowerCase())
+    if (overlapsExistingChecklist(item, acceptedChecklistText)) continue
+    acceptedChecklistText.push(item)
     addedChecklist.push({
       id: `agent-${dispatchId}-ck-${addedChecklist.length + 1}`,
       text: item,
