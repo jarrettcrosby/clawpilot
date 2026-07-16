@@ -1,6 +1,7 @@
 import crypto from 'crypto'
 import { NextRequest, NextResponse } from 'next/server'
-import { createSessionToken, getCookieName, getLoginPassword } from '@/lib/auth'
+import { getLoginPassword } from '@/lib/auth'
+import { createBrowserSession, setBrowserSessionCookie } from '@/lib/authSessions'
 import { recordAuthActivity } from '@/lib/authAudit'
 import { configuredOwnerEmail, ensureOwnerUser, markAppUserSignedIn } from '@/lib/users'
 import { ensureDefaultResourcesForUser } from '@/lib/tenancy'
@@ -98,17 +99,13 @@ export async function POST(req: NextRequest) {
     const ownerEmail = configuredOwnerEmail()
     await markAppUserSignedIn(ownerEmail)
     await ensureDefaultResourcesForUser(ownerEmail)
-    const token = createSessionToken(ownerEmail)
-    const res = NextResponse.json({ ok: true })
-    res.cookies.set({
-      name: getCookieName(),
-      value: token,
-      httpOnly: true,
-      sameSite: 'lax',
-      secure: process.env.NODE_ENV === 'production',
-      path: '/',
-      maxAge: 60 * 60 * 12,
+    const issued = await createBrowserSession({
+      email: ownerEmail,
+      authMethod: 'operator_password',
+      headers: req.headers,
     })
+    const res = NextResponse.json({ ok: true })
+    setBrowserSessionCookie(res, issued)
     await recordAuthActivity({ req, email: ownerEmail, eventType: 'auth.login.succeeded', method: 'operator_password' }).catch(() => undefined)
     return res
   } catch (e: unknown) {

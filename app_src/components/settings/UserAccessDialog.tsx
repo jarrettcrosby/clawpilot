@@ -38,12 +38,14 @@ import PersonOffRounded from '@mui/icons-material/PersonOffRounded'
 import ReplayRounded from '@mui/icons-material/ReplayRounded'
 import RestoreRounded from '@mui/icons-material/RestoreRounded'
 import SaveRounded from '@mui/icons-material/SaveRounded'
+import SecurityRounded from '@mui/icons-material/SecurityRounded'
 import ShareRounded from '@mui/icons-material/ShareRounded'
 import TableChartRounded from '@mui/icons-material/TableChartRounded'
 import ViewKanbanRounded from '@mui/icons-material/ViewKanbanRounded'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import { announceUserDateTimeSettings, formatUserDateTime } from '@/lib/userDateTime'
 import IntegrationSettingsPanel from './IntegrationSettingsPanel'
+import SessionSecurityPanel from './SessionSecurityPanel'
 
 type UserRole = 'owner' | 'admin' | 'member'
 type UserStatus = 'invited' | 'active' | 'disabled'
@@ -829,6 +831,7 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
           <Tab icon={<GroupRounded sx={{ fontSize: 18 }} />} iconPosition="start" label="People" id="settings-tab-1" aria-controls="settings-panel-1" />
           <Tab icon={<ShareRounded sx={{ fontSize: 18 }} />} iconPosition="start" label="Sharing" id="settings-tab-2" aria-controls="settings-panel-2" />
           <Tab icon={<IntegrationInstructionsRounded sx={{ fontSize: 18 }} />} iconPosition="start" label="Integrations" id="settings-tab-3" aria-controls="settings-panel-3" />
+          <Tab icon={<SecurityRounded sx={{ fontSize: 18 }} />} iconPosition="start" label="Security" id="settings-tab-4" aria-controls="settings-panel-4" />
         </Tabs>
       </Box>
 
@@ -1504,6 +1507,7 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
         ) : null}
 
         {!loading && activeTab === 3 ? <IntegrationSettingsPanel isOwner={currentUser?.role === 'owner'} /> : null}
+        {!loading && activeTab === 4 ? <SessionSecurityPanel /> : null}
       </DialogContent>
 
       <Dialog

@@ -3,7 +3,6 @@ import crypto from 'crypto'
 import fs from 'fs'
 import path from 'path'
 import { NextRequest, NextResponse } from 'next/server'
-import { getCookieName, verifySessionToken } from '@/lib/auth'
 import { getAgentRuntimeForOperator, runChatGPTAgent, runOpenAIAgent } from '@/lib/agents/provider'
 import {
   captureAgentLearning,
@@ -21,7 +20,8 @@ import { isOpenClawExecutionEnabled, shouldFallbackToFileOnDatabaseError } from 
 import { getThreadFromPostgres, listThreadsFromPostgres, upsertThreadMessageInPostgres } from '@/lib/persistence/agentThreads'
 import { appendExecutionResultToPostgres, appendExecutionRunToPostgres, isPostgresExecutionStoreEnabled } from '@/lib/persistence/execution'
 import { isPostgresTaskStoreEnabled, readTasksFromPostgres, replaceTasksInPostgres } from '@/lib/persistence/tasks'
-import { requireActiveAppUser } from '@/lib/users'
+import { requireRequestUser } from '@/lib/requestUser'
+import { resolveAgentDispatchWorker, type AgentDispatchWorkerContext } from '@/lib/workerAuth'
 import {
   BOARD_SELECTION_COOKIE,
   requireResourceEditor,
@@ -120,34 +120,32 @@ async function upsertPersistedThreadMessage(input: Parameters<typeof upsertThrea
   })
 }
 
-async function resolveOperator(req: NextRequest): Promise<string | null> {
-  const session = verifySessionToken(req.cookies.get(getCookieName())?.value)
-  if (!session.ok) return null
+async function resolveOperator(req: NextRequest, allowWorker = false): Promise<{
+  operatorId: string
+  worker: AgentDispatchWorkerContext | null
+} | null> {
   try {
-    return (await requireActiveAppUser(session.user)).email
+    const worker = allowWorker ? await resolveAgentDispatchWorker(req) : null
+    if (worker) return { operatorId: worker.operatorId, worker }
+    return { operatorId: (await requireRequestUser(req)).email, worker: null }
   } catch {
     return null
   }
 }
 
-function authorizedWorkerDispatch(req: NextRequest): boolean {
-  if (req.headers.get('x-clawpilot-worker') !== 'agent-dispatch') return false
-  const expected = String(process.env.PIPELINE_OUTBOX_WORKER_SECRET || '')
-  const provided = String(req.headers.get('authorization') || '').replace(/^Bearer\s+/i, '')
-  if (!expected || !provided) return false
-  const expectedBuffer = Buffer.from(expected)
-  const providedBuffer = Buffer.from(provided)
-  return expectedBuffer.length === providedBuffer.length
-    && crypto.timingSafeEqual(expectedBuffer, providedBuffer)
-}
-
-async function resolveAgentBoard(req: NextRequest, operatorId: string, requireEdit = false): Promise<ProjectBoard | null> {
+async function resolveAgentBoard(
+  req: NextRequest,
+  operatorId: string,
+  requireEdit = false,
+  worker?: AgentDispatchWorkerContext | null,
+): Promise<ProjectBoard | null> {
   if (!isPostgresTaskStoreEnabled()) return null
-  const selected = req.cookies.get(BOARD_SELECTION_COOKIE)?.value || undefined
+  const selected = worker?.boardId || req.cookies.get(BOARD_SELECTION_COOKIE)?.value || undefined
   let board: ProjectBoard
   try {
     board = await resolveProjectBoardAccess({ actorEmail: operatorId, boardId: selected })
-  } catch {
+  } catch (error) {
+    if (worker?.boardId) throw error
     board = await resolveProjectBoardAccess({ actorEmail: operatorId })
   }
   if (requireEdit) requireResourceEditor(board)
@@ -323,8 +321,9 @@ function assignmentError(task: Task, agentId: string): string | null {
 }
 
 export async function GET(req: NextRequest) {
-  const operatorId = await resolveOperator(req)
-  if (!operatorId) return NextResponse.json({ ok: false, error: 'Unauthorized' }, { status: 401 })
+  const resolved = await resolveOperator(req)
+  if (!resolved) return NextResponse.json({ ok: false, error: 'Unauthorized' }, { status: 401 })
+  const { operatorId } = resolved
   let board: ProjectBoard | null
   try {
     board = await resolveAgentBoard(req, operatorId)
@@ -374,11 +373,12 @@ export async function GET(req: NextRequest) {
 }
 
 export async function POST(req: NextRequest) {
-  const operatorId = await resolveOperator(req)
-  if (!operatorId) return NextResponse.json({ ok: false, error: 'Unauthorized' }, { status: 401 })
+  const resolved = await resolveOperator(req, true)
+  if (!resolved) return NextResponse.json({ ok: false, error: 'Unauthorized' }, { status: 401 })
+  const { operatorId, worker } = resolved
   let board: ProjectBoard | null
   try {
-    board = await resolveAgentBoard(req, operatorId, true)
+    board = await resolveAgentBoard(req, operatorId, true, worker)
   } catch (error) {
     return NextResponse.json({ ok: false, error: error instanceof Error ? error.message : 'Board edit access denied' }, { status: 403 })
   }
@@ -388,7 +388,7 @@ export async function POST(req: NextRequest) {
   const taskId = String(body?.taskId || '').trim()
   const tags = Array.isArray(body?.tags) ? body.tags.map(String) : undefined
   const requestedDispatchId = String(body?.dispatchId || '').trim()
-  if (requestedDispatchId && !authorizedWorkerDispatch(req)) {
+  if (requestedDispatchId && !worker) {
     return NextResponse.json({ ok: false, error: 'Agent dispatch metadata requires worker authorization' }, { status: 403 })
   }
   const dispatchId = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(requestedDispatchId)

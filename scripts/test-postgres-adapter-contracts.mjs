@@ -929,7 +929,9 @@ assert.ok(!workspacesRoute.includes('googleSharedDriveId'), 'workspace payload m
 const agentDispatchWorker = read('app_src/lib/agentDispatchWorker.ts')
 assertIncludes(agentDispatchWorker, 'claimAgentDispatchOutboxInPostgres', 'agent dispatch worker')
 assertIncludes(agentDispatchWorker, "path: '/api/agents/threads'", 'agent dispatch execution route')
-assertIncludes(agentDispatchWorker, 'createSessionToken(item.operatorId)', 'per-user agent dispatch session')
+assertIncludes(agentDispatchWorker, "'X-ClawPilot-Operator': input.item.operatorId", 'scoped agent dispatch operator identity')
+assertIncludes(agentDispatchWorker, "'X-ClawPilot-Board-Id': input.item.boardId", 'scoped agent dispatch board identity')
+assert.ok(!agentDispatchWorker.includes('Cookie:'), 'agent dispatch worker must not fabricate browser cookies')
 assertIncludes(agentDispatchWorker, "status === 'dead' ? 'failed' : 'queued'", 'agent dispatch retry visibility')
 
 const pullRoute = read('app_src/app/api/pipeline/sync/pull/route.ts')
@@ -966,8 +968,9 @@ for (const requiredVariable of [
 }
 
 const authProxy = read('app_src/proxy.ts')
-assertIncludes(authProxy, 'validSession', 'auth proxy')
-assertIncludes(authProxy, 'activeSessionUser', 'disabled-session revocation')
+assertIncludes(authProxy, 'resolveRequestSession', 'durable auth proxy')
+assertIncludes(authProxy, 'createAuthAttributionHeaders', 'signed request attribution')
+assertIncludes(authProxy, 'authorizedWorkerRequest', 'separate worker authentication')
 assertIncludes(authProxy, '_next/static', 'auth proxy matcher')
 assertIncludes(authProxy, '/api/pipeline/sync/outbox/process', 'auth proxy public worker route')
 assertIncludes(authProxy, '/api/agents/dispatch/process', 'auth proxy public agent worker route')
@@ -985,7 +988,7 @@ assertIncludes(magicRequestRoute, 'MAX_REQUESTS', 'magic-code request rate limit
 
 const magicVerifyRoute = read('app_src/app/api/auth/magic/verify/route.ts')
 assertIncludes(magicVerifyRoute, 'verifyAuthMagicCode', 'magic-code verify route')
-assertIncludes(magicVerifyRoute, 'createSessionToken', 'magic-code session issuance')
+assertIncludes(magicVerifyRoute, 'createBrowserSession', 'durable magic-code session issuance')
 assertIncludes(magicVerifyRoute, 'queuePipelineProvisioning', 'automatic personal pipeline Sheet provisioning')
 
 const tenancyDataVerifier = read('scripts/verify-tenancy-provisioning.mjs')
@@ -1022,6 +1025,7 @@ assertIncludes(healthRoute, '0022_pipeline_sheet_access_links.sql', 'hosted pipe
 assertIncludes(healthRoute, '0033_crm_board_projection_and_legacy_alias_cleanup.sql', 'hosted CRM board projection migration health')
 assertIncludes(healthRoute, '0035_suitecrm_inbound_sync_status.sql', 'hosted SuiteCRM inbound sync migration health')
 assertIncludes(healthRoute, '0036_crm_display_text_and_card_semantics.sql', 'hosted CRM display text migration health')
+assertIncludes(healthRoute, '0040_browser_sessions_and_impersonation.sql', 'hosted browser session migration health')
 assertIncludes(healthRoute, 'readSuiteCrmWorkerHeartbeat', 'hosted SuiteCRM worker health')
 assertIncludes(healthRoute, 'migration_checksums_present', 'hosted migration checksum health')
 assertIncludes(healthRoute, 'queryAgentCredentials', 'shared agent credential store health')

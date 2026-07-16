@@ -1,5 +1,3 @@
-import { createSessionToken, getCookieName } from '@/lib/auth'
-import { BOARD_SELECTION_COOKIE } from '@/lib/tenancy'
 import {
   claimAgentDispatchOutboxInPostgres,
   completeAgentDispatchOutboxInPostgres,
@@ -24,10 +22,6 @@ function workerSecret() {
   return secret
 }
 
-function cookieHeader(item: AgentDispatchOutboxItem) {
-  return `${getCookieName()}=${createSessionToken(item.operatorId)}; ${BOARD_SELECTION_COOKIE}=${item.boardId}`
-}
-
 async function internalJson(input: {
   item: AgentDispatchOutboxItem
   path: string
@@ -42,9 +36,10 @@ async function internalJson(input: {
       method: input.method || 'POST',
       headers: {
         Authorization: `Bearer ${workerSecret()}`,
-        Cookie: cookieHeader(input.item),
         'Content-Type': 'application/json',
         'X-ClawPilot-Worker': 'agent-dispatch',
+        'X-ClawPilot-Operator': input.item.operatorId,
+        'X-ClawPilot-Board-Id': input.item.boardId,
       },
       body: JSON.stringify(input.body),
       signal: controller.signal,

@@ -115,6 +115,14 @@ export function configuredOwnerEmail(): string {
   return normalizeUserEmail(process.env.APP_LOGIN_EMAIL)
 }
 
+export function isRootAppOwner(user: Pick<AppUser, 'email' | 'role'>): boolean {
+  try {
+    return user.role === 'owner' && user.email === configuredOwnerEmail()
+  } catch {
+    return false
+  }
+}
+
 function normalizePermissions(value: unknown): AppUserPermissions {
   const input = value && typeof value === 'object' ? value as Record<string, unknown> : {}
   return {

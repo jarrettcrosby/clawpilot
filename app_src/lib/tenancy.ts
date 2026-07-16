@@ -64,6 +64,11 @@ export type PipelineSpace = {
   updatedAt: string
 }
 
+export type WorkspacePreferences = {
+  defaultBoardId: string | null
+  defaultPipelineId: string | null
+}
+
 type ResourceMemberRow = {
   email?: string
   displayName?: string | null
@@ -103,6 +108,11 @@ type PipelineSpaceRow = {
   projection: PipelineProjection
   created_at: string
   updated_at: string
+}
+
+type WorkspacePreferencesRow = {
+  default_board_id: string | null
+  default_pipeline_id: string | null
 }
 
 const EMPTY_PIPELINE: PipelineProjection = {
@@ -462,6 +472,66 @@ export async function listPipelineSpaces(actorEmailValue: unknown): Promise<Pipe
     [actor.email],
   )
   return result.rows.map(toPipelineSpace)
+}
+
+export async function readWorkspacePreferences(actorEmailValue: unknown): Promise<WorkspacePreferences> {
+  const actor = await requireActiveAppUser(actorEmailValue)
+  const result = await query<WorkspacePreferencesRow>(
+    `SELECT default_board_id::text, default_pipeline_id::text
+     FROM app_user_workspace_preferences
+     WHERE user_email = $1`,
+    [actor.email],
+  )
+  return {
+    defaultBoardId: result.rows[0]?.default_board_id || null,
+    defaultPipelineId: result.rows[0]?.default_pipeline_id || null,
+  }
+}
+
+export async function saveWorkspacePreferences(input: {
+  actorEmail: unknown
+  boardId?: unknown
+  pipelineId?: unknown
+}): Promise<WorkspacePreferences> {
+  const actor = await requireActiveAppUser(input.actorEmail)
+  const hasBoard = input.boardId !== undefined
+  const hasPipeline = input.pipelineId !== undefined
+  if (!hasBoard && !hasPipeline) throw new Error('A dashboard board or pipeline is required')
+
+  const board = hasBoard
+    ? await resolveProjectBoardAccess({ actorEmail: actor.email, boardId: input.boardId })
+    : null
+  const pipeline = hasPipeline
+    ? await resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: input.pipelineId })
+    : null
+
+  await withTransaction(async (client) => {
+    await client.query(
+      `INSERT INTO app_user_workspace_preferences (
+         user_email, default_board_id, default_pipeline_id, created_at, updated_at
+       )
+       VALUES ($1, $2::uuid, $3::uuid, now(), now())
+       ON CONFLICT (user_email) DO UPDATE SET
+         default_board_id = COALESCE(EXCLUDED.default_board_id, app_user_workspace_preferences.default_board_id),
+         default_pipeline_id = COALESCE(EXCLUDED.default_pipeline_id, app_user_workspace_preferences.default_pipeline_id),
+         updated_at = now()`,
+      [actor.email, board?.id || null, pipeline?.id || null],
+    )
+    await recordAuditEvent({
+      actor: actor.email,
+      eventType: 'user.dashboard.preferences.updated',
+      aggregateType: 'app_user',
+      aggregateId: actor.email,
+      organizationId: actor.organizationId,
+      payload: {
+        boardId: board?.id,
+        pipelineId: pipeline?.id,
+        organizationId: actor.organizationId,
+      },
+    }, client)
+  })
+
+  return readWorkspacePreferences(actor.email)
 }
 
 export async function resolveProjectBoardAccess(input: {

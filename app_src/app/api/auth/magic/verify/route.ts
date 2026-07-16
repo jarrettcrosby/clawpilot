@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { createSessionToken, getCookieName } from '@/lib/auth'
+import { createBrowserSession, setBrowserSessionCookie } from '@/lib/authSessions'
 import { recordAuthActivity } from '@/lib/authAudit'
 import { verifyAuthMagicCode } from '@/lib/authMagicCode'
 import { queuePipelineProvisioning } from '@/lib/pipelineProvisioning'
@@ -32,16 +32,13 @@ export async function POST(req: NextRequest) {
       })
     }
 
-    const response = NextResponse.json({ ok: true })
-    response.cookies.set({
-      name: getCookieName(),
-      value: createSessionToken(result.email),
-      httpOnly: true,
-      sameSite: 'lax',
-      secure: process.env.NODE_ENV === 'production',
-      path: '/',
-      maxAge: 60 * 60 * 12,
+    const issued = await createBrowserSession({
+      email: result.email,
+      authMethod: 'magic_code',
+      headers: req.headers,
     })
+    const response = NextResponse.json({ ok: true })
+    setBrowserSessionCookie(response, issued)
     await recordAuthActivity({ req, email: result.email, eventType: 'auth.login.succeeded', method: 'magic_code' }).catch(() => undefined)
     return response
   } catch (error) {
