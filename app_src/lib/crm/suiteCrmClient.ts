@@ -34,6 +34,12 @@ export type SuiteCrmRecordSnapshot = {
 export type SuiteCrmMeetingSnapshot = SuiteCrmRecordSnapshot
 export type SuiteCrmNoteSnapshot = SuiteCrmRecordSnapshot
 export type SuiteCrmAccountContactModule = 'Accounts' | 'Contacts'
+export type SuiteCrmUserMatch = {
+  id: string
+  username: string
+  displayName: string
+  email: string
+}
 
 export type SuiteCrmIncrementalListInput = {
   updatedSince: string
@@ -156,6 +162,48 @@ async function request(
 export async function testSuiteCrmConnection(fetchImpl: typeof fetch = fetch) {
   const response = await request('/Api/V8/meta/modules', { method: 'GET' }, fetchImpl)
   return Boolean(response)
+}
+
+export async function findSuiteCrmUser(input: {
+  email?: string
+  username?: string
+}, fetchImpl: typeof fetch = fetch): Promise<SuiteCrmUserMatch | null> {
+  const username = String(input.username || '').trim()
+  const email = String(input.email || '').trim().toLowerCase()
+  if (username && !/^[A-Za-z0-9._@+-]{1,128}$/.test(username)) throw new Error('SuiteCRM username is invalid')
+  if (!username && (!email || email.length > 254)) throw new Error('SuiteCRM user email is invalid')
+  const field = username ? 'user_name' : 'email1'
+  const value = username || email
+  const parameters = new URLSearchParams({
+    'fields[Users]': 'user_name,first_name,last_name,email1,status',
+    [`filter[${field}][eq]`]: value,
+    'page[number]': '1',
+    'page[size]': '5',
+  })
+  const response = await request(
+    `/Api/V8/module/Users?${parameters}`,
+    { method: 'GET' },
+    fetchImpl,
+  ) as { data?: Array<{ id?: unknown; type?: unknown; attributes?: unknown }> }
+  if (!Array.isArray(response.data)) throw new Error('SuiteCRM returned an invalid user collection')
+  const matches = response.data.flatMap((record) => {
+    const id = String(record?.id || '').trim()
+    const type = String(record?.type || '').trim()
+    const attributes = record?.attributes
+    if (!id || (type && type !== 'Users' && type !== 'User') || !attributes || typeof attributes !== 'object' || Array.isArray(attributes)) {
+      return []
+    }
+    const values = attributes as Record<string, unknown>
+    const matchedUsername = String(values.user_name || '').trim()
+    const matchedEmail = String(values.email1 || '').trim().toLowerCase()
+    const status = String(values.status || '').trim().toLowerCase()
+    if (status && status !== 'active') return []
+    if (username ? matchedUsername.toLowerCase() !== username.toLowerCase() : matchedEmail !== email) return []
+    const displayName = [values.first_name, values.last_name].map((part) => String(part || '').trim()).filter(Boolean).join(' ')
+    return [{ id, username: matchedUsername, displayName: displayName || matchedUsername, email: matchedEmail }]
+  })
+  if (matches.length > 1) throw new Error('SuiteCRM user mapping is ambiguous')
+  return matches[0] || null
 }
 
 async function listSuiteCrmModuleRecordsUpdatedSince(

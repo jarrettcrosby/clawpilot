@@ -8,8 +8,10 @@ function redirectToLogin() {
   const next = `${window.location.pathname}${window.location.search}${window.location.hash}`
   window.location.assign(`/login?next=${encodeURIComponent(next)}`)
 }
-export default function SessionGuard() {
+export default function SessionGuard({ enabled }: { enabled: boolean }) {
   useEffect(() => {
+    if (!enabled) return
+
     let active = true
     let lastActivitySentAt = 0
 
@@ -60,7 +62,7 @@ export default function SessionGuard() {
       document.removeEventListener('visibilitychange', onVisibilityChange)
       window.clearInterval(verificationInterval)
     }
-  }, [])
+  }, [enabled])
 
   return null
 }

@@ -102,6 +102,7 @@ async function executeDispatch(item: AgentDispatchOutboxItem, onResultPersisted:
       tags: ['agent-dispatch', item.trigger],
       dispatchId: item.dispatchId,
       dispatchAttempt: item.attempts,
+      dispatchContinuationDepth: item.continuationDepth || 0,
     },
   })
   onResultPersisted()

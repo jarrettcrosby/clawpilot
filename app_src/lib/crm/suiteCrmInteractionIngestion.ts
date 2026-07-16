@@ -47,6 +47,7 @@ type InteractionRow = {
   campaign_id: string | null
   interaction_type: string | null
   subject: string
+  agent_email: string | null
   agent_name: string | null
   occurred_at: TimestampValue | null
   description: string | null
@@ -258,7 +259,7 @@ async function localInteractions(snapshot: SuiteCrmNoteSnapshot): Promise<Intera
        interaction.source_sheet_id, interaction.source_row_number, interaction.source_payload,
        interaction.organization_id::text, interaction.contact_id::text, interaction.lead_id::text,
        interaction.opportunity_id::text, interaction.meeting_id::text, interaction.campaign_id::text,
-       interaction.interaction_type, interaction.subject, interaction.agent_name,
+       interaction.interaction_type, interaction.subject, interaction.agent_email, interaction.agent_name,
        interaction.occurred_at, interaction.description, interaction.direction,
        interaction.delivery_status, interaction.provider_message_id,
        interaction.provider_thread_id, interaction.metadata
@@ -440,6 +441,7 @@ function interactionFields(
     ...interactionRelations(row, parent),
     interactionType: cleanString(row.interaction_type, 100, 'stored interaction type'),
     subject: inboundSubject || currentSubject,
+    agentEmail: nullableStoredString(row.agent_email),
     agentName: cleanString(row.agent_name, 300, 'stored interaction agent'),
     occurredAt,
     description,

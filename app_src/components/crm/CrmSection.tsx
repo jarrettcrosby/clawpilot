@@ -75,6 +75,11 @@ type PipelineInfo = {
   accessRole: 'owner' | 'editor' | 'viewer'
   shortLinkUrl: string | null
 }
+type CrmPipelineUser = {
+  email: string
+  displayName: string
+  suiteCrmMapped: boolean
+}
 type WorkspaceOrganization = {
   id: string
   parentId: string | null
@@ -98,6 +103,7 @@ type CrmPayload = {
   pipeline?: PipelineInfo
   workspaceHierarchy?: WorkspaceOrganization[]
   hierarchy?: WorkspaceOrganization[]
+  pipelineUsers?: CrmPipelineUser[]
   canManageHierarchy?: boolean
   suiteCrmPunchoutUrl?: string | null
   suiteCrmUsername?: string | null
@@ -111,6 +117,21 @@ type EditorHistoryItem = {
   entity: CrmEntity
   record: RecordValue
   fields: Record<string, string>
+}
+type DropdownOption = { active?: boolean; sort_order?: number; label?: string; value?: string }
+
+const DEFAULT_PRIORITIES = ['A+', 'A', 'B', 'C', 'D']
+const INTERACTION_TYPES = [
+  { value: 'email', label: 'Email' },
+  { value: 'call', label: 'Call' },
+  { value: 'meeting', label: 'Meeting' },
+  { value: 'note', label: 'Note' },
+  { value: 'campaign', label: 'Campaign' },
+] as const
+
+function interactionTypeValue(value: unknown) {
+  const normalized = String(value || '').trim().toLowerCase()
+  return INTERACTION_TYPES.some((option) => option.value === normalized) ? normalized : String(value || '').trim()
 }
 
 const ENTITY_LABELS: Record<CrmEntity, string> = {
@@ -268,8 +289,8 @@ function initialFields(entity: CrmEntity, record: RecordValue | null, userTimeZo
     contactId: textValue(source, 'contactId'), leadId: textValue(source, 'leadId'),
     opportunityId: textValue(source, 'opportunityId'), meetingId: textValue(source, 'meetingId'),
     campaignId: textValue(source, 'campaignId'),
-    interactionType: textValue(source, 'interactionType'), occurredAt: dateTimeLocalValue(source.occurredAt, userTimeZone),
-    agentName: textValue(source, 'agentName'), description: textValue(source, 'description'),
+    interactionType: interactionTypeValue(source.interactionType), occurredAt: dateTimeLocalValue(source.occurredAt, userTimeZone),
+    agentEmail: textValue(source, 'agentEmail'), agentName: textValue(source, 'agentName'), description: textValue(source, 'description'),
   }
 }
 
@@ -302,6 +323,8 @@ export default function CrmSection() {
   const [contacts, setContacts] = useState<RecordValue[]>([])
   const [leads, setLeads] = useState<RecordValue[]>([])
   const [opportunities, setOpportunities] = useState<RecordValue[]>([])
+  const [priorityOptions, setPriorityOptions] = useState<string[]>(DEFAULT_PRIORITIES)
+  const [pipelineUsers, setPipelineUsers] = useState<CrmPipelineUser[]>([])
   const [workspaceHierarchy, setWorkspaceHierarchy] = useState<WorkspaceOrganization[]>([])
   const [canManageHierarchy, setCanManageHierarchy] = useState(false)
   const [suiteCrmPunchoutUrl, setSuiteCrmPunchoutUrl] = useState<string | null>(null)
@@ -333,6 +356,7 @@ export default function CrmSection() {
       setSummary(payload.summary || EMPTY_SUMMARY)
       setPipeline(payload.pipeline || null)
       setWorkspaceHierarchy(payload.workspaceHierarchy || [])
+      setPipelineUsers(payload.pipelineUsers || [])
       setCanManageHierarchy(payload.canManageHierarchy === true)
       setSuiteCrmPunchoutUrl(payload.suiteCrmPunchoutUrl || null)
       setSuiteCrmUsername(payload.suiteCrmUsername || null)
@@ -405,6 +429,29 @@ export default function CrmSection() {
   }, [entity, load, needsReviewOnly, routeQuery, routeReady])
 
   useEffect(() => {
+    let cancelled = false
+    const loadPriorities = async () => {
+      try {
+        const response = await fetch('/api/pipeline/dropdowns')
+        const payload = await response.json().catch(() => ({}))
+        const options = Array.isArray(payload?.catalog?.dropdowns?.priority)
+          ? payload.catalog.dropdowns.priority as DropdownOption[]
+          : []
+        const values = options
+          .filter((option) => option.active !== false)
+          .sort((left, right) => Number(left.sort_order || 0) - Number(right.sort_order || 0))
+          .map((option) => String(option.label || option.value || '').trim())
+          .filter(Boolean)
+        if (!cancelled && values.length > 0) setPriorityOptions(values)
+      } catch {
+        // The default priority catalog remains usable when the optional Sheet catalog is unavailable.
+      }
+    }
+    void loadPriorities()
+    return () => { cancelled = true }
+  }, [])
+
+  useEffect(() => {
     if (editorRecord === undefined) return
     let cancelled = false
     const loadEditorOptions = async () => {
@@ -415,9 +462,17 @@ export default function CrmSection() {
           const contactRecords = await loadCrmOptions('contacts')
           if (!cancelled) setContacts(contactRecords)
         }
+        if (editorRecord && (editorEntity === 'organizations' || editorEntity === 'contacts')) {
+          const opportunityRecords = await loadCrmOptions('opportunities')
+          if (!cancelled) setOpportunities(opportunityRecords)
+        }
         if (['contacts', 'leads', 'meetings', 'interactions'].includes(editorEntity)) {
           const organizationRecords = await loadCrmOptions('organizations')
           if (!cancelled) setOrganizations(organizationRecords)
+        }
+        if (editorEntity === 'interactions') {
+          const contactRecords = await loadCrmOptions('contacts')
+          if (!cancelled) setContacts(contactRecords)
         }
         if (editorEntity === 'meetings') {
           const [contactRecords, leadRecords, opportunityRecords] = await Promise.all([
@@ -456,10 +511,27 @@ export default function CrmSection() {
       .filter((contact) => textValue(contact, 'organizationId') === organizationId)
       .sort((left, right) => textValue(left, 'fullName').localeCompare(textValue(right, 'fullName')))
   }, [contacts, editorEntity, editorRecord])
+  const interactionAgentEmail = useMemo(() => {
+    if (fields.agentEmail) return fields.agentEmail
+    const agentName = String(fields.agentName || '').trim().toLowerCase()
+    if (!agentName) return ''
+    return pipelineUsers.find((user) => (
+      user.email.toLowerCase() === agentName || user.displayName.toLowerCase() === agentName
+    ))?.email || ''
+  }, [fields.agentEmail, fields.agentName, pipelineUsers])
   const relatedOrganization = useMemo(() => {
     if (editorEntity !== 'contacts' || !fields.organizationId) return null
     return organizations.find((organization) => textValue(organization, 'id') === fields.organizationId) || null
   }, [editorEntity, fields.organizationId, organizations])
+  const relatedOpportunities = useMemo(() => {
+    if (!editorRecord || (editorEntity !== 'organizations' && editorEntity !== 'contacts')) return []
+    const recordId = textValue(editorRecord, 'id')
+    return opportunities
+      .filter((opportunity) => editorEntity === 'organizations'
+        ? textValue(opportunity, 'organizationId') === recordId
+        : Array.isArray(opportunity.contactIds) && opportunity.contactIds.map(String).includes(recordId))
+      .sort((left, right) => textValue(left, 'name').localeCompare(textValue(right, 'name')))
+  }, [editorEntity, editorRecord, opportunities])
   const actionReady = Boolean(actionComposer && (
     actionComposer.type === 'send_email'
       ? actionFields.subject?.trim() && actionFields.text?.trim()
@@ -516,6 +588,15 @@ export default function CrmSection() {
     setRelatedContactsLoading(true)
   }
 
+  function openRelatedOpportunity(record: RecordValue) {
+    if (!editorRecord) return
+    setEditorHistory((history) => [...history, { entity: editorEntity, record: editorRecord, fields }])
+    setEditorEntity('opportunities')
+    setEditorRecord(record)
+    setFields(initialFields('opportunities', record, dateTimeSettings.timeZone))
+    setRelatedContactsLoading(false)
+  }
+
   function returnToPreviousEditor() {
     const previous = editorHistory[editorHistory.length - 1]
     if (!previous) return
@@ -553,7 +634,7 @@ export default function CrmSection() {
           fields: editorEntity === 'meetings'
             ? { ...fields, attendeeEmails: fields.attendeeEmails?.split(',').map((email) => email.trim()).filter(Boolean) || [] }
             : editorEntity === 'interactions'
-              ? { ...fields, occurredAt }
+              ? { ...fields, agentEmail: interactionAgentEmail, occurredAt }
               : ['organizations', 'contacts', 'leads'].includes(editorEntity)
                 ? { ...fields, emailOptOut: fields.emailOptOut === 'true' }
                 : fields,
@@ -1204,7 +1285,7 @@ export default function CrmSection() {
             </Stack>
           </>}
           {editorEntity === 'contacts' && <>
-            <TextField disabled={!recordEditable} label="Contact" value={fields.fullName || ''} onChange={(event) => setFields({ ...fields, fullName: event.target.value })} required />
+            <TextField disabled={!recordEditable} label="Contact Full Name" value={fields.fullName || ''} onChange={(event) => setFields({ ...fields, fullName: event.target.value })} required />
             <Stack direction={{ xs: 'column', sm: 'row' }} gap={2} sx={{ minWidth: 0 }}>
               <TextField fullWidth disabled={!recordEditable} label="First name" value={fields.firstName || ''} onChange={(event) => setFields({ ...fields, firstName: event.target.value })} />
               <TextField fullWidth disabled={!recordEditable} label="Last name" value={fields.lastName || ''} onChange={(event) => setFields({ ...fields, lastName: event.target.value })} />
@@ -1237,10 +1318,10 @@ export default function CrmSection() {
                 </ListItemButton>
               </Box>
             )}
-            <Stack direction={{ xs: 'column', sm: 'row' }} gap={2} sx={{ minWidth: 0 }}>
-              <TextField fullWidth disabled={!recordEditable} label="Priority" value={fields.priority || ''} onChange={(event) => setFields({ ...fields, priority: event.target.value })} />
-              <TextField fullWidth disabled={!recordEditable} label="Type" value={fields.contactType || ''} onChange={(event) => setFields({ ...fields, contactType: event.target.value })} />
-            </Stack>
+            <TextField fullWidth select disabled={!recordEditable} label="Priority" value={fields.priority || ''} onChange={(event) => setFields({ ...fields, priority: event.target.value })}>
+              {!priorityOptions.includes(fields.priority || '') && fields.priority ? <MenuItem value={fields.priority}>{fields.priority}</MenuItem> : null}
+              {priorityOptions.map((priority) => <MenuItem key={priority} value={priority}>{priority}</MenuItem>)}
+            </TextField>
             <TextField disabled={!recordEditable} label="Owner" value={fields.accountManager || ''} onChange={(event) => setFields({ ...fields, accountManager: event.target.value })} />
             <TextField disabled={!recordEditable} label="Title" value={fields.jobTitle || ''} onChange={(event) => setFields({ ...fields, jobTitle: event.target.value })} />
             <TextField disabled={!recordEditable} label="Email" type="email" value={fields.email || ''} onChange={(event) => setFields({ ...fields, email: event.target.value })} />
@@ -1294,7 +1375,15 @@ export default function CrmSection() {
           </>}
           {editorEntity === 'meetings' && <>
             <TextField disabled={!recordEditable} label="Meeting" value={fields.subject || ''} onChange={(event) => setFields({ ...fields, subject: event.target.value })} required />
-            <TextField disabled={!recordEditable} select label="Organization" value={fields.organizationId || ''} onChange={(event) => setFields({ ...fields, organizationId: event.target.value })}>
+            <TextField disabled={!recordEditable} select label="Organization" value={fields.organizationId || ''} onChange={(event) => {
+              const organizationId = event.target.value
+              const selectedContact = contacts.find((record) => textValue(record, 'id') === fields.contactId)
+              setFields({
+                ...fields,
+                organizationId,
+                contactId: selectedContact && textValue(selectedContact, 'organizationId') === organizationId ? fields.contactId : '',
+              })
+            }}>
               <MenuItem value="">Unlinked</MenuItem>
               {fields.organizationId && !organizations.some((record) => textValue(record, 'id') === fields.organizationId) ? (
                 <MenuItem value={fields.organizationId}>{(editorRecord ? textValue(editorRecord, 'organizationName') : '') || 'Current organization'}</MenuItem>
@@ -1321,16 +1410,52 @@ export default function CrmSection() {
           </>}
           {editorEntity === 'interactions' && <>
             <TextField disabled={!recordEditable} label="Subject" value={fields.subject || ''} onChange={(event) => setFields({ ...fields, subject: event.target.value })} required />
-            <TextField disabled={!recordEditable} select label="Organization" value={fields.organizationId || ''} onChange={(event) => setFields({ ...fields, organizationId: event.target.value })}>
+            <TextField disabled={!recordEditable} select label="Organization" value={fields.organizationId || ''} onChange={(event) => {
+              const organizationId = event.target.value
+              const selectedContact = contacts.find((record) => textValue(record, 'id') === fields.contactId)
+              setFields({
+                ...fields,
+                organizationId,
+                contactId: selectedContact && textValue(selectedContact, 'organizationId') === organizationId ? fields.contactId : '',
+              })
+            }}>
               <MenuItem value="">None</MenuItem>
               {fields.organizationId && !organizations.some((record) => textValue(record, 'id') === fields.organizationId) ? (
                 <MenuItem value={fields.organizationId}>{(editorRecord ? textValue(editorRecord, 'organizationName') : '') || 'Current organization'}</MenuItem>
               ) : null}
               {organizations.map((record) => <MenuItem key={textValue(record, 'id')} value={textValue(record, 'id')}>{textValue(record, 'name')}</MenuItem>)}
             </TextField>
-            <TextField disabled={!recordEditable} label="Type" value={fields.interactionType || ''} onChange={(event) => setFields({ ...fields, interactionType: event.target.value })} />
+            <TextField disabled={!recordEditable} select label="Contact" value={fields.contactId || ''} onChange={(event) => setFields({ ...fields, contactId: event.target.value })}>
+              <MenuItem value="">None</MenuItem>
+              {contacts
+                .filter((record) => !fields.organizationId || textValue(record, 'organizationId') === fields.organizationId)
+                .map((record) => <MenuItem key={textValue(record, 'id')} value={textValue(record, 'id')}>{textValue(record, 'fullName')}</MenuItem>)}
+            </TextField>
+            <TextField disabled={!recordEditable} select required label="Type" value={fields.interactionType || ''} onChange={(event) => setFields({ ...fields, interactionType: event.target.value })}>
+              {fields.interactionType && !INTERACTION_TYPES.some((option) => option.value === fields.interactionType) ? (
+                <MenuItem value={fields.interactionType}>{fields.interactionType} (legacy)</MenuItem>
+              ) : null}
+              {INTERACTION_TYPES.map((option) => <MenuItem key={option.value} value={option.value}>{option.label}</MenuItem>)}
+            </TextField>
             <TextField disabled={!recordEditable} label="Date" type="datetime-local" value={fields.occurredAt || ''} onChange={(event) => setFields({ ...fields, occurredAt: event.target.value })} InputLabelProps={{ shrink: true }} />
-            <TextField disabled={!recordEditable} label="Agent" value={fields.agentName || ''} onChange={(event) => setFields({ ...fields, agentName: event.target.value })} />
+            <TextField
+              disabled={!recordEditable}
+              select
+              label="Agent"
+              value={interactionAgentEmail}
+              onChange={(event) => {
+                const selected = pipelineUsers.find((user) => user.email === event.target.value)
+                setFields({ ...fields, agentEmail: selected?.email || '', agentName: selected?.displayName || '' })
+              }}
+              helperText={fields.agentName && !interactionAgentEmail ? `Unmapped legacy agent: ${fields.agentName}` : 'Active ClawPilot users with access to this pipeline'}
+            >
+              <MenuItem value="">Unassigned</MenuItem>
+              {pipelineUsers.map((user) => (
+                <MenuItem key={user.email} value={user.email}>
+                  {user.displayName} ({user.email}){user.suiteCrmMapped ? '' : ' - CRM mapping pending'}
+                </MenuItem>
+              ))}
+            </TextField>
           </>}
           {editorEntity === 'campaigns' && <>
             <TextField disabled={!recordEditable} label="Campaign" value={fields.name || ''} onChange={(event) => setFields({ ...fields, name: event.target.value })} required />
@@ -1394,6 +1519,42 @@ export default function CrmSection() {
                 <Typography variant="body2" color="text.secondary" sx={{ py: 2 }}>
                   No related contacts
                 </Typography>
+              )}
+            </Box>
+          )}
+          {(editorEntity === 'organizations' || editorEntity === 'contacts') && editorRecord && (
+            <Box component="section" aria-label="Related opportunities" sx={{ minWidth: 0 }}>
+              <Stack direction="row" justifyContent="space-between" alignItems="center" gap={1}>
+                <Typography variant="subtitle2" fontWeight={700}>Opportunities</Typography>
+                <Typography variant="caption" color="text.secondary">{relatedOpportunities.length}</Typography>
+              </Stack>
+              <Divider sx={{ mt: 1 }} />
+              {relatedOpportunities.length > 0 ? (
+                <List disablePadding>
+                  {relatedOpportunities.map((opportunity, index) => (
+                    <ListItemButton
+                      key={textValue(opportunity, 'id')}
+                      divider={index < relatedOpportunities.length - 1}
+                      onClick={() => openRelatedOpportunity(opportunity)}
+                      sx={{ px: 0, py: 1.25, alignItems: 'flex-start', minWidth: 0 }}
+                    >
+                      <ListItemText
+                        primary={textValue(opportunity, 'name') || textValue(opportunity, 'referenceCode')}
+                        secondary={[
+                          textValue(opportunity, 'stage'),
+                          money(opportunity.value),
+                          textValue(opportunity, 'referenceCode'),
+                        ].filter(Boolean).join(' · ')}
+                        primaryTypographyProps={{ fontWeight: 600, sx: { overflowWrap: 'anywhere' } }}
+                        secondaryTypographyProps={{ sx: { mt: 0.25, whiteSpace: 'normal', overflowWrap: 'anywhere' } }}
+                        sx={{ minWidth: 0, my: 0 }}
+                      />
+                      <ChevronRightRounded color="action" sx={{ mt: 0.5, ml: 1, flexShrink: 0 }} />
+                    </ListItemButton>
+                  ))}
+                </List>
+              ) : (
+                <Typography variant="body2" color="text.secondary" sx={{ py: 2 }}>No related opportunities</Typography>
               )}
             </Box>
           )}

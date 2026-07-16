@@ -1110,6 +1110,7 @@ async function stageActionInteraction(input: {
       parentSuiteCrmType: parentSuiteCrmType || undefined,
       interactionType: input.interactionType,
       subject: input.subject,
+      agentEmail: input.action.actorEmail,
       agentName: input.action.actorEmail,
       occurredAt: new Date().toISOString(),
       description: input.description,

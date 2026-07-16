@@ -77,6 +77,8 @@ type AppUser = {
   jobTitle: string | null
   organizationId: string | null
   organizationName: string | null
+  suiteCrmUserId: string | null
+  suiteCrmUsername: string | null
   timezone: string
   locale: string
   permissions: UserPermissions
@@ -324,6 +326,7 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
   const [newOrganizationParentId, setNewOrganizationParentId] = useState('')
   const [createNames, setCreateNames] = useState({ board: '', pipeline: '' })
   const [shareDrafts, setShareDrafts] = useState<Record<string, ShareDraft>>({})
+  const [crmMappingDrafts, setCrmMappingDrafts] = useState<Record<string, string>>({})
   const [provisioningPipeline, setProvisioningPipeline] = useState<PipelineResource | null>(null)
   const [loading, setLoading] = useState(false)
   const [pendingAction, setPendingAction] = useState<string | null>(null)
@@ -380,6 +383,7 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
     setNewOrganizationParentId('')
     setCreateNames({ board: '', pipeline: '' })
     setShareDrafts({})
+    setCrmMappingDrafts({})
     setProvisioningPipeline(null)
     setNotice('')
     setError('')
@@ -394,6 +398,10 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
 
       if (usersResult.status === 'fulfilled') {
         setUsersPayload(usersResult.value)
+        setCrmMappingDrafts(Object.fromEntries((usersResult.value.users || []).map((user) => [
+          user.email,
+          user.suiteCrmUsername || (user.role === 'owner' ? 'admin' : ''),
+        ])))
         if (usersResult.value.currentUser) {
           setProfile(profileFrom(usersResult.value.currentUser))
           const organizationId = usersResult.value.currentUser.organizationId || ''
@@ -590,6 +598,33 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
       setNotice(`Access updated for ${result.user.displayName || result.user.email}.`)
     } catch (updateError) {
       setError(messageFrom(updateError, 'Unable to update access'))
+    } finally {
+      finishAction()
+    }
+  }
+
+  function canManageCrmMapping(user: AppUser) {
+    if (!usersPayload?.canManageUserAccess || !currentUser) return false
+    if (currentUser.role === 'owner') return true
+    return currentUser.email === user.email || user.role === 'member'
+  }
+
+  async function mapSuiteCrmUser(user: AppUser) {
+    const suiteCrmUsername = String(crmMappingDrafts[user.email] || '').trim()
+    if (busy || !canManageCrmMapping(user) || !suiteCrmUsername) return
+    startAction(`crm-map:${user.email}`)
+    try {
+      const result = await requestJson<UserMutationPayload>('/api/users', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'crm-user-mapping', email: user.email, suiteCrmUsername }),
+      })
+      if (!result.user) throw new Error('CRM mapping response was incomplete')
+      upsertUser(result.user)
+      setCrmMappingDrafts((current) => ({ ...current, [user.email]: result.user?.suiteCrmUsername || suiteCrmUsername }))
+      setNotice(`${result.user.displayName || result.user.email} mapped to SuiteCRM.`)
+    } catch (mappingError) {
+      setError(messageFrom(mappingError, 'Unable to map SuiteCRM user'))
     } finally {
       finishAction()
     }
@@ -1059,7 +1094,10 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
               {displayedUsers.map((user) => {
                 const manageable = canManageUser(user)
                 const canChangeRole = manageable && currentUser?.role === 'owner'
-                const userPending = pendingAction === `status:${user.email}` || pendingAction === `access:${user.email}`
+                const crmMappingManageable = canManageCrmMapping(user)
+                const userPending = pendingAction === `status:${user.email}`
+                  || pendingAction === `access:${user.email}`
+                  || pendingAction === `crm-map:${user.email}`
 
                 return (
                   <Box key={user.email} sx={panelSx}>
@@ -1078,6 +1116,13 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
                               size="small"
                               color={user.status === 'active' ? 'success' : user.status === 'invited' ? 'warning' : 'default'}
                               label={statusLabel(user.status)}
+                              sx={{ height: 24, minHeight: 24, fontSize: '0.7rem' }}
+                            />
+                            <Chip
+                              size="small"
+                              color={user.suiteCrmUserId ? 'success' : 'default'}
+                              variant="outlined"
+                              label={user.suiteCrmUserId ? `CRM: ${user.suiteCrmUsername}` : 'CRM not mapped'}
                               sx={{ height: 24, minHeight: 24, fontSize: '0.7rem' }}
                             />
                           </Stack>
@@ -1119,6 +1164,28 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
                     <Divider sx={{ borderColor: 'rgba(255,255,255,0.07)' }} />
 
                     <Box sx={{ p: { xs: 1.5, sm: 2 }, pt: { xs: 1.25, sm: 1.5 } }}>
+                      {crmMappingManageable ? (
+                        <Box sx={{ display: 'grid', gridTemplateColumns: { xs: 'minmax(0, 1fr)', sm: 'minmax(0, 1fr) auto' }, gap: 1, mb: 1.5 }}>
+                          <TextField
+                            size="small"
+                            label="SuiteCRM username"
+                            value={crmMappingDrafts[user.email] || ''}
+                            onChange={(event) => setCrmMappingDrafts((current) => ({ ...current, [user.email]: event.target.value }))}
+                            disabled={busy}
+                            inputProps={{ maxLength: 128 }}
+                            sx={fieldSx}
+                          />
+                          <Button
+                            variant="outlined"
+                            onClick={() => { void mapSuiteCrmUser(user) }}
+                            disabled={busy || !String(crmMappingDrafts[user.email] || '').trim()}
+                            startIcon={pendingAction === `crm-map:${user.email}` ? <CircularProgress size={16} /> : <ReplayRounded />}
+                            sx={compactButtonSx}
+                          >
+                            Match CRM user
+                          </Button>
+                        </Box>
+                      ) : null}
                       <Box display="flex" alignItems="center" justifyContent="space-between" gap={1.5} mb={0.75}>
                         <Typography variant="caption" color="text.disabled" fontWeight={700}>Permissions</Typography>
                         {canChangeRole ? (

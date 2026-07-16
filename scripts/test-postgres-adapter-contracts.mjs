@@ -145,6 +145,29 @@ for (const table of ['crm_organizations', 'crm_contacts', 'crm_opportunities', '
 assertIncludes(crmMigration, "target_system = 'suitecrm'", 'SuiteCRM outbox migration')
 assertIncludes(crmMigration, 'crm_projection_version', 'CRM workbook projection version')
 
+const crmOpportunityContactsMigration = read('db/migrations/0042_crm_opportunity_contacts.sql')
+for (const contract of [
+  'CREATE TABLE IF NOT EXISTS crm_opportunity_contacts',
+  'REFERENCES crm_opportunities (pipeline_id, id)',
+  'REFERENCES crm_contacts (pipeline_id, id)',
+  'idx_crm_opportunity_contacts_primary',
+]) {
+  assertIncludes(crmOpportunityContactsMigration, contract, 'CRM opportunity contacts migration')
+}
+
+const crmInteractionUserMappingMigration = read('db/migrations/0043_crm_interaction_user_mapping.sql')
+for (const contract of [
+  'ADD COLUMN IF NOT EXISTS suitecrm_user_id text',
+  'ADD COLUMN IF NOT EXISTS suitecrm_username text',
+  'CREATE UNIQUE INDEX IF NOT EXISTS idx_app_users_suitecrm_user_id',
+  'ADD COLUMN IF NOT EXISTS agent_email text',
+  'FOREIGN KEY (agent_email) REFERENCES app_users(email) ON DELETE SET NULL',
+  'idx_crm_interactions_agent_email',
+  'HAVING count(DISTINCT app_user.email) = 1',
+]) {
+  assertIncludes(crmInteractionUserMappingMigration, contract, 'CRM interaction user mapping migration')
+}
+
 const crmIdentityHierarchyMigration = read('db/migrations/0021_crm_identity_and_organization_hierarchy.sql')
 for (const contract of [
   'CREATE TABLE IF NOT EXISTS workspace_organizations',
@@ -390,6 +413,16 @@ assertIncludes(crmAdapter, 'suiteCrmRelationships', 'SuiteCRM meeting subpanel r
 assertIncludes(crmAdapter, "'accounts'::text AS link_field_name", 'SuiteCRM meeting account relationship')
 assertIncludes(crmAdapter, "SELECT 'contacts', 'Contacts', suitecrm_id", 'SuiteCRM meeting contact relationship')
 assertIncludes(crmAdapter, "SELECT 'contact'::text AS link_field_name", 'SuiteCRM Note contact relationship')
+assertIncludes(crmAdapter, 'FROM crm_opportunity_contacts relationship', 'SuiteCRM opportunity contact relationships')
+assertIncludes(crmAdapter, 'Opportunity contacts must belong to the selected organization', 'opportunity contact organization boundary')
+assertIncludes(crmAdapter, 'hydrateOpportunityRows', 'opportunity contact API projection')
+assertIncludes(crmAdapter, 'COALESCE(organization.name, opportunity.organization_name) AS organization_name', 'canonical opportunity organization projection')
+assertIncludes(crmAdapter, 'Opportunity organization was not found', 'opportunity organization identity boundary')
+assertIncludes(crmAdapter, 'agentSuiteCrmUserId', 'SuiteCRM interaction assigned-user projection')
+assertIncludes(crmAdapter, 'assigned_user_id: clean(fields.agentSuiteCrmUserId)', 'SuiteCRM Note assigned user field')
+assertIncludes(crmAdapter, 'Interaction agent must be an active ClawPilot user with pipeline access', 'interaction ClawPilot-user boundary')
+assertIncludes(crmAdapter, 'Interaction contact must belong to the selected organization', 'interaction contact organization boundary')
+assertIncludes(crmAdapter, 'listCrmPipelineUsersInPostgres', 'interaction agent user catalog')
 assertIncludes(crmAdapter, 'contact_id: clean(fields.contactSuiteCrmId)', 'SuiteCRM Note contact field')
 assertIncludes(crmAdapter, 'global_id_c: referenceCode', 'SuiteCRM Global ID projection')
 assertIncludes(crmAdapter, '`crm:${input.entity}:v3:', 'versioned SuiteCRM Global ID outbox contract')
@@ -667,6 +700,8 @@ assertIncludes(suiteCrmClient, "'contact', 'contacts'", 'SuiteCRM Note and Meeti
 assertIncludes(suiteCrmClient, 'alreadyLinked', 'idempotent SuiteCRM relationship creation')
 assertIncludes(suiteCrmClient, "'filter[date_modified][gte]'", 'incremental SuiteCRM meeting polling')
 assertIncludes(suiteCrmClient, 'listSuiteCrmAccountContactRecordsUpdatedSince', 'incremental SuiteCRM account/contact polling')
+assertIncludes(suiteCrmClient, 'findSuiteCrmUser', 'SuiteCRM app-user mapping lookup')
+assertIncludes(suiteCrmClient, '/Api/V8/module/Users', 'SuiteCRM active user module lookup')
 assertIncludes(suiteCrmInteractionContactBackfill, "CLAWPILOT_BACKFILL_CONFIRM !== 'interaction-contacts-v1'", 'guarded SuiteCRM interaction contact backfill')
 assertIncludes(suiteCrmInteractionContactBackfill, "linkFieldName: 'contact'", 'SuiteCRM Note contact backfill relationship')
 assertIncludes(suiteCrmInteractionContactBackfill, 'contact_id: row.contact_suitecrm_id', 'SuiteCRM Note contact backfill field')
@@ -738,11 +773,25 @@ assertIncludes(crmUi, "parameters.set('needsReview', 'true')", 'unresolved inter
 assertIncludes(crmUi, 'openRelatedContact', 'organization related-contact drawer navigation')
 assertIncludes(crmUi, 'openRelatedOrganization', 'contact related-organization drawer navigation')
 assertIncludes(crmUi, 'Related organization', 'contact organization relationship panel')
+assertIncludes(crmUi, 'Contact Full Name', 'contact full-name field label')
+assertIncludes(crmUi, 'priorityOptions.map', 'contact priority catalog selector')
+assertIncludes(crmUi, 'openRelatedOpportunity', 'account and contact opportunity navigation')
+assertIncludes(crmUi, 'No related opportunities', 'account and contact opportunity empty state')
 assertIncludes(crmUi, 'crm-primary-actions', 'contained mobile CRM command row')
 assertIncludes(crmUi, 'CRM record types', 'accessible mobile CRM tabs')
 assertIncludes(crmUi, 'No related contacts', 'organization contact subpanel empty state')
 assertIncludes(crmUi, 'LinkedIn URL', 'organization and contact metadata editing')
 assertIncludes(crmUi, 'Postal code', 'organization and contact address metadata editing')
+assertIncludes(crmUi, 'pipelineUsers', 'interaction ClawPilot agent catalog')
+assertIncludes(crmUi, 'select required label="Type"', 'interaction controlled type selector')
+assertIncludes(crmUi, 'select label="Contact"', 'interaction contact selector')
+assertIncludes(crmUi, 'label="Agent"', 'interaction ClawPilot user selector')
+
+const userAccessUi = read('app_src/components/settings/UserAccessDialog.tsx')
+assertIncludes(userAccessUi, 'Match CRM user', 'admin SuiteCRM user mapping command')
+assertIncludes(userAccessUi, "action: 'crm-user-mapping'", 'admin SuiteCRM user mapping request')
+assertIncludes(usersRoute, "body?.action === 'crm-user-mapping'", 'SuiteCRM app-user mapping route')
+assertIncludes(usersAdapter, 'updateAppUserSuiteCrmMapping', 'SuiteCRM app-user mapping persistence')
 
 const pipelineUi = read('app_src/components/pipeline/PipelineSection.tsx')
 assertIncludes(pipelineUi, 'Open Sheet', 'pipeline Sheet command')

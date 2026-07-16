@@ -69,6 +69,12 @@ function opportunityProductName(value: unknown) {
   return [...new Set(products.map((product) => String(product || '').trim()).filter(Boolean))].join(', ')
 }
 
+function opportunityContactIds(value: unknown, fallback: string[]) {
+  if (value === undefined) return fallback
+  if (!Array.isArray(value)) throw new Error('Opportunity contacts must be a list')
+  return [...new Set(value.map((id) => String(id || '').trim()).filter(Boolean))]
+}
+
 function displayOpportunity(opportunity: CrmOpportunity) {
   return {
     ...opportunity,
@@ -219,6 +225,7 @@ export async function PATCH(req: NextRequest, ctx: { params: Promise<{ id: strin
       actorEmail: context.actor.email,
       fields: {
         organizationId: current.organizationId,
+        contactIds: opportunityContactIds(updates.contactIds, current.contactIds),
         name,
         organization: current.organization,
         priority: updates.priority !== undefined ? String(updates.priority || '') : current.priority,

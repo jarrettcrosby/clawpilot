@@ -97,6 +97,17 @@ export type CrmOpportunity = {
   probability: number
   expectedClose: string
   notes: string
+  contactIds: string[]
+  contacts: Array<{
+    id: string
+    referenceCode: string
+    fullName: string
+    email: string
+    phoneWork: string
+    phoneMobile: string
+    jobTitle: string
+    isPrimary: boolean
+  }>
   syncStatus: CrmSyncStatus
   syncError: string | null
   updatedAt: string
@@ -119,6 +130,7 @@ export type CrmInteraction = {
   sourceRowNumber: number | null
   interactionType: string
   subject: string
+  agentEmail: string | null
   agentName: string
   occurredAt: string | null
   description: string

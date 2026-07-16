@@ -113,6 +113,7 @@ export type StageOpportunityInput = CommonStageInput & {
   fields: {
     organizationId?: string | null
     organizationSuiteCrmId?: string | null
+    contactIds?: string[]
     priority?: string
     name: string
     owner?: string
@@ -205,6 +206,8 @@ export type StageInteractionInput = CommonStageInput & {
     parentSuiteCrmType?: 'Accounts' | 'Contacts' | 'Leads' | 'Opportunities' | 'Meetings' | 'Campaigns'
     interactionType?: string
     subject: string
+    agentEmail?: string | null
+    agentSuiteCrmUserId?: string | null
     agentName?: string
     occurredAt?: string | null
     description?: string
@@ -237,6 +240,12 @@ export type CrmOutboxItem = {
 
 function clean(value: unknown) {
   return String(value ?? '').trim()
+}
+
+function uniqueUuidList(value: unknown) {
+  if (!Array.isArray(value)) return []
+  const ids = value.map(clean).filter((id) => /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id))
+  return [...new Set(ids)]
 }
 
 function nullable(value: unknown) {
@@ -379,6 +388,7 @@ function suiteCrmAttributes(input: StageCrmRecordInput, referenceCode: string) {
     parent_type: fields.parentSuiteCrmId ? clean(fields.parentSuiteCrmType) : '',
     parent_id: clean(fields.parentSuiteCrmId),
     contact_id: clean(fields.contactSuiteCrmId),
+    ...(fields.agentSuiteCrmUserId ? { assigned_user_id: clean(fields.agentSuiteCrmUserId) } : {}),
     description: clean(fields.description),
   }
 }
@@ -398,6 +408,30 @@ async function suiteCrmRelationships(
        FROM crm_contacts
        WHERE pipeline_id = $1::uuid AND id = $2::uuid AND suitecrm_id IS NOT NULL`,
       [input.pipelineId, input.fields.contactId || null],
+    )
+    return result.rows.map((row) => ({
+      linkFieldName: row.link_field_name,
+      relatedModuleName: row.related_module_name,
+      relatedBeanId: row.related_bean_id,
+    }))
+  }
+  if (input.entity === 'opportunities') {
+    const result = await client.query<{
+      link_field_name: 'contacts'
+      related_module_name: 'Contacts'
+      related_bean_id: string
+    }>(
+      `SELECT 'contacts'::text AS link_field_name, 'Contacts'::text AS related_module_name,
+         contact.suitecrm_id AS related_bean_id
+       FROM crm_opportunity_contacts relationship
+       JOIN crm_contacts contact
+         ON contact.pipeline_id = relationship.pipeline_id
+        AND contact.id = relationship.contact_id
+       WHERE relationship.pipeline_id = $1::uuid
+         AND relationship.opportunity_id = $2::uuid
+         AND contact.suitecrm_id IS NOT NULL
+       ORDER BY relationship.sort_order, relationship.contact_id`,
+      [input.pipelineId, input.localId || null],
     )
     return result.rows.map((row) => ({
       linkFieldName: row.link_field_name,
@@ -450,7 +484,7 @@ async function enqueueSuiteCrmRecord(
   referenceCode: string,
   sourceHash: string,
 ): Promise<string | null> {
-  const relationships = await suiteCrmRelationships(client, input)
+  const relationships = await suiteCrmRelationships(client, { ...input, localId })
   const payload: SuiteCrmOutboxRecord = {
     entity: input.entity,
     pipelineId: input.pipelineId,
@@ -855,7 +889,38 @@ async function stageOpportunity(client: PoolClient, input: StageOpportunityInput
       isoDate(fields.expectedClose), nullable(fields.notes), JSON.stringify(input.sourcePayload || {}), sourceHash, input.actorEmail,
     ],
   )
-  return result.rows[0]
+  const row = result.rows[0]
+  if (input.fields.contactIds !== undefined) {
+    const contactIds = uniqueUuidList(input.fields.contactIds)
+    if (contactIds.length !== input.fields.contactIds.length) throw new Error('Opportunity contact selection is invalid')
+    if (contactIds.length > 0) {
+      const eligible = await client.query<{ id: string }>(
+        `SELECT id::text
+         FROM crm_contacts
+         WHERE pipeline_id = $1::uuid
+           AND id = ANY($2::uuid[])
+           AND organization_id = $3::uuid`,
+        [input.pipelineId, contactIds, input.fields.organizationId || null],
+      )
+      if (eligible.rowCount !== contactIds.length) {
+        throw new Error('Opportunity contacts must belong to the selected organization')
+      }
+    }
+    await client.query(
+      `DELETE FROM crm_opportunity_contacts
+       WHERE pipeline_id = $1::uuid AND opportunity_id = $2::uuid`,
+      [input.pipelineId, row.id],
+    )
+    for (const [index, contactId] of contactIds.entries()) {
+      await client.query(
+        `INSERT INTO crm_opportunity_contacts (
+           pipeline_id, opportunity_id, contact_id, is_primary, sort_order, created_by, updated_at
+         ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6, now())`,
+        [input.pipelineId, row.id, contactId, index === 0, index, input.actorEmail],
+      )
+    }
+  }
+  return row
 }
 
 async function stageMeeting(client: PoolClient, input: StageMeetingInput, suiteCrmId: string, sourceHash: string) {
@@ -967,7 +1032,7 @@ async function stageInteraction(client: PoolClient, input: StageInteractionInput
       INSERT INTO crm_interactions (
         pipeline_id, organization_id, contact_id, lead_id, opportunity_id, meeting_id,
         campaign_id, suitecrm_id, source_key, reference_code, source_sheet_id, source_row_number,
-        interaction_type, subject, agent_name, occurred_at, description, direction,
+        interaction_type, subject, agent_email, agent_name, occurred_at, description, direction,
         delivery_status, provider_message_id, provider_thread_id, metadata,
         source_payload, source_hash, sync_status, sync_error, created_by, updated_by
       )
@@ -975,8 +1040,8 @@ async function stageInteraction(client: PoolClient, input: StageInteractionInput
         $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6::uuid, $7::uuid,
         $8, $9,
         COALESCE((SELECT reference_code FROM crm_interactions WHERE pipeline_id = $1::uuid AND source_key = $9), allocate_crm_reference('gi')),
-        $10, $11, $12, $13, $14, $15::timestamptz, $16, $17, $18,
-        $19, $20, $21::jsonb, $22::jsonb, $23, 'pending', NULL, $24, $24
+        $10, $11, $12, $13, $14, $15, $16::timestamptz, $17, $18, $19,
+        $20, $21, $22::jsonb, $23::jsonb, $24, 'pending', NULL, $25, $25
       )
       ON CONFLICT (pipeline_id, source_key) DO UPDATE SET
         organization_id = EXCLUDED.organization_id,
@@ -990,6 +1055,7 @@ async function stageInteraction(client: PoolClient, input: StageInteractionInput
         source_row_number = EXCLUDED.source_row_number,
         interaction_type = EXCLUDED.interaction_type,
         subject = EXCLUDED.subject,
+        agent_email = EXCLUDED.agent_email,
         agent_name = EXCLUDED.agent_name,
         occurred_at = EXCLUDED.occurred_at,
         description = EXCLUDED.description,
@@ -1010,9 +1076,10 @@ async function stageInteraction(client: PoolClient, input: StageInteractionInput
       input.pipelineId, fields.organizationId || null, fields.contactId || null, fields.leadId || null,
       fields.opportunityId || null, fields.meetingId || null, fields.campaignId || null,
       suiteCrmId, input.sourceKey, input.sourceSheetId || null, input.sourceRowNumber || null,
-      nullable(fields.interactionType), clean(fields.subject), nullable(fields.agentName), isoTimestamp(fields.occurredAt),
-      nullable(fields.description), fields.direction || 'internal', nullable(fields.deliveryStatus),
-      fields.providerMessageId || null, fields.providerThreadId || null, JSON.stringify(fields.metadata || {}),
+      nullable(fields.interactionType), clean(fields.subject), fields.agentEmail || null,
+      nullable(fields.agentName), isoTimestamp(fields.occurredAt), nullable(fields.description),
+      fields.direction || 'internal', nullable(fields.deliveryStatus), fields.providerMessageId || null,
+      fields.providerThreadId || null, JSON.stringify(fields.metadata || {}),
       JSON.stringify(input.sourcePayload || {}), sourceHash, input.actorEmail,
     ],
   )
@@ -1084,6 +1151,24 @@ async function normalizeStageCrmRecordInput(
   client: PoolClient,
   input: StageCrmRecordInput,
 ): Promise<StageCrmRecordInput> {
+  if (input.entity === 'opportunities') {
+    const organization = await client.query<{ name: string; suitecrm_id: string | null }>(
+      `SELECT name, suitecrm_id
+       FROM crm_organizations
+       WHERE pipeline_id = $1::uuid AND id = $2::uuid
+       LIMIT 1`,
+      [input.pipelineId, input.fields.organizationId || null],
+    )
+    if (!organization.rows[0]) throw new Error('Opportunity organization was not found')
+    return {
+      ...input,
+      fields: {
+        ...input.fields,
+        organization: clean(organization.rows[0].name),
+        organizationSuiteCrmId: nullable(organization.rows[0].suitecrm_id),
+      },
+    }
+  }
   if (input.entity === 'meetings') {
     const timezone = clean(input.fields.timezone) || 'America/New_York'
     const startsAt = zonedDateTimeToIso(input.fields.startsAt, timezone)
@@ -1095,10 +1180,33 @@ async function normalizeStageCrmRecordInput(
   }
   if (input.entity === 'interactions') {
     const fields = input.fields
+    const agentEmail = clean(fields.agentEmail).toLowerCase()
+    const agentLookup = agentEmail || clean(fields.agentName)
+    const agent = agentLookup
+      ? await client.query<{ email: string; display_name: string | null; suitecrm_user_id: string | null }>(
+          `SELECT app_user.email, app_user.display_name, app_user.suitecrm_user_id
+           FROM app_users app_user
+           JOIN pipeline_spaces pipeline ON pipeline.id = $1::uuid
+           LEFT JOIN pipeline_space_members membership
+             ON membership.pipeline_id = pipeline.id
+            AND membership.user_email = app_user.email
+           WHERE (app_user.email = lower($2) OR lower(COALESCE(app_user.display_name, '')) = lower($2))
+             AND app_user.status = 'active'
+             AND (pipeline.owner_email = app_user.email OR membership.user_email IS NOT NULL)
+           ORDER BY app_user.email
+           LIMIT 2`,
+          [input.pipelineId, agentLookup],
+        )
+      : null
+    if ((agent?.rows.length || 0) > 1) throw new Error('Interaction agent mapping is ambiguous')
+    if (agentEmail && !agent?.rows[0]) {
+      throw new Error('Interaction agent must be an active ClawPilot user with pipeline access')
+    }
     const relationship = await client.query<{
       organization_id: string | null
       organization_suitecrm_id: string | null
       contact_suitecrm_id: string | null
+      contact_organization_id: string | null
     }>(
       `WITH resolved AS (
          SELECT COALESCE(
@@ -1111,7 +1219,8 @@ async function normalizeStageCrmRecordInput(
        )
        SELECT organization.id::text AS organization_id,
          organization.suitecrm_id AS organization_suitecrm_id,
-         contact.suitecrm_id AS contact_suitecrm_id
+         contact.suitecrm_id AS contact_suitecrm_id,
+         contact.organization_id::text AS contact_organization_id
        FROM resolved
        LEFT JOIN crm_organizations organization
          ON organization.pipeline_id = $1::uuid
@@ -1129,10 +1238,22 @@ async function normalizeStageCrmRecordInput(
       ],
     )
     const organization = relationship.rows[0]
+    if (
+      fields.organizationId
+      && fields.contactId
+      && organization?.contact_organization_id !== organization?.organization_id
+    ) {
+      throw new Error('Interaction contact must belong to the selected organization')
+    }
     return {
       ...input,
       fields: {
         ...fields,
+        agentEmail: agent?.rows[0]?.email || null,
+        agentName: agent?.rows[0]
+          ? clean(agent.rows[0].display_name) || agent.rows[0].email
+          : fields.agentName,
+        agentSuiteCrmUserId: agent?.rows[0]?.suitecrm_user_id || null,
         organizationId: organization?.organization_id || null,
         contactSuiteCrmId: organization?.contact_suitecrm_id || null,
         parentSuiteCrmId: organization?.organization_suitecrm_id || fields.parentSuiteCrmId || null,
@@ -1268,7 +1389,8 @@ export async function createCrmOpportunityInPostgres(input: StageOpportunityInpu
         [input.pipelineId, receipt.rows[0].aggregate_id],
       )
       if (!replayed.rows[0]) throw new Error('Opportunity not found')
-      return { opportunity: opportunityFromRow(replayed.rows[0]), created: false }
+      const [opportunity] = await hydrateOpportunityRowsWithClient(client, replayed.rows, input.pipelineId)
+      return { opportunity, created: false }
     }
 
     const existing = await client.query<Record<string, unknown>>(
@@ -1287,7 +1409,8 @@ export async function createCrmOpportunityInPostgres(input: StageOpportunityInpu
         organizationId: nullable(existing.rows[0].organization_id),
         payload: { pipelineId: input.pipelineId, requestFingerprint: null, recoveredReceipt: true },
       }, client)
-      return { opportunity: opportunityFromRow(existing.rows[0]), created: false }
+      const [opportunity] = await hydrateOpportunityRowsWithClient(client, existing.rows, input.pipelineId)
+      return { opportunity, created: false }
     }
 
     const staged = await stageCrmRecordWithClient(client, input)
@@ -1306,7 +1429,8 @@ export async function createCrmOpportunityInPostgres(input: StageOpportunityInpu
       organizationId: input.fields.organizationId || null,
       payload: { pipelineId: input.pipelineId, requestFingerprint },
     }, client)
-    return { opportunity: opportunityFromRow(created.rows[0]), created: true }
+    const [opportunity] = await hydrateOpportunityRowsWithClient(client, created.rows, input.pipelineId)
+    return { opportunity, created: true }
   })
 }
 
@@ -1338,7 +1462,8 @@ export async function updateCrmOpportunityInPostgres(input: {
         [input.pipelineId, input.opportunityId],
       )
       if (!replayed.rows[0]) throw new Error('Opportunity not found')
-      return { opportunity: opportunityFromRow(replayed.rows[0]), applied: false, replayed: true, conflict: false }
+      const [opportunity] = await hydrateOpportunityRowsWithClient(client, replayed.rows, input.pipelineId)
+      return { opportunity, applied: false, replayed: true, conflict: false }
     }
 
     const locked = await client.query<Record<string, unknown>>(
@@ -1351,7 +1476,7 @@ export async function updateCrmOpportunityInPostgres(input: {
     )
     const row = locked.rows[0]
     if (!row) throw new Error('Opportunity not found')
-    const current = opportunityFromRow(row)
+    const [current] = await hydrateOpportunityRowsWithClient(client, [row], input.pipelineId)
     if (current.updatedAt !== input.expectedUpdatedAt) {
       return { opportunity: current, applied: false, replayed: false, conflict: true }
     }
@@ -1367,6 +1492,7 @@ export async function updateCrmOpportunityInPostgres(input: {
         ...input.fields,
         organizationId: current.organizationId,
         organizationSuiteCrmId: nullable(row.organization_suitecrm_id),
+        contactIds: input.fields.contactIds ?? current.contactIds,
       },
     })
     await recordAuditEvent({
@@ -1384,7 +1510,8 @@ export async function updateCrmOpportunityInPostgres(input: {
        LIMIT 1`,
       [input.pipelineId, input.opportunityId],
     )
-    return { opportunity: opportunityFromRow(updated.rows[0]), applied: true, replayed: false, conflict: false }
+    const [opportunity] = await hydrateOpportunityRowsWithClient(client, updated.rows, input.pipelineId)
+    return { opportunity, applied: true, replayed: false, conflict: false }
   })
 }
 
@@ -1827,7 +1954,10 @@ function contactFromRow(row: Record<string, unknown>): CrmContact {
   }
 }
 
-function opportunityFromRow(row: Record<string, unknown>): CrmOpportunity {
+function opportunityFromRow(
+  row: Record<string, unknown>,
+  contacts: CrmOpportunity['contacts'] = [],
+): CrmOpportunity {
   return {
     id: String(row.id), referenceCode: clean(row.reference_code), shortUrl: crmReferenceShortUrl(row.reference_code),
     pipelineId: String(row.pipeline_id), organizationId: nullable(row.organization_id), suiteCrmId: nullable(row.suitecrm_id),
@@ -1835,9 +1965,57 @@ function opportunityFromRow(row: Record<string, unknown>): CrmOpportunity {
     priority: clean(row.priority), name: clean(row.name), owner: clean(row.owner_name), organization: clean(row.organization_name),
     status: clean(row.status), stage: clean(row.stage), lossReason: clean(row.loss_reason), source: clean(row.lead_source),
     value: finite(row.amount), probability: finite(row.probability), expectedClose: crmDateOnly(row.expected_close),
-    notes: clean(row.description), syncStatus: row.sync_status as CrmOpportunity['syncStatus'], syncError: nullable(row.sync_error),
+    notes: clean(row.description), contactIds: contacts.map((contact) => contact.id), contacts,
+    syncStatus: row.sync_status as CrmOpportunity['syncStatus'], syncError: nullable(row.sync_error),
     updatedAt: String(row.updated_at),
   }
+}
+
+async function hydrateOpportunityRows(
+  rows: Record<string, unknown>[],
+  pipelineId: string,
+  runQuery: (text: string, values: unknown[]) => Promise<{ rows: Record<string, unknown>[] }>,
+) {
+  if (rows.length === 0) return []
+  const opportunityIds = rows.map((row) => String(row.id))
+  const relationshipResult = await runQuery(
+    `SELECT relationship.opportunity_id::text, relationship.is_primary,
+       contact.id::text, contact.reference_code, contact.full_name, contact.email,
+       contact.phone_work, contact.phone_mobile, contact.job_title
+     FROM crm_opportunity_contacts relationship
+     JOIN crm_contacts contact
+       ON contact.pipeline_id = relationship.pipeline_id
+      AND contact.id = relationship.contact_id
+     WHERE relationship.pipeline_id = $1::uuid
+       AND relationship.opportunity_id = ANY($2::uuid[])
+     ORDER BY relationship.opportunity_id, relationship.sort_order, contact.full_name, contact.id`,
+    [pipelineId, opportunityIds],
+  )
+  const byOpportunity = new Map<string, CrmOpportunity['contacts']>()
+  for (const relationship of relationshipResult.rows) {
+    const opportunityId = String(relationship.opportunity_id)
+    const contacts = byOpportunity.get(opportunityId) || []
+    contacts.push({
+      id: String(relationship.id),
+      referenceCode: clean(relationship.reference_code),
+      fullName: clean(relationship.full_name),
+      email: clean(relationship.email),
+      phoneWork: clean(relationship.phone_work),
+      phoneMobile: clean(relationship.phone_mobile),
+      jobTitle: clean(relationship.job_title),
+      isPrimary: relationship.is_primary === true,
+    })
+    byOpportunity.set(opportunityId, contacts)
+  }
+  return rows.map((row) => opportunityFromRow(row, byOpportunity.get(String(row.id)) || []))
+}
+
+function hydrateOpportunityRowsWithClient(client: PoolClient, rows: Record<string, unknown>[], pipelineId: string) {
+  return hydrateOpportunityRows(rows, pipelineId, (text, values) => client.query<Record<string, unknown>>(text, values))
+}
+
+function hydrateOpportunityRowsWithPool(rows: Record<string, unknown>[], pipelineId: string) {
+  return hydrateOpportunityRows(rows, pipelineId, (text, values) => query<Record<string, unknown>>(text, values))
 }
 
 function interactionFromRow(row: Record<string, unknown>): CrmInteraction {
@@ -1848,7 +2026,8 @@ function interactionFromRow(row: Record<string, unknown>): CrmInteraction {
     opportunityId: nullable(row.opportunity_id), leadId: nullable(row.lead_id), meetingId: nullable(row.meeting_id),
     campaignId: nullable(row.campaign_id), suiteCrmId: nullable(row.suitecrm_id), sourceKey: String(row.source_key),
     sourceRowNumber: row.source_row_number === null ? null : Number(row.source_row_number), interactionType: clean(row.interaction_type),
-    subject: clean(row.subject), agentName: clean(row.agent_name), occurredAt: row.occurred_at ? String(row.occurred_at) : null,
+    subject: clean(row.subject), agentEmail: nullable(row.agent_email), agentName: clean(row.agent_name),
+    occurredAt: row.occurred_at ? String(row.occurred_at) : null,
     description: clean(row.description), direction: (row.direction || 'internal') as CrmInteraction['direction'],
     deliveryStatus: clean(row.delivery_status), providerMessageId: nullable(row.provider_message_id),
     providerThreadId: nullable(row.provider_thread_id), syncStatus: row.sync_status as CrmInteraction['syncStatus'], syncError: nullable(row.sync_error),
@@ -1951,12 +2130,19 @@ export async function listCrmRecordsInPostgres(input: {
   }
   if (input.entity === 'opportunities') {
     const result = await query<Record<string, unknown>>(
-      `SELECT * FROM crm_opportunities
-       WHERE pipeline_id = $1::uuid AND ($2 = '' OR reference_code ILIKE '%' || $2 || '%' OR name ILIKE '%' || $2 || '%' OR organization_name ILIKE '%' || $2 || '%')
-       ORDER BY updated_at DESC, id LIMIT $3`,
+      `SELECT opportunity.*, COALESCE(organization.name, opportunity.organization_name) AS organization_name
+       FROM crm_opportunities opportunity
+       LEFT JOIN crm_organizations organization
+         ON organization.pipeline_id = opportunity.pipeline_id
+        AND organization.id = opportunity.organization_id
+       WHERE opportunity.pipeline_id = $1::uuid
+         AND ($2 = '' OR opportunity.reference_code ILIKE '%' || $2 || '%'
+           OR opportunity.name ILIKE '%' || $2 || '%'
+           OR COALESCE(organization.name, opportunity.organization_name) ILIKE '%' || $2 || '%')
+       ORDER BY opportunity.updated_at DESC, opportunity.id LIMIT $3`,
       [input.pipelineId, search, limit],
     )
-    return result.rows.map(opportunityFromRow)
+    return hydrateOpportunityRowsWithPool(result.rows, input.pipelineId)
   }
   if (input.entity === 'meetings') {
     const result = await query<Record<string, unknown>>(
@@ -2019,14 +2205,18 @@ export async function readCrmOpportunityInPostgres(input: {
   id: string
 }): Promise<CrmOpportunity> {
   const result = await query<Record<string, unknown>>(
-    `SELECT * FROM crm_opportunities
-     WHERE pipeline_id = $1::uuid AND id = $2::uuid
+    `SELECT opportunity.*, COALESCE(organization.name, opportunity.organization_name) AS organization_name
+     FROM crm_opportunities opportunity
+     LEFT JOIN crm_organizations organization
+       ON organization.pipeline_id = opportunity.pipeline_id
+      AND organization.id = opportunity.organization_id
+     WHERE opportunity.pipeline_id = $1::uuid AND opportunity.id = $2::uuid
      LIMIT 1`,
     [input.pipelineId, input.id],
   )
   const row = result.rows[0]
   if (!row) throw new Error('Opportunity not found')
-  return opportunityFromRow(row)
+  return (await hydrateOpportunityRowsWithPool([row], input.pipelineId))[0]
 }
 
 export async function appendCrmOpportunityCommentInPostgres(input: {
@@ -2051,7 +2241,7 @@ export async function appendCrmOpportunityCommentInPostgres(input: {
     )
     const row = locked.rows[0]
     if (!row) throw new Error('Opportunity not found')
-    const current = opportunityFromRow(row)
+    const [current] = await hydrateOpportunityRowsWithClient(client, [row], input.pipelineId)
 
     const existing = await client.query(
       `SELECT 1 FROM crm_interactions
@@ -2075,6 +2265,7 @@ export async function appendCrmOpportunityCommentInPostgres(input: {
       fields: {
         organizationId: current.organizationId,
         organizationSuiteCrmId: nullable(row.organization_suitecrm_id),
+        contactIds: current.contactIds,
         name: current.name,
         organization: current.organization,
         priority: current.priority,
@@ -2102,6 +2293,7 @@ export async function appendCrmOpportunityCommentInPostgres(input: {
         parentSuiteCrmType: 'Opportunities',
         interactionType: 'Note',
         subject: `Note: ${current.name}`,
+        agentEmail: input.actorEmail,
         agentName: input.actorName,
         occurredAt: input.occurredAt,
         description: input.comment,
@@ -2115,8 +2307,37 @@ export async function appendCrmOpportunityCommentInPostgres(input: {
        LIMIT 1`,
       [input.pipelineId, input.opportunityId],
     )
-    return { opportunity: opportunityFromRow(updated.rows[0]), created: true, conflict: false }
+    const [opportunity] = await hydrateOpportunityRowsWithClient(client, updated.rows, input.pipelineId)
+    return { opportunity, created: true, conflict: false }
   })
+}
+
+export async function listCrmPipelineUsersInPostgres(pipelineId: string): Promise<Array<{
+  email: string
+  displayName: string
+  suiteCrmMapped: boolean
+}>> {
+  const result = await query<{
+    email: string
+    display_name: string | null
+    suitecrm_user_id: string | null
+  }>(
+    `SELECT app_user.email, app_user.display_name, app_user.suitecrm_user_id
+     FROM app_users app_user
+     JOIN pipeline_spaces pipeline ON pipeline.id = $1::uuid
+     LEFT JOIN pipeline_space_members membership
+       ON membership.pipeline_id = pipeline.id
+      AND membership.user_email = app_user.email
+     WHERE app_user.status = 'active'
+       AND (pipeline.owner_email = app_user.email OR membership.user_email IS NOT NULL)
+     ORDER BY COALESCE(app_user.display_name, app_user.email), app_user.email`,
+    [pipelineId],
+  )
+  return result.rows.map((row) => ({
+    email: row.email,
+    displayName: clean(row.display_name) || row.email,
+    suiteCrmMapped: Boolean(row.suitecrm_user_id),
+  }))
 }
 
 export async function readCrmSummaryFromPostgres(pipelineId: string): Promise<CrmSummary> {
@@ -2190,6 +2411,8 @@ export async function readCrmRecordReference(input: {
        to_jsonb(record)->>'opportunity_id' AS opportunity_id,
        to_jsonb(record)->>'meeting_id' AS meeting_id,
        to_jsonb(record)->>'campaign_id' AS campaign_id,
+       to_jsonb(record)->>'agent_email' AS agent_email,
+       to_jsonb(record)->>'agent_name' AS agent_name,
        COALESCE(to_jsonb(record)->>'email', '') AS email,
        COALESCE(to_jsonb(record)->>'phone_mobile', to_jsonb(record)->>'phone_work', to_jsonb(record)->>'phone', '') AS phone,
        COALESCE(to_jsonb(record)->>'email_opt_out', 'false') AS email_opt_out,
@@ -2222,6 +2445,8 @@ export async function readCrmRecordReference(input: {
     opportunityId: nullable(row.opportunity_id),
     meetingId: nullable(row.meeting_id),
     campaignId: nullable(row.campaign_id),
+    agentEmail: nullable(row.agent_email),
+    agentName: clean(row.agent_name),
     email: clean(row.email),
     phone: clean(row.phone),
     emailOptOut: row.email_opt_out === true || clean(row.email_opt_out) === 'true',

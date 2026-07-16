@@ -9,6 +9,7 @@ import {
 import { ensureDefaultResourcesForUser } from '@/lib/tenancy'
 import { syncAppUserProfileToOwnedPipelines } from '@/lib/persistence/crm'
 import { sessionEmail } from '@/lib/requestUser'
+import { findSuiteCrmUser } from '@/lib/crm/suiteCrmClient'
 import {
   AppUserAuthorizationError,
   AppUserNotFoundError,
@@ -18,6 +19,7 @@ import {
   setAppUserStatus,
   updateAppUserAccess,
   updateAppUserProfile,
+  updateAppUserSuiteCrmMapping,
 } from '@/lib/users'
 
 function userMutationErrorStatus(error: unknown): number {
@@ -84,6 +86,18 @@ export async function PATCH(req: NextRequest) {
 
   try {
     const body = await req.json()
+    if (body?.action === 'crm-user-mapping') {
+      const suiteCrmUsername = String(body.suiteCrmUsername || '').trim()
+      const match = await findSuiteCrmUser({ username: suiteCrmUsername })
+      if (!match) throw new Error('No active SuiteCRM user matches that username')
+      const user = await updateAppUserSuiteCrmMapping({
+        actorEmail,
+        email: body.email,
+        suiteCrmUserId: match.id,
+        suiteCrmUsername: match.username,
+      })
+      return NextResponse.json({ ok: true, user })
+    }
     if (body?.action === 'profile') {
       await ensurePrimaryWorkspaceOrganization(actorEmail)
       await ensureDefaultResourcesForUser(actorEmail)

@@ -321,6 +321,7 @@ async function readAuditRows(scope: ActivityScope, context: ScopeContext, snapsh
           ? {
             section: 'crm',
             id: typeof row.payload?.referenceCode === 'string' ? row.payload.referenceCode : undefined,
+            resourceId,
             label: String(row.payload?.recordTitle || row.payload?.referenceCode || row.aggregate_id || 'CRM record'),
           }
           : activityModule === 'agents'

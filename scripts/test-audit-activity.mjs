@@ -70,7 +70,16 @@ for (const fragment of ['parseCursor', "Buffer.from(value, 'base64url')", 'autho
 }
 
 const activityUi = read('app_src/components/activity/ActivityLogPage.tsx')
-for (const fragment of ['My activity', 'Organization', 'Global system', '/api/activity?', 'Event details']) {
+for (const fragment of [
+  'My activity',
+  'Organization',
+  'Global system',
+  '/api/activity?',
+  'Event details',
+  'activityTargetUrl',
+  "url.searchParams.set('pipeline', target.resourceId)",
+  'window.location.assign(nextUrl.toString())',
+]) {
   assert.ok(activityUi.includes(fragment), `activity UI missing ${fragment}`)
 }
 assert.ok(!activityUi.includes('defaultModule'), 'activity must not default to the currently selected module')

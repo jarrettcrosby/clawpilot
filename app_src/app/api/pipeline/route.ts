@@ -4,7 +4,7 @@ import fs from 'fs'
 import path from 'path'
 import type { Task } from '@/lib/types'
 import { isCrmBoardCard } from '@/lib/crm/boardCard.mjs'
-import type { CrmContact, CrmOpportunity } from '@/lib/crm/types'
+import type { CrmOpportunity } from '@/lib/crm/types'
 import { buildCanonicalWorkItem } from '@/lib/workItemModel'
 import { shouldFallbackToFileOnDatabaseError } from '@/lib/persistence/config'
 import {
@@ -66,18 +66,12 @@ function pipelineWorkItemsFromTasks(tasks: Task[]) {
     }))
 }
 
-function crmOpportunityForPipeline(
-  opportunity: CrmOpportunity,
-  contactsByOrganization: Map<string, CrmContact[]>,
-) {
-  const contacts = opportunity.organizationId
-    ? contactsByOrganization.get(opportunity.organizationId) || []
-    : []
+function crmOpportunityForPipeline(opportunity: CrmOpportunity) {
   return {
     ...opportunity,
     org: opportunity.organization,
     closeDate: opportunity.expectedClose,
-    contacts: contacts.map((contact) => ({
+    contacts: opportunity.contacts.map((contact) => ({
       id: contact.id,
       name: contact.fullName,
       phone: contact.phoneMobile || contact.phoneWork,
@@ -130,27 +124,15 @@ export async function GET(req: NextRequest) {
     if (isPostgresPipelineStoreEnabled()) {
       try {
         if (selectedPipeline) {
-          const [projection, opportunities, contacts, crmSummary] = await Promise.all([
+          const [projection, opportunities, crmSummary] = await Promise.all([
             readPipelineProjectionForSpace(selectedPipeline),
             listCrmRecordsInPostgres({
               pipelineId: selectedPipeline.id,
               entity: 'opportunities',
               limit: 1000,
             }) as Promise<CrmOpportunity[]>,
-            listCrmRecordsInPostgres({
-              pipelineId: selectedPipeline.id,
-              entity: 'contacts',
-              limit: 1000,
-            }) as Promise<CrmContact[]>,
             readCrmSummaryFromPostgres(selectedPipeline.id),
           ])
-          const contactsByOrganization = new Map<string, CrmContact[]>()
-          for (const contact of contacts) {
-            if (!contact.organizationId) continue
-            const current = contactsByOrganization.get(contact.organizationId) || []
-            current.push(contact)
-            contactsByOrganization.set(contact.organizationId, current)
-          }
           return NextResponse.json({
             syncedAt: projection.syncedAt || null,
             summary: {
@@ -162,7 +144,7 @@ export async function GET(req: NextRequest) {
               pendingSync: crmSummary.pendingSync,
               failedSync: crmSummary.failedSync,
             },
-            opportunities: opportunities.map((opportunity) => crmOpportunityForPipeline(opportunity, contactsByOrganization)),
+            opportunities: opportunities.map(crmOpportunityForPipeline),
             workItems,
             storage: 'postgres',
             pipeline: {
@@ -255,6 +237,7 @@ export async function POST(req: NextRequest) {
     const source = String(body?.source || '')
     const expectedClose = String(body?.closeDate || body?.expectedClose || '')
     const notes = String(body?.notes || '')
+    const contactIds = Array.isArray(body?.contactIds) ? body.contactIds.map(String) : []
     if (organizationRecord.relationshipType !== 'customer') {
       throw new Error('Opportunities must be linked to a customer organization')
     }
@@ -267,6 +250,7 @@ export async function POST(req: NextRequest) {
       fields: {
         organizationId: organizationRecord.id,
         organizationSuiteCrmId: organizationRecord.suiteCrmId,
+        contactIds,
         name,
         organization,
         priority,
@@ -284,7 +268,7 @@ export async function POST(req: NextRequest) {
       ok: true,
       queued: staged.created,
       replayed: !staged.created,
-      opportunity: crmOpportunityForPipeline(staged.opportunity, new Map()),
+      opportunity: crmOpportunityForPipeline(staged.opportunity),
       crm: {
         id: staged.opportunity.id,
         referenceCode: staged.opportunity.referenceCode,

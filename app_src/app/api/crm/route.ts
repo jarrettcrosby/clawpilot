@@ -6,6 +6,7 @@ import { reconcileCrmBoardProjectionsForPipeline } from '@/lib/crm/boardProjecti
 import {
   ensurePipelineCrmHierarchy,
   ensurePipelineCrmReferenceLinks,
+  listCrmPipelineUsersInPostgres,
   listCrmRecordsInPostgres,
   readCrmRecordReference,
   readCrmSummaryFromPostgres,
@@ -60,6 +61,16 @@ function emailList(value: unknown) {
   return Array.from(new Set(value.map(validEmail).filter(Boolean))).slice(0, 200)
 }
 
+function uuidList(value: unknown, label: string) {
+  if (value === undefined || value === null || value === '') return []
+  if (!Array.isArray(value)) throw new Error(`${label} must be a list`)
+  const ids = value.map((item) => stringValue(item, 50)).filter(Boolean)
+  if (ids.some((id) => !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id))) {
+    throw new Error(`${label} contains an invalid record`)
+  }
+  return [...new Set(ids)]
+}
+
 function timezoneValue(value: unknown) {
   const timezone = stringValue(value, 100) || 'America/New_York'
   try {
@@ -92,7 +103,7 @@ export async function GET(req: NextRequest) {
     const canOpenSuiteCrm = (actor.role === 'owner' || actor.role === 'admin') && currentOrganization.parentId === null
     await syncAppUserProfileToCrm({ email: actor.email, pipelineId: pipeline.id })
     await ensurePipelineCrmReferenceLinks(pipeline.id)
-    const [records, summary, workspaceHierarchy, matonCredential] = await Promise.all([
+    const [records, summary, workspaceHierarchy, matonCredential, pipelineUsers] = await Promise.all([
       listCrmRecordsInPostgres({
         pipelineId: pipeline.id,
         entity,
@@ -103,6 +114,7 @@ export async function GET(req: NextRequest) {
       readCrmSummaryFromPostgres(pipeline.id),
       listWorkspaceOrganizationHierarchy(actor.email),
       readMatonCredentialStateFromPostgres(actor.email),
+      listCrmPipelineUsersInPostgres(pipeline.id),
     ])
     const selectedProviderEmail = (app: string) => matonCredential.connections.find((connection) => (
       connection.app === app
@@ -123,6 +135,7 @@ export async function GET(req: NextRequest) {
         shortLinkUrl: pipeline.shortLinkUrl,
       },
       workspaceHierarchy,
+      pipelineUsers,
       canManageHierarchy: actor.role === 'owner' || actor.role === 'admin',
       providerIdentities: {
         googleMail: selectedProviderEmail('google-mail'),
@@ -231,10 +244,11 @@ export async function POST(req: NextRequest) {
       const organizationName = organization?.name || stringValue(fields.organization, 250)
       if (!name || !organizationName) throw new Error('Opportunity and organization are required')
       const staged = await stageCrmRecordInPostgres({
-        entity, pipelineId: pipeline.id, sourceKey, actorEmail: actor.email,
+        entity, pipelineId: pipeline.id, localId: current?.id, sourceKey, actorEmail: actor.email,
         sourcePayload: { source: 'clawpilot' },
         fields: {
           organizationId: organization?.id || null, organizationSuiteCrmId: organization?.suiteCrmId || null,
+          contactIds: fields.contactIds === undefined ? undefined : uuidList(fields.contactIds, 'Opportunity contacts'),
           name, organization: organizationName, priority: stringValue(fields.priority, 50), owner: stringValue(fields.owner, 200),
           status: stringValue(fields.status, 100), stage: stringValue(fields.stage, 100), lossReason: stringValue(fields.lossReason, 250),
           source: stringValue(fields.source, 150), value: numberValue(fields.value), probability: numberValue(fields.probability, 0, 100),
@@ -382,7 +396,9 @@ export async function POST(req: NextRequest) {
         meetingId: stringValue(fields.meetingId || current?.meetingId) || null,
         campaignId: stringValue(fields.campaignId || current?.campaignId) || null,
         parentSuiteCrmId, parentSuiteCrmType, interactionType: stringValue(fields.interactionType, 100),
-        subject, agentName: stringValue(fields.agentName, 200), occurredAt: stringValue(fields.occurredAt, 50) || null,
+        subject, agentEmail: validEmail(fields.agentEmail || current?.agentEmail),
+        agentName: stringValue(fields.agentName || current?.agentName, 200),
+        occurredAt: stringValue(fields.occurredAt, 50) || null,
         description: stringValue(fields.description, 10_000),
         direction: ['inbound', 'outbound', 'internal'].includes(String(fields.direction))
           ? fields.direction as 'inbound' | 'outbound' | 'internal'
