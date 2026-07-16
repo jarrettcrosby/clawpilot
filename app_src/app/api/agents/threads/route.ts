@@ -12,6 +12,14 @@ import {
 import { resolveResponderId } from '@/lib/agents/responder.mjs'
 import { getThread as getFileThread, listThreads as listFileThreads, upsertThreadMessage as upsertFileThreadMessage } from '@/lib/agents/threadStore.mjs'
 import { normalizeProductAgentId, resolveExecutionAgentForControlAgent } from '@/lib/agents/routing'
+import {
+  applyAgentTaskExecutionPlanForDispatch,
+  formatAgentTaskExecutionResult,
+  parseAgentTaskExecutionPlan,
+  restorePersistedAgentTaskExecutionOutcome,
+  type AgentTaskExecutionEvidence,
+  type AgentTaskExecutionPlan,
+} from '@/lib/agents/taskExecution'
 import { isCrmBoardCard } from '@/lib/crm/boardCard.mjs'
 import { withFileLock } from '@/lib/fileLock'
 import type { Comment, Task } from '@/lib/types'
@@ -167,18 +175,61 @@ function deriveNextAction(summary: string): string {
   return firstRemaining?.replace(/^[-*]\s+/, '').trim() || 'Review the agent result and choose the next concrete step.'
 }
 
-async function recordAgentResult(taskId: string, agentId: string, summary: string, boardId?: string, dispatchId?: string) {
+async function restorePersistedDispatchOutcome(input: {
+  taskId: string
+  agentId: string
+  dispatchId: string
+  boardId?: string
+}) {
+  const tasks = await readTasks(input.boardId)
+  const index = tasks.findIndex((task) => String(task.id) === input.taskId)
+  if (index === -1) return null
+
+  const restored = restorePersistedAgentTaskExecutionOutcome({
+    task: tasks[index],
+    agentId: input.agentId,
+    dispatchId: input.dispatchId,
+    timestamp: new Date().toISOString(),
+  })
+  if (!restored) return null
+
+  tasks[index] = restored.task
+  await writeTasks(tasks, input.boardId)
+  return restored
+}
+
+async function recordAgentResult(input: {
+  taskId: string
+  agentId: string
+  summary: string
+  boardId?: string
+  dispatchId?: string
+  plan?: AgentTaskExecutionPlan
+}): Promise<{ evidence: AgentTaskExecutionEvidence | null; summary: string; applied: boolean }> {
+  const { taskId, agentId, summary, boardId, dispatchId, plan } = input
   const tasks = await readTasks(boardId)
   const index = tasks.findIndex((task) => String(task.id) === taskId)
-  if (index === -1) return
+  if (index === -1) return { evidence: null, summary, applied: false }
 
-  const task = tasks[index]
   const now = new Date().toISOString()
-  const nextAction = deriveNextAction(summary)
+  let task = tasks[index]
+  let evidence: AgentTaskExecutionEvidence | null = null
+  let resultSummary = summary
+  let planApplied = true
+  if (plan) {
+    if (!dispatchId) throw new Error('Task execution plan requires a dispatch ID')
+    const applied = applyAgentTaskExecutionPlanForDispatch({ task, plan, agentId, dispatchId, timestamp: now })
+    task = applied.task
+    evidence = applied.evidence
+    planApplied = applied.applied
+    resultSummary = formatAgentTaskExecutionResult(agentId, evidence)
+    if (!planApplied) return { evidence, summary: resultSummary, applied: false }
+  }
+  const nextAction = evidence?.nextAction || deriveNextAction(resultSummary)
   const commentId = dispatchId ? `agent-dispatch-${dispatchId}` : Date.now().toString()
   const comment: Comment = {
     id: commentId,
-    text: `Agent: ${agentId}\n\n${summary}`,
+    text: /^Agent\s*:/i.test(resultSummary) ? resultSummary : `Agent: ${agentId}\n\n${resultSummary}`,
     createdAt: now,
     timestamp: now,
     author: agentId,
@@ -192,10 +243,17 @@ async function recordAgentResult(taskId: string, agentId: string, summary: strin
   const execution = updatesCurrentDispatch
     ? {
         ...(task.execution || {}),
-        executionStatus: 'completed',
+        executionStatus: evidence?.status || 'responded',
         lastUpdatedAt: now,
-        latestExecutionNote: summary,
-        lastResult: { type: 'agent-thread-result', agentId, summary, nextAction, recordedAt: now },
+        latestExecutionNote: resultSummary,
+        lastResult: evidence ? task.execution?.lastResult : {
+          type: 'agent-thread-response',
+          agentId,
+          summary: resultSummary,
+          nextAction,
+          evidence: [],
+          recordedAt: now,
+        },
         agentDispatch: dispatchId
           ? {
               id: dispatchId,
@@ -216,7 +274,9 @@ async function recordAgentResult(taskId: string, agentId: string, summary: strin
       ...(task.activity || []),
       {
         type: 'comment',
-        message: `Agent ${agentId} posted a task result.`,
+        message: evidence
+          ? `Agent ${agentId} posted an evidence-backed task result.`
+          : `Agent ${agentId} posted a task response.`,
         timestamp: now,
         actor: agentId,
         taskId: task.id,
@@ -228,6 +288,7 @@ async function recordAgentResult(taskId: string, agentId: string, summary: strin
     updatedAt: now,
   }
   await writeTasks(tasks, boardId)
+  return { evidence, summary: resultSummary, applied: planApplied }
 }
 
 async function recordExecutionTelemetry(entry: Record<string, unknown>, includeResult = false) {
@@ -301,14 +362,29 @@ async function runOpenClawAgent(agentId: string, message: string): Promise<strin
 function buildTaskContext(task: Task, agentId: string, durableContext?: string | null): string {
   const checklist = (task.checklist || []).map((item) => `- [${item.done ? 'x' : ' '}] ${item.text}`).join('\n')
   const nextAction = String(task.workItem?.nextAction || '').trim()
+  const recentComments = (task.comments || [])
+    .filter((comment) => !comment.deletedAt)
+    .slice(-12)
+    .map((comment) => `- ${comment.author}: ${comment.text}`)
+    .join('\n')
+  const recentActivity = (task.activity || [])
+    .slice(-12)
+    .map((entry) => `- ${entry.timestamp} | ${entry.actor} | ${entry.message}`)
+    .join('\n')
   return [
     `Task: ${task.title}`,
-    task.desc ? `Description: ${task.desc}` : null,
+    task.desc ? `Description:\n${task.desc}` : null,
+    task.outcomeStatement ? `Outcome:\n${task.outcomeStatement}` : null,
     `Status: ${task.status}`,
     `Priority: ${task.priority}`,
+    `Category: ${task.category || 'none'}`,
+    task.tags?.length ? `Tags: ${task.tags.join(', ')}` : null,
+    task.dueDate ? `Due date: ${task.dueDate}` : null,
     `Assigned agent: ${agentId}`,
     nextAction ? `Next action: ${nextAction}` : null,
     checklist ? `Checklist:\n${checklist}` : null,
+    recentComments ? `Recent card comments:\n${recentComments}` : null,
+    recentActivity ? `Recent card activity:\n${recentActivity}` : null,
     durableContext ? `Durable agent context:\n${durableContext}` : null,
   ].filter(Boolean).join('\n')
 }
@@ -425,6 +501,9 @@ export async function POST(req: NextRequest) {
     ? beforeMessages.find((message) => message.role === 'agent' && message.meta?.dispatchId === dispatchId)
     : null
   if (existingResponse) {
+    const restored = dispatchId
+      ? await restorePersistedDispatchOutcome({ taskId, agentId, dispatchId, boardId: board?.id })
+      : null
     return NextResponse.json({
       ok: true,
       deduplicated: true,
@@ -432,7 +511,7 @@ export async function POST(req: NextRequest) {
       userMessage: beforeMessages.find((message) => message.id === requestMessageId) || null,
       agentMessage: existingResponse,
       runtime,
-      canonicalWorkItem: buildCanonicalWorkItem(task),
+      canonicalWorkItem: buildCanonicalWorkItem(restored?.task || task),
     })
   }
 
@@ -441,18 +520,33 @@ export async function POST(req: NextRequest) {
     ? (task.comments || []).find((comment) => comment.id === resultCommentId)
     : null
   if (existingResultComment) {
+    const restored = dispatchId
+      ? await restorePersistedDispatchOutcome({ taskId, agentId, dispatchId, boardId: board?.id })
+      : null
     const recoveredText = existingResultComment.text.replace(/^Agent:\s*[^\n]+\n\n/i, '').trim()
+    const responseText = restored?.summary || recoveredText || existingResultComment.text
+    const executionStatus = restored?.evidence.status || 'responded'
     await upsertPersistedThreadMessage({
       messageId: resultMessageId,
       operatorId,
       agentId,
-      text: recoveredText || existingResultComment.text,
+      text: responseText,
       role: 'agent',
       taskId,
-      status: 'active',
+      status: executionStatus === 'blocked' || executionStatus === 'awaiting_input' ? 'blocked' : 'active',
       tags,
       routing,
-      meta: { source: messageSource, phase: 'response', dispatchId, recovered: true, responder: responderId, executionAgentId, provider: runtime.provider },
+      meta: {
+        source: messageSource,
+        phase: 'response',
+        dispatchId,
+        recovered: true,
+        responder: responderId,
+        executionAgentId,
+        provider: runtime.provider,
+        executionStatus,
+        evidence: restored?.evidence.changes || [],
+      },
     })
     const recoveredThread = await getPersistedThread({ operatorId, agentId, taskId })
     const recoveredMessages = (Array.isArray(recoveredThread?.messages) ? recoveredThread.messages : []) as Array<{
@@ -468,7 +562,7 @@ export async function POST(req: NextRequest) {
       userMessage: recoveredMessages.find((message) => message.id === requestMessageId) || null,
       agentMessage: recoveredMessages.find((message) => message.id === resultMessageId) || null,
       runtime,
-      canonicalWorkItem: buildCanonicalWorkItem(task),
+      canonicalWorkItem: buildCanonicalWorkItem(restored?.task || task),
     })
   }
 
@@ -517,13 +611,16 @@ export async function POST(req: NextRequest) {
   const taskContext = buildTaskContext(task, agentId, durableAgentContext)
 
   let responseText = ''
+  let executionPlan: AgentTaskExecutionPlan | undefined
   try {
+    const mode = worker && dispatchId ? 'task-execution' as const : 'conversation' as const
     if (runtime.provider === 'openai') {
       responseText = await runOpenAIAgent({
         agentId,
         taskContext,
         userText: text,
         conversation,
+        mode,
       })
     } else if (runtime.provider === 'openai-codex') {
       responseText = await runChatGPTAgent({
@@ -533,9 +630,25 @@ export async function POST(req: NextRequest) {
         taskContext,
         userText: text,
         conversation,
+        mode,
       })
     } else {
-      responseText = await runOpenClawAgent(executionAgentId, `${taskContext}\n\nOperator request:\n${text}`)
+      const executionContract = mode === 'task-execution'
+        ? '\n\nReturn one JSON object with status, summary, nextAction, waitingOn, blocker, descriptionUpdate, checklistAdd, and learned. Status must be triaged, awaiting_input, or blocked. Do not claim unavailable external work.'
+        : ''
+      responseText = await runOpenClawAgent(executionAgentId, `${taskContext}\n\nOperator request:\n${text}${executionContract}`)
+    }
+    if (mode === 'task-execution') {
+      executionPlan = parseAgentTaskExecutionPlan(responseText)
+      responseText = formatAgentTaskExecutionResult(agentId, {
+        status: executionPlan.status,
+        summary: executionPlan.summary,
+        nextAction: executionPlan.nextAction,
+        waitingOn: executionPlan.waitingOn,
+        blocker: executionPlan.blocker,
+        changes: [],
+        learned: executionPlan.learned,
+      })
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Agent execution failed'
@@ -569,6 +682,15 @@ export async function POST(req: NextRequest) {
   }
 
   const completedAt = new Date().toISOString()
+  const recorded = await recordAgentResult({
+    taskId,
+    agentId,
+    summary: responseText,
+    boardId: board?.id,
+    dispatchId,
+    plan: executionPlan,
+  })
+  responseText = recorded.summary
   if (isPostgresTaskStoreEnabled()) {
     try {
       await captureAgentLearning({ operatorId, agentId, responseText })
@@ -576,7 +698,6 @@ export async function POST(req: NextRequest) {
       console.error('[agent-threads] durable context write failed', error)
     }
   }
-  await recordAgentResult(taskId, agentId, responseText, board?.id, dispatchId)
   await recordExecutionTelemetry({
     runId,
     operatorId,
@@ -584,10 +705,11 @@ export async function POST(req: NextRequest) {
     agentId,
     provider: runtime.provider,
     model: runtime.model,
-    status: 'completed',
+    status: recorded.applied ? recorded.evidence?.status || 'responded' : 'stale',
     startedAt,
     completedAt,
     summary: responseText,
+    evidence: recorded.evidence?.changes || [],
     dispatchId,
     dispatchAttempt,
   }, true)
@@ -599,10 +721,23 @@ export async function POST(req: NextRequest) {
     text: responseText,
     role: 'agent',
     taskId,
-    status: 'active',
+    status: recorded.applied && (recorded.evidence?.status === 'blocked' || recorded.evidence?.status === 'awaiting_input')
+      ? 'blocked'
+      : 'active',
     tags,
     routing,
-    meta: { source: messageSource, phase: 'response', dispatchId, dispatchAttempt, responder: responderId, executionAgentId, provider: runtime.provider },
+    meta: {
+      source: messageSource,
+      phase: 'response',
+      dispatchId,
+      dispatchAttempt,
+      responder: responderId,
+      executionAgentId,
+      provider: runtime.provider,
+      executionStatus: recorded.applied ? recorded.evidence?.status || 'responded' : 'stale',
+      executionApplied: recorded.applied,
+      evidence: recorded.evidence?.changes || [],
+    },
   })
 
   const thread = await getPersistedThread({ operatorId, agentId, taskId })

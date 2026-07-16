@@ -44,7 +44,7 @@ function extractLineValue(text: string, prefixes: string[]): string | undefined 
       const re = new RegExp(`^${prefix}\\s*:`, 'i')
       if (re.test(line)) {
         const value = line.replace(re, '').trim()
-        if (value) return value
+        if (value && !/^(?:none|n\/?a|not applicable)$/i.test(value)) return value
       }
     }
   }
@@ -92,7 +92,16 @@ export function deriveCanonicalBlocker(task: Task): string | undefined {
 }
 
 export function deriveCanonicalLastConcreteAction(task: Task): string | undefined {
-  const result = (task.execution?.lastResult || {}) as { whatWasDone?: unknown; summary?: unknown; currentState?: unknown }
+  const result = (task.execution?.lastResult || {}) as {
+    type?: unknown
+    evidence?: unknown
+    whatWasDone?: unknown
+    summary?: unknown
+    currentState?: unknown
+  }
+  if (result.type === 'agent-task-execution' && Array.isArray(result.evidence) && result.evidence.length === 0) {
+    return undefined
+  }
   const fromResult = result.whatWasDone ?? result.summary ?? result.currentState
   if (typeof fromResult === 'string' && fromResult.trim()) return fromResult.trim()
 

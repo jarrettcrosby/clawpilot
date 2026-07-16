@@ -44,11 +44,16 @@ These are application roles, not separately created ChatGPT custom agents. Each 
 - Chat always has an explicit selected task and product agent. ClawPilot does not silently send a message against a hidden task.
 - Assignment creates durable dispatch work. A later signed-user card comment creates another dispatch only when it explicitly addresses the assigned agent.
 - The Railway worker claims dispatches, runs the selected role through the user's own ChatGPT/Codex authorization, and persists execution runs/results.
-- The agent reply is appended to the task thread.
-- A concrete `Remaining` action from the result becomes the task `nextAction`.
+- Autonomous dispatch uses a structured task-execution contract. The role can repair a missing or generic task description, add deduplicated checklist items, set the next action, and record a specific blocker or required operator input.
+- A substantive user-authored description is immutable to agent execution. Dispatch retries restore the already-persisted semantic result, and a stale dispatch cannot mutate a task after a newer assignment or comment has been queued.
+- The agent reply and the exact persisted mutations are appended to the task thread as evidence. A provider response with no mutation is reported as no deliverable changed.
+- A concrete `nextAction` from the structured result becomes the task `nextAction`.
 - Every successful role response uses `Changed`, `Remaining`, `Waiting on`, and `Learned`. `Learned` contains one reusable operating lesson or `none`.
 - Users can only see tasks and threads on boards they can access.
-- Agents can reply, analyze, and propose a next move, but they do not create project tasks. Any later write capability remains explicit, permission-checked, task-scoped, and auditable.
+- Conversation replies use `responded`; autonomous task planning uses `triaged`; missing operator data uses `awaiting_input`; and unavailable capabilities use `blocked`. A successful HTTP/provider dispatch never means the requested work is complete.
+- `completed` requires separate, persisted completion evidence. Transport success, prose, plans, suggestions, and a model's self-reported success cannot close a task.
+- The current in-app executor does not have repository, GitHub, deployment, browser, mail, calendar, or arbitrary CRM tools. Work requiring one of those capabilities must name the missing capability and remain blocked rather than simulate completion.
+- Repository implementation requires a separately authenticated, sandboxed Codex runner with repository scope and auditable GitHub writeback. The per-user ChatGPT device authorization used for role responses is not treated as repository authorization.
 - Dispatch failures remain visible and retryable; no timeout or provider failure may leave the interface in an indefinite sending state.
 
 ## Layered Context

@@ -20,7 +20,11 @@ Provide a user-owned pipeline workspace while preserving the Opportunities Sheet
 - Every active user receives a default pipeline space.
 - A pipeline owner can share view or edit access with another active user.
 - Railway Postgres stores ClawPilot-owned pipeline definitions, normalized rows, projections, sync outbox entries, and audit events.
+- Pipeline editors can create an opportunity from the Pipeline surface by selecting an existing customer organization or creating that customer organization inline. The opportunity is immediately written to the tenant-scoped CRM tables in Postgres and queued for SuiteCRM synchronization.
+- ClawPilot opportunity creation and editing require caller-stable idempotency keys. Creates return the existing record without overwriting later edits, and edits use an atomic version check plus a durable replay receipt so concurrent writers cannot silently replace one another.
+- Opportunity edits and comments update the CRM record by its Postgres UUID. They never infer or increment a Google Sheet row number.
 - Only `Opportunities!B5:M` remains an operator-facing writable workbook table. CRM and reporting tabs are generated projections.
+- SuiteCRM/Postgres is the entity authority for app-created opportunities. Google Sheets remains an operator-editable input and reporting surface; synchronization projects changes in both directions through durable outboxes rather than competing direct writes.
 - Pull synchronization updates durable normalized rows and a read projection.
 - Push synchronization uses an outbox and worker heartbeat; the UI reports sync state instead of assuming a write succeeded.
 - New pipeline spaces are app-owned until their owner explicitly confirms the `provision-pipeline` workspace action.
@@ -72,6 +76,6 @@ The configured owner's historical default pipeline remains on the environment Sh
 
 ## Operational Check
 
-Use `/api/pipeline/sync-status` and the Railway health endpoint to verify the active projection and worker heartbeat after deployment.
+Use `/api/pipeline/sync-status` and the Railway health endpoint to verify the active projection and worker heartbeat after deployment. The sync-status response includes pending and failed CRM record counts so the application cannot report an app-created opportunity as synchronized before the SuiteCRM outbox succeeds.
 
 See [CRM and workbook reporting](crm-and-reporting.md) for CRM authority, entity mapping, migration, and workbook projection rules.

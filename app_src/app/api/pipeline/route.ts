@@ -1,11 +1,18 @@
 import { NextRequest, NextResponse } from 'next/server'
-import crypto from 'crypto'
+import crypto from 'node:crypto'
 import fs from 'fs'
 import path from 'path'
 import type { Task } from '@/lib/types'
 import { isCrmBoardCard } from '@/lib/crm/boardCard.mjs'
+import type { CrmContact, CrmOpportunity } from '@/lib/crm/types'
 import { buildCanonicalWorkItem } from '@/lib/workItemModel'
 import { shouldFallbackToFileOnDatabaseError } from '@/lib/persistence/config'
+import {
+  createCrmOpportunityInPostgres,
+  listCrmRecordsInPostgres,
+  readCrmRecordReference,
+  readCrmSummaryFromPostgres,
+} from '@/lib/persistence/crm'
 import { isPostgresTaskStoreEnabled, readTasksFromPostgres } from '@/lib/persistence/tasks'
 import { isPostgresPipelineStoreEnabled } from '@/lib/persistence/pipeline'
 import { requireRequestUser } from '@/lib/requestUser'
@@ -17,7 +24,6 @@ import {
   requireResourceEditor,
   resolvePipelineSpaceAccess,
   resolveProjectBoardAccess,
-  writeAppPipelineProjection,
   type PipelineSpace,
 } from '@/lib/tenancy'
 
@@ -60,6 +66,39 @@ function pipelineWorkItemsFromTasks(tasks: Task[]) {
     }))
 }
 
+function crmOpportunityForPipeline(
+  opportunity: CrmOpportunity,
+  contactsByOrganization: Map<string, CrmContact[]>,
+) {
+  const contacts = opportunity.organizationId
+    ? contactsByOrganization.get(opportunity.organizationId) || []
+    : []
+  return {
+    ...opportunity,
+    org: opportunity.organization,
+    closeDate: opportunity.expectedClose,
+    contacts: contacts.map((contact) => ({
+      id: contact.id,
+      name: contact.fullName,
+      phone: contact.phoneMobile || contact.phoneWork,
+      email: contact.email,
+      title: contact.jobTitle,
+    })),
+  }
+}
+
+function opportunityIdempotencyKey(req: NextRequest, pipelineId: string, actorEmail: string) {
+  const provided = String(req.headers.get('idempotency-key') || '').trim()
+  if (!provided) throw new Error('Idempotency-Key is required for opportunity creation')
+  if (provided.length > 200) throw new Error('Idempotency-Key must be 200 characters or fewer')
+  const digest = crypto
+    .createHash('sha256')
+    .update(`${pipelineId}\n${actorEmail.toLowerCase()}\n${provided}`)
+    .digest('hex')
+    .slice(0, 40)
+  return `app:opportunities:${digest}`
+}
+
 export async function GET(req: NextRequest) {
   let workItems: ReturnType<typeof pipelineWorkItemsFromTasks> = []
   try {
@@ -85,15 +124,43 @@ export async function GET(req: NextRequest) {
 
     if (isPostgresPipelineStoreEnabled()) {
       try {
-        const projection = selectedPipeline ? await readPipelineProjectionForSpace(selectedPipeline) : null
-        if (projection) {
+        if (selectedPipeline) {
+          const [projection, opportunities, contacts, crmSummary] = await Promise.all([
+            readPipelineProjectionForSpace(selectedPipeline),
+            listCrmRecordsInPostgres({
+              pipelineId: selectedPipeline.id,
+              entity: 'opportunities',
+              limit: 1000,
+            }) as Promise<CrmOpportunity[]>,
+            listCrmRecordsInPostgres({
+              pipelineId: selectedPipeline.id,
+              entity: 'contacts',
+              limit: 1000,
+            }) as Promise<CrmContact[]>,
+            readCrmSummaryFromPostgres(selectedPipeline.id),
+          ])
+          const contactsByOrganization = new Map<string, CrmContact[]>()
+          for (const contact of contacts) {
+            if (!contact.organizationId) continue
+            const current = contactsByOrganization.get(contact.organizationId) || []
+            current.push(contact)
+            contactsByOrganization.set(contact.organizationId, current)
+          }
           return NextResponse.json({
             syncedAt: projection.syncedAt || null,
-            summary: projection.summary || { opportunities: 0, organizations: 0, contacts: 0, totalOpenValue: 0 },
-            opportunities: Array.isArray(projection.opportunities) ? projection.opportunities : [],
+            summary: {
+              opportunities: crmSummary.opportunities,
+              organizations: crmSummary.organizations,
+              contacts: crmSummary.contacts,
+              totalOpenValue: crmSummary.openPipelineValue,
+              weightedPipelineValue: crmSummary.weightedPipelineValue,
+              pendingSync: crmSummary.pendingSync,
+              failedSync: crmSummary.failedSync,
+            },
+            opportunities: opportunities.map((opportunity) => crmOpportunityForPipeline(opportunity, contactsByOrganization)),
             workItems,
             storage: 'postgres',
-            pipeline: selectedPipeline ? {
+            pipeline: {
               id: selectedPipeline.id,
               name: selectedPipeline.name,
               ownerEmail: selectedPipeline.ownerEmail,
@@ -103,7 +170,7 @@ export async function GET(req: NextRequest) {
               shortLinkUrl: selectedPipeline.shortLinkUrl,
               provisioningStatus: selectedPipeline.provisioningStatus,
               provisioningError: selectedPipeline.provisioningError,
-            } : null,
+            },
           })
         }
       } catch (error) {
@@ -151,55 +218,73 @@ export async function POST(req: NextRequest) {
   try {
     const actor = await requireRequestUser(req)
     const selected = req.cookies.get(PIPELINE_SELECTION_COOKIE)?.value || undefined
-    const pipeline = await resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: selected })
-      .catch(() => resolvePipelineSpaceAccess({ actorEmail: actor.email }))
+    const pipeline = selected
+      ? await resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: selected })
+      : await resolvePipelineSpaceAccess({ actorEmail: actor.email })
     requireResourceEditor(pipeline)
-    if (pipeline.syncEnabled) {
-      return NextResponse.json({ ok: false, error: 'Create sheet-backed opportunities in the connected operator sheet' }, { status: 409 })
-    }
 
     const body = await req.json()
     const name = String(body?.name || '').trim()
-    const organization = String(body?.organization || body?.org || '').trim()
-    if (!name || !organization) {
-      return NextResponse.json({ ok: false, error: 'Opportunity name and organization are required' }, { status: 400 })
+    const organizationId = String(body?.organizationId || '').trim()
+    if (!name || !organizationId) {
+      return NextResponse.json({ ok: false, error: 'Opportunity name and a CRM organization are required' }, { status: 400 })
     }
-    const now = new Date().toISOString()
+    const organizationRecord = await readCrmRecordReference({
+      pipelineId: pipeline.id,
+      entity: 'organizations',
+      id: organizationId,
+    })
+    const organization = String(organizationRecord.name || '').trim()
+    if (!organization) throw new Error('The selected CRM organization has no name')
+
     const value = Number.isFinite(Number(body?.value)) ? Math.max(0, Number(body.value)) : 0
     const probability = Number.isFinite(Number(body?.probability))
       ? Math.max(0, Math.min(100, Number(body.probability)))
       : 0
-    const opportunity = {
-      id: `opp_${crypto.randomUUID()}`,
-      name,
-      organization,
-      org: organization,
-      priority: String(body?.priority || 'C'),
-      owner: String(body?.owner || actor.displayName || actor.email),
-      status: String(body?.status || 'Open'),
-      stage: String(body?.stage || 'Identified Lead'),
-      source: String(body?.source || ''),
-      value,
-      probability,
-      closeDate: String(body?.closeDate || ''),
-      notes: String(body?.notes || ''),
-      createdAt: now,
-      createdBy: actor.email,
-      updatedAt: now,
+    const sourceKey = opportunityIdempotencyKey(req, pipeline.id, actor.email)
+    const priority = String(body?.priority || 'C')
+    const owner = String(body?.owner || actor.displayName || actor.email)
+    const status = String(body?.status || 'Open')
+    const stage = String(body?.stage || 'Identified Lead')
+    const source = String(body?.source || '')
+    const expectedClose = String(body?.closeDate || body?.expectedClose || '')
+    const notes = String(body?.notes || '')
+    if (organizationRecord.relationshipType !== 'customer') {
+      throw new Error('Opportunities must be linked to a customer organization')
     }
-    const projection = await readPipelineProjectionForSpace(pipeline)
-    const opportunities = [...(Array.isArray(projection.opportunities) ? projection.opportunities : []), opportunity]
-    const closed = new Set(['abandoned', 'loss', 'closed', 'closed-lost', 'lost'])
-    const summary = {
-      ...projection.summary,
-      opportunities: opportunities.length,
-      organizations: new Set(opportunities.map((entry) => String(entry.organization || entry.org || '').trim()).filter(Boolean)).size,
-      totalOpenValue: Math.round(opportunities
-        .filter((entry) => !closed.has(String(entry.status || '').toLowerCase()))
-        .reduce((total, entry) => total + (Number(entry.value) || 0), 0) * 100) / 100,
-    }
-    await writeAppPipelineProjection(pipeline, { ...projection, syncedAt: now, source: 'app', summary, opportunities })
-    return NextResponse.json({ ok: true, opportunity }, { status: 201 })
+    const staged = await createCrmOpportunityInPostgres({
+      entity: 'opportunities',
+      pipelineId: pipeline.id,
+      sourceKey,
+      sourcePayload: { source: 'clawpilot-pipeline' },
+      actorEmail: actor.email,
+      fields: {
+        organizationId: organizationRecord.id,
+        organizationSuiteCrmId: organizationRecord.suiteCrmId,
+        name,
+        organization,
+        priority,
+        owner,
+        status,
+        stage,
+        source,
+        value,
+        probability,
+        expectedClose: expectedClose || null,
+        notes,
+      },
+    })
+    return NextResponse.json({
+      ok: true,
+      queued: staged.created,
+      replayed: !staged.created,
+      opportunity: crmOpportunityForPipeline(staged.opportunity, new Map()),
+      crm: {
+        id: staged.opportunity.id,
+        referenceCode: staged.opportunity.referenceCode,
+        syncStatus: staged.opportunity.syncStatus,
+      },
+    }, { status: staged.created ? 201 : 200 })
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unable to create opportunity'
     const status = message === 'Unauthorized' ? 401 : /denied|view-only/i.test(message) ? 403 : 400

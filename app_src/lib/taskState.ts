@@ -82,14 +82,16 @@ export function getTaskStartability(task: Task): TaskStartabilityResult {
   return { status: 'NOT_STARTABLE', state, reason: state }
 }
 
-export type ExecutionStatus = 'queued' | 'running' | 'blocked' | 'awaiting_input' | 'completed'
+export type ExecutionStatus = 'queued' | 'running' | 'triaged' | 'responded' | 'blocked' | 'awaiting_input' | 'completed'
 export const EXECUTION_LIFECYCLE = {
-  statuses: ['queued', 'running', 'blocked', 'awaiting_input', 'completed'] as ExecutionStatus[],
+  statuses: ['queued', 'running', 'triaged', 'responded', 'blocked', 'awaiting_input', 'completed'] as ExecutionStatus[],
   transitions: {
-    queued: ['running', 'blocked', 'awaiting_input', 'completed'],
-    running: ['blocked', 'awaiting_input', 'completed'],
-    blocked: ['running', 'awaiting_input', 'completed'],
-    awaiting_input: ['running', 'blocked', 'completed'],
+    queued: ['running', 'triaged', 'responded', 'blocked', 'awaiting_input', 'completed'],
+    running: ['triaged', 'responded', 'blocked', 'awaiting_input', 'completed'],
+    triaged: ['running', 'responded', 'blocked', 'awaiting_input', 'completed'],
+    responded: ['running', 'triaged', 'blocked', 'awaiting_input', 'completed'],
+    blocked: ['running', 'triaged', 'responded', 'awaiting_input', 'completed'],
+    awaiting_input: ['running', 'triaged', 'responded', 'blocked', 'completed'],
     completed: [],
   } as Record<ExecutionStatus, ExecutionStatus[]>,
 }

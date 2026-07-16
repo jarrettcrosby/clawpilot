@@ -89,7 +89,7 @@ async function markDispatchState(
   })
 }
 
-async function executeDispatch(item: AgentDispatchOutboxItem) {
+async function executeDispatch(item: AgentDispatchOutboxItem, onResultPersisted: () => void) {
   await markDispatchState(item, 'running')
   await internalJson({
     item,
@@ -104,6 +104,7 @@ async function executeDispatch(item: AgentDispatchOutboxItem) {
       dispatchAttempt: item.attempts,
     },
   })
+  onResultPersisted()
   await markDispatchState(item, 'succeeded')
 }
 
@@ -121,8 +122,9 @@ export async function processAgentDispatchOutbox(input: {
   const results: Array<{ id: string; trigger: string; status: 'succeeded' | 'failed' | 'dead' }> = []
 
   for (const item of items) {
+    let resultPersisted = false
     try {
-      await executeDispatch(item)
+      await executeDispatch(item, () => { resultPersisted = true })
       await completeAgentDispatchOutboxInPostgres(item)
       results.push({ id: item.dispatchId, trigger: item.trigger, status: 'succeeded' })
       continue
@@ -133,10 +135,12 @@ export async function processAgentDispatchOutbox(input: {
         error: message,
         maxAttempts: isPermanentFailure(error) ? item.attempts : maxAttempts,
       })
-      try {
-        await markDispatchState(item, status === 'dead' ? 'failed' : 'queued', message)
-      } catch (stateError) {
-        console.error('[agent-dispatch] unable to record task dispatch state', stateError)
+      if (!resultPersisted) {
+        try {
+          await markDispatchState(item, status === 'dead' ? 'failed' : 'queued', message)
+        } catch (stateError) {
+          console.error('[agent-dispatch] unable to record task dispatch state', stateError)
+        }
       }
       results.push({ id: item.dispatchId, trigger: item.trigger, status })
     }
