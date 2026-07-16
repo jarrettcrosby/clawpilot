@@ -1,7 +1,10 @@
 ---
+id: cp-incident-2026-03-20-stable-build-integrity
 title: 2026-03-20 Stable Build Integrity Outage
+summary: Historical evidence for the committed-files-only build and release-safety control.
 status: historical
 kind: incident
+area: operations
 tags: [incident, build, deployment, rollback]
 app_visible: true
 ---

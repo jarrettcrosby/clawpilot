@@ -28,6 +28,7 @@ import {
   ensurePrimaryWorkspaceOrganization,
   workspaceOrganizationAncestors,
 } from '@/lib/organizations'
+import { recordAuditEvent } from '@/lib/auditWriter'
 import { requireActiveAppUser } from '@/lib/users'
 import { zonedDateTimeToIso } from '@/lib/zonedDateTime'
 
@@ -447,7 +448,7 @@ async function enqueueSuiteCrmRecord(
   suiteCrmId: string,
   referenceCode: string,
   sourceHash: string,
-) {
+): Promise<string | null> {
   const relationships = await suiteCrmRelationships(client, input)
   const payload: SuiteCrmOutboxRecord = {
     entity: input.entity,
@@ -457,7 +458,8 @@ async function enqueueSuiteCrmRecord(
     attributes: suiteCrmAttributes(input, referenceCode),
     ...(relationships.length > 0 ? { relationships } : {}),
   }
-  await client.query(
+  const idempotencyKey = `crm:${input.entity}:v3:${localId}:${sourceHash}`
+  const inserted = await client.query<{ idempotency_key: string }>(
     `
       INSERT INTO sync_outbox (
         aggregate_type, aggregate_id, operation, target_system, payload,
@@ -466,15 +468,17 @@ async function enqueueSuiteCrmRecord(
       VALUES ($1, $2, 'upsert_record', 'suitecrm', $3::jsonb, 'queued', $4, now(), now(), now())
       ON CONFLICT (target_system, idempotency_key)
       WHERE idempotency_key IS NOT NULL
-      DO UPDATE SET updated_at = sync_outbox.updated_at
+      DO NOTHING
+      RETURNING idempotency_key
     `,
     [
       `crm_${input.entity}`,
       localId,
       JSON.stringify(payload),
-      `crm:${input.entity}:v3:${localId}:${sourceHash}`,
+      idempotencyKey,
     ],
   )
+  return inserted.rows[0]?.idempotency_key || null
 }
 
 async function applyWorkspaceOrganizationIdentity(
@@ -1169,8 +1173,16 @@ export async function stageCrmRecordWithClient(client: PoolClient, rawInput: Sta
       row = await stageInteraction(client, input, suiteCrmId, sourceHash)
       break
   }
+  let suiteCrmOutboxKey: string | null = null
   if (input.emitSuiteCrmOutbox !== false) {
-    await enqueueSuiteCrmRecord(client, input, row.id, row.suitecrm_id, row.reference_code, sourceHash)
+    suiteCrmOutboxKey = await enqueueSuiteCrmRecord(
+      client,
+      input,
+      row.id,
+      row.suitecrm_id,
+      row.reference_code,
+      sourceHash,
+    )
   } else {
     const table = ENTITY_TABLE[input.entity]
     await client.query(
@@ -1188,17 +1200,22 @@ export async function stageCrmRecordWithClient(client: PoolClient, rawInput: Sta
     referenceCode: row.reference_code,
     title: title || row.reference_code,
   })
-  await client.query(
-    `INSERT INTO audit_events (actor, event_type, aggregate_type, aggregate_id, payload)
-     VALUES ($1, 'crm.record.staged', $2, $3, $4::jsonb)`,
-    [input.actorEmail, `crm_${input.entity}`, row.id, JSON.stringify({
-      pipelineId: input.pipelineId,
-      sourceKey,
-      referenceCode: row.reference_code,
-      recordTitle: title || row.reference_code,
-      message: `${title || row.reference_code} queued for CRM synchronization`,
-    })],
-  )
+  if (suiteCrmOutboxKey) {
+    await recordAuditEvent({
+      actor: input.actorEmail,
+      eventType: 'crm.record.staged',
+      aggregateType: `crm_${input.entity}`,
+      aggregateId: row.id,
+      eventKey: `crm-stage:${suiteCrmOutboxKey}`,
+      payload: {
+        pipelineId: input.pipelineId,
+        sourceKey,
+        referenceCode: row.reference_code,
+        recordTitle: title || row.reference_code,
+        message: `${title || row.reference_code} queued for CRM synchronization`,
+      },
+    }, client)
+  }
   return {
     id: row.id,
     suiteCrmId: row.suitecrm_id,

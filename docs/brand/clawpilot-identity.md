@@ -1,7 +1,10 @@
 ---
+id: cp-brand-identity
 title: ClawPilot Identity
+summary: Canonical product identity, visual assets, and color roles for ClawPilot surfaces.
 status: active
 kind: brand-contract
+area: brand
 tags: [brand, logo, interface, email]
 app_visible: true
 ---

@@ -8,9 +8,11 @@ import Typography from '@mui/material/Typography';
 import MenuRounded from '@mui/icons-material/MenuRounded';
 import CloseRounded from '@mui/icons-material/CloseRounded';
 import RefreshRounded from '@mui/icons-material/RefreshRounded';
+import AddRounded from '@mui/icons-material/AddRounded';
 import Alert from '@mui/material/Alert';
 import DocSidebar from './DocSidebar';
 import DocViewer from './DocViewer';
+import DocGeneratorDialog from './DocGeneratorDialog';
 
 type Doc = {
   id: string;
@@ -34,11 +36,12 @@ export default function DocsSection() {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [error, setError] = useState('');
   const [search, setSearch] = useState('');
+  const [generatorOpen, setGeneratorOpen] = useState(false);
   const requestSequence = useRef(0)
   const requestController = useRef<AbortController | null>(null)
   const initialDeepLinkHandled = useRef(false)
 
-  async function loadDocs(method: 'GET' | 'POST' = 'GET', query = search) {
+  async function loadDocs(method: 'GET' | 'POST' = 'GET', query = search, preferredId?: string) {
     const sequence = requestSequence.current + 1
     requestSequence.current = sequence
     requestController.current?.abort()
@@ -65,7 +68,8 @@ export default function DocsSection() {
       const preferred = docParam
         ? nextDocs.find(d => d.slug === docParam || d.id === docParam) || null
         : null
-      setSelectedDoc((current) => (current ? nextDocs.find(doc => doc.id === current.id) : null)
+      setSelectedDoc((current) => (preferredId ? nextDocs.find(doc => doc.id === preferredId) : null)
+        || (current ? nextDocs.find(doc => doc.id === current.id) : null)
         || preferred
         || nextDocs[0]
         || null)
@@ -100,6 +104,12 @@ export default function DocsSection() {
       window.history.replaceState(null, '', `${url.pathname}${url.search}${url.hash}`)
     }
   };
+
+  async function handleGenerated(document: { id: string }) {
+    setGeneratorOpen(false)
+    setSearch('')
+    await loadDocs('GET', '', document.id)
+  }
 
   return (
     <Box
@@ -144,6 +154,7 @@ export default function DocsSection() {
           selectedId={selectedDoc?.id ?? null}
           onSelect={selectDoc}
           onRefresh={() => void loadDocs('POST', search)}
+          onCreate={() => setGeneratorOpen(true)}
           refreshing={loading}
           search={search}
           onSearch={setSearch}
@@ -165,6 +176,7 @@ export default function DocsSection() {
           selectedId={selectedDoc?.id ?? null}
           onSelect={selectDoc}
           onRefresh={() => void loadDocs('POST', search)}
+          onCreate={() => setGeneratorOpen(true)}
           refreshing={loading}
           search={search}
           onSearch={setSearch}
@@ -229,10 +241,18 @@ export default function DocsSection() {
             {selectedDoc?.title || 'Docs'}
           </Typography>
           <IconButton
+            aria-label="New document"
+            onClick={() => setGeneratorOpen(true)}
+            disabled={loading}
+            sx={{ color: 'text.secondary', ml: 'auto' }}
+          >
+            <AddRounded />
+          </IconButton>
+          <IconButton
             aria-label="Refresh document briefs"
             onClick={() => void loadDocs('POST', search)}
             disabled={loading}
-            sx={{ color: 'text.secondary', ml: 'auto' }}
+            sx={{ color: 'text.secondary' }}
           >
             <RefreshRounded />
           </IconButton>
@@ -241,6 +261,11 @@ export default function DocsSection() {
           <DocViewer doc={selectedDoc} loading={loading} />
         </Box>
       </Box>
+      <DocGeneratorDialog
+        open={generatorOpen}
+        onClose={() => setGeneratorOpen(false)}
+        onGenerated={handleGenerated}
+      />
     </Box>
   );
 }

@@ -118,6 +118,15 @@ type AgentTurnInput = {
   conversation?: Array<{ role: string; text: string }>
 }
 
+export function stableAgentProfileId(operatorId: string, agentId: ProductAgentId): string {
+  const digest = crypto
+    .createHash('sha256')
+    .update(`${String(operatorId || '').trim().toLowerCase()}\n${agentId}`)
+    .digest('hex')
+    .slice(0, 24)
+  return `clawpilot_${agentId}_${digest}`
+}
+
 function buildAgentPrompt(input: AgentTurnInput): string {
   const history = (input.conversation || [])
     .slice(-8)
@@ -127,7 +136,9 @@ function buildAgentPrompt(input: AgentTurnInput): string {
     `Task context:\n${input.taskContext}`,
     history ? `Recent task thread:\n${history}` : null,
     `Operator request:\n${input.userText}`,
-    'Reply using exactly these headings: Changed, Remaining, Waiting on. Use "none" when there is no blocker. Do not claim an external action unless the supplied context proves it occurred.',
+    'Reply using exactly these headings: Changed, Remaining, Waiting on, Learned.',
+    'Learned must contain one reusable operating lesson from this work, or "none". Keep it generic and exclude names, organizations, emails, IDs, URLs, customer data, and task-specific facts.',
+    'Use "none" when there is no blocker. Do not claim an external action unless the supplied context proves it occurred.',
   ].filter(Boolean).join('\n\n')
 }
 
@@ -181,11 +192,7 @@ export async function runChatGPTAgent(input: AgentTurnInput & {
     throw new Error('Connect ChatGPT before sending an agent message')
   }
   const prompt = buildAgentPrompt(input)
-  const sessionId = `clawpilot_${crypto
-    .createHash('sha256')
-    .update(`${input.operatorId}\n${input.agentId}\n${input.taskId}`)
-    .digest('hex')
-    .slice(0, 32)}`
+  const sessionId = stableAgentProfileId(input.operatorId, input.agentId)
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), 120_000)
 

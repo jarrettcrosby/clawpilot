@@ -1,7 +1,10 @@
 ---
+id: cp-module-short-links
 title: Shared Short Links
+summary: Organization-scoped short-link ownership, slugs, limits, lifecycle, search, and cross-application use.
 status: active
 kind: module-contract
+area: links
 tags: [links, redirects, eigenracing, tenancy]
 app_visible: true
 ---

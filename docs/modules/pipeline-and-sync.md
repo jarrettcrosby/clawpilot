@@ -1,7 +1,10 @@
 ---
+id: cp-module-pipeline-sync
 title: Pipeline and Synchronization
+summary: Personal and shared pipelines, managed Google Sheets, projections, outboxes, permissions, and synchronization lifecycle.
 status: active
 kind: module-contract
+area: pipeline
 tags: [pipeline, google-drive, google-sheets, outbox, provisioning, projections, crm]
 app_visible: true
 ---

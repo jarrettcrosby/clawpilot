@@ -1,7 +1,10 @@
 ---
+id: cp-ops-environments
 title: ClawPilot Environments and Deployment
+summary: Canonical repository, branches, local startup, hosted topology, validation gates, promotion, verification, and rollback.
 status: active
 kind: operations-contract
+area: operations
 tags: [deployment, railway, vercel, github, environments]
 app_visible: true
 ---

@@ -1,7 +1,10 @@
 ---
+id: cp-ops-chatgpt-agent-auth
 title: ChatGPT Agent Authorization
+summary: Per-user Codex device authorization, credential isolation, environment requirements, and product-agent mapping.
 status: active
 kind: operations-runbook
+area: operations
 tags: [chatgpt, codex, oauth, credentials, agents]
 app_visible: false
 ---
@@ -49,5 +52,7 @@ The Codex backend and OAuth client behavior must be regression-tested during Ope
 ## Product Agent Mapping
 
 ClawPilot defines five product profiles: Projects, Pipeline, Docs, Calendar, and ClawPilot. Each profile contributes a distinct instruction and routing context, but all five use the initiating ClawPilot user's connected ChatGPT/Codex authorization. They are not separate Custom GPT objects in the user's ChatGPT sidebar.
+
+The profile identity is deterministic for the normalized ClawPilot email and role, so the same user returns to the same logical agent across tasks. Provider requests remain stateless with `store: false`; the profile key is a cache boundary, not durable provider memory. ClawPilot reconstructs every prompt from the versioned role instruction, selected task thread, that user's private role memory, and active privacy-gated shared role principles. New users receive this mapping automatically when they connect their own ChatGPT account.
 
 Task assignment and explicit `@Agent` card comments enqueue durable Postgres dispatch records. The Railway worker restores the initiating user's session and selected board, executes against that user's credential, retries transient failures, and writes the result to both the user's private task thread and the shared card.

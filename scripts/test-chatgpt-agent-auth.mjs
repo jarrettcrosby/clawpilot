@@ -74,6 +74,11 @@ for (const fragment of [
 }
 assert.ok(!authSource.includes('console.'))
 
+const providerSource = read('app_src/lib/agents/provider.ts')
+assert.ok(providerSource.includes('stableAgentProfileId(input.operatorId, input.agentId)'))
+assert.ok(providerSource.includes('return `clawpilot_${agentId}_${digest}`'))
+assert.ok(!providerSource.includes('`${input.operatorId}\\n${input.agentId}\\n${input.taskId}`'))
+
 const credentialStoreSource = read('app_src/lib/persistence/agentCredentials.ts')
 for (const fragment of [
   'AGENT_CREDENTIAL_DATABASE_URL',

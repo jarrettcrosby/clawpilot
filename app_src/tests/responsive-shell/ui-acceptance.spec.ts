@@ -268,6 +268,66 @@ test('responsive shell: 390x844 exposes compact navigation and dismissible drawe
   await expectNoHorizontalOverflow(page)
 })
 
+test('docs generate a user-scoped pipeline snapshot from the mobile toolbar', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 })
+  const generatedDocument = {
+    id: 'generated-pipeline-document',
+    title: 'Pipeline Brief - Jul 15, 2026, 10:15 PM',
+    category: 'pipeline',
+    date: '2026-07-15',
+    slug: 'pipeline-brief-2026-07-15-test',
+    tags: ['pipeline', 'generated-on-demand'],
+    status: 'generated',
+    source: 'user',
+    content: '# Pipeline Brief\n\nGenerated from My pipeline.',
+  }
+  let documents = [{
+    id: 'canonical-pipeline-document',
+    title: 'Pipeline Brief',
+    category: 'pipeline',
+    date: '2026-07-15',
+    slug: 'pipeline-brief',
+    tags: ['pipeline'],
+    status: 'generated',
+    source: 'system',
+    content: '# Pipeline Brief\n\nCurrent pipeline.',
+  }]
+  let generatedPayload: Record<string, unknown> | null = null
+
+  await page.route((url) => url.pathname === '/api/docs', (route) => route.fulfill({ json: documents }))
+  await page.route((url) => url.pathname === '/api/workspaces', (route) => route.fulfill({
+    json: {
+      ok: true,
+      boards: [{ id: 'board-1', name: 'ClawPilot board' }],
+      pipelines: [{ id: 'pipeline-1', name: 'My pipeline' }],
+      selectedBoardId: 'board-1',
+      selectedPipelineId: 'pipeline-1',
+    },
+  }))
+  await page.route((url) => url.pathname === '/api/docs/generate', async (route) => {
+    generatedPayload = route.request().postDataJSON() as Record<string, unknown>
+    documents = [generatedDocument, ...documents]
+    await route.fulfill({ status: 201, json: { ok: true, document: generatedDocument } })
+  })
+
+  await gotoApp(page, '/#docs')
+  await page.getByRole('button', { name: 'New document' }).click()
+  await expect(page.getByRole('heading', { name: 'New document' })).toBeVisible()
+  await page.getByLabel('Document type').click()
+  await page.getByRole('option', { name: 'Pipeline report' }).click()
+  await expect(page.getByRole('combobox', { name: 'Pipeline' })).toHaveText(/My pipeline/)
+  await page.getByRole('button', { name: 'Generate' }).click()
+
+  await expect.poll(() => generatedPayload).toEqual({
+    kind: 'pipeline-report',
+    boardId: 'board-1',
+    pipelineId: 'pipeline-1',
+  })
+  await expect(page.getByRole('heading', { name: generatedDocument.title })).toBeVisible()
+  await expect(page.getByText('Generated from My pipeline.')).toBeVisible()
+  await expectNoHorizontalOverflow(page)
+})
+
 test('projects workspace actions stay fully visible on narrow portrait screens', async ({ page }) => {
   await page.route('**/api/workspaces', (route) => route.fulfill({
     json: {

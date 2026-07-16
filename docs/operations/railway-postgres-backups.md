@@ -1,7 +1,10 @@
 ---
+id: cp-ops-railway-backups
 title: Railway Postgres Backups
+summary: Provider backup policy, verified snapshots, logical exports, restore drills, and recovery evidence.
 status: active
 kind: operations-runbook
+area: operations
 tags: [railway, postgres, backups, restore, pitr]
 app_visible: false
 ---

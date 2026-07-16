@@ -1,7 +1,10 @@
 ---
+id: cp-ops-google-workspace
 title: Google Workspace Integration
+summary: Google service-account ownership, Shared Drive setup, managed folder conventions, application configuration, and rotation.
 status: active
 kind: operations-runbook
+area: operations
 tags: [google-workspace, drive, sheets, service-account, credentials]
 app_visible: false
 ---

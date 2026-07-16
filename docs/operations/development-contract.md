@@ -1,7 +1,10 @@
 ---
+id: cp-legacy-development-contract
 title: Historical Development Contract Pointer
+summary: Compatibility pointer from the retired local development contract to current repository and environment rules.
 status: superseded
 kind: compatibility-pointer
+area: archive
 tags: [historical, compatibility, development]
 app_visible: false
 ---

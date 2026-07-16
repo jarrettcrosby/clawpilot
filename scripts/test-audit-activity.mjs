@@ -43,6 +43,19 @@ for (const fragment of ['subject, organization_id, is_system', 'ON CONFLICT (eve
 const crmAdapter = read('app_src/lib/persistence/crm.ts')
 assert.ok(crmAdapter.includes('referenceCode: row.reference_code'), 'CRM audit rows must carry the navigable Global ID')
 assert.ok(crmAdapter.includes('recordTitle: title || row.reference_code'), 'CRM audit rows must carry a readable target label')
+assert.ok(crmAdapter.includes('DO NOTHING\n      RETURNING idempotency_key'), 'CRM restaging must observe whether new SuiteCRM work was queued')
+assert.ok(crmAdapter.includes('if (suiteCrmOutboxKey)'), 'CRM audit rows must only be written for actual outbox inserts')
+assert.ok(crmAdapter.includes('eventKey: `crm-stage:${suiteCrmOutboxKey}`'), 'CRM queue audit rows need deterministic event keys')
+
+const crmAuditDedupe = read('db/migrations/0038_dedupe_crm_stage_audit.sql')
+for (const fragment of [
+  "event.event_type = 'crm.record.staged'",
+  "outbox.target_system = 'suitecrm'",
+  "outbox.operation = 'upsert_record'",
+  "event_key = 'crm-stage:' || keeper.idempotency_key",
+]) {
+  assert.ok(crmAuditDedupe.includes(fragment), `CRM audit dedupe migration missing ${fragment}`)
+}
 
 const authAudit = read('app_src/lib/authAudit.ts')
 assert.ok(authAudit.includes('actor: authenticatedActor ? email : null'), 'unverified login claims cannot be recorded as authenticated actors')

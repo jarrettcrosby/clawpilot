@@ -1,7 +1,10 @@
 ---
+id: cp-vault-map
 title: ClawPilot Vault Map
+summary: Human entry point for the canonical repository vault and its current contracts, maps, operations, and history.
 status: active
 kind: vault-map
+area: knowledge
 tags: [clawpilot, documentation, navigation, obsidian]
 app_visible: false
 ---
@@ -9,6 +12,24 @@ app_visible: false
 # ClawPilot Vault Map
 
 Open the repository root, not the `docs/` folder, as the Obsidian vault. Start with the [canonical knowledge index](index.md). Portable vault settings are committed; window layout, hotkeys, themes, and community plugins remain local.
+
+## Maps Of Content
+
+- [ClawPilot context map](maps/context-map.md)
+- [Product map](maps/product-map.md)
+- [Platform and data map](maps/platform-data-map.md)
+- [Operations map](maps/operations-map.md)
+- [Evolution map](maps/evolution-map.md)
+
+Maps connect topics across folders. The repository uses PARA semantics rather than a disruptive PARA folder migration: active board and release work is Projects, module and operating contracts are Areas, maps, decisions, brand, and research are Resources, and retained incidents plus Git history are Archive.
+
+### Accepted Decisions
+
+- [Decision index](decisions/index.md)
+- [Postgres and Sheets authority](decisions/0001-postgres-and-sheets-authority.md)
+- [Organization-rooted tenancy](decisions/0002-organization-rooted-tenancy.md)
+- [CRM Global Identity and synchronization](decisions/0003-crm-global-identity-and-sync.md)
+- [Local-first knowledge retrieval](decisions/0004-local-first-knowledge-retrieval.md)
 
 ## Current Contracts
 
@@ -44,11 +65,13 @@ The active module contracts above are the current product and architecture surfa
 
 Use this order to understand progress without reconstructing it from dated worklogs:
 
-1. Read the relevant active module contract for current behavior.
-2. Read the [environment contract](operations/clawpilot-environments.md) for the deployed topology and validation gates.
-3. Read the [release contract](releases/README.md) and [release catalog](releases/catalog.json) for user-facing shipped changes.
-4. Use the in-app Versions surface for durable environment-specific releases and checkpoints.
-5. Use GitHub pull requests and Git history for implementation-level evidence.
+1. Start with the [context map](maps/context-map.md) when the question spans modules.
+2. Read the relevant active module contract for current behavior.
+3. Read a decision record when the reason or tradeoff matters.
+4. Read the [environment contract](operations/clawpilot-environments.md) for the deployed topology and validation gates.
+5. Read the [release contract](releases/README.md) and [release catalog](releases/catalog.json) for user-facing shipped changes.
+6. Use the in-app Versions surface for durable environment-specific releases and checkpoints.
+7. Use GitHub pull requests and Git history for implementation-level evidence.
 
 ## Historical Archive
 
@@ -56,8 +79,8 @@ Retain historical Markdown only when the event itself has continuing operational
 
 ## App Search Flow
 
-The configured owner receives the repository catalog in ClawPilot Docs; other users receive only their own generated and user-owned documents. A changed repository note is stored in Postgres, indexed for full-text search, and queued for a 256-dimension vector. Knowledge defaults to Local with no external content transfer or embedding-provider cost. The owner can select External in **Settings > Integrations > Knowledge** only after a dedicated `OPENAI_EMBEDDING_API_KEY` is configured; external mode sends document content and semantic search input to OpenAI. See [Knowledge vault organization](operations/knowledge-vault-organization.md) for the complete flow.
+The configured owner receives notes explicitly marked `app_visible: true` in ClawPilot Docs; other users receive only their own generated and user-owned documents. A changed repository note is stored in Postgres, indexed for full-text search, and queued for a 256-dimension vector. Knowledge defaults to Local with no external content transfer or embedding-provider cost. The owner can select External in **Settings > Integrations > Knowledge** only after a dedicated `OPENAI_EMBEDDING_API_KEY` is configured; external mode sends document content and semantic search input to OpenAI. See [Knowledge vault organization](operations/knowledge-vault-organization.md) for the complete flow.
 
 ## Authoring Rule
 
-Every implementation and release updates its owning active contract and release copy as part of the work, without waiting for an operator prompt. Do not create another top-level progress log. Add a dated incident or audit only when the evidence will remain useful. Run `npm run verify:docs` before committing documentation changes.
+Every implementation and release updates its owning active contract and release copy as part of the work, without waiting for an operator prompt. Temporary capture belongs in the [knowledge inbox](inbox/README.md) and must be refactored before promotion. Use the committed Obsidian templates for recurring note types. Do not create another top-level progress log. Add a decision, incident, or audit only when its evidence will remain useful. Run `npm run verify:docs` before committing documentation changes.

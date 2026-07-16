@@ -1,7 +1,10 @@
 ---
+id: cp-release-contract
 title: Release Documentation Contract
+summary: Required environment-specific release metadata, user-facing copy, access windows, and promotion evidence.
 status: active
 kind: release-contract
+area: releases
 tags: [releases, deployment, changelog]
 app_visible: true
 ---

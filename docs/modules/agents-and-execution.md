@@ -1,7 +1,10 @@
 ---
+id: cp-module-agents-execution
 title: Agents and Execution
+summary: Agent identities, user authorization, task routing, execution evidence, and writeback behavior.
 status: active
 kind: module-contract
+area: agents
 tags: [agents, chatgpt, codex, execution, tasks]
 app_visible: true
 ---
@@ -22,6 +25,13 @@ Route task-specific work to stable ClawPilot agent roles and write the result ba
 
 These are application roles, not separately created ChatGPT custom agents. Each role supplies a dedicated system instruction and task context to the authenticated user's Codex execution session. This avoids hidden external agent configuration while keeping role behavior consistent and reviewable in the repository.
 
+## Stable Identity and Automatic Provisioning
+
+- ClawPilot derives one stable profile ID from the normalized user email and role ID. The same user therefore returns to the same logical Projects, Pipeline, Docs, Calendar, or ClawPilot agent across tasks and sessions.
+- Every active user receives the same five role definitions automatically. Connecting ChatGPT authorizes execution for that user; it does not require an administrator to recreate agents in the user's ChatGPT account.
+- A profile ID is a ClawPilot identity and prompt-cache boundary, not an OpenAI-hosted custom GPT or durable provider-side conversation. ClawPilot sends the role instructions, current task, recent task thread, and durable context on every execution.
+- Role instructions are versioned in the application. A release can improve a role once and make that behavior available to every connected user without changing their private credentials or data.
+
 ## Authorization Boundary
 
 - Every ClawPilot user completes their own ChatGPT/Codex device authorization. The browser approval flow returns to ClawPilot after the user grants access.
@@ -36,9 +46,23 @@ These are application roles, not separately created ChatGPT custom agents. Each 
 - The Railway worker claims dispatches, runs the selected role through the user's own ChatGPT/Codex authorization, and persists execution runs/results.
 - The agent reply is appended to the task thread.
 - A concrete `Remaining` action from the result becomes the task `nextAction`.
+- Every successful role response uses `Changed`, `Remaining`, `Waiting on`, and `Learned`. `Learned` contains one reusable operating lesson or `none`.
 - Users can only see tasks and threads on boards they can access.
 - Agents can reply, analyze, and propose a next move, but they do not create project tasks. Any later write capability remains explicit, permission-checked, task-scoped, and auditable.
 - Dispatch failures remain visible and retryable; no timeout or provider failure may leave the interface in an indefinite sending state.
+
+## Layered Context
+
+ClawPilot rebuilds each execution context from four explicit layers:
+
+1. The repository-owned instruction for the selected role.
+2. The selected task and its recent thread.
+3. Private user-and-role memory, readable only when that same user runs that same role.
+4. Active shared role principles that contain no user, organization, customer, URL, email, Global ID, or task-specific data.
+
+Successful responses may add a bounded private lesson. A generic lesson can become a shared candidate, but it is inactive until the identical lesson has independent evidence from at least two organizations. Seeded and promoted shared principles improve the role for all users; private lessons never cross the user boundary. Unsafe or task-specific lessons remain private and are not considered for promotion.
+
+The shared layer is deliberately an operating-principle layer, not a shared transcript. Raw task threads, customer records, documents, and credentials are never copied into shared role memory.
 
 ## Durable Data
 
@@ -46,6 +70,8 @@ These are application roles, not separately created ChatGPT custom agents. Each 
 - `agent_dispatch_outbox`
 - `execution_runs`
 - `execution_results`
+- `agent_context_memories`
+- `agent_context_memory_evidence`
 - encrypted per-user agent credential records in the credential database
 
 Use the [ChatGPT agent authorization runbook](../operations/chatgpt-agent-auth.md) for device flow, environment variables, credential rotation, and reconnect behavior.

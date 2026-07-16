@@ -1,7 +1,10 @@
 ---
+id: cp-module-projects-tenancy
 title: Projects and Tenancy
+summary: Personal and shared project boards, CRM board projections, card behavior, organization scoping, and resource access.
 status: active
 kind: module-contract
+area: projects
 tags: [projects, boards, tasks, sharing]
 app_visible: true
 ---

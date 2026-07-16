@@ -1,7 +1,10 @@
 ---
+id: cp-knowledge-index
 title: ClawPilot Knowledge Index
+summary: Application-visible index of canonical ClawPilot maps, contracts, decisions, releases, and retained evidence.
 status: active
 kind: knowledge-index
+area: knowledge
 tags: [clawpilot, architecture, operations, releases, search]
 app_visible: true
 ---
@@ -9,6 +12,22 @@ app_visible: true
 # ClawPilot Knowledge Index
 
 This repository is the canonical source for ClawPilot product, engineering, and operating knowledge. Use the [vault map](README.md) for Obsidian navigation. The Docs application indexes this catalog for the configured owner and keeps every other user's generated workspace documents private.
+
+## Maps Of Content
+
+- [ClawPilot context map](maps/context-map.md)
+- [Product map](maps/product-map.md)
+- [Platform and data map](maps/platform-data-map.md)
+- [Operations map](maps/operations-map.md)
+- [Evolution map](maps/evolution-map.md)
+
+## Accepted Decisions
+
+- [Decision index](decisions/index.md)
+- [Postgres and Sheets authority](decisions/0001-postgres-and-sheets-authority.md)
+- [Organization-rooted tenancy](decisions/0002-organization-rooted-tenancy.md)
+- [CRM Global Identity and synchronization](decisions/0003-crm-global-identity-and-sync.md)
+- [Local-first knowledge retrieval](decisions/0004-local-first-knowledge-retrieval.md)
 
 ## Active Module Contracts
 
@@ -34,11 +53,13 @@ The active module contracts are the current product and architecture surface. Th
 
 ## Build And Release Trail
 
-1. Read the relevant module contract for the behavior that should exist now.
-2. Use [ClawPilot environments and deployment](operations/clawpilot-environments.md) for runtime topology and release gates.
-3. Use the [release documentation contract](releases/README.md) and [release catalog](releases/catalog.json) for shipped user-facing changes.
-4. Use the in-app Versions surface for the durable environment-specific deployment and checkpoint record.
-5. Use GitHub pull requests and Git history for code-level evidence.
+1. Start with the [context map](maps/context-map.md) when the question spans modules.
+2. Read the relevant module contract for the behavior that should exist now.
+3. Read a decision record when the reason or tradeoff matters.
+4. Use [ClawPilot environments and deployment](operations/clawpilot-environments.md) for runtime topology and release gates.
+5. Use the [release documentation contract](releases/README.md) and [release catalog](releases/catalog.json) for shipped user-facing changes.
+6. Use the in-app Versions surface for the durable environment-specific deployment and checkpoint record.
+7. Use GitHub pull requests and Git history for code-level evidence.
 
 ## Historical Archive
 
@@ -50,6 +71,6 @@ The separate legacy Obsidian/OpenClaw vaults are import sources, not live ClawPi
 
 ## Retrieval Policy
 
-ClawPilot stores user documents in Postgres, with an owner boundary, status, source, category, tags, content hash, and full-text search index. Repository Markdown is synchronized only into the configured owner's catalog; `app_visible: false` excludes a note from the application without removing it from the Obsidian vault.
+ClawPilot stores user documents in Postgres, with an owner boundary, status, source, category, tags, content hash, and full-text search index. Repository Markdown is synchronized only into the configured owner's catalog, and only explicit `app_visible: true` notes enter that catalog. Vault-only maps, templates, compatibility pointers, and provider procedures can remain in Obsidian without becoming competing search results.
 
 When content changes, the same transaction queues an embedding job. The worker defaults to a deterministic 256-dimension local vector and combines same-model vector and full-text ranking. The owner can opt into External from **Settings > Integrations > Knowledge** only when a dedicated `OPENAI_EMBEDDING_API_KEY` is configured; external mode sends document content and semantic search input to OpenAI and may incur usage cost. See [Knowledge vault organization](operations/knowledge-vault-organization.md) for metadata, synchronization, privacy, and verification rules.
