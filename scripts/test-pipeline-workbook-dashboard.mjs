@@ -75,6 +75,7 @@ const chartRequestBlock = source.slice(
   source.indexOf('export async function configurePipelineTabsWithRequest'),
 )
 assert.equal((chartRequestBlock.match(/\n\s+chart\(\{/g) || []).length, 3)
+assert.match(chartRequestBlock, /targetAxis: input\.chartType === 'BAR' \? 'BOTTOM_AXIS' : 'LEFT_AXIS'/)
 for (const chartContract of [
   { title: 'Opportunity lifecycle', start: 6, end: 10, row: 3, column: 4, type: 'COLUMN' },
   { title: 'Pipeline value', start: 11, end: 14, row: 18, column: 4, type: 'COLUMN' },

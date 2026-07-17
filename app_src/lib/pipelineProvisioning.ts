@@ -888,7 +888,7 @@ function dashboardChartRequests(sheetId: number) {
                   }],
                 },
               },
-              targetAxis: 'LEFT_AXIS',
+              targetAxis: input.chartType === 'BAR' ? 'BOTTOM_AXIS' : 'LEFT_AXIS',
             }],
           },
         },
