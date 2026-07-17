@@ -30,6 +30,10 @@ import { getPostgresPool } from '@/lib/persistence/postgres'
 import { syncAppUserProfileToCrm } from '@/lib/persistence/crm'
 import { createShortLink, listShortLinks, type ShortLinkActor } from '@/lib/shortlinks'
 import { ensurePrimaryWorkspaceOrganization } from '@/lib/organizations'
+import {
+  readPipelineWorkbookBranding,
+  type OrganizationBranding,
+} from '@/lib/organizationBranding'
 import { normalizeUserEmail } from '@/lib/users'
 
 const DRIVE_FOLDER_MIME_TYPE = 'application/vnd.google-apps.folder'
@@ -63,10 +67,7 @@ const TAB_HEADERS: Record<(typeof EXPECTED_TABS)[number], string[]> = {
   Interactions: ['Priority', 'Interaction', 'Owner', 'Organization', 'Agent', 'Date', 'Opportunity', 'Contact', 'Notes'],
   Calculations: ['Metric', 'Value'],
   Dashboard: ['Metric', 'Value'],
-  Dropdowns: [
-    'Priority', 'Type', 'Acct Manager', 'Stage', 'Loss Reason',
-    'Source', 'Interaction', 'Status', 'State', 'Product',
-  ],
+  Dropdowns: ['Owner', 'Product', 'Stage', 'Priority', 'Status', 'Source', 'Loss Reason'],
 }
 
 type DriveFile = {
@@ -135,6 +136,16 @@ const INITIAL_TAB_ROWS: Partial<Record<(typeof EXPECTED_TABS)[number], unknown[]
     ['Opportunities', '=Calculations!C5'],
     ['Organizations', '=Calculations!C9'],
     ['Contacts', '=Calculations!C10'],
+  ],
+  Dropdowns: [
+    ['', '', 'Identified Lead', 'A+', 'Open', 'Inbound', 'No Decision'],
+    ['', '', 'Qualified Lead', 'A', 'On Hold', 'Outbound', 'Budget'],
+    ['', '', 'Needs Analysis', 'B', 'Closed', 'Referral', 'Competition'],
+    ['', '', 'Demo', 'C', 'Won', 'Website', 'Not a Fit'],
+    ['', '', 'Proposal', 'D', 'Lost', 'Partner', ''],
+    ['', '', 'Negotiation', '', 'Abandoned', '', ''],
+    ['', '', 'Loss', '', '', '', ''],
+    ['', '', 'Won', '', '', '', ''],
   ],
 }
 
@@ -865,6 +876,13 @@ export async function configurePipelineTabsWithRequest(
     typeof sheet.properties?.sheetId === 'number'
     && EXPECTED_TABS.includes(sheet.properties?.title as (typeof EXPECTED_TABS)[number])
   ))
+  if (managedSheets.length === 0) {
+    throw new PipelineProvisioningRequestError(
+      'Managed pipeline workbook has no ClawPilot tabs to brand',
+      409,
+      'GOOGLE_PIPELINE_TABS_MISSING',
+    )
+  }
   const formattingRequests: unknown[] = []
   managedSheets.forEach((sheet) => {
     const sheetIdValue = sheet.properties?.sheetId
@@ -956,6 +974,138 @@ export async function configurePipelineTabsWithRequest(
 export async function configurePipelineTabs(runtime: GoogleWorkspaceRuntime, sheetId: string) {
   const request: SheetsJsonRequest = (pathname, input) => googleSheetsJson(runtime, pathname, input)
   return configurePipelineTabsWithRequest(request, sheetId, runtime.serviceAccountEmail)
+}
+
+function googleColor(hex: string) {
+  const value = /^#[0-9A-F]{6}$/i.test(hex) ? hex.slice(1) : '1F2430'
+  return {
+    red: Number.parseInt(value.slice(0, 2), 16) / 255,
+    green: Number.parseInt(value.slice(2, 4), 16) / 255,
+    blue: Number.parseInt(value.slice(4, 6), 16) / 255,
+  }
+}
+
+function contrastingGoogleColor(hex: string) {
+  const color = googleColor(hex)
+  const luminance = (0.2126 * color.red) + (0.7152 * color.green) + (0.0722 * color.blue)
+  return luminance > 0.55 ? { red: 0.08, green: 0.08, blue: 0.1 } : { red: 1, green: 1, blue: 1 }
+}
+
+function sheetText(value: string) {
+  const text = String(value || '').trim().slice(0, 200)
+  return /^[=+\-@]/.test(text) ? `'${text}` : text
+}
+
+export async function applyPipelineWorkbookBrandingWithRequest(
+  request: SheetsJsonRequest,
+  sheetId: string,
+  branding: OrganizationBranding,
+) {
+  const metadata = await spreadsheetMetadata(request, sheetId)
+  const managedSheets = (metadata.sheets || []).filter((sheet) => (
+    typeof sheet.properties?.sheetId === 'number'
+    && EXPECTED_TABS.includes(sheet.properties?.title as (typeof EXPECTED_TABS)[number])
+  ))
+  if (managedSheets.length === 0) {
+    throw new PipelineProvisioningRequestError(
+      'Managed pipeline workbook has no ClawPilot tabs to brand',
+      409,
+      'GOOGLE_PIPELINE_TABS_MISSING',
+    )
+  }
+  const escapedLogoUrl = branding.logoUrl.replace(/"/g, '""')
+  await request(`/v4/spreadsheets/${sheetId}/values:batchUpdate`, {
+    method: 'POST',
+    body: {
+      valueInputOption: 'USER_ENTERED',
+      data: managedSheets.flatMap((sheet) => {
+        const title = sheet.properties?.title as (typeof EXPECTED_TABS)[number]
+        return [
+          { range: `'${title}'!B1`, majorDimension: 'ROWS', values: [[`=IMAGE("${escapedLogoUrl}",4,48,48)`]] },
+          { range: `'${title}'!C1`, majorDimension: 'ROWS', values: [[sheetText(branding.organizationName)]] },
+          { range: `'${title}'!C2`, majorDimension: 'ROWS', values: [['Powered by ClawPilot']] },
+        ]
+      }),
+    },
+    idempotent: true,
+  })
+
+  const primary = googleColor(branding.primaryColor)
+  const accent = googleColor(branding.accentColor)
+  const foreground = contrastingGoogleColor(branding.primaryColor)
+  const requests: unknown[] = []
+  for (const sheet of managedSheets) {
+    const id = sheet.properties?.sheetId
+    const title = sheet.properties?.title as (typeof EXPECTED_TABS)[number]
+    if (id === undefined) continue
+    const endColumnIndex = Math.max(8, 1 + TAB_HEADERS[title].length)
+    requests.push(
+      {
+        repeatCell: {
+          range: { sheetId: id, startRowIndex: 0, endRowIndex: 3, startColumnIndex: 1, endColumnIndex },
+          cell: { userEnteredFormat: { backgroundColor: primary } },
+          fields: 'userEnteredFormat.backgroundColor',
+        },
+      },
+      {
+        repeatCell: {
+          range: { sheetId: id, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 2, endColumnIndex },
+          cell: { userEnteredFormat: { textFormat: { foregroundColor: foreground, fontSize: 14, bold: true } } },
+          fields: 'userEnteredFormat.textFormat',
+        },
+      },
+      {
+        repeatCell: {
+          range: { sheetId: id, startRowIndex: 1, endRowIndex: 2, startColumnIndex: 2, endColumnIndex },
+          cell: { userEnteredFormat: { textFormat: { foregroundColor: accent, fontSize: 10, bold: true } } },
+          fields: 'userEnteredFormat.textFormat',
+        },
+      },
+      {
+        repeatCell: {
+          range: { sheetId: id, startRowIndex: 3, endRowIndex: 4, startColumnIndex: 1, endColumnIndex: 1 + TAB_HEADERS[title].length },
+          cell: {
+            userEnteredFormat: {
+              backgroundColor: primary,
+              textFormat: { foregroundColor: foreground, bold: true },
+              borders: { bottom: { style: 'SOLID_THICK', color: accent } },
+            },
+          },
+          fields: 'userEnteredFormat(backgroundColor,textFormat,borders)',
+        },
+      },
+      {
+        updateDimensionProperties: {
+          range: { sheetId: id, dimension: 'ROWS', startIndex: 0, endIndex: 1 },
+          properties: { pixelSize: 52 },
+          fields: 'pixelSize',
+        },
+      },
+      {
+        updateDimensionProperties: {
+          range: { sheetId: id, dimension: 'COLUMNS', startIndex: 1, endIndex: 2 },
+          properties: { pixelSize: 58 },
+          fields: 'pixelSize',
+        },
+      },
+    )
+  }
+  if (requests.length > 0) {
+    await request(`/v4/spreadsheets/${sheetId}:batchUpdate`, {
+      method: 'POST',
+      body: { requests, includeSpreadsheetInResponse: false },
+      idempotent: true,
+    })
+  }
+}
+
+export async function applyPipelineWorkbookBranding(
+  runtime: GoogleWorkspaceRuntime,
+  sheetId: string,
+  branding: OrganizationBranding,
+) {
+  const request: SheetsJsonRequest = (pathname, input) => googleSheetsJson(runtime, pathname, input)
+  return applyPipelineWorkbookBrandingWithRequest(request, sheetId, branding)
 }
 
 async function verifyPipelineTabsAndHeaders(runtime: GoogleWorkspaceRuntime, sheetId: string) {
@@ -1325,6 +1475,11 @@ export async function provisionPipelineGoogleResources(pipelineId: string) {
       }
 
       await configurePipelineTabs(runtime, sheetId)
+      await applyPipelineWorkbookBranding(
+        runtime,
+        sheetId,
+        await readPipelineWorkbookBranding(pipeline.id),
+      )
       await verifyPipelineTabsAndHeaders(runtime, sheetId)
       const verifiedSheetFile = await getDriveFile(runtime, sheetId)
       verifyPipelineFile(verifiedSheetFile, pipeline.id, folderId, runtimeSharedDriveId(runtime))

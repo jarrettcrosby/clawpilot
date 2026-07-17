@@ -386,8 +386,10 @@ function normalizeDropdownCatalog(input: unknown): PipelineDropdownCatalog {
     if (Array.isArray(options) && options.length > 1000) throw new Error(`Pipeline dropdown ${key} has too many options`)
     const normalized = Array.isArray(options)
       ? options.map((option, index) => {
-          const value = cleanString(option?.value) || cleanString(option?.label) || ''
-          const label = cleanString(option?.label) || value
+          const rawValue = cleanString(option?.value) || cleanString(option?.label) || ''
+          const rawLabel = cleanString(option?.label) || rawValue
+          const value = key === 'stage' && rawValue.toLowerCase() === 'neogotiation' ? 'Negotiation' : rawValue
+          const label = key === 'stage' && rawLabel.toLowerCase() === 'neogotiation' ? 'Negotiation' : rawLabel
           if (value.length > 250 || label.length > 250) throw new Error(`Pipeline dropdown ${key} option is too long`)
           return {
             value,

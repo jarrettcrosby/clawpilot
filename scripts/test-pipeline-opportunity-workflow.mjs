@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { crmDateOnly } from '../app_src/lib/crm/dateOnly.mjs'
+import { splitPipelineProductNames } from '../app_src/lib/pipeline/productNames.mjs'
 
 const root = process.cwd()
 const read = (relativePath) => readFileSync(resolve(root, relativePath), 'utf8')
@@ -63,6 +64,9 @@ assert.match(component, /productIds: newOpportunity\.productIds/)
 assert.match(component, /ownerContactId: newOpportunity\.ownerContactId/)
 assert.match(component, /fetch\('\/api\/pipeline\/catalog'/)
 assert.match(component, /aria-label="Open pipeline setup"/)
+assert.match(component, /title="Configure pipeline"/)
+assert.match(component, /Add products and workflow choices before creating the first opportunity/)
+assert.match(component, />\s*Open setup\s*<\/Button>/)
 assert.doesNotMatch(component, /multiple\s+freeSolo/, 'products must come from the tenant catalog')
 assert.match(component, /Select an organization already in CRM/)
 assert.match(component, /Associated contacts/)
@@ -107,6 +111,14 @@ assert.equal(crmDateOnly('2026-08-14'), '2026-08-14')
 assert.equal(crmDateOnly('2026-08-14T00:00:00.000Z'), '2026-08-14')
 assert.equal(crmDateOnly(new Date(2026, 7, 14)), '2026-08-14')
 assert.equal(crmDateOnly('Fri Aug 14'), '')
+
+assert.deepEqual(
+  splitPipelineProductNames('AAR, CAC, AAR, Merchant y140 & y182'),
+  ['AAR', 'CAC', 'Merchant y140 & y182'],
+)
+assert.deepEqual(splitPipelineProductNames(['LDS', 'POD, TIA']), ['LDS', 'POD', 'TIA'])
+assert.match(crmPersistence, /splitPipelineProductNames/)
+assert.match(read('app_src/lib/persistence/pipeline.ts'), /rawValue\.toLowerCase\(\) === 'neogotiation'/)
 
 const syncStatus = read('app_src/app/api/pipeline/sync-status/route.ts')
 assert.match(syncStatus, /readCrmSummaryFromPostgres/)

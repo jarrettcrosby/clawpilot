@@ -186,6 +186,48 @@ for (const contract of [
   assertIncludes(pipelineCatalogMigration, contract, 'pipeline people and products migration')
 }
 
+const atomicProductCatalogMigration = read('db/migrations/0046_atomic_pipeline_products_and_sync_retry_state.sql')
+for (const contract of [
+  'generated_product_combinations',
+  "product.name LIKE '%,%'",
+  "'delete_record'",
+  'crm:products:combination-cleanup:v1:',
+  'legacy_workflow_catalogs',
+  "'{dropdowns,stage}'",
+  "'{dropdowns,priority}'",
+  "'{dropdowns,status}'",
+  "'{dropdowns,source}'",
+  "'{dropdowns,loss_reason}'",
+  'pipeline-catalog-canonical:v1',
+  "SET sync_status = 'pending'",
+  "'pipeline.product_catalog.normalized'",
+  'globalIdentifiersRetained',
+]) {
+  assertIncludes(atomicProductCatalogMigration, contract, 'atomic pipeline product cleanup migration')
+}
+
+const organizationBrandingMigration = read('db/migrations/0047_workspace_organization_branding.sql')
+for (const contract of [
+  'CREATE TABLE IF NOT EXISTS workspace_organization_branding',
+  'logo_bytes bytea',
+  "primary_color text NOT NULL DEFAULT '#1F2430'",
+  "accent_color text NOT NULL DEFAULT '#A8C7FA'",
+  'octet_length(logo_bytes) <= 2097152',
+]) {
+  assertIncludes(organizationBrandingMigration, contract, 'workspace organization branding migration')
+}
+
+const pipelineSpellingMigration = read('db/migrations/0048_canonical_pipeline_negotiation_spelling.sql')
+for (const contract of [
+  'corrected_pipeline_stages',
+  "'neogotiation'",
+  "'Negotiation'",
+  'negotiation-spelling:v1',
+  "'pipeline.workflow_spelling.normalized'",
+]) {
+  assertIncludes(pipelineSpellingMigration, contract, 'canonical pipeline stage spelling migration')
+}
+
 const crmIdentityHierarchyMigration = read('db/migrations/0021_crm_identity_and_organization_hierarchy.sql')
 for (const contract of [
   'CREATE TABLE IF NOT EXISTS workspace_organizations',
@@ -370,6 +412,9 @@ assertIncludes(pipelineProvisioning, "idempotent: false", 'non-retried ambiguous
 assertIncludes(pipelineProvisioning, 'ensurePipelineShortLink(pipeline, pipeline.sheetId)', 'ready pipeline Sheet-link repair')
 assertIncludes(pipelineProvisioning, "const EXPECTED_TABS", 'managed pipeline tab contract')
 assertIncludes(pipelineProvisioning, "range: `'${title}'!B4`", 'managed pipeline B4 headers')
+assertIncludes(pipelineProvisioning, "Dropdowns: ['Owner', 'Product', 'Stage', 'Priority', 'Status', 'Source', 'Loss Reason']", 'canonical managed pipeline dropdown headers')
+assertIncludes(pipelineProvisioning, 'applyPipelineWorkbookBrandingWithRequest', 'organization workbook branding')
+assertIncludes(pipelineProvisioning, '=IMAGE(', 'organization workbook logo formula')
 for (const tab of ['Start Here', 'Calculations', 'Dashboard']) {
   assertIncludes(pipelineProvisioning, `'${tab}'`, 'managed CRM workbook tab contract')
 }
@@ -866,6 +911,7 @@ assertIncludes(outboxWorker, "item.operation === 'update_opportunity'", 'pipelin
 assertIncludes(outboxWorker, "item.operation === 'append_interaction'", 'pipeline outbox worker')
 assertIncludes(outboxWorker, "item.operation === 'replace_dropdowns'", 'pipeline outbox worker')
 assertIncludes(outboxWorker, "item.operation === 'patch_dropdowns'", 'pipeline dropdown patch worker')
+assertIncludes(outboxWorker, "item.operation === 'apply_workbook_branding'", 'pipeline workbook branding worker')
 assertIncludes(outboxWorker, "item.operation === 'project_crm_workbook'", 'CRM projection worker dispatch')
 assertIncludes(outboxWorker, "item.operation === 'sync_pipeline_owner_profile_v1'", 'owner profile projection worker dispatch')
 assertIncludes(outboxWorker, 'Opportunity Sheet row changed', 'pipeline outbox worker optimistic check')
@@ -1120,6 +1166,9 @@ assertIncludes(healthRoute, '0035_suitecrm_inbound_sync_status.sql', 'hosted Sui
 assertIncludes(healthRoute, '0036_crm_display_text_and_card_semantics.sql', 'hosted CRM display text migration health')
 assertIncludes(healthRoute, '0040_browser_sessions_and_impersonation.sql', 'hosted browser session migration health')
 assertIncludes(healthRoute, '0045_pipeline_people_products_and_dropdown_catalogs.sql', 'hosted pipeline catalog migration health')
+assertIncludes(healthRoute, '0046_atomic_pipeline_products_and_sync_retry_state.sql', 'hosted atomic product catalog migration health')
+assertIncludes(healthRoute, '0047_workspace_organization_branding.sql', 'hosted organization branding migration health')
+assertIncludes(healthRoute, '0048_canonical_pipeline_negotiation_spelling.sql', 'hosted pipeline spelling migration health')
 assertIncludes(healthRoute, 'readSuiteCrmWorkerHeartbeat', 'hosted SuiteCRM worker health')
 assertIncludes(healthRoute, 'migration_checksums_present', 'hosted migration checksum health')
 assertIncludes(healthRoute, 'queryAgentCredentials', 'shared agent credential store health')

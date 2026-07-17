@@ -40,6 +40,7 @@
     "crm:backfill-suitecrm": "node scripts/backfill-suitecrm-global-ids.mjs",
     "crm:backfill-suitecrm-interaction-contacts": "node scripts/backfill-suitecrm-interaction-contacts.mjs",
     "crm:delete-unresolved-interactions": "node scripts/delete-unresolved-crm-interactions.mjs",
+    "agents:backfill-project-documents": "node scripts/backfill-project-agent-documents.mjs",
     "users:reconcile-nick-access": "node scripts/reconcile-nick-access.mjs",
     "release:record": "node scripts/record-release.mjs",
     "mail:verify": "node scripts/verify-mail-sender.mjs",
