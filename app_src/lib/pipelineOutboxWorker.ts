@@ -29,6 +29,18 @@ class PermanentOutboxError extends Error {}
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
+function managedWorkspaceErrorDetails(error: unknown) {
+  const candidate = error && typeof error === 'object'
+    ? error as Record<string, unknown>
+    : {}
+  return {
+    name: error instanceof Error ? error.name : typeof error,
+    message: getErrorMessage(error).replace(/[\u0000-\u001f\u007f]+/g, ' ').trim().slice(0, 500),
+    code: typeof candidate.code === 'string' || typeof candidate.code === 'number' ? candidate.code : undefined,
+    status: typeof candidate.status === 'number' ? candidate.status : undefined,
+  }
+}
+
 function workspacePipelineId(item: PipelineOutboxItem) {
   const pipelineId = String(item.pipelineId || item.payload.pipelineId || item.aggregateId || '').trim()
   if (!UUID_PATTERN.test(pipelineId)) throw new PermanentOutboxError('Managed pipeline operation has an invalid pipeline ID')
@@ -290,6 +302,15 @@ export async function processPipelineSyncOutbox(input: {
         || item.operation === 'reconcile_pipeline_hierarchy_v5'
         || item.operation === 'reconcile_pipeline_hierarchy_v6'
         || item.operation === 'sync_pipeline_permissions'
+      if (managedWorkspaceOperation) {
+        console.error('[pipeline-outbox] managed Google operation failed', {
+          outboxId: item.id,
+          operation: item.operation,
+          pipelineId: item.pipelineId || item.aggregateId,
+          attempts: item.attempts,
+          error: managedWorkspaceErrorDetails(error),
+        })
+      }
       const status = await failPipelineSyncOutboxInPostgres({
         item,
         error: managedWorkspaceOperation ? sanitizePipelineProvisioningError(error) : getErrorMessage(error),
