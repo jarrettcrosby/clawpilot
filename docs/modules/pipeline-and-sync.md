@@ -62,7 +62,7 @@ This imported taxonomy is specific to that pipeline. New organizations receive t
 - Existing bound folders and Sheets are moved and renamed by Google resource ID. ClawPilot verifies the exact new parent and name before it removes an empty managed legacy folder.
 - Provisioning is resumable. `drive_folder_id` and `provisioning_sheet_id` are stored as soon as each external resource verifies, while public `sheet_id` and `sync_enabled` are set only after all checks pass.
 - A managed Sheet requires `Start Here`, `Organizations`, `Contacts`, `Opportunities`, `Interactions`, `Calculations`, `Dashboard`, and `Dropdowns`; headers begin on row 4.
-- Workbook provisioning seeds default Dropdown values only when it first creates the `Dropdowns` tab. Later CRM projections refresh generated CRM and reporting content without replacing the pipeline's configured product or workflow catalogs.
+- Workbook provisioning seeds Dropdown headers and default values only when it first creates the `Dropdowns` tab. After that, the dropdown synchronizer owns both its headers and values; later CRM projections refresh generated CRM and reporting content without relabeling or replacing the pipeline's configured product or workflow catalogs.
 - Column A contains protected record identity. Google protected ranges allow user edits only in `Opportunities!B5:M`.
 - Opportunity pulls stage SuiteCRM records through the CRM outbox. Organizations, Contacts, Interactions, Calculations, and Dashboard are regenerated from the CRM projection.
 - A ClawPilot short link points to the private Sheet. Creating the link does not change Google permissions.

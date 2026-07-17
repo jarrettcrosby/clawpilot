@@ -281,6 +281,21 @@ for (const contract of [
   assertIncludes(configuredPipelineDropdownsMigration, contract, 'configured pipeline dropdown preservation migration')
 }
 
+const canonicalDropdownLayoutMigration = read('db/migrations/0052_restore_canonical_dropdown_layout.sql')
+for (const contract of [
+  'canonical_dropdown_layout_regressions',
+  "pipeline.owner_email = 'jarrett@suburbiasandwichco.com'",
+  'crm_opportunity_products',
+  "'productModel', 'many-to-many'",
+  'canonical-dropdown-layout-repair:v1',
+  "'merchant y140 & y182'",
+  '"value":"Account Transition"',
+  '"value":"Price"',
+  "'pipeline.canonical_dropdown_layout.restored'",
+]) {
+  assertIncludes(canonicalDropdownLayoutMigration, contract, 'canonical dropdown layout restore migration')
+}
+
 const crmIdentityHierarchyMigration = read('db/migrations/0021_crm_identity_and_organization_hierarchy.sql')
 for (const contract of [
   'CREATE TABLE IF NOT EXISTS workspace_organizations',
@@ -467,7 +482,8 @@ assertIncludes(pipelineProvisioning, "const EXPECTED_TABS", 'managed pipeline ta
 assertIncludes(pipelineProvisioning, "range: `'${title}'!B4`", 'managed pipeline B4 headers')
 assertIncludes(pipelineProvisioning, "Dropdowns: ['Owner', 'Product', 'Stage', 'Priority', 'Status', 'Source', 'Loss Reason']", 'canonical managed pipeline dropdown headers')
 assertIncludes(pipelineProvisioning, 'const newlyProvisionedTitles = new Set<string>()', 'new workbook tab seed tracking')
-assertIncludes(pipelineProvisioning, "title !== 'Dropdowns' || newlyProvisionedTitles.has(title)", 'configured dropdown rows are not reseeded during projection')
+assertIncludes(pipelineProvisioning, "title === 'Dropdowns' && !newlyProvisionedTitles.has(title)", 'configured dropdown headers and rows are not rewritten during projection')
+assertIncludes(pipelineProvisioning, 'if (preserveConfiguredDropdowns) return writes', 'configured dropdown projection ownership boundary')
 assertIncludes(pipelineProvisioning, 'applyPipelineWorkbookBrandingWithRequest', 'organization workbook branding')
 assertIncludes(pipelineProvisioning, '=IMAGE(', 'organization workbook logo formula')
 for (const tab of ['Start Here', 'Calculations', 'Dashboard']) {
@@ -1227,6 +1243,7 @@ assertIncludes(healthRoute, '0048_canonical_pipeline_negotiation_spelling.sql', 
 assertIncludes(healthRoute, '0049_residual_pipeline_catalog_repair.sql', 'hosted residual pipeline catalog migration health')
 assertIncludes(healthRoute, '0050_historical_pipeline_catalog_restore.sql', 'hosted historical pipeline catalog migration health')
 assertIncludes(healthRoute, '0051_preserve_configured_pipeline_dropdowns.sql', 'hosted configured pipeline dropdown preservation health')
+assertIncludes(healthRoute, '0052_restore_canonical_dropdown_layout.sql', 'hosted canonical dropdown layout migration health')
 assertIncludes(healthRoute, 'readSuiteCrmWorkerHeartbeat', 'hosted SuiteCRM worker health')
 assertIncludes(healthRoute, 'migration_checksums_present', 'hosted migration checksum health')
 assertIncludes(healthRoute, 'queryAgentCredentials', 'shared agent credential store health')

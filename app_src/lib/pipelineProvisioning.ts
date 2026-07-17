@@ -860,19 +860,32 @@ export async function configurePipelineTabsWithRequest(
     method: 'POST',
     body: {
       valueInputOption: 'USER_ENTERED',
-      data: EXPECTED_TABS.flatMap((title) => [...(IDENTIFIER_TABS.includes(title as (typeof IDENTIFIER_TABS)[number]) ? [{
-        range: `'${title}'!A4`,
-        majorDimension: 'ROWS' as const,
-        values: [['ClawPilot Record ID']],
-      }] : []), {
-        range: `'${title}'!B4`,
-        majorDimension: 'ROWS',
-        values: [TAB_HEADERS[title]],
-      }, ...(INITIAL_TAB_ROWS[title] && (title !== 'Dropdowns' || newlyProvisionedTitles.has(title)) ? [{
-        range: `'${title}'!B5`,
-        majorDimension: 'ROWS' as const,
-        values: INITIAL_TAB_ROWS[title],
-      }] : [])]),
+      data: EXPECTED_TABS.flatMap((title) => {
+        const writes: Array<{ range: string; majorDimension: 'ROWS'; values: unknown[][] }> = []
+        if (IDENTIFIER_TABS.includes(title as (typeof IDENTIFIER_TABS)[number])) {
+          writes.push({
+            range: `'${title}'!A4`,
+            majorDimension: 'ROWS',
+            values: [['ClawPilot Record ID']],
+          })
+        }
+        const preserveConfiguredDropdowns = title === 'Dropdowns' && !newlyProvisionedTitles.has(title)
+        if (preserveConfiguredDropdowns) return writes
+
+        writes.push({
+          range: `'${title}'!B4`,
+          majorDimension: 'ROWS',
+          values: [TAB_HEADERS[title]],
+        })
+        if (INITIAL_TAB_ROWS[title]) {
+          writes.push({
+            range: `'${title}'!B5`,
+            majorDimension: 'ROWS',
+            values: INITIAL_TAB_ROWS[title] || [],
+          })
+        }
+        return writes
+      }),
     },
     idempotent: true,
   })
