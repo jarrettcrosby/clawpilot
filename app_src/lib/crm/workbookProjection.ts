@@ -3,7 +3,10 @@ import {
   configurePipelineTabs,
 } from '@/lib/pipelineProvisioning'
 import { readPipelineWorkbookBranding } from '@/lib/organizationBranding'
-import { configureLegacyPipelineTabs } from '@/lib/pipelineLegacyWorkbook'
+import {
+  applyLegacyPipelineWorkbookBranding,
+  configureLegacyPipelineTabs,
+} from '@/lib/pipelineLegacyWorkbook'
 import { resolveManagedGoogleWorkspaceRuntime } from '@/lib/integrations/googleWorkspace'
 import { googleSheetsJson, type GoogleWorkspaceRuntime } from '@/lib/integrations/googleWorkspaceClient'
 import { matonFetch } from '@/lib/maton'
@@ -130,14 +133,18 @@ export async function projectCrmWorkbook(input: {
     actorEmail: input.actorEmail,
   })
   try {
+    const branding = await readPipelineWorkbookBranding(input.context.pipelineId)
     if (runtime) {
       await configurePipelineTabs(runtime, input.context.sheetId)
       await applyPipelineWorkbookBranding(
         runtime,
         input.context.sheetId,
-        await readPipelineWorkbookBranding(input.context.pipelineId),
+        branding,
       )
-    } else await configureLegacyPipelineTabs(input.context.sheetId)
+    } else {
+      await configureLegacyPipelineTabs(input.context.sheetId)
+      await applyLegacyPipelineWorkbookBranding(input.context.sheetId, branding)
+    }
     const [organizations, contacts, opportunities, interactions] = await Promise.all([
       listCrmRecordsInPostgres({ pipelineId: input.context.pipelineId, entity: 'organizations', limit: 1000 }) as Promise<CrmOrganization[]>,
       listCrmRecordsInPostgres({ pipelineId: input.context.pipelineId, entity: 'contacts', limit: 1000 }) as Promise<CrmContact[]>,

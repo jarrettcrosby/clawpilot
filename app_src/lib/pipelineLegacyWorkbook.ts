@@ -1,8 +1,10 @@
 import { matonFetch } from '@/lib/maton'
 import {
+  applyPipelineWorkbookBrandingWithRequest,
   configurePipelineTabsWithRequest,
   type SheetsRequestInput,
 } from '@/lib/pipelineProvisioning'
+import type { OrganizationBranding } from '@/lib/organizationBranding'
 
 function safeGatewayErrorDetail(raw: string): string {
   let candidate = raw
@@ -42,4 +44,11 @@ async function matonSheetsJson<T>(pathname: string, input: SheetsRequestInput = 
 
 export async function configureLegacyPipelineTabs(sheetId: string) {
   return configurePipelineTabsWithRequest(matonSheetsJson, sheetId)
+}
+
+export async function applyLegacyPipelineWorkbookBranding(
+  sheetId: string,
+  branding: OrganizationBranding,
+) {
+  return applyPipelineWorkbookBrandingWithRequest(matonSheetsJson, sheetId, branding)
 }
