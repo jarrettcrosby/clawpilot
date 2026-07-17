@@ -10,6 +10,8 @@ const port = String(process.env.PORT || 4002)
 const baseUrl = String(process.env.PIPELINE_OUTBOX_URL || `http://127.0.0.1:${port}`).replace(/\/$/, '')
 const pipelineIntervalMs = Math.max(1000, Math.min(Number(process.env.PIPELINE_OUTBOX_POLL_MS || 10000), 300000))
 const agentIntervalMs = Math.max(1000, Math.min(Number(process.env.AGENT_DISPATCH_POLL_MS || 5000), 300000))
+const repositoryIntervalMs = Math.max(1000, Math.min(Number(process.env.REPOSITORY_RUNNER_POLL_MS || 5000), 300000))
+const repositoryRunnerEnabled = String(process.env.CLAWPILOT_REPOSITORY_RUNNER_ENABLED || '0') === '1'
 const crmIntegrationIntervalMs = Math.max(5000, Math.min(Number(process.env.CRM_INTEGRATION_POLL_MS || 30000), 300000))
 const embeddingIntervalMs = Math.max(5000, Math.min(Number(process.env.DOCUMENT_EMBEDDING_POLL_MS || 15000), 300000))
 const radarIntervalMs = Math.max(60000, Math.min(Number(process.env.AI_RADAR_POLL_MS || 3600000), 86400000))
@@ -59,6 +61,9 @@ await Promise.all([
   runLoop('crm-outbox', '/api/crm/outbox/process', 10, pipelineIntervalMs),
   runLoop('crm-integrations', '/api/crm/integrations/process', 10, crmIntegrationIntervalMs),
   runLoop('agent-dispatch', '/api/agents/dispatch/process', 1, agentIntervalMs),
+  ...(repositoryRunnerEnabled
+    ? [runLoop('repository-runner', '/api/agents/repository-runs/process', 1, repositoryIntervalMs)]
+    : []),
   runLoop('document-embeddings', '/api/docs/embeddings/process', 12, embeddingIntervalMs),
   runLoop('ai-radar', '/api/ai-radar/process', 1, radarIntervalMs),
 ])

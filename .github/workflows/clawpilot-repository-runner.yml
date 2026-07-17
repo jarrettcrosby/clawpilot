@@ -1,0 +1,318 @@
+name: ClawPilot repository patch
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository_run_id:
+        description: ClawPilot repository run identifier
+        required: true
+        type: string
+      dispatch_bot_user:
+        description: Exact GitHub App bot allowed to start Codex
+        required: true
+        type: string
+      callback_url:
+        description: ClawPilot signed report endpoint
+        required: true
+        type: string
+      base_sha:
+        description: Exact dev commit to patch
+        required: true
+        type: string
+      instruction_base64:
+        description: Base64-encoded bounded repository instruction
+        required: true
+        type: string
+
+concurrency:
+  group: clawpilot-repository-${{ inputs.repository_run_id }}
+  cancel-in-progress: false
+
+jobs:
+  acknowledge:
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Record workflow start
+        env:
+          CALLBACK_URL: ${{ inputs.callback_url }}
+          REPORT_SECRET: ${{ secrets.CLAWPILOT_REPOSITORY_RUNNER_REPORT_SECRET }}
+          REPOSITORY_RUN_ID: ${{ inputs.repository_run_id }}
+          WORKFLOW_RUN_ID: ${{ github.run_id }}
+          WORKFLOW_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$CALLBACK_URL" in
+            https://aiapp.eigenracing.com/api/agents/repository-runs/report|https://dev.aiapp.eigenracing.com/api/agents/repository-runs/report) ;;
+            *) echo "Unapproved ClawPilot callback URL" >&2; exit 1 ;;
+          esac
+          [[ ${#REPORT_SECRET} -ge 32 ]]
+          BODY=$(jq -cn \
+            --arg runId "$REPOSITORY_RUN_ID" \
+            --arg status running \
+            --arg workflowRunId "$WORKFLOW_RUN_ID" \
+            --arg workflowUrl "$WORKFLOW_URL" \
+            '{runId:$runId,status:$status,workflowRunId:$workflowRunId,workflowUrl:$workflowUrl}')
+          TIMESTAMP=$(date +%s)
+          SIGNATURE=$(printf '%s' "$TIMESTAMP.$BODY" | openssl dgst -sha256 -hmac "$REPORT_SECRET" -hex | awk '{print $2}')
+          curl --fail-with-body --silent --show-error \
+            -H 'Content-Type: application/json' \
+            -H "X-ClawPilot-Timestamp: $TIMESTAMP" \
+            -H "X-ClawPilot-Signature: sha256=$SIGNATURE" \
+            --data "$BODY" \
+            "$CALLBACK_URL"
+
+  generate_patch:
+    needs: acknowledge
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      policy_status: ${{ steps.policy.outputs.status }}
+      policy_reason: ${{ steps.policy.outputs.reason }}
+      patch_digest: ${{ steps.policy.outputs.patch_digest }}
+      changed_paths: ${{ steps.policy.outputs.changed_paths }}
+      artifact_url: ${{ steps.artifact.outputs.artifact-url }}
+      summary: ${{ steps.summary.outputs.text }}
+    steps:
+      - name: Checkout recorded base commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.base_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Decode bounded instruction
+        env:
+          INSTRUCTION_BASE64: ${{ inputs.instruction_base64 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s' "$INSTRUCTION_BASE64" | base64 --decode > "$RUNNER_TEMP/repository-instruction.md"
+          BYTES=$(wc -c < "$RUNNER_TEMP/repository-instruction.md")
+          [[ "$BYTES" -gt 0 && "$BYTES" -le 12000 ]]
+
+      - name: Run Codex in patch workspace
+        id: codex
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt-file: ${{ runner.temp }}/repository-instruction.md
+          output-file: ${{ runner.temp }}/codex-summary.md
+          sandbox: workspace-write
+          safety-strategy: drop-sudo
+          allow-bot-users: ${{ inputs.dispatch_bot_user }}
+          codex-args: '["--ephemeral"]'
+
+      - name: Capture concise summary
+        id: summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          from pathlib import Path
+          value = Path("${{ runner.temp }}/codex-summary.md").read_text(errors="replace")[:4000]
+          print("text<<CLAWPILOT_SUMMARY")
+          print(value)
+          print("CLAWPILOT_SUMMARY")
+          PY
+
+      - name: Enforce patch policy
+        id: policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Intent-to-add makes new source files visible to git diff without
+          # staging their content or granting the workflow source write access.
+          git add --intent-to-add -- .
+          git diff --binary --no-ext-diff > "$RUNNER_TEMP/repository.patch"
+          git diff --name-only --no-ext-diff > "$RUNNER_TEMP/changed-paths.txt"
+          STATUS=patch_ready
+          REASON=""
+          PATCH_BYTES=$(wc -c < "$RUNNER_TEMP/repository.patch")
+          PATH_COUNT=$(grep -c . "$RUNNER_TEMP/changed-paths.txt" || true)
+
+          if [[ "$PATCH_BYTES" -eq 0 ]]; then
+            STATUS=policy_rejected
+            REASON="Codex did not produce a repository patch."
+          elif [[ "$PATCH_BYTES" -gt 2097152 ]]; then
+            STATUS=policy_rejected
+            REASON="Patch exceeds the 2 MiB review limit."
+          elif [[ "$PATH_COUNT" -gt 60 ]]; then
+            STATUS=policy_rejected
+            REASON="Patch changes more than 60 files."
+          elif git diff --numstat --no-ext-diff | awk '$1 == "-" || $2 == "-" { found=1 } END { exit !found }'; then
+            STATUS=policy_rejected
+            REASON="Binary repository changes are not permitted."
+          elif git diff --summary --no-ext-diff | grep -Eq 'mode change|create mode 120000'; then
+            STATUS=policy_rejected
+            REASON="Executable-mode and symbolic-link changes are not permitted."
+          else
+            while IFS= read -r path; do
+              [[ -z "$path" ]] && continue
+              if [[ ! "$path" =~ ^(app_src/|scripts/|docs/|db/migrations/|services/|package\.json$|railway\.json$|vercel\.json$|Dockerfile$) ]]; then
+                STATUS=policy_rejected
+                REASON="Path is outside the repository patch allowlist: $path"
+                break
+              fi
+              if [[ "$path" == *"/.env"* || "$path" == *"credentials"* || "$path" == data/* || "$path" == data-dev/* ]]; then
+                STATUS=policy_rejected
+                REASON="Runtime data and credential paths are not permitted: $path"
+                break
+              fi
+            done < "$RUNNER_TEMP/changed-paths.txt"
+          fi
+
+          DIGEST=$(sha256sum "$RUNNER_TEMP/repository.patch" | awk '{print $1}')
+          CHANGED_PATHS=$(jq -Rsc 'split("\n") | map(select(length > 0))' < "$RUNNER_TEMP/changed-paths.txt")
+          {
+            echo "status=$STATUS"
+            echo "patch_digest=$DIGEST"
+            echo "changed_paths=$(printf '%s' "$CHANGED_PATHS" | base64 -w0)"
+            echo "reason=$REASON"
+          } >> "$GITHUB_OUTPUT"
+          jq -cn \
+            --arg status "$STATUS" \
+            --arg reason "$REASON" \
+            --arg patchDigest "$DIGEST" \
+            --argjson changedPaths "$CHANGED_PATHS" \
+            '{status:$status,reason:$reason,patchDigest:$patchDigest,changedPaths:$changedPaths}' \
+            > "$RUNNER_TEMP/patch-policy.json"
+
+      - name: Upload review artifact
+        id: artifact
+        if: steps.policy.outputs.status == 'patch_ready'
+        uses: actions/upload-artifact@v4
+        with:
+          name: repository-patch-${{ inputs.repository_run_id }}
+          path: |
+            ${{ runner.temp }}/repository.patch
+            ${{ runner.temp }}/changed-paths.txt
+            ${{ runner.temp }}/patch-policy.json
+            ${{ runner.temp }}/codex-summary.md
+          if-no-files-found: error
+          retention-days: 14
+
+  validate_patch:
+    needs: generate_patch
+    if: needs.generate_patch.outputs.policy_status == 'patch_ready'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout recorded base commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.base_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download generated patch
+        uses: actions/download-artifact@v4
+        with:
+          name: repository-patch-${{ inputs.repository_run_id }}
+          path: ${{ runner.temp }}/repository-patch
+
+      - name: Apply patch to clean checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          git apply --check "$RUNNER_TEMP/repository-patch/repository.patch"
+          git apply "$RUNNER_TEMP/repository-patch/repository.patch"
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: app_src/package-lock.json
+
+      - name: Install without lifecycle scripts
+        run: npm --prefix app_src ci --ignore-scripts
+
+      - name: Validate patch
+        run: npm run check
+
+  report:
+    needs: [acknowledge, generate_patch, validate_patch]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Report signed repository evidence
+        env:
+          CALLBACK_URL: ${{ inputs.callback_url }}
+          REPORT_SECRET: ${{ secrets.CLAWPILOT_REPOSITORY_RUNNER_REPORT_SECRET }}
+          REPOSITORY_RUN_ID: ${{ inputs.repository_run_id }}
+          WORKFLOW_RUN_ID: ${{ github.run_id }}
+          WORKFLOW_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          GENERATE_RESULT: ${{ needs.generate_patch.result }}
+          VALIDATE_RESULT: ${{ needs.validate_patch.result }}
+          POLICY_STATUS: ${{ needs.generate_patch.outputs.policy_status }}
+          POLICY_REASON: ${{ needs.generate_patch.outputs.policy_reason }}
+          PATCH_DIGEST: ${{ needs.generate_patch.outputs.patch_digest }}
+          CHANGED_PATHS_BASE64: ${{ needs.generate_patch.outputs.changed_paths }}
+          ARTIFACT_URL: ${{ needs.generate_patch.outputs.artifact_url }}
+          SUMMARY: ${{ needs.generate_patch.outputs.summary }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$CALLBACK_URL" in
+            https://aiapp.eigenracing.com/api/agents/repository-runs/report|https://dev.aiapp.eigenracing.com/api/agents/repository-runs/report) ;;
+            *) echo "Unapproved ClawPilot callback URL" >&2; exit 1 ;;
+          esac
+          [[ ${#REPORT_SECRET} -ge 32 ]]
+
+          STATUS=failed
+          ERROR="Repository patch generation or validation failed."
+          if [[ "$GENERATE_RESULT" == success && "$POLICY_STATUS" == policy_rejected ]]; then
+            STATUS=policy_rejected
+            ERROR="${POLICY_REASON:-Repository patch policy rejected the generated change.}"
+          elif [[ "$GENERATE_RESULT" == success && "$VALIDATE_RESULT" == success ]]; then
+            STATUS=patch_ready
+            ERROR=""
+          elif [[ "$GENERATE_RESULT" == success && "$VALIDATE_RESULT" == skipped ]]; then
+            STATUS=policy_rejected
+            ERROR="Repository patch was not eligible for validation."
+          fi
+
+          if [[ -n "$CHANGED_PATHS_BASE64" ]]; then
+            CHANGED_PATHS=$(printf '%s' "$CHANGED_PATHS_BASE64" | base64 --decode)
+          else
+            CHANGED_PATHS='[]'
+          fi
+          BODY=$(jq -cn \
+            --arg runId "$REPOSITORY_RUN_ID" \
+            --arg status "$STATUS" \
+            --arg workflowRunId "$WORKFLOW_RUN_ID" \
+            --arg workflowUrl "$WORKFLOW_URL" \
+            --arg artifactUrl "$ARTIFACT_URL" \
+            --arg patchDigest "$PATCH_DIGEST" \
+            --arg summary "${SUMMARY:0:4000}" \
+            --arg error "$ERROR" \
+            --arg generateResult "$GENERATE_RESULT" \
+            --arg validateResult "$VALIDATE_RESULT" \
+            --argjson changedPaths "$CHANGED_PATHS" \
+            '{
+              runId:$runId,
+              status:$status,
+              workflowRunId:$workflowRunId,
+              workflowUrl:$workflowUrl,
+              artifactUrl:$artifactUrl,
+              patchDigest:$patchDigest,
+              changedPaths:$changedPaths,
+              summary:$summary,
+              error:$error,
+              validationResult:{generation:$generateResult,validation:$validateResult}
+            }')
+          TIMESTAMP=$(date +%s)
+          SIGNATURE=$(printf '%s' "$TIMESTAMP.$BODY" | openssl dgst -sha256 -hmac "$REPORT_SECRET" -hex | awk '{print $2}')
+          curl --fail-with-body --silent --show-error \
+            -H 'Content-Type: application/json' \
+            -H "X-ClawPilot-Timestamp: $TIMESTAMP" \
+            -H "X-ClawPilot-Signature: sha256=$SIGNATURE" \
+            --data "$BODY" \
+            "$CALLBACK_URL"

@@ -104,8 +104,44 @@ function validateSuiteCrmConfiguration() {
   return 'enabled'
 }
 
+function validateRepositoryRunnerConfiguration() {
+  const enabled = String(process.env.CLAWPILOT_REPOSITORY_RUNNER_ENABLED || '0')
+  if (enabled !== '0' && enabled !== '1') fail('CLAWPILOT_REPOSITORY_RUNNER_ENABLED must be 0 or 1')
+  if (enabled === '0') return 'disabled'
+
+  const positiveInteger = (value) => /^[1-9][0-9]*$/.test(String(value || '').trim())
+  if (!positiveInteger(process.env.CLAWPILOT_GITHUB_APP_ID)) fail('CLAWPILOT_GITHUB_APP_ID must be a positive integer')
+  if (!/^[A-Za-z0-9][A-Za-z0-9-]{0,38}(?:\[bot\])?$/.test(String(process.env.CLAWPILOT_GITHUB_APP_BOT_USER || '').trim())) {
+    fail('CLAWPILOT_GITHUB_APP_BOT_USER must be the exact GitHub App bot username')
+  }
+  if (!positiveInteger(process.env.CLAWPILOT_GITHUB_INSTALLATION_ID)) fail('CLAWPILOT_GITHUB_INSTALLATION_ID must be a positive integer')
+  if (!positiveInteger(process.env.CLAWPILOT_GITHUB_REPOSITORY_ID)) fail('CLAWPILOT_GITHUB_REPOSITORY_ID must be a positive integer')
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(String(process.env.CLAWPILOT_GITHUB_REPOSITORY || ''))) {
+    fail('CLAWPILOT_GITHUB_REPOSITORY must use owner/repository format')
+  }
+  const branch = String(process.env.CLAWPILOT_GITHUB_BASE_BRANCH || 'dev')
+  if (!/^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$/.test(branch) || branch.split('/').includes('..')) {
+    fail('CLAWPILOT_GITHUB_BASE_BRANCH is invalid')
+  }
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}\.ya?ml$/.test(String(process.env.CLAWPILOT_GITHUB_WORKFLOW_FILE || 'clawpilot-repository-runner.yml'))) {
+    fail('CLAWPILOT_GITHUB_WORKFLOW_FILE is invalid')
+  }
+  const privateKey = String(process.env.CLAWPILOT_GITHUB_APP_PRIVATE_KEY_BASE64 || '')
+  try {
+    const decoded = Buffer.from(privateKey, 'base64').toString('utf8')
+    if (!decoded.includes('BEGIN PRIVATE KEY') && !decoded.includes('BEGIN RSA PRIVATE KEY')) throw new Error('invalid')
+  } catch {
+    fail('CLAWPILOT_GITHUB_APP_PRIVATE_KEY_BASE64 must contain a base64-encoded PEM private key')
+  }
+  if (String(process.env.CLAWPILOT_REPOSITORY_RUNNER_REPORT_SECRET || '').length < 32) {
+    fail('CLAWPILOT_REPOSITORY_RUNNER_REPORT_SECRET must contain at least 32 characters')
+  }
+  return 'enabled'
+}
+
 const origin = validateShortLinkOrigin()
 const clients = validateServiceClients()
 const embeddingProvider = validateEmbeddingConfiguration()
 const suiteCrm = validateSuiteCrmConfiguration()
-console.log(`[runtime-config] valid shortLinkOrigin=${origin} clients=${clients} embeddingProvider=${embeddingProvider} suiteCrm=${suiteCrm}`)
+const repositoryRunner = validateRepositoryRunnerConfiguration()
+console.log(`[runtime-config] valid shortLinkOrigin=${origin} clients=${clients} embeddingProvider=${embeddingProvider} suiteCrm=${suiteCrm} repositoryRunner=${repositoryRunner}`)
