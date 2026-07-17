@@ -77,6 +77,7 @@ type PipelineInfo = {
   shortLinkUrl: string | null
 }
 type CrmPipelineUser = {
+  referenceCode: string
   email: string
   displayName: string
   suiteCrmMapped: boolean
@@ -122,6 +123,7 @@ type EditorHistoryItem = {
 type DropdownOption = { active?: boolean; sort_order?: number; label?: string; value?: string }
 
 const DEFAULT_PRIORITIES = ['A+', 'A', 'B', 'C', 'D']
+const LEGACY_CONTACT_OWNER = '__legacy_contact_owner__'
 const INTERACTION_TYPES = [
   { value: 'email', label: 'Email' },
   { value: 'call', label: 'Call' },
@@ -256,6 +258,8 @@ function initialFields(entity: CrmEntity, record: RecordValue | null, userTimeZo
     fullName: textValue(source, 'fullName'), organizationId: textValue(source, 'organizationId'),
     firstName: textValue(source, 'firstName'), lastName: textValue(source, 'lastName'), priority: textValue(source, 'priority'),
     contactType: textValue(source, 'contactType'), accountManager: textValue(source, 'accountManager'),
+    ownerUserReferenceCode: textValue(source, 'ownerUserReferenceCode'), ownerEmail: textValue(source, 'ownerEmail'),
+    ownerDisplayName: textValue(source, 'ownerDisplayName'),
     jobTitle: textValue(source, 'jobTitle'), email: textValue(source, 'email'), linkedinUrl: textValue(source, 'linkedinUrl'),
     phoneWork: textValue(source, 'phoneWork'), phoneMobile: textValue(source, 'phoneMobile'),
     address: textValue(source, 'address'), city: textValue(source, 'city'), state: textValue(source, 'state'),
@@ -308,6 +312,19 @@ function initialFields(entity: CrmEntity, record: RecordValue | null, userTimeZo
     interactionType: interactionTypeValue(source.interactionType), occurredAt: dateTimeLocalValue(source.occurredAt, userTimeZone),
     agentEmail: textValue(source, 'agentEmail'), agentName: textValue(source, 'agentName'), description: textValue(source, 'description'),
   }
+}
+
+function contactFieldsForSave(fields: Record<string, string>) {
+  const saved: Record<string, string | boolean> = {
+    ...fields,
+    emailOptOut: fields.emailOptOut === 'true',
+  }
+  if (!fields.ownerUserReferenceCode && fields.accountManager) {
+    delete saved.ownerUserReferenceCode
+    delete saved.ownerEmail
+    delete saved.ownerDisplayName
+  }
+  return saved
 }
 
 async function loadCrmOptions(entity: CrmEntity): Promise<RecordValue[]> {
@@ -535,6 +552,8 @@ export default function CrmSection() {
       user.email.toLowerCase() === agentName || user.displayName.toLowerCase() === agentName
     ))?.email || ''
   }, [fields.agentEmail, fields.agentName, pipelineUsers])
+  const contactOwnerSelection = fields.ownerUserReferenceCode
+    || (editorEntity === 'contacts' && fields.accountManager ? LEGACY_CONTACT_OWNER : '')
   const relatedOrganization = useMemo(() => {
     if (editorEntity !== 'contacts' || !fields.organizationId) return null
     return organizations.find((organization) => textValue(organization, 'id') === fields.organizationId) || null
@@ -658,7 +677,9 @@ export default function CrmSection() {
                     price: Number(fields.price || 0),
                     cost: Number(fields.cost || 0),
                   }
-              : ['organizations', 'contacts', 'leads'].includes(editorEntity)
+              : editorEntity === 'contacts'
+                ? contactFieldsForSave(fields)
+              : ['organizations', 'leads'].includes(editorEntity)
                 ? { ...fields, emailOptOut: fields.emailOptOut === 'true' }
                 : fields,
         }),
@@ -1348,7 +1369,39 @@ export default function CrmSection() {
               {!priorityOptions.includes(fields.priority || '') && fields.priority ? <MenuItem value={fields.priority}>{fields.priority}</MenuItem> : null}
               {priorityOptions.map((priority) => <MenuItem key={priority} value={priority}>{priority}</MenuItem>)}
             </TextField>
-            <TextField disabled={!recordEditable} label="Owner" value={fields.accountManager || ''} onChange={(event) => setFields({ ...fields, accountManager: event.target.value })} />
+            <TextField
+              disabled={!recordEditable}
+              select
+              label="Owner"
+              value={contactOwnerSelection}
+              onChange={(event) => {
+                const referenceCode = event.target.value
+                if (referenceCode === LEGACY_CONTACT_OWNER) return
+                const selected = pipelineUsers.find((user) => user.referenceCode === referenceCode)
+                setFields({
+                  ...fields,
+                  ownerUserReferenceCode: referenceCode,
+                  ownerEmail: selected?.email || '',
+                  ownerDisplayName: selected?.displayName || '',
+                  accountManager: selected?.displayName || '',
+                })
+              }}
+            >
+              <MenuItem value="">Unassigned</MenuItem>
+              {!fields.ownerUserReferenceCode && fields.accountManager ? (
+                <MenuItem value={LEGACY_CONTACT_OWNER}>{fields.accountManager} (legacy)</MenuItem>
+              ) : null}
+              {fields.ownerUserReferenceCode && !pipelineUsers.some((user) => user.referenceCode === fields.ownerUserReferenceCode) ? (
+                <MenuItem value={fields.ownerUserReferenceCode}>
+                  {fields.ownerDisplayName || fields.accountManager || fields.ownerEmail || fields.ownerUserReferenceCode}
+                </MenuItem>
+              ) : null}
+              {pipelineUsers.map((user) => (
+                <MenuItem key={user.referenceCode} value={user.referenceCode}>
+                  {user.displayName} ({user.email})
+                </MenuItem>
+              ))}
+            </TextField>
             <TextField disabled={!recordEditable} label="Title" value={fields.jobTitle || ''} onChange={(event) => setFields({ ...fields, jobTitle: event.target.value })} />
             <TextField disabled={!recordEditable} label="Email" type="email" value={fields.email || ''} onChange={(event) => setFields({ ...fields, email: event.target.value })} />
             <TextField disabled={!recordEditable} label="LinkedIn URL" type="url" value={fields.linkedinUrl || ''} onChange={(event) => setFields({ ...fields, linkedinUrl: event.target.value })} />

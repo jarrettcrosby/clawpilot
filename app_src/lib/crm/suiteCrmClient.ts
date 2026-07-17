@@ -1,4 +1,4 @@
-import type { CrmEntity, SuiteCrmOutboxRecord } from '@/lib/crm/types'
+import type { CrmEntity, SuiteCrmOutboxRecord, SuiteCrmUserIdentityOutboxRecord } from '@/lib/crm/types'
 
 const ENTITY_MODULE: Record<CrmEntity, string> = {
   organizations: 'Accounts',
@@ -40,6 +40,7 @@ export type SuiteCrmUserMatch = {
   username: string
   displayName: string
   email: string
+  globalId: string | null
 }
 
 export type SuiteCrmIncrementalListInput = {
@@ -176,7 +177,7 @@ export async function findSuiteCrmUser(input: {
   const field = username ? 'user_name' : 'email1'
   const value = username || email
   const parameters = new URLSearchParams({
-    'fields[Users]': 'user_name,first_name,last_name,email1,status',
+    'fields[Users]': 'user_name,first_name,last_name,email1,status,global_id_c',
     [`filter[${field}][eq]`]: value,
     'page[number]': '1',
     'page[size]': '5',
@@ -201,7 +202,8 @@ export async function findSuiteCrmUser(input: {
     if (status && status !== 'active') return []
     if (username ? matchedUsername.toLowerCase() !== username.toLowerCase() : matchedEmail !== email) return []
     const displayName = [values.first_name, values.last_name].map((part) => String(part || '').trim()).filter(Boolean).join(' ')
-    return [{ id, username: matchedUsername, displayName: displayName || matchedUsername, email: matchedEmail }]
+    const globalId = String(values.global_id_c || '').trim().toLowerCase() || null
+    return [{ id, username: matchedUsername, displayName: displayName || matchedUsername, email: matchedEmail, globalId }]
   })
   if (matches.length > 1) throw new Error('SuiteCRM user mapping is ambiguous')
   return matches[0] || null
@@ -338,6 +340,63 @@ export async function upsertSuiteCrmRecord(
     }, fetchImpl)
   }
   return id
+}
+
+export async function upsertSuiteCrmUserIdentity(
+  record: SuiteCrmUserIdentityOutboxRecord,
+  fetchImpl: typeof fetch = fetch,
+) {
+  const suiteCrmUserId = String(record.suiteCrmUserId || '').trim().toLowerCase()
+  const referenceCode = String(record.referenceCode || '').trim().toLowerCase()
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(suiteCrmUserId)) {
+    throw new Error('SuiteCRM user identity has an invalid record ID')
+  }
+  if (!/^gu[0-9]{7}$/.test(referenceCode)) {
+    throw new Error('SuiteCRM user identity has an invalid Global ID')
+  }
+
+  const existing = await request(
+    `/Api/V8/module/Users/${encodeURIComponent(suiteCrmUserId)}`,
+    { method: 'GET' },
+    fetchImpl,
+  ) as JsonApiResponse
+  const existingId = String(existing?.data?.id || '').trim().toLowerCase()
+  const existingGlobalId = String(existing?.data?.attributes?.global_id_c || '').trim().toLowerCase()
+  if (existingId !== suiteCrmUserId) throw new Error('SuiteCRM returned an unexpected user record')
+  if (existingGlobalId && existingGlobalId !== referenceCode) {
+    throw new Error('SuiteCRM user already has a different permanent ClawPilot Global ID')
+  }
+
+  const parameters = new URLSearchParams({
+    'fields[Users]': 'global_id_c',
+    'filter[global_id_c][eq]': referenceCode,
+    'page[number]': '1',
+    'page[size]': '2',
+  })
+  const matches = await request(
+    `/Api/V8/module/Users?${parameters}`,
+    { method: 'GET' },
+    fetchImpl,
+  ) as { data?: Array<{ id?: unknown }> }
+  if (!Array.isArray(matches.data)) throw new Error('SuiteCRM returned an invalid user Global ID lookup')
+  if (matches.data.some((entry) => String(entry?.id || '').trim().toLowerCase() !== suiteCrmUserId)) {
+    throw new Error('ClawPilot user Global ID is already assigned to another SuiteCRM user')
+  }
+  if (existingGlobalId === referenceCode) return suiteCrmUserId
+
+  const response = await request('/Api/V8/module', {
+    method: 'PATCH',
+    body: JSON.stringify({
+      data: {
+        type: 'Users',
+        id: suiteCrmUserId,
+        attributes: { global_id_c: referenceCode },
+      },
+    }),
+  }, fetchImpl) as JsonApiResponse
+  const updatedId = String(response?.data?.id || '').trim().toLowerCase()
+  if (updatedId !== suiteCrmUserId) throw new Error('SuiteCRM returned an unexpected updated user ID')
+  return updatedId
 }
 
 export async function deleteSuiteCrmRecord(

@@ -16,7 +16,8 @@ function localDevelopmentUser(): AppUser | null {
   const email = String(process.env.APP_LOGIN_EMAIL || 'local.developer@example.test').trim().toLowerCase()
   return {
     email,
-    referenceCode: 'gc0000001',
+    referenceCode: 'gu0000001',
+    contactReferenceCode: 'gc0000002',
     role: 'owner',
     status: 'active',
     displayName: 'Local Developer',

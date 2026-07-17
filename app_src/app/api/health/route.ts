@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
 import fs from 'fs'
 import { getAgentRuntime } from '@/lib/agents/provider'
+import { getRepositoryRunnerConfiguration } from '@/lib/agents/repositoryRunnerConfig'
 import { getStorageDriver, isHostedRuntime } from '@/lib/persistence/config'
 import { query as queryAgentCredentials } from '@/lib/persistence/agentCredentials'
 import { query } from '@/lib/persistence/postgres'
@@ -67,6 +68,7 @@ export async function GET() {
     let agentWorker: Record<string, unknown> = { status: 'not-owned' }
     let crm: Record<string, unknown> = { status: 'disabled' }
     let knowledgeWorkers: Array<Record<string, unknown>> = []
+    const repositoryRunner = getRepositoryRunnerConfiguration()
 
     if (cloudProvider === 'railway' && storage !== 'postgres') {
       errors.push('Railway runtime requires Postgres storage.')
@@ -103,6 +105,9 @@ export async function GET() {
     }
     if (String(process.env.MATON_GMAIL_CONNECTION_ID || '').length < 8) {
       errors.push('Hosted runtime Maton Gmail connection is not configured.')
+    }
+    if (repositoryRunner.enabled && !repositoryRunner.ready) {
+      errors.push(repositoryRunner.reason)
     }
     if (!String(process.env.CLAWPILOT_MAIL_FROM || '').includes('@')) {
       errors.push('Hosted runtime ClawPilot mail sender is not configured.')
@@ -188,6 +193,8 @@ export async function GET() {
           configured_pipeline_dropdowns_migration_applied: boolean
           canonical_dropdown_layout_migration_applied: boolean
           empty_pipeline_templates_migration_applied: boolean
+          crm_contact_owner_identity_migration_applied: boolean
+          repository_runner_migration_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -383,6 +390,16 @@ export async function GET() {
                 FROM schema_migrations
                 WHERE filename = '0053_seed_empty_pipeline_templates.sql'
               ) AS empty_pipeline_templates_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0054_crm_contact_owner_user_identity.sql'
+              ) AS crm_contact_owner_identity_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0055_repository_runner_control_plane.sql'
+              ) AS repository_runner_migration_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -433,6 +450,8 @@ export async function GET() {
             && row?.configured_pipeline_dropdowns_migration_applied
             && row?.canonical_dropdown_layout_migration_applied
             && row?.empty_pipeline_templates_migration_applied
+            && row?.crm_contact_owner_identity_migration_applied
+            && row?.repository_runner_migration_applied
             && row?.migration_checksums_present
           ),
         }
@@ -475,6 +494,8 @@ export async function GET() {
           || !row?.configured_pipeline_dropdowns_migration_applied
           || !row?.canonical_dropdown_layout_migration_applied
           || !row?.empty_pipeline_templates_migration_applied
+          || !row?.crm_contact_owner_identity_migration_applied
+          || !row?.repository_runner_migration_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')
@@ -603,6 +624,14 @@ export async function GET() {
         aiRadar: process.env.AI_RADAR_ENABLED !== 'false',
         shortLinks: true,
         crm: process.env.CRM_ENABLED === '1',
+        repositoryRunner: {
+          enabled: repositoryRunner.enabled,
+          ready: repositoryRunner.ready,
+          reason: repositoryRunner.reason,
+          repository: repositoryRunner.repositoryFullName,
+          baseBranch: repositoryRunner.baseBranch,
+          patchOnly: true,
+        },
       },
       checkedAt,
     }, { status: errors.length > 0 ? 503 : 200 })

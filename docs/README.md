@@ -51,6 +51,7 @@ Current product behavior is defined by active module and operating contracts. Op
 - [ClawPilot environments and deployment](operations/clawpilot-environments.md)
 - [Knowledge vault organization](operations/knowledge-vault-organization.md)
 - [ChatGPT agent authorization](operations/chatgpt-agent-auth.md)
+- [Repository patch runner](operations/repository-patch-runner.md)
 - [Google Workspace integration](operations/google-workspace-integration.md)
 - [Railway Postgres backups](operations/railway-postgres-backups.md)
 - [SuiteCRM Railway runbook](operations/suitecrm.md)

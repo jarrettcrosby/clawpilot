@@ -30,6 +30,7 @@ import useMediaQuery from '@mui/material/useMediaQuery'
 import CheckRounded from '@mui/icons-material/CheckRounded'
 import ContentCopyRounded from '@mui/icons-material/ContentCopyRounded'
 import DescriptionRounded from '@mui/icons-material/DescriptionRounded'
+import DifferenceRounded from '@mui/icons-material/DifferenceRounded'
 import ForumRounded from '@mui/icons-material/ForumRounded'
 import LinkOffRounded from '@mui/icons-material/LinkOffRounded'
 import LoginRounded from '@mui/icons-material/LoginRounded'
@@ -85,6 +86,49 @@ type ThreadMessage = {
   taskId?: string
 }
 
+type RepositoryRun = {
+  id: string
+  status: 'queued' | 'dispatching' | 'dispatched' | 'running' | 'patch_ready' | 'policy_rejected' | 'failed' | 'cancelled'
+  repositoryFullName: string
+  baseRef: string
+  baseSha?: string | null
+  workflowUrl?: string | null
+  artifactUrl?: string | null
+  changedPaths?: string[]
+  summary?: string | null
+  error?: string | null
+}
+
+type RepositoryRunnerState = {
+  runner: {
+    enabled: boolean
+    ready: boolean
+    reason: string
+    repository: string
+    baseBranch: string
+    patchOnly: boolean
+  }
+  run: RepositoryRun | null
+}
+
+function repositoryRunActive(run: RepositoryRun | null | undefined) {
+  return Boolean(run && ['queued', 'dispatching', 'dispatched', 'running'].includes(run.status))
+}
+
+function repositoryRunLabel(run: RepositoryRun | null | undefined) {
+  if (!run) return ''
+  return ({
+    queued: 'Patch queued',
+    dispatching: 'Dispatching patch',
+    dispatched: 'Patch dispatched',
+    running: 'Generating patch',
+    patch_ready: 'Patch ready',
+    policy_rejected: 'Patch rejected',
+    failed: 'Patch failed',
+    cancelled: 'Patch cancelled',
+  } as Record<string, string>)[run.status] || run.status
+}
+
 function formatTimestamp(value: string | undefined, settings: UserDateTimeSettings) {
   return formatUserDateTime(value, settings, {
     year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
@@ -118,6 +162,8 @@ function taskExecutionView(task: Task | null) {
     triaged: 'Plan prepared',
     responded: 'Discussion updated',
     succeeded: 'Run recorded',
+    patch_ready: 'Patch ready',
+    policy_rejected: 'Patch rejected',
     failed: 'Run failed',
     idle: 'Ready',
   } as Record<string, string>)[status] || status.replaceAll('_', ' ')
@@ -125,7 +171,7 @@ function taskExecutionView(task: Task | null) {
     ? 'error'
     : status === 'awaiting_input'
       ? 'warning'
-      : status === 'completed' || status === 'succeeded'
+    : status === 'completed' || status === 'succeeded' || status === 'patch_ready'
         ? 'success'
         : active
           ? 'info'
@@ -203,6 +249,8 @@ export default function AgentsSection() {
   const [authError, setAuthError] = useState('')
   const [popupBlocked, setPopupBlocked] = useState(false)
   const [codeCopied, setCodeCopied] = useState(false)
+  const [repositoryState, setRepositoryState] = useState<RepositoryRunnerState | null>(null)
+  const [repositoryQueueing, setRepositoryQueueing] = useState(false)
 
   const loadWorkspace = useCallback(async () => {
     const [agentResponse, taskResponse] = await Promise.all([
@@ -345,6 +393,34 @@ export default function AgentsSection() {
       })
   }, [selectedAgentId, selectedTaskId])
 
+  const loadRepositoryState = useCallback(async () => {
+    if (!selectedTaskId) {
+      setRepositoryState(null)
+      return
+    }
+    const params = new URLSearchParams({ taskId: selectedTaskId })
+    const response = await fetch(`/api/agents/repository-runs?${params.toString()}`)
+    const payload = await response.json().catch(() => null)
+    if (!response.ok) throw new Error(payload?.error || 'Unable to load repository runner status')
+    setRepositoryState(payload as RepositoryRunnerState)
+  }, [selectedTaskId])
+
+  useEffect(() => {
+    loadRepositoryState().catch(() => setRepositoryState(null))
+  }, [loadRepositoryState])
+
+  useEffect(() => {
+    if (!repositoryRunActive(repositoryState?.run)) return
+    const timer = setInterval(() => {
+      void loadRepositoryState()
+        .then(() => loadWorkspace())
+        .catch(() => undefined)
+    }, 4000)
+    return () => {
+      clearInterval(timer)
+    }
+  }, [loadRepositoryState, loadWorkspace, repositoryState?.run])
+
   useEffect(() => {
     if (selectedDispatchStatus !== 'queued' && selectedDispatchStatus !== 'running') return
     let active = true
@@ -461,6 +537,32 @@ export default function AgentsSection() {
     await sendMessage(`Continue work. Next action: ${nextAction}`, 'work')
   }
 
+  async function queueRepositoryPatch() {
+    if (!selectedTaskId || repositoryQueueing || repositoryRunActive(repositoryState?.run)) return
+    setRepositoryQueueing(true)
+    try {
+      const response = await fetch('/api/agents/repository-runs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          taskId: selectedTaskId,
+          instruction: executionView.nextAction || undefined,
+        }),
+      })
+      const payload = await response.json().catch(() => null)
+      if (!response.ok) throw new Error(payload?.error || 'Unable to queue repository patch')
+      setRepositoryState((current) => current
+        ? { ...current, run: payload.run || current.run }
+        : current)
+      setNotice('Repository patch queued. Validation evidence will update here.')
+      await loadRepositoryState()
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'Unable to queue repository patch.')
+    } finally {
+      setRepositoryQueueing(false)
+    }
+  }
+
   function closeAuthDialog() {
     setDeviceLogin(null)
     setAuthPhase('waiting')
@@ -544,7 +646,11 @@ export default function AgentsSection() {
     codexAuth?.email,
     codexAuth?.planType,
     codexAuth?.expiresAt ? `Expires ${formatTimestamp(codexAuth.expiresAt, dateTimeSettings)}` : '',
-    codexConnected ? 'Task discussion and documents; repository runner not connected' : '',
+    codexConnected
+      ? repositoryState?.runner.ready
+        ? `Patch runner: ${repositoryState.runner.repository}@${repositoryState.runner.baseBranch}`
+        : repositoryState?.runner.reason || 'Repository runner status loads with a selected task'
+      : '',
   ].filter(Boolean).join(' | ')
 
   return (
@@ -653,6 +759,17 @@ export default function AgentsSection() {
                 <Chip size="small" label={selectedTask.status} />
                 <Chip size="small" label={selectedTask.priority} />
                 <Chip size="small" color={executionView.color} label={executionView.label} />
+                {repositoryState?.run && (
+                  <Chip
+                    size="small"
+                    color={repositoryState.run.status === 'patch_ready'
+                      ? 'success'
+                      : repositoryState.run.status === 'failed' || repositoryState.run.status === 'policy_rejected'
+                        ? 'error'
+                        : 'info'}
+                    label={repositoryRunLabel(repositoryState.run)}
+                  />
+                )}
                 {selectedTask.dueDate && <Chip size="small" label={`Due ${selectedTask.dueDate}`} />}
               </Stack>
               {executionView.active && <LinearProgress color="info" sx={{ height: 3, borderRadius: 1, mb: 0.75 }} />}
@@ -682,6 +799,11 @@ export default function AgentsSection() {
                       {executionView.error}
                     </Typography>
                   )}
+                  {repositoryState?.run?.baseSha && (
+                    <Typography variant="caption" color="text.secondary" display="block" mt={0.4} sx={{ overflowWrap: 'anywhere' }}>
+                      <Box component="span" color="text.disabled">Repository base:</Box> {repositoryState.run.repositoryFullName}@{repositoryState.run.baseSha.slice(0, 12)}
+                    </Typography>
+                  )}
                   <Typography variant="caption" color="text.secondary" display="block" mt={0.4}>
                     Checklist: {(selectedTask.checklist || []).filter((item) => item.done).length}/{(selectedTask.checklist || []).length}
                   </Typography>
@@ -696,6 +818,34 @@ export default function AgentsSection() {
                     >
                       {executionView.documentTitle || 'Working document'}
                     </Button>
+                  )}
+                  {repositoryState?.run?.artifactUrl && (
+                    <Button
+                      size="small"
+                      href={repositoryState.run.artifactUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      startIcon={<DifferenceRounded />}
+                      sx={{ textTransform: 'none' }}
+                    >
+                      Review patch
+                    </Button>
+                  )}
+                  {repositoryState?.runner.ready && !repositoryRunActive(repositoryState.run) && (
+                    <Tooltip title="Generate and validate a patch in an isolated GitHub Actions runner. This does not push, open a pull request, merge, or deploy.">
+                      <span>
+                        <Button
+                          size="small"
+                          variant="outlined"
+                          startIcon={repositoryQueueing ? <CircularProgress size={14} /> : <DifferenceRounded />}
+                          onClick={queueRepositoryPatch}
+                          disabled={repositoryQueueing || executionView.active}
+                          sx={{ textTransform: 'none' }}
+                        >
+                          Generate patch
+                        </Button>
+                      </span>
+                    </Tooltip>
                   )}
                   {!executionView.active && runtime?.ready && executionView.nextAction && (
                     <Button

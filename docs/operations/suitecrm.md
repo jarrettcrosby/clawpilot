@@ -19,7 +19,9 @@ Each Railway environment has a `suitecrm` service, a dedicated MariaDB service, 
 
 The image is built from `services/suitecrm/`. It verifies the official SuiteCRM 8.10.1 release digest, serves `public/` with Apache, runs the legacy scheduler every minute, and continuously restarts the Symfony Messenger worker.
 
-Container boot also idempotently installs the ClawPilot `Global ID` custom field on Accounts, Contacts, AOS Products, Leads, Opportunities, Meetings, Notes, and Campaigns. The field is named `global_id_c` in SuiteCRM metadata, labeled `Global ID`, added to native detail layouts, and enabled for reporting and unified search. Notes also receive a reportable, audited `Occurred At` DateTime field named `occurred_at_c` on native edit, detail, and list layouts; it stores the interaction's business timestamp separately from SuiteCRM's system creation time.
+Container boot also idempotently installs the ClawPilot `Global ID` custom field on Accounts, Contacts, AOS Products, Leads, Opportunities, Meetings, Notes, Campaigns, and Users. The field is named `global_id_c` in SuiteCRM metadata, labeled `Global ID`, and added to native detail and list layouts. Business-record modules are enabled for reporting and unified search; Users retain their administrator-module search boundary. Notes also receive a reportable, audited `Occurred At` DateTime field named `occurred_at_c` on native edit, detail, and list layouts; it stores the interaction's business timestamp separately from SuiteCRM's system creation time.
+
+Every ClawPilot application user owns a permanent `gu#######` identity in Postgres. When an administrator maps that person to a native SuiteCRM User, ClawPilot queues an idempotent `global_id_c` projection through the SuiteCRM outbox. The worker refuses to overwrite a different permanent ID or duplicate one onto a second SuiteCRM User. The person's CRM Contact remains a separate `gc#######` record.
 
 ## Required Variables
 

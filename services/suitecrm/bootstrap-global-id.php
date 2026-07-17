@@ -136,19 +136,22 @@ function ensure_global_id_search_field(string $module): void
 }
 
 /** @param array<string, mixed> $definition */
-function global_id_definition_is_current(array $definition): bool
+function global_id_definition_is_current(array $definition, bool $unifiedSearch = true): bool
 {
     $fullText = $definition['full_text_search'] ?? null;
-    return ($definition['vname'] ?? '') === CLAWPILOT_GLOBAL_ID_LABEL
+    $base = ($definition['vname'] ?? '') === CLAWPILOT_GLOBAL_ID_LABEL
         && (int) ($definition['len'] ?? 0) === 9
         && !empty($definition['audited'])
-        && !empty($definition['reportable'])
-        && !empty($definition['unified_search'])
+        && !empty($definition['reportable']);
+    if (!$base || !$unifiedSearch) {
+        return $base;
+    }
+    return !empty($definition['unified_search'])
         && is_array($fullText)
         && !empty($fullText['enabled']);
 }
 
-function ensure_global_id_field(string $module): void
+function ensure_global_id_field(string $module, bool $unifiedSearch = true): void
 {
     $bean = BeanFactory::newBean($module);
     if (!$bean) {
@@ -163,7 +166,7 @@ function ensure_global_id_field(string $module): void
         : [];
     $existing = $dynamic->getFieldWidget($module, CLAWPILOT_GLOBAL_ID_FIELD);
 
-    if (!$existing || !global_id_definition_is_current($definition)) {
+    if (!$existing || !global_id_definition_is_current($definition, $unifiedSearch)) {
         $field = $existing ?: get_widget('varchar');
         $field->name = $existing ? CLAWPILOT_GLOBAL_ID_FIELD : 'global_id';
         $field->label = CLAWPILOT_GLOBAL_ID_LABEL;
@@ -180,14 +183,16 @@ function ensure_global_id_field(string $module): void
         $field->importable = 'true';
         $field->duplicate_merge = 'disabled';
         $field->reportable = true;
-        $field->unified_search = 1;
-        $field->full_text_search = ['enabled' => true, 'boost' => 3];
+        $field->unified_search = $unifiedSearch ? 1 : 0;
+        $field->full_text_search = ['enabled' => $unifiedSearch, 'boost' => 3];
         $field->comment = 'Permanent ClawPilot global reference. Managed by ClawPilot.';
         $field->save($dynamic);
     }
 
     $dynamic->setLabel('en_us', CLAWPILOT_GLOBAL_ID_LABEL, 'Global ID');
-    ensure_global_id_search_field($module);
+    if ($unifiedSearch) {
+        ensure_global_id_search_field($module);
+    }
     expose_global_id_in_detail_view($module);
     expose_global_id_in_list_view($module);
     expose_global_id_in_search_view($module, 'basic_search');
@@ -314,6 +319,10 @@ $modules = [
 foreach ($modules as $module) {
     ensure_global_id_field($module);
 }
+
+// Users are administered separately from business-record global search, but
+// still need a visible, reportable gu identity for ClawPilot assignment maps.
+ensure_global_id_field('Users', false);
 
 ensure_note_occurred_at_field();
 

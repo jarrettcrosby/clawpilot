@@ -60,6 +60,9 @@ export type CrmContact = {
   fullName: string
   contactType: string
   accountManager: string
+  ownerUserReferenceCode: string | null
+  ownerEmail: string | null
+  ownerDisplayName: string
   jobTitle: string
   email: string
   linkedinUrl: string
@@ -297,4 +300,10 @@ export type SuiteCrmOutboxRecord = {
     relatedModuleName: 'Accounts' | 'Contacts' | 'Leads' | 'Opportunities'
     relatedBeanId: string
   }>
+}
+
+export type SuiteCrmUserIdentityOutboxRecord = {
+  localId: string
+  suiteCrmUserId: string
+  referenceCode: string
 }

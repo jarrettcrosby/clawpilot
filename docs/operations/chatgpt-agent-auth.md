@@ -59,4 +59,4 @@ Task assignment and explicit `@Agent` card comments enqueue durable Postgres dis
 
 The Agents workbench keeps conversation and execution separate. **Discuss** sends a private task-scoped question and does not mutate shared task evidence. **Work** immediately persists the operator instruction, queues a durable dispatch, and lets the worker apply only evidence-backed task and document changes. A queued or running task rejects another Work request until the active dispatch finishes.
 
-This response bridge is not repository authorization. It can reason over supplied task context and produce ClawPilot task artifacts, but repository changes require a separate sandboxed Codex runner with scoped source-control credentials and auditable writeback.
+This response bridge is not repository authorization. It can reason over supplied task context and produce ClawPilot task artifacts. The optional patch runner uses a separate GitHub App and a separate GitHub Actions OpenAI API key; it never receives a user's ChatGPT access token, refresh token, account ID, or browser session. See the [repository patch runner runbook](repository-patch-runner.md).

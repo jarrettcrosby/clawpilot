@@ -59,6 +59,7 @@ export const OWNER_PERMISSIONS: AppUserPermissions = {
 export type AppUser = {
   email: string
   referenceCode: string
+  contactReferenceCode: string
   role: AppUserRole
   status: AppUserStatus
   displayName: string | null
@@ -88,6 +89,7 @@ export type InviteAppUserResult = {
 type AppUserRow = {
   email: string
   reference_code: string
+  contact_reference_code: string
   role: AppUserRole
   status: AppUserStatus
   display_name: string | null
@@ -193,6 +195,7 @@ function toAppUser(row: AppUserRow): AppUser {
   return {
     email: row.email,
     referenceCode: row.reference_code,
+    contactReferenceCode: row.contact_reference_code,
     role: row.role,
     status: row.status,
     displayName: row.display_name,
@@ -218,11 +221,12 @@ export async function ensureOwnerUser(): Promise<AppUser> {
   const result = await query<AppUserRow>(
     `
       INSERT INTO app_users (
-        email, reference_code, role, status, permissions, activated_at, created_at, updated_at
+        email, reference_code, contact_reference_code, role, status, permissions, activated_at, created_at, updated_at
       )
       VALUES (
         $1,
-        COALESCE((SELECT reference_code FROM app_users WHERE email = $1), allocate_crm_reference('gc')),
+        COALESCE((SELECT reference_code FROM app_users WHERE email = $1), allocate_crm_reference('gu')),
+        COALESCE((SELECT contact_reference_code FROM app_users WHERE email = $1), allocate_crm_reference('gc')),
         'owner', 'active', $2::jsonb, now(), now(), now()
       )
       ON CONFLICT (email) DO UPDATE SET
@@ -339,12 +343,13 @@ export async function inviteAppUser(input: {
     const result = await client.query<AppUserRow>(
       `
         INSERT INTO app_users (
-          email, reference_code, role, status, permissions, invited_by, invited_at,
+          email, reference_code, contact_reference_code, role, status, permissions, invited_by, invited_at,
           organization_id, organization_name, created_at, updated_at
         )
         VALUES (
           $1,
-          COALESCE((SELECT reference_code FROM app_users WHERE email = $1), allocate_crm_reference('gc')),
+          COALESCE((SELECT reference_code FROM app_users WHERE email = $1), allocate_crm_reference('gu')),
+          COALESCE((SELECT contact_reference_code FROM app_users WHERE email = $1), allocate_crm_reference('gc')),
           'member', 'invited', $3::jsonb, $2, now(), $4::uuid, $5, now(), now()
         )
         ON CONFLICT (email) DO UPDATE SET
@@ -490,6 +495,32 @@ export async function updateAppUserSuiteCrmMapping(input: {
       [email, suiteCrmUserId, suiteCrmUsername],
     )
     if (!result.rows[0]) throw new AppUserNotFoundError()
+    const user = toAppUser(result.rows[0])
+    if (!user.suiteCrmUserId) throw new Error('SuiteCRM user mapping was not persisted')
+    const payload = {
+      localId: user.email,
+      suiteCrmUserId: user.suiteCrmUserId,
+      referenceCode: user.referenceCode,
+    }
+    await client.query(
+      `INSERT INTO sync_outbox (
+         aggregate_type, aggregate_id, operation, target_system, payload,
+         status, attempts, idempotency_key, created_at, available_at, updated_at
+       )
+       VALUES ('app_users', $1, 'upsert_user_identity', 'suitecrm', $2::jsonb,
+         'queued', 0, $3, now(), now(), now())
+       ON CONFLICT (target_system, idempotency_key)
+       WHERE idempotency_key IS NOT NULL
+       DO UPDATE SET
+         payload = EXCLUDED.payload,
+         status = CASE WHEN sync_outbox.status = 'processing' THEN sync_outbox.status ELSE 'queued' END,
+         attempts = CASE WHEN sync_outbox.status = 'processing' THEN sync_outbox.attempts ELSE 0 END,
+         last_error = CASE WHEN sync_outbox.status = 'processing' THEN sync_outbox.last_error ELSE NULL END,
+         available_at = CASE WHEN sync_outbox.status = 'processing' THEN sync_outbox.available_at ELSE now() END,
+         processed_at = CASE WHEN sync_outbox.status = 'processing' THEN sync_outbox.processed_at ELSE NULL END,
+         updated_at = now()`,
+      [user.email, JSON.stringify(payload), `crm:suitecrm-user-global-id:v1:${user.email}:${user.suiteCrmUserId}:${user.referenceCode}`],
+    )
     await recordAuditEvent({
       actor: actor.email,
       eventType: 'user.crm_mapping.updated',
@@ -497,9 +528,9 @@ export async function updateAppUserSuiteCrmMapping(input: {
       aggregateId: email,
       subject: target.displayName || email,
       organizationId: target.organizationId,
-      payload: { suiteCrmUsername },
+      payload: { suiteCrmUsername, referenceCode: user.referenceCode, globalIdSync: 'queued' },
     }, client)
-    return toAppUser(result.rows[0])
+    return user
   })
 }
 

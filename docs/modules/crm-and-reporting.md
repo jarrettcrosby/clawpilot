@@ -19,7 +19,7 @@ Use ClawPilot as the customer-work interface, SuiteCRM as the canonical CRM, Rai
 
 - SuiteCRM owns Organizations, Contacts, Products, Leads, Opportunities, Meetings, Interactions, Campaigns, CRM relationships, and CRM record history.
 - ClawPilot is the primary user interface for those modules. Only root-organization owners and administrators may open the global native SuiteCRM surface for configuration and inspection; child-organization administrators remain scoped to their ClawPilot account subtree.
-- A workspace organization owns one durable `ga` identity and an app user owns one durable `gc` identity. Their pipeline records are projections of those identities, not new accounts or contacts.
+- A workspace organization owns one durable `ga` identity. An app user owns one durable `gu` identity and one separate canonical `gc` identity for CRM Contact projections. Existing Contact `gc` values never become user IDs and are not rewritten when `gu` identities are allocated.
 - Saving a user profile updates the app user and its CRM Contact projection. Administrators may rename the shared workspace organization; ordinary members cannot rename it from their personal profile. The user Contact is projected into the primary pipeline for the user's assigned organization, including when that pipeline is shared with other members of the same company.
 - Invitations assign a user to an explicit workspace organization. An administrator may select the current organization, select a descendant organization, or create a child organization from an existing CRM Account while preserving its permanent `ga` identity. Child administrators can manage only their own organization subtree.
 - Pipeline ownership choices are not application-access lists. Active ClawPilot members are projected to CRM Contacts and remain governed by their application role. An administrator may separately mark a tenant Contact as a CRM-only pipeline person; that record may own opportunities but cannot authenticate to ClawPilot until it completes the normal invitation and activation flow.
@@ -31,6 +31,7 @@ Use ClawPilot as the customer-work interface, SuiteCRM as the canonical CRM, Rai
 
 | ClawPilot | SuiteCRM | Workbook |
 |---|---|---|
+| `gu2841963` App user | User assignment mapping through `assigned_user_id` | Native User `global_id_c` after administrator mapping |
 | `ga4827316` Organization | Account | Generated `Organizations` projection |
 | `gc8172045` Contact | Contact | Generated `Contacts` projection |
 | `gp4286157` Product | AOS Product | `Dropdowns` validation and opportunity relationships |
@@ -42,11 +43,11 @@ Use ClawPilot as the customer-work interface, SuiteCRM as the canonical CRM, Rai
 
 Every migrated record preserves its source workbook payload, source row, stable source key, deterministic SuiteCRM identifier, last synchronization state, and error details. Imports are additive and idempotent; they do not delete the source workbook.
 
-Every SuiteCRM module in the table has a native custom field labeled `Global ID`. Its API name is `global_id_c`; it is visible on the native detail layout, reportable, audited, available to unified search, and populated from the permanent ClawPilot reference. Existing projections are refreshed with `npm run crm:backfill-suitecrm` after the SuiteCRM metadata deployment.
+Every SuiteCRM business-record module in the table has a native custom field labeled `Global ID`. Its API name is `global_id_c`; it is visible on the native detail layout, reportable, audited, available to unified search, and populated from the permanent ClawPilot record reference. A `gu` identifies the ClawPilot user independently; an administrator's explicit SuiteCRM user mapping supplies the native `assigned_user_id` and queues the same `gu` for the native SuiteCRM User's `global_id_c`. The retryable projection refuses to overwrite a different permanent ID or duplicate a `gu` on another SuiteCRM User. Existing business-record projections are refreshed with `npm run crm:backfill-suitecrm` after the SuiteCRM metadata deployment.
 
 The two-letter module prefix is fixed and the seven-digit suffix is randomly allocated. The permanent registries reserve both the full code and the numeric suffix globally across modules, prevent concurrent collisions, and never release either value after deletion or archival. Sequential codes issued before this contract remain permanently reserved and can never be reissued. Their obsolete public short links are disabled and removed from user-visible link results; the immutable registries retain the historical allocation and canonical replacement for audit integrity.
 
-Each reference code has a stable short link. The redirect enters the authenticated ClawPilot CRM route, which selects a pipeline the user can access before opening the record; canonical organization and user codes remain stable when the same identity is projected into another authorized pipeline. User-created links remain visible and manageable only inside the exact organization that owns them.
+Each CRM record reference code has a stable short link. The redirect enters the authenticated ClawPilot CRM route, which selects a pipeline the user can access before opening the record; canonical organization and Contact codes remain stable when the same identity is projected into another authorized pipeline. User-created links remain visible and manageable only inside the exact organization that owns them.
 
 Organization and Contact records are also projected into the owner's managed `CRM Board`. Titles use `<Global ID> - <record name>`. The card record block renders the Global ID and name as links to the ClawPilot CRM editor, renders the primary email as an organization-scoped link to the ClawPilot email composer, and maps the editable card Description directly to the native CRM description. The projection uses the CRM row UUID for durable one-card identity, not the visible reference string.
 
@@ -60,6 +61,8 @@ An Opportunity owns one permanent `go` reference, one required Organization rela
 - Records with a phone number expose a call command. It records the interaction before returning a validated `tel:` URL to the device.
 - Campaigns accept `gc` and `gl` recipients, support `{{firstName}}`, `{{lastName}}`, `{{name}}`, `{{email}}`, and `{{referenceCode}}` merge fields, deduplicate recipients by email, and suppress opted-out recipients.
 - Every action is a durable intent with an idempotency key, leased provider attempt, retry state, audit event, and resulting CRM interaction. The worker handles failed retries and campaign child messages.
+
+The Contact editor offers only active ClawPilot users who can access the selected pipeline as Owner. A selection persists the owner's immutable `gu`, normalized email, and display-name snapshot; the display name remains readable if the user later becomes unavailable. Unassigned contacts keep all three owner identity fields empty. Legacy owner strings remain readable and are upgraded only when they match one accessible active user unambiguously. When that user has an administrator-managed SuiteCRM mapping, Contact synchronization writes the native `assigned_user_id`; the Contact's own `gc` remains unchanged.
 
 The interaction editor requires a controlled interaction type and offers only active ClawPilot users who can access the selected pipeline as the Agent. Administrators can map each ClawPilot user to one active native SuiteCRM username; the gateway then assigns the Note to that SuiteCRM user while preserving the ClawPilot email as the durable actor identity. Contact selection is scoped to the selected Organization and is optional only when the interaction is genuinely account-level.
 

@@ -1,4 +1,4 @@
-import { deleteSuiteCrmRecord, upsertSuiteCrmRecord } from '@/lib/crm/suiteCrmClient'
+import { deleteSuiteCrmRecord, upsertSuiteCrmRecord, upsertSuiteCrmUserIdentity } from '@/lib/crm/suiteCrmClient'
 import {
   claimSuiteCrmOutboxInPostgres,
   completeSuiteCrmOutboxInPostgres,
@@ -18,10 +18,11 @@ export async function processSuiteCrmOutbox(input: { limit?: number; maxAttempts
   for (const item of items) {
     try {
       if (!item.payload || item.payload.localId !== item.aggregateId) throw new Error('SuiteCRM outbox payload is invalid')
-      if (item.operation === 'delete_record') await deleteSuiteCrmRecord(item.payload)
+      if (item.operation === 'upsert_user_identity') await upsertSuiteCrmUserIdentity(item.payload)
+      else if (item.operation === 'delete_record') await deleteSuiteCrmRecord(item.payload)
       else await upsertSuiteCrmRecord(item.payload)
       await completeSuiteCrmOutboxInPostgres(item)
-      projectedPipelines.set(item.payload.pipelineId, item.id)
+      if (item.operation !== 'upsert_user_identity') projectedPipelines.set(item.payload.pipelineId, item.id)
       results.push({ id: item.id, status: 'succeeded' })
     } catch (error) {
       const status = await failSuiteCrmOutboxInPostgres({

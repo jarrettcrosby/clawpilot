@@ -72,6 +72,7 @@ type UserPermissions = {
 type AppUser = {
   email: string
   referenceCode: string
+  contactReferenceCode: string
   role: UserRole
   status: UserStatus
   displayName: string | null
@@ -970,8 +971,15 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
                   />
                   <TextField
                     size="small"
-                    label="CRM contact"
+                    label="CRM user Global ID"
                     value={currentUser.referenceCode}
+                    disabled
+                    sx={fieldSx}
+                  />
+                  <TextField
+                    size="small"
+                    label="CRM contact Global ID"
+                    value={currentUser.contactReferenceCode || ''}
                     disabled
                     sx={fieldSx}
                   />

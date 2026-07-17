@@ -43,7 +43,8 @@ for (const column of ['email text PRIMARY KEY', 'role text NOT NULL', 'status te
 
 const usersAdapter = read('app_src/lib/users.ts')
 assertIncludes(usersAdapter, 'ensureOwnerUser', 'app users adapter')
-assertIncludes(usersAdapter, "COALESCE((SELECT reference_code FROM app_users WHERE email = $1), allocate_crm_reference('gc'))", 'side-effect-free app user upsert')
+assertIncludes(usersAdapter, "COALESCE((SELECT reference_code FROM app_users WHERE email = $1), allocate_crm_reference('gu'))", 'side-effect-free app user identity upsert')
+assertIncludes(usersAdapter, "COALESCE((SELECT contact_reference_code FROM app_users WHERE email = $1), allocate_crm_reference('gc'))", 'side-effect-free app user contact identity upsert')
 assertIncludes(usersAdapter, 'inviteAppUser', 'app users adapter')
 assertIncludes(usersAdapter, 'organization_id = EXCLUDED.organization_id', 'invitation organization assignment')
 assertIncludes(usersAdapter, 'restoreInvitedUserAssignment', 'failed invitation assignment rollback')
@@ -55,6 +56,7 @@ assertIncludes(usersAdapter, 'Restore the disabled user before sending a new inv
 assertIncludes(usersAdapter, 'updateAppUserProfile', 'app users adapter')
 assertIncludes(usersAdapter, "UPDATE workspace_organizations", 'atomic profile organization update')
 assertIncludes(usersAdapter, "'pipeline:' || pipeline.id::text || ':provision'", 'profile Drive reconciliation enqueue')
+assertIncludes(usersAdapter, "VALUES ('app_users', $1, 'upsert_user_identity', 'suitecrm'", 'retryable native SuiteCRM user identity projection')
 assertIncludes(usersAdapter, 'updateAppUserAccess', 'app users adapter')
 assertIncludes(usersAdapter, 'AppUserAuthorizationError', 'app user authorization errors')
 assertIncludes(usersAdapter, 'AppUserNotFoundError', 'app user not-found errors')
@@ -308,6 +310,24 @@ for (const contract of [
   assertIncludes(emptyPipelineTemplateMigration, contract, 'empty pipeline template migration')
 }
 
+const crmContactOwnerIdentityMigration = read('db/migrations/0054_crm_contact_owner_user_identity.sql')
+for (const contract of [
+  "allocate_crm_reference('gu')",
+  'ADD COLUMN IF NOT EXISTS contact_reference_code text',
+  "CHECK (reference_code ~ '^gu[0-9]{7}$')",
+  'owner_user_reference_code text',
+  'owner_email text',
+  'owner_display_name text',
+  'HAVING count(*) = 1',
+  "'assigned_user_id', app_user.suitecrm_user_id",
+  'crm:contacts:owner-backfill:v1:',
+  "'upsert_user_identity'",
+  "'referenceCode', app_user.reference_code",
+  'crm:suitecrm-user-global-id:v1:',
+]) {
+  assertIncludes(crmContactOwnerIdentityMigration, contract, 'CRM contact owner user identity migration')
+}
+
 const crmIdentityHierarchyMigration = read('db/migrations/0021_crm_identity_and_organization_hierarchy.sql')
 for (const contract of [
   'CREATE TABLE IF NOT EXISTS workspace_organizations',
@@ -534,7 +554,7 @@ assertIncludes(crmAdapter, 'stageCrmRecordInPostgres', 'CRM projection adapter')
 assertIncludes(crmAdapter, "target_system, payload", 'CRM outbox persistence')
 assertIncludes(crmAdapter, "'upsert_record', 'suitecrm'", 'SuiteCRM outbox target')
 assertIncludes(crmAdapter, "SET sync_status = 'synced', sync_error = NULL, suitecrm_synced_at = now()", 'SuiteCRM inbound records marked synced')
-assertIncludes(crmAdapter, "operation IN ('upsert_record', 'delete_record')", 'SuiteCRM deletion outbox claims')
+assertIncludes(crmAdapter, "operation IN ('upsert_record', 'delete_record', 'upsert_user_identity')", 'SuiteCRM record and user identity outbox claims')
 assertIncludes(crmAdapter, 'ensurePipelineCrmHierarchy', 'workspace organization CRM hierarchy')
 assertIncludes(crmAdapter, 'WITH RECURSIVE descendants AS', 'descendant organization CRM hierarchy')
 assertIncludes(crmAdapter, "relationship_type = 'customer'\n       AND parent_organization_id IS NULL", 'existing nested CRM customer hierarchy preservation')
@@ -552,7 +572,7 @@ assertIncludes(crmAdapter, "importStatus === 'succeeded'", 'successful source re
 assertIncludes(crmAdapter, 'syncAppUserProfileToOwnedPipelines', 'all organization pipeline profile projection')
 assertIncludes(crmAdapter, 'syncPipelineOwnerProfileToCrm', 'pipeline owner profile backfill projection')
 assertIncludes(crmAdapter, 'CRM profile synchronization requires an organization pipeline', 'profile projection organization boundary')
-assertIncludes(crmAdapter, 'appUserReferenceCode: user.referenceCode', 'canonical app-user CRM contact identity')
+assertIncludes(crmAdapter, 'appUserContactReferenceCode: user.contactReferenceCode', 'separate canonical app-user CRM contact identity')
 assertIncludes(crmAdapter, 'COALESCE(\n           $2::uuid,', 'interaction organization relationship normalization')
 assertIncludes(crmAdapter, 'organizationName: clean(row.organization_name)', 'interaction organization API projection')
 assertIncludes(crmAdapter, "to_jsonb(record)->>'contact_id' AS contact_id", 'interaction relationship edit hydration')
@@ -571,6 +591,10 @@ assertIncludes(crmAdapter, 'COALESCE(organization.name, opportunity.organization
 assertIncludes(crmAdapter, 'Opportunity organization was not found', 'opportunity organization identity boundary')
 assertIncludes(crmAdapter, 'agentSuiteCrmUserId', 'SuiteCRM interaction assigned-user projection')
 assertIncludes(crmAdapter, 'assigned_user_id: clean(fields.agentSuiteCrmUserId)', 'SuiteCRM Note assigned user field')
+assertIncludes(crmAdapter, 'assigned_user_id: clean(fields.ownerSuiteCrmUserId)', 'SuiteCRM Contact assigned user field')
+assertIncludes(crmAdapter, 'ownerUserReferenceCode: owner.referenceCode', 'stable Contact owner user identity')
+assertIncludes(crmAdapter, 'Contact owner must be an active ClawPilot user with pipeline access', 'Contact owner pipeline-access boundary')
+assertIncludes(crmAdapter, 'owner_display_name = $32', 'Contact owner identity snapshot persistence')
 assertIncludes(crmAdapter, 'Interaction agent must be an active ClawPilot user with pipeline access', 'interaction ClawPilot-user boundary')
 assertIncludes(crmAdapter, 'Interaction contact must belong to the selected organization', 'interaction contact organization boundary')
 assertIncludes(crmAdapter, 'listCrmPipelineUsersInPostgres', 'interaction agent user catalog')
@@ -792,6 +816,7 @@ assertIncludes(crmSuiteCrmAccountContactIngestion, 'emitSuiteCrmOutbox: false', 
 assertIncludes(crmSuiteCrmAccountContactIngestion, 'stagedPipelineIds.add(row.pipeline_id)', 'post-stage CRM-card pipeline collection')
 assertIncludes(crmSuiteCrmAccountContactIngestion, 'workspaceOrganizationId', 'SuiteCRM account app-only field preservation')
 assertIncludes(crmSuiteCrmAccountContactIngestion, 'appUserEmail', 'SuiteCRM contact app-only field preservation')
+assertIncludes(crmSuiteCrmAccountContactIngestion, 'appUserContactReferenceCode', 'SuiteCRM contact gc identity preservation')
 assertIncludes(crmSuiteCrmAccountContactIngestion, 'SELECT DISTINCT pipeline_id::text', 'bound CRM-board pipeline backfill')
 assertIncludes(crmSuiteCrmAccountContactIngestion, 'const projectionPipelineIds = new Set(await boundCrmBoardPipelineIds())', 'deduplicated CRM-board pipeline reconciliation')
 assertIncludes(crmSuiteCrmAccountContactIngestion, 'reconcileCrmBoardProjectionsForPipeline', 'SuiteCRM CRM-card projection reconciliation')
@@ -862,6 +887,9 @@ assertIncludes(suiteCrmClient, "'filter[date_modified][gte]'", 'incremental Suit
 assertIncludes(suiteCrmClient, 'listSuiteCrmAccountContactRecordsUpdatedSince', 'incremental SuiteCRM account/contact polling')
 assertIncludes(suiteCrmClient, 'findSuiteCrmUser', 'SuiteCRM app-user mapping lookup')
 assertIncludes(suiteCrmClient, '/Api/V8/module/Users', 'SuiteCRM active user module lookup')
+assertIncludes(suiteCrmClient, 'upsertSuiteCrmUserIdentity', 'SuiteCRM native user Global ID projection')
+assertIncludes(suiteCrmClient, 'SuiteCRM user already has a different permanent ClawPilot Global ID', 'SuiteCRM user Global ID overwrite protection')
+assertIncludes(suiteCrmClient, 'ClawPilot user Global ID is already assigned to another SuiteCRM user', 'SuiteCRM user Global ID duplicate protection')
 assertIncludes(suiteCrmClient, "products: 'AOS_Products'", 'SuiteCRM product module mapping')
 assertIncludes(suiteCrmInteractionContactBackfill, "CLAWPILOT_BACKFILL_CONFIRM !== 'interaction-contacts-v1'", 'guarded SuiteCRM interaction contact backfill')
 assertIncludes(suiteCrmInteractionContactBackfill, "linkFieldName: 'contact'", 'SuiteCRM Note contact backfill relationship')
@@ -881,7 +909,8 @@ assertIncludes(suiteCrmClient, 'type !== moduleName && type !== recordType', 'Su
 const suiteCrmGlobalIdBootstrap = read('services/suitecrm/bootstrap-global-id.php')
 assertIncludes(suiteCrmGlobalIdBootstrap, "const CLAWPILOT_GLOBAL_ID_FIELD = 'global_id_c'", 'native SuiteCRM Global ID field')
 assertIncludes(suiteCrmGlobalIdBootstrap, "const CLAWPILOT_NOTE_OCCURRED_AT_FIELD = 'occurred_at_c'", 'native SuiteCRM interaction occurrence field')
-assertIncludes(suiteCrmGlobalIdBootstrap, '$field->unified_search = 1', 'native SuiteCRM Global ID unified search')
+assertIncludes(suiteCrmGlobalIdBootstrap, '$field->unified_search = $unifiedSearch ? 1 : 0', 'module-scoped native SuiteCRM Global ID unified search')
+assertIncludes(suiteCrmGlobalIdBootstrap, "ensure_global_id_field('Users', false)", 'native SuiteCRM User Global ID field')
 assertIncludes(suiteCrmGlobalIdBootstrap, "'Meetings'", 'SuiteCRM meeting Global ID field')
 assertIncludes(suiteCrmGlobalIdBootstrap, "'AOS_Products'", 'SuiteCRM product Global ID field')
 assertIncludes(suiteCrmGlobalIdBootstrap, 'expose_global_id_in_detail_view', 'SuiteCRM Global ID detail layout')
@@ -919,6 +948,8 @@ assertIncludes(crmWorkbookImport, 'sourceCounts.organizations += derivedOrganiza
 const crmWorker = read('app_src/lib/crm/worker.ts')
 assertIncludes(crmWorker, 'upsertSuiteCrmRecord', 'SuiteCRM outbox worker')
 assertIncludes(crmWorker, 'deleteSuiteCrmRecord', 'SuiteCRM deletion worker')
+assertIncludes(crmWorker, 'upsertSuiteCrmUserIdentity(item.payload)', 'SuiteCRM user identity outbox worker')
+assertIncludes(crmWorker, "item.operation !== 'upsert_user_identity'", 'SuiteCRM user identity workbook projection isolation')
 assertIncludes(crmWorker, "operation: 'project_crm_workbook'", 'CRM to workbook projection enqueue')
 
 const crmPunchoutRoute = read('app_src/app/api/crm/punchout/route.ts')
@@ -950,10 +981,18 @@ assertIncludes(crmUi, 'pipelineUsers', 'interaction ClawPilot agent catalog')
 assertIncludes(crmUi, 'select required label="Type"', 'interaction controlled type selector')
 assertIncludes(crmUi, 'select label="Contact"', 'interaction contact selector')
 assertIncludes(crmUi, 'label="Agent"', 'interaction ClawPilot user selector')
+assertIncludes(crmUi, 'LEGACY_CONTACT_OWNER', 'legacy Contact owner display state')
+assertIncludes(crmUi, 'ownerUserReferenceCode: referenceCode', 'Contact owner stable-identity selection')
+assertIncludes(crmUi, '<MenuItem value="">Unassigned</MenuItem>', 'Contact owner unassigned option')
+assertIncludes(crmUi, 'delete saved.ownerUserReferenceCode', 'untouched legacy Contact owner preservation')
+assertIncludes(crmRoute, '...(fields.ownerUserReferenceCode === undefined ? {}', 'legacy Contact owner API omission')
+assertIncludes(crmAdapter, 'fields.ownerSuiteCrmUserId === undefined ? {}', 'legacy SuiteCRM owner assignment preservation')
 
 const userAccessUi = read('app_src/components/settings/UserAccessDialog.tsx')
 assertIncludes(userAccessUi, 'Match CRM user', 'admin SuiteCRM user mapping command')
 assertIncludes(userAccessUi, "action: 'crm-user-mapping'", 'admin SuiteCRM user mapping request')
+assertIncludes(userAccessUi, 'label="CRM user Global ID"', 'gu app-user identity display')
+assertIncludes(userAccessUi, 'currentUser.contactReferenceCode', 'separate gc Contact identity display')
 assertIncludes(usersRoute, "body?.action === 'crm-user-mapping'", 'SuiteCRM app-user mapping route')
 assertIncludes(usersAdapter, 'updateAppUserSuiteCrmMapping', 'SuiteCRM app-user mapping persistence')
 
@@ -1257,6 +1296,7 @@ assertIncludes(healthRoute, '0045_pipeline_people_products_and_dropdown_catalogs
 assertIncludes(healthRoute, '0046_atomic_pipeline_products_and_sync_retry_state.sql', 'hosted atomic product catalog migration health')
 assertIncludes(healthRoute, '0047_workspace_organization_branding.sql', 'hosted organization branding migration health')
 assertIncludes(healthRoute, '0053_seed_empty_pipeline_templates.sql', 'hosted empty pipeline template migration health')
+assertIncludes(healthRoute, '0054_crm_contact_owner_user_identity.sql', 'hosted CRM contact owner identity migration health')
 assertIncludes(healthRoute, '0048_canonical_pipeline_negotiation_spelling.sql', 'hosted pipeline spelling migration health')
 assertIncludes(healthRoute, '0049_residual_pipeline_catalog_repair.sql', 'hosted residual pipeline catalog migration health')
 assertIncludes(healthRoute, '0050_historical_pipeline_catalog_restore.sql', 'hosted historical pipeline catalog migration health')

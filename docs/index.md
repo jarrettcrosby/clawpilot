@@ -44,6 +44,7 @@ This repository is the canonical source for ClawPilot product, engineering, and 
 
 - [Environments and deployment](operations/clawpilot-environments.md)
 - [Knowledge vault organization](operations/knowledge-vault-organization.md)
+- [Repository patch runner](operations/repository-patch-runner.md)
 - [Release documentation contract](releases/README.md)
 - [ClawPilot identity](brand/clawpilot-identity.md)
 

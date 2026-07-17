@@ -60,8 +60,10 @@ These are application roles, not separately created ChatGPT custom agents. Each 
 - Users can only see tasks and threads on boards they can access.
 - Conversation replies use `responded`; autonomous task planning uses `triaged`; missing operator data uses `awaiting_input`; and unavailable capabilities use `blocked`. A successful HTTP/provider dispatch never means the requested work is complete.
 - `completed` requires separate, persisted completion evidence. Transport success, prose, plans, suggestions, and a model's self-reported success cannot close a task.
-- The current in-app executor does not have repository, GitHub, deployment, browser, mail, calendar, or arbitrary CRM tools. Work requiring one of those capabilities must name the missing capability and remain blocked rather than simulate completion.
-- Repository implementation requires a separately authenticated, sandboxed Codex runner with repository scope and auditable GitHub writeback. The per-user ChatGPT device authorization used for role responses is not treated as repository authorization.
+- The conversational executor does not have deployment, browser, mail, calendar, or arbitrary CRM tools. Work requiring one of those capabilities must name the missing capability and remain blocked rather than simulate completion.
+- An editor can explicitly request **Generate patch** for a selected, assigned task when the repository runner is enabled. ClawPilot records the exact `dev` commit, dispatches a fixed GitHub Actions workflow, and returns a validated patch artifact plus changed paths and checks to the task. It does not push, create a branch or pull request, merge, or deploy.
+- Repository patch generation uses a separate GitHub App and a separate GitHub Actions OpenAI API key. The per-user ChatGPT device authorization used for product-agent discussion and task work is never transmitted to the repository runner.
+- A patch-ready result moves an unfinished task to review and records evidence; it never marks the task complete. Publication remains a separate operator-authorized step.
 - Dispatch failures remain visible and retryable; no timeout or provider failure may leave the interface in an indefinite sending state.
 - The Dashboard `Agent attention` metric counts assigned tasks whose durable execution status is `blocked` or `awaiting_input`. It does not expose the all-time execution-result row count as an action metric; historical runs and results remain available as execution evidence.
 
@@ -84,6 +86,8 @@ The shared layer is deliberately an operating-principle layer, not a shared tran
 - `agent_dispatch_outbox`
 - `execution_runs`
 - `execution_results`
+- `repository_bindings`
+- `repository_runs`
 - task-linked agent working documents in `app_documents`
 - `agent_context_memories`
 - `agent_context_memory_evidence`
