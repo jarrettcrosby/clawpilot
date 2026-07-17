@@ -1,5 +1,6 @@
 import { query, withTransaction } from '@/lib/persistence/postgres'
 import { recordAuditEvent } from '@/lib/auditWriter'
+import { findSuiteCrmUser } from '@/lib/crm/suiteCrmClient'
 
 const EMAIL_PATTERN = /^[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+$/i
 
@@ -562,11 +563,9 @@ export async function updateAppUserCrmEmployee(input: {
   })
 }
 
-export async function updateAppUserSuiteCrmMapping(input: {
+export async function syncAppUserSuiteCrmIdentity(input: {
   actorEmail: unknown
   email: unknown
-  suiteCrmUserId: unknown
-  suiteCrmUsername: unknown
 }): Promise<AppUser> {
   const actor = await requireActiveAppUser(input.actorEmail)
   if (!canManageUserAccess(actor)) {
@@ -585,13 +584,23 @@ export async function updateAppUserSuiteCrmMapping(input: {
   if (actor.role !== 'owner' && target.role === 'admin' && target.email !== actor.email) {
     throw new AppUserAuthorizationError('Only the owner can update another administrator CRM mapping')
   }
-  const suiteCrmUserId = String(input.suiteCrmUserId || '').trim().toLowerCase()
-  const suiteCrmUsername = String(input.suiteCrmUsername || '').trim()
-  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(suiteCrmUserId)) {
-    throw new Error('SuiteCRM user ID is invalid')
+  const referenceCode = target.referenceCode.toLowerCase()
+  let suiteCrmUserId = String(target.suiteCrmUserId || '').trim().toLowerCase()
+  let matchedBy = suiteCrmUserId ? 'existing_mapping' : ''
+  if (!suiteCrmUserId) {
+    const match = await findSuiteCrmUser({ globalId: referenceCode })
+      || await findSuiteCrmUser({ email: target.email })
+    if (!match) {
+      throw new Error(`No active SuiteCRM employee matches ${referenceCode} or ${target.email}. Create the employee in SuiteCRM with this email, then sync again.`)
+    }
+    if (match.globalId && match.globalId !== referenceCode) {
+      throw new Error('SuiteCRM employee already has a different permanent ClawPilot Global ID')
+    }
+    suiteCrmUserId = match.id.toLowerCase()
+    matchedBy = match.globalId === referenceCode ? 'global_id' : 'email'
   }
-  if (!/^[A-Za-z0-9._@+-]{1,128}$/.test(suiteCrmUsername)) {
-    throw new Error('SuiteCRM username is invalid')
+  if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(suiteCrmUserId)) {
+    throw new Error('SuiteCRM user ID is invalid')
   }
   return withTransaction(async (client) => {
     const result = await client.query<AppUserRow>(
@@ -601,7 +610,7 @@ export async function updateAppUserSuiteCrmMapping(input: {
            updated_at = now()
        WHERE email = $1
        RETURNING *`,
-      [email, suiteCrmUserId, suiteCrmUsername],
+      [email, suiteCrmUserId, referenceCode],
     )
     if (!result.rows[0]) throw new AppUserNotFoundError()
     const user = toAppUser(result.rows[0])
@@ -611,6 +620,7 @@ export async function updateAppUserSuiteCrmMapping(input: {
       localId: user.email,
       suiteCrmUserId: user.suiteCrmUserId,
       referenceCode: user.referenceCode,
+      username: user.referenceCode,
     }
     await client.query(
       `INSERT INTO sync_outbox (
@@ -629,16 +639,21 @@ export async function updateAppUserSuiteCrmMapping(input: {
          available_at = CASE WHEN sync_outbox.status = 'processing' THEN sync_outbox.available_at ELSE now() END,
          processed_at = CASE WHEN sync_outbox.status = 'processing' THEN sync_outbox.processed_at ELSE NULL END,
          updated_at = now()`,
-      [user.email, JSON.stringify(payload), `crm:suitecrm-user-global-id:v1:${user.email}:${user.suiteCrmUserId}:${user.referenceCode}`],
+      [user.email, JSON.stringify(payload), `crm:suitecrm-user-identity:v2:${user.email}:${user.suiteCrmUserId}:${user.referenceCode}`],
     )
     await recordAuditEvent({
       actor: actor.email,
-      eventType: 'user.crm_mapping.updated',
+      eventType: 'user.crm_identity.synced',
       aggregateType: 'app_user',
       aggregateId: email,
       subject: target.displayName || email,
       organizationId: target.organizationId,
-      payload: { suiteCrmUsername, referenceCode: user.referenceCode, globalIdSync: 'queued' },
+      payload: {
+        suiteCrmUsername: referenceCode,
+        referenceCode: user.referenceCode,
+        matchedBy,
+        identitySync: 'queued',
+      },
     }, client)
     return user
   })

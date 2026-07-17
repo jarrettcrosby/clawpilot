@@ -306,4 +306,5 @@ export type SuiteCrmUserIdentityOutboxRecord = {
   localId: string
   suiteCrmUserId: string
   referenceCode: string
+  username: string
 }

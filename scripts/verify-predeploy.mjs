@@ -150,6 +150,7 @@ for (const requiredPath of [
   'db/migrations/0054_crm_contact_owner_user_identity.sql',
   'db/migrations/0055_repository_runner_control_plane.sql',
   'db/migrations/0056_crm_employee_identity_and_workbook_dashboard.sql',
+  'db/migrations/0057_canonical_suitecrm_usernames.sql',
   '.github/workflows/clawpilot-repository-runner.yml',
   'scripts/start-railway.sh',
   'scripts/test-suitecrm-interaction-ingestion.mjs',

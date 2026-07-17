@@ -344,6 +344,16 @@ for (const contract of [
   assertIncludes(crmEmployeeIdentityMigration, contract, 'CRM employee identity and workbook repair migration')
 }
 
+const canonicalSuiteCrmUsernameMigration = read('db/migrations/0057_canonical_suitecrm_usernames.sql')
+for (const contract of [
+  'app_users_suitecrm_identity_canonical',
+  'suitecrm_username = reference_code',
+  "'username', app_user.reference_code",
+  'crm:suitecrm-user-identity:v2:',
+]) {
+  assertIncludes(canonicalSuiteCrmUsernameMigration, contract, 'canonical SuiteCRM employee username migration')
+}
+
 const crmIdentityHierarchyMigration = read('db/migrations/0021_crm_identity_and_organization_hierarchy.sql')
 for (const contract of [
   'CREATE TABLE IF NOT EXISTS workspace_organizations',
@@ -905,6 +915,8 @@ assertIncludes(suiteCrmClient, 'listSuiteCrmAccountContactRecordsUpdatedSince', 
 assertIncludes(suiteCrmClient, 'findSuiteCrmUser', 'SuiteCRM app-user mapping lookup')
 assertIncludes(suiteCrmClient, '/Api/V8/module/Users', 'SuiteCRM active user module lookup')
 assertIncludes(suiteCrmClient, 'upsertSuiteCrmUserIdentity', 'SuiteCRM native user Global ID projection')
+assertIncludes(suiteCrmClient, 'attributes: { user_name: username, global_id_c: referenceCode }', 'SuiteCRM canonical gu username projection')
+assertIncludes(suiteCrmClient, 'SuiteCRM employee username must equal the permanent ClawPilot Global ID', 'SuiteCRM canonical username guard')
 assertIncludes(suiteCrmClient, 'SuiteCRM user already has a different permanent ClawPilot Global ID', 'SuiteCRM user Global ID overwrite protection')
 assertIncludes(suiteCrmClient, 'ClawPilot user Global ID is already assigned to another SuiteCRM user', 'SuiteCRM user Global ID duplicate protection')
 assertIncludes(suiteCrmClient, "products: 'AOS_Products'", 'SuiteCRM product module mapping')
@@ -1006,15 +1018,17 @@ assertIncludes(crmRoute, '...(fields.ownerUserReferenceCode === undefined ? {}',
 assertIncludes(crmAdapter, 'fields.ownerSuiteCrmUserId === undefined ? {}', 'legacy SuiteCRM owner assignment preservation')
 
 const userAccessUi = read('app_src/components/settings/UserAccessDialog.tsx')
-assertIncludes(userAccessUi, 'Link existing CRM employee', 'admin SuiteCRM employee mapping command')
-assertIncludes(userAccessUi, "action: 'crm-user-mapping'", 'admin SuiteCRM user mapping request')
+assertIncludes(userAccessUi, 'Sync CRM identity', 'admin canonical SuiteCRM identity command')
+assertIncludes(userAccessUi, "action: 'crm-user-sync'", 'admin canonical SuiteCRM identity request')
+assertIncludes(userAccessUi, 'Permanent ClawPilot user Global ID', 'read-only canonical SuiteCRM username guidance')
 assertIncludes(userAccessUi, "action: 'crm-employee'", 'explicit CRM employee access request')
 assertIncludes(userAccessUi, 'CRM employee', 'CRM employee invitation and access control')
 assertIncludes(userAccessUi, 'label="CRM user Global ID"', 'gu app-user identity display')
 assertIncludes(userAccessUi, 'currentUser.contactReferenceCode', 'separate gc Contact identity display')
-assertIncludes(usersRoute, "body?.action === 'crm-user-mapping'", 'SuiteCRM app-user mapping route')
+assertIncludes(usersRoute, "body?.action === 'crm-user-sync'", 'SuiteCRM app-user identity sync route')
 assertIncludes(usersRoute, "body?.action === 'crm-employee'", 'CRM employee access route')
-assertIncludes(usersAdapter, 'updateAppUserSuiteCrmMapping', 'SuiteCRM app-user mapping persistence')
+assertIncludes(usersAdapter, 'syncAppUserSuiteCrmIdentity', 'SuiteCRM canonical app-user identity persistence')
+assertIncludes(usersAdapter, 'username: user.referenceCode', 'SuiteCRM gu username outbox payload')
 
 const pipelineUi = read('app_src/components/pipeline/PipelineSection.tsx')
 assertIncludes(pipelineUi, 'Open Sheet', 'pipeline Sheet command')
