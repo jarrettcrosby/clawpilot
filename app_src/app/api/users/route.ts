@@ -18,6 +18,7 @@ import {
   listAppUsers,
   setAppUserStatus,
   updateAppUserAccess,
+  updateAppUserCrmEmployee,
   updateAppUserProfile,
   updateAppUserSuiteCrmMapping,
 } from '@/lib/users'
@@ -67,6 +68,7 @@ export async function POST(req: NextRequest) {
       createOrganization: body?.createOrganization === true,
       organizationName: body?.organizationName,
       parentOrganizationId: body?.parentOrganizationId,
+      crmUserEnabled: body?.crmUserEnabled === true,
     })
     return NextResponse.json({
       ok: true,
@@ -86,6 +88,14 @@ export async function PATCH(req: NextRequest) {
 
   try {
     const body = await req.json()
+    if (body?.action === 'crm-employee') {
+      const user = await updateAppUserCrmEmployee({
+        actorEmail,
+        email: body.email,
+        enabled: body.enabled === true,
+      })
+      return NextResponse.json({ ok: true, user })
+    }
     if (body?.action === 'crm-user-mapping') {
       const suiteCrmUsername = String(body.suiteCrmUsername || '').trim()
       const match = await findSuiteCrmUser({ username: suiteCrmUsername })

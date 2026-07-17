@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
 const source = readFileSync(resolve(process.cwd(), 'app_src/lib/pipelineProvisioning.ts'), 'utf8')
+const projectionSource = readFileSync(resolve(process.cwd(), 'app_src/lib/crm/workbookProjection.ts'), 'utf8')
 
 for (const tutorialText of [
   'Only the Opportunities tab is operator-editable.',
@@ -35,6 +36,9 @@ const formulaContract = [
   ['Organizations', '=COUNTA(Organizations!C5:C)'],
   ['Contacts', '=COUNTA(Contacts!C5:C)'],
   ['Interactions', '=COUNTA(Interactions!C5:C)'],
+  ['Interactions 61-90 days', 'Interactions!G5:G,">="&TODAY()-90', 'Interactions!G5:G,"<"&TODAY()-60'],
+  ['Interactions 31-60 days', 'Interactions!G5:G,">="&TODAY()-60', 'Interactions!G5:G,"<"&TODAY()-30'],
+  ['Interactions last 30 days', 'Interactions!G5:G,">="&TODAY()-30', 'Interactions!G5:G,"<="&TODAY()'],
 ]
 const initialRowsStart = source.indexOf('const INITIAL_TAB_ROWS')
 const calculationsBlock = source.slice(
@@ -71,17 +75,18 @@ assert.match(source, /charts\(chartId\)/)
 assert.match(source, /charts\(chartId\),merges/)
 assert.match(source, /title === 'Dashboard'[\s\S]{0,320}deleteEmbeddedObject: \{ objectId: chart\.chartId \}/)
 assert.match(source, /formattingRequests\.push\(\.\.\.dashboardChartRequests\(sheetIdValue\)\)/)
-assert.equal((source.match(/title: '(?:Opportunity lifecycle|Pipeline value|CRM records)'/g) || []).length, 3)
+assert.equal((source.match(/title: '(?:Opportunity lifecycle|Pipeline value|CRM records|Interactions, last 90 days)'/g) || []).length, 4)
 const chartRequestBlock = source.slice(
   source.indexOf('function dashboardChartRequests'),
   source.indexOf('export async function configurePipelineTabsWithRequest'),
 )
-assert.equal((chartRequestBlock.match(/\n\s+chart\(\{/g) || []).length, 3)
+assert.equal((chartRequestBlock.match(/\n\s+chart\(\{/g) || []).length, 4)
 assert.match(chartRequestBlock, /targetAxis: input\.chartType === 'BAR' \? 'BOTTOM_AXIS' : 'LEFT_AXIS'/)
 for (const chartContract of [
   { title: 'Opportunity lifecycle', start: 6, end: 10, row: 3, column: 4, type: 'COLUMN' },
   { title: 'Pipeline value', start: 11, end: 14, row: 18, column: 4, type: 'COLUMN' },
   { title: 'CRM records', start: 14, end: 17, row: 3, column: 9, type: 'BAR' },
+  { title: 'Interactions, last 90 days', start: 17, end: 20, row: 18, column: 9, type: 'COLUMN' },
 ]) {
   const chartStart = chartRequestBlock.indexOf(`title: '${chartContract.title}'`)
   const chartDefinition = chartRequestBlock.slice(chartStart, chartRequestBlock.indexOf('}),', chartStart) + 3)
@@ -92,7 +97,8 @@ for (const chartContract of [
   assert.ok(chartDefinition.includes(`anchorColumnIndex: ${chartContract.column}`))
   assert.ok(chartDefinition.includes(`chartType: '${chartContract.type}'`))
 }
-assert.match(chartRequestBlock, /widthPixels: 420/)
+assert.match(chartRequestBlock, /widthPixels: 400/)
+assert.match(chartRequestBlock, /heightPixels: 250/)
 const dashboardReconciliation = source.slice(
   source.indexOf("if (title === 'Dashboard')"),
   source.indexOf(
@@ -139,6 +145,9 @@ for (const [metric, reference] of [
   ['Organizations', '=Calculations!C15'],
   ['Contacts', '=Calculations!C16'],
   ['Interactions', '=Calculations!C17'],
+  ['Interactions 61-90 days', '=Calculations!C18'],
+  ['Interactions 31-60 days', '=Calculations!C19'],
+  ['Interactions last 30 days', '=Calculations!C20'],
 ]) {
   assert.ok(dashboardTableBlock.includes(`['${metric}', '${reference}']`), `Dashboard table missing ${metric}`)
 }
@@ -147,5 +156,18 @@ assert.match(source, /applyPipelineWorkbookBrandingWithRequest/)
 assert.match(source, /range: `'\$\{title\}'!B1`/)
 assert.match(source, /range: `'\$\{title\}'!C1`/)
 assert.match(source, /range: `'\$\{title\}'!C2`/)
+assert.match(source, /function workbookBrandMark/)
+assert.match(source, /values: \[\[workbookBrandMark\(branding\)\]\]/)
+assert.doesNotMatch(source, /=IMAGE\(/, 'managed workbooks must not require manual external-image approval')
+assert.match(source, /title === 'Dropdowns'[\s\S]{0,80}\? 'ZZ'/)
+assert.match(source, /REQUIRED_CONFIGURED_DROPDOWNS\.some/)
+assert.match(source, /unique\.has\('owner'\) \|\| unique\.has\('acct_manager'\)/)
+assert.match(source, /legacyDashboardHasUnmanagedHeader/)
+assert.match(configureBlock, /deleteSheet: \{ sheetId: legacyDashboard\.properties\.sheetId \}/)
+assert.match(configureBlock, /addSheet: \{ properties: \{ title: 'Dashboard', index: EXPECTED_TABS\.indexOf\('Dashboard'\) \} \}/)
+assert.match(source, /dimension: 'COLUMNS', startIndex: 4, endIndex: 14[\s\S]{0,100}pixelSize: 84/)
+assert.match(source, /dimension: 'ROWS', startIndex: 3, endIndex: 36[\s\S]{0,100}pixelSize: 20/)
+assert.match(projectionSource, /await configurePipelineTabs\(runtime, input\.context\.sheetId\)[\s\S]{0,260}await applyPipelineWorkbookBranding/)
+assert.match(projectionSource, /await readPipelineWorkbookBranding\(input\.context\.pipelineId\)/)
 
 console.log('pipeline workbook dashboard contract tests passed')

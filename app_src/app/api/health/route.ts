@@ -195,6 +195,7 @@ export async function GET() {
           empty_pipeline_templates_migration_applied: boolean
           crm_contact_owner_identity_migration_applied: boolean
           repository_runner_migration_applied: boolean
+          crm_employee_identity_migration_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -400,6 +401,11 @@ export async function GET() {
                 FROM schema_migrations
                 WHERE filename = '0055_repository_runner_control_plane.sql'
               ) AS repository_runner_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0056_crm_employee_identity_and_workbook_dashboard.sql'
+              ) AS crm_employee_identity_migration_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -452,6 +458,7 @@ export async function GET() {
             && row?.empty_pipeline_templates_migration_applied
             && row?.crm_contact_owner_identity_migration_applied
             && row?.repository_runner_migration_applied
+            && row?.crm_employee_identity_migration_applied
             && row?.migration_checksums_present
           ),
         }
@@ -496,6 +503,7 @@ export async function GET() {
           || !row?.empty_pipeline_templates_migration_applied
           || !row?.crm_contact_owner_identity_migration_applied
           || !row?.repository_runner_migration_applied
+          || !row?.crm_employee_identity_migration_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')

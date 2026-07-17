@@ -71,8 +71,9 @@ type UserPermissions = {
 
 type AppUser = {
   email: string
-  referenceCode: string
+  referenceCode: string | null
   contactReferenceCode: string
+  crmUserEnabled: boolean
   role: UserRole
   status: UserStatus
   displayName: string | null
@@ -323,6 +324,7 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
   const [workspacesPayload, setWorkspacesPayload] = useState<WorkspacesPayload | null>(null)
   const [profile, setProfile] = useState<ProfileForm>(EMPTY_PROFILE)
   const [inviteEmail, setInviteEmail] = useState('')
+  const [inviteCrmEmployee, setInviteCrmEmployee] = useState(false)
   const [inviteOrganizationId, setInviteOrganizationId] = useState('')
   const [newOrganizationName, setNewOrganizationName] = useState('')
   const [newOrganizationParentId, setNewOrganizationParentId] = useState('')
@@ -380,6 +382,7 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
     setWorkspacesPayload(null)
     setProfile(EMPTY_PROFILE)
     setInviteEmail('')
+    setInviteCrmEmployee(false)
     setInviteOrganizationId('')
     setNewOrganizationName('')
     setNewOrganizationParentId('')
@@ -543,12 +546,14 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
           createOrganization: creatingOrganization,
           organizationName: creatingOrganization ? newOrganizationName.trim() : undefined,
           parentOrganizationId: creatingOrganization ? newOrganizationParentId : undefined,
+          crmUserEnabled: inviteCrmEmployee,
         }),
       })
       if (result.user) upsertUser(result.user)
       const refreshed = await requestJson<UsersPayload>('/api/users')
       setUsersPayload(refreshed)
       setInviteEmail('')
+      setInviteCrmEmployee(false)
       setInviteOrganizationId(refreshed.currentUser?.organizationId || '')
       setNewOrganizationName('')
       setNewOrganizationParentId(refreshed.currentUser?.organizationId || '')
@@ -627,6 +632,30 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
       setNotice(`${result.user.displayName || result.user.email} mapped to SuiteCRM.`)
     } catch (mappingError) {
       setError(messageFrom(mappingError, 'Unable to map SuiteCRM user'))
+    } finally {
+      finishAction()
+    }
+  }
+
+  async function updateCrmEmployee(user: AppUser, enabled: boolean) {
+    if (busy || !canManageCrmMapping(user) || user.role === 'owner') return
+    startAction(`crm-employee:${user.email}`)
+    try {
+      const result = await requestJson<UserMutationPayload>('/api/users', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'crm-employee', email: user.email, enabled }),
+      })
+      if (!result.user) throw new Error('CRM employee response was incomplete')
+      upsertUser(result.user)
+      if (!result.user.crmUserEnabled) {
+        setCrmMappingDrafts((current) => ({ ...current, [user.email]: '' }))
+      }
+      setNotice(enabled
+        ? `${result.user.displayName || result.user.email} is now a CRM employee.`
+        : `${result.user.displayName || result.user.email} was removed as a CRM employee.`)
+    } catch (employeeError) {
+      setError(messageFrom(employeeError, 'Unable to update CRM employee access'))
     } finally {
       finishAction()
     }
@@ -972,7 +1001,7 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
                   <TextField
                     size="small"
                     label="CRM user Global ID"
-                    value={currentUser.referenceCode}
+                    value={currentUser.crmUserEnabled ? currentUser.referenceCode || '' : 'Not a CRM employee'}
                     disabled
                     sx={fieldSx}
                   />
@@ -1096,6 +1125,23 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
                       </TextField>
                     </>
                   ) : null}
+                  <Box sx={{ gridColumn: { sm: '1 / -1' }, px: 0.25 }}>
+                    <FormControlLabel
+                      control={(
+                        <Switch
+                          size="small"
+                          checked={inviteCrmEmployee}
+                          onChange={(event) => setInviteCrmEmployee(event.target.checked)}
+                          disabled={busy}
+                          inputProps={{ 'aria-label': 'Configure invited user as a CRM employee' }}
+                        />
+                      )}
+                      label="CRM employee"
+                    />
+                    <Typography variant="caption" color="text.disabled" display="block">
+                      Creates a permanent gu identity. Link the employee to an existing SuiteCRM user after invitation if needed.
+                    </Typography>
+                  </Box>
                 </Box>
               </Box>
             ) : null}
@@ -1105,8 +1151,10 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
                 const manageable = canManageUser(user)
                 const canChangeRole = manageable && currentUser?.role === 'owner'
                 const crmMappingManageable = canManageCrmMapping(user)
+                const crmEmployeeManageable = crmMappingManageable && user.role !== 'owner'
                 const userPending = pendingAction === `status:${user.email}`
                   || pendingAction === `access:${user.email}`
+                  || pendingAction === `crm-employee:${user.email}`
                   || pendingAction === `crm-map:${user.email}`
 
                 return (
@@ -1130,9 +1178,11 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
                             />
                             <Chip
                               size="small"
-                              color={user.suiteCrmUserId ? 'success' : 'default'}
+                              color={user.crmUserEnabled && user.suiteCrmUserId ? 'success' : 'default'}
                               variant="outlined"
-                              label={user.suiteCrmUserId ? `CRM: ${user.suiteCrmUsername}` : 'CRM not mapped'}
+                              label={!user.crmUserEnabled
+                                ? 'App only'
+                                : user.suiteCrmUserId ? `CRM: ${user.suiteCrmUsername}` : `CRM employee: ${user.referenceCode}`}
                               sx={{ height: 24, minHeight: 24, fontSize: '0.7rem' }}
                             />
                           </Stack>
@@ -1175,10 +1225,27 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
 
                     <Box sx={{ p: { xs: 1.5, sm: 2 }, pt: { xs: 1.25, sm: 1.5 } }}>
                       {crmMappingManageable ? (
+                        <Box display="flex" alignItems="center" justifyContent="space-between" gap={1.5} mb={1.5}>
+                          <Box>
+                            <Typography variant="body2" color="text.primary" fontWeight={700}>CRM employee</Typography>
+                            <Typography variant="caption" color="text.disabled">
+                              Employee identities receive a permanent gu Global ID and may own CRM records.
+                            </Typography>
+                          </Box>
+                          <Switch
+                            size="small"
+                            checked={user.crmUserEnabled}
+                            onChange={(event) => { void updateCrmEmployee(user, event.target.checked) }}
+                            disabled={busy || !crmEmployeeManageable}
+                            inputProps={{ 'aria-label': `CRM employee access for ${user.email}` }}
+                          />
+                        </Box>
+                      ) : null}
+                      {crmMappingManageable && user.crmUserEnabled ? (
                         <Box sx={{ display: 'grid', gridTemplateColumns: { xs: 'minmax(0, 1fr)', sm: 'minmax(0, 1fr) auto' }, gap: 1, mb: 1.5 }}>
                           <TextField
                             size="small"
-                            label="SuiteCRM username"
+                            label="SuiteCRM employee username"
                             value={crmMappingDrafts[user.email] || ''}
                             onChange={(event) => setCrmMappingDrafts((current) => ({ ...current, [user.email]: event.target.value }))}
                             disabled={busy}
@@ -1192,7 +1259,7 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
                             startIcon={pendingAction === `crm-map:${user.email}` ? <CircularProgress size={16} /> : <ReplayRounded />}
                             sx={compactButtonSx}
                           >
-                            Match CRM user
+                            Link existing CRM employee
                           </Button>
                         </Box>
                       ) : null}

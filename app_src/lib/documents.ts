@@ -248,6 +248,24 @@ type ExistingAgentTaskDocumentRow = {
   content: string
 }
 
+export async function readAgentTaskDocumentContext(input: {
+  ownerEmail: string
+  taskId: string
+  agentId: string
+}): Promise<string | null> {
+  const ownerEmail = normalizeUserEmail(input.ownerEmail)
+  const agentId = singleLine(input.agentId).toLowerCase() || 'agent'
+  const sourceKey = `agent-task:${input.taskId}:${agentId}`
+  const result = await query<{ content: string }>(
+    `SELECT content
+     FROM app_documents
+     WHERE owner_email = $1 AND source_key = $2
+     LIMIT 1`,
+    [ownerEmail, sourceKey],
+  )
+  return result.rows[0]?.content || null
+}
+
 export async function appendAgentTaskDocument(input: {
   ownerEmail: string
   boardId: string

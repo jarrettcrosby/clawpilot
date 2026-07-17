@@ -1398,6 +1398,8 @@ async function activeCrmContactOwners(
        ON membership.pipeline_id = pipeline.id
       AND membership.user_email = app_user.email
      WHERE app_user.status = 'active'
+       AND app_user.crm_user_enabled = true
+       AND app_user.reference_code IS NOT NULL
        AND (pipeline.owner_email = app_user.email OR membership.user_email IS NOT NULL)
        AND (
          ($2 <> '' AND app_user.reference_code = $2)
@@ -1538,6 +1540,8 @@ async function normalizeStageCrmRecordInput(
             AND membership.user_email = app_user.email
            WHERE (app_user.email = lower($2) OR lower(COALESCE(app_user.display_name, '')) = lower($2))
              AND app_user.status = 'active'
+             AND app_user.crm_user_enabled = true
+             AND app_user.reference_code IS NOT NULL
              AND (pipeline.owner_email = app_user.email OR membership.user_email IS NOT NULL)
            ORDER BY app_user.email
            LIMIT 2`,
@@ -3137,6 +3141,8 @@ async function readPipelineCatalogPeople(
       AND contact.app_user_email = app_user.email
      WHERE app_user.organization_id = $2::uuid
        AND app_user.status = 'active'
+       AND app_user.crm_user_enabled = true
+       AND app_user.reference_code IS NOT NULL
      UNION ALL
      SELECT contact.id::text, contact.reference_code, contact.full_name,
        COALESCE(contact.email, ''), COALESCE(contact.job_title, ''),
@@ -3377,6 +3383,8 @@ export async function listCrmPipelineUsersInPostgres(pipelineId: string): Promis
        ON membership.pipeline_id = pipeline.id
       AND membership.user_email = app_user.email
      WHERE app_user.status = 'active'
+       AND app_user.crm_user_enabled = true
+       AND app_user.reference_code IS NOT NULL
        AND (pipeline.owner_email = app_user.email OR membership.user_email IS NOT NULL)
      ORDER BY COALESCE(app_user.display_name, app_user.email), app_user.email`,
     [pipelineId],

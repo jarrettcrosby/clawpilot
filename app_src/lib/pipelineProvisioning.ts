@@ -121,6 +121,7 @@ export type SheetsJsonRequest = <T>(pathname: string, input?: SheetsRequestInput
 const GENERATED_TABS = EXPECTED_TABS.filter((title) => title !== 'Opportunities')
 const IDENTIFIER_TABS = ['Organizations', 'Contacts', 'Opportunities', 'Interactions'] as const
 const PROTECTION_PREFIX = 'ClawPilot managed:'
+const REQUIRED_CONFIGURED_DROPDOWNS = ['product', 'stage', 'priority', 'status', 'source', 'loss_reason'] as const
 const GENERATED_REPORT_CLEAR_RANGES = [
   "'Calculations'!B4:ZZZ",
   "'Dashboard'!B4:ZZZ",
@@ -150,6 +151,9 @@ const INITIAL_TAB_ROWS: Partial<Record<(typeof EXPECTED_TABS)[number], unknown[]
     ['Organizations', '=COUNTA(Organizations!C5:C)'],
     ['Contacts', '=COUNTA(Contacts!C5:C)'],
     ['Interactions', '=COUNTA(Interactions!C5:C)'],
+    ['Interactions 61-90 days', '=COUNTIFS(Interactions!C5:C,"<>",Interactions!G5:G,">="&TODAY()-90,Interactions!G5:G,"<"&TODAY()-60)'],
+    ['Interactions 31-60 days', '=COUNTIFS(Interactions!C5:C,"<>",Interactions!G5:G,">="&TODAY()-60,Interactions!G5:G,"<"&TODAY()-30)'],
+    ['Interactions last 30 days', '=COUNTIFS(Interactions!C5:C,"<>",Interactions!G5:G,">="&TODAY()-30,Interactions!G5:G,"<="&TODAY())'],
   ],
   Dashboard: [
     ['Total opportunities', '=Calculations!C5'],
@@ -165,6 +169,9 @@ const INITIAL_TAB_ROWS: Partial<Record<(typeof EXPECTED_TABS)[number], unknown[]
     ['Organizations', '=Calculations!C15'],
     ['Contacts', '=Calculations!C16'],
     ['Interactions', '=Calculations!C17'],
+    ['Interactions 61-90 days', '=Calculations!C18'],
+    ['Interactions 31-60 days', '=Calculations!C19'],
+    ['Interactions last 30 days', '=Calculations!C20'],
   ],
   Dropdowns: [
     ['', '', 'Identified Lead', 'A+', 'Open', 'Inbound', 'No Decision'],
@@ -843,6 +850,14 @@ async function spreadsheetMetadata(request: SheetsJsonRequest, sheetId: string) 
   return metadata
 }
 
+async function legacyDashboardHasUnmanagedHeader(request: SheetsJsonRequest, sheetId: string) {
+  const range = encodeURIComponent("'Dashboard'!D1:ZZ3")
+  const result = await request<{ values?: unknown[][] }>(
+    `/v4/spreadsheets/${sheetId}/values/${range}?majorDimension=ROWS`,
+  )
+  return (result.values || []).some((row) => row.some((value) => String(value ?? '').trim() !== ''))
+}
+
 function dashboardChartRequests(sheetId: number) {
   const chart = (input: {
     title: string
@@ -906,8 +921,8 @@ function dashboardChartRequests(sheetId: number) {
               rowIndex: input.anchorRowIndex,
               columnIndex: input.anchorColumnIndex,
             },
-            widthPixels: 420,
-            heightPixels: 260,
+            widthPixels: 400,
+            heightPixels: 250,
           },
         },
       },
@@ -941,6 +956,15 @@ function dashboardChartRequests(sheetId: number) {
       anchorColumnIndex: 9,
       chartType: 'BAR',
       valueAxisTitle: 'Records',
+    }),
+    chart({
+      title: 'Interactions, last 90 days',
+      startRowIndex: 17,
+      endRowIndex: 20,
+      anchorRowIndex: 18,
+      anchorColumnIndex: 9,
+      chartType: 'COLUMN',
+      valueAxisTitle: 'Interactions',
     }),
   ]
 }
@@ -985,6 +1009,27 @@ export async function configurePipelineTabsWithRequest(
       body: { requests, includeSpreadsheetInResponse: false },
       idempotent: false,
     })
+    metadata = await spreadsheetMetadata(request, sheetId)
+  }
+
+  const legacyDashboard = (metadata.sheets || [])
+    .find((sheet) => sheet.properties?.title === 'Dashboard')
+  if (
+    typeof legacyDashboard?.properties?.sheetId === 'number'
+    && await legacyDashboardHasUnmanagedHeader(request, sheetId)
+  ) {
+    await request(`/v4/spreadsheets/${sheetId}:batchUpdate`, {
+      method: 'POST',
+      body: {
+        requests: [
+          { deleteSheet: { sheetId: legacyDashboard.properties.sheetId } },
+          { addSheet: { properties: { title: 'Dashboard', index: EXPECTED_TABS.indexOf('Dashboard') } } },
+        ],
+        includeSpreadsheetInResponse: false,
+      },
+      idempotent: false,
+    })
+    newlyProvisionedTitles.add('Dashboard')
     metadata = await spreadsheetMetadata(request, sheetId)
   }
 
@@ -1123,6 +1168,41 @@ export async function configurePipelineTabsWithRequest(
             fields: 'userEnteredFormat.numberFormat',
           },
         },
+        {
+          updateDimensionProperties: {
+            range: { sheetId: sheetIdValue, dimension: 'COLUMNS', startIndex: 1, endIndex: 2 },
+            properties: { pixelSize: 180 },
+            fields: 'pixelSize',
+          },
+        },
+        {
+          updateDimensionProperties: {
+            range: { sheetId: sheetIdValue, dimension: 'COLUMNS', startIndex: 2, endIndex: 3 },
+            properties: { pixelSize: 120 },
+            fields: 'pixelSize',
+          },
+        },
+        {
+          updateDimensionProperties: {
+            range: { sheetId: sheetIdValue, dimension: 'COLUMNS', startIndex: 3, endIndex: 4 },
+            properties: { pixelSize: 24 },
+            fields: 'pixelSize',
+          },
+        },
+        {
+          updateDimensionProperties: {
+            range: { sheetId: sheetIdValue, dimension: 'COLUMNS', startIndex: 4, endIndex: 14 },
+            properties: { pixelSize: 84 },
+            fields: 'pixelSize',
+          },
+        },
+        {
+          updateDimensionProperties: {
+            range: { sheetId: sheetIdValue, dimension: 'ROWS', startIndex: 3, endIndex: 36 },
+            properties: { pixelSize: 20 },
+            fields: 'pixelSize',
+          },
+        },
       )
     }
     formattingRequests.push({
@@ -1145,11 +1225,13 @@ export async function configurePipelineTabsWithRequest(
         fields: 'userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)',
       },
     })
-    formattingRequests.push({
-      autoResizeDimensions: {
-        dimensions: { sheetId: sheetIdValue, dimension: 'COLUMNS', startIndex: 1, endIndex: 1 + TAB_HEADERS[title].length },
-      },
-    })
+    if (title !== 'Dashboard') {
+      formattingRequests.push({
+        autoResizeDimensions: {
+          dimensions: { sheetId: sheetIdValue, dimension: 'COLUMNS', startIndex: 1, endIndex: 1 + TAB_HEADERS[title].length },
+        },
+      })
+    }
     if (GENERATED_TABS.includes(title as (typeof GENERATED_TABS)[number])) {
       formattingRequests.push({
         addProtectedRange: {
@@ -1218,6 +1300,13 @@ function sheetText(value: string) {
   return /^[=+\-@]/.test(text) ? `'${text}` : text
 }
 
+function workbookBrandMark(branding: OrganizationBranding) {
+  if (!branding.hasCustomLogo) return 'CP'
+  const words = branding.organizationName.match(/[A-Za-z0-9]+/g) || []
+  if (words.length > 1) return words.slice(0, 2).map((word) => word[0]).join('').toUpperCase()
+  return (words[0] || 'CP').slice(0, 2).toUpperCase()
+}
+
 export async function applyPipelineWorkbookBrandingWithRequest(
   request: SheetsJsonRequest,
   sheetId: string,
@@ -1235,7 +1324,6 @@ export async function applyPipelineWorkbookBrandingWithRequest(
       'GOOGLE_PIPELINE_TABS_MISSING',
     )
   }
-  const escapedLogoUrl = branding.logoUrl.replace(/"/g, '""')
   await request(`/v4/spreadsheets/${sheetId}/values:batchUpdate`, {
     method: 'POST',
     body: {
@@ -1243,7 +1331,8 @@ export async function applyPipelineWorkbookBrandingWithRequest(
       data: managedSheets.flatMap((sheet) => {
         const title = sheet.properties?.title as (typeof EXPECTED_TABS)[number]
         return [
-          { range: `'${title}'!B1`, majorDimension: 'ROWS', values: [[`=IMAGE("${escapedLogoUrl}",4,48,48)`]] },
+          // Service-account IMAGE formulas remain #REF until a human approves external URL access.
+          { range: `'${title}'!B1`, majorDimension: 'ROWS', values: [[workbookBrandMark(branding)]] },
           { range: `'${title}'!C1`, majorDimension: 'ROWS', values: [[sheetText(branding.organizationName)]] },
           { range: `'${title}'!C2`, majorDimension: 'ROWS', values: [['Powered by ClawPilot']] },
         ]
@@ -1267,6 +1356,19 @@ export async function applyPipelineWorkbookBrandingWithRequest(
           range: { sheetId: id, startRowIndex: 0, endRowIndex: 3, startColumnIndex: 1, endColumnIndex },
           cell: { userEnteredFormat: { backgroundColor: primary } },
           fields: 'userEnteredFormat.backgroundColor',
+        },
+      },
+      {
+        repeatCell: {
+          range: { sheetId: id, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 1, endColumnIndex: 2 },
+          cell: {
+            userEnteredFormat: {
+              textFormat: { foregroundColor: foreground, fontSize: 18, bold: true },
+              horizontalAlignment: 'CENTER',
+              verticalAlignment: 'MIDDLE',
+            },
+          },
+          fields: 'userEnteredFormat(textFormat,horizontalAlignment,verticalAlignment)',
         },
       },
       {
@@ -1345,7 +1447,9 @@ async function verifyPipelineTabsAndHeaders(runtime: GoogleWorkspaceRuntime, she
   }
   const parameters = new URLSearchParams({ majorDimension: 'ROWS' })
   for (const title of EXPECTED_TABS) {
-    const endColumn = String.fromCharCode('A'.charCodeAt(0) + TAB_HEADERS[title].length)
+    const endColumn = title === 'Dropdowns'
+      ? 'ZZ'
+      : String.fromCharCode('A'.charCodeAt(0) + TAB_HEADERS[title].length)
     parameters.append('ranges', `'${title}'!B4:${endColumn}4`)
   }
   const values = await googleSheetsJson<{ valueRanges?: Array<{ values?: unknown[][] }> }>(
@@ -1361,10 +1465,27 @@ async function verifyPipelineTabsAndHeaders(runtime: GoogleWorkspaceRuntime, she
   }
   EXPECTED_TABS.forEach((title, index) => {
     const actual = values.valueRanges?.[index]?.values?.[0] || []
+    if (title === 'Dropdowns') {
+      const normalized = actual.map((header) => normalizeDropdownKey(String(header || ''))).filter(Boolean)
+      const unique = new Set(normalized)
+      const ownerConfigured = unique.has('owner') || unique.has('acct_manager')
+      if (
+        normalized.length !== unique.size
+        || !ownerConfigured
+        || REQUIRED_CONFIGURED_DROPDOWNS.some((header) => !unique.has(header))
+      ) {
+        throw new PipelineProvisioningRequestError(
+          'Managed pipeline Dropdowns headers did not verify',
+          409,
+          'GOOGLE_PIPELINE_HEADERS_INVALID',
+        )
+      }
+      return
+    }
     const expected = TAB_HEADERS[title]
     if (actual.length !== expected.length || expected.some((header, column) => actual[column] !== header)) {
       throw new PipelineProvisioningRequestError(
-        'Managed pipeline Sheet headers did not verify',
+        `Managed pipeline ${title} headers did not verify`,
         409,
         'GOOGLE_PIPELINE_HEADERS_INVALID',
       )
@@ -1684,6 +1805,13 @@ export async function provisionPipelineGoogleResources(pipelineId: string) {
       }
 
       if (alreadyReady) {
+        await configurePipelineTabs(runtime, sheetId)
+        await applyPipelineWorkbookBranding(
+          runtime,
+          sheetId,
+          await readPipelineWorkbookBranding(pipeline.id),
+        )
+        await verifyPipelineTabsAndHeaders(runtime, sheetId)
         await reconcilePipelineGooglePermissionsUnlocked(pipeline.id, runtime)
         const shortLinkId = await ensurePipelineShortLink(pipeline, sheetId)
         if (pipeline.shortLinkId !== shortLinkId) {

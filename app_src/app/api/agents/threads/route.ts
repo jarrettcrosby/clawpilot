@@ -22,7 +22,11 @@ import {
   type AgentTaskExecutionPlan,
 } from '@/lib/agents/taskExecution'
 import { isCrmBoardCard } from '@/lib/crm/boardCard.mjs'
-import { appendAgentTaskDocument, type AgentTaskDocumentReference } from '@/lib/documents'
+import {
+  appendAgentTaskDocument,
+  readAgentTaskDocumentContext,
+  type AgentTaskDocumentReference,
+} from '@/lib/documents'
 import { withFileLock } from '@/lib/fileLock'
 import type { Comment, Task } from '@/lib/types'
 import { buildCanonicalWorkItem, canonicalizeTasks } from '@/lib/workItemModel'
@@ -399,13 +403,16 @@ async function recordAgentResult(input: {
   const continuationDepth = Math.max(0, Math.trunc(Number(input.dispatchContinuationDepth) || 0))
   const progressedChecklist = Boolean(evidence?.completedChecklistIds.length)
     || Boolean(evidence?.changes.some((change) => /checklist item.*added/i.test(change)))
+  const correctiveContinuation = continuationDepth === 0
+    && !progressedChecklist
+    && Boolean(evidence?.deliverable.trim())
   const nextChecklistItem = tasks[index].checklist.find((item) => !item.done)
   if (
     boardId
     && dispatchId
     && planApplied
     && evidence?.status === 'running'
-    && progressedChecklist
+    && (progressedChecklist || correctiveContinuation)
     && nextChecklistItem
     && continuationDepth < 8
     && isPostgresTaskStoreEnabled()
@@ -529,7 +536,12 @@ function formatPriorTaskExecution(task: Task): string {
   return boundedContextText(context, 5_000)
 }
 
-function buildTaskContext(task: Task, agentId: string, durableContext?: string | null): string {
+function buildTaskContext(
+  task: Task,
+  agentId: string,
+  durableContext?: string | null,
+  taskDocumentContext?: string | null,
+): string {
   const checklist = (task.checklist || [])
     .map((item) => `- [${item.done ? 'x' : ' '}] ${item.text} (id: ${item.id})`)
     .join('\n')
@@ -559,6 +571,9 @@ function buildTaskContext(task: Task, agentId: string, durableContext?: string |
     priorExecution ? `Prior task execution:\n${priorExecution}` : null,
     recentComments ? `Recent card comments:\n${recentComments}` : null,
     recentActivity ? `Recent card activity:\n${recentActivity}` : null,
+    taskDocumentContext
+      ? `Current task working document:\n${boundedContextText(taskDocumentContext, 12_000)}`
+      : null,
     durableContext ? `Durable agent context:\n${durableContext}` : null,
   ].filter(Boolean).join('\n')
 }
@@ -888,6 +903,7 @@ export async function POST(req: NextRequest) {
     .filter((message) => dispatchId ? message.meta?.dispatchId !== dispatchId : message.id !== userMessage?.id)
     .map((message) => ({ role: message.role, text: message.text }))
   let durableAgentContext: string | null = null
+  let taskDocumentContext: string | null = null
   if (isPostgresTaskStoreEnabled()) {
     try {
       durableAgentContext = formatAgentContextMemories(await readAgentContextMemories({
@@ -897,8 +913,17 @@ export async function POST(req: NextRequest) {
     } catch (error) {
       console.error('[agent-threads] durable context read failed', error)
     }
+    try {
+      taskDocumentContext = await readAgentTaskDocumentContext({
+        ownerEmail: operatorId,
+        taskId,
+        agentId,
+      })
+    } catch (error) {
+      console.error('[agent-threads] task document context read failed', error)
+    }
   }
-  const taskContext = buildTaskContext(task, agentId, durableAgentContext)
+  const taskContext = buildTaskContext(task, agentId, durableAgentContext, taskDocumentContext)
 
   let responseText = ''
   let executionPlan: AgentTaskExecutionPlan | undefined
