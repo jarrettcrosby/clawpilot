@@ -193,6 +193,14 @@ function evidenceFromPlan(
   }
 }
 
+function boardStatusForExecution(task: Task, status: AgentTaskExecutionStatus): Task['status'] {
+  if (task.status === 'done') return 'done'
+  if (status === 'running') return 'in-progress'
+  if (status === 'completed' || status === 'awaiting_input' || status === 'blocked') return 'review'
+  if (status === 'triaged' && task.status === 'backlog') return 'todo'
+  return task.status
+}
+
 export function applyAgentTaskExecutionPlan(input: {
   task: Task
   plan: AgentTaskExecutionPlan
@@ -241,6 +249,8 @@ export function applyAgentTaskExecutionPlan(input: {
       ? 'completed'
       : plan.status
   const effectivePlan = effectiveStatus === plan.status ? plan : { ...plan, status: effectiveStatus }
+  const boardStatus = boardStatusForExecution(task, effectivePlan.status)
+  if (boardStatus !== task.status) changes.push(`card moved to ${boardStatus}`)
 
   const previousNextAction = String(task.workItem?.nextAction || '').trim()
   if (plan.nextAction !== previousNextAction) changes.push('next action updated')
@@ -286,6 +296,7 @@ export function applyAgentTaskExecutionPlan(input: {
   ]
   const nextTask = applyCanonicalWorkItem({
     ...task,
+    status: boardStatus,
     desc: description,
     checklist,
     activity,

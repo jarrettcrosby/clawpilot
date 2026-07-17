@@ -27,7 +27,7 @@ Start the isolated local runtime from the repository root:
 ./scripts/dev-start.sh
 ```
 
-Use `http://localhost:4002`. The start script supplies isolated `data-dev` paths; normal validation must not use a plain `npm run dev`. Keep a tool-managed startup shell alive while browser testing so its child process is not cleaned up.
+Use `http://localhost:4002`. The start script supplies isolated `data-dev` paths; normal validation must not use a plain `npm run dev`. When `APP_AUTH_REQUIRED=0` on a non-hosted runtime, API requests use a synthetic local operator so the isolated file-backed workspace remains testable without weakening Railway or Vercel session enforcement. Keep a tool-managed startup shell alive while browser testing so its child process is not cleaned up.
 
 ## Hosted Topology
 

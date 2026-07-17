@@ -42,6 +42,9 @@ These are application roles, not separately created ChatGPT custom agents. Each 
 ## Current Contract
 
 - Chat always has an explicit selected task and product agent. ClawPilot does not silently send a message against a hidden task.
+- The Agents workbench has two explicit interaction modes. **Discuss** keeps questions and scope refinement in the initiating user's private task thread without changing card evidence. **Work** creates a durable dispatch that may update the task, checklist, next action, and working document only through the structured execution contract.
+- A signed-user Work request commits the task state and dispatch outbox transaction before it is acknowledged as queued. The matching thread request uses a deterministic ID and can be reconstructed by the worker if its post-commit thread write is interrupted. The interface then follows the durable dispatch through queued, working, input-needed, blocked, and review states instead of holding one ambiguous request open.
+- A task may have only one queued or running agent dispatch. Users resume the recorded next action or retry a failed run after the active dispatch has stopped; duplicate clicks cannot create parallel task mutations.
 - Assignment creates durable dispatch work. A later signed-user card comment creates another dispatch only when it explicitly addresses the assigned agent.
 - The Railway worker claims dispatches, runs the selected role through the user's own ChatGPT/Codex authorization, and persists execution runs/results.
 - Autonomous dispatch uses a structured task-execution contract. The role can repair a missing or generic task description, add deduplicated checklist items, set the next action, and record a specific blocker or required operator input.
@@ -50,9 +53,10 @@ These are application roles, not separately created ChatGPT custom agents. Each 
 - A substantive user-authored description is immutable to agent execution. Dispatch retries restore the already-persisted semantic result, and a stale dispatch cannot mutate a task after a newer assignment or comment has been queued.
 - Substantive research, comparison, design, and specification output is written to one task-and-agent working document. Each continuation prepends an idempotent, timestamped work-log entry to that same document; dispatch retries cannot duplicate an entry.
 - The card receives a concise agent comment with status, persisted changes, next action, waiting state, and a clickable link to the working document. Full deliverables remain in the agent thread, execution result, and working document instead of being split across long card comments.
+- Discussion responses never create card comments, task documents, checklist mutations, or completion evidence. A user must choose Work when they want the agent to act on the task.
 - The exact persisted task mutations are appended to the task thread as evidence. A provider response with no mutation is reported as no deliverable changed.
 - A concrete `nextAction` from the structured result becomes the task `nextAction`.
-- Every successful role response uses `Changed`, `Remaining`, `Waiting on`, and `Learned`. `Learned` contains one reusable operating lesson or `none`.
+- Every successful Work result records changed evidence, remaining work, waiting state, and one reusable learned principle or `none`. Discuss replies remain natural task conversation and do not create execution evidence.
 - Users can only see tasks and threads on boards they can access.
 - Conversation replies use `responded`; autonomous task planning uses `triaged`; missing operator data uses `awaiting_input`; and unavailable capabilities use `blocked`. A successful HTTP/provider dispatch never means the requested work is complete.
 - `completed` requires separate, persisted completion evidence. Transport success, prose, plans, suggestions, and a model's self-reported success cannot close a task.

@@ -145,15 +145,15 @@ function buildAgentPrompt(input: AgentTurnInput): string {
       'Return exactly one JSON object with keys: status, summary, deliverable, nextAction, waitingOn, blocker, descriptionUpdate, checklistAdd, checklistComplete, learned.',
       'status must be running, completed, awaiting_input, or blocked. Use running after completing one evidenced checklist step when more work remains. Use completed only when the requested outcome and every relevant checklist item are complete. Use awaiting_input when one specific operator decision or datum is required. Use blocked only for a concrete unavailable capability.',
       'deliverable must contain the actual research, comparison, recommendation, specification, or other task result produced in this run. checklistComplete must contain at most one exact checklist item ID from the task context, and only when the deliverable is sufficient evidence for that item. checklistAdd must be an array of concise strings. Use empty strings and empty arrays when a field does not apply.',
+      'Do not present model memory as current external research. When the task requires current web, repository, email, calendar, CRM, or other external evidence that is not present in the supplied context, use blocked and name that missing capability. You may still produce a clearly labeled design based only on supplied facts when that satisfies the requested step.',
       'learned must be one generic reusable operating lesson or "none" and must exclude names, organizations, emails, IDs, URLs, customer data, and task-specific facts.',
       'Do not wrap the JSON in Markdown. Do not report a planned or suggested action as completed work.',
     ].join('\n\n')
   }
   return [
     ...context,
-    'Reply using exactly these headings: Changed, Remaining, Waiting on, Learned.',
-    'Learned must contain one reusable operating lesson from this work, or "none". Keep it generic and exclude names, organizations, emails, IDs, URLs, customer data, and task-specific facts.',
-    'Use "none" when there is no blocker. Do not claim an external action unless the supplied context proves it occurred.',
+    'This is a private task discussion, not an execution run. Answer the operator directly and concisely. Help clarify scope, compare choices, or prepare a precise instruction for a later Work run. Do not claim that the task, checklist, card, document, repository, or any external system changed.',
+    'Distinguish facts in the supplied task context from assumptions. Do not claim an external action or current external research unless the supplied context proves it occurred.',
   ].join('\n\n')
 }
 

@@ -10,6 +10,13 @@ const AGENT_NAMES: Record<string, string> = {
   calendar: 'Calendar',
 }
 
+const DISPATCH_TRIGGER_LABELS: Record<AgentDispatchTrigger, string> = {
+  assignment: 'assignment',
+  comment: 'comment',
+  continuation: 'continued work',
+  manual: 'manual work request',
+}
+
 export function assignmentKickoffText() {
   return 'This task was assigned to you for autonomous execution. Use the available task-scoped tools now, persist concrete changes, and record evidence. If the requested deliverable requires a capability that is not available in this run, record that exact blocker instead of reporting the work as complete.'
 }
@@ -46,7 +53,7 @@ export function prepareAgentDispatch(input: {
     continuationDepth: input.continuationDepth || 0,
     queuedAt,
   }
-  const label = input.trigger === 'assignment' ? 'assignment' : input.trigger === 'comment' ? 'comment' : 'continued work'
+  const label = DISPATCH_TRIGGER_LABELS[input.trigger]
   const nextTask: Task = {
     ...input.task,
     execution: {
