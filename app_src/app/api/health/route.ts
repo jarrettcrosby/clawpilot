@@ -185,6 +185,7 @@ export async function GET() {
           pipeline_spelling_migration_applied: boolean
           residual_pipeline_catalog_migration_applied: boolean
           historical_pipeline_catalog_migration_applied: boolean
+          configured_pipeline_dropdowns_migration_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -365,6 +366,11 @@ export async function GET() {
                 FROM schema_migrations
                 WHERE filename = '0050_historical_pipeline_catalog_restore.sql'
               ) AS historical_pipeline_catalog_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0051_preserve_configured_pipeline_dropdowns.sql'
+              ) AS configured_pipeline_dropdowns_migration_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -412,6 +418,7 @@ export async function GET() {
             && row?.pipeline_spelling_migration_applied
             && row?.residual_pipeline_catalog_migration_applied
             && row?.historical_pipeline_catalog_migration_applied
+            && row?.configured_pipeline_dropdowns_migration_applied
             && row?.migration_checksums_present
           ),
         }

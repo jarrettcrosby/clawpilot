@@ -144,6 +144,7 @@ for (const requiredPath of [
   'db/migrations/0048_canonical_pipeline_negotiation_spelling.sql',
   'db/migrations/0049_residual_pipeline_catalog_repair.sql',
   'db/migrations/0050_historical_pipeline_catalog_restore.sql',
+  'db/migrations/0051_preserve_configured_pipeline_dropdowns.sql',
   'scripts/start-railway.sh',
   'scripts/test-suitecrm-interaction-ingestion.mjs',
   'scripts/pipeline-outbox-poller.mjs',
