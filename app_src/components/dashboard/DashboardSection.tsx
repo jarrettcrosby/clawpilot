@@ -37,7 +37,6 @@ type DocMeta = {
   slug: string
 }
 
-type ExecutionSummary = { count: number }
 type UserSummary = { displayName?: string | null; email?: string }
 type Filter = { priority: string[]; status: string[]; labels: string[] }
 type WorkspaceResource = {
@@ -66,7 +65,6 @@ type PipelineSnapshot = {
 type Availability = {
   tasks: boolean
   docs: boolean
-  execution: boolean
   pipeline: boolean
 }
 type Props = {
@@ -94,7 +92,6 @@ const STATUS_COLORS: Record<string, string> = {
 const EMPTY_AVAILABILITY: Availability = {
   tasks: false,
   docs: false,
-  execution: false,
   pipeline: false,
 }
 
@@ -158,7 +155,6 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter }: P
   const { timeZone } = useUserDateTime()
   const [tasks, setTasks] = useState<Task[]>([])
   const [docs, setDocs] = useState<DocMeta[]>([])
-  const [executionResults, setExecutionResults] = useState<ExecutionSummary | null>(null)
   const [pipelineSnapshot, setPipelineSnapshot] = useState<PipelineSnapshot | null>(null)
   const [workspace, setWorkspace] = useState<WorkspaceSnapshot | null>(null)
   const [user, setUser] = useState<UserSummary | null>(null)
@@ -194,14 +190,13 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter }: P
       const results = await Promise.allSettled([
         fetchJson(taskRequestUrl(boardId), controller.signal),
         fetchJson('/api/docs', controller.signal),
-        fetchJson('/api/execution-results/summary', controller.signal),
         fetchJson('/api/users', controller.signal),
         fetchJson(pipelineRequestUrl(boardId, pipelineId), controller.signal),
       ])
       clearTimeout(timeout)
       if (!active) return
 
-      const [tasksResult, docsResult, executionResult, usersResult, pipelineResult] = results
+      const [tasksResult, docsResult, usersResult, pipelineResult] = results
       const nextAvailability = { ...EMPTY_AVAILABILITY }
       if (tasksResult.status === 'fulfilled' && Array.isArray(tasksResult.value)) {
         setTasks(tasksResult.value as Task[])
@@ -210,10 +205,6 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter }: P
       if (docsResult.status === 'fulfilled' && Array.isArray(docsResult.value)) {
         setDocs(docsResult.value as DocMeta[])
         nextAvailability.docs = true
-      }
-      if (executionResult.status === 'fulfilled' && executionResult.value && typeof executionResult.value === 'object') {
-        setExecutionResults(executionResult.value as ExecutionSummary)
-        nextAvailability.execution = true
       }
       if (usersResult.status === 'fulfilled' && usersResult.value && typeof usersResult.value === 'object') {
         const currentUser = (usersResult.value as { currentUser?: UserSummary }).currentUser
@@ -245,20 +236,13 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter }: P
     async function refreshLiveData() {
       controller?.abort()
       controller = new AbortController()
-      const results = await Promise.allSettled([
-        fetchJson(taskRequestUrl(selectedBoardId), controller.signal),
-        fetchJson('/api/execution-results/summary', controller.signal),
-      ])
+      const results = await Promise.allSettled([fetchJson(taskRequestUrl(selectedBoardId), controller.signal)])
       if (!active) return
-      const [tasksResult, executionResult] = results
+      const [tasksResult] = results
       if (tasksResult.status === 'fulfilled' && Array.isArray(tasksResult.value)) {
         setTasks(tasksResult.value as Task[])
         setAvailability((current) => ({ ...current, tasks: true }))
         setSnapshotTime(Date.now())
-      }
-      if (executionResult.status === 'fulfilled' && executionResult.value && typeof executionResult.value === 'object') {
-        setExecutionResults(executionResult.value as ExecutionSummary)
-        setAvailability((current) => ({ ...current, execution: true }))
       }
       if (results.some((result) => result.status === 'rejected')) setLoadWarning(true)
     }
@@ -277,6 +261,11 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter }: P
   const inProgress = useMemo(() => activeTasks.filter((task) => task.status === 'in-progress'), [activeTasks])
   const highPriority = useMemo(() => activeTasks.filter((task) => task.priority === 'high'), [activeTasks])
   const done = useMemo(() => operationalTasks.filter((task) => task.status === 'done'), [operationalTasks])
+  const agentAttention = useMemo(() => operationalTasks.filter((task) => {
+    if (!task.assignedAgent) return false
+    const executionStatus = String(task.execution?.executionStatus || '').toLowerCase()
+    return executionStatus === 'blocked' || executionStatus === 'awaiting_input'
+  }), [operationalTasks])
   const referenceTime = snapshotTime || 1
   const nowWorking = useMemo(() => deriveNowWorking(operationalTasks, referenceTime), [operationalTasks, referenceTime])
 
@@ -338,7 +327,7 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter }: P
     { label: 'High priority', value: highPriority.length, available: availability.tasks, loading: taskLoading, Icon: PriorityHighRounded, color: '#FFA726', action: () => navigateToProjects({ priority: ['high'], status: [], labels: [] }) },
     { label: 'Open tasks', value: activeTasks.length, available: availability.tasks, loading: taskLoading, Icon: RadioButtonUncheckedRounded, color: '#CFC6EA', action: () => navigateToProjects({ priority: [], status: ACTIVE_STATUS_ORDER, labels: [] }) },
     { label: 'Completed', value: done.length, available: availability.tasks, loading: taskLoading, Icon: CheckCircleRounded, color: '#66BB6A', action: () => navigateToProjects({ priority: [], status: ['done'], labels: [] }) },
-    { label: 'Agent results', value: executionResults?.count || 0, available: availability.execution, loading, Icon: SmartToyRounded, color: '#4FD1B8', action: () => onNavigate('agents') },
+    { label: 'Agent attention', value: agentAttention.length, available: availability.tasks, loading: taskLoading, Icon: SmartToyRounded, color: '#4FD1B8', action: () => onNavigate('agents') },
   ]
 
   function navigateToProjects(filter: Filter) {

@@ -1,3 +1,4 @@
+import type { PoolClient } from 'pg'
 import { query, withTransaction } from '@/lib/persistence/postgres'
 import { recordAuditEvent } from '@/lib/auditWriter'
 import {
@@ -10,6 +11,7 @@ import {
 } from '@/lib/persistence/pipeline'
 import { shortLinkUrl } from '@/lib/shortlinks'
 import { ensurePrimaryWorkspaceOrganization } from '@/lib/organizations'
+import { createBasePipelineDropdownCatalog } from '@/lib/pipeline/baseTemplate.mjs'
 import {
   effectiveUserPermissions,
   getAppUser,
@@ -190,6 +192,15 @@ function cleanResourceName(value: unknown, fallback: string): string {
   return name
 }
 
+async function ensureBasePipelineTemplate(client: PoolClient, pipelineId: string) {
+  await client.query(
+    `INSERT INTO pipeline_dropdown_catalogs (pipeline_id, catalog, created_at, updated_at)
+     VALUES ($1::uuid, $2::jsonb, now(), now())
+     ON CONFLICT (pipeline_id) DO NOTHING`,
+    [pipelineId, JSON.stringify(createBasePipelineDropdownCatalog())],
+  )
+}
+
 export async function ensureDefaultResourcesForUser(emailValue: unknown): Promise<{
   boardId: string
   pipelineId: string
@@ -254,6 +265,7 @@ export async function ensureDefaultResourcesForUser(emailValue: unknown): Promis
       )
     }
     if (!personalPipeline.rows[0]) throw new Error('Unable to provision a personal pipeline')
+    await ensureBasePipelineTemplate(client, personalPipeline.rows[0].id)
 
     const crmPipeline = await client.query<{ id: string; owner_email: string }>(
       `SELECT pipeline.id::text, pipeline.owner_email
@@ -630,6 +642,7 @@ export async function createPipelineSpace(input: { actorEmail: unknown; name: un
        RETURNING id::text`,
       [name, actor.email, organization.id],
     )
+    await ensureBasePipelineTemplate(client, result.rows[0].id)
     await recordAuditEvent({
       actor: actor.email,
       eventType: 'pipeline.space.created',

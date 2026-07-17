@@ -33,10 +33,13 @@ import AddToDriveRounded from '@mui/icons-material/AddToDriveRounded'
 import OpenInNewRounded from '@mui/icons-material/OpenInNewRounded'
 import ReplayRounded from '@mui/icons-material/ReplayRounded'
 import TuneRounded from '@mui/icons-material/TuneRounded'
+import InsightsRounded from '@mui/icons-material/InsightsRounded'
+import HelpOutlineRounded from '@mui/icons-material/HelpOutlineRounded'
 import Tabs from '@mui/material/Tabs'
 import Tab from '@mui/material/Tab'
 import useMediaQuery from '@mui/material/useMediaQuery'
 import WorkspaceSelector from '@/components/workspaces/WorkspaceSelector'
+import PipelineInsights from '@/components/pipeline/PipelineInsights'
 import PipelineCatalogDialog, {
   type PipelineCatalogPerson,
   type PipelineCatalogProduct,
@@ -44,6 +47,8 @@ import PipelineCatalogDialog, {
 } from '@/components/pipeline/PipelineCatalogDialog'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import { formatUserDateTime, type UserDateTimeSettings } from '@/lib/userDateTime'
+import { isActivePipelineStatus, summarizePipeline } from '@/lib/pipeline/analytics.mjs'
+import { BASE_PIPELINE_WORKFLOW } from '@/lib/pipeline/baseTemplate.mjs'
 
 type Contact = {
   id: string
@@ -98,6 +103,14 @@ type Deal = {
   contactTitle?: string
 }
 
+type PipelineSummary = {
+  activeCount: number
+  wonCount: number
+  activeValue: number
+  weightedActiveValue: number
+  active: Deal[]
+}
+
 type LooseRecord = Record<string, unknown>
 type DropdownOption = { active?: boolean; sort_order?: number; label?: string; value?: string }
 type PipelineProvisioningStatus = 'not_requested' | 'queued' | 'provisioning' | 'ready' | 'failed'
@@ -136,11 +149,11 @@ function normalizeDeal(d: Deal): Deal {
   }
 }
 
-const DEFAULT_STAGES = ['Identified Lead', 'Qualified Lead', 'Needs Analysis', 'Demo', 'Proposal', 'Negotiation', 'Loss', 'Won']
-const DEFAULT_PRIORITIES = ['A+', 'A', 'B', 'C', 'D']
-const DEFAULT_STATUSES = ['Open', 'On Hold', 'Closed', 'Won', 'Lost', 'Abandoned']
-const DEFAULT_SOURCES = ['Inbound', 'Outbound', 'Referral', 'Website', 'Partner']
-const DEFAULT_LOSS_REASONS = ['No Decision', 'Budget', 'Competition', 'Not a Fit']
+const DEFAULT_STAGES = [...BASE_PIPELINE_WORKFLOW.stage]
+const DEFAULT_PRIORITIES = [...BASE_PIPELINE_WORKFLOW.priority]
+const DEFAULT_STATUSES = [...BASE_PIPELINE_WORKFLOW.status]
+const DEFAULT_SOURCES = [...BASE_PIPELINE_WORKFLOW.source]
+const DEFAULT_LOSS_REASONS = [...BASE_PIPELINE_WORKFLOW.loss_reason]
 
 const PRIORITY_COLORS: Record<string, string> = {
   'A+': '#66BB6A', A: '#A8C7FA', B: '#CFC6EA', C: '#FDD663', D: '#EF5350',
@@ -160,9 +173,9 @@ function fmt$(n: number) {
 }
 
 function compareDealsForPriority(a: Deal, b: Deal) {
-  const aOpen = (a.status || '').toLowerCase() === 'open' ? 1 : 0
-  const bOpen = (b.status || '').toLowerCase() === 'open' ? 1 : 0
-  if (aOpen !== bOpen) return bOpen - aOpen
+  const aActive = isActivePipelineStatus(a.status) ? 1 : 0
+  const bActive = isActivePipelineStatus(b.status) ? 1 : 0
+  if (aActive !== bActive) return bActive - aActive
 
   const aPriority = PRIORITY_SORT_WEIGHT[(a.priority || '').trim()] || 0
   const bPriority = PRIORITY_SORT_WEIGHT[(b.priority || '').trim()] || 0
@@ -713,8 +726,8 @@ export default function PipelineSection() {
   const [deals, setDeals] = useState<Deal[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
-  const [view, setView] = useState<'board' | 'list'>('board')
-  const [filterStatus, setFilterStatus] = useState<'all' | 'open' | 'closed'>('all')
+  const [view, setView] = useState<'insights' | 'board' | 'list'>('board')
+  const [filterStatus, setFilterStatus] = useState<'all' | 'active' | 'terminal'>('all')
   const [selectedDeal, setSelectedDeal] = useState<Deal | null>(null)
   const [stageOptions, setStageOptions] = useState<string[]>(DEFAULT_STAGES)
   const [priorityOptions, setPriorityOptions] = useState<string[]>(DEFAULT_PRIORITIES)
@@ -725,6 +738,9 @@ export default function PipelineSection() {
   const [catalogProducts, setCatalogProducts] = useState<PipelineCatalogProduct[]>([])
   const [catalogOpen, setCatalogOpen] = useState(false)
   const compactLandscapeBoard = useMediaQuery('(orientation: landscape) and (max-height: 500px) and (max-width: 899.95px)')
+  const mobilePortraitBoard = useMediaQuery('(orientation: portrait) and (max-width: 899.95px)')
+  const singleStageBoard = compactLandscapeBoard || mobilePortraitBoard
+  const [pipelineGuideOpen, setPipelineGuideOpen] = useState(false)
   const [activeStage, setActiveStage] = useState<string>(DEFAULT_STAGES[0])
   const [syncSurface, setSyncSurface] = useState<SyncSurface>({ state: 'unknown', lastSyncedAt: null, summary: null })
   const [syncingNow, setSyncingNow] = useState(false)
@@ -867,6 +883,10 @@ export default function PipelineSection() {
   const loadCatalog = async () => {
     const response = await fetch('/api/pipeline/catalog', { cache: 'no-store' })
     const payload = await response.json().catch(() => ({}))
+    if (response.status === 409 && String(payload?.error || '').includes('Postgres storage')) {
+      applyCatalog({ pipelineId: '', canEdit: false, people: [], products: [] })
+      return
+    }
     if (!response.ok || payload?.ok === false) throw new Error(payload?.error || 'Unable to load pipeline setup')
     applyCatalog({
       pipelineId: String(payload.pipelineId || ''),
@@ -910,22 +930,19 @@ export default function PipelineSection() {
   }, [contactOptions.length, contactsLoading, newOpportunityOpen, organizations.length, organizationsLoading, selectedDeal])
 
   const filtered = useMemo(() => {
-    const scoped = filterStatus === 'open'
-      ? deals.filter(d => (d.status || '').toLowerCase() === 'open')
-      : filterStatus === 'closed'
-        ? deals.filter(d => (d.status || '').toLowerCase() !== 'open')
+    const scoped = filterStatus === 'active'
+      ? deals.filter(d => isActivePipelineStatus(d.status))
+      : filterStatus === 'terminal'
+        ? deals.filter(d => !isActivePipelineStatus(d.status))
         : deals
 
     return [...scoped].sort(compareDealsForPriority)
   }, [deals, filterStatus])
 
-  const openDeals = useMemo(() => deals.filter(d => (d.status || '').toLowerCase() === 'open'), [deals])
-  const closedDeals = useMemo(() => deals.filter(d => (d.status || '').toLowerCase() !== 'open'), [deals])
-  const highPriorityOpenDeals = useMemo(() => openDeals.filter(d => ['A+', 'A'].includes((d.priority || '').trim())), [openDeals])
-  const totalValue = useMemo(() => openDeals.reduce((s, d) => s + d.value, 0), [openDeals])
-  const weightedPipelineValue = useMemo(
-    () => openDeals.reduce((s, d) => s + (Number(d.value || 0) * (Number(d.probability || 0) / 100)), 0),
-    [openDeals],
+  const pipelineSummary = useMemo(() => summarizePipeline(deals) as unknown as PipelineSummary, [deals])
+  const highPriorityActiveDeals = useMemo(
+    () => pipelineSummary.active.filter((deal: Deal) => ['A+', 'A'].includes((deal.priority || '').trim())),
+    [pipelineSummary.active],
   )
 
   const moveDealStage = async (deal: Deal, direction: -1 | 1) => {
@@ -1145,15 +1162,15 @@ export default function PipelineSection() {
             '& > *': { flexShrink: 0 },
           } : undefined}
         >
-          <Box><Typography variant="caption" color="text.disabled">Pipeline Value</Typography><Typography variant="h6" fontWeight={700} lineHeight={1.15} color="#66BB6A">{fmt$(totalValue)}</Typography></Box>
+          <Box><Typography variant="caption" color="text.disabled">Active Pipeline</Typography><Typography variant="h6" fontWeight={700} lineHeight={1.15} color="#66BB6A">{fmt$(pipelineSummary.activeValue)}</Typography></Box>
           <Box>
             <Typography variant="caption" color="text.disabled">Weighted Value</Typography>
-            <Typography variant="h6" fontWeight={700} lineHeight={1.15} color="#A8C7FA">{fmt$(weightedPipelineValue)}</Typography>
+            <Typography variant="h6" fontWeight={700} lineHeight={1.15} color="#A8C7FA">{fmt$(pipelineSummary.weightedActiveValue)}</Typography>
             {!compactLandscapeBoard && <Typography variant="caption" color="text.secondary">Σ(value × win probability)</Typography>}
           </Box>
-          <Box><Typography variant="caption" color="text.disabled">Open</Typography><Typography variant="h6" fontWeight={700} lineHeight={1.15}>{openDeals.length}</Typography></Box>
-          <Box><Typography variant="caption" color="text.disabled">High Priority</Typography><Typography variant="h6" fontWeight={700} lineHeight={1.15}>{highPriorityOpenDeals.length}</Typography></Box>
-          <Box><Typography variant="caption" color="text.disabled">Closed</Typography><Typography variant="h6" fontWeight={700} lineHeight={1.15}>{closedDeals.length}</Typography></Box>
+          <Box><Typography variant="caption" color="text.disabled">Active</Typography><Typography variant="h6" fontWeight={700} lineHeight={1.15}>{pipelineSummary.activeCount}</Typography></Box>
+          <Box><Typography variant="caption" color="text.disabled">High Priority</Typography><Typography variant="h6" fontWeight={700} lineHeight={1.15}>{highPriorityActiveDeals.length}</Typography></Box>
+          <Box><Typography variant="caption" color="text.disabled">Won</Typography><Typography variant="h6" fontWeight={700} lineHeight={1.15}>{pipelineSummary.wonCount}</Typography></Box>
 
           <Stack spacing={0.45} sx={{ minWidth: compactLandscapeBoard ? 170 : { xs: '100%', sm: 260 }, maxWidth: compactLandscapeBoard ? 220 : { xs: '100%', md: 460 } }}>
             <Typography variant="caption" sx={{ color: '#A8C7FA', fontWeight: 700 }}>{pipelineSyncEnabled ? 'Pipeline sync' : 'Pipeline storage'}</Typography>
@@ -1252,6 +1269,21 @@ export default function PipelineSection() {
                 </IconButton>
               </span>
             </Tooltip>
+            <Tooltip title="How pipeline calculations work">
+              <IconButton
+                aria-label="Open pipeline guide"
+                onClick={() => setPipelineGuideOpen(true)}
+                sx={{
+                  minWidth: 38,
+                  minHeight: 38,
+                  border: '1px solid rgba(255,255,255,0.18)',
+                  color: 'text.secondary',
+                  borderRadius: 1,
+                }}
+              >
+                <HelpOutlineRounded fontSize="small" />
+              </IconButton>
+            </Tooltip>
             {canEdit ? (
               <Button
                 variant="contained"
@@ -1281,10 +1313,11 @@ export default function PipelineSection() {
             ) : null}
             <ToggleButtonGroup size="small" value={filterStatus} exclusive onChange={(_, v) => v && setFilterStatus(v)}>
               <ToggleButton value="all">All</ToggleButton>
-              <ToggleButton value="open">Open</ToggleButton>
-              <ToggleButton value="closed">Closed</ToggleButton>
+              <ToggleButton value="active">Active</ToggleButton>
+              <ToggleButton value="terminal">Terminal</ToggleButton>
             </ToggleButtonGroup>
             <ToggleButtonGroup size="small" value={view} exclusive onChange={(_, v) => v && setView(v)}>
+              <Tooltip title="Pipeline insights"><ToggleButton value="insights"><InsightsRounded sx={{ fontSize: 18 }} /></ToggleButton></Tooltip>
               <Tooltip title="Board view"><ToggleButton value="board"><ViewColumnRounded sx={{ fontSize: 18 }} /></ToggleButton></Tooltip>
               <Tooltip title="List view"><ToggleButton value="list"><TableRowsRounded sx={{ fontSize: 18 }} /></ToggleButton></Tooltip>
             </ToggleButtonGroup>
@@ -1308,10 +1341,24 @@ export default function PipelineSection() {
 
       <Box
         data-testid="pipeline-results"
-        sx={{ flex: 1, minHeight: 0, overflow: 'auto', px: { xs: 1, md: 2 }, py: compactLandscapeBoard ? 0.5 : 2 }}
+        sx={{
+          flex: 1,
+          minHeight: 0,
+          overflow: 'auto',
+          px: { xs: 1, md: 2 },
+          py: compactLandscapeBoard ? 0.5 : 2,
+          WebkitOverflowScrolling: 'touch',
+          touchAction: singleStageBoard ? 'pan-y' : 'auto',
+        }}
       >
-        {view === 'board' ? (
-          compactLandscapeBoard ? (
+        {view === 'insights' ? (
+          <PipelineInsights
+            deals={deals}
+            stages={stageOptions}
+            onOpenDeal={(deal) => setSelectedDeal(deals.find((candidate) => candidate.id === deal.id) || null)}
+          />
+        ) : view === 'board' ? (
+          singleStageBoard ? (
             <Box sx={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 }}>
               <Tabs
                 value={activeStage}
@@ -1332,7 +1379,7 @@ export default function PipelineSection() {
                 ))}
               </Tabs>
 
-              <Box sx={{ flex: 1, minHeight: 0, overflow: 'auto', WebkitOverflowScrolling: 'touch', pr: 0.5 }}>
+              <Box sx={{ flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden', WebkitOverflowScrolling: 'touch', touchAction: 'pan-y', pr: 0.5 }}>
                 {(filtered.filter(d => d.stage === activeStage)).map(deal => (
                   <DealCard key={deal.id} deal={deal} onClick={() => setSelectedDeal(deal)} onMoveStage={moveDealStage} />
                 ))}
@@ -1376,6 +1423,60 @@ export default function PipelineSection() {
           </Box>
         )}
       </Box>
+
+      <Dialog
+        open={pipelineGuideOpen}
+        onClose={() => setPipelineGuideOpen(false)}
+        fullScreen={singleStageBoard}
+        fullWidth
+        maxWidth="sm"
+        PaperProps={{ sx: { backgroundColor: '#1A1A23', border: '1px solid rgba(255,255,255,0.08)', borderRadius: singleStageBoard ? 0 : 1 } }}
+      >
+        <DialogTitle sx={{ fontWeight: 700, pr: 7 }}>
+          How your pipeline works
+          <IconButton
+            aria-label="Close pipeline guide"
+            onClick={() => setPipelineGuideOpen(false)}
+            sx={{ position: 'absolute', right: 12, top: 10 }}
+          >
+            <CloseRounded />
+          </IconButton>
+        </DialogTitle>
+        <DialogContent dividers sx={{ py: 2.5 }}>
+          <Stack spacing={2.5}>
+            <Box>
+              <Typography variant="subtitle2" fontWeight={700}>Status controls lifecycle and reporting</Typography>
+              <Typography variant="body2" color="text.secondary" mt={0.5}>
+                Open and On Hold are active. Closed and Won count as won. Lost and Abandoned count as lost. Active pipeline value excludes every terminal status.
+              </Typography>
+            </Box>
+            <Box>
+              <Typography variant="subtitle2" fontWeight={700}>Stage controls the board lane</Typography>
+              <Typography variant="body2" color="text.secondary" mt={0.5}>
+                Moving a card changes its sales-process stage. Stage does not override lifecycle status; contradictory combinations appear in Insights for review.
+              </Typography>
+            </Box>
+            <Box>
+              <Typography variant="subtitle2" fontWeight={700}>Weighted value is value × probability</Typography>
+              <Typography variant="body2" color="text.secondary" mt={0.5}>
+                Expected Close places active value into the forecast period. Products can be selected together on one opportunity rather than stored as combination products.
+              </Typography>
+            </Box>
+            <Box>
+              <Typography variant="subtitle2" fontWeight={700}>The Sheet is a synchronized operator view</Typography>
+              <Typography variant="body2" color="text.secondary" mt={0.5}>
+                Edit opportunity rows only. ClawPilot generates CRM records, dropdowns, calculations, and dashboard reporting from the same pipeline definitions used here.
+              </Typography>
+            </Box>
+            <Alert severity="info" sx={{ borderRadius: 1 }}>
+              Every new pipeline starts with this base workflow. Owners can tailor stages, priorities, statuses, sources, people, and products from Configure pipeline.
+            </Alert>
+          </Stack>
+        </DialogContent>
+        <DialogActions sx={{ px: 3, py: 2 }}>
+          <Button onClick={() => setPipelineGuideOpen(false)}>Done</Button>
+        </DialogActions>
+      </Dialog>
 
       <Dialog
         open={pipelineSheetDialogOpen}

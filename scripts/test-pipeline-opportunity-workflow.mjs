@@ -4,6 +4,15 @@ import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { crmDateOnly } from '../app_src/lib/crm/dateOnly.mjs'
 import { splitPipelineProductNames } from '../app_src/lib/pipeline/productNames.mjs'
+import {
+  isActivePipelineStatus,
+  isTerminalPipelineStatus,
+  summarizePipeline,
+} from '../app_src/lib/pipeline/analytics.mjs'
+import {
+  BASE_PIPELINE_WORKFLOW,
+  createBasePipelineDropdownCatalog,
+} from '../app_src/lib/pipeline/baseTemplate.mjs'
 
 const root = process.cwd()
 const read = (relativePath) => readFileSync(resolve(root, relativePath), 'utf8')
@@ -119,6 +128,38 @@ assert.deepEqual(
 assert.deepEqual(splitPipelineProductNames(['LDS', 'POD, TIA']), ['LDS', 'POD', 'TIA'])
 assert.match(crmPersistence, /splitPipelineProductNames/)
 assert.match(read('app_src/lib/persistence/pipeline.ts'), /rawValue\.toLowerCase\(\) === 'neogotiation'/)
+
+assert.equal(isActivePipelineStatus('Open'), true)
+assert.equal(isActivePipelineStatus('On Hold'), true)
+assert.equal(isTerminalPipelineStatus('Closed'), true)
+assert.equal(isTerminalPipelineStatus('Won'), true)
+const analytics = summarizePipeline([
+  { id: 'open', status: 'Open', stage: 'Proposal', value: 100, probability: 50, closeDate: '2026-08-01' },
+  { id: 'hold', status: 'On Hold', stage: 'Needs Analysis', value: 200, probability: 25, closeDate: '2026-09-01' },
+  { id: 'won', status: 'Closed', stage: 'Closed', value: 300, probability: 100, closeDate: '2026-06-01' },
+  { id: 'lost', status: 'Lost', stage: 'Loss', value: 400, probability: 0, closeDate: '2026-05-01' },
+  { id: 'conflict', status: 'Open', stage: 'Loss', value: 500, probability: 10, closeDate: '' },
+], { now: '2026-07-16T12:00:00Z' })
+assert.equal(analytics.totalCount, 5)
+assert.equal(analytics.activeCount, 3)
+assert.equal(analytics.onHoldCount, 1)
+assert.equal(analytics.activeValue, 800)
+assert.equal(analytics.weightedActiveValue, 150)
+assert.equal(analytics.wonCount, 1)
+assert.equal(analytics.lostCount, 1)
+assert.equal(analytics.winRate, 50)
+assert.deepEqual(analytics.lifecycleConflicts.map((deal) => deal.id), ['conflict'])
+assert.deepEqual(analytics.missingCloseDate.map((deal) => deal.id), ['conflict'])
+
+const baseCatalog = createBasePipelineDropdownCatalog('2026-07-16T12:00:00Z')
+assert.deepEqual(BASE_PIPELINE_WORKFLOW.status, ['Open', 'On Hold', 'Won', 'Lost', 'Abandoned'])
+assert.deepEqual(baseCatalog.dropdowns.product, [])
+assert.deepEqual(baseCatalog.dropdowns.stage.map((option) => option.value), BASE_PIPELINE_WORKFLOW.stage)
+assert.equal(baseCatalog.dropdowns.stage.every((option, index) => option.active && option.sort_order === index), true)
+const tenancy = read('app_src/lib/tenancy.ts')
+assert.match(tenancy, /ensureBasePipelineTemplate\(client, personalPipeline\.rows\[0\]\.id\)/)
+assert.match(tenancy, /ensureBasePipelineTemplate\(client, result\.rows\[0\]\.id\)/)
+assert.match(tenancy, /ON CONFLICT \(pipeline_id\) DO NOTHING/)
 
 const syncStatus = read('app_src/app/api/pipeline/sync-status/route.ts')
 assert.match(syncStatus, /readCrmSummaryFromPostgres/)

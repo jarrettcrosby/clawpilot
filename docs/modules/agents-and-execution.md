@@ -59,6 +59,7 @@ These are application roles, not separately created ChatGPT custom agents. Each 
 - The current in-app executor does not have repository, GitHub, deployment, browser, mail, calendar, or arbitrary CRM tools. Work requiring one of those capabilities must name the missing capability and remain blocked rather than simulate completion.
 - Repository implementation requires a separately authenticated, sandboxed Codex runner with repository scope and auditable GitHub writeback. The per-user ChatGPT device authorization used for role responses is not treated as repository authorization.
 - Dispatch failures remain visible and retryable; no timeout or provider failure may leave the interface in an indefinite sending state.
+- The Dashboard `Agent attention` metric counts assigned tasks whose durable execution status is `blocked` or `awaiting_input`. It does not expose the all-time execution-result row count as an action metric; historical runs and results remain available as execution evidence.
 
 ## Layered Context
 
