@@ -121,6 +121,7 @@ export type SheetsJsonRequest = <T>(pathname: string, input?: SheetsRequestInput
 const GENERATED_TABS = EXPECTED_TABS.filter((title) => title !== 'Opportunities')
 const IDENTIFIER_TABS = ['Organizations', 'Contacts', 'Opportunities', 'Interactions'] as const
 const PROTECTION_PREFIX = 'ClawPilot managed:'
+const REQUIRED_CONFIGURED_DROPDOWNS = ['product', 'stage', 'priority', 'status', 'source', 'loss_reason'] as const
 const GENERATED_REPORT_CLEAR_RANGES = [
   "'Calculations'!B4:ZZZ",
   "'Dashboard'!B4:ZZZ",
@@ -1299,6 +1300,13 @@ function sheetText(value: string) {
   return /^[=+\-@]/.test(text) ? `'${text}` : text
 }
 
+function workbookBrandMark(branding: OrganizationBranding) {
+  if (!branding.hasCustomLogo) return 'CP'
+  const words = branding.organizationName.match(/[A-Za-z0-9]+/g) || []
+  if (words.length > 1) return words.slice(0, 2).map((word) => word[0]).join('').toUpperCase()
+  return (words[0] || 'CP').slice(0, 2).toUpperCase()
+}
+
 export async function applyPipelineWorkbookBrandingWithRequest(
   request: SheetsJsonRequest,
   sheetId: string,
@@ -1316,7 +1324,6 @@ export async function applyPipelineWorkbookBrandingWithRequest(
       'GOOGLE_PIPELINE_TABS_MISSING',
     )
   }
-  const escapedLogoUrl = branding.logoUrl.replace(/"/g, '""')
   await request(`/v4/spreadsheets/${sheetId}/values:batchUpdate`, {
     method: 'POST',
     body: {
@@ -1324,7 +1331,8 @@ export async function applyPipelineWorkbookBrandingWithRequest(
       data: managedSheets.flatMap((sheet) => {
         const title = sheet.properties?.title as (typeof EXPECTED_TABS)[number]
         return [
-          { range: `'${title}'!B1`, majorDimension: 'ROWS', values: [[`=IMAGE("${escapedLogoUrl}",4,48,48)`]] },
+          // Service-account IMAGE formulas remain #REF until a human approves external URL access.
+          { range: `'${title}'!B1`, majorDimension: 'ROWS', values: [[workbookBrandMark(branding)]] },
           { range: `'${title}'!C1`, majorDimension: 'ROWS', values: [[sheetText(branding.organizationName)]] },
           { range: `'${title}'!C2`, majorDimension: 'ROWS', values: [['Powered by ClawPilot']] },
         ]
@@ -1348,6 +1356,19 @@ export async function applyPipelineWorkbookBrandingWithRequest(
           range: { sheetId: id, startRowIndex: 0, endRowIndex: 3, startColumnIndex: 1, endColumnIndex },
           cell: { userEnteredFormat: { backgroundColor: primary } },
           fields: 'userEnteredFormat.backgroundColor',
+        },
+      },
+      {
+        repeatCell: {
+          range: { sheetId: id, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 1, endColumnIndex: 2 },
+          cell: {
+            userEnteredFormat: {
+              textFormat: { foregroundColor: foreground, fontSize: 18, bold: true },
+              horizontalAlignment: 'CENTER',
+              verticalAlignment: 'MIDDLE',
+            },
+          },
+          fields: 'userEnteredFormat(textFormat,horizontalAlignment,verticalAlignment)',
         },
       },
       {
@@ -1426,7 +1447,9 @@ async function verifyPipelineTabsAndHeaders(runtime: GoogleWorkspaceRuntime, she
   }
   const parameters = new URLSearchParams({ majorDimension: 'ROWS' })
   for (const title of EXPECTED_TABS) {
-    const endColumn = String.fromCharCode('A'.charCodeAt(0) + TAB_HEADERS[title].length)
+    const endColumn = title === 'Dropdowns'
+      ? 'ZZ'
+      : String.fromCharCode('A'.charCodeAt(0) + TAB_HEADERS[title].length)
     parameters.append('ranges', `'${title}'!B4:${endColumn}4`)
   }
   const values = await googleSheetsJson<{ valueRanges?: Array<{ values?: unknown[][] }> }>(
@@ -1442,10 +1465,27 @@ async function verifyPipelineTabsAndHeaders(runtime: GoogleWorkspaceRuntime, she
   }
   EXPECTED_TABS.forEach((title, index) => {
     const actual = values.valueRanges?.[index]?.values?.[0] || []
+    if (title === 'Dropdowns') {
+      const normalized = actual.map((header) => normalizeDropdownKey(String(header || ''))).filter(Boolean)
+      const unique = new Set(normalized)
+      const ownerConfigured = unique.has('owner') || unique.has('acct_manager')
+      if (
+        normalized.length !== unique.size
+        || !ownerConfigured
+        || REQUIRED_CONFIGURED_DROPDOWNS.some((header) => !unique.has(header))
+      ) {
+        throw new PipelineProvisioningRequestError(
+          'Managed pipeline Dropdowns headers did not verify',
+          409,
+          'GOOGLE_PIPELINE_HEADERS_INVALID',
+        )
+      }
+      return
+    }
     const expected = TAB_HEADERS[title]
     if (actual.length !== expected.length || expected.some((header, column) => actual[column] !== header)) {
       throw new PipelineProvisioningRequestError(
-        'Managed pipeline Sheet headers did not verify',
+        `Managed pipeline ${title} headers did not verify`,
         409,
         'GOOGLE_PIPELINE_HEADERS_INVALID',
       )

@@ -22,6 +22,7 @@ export type AgentTaskDocumentBuild = {
 }
 
 const WORK_LOG_HEADING = '## Work log'
+const DELIVERABLE_HEADING = '## Working deliverable'
 
 function cleanInline(value: unknown, fallback = 'none') {
   return String(value || '')
@@ -57,7 +58,7 @@ export function agentTaskDocumentTitle(taskTitle: string, agentId: string) {
 
 function previousWorkLog(existingContent: string) {
   const headingIndex = existingContent.indexOf(`\n${WORK_LOG_HEADING}\n`)
-  if (headingIndex < 0) return existingContent.trim()
+  if (headingIndex < 0 || !existingContent.includes(`\n${DELIVERABLE_HEADING}\n`)) return ''
   return existingContent.slice(headingIndex + WORK_LOG_HEADING.length + 2).trim()
 }
 
@@ -74,17 +75,9 @@ export function buildAgentTaskDocument(input: AgentTaskDocumentInput): AgentTask
   const priorEntries = previousWorkLog(existingContent)
   const entry = [
     marker,
-    `### ${cleanInline(input.displayTimestamp, input.recordedAt)} - ${cleanInline(input.summary, 'Agent update')}`,
-    '',
-    `- **Status:** ${cleanInline(input.status, 'responded')}`,
-    `- **Changed:** ${changes.length > 0 ? changes.join('; ') : 'Working document updated'}`,
-    `- **Next action:** ${cleanInline(input.nextAction)}`,
-    `- **Waiting on:** ${cleanInline(input.waitingOn)}`,
-    `- **Recorded:** ${cleanInline(input.recordedAt)}`,
-    '',
-    '#### Deliverable',
-    '',
-    deliverable || 'No substantive deliverable was recorded.',
+    `- **${cleanInline(input.displayTimestamp, input.recordedAt)}:** ${cleanInline(input.summary, 'Agent update')} `
+      + `Status: ${cleanInline(input.status, 'responded')}. `
+      + `Changed: ${changes.length > 0 ? changes.join('; ') : 'working document updated'}.`,
   ].join('\n')
 
   const content = [
@@ -102,6 +95,10 @@ export function buildAgentTaskDocument(input: AgentTaskDocumentInput): AgentTask
     `- **Next action:** ${cleanInline(input.nextAction)}`,
     `- **Waiting on:** ${cleanInline(input.waitingOn)}`,
     `- **Last updated:** ${cleanInline(input.displayTimestamp, input.recordedAt)}`,
+    '',
+    DELIVERABLE_HEADING,
+    '',
+    deliverable || 'No substantive deliverable was recorded.',
     '',
     WORK_LOG_HEADING,
     '',

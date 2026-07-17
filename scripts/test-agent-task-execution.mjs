@@ -392,6 +392,7 @@ const firstDocument = taskDocument.buildAgentTaskDocument({
 assert.equal(firstDocument.title, 'QuickBooks Integration - Projects Research')
 assert.equal(firstDocument.appended, true)
 assert.match(firstDocument.content, /QuickBooks owns posted accounting records/)
+assert.match(firstDocument.content, /## Working deliverable/)
 const duplicateDocument = taskDocument.buildAgentTaskDocument({
   existingContent: firstDocument.content,
   taskId: 'task-1',
@@ -429,6 +430,11 @@ const continuedDocument = taskDocument.buildAgentTaskDocument({
 assert.match(continuedDocument.content, /agent-result:dispatch-2/)
 assert.match(continuedDocument.content, /agent-result:dispatch-1/)
 assert.ok(continuedDocument.content.indexOf('agent-result:dispatch-2') < continuedDocument.content.indexOf('agent-result:dispatch-1'))
+assert.doesNotMatch(
+  continuedDocument.content,
+  /QuickBooks owns posted accounting records/,
+  'the coherent working document must replace prior deliverable bodies while retaining compact audit markers',
+)
 
 const overlappingPlan = execution.parseAgentTaskExecutionPlan(JSON.stringify({
   status: 'triaged',
@@ -641,6 +647,7 @@ assert.match(provider, /Do not report a planned or suggested action as completed
 assert.match(provider, /You cannot edit repository files/)
 assert.match(provider, /complete one existing checklist item/)
 assert.match(provider, /checklistComplete/)
+assert.match(provider, /clean replacement content for the task working document/)
 
 const threadRoute = read('app_src/app/api/agents/threads/route.ts')
 const dispatchSource = read('app_src/lib/agents/dispatch.ts')
@@ -715,6 +722,10 @@ assert.match(threadRoute, /restorePersistedDispatchOutcome/)
 assert.match(threadRoute, /evidence:\s*recorded\.evidence\?\.changes/)
 assert.match(threadRoute, /trigger:\s*'continuation'/)
 assert.match(threadRoute, /continuationDepth < 8/)
+assert.match(threadRoute, /const correctiveContinuation = continuationDepth === 0/)
+assert.match(threadRoute, /progressedChecklist \|\| correctiveContinuation/)
+assert.match(threadRoute, /readAgentTaskDocumentContext/)
+assert.match(threadRoute, /Current task working document:/)
 assert.match(threadRoute, /Next checklist item ID:/)
 assert.match(threadRoute, /appendAgentTaskDocument/)
 assert.match(threadRoute, /agentId === 'projects'/)

@@ -536,7 +536,8 @@ assertIncludes(pipelineProvisioning, 'const newlyProvisionedTitles = new Set<str
 assertIncludes(pipelineProvisioning, "title === 'Dropdowns' && !newlyProvisionedTitles.has(title)", 'configured dropdown headers and rows are not rewritten during projection')
 assertIncludes(pipelineProvisioning, 'if (preserveConfiguredDropdowns) return writes', 'configured dropdown projection ownership boundary')
 assertIncludes(pipelineProvisioning, 'applyPipelineWorkbookBrandingWithRequest', 'organization workbook branding')
-assertIncludes(pipelineProvisioning, '=IMAGE(', 'organization workbook logo formula')
+assertIncludes(pipelineProvisioning, 'workbookBrandMark(branding)', 'organization workbook brand mark')
+assert.ok(!pipelineProvisioning.includes('=IMAGE('), 'managed workbooks must not require external image approval')
 for (const tab of ['Start Here', 'Calculations', 'Dashboard']) {
   assertIncludes(pipelineProvisioning, `'${tab}'`, 'managed CRM workbook tab contract')
 }
