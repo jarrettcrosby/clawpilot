@@ -168,14 +168,14 @@ export async function testSuiteCrmConnection(fetchImpl: typeof fetch = fetch) {
 
 export async function findSuiteCrmUser(input: {
   email?: string
-  username?: string
+  globalId?: string
 }, fetchImpl: typeof fetch = fetch): Promise<SuiteCrmUserMatch | null> {
-  const username = String(input.username || '').trim()
   const email = String(input.email || '').trim().toLowerCase()
-  if (username && !/^[A-Za-z0-9._@+-]{1,128}$/.test(username)) throw new Error('SuiteCRM username is invalid')
-  if (!username && (!email || email.length > 254)) throw new Error('SuiteCRM user email is invalid')
-  const field = username ? 'user_name' : 'email1'
-  const value = username || email
+  const globalId = String(input.globalId || '').trim().toLowerCase()
+  if (globalId && !/^gu[0-9]{7}$/.test(globalId)) throw new Error('SuiteCRM user Global ID is invalid')
+  if (!globalId && (!email || email.length > 254)) throw new Error('SuiteCRM user email is invalid')
+  const field = globalId ? 'global_id_c' : 'email1'
+  const value = globalId || email
   const parameters = new URLSearchParams({
     'fields[Users]': 'user_name,first_name,last_name,email1,status,global_id_c',
     [`filter[${field}][eq]`]: value,
@@ -200,10 +200,12 @@ export async function findSuiteCrmUser(input: {
     const matchedEmail = String(values.email1 || '').trim().toLowerCase()
     const status = String(values.status || '').trim().toLowerCase()
     if (status && status !== 'active') return []
-    if (username ? matchedUsername.toLowerCase() !== username.toLowerCase() : matchedEmail !== email) return []
+    if (globalId
+      ? globalId !== String(values.global_id_c || '').trim().toLowerCase()
+      : matchedEmail !== email) return []
     const displayName = [values.first_name, values.last_name].map((part) => String(part || '').trim()).filter(Boolean).join(' ')
-    const globalId = String(values.global_id_c || '').trim().toLowerCase() || null
-    return [{ id, username: matchedUsername, displayName: displayName || matchedUsername, email: matchedEmail, globalId }]
+    const matchedGlobalId = String(values.global_id_c || '').trim().toLowerCase() || null
+    return [{ id, username: matchedUsername || matchedGlobalId || '', displayName: displayName || matchedUsername || matchedEmail, email: matchedEmail, globalId: matchedGlobalId }]
   })
   if (matches.length > 1) throw new Error('SuiteCRM user mapping is ambiguous')
   return matches[0] || null
@@ -348,11 +350,15 @@ export async function upsertSuiteCrmUserIdentity(
 ) {
   const suiteCrmUserId = String(record.suiteCrmUserId || '').trim().toLowerCase()
   const referenceCode = String(record.referenceCode || '').trim().toLowerCase()
-  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(suiteCrmUserId)) {
+  const username = String(record.username || '').trim().toLowerCase()
+  if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(suiteCrmUserId)) {
     throw new Error('SuiteCRM user identity has an invalid record ID')
   }
   if (!/^gu[0-9]{7}$/.test(referenceCode)) {
     throw new Error('SuiteCRM user identity has an invalid Global ID')
+  }
+  if (username !== referenceCode) {
+    throw new Error('SuiteCRM employee username must equal the permanent ClawPilot Global ID')
   }
 
   const existing = await request(
@@ -382,7 +388,22 @@ export async function upsertSuiteCrmUserIdentity(
   if (matches.data.some((entry) => String(entry?.id || '').trim().toLowerCase() !== suiteCrmUserId)) {
     throw new Error('ClawPilot user Global ID is already assigned to another SuiteCRM user')
   }
-  if (existingGlobalId === referenceCode) return suiteCrmUserId
+
+  const usernameParameters = new URLSearchParams({
+    'fields[Users]': 'user_name',
+    'filter[user_name][eq]': username,
+    'page[number]': '1',
+    'page[size]': '2',
+  })
+  const usernameMatches = await request(
+    `/Api/V8/module/Users?${usernameParameters}`,
+    { method: 'GET' },
+    fetchImpl,
+  ) as { data?: Array<{ id?: unknown }> }
+  if (!Array.isArray(usernameMatches.data)) throw new Error('SuiteCRM returned an invalid username lookup')
+  if (usernameMatches.data.some((entry) => String(entry?.id || '').trim().toLowerCase() !== suiteCrmUserId)) {
+    throw new Error('ClawPilot user Global ID is already used as another SuiteCRM username')
+  }
 
   const response = await request('/Api/V8/module', {
     method: 'PATCH',
@@ -390,7 +411,7 @@ export async function upsertSuiteCrmUserIdentity(
       data: {
         type: 'Users',
         id: suiteCrmUserId,
-        attributes: { global_id_c: referenceCode },
+        attributes: { user_name: username, global_id_c: referenceCode },
       },
     }),
   }, fetchImpl) as JsonApiResponse
