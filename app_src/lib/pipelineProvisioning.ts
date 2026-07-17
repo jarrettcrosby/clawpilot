@@ -100,6 +100,13 @@ type SpreadsheetMetadata = {
     properties?: { sheetId?: number; title?: string; index?: number }
     protectedRanges?: Array<{ protectedRangeId?: number; description?: string }>
     charts?: Array<{ chartId?: number }>
+    merges?: Array<{
+      sheetId?: number
+      startRowIndex?: number
+      endRowIndex?: number
+      startColumnIndex?: number
+      endColumnIndex?: number
+    }>
   }>
 }
 
@@ -824,7 +831,7 @@ async function ensurePipelineSheet(
 
 async function spreadsheetMetadata(request: SheetsJsonRequest, sheetId: string) {
   const metadata = await request<SpreadsheetMetadata>(
-    `/v4/spreadsheets/${sheetId}?fields=spreadsheetId,sheets(properties,protectedRanges(protectedRangeId,description),charts(chartId))`,
+    `/v4/spreadsheets/${sheetId}?fields=spreadsheetId,sheets(properties,protectedRanges(protectedRangeId,description),charts(chartId),merges)`,
   )
   if (validResourceId(metadata.spreadsheetId, 'Managed pipeline Sheet ID') !== sheetId) {
     throw new PipelineProvisioningRequestError(
@@ -899,7 +906,7 @@ function dashboardChartRequests(sheetId: number) {
               rowIndex: input.anchorRowIndex,
               columnIndex: input.anchorColumnIndex,
             },
-            widthPixels: 520,
+            widthPixels: 420,
             heightPixels: 260,
           },
         },
@@ -931,7 +938,7 @@ function dashboardChartRequests(sheetId: number) {
       startRowIndex: 14,
       endRowIndex: 17,
       anchorRowIndex: 3,
-      anchorColumnIndex: 13,
+      anchorColumnIndex: 9,
       chartType: 'BAR',
       valueAxisTitle: 'Records',
     }),
@@ -976,6 +983,21 @@ export async function configurePipelineTabsWithRequest(
     await request(`/v4/spreadsheets/${sheetId}:batchUpdate`, {
       method: 'POST',
       body: { requests, includeSpreadsheetInResponse: false },
+      idempotent: false,
+    })
+    metadata = await spreadsheetMetadata(request, sheetId)
+  }
+
+  const dashboardMerges = (metadata.sheets || [])
+    .find((sheet) => sheet.properties?.title === 'Dashboard')
+    ?.merges || []
+  if (dashboardMerges.length > 0) {
+    await request(`/v4/spreadsheets/${sheetId}:batchUpdate`, {
+      method: 'POST',
+      body: {
+        requests: dashboardMerges.map((range) => ({ unmergeCells: { range } })),
+        includeSpreadsheetInResponse: false,
+      },
       idempotent: false,
     })
   }
