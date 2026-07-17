@@ -118,6 +118,7 @@ assert.deepEqual(
 )
 assert.deepEqual(splitPipelineProductNames(['LDS', 'POD, TIA']), ['LDS', 'POD', 'TIA'])
 assert.match(crmPersistence, /splitPipelineProductNames/)
+assert.match(read('app_src/lib/persistence/pipeline.ts'), /rawValue\.toLowerCase\(\) === 'neogotiation'/)
 
 const syncStatus = read('app_src/app/api/pipeline/sync-status/route.ts')
 assert.match(syncStatus, /readCrmSummaryFromPostgres/)
