@@ -92,8 +92,8 @@ async function readJson(response: Response): Promise<unknown> {
 function responseErrorDetail(parsed: unknown) {
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return ''
   const errors = (parsed as { errors?: unknown }).errors
-  if (!Array.isArray(errors)) return ''
-  return errors
+  const entries = Array.isArray(errors) ? errors : errors && typeof errors === 'object' ? [errors] : []
+  return entries
     .slice(0, 3)
     .map((error) => {
       if (!error || typeof error !== 'object' || Array.isArray(error)) return ''

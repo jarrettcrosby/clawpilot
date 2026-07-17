@@ -544,6 +544,8 @@ assert.match(threadRoute, /trigger:\s*'continuation'/)
 assert.match(threadRoute, /continuationDepth < 8/)
 assert.match(threadRoute, /Next checklist item ID:/)
 assert.match(threadRoute, /appendAgentTaskDocument/)
+assert.match(threadRoute, /agentId === 'projects'/)
+assert.match(read('scripts/backfill-project-agent-documents.mjs'), /historical-agent-comment:/)
 assert.doesNotMatch(threadRoute, /executionStatus:\s*'completed'/)
 
 console.log('agent task execution behavioral tests passed')

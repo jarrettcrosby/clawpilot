@@ -5,11 +5,15 @@ import { matonFetch } from '@/lib/maton'
 import { projectCrmWorkbook } from '@/lib/crm/workbookProjection'
 import { syncPipelineOwnerProfileToCrm } from '@/lib/persistence/crm'
 import {
+  applyPipelineWorkbookBranding,
+  applyPipelineWorkbookBrandingWithRequest,
   provisionPipelineGoogleResources,
   reconcilePipelineGooglePermissions,
   replaceManagedPipelineDropdowns,
   sanitizePipelineProvisioningError,
+  type SheetsJsonRequest,
 } from '@/lib/pipelineProvisioning'
+import { readPipelineWorkbookBranding } from '@/lib/organizationBranding'
 import {
   claimPipelineSyncOutboxInPostgres,
   completePipelineSyncOutboxInPostgres,
@@ -51,6 +55,17 @@ function hasManagedSheetsBinding(context: ResolvedPipelineOutboxSheetContext): c
     && context.googleSharedDriveId
     && !context.legacyOwnerFallback,
   )
+}
+
+const matonSheetsRequest: SheetsJsonRequest = async (pathname, input = {}) => {
+  const response = await matonFetch(`/google-sheets${pathname}`, {
+    method: input.method || 'GET',
+    headers: input.body === undefined ? undefined : { 'Content-Type': 'application/json' },
+    body: input.body === undefined ? undefined : JSON.stringify(input.body),
+  })
+  const text = await response.text()
+  if (!response.ok) throw new Error(`Sheets request failed (${response.status}): ${text.slice(0, 1000)}`)
+  return (text ? JSON.parse(text) : {}) as never
 }
 
 async function readValues(
@@ -128,6 +143,16 @@ async function executeOutboxItem(
   context: ResolvedPipelineOutboxSheetContext,
   managedRuntime: GoogleWorkspaceRuntime | null,
 ) {
+  if (item.operation === 'apply_workbook_branding') {
+    if (!context.pipelineId) throw new PermanentOutboxError('Workbook branding is missing its pipeline context')
+    const branding = await readPipelineWorkbookBranding(context.pipelineId)
+    if (managedRuntime) {
+      await applyPipelineWorkbookBranding(managedRuntime, context.sheetId, branding)
+    } else {
+      await applyPipelineWorkbookBrandingWithRequest(matonSheetsRequest, context.sheetId, branding)
+    }
+    return
+  }
   if (item.operation === 'project_crm_workbook') {
     if (!context.pipelineId || !context.ownerEmail) {
       throw new PermanentOutboxError('CRM projection is missing its pipeline owner context')

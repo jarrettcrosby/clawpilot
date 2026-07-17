@@ -84,7 +84,7 @@ const WORKFLOW_FIELDS: Array<{ key: WorkflowField; label: string; helper: string
 const DEFAULT_WORKFLOW: Record<WorkflowField, string[]> = {
   stage: ['Identified Lead', 'Qualified Lead', 'Needs Analysis', 'Demo', 'Proposal', 'Negotiation', 'Loss', 'Won'],
   priority: ['A+', 'A', 'B', 'C', 'D'],
-  status: ['Open', 'Abandoned', 'Closed', 'Won', 'Lost'],
+  status: ['Open', 'On Hold', 'Closed', 'Won', 'Lost', 'Abandoned'],
   source: ['Inbound', 'Outbound', 'Referral', 'Website', 'Partner'],
   loss_reason: ['No Decision', 'Budget', 'Competition', 'Not a Fit'],
 }

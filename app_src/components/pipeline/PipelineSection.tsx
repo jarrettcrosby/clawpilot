@@ -138,7 +138,7 @@ function normalizeDeal(d: Deal): Deal {
 
 const DEFAULT_STAGES = ['Identified Lead', 'Qualified Lead', 'Needs Analysis', 'Demo', 'Proposal', 'Negotiation', 'Loss', 'Won']
 const DEFAULT_PRIORITIES = ['A+', 'A', 'B', 'C', 'D']
-const DEFAULT_STATUSES = ['Open', 'Abandoned', 'Closed', 'Won', 'Lost']
+const DEFAULT_STATUSES = ['Open', 'On Hold', 'Closed', 'Won', 'Lost', 'Abandoned']
 const DEFAULT_SOURCES = ['Inbound', 'Outbound', 'Referral', 'Website', 'Partner']
 const DEFAULT_LOSS_REASONS = ['No Decision', 'Budget', 'Competition', 'Not a Fit']
 
@@ -1234,13 +1234,19 @@ export default function PipelineSection() {
                       : 'Create Sheet'}
               </Button>
             ) : null}
-            <Tooltip title="Pipeline setup">
+            <Tooltip title="Configure pipeline">
               <span>
                 <IconButton
                   aria-label="Open pipeline setup"
                   onClick={() => setCatalogOpen(true)}
                   disabled={!pipelineId}
-                  sx={{ minWidth: 38, minHeight: 38, border: '1px solid rgba(168,199,250,0.45)', color: '#A8C7FA', borderRadius: 1 }}
+                  sx={{
+                    minWidth: 38,
+                    minHeight: 38,
+                    border: '1px solid rgba(168,199,250,0.45)',
+                    color: '#A8C7FA',
+                    borderRadius: 1,
+                  }}
                 >
                   <TuneRounded fontSize="small" />
                 </IconButton>
@@ -1285,6 +1291,20 @@ export default function PipelineSection() {
           </Stack>
         </Stack>
       </Box>
+
+      {!loading && canEdit && productOptions.length === 0 ? (
+        <Alert
+          severity="info"
+          action={(
+            <Button color="inherit" size="small" onClick={() => setCatalogOpen(true)}>
+              Open setup
+            </Button>
+          )}
+          sx={{ mx: { xs: 1, md: 2 }, mt: 1, borderRadius: 1 }}
+        >
+          Add products and workflow choices before creating the first opportunity.
+        </Alert>
+      ) : null}
 
       <Box
         data-testid="pipeline-results"

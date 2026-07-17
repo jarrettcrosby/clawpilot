@@ -24,6 +24,7 @@ import type {
 } from '@/lib/crm/types'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import { syncPipelineProductDropdownCatalogInPostgres } from '@/lib/persistence/pipeline'
+import { splitPipelineProductNames } from '@/lib/pipeline/productNames.mjs'
 import { query, withTransaction } from '@/lib/persistence/postgres'
 import { appPublicUrl } from '@/lib/publicUrl'
 import { shortLinkUrl } from '@/lib/shortlinks'
@@ -2767,12 +2768,14 @@ async function ensurePipelineCatalogProducts(
       const options = Array.isArray(dropdowns[key]) ? dropdowns[key] as Array<Record<string, unknown>> : []
       for (const option of [...options].sort((left, right) => finite(left.sort_order) - finite(right.sort_order))) {
         if (option.active === false) continue
-        candidates.push({ name: clean(option.label) || clean(option.value), origin: 'dropdown' })
+        for (const name of splitPipelineProductNames(clean(option.label) || clean(option.value))) {
+          candidates.push({ name, origin: 'dropdown' })
+        }
       }
     }
     for (const opportunity of opportunities.rows) {
-      for (const name of clean(opportunity.name).split(',')) {
-        candidates.push({ name: clean(name), origin: 'opportunity' })
+      for (const name of splitPipelineProductNames(opportunity.name)) {
+        candidates.push({ name, origin: 'opportunity' })
       }
     }
 
@@ -3548,7 +3551,12 @@ export async function failSuiteCrmOutboxInPostgres(input: { item: CrmOutboxItem;
     if (!result.rows[0]) throw new Error('SuiteCRM outbox lease was lost')
     const table = tableForAggregate(input.item.aggregateType)
     if (table && input.item.operation === 'upsert_record') {
-      await client.query(`UPDATE ${table} SET sync_status = 'failed', sync_error = $2, updated_at = now() WHERE id = $1::uuid`, [input.item.aggregateId, message])
+      await client.query(
+        `UPDATE ${table}
+         SET sync_status = $3, sync_error = $2, updated_at = now()
+         WHERE id = $1::uuid`,
+        [input.item.aggregateId, message, dead ? 'failed' : 'pending'],
+      )
     }
     return result.rows[0].status
   })

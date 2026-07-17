@@ -262,6 +262,7 @@ async function recordAgentResult(input: {
   const nextAction = evidence?.nextAction || deriveNextAction(resultSummary)
   const commentId = dispatchId ? `agent-dispatch-${dispatchId}` : Date.now().toString()
   const substantiveDeliverable = evidence?.deliverable
+    || (agentId === 'projects' && resultSummary.trim() ? resultSummary : '')
     || (!plan && (resultSummary.length >= 600 || resultSummary.split(/\r?\n/).length >= 10) ? resultSummary : '')
   let document: AgentTaskDocumentReference | null = null
   if (boardId && substantiveDeliverable && isPostgresTaskStoreEnabled()) {

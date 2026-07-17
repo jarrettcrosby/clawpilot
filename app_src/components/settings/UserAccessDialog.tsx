@@ -45,6 +45,7 @@ import ViewKanbanRounded from '@mui/icons-material/ViewKanbanRounded'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import { announceUserDateTimeSettings, formatUserDateTime } from '@/lib/userDateTime'
 import IntegrationSettingsPanel from './IntegrationSettingsPanel'
+import OrganizationBrandingPanel from './OrganizationBrandingPanel'
 import SessionSecurityPanel from './SessionSecurityPanel'
 
 type UserRole = 'owner' | 'admin' | 'member'
@@ -994,6 +995,7 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
                     Save profile
                   </Button>
                 </Box>
+                <OrganizationBrandingPanel />
               </>
             ) : (
               <Typography color="text.secondary">Profile unavailable.</Typography>
