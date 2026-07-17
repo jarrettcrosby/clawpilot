@@ -5,6 +5,7 @@ import { resolve } from 'node:path'
 
 const source = readFileSync(resolve(process.cwd(), 'app_src/lib/pipelineProvisioning.ts'), 'utf8')
 const projectionSource = readFileSync(resolve(process.cwd(), 'app_src/lib/crm/workbookProjection.ts'), 'utf8')
+const legacySource = readFileSync(resolve(process.cwd(), 'app_src/lib/pipelineLegacyWorkbook.ts'), 'utf8')
 
 for (const tutorialText of [
   'Only the Opportunities tab is operator-editable.',
@@ -168,6 +169,8 @@ assert.match(configureBlock, /addSheet: \{ properties: \{ title: 'Dashboard', in
 assert.match(source, /dimension: 'COLUMNS', startIndex: 4, endIndex: 14[\s\S]{0,100}pixelSize: 84/)
 assert.match(source, /dimension: 'ROWS', startIndex: 3, endIndex: 36[\s\S]{0,100}pixelSize: 20/)
 assert.match(projectionSource, /await configurePipelineTabs\(runtime, input\.context\.sheetId\)[\s\S]{0,260}await applyPipelineWorkbookBranding/)
-assert.match(projectionSource, /await readPipelineWorkbookBranding\(input\.context\.pipelineId\)/)
+assert.match(projectionSource, /const branding = await readPipelineWorkbookBranding\(input\.context\.pipelineId\)/)
+assert.match(projectionSource, /await configureLegacyPipelineTabs\(input\.context\.sheetId\)[\s\S]{0,180}await applyLegacyPipelineWorkbookBranding\(input\.context\.sheetId, branding\)/)
+assert.match(legacySource, /applyPipelineWorkbookBrandingWithRequest\(matonSheetsJson, sheetId, branding\)/)
 
 console.log('pipeline workbook dashboard contract tests passed')
