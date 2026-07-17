@@ -99,6 +99,7 @@ type SpreadsheetMetadata = {
   sheets?: Array<{
     properties?: { sheetId?: number; title?: string; index?: number }
     protectedRanges?: Array<{ protectedRangeId?: number; description?: string }>
+    charts?: Array<{ chartId?: number }>
   }>
 }
 
@@ -113,29 +114,50 @@ export type SheetsJsonRequest = <T>(pathname: string, input?: SheetsRequestInput
 const GENERATED_TABS = EXPECTED_TABS.filter((title) => title !== 'Opportunities')
 const IDENTIFIER_TABS = ['Organizations', 'Contacts', 'Opportunities', 'Interactions'] as const
 const PROTECTION_PREFIX = 'ClawPilot managed:'
+const GENERATED_REPORT_CLEAR_RANGES = [
+  "'Calculations'!B4:ZZZ",
+  "'Dashboard'!B4:ZZZ",
+] as const
 
 const INITIAL_TAB_ROWS: Partial<Record<(typeof EXPECTED_TABS)[number], unknown[][]>> = {
   'Start Here': [
-    ['Opportunity updates', 'Edit rows on the Opportunities tab. ClawPilot syncs those changes into the CRM.'],
-    ['CRM records', 'Organizations, Contacts, and Interactions are generated from the CRM and are read-only here.'],
-    ['Reporting', 'Calculations and Dashboard are generated from the CRM projection.'],
+    ['Opportunity updates', 'Only the Opportunities tab is operator-editable. ClawPilot syncs those changes with the CRM.'],
+    ['Status', 'Controls lifecycle reporting and formulas. Active excludes Won, Lost, Closed, and Abandoned; Open and On Hold remain active.'],
+    ['Stage', 'Controls where an opportunity appears on the pipeline board.'],
+    ['Probability', 'Controls weighted active value: opportunity value multiplied by win probability.'],
+    ['Expected Close', 'Controls when opportunity value appears in the sales forecast.'],
+    ['Products', 'Products are selected as a multi-select field in ClawPilot and synchronized with the opportunity.'],
+    ['Generated tabs', 'Organizations, Contacts, Interactions, Calculations, Dashboard, and Dropdowns are managed by ClawPilot.'],
   ],
   Calculations: [
     ['Total opportunities', '=COUNTA(Opportunities!C5:C)'],
-    ['Open pipeline', '=SUMIFS(Opportunities!J5:J,Opportunities!F5:F,"<>Closed",Opportunities!F5:F,"<>Lost",Opportunities!F5:F,"<>Abandoned")'],
-    ['Weighted pipeline', '=SUMPRODUCT(Opportunities!J5:J,Opportunities!K5:K/100,--(Opportunities!F5:F<>"Closed"),--(Opportunities!F5:F<>"Lost"),--(Opportunities!F5:F<>"Abandoned"))'],
-    ['Won value', '=SUMIF(Opportunities!F5:F,"Won",Opportunities!J5:J)'],
+    ['Open opportunities', '=COUNTIFS(Opportunities!C5:C,"<>",Opportunities!F5:F,"Open")'],
+    ['On-hold opportunities', '=COUNTIFS(Opportunities!C5:C,"<>",Opportunities!F5:F,"On Hold")'],
+    ['Active opportunities', '=COUNTIFS(Opportunities!C5:C,"<>",Opportunities!F5:F,"<>Won",Opportunities!F5:F,"<>Lost",Opportunities!F5:F,"<>Closed",Opportunities!F5:F,"<>Abandoned")'],
+    ['Active pipeline value', '=SUMIFS(Opportunities!J5:J,Opportunities!C5:C,"<>",Opportunities!F5:F,"<>Won",Opportunities!F5:F,"<>Lost",Opportunities!F5:F,"<>Closed",Opportunities!F5:F,"<>Abandoned")'],
+    ['Weighted active value', '=SUMPRODUCT(Opportunities!J5:J,Opportunities!K5:K/100,--(Opportunities!C5:C<>""),--(Opportunities!F5:F<>"Won"),--(Opportunities!F5:F<>"Lost"),--(Opportunities!F5:F<>"Closed"),--(Opportunities!F5:F<>"Abandoned"))'],
+    ['Won opportunities', '=COUNTIFS(Opportunities!C5:C,"<>",Opportunities!F5:F,"Won")+COUNTIFS(Opportunities!C5:C,"<>",Opportunities!F5:F,"Closed")'],
+    ['Won value', '=SUMIFS(Opportunities!J5:J,Opportunities!C5:C,"<>",Opportunities!F5:F,"Won")+SUMIFS(Opportunities!J5:J,Opportunities!C5:C,"<>",Opportunities!F5:F,"Closed")'],
+    ['Lost opportunities', '=COUNTIFS(Opportunities!C5:C,"<>",Opportunities!F5:F,"Lost")+COUNTIFS(Opportunities!C5:C,"<>",Opportunities!F5:F,"Abandoned")'],
+    ['Win rate', '=IFERROR(C11/(C11+C13),0)'],
     ['Organizations', '=COUNTA(Organizations!C5:C)'],
     ['Contacts', '=COUNTA(Contacts!C5:C)'],
     ['Interactions', '=COUNTA(Interactions!C5:C)'],
   ],
   Dashboard: [
-    ['Open pipeline', '=Calculations!C6'],
-    ['Weighted pipeline', '=Calculations!C7'],
-    ['Won value', '=Calculations!C8'],
-    ['Opportunities', '=Calculations!C5'],
-    ['Organizations', '=Calculations!C9'],
-    ['Contacts', '=Calculations!C10'],
+    ['Total opportunities', '=Calculations!C5'],
+    ['Active opportunities', '=Calculations!C8'],
+    ['Open opportunities', '=Calculations!C6'],
+    ['On-hold opportunities', '=Calculations!C7'],
+    ['Won opportunities', '=Calculations!C11'],
+    ['Lost opportunities', '=Calculations!C13'],
+    ['Win rate', '=Calculations!C14'],
+    ['Active pipeline value', '=Calculations!C9'],
+    ['Weighted active value', '=Calculations!C10'],
+    ['Won value', '=Calculations!C12'],
+    ['Organizations', '=Calculations!C15'],
+    ['Contacts', '=Calculations!C16'],
+    ['Interactions', '=Calculations!C17'],
   ],
   Dropdowns: [
     ['', '', 'Identified Lead', 'A+', 'Open', 'Inbound', 'No Decision'],
@@ -802,7 +824,7 @@ async function ensurePipelineSheet(
 
 async function spreadsheetMetadata(request: SheetsJsonRequest, sheetId: string) {
   const metadata = await request<SpreadsheetMetadata>(
-    `/v4/spreadsheets/${sheetId}?fields=spreadsheetId,sheets(properties,protectedRanges(protectedRangeId,description))`,
+    `/v4/spreadsheets/${sheetId}?fields=spreadsheetId,sheets(properties,protectedRanges(protectedRangeId,description),charts(chartId))`,
   )
   if (validResourceId(metadata.spreadsheetId, 'Managed pipeline Sheet ID') !== sheetId) {
     throw new PipelineProvisioningRequestError(
@@ -812,6 +834,108 @@ async function spreadsheetMetadata(request: SheetsJsonRequest, sheetId: string) 
     )
   }
   return metadata
+}
+
+function dashboardChartRequests(sheetId: number) {
+  const chart = (input: {
+    title: string
+    startRowIndex: number
+    endRowIndex: number
+    anchorRowIndex: number
+    anchorColumnIndex: number
+    chartType: 'BAR' | 'COLUMN'
+    valueAxisTitle: string
+  }) => ({
+    addChart: {
+      chart: {
+        spec: {
+          title: input.title,
+          basicChart: {
+            chartType: input.chartType,
+            legendPosition: 'NO_LEGEND',
+            headerCount: 0,
+            axis: input.chartType === 'BAR'
+              ? [
+                { position: 'BOTTOM_AXIS', title: input.valueAxisTitle },
+                { position: 'LEFT_AXIS', title: 'Metric' },
+              ]
+              : [
+                { position: 'BOTTOM_AXIS', title: 'Metric' },
+                { position: 'LEFT_AXIS', title: input.valueAxisTitle },
+              ],
+            domains: [{
+              domain: {
+                sourceRange: {
+                  sources: [{
+                    sheetId,
+                    startRowIndex: input.startRowIndex,
+                    endRowIndex: input.endRowIndex,
+                    startColumnIndex: 1,
+                    endColumnIndex: 2,
+                  }],
+                },
+              },
+            }],
+            series: [{
+              series: {
+                sourceRange: {
+                  sources: [{
+                    sheetId,
+                    startRowIndex: input.startRowIndex,
+                    endRowIndex: input.endRowIndex,
+                    startColumnIndex: 2,
+                    endColumnIndex: 3,
+                  }],
+                },
+              },
+              targetAxis: input.chartType === 'BAR' ? 'BOTTOM_AXIS' : 'LEFT_AXIS',
+            }],
+          },
+        },
+        position: {
+          overlayPosition: {
+            anchorCell: {
+              sheetId,
+              rowIndex: input.anchorRowIndex,
+              columnIndex: input.anchorColumnIndex,
+            },
+            widthPixels: 520,
+            heightPixels: 260,
+          },
+        },
+      },
+    },
+  })
+
+  return [
+    chart({
+      title: 'Opportunity lifecycle',
+      startRowIndex: 6,
+      endRowIndex: 10,
+      anchorRowIndex: 3,
+      anchorColumnIndex: 4,
+      chartType: 'COLUMN',
+      valueAxisTitle: 'Opportunities',
+    }),
+    chart({
+      title: 'Pipeline value',
+      startRowIndex: 11,
+      endRowIndex: 14,
+      anchorRowIndex: 18,
+      anchorColumnIndex: 4,
+      chartType: 'COLUMN',
+      valueAxisTitle: 'Value',
+    }),
+    chart({
+      title: 'CRM records',
+      startRowIndex: 14,
+      endRowIndex: 17,
+      anchorRowIndex: 3,
+      anchorColumnIndex: 13,
+      chartType: 'BAR',
+      valueAxisTitle: 'Records',
+    }),
+  ]
 }
 
 export async function configurePipelineTabsWithRequest(
@@ -855,6 +979,12 @@ export async function configurePipelineTabsWithRequest(
       idempotent: false,
     })
   }
+
+  await request(`/v4/spreadsheets/${sheetId}/values:batchClear`, {
+    method: 'POST',
+    body: { ranges: [...GENERATED_REPORT_CLEAR_RANGES] },
+    idempotent: true,
+  })
 
   await request(`/v4/spreadsheets/${sheetId}/values:batchUpdate`, {
     method: 'POST',
@@ -912,6 +1042,14 @@ export async function configurePipelineTabsWithRequest(
         formattingRequests.push({ deleteProtectedRange: { protectedRangeId: range.protectedRangeId } })
       }
     }
+    if (title === 'Dashboard') {
+      for (const chart of sheet.charts || []) {
+        if (chart.chartId !== undefined) {
+          formattingRequests.push({ deleteEmbeddedObject: { objectId: chart.chartId } })
+        }
+      }
+      formattingRequests.push(...dashboardChartRequests(sheetIdValue))
+    }
     formattingRequests.push({
       updateSheetProperties: {
         properties: {
@@ -922,6 +1060,49 @@ export async function configurePipelineTabsWithRequest(
         fields: 'index,gridProperties.frozenRowCount,gridProperties.frozenColumnCount',
       },
     })
+    if (title === 'Calculations') {
+      formattingRequests.push(
+        {
+          repeatCell: {
+            range: { sheetId: sheetIdValue, startRowIndex: 8, endRowIndex: 10, startColumnIndex: 2, endColumnIndex: 3 },
+            cell: { userEnteredFormat: { numberFormat: { type: 'CURRENCY', pattern: '$#,##0.00' } } },
+            fields: 'userEnteredFormat.numberFormat',
+          },
+        },
+        {
+          repeatCell: {
+            range: { sheetId: sheetIdValue, startRowIndex: 11, endRowIndex: 12, startColumnIndex: 2, endColumnIndex: 3 },
+            cell: { userEnteredFormat: { numberFormat: { type: 'CURRENCY', pattern: '$#,##0.00' } } },
+            fields: 'userEnteredFormat.numberFormat',
+          },
+        },
+        {
+          repeatCell: {
+            range: { sheetId: sheetIdValue, startRowIndex: 13, endRowIndex: 14, startColumnIndex: 2, endColumnIndex: 3 },
+            cell: { userEnteredFormat: { numberFormat: { type: 'PERCENT', pattern: '0.0%' } } },
+            fields: 'userEnteredFormat.numberFormat',
+          },
+        },
+      )
+    }
+    if (title === 'Dashboard') {
+      formattingRequests.push(
+        {
+          repeatCell: {
+            range: { sheetId: sheetIdValue, startRowIndex: 10, endRowIndex: 11, startColumnIndex: 2, endColumnIndex: 3 },
+            cell: { userEnteredFormat: { numberFormat: { type: 'PERCENT', pattern: '0.0%' } } },
+            fields: 'userEnteredFormat.numberFormat',
+          },
+        },
+        {
+          repeatCell: {
+            range: { sheetId: sheetIdValue, startRowIndex: 11, endRowIndex: 14, startColumnIndex: 2, endColumnIndex: 3 },
+            cell: { userEnteredFormat: { numberFormat: { type: 'CURRENCY', pattern: '$#,##0.00' } } },
+            fields: 'userEnteredFormat.numberFormat',
+          },
+        },
+      )
+    }
     formattingRequests.push({
       updateDimensionProperties: {
         range: { sheetId: sheetIdValue, dimension: 'COLUMNS', startIndex: 0, endIndex: 1 },

@@ -146,6 +146,7 @@ for (const requiredPath of [
   'db/migrations/0050_historical_pipeline_catalog_restore.sql',
   'db/migrations/0051_preserve_configured_pipeline_dropdowns.sql',
   'db/migrations/0052_restore_canonical_dropdown_layout.sql',
+  'db/migrations/0053_seed_empty_pipeline_templates.sql',
   'scripts/start-railway.sh',
   'scripts/test-suitecrm-interaction-ingestion.mjs',
   'scripts/pipeline-outbox-poller.mjs',

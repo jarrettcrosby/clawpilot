@@ -26,6 +26,7 @@ import useMediaQuery from '@mui/material/useMediaQuery'
 import CloseRounded from '@mui/icons-material/CloseRounded'
 import DownloadRounded from '@mui/icons-material/DownloadRounded'
 import EditRounded from '@mui/icons-material/EditRounded'
+import { BASE_PIPELINE_WORKFLOW } from '@/lib/pipeline/baseTemplate.mjs'
 import PersonAddRounded from '@mui/icons-material/PersonAddRounded'
 import UploadFileRounded from '@mui/icons-material/UploadFileRounded'
 import Inventory2Rounded from '@mui/icons-material/Inventory2Rounded'
@@ -81,13 +82,7 @@ const WORKFLOW_FIELDS: Array<{ key: WorkflowField; label: string; helper: string
   { key: 'loss_reason', label: 'Loss reasons', helper: 'Reasons available when an opportunity is lost.' },
 ]
 
-const DEFAULT_WORKFLOW: Record<WorkflowField, string[]> = {
-  stage: ['Identified Lead', 'Qualified Lead', 'Needs Analysis', 'Demo', 'Proposal', 'Negotiation', 'Loss', 'Won'],
-  priority: ['A+', 'A', 'B', 'C', 'D'],
-  status: ['Open', 'On Hold', 'Closed', 'Won', 'Lost', 'Abandoned'],
-  source: ['Inbound', 'Outbound', 'Referral', 'Website', 'Partner'],
-  loss_reason: ['No Decision', 'Budget', 'Competition', 'Not a Fit'],
-}
+const DEFAULT_WORKFLOW: Record<WorkflowField, readonly string[]> = BASE_PIPELINE_WORKFLOW
 
 const EMPTY_PERSON = {
   id: '',

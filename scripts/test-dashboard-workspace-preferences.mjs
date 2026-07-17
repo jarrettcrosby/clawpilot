@@ -30,6 +30,10 @@ assert.match(dashboard, /if\s*\(loading\)/, 'dashboard must retain an explicit l
 assert.match(dashboard, /<Skeleton\b/, 'dashboard loading shell must render Skeleton content')
 assert.doesNotMatch(dashboard, /CircularProgress/, 'dashboard loading must not collapse to a spinner')
 assert.doesNotMatch(dashboard, /(?:window\.)?location\.reload\s*\(/, 'dashboard selection must update without a full-page reload')
+assert.match(dashboard, /label:\s*['"]Agent attention['"]/, 'dashboard must expose an actionable agent metric')
+assert.match(dashboard, /executionStatus === ['"]blocked['"] \|\| executionStatus === ['"]awaiting_input['"]/, 'agent attention must count tasks that need operator action')
+assert.doesNotMatch(dashboard, /Agent results/, 'dashboard must not present the historical execution row count as actionable')
+assert.doesNotMatch(dashboard, /execution-results\/summary/, 'dashboard must not fetch the historical execution row count')
 
 const workspaceRoute = read('app_src/app/api/workspaces/route.ts')
 assert.match(workspaceRoute, /searchParams\.get\(['"]dashboard['"]\)/, 'workspace API must recognize dashboard preference reads')
