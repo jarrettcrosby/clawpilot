@@ -589,6 +589,7 @@ function DealDrawer({
             {sources.map(s => <MenuItem key={s} value={s}>{s}</MenuItem>)}
           </TextField>
           <TextField disabled={readOnly} label="Loss Reason" select size="small" value={form.lossReason || ''} onChange={e => setForm({ ...form, lossReason: e.target.value })}>
+            <MenuItem value="">Not selected</MenuItem>
             {lossReasons.map(l => <MenuItem key={l} value={l}>{l}</MenuItem>)}
           </TextField>
         </Stack>
