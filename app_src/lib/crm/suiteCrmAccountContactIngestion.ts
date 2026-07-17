@@ -69,7 +69,7 @@ type ContactRow = CommonLocalRow & {
   organization_id: string
   organization_suitecrm_id: string | null
   app_user_email: string | null
-  app_user_reference_code: string | null
+  app_user_contact_reference_code: string | null
   priority: string | null
   first_name: string | null
   last_name: string | null
@@ -304,7 +304,7 @@ async function localContacts(snapshot: SuiteCrmRecordSnapshot): Promise<ContactR
        contact.suitecrm_id, contact.reference_code, contact.source_key,
        contact.source_sheet_id, contact.source_row_number, contact.source_payload,
        contact.organization_id::text, organization.suitecrm_id AS organization_suitecrm_id,
-       contact.app_user_email, app_user.reference_code AS app_user_reference_code,
+       contact.app_user_email, app_user.contact_reference_code AS app_user_contact_reference_code,
        contact.priority, contact.first_name, contact.last_name, contact.full_name,
        contact.contact_type, contact.account_manager, contact.job_title, contact.email,
        contact.linkedin_url, contact.phone_work, contact.phone_mobile,
@@ -446,7 +446,7 @@ function contactFields(
     organizationId: row.organization_id,
     organizationSuiteCrmId: row.organization_suitecrm_id,
     appUserEmail: nullableStoredString(row.app_user_email),
-    appUserReferenceCode: nullableStoredString(row.app_user_reference_code),
+    appUserContactReferenceCode: nullableStoredString(row.app_user_contact_reference_code),
     priority: storedString(row.priority),
     firstName,
     lastName,

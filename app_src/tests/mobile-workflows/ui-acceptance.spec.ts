@@ -142,6 +142,7 @@ function note(testInfo: TestInfo, description: string) {
 }
 
 async function mockCrmRecords(page: Page) {
+  const crmWrites: Array<Record<string, unknown>> = []
   await page.route((url) => url.pathname === '/api/workspaces', async (route) => {
     await route.fulfill({
       json: {
@@ -181,6 +182,10 @@ async function mockCrmRecords(page: Page) {
       fullName: 'Acceptance Contact',
       organizationId: '00000000-0000-4000-8000-000000000101',
       organizationName: 'Acceptance Organization',
+      accountManager: 'Mobile Operator',
+      ownerUserReferenceCode: 'gu2468135',
+      ownerEmail: 'operator@example.test',
+      ownerDisplayName: 'Mobile Operator',
       jobTitle: 'Mobile Lead',
       email: 'contact@example.test',
       emailOptOut: true,
@@ -250,7 +255,13 @@ async function mockCrmRecords(page: Page) {
 
   await page.route((url) => url.pathname === '/api/crm', async (route) => {
     if (route.request().method() !== 'GET') {
-      await route.continue()
+      const body = route.request().postDataJSON() as Record<string, unknown>
+      crmWrites.push(body)
+      await route.fulfill({
+        status: 201,
+        contentType: 'application/json',
+        body: JSON.stringify({ ok: true, queued: true, record: { id: '00000000-0000-4000-8000-000000000107' } }),
+      })
       return
     }
 
@@ -296,10 +307,17 @@ async function mockCrmRecords(page: Page) {
         }],
         canManageHierarchy: false,
         pipelineUsers: [{
+          referenceCode: 'gu2468135',
           email: 'operator@example.test',
           displayName: 'Mobile Operator',
           suiteCrmMapped: true,
           suiteCrmUsername: 'operator',
+        }, {
+          referenceCode: 'gu9753102',
+          email: 'support@example.test',
+          displayName: 'Support Operator',
+          suiteCrmMapped: false,
+          suiteCrmUsername: null,
         }],
         suiteCrmPunchoutUrl: 'https://crm.eigenracing.com',
         suiteCrmUsername: 'admin',
@@ -307,6 +325,7 @@ async function mockCrmRecords(page: Page) {
       }),
     })
   })
+  return { crmWrites }
 }
 
 for (const viewport of MOBILE_VIEWPORTS) {
@@ -514,7 +533,7 @@ for (const viewport of MOBILE_VIEWPORTS) {
     })
 
     test('CRM tabs, records, and optional editor remain usable', async ({ page }, testInfo) => {
-      await mockCrmRecords(page)
+      const { crmWrites } = await mockCrmRecords(page)
       await gotoApp(page, '/#crm')
       await expect(activeSection(page).getByRole('heading', { name: 'CRM', exact: true })).toBeVisible()
       const primaryActions = page.getByTestId('crm-primary-actions')
@@ -550,7 +569,16 @@ for (const viewport of MOBILE_VIEWPORTS) {
         await expect(closeEditor).toBeVisible()
         const drawer = closeEditor.locator('xpath=ancestor::*[contains(@class,"MuiDrawer-paper")][1]')
         await expectUsableGeometry(drawer, 'CRM editor drawer', 160, 280)
-        await closeEditor.click()
+        await drawer.getByLabel('Contact Full Name').fill('Assigned Contact')
+        await drawer.getByRole('combobox', { name: 'Organization' }).click()
+        await page.getByRole('option', { name: 'Acceptance Organization' }).click()
+        await drawer.getByRole('combobox', { name: 'Owner' }).click()
+        await page.getByRole('option', { name: 'Support Operator (support@example.test)' }).click()
+        await drawer.getByRole('button', { name: 'Save' }).click()
+        await expect.poll(() => {
+          const fields = crmWrites.at(-1)?.fields as Record<string, unknown> | undefined
+          return fields?.ownerUserReferenceCode
+        }).toBe('gu9753102')
       } else {
         note(testInfo, 'CRM is view-only, so the editor drawer was not opened')
       }
@@ -639,6 +667,7 @@ for (const viewport of MOBILE_VIEWPORTS) {
       await expect(relatedOrganization).toContainText('Acceptance Organization')
       await expect(relatedOrganization).toContainText('ga7654321')
       await expect(drawer.getByRole('textbox', { name: 'Email', exact: true })).toHaveValue('contact@example.test')
+      await expect(drawer.getByRole('combobox', { name: 'Owner' })).toContainText('Mobile Operator')
       await expect(drawer.getByRole('checkbox', { name: 'Do not email' })).toBeChecked()
       await expect(drawer.getByRole('button', { name: 'Email', exact: true })).toBeDisabled()
       await relatedOrganization.click()

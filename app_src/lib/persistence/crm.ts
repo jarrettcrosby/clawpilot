@@ -21,6 +21,7 @@ import type {
   CrmRecord,
   CrmSummary,
   SuiteCrmOutboxRecord,
+  SuiteCrmUserIdentityOutboxRecord,
 } from '@/lib/crm/types'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import { syncPipelineProductDropdownCatalogInPostgres } from '@/lib/persistence/pipeline'
@@ -90,13 +91,17 @@ export type StageContactInput = CommonStageInput & {
     organizationId?: string | null
     organizationSuiteCrmId?: string | null
     appUserEmail?: string | null
-    appUserReferenceCode?: string | null
+    appUserContactReferenceCode?: string | null
     priority?: string
     firstName?: string
     lastName?: string
     fullName: string
     contactType?: string
     accountManager?: string
+    ownerUserReferenceCode?: string | null
+    ownerEmail?: string | null
+    ownerDisplayName?: string | null
+    ownerSuiteCrmUserId?: string | null
     jobTitle?: string
     email?: string
     linkedinUrl?: string
@@ -253,15 +258,24 @@ export type StageCrmRecordInput =
   | StageInteractionInput
   | StageCampaignInput
 
-export type CrmOutboxItem = {
+type CrmOutboxItemBase = {
   id: string
   aggregateType: string
   aggregateId: string
-  operation: 'upsert_record' | 'delete_record'
-  payload: SuiteCrmOutboxRecord
   attempts: number
   lockToken: string
 }
+
+export type CrmOutboxItem = CrmOutboxItemBase & (
+  | {
+    operation: 'upsert_record' | 'delete_record'
+    payload: SuiteCrmOutboxRecord
+  }
+  | {
+    operation: 'upsert_user_identity'
+    payload: SuiteCrmUserIdentityOutboxRecord
+  }
+)
 
 function clean(value: unknown) {
   return String(value ?? '').trim()
@@ -339,6 +353,9 @@ function suiteCrmAttributes(input: StageCrmRecordInput, referenceCode: string) {
       primary_address_postalcode: clean(fields.postalCode),
       primary_address_country: clean(fields.country),
       account_id: clean(fields.organizationSuiteCrmId),
+      ...(fields.ownerSuiteCrmUserId === undefined ? {} : {
+        assigned_user_id: clean(fields.ownerSuiteCrmUserId),
+      }),
       description: clean(fields.description),
     }
   }
@@ -752,6 +769,7 @@ async function stageContact(
          primary_address_postal_code = $22, primary_address_country = $23,
          description = $24, email_opt_out = $25, source_payload = $26::jsonb,
          pipeline_user = COALESCE($29::boolean, pipeline_user),
+         owner_user_reference_code = $30, owner_email = $31, owner_display_name = $32,
          sync_status = CASE WHEN source_hash IS DISTINCT FROM $27 THEN 'pending' ELSE sync_status END,
          sync_error = CASE WHEN source_hash IS DISTINCT FROM $27 THEN NULL ELSE sync_error END,
          source_hash = $27, updated_by = $28, updated_at = now()
@@ -766,6 +784,7 @@ async function stageContact(
         nullable(fields.state), nullable(fields.postalCode), nullable(fields.country), nullable(fields.description),
         fields.emailOptOut === true, JSON.stringify(input.sourcePayload || {}), sourceHash, input.actorEmail,
         fields.pipelineUser === undefined ? null : fields.pipelineUser,
+        nullable(fields.ownerUserReferenceCode), nullable(fields.ownerEmail), nullable(fields.ownerDisplayName),
       ],
     )
     if (!updated.rows[0]) throw new Error('CRM contact was not found')
@@ -773,7 +792,7 @@ async function stageContact(
       client,
       updated.rows[0],
       fields.appUserEmail,
-      fields.appUserReferenceCode,
+      fields.appUserContactReferenceCode,
     )
   }
   const result = await client.query<{ id: string; suitecrm_id: string; reference_code: string }>(
@@ -784,14 +803,15 @@ async function stageContact(
         email, linkedin_url, phone_work, phone_mobile, primary_address_street,
         primary_address_city, primary_address_state, primary_address_postal_code,
         primary_address_country, description, email_opt_out, source_payload, source_hash,
-        sync_status, sync_error, created_by, updated_by, pipeline_user
+        sync_status, sync_error, created_by, updated_by, pipeline_user,
+        owner_user_reference_code, owner_email, owner_display_name
       )
       VALUES (
         $1::uuid, $2::uuid, $3, $4, $4,
         COALESCE((SELECT reference_code FROM crm_contacts WHERE pipeline_id = $1::uuid AND identity_key = $4), allocate_crm_reference('gc')),
         $5, $6, $7, $8, $9, $10, $11, $12, $13,
         $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25::jsonb, $26,
-        'pending', NULL, $27, $27, COALESCE($28::boolean, false)
+        'pending', NULL, $27, $27, COALESCE($28::boolean, false), $29, $30, $31
       )
       ON CONFLICT (pipeline_id, identity_key) DO UPDATE SET
         organization_id = EXCLUDED.organization_id,
@@ -818,6 +838,9 @@ async function stageContact(
         description = EXCLUDED.description,
         email_opt_out = EXCLUDED.email_opt_out,
         pipeline_user = COALESCE($28::boolean, crm_contacts.pipeline_user),
+        owner_user_reference_code = EXCLUDED.owner_user_reference_code,
+        owner_email = EXCLUDED.owner_email,
+        owner_display_name = EXCLUDED.owner_display_name,
         source_payload = EXCLUDED.source_payload,
         source_hash = EXCLUDED.source_hash,
         sync_status = CASE WHEN crm_contacts.source_hash IS DISTINCT FROM EXCLUDED.source_hash THEN 'pending' ELSE crm_contacts.sync_status END,
@@ -834,13 +857,14 @@ async function stageContact(
       nullable(fields.address), nullable(fields.city), nullable(fields.state), nullable(fields.postalCode), nullable(fields.country),
       nullable(fields.description), fields.emailOptOut === true, JSON.stringify(input.sourcePayload || {}), sourceHash, input.actorEmail,
       fields.pipelineUser === undefined ? null : fields.pipelineUser,
+      nullable(fields.ownerUserReferenceCode), nullable(fields.ownerEmail), nullable(fields.ownerDisplayName),
     ],
   )
   return applyAppUserContactIdentity(
     client,
     result.rows[0],
     fields.appUserEmail,
-    fields.appUserReferenceCode,
+    fields.appUserContactReferenceCode,
   )
 }
 
@@ -1298,10 +1322,181 @@ async function ensureCrmReferenceShortLink(
   return inserted.rows[0] ? crmReferenceShortUrl(input.referenceCode) : null
 }
 
+type CrmContactOwnerSnapshot = {
+  referenceCode: string
+  email: string
+  displayName: string
+  suiteCrmUserId: string | null
+  accountManager: string
+}
+
+function contactOwnerFields(
+  fields: StageContactInput['fields'],
+  owner: CrmContactOwnerSnapshot,
+): StageContactInput['fields'] {
+  return {
+    ...fields,
+    accountManager: owner.displayName,
+    ownerUserReferenceCode: owner.referenceCode,
+    ownerEmail: owner.email,
+    ownerDisplayName: owner.displayName,
+    ownerSuiteCrmUserId: owner.suiteCrmUserId,
+  }
+}
+
+async function currentCrmContactOwner(
+  client: PoolClient,
+  input: Pick<StageContactInput, 'pipelineId' | 'localId'>,
+): Promise<CrmContactOwnerSnapshot | null> {
+  if (!input.localId) return null
+  const result = await client.query<{
+    owner_user_reference_code: string | null
+    owner_email: string | null
+    owner_display_name: string | null
+    account_manager: string | null
+    suitecrm_user_id: string | null
+  }>(
+    `SELECT contact.owner_user_reference_code, contact.owner_email, contact.owner_display_name,
+       contact.account_manager, app_user.suitecrm_user_id
+     FROM crm_contacts contact
+     LEFT JOIN app_users app_user
+       ON app_user.reference_code = contact.owner_user_reference_code
+     WHERE contact.pipeline_id = $1::uuid AND contact.id = $2::uuid
+     LIMIT 1`,
+    [input.pipelineId, input.localId],
+  )
+  const row = result.rows[0]
+  const referenceCode = clean(row?.owner_user_reference_code).toLowerCase()
+  const email = clean(row?.owner_email).toLowerCase()
+  const displayName = clean(row?.owner_display_name)
+  if (!/^gu[0-9]{7}$/.test(referenceCode) || !email || !displayName) return null
+  return {
+    referenceCode,
+    email,
+    displayName,
+    suiteCrmUserId: nullable(row?.suitecrm_user_id),
+    accountManager: clean(row.account_manager) || displayName,
+  }
+}
+
+async function activeCrmContactOwners(
+  client: PoolClient,
+  input: { pipelineId: string; referenceCode?: string; legacyOwner?: string },
+): Promise<CrmContactOwnerSnapshot[]> {
+  const referenceCode = clean(input.referenceCode).toLowerCase()
+  const legacyOwner = clean(input.legacyOwner).toLowerCase()
+  const result = await client.query<{
+    reference_code: string
+    email: string
+    display_name: string | null
+    suitecrm_user_id: string | null
+  }>(
+    `SELECT app_user.reference_code, app_user.email, app_user.display_name, app_user.suitecrm_user_id
+     FROM app_users app_user
+     JOIN pipeline_spaces pipeline ON pipeline.id = $1::uuid
+     LEFT JOIN pipeline_space_members membership
+       ON membership.pipeline_id = pipeline.id
+      AND membership.user_email = app_user.email
+     WHERE app_user.status = 'active'
+       AND (pipeline.owner_email = app_user.email OR membership.user_email IS NOT NULL)
+       AND (
+         ($2 <> '' AND app_user.reference_code = $2)
+         OR (
+           $2 = ''
+           AND $3 <> ''
+           AND (
+             app_user.email = $3
+             OR lower(COALESCE(NULLIF(btrim(app_user.display_name), ''), app_user.email)) = $3
+           )
+         )
+       )
+     ORDER BY CASE WHEN app_user.email = $3 THEN 0 ELSE 1 END, app_user.email`,
+    [input.pipelineId, referenceCode, legacyOwner],
+  )
+  return result.rows.map((row) => ({
+    referenceCode: row.reference_code,
+    email: row.email,
+    displayName: clean(row.display_name) || row.email,
+    suiteCrmUserId: nullable(row.suitecrm_user_id),
+    accountManager: clean(row.display_name) || row.email,
+  }))
+}
+
+async function normalizeStageContactOwner(
+  client: PoolClient,
+  input: StageContactInput,
+): Promise<StageContactInput> {
+  const fields = input.fields
+  const current = await currentCrmContactOwner(client, input)
+  const selectionSpecified = Object.prototype.hasOwnProperty.call(fields, 'ownerUserReferenceCode')
+
+  if (selectionSpecified) {
+    const requestedReference = clean(fields.ownerUserReferenceCode).toLowerCase()
+    if (!requestedReference) {
+      return {
+        ...input,
+        fields: {
+          ...fields,
+          accountManager: '',
+          ownerUserReferenceCode: null,
+          ownerEmail: null,
+          ownerDisplayName: null,
+          ownerSuiteCrmUserId: null,
+        },
+      }
+    }
+    if (!/^gu[0-9]{7}$/.test(requestedReference)) throw new Error('Contact owner identity is invalid')
+    const [owner] = await activeCrmContactOwners(client, {
+      pipelineId: input.pipelineId,
+      referenceCode: requestedReference,
+    })
+    if (owner) return { ...input, fields: contactOwnerFields(fields, owner) }
+    if (current?.referenceCode === requestedReference) {
+      return { ...input, fields: contactOwnerFields(fields, current) }
+    }
+    throw new Error('Contact owner must be an active ClawPilot user with pipeline access')
+  }
+
+  const legacyOwner = clean(fields.accountManager)
+  if (legacyOwner) {
+    const candidates = await activeCrmContactOwners(client, {
+      pipelineId: input.pipelineId,
+      legacyOwner,
+    })
+    const exactEmailMatches = candidates.filter((candidate) => candidate.email === legacyOwner.toLowerCase())
+    const bestMatches = exactEmailMatches.length > 0 ? exactEmailMatches : candidates
+    if (bestMatches.length === 1) {
+      return { ...input, fields: contactOwnerFields(fields, bestMatches[0]) }
+    }
+    const normalizedLegacy = legacyOwner.toLowerCase()
+    if (current && [current.accountManager, current.displayName, current.email].some((value) => (
+      value.toLowerCase() === normalizedLegacy
+    ))) {
+      return { ...input, fields: contactOwnerFields(fields, current) }
+    }
+  } else if (current) {
+    return { ...input, fields: contactOwnerFields(fields, current) }
+  }
+
+  return {
+    ...input,
+    fields: {
+      ...fields,
+      ownerUserReferenceCode: null,
+      ownerEmail: null,
+      ownerDisplayName: null,
+      ownerSuiteCrmUserId: undefined,
+    },
+  }
+}
+
 async function normalizeStageCrmRecordInput(
   client: PoolClient,
   input: StageCrmRecordInput,
 ): Promise<StageCrmRecordInput> {
+  if (input.entity === 'contacts') {
+    return normalizeStageContactOwner(client, input)
+  }
   if (input.entity === 'opportunities') {
     const organization = await client.query<{ name: string; suitecrm_id: string | null }>(
       `SELECT name, suitecrm_id
@@ -1761,7 +1956,7 @@ export async function updateCrmDescriptionWithClient(client: PoolClient, input: 
 
   const result = await client.query<Record<string, unknown>>(
     `SELECT contact.*, organization.suitecrm_id AS organization_suitecrm_id,
-       app_user.reference_code AS app_user_reference_code
+       app_user.contact_reference_code AS app_user_contact_reference_code
      FROM crm_contacts contact
      JOIN crm_organizations organization ON organization.id = contact.organization_id
      LEFT JOIN app_users app_user ON app_user.email = contact.app_user_email
@@ -1787,7 +1982,7 @@ export async function updateCrmDescriptionWithClient(client: PoolClient, input: 
       organizationId: clean(row.organization_id),
       organizationSuiteCrmId: clean(row.organization_suitecrm_id),
       appUserEmail: nullable(row.app_user_email),
-      appUserReferenceCode: nullable(row.app_user_reference_code),
+      appUserContactReferenceCode: nullable(row.app_user_contact_reference_code),
       priority: clean(row.priority),
       firstName: clean(row.first_name),
       lastName: clean(row.last_name),
@@ -2047,7 +2242,7 @@ export async function syncAppUserProfileToCrm(input: {
       organizationId: organization.id,
       organizationSuiteCrmId: organization.suiteCrmId,
       appUserEmail: user.email,
-      appUserReferenceCode: user.referenceCode,
+      appUserContactReferenceCode: user.contactReferenceCode,
       fullName: displayName,
       email: user.email,
       jobTitle: clean(user.jobTitle),
@@ -2123,7 +2318,9 @@ function contactFromRow(row: Record<string, unknown>): CrmContact {
     organizationName: clean(row.organization_name), suiteCrmId: nullable(row.suitecrm_id), sourceKey: String(row.source_key),
     sourceRowNumber: row.source_row_number === null ? null : Number(row.source_row_number), priority: clean(row.priority),
     firstName: clean(row.first_name), lastName: clean(row.last_name), fullName: clean(row.full_name), contactType: clean(row.contact_type),
-    accountManager: clean(row.account_manager), jobTitle: clean(row.job_title), email: clean(row.email), linkedinUrl: clean(row.linkedin_url),
+    accountManager: clean(row.account_manager), ownerUserReferenceCode: nullable(row.owner_user_reference_code),
+    ownerEmail: nullable(row.owner_email), ownerDisplayName: clean(row.owner_display_name),
+    jobTitle: clean(row.job_title), email: clean(row.email), linkedinUrl: clean(row.linkedin_url),
     phoneWork: clean(row.phone_work), phoneMobile: clean(row.phone_mobile), address: clean(row.primary_address_street),
     city: clean(row.primary_address_city), state: clean(row.primary_address_state), postalCode: clean(row.primary_address_postal_code),
     country: clean(row.primary_address_country), description: clean(row.description), emailOptOut: row.email_opt_out === true,
@@ -2679,14 +2876,14 @@ async function ensurePipelineCatalogAppUserContacts(
     await lockCrmMutation(client, `pipeline-catalog-people:${context.pipelineId}`)
     const users = await client.query<{
       email: string
-      reference_code: string
+      contact_reference_code: string
       display_name: string | null
       job_title: string | null
       timezone: string | null
       locale: string | null
       contact_id: string | null
     }>(
-      `SELECT app_user.email, app_user.reference_code, app_user.display_name, app_user.job_title,
+      `SELECT app_user.email, app_user.contact_reference_code, app_user.display_name, app_user.job_title,
          app_user.timezone, app_user.locale, contact.id::text AS contact_id
        FROM app_users app_user
        LEFT JOIN crm_contacts contact
@@ -2716,7 +2913,7 @@ async function ensurePipelineCatalogAppUserContacts(
           organizationId: context.crmOrganizationId,
           organizationSuiteCrmId: context.crmOrganizationSuiteCrmId,
           appUserEmail: user.email,
-          appUserReferenceCode: user.reference_code,
+          appUserContactReferenceCode: user.contact_reference_code,
           fullName: displayName,
           email: user.email,
           jobTitle: clean(user.job_title),
@@ -3162,16 +3359,18 @@ export async function upsertPipelineCatalogProductInPostgres(input: {
 }
 
 export async function listCrmPipelineUsersInPostgres(pipelineId: string): Promise<Array<{
+  referenceCode: string
   email: string
   displayName: string
   suiteCrmMapped: boolean
 }>> {
   const result = await query<{
+    reference_code: string
     email: string
     display_name: string | null
     suitecrm_user_id: string | null
   }>(
-    `SELECT app_user.email, app_user.display_name, app_user.suitecrm_user_id
+    `SELECT app_user.reference_code, app_user.email, app_user.display_name, app_user.suitecrm_user_id
      FROM app_users app_user
      JOIN pipeline_spaces pipeline ON pipeline.id = $1::uuid
      LEFT JOIN pipeline_space_members membership
@@ -3183,6 +3382,7 @@ export async function listCrmPipelineUsersInPostgres(pipelineId: string): Promis
     [pipelineId],
   )
   return result.rows.map((row) => ({
+    referenceCode: row.reference_code,
     email: row.email,
     displayName: clean(row.display_name) || row.email,
     suiteCrmMapped: Boolean(row.suitecrm_user_id),
@@ -3472,7 +3672,7 @@ export async function claimSuiteCrmOutboxInPostgres(input: { limit?: number; max
     const result = await client.query<Record<string, unknown>>(
       `WITH candidates AS (
          SELECT id FROM sync_outbox
-         WHERE target_system = 'suitecrm' AND operation IN ('upsert_record', 'delete_record')
+         WHERE target_system = 'suitecrm' AND operation IN ('upsert_record', 'delete_record', 'upsert_user_identity')
            AND status IN ('queued', 'failed') AND attempts < $1 AND available_at <= now()
          ORDER BY available_at, created_at FOR UPDATE SKIP LOCKED LIMIT $2
        )
@@ -3495,9 +3695,9 @@ export async function claimSuiteCrmOutboxInPostgres(input: { limit?: number; max
     }
     return result.rows.map((row) => ({
       id: String(row.id), aggregateType: String(row.aggregate_type), aggregateId: String(row.aggregate_id),
-      operation: row.operation as CrmOutboxItem['operation'], payload: row.payload as SuiteCrmOutboxRecord,
+      operation: row.operation, payload: row.payload,
       attempts: Number(row.attempts), lockToken: String(row.lock_token),
-    } satisfies CrmOutboxItem))
+    } as CrmOutboxItem))
   })
 }
 

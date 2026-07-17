@@ -207,7 +207,11 @@ export async function POST(req: NextRequest) {
           organizationId: organization.id, organizationSuiteCrmId: organization.suiteCrmId,
           fullName, firstName: stringValue(fields.firstName, 100), lastName: stringValue(fields.lastName, 150),
           priority: stringValue(fields.priority, 50), contactType: stringValue(fields.contactType, 100),
-          accountManager: stringValue(fields.accountManager, 200), jobTitle: stringValue(fields.jobTitle, 250),
+          accountManager: stringValue(fields.accountManager, 200),
+          ...(fields.ownerUserReferenceCode === undefined ? {} : {
+            ownerUserReferenceCode: stringValue(fields.ownerUserReferenceCode, 9).toLowerCase() || null,
+          }),
+          jobTitle: stringValue(fields.jobTitle, 250),
           email: validEmail(fields.email), linkedinUrl: stringValue(fields.linkedinUrl, 500),
           phoneWork: stringValue(fields.phoneWork, 100), phoneMobile: stringValue(fields.phoneMobile, 100),
           address: stringValue(fields.address, 500), city: stringValue(fields.city, 150), state: stringValue(fields.state, 150),
