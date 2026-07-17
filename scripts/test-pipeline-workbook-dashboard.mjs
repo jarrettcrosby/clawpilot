@@ -66,7 +66,9 @@ assert.ok(
 assert.match(configureBlock, /range: `'\$\{title\}'!B5`[\s\S]{0,100}values: INITIAL_TAB_ROWS\[title\]/)
 
 assert.match(source, /charts\?: Array<\{ chartId\?: number \}>/)
+assert.match(source, /merges\?: Array</)
 assert.match(source, /charts\(chartId\)/)
+assert.match(source, /charts\(chartId\),merges/)
 assert.match(source, /title === 'Dashboard'[\s\S]{0,320}deleteEmbeddedObject: \{ objectId: chart\.chartId \}/)
 assert.match(source, /formattingRequests\.push\(\.\.\.dashboardChartRequests\(sheetIdValue\)\)/)
 assert.equal((source.match(/title: '(?:Opportunity lifecycle|Pipeline value|CRM records)'/g) || []).length, 3)
@@ -79,7 +81,7 @@ assert.match(chartRequestBlock, /targetAxis: input\.chartType === 'BAR' \? 'BOTT
 for (const chartContract of [
   { title: 'Opportunity lifecycle', start: 6, end: 10, row: 3, column: 4, type: 'COLUMN' },
   { title: 'Pipeline value', start: 11, end: 14, row: 18, column: 4, type: 'COLUMN' },
-  { title: 'CRM records', start: 14, end: 17, row: 3, column: 13, type: 'BAR' },
+  { title: 'CRM records', start: 14, end: 17, row: 3, column: 9, type: 'BAR' },
 ]) {
   const chartStart = chartRequestBlock.indexOf(`title: '${chartContract.title}'`)
   const chartDefinition = chartRequestBlock.slice(chartStart, chartRequestBlock.indexOf('}),', chartStart) + 3)
@@ -90,6 +92,7 @@ for (const chartContract of [
   assert.ok(chartDefinition.includes(`anchorColumnIndex: ${chartContract.column}`))
   assert.ok(chartDefinition.includes(`chartType: '${chartContract.type}'`))
 }
+assert.match(chartRequestBlock, /widthPixels: 420/)
 const dashboardReconciliation = source.slice(
   source.indexOf("if (title === 'Dashboard')"),
   source.indexOf(
@@ -101,6 +104,11 @@ assert.ok(
   dashboardReconciliation.indexOf('deleteEmbeddedObject')
     < dashboardReconciliation.indexOf('dashboardChartRequests'),
   'Dashboard charts must be deleted before the managed chart set is added',
+)
+assert.match(configureBlock, /dashboardMerges\.map\(\(range\) => \(\{ unmergeCells: \{ range \} \}\)\)/)
+assert.ok(
+  configureBlock.indexOf('unmergeCells') < configureBlock.indexOf('/values:batchClear'),
+  'legacy Dashboard merges must be removed before report formulas are written',
 )
 
 assert.doesNotMatch(clearRangesBlock, /Opportunities|Dropdowns/, 'report cleanup must not clear operator-owned tabs')
