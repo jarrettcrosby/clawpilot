@@ -228,6 +228,26 @@ for (const contract of [
   assertIncludes(pipelineSpellingMigration, contract, 'canonical pipeline stage spelling migration')
 }
 
+const residualPipelineCatalogMigration = read('db/migrations/0049_residual_pipeline_catalog_repair.sql')
+for (const contract of [
+  'residual_pipeline_catalogs',
+  "catalog.catalog->'dropdowns'->'stage' = catalog.catalog->'dropdowns'->'owner'",
+  'residual_canonical_products',
+  'residual_invalid_products',
+  'crm:products:residual-catalog-cleanup:v1:',
+  "'{dropdowns,product}'",
+  "'{dropdowns,stage}'",
+  "'{dropdowns,priority}'",
+  "'{dropdowns,status}'",
+  "'{dropdowns,source}'",
+  "'{dropdowns,loss_reason}'",
+  'residual-catalog-repair:v1',
+  "'pipeline.residual_catalog.normalized'",
+  'globalIdentifiersRetained',
+]) {
+  assertIncludes(residualPipelineCatalogMigration, contract, 'residual pipeline catalog repair migration')
+}
+
 const crmIdentityHierarchyMigration = read('db/migrations/0021_crm_identity_and_organization_hierarchy.sql')
 for (const contract of [
   'CREATE TABLE IF NOT EXISTS workspace_organizations',
@@ -1169,6 +1189,7 @@ assertIncludes(healthRoute, '0045_pipeline_people_products_and_dropdown_catalogs
 assertIncludes(healthRoute, '0046_atomic_pipeline_products_and_sync_retry_state.sql', 'hosted atomic product catalog migration health')
 assertIncludes(healthRoute, '0047_workspace_organization_branding.sql', 'hosted organization branding migration health')
 assertIncludes(healthRoute, '0048_canonical_pipeline_negotiation_spelling.sql', 'hosted pipeline spelling migration health')
+assertIncludes(healthRoute, '0049_residual_pipeline_catalog_repair.sql', 'hosted residual pipeline catalog migration health')
 assertIncludes(healthRoute, 'readSuiteCrmWorkerHeartbeat', 'hosted SuiteCRM worker health')
 assertIncludes(healthRoute, 'migration_checksums_present', 'hosted migration checksum health')
 assertIncludes(healthRoute, 'queryAgentCredentials', 'shared agent credential store health')

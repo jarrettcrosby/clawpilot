@@ -142,6 +142,7 @@ for (const requiredPath of [
   'db/migrations/0046_atomic_pipeline_products_and_sync_retry_state.sql',
   'db/migrations/0047_workspace_organization_branding.sql',
   'db/migrations/0048_canonical_pipeline_negotiation_spelling.sql',
+  'db/migrations/0049_residual_pipeline_catalog_repair.sql',
   'scripts/start-railway.sh',
   'scripts/test-suitecrm-interaction-ingestion.mjs',
   'scripts/pipeline-outbox-poller.mjs',
