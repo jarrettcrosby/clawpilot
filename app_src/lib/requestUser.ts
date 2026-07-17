@@ -18,6 +18,7 @@ function localDevelopmentUser(): AppUser | null {
     email,
     referenceCode: 'gu0000001',
     contactReferenceCode: 'gc0000002',
+    crmUserEnabled: true,
     role: 'owner',
     status: 'active',
     displayName: 'Local Developer',

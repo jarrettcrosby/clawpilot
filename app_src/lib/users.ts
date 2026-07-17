@@ -58,8 +58,9 @@ export const OWNER_PERMISSIONS: AppUserPermissions = {
 
 export type AppUser = {
   email: string
-  referenceCode: string
+  referenceCode: string | null
   contactReferenceCode: string
+  crmUserEnabled: boolean
   role: AppUserRole
   status: AppUserStatus
   displayName: string | null
@@ -88,8 +89,9 @@ export type InviteAppUserResult = {
 
 type AppUserRow = {
   email: string
-  reference_code: string
+  reference_code: string | null
   contact_reference_code: string
+  crm_user_enabled: boolean
   role: AppUserRole
   status: AppUserStatus
   display_name: string | null
@@ -196,6 +198,7 @@ function toAppUser(row: AppUserRow): AppUser {
     email: row.email,
     referenceCode: row.reference_code,
     contactReferenceCode: row.contact_reference_code,
+    crmUserEnabled: row.crm_user_enabled,
     role: row.role,
     status: row.status,
     displayName: row.display_name,
@@ -221,15 +224,18 @@ export async function ensureOwnerUser(): Promise<AppUser> {
   const result = await query<AppUserRow>(
     `
       INSERT INTO app_users (
-        email, reference_code, contact_reference_code, role, status, permissions, activated_at, created_at, updated_at
+        email, reference_code, contact_reference_code, crm_user_enabled,
+        role, status, permissions, activated_at, created_at, updated_at
       )
       VALUES (
         $1,
         COALESCE((SELECT reference_code FROM app_users WHERE email = $1), allocate_crm_reference('gu')),
         COALESCE((SELECT contact_reference_code FROM app_users WHERE email = $1), allocate_crm_reference('gc')),
-        'owner', 'active', $2::jsonb, now(), now(), now()
+        true, 'owner', 'active', $2::jsonb, now(), now(), now()
       )
       ON CONFLICT (email) DO UPDATE SET
+        reference_code = COALESCE(app_users.reference_code, allocate_crm_reference('gu')),
+        crm_user_enabled = true,
         role = 'owner',
         status = CASE WHEN app_users.status = 'disabled' THEN 'disabled' ELSE 'active' END,
         permissions = $2::jsonb,
@@ -282,10 +288,12 @@ export async function inviteAppUser(input: {
   actorEmail: unknown
   email: unknown
   organizationId: unknown
+  crmUserEnabled?: unknown
 }): Promise<InviteAppUserResult> {
   const actor = await requireActiveAppUser(input.actorEmail)
   if (!canInviteUsers(actor)) throw new AppUserAuthorizationError('You do not have permission to invite users')
   const email = normalizeUserEmail(input.email)
+  const crmUserEnabled = input.crmUserEnabled === true
   const organizationId = String(input.organizationId || '').trim()
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(organizationId)) {
     throw new Error('A valid invitation organization is required')
@@ -339,17 +347,23 @@ export async function inviteAppUser(input: {
         previousInvitedBy: current.invited_by,
       }
     }
+    const invitedCrmUserEnabled = current ? current.crm_user_enabled : crmUserEnabled
 
     const result = await client.query<AppUserRow>(
       `
         INSERT INTO app_users (
-          email, reference_code, contact_reference_code, role, status, permissions, invited_by, invited_at,
+          email, reference_code, contact_reference_code, crm_user_enabled,
+          role, status, permissions, invited_by, invited_at,
           organization_id, organization_name, created_at, updated_at
         )
         VALUES (
           $1,
-          COALESCE((SELECT reference_code FROM app_users WHERE email = $1), allocate_crm_reference('gu')),
+          CASE WHEN $6::boolean
+            THEN COALESCE((SELECT reference_code FROM app_users WHERE email = $1), allocate_crm_reference('gu'))
+            ELSE NULL
+          END,
           COALESCE((SELECT contact_reference_code FROM app_users WHERE email = $1), allocate_crm_reference('gc')),
+          $6::boolean,
           'member', 'invited', $3::jsonb, $2, now(), $4::uuid, $5, now(), now()
         )
         ON CONFLICT (email) DO UPDATE SET
@@ -361,7 +375,7 @@ export async function inviteAppUser(input: {
           updated_at = now()
         RETURNING *
       `,
-      [email, actor.email, JSON.stringify(MEMBER_PERMISSIONS), organizationId, organization.rows[0].name],
+      [email, actor.email, JSON.stringify(MEMBER_PERMISSIONS), organizationId, organization.rows[0].name, invitedCrmUserEnabled],
     )
     await recordAuditEvent({
       actor: actor.email,
@@ -375,6 +389,7 @@ export async function inviteAppUser(input: {
         organizationName: organization.rows[0].name,
         previousOrganizationId: current?.organization_id || null,
         reinvited: Boolean(current),
+        crmUserEnabled: result.rows[0].crm_user_enabled,
       },
     }, client)
     return {
@@ -456,6 +471,97 @@ export async function setAppUserStatus(input: {
   return toAppUser(row)
 }
 
+export async function updateAppUserCrmEmployee(input: {
+  actorEmail: unknown
+  email: unknown
+  enabled: unknown
+}): Promise<AppUser> {
+  const actor = await requireActiveAppUser(input.actorEmail)
+  if (!canManageUserAccess(actor)) {
+    throw new AppUserAuthorizationError('You do not have permission to manage CRM employees')
+  }
+  const email = normalizeUserEmail(input.email)
+  const enabled = input.enabled === true
+  const target = await getAppUser(email)
+  if (!target) throw new AppUserNotFoundError()
+  await requireOrganizationInActorScope(actor, target.organizationId)
+  if (target.role === 'owner' && !enabled) {
+    throw new AppUserAuthorizationError('The owner must remain a CRM employee')
+  }
+  if (actor.role !== 'owner' && target.role !== 'member' && target.email !== actor.email) {
+    throw new AppUserAuthorizationError('Only the owner can manage another administrator as a CRM employee')
+  }
+
+  return withTransaction(async (client) => {
+    const locked = await client.query<AppUserRow>('SELECT * FROM app_users WHERE email = $1 FOR UPDATE', [email])
+    const current = locked.rows[0]
+    if (!current) throw new AppUserNotFoundError()
+    if (current.crm_user_enabled === enabled) return toAppUser(current)
+
+    let updated: AppUserRow | undefined
+    if (enabled) {
+      const result = await client.query<AppUserRow>(
+        `UPDATE app_users
+         SET crm_user_enabled = true,
+             reference_code = COALESCE(reference_code, allocate_crm_reference('gu')),
+             updated_at = now()
+         WHERE email = $1
+         RETURNING *`,
+        [email],
+      )
+      updated = result.rows[0]
+    } else {
+      const ownedContacts = await client.query<{ count: string }>(
+        `SELECT count(*)::text AS count
+         FROM crm_contacts
+         WHERE owner_user_reference_code = $1`,
+        [current.reference_code],
+      )
+      const ownedCount = Number(ownedContacts.rows[0]?.count || 0)
+      if (ownedCount > 0) {
+        throw new Error(`Reassign ${ownedCount} CRM Contact${ownedCount === 1 ? '' : 's'} before removing this employee`)
+      }
+      const result = await client.query<AppUserRow>(
+        `UPDATE app_users
+         SET crm_user_enabled = false,
+             reference_code = NULL,
+             suitecrm_user_id = NULL,
+             suitecrm_username = NULL,
+             updated_at = now()
+         WHERE email = $1
+         RETURNING *`,
+        [email],
+      )
+      updated = result.rows[0]
+      if (current.reference_code) {
+        await client.query(
+          `UPDATE crm_reference_registry
+           SET status = 'retired', retired_at = COALESCE(retired_at, now())
+           WHERE reference_code = $1 AND status = 'active'`,
+          [current.reference_code],
+        )
+      }
+    }
+    if (!updated) throw new AppUserNotFoundError()
+    const user = toAppUser(updated)
+    await recordAuditEvent({
+      actor: actor.email,
+      eventType: 'user.crm_employee.updated',
+      aggregateType: 'app_user',
+      aggregateId: email,
+      subject: target.displayName || email,
+      organizationId: target.organizationId,
+      payload: {
+        enabled,
+        previousReferenceCode: current.reference_code,
+        referenceCode: user.referenceCode,
+        suiteCrmMappingCleared: !enabled && Boolean(current.suitecrm_user_id),
+      },
+    }, client)
+    return user
+  })
+}
+
 export async function updateAppUserSuiteCrmMapping(input: {
   actorEmail: unknown
   email: unknown
@@ -469,6 +575,9 @@ export async function updateAppUserSuiteCrmMapping(input: {
   const email = normalizeUserEmail(input.email)
   const target = await getAppUser(email)
   if (!target) throw new AppUserNotFoundError()
+  if (!target.crmUserEnabled || !target.referenceCode) {
+    throw new Error('Configure this user as a CRM employee before matching a SuiteCRM user')
+  }
   await requireOrganizationInActorScope(actor, target.organizationId)
   if (target.role === 'owner' && target.email !== actor.email) {
     throw new AppUserAuthorizationError('Only the owner can update the owner CRM mapping')
@@ -497,6 +606,7 @@ export async function updateAppUserSuiteCrmMapping(input: {
     if (!result.rows[0]) throw new AppUserNotFoundError()
     const user = toAppUser(result.rows[0])
     if (!user.suiteCrmUserId) throw new Error('SuiteCRM user mapping was not persisted')
+    if (!user.referenceCode) throw new Error('CRM employee Global ID was not persisted')
     const payload = {
       localId: user.email,
       suiteCrmUserId: user.suiteCrmUserId,

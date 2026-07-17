@@ -58,6 +58,8 @@ assertIncludes(usersAdapter, "UPDATE workspace_organizations", 'atomic profile o
 assertIncludes(usersAdapter, "'pipeline:' || pipeline.id::text || ':provision'", 'profile Drive reconciliation enqueue')
 assertIncludes(usersAdapter, "VALUES ('app_users', $1, 'upsert_user_identity', 'suitecrm'", 'retryable native SuiteCRM user identity projection')
 assertIncludes(usersAdapter, 'updateAppUserAccess', 'app users adapter')
+assertIncludes(usersAdapter, 'updateAppUserCrmEmployee', 'explicit CRM employee access')
+assertIncludes(usersAdapter, 'Reassign ${ownedCount} CRM Contact', 'CRM employee owner reassignment guard')
 assertIncludes(usersAdapter, 'AppUserAuthorizationError', 'app user authorization errors')
 assertIncludes(usersAdapter, 'AppUserNotFoundError', 'app user not-found errors')
 
@@ -326,6 +328,20 @@ for (const contract of [
   'crm:suitecrm-user-global-id:v1:',
 ]) {
   assertIncludes(crmContactOwnerIdentityMigration, contract, 'CRM contact owner user identity migration')
+}
+
+const crmEmployeeIdentityMigration = read('db/migrations/0056_crm_employee_identity_and_workbook_dashboard.sql')
+for (const contract of [
+  'crm_user_enabled boolean NOT NULL DEFAULT false',
+  "email = 'olivia@suburbiasandwichco.com'",
+  'retired_app_user_global_identities',
+  "SET status = 'retired'",
+  'ALTER COLUMN reference_code DROP NOT NULL',
+  'app_users_crm_employee_identity_complete',
+  "'provision_pipeline'",
+  'managed-dashboard-v2',
+]) {
+  assertIncludes(crmEmployeeIdentityMigration, contract, 'CRM employee identity and workbook repair migration')
 }
 
 const crmIdentityHierarchyMigration = read('db/migrations/0021_crm_identity_and_organization_hierarchy.sql')
@@ -989,11 +1005,14 @@ assertIncludes(crmRoute, '...(fields.ownerUserReferenceCode === undefined ? {}',
 assertIncludes(crmAdapter, 'fields.ownerSuiteCrmUserId === undefined ? {}', 'legacy SuiteCRM owner assignment preservation')
 
 const userAccessUi = read('app_src/components/settings/UserAccessDialog.tsx')
-assertIncludes(userAccessUi, 'Match CRM user', 'admin SuiteCRM user mapping command')
+assertIncludes(userAccessUi, 'Link existing CRM employee', 'admin SuiteCRM employee mapping command')
 assertIncludes(userAccessUi, "action: 'crm-user-mapping'", 'admin SuiteCRM user mapping request')
+assertIncludes(userAccessUi, "action: 'crm-employee'", 'explicit CRM employee access request')
+assertIncludes(userAccessUi, 'CRM employee', 'CRM employee invitation and access control')
 assertIncludes(userAccessUi, 'label="CRM user Global ID"', 'gu app-user identity display')
 assertIncludes(userAccessUi, 'currentUser.contactReferenceCode', 'separate gc Contact identity display')
 assertIncludes(usersRoute, "body?.action === 'crm-user-mapping'", 'SuiteCRM app-user mapping route')
+assertIncludes(usersRoute, "body?.action === 'crm-employee'", 'CRM employee access route')
 assertIncludes(usersAdapter, 'updateAppUserSuiteCrmMapping', 'SuiteCRM app-user mapping persistence')
 
 const pipelineUi = read('app_src/components/pipeline/PipelineSection.tsx')
@@ -1297,6 +1316,7 @@ assertIncludes(healthRoute, '0046_atomic_pipeline_products_and_sync_retry_state.
 assertIncludes(healthRoute, '0047_workspace_organization_branding.sql', 'hosted organization branding migration health')
 assertIncludes(healthRoute, '0053_seed_empty_pipeline_templates.sql', 'hosted empty pipeline template migration health')
 assertIncludes(healthRoute, '0054_crm_contact_owner_user_identity.sql', 'hosted CRM contact owner identity migration health')
+assertIncludes(healthRoute, '0056_crm_employee_identity_and_workbook_dashboard.sql', 'hosted CRM employee identity migration health')
 assertIncludes(healthRoute, '0048_canonical_pipeline_negotiation_spelling.sql', 'hosted pipeline spelling migration health')
 assertIncludes(healthRoute, '0049_residual_pipeline_catalog_repair.sql', 'hosted residual pipeline catalog migration health')
 assertIncludes(healthRoute, '0050_historical_pipeline_catalog_restore.sql', 'hosted historical pipeline catalog migration health')

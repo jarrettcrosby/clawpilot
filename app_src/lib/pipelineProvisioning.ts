@@ -150,6 +150,9 @@ const INITIAL_TAB_ROWS: Partial<Record<(typeof EXPECTED_TABS)[number], unknown[]
     ['Organizations', '=COUNTA(Organizations!C5:C)'],
     ['Contacts', '=COUNTA(Contacts!C5:C)'],
     ['Interactions', '=COUNTA(Interactions!C5:C)'],
+    ['Interactions 61-90 days', '=COUNTIFS(Interactions!C5:C,"<>",Interactions!G5:G,">="&TODAY()-90,Interactions!G5:G,"<"&TODAY()-60)'],
+    ['Interactions 31-60 days', '=COUNTIFS(Interactions!C5:C,"<>",Interactions!G5:G,">="&TODAY()-60,Interactions!G5:G,"<"&TODAY()-30)'],
+    ['Interactions last 30 days', '=COUNTIFS(Interactions!C5:C,"<>",Interactions!G5:G,">="&TODAY()-30,Interactions!G5:G,"<="&TODAY())'],
   ],
   Dashboard: [
     ['Total opportunities', '=Calculations!C5'],
@@ -165,6 +168,9 @@ const INITIAL_TAB_ROWS: Partial<Record<(typeof EXPECTED_TABS)[number], unknown[]
     ['Organizations', '=Calculations!C15'],
     ['Contacts', '=Calculations!C16'],
     ['Interactions', '=Calculations!C17'],
+    ['Interactions 61-90 days', '=Calculations!C18'],
+    ['Interactions 31-60 days', '=Calculations!C19'],
+    ['Interactions last 30 days', '=Calculations!C20'],
   ],
   Dropdowns: [
     ['', '', 'Identified Lead', 'A+', 'Open', 'Inbound', 'No Decision'],
@@ -843,6 +849,14 @@ async function spreadsheetMetadata(request: SheetsJsonRequest, sheetId: string) 
   return metadata
 }
 
+async function legacyDashboardHasUnmanagedHeader(request: SheetsJsonRequest, sheetId: string) {
+  const range = encodeURIComponent("'Dashboard'!D1:ZZ3")
+  const result = await request<{ values?: unknown[][] }>(
+    `/v4/spreadsheets/${sheetId}/values/${range}?majorDimension=ROWS`,
+  )
+  return (result.values || []).some((row) => row.some((value) => String(value ?? '').trim() !== ''))
+}
+
 function dashboardChartRequests(sheetId: number) {
   const chart = (input: {
     title: string
@@ -906,8 +920,8 @@ function dashboardChartRequests(sheetId: number) {
               rowIndex: input.anchorRowIndex,
               columnIndex: input.anchorColumnIndex,
             },
-            widthPixels: 420,
-            heightPixels: 260,
+            widthPixels: 400,
+            heightPixels: 250,
           },
         },
       },
@@ -941,6 +955,15 @@ function dashboardChartRequests(sheetId: number) {
       anchorColumnIndex: 9,
       chartType: 'BAR',
       valueAxisTitle: 'Records',
+    }),
+    chart({
+      title: 'Interactions, last 90 days',
+      startRowIndex: 17,
+      endRowIndex: 20,
+      anchorRowIndex: 18,
+      anchorColumnIndex: 9,
+      chartType: 'COLUMN',
+      valueAxisTitle: 'Interactions',
     }),
   ]
 }
@@ -985,6 +1008,27 @@ export async function configurePipelineTabsWithRequest(
       body: { requests, includeSpreadsheetInResponse: false },
       idempotent: false,
     })
+    metadata = await spreadsheetMetadata(request, sheetId)
+  }
+
+  const legacyDashboard = (metadata.sheets || [])
+    .find((sheet) => sheet.properties?.title === 'Dashboard')
+  if (
+    typeof legacyDashboard?.properties?.sheetId === 'number'
+    && await legacyDashboardHasUnmanagedHeader(request, sheetId)
+  ) {
+    await request(`/v4/spreadsheets/${sheetId}:batchUpdate`, {
+      method: 'POST',
+      body: {
+        requests: [
+          { deleteSheet: { sheetId: legacyDashboard.properties.sheetId } },
+          { addSheet: { properties: { title: 'Dashboard', index: EXPECTED_TABS.indexOf('Dashboard') } } },
+        ],
+        includeSpreadsheetInResponse: false,
+      },
+      idempotent: false,
+    })
+    newlyProvisionedTitles.add('Dashboard')
     metadata = await spreadsheetMetadata(request, sheetId)
   }
 
@@ -1123,6 +1167,41 @@ export async function configurePipelineTabsWithRequest(
             fields: 'userEnteredFormat.numberFormat',
           },
         },
+        {
+          updateDimensionProperties: {
+            range: { sheetId: sheetIdValue, dimension: 'COLUMNS', startIndex: 1, endIndex: 2 },
+            properties: { pixelSize: 180 },
+            fields: 'pixelSize',
+          },
+        },
+        {
+          updateDimensionProperties: {
+            range: { sheetId: sheetIdValue, dimension: 'COLUMNS', startIndex: 2, endIndex: 3 },
+            properties: { pixelSize: 120 },
+            fields: 'pixelSize',
+          },
+        },
+        {
+          updateDimensionProperties: {
+            range: { sheetId: sheetIdValue, dimension: 'COLUMNS', startIndex: 3, endIndex: 4 },
+            properties: { pixelSize: 24 },
+            fields: 'pixelSize',
+          },
+        },
+        {
+          updateDimensionProperties: {
+            range: { sheetId: sheetIdValue, dimension: 'COLUMNS', startIndex: 4, endIndex: 14 },
+            properties: { pixelSize: 84 },
+            fields: 'pixelSize',
+          },
+        },
+        {
+          updateDimensionProperties: {
+            range: { sheetId: sheetIdValue, dimension: 'ROWS', startIndex: 3, endIndex: 36 },
+            properties: { pixelSize: 20 },
+            fields: 'pixelSize',
+          },
+        },
       )
     }
     formattingRequests.push({
@@ -1145,11 +1224,13 @@ export async function configurePipelineTabsWithRequest(
         fields: 'userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)',
       },
     })
-    formattingRequests.push({
-      autoResizeDimensions: {
-        dimensions: { sheetId: sheetIdValue, dimension: 'COLUMNS', startIndex: 1, endIndex: 1 + TAB_HEADERS[title].length },
-      },
-    })
+    if (title !== 'Dashboard') {
+      formattingRequests.push({
+        autoResizeDimensions: {
+          dimensions: { sheetId: sheetIdValue, dimension: 'COLUMNS', startIndex: 1, endIndex: 1 + TAB_HEADERS[title].length },
+        },
+      })
+    }
     if (GENERATED_TABS.includes(title as (typeof GENERATED_TABS)[number])) {
       formattingRequests.push({
         addProtectedRange: {
@@ -1684,6 +1765,13 @@ export async function provisionPipelineGoogleResources(pipelineId: string) {
       }
 
       if (alreadyReady) {
+        await configurePipelineTabs(runtime, sheetId)
+        await applyPipelineWorkbookBranding(
+          runtime,
+          sheetId,
+          await readPipelineWorkbookBranding(pipeline.id),
+        )
+        await verifyPipelineTabsAndHeaders(runtime, sheetId)
         await reconcilePipelineGooglePermissionsUnlocked(pipeline.id, runtime)
         const shortLinkId = await ensurePipelineShortLink(pipeline, sheetId)
         if (pipeline.shortLinkId !== shortLinkId) {

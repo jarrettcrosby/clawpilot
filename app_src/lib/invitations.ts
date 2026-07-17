@@ -175,7 +175,7 @@ async function rollbackInvitation(input: {
       )
     }
     if (input.deleteUser) {
-      await client.query(
+      const removed = await client.query<{ reference_code: string | null }>(
         `
           DELETE FROM app_users user_record
           WHERE user_record.email = $1
@@ -183,9 +183,19 @@ async function rollbackInvitation(input: {
             AND NOT EXISTS (
               SELECT 1 FROM app_user_invitations invitation WHERE invitation.email = user_record.email
             )
+          RETURNING reference_code
         `,
         [input.email],
       )
+      const referenceCode = removed.rows[0]?.reference_code
+      if (referenceCode) {
+        await client.query(
+          `UPDATE crm_reference_registry
+           SET status = 'retired', retired_at = COALESCE(retired_at, now())
+           WHERE reference_code = $1 AND status = 'active'`,
+          [referenceCode],
+        )
+      }
     }
   })
 }
@@ -227,6 +237,7 @@ export async function createUserInvitation(input: {
   createOrganization?: unknown
   organizationName?: unknown
   parentOrganizationId?: unknown
+  crmUserEnabled?: unknown
 }): Promise<{ user: AppUser; delivery: 'sent'; expiresAt: string }> {
   const actor = await requireActiveAppUser(input.actorEmail)
   const email = normalizeUserEmail(input.email)
@@ -247,6 +258,7 @@ export async function createUserInvitation(input: {
       actorEmail: actor.email,
       email,
       organizationId: assignment.organization.id,
+      crmUserEnabled: input.crmUserEnabled,
     })
     user = invited.user
     userCreated = invited.created
