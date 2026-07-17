@@ -296,6 +296,18 @@ for (const contract of [
   assertIncludes(canonicalDropdownLayoutMigration, contract, 'canonical dropdown layout restore migration')
 }
 
+const emptyPipelineTemplateMigration = read('db/migrations/0053_seed_empty_pipeline_templates.sql')
+for (const contract of [
+  'empty_catalogs',
+  "('stage', 'Identified Lead', 0)",
+  "('status', 'On Hold', 1)",
+  "('source', 'Referral', 2)",
+  "COALESCE(catalog.catalog->'dropdowns', '{}'::jsonb) || base_dropdowns.value",
+  'desired_revision = catalog.desired_revision + 1',
+]) {
+  assertIncludes(emptyPipelineTemplateMigration, contract, 'empty pipeline template migration')
+}
+
 const crmIdentityHierarchyMigration = read('db/migrations/0021_crm_identity_and_organization_hierarchy.sql')
 for (const contract of [
   'CREATE TABLE IF NOT EXISTS workspace_organizations',
@@ -410,6 +422,8 @@ assertIncludes(tenancyAdapter, 'resolvePipelineSpaceAccess', 'tenancy adapter')
 assertIncludes(tenancyAdapter, "SELECT 'CRM Board'", 'per-user CRM board provisioning')
 assertIncludes(tenancyAdapter, 'WHERE owner_email = $1 AND is_default', 'per-user personal pipeline provisioning')
 assertIncludes(tenancyAdapter, 'pipelineProvisioningRequired', 'personal pipeline Sheet provisioning signal')
+assertIncludes(tenancyAdapter, 'ON CONFLICT (pipeline_id) DO UPDATE', 'empty pipeline template repair')
+assertIncludes(tenancyAdapter, "((EXCLUDED.catalog->'dropdowns') - 'product')", 'pipeline product preservation')
 assertIncludes(tenancyAdapter, '!personalPipeline.rows[0].short_link_id', 'personal pipeline short-link reconciliation signal')
 assertIncludes(tenancyAdapter, 'workspace_organization_id = $1::uuid', 'organization-primary CRM pipeline selection')
 assertIncludes(tenancyAdapter, 'Only the board owner can share it', 'tenancy adapter')
@@ -1239,6 +1253,7 @@ assertIncludes(healthRoute, '0040_browser_sessions_and_impersonation.sql', 'host
 assertIncludes(healthRoute, '0045_pipeline_people_products_and_dropdown_catalogs.sql', 'hosted pipeline catalog migration health')
 assertIncludes(healthRoute, '0046_atomic_pipeline_products_and_sync_retry_state.sql', 'hosted atomic product catalog migration health')
 assertIncludes(healthRoute, '0047_workspace_organization_branding.sql', 'hosted organization branding migration health')
+assertIncludes(healthRoute, '0053_seed_empty_pipeline_templates.sql', 'hosted empty pipeline template migration health')
 assertIncludes(healthRoute, '0048_canonical_pipeline_negotiation_spelling.sql', 'hosted pipeline spelling migration health')
 assertIncludes(healthRoute, '0049_residual_pipeline_catalog_repair.sql', 'hosted residual pipeline catalog migration health')
 assertIncludes(healthRoute, '0050_historical_pipeline_catalog_restore.sql', 'hosted historical pipeline catalog migration health')

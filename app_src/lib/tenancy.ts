@@ -196,7 +196,37 @@ async function ensureBasePipelineTemplate(client: PoolClient, pipelineId: string
   await client.query(
     `INSERT INTO pipeline_dropdown_catalogs (pipeline_id, catalog, created_at, updated_at)
      VALUES ($1::uuid, $2::jsonb, now(), now())
-     ON CONFLICT (pipeline_id) DO NOTHING`,
+     ON CONFLICT (pipeline_id) DO UPDATE
+     SET catalog = jsonb_set(
+           pipeline_dropdown_catalogs.catalog,
+           '{dropdowns}',
+           COALESCE(pipeline_dropdown_catalogs.catalog->'dropdowns', '{}'::jsonb)
+             || ((EXCLUDED.catalog->'dropdowns') - 'product'),
+           true
+         ),
+         source = 'app',
+         desired_revision = pipeline_dropdown_catalogs.desired_revision + 1,
+         updated_at = now()
+     WHERE COALESCE(jsonb_array_length(
+             CASE WHEN jsonb_typeof(pipeline_dropdown_catalogs.catalog->'dropdowns'->'stage') = 'array'
+               THEN pipeline_dropdown_catalogs.catalog->'dropdowns'->'stage' ELSE '[]'::jsonb END
+           ), 0) = 0
+       AND COALESCE(jsonb_array_length(
+             CASE WHEN jsonb_typeof(pipeline_dropdown_catalogs.catalog->'dropdowns'->'priority') = 'array'
+               THEN pipeline_dropdown_catalogs.catalog->'dropdowns'->'priority' ELSE '[]'::jsonb END
+           ), 0) = 0
+       AND COALESCE(jsonb_array_length(
+             CASE WHEN jsonb_typeof(pipeline_dropdown_catalogs.catalog->'dropdowns'->'status') = 'array'
+               THEN pipeline_dropdown_catalogs.catalog->'dropdowns'->'status' ELSE '[]'::jsonb END
+           ), 0) = 0
+       AND COALESCE(jsonb_array_length(
+             CASE WHEN jsonb_typeof(pipeline_dropdown_catalogs.catalog->'dropdowns'->'source') = 'array'
+               THEN pipeline_dropdown_catalogs.catalog->'dropdowns'->'source' ELSE '[]'::jsonb END
+           ), 0) = 0
+       AND COALESCE(jsonb_array_length(
+             CASE WHEN jsonb_typeof(pipeline_dropdown_catalogs.catalog->'dropdowns'->'loss_reason') = 'array'
+               THEN pipeline_dropdown_catalogs.catalog->'dropdowns'->'loss_reason' ELSE '[]'::jsonb END
+           ), 0) = 0`,
     [pipelineId, JSON.stringify(createBasePipelineDropdownCatalog())],
   )
 }

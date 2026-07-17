@@ -187,6 +187,7 @@ export async function GET() {
           historical_pipeline_catalog_migration_applied: boolean
           configured_pipeline_dropdowns_migration_applied: boolean
           canonical_dropdown_layout_migration_applied: boolean
+          empty_pipeline_templates_migration_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -377,6 +378,11 @@ export async function GET() {
                 FROM schema_migrations
                 WHERE filename = '0052_restore_canonical_dropdown_layout.sql'
               ) AS canonical_dropdown_layout_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0053_seed_empty_pipeline_templates.sql'
+              ) AS empty_pipeline_templates_migration_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -426,6 +432,7 @@ export async function GET() {
             && row?.historical_pipeline_catalog_migration_applied
             && row?.configured_pipeline_dropdowns_migration_applied
             && row?.canonical_dropdown_layout_migration_applied
+            && row?.empty_pipeline_templates_migration_applied
             && row?.migration_checksums_present
           ),
         }
@@ -467,6 +474,7 @@ export async function GET() {
           || !row?.historical_pipeline_catalog_migration_applied
           || !row?.configured_pipeline_dropdowns_migration_applied
           || !row?.canonical_dropdown_layout_migration_applied
+          || !row?.empty_pipeline_templates_migration_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')

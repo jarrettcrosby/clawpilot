@@ -159,7 +159,9 @@ assert.equal(baseCatalog.dropdowns.stage.every((option, index) => option.active 
 const tenancy = read('app_src/lib/tenancy.ts')
 assert.match(tenancy, /ensureBasePipelineTemplate\(client, personalPipeline\.rows\[0\]\.id\)/)
 assert.match(tenancy, /ensureBasePipelineTemplate\(client, result\.rows\[0\]\.id\)/)
-assert.match(tenancy, /ON CONFLICT \(pipeline_id\) DO NOTHING/)
+assert.match(tenancy, /ON CONFLICT \(pipeline_id\) DO UPDATE/)
+assert.match(tenancy, /\(\(EXCLUDED\.catalog->'dropdowns'\) - 'product'\)/)
+assert.match(tenancy, /WHERE COALESCE\(jsonb_array_length/)
 
 const syncStatus = read('app_src/app/api/pipeline/sync-status/route.ts')
 assert.match(syncStatus, /readCrmSummaryFromPostgres/)

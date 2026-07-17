@@ -18,7 +18,7 @@ Provide a user-owned pipeline workspace while preserving the Opportunities Sheet
 ## Current Contract
 
 - Every active user receives a default pipeline space.
-- Every new default or additional pipeline receives the generic base workflow once: stages, priorities, lifecycle statuses, sources, and loss reasons are seeded in `pipeline_dropdown_catalogs`; products remain empty until that organization adds or imports its own catalog. `ON CONFLICT DO NOTHING` preserves every existing pipeline customization.
+- Every new default or additional pipeline receives the generic base workflow once: stages, priorities, lifecycle statuses, sources, and loss reasons are seeded in `pipeline_dropdown_catalogs`; products remain empty until that organization adds or imports its own catalog. Existing customized catalogs are preserved, while wholly empty legacy workflow catalogs receive the base choices without replacing their products.
 - A pipeline owner can share view or edit access with another active user.
 - Railway Postgres stores ClawPilot-owned pipeline definitions, normalized rows, projections, sync outbox entries, and audit events.
 - Pipeline editors can create an opportunity from the Pipeline surface by selecting an existing customer organization or creating that customer organization inline. Products are selected from active, tenant-scoped CRM Product records and are stored as durable relationships rather than inferred only from a display string. Legacy opportunity names remain readable during migration, while unambiguous existing product names are attached to their new Product records. The opportunity is immediately written to the tenant-scoped CRM tables in Postgres and queued for SuiteCRM synchronization.
