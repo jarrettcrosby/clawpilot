@@ -517,6 +517,8 @@ assertIncludes(pipelineProvisioning, 'GOOGLE_PIPELINE_FOLDER_MOVE_UNVERIFIED', '
 
 const legacyPipelineWorkbook = read('app_src/lib/pipelineLegacyWorkbook.ts')
 assertIncludes(legacyPipelineWorkbook, 'configurePipelineTabsWithRequest', 'legacy Maton workbook layout parity')
+assertIncludes(legacyPipelineWorkbook, 'safeGatewayErrorDetail', 'bounded legacy Sheets diagnostics')
+assertIncludes(legacyPipelineWorkbook, '.slice(0, 800)', 'bounded legacy Sheets error detail')
 
 const pipelineSync = read('app_src/lib/pipelineSync.ts')
 assertIncludes(pipelineSync, 'resolvePipelineSheetBindingInPostgres', 'pipeline pull binding resolution')
