@@ -184,6 +184,7 @@ export async function GET() {
           organization_branding_migration_applied: boolean
           pipeline_spelling_migration_applied: boolean
           residual_pipeline_catalog_migration_applied: boolean
+          historical_pipeline_catalog_migration_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -359,6 +360,11 @@ export async function GET() {
                 FROM schema_migrations
                 WHERE filename = '0049_residual_pipeline_catalog_repair.sql'
               ) AS residual_pipeline_catalog_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0050_historical_pipeline_catalog_restore.sql'
+              ) AS historical_pipeline_catalog_migration_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -405,6 +411,7 @@ export async function GET() {
             && row?.organization_branding_migration_applied
             && row?.pipeline_spelling_migration_applied
             && row?.residual_pipeline_catalog_migration_applied
+            && row?.historical_pipeline_catalog_migration_applied
             && row?.migration_checksums_present
           ),
         }
@@ -443,6 +450,7 @@ export async function GET() {
           || !row?.organization_branding_migration_applied
           || !row?.pipeline_spelling_migration_applied
           || !row?.residual_pipeline_catalog_migration_applied
+          || !row?.historical_pipeline_catalog_migration_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')
