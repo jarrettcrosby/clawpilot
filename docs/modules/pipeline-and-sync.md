@@ -40,6 +40,20 @@ Provide a user-owned pipeline workspace while preserving the Opportunities Sheet
 - Raw credentials, Sheet IDs, folder IDs, Shared Drive IDs, and internal short-link IDs are not returned in workspace payloads. The owner settings endpoint may return Shared Drive IDs only in the authorized selection list.
 - Loading Pipeline setup is read-only for viewers. Catalog bootstrap, CRM projection, and Sheet synchronization run only for pipeline editors or system workers.
 
+## Historical Default Pipeline Catalog
+
+The configured owner's imported workbook uses 13 real products: `AAR`, `LDS`, `CAO`, `CAC`, `GLC`, `TIA`, `POD`, `DTS`, `CPR`, `PTP`, `Merchant y140`, `Merchant y140 & y182`, and `Merchant y182`. The legacy Dropdowns tab expanded those products into 515 comma-separated combinations because Google Sheets could not provide the required multi-select behavior. Those combinations are transport values for opportunity rows, not Product records. ClawPilot and SuiteCRM store only the 13 atomic products and the Pipeline opportunity editor supplies the multi-select interface.
+
+The same historical catalog defines:
+
+- Sources: `Linkedin`, `Email`, `Phone Outreach`, `Networking`, `Website`, `Account Transition`, `Trade Show`.
+- Stages: `Identified Lead`, `Qualified Lead`, `Needs Analysis`, `Demo`, `Proposal`, `Negotiation`, `Closed`, `Closed Delayed`, `Loss`.
+- Priorities: `A+`, `A`, `B`, `C`, `D`.
+- Statuses: `Open`, `Closed`, `Lost`, `Abandoned`, `On Hold`.
+- Loss reasons: `Price`, `Functionality`, `Competitor`, `Complaint`, `Other`.
+
+This imported taxonomy is specific to that pipeline. New organizations receive their own tenant-scoped catalog and can edit or import products and workflow values without inheriting another organization's choices. Owner choices are always projected from active ClawPilot users and explicitly added CRM-only people for the selected organization; the legacy static account-manager column is not authoritative.
+
 ## Managed Google Resources
 
 - Service accounts cannot own files for this workflow, so provisioning requires the bound Shared Drive and never falls back to My Drive or Maton.
