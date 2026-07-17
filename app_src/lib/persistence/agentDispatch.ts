@@ -6,8 +6,28 @@ const TARGET_SYSTEM = 'agent_runtime'
 const AGGREGATE_TYPE = 'agent_task'
 const WORKER_HEARTBEAT_KEY = 'agent.dispatch.worker.heartbeat'
 
-export type AgentDispatchTrigger = 'assignment' | 'comment' | 'continuation'
+export type AgentDispatchTrigger = 'assignment' | 'comment' | 'continuation' | 'manual'
 export type AgentDispatchStatus = 'queued' | 'processing' | 'succeeded' | 'failed' | 'dead'
+
+const ACTIVE_DISPATCH_ERROR_CODE = 'AGENT_DISPATCH_ACTIVE'
+
+export class AgentDispatchConflictError extends Error {
+  readonly code = ACTIVE_DISPATCH_ERROR_CODE
+
+  constructor(readonly taskId: string) {
+    super('An agent work run is already queued or running for this task.')
+    this.name = 'AgentDispatchConflictError'
+  }
+}
+
+export function isAgentDispatchConflictError(error: unknown): error is AgentDispatchConflictError {
+  if (error instanceof AgentDispatchConflictError) return true
+  return Boolean(
+    error
+    && typeof error === 'object'
+    && (error as { code?: unknown }).code === ACTIVE_DISPATCH_ERROR_CODE,
+  )
+}
 
 export type AgentDispatchEnqueueInput = {
   dispatchId: string
@@ -64,7 +84,7 @@ function requireDispatchInput(input: AgentDispatchEnqueueInput): AgentDispatchEn
   if (!dispatchId || !idempotencyKey || !operatorId || !boardId || !taskId || !agentId || !text) {
     throw new Error('Agent dispatch requires dispatch, operator, board, task, agent, and text values')
   }
-  if (!['assignment', 'comment', 'continuation'].includes(input.trigger)) {
+  if (!['assignment', 'comment', 'continuation', 'manual'].includes(input.trigger)) {
     throw new Error('Agent dispatch trigger is invalid')
   }
   return {
@@ -79,6 +99,34 @@ function requireDispatchInput(input: AgentDispatchEnqueueInput): AgentDispatchEn
     continuationDepth,
     queuedAt,
   }
+}
+
+async function rejectOverlappingManualDispatch(
+  client: PoolClient,
+  input: AgentDispatchEnqueueInput,
+): Promise<void> {
+  if (input.trigger !== 'manual') return
+
+  await client.query(
+    'SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
+    [`agent-dispatch:${input.boardId}:${input.taskId}`],
+  )
+  const active = await client.query<{ id: string }>(
+    `
+      SELECT id::text
+      FROM sync_outbox
+      WHERE target_system = $1
+        AND aggregate_type = $2
+        AND operation = 'run_agent'
+        AND aggregate_id = $3
+        AND payload->>'boardId' = $4
+        AND status IN ('queued', 'processing', 'failed')
+        AND id <> $5::uuid
+      LIMIT 1
+    `,
+    [TARGET_SYSTEM, AGGREGATE_TYPE, input.taskId, input.boardId, input.dispatchId],
+  )
+  if (active.rows[0]) throw new AgentDispatchConflictError(input.taskId)
 }
 
 function payloadFor(input: AgentDispatchEnqueueInput) {
@@ -101,6 +149,7 @@ export async function insertAgentDispatchOutbox(
   rawInput: AgentDispatchEnqueueInput,
 ): Promise<{ id: string; status: AgentDispatchStatus }> {
   const input = requireDispatchInput(rawInput)
+  await rejectOverlappingManualDispatch(client, input)
   const result = await client.query<{ id: string; status: AgentDispatchStatus }>(
     `
       INSERT INTO sync_outbox (

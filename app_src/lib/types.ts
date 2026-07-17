@@ -108,7 +108,7 @@ export type Task = {
     suggestions?: unknown[]
     agentDispatch?: {
       id: string
-      trigger: 'assignment' | 'comment' | 'continuation'
+      trigger: 'assignment' | 'comment' | 'continuation' | 'manual'
       status: 'queued' | 'running' | 'succeeded' | 'failed'
       attempts: number
       continuationDepth?: number

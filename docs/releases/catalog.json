@@ -3,8 +3,8 @@
   "releases": {
     "default": {
       "oncePerEnvironment": true,
-      "title": "Iterative agents and exact CRM relationships",
-      "summary": "Agents can now continue bounded checklist work into a concrete research or design deliverable, while CRM opportunities and interactions preserve exact account, contact, user, and navigation relationships across ClawPilot, SuiteCRM, and pipeline reporting.",
+      "title": "Auditable agent work and exact CRM relationships",
+      "summary": "Agent conversations now separate private discussion from durable task work, with queued execution, visible evidence, bounded continuations, and review-ready documents. CRM opportunities and interactions continue to preserve exact account, contact, user, and navigation relationships across ClawPilot, SuiteCRM, and pipeline reporting.",
       "features": [
         "A New opportunity workflow available to pipeline owners and editors",
         "Tenant-scoped selection of existing CRM customer organizations",
@@ -18,6 +18,8 @@
         "Organization-scoped Contact, controlled Type, and active ClawPilot Agent selectors for interactions",
         "Administrator mapping from ClawPilot users to native SuiteCRM users",
         "Task-linked agent working documents that consolidate research and design output behind concise card-comment links",
+        "Explicit Work and Discuss modes so private conversation cannot silently mutate shared task evidence",
+        "Visible queued, working, input-needed, blocked, and review-ready states with direct access to the working document and next run",
         "Browser-session security details that identify the authenticated user, support-mode effective user, and observed sign-in network addresses"
       ],
       "fixes": [
@@ -38,7 +40,11 @@
         "Opens Activity targets in the event's owning board or pipeline instead of the currently selected workspace resource",
         "Keeps local development usable when hosted browser-session authentication is disabled",
         "Prevents continuation runs from repeating checklist work by supplying the exact next item ID and accepting an exact legacy item label",
-        "Rejects malformed forwarded addresses and keeps raw browser-session IP data out of the general activity stream"
+        "Rejects malformed forwarded addresses and keeps raw browser-session IP data out of the general activity stream",
+        "Rejects overlapping manual agent runs across browser sessions with a task-scoped transactional lock",
+        "Prevents discussion replies and unsourced current-research claims from being recorded as completed task work",
+        "Sanitizes agent-provider failures so credentials and upstream authorization details never appear in task threads",
+        "Restores authenticated API behavior for the explicitly unauthenticated, non-hosted local development runtime"
       ]
     }
   }

@@ -32,6 +32,20 @@ test('ui acceptance: projects core card and drawer workflow', async ({ page, req
   let task: TestTask | null = null
 
   try {
+    await page.route((url) => url.pathname === '/api/workspaces', (route) => route.fulfill({
+      json: {
+        ok: true,
+        boards: [{
+          id: 'ui-acceptance-board',
+          name: 'ClawPilot board',
+          ownerEmail: 'test@example.com',
+          accessRole: 'owner',
+        }],
+        pipelines: [],
+        selectedBoardId: 'ui-acceptance-board',
+        selectedPipelineId: null,
+      },
+    }))
     await page.goto('/#projects')
     await expect(page.getByPlaceholder('Search cards...')).toBeVisible()
     await page.getByRole('button', { name: 'New task' }).click()

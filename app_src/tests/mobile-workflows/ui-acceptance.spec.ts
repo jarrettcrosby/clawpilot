@@ -489,7 +489,7 @@ for (const viewport of MOBILE_VIEWPORTS) {
         } })
       })
       await gotoApp(page, '/#pipeline')
-      await expect(page.getByText('Pipeline Value', { exact: true })).toBeVisible()
+      await expect(page.getByText('Active Pipeline', { exact: true })).toBeVisible()
 
       await page.getByRole('button', { name: 'Open pipeline setup' }).click()
       const setupDialog = page.getByRole('dialog', { name: /Pipeline setup/ })
@@ -501,12 +501,14 @@ for (const viewport of MOBILE_VIEWPORTS) {
       await expect(setupDialog.getByRole('textbox', { name: 'Stages' })).toBeVisible()
       await setupDialog.getByRole('button', { name: 'Close pipeline setup' }).click()
 
-      const viewButtons = activeSection(page).locator('.MuiToggleButtonGroup-root').last().getByRole('button')
-      await expect(viewButtons).toHaveCount(2)
-      await viewButtons.nth(1).click()
-      await expect(viewButtons.nth(1)).toHaveAttribute('aria-pressed', 'true')
-      await viewButtons.nth(0).click()
-      await expect(viewButtons.nth(0)).toHaveAttribute('aria-pressed', 'true')
+      const viewSelector = activeSection(page).locator('.MuiToggleButtonGroup-root').last()
+      await expect(viewSelector.getByRole('button')).toHaveCount(3)
+      const listView = viewSelector.getByRole('button', { name: 'List view' })
+      const boardView = viewSelector.getByRole('button', { name: 'Board view' })
+      await listView.click()
+      await expect(listView).toHaveAttribute('aria-pressed', 'true')
+      await boardView.click()
+      await expect(boardView).toHaveAttribute('aria-pressed', 'true')
 
       await expectScrollableWorkspace(page, activeSection(page), 'y', 'Pipeline workspace')
     })
@@ -670,7 +672,7 @@ for (const viewport of MOBILE_VIEWPORTS) {
       await expectNoDocumentOverflow(page)
     })
 
-    test('Agents task selector and chat composer remain reachable', async ({ page }) => {
+    test('Agents task selector and work controls remain reachable', async ({ page }) => {
       await gotoApp(page, '/#agents')
       await expect(activeSection(page).getByRole('heading', { name: 'Agents', exact: true })).toBeVisible()
 
@@ -678,11 +680,18 @@ for (const viewport of MOBILE_VIEWPORTS) {
       await taskSelector.scrollIntoViewIfNeeded()
       await expectUsableGeometry(taskSelector, 'Agent task selector', 38, 220)
 
-      const composer = page.getByPlaceholder(/Message .* about this task|Assign a task to start a thread/)
+      await expect(page.getByRole('button', { name: 'Work mode' })).toBeVisible()
+      await expect(page.getByRole('button', { name: 'Discuss mode' })).toBeVisible()
+
+      const composer = page.getByPlaceholder(/Give .* a concrete work instruction|Assign a task to start a thread/)
       await composer.scrollIntoViewIfNeeded()
       const composerControl = composer.locator('xpath=ancestor::*[contains(@class,"MuiInputBase-root")][1]')
       await expectUsableGeometry(composerControl, 'Agent chat composer', 38, 220)
-      await expect(page.getByRole('button', { name: 'Send to assigned agent' })).toBeVisible()
+      await expect(page.getByRole('button', { name: 'Queue agent work' })).toBeVisible()
+
+      await page.getByRole('button', { name: 'Discuss mode' }).click()
+      await expect(page.getByPlaceholder(/Discuss this task with/)).toBeVisible()
+      await expect(page.getByRole('button', { name: 'Send discussion message' })).toBeVisible()
       await expectNoDocumentOverflow(page)
     })
 

@@ -384,7 +384,8 @@ assertIncludes(agentContextMemory, "scope = 'shared'", 'shared role context read
 assertIncludes(agentContextMemory, "scope = 'operator' AND operator_id = $2", 'operator context read boundary')
 assertIncludes(agentContextMemory, 'evidence.count >= 2', 'cross-organization shared memory promotion gate')
 assertIncludes(agentContextMemory, 'isShareableAgentLearning', 'shared memory privacy filter')
-assertIncludes(agentContextProvider, 'Changed, Remaining, Waiting on, Learned', 'transparent agent learning response contract')
+assertIncludes(agentContextProvider, 'This is a private task discussion, not an execution run', 'non-mutating discussion response contract')
+assertIncludes(agentContextProvider, 'learned must be one generic reusable operating lesson', 'task execution learning contract')
 assertIncludes(agentContextMigration, 'PRIMARY KEY (memory_id, organization_id)', 'independent organization evidence contract')
 
 const matonCredentialAdapter = read('app_src/lib/persistence/matonCredentials.ts')

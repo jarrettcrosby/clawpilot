@@ -158,6 +158,10 @@ test('short links: desktop operator workflow', async ({ page, context }) => {
   await context.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: 'http://127.0.0.1:4002' })
   await page.setViewportSize({ width: 1366, height: 768 })
   await page.goto('/#links')
+  test.skip(
+    await page.getByTestId('nav-desktop-links').count() === 0,
+    'Short-link UI requires the PostgreSQL storage driver',
+  )
 
   await expect(page.getByRole('heading', { name: 'Short Links', level: 1 })).toBeVisible()
   await expect(page.getByTestId('nav-desktop-links')).toHaveAttribute('aria-current', 'page')
@@ -216,6 +220,10 @@ test('short links: mobile navigation and controls stay contained', async ({ page
   await page.goto('/#dashboard')
 
   await page.getByTestId('mobile-navigation-toggle').click()
+  test.skip(
+    await page.getByTestId('nav-mobile-links').count() === 0,
+    'Short-link UI requires the PostgreSQL storage driver',
+  )
   await page.getByTestId('nav-mobile-links').click()
   await expect(page).toHaveURL(/#links$/)
   await expect(page.getByRole('heading', { name: 'Short Links', level: 1 })).toBeVisible()

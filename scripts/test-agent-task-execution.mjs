@@ -71,6 +71,44 @@ function loadTaskDocumentModule() {
   return module.exports
 }
 
+function loadAgentDispatchModule() {
+  const path = 'app_src/lib/agents/dispatch.ts'
+  const module = { exports: {} }
+  const sandbox = {
+    console,
+    exports: module.exports,
+    module,
+    require(specifier) {
+      if (specifier === 'crypto') return requireFromApp('node:crypto')
+      throw new Error(`Unexpected import: ${specifier}`)
+    },
+  }
+  vm.runInNewContext(transpile(path), sandbox, { filename: path })
+  return module.exports
+}
+
+function loadAgentDispatchPersistenceModule() {
+  const path = 'app_src/lib/persistence/agentDispatch.ts'
+  const module = { exports: {} }
+  const sandbox = {
+    console,
+    exports: module.exports,
+    module,
+    require(specifier) {
+      if (specifier === 'crypto') return requireFromApp('node:crypto')
+      if (specifier === '@/lib/persistence/postgres') {
+        return {
+          query: async () => ({ rows: [], rowCount: 0 }),
+          withTransaction: async (callback) => callback({ query: async () => ({ rows: [], rowCount: 0 }) }),
+        }
+      }
+      throw new Error(`Unexpected import: ${specifier}`)
+    },
+  }
+  vm.runInNewContext(transpile(path), sandbox, { filename: path })
+  return module.exports
+}
+
 function mockResponse(status, payload) {
   return {
     ok: status >= 200 && status < 300,
@@ -143,6 +181,8 @@ function loadDispatchWorker({ failBeforeResult = false, failSucceededState = fal
 const workItem = loadWorkItemModule()
 const execution = loadExecutionModule(workItem)
 const taskDocument = loadTaskDocumentModule()
+const agentDispatch = loadAgentDispatchModule()
+const agentDispatchPersistence = loadAgentDispatchPersistenceModule()
 const plan = execution.parseAgentTaskExecutionPlan(JSON.stringify({
   status: 'triaged',
   summary: 'Converted the request into durable task context and acceptance steps.',
@@ -189,6 +229,67 @@ const baseTask = {
     },
   },
 }
+
+const manualPrepared = agentDispatch.prepareAgentDispatch({
+  operatorId: 'owner@example.com',
+  boardId: '22222222-2222-4222-8222-222222222222',
+  task: { ...baseTask, execution: undefined },
+  agentId: 'projects',
+  text: 'Produce the requested task deliverable.',
+  trigger: 'manual',
+  eventId: 'manual-request-1',
+  queuedAt: '2026-07-16T12:00:30.000Z',
+})
+assert.equal(manualPrepared.dispatch.trigger, 'manual')
+assert.equal(
+  manualPrepared.dispatch.idempotencyKey,
+  'agent:22222222-2222-4222-8222-222222222222:task-1:manual:manual-request-1',
+)
+assert.equal(manualPrepared.task.execution.agentDispatch.trigger, 'manual')
+assert.equal(manualPrepared.task.execution.latestExecutionNote, 'Agent run queued from manual work request.')
+assert.equal(manualPrepared.task.activity.at(-1).message, 'Agent projects run queued from manual work request.')
+
+const dispatchQueries = []
+const dispatchClient = {
+  async query(statement, parameters = []) {
+    const sql = String(statement)
+    dispatchQueries.push({ sql, parameters })
+    if (sql.includes('pg_advisory_xact_lock')) return { rows: [], rowCount: 1 }
+    if (sql.includes('SELECT id::text') && sql.includes('FROM sync_outbox')) return { rows: [], rowCount: 0 }
+    if (sql.includes('INSERT INTO sync_outbox')) {
+      return { rows: [{ id: manualPrepared.dispatch.dispatchId, status: 'queued' }], rowCount: 1 }
+    }
+    if (sql.includes('INSERT INTO audit_events')) return { rows: [], rowCount: 1 }
+    throw new Error(`Unexpected dispatch SQL: ${sql}`)
+  },
+}
+const insertedManual = await agentDispatchPersistence.insertAgentDispatchOutbox(
+  dispatchClient,
+  manualPrepared.dispatch,
+)
+assert.equal(insertedManual.status, 'queued', 'manual must be a valid durable dispatch trigger')
+assert.ok(
+  dispatchQueries.some((entry) => entry.sql.includes('pg_advisory_xact_lock')),
+  'manual dispatch insertion must serialize overlap checks per task',
+)
+
+const conflictingDispatchClient = {
+  async query(statement) {
+    const sql = String(statement)
+    if (sql.includes('pg_advisory_xact_lock')) return { rows: [], rowCount: 1 }
+    if (sql.includes('SELECT id::text') && sql.includes('FROM sync_outbox')) {
+      return { rows: [{ id: '33333333-3333-4333-8333-333333333333' }], rowCount: 1 }
+    }
+    throw new Error(`Conflict check should stop before dispatch insertion: ${sql}`)
+  },
+}
+await assert.rejects(
+  () => agentDispatchPersistence.insertAgentDispatchOutbox(conflictingDispatchClient, manualPrepared.dispatch),
+  (error) => agentDispatchPersistence.isAgentDispatchConflictError(error)
+    && /already queued or running/.test(error.message),
+  'a second manual run must be rejected inside the dispatch transaction',
+)
+
 const first = execution.applyAgentTaskExecutionPlan({
   task: baseTask,
   plan,
@@ -198,11 +299,13 @@ const first = execution.applyAgentTaskExecutionPlan({
 })
 assert.equal(first.task.desc, plan.descriptionUpdate)
 assert.equal(first.task.checklist.length, 2)
+assert.equal(first.task.status, 'todo')
 assert.equal(first.task.execution.executionStatus, 'triaged')
 assert.notEqual(first.task.execution.executionStatus, 'completed')
 assert.deepEqual(Array.from(first.task.execution.lastResult.evidence), [
   'description updated',
   '2 checklist items added',
+  'card moved to todo',
   'next action updated',
 ])
 
@@ -243,6 +346,7 @@ const iterativeResult = execution.applyAgentTaskExecutionPlan({
 })
 assert.equal(iterativeResult.task.checklist[0].done, true)
 assert.equal(iterativeResult.task.checklist[1].done, false)
+assert.equal(iterativeResult.task.status, 'in-progress')
 assert.equal(iterativeResult.task.execution.executionStatus, 'running')
 assert.equal(iterativeResult.task.execution.lastResult.deliverable, iterativePlan.deliverable)
 assert.deepEqual(Array.from(iterativeResult.task.execution.lastResult.completedChecklistIds), ['ck-run-1'])
@@ -443,6 +547,7 @@ const awaitingResult = execution.applyAgentTaskExecutionPlan({
   dispatchId: 'dispatch-1',
   timestamp: '2026-07-16T12:05:00.000Z',
 })
+assert.equal(awaitingResult.task.status, 'review')
 const overwrittenByRetry = workItem.applyCanonicalWorkItem({
   ...awaitingResult.task,
   execution: {
@@ -482,9 +587,10 @@ const noEvidencePlan = execution.parseAgentTaskExecutionPlan(JSON.stringify({
 const noEvidence = execution.applyAgentTaskExecutionPlan({
   task: {
     ...baseTask,
+    status: 'todo',
     desc: 'Detailed implementation context.',
     workItem: {
-      status: 'backlog',
+      status: 'todo',
       assignedAgent: 'projects',
       nextAction: 'Keep the existing next action.',
       activity: [],
@@ -519,6 +625,7 @@ assert.deepEqual(preResultFailure.taskStates, ['running', 'queued'])
 assert.equal(preResultFailure.failedItems.length, 1)
 
 const taskRoute = read('app_src/app/api/tasks/route.ts')
+const requestUser = read('app_src/lib/requestUser.ts')
 assert.match(taskRoute, /return normalized\.slice\(0, 10_000\)/, 'long task descriptions must be preserved')
 assert.doesNotMatch(taskRoute, /compact\.length\s*>\s*280/, 'task descriptions must not be replaced at 280 characters')
 assert.match(taskRoute, /preservedSuccessStatus/, 'worker success must preserve semantic execution state')
@@ -536,6 +643,72 @@ assert.match(provider, /complete one existing checklist item/)
 assert.match(provider, /checklistComplete/)
 
 const threadRoute = read('app_src/app/api/agents/threads/route.ts')
+const dispatchSource = read('app_src/lib/agents/dispatch.ts')
+const dispatchPersistenceSource = read('app_src/lib/persistence/agentDispatch.ts')
+assert.match(
+  dispatchPersistenceSource,
+  /AgentDispatchTrigger = 'assignment' \| 'comment' \| 'continuation' \| 'manual'/,
+  'manual work must have a stable durable dispatch trigger',
+)
+assert.match(
+  dispatchPersistenceSource,
+  /\['assignment', 'comment', 'continuation', 'manual'\]\.includes\(input\.trigger\)/,
+  'dispatch validation must accept the manual trigger',
+)
+assert.match(dispatchPersistenceSource, /pg_advisory_xact_lock/)
+assert.match(dispatchSource, /manual: 'manual work request'/, 'manual queue activity must use a human-readable label')
+
+const postStart = threadRoute.indexOf('export async function POST')
+const assignmentGuard = threadRoute.indexOf('const mismatch = assignmentError(task, agentId)', postStart)
+const runtimeGuard = threadRoute.indexOf('if (!runtime.ready)', postStart)
+const workBranchStart = threadRoute.indexOf("if (signedUserMode === 'work')", postStart)
+const synchronousRunStart = threadRoute.indexOf('const runId = dispatchId || crypto.randomUUID()', workBranchStart)
+assert.ok(postStart >= 0 && assignmentGuard > postStart && runtimeGuard > assignmentGuard)
+assert.ok(workBranchStart > runtimeGuard && synchronousRunStart > workBranchStart)
+const workBranch = threadRoute.slice(workBranchStart, synchronousRunStart)
+assert.match(threadRoute, /requestedMode !== 'discuss' && requestedMode !== 'work'/)
+assert.match(
+  threadRoute,
+  /const signedUserMode:[\s\S]{0,120}worker[\s\S]{0,80}\? null[\s\S]{0,120}requestedMode === 'work' \? 'work' : 'discuss'/,
+  'missing signed-user mode must default to discuss while worker mode is ignored',
+)
+assert.match(threadRoute, /const isTaskExecution = Boolean\(worker && dispatchId\)/)
+assert.match(workBranch, /activeDispatch\?\.status === 'queued' \|\| activeDispatch\?\.status === 'running'/)
+assert.match(workBranch, /trigger: 'manual'/)
+assert.match(workBranch, /await writeTasks\(tasks, board\.id, \[prepared\.dispatch\]\)/)
+assert.match(workBranch, /`agent-dispatch-\$\{manualDispatchId\}-request`/)
+assert.match(workBranch, /messageId: manualRequestMessageId/)
+assert.match(workBranch, /queued: true/)
+assert.ok(
+  workBranch.indexOf('await writeTasks(tasks, board.id, [prepared.dispatch])')
+    < workBranch.indexOf('await upsertPersistedThreadMessage'),
+  'the durable task/outbox transaction must commit before the queued response is returned',
+)
+assert.doesNotMatch(workBranch, /runOpenAIAgent|runChatGPTAgent|runOpenClawAgent|recordAgentResult|captureAgentLearning|writeDocsLog/)
+assert.match(threadRoute, /agentDispatches\.length > 0 \|\| isAgentDispatchConflictError\(error\)/)
+assert.match(
+  threadRoute,
+  /const recorded:[\s\S]{0,180}= isTaskExecution\s*\? await recordAgentResult/,
+  'discussion must bypass task result recording',
+)
+assert.match(threadRoute, /if \(isTaskExecution && isPostgresTaskStoreEnabled\(\)\)/)
+assert.match(threadRoute, /if \(isTaskExecution\) await writeDocsLog\(agentId, responseText\)/)
+assert.match(threadRoute, /interactionMode: isTaskExecution \? 'task-execution' : 'discuss'/)
+assert.match(threadRoute, /mode: 'discuss',[\s\S]{0,160}responder: responderId/)
+assert.match(threadRoute, /This is a private discussion, not task execution\./)
+assert.match(threadRoute, /function publicAgentProviderError/)
+assert.match(threadRoute, /The agent connection was rejected\. Reconnect ChatGPT or update the provider credential in Settings\./)
+assert.match(threadRoute, /label: runtime\.provider === 'openai-codex' \? 'Reconnect ChatGPT' : 'Provider credential rejected'/)
+assert.match(threadRoute, /provider request failed/)
+assert.equal(
+  (threadRoute.match(/recordAgentResult\(/g) || []).length,
+  2,
+  'recordAgentResult must have one declaration and one worker-gated call',
+)
+assert.match(threadRoute, /record\.deliverable \? `Deliverable:/)
+assert.match(threadRoute, /boundedContextText\(record\.deliverable, 3_500\)/)
+assert.match(threadRoute, /documentReference \? `Document:/)
+assert.match(threadRoute, /return boundedContextText\(context, 5_000\)/)
 assert.match(threadRoute, /parseAgentTaskExecutionPlan\(responseText\)/)
 assert.match(threadRoute, /applyAgentTaskExecutionPlanForDispatch/)
 assert.match(threadRoute, /restorePersistedDispatchOutcome/)
@@ -547,5 +720,10 @@ assert.match(threadRoute, /appendAgentTaskDocument/)
 assert.match(threadRoute, /agentId === 'projects'/)
 assert.match(read('scripts/backfill-project-agent-documents.mjs'), /historical-agent-comment:/)
 assert.doesNotMatch(threadRoute, /executionStatus:\s*'completed'/)
+assert.match(requestUser, /process\.env\.APP_AUTH_REQUIRED !== '0'/)
+assert.match(requestUser, /process\.env\.RAILWAY_ENVIRONMENT_NAME/)
+assert.match(requestUser, /process\.env\.VERCEL/)
+assert.match(requestUser, /local\.developer@example\.test/)
+assert.doesNotMatch(requestUser, /developer@clawpilot\.local/)
 
 console.log('agent task execution behavioral tests passed')

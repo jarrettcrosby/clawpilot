@@ -16,19 +16,26 @@ import Divider from '@mui/material/Divider'
 import FormControl from '@mui/material/FormControl'
 import IconButton from '@mui/material/IconButton'
 import InputLabel from '@mui/material/InputLabel'
+import LinearProgress from '@mui/material/LinearProgress'
 import MenuItem from '@mui/material/MenuItem'
 import Select from '@mui/material/Select'
 import Snackbar from '@mui/material/Snackbar'
 import Stack from '@mui/material/Stack'
 import TextField from '@mui/material/TextField'
 import Tooltip from '@mui/material/Tooltip'
+import ToggleButton from '@mui/material/ToggleButton'
+import ToggleButtonGroup from '@mui/material/ToggleButtonGroup'
 import Typography from '@mui/material/Typography'
 import useMediaQuery from '@mui/material/useMediaQuery'
 import CheckRounded from '@mui/icons-material/CheckRounded'
 import ContentCopyRounded from '@mui/icons-material/ContentCopyRounded'
+import DescriptionRounded from '@mui/icons-material/DescriptionRounded'
+import ForumRounded from '@mui/icons-material/ForumRounded'
 import LinkOffRounded from '@mui/icons-material/LinkOffRounded'
 import LoginRounded from '@mui/icons-material/LoginRounded'
 import OpenInNewRounded from '@mui/icons-material/OpenInNewRounded'
+import PlayArrowRounded from '@mui/icons-material/PlayArrowRounded'
+import ReplayRounded from '@mui/icons-material/ReplayRounded'
 import RefreshRounded from '@mui/icons-material/RefreshRounded'
 import SendRounded from '@mui/icons-material/SendRounded'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
@@ -68,6 +75,7 @@ type DeviceLogin = {
 }
 
 type AuthPhase = 'waiting' | 'expired' | 'failed'
+type InteractionMode = 'work' | 'discuss'
 
 type ThreadMessage = {
   id: string
@@ -85,6 +93,59 @@ function formatTimestamp(value: string | undefined, settings: UserDateTimeSettin
 
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' ? value as Record<string, unknown> : {}
+}
+
+function taskExecutionView(task: Task | null) {
+  const execution = task?.execution
+  const result = asRecord(execution?.lastResult)
+  const document = asRecord(result.document)
+  const dispatch = execution?.agentDispatch
+  const executionStatus = String(execution?.executionStatus || '').trim().toLowerCase()
+  const dispatchStatus = String(dispatch?.status || '').trim().toLowerCase()
+  const active = dispatchStatus === 'queued' || dispatchStatus === 'running'
+  const failed = dispatchStatus === 'failed'
+  const status = failed
+    ? 'failed'
+    : active
+      ? dispatchStatus
+      : executionStatus || dispatchStatus || 'idle'
+  const label = ({
+    queued: 'Queued',
+    running: 'Working',
+    awaiting_input: 'Needs your input',
+    blocked: 'Blocked',
+    completed: 'Ready to review',
+    triaged: 'Plan prepared',
+    responded: 'Discussion updated',
+    succeeded: 'Run recorded',
+    failed: 'Run failed',
+    idle: 'Ready',
+  } as Record<string, string>)[status] || status.replaceAll('_', ' ')
+  const color = status === 'failed' || status === 'blocked'
+    ? 'error'
+    : status === 'awaiting_input'
+      ? 'warning'
+      : status === 'completed' || status === 'succeeded'
+        ? 'success'
+        : active
+          ? 'info'
+          : 'default'
+
+  return {
+    active,
+    failed,
+    status,
+    label,
+    color: color as 'default' | 'error' | 'warning' | 'success' | 'info',
+    summary: String(result.summary || '').trim(),
+    changed: String(result.whatWasDone || '').trim(),
+    nextAction: String(result.nextAction || task?.workItem?.nextAction || '').trim(),
+    waitingOn: String(result.waitingOn || task?.workItem?.waitingOn || '').trim(),
+    blocker: String(result.blockedReason || task?.workItem?.blocker || '').trim(),
+    documentTitle: String(document.title || '').trim(),
+    documentUrl: String(document.url || '').trim(),
+    error: String(dispatch?.error || '').trim(),
+  }
 }
 
 function payloadMessage(payload: Record<string, unknown>, fallback: string) {
@@ -131,7 +192,9 @@ export default function AgentsSection() {
   const [selectedTaskId, setSelectedTaskId] = useState('')
   const [messages, setMessages] = useState<ThreadMessage[]>([])
   const [composer, setComposer] = useState('')
+  const [interactionMode, setInteractionMode] = useState<InteractionMode>('work')
   const [sending, setSending] = useState(false)
+  const [sendingMode, setSendingMode] = useState<InteractionMode | null>(null)
   const [notice, setNotice] = useState('')
   const [authStarting, setAuthStarting] = useState(false)
   const [authDisconnecting, setAuthDisconnecting] = useState(false)
@@ -255,6 +318,7 @@ export default function AgentsSection() {
   const selectedAgent = agents.find((agent) => agent.id === selectedAgentId) || null
   const selectedTask = tasks.find((task) => task.id === selectedTaskId) || null
   const selectedDispatchStatus = selectedTask?.execution?.agentDispatch?.status
+  const executionView = taskExecutionView(selectedTask)
   const assignedCount = openTasks.filter((task) => Boolean(task.assignedAgent)).length
 
   useEffect(() => {
@@ -341,32 +405,60 @@ export default function AgentsSection() {
     }
   }
 
-  async function sendMessage() {
-    const text = composer.trim()
+  async function sendMessage(textOverride?: string, modeOverride?: InteractionMode) {
+    const text = String(textOverride || composer).trim()
+    const mode = modeOverride || interactionMode
     if (!selectedAgentId || !selectedTaskId || !text || !runtime?.ready) return
+    if (mode === 'work' && executionView.active) {
+      setNotice('This task already has an active agent run.')
+      return
+    }
+    const optimisticMessageId = `local-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    setMessages((current) => [
+      ...current,
+      {
+        id: optimisticMessageId,
+        role: 'user',
+        text,
+        createdAt: new Date().toISOString(),
+        taskId: selectedTaskId,
+      },
+    ])
+    if (!textOverride) setComposer('')
     setSending(true)
+    setSendingMode(mode)
     try {
       const response = await fetch('/api/agents/threads', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ agentId: selectedAgentId, taskId: selectedTaskId, text }),
+        body: JSON.stringify({ agentId: selectedAgentId, taskId: selectedTaskId, text, mode }),
       })
       const payload = await response.json().catch(() => null)
+      if (payload?.runtime) setRuntime(payload.runtime)
       if (!response.ok) throw new Error(payload?.error || 'Agent request failed')
       setMessages(Array.isArray(payload?.thread?.messages) ? payload.thread.messages : [])
-      setComposer('')
-      if (payload?.canonicalWorkItem) {
-        setTasks((current) => current.map((task) => (
-          task.id === selectedTaskId
-            ? { ...task, workItem: payload.canonicalWorkItem, updatedAt: new Date().toISOString() }
-            : task
-        )))
-      }
+      await loadWorkspace()
+      if (payload?.queued) setNotice('Agent work queued. Progress will update here automatically.')
     } catch (error) {
+      try {
+        const params = new URLSearchParams({ agentId: selectedAgentId, taskId: selectedTaskId })
+        const response = await fetch(`/api/agents/threads?${params.toString()}`)
+        const payload = await response.json()
+        if (response.ok) setMessages(Array.isArray(payload?.messages) ? payload.messages : [])
+      } catch {
+        setMessages((current) => current.filter((message) => message.id !== optimisticMessageId))
+      }
+      if (!textOverride) setComposer((current) => current || text)
       setNotice(error instanceof Error ? error.message : 'Agent request failed.')
     } finally {
       setSending(false)
+      setSendingMode(null)
     }
+  }
+
+  async function runNextAction() {
+    const nextAction = executionView.nextAction || 'Continue the task from the current description and complete the next concrete step.'
+    await sendMessage(`Continue work. Next action: ${nextAction}`, 'work')
   }
 
   function closeAuthDialog() {
@@ -452,6 +544,7 @@ export default function AgentsSection() {
     codexAuth?.email,
     codexAuth?.planType,
     codexAuth?.expiresAt ? `Expires ${formatTimestamp(codexAuth.expiresAt, dateTimeSettings)}` : '',
+    codexConnected ? 'Task discussion and documents; repository runner not connected' : '',
   ].filter(Boolean).join(' | ')
 
   return (
@@ -555,26 +648,69 @@ export default function AgentsSection() {
           </Stack>
 
           {selectedTask && (
-            <Box sx={{ px: shortLandscape ? 0.75 : 1.25, py: shortLandscape ? 0.5 : 1, mb: shortLandscape ? 0.75 : 1.25, maxHeight: shortLandscape ? 48 : 'none', overflow: shortLandscape ? 'auto' : 'visible', borderRadius: 1, backgroundColor: 'rgba(255,255,255,0.04)' }}>
-              <Stack direction="row" spacing={1} flexWrap="wrap" mb={0.5}>
+            <Box data-testid="agent-task-status" sx={{ px: shortLandscape ? 0.75 : 1.25, py: shortLandscape ? 0.5 : 1, mb: shortLandscape ? 0.75 : 1.25, maxHeight: shortLandscape ? 112 : 'none', overflow: shortLandscape ? 'auto' : 'visible', borderRadius: 1, backgroundColor: 'rgba(255,255,255,0.04)' }}>
+              <Stack direction="row" spacing={0.75} flexWrap="wrap" alignItems="center" mb={0.75}>
                 <Chip size="small" label={selectedTask.status} />
                 <Chip size="small" label={selectedTask.priority} />
-                {selectedDispatchStatus && (
-                  <Chip
-                    size="small"
-                    color={selectedDispatchStatus === 'failed' ? 'error' : selectedDispatchStatus === 'succeeded' ? 'success' : 'info'}
-                    label={`Agent ${selectedDispatchStatus}`}
-                  />
-                )}
+                <Chip size="small" color={executionView.color} label={executionView.label} />
                 {selectedTask.dueDate && <Chip size="small" label={`Due ${selectedTask.dueDate}`} />}
               </Stack>
+              {executionView.active && <LinearProgress color="info" sx={{ height: 3, borderRadius: 1, mb: 0.75 }} />}
               {selectedTask.desc && !shortLandscape && <Typography variant="body2" color="text.secondary" sx={{ overflowWrap: 'anywhere' }}>{selectedTask.desc}</Typography>}
-              {selectedTask.workItem?.nextAction && (
-                <Typography variant="caption" color="text.primary" display="block" mt={0.75}>Next: {selectedTask.workItem.nextAction}</Typography>
+              {executionView.summary && !shortLandscape && (
+                <Typography variant="body2" color="text.primary" display="block" mt={0.75}>{executionView.summary}</Typography>
               )}
-              <Typography variant="caption" color="text.secondary" display="block" mt={0.5}>
-                Checklist: {(selectedTask.checklist || []).filter((item) => item.done).length}/{(selectedTask.checklist || []).length}
-              </Typography>
+              {executionView.changed && !shortLandscape && (
+                <Typography variant="caption" color="text.secondary" display="block" mt={0.4} sx={{ overflowWrap: 'anywhere' }}>
+                  <Box component="span" color="text.disabled">Changed:</Box> {executionView.changed}
+                </Typography>
+              )}
+              <Box display="grid" gridTemplateColumns={{ xs: '1fr', sm: 'minmax(0, 1fr) auto' }} gap={0.75} alignItems="end" mt={0.75}>
+                <Box minWidth={0}>
+                  {executionView.nextAction && (
+                    <Typography variant="caption" color="text.primary" display="block" sx={{ overflowWrap: 'anywhere' }}>
+                      <Box component="span" color="text.disabled">Next:</Box> {executionView.nextAction}
+                    </Typography>
+                  )}
+                  {(executionView.blocker || executionView.waitingOn) && (
+                    <Typography variant="caption" color={executionView.blocker ? 'error.light' : 'warning.light'} display="block" mt={0.4} sx={{ overflowWrap: 'anywhere' }}>
+                      <Box component="span" color="text.disabled">Waiting on:</Box> {executionView.blocker || executionView.waitingOn}
+                    </Typography>
+                  )}
+                  {executionView.error && (
+                    <Typography variant="caption" color="error.light" display="block" mt={0.4} sx={{ overflowWrap: 'anywhere' }}>
+                      {executionView.error}
+                    </Typography>
+                  )}
+                  <Typography variant="caption" color="text.secondary" display="block" mt={0.4}>
+                    Checklist: {(selectedTask.checklist || []).filter((item) => item.done).length}/{(selectedTask.checklist || []).length}
+                  </Typography>
+                </Box>
+                <Stack direction="row" spacing={0.75} flexWrap="wrap" justifyContent={{ xs: 'flex-start', sm: 'flex-end' }}>
+                  {executionView.documentUrl && (
+                    <Button
+                      size="small"
+                      href={executionView.documentUrl}
+                      startIcon={<DescriptionRounded />}
+                      sx={{ textTransform: 'none' }}
+                    >
+                      {executionView.documentTitle || 'Working document'}
+                    </Button>
+                  )}
+                  {!executionView.active && runtime?.ready && executionView.nextAction && (
+                    <Button
+                      size="small"
+                      variant="outlined"
+                      startIcon={executionView.failed ? <ReplayRounded /> : <PlayArrowRounded />}
+                      onClick={runNextAction}
+                      disabled={sending}
+                      sx={{ textTransform: 'none' }}
+                    >
+                      {executionView.failed ? 'Retry work' : 'Run next step'}
+                    </Button>
+                  )}
+                </Stack>
+              </Box>
             </Box>
           )}
 
@@ -589,43 +725,81 @@ export default function AgentsSection() {
                 <Box sx={{ px: 1.2, py: 0.9, borderRadius: 1, backgroundColor: message.role === 'user' ? 'rgba(168,199,250,0.2)' : message.role === 'system' ? 'rgba(239,83,80,0.12)' : 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.08)' }}>
                   <Typography variant="body2" color="text.primary" sx={{ whiteSpace: 'pre-wrap', lineHeight: 1.45, overflowWrap: 'anywhere' }}>{message.text}</Typography>
                 </Box>
-                <Typography variant="caption" color="text.disabled" sx={{ px: 0.5 }}>{formatTimestamp(message.createdAt, dateTimeSettings)}</Typography>
+                <Typography variant="caption" color="text.disabled" sx={{ px: 0.5 }}>
+                  {message.role === 'user' ? 'You' : message.role === 'agent' ? selectedAgent?.name || 'Agent' : 'System'} | {formatTimestamp(message.createdAt, dateTimeSettings)}
+                </Typography>
               </Box>
             ))}
+            {sendingMode && (
+              <Stack direction="row" spacing={0.75} alignItems="center" color="text.secondary" px={0.5}>
+                <CircularProgress size={14} color="inherit" />
+                <Typography variant="caption">
+                  {sendingMode === 'work' ? 'Queueing auditable work...' : `${selectedAgent?.name || 'Agent'} is responding...`}
+                </Typography>
+              </Stack>
+            )}
           </Stack>
 
-          <Stack direction="row" spacing={1} mt={shortLandscape ? 0.75 : 1.25} alignItems="flex-end">
-            <TextField
-              size="small"
-              placeholder={selectedTask ? `Message ${selectedAgent?.name || 'agent'} about this task` : 'Assign a task to start a thread'}
-              value={composer}
-              onChange={(event) => setComposer(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter' && !event.shiftKey) {
-                  event.preventDefault()
-                  sendMessage()
-                }
-              }}
-              fullWidth
-              multiline
-              minRows={1}
-              maxRows={4}
-              disabled={!selectedTaskId || !runtime?.ready || sending}
-            />
-            <Tooltip title="Send to assigned agent">
-              <span>
-                <IconButton
-                  color="primary"
-                  aria-label="Send to assigned agent"
-                  onClick={sendMessage}
-                  disabled={!selectedTaskId || !runtime?.ready || !composer.trim() || sending}
-                  sx={{ width: 40, height: 40 }}
-                >
-                  {sending ? <CircularProgress size={20} /> : <SendRounded />}
-                </IconButton>
-              </span>
-            </Tooltip>
-          </Stack>
+          <Box mt={shortLandscape ? 0.75 : 1.25}>
+            <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={1} mb={0.75}>
+              <ToggleButtonGroup
+                size="small"
+                exclusive
+                value={interactionMode}
+                onChange={(_, value: InteractionMode | null) => { if (value) setInteractionMode(value) }}
+                aria-label="Agent interaction mode"
+                sx={{ '& .MuiToggleButton-root': { textTransform: 'none', minHeight: 32, px: 1.25, gap: 0.5 } }}
+              >
+                <ToggleButton value="work" aria-label="Work mode" disabled={sending}>
+                  <Tooltip title="Queue auditable task work and update its evidence">
+                    <Box component="span" display="inline-flex" alignItems="center" gap={0.5}><PlayArrowRounded sx={{ fontSize: 17 }} />Work</Box>
+                  </Tooltip>
+                </ToggleButton>
+                <ToggleButton value="discuss" aria-label="Discuss mode" disabled={sending}>
+                  <Tooltip title="Discuss this task without changing its work evidence">
+                    <Box component="span" display="inline-flex" alignItems="center" gap={0.5}><ForumRounded sx={{ fontSize: 17 }} />Discuss</Box>
+                  </Tooltip>
+                </ToggleButton>
+              </ToggleButtonGroup>
+              {executionView.active && <Typography variant="caption" color="info.light">Agent working</Typography>}
+            </Stack>
+            <Stack direction="row" spacing={1} alignItems="flex-end">
+              <TextField
+                size="small"
+                placeholder={!selectedTask
+                  ? 'Assign a task to start a thread'
+                  : interactionMode === 'work'
+                    ? `Give ${selectedAgent?.name || 'the agent'} a concrete work instruction`
+                    : `Discuss this task with ${selectedAgent?.name || 'the agent'}`}
+                value={composer}
+                onChange={(event) => setComposer(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' && !event.shiftKey) {
+                    event.preventDefault()
+                    void sendMessage()
+                  }
+                }}
+                fullWidth
+                multiline
+                minRows={1}
+                maxRows={4}
+                disabled={!selectedTaskId || !runtime?.ready || sending || (interactionMode === 'work' && executionView.active)}
+              />
+              <Tooltip title={interactionMode === 'work' ? 'Queue agent work' : 'Send discussion message'}>
+                <span>
+                  <IconButton
+                    color="primary"
+                    aria-label={interactionMode === 'work' ? 'Queue agent work' : 'Send discussion message'}
+                    onClick={() => { void sendMessage() }}
+                    disabled={!selectedTaskId || !runtime?.ready || !composer.trim() || sending || (interactionMode === 'work' && executionView.active)}
+                    sx={{ width: 40, height: 40 }}
+                  >
+                    {sending ? <CircularProgress size={20} /> : interactionMode === 'work' ? <PlayArrowRounded /> : <SendRounded />}
+                  </IconButton>
+                </span>
+              </Tooltip>
+            </Stack>
+          </Box>
         </Card>
       </Box>
 
@@ -633,10 +807,24 @@ export default function AgentsSection() {
       <Stack spacing={0.75}>
         {openTasks.map((task) => (
           <Box key={task.id} sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', sm: 'minmax(0, 1fr) 220px' }, gap: 1, alignItems: 'center', px: 1.25, py: 1, borderBottom: '1px solid rgba(255,255,255,0.06)' }}>
-            <Box minWidth={0}>
-              <Typography variant="body2" fontWeight={600} noWrap>{task.title}</Typography>
-              <Typography variant="caption" color="text.secondary">{task.status} | {task.priority}</Typography>
-            </Box>
+            <ButtonBase
+              onClick={() => {
+                if (!task.assignedAgent) return
+                setSelectedAgentId(task.assignedAgent)
+                setSelectedTaskId(task.id)
+                window.scrollTo({ top: 0, behavior: 'smooth' })
+              }}
+              disabled={!task.assignedAgent}
+              aria-label={task.assignedAgent ? `Open ${task.title} agent thread` : undefined}
+              sx={{ minWidth: 0, justifyContent: 'flex-start', textAlign: 'left', borderRadius: 1, px: 0.25, py: 0.25 }}
+            >
+              <Box minWidth={0}>
+                <Typography variant="body2" fontWeight={600} noWrap>{task.title}</Typography>
+                <Typography variant="caption" color="text.secondary">
+                  {task.status} | {task.priority}{task.assignedAgent ? ` | ${taskExecutionView(task).label}` : ''}
+                </Typography>
+              </Box>
+            </ButtonBase>
             <FormControl size="small">
               <InputLabel>Assigned agent</InputLabel>
               <Select

@@ -197,8 +197,8 @@ test('dashboard links open their target section and selected document', async ({
   await expect(page.getByPlaceholder('Search cards...')).toBeVisible()
 
   await page.evaluate(() => { window.location.hash = 'dashboard' })
-  await expect(page.getByRole('button', { name: /Agent results/ })).toBeVisible()
-  await page.getByRole('button', { name: /Agent results/ }).click()
+  await expect(page.getByRole('button', { name: /Agent attention/ })).toBeVisible()
+  await page.getByRole('button', { name: /Agent attention/ }).click()
   await expect(page).toHaveURL(/#agents$/)
   await expect(page.getByRole('heading', { name: 'Agents', exact: true, level: 5 })).toBeVisible()
 })
