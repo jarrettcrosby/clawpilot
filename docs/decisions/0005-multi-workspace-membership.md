@@ -44,6 +44,8 @@ Global application role, organization membership role, and resource sharing rema
 
 Each root workspace owns an independent primary CRM pipeline, CRM Account graph, personal and shared pipelines, managed Google Drive hierarchy and workbooks, project boards, CRM boards, Docs, short links, product catalog, agents and organization memory, provider credentials, Toast locations and sales, accounting mappings, and export drafts.
 
+The historical environment workbook is a single-pipeline compatibility resource, not a user-wide default. A second root never reuses that Sheet ID. Its default pipeline begins app-owned and receives a separate managed workbook through the normal provisioning workflow.
+
 Personal authentication such as the user's ChatGPT connection remains attached to the person, but agent retrieval and execution context is partitioned by active workspace. Organization integrations such as Toast never reuse credentials across memberships.
 
 ## Interface Contract

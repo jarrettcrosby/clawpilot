@@ -147,9 +147,19 @@ for (const fragment of [
   'WHERE pipeline.workspace_organization_id = $2::uuid',
   'WHERE user_email = $1 AND workspace_organization_id = $2::uuid',
   'ON CONFLICT (user_email, workspace_organization_id) DO UPDATE SET',
+  'VALUES ($1, $2, $3::uuid, true, NULL, false)',
+  'AND (pipeline_spaces.sheet_id IS NULL OR pipeline_spaces.sheet_id = $2)',
+  'WHERE existing.sheet_id = $2',
+  'AND existing.id <> $1::uuid',
+  'if (legacySheetClaim.rows[0]) personalPipeline = legacySheetClaim',
 ]) {
   assertIncludes(tenancy, fragment, 'workspace-scoped tenancy adapter')
 }
+assert.doesNotMatch(
+  tenancy,
+  /VALUES \(\$1, \$2, \$3::uuid, true, \$4, \$5\)/,
+  'a new owner pipeline cannot claim the legacy workbook before checking existing ownership',
+)
 assert.ok(
   !tenancy.includes("SELECT workspace_organization_id::text FROM project_boards WHERE id = $1::uuid"),
   'a requested board cannot replace the active browser workspace',
