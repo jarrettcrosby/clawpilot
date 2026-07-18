@@ -131,6 +131,9 @@ for (const fragment of [
   'recordQuickBooksWorkerHeartbeatInPostgres',
 ]) includes(processRoute, fragment, 'QuickBooks worker route')
 
+const authProxy = read('app_src/proxy.ts')
+includes(authProxy, '/api/integrations/quickbooks/process', 'QuickBooks worker proxy allowlist')
+
 const panel = read('app_src/components/settings/QuickBooksIntegrationPanel.tsx')
 for (const fragment of [
   'Connect selected QuickBooks',
