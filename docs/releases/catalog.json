@@ -20,7 +20,8 @@
         "Task-linked agent working documents that consolidate research and design output behind concise card-comment links",
         "Explicit Work and Discuss modes so private conversation cannot silently mutate shared task evidence",
         "Visible queued, working, input-needed, blocked, and review-ready states with direct access to the working document and next run",
-        "Browser-session security details that identify the authenticated user, support-mode effective user, and observed sign-in network addresses"
+        "Browser-session security details that identify the authenticated user, support-mode effective user, and observed sign-in network addresses",
+        "Independent EPISCS ownership for the established Sales CRM graph, pipeline workbook, record links, documents, and CRM Board"
       ],
       "fixes": [
         "Preserves meaningful card descriptions up to 10,000 characters instead of replacing detailed scope with generic text",
@@ -44,7 +45,8 @@
         "Rejects overlapping manual agent runs across browser sessions with a task-scoped transactional lock",
         "Prevents discussion replies and unsourced current-research claims from being recorded as completed task work",
         "Sanitizes agent-provider failures so credentials and upstream authorization details never appear in task threads",
-        "Restores authenticated API behavior for the explicitly unauthenticated, non-hosted local development runtime"
+        "Restores authenticated API behavior for the explicitly unauthenticated, non-hosted local development runtime",
+        "Keeps Suburbia memberships and child-workspace CRM projections isolated while moving all Sales customer contacts, opportunities, interactions, meetings, products, and history to EPISCS"
       ]
     }
   }

@@ -58,6 +58,7 @@ Current product behavior is defined by active module and operating contracts. Op
 - [Google Workspace integration](operations/google-workspace-integration.md)
 - [Railway Postgres backups](operations/railway-postgres-backups.md)
 - [SuiteCRM Railway runbook](operations/suitecrm.md)
+- [Sales pipeline EPISCS migration](operations/sales-pipeline-episcs-migration.md)
 - [Release documentation contract](releases/README.md)
 - [ClawPilot identity](brand/clawpilot-identity.md)
 

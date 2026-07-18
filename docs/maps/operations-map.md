@@ -21,6 +21,7 @@ app_visible: true
 
 - [Google Workspace Integration](../operations/google-workspace-integration.md): service account, Shared Drive, managed folders, and credential rotation.
 - [SuiteCRM Railway Runbook](../operations/suitecrm.md): service topology, Global ID fields, scheduler, upgrades, and rollback.
+- [Sales Pipeline EPISCS Migration](../operations/sales-pipeline-episcs-migration.md): guarded ownership transfer for the established Sales CRM graph and workbook.
 - [Railway Postgres Backups](../operations/railway-postgres-backups.md): provider backups, snapshots, logical exports, and restore drills.
 - [ChatGPT Agent Authorization](../operations/chatgpt-agent-auth.md): per-user Codex device authorization and agent mapping.
 - [Agent Security and Integration Isolation](../operations/agent-security-and-isolation.md): prompt trust zones, deterministic connector ingestion, action approvals, and worker scheduling.
