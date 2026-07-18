@@ -5,6 +5,7 @@ const expectedStorage = String(process.env.CLAWPILOT_EXPECT_STORAGE || '').trim(
 const expectPipeline = String(process.env.CLAWPILOT_EXPECT_PIPELINE || '0') === '1'
 const expectedBranch = String(process.env.CLAWPILOT_EXPECT_BRANCH || '').trim()
 const expectedEnvironment = String(process.env.CLAWPILOT_EXPECT_ENVIRONMENT || '').trim()
+const smokeWorkspace = String(process.env.CLAWPILOT_SMOKE_WORKSPACE || '').trim()
 
 if (!baseUrl) {
   console.error('Usage: CLAWPILOT_BASE_URL=https://... npm run verify:deployed')
@@ -19,6 +20,19 @@ if (process.env.CLAWPILOT_SMOKE_COOKIE) {
   headers.Cookie = process.env.CLAWPILOT_SMOKE_COOKIE
 }
 
+function applySessionCookie(response) {
+  const setCookies = typeof response.headers.getSetCookie === 'function'
+    ? response.headers.getSetCookie()
+    : [response.headers.get('set-cookie')].filter(Boolean)
+  const sessionCookie = setCookies.find((value) => (
+    /^(?:__Host-)?clawpilot_session=/i.test(value)
+    && !/Max-Age=0(?:;|$)/i.test(value)
+  ))
+  const cookie = sessionCookie?.split(';', 1)[0]
+  if (!cookie) throw new Error('authentication response did not set a session cookie')
+  headers.Cookie = cookie
+}
+
 async function authenticate() {
   const password = process.env.CLAWPILOT_SMOKE_PASSWORD
   const operatorSecret = process.env.CLAWPILOT_SMOKE_OPERATOR_SECRET || process.env.PIPELINE_OUTBOX_WORKER_SECRET
@@ -31,10 +45,35 @@ async function authenticate() {
     body: JSON.stringify({ password }),
   })
   if (!response.ok) throw new Error(`authentication failed with HTTP ${response.status}`)
-  const cookie = response.headers.get('set-cookie')?.split(';', 1)[0]
-  if (!cookie) throw new Error('authentication response did not set a session cookie')
-  headers.Cookie = cookie
+  applySessionCookie(response)
   console.log('OK: authenticated smoke session')
+}
+
+async function selectSmokeWorkspace() {
+  if (!smokeWorkspace) return
+  const session = await getJson('/api/auth/session')
+  const workspaces = Array.isArray(session?.availableWorkspaces) ? session.availableWorkspaces : []
+  const normalizedTarget = smokeWorkspace.toLowerCase()
+  const workspace = workspaces.find((entry) => [
+    entry?.organizationId,
+    entry?.referenceCode,
+    entry?.name,
+  ].some((value) => String(value || '').trim().toLowerCase() === normalizedTarget))
+  if (!workspace?.organizationId) throw new Error(`smoke workspace is unavailable: ${smokeWorkspace}`)
+  if (session?.activeWorkspace?.organizationId === workspace.organizationId) {
+    console.log(`OK: smoke workspace is ${workspace.name}`)
+    return
+  }
+  const response = await fetch(`${baseUrl}/api/auth/workspace`, {
+    method: 'POST',
+    headers: { ...headers, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'switch', organizationId: workspace.organizationId }),
+    redirect: 'manual',
+  })
+  const raw = await response.text()
+  if (!response.ok) throw new Error(`workspace switch failed with HTTP ${response.status}: ${raw.slice(0, 300)}`)
+  applySessionCookie(response)
+  console.log(`OK: switched smoke workspace to ${workspace.name}`)
 }
 
 async function verifyAuthenticationBoundary() {
@@ -77,6 +116,7 @@ async function getJson(pathname) {
 try {
   await verifyAuthenticationBoundary()
   await authenticate()
+  await selectSmokeWorkspace()
   const health = await getJson('/api/health')
   check(health?.status === 'ok', 'health status is ok')
 
