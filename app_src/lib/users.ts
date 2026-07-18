@@ -29,6 +29,7 @@ export type AppUserPermissions = {
   viewFullReleaseHistory: boolean
   manageBackups: boolean
   manageLinks: boolean
+  viewAccounting: boolean
   viewOrganizationAudit: boolean
   viewSystemAudit: boolean
 }
@@ -41,6 +42,7 @@ export const MEMBER_PERMISSIONS: AppUserPermissions = {
   viewFullReleaseHistory: false,
   manageBackups: false,
   manageLinks: false,
+  viewAccounting: false,
   viewOrganizationAudit: false,
   viewSystemAudit: false,
 }
@@ -53,6 +55,7 @@ export const OWNER_PERMISSIONS: AppUserPermissions = {
   viewFullReleaseHistory: true,
   manageBackups: true,
   manageLinks: true,
+  viewAccounting: true,
   viewOrganizationAudit: true,
   viewSystemAudit: true,
 }
@@ -153,6 +156,7 @@ function normalizePermissions(value: unknown): AppUserPermissions {
     viewFullReleaseHistory: input.viewFullReleaseHistory === true,
     manageBackups: input.manageBackups === true,
     manageLinks: input.manageLinks === true,
+    viewAccounting: input.viewAccounting === true,
     viewOrganizationAudit: input.viewOrganizationAudit === true,
     viewSystemAudit: input.viewSystemAudit === true,
   }

@@ -1,6 +1,14 @@
 import crypto from 'crypto'
 import { recordAuditEvent } from '@/lib/auditWriter'
-import type { QuickBooksAccount, QuickBooksCompanyInfo, QuickBooksItem } from '@/lib/integrations/quickBooksClient'
+import type {
+  QuickBooksAccount,
+  QuickBooksAttachment,
+  QuickBooksCompanyInfo,
+  QuickBooksCustomer,
+  QuickBooksItem,
+  QuickBooksTransaction,
+  QuickBooksVendor,
+} from '@/lib/integrations/quickBooksClient'
 import { query, withTransaction } from '@/lib/persistence/postgres'
 
 export const QUICKBOOKS_MAPPING_KEYS = [
@@ -42,10 +50,17 @@ export async function readQuickBooksIntegrationStateFromPostgres(organizationId:
        WHERE organization_id = $1::uuid LIMIT 1`,
       [organizationId],
     ),
-    query<{ accounts: string; items: string }>(
+    query<{
+      accounts: string; items: string; customers: string; vendors: string
+      transactions: string; attachments: string
+    }>(
       `SELECT
          (SELECT count(*) FROM quickbooks_accounts WHERE organization_id = $1::uuid)::text AS accounts,
-         (SELECT count(*) FROM quickbooks_items WHERE organization_id = $1::uuid)::text AS items`,
+         (SELECT count(*) FROM quickbooks_items WHERE organization_id = $1::uuid)::text AS items,
+         (SELECT count(*) FROM quickbooks_customers WHERE organization_id = $1::uuid)::text AS customers,
+         (SELECT count(*) FROM quickbooks_vendors WHERE organization_id = $1::uuid)::text AS vendors,
+         (SELECT count(*) FROM quickbooks_transactions WHERE organization_id = $1::uuid)::text AS transactions,
+         (SELECT count(*) FROM quickbooks_attachments WHERE organization_id = $1::uuid)::text AS attachments`,
       [organizationId],
     ),
     query<{
@@ -118,6 +133,10 @@ export async function readQuickBooksIntegrationStateFromPostgres(organizationId:
     counts: {
       accounts: Number(counts.rows[0]?.accounts || 0),
       items: Number(counts.rows[0]?.items || 0),
+      customers: Number(counts.rows[0]?.customers || 0),
+      vendors: Number(counts.rows[0]?.vendors || 0),
+      transactions: Number(counts.rows[0]?.transactions || 0),
+      attachments: Number(counts.rows[0]?.attachments || 0),
     },
     accounts: accounts.rows.map((row) => ({
       id: row.id,
@@ -203,6 +222,10 @@ export async function bindQuickBooksConnectionInPostgres(input: {
     )
     await client.query('DELETE FROM quickbooks_accounts WHERE organization_id = $1::uuid', [input.organizationId])
     await client.query('DELETE FROM quickbooks_items WHERE organization_id = $1::uuid', [input.organizationId])
+    await client.query('DELETE FROM quickbooks_customers WHERE organization_id = $1::uuid', [input.organizationId])
+    await client.query('DELETE FROM quickbooks_vendors WHERE organization_id = $1::uuid', [input.organizationId])
+    await client.query('DELETE FROM quickbooks_transactions WHERE organization_id = $1::uuid', [input.organizationId])
+    await client.query('DELETE FROM quickbooks_attachments WHERE organization_id = $1::uuid', [input.organizationId])
     await client.query(
       `UPDATE toast_accounting_mappings SET
          quickbooks_account_id = NULL, quickbooks_account_name = NULL,
@@ -383,19 +406,23 @@ export async function completeQuickBooksCatalogSyncInPostgres(input: {
   company: QuickBooksCompanyInfo
   accounts: QuickBooksAccount[]
   items: QuickBooksItem[]
+  customers: QuickBooksCustomer[]
+  vendors: QuickBooksVendor[]
+  transactions: QuickBooksTransaction[]
+  attachments: QuickBooksAttachment[]
 }) {
   await withTransaction(async (client) => {
     await client.query('DELETE FROM quickbooks_accounts WHERE organization_id = $1::uuid', [input.job.organizationId])
     for (const account of input.accounts) {
       await client.query(
         `INSERT INTO quickbooks_accounts (
-           organization_id, quickbooks_account_id, name, fully_qualified_name, classification,
-           account_type, account_sub_type, currency_code, active, source_payload, synced_at
-         ) VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, now())`,
+         organization_id, quickbooks_account_id, name, fully_qualified_name, classification,
+           account_type, account_sub_type, currency_code, current_balance, active, source_payload, synced_at
+         ) VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, now())`,
         [
           input.job.organizationId, account.id, account.name, account.fullyQualifiedName,
           account.classification, account.accountType, account.accountSubType, account.currencyCode,
-          account.active, JSON.stringify(account.sourcePayload),
+          account.currentBalance, account.active, JSON.stringify(account.sourcePayload),
         ],
       )
     }
@@ -404,14 +431,87 @@ export async function completeQuickBooksCatalogSyncInPostgres(input: {
       await client.query(
         `INSERT INTO quickbooks_items (
            organization_id, quickbooks_item_id, name, fully_qualified_name, item_type, sku, description,
-           unit_price, purchase_cost, income_account_id, expense_account_id, asset_account_id,
-           active, taxable, source_payload, synced_at
-         ) VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15::jsonb, now())`,
+           unit_price, purchase_cost, quantity_on_hand, track_quantity, income_account_id,
+           expense_account_id, asset_account_id, active, taxable, source_payload, synced_at
+         ) VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17::jsonb, now())`,
         [
           input.job.organizationId, item.id, item.name, item.fullyQualifiedName, item.itemType, item.sku,
-          item.description, item.unitPrice, item.purchaseCost, item.incomeAccountId, item.expenseAccountId,
-          item.assetAccountId, item.active, item.taxable, JSON.stringify(item.sourcePayload),
+          item.description, item.unitPrice, item.purchaseCost, item.quantityOnHand, item.trackQuantity,
+          item.incomeAccountId, item.expenseAccountId, item.assetAccountId, item.active, item.taxable,
+          JSON.stringify(item.sourcePayload),
         ],
+      )
+    }
+    await client.query('DELETE FROM quickbooks_customers WHERE organization_id = $1::uuid', [input.job.organizationId])
+    for (let offset = 0; offset < input.customers.length; offset += 500) {
+      await client.query(
+        `INSERT INTO quickbooks_customers (
+           organization_id, quickbooks_customer_id, display_name, company_name, email, phone,
+           currency_code, balance, active, source_payload, synced_at
+         )
+         SELECT $1::uuid, row.id, row."displayName", row."companyName", row.email, row.phone,
+           row."currencyCode", row.balance, row.active, row."sourcePayload", now()
+         FROM jsonb_to_recordset($2::jsonb) AS row(
+           id text, "displayName" text, "companyName" text, email text, phone text,
+           "currencyCode" text, balance numeric, active boolean, "sourcePayload" jsonb
+         )`,
+        [input.job.organizationId, JSON.stringify(input.customers.slice(offset, offset + 500))],
+      )
+    }
+    await client.query('DELETE FROM quickbooks_vendors WHERE organization_id = $1::uuid', [input.job.organizationId])
+    for (let offset = 0; offset < input.vendors.length; offset += 500) {
+      await client.query(
+        `INSERT INTO quickbooks_vendors (
+           organization_id, quickbooks_vendor_id, display_name, company_name, email, phone,
+           currency_code, balance, active, source_payload, synced_at
+         )
+         SELECT $1::uuid, row.id, row."displayName", row."companyName", row.email, row.phone,
+           row."currencyCode", row.balance, row.active, row."sourcePayload", now()
+         FROM jsonb_to_recordset($2::jsonb) AS row(
+           id text, "displayName" text, "companyName" text, email text, phone text,
+           "currencyCode" text, balance numeric, active boolean, "sourcePayload" jsonb
+         )`,
+        [input.job.organizationId, JSON.stringify(input.vendors.slice(offset, offset + 500))],
+      )
+    }
+    await client.query('DELETE FROM quickbooks_transactions WHERE organization_id = $1::uuid', [input.job.organizationId])
+    for (let offset = 0; offset < input.transactions.length; offset += 500) {
+      await client.query(
+        `INSERT INTO quickbooks_transactions (
+           organization_id, entity_type, quickbooks_transaction_id, document_number,
+           transaction_date, due_date, party_id, party_name, account_id, account_name,
+           currency_code, total_amount, open_balance, transaction_status, email_status,
+           payment_method, memo, source_payload, synced_at
+         )
+         SELECT $1::uuid, row."entityType", row.id, row."documentNumber",
+           row."transactionDate"::date, row."dueDate"::date, row."partyId", row."partyName",
+           row."accountId", row."accountName", row."currencyCode", row."totalAmount",
+           row."openBalance", row.status, row."emailStatus", row."paymentMethod", row.memo,
+           row."sourcePayload", now()
+         FROM jsonb_to_recordset($2::jsonb) AS row(
+           id text, "entityType" text, "documentNumber" text, "transactionDate" text,
+           "dueDate" text, "partyId" text, "partyName" text, "accountId" text,
+           "accountName" text, "currencyCode" text, "totalAmount" numeric,
+           "openBalance" numeric, status text, "emailStatus" text, "paymentMethod" text,
+           memo text, "sourcePayload" jsonb
+         )`,
+        [input.job.organizationId, JSON.stringify(input.transactions.slice(offset, offset + 500))],
+      )
+    }
+    await client.query('DELETE FROM quickbooks_attachments WHERE organization_id = $1::uuid', [input.job.organizationId])
+    for (let offset = 0; offset < input.attachments.length; offset += 500) {
+      await client.query(
+        `INSERT INTO quickbooks_attachments (
+           organization_id, quickbooks_attachment_id, file_name, content_type, size_bytes,
+           note, entity_references, source_payload, synced_at
+         )
+         SELECT $1::uuid, row.id, row."fileName", row."contentType", row."sizeBytes",
+           row.note, COALESCE(row."entityReferences", '[]'::jsonb), row."sourcePayload", now()
+         FROM jsonb_to_recordset($2::jsonb) AS row(
+           id text, "fileName" text, "contentType" text, "sizeBytes" bigint,
+           note text, "entityReferences" jsonb, "sourcePayload" jsonb
+         )`,
+        [input.job.organizationId, JSON.stringify(input.attachments.slice(offset, offset + 500))],
       )
     }
     await client.query(
@@ -439,7 +539,14 @@ export async function completeQuickBooksCatalogSyncInPostgres(input: {
          status = 'succeeded', result_summary = $3::jsonb, last_error = NULL,
          locked_at = NULL, locked_by = NULL, lock_token = NULL, completed_at = now(), updated_at = now()
        WHERE id = $1::uuid AND lock_token = $2::uuid`,
-      [input.job.id, input.job.lockToken, JSON.stringify({ accounts: input.accounts.length, items: input.items.length })],
+      [input.job.id, input.job.lockToken, JSON.stringify({
+        accounts: input.accounts.length,
+        items: input.items.length,
+        customers: input.customers.length,
+        vendors: input.vendors.length,
+        transactions: input.transactions.length,
+        attachments: input.attachments.length,
+      })],
     )
     if (!completed.rowCount) throw new Error('QuickBooks sync lease was lost')
     await recordAuditEvent({
@@ -449,7 +556,15 @@ export async function completeQuickBooksCatalogSyncInPostgres(input: {
       aggregateId: input.job.organizationId,
       organizationId: input.job.organizationId,
       isSystem: true,
-      payload: { companyName: input.company.companyName, accounts: input.accounts.length, items: input.items.length },
+      payload: {
+        companyName: input.company.companyName,
+        accounts: input.accounts.length,
+        items: input.items.length,
+        customers: input.customers.length,
+        vendors: input.vendors.length,
+        transactions: input.transactions.length,
+        attachments: input.attachments.length,
+      },
     }, client)
   })
 }

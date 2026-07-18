@@ -1,7 +1,7 @@
 ---
 id: cp-module-quickbooks-accounting
 title: QuickBooks Accounting Connector
-summary: Organization-bound QuickBooks access, read-only catalog synchronization, explicit CRM product import, and controlled accounting mappings.
+summary: Organization-bound QuickBooks access, a read-only accounting explorer, explicit CRM product import, and controlled accounting mappings.
 status: active
 kind: module-contract
 area: integrations
@@ -13,7 +13,7 @@ app_visible: true
 
 ## Purpose
 
-Bind one QuickBooks Online company to the active ClawPilot organization without confusing a user's personal provider authorization with organization data ownership. The current connector reads company metadata, chart-of-account records, and product or service items. Financial writes remain locked until sandbox behavior, reconciliation, approval, and recovery controls are accepted.
+Bind one QuickBooks Online company to the active ClawPilot organization without confusing a user's personal provider authorization with organization data ownership. The connector projects company metadata, accounts, products and services, customers, vendors, transaction forms, and attachment metadata into an organization-scoped read model. Financial writes remain locked until sandbox behavior, reconciliation, approval, and recovery controls are accepted.
 
 ## Connection And Tenancy Contract
 
@@ -24,23 +24,28 @@ Bind one QuickBooks Online company to the active ClawPilot organization without 
 - Every API read, cached record, worker job, Toast mapping, CRM import, and audit event is scoped by `organization_id`.
 - Rebinding or disconnecting clears cached account and item rows and invalidates old account mappings. It never falls back to another organization or platform credential.
 
-## Read-Only Catalog Flow
+## Read-Only Accounting Flow
 
 ```mermaid
 flowchart LR
   User[User Maton authorization] --> Binding[Organization connection binding]
   Binding --> Worker[Leased catalog worker]
   Worker --> QBO[QuickBooks read-only APIs]
-  QBO --> Accounts[(Account cache)]
-  QBO --> Items[(Item cache)]
+  QBO --> Accounts[(Account and product projections)]
+  QBO --> Financial[(Customer, vendor, transaction, attachment projections)]
+  Financial --> Explorer[Accounting explorer]
+  QBO --> Items[(Product and service projection)]
   Items --> Selection[Explicit manager selection]
   Selection --> CRM[(CRM product catalog)]
   CRM --> Pipeline[Pipeline product dropdown]
 ```
 
-- The shared Railway poller claims catalog jobs with a lease and bounded retries.
+- The shared Railway poller claims snapshot jobs with a lease and bounded retries.
 - Automatic refresh runs no more often than once every 24 hours for enabled active bindings. A manager can queue a refresh from Settings.
-- Provider responses are size-bounded and parsed into sanitized account and item records before Postgres persistence.
+- Provider responses are size-bounded and parsed into sanitized projections before Postgres persistence.
+- The Accounting workspace supports an overview, invoices, receipts, all transaction types, products and services, the chart of accounts, customers, vendors, and attachment metadata. Lists are paginated and searched server-side.
+- Overview totals are operational views of synced transaction forms. They are not represented as a profit-and-loss statement, balance sheet, or other formal QuickBooks report.
+- Organization owners can view accounting data. Administrators can grant the `viewAccounting` permission to selected organization members. Connector management remains restricted to owners and access administrators.
 - Categories, inactive items, and ambiguous duplicate names are not imported as pipeline products.
 - Product import is explicit and limited to 100 selected active products or services per request. It stages durable CRM product records, queues SuiteCRM projection, and refreshes the selected pipeline's product catalog.
 - Read access does not create invoices, receipts, payments, journal entries, customers, or provider-side items.
@@ -66,6 +71,10 @@ The current release is read-only. QuickBooks posting will require a separate acc
 - `organization_quickbooks_connections`
 - `quickbooks_accounts`
 - `quickbooks_items`
+- `quickbooks_customers`
+- `quickbooks_vendors`
+- `quickbooks_transactions`
+- `quickbooks_attachments`
 - `quickbooks_sync_outbox`
 - `toast_accounting_mappings`
 - `toast_accounting_export_drafts`
