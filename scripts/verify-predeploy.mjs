@@ -153,6 +153,7 @@ for (const requiredPath of [
   'db/migrations/0057_canonical_suitecrm_usernames.sql',
   'db/migrations/0058_agent_public_research_outbox.sql',
   'db/migrations/0059_toast_restaurant_integrations.sql',
+  'db/migrations/0060_multi_workspace_memberships.sql',
   '.github/workflows/clawpilot-repository-runner.yml',
   'scripts/start-railway.sh',
   'scripts/test-suitecrm-interaction-ingestion.mjs',

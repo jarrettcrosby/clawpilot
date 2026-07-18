@@ -7,6 +7,7 @@ export type RequestAuthAttribution = {
   sessionId: string
   authenticatedUser: string
   effectiveUser: string
+  activeWorkspaceOrganizationId: string
   impersonating: boolean
 }
 function secret(): string {
@@ -38,6 +39,7 @@ export function verifyAuthAttributionHeaders(headers: Pick<Headers, 'get'>): Req
     const parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as RequestAuthAttribution
     if (
       !/^[0-9a-f-]{36}$/i.test(String(parsed.sessionId || ''))
+      || !/^[0-9a-f-]{36}$/i.test(String(parsed.activeWorkspaceOrganizationId || ''))
       || !String(parsed.authenticatedUser || '').includes('@')
       || !String(parsed.effectiveUser || '').includes('@')
       || parsed.impersonating !== (parsed.authenticatedUser !== parsed.effectiveUser)
@@ -46,6 +48,7 @@ export function verifyAuthAttributionHeaders(headers: Pick<Headers, 'get'>): Req
       sessionId: parsed.sessionId,
       authenticatedUser: parsed.authenticatedUser.toLowerCase(),
       effectiveUser: parsed.effectiveUser.toLowerCase(),
+      activeWorkspaceOrganizationId: parsed.activeWorkspaceOrganizationId.toLowerCase(),
       impersonating: parsed.impersonating,
     }
   } catch {

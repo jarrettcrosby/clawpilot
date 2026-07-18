@@ -1,7 +1,12 @@
 import fs from 'fs'
 import path from 'path'
 import { query } from '@/lib/persistence/postgres'
-import type { AppUser } from '@/lib/users'
+import {
+  effectiveAuthorizationRole,
+  effectiveUserPermissions,
+  isRootAppOwner,
+  type AppUser,
+} from '@/lib/users'
 
 const PIPELINE_LOG_FILE = process.env.PIPELINE_LOG_PATH
   || path.join(process.cwd(), '..', 'data', 'logs', 'pipeline-events.jsonl')
@@ -15,7 +20,7 @@ const SAFE_DETAIL_KEYS = new Set([
   'provider', 'app', 'actionType', 'referenceCode', 'attempts', 'availableAt', 'outboxId',
   'syncStatus', 'opportunityId', 'opportunityName', 'organization', 'fromStage', 'toStage',
   'reinvited', 'previousOrganizationId', 'dispatchId', 'agentId', 'trigger', 'sourceKey',
-  'recordTitle',
+  'recordTitle', 'recordType', 'entity', 'globalId',
   'eligible', 'queued', 'deletedReferenceCodes', 'matchedReferenceCodes', 'suiteCrmDeletesQueued',
   'sessionId', 'deviceLabel', 'authMethod', 'idleExpiresAt', 'absoluteExpiresAt',
   'revokeReason', 'revokedCount', 'authenticatedUser', 'effectiveUser', 'impersonated',
@@ -68,6 +73,12 @@ type TaskActivityRow = {
   occurred_at: string
 }
 
+type ScopedUserRow = {
+  email: string | null
+  display_name: string | null
+  organization_id: string | null
+}
+
 type ScopeContext = {
   selfEmail: string
   organizationIds: string[]
@@ -78,9 +89,11 @@ type ScopeContext = {
 }
 
 export function activityCapabilities(actor: AppUser): ActivityCapabilities {
-  const canViewOrganization = actor.role === 'owner'
-    || (actor.role === 'admin' && actor.permissions.viewOrganizationAudit)
-  const canViewGlobal = actor.role === 'owner'
+  const role = effectiveAuthorizationRole(actor)
+  const permissions = effectiveUserPermissions(actor)
+  const canViewOrganization = role === 'owner'
+    || (role === 'admin' && permissions.viewOrganizationAudit)
+  const canViewGlobal = isRootAppOwner(actor)
     || (actor.role === 'admin' && actor.permissions.viewSystemAudit)
   return {
     canViewOrganization,
@@ -151,6 +164,56 @@ function titleCase(value: string): string {
     .replace(/\b\w/g, (character) => character.toUpperCase())
 }
 
+const CRM_RECORD_TYPE_LABELS: Record<string, string> = {
+  account: 'Organization',
+  accounts: 'Organization',
+  organization: 'Organization',
+  organizations: 'Organization',
+  contact: 'Contact',
+  contacts: 'Contact',
+  product: 'Product',
+  products: 'Product',
+  lead: 'Lead',
+  leads: 'Lead',
+  opportunity: 'Opportunity',
+  opportunities: 'Opportunity',
+  meeting: 'Meeting',
+  meetings: 'Meeting',
+  interaction: 'Interaction',
+  interactions: 'Interaction',
+  campaign: 'Campaign',
+  campaigns: 'Campaign',
+  user: 'Employee',
+  users: 'Employee',
+}
+
+function crmRecordTypeLabel(value: unknown): string | null {
+  const raw = typeof value === 'string' ? value.trim() : ''
+  if (!raw) return null
+  const normalized = raw
+    .toLowerCase()
+    .replace(/^crm[._-]/, '')
+    .replace(/[._-]+/g, ' ')
+    .trim()
+  return CRM_RECORD_TYPE_LABELS[normalized] || titleCase(normalized)
+}
+
+function crmAuditRecordMetadata(row: AuditRow): { recordType: string | null; referenceCode: string | null } {
+  const payload = row.payload || {}
+  const recordType = crmRecordTypeLabel(payload.recordType)
+    || crmRecordTypeLabel(payload.entity)
+    || crmRecordTypeLabel(row.aggregate_type)
+  const payloadReference = [payload.referenceCode, payload.globalId]
+    .find((value) => typeof value === 'string' && value.trim())
+  const aggregateReference = typeof row.aggregate_id === 'string' && /^g[a-z][0-9]{7}$/i.test(row.aggregate_id)
+    ? row.aggregate_id
+    : null
+  return {
+    recordType,
+    referenceCode: typeof payloadReference === 'string' ? payloadReference.trim() : aggregateReference,
+  }
+}
+
 function auditMessage(row: AuditRow): string {
   const payload = row.payload || {}
   if (typeof payload.message === 'string' && payload.message.trim()) return payload.message.trim()
@@ -189,67 +252,82 @@ async function loadScopeContext(actor: AppUser, scope: ActivityScope): Promise<S
   }
 
   const users = scope === 'organization' && actor.organizationId
-      ? await query<{ email: string; display_name: string | null; organization_id: string | null }>(
+      ? await query<ScopedUserRow>(
         `WITH RECURSIVE managed AS (
            SELECT id FROM workspace_organizations WHERE id = $1::uuid
            UNION ALL
            SELECT child.id FROM workspace_organizations child JOIN managed parent ON child.parent_id = parent.id
          )
-         SELECT app_user.email, app_user.display_name, app_user.organization_id::text
-         FROM app_users app_user JOIN managed ON managed.id = app_user.organization_id`,
+         SELECT app_user.email, app_user.display_name, managed.id::text AS organization_id
+         FROM managed
+         LEFT JOIN app_user_organization_memberships membership
+           ON membership.organization_id = managed.id
+          AND membership.status = 'active'
+         LEFT JOIN app_users app_user
+           ON app_user.email = membership.user_email
+          AND app_user.status = 'active'`,
         [actor.organizationId],
       )
-      : { rows: [{ email: actor.email, display_name: actor.displayName, organization_id: actor.organizationId }] }
+      : { rows: [{ email: actor.email, display_name: actor.displayName, organization_id: actor.organizationId }] as ScopedUserRow[] }
 
   const actorNames = new Map<string, string | null>()
   const actorKeys = new Set<string>()
   const organizationIds = new Set<string>()
   for (const user of users.rows) {
-    actorNames.set(user.email.toLowerCase(), user.display_name)
-    actorKeys.add(user.email.toLowerCase())
+    if (user.email) {
+      actorNames.set(user.email.toLowerCase(), user.display_name)
+      actorKeys.add(user.email.toLowerCase())
+    }
     if (user.display_name) actorKeys.add(user.display_name.toLowerCase())
     if (user.organization_id) organizationIds.add(user.organization_id)
   }
-  if (actor.role === 'owner') actorKeys.add('jarrett')
+  actorNames.set(actor.email.toLowerCase(), actor.displayName)
+  actorKeys.add(actor.email.toLowerCase())
+  if (actor.displayName) actorKeys.add(actor.displayName.toLowerCase())
+  if (effectiveAuthorizationRole(actor) === 'owner') actorKeys.add('jarrett')
 
-  const resourceParams = scope === 'organization'
-    ? [[...organizationIds]]
-    : [actor.email]
   const boardResult = scope === 'organization'
       ? await query<{ id: string }>(
-        `SELECT DISTINCT board.id::text
+        `SELECT board.id::text
          FROM project_boards board
-         LEFT JOIN app_users owner_user ON owner_user.email = board.owner_email
-         LEFT JOIN project_board_members member ON member.board_id = board.id
-         LEFT JOIN app_users member_user ON member_user.email = member.user_email
-         WHERE owner_user.organization_id = ANY($1::uuid[])
-            OR member_user.organization_id = ANY($1::uuid[])`,
-        resourceParams,
+         WHERE board.workspace_organization_id = ANY($1::uuid[])`,
+        [[...organizationIds]],
       )
-      : await query<{ id: string }>(
+      : actor.organizationId
+        ? await query<{ id: string }>(
+          `SELECT board.id::text FROM project_boards board
+           WHERE board.workspace_organization_id = $2::uuid
+             AND (board.owner_email = $1
+               OR EXISTS (SELECT 1 FROM project_board_members member WHERE member.board_id = board.id AND member.user_email = $1))`,
+          [actor.email, actor.organizationId],
+        )
+        : await query<{ id: string }>(
         `SELECT board.id::text FROM project_boards board
          WHERE board.owner_email = $1
             OR EXISTS (SELECT 1 FROM project_board_members member WHERE member.board_id = board.id AND member.user_email = $1)`,
-        resourceParams,
-      )
+          [actor.email],
+        )
   const pipelineResult = scope === 'organization'
       ? await query<{ id: string }>(
-        `SELECT DISTINCT pipeline.id::text
+        `SELECT pipeline.id::text
          FROM pipeline_spaces pipeline
-         LEFT JOIN app_users owner_user ON owner_user.email = pipeline.owner_email
-         LEFT JOIN pipeline_space_members member ON member.pipeline_id = pipeline.id
-         LEFT JOIN app_users member_user ON member_user.email = member.user_email
-         WHERE pipeline.workspace_organization_id = ANY($1::uuid[])
-            OR owner_user.organization_id = ANY($1::uuid[])
-            OR member_user.organization_id = ANY($1::uuid[])`,
-        resourceParams,
+         WHERE pipeline.workspace_organization_id = ANY($1::uuid[])`,
+        [[...organizationIds]],
       )
-      : await query<{ id: string }>(
+      : actor.organizationId
+        ? await query<{ id: string }>(
+          `SELECT pipeline.id::text FROM pipeline_spaces pipeline
+           WHERE pipeline.workspace_organization_id = $2::uuid
+             AND (pipeline.owner_email = $1
+               OR EXISTS (SELECT 1 FROM pipeline_space_members member WHERE member.pipeline_id = pipeline.id AND member.user_email = $1))`,
+          [actor.email, actor.organizationId],
+        )
+        : await query<{ id: string }>(
         `SELECT pipeline.id::text FROM pipeline_spaces pipeline
          WHERE pipeline.owner_email = $1
             OR EXISTS (SELECT 1 FROM pipeline_space_members member WHERE member.pipeline_id = pipeline.id AND member.user_email = $1)`,
-        resourceParams,
-      )
+          [actor.email],
+        )
 
   return {
     selfEmail: actor.email.toLowerCase(),
@@ -267,13 +345,14 @@ async function readAuditRows(scope: ActivityScope, context: ScopeContext, snapsh
     : scope === 'organization'
       ? `event.organization_id = ANY($1::uuid[]) AND event.created_at <= $2::timestamptz`
       : `(lower(COALESCE(event.actor, '')) = $1 OR lower(COALESCE(event.subject, '')) = $1)
-         AND event.created_at <= $2::timestamptz`
+         AND event.organization_id = ANY($2::uuid[])
+         AND event.created_at <= $3::timestamptz`
   const values = scope === 'global'
     ? [snapshotAt, fetchLimit]
     : scope === 'organization'
       ? [context.organizationIds, snapshotAt, fetchLimit]
-      : [context.selfEmail, snapshotAt, fetchLimit]
-  const limitParameter = scope === 'global' ? '$2' : '$3'
+      : [context.selfEmail, context.organizationIds, snapshotAt, fetchLimit]
+  const limitParameter = scope === 'global' ? '$2' : scope === 'organization' ? '$3' : '$4'
   const result = await query<AuditRow>(
     `SELECT event.id::text, event.actor, actor_user.display_name AS actor_name,
        event.event_type, event.aggregate_type, event.aggregate_id, event.payload,
@@ -295,11 +374,14 @@ async function readAuditRows(scope: ActivityScope, context: ScopeContext, snapsh
   )
   return result.rows.map((row) => {
     const activityModule = eventModule(row.event_type)
+    const crmMetadata = activityModule === 'crm' ? crmAuditRecordMetadata(row) : null
     const details = sanitizeAuditDetails({
       eventType: row.event_type,
       aggregateType: row.aggregate_type,
       aggregateId: row.aggregate_id,
       ...(row.payload || {}),
+      ...(crmMetadata?.recordType ? { recordType: crmMetadata.recordType } : {}),
+      ...(crmMetadata?.referenceCode ? { referenceCode: crmMetadata.referenceCode } : {}),
     })
     const resourceId = typeof row.payload?.pipelineId === 'string' ? row.payload.pipelineId : undefined
     return {
@@ -320,9 +402,9 @@ async function readAuditRows(scope: ActivityScope, context: ScopeContext, snapsh
           : activityModule === 'crm'
           ? {
             section: 'crm',
-            id: typeof row.payload?.referenceCode === 'string' ? row.payload.referenceCode : undefined,
+            id: crmMetadata?.referenceCode || undefined,
             resourceId,
-            label: String(row.payload?.recordTitle || row.payload?.referenceCode || row.aggregate_id || 'CRM record'),
+            label: String(row.payload?.recordTitle || crmMetadata?.referenceCode || row.aggregate_id || 'CRM record'),
           }
           : activityModule === 'agents'
             ? { section: 'agents', id: row.aggregate_id || undefined, label: 'Agent activity' }
@@ -413,8 +495,8 @@ function readPipelineEvents(scope: ActivityScope, context: ScopeContext, snapsho
       if (!['updated', 'moved', 'comment'].includes(activityType)) continue
       const pipelineId = String(row.pipelineId || '')
       const actor = String(row.changedBy || row.actor || 'system')
+      if (!pipelineIds.has(pipelineId)) continue
       if (scope === 'self' && !actorKeys.has(actor.toLowerCase())) continue
-      if (scope === 'organization' && !pipelineIds.has(pipelineId) && !actorKeys.has(actor.toLowerCase())) continue
       const timestamp = String(row.ts || row.timestamp || '')
       if (!Number.isFinite(Date.parse(timestamp))) continue
       if (Date.parse(timestamp) > Date.parse(snapshotAt)) continue

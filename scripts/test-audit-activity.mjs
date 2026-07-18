@@ -26,6 +26,8 @@ const audit = read('app_src/lib/audit.ts')
 assert.ok(audit.includes("event.is_system = true"), 'global scope must select only platform system events')
 assert.ok(audit.includes('event.organization_id = ANY($1::uuid[])'), 'organization scope must use the event-time organization snapshot')
 assert.ok(audit.includes("lower(COALESCE(event.subject, '')) = $1"), 'self scope must include events targeting the user')
+assert.ok(audit.includes('event.organization_id = ANY($2::uuid[])'), 'self scope must remain inside the active workspace')
+assert.ok(audit.includes('if (!pipelineIds.has(pipelineId)) continue'), 'pipeline logs must remain inside the active workspace')
 assert.ok(audit.includes("input.scope === 'global' ? Promise.resolve([])"), 'global system scope must exclude tenant task history')
 assert.ok(audit.includes("input.scope === 'global' ? [] : readPipelineEvents"), 'global system scope must exclude tenant pipeline activity')
 assert.ok(audit.includes("if (scope === 'global')"), 'global system scope must short-circuit tenant resource discovery')
@@ -34,11 +36,28 @@ assert.ok(audit.includes('pipelineIds: []'), 'global system scope must not load 
 assert.ok(audit.includes('SAFE_DETAIL_KEYS'), 'audit DTOs must use a display allowlist')
 assert.ok(audit.includes('SENSITIVE_KEY'), 'audit DTOs must retain defense-in-depth secret redaction')
 assert.ok(!audit.includes("? 'TRUE'"), 'global scope cannot use an unrestricted tenant query')
+for (const fragment of [
+  'effectiveAuthorizationRole(actor)',
+  'effectiveUserPermissions(actor)',
+  'app_user_organization_memberships membership',
+  'board.workspace_organization_id = ANY($1::uuid[])',
+  'pipeline.workspace_organization_id = ANY($1::uuid[])',
+]) {
+  assert.ok(audit.includes(fragment), `activity scope must honor the active workspace through ${fragment}`)
+}
+for (const fragment of [
+  'crmAuditRecordMetadata',
+  'recordType: crmMetadata.recordType',
+  'referenceCode: crmMetadata.referenceCode',
+]) {
+  assert.ok(audit.includes(fragment), `CRM audit DTO missing ${fragment}`)
+}
 
 const writer = read('app_src/lib/auditWriter.ts')
 for (const fragment of ['subject, organization_id, is_system', 'ON CONFLICT (event_key)', 'input.subject', 'input.organizationId']) {
   assert.ok(writer.includes(fragment), `audit writer missing ${fragment}`)
 }
+assert.ok(writer.includes('attribution?.activeWorkspaceOrganizationId'), 'request audit events must inherit the active browser workspace')
 
 const crmAdapter = read('app_src/lib/persistence/crm.ts')
 assert.ok(crmAdapter.includes('referenceCode: row.reference_code'), 'CRM audit rows must carry the navigable Global ID')
@@ -68,6 +87,8 @@ const route = read('app_src/app/api/activity/route.ts')
 for (const fragment of ['parseCursor', "Buffer.from(value, 'base64url')", 'authorizeActivityScope', 'nextCursor']) {
   assert.ok(route.includes(fragment), `activity endpoint missing ${fragment}`)
 }
+const requestUser = read('app_src/lib/requestUser.ts')
+assert.ok(requestUser.includes('session.activeWorkspaceOrganizationId'), 'activity request user must resolve the active workspace membership')
 
 const activityUi = read('app_src/components/activity/ActivityLogPage.tsx')
 for (const fragment of [
@@ -79,9 +100,13 @@ for (const fragment of [
   'activityTargetUrl',
   "url.searchParams.set('pipeline', target.resourceId)",
   'window.location.assign(nextUrl.toString())',
+  'searchableDetailText(event.details)',
+  'Record type:',
+  'Global ID:',
 ]) {
   assert.ok(activityUi.includes(fragment), `activity UI missing ${fragment}`)
 }
+assert.ok(activityUi.includes('append ? [...current, ...nextEvents] : nextEvents'), 'activity pagination must preserve every returned event')
 assert.ok(!activityUi.includes('defaultModule'), 'activity must not default to the currently selected module')
 assert.ok(!activityUi.includes('/api/pipeline/activity'), 'activity must not depend on selected pipeline history')
 

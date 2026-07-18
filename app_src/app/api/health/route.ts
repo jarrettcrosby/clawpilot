@@ -203,6 +203,7 @@ export async function GET() {
           canonical_suitecrm_usernames_migration_applied: boolean
           agent_research_migration_applied: boolean
           toast_integrations_migration_applied: boolean
+          multi_workspace_memberships_migration_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -428,6 +429,11 @@ export async function GET() {
                 FROM schema_migrations
                 WHERE filename = '0059_toast_restaurant_integrations.sql'
               ) AS toast_integrations_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0060_multi_workspace_memberships.sql'
+              ) AS multi_workspace_memberships_migration_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -484,6 +490,7 @@ export async function GET() {
             && row?.canonical_suitecrm_usernames_migration_applied
             && row?.agent_research_migration_applied
             && row?.toast_integrations_migration_applied
+            && row?.multi_workspace_memberships_migration_applied
             && row?.migration_checksums_present
           ),
         }
@@ -532,6 +539,7 @@ export async function GET() {
           || !row?.canonical_suitecrm_usernames_migration_applied
           || !row?.agent_research_migration_applied
           || !row?.toast_integrations_migration_applied
+          || !row?.multi_workspace_memberships_migration_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')

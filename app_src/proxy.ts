@@ -160,6 +160,7 @@ export async function proxy(req: NextRequest) {
       sessionId: session.id,
       authenticatedUser: session.authenticatedUser,
       effectiveUser: session.effectiveUser,
+      activeWorkspaceOrganizationId: session.activeWorkspaceOrganizationId || '',
       impersonating: session.impersonating,
     })
     for (const [key, value] of Object.entries(attribution)) requestHeaders.set(key, value)

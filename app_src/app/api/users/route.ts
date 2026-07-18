@@ -1,19 +1,19 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { disconnectChatGPT } from '@/lib/agents/chatgptAuth'
-import { revokeAllBrowserSessionsForUser } from '@/lib/authSessions'
+import { revokeBrowserSessionsForUserWorkspace } from '@/lib/authSessions'
 import { createUserInvitation } from '@/lib/invitations'
 import {
-  ensurePrimaryWorkspaceOrganization,
   listWorkspaceOrganizationHierarchy,
+  workspaceOrganizationById,
 } from '@/lib/organizations'
 import { ensureDefaultResourcesForUser } from '@/lib/tenancy'
 import { syncAppUserProfileToOwnedPipelines } from '@/lib/persistence/crm'
-import { sessionEmail } from '@/lib/requestUser'
+import { requireRequestUser } from '@/lib/requestUser'
 import {
   AppUserAuthorizationError,
   AppUserNotFoundError,
   canInviteUsers,
   canManageUserAccess,
+  effectiveAuthorizationRole,
   listAppUsers,
   setAppUserStatus,
   updateAppUserAccess,
@@ -30,19 +30,21 @@ function userMutationErrorStatus(error: unknown): number {
 }
 
 export async function GET(req: NextRequest) {
-  const email = await sessionEmail(req)
-  if (!email) return NextResponse.json({ ok: false, error: 'Unauthorized' }, { status: 401 })
-
   try {
-    const currentOrganization = await ensurePrimaryWorkspaceOrganization(email)
-    await ensureDefaultResourcesForUser(email)
-    const { actor, users } = await listAppUsers(email)
-    const workspaceOrganizations = await listWorkspaceOrganizationHierarchy(email)
+    const requestActor = await requireRequestUser(req)
+    const currentOrganization = requestActor.organizationId
+      ? await workspaceOrganizationById(requestActor.organizationId)
+      : null
+    if (!currentOrganization) throw new Error('Active workspace is not available')
+    await ensureDefaultResourcesForUser(requestActor)
+    const { actor, users } = await listAppUsers(requestActor)
+    const workspaceOrganizations = await listWorkspaceOrganizationHierarchy(requestActor)
+    const organizationRole = effectiveAuthorizationRole(actor)
     return NextResponse.json({
       ok: true,
       currentUser: actor,
       currentOrganization,
-      isAdmin: actor.role === 'owner' || actor.role === 'admin',
+      isAdmin: organizationRole === 'owner' || organizationRole === 'admin',
       canInvite: canInviteUsers(actor),
       canManageUserAccess: canManageUserAccess(actor),
       users,
@@ -55,13 +57,11 @@ export async function GET(req: NextRequest) {
 }
 
 export async function POST(req: NextRequest) {
-  const actorEmail = await sessionEmail(req)
-  if (!actorEmail) return NextResponse.json({ ok: false, error: 'Unauthorized' }, { status: 401 })
-
   try {
+    const actor = await requireRequestUser(req)
     const body = await req.json()
     const invitation = await createUserInvitation({
-      actorEmail,
+      actorEmail: actor,
       email: body?.email,
       organizationId: body?.organizationId,
       createOrganization: body?.createOrganization === true,
@@ -82,22 +82,25 @@ export async function POST(req: NextRequest) {
 }
 
 export async function PATCH(req: NextRequest) {
-  const actorEmail = await sessionEmail(req)
-  if (!actorEmail) return NextResponse.json({ ok: false, error: 'Unauthorized' }, { status: 401 })
-
   try {
+    const actor = await requireRequestUser(req)
     const body = await req.json()
     if (body?.action === 'crm-employee') {
       let user = await updateAppUserCrmEmployee({
-        actorEmail,
+        actorEmail: actor,
         email: body.email,
+        organizationId: body.organizationId,
         enabled: body.enabled === true,
       })
       let warning: string | undefined
       let crmIdentitySync: 'queued' | 'not-mapped' = 'not-mapped'
       if (body.enabled === true) {
         try {
-          user = await syncAppUserSuiteCrmIdentity({ actorEmail, email: body.email })
+          user = await syncAppUserSuiteCrmIdentity({
+            actorEmail: actor,
+            email: body.email,
+            organizationId: body.organizationId,
+          })
           crmIdentitySync = 'queued'
         } catch (error) {
           warning = error instanceof Error ? error.message : 'SuiteCRM identity sync is pending'
@@ -106,14 +109,17 @@ export async function PATCH(req: NextRequest) {
       return NextResponse.json({ ok: true, user, crmIdentitySync, warning })
     }
     if (body?.action === 'crm-user-sync') {
-      const user = await syncAppUserSuiteCrmIdentity({ actorEmail, email: body.email })
+      const user = await syncAppUserSuiteCrmIdentity({
+        actorEmail: actor,
+        email: body.email,
+        organizationId: body.organizationId,
+      })
       return NextResponse.json({ ok: true, user, crmIdentitySync: 'queued' })
     }
     if (body?.action === 'profile') {
-      await ensurePrimaryWorkspaceOrganization(actorEmail)
-      await ensureDefaultResourcesForUser(actorEmail)
+      await ensureDefaultResourcesForUser(actor)
       const user = await updateAppUserProfile({
-        actorEmail,
+        actorEmail: actor,
         displayName: body.displayName,
         jobTitle: body.jobTitle,
         organizationName: body.organizationName,
@@ -131,30 +137,37 @@ export async function PATCH(req: NextRequest) {
     }
     if (body?.action === 'access') {
       const user = await updateAppUserAccess({
-        actorEmail,
+        actorEmail: actor,
         email: body.email,
+        organizationId: body.organizationId,
         role: body.role === 'admin' ? 'admin' : body.role === 'member' ? 'member' : undefined,
         permissions: body.permissions,
       })
-      await revokeAllBrowserSessionsForUser({
+      if (!user.organizationId) throw new Error('User workspace assignment is missing')
+      await revokeBrowserSessionsForUserWorkspace({
         userEmail: user.email,
-        actor: actorEmail,
+        organizationId: user.organizationId,
+        actor: actor.email,
         reason: 'access_changed',
       })
       return NextResponse.json({ ok: true, user })
     }
     const status = body?.status === 'active' ? 'active' : body?.status === 'disabled' ? 'disabled' : null
     if (!status) return NextResponse.json({ ok: false, error: 'Valid status required' }, { status: 400 })
-    const user = await setAppUserStatus({ actorEmail, email: body?.email, status })
+    const user = await setAppUserStatus({
+      actorEmail: actor,
+      email: body?.email,
+      organizationId: body?.organizationId,
+      status,
+    })
     if (status === 'disabled') {
-      await Promise.all([
-        disconnectChatGPT(user.email).catch(() => undefined),
-        revokeAllBrowserSessionsForUser({
-          userEmail: user.email,
-          actor: actorEmail,
-          reason: 'account_disabled',
-        }),
-      ])
+      if (!user.organizationId) throw new Error('User workspace assignment is missing')
+      await revokeBrowserSessionsForUserWorkspace({
+        userEmail: user.email,
+        organizationId: user.organizationId,
+        actor: actor.email,
+        reason: 'workspace_access_disabled',
+      })
     }
     return NextResponse.json({ ok: true, user })
   } catch (error) {

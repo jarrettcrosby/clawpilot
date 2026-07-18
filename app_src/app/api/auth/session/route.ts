@@ -5,6 +5,7 @@ import {
   upgradeLegacyRequestSession,
 } from '@/lib/authSessions'
 import { getAppUser, isRootAppOwner } from '@/lib/users'
+import { listWorkspaceMemberships, requireWorkspaceAppUser } from '@/lib/workspaceMemberships'
 
 export async function GET(req: NextRequest) {
   try {
@@ -15,9 +16,10 @@ export async function GET(req: NextRequest) {
       issued = await upgradeLegacyRequestSession(req, session)
       session = issued.session
     }
-    const [authenticatedUser, effectiveUser] = await Promise.all([
+    const [authenticatedUser, effectiveUser, memberships] = await Promise.all([
       getAppUser(session.authenticatedUser),
-      getAppUser(session.effectiveUser),
+      requireWorkspaceAppUser(session.effectiveUser, session.activeWorkspaceOrganizationId),
+      listWorkspaceMemberships(session.effectiveUser),
     ])
     if (!authenticatedUser || authenticatedUser.status !== 'active' || !effectiveUser || effectiveUser.status !== 'active') {
       return NextResponse.json({ ok: false }, { status: 401 })
@@ -39,7 +41,23 @@ export async function GET(req: NextRequest) {
         displayName: effectiveUser.displayName,
         role: effectiveUser.role,
         organizationName: effectiveUser.organizationName,
+        organizationRole: effectiveUser.organizationRole,
       },
+      activeWorkspace: {
+        organizationId: effectiveUser.organizationId,
+        referenceCode: session.activeWorkspaceReferenceCode,
+        name: effectiveUser.organizationName,
+        role: effectiveUser.organizationRole,
+        switchedAt: session.activeWorkspaceSwitchedAt,
+      },
+      availableWorkspaces: memberships.map((membership) => ({
+        organizationId: membership.organizationId,
+        referenceCode: membership.organizationReferenceCode,
+        name: membership.organizationName,
+        organizationType: membership.organizationType,
+        role: membership.role,
+        isDefault: membership.isDefault,
+      })),
       session: {
         id: session.id,
         deviceLabel: session.deviceLabel,

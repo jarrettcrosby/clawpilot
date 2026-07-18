@@ -208,7 +208,8 @@ for (const fragment of [
 const route = read('app_src/app/api/integrations/toast/route.ts')
 for (const fragment of [
   'requireRequestUser',
-  'actor.role !== \'owner\'',
+  'effectiveAuthorizationRole(actor)',
+  "role !== 'owner'",
   'permissions.manageUserAccess',
   'requireManager(actor)',
   "action === 'update-credential'",

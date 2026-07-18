@@ -15,6 +15,20 @@ assert.match(migration, /user_email\s+text\s+PRIMARY KEY\s+REFERENCES\s+app_user
 assert.match(migration, /default_board_id\s+uuid\s+REFERENCES\s+project_boards\s*\(\s*id\s*\)\s+ON DELETE SET NULL/i)
 assert.match(migration, /default_pipeline_id\s+uuid\s+REFERENCES\s+pipeline_spaces\s*\(\s*id\s*\)\s+ON DELETE SET NULL/i)
 
+const multiWorkspaceMigrationPath = 'db/migrations/0060_multi_workspace_memberships.sql'
+assert.ok(fs.existsSync(path.join(root, multiWorkspaceMigrationPath)), `${multiWorkspaceMigrationPath} must exist`)
+const multiWorkspaceMigration = read(multiWorkspaceMigrationPath)
+assert.match(
+  multiWorkspaceMigration,
+  /ALTER TABLE app_user_workspace_preferences[\s\S]*?ADD COLUMN IF NOT EXISTS workspace_organization_id uuid[\s\S]*?ALTER COLUMN workspace_organization_id SET NOT NULL/i,
+  'dashboard preferences must acquire a required workspace organization',
+)
+assert.match(
+  multiWorkspaceMigration,
+  /PRIMARY KEY\s*\(\s*user_email\s*,\s*workspace_organization_id\s*\)/i,
+  'dashboard preferences must be unique per user and workspace',
+)
+
 const dashboard = read('app_src/components/dashboard/DashboardSection.tsx')
 assert.ok(dashboard.includes('/api/workspaces?dashboard=true'), 'dashboard must request its per-user workspace defaults')
 assert.match(dashboard, /new URLSearchParams\(\{ includeCrmCards: ['"]true['"] \}\)/, 'dashboard task requests must include CRM cards')
@@ -38,6 +52,8 @@ assert.doesNotMatch(dashboard, /execution-results\/summary/, 'dashboard must not
 const workspaceRoute = read('app_src/app/api/workspaces/route.ts')
 assert.match(workspaceRoute, /searchParams\.get\(['"]dashboard['"]\)/, 'workspace API must recognize dashboard preference reads')
 assert.match(workspaceRoute, /setDefault/, 'workspace API must recognize durable dashboard selections')
+assert.match(workspaceRoute, /readWorkspacePreferences\(actor\)/, 'workspace API must read defaults in the active workspace')
+assert.match(workspaceRoute, /saveWorkspacePreferences\(\{[\s\S]{0,100}?actorEmail:\s*actor/, 'workspace API must save defaults in the active workspace')
 
 const workspaceSelector = read('app_src/components/workspaces/WorkspaceSelector.tsx')
 assert.match(workspaceSelector, /url\.searchParams\.set\(kind, id\)/, 'workspace selector must keep the selected resource in the URL')
@@ -51,6 +67,28 @@ assert.match(taskRoute, /searchParams\.get\(['"]includeCrmCards['"]\)/, 'task AP
 const pipelineRoute = read('app_src/app/api/pipeline/route.ts')
 assert.match(pipelineRoute, /searchParams\.get\(['"]pipelineId['"]\)/, 'pipeline API must accept an explicit pipelineId')
 
+const tenancy = read('app_src/lib/tenancy.ts')
+assert.match(
+  tenancy,
+  /FROM app_user_workspace_preferences[\s\S]{0,120}?WHERE user_email = \$1 AND workspace_organization_id = \$2::uuid/,
+  'dashboard preference reads must include the active workspace organization',
+)
+assert.match(
+  tenancy,
+  /ON CONFLICT \(user_email, workspace_organization_id\) DO UPDATE SET/,
+  'dashboard preference writes must upsert independently per workspace',
+)
+assert.match(
+  tenancy,
+  /FROM project_boards board[\s\S]{0,900}?WHERE board\.workspace_organization_id = \$2::uuid/,
+  'dashboard boards must be restricted to the active workspace organization',
+)
+assert.match(
+  tenancy,
+  /FROM pipeline_spaces pipeline[\s\S]{0,1800}?WHERE pipeline\.workspace_organization_id = \$2::uuid/,
+  'dashboard pipelines must be restricted to the active workspace organization',
+)
+
 const healthRoute = read('app_src/app/api/health/route.ts')
 const healthAlias = healthRoute.match(
   /WHERE filename = ['"]0041_dashboard_workspace_preferences\.sql['"][\s\S]{0,160}?\)\s+AS\s+([a-z0-9_]+)/i,
@@ -58,12 +96,23 @@ const healthAlias = healthRoute.match(
 assert.ok(healthAlias, 'health must query the 0041 migration')
 const healthChecks = healthRoute.match(new RegExp(`row\\?\\.${healthAlias}`, 'g')) || []
 assert.ok(healthChecks.length >= 2, 'health must require 0041 for current migrations and report it when missing')
+const multiWorkspaceHealthAlias = healthRoute.match(
+  /WHERE filename = ['"]0060_multi_workspace_memberships\.sql['"][\s\S]{0,160}?\)\s+AS\s+([a-z0-9_]+)/i,
+)?.[1]
+assert.ok(multiWorkspaceHealthAlias, 'health must query the 0060 migration')
+const multiWorkspaceHealthChecks = healthRoute.match(new RegExp(`row\\?\\.${multiWorkspaceHealthAlias}`, 'g')) || []
+assert.ok(multiWorkspaceHealthChecks.length >= 2, 'health must require 0060 for current migrations and report it when missing')
 
 const predeploy = read('scripts/verify-predeploy.mjs')
 assert.match(
   predeploy,
   /['"]db\/migrations\/0041_dashboard_workspace_preferences\.sql['"]/,
   'predeploy must require the 0041 migration file',
+)
+assert.match(
+  predeploy,
+  /['"]db\/migrations\/0060_multi_workspace_memberships\.sql['"]/,
+  'predeploy must require the 0060 migration file',
 )
 
 const packageJson = JSON.parse(read('package.json'))

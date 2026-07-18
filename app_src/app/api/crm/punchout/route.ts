@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { suiteCrmPublicUrl } from '@/lib/crm/suiteCrmPublicUrl'
-import { ensurePrimaryWorkspaceOrganization } from '@/lib/organizations'
+import { workspaceOrganizationById } from '@/lib/organizations'
 import { requireRequestUser } from '@/lib/requestUser'
+import { effectiveAuthorizationRole } from '@/lib/users'
 
 const NO_STORE_HEADERS = { 'Cache-Control': 'no-store' }
 
@@ -21,13 +22,22 @@ function errorResponse(error: unknown) {
 export async function GET(req: NextRequest) {
   try {
     const actor = await requireRequestUser(req)
-    if (actor.role !== 'owner' && actor.role !== 'admin') {
+    const role = effectiveAuthorizationRole(actor)
+    if (role !== 'owner' && role !== 'admin') {
       return NextResponse.json(
         { ok: false, error: 'SuiteCRM access requires an owner or administrator' },
         { status: 403, headers: NO_STORE_HEADERS },
       )
     }
-    const organization = await ensurePrimaryWorkspaceOrganization(actor.email)
+    const organization = actor.organizationId
+      ? await workspaceOrganizationById(actor.organizationId)
+      : null
+    if (!organization) {
+      return NextResponse.json(
+        { ok: false, error: 'Active workspace is not available' },
+        { status: 403, headers: NO_STORE_HEADERS },
+      )
+    }
     if (organization.parentId !== null) {
       return NextResponse.json(
         { ok: false, error: 'Native SuiteCRM access is limited to root organization administrators' },

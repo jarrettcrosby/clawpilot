@@ -17,7 +17,7 @@ Turn operating data into private, readable briefs and make shipped changes visib
 
 ## Documents
 
-- Documents are owned by a user and never listed across owners.
+- Documents are owned by a user inside one workspace organization. The same person switching between peer businesses sees separate briefs, snapshots, repository copies, and agent working documents; reads and writes require both the owner email and active organization.
 - ClawPilot generates Build, Project Board, Pipeline, and AI Opportunity briefs for that user's currently selected accessible board and pipeline.
 - Pipeline Briefs combine opportunity state with CRM interactions. They report 30- and 90-day touch volume, email/call/meeting mix, opportunity-link coverage, untouched and stale deals, close-date risk, stage-level touch benchmarks, and a ranked next-action queue. Cadence comparisons use only interactions explicitly linked to an opportunity so one organization-level email is not credited to every open deal.
 - `Above normal` cadence is a review signal rather than an automatic success rating. The brief asks the user to verify that repeated touches are advancing stage, decision ownership, or the close plan.
@@ -34,7 +34,7 @@ Turn operating data into private, readable briefs and make shipped changes visib
 - The owner controls `Local` or `External` from **Settings > Integrations > Knowledge**. The persisted Settings choice takes precedence over the environment bootstrap default and is recorded in the audit log.
 - `External` uses OpenAI semantic embeddings only when the server has a dedicated `OPENAI_EMBEDDING_API_KEY`. The option is unavailable without that key. Enabling it sends document content and semantic search input to the configured external provider and can incur provider usage costs.
 - The general agent API key and each user's ChatGPT/Codex OAuth authorization are never reused for knowledge embeddings. Local remains the baseline unless the owner decides external semantic quality justifies the privacy and cost tradeoff.
-- The AI Opportunity Radar ingests bounded official OpenAI, GitHub, Vercel, and Railway feeds and refreshes each active user's private research brief.
+- The AI Opportunity Radar ingests bounded official OpenAI, GitHub, Vercel, and Railway feeds and refreshes a separate private research brief for each active user membership.
 
 ## Releases
 

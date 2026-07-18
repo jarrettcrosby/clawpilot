@@ -5,6 +5,7 @@ import { verifyAuthMagicCode } from '@/lib/authMagicCode'
 import { queuePipelineProvisioning } from '@/lib/pipelineProvisioning'
 import { syncAppUserProfileToOwnedPipelines } from '@/lib/persistence/crm'
 import { ensureDefaultResourcesForUser } from '@/lib/tenancy'
+import { requireWorkspaceAppUser } from '@/lib/workspaceMemberships'
 
 export async function POST(req: NextRequest) {
   try {
@@ -22,12 +23,13 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: false, error: 'The code is invalid or expired.' }, { status: 401 })
     }
 
-    const resources = await ensureDefaultResourcesForUser(result.email)
+    const actor = await requireWorkspaceAppUser(result.email, result.organizationId)
+    const resources = await ensureDefaultResourcesForUser(actor)
     await syncAppUserProfileToOwnedPipelines(result.email).catch((error) => {
       console.error('[auth] CRM profile projection deferred', error instanceof Error ? error.message : 'unknown error')
     })
     if (resources.pipelineProvisioningRequired) {
-      await queuePipelineProvisioning({ actorEmail: result.email, pipelineId: resources.pipelineId }).catch((error) => {
+      await queuePipelineProvisioning({ actorEmail: actor.email, pipelineId: resources.pipelineId }).catch((error) => {
         console.error('[auth] Personal pipeline Sheet provisioning deferred', error instanceof Error ? error.message : 'unknown error')
       })
     }
@@ -36,10 +38,17 @@ export async function POST(req: NextRequest) {
       email: result.email,
       authMethod: 'magic_code',
       headers: req.headers,
+      organizationId: actor.organizationId,
     })
     const response = NextResponse.json({ ok: true })
     setBrowserSessionCookie(response, issued)
-    await recordAuthActivity({ req, email: result.email, eventType: 'auth.login.succeeded', method: 'magic_code' }).catch(() => undefined)
+    await recordAuthActivity({
+      req,
+      email: result.email,
+      eventType: 'auth.login.succeeded',
+      method: 'magic_code',
+      organizationId: actor.organizationId,
+    }).catch(() => undefined)
     return response
   } catch (error) {
     console.error('[auth] Magic-code verification failed', error instanceof Error ? error.message : 'unknown error')

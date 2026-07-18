@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireRequestUser } from '@/lib/requestUser'
+import type { AppUser } from '@/lib/users'
 import {
   PipelineProvisioningRequestError,
   queuePipelineProvisioning,
@@ -30,23 +31,23 @@ const COOKIE_OPTIONS = {
 }
 
 async function workspacePayload(
-  actorEmail: string,
+  actor: AppUser,
   req: NextRequest,
   selected?: { boardId?: string; pipelineId?: string },
   preferDefaults = false,
 ) {
   const [boards, pipelines, preferences] = await Promise.all([
-    listProjectBoards(actorEmail),
-    listPipelineSpaces(actorEmail),
-    readWorkspacePreferences(actorEmail),
+    listProjectBoards(actor),
+    listPipelineSpaces(actor),
+    readWorkspacePreferences(actor),
   ])
   const requestedBoardId = selected?.boardId || req.cookies.get(BOARD_SELECTION_COOKIE)?.value || ''
   const requestedPipelineId = selected?.pipelineId || req.cookies.get(PIPELINE_SELECTION_COOKIE)?.value || ''
   const defaultBoard = boards.find((board) => board.id === preferences.defaultBoardId)
-    || boards.find((board) => board.ownerEmail === actorEmail && board.isDefault)
+    || boards.find((board) => board.ownerEmail === actor.email && board.isDefault)
     || boards[0]
   const defaultPipeline = pipelines.find((pipeline) => pipeline.id === preferences.defaultPipelineId)
-    || pipelines.find((pipeline) => pipeline.ownerEmail === actorEmail && pipeline.isDefault)
+    || pipelines.find((pipeline) => pipeline.ownerEmail === actor.email && pipeline.isDefault)
     || pipelines[0]
   const selectedBoard = preferDefaults
     ? defaultBoard
@@ -69,6 +70,11 @@ async function workspacePayload(
     selectedPipelineId: selectedPipeline?.id || null,
     defaultBoardId: defaultBoard?.id || null,
     defaultPipelineId: defaultPipeline?.id || null,
+    activeWorkspace: {
+      organizationId: actor.organizationId,
+      name: actor.organizationName,
+      role: actor.organizationRole,
+    },
   }
 }
 
@@ -88,7 +94,7 @@ export async function GET(req: NextRequest) {
   try {
     const actor = await requireRequestUser(req)
     const dashboard = req.nextUrl.searchParams.get('dashboard') === 'true'
-    const payload = await workspacePayload(actor.email, req, undefined, dashboard)
+    const payload = await workspacePayload(actor, req, undefined, dashboard)
     const response = NextResponse.json(payload)
     if (dashboard && payload.selectedBoardId) {
       response.cookies.set(BOARD_SELECTION_COOKIE, payload.selectedBoardId, COOKIE_OPTIONS)
@@ -112,13 +118,13 @@ export async function POST(req: NextRequest) {
     let actionResult: Record<string, unknown> | undefined
 
     if (action === 'create-board') {
-      selectedBoardId = (await createProjectBoard({ actorEmail: actor.email, name: body?.name })).id
+      selectedBoardId = (await createProjectBoard({ actorEmail: actor, name: body?.name })).id
     } else if (action === 'create-pipeline') {
-      selectedPipelineId = (await createPipelineSpace({ actorEmail: actor.email, name: body?.name })).id
+      selectedPipelineId = (await createPipelineSpace({ actorEmail: actor, name: body?.name })).id
     } else if (action === 'select-board') {
-      selectedBoardId = (await resolveProjectBoardAccess({ actorEmail: actor.email, boardId: body?.boardId })).id
+      selectedBoardId = (await resolveProjectBoardAccess({ actorEmail: actor, boardId: body?.boardId })).id
     } else if (action === 'select-pipeline') {
-      selectedPipelineId = (await resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: body?.pipelineId })).id
+      selectedPipelineId = (await resolvePipelineSpaceAccess({ actorEmail: actor, pipelineId: body?.pipelineId })).id
     } else if (action === 'provision-pipeline') {
       const unsupported = Object.keys(body || {}).find((field) => !['action', 'pipelineId'].includes(field))
       if (unsupported) {
@@ -128,42 +134,42 @@ export async function POST(req: NextRequest) {
           'PIPELINE_PROVISIONING_FIELDS_INVALID',
         )
       }
-      const pipeline = await resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: body?.pipelineId })
+      const pipeline = await resolvePipelineSpaceAccess({ actorEmail: actor, pipelineId: body?.pipelineId })
       if (pipeline.ownerEmail !== actor.email || pipeline.accessRole !== 'owner') {
         throw new PipelineProvisioningRequestError('Only the pipeline owner can provision it', 403)
       }
       actionResult = await queuePipelineProvisioning({ actorEmail: actor.email, pipelineId: pipeline.id })
     } else if (action === 'share-board') {
       await shareProjectBoard({
-        actorEmail: actor.email,
+        actorEmail: actor,
         boardId: body?.boardId,
         userEmail: body?.email,
         accessRole: body?.accessRole,
       })
     } else if (action === 'share-pipeline') {
       await sharePipelineSpace({
-        actorEmail: actor.email,
+        actorEmail: actor,
         pipelineId: body?.pipelineId,
         userEmail: body?.email,
         accessRole: body?.accessRole,
       })
     } else if (action === 'remove-board-share') {
-      await removeProjectBoardShare({ actorEmail: actor.email, boardId: body?.boardId, userEmail: body?.email })
+      await removeProjectBoardShare({ actorEmail: actor, boardId: body?.boardId, userEmail: body?.email })
     } else if (action === 'remove-pipeline-share') {
-      await removePipelineShare({ actorEmail: actor.email, pipelineId: body?.pipelineId, userEmail: body?.email })
+      await removePipelineShare({ actorEmail: actor, pipelineId: body?.pipelineId, userEmail: body?.email })
     } else {
       return NextResponse.json({ ok: false, error: 'Unsupported workspace action' }, { status: 400 })
     }
 
     if (body?.setDefault === true && (selectedBoardId || selectedPipelineId)) {
       await saveWorkspacePreferences({
-        actorEmail: actor.email,
+        actorEmail: actor,
         ...(selectedBoardId ? { boardId: selectedBoardId } : {}),
         ...(selectedPipelineId ? { pipelineId: selectedPipelineId } : {}),
       })
     }
 
-    const payload = await workspacePayload(actor.email, req, {
+    const payload = await workspacePayload(actor, req, {
       boardId: selectedBoardId,
       pipelineId: selectedPipelineId,
     })

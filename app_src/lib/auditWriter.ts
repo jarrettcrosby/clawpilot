@@ -54,7 +54,7 @@ export async function recordAuditEvent(input: {
     JSON.stringify(payload),
     input.eventKey || null,
     subject,
-    input.organizationId || null,
+    input.organizationId || attribution?.activeWorkspaceOrganizationId || null,
     input.isSystem === true,
   ]
   if (client) await client.query(sql, values)

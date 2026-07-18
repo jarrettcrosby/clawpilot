@@ -305,16 +305,16 @@ async function resolveTaskBoard(
 ): Promise<ProjectBoard | null> {
   if (!isPostgresTaskStoreEnabled()) return null
   const worker = workerContext === undefined ? await resolveAgentDispatchWorker(req) : workerContext
-  const actorEmail = worker?.operatorId || (await requireRequestUser(req)).email
+  const actor = worker ? worker.actor : await requireRequestUser(req)
   const explicit = new URL(req.url).searchParams.get('boardId')
   if (worker && explicit && explicit !== worker.boardId) throw new Error('Worker board claim mismatch')
   const selected = worker?.boardId || explicit || req.cookies.get(BOARD_SELECTION_COOKIE)?.value || undefined
   let board: ProjectBoard
   try {
-    board = await resolveProjectBoardAccess({ actorEmail, boardId: selected })
+    board = await resolveProjectBoardAccess({ actorEmail: actor, boardId: selected })
   } catch (error) {
     if (explicit || worker) throw error
-    board = await resolveProjectBoardAccess({ actorEmail })
+    board = await resolveProjectBoardAccess({ actorEmail: actor })
   }
   if (requireEdit) requireResourceEditor(board)
   return board
@@ -488,7 +488,7 @@ export async function GET(req: NextRequest) {
       const binding = await resolveCrmBoardBinding(board.id)
       if (binding) {
         const actor = await requireRequestUser(req)
-        await resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: binding.pipeline_id })
+        await resolvePipelineSpaceAccess({ actorEmail: actor, pipelineId: binding.pipeline_id })
       }
       await reconcileCrmBoardProjection({ boardId: board.id })
     }
@@ -746,8 +746,8 @@ export async function PATCH(req: NextRequest) {
   if (board) {
     const binding = await resolveCrmBoardBinding(board.id)
     if (binding) {
-      const actorEmail = workerContext?.operatorId || (await requireRequestUser(req)).email
-      const pipeline = await resolvePipelineSpaceAccess({ actorEmail, pipelineId: binding.pipeline_id })
+      const actor = workerContext?.actor || await requireRequestUser(req)
+      const pipeline = await resolvePipelineSpaceAccess({ actorEmail: actor, pipelineId: binding.pipeline_id })
       requireResourceEditor(pipeline)
     }
   }

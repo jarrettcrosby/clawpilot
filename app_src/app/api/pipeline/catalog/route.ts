@@ -7,6 +7,7 @@ import {
 } from '@/lib/persistence/crm'
 import { isPostgresPipelineStoreEnabled } from '@/lib/persistence/pipeline'
 import { requireRequestUser } from '@/lib/requestUser'
+import type { AppUser } from '@/lib/users'
 import {
   PIPELINE_SELECTION_COOKIE,
   requireResourceEditor,
@@ -98,11 +99,11 @@ function parseCsv(text: string) {
   return rows
 }
 
-async function selectedPipeline(req: NextRequest, actorEmail: string) {
+async function selectedPipeline(req: NextRequest, actor: AppUser) {
   const selected = req.cookies.get(PIPELINE_SELECTION_COOKIE)?.value || undefined
   return selected
-    ? resolvePipelineSpaceAccess({ actorEmail, pipelineId: selected })
-    : resolvePipelineSpaceAccess({ actorEmail })
+    ? resolvePipelineSpaceAccess({ actorEmail: actor, pipelineId: selected })
+    : resolvePipelineSpaceAccess({ actorEmail: actor })
 }
 
 function errorResponse(error: unknown) {
@@ -125,7 +126,7 @@ export async function GET(req: NextRequest) {
   }
   try {
     const actor = await requireRequestUser(req)
-    const pipeline = await selectedPipeline(req, actor.email)
+    const pipeline = await selectedPipeline(req, actor)
     const catalog = await readPipelineCatalogInPostgres({
       pipelineId: pipeline.id,
       actorEmail: actor.email,
@@ -152,7 +153,7 @@ export async function POST(req: NextRequest) {
   }
   try {
     const actor = await requireRequestUser(req)
-    const pipeline = await selectedPipeline(req, actor.email)
+    const pipeline = await selectedPipeline(req, actor)
     requireResourceEditor(pipeline)
 
     const contentType = req.headers.get('content-type') || ''

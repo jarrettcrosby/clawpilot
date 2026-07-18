@@ -26,6 +26,7 @@ Provide a responsive, authenticated ClawPilot workspace with clear user identity
 - Mobile navigation uses a temporary drawer plus compact bottom navigation; secondary modules remain reachable through More in portrait and landscape layouts.
 - Existing active users sign in with a six-digit one-time code.
 - Every successful sign-in creates an independently revocable Postgres browser session. The cookie contains only a random opaque secret; Postgres stores its HMAC hash, authenticated and effective identities, device summary, validated sign-in and last-observed IP addresses reported by the hosting edge, activity timestamps, idle and absolute expiry, revocation state, and bounded support-mode state.
+- Every browser session selects exactly one active workspace organization. A user with more than one active membership can switch businesses from the application header; the server validates the target membership, rotates the session token, audits the change, clears stale board and pipeline selections, and reloads that workspace's defaults. Separate browsers may remain in separate active workspaces for the same user.
 - Owner and administrator sessions expire after one hour without verified user activity; member sessions expire after eight hours without activity. All sessions have a 24-hour absolute limit. Background polling does not extend inactivity by itself.
 - Settings > Security lists the signed-in user's active browsers with their authenticated identity, effective identity during support mode, sign-in address, and last-observed address. The user can revoke one browser or every other browser. Disabling an account or changing its access revokes that user's active browser sessions.
 - New users receive a branded welcome link first. That invitation must be valid before an invitation-purpose sign-in code can activate the account.
@@ -39,6 +40,7 @@ Provide a responsive, authenticated ClawPilot workspace with clear user identity
 - Timestamps are stored in UTC and rendered in the signed-in user's timezone and locale.
 - ChatGPT/Codex authorization is stored per ClawPilot user. One user's credential cannot authorize another user's agent execution.
 - Activity is independent from the selected board or pipeline. Every user can review events they performed and security events targeting their account.
+- CRM Activity entries expose the affected record type and Global ID when available. Separate events for an Account, Contact, Opportunity, Meeting, or Interaction must remain distinct and must not be deleted merely because their human-readable summaries are similar.
 - Opening an activity target first resolves and selects the event's owning board or pipeline, including CRM pipeline records, and then opens the referenced task, document, Global ID, or module. The target action must never depend on whichever project or pipeline happened to be selected before the Activity drawer opened.
 - Administrators with `viewOrganizationAudit` can review the immutable event-time history for their assigned organization subtree. Moving a user or changing a share does not retroactively reclassify an event.
 - Administrators with `viewSystemAudit` can review global platform and worker activity. That scope excludes tenant board, pipeline, CRM, document, and short-link records.
@@ -52,19 +54,23 @@ Provide a responsive, authenticated ClawPilot workspace with clear user identity
 - `app_user_invitations`
 - `auth_magic_codes`
 - `app_sessions`
-  - authenticated and effective user identities plus validated `inet` sign-in and last-observed addresses
-- `app_user_workspace_preferences`, keyed by user email with nullable foreign keys to the default project board and pipeline
-- `app_users.organization_id`, organization hierarchy, global role, and explicit permissions
-- During multi-workspace migration, organization role and permission overrides move to membership records while `app_users.organization_id` remains only a compatibility/default pointer.
+  - authenticated and effective user identities, active workspace organization, and validated `inet` sign-in and last-observed addresses
+- `app_user_organization_memberships`, keyed by user email and organization with membership role, permissions, status, and default preference
+- `app_user_workspace_preferences`, keyed by user email and workspace organization with nullable foreign keys to that workspace's default project board and pipeline
+- `app_documents.workspace_organization_id`, required on every generated, repository, user, and agent document so a person with multiple businesses cannot read documents from another active workspace
+- `app_users.organization_id`, retained only as a compatibility/default pointer; request authorization resolves from the browser session's active organization membership
+- organization hierarchy, global application role, and explicit global permissions
 - `audit_events.subject`, `audit_events.organization_id`, `audit_events.is_system`, and idempotent event keys
 - separate encrypted agent credential database
 
 ## Confirmed Nick Access
 
 - Nick remains assigned to the organization named exactly `Nick's Organization`; that display name is canonical.
+- Express Parcel International DBA EPISCS is a peer root workspace for the configured owner. Creating it grants no EPISCS membership to Olivia, Nick, or any other existing or invited Suburbia user and moves no board, pipeline, CRM, document, short-link, or integration data.
+- Existing and ordinary invited users remain in the Suburbia Sandwich Co tree unless an administrator explicitly selects another organization during invitation. Switching the inviter's browser does not silently reparent an existing user.
 - Nick retains the global application role `admin`; that access assignment is intentional.
 - Global application role and organization data scope are independent. Nick's global admin role permits authorized software-administration functions, while CRM, pipeline, board, document, and short-link data access still resolves through organization relationships and explicit sharing.
 
 ## Security Boundary
 
-An invited account is not a normal active account. Ordinary sign-in rejects invited, disabled, expired, or revoked access. Invitation activation consumes the code and invitation in one database transaction. Settings and administration endpoints enforce both the global privilege and organization boundary instead of trusting client-selected organization IDs. Dashboard defaults are saved only after access to the selected board or pipeline is resolved for the signed-in user. Background agent workers use a separate bearer-secret channel with validated operator and board claims; they never create or reuse browser sessions.
+An invited account is not a normal active account. Ordinary sign-in rejects invited, disabled, expired, or revoked access. Invitation activation consumes the code and invitation in one database transaction and activates the exact invited organization membership. Settings and administration endpoints enforce both the global privilege and active membership boundary instead of trusting client-selected organization IDs. Dashboard defaults are saved only after access to the selected board or pipeline is resolved within the active workspace. Background agent workers use a separate bearer-secret channel with validated operator, organization, and board claims; they never create or reuse browser sessions.

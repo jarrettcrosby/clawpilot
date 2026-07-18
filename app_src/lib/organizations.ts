@@ -6,7 +6,9 @@ import {
   getAppUser,
   normalizeUserEmail,
   requireActiveAppUser,
+  type AppUser,
 } from '@/lib/users'
+import { requireWorkspaceAppUser } from '@/lib/workspaceMemberships'
 
 export type WorkspaceOrganization = {
   id: string
@@ -73,7 +75,7 @@ function toWorkspaceOrganization(row: WorkspaceOrganizationRow): WorkspaceOrgani
   }
 }
 
-async function organizationById(id: string) {
+export async function workspaceOrganizationById(id: string) {
   const result = await query<WorkspaceOrganizationRow>(
     `SELECT organization.id::text, organization.reference_code,
        organization.parent_id::text, parent.name AS parent_name,
@@ -87,6 +89,37 @@ async function organizationById(id: string) {
   return result.rows[0] ? toWorkspaceOrganization(result.rows[0]) : null
 }
 
+async function resolveOrganizationActor(value: AppUser | unknown): Promise<AppUser> {
+  if (value && typeof value === 'object' && typeof (value as AppUser).email === 'string') {
+    const actor = value as AppUser
+    if (actor.organizationId) return requireWorkspaceAppUser(actor.email, actor.organizationId)
+    return requireActiveAppUser(actor.email)
+  }
+  return requireActiveAppUser(value)
+}
+
+async function ensureOrganizationMembership(input: {
+  user: AppUser
+  organizationId: string
+}) {
+  const { user, organizationId } = input
+  if (!user) return
+  await query(
+    `INSERT INTO app_user_organization_memberships (
+       user_email, organization_id, role, permissions, status, is_default,
+       created_by, updated_by, created_at, updated_at
+     )
+     SELECT $1, $2::uuid, $3, $4::jsonb, $5,
+       NOT EXISTS (
+         SELECT 1 FROM app_user_organization_memberships
+         WHERE user_email = $1 AND is_default
+       ),
+       COALESCE($6, $1), $1, now(), now()
+     ON CONFLICT (user_email, organization_id) DO NOTHING`,
+    [user.email, organizationId, user.role, JSON.stringify(user.permissions), user.status, user.invitedBy],
+  )
+}
+
 export async function ensurePrimaryWorkspaceOrganization(
   emailValue: unknown,
   visited = new Set<string>(),
@@ -98,8 +131,9 @@ export async function ensurePrimaryWorkspaceOrganization(
   if (!user || user.status === 'disabled') throw new Error('User access is not available for organization provisioning')
 
   if (user.organizationId) {
-    const current = await organizationById(user.organizationId)
+    const current = await workspaceOrganizationById(user.organizationId)
     if (current) {
+      await ensureOrganizationMembership({ user, organizationId: current.id })
       await query(
         `UPDATE app_users SET organization_name = $2, updated_at = now() WHERE email = $1 AND organization_name IS DISTINCT FROM $2`,
         [email, current.name],
@@ -110,7 +144,7 @@ export async function ensurePrimaryWorkspaceOrganization(
 
   if (user.role !== 'owner' && user.invitedBy) {
     const inviterOrganization = await ensurePrimaryWorkspaceOrganization(user.invitedBy, visited)
-    return withTransaction(async (client) => {
+    const organization = await withTransaction(async (client) => {
       const assigned = await client.query<{ organization_id: string | null }>(
         'SELECT organization_id::text FROM app_users WHERE email = $1 FOR UPDATE',
         [email],
@@ -127,10 +161,12 @@ export async function ensurePrimaryWorkspaceOrganization(
       }
       const organization = organizationId === inviterOrganization.id
         ? inviterOrganization
-        : await organizationById(organizationId)
+        : await workspaceOrganizationById(organizationId)
       if (!organization) throw new Error('User organization is not available')
       return organization
     })
+    await ensureOrganizationMembership({ user, organizationId: organization.id })
+    return organization
   }
 
   const name = defaultOrganizationName({
@@ -174,6 +210,14 @@ export async function ensurePrimaryWorkspaceOrganization(
       [email, organization.id, organization.name],
     )
     await client.query(
+      `INSERT INTO app_user_organization_memberships (
+         user_email, organization_id, role, permissions, status, is_default,
+         created_by, updated_by, created_at, updated_at
+       ) VALUES ($1, $2::uuid, $3, $4::jsonb, $5, true, COALESCE($6, $1), $1, now(), now())
+       ON CONFLICT (user_email, organization_id) DO NOTHING`,
+      [email, organization.id, user.role, JSON.stringify(user.permissions), user.status, user.invitedBy],
+    )
+    await client.query(
       `UPDATE pipeline_spaces SET workspace_organization_id = $2::uuid, updated_at = now() WHERE owner_email = $1`,
       [email, organization.id],
     )
@@ -191,16 +235,19 @@ export async function resolveInvitationWorkspaceOrganization(input: {
   organizationName?: unknown
   parentOrganizationId?: unknown
 }): Promise<{ organization: WorkspaceOrganization; created: boolean }> {
-  const actor = await requireActiveAppUser(input.actorEmail)
+  const actor = await resolveOrganizationActor(input.actorEmail)
   if (!canInviteUsers(actor)) {
     throw new AppUserAuthorizationError('You do not have permission to assign invitation organizations')
   }
-  const current = await ensurePrimaryWorkspaceOrganization(actor.email)
+  const current = actor.organizationId
+    ? await workspaceOrganizationById(actor.organizationId)
+    : await ensurePrimaryWorkspaceOrganization(actor.email)
+  if (!current) throw new Error('Active workspace is not available')
   const createOrganization = input.createOrganization === true
   const requestedId = String(input.organizationId || '').trim()
 
   if (!createOrganization) {
-    const organization = requestedId ? await organizationById(requestedId) : current
+    const organization = requestedId ? await workspaceOrganizationById(requestedId) : current
     if (!organization) throw new Error('Invitation organization was not found')
     const lineage = await workspaceOrganizationAncestors(organization.id)
     if (!lineage.some((candidate) => candidate.id === current.id)) {
@@ -210,7 +257,7 @@ export async function resolveInvitationWorkspaceOrganization(input: {
   }
 
   const parentId = String(input.parentOrganizationId || '').trim() || current.id
-  const parent = await organizationById(parentId)
+  const parent = await workspaceOrganizationById(parentId)
   if (!parent) throw new Error('Parent organization was not found')
   const parentLineage = await workspaceOrganizationAncestors(parent.id)
   if (!parentLineage.some((candidate) => candidate.id === current.id)) {
@@ -306,7 +353,10 @@ export async function retireUnusedWorkspaceOrganization(organizationIdValue: unk
     )
     if (!organization.rows[0]?.parent_id) return
     const inUse = await client.query<{ in_use: boolean }>(
-      `SELECT EXISTS(SELECT 1 FROM app_users WHERE organization_id = $1::uuid)
+      `SELECT EXISTS(
+            SELECT 1 FROM app_user_organization_memberships
+            WHERE organization_id = $1::uuid
+          )
           OR EXISTS(SELECT 1 FROM pipeline_spaces WHERE workspace_organization_id = $1::uuid)
           OR EXISTS(SELECT 1 FROM workspace_organizations WHERE parent_id = $1::uuid)
           OR EXISTS(SELECT 1 FROM crm_organizations WHERE workspace_organization_id = $1::uuid) AS in_use`,
@@ -324,14 +374,17 @@ export async function retireUnusedWorkspaceOrganization(organizationIdValue: unk
 }
 
 export async function updatePrimaryWorkspaceOrganization(input: {
-  actorEmail: unknown
+  actorEmail: AppUser | unknown
   name: unknown
 }) {
-  const actor = await requireActiveAppUser(input.actorEmail)
+  const actor = await resolveOrganizationActor(input.actorEmail)
   if (!canManageUserAccess(actor)) {
     throw new AppUserAuthorizationError('You do not have permission to rename the shared organization')
   }
-  const organization = await ensurePrimaryWorkspaceOrganization(actor.email)
+  const organization = actor.organizationId
+    ? await workspaceOrganizationById(actor.organizationId)
+    : await ensurePrimaryWorkspaceOrganization(actor.email)
+  if (!organization) throw new Error('Active workspace is not available')
   const name = cleanOrganizationName(input.name)
   const result = await withTransaction(async (client) => {
     const updated = await client.query<WorkspaceOrganizationRow>(
@@ -350,9 +403,12 @@ export async function updatePrimaryWorkspaceOrganization(input: {
   return { ...toWorkspaceOrganization(result), parentName: organization.parentName }
 }
 
-export async function listWorkspaceOrganizationHierarchy(actorEmailValue: unknown) {
-  const actor = await requireActiveAppUser(actorEmailValue)
-  const current = await ensurePrimaryWorkspaceOrganization(actor.email)
+export async function listWorkspaceOrganizationHierarchy(actorEmailValue: AppUser | unknown) {
+  const actor = await resolveOrganizationActor(actorEmailValue)
+  const current = actor.organizationId
+    ? await workspaceOrganizationById(actor.organizationId)
+    : await ensurePrimaryWorkspaceOrganization(actor.email)
+  if (!current) throw new Error('Active workspace is not available')
   const canViewAll = canInviteUsers(actor) || canManageUserAccess(actor)
   const result = await query<WorkspaceOrganizationRow>(
     canViewAll
@@ -374,10 +430,12 @@ export async function listWorkspaceOrganizationHierarchy(actorEmailValue: unknow
              SELECT jsonb_agg(jsonb_build_object(
                'email', app_user.email,
                'displayName', app_user.display_name,
-               'role', app_user.role,
-               'status', app_user.status
-             ) ORDER BY app_user.created_at, app_user.email)
-             FROM app_users app_user WHERE app_user.organization_id = tree.id
+               'role', membership.role,
+               'status', membership.status
+             ) ORDER BY membership.created_at, app_user.email)
+             FROM app_user_organization_memberships membership
+             JOIN app_users app_user ON app_user.email = membership.user_email
+             WHERE membership.organization_id = tree.id
            ), '[]'::jsonb) AS members
          FROM organization_tree tree
          LEFT JOIN workspace_organizations parent ON parent.id = tree.parent_id
@@ -389,10 +447,12 @@ export async function listWorkspaceOrganizationHierarchy(actorEmailValue: unknow
              SELECT jsonb_agg(jsonb_build_object(
                'email', app_user.email,
                'displayName', app_user.display_name,
-               'role', app_user.role,
-               'status', app_user.status
-             ) ORDER BY app_user.created_at, app_user.email)
-             FROM app_users app_user WHERE app_user.organization_id = organization.id
+               'role', membership.role,
+               'status', membership.status
+             ) ORDER BY membership.created_at, app_user.email)
+             FROM app_user_organization_memberships membership
+             JOIN app_users app_user ON app_user.email = membership.user_email
+             WHERE membership.organization_id = organization.id
            ), '[]'::jsonb) AS members
          FROM workspace_organizations organization
          LEFT JOIN workspace_organizations parent ON parent.id = organization.parent_id
@@ -425,18 +485,22 @@ export async function workspaceOrganizationAncestors(organizationId: string) {
   return result.rows.map(toWorkspaceOrganization)
 }
 
-export async function workspaceOrganizationRootId(emailValue: unknown) {
-  const organization = await ensurePrimaryWorkspaceOrganization(emailValue)
+export async function workspaceOrganizationRootId(actorValue: AppUser | unknown) {
+  const actor = await resolveOrganizationActor(actorValue)
+  const organization = actor.organizationId
+    ? await workspaceOrganizationById(actor.organizationId)
+    : await ensurePrimaryWorkspaceOrganization(actor.email)
+  if (!organization) throw new Error('Active workspace is not available')
   const ancestors = await workspaceOrganizationAncestors(organization.id)
   return (ancestors.find((candidate) => candidate.parentId === null) || organization).id
 }
 
 export async function updateWorkspaceOrganizationParent(input: {
-  actorEmail: unknown
+  actorEmail: AppUser | unknown
   organizationId: unknown
   parentId: unknown
 }) {
-  const actor = await requireActiveAppUser(input.actorEmail)
+  const actor = await resolveOrganizationActor(input.actorEmail)
   if (!canManageUserAccess(actor)) {
     throw new AppUserAuthorizationError('You do not have permission to manage organization hierarchy')
   }
@@ -444,7 +508,10 @@ export async function updateWorkspaceOrganizationParent(input: {
   const parentId = String(input.parentId || '').trim()
   if (!organizationId || !parentId) throw new Error('Organization and parent organization are required')
   if (organizationId === parentId) throw new Error('An organization cannot be its own parent')
-  const actorOrganization = await ensurePrimaryWorkspaceOrganization(actor.email)
+  const actorOrganization = actor.organizationId
+    ? await workspaceOrganizationById(actor.organizationId)
+    : await ensurePrimaryWorkspaceOrganization(actor.email)
+  if (!actorOrganization) throw new Error('Active workspace is not available')
   if (organizationId === actorOrganization.id) {
     throw new AppUserAuthorizationError('You cannot reparent the organization that defines your admin scope')
   }
@@ -509,5 +576,5 @@ export async function updateWorkspaceOrganizationParent(input: {
       [actor.email, organizationId, JSON.stringify({ parentId })],
     )
   })
-  return listWorkspaceOrganizationHierarchy(actor.email)
+  return listWorkspaceOrganizationHierarchy(actor)
 }

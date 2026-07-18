@@ -167,6 +167,25 @@ function detailValue(value: unknown): string {
   return JSON.stringify(value)
 }
 
+function searchableDetailText(details: Record<string, unknown>): string {
+  return Object.entries(details)
+    .flatMap(([key, value]) => [displayType(key), detailValue(value)])
+    .join(' ')
+}
+
+function crmRecordMetadata(event: ActivityEvent): { recordType: string | null; referenceCode: string | null } | null {
+  if (event.module !== 'crm') return null
+  const recordType = typeof event.details.recordType === 'string' && event.details.recordType.trim()
+    ? event.details.recordType.trim()
+    : null
+  const detailReference = [event.details.referenceCode, event.details.globalId]
+    .find((value) => typeof value === 'string' && value.trim())
+  const referenceCode = typeof detailReference === 'string'
+    ? detailReference.trim()
+    : event.target?.id || null
+  return { recordType, referenceCode }
+}
+
 export default function ActivityLogPage({ onClose }: Props) {
   const dateTimeSettings = useUserDateTime()
   const [events, setEvents] = useState<ActivityEvent[]>([])
@@ -222,18 +241,30 @@ export default function ActivityLogPage({ onClose }: Props) {
   }, [events])
   const unreadCount = useMemo(() => events.filter((event) => !readIds.has(event.id)).length, [events, readIds])
 
-  const filtered = useMemo(() => events.filter((event) => {
-    if (moduleFilter !== 'all' && event.module !== moduleFilter) return false
-    if (typeFilter !== 'all' && event.type !== typeFilter) return false
-    if (actorFilter !== 'all' && event.actor !== actorFilter) return false
-    if (readFilter === 'unread' && readIds.has(event.id)) return false
-    if (readFilter === 'read' && !readIds.has(event.id)) return false
-    if (search) {
-      const haystack = `${event.message} ${event.eventType} ${event.actor} ${event.actorName || ''} ${event.target?.label || ''}`.toLowerCase()
-      if (!haystack.includes(search.toLowerCase())) return false
-    }
-    return true
-  }), [actorFilter, events, moduleFilter, readFilter, readIds, search, typeFilter])
+  const filtered = useMemo(() => {
+    const searchTerm = search.trim().toLowerCase()
+    return events.filter((event) => {
+      if (moduleFilter !== 'all' && event.module !== moduleFilter) return false
+      if (typeFilter !== 'all' && event.type !== typeFilter) return false
+      if (actorFilter !== 'all' && event.actor !== actorFilter) return false
+      if (readFilter === 'unread' && readIds.has(event.id)) return false
+      if (readFilter === 'read' && !readIds.has(event.id)) return false
+      if (searchTerm) {
+        const haystack = [
+          event.message,
+          event.eventType,
+          event.actor,
+          event.actorName,
+          event.target?.label,
+          event.target?.id,
+          event.target?.resourceId,
+          searchableDetailText(event.details),
+        ].filter(Boolean).join(' ').toLowerCase()
+        if (!haystack.includes(searchTerm)) return false
+      }
+      return true
+    })
+  }, [actorFilter, events, moduleFilter, readFilter, readIds, search, typeFilter])
 
   const grouped = useMemo(() => {
     const result: Record<string, ActivityEvent[]> = {}
@@ -406,6 +437,7 @@ export default function ActivityLogPage({ onClose }: Props) {
               const isRead = readIds.has(event.id)
               const isExpanded = expanded.has(event.id)
               const color = TYPE_COLORS[event.type] || '#A8C7FA'
+              const crmMetadata = crmRecordMetadata(event)
               return (
                 <Box key={event.id} sx={{ borderBottom: '1px solid rgba(255,255,255,0.04)', backgroundColor: isRead ? 'transparent' : 'rgba(168,199,250,0.025)' }}>
                   <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.25, px: { xs: 2, sm: 3 }, py: 1.5 }}>
@@ -419,6 +451,17 @@ export default function ActivityLogPage({ onClose }: Props) {
                       <Stack direction="row" spacing={0.75} alignItems="center" flexWrap="wrap">
                         <Typography variant="caption" color="text.disabled" sx={{ fontSize: '0.68rem' }}>{formatTimestamp(event.timestamp, dateTimeSettings)}</Typography>
                         <Chip size="small" label={displayType(event.type)} sx={{ height: 17, fontSize: '0.6rem', borderRadius: 0.75, backgroundColor: `${color}18`, color }} />
+                        {crmMetadata?.recordType && (
+                          <Typography variant="caption" color="text.secondary" sx={{ fontSize: '0.68rem' }}>
+                            <Box component="span" sx={{ color: 'text.disabled' }}>Record type:</Box> {crmMetadata.recordType}
+                          </Typography>
+                        )}
+                        {crmMetadata?.referenceCode && (
+                          <Typography variant="caption" color="text.secondary" sx={{ fontSize: '0.68rem', overflowWrap: 'anywhere' }}>
+                            <Box component="span" sx={{ color: 'text.disabled' }}>Global ID:</Box>{' '}
+                            <Box component="span" sx={{ fontFamily: 'monospace' }}>{crmMetadata.referenceCode}</Box>
+                          </Typography>
+                        )}
                         <Typography variant="caption" sx={{ fontSize: '0.68rem', color: 'rgba(255,255,255,0.35)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: { xs: 150, sm: 260 } }}>{event.target?.label || event.eventType}</Typography>
                       </Stack>
                     </Box>

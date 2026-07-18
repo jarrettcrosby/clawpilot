@@ -31,7 +31,7 @@ async function documentPayload(req: NextRequest, refresh: boolean) {
   if (refresh) await refreshUserBriefs(actor, selection)
   else if (!search) await ensureUserBriefs(actor, selection)
   await syncRepositoryDocuments(actor, { force: refresh })
-  return listUserDocuments(actor.email, search)
+  return listUserDocuments(actor, search)
 }
 
 export async function GET(req: NextRequest) {

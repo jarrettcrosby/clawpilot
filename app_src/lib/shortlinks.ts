@@ -4,8 +4,8 @@ import type { QueryResultRow } from 'pg'
 import { getStorageDriver } from '@/lib/persistence/config'
 import { query, withTransaction } from '@/lib/persistence/postgres'
 import { requireRequestUser } from '@/lib/requestUser'
-import { ensurePrimaryWorkspaceOrganization } from '@/lib/organizations'
-import { effectiveUserPermissions, normalizeUserEmail } from '@/lib/users'
+import { effectiveAuthorizationRole, effectiveUserPermissions, normalizeUserEmail } from '@/lib/users'
+import { requireWorkspaceAppUser } from '@/lib/workspaceMemberships'
 
 const SLUG_PATTERN = /^[a-z0-9][a-z0-9_-]{2,63}$/
 const CRM_REFERENCE_SLUG_PATTERN = /^g[aciklmop][0-9]{7}$/
@@ -244,7 +244,9 @@ export async function resolveShortLinkActor(req: NextRequest): Promise<ShortLink
     }
     let organizationId: string
     try {
-      organizationId = (await ensurePrimaryWorkspaceOrganization(ownerEmail)).id
+      const requestedOrganizationId = String(req.headers.get('x-shortlink-organization') || '').trim()
+      organizationId = (await requireWorkspaceAppUser(ownerEmail, requestedOrganizationId || undefined)).organizationId || ''
+      if (!organizationId) throw new Error('Workspace unavailable')
     } catch {
       throw new ShortLinkRequestError('Authenticated user has no active ClawPilot organization', 403)
     }
@@ -258,12 +260,14 @@ export async function resolveShortLinkActor(req: NextRequest): Promise<ShortLink
   }
 
   const user = await requireRequestUser(req)
+  if (!user.organizationId) throw new ShortLinkRequestError('Active workspace is not available', 403)
   const permissions = effectiveUserPermissions(user)
+  const role = effectiveAuthorizationRole(user)
   return {
     ownerEmail: user.email,
-    organizationId: (await ensurePrimaryWorkspaceOrganization(user.email)).id,
+    organizationId: user.organizationId,
     sourceApp: 'clawpilot',
-    manageOrganization: (user.role === 'owner' || user.role === 'admin') && permissions.manageLinks,
+    manageOrganization: (role === 'owner' || role === 'admin') && permissions.manageLinks,
     service: false,
   }
 }

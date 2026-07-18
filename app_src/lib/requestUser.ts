@@ -1,6 +1,7 @@
 import type { NextRequest } from 'next/server'
 import { resolveRequestSession, type BrowserSession } from '@/lib/authSessions'
 import { OWNER_PERMISSIONS, requireActiveAppUser, type AppUser } from '@/lib/users'
+import { requireWorkspaceAppUser } from '@/lib/workspaceMemberships'
 
 function localDevelopmentUser(): AppUser | null {
   const hosted = Boolean(
@@ -25,6 +26,8 @@ function localDevelopmentUser(): AppUser | null {
     jobTitle: null,
     organizationId: null,
     organizationName: 'Local ClawPilot',
+    organizationRole: 'owner',
+    organizationPermissions: { ...OWNER_PERMISSIONS },
     suiteCrmUserId: null,
     suiteCrmUsername: null,
     timezone: 'America/New_York',
@@ -50,7 +53,9 @@ export async function sessionEmail(req: NextRequest): Promise<string | null> {
 
 export async function requireRequestUser(req: NextRequest): Promise<AppUser> {
   const session = await requestSession(req)
-  if (session?.effectiveUser) return requireActiveAppUser(session.effectiveUser)
+  if (session?.effectiveUser) {
+    return requireWorkspaceAppUser(session.effectiveUser, session.activeWorkspaceOrganizationId)
+  }
   const localUser = localDevelopmentUser()
   if (localUser) return localUser
   throw new Error('Unauthorized')
@@ -60,6 +65,6 @@ export async function requireRequestSession(req: NextRequest): Promise<BrowserSe
   const session = await requestSession(req)
   if (!session) throw new Error('Unauthorized')
   await requireActiveAppUser(session.authenticatedUser)
-  await requireActiveAppUser(session.effectiveUser)
+  await requireWorkspaceAppUser(session.effectiveUser, session.activeWorkspaceOrganizationId)
   return session
 }

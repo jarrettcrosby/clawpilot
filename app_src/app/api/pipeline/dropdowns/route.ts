@@ -67,8 +67,8 @@ export async function GET(req: NextRequest) {
     if (isPostgresPipelineStoreEnabled()) {
       const actor = await requireRequestUser(req)
       const selected = req.cookies.get(PIPELINE_SELECTION_COOKIE)?.value || undefined
-      const pipeline = await resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: selected })
-        .catch(() => resolvePipelineSpaceAccess({ actorEmail: actor.email }))
+      const pipeline = await resolvePipelineSpaceAccess({ actorEmail: actor, pipelineId: selected })
+        .catch(() => resolvePipelineSpaceAccess({ actorEmail: actor }))
       if (!pipeline.syncEnabled) {
         const catalog = await readPipelineDropdownCatalogForSpaceInPostgres(pipeline.id)
         return NextResponse.json({ ok: true, catalog: catalog || { syncedAt: null, source: 'app', dropdowns: {} } })
@@ -92,8 +92,8 @@ export async function PUT(req: NextRequest) {
     if (isPostgresPipelineStoreEnabled()) {
       const actor = await requireRequestUser(req)
       const selected = req.cookies.get(PIPELINE_SELECTION_COOKIE)?.value || undefined
-      const pipeline = await resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: selected })
-        .catch(() => resolvePipelineSpaceAccess({ actorEmail: actor.email }))
+      const pipeline = await resolvePipelineSpaceAccess({ actorEmail: actor, pipelineId: selected })
+        .catch(() => resolvePipelineSpaceAccess({ actorEmail: actor }))
       requireResourceEditor(pipeline)
       const current = await readPipelineDropdownCatalogForSpaceInPostgres(pipeline.id)
       const catalog = mergeEditableWorkflowCatalog(current, body)

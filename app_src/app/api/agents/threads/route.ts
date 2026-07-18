@@ -41,6 +41,7 @@ import {
 } from '@/lib/persistence/agentResearch'
 import { isPostgresTaskStoreEnabled, readTasksFromPostgres, replaceTasksInPostgres } from '@/lib/persistence/tasks'
 import { requireRequestUser } from '@/lib/requestUser'
+import type { AppUser } from '@/lib/users'
 import { resolveAgentDispatchWorker, type AgentDispatchWorkerContext } from '@/lib/workerAuth'
 import {
   BOARD_SELECTION_COOKIE,
@@ -143,12 +144,14 @@ async function upsertPersistedThreadMessage(input: Parameters<typeof upsertThrea
 
 async function resolveOperator(req: NextRequest, allowWorker = false): Promise<{
   operatorId: string
+  actor: AppUser
   worker: AgentDispatchWorkerContext | null
 } | null> {
   try {
     const worker = allowWorker ? await resolveAgentDispatchWorker(req) : null
-    if (worker) return { operatorId: worker.operatorId, worker }
-    return { operatorId: (await requireRequestUser(req)).email, worker: null }
+    if (worker) return { operatorId: worker.operatorId, actor: worker.actor, worker }
+    const actor = await requireRequestUser(req)
+    return { operatorId: actor.email, actor, worker: null }
   } catch {
     return null
   }
@@ -156,7 +159,7 @@ async function resolveOperator(req: NextRequest, allowWorker = false): Promise<{
 
 async function resolveAgentBoard(
   req: NextRequest,
-  operatorId: string,
+  actor: AppUser,
   requireEdit = false,
   worker?: AgentDispatchWorkerContext | null,
 ): Promise<ProjectBoard | null> {
@@ -164,10 +167,10 @@ async function resolveAgentBoard(
   const selected = worker?.boardId || req.cookies.get(BOARD_SELECTION_COOKIE)?.value || undefined
   let board: ProjectBoard
   try {
-    board = await resolveProjectBoardAccess({ actorEmail: operatorId, boardId: selected })
+    board = await resolveProjectBoardAccess({ actorEmail: actor, boardId: selected })
   } catch (error) {
     if (worker?.boardId) throw error
-    board = await resolveProjectBoardAccess({ actorEmail: operatorId })
+    board = await resolveProjectBoardAccess({ actorEmail: actor })
   }
   if (requireEdit) requireResourceEditor(board)
   return board
@@ -271,13 +274,14 @@ async function recordAgentResult(input: {
   taskId: string
   agentId: string
   operatorId: string
+  organizationId: string
   summary: string
   boardId?: string
   dispatchId?: string
   dispatchContinuationDepth?: number
   plan?: AgentTaskExecutionPlan
 }): Promise<{ evidence: AgentTaskExecutionEvidence | null; summary: string; applied: boolean; continuationQueued: boolean }> {
-  const { taskId, agentId, operatorId, summary, boardId, dispatchId, plan } = input
+  const { taskId, agentId, operatorId, organizationId, summary, boardId, dispatchId, plan } = input
   const tasks = await readTasks(boardId)
   const index = tasks.findIndex((task) => String(task.id) === taskId)
   if (index === -1) return { evidence: null, summary, applied: false, continuationQueued: false }
@@ -325,6 +329,7 @@ async function recordAgentResult(input: {
     try {
       document = await appendAgentTaskDocument({
         ownerEmail: operatorId,
+        organizationId,
         boardId,
         taskId,
         taskTitle: task.title,
@@ -605,10 +610,10 @@ function assignmentError(task: Task, agentId: string): string | null {
 export async function GET(req: NextRequest) {
   const resolved = await resolveOperator(req)
   if (!resolved) return NextResponse.json({ ok: false, error: 'Unauthorized' }, { status: 401 })
-  const { operatorId } = resolved
+  const { operatorId, actor } = resolved
   let board: ProjectBoard | null
   try {
-    board = await resolveAgentBoard(req, operatorId)
+    board = await resolveAgentBoard(req, actor)
   } catch (error) {
     return NextResponse.json({ ok: false, error: error instanceof Error ? error.message : 'Board access denied' }, { status: 403 })
   }
@@ -657,10 +662,10 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   const resolved = await resolveOperator(req, true)
   if (!resolved) return NextResponse.json({ ok: false, error: 'Unauthorized' }, { status: 401 })
-  const { operatorId, worker } = resolved
+  const { operatorId, actor, worker } = resolved
   let board: ProjectBoard | null
   try {
-    board = await resolveAgentBoard(req, operatorId, true, worker)
+    board = await resolveAgentBoard(req, actor, true, worker)
   } catch (error) {
     return NextResponse.json({ ok: false, error: error instanceof Error ? error.message : 'Board edit access denied' }, { status: 403 })
   }
@@ -946,6 +951,7 @@ export async function POST(req: NextRequest) {
     try {
       durableAgentContext = formatAgentContextMemories(await readAgentContextMemories({
         operatorId,
+        organizationId: board!.workspaceOrganizationId,
         agentId,
       }))
     } catch (error) {
@@ -954,6 +960,7 @@ export async function POST(req: NextRequest) {
     try {
       taskDocumentContext = await readAgentTaskDocumentContext({
         ownerEmail: operatorId,
+        organizationId: board!.workspaceOrganizationId,
         taskId,
         agentId,
       })
@@ -1116,9 +1123,10 @@ export async function POST(req: NextRequest) {
   const completedAt = new Date().toISOString()
   const recorded: Awaited<ReturnType<typeof recordAgentResult>> = isTaskExecution
     ? await recordAgentResult({
-        taskId,
-        agentId,
-        operatorId,
+      taskId,
+      agentId,
+      operatorId,
+      organizationId: board!.workspaceOrganizationId,
         summary: responseText,
         boardId: board?.id,
         dispatchId,
@@ -1135,7 +1143,12 @@ export async function POST(req: NextRequest) {
     && !(Array.isArray(researchEvidenceContext) && researchEvidenceContext.length > 0)
   ) {
     try {
-      await captureAgentLearning({ operatorId, agentId, responseText })
+      await captureAgentLearning({
+        operatorId,
+        organizationId: board!.workspaceOrganizationId,
+        agentId,
+        responseText,
+      })
     } catch (error) {
       console.error('[agent-threads] durable context write failed', error)
     }

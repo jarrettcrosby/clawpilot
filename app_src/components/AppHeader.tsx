@@ -31,6 +31,7 @@ import ShortcutsModal from '@/components/help/ShortcutsModal'
 import UserAccessDialog from '@/components/settings/UserAccessDialog'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import { formatUserDateTime } from '@/lib/userDateTime'
+import ActiveWorkspaceSwitcher from '@/components/workspaces/ActiveWorkspaceSwitcher'
 
 type ActivityPreview = { id: string }
 
@@ -210,6 +211,7 @@ export default function AppHeader({
           <Typography variant="subtitle1" fontWeight={600} color="text.primary" sx={{ fontSize: '0.95rem', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
             {label}
           </Typography>
+          <ActiveWorkspaceSwitcher />
         </Box>
 
         <Box display="flex" alignItems="center" gap={0.5}>

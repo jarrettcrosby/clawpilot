@@ -13,10 +13,6 @@ type MemoryRow = AgentContextMemory & {
   id: string
 }
 
-type OrganizationRow = {
-  organization_id: string | null
-}
-
 function normalizedLearning(value: unknown): string {
   return String(value || '')
     .replace(/^[-*]\s+/, '')
@@ -57,6 +53,7 @@ export function isShareableAgentLearning(value: unknown): boolean {
 
 export async function readAgentContextMemories(input: {
   operatorId: string
+  organizationId: string
   agentId: ProductAgentId
   limit?: number
 }): Promise<AgentContextMemory[]> {
@@ -70,16 +67,16 @@ export async function readAgentContextMemories(input: {
         AND status = 'active'
         AND (
           (scope = 'shared' AND operator_id IS NULL)
-          OR (scope = 'operator' AND operator_id = $2)
+          OR (scope = 'operator' AND operator_id = $2 AND organization_id = $3::uuid)
         )
       ORDER BY
         CASE scope WHEN 'shared' THEN 0 ELSE 1 END,
         evidence_count DESC,
         updated_at DESC,
         id
-      LIMIT $3
+      LIMIT $4
     `,
-    [input.agentId, operatorId, limit],
+    [input.agentId, operatorId, input.organizationId, limit],
   )
   return result.rows.map((row) => ({ scope: row.scope, content: row.content }))
 }
@@ -100,6 +97,7 @@ export function formatAgentContextMemories(memories: AgentContextMemory[]): stri
 
 export async function captureAgentLearning(input: {
   operatorId: string
+  organizationId: string
   agentId: ProductAgentId
   responseText: string
 }): Promise<{ captured: boolean; shared: boolean }> {
@@ -112,35 +110,36 @@ export async function captureAgentLearning(input: {
   const contentHash = learningHash(content)
 
   return withTransaction(async (client) => {
+    const membership = await client.query(
+      `SELECT 1
+       FROM app_user_organization_memberships
+       WHERE user_email = $1 AND organization_id = $2::uuid AND status = 'active'
+       LIMIT 1`,
+      [operatorId, input.organizationId],
+    )
+    if (!membership.rows[0]) return { captured: false, shared: false }
     await client.query(
       `
         INSERT INTO agent_context_memories (
-          agent_id, scope, operator_id, content, content_hash, status, source, evidence_count
+          agent_id, scope, operator_id, organization_id, content, content_hash, status, source, evidence_count
         )
-        VALUES ($1, 'operator', $2, $3, $4, 'active', 'agent_learning', 1)
-        ON CONFLICT (agent_id, scope, identity_key, content_hash) DO UPDATE SET
+        VALUES ($1, 'operator', $2, $3::uuid, $4, $5, 'active', 'agent_learning', 1)
+        ON CONFLICT (agent_id, scope, identity_key, organization_id, content_hash) DO UPDATE SET
           evidence_count = agent_context_memories.evidence_count + 1,
           updated_at = now()
       `,
-      [input.agentId, operatorId, content, contentHash],
+      [input.agentId, operatorId, input.organizationId, content, contentHash],
     )
 
     if (!isShareableAgentLearning(content)) return { captured: true, shared: false }
 
-    const organization = await client.query<OrganizationRow>(
-      'SELECT organization_id::text FROM app_users WHERE email = $1',
-      [operatorId],
-    )
-    const organizationId = organization.rows[0]?.organization_id
-    if (!organizationId) return { captured: true, shared: false }
-
     const shared = await client.query<{ id: string }>(
       `
         INSERT INTO agent_context_memories (
-          agent_id, scope, operator_id, content, content_hash, status, source, evidence_count
+          agent_id, scope, operator_id, organization_id, content, content_hash, status, source, evidence_count
         )
-        VALUES ($1, 'shared', NULL, $2, $3, 'needs_review', 'agent_learning', 1)
-        ON CONFLICT (agent_id, scope, identity_key, content_hash) DO UPDATE SET
+        VALUES ($1, 'shared', NULL, NULL, $2, $3, 'needs_review', 'agent_learning', 1)
+        ON CONFLICT (agent_id, scope, identity_key, organization_id, content_hash) DO UPDATE SET
           updated_at = now()
         RETURNING id::text
       `,
@@ -155,7 +154,7 @@ export async function captureAgentLearning(input: {
         VALUES ($1::uuid, $2::uuid, $3)
         ON CONFLICT (memory_id, organization_id) DO NOTHING
       `,
-      [memoryId, organizationId, operatorId],
+      [memoryId, input.organizationId, operatorId],
     )
     await client.query(
       `

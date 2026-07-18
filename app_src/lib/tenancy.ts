@@ -17,8 +17,10 @@ import {
   getAppUser,
   normalizeUserEmail,
   requireActiveAppUser,
+  type AppUser,
   type AppUserStatus,
 } from '@/lib/users'
+import { requireWorkspaceAppUser } from '@/lib/workspaceMemberships'
 
 export const BOARD_SELECTION_COOKIE = 'clawpilot_board_id'
 export const PIPELINE_SELECTION_COOKIE = 'clawpilot_pipeline_id'
@@ -35,6 +37,7 @@ export type ProjectBoard = {
   id: string
   name: string
   ownerEmail: string
+  workspaceOrganizationId: string
   isDefault: boolean
   accessRole: ResourceAccessRole
   members: SharedResourceMember[]
@@ -82,6 +85,7 @@ type ProjectBoardRow = {
   id: string
   name: string
   owner_email: string
+  workspace_organization_id: string
   is_default: boolean
   access_role: ResourceAccessRole
   members: ResourceMemberRow[] | null
@@ -141,12 +145,28 @@ function toProjectBoard(row: ProjectBoardRow): ProjectBoard {
     id: row.id,
     name: row.name,
     ownerEmail: row.owner_email,
+    workspaceOrganizationId: row.workspace_organization_id,
     isDefault: row.is_default,
     accessRole: row.access_role,
     members: normalizeMembers(row.members),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   }
+}
+
+type TenantActorInput = AppUser | unknown
+
+function isAppUser(value: unknown): value is AppUser {
+  return Boolean(value && typeof value === 'object' && typeof (value as AppUser).email === 'string')
+}
+
+async function resolveTenantActor(value: TenantActorInput): Promise<AppUser> {
+  if (isAppUser(value) && value.organizationId) {
+    return requireWorkspaceAppUser(value.email, value.organizationId)
+  }
+  const user = await requireActiveAppUser(isAppUser(value) ? value.email : value)
+  const organization = await ensurePrimaryWorkspaceOrganization(user.email)
+  return requireWorkspaceAppUser(user.email, organization.id)
 }
 
 function hostedShortLinkUrl(slug: string | null) {
@@ -231,17 +251,20 @@ async function ensureBasePipelineTemplate(client: PoolClient, pipelineId: string
   )
 }
 
-export async function ensureDefaultResourcesForUser(emailValue: unknown): Promise<{
+export async function ensureDefaultResourcesForUser(emailValue: TenantActorInput): Promise<{
   boardId: string
   pipelineId: string
   crmBoardId: string
   pipelineProvisioningRequired: boolean
 }> {
-  const user = await requireActiveAppUser(emailValue)
-  const organization = await ensurePrimaryWorkspaceOrganization(user.email)
+  const user = await resolveTenantActor(emailValue)
+  if (!user.organizationId) throw new Error('Active workspace is not configured')
+  const organization = { id: user.organizationId, name: user.organizationName || 'Workspace' }
   const ownerEmail = normalizeUserEmail(user.email)
   const configuredOwner = normalizeUserEmail(process.env.APP_LOGIN_EMAIL)
+  const compatibilityUser = await getAppUser(ownerEmail)
   const isConfiguredOwner = ownerEmail === configuredOwner
+    && compatibilityUser?.organizationId === organization.id
 
   return withTransaction(async (client) => {
     await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [organization.id])
@@ -249,15 +272,17 @@ export async function ensureDefaultResourcesForUser(emailValue: unknown): Promis
 
     await client.query(
       `
-        INSERT INTO project_boards (name, owner_email, is_default)
-        VALUES ($1, $2, true)
-        ON CONFLICT (owner_email) WHERE is_default DO NOTHING
+        INSERT INTO project_boards (name, owner_email, workspace_organization_id, is_default)
+        VALUES ($1, $2, $3::uuid, true)
+        ON CONFLICT (owner_email, workspace_organization_id) WHERE is_default DO NOTHING
       `,
-      [isConfiguredOwner ? 'ClawPilot board' : 'My board', ownerEmail],
+      [isConfiguredOwner ? 'ClawPilot board' : 'My board', ownerEmail, organization.id],
     )
     const board = await client.query<{ id: string }>(
-      'SELECT id::text FROM project_boards WHERE owner_email = $1 AND is_default LIMIT 1',
-      [ownerEmail],
+      `SELECT id::text FROM project_boards
+       WHERE owner_email = $1 AND workspace_organization_id = $2::uuid AND is_default
+       LIMIT 1`,
+      [ownerEmail, organization.id],
     )
     if (!board.rows[0]) throw new Error('Unable to provision a project board')
 
@@ -272,10 +297,10 @@ export async function ensureDefaultResourcesForUser(emailValue: unknown): Promis
     let personalPipeline = await client.query<PipelineResourceRow>(
       `SELECT id::text, owner_email, provisioning_status, sheet_id, short_link_id::text, sync_enabled
        FROM pipeline_spaces
-       WHERE owner_email = $1 AND is_default
+       WHERE owner_email = $1 AND workspace_organization_id = $2::uuid AND is_default
        LIMIT 1
        FOR UPDATE`,
-      [ownerEmail],
+      [ownerEmail, organization.id],
     )
 
     if (!personalPipeline.rows[0]) {
@@ -317,22 +342,28 @@ export async function ensureDefaultResourcesForUser(emailValue: unknown): Promis
     if (!crmPipeline.rows[0]) throw new Error('Unable to provision an organization CRM pipeline')
 
     await client.query(
-      `INSERT INTO project_boards (name, owner_email, is_default, created_at, updated_at)
-       SELECT 'CRM Board', $1, false, now(), now()
+      `INSERT INTO project_boards (
+         name, owner_email, workspace_organization_id, is_default, created_at, updated_at
+       )
+       SELECT 'CRM Board', $1, $2::uuid, false, now(), now()
        WHERE NOT EXISTS (
          SELECT 1 FROM project_boards
-         WHERE owner_email = $1 AND lower(btrim(name)) = 'crm board'
+         WHERE owner_email = $1
+           AND workspace_organization_id = $2::uuid
+           AND lower(btrim(name)) = 'crm board'
        )`,
-      [ownerEmail],
+      [ownerEmail, organization.id],
     )
     const crmBoard = await client.query<{ id: string }>(
       `SELECT id::text
        FROM project_boards
-       WHERE owner_email = $1 AND lower(btrim(name)) = 'crm board'
+       WHERE owner_email = $1
+         AND workspace_organization_id = $2::uuid
+         AND lower(btrim(name)) = 'crm board'
        ORDER BY created_at, id
        LIMIT 1
        FOR UPDATE`,
-      [ownerEmail],
+      [ownerEmail, organization.id],
     )
     if (!crmBoard.rows[0]) throw new Error('Unable to provision a CRM board')
 
@@ -406,15 +437,17 @@ export async function ensureDefaultResourcesForUser(emailValue: unknown): Promis
   })
 }
 
-export async function listProjectBoards(actorEmailValue: unknown): Promise<ProjectBoard[]> {
-  const actor = await requireActiveAppUser(actorEmailValue)
-  await ensureDefaultResourcesForUser(actor.email)
+export async function listProjectBoards(actorEmailValue: TenantActorInput): Promise<ProjectBoard[]> {
+  const actor = await resolveTenantActor(actorEmailValue)
+  if (!actor.organizationId) throw new Error('Active workspace is not configured')
+  await ensureDefaultResourcesForUser(actor)
   const result = await query<ProjectBoardRow>(
     `
       SELECT
         board.id::text,
         board.name,
         board.owner_email,
+        board.workspace_organization_id::text,
         board.is_default,
         CASE WHEN board.owner_email = $1 THEN 'owner' ELSE membership.access_role END AS access_role,
         CASE WHEN board.owner_email = $1 THEN COALESCE((
@@ -434,19 +467,21 @@ export async function listProjectBoards(actorEmailValue: unknown): Promise<Proje
       LEFT JOIN project_board_members membership
         ON membership.board_id = board.id
        AND membership.user_email = $1
-      WHERE board.owner_email = $1 OR membership.user_email = $1
+      WHERE board.workspace_organization_id = $2::uuid
+        AND (board.owner_email = $1 OR membership.user_email = $1)
       ORDER BY
         CASE WHEN board.owner_email = $1 AND board.is_default THEN 0 WHEN board.owner_email = $1 THEN 1 ELSE 2 END,
         board.created_at ASC
     `,
-    [actor.email],
+    [actor.email, actor.organizationId],
   )
   return result.rows.map(toProjectBoard)
 }
 
-export async function listPipelineSpaces(actorEmailValue: unknown): Promise<PipelineSpace[]> {
-  const actor = await requireActiveAppUser(actorEmailValue)
-  await ensureDefaultResourcesForUser(actor.email)
+export async function listPipelineSpaces(actorEmailValue: TenantActorInput): Promise<PipelineSpace[]> {
+  const actor = await resolveTenantActor(actorEmailValue)
+  if (!actor.organizationId) throw new Error('Active workspace is not configured')
+  await ensureDefaultResourcesForUser(actor)
   const result = await query<PipelineSpaceRow>(
     `
       SELECT
@@ -494,7 +529,8 @@ export async function listPipelineSpaces(actorEmailValue: unknown): Promise<Pipe
        AND membership.user_email = $1
       LEFT JOIN short_links short_link
         ON short_link.id = pipeline.short_link_id
-      WHERE pipeline.owner_email = $1 OR membership.user_email = $1
+      WHERE pipeline.workspace_organization_id = $2::uuid
+        AND (pipeline.owner_email = $1 OR membership.user_email = $1)
       ORDER BY
         CASE
           WHEN EXISTS (
@@ -511,18 +547,19 @@ export async function listPipelineSpaces(actorEmailValue: unknown): Promise<Pipe
         END,
         pipeline.created_at ASC
     `,
-    [actor.email],
+    [actor.email, actor.organizationId],
   )
   return result.rows.map(toPipelineSpace)
 }
 
-export async function readWorkspacePreferences(actorEmailValue: unknown): Promise<WorkspacePreferences> {
-  const actor = await requireActiveAppUser(actorEmailValue)
+export async function readWorkspacePreferences(actorEmailValue: TenantActorInput): Promise<WorkspacePreferences> {
+  const actor = await resolveTenantActor(actorEmailValue)
+  if (!actor.organizationId) throw new Error('Active workspace is not configured')
   const result = await query<WorkspacePreferencesRow>(
     `SELECT default_board_id::text, default_pipeline_id::text
      FROM app_user_workspace_preferences
-     WHERE user_email = $1`,
-    [actor.email],
+     WHERE user_email = $1 AND workspace_organization_id = $2::uuid`,
+    [actor.email, actor.organizationId],
   )
   return {
     defaultBoardId: result.rows[0]?.default_board_id || null,
@@ -531,33 +568,34 @@ export async function readWorkspacePreferences(actorEmailValue: unknown): Promis
 }
 
 export async function saveWorkspacePreferences(input: {
-  actorEmail: unknown
+  actorEmail: TenantActorInput
   boardId?: unknown
   pipelineId?: unknown
 }): Promise<WorkspacePreferences> {
-  const actor = await requireActiveAppUser(input.actorEmail)
+  const actor = await resolveTenantActor(input.actorEmail)
+  if (!actor.organizationId) throw new Error('Active workspace is not configured')
   const hasBoard = input.boardId !== undefined
   const hasPipeline = input.pipelineId !== undefined
   if (!hasBoard && !hasPipeline) throw new Error('A dashboard board or pipeline is required')
 
   const board = hasBoard
-    ? await resolveProjectBoardAccess({ actorEmail: actor.email, boardId: input.boardId })
+    ? await resolveProjectBoardAccess({ actorEmail: actor, boardId: input.boardId })
     : null
   const pipeline = hasPipeline
-    ? await resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: input.pipelineId })
+    ? await resolvePipelineSpaceAccess({ actorEmail: actor, pipelineId: input.pipelineId })
     : null
 
   await withTransaction(async (client) => {
     await client.query(
       `INSERT INTO app_user_workspace_preferences (
-         user_email, default_board_id, default_pipeline_id, created_at, updated_at
+         user_email, workspace_organization_id, default_board_id, default_pipeline_id, created_at, updated_at
        )
-       VALUES ($1, $2::uuid, $3::uuid, now(), now())
-       ON CONFLICT (user_email) DO UPDATE SET
+       VALUES ($1, $2::uuid, $3::uuid, $4::uuid, now(), now())
+       ON CONFLICT (user_email, workspace_organization_id) DO UPDATE SET
          default_board_id = COALESCE(EXCLUDED.default_board_id, app_user_workspace_preferences.default_board_id),
          default_pipeline_id = COALESCE(EXCLUDED.default_pipeline_id, app_user_workspace_preferences.default_pipeline_id),
          updated_at = now()`,
-      [actor.email, board?.id || null, pipeline?.id || null],
+      [actor.email, actor.organizationId, board?.id || null, pipeline?.id || null],
     )
     await recordAuditEvent({
       actor: actor.email,
@@ -573,32 +611,34 @@ export async function saveWorkspacePreferences(input: {
     }, client)
   })
 
-  return readWorkspacePreferences(actor.email)
+  return readWorkspacePreferences(actor)
 }
 
 export async function resolveProjectBoardAccess(input: {
-  actorEmail: unknown
+  actorEmail: TenantActorInput
   boardId?: unknown
 }): Promise<ProjectBoard> {
-  const boards = await listProjectBoards(input.actorEmail)
   const requested = String(input.boardId || '').trim()
+  const actorInput = input.actorEmail
+  const boards = await listProjectBoards(actorInput)
   if (requested) {
     const board = boards.find((candidate) => candidate.id === requested)
     if (!board) throw new Error('Project board access denied')
     return board
   }
-  const actor = normalizeUserEmail(input.actorEmail)
-  const fallback = boards.find((board) => board.ownerEmail === actor && board.isDefault) || boards[0]
+  const actor = await resolveTenantActor(actorInput)
+  const fallback = boards.find((board) => board.ownerEmail === actor.email && board.isDefault) || boards[0]
   if (!fallback) throw new Error('No project board is available')
   return fallback
 }
 
 export async function resolvePipelineSpaceAccess(input: {
-  actorEmail: unknown
+  actorEmail: TenantActorInput
   pipelineId?: unknown
 }): Promise<PipelineSpace> {
-  const pipelines = await listPipelineSpaces(input.actorEmail)
   const requested = String(input.pipelineId || '').trim()
+  const actorInput = input.actorEmail
+  const pipelines = await listPipelineSpaces(actorInput)
   if (requested) {
     const pipeline = pipelines.find((candidate) => candidate.id === requested)
     if (!pipeline) throw new Error('Pipeline access denied')
@@ -638,14 +678,17 @@ export function isLegacyOwnerSheetPipeline(
   )
 }
 
-export async function createProjectBoard(input: { actorEmail: unknown; name: unknown }): Promise<ProjectBoard> {
-  const actor = await requireActiveAppUser(input.actorEmail)
+export async function createProjectBoard(input: { actorEmail: TenantActorInput; name: unknown }): Promise<ProjectBoard> {
+  const actor = await resolveTenantActor(input.actorEmail)
+  if (!actor.organizationId) throw new Error('Active workspace is not configured')
   if (!effectiveUserPermissions(actor).createBoards) throw new Error('You do not have permission to create boards')
   const name = cleanResourceName(input.name, 'New board')
   const boardId = await withTransaction(async (client) => {
     const result = await client.query<{ id: string }>(
-      'INSERT INTO project_boards (name, owner_email) VALUES ($1, $2) RETURNING id::text',
-      [name, actor.email],
+      `INSERT INTO project_boards (name, owner_email, workspace_organization_id)
+       VALUES ($1, $2, $3::uuid)
+       RETURNING id::text`,
+      [name, actor.email, actor.organizationId],
     )
     await recordAuditEvent({
       actor: actor.email,
@@ -657,20 +700,20 @@ export async function createProjectBoard(input: { actorEmail: unknown; name: unk
     }, client)
     return result.rows[0].id
   })
-  return resolveProjectBoardAccess({ actorEmail: actor.email, boardId })
+  return resolveProjectBoardAccess({ actorEmail: actor, boardId })
 }
 
-export async function createPipelineSpace(input: { actorEmail: unknown; name: unknown }): Promise<PipelineSpace> {
-  const actor = await requireActiveAppUser(input.actorEmail)
+export async function createPipelineSpace(input: { actorEmail: TenantActorInput; name: unknown }): Promise<PipelineSpace> {
+  const actor = await resolveTenantActor(input.actorEmail)
+  if (!actor.organizationId) throw new Error('Active workspace is not configured')
   if (!effectiveUserPermissions(actor).createPipelines) throw new Error('You do not have permission to create pipelines')
   const name = cleanResourceName(input.name, 'New pipeline')
-  const organization = await ensurePrimaryWorkspaceOrganization(actor.email)
   const pipelineId = await withTransaction(async (client) => {
     const result = await client.query<{ id: string }>(
       `INSERT INTO pipeline_spaces (name, owner_email, workspace_organization_id)
        VALUES ($1, $2, $3::uuid)
        RETURNING id::text`,
-      [name, actor.email, organization.id],
+      [name, actor.email, actor.organizationId],
     )
     await ensureBasePipelineTemplate(client, result.rows[0].id)
     await recordAuditEvent({
@@ -678,19 +721,27 @@ export async function createPipelineSpace(input: { actorEmail: unknown; name: un
       eventType: 'pipeline.space.created',
       aggregateType: 'pipeline_space',
       aggregateId: result.rows[0].id,
-      organizationId: organization.id,
-      payload: { name, pipelineId: result.rows[0].id, organizationId: organization.id },
+      organizationId: actor.organizationId,
+      payload: { name, pipelineId: result.rows[0].id, organizationId: actor.organizationId },
     }, client)
     return result.rows[0].id
   })
-  return resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId })
+  return resolvePipelineSpaceAccess({ actorEmail: actor, pipelineId })
 }
 
-async function validateShareTarget(actorEmail: string, targetEmailValue: unknown) {
+async function validateShareTarget(actor: AppUser, targetEmailValue: unknown) {
   const targetEmail = normalizeUserEmail(targetEmailValue)
-  if (targetEmail === actorEmail) throw new Error('The owner already has access')
+  if (targetEmail === actor.email) throw new Error('The owner already has access')
   const target = await getAppUser(targetEmail)
   if (!target || target.status === 'disabled') throw new Error('Invite or restore this user before sharing')
+  const membership = await query<{ allowed: boolean }>(
+    `SELECT EXISTS (
+       SELECT 1 FROM app_user_organization_memberships
+       WHERE user_email = $1 AND organization_id = $2::uuid AND status = 'active'
+     ) AS allowed`,
+    [targetEmail, actor.organizationId],
+  )
+  if (!membership.rows[0]?.allowed) throw new Error('User must belong to the active business before sharing')
   return target
 }
 
@@ -699,15 +750,15 @@ function normalizeShareRole(value: unknown): 'editor' | 'viewer' {
 }
 
 export async function shareProjectBoard(input: {
-  actorEmail: unknown
+  actorEmail: TenantActorInput
   boardId: unknown
   userEmail: unknown
   accessRole: unknown
 }): Promise<ProjectBoard> {
-  const actor = await requireActiveAppUser(input.actorEmail)
-  const board = await resolveProjectBoardAccess({ actorEmail: actor.email, boardId: input.boardId })
+  const actor = await resolveTenantActor(input.actorEmail)
+  const board = await resolveProjectBoardAccess({ actorEmail: actor, boardId: input.boardId })
   if (board.ownerEmail !== actor.email) throw new Error('Only the board owner can share it')
-  const target = await validateShareTarget(actor.email, input.userEmail)
+  const target = await validateShareTarget(actor, input.userEmail)
   const accessRole = normalizeShareRole(input.accessRole)
   await withTransaction(async (client) => {
     await client.query(
@@ -728,19 +779,19 @@ export async function shareProjectBoard(input: {
       payload: { userEmail: target.email, accessRole, organizationId: actor.organizationId },
     }, client)
   })
-  return resolveProjectBoardAccess({ actorEmail: actor.email, boardId: board.id })
+  return resolveProjectBoardAccess({ actorEmail: actor, boardId: board.id })
 }
 
 export async function sharePipelineSpace(input: {
-  actorEmail: unknown
+  actorEmail: TenantActorInput
   pipelineId: unknown
   userEmail: unknown
   accessRole: unknown
 }): Promise<PipelineSpace> {
-  const actor = await requireActiveAppUser(input.actorEmail)
-  const pipeline = await resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: input.pipelineId })
+  const actor = await resolveTenantActor(input.actorEmail)
+  const pipeline = await resolvePipelineSpaceAccess({ actorEmail: actor, pipelineId: input.pipelineId })
   if (pipeline.ownerEmail !== actor.email) throw new Error('Only the pipeline owner can share it')
-  const target = await validateShareTarget(actor.email, input.userEmail)
+  const target = await validateShareTarget(actor, input.userEmail)
   const accessRole = normalizeShareRole(input.accessRole)
   await withTransaction(async (client) => {
     await client.query(
@@ -764,16 +815,16 @@ export async function sharePipelineSpace(input: {
       payload: { pipelineId: pipeline.id, userEmail: target.email, accessRole, organizationId: pipeline.workspaceOrganizationId },
     }, client)
   })
-  return resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: pipeline.id })
+  return resolvePipelineSpaceAccess({ actorEmail: actor, pipelineId: pipeline.id })
 }
 
 export async function removeProjectBoardShare(input: {
-  actorEmail: unknown
+  actorEmail: TenantActorInput
   boardId: unknown
   userEmail: unknown
 }): Promise<ProjectBoard> {
-  const actor = await requireActiveAppUser(input.actorEmail)
-  const board = await resolveProjectBoardAccess({ actorEmail: actor.email, boardId: input.boardId })
+  const actor = await resolveTenantActor(input.actorEmail)
+  const board = await resolveProjectBoardAccess({ actorEmail: actor, boardId: input.boardId })
   if (board.ownerEmail !== actor.email) throw new Error('Only the board owner can change sharing')
   const userEmail = normalizeUserEmail(input.userEmail)
   await withTransaction(async (client) => {
@@ -787,16 +838,16 @@ export async function removeProjectBoardShare(input: {
       payload: { userEmail, organizationId: actor.organizationId },
     }, client)
   })
-  return resolveProjectBoardAccess({ actorEmail: actor.email, boardId: board.id })
+  return resolveProjectBoardAccess({ actorEmail: actor, boardId: board.id })
 }
 
 export async function removePipelineShare(input: {
-  actorEmail: unknown
+  actorEmail: TenantActorInput
   pipelineId: unknown
   userEmail: unknown
 }): Promise<PipelineSpace> {
-  const actor = await requireActiveAppUser(input.actorEmail)
-  const pipeline = await resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: input.pipelineId })
+  const actor = await resolveTenantActor(input.actorEmail)
+  const pipeline = await resolvePipelineSpaceAccess({ actorEmail: actor, pipelineId: input.pipelineId })
   if (pipeline.ownerEmail !== actor.email) throw new Error('Only the pipeline owner can change sharing')
   const userEmail = normalizeUserEmail(input.userEmail)
   await withTransaction(async (client) => {
@@ -814,7 +865,7 @@ export async function removePipelineShare(input: {
       payload: { pipelineId: pipeline.id, userEmail, organizationId: pipeline.workspaceOrganizationId },
     }, client)
   })
-  return resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: pipeline.id })
+  return resolvePipelineSpaceAccess({ actorEmail: actor, pipelineId: pipeline.id })
 }
 
 export async function readPipelineProjectionForSpace(space: PipelineSpace): Promise<PipelineProjection> {

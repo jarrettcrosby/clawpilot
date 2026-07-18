@@ -35,8 +35,8 @@ export async function GET(req: NextRequest) {
     if (isPostgresPipelineStoreEnabled()) {
       const actor = await requireRequestUser(req)
       const selected = req.cookies.get(PIPELINE_SELECTION_COOKIE)?.value || undefined
-      const pipeline = await resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: selected })
-        .catch(() => resolvePipelineSpaceAccess({ actorEmail: actor.email }))
+      const pipeline = await resolvePipelineSpaceAccess({ actorEmail: actor, pipelineId: selected })
+        .catch(() => resolvePipelineSpaceAccess({ actorEmail: actor }))
       selectedPipelineId = pipeline.id
       includeLegacyEvents = pipeline.sheetBacked
     }
