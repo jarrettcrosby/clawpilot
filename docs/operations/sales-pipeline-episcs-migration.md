@@ -23,6 +23,8 @@ Suburbia user memberships remain Suburbia memberships. CRM organization projecti
 
 The Sales root CRM row receives the existing EPISCS Account identity. The placeholder root receives the existing Suburbia Account identity. Global IDs and SuiteCRM IDs are exchanged with their business identities rather than reallocated. Customer parent relationships, root contacts, root interactions, and root meetings are restaged through the SuiteCRM outbox. The Google workbook is queued for EPISCS branding after commit.
 
+When one canonical Contact is projected into both business roots, Suburbia is staged first and EPISCS is staged last. This preserves the local Suburbia projection while making EPISCS the final SuiteCRM primary Account for the Contact represented in the migrated Sales pipeline.
+
 ## Safety Contract
 
 - The command is a dry run unless `--apply` is supplied.
@@ -55,6 +57,18 @@ npm run crm:migrate-sales-to-episcs -- --apply --json
 ```
 
 Run development first. Promote the tested command through the normal `dev` to `main` pull request before production execution.
+
+For an environment migrated before the root-contact ordering safeguard was deployed, queue the bounded finalization after the normal migration reports `already-complete`:
+
+```bash
+CLAWPILOT_MIGRATION_ACTOR='operator@example.com' \
+CLAWPILOT_MIGRATION_ENVIRONMENT='production' \
+CLAWPILOT_EPISCS_MIGRATION_CONFIRM='MOVE_SALES_PIPELINE_TO_EPISCS' \
+DATABASE_URL='resolved Railway Postgres URL' \
+npm run crm:migrate-sales-to-episcs -- --apply --finalize-root-contacts --json
+```
+
+The finalization has its own idempotency keys. A repeated successful run reports `already-complete` and does not requeue the Contacts.
 
 ## Verify
 

@@ -12,10 +12,12 @@ const PLACEHOLDER_PIPELINE_NAME = 'My pipeline'
 const CONFIRMATION = 'MOVE_SALES_PIPELINE_TO_EPISCS'
 const LOCK_KEY = 'clawpilot:sales-pipeline-to-episcs:v1'
 const MIGRATION_VERSION = 'v1'
+const CONTACT_FINALIZATION_PHASE = 'root-contact-finalization'
 
 function parseArgs(argv) {
   return {
     apply: argv.includes('--apply'),
+    finalizeRootContacts: argv.includes('--finalize-root-contacts'),
     json: argv.includes('--json'),
   }
 }
@@ -421,7 +423,7 @@ async function enqueueSuiteCrmMigration(client, input) {
       `crm_${input.entity}`,
       input.id,
       JSON.stringify(payload),
-      `crm:workspace-transfer:${MIGRATION_VERSION}:${input.entity}:${input.id}:${input.workspaceId}`,
+      `crm:workspace-transfer:${MIGRATION_VERSION}:${input.idempotencyPhase ? `${input.idempotencyPhase}:` : ''}${input.entity}:${input.id}:${input.workspaceId}`,
     ],
   )
 }
@@ -470,15 +472,16 @@ async function stageOrganizationRelationships(client, pipelineId, organizationId
   return rows.length
 }
 
-async function stageRootContacts(client, pipelineId, rootId, workspaceId) {
+async function stageRootContacts(client, pipelineId, rootId, workspaceId, options = {}) {
   const rows = await queryRows(
     client,
     `SELECT contact.*, organization.suitecrm_id AS organization_suitecrm_id
      FROM crm_contacts contact
      JOIN crm_organizations organization ON organization.id = contact.organization_id
      WHERE contact.pipeline_id = $1::uuid AND contact.organization_id = $2::uuid
+       AND ($3::uuid[] IS NULL OR contact.id = ANY($3::uuid[]))
      ORDER BY contact.id`,
-    [pipelineId, rootId],
+    [pipelineId, rootId, options.contactIds?.length ? options.contactIds : null],
   )
   for (const row of rows) {
     const payload = await latestSuiteCrmPayload(client, row.id) || { attributes: {} }
@@ -503,6 +506,7 @@ async function stageRootContacts(client, pipelineId, rootId, workspaceId) {
     await enqueueSuiteCrmMigration(client, {
       entity: 'contacts', pipelineId, id: row.id, suiteCrmId: row.suitecrm_id,
       referenceCode: row.reference_code, workspaceId, payload,
+      idempotencyPhase: options.idempotencyPhase,
     })
   }
   if (rows.length > 0) {
@@ -513,6 +517,71 @@ async function stageRootContacts(client, pipelineId, rootId, workspaceId) {
     )
   }
   return rows.length
+}
+
+async function finalizeRootContacts(client, context, environmentName) {
+  const contacts = await queryRows(
+    client,
+    `SELECT id::text, reference_code, full_name
+     FROM crm_contacts
+     WHERE pipeline_id = $1::uuid
+       AND organization_id = $2::uuid
+     ORDER BY id`,
+    [context.salesPipeline.id, context.salesRoot.id],
+  )
+  const existing = await queryRows(
+    client,
+    `SELECT aggregate_id, status
+     FROM sync_outbox
+     WHERE target_system = 'suitecrm'
+       AND operation = 'upsert_record'
+       AND idempotency_key LIKE $1`,
+    [`crm:workspace-transfer:${MIGRATION_VERSION}:${CONTACT_FINALIZATION_PHASE}:contacts:%:${context.targetWorkspace.id}`],
+  )
+  const succeeded = new Set(
+    existing.filter((row) => row.status === 'succeeded').map((row) => row.aggregate_id),
+  )
+  if (contacts.length === 0 || contacts.every((contact) => succeeded.has(contact.id))) {
+    return { state: 'already-finalized', contacts: contacts.length }
+  }
+  const pendingContacts = contacts.filter((contact) => !succeeded.has(contact.id))
+  const staged = await stageRootContacts(
+    client,
+    context.salesPipeline.id,
+    context.salesRoot.id,
+    context.targetWorkspace.id,
+    {
+      idempotencyPhase: CONTACT_FINALIZATION_PHASE,
+      contactIds: pendingContacts.map((contact) => contact.id),
+    },
+  )
+  await client.query(
+    `INSERT INTO audit_events (
+       actor, event_type, aggregate_type, aggregate_id, payload, event_key,
+       subject, organization_id, is_system, created_at
+     ) VALUES ($1, 'crm.pipeline_workspace.root_contacts_finalization_queued',
+       'pipeline_space', $2, $3::jsonb, $4, $5, $6::uuid, true, now())
+     ON CONFLICT (event_key) WHERE event_key IS NOT NULL DO NOTHING`,
+    [
+      context.actorEmail,
+      context.salesPipeline.id,
+      JSON.stringify({
+        migrationVersion: MIGRATION_VERSION,
+        environment: environmentName,
+        pipelineId: context.salesPipeline.id,
+        workspaceId: context.targetWorkspace.id,
+        contacts: contacts.map((contact) => ({
+          id: contact.id,
+          referenceCode: contact.reference_code,
+          name: contact.full_name,
+        })),
+      }),
+      `crm-pipeline-workspace-root-contacts-finalization:${MIGRATION_VERSION}:${context.salesPipeline.id}:${context.targetWorkspace.id}`,
+      SALES_PIPELINE_NAME,
+      context.targetWorkspace.id,
+    ],
+  )
+  return { state: 'queued', contacts: staged, alreadySucceeded: succeeded.size }
 }
 
 async function stageRootInteractions(client, pipelineId, rootId, workspaceId) {
@@ -1183,10 +1252,12 @@ async function executeMigration(client, context, environmentName) {
         context.sourceWorkspace.id,
       )
     ),
+    // Shared canonical contacts can exist in both roots. Stage Suburbia first so
+    // the migrated EPISCS relationship is the final SuiteCRM primary Account.
     contacts: (
-      await stageRootContacts(client, context.salesPipeline.id, context.salesRoot.id, context.targetWorkspace.id)
-    ) + (
       await stageRootContacts(client, context.placeholder.id, context.placeholderRoot.id, context.sourceWorkspace.id)
+    ) + (
+      await stageRootContacts(client, context.salesPipeline.id, context.salesRoot.id, context.targetWorkspace.id)
     ),
     interactions: await stageRootInteractions(
       client,
@@ -1271,14 +1342,24 @@ async function main() {
     await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [LOCK_KEY])
     const context = await readContext(client, actorEmail)
     if (context.state === 'complete') {
+      const finalization = args.finalizeRootContacts
+        ? await finalizeRootContacts(client, context, environmentName)
+        : null
       result = {
         ok: true,
         mode: args.apply ? 'apply' : 'dry-run',
-        state: 'already-complete',
+        state: finalization
+          ? finalization.state === 'already-finalized'
+            ? 'already-complete'
+            : args.apply
+              ? 'root-contact-finalization-queued'
+              : 'validated-root-contact-finalization-rollback'
+          : 'already-complete',
         environment: environmentName,
         salesPipelineId: context.salesPipeline.id,
         sourceWorkspace: context.sourceWorkspace,
         targetWorkspace: context.targetWorkspace,
+        ...(finalization ? { rootContactFinalization: finalization } : {}),
         ...(await completedSummary(client, context)),
       }
     } else {

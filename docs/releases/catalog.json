@@ -46,7 +46,8 @@
         "Prevents discussion replies and unsourced current-research claims from being recorded as completed task work",
         "Sanitizes agent-provider failures so credentials and upstream authorization details never appear in task threads",
         "Restores authenticated API behavior for the explicitly unauthenticated, non-hosted local development runtime",
-        "Keeps Suburbia memberships and child-workspace CRM projections isolated while moving all Sales customer contacts, opportunities, interactions, meetings, products, and history to EPISCS"
+        "Keeps Suburbia memberships and child-workspace CRM projections isolated while moving all Sales customer contacts, opportunities, interactions, meetings, products, and history to EPISCS",
+        "Makes EPISCS the final SuiteCRM primary Account when a migrated Contact also has a generated Suburbia projection"
       ]
     }
   }

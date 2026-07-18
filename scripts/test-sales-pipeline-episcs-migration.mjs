@@ -22,7 +22,8 @@ for (const [fragment, label] of [
   ['pg_advisory_xact_lock', 'migration lock'],
   ["if (args.apply) await client.query('COMMIT')", 'explicit apply commit'],
   ["else await client.query('ROLLBACK')", 'dry-run rollback'],
-  ["state: 'already-complete'", 'idempotent completed state'],
+  ["'already-complete'", 'idempotent completed state'],
+  ["finalizeRootContacts: argv.includes('--finalize-root-contacts')", 'guarded root-contact finalization mode'],
 ]) assertIncludes(fragment, label)
 
 for (const [fragment, label] of [
@@ -43,6 +44,7 @@ for (const [fragment, label] of [
 for (const [fragment, label] of [
   ['stageOrganizationRelationships(', 'SuiteCRM account relationship restaging'],
   ['stageRootContacts(', 'SuiteCRM root contact restaging'],
+  ["const CONTACT_FINALIZATION_PHASE = 'root-contact-finalization'", 'idempotent root-contact finalization phase'],
   ['stageRootInteractions(', 'SuiteCRM root interaction restaging'],
   ['stageRootMeetings(', 'SuiteCRM root meeting restaging'],
   ["'apply_workbook_branding', 'google_sheets'", 'workbook branding restaging'],
@@ -61,6 +63,12 @@ assert.match(
   migration,
   /stageOrganizationRelationships\([\s\S]*?context\.placeholder\.id,[\s\S]*?\[context\.placeholderRoot\.id\][\s\S]*?context\.sourceWorkspace\.id/,
   'The Suburbia placeholder root must be restaged separately in the Suburbia pipeline',
+)
+
+assert.match(
+  migration,
+  /stageRootContacts\(client, context\.placeholder\.id,[\s\S]*?stageRootContacts\(client, context\.salesPipeline\.id/,
+  'The migrated EPISCS root contact projection must be staged after the Suburbia placeholder projection',
 )
 
 console.log('PASS sales pipeline to EPISCS migration contract')
