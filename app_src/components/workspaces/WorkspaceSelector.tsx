@@ -62,7 +62,10 @@ export default function WorkspaceSelector({
       })
       const result = await response.json().catch(() => ({})) as WorkspacePayload
       if (!response.ok || !result.ok) throw new Error(result.error || 'Unable to switch workspace')
-      window.location.reload()
+      const url = new URL(window.location.href)
+      for (const parameter of ['board', 'pipeline', 'crm', 'crmAction', 'doc']) url.searchParams.delete(parameter)
+      url.searchParams.set(kind, id)
+      window.location.assign(url.toString())
     } catch {
       // Keep the current resource selected when switching fails.
     } finally {

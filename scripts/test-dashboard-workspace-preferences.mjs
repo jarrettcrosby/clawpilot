@@ -39,6 +39,11 @@ const workspaceRoute = read('app_src/app/api/workspaces/route.ts')
 assert.match(workspaceRoute, /searchParams\.get\(['"]dashboard['"]\)/, 'workspace API must recognize dashboard preference reads')
 assert.match(workspaceRoute, /setDefault/, 'workspace API must recognize durable dashboard selections')
 
+const workspaceSelector = read('app_src/components/workspaces/WorkspaceSelector.tsx')
+assert.match(workspaceSelector, /url\.searchParams\.set\(kind, id\)/, 'workspace selector must keep the selected resource in the URL')
+assert.match(workspaceSelector, /window\.location\.assign\(url\.toString\(\)\)/, 'workspace selector must reload through the corrected URL')
+assert.doesNotMatch(workspaceSelector, /window\.location\.reload\(\)/, 'workspace selector must not retain stale route parameters')
+
 const taskRoute = read('app_src/app/api/tasks/route.ts')
 assert.match(taskRoute, /searchParams\.get\(['"]boardId['"]\)/, 'task API must accept an explicit boardId')
 assert.match(taskRoute, /searchParams\.get\(['"]includeCrmCards['"]\)/, 'task API must accept the CRM-card count flag')
