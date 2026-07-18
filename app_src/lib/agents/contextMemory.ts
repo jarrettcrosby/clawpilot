@@ -1,5 +1,6 @@
 import crypto from 'crypto'
 import type { ProductAgentId } from '@/lib/agents/routing'
+import { detectPromptInjectionIndicators } from '@/lib/agents/promptSecurity'
 import { query, withTransaction } from '@/lib/persistence/postgres'
 import { normalizeUserEmail } from '@/lib/users'
 
@@ -105,6 +106,9 @@ export async function captureAgentLearning(input: {
   const operatorId = normalizeUserEmail(input.operatorId)
   const content = extractAgentLearning(input.responseText)
   if (!content) return { captured: false, shared: false }
+  if (detectPromptInjectionIndicators(content).length > 0) {
+    return { captured: false, shared: false }
+  }
   const contentHash = learningHash(content)
 
   return withTransaction(async (client) => {
@@ -153,11 +157,10 @@ export async function captureAgentLearning(input: {
       `,
       [memoryId, organizationId, operatorId],
     )
-    const promoted = await client.query<{ status: string }>(
+    await client.query(
       `
         UPDATE agent_context_memories memory
         SET evidence_count = evidence.count,
-            status = CASE WHEN evidence.count >= 2 THEN 'active' ELSE memory.status END,
             updated_at = now()
         FROM (
           SELECT memory_id, count(*)::integer AS count
@@ -166,10 +169,9 @@ export async function captureAgentLearning(input: {
           GROUP BY memory_id
         ) evidence
         WHERE memory.id = evidence.memory_id
-        RETURNING memory.status
       `,
       [memoryId],
     )
-    return { captured: true, shared: promoted.rows[0]?.status === 'active' }
+    return { captured: true, shared: false }
   })
 }

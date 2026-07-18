@@ -9,6 +9,16 @@ export type ChatGPTCodexCredential = {
 
 type CodexEvent = Record<string, unknown>
 
+export type ChatGPTCodexCitation = {
+  url: string
+  title?: string
+}
+
+export type ChatGPTCodexResearchResponse = {
+  text: string
+  citations: ChatGPTCodexCitation[]
+}
+
 function extractOutputText(payload: Record<string, unknown>): string {
   if (typeof payload.output_text === 'string') return payload.output_text.trim()
   const output = Array.isArray(payload.output) ? payload.output : []
@@ -25,6 +35,43 @@ function extractOutputText(payload: Record<string, unknown>): string {
     }
   }
   return parts.join('\n').trim()
+}
+
+function extractCitations(payload: Record<string, unknown>): ChatGPTCodexCitation[] {
+  const citations = new Map<string, ChatGPTCodexCitation>()
+  const output = Array.isArray(payload.output) ? payload.output : []
+  for (const item of output) {
+    if (!item || typeof item !== 'object') continue
+    const record = item as Record<string, unknown>
+    const action = record.action && typeof record.action === 'object'
+      ? record.action as Record<string, unknown>
+      : null
+    const sources = Array.isArray(action?.sources) ? action.sources : []
+    for (const source of sources) {
+      if (!source || typeof source !== 'object') continue
+      const sourceRecord = source as Record<string, unknown>
+      const url = String(sourceRecord.url || '').trim()
+      if (!/^https:\/\//i.test(url)) continue
+      citations.set(url, { url, title: String(sourceRecord.title || '').trim() || undefined })
+    }
+
+    const content = Array.isArray(record.content) ? record.content : []
+    for (const entry of content) {
+      if (!entry || typeof entry !== 'object') continue
+      const annotations = Array.isArray((entry as Record<string, unknown>).annotations)
+        ? (entry as Record<string, unknown>).annotations as unknown[]
+        : []
+      for (const annotation of annotations) {
+        if (!annotation || typeof annotation !== 'object') continue
+        const annotationRecord = annotation as Record<string, unknown>
+        if (String(annotationRecord.type || '') !== 'url_citation') continue
+        const url = String(annotationRecord.url || '').trim()
+        if (!/^https:\/\//i.test(url)) continue
+        citations.set(url, { url, title: String(annotationRecord.title || '').trim() || undefined })
+      }
+    }
+  }
+  return [...citations.values()].slice(0, 30)
 }
 
 function errorMessage(payload: Record<string, unknown>, fallback: string): string {
@@ -84,13 +131,14 @@ function eventFailure(event: CodexEvent): string | null {
   return errorMessage(response, 'ChatGPT agent execution failed')
 }
 
-async function readCodexStream(response: Response): Promise<string> {
+async function readCodexStream(response: Response): Promise<ChatGPTCodexResearchResponse> {
   if (!response.body) throw new Error('ChatGPT returned an empty response stream')
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
   let buffer = ''
   let text = ''
   let completedText = ''
+  let citations: ChatGPTCodexCitation[] = []
   let total = 0
 
   function consume(chunk: string) {
@@ -102,10 +150,12 @@ async function readCodexStream(response: Response): Promise<string> {
       text += event.delta
     }
     if (event.type === 'response.completed' || event.type === 'response.done') {
-      const completed = event.response && typeof event.response === 'object'
-        ? extractOutputText(event.response as Record<string, unknown>)
-        : ''
+      const responsePayload = event.response && typeof event.response === 'object'
+        ? event.response as Record<string, unknown>
+        : null
+      const completed = responsePayload ? extractOutputText(responsePayload) : ''
       if (completed) completedText = completed
+      if (responsePayload) citations = extractCitations(responsePayload)
     }
   }
 
@@ -132,17 +182,18 @@ async function readCodexStream(response: Response): Promise<string> {
 
   const result = text.trim() || completedText.trim()
   if (!result) throw new Error('ChatGPT returned an empty agent response')
-  return result
+  return { text: result, citations }
 }
 
-export async function runChatGPTCodexResponse(input: {
+async function runChatGPTCodexRequest(input: {
   credential: ChatGPTCodexCredential
   model: string
   instructions: string
   prompt: string
   sessionId: string
   signal?: AbortSignal
-}): Promise<string> {
+  webSearch?: boolean
+}): Promise<ChatGPTCodexResearchResponse> {
   const response = await fetch(CODEX_RESPONSES_URL, {
     method: 'POST',
     headers: {
@@ -161,7 +212,13 @@ export async function runChatGPTCodexResponse(input: {
       instructions: input.instructions,
       input: [{ role: 'user', content: [{ type: 'input_text', text: input.prompt }] }],
       text: { verbosity: 'low' },
-      include: ['reasoning.encrypted_content'],
+      ...(input.webSearch ? {
+        tools: [{ type: 'web_search', search_context_size: 'medium' }],
+        tool_choice: 'required',
+      } : {}),
+      include: input.webSearch
+        ? ['reasoning.encrypted_content', 'web_search_call.action.sources']
+        : ['reasoning.encrypted_content'],
       prompt_cache_key: input.sessionId,
       store: false,
       stream: true,
@@ -184,4 +241,26 @@ export async function runChatGPTCodexResponse(input: {
   }
 
   return readCodexStream(response)
+}
+
+export async function runChatGPTCodexResponse(input: {
+  credential: ChatGPTCodexCredential
+  model: string
+  instructions: string
+  prompt: string
+  sessionId: string
+  signal?: AbortSignal
+}): Promise<string> {
+  return (await runChatGPTCodexRequest(input)).text
+}
+
+export async function runChatGPTCodexWebResearchResponse(input: {
+  credential: ChatGPTCodexCredential
+  model: string
+  instructions: string
+  prompt: string
+  sessionId: string
+  signal?: AbortSignal
+}): Promise<ChatGPTCodexResearchResponse> {
+  return runChatGPTCodexRequest({ ...input, webSearch: true })
 }

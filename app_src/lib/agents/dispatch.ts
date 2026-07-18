@@ -30,6 +30,7 @@ export function commentTargetsAssignedAgent(text: string, agentId: string): bool
 }
 
 export function prepareAgentDispatch(input: {
+  dispatchId?: string
   operatorId: string
   boardId: string
   task: Task
@@ -40,7 +41,7 @@ export function prepareAgentDispatch(input: {
   eventId?: string
   queuedAt?: string
 }): { task: Task; dispatch: AgentDispatchEnqueueInput } {
-  const dispatchId = crypto.randomUUID()
+  const dispatchId = input.dispatchId || crypto.randomUUID()
   const queuedAt = input.queuedAt || new Date().toISOString()
   const eventId = String(input.eventId || dispatchId)
   const dispatch: AgentDispatchEnqueueInput = {

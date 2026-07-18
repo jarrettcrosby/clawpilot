@@ -10,6 +10,8 @@ const port = String(process.env.PORT || 4002)
 const baseUrl = String(process.env.PIPELINE_OUTBOX_URL || `http://127.0.0.1:${port}`).replace(/\/$/, '')
 const pipelineIntervalMs = Math.max(1000, Math.min(Number(process.env.PIPELINE_OUTBOX_POLL_MS || 10000), 300000))
 const agentIntervalMs = Math.max(1000, Math.min(Number(process.env.AGENT_DISPATCH_POLL_MS || 5000), 300000))
+const researchIntervalMs = Math.max(5000, Math.min(Number(process.env.AGENT_RESEARCH_POLL_MS || 10000), 300000))
+const toastIntervalMs = Math.max(5000, Math.min(Number(process.env.TOAST_SYNC_POLL_MS || 15000), 300000))
 const repositoryIntervalMs = Math.max(1000, Math.min(Number(process.env.REPOSITORY_RUNNER_POLL_MS || 5000), 300000))
 const repositoryRunnerEnabled = String(process.env.CLAWPILOT_REPOSITORY_RUNNER_ENABLED || '0') === '1'
 const crmIntegrationIntervalMs = Math.max(5000, Math.min(Number(process.env.CRM_INTEGRATION_POLL_MS || 30000), 300000))
@@ -61,6 +63,8 @@ await Promise.all([
   runLoop('crm-outbox', '/api/crm/outbox/process', 10, pipelineIntervalMs),
   runLoop('crm-integrations', '/api/crm/integrations/process', 10, crmIntegrationIntervalMs),
   runLoop('agent-dispatch', '/api/agents/dispatch/process', 1, agentIntervalMs),
+  runLoop('agent-research', '/api/agents/research/process', 1, researchIntervalMs),
+  runLoop('toast-sync', '/api/integrations/toast/process', 4, toastIntervalMs),
   ...(repositoryRunnerEnabled
     ? [runLoop('repository-runner', '/api/agents/repository-runs/process', 1, repositoryIntervalMs)]
     : []),

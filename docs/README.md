@@ -39,6 +39,7 @@ Current product behavior is defined by active module and operating contracts. Op
 
 - [Application shell and access](modules/application-shell-and-access.md)
 - [User integrations and credentials](modules/user-integrations.md)
+- [Toast sales and accounting](modules/toast-and-accounting.md)
 - [Projects and tenancy](modules/projects-and-tenancy.md)
 - [Pipeline and synchronization](modules/pipeline-and-sync.md)
 - [CRM and workbook reporting](modules/crm-and-reporting.md)
@@ -49,6 +50,7 @@ Current product behavior is defined by active module and operating contracts. Op
 ### Operations
 
 - [ClawPilot environments and deployment](operations/clawpilot-environments.md)
+- [Agent security and integration isolation](operations/agent-security-and-isolation.md)
 - [Knowledge vault organization](operations/knowledge-vault-organization.md)
 - [ChatGPT agent authorization](operations/chatgpt-agent-auth.md)
 - [Repository patch runner](operations/repository-patch-runner.md)

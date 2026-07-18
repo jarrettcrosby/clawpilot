@@ -23,6 +23,7 @@ ClawPilot is a private operating workspace that connects work boards, pipeline d
 6. [Knowledge, Releases, and Checkpoints](../modules/knowledge-releases-and-checkpoints.md) provides private briefs, hybrid search, releases, and recovery checkpoints.
 7. [Shared Short Links](../modules/short-links.md) exposes controlled organization-scoped links to records and managed resources.
 8. [User Integrations and Credentials](../modules/user-integrations.md) lets each user connect the external services used by those workflows.
+9. [Toast Sales and Accounting](../modules/toast-and-accounting.md) ingests restaurant sales evidence and prepares controlled accounting drafts.
 
 The [ClawPilot Identity](../brand/clawpilot-identity.md) contract keeps those surfaces visually and verbally consistent.
 
@@ -33,6 +34,7 @@ The [ClawPilot Identity](../brand/clawpilot-identity.md) contract keeps those su
 - Project card -> assigned app agent -> user ChatGPT authorization -> execution log and result -> task thread.
 - User profile -> organization membership -> CRM account/contact -> Drive folder and pipeline resource scope.
 - Release -> Versions entry -> Build Brief -> searchable knowledge catalog.
+- Toast restaurant -> immutable source snapshot -> daily sales projection -> reviewable accounting draft.
 
 ## Product Authority
 

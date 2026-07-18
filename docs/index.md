@@ -33,6 +33,7 @@ This repository is the canonical source for ClawPilot product, engineering, and 
 
 - [Application shell and access](modules/application-shell-and-access.md)
 - [User integrations and credentials](modules/user-integrations.md)
+- [Toast sales and accounting](modules/toast-and-accounting.md)
 - [Projects and tenancy](modules/projects-and-tenancy.md)
 - [Pipeline and synchronization](modules/pipeline-and-sync.md)
 - [CRM and workbook reporting](modules/crm-and-reporting.md)
@@ -43,6 +44,7 @@ This repository is the canonical source for ClawPilot product, engineering, and 
 ## Active Operating Contracts
 
 - [Environments and deployment](operations/clawpilot-environments.md)
+- [Agent security and integration isolation](operations/agent-security-and-isolation.md)
 - [Knowledge vault organization](operations/knowledge-vault-organization.md)
 - [Repository patch runner](operations/repository-patch-runner.md)
 - [Release documentation contract](releases/README.md)

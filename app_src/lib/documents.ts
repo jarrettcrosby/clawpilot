@@ -6,6 +6,10 @@ import type { PoolClient } from 'pg'
 import { listAiRadarItems } from '@/lib/aiRadar'
 import { buildAgentTaskDocument } from '@/lib/agents/taskDocument'
 import { embedSearchQuery } from '@/lib/documentEmbeddings'
+import {
+  buildPipelineEngagementInsights,
+  type PipelineBriefOpportunityInput,
+} from '@/lib/pipelineBrief'
 import { query, withTransaction } from '@/lib/persistence/postgres'
 import { MEMBER_RELEASE_HISTORY_DAYS, releaseAccessFor } from '@/lib/releases'
 import {
@@ -60,6 +64,38 @@ type ReleaseBriefRow = {
   deployed_at: string
   features: string[] | null
   fixes: string[] | null
+}
+
+type PipelineEngagementBriefRow = {
+  reference_code: string
+  name: string
+  organization_name: string
+  status: string
+  stage: string
+  amount: string
+  probability: string
+  expected_close: string | null
+  total_touches: string
+  touches_30d: string
+  touches_90d: string
+  inbound_30d: string
+  outbound_30d: string
+  email_30d: string
+  call_30d: string
+  meeting_30d: string
+  last_touch_at: string | null
+}
+
+type PipelineActivityBriefRow = {
+  total_30d: string
+  total_90d: string
+  linked_30d: string
+  email_30d: string
+  call_30d: string
+  meeting_30d: string
+  inbound_30d: string
+  outbound_30d: string
+  failed_30d: string
 }
 
 export type DocumentBriefSelection = {
@@ -372,7 +408,14 @@ export async function refreshUserBriefs(
         : Promise.reject(error)),
   ])
   const releaseAccess = releaseAccessFor(user)
-  const [tasksResult, pipelineProjection, releasesResult, radarItems] = await Promise.all([
+  const [
+    tasksResult,
+    pipelineProjection,
+    releasesResult,
+    radarItems,
+    engagementResult,
+    activityResult,
+  ] = await Promise.all([
     query<TaskBriefRow>(
       `
         SELECT
@@ -406,6 +449,78 @@ export async function refreshUserBriefs(
       [releaseAccess.historyScope === 'full', MEMBER_RELEASE_HISTORY_DAYS],
     ),
     listAiRadarItems(12),
+    query<PipelineEngagementBriefRow>(
+      `
+        SELECT
+          opportunity.reference_code,
+          opportunity.name,
+          COALESCE(organization.name, opportunity.organization_name, '') AS organization_name,
+          COALESCE(opportunity.status, '') AS status,
+          COALESCE(opportunity.stage, '') AS stage,
+          opportunity.amount::text,
+          opportunity.probability::text,
+          opportunity.expected_close::text,
+          count(interaction.id)::text AS total_touches,
+          count(interaction.id) FILTER (
+            WHERE COALESCE(interaction.occurred_at, interaction.updated_at) >= now() - interval '30 days'
+          )::text AS touches_30d,
+          count(interaction.id) FILTER (
+            WHERE COALESCE(interaction.occurred_at, interaction.updated_at) >= now() - interval '90 days'
+          )::text AS touches_90d,
+          count(interaction.id) FILTER (
+            WHERE interaction.direction = 'inbound'
+              AND COALESCE(interaction.occurred_at, interaction.updated_at) >= now() - interval '30 days'
+          )::text AS inbound_30d,
+          count(interaction.id) FILTER (
+            WHERE interaction.direction = 'outbound'
+              AND COALESCE(interaction.occurred_at, interaction.updated_at) >= now() - interval '30 days'
+          )::text AS outbound_30d,
+          count(interaction.id) FILTER (
+            WHERE (lower(COALESCE(interaction.interaction_type, '')) LIKE '%email%'
+              OR interaction.provider_message_id IS NOT NULL)
+              AND COALESCE(interaction.occurred_at, interaction.updated_at) >= now() - interval '30 days'
+          )::text AS email_30d,
+          count(interaction.id) FILTER (
+            WHERE lower(COALESCE(interaction.interaction_type, '')) LIKE '%call%'
+              AND COALESCE(interaction.occurred_at, interaction.updated_at) >= now() - interval '30 days'
+          )::text AS call_30d,
+          count(interaction.id) FILTER (
+            WHERE (interaction.meeting_id IS NOT NULL
+              OR lower(COALESCE(interaction.interaction_type, '')) LIKE '%meeting%')
+              AND COALESCE(interaction.occurred_at, interaction.updated_at) >= now() - interval '30 days'
+          )::text AS meeting_30d,
+          max(COALESCE(interaction.occurred_at, interaction.updated_at))::text AS last_touch_at
+        FROM crm_opportunities opportunity
+        LEFT JOIN crm_organizations organization
+          ON organization.pipeline_id = opportunity.pipeline_id
+         AND organization.id = opportunity.organization_id
+        LEFT JOIN crm_interactions interaction
+          ON interaction.pipeline_id = opportunity.pipeline_id
+         AND interaction.opportunity_id = opportunity.id
+        WHERE opportunity.pipeline_id = $1::uuid
+          AND lower(btrim(COALESCE(opportunity.status, 'open'))) NOT IN ('won', 'lost', 'closed', 'abandoned')
+        GROUP BY opportunity.id, organization.name
+        ORDER BY opportunity.amount DESC, opportunity.updated_at DESC
+      `,
+      [pipeline.id],
+    ),
+    query<PipelineActivityBriefRow>(
+      `
+        SELECT
+          count(*) FILTER (WHERE COALESCE(occurred_at, updated_at) >= now() - interval '30 days')::text AS total_30d,
+          count(*) FILTER (WHERE COALESCE(occurred_at, updated_at) >= now() - interval '90 days')::text AS total_90d,
+          count(*) FILTER (WHERE opportunity_id IS NOT NULL AND COALESCE(occurred_at, updated_at) >= now() - interval '30 days')::text AS linked_30d,
+          count(*) FILTER (WHERE (lower(COALESCE(interaction_type, '')) LIKE '%email%' OR provider_message_id IS NOT NULL) AND COALESCE(occurred_at, updated_at) >= now() - interval '30 days')::text AS email_30d,
+          count(*) FILTER (WHERE lower(COALESCE(interaction_type, '')) LIKE '%call%' AND COALESCE(occurred_at, updated_at) >= now() - interval '30 days')::text AS call_30d,
+          count(*) FILTER (WHERE (meeting_id IS NOT NULL OR lower(COALESCE(interaction_type, '')) LIKE '%meeting%') AND COALESCE(occurred_at, updated_at) >= now() - interval '30 days')::text AS meeting_30d,
+          count(*) FILTER (WHERE direction = 'inbound' AND COALESCE(occurred_at, updated_at) >= now() - interval '30 days')::text AS inbound_30d,
+          count(*) FILTER (WHERE direction = 'outbound' AND COALESCE(occurred_at, updated_at) >= now() - interval '30 days')::text AS outbound_30d,
+          count(*) FILTER (WHERE lower(COALESCE(delivery_status, '')) = 'failed' AND COALESCE(occurred_at, updated_at) >= now() - interval '30 days')::text AS failed_30d
+        FROM crm_interactions
+        WHERE pipeline_id = $1::uuid
+      `,
+      [pipeline.id],
+    ),
   ])
 
   const now = new Date().toISOString()
@@ -451,6 +566,48 @@ export async function refreshUserBriefs(
 
   const summary = pipelineProjection.summary || {}
   const opportunities = Array.isArray(pipelineProjection.opportunities) ? pipelineProjection.opportunities : []
+  const activity = activityResult.rows[0] || {
+    total_30d: '0', total_90d: '0', linked_30d: '0', email_30d: '0', call_30d: '0', meeting_30d: '0',
+    inbound_30d: '0', outbound_30d: '0', failed_30d: '0',
+  }
+  const engagementInputs: PipelineBriefOpportunityInput[] = engagementResult.rows.map((row) => ({
+    referenceCode: singleLine(row.reference_code),
+    name: singleLine(row.name) || 'Untitled opportunity',
+    organization: singleLine(row.organization_name),
+    stage: singleLine(row.stage),
+    status: singleLine(row.status),
+    value: Number(row.amount || 0),
+    probability: Number(row.probability || 0),
+    expectedClose: row.expected_close,
+    touches30d: Number(row.touches_30d || 0),
+    touches90d: Number(row.touches_90d || 0),
+    totalTouches: Number(row.total_touches || 0),
+    inbound30d: Number(row.inbound_30d || 0),
+    outbound30d: Number(row.outbound_30d || 0),
+    email30d: Number(row.email_30d || 0),
+    call30d: Number(row.call_30d || 0),
+    meeting30d: Number(row.meeting_30d || 0),
+    lastTouchAt: row.last_touch_at,
+  }))
+  const engagement = buildPipelineEngagementInsights(engagementInputs, new Date(now))
+  const total30d = Number(activity.total_30d || 0)
+  const linked30d = Number(activity.linked_30d || 0)
+  const linkedRate = total30d > 0 ? Math.round((linked30d / total30d) * 100) : 0
+  const actionQueue = engagement.opportunities.slice(0, 10).map((item) => {
+    const identity = item.referenceCode
+      ? `[${item.referenceCode}](/crm/${encodeURIComponent(item.referenceCode)}) - ${item.name}`
+      : item.name
+    const lastTouch = item.daysSinceLastTouch === null
+      ? 'no linked touch history'
+      : item.daysSinceLastTouch === 0 ? 'last touch today' : `last touch ${item.daysSinceLastTouch}d ago`
+    const close = item.daysToClose === null
+      ? 'no expected close date'
+      : item.daysToClose < 0 ? `close date overdue by ${Math.abs(item.daysToClose)}d` : `closes in ${item.daysToClose}d`
+    return `${identity}${item.organization ? ` (${item.organization})` : ''} - ${money(item.value)}, ${item.stage || 'No stage'} - ${item.touches30d} touches/30d vs ${item.benchmark30d} ${item.benchmarkLabel}; ${lastTouch}; ${close}. **Next:** ${item.recommendedAction}.`
+  })
+  const stageCadence = engagement.stageBenchmarks.map((benchmark) => (
+    `${benchmark.stage}: median ${benchmark.medianTouches30d} and average ${benchmark.averageTouches30d} touches/30d across ${benchmark.opportunities} open opportunities`
+  ))
   const pipelineContent = [
     '# Pipeline Brief',
     '',
@@ -465,9 +622,35 @@ export async function refreshUserBriefs(
     `- Organizations: ${Number(summary.organizations || 0)}`,
     `- Contacts: ${Number(summary.contacts || 0)}`,
     `- Open value: ${money(Number(summary.totalOpenValue || 0))}`,
+    `- Touches in the last 30 days: ${total30d} (${linked30d} linked to an opportunity; ${linkedRate}% coverage)`,
+    `- Touches in the last 90 days: ${Number(activity.total_90d || 0)}`,
+    `- Untouched open opportunities: ${engagement.untouched}`,
+    `- Stale open opportunities (14+ days): ${engagement.stale}`,
+    `- Closing within 30 days: ${engagement.closingWithin30Days}`,
+    `- Overdue expected close dates: ${engagement.overdueCloseDates}`,
+    '',
+    '## Engagement Health',
+    `- Email touches (30d): ${Number(activity.email_30d || 0)}`,
+    `- Call touches (30d): ${Number(activity.call_30d || 0)}`,
+    `- Meeting touches (30d): ${Number(activity.meeting_30d || 0)}`,
+    `- Inbound / outbound (30d): ${Number(activity.inbound_30d || 0)} / ${Number(activity.outbound_30d || 0)}`,
+    `- Failed deliveries (30d): ${Number(activity.failed_30d || 0)}`,
+    `- Below normal cadence: ${engagement.lagging}`,
+    `- Above normal cadence: ${engagement.aboveNormal}`,
+    '',
+    '## Priority Actions',
+    markdownList(actionQueue, 'No open opportunities require an action.'),
+    '',
+    '## Stage Touch Benchmarks',
+    markdownList(stageCadence, 'Not enough open opportunities to calculate a benchmark.'),
     '',
     '## Current Opportunities',
     markdownList(opportunities.slice(0, 10).map((item) => `${item.name || 'Untitled'} - ${item.stage || 'No stage'} - ${money(Number(item.value || 0))}${item.organization ? ` - ${item.organization}` : ''}`), 'No opportunities recorded.'),
+    '',
+    '## Measurement Notes',
+    '- Opportunity cadence uses interactions explicitly linked to that opportunity so an organization-level email is not counted against every open deal.',
+    '- The opportunity-link coverage rate shows how much of the recent interaction stream can support deal-level analysis.',
+    '- Above-normal activity is a review signal, not an automatic positive result; verify that repeated touches are moving stage, close plan, or decision ownership.',
   ].join('\n')
 
   const researchTasks = tasks.filter((task) => task.category === 'research')

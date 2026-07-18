@@ -10,6 +10,7 @@ export type AgentTaskExecutionPlan = {
   nextAction: string
   waitingOn: string
   blocker: string
+  researchQuery: string
   descriptionUpdate: string
   checklistAdd: string[]
   checklistComplete: string[]
@@ -23,6 +24,7 @@ export type AgentTaskExecutionEvidence = {
   nextAction: string
   waitingOn: string
   blocker: string
+  researchQuery: string
   changes: string[]
   completedChecklistIds: string[]
   learned: string
@@ -135,6 +137,7 @@ export function parseAgentTaskExecutionPlan(value: unknown): AgentTaskExecutionP
   const nextAction = cleanText(input.nextAction, 500)
   const waitingOn = cleanText(input.waitingOn, 500)
   const blocker = cleanText(input.blocker, 500)
+  const researchQuery = cleanText(input.researchQuery, 2000)
   const descriptionUpdate = cleanText(input.descriptionUpdate, 10_000)
   const checklistAdd = Array.from(new Set(
     (Array.isArray(input.checklistAdd) ? input.checklistAdd : [])
@@ -150,7 +153,7 @@ export function parseAgentTaskExecutionPlan(value: unknown): AgentTaskExecutionP
 
   if (!summary) throw new Error('Agent execution summary is required')
   if (!nextAction) throw new Error('Agent execution nextAction is required')
-  if ((status === 'running' || status === 'completed') && !deliverable) {
+  if ((status === 'running' || status === 'completed') && !deliverable && !researchQuery) {
     throw new Error('Agent execution deliverable is required for substantive progress')
   }
   if (status === 'blocked' && !blocker) throw new Error('Blocked agent execution requires a specific blocker')
@@ -163,6 +166,7 @@ export function parseAgentTaskExecutionPlan(value: unknown): AgentTaskExecutionP
     nextAction,
     waitingOn,
     blocker,
+    researchQuery,
     descriptionUpdate,
     checklistAdd,
     checklistComplete,
@@ -187,6 +191,7 @@ function evidenceFromPlan(
     nextAction: plan.nextAction,
     waitingOn: plan.waitingOn,
     blocker: plan.blocker,
+    researchQuery: plan.researchQuery,
     changes,
     completedChecklistIds,
     learned: plan.learned,
@@ -243,11 +248,13 @@ export function applyAgentTaskExecutionPlan(input: {
   })
   const checklist = [...updatedChecklist, ...addedChecklist]
   const hasRemainingChecklist = checklist.some((item) => !item.done)
-  const effectiveStatus: AgentTaskExecutionStatus = plan.status === 'completed' && hasRemainingChecklist
+  const effectiveStatus: AgentTaskExecutionStatus = plan.researchQuery
     ? 'running'
-    : plan.status === 'running' && !hasRemainingChecklist
-      ? 'completed'
-      : plan.status
+    : plan.status === 'completed' && hasRemainingChecklist
+      ? 'running'
+      : plan.status === 'running' && !hasRemainingChecklist
+        ? 'completed'
+        : plan.status
   const effectivePlan = effectiveStatus === plan.status ? plan : { ...plan, status: effectiveStatus }
   const boardStatus = boardStatusForExecution(task, effectivePlan.status)
   if (boardStatus !== task.status) changes.push(`card moved to ${boardStatus}`)
@@ -256,6 +263,7 @@ export function applyAgentTaskExecutionPlan(input: {
   if (plan.nextAction !== previousNextAction) changes.push('next action updated')
   if (effectivePlan.blocker) changes.push('specific blocker recorded')
   else if (effectivePlan.waitingOn) changes.push('required input recorded')
+  if (effectivePlan.researchQuery) changes.push('public research retrieval requested')
 
   const note = [
     `Status: ${effectivePlan.status}`,
@@ -264,6 +272,7 @@ export function applyAgentTaskExecutionPlan(input: {
     `Next action: ${effectivePlan.nextAction}`,
     `Waiting on: ${effectivePlan.waitingOn || 'none'}`,
     `Blocker: ${effectivePlan.blocker || 'none'}`,
+    `Research query: ${effectivePlan.researchQuery || 'none'}`,
     `Evidence: ${changes.length > 0 ? changes.join('; ') : 'No task artifact changed'}`,
   ].filter(Boolean).join('\n')
   const lastResult = {
@@ -275,6 +284,7 @@ export function applyAgentTaskExecutionPlan(input: {
     nextAction: effectivePlan.nextAction,
     waitingOn: effectivePlan.waitingOn || undefined,
     blockedReason: effectivePlan.blocker || undefined,
+    researchQuery: effectivePlan.researchQuery || undefined,
     evidence: changes,
     completedChecklistIds,
     learned: effectivePlan.learned || undefined,
@@ -357,6 +367,7 @@ export function readPersistedAgentTaskExecutionEvidence(
     nextAction,
     waitingOn: cleanText(record.waitingOn, 500),
     blocker: cleanText(record.blockedReason, 500),
+    researchQuery: cleanText(record.researchQuery, 2000),
     changes: (Array.isArray(record.evidence) ? record.evidence : [])
       .map((change) => cleanText(change, 240))
       .filter(Boolean)
@@ -415,6 +426,7 @@ export function formatAgentTaskExecutionResult(agentId: string, evidence: AgentT
     `Evidence: ${evidence.changes.length > 0 ? evidence.changes.join('; ') : 'No persisted task mutation.'}`,
     `Remaining: ${evidence.nextAction}`,
     `Waiting on: ${evidence.blocker || evidence.waitingOn || 'none'}`,
+    `Research queued: ${evidence.researchQuery || 'none'}`,
     `Learned: ${evidence.learned || 'none'}`,
   ].join('\n')
 }

@@ -79,6 +79,18 @@ assert.match(configureBlock, /deleteConditionalFormatRule/)
 assert.match(configureBlock, /deleteBanding/)
 assert.match(configureBlock, /clearBasicFilter/)
 assert.match(configureBlock, /deleteEmbeddedObject/)
+assert.match(configureBlock, /filteredRowsIncluded: true/)
+const validationResetIndex = configureBlock.indexOf('filteredRowsIncluded: true')
+const opportunityValidationIndex = configureBlock.indexOf('...opportunityValidationRequests(sheetIdValue, rowCount)')
+assert.ok(validationResetIndex >= 0, 'managed workbook ranges must clear legacy validation')
+assert.ok(
+  validationResetIndex < opportunityValidationIndex,
+  'legacy validation must clear before current opportunity rules are applied',
+)
+assert.doesNotMatch(
+  configureBlock.slice(configureBlock.indexOf('for (const chart of sheet.charts || [])') - 120, configureBlock.indexOf('for (const chart of sheet.charts || [])')),
+  /title === 'Dashboard'/,
+)
 
 const chartRequestBlock = source.slice(
   source.indexOf('function dashboardChartRequests'),

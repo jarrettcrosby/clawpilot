@@ -19,6 +19,8 @@ Turn operating data into private, readable briefs and make shipped changes visib
 
 - Documents are owned by a user and never listed across owners.
 - ClawPilot generates Build, Project Board, Pipeline, and AI Opportunity briefs for that user's currently selected accessible board and pipeline.
+- Pipeline Briefs combine opportunity state with CRM interactions. They report 30- and 90-day touch volume, email/call/meeting mix, opportunity-link coverage, untouched and stale deals, close-date risk, stage-level touch benchmarks, and a ranked next-action queue. Cadence comparisons use only interactions explicitly linked to an opportunity so one organization-level email is not credited to every open deal.
+- `Above normal` cadence is a review signal rather than an automatic success rating. The brief asks the user to verify that repeated touches are advancing stage, decision ownership, or the close plan.
 - A user can tap **New document**, choose the brief type, and select an accessible board or pipeline when that document needs a resource. ClawPilot refreshes the source data and creates a uniquely named point-in-time snapshot instead of overwriting an earlier user-generated report.
 - On-demand snapshots use the user's locale and timezone in the title, retain the selected resource relationship, and are tagged `generated-on-demand`. The API rechecks signed-user board and pipeline access before generation.
 - The configured owner also receives the curated repository knowledge catalog.
