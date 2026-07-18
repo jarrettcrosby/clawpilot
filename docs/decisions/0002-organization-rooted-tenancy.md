@@ -19,7 +19,9 @@ ClawPilot must support users in the root company, users in child companies, shar
 
 ## Decision
 
-Every app user belongs to one workspace organization. Parent-child organization relationships define the visible CRM and resource subtree. Application roles and explicit permissions are independent from organization membership. Invitations require the target organization; they never create an organization implicitly.
+Every tenant-owned operation belongs to one workspace organization. Parent-child organization relationships define the visible CRM and resource subtree. Application roles and explicit permissions are independent from organization membership. Invitations require the target organization; they never create an organization implicitly.
+
+[Decision 0005](0005-multi-workspace-membership.md) amends the original one-user/one-organization assumption: one app identity may hold multiple memberships, while each request and browser session remains scoped to exactly one active workspace organization.
 
 ## Consequences
 

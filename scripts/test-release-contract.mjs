@@ -55,6 +55,7 @@ function loadTypeScriptModule(relativePath, mocks) {
 const migration = read('db/migrations/0011_knowledge_releases_checkpoints.sql')
 const hardeningMigration = read('db/migrations/0012_invitation_release_hardening.sql')
 const documentBriefs = read('app_src/lib/documents.ts')
+const releasesSource = read('app_src/lib/releases.ts')
 for (const fragment of [
   'CREATE TABLE IF NOT EXISTS release_entries',
   'CREATE TABLE IF NOT EXISTS data_checkpoints',
@@ -76,6 +77,10 @@ for (const fragment of [
 assert.ok(
   documentBriefs.includes('SELECT DISTINCT ON (commit_hash)'),
   'build brief must collapse repeated deployments of the same commit',
+)
+assert.ok(
+  releasesSource.includes('SELECT DISTINCT ON (environment, commit_hash)'),
+  'release history must collapse repeated deployments of a commit within each environment',
 )
 
 const overviewQueries = []

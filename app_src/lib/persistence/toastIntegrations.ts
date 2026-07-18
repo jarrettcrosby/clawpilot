@@ -67,12 +67,47 @@ export type ToastLocationState = {
   updatedAt: string
 }
 
+export type ToastDatasetCoverage = {
+  available: boolean
+  successfulJobs: number
+  failedJobs: number
+  businessDates: number
+  records: number
+  latestBusinessDate: string | null
+}
+
+export type ToastReportingState = {
+  businessDays: number
+  firstBusinessDate: string | null
+  latestBusinessDate: string | null
+  locationsWithData: number
+  totals: {
+    grossSales: number
+    netSales: number
+    discounts: number
+    voids: number
+    refunds: number
+    orders: number
+    guests: number
+    standardOrders: number
+    analyticsRows: number
+  }
+  datasets: {
+    restaurantProfiles: { available: boolean; locations: number }
+    standardOrders: ToastDatasetCoverage
+    analyticsSales: ToastDatasetCoverage
+    analyticsPayouts: ToastDatasetCoverage
+  }
+  noDataReason: 'credentials_required' | 'locations_required' | 'sync_required' | 'no_records' | null
+}
+
 export type ToastIntegrationState = {
   organizationId: string
   credentials: Record<ToastAccessType, ToastCredentialState>
   locations: ToastLocationState[]
   jobs: { pending: number; processing: number; failed: number; dead: number; succeeded: number }
   accountingDrafts: { needsMapping: number; needsReview: number; approved: number; posted: number; failed: number }
+  reporting: ToastReportingState
   latestSyncAt: string | null
 }
 
@@ -109,6 +144,28 @@ export type ToastSyncJob = {
 
 function iso(value: TimestampValue | null | undefined) {
   return value ? new Date(value).toISOString() : null
+}
+
+function dateOnly(value: TimestampValue | null | undefined) {
+  if (!value) return null
+  if (typeof value === 'string') return value.slice(0, 10)
+  return value.toISOString().slice(0, 10)
+}
+
+function count(value: string | number | null | undefined) {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed : 0
+}
+
+function emptyDatasetCoverage(): ToastDatasetCoverage {
+  return {
+    available: false,
+    successfulJobs: 0,
+    failedJobs: 0,
+    businessDates: 0,
+    records: 0,
+    latestBusinessDate: null,
+  }
 }
 
 function emptyCredential(accessType: ToastAccessType): ToastCredentialState {
@@ -174,7 +231,7 @@ async function audit(
 }
 
 export async function readToastIntegrationStateFromPostgres(organizationId: string): Promise<ToastIntegrationState> {
-  const [credentialResult, locationResult, jobResult, draftResult, latestResult] = await Promise.all([
+  const [credentialResult, locationResult, jobResult, draftResult, latestResult, reportingResult, datasetResult] = await Promise.all([
     query<CredentialRow>(
       `SELECT * FROM organization_toast_credentials WHERE organization_id = $1::uuid ORDER BY access_type`,
       [organizationId],
@@ -198,6 +255,65 @@ export async function readToastIntegrationStateFromPostgres(organizationId: stri
        FROM toast_sync_outbox WHERE organization_id = $1::uuid AND status = 'succeeded'`,
       [organizationId],
     ),
+    query<{
+      business_days: string
+      first_business_date: TimestampValue | null
+      latest_business_date: TimestampValue | null
+      locations_with_data: string
+      gross_sales: string
+      net_sales: string
+      discounts: string
+      voids: string
+      refunds: string
+      orders_count: string
+      guest_count: string
+      standard_orders_count: string
+      analytics_rows: string
+    }>(
+      `SELECT
+         count(DISTINCT business_date)::text AS business_days,
+         min(business_date) AS first_business_date,
+         max(business_date) AS latest_business_date,
+         count(DISTINCT restaurant_guid)::text AS locations_with_data,
+         coalesce(sum(gross_sales), 0)::text AS gross_sales,
+         coalesce(sum(net_sales), 0)::text AS net_sales,
+         coalesce(sum(discounts), 0)::text AS discounts,
+         coalesce(sum(voids), 0)::text AS voids,
+         coalesce(sum(refunds), 0)::text AS refunds,
+         coalesce(sum(orders_count), 0)::text AS orders_count,
+         coalesce(sum(guest_count), 0)::text AS guest_count,
+         coalesce(sum(standard_orders_count), 0)::text AS standard_orders_count,
+         coalesce(sum(analytics_rows), 0)::text AS analytics_rows
+       FROM toast_daily_sales
+       WHERE organization_id = $1::uuid`,
+      [organizationId],
+    ),
+    query<{
+      sync_kind: ToastSyncJob['syncKind']
+      successful_jobs: string
+      failed_jobs: string
+      business_dates: string
+      records: string
+      latest_business_date: TimestampValue | null
+    }>(
+      `SELECT
+         sync_kind,
+         count(*) FILTER (WHERE status = 'succeeded')::text AS successful_jobs,
+         count(*) FILTER (WHERE status IN ('failed', 'dead'))::text AS failed_jobs,
+         count(DISTINCT business_date) FILTER (WHERE status = 'succeeded')::text AS business_dates,
+         coalesce(sum(
+           CASE
+             WHEN status = 'succeeded' AND jsonb_typeof(result_summary -> 'records') = 'number'
+               THEN (result_summary ->> 'records')::bigint
+             ELSE 0
+           END
+         ), 0)::text AS records,
+         max(business_date) FILTER (WHERE status = 'succeeded') AS latest_business_date
+       FROM toast_sync_outbox
+       WHERE organization_id = $1::uuid
+       GROUP BY sync_kind`,
+      [organizationId],
+    ),
   ])
   const credentials = {
     analytics: emptyCredential('analytics'),
@@ -213,12 +329,76 @@ export async function readToastIntegrationStateFromPostgres(organizationId: stri
     const key = row.status === 'needs_mapping' ? 'needsMapping' : row.status === 'needs_review' ? 'needsReview' : row.status
     if (key in accountingDrafts) accountingDrafts[key as keyof typeof accountingDrafts] = Number(row.count) || 0
   }
+  const locations = locationResult.rows.map(locationState)
+  const reportingRow = reportingResult.rows[0]
+  const datasets = {
+    restaurantProfiles: {
+      available: locations.some((location) => location.standardAccess),
+      locations: locations.filter((location) => location.standardAccess).length,
+    },
+    standardOrders: emptyDatasetCoverage(),
+    analyticsSales: emptyDatasetCoverage(),
+    analyticsPayouts: emptyDatasetCoverage(),
+  }
+  datasets.standardOrders.available = credentials.standard.configured
+    && locations.some((location) => location.selected && location.standardAccess)
+  datasets.analyticsSales.available = credentials.analytics.configured
+    && locations.some((location) => location.selected && location.analyticsAccess)
+  datasets.analyticsPayouts.available = datasets.analyticsSales.available
+  const datasetKeys: Record<ToastSyncJob['syncKind'], keyof Omit<typeof datasets, 'restaurantProfiles'>> = {
+    standard_orders: 'standardOrders',
+    analytics_sales: 'analyticsSales',
+    analytics_payouts: 'analyticsPayouts',
+  }
+  for (const row of datasetResult.rows) {
+    const dataset = datasets[datasetKeys[row.sync_kind]]
+    dataset.successfulJobs = count(row.successful_jobs)
+    dataset.failedJobs = count(row.failed_jobs)
+    dataset.businessDates = count(row.business_dates)
+    dataset.records = count(row.records)
+    dataset.latestBusinessDate = dateOnly(row.latest_business_date)
+  }
+  const selectedLocations = locations.filter((location) => location.selected).length
+  const successfulJobs = datasets.standardOrders.successfulJobs
+    + datasets.analyticsSales.successfulJobs
+    + datasets.analyticsPayouts.successfulJobs
+  const sourceRecords = datasets.standardOrders.records + datasets.analyticsSales.records + datasets.analyticsPayouts.records
+  const configuredCredentials = credentials.standard.configured || credentials.analytics.configured
+  const noDataReason = !configuredCredentials
+    ? 'credentials_required'
+    : selectedLocations === 0
+      ? 'locations_required'
+      : successfulJobs === 0
+        ? 'sync_required'
+        : sourceRecords === 0
+          ? 'no_records'
+          : null
+  const reporting: ToastReportingState = {
+    businessDays: count(reportingRow?.business_days),
+    firstBusinessDate: dateOnly(reportingRow?.first_business_date),
+    latestBusinessDate: dateOnly(reportingRow?.latest_business_date),
+    locationsWithData: count(reportingRow?.locations_with_data),
+    totals: {
+      grossSales: count(reportingRow?.gross_sales),
+      netSales: count(reportingRow?.net_sales),
+      discounts: count(reportingRow?.discounts),
+      voids: count(reportingRow?.voids),
+      refunds: count(reportingRow?.refunds),
+      orders: count(reportingRow?.orders_count),
+      guests: count(reportingRow?.guest_count),
+      standardOrders: count(reportingRow?.standard_orders_count),
+      analyticsRows: count(reportingRow?.analytics_rows),
+    },
+    datasets,
+    noDataReason,
+  }
   return {
     organizationId,
     credentials,
-    locations: locationResult.rows.map(locationState),
+    locations,
     jobs,
     accountingDrafts,
+    reporting,
     latestSyncAt: iso(latestResult.rows[0]?.latest),
   }
 }

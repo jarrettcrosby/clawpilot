@@ -46,6 +46,12 @@ flowchart LR
 5. Normalized daily sales and order counts are upserted per organization, restaurant, and business date.
 6. Each completed projection refreshes one idempotent accounting draft. The draft remains `needs_mapping` or `needs_review`; this worker has no QuickBooks credential or posting capability.
 
+## Organization Reporting
+
+The integration settings expose a reporting-readiness summary for the signed-in organization. It reports verified location profiles, successful business-date coverage, source record counts, daily order and guest totals, Analytics sales totals when available, sync failures, and accounting draft state. A completed sync that returns no orders is shown as a valid no-data result rather than a connection failure.
+
+Standard and Analytics readiness remain independent. An organization can connect Standard access for location profiles and order coverage without connecting Analytics; sales and payout reporting remains visibly unavailable until that organization supplies and verifies its own Analytics credential. Queries and API responses remain filtered by `organization_id`.
+
 ## Accounting Boundary
 
 Toast Analytics reporting is operational information, not a GAAP ledger. ClawPilot does not post raw Analytics rows directly to QuickBooks.
@@ -66,7 +72,7 @@ Toast Analytics reporting is operational information, not a GAAP ledger. ClawPil
 - `toast_accounting_mappings`
 - `toast_accounting_export_drafts`
 
-All rows are organization-scoped. Development and production use their own Postgres databases and credential records.
+All rows are organization-scoped. A multi-business user connects, selects, and reports on Toast only within the active workspace membership; credentials and restaurant data never cross root businesses. Development and production use their own Postgres databases and credential records.
 
 ## Current Release Boundary
 

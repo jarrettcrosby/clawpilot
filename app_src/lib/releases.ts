@@ -396,9 +396,15 @@ async function listReleases(fullHistory: boolean): Promise<ReleaseEntry[]> {
       SELECT
         id, commit_hash, environment, branch, deployment_id, title, summary,
         features, fixes, source, deployed_at, created_at, updated_at
-      FROM release_entries
-      WHERE $1::boolean
-        OR deployed_at >= now() - ($2::integer * interval '1 day')
+      FROM (
+        SELECT DISTINCT ON (environment, commit_hash)
+          id, commit_hash, environment, branch, deployment_id, title, summary,
+          features, fixes, source, deployed_at, created_at, updated_at
+        FROM release_entries
+        WHERE $1::boolean
+          OR deployed_at >= now() - ($2::integer * interval '1 day')
+        ORDER BY environment, commit_hash, deployed_at DESC, id DESC
+      ) latest_deployments
       ORDER BY deployed_at DESC, id DESC
     `,
     [fullHistory, MEMBER_RELEASE_HISTORY_DAYS],

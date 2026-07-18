@@ -1037,6 +1037,11 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
             {usersPayload?.isAdmin && usersPayload.canInvite ? (
               <Box component="form" onSubmit={inviteUser} mb={2.5}>
                 <Typography variant="subtitle2" color="text.primary" fontWeight={700} mb={1}>Invite</Typography>
+                <Alert severity="info" variant="outlined" sx={{ mb: 1.5, borderRadius: '8px' }}>
+                  Choose the organization whose data this person may access. New invitations start as Members; after inviting,
+                  the owner can promote the person to Admin and select administrative permissions on their user card. Enable
+                  CRM employee only when the person should own CRM records.
+                </Alert>
                 <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', sm: 'minmax(0, 1fr) minmax(0, 1fr) auto' }, gap: 1 }}>
                   <TextField
                     required
@@ -1144,6 +1149,15 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
                 const canChangeRole = manageable && currentUser?.role === 'owner'
                 const crmMappingManageable = canManageCrmMapping(user)
                 const crmEmployeeManageable = crmMappingManageable && user.role !== 'owner'
+                const permissionGuidance = user.role === 'owner'
+                  ? 'Owner access is fixed and always includes every permission. Transfer ownership through a separate audited workflow.'
+                  : !manageable
+                    ? currentUser?.email === user.email
+                      ? 'Your permissions are managed by another organization administrator.'
+                      : 'Manage access permission is required to change this user.'
+                    : user.role === 'member'
+                      ? 'Members can be granted work-creation access. Promote this user to Admin to enable administrative permissions.'
+                      : 'Admin permissions can be adjusted individually. An admin cannot grant access they do not hold.'
                 const userPending = pendingAction === `status:${user.email}`
                   || pendingAction === `access:${user.email}`
                   || pendingAction === `crm-employee:${user.email}`
@@ -1278,6 +1292,14 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
                           </TextField>
                         ) : null}
                       </Box>
+
+                      <Typography
+                        variant="caption"
+                        color="text.disabled"
+                        sx={{ display: 'block', mb: 0.75, lineHeight: 1.45 }}
+                      >
+                        {permissionGuidance}
+                      </Typography>
 
                       <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', sm: '1fr 1fr' }, columnGap: 2, rowGap: 0 }}>
                         {PERMISSIONS.map((permission) => {

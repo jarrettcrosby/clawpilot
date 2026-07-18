@@ -89,6 +89,17 @@ assert.ok(tasksRoute.includes("throw new Error('Worker board claim mismatch')"),
 const settings = read('app_src/components/settings/UserAccessDialog.tsx')
 assert.ok(settings.includes('SessionSecurityPanel'))
 assert.ok(settings.includes('label="Security"'))
+for (const fragment of [
+  'Choose the organization whose data this person may access.',
+  'New invitations start as Members',
+  'CRM employee only when the person should own CRM records.',
+  'Owner access is fixed and always includes every permission.',
+  'Your permissions are managed by another organization administrator.',
+  'Promote this user to Admin to enable administrative permissions.',
+  'An admin cannot grant access they do not hold.',
+]) {
+  assert.ok(settings.includes(fragment), `permission UI guidance missing ${fragment}`)
+}
 const securityPanel = read('app_src/components/settings/SessionSecurityPanel.tsx')
 for (const fragment of [
   'Browser sessions',

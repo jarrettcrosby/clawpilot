@@ -87,9 +87,10 @@ export async function GET(req: NextRequest) {
   try {
     const actor = await requireRequestUser(req)
     requirePostgres()
+    requireManager(actor)
     return json({
       ok: true,
-      canManage: actor.role === 'owner' || (actor.role === 'admin' && effectiveUserPermissions(actor).manageUserAccess),
+      canManage: true,
       integration: await getToastIntegrationState(organizationId(actor)),
     })
   } catch (error) {

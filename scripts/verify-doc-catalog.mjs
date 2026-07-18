@@ -21,6 +21,7 @@ const requiredCurrentDocuments = [
   'docs/decisions/0002-organization-rooted-tenancy.md',
   'docs/decisions/0003-crm-global-identity-and-sync.md',
   'docs/decisions/0004-local-first-knowledge-retrieval.md',
+  'docs/decisions/0005-multi-workspace-membership.md',
   'docs/modules/application-shell-and-access.md',
   'docs/modules/projects-and-tenancy.md',
   'docs/modules/pipeline-and-sync.md',

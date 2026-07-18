@@ -29,7 +29,10 @@ Provide a responsive, authenticated ClawPilot workspace with clear user identity
 - Owner and administrator sessions expire after one hour without verified user activity; member sessions expire after eight hours without activity. All sessions have a 24-hour absolute limit. Background polling does not extend inactivity by itself.
 - Settings > Security lists the signed-in user's active browsers with their authenticated identity, effective identity during support mode, sign-in address, and last-observed address. The user can revoke one browser or every other browser. Disabling an account or changing its access revokes that user's active browser sessions.
 - New users receive a branded welcome link first. That invitation must be valid before an invitation-purpose sign-in code can activate the account.
+- Invitations start with the Member role. The invitation form explains that organization selection controls data scope, the owner may promote the resulting user to Admin and select administrative permissions, and CRM employee status is only for people who may own CRM records.
 - The configured owner can invite users, assign global application roles, and grant explicit privileges. Application administration is independent from organization membership, so a child-organization user may also be a global application administrator.
+- The root owner can edit every non-owner account in the managed organization graph. Administrators with `manageUserAccess` can edit members but cannot promote users, edit another administrator, modify the owner, or grant privileges outside their own effective access.
+- Owner permissions are fixed. Member permissions are limited to work creation; administrative switches become available only after the owner promotes the person to Admin. Settings explains these constraints beside the disabled controls.
 - An invitation must assign the person to an existing organization or deliberately create a child organization. It must never synthesize a personal organization from the person's name or email.
 - Organization membership and hierarchy placement define the user's data graph. The global `owner`, `admin`, or `member` role plus explicit permissions controls application administration.
 - Each user manages name, job title, organization, timezone, locale, integrations, and sharing in Settings. Profile changes update that user's CRM Contact and organization membership projection.
@@ -52,6 +55,7 @@ Provide a responsive, authenticated ClawPilot workspace with clear user identity
   - authenticated and effective user identities plus validated `inet` sign-in and last-observed addresses
 - `app_user_workspace_preferences`, keyed by user email with nullable foreign keys to the default project board and pipeline
 - `app_users.organization_id`, organization hierarchy, global role, and explicit permissions
+- During multi-workspace migration, organization role and permission overrides move to membership records while `app_users.organization_id` remains only a compatibility/default pointer.
 - `audit_events.subject`, `audit_events.organization_id`, `audit_events.is_system`, and idempotent event keys
 - separate encrypted agent credential database
 
