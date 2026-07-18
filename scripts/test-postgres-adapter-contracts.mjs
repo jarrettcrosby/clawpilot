@@ -1299,6 +1299,8 @@ assertIncludes(authProxy, 'authorizedWorkerRequest', 'separate worker authentica
 assertIncludes(authProxy, '_next/static', 'auth proxy matcher')
 assertIncludes(authProxy, '/api/pipeline/sync/outbox/process', 'auth proxy public worker route')
 assertIncludes(authProxy, '/api/agents/dispatch/process', 'auth proxy public agent worker route')
+assertIncludes(authProxy, '/api/agents/research/process', 'auth proxy public agent research worker route')
+assertIncludes(authProxy, '/api/integrations/toast/process', 'auth proxy public Toast worker route')
 assertIncludes(authProxy, 'HOSTED_RUNTIME', 'auth proxy fail-closed hosted mode')
 
 const loginRoute = read('app_src/app/api/auth/login/route.ts')
