@@ -10,6 +10,9 @@ const root = process.cwd()
 const nodeRequire = createRequire(import.meta.url)
 const requireFromApp = createRequire(new URL('../app_src/package.json', import.meta.url))
 const ts = requireFromApp('typescript')
+const organizationId = '11111111-1111-4111-8111-111111111111'
+const otherOrganizationId = '22222222-2222-4222-8222-222222222222'
+const restaurantGuid = '33333333-3333-4333-8333-333333333333'
 
 function read(path) {
   return readFileSync(resolve(root, path), 'utf8')
@@ -87,9 +90,111 @@ for (const fragment of [
 }
 assert.ok(!persistence.includes('console.'), 'Toast persistence must not log credentials or payloads')
 
+const tenantQueries = []
+const tenantPersistence = loadTypeScriptModule('app_src/lib/persistence/toastIntegrations.ts', {
+  mocks: {
+    '@/lib/persistence/postgres': {
+      query: async (sql, params = []) => {
+        tenantQueries.push({ sql: String(sql), params: [...params] })
+        const organization = String(params[0] || '')
+        if (organization !== organizationId) return { rows: [], rowCount: 0 }
+        if (String(sql).includes('FROM organization_toast_credentials')) {
+          return {
+            rows: [{
+              organization_id: organizationId,
+              access_type: 'standard',
+              api_base_url: 'https://ws-api.toasttab.com',
+              client_id: 'standard-client-id',
+              client_secret_ciphertext: Buffer.from('ciphertext'),
+              client_secret_iv: Buffer.alloc(12),
+              client_secret_tag: Buffer.alloc(16),
+              client_secret_last_four: 'ABCD',
+              credential_version: 1,
+              sync_enabled: true,
+              verified_at: '2026-07-17T12:00:00.000Z',
+              last_error_code: null,
+              updated_at: '2026-07-17T12:00:00.000Z',
+            }],
+            rowCount: 1,
+          }
+        }
+        if (String(sql).includes('FROM toast_locations')) {
+          return {
+            rows: [{
+              organization_id: organizationId,
+              restaurant_guid: restaurantGuid,
+              restaurant_name: 'Test Restaurant',
+              location_name: null,
+              location_code: null,
+              timezone: 'America/New_York',
+              active: true,
+              test_mode: false,
+              archived: false,
+              analytics_access: false,
+              standard_access: true,
+              selected: true,
+              last_verified_at: '2026-07-17T12:00:00.000Z',
+              updated_at: '2026-07-17T12:00:00.000Z',
+            }],
+            rowCount: 1,
+          }
+        }
+        if (String(sql).includes('GROUP BY sync_kind')) {
+          return {
+            rows: [{
+              sync_kind: 'standard_orders',
+              successful_jobs: '2',
+              failed_jobs: '0',
+              business_dates: '2',
+              records: '0',
+              latest_business_date: '2026-07-17',
+            }],
+            rowCount: 1,
+          }
+        }
+        if (String(sql).includes('FROM toast_daily_sales')) {
+          return {
+            rows: [{
+              business_days: '2',
+              first_business_date: '2026-07-16',
+              latest_business_date: '2026-07-17',
+              locations_with_data: '1',
+              gross_sales: '0',
+              net_sales: '0',
+              discounts: '0',
+              voids: '0',
+              refunds: '0',
+              orders_count: '0',
+              guest_count: '0',
+              standard_orders_count: '0',
+              analytics_rows: '0',
+            }],
+            rowCount: 1,
+          }
+        }
+        if (String(sql).includes('max(completed_at)')) {
+          return { rows: [{ latest: '2026-07-17T12:00:00.000Z' }], rowCount: 1 }
+        }
+        return { rows: [], rowCount: 0 }
+      },
+      withTransaction: async (work) => work({ query: async () => ({ rows: [], rowCount: 0 }) }),
+    },
+  },
+})
+const tenantState = await tenantPersistence.readToastIntegrationStateFromPostgres(organizationId)
+assert.equal(tenantState.reporting.noDataReason, 'no_records')
+assert.equal(tenantState.reporting.datasets.standardOrders.businessDates, 2)
+assert.equal(tenantState.reporting.datasets.standardOrders.records, 0)
+const firstTenantQueryCount = tenantQueries.length
+await tenantPersistence.readToastIntegrationStateFromPostgres(otherOrganizationId)
+assert.ok(tenantQueries.slice(0, firstTenantQueryCount).every((entry) => entry.params[0] === organizationId))
+assert.ok(tenantQueries.slice(firstTenantQueryCount).every((entry) => entry.params[0] === otherOrganizationId))
+assert.equal(tenantState.organizationId, organizationId)
+
 const panel = read('app_src/components/settings/ToastIntegrationPanel.tsx')
 for (const fragment of [
   'Data available',
+  'Guests',
   'Restaurant profiles',
   'Standard orders',
   'Analytics sales',
@@ -105,6 +210,7 @@ for (const fragment of [
   'requireRequestUser',
   'actor.role !== \'owner\'',
   'permissions.manageUserAccess',
+  'requireManager(actor)',
   "action === 'update-credential'",
   "action === 'queue-sync'",
   "action === 'disconnect'",
@@ -121,8 +227,6 @@ assert.ok(settings.includes("activeIntegration === 'google' && isOwner"), 'Googl
 assert.ok(settings.includes("activeIntegration === 'knowledge' && isOwner"), 'knowledge settings must remain owner-only')
 
 process.env.AGENT_CREDENTIAL_ENCRYPTION_KEY = 'toast-test-encryption-key-0123456789abcdef'
-const organizationId = '11111111-1111-4111-8111-111111111111'
-const otherOrganizationId = '22222222-2222-4222-8222-222222222222'
 const cryptoModule = loadTypeScriptModule('app_src/lib/integrations/toastCredentialCrypto.ts', {
   mocks: {
     crypto,
@@ -147,7 +251,6 @@ assert.throws(
 )
 
 const requests = []
-const restaurantGuid = '33333333-3333-4333-8333-333333333333'
 const reportGuid = '44444444-4444-4444-8444-444444444444'
 const toastFetch = async (url, init = {}) => {
   requests.push({ url: String(url), init })

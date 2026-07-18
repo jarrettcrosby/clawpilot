@@ -363,7 +363,7 @@ export default function ToastIntegrationPanel() {
         <Box
           sx={{
             display: 'grid',
-            gridTemplateColumns: { xs: 'repeat(2, minmax(0, 1fr))', sm: 'repeat(4, minmax(0, 1fr))' },
+            gridTemplateColumns: { xs: 'repeat(2, minmax(0, 1fr))', sm: 'repeat(5, minmax(0, 1fr))' },
             borderBlock: '1px solid rgba(255,255,255,0.1)',
           }}
         >
@@ -373,6 +373,9 @@ export default function ToastIntegrationPanel() {
             ['Orders', numberLabel(integration.reporting.datasets.standardOrders.successfulJobs > 0
               ? integration.reporting.totals.standardOrders
               : integration.reporting.totals.orders)],
+            ['Guests', integration.reporting.datasets.analyticsSales.successfulJobs > 0
+              ? numberLabel(integration.reporting.totals.guests)
+              : '\u2014'],
             ['Net sales', integration.reporting.datasets.analyticsSales.successfulJobs > 0
               ? numberLabel(integration.reporting.totals.netSales, 2)
               : '\u2014'],

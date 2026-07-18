@@ -23,6 +23,15 @@ One app identity may hold memberships in multiple workspace organizations. Indep
 
 Global application role, organization membership role, and resource sharing remain separate controls. A user may own two organizations, administer the ClawPilot application globally, and still operate within only one tenant boundary per request.
 
+## Organization Access Contract
+
+- Store role and explicit permission overrides on each organization membership rather than copying one global permission set across independent businesses.
+- The root organization owner can manage memberships in that root and its descendant organization graph. An administrator of a child organization is limited to that child subtree and cannot manage a parent, sibling, or separate root.
+- Role presets provide a safe baseline: Owner has fixed full organization access, Admin may receive individually selected administrative permissions, and Member may receive work-creation permissions without administration privileges.
+- A delegating administrator cannot grant a permission or organization scope that the administrator does not already hold. Independent global platform administration remains a separate assignment.
+- Ownership transfer is a separate, recently authenticated, audited workflow. The ordinary permission matrix cannot disable or demote the current owner.
+- The interface shows both configured and effective access, including whether a control is fixed by role, inherited through the organization graph, or explicitly granted.
+
 ## Data Contract
 
 - Add an organization-membership table keyed by user email and workspace organization with organization role, permissions, status, and default preference.
