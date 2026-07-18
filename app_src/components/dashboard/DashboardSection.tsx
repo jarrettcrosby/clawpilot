@@ -28,48 +28,20 @@ import { deriveNowWorking } from '@/lib/nowWorking'
 import type { Task } from '@/lib/types'
 import { hourInUserTimeZone } from '@/lib/userDateTime'
 import { deriveNextActionGuidance, deriveStateTruth } from '@/lib/workItemModel'
+import type {
+  DashboardAvailability as Availability,
+  DashboardDocMeta as DocMeta,
+  DashboardPipelineSnapshot as PipelineSnapshot,
+  DashboardUserSummary as UserSummary,
+  DashboardWorkspaceSnapshot as WorkspaceSnapshot,
+} from '@/lib/dashboardBootstrapTypes'
+import { readWorkspaceBootstrap } from '@/lib/workspaceClient'
 
-type DocMeta = {
-  id: string
-  title: string
-  category: string
-  date: string
-  slug: string
-}
-
-type UserSummary = { displayName?: string | null; email?: string }
 type Filter = { priority: string[]; status: string[]; labels: string[] }
-type WorkspaceResource = {
-  id: string
-  name: string
-  ownerEmail: string
-  accessRole: 'owner' | 'editor' | 'viewer'
-}
-type WorkspaceSnapshot = {
-  boards: WorkspaceResource[]
-  pipelines: WorkspaceResource[]
-  selectedBoardId: string | null
-  selectedPipelineId: string | null
-  defaultBoardId: string | null
-  defaultPipelineId: string | null
-}
-type PipelineSnapshot = {
-  summary: {
-    opportunities: number
-    organizations: number
-    contacts: number
-    totalOpenValue: number
-  }
-  pipeline?: { id: string; name: string } | null
-}
-type Availability = {
-  tasks: boolean
-  docs: boolean
-  pipeline: boolean
-}
 type Props = {
   onNavigate: (section: string) => void
   onNavigateWithFilter?: (section: string, filter?: Filter) => void
+  initialWorkspaceId?: string | null
 }
 
 const STATUS_LABELS: Record<string, string> = {
@@ -151,18 +123,25 @@ function MetricValue({ available, loading, value }: { available: boolean; loadin
   return <Typography variant="h5" fontWeight={700} color="text.primary" lineHeight={1}>{available ? value : '—'}</Typography>
 }
 
-export default function DashboardSection({ onNavigate, onNavigateWithFilter }: Props) {
+export default function DashboardSection({ onNavigate, onNavigateWithFilter, initialWorkspaceId }: Props) {
   const { timeZone } = useUserDateTime()
-  const [tasks, setTasks] = useState<Task[]>([])
-  const [docs, setDocs] = useState<DocMeta[]>([])
-  const [pipelineSnapshot, setPipelineSnapshot] = useState<PipelineSnapshot | null>(null)
-  const [workspace, setWorkspace] = useState<WorkspaceSnapshot | null>(null)
-  const [user, setUser] = useState<UserSummary | null>(null)
-  const [availability, setAvailability] = useState<Availability>(EMPTY_AVAILABILITY)
-  const [snapshotTime, setSnapshotTime] = useState(0)
-  const [loading, setLoading] = useState(true)
+  const initialBootstrap = initialWorkspaceId ? readWorkspaceBootstrap(initialWorkspaceId) : null
+  const [tasks, setTasks] = useState<Task[]>(() => initialBootstrap?.tasks || [])
+  const [docs, setDocs] = useState<DocMeta[]>(() => initialBootstrap?.docs || [])
+  const [pipelineSnapshot, setPipelineSnapshot] = useState<PipelineSnapshot | null>(
+    () => initialBootstrap?.pipelineSnapshot || null,
+  )
+  const [workspace, setWorkspace] = useState<WorkspaceSnapshot | null>(() => initialBootstrap?.workspace || null)
+  const [user, setUser] = useState<UserSummary | null>(() => initialBootstrap?.user || null)
+  const [availability, setAvailability] = useState<Availability>(
+    () => initialBootstrap?.availability || EMPTY_AVAILABILITY,
+  )
+  const [snapshotTime, setSnapshotTime] = useState(
+    () => initialBootstrap ? Date.parse(initialBootstrap.generatedAt) || Date.now() : 0,
+  )
+  const [loading, setLoading] = useState(!initialBootstrap)
   const [selectionPending, setSelectionPending] = useState<'board' | 'pipeline' | null>(null)
-  const [loadWarning, setLoadWarning] = useState(false)
+  const [loadWarning, setLoadWarning] = useState(Boolean(initialBootstrap?.unavailable.length))
   const salutation = useMemo(() => greeting(timeZone), [timeZone])
   const selectedBoardId = workspace?.selectedBoardId || ''
   const selectedPipelineId = workspace?.selectedPipelineId || ''
@@ -204,14 +183,14 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter }: P
       const [tasksResult, pipelineResult] = scopedResults
       const [docsResult, usersResult] = independentResults
       const results = [tasksResult, docsResult, usersResult, pipelineResult]
-      const nextAvailability = { ...EMPTY_AVAILABILITY }
+      const successfulAvailability = { ...EMPTY_AVAILABILITY }
       if (tasksResult.status === 'fulfilled' && Array.isArray(tasksResult.value)) {
         setTasks(tasksResult.value as Task[])
-        nextAvailability.tasks = true
+        successfulAvailability.tasks = true
       }
       if (docsResult.status === 'fulfilled' && Array.isArray(docsResult.value)) {
         setDocs(docsResult.value as DocMeta[])
-        nextAvailability.docs = true
+        successfulAvailability.docs = true
       }
       if (usersResult.status === 'fulfilled' && usersResult.value && typeof usersResult.value === 'object') {
         const currentUser = (usersResult.value as { currentUser?: UserSummary }).currentUser
@@ -219,9 +198,13 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter }: P
       }
       if (pipelineResult.status === 'fulfilled' && isPipelineSnapshot(pipelineResult.value)) {
         setPipelineSnapshot(pipelineResult.value)
-        nextAvailability.pipeline = true
+        successfulAvailability.pipeline = true
       }
-      setAvailability(nextAvailability)
+      setAvailability((current) => ({
+        tasks: successfulAvailability.tasks || current.tasks,
+        docs: successfulAvailability.docs || current.docs,
+        pipeline: successfulAvailability.pipeline || current.pipeline,
+      }))
       setLoadWarning(workspaceFailed || results.some((result) => result.status === 'rejected'))
       setSnapshotTime(Date.now())
       setLoading(false)

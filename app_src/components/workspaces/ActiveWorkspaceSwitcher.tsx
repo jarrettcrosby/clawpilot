@@ -21,7 +21,12 @@ import AddBusinessRounded from '@mui/icons-material/AddBusinessRounded'
 import BusinessRounded from '@mui/icons-material/BusinessRounded'
 import CheckRounded from '@mui/icons-material/CheckRounded'
 import ExpandMoreRounded from '@mui/icons-material/ExpandMoreRounded'
-import { announceWorkspaceChange } from '@/lib/workspaceClient'
+import {
+  announceWorkspaceChange,
+  prefetchWorkspaceBootstrap,
+  rememberWorkspaceVisit,
+  selectWorkspacePrefetchTargets,
+} from '@/lib/workspaceClient'
 
 type Workspace = {
   organizationId: string
@@ -76,6 +81,10 @@ export default function ActiveWorkspaceSwitcher() {
     (workspace) => workspace.organizationId === payload.activeOrganizationId,
   ) || payload?.workspaces[0] || null, [payload])
 
+  useEffect(() => {
+    if (current?.organizationId) rememberWorkspaceVisit(current.organizationId)
+  }, [current?.organizationId])
+
   if (!current) return null
 
   function finishWorkspaceChange(activeWorkspace: ActiveWorkspace, organizationType: Workspace['organizationType']) {
@@ -106,10 +115,19 @@ export default function ActiveWorkspaceSwitcher() {
     setCreateOpen(false)
     setBusinessName('')
     setSwitching(null)
+    rememberWorkspaceVisit(activeWorkspace.organizationId)
     announceWorkspaceChange({
       organizationId: activeWorkspace.organizationId,
       organizationName: activeWorkspace.name,
     })
+  }
+
+  function openWorkspaceMenu(target: HTMLElement) {
+    setAnchor(target)
+    if (!payload || !current) return
+    for (const workspace of selectWorkspacePrefetchTargets(payload.workspaces, current.organizationId)) {
+      void prefetchWorkspaceBootstrap(workspace.organizationId)
+    }
   }
 
   async function selectWorkspace(organizationId: string) {
@@ -119,6 +137,7 @@ export default function ActiveWorkspaceSwitcher() {
     }
     setSwitching(organizationId)
     setError('')
+    const bootstrapPromise = prefetchWorkspaceBootstrap(organizationId)
     try {
       const response = await fetch('/api/auth/workspace', {
         method: 'POST',
@@ -129,6 +148,10 @@ export default function ActiveWorkspaceSwitcher() {
       if (!response.ok || !result.ok || !result.activeWorkspace) {
         throw new Error(result.error || 'Unable to switch businesses')
       }
+      await Promise.race([
+        bootstrapPromise,
+        new Promise<null>((resolve) => window.setTimeout(() => resolve(null), 200)),
+      ])
       const selected = payload?.workspaces.find((workspace) => workspace.organizationId === organizationId)
       finishWorkspaceChange(result.activeWorkspace, selected?.organizationType || 'member')
     } catch (caught) {
@@ -169,7 +192,7 @@ export default function ActiveWorkspaceSwitcher() {
           aria-label={`Active business: ${current.organizationName}`}
           aria-haspopup={canOpen ? 'menu' : undefined}
           aria-expanded={canOpen ? Boolean(anchor) : undefined}
-          onClick={(event) => { if (canOpen) setAnchor(event.currentTarget) }}
+          onClick={(event) => { if (canOpen) openWorkspaceMenu(event.currentTarget) }}
           startIcon={<BusinessRounded sx={{ fontSize: 17 }} />}
           endIcon={canOpen ? <ExpandMoreRounded sx={{ fontSize: 16 }} /> : undefined}
           sx={{

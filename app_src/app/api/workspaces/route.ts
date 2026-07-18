@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { readDashboardWorkspace } from '@/lib/dashboardWorkspace'
 import { requireRequestUser } from '@/lib/requestUser'
 import type { AppUser } from '@/lib/users'
 import {
@@ -10,9 +11,6 @@ import {
   PIPELINE_SELECTION_COOKIE,
   createPipelineSpace,
   createProjectBoard,
-  listPipelineSpaces,
-  listProjectBoards,
-  readWorkspacePreferences,
   removePipelineShare,
   removeProjectBoardShare,
   resolvePipelineSpaceAccess,
@@ -36,40 +34,17 @@ async function workspacePayload(
   selected?: { boardId?: string; pipelineId?: string },
   preferDefaults = false,
 ) {
-  const [boards, pipelines, preferences] = await Promise.all([
-    listProjectBoards(actor),
-    listPipelineSpaces(actor),
-    readWorkspacePreferences(actor),
-  ])
   const requestedBoardId = selected?.boardId || req.cookies.get(BOARD_SELECTION_COOKIE)?.value || ''
   const requestedPipelineId = selected?.pipelineId || req.cookies.get(PIPELINE_SELECTION_COOKIE)?.value || ''
-  const defaultBoard = boards.find((board) => board.id === preferences.defaultBoardId)
-    || boards.find((board) => board.ownerEmail === actor.email && board.isDefault)
-    || boards[0]
-  const defaultPipeline = pipelines.find((pipeline) => pipeline.id === preferences.defaultPipelineId)
-    || pipelines.find((pipeline) => pipeline.ownerEmail === actor.email && pipeline.isDefault)
-    || pipelines[0]
-  const selectedBoard = preferDefaults
-    ? defaultBoard
-    : boards.find((board) => board.id === requestedBoardId) || defaultBoard
-  const selectedPipeline = preferDefaults
-    ? defaultPipeline
-    : pipelines.find((pipeline) => pipeline.id === requestedPipelineId) || defaultPipeline
+  const workspace = await readDashboardWorkspace(actor, {
+    requestedBoardId,
+    requestedPipelineId,
+    preferDefaults,
+  })
 
   return {
     ok: true,
-    boards,
-    pipelines: pipelines.map((pipeline) => {
-      const { projection, sheetId, shortLinkId, ...summary } = pipeline
-      void projection
-      void sheetId
-      void shortLinkId
-      return summary
-    }),
-    selectedBoardId: selectedBoard?.id || null,
-    selectedPipelineId: selectedPipeline?.id || null,
-    defaultBoardId: defaultBoard?.id || null,
-    defaultPipelineId: defaultPipeline?.id || null,
+    ...workspace,
     activeWorkspace: {
       organizationId: actor.organizationId,
       name: actor.organizationName,

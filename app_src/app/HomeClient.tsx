@@ -17,7 +17,7 @@ import ImpersonationBanner from '@/components/auth/ImpersonationBanner'
 import { Box } from '@mui/material'
 import type { BoardFilter } from '@/components/projects/FilterBar'
 import { emptyFilter } from '@/components/projects/FilterBar'
-import { WORKSPACE_CHANGED_EVENT } from '@/lib/workspaceClient'
+import { WORKSPACE_CHANGED_EVENT, type WorkspaceChangedDetail } from '@/lib/workspaceClient'
 
 const SECTIONS = ['dashboard', 'docs', 'projects', 'pipeline', 'crm', 'links', 'agents', 'versions']
 const DESKTOP_NAV_COLLAPSED_KEY = 'clawpilot_desktop_nav_collapsed'
@@ -69,6 +69,7 @@ export default function HomeClient({
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
   const [boardFilter, setBoardFilter] = useState<BoardFilter>(emptyFilter())
   const [workspaceRevision, setWorkspaceRevision] = useState(0)
+  const [activeWorkspaceId, setActiveWorkspaceId] = useState<string | null>(null)
 
   const toggleDesktopNav = useCallback(() => {
     try {
@@ -136,9 +137,11 @@ export default function HomeClient({
   }, [activeSection, navigate, shortLinksEnabled])
 
   useEffect(() => {
-    function onWorkspaceChanged() {
+    function onWorkspaceChanged(event: Event) {
+      const detail = (event as CustomEvent<WorkspaceChangedDetail>).detail
       setMobileNavOpen(false)
       setBoardFilter(emptyFilter())
+      setActiveWorkspaceId(detail?.organizationId || null)
       setWorkspaceRevision((revision) => revision + 1)
     }
     window.addEventListener(WORKSPACE_CHANGED_EVENT, onWorkspaceChanged)
@@ -225,7 +228,11 @@ export default function HomeClient({
         >
           {section === 'dashboard' && (
             <Box sx={{ height: '100%', overflow: 'auto' }}>
-              <DashboardSection onNavigate={navigate} onNavigateWithFilter={navigateWithFilter} />
+              <DashboardSection
+                onNavigate={navigate}
+                onNavigateWithFilter={navigateWithFilter}
+                initialWorkspaceId={activeWorkspaceId}
+              />
             </Box>
           )}
           {section === 'docs' && (
