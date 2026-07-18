@@ -28,7 +28,7 @@ Both the `development` and `production` Postgres volume instances must have:
 
 Provider backups are incremental, Copy-on-Write volume snapshots and are billed as volume storage. Railway limits a manual backup to 50% of the volume's total capacity.
 
-Current Railway references, checked on 2026-07-13 EDT:
+Current Railway references, checked on 2026-07-18 EDT:
 
 - [Volume backups](https://docs.railway.com/volumes/backups)
 - [PostgreSQL backups and observability](https://docs.railway.com/databases/postgresql)
@@ -37,7 +37,7 @@ Current Railway references, checked on 2026-07-13 EDT:
 
 ## Live Provider Evidence
 
-The final read-only Railway GraphQL audit at `2026-07-14T00:39:54.682Z` returned the following state for project `clawpilot` (`b5169ebd-8166-4b96-9a81-7cc8adaa9270`):
+The initial read-only Railway GraphQL audit at `2026-07-14T00:39:54.682Z` returned the following state for project `clawpilot` (`b5169ebd-8166-4b96-9a81-7cc8adaa9270`):
 
 | Environment | Environment ID | Volume instance ID | Used / capacity | Schedules | Provider backups |
 |---|---|---|---:|---|---|
@@ -46,7 +46,7 @@ The final read-only Railway GraphQL audit at `2026-07-14T00:39:54.682Z` returned
 
 Both instances were `READY`, mounted at `/var/lib/postgresql/data`, and attached to the shared Railway service definition `Postgres` (`bc62c97a-e87f-43fa-8c87-a7503d5565e9`). The volumes are isolated by environment even though Railway reports the same logical volume and service IDs.
 
-That GraphQL result is the pre-configuration baseline. The authenticated dashboard evidence below supersedes its backup and schedule columns: both environments now have a verified manual provider snapshot and active daily, weekly, and monthly schedules.
+That GraphQL result is the pre-configuration baseline. The authenticated dashboard evidence below supersedes its backup and schedule columns: both environments now have verified provider snapshots, active daily, weekly, and monthly schedules, and point-in-time recovery.
 
 ### CLI Limitation And Dashboard Resolution
 
@@ -58,8 +58,19 @@ The operator-authenticated Railway dashboard was used to complete the policy:
 
 1. `production`: **Daily**, **Weekly**, and **Monthly** schedules are checked; the manual backup is listed.
 2. `development`: **Daily**, **Weekly**, and **Monthly** schedules are checked; the manual backup is listed.
-3. The persisted checkbox state was reopened and verified in both environments on `2026-07-14`.
+3. The persisted checkbox state was reopened and verified in both environments on `2026-07-14`; production was rechecked on `2026-07-18` with all three schedules still enabled.
 4. The read-only API audit remains the repeatable machine gate when an account or workspace API token is available.
+
+### Point-In-Time Recovery Evidence
+
+The authenticated Railway dashboard was inspected without staging a restore or changing either service on `2026-07-18`:
+
+| Environment | Earliest displayed recovery point | Latest displayed recovery point | State |
+|---|---|---|---|
+| `development` | `2026-07-15 17:48 EDT` | `2026-07-18 18:05 EDT` | enabled |
+| `production` | `2026-07-14 16:33 EDT` | `2026-07-18 18:07 EDT` | enabled |
+
+Railway reports that a PITR restore creates a new Postgres service and leaves the source running. PITR is independent of the daily, weekly, monthly, and manual volume backups, so both controls remain enabled.
 
 ## Repeatable Audit
 
@@ -104,6 +115,12 @@ Before the managed pipeline and credential migrations, PostgreSQL 18 custom-form
 
 These artifacts are local logical recovery points, not Railway provider snapshots. They remain outside Git under the ignored `backups/` directory.
 
+Before the production data-retirement pass, another PostgreSQL 18 custom-format dump was created and validated:
+
+| Environment | Local ignored artifact | Size | SHA-256 |
+|---|---|---:|---|
+| `production` | `backups/postgres/clawpilot-production-20260718T212924Z-pre-hygiene.dump` | 2,104,295 bytes | `bd1dcf690b7003832e22306bbcbc7f3a0e1da4e1a81203590d9f88f975f2f5d8` |
+
 ### Verified Railway Provider Snapshots
 
 Manual Railway volume backups were created and confirmed in the authenticated Railway dashboard on `2026-07-14` before the credential and managed-pipeline migrations:
@@ -130,6 +147,23 @@ Railway retains the original volume unmounted after staging the replacement. A r
 
 For a logical restore, provision a separate Postgres database first. Restore into the separate database, validate it, then change `DATABASE_URL` deliberately. Do not overwrite the active production database as the first restore step.
 
-Railway point-in-time recovery is a separate feature. Enabling it creates a storage bucket, adds WAL archive variables, and redeploys Postgres. It was not enabled or verified during this review.
+### Verified Logical Restore Drill
+
+The `2026-07-18` pre-hygiene production dump was restored on `2026-07-18` into a uniquely named temporary database on the development Postgres service. The active development and production databases were not changed. Validation returned:
+
+| Check | Result |
+|---|---:|
+| Applied migration records | 61 |
+| Users | 7 |
+| Workspace organizations | 5 |
+| Tasks | 16 |
+| Pipeline spaces | 5 |
+| CRM organizations | 64 |
+| CRM contacts | 66 |
+| CRM interactions | 240 |
+| Audit events | 1,808 |
+| Unvalidated foreign keys | 0 |
+
+The temporary restore database was dropped after validation. This proves the ignored logical artifact can be read and restored independently; it does not replace a provider-native volume or PITR drill during a planned maintenance window.
 
 Use [ClawPilot environments and deployment](clawpilot-environments.md) for release sequencing and [Shared short links](../modules/short-links.md) for public link routing. Backup evidence must remain focused on recovery controls.

@@ -91,6 +91,8 @@ Verify both development and production after release-facing changes:
 
 Also validate the affected authenticated browser workflow. A green build does not replace live board, agent-thread, CRM, Sheet, or mobile acceptance.
 
+The `Deployed runtime monitor` GitHub workflow checks both custom domains every 30 minutes without application credentials. It verifies the login boundary, Postgres persistence, migrations, SuiteCRM, pipeline, agent, research, Toast, QuickBooks, AI Radar, and document-embedding worker health. A failed scheduled run is an operational alert and must not be dismissed as a deployment-only failure.
+
 ## Recovery And Rollback
 
 Stop or freeze affected writes before restoring data. Roll code back to the previous reviewed commit when the defect is application-only. Restore Postgres, MariaDB, and SuiteCRM volume checkpoints as a coordinated recovery when data integrity is affected; preserve and later drain durable outbox work only after the restored projections are verified. Re-run migrations and deployed smoke checks before reopening writes.

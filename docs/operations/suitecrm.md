@@ -110,6 +110,16 @@ npm run crm:delete-unresolved-interactions
 
 The cleanup cancels stale upserts, queues native SuiteCRM deletion, removes active Postgres records and generated workbook projections, disables their short links, and retires every matched Global ID so it can never be allocated again.
 
+The July production-hygiene cleanup for the two approved test interactions, their linked test meeting, and the obsolete pre-reconciliation workbook failure is separately guarded and auditable:
+
+```bash
+CLAWPILOT_RETIRE_CONFIRM=production-test-data-v1 \
+CLAWPILOT_RETIRE_ACTOR=jarrett@suburbiasandwichco.com \
+npm run crm:retire-production-test-data
+```
+
+This command verifies exact Global IDs and subjects before changing data, queues SuiteCRM record deletion, retires all affected Global IDs and short links, and records the removed dead outbox payload in `audit_events`. The historical Google Calendar provider ID is retained as audit evidence because the event is already in the past; the command does not use a current user's Calendar connection to mutate an event created under an older organizer selection.
+
 After a public-domain change, update `SUITECRM_PUBLIC_URL` on both services and redeploy SuiteCRM before ClawPilot. Confirm the managed `site_url` and trusted-host entries, then test `/api/crm/punchout` as an owner/admin and confirm a member receives `403`.
 
 ## Upgrade Rule

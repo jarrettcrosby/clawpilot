@@ -52,6 +52,7 @@ import RefreshRounded from '@mui/icons-material/RefreshRounded'
 import SearchRounded from '@mui/icons-material/SearchRounded'
 import UploadFileRounded from '@mui/icons-material/UploadFileRounded'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
+import { annotateInteractionEventHistory } from '@/lib/crm/interactionHistory.mjs'
 import WorkspaceSelector from '@/components/workspaces/WorkspaceSelector'
 import type { CrmEntity, CrmSummary } from '@/lib/crm/types'
 import { formatUserDateTime, type UserDateTimeSettings } from '@/lib/userDateTime'
@@ -232,7 +233,7 @@ function columns(entity: CrmEntity) {
   ] as const
   return [
     ['referenceCode', 'ID'], ['subject', 'Interaction'], ['organizationName', 'Organization'], ['interactionType', 'Type'],
-    ['occurredAt', 'Date'], ['agentName', 'Agent'],
+    ['eventAction', 'Event action'], ['occurredAt', 'Date'], ['agentName', 'Agent'],
   ] as const
 }
 
@@ -385,7 +386,8 @@ export default function CrmSection() {
       const response = await fetch(`/api/crm?${parameters}`)
       const payload = await response.json().catch(() => ({})) as CrmPayload
       if (!response.ok || !payload.ok) throw new Error(payload.error || 'Unable to load CRM records')
-      setRecords(payload.records || [])
+      const nextRecords = payload.records || []
+      setRecords(nextEntity === 'interactions' ? annotateInteractionEventHistory(nextRecords) : nextRecords)
       setSummary(payload.summary || EMPTY_SUMMARY)
       setPipeline(payload.pipeline || null)
       setWorkspaceHierarchy(payload.workspaceHierarchy || [])

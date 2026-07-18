@@ -1,11 +1,11 @@
 ---
 id: cp-module-user-integrations
 title: User Integrations and Credentials
-summary: Per-user Maton connections, organization Toast access, Google Workspace administration, managed resources, and credential controls.
+summary: Per-user Maton connections, organization QuickBooks and Toast access, Google Workspace administration, managed resources, and credential controls.
 status: active
 kind: module-contract
 area: integrations
-tags: [integrations, maton, toast, google-workspace, credentials, tenancy]
+tags: [integrations, maton, quickbooks, toast, google-workspace, credentials, tenancy]
 app_visible: true
 ---
 
@@ -49,6 +49,14 @@ Keep user-owned Maton accounts separate from the platform Google Workspace crede
 - Selected restaurants synchronize through a leased, retryable Postgres outbox. Raw provider records are immutable snapshots; daily sales are normalized projections.
 - Toast ingestion only creates a reviewable accounting draft. It cannot post to QuickBooks. See [Toast Sales and Accounting](toast-and-accounting.md) for the data flow and release boundary.
 
+## QuickBooks Organization Contract
+
+- QuickBooks authorization starts as a per-user Maton connection, but the selected company is explicitly bound to the active ClawPilot organization before any business data is read.
+- A single provider connection cannot be bound to multiple organizations. Switching workspaces never reuses the previous organization's company, account catalog, product catalog, or Toast mappings.
+- Settings exposes a read-only company, chart-of-accounts, and item catalog. A manager explicitly selects products or services to import into the active CRM and pipeline catalog.
+- Selected Toast locations can map accounting categories to active QuickBooks accounts. Mapping changes are organization-scoped and audited.
+- Disconnecting or rebinding clears cached provider catalog rows and invalidates stale accounting mappings. Provider writes remain disabled. See [QuickBooks Accounting Connector](quickbooks-accounting.md).
+
 ## Managed Pipeline Resources
 
 - Provisioning is an explicit pipeline-owner command.
@@ -77,4 +85,5 @@ Use the [Google Workspace integration runbook](../operations/google-workspace-in
 4. Check `/api/pipeline/sync-status` and the worker heartbeat after a pull or queued write.
 5. Confirm Knowledge remains `Local` unless the owner deliberately enables `External` and the dedicated key is configured.
 6. Confirm each Toast access type reports its own verified state, selected locations are correct, and accounting output remains a draft.
-7. Rotate credentials through Settings or the owning server environment as appropriate; never add plaintext keys, private keys, OAuth tokens, or full connection IDs to documentation, logs, or release copy.
+7. Confirm the QuickBooks company shown in Settings belongs to the active organization, catalog sync is current, and no financial posting controls are exposed.
+8. Rotate credentials through Settings or the owning server environment as appropriate; never add plaintext keys, private keys, OAuth tokens, or full connection IDs to documentation, logs, or release copy.
