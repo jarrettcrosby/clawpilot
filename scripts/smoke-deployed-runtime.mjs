@@ -91,6 +91,8 @@ try {
     if (health?.runtime === 'railway') {
       check(health?.worker?.status === 'reachable', 'pipeline outbox worker heartbeat is fresh')
       check(health?.agentWorker?.status === 'reachable', 'agent dispatch worker heartbeat is fresh')
+      check(health?.agentResearchWorker?.status === 'reachable', 'agent research worker heartbeat is fresh')
+      check(health?.toastWorker?.status === 'reachable', 'Toast sync worker heartbeat is fresh')
       check(health?.credentialStore?.status === 'reachable', 'shared agent credential store is reachable')
       const knowledgeWorkers = Array.isArray(health?.knowledgeWorkers) ? health.knowledgeWorkers : []
       const aiRadar = knowledgeWorkers.find((entry) => entry?.name === 'ai-radar')
