@@ -13,6 +13,7 @@ import Switch from '@mui/material/Switch'
 import TextField from '@mui/material/TextField'
 import Typography from '@mui/material/Typography'
 import AnalyticsRounded from '@mui/icons-material/AnalyticsRounded'
+import AssessmentRounded from '@mui/icons-material/AssessmentRounded'
 import CloudDoneRounded from '@mui/icons-material/CloudDoneRounded'
 import KeyRounded from '@mui/icons-material/KeyRounded'
 import LocationOnRounded from '@mui/icons-material/LocationOnRounded'
@@ -55,12 +56,47 @@ type LocationState = {
   updatedAt: string
 }
 
+type DatasetCoverage = {
+  available: boolean
+  successfulJobs: number
+  failedJobs: number
+  businessDates: number
+  records: number
+  latestBusinessDate: string | null
+}
+
+type ReportingState = {
+  businessDays: number
+  firstBusinessDate: string | null
+  latestBusinessDate: string | null
+  locationsWithData: number
+  totals: {
+    grossSales: number
+    netSales: number
+    discounts: number
+    voids: number
+    refunds: number
+    orders: number
+    guests: number
+    standardOrders: number
+    analyticsRows: number
+  }
+  datasets: {
+    restaurantProfiles: { available: boolean; locations: number }
+    standardOrders: DatasetCoverage
+    analyticsSales: DatasetCoverage
+    analyticsPayouts: DatasetCoverage
+  }
+  noDataReason: 'credentials_required' | 'locations_required' | 'sync_required' | 'no_records' | null
+}
+
 type IntegrationState = {
   organizationId: string
   credentials: Record<AccessType, CredentialState>
   locations: LocationState[]
   jobs: { pending: number; processing: number; failed: number; dead: number; succeeded: number }
   accountingDrafts: { needsMapping: number; needsReview: number; approved: number; posted: number; failed: number }
+  reporting: ReportingState
   latestSyncAt: string | null
 }
 
@@ -93,6 +129,30 @@ const EMPTY_STATE: IntegrationState = {
   locations: [],
   jobs: { pending: 0, processing: 0, failed: 0, dead: 0, succeeded: 0 },
   accountingDrafts: { needsMapping: 0, needsReview: 0, approved: 0, posted: 0, failed: 0 },
+  reporting: {
+    businessDays: 0,
+    firstBusinessDate: null,
+    latestBusinessDate: null,
+    locationsWithData: 0,
+    totals: {
+      grossSales: 0,
+      netSales: 0,
+      discounts: 0,
+      voids: 0,
+      refunds: 0,
+      orders: 0,
+      guests: 0,
+      standardOrders: 0,
+      analyticsRows: 0,
+    },
+    datasets: {
+      restaurantProfiles: { available: false, locations: 0 },
+      standardOrders: { available: false, successfulJobs: 0, failedJobs: 0, businessDates: 0, records: 0, latestBusinessDate: null },
+      analyticsSales: { available: false, successfulJobs: 0, failedJobs: 0, businessDates: 0, records: 0, latestBusinessDate: null },
+      analyticsPayouts: { available: false, successfulJobs: 0, failedJobs: 0, businessDates: 0, records: 0, latestBusinessDate: null },
+    },
+    noDataReason: 'credentials_required',
+  },
   latestSyncAt: null,
 }
 
@@ -125,6 +185,27 @@ function errorMessage(error: unknown) {
 
 function accessLabel(accessType: AccessType) {
   return accessType === 'analytics' ? 'Analytics API' : 'Standard API'
+}
+
+function numberLabel(value: number, maximumFractionDigits = 0) {
+  return new Intl.NumberFormat(undefined, { maximumFractionDigits }).format(value)
+}
+
+function datasetStatus(dataset: DatasetCoverage, credentialConfigured: boolean) {
+  if (dataset.failedJobs > 0) return { label: 'Needs attention', color: 'error' as const }
+  if (dataset.successfulJobs > 0 && dataset.records === 0) return { label: 'No data', color: 'default' as const }
+  if (dataset.successfulJobs > 0) return { label: 'Reporting', color: 'success' as const }
+  if (dataset.available) return { label: 'Ready to sync', color: 'info' as const }
+  if (credentialConfigured) return { label: 'Select location', color: 'warning' as const }
+  return { label: 'Not connected', color: 'default' as const }
+}
+
+function noDataMessage(reason: ReportingState['noDataReason']) {
+  if (reason === 'credentials_required') return 'Connect a Toast credential to populate reporting.'
+  if (reason === 'locations_required') return 'Select at least one verified location to populate reporting.'
+  if (reason === 'sync_required') return 'Connection verified. Sync a completed business date to populate reporting.'
+  if (reason === 'no_records') return 'Connection verified. No completed Toast records were returned for the synced business dates.'
+  return ''
 }
 
 export default function ToastIntegrationPanel() {
@@ -271,6 +352,91 @@ export default function ToastIntegrationPanel() {
           sx={{ m: 0 }}
         />
       </Stack>
+
+      <Divider sx={{ my: 3 }} />
+
+      <Box component="section" aria-labelledby="toast-reporting-heading">
+        <Stack direction="row" spacing={1} alignItems="center" mb={1.5}>
+          <AssessmentRounded color="primary" />
+          <Typography id="toast-reporting-heading" fontWeight={700}>Data available</Typography>
+        </Stack>
+        <Box
+          sx={{
+            display: 'grid',
+            gridTemplateColumns: { xs: 'repeat(2, minmax(0, 1fr))', sm: 'repeat(4, minmax(0, 1fr))' },
+            borderBlock: '1px solid rgba(255,255,255,0.1)',
+          }}
+        >
+          {[
+            ['Business dates', numberLabel(integration.reporting.businessDays)],
+            ['Locations', numberLabel(integration.reporting.locationsWithData)],
+            ['Orders', numberLabel(integration.reporting.datasets.standardOrders.successfulJobs > 0
+              ? integration.reporting.totals.standardOrders
+              : integration.reporting.totals.orders)],
+            ['Net sales', integration.reporting.datasets.analyticsSales.successfulJobs > 0
+              ? numberLabel(integration.reporting.totals.netSales, 2)
+              : '\u2014'],
+          ].map(([label, value], index) => (
+            <Box
+              key={label}
+              sx={{
+                py: 1.5,
+                px: { xs: 1, sm: 1.5 },
+                borderLeft: index % 2 ? '1px solid rgba(255,255,255,0.08)' : 0,
+                borderTop: { xs: index > 1 ? '1px solid rgba(255,255,255,0.08)' : 0, sm: 0 },
+                '&:not(:first-of-type)': { borderLeft: { sm: '1px solid rgba(255,255,255,0.08)' } },
+              }}
+            >
+              <Typography variant="caption" color="text.secondary">{label}</Typography>
+              <Typography fontWeight={700} sx={{ overflowWrap: 'anywhere' }}>{value}</Typography>
+            </Box>
+          ))}
+        </Box>
+        <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 1 }}>
+          {integration.reporting.firstBusinessDate && integration.reporting.latestBusinessDate
+            ? `Coverage ${integration.reporting.firstBusinessDate} through ${integration.reporting.latestBusinessDate}`
+            : 'No business-date coverage yet'}
+        </Typography>
+        <Stack spacing={1} mt={1.5}>
+          {[
+            {
+              label: 'Restaurant profiles',
+              detail: `${integration.reporting.datasets.restaurantProfiles.locations} verified`,
+              status: integration.reporting.datasets.restaurantProfiles.available
+                ? { label: 'Available', color: 'success' as const }
+                : { label: 'Not connected', color: 'default' as const },
+            },
+            {
+              label: 'Standard orders',
+              detail: `${integration.reporting.datasets.standardOrders.businessDates} dates / ${integration.reporting.datasets.standardOrders.records} records`,
+              status: datasetStatus(integration.reporting.datasets.standardOrders, integration.credentials.standard.configured),
+            },
+            {
+              label: 'Analytics sales',
+              detail: `${integration.reporting.datasets.analyticsSales.businessDates} dates / ${integration.reporting.datasets.analyticsSales.records} rows`,
+              status: datasetStatus(integration.reporting.datasets.analyticsSales, integration.credentials.analytics.configured),
+            },
+            {
+              label: 'Analytics payouts',
+              detail: `${integration.reporting.datasets.analyticsPayouts.businessDates} dates / ${integration.reporting.datasets.analyticsPayouts.records} rows`,
+              status: datasetStatus(integration.reporting.datasets.analyticsPayouts, integration.credentials.analytics.configured),
+            },
+          ].map((dataset) => (
+            <Stack key={dataset.label} direction="row" spacing={1} alignItems="center" justifyContent="space-between">
+              <Box minWidth={0}>
+                <Typography variant="body2" fontWeight={650}>{dataset.label}</Typography>
+                <Typography variant="caption" color="text.secondary">{dataset.detail}</Typography>
+              </Box>
+              <Chip size="small" color={dataset.status.color} variant="outlined" label={dataset.status.label} />
+            </Stack>
+          ))}
+        </Stack>
+        {integration.reporting.noDataReason ? (
+          <Alert severity="info" sx={{ mt: 1.5, borderRadius: '8px' }}>
+            {noDataMessage(integration.reporting.noDataReason)}
+          </Alert>
+        ) : null}
+      </Box>
 
       <Divider sx={{ my: 3 }} />
 

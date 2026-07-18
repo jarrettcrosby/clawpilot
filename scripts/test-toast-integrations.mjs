@@ -79,10 +79,26 @@ for (const fragment of [
   "'toast.sync.queued'",
   'refreshToastAccountingDraftInPostgres',
   'idempotency_key',
+  'reporting: ToastReportingState',
+  "result_summary ->> 'records'",
+  'WHERE organization_id = $1::uuid\n       GROUP BY sync_kind',
 ]) {
   assert.ok(persistence.includes(fragment), `Toast persistence contract missing ${fragment}`)
 }
 assert.ok(!persistence.includes('console.'), 'Toast persistence must not log credentials or payloads')
+
+const panel = read('app_src/components/settings/ToastIntegrationPanel.tsx')
+for (const fragment of [
+  'Data available',
+  'Restaurant profiles',
+  'Standard orders',
+  'Analytics sales',
+  'Analytics payouts',
+  'Coverage ${integration.reporting.firstBusinessDate} through ${integration.reporting.latestBusinessDate}',
+  'No completed Toast records were returned for the synced business dates.',
+]) {
+  assert.ok(panel.includes(fragment), `Toast reporting panel missing ${fragment}`)
+}
 
 const route = read('app_src/app/api/integrations/toast/route.ts')
 for (const fragment of [

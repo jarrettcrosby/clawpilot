@@ -19,6 +19,7 @@ Decision records explain durable choices and tradeoffs. Current behavior still l
 | [0002 - Organization-Rooted Tenancy](0002-organization-rooted-tenancy.md) | Accepted | Access, projects, short links |
 | [0003 - CRM Global Identity and Synchronization](0003-crm-global-identity-and-sync.md) | Accepted | CRM, SuiteCRM, pipeline |
 | [0004 - Local-First Knowledge Retrieval](0004-local-first-knowledge-retrieval.md) | Accepted | Knowledge and integrations |
+| [0005 - Multi-Workspace User Membership](0005-multi-workspace-membership.md) | Accepted | Access, sessions, all tenant modules |
 
 ## When To Add A Decision
 

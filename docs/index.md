@@ -28,6 +28,7 @@ This repository is the canonical source for ClawPilot product, engineering, and 
 - [Organization-rooted tenancy](decisions/0002-organization-rooted-tenancy.md)
 - [CRM Global Identity and synchronization](decisions/0003-crm-global-identity-and-sync.md)
 - [Local-first knowledge retrieval](decisions/0004-local-first-knowledge-retrieval.md)
+- [Multi-workspace user membership](decisions/0005-multi-workspace-membership.md)
 
 ## Active Module Contracts
 
