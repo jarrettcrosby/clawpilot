@@ -131,9 +131,8 @@ export async function resolveCrmBoardBinding(boardId: string): Promise<CrmBoardB
     }>(
       `SELECT board.id::text AS board_id, projection.pipeline_id::text,
          projection.workspace_organization_id::text, board.owner_email,
-         app_user.organization_id::text AS owner_organization_id, board.name AS board_name
+         board.workspace_organization_id::text AS owner_organization_id, board.name AS board_name
        FROM project_boards board
-       JOIN app_users app_user ON app_user.email = board.owner_email
        LEFT JOIN crm_board_projections projection ON projection.board_id = board.id
        WHERE board.id = $1::uuid
        FOR UPDATE OF board`,

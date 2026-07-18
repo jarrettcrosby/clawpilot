@@ -106,7 +106,13 @@ export async function POST(req: NextRequest) {
     })
     const res = NextResponse.json({ ok: true })
     setBrowserSessionCookie(res, issued)
-    await recordAuthActivity({ req, email: ownerEmail, eventType: 'auth.login.succeeded', method: 'operator_password' }).catch(() => undefined)
+    await recordAuthActivity({
+      req,
+      email: ownerEmail,
+      eventType: 'auth.login.succeeded',
+      method: 'operator_password',
+      organizationId: issued.session.activeWorkspaceOrganizationId,
+    }).catch(() => undefined)
     return res
   } catch (e: unknown) {
     return NextResponse.json({ ok: false, error: String(e) }, { status: 500 })

@@ -11,8 +11,8 @@ import {
 async function context(req: NextRequest) {
   const actor = await requireRequestUser(req)
   const selected = req.cookies.get(PIPELINE_SELECTION_COOKIE)?.value || undefined
-  const pipeline = await resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: selected })
-    .catch(() => resolvePipelineSpaceAccess({ actorEmail: actor.email }))
+  const pipeline = await resolvePipelineSpaceAccess({ actorEmail: actor, pipelineId: selected })
+    .catch(() => resolvePipelineSpaceAccess({ actorEmail: actor }))
   if (pipeline.ownerEmail !== actor.email || pipeline.accessRole !== 'owner') {
     throw new Error('Only the pipeline owner can import its CRM workbook')
   }

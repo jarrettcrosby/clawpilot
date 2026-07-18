@@ -26,8 +26,8 @@ function clean(value: unknown, limit: number): string {
 async function requestContext(req: NextRequest, requireEdit: boolean) {
   const actor = await requireRequestUser(req)
   const selected = req.cookies.get(BOARD_SELECTION_COOKIE)?.value || undefined
-  const board = await resolveProjectBoardAccess({ actorEmail: actor.email, boardId: selected })
-    .catch(() => resolveProjectBoardAccess({ actorEmail: actor.email }))
+  const board = await resolveProjectBoardAccess({ actorEmail: actor, boardId: selected })
+    .catch(() => resolveProjectBoardAccess({ actorEmail: actor }))
   if (requireEdit) requireResourceEditor(board)
   return { actor, board }
 }

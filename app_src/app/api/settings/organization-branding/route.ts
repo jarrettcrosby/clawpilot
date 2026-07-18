@@ -1,10 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { ensurePrimaryWorkspaceOrganization } from '@/lib/organizations'
 import {
   readWorkspaceOrganizationBranding,
   updateWorkspaceOrganizationBranding,
 } from '@/lib/organizationBranding'
 import { requireRequestUser } from '@/lib/requestUser'
+import { effectiveAuthorizationRole } from '@/lib/users'
 
 export const runtime = 'nodejs'
 
@@ -36,11 +36,12 @@ function statusFor(error: unknown) {
 export async function GET(req: NextRequest) {
   try {
     const actor = await requireRequestUser(req)
-    const organization = await ensurePrimaryWorkspaceOrganization(actor.email)
+    if (!actor.organizationId) throw new Error('Active workspace is not available')
+    const role = effectiveAuthorizationRole(actor)
     return NextResponse.json({
       ok: true,
-      canEdit: actor.role === 'owner' || actor.role === 'admin',
-      branding: await readWorkspaceOrganizationBranding(organization.id),
+      canEdit: role === 'owner' || role === 'admin',
+      branding: await readWorkspaceOrganizationBranding(actor.organizationId),
     })
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unable to load organization branding'
@@ -51,10 +52,11 @@ export async function GET(req: NextRequest) {
 export async function PUT(req: NextRequest) {
   try {
     const actor = await requireRequestUser(req)
-    if (actor.role !== 'owner' && actor.role !== 'admin') {
+    const role = effectiveAuthorizationRole(actor)
+    if (role !== 'owner' && role !== 'admin') {
       throw new Error('Organization admin permission is required')
     }
-    const organization = await ensurePrimaryWorkspaceOrganization(actor.email)
+    if (!actor.organizationId) throw new Error('Active workspace is not available')
     const form = await req.formData()
     const logo = form.get('logo')
     const removeLogo = String(form.get('removeLogo') || '') === 'true'
@@ -70,7 +72,7 @@ export async function PUT(req: NextRequest) {
       if (!logoMimeType) throw new Error('Organization logos must be PNG, JPEG, or WebP images')
     }
     const branding = await updateWorkspaceOrganizationBranding({
-      organizationId: organization.id,
+      organizationId: actor.organizationId,
       actorEmail: actor.email,
       primaryColor: String(form.get('primaryColor') || ''),
       accentColor: String(form.get('accentColor') || ''),

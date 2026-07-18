@@ -25,6 +25,7 @@ export async function POST(req: NextRequest) {
       method: 'session',
       effectiveUser: session.effectiveUser,
       sessionId: session.legacy ? undefined : session.id,
+      organizationId: session.activeWorkspaceOrganizationId,
     }).catch(() => undefined)
   }
   const response = NextResponse.json({ ok: true })

@@ -4,7 +4,7 @@ import { existsSync } from 'node:fs'
 import path from 'node:path'
 import type { PoolClient, QueryResultRow } from 'pg'
 import { query, withTransaction } from '@/lib/persistence/postgres'
-import { effectiveUserPermissions, type AppUser } from '@/lib/users'
+import { effectiveAuthorizationRole, effectiveUserPermissions, type AppUser } from '@/lib/users'
 
 export const MEMBER_RELEASE_HISTORY_DAYS = 30
 export const MAX_CHECKPOINT_ROWS = 100_000
@@ -378,9 +378,10 @@ function toCheckpoint(row: CheckpointRow): DataCheckpoint {
   }
 }
 
-export function releaseAccessFor(user: Pick<AppUser, 'role' | 'permissions'>): ReleaseAccess {
+export function releaseAccessFor(user: Pick<AppUser, 'role' | 'permissions' | 'organizationRole' | 'organizationPermissions'>): ReleaseAccess {
   const permissions = effectiveUserPermissions(user)
-  const elevatedRole = user.role === 'owner' || user.role === 'admin'
+  const role = effectiveAuthorizationRole(user)
+  const elevatedRole = role === 'owner' || role === 'admin'
   const fullHistory = elevatedRole && permissions.viewFullReleaseHistory
   const manageBackups = elevatedRole && permissions.manageBackups
   return {

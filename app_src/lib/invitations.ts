@@ -11,9 +11,10 @@ import {
   getAppUser,
   inviteAppUser,
   normalizeUserEmail,
-  requireActiveAppUser,
+  resolveAppUserActor,
   restoreInvitedUserAssignment,
   type AppUser,
+  type AppUserMembershipSnapshot,
 } from '@/lib/users'
 
 const INVITATION_LIFETIME_DAYS = 7
@@ -239,10 +240,10 @@ export async function createUserInvitation(input: {
   parentOrganizationId?: unknown
   crmUserEnabled?: unknown
 }): Promise<{ user: AppUser; delivery: 'sent'; expiresAt: string }> {
-  const actor = await requireActiveAppUser(input.actorEmail)
+  const actor = await resolveAppUserActor(input.actorEmail)
   const email = normalizeUserEmail(input.email)
   const assignment = await resolveInvitationWorkspaceOrganization({
-    actorEmail: actor.email,
+    actorEmail: actor,
     organizationId: input.organizationId,
     createOrganization: input.createOrganization,
     organizationName: input.organizationName,
@@ -250,20 +251,20 @@ export async function createUserInvitation(input: {
   })
   let user: AppUser | null = null
   let userCreated = false
-  let previousOrganizationId: string | null = null
   let previousInvitedBy: string | null = null
+  let previousMembership: AppUserMembershipSnapshot | null = null
   let invitation: IssuedInvitationRow | null = null
   try {
     const invited = await inviteAppUser({
-      actorEmail: actor.email,
+      actorEmail: actor,
       email,
       organizationId: assignment.organization.id,
       crmUserEnabled: input.crmUserEnabled,
     })
     user = invited.user
     userCreated = invited.created
-    previousOrganizationId = invited.previousOrganizationId
     previousInvitedBy = invited.previousInvitedBy
+    previousMembership = invited.previousMembership
     const token = crypto.randomBytes(32).toString('base64url')
     const digest = tokenDigest(token)
     const fromAddress = mailFromAddress()
@@ -303,8 +304,9 @@ export async function createUserInvitation(input: {
     if (user && !userCreated) {
       await restoreInvitedUserAssignment({
         email: user.email,
-        organizationId: previousOrganizationId,
+        organizationId: assignment.organization.id,
         invitedBy: previousInvitedBy,
+        previousMembership,
       })
     }
     if (assignment.created) await retireUnusedWorkspaceOrganization(assignment.organization.id)

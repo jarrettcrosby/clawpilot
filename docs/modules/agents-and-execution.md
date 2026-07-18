@@ -90,10 +90,10 @@ ClawPilot rebuilds each execution context from four explicit layers:
 
 1. The repository-owned instruction for the selected role.
 2. The selected task and its recent thread.
-3. Private user-and-role memory, readable only when that same user runs that same role.
+3. Private user, workspace, and role memory, readable only when that same user runs that same role inside the same active workspace.
 4. Active shared role principles that contain no user, organization, customer, URL, email, Global ID, or task-specific data.
 
-Successful responses may add a bounded private lesson when the source context has no prompt-injection indicators. A generic lesson can become a shared candidate and collect independent organizational evidence, but evidence never activates it automatically. A root administrator must review and promote shared principles before they can influence another user. Seeded and approved shared principles improve the role for all users; private lessons never cross the user boundary. Unsafe or task-specific lessons are rejected or remain private and are not considered for promotion.
+Successful responses may add a bounded private lesson when the source context has no prompt-injection indicators. Private lessons are partitioned by active workspace as well as user and role, so a lesson learned while operating EPISCS cannot enter a Suburbia Sandwich Co request. A generic lesson can become a shared candidate and collect independent organizational evidence, but evidence never activates it automatically. A root administrator must review and promote shared principles before they can influence another user or workspace. Seeded and approved shared principles improve the role for all users; private lessons never cross the user or workspace boundary. Unsafe or task-specific lessons are rejected or remain private and are not considered for promotion.
 
 The shared layer is deliberately an operating-principle layer, not a shared transcript. Raw task threads, customer records, documents, and credentials are never copied into shared role memory.
 
@@ -107,7 +107,7 @@ The shared layer is deliberately an operating-principle layer, not a shared tran
 - `execution_results`
 - `repository_bindings`
 - `repository_runs`
-- task-linked agent working documents in `app_documents`
+- task-linked agent working documents in `app_documents`, partitioned by owner and the task board's workspace organization
 - `agent_context_memories`
 - `agent_context_memory_evidence`
 - encrypted per-user agent credential records in the credential database

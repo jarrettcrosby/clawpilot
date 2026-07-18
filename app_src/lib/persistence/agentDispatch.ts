@@ -293,11 +293,28 @@ export async function completeAgentDispatchOutboxInPostgres(item: AgentDispatchO
       [item.dispatchId, item.lockToken],
     )
     if (result.rowCount !== 1) throw new Error(`Agent dispatch lease lost for ${item.dispatchId}`)
-    await client.query(
-      `INSERT INTO audit_events (actor, event_type, aggregate_type, aggregate_id, payload)
-       VALUES ($1, 'agent.dispatch.succeeded', $2, $3, $4::jsonb)`,
-      [item.operatorId, AGGREGATE_TYPE, item.taskId, JSON.stringify({ dispatchId: item.dispatchId, attempts: item.attempts })],
+    const audit = await client.query(
+      `INSERT INTO audit_events (
+         actor, event_type, aggregate_type, aggregate_id, organization_id, payload
+       )
+       SELECT $1, 'agent.dispatch.succeeded', $2, $3,
+         board.workspace_organization_id, $5::jsonb
+       FROM project_boards board
+       WHERE board.id = $4::uuid
+       RETURNING id`,
+      [
+        item.operatorId,
+        AGGREGATE_TYPE,
+        item.taskId,
+        item.boardId,
+        JSON.stringify({
+          dispatchId: item.dispatchId,
+          attempts: item.attempts,
+          boardId: item.boardId,
+        }),
+      ],
     )
+    if (audit.rowCount !== 1) throw new Error(`Agent dispatch board missing for ${item.dispatchId}`)
   })
 }
 
@@ -330,17 +347,30 @@ export async function failAgentDispatchOutboxInPostgres(input: {
       [input.item.dispatchId, input.item.lockToken, status, error, availableAt],
     )
     if (result.rowCount !== 1) throw new Error(`Agent dispatch lease lost for ${input.item.dispatchId}`)
-    await client.query(
-      `INSERT INTO audit_events (actor, event_type, aggregate_type, aggregate_id, payload)
-       VALUES ($1, $2, $3, $4, $5::jsonb)`,
+    const audit = await client.query(
+      `INSERT INTO audit_events (
+         actor, event_type, aggregate_type, aggregate_id, organization_id, payload
+       )
+       SELECT $1, $2, $3, $4, board.workspace_organization_id, $6::jsonb
+       FROM project_boards board
+       WHERE board.id = $5::uuid
+       RETURNING id`,
       [
         input.item.operatorId,
         `agent.dispatch.${status}`,
         AGGREGATE_TYPE,
         input.item.taskId,
-        JSON.stringify({ dispatchId: input.item.dispatchId, attempts: input.item.attempts, error, availableAt: status === 'failed' ? availableAt : null }),
+        input.item.boardId,
+        JSON.stringify({
+          dispatchId: input.item.dispatchId,
+          attempts: input.item.attempts,
+          error,
+          availableAt: status === 'failed' ? availableAt : null,
+          boardId: input.item.boardId,
+        }),
       ],
     )
+    if (audit.rowCount !== 1) throw new Error(`Agent dispatch board missing for ${input.item.dispatchId}`)
   })
   return status
 }

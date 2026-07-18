@@ -14,7 +14,7 @@ import {
 } from '@/lib/integrations/toastIntegrations'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import { requireRequestUser } from '@/lib/requestUser'
-import { effectiveUserPermissions, type AppUser } from '@/lib/users'
+import { effectiveAuthorizationRole, effectiveUserPermissions, type AppUser } from '@/lib/users'
 
 export const dynamic = 'force-dynamic'
 export const revalidate = 0
@@ -48,8 +48,9 @@ function organizationId(actor: AppUser) {
 }
 
 function requireManager(actor: AppUser) {
+  const role = effectiveAuthorizationRole(actor)
   const permissions = effectiveUserPermissions(actor)
-  if (actor.role !== 'owner' && (actor.role !== 'admin' || !permissions.manageUserAccess)) {
+  if (role !== 'owner' && (role !== 'admin' || !permissions.manageUserAccess)) {
     throw new ToastIntegrationRequestError(
       'Only an organization owner or access administrator can manage Toast',
       403,

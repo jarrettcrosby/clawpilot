@@ -13,11 +13,12 @@ import {
   stageCrmRecordInPostgres,
   syncAppUserProfileToCrm,
 } from '@/lib/persistence/crm'
-import { ensurePrimaryWorkspaceOrganization, listWorkspaceOrganizationHierarchy } from '@/lib/organizations'
+import { listWorkspaceOrganizationHierarchy, workspaceOrganizationById } from '@/lib/organizations'
 import { suiteCrmAdminPortalUrl, suiteCrmAdminUsername } from '@/lib/crm/suiteCrmPublicUrl'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import { readMatonCredentialStateFromPostgres } from '@/lib/persistence/matonCredentials'
 import { requireRequestUser } from '@/lib/requestUser'
+import { effectiveAuthorizationRole, type AppUser } from '@/lib/users'
 import {
   PIPELINE_SELECTION_COOKIE,
   requireResourceEditor,
@@ -81,10 +82,10 @@ function timezoneValue(value: unknown) {
   }
 }
 
-async function selectedPipeline(req: NextRequest, actorEmail: string) {
+async function selectedPipeline(req: NextRequest, actor: AppUser) {
   const selected = req.cookies.get(PIPELINE_SELECTION_COOKIE)?.value || undefined
-  return resolvePipelineSpaceAccess({ actorEmail, pipelineId: selected })
-    .catch(() => resolvePipelineSpaceAccess({ actorEmail }))
+  return resolvePipelineSpaceAccess({ actorEmail: actor, pipelineId: selected })
+    .catch(() => resolvePipelineSpaceAccess({ actorEmail: actor }))
 }
 
 function errorResponse(error: unknown) {
@@ -97,10 +98,14 @@ export async function GET(req: NextRequest) {
   if (!isPostgresStorageEnabled()) return NextResponse.json({ ok: false, error: 'CRM requires Postgres storage' }, { status: 409 })
   try {
     const actor = await requireRequestUser(req)
-    const pipeline = await selectedPipeline(req, actor.email)
+    const pipeline = await selectedPipeline(req, actor)
     const entity = entityValue(req.nextUrl.searchParams.get('entity') || 'organizations')
-    const currentOrganization = await ensurePrimaryWorkspaceOrganization(actor.email)
-    const canOpenSuiteCrm = (actor.role === 'owner' || actor.role === 'admin') && currentOrganization.parentId === null
+    const currentOrganization = actor.organizationId
+      ? await workspaceOrganizationById(actor.organizationId)
+      : null
+    const organizationRole = effectiveAuthorizationRole(actor)
+    const canOpenSuiteCrm = (organizationRole === 'owner' || organizationRole === 'admin')
+      && currentOrganization?.parentId === null
     await syncAppUserProfileToCrm({ email: actor.email, pipelineId: pipeline.id })
     await ensurePipelineCrmReferenceLinks(pipeline.id)
     const [records, summary, workspaceHierarchy, matonCredential, pipelineUsers] = await Promise.all([
@@ -112,7 +117,7 @@ export async function GET(req: NextRequest) {
         needsReview: req.nextUrl.searchParams.get('needsReview') === 'true',
       }),
       readCrmSummaryFromPostgres(pipeline.id),
-      listWorkspaceOrganizationHierarchy(actor.email),
+      listWorkspaceOrganizationHierarchy(actor),
       readMatonCredentialStateFromPostgres(actor.email),
       listCrmPipelineUsersInPostgres(pipeline.id),
     ])
@@ -136,7 +141,7 @@ export async function GET(req: NextRequest) {
       },
       workspaceHierarchy,
       pipelineUsers,
-      canManageHierarchy: actor.role === 'owner' || actor.role === 'admin',
+      canManageHierarchy: organizationRole === 'owner' || organizationRole === 'admin',
       providerIdentities: {
         googleMail: selectedProviderEmail('google-mail'),
         googleCalendar: selectedProviderEmail('google-calendar'),
@@ -154,7 +159,7 @@ export async function POST(req: NextRequest) {
   if (!isPostgresStorageEnabled()) return NextResponse.json({ ok: false, error: 'CRM requires Postgres storage' }, { status: 409 })
   try {
     const actor = await requireRequestUser(req)
-    const pipeline = await selectedPipeline(req, actor.email)
+    const pipeline = await selectedPipeline(req, actor)
     requireResourceEditor(pipeline)
     const hierarchy = await ensurePipelineCrmHierarchy({ pipelineId: pipeline.id, actorEmail: actor.email })
     const body = await req.json()

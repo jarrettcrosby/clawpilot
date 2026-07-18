@@ -228,11 +228,15 @@ const persistenceMock = {
 }
 
 const usersMock = {
+  effectiveAuthorizationRole(user) {
+    return user.organizationRole || user.role
+  },
   effectiveUserPermissions(user) {
-    if (user.role === 'owner') {
+    const role = user.organizationRole || user.role
+    if (role === 'owner') {
       return { ...permissionsDefaults, viewFullReleaseHistory: true, manageBackups: true, manageLinks: true, viewOrganizationAudit: true, viewSystemAudit: true }
     }
-    return { ...permissionsDefaults, ...user.permissions }
+    return { ...permissionsDefaults, ...(user.organizationPermissions || user.permissions) }
   },
 }
 
@@ -271,6 +275,11 @@ assert.equal(releaseAccessFor(admin).manageBackups, true)
 assert.equal(releaseAccessFor({ ...admin, permissions: permissionsDefaults }).manageBackups, false)
 assert.equal(releaseAccessFor({ ...admin, permissions: permissionsDefaults }).historyScope, 'last-30-days')
 assert.equal(releaseAccessFor({ ...admin, role: 'owner', permissions: permissionsDefaults }).manageBackups, true)
+assert.equal(releaseAccessFor({
+  ...admin,
+  organizationRole: 'member',
+  organizationPermissions: permissionsDefaults,
+}).manageBackups, false)
 
 overviewQueries.length = 0
 const memberOverview = await getReleaseOverview(member)

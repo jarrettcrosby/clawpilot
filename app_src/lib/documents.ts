@@ -18,6 +18,7 @@ import {
   resolveProjectBoardAccess,
 } from '@/lib/tenancy'
 import { configuredOwnerEmail, getAppUser, normalizeUserEmail, type AppUser } from '@/lib/users'
+import { requireWorkspaceAppUser } from '@/lib/workspaceMemberships'
 
 export type AppDocument = {
   id: string
@@ -171,6 +172,7 @@ function money(value: number): string {
 
 async function upsertDocument(input: {
   ownerEmail: string
+  organizationId: string
   sourceKey: string
   source: 'system' | 'repository' | 'user' | 'agent'
   kind: string
@@ -190,16 +192,16 @@ async function upsertDocument(input: {
   const sql = `
       WITH changed_document AS (
         INSERT INTO app_documents (
-          owner_email, source_key, source, kind, status, title, slug, category,
+          owner_email, workspace_organization_id, source_key, source, kind, status, title, slug, category,
           content, excerpt, tags, source_path, content_hash, board_id, pipeline_id,
           generated_at, created_at, updated_at
         )
         VALUES (
-          $1, $2, $3, $4, $5, $6, $7, $8,
-          $9, $10, $11::text[], $12, $13, $14::uuid, $15::uuid,
-          $16::timestamptz, now(), now()
+          $1, $2::uuid, $3, $4, $5, $6, $7, $8, $9,
+          $10, $11, $12::text[], $13, $14, $15::uuid, $16::uuid,
+          $17::timestamptz, now(), now()
         )
-        ON CONFLICT (owner_email, source_key) DO UPDATE SET
+        ON CONFLICT (owner_email, workspace_organization_id, source_key) DO UPDATE SET
           source = EXCLUDED.source,
           kind = EXCLUDED.kind,
           status = EXCLUDED.status,
@@ -246,6 +248,7 @@ async function upsertDocument(input: {
     `
   const parameters = [
     input.ownerEmail,
+    input.organizationId,
     input.sourceKey,
     input.source,
     input.kind,
@@ -286,6 +289,7 @@ type ExistingAgentTaskDocumentRow = {
 
 export async function readAgentTaskDocumentContext(input: {
   ownerEmail: string
+  organizationId: string
   taskId: string
   agentId: string
 }): Promise<string | null> {
@@ -295,15 +299,18 @@ export async function readAgentTaskDocumentContext(input: {
   const result = await query<{ content: string }>(
     `SELECT content
      FROM app_documents
-     WHERE owner_email = $1 AND source_key = $2
+     WHERE owner_email = $1
+       AND workspace_organization_id = $2::uuid
+       AND source_key = $3
      LIMIT 1`,
-    [ownerEmail, sourceKey],
+    [ownerEmail, input.organizationId, sourceKey],
   )
   return result.rows[0]?.content || null
 }
 
 export async function appendAgentTaskDocument(input: {
   ownerEmail: string
+  organizationId: string
   boardId: string
   taskId: string
   taskTitle: string
@@ -330,15 +337,17 @@ export async function appendAgentTaskDocument(input: {
     timeStyle: 'short',
   }).format(recordedAt)
   return withTransaction(async (client) => {
-    await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`${ownerEmail}:${sourceKey}`])
+    await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`${ownerEmail}:${input.organizationId}:${sourceKey}`])
     const existing = await client.query<ExistingAgentTaskDocumentRow>(
       `
         SELECT id::text, title, slug, content
         FROM app_documents
-        WHERE owner_email = $1 AND source_key = $2
+        WHERE owner_email = $1
+          AND workspace_organization_id = $2::uuid
+          AND source_key = $3
         LIMIT 1
       `,
-      [ownerEmail, sourceKey],
+      [ownerEmail, input.organizationId, sourceKey],
     )
     const current = existing.rows[0] || null
     const built = buildAgentTaskDocument({
@@ -367,6 +376,7 @@ export async function appendAgentTaskDocument(input: {
     if (built.appended || !current || current.title !== built.title) {
       id = await upsertDocument({
         ownerEmail,
+        organizationId: input.organizationId,
         sourceKey,
         source: 'agent',
         kind: 'agent-task-deliverable',
@@ -397,14 +407,16 @@ export async function refreshUserBriefs(
   selection: DocumentBriefSelection = {},
 ): Promise<void> {
   const ownerEmail = normalizeUserEmail(user.email)
+  const organizationId = String(user.organizationId || '').trim()
+  if (!organizationId) throw new Error('Active workspace is required for documents')
   const [board, pipeline] = await Promise.all([
-    resolveProjectBoardAccess({ actorEmail: ownerEmail, boardId: selection.boardId })
+    resolveProjectBoardAccess({ actorEmail: user, boardId: selection.boardId })
       .catch((error) => selection.boardId
-        ? resolveProjectBoardAccess({ actorEmail: ownerEmail })
+        ? resolveProjectBoardAccess({ actorEmail: user })
         : Promise.reject(error)),
-    resolvePipelineSpaceAccess({ actorEmail: ownerEmail, pipelineId: selection.pipelineId })
+    resolvePipelineSpaceAccess({ actorEmail: user, pipelineId: selection.pipelineId })
       .catch((error) => selection.pipelineId
-        ? resolvePipelineSpaceAccess({ actorEmail: ownerEmail })
+        ? resolvePipelineSpaceAccess({ actorEmail: user })
         : Promise.reject(error)),
   ])
   const releaseAccess = releaseAccessFor(user)
@@ -684,19 +696,26 @@ export async function refreshUserBriefs(
   ].join('\n')
 
   await Promise.all([
-    upsertDocument({ ownerEmail, sourceKey: 'system:build-brief', source: 'system', kind: 'build-brief', status: 'generated', title: 'Build Brief', slug: 'build-brief', category: 'briefings', content: buildContent, tags: ['build', 'releases'], generatedAt: now }),
-    upsertDocument({ ownerEmail, sourceKey: 'system:project-brief', source: 'system', kind: 'project-report', status: 'generated', title: 'Project Board Brief', slug: 'project-board-brief', category: 'projects', content: projectContent, tags: ['projects', 'tasks'], boardId: board.id, generatedAt: now }),
-    upsertDocument({ ownerEmail, sourceKey: 'system:pipeline-brief', source: 'system', kind: 'pipeline-report', status: 'generated', title: 'Pipeline Brief', slug: 'pipeline-brief', category: 'pipeline', content: pipelineContent, tags: ['pipeline', 'report'], pipelineId: pipeline.id, generatedAt: now }),
-    upsertDocument({ ownerEmail, sourceKey: 'system:ai-opportunity-radar', source: 'system', kind: 'research-radar', status: 'generated', title: 'AI and Opportunity Radar', slug: 'ai-opportunity-radar', category: 'radar', content: radarContent, tags: ['ai', 'research', 'opportunities'], generatedAt: now }),
+    upsertDocument({ ownerEmail, organizationId, sourceKey: 'system:build-brief', source: 'system', kind: 'build-brief', status: 'generated', title: 'Build Brief', slug: 'build-brief', category: 'briefings', content: buildContent, tags: ['build', 'releases'], generatedAt: now }),
+    upsertDocument({ ownerEmail, organizationId, sourceKey: 'system:project-brief', source: 'system', kind: 'project-report', status: 'generated', title: 'Project Board Brief', slug: 'project-board-brief', category: 'projects', content: projectContent, tags: ['projects', 'tasks'], boardId: board.id, generatedAt: now }),
+    upsertDocument({ ownerEmail, organizationId, sourceKey: 'system:pipeline-brief', source: 'system', kind: 'pipeline-report', status: 'generated', title: 'Pipeline Brief', slug: 'pipeline-brief', category: 'pipeline', content: pipelineContent, tags: ['pipeline', 'report'], pipelineId: pipeline.id, generatedAt: now }),
+    upsertDocument({ ownerEmail, organizationId, sourceKey: 'system:ai-opportunity-radar', source: 'system', kind: 'research-radar', status: 'generated', title: 'AI and Opportunity Radar', slug: 'ai-opportunity-radar', category: 'radar', content: radarContent, tags: ['ai', 'research', 'opportunities'], generatedAt: now }),
   ])
 }
 
 export async function refreshActiveUserBriefs(): Promise<{ refreshed: number; errors: string[] }> {
-  const activeUsers = await query<{ email: string }>(
-    `SELECT email FROM app_users WHERE status = 'active' ORDER BY email`,
+  const activeUsers = await query<{ email: string; organization_id: string }>(
+    `SELECT app_user.email, membership.organization_id::text
+     FROM app_users app_user
+     JOIN app_user_organization_memberships membership
+       ON membership.user_email = app_user.email
+      AND membership.status = 'active'
+     WHERE app_user.status = 'active'
+     ORDER BY app_user.email, membership.is_default DESC, membership.created_at`,
   )
-  const users = (await Promise.all(activeUsers.rows.map((row) => getAppUser(row.email))))
-    .filter((user): user is AppUser => user !== null)
+  const users = await Promise.all(activeUsers.rows.map((row) => (
+    requireWorkspaceAppUser(row.email, row.organization_id)
+  )))
   const settled = await Promise.allSettled(users.map((user) => refreshUserBriefs(user)))
   return {
     refreshed: settled.filter((result) => result.status === 'fulfilled').length,
@@ -720,11 +739,13 @@ export async function generateUserDocument(input: {
   pipelineId?: string | null
 }): Promise<{ id: string; title: string; slug: string }> {
   const ownerEmail = normalizeUserEmail(input.user.email)
+  const organizationId = String(input.user.organizationId || '').trim()
+  if (!organizationId) throw new Error('Active workspace is required for documents')
   if (!Object.hasOwn(GENERATED_SOURCE_KEYS, input.kind)) throw new Error('Unsupported document type')
 
   const [board, pipeline] = await Promise.all([
-    resolveProjectBoardAccess({ actorEmail: ownerEmail, boardId: input.boardId }),
-    resolvePipelineSpaceAccess({ actorEmail: ownerEmail, pipelineId: input.pipelineId }),
+    resolveProjectBoardAccess({ actorEmail: input.user, boardId: input.boardId }),
+    resolvePipelineSpaceAccess({ actorEmail: input.user, pipelineId: input.pipelineId }),
   ])
   await refreshUserBriefs(input.user, { boardId: board.id, pipelineId: pipeline.id })
 
@@ -733,10 +754,11 @@ export async function generateUserDocument(input: {
       SELECT kind, title, category, content, tags, board_id::text, pipeline_id::text
       FROM app_documents
       WHERE owner_email = $1
-        AND source_key = $2
+        AND workspace_organization_id = $2::uuid
+        AND source_key = $3
       LIMIT 1
     `,
-    [ownerEmail, GENERATED_SOURCE_KEYS[input.kind]],
+    [ownerEmail, organizationId, GENERATED_SOURCE_KEYS[input.kind]],
   )
   const source = template.rows[0]
   if (!source) throw new Error('Document source could not be prepared')
@@ -753,6 +775,7 @@ export async function generateUserDocument(input: {
   const slug = `${safeSlug(source.title)}-${now.toISOString().slice(0, 10)}-${suffix}`
   const id = await upsertDocument({
     ownerEmail,
+    organizationId,
     sourceKey: `user-generated:${input.kind}:${crypto.randomUUID()}`,
     source: 'user',
     kind: source.kind,
@@ -782,14 +805,16 @@ export async function ensureUserBriefs(
   selection: DocumentBriefSelection = {},
 ): Promise<void> {
   const ownerEmail = normalizeUserEmail(user.email)
+  const organizationId = String(user.organizationId || '').trim()
+  if (!organizationId) throw new Error('Active workspace is required for documents')
   const [board, pipeline] = await Promise.all([
-    resolveProjectBoardAccess({ actorEmail: ownerEmail, boardId: selection.boardId })
+    resolveProjectBoardAccess({ actorEmail: user, boardId: selection.boardId })
       .catch((error) => selection.boardId
-        ? resolveProjectBoardAccess({ actorEmail: ownerEmail })
+        ? resolveProjectBoardAccess({ actorEmail: user })
         : Promise.reject(error)),
-    resolvePipelineSpaceAccess({ actorEmail: ownerEmail, pipelineId: selection.pipelineId })
+    resolvePipelineSpaceAccess({ actorEmail: user, pipelineId: selection.pipelineId })
       .catch((error) => selection.pipelineId
-        ? resolvePipelineSpaceAccess({ actorEmail: ownerEmail })
+        ? resolvePipelineSpaceAccess({ actorEmail: user })
         : Promise.reject(error)),
   ])
   const existing = await query<{ source_key: string; board_id: string | null; pipeline_id: string | null }>(
@@ -797,9 +822,10 @@ export async function ensureUserBriefs(
       SELECT source_key, board_id::text, pipeline_id::text
       FROM app_documents
       WHERE owner_email = $1
-        AND source_key = ANY($2::text[])
+        AND workspace_organization_id = $2::uuid
+        AND source_key = ANY($3::text[])
     `,
-    [ownerEmail, GENERATED_BRIEF_KEYS],
+    [ownerEmail, organizationId, GENERATED_BRIEF_KEYS],
   )
   const byKey = new Map(existing.rows.map((row) => [row.source_key, row]))
   const complete = GENERATED_BRIEF_KEYS.every((key) => byKey.has(key))
@@ -875,9 +901,12 @@ export async function syncRepositoryDocuments(
   options: { force?: boolean } = {},
 ): Promise<void> {
   if (normalizeUserEmail(user.email) !== configuredOwnerEmail()) return
+  const organizationId = String(user.organizationId || '').trim()
+  if (!organizationId) throw new Error('Active workspace is required for documents')
+  const syncKey = `${user.email}:${organizationId}`
   const runtime = globalThis as RepositorySyncGlobal
   if (!runtime.__clawpilotRepositoryDocsSynced) runtime.__clawpilotRepositoryDocsSynced = new Set()
-  if (!options.force && runtime.__clawpilotRepositoryDocsSynced.has(user.email)) return
+  if (!options.force && runtime.__clawpilotRepositoryDocsSynced.has(syncKey)) return
   const root = await repositoryDocsRoot()
   if (!root) return
   const files = await markdownFiles(root)
@@ -892,6 +921,7 @@ export async function syncRepositoryDocuments(
     const area = singleLine(parsed.data.area)
     return {
       ownerEmail: user.email,
+      organizationId,
       sourceKey: `repository:${relativePath}`,
       source: 'repository' as const,
       kind: singleLine(parsed.data.kind) || classification.category,
@@ -909,12 +939,13 @@ export async function syncRepositoryDocuments(
     `
       DELETE FROM app_documents
       WHERE owner_email = $1
+        AND workspace_organization_id = $2::uuid
         AND source = 'repository'
-        AND NOT (source_key = ANY($2::text[]))
+        AND NOT (source_key = ANY($3::text[]))
     `,
-    [user.email, repositoryDocuments.map((document) => document.sourceKey)],
+    [user.email, organizationId, repositoryDocuments.map((document) => document.sourceKey)],
   )
-  runtime.__clawpilotRepositoryDocsSynced.add(user.email)
+  runtime.__clawpilotRepositoryDocsSynced.add(syncKey)
 }
 
 export async function listLocalRepositoryDocuments(searchValue?: unknown): Promise<AppDocument[]> {
@@ -978,8 +1009,10 @@ function toDocument(row: DocumentRow): AppDocument {
   }
 }
 
-export async function listUserDocuments(emailValue: unknown, searchValue?: unknown): Promise<AppDocument[]> {
-  const ownerEmail = normalizeUserEmail(emailValue)
+export async function listUserDocuments(user: AppUser, searchValue?: unknown): Promise<AppDocument[]> {
+  const ownerEmail = normalizeUserEmail(user.email)
+  const organizationId = String(user.organizationId || '').trim()
+  if (!organizationId) throw new Error('Active workspace is required for documents')
   const search = singleLine(searchValue).slice(0, 200)
   const semantic = search ? await embedSearchQuery(search) : null
   const result = await query<DocumentRow>(
@@ -999,25 +1032,26 @@ export async function listUserDocuments(emailValue: unknown, searchValue?: unkno
         source_path
       FROM app_documents
       WHERE owner_email = $1
+        AND workspace_organization_id = $2::uuid
         AND (
-          $2 = ''
-          OR search_vector @@ websearch_to_tsquery('english'::regconfig, $2)
-          OR title ILIKE '%' || $2 || '%'
-          OR array_to_string(tags, ' ') ILIKE '%' || $2 || '%'
+          $3 = ''
+          OR search_vector @@ websearch_to_tsquery('english'::regconfig, $3)
+          OR title ILIKE '%' || $3 || '%'
+          OR array_to_string(tags, ' ') ILIKE '%' || $3 || '%'
           OR (
             embedding IS NOT NULL
-            AND $3::vector IS NOT NULL
-            AND embedding_model = $4
-            AND 1 - (embedding <=> $3::vector) >= 0.35
+            AND $4::vector IS NOT NULL
+            AND embedding_model = $5
+            AND 1 - (embedding <=> $4::vector) >= 0.35
           )
         )
       ORDER BY
-        CASE WHEN $2 = '' THEN 0 ELSE GREATEST(
-          ts_rank_cd(search_vector, websearch_to_tsquery('english'::regconfig, $2)) * 1.2,
-          CASE WHEN title ILIKE '%' || $2 || '%' THEN 0.8 ELSE 0 END,
+        CASE WHEN $3 = '' THEN 0 ELSE GREATEST(
+          ts_rank_cd(search_vector, websearch_to_tsquery('english'::regconfig, $3)) * 1.2,
+          CASE WHEN title ILIKE '%' || $3 || '%' THEN 0.8 ELSE 0 END,
           CASE
-            WHEN embedding IS NOT NULL AND $3::vector IS NOT NULL AND embedding_model = $4
-            THEN 1 - (embedding <=> $3::vector)
+            WHEN embedding IS NOT NULL AND $4::vector IS NOT NULL AND embedding_model = $5
+            THEN 1 - (embedding <=> $4::vector)
             ELSE 0
           END
         ) END DESC,
@@ -1032,7 +1066,7 @@ export async function listUserDocuments(emailValue: unknown, searchValue?: unkno
         updated_at DESC,
         title ASC
     `,
-    [ownerEmail, search, semantic?.vector || null, semantic?.model || ''],
+    [ownerEmail, organizationId, search, semantic?.vector || null, semantic?.model || ''],
   )
   return result.rows.map(toDocument)
 }

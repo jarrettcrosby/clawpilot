@@ -466,8 +466,10 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
     setUsersPayload((current) => {
       if (!current) return current
       const existing = current.users || []
-      const users = existing.some((candidate) => candidate.email === user.email)
-        ? existing.map((candidate) => candidate.email === user.email ? user : candidate)
+      const sameMembership = (candidate: AppUser) => candidate.email === user.email
+        && candidate.organizationId === user.organizationId
+      const users = existing.some(sameMembership)
+        ? existing.map((candidate) => sameMembership(candidate) ? user : candidate)
         : [...existing, user]
       return {
         ...current,
@@ -575,7 +577,7 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
       const result = await requestJson<UserMutationPayload>('/api/users', {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: user.email, status }),
+        body: JSON.stringify({ email: user.email, organizationId: user.organizationId, status }),
       })
       if (!result.user) throw new Error('User response was incomplete')
       upsertUser(result.user)
@@ -594,7 +596,13 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
       const result = await requestJson<UserMutationPayload>('/api/users', {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'access', email: user.email, role, permissions }),
+        body: JSON.stringify({
+          action: 'access',
+          email: user.email,
+          organizationId: user.organizationId,
+          role,
+          permissions,
+        }),
       })
       if (!result.user) throw new Error('User response was incomplete')
       upsertUser(result.user)
@@ -619,7 +627,11 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
       const result = await requestJson<UserMutationPayload>('/api/users', {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'crm-user-sync', email: user.email }),
+        body: JSON.stringify({
+          action: 'crm-user-sync',
+          email: user.email,
+          organizationId: user.organizationId,
+        }),
       })
       if (!result.user) throw new Error('CRM mapping response was incomplete')
       upsertUser(result.user)
@@ -638,7 +650,12 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
       const result = await requestJson<UserMutationPayload>('/api/users', {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'crm-employee', email: user.email, enabled }),
+        body: JSON.stringify({
+          action: 'crm-employee',
+          email: user.email,
+          organizationId: user.organizationId,
+          enabled,
+        }),
       })
       if (!result.user) throw new Error('CRM employee response was incomplete')
       upsertUser(result.user)
@@ -1164,7 +1181,7 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
                   || pendingAction === `crm-map:${user.email}`
 
                 return (
-                  <Box key={user.email} sx={panelSx}>
+                  <Box key={`${user.email}:${user.organizationId || 'identity'}`} sx={panelSx}>
                     <Box sx={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto', gap: 1.5, alignItems: 'start', p: { xs: 1.5, sm: 2 } }}>
                       <Stack direction="row" spacing={1.25} alignItems="center" minWidth={0}>
                         <Avatar sx={{ width: 38, height: 38, bgcolor: '#2D3442', color: 'primary.main', fontSize: '0.8rem', fontWeight: 700 }}>

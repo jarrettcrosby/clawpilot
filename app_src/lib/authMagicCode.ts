@@ -23,7 +23,7 @@ export type VerifyAuthMagicCodeInput = {
 }
 
 export type VerifyAuthMagicCodeResult =
-  | { status: 'verified'; email: string }
+  | { status: 'verified'; email: string; organizationId: string | null }
   | { status: 'invalid'; attemptsRemaining: number }
   | { status: 'locked' | 'expired' | 'consumed' | 'not-found' | 'not-authorized' }
 
@@ -41,6 +41,10 @@ type VerificationRow = {
   attempts: number
   purpose: 'sign_in' | 'invitation'
   invitation_id: string | null
+}
+
+type VerificationOutcome = VerificationRow & {
+  organization_id?: string | null
 }
 
 function sessionSecret(): string {
@@ -202,6 +206,13 @@ export async function requestInvitationAuthMagicCode(input: {
         AND invitation.accepted_at IS NULL
         AND invitation.expires_at > now()
         AND user_record.status IN ('invited', 'active')
+        AND EXISTS (
+          SELECT 1
+          FROM app_user_organization_memberships membership
+          WHERE membership.user_email = invitation.email
+            AND membership.organization_id = invitation.workspace_organization_id
+            AND membership.status = 'invited'
+        )
       LIMIT 1
     `,
     [input.invitationId, requestedEmail],
@@ -294,7 +305,10 @@ export async function verifyAuthMagicCode(
       const verified = result.rows[0]
       if (verified?.status !== 'verified') return verified
       if (verified.purpose === 'invitation') {
-        const invitation = await client.query(
+        const invitation = await client.query<{
+          id: string
+          workspace_organization_id: string
+        }>(
           `
             UPDATE app_user_invitations
             SET accepted_at = now(), updated_at = now()
@@ -304,14 +318,28 @@ export async function verifyAuthMagicCode(
               AND revoked_at IS NULL
               AND code_requested_at IS NOT NULL
               AND expires_at > now()
-              AND workspace_organization_id = (
-                SELECT organization_id FROM app_users WHERE email = $2
+              AND EXISTS (
+                SELECT 1
+                FROM app_user_organization_memberships membership
+                WHERE membership.user_email = $2
+                  AND membership.organization_id = app_user_invitations.workspace_organization_id
+                  AND membership.status = 'invited'
               )
-            RETURNING id
+            RETURNING id::text, workspace_organization_id::text
           `,
           [verified.invitation_id, requestedEmail],
         )
         if (!invitation.rows[0]) throw new Error(AUTHORIZATION_CHANGED)
+        const activatedMembership = await client.query(
+          `UPDATE app_user_organization_memberships
+           SET status = 'active', updated_at = now()
+           WHERE user_email = $1
+             AND organization_id = $2::uuid
+             AND status = 'invited'
+           RETURNING organization_id`,
+          [requestedEmail, invitation.rows[0].workspace_organization_id],
+        )
+        if (!activatedMembership.rows[0]) throw new Error(AUTHORIZATION_CHANGED)
         const activated = await client.query(
           `
             UPDATE app_users
@@ -326,6 +354,10 @@ export async function verifyAuthMagicCode(
           [requestedEmail],
         )
         if (!activated.rows[0]) throw new Error(AUTHORIZATION_CHANGED)
+        return {
+          ...verified,
+          organization_id: invitation.rows[0].workspace_organization_id,
+        } satisfies VerificationOutcome
       } else {
         const signedIn = await client.query(
           `
@@ -339,7 +371,7 @@ export async function verifyAuthMagicCode(
         )
         if (!signedIn.rows[0]) throw new Error(AUTHORIZATION_CHANGED)
       }
-      return verified
+      return { ...verified, organization_id: null } satisfies VerificationOutcome
     })
   } catch (error) {
     if (error instanceof Error && error.message === AUTHORIZATION_CHANGED) return { status: 'not-authorized' }
@@ -348,7 +380,11 @@ export async function verifyAuthMagicCode(
 
   if (!row) return { status: 'not-found' }
   if (row.status === 'verified') {
-    return { status: 'verified', email: requestedEmail }
+    return {
+      status: 'verified',
+      email: requestedEmail,
+      organizationId: (row as VerificationOutcome).organization_id || null,
+    }
   }
   if (row.status === 'invalid') {
     return { status: 'invalid', attemptsRemaining: Math.max(0, MAX_ATTEMPTS - Number(row.attempts || 0)) }

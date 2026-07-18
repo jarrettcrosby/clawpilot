@@ -40,8 +40,8 @@ export async function GET(req: NextRequest) {
     try {
       const actor = await requireRequestUser(req)
       const selected = req.cookies.get(BOARD_SELECTION_COOKIE)?.value || undefined
-      const board = await resolveProjectBoardAccess({ actorEmail: actor.email, boardId: selected })
-        .catch(() => resolveProjectBoardAccess({ actorEmail: actor.email }))
+      const board = await resolveProjectBoardAccess({ actorEmail: actor, boardId: selected })
+        .catch(() => resolveProjectBoardAccess({ actorEmail: actor }))
       entries = await listExecutionResultsFromPostgres({ operatorId: actor.email, boardId: board.id, taskId, limit })
     } catch (error) {
       if (!shouldFallbackToFileOnDatabaseError()) throw error

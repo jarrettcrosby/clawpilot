@@ -25,6 +25,17 @@ for (const fragment of ['initial_ip_address inet', 'last_ip_address inet', 'host
   assert.ok(ipMigration.includes(fragment), `browser-session IP migration missing ${fragment}`)
 }
 
+const workspaceMigration = read('db/migrations/0060_multi_workspace_memberships.sql')
+for (const fragment of [
+  'ADD COLUMN IF NOT EXISTS active_workspace_organization_id uuid',
+  'ALTER COLUMN active_workspace_organization_id SET NOT NULL',
+  'FOREIGN KEY (effective_user_email, active_workspace_organization_id)',
+  'REFERENCES app_user_organization_memberships (user_email, organization_id)',
+  'idx_app_sessions_active_workspace',
+]) {
+  assert.ok(workspaceMigration.includes(fragment), `active-workspace session migration missing ${fragment}`)
+}
+
 const requestIp = read('app_src/lib/requestIpAddress.ts')
 for (const fragment of ["from 'node:net'", 'normalizeIpAddress', 'observedRequestIpAddress', 'x-vercel-forwarded-for', 'x-forwarded-for']) {
   assert.ok(requestIp.includes(fragment), `request IP normalization missing ${fragment}`)
@@ -38,6 +49,9 @@ for (const fragment of [
   'last_user_activity_at',
   'host(session.initial_ip_address) AS initial_ip_address',
   'host(session.last_ip_address) AS last_ip_address',
+  'session.active_workspace_organization_id::text',
+  'JOIN app_user_organization_memberships active_membership',
+  'active_membership.status AS active_membership_status',
   '$7::inet',
   "$8::integer * interval '1 second'",
   "$9::integer * interval '1 second'",
@@ -48,12 +62,27 @@ for (const fragment of [
   "$4::integer * interval '1 second'",
   "eventType: 'auth.impersonation.started'",
   "eventType: 'auth.impersonation.ended'",
+  "eventType: 'auth.workspace.switched'",
   'effective_user_email = authenticated_user_email',
+  'switchBrowserSessionWorkspace',
+  "row.active_membership_status !== 'active'",
 ]) assert.ok(sessions.includes(fragment), `session adapter missing ${fragment}`)
 assert.ok(!/^\s*token\s+text\b/m.test(migration), 'raw browser tokens must never be persisted')
 const insertedSessionColumns = sessions.match(/INSERT INTO app_sessions\s*\(([^)]*)\)/m)?.[1] || ''
 assert.ok(insertedSessionColumns.includes('token_hash'), 'session inserts must persist a token hash')
+assert.ok(insertedSessionColumns.includes('active_workspace_organization_id'), 'session inserts must persist the active workspace')
 assert.ok(!/(^|,)\s*token\s*(,|$)/m.test(insertedSessionColumns), 'session inserts must never persist a raw token')
+assert.match(
+  sessions,
+  /JOIN LATERAL \(\s*SELECT organization_id, role[\s\S]*?FROM app_user_organization_memberships/,
+  'session creation must select the membership role used to set its idle policy',
+)
+
+const requestUser = read('app_src/lib/requestUser.ts')
+assert.ok(
+  requestUser.includes('requireWorkspaceAppUser(session.effectiveUser, session.activeWorkspaceOrganizationId)'),
+  'request authorization must use the per-session active workspace membership',
+)
 
 const auth = read('app_src/lib/auth.ts')
 assert.ok(auth.includes("'__Host-clawpilot_session'"), 'production session cookie must use __Host prefix')
@@ -62,6 +91,7 @@ assert.ok(auth.includes('LEGACY_COOKIE_NAME'), 'legacy cookies must remain reada
 const attribution = read('app_src/lib/authAttribution.ts')
 assert.ok(attribution.includes("createHmac('sha256'"), 'request attribution must be signed')
 assert.ok(attribution.includes('timingSafeEqual'), 'request attribution proof must use constant-time verification')
+assert.ok(attribution.includes('activeWorkspaceOrganizationId'), 'request attribution must carry the active browser workspace')
 
 const writer = read('app_src/lib/auditWriter.ts')
 for (const fragment of ['verifyAuthAttributionHeaders', 'authenticatedUser', 'effectiveUser', 'impersonated: true']) {
@@ -83,6 +113,8 @@ const worker = read('app_src/lib/agentDispatchWorker.ts')
 assert.ok(worker.includes("'X-ClawPilot-Operator': input.item.operatorId"))
 assert.ok(worker.includes("'X-ClawPilot-Board-Id': input.item.boardId"))
 assert.ok(!worker.includes('Cookie:'), 'worker cannot authenticate with a browser cookie')
+const workerAuth = read('app_src/lib/workerAuth.ts')
+assert.ok(workerAuth.includes('requireWorkspaceAppUser(operatorId, board.rows[0].workspace_organization_id)'), 'worker identity must be scoped to its claimed board workspace')
 const tasksRoute = read('app_src/app/api/tasks/route.ts')
 assert.ok(tasksRoute.includes("throw new Error('Worker board claim mismatch')"), 'worker requests must not override their board claim')
 

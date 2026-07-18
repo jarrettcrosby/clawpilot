@@ -129,9 +129,8 @@ export async function replaceTasksInPostgres(tasks: Task[], scope: TaskStoreScop
     )
     const previousById = new Map(previous.rows.map((row) => [row.id, row.payload]))
     const boardOrganization = await client.query<{ organization_id: string | null }>(
-      `SELECT app_user.organization_id::text
+      `SELECT board.workspace_organization_id::text AS organization_id
        FROM project_boards board
-       JOIN app_users app_user ON app_user.email = board.owner_email
        WHERE board.id = $1::uuid`,
       [scope.boardId],
     )

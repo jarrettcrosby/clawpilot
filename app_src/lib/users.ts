@@ -68,6 +68,8 @@ export type AppUser = {
   jobTitle: string | null
   organizationId: string | null
   organizationName: string | null
+  organizationRole: AppUserRole | null
+  organizationPermissions: AppUserPermissions | null
   suiteCrmUserId: string | null
   suiteCrmUsername: string | null
   timezone: string
@@ -86,6 +88,15 @@ export type InviteAppUserResult = {
   created: boolean
   previousOrganizationId: string | null
   previousInvitedBy: string | null
+  membershipCreated: boolean
+  previousMembership: AppUserMembershipSnapshot | null
+}
+
+export type AppUserMembershipSnapshot = {
+  role: AppUserRole
+  permissions: AppUserPermissions
+  status: AppUserStatus
+  isDefault: boolean
 }
 
 type AppUserRow = {
@@ -147,7 +158,7 @@ function normalizePermissions(value: unknown): AppUserPermissions {
   }
 }
 
-function permissionsForRole(role: AppUserRole, value: unknown): AppUserPermissions {
+export function permissionsForRole(role: AppUserRole, value: unknown): AppUserPermissions {
   if (role === 'owner') return { ...OWNER_PERMISSIONS }
   const permissions = normalizePermissions(value)
   if (role === 'member') {
@@ -162,16 +173,28 @@ function permissionsForRole(role: AppUserRole, value: unknown): AppUserPermissio
   return permissions
 }
 
-export function effectiveUserPermissions(user: Pick<AppUser, 'role' | 'permissions'>): AppUserPermissions {
-  return permissionsForRole(user.role, user.permissions)
+type AuthorizationUser = Pick<AppUser, 'role' | 'permissions'>
+  & Partial<Pick<AppUser, 'organizationRole' | 'organizationPermissions'>>
+
+export function effectiveAuthorizationRole(user: AuthorizationUser): AppUserRole {
+  return user.organizationRole || user.role
 }
 
-export function canInviteUsers(user: Pick<AppUser, 'role' | 'permissions'>): boolean {
-  return (user.role === 'owner' || user.role === 'admin') && effectiveUserPermissions(user).inviteUsers
+export function effectiveUserPermissions(user: AuthorizationUser): AppUserPermissions {
+  return permissionsForRole(
+    effectiveAuthorizationRole(user),
+    user.organizationPermissions || user.permissions,
+  )
 }
 
-export function canManageUserAccess(user: Pick<AppUser, 'role' | 'permissions'>): boolean {
-  return (user.role === 'owner' || user.role === 'admin') && effectiveUserPermissions(user).manageUserAccess
+export function canInviteUsers(user: AuthorizationUser): boolean {
+  const role = effectiveAuthorizationRole(user)
+  return (role === 'owner' || role === 'admin') && effectiveUserPermissions(user).inviteUsers
+}
+
+export function canManageUserAccess(user: AuthorizationUser): boolean {
+  const role = effectiveAuthorizationRole(user)
+  return (role === 'owner' || role === 'admin') && effectiveUserPermissions(user).manageUserAccess
 }
 
 async function requireOrganizationInActorScope(actor: AppUser, organizationId: string | null) {
@@ -206,6 +229,8 @@ function toAppUser(row: AppUserRow): AppUser {
     jobTitle: row.job_title,
     organizationId: row.organization_id,
     organizationName: row.organization_name,
+    organizationRole: null,
+    organizationPermissions: null,
     suiteCrmUserId: row.suitecrm_user_id,
     suiteCrmUsername: row.suitecrm_username,
     timezone: row.timezone || 'America/New_York',
@@ -218,6 +243,60 @@ function toAppUser(row: AppUserRow): AppUser {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   }
+}
+
+type ScopedAppUserRow = AppUserRow & {
+  membership_organization_id: string
+  membership_organization_name: string
+  membership_role: AppUserRole
+  membership_permissions: unknown
+  membership_status: AppUserStatus
+}
+
+function toScopedAppUser(row: ScopedAppUserRow): AppUser {
+  const role = row.membership_role
+  const permissions = permissionsForRole(role, row.membership_permissions)
+  return {
+    ...toAppUser(row),
+    role,
+    permissions,
+    status: row.membership_status,
+    organizationId: row.membership_organization_id,
+    organizationName: row.membership_organization_name,
+    organizationRole: role,
+    organizationPermissions: permissions,
+  }
+}
+
+function overlayIdentityOnMembership(identity: AppUser, membership: AppUser): AppUser {
+  return {
+    ...identity,
+    role: membership.role,
+    permissions: membership.permissions,
+    status: membership.status,
+    organizationId: membership.organizationId,
+    organizationName: membership.organizationName,
+    organizationRole: membership.organizationRole,
+    organizationPermissions: membership.organizationPermissions,
+  }
+}
+
+async function getScopedAppUser(email: string, organizationId: string): Promise<AppUser | null> {
+  const result = await query<ScopedAppUserRow>(
+    `SELECT app_user.*,
+       membership.organization_id::text AS membership_organization_id,
+       organization.name AS membership_organization_name,
+       membership.role AS membership_role,
+       membership.permissions AS membership_permissions,
+       membership.status AS membership_status
+     FROM app_users app_user
+     JOIN app_user_organization_memberships membership ON membership.user_email = app_user.email
+     JOIN workspace_organizations organization ON organization.id = membership.organization_id
+     WHERE app_user.email = $1 AND membership.organization_id = $2::uuid
+     LIMIT 1`,
+    [email, organizationId],
+  )
+  return result.rows[0] ? toScopedAppUser(result.rows[0]) : null
 }
 
 export async function ensureOwnerUser(): Promise<AppUser> {
@@ -262,10 +341,26 @@ export async function requireActiveAppUser(emailValue: unknown): Promise<AppUser
   return user
 }
 
-export async function listAppUsers(actorEmailValue: unknown): Promise<{ actor: AppUser; users: AppUser[] }> {
-  const actor = await requireActiveAppUser(actorEmailValue)
-  if (!canInviteUsers(actor) && !canManageUserAccess(actor)) return { actor, users: [actor] }
-  if (!actor.organizationId) return { actor, users: [actor] }
+export async function resolveAppUserActor(value: AppUser | unknown): Promise<AppUser> {
+  if (value && typeof value === 'object' && typeof (value as AppUser).email === 'string') {
+    const actor = value as AppUser
+    if (actor.status !== 'active') throw new Error('User access is not active')
+    return actor
+  }
+  return requireActiveAppUser(value)
+}
+
+export async function listAppUsers(actorEmailValue: AppUser | unknown): Promise<{ actor: AppUser; users: AppUser[] }> {
+  const actor = await resolveAppUserActor(actorEmailValue)
+  const actorView = actor.organizationRole
+    ? {
+        ...actor,
+        role: actor.organizationRole,
+        permissions: actor.organizationPermissions || actor.permissions,
+      }
+    : actor
+  if (!canInviteUsers(actor) && !canManageUserAccess(actor)) return { actor: actorView, users: [actorView] }
+  if (!actor.organizationId) return { actor: actorView, users: [actorView] }
   const result = await query<AppUserRow>(
     `
       WITH RECURSIVE managed AS (
@@ -275,14 +370,25 @@ export async function listAppUsers(actorEmailValue: unknown): Promise<{ actor: A
         FROM workspace_organizations child
         JOIN managed parent ON child.parent_id = parent.id
       )
-      SELECT app_user.*
-      FROM app_users app_user
-      JOIN managed ON managed.id = app_user.organization_id
-      ORDER BY CASE app_user.role WHEN 'owner' THEN 0 ELSE 1 END, app_user.created_at ASC, app_user.email ASC
+      SELECT app_user.*,
+        membership.organization_id::text AS membership_organization_id,
+        organization.name AS membership_organization_name,
+        membership.role AS membership_role,
+        membership.permissions AS membership_permissions,
+        membership.status AS membership_status
+      FROM app_user_organization_memberships membership
+      JOIN app_users app_user ON app_user.email = membership.user_email
+      JOIN workspace_organizations organization ON organization.id = membership.organization_id
+      JOIN managed ON managed.id = membership.organization_id
+      ORDER BY CASE membership.role WHEN 'owner' THEN 0 ELSE 1 END,
+        membership.created_at ASC, app_user.email ASC
     `,
     [actor.organizationId],
   )
-  return { actor, users: result.rows.map(toAppUser) }
+  return {
+    actor: actorView,
+    users: result.rows.map((row) => toScopedAppUser(row as ScopedAppUserRow)),
+  }
 }
 
 export async function inviteAppUser(input: {
@@ -291,7 +397,7 @@ export async function inviteAppUser(input: {
   organizationId: unknown
   crmUserEnabled?: unknown
 }): Promise<InviteAppUserResult> {
-  const actor = await requireActiveAppUser(input.actorEmail)
+  const actor = await resolveAppUserActor(input.actorEmail)
   if (!canInviteUsers(actor)) throw new AppUserAuthorizationError('You do not have permission to invite users')
   const email = normalizeUserEmail(input.email)
   const crmUserEnabled = input.crmUserEnabled === true
@@ -306,6 +412,8 @@ export async function inviteAppUser(input: {
       created: false,
       previousOrganizationId: actor.organizationId,
       previousInvitedBy: actor.invitedBy,
+      membershipCreated: false,
+      previousMembership: null,
     }
   }
 
@@ -329,24 +437,35 @@ export async function inviteAppUser(input: {
     if (!organization.rows[0]) throw new Error('Invitation organization was not found')
     const existing = await client.query<AppUserRow>('SELECT * FROM app_users WHERE email = $1 FOR UPDATE', [email])
     const current = existing.rows[0]
-    if (current?.role === 'owner') throw new Error('The owner already has access')
-    if (current?.role === 'admin' && actor.role !== 'owner') throw new AppUserAuthorizationError('Only the owner can invite administrators')
     if (current?.status === 'disabled') {
       if (!canManageUserAccess(actor)) {
         throw new AppUserAuthorizationError('You do not have permission to restore disabled users')
       }
       throw new AppUserAuthorizationError('Restore the disabled user before sending a new invitation')
     }
-    if (current?.status === 'active') {
-      if (current.organization_id !== organizationId) {
-        throw new AppUserAuthorizationError('Active users must be moved by an administrator before reinviting')
-      }
-      return {
-        user: toAppUser(current),
-        created: false,
-        previousOrganizationId: current.organization_id,
-        previousInvitedBy: current.invited_by,
-      }
+    const existingMembership = await client.query<{
+      role: AppUserRole
+      permissions: unknown
+      status: AppUserStatus
+      is_default: boolean
+    }>(
+      `SELECT role, permissions, status, is_default
+       FROM app_user_organization_memberships
+       WHERE user_email = $1 AND organization_id = $2::uuid
+       FOR UPDATE`,
+      [email, organizationId],
+    )
+    const membershipRow = existingMembership.rows[0]
+    const previousMembership = membershipRow
+      ? {
+          role: membershipRow.role,
+          permissions: permissionsForRole(membershipRow.role, membershipRow.permissions),
+          status: membershipRow.status,
+          isDefault: membershipRow.is_default,
+        }
+      : null
+    if (membershipRow?.status === 'active') {
+      throw new AppUserAuthorizationError('This user already has active access to the selected organization')
     }
     const invitedCrmUserEnabled = current ? current.crm_user_enabled : crmUserEnabled
 
@@ -368,16 +487,52 @@ export async function inviteAppUser(input: {
           'member', 'invited', $3::jsonb, $2, now(), $4::uuid, $5, now(), now()
         )
         ON CONFLICT (email) DO UPDATE SET
-          status = 'invited',
+          status = CASE WHEN app_users.status = 'active' THEN 'active' ELSE 'invited' END,
           invited_by = EXCLUDED.invited_by,
           invited_at = now(),
-          organization_id = EXCLUDED.organization_id,
-          organization_name = EXCLUDED.organization_name,
+          organization_id = COALESCE(app_users.organization_id, EXCLUDED.organization_id),
+          organization_name = CASE
+            WHEN app_users.organization_id IS NULL THEN EXCLUDED.organization_name
+            ELSE app_users.organization_name
+          END,
           updated_at = now()
         RETURNING *
       `,
       [email, actor.email, JSON.stringify(MEMBER_PERMISSIONS), organizationId, organization.rows[0].name, invitedCrmUserEnabled],
     )
+    const membership = await client.query<{
+      role: AppUserRole
+      permissions: unknown
+      status: AppUserStatus
+      is_default: boolean
+    }>(
+      `INSERT INTO app_user_organization_memberships (
+         user_email, organization_id, role, permissions, status, is_default,
+         created_by, updated_by, created_at, updated_at
+       ) VALUES (
+         $1, $2::uuid, 'member', $3::jsonb, 'invited',
+         NOT EXISTS (
+           SELECT 1 FROM app_user_organization_memberships
+           WHERE user_email = $1 AND is_default
+         ),
+         $4, $4, now(), now()
+       )
+       ON CONFLICT (user_email, organization_id) DO UPDATE SET
+         status = 'invited',
+         updated_by = EXCLUDED.updated_by,
+         updated_at = now()
+       RETURNING role, permissions, status, is_default`,
+      [email, organizationId, JSON.stringify(MEMBER_PERMISSIONS), actor.email],
+    )
+    const invitedMembership = membership.rows[0]
+    const invitedUser = {
+      ...toAppUser(result.rows[0]),
+      organizationId,
+      organizationName: organization.rows[0].name,
+      organizationRole: invitedMembership.role,
+      organizationPermissions: permissionsForRole(invitedMembership.role, invitedMembership.permissions),
+      status: invitedMembership.status,
+    }
     await recordAuditEvent({
       actor: actor.email,
       eventType: 'user.invited',
@@ -389,40 +544,61 @@ export async function inviteAppUser(input: {
         organizationId,
         organizationName: organization.rows[0].name,
         previousOrganizationId: current?.organization_id || null,
-        reinvited: Boolean(current),
+        membershipCreated: !membershipRow,
+        reinvited: Boolean(membershipRow),
         crmUserEnabled: result.rows[0].crm_user_enabled,
       },
     }, client)
     return {
-      user: toAppUser(result.rows[0]),
+      user: invitedUser,
       created: !current,
       previousOrganizationId: current?.organization_id || null,
       previousInvitedBy: current?.invited_by || null,
+      membershipCreated: !membershipRow,
+      previousMembership,
     }
   })
 }
 
 export async function restoreInvitedUserAssignment(input: {
   email: unknown
-  organizationId: string | null
+  organizationId: string
   invitedBy: string | null
+  previousMembership: AppUserMembershipSnapshot | null
 }): Promise<void> {
   const email = normalizeUserEmail(input.email)
   await withTransaction(async (client) => {
-    const organization = input.organizationId
-      ? await client.query<{ name: string }>(
-        'SELECT name FROM workspace_organizations WHERE id = $1::uuid',
-        [input.organizationId],
+    if (input.previousMembership) {
+      await client.query(
+        `UPDATE app_user_organization_memberships
+         SET role = $3,
+             permissions = $4::jsonb,
+             status = $5,
+             is_default = $6,
+             updated_at = now()
+         WHERE user_email = $1 AND organization_id = $2::uuid`,
+        [
+          email,
+          input.organizationId,
+          input.previousMembership.role,
+          JSON.stringify(input.previousMembership.permissions),
+          input.previousMembership.status,
+          input.previousMembership.isDefault,
+        ],
       )
-      : null
+    } else {
+      await client.query(
+        `DELETE FROM app_user_organization_memberships
+         WHERE user_email = $1 AND organization_id = $2::uuid`,
+        [email, input.organizationId],
+      )
+    }
     await client.query(
       `UPDATE app_users
-       SET organization_id = $2::uuid,
-           organization_name = $3,
-           invited_by = $4,
+       SET invited_by = $2,
            updated_at = now()
-       WHERE email = $1 AND status = 'invited'`,
-      [email, input.organizationId, organization?.rows[0]?.name || null, input.invitedBy],
+       WHERE email = $1`,
+      [email, input.invitedBy],
     )
   })
 }
@@ -430,66 +606,93 @@ export async function restoreInvitedUserAssignment(input: {
 export async function setAppUserStatus(input: {
   actorEmail: unknown
   email: unknown
+  organizationId?: unknown
   status: 'active' | 'disabled'
 }): Promise<AppUser> {
-  const actor = await requireActiveAppUser(input.actorEmail)
+  const actor = await resolveAppUserActor(input.actorEmail)
   if (!canManageUserAccess(actor)) throw new AppUserAuthorizationError('You do not have permission to manage users')
   const email = normalizeUserEmail(input.email)
   if (email === actor.email && input.status === 'disabled') throw new AppUserAuthorizationError('You cannot disable your own account')
 
-  const target = await getAppUser(email)
+  const organizationId = String(input.organizationId || actor.organizationId || '').trim()
+  if (!organizationId) throw new AppUserAuthorizationError('Active workspace is not configured')
+  await requireOrganizationInActorScope(actor, organizationId)
+  const target = await getScopedAppUser(email, organizationId)
   if (!target) throw new AppUserNotFoundError()
-  await requireOrganizationInActorScope(actor, target.organizationId)
   if (target.role === 'owner') throw new AppUserAuthorizationError('The owner account cannot be changed')
-  if (actor.role !== 'owner' && target.role !== 'member') throw new AppUserAuthorizationError('Only the owner can manage administrators')
+  if (effectiveAuthorizationRole(actor) !== 'owner' && target.role !== 'member') {
+    throw new AppUserAuthorizationError('Only the owner can manage administrators')
+  }
   if (input.status === 'active' && target.status === 'invited') {
     throw new AppUserAuthorizationError('Invited users must accept their welcome link before activation')
   }
 
-  const row = await withTransaction(async (client) => {
-    const result = await client.query<AppUserRow>(
-      `UPDATE app_users
-       SET status = $2,
-           activated_at = CASE WHEN $2 = 'active' THEN COALESCE(activated_at, now()) ELSE activated_at END,
+  await withTransaction(async (client) => {
+    const result = await client.query(
+      `UPDATE app_user_organization_memberships
+       SET status = $3,
+           updated_by = $4,
            updated_at = now()
-       WHERE email = $1
+       WHERE user_email = $1
+         AND organization_id = $2::uuid
          AND role <> 'owner'
-       RETURNING *`,
-      [email, input.status],
+       RETURNING user_email`,
+      [email, organizationId, input.status, actor.email],
     )
     if (!result.rows[0]) throw new AppUserNotFoundError()
+    await client.query(
+      `UPDATE app_users app_user
+       SET status = CASE
+             WHEN $2 = 'active' THEN 'active'
+             WHEN EXISTS (
+               SELECT 1
+               FROM app_user_organization_memberships membership
+               WHERE membership.user_email = app_user.email
+                 AND membership.status = 'active'
+             ) THEN 'active'
+             ELSE 'disabled'
+           END,
+           activated_at = CASE WHEN $2 = 'active' THEN COALESCE(activated_at, now()) ELSE activated_at END,
+           updated_at = now()
+       WHERE email = $1`,
+      [email, input.status],
+    )
     await recordAuditEvent({
       actor: actor.email,
       eventType: 'user.status.updated',
       aggregateType: 'app_user',
       aggregateId: email,
       subject: email,
-      organizationId: target.organizationId,
-      payload: { previousStatus: target.status, status: input.status, organizationId: target.organizationId },
+      organizationId,
+      payload: { previousStatus: target.status, status: input.status, organizationId },
     }, client)
-    return result.rows[0]
   })
-  return toAppUser(row)
+  const updated = await getScopedAppUser(email, organizationId)
+  if (!updated) throw new AppUserNotFoundError()
+  return updated
 }
 
 export async function updateAppUserCrmEmployee(input: {
   actorEmail: unknown
   email: unknown
+  organizationId?: unknown
   enabled: unknown
 }): Promise<AppUser> {
-  const actor = await requireActiveAppUser(input.actorEmail)
+  const actor = await resolveAppUserActor(input.actorEmail)
   if (!canManageUserAccess(actor)) {
     throw new AppUserAuthorizationError('You do not have permission to manage CRM employees')
   }
   const email = normalizeUserEmail(input.email)
   const enabled = input.enabled === true
-  const target = await getAppUser(email)
+  const organizationId = String(input.organizationId || actor.organizationId || '').trim()
+  if (!organizationId) throw new AppUserAuthorizationError('Active workspace is not configured')
+  await requireOrganizationInActorScope(actor, organizationId)
+  const target = await getScopedAppUser(email, organizationId)
   if (!target) throw new AppUserNotFoundError()
-  await requireOrganizationInActorScope(actor, target.organizationId)
   if (target.role === 'owner' && !enabled) {
     throw new AppUserAuthorizationError('The owner must remain a CRM employee')
   }
-  if (actor.role !== 'owner' && target.role !== 'member' && target.email !== actor.email) {
+  if (effectiveAuthorizationRole(actor) !== 'owner' && target.role !== 'member' && target.email !== actor.email) {
     throw new AppUserAuthorizationError('Only the owner can manage another administrator as a CRM employee')
   }
 
@@ -497,7 +700,9 @@ export async function updateAppUserCrmEmployee(input: {
     const locked = await client.query<AppUserRow>('SELECT * FROM app_users WHERE email = $1 FOR UPDATE', [email])
     const current = locked.rows[0]
     if (!current) throw new AppUserNotFoundError()
-    if (current.crm_user_enabled === enabled) return toAppUser(current)
+    if (current.crm_user_enabled === enabled) {
+      return overlayIdentityOnMembership(toAppUser(current), target)
+    }
 
     let updated: AppUserRow | undefined
     if (enabled) {
@@ -544,14 +749,14 @@ export async function updateAppUserCrmEmployee(input: {
       }
     }
     if (!updated) throw new AppUserNotFoundError()
-    const user = toAppUser(updated)
+    const user = overlayIdentityOnMembership(toAppUser(updated), target)
     await recordAuditEvent({
       actor: actor.email,
       eventType: 'user.crm_employee.updated',
       aggregateType: 'app_user',
       aggregateId: email,
       subject: target.displayName || email,
-      organizationId: target.organizationId,
+      organizationId,
       payload: {
         enabled,
         previousReferenceCode: current.reference_code,
@@ -566,22 +771,25 @@ export async function updateAppUserCrmEmployee(input: {
 export async function syncAppUserSuiteCrmIdentity(input: {
   actorEmail: unknown
   email: unknown
+  organizationId?: unknown
 }): Promise<AppUser> {
-  const actor = await requireActiveAppUser(input.actorEmail)
+  const actor = await resolveAppUserActor(input.actorEmail)
   if (!canManageUserAccess(actor)) {
     throw new AppUserAuthorizationError('You do not have permission to manage CRM user mappings')
   }
   const email = normalizeUserEmail(input.email)
-  const target = await getAppUser(email)
+  const organizationId = String(input.organizationId || actor.organizationId || '').trim()
+  if (!organizationId) throw new AppUserAuthorizationError('Active workspace is not configured')
+  await requireOrganizationInActorScope(actor, organizationId)
+  const target = await getScopedAppUser(email, organizationId)
   if (!target) throw new AppUserNotFoundError()
   if (!target.crmUserEnabled || !target.referenceCode) {
     throw new Error('Configure this user as a CRM employee before matching a SuiteCRM user')
   }
-  await requireOrganizationInActorScope(actor, target.organizationId)
   if (target.role === 'owner' && target.email !== actor.email) {
     throw new AppUserAuthorizationError('Only the owner can update the owner CRM mapping')
   }
-  if (actor.role !== 'owner' && target.role === 'admin' && target.email !== actor.email) {
+  if (effectiveAuthorizationRole(actor) !== 'owner' && target.role === 'admin' && target.email !== actor.email) {
     throw new AppUserAuthorizationError('Only the owner can update another administrator CRM mapping')
   }
   const referenceCode = target.referenceCode.toLowerCase()
@@ -613,7 +821,7 @@ export async function syncAppUserSuiteCrmIdentity(input: {
       [email, suiteCrmUserId, referenceCode],
     )
     if (!result.rows[0]) throw new AppUserNotFoundError()
-    const user = toAppUser(result.rows[0])
+    const user = overlayIdentityOnMembership(toAppUser(result.rows[0]), target)
     if (!user.suiteCrmUserId) throw new Error('SuiteCRM user mapping was not persisted')
     if (!user.referenceCode) throw new Error('CRM employee Global ID was not persisted')
     const payload = {
@@ -647,7 +855,7 @@ export async function syncAppUserSuiteCrmIdentity(input: {
       aggregateType: 'app_user',
       aggregateId: email,
       subject: target.displayName || email,
-      organizationId: target.organizationId,
+      organizationId,
       payload: {
         suiteCrmUsername: referenceCode,
         referenceCode: user.referenceCode,
@@ -693,7 +901,7 @@ export async function updateAppUserProfile(input: {
   timezone?: unknown
   locale?: unknown
 }): Promise<AppUser> {
-  const actor = await requireActiveAppUser(input.actorEmail)
+  const actor = await resolveAppUserActor(input.actorEmail)
   const displayName = cleanOptionalText(input.displayName, 100)
   if (!displayName) throw new Error('Name is required')
   const jobTitle = cleanOptionalText(input.jobTitle, 120)
@@ -702,16 +910,17 @@ export async function updateAppUserProfile(input: {
   const timezone = normalizeTimezone(input.timezone)
   const locale = normalizeLocale(input.locale)
   const row = await withTransaction(async (client) => {
-    const locked = await client.query<{ organization_id: string | null; organization_name: string }>(
-      `SELECT app_user.organization_id::text, organization.name AS organization_name
-       FROM app_users app_user
-       LEFT JOIN workspace_organizations organization ON organization.id = app_user.organization_id
-       WHERE app_user.email = $1
-       FOR UPDATE OF app_user`,
-      [actor.email],
+    if (!actor.organizationId) throw new Error('Active workspace is not configured')
+    await client.query('SELECT email FROM app_users WHERE email = $1 FOR UPDATE', [actor.email])
+    const locked = await client.query<{ organization_name: string }>(
+      `SELECT name AS organization_name
+       FROM workspace_organizations
+       WHERE id = $1::uuid
+       FOR UPDATE`,
+      [actor.organizationId],
     )
-    const organizationId = locked.rows[0]?.organization_id
-    if (!organizationId) throw new Error('User organization is not configured')
+    const organizationId = actor.organizationId
+    if (!locked.rows[0]) throw new Error('Active workspace is not available')
     const organizationName = canManageUserAccess(actor)
       ? requestedOrganizationName
       : locked.rows[0].organization_name
@@ -737,13 +946,13 @@ export async function updateAppUserProfile(input: {
       `UPDATE app_users
        SET display_name = $2,
            job_title = $3,
-           organization_name = $4,
-           timezone = $5,
-           locale = $6,
+           organization_name = CASE WHEN organization_id = $4::uuid THEN $5 ELSE organization_name END,
+           timezone = $6,
+           locale = $7,
            updated_at = now()
        WHERE email = $1
        RETURNING *`,
-      [actor.email, displayName, jobTitle, organizationName, timezone, locale],
+      [actor.email, displayName, jobTitle, organizationId, organizationName, timezone, locale],
     )
 
     await recordAuditEvent({
@@ -769,6 +978,7 @@ export async function updateAppUserProfile(input: {
          'pipeline:' || pipeline.id::text || ':provision', now(), now(), now()
        FROM pipeline_spaces pipeline
        WHERE pipeline.owner_email = $1
+         AND pipeline.workspace_organization_id = $2::uuid
          AND pipeline.google_service_account_email IS NOT NULL
          AND pipeline.google_shared_drive_id IS NOT NULL
        ON CONFLICT (target_system, idempotency_key)
@@ -776,35 +986,42 @@ export async function updateAppUserProfile(input: {
        DO UPDATE SET status = 'queued', attempts = 0, last_error = NULL,
          available_at = now(), processed_at = NULL, locked_at = NULL,
          lock_token = NULL, updated_at = now()`,
-      [actor.email],
+      [actor.email, organizationId],
     )
     await client.query(
       `UPDATE pipeline_spaces
        SET provisioning_status = 'queued', provisioning_error = NULL, updated_at = now()
        WHERE owner_email = $1
+         AND workspace_organization_id = $2::uuid
          AND google_service_account_email IS NOT NULL
          AND google_shared_drive_id IS NOT NULL`,
-      [actor.email],
+      [actor.email, organizationId],
     )
     return updated.rows[0]
   })
-  return toAppUser(row)
+  return {
+    ...overlayIdentityOnMembership(toAppUser(row), actor),
+    organizationName: requestedOrganizationName,
+  }
 }
 
 export async function updateAppUserAccess(input: {
   actorEmail: unknown
   email: unknown
+  organizationId?: unknown
   role?: 'admin' | 'member'
   permissions?: Partial<AppUserPermissions>
 }): Promise<AppUser> {
-  const actor = await requireActiveAppUser(input.actorEmail)
+  const actor = await resolveAppUserActor(input.actorEmail)
   if (!canManageUserAccess(actor)) throw new AppUserAuthorizationError('You do not have permission to manage users')
   const email = normalizeUserEmail(input.email)
-  const target = await getAppUser(email)
+  const organizationId = String(input.organizationId || actor.organizationId || '').trim()
+  if (!organizationId) throw new AppUserAuthorizationError('Active workspace is not configured')
+  await requireOrganizationInActorScope(actor, organizationId)
+  const target = await getScopedAppUser(email, organizationId)
   if (!target) throw new AppUserNotFoundError()
-  await requireOrganizationInActorScope(actor, target.organizationId)
   if (target.role === 'owner') throw new AppUserAuthorizationError('The owner account cannot be changed')
-  if (actor.role !== 'owner' && (target.role !== 'member' || input.role === 'admin')) {
+  if (effectiveAuthorizationRole(actor) !== 'owner' && (target.role !== 'member' || input.role === 'admin')) {
     throw new AppUserAuthorizationError('Only the owner can manage administrators')
   }
 
@@ -814,50 +1031,61 @@ export async function updateAppUserAccess(input: {
     : target.permissions
   const requested = input.permissions && typeof input.permissions === 'object' ? input.permissions : {}
   const permissions = permissionsForRole(role, { ...base, ...requested })
-  const row = await withTransaction(async (client) => {
-    const result = await client.query<AppUserRow>(
-      `UPDATE app_users
+  await withTransaction(async (client) => {
+    const result = await client.query(
+      `UPDATE app_user_organization_memberships
        SET role = $2,
            permissions = $3::jsonb,
+           updated_by = $5,
            updated_at = now()
-       WHERE email = $1
-       RETURNING *`,
-      [email, role, JSON.stringify(permissions)],
+       WHERE user_email = $1
+         AND organization_id = $4::uuid
+         AND role <> 'owner'
+       RETURNING user_email`,
+      [email, role, JSON.stringify(permissions), organizationId, actor.email],
     )
+    if (!result.rows[0]) throw new AppUserNotFoundError()
     await recordAuditEvent({
       actor: actor.email,
       eventType: 'user.access.updated',
       aggregateType: 'app_user',
       aggregateId: email,
       subject: email,
-      organizationId: target.organizationId,
+      organizationId,
       payload: {
-        organizationId: target.organizationId,
+        organizationId,
         previousRole: target.role,
         role,
         permissions,
       },
     }, client)
-    return result.rows[0]
   })
-  return toAppUser(row)
+  const updated = await getScopedAppUser(email, organizationId)
+  if (!updated) throw new AppUserNotFoundError()
+  return updated
 }
 
 export async function markAppUserSignedIn(emailValue: unknown): Promise<AppUser> {
   const email = normalizeUserEmail(emailValue)
-  const result = await query<AppUserRow>(
-    `
-      UPDATE app_users
-      SET status = 'active',
-          activated_at = COALESCE(activated_at, now()),
-          last_login_at = now(),
-          updated_at = now()
-      WHERE email = $1
-        AND status IN ('invited', 'active')
-      RETURNING *
-    `,
-    [email],
-  )
-  if (!result.rows[0]) throw new Error('User access is not active')
-  return toAppUser(result.rows[0])
+  return withTransaction(async (client) => {
+    const result = await client.query<AppUserRow>(
+      `UPDATE app_users
+       SET status = 'active',
+           activated_at = COALESCE(activated_at, now()),
+           last_login_at = now(),
+           updated_at = now()
+       WHERE email = $1
+         AND status IN ('invited', 'active')
+       RETURNING *`,
+      [email],
+    )
+    if (!result.rows[0]) throw new Error('User access is not active')
+    await client.query(
+      `UPDATE app_user_organization_memberships
+       SET status = 'active', updated_at = now()
+       WHERE user_email = $1 AND status = 'invited' AND is_default`,
+      [email],
+    )
+    return toAppUser(result.rows[0])
+  })
 }

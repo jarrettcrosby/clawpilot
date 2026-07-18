@@ -21,8 +21,8 @@ export async function POST(req: NextRequest) {
       const actor = await requireRequestUser(req)
       actorEmail = actor.email
       const selected = req.cookies.get(PIPELINE_SELECTION_COOKIE)?.value || undefined
-      pipeline = await resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: selected })
-        .catch(() => resolvePipelineSpaceAccess({ actorEmail: actor.email }))
+      pipeline = await resolvePipelineSpaceAccess({ actorEmail: actor, pipelineId: selected })
+        .catch(() => resolvePipelineSpaceAccess({ actorEmail: actor }))
       requireResourceEditor(pipeline)
       if (!pipeline.syncEnabled) {
         return NextResponse.json({ ok: false, error: 'This pipeline is app-managed and has no external sync source' }, { status: 400 })

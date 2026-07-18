@@ -46,6 +46,7 @@ export async function recordAuthActivity(input: {
   reason?: string
   effectiveUser?: string
   sessionId?: string
+  organizationId?: string | null
 }): Promise<void> {
   const email = normalizedEmail(input.email)
   const authenticatedActor = input.eventType === 'auth.login.succeeded' || input.eventType === 'auth.logout.succeeded'
@@ -55,6 +56,7 @@ export async function recordAuthActivity(input: {
     eventType: input.eventType,
     aggregateType: 'app_user',
     aggregateId: email || 'unknown',
+    organizationId: input.organizationId,
     payload: {
       method: input.method,
       outcome: input.eventType.endsWith('.succeeded') ? 'succeeded' : input.eventType.endsWith('.failed') || input.eventType.endsWith('.denied') ? 'failed' : 'requested',
@@ -64,6 +66,7 @@ export async function recordAuthActivity(input: {
       requestId: input.req.headers.get('x-request-id') || input.req.headers.get('x-vercel-id') || undefined,
       effectiveUser: input.effectiveUser,
       sessionId: input.sessionId,
+      organizationId: input.organizationId || undefined,
     },
   })
 }

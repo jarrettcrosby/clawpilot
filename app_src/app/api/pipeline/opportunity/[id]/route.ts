@@ -37,8 +37,8 @@ async function resolvePipelineContext(req: NextRequest): Promise<PipelineContext
   const actor = await requireRequestUser(req)
   const selected = req.cookies.get(PIPELINE_SELECTION_COOKIE)?.value || undefined
   const pipeline = selected
-    ? await resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: selected })
-    : await resolvePipelineSpaceAccess({ actorEmail: actor.email })
+    ? await resolvePipelineSpaceAccess({ actorEmail: actor, pipelineId: selected })
+    : await resolvePipelineSpaceAccess({ actorEmail: actor })
   requireResourceEditor(pipeline)
   return { actor, pipeline }
 }

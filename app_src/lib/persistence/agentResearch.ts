@@ -286,11 +286,24 @@ export async function completeAgentResearchOutboxInPostgres(item: AgentResearchO
       [item.jobId, item.lockToken],
     )
     if (result.rowCount !== 1) throw new Error(`Agent research lease lost for ${item.jobId}`)
-    await client.query(
-      `INSERT INTO audit_events (actor, event_type, aggregate_type, aggregate_id, payload)
-       VALUES ($1, 'agent.research.succeeded', $2, $3, $4::jsonb)`,
-      [item.operatorId, AGGREGATE_TYPE, item.taskId, JSON.stringify({ jobId: item.jobId, attempts: item.attempts })],
+    const audit = await client.query(
+      `INSERT INTO audit_events (
+         actor, event_type, aggregate_type, aggregate_id, organization_id, payload
+       )
+       SELECT $1, 'agent.research.succeeded', $2, $3,
+         board.workspace_organization_id, $5::jsonb
+       FROM project_boards board
+       WHERE board.id = $4::uuid
+       RETURNING id`,
+      [
+        item.operatorId,
+        AGGREGATE_TYPE,
+        item.taskId,
+        item.boardId,
+        JSON.stringify({ jobId: item.jobId, attempts: item.attempts, boardId: item.boardId }),
+      ],
     )
+    if (audit.rowCount !== 1) throw new Error(`Agent research board missing for ${item.jobId}`)
   })
 }
 
@@ -316,17 +329,30 @@ export async function failAgentResearchOutboxInPostgres(input: {
       [input.item.jobId, input.item.lockToken, status, error, availableAt],
     )
     if (result.rowCount !== 1) throw new Error(`Agent research lease lost for ${input.item.jobId}`)
-    await client.query(
-      `INSERT INTO audit_events (actor, event_type, aggregate_type, aggregate_id, payload)
-       VALUES ($1, $2, $3, $4, $5::jsonb)`,
+    const audit = await client.query(
+      `INSERT INTO audit_events (
+         actor, event_type, aggregate_type, aggregate_id, organization_id, payload
+       )
+       SELECT $1, $2, $3, $4, board.workspace_organization_id, $6::jsonb
+       FROM project_boards board
+       WHERE board.id = $5::uuid
+       RETURNING id`,
       [
         input.item.operatorId,
         `agent.research.${status}`,
         AGGREGATE_TYPE,
         input.item.taskId,
-        JSON.stringify({ jobId: input.item.jobId, attempts: input.item.attempts, error, availableAt: status === 'failed' ? availableAt : null }),
+        input.item.boardId,
+        JSON.stringify({
+          jobId: input.item.jobId,
+          attempts: input.item.attempts,
+          error,
+          availableAt: status === 'failed' ? availableAt : null,
+          boardId: input.item.boardId,
+        }),
       ],
     )
+    if (audit.rowCount !== 1) throw new Error(`Agent research board missing for ${input.item.jobId}`)
   })
   return status
 }

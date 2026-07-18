@@ -106,8 +106,10 @@ try {
   let sequence = 0
   let record = null
   const delivered = []
+  const activatedMemberships = []
   let deliveryShouldFail = false
   let invitationValid = true
+  const invitationOrganizationId = '20000000-0000-4000-8000-000000000001'
 
   const fakeClient = {
     async query(sql, values) {
@@ -153,8 +155,16 @@ try {
 
       if (sql.includes('UPDATE app_user_invitations')) {
         return invitationValid && values[0] === '10000000-0000-4000-8000-000000000001'
-          ? { rows: [{ id: values[0] }], rowCount: 1 }
+          ? { rows: [{ id: values[0], workspace_organization_id: invitationOrganizationId }], rowCount: 1 }
           : { rows: [], rowCount: 0 }
+      }
+
+      if (sql.includes('UPDATE app_user_organization_memberships')) {
+        if (values[0] === 'invited@example.com' && values[1] === invitationOrganizationId) {
+          activatedMemberships.push({ email: values[0], organizationId: values[1] })
+          return { rows: [{ organization_id: values[1] }], rowCount: 1 }
+        }
+        return { rows: [], rowCount: 0 }
       }
 
       if (sql.includes('UPDATE app_users')) {
@@ -220,6 +230,9 @@ try {
   assert.ok(authModule.source.includes("interval '15 minutes'"))
   assert.ok(authModule.source.includes("interval '60 seconds'"))
   assert.ok(authModule.source.includes('FOR UPDATE'))
+  assert.ok(authModule.source.includes('membership.organization_id = invitation.workspace_organization_id'))
+  assert.ok(authModule.source.includes("membership.status = 'invited'"))
+  assert.ok(authModule.source.includes('AND organization_id = $2::uuid'))
   assert.ok(!authModule.source.includes('console.'))
 
   const unauthorized = await requestAuthMagicCode({ email: 'other@example.com' })
@@ -264,6 +277,7 @@ try {
   const verified = await verifyAuthMagicCode({ email: 'operator@example.com', code: replacementCode })
   assert.equal(verified.status, 'verified')
   assert.equal(verified.email, 'operator@example.com')
+  assert.equal(verified.organizationId, null)
   const consumed = await verifyAuthMagicCode({ email: 'operator@example.com', code: replacementCode })
   assert.equal(consumed.status, 'consumed')
 
@@ -285,6 +299,11 @@ try {
   assert.equal(record.invitationId, '10000000-0000-4000-8000-000000000001')
   const invitationVerified = await verifyAuthMagicCode({ email: 'invited@example.com', code: delivered.at(-1).code })
   assert.equal(invitationVerified.status, 'verified')
+  assert.equal(invitationVerified.organizationId, invitationOrganizationId)
+  assert.deepEqual(activatedMemberships, [{
+    email: 'invited@example.com',
+    organizationId: invitationOrganizationId,
+  }])
 
   now += 61_000
   invitationValid = false

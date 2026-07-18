@@ -19,7 +19,7 @@ export async function PATCH(req: NextRequest) {
     const actor = await requireRequestUser(req)
     const body = await req.json()
     const hierarchy = await updateWorkspaceOrganizationParent({
-      actorEmail: actor.email,
+      actorEmail: actor,
       organizationId: body?.organizationId,
       parentId: body?.parentId,
     })

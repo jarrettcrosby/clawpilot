@@ -29,8 +29,8 @@ export async function GET(req: NextRequest) {
       try {
         const actor = await requireRequestUser(req)
         const selected = req.cookies.get(PIPELINE_SELECTION_COOKIE)?.value || undefined
-        const pipeline = await resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: selected })
-          .catch(() => resolvePipelineSpaceAccess({ actorEmail: actor.email }))
+        const pipeline = await resolvePipelineSpaceAccess({ actorEmail: actor, pipelineId: selected })
+          .catch(() => resolvePipelineSpaceAccess({ actorEmail: actor }))
         selectedPipeline = pipeline
         const [projection, diagnostics, crmSummary] = await Promise.all([
           readPipelineProjectionForSpace(pipeline),

@@ -32,6 +32,7 @@ import { shortLinkUrl } from '@/lib/shortlinks'
 import {
   ensurePrimaryWorkspaceOrganization,
   workspaceOrganizationAncestors,
+  workspaceOrganizationById,
 } from '@/lib/organizations'
 import { recordAuditEvent } from '@/lib/auditWriter'
 import { requireActiveAppUser } from '@/lib/users'
@@ -2211,18 +2212,23 @@ export async function syncAppUserProfileToCrm(input: {
   pipelineId: string
 }) {
   const user = await requireActiveAppUser(input.email)
-  const organizationPipeline = await query<{ id: string }>(
-    `SELECT pipeline.id::text
+  const organizationPipeline = await query<{ id: string; workspace_organization_id: string }>(
+    `SELECT pipeline.id::text, pipeline.workspace_organization_id::text
      FROM pipeline_spaces pipeline
-     JOIN app_users app_user ON app_user.email = $2
+     JOIN app_user_organization_memberships membership
+       ON membership.user_email = $2
+      AND membership.organization_id = pipeline.workspace_organization_id
+      AND membership.status = 'active'
      WHERE pipeline.id = $1::uuid
-       AND pipeline.workspace_organization_id = app_user.organization_id
      LIMIT 1`,
     [input.pipelineId, user.email],
   )
   if (!organizationPipeline.rows[0]) throw new Error('CRM profile synchronization requires an organization pipeline')
   const displayName = clean(user.displayName) || user.email.split('@')[0]
-  const workspaceOrganization = await ensurePrimaryWorkspaceOrganization(user.email)
+  const workspaceOrganization = await workspaceOrganizationById(
+    organizationPipeline.rows[0].workspace_organization_id,
+  )
+  if (!workspaceOrganization) throw new Error('CRM profile workspace is not available')
   const hierarchy = await ensurePipelineCrmHierarchy({
     pipelineId: input.pipelineId,
     actorEmail: user.email,
@@ -2284,8 +2290,10 @@ export async function syncAppUserProfileToOwnedPipelines(email: string) {
   const pipelines = await query<{ id: string }>(
     `SELECT pipeline.id::text
      FROM pipeline_spaces pipeline
-     JOIN app_users app_user ON app_user.email = $1
-     WHERE pipeline.workspace_organization_id = app_user.organization_id
+     JOIN app_user_organization_memberships membership
+       ON membership.user_email = $1
+      AND membership.organization_id = pipeline.workspace_organization_id
+      AND membership.status = 'active'
      ORDER BY pipeline.created_at, pipeline.id`,
     [user.email],
   )
@@ -2890,11 +2898,14 @@ async function ensurePipelineCatalogAppUserContacts(
       `SELECT app_user.email, app_user.contact_reference_code, app_user.display_name, app_user.job_title,
          app_user.timezone, app_user.locale, contact.id::text AS contact_id
        FROM app_users app_user
+       JOIN app_user_organization_memberships membership
+         ON membership.user_email = app_user.email
+        AND membership.organization_id = $2::uuid
+        AND membership.status = 'active'
        LEFT JOIN crm_contacts contact
          ON contact.pipeline_id = $1::uuid
         AND contact.app_user_email = app_user.email
-       WHERE app_user.organization_id = $2::uuid
-         AND app_user.status = 'active'
+       WHERE app_user.status = 'active'
        ORDER BY app_user.email`,
       [context.pipelineId, context.workspaceOrganizationId],
     )
@@ -3136,11 +3147,14 @@ async function readPipelineCatalogPeople(
        'app_user'::text AS source, true AS app_access, app_user.status,
        (app_user.status = 'active') AS active
      FROM app_users app_user
+     JOIN app_user_organization_memberships membership
+       ON membership.user_email = app_user.email
+      AND membership.organization_id = $2::uuid
+      AND membership.status = 'active'
      JOIN crm_contacts contact
        ON contact.pipeline_id = $1::uuid
       AND contact.app_user_email = app_user.email
-     WHERE app_user.organization_id = $2::uuid
-       AND app_user.status = 'active'
+     WHERE app_user.status = 'active'
        AND app_user.crm_user_enabled = true
        AND app_user.reference_code IS NOT NULL
      UNION ALL

@@ -29,7 +29,6 @@ import {
 import { getPostgresPool } from '@/lib/persistence/postgres'
 import { syncAppUserProfileToCrm } from '@/lib/persistence/crm'
 import { createShortLink, listShortLinks, type ShortLinkActor } from '@/lib/shortlinks'
-import { ensurePrimaryWorkspaceOrganization } from '@/lib/organizations'
 import {
   readPipelineWorkbookBranding,
   type OrganizationBranding,
@@ -2175,17 +2174,28 @@ async function verifyPipelineTabsAndHeaders(runtime: GoogleWorkspaceRuntime, she
   })
 }
 
-const shortLinkActor = async (ownerEmail: string): Promise<ShortLinkActor> => ({
-  ownerEmail,
-  organizationId: (await ensurePrimaryWorkspaceOrganization(ownerEmail)).id,
-  sourceApp: 'clawpilot',
-  manageOrganization: false,
-  service: false,
-})
+const shortLinkActor = async (pipeline: PipelineProvisioningRecord): Promise<ShortLinkActor> => {
+  const scoped = await getPostgresPool().query<{ workspace_organization_id: string }>(
+    `SELECT workspace_organization_id::text
+     FROM pipeline_spaces
+     WHERE id = $1::uuid
+     LIMIT 1`,
+    [pipeline.id],
+  )
+  const organizationId = scoped.rows[0]?.workspace_organization_id
+  if (!organizationId) throw new Error('Pipeline workspace organization is not available')
+  return {
+    ownerEmail: pipeline.ownerEmail,
+    organizationId,
+    sourceApp: 'clawpilot',
+    manageOrganization: false,
+    service: false,
+  }
+}
 
 async function ensurePipelineShortLink(pipeline: PipelineProvisioningRecord, sheetId: string) {
   const destinationUrl = `https://docs.google.com/spreadsheets/d/${sheetId}/edit`
-  const actor = await shortLinkActor(pipeline.ownerEmail)
+  const actor = await shortLinkActor(pipeline)
   const existing = (await listShortLinks(actor, {
     query: destinationUrl,
     status: 'active',

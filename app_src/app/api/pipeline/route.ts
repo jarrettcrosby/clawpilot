@@ -119,13 +119,13 @@ export async function GET(req: NextRequest) {
       const selectedBoardId = explicitBoardId || req.cookies.get(BOARD_SELECTION_COOKIE)?.value || undefined
       const selectedPipelineId = explicitPipelineId || req.cookies.get(PIPELINE_SELECTION_COOKIE)?.value || undefined
       const board = explicitBoardId
-        ? await resolveProjectBoardAccess({ actorEmail: actor.email, boardId: explicitBoardId })
-        : await resolveProjectBoardAccess({ actorEmail: actor.email, boardId: selectedBoardId })
-          .catch(() => resolveProjectBoardAccess({ actorEmail: actor.email }))
+        ? await resolveProjectBoardAccess({ actorEmail: actor, boardId: explicitBoardId })
+        : await resolveProjectBoardAccess({ actorEmail: actor, boardId: selectedBoardId })
+          .catch(() => resolveProjectBoardAccess({ actorEmail: actor }))
       selectedPipeline = explicitPipelineId
-        ? await resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: explicitPipelineId })
-        : await resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: selectedPipelineId })
-          .catch(() => resolvePipelineSpaceAccess({ actorEmail: actor.email }))
+        ? await resolvePipelineSpaceAccess({ actorEmail: actor, pipelineId: explicitPipelineId })
+        : await resolvePipelineSpaceAccess({ actorEmail: actor, pipelineId: selectedPipelineId })
+          .catch(() => resolvePipelineSpaceAccess({ actorEmail: actor }))
       boardId = board.id
     }
     workItems = pipelineWorkItemsFromTasks(await readTasks(boardId))
@@ -215,8 +215,8 @@ export async function POST(req: NextRequest) {
     const actor = await requireRequestUser(req)
     const selected = req.cookies.get(PIPELINE_SELECTION_COOKIE)?.value || undefined
     const pipeline = selected
-      ? await resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: selected })
-      : await resolvePipelineSpaceAccess({ actorEmail: actor.email })
+      ? await resolvePipelineSpaceAccess({ actorEmail: actor, pipelineId: selected })
+      : await resolvePipelineSpaceAccess({ actorEmail: actor })
     requireResourceEditor(pipeline)
 
     const body = await req.json()

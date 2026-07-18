@@ -43,9 +43,11 @@ export async function POST(req: NextRequest) {
     }
     const body = await req.json()
     if (body?.action === 'revoke-others') {
+      if (!session.activeWorkspaceOrganizationId) throw new Error('Active workspace is not available')
       const revoked = await revokeOtherBrowserSessions({
         authenticatedUser: session.authenticatedUser,
         currentSessionId: session.id,
+        organizationId: session.activeWorkspaceOrganizationId,
       })
       const response = NextResponse.json({ ok: true, revoked })
       if (issued) setBrowserSessionCookie(response, issued)

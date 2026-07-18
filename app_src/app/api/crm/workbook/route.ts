@@ -15,8 +15,8 @@ export async function POST(req: NextRequest) {
   try {
     const actor = await requireRequestUser(req)
     const selected = req.cookies.get(PIPELINE_SELECTION_COOKIE)?.value || undefined
-    const pipeline = await resolvePipelineSpaceAccess({ actorEmail: actor.email, pipelineId: selected })
-      .catch(() => resolvePipelineSpaceAccess({ actorEmail: actor.email }))
+    const pipeline = await resolvePipelineSpaceAccess({ actorEmail: actor, pipelineId: selected })
+      .catch(() => resolvePipelineSpaceAccess({ actorEmail: actor }))
     if (pipeline.ownerEmail !== actor.email || pipeline.accessRole !== 'owner') {
       return NextResponse.json({ ok: false, error: 'Only the pipeline owner can refresh its CRM workbook' }, { status: 403 })
     }

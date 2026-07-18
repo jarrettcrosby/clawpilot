@@ -121,9 +121,9 @@ async function resolveAssignmentBoard(req: NextRequest, requireEdit = false): Pr
   const selected = req.cookies.get(BOARD_SELECTION_COOKIE)?.value || undefined
   let board: ProjectBoard
   try {
-    board = await resolveProjectBoardAccess({ actorEmail: actor.email, boardId: selected })
+    board = await resolveProjectBoardAccess({ actorEmail: actor, boardId: selected })
   } catch {
-    board = await resolveProjectBoardAccess({ actorEmail: actor.email })
+    board = await resolveProjectBoardAccess({ actorEmail: actor })
   }
   if (requireEdit) requireResourceEditor(board)
   return { board, actorEmail: actor.email }
