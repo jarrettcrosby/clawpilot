@@ -1037,6 +1037,11 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
             {usersPayload?.isAdmin && usersPayload.canInvite ? (
               <Box component="form" onSubmit={inviteUser} mb={2.5}>
                 <Typography variant="subtitle2" color="text.primary" fontWeight={700} mb={1}>Invite</Typography>
+                <Alert severity="info" variant="outlined" sx={{ mb: 1.5, borderRadius: '8px' }}>
+                  Choose the organization whose data this person may access. New invitations start as Members; after inviting,
+                  the owner can promote the person to Admin and select administrative permissions on their user card. Enable
+                  CRM employee only when the person should own CRM records.
+                </Alert>
                 <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', sm: 'minmax(0, 1fr) minmax(0, 1fr) auto' }, gap: 1 }}>
                   <TextField
                     required
