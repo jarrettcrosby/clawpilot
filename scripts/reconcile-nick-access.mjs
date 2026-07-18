@@ -24,8 +24,8 @@ function fail(message) {
 }
 
 if (!process.env.DATABASE_URL) fail('DATABASE_URL is required')
-if (process.env.CLAWPILOT_USER_ACCESS_CONFIRM !== 'nick-admin-v1') {
-  fail('CLAWPILOT_USER_ACCESS_CONFIRM=nick-admin-v1 is required')
+if (process.env.CLAWPILOT_USER_ACCESS_CONFIRM !== 'nick-disabled-admin-v2') {
+  fail('CLAWPILOT_USER_ACCESS_CONFIRM=nick-disabled-admin-v2 is required')
 }
 
 const actor = String(process.env.CLAWPILOT_USER_ACCESS_ACTOR || '').trim().toLowerCase()
@@ -43,14 +43,18 @@ async function main() {
   const client = await pool.connect()
   try {
     await client.query('BEGIN')
-    await client.query(`SELECT pg_advisory_xact_lock(hashtext('clawpilot-reconcile-nick-access-v1'))`)
+    await client.query(`SELECT pg_advisory_xact_lock(hashtext('clawpilot-reconcile-nick-access-v2'))`)
     const current = await client.query(
-      `SELECT app_user.organization_id::text, organization.parent_id::text,
-         organization.name AS organization_name
+      `SELECT app_user.organization_id::text, app_user.status AS user_status,
+         organization.parent_id::text, organization.name AS organization_name,
+         membership.status AS membership_status, membership.role AS membership_role
        FROM app_users app_user
        JOIN workspace_organizations organization ON organization.id = app_user.organization_id
+       JOIN app_user_organization_memberships membership
+         ON membership.user_email = app_user.email
+        AND membership.organization_id = app_user.organization_id
        WHERE app_user.email = $1
-       FOR UPDATE OF app_user, organization`,
+       FOR UPDATE OF app_user, organization, membership`,
       [NICK_EMAIL],
     )
     if (!current.rows[0]) throw new Error('Nick must already be assigned to an organization')
@@ -65,19 +69,53 @@ async function main() {
     await client.query(
       `UPDATE app_users
        SET role = 'admin', permissions = $2::jsonb,
-         organization_name = $3, updated_at = now()
+         status = 'disabled', organization_name = $3, updated_at = now()
        WHERE email = $1`,
       [NICK_EMAIL, JSON.stringify(ADMIN_PERMISSIONS), ORGANIZATION_NAME],
     )
     await client.query(
-      `INSERT INTO audit_events (actor, event_type, aggregate_type, aggregate_id, payload)
-       VALUES ($1, 'user.admin_access.reconciled', 'app_user', $2, $3::jsonb)`,
-      [actor, NICK_EMAIL, JSON.stringify({
+      `UPDATE app_user_organization_memberships
+       SET role = 'admin', permissions = $3::jsonb, status = 'disabled',
+         updated_by = $4, updated_at = now()
+       WHERE user_email = $1 AND organization_id = $2::uuid`,
+      [NICK_EMAIL, current.rows[0].organization_id, JSON.stringify(ADMIN_PERMISSIONS), actor],
+    )
+    const revoked = await client.query(
+      `UPDATE app_sessions
+       SET revoked_at = now(), revoked_reason = 'account_disabled_by_operator'
+       WHERE (authenticated_user_email = $1 OR effective_user_email = $1)
+         AND revoked_at IS NULL
+       RETURNING id`,
+      [NICK_EMAIL],
+    )
+    if (current.rows[0].user_status !== 'disabled' || current.rows[0].membership_status !== 'disabled') {
+      await client.query(
+        `INSERT INTO audit_events (
+           actor, event_type, aggregate_type, aggregate_id, subject, organization_id, payload
+         ) VALUES ($1, 'user.status.updated', 'app_user', $2, $2, $3::uuid, $4::jsonb)`,
+        [actor, NICK_EMAIL, current.rows[0].organization_id, JSON.stringify({
+          previousStatus: current.rows[0].membership_status,
+          previousUserStatus: current.rows[0].user_status,
+          status: 'disabled',
+          organizationId: current.rows[0].organization_id,
+          source: 'operator-disabled-access-reconciliation',
+          revokedSessions: revoked.rowCount,
+        })],
+      )
+    }
+    await client.query(
+      `INSERT INTO audit_events (
+         actor, event_type, aggregate_type, aggregate_id, subject, organization_id, payload
+       ) VALUES ($1, 'user.admin_access.reconciled', 'app_user', $2, $2, $3::uuid, $4::jsonb)`,
+      [actor, NICK_EMAIL, current.rows[0].organization_id, JSON.stringify({
         subject: NICK_EMAIL,
         organizationId: current.rows[0].organization_id,
         organizationName: ORGANIZATION_NAME,
         previousOrganizationName: current.rows[0].organization_name,
+        previousRole: current.rows[0].membership_role,
         role: 'admin',
+        status: 'disabled',
+        revokedSessions: revoked.rowCount,
       })],
     )
     await client.query('COMMIT')
@@ -85,6 +123,8 @@ async function main() {
       ok: true,
       email: NICK_EMAIL,
       role: 'admin',
+      status: 'disabled',
+      revokedSessions: revoked.rowCount,
       organizationId: current.rows[0].organization_id,
       organizationName: ORGANIZATION_NAME,
     }))
