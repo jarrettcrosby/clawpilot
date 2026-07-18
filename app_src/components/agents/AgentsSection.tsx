@@ -1,6 +1,6 @@
 'use client'
 
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import Alert from '@mui/material/Alert'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
@@ -251,6 +251,8 @@ export default function AgentsSection() {
   const [codeCopied, setCodeCopied] = useState(false)
   const [repositoryState, setRepositoryState] = useState<RepositoryRunnerState | null>(null)
   const [repositoryQueueing, setRepositoryQueueing] = useState(false)
+  const sendingRef = useRef(false)
+  const messageListRef = useRef<HTMLDivElement | null>(null)
 
   const loadWorkspace = useCallback(async () => {
     const [agentResponse, taskResponse] = await Promise.all([
@@ -393,6 +395,12 @@ export default function AgentsSection() {
       })
   }, [selectedAgentId, selectedTaskId])
 
+  useEffect(() => {
+    const messageList = messageListRef.current
+    if (!messageList) return
+    messageList.scrollTop = messageList.scrollHeight
+  }, [messages, sendingMode, selectedTaskId])
+
   const loadRepositoryState = useCallback(async () => {
     if (!selectedTaskId) {
       setRepositoryState(null)
@@ -484,12 +492,14 @@ export default function AgentsSection() {
   async function sendMessage(textOverride?: string, modeOverride?: InteractionMode) {
     const text = String(textOverride || composer).trim()
     const mode = modeOverride || interactionMode
-    if (!selectedAgentId || !selectedTaskId || !text || !runtime?.ready) return
+    if (!selectedAgentId || !selectedTaskId || !text || !runtime?.ready || sendingRef.current) return
     if (mode === 'work' && executionView.active) {
       setNotice('This task already has an active agent run.')
       return
     }
-    const optimisticMessageId = `local-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    sendingRef.current = true
+    const clientMessageId = crypto.randomUUID()
+    const optimisticMessageId = `local-${clientMessageId}`
     setMessages((current) => [
       ...current,
       {
@@ -507,7 +517,7 @@ export default function AgentsSection() {
       const response = await fetch('/api/agents/threads', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ agentId: selectedAgentId, taskId: selectedTaskId, text, mode }),
+        body: JSON.stringify({ agentId: selectedAgentId, taskId: selectedTaskId, text, mode, clientMessageId }),
       })
       const payload = await response.json().catch(() => null)
       if (payload?.runtime) setRuntime(payload.runtime)
@@ -527,6 +537,7 @@ export default function AgentsSection() {
       if (!textOverride) setComposer((current) => current || text)
       setNotice(error instanceof Error ? error.message : 'Agent request failed.')
     } finally {
+      sendingRef.current = false
       setSending(false)
       setSendingMode(null)
     }
@@ -865,7 +876,7 @@ export default function AgentsSection() {
           )}
 
           <Divider sx={{ borderColor: 'rgba(255,255,255,0.08)', mb: shortLandscape ? 0.75 : 1.25 }} />
-          <Stack spacing={1} sx={{ flex: 1, minHeight: shortLandscape ? 40 : 220, maxHeight: shortLandscape ? 72 : 380, overflowY: 'auto', pr: 0.5 }}>
+          <Stack data-testid="agent-thread-messages" ref={messageListRef} spacing={1} sx={{ flex: 1, minHeight: shortLandscape ? 40 : 220, maxHeight: shortLandscape ? 72 : 380, overflowY: 'auto', pr: 0.5 }}>
             {!selectedTaskId ? (
               <Typography variant="body2" color="text.disabled">No open tasks assigned to this agent.</Typography>
             ) : messages.length === 0 ? (

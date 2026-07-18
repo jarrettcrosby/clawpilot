@@ -242,6 +242,7 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
   const [editCheckAssignee, setEditCheckAssignee] = useState('')
   const [editCheckDue, setEditCheckDue] = useState('')
   const commentRef = useRef<HTMLInputElement>(null)
+  const commentSubmittingRef = useRef(false)
   const touchLandscape = useMediaQuery('(orientation: landscape) and (pointer: coarse)')
   const shortLandscape = useMediaQuery('(orientation: landscape) and (max-height: 500px) and (max-width: 899.95px)')
 
@@ -304,9 +305,15 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
 
   const submitComment = async () => {
     const text = commentText.trim()
-    if (!text) return
+    if (!text || commentSubmittingRef.current) return
+    commentSubmittingRef.current = true
     setCommentText('')
-    await patch({ _comment: text })
+    try {
+      const updated = await patch({ _comment: text, _commentId: crypto.randomUUID() })
+      if (!updated) setCommentText((current) => current || text)
+    } finally {
+      commentSubmittingRef.current = false
+    }
   }
 
   async function assignTask(agentId: string) {
@@ -755,7 +762,7 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
           <Popover open={Boolean(mentionAnchor)} anchorEl={mentionAnchor} onClose={() => setMentionAnchor(null)} anchorOrigin={{ vertical: 'top', horizontal: 'left' }}
             PaperProps={{ sx: { backgroundColor: '#232330', border: '1px solid rgba(255,255,255,0.08)', borderRadius: 2, p: 0.5, minWidth: 180 } }}>
             <Typography variant="overline" color="text.disabled" sx={{ fontSize: '0.6rem', letterSpacing: 1.5, px: 1.5, py: 0.5, display: 'block' }}>MENTION</Typography>
-            {PEOPLE.map(p => (
+            {PEOPLE.filter((person) => person.id === task.assignedAgent).map(p => (
               <MenuItem key={p.id} onClick={() => insertMention(`@${p.name}`)}
                 sx={{ borderRadius: 1.5, fontSize: '0.85rem', '&:hover': { backgroundColor: 'rgba(168,199,250,0.08)' } }}>
                 <Stack direction="row" spacing={1.5} alignItems="center">
@@ -766,6 +773,11 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
                 </Stack>
               </MenuItem>
             ))}
+            {!task.assignedAgent && (
+              <MenuItem disabled sx={{ borderRadius: 1.5, fontSize: '0.8rem' }}>
+                Assign an agent before mentioning one
+              </MenuItem>
+            )}
           </Popover>
           <Stack spacing={2}>
             {[...(task.comments||[])].reverse().map(c => (

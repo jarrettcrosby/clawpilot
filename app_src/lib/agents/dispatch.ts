@@ -22,9 +22,11 @@ export function assignmentKickoffText() {
 }
 
 export function commentTargetsAssignedAgent(text: string, agentId: string): boolean {
-  const normalized = String(text || '').toLowerCase()
-  const aliases = [agentId, AGENT_NAMES[agentId]].filter(Boolean).map((value) => String(value).toLowerCase())
-  return aliases.some((alias) => normalized.includes(`@${alias}`))
+  const aliases = [agentId, AGENT_NAMES[agentId]].filter(Boolean).map((value) => String(value))
+  return aliases.some((alias) => {
+    const escaped = alias.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    return new RegExp(`(^|[^A-Za-z0-9_])@${escaped}(?![A-Za-z0-9_-])`, 'i').test(String(text || ''))
+  })
 }
 
 export function prepareAgentDispatch(input: {

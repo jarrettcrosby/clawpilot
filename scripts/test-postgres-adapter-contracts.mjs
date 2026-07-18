@@ -540,7 +540,12 @@ assertIncludes(pipelineProvisioning, "supportsAllDrives: 'true'", 'Shared Drive 
 assertIncludes(pipelineProvisioning, "idempotent: false", 'non-retried ambiguous Google creates')
 assertIncludes(pipelineProvisioning, 'ensurePipelineShortLink(pipeline, pipeline.sheetId)', 'ready pipeline Sheet-link repair')
 assertIncludes(pipelineProvisioning, "const EXPECTED_TABS", 'managed pipeline tab contract')
-assertIncludes(pipelineProvisioning, "range: `'${title}'!B4`", 'managed pipeline B4 headers')
+assertIncludes(
+  pipelineProvisioning,
+  "const dataColumn = title === 'Dashboard' ? 'P' : title === 'Start Here' ? 'C' : 'B'",
+  'managed workbook header column mapping',
+)
+assertIncludes(pipelineProvisioning, "range: `'${title}'!${dataColumn}4`", 'managed workbook header projection')
 assertIncludes(pipelineProvisioning, "Dropdowns: ['Owner', 'Product', 'Stage', 'Priority', 'Status', 'Source', 'Loss Reason']", 'canonical managed pipeline dropdown headers')
 assertIncludes(pipelineProvisioning, 'const newlyProvisionedTitles = new Set<string>()', 'new workbook tab seed tracking')
 assertIncludes(pipelineProvisioning, "title === 'Dropdowns' && !newlyProvisionedTitles.has(title)", 'configured dropdown headers and rows are not rewritten during projection')
