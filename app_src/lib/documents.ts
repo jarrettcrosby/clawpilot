@@ -440,9 +440,14 @@ export async function refreshUserBriefs(
     query<ReleaseBriefRow>(
       `
         SELECT title, summary, deployed_at::text, features, fixes
-        FROM release_entries
-        WHERE $1::boolean
-          OR deployed_at >= now() - ($2::integer * interval '1 day')
+        FROM (
+          SELECT DISTINCT ON (commit_hash)
+            commit_hash, title, summary, deployed_at, features, fixes
+          FROM release_entries
+          WHERE $1::boolean
+            OR deployed_at >= now() - ($2::integer * interval '1 day')
+          ORDER BY commit_hash, deployed_at DESC
+        ) recent_releases
         ORDER BY deployed_at DESC
         LIMIT 5
       `,
