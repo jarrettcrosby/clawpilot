@@ -5,15 +5,17 @@ import Box from '@mui/material/Box'
 import Tab from '@mui/material/Tab'
 import Tabs from '@mui/material/Tabs'
 import CloudRounded from '@mui/icons-material/CloudRounded'
+import AccountBalanceRounded from '@mui/icons-material/AccountBalanceRounded'
 import HubRounded from '@mui/icons-material/HubRounded'
 import ManageSearchRounded from '@mui/icons-material/ManageSearchRounded'
 import RestaurantRounded from '@mui/icons-material/RestaurantRounded'
 import EmbeddingSettingsPanel from './EmbeddingSettingsPanel'
 import GoogleWorkspaceIntegrationPanel from './GoogleWorkspaceIntegrationPanel'
 import MatonIntegrationPanel from './MatonIntegrationPanel'
+import QuickBooksIntegrationPanel from './QuickBooksIntegrationPanel'
 import ToastIntegrationPanel from './ToastIntegrationPanel'
 
-type IntegrationKey = 'google' | 'maton' | 'toast' | 'knowledge'
+type IntegrationKey = 'google' | 'maton' | 'quickbooks' | 'toast' | 'knowledge'
 
 export default function IntegrationSettingsPanel({
   isOwner,
@@ -36,11 +38,13 @@ export default function IntegrationSettingsPanel({
     ? [
         { key: 'google' as const, label: 'Google Workspace', icon: <CloudRounded sx={{ fontSize: 18 }} /> },
         { key: 'maton' as const, label: 'Maton', icon: <HubRounded sx={{ fontSize: 18 }} /> },
+        { key: 'quickbooks' as const, label: 'QuickBooks', icon: <AccountBalanceRounded sx={{ fontSize: 18 }} /> },
         { key: 'toast' as const, label: 'Toast', icon: <RestaurantRounded sx={{ fontSize: 18 }} /> },
         { key: 'knowledge' as const, label: 'Knowledge', icon: <ManageSearchRounded sx={{ fontSize: 18 }} /> },
       ]
     : [
         { key: 'maton' as const, label: 'Maton', icon: <HubRounded sx={{ fontSize: 18 }} /> },
+        { key: 'quickbooks' as const, label: 'QuickBooks', icon: <AccountBalanceRounded sx={{ fontSize: 18 }} /> },
         { key: 'toast' as const, label: 'Toast', icon: <RestaurantRounded sx={{ fontSize: 18 }} /> },
       ]
 
@@ -89,6 +93,11 @@ export default function IntegrationSettingsPanel({
       {activeIntegration === 'toast' ? (
         <Box role="tabpanel" id="integration-panel-toast" aria-labelledby="integration-tab-toast">
           <ToastIntegrationPanel />
+        </Box>
+      ) : null}
+      {activeIntegration === 'quickbooks' ? (
+        <Box role="tabpanel" id="integration-panel-quickbooks" aria-labelledby="integration-tab-quickbooks">
+          <QuickBooksIntegrationPanel />
         </Box>
       ) : null}
       {activeIntegration === 'knowledge' && isOwner ? (

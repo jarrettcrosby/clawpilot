@@ -9,6 +9,7 @@ import { readPipelineOutboxWorkerHeartbeatFromPostgres } from '@/lib/persistence
 import { readAgentDispatchWorkerHeartbeatFromPostgres } from '@/lib/persistence/agentDispatch'
 import { readAgentResearchWorkerHeartbeatFromPostgres } from '@/lib/persistence/agentResearch'
 import { readToastWorkerHeartbeatFromPostgres } from '@/lib/persistence/toastIntegrations'
+import { readQuickBooksWorkerHeartbeatFromPostgres } from '@/lib/persistence/quickBooksIntegrations'
 import { effectiveDocumentEmbeddingConfiguration } from '@/lib/documentEmbeddings'
 import { validateShortLinkConfiguration } from '@/lib/shortlinks'
 import { readSuiteCrmWorkerHeartbeat } from '@/lib/persistence/crm'
@@ -70,6 +71,7 @@ export async function GET() {
     let agentWorker: Record<string, unknown> = { status: 'not-owned' }
     let agentResearchWorker: Record<string, unknown> = { status: 'not-owned' }
     let toastWorker: Record<string, unknown> = { status: 'not-owned' }
+    let quickBooksWorker: Record<string, unknown> = { status: 'not-owned' }
     let crm: Record<string, unknown> = { status: 'disabled' }
     let knowledgeWorkers: Array<Record<string, unknown>> = []
     const repositoryRunner = getRepositoryRunnerConfiguration()
@@ -204,6 +206,7 @@ export async function GET() {
           agent_research_migration_applied: boolean
           toast_integrations_migration_applied: boolean
           multi_workspace_memberships_migration_applied: boolean
+          quickbooks_connector_migration_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -434,6 +437,11 @@ export async function GET() {
                 FROM schema_migrations
                 WHERE filename = '0060_multi_workspace_memberships.sql'
               ) AS multi_workspace_memberships_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0061_quickbooks_organization_connector.sql'
+              ) AS quickbooks_connector_migration_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -491,6 +499,7 @@ export async function GET() {
             && row?.agent_research_migration_applied
             && row?.toast_integrations_migration_applied
             && row?.multi_workspace_memberships_migration_applied
+            && row?.quickbooks_connector_migration_applied
             && row?.migration_checksums_present
           ),
         }
@@ -540,6 +549,7 @@ export async function GET() {
           || !row?.agent_research_migration_applied
           || !row?.toast_integrations_migration_applied
           || !row?.multi_workspace_memberships_migration_applied
+          || !row?.quickbooks_connector_migration_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')
@@ -621,6 +631,21 @@ export async function GET() {
             errors.push('Toast sync worker heartbeat is missing or stale.')
           }
 
+          const quickBooksHeartbeat = await readQuickBooksWorkerHeartbeatFromPostgres()
+          const quickBooksHeartbeatAt = Date.parse(String(quickBooksHeartbeat?.checkedAt || ''))
+          const quickBooksPollMs = Math.max(5000, Math.min(Number(process.env.QUICKBOOKS_SYNC_POLL_MS || 30000), 300000))
+          const maxQuickBooksHeartbeatAgeMs = Math.max(180_000, quickBooksPollMs * 3)
+          const quickBooksAgeMs = Number.isFinite(quickBooksHeartbeatAt) ? checkedAt - quickBooksHeartbeatAt : null
+          quickBooksWorker = {
+            status: quickBooksAgeMs !== null && quickBooksAgeMs <= maxQuickBooksHeartbeatAgeMs ? 'reachable' : 'stale',
+            heartbeatAt: quickBooksHeartbeat?.checkedAt || null,
+            phase: quickBooksHeartbeat?.phase || null,
+            ageMs: quickBooksAgeMs,
+          }
+          if (quickBooksAgeMs === null || quickBooksAgeMs > maxQuickBooksHeartbeatAgeMs) {
+            errors.push('QuickBooks sync worker heartbeat is missing or stale.')
+          }
+
           const knowledgeResult = await query<{
             worker_name: string
             checked_at: string
@@ -690,6 +715,7 @@ export async function GET() {
       agentWorker,
       agentResearchWorker,
       toastWorker,
+      quickBooksWorker,
       crm,
       knowledgeWorkers,
       capabilities: {
@@ -701,6 +727,7 @@ export async function GET() {
         shortLinks: true,
         crm: process.env.CRM_ENABLED === '1',
         toast: true,
+        quickBooks: true,
         repositoryRunner: {
           enabled: repositoryRunner.enabled,
           ready: repositoryRunner.ready,

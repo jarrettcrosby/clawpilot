@@ -31,6 +31,7 @@ const requiredCurrentDocuments = [
   'docs/modules/short-links.md',
   'docs/modules/user-integrations.md',
   'docs/modules/toast-and-accounting.md',
+  'docs/modules/quickbooks-accounting.md',
   'docs/operations/clawpilot-environments.md',
   'docs/operations/agent-security-and-isolation.md',
   'docs/operations/knowledge-vault-organization.md',

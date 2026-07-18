@@ -1,5 +1,8 @@
 {
-  "status": "in_progress",
+  "status": "superseded",
+  "supersededAt": "2026-07-18T00:00:00Z",
+  "supersededBy": "docs/index.md",
+  "supersessionReason": "Historical partial review retained only as evidence; active module contracts, maps, release records, and tracked backlog now define current work.",
   "scope": "4002-dev-only",
   "date": "2026-03-22",
   "artifacts": {

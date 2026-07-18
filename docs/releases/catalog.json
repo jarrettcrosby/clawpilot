@@ -3,8 +3,8 @@
   "releases": {
     "default": {
       "oncePerEnvironment": true,
-      "title": "Auditable agent work and exact CRM relationships",
-      "summary": "Agent conversations now separate private discussion from durable task work, with queued execution, visible evidence, bounded continuations, and review-ready documents. CRM opportunities and interactions continue to preserve exact account, contact, user, and navigation relationships across ClawPilot, SuiteCRM, and pipeline reporting.",
+      "title": "Organization accounting, exact CRM history, and monitored operations",
+      "summary": "Each active business can now bind its own QuickBooks Online company, refresh a read-only accounting catalog, import selected products, and map Toast locations without enabling financial writes. CRM history preserves distinct calendar and interaction identity, while scheduled environment checks and verified recovery controls make database and worker failures visible.",
       "features": [
         "A New opportunity workflow available to pipeline owners and editors",
         "Tenant-scoped selection of existing CRM customer organizations",
@@ -21,7 +21,10 @@
         "Explicit Work and Discuss modes so private conversation cannot silently mutate shared task evidence",
         "Visible queued, working, input-needed, blocked, and review-ready states with direct access to the working document and next run",
         "Browser-session security details that identify the authenticated user, support-mode effective user, and observed sign-in network addresses",
-        "Independent EPISCS ownership for the established Sales CRM graph, pipeline workbook, record links, documents, and CRM Board"
+        "Independent EPISCS ownership for the established Sales CRM graph, pipeline workbook, record links, documents, and CRM Board",
+        "Organization-bound QuickBooks Online connections with read-only company, chart-of-accounts, and product/service catalog synchronization",
+        "Explicit QuickBooks item import into each organization's CRM product catalog and per-location Toast accounting mappings",
+        "Credential-free scheduled monitoring of development and production database, authentication, CRM, accounting, and agent worker health"
       ],
       "fixes": [
         "Preserves meaningful card descriptions up to 10,000 characters instead of replacing detailed scope with generic text",
@@ -48,7 +51,10 @@
         "Restores authenticated API behavior for the explicitly unauthenticated, non-hosted local development runtime",
         "Keeps Suburbia memberships and child-workspace CRM projections isolated while moving all Sales customer contacts, opportunities, interactions, meetings, products, and history to EPISCS",
         "Makes EPISCS the final SuiteCRM primary Account when a migrated Contact also has a generated Suburbia projection",
-        "Prevents a configured owner with multiple root businesses from binding the same Google Sheet to two pipelines"
+        "Prevents a configured owner with multiple root businesses from binding the same Google Sheet to two pipelines",
+        "Separates same-subject calendar and interaction rows by stable identity so distinct CRM history is not presented as an accidental duplicate",
+        "Retires approved production test interactions and meetings while preserving auditable delete and synchronization evidence",
+        "Invalidates stale QuickBooks mappings when a connection changes or catalog entries become inactive"
       ]
     }
   }

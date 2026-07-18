@@ -1,0 +1,43 @@
+name: Deployed runtime monitor
+
+on:
+  schedule:
+    - cron: '7,37 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deployed-runtime-monitor
+  cancel-in-progress: true
+
+jobs:
+  monitor:
+    name: ${{ matrix.environment }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - environment: production
+            branch: main
+            base_url: https://aiapp.eigenracing.com
+          - environment: development
+            branch: dev
+            base_url: https://dev.aiapp.eigenracing.com
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+
+      - name: Verify public runtime contract
+        env:
+          CLAWPILOT_BASE_URL: ${{ matrix.base_url }}
+          CLAWPILOT_EXPECT_BRANCH: ${{ matrix.branch }}
+          CLAWPILOT_EXPECT_ENVIRONMENT: ${{ matrix.environment }}
+        run: node scripts/monitor-deployed-runtime.mjs

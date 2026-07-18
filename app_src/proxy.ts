@@ -45,6 +45,8 @@ function isPublicApi(pathname: string) {
   return (
     normalizedPath === '/api/health'
     || normalizedPath === '/api/version'
+    || normalizedPath === '/api/runtime'
+    || normalizedPath === '/api/persistence/status'
     || normalizedPath === '/api/client-error'
     || normalizedPath === '/api/invitations/accept'
     || normalizedPath === '/api/pipeline/sync/outbox/process'
@@ -52,7 +54,9 @@ function isPublicApi(pathname: string) {
     || normalizedPath === '/api/crm/integrations/process'
     || normalizedPath === '/api/agents/dispatch/process'
     || normalizedPath === '/api/agents/research/process'
+    || normalizedPath === '/api/agents/repository-runs/process'
     || normalizedPath === '/api/integrations/toast/process'
+    || normalizedPath === '/api/integrations/quickbooks/process'
     || normalizedPath === '/api/docs/embeddings/process'
     || normalizedPath === '/api/ai-radar/process'
     || normalizedPath === '/api/shortlinks'

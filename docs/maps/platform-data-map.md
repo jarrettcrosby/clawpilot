@@ -58,6 +58,7 @@ flowchart LR
 - [CRM and Workbook Reporting](../modules/crm-and-reporting.md)
 - [User Integrations and Credentials](../modules/user-integrations.md)
 - [Toast Sales and Accounting](../modules/toast-and-accounting.md)
+- [QuickBooks Accounting Connector](../modules/quickbooks-accounting.md)
 - [Shared Short Links](../modules/short-links.md)
 - [Postgres and Sheets Authority](../decisions/0001-postgres-and-sheets-authority.md)
 - [Google Workspace Integration](../operations/google-workspace-integration.md)

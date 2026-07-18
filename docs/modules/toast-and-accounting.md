@@ -35,8 +35,8 @@ flowchart LR
   Raw --> Sales[(Daily sales projection)]
   Sales --> Draft[(Accounting export draft)]
   Draft --> Review[Account mapping and human review]
-  Review --> QBOutbox[Authorized QuickBooks outbox]
-  QBOutbox --> QuickBooks[QuickBooks]
+  Review --> FutureQBOutbox[Future authorized posting outbox]
+  FutureQBOutbox --> QuickBooks[QuickBooks]
 ```
 
 1. A manager selects verified restaurant locations and queues a business date or enables daily synchronization.
@@ -61,6 +61,7 @@ Toast Analytics reporting is operational information, not a GAAP ledger. ClawPil
 - Posting requires a separately connected QuickBooks company, current organization authorization, an explicit approval, and an idempotency key.
 - Failed or ambiguous exports remain reviewable and retryable; they never silently fall back to another restaurant, organization, or QuickBooks company.
 - Agents may summarize a normalized draft but cannot retrieve Toast or QuickBooks credentials, change mappings, approve a draft, or post a transaction.
+- Account mapping uses the active organization's read-only QuickBooks catalog described in [QuickBooks Accounting Connector](quickbooks-accounting.md).
 
 ## Durable Data
 
@@ -76,7 +77,7 @@ All rows are organization-scoped. A multi-business user connects, selects, and r
 
 ## Current Release Boundary
 
-This release implements both Toast credential connections, location verification, scheduled and manual read-only ingestion, immutable source snapshots, daily projections, accounting draft generation, worker health, and audit events. QuickBooks authorization, account-mapping management, draft approval, and posting are intentionally locked for the next accounting connector slice.
+This release implements both Toast credential connections, location verification, scheduled and manual read-only ingestion, immutable source snapshots, daily projections, accounting draft generation, worker health, and audit events. Organization-bound QuickBooks authorization and account-mapping management are available. Draft approval and all QuickBooks financial posting remain intentionally locked.
 
 ## Verification
 
@@ -87,3 +88,4 @@ This release implements both Toast credential connections, location verification
 5. Confirm immutable snapshots and one daily projection exist for the same organization, restaurant, and business date.
 6. Confirm the accounting draft is not posted and reports `needs_mapping` or `needs_review`.
 7. Confirm `/api/health` reports the Toast worker heartbeat in Railway.
+8. Bind the intended organization to QuickBooks, save one location's account mappings, and confirm financial posting remains unavailable.

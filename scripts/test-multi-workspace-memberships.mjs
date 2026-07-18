@@ -266,6 +266,12 @@ assert.ok(
 const header = read('app_src/components/AppHeader.tsx')
 assertIncludes(header, '<ActiveWorkspaceSwitcher />', 'application header workspace switcher')
 
+const deployedSmoke = read('scripts/smoke-deployed-runtime.mjs')
+assertIncludes(deployedSmoke, 'CLAWPILOT_SMOKE_WORKSPACE', 'workspace-aware deployed smoke')
+assertIncludes(deployedSmoke, "getJson('/api/auth/session')", 'workspace-aware deployed smoke')
+assertIncludes(deployedSmoke, "fetch(`${baseUrl}/api/auth/workspace`", 'workspace-aware deployed smoke')
+assertIncludes(deployedSmoke, "body: JSON.stringify({ action: 'switch', organizationId: workspace.organizationId })", 'workspace-aware deployed smoke')
+
 const health = read('app_src/app/api/health/route.ts')
 assertIncludes(health, '0060_multi_workspace_memberships.sql', 'migration health gate')
 const predeploy = read('scripts/verify-predeploy.mjs')
