@@ -47,7 +47,8 @@
         "Sanitizes agent-provider failures so credentials and upstream authorization details never appear in task threads",
         "Restores authenticated API behavior for the explicitly unauthenticated, non-hosted local development runtime",
         "Keeps Suburbia memberships and child-workspace CRM projections isolated while moving all Sales customer contacts, opportunities, interactions, meetings, products, and history to EPISCS",
-        "Makes EPISCS the final SuiteCRM primary Account when a migrated Contact also has a generated Suburbia projection"
+        "Makes EPISCS the final SuiteCRM primary Account when a migrated Contact also has a generated Suburbia projection",
+        "Prevents a configured owner with multiple root businesses from binding the same Google Sheet to two pipelines"
       ]
     }
   }

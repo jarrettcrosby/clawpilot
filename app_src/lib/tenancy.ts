@@ -308,14 +308,12 @@ export async function ensureDefaultResourcesForUser(emailValue: TenantActorInput
         `INSERT INTO pipeline_spaces (
            name, owner_email, workspace_organization_id, is_default, sheet_id, sync_enabled
          )
-         VALUES ($1, $2, $3::uuid, true, $4, $5)
+         VALUES ($1, $2, $3::uuid, true, NULL, false)
          RETURNING id::text, owner_email, provisioning_status, sheet_id, short_link_id::text, sync_enabled`,
         [
           isConfiguredOwner ? 'Sales pipeline' : 'My pipeline',
           ownerEmail,
           organization.id,
-          isConfiguredOwner ? DEFAULT_PIPELINE_SHEET_ID : null,
-          isConfiguredOwner,
         ],
       )
     }
@@ -404,7 +402,7 @@ export async function ensureDefaultResourcesForUser(emailValue: TenantActorInput
 
     if (isConfiguredOwner) {
       await client.query('UPDATE tasks SET board_id = $1::uuid WHERE board_id IS NULL', [board.rows[0].id])
-      await client.query(
+      const legacySheetClaim = await client.query<PipelineResourceRow>(
         `
           UPDATE pipeline_spaces
           SET sheet_id = $2,
@@ -418,9 +416,18 @@ export async function ensureDefaultResourcesForUser(emailValue: TenantActorInput
               ),
               updated_at = now()
           WHERE id = $1::uuid
+            AND (pipeline_spaces.sheet_id IS NULL OR pipeline_spaces.sheet_id = $2)
+            AND NOT EXISTS (
+              SELECT 1
+              FROM pipeline_spaces existing
+              WHERE existing.sheet_id = $2
+                AND existing.id <> $1::uuid
+            )
+          RETURNING id::text, owner_email, provisioning_status, sheet_id, short_link_id::text, sync_enabled
         `,
         [personalPipeline.rows[0].id, DEFAULT_PIPELINE_SHEET_ID],
       )
+      if (legacySheetClaim.rows[0]) personalPipeline = legacySheetClaim
     }
 
     return {

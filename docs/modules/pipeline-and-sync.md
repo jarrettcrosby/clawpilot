@@ -35,6 +35,7 @@ Provide a user-owned pipeline workspace while preserving the Opportunities Sheet
 - Pull synchronization updates durable normalized rows and a read projection.
 - Push synchronization uses an outbox and worker heartbeat; the UI reports sync state instead of assuming a write succeeded.
 - New pipeline spaces are app-owned until their owner explicitly confirms the `provision-pipeline` workspace action.
+- The configured owner's historical environment Sheet may belong to only one pipeline. Default-resource creation starts new pipelines without a Sheet binding and claims that historical Sheet only when no other pipeline owns it; a second root therefore remains app-owned until its own managed workbook is provisioned, and loading that root cannot overwrite or duplicate the first root's Sheet binding.
 - Managed pipelines use one platform Google Workspace integration per environment database. The owner-only settings API stores a standard Google API key and service-account credential separately with AES-256-GCM encryption under `AGENT_CREDENTIAL_ENCRYPTION_KEY`.
 - API-key and service-account rotations validate candidates before one atomic persistence update. A failed candidate leaves the current encrypted credential and Shared Drive selection unchanged.
 - The integration is ready only when the API key, validated service account, and a selected writable Shared Drive are present. Shared Drive selection verifies that the root can add children and share content.
