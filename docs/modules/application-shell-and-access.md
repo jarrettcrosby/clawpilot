@@ -69,6 +69,7 @@ Provide a responsive, authenticated ClawPilot workspace with clear user identity
 - Express Parcel International DBA EPISCS is a peer root workspace for the configured owner. Creating it grants no EPISCS membership to Olivia, Nick, or any other existing or invited Suburbia user and moves no board, pipeline, CRM, document, short-link, or integration data.
 - Existing and ordinary invited users remain in the Suburbia Sandwich Co tree unless an administrator explicitly selects another organization during invitation. Switching the inviter's browser does not silently reparent an existing user.
 - Nick retains the global application role `admin`; that access assignment is intentional.
+- Nick's account and organization membership remain `disabled`. Disabled status and administrator privileges are independent: the privileges are preserved for a future explicit restore, but they do not permit sign-in or access while disabled. Access reconciliation must never reactivate him and must revoke any existing browser sessions.
 - Global application role and organization data scope are independent. Nick's global admin role permits authorized software-administration functions, while CRM, pipeline, board, document, and short-link data access still resolves through organization relationships and explicit sharing.
 
 ## Security Boundary
