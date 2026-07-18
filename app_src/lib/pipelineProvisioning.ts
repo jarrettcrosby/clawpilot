@@ -1599,13 +1599,23 @@ export async function configurePipelineTabsWithRequest(
       }
     }
     if (sheet.basicFilter) formattingRequests.push({ clearBasicFilter: { sheetId: sheetIdValue } })
-    if (title === 'Dashboard') {
-      for (const chart of sheet.charts || []) {
-        if (chart.chartId !== undefined) {
-          formattingRequests.push({ deleteEmbeddedObject: { objectId: chart.chartId } })
-        }
+    for (const chart of sheet.charts || []) {
+      if (chart.chartId !== undefined) {
+        formattingRequests.push({ deleteEmbeddedObject: { objectId: chart.chartId } })
       }
     }
+    formattingRequests.push({
+      setDataValidation: {
+        range: {
+          sheetId: sheetIdValue,
+          startRowIndex: 4,
+          endRowIndex: rowCount,
+          startColumnIndex: tableStartColumnIndex,
+          endColumnIndex: tableEndColumnIndex,
+        },
+        filteredRowsIncluded: true,
+      },
+    })
     formattingRequests.push(
       {
         updateSheetProperties: {

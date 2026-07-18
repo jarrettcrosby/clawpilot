@@ -7,6 +7,8 @@ import { query as queryAgentCredentials } from '@/lib/persistence/agentCredentia
 import { query } from '@/lib/persistence/postgres'
 import { readPipelineOutboxWorkerHeartbeatFromPostgres } from '@/lib/persistence/pipeline'
 import { readAgentDispatchWorkerHeartbeatFromPostgres } from '@/lib/persistence/agentDispatch'
+import { readAgentResearchWorkerHeartbeatFromPostgres } from '@/lib/persistence/agentResearch'
+import { readToastWorkerHeartbeatFromPostgres } from '@/lib/persistence/toastIntegrations'
 import { effectiveDocumentEmbeddingConfiguration } from '@/lib/documentEmbeddings'
 import { validateShortLinkConfiguration } from '@/lib/shortlinks'
 import { readSuiteCrmWorkerHeartbeat } from '@/lib/persistence/crm'
@@ -66,6 +68,8 @@ export async function GET() {
     let credentialStore: Record<string, unknown> = { status: 'not-configured' }
     let worker: Record<string, unknown> = { status: 'not-owned' }
     let agentWorker: Record<string, unknown> = { status: 'not-owned' }
+    let agentResearchWorker: Record<string, unknown> = { status: 'not-owned' }
+    let toastWorker: Record<string, unknown> = { status: 'not-owned' }
     let crm: Record<string, unknown> = { status: 'disabled' }
     let knowledgeWorkers: Array<Record<string, unknown>> = []
     const repositoryRunner = getRepositoryRunnerConfiguration()
@@ -196,6 +200,9 @@ export async function GET() {
           crm_contact_owner_identity_migration_applied: boolean
           repository_runner_migration_applied: boolean
           crm_employee_identity_migration_applied: boolean
+          canonical_suitecrm_usernames_migration_applied: boolean
+          agent_research_migration_applied: boolean
+          toast_integrations_migration_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -406,6 +413,21 @@ export async function GET() {
                 FROM schema_migrations
                 WHERE filename = '0056_crm_employee_identity_and_workbook_dashboard.sql'
               ) AS crm_employee_identity_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0057_canonical_suitecrm_usernames.sql'
+              ) AS canonical_suitecrm_usernames_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0058_agent_public_research_outbox.sql'
+              ) AS agent_research_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0059_toast_restaurant_integrations.sql'
+              ) AS toast_integrations_migration_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -459,6 +481,9 @@ export async function GET() {
             && row?.crm_contact_owner_identity_migration_applied
             && row?.repository_runner_migration_applied
             && row?.crm_employee_identity_migration_applied
+            && row?.canonical_suitecrm_usernames_migration_applied
+            && row?.agent_research_migration_applied
+            && row?.toast_integrations_migration_applied
             && row?.migration_checksums_present
           ),
         }
@@ -504,6 +529,9 @@ export async function GET() {
           || !row?.crm_contact_owner_identity_migration_applied
           || !row?.repository_runner_migration_applied
           || !row?.crm_employee_identity_migration_applied
+          || !row?.canonical_suitecrm_usernames_migration_applied
+          || !row?.agent_research_migration_applied
+          || !row?.toast_integrations_migration_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')
@@ -553,6 +581,36 @@ export async function GET() {
           }
           if (agentAgeMs === null || agentAgeMs > maxAgentHeartbeatAgeMs) {
             errors.push('Agent dispatch worker heartbeat is missing or stale.')
+          }
+
+          const researchHeartbeat = await readAgentResearchWorkerHeartbeatFromPostgres()
+          const researchHeartbeatAt = Date.parse(String(researchHeartbeat?.checkedAt || ''))
+          const researchPollMs = Math.max(5000, Math.min(Number(process.env.AGENT_RESEARCH_POLL_MS || 10000), 300000))
+          const maxResearchHeartbeatAgeMs = Math.max(360_000, researchPollMs * 3)
+          const researchAgeMs = Number.isFinite(researchHeartbeatAt) ? checkedAt - researchHeartbeatAt : null
+          agentResearchWorker = {
+            status: researchAgeMs !== null && researchAgeMs <= maxResearchHeartbeatAgeMs ? 'reachable' : 'stale',
+            heartbeatAt: researchHeartbeat?.checkedAt || null,
+            phase: researchHeartbeat?.phase || null,
+            ageMs: researchAgeMs,
+          }
+          if (researchAgeMs === null || researchAgeMs > maxResearchHeartbeatAgeMs) {
+            errors.push('Agent research worker heartbeat is missing or stale.')
+          }
+
+          const toastHeartbeat = await readToastWorkerHeartbeatFromPostgres()
+          const toastHeartbeatAt = Date.parse(String(toastHeartbeat?.checkedAt || ''))
+          const toastPollMs = Math.max(5000, Math.min(Number(process.env.TOAST_SYNC_POLL_MS || 15000), 300000))
+          const maxToastHeartbeatAgeMs = Math.max(180_000, toastPollMs * 3)
+          const toastAgeMs = Number.isFinite(toastHeartbeatAt) ? checkedAt - toastHeartbeatAt : null
+          toastWorker = {
+            status: toastAgeMs !== null && toastAgeMs <= maxToastHeartbeatAgeMs ? 'reachable' : 'stale',
+            heartbeatAt: toastHeartbeat?.checkedAt || null,
+            phase: toastHeartbeat?.phase || null,
+            ageMs: toastAgeMs,
+          }
+          if (toastAgeMs === null || toastAgeMs > maxToastHeartbeatAgeMs) {
+            errors.push('Toast sync worker heartbeat is missing or stale.')
           }
 
           const knowledgeResult = await query<{
@@ -622,6 +680,8 @@ export async function GET() {
       credentialStore,
       worker,
       agentWorker,
+      agentResearchWorker,
+      toastWorker,
       crm,
       knowledgeWorkers,
       capabilities: {
@@ -632,6 +692,7 @@ export async function GET() {
         aiRadar: process.env.AI_RADAR_ENABLED !== 'false',
         shortLinks: true,
         crm: process.env.CRM_ENABLED === '1',
+        toast: true,
         repositoryRunner: {
           enabled: repositoryRunner.enabled,
           ready: repositoryRunner.ready,

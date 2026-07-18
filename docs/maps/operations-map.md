@@ -23,6 +23,7 @@ app_visible: true
 - [SuiteCRM Railway Runbook](../operations/suitecrm.md): service topology, Global ID fields, scheduler, upgrades, and rollback.
 - [Railway Postgres Backups](../operations/railway-postgres-backups.md): provider backups, snapshots, logical exports, and restore drills.
 - [ChatGPT Agent Authorization](../operations/chatgpt-agent-auth.md): per-user Codex device authorization and agent mapping.
+- [Agent Security and Integration Isolation](../operations/agent-security-and-isolation.md): prompt trust zones, deterministic connector ingestion, action approvals, and worker scheduling.
 
 ## Operational Knowledge
 

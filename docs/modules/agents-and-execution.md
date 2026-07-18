@@ -38,6 +38,17 @@ These are application roles, not separately created ChatGPT custom agents. Each 
 - Access and refresh tokens are encrypted in the restricted credential database and keyed by normalized ClawPilot email.
 - Development and production may share only that least-privilege credential store and encryption key. Boards, tasks, messages, runs, and results remain environment-specific.
 - Expired or revoked authorization disables execution and asks that user to reconnect; ClawPilot does not fall back to another user's credential or a synthetic response.
+- Per-user ChatGPT authorization is an identity, usage, and credential boundary. It is not a prompt-injection boundary and never replaces ClawPilot's authorization and action policies.
+
+## Prompt And Integration Security Boundary
+
+- Task scope is serialized separately from comments, activity, documents, prior agent output, durable memory, and connector-derived content. The latter are explicitly labeled as untrusted reference data in every model request.
+- Agent system instructions prohibit reference data from changing the role, output contract, permissions, approval requirements, or available capabilities. Injection indicators are recorded as execution telemetry and prevent that run from adding durable memory. Indicators support review and do not replace authorization controls.
+- The conversational agent receives no Gmail, Calendar, CRM, Google Drive, shell, browser, repository, deployment, or arbitrary network tool. It cannot retrieve a connector credential or invoke an external integration.
+- Inbound connectors run deterministically outside the model request. Gmail polling stores the provider message in `crm_inbound_messages`, parses exact `%gslt...` references and `%xx`, and projects a CRM interaction before any agent could consume a bounded database projection.
+- Scheduled polling and reconciliation improve reliability; they are not the security boundary. The boundary is the combination of separate worker authorization, scoped credentials, tenant-scoped database access, immutable provider identifiers, idempotent outboxes, structured model output, and server-side policy checks.
+- Any future agent-initiated external operation must first create a typed proposal. A separate executor must reauthorize the signed user and organization, validate the target and idempotency key, require confirmation for consequential writes, and only then enqueue the connector-specific action. The model never receives the connector credential.
+- Raw email, HTML, attachments, CRM notes, Sheet cells, websites, and connector responses must never be treated as operator instructions. When raw content is needed for summarization, that model pass has no write tools and its validated output remains data.
 
 ## Current Contract
 
@@ -49,6 +60,9 @@ These are application roles, not separately created ChatGPT custom agents. Each 
 - Assignment creates durable dispatch work. A later signed-user card comment creates another dispatch only when it explicitly addresses the assigned agent.
 - Card comments carry a stable submission ID, so a browser retry cannot append or dispatch the same comment twice. The mention control exposes only the card's assigned agent; assigning an agent is required before a mention can request work.
 - The Railway worker claims dispatches, runs the selected role through the user's own ChatGPT/Codex authorization, and persists execution runs/results.
+- When Projects needs current public evidence, its structured result requests one precise research query instead of becoming blocked or asking the operator to find sources. A worker-only `agent_research` outbox claim runs a web-search-only model call, requires verifiable citations, stores the evidence under the same operator, board, task, and role, and then queues one continuation on that task.
+- The research retrieval call has no Gmail, Calendar, CRM, Drive, shell, repository, deployment, or connector tools. Retrieved pages and their summaries re-enter the Projects run only as bounded untrusted reference data. A web-derived run cannot add private or shared durable memory automatically.
+- The interim retrieval request remains in the task thread and audit history but creates no placeholder working document or card comment. The resumed Projects run writes the sourced deliverable and one consolidated card result.
 - Autonomous dispatch uses a structured task-execution contract. The role can repair a missing or generic task description, add deduplicated checklist items, set the next action, and record a specific blocker or required operator input.
 - Autonomous task work is a bounded continuation sequence rather than a single prose reply. Each successful step receives the prior persisted deliverable and checklist evidence, may complete at most one evidenced checklist item, and queues the next step only while concrete unchecked work remains. A task stops after eight continuations, on completion, on a specific operator decision, or on a real capability blocker.
 - Intermediate continuation results remain durable in the task thread, execution history, and working document. The card receives one consolidated agent comment when the continuation chain stops instead of one near-duplicate comment per internal step.
@@ -79,7 +93,7 @@ ClawPilot rebuilds each execution context from four explicit layers:
 3. Private user-and-role memory, readable only when that same user runs that same role.
 4. Active shared role principles that contain no user, organization, customer, URL, email, Global ID, or task-specific data.
 
-Successful responses may add a bounded private lesson. A generic lesson can become a shared candidate, but it is inactive until the identical lesson has independent evidence from at least two organizations. Seeded and promoted shared principles improve the role for all users; private lessons never cross the user boundary. Unsafe or task-specific lessons remain private and are not considered for promotion.
+Successful responses may add a bounded private lesson when the source context has no prompt-injection indicators. A generic lesson can become a shared candidate and collect independent organizational evidence, but evidence never activates it automatically. A root administrator must review and promote shared principles before they can influence another user. Seeded and approved shared principles improve the role for all users; private lessons never cross the user boundary. Unsafe or task-specific lessons are rejected or remain private and are not considered for promotion.
 
 The shared layer is deliberately an operating-principle layer, not a shared transcript. Raw task threads, customer records, documents, and credentials are never copied into shared role memory.
 
@@ -87,6 +101,8 @@ The shared layer is deliberately an operating-principle layer, not a shared tran
 
 - agent assignments and task threads
 - `agent_dispatch_outbox`
+- `sync_outbox` rows scoped to `target_system = 'agent_research'`
+- `agent_research_evidence`
 - `execution_runs`
 - `execution_results`
 - `repository_bindings`
@@ -97,3 +113,4 @@ The shared layer is deliberately an operating-principle layer, not a shared tran
 - encrypted per-user agent credential records in the credential database
 
 Use the [ChatGPT agent authorization runbook](../operations/chatgpt-agent-auth.md) for device flow, environment variables, credential rotation, and reconnect behavior.
+Use the [Agent Security and Integration Isolation](../operations/agent-security-and-isolation.md) runbook for trust zones, worker responsibilities, approval rules, and prompt-injection response.

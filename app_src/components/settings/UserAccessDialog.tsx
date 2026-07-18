@@ -1642,7 +1642,15 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
           </Box>
         ) : null}
 
-        {!loading && activeTab === 3 ? <IntegrationSettingsPanel isOwner={currentUser?.role === 'owner'} /> : null}
+        {!loading && activeTab === 3 ? (
+          <IntegrationSettingsPanel
+            isOwner={currentUser?.role === 'owner'}
+            canManageOrganizationIntegrations={Boolean(
+              currentUser?.role === 'owner'
+              || (currentUser?.role === 'admin' && currentUser.permissions.manageUserAccess)
+            )}
+          />
+        ) : null}
         {!loading && activeTab === 4 ? <SessionSecurityPanel /> : null}
       </DialogContent>
 

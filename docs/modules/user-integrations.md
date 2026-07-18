@@ -1,11 +1,11 @@
 ---
 id: cp-module-user-integrations
 title: User Integrations and Credentials
-summary: Per-user Maton connections, Google Workspace administration, managed resources, credential storage, and knowledge provider controls.
+summary: Per-user Maton connections, organization Toast access, Google Workspace administration, managed resources, and credential controls.
 status: active
 kind: module-contract
 area: integrations
-tags: [integrations, maton, google-workspace, credentials, tenancy]
+tags: [integrations, maton, toast, google-workspace, credentials, tenancy]
 app_visible: true
 ---
 
@@ -41,6 +41,14 @@ Keep user-owned Maton accounts separate from the platform Google Workspace crede
 - A selected Shared Drive is required because a service account cannot use personal Drive storage as the owner of managed files. Settings lists only Shared Drives visible to the configured service account.
 - Credential rotation for the same service-account email keeps managed pipelines active. Replacing the service account fails closed for existing managed pipelines until their binding is explicitly re-established.
 
+## Toast Organization Contract
+
+- Toast is organization-scoped. An organization owner or an administrator with access-management permission can manage it; ordinary members cannot change credentials, locations, or schedules.
+- Analytics and Standard API credentials are separate encrypted records. Encryption binds each secret to its organization and access type so one credential cannot be decrypted as the other or across tenants.
+- Analytics discovers management-group restaurants and supplies reporting data. Standard access verifies each restaurant GUID and supplies location-scoped operational records.
+- Selected restaurants synchronize through a leased, retryable Postgres outbox. Raw provider records are immutable snapshots; daily sales are normalized projections.
+- Toast ingestion only creates a reviewable accounting draft. It cannot post to QuickBooks. See [Toast Sales and Accounting](toast-and-accounting.md) for the data flow and release boundary.
+
 ## Managed Pipeline Resources
 
 - Provisioning is an explicit pipeline-owner command.
@@ -68,4 +76,5 @@ Use the [Google Workspace integration runbook](../operations/google-workspace-in
 3. Confirm pipeline provisioning reaches `ready`, exposes its short link, and enables Sheet sync.
 4. Check `/api/pipeline/sync-status` and the worker heartbeat after a pull or queued write.
 5. Confirm Knowledge remains `Local` unless the owner deliberately enables `External` and the dedicated key is configured.
-6. Rotate credentials through Settings or the owning server environment as appropriate; never add plaintext keys, private keys, OAuth tokens, or full connection IDs to documentation, logs, or release copy.
+6. Confirm each Toast access type reports its own verified state, selected locations are correct, and accounting output remains a draft.
+7. Rotate credentials through Settings or the owning server environment as appropriate; never add plaintext keys, private keys, OAuth tokens, or full connection IDs to documentation, logs, or release copy.

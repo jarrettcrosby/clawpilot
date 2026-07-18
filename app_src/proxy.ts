@@ -51,6 +51,8 @@ function isPublicApi(pathname: string) {
     || normalizedPath === '/api/crm/outbox/process'
     || normalizedPath === '/api/crm/integrations/process'
     || normalizedPath === '/api/agents/dispatch/process'
+    || normalizedPath === '/api/agents/research/process'
+    || normalizedPath === '/api/integrations/toast/process'
     || normalizedPath === '/api/docs/embeddings/process'
     || normalizedPath === '/api/ai-radar/process'
     || normalizedPath === '/api/shortlinks'

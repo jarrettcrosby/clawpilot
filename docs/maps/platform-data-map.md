@@ -21,6 +21,8 @@ app_visible: true
 | Calendar and email provider state | Connected user account | ClawPilot CRM interactions and meetings |
 | Deployment history | Postgres release entries | Versions and Build Brief |
 | Repository knowledge | Git-tracked Markdown | Owner Docs catalog and vectors |
+| Toast restaurant sales and orders | Toast read-only APIs | Immutable snapshots, daily projections, and accounting drafts in Postgres |
+| Posted accounting transactions | Connected QuickBooks company | Approved accounting outbox and provider transaction reference |
 
 ## Identity Graph
 
@@ -43,6 +45,10 @@ flowchart LR
   Inbound --> PG
   Providers[Mail and Calendar] <--> Actions[Integration Actions]
   Actions <--> PG
+  Toast[Toast APIs] --> ToastWorker[Toast Ingestion Worker]
+  ToastWorker --> PG
+  PG --> AccountingDraft[Accounting Draft Review]
+  AccountingDraft --> QuickBooks[Authorized QuickBooks Connector]
 ```
 
 ## Connected Contracts
@@ -50,6 +56,7 @@ flowchart LR
 - [Pipeline and Synchronization](../modules/pipeline-and-sync.md)
 - [CRM and Workbook Reporting](../modules/crm-and-reporting.md)
 - [User Integrations and Credentials](../modules/user-integrations.md)
+- [Toast Sales and Accounting](../modules/toast-and-accounting.md)
 - [Shared Short Links](../modules/short-links.md)
 - [Postgres and Sheets Authority](../decisions/0001-postgres-and-sheets-authority.md)
 - [Google Workspace Integration](../operations/google-workspace-integration.md)

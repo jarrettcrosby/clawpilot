@@ -4,7 +4,8 @@ import fs from 'fs'
 import path from 'path'
 import { NextRequest, NextResponse } from 'next/server'
 import { prepareAgentDispatch } from '@/lib/agents/dispatch'
-import { getAgentRuntimeForOperator, runChatGPTAgent, runOpenAIAgent } from '@/lib/agents/provider'
+import { agentInstructions, getAgentRuntimeForOperator, runChatGPTAgent, runOpenAIAgent } from '@/lib/agents/provider'
+import { detectPromptInjectionIndicators, serializePromptSection } from '@/lib/agents/promptSecurity'
 import {
   captureAgentLearning,
   formatAgentContextMemories,
@@ -34,6 +35,10 @@ import { isOpenClawExecutionEnabled, shouldFallbackToFileOnDatabaseError } from 
 import { getThreadFromPostgres, listThreadsFromPostgres, upsertThreadMessageInPostgres } from '@/lib/persistence/agentThreads'
 import { appendExecutionResultToPostgres, appendExecutionRunToPostgres, isPostgresExecutionStoreEnabled } from '@/lib/persistence/execution'
 import { isAgentDispatchConflictError, type AgentDispatchEnqueueInput } from '@/lib/persistence/agentDispatch'
+import {
+  enqueueAgentResearchInPostgres,
+  readAgentResearchEvidenceFromPostgres,
+} from '@/lib/persistence/agentResearch'
 import { isPostgresTaskStoreEnabled, readTasksFromPostgres, replaceTasksInPostgres } from '@/lib/persistence/tasks'
 import { requireRequestUser } from '@/lib/requestUser'
 import { resolveAgentDispatchWorker, type AgentDispatchWorkerContext } from '@/lib/workerAuth'
@@ -305,13 +310,15 @@ async function recordAgentResult(input: {
     && dispatchId
     && planApplied
     && evidence?.status === 'running'
+    && !evidence?.researchQuery
     && (progressedChecklist || correctiveContinuation)
     && nextChecklistItem
     && continuationDepth < 8
     && isPostgresTaskStoreEnabled(),
   )
+  const researchPending = Boolean(evidence?.researchQuery)
   const substantiveDeliverable = evidence?.deliverable
-    || (agentId === 'projects' && resultSummary.trim() ? resultSummary : '')
+    || (agentId === 'projects' && !researchPending && resultSummary.trim() ? resultSummary : '')
     || (!plan && (resultSummary.length >= 600 || resultSummary.split(/\r?\n/).length >= 10) ? resultSummary : '')
   let document: AgentTaskDocumentReference | null = null
   if (boardId && substantiveDeliverable && isPostgresTaskStoreEnabled()) {
@@ -363,7 +370,7 @@ async function recordAgentResult(input: {
     author: agentId,
   }
   const existingCommentIndex = (task.comments || []).findIndex((entry) => entry.id === commentId)
-  const comments = shouldQueueContinuation
+  const comments = shouldQueueContinuation || researchPending
     ? task.comments || []
     : existingCommentIndex >= 0
       ? (task.comments || []).map((entry, entryIndex) => entryIndex === existingCommentIndex ? comment : entry)
@@ -400,7 +407,7 @@ async function recordAgentResult(input: {
   tasks[index] = {
     ...task,
     comments,
-    activity: shouldQueueContinuation || activityAlreadyRecorded
+    activity: shouldQueueContinuation || researchPending || activityAlreadyRecorded
       ? task.activity
       : [
           ...(task.activity || []),
@@ -546,41 +553,46 @@ function buildTaskContext(
   agentId: string,
   durableContext?: string | null,
   taskDocumentContext?: string | null,
+  researchEvidence?: unknown,
 ): string {
-  const checklist = (task.checklist || [])
-    .map((item) => `- [${item.done ? 'x' : ' '}] ${item.text} (id: ${item.id})`)
-    .join('\n')
   const nextAction = String(task.workItem?.nextAction || '').trim()
   const recentComments = (task.comments || [])
     .filter((comment) => !comment.deletedAt)
     .slice(-12)
-    .map((comment) => `- ${comment.author}: ${comment.text}`)
-    .join('\n')
+    .map((comment) => ({ author: comment.author, text: comment.text }))
   const recentActivity = (task.activity || [])
     .slice(-12)
-    .map((entry) => `- ${entry.timestamp} | ${entry.actor} | ${entry.message}`)
-    .join('\n')
+    .map((entry) => ({ timestamp: entry.timestamp, actor: entry.actor, message: entry.message }))
   const priorExecution = formatPriorTaskExecution(task)
+  const taskScope = {
+    title: task.title,
+    description: task.desc || null,
+    outcome: task.outcomeStatement || null,
+    status: task.status,
+    priority: task.priority,
+    category: task.category || null,
+    tags: task.tags || [],
+    dueDate: task.dueDate || null,
+    assignedAgent: agentId,
+    nextAction: nextAction || null,
+    checklist: (task.checklist || []).map((item) => ({
+      id: item.id,
+      text: item.text,
+      done: Boolean(item.done),
+    })),
+  }
+  const referenceData = {
+    priorExecution: priorExecution || null,
+    recentComments,
+    recentActivity,
+    taskDocument: taskDocumentContext ? boundedContextText(taskDocumentContext, 12_000) : null,
+    durableAgentContext: durableContext || null,
+    researchEvidence: researchEvidence || null,
+  }
   return [
-    `Task: ${task.title}`,
-    task.desc ? `Description:\n${task.desc}` : null,
-    task.outcomeStatement ? `Outcome:\n${task.outcomeStatement}` : null,
-    `Status: ${task.status}`,
-    `Priority: ${task.priority}`,
-    `Category: ${task.category || 'none'}`,
-    task.tags?.length ? `Tags: ${task.tags.join(', ')}` : null,
-    task.dueDate ? `Due date: ${task.dueDate}` : null,
-    `Assigned agent: ${agentId}`,
-    nextAction ? `Next action: ${nextAction}` : null,
-    checklist ? `Checklist:\n${checklist}` : null,
-    priorExecution ? `Prior task execution:\n${priorExecution}` : null,
-    recentComments ? `Recent card comments:\n${recentComments}` : null,
-    recentActivity ? `Recent card activity:\n${recentActivity}` : null,
-    taskDocumentContext
-      ? `Current task working document:\n${boundedContextText(taskDocumentContext, 12_000)}`
-      : null,
-    durableContext ? `Durable agent context:\n${durableContext}` : null,
-  ].filter(Boolean).join('\n')
+    serializePromptSection('AUTHORIZED_TASK_SCOPE', 'authorized-business-scope', taskScope),
+    serializePromptSection('REFERENCE_DATA', 'untrusted-reference-data', referenceData),
+  ].join('\n\n')
 }
 
 function assignmentError(task: Task, agentId: string): string | null {
@@ -929,6 +941,7 @@ export async function POST(req: NextRequest) {
     .map((message) => ({ role: message.role, text: message.text }))
   let durableAgentContext: string | null = null
   let taskDocumentContext: string | null = null
+  let researchEvidenceContext: unknown = null
   if (isPostgresTaskStoreEnabled()) {
     try {
       durableAgentContext = formatAgentContextMemories(await readAgentContextMemories({
@@ -947,11 +960,33 @@ export async function POST(req: NextRequest) {
     } catch (error) {
       console.error('[agent-threads] task document context read failed', error)
     }
+    try {
+      const evidence = await readAgentResearchEvidenceFromPostgres({
+        operatorId,
+        boardId: board!.id,
+        taskId,
+        agentId,
+        limit: 3,
+      })
+      researchEvidenceContext = evidence.map((item) => ({
+        query: item.query,
+        result: boundedContextText(item.resultText, 12_000),
+        citations: item.citations,
+        retrievedAt: item.createdAt,
+      }))
+    } catch (error) {
+      console.error('[agent-threads] public research evidence read failed', error)
+    }
   }
-  const taskContext = buildTaskContext(task, agentId, durableAgentContext, taskDocumentContext)
+  const taskContext = buildTaskContext(task, agentId, durableAgentContext, taskDocumentContext, researchEvidenceContext)
+  const promptSecuritySignals = detectPromptInjectionIndicators({
+    taskContext,
+    conversation,
+  })
 
   let responseText = ''
   let executionPlan: AgentTaskExecutionPlan | undefined
+  let researchQueued = false
   const providerMode = isTaskExecution ? 'task-execution' as const : 'conversation' as const
   const providerUserText = isTaskExecution
     ? text
@@ -982,10 +1017,31 @@ export async function POST(req: NextRequest) {
       const executionContract = providerMode === 'task-execution'
         ? '\n\nReturn one JSON object with status, summary, deliverable, nextAction, waitingOn, blocker, descriptionUpdate, checklistAdd, checklistComplete, and learned. Status must be running, completed, awaiting_input, or blocked. Complete at most one exact checklist item ID and only when the deliverable supports it. Do not claim unavailable external work.'
         : ''
-      responseText = await runOpenClawAgent(executionAgentId, `${taskContext}\n\nOperator request:\n${providerUserText}${executionContract}`)
+      responseText = await runOpenClawAgent(
+        executionAgentId,
+        `${agentInstructions(agentId)}\n\n${taskContext}\n\n${serializePromptSection('AUTHENTICATED_OPERATOR_REQUEST', 'authenticated-operator-request', providerUserText)}${executionContract}`,
+      )
     }
     if (providerMode === 'task-execution') {
       executionPlan = parseAgentTaskExecutionPlan(responseText)
+      if (executionPlan.researchQuery) {
+        if (agentId !== 'projects' || !dispatchId || !board?.id) {
+          throw new Error('Public research requests require a durable Projects task dispatch')
+        }
+        await enqueueAgentResearchInPostgres({
+          jobId: crypto.randomUUID(),
+          continuationDispatchId: crypto.randomUUID(),
+          originDispatchId: dispatchId,
+          operatorId,
+          boardId: board.id,
+          taskId,
+          agentId: 'projects',
+          query: executionPlan.researchQuery,
+          continuationDepth: dispatchContinuationDepth,
+          queuedAt: new Date().toISOString(),
+        })
+        researchQueued = true
+      }
       responseText = formatAgentTaskExecutionResult(agentId, {
         status: executionPlan.status,
         summary: executionPlan.summary,
@@ -993,6 +1049,7 @@ export async function POST(req: NextRequest) {
         nextAction: executionPlan.nextAction,
         waitingOn: executionPlan.waitingOn,
         blocker: executionPlan.blocker,
+        researchQuery: executionPlan.researchQuery,
         changes: [],
         completedChecklistIds: [],
         learned: executionPlan.learned,
@@ -1031,6 +1088,7 @@ export async function POST(req: NextRequest) {
       dispatchId,
       dispatchAttempt,
       interactionMode: isTaskExecution ? 'task-execution' : 'discuss',
+      securitySignals: promptSecuritySignals,
     })
     await upsertPersistedThreadMessage({
       messageId: resultMessageId,
@@ -1069,7 +1127,13 @@ export async function POST(req: NextRequest) {
       })
     : { evidence: null, summary: responseText, applied: true, continuationQueued: false }
   responseText = recorded.summary
-  if (isTaskExecution && isPostgresTaskStoreEnabled()) {
+  if (
+    isTaskExecution
+    && isPostgresTaskStoreEnabled()
+    && promptSecuritySignals.length === 0
+    && !researchQueued
+    && !(Array.isArray(researchEvidenceContext) && researchEvidenceContext.length > 0)
+  ) {
     try {
       await captureAgentLearning({ operatorId, agentId, responseText })
     } catch (error) {
@@ -1093,6 +1157,8 @@ export async function POST(req: NextRequest) {
     dispatchId,
     dispatchAttempt,
     interactionMode: isTaskExecution ? 'task-execution' : 'discuss',
+    securitySignals: promptSecuritySignals,
+    researchQueued,
   }, true)
   if (isTaskExecution) await writeDocsLog(agentId, responseText)
   const responseMeta = isTaskExecution
@@ -1109,6 +1175,7 @@ export async function POST(req: NextRequest) {
         executionApplied: recorded.applied,
         evidence: recorded.evidence?.changes || [],
         continuationQueued: recorded.continuationQueued,
+        researchQueued,
       }
     : {
         source: messageSource,
@@ -1150,5 +1217,6 @@ export async function POST(req: NextRequest) {
     runtime,
     canonicalWorkItem: updatedTask ? buildCanonicalWorkItem(updatedTask) : null,
     continuationQueued: recorded.continuationQueued,
+    researchQueued,
   })
 }
