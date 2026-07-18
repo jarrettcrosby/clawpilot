@@ -21,6 +21,7 @@ import AddBusinessRounded from '@mui/icons-material/AddBusinessRounded'
 import BusinessRounded from '@mui/icons-material/BusinessRounded'
 import CheckRounded from '@mui/icons-material/CheckRounded'
 import ExpandMoreRounded from '@mui/icons-material/ExpandMoreRounded'
+import { announceWorkspaceChange } from '@/lib/workspaceClient'
 
 type Workspace = {
   organizationId: string
@@ -36,6 +37,19 @@ type WorkspaceResponse = {
   activeOrganizationId: string | null
   canCreateRoot: boolean
   workspaces: Workspace[]
+}
+
+type ActiveWorkspace = {
+  organizationId: string
+  referenceCode: string
+  name: string
+  role: Workspace['role']
+}
+
+type WorkspaceMutationResponse = {
+  ok?: boolean
+  error?: string
+  activeWorkspace?: ActiveWorkspace
 }
 
 export default function ActiveWorkspaceSwitcher() {
@@ -64,6 +78,40 @@ export default function ActiveWorkspaceSwitcher() {
 
   if (!current) return null
 
+  function finishWorkspaceChange(activeWorkspace: ActiveWorkspace, organizationType: Workspace['organizationType']) {
+    setPayload((previous) => {
+      if (!previous) return previous
+      const existing = previous.workspaces.find(
+        (workspace) => workspace.organizationId === activeWorkspace.organizationId,
+      )
+      const nextWorkspace: Workspace = {
+        organizationId: activeWorkspace.organizationId,
+        organizationReferenceCode: activeWorkspace.referenceCode,
+        organizationName: activeWorkspace.name,
+        organizationType: existing?.organizationType || organizationType,
+        role: activeWorkspace.role,
+        isDefault: existing?.isDefault || false,
+      }
+      return {
+        ...previous,
+        activeOrganizationId: activeWorkspace.organizationId,
+        workspaces: existing
+          ? previous.workspaces.map((workspace) => (
+              workspace.organizationId === activeWorkspace.organizationId ? nextWorkspace : workspace
+            ))
+          : [...previous.workspaces, nextWorkspace],
+      }
+    })
+    setAnchor(null)
+    setCreateOpen(false)
+    setBusinessName('')
+    setSwitching(null)
+    announceWorkspaceChange({
+      organizationId: activeWorkspace.organizationId,
+      organizationName: activeWorkspace.name,
+    })
+  }
+
   async function selectWorkspace(organizationId: string) {
     if (organizationId === current?.organizationId || switching) {
       setAnchor(null)
@@ -77,11 +125,12 @@ export default function ActiveWorkspaceSwitcher() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'switch', organizationId }),
       })
-      const result = await response.json() as { ok?: boolean; error?: string }
-      if (!response.ok || !result.ok) throw new Error(result.error || 'Unable to switch businesses')
-      const target = new URL('/', window.location.origin)
-      target.hash = 'dashboard'
-      window.location.assign(target.toString())
+      const result = await response.json() as WorkspaceMutationResponse
+      if (!response.ok || !result.ok || !result.activeWorkspace) {
+        throw new Error(result.error || 'Unable to switch businesses')
+      }
+      const selected = payload?.workspaces.find((workspace) => workspace.organizationId === organizationId)
+      finishWorkspaceChange(result.activeWorkspace, selected?.organizationType || 'member')
     } catch (caught) {
       setSwitching(null)
       setError(caught instanceof Error ? caught.message : 'Unable to switch businesses')
@@ -99,11 +148,11 @@ export default function ActiveWorkspaceSwitcher() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'create-root', name }),
       })
-      const result = await response.json() as { ok?: boolean; error?: string }
-      if (!response.ok || !result.ok) throw new Error(result.error || 'Unable to add business')
-      const target = new URL('/', window.location.origin)
-      target.hash = 'dashboard'
-      window.location.assign(target.toString())
+      const result = await response.json() as WorkspaceMutationResponse
+      if (!response.ok || !result.ok || !result.activeWorkspace) {
+        throw new Error(result.error || 'Unable to add business')
+      }
+      finishWorkspaceChange(result.activeWorkspace, 'root')
     } catch (caught) {
       setSwitching(null)
       setError(caught instanceof Error ? caught.message : 'Unable to add business')

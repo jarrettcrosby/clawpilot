@@ -173,6 +173,10 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter }: P
     const timeout = setTimeout(() => controller.abort(), 10_000)
 
     async function load() {
+      const independentResultsPromise = Promise.allSettled([
+        fetchJson('/api/docs', controller.signal),
+        fetchJson('/api/users', controller.signal),
+      ])
       let nextWorkspace: WorkspaceSnapshot | null = null
       let workspaceFailed = false
       try {
@@ -187,16 +191,19 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter }: P
 
       const boardId = nextWorkspace?.selectedBoardId
       const pipelineId = nextWorkspace?.selectedPipelineId
-      const results = await Promise.allSettled([
-        fetchJson(taskRequestUrl(boardId), controller.signal),
-        fetchJson('/api/docs', controller.signal),
-        fetchJson('/api/users', controller.signal),
-        fetchJson(pipelineRequestUrl(boardId, pipelineId), controller.signal),
+      const [scopedResults, independentResults] = await Promise.all([
+        Promise.allSettled([
+          fetchJson(taskRequestUrl(boardId), controller.signal),
+          fetchJson(pipelineRequestUrl(boardId, pipelineId), controller.signal),
+        ]),
+        independentResultsPromise,
       ])
       clearTimeout(timeout)
       if (!active) return
 
-      const [tasksResult, docsResult, usersResult, pipelineResult] = results
+      const [tasksResult, pipelineResult] = scopedResults
+      const [docsResult, usersResult] = independentResults
+      const results = [tasksResult, docsResult, usersResult, pipelineResult]
       const nextAvailability = { ...EMPTY_AVAILABILITY }
       if (tasksResult.status === 'fulfilled' && Array.isArray(tasksResult.value)) {
         setTasks(tasksResult.value as Task[])

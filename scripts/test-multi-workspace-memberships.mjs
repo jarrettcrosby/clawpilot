@@ -219,6 +219,22 @@ assertIncludes(switcher, "fetch('/api/auth/workspace'", 'workspace switcher')
 assertIncludes(switcher, "body: JSON.stringify({ action: 'switch', organizationId })", 'workspace switcher')
 assertIncludes(switcher, "body: JSON.stringify({ action: 'create-root', name })", 'peer root workspace creation')
 assertIncludes(switcher, 'Add business', 'peer root workspace creation')
+assertIncludes(switcher, 'announceWorkspaceChange', 'in-app workspace transition')
+assert.ok(!switcher.includes('window.location.assign'), 'workspace switching cannot force a full document reload')
+const workspaceClient = read('app_src/lib/workspaceClient.ts')
+assertIncludes(workspaceClient, "WORKSPACE_CHANGED_EVENT = 'clawpilot:workspace-changed'", 'workspace change event')
+assertIncludes(workspaceClient, 'window.history.replaceState', 'workspace URL reset without navigation')
+const homeClient = read('app_src/app/HomeClient.tsx')
+assertIncludes(homeClient, 'window.addEventListener(WORKSPACE_CHANGED_EVENT', 'workspace-scoped content refresh')
+assertIncludes(homeClient, 'key={`workspace-${workspaceRevision}`}', 'workspace-scoped content remount')
+const dashboard = read('app_src/components/dashboard/DashboardSection.tsx')
+assertIncludes(dashboard, 'const independentResultsPromise = Promise.allSettled([', 'parallel dashboard loading')
+assertIncludes(dashboard, 'independentResultsPromise,', 'parallel dashboard loading')
+assertIncludes(authWorkspaceRoute, 'const [session, body] = await Promise.all([', 'single session validation on workspace switch')
+assert.ok(
+  !authWorkspaceRoute.includes('const [session, actor, body] = await Promise.all(['),
+  'ordinary workspace switching cannot resolve the request session twice',
+)
 const header = read('app_src/components/AppHeader.tsx')
 assertIncludes(header, '<ActiveWorkspaceSwitcher />', 'application header workspace switcher')
 

@@ -50,14 +50,14 @@ export async function GET(req: NextRequest) {
 
 export async function POST(req: NextRequest) {
   try {
-    const [session, actor, body] = await Promise.all([
+    const [session, body] = await Promise.all([
       requireRequestSession(req),
-      requireRequestUser(req),
       req.json(),
     ])
     const action = String(body?.action || 'switch')
     let organizationId = String(body?.organizationId || '').trim()
     if (action === 'create-root') {
+      const actor = await requireRequestUser(req)
       const membership = await createIndependentRootWorkspace({ actor, name: body?.name })
       organizationId = membership.organizationId
     } else if (action !== 'switch') {

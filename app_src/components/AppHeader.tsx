@@ -56,6 +56,7 @@ const MODULE_LABELS: Record<string, string> = {
 
 type Props = {
   activeSection: string
+  workspaceRevision: number
   title?: string
   onShortcutsOpen?: () => void
   desktopNavCollapsed: boolean
@@ -66,6 +67,7 @@ type Props = {
 
 export default function AppHeader({
   activeSection,
+  workspaceRevision,
   title,
   onShortcutsOpen,
   desktopNavCollapsed,
@@ -75,7 +77,10 @@ export default function AppHeader({
 }: Props) {
   const dateTimeSettings = useUserDateTime()
   const [drawerOpen, setDrawerOpen] = useState(false)
-  const [activityEvents, setActivityEvents] = useState<ActivityPreview[]>([])
+  const [activityState, setActivityState] = useState<{
+    workspaceRevision: number
+    events: ActivityPreview[]
+  }>({ workspaceRevision: 0, events: [] })
   const [helpAnchor, setHelpAnchor] = useState<null | HTMLElement>(null)
   const [shortcutsOpen, setShortcutsOpen] = useState(false)
   const [health, setHealth] = useState<{ status: string; errors: string[] }>({ status: 'ok', errors: [] })
@@ -95,20 +100,27 @@ export default function AppHeader({
   const [runtimeAnchor, setRuntimeAnchor] = useState<null | HTMLElement>(null)
   const [freezeState, setFreezeState] = useState<{ frozen: boolean; reason?: string | null } | null>(null)
 
-  const unreadCount = useMemo(() => (
-    drawerOpen ? 0 : getReadCount(activityEvents)
-  ), [activityEvents, drawerOpen])
+  const unreadCount = useMemo(() => {
+    if (drawerOpen || activityState.workspaceRevision !== workspaceRevision) return 0
+    return getReadCount(activityState.events)
+  }, [activityState, drawerOpen, workspaceRevision])
 
   useEffect(() => {
+    let active = true
     fetch('/api/activity?limit=100', { cache: 'no-store' })
       .then(async (response) => {
         if (!response.ok) return [] as ActivityPreview[]
         const payload = await response.json() as { events?: ActivityPreview[] }
         return Array.isArray(payload.events) ? payload.events : []
       })
-      .then(setActivityEvents)
-      .catch(() => setActivityEvents([]))
-  }, [drawerOpen])
+      .then((events) => {
+        if (active) setActivityState({ workspaceRevision, events })
+      })
+      .catch(() => {
+        if (active) setActivityState({ workspaceRevision, events: [] })
+      })
+    return () => { active = false }
+  }, [drawerOpen, workspaceRevision])
 
   useEffect(() => {
     function check() {

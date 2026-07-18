@@ -17,6 +17,7 @@ import ImpersonationBanner from '@/components/auth/ImpersonationBanner'
 import { Box } from '@mui/material'
 import type { BoardFilter } from '@/components/projects/FilterBar'
 import { emptyFilter } from '@/components/projects/FilterBar'
+import { WORKSPACE_CHANGED_EVENT } from '@/lib/workspaceClient'
 
 const SECTIONS = ['dashboard', 'docs', 'projects', 'pipeline', 'crm', 'links', 'agents', 'versions']
 const DESKTOP_NAV_COLLAPSED_KEY = 'clawpilot_desktop_nav_collapsed'
@@ -67,6 +68,7 @@ export default function HomeClient({
   const [shortcutsOpen, setShortcutsOpen] = useState(false)
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
   const [boardFilter, setBoardFilter] = useState<BoardFilter>(emptyFilter())
+  const [workspaceRevision, setWorkspaceRevision] = useState(0)
 
   const toggleDesktopNav = useCallback(() => {
     try {
@@ -133,6 +135,16 @@ export default function HomeClient({
     if (!shortLinksEnabled && activeSection === 'links') navigate('dashboard')
   }, [activeSection, navigate, shortLinksEnabled])
 
+  useEffect(() => {
+    function onWorkspaceChanged() {
+      setMobileNavOpen(false)
+      setBoardFilter(emptyFilter())
+      setWorkspaceRevision((revision) => revision + 1)
+    }
+    window.addEventListener(WORKSPACE_CHANGED_EVENT, onWorkspaceChanged)
+    return () => window.removeEventListener(WORKSPACE_CHANGED_EVENT, onWorkspaceChanged)
+  }, [])
+
   // Global keyboard shortcuts
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
@@ -194,6 +206,7 @@ export default function HomeClient({
         <SessionGuard enabled={sessionGuardEnabled} />
         <AppHeader
           activeSection={section}
+          workspaceRevision={workspaceRevision}
           desktopNavCollapsed={desktopNavCollapsed}
           mobileNavOpen={mobileNavOpen}
           onToggleDesktopNav={toggleDesktopNav}
@@ -201,6 +214,7 @@ export default function HomeClient({
         />
         <ImpersonationBanner />
         <Box
+          key={`workspace-${workspaceRevision}`}
           sx={{
             flex: 1,
             overflow: ['docs', 'projects', 'pipeline', 'crm'].includes(section) ? 'hidden' : 'auto',
