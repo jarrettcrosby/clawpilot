@@ -45,6 +45,8 @@ function isPublicApi(pathname: string) {
   return (
     normalizedPath === '/api/health'
     || normalizedPath === '/api/version'
+    || normalizedPath === '/api/runtime'
+    || normalizedPath === '/api/persistence/status'
     || normalizedPath === '/api/client-error'
     || normalizedPath === '/api/invitations/accept'
     || normalizedPath === '/api/pipeline/sync/outbox/process'
