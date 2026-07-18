@@ -50,9 +50,11 @@ assert.doesNotMatch(dashboard, /Agent results/, 'dashboard must not present the 
 assert.doesNotMatch(dashboard, /execution-results\/summary/, 'dashboard must not fetch the historical execution row count')
 
 const workspaceRoute = read('app_src/app/api/workspaces/route.ts')
+const dashboardWorkspace = read('app_src/lib/dashboardWorkspace.ts')
 assert.match(workspaceRoute, /searchParams\.get\(['"]dashboard['"]\)/, 'workspace API must recognize dashboard preference reads')
 assert.match(workspaceRoute, /setDefault/, 'workspace API must recognize durable dashboard selections')
-assert.match(workspaceRoute, /readWorkspacePreferences\(actor\)/, 'workspace API must read defaults in the active workspace')
+assert.match(workspaceRoute, /readDashboardWorkspace\(actor/, 'workspace API must read the active dashboard workspace')
+assert.match(dashboardWorkspace, /readWorkspacePreferences\(actor\)/, 'dashboard workspace must read defaults in the active workspace')
 assert.match(workspaceRoute, /saveWorkspacePreferences\(\{[\s\S]{0,100}?actorEmail:\s*actor/, 'workspace API must save defaults in the active workspace')
 
 const workspaceSelector = read('app_src/components/workspaces/WorkspaceSelector.tsx')

@@ -1132,11 +1132,12 @@ assert.ok(
 )
 
 const workspacesRoute = read('app_src/app/api/workspaces/route.ts')
+const dashboardWorkspaceAdapter = read('app_src/lib/dashboardWorkspace.ts')
 assertIncludes(workspacesRoute, "action === 'provision-pipeline'", 'owner-confirmed pipeline provisioning action')
 assertIncludes(workspacesRoute, "pipeline.accessRole !== 'owner'", 'pipeline provisioning owner access')
 assert.ok(!workspacesRoute.includes('driveConnectionId: body'), 'workspace route must not accept a Drive connection binding')
 assert.ok(!workspacesRoute.includes('sheetsConnectionId: body'), 'workspace route must not accept a Sheets connection binding')
-assertIncludes(workspacesRoute, 'const { projection, sheetId, shortLinkId, ...summary }', 'workspace pipeline resource ID redaction')
+assertIncludes(dashboardWorkspaceAdapter, 'const { projection, sheetId, shortLinkId, ...summary }', 'workspace pipeline resource ID redaction')
 assertIncludes(tenancyAdapter, 'enqueuePipelinePermissionSyncWithClient', 'pipeline membership permission synchronization')
 
 const googleWorkspaceCrypto = read('app_src/lib/integrations/googleWorkspaceCrypto.ts')

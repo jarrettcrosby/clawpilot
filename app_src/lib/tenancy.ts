@@ -437,10 +437,13 @@ export async function ensureDefaultResourcesForUser(emailValue: TenantActorInput
   })
 }
 
-export async function listProjectBoards(actorEmailValue: TenantActorInput): Promise<ProjectBoard[]> {
+export async function listProjectBoards(
+  actorEmailValue: TenantActorInput,
+  options: { ensureDefaults?: boolean } = {},
+): Promise<ProjectBoard[]> {
   const actor = await resolveTenantActor(actorEmailValue)
   if (!actor.organizationId) throw new Error('Active workspace is not configured')
-  await ensureDefaultResourcesForUser(actor)
+  if (options.ensureDefaults !== false) await ensureDefaultResourcesForUser(actor)
   const result = await query<ProjectBoardRow>(
     `
       SELECT
@@ -478,10 +481,13 @@ export async function listProjectBoards(actorEmailValue: TenantActorInput): Prom
   return result.rows.map(toProjectBoard)
 }
 
-export async function listPipelineSpaces(actorEmailValue: TenantActorInput): Promise<PipelineSpace[]> {
+export async function listPipelineSpaces(
+  actorEmailValue: TenantActorInput,
+  options: { ensureDefaults?: boolean } = {},
+): Promise<PipelineSpace[]> {
   const actor = await resolveTenantActor(actorEmailValue)
   if (!actor.organizationId) throw new Error('Active workspace is not configured')
-  await ensureDefaultResourcesForUser(actor)
+  if (options.ensureDefaults !== false) await ensureDefaultResourcesForUser(actor)
   const result = await query<PipelineSpaceRow>(
     `
       SELECT

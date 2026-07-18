@@ -61,6 +61,22 @@ export async function requireRequestUser(req: NextRequest): Promise<AppUser> {
   throw new Error('Unauthorized')
 }
 
+export async function requireRequestUserForWorkspace(
+  req: NextRequest,
+  organizationIdValue: unknown,
+): Promise<AppUser> {
+  const organizationId = String(organizationIdValue || '').trim()
+  if (!organizationId) throw new Error('Active workspace access is not available')
+  const session = await requestSession(req)
+  if (session?.effectiveUser) {
+    await requireActiveAppUser(session.authenticatedUser)
+    return requireWorkspaceAppUser(session.effectiveUser, organizationId)
+  }
+  const localUser = localDevelopmentUser()
+  if (localUser && localUser.organizationId === organizationId) return localUser
+  throw new Error('Unauthorized')
+}
+
 export async function requireRequestSession(req: NextRequest): Promise<BrowserSession> {
   const session = await requestSession(req)
   if (!session) throw new Error('Unauthorized')
