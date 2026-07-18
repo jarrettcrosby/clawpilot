@@ -19,6 +19,7 @@ import CloseRounded from '@mui/icons-material/CloseRounded'
 import LinkRounded from '@mui/icons-material/LinkRounded'
 import MoreHorizRounded from '@mui/icons-material/MoreHorizRounded'
 import ContactsRounded from '@mui/icons-material/ContactsRounded'
+import AccountBalanceRounded from '@mui/icons-material/AccountBalanceRounded'
 import BrandMark from '@/components/BrandMark'
 import { DashboardIcon, DocsIcon, ProjectsIcon, PipelineIcon, AgentsIcon, VersionsIcon } from '@/lib/icons'
 
@@ -28,6 +29,7 @@ const NAV_ITEMS = [
   { id: 'projects', label: 'Projects', Icon: ProjectsIcon },
   { id: 'pipeline', label: 'Pipeline', Icon: PipelineIcon },
   { id: 'crm', label: 'CRM', Icon: ContactsRounded },
+  { id: 'accounting', label: 'Accounting', Icon: AccountBalanceRounded },
   { id: 'links', label: 'Links', Icon: LinkRounded },
   { id: 'agents', label: 'Agents', Icon: AgentsIcon },
   { id: 'versions', label: 'Versions', Icon: VersionsIcon },

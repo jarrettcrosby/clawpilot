@@ -155,6 +155,7 @@ for (const requiredPath of [
   'db/migrations/0059_toast_restaurant_integrations.sql',
   'db/migrations/0060_multi_workspace_memberships.sql',
   'db/migrations/0061_quickbooks_organization_connector.sql',
+  'db/migrations/0062_quickbooks_financial_explorer.sql',
   '.github/workflows/clawpilot-repository-runner.yml',
   '.github/workflows/deployed-runtime-monitor.yml',
   'scripts/start-railway.sh',

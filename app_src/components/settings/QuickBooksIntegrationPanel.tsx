@@ -263,12 +263,12 @@ export default function QuickBooksIntegrationPanel() {
               <Switch
                 checked={integration.connection.catalogSyncEnabled === true}
                 onChange={(_, enabled) => {
-                  void patch('configure-sync', { action: 'configure-sync', enabled }, enabled ? 'Daily catalog refresh enabled.' : 'Daily catalog refresh disabled.')
+                  void patch('configure-sync', { action: 'configure-sync', enabled }, enabled ? 'Daily QuickBooks refresh enabled.' : 'Daily QuickBooks refresh disabled.')
                 }}
                 disabled={busy}
               />
             )}
-            label="Daily catalog refresh"
+            label="Daily QuickBooks refresh"
             sx={{ m: 0 }}
           />
         ) : null}
@@ -279,7 +279,7 @@ export default function QuickBooksIntegrationPanel() {
           <Button
             variant="contained"
             startIcon={pendingAction === 'bind' ? <CircularProgress size={16} /> : <LinkRounded />}
-            onClick={() => { void patch('bind', { action: 'bind-selected-connection' }, 'QuickBooks company connected and catalog refresh queued.') }}
+            onClick={() => { void patch('bind', { action: 'bind-selected-connection' }, 'QuickBooks company connected and data refresh queued.') }}
             disabled={busy}
             sx={buttonSx}
           >
@@ -290,11 +290,11 @@ export default function QuickBooksIntegrationPanel() {
             <Button
               variant="outlined"
               startIcon={pendingAction === 'refresh' ? <CircularProgress size={16} /> : <RefreshRounded />}
-              onClick={() => { void patch('refresh', { action: 'refresh-catalog' }, 'QuickBooks catalog refresh queued.') }}
+              onClick={() => { void patch('refresh', { action: 'refresh-catalog' }, 'QuickBooks data refresh queued.') }}
               disabled={busy}
               sx={buttonSx}
             >
-              Refresh catalog
+              Refresh QuickBooks data
             </Button>
             <Button
               color="error"
