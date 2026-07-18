@@ -97,9 +97,22 @@ type DrivePermission = {
 type SpreadsheetMetadata = {
   spreadsheetId?: string
   sheets?: Array<{
-    properties?: { sheetId?: number; title?: string; index?: number }
+    properties?: {
+      sheetId?: number
+      title?: string
+      index?: number
+      gridProperties?: {
+        rowCount?: number
+        columnCount?: number
+        frozenRowCount?: number
+        frozenColumnCount?: number
+      }
+    }
     protectedRanges?: Array<{ protectedRangeId?: number; description?: string }>
     charts?: Array<{ chartId?: number }>
+    conditionalFormats?: unknown[]
+    bandedRanges?: Array<{ bandedRangeId?: number }>
+    basicFilter?: unknown
     merges?: Array<{
       sheetId?: number
       startRowIndex?: number
@@ -123,19 +136,73 @@ const IDENTIFIER_TABS = ['Organizations', 'Contacts', 'Opportunities', 'Interact
 const PROTECTION_PREFIX = 'ClawPilot managed:'
 const REQUIRED_CONFIGURED_DROPDOWNS = ['product', 'stage', 'priority', 'status', 'source', 'loss_reason'] as const
 const GENERATED_REPORT_CLEAR_RANGES = [
+  "'Start Here'!B4:ZZZ",
   "'Calculations'!B4:ZZZ",
   "'Dashboard'!B4:ZZZ",
 ] as const
+const GENERATED_HEADER_CLEAR_RANGES = EXPECTED_TABS.map((title) => `'${title}'!A1:ZZ3`)
+
+const WORKBOOK_THEME = {
+  shell: '#0F0F13',
+  surface: '#1A1A23',
+  surfaceVariant: '#232330',
+  canvas: '#F4F6FA',
+  paper: '#FFFFFF',
+  paperAlt: '#F8F9FC',
+  editable: '#EEF4FF',
+  editableAlt: '#E7F0FF',
+  ink: '#20212A',
+  muted: '#626675',
+  outline: '#D9DCE5',
+  accent: '#A8C7FA',
+  secondary: '#CFC6EA',
+  success: '#4F9E67',
+  successFill: '#E7F4EA',
+  warning: '#A86708',
+  warningFill: '#FFF1D6',
+  danger: '#B34A45',
+  dangerFill: '#FCE8E6',
+  info: '#3D6FA8',
+  infoFill: '#E8F0FE',
+} as const
+
+const WORKBOOK_TAB_COLORS: Record<(typeof EXPECTED_TABS)[number], string> = {
+  'Start Here': WORKBOOK_THEME.accent,
+  Organizations: '#79A8F5',
+  Contacts: WORKBOOK_THEME.secondary,
+  Opportunities: '#76C98D',
+  Interactions: '#66CDBD',
+  Calculations: '#8E94A6',
+  Dashboard: WORKBOOK_THEME.accent,
+  Dropdowns: '#E7B867',
+}
+
+const WORKBOOK_COLUMN_WIDTHS: Record<(typeof EXPECTED_TABS)[number], number[]> = {
+  'Start Here': [64, 190, 720],
+  Organizations: [80, 220, 150, 120, 105, 150, 190, 125, 220, 120, 85, 280, 220, 130],
+  Contacts: [80, 190, 150, 200, 180, 220, 125, 105, 125, 135, 190, 300],
+  Opportunities: [80, 220, 150, 210, 105, 145, 135, 135, 125, 100, 130, 340],
+  Interactions: [80, 240, 150, 210, 155, 155, 200, 185, 420],
+  Calculations: [240, 150],
+  Dashboard: [],
+  Dropdowns: [160, 180, 170, 120, 140, 160, 170],
+}
+
+const FILTERED_TABLE_TABS = ['Organizations', 'Contacts', 'Opportunities', 'Interactions'] as const
+const DASHBOARD_HELPER_COLUMN_INDEX = 15
+const DASHBOARD_LAST_VISIBLE_COLUMN_INDEX = 13
 
 const INITIAL_TAB_ROWS: Partial<Record<(typeof EXPECTED_TABS)[number], unknown[][]>> = {
   'Start Here': [
-    ['Opportunity updates', 'Only the Opportunities tab is operator-editable. ClawPilot syncs those changes with the CRM.'],
-    ['Status', 'Controls lifecycle reporting and formulas. Active excludes Won, Lost, Closed, and Abandoned; Open and On Hold remain active.'],
-    ['Stage', 'Controls where an opportunity appears on the pipeline board.'],
-    ['Probability', 'Controls weighted active value: opportunity value multiplied by win probability.'],
-    ['Expected Close', 'Controls when opportunity value appears in the sales forecast.'],
-    ['Products', 'Products are selected as a multi-select field in ClawPilot and synchronized with the opportunity.'],
-    ['Generated tabs', 'Organizations, Contacts, Interactions, Calculations, Dashboard, and Dropdowns are managed by ClawPilot.'],
+    ['WORKFLOW', 'Use this workbook as a focused pipeline workspace. ClawPilot remains the system of record for CRM relationships, access, and automation.'],
+    ['1. Update opportunities', 'Only the Opportunities tab is operator-editable. ClawPilot syncs those changes with the CRM.'],
+    ['2. Set lifecycle status', 'Status controls lifecycle reporting and formulas. Active excludes Won, Lost, Closed, and Abandoned; Open and On Hold remain active.'],
+    ['3. Move the pipeline stage', 'Stage controls where an opportunity appears on the pipeline board.'],
+    ['4. Confirm probability', 'Probability controls weighted active value: opportunity value multiplied by win probability. Enter a whole percent from 0 to 100.'],
+    ['5. Add the forecast date', 'Expected Close controls when opportunity value appears in the sales forecast.'],
+    ['PRODUCTS', 'Products are selected as a multi-select field in ClawPilot and synchronized with the opportunity.'],
+    ['GENERATED REPORTING', 'Organizations, Contacts, Interactions, Calculations, Dashboard, and Dropdowns are managed by ClawPilot.'],
+    ['DATA SAFETY', 'Do not rename tabs or move table headers. Hidden record IDs preserve exact CRM relationships and are protected from editing.'],
   ],
   Calculations: [
     ['Total opportunities', '=COUNTA(Opportunities!C5:C)'],
@@ -838,7 +905,7 @@ async function ensurePipelineSheet(
 
 async function spreadsheetMetadata(request: SheetsJsonRequest, sheetId: string) {
   const metadata = await request<SpreadsheetMetadata>(
-    `/v4/spreadsheets/${sheetId}?fields=spreadsheetId,sheets(properties,protectedRanges(protectedRangeId,description),charts(chartId),merges)`,
+    `/v4/spreadsheets/${sheetId}?fields=spreadsheetId,sheets(properties,protectedRanges(protectedRangeId,description),charts(chartId),conditionalFormats,bandedRanges(bandedRangeId),basicFilter,merges)`,
   )
   if (validResourceId(metadata.spreadsheetId, 'Managed pipeline Sheet ID') !== sheetId) {
     throw new PipelineProvisioningRequestError(
@@ -867,23 +934,48 @@ function dashboardChartRequests(sheetId: number) {
     anchorColumnIndex: number
     chartType: 'BAR' | 'COLUMN'
     valueAxisTitle: string
+    seriesColor: string
   }) => ({
     addChart: {
       chart: {
         spec: {
           title: input.title,
+          fontName: 'Arial',
+          hiddenDimensionStrategy: 'SHOW_ALL',
+          backgroundColor: googleColor(WORKBOOK_THEME.paper),
+          titleTextFormat: {
+            foregroundColor: googleColor(WORKBOOK_THEME.ink),
+            fontSize: 14,
+            bold: true,
+          },
           basicChart: {
             chartType: input.chartType,
             legendPosition: 'NO_LEGEND',
             headerCount: 0,
             axis: input.chartType === 'BAR'
               ? [
-                { position: 'BOTTOM_AXIS', title: input.valueAxisTitle },
-                { position: 'LEFT_AXIS', title: 'Metric' },
+                {
+                  position: 'BOTTOM_AXIS',
+                  title: input.valueAxisTitle,
+                  format: { foregroundColor: googleColor(WORKBOOK_THEME.muted), fontSize: 9 },
+                },
+                {
+                  position: 'LEFT_AXIS',
+                  title: 'Metric',
+                  format: { foregroundColor: googleColor(WORKBOOK_THEME.muted), fontSize: 9 },
+                },
               ]
               : [
-                { position: 'BOTTOM_AXIS', title: 'Metric' },
-                { position: 'LEFT_AXIS', title: input.valueAxisTitle },
+                {
+                  position: 'BOTTOM_AXIS',
+                  title: 'Metric',
+                  format: { foregroundColor: googleColor(WORKBOOK_THEME.muted), fontSize: 9 },
+                },
+                {
+                  position: 'LEFT_AXIS',
+                  title: input.valueAxisTitle,
+                  format: { foregroundColor: googleColor(WORKBOOK_THEME.muted), fontSize: 9 },
+                },
               ],
             domains: [{
               domain: {
@@ -892,8 +984,8 @@ function dashboardChartRequests(sheetId: number) {
                     sheetId,
                     startRowIndex: input.startRowIndex,
                     endRowIndex: input.endRowIndex,
-                    startColumnIndex: 1,
-                    endColumnIndex: 2,
+                    startColumnIndex: DASHBOARD_HELPER_COLUMN_INDEX,
+                    endColumnIndex: DASHBOARD_HELPER_COLUMN_INDEX + 1,
                   }],
                 },
               },
@@ -905,12 +997,13 @@ function dashboardChartRequests(sheetId: number) {
                     sheetId,
                     startRowIndex: input.startRowIndex,
                     endRowIndex: input.endRowIndex,
-                    startColumnIndex: 2,
-                    endColumnIndex: 3,
+                    startColumnIndex: DASHBOARD_HELPER_COLUMN_INDEX + 1,
+                    endColumnIndex: DASHBOARD_HELPER_COLUMN_INDEX + 2,
                   }],
                 },
               },
               targetAxis: input.chartType === 'BAR' ? 'BOTTOM_AXIS' : 'LEFT_AXIS',
+              color: googleColor(input.seriesColor),
             }],
           },
         },
@@ -921,7 +1014,7 @@ function dashboardChartRequests(sheetId: number) {
               rowIndex: input.anchorRowIndex,
               columnIndex: input.anchorColumnIndex,
             },
-            widthPixels: 400,
+            widthPixels: 440,
             heightPixels: 250,
           },
         },
@@ -934,39 +1027,413 @@ function dashboardChartRequests(sheetId: number) {
       title: 'Opportunity lifecycle',
       startRowIndex: 6,
       endRowIndex: 10,
-      anchorRowIndex: 3,
-      anchorColumnIndex: 4,
+      anchorRowIndex: 9,
+      anchorColumnIndex: 1,
       chartType: 'COLUMN',
       valueAxisTitle: 'Opportunities',
+      seriesColor: WORKBOOK_THEME.accent,
     }),
     chart({
       title: 'Pipeline value',
       startRowIndex: 11,
       endRowIndex: 14,
-      anchorRowIndex: 18,
-      anchorColumnIndex: 4,
+      anchorRowIndex: 9,
+      anchorColumnIndex: 7,
       chartType: 'COLUMN',
       valueAxisTitle: 'Value',
+      seriesColor: WORKBOOK_THEME.success,
     }),
     chart({
       title: 'CRM records',
       startRowIndex: 14,
       endRowIndex: 17,
-      anchorRowIndex: 3,
-      anchorColumnIndex: 9,
+      anchorRowIndex: 24,
+      anchorColumnIndex: 1,
       chartType: 'BAR',
       valueAxisTitle: 'Records',
+      seriesColor: WORKBOOK_THEME.secondary,
     }),
     chart({
       title: 'Interactions, last 90 days',
       startRowIndex: 17,
       endRowIndex: 20,
-      anchorRowIndex: 18,
-      anchorColumnIndex: 9,
+      anchorRowIndex: 24,
+      anchorColumnIndex: 7,
       chartType: 'COLUMN',
       valueAxisTitle: 'Interactions',
+      seriesColor: '#66CDBD',
     }),
   ]
+}
+
+function dashboardValueWrites() {
+  return [
+    { range: "'Dashboard'!B5", majorDimension: 'ROWS' as const, values: [['ACTIVE PIPELINE']] },
+    { range: "'Dashboard'!B6", majorDimension: 'ROWS' as const, values: [['=Calculations!C9']] },
+    { range: "'Dashboard'!E5", majorDimension: 'ROWS' as const, values: [['WEIGHTED PIPELINE']] },
+    { range: "'Dashboard'!E6", majorDimension: 'ROWS' as const, values: [['=Calculations!C10']] },
+    { range: "'Dashboard'!H5", majorDimension: 'ROWS' as const, values: [['WON VALUE']] },
+    { range: "'Dashboard'!H6", majorDimension: 'ROWS' as const, values: [['=Calculations!C12']] },
+    { range: "'Dashboard'!K5", majorDimension: 'ROWS' as const, values: [['WIN RATE']] },
+    { range: "'Dashboard'!K6", majorDimension: 'ROWS' as const, values: [['=Calculations!C14']] },
+    { range: "'Dashboard'!B9", majorDimension: 'ROWS' as const, values: [['PIPELINE PERFORMANCE']] },
+    { range: "'Dashboard'!B24", majorDimension: 'ROWS' as const, values: [['CUSTOMER ACTIVITY']] },
+    {
+      range: "'Dashboard'!B40",
+      majorDimension: 'ROWS' as const,
+      values: [['Generated from ClawPilot CRM records. Update live sales data on the Opportunities tab.']],
+    },
+  ]
+}
+
+function googleBorder(hex: string = WORKBOOK_THEME.outline, style: string = 'SOLID') {
+  return { style, color: googleColor(hex) }
+}
+
+function tableBandingRequest(input: {
+  sheetId: number
+  rowCount: number
+  startColumnIndex?: number
+  endColumnIndex: number
+  editable?: boolean
+}) {
+  return {
+    addBanding: {
+      bandedRange: {
+        range: {
+          sheetId: input.sheetId,
+          startRowIndex: 4,
+          endRowIndex: input.rowCount,
+          startColumnIndex: input.startColumnIndex ?? 1,
+          endColumnIndex: input.endColumnIndex,
+        },
+        rowProperties: {
+          firstBandColor: googleColor(input.editable ? WORKBOOK_THEME.editable : WORKBOOK_THEME.paper),
+          secondBandColor: googleColor(input.editable ? WORKBOOK_THEME.editableAlt : WORKBOOK_THEME.paperAlt),
+        },
+      },
+    },
+  }
+}
+
+function conditionalTextRule(input: {
+  sheetId: number
+  rowCount: number
+  columnIndex: number
+  value: string
+  fill: string
+  foreground: string
+}) {
+  return {
+    addConditionalFormatRule: {
+      rule: {
+        ranges: [{
+          sheetId: input.sheetId,
+          startRowIndex: 4,
+          endRowIndex: input.rowCount,
+          startColumnIndex: input.columnIndex,
+          endColumnIndex: input.columnIndex + 1,
+        }],
+        booleanRule: {
+          condition: { type: 'TEXT_EQ', values: [{ userEnteredValue: input.value }] },
+          format: {
+            backgroundColor: googleColor(input.fill),
+            textFormat: { foregroundColor: googleColor(input.foreground), bold: true },
+          },
+        },
+      },
+      index: 0,
+    },
+  }
+}
+
+function commonTableConditionalFormatting(sheetId: number, rowCount: number) {
+  return [
+    conditionalTextRule({ sheetId, rowCount, columnIndex: 1, value: 'A+', fill: '#E2F3E7', foreground: '#2C6A3C' }),
+    conditionalTextRule({ sheetId, rowCount, columnIndex: 1, value: 'A', fill: '#E8F0FE', foreground: '#315D91' }),
+    conditionalTextRule({ sheetId, rowCount, columnIndex: 1, value: 'B', fill: '#F0EBFA', foreground: '#625080' }),
+    conditionalTextRule({ sheetId, rowCount, columnIndex: 1, value: 'C', fill: '#FFF1D6', foreground: '#8B5A08' }),
+    conditionalTextRule({ sheetId, rowCount, columnIndex: 1, value: 'D', fill: '#FCE8E6', foreground: '#963D39' }),
+  ]
+}
+
+function syncStatusConditionalFormatting(sheetId: number, rowCount: number, columnIndex: number) {
+  return [
+    conditionalTextRule({ sheetId, rowCount, columnIndex, value: 'synced', fill: WORKBOOK_THEME.successFill, foreground: '#2C6A3C' }),
+    conditionalTextRule({ sheetId, rowCount, columnIndex, value: 'pending', fill: WORKBOOK_THEME.warningFill, foreground: '#8B5A08' }),
+    conditionalTextRule({ sheetId, rowCount, columnIndex, value: 'queued', fill: WORKBOOK_THEME.warningFill, foreground: '#8B5A08' }),
+    conditionalTextRule({ sheetId, rowCount, columnIndex, value: 'failed', fill: WORKBOOK_THEME.dangerFill, foreground: '#963D39' }),
+  ]
+}
+
+function opportunityStatusConditionalFormatting(sheetId: number, rowCount: number) {
+  return [
+    conditionalTextRule({ sheetId, rowCount, columnIndex: 5, value: 'Open', fill: WORKBOOK_THEME.infoFill, foreground: '#315D91' }),
+    conditionalTextRule({ sheetId, rowCount, columnIndex: 5, value: 'On Hold', fill: WORKBOOK_THEME.warningFill, foreground: '#8B5A08' }),
+    conditionalTextRule({ sheetId, rowCount, columnIndex: 5, value: 'Won', fill: WORKBOOK_THEME.successFill, foreground: '#2C6A3C' }),
+    conditionalTextRule({ sheetId, rowCount, columnIndex: 5, value: 'Closed', fill: WORKBOOK_THEME.successFill, foreground: '#2C6A3C' }),
+    conditionalTextRule({ sheetId, rowCount, columnIndex: 5, value: 'Lost', fill: WORKBOOK_THEME.dangerFill, foreground: '#963D39' }),
+    conditionalTextRule({ sheetId, rowCount, columnIndex: 5, value: 'Abandoned', fill: WORKBOOK_THEME.dangerFill, foreground: '#963D39' }),
+  ]
+}
+
+function setRangeNumberFormat(input: {
+  sheetId: number
+  startRowIndex: number
+  endRowIndex?: number
+  startColumnIndex: number
+  endColumnIndex: number
+  type: string
+  pattern: string
+}) {
+  return {
+    repeatCell: {
+      range: {
+        sheetId: input.sheetId,
+        startRowIndex: input.startRowIndex,
+        ...(input.endRowIndex === undefined ? {} : { endRowIndex: input.endRowIndex }),
+        startColumnIndex: input.startColumnIndex,
+        endColumnIndex: input.endColumnIndex,
+      },
+      cell: { userEnteredFormat: { numberFormat: { type: input.type, pattern: input.pattern } } },
+      fields: 'userEnteredFormat.numberFormat',
+    },
+  }
+}
+
+function opportunityValidationRequests(sheetId: number, rowCount: number) {
+  const dropdown = (columnIndex: number, sourceColumn: string) => ({
+    setDataValidation: {
+      range: {
+        sheetId,
+        startRowIndex: 4,
+        endRowIndex: rowCount,
+        startColumnIndex: columnIndex,
+        endColumnIndex: columnIndex + 1,
+      },
+      rule: {
+        condition: {
+          type: 'ONE_OF_RANGE',
+          values: [{ userEnteredValue: `='Dropdowns'!$${sourceColumn}$5:$${sourceColumn}` }],
+        },
+        strict: false,
+        showCustomUi: true,
+      },
+    },
+  })
+  const numeric = (columnIndex: number, type: string, values: string[]) => ({
+    setDataValidation: {
+      range: {
+        sheetId,
+        startRowIndex: 4,
+        endRowIndex: rowCount,
+        startColumnIndex: columnIndex,
+        endColumnIndex: columnIndex + 1,
+      },
+      rule: {
+        condition: { type, values: values.map((value) => ({ userEnteredValue: value })) },
+        strict: true,
+        showCustomUi: true,
+      },
+    },
+  })
+  return [
+    dropdown(1, 'E'),
+    dropdown(3, 'B'),
+    dropdown(5, 'F'),
+    dropdown(6, 'D'),
+    dropdown(7, 'H'),
+    dropdown(8, 'G'),
+    numeric(9, 'NUMBER_GREATER_THAN_EQ', ['0']),
+    numeric(10, 'NUMBER_BETWEEN', ['0', '100']),
+    {
+      setDataValidation: {
+        range: {
+          sheetId,
+          startRowIndex: 4,
+          endRowIndex: rowCount,
+          startColumnIndex: 11,
+          endColumnIndex: 12,
+        },
+        rule: { condition: { type: 'DATE_IS_VALID' }, strict: true, showCustomUi: true },
+      },
+    },
+  ]
+}
+
+function dashboardLayoutRequests(sheetId: number) {
+  const requests: unknown[] = []
+  const cards = [
+    { startColumnIndex: 1, endColumnIndex: 4, valueColumnIndex: 1, color: WORKBOOK_THEME.accent },
+    { startColumnIndex: 4, endColumnIndex: 7, valueColumnIndex: 4, color: WORKBOOK_THEME.secondary },
+    { startColumnIndex: 7, endColumnIndex: 10, valueColumnIndex: 7, color: '#76C98D' },
+    { startColumnIndex: 10, endColumnIndex: 13, valueColumnIndex: 10, color: '#E7B867' },
+  ]
+  for (const card of cards) {
+    requests.push(
+      {
+        mergeCells: {
+          range: { sheetId, startRowIndex: 4, endRowIndex: 5, startColumnIndex: card.startColumnIndex, endColumnIndex: card.endColumnIndex },
+          mergeType: 'MERGE_ALL',
+        },
+      },
+      {
+        mergeCells: {
+          range: { sheetId, startRowIndex: 5, endRowIndex: 7, startColumnIndex: card.startColumnIndex, endColumnIndex: card.endColumnIndex },
+          mergeType: 'MERGE_ALL',
+        },
+      },
+      {
+        repeatCell: {
+          range: { sheetId, startRowIndex: 4, endRowIndex: 7, startColumnIndex: card.startColumnIndex, endColumnIndex: card.endColumnIndex },
+          cell: {
+            userEnteredFormat: {
+              backgroundColor: googleColor(WORKBOOK_THEME.surface),
+              borders: {
+                top: googleBorder(card.color, 'SOLID_THICK'),
+                bottom: googleBorder(WORKBOOK_THEME.outline),
+                left: googleBorder(WORKBOOK_THEME.outline),
+                right: googleBorder(WORKBOOK_THEME.outline),
+              },
+            },
+          },
+          fields: 'userEnteredFormat(backgroundColor,borders)',
+        },
+      },
+      {
+        repeatCell: {
+          range: { sheetId, startRowIndex: 4, endRowIndex: 5, startColumnIndex: card.startColumnIndex, endColumnIndex: card.endColumnIndex },
+          cell: {
+            userEnteredFormat: {
+              textFormat: { foregroundColor: googleColor(WORKBOOK_THEME.accent), fontSize: 9, bold: true },
+              horizontalAlignment: 'LEFT',
+              verticalAlignment: 'BOTTOM',
+            },
+          },
+          fields: 'userEnteredFormat(textFormat,horizontalAlignment,verticalAlignment)',
+        },
+      },
+      {
+        repeatCell: {
+          range: { sheetId, startRowIndex: 5, endRowIndex: 7, startColumnIndex: card.startColumnIndex, endColumnIndex: card.endColumnIndex },
+          cell: {
+            userEnteredFormat: {
+              textFormat: { foregroundColor: googleColor(card.color), fontSize: 20, bold: true },
+              horizontalAlignment: 'LEFT',
+              verticalAlignment: 'MIDDLE',
+            },
+          },
+          fields: 'userEnteredFormat(textFormat,horizontalAlignment,verticalAlignment)',
+        },
+      },
+    )
+  }
+  requests.push(
+    {
+      mergeCells: {
+        range: { sheetId, startRowIndex: 8, endRowIndex: 9, startColumnIndex: 1, endColumnIndex: DASHBOARD_LAST_VISIBLE_COLUMN_INDEX },
+        mergeType: 'MERGE_ALL',
+      },
+    },
+    {
+      mergeCells: {
+        range: { sheetId, startRowIndex: 23, endRowIndex: 24, startColumnIndex: 1, endColumnIndex: DASHBOARD_LAST_VISIBLE_COLUMN_INDEX },
+        mergeType: 'MERGE_ALL',
+      },
+    },
+    {
+      mergeCells: {
+        range: { sheetId, startRowIndex: 39, endRowIndex: 40, startColumnIndex: 1, endColumnIndex: DASHBOARD_LAST_VISIBLE_COLUMN_INDEX },
+        mergeType: 'MERGE_ALL',
+      },
+    },
+    {
+      repeatCell: {
+        range: { sheetId, startRowIndex: 8, endRowIndex: 9, startColumnIndex: 1, endColumnIndex: DASHBOARD_LAST_VISIBLE_COLUMN_INDEX },
+        cell: {
+          userEnteredFormat: {
+            textFormat: { foregroundColor: googleColor(WORKBOOK_THEME.ink), fontSize: 11, bold: true },
+            borders: { bottom: googleBorder(WORKBOOK_THEME.outline, 'SOLID_MEDIUM') },
+            verticalAlignment: 'MIDDLE',
+          },
+        },
+        fields: 'userEnteredFormat(textFormat,borders,verticalAlignment)',
+      },
+    },
+    {
+      repeatCell: {
+        range: { sheetId, startRowIndex: 23, endRowIndex: 24, startColumnIndex: 1, endColumnIndex: DASHBOARD_LAST_VISIBLE_COLUMN_INDEX },
+        cell: {
+          userEnteredFormat: {
+            textFormat: { foregroundColor: googleColor(WORKBOOK_THEME.ink), fontSize: 11, bold: true },
+            borders: { bottom: googleBorder(WORKBOOK_THEME.outline, 'SOLID_MEDIUM') },
+            verticalAlignment: 'MIDDLE',
+          },
+        },
+        fields: 'userEnteredFormat(textFormat,borders,verticalAlignment)',
+      },
+    },
+    {
+      repeatCell: {
+        range: { sheetId, startRowIndex: 39, endRowIndex: 40, startColumnIndex: 1, endColumnIndex: DASHBOARD_LAST_VISIBLE_COLUMN_INDEX },
+        cell: {
+          userEnteredFormat: {
+            textFormat: { foregroundColor: googleColor(WORKBOOK_THEME.muted), fontSize: 9, italic: true },
+            horizontalAlignment: 'LEFT',
+          },
+        },
+        fields: 'userEnteredFormat(textFormat,horizontalAlignment)',
+      },
+    },
+    setRangeNumberFormat({ sheetId, startRowIndex: 5, endRowIndex: 6, startColumnIndex: 1, endColumnIndex: 2, type: 'CURRENCY', pattern: '$#,##0' }),
+    setRangeNumberFormat({ sheetId, startRowIndex: 5, endRowIndex: 6, startColumnIndex: 4, endColumnIndex: 5, type: 'CURRENCY', pattern: '$#,##0' }),
+    setRangeNumberFormat({ sheetId, startRowIndex: 5, endRowIndex: 6, startColumnIndex: 7, endColumnIndex: 8, type: 'CURRENCY', pattern: '$#,##0' }),
+    setRangeNumberFormat({ sheetId, startRowIndex: 5, endRowIndex: 6, startColumnIndex: 10, endColumnIndex: 11, type: 'PERCENT', pattern: '0.0%' }),
+    {
+      updateDimensionProperties: {
+        range: { sheetId, dimension: 'COLUMNS', startIndex: 1, endIndex: DASHBOARD_LAST_VISIBLE_COLUMN_INDEX },
+        properties: { pixelSize: 72 },
+        fields: 'pixelSize',
+      },
+    },
+    {
+      updateDimensionProperties: {
+        range: { sheetId, dimension: 'COLUMNS', startIndex: DASHBOARD_HELPER_COLUMN_INDEX, endIndex: DASHBOARD_HELPER_COLUMN_INDEX + 2 },
+        properties: { hiddenByUser: true },
+        fields: 'hiddenByUser',
+      },
+    },
+    {
+      updateDimensionProperties: {
+        range: { sheetId, dimension: 'ROWS', startIndex: 4, endIndex: 7 },
+        properties: { pixelSize: 30 },
+        fields: 'pixelSize',
+      },
+    },
+    {
+      updateDimensionProperties: {
+        range: { sheetId, dimension: 'ROWS', startIndex: 8, endIndex: 9 },
+        properties: { pixelSize: 30 },
+        fields: 'pixelSize',
+      },
+    },
+    {
+      updateDimensionProperties: {
+        range: { sheetId, dimension: 'ROWS', startIndex: 23, endIndex: 24 },
+        properties: { pixelSize: 30 },
+        fields: 'pixelSize',
+      },
+    },
+    {
+      updateDimensionProperties: {
+        range: { sheetId, dimension: 'ROWS', startIndex: 39, endIndex: 40 },
+        properties: { pixelSize: 28 },
+        fields: 'pixelSize',
+      },
+    },
+    ...dashboardChartRequests(sheetId),
+  )
+  return requests
 }
 
 export async function configurePipelineTabsWithRequest(
@@ -1033,14 +1500,16 @@ export async function configurePipelineTabsWithRequest(
     metadata = await spreadsheetMetadata(request, sheetId)
   }
 
-  const dashboardMerges = (metadata.sheets || [])
-    .find((sheet) => sheet.properties?.title === 'Dashboard')
-    ?.merges || []
-  if (dashboardMerges.length > 0) {
+  const managedMerges = (metadata.sheets || []).flatMap((sheet) => (
+    EXPECTED_TABS.includes(sheet.properties?.title as (typeof EXPECTED_TABS)[number])
+      ? sheet.merges || []
+      : []
+  ))
+  if (managedMerges.length > 0) {
     await request(`/v4/spreadsheets/${sheetId}:batchUpdate`, {
       method: 'POST',
       body: {
-        requests: dashboardMerges.map((range) => ({ unmergeCells: { range } })),
+        requests: managedMerges.map((range) => ({ unmergeCells: { range } })),
         includeSpreadsheetInResponse: false,
       },
       idempotent: false,
@@ -1049,7 +1518,7 @@ export async function configurePipelineTabsWithRequest(
 
   await request(`/v4/spreadsheets/${sheetId}/values:batchClear`, {
     method: 'POST',
-    body: { ranges: [...GENERATED_REPORT_CLEAR_RANGES] },
+    body: { ranges: [...GENERATED_HEADER_CLEAR_RANGES, ...GENERATED_REPORT_CLEAR_RANGES] },
     idempotent: true,
   })
 
@@ -1069,20 +1538,21 @@ export async function configurePipelineTabsWithRequest(
         const preserveConfiguredDropdowns = title === 'Dropdowns' && !newlyProvisionedTitles.has(title)
         if (preserveConfiguredDropdowns) return writes
 
+        const dataColumn = title === 'Dashboard' ? 'P' : title === 'Start Here' ? 'C' : 'B'
         writes.push({
-          range: `'${title}'!B4`,
+          range: `'${title}'!${dataColumn}4`,
           majorDimension: 'ROWS',
           values: [TAB_HEADERS[title]],
         })
         if (INITIAL_TAB_ROWS[title]) {
           writes.push({
-            range: `'${title}'!B5`,
+            range: `'${title}'!${dataColumn}5`,
             majorDimension: 'ROWS',
             values: INITIAL_TAB_ROWS[title] || [],
           })
         }
         return writes
-      }),
+      }).concat(dashboardValueWrites()),
     },
     idempotent: true,
   })
@@ -1104,134 +1574,258 @@ export async function configurePipelineTabsWithRequest(
     const sheetIdValue = sheet.properties?.sheetId
     const title = sheet.properties?.title as (typeof EXPECTED_TABS)[number]
     if (sheetIdValue === undefined) return
+    const tableStartColumnIndex = title === 'Start Here' ? 2 : 1
+    const tableEndColumnIndex = tableStartColumnIndex + TAB_HEADERS[title].length
+    const visibleEndColumnIndex = title === 'Dashboard'
+      ? DASHBOARD_LAST_VISIBLE_COLUMN_INDEX
+      : Math.max(8, tableEndColumnIndex)
+    const minimumRows = title === 'Dashboard' ? 44 : title === 'Start Here' ? 30 : title === 'Calculations' ? 40 : 1000
+    const rowCount = Math.max(minimumRows, sheet.properties?.gridProperties?.rowCount || 0)
+    const columnCount = Math.max(
+      sheet.properties?.gridProperties?.columnCount || 0,
+      title === 'Dashboard' ? DASHBOARD_HELPER_COLUMN_INDEX + 2 : tableEndColumnIndex,
+    )
     for (const range of sheet.protectedRanges || []) {
       if (range.protectedRangeId !== undefined && String(range.description || '').startsWith(PROTECTION_PREFIX)) {
         formattingRequests.push({ deleteProtectedRange: { protectedRangeId: range.protectedRangeId } })
       }
     }
+    for (let index = (sheet.conditionalFormats || []).length - 1; index >= 0; index -= 1) {
+      formattingRequests.push({ deleteConditionalFormatRule: { sheetId: sheetIdValue, index } })
+    }
+    for (const bandedRange of sheet.bandedRanges || []) {
+      if (bandedRange.bandedRangeId !== undefined) {
+        formattingRequests.push({ deleteBanding: { bandedRangeId: bandedRange.bandedRangeId } })
+      }
+    }
+    if (sheet.basicFilter) formattingRequests.push({ clearBasicFilter: { sheetId: sheetIdValue } })
     if (title === 'Dashboard') {
       for (const chart of sheet.charts || []) {
         if (chart.chartId !== undefined) {
           formattingRequests.push({ deleteEmbeddedObject: { objectId: chart.chartId } })
         }
       }
-      formattingRequests.push(...dashboardChartRequests(sheetIdValue))
     }
-    formattingRequests.push({
-      updateSheetProperties: {
-        properties: {
-          sheetId: sheetIdValue,
-          index: EXPECTED_TABS.indexOf(title),
-          gridProperties: { frozenRowCount: 4, frozenColumnCount: 1 },
+    formattingRequests.push(
+      {
+        updateSheetProperties: {
+          properties: {
+            sheetId: sheetIdValue,
+            index: EXPECTED_TABS.indexOf(title),
+            tabColor: googleColor(WORKBOOK_TAB_COLORS[title]),
+            gridProperties: {
+              rowCount,
+              columnCount,
+              frozenRowCount: title === 'Dashboard' ? 3 : 4,
+              frozenColumnCount: 1,
+              hideGridlines: true,
+            },
+          },
+          fields: 'index,tabColor,gridProperties(rowCount,columnCount,frozenRowCount,frozenColumnCount,hideGridlines)',
         },
-        fields: 'index,gridProperties.frozenRowCount,gridProperties.frozenColumnCount',
       },
-    })
-    if (title === 'Calculations') {
+      {
+        repeatCell: {
+          range: { sheetId: sheetIdValue, startRowIndex: 0, endRowIndex: rowCount, startColumnIndex: 0, endColumnIndex: columnCount },
+          cell: {
+            userEnteredFormat: {
+              backgroundColor: googleColor(WORKBOOK_THEME.canvas),
+              textFormat: { foregroundColor: googleColor(WORKBOOK_THEME.ink), fontFamily: 'Arial', fontSize: 10 },
+              verticalAlignment: 'MIDDLE',
+              wrapStrategy: 'CLIP',
+            },
+          },
+          fields: 'userEnteredFormat',
+        },
+      },
+      {
+        repeatCell: {
+          range: { sheetId: sheetIdValue, startRowIndex: 0, endRowIndex: 3, startColumnIndex: 1, endColumnIndex: visibleEndColumnIndex },
+          cell: {
+            userEnteredFormat: {
+              backgroundColor: googleColor(WORKBOOK_THEME.shell),
+              textFormat: { foregroundColor: googleColor('#FFFFFF'), fontFamily: 'Arial' },
+            },
+          },
+          fields: 'userEnteredFormat(backgroundColor,textFormat)',
+        },
+      },
+      {
+        updateDimensionProperties: {
+          range: { sheetId: sheetIdValue, dimension: 'COLUMNS', startIndex: 0, endIndex: 1 },
+          properties: { hiddenByUser: true },
+          fields: 'hiddenByUser',
+        },
+      },
+      {
+        updateDimensionProperties: {
+          range: { sheetId: sheetIdValue, dimension: 'ROWS', startIndex: 0, endIndex: 1 },
+          properties: { pixelSize: 38 },
+          fields: 'pixelSize',
+        },
+      },
+      {
+        updateDimensionProperties: {
+          range: { sheetId: sheetIdValue, dimension: 'ROWS', startIndex: 1, endIndex: 2 },
+          properties: { pixelSize: 24 },
+          fields: 'pixelSize',
+        },
+      },
+      {
+        updateDimensionProperties: {
+          range: { sheetId: sheetIdValue, dimension: 'ROWS', startIndex: 2, endIndex: 3 },
+          properties: { pixelSize: 8 },
+          fields: 'pixelSize',
+        },
+      },
+    )
+
+    if (title !== 'Dashboard') {
       formattingRequests.push(
         {
           repeatCell: {
-            range: { sheetId: sheetIdValue, startRowIndex: 8, endRowIndex: 10, startColumnIndex: 2, endColumnIndex: 3 },
-            cell: { userEnteredFormat: { numberFormat: { type: 'CURRENCY', pattern: '$#,##0.00' } } },
-            fields: 'userEnteredFormat.numberFormat',
+            range: { sheetId: sheetIdValue, startRowIndex: 3, endRowIndex: 4, startColumnIndex: tableStartColumnIndex, endColumnIndex: tableEndColumnIndex },
+            cell: {
+              userEnteredFormat: {
+                backgroundColor: googleColor(WORKBOOK_THEME.surface),
+                textFormat: { foregroundColor: googleColor('#FFFFFF'), fontFamily: 'Arial', fontSize: 10, bold: true },
+                horizontalAlignment: 'LEFT',
+                verticalAlignment: 'MIDDLE',
+                borders: { bottom: googleBorder(WORKBOOK_THEME.accent, 'SOLID_THICK') },
+                wrapStrategy: 'WRAP',
+              },
+            },
+            fields: 'userEnteredFormat',
           },
         },
         {
           repeatCell: {
-            range: { sheetId: sheetIdValue, startRowIndex: 11, endRowIndex: 12, startColumnIndex: 2, endColumnIndex: 3 },
-            cell: { userEnteredFormat: { numberFormat: { type: 'CURRENCY', pattern: '$#,##0.00' } } },
-            fields: 'userEnteredFormat.numberFormat',
+            range: { sheetId: sheetIdValue, startRowIndex: 4, endRowIndex: rowCount, startColumnIndex: tableStartColumnIndex, endColumnIndex: tableEndColumnIndex },
+            cell: {
+              userEnteredFormat: {
+                textFormat: { foregroundColor: googleColor(WORKBOOK_THEME.ink), fontFamily: 'Arial', fontSize: 10 },
+                verticalAlignment: 'MIDDLE',
+                borders: { bottom: googleBorder(WORKBOOK_THEME.outline) },
+                wrapStrategy: title === 'Start Here' ? 'WRAP' : 'CLIP',
+              },
+            },
+            fields: 'userEnteredFormat(textFormat,verticalAlignment,borders,wrapStrategy)',
+          },
+        },
+        {
+          updateDimensionProperties: {
+            range: { sheetId: sheetIdValue, dimension: 'ROWS', startIndex: 3, endIndex: 4 },
+            properties: { pixelSize: 34 },
+            fields: 'pixelSize',
+          },
+        },
+        {
+          updateDimensionProperties: {
+            range: { sheetId: sheetIdValue, dimension: 'ROWS', startIndex: 4, endIndex: rowCount },
+            properties: { pixelSize: title === 'Start Here' ? 54 : 32 },
+            fields: 'pixelSize',
+          },
+        },
+      )
+      WORKBOOK_COLUMN_WIDTHS[title].forEach((pixelSize, column) => {
+        formattingRequests.push({
+          updateDimensionProperties: {
+            range: { sheetId: sheetIdValue, dimension: 'COLUMNS', startIndex: 1 + column, endIndex: 2 + column },
+            properties: { pixelSize },
+            fields: 'pixelSize',
+          },
+        })
+      })
+      formattingRequests.push(tableBandingRequest({
+        sheetId: sheetIdValue,
+        rowCount,
+        startColumnIndex: tableStartColumnIndex,
+        endColumnIndex: tableEndColumnIndex,
+        editable: title === 'Opportunities',
+      }))
+    }
+
+    if (title === 'Start Here') {
+      formattingRequests.push(
+        {
+          repeatCell: {
+            range: { sheetId: sheetIdValue, startRowIndex: 4, endRowIndex: 13, startColumnIndex: 2, endColumnIndex: 3 },
+            cell: {
+              userEnteredFormat: {
+                textFormat: { foregroundColor: googleColor(WORKBOOK_THEME.info), fontSize: 10, bold: true },
+                verticalAlignment: 'TOP',
+              },
+            },
+            fields: 'userEnteredFormat(textFormat,verticalAlignment)',
           },
         },
         {
           repeatCell: {
-            range: { sheetId: sheetIdValue, startRowIndex: 13, endRowIndex: 14, startColumnIndex: 2, endColumnIndex: 3 },
-            cell: { userEnteredFormat: { numberFormat: { type: 'PERCENT', pattern: '0.0%' } } },
-            fields: 'userEnteredFormat.numberFormat',
+            range: { sheetId: sheetIdValue, startRowIndex: 4, endRowIndex: 13, startColumnIndex: 3, endColumnIndex: 4 },
+            cell: { userEnteredFormat: { textFormat: { foregroundColor: googleColor(WORKBOOK_THEME.ink), fontSize: 10 }, verticalAlignment: 'TOP' } },
+            fields: 'userEnteredFormat(textFormat,verticalAlignment)',
           },
         },
+      )
+    }
+
+    if (FILTERED_TABLE_TABS.includes(title as (typeof FILTERED_TABLE_TABS)[number])) {
+      formattingRequests.push(
+        {
+          setBasicFilter: {
+            filter: {
+              range: {
+                sheetId: sheetIdValue,
+                startRowIndex: 3,
+                endRowIndex: rowCount,
+                startColumnIndex: 1,
+                endColumnIndex: tableEndColumnIndex,
+              },
+            },
+          },
+        },
+        ...commonTableConditionalFormatting(sheetIdValue, rowCount),
+      )
+    }
+
+    if (title === 'Organizations') {
+      formattingRequests.push(...syncStatusConditionalFormatting(sheetIdValue, rowCount, 5))
+    }
+    if (title === 'Contacts') {
+      formattingRequests.push(
+        ...syncStatusConditionalFormatting(sheetIdValue, rowCount, 8),
+        setRangeNumberFormat({ sheetId: sheetIdValue, startRowIndex: 4, startColumnIndex: 10, endColumnIndex: 11, type: 'DATE', pattern: 'mmm d, yyyy' }),
+      )
+    }
+    if (title === 'Opportunities') {
+      formattingRequests.push(
+        ...opportunityStatusConditionalFormatting(sheetIdValue, rowCount),
+        ...opportunityValidationRequests(sheetIdValue, rowCount),
+        setRangeNumberFormat({ sheetId: sheetIdValue, startRowIndex: 4, startColumnIndex: 9, endColumnIndex: 10, type: 'CURRENCY', pattern: '$#,##0.00' }),
+        setRangeNumberFormat({ sheetId: sheetIdValue, startRowIndex: 4, startColumnIndex: 10, endColumnIndex: 11, type: 'NUMBER', pattern: '0.0"%"' }),
+        setRangeNumberFormat({ sheetId: sheetIdValue, startRowIndex: 4, startColumnIndex: 11, endColumnIndex: 12, type: 'DATE', pattern: 'mmm d, yyyy' }),
+      )
+    }
+    if (title === 'Interactions') {
+      formattingRequests.push(
+        setRangeNumberFormat({ sheetId: sheetIdValue, startRowIndex: 4, startColumnIndex: 6, endColumnIndex: 7, type: 'DATE_TIME', pattern: 'mmm d, yyyy h:mm AM/PM' }),
+      )
+    }
+    if (title === 'Calculations') {
+      formattingRequests.push(
+        setRangeNumberFormat({ sheetId: sheetIdValue, startRowIndex: 8, endRowIndex: 10, startColumnIndex: 2, endColumnIndex: 3, type: 'CURRENCY', pattern: '$#,##0.00' }),
+        setRangeNumberFormat({ sheetId: sheetIdValue, startRowIndex: 11, endRowIndex: 12, startColumnIndex: 2, endColumnIndex: 3, type: 'CURRENCY', pattern: '$#,##0.00' }),
+        setRangeNumberFormat({ sheetId: sheetIdValue, startRowIndex: 13, endRowIndex: 14, startColumnIndex: 2, endColumnIndex: 3, type: 'PERCENT', pattern: '0.0%' }),
       )
     }
     if (title === 'Dashboard') {
       formattingRequests.push(
-        {
-          repeatCell: {
-            range: { sheetId: sheetIdValue, startRowIndex: 10, endRowIndex: 11, startColumnIndex: 2, endColumnIndex: 3 },
-            cell: { userEnteredFormat: { numberFormat: { type: 'PERCENT', pattern: '0.0%' } } },
-            fields: 'userEnteredFormat.numberFormat',
-          },
-        },
-        {
-          repeatCell: {
-            range: { sheetId: sheetIdValue, startRowIndex: 11, endRowIndex: 14, startColumnIndex: 2, endColumnIndex: 3 },
-            cell: { userEnteredFormat: { numberFormat: { type: 'CURRENCY', pattern: '$#,##0.00' } } },
-            fields: 'userEnteredFormat.numberFormat',
-          },
-        },
-        {
-          updateDimensionProperties: {
-            range: { sheetId: sheetIdValue, dimension: 'COLUMNS', startIndex: 1, endIndex: 2 },
-            properties: { pixelSize: 180 },
-            fields: 'pixelSize',
-          },
-        },
-        {
-          updateDimensionProperties: {
-            range: { sheetId: sheetIdValue, dimension: 'COLUMNS', startIndex: 2, endIndex: 3 },
-            properties: { pixelSize: 120 },
-            fields: 'pixelSize',
-          },
-        },
-        {
-          updateDimensionProperties: {
-            range: { sheetId: sheetIdValue, dimension: 'COLUMNS', startIndex: 3, endIndex: 4 },
-            properties: { pixelSize: 24 },
-            fields: 'pixelSize',
-          },
-        },
-        {
-          updateDimensionProperties: {
-            range: { sheetId: sheetIdValue, dimension: 'COLUMNS', startIndex: 4, endIndex: 14 },
-            properties: { pixelSize: 84 },
-            fields: 'pixelSize',
-          },
-        },
-        {
-          updateDimensionProperties: {
-            range: { sheetId: sheetIdValue, dimension: 'ROWS', startIndex: 3, endIndex: 36 },
-            properties: { pixelSize: 20 },
-            fields: 'pixelSize',
-          },
-        },
+        setRangeNumberFormat({ sheetId: sheetIdValue, startRowIndex: 10, endRowIndex: 11, startColumnIndex: 16, endColumnIndex: 17, type: 'PERCENT', pattern: '0.0%' }),
+        setRangeNumberFormat({ sheetId: sheetIdValue, startRowIndex: 11, endRowIndex: 14, startColumnIndex: 16, endColumnIndex: 17, type: 'CURRENCY', pattern: '$#,##0.00' }),
+        ...dashboardLayoutRequests(sheetIdValue),
       )
     }
-    formattingRequests.push({
-      updateDimensionProperties: {
-        range: { sheetId: sheetIdValue, dimension: 'COLUMNS', startIndex: 0, endIndex: 1 },
-        properties: { hiddenByUser: true },
-        fields: 'hiddenByUser',
-      },
-    })
-    formattingRequests.push({
-      repeatCell: {
-        range: { sheetId: sheetIdValue, startRowIndex: 3, endRowIndex: 4, startColumnIndex: 1, endColumnIndex: 1 + TAB_HEADERS[title].length },
-        cell: {
-          userEnteredFormat: {
-            backgroundColor: { red: 0.12, green: 0.14, blue: 0.18 },
-            textFormat: { foregroundColor: { red: 1, green: 1, blue: 1 }, bold: true },
-            horizontalAlignment: 'LEFT',
-          },
-        },
-        fields: 'userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)',
-      },
-    })
-    if (title !== 'Dashboard') {
-      formattingRequests.push({
-        autoResizeDimensions: {
-          dimensions: { sheetId: sheetIdValue, dimension: 'COLUMNS', startIndex: 1, endIndex: 1 + TAB_HEADERS[title].length },
-        },
-      })
-    }
+
     if (GENERATED_TABS.includes(title as (typeof GENERATED_TABS)[number])) {
       formattingRequests.push({
         addProtectedRange: {
@@ -1324,6 +1918,160 @@ export async function applyPipelineWorkbookBrandingWithRequest(
       'GOOGLE_PIPELINE_TABS_MISSING',
     )
   }
+  const primary = googleColor(branding.primaryColor)
+  const accent = googleColor(branding.accentColor)
+  const foreground = contrastingGoogleColor(branding.primaryColor)
+  const markForeground = contrastingGoogleColor(branding.accentColor)
+  const requests: unknown[] = []
+  for (const sheet of managedSheets) {
+    const id = sheet.properties?.sheetId
+    const title = sheet.properties?.title as (typeof EXPECTED_TABS)[number]
+    if (id === undefined) continue
+    const tableStartColumnIndex = title === 'Start Here' ? 2 : 1
+    const endColumnIndex = title === 'Dashboard'
+      ? DASHBOARD_LAST_VISIBLE_COLUMN_INDEX
+      : Math.max(8, tableStartColumnIndex + TAB_HEADERS[title].length)
+    for (const merge of sheet.merges || []) {
+      if ((merge.startRowIndex || 0) < 3 && (merge.endRowIndex || 0) <= 3) {
+        requests.push({ unmergeCells: { range: merge } })
+      }
+    }
+    requests.push(
+      {
+        mergeCells: {
+          range: { sheetId: id, startRowIndex: 0, endRowIndex: 2, startColumnIndex: 1, endColumnIndex: 2 },
+          mergeType: 'MERGE_ALL',
+        },
+      },
+      {
+        mergeCells: {
+          range: { sheetId: id, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 2, endColumnIndex },
+          mergeType: 'MERGE_ALL',
+        },
+      },
+      {
+        mergeCells: {
+          range: { sheetId: id, startRowIndex: 1, endRowIndex: 2, startColumnIndex: 2, endColumnIndex },
+          mergeType: 'MERGE_ALL',
+        },
+      },
+      {
+        repeatCell: {
+          range: { sheetId: id, startRowIndex: 0, endRowIndex: 3, startColumnIndex: 1, endColumnIndex },
+          cell: { userEnteredFormat: { backgroundColor: primary } },
+          fields: 'userEnteredFormat.backgroundColor',
+        },
+      },
+      {
+        repeatCell: {
+          range: { sheetId: id, startRowIndex: 0, endRowIndex: 2, startColumnIndex: 1, endColumnIndex: 2 },
+          cell: {
+            userEnteredFormat: {
+              backgroundColor: accent,
+              textFormat: { foregroundColor: markForeground, fontSize: 16, bold: true },
+              horizontalAlignment: 'CENTER',
+              verticalAlignment: 'MIDDLE',
+            },
+          },
+          fields: 'userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,verticalAlignment)',
+        },
+      },
+      {
+        repeatCell: {
+          range: { sheetId: id, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 2, endColumnIndex },
+          cell: {
+            userEnteredFormat: {
+              textFormat: { foregroundColor: foreground, fontSize: 15, bold: true },
+              horizontalAlignment: 'LEFT',
+              verticalAlignment: 'BOTTOM',
+            },
+          },
+          fields: 'userEnteredFormat(textFormat,horizontalAlignment,verticalAlignment)',
+        },
+      },
+      {
+        repeatCell: {
+          range: { sheetId: id, startRowIndex: 1, endRowIndex: 2, startColumnIndex: 2, endColumnIndex },
+          cell: {
+            userEnteredFormat: {
+              textFormat: { foregroundColor: foreground, fontSize: 9, bold: false },
+              horizontalAlignment: 'LEFT',
+              verticalAlignment: 'TOP',
+            },
+          },
+          fields: 'userEnteredFormat(textFormat,horizontalAlignment,verticalAlignment)',
+        },
+      },
+      {
+        repeatCell: {
+          range: { sheetId: id, startRowIndex: 2, endRowIndex: 3, startColumnIndex: 1, endColumnIndex },
+          cell: {
+            userEnteredFormat: {
+              backgroundColor: primary,
+              borders: { bottom: { style: 'SOLID_THICK', color: accent } },
+            },
+          },
+          fields: 'userEnteredFormat(backgroundColor,borders)',
+        },
+      },
+      {
+        updateDimensionProperties: {
+          range: { sheetId: id, dimension: 'ROWS', startIndex: 0, endIndex: 1 },
+          properties: { pixelSize: 38 },
+          fields: 'pixelSize',
+        },
+      },
+      {
+        updateDimensionProperties: {
+          range: { sheetId: id, dimension: 'ROWS', startIndex: 1, endIndex: 2 },
+          properties: { pixelSize: 24 },
+          fields: 'pixelSize',
+        },
+      },
+      {
+        updateDimensionProperties: {
+          range: { sheetId: id, dimension: 'ROWS', startIndex: 2, endIndex: 3 },
+          properties: { pixelSize: 8 },
+          fields: 'pixelSize',
+        },
+      },
+      {
+        updateDimensionProperties: {
+          range: { sheetId: id, dimension: 'COLUMNS', startIndex: 1, endIndex: 2 },
+          properties: { pixelSize: 64 },
+          fields: 'pixelSize',
+        },
+      },
+    )
+    if (title !== 'Dashboard') {
+      requests.push({
+        repeatCell: {
+          range: {
+            sheetId: id,
+            startRowIndex: 3,
+            endRowIndex: 4,
+            startColumnIndex: tableStartColumnIndex,
+            endColumnIndex: tableStartColumnIndex + TAB_HEADERS[title].length,
+          },
+          cell: {
+            userEnteredFormat: {
+              backgroundColor: primary,
+              textFormat: { foregroundColor: foreground, fontSize: 10, bold: true },
+              borders: { bottom: { style: 'SOLID_THICK', color: accent } },
+            },
+          },
+          fields: 'userEnteredFormat(backgroundColor,textFormat,borders)',
+        },
+      })
+    }
+  }
+  if (requests.length > 0) {
+    await request(`/v4/spreadsheets/${sheetId}:batchUpdate`, {
+      method: 'POST',
+      body: { requests, includeSpreadsheetInResponse: false },
+      idempotent: true,
+    })
+  }
   await request(`/v4/spreadsheets/${sheetId}/values:batchUpdate`, {
     method: 'POST',
     body: {
@@ -1334,93 +2082,12 @@ export async function applyPipelineWorkbookBrandingWithRequest(
           // Service-account IMAGE formulas remain #REF until a human approves external URL access.
           { range: `'${title}'!B1`, majorDimension: 'ROWS', values: [[workbookBrandMark(branding)]] },
           { range: `'${title}'!C1`, majorDimension: 'ROWS', values: [[sheetText(branding.organizationName)]] },
-          { range: `'${title}'!C2`, majorDimension: 'ROWS', values: [['Powered by ClawPilot']] },
+          { range: `'${title}'!C2`, majorDimension: 'ROWS', values: [[`${title} | Managed by ClawPilot`]] },
         ]
       }),
     },
     idempotent: true,
   })
-
-  const primary = googleColor(branding.primaryColor)
-  const accent = googleColor(branding.accentColor)
-  const foreground = contrastingGoogleColor(branding.primaryColor)
-  const requests: unknown[] = []
-  for (const sheet of managedSheets) {
-    const id = sheet.properties?.sheetId
-    const title = sheet.properties?.title as (typeof EXPECTED_TABS)[number]
-    if (id === undefined) continue
-    const endColumnIndex = Math.max(8, 1 + TAB_HEADERS[title].length)
-    requests.push(
-      {
-        repeatCell: {
-          range: { sheetId: id, startRowIndex: 0, endRowIndex: 3, startColumnIndex: 1, endColumnIndex },
-          cell: { userEnteredFormat: { backgroundColor: primary } },
-          fields: 'userEnteredFormat.backgroundColor',
-        },
-      },
-      {
-        repeatCell: {
-          range: { sheetId: id, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 1, endColumnIndex: 2 },
-          cell: {
-            userEnteredFormat: {
-              textFormat: { foregroundColor: foreground, fontSize: 18, bold: true },
-              horizontalAlignment: 'CENTER',
-              verticalAlignment: 'MIDDLE',
-            },
-          },
-          fields: 'userEnteredFormat(textFormat,horizontalAlignment,verticalAlignment)',
-        },
-      },
-      {
-        repeatCell: {
-          range: { sheetId: id, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 2, endColumnIndex },
-          cell: { userEnteredFormat: { textFormat: { foregroundColor: foreground, fontSize: 14, bold: true } } },
-          fields: 'userEnteredFormat.textFormat',
-        },
-      },
-      {
-        repeatCell: {
-          range: { sheetId: id, startRowIndex: 1, endRowIndex: 2, startColumnIndex: 2, endColumnIndex },
-          cell: { userEnteredFormat: { textFormat: { foregroundColor: accent, fontSize: 10, bold: true } } },
-          fields: 'userEnteredFormat.textFormat',
-        },
-      },
-      {
-        repeatCell: {
-          range: { sheetId: id, startRowIndex: 3, endRowIndex: 4, startColumnIndex: 1, endColumnIndex: 1 + TAB_HEADERS[title].length },
-          cell: {
-            userEnteredFormat: {
-              backgroundColor: primary,
-              textFormat: { foregroundColor: foreground, bold: true },
-              borders: { bottom: { style: 'SOLID_THICK', color: accent } },
-            },
-          },
-          fields: 'userEnteredFormat(backgroundColor,textFormat,borders)',
-        },
-      },
-      {
-        updateDimensionProperties: {
-          range: { sheetId: id, dimension: 'ROWS', startIndex: 0, endIndex: 1 },
-          properties: { pixelSize: 52 },
-          fields: 'pixelSize',
-        },
-      },
-      {
-        updateDimensionProperties: {
-          range: { sheetId: id, dimension: 'COLUMNS', startIndex: 1, endIndex: 2 },
-          properties: { pixelSize: 58 },
-          fields: 'pixelSize',
-        },
-      },
-    )
-  }
-  if (requests.length > 0) {
-    await request(`/v4/spreadsheets/${sheetId}:batchUpdate`, {
-      method: 'POST',
-      body: { requests, includeSpreadsheetInResponse: false },
-      idempotent: true,
-    })
-  }
 }
 
 export async function applyPipelineWorkbookBranding(
@@ -1447,10 +2114,15 @@ async function verifyPipelineTabsAndHeaders(runtime: GoogleWorkspaceRuntime, she
   }
   const parameters = new URLSearchParams({ majorDimension: 'ROWS' })
   for (const title of EXPECTED_TABS) {
+    const startColumn = title === 'Dashboard' ? 'P' : title === 'Start Here' ? 'C' : 'B'
     const endColumn = title === 'Dropdowns'
       ? 'ZZ'
+      : title === 'Dashboard'
+        ? 'Q'
+        : title === 'Start Here'
+          ? 'D'
       : String.fromCharCode('A'.charCodeAt(0) + TAB_HEADERS[title].length)
-    parameters.append('ranges', `'${title}'!B4:${endColumn}4`)
+    parameters.append('ranges', `'${title}'!${startColumn}4:${endColumn}4`)
   }
   const values = await googleSheetsJson<{ valueRanges?: Array<{ values?: unknown[][] }> }>(
     runtime,

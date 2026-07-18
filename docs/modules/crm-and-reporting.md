@@ -88,6 +88,10 @@ The managed workbook requires `Start Here`, `Organizations`, `Contacts`, `Opport
 
 Google protected ranges permit user edits only in `Opportunities!B5:M`. All other tabs, the opportunity headers, and record identifiers are generated and protected. `Calculations` and `Dashboard` derive reporting values from the projected CRM data.
 
+Workbook projection is also the visual authority. Each run removes stale merges, filters, banding, conditional rules, protected ranges, and embedded charts before applying the managed ClawPilot layout. Generated tables use fixed widths, alternating light rows, status and synchronization cues, and hidden record identity. The Opportunities table is visually marked as the writable surface and receives pipeline-scoped dropdown and numeric validation. The Dashboard stores its chart formulas in hidden `P:Q` helpers so report cards and charts remain stable without exposing calculation plumbing to the operator.
+
+Workbook branding uses the owning organization's configured primary and accent colors. REST-managed Sheets cannot reliably insert a private external image without a one-time human URL approval, so the header uses a deterministic `CP` mark by default and organization initials when a custom logo is configured; it never leaves a broken `#REF!` image formula in a generated workbook.
+
 The pipeline and CRM surfaces expose the workbook through its ClawPilot short link. The Pipeline header also creates, retries, or repairs the managed Sheet when the current owner has no usable link. That link does not bypass Google access controls.
 
 ## Synchronization

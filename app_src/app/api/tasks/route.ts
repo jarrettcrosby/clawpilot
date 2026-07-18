@@ -66,6 +66,7 @@ type TaskPatchBody = TaskBody & {
   crmDescription?: string
   crmDescriptionHash?: string
   _comment?: string
+  _commentId?: string
   _editCommentId?: string
   _editCommentText?: string
   _deleteCommentId?: string
@@ -878,10 +879,20 @@ export async function PATCH(req: NextRequest) {
     }
   }
   if (_comment) {
-    const comment: Comment = { id: crypto.randomUUID(), text: _comment, createdAt: now, timestamp: now, author: actor }
-    comments.push(comment)
-    addedComment = comment
-    activity.push({ type: 'comment', message: `Commented: "${_comment.slice(0, 60)}${_comment.length > 60 ? '...' : ''}"`, timestamp: now, ...base })
+    const requestedCommentId = String(body._commentId || '').trim().toLowerCase()
+    const commentId = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(requestedCommentId)
+      ? requestedCommentId
+      : crypto.randomUUID()
+    const existingComment = comments.find((comment) => comment.id === commentId)
+    if (existingComment && existingComment.text !== _comment) {
+      return NextResponse.json({ error: 'Comment id was already used for different content' }, { status: 409 })
+    }
+    if (!existingComment) {
+      const comment: Comment = { id: commentId, text: _comment, createdAt: now, timestamp: now, author: actor }
+      comments.push(comment)
+      addedComment = comment
+      activity.push({ type: 'comment', message: `Commented: "${_comment.slice(0, 60)}${_comment.length > 60 ? '...' : ''}"`, timestamp: now, ...base })
+    }
   }
   if (_checklistAdd) {
     const item: ChecklistItem = {

@@ -833,3 +833,125 @@ for (const viewport of MOBILE_VIEWPORTS) {
     })
   })
 }
+
+test.describe('agent discussion regression', () => {
+  test.beforeEach(async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 })
+  })
+
+  test('one user action sends once and keeps the latest response in view', async ({ page }) => {
+    const taskId = 'agent-discussion-regression-task'
+    const agentId = 'projects'
+    const historicalMessages = Array.from({ length: 14 }, (_, index) => ({
+      id: `history-${index}`,
+      role: index % 2 === 0 ? 'user' : 'agent',
+      text: `Historical message ${index + 1}`,
+      createdAt: `2026-07-17T12:${String(index).padStart(2, '0')}:00.000Z`,
+      taskId,
+    }))
+    let discussionPosts = 0
+
+    await page.route((url) => url.pathname === '/api/agents', async (route) => {
+      await route.fulfill({
+        json: {
+          agents: [{
+            id: agentId,
+            name: 'Projects',
+            owner: 'Execution',
+            status: 'ready',
+            summary: 'Plans and sequences assigned project work.',
+            kind: 'product',
+          }],
+          runtime: { provider: 'openai-codex', ready: true, status: 'ready', label: 'ChatGPT connected' },
+        },
+      })
+    })
+    await page.route((url) => url.pathname === '/api/tasks', async (route) => {
+      await route.fulfill({
+        json: [{
+          id: taskId,
+          title: 'Agent discussion regression',
+          desc: 'Verify one discussion request produces one visible response.',
+          status: 'backlog',
+          priority: 'medium',
+          category: 'projects',
+          assignedAgent: agentId,
+          checklist: [],
+          comments: [],
+          activity: [],
+          createdAt: '2026-07-17T12:00:00.000Z',
+          updatedAt: '2026-07-17T12:00:00.000Z',
+        }],
+      })
+    })
+    await page.route((url) => url.pathname === '/api/agents/repository-runs', async (route) => {
+      await route.fulfill({
+        json: {
+          runner: { enabled: false, ready: false, reason: 'Acceptance fixture', repository: '', baseBranch: 'dev', patchOnly: true },
+          run: null,
+        },
+      })
+    })
+    await page.route((url) => url.pathname === '/api/agents/threads', async (route) => {
+      if (route.request().method() === 'GET') {
+        await route.fulfill({ json: { messages: historicalMessages } })
+        return
+      }
+      discussionPosts += 1
+      const request = route.request().postDataJSON() as Record<string, unknown>
+      expect(request.mode).toBe('discuss')
+      expect(String(request.clientMessageId || '')).toMatch(/^[0-9a-f-]{36}$/i)
+      await new Promise((resolve) => setTimeout(resolve, 150))
+      await route.fulfill({
+        json: {
+          runtime: { provider: 'openai-codex', ready: true, status: 'ready', label: 'ChatGPT connected' },
+          thread: {
+            messages: [
+              ...historicalMessages,
+              {
+                id: `agent-discuss-${request.clientMessageId}-request`,
+                role: 'user',
+                text: String(request.text || ''),
+                createdAt: '2026-07-17T13:00:00.000Z',
+                taskId,
+              },
+              {
+                id: `agent-discuss-${request.clientMessageId}-result`,
+                role: 'agent',
+                text: 'Latest agent response',
+                createdAt: '2026-07-17T13:00:01.000Z',
+                taskId,
+              },
+            ],
+          },
+        },
+      })
+    })
+
+    await gotoApp(page, '/#agents')
+    await page.getByRole('button', { name: 'Discuss mode' }).click()
+    const composer = page.getByPlaceholder('Discuss this task with Projects')
+    await composer.fill('Review the integration decision.')
+
+    await page.evaluate(() => {
+      const input = document.querySelector('textarea[placeholder="Discuss this task with Projects"]')
+      const button = document.querySelector('button[aria-label="Send discussion message"]') as HTMLButtonElement | null
+      input?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }))
+      button?.click()
+    })
+
+    await expect(page.getByText('Latest agent response')).toBeVisible()
+    await expect.poll(() => discussionPosts).toBe(1)
+    const messageList = page.getByTestId('agent-thread-messages')
+    await expect.poll(() => messageList.evaluate((node) => (
+      node.scrollHeight <= node.clientHeight + 1 || node.scrollTop > 0
+    ))).toBeTruthy()
+    await expect.poll(() => messageList.evaluate((node) => {
+      const last = node.lastElementChild as HTMLElement | null
+      if (!last) return false
+      const container = node.getBoundingClientRect()
+      const item = last.getBoundingClientRect()
+      return item.bottom <= container.bottom + 1 && item.top >= container.top - 1
+    })).toBeTruthy()
+  })
+})

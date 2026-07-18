@@ -293,6 +293,23 @@ async function recordAgentResult(input: {
   }
   const nextAction = evidence?.nextAction || deriveNextAction(resultSummary)
   const commentId = dispatchId ? `agent-dispatch-${dispatchId}` : Date.now().toString()
+  const continuationDepth = Math.max(0, Math.trunc(Number(input.dispatchContinuationDepth) || 0))
+  const progressedChecklist = Boolean(evidence?.completedChecklistIds.length)
+    || Boolean(evidence?.changes.some((change) => /checklist item.*added/i.test(change)))
+  const correctiveContinuation = continuationDepth === 0
+    && !progressedChecklist
+    && Boolean(evidence?.deliverable.trim())
+  const nextChecklistItem = task.checklist.find((item) => !item.done)
+  const shouldQueueContinuation = Boolean(
+    boardId
+    && dispatchId
+    && planApplied
+    && evidence?.status === 'running'
+    && (progressedChecklist || correctiveContinuation)
+    && nextChecklistItem
+    && continuationDepth < 8
+    && isPostgresTaskStoreEnabled(),
+  )
   const substantiveDeliverable = evidence?.deliverable
     || (agentId === 'projects' && resultSummary.trim() ? resultSummary : '')
     || (!plan && (resultSummary.length >= 600 || resultSummary.split(/\r?\n/).length >= 10) ? resultSummary : '')
@@ -346,9 +363,11 @@ async function recordAgentResult(input: {
     author: agentId,
   }
   const existingCommentIndex = (task.comments || []).findIndex((entry) => entry.id === commentId)
-  const comments = existingCommentIndex >= 0
-    ? (task.comments || []).map((entry, entryIndex) => entryIndex === existingCommentIndex ? comment : entry)
-    : [...(task.comments || []), comment]
+  const comments = shouldQueueContinuation
+    ? task.comments || []
+    : existingCommentIndex >= 0
+      ? (task.comments || []).map((entry, entryIndex) => entryIndex === existingCommentIndex ? comment : entry)
+      : [...(task.comments || []), comment]
   const currentDispatch = task.execution?.agentDispatch
   const updatesCurrentDispatch = !dispatchId || !currentDispatch || currentDispatch.id === dispatchId
   const execution = updatesCurrentDispatch
@@ -381,42 +400,28 @@ async function recordAgentResult(input: {
   tasks[index] = {
     ...task,
     comments,
-    activity: activityAlreadyRecorded ? task.activity : [
-      ...(task.activity || []),
-      {
-        type: 'comment',
-        message: evidence
-          ? `Agent ${agentId} posted an evidence-backed task result.`
-          : `Agent ${agentId} posted a task response.`,
-        timestamp: now,
-        actor: agentId,
-        taskId: task.id,
-        taskTitle: task.title,
-        commentId,
-      },
-    ],
+    activity: shouldQueueContinuation || activityAlreadyRecorded
+      ? task.activity
+      : [
+          ...(task.activity || []),
+          {
+            type: 'comment',
+            message: evidence
+              ? `Agent ${agentId} posted an evidence-backed task result.`
+              : `Agent ${agentId} posted a task response.`,
+            timestamp: now,
+            actor: agentId,
+            taskId: task.id,
+            taskTitle: task.title,
+            commentId,
+          },
+        ],
     execution,
     updatedAt: now,
   }
 
   const dispatches: AgentDispatchEnqueueInput[] = []
-  const continuationDepth = Math.max(0, Math.trunc(Number(input.dispatchContinuationDepth) || 0))
-  const progressedChecklist = Boolean(evidence?.completedChecklistIds.length)
-    || Boolean(evidence?.changes.some((change) => /checklist item.*added/i.test(change)))
-  const correctiveContinuation = continuationDepth === 0
-    && !progressedChecklist
-    && Boolean(evidence?.deliverable.trim())
-  const nextChecklistItem = tasks[index].checklist.find((item) => !item.done)
-  if (
-    boardId
-    && dispatchId
-    && planApplied
-    && evidence?.status === 'running'
-    && (progressedChecklist || correctiveContinuation)
-    && nextChecklistItem
-    && continuationDepth < 8
-    && isPostgresTaskStoreEnabled()
-  ) {
+  if (shouldQueueContinuation && boardId && dispatchId && nextChecklistItem) {
     const prepared = prepareAgentDispatch({
       operatorId,
       boardId,
@@ -659,6 +664,10 @@ export async function POST(req: NextRequest) {
   const signedUserMode: 'discuss' | 'work' | null = worker
     ? null
     : requestedMode === 'work' ? 'work' : 'discuss'
+  const requestedClientMessageId = String(body?.clientMessageId || '').trim()
+  const clientMessageId = !worker && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(requestedClientMessageId)
+    ? requestedClientMessageId.toLowerCase()
+    : undefined
   const requestedDispatchId = String(body?.dispatchId || '').trim()
   if (requestedDispatchId && !worker) {
     return NextResponse.json({ ok: false, error: 'Agent dispatch metadata requires worker authorization' }, { status: 403 })
@@ -689,8 +698,12 @@ export async function POST(req: NextRequest) {
   ])
   const responderId = runtime.provider === 'openclaw' ? resolveResponderId(executionAgentId) : agentId
   const routing = { responder: responderId, channel: 'internal', priority: 'normal' }
-  const requestMessageId = dispatchId ? `agent-dispatch-${dispatchId}-request` : undefined
-  const resultMessageId = dispatchId ? `agent-dispatch-${dispatchId}-result` : undefined
+  const requestMessageId = dispatchId
+    ? `agent-dispatch-${dispatchId}-request`
+    : clientMessageId ? `agent-discuss-${clientMessageId}-request` : undefined
+  const resultMessageId = dispatchId
+    ? `agent-dispatch-${dispatchId}-result`
+    : clientMessageId ? `agent-discuss-${clientMessageId}-result` : undefined
   const beforeMessages = (Array.isArray(beforeThread?.messages) ? beforeThread.messages : []) as Array<{
     id: string
     role: string
@@ -700,8 +713,8 @@ export async function POST(req: NextRequest) {
   const existingRequest = requestMessageId
     ? beforeMessages.find((message) => message.id === requestMessageId) || null
     : null
-  const existingResponse = dispatchId
-    ? beforeMessages.find((message) => message.role === 'agent' && message.meta?.dispatchId === dispatchId)
+  const existingResponse = resultMessageId
+    ? beforeMessages.find((message) => message.id === resultMessageId)
     : null
   if (existingResponse) {
     const restored = dispatchId
@@ -716,6 +729,18 @@ export async function POST(req: NextRequest) {
       runtime,
       canonicalWorkItem: buildCanonicalWorkItem(restored?.task || task),
     })
+  }
+  if (clientMessageId && existingRequest) {
+    return NextResponse.json({
+      ok: true,
+      pending: true,
+      deduplicated: true,
+      thread: beforeThread,
+      userMessage: existingRequest,
+      agentMessage: null,
+      runtime,
+      canonicalWorkItem: buildCanonicalWorkItem(task),
+    }, { status: 202 })
   }
 
   const resultCommentId = dispatchId ? `agent-dispatch-${dispatchId}` : ''
@@ -863,7 +888,7 @@ export async function POST(req: NextRequest) {
     })
   }
 
-  const runId = dispatchId || crypto.randomUUID()
+  const runId = dispatchId || clientMessageId || crypto.randomUUID()
   const startedAt = new Date().toISOString()
 
   let afterUser = beforeThread

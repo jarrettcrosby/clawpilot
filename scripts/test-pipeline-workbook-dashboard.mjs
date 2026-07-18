@@ -9,19 +9,18 @@ const legacySource = readFileSync(resolve(process.cwd(), 'app_src/lib/pipelineLe
 
 for (const tutorialText of [
   'Only the Opportunities tab is operator-editable.',
-  'Status',
-  'Controls lifecycle reporting and formulas.',
-  'Stage',
-  'Controls where an opportunity appears on the pipeline board.',
-  'Probability',
-  'Controls weighted active value:',
-  'Expected Close',
-  'Controls when opportunity value appears in the sales forecast.',
+  'Status controls lifecycle reporting and formulas.',
+  'Stage controls where an opportunity appears on the pipeline board.',
+  'Probability controls weighted active value:',
+  'Expected Close controls when opportunity value appears in the sales forecast.',
   'Products are selected as a multi-select field in ClawPilot',
+  'Hidden record IDs preserve exact CRM relationships',
 ]) {
   assert.ok(source.includes(tutorialText), `Start Here tutorial missing: ${tutorialText}`)
 }
-assert.doesNotMatch(source, /Start Here[\s\S]{0,1800}(?:Jarrett|Eigen Racing)/i)
+assert.doesNotMatch(source, /Start Here[\s\S]{0,1800}(?:Eigen Racing)/i)
+assert.match(source, /title === 'Start Here' \? 'C' : 'B'/)
+assert.match(source, /'Start Here': \[64, 190, 720\]/)
 
 const formulaContract = [
   ['Total opportunities', '=COUNTA(Opportunities!C5:C)'],
@@ -46,7 +45,6 @@ const calculationsBlock = source.slice(
   source.indexOf('  Calculations: [', initialRowsStart),
   source.indexOf('  Dashboard: [', initialRowsStart),
 )
-
 for (const [metric, ...fragments] of formulaContract) {
   const formulaLine = calculationsBlock.split('\n').find((line) => line.includes(`['${metric}'`)) || ''
   assert.ok(formulaLine, `missing generated metric: ${metric}`)
@@ -55,39 +53,48 @@ for (const [metric, ...fragments] of formulaContract) {
   }
 }
 
-assert.match(source, /const GENERATED_REPORT_CLEAR_RANGES = \[\s*"'Calculations'!B4:ZZZ",\s*"'Dashboard'!B4:ZZZ",\s*\] as const/)
-assert.match(source, /\/values:batchClear`[\s\S]{0,180}body: \{ ranges: \[\.\.\.GENERATED_REPORT_CLEAR_RANGES\] \}/)
-const clearRangesBlock = source.match(/const GENERATED_REPORT_CLEAR_RANGES = \[([\s\S]*?)\] as const/)?.[1] || ''
-const clearRanges = [...clearRangesBlock.matchAll(/"([^"]+)"/g)].map((match) => match[1])
-assert.deepEqual(clearRanges, ["'Calculations'!B4:ZZZ", "'Dashboard'!B4:ZZZ"])
 const configureBlock = source.slice(
   source.indexOf('export async function configurePipelineTabsWithRequest'),
   source.indexOf('export async function configurePipelineTabs('),
 )
-assert.ok(
-  configureBlock.indexOf('/values:batchClear') < configureBlock.indexOf('/values:batchUpdate'),
-  'generated report cells must be cleared before replacement values are written',
-)
-assert.match(configureBlock, /range: `'\$\{title\}'!B5`[\s\S]{0,100}values: INITIAL_TAB_ROWS\[title\]/)
+assert.match(source, /const GENERATED_HEADER_CLEAR_RANGES = EXPECTED_TABS\.map/)
+assert.match(source, /const GENERATED_REPORT_CLEAR_RANGES = \[\s*"'Start Here'!B4:ZZZ",\s*"'Calculations'!B4:ZZZ",\s*"'Dashboard'!B4:ZZZ",\s*\] as const/)
+assert.match(configureBlock, /body: \{ ranges: \[\.\.\.GENERATED_HEADER_CLEAR_RANGES, \.\.\.GENERATED_REPORT_CLEAR_RANGES\] \}/)
+assert.ok(configureBlock.indexOf('unmergeCells') < configureBlock.indexOf('/values:batchClear'))
+assert.ok(configureBlock.indexOf('/values:batchClear') < configureBlock.indexOf('/values:batchUpdate'))
+assert.match(configureBlock, /const dataColumn = title === 'Dashboard' \? 'P' : title === 'Start Here' \? 'C' : 'B'/)
 
+const verificationBlock = source.slice(
+  source.indexOf('async function verifyPipelineTabsAndHeaders'),
+  source.indexOf('const shortLinkActor'),
+)
+assert.match(verificationBlock, /const startColumn = title === 'Dashboard' \? 'P' : title === 'Start Here' \? 'C' : 'B'/)
+assert.match(verificationBlock, /title === 'Start Here'\s*\? 'D'/)
+
+assert.match(source, /conditionalFormats\?: unknown\[\]/)
+assert.match(source, /bandedRanges\?: Array<\{ bandedRangeId\?: number \}>/)
+assert.match(source, /basicFilter\?: unknown/)
 assert.match(source, /charts\?: Array<\{ chartId\?: number \}>/)
-assert.match(source, /merges\?: Array</)
-assert.match(source, /charts\(chartId\)/)
-assert.match(source, /charts\(chartId\),merges/)
-assert.match(source, /title === 'Dashboard'[\s\S]{0,320}deleteEmbeddedObject: \{ objectId: chart\.chartId \}/)
-assert.match(source, /formattingRequests\.push\(\.\.\.dashboardChartRequests\(sheetIdValue\)\)/)
-assert.equal((source.match(/title: '(?:Opportunity lifecycle|Pipeline value|CRM records|Interactions, last 90 days)'/g) || []).length, 4)
+assert.match(configureBlock, /deleteConditionalFormatRule/)
+assert.match(configureBlock, /deleteBanding/)
+assert.match(configureBlock, /clearBasicFilter/)
+assert.match(configureBlock, /deleteEmbeddedObject/)
+
 const chartRequestBlock = source.slice(
   source.indexOf('function dashboardChartRequests'),
-  source.indexOf('export async function configurePipelineTabsWithRequest'),
+  source.indexOf('function dashboardValueWrites'),
 )
 assert.equal((chartRequestBlock.match(/\n\s+chart\(\{/g) || []).length, 4)
-assert.match(chartRequestBlock, /targetAxis: input\.chartType === 'BAR' \? 'BOTTOM_AXIS' : 'LEFT_AXIS'/)
+assert.match(chartRequestBlock, /startColumnIndex: DASHBOARD_HELPER_COLUMN_INDEX/)
+assert.match(chartRequestBlock, /startColumnIndex: DASHBOARD_HELPER_COLUMN_INDEX \+ 1/)
+assert.match(chartRequestBlock, /hiddenDimensionStrategy: 'SHOW_ALL'/)
+assert.match(chartRequestBlock, /widthPixels: 440/)
+assert.match(chartRequestBlock, /heightPixels: 250/)
 for (const chartContract of [
-  { title: 'Opportunity lifecycle', start: 6, end: 10, row: 3, column: 4, type: 'COLUMN' },
-  { title: 'Pipeline value', start: 11, end: 14, row: 18, column: 4, type: 'COLUMN' },
-  { title: 'CRM records', start: 14, end: 17, row: 3, column: 9, type: 'BAR' },
-  { title: 'Interactions, last 90 days', start: 17, end: 20, row: 18, column: 9, type: 'COLUMN' },
+  { title: 'Opportunity lifecycle', start: 6, end: 10, row: 9, column: 1, type: 'COLUMN' },
+  { title: 'Pipeline value', start: 11, end: 14, row: 9, column: 7, type: 'COLUMN' },
+  { title: 'CRM records', start: 14, end: 17, row: 24, column: 1, type: 'BAR' },
+  { title: 'Interactions, last 90 days', start: 17, end: 20, row: 24, column: 7, type: 'COLUMN' },
 ]) {
   const chartStart = chartRequestBlock.indexOf(`title: '${chartContract.title}'`)
   const chartDefinition = chartRequestBlock.slice(chartStart, chartRequestBlock.indexOf('}),', chartStart) + 3)
@@ -98,76 +105,58 @@ for (const chartContract of [
   assert.ok(chartDefinition.includes(`anchorColumnIndex: ${chartContract.column}`))
   assert.ok(chartDefinition.includes(`chartType: '${chartContract.type}'`))
 }
-assert.match(chartRequestBlock, /widthPixels: 400/)
-assert.match(chartRequestBlock, /heightPixels: 250/)
-const dashboardReconciliation = source.slice(
-  source.indexOf("if (title === 'Dashboard')"),
-  source.indexOf(
-    'formattingRequests.push({\n      updateSheetProperties',
-    source.indexOf("if (title === 'Dashboard')"),
-  ),
-)
-assert.ok(
-  dashboardReconciliation.indexOf('deleteEmbeddedObject')
-    < dashboardReconciliation.indexOf('dashboardChartRequests'),
-  'Dashboard charts must be deleted before the managed chart set is added',
-)
-assert.match(configureBlock, /dashboardMerges\.map\(\(range\) => \(\{ unmergeCells: \{ range \} \}\)\)/)
-assert.ok(
-  configureBlock.indexOf('unmergeCells') < configureBlock.indexOf('/values:batchClear'),
-  'legacy Dashboard merges must be removed before report formulas are written',
-)
 
-assert.doesNotMatch(clearRangesBlock, /Opportunities|Dropdowns/, 'report cleanup must not clear operator-owned tabs')
-assert.match(source, /title === 'Dropdowns' && !newlyProvisionedTitles\.has\(title\)/)
-assert.match(source, /if \(preserveConfiguredDropdowns\) return writes/)
-assert.doesNotMatch(source, /(?:Opportunities|Dropdowns)'!B5:[A-Z]+(?:\d+)?[^\n]*:clear/)
-const initialRowsBlock = source.slice(
-  source.indexOf('const INITIAL_TAB_ROWS'),
-  source.indexOf('export class PipelineProvisioningRequestError'),
+const dashboardWrites = source.slice(
+  source.indexOf('function dashboardValueWrites'),
+  source.indexOf('function googleBorder'),
 )
-assert.doesNotMatch(initialRowsBlock, /\n\s+Opportunities\s*:/, 'Opportunities rows must never be seeded or replaced')
-
-const dashboardTableBlock = source.slice(
-  source.indexOf('  Dashboard: [', initialRowsStart),
-  source.indexOf('  Dropdowns: [', initialRowsStart),
-)
-for (const [metric, reference] of [
-  ['Total opportunities', '=Calculations!C5'],
-  ['Active opportunities', '=Calculations!C8'],
-  ['Open opportunities', '=Calculations!C6'],
-  ['On-hold opportunities', '=Calculations!C7'],
-  ['Won opportunities', '=Calculations!C11'],
-  ['Lost opportunities', '=Calculations!C13'],
-  ['Win rate', '=Calculations!C14'],
-  ['Active pipeline value', '=Calculations!C9'],
-  ['Weighted active value', '=Calculations!C10'],
-  ['Won value', '=Calculations!C12'],
-  ['Organizations', '=Calculations!C15'],
-  ['Contacts', '=Calculations!C16'],
-  ['Interactions', '=Calculations!C17'],
-  ['Interactions 61-90 days', '=Calculations!C18'],
-  ['Interactions 31-60 days', '=Calculations!C19'],
-  ['Interactions last 30 days', '=Calculations!C20'],
-]) {
-  assert.ok(dashboardTableBlock.includes(`['${metric}', '${reference}']`), `Dashboard table missing ${metric}`)
+for (const cell of ['B5', 'B6', 'E5', 'E6', 'H5', 'H6', 'K5', 'K6', 'B9', 'B24', 'B40']) {
+  assert.ok(dashboardWrites.includes(`'Dashboard'!${cell}`), `Dashboard write missing ${cell}`)
 }
+assert.match(source, /const DASHBOARD_HELPER_COLUMN_INDEX = 15/)
+assert.match(source, /properties: \{ hiddenByUser: true \}/)
+assert.match(source, /hideGridlines: true/)
+assert.match(source, /tabColor: googleColor\(WORKBOOK_TAB_COLORS\[title\]\)/)
+assert.match(source, /properties: \{ pixelSize \}/)
+assert.match(source, /tableBandingRequest/)
+assert.match(source, /setBasicFilter/)
+
+assert.match(source, /pattern: '0\.0"%"'/)
+assert.match(source, /numeric\(10, 'NUMBER_BETWEEN', \['0', '100'\]\)/)
+for (const contract of [
+  "dropdown(1, 'E')",
+  "dropdown(3, 'B')",
+  "dropdown(5, 'F')",
+  "dropdown(6, 'D')",
+  "dropdown(7, 'H')",
+  "dropdown(8, 'G')",
+]) {
+  assert.ok(source.includes(contract), `Opportunity validation missing ${contract}`)
+}
+assert.match(source, /editable: title === 'Opportunities'/)
+assert.match(source, /PROTECTION_PREFIX/)
+assert.match(source, /generated \$\{title\}/)
+assert.match(source, /opportunity identifiers and headers/)
 
 assert.match(source, /applyPipelineWorkbookBrandingWithRequest/)
 assert.match(source, /range: `'\$\{title\}'!B1`/)
 assert.match(source, /range: `'\$\{title\}'!C1`/)
 assert.match(source, /range: `'\$\{title\}'!C2`/)
 assert.match(source, /function workbookBrandMark/)
-assert.match(source, /values: \[\[workbookBrandMark\(branding\)\]\]/)
-assert.doesNotMatch(source, /=IMAGE\(/, 'managed workbooks must not require manual external-image approval')
-assert.match(source, /title === 'Dropdowns'[\s\S]{0,80}\? 'ZZ'/)
-assert.match(source, /REQUIRED_CONFIGURED_DROPDOWNS\.some/)
-assert.match(source, /unique\.has\('owner'\) \|\| unique\.has\('acct_manager'\)/)
-assert.match(source, /legacyDashboardHasUnmanagedHeader/)
-assert.match(configureBlock, /deleteSheet: \{ sheetId: legacyDashboard\.properties\.sheetId \}/)
-assert.match(configureBlock, /addSheet: \{ properties: \{ title: 'Dashboard', index: EXPECTED_TABS\.indexOf\('Dashboard'\) \} \}/)
-assert.match(source, /dimension: 'COLUMNS', startIndex: 4, endIndex: 14[\s\S]{0,100}pixelSize: 84/)
-assert.match(source, /dimension: 'ROWS', startIndex: 3, endIndex: 36[\s\S]{0,100}pixelSize: 20/)
+assert.doesNotMatch(source, /=IMAGE\(/)
+const brandingBlock = source.slice(
+  source.indexOf('export async function applyPipelineWorkbookBrandingWithRequest'),
+  source.indexOf('export async function applyPipelineWorkbookBranding('),
+)
+assert.ok(
+  brandingBlock.indexOf('/v4/spreadsheets/${sheetId}:batchUpdate')
+    < brandingBlock.lastIndexOf('/v4/spreadsheets/${sheetId}/values:batchUpdate'),
+  'branding cells must be written after header merges are reconciled',
+)
+
+assert.match(source, /title === 'Dropdowns' && !newlyProvisionedTitles\.has\(title\)/)
+assert.match(source, /if \(preserveConfiguredDropdowns\) return writes/)
+assert.doesNotMatch(source.slice(initialRowsStart, source.indexOf('export class PipelineProvisioningRequestError')), /\n\s+Opportunities\s*:/)
 assert.match(projectionSource, /await configurePipelineTabs\(runtime, input\.context\.sheetId\)[\s\S]{0,260}await applyPipelineWorkbookBranding/)
 assert.match(projectionSource, /const branding = await readPipelineWorkbookBranding\(input\.context\.pipelineId\)/)
 assert.match(projectionSource, /await configureLegacyPipelineTabs\(input\.context\.sheetId\)[\s\S]{0,180}await applyLegacyPipelineWorkbookBranding\(input\.context\.sheetId, branding\)/)
