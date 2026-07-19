@@ -267,9 +267,35 @@ export async function readQuickBooksAttachmentDownloadUrl(input: {
   attachmentId: string
   thumbnail?: boolean
 }) {
+  const attachmentId = String(input.attachmentId || '').trim()
+  if (!attachmentId || attachmentId.length > 200 || /[^\x20-\x7e]/.test(attachmentId)) {
+    throw new Error('QuickBooks attachment id is invalid')
+  }
+
+  // Maton can read Attachable metadata even when its download resource returns
+  // a gateway error. A targeted query refreshes the short-lived Intuit URLs.
+  const escapedAttachmentId = attachmentId.replaceAll("'", "''")
+  const query = encodeURIComponent(`SELECT * FROM Attachable WHERE Id = '${escapedAttachmentId}'`)
+  try {
+    const attachmentPayload = await request(
+      `/quickbooks/v3/company/:realmId/query?query=${query}&minorversion=${MINOR_VERSION}`,
+      input.ownerEmail,
+      input.connectionId,
+    )
+    const source = parseQuickBooksAttachments(attachmentPayload)
+      .find((attachment) => attachment.id === attachmentId)
+      ?.sourcePayload as Record<string, unknown> | undefined
+    const queriedCandidate = input.thumbnail
+      ? source?.ThumbnailTempDownloadUri || source?.TempDownloadUri
+      : source?.TempDownloadUri
+    if (queriedCandidate) return validatedAttachmentUrl(queriedCandidate)
+  } catch {
+    // Fall through to Maton's dedicated download resource.
+  }
+
   const endpoint = input.thumbnail ? 'attachable-thumbnail' : 'download'
   const response = await requestResponse(
-    `/quickbooks/v3/company/:realmId/${endpoint}/${encodeURIComponent(input.attachmentId)}`,
+    `/quickbooks/v3/company/:realmId/${endpoint}/${encodeURIComponent(attachmentId)}`,
     input.ownerEmail,
     input.connectionId,
   )
@@ -283,7 +309,11 @@ export async function readQuickBooksAttachmentDownloadUrl(input: {
       ? parsed
       : String(parsed.TempDownloadUrl || parsed.TempDownloadUri || parsed.url || '')
   } catch {}
-  const url = new URL(candidate)
+  return validatedAttachmentUrl(candidate)
+}
+
+function validatedAttachmentUrl(value: unknown) {
+  const url = new URL(String(value || '').trim())
   if (url.protocol !== 'https:' || url.username || url.password) {
     throw new Error('QuickBooks returned an invalid attachment URL')
   }
