@@ -21,13 +21,26 @@ import BrandMark from '@/components/BrandMark'
 
 type LoginMode = 'email' | 'code'
 type PendingAction = 'request' | 'verify' | null
-type AuthResponse = { ok?: boolean; error?: string; message?: string; email?: string }
+type AuthResponse = {
+  ok?: boolean
+  error?: string
+  message?: string
+  email?: string
+  available?: boolean
+  entryUrl?: string
+}
 
 const INVITATION_TOKEN_STORAGE_KEY = 'clawpilot.invitationToken'
 
 function nextPath() {
   const requested = new URLSearchParams(window.location.search).get('next') || '/'
   return requested.startsWith('/') && !requested.startsWith('//') ? requested : '/'
+}
+
+async function createDemoSession() {
+  const response = await fetch('/api/auth/demo', { method: 'POST' })
+  const result = (await response.json().catch(() => ({}))) as AuthResponse
+  if (!response.ok || !result.ok) throw new Error(result.error || 'The demo is unavailable')
 }
 
 export default function LoginPage() {
@@ -41,6 +54,7 @@ export default function LoginPage() {
   const [resendSeconds, setResendSeconds] = useState(0)
   const [invitedFlow, setInvitedFlow] = useState(false)
   const [demoAvailable, setDemoAvailable] = useState(false)
+  const [demoEntryUrl, setDemoEntryUrl] = useState('')
   const [demoChecked, setDemoChecked] = useState(false)
   const [demoPending, setDemoPending] = useState(false)
 
@@ -63,10 +77,23 @@ export default function LoginPage() {
     let active = true
     fetch('/api/auth/demo', { cache: 'no-store' })
       .then((response) => response.json())
-      .then((result) => {
+      .then(async (result: AuthResponse) => {
         if (!active) return
         setDemoAvailable(result?.available === true)
+        setDemoEntryUrl(String(result?.entryUrl || ''))
         setDemoChecked(true)
+        const autoStart = new URLSearchParams(window.location.search).get('demo') === '1'
+        if (result?.available === true && autoStart) {
+          setDemoPending(true)
+          try {
+            await createDemoSession()
+            window.location.replace(nextPath())
+          } catch (demoError) {
+            if (!active) return
+            setError(demoError instanceof Error ? demoError.message : 'The demo is unavailable')
+            setDemoPending(false)
+          }
+        }
       })
       .catch(() => { if (active) setDemoChecked(true) })
     return () => { active = false }
@@ -162,9 +189,7 @@ export default function LoginPage() {
     setDemoPending(true)
     setError('')
     try {
-      const response = await fetch('/api/auth/demo', { method: 'POST' })
-      const result = (await response.json().catch(() => ({}))) as AuthResponse
-      if (!response.ok || !result.ok) throw new Error(result.error || 'The demo is unavailable')
+      await createDemoSession()
       window.location.replace(nextPath())
     } catch (demoError) {
       setError(demoError instanceof Error ? demoError.message : 'The demo is unavailable')
@@ -182,6 +207,7 @@ export default function LoginPage() {
     || (mode === 'email' && !email.trim().includes('@'))
     || (mode === 'code' && code.length !== 6)
   const showDemo = demoChecked && demoAvailable && !invitedFlow
+  const showDemoEntry = demoChecked && !demoAvailable && Boolean(demoEntryUrl) && !invitedFlow
   const showSignIn = demoChecked && !showDemo
 
   return (
@@ -319,6 +345,29 @@ export default function LoginPage() {
               {resendSeconds > 0 ? `Resend in ${resendSeconds}s` : 'Resend code'}
             </Button>
           </Stack>
+        ) : null}
+
+        {showDemoEntry && mode === 'email' ? (
+          <>
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, my: 2 }}>
+              <Box sx={{ height: '1px', flex: 1, bgcolor: 'rgba(255,255,255,0.1)' }} />
+              <Typography variant="caption" color="text.secondary">or</Typography>
+              <Box sx={{ height: '1px', flex: 1, bgcolor: 'rgba(255,255,255,0.1)' }} />
+            </Box>
+            <Button
+              fullWidth
+              component="a"
+              href={demoEntryUrl}
+              variant="outlined"
+              startIcon={<PlayArrowRounded />}
+              sx={{ minHeight: 44, borderRadius: 1, fontWeight: 750 }}
+            >
+              Explore demo account
+            </Button>
+            <Typography variant="body2" color="text.secondary" sx={{ mt: 1.5, textAlign: 'center' }}>
+              Open a ready-to-use workspace with synthetic CRM, pipeline, project, document, and accounting data.
+            </Typography>
+          </>
         ) : null}
 
         {showDemo ? (
