@@ -4,7 +4,6 @@ import { FormEvent, useEffect, useState } from 'react'
 import ArrowBackRounded from '@mui/icons-material/ArrowBackRounded'
 import LoginRounded from '@mui/icons-material/LoginRounded'
 import MailOutlineRounded from '@mui/icons-material/MailOutlineRounded'
-import PlayArrowRounded from '@mui/icons-material/PlayArrowRounded'
 import {
   Alert,
   Box,
@@ -26,8 +25,6 @@ type AuthResponse = {
   error?: string
   message?: string
   email?: string
-  available?: boolean
-  entryUrl?: string
 }
 
 const INVITATION_TOKEN_STORAGE_KEY = 'clawpilot.invitationToken'
@@ -53,9 +50,6 @@ export default function LoginPage() {
   const [pending, setPending] = useState<PendingAction>(null)
   const [resendSeconds, setResendSeconds] = useState(0)
   const [invitedFlow, setInvitedFlow] = useState(false)
-  const [demoAvailable, setDemoAvailable] = useState(false)
-  const [demoEntryUrl, setDemoEntryUrl] = useState('')
-  const [demoChecked, setDemoChecked] = useState(false)
   const [demoPending, setDemoPending] = useState(false)
 
   useEffect(() => {
@@ -74,28 +68,18 @@ export default function LoginPage() {
   }, [])
 
   useEffect(() => {
+    const autoStart = new URLSearchParams(window.location.search).get('demo') === '1'
+    if (!autoStart) return
+
     let active = true
-    fetch('/api/auth/demo', { cache: 'no-store' })
-      .then((response) => response.json())
-      .then(async (result: AuthResponse) => {
+    setDemoPending(true)
+    createDemoSession()
+      .then(() => { if (active) window.location.replace(nextPath()) })
+      .catch((demoError) => {
         if (!active) return
-        setDemoAvailable(result?.available === true)
-        setDemoEntryUrl(String(result?.entryUrl || ''))
-        setDemoChecked(true)
-        const autoStart = new URLSearchParams(window.location.search).get('demo') === '1'
-        if (result?.available === true && autoStart) {
-          setDemoPending(true)
-          try {
-            await createDemoSession()
-            window.location.replace(nextPath())
-          } catch (demoError) {
-            if (!active) return
-            setError(demoError instanceof Error ? demoError.message : 'The demo is unavailable')
-            setDemoPending(false)
-          }
-        }
+        setError(demoError instanceof Error ? demoError.message : 'The demo is unavailable')
+        setDemoPending(false)
       })
-      .catch(() => { if (active) setDemoChecked(true) })
     return () => { active = false }
   }, [])
 
@@ -184,19 +168,6 @@ export default function LoginPage() {
     setNotice('')
   }
 
-  const openDemo = async () => {
-    if (demoPending) return
-    setDemoPending(true)
-    setError('')
-    try {
-      await createDemoSession()
-      window.location.replace(nextPath())
-    } catch (demoError) {
-      setError(demoError instanceof Error ? demoError.message : 'The demo is unavailable')
-      setDemoPending(false)
-    }
-  }
-
   const primaryLabel = mode === 'email' ? 'Email sign-in code' : 'Verify and sign in'
   const primaryIcon = pending
     ? <CircularProgress size={16} color="inherit" />
@@ -206,9 +177,7 @@ export default function LoginPage() {
   const primaryDisabled = Boolean(pending)
     || (mode === 'email' && !email.trim().includes('@'))
     || (mode === 'code' && code.length !== 6)
-  const showDemo = demoChecked && demoAvailable && !invitedFlow
-  const showDemoEntry = demoChecked && !demoAvailable && Boolean(demoEntryUrl) && !invitedFlow
-  const showSignIn = demoChecked && !showDemo
+  const showSignIn = !demoPending
 
   return (
     <Box
@@ -244,7 +213,7 @@ export default function LoginPage() {
               ClawPilot
             </Typography>
             <Typography variant="body2" color="text.secondary">
-              {showDemo ? 'Interactive product demo' : invitedFlow ? 'Complete your sign in' : 'Operator sign in'}
+              {demoPending ? 'Opening demo workspace' : invitedFlow ? 'Complete your sign in' : 'Operator sign in'}
             </Typography>
           </Box>
         </Box>
@@ -252,7 +221,7 @@ export default function LoginPage() {
         {error ? <Alert severity="error" sx={{ mb: 2 }}>{error}</Alert> : null}
         {notice ? <Alert severity="success" sx={{ mb: 2 }}>{notice}</Alert> : null}
 
-        {!demoChecked ? (
+        {demoPending ? (
           <Box sx={{ minHeight: 120, display: 'grid', placeItems: 'center' }}>
             <CircularProgress size={24} />
           </Box>
@@ -345,48 +314,6 @@ export default function LoginPage() {
               {resendSeconds > 0 ? `Resend in ${resendSeconds}s` : 'Resend code'}
             </Button>
           </Stack>
-        ) : null}
-
-        {showDemoEntry && mode === 'email' ? (
-          <>
-            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, my: 2 }}>
-              <Box sx={{ height: '1px', flex: 1, bgcolor: 'rgba(255,255,255,0.1)' }} />
-              <Typography variant="caption" color="text.secondary">or</Typography>
-              <Box sx={{ height: '1px', flex: 1, bgcolor: 'rgba(255,255,255,0.1)' }} />
-            </Box>
-            <Button
-              fullWidth
-              component="a"
-              href={demoEntryUrl}
-              variant="outlined"
-              startIcon={<PlayArrowRounded />}
-              sx={{ minHeight: 44, borderRadius: 1, fontWeight: 750 }}
-            >
-              Explore demo account
-            </Button>
-            <Typography variant="body2" color="text.secondary" sx={{ mt: 1.5, textAlign: 'center' }}>
-              Open a ready-to-use workspace with synthetic CRM, pipeline, project, document, and accounting data.
-            </Typography>
-          </>
-        ) : null}
-
-        {showDemo ? (
-          <>
-            <Button
-              fullWidth
-              type="button"
-              variant="contained"
-              startIcon={demoPending ? <CircularProgress size={16} color="inherit" /> : <PlayArrowRounded />}
-              onClick={() => { void openDemo() }}
-              disabled={demoPending}
-              sx={{ minHeight: 44, borderRadius: 1, fontWeight: 750 }}
-            >
-              Explore the live demo
-            </Button>
-            <Typography variant="body2" color="text.secondary" sx={{ mt: 1.5, textAlign: 'center' }}>
-              Synthetic CRM, pipeline, projects, documents, and accounting data refresh automatically. External integrations are disabled.
-            </Typography>
-          </>
         ) : null}
 
       </Paper>

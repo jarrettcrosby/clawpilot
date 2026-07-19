@@ -55,12 +55,22 @@ assert.ok(crmPersistence.includes("input.emitSuiteCrmOutbox !== false && !isDemo
 const demoRoute = read('app_src/app/api/auth/demo/route.ts')
 assert.ok(demoRoute.includes("authMethod: 'demo'"))
 assert.ok(demoRoute.includes('assertDemoEnvironment()'))
-assert.ok(demoRoute.includes('entryUrl: demoEntryUrl()'))
+assert.ok(!demoRoute.includes('entryUrl: demoEntryUrl()'), 'public demo status cannot advertise the entry URL')
 
 const loginPage = read('app_src/app/login/page.tsx')
-assert.ok(loginPage.includes('Explore demo account'))
+assert.ok(!loginPage.includes('Explore demo'), 'normal login cannot advertise demo access')
 assert.ok(loginPage.includes("get('demo') === '1'"))
-assert.ok(loginPage.includes('await createDemoSession()'))
+assert.ok(loginPage.includes('createDemoSession()'))
+
+const demoEntryRoute = read('app_src/app/api/workspaces/demo-entry/route.ts')
+assert.ok(demoEntryRoute.includes('await requireRequestUser(req)'))
+assert.ok(demoEntryRoute.includes("new URL('/api/health', entryUrl)"))
+assert.ok(demoEntryRoute.includes('The demo workspace is temporarily unavailable.'))
+
+const workspaceSwitcher = read('app_src/components/workspaces/ActiveWorkspaceSwitcher.tsx')
+assert.ok(workspaceSwitcher.includes('Open demo workspace'))
+assert.ok(workspaceSwitcher.includes("fetch('/api/workspaces/demo-entry'"))
+assert.ok(workspaceSwitcher.includes('Synthetic data, isolated from your businesses'))
 
 const seed = read('scripts/seed-demo-environment.mjs')
 assert.ok(seed.includes("CLAWPILOT_DEMO_MODE !== '1'"))

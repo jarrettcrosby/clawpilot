@@ -1,6 +1,6 @@
 ---
 id: cp-ops-public-demo
-title: Public Demo Environment
+title: Demo Environment
 summary: Isolated synthetic ClawPilot environment, rolling-date dataset, reset controls, provider boundaries, and acceptance checks.
 status: active
 kind: operations-contract
@@ -9,13 +9,13 @@ tags: [demo, railway, synthetic-data, security, quickbooks]
 app_visible: true
 ---
 
-# Public Demo Environment
+# Demo Environment
 
 ## Purpose
 
-The public demo shows a complete ClawPilot workspace without copying production or development data. It uses a dedicated Railway `demo` environment, app instance, and Postgres database at `https://demo.aiapp.eigenracing.com`. It does not share application rows, sessions, provider credentials, databases, or backups with development or production.
+The member-accessible demo shows a complete ClawPilot workspace without copying production or development data. It uses a dedicated Railway `demo` environment, app instance, and Postgres database at `https://demo.aiapp.eigenracing.com`. It does not share application rows, sessions, provider credentials, databases, or backups with development or production.
 
-Visitors enter from **Explore demo account** on the normal ClawPilot login screen. That single action opens the demo host with `demo=1`; the demo host creates its own isolated browser session and opens the ready-to-use workspace automatically. A visitor does not enter a demo email, password, or magic code and does not need to know that the demo runs in a separate environment.
+The normal ClawPilot login screen never advertises or opens the demo. An authenticated member opens the active-business control in the application header and selects **Open demo workspace**. ClawPilot verifies that the isolated demo is healthy before navigating to the demo host with `demo=1`; the demo host then creates its own isolated browser session and opens the ready-to-use workspace automatically. If the demo hostname or service is unavailable, the member remains in their current workspace and sees a clear error.
 
 ## Synthetic Data Contract
 
@@ -35,7 +35,7 @@ Visitors enter from **Explore demo account** on the normal ClawPilot login scree
 
 ## Seed And Reset
 
-Railway predeploy applies all migrations, runs `npm run demo:seed`, and verifies the result before the app starts. The runtime refresh loop regenerates the dataset every 24 hours by default. A reset is transactional, but it invalidates existing public demo sessions; the visitor can immediately re-enter through **Explore the live demo**.
+Railway predeploy applies all migrations, runs `npm run demo:seed`, and verifies the result before the app starts. The runtime refresh loop regenerates the dataset every 24 hours by default. A reset is transactional, but it invalidates existing demo sessions; a member can immediately re-enter through **Open demo workspace** in ClawPilot.
 
 Manual operations:
 
@@ -51,7 +51,7 @@ The seeder refuses to run unless demo mode and environment guards pass. A local 
 1. Run `npm run test:demo` to verify synthetic identities, rolling date cohorts, migration controls, and provider restrictions.
 2. Run `railway run --environment development --service Postgres npm run demo:verify-postgres`. This creates a temporary database, applies every migration, seeds and verifies it, then drops only that generated database.
 3. Verify `https://demo.aiapp.eigenracing.com/api/health` reports current migrations and worker heartbeats.
-4. Use **Explore demo account** from the normal development or production login screen in desktop and mobile layouts. Confirm the automatic handoff opens CRM, pipeline, QuickBooks invoices and line items, projects, and documents with current relative dates.
+4. Confirm the normal development and production login screens contain no demo action. Sign in as a member, use **Open demo workspace** from the active-business control in desktop and mobile layouts, and confirm the automatic handoff opens CRM, pipeline, QuickBooks invoices and line items, projects, and documents with current relative dates.
 5. Confirm restricted settings return `403` and no external provider request or accounting write is possible.
 
 See [ClawPilot Environments and Deployment](clawpilot-environments.md), [QuickBooks Accounting Connector](../modules/quickbooks-accounting.md), and [Organization-rooted Tenancy](../decisions/0002-organization-rooted-tenancy.md).

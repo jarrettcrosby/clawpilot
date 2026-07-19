@@ -21,6 +21,7 @@ import AddBusinessRounded from '@mui/icons-material/AddBusinessRounded'
 import BusinessRounded from '@mui/icons-material/BusinessRounded'
 import CheckRounded from '@mui/icons-material/CheckRounded'
 import ExpandMoreRounded from '@mui/icons-material/ExpandMoreRounded'
+import ScienceRounded from '@mui/icons-material/ScienceRounded'
 import {
   announceWorkspaceChange,
   prefetchWorkspaceBootstrap,
@@ -57,12 +58,19 @@ type WorkspaceMutationResponse = {
   activeWorkspace?: ActiveWorkspace
 }
 
+type DemoEntryResponse = {
+  ok?: boolean
+  error?: string
+  entryUrl?: string
+}
+
 export default function ActiveWorkspaceSwitcher() {
   const [payload, setPayload] = useState<WorkspaceResponse | null>(null)
   const [anchor, setAnchor] = useState<HTMLElement | null>(null)
   const [switching, setSwitching] = useState<string | null>(null)
   const [createOpen, setCreateOpen] = useState(false)
   const [businessName, setBusinessName] = useState('')
+  const [demoOpening, setDemoOpening] = useState(false)
   const [error, setError] = useState('')
 
   useEffect(() => {
@@ -182,19 +190,35 @@ export default function ActiveWorkspaceSwitcher() {
     }
   }
 
-  const canSwitch = (payload?.workspaces.length || 0) > 1
-  const canOpen = canSwitch || Boolean(payload?.canCreateRoot)
+  async function openDemoWorkspace() {
+    if (switching || demoOpening) return
+    setDemoOpening(true)
+    setError('')
+    try {
+      const response = await fetch('/api/workspaces/demo-entry', { cache: 'no-store' })
+      const result = await response.json() as DemoEntryResponse
+      if (!response.ok || !result.ok || !result.entryUrl) {
+        throw new Error(result.error || 'The demo workspace is temporarily unavailable.')
+      }
+      window.location.href = result.entryUrl
+    } catch (caught) {
+      setAnchor(null)
+      setDemoOpening(false)
+      setError(caught instanceof Error ? caught.message : 'The demo workspace is temporarily unavailable.')
+    }
+  }
+
   return (
     <>
-      <Tooltip title={canOpen ? 'Switch or add business' : `Active business: ${current.organizationName}`}>
+      <Tooltip title="Switch business or open demo">
         <Button
           data-testid="active-workspace-switcher"
           aria-label={`Active business: ${current.organizationName}`}
-          aria-haspopup={canOpen ? 'menu' : undefined}
-          aria-expanded={canOpen ? Boolean(anchor) : undefined}
-          onClick={(event) => { if (canOpen) openWorkspaceMenu(event.currentTarget) }}
+          aria-haspopup="menu"
+          aria-expanded={Boolean(anchor)}
+          onClick={(event) => openWorkspaceMenu(event.currentTarget)}
           startIcon={<BusinessRounded sx={{ fontSize: 17 }} />}
-          endIcon={canOpen ? <ExpandMoreRounded sx={{ fontSize: 16 }} /> : undefined}
+          endIcon={<ExpandMoreRounded sx={{ fontSize: 16 }} />}
           sx={{
             minWidth: 0,
             maxWidth: { xs: 48, sm: 230 },
@@ -227,7 +251,7 @@ export default function ActiveWorkspaceSwitcher() {
       <Menu
         anchorEl={anchor}
         open={Boolean(anchor)}
-        onClose={() => { if (!switching) setAnchor(null) }}
+        onClose={() => { if (!switching && !demoOpening) setAnchor(null) }}
         anchorOrigin={{ vertical: 'bottom', horizontal: 'left' }}
         transformOrigin={{ vertical: 'top', horizontal: 'left' }}
         PaperProps={{
@@ -246,7 +270,7 @@ export default function ActiveWorkspaceSwitcher() {
             <MenuItem
               key={workspace.organizationId}
               selected={selected}
-              disabled={Boolean(switching)}
+              disabled={Boolean(switching) || demoOpening}
               onClick={() => void selectWorkspace(workspace.organizationId)}
               sx={{ py: 1.1 }}
             >
@@ -266,10 +290,10 @@ export default function ActiveWorkspaceSwitcher() {
             </MenuItem>
           )
         })}
-        {payload?.canCreateRoot && <Divider />}
+        <Divider />
         {payload?.canCreateRoot && (
           <MenuItem
-            disabled={Boolean(switching)}
+            disabled={Boolean(switching) || demoOpening}
             onClick={() => {
               setAnchor(null)
               setBusinessName('')
@@ -283,6 +307,23 @@ export default function ActiveWorkspaceSwitcher() {
             <ListItemText primary="Add business" primaryTypographyProps={{ variant: 'body2' }} />
           </MenuItem>
         )}
+        <MenuItem
+          disabled={Boolean(switching) || demoOpening}
+          onClick={() => { void openDemoWorkspace() }}
+          sx={{ py: 1.1 }}
+        >
+          <ListItemIcon sx={{ minWidth: 34 }}>
+            {demoOpening
+              ? <CircularProgress size={17} />
+              : <ScienceRounded sx={{ fontSize: 19, color: '#A8C7FA' }} />}
+          </ListItemIcon>
+          <ListItemText
+            primary="Open demo workspace"
+            secondary="Synthetic data, isolated from your businesses"
+            primaryTypographyProps={{ variant: 'body2' }}
+            secondaryTypographyProps={{ variant: 'caption' }}
+          />
+        </MenuItem>
       </Menu>
 
       <Dialog

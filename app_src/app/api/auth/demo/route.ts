@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { createBrowserSession, setBrowserSessionCookie } from '@/lib/authSessions'
-import { assertDemoEnvironment, demoEntryUrl, DEMO_USER_EMAIL, isDemoEnvironment } from '@/lib/demoMode'
+import { assertDemoEnvironment, DEMO_USER_EMAIL, isDemoEnvironment } from '@/lib/demoMode'
 
 export const dynamic = 'force-dynamic'
 export const revalidate = 0
@@ -14,7 +14,6 @@ export async function GET() {
   return json({
     ok: true,
     available: isDemoEnvironment(),
-    entryUrl: demoEntryUrl(),
   })
 }
 
