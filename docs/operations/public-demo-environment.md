@@ -15,6 +15,8 @@ app_visible: true
 
 The demo is a protected account inside each existing ClawPilot deployment. It is not a separate app instance, host, Railway environment, or public login path. An authorized signed-in user opens the active-business control and selects **Open demo account**. The current browser session switches to a complete synthetic customer example and can switch back to any normal business from the same control.
 
+The obsolete Railway `demo` environment was retired on July 19, 2026. Do not recreate a standalone demo service or restore `demo.aiapp.eigenracing.com`; development and production each seed the same protected account contract into their own database.
+
 The login screen never advertises or opens the demo. An invitation starts with demo access off. An organization administrator must explicitly enable **Demo account access** for that user; owners retain access by default.
 
 ## Synthetic Data Contract
