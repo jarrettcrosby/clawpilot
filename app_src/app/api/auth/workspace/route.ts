@@ -5,7 +5,7 @@ import {
 } from '@/lib/authSessions'
 import { requireRequestSession, requireRequestUser } from '@/lib/requestUser'
 import { BOARD_SELECTION_COOKIE, PIPELINE_SELECTION_COOKIE } from '@/lib/tenancy'
-import { isRootAppOwner } from '@/lib/users'
+import { appUserHasDemoAccess, isRootAppOwner } from '@/lib/users'
 import {
   createIndependentRootWorkspace,
   listWorkspaceMemberships,
@@ -36,12 +36,16 @@ function errorResponse(error: unknown) {
 export async function GET(req: NextRequest) {
   try {
     const actor = await requireRequestUser(req)
-    const memberships = await listWorkspaceMemberships(actor.email)
+    const [memberships, canAccessDemo] = await Promise.all([
+      listWorkspaceMemberships(actor.email),
+      appUserHasDemoAccess(actor.email),
+    ])
     return NextResponse.json({
       ok: true,
       activeOrganizationId: actor.organizationId,
       canCreateRoot: isRootAppOwner(actor),
-      workspaces: memberships,
+      canAccessDemo,
+      workspaces: canAccessDemo ? memberships : memberships.filter((membership) => !membership.isDemo),
     })
   } catch (error) {
     return errorResponse(error)

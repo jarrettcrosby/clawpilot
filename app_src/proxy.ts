@@ -153,9 +153,9 @@ export async function proxy(req: NextRequest) {
   }
 
   if (session) {
-    if (demoMutationIsRestricted(pathname, req.method)) {
+    if (demoMutationIsRestricted(pathname, req.method, session.activeWorkspaceOrganizationId)) {
       return NextResponse.json(
-        { ok: false, error: 'This action is disabled in the public demo. Demo data resets automatically.' },
+        { ok: false, error: 'This demo account is read-only.' },
         { status: 403 },
       )
     }

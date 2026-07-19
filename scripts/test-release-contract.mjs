@@ -459,10 +459,11 @@ for (const fragment of [
   'npm run db:migrate',
   'npm run demo:seed',
   'npm run demo:verify',
-  'RAILWAY_ENVIRONMENT_NAME:-',
 ]) {
   assert.ok(railwayPredeploy.includes(fragment), `Railway predeploy wrapper missing ${fragment}`)
 }
+assert.ok(!railwayPredeploy.includes('CLAWPILOT_DEMO_MODE'))
+assert.ok(!railwayPredeploy.includes('RAILWAY_ENVIRONMENT_NAME'))
 assert.ok(
   railwayPredeploy.indexOf('npm run db:migrate') < railwayPredeploy.indexOf('npm run demo:seed'),
   'demo data must only be seeded after migrations complete',

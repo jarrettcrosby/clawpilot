@@ -9,7 +9,7 @@ const { Client } = requireFromApp('pg')
 const sourceUrl = String(process.env.DATABASE_PUBLIC_URL || process.env.DATABASE_URL || '')
 if (!sourceUrl) throw new Error('DATABASE_PUBLIC_URL or DATABASE_URL is required')
 
-const databaseName = `clawpilot_demo_test_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`
+const databaseName = `clawpilot_demo_account_test_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`
 const adminUrl = new URL(sourceUrl)
 const testUrl = new URL(sourceUrl)
 testUrl.pathname = `/${databaseName}`
@@ -29,9 +29,6 @@ function run(script) {
       ...process.env,
       DATABASE_URL: testUrl.toString(),
       PGSSLMODE: external ? 'require' : process.env.PGSSLMODE,
-      CLAWPILOT_DEMO_MODE: '1',
-      CLAWPILOT_ALLOW_LOCAL_DEMO_SEED: '1',
-      RAILWAY_ENVIRONMENT_NAME: 'demo',
     },
     encoding: 'utf8',
   })
@@ -45,10 +42,10 @@ try {
   const setup = adminClient()
   await setup.connect()
   const stale = await setup.query(
-    `SELECT datname FROM pg_database WHERE datname LIKE 'clawpilot_demo_test_%'`,
+    `SELECT datname FROM pg_database WHERE datname LIKE 'clawpilot_demo_account_test_%'`,
   )
   for (const row of stale.rows) {
-    if (/^clawpilot_demo_test_[0-9]+_[0-9a-f]+$/.test(row.datname)) {
+    if (/^clawpilot_demo_account_test_[0-9]+_[0-9a-f]+$/.test(row.datname)) {
       await setup.query(`DROP DATABASE IF EXISTS ${row.datname} WITH (FORCE)`)
     }
   }
@@ -60,7 +57,7 @@ try {
   run('scripts/verify-demo-environment.mjs')
   run('scripts/seed-demo-environment.mjs')
   run('scripts/verify-demo-environment.mjs')
-  console.log('demo Postgres seed acceptance passed')
+  console.log('demo account Postgres seed acceptance passed')
 } finally {
   if (created) {
     const cleanup = adminClient()

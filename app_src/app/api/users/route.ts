@@ -68,6 +68,7 @@ export async function POST(req: NextRequest) {
       organizationName: body?.organizationName,
       parentOrganizationId: body?.parentOrganizationId,
       crmUserEnabled: body?.crmUserEnabled === true,
+      demoAccess: body?.demoAccess === true,
     })
     return NextResponse.json({
       ok: true,

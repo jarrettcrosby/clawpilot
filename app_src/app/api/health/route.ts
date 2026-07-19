@@ -14,7 +14,6 @@ import { effectiveDocumentEmbeddingConfiguration } from '@/lib/documentEmbedding
 import { validateShortLinkConfiguration } from '@/lib/shortlinks'
 import { readSuiteCrmWorkerHeartbeat } from '@/lib/persistence/crm'
 import { suiteCrmBaseUrl } from '@/lib/crm/suiteCrmClient'
-import { isDemoEnvironment } from '@/lib/demoMode'
 
 const DEV_LOG_PATH = '/tmp/clawd-app-dev.log'
 const FALLBACK_LOG_PATH = '/tmp/clawd-app.log'
@@ -76,7 +75,6 @@ export async function GET() {
     let crm: Record<string, unknown> = { status: 'disabled' }
     let knowledgeWorkers: Array<Record<string, unknown>> = []
     const repositoryRunner = getRepositoryRunnerConfiguration()
-    const demoEnvironment = isDemoEnvironment()
 
     if (cloudProvider === 'railway' && storage !== 'postgres') {
       errors.push('Railway runtime requires Postgres storage.')
@@ -108,16 +106,16 @@ export async function GET() {
         errors.push('Agent credential store is unreachable.')
       }
     }
-    if (!demoEnvironment && String(process.env.MATON_API_KEY || '').length < 16) {
+    if (String(process.env.MATON_API_KEY || '').length < 16) {
       errors.push('Hosted runtime Maton credential is missing or too short.')
     }
-    if (!demoEnvironment && String(process.env.MATON_GMAIL_CONNECTION_ID || '').length < 8) {
+    if (String(process.env.MATON_GMAIL_CONNECTION_ID || '').length < 8) {
       errors.push('Hosted runtime Maton Gmail connection is not configured.')
     }
     if (repositoryRunner.enabled && !repositoryRunner.ready) {
       errors.push(repositoryRunner.reason)
     }
-    if (!demoEnvironment && !String(process.env.CLAWPILOT_MAIL_FROM || '').includes('@')) {
+    if (!String(process.env.CLAWPILOT_MAIL_FROM || '').includes('@')) {
       errors.push('Hosted runtime ClawPilot mail sender is not configured.')
     }
     try {
@@ -126,7 +124,7 @@ export async function GET() {
     } catch {
       errors.push('Hosted runtime public URL is not configured.')
     }
-    if (!demoEnvironment && String(process.env.PIPELINE_SHEET_ID || '').length < 20) {
+    if (String(process.env.PIPELINE_SHEET_ID || '').length < 20) {
       errors.push('Hosted runtime pipeline Sheet is not configured.')
     }
     if (cloudProvider === 'railway' && String(process.env.PIPELINE_OUTBOX_WORKER_SECRET || '').length < 32) {
@@ -213,6 +211,7 @@ export async function GET() {
           quickbooks_reports_migration_applied: boolean
           quickbooks_write_control_migration_applied: boolean
           demo_quickbooks_crm_migration_applied: boolean
+          demo_workspace_account_migration_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -468,6 +467,11 @@ export async function GET() {
                 FROM schema_migrations
                 WHERE filename = '0065_demo_and_quickbooks_crm_reconciliation.sql'
               ) AS demo_quickbooks_crm_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0066_demo_workspace_account.sql'
+              ) AS demo_workspace_account_migration_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -530,6 +534,7 @@ export async function GET() {
             && row?.quickbooks_reports_migration_applied
             && row?.quickbooks_write_control_migration_applied
             && row?.demo_quickbooks_crm_migration_applied
+            && row?.demo_workspace_account_migration_applied
             && row?.migration_checksums_present
           ),
         }
@@ -584,6 +589,7 @@ export async function GET() {
           || !row?.quickbooks_reports_migration_applied
           || !row?.quickbooks_write_control_migration_applied
           || !row?.demo_quickbooks_crm_migration_applied
+          || !row?.demo_workspace_account_migration_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')

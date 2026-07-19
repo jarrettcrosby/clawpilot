@@ -6,7 +6,7 @@ import { buildDemoDataset } from './demo-dataset.mjs'
 const requireFromApp = createRequire(new URL('../app_src/package.json', import.meta.url))
 const { Pool } = requireFromApp('pg')
 
-const DEMO_EMAIL = 'demo@clawpilot.example'
+const DEMO_EMAIL = 'demo-system@clawpilot.example'
 const ROOT_ORGANIZATION_ID = '10000000-0000-4000-8000-000000000001'
 const PIPELINE_ID = '20000000-0000-4000-8000-000000000001'
 const BOARD_ID = '30000000-0000-4000-8000-000000000001'
@@ -17,11 +17,7 @@ function fail(message) {
 }
 
 if (!process.env.DATABASE_URL) fail('DATABASE_URL is required')
-if (process.env.CLAWPILOT_DEMO_MODE !== '1') fail('CLAWPILOT_DEMO_MODE=1 is required')
 const environment = String(process.env.RAILWAY_ENVIRONMENT_NAME || '').toLowerCase()
-if (environment !== 'demo' && process.env.CLAWPILOT_ALLOW_LOCAL_DEMO_SEED !== '1') {
-  fail('RAILWAY_ENVIRONMENT_NAME=demo is required outside an explicitly allowed local seed')
-}
 
 const dataset = buildDemoDataset(process.env.DEMO_ANCHOR_DATE || '')
 const sslMode = String(process.env.PGSSLMODE || process.env.DATABASE_SSL || '').toLowerCase()
@@ -50,15 +46,43 @@ function isoDaysAgo(days, hour = 15) {
 async function main() {
   const client = await pool.connect()
   try {
-    await client.query(`SELECT pg_advisory_lock(hashtext('clawpilot-demo-seed'))`)
+    await client.query(`SELECT pg_advisory_lock(hashtext('clawpilot-demo-account-seed'))`)
     await client.query('BEGIN')
-    await client.query(`TRUNCATE TABLE app_users, workspace_organizations RESTART IDENTITY CASCADE`)
-    await client.query(`TRUNCATE TABLE app_settings, app_objects, execution_runs, execution_results, demo_dataset_metadata RESTART IDENTITY CASCADE`)
+    await client.query(
+      `DELETE FROM app_documents WHERE workspace_organization_id = $1::uuid`,
+      [ROOT_ORGANIZATION_ID],
+    )
+    await client.query(
+      `DELETE FROM tasks
+       WHERE board_id IN (
+         SELECT id FROM project_boards WHERE workspace_organization_id = $1::uuid
+       )`,
+      [ROOT_ORGANIZATION_ID],
+    )
+    await client.query(
+      `DELETE FROM organization_quickbooks_connections WHERE organization_id = $1::uuid`,
+      [ROOT_ORGANIZATION_ID],
+    )
+    await client.query(
+      `DELETE FROM pipeline_spaces WHERE workspace_organization_id = $1::uuid`,
+      [ROOT_ORGANIZATION_ID],
+    )
+    await client.query(
+      `DELETE FROM project_boards WHERE workspace_organization_id = $1::uuid`,
+      [ROOT_ORGANIZATION_ID],
+    )
+    await client.query(`DELETE FROM demo_dataset_metadata WHERE dataset_key IN ('workspace-demo', 'public-demo')`)
 
     const root = await client.query(
       `INSERT INTO workspace_organizations (
-         id, name, organization_type, created_at, updated_at
-       ) VALUES ($1::uuid, 'Northstar Operating Group', 'root', $2::timestamptz, $2::timestamptz)
+         id, parent_id, name, organization_type, is_demo, created_at, updated_at
+       ) VALUES ($1::uuid, NULL, 'ClawPilot Demo Company', 'root', true, $2::timestamptz, $2::timestamptz)
+       ON CONFLICT (id) DO UPDATE SET
+         parent_id = NULL,
+         name = EXCLUDED.name,
+         organization_type = 'root',
+         is_demo = true,
+         updated_at = EXCLUDED.updated_at
        RETURNING reference_code`,
       [ROOT_ORGANIZATION_ID, dataset.generatedAt],
     )
@@ -69,18 +93,34 @@ async function main() {
          organization_id, organization_name, crm_user_enabled, reference_code,
          invited_at, activated_at, last_login_at, created_at, updated_at
        ) VALUES (
-         $1, 'owner', 'active', 'Demo Operator', 'Business Owner', 'America/New_York', 'en-US',
-         $2::jsonb, $3::uuid, 'Northstar Operating Group', false, NULL,
+         $1, 'member', 'active', 'ClawPilot Demo Team', 'Demo account steward', 'America/New_York', 'en-US',
+         $2::jsonb, $3::uuid, 'ClawPilot Demo Company', false, NULL,
          $4::timestamptz, $4::timestamptz, $4::timestamptz, $4::timestamptz, $4::timestamptz
-       )`,
+       )
+       ON CONFLICT (email) DO UPDATE SET
+         role = 'member',
+         status = 'active',
+         display_name = EXCLUDED.display_name,
+         job_title = EXCLUDED.job_title,
+         timezone = EXCLUDED.timezone,
+         locale = EXCLUDED.locale,
+         permissions = EXCLUDED.permissions,
+         organization_id = EXCLUDED.organization_id,
+         organization_name = EXCLUDED.organization_name,
+         crm_user_enabled = false,
+         updated_at = EXCLUDED.updated_at`,
       [DEMO_EMAIL, JSON.stringify({
+        accessDemo: false,
         inviteUsers: false,
         manageUserAccess: false,
-        createBoards: true,
-        createPipelines: true,
+        createBoards: false,
+        createPipelines: false,
         viewFullReleaseHistory: false,
         manageBackups: false,
         manageLinks: false,
+        viewAccounting: true,
+        prepareAccounting: false,
+        approveAccounting: false,
         viewOrganizationAudit: true,
         viewSystemAudit: false,
       }), ROOT_ORGANIZATION_ID, dataset.generatedAt],
@@ -93,15 +133,26 @@ async function main() {
       `INSERT INTO app_user_organization_memberships (
          user_email, organization_id, role, permissions, status, is_default,
          created_by, updated_by, created_at, updated_at
-       ) VALUES ($1, $2::uuid, 'owner', $3::jsonb, 'active', true, $1, $1, $4::timestamptz, $4::timestamptz)`,
+       ) VALUES ($1, $2::uuid, 'owner', $3::jsonb, 'active', true, $1, $1, $4::timestamptz, $4::timestamptz)
+       ON CONFLICT (user_email, organization_id) DO UPDATE SET
+         role = 'owner',
+         permissions = EXCLUDED.permissions,
+         status = 'active',
+         is_default = true,
+         updated_by = EXCLUDED.updated_by,
+         updated_at = EXCLUDED.updated_at`,
       [DEMO_EMAIL, ROOT_ORGANIZATION_ID, JSON.stringify({
+        accessDemo: true,
         inviteUsers: false,
         manageUserAccess: false,
-        createBoards: true,
-        createPipelines: true,
+        createBoards: false,
+        createPipelines: false,
         viewFullReleaseHistory: false,
         manageBackups: false,
         manageLinks: false,
+        viewAccounting: true,
+        prepareAccounting: false,
+        approveAccounting: false,
         viewOrganizationAudit: true,
         viewSystemAudit: false,
       }), dataset.generatedAt],
@@ -109,7 +160,12 @@ async function main() {
     await client.query(
       `INSERT INTO workspace_organization_branding (
          organization_id, primary_color, accent_color, updated_by, created_at, updated_at
-       ) VALUES ($1::uuid, '#1F2430', '#A8C7FA', $2, $3::timestamptz, $3::timestamptz)`,
+       ) VALUES ($1::uuid, '#1F2430', '#A8C7FA', $2, $3::timestamptz, $3::timestamptz)
+       ON CONFLICT (organization_id) DO UPDATE SET
+         primary_color = EXCLUDED.primary_color,
+         accent_color = EXCLUDED.accent_color,
+         updated_by = EXCLUDED.updated_by,
+         updated_at = EXCLUDED.updated_at`,
       [ROOT_ORGANIZATION_ID, DEMO_EMAIL, dataset.generatedAt],
     )
 
@@ -117,7 +173,7 @@ async function main() {
       `INSERT INTO pipeline_spaces (
          id, name, owner_email, is_default, sync_enabled, projection,
          workspace_organization_id, provisioning_status, created_at, updated_at
-       ) VALUES ($1::uuid, 'Northstar Revenue Pipeline', $2, true, false, $3::jsonb,
+       ) VALUES ($1::uuid, 'Demo Revenue Pipeline', $2, true, false, $3::jsonb,
          $4::uuid, 'not_requested', $5::timestamptz, $5::timestamptz)`,
       [PIPELINE_ID, DEMO_EMAIL, JSON.stringify({
         syncedAt: dataset.generatedAt,
@@ -139,7 +195,7 @@ async function main() {
     await client.query(
       `INSERT INTO project_boards (
          id, name, owner_email, is_default, workspace_organization_id, created_at, updated_at
-       ) VALUES ($1::uuid, 'Northstar Operations', $2, true, $3::uuid, $4::timestamptz, $4::timestamptz)`,
+       ) VALUES ($1::uuid, 'Demo Operations Board', $2, true, $3::uuid, $4::timestamptz, $4::timestamptz)`,
       [BOARD_ID, DEMO_EMAIL, ROOT_ORGANIZATION_ID, dataset.generatedAt],
     )
     await client.query(
@@ -148,9 +204,13 @@ async function main() {
       [BOARD_ID, DEMO_EMAIL, dataset.generatedAt],
     )
     await client.query(
-      `INSERT INTO app_user_workspace_preferences (
+       `INSERT INTO app_user_workspace_preferences (
          user_email, workspace_organization_id, default_board_id, default_pipeline_id, created_at, updated_at
-       ) VALUES ($1, $2::uuid, $3::uuid, $4::uuid, $5::timestamptz, $5::timestamptz)`,
+       ) VALUES ($1, $2::uuid, $3::uuid, $4::uuid, $5::timestamptz, $5::timestamptz)
+       ON CONFLICT (user_email, workspace_organization_id) DO UPDATE SET
+         default_board_id = EXCLUDED.default_board_id,
+         default_pipeline_id = EXCLUDED.default_pipeline_id,
+         updated_at = EXCLUDED.updated_at`,
       [DEMO_EMAIL, ROOT_ORGANIZATION_ID, BOARD_ID, PIPELINE_ID, dataset.generatedAt],
     )
 
@@ -163,8 +223,8 @@ async function main() {
          created_by, updated_by, created_at, updated_at
        ) VALUES (
          $1::uuid, $2::uuid, $3, 'workspace:demo-root', 'workspace:demo-root', $4,
-         $5::uuid, 'workspace_root', 'Northstar Operating Group', 'Parent organization', 'Demo Operator',
-         'Synthetic parent organization for the public ClawPilot demo.', $6::jsonb, $7,
+         $5::uuid, 'workspace_root', 'ClawPilot Demo Company', 'Parent organization', 'ClawPilot Demo Team',
+         'Synthetic parent organization for the ClawPilot demo account.', $6::jsonb, $7,
          'synced', $8::timestamptz, $9, $9, $8::timestamptz, $8::timestamptz
        )`,
       [crmRootId, PIPELINE_ID, 'demo-suitecrm-root', rootReference, ROOT_ORGANIZATION_ID,
@@ -185,7 +245,7 @@ async function main() {
            created_by, updated_by, created_at, updated_at
          ) VALUES (
            $1::uuid, $2::uuid, $3, $4, $4, $5::uuid, 'customer', $6, $7,
-           'Customer', 'Demo Operator', $8, $9, $10, $11, 'US',
+           'Customer', 'ClawPilot Demo Team', $8, $9, $10, $11, 'US',
            'Synthetic customer account with activity in the rolling 90-day demo window.',
            $12::jsonb, $13, 'synced', $14::timestamptz, $15, $15, $14::timestamptz, $14::timestamptz
          )`,
@@ -211,7 +271,7 @@ async function main() {
            sync_status, suitecrm_synced_at, created_by, updated_by, created_at, updated_at
          ) VALUES (
            $1::uuid, $2::uuid, $3::uuid, $4, $5, $6, 'B', $7, $8, $9,
-           'Customer', 'Demo Operator', $10, $11, $12,
+           'Customer', 'ClawPilot Demo Team', $10, $11, $12,
            'Synthetic CRM contact associated with a demo customer account.',
            $13::jsonb, $14, 'synced', $15::timestamptz, $16, $16, $15::timestamptz, $15::timestamptz
          )`,
@@ -257,7 +317,7 @@ async function main() {
            expected_close, description, source_payload, source_hash, sync_status, suitecrm_synced_at,
            created_by, updated_by, created_at, updated_at
          ) VALUES (
-           $1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7, 'Demo Operator', $8,
+           $1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7, 'ClawPilot Demo Team', $8,
            $9, $10, 'Referral', $11, $12, $13::date,
            'Synthetic opportunity demonstrating products, touchpoints, and stage-weighted forecasting.',
            $14::jsonb, $15, 'synced', $16::timestamptz, $17, $17, $16::timestamptz, $16::timestamptz
@@ -290,7 +350,7 @@ async function main() {
            sync_status, suitecrm_synced_at, created_by, updated_by, created_at, updated_at
          ) VALUES (
            $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6, $7, $8, $9,
-           'Demo Operator', $10::timestamptz, $11, $12, 'logged', $13::jsonb,
+           'ClawPilot Demo Team', $10::timestamptz, $11, $12, 'logged', $13::jsonb,
            $13::jsonb, $14, 'synced', $10::timestamptz, $15, $15, $10::timestamptz, $10::timestamptz
          )`,
         [uuid('8', index + 1), PIPELINE_ID, organizationId, contactId, opportunityId,
@@ -301,17 +361,17 @@ async function main() {
     }
 
     const taskDefinitions = [
-      ['demo-task-1', 'Review Bluebird expansion proposal', 'in-progress', 'high', 4],
-      ['demo-task-2', 'Prepare Harbor reporting rollout', 'todo', 'high', 9],
+      ['demo-task-1', 'Review Acorn Ridge expansion proposal', 'in-progress', 'high', 4],
+      ['demo-task-2', 'Prepare Cedar Harbor reporting rollout', 'todo', 'high', 9],
       ['demo-task-3', 'Reconcile June operating statements', 'review', 'medium', 18],
       ['demo-task-4', 'Document customer onboarding playbook', 'backlog', 'medium', 33],
-      ['demo-task-5', 'Confirm Summit pilot stakeholders', 'done', 'low', 47],
+      ['demo-task-5', 'Confirm Highline pilot stakeholders', 'done', 'low', 47],
     ]
     for (const [id, title, status, priority, daysAgo] of taskDefinitions) {
       const createdAt = isoDaysAgo(Number(daysAgo) + 7)
       const updatedAt = isoDaysAgo(Number(daysAgo))
       const payload = {
-        id, title, desc: 'Synthetic project card showing a realistic operator workflow in the public demo.',
+        id, title, desc: 'Synthetic project card showing a realistic operator workflow in the demo account.',
         status, priority, category: 'operations', tags: ['demo', 'customer-work'], assignedAgent: null,
         checklist: [{ id: `${id}-check-1`, text: 'Review linked CRM context', done: status === 'done' }],
         comments: [], activity: [], createdAt, updatedAt,
@@ -328,7 +388,7 @@ async function main() {
 
     const documents = [
       ['demo-weekly-brief', 'Weekly Pipeline Brief', 'pipeline-brief', 'A concise view of revenue movement, aging opportunities, and recommended follow-ups across the synthetic 90-day history.'],
-      ['demo-account-plan', 'Bluebird Account Plan', 'account-plan', 'Stakeholders, products, recent interactions, commercial goals, and the next decision for Bluebird Retail Co.'],
+      ['demo-account-plan', 'Acorn Ridge Account Plan', 'account-plan', 'Stakeholders, products, recent interactions, commercial goals, and the next decision for Acorn Ridge Retail.'],
       ['demo-finance-review', 'Monthly Finance Review', 'finance-review', 'Revenue, receivables, expenses, invoice aging, and reconciliation notes generated from synthetic QuickBooks records.'],
     ]
     for (const [sourceKey, title, category, content] of documents) {
@@ -352,13 +412,13 @@ async function main() {
          write_mode, crm_pipeline_id, crm_customer_sync_enabled, crm_product_sync_enabled,
          last_catalog_synced_at, last_crm_synced_at, created_at, updated_at
        ) VALUES (
-         $1::uuid, $2, 'demo-synthetic-no-provider', 'Northstar Operating Group', 'US',
+         $1::uuid, $2, 'demo-synthetic-no-provider', 'ClawPilot Demo Company', 'US',
          $3::jsonb, 'active', false, $4::timestamptz, $2, $2, 'disabled', $5::uuid,
          true, true, $4::timestamptz, $4::timestamptz, $4::timestamptz, $4::timestamptz
        )`,
       [ROOT_ORGANIZATION_ID, DEMO_EMAIL, JSON.stringify({
-        legalName: 'Northstar Operating Group LLC',
-        email: 'finance@northstar-demo.example.com',
+        legalName: 'ClawPilot Demo Company LLC',
+        email: 'finance@demo.clawpilot.example',
         phone: '+1-202-555-0199',
         address: { lines: ['100 Demo Avenue'], city: 'Boston', region: 'MA', postalCode: '02110', country: 'US' },
         synthetic: true,
@@ -380,7 +440,7 @@ async function main() {
            organization_id, quickbooks_item_id, name, fully_qualified_name, item_type, sku,
            description, unit_price, purchase_cost, active, taxable, source_payload, synced_at
          ) VALUES ($1::uuid, $2, $3, $3, $4, $5,
-           'Synthetic product or service used by the public demo.', $6, $7, true, false, $8::jsonb, $9::timestamptz)`,
+           'Synthetic product or service used by the demo account.', $6, $7, true, false, $8::jsonb, $9::timestamptz)`,
         [ROOT_ORGANIZATION_ID, product.providerId, product.name, product.type, product.sku,
           product.price, product.cost, JSON.stringify({ Id: product.providerId, Name: product.name, Type: product.type, synthetic: true }), dataset.generatedAt],
       )
@@ -556,10 +616,59 @@ async function main() {
     )
 
     await client.query(
+      `INSERT INTO project_board_members (
+         board_id, user_email, access_role, shared_by, created_at, updated_at
+       )
+       SELECT $1::uuid, membership.user_email,
+         CASE WHEN membership.user_email = $2 THEN 'editor' ELSE 'viewer' END,
+         $2, $3::timestamptz, $3::timestamptz
+       FROM app_user_organization_memberships membership
+       WHERE membership.organization_id = $4::uuid
+         AND membership.status = 'active'
+       ON CONFLICT (board_id, user_email) DO UPDATE SET
+         access_role = EXCLUDED.access_role,
+         shared_by = EXCLUDED.shared_by,
+         updated_at = EXCLUDED.updated_at`,
+      [BOARD_ID, DEMO_EMAIL, dataset.generatedAt, ROOT_ORGANIZATION_ID],
+    )
+    await client.query(
+      `INSERT INTO pipeline_space_members (
+         pipeline_id, user_email, access_role, shared_by, created_at, updated_at
+       )
+       SELECT $1::uuid, membership.user_email,
+         CASE WHEN membership.user_email = $2 THEN 'editor' ELSE 'viewer' END,
+         $2, $3::timestamptz, $3::timestamptz
+       FROM app_user_organization_memberships membership
+       WHERE membership.organization_id = $4::uuid
+         AND membership.status = 'active'
+       ON CONFLICT (pipeline_id, user_email) DO UPDATE SET
+         access_role = EXCLUDED.access_role,
+         shared_by = EXCLUDED.shared_by,
+         updated_at = EXCLUDED.updated_at`,
+      [PIPELINE_ID, DEMO_EMAIL, dataset.generatedAt, ROOT_ORGANIZATION_ID],
+    )
+    await client.query(
+      `INSERT INTO app_user_workspace_preferences (
+         user_email, workspace_organization_id, default_board_id, default_pipeline_id,
+         created_at, updated_at
+       )
+       SELECT membership.user_email, $1::uuid, $2::uuid, $3::uuid,
+         $4::timestamptz, $4::timestamptz
+       FROM app_user_organization_memberships membership
+       WHERE membership.organization_id = $1::uuid
+         AND membership.status = 'active'
+       ON CONFLICT (user_email, workspace_organization_id) DO UPDATE SET
+         default_board_id = EXCLUDED.default_board_id,
+         default_pipeline_id = EXCLUDED.default_pipeline_id,
+         updated_at = EXCLUDED.updated_at`,
+      [ROOT_ORGANIZATION_ID, BOARD_ID, PIPELINE_ID, dataset.generatedAt],
+    )
+
+    await client.query(
       `INSERT INTO demo_dataset_metadata (
          dataset_key, dataset_version, anchor_date, recent_window_days,
          context_window_days, generated_at, summary
-       ) VALUES ('public-demo', $1, $2::date, 30, 90, $3::timestamptz, $4::jsonb)`,
+       ) VALUES ('workspace-demo', $1, $2::date, 30, 90, $3::timestamptz, $4::jsonb)`,
       [dataset.version, dataset.anchorDate, dataset.generatedAt, JSON.stringify({
         synthetic: true,
         donorShape: ['relationship-sales', 'operating-finance'],
@@ -574,7 +683,7 @@ async function main() {
     await client.query('COMMIT')
     console.log(JSON.stringify({
       ok: true,
-      environment: environment || 'local-demo',
+      environment: environment || 'local',
       anchorDate: dataset.anchorDate,
       organizations: dataset.organizations.length + 1,
       contacts: dataset.people.length,
@@ -587,7 +696,7 @@ async function main() {
     await client.query('ROLLBACK').catch(() => undefined)
     throw error
   } finally {
-    await client.query(`SELECT pg_advisory_unlock(hashtext('clawpilot-demo-seed'))`).catch(() => undefined)
+    await client.query(`SELECT pg_advisory_unlock(hashtext('clawpilot-demo-account-seed'))`).catch(() => undefined)
     client.release()
     await pool.end()
   }

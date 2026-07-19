@@ -34,12 +34,6 @@ function nextPath() {
   return requested.startsWith('/') && !requested.startsWith('//') ? requested : '/'
 }
 
-async function createDemoSession() {
-  const response = await fetch('/api/auth/demo', { method: 'POST' })
-  const result = (await response.json().catch(() => ({}))) as AuthResponse
-  if (!response.ok || !result.ok) throw new Error(result.error || 'The demo is unavailable')
-}
-
 export default function LoginPage() {
   const [mode, setMode] = useState<LoginMode>('email')
   const [email, setEmail] = useState('')
@@ -50,7 +44,6 @@ export default function LoginPage() {
   const [pending, setPending] = useState<PendingAction>(null)
   const [resendSeconds, setResendSeconds] = useState(0)
   const [invitedFlow, setInvitedFlow] = useState(false)
-  const [demoPending, setDemoPending] = useState(false)
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search)
@@ -65,22 +58,6 @@ export default function LoginPage() {
       setResendSeconds(60)
       setNotice('Your one-time sign-in code is on the way.')
     }
-  }, [])
-
-  useEffect(() => {
-    const autoStart = new URLSearchParams(window.location.search).get('demo') === '1'
-    if (!autoStart) return
-
-    let active = true
-    setDemoPending(true)
-    createDemoSession()
-      .then(() => { if (active) window.location.replace(nextPath()) })
-      .catch((demoError) => {
-        if (!active) return
-        setError(demoError instanceof Error ? demoError.message : 'The demo is unavailable')
-        setDemoPending(false)
-      })
-    return () => { active = false }
   }, [])
 
   useEffect(() => {
@@ -177,7 +154,6 @@ export default function LoginPage() {
   const primaryDisabled = Boolean(pending)
     || (mode === 'email' && !email.trim().includes('@'))
     || (mode === 'code' && code.length !== 6)
-  const showSignIn = !demoPending
 
   return (
     <Box
@@ -213,7 +189,7 @@ export default function LoginPage() {
               ClawPilot
             </Typography>
             <Typography variant="body2" color="text.secondary">
-              {demoPending ? 'Opening demo workspace' : invitedFlow ? 'Complete your sign in' : 'Operator sign in'}
+              {invitedFlow ? 'Complete your sign in' : 'Operator sign in'}
             </Typography>
           </Box>
         </Box>
@@ -221,13 +197,7 @@ export default function LoginPage() {
         {error ? <Alert severity="error" sx={{ mb: 2 }}>{error}</Alert> : null}
         {notice ? <Alert severity="success" sx={{ mb: 2 }}>{notice}</Alert> : null}
 
-        {demoPending ? (
-          <Box sx={{ minHeight: 120, display: 'grid', placeItems: 'center' }}>
-            <CircularProgress size={24} />
-          </Box>
-        ) : null}
-
-        {showSignIn && mode === 'email' ? (
+        {mode === 'email' ? (
           <TextField
             autoFocus
             fullWidth
@@ -254,7 +224,7 @@ export default function LoginPage() {
           />
         ) : null}
 
-        {showSignIn && mode === 'code' ? (
+        {mode === 'code' ? (
           <>
             <Typography variant="body2" color="text.secondary" sx={{ mb: 1.5, overflowWrap: 'anywhere' }}>
               Enter the code sent to <Box component="span" color="text.primary" sx={{ overflowWrap: 'anywhere' }}>{sentEmail}</Box>.
@@ -281,8 +251,7 @@ export default function LoginPage() {
           </>
         ) : null}
 
-        {showSignIn ? (
-          <Button
+        <Button
             fullWidth
             type="submit"
             variant="contained"
@@ -298,10 +267,9 @@ export default function LoginPage() {
             }}
           >
             {primaryLabel}
-          </Button>
-        ) : null}
+        </Button>
 
-        {showSignIn && mode === 'code' ? (
+        {mode === 'code' ? (
           <Stack direction="row" justifyContent="space-between" sx={{ mt: 1.5 }}>
             <Button size="small" startIcon={<ArrowBackRounded />} onClick={resetEmail} disabled={Boolean(pending)}>
               {invitedFlow ? 'Back to welcome' : 'Change email'}

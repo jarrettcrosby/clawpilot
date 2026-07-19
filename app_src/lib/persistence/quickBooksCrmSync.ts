@@ -1,5 +1,4 @@
 import { recordAuditEvent } from '@/lib/auditWriter'
-import { isDemoMode } from '@/lib/demoMode'
 import { stageCrmRecordWithClient } from '@/lib/persistence/crm'
 import { syncPipelineProductDropdownCatalogInPostgres } from '@/lib/persistence/pipeline'
 import { query, withTransaction } from '@/lib/persistence/postgres'
@@ -138,7 +137,7 @@ export async function reconcileQuickBooksCatalogToCrmInPostgres(input: {
             sourceKey: `quickbooks:customer:${providerId}`,
             sourcePayload: { provider: 'quickbooks', customerId: providerId, customer: sourcePayload },
             actorEmail,
-            emitSuiteCrmOutbox: !isDemoMode(),
+            emitSuiteCrmOutbox: true,
             fields: {
               name: organizationName,
               parentOrganizationId: workspaceRoot.rows[0].id,
@@ -184,7 +183,7 @@ export async function reconcileQuickBooksCatalogToCrmInPostgres(input: {
               sourceKey: `quickbooks:customer-contact:${providerId}`,
               sourcePayload: { provider: 'quickbooks', customerId: providerId, customer: sourcePayload },
               actorEmail,
-              emitSuiteCrmOutbox: !isDemoMode(),
+              emitSuiteCrmOutbox: true,
               fields: {
                 organizationId: stagedOrganization.id,
                 organizationSuiteCrmId: stagedOrganization.suiteCrmId,
@@ -239,7 +238,7 @@ export async function reconcileQuickBooksCatalogToCrmInPostgres(input: {
             sourceKey: `quickbooks:item:${item.quickbooks_item_id}`,
             sourcePayload: { provider: 'quickbooks', itemId: item.quickbooks_item_id, item: sourceObject(item.source_payload) },
             actorEmail,
-            emitSuiteCrmOutbox: !isDemoMode(),
+            emitSuiteCrmOutbox: true,
             fields: {
               name: item.fully_qualified_name || item.name,
               sku: item.sku || undefined,

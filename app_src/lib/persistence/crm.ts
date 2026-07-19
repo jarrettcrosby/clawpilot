@@ -37,7 +37,6 @@ import {
 import { recordAuditEvent } from '@/lib/auditWriter'
 import { requireActiveAppUser } from '@/lib/users'
 import { zonedDateTimeToIso } from '@/lib/zonedDateTime'
-import { isDemoMode } from '@/lib/demoMode'
 
 const ENTITY_TABLE: Record<CrmEntity, string> = {
   organizations: 'crm_organizations',
@@ -1661,7 +1660,7 @@ export async function stageCrmRecordWithClient(client: PoolClient, rawInput: Sta
       break
   }
   let suiteCrmOutboxKey: string | null = null
-  if (input.emitSuiteCrmOutbox !== false && !isDemoMode()) {
+  if (input.emitSuiteCrmOutbox !== false) {
     suiteCrmOutboxKey = await enqueueSuiteCrmRecord(
       client,
       input,
