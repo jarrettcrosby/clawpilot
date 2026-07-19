@@ -194,6 +194,9 @@ for (const fragment of [
   "'CashFlow'",
   "'AgedReceivables'",
   "'attachable-thumbnail'",
+  "SELECT * FROM Attachable WHERE Id = '${escapedAttachmentId}'",
+  'ThumbnailTempDownloadUri',
+  'validatedAttachmentUrl',
   'readQuickBooksAttachmentDownloadUrl',
 ]) includes(client + read('app_src/lib/maton.ts'), fragment, 'QuickBooks client')
 assert.ok(!client.includes("method: 'POST'"), 'QuickBooks catalog client must remain read-only')
