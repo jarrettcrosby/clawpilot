@@ -275,7 +275,8 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
         body: JSON.stringify({
           action: 'save-profile',
           scope,
-          restaurantGuid: scope === 'location_override' ? locationGuid : null,
+          restaurantGuid: locationGuid,
+          businessDate,
           profile: profilePayload(profile),
         }),
       })
@@ -302,7 +303,8 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
         body: JSON.stringify({
           action: 'save-mappings',
           scope,
-          restaurantGuid: scope === 'location_override' ? locationGuid : null,
+          restaurantGuid: locationGuid,
+          businessDate,
           mappings,
         }),
       })

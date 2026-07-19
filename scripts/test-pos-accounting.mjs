@@ -157,6 +157,9 @@ const accountingRoute = loadTypeScriptModule('app_src/app/api/pos/accounting/rou
     canConfigureAccountingScope: authorization.canConfigureAccountingScope,
   },
   '@/lib/persistence/config': { isPostgresStorageEnabled: () => true },
+  '@/lib/persistence/posAccountingNotifications': {
+    reconcilePosAccountingIssueForDateInPostgres: async () => ({ status: 'resolved' }),
+  },
   '@/lib/persistence/posAccounting': {
     POS_ACCOUNTING_SCOPES: ['organization_default', 'location_override'],
     PosAccountingRequestError: class PosAccountingRequestError extends Error {},

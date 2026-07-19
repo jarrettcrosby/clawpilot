@@ -5,6 +5,7 @@ import {
   canConfigureAccountingScope,
 } from '@/lib/accountingAuthorization'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
+import { reconcilePosAccountingIssueForDateInPostgres } from '@/lib/persistence/posAccountingNotifications'
 import {
   POS_ACCOUNTING_SCOPES,
   PosAccountingRequestError,
@@ -99,7 +100,7 @@ async function requestBody(req: NextRequest) {
     const parsed = JSON.parse(raw) as unknown
     assertFields(
       parsed,
-      new Set(['action', 'scope', 'restaurantGuid', 'profile', 'mappings']),
+      new Set(['action', 'scope', 'restaurantGuid', 'businessDate', 'profile', 'mappings']),
       'POS_ACCOUNTING_REQUEST_INVALID',
       'POS accounting request',
     )
@@ -116,6 +117,23 @@ function scopeValue(value: unknown): PosAccountingScope {
     throw new PosAccountingRequestError('POS_ACCOUNTING_SCOPE_INVALID', 'POS accounting scope is invalid')
   }
   return scope
+}
+
+async function reconcileIssueState(input: {
+  organizationId: string
+  restaurantGuid: string
+  businessDate: string
+}) {
+  try {
+    return await reconcilePosAccountingIssueForDateInPostgres(input)
+  } catch {
+    return {
+      status: 'pending' as const,
+      changed: false,
+      issueCount: null,
+      recipients: null,
+    }
+  }
 }
 
 export async function GET(req: NextRequest) {
@@ -152,7 +170,6 @@ export async function PATCH(req: NextRequest) {
     const body = await requestBody(req)
     const action = String(body.action || '')
     const scope = scopeValue(body.scope)
-    const restaurantGuid = restaurantGuidValue(body.restaurantGuid, scope === 'location_override')
     if (!canConfigureAccountingScope(capabilities, scope)) {
       return json({
         ok: false,
@@ -160,6 +177,9 @@ export async function PATCH(req: NextRequest) {
         code: 'POS_ACCOUNTING_ORGANIZATION_CONFIG_REQUIRED',
       }, 403)
     }
+    const selectedRestaurantGuid = restaurantGuidValue(body.restaurantGuid, true)
+    const businessDate = dateValue(body.businessDate)
+    const restaurantGuid = scope === 'location_override' ? selectedRestaurantGuid : null
     if (action === 'save-profile') {
       if (body.mappings !== undefined) throw new PosAccountingRequestError('POS_ACCOUNTING_REQUEST_INVALID', 'Mappings are not accepted when saving a profile')
       assertFields(body.profile, PROFILE_FIELDS, 'POS_ACCOUNTING_PROFILE_INVALID', 'POS accounting profile')
@@ -170,7 +190,12 @@ export async function PATCH(req: NextRequest) {
         actorEmail: actor.email,
         profile: validatePosAccountingProfile(body.profile),
       })
-      return json({ ok: true, capabilities, profile })
+      const issueState = await reconcileIssueState({
+        organizationId,
+        restaurantGuid: selectedRestaurantGuid!,
+        businessDate,
+      })
+      return json({ ok: true, capabilities, profile, issueState })
     }
     if (action === 'save-mappings') {
       if (body.profile !== undefined) throw new PosAccountingRequestError('POS_ACCOUNTING_REQUEST_INVALID', 'Profile fields are not accepted when saving mappings')
@@ -185,7 +210,12 @@ export async function PATCH(req: NextRequest) {
         actorEmail: actor.email,
         mappings: validatePosAccountingMappings(body.mappings),
       })
-      return json({ ok: true, capabilities, mappings })
+      const issueState = await reconcileIssueState({
+        organizationId,
+        restaurantGuid: selectedRestaurantGuid!,
+        businessDate,
+      })
+      return json({ ok: true, capabilities, mappings, issueState })
     }
     throw new PosAccountingRequestError('POS_ACCOUNTING_ACTION_INVALID', 'POS accounting action is invalid')
   } catch (error) {

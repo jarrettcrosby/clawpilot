@@ -47,10 +47,13 @@ type ActivityEvent = {
   actor: string
   actorName: string | null
   target: {
-    section: 'projects' | 'pipeline' | 'crm' | 'agents' | 'docs' | 'versions'
+    section: 'projects' | 'pipeline' | 'crm' | 'pos' | 'agents' | 'docs' | 'versions'
     id?: string
     resourceId?: string
     label?: string
+    organizationId?: string
+    restaurantGuid?: string
+    businessDate?: string
   } | null
   details: Record<string, unknown>
 }
@@ -76,6 +79,7 @@ const MODULE_LABELS: Record<string, string> = {
   projects: 'Projects',
   pipeline: 'Pipeline',
   crm: 'CRM',
+  pos: 'POS',
   agents: 'Agents',
   docs: 'Docs',
   users: 'People',
@@ -105,13 +109,24 @@ function saveReadIds(ids: Set<string>) {
 
 function activityTargetUrl(target: NonNullable<ActivityEvent['target']>) {
   const url = new URL(window.location.href)
-  for (const parameter of ['board', 'pipeline', 'crm', 'crmAction', 'doc']) url.searchParams.delete(parameter)
+  for (const parameter of ['board', 'pipeline', 'crm', 'crmAction', 'doc', 'posView', 'location', 'date']) {
+    url.searchParams.delete(parameter)
+  }
   if (target.resourceId && target.section === 'projects') url.searchParams.set('board', target.resourceId)
   if (target.resourceId && (target.section === 'pipeline' || target.section === 'crm')) {
     url.searchParams.set('pipeline', target.resourceId)
   }
   if (target.id && target.section === 'crm') url.searchParams.set('crm', target.id)
   if (target.id && target.section === 'docs') url.searchParams.set('doc', target.id)
+  if (target.section === 'pos') {
+    url.searchParams.set('posView', 'accounting')
+    if (target.restaurantGuid || target.resourceId) {
+      url.searchParams.set('location', target.restaurantGuid || target.resourceId || '')
+    }
+    if (target.businessDate || target.id) {
+      url.searchParams.set('date', target.businessDate || target.id || '')
+    }
+  }
   url.hash = target.section
   return url
 }
@@ -311,6 +326,21 @@ export default function ActivityLogPage({ onClose }: Props) {
   }
 
   async function selectResource(target: NonNullable<ActivityEvent['target']>) {
+    if (target.section === 'pos' && target.organizationId) {
+      const currentResponse = await fetch('/api/auth/workspace', { cache: 'no-store' })
+      const current = await currentResponse.json().catch(() => ({})) as { activeOrganizationId?: string; error?: string }
+      if (!currentResponse.ok) throw new Error(current.error || 'Unable to read the active organization')
+      if (current.activeOrganizationId !== target.organizationId) {
+        const switchResponse = await fetch('/api/auth/workspace', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'switch', organizationId: target.organizationId }),
+        })
+        const switched = await switchResponse.json().catch(() => ({})) as { error?: string }
+        if (!switchResponse.ok) throw new Error(switched.error || 'Unable to open the accounting organization')
+      }
+      return
+    }
     if (!target.resourceId || !['projects', 'pipeline', 'crm'].includes(target.section)) return
     const kind = target.section === 'projects' ? 'board' : 'pipeline'
     const response = await fetch('/api/workspaces', {
@@ -333,7 +363,8 @@ export default function ActivityLogPage({ onClose }: Props) {
     try {
       await selectResource(event.target)
       if (event.target.section === 'projects' && event.target.id) queueProjectTaskOpen(event.target.id)
-      if (event.target.resourceId && ['projects', 'pipeline', 'crm'].includes(event.target.section)) {
+      if (event.target.section === 'pos'
+        || (event.target.resourceId && ['projects', 'pipeline', 'crm'].includes(event.target.section))) {
         const nextUrl = activityTargetUrl(event.target)
         onClose?.()
         window.location.assign(nextUrl.toString())

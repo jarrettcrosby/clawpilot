@@ -375,8 +375,27 @@ export default function PosSection() {
   const [orderDetail, setOrderDetail] = useState<DataRecord | null>(null)
   const [orderLoading, setOrderLoading] = useState(false)
   const [orderError, setOrderError] = useState<string | null>(null)
+  const [queryReady, setQueryReady] = useState(false)
 
   const invalidRange = Boolean(from && to && from > to)
+
+  useEffect(() => {
+    const parameters = new URLSearchParams(window.location.search)
+    const targetView = parameters.get('posView')
+    const targetDate = parameters.get('date')
+    const targetLocation = parameters.get('location')
+    if (targetView && ['overview', 'orders', 'reports', 'accounting'].includes(targetView)) {
+      setView(targetView as PosView)
+    }
+    if (targetDate && /^\d{4}-\d{2}-\d{2}$/.test(targetDate)) {
+      setFrom(targetDate)
+      setTo(targetDate)
+    }
+    if (targetLocation && /^[0-9a-f-]{36}$/i.test(targetLocation)) {
+      setLocation(targetLocation.toLowerCase())
+    }
+    setQueryReady(true)
+  }, [])
 
   useEffect(() => {
     const timer = window.setTimeout(() => setSearch(searchInput.trim()), 300)
@@ -384,7 +403,7 @@ export default function PosSection() {
   }, [searchInput])
 
   useEffect(() => {
-    if (!from || !to || invalidRange) return
+    if (!queryReady || !from || !to || invalidRange) return
     const controller = new AbortController()
     setLoading(true)
     setError(null)
@@ -414,10 +433,10 @@ export default function PosSection() {
 
     void load()
     return () => controller.abort()
-  }, [from, invalidRange, location, page, pageSize, revision, search, to])
+  }, [from, invalidRange, location, page, pageSize, queryReady, revision, search, to])
 
   useEffect(() => {
-    if (!selectedOrderId || !from || !to || invalidRange) return
+    if (!queryReady || !selectedOrderId || !from || !to || invalidRange) return
     const controller = new AbortController()
     setOrderLoading(true)
     setOrderError(null)
@@ -449,7 +468,7 @@ export default function PosSection() {
 
     void loadOrder()
     return () => controller.abort()
-  }, [from, invalidRange, location, page, pageSize, selectedOrderId, to])
+  }, [from, invalidRange, location, page, pageSize, queryReady, selectedOrderId, to])
 
   const currencyCode = textValue(snapshot?.summary || {}, ['currencyCode', 'currency'], 'USD')
   const money = useMemo(() => (amount: number, compact = false) => {

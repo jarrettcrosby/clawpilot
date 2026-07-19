@@ -218,6 +218,9 @@ export async function GET() {
           pos_accounting_profiles_migration_applied: boolean
           toast_menu_catalog_migration_applied: boolean
           quickbooks_reference_catalogs_migration_applied: boolean
+          toast_sync_rerun_migration_applied: boolean
+          toast_sync_worker_hardening_migration_applied: boolean
+          pos_accounting_notifications_migration_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -503,6 +506,21 @@ export async function GET() {
                 FROM schema_migrations
                 WHERE filename = '0071_quickbooks_accounting_reference_catalogs.sql'
               ) AS quickbooks_reference_catalogs_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0072_toast_sync_rerun_requests.sql'
+              ) AS toast_sync_rerun_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0073_toast_sync_worker_hardening.sql'
+              ) AS toast_sync_worker_hardening_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0074_pos_accounting_issue_notifications.sql'
+              ) AS pos_accounting_notifications_migration_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -571,6 +589,9 @@ export async function GET() {
             && row?.pos_accounting_profiles_migration_applied
             && row?.toast_menu_catalog_migration_applied
             && row?.quickbooks_reference_catalogs_migration_applied
+            && row?.toast_sync_rerun_migration_applied
+            && row?.toast_sync_worker_hardening_migration_applied
+            && row?.pos_accounting_notifications_migration_applied
             && row?.migration_checksums_present
           ),
         }
@@ -631,6 +652,9 @@ export async function GET() {
           || !row?.pos_accounting_profiles_migration_applied
           || !row?.toast_menu_catalog_migration_applied
           || !row?.quickbooks_reference_catalogs_migration_applied
+          || !row?.toast_sync_rerun_migration_applied
+          || !row?.toast_sync_worker_hardening_migration_applied
+          || !row?.pos_accounting_notifications_migration_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')
@@ -642,6 +666,7 @@ export async function GET() {
           && row?.demo_workspace_account_migration_applied
           && row?.quickbooks_write_control_migration_applied
           && row?.quickbooks_write_connection_binding_migration_applied
+          && row?.pos_accounting_notifications_migration_applied
         ) {
           const queueResult = await query<{
             toast_pending: number
@@ -659,6 +684,11 @@ export async function GET() {
             quickbooks_write_dead: number
             quickbooks_write_stale_processing: number
             quickbooks_write_unbound_active: number
+            pos_notification_pending: number
+            pos_notification_failed: number
+            pos_notification_dead: number
+            pos_notification_stale_processing: number
+            pos_notification_overdue: number
           }>(
             `WITH toast_queue AS (
                SELECT
@@ -708,6 +738,23 @@ export async function GET() {
                FROM quickbooks_write_requests request
                JOIN workspace_organizations organization ON organization.id = request.organization_id
                WHERE organization.is_demo = false
+             ), pos_notification_queue AS (
+               SELECT
+                 count(*) FILTER (WHERE notification.status = 'pending')::integer AS pending,
+                 count(*) FILTER (WHERE notification.status = 'failed')::integer AS failed,
+                 count(*) FILTER (WHERE notification.status = 'dead')::integer AS dead,
+                 count(*) FILTER (
+                   WHERE notification.status = 'processing'
+                     AND notification.locked_at < now() - interval '15 minutes'
+                 )::integer AS stale_processing,
+                 count(*) FILTER (
+                   WHERE notification.status IN ('pending', 'failed')
+                     AND notification.available_at < now() - interval '15 minutes'
+                 )::integer AS overdue
+               FROM pos_accounting_notification_outbox notification
+               JOIN pos_accounting_issue_states issue ON issue.id = notification.issue_state_id
+               JOIN workspace_organizations organization ON organization.id = issue.organization_id
+               WHERE organization.is_demo = false
              )
              SELECT
                toast_queue.pending AS toast_pending,
@@ -724,8 +771,16 @@ export async function GET() {
                quickbooks_write_queue.failed AS quickbooks_write_failed,
                quickbooks_write_queue.dead AS quickbooks_write_dead,
                quickbooks_write_queue.stale_processing AS quickbooks_write_stale_processing,
-               quickbooks_write_queue.unbound_active AS quickbooks_write_unbound_active
-             FROM toast_queue CROSS JOIN quickbooks_queue CROSS JOIN quickbooks_write_queue`,
+               quickbooks_write_queue.unbound_active AS quickbooks_write_unbound_active,
+               pos_notification_queue.pending AS pos_notification_pending,
+               pos_notification_queue.failed AS pos_notification_failed,
+               pos_notification_queue.dead AS pos_notification_dead,
+               pos_notification_queue.stale_processing AS pos_notification_stale_processing,
+               pos_notification_queue.overdue AS pos_notification_overdue
+             FROM toast_queue
+             CROSS JOIN quickbooks_queue
+             CROSS JOIN quickbooks_write_queue
+             CROSS JOIN pos_notification_queue`,
           )
           const queue = queueResult.rows[0]
           const queueErrors = Number(queue?.toast_dead || 0)
@@ -737,6 +792,9 @@ export async function GET() {
             + Number(queue?.quickbooks_write_dead || 0)
             + Number(queue?.quickbooks_write_stale_processing || 0)
             + Number(queue?.quickbooks_write_unbound_active || 0)
+            + Number(queue?.pos_notification_dead || 0)
+            + Number(queue?.pos_notification_stale_processing || 0)
+            + Number(queue?.pos_notification_overdue || 0)
           integrationQueues = {
             status: queueErrors > 0 ? 'error' : 'healthy',
             toast: {
@@ -760,6 +818,13 @@ export async function GET() {
               staleProcessing: Number(queue?.quickbooks_write_stale_processing || 0),
               unboundActive: Number(queue?.quickbooks_write_unbound_active || 0),
             },
+            posAccountingNotifications: {
+              pending: Number(queue?.pos_notification_pending || 0),
+              failed: Number(queue?.pos_notification_failed || 0),
+              dead: Number(queue?.pos_notification_dead || 0),
+              staleProcessing: Number(queue?.pos_notification_stale_processing || 0),
+              overdue: Number(queue?.pos_notification_overdue || 0),
+            },
           }
           if (cloudProvider === 'railway') {
             if (Number(queue?.toast_dead || 0) > 0) errors.push('Toast sync queue has terminal failed jobs.')
@@ -771,6 +836,9 @@ export async function GET() {
             if (Number(queue?.quickbooks_write_dead || 0) > 0) errors.push('QuickBooks write queue has terminal failed requests.')
             if (Number(queue?.quickbooks_write_stale_processing || 0) > 0) errors.push('QuickBooks write queue has stale processing requests.')
             if (Number(queue?.quickbooks_write_unbound_active || 0) > 0) errors.push('QuickBooks write queue has requests without a reviewed connection binding.')
+            if (Number(queue?.pos_notification_dead || 0) > 0) errors.push('POS accounting notification queue has terminal failed deliveries.')
+            if (Number(queue?.pos_notification_stale_processing || 0) > 0) errors.push('POS accounting notification queue has stale processing deliveries.')
+            if (Number(queue?.pos_notification_overdue || 0) > 0) errors.push('POS accounting notification queue has overdue deliveries.')
           }
         }
 

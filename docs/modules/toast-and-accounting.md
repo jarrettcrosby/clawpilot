@@ -109,6 +109,18 @@ The integration settings expose a reporting-readiness summary for the signed-in 
 
 Standard and Analytics readiness remain independent. Standard Orders is sufficient for the POS operational view. Analytics remains optional for management reporting, payouts, and cross-source reconciliation. When both are present, a material net-sales difference marks the accounting draft as `variance` instead of silently treating the feeds as equal. Queries and API responses remain filtered by `organization_id`.
 
+## Accounting Issue Notifications
+
+ClawPilot turns confirmed accounting blockers into actionable, organization-scoped notifications instead of requiring an operator to repeatedly inspect every business date.
+
+- A completed projection and every profile or mapping save re-evaluates the canonical POS accounting preview for the selected organization, restaurant, and business date.
+- Confirmed blockers include missing mappings, an unverified QuickBooks company binding, an unbalanced payments journal, unallocated sales, and open checks when the profile policy requires a hold. Unavailable preview or payout data does not create a false alert.
+- One durable issue state is maintained per organization, restaurant, and business date. The normalized issue fingerprint prevents repeated worker checks and threaded retries from creating duplicate alerts.
+- A changed issue set or an issue that recurs after resolution creates a new occurrence. Resolving the underlying blockers closes the issue, cancels unsent mail, and records a resolution in Activity.
+- The in-app Activity event and email action open the exact organization, POS Accounting view, restaurant, and business date that needs review.
+- Email delivery uses a leased outbox with retry backoff, terminal failure visibility, and authorization checks immediately before delivery. It targets active owners and active organization administrators who hold both accounting-view and access-management permissions for that exact organization. Descendant organizations, global role alone, and inactive memberships do not confer recipient access.
+- `/api/health` exposes pending, failed, dead, stale, and overdue accounting-notification deliveries. The Toast worker reconciles stale open issues independently from ingestion so a mail-provider failure cannot poison POS projections.
+
 ## Accounting Boundary
 
 Toast Analytics reporting is operational information, not a GAAP ledger. ClawPilot does not post raw Analytics rows directly to QuickBooks.
@@ -136,6 +148,8 @@ Toast Analytics reporting is operational information, not a GAAP ledger. ClawPil
 - `toast_accounting_export_drafts`
 - `pos_accounting_profiles`
 - `pos_accounting_catalog_mappings`
+- `pos_accounting_issue_states`
+- `pos_accounting_notification_outbox`
 - `quickbooks_accounts`
 - `quickbooks_items`
 - `quickbooks_classes`
@@ -146,7 +160,7 @@ All rows are organization-scoped. A multi-business user connects, selects, and r
 
 ## Current Release Boundary
 
-This release implements both Toast credential connections, location verification, scheduled and manual read-only ingestion, immutable source snapshots, sanitized order/check/item projections, menu catalogs, a dedicated responsive POS workspace, operational reports, daily projections, versioned accounting profiles, QuickBooks reference catalogs, immutable accounting previews, worker health, and audit events. Organization-bound QuickBooks authorization and mapping management are available. Toast-to-QuickBooks financial posting remains intentionally locked pending complete mapping, reconciliation, independent approval, and sandbox acceptance.
+This release implements both Toast credential connections, location verification, scheduled and manual read-only ingestion, immutable source snapshots, sanitized order/check/item projections, menu catalogs, a dedicated responsive POS workspace, operational reports, daily projections, versioned accounting profiles, QuickBooks reference catalogs, immutable accounting previews, deduplicated accounting-issue notifications, worker health, and audit events. Organization-bound QuickBooks authorization and mapping management are available. Toast-to-QuickBooks financial posting remains intentionally locked pending complete mapping, reconciliation, independent approval, and sandbox acceptance.
 
 ## Verification
 
@@ -159,3 +173,5 @@ This release implements both Toast credential connections, location verification
 7. Confirm the legacy accounting draft is not posted and reports `needs_mapping`; then confirm the canonical POS accounting preview independently reports mapping, allocation, reconciliation, and hold evidence.
 8. Confirm `/api/health` reports the Toast worker heartbeat in Railway.
 9. Bind the intended organization to QuickBooks, save one location's account mappings, and confirm financial posting remains unavailable.
+10. Leave one confirmed mapping issue, run the worker twice, and confirm one Activity item and one email delivery are created for that occurrence. Open the action and confirm the correct organization, location, date, and Accounting view load.
+11. Resolve the issue and confirm Activity records the resolution. Reintroduce the issue and confirm exactly one new occurrence is queued.

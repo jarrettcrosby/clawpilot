@@ -103,12 +103,18 @@ assert.ok(!persistence.includes("status = 'pending', attempt_count = 0"), 'autom
 
 const posMigration = read('db/migrations/0067_toast_pos_orders.sql')
 for (const fragment of [
-  'ADD COLUMN IF NOT EXISTS lock_token uuid',
-  "'standard_order_updates'",
-  "'deployment.database.identity'",
   'CREATE TABLE IF NOT EXISTS toast_pos_orders',
 ]) {
   assert.ok(posMigration.includes(fragment), `Toast POS migration missing ${fragment}`)
+}
+
+const workerHardeningMigration = read('db/migrations/0073_toast_sync_worker_hardening.sql')
+for (const fragment of [
+  'ADD COLUMN IF NOT EXISTS lock_token uuid',
+  "'standard_order_updates'",
+  "'deployment.database.identity'",
+]) {
+  assert.ok(workerHardeningMigration.includes(fragment), `Toast worker hardening migration missing ${fragment}`)
 }
 
 const rerunMigration = read('db/migrations/0072_toast_sync_rerun_requests.sql')
@@ -116,6 +122,28 @@ assert.ok(
   rerunMigration.includes('ADD COLUMN IF NOT EXISTS rerun_requested_at timestamptz'),
   'Toast rerun migration must add the durable follow-up marker',
 )
+
+const notificationMigration = read('db/migrations/0074_pos_accounting_issue_notifications.sql')
+for (const fragment of [
+  'CREATE TABLE IF NOT EXISTS pos_accounting_issue_states',
+  'CREATE TABLE IF NOT EXISTS pos_accounting_notification_outbox',
+  'issue_fingerprint text NOT NULL',
+  'issues jsonb NOT NULL',
+  'pos_accounting_notification_delivery_unique',
+  "status IN ('pending', 'processing', 'failed', 'succeeded', 'dead', 'cancelled')",
+]) {
+  assert.ok(notificationMigration.includes(fragment), `POS accounting notification migration missing ${fragment}`)
+}
+
+const toastWorker = read('app_src/lib/toastSyncWorker.ts')
+for (const fragment of [
+  'reconcilePosAccountingIssueForDateInPostgres',
+  'processPosAccountingNotificationOutbox',
+  'reconcileStaleOpenPosAccountingIssuesInPostgres',
+  'refreshAccountingState',
+]) {
+  assert.ok(toastWorker.includes(fragment), `Toast worker notification integration missing ${fragment}`)
+}
 
 const tenantQueries = []
 const toastOrderProjection = loadTypeScriptModule('app_src/lib/integrations/toastOrderProjection.ts')

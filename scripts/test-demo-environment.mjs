@@ -123,6 +123,9 @@ assert.ok(health.includes("filename = '0068_quickbooks_write_connection_binding.
 assert.ok(health.includes("filename = '0069_pos_accounting_profiles_and_catalog_mappings.sql'"))
 assert.ok(health.includes("filename = '0070_toast_menu_catalog.sql'"))
 assert.ok(health.includes("filename = '0071_quickbooks_accounting_reference_catalogs.sql'"))
+assert.ok(health.includes("filename = '0072_toast_sync_rerun_requests.sql'"))
+assert.ok(health.includes("filename = '0073_toast_sync_worker_hardening.sql'"))
+assert.ok(health.includes("filename = '0074_pos_accounting_issue_notifications.sql'"))
 assert.ok(!health.includes('demoEnvironment'))
 
 const proxy = read('app_src/proxy.ts')
