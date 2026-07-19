@@ -14,6 +14,13 @@ const MINOR_VERSION = '75'
 const QUERY_PAGE_SIZE = 1000
 const TRANSACTION_PAGE_SIZE = 200
 const MAX_CATALOG_RECORDS = 20_000
+const REQUEST_SPACING_MS = 300
+const MAX_REQUEST_ATTEMPTS = 5
+const DEFAULT_RETRY_DELAY_MS = 1_500
+const MAX_RETRY_DELAY_MS = 30_000
+const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504])
+
+let lastRequestStartedAt = 0
 
 const TRANSACTION_ENTITIES = [
   'Invoice',
@@ -57,12 +64,43 @@ async function responseJson(response: Response) {
   return payload
 }
 
+function sleep(durationMs: number) {
+  return new Promise((resolve) => setTimeout(resolve, durationMs))
+}
+
+function retryAfterMs(value: string | null) {
+  if (!value) return 0
+  const seconds = Number(value)
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return Math.min(MAX_RETRY_DELAY_MS, Math.ceil(seconds * 1_000))
+  }
+  const retryAt = Date.parse(value)
+  if (!Number.isFinite(retryAt)) return 0
+  return Math.min(MAX_RETRY_DELAY_MS, Math.max(0, retryAt - Date.now()))
+}
+
+async function paceRequest() {
+  const elapsed = Date.now() - lastRequestStartedAt
+  if (elapsed < REQUEST_SPACING_MS) await sleep(REQUEST_SPACING_MS - elapsed)
+  lastRequestStartedAt = Date.now()
+}
+
 async function request(pathname: string, ownerEmail: string, connectionId: string) {
-  return responseJson(await matonFetch(pathname, { method: 'GET' }, {
-    ownerEmail,
-    app: 'quickbooks',
-    boundConnectionId: connectionId,
-  }))
+  for (let attempt = 0; attempt < MAX_REQUEST_ATTEMPTS; attempt += 1) {
+    await paceRequest()
+    const response = await matonFetch(pathname, { method: 'GET' }, {
+      ownerEmail,
+      app: 'quickbooks',
+      boundConnectionId: connectionId,
+    })
+    if (!RETRYABLE_STATUSES.has(response.status) || attempt === MAX_REQUEST_ATTEMPTS - 1) {
+      return responseJson(response)
+    }
+    await response.body?.cancel().catch(() => undefined)
+    const exponentialBackoff = Math.min(MAX_RETRY_DELAY_MS, DEFAULT_RETRY_DELAY_MS * (2 ** attempt))
+    await sleep(Math.max(exponentialBackoff, retryAfterMs(response.headers.get('retry-after'))))
+  }
+  throw new Error('QuickBooks request retry budget exhausted')
 }
 
 async function queryEntityPage(
@@ -120,20 +158,26 @@ export async function readQuickBooksCompanyInfo(ownerEmail: string, connectionId
 }
 
 export async function readQuickBooksCatalog(ownerEmail: string, connectionId: string) {
-  const [company, accounts, items, customers, vendors, attachments, transactionGroups] = await Promise.all([
-    readQuickBooksCompanyInfo(ownerEmail, connectionId),
-    queryAllEntities('Account', ownerEmail, connectionId, parseQuickBooksAccounts),
-    queryAllEntities('Item', ownerEmail, connectionId, parseQuickBooksItems),
-    queryAllEntities('Customer', ownerEmail, connectionId, parseQuickBooksCustomers),
-    queryAllEntities('Vendor', ownerEmail, connectionId, parseQuickBooksVendors),
-    queryAllEntities('Attachable', ownerEmail, connectionId, parseQuickBooksAttachments),
-    Promise.all(TRANSACTION_ENTITIES.map((entity) => queryAllEntities(
+  const company = await readQuickBooksCompanyInfo(ownerEmail, connectionId)
+  const accounts = await queryAllEntities('Account', ownerEmail, connectionId, parseQuickBooksAccounts)
+  const items = await queryAllEntities('Item', ownerEmail, connectionId, parseQuickBooksItems)
+  const customers = await queryAllEntities('Customer', ownerEmail, connectionId, parseQuickBooksCustomers)
+  const vendors = await queryAllEntities('Vendor', ownerEmail, connectionId, parseQuickBooksVendors)
+  const transactionGroups: QuickBooksTransaction[][] = []
+  for (const entity of TRANSACTION_ENTITIES) {
+    transactionGroups.push(await queryAllEntities(
       entity,
       ownerEmail,
       connectionId,
       (payload) => parseQuickBooksTransactions(payload, entity),
-    ))),
-  ])
+    ))
+  }
+  const attachments = await queryAllEntities(
+    'Attachable',
+    ownerEmail,
+    connectionId,
+    parseQuickBooksAttachments,
+  )
   return {
     company,
     accounts,

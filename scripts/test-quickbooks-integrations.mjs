@@ -126,12 +126,16 @@ for (const fragment of [
   'TRANSACTION_PAGE_SIZE',
   'MAX_CATALOG_RECORDS',
   'MAX_RESPONSE_BYTES',
+  'RETRYABLE_STATUSES',
+  "response.headers.get('retry-after')",
+  'for (const entity of TRANSACTION_ENTITIES)',
   "cache: 'no-store'",
   "'Invoice'",
   "'Attachable'",
   'parseQuickBooksTransactions',
 ]) includes(client + read('app_src/lib/maton.ts'), fragment, 'QuickBooks client')
 assert.ok(!client.includes("method: 'POST'"), 'QuickBooks catalog client must remain read-only')
+assert.ok(!client.includes('TRANSACTION_ENTITIES.map'), 'QuickBooks entity reads must remain paced')
 
 const persistence = read('app_src/lib/persistence/quickBooksIntegrations.ts')
 for (const fragment of [
