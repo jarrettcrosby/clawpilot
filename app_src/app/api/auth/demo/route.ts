@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { createBrowserSession, setBrowserSessionCookie } from '@/lib/authSessions'
-import { assertDemoEnvironment, DEMO_USER_EMAIL, isDemoEnvironment } from '@/lib/demoMode'
+import { assertDemoEnvironment, demoEntryUrl, DEMO_USER_EMAIL, isDemoEnvironment } from '@/lib/demoMode'
 
 export const dynamic = 'force-dynamic'
 export const revalidate = 0
@@ -11,7 +11,11 @@ function json(payload: Record<string, unknown>, status = 200) {
 }
 
 export async function GET() {
-  return json({ ok: true, available: isDemoEnvironment() })
+  return json({
+    ok: true,
+    available: isDemoEnvironment(),
+    entryUrl: demoEntryUrl(),
+  })
 }
 
 export async function POST(req: NextRequest) {

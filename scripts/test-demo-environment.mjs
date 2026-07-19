@@ -44,6 +44,8 @@ for (const fragment of [
 const demoMode = read('app_src/lib/demoMode.ts')
 assert.ok(demoMode.includes("CLAWPILOT_DEMO_MODE === '1'"))
 assert.ok(demoMode.includes("RAILWAY_ENVIRONMENT_NAME || '').toLowerCase() === 'demo'"))
+assert.ok(demoMode.includes('https://demo.aiapp.eigenracing.com/login?demo=1'))
+assert.ok(demoMode.includes('CLAWPILOT_DEMO_URL'))
 assert.ok(demoMode.includes("'/api/integrations/'"))
 assert.ok(demoMode.includes("'/api/agents/'"))
 
@@ -53,6 +55,12 @@ assert.ok(crmPersistence.includes("input.emitSuiteCrmOutbox !== false && !isDemo
 const demoRoute = read('app_src/app/api/auth/demo/route.ts')
 assert.ok(demoRoute.includes("authMethod: 'demo'"))
 assert.ok(demoRoute.includes('assertDemoEnvironment()'))
+assert.ok(demoRoute.includes('entryUrl: demoEntryUrl()'))
+
+const loginPage = read('app_src/app/login/page.tsx')
+assert.ok(loginPage.includes('Explore demo account'))
+assert.ok(loginPage.includes("get('demo') === '1'"))
+assert.ok(loginPage.includes('await createDemoSession()'))
 
 const seed = read('scripts/seed-demo-environment.mjs')
 assert.ok(seed.includes("CLAWPILOT_DEMO_MODE !== '1'"))

@@ -15,6 +15,8 @@ app_visible: true
 
 The public demo shows a complete ClawPilot workspace without copying production or development data. It uses a dedicated Railway `demo` environment, app instance, and Postgres database at `https://demo.aiapp.eigenracing.com`. It does not share application rows, sessions, provider credentials, databases, or backups with development or production.
 
+Visitors enter from **Explore demo account** on the normal ClawPilot login screen. That single action opens the demo host with `demo=1`; the demo host creates its own isolated browser session and opens the ready-to-use workspace automatically. A visitor does not enter a demo email, password, or magic code and does not need to know that the demo runs in a separate environment.
+
 ## Synthetic Data Contract
 
 - The demo generator creates a fictional parent company, customer accounts, contacts, products, opportunities, interactions, project work, documents, and accounting records. Names, emails, phone numbers, provider IDs, and record IDs are synthetic.
@@ -49,7 +51,7 @@ The seeder refuses to run unless demo mode and environment guards pass. A local 
 1. Run `npm run test:demo` to verify synthetic identities, rolling date cohorts, migration controls, and provider restrictions.
 2. Run `railway run --environment development --service Postgres npm run demo:verify-postgres`. This creates a temporary database, applies every migration, seeds and verifies it, then drops only that generated database.
 3. Verify `https://demo.aiapp.eigenracing.com/api/health` reports current migrations and worker heartbeats.
-4. Use **Explore the live demo** in desktop and mobile layouts. Confirm CRM, pipeline, QuickBooks invoices and line items, projects, and documents render with current relative dates.
+4. Use **Explore demo account** from the normal development or production login screen in desktop and mobile layouts. Confirm the automatic handoff opens CRM, pipeline, QuickBooks invoices and line items, projects, and documents with current relative dates.
 5. Confirm restricted settings return `403` and no external provider request or accounting write is possible.
 
 See [ClawPilot Environments and Deployment](clawpilot-environments.md), [QuickBooks Accounting Connector](../modules/quickbooks-accounting.md), and [Organization-rooted Tenancy](../decisions/0002-organization-rooted-tenancy.md).

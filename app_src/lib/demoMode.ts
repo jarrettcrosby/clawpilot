@@ -1,4 +1,20 @@
 export const DEMO_USER_EMAIL = 'demo@clawpilot.example'
+export const DEFAULT_DEMO_ENTRY_URL = 'https://demo.aiapp.eigenracing.com/login?demo=1'
+
+export function demoEntryUrl(): string {
+  const configured = String(process.env.CLAWPILOT_DEMO_URL || '').trim()
+  if (!configured) return DEFAULT_DEMO_ENTRY_URL
+  try {
+    const url = new URL(configured)
+    if (url.protocol !== 'https:') return DEFAULT_DEMO_ENTRY_URL
+    url.pathname = '/login'
+    url.search = '?demo=1'
+    url.hash = ''
+    return url.toString()
+  } catch {
+    return DEFAULT_DEMO_ENTRY_URL
+  }
+}
 
 export function isDemoMode(): boolean {
   return process.env.CLAWPILOT_DEMO_MODE === '1'
