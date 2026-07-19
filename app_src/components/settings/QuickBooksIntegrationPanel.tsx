@@ -28,6 +28,7 @@ import AccountBalanceRounded from '@mui/icons-material/AccountBalanceRounded'
 import CloudDoneRounded from '@mui/icons-material/CloudDoneRounded'
 import ExpandMoreRounded from '@mui/icons-material/ExpandMoreRounded'
 import Inventory2Rounded from '@mui/icons-material/Inventory2Rounded'
+import HubRounded from '@mui/icons-material/HubRounded'
 import LinkRounded from '@mui/icons-material/LinkRounded'
 import PowerSettingsNewRounded from '@mui/icons-material/PowerSettingsNewRounded'
 import RefreshRounded from '@mui/icons-material/RefreshRounded'
@@ -89,6 +90,13 @@ type IntegrationState = {
   toastLocations: ToastLocation[]
   mappings: Mapping[]
   draftCounts: Record<string, number>
+  crmSync: {
+    pipelineId: string | null
+    customerSyncEnabled: boolean
+    productSyncEnabled: boolean
+    lastSyncedAt: string | null
+    lastError: string | null
+  }
   sync: {
     status: string
     attemptCount: number
@@ -133,6 +141,13 @@ const EMPTY_STATE: IntegrationState = {
   toastLocations: [],
   mappings: [],
   draftCounts: {},
+  crmSync: {
+    pipelineId: null,
+    customerSyncEnabled: false,
+    productSyncEnabled: false,
+    lastSyncedAt: null,
+    lastError: null,
+  },
   sync: null,
 }
 
@@ -178,6 +193,8 @@ export default function QuickBooksIntegrationPanel() {
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [confirmDisconnect, setConfirmDisconnect] = useState(false)
+  const [crmCustomers, setCrmCustomers] = useState(false)
+  const [crmProducts, setCrmProducts] = useState(false)
 
   const busy = Boolean(pendingAction)
   const importableItems = useMemo(() => integration.items.filter((item) => (
@@ -192,6 +209,8 @@ export default function QuickBooksIntegrationPanel() {
       location.restaurantGuid,
       initialMappings(next, location.restaurantGuid),
     ])))
+    setCrmCustomers(next.crmSync.customerSyncEnabled)
+    setCrmProducts(next.crmSync.productSyncEnabled)
   }
 
   useEffect(() => {
@@ -372,6 +391,53 @@ export default function QuickBooksIntegrationPanel() {
         >
           Import {selectedItems.length || ''} selected
         </Button>
+      </Box>
+
+      <Divider sx={{ my: 3 }} />
+
+      <Box component="section" aria-labelledby="quickbooks-crm-heading">
+        <Stack direction="row" spacing={1} alignItems="center" mb={1.5}>
+          <HubRounded color="primary" />
+          <Box>
+            <Typography id="quickbooks-crm-heading" fontWeight={700}>CRM reconciliation</Typography>
+            <Typography variant="caption" color="text.secondary">
+              Link QuickBooks customer and product identities to the selected pipeline so repeated syncs update reconciled records.
+            </Typography>
+          </Box>
+        </Stack>
+        <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} mb={1.5}>
+          <FormControlLabel
+            control={<Switch checked={crmCustomers} onChange={(_, checked) => setCrmCustomers(checked)} disabled={busy || !integration.connection.configured} />}
+            label="Customers to CRM"
+            sx={{ m: 0 }}
+          />
+          <FormControlLabel
+            control={<Switch checked={crmProducts} onChange={(_, checked) => setCrmProducts(checked)} disabled={busy || !integration.connection.configured} />}
+            label="Products to CRM"
+            sx={{ m: 0 }}
+          />
+        </Stack>
+        <Button
+          variant="outlined"
+          startIcon={pendingAction === 'configure-crm-sync' ? <CircularProgress size={16} /> : <HubRounded />}
+          onClick={() => {
+            void patch(
+              'configure-crm-sync',
+              { action: 'configure-crm-sync', customers: crmCustomers, products: crmProducts },
+              'QuickBooks CRM reconciliation settings saved and cached records reconciled.',
+            )
+          }}
+          disabled={!integration.connection.configured || busy}
+          sx={buttonSx}
+        >
+          Save and reconcile
+        </Button>
+        {integration.crmSync.lastSyncedAt ? (
+          <Typography variant="caption" color="text.secondary" display="block" mt={1.25}>
+            Last reconciled {new Date(integration.crmSync.lastSyncedAt).toLocaleString()}
+          </Typography>
+        ) : null}
+        {integration.crmSync.lastError ? <Alert severity="warning" sx={{ mt: 1.5, borderRadius: '8px' }}>{integration.crmSync.lastError}</Alert> : null}
       </Box>
 
       <Divider sx={{ my: 3 }} />

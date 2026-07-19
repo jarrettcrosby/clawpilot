@@ -44,9 +44,16 @@ export async function readQuickBooksIntegrationStateFromPostgres(organizationId:
       last_catalog_synced_at: string | null
       last_error_code: string | null
       credential_owner_email: string
+      crm_pipeline_id: string | null
+      crm_customer_sync_enabled: boolean
+      crm_product_sync_enabled: boolean
+      last_crm_synced_at: string | null
+      last_crm_sync_error: string | null
     }>(
       `SELECT company_name, country, status, catalog_sync_enabled,
-         verified_at::text, last_catalog_synced_at::text, last_error_code, credential_owner_email
+         verified_at::text, last_catalog_synced_at::text, last_error_code, credential_owner_email,
+         crm_pipeline_id::text, crm_customer_sync_enabled, crm_product_sync_enabled,
+         last_crm_synced_at::text, last_crm_sync_error
        FROM organization_quickbooks_connections
        WHERE organization_id = $1::uuid LIMIT 1`,
       [organizationId],
@@ -141,6 +148,19 @@ export async function readQuickBooksIntegrationStateFromPostgres(organizationId:
       transactions: Number(counts.rows[0]?.transactions || 0),
       attachments: Number(counts.rows[0]?.attachments || 0),
       reports: Number(counts.rows[0]?.reports || 0),
+    },
+    crmSync: connectionRow ? {
+      pipelineId: connectionRow.crm_pipeline_id,
+      customerSyncEnabled: connectionRow.crm_customer_sync_enabled,
+      productSyncEnabled: connectionRow.crm_product_sync_enabled,
+      lastSyncedAt: connectionRow.last_crm_synced_at,
+      lastError: connectionRow.last_crm_sync_error,
+    } : {
+      pipelineId: null,
+      customerSyncEnabled: false,
+      productSyncEnabled: false,
+      lastSyncedAt: null,
+      lastError: null,
     },
     accounts: accounts.rows.map((row) => ({
       id: row.id,

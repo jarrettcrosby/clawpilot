@@ -4,6 +4,7 @@ import { FormEvent, useEffect, useState } from 'react'
 import ArrowBackRounded from '@mui/icons-material/ArrowBackRounded'
 import LoginRounded from '@mui/icons-material/LoginRounded'
 import MailOutlineRounded from '@mui/icons-material/MailOutlineRounded'
+import PlayArrowRounded from '@mui/icons-material/PlayArrowRounded'
 import {
   Alert,
   Box,
@@ -39,6 +40,9 @@ export default function LoginPage() {
   const [pending, setPending] = useState<PendingAction>(null)
   const [resendSeconds, setResendSeconds] = useState(0)
   const [invitedFlow, setInvitedFlow] = useState(false)
+  const [demoAvailable, setDemoAvailable] = useState(false)
+  const [demoChecked, setDemoChecked] = useState(false)
+  const [demoPending, setDemoPending] = useState(false)
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search)
@@ -53,6 +57,19 @@ export default function LoginPage() {
       setResendSeconds(60)
       setNotice('Your one-time sign-in code is on the way.')
     }
+  }, [])
+
+  useEffect(() => {
+    let active = true
+    fetch('/api/auth/demo', { cache: 'no-store' })
+      .then((response) => response.json())
+      .then((result) => {
+        if (!active) return
+        setDemoAvailable(result?.available === true)
+        setDemoChecked(true)
+      })
+      .catch(() => { if (active) setDemoChecked(true) })
+    return () => { active = false }
   }, [])
 
   useEffect(() => {
@@ -140,6 +157,21 @@ export default function LoginPage() {
     setNotice('')
   }
 
+  const openDemo = async () => {
+    if (demoPending) return
+    setDemoPending(true)
+    setError('')
+    try {
+      const response = await fetch('/api/auth/demo', { method: 'POST' })
+      const result = (await response.json().catch(() => ({}))) as AuthResponse
+      if (!response.ok || !result.ok) throw new Error(result.error || 'The demo is unavailable')
+      window.location.replace(nextPath())
+    } catch (demoError) {
+      setError(demoError instanceof Error ? demoError.message : 'The demo is unavailable')
+      setDemoPending(false)
+    }
+  }
+
   const primaryLabel = mode === 'email' ? 'Email sign-in code' : 'Verify and sign in'
   const primaryIcon = pending
     ? <CircularProgress size={16} color="inherit" />
@@ -149,6 +181,8 @@ export default function LoginPage() {
   const primaryDisabled = Boolean(pending)
     || (mode === 'email' && !email.trim().includes('@'))
     || (mode === 'code' && code.length !== 6)
+  const showDemo = demoChecked && demoAvailable && !invitedFlow
+  const showSignIn = demoChecked && !showDemo
 
   return (
     <Box
@@ -184,7 +218,7 @@ export default function LoginPage() {
               ClawPilot
             </Typography>
             <Typography variant="body2" color="text.secondary">
-              {invitedFlow ? 'Complete your sign in' : 'Operator sign in'}
+              {showDemo ? 'Interactive product demo' : invitedFlow ? 'Complete your sign in' : 'Operator sign in'}
             </Typography>
           </Box>
         </Box>
@@ -192,7 +226,13 @@ export default function LoginPage() {
         {error ? <Alert severity="error" sx={{ mb: 2 }}>{error}</Alert> : null}
         {notice ? <Alert severity="success" sx={{ mb: 2 }}>{notice}</Alert> : null}
 
-        {mode === 'email' ? (
+        {!demoChecked ? (
+          <Box sx={{ minHeight: 120, display: 'grid', placeItems: 'center' }}>
+            <CircularProgress size={24} />
+          </Box>
+        ) : null}
+
+        {showSignIn && mode === 'email' ? (
           <TextField
             autoFocus
             fullWidth
@@ -219,7 +259,7 @@ export default function LoginPage() {
           />
         ) : null}
 
-        {mode === 'code' ? (
+        {showSignIn && mode === 'code' ? (
           <>
             <Typography variant="body2" color="text.secondary" sx={{ mb: 1.5, overflowWrap: 'anywhere' }}>
               Enter the code sent to <Box component="span" color="text.primary" sx={{ overflowWrap: 'anywhere' }}>{sentEmail}</Box>.
@@ -246,25 +286,27 @@ export default function LoginPage() {
           </>
         ) : null}
 
-        <Button
-          fullWidth
-          type="submit"
-          variant="contained"
-          endIcon={primaryIcon}
-          disabled={primaryDisabled}
-          sx={{
-            minHeight: 44,
-            borderRadius: 1,
-            bgcolor: '#A8C7FA',
-            color: '#001D36',
-            fontWeight: 750,
-            '&:hover': { bgcolor: '#BDD4FB' },
-          }}
-        >
-          {primaryLabel}
-        </Button>
+        {showSignIn ? (
+          <Button
+            fullWidth
+            type="submit"
+            variant="contained"
+            endIcon={primaryIcon}
+            disabled={primaryDisabled}
+            sx={{
+              minHeight: 44,
+              borderRadius: 1,
+              bgcolor: '#A8C7FA',
+              color: '#001D36',
+              fontWeight: 750,
+              '&:hover': { bgcolor: '#BDD4FB' },
+            }}
+          >
+            {primaryLabel}
+          </Button>
+        ) : null}
 
-        {mode === 'code' ? (
+        {showSignIn && mode === 'code' ? (
           <Stack direction="row" justifyContent="space-between" sx={{ mt: 1.5 }}>
             <Button size="small" startIcon={<ArrowBackRounded />} onClick={resetEmail} disabled={Boolean(pending)}>
               {invitedFlow ? 'Back to welcome' : 'Change email'}
@@ -277,6 +319,25 @@ export default function LoginPage() {
               {resendSeconds > 0 ? `Resend in ${resendSeconds}s` : 'Resend code'}
             </Button>
           </Stack>
+        ) : null}
+
+        {showDemo ? (
+          <>
+            <Button
+              fullWidth
+              type="button"
+              variant="contained"
+              startIcon={demoPending ? <CircularProgress size={16} color="inherit" /> : <PlayArrowRounded />}
+              onClick={() => { void openDemo() }}
+              disabled={demoPending}
+              sx={{ minHeight: 44, borderRadius: 1, fontWeight: 750 }}
+            >
+              Explore the live demo
+            </Button>
+            <Typography variant="body2" color="text.secondary" sx={{ mt: 1.5, textAlign: 'center' }}>
+              Synthetic CRM, pipeline, projects, documents, and accounting data refresh automatically. External integrations are disabled.
+            </Typography>
+          </>
         ) : null}
 
       </Paper>

@@ -74,12 +74,20 @@ if (!String(railway?.deploy?.startCommand || '').includes('npm run start:railway
   fail('railway.json deploy.startCommand must use "npm run start:railway"')
 }
 
-if (!String(railway?.deploy?.preDeployCommand || '').includes('npm run db:migrate')) {
-  fail('railway.json deploy.preDeployCommand must run "npm run db:migrate"')
+if (String(railway?.deploy?.preDeployCommand || '') !== 'bash scripts/predeploy-railway.sh') {
+  fail('railway.json deploy.preDeployCommand must use scripts/predeploy-railway.sh')
 }
 
-if (!String(railway?.deploy?.preDeployCommand || '').includes('npm run mail:verify')) {
-  fail('railway.json deploy.preDeployCommand must verify the configured mail sender')
+const railwayPredeploy = readFileSync(resolve(root, 'scripts/predeploy-railway.sh'), 'utf8')
+for (const requiredCommand of [
+  'npm run mail:verify',
+  'npm run db:migrate',
+  'npm run demo:seed',
+  'npm run demo:verify',
+]) {
+  if (!railwayPredeploy.includes(requiredCommand)) {
+    fail(`scripts/predeploy-railway.sh must run "${requiredCommand}"`)
+  }
 }
 
 const railwayStart = readFileSync(resolve(root, 'scripts/start-railway.sh'), 'utf8')
@@ -158,6 +166,7 @@ for (const requiredPath of [
   'db/migrations/0062_quickbooks_financial_explorer.sql',
   'db/migrations/0063_quickbooks_financial_reports.sql',
   'db/migrations/0064_quickbooks_write_control.sql',
+  'db/migrations/0065_demo_and_quickbooks_crm_reconciliation.sql',
   '.github/workflows/clawpilot-repository-runner.yml',
   '.github/workflows/deployed-runtime-monitor.yml',
   'scripts/start-railway.sh',

@@ -219,6 +219,29 @@ for (const fragment of [
   'idx_quickbooks_write_requests_due',
 ]) includes(writeMigration, fragment, 'QuickBooks write-control migration')
 
+const crmReconciliationMigration = read('db/migrations/0065_demo_and_quickbooks_crm_reconciliation.sql')
+for (const fragment of [
+  'crm_pipeline_id uuid REFERENCES pipeline_spaces(id) ON DELETE SET NULL',
+  'crm_customer_sync_enabled boolean NOT NULL DEFAULT false',
+  'crm_product_sync_enabled boolean NOT NULL DEFAULT false',
+  'CREATE TABLE IF NOT EXISTS quickbooks_crm_links',
+  "provider_entity_type IN ('customer', 'item')",
+  "crm_entity_type IN ('organization', 'contact', 'product')",
+]) includes(crmReconciliationMigration, fragment, 'QuickBooks CRM reconciliation migration')
+
+const crmReconciliation = read('app_src/lib/persistence/quickBooksCrmSync.ts')
+for (const fragment of [
+  'configureQuickBooksCrmSyncInPostgres',
+  'reconcileQuickBooksCatalogToCrmInPostgres',
+  'quickbooks:customer:',
+  'quickbooks:item:',
+  'quickbooks_crm_links',
+  'parentOrganizationId: workspaceRoot.rows[0].id',
+  "relationship_type = 'workspace_root'",
+  'const describesPerson = Boolean(givenName || familyName)',
+  'syncPipelineProductDropdownCatalogInPostgres',
+]) includes(crmReconciliation, fragment, 'QuickBooks CRM reconciliation adapter')
+
 const client = read('app_src/lib/integrations/quickBooksClient.ts')
 for (const fragment of [
   "app: 'quickbooks'",
@@ -640,6 +663,7 @@ for (const fragment of [
   "filename = '0062_quickbooks_financial_explorer.sql'",
   "filename = '0063_quickbooks_financial_reports.sql'",
   "filename = '0064_quickbooks_write_control.sql'",
+  "filename = '0065_demo_and_quickbooks_crm_reconciliation.sql'",
   'readQuickBooksWorkerHeartbeatFromPostgres',
   'QuickBooks sync worker heartbeat is missing or stale.',
   'quickBooks: true',

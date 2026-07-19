@@ -24,7 +24,7 @@ ClawPilot is a private operating workspace that connects work boards, pipeline d
 7. [Shared Short Links](../modules/short-links.md) exposes controlled organization-scoped links to records and managed resources.
 8. [User Integrations and Credentials](../modules/user-integrations.md) lets each user connect the external services used by those workflows.
 9. [Toast Sales and Accounting](../modules/toast-and-accounting.md) ingests restaurant sales evidence and prepares controlled accounting drafts.
-10. [QuickBooks Accounting Connector](../modules/quickbooks-accounting.md) binds each active business to its own accounting catalog and controls product import and Toast mappings.
+10. [QuickBooks Accounting Connector](../modules/quickbooks-accounting.md) binds each active business to its own accounting catalog and controls customer/product CRM reconciliation, accounting writes, and Toast mappings.
 
 The [ClawPilot Identity](../brand/clawpilot-identity.md) contract keeps those surfaces visually and verbally consistent.
 
@@ -36,7 +36,7 @@ The [ClawPilot Identity](../brand/clawpilot-identity.md) contract keeps those su
 - User profile -> organization membership -> CRM account/contact -> Drive folder and pipeline resource scope.
 - Release -> Versions entry -> Build Brief -> searchable knowledge catalog.
 - Toast restaurant -> immutable source snapshot -> daily sales projection -> reviewable accounting draft.
-- User QuickBooks authorization -> active organization binding -> read-only catalog -> explicit CRM product import and Toast account mappings.
+- User QuickBooks authorization -> active organization binding -> read-only catalog -> configurable CRM customer/product reconciliation and Toast account mappings.
 
 ## Product Authority
 

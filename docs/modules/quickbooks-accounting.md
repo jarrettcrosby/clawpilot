@@ -37,8 +37,8 @@ flowchart LR
   Financial --> Explorer[Accounting explorer]
   Reports --> Explorer
   QBO --> Items[(Product and service projection)]
-  Items --> Selection[Explicit manager selection]
-  Selection --> CRM[(CRM product catalog)]
+  Items --> Reconcile[Configured identity reconciliation]
+  Reconcile --> CRM[(CRM customer and product catalog)]
   CRM --> Pipeline[Pipeline product dropdown]
 ```
 
@@ -52,8 +52,11 @@ flowchart LR
 - Selecting an invoice reconstructs a document view from its durable source payload, including customer and company addresses, dates, terms, item descriptions, quantities, rates, subtotal, tax, total, balance, and linked attachments.
 - Receipt and invoice attachments remain organization scoped. ClawPilot validates the signed-in user's accounting permission, resolves the organization binding on the server, and requests a short-lived QuickBooks download URL. Because Maton may reject QuickBooks' dedicated download resource, ClawPilot first refreshes the exact Attachable metadata and uses its temporary Intuit URL, retaining the documented download resource as a fallback. Provider credentials and durable download URLs are never returned by ClawPilot APIs.
 - Organization owners can view accounting data. Administrators can grant `viewAccounting` to selected organization members. `prepareAccounting` separately allows a user to create and submit drafts. `approveAccounting` is restricted to owners and explicitly authorized organization administrators. Connector management remains restricted to owners and access administrators.
-- Categories, inactive items, and ambiguous duplicate names are not imported as pipeline products.
-- Product import is explicit and limited to 100 selected active products or services per request. It stages durable CRM product records, queues SuiteCRM projection, and refreshes the selected pipeline's product catalog.
+- An organization manager can independently enable **Customers to CRM** and **Products to CRM** for the selected organization-owned pipeline. Saving the configuration reconciles the current cache immediately; each successful daily catalog refresh reconciles it again.
+- QuickBooks customer IDs map durably to CRM account Global IDs. Customers are placed beneath the active workspace CRM root. A person contact is created only when QuickBooks provides person-name evidence or a display name distinct from the company. Renames update the linked record instead of creating a duplicate.
+- QuickBooks item IDs map durably to CRM product Global IDs. Categories are excluded; inactive products remain inactive and therefore do not enter the active pipeline dropdown. Reconciliation refreshes the selected pipeline's atomic multi-product catalog.
+- `quickbooks_crm_links` retains provider entity ID, CRM record ID, source hash, pipeline, and organization. A provider ID never falls back across organizations or pipelines.
+- Managers can leave automatic reconciliation off and use the existing explicit product import, limited to 100 selected active products or services per request.
 - Read access does not create invoices, receipts, payments, journal entries, customers, or provider-side items.
 
 ## Toast Mapping Contract
@@ -92,6 +95,7 @@ The following remain outside this accepted boundary:
 - `quickbooks_financial_reports`
 - `quickbooks_sync_outbox`
 - `quickbooks_write_requests`
+- `quickbooks_crm_links`
 - `toast_accounting_mappings`
 - `toast_accounting_export_drafts`
 - `audit_events`
@@ -101,10 +105,10 @@ The following remain outside this accepted boundary:
 1. Run `npm run test:quickbooks` and `npm run test:toast`.
 2. Select an active Maton QuickBooks connection, switch to the intended workspace, and bind it in **Settings > Integrations > QuickBooks**.
 3. Confirm the company name matches the active organization before importing or mapping anything.
-4. Refresh the catalog and confirm `/api/health` reports migration `0064` plus a current QuickBooks worker heartbeat.
+4. Refresh the catalog and confirm `/api/health` reports migration `0065` plus a current QuickBooks worker heartbeat.
 5. Open each Financial reports tab and verify its period, basis, nested rows, totals, and latest-sync state against QuickBooks Online.
 6. Open an invoice and verify its item lines, quantity, rate, tax, total, balance, and customer addresses. Open one linked receipt image or PDF and confirm another organization cannot retrieve it.
-7. Import a small selected item set and verify CRM, SuiteCRM outbox, and pipeline product dropdown results.
+7. Enable customer and product reconciliation for a test pipeline. Verify customer accounts remain children of the workspace root, person contacts are not fabricated from company-only rows, provider renames update the same Global IDs, SuiteCRM outbox records are scoped correctly, and the pipeline product dropdown contains atomic active products.
 8. Save one Toast location mapping and confirm another organization cannot read or mutate it.
 9. Create a customer, product, and invoice draft. Confirm submission and approval preserve the same request fingerprint and record distinct signed-user audit events.
 10. With provider posting disabled, confirm an approved request remains approved and no QuickBooks mutation is sent.
