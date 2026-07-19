@@ -38,6 +38,7 @@ import {
 } from '@mui/material'
 import AddRounded from '@mui/icons-material/AddRounded'
 import AccountTreeRounded from '@mui/icons-material/AccountTreeRounded'
+import ArchiveRounded from '@mui/icons-material/ArchiveRounded'
 import ArrowBackRounded from '@mui/icons-material/ArrowBackRounded'
 import BusinessRounded from '@mui/icons-material/BusinessRounded'
 import CampaignRounded from '@mui/icons-material/CampaignRounded'
@@ -50,6 +51,7 @@ import OpenInNewRounded from '@mui/icons-material/OpenInNewRounded'
 import PhoneRounded from '@mui/icons-material/PhoneRounded'
 import RefreshRounded from '@mui/icons-material/RefreshRounded'
 import SearchRounded from '@mui/icons-material/SearchRounded'
+import SyncAltRounded from '@mui/icons-material/SyncAltRounded'
 import UploadFileRounded from '@mui/icons-material/UploadFileRounded'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import { annotateInteractionEventHistory } from '@/lib/crm/interactionHistory.mjs'
@@ -68,6 +70,17 @@ type CrmActionPayload = {
     lastError?: string | null
     responseSummary?: Record<string, unknown>
   }
+}
+type CampaignRecipient = {
+  id: string
+  contactId?: string | null
+  leadId?: string | null
+  referenceCode: string
+  name: string
+  email: string
+  status: string
+  sentAt?: string | null
+  lastError?: string | null
 }
 type PipelineInfo = {
   id: string
@@ -107,6 +120,7 @@ type CrmPayload = {
   workspaceHierarchy?: WorkspaceOrganization[]
   hierarchy?: WorkspaceOrganization[]
   pipelineUsers?: CrmPipelineUser[]
+  campaignRecipients?: CampaignRecipient[]
   canManageHierarchy?: boolean
   suiteCrmPunchoutUrl?: string | null
   suiteCrmUsername?: string | null
@@ -115,6 +129,21 @@ type CrmPayload = {
     googleMail?: string | null
     googleCalendar?: string | null
   }
+}
+type CrmLifecyclePayload = {
+  ok?: boolean
+  error?: string
+  result?: {
+    archived?: boolean
+    created?: boolean
+    accountReferenceCode?: string
+    contactReferenceCode?: string
+    opportunityReferenceCode?: string
+  }
+}
+type LifecycleDialog = {
+  type: 'archive' | 'convert-lead'
+  record: RecordValue
 }
 type EditorHistoryItem = {
   entity: CrmEntity
@@ -269,6 +298,7 @@ function initialFields(entity: CrmEntity, record: RecordValue | null, userTimeZo
   }
   if (entity === 'leads') return {
     fullName: textValue(source, 'fullName'), organizationId: textValue(source, 'organizationId'),
+    firstName: textValue(source, 'firstName'), lastName: textValue(source, 'lastName'),
     companyName: textValue(source, 'companyName'), jobTitle: textValue(source, 'jobTitle'),
     email: textValue(source, 'email'), phoneWork: textValue(source, 'phoneWork'),
     phoneMobile: textValue(source, 'phoneMobile'), status: textValue(source, 'status'),
@@ -357,6 +387,10 @@ export default function CrmSection() {
   const [contacts, setContacts] = useState<RecordValue[]>([])
   const [leads, setLeads] = useState<RecordValue[]>([])
   const [opportunities, setOpportunities] = useState<RecordValue[]>([])
+  const [campaigns, setCampaigns] = useState<RecordValue[]>([])
+  const [relatedActivity, setRelatedActivity] = useState<RecordValue[]>([])
+  const [campaignRecipients, setCampaignRecipients] = useState<CampaignRecipient[]>([])
+  const [relatedActivityLoading, setRelatedActivityLoading] = useState(false)
   const [priorityOptions, setPriorityOptions] = useState<string[]>(DEFAULT_PRIORITIES)
   const [pipelineUsers, setPipelineUsers] = useState<CrmPipelineUser[]>([])
   const [workspaceHierarchy, setWorkspaceHierarchy] = useState<WorkspaceOrganization[]>([])
@@ -373,6 +407,8 @@ export default function CrmSection() {
   const [relatedContactsLoading, setRelatedContactsLoading] = useState(false)
   const [actionComposer, setActionComposer] = useState<{ type: CrmActionType; record: RecordValue } | null>(null)
   const [actionFields, setActionFields] = useState<Record<string, string>>({})
+  const [lifecycleDialog, setLifecycleDialog] = useState<LifecycleDialog | null>(null)
+  const [lifecycleFields, setLifecycleFields] = useState<Record<string, string>>({})
   const [routeQuery, setRouteQuery] = useState('')
   const [routeReady, setRouteReady] = useState(false)
   const deepLinkOpened = useRef(false)
@@ -491,7 +527,13 @@ export default function CrmSection() {
     let cancelled = false
     const loadEditorOptions = async () => {
       const loadingRelatedContacts = editorEntity === 'organizations' && Boolean(editorRecord)
+      const loadingRelatedActivity = Boolean(editorRecord) && (editorEntity === 'leads' || editorEntity === 'campaigns')
       setRelatedContactsLoading(loadingRelatedContacts)
+      setRelatedActivityLoading(loadingRelatedActivity)
+      if (loadingRelatedActivity) {
+        setRelatedActivity([])
+        setCampaignRecipients([])
+      }
       try {
         if (loadingRelatedContacts) {
           const contactRecords = await loadCrmOptions('contacts')
@@ -506,8 +548,18 @@ export default function CrmSection() {
           if (!cancelled) setOrganizations(organizationRecords)
         }
         if (editorEntity === 'interactions') {
-          const contactRecords = await loadCrmOptions('contacts')
+          const [contactRecords, leadRecords, opportunityRecords, campaignRecords] = await Promise.all([
+            loadCrmOptions('contacts'),
+            loadCrmOptions('leads'),
+            loadCrmOptions('opportunities'),
+            loadCrmOptions('campaigns'),
+          ])
           if (!cancelled) setContacts(contactRecords)
+          if (!cancelled) {
+            setLeads(leadRecords)
+            setOpportunities(opportunityRecords)
+            setCampaigns(campaignRecords)
+          }
         }
         if (editorEntity === 'meetings') {
           const [contactRecords, leadRecords, opportunityRecords] = await Promise.all([
@@ -521,12 +573,49 @@ export default function CrmSection() {
             setOpportunities(opportunityRecords)
           }
         }
+        if (editorEntity === 'leads' && editorRecord
+          && (editorRecord.convertedContactId || editorRecord.convertedOpportunityId)) {
+          const [contactRecords, opportunityRecords] = await Promise.all([
+            loadCrmOptions('contacts'),
+            loadCrmOptions('opportunities'),
+          ])
+          if (!cancelled) {
+            setContacts(contactRecords)
+            setOpportunities(opportunityRecords)
+          }
+        }
+        if (editorEntity === 'campaigns' && editorRecord) {
+          const [contactRecords, leadRecords] = await Promise.all([
+            loadCrmOptions('contacts'),
+            loadCrmOptions('leads'),
+          ])
+          if (!cancelled) {
+            setContacts(contactRecords)
+            setLeads(leadRecords)
+          }
+        }
+        if (loadingRelatedActivity && editorRecord) {
+          const parameters = new URLSearchParams({
+            entity: 'interactions',
+            relatedEntity: editorEntity,
+            relatedId: textValue(editorRecord, 'id'),
+            limit: '100',
+          })
+          const response = await fetch(`/api/crm?${parameters}`)
+          const payload = await response.json().catch(() => ({})) as CrmPayload
+          if (!response.ok || !payload.ok) throw new Error(payload.error || 'Unable to load CRM activity')
+          if (!cancelled) {
+            setRelatedActivity(annotateInteractionEventHistory(payload.records || []))
+            setCampaignRecipients(payload.campaignRecipients || [])
+          }
+        }
       } catch (optionsError) {
         if (!cancelled) {
           setError(optionsError instanceof Error ? optionsError.message : 'Unable to load CRM relationship options')
         }
       } finally {
         if (!cancelled && loadingRelatedContacts) setRelatedContactsLoading(false)
+        if (!cancelled && loadingRelatedActivity) setRelatedActivityLoading(false)
       }
     }
     void loadEditorOptions()
@@ -535,7 +624,11 @@ export default function CrmSection() {
 
   const editable = Boolean(pipeline && pipeline.accessRole !== 'viewer' && entity !== 'opportunities')
   const editorEditable = Boolean(pipeline && pipeline.accessRole !== 'viewer' && editorEntity !== 'opportunities')
-  const recordEditable = editorEditable && (editorEntity === 'products' || !editorRecord?.workspaceOrganizationId)
+  const convertedLead = editorEntity === 'leads'
+    && Boolean(editorRecord?.convertedContactId || editorRecord?.convertedOpportunityId)
+  const recordEditable = editorEditable
+    && (editorEntity === 'products' || !editorRecord?.workspaceOrganizationId)
+    && !convertedLead
   const tableColumns = useMemo(() => columns(entity), [entity])
   const relatedContacts = useMemo(() => {
     const organizationId = editorEntity === 'organizations' && editorRecord
@@ -569,6 +662,22 @@ export default function CrmSection() {
         : Array.isArray(opportunity.contactIds) && opportunity.contactIds.map(String).includes(recordId))
       .sort((left, right) => textValue(left, 'name').localeCompare(textValue(right, 'name')))
   }, [editorEntity, editorRecord, opportunities])
+  const convertedContact = useMemo(() => {
+    if (!editorRecord?.convertedContactId) return null
+    return contacts.find((contact) => textValue(contact, 'id') === textValue(editorRecord, 'convertedContactId')) || null
+  }, [contacts, editorRecord])
+  const convertedOrganization = useMemo(() => {
+    if (!editorRecord?.organizationId) return null
+    return organizations.find((organization) => (
+      textValue(organization, 'id') === textValue(editorRecord, 'organizationId')
+    )) || null
+  }, [editorRecord, organizations])
+  const convertedOpportunity = useMemo(() => {
+    if (!editorRecord?.convertedOpportunityId) return null
+    return opportunities.find((opportunity) => (
+      textValue(opportunity, 'id') === textValue(editorRecord, 'convertedOpportunityId')
+    )) || null
+  }, [editorRecord, opportunities])
   const actionReady = Boolean(actionComposer && (
     actionComposer.type === 'send_email'
       ? actionFields.subject?.trim() && actionFields.text?.trim()
@@ -634,6 +743,16 @@ export default function CrmSection() {
     setRelatedContactsLoading(false)
   }
 
+  function openRelatedInteraction(record: RecordValue) {
+    if (!editorRecord) return
+    setEditorHistory((history) => [...history, { entity: editorEntity, record: editorRecord, fields }])
+    setEditorEntity('interactions')
+    setEditorRecord(record)
+    setFields(initialFields('interactions', record, dateTimeSettings.timeZone))
+    setRelatedContactsLoading(false)
+    setRelatedActivityLoading(false)
+  }
+
   function returnToPreviousEditor() {
     const previous = editorHistory[editorHistory.length - 1]
     if (!previous) return
@@ -649,6 +768,60 @@ export default function CrmSection() {
     setEditorRecord(undefined)
     setEditorHistory([])
     setRelatedContactsLoading(false)
+    setRelatedActivityLoading(false)
+  }
+
+  function openLifecycleDialog(type: LifecycleDialog['type'], record: RecordValue) {
+    if (type === 'convert-lead') {
+      const accountName = textValue(record, 'organizationName') || textValue(record, 'companyName')
+        || `${textValue(record, 'fullName')} Account`
+      setLifecycleFields({
+        accountName,
+        opportunityName: `${accountName} - ${textValue(record, 'fullName')}`,
+        opportunityValue: '0',
+      })
+    } else {
+      setLifecycleFields({})
+    }
+    setLifecycleDialog({ type, record })
+  }
+
+  async function submitLifecycleAction() {
+    if (!lifecycleDialog) return
+    setBusy(true)
+    setError('')
+    try {
+      const response = await fetch('/api/crm', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: lifecycleDialog.type,
+          entity: editorEntity,
+          id: lifecycleDialog.record.id,
+          ...(lifecycleDialog.type === 'convert-lead' ? {
+            fields: {
+              accountName: lifecycleFields.accountName,
+              opportunityName: lifecycleFields.opportunityName,
+              opportunityValue: Number(lifecycleFields.opportunityValue || 0),
+            },
+          } : {}),
+        }),
+      })
+      const payload = await response.json().catch(() => ({})) as CrmLifecyclePayload
+      if (!response.ok || !payload.ok) throw new Error(payload.error || 'CRM lifecycle action failed')
+      const wasConversion = lifecycleDialog.type === 'convert-lead'
+      setLifecycleDialog(null)
+      setEditorRecord(undefined)
+      setEditorHistory([])
+      setNotice(wasConversion
+        ? `Lead converted to ${payload.result?.accountReferenceCode}, ${payload.result?.contactReferenceCode}, and ${payload.result?.opportunityReferenceCode}`
+        : `${ENTITY_LABELS[editorEntity].slice(0, -1)} archived`)
+      await load(entity, query, needsReviewOnly)
+    } catch (lifecycleError) {
+      setError(lifecycleError instanceof Error ? lifecycleError.message : 'CRM lifecycle action failed')
+    } finally {
+      setBusy(false)
+    }
   }
 
   async function saveRecord() {
@@ -1183,6 +1356,59 @@ export default function CrmSection() {
         </DialogActions>
       </Dialog>
 
+      <Dialog
+        open={Boolean(lifecycleDialog)}
+        onClose={() => { if (!busy) setLifecycleDialog(null) }}
+        fullScreen={shortLandscape}
+        fullWidth
+        maxWidth="xs"
+      >
+        <DialogTitle>{lifecycleDialog?.type === 'convert-lead' ? 'Convert lead' : 'Archive record'}</DialogTitle>
+        <DialogContent>
+          {lifecycleDialog?.type === 'convert-lead' ? (
+            <Stack spacing={2} mt={0.5}>
+              <TextField
+                label="Account"
+                required
+                value={lifecycleFields.accountName || ''}
+                onChange={(event) => setLifecycleFields({ ...lifecycleFields, accountName: event.target.value })}
+              />
+              <TextField
+                label="Opportunity"
+                required
+                value={lifecycleFields.opportunityName || ''}
+                onChange={(event) => setLifecycleFields({ ...lifecycleFields, opportunityName: event.target.value })}
+              />
+              <TextField
+                label="Opportunity value"
+                type="number"
+                inputProps={{ min: 0, step: '0.01' }}
+                value={lifecycleFields.opportunityValue || '0'}
+                onChange={(event) => setLifecycleFields({ ...lifecycleFields, opportunityValue: event.target.value })}
+              />
+            </Stack>
+          ) : (
+            <Typography mt={0.5}>
+              Archive {textValue(lifecycleDialog?.record || {}, 'fullName')
+                || textValue(lifecycleDialog?.record || {}, 'name')
+                || textValue(lifecycleDialog?.record || {}, 'referenceCode')}?
+            </Typography>
+          )}
+        </DialogContent>
+        <DialogActions sx={{ flexWrap: 'wrap' }}>
+          <Button onClick={() => setLifecycleDialog(null)} disabled={busy}>Cancel</Button>
+          <Button
+            variant="contained"
+            color={lifecycleDialog?.type === 'archive' ? 'error' : 'primary'}
+            onClick={submitLifecycleAction}
+            disabled={busy || (lifecycleDialog?.type === 'convert-lead'
+              && (!lifecycleFields.accountName?.trim() || !lifecycleFields.opportunityName?.trim()))}
+          >
+            {busy ? 'Working…' : lifecycleDialog?.type === 'convert-lead' ? 'Convert' : 'Archive'}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
       <Drawer
         anchor="right"
         open={hierarchyOpen}
@@ -1303,6 +1529,22 @@ export default function CrmSection() {
                 <Button startIcon={<CampaignRounded />} variant="outlined" onClick={() => openAction('send_campaign', editorRecord)}>
                   Send campaign
                 </Button>
+              )}
+              {editorEntity === 'leads' && !convertedLead && (
+                <Button startIcon={<SyncAltRounded />} variant="outlined" onClick={() => openLifecycleDialog('convert-lead', editorRecord)}>
+                  Convert
+                </Button>
+              )}
+              {(editorEntity === 'leads' || editorEntity === 'campaigns') && (
+                <Tooltip title={`Archive ${ENTITY_LABELS[editorEntity].slice(0, -1).toLowerCase()}`}>
+                  <IconButton
+                    aria-label={`Archive ${ENTITY_LABELS[editorEntity].slice(0, -1).toLowerCase()}`}
+                    color="error"
+                    onClick={() => openLifecycleDialog('archive', editorRecord)}
+                  >
+                    <ArchiveRounded />
+                  </IconButton>
+                </Tooltip>
               )}
             </Stack>
           )}
@@ -1427,6 +1669,10 @@ export default function CrmSection() {
           </>}
           {editorEntity === 'leads' && <>
             <TextField disabled={!recordEditable} label="Lead" value={fields.fullName || ''} onChange={(event) => setFields({ ...fields, fullName: event.target.value })} required />
+            <Stack direction={{ xs: 'column', sm: 'row' }} gap={2} sx={{ minWidth: 0 }}>
+              <TextField fullWidth disabled={!recordEditable} label="First name" value={fields.firstName || ''} onChange={(event) => setFields({ ...fields, firstName: event.target.value })} />
+              <TextField fullWidth disabled={!recordEditable} label="Last name" value={fields.lastName || ''} onChange={(event) => setFields({ ...fields, lastName: event.target.value })} />
+            </Stack>
             <TextField disabled={!recordEditable} select label="Organization" value={fields.organizationId || ''} onChange={(event) => setFields({ ...fields, organizationId: event.target.value })}>
               <MenuItem value="">Unlinked</MenuItem>
               {fields.organizationId && !organizations.some((record) => textValue(record, 'id') === fields.organizationId) ? (
@@ -1445,6 +1691,15 @@ export default function CrmSection() {
             <TextField disabled={!recordEditable} label="Mobile" value={fields.phoneMobile || ''} onChange={(event) => setFields({ ...fields, phoneMobile: event.target.value })} />
             <TextField disabled={!recordEditable} label="Status" value={fields.status || ''} onChange={(event) => setFields({ ...fields, status: event.target.value })} />
             <TextField disabled={!recordEditable} label="Source" value={fields.source || ''} onChange={(event) => setFields({ ...fields, source: event.target.value })} />
+            <TextField disabled={!recordEditable} select label="Owner" value={fields.assignedTo || ''} onChange={(event) => setFields({ ...fields, assignedTo: event.target.value })}>
+              <MenuItem value="">Unassigned</MenuItem>
+              {fields.assignedTo && !pipelineUsers.some((user) => (
+                user.email === fields.assignedTo || user.displayName === fields.assignedTo
+              )) ? <MenuItem value={fields.assignedTo}>{fields.assignedTo} (legacy)</MenuItem> : null}
+              {pipelineUsers.map((user) => (
+                <MenuItem key={user.email} value={user.email}>{user.displayName} ({user.email})</MenuItem>
+              ))}
+            </TextField>
           </>}
           {editorEntity === 'opportunities' && <>
             <TextField disabled label="Opportunity" value={fields.name || ''} />
@@ -1539,6 +1794,18 @@ export default function CrmSection() {
                 .filter((record) => !fields.organizationId || textValue(record, 'organizationId') === fields.organizationId)
                 .map((record) => <MenuItem key={textValue(record, 'id')} value={textValue(record, 'id')}>{textValue(record, 'fullName')}</MenuItem>)}
             </TextField>
+            <TextField disabled={!recordEditable} select label="Lead" value={fields.leadId || ''} onChange={(event) => setFields({ ...fields, leadId: event.target.value })}>
+              <MenuItem value="">None</MenuItem>
+              {leads.map((record) => <MenuItem key={textValue(record, 'id')} value={textValue(record, 'id')}>{textValue(record, 'fullName')}</MenuItem>)}
+            </TextField>
+            <TextField disabled={!recordEditable} select label="Opportunity" value={fields.opportunityId || ''} onChange={(event) => setFields({ ...fields, opportunityId: event.target.value })}>
+              <MenuItem value="">None</MenuItem>
+              {opportunities.map((record) => <MenuItem key={textValue(record, 'id')} value={textValue(record, 'id')}>{textValue(record, 'name')}</MenuItem>)}
+            </TextField>
+            <TextField disabled={!recordEditable} select label="Campaign" value={fields.campaignId || ''} onChange={(event) => setFields({ ...fields, campaignId: event.target.value })}>
+              <MenuItem value="">None</MenuItem>
+              {campaigns.map((record) => <MenuItem key={textValue(record, 'id')} value={textValue(record, 'id')}>{textValue(record, 'name')}</MenuItem>)}
+            </TextField>
             <TextField disabled={!recordEditable} select required label="Type" value={fields.interactionType || ''} onChange={(event) => setFields({ ...fields, interactionType: event.target.value })}>
               {fields.interactionType && !INTERACTION_TYPES.some((option) => option.value === fields.interactionType) ? (
                 <MenuItem value={fields.interactionType}>{fields.interactionType} (legacy)</MenuItem>
@@ -1579,6 +1846,121 @@ export default function CrmSection() {
             <TextField disabled={!recordEditable} label="Message template" value={fields.bodyTemplate || ''} onChange={(event) => setFields({ ...fields, bodyTemplate: event.target.value })} multiline minRows={8} />
           </>}
           <TextField disabled={!recordEditable} label="Description" value={fields.description || fields.notes || ''} onChange={(event) => setFields({ ...fields, description: event.target.value, notes: event.target.value })} multiline minRows={4} />
+          {editorEntity === 'leads' && editorRecord && convertedLead && (
+            <Box component="section" aria-label="Converted records" sx={{ minWidth: 0 }}>
+              <Typography variant="subtitle2" fontWeight={700}>Converted records</Typography>
+              <Divider sx={{ mt: 1 }} />
+              <List disablePadding>
+                <ListItemButton
+                  disabled={!convertedOrganization}
+                  onClick={() => { if (convertedOrganization) openRelatedOrganization(convertedOrganization) }}
+                  sx={{ px: 0, py: 1.25, minWidth: 0 }}
+                >
+                  <ListItemText
+                    primary={textValue(editorRecord, 'organizationName') || 'Account'}
+                    secondary={textValue(editorRecord, 'organizationReferenceCode') || 'Account'}
+                    primaryTypographyProps={{ fontWeight: 600, sx: { overflowWrap: 'anywhere' } }}
+                    sx={{ minWidth: 0 }}
+                  />
+                  {convertedOrganization ? <ChevronRightRounded color="action" /> : null}
+                </ListItemButton>
+                <ListItemButton
+                  disabled={!convertedContact}
+                  onClick={() => { if (convertedContact) openRelatedContact(convertedContact) }}
+                  sx={{ px: 0, py: 1.25, minWidth: 0 }}
+                >
+                  <ListItemText
+                    primary={textValue(editorRecord, 'convertedContactName') || 'Contact'}
+                    secondary={textValue(editorRecord, 'convertedContactReferenceCode') || 'Contact'}
+                    primaryTypographyProps={{ fontWeight: 600, sx: { overflowWrap: 'anywhere' } }}
+                    sx={{ minWidth: 0 }}
+                  />
+                  {convertedContact ? <ChevronRightRounded color="action" /> : null}
+                </ListItemButton>
+                <ListItemButton
+                  disabled={!convertedOpportunity}
+                  onClick={() => { if (convertedOpportunity) openRelatedOpportunity(convertedOpportunity) }}
+                  sx={{ px: 0, py: 1.25, minWidth: 0 }}
+                >
+                  <ListItemText
+                    primary={textValue(editorRecord, 'convertedOpportunityName') || 'Opportunity'}
+                    secondary={textValue(editorRecord, 'convertedOpportunityReferenceCode') || 'Opportunity'}
+                    primaryTypographyProps={{ fontWeight: 600, sx: { overflowWrap: 'anywhere' } }}
+                    sx={{ minWidth: 0 }}
+                  />
+                  {convertedOpportunity ? <ChevronRightRounded color="action" /> : null}
+                </ListItemButton>
+              </List>
+            </Box>
+          )}
+          {editorEntity === 'campaigns' && editorRecord && (
+            <Box component="section" aria-label="Campaign recipients" sx={{ minWidth: 0 }}>
+              <Stack direction="row" justifyContent="space-between" alignItems="center" gap={1}>
+                <Typography variant="subtitle2" fontWeight={700}>Recipients</Typography>
+                {!relatedActivityLoading && <Typography variant="caption" color="text.secondary">{campaignRecipients.length}</Typography>}
+              </Stack>
+              <Divider sx={{ mt: 1 }} />
+              {relatedActivityLoading ? (
+                <Box sx={{ py: 2.5, display: 'grid', placeItems: 'center' }}><CircularProgress size={22} /></Box>
+              ) : campaignRecipients.length > 0 ? (
+                <List disablePadding>
+                  {campaignRecipients.map((recipient, index) => (
+                    <ListItemButton key={recipient.id} disabled divider={index < campaignRecipients.length - 1} sx={{ px: 0, py: 1.25, minWidth: 0 }}>
+                      <ListItemText
+                        primary={recipient.name || recipient.email}
+                        secondary={[recipient.referenceCode, recipient.email, recipient.status].filter(Boolean).join(' · ')}
+                        primaryTypographyProps={{ fontWeight: 600, sx: { overflowWrap: 'anywhere' } }}
+                        secondaryTypographyProps={{ sx: { whiteSpace: 'normal', overflowWrap: 'anywhere' } }}
+                        sx={{ minWidth: 0 }}
+                      />
+                      <Chip size="small" label={recipient.status} variant="outlined" color={recipient.status === 'failed' ? 'error' : recipient.status === 'sent' ? 'success' : recipient.status === 'suppressed' ? 'warning' : 'default'} />
+                    </ListItemButton>
+                  ))}
+                </List>
+              ) : (
+                <Typography variant="body2" color="text.secondary" sx={{ py: 2 }}>No campaign recipients</Typography>
+              )}
+            </Box>
+          )}
+          {(editorEntity === 'leads' || editorEntity === 'campaigns') && editorRecord && (
+            <Box component="section" aria-label="Related CRM activity" sx={{ minWidth: 0 }}>
+              <Stack direction="row" justifyContent="space-between" alignItems="center" gap={1}>
+                <Typography variant="subtitle2" fontWeight={700}>Activity</Typography>
+                {!relatedActivityLoading && <Typography variant="caption" color="text.secondary">{relatedActivity.length}</Typography>}
+              </Stack>
+              <Divider sx={{ mt: 1 }} />
+              {relatedActivityLoading ? (
+                <Box sx={{ py: 2.5, display: 'grid', placeItems: 'center' }}><CircularProgress size={22} /></Box>
+              ) : relatedActivity.length > 0 ? (
+                <List disablePadding>
+                  {relatedActivity.map((activity, index) => (
+                    <ListItemButton
+                      key={textValue(activity, 'id')}
+                      divider={index < relatedActivity.length - 1}
+                      onClick={() => openRelatedInteraction(activity)}
+                      sx={{ px: 0, py: 1.25, alignItems: 'flex-start', minWidth: 0 }}
+                    >
+                      <ListItemText
+                        primary={textValue(activity, 'subject') || textValue(activity, 'referenceCode')}
+                        secondary={[
+                          textValue(activity, 'interactionType'),
+                          displayValue(activity, 'occurredAt', dateTimeSettings),
+                          textValue(activity, 'deliveryStatus'),
+                          textValue(activity, 'referenceCode'),
+                        ].filter((value) => value && value !== '—').join(' · ')}
+                        primaryTypographyProps={{ fontWeight: 600, sx: { overflowWrap: 'anywhere' } }}
+                        secondaryTypographyProps={{ sx: { whiteSpace: 'normal', overflowWrap: 'anywhere' } }}
+                        sx={{ minWidth: 0 }}
+                      />
+                      <ChevronRightRounded color="action" sx={{ mt: 0.5, ml: 1, flexShrink: 0 }} />
+                    </ListItemButton>
+                  ))}
+                </List>
+              ) : (
+                <Typography variant="body2" color="text.secondary" sx={{ py: 2 }}>No related activity</Typography>
+              )}
+            </Box>
+          )}
           {editorEntity === 'organizations' && editorRecord && (
             <Box component="section" sx={{ minWidth: 0 }}>
               <Stack direction="row" justifyContent="space-between" alignItems="center" gap={1}>

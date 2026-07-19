@@ -127,6 +127,8 @@ try {
   }
   if (expectedStorage === 'postgres') {
     check(persistence?.database === 'reachable', 'Postgres is reachable')
+    check(typeof persistence?.databaseFingerprint === 'string' && persistence.databaseFingerprint.length > 0,
+      'Postgres deployment identity is available')
     check(health?.database?.migrationsCurrent === true, 'database migrations are current')
     if (health?.runtime === 'railway') {
       check(health?.worker?.status === 'reachable', 'pipeline outbox worker heartbeat is fresh')

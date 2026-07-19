@@ -10,6 +10,18 @@ const DEMO_EMAIL = 'demo-system@clawpilot.example'
 const ROOT_ORGANIZATION_ID = '10000000-0000-4000-8000-000000000001'
 const PIPELINE_ID = '20000000-0000-4000-8000-000000000001'
 const BOARD_ID = '30000000-0000-4000-8000-000000000001'
+const TOAST_RESTAURANT_GUID = '90000000-0000-4000-8000-000000000001'
+const TOAST_MENU_GUID = '91000000-0000-4000-8000-000000000001'
+const TOAST_TAX_GUID = '93000000-0000-4000-8000-000000000001'
+const TOAST_DISCOUNT_GUID = '93000000-0000-4000-8000-000000000002'
+
+const DEMO_MENU = [
+  { id: '94000000-0000-4000-8000-000000000001', name: 'Harbor melt', groupId: '92000000-0000-4000-8000-000000000001', group: 'Sandwiches', categoryId: '93000000-0000-4000-8000-000000000011', price: 15 },
+  { id: '94000000-0000-4000-8000-000000000002', name: 'Garden wrap', groupId: '92000000-0000-4000-8000-000000000001', group: 'Sandwiches', categoryId: '93000000-0000-4000-8000-000000000011', price: 13.5 },
+  { id: '94000000-0000-4000-8000-000000000003', name: 'Market fries', groupId: '92000000-0000-4000-8000-000000000002', group: 'Sides', categoryId: '93000000-0000-4000-8000-000000000012', price: 6 },
+  { id: '94000000-0000-4000-8000-000000000004', name: 'Cold brew', groupId: '92000000-0000-4000-8000-000000000003', group: 'Drinks', categoryId: '93000000-0000-4000-8000-000000000013', price: 5.5 },
+  { id: '94000000-0000-4000-8000-000000000005', name: 'Seasonal bowl', groupId: '92000000-0000-4000-8000-000000000004', group: 'Bowls', categoryId: '93000000-0000-4000-8000-000000000014', price: 17 },
+]
 
 function fail(message) {
   console.error(`demo:seed failed: ${message}`)
@@ -60,7 +72,19 @@ async function main() {
       [ROOT_ORGANIZATION_ID],
     )
     await client.query(
+      `DELETE FROM pos_accounting_catalog_mappings WHERE organization_id = $1::uuid`,
+      [ROOT_ORGANIZATION_ID],
+    )
+    await client.query(
+      `DELETE FROM pos_accounting_profiles WHERE organization_id = $1::uuid`,
+      [ROOT_ORGANIZATION_ID],
+    )
+    await client.query(
       `DELETE FROM organization_quickbooks_connections WHERE organization_id = $1::uuid`,
+      [ROOT_ORGANIZATION_ID],
+    )
+    await client.query(
+      `DELETE FROM toast_locations WHERE organization_id = $1::uuid`,
       [ROOT_ORGANIZATION_ID],
     )
     await client.query(
@@ -168,6 +192,212 @@ async function main() {
          updated_at = EXCLUDED.updated_at`,
       [ROOT_ORGANIZATION_ID, DEMO_EMAIL, dataset.generatedAt],
     )
+
+    await client.query(
+      `INSERT INTO toast_locations (
+         organization_id, restaurant_guid, restaurant_name, location_name, location_code,
+         timezone, active, test_mode, archived, analytics_access, standard_access,
+         selected, last_verified_at, created_at, updated_at
+       ) VALUES (
+         $1::uuid, $2::uuid, 'Harbor Street Kitchen', 'Mobile kitchen', 'DEMO-TRUCK-01',
+         'America/New_York', true, true, false, false, true, true,
+         $3::timestamptz, $3::timestamptz, $3::timestamptz
+       )`,
+      [ROOT_ORGANIZATION_ID, TOAST_RESTAURANT_GUID, dataset.generatedAt],
+    )
+    await client.query(
+      `INSERT INTO toast_menu_catalog_restaurants (
+         organization_id, restaurant_guid, provider_restaurant_id, name, timezone,
+         source_revision, synced_at, created_at, updated_at
+       ) VALUES ($1::uuid, $2::uuid, $2::text, 'Harbor Street Kitchen', 'America/New_York',
+         $3::timestamptz, $3::timestamptz, $3::timestamptz, $3::timestamptz)`,
+      [ROOT_ORGANIZATION_ID, TOAST_RESTAURANT_GUID, dataset.generatedAt],
+    )
+    await client.query(
+      `INSERT INTO toast_menu_catalog_menus (
+         organization_id, restaurant_guid, menu_guid, provider_menu_id, name, visibility,
+         position, source_revision, synced_at, created_at, updated_at
+       ) VALUES ($1::uuid, $2::uuid, $3::uuid, $3::text, 'Harbor Street menu',
+         ARRAY['POS','ONLINE']::text[], 0, $4::timestamptz, $4::timestamptz,
+         $4::timestamptz, $4::timestamptz)`,
+      [ROOT_ORGANIZATION_ID, TOAST_RESTAURANT_GUID, TOAST_MENU_GUID, dataset.generatedAt],
+    )
+    const menuGroups = [...new Map(DEMO_MENU.map((item) => [item.groupId, item])).values()]
+    for (const [position, group] of menuGroups.entries()) {
+      await client.query(
+        `INSERT INTO toast_menu_catalog_groups (
+           organization_id, restaurant_guid, menu_guid, group_guid, provider_group_id,
+           name, visibility, position, source_revision, synced_at, created_at, updated_at
+         ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $4::text, $5,
+           ARRAY['POS','ONLINE']::text[], $6, $7::timestamptz, $7::timestamptz,
+           $7::timestamptz, $7::timestamptz)`,
+        [ROOT_ORGANIZATION_ID, TOAST_RESTAURANT_GUID, TOAST_MENU_GUID,
+          group.groupId, group.group, position, dataset.generatedAt],
+      )
+      await client.query(
+        `INSERT INTO toast_menu_catalog_sales_categories (
+           organization_id, restaurant_guid, sales_category_guid,
+           provider_sales_category_id, name, source_revision, synced_at, created_at, updated_at
+         ) VALUES ($1::uuid, $2::uuid, $3::uuid, $3::text, $4,
+           $5::timestamptz, $5::timestamptz, $5::timestamptz, $5::timestamptz)`,
+        [ROOT_ORGANIZATION_ID, TOAST_RESTAURANT_GUID, group.categoryId,
+          group.group, dataset.generatedAt],
+      )
+    }
+    for (const [position, item] of DEMO_MENU.entries()) {
+      await client.query(
+        `INSERT INTO toast_menu_catalog_items (
+           organization_id, restaurant_guid, menu_guid, group_guid, item_guid,
+           provider_item_id, name, price, visibility, sales_category_guid,
+           provider_sales_category_id, position, source_revision, synced_at, created_at, updated_at
+         ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $5::text,
+           $6, $7, ARRAY['POS','ONLINE']::text[], $8::uuid, $8::text, $9,
+           $10::timestamptz, $10::timestamptz, $10::timestamptz, $10::timestamptz)`,
+        [ROOT_ORGANIZATION_ID, TOAST_RESTAURANT_GUID, TOAST_MENU_GUID,
+          item.groupId, item.id, item.name, item.price, item.categoryId, position, dataset.generatedAt],
+      )
+    }
+    await client.query(
+      `INSERT INTO toast_menu_catalog_sync_status (
+         organization_id, restaurant_guid, provider_restaurant_id, source_revision,
+         observed_source_revision, status, menu_count, group_count, item_count,
+         sales_category_count, last_checked_at, last_synced_at, created_at, updated_at
+       ) VALUES ($1::uuid, $2::uuid, $2::text, $3::timestamptz, $3::timestamptz,
+         'ready', 1, $4, $5, $4, $3::timestamptz, $3::timestamptz,
+         $3::timestamptz, $3::timestamptz)`,
+      [ROOT_ORGANIZATION_ID, TOAST_RESTAURANT_GUID, dataset.generatedAt,
+        menuGroups.length, DEMO_MENU.length],
+    )
+    for (let day = 0; day < 30; day += 1) {
+      const businessDate = isoDaysAgo(day, 12).slice(0, 10)
+      const orderCount = 6 + (day % 5)
+      const daily = {
+        gross: 0, net: 0, discounts: 0, tax: 0, tips: 0,
+        service: 0, tendered: 0, total: 0, cash: 0, card: 0,
+      }
+      for (let orderIndex = 0; orderIndex < orderCount; orderIndex += 1) {
+        const sequence = day * 20 + orderIndex + 1
+        const gross = Number((12.5 + ((sequence * 137) % 2400) / 100).toFixed(2))
+        const discount = orderIndex % 4 === 0 ? Number((gross * 0.1).toFixed(2)) : 0
+        const net = Number((gross - discount).toFixed(2))
+        const tax = Number((net * 0.0625).toFixed(2))
+        const tip = orderIndex % 3 === 0 ? Number((net * 0.15).toFixed(2)) : 0
+        const tendered = Number((net + tax).toFixed(2))
+        const total = Number((tendered + tip).toFixed(2))
+        const cash = orderIndex % 5 === 0 ? tendered : 0
+        const card = cash ? 0 : tendered
+        daily.gross += gross
+        daily.net += net
+        daily.discounts += discount
+        daily.tax += tax
+        daily.tips += tip
+        daily.tendered += tendered
+        daily.total += total
+        daily.cash += cash
+        daily.card += card
+        const orderGuid = `demo-pos-${businessDate}-${String(orderIndex + 1).padStart(3, '0')}`
+        const openedAt = isoDaysAgo(day, 11 + (orderIndex % 7))
+        const selectedItem = DEMO_MENU[sequence % DEMO_MENU.length]
+        const processingFee = cash ? null : Number((tendered * 0.029 + 0.15).toFixed(2))
+        const details = {
+          synthetic: true,
+          checks: [{
+            displayNumber: String(1000 + sequence),
+            paymentStatus: 'PAID',
+            amount: net,
+            tax,
+            total,
+            serviceCharges: 0,
+            selections: [{
+              itemGuid: selectedItem.id,
+              providerGuid: selectedItem.id,
+              itemName: selectedItem.name,
+              name: selectedItem.name,
+              groupGuid: selectedItem.groupId,
+              groupName: selectedItem.group,
+              quantity: 1,
+              gross,
+              net,
+              tax,
+              voided: false,
+              modifiers: [],
+              discounts: discount ? [{
+                providerGuid: TOAST_DISCOUNT_GUID,
+                name: 'Demo discount',
+                amount: discount,
+              }] : [],
+              taxes: [{
+                providerGuid: TOAST_TAX_GUID,
+                name: 'Sales tax',
+                amount: tax,
+              }],
+            }],
+            payments: [{
+              type: cash ? 'CASH' : 'CREDIT',
+              cardBrand: cash ? null : ['VISA', 'MASTERCARD', 'AMEX'][sequence % 3],
+              status: 'CAPTURED',
+              amount: tendered,
+              tip,
+              processingFee,
+              refunded: false,
+            }],
+          }],
+        }
+        await client.query(
+          `INSERT INTO toast_pos_orders (
+             organization_id, restaurant_guid, order_guid, business_date, display_number,
+             source, dining_option, approval_status, payment_status, opened_at, closed_at, paid_at,
+             guest_count, check_count, item_count, gross_sales, net_sales, discounts, tax,
+             service_charges, tips, refunds, tendered, total, cash_tender, card_tender,
+             other_tender, voided, deleted, details, payload_hash, created_at, updated_at
+           ) VALUES (
+             $1::uuid, $2::uuid, $3, $4::date, $5, 'Demo counter', 'TAKE_OUT', 'APPROVED',
+             'PAID', $6::timestamptz, $6::timestamptz, $6::timestamptz,
+             1, 1, 1, $7, $8, $9, $10, 0, $11, 0, $12, $13, $14, $15,
+             0, false, false, $16::jsonb, $17, $6::timestamptz, $6::timestamptz
+           )`,
+          [ROOT_ORGANIZATION_ID, TOAST_RESTAURANT_GUID, orderGuid, businessDate,
+            String(1000 + sequence), openedAt, gross, net, discount, tax, tip,
+            tendered, total, cash, card, JSON.stringify(details), digest(details)],
+        )
+      }
+      for (const key of Object.keys(daily)) daily[key] = Number(daily[key].toFixed(2))
+      await client.query(
+        `INSERT INTO toast_daily_sales (
+           organization_id, restaurant_guid, business_date, standard_orders_count,
+           standard_gross_sales, standard_net_sales, standard_discounts, standard_voids,
+           standard_refunds, standard_tax, standard_tips, standard_service_charges,
+           standard_tendered, standard_total, standard_cash, standard_card,
+           standard_other_tender, source_revision, updated_at
+         ) VALUES (
+           $1::uuid, $2::uuid, $3::date, $4, $5, $6, $7, 0, 0, $8, $9, 0,
+           $10, $11, $12, $13, 0, 1, $14::timestamptz
+         )`,
+        [ROOT_ORGANIZATION_ID, TOAST_RESTAURANT_GUID, businessDate, orderCount,
+          daily.gross, daily.net, daily.discounts, daily.tax, daily.tips,
+          daily.tendered, daily.total, daily.cash, daily.card, dataset.generatedAt],
+      )
+      const sourceSummary = {
+        synthetic: true,
+        standardOrders: orderCount,
+        standard: {
+          grossSales: daily.gross, netSales: daily.net, discounts: daily.discounts,
+          tax: daily.tax, tips: daily.tips, tendered: daily.tendered, total: daily.total,
+          cash: daily.cash, card: daily.card, otherTender: 0,
+        },
+      }
+      await client.query(
+        `INSERT INTO toast_accounting_export_drafts (
+           organization_id, restaurant_guid, business_date, idempotency_key, status,
+           reconciliation_status, source_summary, proposed_lines, created_at, updated_at
+         ) VALUES (
+           $1::uuid, $2::uuid, $3::date, $4, 'needs_review', 'ready',
+           $5::jsonb, '[]'::jsonb, $6::timestamptz, $6::timestamptz
+         )`,
+        [ROOT_ORGANIZATION_ID, TOAST_RESTAURANT_GUID, businessDate,
+          digest(`demo-pos-draft:${businessDate}`), JSON.stringify(sourceSummary), dataset.generatedAt],
+      )
+    }
 
     await client.query(
       `INSERT INTO pipeline_spaces (
@@ -434,6 +664,22 @@ async function main() {
           account.balance, JSON.stringify({ Id: account.id, Name: account.name, synthetic: true }), dataset.generatedAt],
       )
     }
+    const posAccounts = [
+      ['qb-pos-account-clearing', 'POS Clearing', 'Asset', 'Bank'],
+      ['qb-pos-account-cash', 'Cash on Hand', 'Asset', 'Bank'],
+      ['qb-pos-account-tips', 'Tips Payable', 'Liability', 'Other Current Liability'],
+      ['qb-pos-account-fees', 'Merchant Processing Fees', 'Expense', 'Expense'],
+    ]
+    for (const [id, name, classification, accountType] of posAccounts) {
+      await client.query(
+        `INSERT INTO quickbooks_accounts (
+           organization_id, quickbooks_account_id, name, fully_qualified_name, classification,
+           account_type, current_balance, active, source_payload, synced_at
+         ) VALUES ($1::uuid, $2, $3, $3, $4, $5, 0, true, $6::jsonb, $7::timestamptz)`,
+        [ROOT_ORGANIZATION_ID, id, name, classification, accountType,
+          JSON.stringify({ Id: id, Name: name, synthetic: true }), dataset.generatedAt],
+      )
+    }
     for (const product of dataset.products) {
       await client.query(
         `INSERT INTO quickbooks_items (
@@ -451,6 +697,93 @@ async function main() {
          ) VALUES ($1::uuid, $2::uuid, 'item', $3, 'product', $4::uuid, $5, $6::timestamptz, $6::timestamptz, $6::timestamptz)`,
         [ROOT_ORGANIZATION_ID, PIPELINE_ID, product.providerId, productIds.get(product.providerId),
           digest(product), dataset.generatedAt],
+      )
+    }
+    const posItems = [
+      ...DEMO_MENU.map((item) => ({ id: `qb-pos-item-${item.id.slice(-3)}`, name: item.name, price: item.price })),
+      { id: 'qb-pos-item-discount', name: 'POS Discounts', price: 0 },
+    ]
+    for (const item of posItems) {
+      await client.query(
+        `INSERT INTO quickbooks_items (
+           organization_id, quickbooks_item_id, name, fully_qualified_name, item_type,
+           description, unit_price, purchase_cost, active, taxable, source_payload, synced_at
+         ) VALUES ($1::uuid, $2, $3, $3, 'NonInventory',
+           'Synthetic Toast posting target used by the demo account.', $4, 0, true, true,
+           $5::jsonb, $6::timestamptz)`,
+        [ROOT_ORGANIZATION_ID, item.id, item.name, item.price,
+          JSON.stringify({ Id: item.id, Name: item.name, Type: 'NonInventory', synthetic: true }),
+          dataset.generatedAt],
+      )
+    }
+    await client.query(
+      `INSERT INTO quickbooks_tax_codes (
+         organization_id, quickbooks_tax_code_id, name, description, taxable,
+         active, source_payload, synced_at
+       ) VALUES ($1::uuid, 'qb-tax-sales', 'Demo sales tax',
+         'Synthetic taxable sales code', true, true, $2::jsonb, $3::timestamptz)`,
+      [ROOT_ORGANIZATION_ID, JSON.stringify({ Id: 'qb-tax-sales', Name: 'Demo sales tax', Taxable: true, synthetic: true }), dataset.generatedAt],
+    )
+    await client.query(
+      `INSERT INTO quickbooks_classes (
+         organization_id, quickbooks_class_id, name, fully_qualified_name,
+         active, source_payload, synced_at
+       ) VALUES ($1::uuid, 'qb-class-food-truck', 'Food truck', 'Food truck',
+         true, $2::jsonb, $3::timestamptz)`,
+      [ROOT_ORGANIZATION_ID, JSON.stringify({ Id: 'qb-class-food-truck', Name: 'Food truck', synthetic: true }), dataset.generatedAt],
+    )
+    await client.query(
+      `INSERT INTO quickbooks_departments (
+         organization_id, quickbooks_department_id, name, fully_qualified_name,
+         active, source_payload, synced_at
+       ) VALUES ($1::uuid, 'qb-department-mobile-kitchen', 'Mobile kitchen', 'Mobile kitchen',
+         true, $2::jsonb, $3::timestamptz)`,
+      [ROOT_ORGANIZATION_ID, JSON.stringify({ Id: 'qb-department-mobile-kitchen', Name: 'Mobile kitchen', synthetic: true }), dataset.generatedAt],
+    )
+    await client.query(
+      `INSERT INTO pos_accounting_profiles (
+         organization_id, restaurant_guid, profile_revision, schema_version, effective_from,
+         quickbooks_binding_status, quickbooks_connection_fingerprint, quickbooks_company_name,
+         quickbooks_connection_verified_at, quickbooks_catalog_synced_at, posting_method,
+         quickbooks_class_id, quickbooks_class_name, quickbooks_department_id,
+         quickbooks_department_name, quickbooks_clearing_account_id,
+         quickbooks_clearing_account_name, track_sales_tax, breakout_dimensions,
+         memo_mode, custom_transaction_number, transaction_number_suffix,
+         suppress_zero_over_short, auto_payout_tips, deposit_checks_with_cash,
+         open_check_policy, batch_hold_policy, created_by, created_at
+       ) VALUES (
+         $1::uuid, NULL, 1, 1, $2::timestamptz, 'verified', $3,
+         'ClawPilot Demo Company', $2::timestamptz, $2::timestamptz,
+         'itemized_sales_receipt', 'qb-class-food-truck', 'Food truck',
+         'qb-department-mobile-kitchen', 'Mobile kitchen', 'qb-pos-account-clearing',
+         'POS Clearing', true, ARRAY['order_source','payment_type']::text[],
+         'pos_date', true, 'POS', true, false, false, 'hold', 'hold_until_settled',
+         $4, $2::timestamptz
+       )`,
+      [ROOT_ORGANIZATION_ID, dataset.generatedAt, digest('demo-synthetic-no-provider'), DEMO_EMAIL],
+    )
+    const mappingRevision = new Date(dataset.generatedAt).getTime()
+    const mappings = [
+      ...DEMO_MENU.map((item) => ['sales_item', item.id, item.name, 'item', `qb-pos-item-${item.id.slice(-3)}`, item.name]),
+      ['discount', TOAST_DISCOUNT_GUID, 'Demo discount', 'item', 'qb-pos-item-discount', 'POS Discounts'],
+      ['tax', TOAST_TAX_GUID, 'Sales tax', 'tax_code', 'qb-tax-sales', 'Demo sales tax'],
+      ['service_charge', 'summary:tips', 'Credit tips', 'account', 'qb-pos-account-tips', 'Tips Payable'],
+      ['fee', 'summary:processing_fees', 'Processing fees', 'account', 'qb-pos-account-fees', 'Merchant Processing Fees'],
+      ['cash_drawer', 'summary:cash', 'Cash in drawer', 'account', 'qb-pos-account-cash', 'Cash on Hand'],
+      ['card_brand', 'summary:card_settlement', 'Calculated card settlement', 'account', '1000', 'Operating Checking'],
+    ]
+    for (const [sourceKind, sourceId, sourceName, targetType, targetId, targetName] of mappings) {
+      await client.query(
+        `INSERT INTO pos_accounting_catalog_mappings (
+           organization_id, restaurant_guid, source_kind, source_id, source_name,
+           target_type, target_id, target_name, active, mapping_revision,
+           effective_from, validation_status, source_catalog_revision,
+           target_catalog_revision, last_validated_at, created_by, created_at
+         ) VALUES ($1::uuid, NULL, $2, $3, $4, $5, $6, $7, true, 1,
+           $8::timestamptz, 'valid', $9::bigint, $9::bigint,
+           $8::timestamptz, $10, $8::timestamptz)`,
+        [ROOT_ORGANIZATION_ID, sourceKind, sourceId, sourceName, targetType, targetId,
+          targetName, dataset.generatedAt, mappingRevision, DEMO_EMAIL],
       )
     }
     for (const organization of dataset.organizations) {

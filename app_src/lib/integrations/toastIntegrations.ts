@@ -1,5 +1,6 @@
 import {
   authenticateToast,
+  getToastMenuCatalogV2,
   getToastStandardRestaurant,
   listToastAnalyticsRestaurants,
   normalizeToastApiBaseUrl,
@@ -28,6 +29,14 @@ import {
   upsertToastStandardLocationInPostgres,
   writeToastCredentialInPostgres,
 } from '@/lib/persistence/toastIntegrations'
+import {
+  readPosCatalogFromPostgres,
+  readToastCatalogRefreshTargetsInPostgres,
+  recordToastMenuCatalogCheckInPostgres,
+  recordToastMenuCatalogErrorInPostgres,
+  recordToastMenuCatalogUnavailableInPostgres,
+  replaceToastMenuCatalogInPostgres,
+} from '@/lib/persistence/posCatalog'
 
 export class ToastIntegrationRequestError extends Error {
   readonly status: number
@@ -241,6 +250,80 @@ export async function queueToastSync(input: {
       )
     }
     return result
+  } catch (error) {
+    throw sanitizeError(error)
+  }
+}
+
+export async function refreshToastMenuCatalog(input: {
+  organizationId: unknown
+  actorEmail: string
+  force?: boolean
+}) {
+  const organizationId = normalizeToastOrganizationId(input.organizationId)
+  try {
+    const targets = await readToastCatalogRefreshTargetsInPostgres(organizationId)
+    if (!targets.length) {
+      throw new ToastIntegrationRequestError(
+        'Select at least one verified Toast Standard location before refreshing the menu catalog',
+        409,
+        'TOAST_CATALOG_LOCATION_REQUIRED',
+      )
+    }
+    const credential = await runtimeCredential(organizationId, 'standard')
+    const locations: Array<Record<string, unknown>> = []
+    for (const target of targets) {
+      try {
+        const source = await getToastMenuCatalogV2({
+          credential,
+          restaurantGuid: target.restaurantGuid,
+          currentSourceRevision: target.sourceRevision,
+          force: input.force === true,
+        })
+        if (source.status === 'updated') {
+          const persisted = await replaceToastMenuCatalogInPostgres({
+            organizationId,
+            restaurantName: target.restaurantName,
+            catalog: source.catalog,
+          })
+          locations.push({ restaurantGuid: target.restaurantGuid, ...persisted })
+          continue
+        }
+        if (source.status === 'unchanged') {
+          const checked = await recordToastMenuCatalogCheckInPostgres({
+            organizationId,
+            restaurantGuid: target.restaurantGuid,
+            sourceRevision: source.metadata.sourceRevision,
+          })
+          locations.push({ restaurantGuid: target.restaurantGuid, ...checked })
+          continue
+        }
+        const unavailable = await recordToastMenuCatalogUnavailableInPostgres({
+          organizationId,
+          restaurantGuid: target.restaurantGuid,
+          sourceRevision: source.metadata?.sourceRevision || null,
+          reason: source.reason,
+          errorCode: source.errorCode,
+        })
+        locations.push({ restaurantGuid: target.restaurantGuid, ...unavailable })
+      } catch (error) {
+        const sanitized = sanitizeError(error)
+        await recordToastMenuCatalogErrorInPostgres({
+          organizationId,
+          restaurantGuid: target.restaurantGuid,
+          errorCode: sanitized.code,
+        }).catch(() => undefined)
+        locations.push({
+          restaurantGuid: target.restaurantGuid,
+          status: 'error',
+          errorCode: sanitized.code,
+        })
+      }
+    }
+    return {
+      refresh: { force: input.force === true, locations },
+      catalog: await readPosCatalogFromPostgres(organizationId),
+    }
   } catch (error) {
     throw sanitizeError(error)
   }

@@ -89,7 +89,9 @@ Verify both development and production after release-facing changes:
 - `/api/pipeline/sync-status`
 - `/api/tasks`
 
-Also validate the affected authenticated browser workflow. A green build does not replace live board, agent-thread, CRM, Sheet, or mobile acceptance.
+`/api/persistence/status` must return a non-empty `databaseFingerprint`. Railway and Vercel for the same environment must report the same fingerprint, while development and production must report different fingerprints. A missing or cross-environment identity is a release blocker.
+
+Also validate the affected authenticated browser workflow. A green build does not replace live board, agent-thread, CRM, Sheet, POS, accounting, or mobile acceptance.
 
 The `Deployed runtime monitor` GitHub workflow checks both custom domains every 30 minutes without application credentials. It verifies the login boundary, Postgres persistence, migrations, SuiteCRM, pipeline, agent, research, Toast, QuickBooks, AI Radar, and document-embedding worker health. A failed scheduled run is an operational alert and must not be dismissed as a deployment-only failure.
 

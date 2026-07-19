@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { resolveCrmReferenceRoute } from '@/lib/persistence/crm'
+import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import { appPublicUrl } from '@/lib/publicUrl'
 import { sessionEmail } from '@/lib/requestUser'
 
@@ -17,6 +18,9 @@ export async function GET(req: NextRequest, context: { params: Promise<{ referen
     actorEmail: await sessionEmail(req),
     requestedPipelineId,
   })
+  if (isPostgresStorageEnabled() && !resolved.found) {
+    return NextResponse.json({ ok: false, error: 'CRM record not found' }, { status: 404 })
+  }
   const destination = new URL('/', appPublicUrl())
   destination.searchParams.set('crm', resolved.referenceCode)
   const pipelineId = CRM_PIPELINE_PATTERN.test(requestedPipelineId)

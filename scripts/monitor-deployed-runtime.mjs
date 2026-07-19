@@ -63,6 +63,7 @@ export function validateMonitorSnapshot(snapshot, expectations = {}) {
   if (persistence.ok !== true) failures.push('persistence status is not healthy')
   if (persistence.driver !== 'postgres') failures.push(`persistence driver is ${persistence.driver || 'missing'}`)
   if (persistence.database !== 'reachable') failures.push('persistence database is not reachable')
+  if (!asText(persistence.databaseFingerprint)) failures.push('persistence database identity is missing')
 
   const expectedEnvironment = asText(expectations.environment)
   const expectedBranch = asText(expectations.branch)

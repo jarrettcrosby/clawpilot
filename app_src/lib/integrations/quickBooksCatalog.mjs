@@ -159,6 +159,53 @@ export function parseQuickBooksVendors(payload) {
   return parsePartyRows(payload, 'Vendor')
 }
 
+function parseTrackingDimensionRows(payload, entity, childFlag, parentKey) {
+  const rows = record(record(payload).QueryResponse)[entity]
+  if (!Array.isArray(rows)) return []
+  return rows.map((value) => {
+    const dimension = record(value)
+    const id = text(dimension.Id, 200)
+    const name = text(dimension.Name, 200)
+    if (!id || !name) return null
+    return {
+      id,
+      name,
+      fullyQualifiedName: text(dimension.FullyQualifiedName, 500) || name,
+      child: dimension[childFlag] === true,
+      parentId: referenceId(dimension[parentKey]),
+      active: dimension.Active !== false,
+      sourcePayload: dimension,
+    }
+  }).filter((value) => value !== null)
+}
+
+export function parseQuickBooksClasses(payload) {
+  return parseTrackingDimensionRows(payload, 'Class', 'SubClass', 'ParentRef')
+}
+
+export function parseQuickBooksDepartments(payload) {
+  return parseTrackingDimensionRows(payload, 'Department', 'SubDepartment', 'ParentRef')
+}
+
+export function parseQuickBooksTaxCodes(payload) {
+  const rows = record(record(payload).QueryResponse).TaxCode
+  if (!Array.isArray(rows)) return []
+  return rows.map((value) => {
+    const taxCode = record(value)
+    const id = text(taxCode.Id, 200)
+    const name = text(taxCode.Name, 200)
+    if (!id || !name) return null
+    return {
+      id,
+      name,
+      description: text(taxCode.Description, 1000) || null,
+      taxable: taxCode.Taxable === true,
+      active: taxCode.Active !== false,
+      sourcePayload: taxCode,
+    }
+  }).filter((value) => value !== null)
+}
+
 function firstReference(source, keys) {
   for (const key of keys) {
     const candidate = reference(source[key])

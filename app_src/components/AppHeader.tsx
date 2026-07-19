@@ -50,6 +50,7 @@ const MODULE_LABELS: Record<string, string> = {
   pipeline: 'Pipeline',
   crm: 'CRM',
   accounting: 'Accounting',
+  pos: 'POS',
   links: 'Short Links',
   agents: 'Agents',
   versions: 'Versions',
