@@ -23,6 +23,12 @@ function date(value) {
   return /^\d{4}-\d{2}-\d{2}$/.test(candidate) ? candidate : null
 }
 
+function timestamp(value) {
+  const candidate = text(value, 100)
+  const parsed = Date.parse(candidate)
+  return candidate && Number.isFinite(parsed) ? new Date(parsed).toISOString() : null
+}
+
 function reference(value) {
   const input = record(value)
   return {
@@ -35,6 +41,24 @@ function referenceId(value) {
   return text(record(value).value, 200) || null
 }
 
+function postalAddress(value) {
+  const address = record(value)
+  const lines = [address.Line1, address.Line2, address.Line3, address.Line4, address.Line5]
+    .map((line) => text(line, 500))
+    .filter(Boolean)
+  const city = text(address.City, 200)
+  const region = text(address.CountrySubDivisionCode, 100)
+  const postalCode = text(address.PostalCode, 40)
+  const country = text(address.Country, 100)
+  return {
+    lines,
+    city: city || null,
+    region: region || null,
+    postalCode: postalCode || null,
+    country: country || null,
+  }
+}
+
 export function parseQuickBooksCompanyInfo(payload) {
   const company = record(record(payload).CompanyInfo)
   const companyName = text(company.CompanyName, 200)
@@ -42,6 +66,10 @@ export function parseQuickBooksCompanyInfo(payload) {
   return {
     companyName,
     country: text(company.Country, 10) || null,
+    legalName: text(company.LegalName, 200) || null,
+    email: text(record(company.Email).Address, 320) || null,
+    phone: text(record(company.PrimaryPhone).FreeFormNumber, 100) || null,
+    address: postalAddress(company.CompanyAddr),
   }
 }
 
@@ -181,6 +209,140 @@ export function parseQuickBooksTransactions(payload, entityType) {
   }).filter((value) => value !== null)
 }
 
+function parseInvoiceLines(value, depth = 0, output = []) {
+  const lines = Array.isArray(value) ? value : []
+  for (const lineValue of lines) {
+    const line = record(lineValue)
+    const detailType = text(line.DetailType, 100)
+    const description = text(line.Description, 4000) || null
+    const lineId = text(line.Id, 200) || null
+    if (detailType === 'GroupLineDetail') {
+      const detail = record(line.GroupLineDetail)
+      const group = reference(detail.GroupItemRef)
+      output.push({
+        id: lineId,
+        kind: 'group',
+        depth,
+        description,
+        itemId: group.id,
+        itemName: group.name || description || 'Group',
+        quantity: null,
+        unitPrice: null,
+        amount: signedAmount(line.Amount),
+        discountPercent: null,
+        serviceDate: null,
+      })
+      parseInvoiceLines(detail.Line, depth + 1, output)
+      continue
+    }
+    if (detailType === 'SalesItemLineDetail') {
+      const detail = record(line.SalesItemLineDetail)
+      const item = reference(detail.ItemRef)
+      output.push({
+        id: lineId,
+        kind: 'item',
+        depth,
+        description,
+        itemId: item.id,
+        itemName: item.name || description || 'Line item',
+        quantity: detail.Qty === undefined || detail.Qty === null ? null : signedAmount(detail.Qty),
+        unitPrice: detail.UnitPrice === undefined || detail.UnitPrice === null ? null : signedAmount(detail.UnitPrice),
+        amount: signedAmount(line.Amount),
+        discountPercent: null,
+        serviceDate: date(detail.ServiceDate),
+      })
+      continue
+    }
+    if (detailType === 'DiscountLineDetail') {
+      const detail = record(line.DiscountLineDetail)
+      output.push({
+        id: lineId,
+        kind: 'discount',
+        depth,
+        description: description || 'Discount',
+        itemId: null,
+        itemName: 'Discount',
+        quantity: null,
+        unitPrice: null,
+        amount: signedAmount(line.Amount),
+        discountPercent: detail.PercentBased === true ? signedAmount(detail.DiscountPercent) : null,
+        serviceDate: null,
+      })
+      continue
+    }
+    if (detailType === 'SubTotalLineDetail') {
+      output.push({
+        id: lineId,
+        kind: 'subtotal',
+        depth,
+        description: description || 'Subtotal',
+        itemId: null,
+        itemName: 'Subtotal',
+        quantity: null,
+        unitPrice: null,
+        amount: signedAmount(line.Amount),
+        discountPercent: null,
+        serviceDate: null,
+      })
+      continue
+    }
+    if (description || line.Amount !== undefined) {
+      output.push({
+        id: lineId,
+        kind: 'description',
+        depth,
+        description,
+        itemId: null,
+        itemName: description || 'Line',
+        quantity: null,
+        unitPrice: null,
+        amount: signedAmount(line.Amount),
+        discountPercent: null,
+        serviceDate: null,
+      })
+    }
+  }
+  return output
+}
+
+export function parseQuickBooksInvoiceDetail(value) {
+  const invoice = record(value)
+  const id = text(invoice.Id, 200)
+  if (!id) throw new Error('QuickBooks invoice is missing an id')
+  const customer = reference(invoice.CustomerRef)
+  const lines = parseInvoiceLines(invoice.Line)
+  const subtotalLine = [...lines].reverse().find((line) => line.kind === 'subtotal')
+  const totalTax = signedAmount(record(invoice.TxnTaxDetail).TotalTax)
+  return {
+    id,
+    documentNumber: text(invoice.DocNumber, 200) || null,
+    transactionDate: date(invoice.TxnDate),
+    dueDate: date(invoice.DueDate),
+    customerId: customer.id,
+    customerName: customer.name,
+    billingEmail: text(record(invoice.BillEmail).Address, 320) || null,
+    billingAddress: postalAddress(invoice.BillAddr),
+    shippingAddress: postalAddress(invoice.ShipAddr),
+    currencyCode: text(record(invoice.CurrencyRef).value, 10) || null,
+    exchangeRate: invoice.ExchangeRate === undefined || invoice.ExchangeRate === null
+      ? null
+      : signedAmount(invoice.ExchangeRate),
+    salesTerm: reference(invoice.SalesTermRef).name,
+    shipMethod: reference(invoice.ShipMethodRef).name,
+    trackingNumber: text(invoice.TrackingNum, 200) || null,
+    customerMemo: text(record(invoice.CustomerMemo).value, 4000) || null,
+    privateNote: text(invoice.PrivateNote, 4000) || null,
+    subtotal: subtotalLine
+      ? subtotalLine.amount
+      : signedAmount(invoice.TotalAmt) - totalTax,
+    totalTax,
+    totalAmount: signedAmount(invoice.TotalAmt),
+    balance: signedAmount(invoice.Balance),
+    deposit: signedAmount(invoice.Deposit),
+    lines,
+  }
+}
+
 export function parseQuickBooksAttachments(payload) {
   const rows = record(record(payload).QueryResponse).Attachable
   if (!Array.isArray(rows)) return []
@@ -208,4 +370,80 @@ export function parseQuickBooksAttachments(payload) {
       sourcePayload: attachment,
     }
   }).filter((value) => value !== null)
+}
+
+function reportCells(value) {
+  const source = record(value)
+  const cells = Array.isArray(source.ColData) ? source.ColData : []
+  return cells.map((cellValue) => {
+    const cell = record(cellValue)
+    return {
+      value: text(cell.value, 2000),
+      id: text(cell.id, 200) || null,
+      href: text(cell.href, 2000) || null,
+    }
+  })
+}
+
+function flattenReportRows(value, depth = 0, output = []) {
+  const container = record(value)
+  const rows = Array.isArray(container.Row) ? container.Row : []
+  for (const rowValue of rows) {
+    const row = record(rowValue)
+    const group = text(row.group, 200) || null
+    const rowType = text(row.type, 40).toLowerCase()
+    if (rowType === 'section' || row.Header || row.Rows || row.Summary) {
+      const headerCells = reportCells(row.Header)
+      if (headerCells.some((cell) => cell.value || cell.id) || group) {
+        output.push({ kind: 'section', depth, group, cells: headerCells })
+      }
+      flattenReportRows(row.Rows, depth + 1, output)
+      const summaryCells = reportCells(row.Summary)
+      if (summaryCells.some((cell) => cell.value || cell.id)) {
+        output.push({ kind: 'summary', depth, group, cells: summaryCells })
+      }
+      continue
+    }
+    const cells = reportCells(row)
+    if (cells.some((cell) => cell.value || cell.id)) {
+      output.push({ kind: 'data', depth, group, cells })
+    }
+  }
+  return output
+}
+
+export function parseQuickBooksFinancialReport(payload) {
+  const source = record(payload)
+  const header = record(source.Header)
+  const columnRows = Array.isArray(record(source.Columns).Column)
+    ? record(source.Columns).Column
+    : []
+  const options = Array.isArray(header.Option) ? header.Option : []
+  const reportName = text(header.ReportName, 200) || 'QuickBooks report'
+  const columns = columnRows.map((columnValue) => {
+    const column = record(columnValue)
+    return {
+      title: text(column.ColTitle, 500),
+      type: text(column.ColType, 100) || null,
+    }
+  })
+  return {
+    reportName,
+    reportBasis: text(header.ReportBasis, 100) || null,
+    startPeriod: date(header.StartPeriod),
+    endPeriod: date(header.EndPeriod),
+    currencyCode: text(header.Currency, 10) || null,
+    generatedAt: timestamp(header.Time),
+    noData: options.some((optionValue) => {
+      const option = record(optionValue)
+      return text(option.Name, 100) === 'NoReportData' && text(option.Value, 20).toLowerCase() === 'true'
+    }),
+    options: Object.fromEntries(options.flatMap((optionValue) => {
+      const option = record(optionValue)
+      const name = text(option.Name, 100)
+      return name ? [[name, text(option.Value, 500)]] : []
+    })),
+    columns,
+    rows: flattenReportRows(source.Rows),
+  }
 }

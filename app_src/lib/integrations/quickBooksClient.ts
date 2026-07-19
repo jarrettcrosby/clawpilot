@@ -4,6 +4,7 @@ import {
   parseQuickBooksAttachments,
   parseQuickBooksCompanyInfo,
   parseQuickBooksCustomers,
+  parseQuickBooksFinancialReport,
   parseQuickBooksItems,
   parseQuickBooksTransactions,
   parseQuickBooksVendors,
@@ -43,6 +44,25 @@ export type QuickBooksCustomer = ReturnType<typeof parseQuickBooksCustomers>[num
 export type QuickBooksVendor = ReturnType<typeof parseQuickBooksVendors>[number]
 export type QuickBooksTransaction = ReturnType<typeof parseQuickBooksTransactions>[number]
 export type QuickBooksAttachment = ReturnType<typeof parseQuickBooksAttachments>[number]
+export type QuickBooksFinancialReport = ReturnType<typeof parseQuickBooksFinancialReport>
+
+export const QUICKBOOKS_FINANCIAL_REPORT_KEYS = [
+  'profit_loss', 'balance_sheet', 'cash_flow', 'ar_aging', 'ap_aging',
+] as const
+
+export const QUICKBOOKS_FINANCIAL_REPORT_PERIODS = [
+  'mtd', 'qtd', 'ytd', 'six_months', 'as_of_today',
+] as const
+
+export type QuickBooksFinancialReportKey = typeof QUICKBOOKS_FINANCIAL_REPORT_KEYS[number]
+export type QuickBooksFinancialReportPeriod = typeof QUICKBOOKS_FINANCIAL_REPORT_PERIODS[number]
+export type QuickBooksFinancialReportSnapshot = {
+  reportKey: QuickBooksFinancialReportKey
+  periodKey: QuickBooksFinancialReportPeriod
+  status: 'ready' | 'error'
+  errorCode: string | null
+  report: QuickBooksFinancialReport | null
+}
 
 async function responseJson(response: Response) {
   const contentLength = Number(response.headers.get('content-length') || 0)
@@ -85,7 +105,7 @@ async function paceRequest() {
   lastRequestStartedAt = Date.now()
 }
 
-async function request(pathname: string, ownerEmail: string, connectionId: string) {
+async function requestResponse(pathname: string, ownerEmail: string, connectionId: string) {
   for (let attempt = 0; attempt < MAX_REQUEST_ATTEMPTS; attempt += 1) {
     await paceRequest()
     const response = await matonFetch(pathname, { method: 'GET' }, {
@@ -94,13 +114,17 @@ async function request(pathname: string, ownerEmail: string, connectionId: strin
       boundConnectionId: connectionId,
     })
     if (!RETRYABLE_STATUSES.has(response.status) || attempt === MAX_REQUEST_ATTEMPTS - 1) {
-      return responseJson(response)
+      return response
     }
     await response.body?.cancel().catch(() => undefined)
     const exponentialBackoff = Math.min(MAX_RETRY_DELAY_MS, DEFAULT_RETRY_DELAY_MS * (2 ** attempt))
     await sleep(Math.max(exponentialBackoff, retryAfterMs(response.headers.get('retry-after'))))
   }
   throw new Error('QuickBooks request retry budget exhausted')
+}
+
+async function request(pathname: string, ownerEmail: string, connectionId: string) {
+  return responseJson(await requestResponse(pathname, ownerEmail, connectionId))
 }
 
 async function queryEntityPage(
@@ -157,6 +181,115 @@ export async function readQuickBooksCompanyInfo(ownerEmail: string, connectionId
   return parseQuickBooksCompanyInfo(payload)
 }
 
+function isoDate(value: Date) {
+  return value.toISOString().slice(0, 10)
+}
+
+function financialReportPeriods(now = new Date()) {
+  const end = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()))
+  const month = new Date(Date.UTC(end.getUTCFullYear(), end.getUTCMonth(), 1))
+  const quarter = new Date(Date.UTC(end.getUTCFullYear(), Math.floor(end.getUTCMonth() / 3) * 3, 1))
+  const year = new Date(Date.UTC(end.getUTCFullYear(), 0, 1))
+  const sixMonths = new Date(Date.UTC(end.getUTCFullYear(), end.getUTCMonth() - 5, 1))
+  return [
+    { periodKey: 'mtd' as const, startDate: isoDate(month), endDate: isoDate(end) },
+    { periodKey: 'qtd' as const, startDate: isoDate(quarter), endDate: isoDate(end) },
+    { periodKey: 'ytd' as const, startDate: isoDate(year), endDate: isoDate(end) },
+    { periodKey: 'six_months' as const, startDate: isoDate(sixMonths), endDate: isoDate(end) },
+  ]
+}
+
+export async function readQuickBooksFinancialReports(
+  ownerEmail: string,
+  connectionId: string,
+  now = new Date(),
+) {
+  const periods = financialReportPeriods(now)
+  const endDate = isoDate(new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())))
+  const requests: Array<{
+    reportKey: QuickBooksFinancialReportKey
+    periodKey: QuickBooksFinancialReportPeriod
+    endpoint: string
+    params: Record<string, string>
+  }> = []
+  for (const reportKey of ['profit_loss', 'cash_flow'] as const) {
+    for (const period of periods) {
+      requests.push({
+        reportKey,
+        periodKey: period.periodKey,
+        endpoint: reportKey === 'profit_loss' ? 'ProfitAndLoss' : 'CashFlow',
+        params: {
+          start_date: period.startDate,
+          end_date: period.endDate,
+          summarize_column_by: 'Month',
+        },
+      })
+    }
+  }
+  requests.push(
+    { reportKey: 'balance_sheet', periodKey: 'as_of_today', endpoint: 'BalanceSheet', params: { end_date: endDate } },
+    { reportKey: 'ar_aging', periodKey: 'as_of_today', endpoint: 'AgedReceivables', params: { report_date: endDate } },
+    { reportKey: 'ap_aging', periodKey: 'as_of_today', endpoint: 'AgedPayables', params: { report_date: endDate } },
+  )
+
+  const snapshots: QuickBooksFinancialReportSnapshot[] = []
+  for (const reportRequest of requests) {
+    try {
+      const search = new URLSearchParams({ ...reportRequest.params, minorversion: MINOR_VERSION })
+      const payload = await request(
+        `/quickbooks/v3/company/:realmId/reports/${reportRequest.endpoint}?${search.toString()}`,
+        ownerEmail,
+        connectionId,
+      )
+      snapshots.push({
+        reportKey: reportRequest.reportKey,
+        periodKey: reportRequest.periodKey,
+        status: 'ready',
+        errorCode: null,
+        report: parseQuickBooksFinancialReport(payload),
+      })
+    } catch {
+      snapshots.push({
+        reportKey: reportRequest.reportKey,
+        periodKey: reportRequest.periodKey,
+        status: 'error',
+        errorCode: 'QUICKBOOKS_REPORT_FETCH_FAILED',
+        report: null,
+      })
+    }
+  }
+  return snapshots
+}
+
+export async function readQuickBooksAttachmentDownloadUrl(input: {
+  ownerEmail: string
+  connectionId: string
+  attachmentId: string
+  thumbnail?: boolean
+}) {
+  const endpoint = input.thumbnail ? 'attachable-thumbnail' : 'download'
+  const response = await requestResponse(
+    `/quickbooks/v3/company/:realmId/${endpoint}/${encodeURIComponent(input.attachmentId)}`,
+    input.ownerEmail,
+    input.connectionId,
+  )
+  const raw = await response.text()
+  if (!response.ok) throw new Error(`QuickBooks attachment request failed with HTTP ${response.status}`)
+  if (Buffer.byteLength(raw, 'utf8') > 16_384) throw new Error('QuickBooks attachment URL response was invalid')
+  let candidate = raw.trim()
+  try {
+    const parsed = JSON.parse(candidate) as Record<string, unknown> | string
+    candidate = typeof parsed === 'string'
+      ? parsed
+      : String(parsed.TempDownloadUrl || parsed.TempDownloadUri || parsed.url || '')
+  } catch {}
+  const url = new URL(candidate)
+  if (url.protocol !== 'https:' || url.username || url.password) {
+    throw new Error('QuickBooks returned an invalid attachment URL')
+  }
+  return url.toString()
+}
+
 export async function readQuickBooksCatalog(ownerEmail: string, connectionId: string) {
   const company = await readQuickBooksCompanyInfo(ownerEmail, connectionId)
   const accounts = await queryAllEntities('Account', ownerEmail, connectionId, parseQuickBooksAccounts)
@@ -178,6 +311,7 @@ export async function readQuickBooksCatalog(ownerEmail: string, connectionId: st
     connectionId,
     parseQuickBooksAttachments,
   )
+  const reports = await readQuickBooksFinancialReports(ownerEmail, connectionId)
   return {
     company,
     accounts,
@@ -186,5 +320,6 @@ export async function readQuickBooksCatalog(ownerEmail: string, connectionId: st
     vendors,
     transactions: transactionGroups.flat(),
     attachments,
+    reports,
   }
 }

@@ -208,6 +208,7 @@ export async function GET() {
           multi_workspace_memberships_migration_applied: boolean
           quickbooks_connector_migration_applied: boolean
           quickbooks_explorer_migration_applied: boolean
+          quickbooks_reports_migration_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -448,6 +449,11 @@ export async function GET() {
                 FROM schema_migrations
                 WHERE filename = '0062_quickbooks_financial_explorer.sql'
               ) AS quickbooks_explorer_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0063_quickbooks_financial_reports.sql'
+              ) AS quickbooks_reports_migration_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -507,6 +513,7 @@ export async function GET() {
             && row?.multi_workspace_memberships_migration_applied
             && row?.quickbooks_connector_migration_applied
             && row?.quickbooks_explorer_migration_applied
+            && row?.quickbooks_reports_migration_applied
             && row?.migration_checksums_present
           ),
         }
@@ -558,6 +565,7 @@ export async function GET() {
           || !row?.multi_workspace_memberships_migration_applied
           || !row?.quickbooks_connector_migration_applied
           || !row?.quickbooks_explorer_migration_applied
+          || !row?.quickbooks_reports_migration_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')

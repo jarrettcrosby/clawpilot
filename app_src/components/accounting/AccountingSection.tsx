@@ -28,14 +28,92 @@ import AttachFileRounded from '@mui/icons-material/AttachFileRounded'
 import ChevronLeftRounded from '@mui/icons-material/ChevronLeftRounded'
 import ChevronRightRounded from '@mui/icons-material/ChevronRightRounded'
 import CloseRounded from '@mui/icons-material/CloseRounded'
+import OpenInNewRounded from '@mui/icons-material/OpenInNewRounded'
 import RefreshRounded from '@mui/icons-material/RefreshRounded'
 import SearchRounded from '@mui/icons-material/SearchRounded'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import { formatUserDateTime } from '@/lib/userDateTime'
 
-type View = 'overview' | 'invoices' | 'receipts' | 'transactions' | 'products' | 'accounts' | 'customers' | 'vendors' | 'attachments'
+type View = 'overview' | 'reports' | 'invoices' | 'receipts' | 'transactions' | 'products' | 'accounts' | 'customers' | 'vendors' | 'attachments'
 type Range = '30d' | '90d' | 'ytd' | '12m' | 'all'
+type ReportKey = 'profit_loss' | 'balance_sheet' | 'cash_flow' | 'ar_aging' | 'ap_aging'
+type ReportPeriod = 'mtd' | 'qtd' | 'ytd' | 'six_months' | 'as_of_today'
 type ExplorerRow = Record<string, unknown> & { id: string }
+
+type ReportCell = { value?: string; id?: string | null; href?: string | null }
+type FinancialReport = {
+  reportKey: ReportKey
+  periodKey: ReportPeriod
+  reportName: string
+  reportBasis: string | null
+  startPeriod: string | null
+  endPeriod: string | null
+  currencyCode: string | null
+  generatedAt: string | null
+  columns: Array<{ title?: string; type?: string | null }>
+  rows: Array<{
+    kind?: 'section' | 'data' | 'summary'
+    depth?: number
+    group?: string | null
+    cells?: ReportCell[]
+  }>
+  noData: boolean
+  status: 'ready' | 'error'
+  lastErrorCode: string | null
+  lastAttemptedAt: string
+  syncedAt: string | null
+}
+
+type InvoiceDetail = {
+  company: {
+    companyName: string
+    legalName: string | null
+    email: string | null
+    phone: string | null
+    address: { lines?: string[]; city?: string | null; region?: string | null; postalCode?: string | null; country?: string | null }
+  }
+  invoice: {
+    id: string
+    documentNumber: string | null
+    transactionDate: string | null
+    dueDate: string | null
+    customerName: string | null
+    billingEmail: string | null
+    billingAddress: { lines?: string[]; city?: string | null; region?: string | null; postalCode?: string | null; country?: string | null }
+    shippingAddress: { lines?: string[]; city?: string | null; region?: string | null; postalCode?: string | null; country?: string | null }
+    currencyCode: string | null
+    exchangeRate: number | null
+    salesTerm: string | null
+    shipMethod: string | null
+    trackingNumber: string | null
+    customerMemo: string | null
+    privateNote: string | null
+    subtotal: number
+    totalTax: number
+    totalAmount: number
+    balance: number
+    deposit: number
+    lines: Array<{
+      id: string | null
+      kind: 'group' | 'item' | 'discount' | 'subtotal' | 'description'
+      depth: number
+      description: string | null
+      itemName: string
+      quantity: number | null
+      unitPrice: number | null
+      amount: number
+      discountPercent: number | null
+      serviceDate: string | null
+    }>
+  }
+  attachments: Array<{
+    id: string
+    fileName: string | null
+    contentType: string | null
+    sizeBytes: number | null
+    note: string | null
+  }>
+}
 
 type Overview = {
   connection: {
@@ -54,6 +132,8 @@ type Overview = {
     vendors: number
     transactions: number
     attachments: number
+    reports: number
+    reportErrors: number
   }
   metrics: {
     invoiced: number
@@ -87,6 +167,7 @@ type Column = {
 
 const VIEWS: Array<{ id: View; label: string }> = [
   { id: 'overview', label: 'Overview' },
+  { id: 'reports', label: 'Financial reports' },
   { id: 'invoices', label: 'Invoices' },
   { id: 'receipts', label: 'Receipts' },
   { id: 'transactions', label: 'All transactions' },
@@ -95,6 +176,21 @@ const VIEWS: Array<{ id: View; label: string }> = [
   { id: 'customers', label: 'Customers' },
   { id: 'vendors', label: 'Vendors' },
   { id: 'attachments', label: 'Attachments' },
+]
+
+const REPORTS: Array<{ id: ReportKey; label: string; shortLabel: string }> = [
+  { id: 'profit_loss', label: 'Profit & Loss', shortLabel: 'P&L' },
+  { id: 'balance_sheet', label: 'Balance Sheet', shortLabel: 'Balance' },
+  { id: 'cash_flow', label: 'Cash Flow', shortLabel: 'Cash flow' },
+  { id: 'ar_aging', label: 'A/R Aging', shortLabel: 'A/R' },
+  { id: 'ap_aging', label: 'A/P Aging', shortLabel: 'A/P' },
+]
+
+const REPORT_PERIODS: Array<{ id: ReportPeriod; label: string }> = [
+  { id: 'mtd', label: 'Month to date' },
+  { id: 'qtd', label: 'Quarter to date' },
+  { id: 'ytd', label: 'Year to date' },
+  { id: 'six_months', label: 'Last 6 months' },
 ]
 
 const RANGES: Array<{ id: Range; label: string }> = [
@@ -223,6 +319,373 @@ function TrendChart({ rows, money }: {
   )
 }
 
+function FinancialReportPanel({
+  reportKey,
+  onReportKeyChange,
+  period,
+  onPeriodChange,
+  report,
+  loading,
+  dateOnly,
+  formatDateTime,
+}: {
+  reportKey: ReportKey
+  onReportKeyChange: (value: ReportKey) => void
+  period: ReportPeriod
+  onPeriodChange: (value: ReportPeriod) => void
+  report: FinancialReport | null
+  loading: boolean
+  dateOnly: (value: unknown) => string
+  formatDateTime: (value: string) => string
+}) {
+  const supportsPeriods = reportKey === 'profit_loss' || reportKey === 'cash_flow'
+  const columnCount = Math.max(
+    1,
+    report?.columns.length || 0,
+    ...(report?.rows.map((row) => row.cells?.length || 0) || [0]),
+  )
+  const columns = Array.from({ length: columnCount }, (_, index) => ({
+    title: report?.columns[index]?.title || (index === 0 ? 'Account or category' : index === columnCount - 1 ? 'Total' : `Column ${index + 1}`),
+    type: report?.columns[index]?.type || null,
+  }))
+  const periodText = report?.startPeriod
+    ? `${dateOnly(report.startPeriod)} – ${dateOnly(report.endPeriod)}`
+    : report?.endPeriod ? `As of ${dateOnly(report.endPeriod)}` : 'Current QuickBooks period'
+
+  return (
+    <Stack spacing={2}>
+      <Tabs
+        value={reportKey}
+        onChange={(_, value: ReportKey) => onReportKeyChange(value)}
+        variant="scrollable"
+        scrollButtons="auto"
+        allowScrollButtonsMobile
+        aria-label="Financial report"
+        sx={{ borderBottom: '1px solid rgba(255,255,255,0.08)', '& .MuiTab-root': { minHeight: 44, textTransform: 'none', letterSpacing: 0, whiteSpace: 'nowrap' } }}
+      >
+        {REPORTS.map((candidate) => <Tab key={candidate.id} value={candidate.id} label={candidate.label} />)}
+      </Tabs>
+
+      {supportsPeriods ? (
+        <Box display="flex" gap={1} overflow="auto" pb={0.25} sx={{ scrollbarWidth: 'thin' }}>
+          {REPORT_PERIODS.map((candidate) => (
+            <Button
+              key={candidate.id}
+              size="small"
+              variant={period === candidate.id ? 'contained' : 'outlined'}
+              onClick={() => onPeriodChange(candidate.id)}
+              sx={{ borderRadius: '8px', whiteSpace: 'nowrap', flexShrink: 0 }}
+            >
+              {candidate.label}
+            </Button>
+          ))}
+        </Box>
+      ) : null}
+
+      {loading && !report ? (
+        <Box display="grid" sx={{ placeItems: 'center' }} minHeight={320}><CircularProgress /></Box>
+      ) : !report ? (
+        <Alert severity="info">This statement has not been cached yet. Refresh QuickBooks data to retrieve it.</Alert>
+      ) : (
+        <Stack spacing={1.5}>
+          {report.lastErrorCode ? (
+            <Alert severity={report.syncedAt ? 'warning' : 'error'}>
+              {report.syncedAt
+                ? 'QuickBooks could not refresh this statement. The last successful version remains available.'
+                : 'QuickBooks could not produce this statement during the latest refresh.'}
+            </Alert>
+          ) : null}
+
+          <Box display="flex" alignItems="flex-start" justifyContent="space-between" gap={2} flexWrap="wrap">
+            <Box>
+              <Typography variant="h6" fontWeight={700}>{report.reportName}</Typography>
+              <Typography variant="body2" color="text.secondary">{periodText}</Typography>
+            </Box>
+            <Box display="flex" gap={0.75} flexWrap="wrap">
+              {report.reportBasis ? <Chip size="small" variant="outlined" label={`${report.reportBasis} basis`} /> : null}
+              {report.currencyCode ? <Chip size="small" variant="outlined" label={report.currencyCode} /> : null}
+              {report.syncedAt ? <Chip size="small" color="success" variant="outlined" label={`Synced ${formatDateTime(report.syncedAt)}`} /> : null}
+            </Box>
+          </Box>
+
+          <Box sx={{ ...panelSx, overflow: 'hidden', position: 'relative', minHeight: 240 }}>
+            {loading ? <Box sx={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', bgcolor: 'rgba(15,15,19,0.62)', zIndex: 5 }}><CircularProgress size={28} /></Box> : null}
+            <TableContainer sx={{ display: { xs: 'none', md: 'block' }, maxHeight: 'calc(100dvh - 360px)' }}>
+              <Table stickyHeader size="small" aria-label={`${report.reportName} statement`}>
+                <TableHead>
+                  <TableRow>
+                    {columns.map((column, index) => (
+                      <TableCell
+                        key={`${column.title}-${index}`}
+                        align={index === 0 ? 'left' : 'right'}
+                        sx={{
+                          bgcolor: '#171821', color: 'text.secondary', fontWeight: 700, whiteSpace: 'nowrap',
+                          ...(index === 0 ? { position: 'sticky', left: 0, zIndex: 4, minWidth: 240 } : { minWidth: 118 }),
+                        }}
+                      >
+                        {column.title}
+                      </TableCell>
+                    ))}
+                  </TableRow>
+                </TableHead>
+                <TableBody>
+                  {report.rows.map((row, rowIndex) => {
+                    const cells = Array.from({ length: columnCount }, (_, index) => row.cells?.[index]?.value || '')
+                    const label = cells[0] || row.group || 'Section'
+                    const background = row.kind === 'summary' ? '#1B1C24' : row.kind === 'section' ? '#171821' : 'transparent'
+                    return (
+                      <TableRow key={`${row.kind || 'row'}-${rowIndex}`} sx={{ bgcolor: background, '& td': { borderColor: 'rgba(255,255,255,0.065)' } }}>
+                        {cells.map((cell, cellIndex) => (
+                          <TableCell
+                            key={cellIndex}
+                            align={cellIndex === 0 ? 'left' : 'right'}
+                            sx={{
+                              fontWeight: row.kind === 'data' ? 400 : 700,
+                              whiteSpace: cellIndex === 0 ? 'normal' : 'nowrap',
+                              ...(cellIndex === 0 ? {
+                                position: 'sticky', left: 0, zIndex: 1, minWidth: 240,
+                                bgcolor: background === 'transparent' ? '#15151D' : background,
+                                pl: 2 + Math.min(Number(row.depth || 0), 5) * 2,
+                              } : undefined),
+                            }}
+                          >
+                            {cellIndex === 0 ? label : cell || '—'}
+                          </TableCell>
+                        ))}
+                      </TableRow>
+                    )
+                  })}
+                </TableBody>
+              </Table>
+            </TableContainer>
+
+            <Box sx={{ display: { xs: 'block', md: 'none' } }}>
+              {report.rows.map((row, rowIndex) => {
+                const cells = Array.isArray(row.cells) ? row.cells : []
+                const label = cells[0]?.value || row.group || 'Section'
+                const values = cells.slice(1).map((cell, index) => ({
+                  label: columns[index + 1]?.title || `Column ${index + 2}`,
+                  value: cell.value || '',
+                })).filter((entry) => entry.value)
+                return (
+                  <Box
+                    key={`${row.kind || 'row'}-${rowIndex}`}
+                    sx={{
+                      px: 2, py: row.kind === 'section' ? 1.5 : 1.25,
+                      borderBottom: '1px solid rgba(255,255,255,0.065)',
+                      bgcolor: row.kind === 'summary' ? '#1B1C24' : row.kind === 'section' ? '#171821' : 'transparent',
+                    }}
+                  >
+                    <Typography fontWeight={row.kind === 'data' ? 500 : 700} sx={{ pl: Math.min(Number(row.depth || 0), 4) * 1.25 }}>
+                      {label}
+                    </Typography>
+                    {values.length ? (
+                      <Box display="grid" gridTemplateColumns="minmax(0, 1fr) auto" gap={0.75} mt={0.75} pl={Math.min(Number(row.depth || 0), 4) * 1.25}>
+                        {values.map((entry, valueIndex) => (
+                          <Box key={`${entry.label}-${valueIndex}`} display="contents">
+                            <Typography variant="caption" color="text.disabled">{entry.label}</Typography>
+                            <Typography variant="body2" fontWeight={row.kind === 'summary' ? 700 : 500} textAlign="right">{entry.value}</Typography>
+                          </Box>
+                        ))}
+                      </Box>
+                    ) : null}
+                  </Box>
+                )
+              })}
+            </Box>
+
+            {!report.rows.length || report.noData ? (
+              <Box display="grid" sx={{ placeItems: 'center' }} minHeight={240} px={2}>
+                <Typography color="text.secondary">QuickBooks returned no report data for this period.</Typography>
+              </Box>
+            ) : null}
+          </Box>
+          <Typography variant="caption" color="text.disabled">
+            This statement is rendered from the QuickBooks Reports API. Totals and accounting basis are controlled by the connected QuickBooks company.
+          </Typography>
+        </Stack>
+      )}
+    </Stack>
+  )
+}
+
+function addressLines(address: InvoiceDetail['invoice']['billingAddress']) {
+  const cityRegion = [address.city, address.region].filter(Boolean).join(', ')
+  const locality = [cityRegion, address.postalCode].filter(Boolean).join(' ')
+  return [
+    ...(Array.isArray(address.lines) ? address.lines : []),
+    locality,
+    address.country || '',
+  ].filter(Boolean)
+}
+
+function AttachmentPreview({ attachment, compact = false }: {
+  attachment: InvoiceDetail['attachments'][number]
+  compact?: boolean
+}) {
+  const href = `/api/accounting/quickbooks/attachments/${encodeURIComponent(attachment.id)}`
+  const contentType = String(attachment.contentType || '').toLowerCase()
+  const fileName = String(attachment.fileName || '').toLowerCase()
+  const isImage = contentType.startsWith('image/') || /\.(avif|gif|heic|heif|jpe?g|png|webp)$/.test(fileName)
+  const isPdf = contentType === 'application/pdf' || fileName.endsWith('.pdf')
+  return (
+    <Box sx={{ border: '1px solid rgba(255,255,255,0.12)', borderRadius: '8px', overflow: 'hidden', minWidth: 0 }}>
+      {isImage ? (
+        <Box
+          component="img"
+          src={compact ? `${href}?thumbnail=1` : href}
+          alt={attachment.fileName || 'QuickBooks receipt'}
+          referrerPolicy="no-referrer"
+          sx={{ width: '100%', height: compact ? 140 : 260, objectFit: 'contain', display: 'block', bgcolor: '#0F0F13' }}
+        />
+      ) : isPdf && !compact ? (
+        <Box
+          component="iframe"
+          src={href}
+          title={attachment.fileName || 'QuickBooks receipt PDF'}
+          referrerPolicy="no-referrer"
+          sx={{ width: '100%', height: 360, border: 0, display: 'block', bgcolor: '#0F0F13' }}
+        />
+      ) : (
+        <Box display="grid" sx={{ placeItems: 'center', bgcolor: '#111219' }} height={compact ? 100 : 160}>
+          <AttachFileRounded sx={{ fontSize: 36, color: 'text.disabled' }} />
+        </Box>
+      )}
+      <Box p={1.25} display="flex" alignItems="center" justifyContent="space-between" gap={1} bgcolor="#1B1C24">
+        <Box minWidth={0}>
+          <Typography variant="body2" fontWeight={600} noWrap>{attachment.fileName || 'QuickBooks attachment'}</Typography>
+          <Typography variant="caption" color="text.disabled">{formatBytes(attachment.sizeBytes)}</Typography>
+        </Box>
+        <Tooltip title="Open attachment">
+          <IconButton component="a" href={href} target="_blank" rel="noreferrer" aria-label={`Open ${attachment.fileName || 'attachment'}`} size="small">
+            <OpenInNewRounded fontSize="small" />
+          </IconButton>
+        </Tooltip>
+      </Box>
+    </Box>
+  )
+}
+
+function InvoiceDocument({ detail, money, dateOnly }: {
+  detail: InvoiceDetail
+  money: (amount: number, currencyCode?: string | null, compact?: boolean) => string
+  dateOnly: (value: unknown) => string
+}) {
+  const invoice = detail.invoice
+  const companyAddress = addressLines(detail.company.address)
+  const billingAddress = addressLines(invoice.billingAddress)
+  const shippingAddress = addressLines(invoice.shippingAddress)
+  const displayLines = invoice.lines.filter((line) => line.kind !== 'subtotal' || line.depth > 0)
+  return (
+    <Stack spacing={2}>
+      <Box sx={{ bgcolor: '#F7F8FA', color: '#15171A', borderRadius: '8px', overflow: 'hidden', boxShadow: '0 18px 48px rgba(0,0,0,0.28)' }}>
+        <Box sx={{ height: 7, bgcolor: '#6EA8FE' }} />
+        <Box sx={{ p: { xs: 2, sm: 3 } }}>
+          <Box display="flex" alignItems="flex-start" justifyContent="space-between" gap={2} flexWrap="wrap">
+            <Box maxWidth={360}>
+              <Typography fontSize="1.35rem" fontWeight={800}>{detail.company.companyName}</Typography>
+              {detail.company.legalName && detail.company.legalName !== detail.company.companyName ? <Typography variant="body2" color="#5F6670">{detail.company.legalName}</Typography> : null}
+              {companyAddress.map((line) => <Typography key={line} variant="body2" color="#5F6670">{line}</Typography>)}
+              {detail.company.phone ? <Typography variant="body2" color="#5F6670">{detail.company.phone}</Typography> : null}
+              {detail.company.email ? <Typography variant="body2" color="#5F6670">{detail.company.email}</Typography> : null}
+            </Box>
+            <Box textAlign="right">
+              <Typography fontSize="1.8rem" fontWeight={800} color="#2C4A78">INVOICE</Typography>
+              <Typography fontWeight={700}>#{invoice.documentNumber || invoice.id}</Typography>
+              <Chip size="small" label={invoice.balance > 0 ? 'Open' : 'Paid'} color={invoice.balance > 0 ? 'warning' : 'success'} sx={{ mt: 1 }} />
+            </Box>
+          </Box>
+
+          <Divider sx={{ my: 2.5, borderColor: '#DCE1E8' }} />
+
+          <Box display="grid" gridTemplateColumns={{ xs: '1fr', sm: 'minmax(0, 1fr) minmax(220px, auto)' }} gap={3}>
+            <Box display="grid" gridTemplateColumns={{ xs: '1fr', sm: shippingAddress.length ? '1fr 1fr' : '1fr' }} gap={2}>
+              <Box>
+                <Typography variant="caption" fontWeight={800} color="#68717D">BILL TO</Typography>
+                <Typography fontWeight={700} mt={0.5}>{invoice.customerName || 'Customer'}</Typography>
+                {billingAddress.map((line) => <Typography key={line} variant="body2" color="#5F6670">{line}</Typography>)}
+                {invoice.billingEmail ? <Typography variant="body2" color="#5F6670">{invoice.billingEmail}</Typography> : null}
+              </Box>
+              {shippingAddress.length ? (
+                <Box>
+                  <Typography variant="caption" fontWeight={800} color="#68717D">SHIP TO</Typography>
+                  {shippingAddress.map((line) => <Typography key={line} variant="body2" color="#5F6670" mt={line === shippingAddress[0] ? 0.5 : 0}>{line}</Typography>)}
+                </Box>
+              ) : null}
+            </Box>
+            <Box display="grid" gridTemplateColumns="auto auto" alignContent="start" gap="6px 18px">
+              <Typography variant="body2" color="#68717D">Invoice date</Typography><Typography variant="body2" fontWeight={700} textAlign="right">{dateOnly(invoice.transactionDate)}</Typography>
+              <Typography variant="body2" color="#68717D">Due date</Typography><Typography variant="body2" fontWeight={700} textAlign="right">{dateOnly(invoice.dueDate)}</Typography>
+              {invoice.salesTerm ? <><Typography variant="body2" color="#68717D">Terms</Typography><Typography variant="body2" fontWeight={700} textAlign="right">{invoice.salesTerm}</Typography></> : null}
+              {invoice.trackingNumber ? <><Typography variant="body2" color="#68717D">Tracking</Typography><Typography variant="body2" fontWeight={700} textAlign="right">{invoice.trackingNumber}</Typography></> : null}
+            </Box>
+          </Box>
+
+          <Box mt={3} sx={{ border: '1px solid #DCE1E8', borderRadius: '6px', overflow: 'hidden' }}>
+            <TableContainer sx={{ display: { xs: 'none', sm: 'block' } }}>
+              <Table size="small" aria-label="Invoice line items">
+                <TableHead><TableRow sx={{ bgcolor: '#E9EEF5' }}>
+                  <TableCell sx={{ color: '#334155', fontWeight: 800 }}>Product or service</TableCell>
+                  <TableCell sx={{ color: '#334155', fontWeight: 800 }}>Description</TableCell>
+                  <TableCell align="right" sx={{ color: '#334155', fontWeight: 800 }}>Qty</TableCell>
+                  <TableCell align="right" sx={{ color: '#334155', fontWeight: 800 }}>Rate</TableCell>
+                  <TableCell align="right" sx={{ color: '#334155', fontWeight: 800 }}>Amount</TableCell>
+                </TableRow></TableHead>
+                <TableBody>{displayLines.map((line, index) => (
+                  <TableRow key={line.id || index} sx={{ '& td': { borderColor: '#E5E9EF' }, bgcolor: line.kind === 'subtotal' ? '#F1F4F8' : 'transparent' }}>
+                    <TableCell sx={{ color: '#15171A', fontWeight: line.kind === 'item' ? 700 : 600, pl: 2 + Math.min(line.depth, 3) * 2 }}>{line.itemName}</TableCell>
+                    <TableCell sx={{ color: '#5F6670' }}>{line.description || '—'}</TableCell>
+                    <TableCell align="right" sx={{ color: '#15171A' }}>{line.quantity ?? '—'}</TableCell>
+                    <TableCell align="right" sx={{ color: '#15171A' }}>{line.unitPrice === null ? '—' : money(line.unitPrice, invoice.currencyCode)}</TableCell>
+                    <TableCell align="right" sx={{ color: '#15171A', fontWeight: 700 }}>{money(line.amount, invoice.currencyCode)}</TableCell>
+                  </TableRow>
+                ))}</TableBody>
+              </Table>
+            </TableContainer>
+            <Box sx={{ display: { xs: 'block', sm: 'none' } }}>
+              {displayLines.map((line, index) => (
+                <Box key={line.id || index} px={1.5} py={1.25} borderBottom="1px solid #E5E9EF" sx={{ pl: 1.5 + Math.min(line.depth, 3) * 1.25 }}>
+                  <Box display="flex" justifyContent="space-between" gap={1.5}>
+                    <Typography variant="body2" fontWeight={700}>{line.itemName}</Typography>
+                    <Typography variant="body2" fontWeight={800}>{money(line.amount, invoice.currencyCode)}</Typography>
+                  </Box>
+                  {line.description ? <Typography variant="caption" color="#5F6670">{line.description}</Typography> : null}
+                  {line.quantity !== null || line.unitPrice !== null ? <Typography variant="caption" color="#68717D" display="block">{line.quantity ?? '—'} × {line.unitPrice === null ? '—' : money(line.unitPrice, invoice.currencyCode)}</Typography> : null}
+                </Box>
+              ))}
+              {!displayLines.length ? <Typography variant="body2" color="#5F6670" p={2}>No invoice line items were returned by QuickBooks.</Typography> : null}
+            </Box>
+          </Box>
+
+          <Box display="grid" gridTemplateColumns={{ xs: '1fr', sm: 'minmax(0, 1fr) 280px' }} gap={3} mt={2.5}>
+            <Box>
+              {invoice.customerMemo ? <><Typography variant="caption" fontWeight={800} color="#68717D">MESSAGE</Typography><Typography variant="body2" sx={{ whiteSpace: 'pre-wrap' }}>{invoice.customerMemo}</Typography></> : null}
+              {invoice.privateNote ? <><Typography variant="caption" fontWeight={800} color="#68717D" display="block" mt={invoice.customerMemo ? 2 : 0}>INTERNAL NOTE</Typography><Typography variant="body2" color="#5F6670" sx={{ whiteSpace: 'pre-wrap' }}>{invoice.privateNote}</Typography></> : null}
+            </Box>
+            <Box display="grid" gridTemplateColumns="1fr auto" gap="8px 18px" alignContent="start">
+              <Typography variant="body2" color="#68717D">Subtotal</Typography><Typography variant="body2" textAlign="right">{money(invoice.subtotal, invoice.currencyCode)}</Typography>
+              {invoice.totalTax ? <><Typography variant="body2" color="#68717D">Tax</Typography><Typography variant="body2" textAlign="right">{money(invoice.totalTax, invoice.currencyCode)}</Typography></> : null}
+              {invoice.deposit ? <><Typography variant="body2" color="#68717D">Deposit</Typography><Typography variant="body2" textAlign="right">−{money(invoice.deposit, invoice.currencyCode)}</Typography></> : null}
+              <Divider sx={{ gridColumn: '1 / -1', borderColor: '#DCE1E8' }} />
+              <Typography fontWeight={800}>Total</Typography><Typography fontWeight={800} textAlign="right">{money(invoice.totalAmount, invoice.currencyCode)}</Typography>
+              <Typography fontWeight={800} color="#2C4A78">Balance due</Typography><Typography fontWeight={800} color="#2C4A78" textAlign="right">{money(invoice.balance, invoice.currencyCode)}</Typography>
+            </Box>
+          </Box>
+        </Box>
+      </Box>
+
+      {detail.attachments.length ? (
+        <Box>
+          <Typography fontWeight={700} mb={1}>Invoice attachments</Typography>
+          <Box display="grid" gridTemplateColumns={{ xs: '1fr', sm: 'repeat(2, minmax(0, 1fr))' }} gap={1.5}>
+            {detail.attachments.map((attachment) => <AttachmentPreview key={attachment.id} attachment={attachment} compact />)}
+          </Box>
+        </Box>
+      ) : null}
+    </Stack>
+  )
+}
+
 export default function AccountingSection() {
   const dateTimeSettings = useUserDateTime()
   const [view, setView] = useState<View>('overview')
@@ -235,11 +698,24 @@ export default function AccountingSection() {
   const [search, setSearch] = useState('')
   const [status, setStatus] = useState('')
   const [entityType, setEntityType] = useState('')
+  const [reportKey, setReportKey] = useState<ReportKey>('profit_loss')
+  const [reportPeriod, setReportPeriod] = useState<ReportPeriod>('ytd')
+  const [financialReport, setFinancialReport] = useState<FinancialReport | null>(null)
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [selected, setSelected] = useState<{ view: View; row: ExplorerRow } | null>(null)
+  const [invoiceDetail, setInvoiceDetail] = useState<InvoiceDetail | null>(null)
+  const [invoiceLoading, setInvoiceLoading] = useState(false)
+  const [invoiceError, setInvoiceError] = useState<string | null>(null)
+  const [transactionAttachments, setTransactionAttachments] = useState<InvoiceDetail['attachments']>([])
+  const [transactionAttachmentsLoading, setTransactionAttachmentsLoading] = useState(false)
+  const [transactionAttachmentsError, setTransactionAttachmentsError] = useState<string | null>(null)
+
+  const effectiveReportPeriod: ReportPeriod = reportKey === 'profit_loss' || reportKey === 'cash_flow'
+    ? reportPeriod === 'as_of_today' ? 'ytd' : reportPeriod
+    : 'as_of_today'
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -254,7 +730,12 @@ export default function AccountingSection() {
     setLoading(true)
     setError(null)
     const params = new URLSearchParams({ range })
-    if (view !== 'overview') {
+    if (view === 'reports') {
+      params.set('view', 'reports')
+      params.set('report', reportKey)
+      params.set('period', effectiveReportPeriod)
+      setFinancialReport(null)
+    } else if (view !== 'overview') {
       params.set('view', view)
       params.set('page', String(page))
       params.set('pageSize', '25')
@@ -270,11 +751,13 @@ export default function AccountingSection() {
           capabilities?: Capabilities
           overview?: Overview
           result?: ListResult
+          report?: FinancialReport | null
         }
         if (!response.ok || !payload.ok) throw new Error(payload.error || 'Accounting data is unavailable')
         if (payload.capabilities) setCapabilities(payload.capabilities)
         if (payload.overview) setOverview(payload.overview)
         if (payload.result) setResult(payload.result)
+        if ('report' in payload) setFinancialReport(payload.report || null)
       })
       .catch((fetchError) => {
         if ((fetchError as Error).name !== 'AbortError') setError((fetchError as Error).message)
@@ -283,7 +766,81 @@ export default function AccountingSection() {
         if (!controller.signal.aborted) setLoading(false)
       })
     return () => controller.abort()
-  }, [entityType, page, range, search, status, view])
+  }, [effectiveReportPeriod, entityType, page, range, reportKey, search, status, view])
+
+  useEffect(() => {
+    const isInvoice = selected
+      && (selected.view === 'invoices' || selected.view === 'transactions')
+      && textValue(selected.row, 'entityType') === 'Invoice'
+    if (!isInvoice || !selected) {
+      setInvoiceDetail(null)
+      setInvoiceError(null)
+      setInvoiceLoading(false)
+      return
+    }
+
+    const controller = new AbortController()
+    setInvoiceDetail(null)
+    setInvoiceError(null)
+    setInvoiceLoading(true)
+    const params = new URLSearchParams({ view: 'invoice', id: selected.row.id })
+    fetch(`/api/accounting/quickbooks?${params}`, { cache: 'no-store', signal: controller.signal })
+      .then(async (response) => {
+        const payload = await response.json() as { ok?: boolean; error?: string; invoice?: InvoiceDetail }
+        if (!response.ok || !payload.ok || !payload.invoice) {
+          throw new Error(payload.error || 'Invoice detail is unavailable')
+        }
+        setInvoiceDetail(payload.invoice)
+      })
+      .catch((fetchError) => {
+        if ((fetchError as Error).name !== 'AbortError') setInvoiceError((fetchError as Error).message)
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setInvoiceLoading(false)
+      })
+    return () => controller.abort()
+  }, [selected])
+
+  useEffect(() => {
+    const selectedEntityType = selected ? textValue(selected.row, 'entityType', '') : ''
+    const isNonInvoiceTransaction = selected
+      && ['invoices', 'receipts', 'transactions'].includes(selected.view)
+      && selectedEntityType
+      && selectedEntityType !== 'Invoice'
+    if (!isNonInvoiceTransaction || !selected) {
+      setTransactionAttachments([])
+      setTransactionAttachmentsError(null)
+      setTransactionAttachmentsLoading(false)
+      return
+    }
+
+    const controller = new AbortController()
+    setTransactionAttachments([])
+    setTransactionAttachmentsError(null)
+    setTransactionAttachmentsLoading(true)
+    const params = new URLSearchParams({
+      view: 'transaction-attachments',
+      id: selected.row.id,
+      entityType: selectedEntityType,
+    })
+    fetch(`/api/accounting/quickbooks?${params}`, { cache: 'no-store', signal: controller.signal })
+      .then(async (response) => {
+        const payload = await response.json() as {
+          ok?: boolean
+          error?: string
+          attachments?: InvoiceDetail['attachments']
+        }
+        if (!response.ok || !payload.ok) throw new Error(payload.error || 'Receipt evidence is unavailable')
+        setTransactionAttachments(Array.isArray(payload.attachments) ? payload.attachments : [])
+      })
+      .catch((fetchError) => {
+        if ((fetchError as Error).name !== 'AbortError') setTransactionAttachmentsError((fetchError as Error).message)
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setTransactionAttachmentsLoading(false)
+      })
+    return () => controller.abort()
+  }, [selected])
 
   const money = useMemo(() => (amount: number, currencyCode?: string | null, compact = false) => {
     const currency = currencyCode || overview?.currencyCode
@@ -380,6 +937,14 @@ export default function AccountingSection() {
   const totalPages = Math.max(1, Math.ceil(result.total / result.pageSize))
   const connection = overview?.connection
   const rangeLabel = RANGES.find((candidate) => candidate.id === range)?.label || 'YTD'
+  const selectedIsInvoice = Boolean(
+    selected
+    && (selected.view === 'invoices' || selected.view === 'transactions')
+    && textValue(selected.row, 'entityType') === 'Invoice',
+  )
+  const selectedIsTransaction = Boolean(
+    selected && ['invoices', 'receipts', 'transactions'].includes(selected.view),
+  )
 
   return (
     <Box height="100%" display="flex" flexDirection="column" minWidth={0} bgcolor="#0F0F13">
@@ -453,6 +1018,13 @@ export default function AccountingSection() {
                   <Metric label="Overdue" value={money(overview.metrics.overdueInvoices, null, true)} detail={`${overview.metrics.overdueInvoiceCount} invoices`} color={overview.metrics.overdueInvoiceCount ? '#FF8A80' : '#70D6A7'} onClick={() => { setView('invoices'); setStatus('Overdue') }} />
                   <Metric label={`Sales receipts · ${rangeLabel}`} value={money(overview.metrics.receivedSales, null, true)} detail="Paid at sale" onClick={() => setView('receipts')} />
                   <Metric label={`Expenses · ${rangeLabel}`} value={money(overview.metrics.expenses, null, true)} detail="Purchases and bills" color="#F2B76D" onClick={() => setView('receipts')} />
+                  <Metric
+                    label="Financial statements"
+                    value={overview.counts.reports.toLocaleString(dateTimeSettings.locale)}
+                    detail={overview.counts.reportErrors ? `${overview.counts.reportErrors} refresh warnings` : 'QuickBooks report snapshots'}
+                    color="#A8C7FA"
+                    onClick={() => setView('reports')}
+                  />
                   <Metric label="Products & services" value={overview.counts.products.toLocaleString(dateTimeSettings.locale)} detail={`${overview.counts.accounts} accounts`} onClick={() => setView('products')} />
                 </Box>
 
@@ -477,6 +1049,7 @@ export default function AccountingSection() {
                         ['Accounts', overview.counts.accounts, 'accounts'],
                         ['Products & services', overview.counts.products, 'products'],
                         ['Attachments', overview.counts.attachments, 'attachments'],
+                        ['Financial statements', overview.counts.reports, 'reports'],
                       ].map(([label, count, target]) => (
                         <Box key={String(label)} display="contents">
                           <Button onClick={() => setView(target as View)} sx={{ justifyContent: 'flex-start', color: 'text.secondary', minWidth: 0, p: 0, textTransform: 'none' }}>{String(label)}</Button>
@@ -505,9 +1078,20 @@ export default function AccountingSection() {
                     </Box>
                   )) : <Typography color="text.secondary" p={2}>No synced transactions.</Typography>}
                 </Box>
-                <Alert severity="info" variant="outlined">Activity totals are operational views of synced transaction forms, not formal financial statements.</Alert>
+                <Alert severity="info" variant="outlined">Activity totals are operational views. Use Financial reports for authoritative QuickBooks statements and accounting basis.</Alert>
               </Stack>
             ) : null
+          ) : view === 'reports' ? (
+            <FinancialReportPanel
+              reportKey={reportKey}
+              onReportKeyChange={setReportKey}
+              period={effectiveReportPeriod}
+              onPeriodChange={setReportPeriod}
+              report={financialReport}
+              loading={loading}
+              dateOnly={dateOnly}
+              formatDateTime={(value) => formatUserDateTime(value, dateTimeSettings, { dateStyle: 'medium', timeStyle: 'short' })}
+            />
           ) : (
             <Stack spacing={2}>
               <Box display="flex" alignItems={{ xs: 'stretch', sm: 'center' }} gap={1.25} flexDirection={{ xs: 'column', sm: 'row' }}>
@@ -603,7 +1187,14 @@ export default function AccountingSection() {
         anchor="right"
         open={Boolean(selected)}
         onClose={() => setSelected(null)}
-        PaperProps={{ sx: { width: { xs: '100%', sm: 440 }, maxWidth: '100vw', bgcolor: '#171821', backgroundImage: 'none' } }}
+        PaperProps={{
+          sx: {
+            width: selectedIsInvoice ? { xs: '100%', sm: 760, lg: 920 } : { xs: '100%', sm: 440 },
+            maxWidth: '100vw',
+            bgcolor: '#171821',
+            backgroundImage: 'none',
+          },
+        }}
       >
         {selected ? (
           <Box height="100%" display="flex" flexDirection="column">
@@ -615,23 +1206,58 @@ export default function AccountingSection() {
               <IconButton aria-label="Close record details" onClick={() => setSelected(null)}><CloseRounded /></IconButton>
             </Box>
             <Divider />
-            <Box flex={1} overflow="auto" p={2.5}>
-              <Stack spacing={2}>
-                {columns.map((column) => (
-                  <Box key={column.key}>
-                    <Typography variant="caption" color="text.disabled" display="block" mb={0.5}>{column.label}</Typography>
-                    <Box sx={{ '& .MuiTypography-root': { whiteSpace: 'normal' } }}>{column.render(selected.row)}</Box>
-                  </Box>
-                ))}
-                {selected.view !== 'accounts' && selected.view !== 'products' && selected.view !== 'customers' && selected.view !== 'vendors' && selected.view !== 'attachments' ? (
-                  <>
-                    <Box><Typography variant="caption" color="text.disabled" display="block" mb={0.5}>Due date</Typography><Typography variant="body2">{dateOnly(value(selected.row, 'dueDate'))}</Typography></Box>
-                    <Box><Typography variant="caption" color="text.disabled" display="block" mb={0.5}>Account</Typography><Typography variant="body2">{textValue(selected.row, 'accountName')}</Typography></Box>
-                    <Box><Typography variant="caption" color="text.disabled" display="block" mb={0.5}>Payment method</Typography><Typography variant="body2">{textValue(selected.row, 'paymentMethod')}</Typography></Box>
-                    <Box><Typography variant="caption" color="text.disabled" display="block" mb={0.5}>Memo</Typography><Typography variant="body2" sx={{ whiteSpace: 'pre-wrap' }}>{textValue(selected.row, 'memo')}</Typography></Box>
-                  </>
-                ) : null}
-              </Stack>
+            <Box flex={1} overflow="auto" p={{ xs: 2, sm: 2.5 }}>
+              {selectedIsInvoice ? (
+                invoiceLoading ? (
+                  <Box display="grid" sx={{ placeItems: 'center' }} minHeight={320}><CircularProgress /></Box>
+                ) : invoiceError ? (
+                  <Alert severity="error">{invoiceError}</Alert>
+                ) : invoiceDetail ? (
+                  <InvoiceDocument detail={invoiceDetail} money={money} dateOnly={dateOnly} />
+                ) : null
+              ) : selected.view === 'attachments' ? (
+                <AttachmentPreview attachment={{
+                  id: selected.row.id,
+                  fileName: textValue(selected.row, 'fileName', '') || null,
+                  contentType: textValue(selected.row, 'contentType', '') || null,
+                  sizeBytes: value(selected.row, 'sizeBytes') === null || value(selected.row, 'sizeBytes') === undefined
+                    ? null
+                    : Number(value(selected.row, 'sizeBytes')),
+                  note: textValue(selected.row, 'note', '') || null,
+                }} />
+              ) : (
+                <Stack spacing={2}>
+                  {columns.map((column) => (
+                    <Box key={column.key}>
+                      <Typography variant="caption" color="text.disabled" display="block" mb={0.5}>{column.label}</Typography>
+                      <Box sx={{ '& .MuiTypography-root': { whiteSpace: 'normal' } }}>{column.render(selected.row)}</Box>
+                    </Box>
+                  ))}
+                  {selected.view !== 'accounts' && selected.view !== 'products' && selected.view !== 'customers' && selected.view !== 'vendors' ? (
+                    <>
+                      <Box><Typography variant="caption" color="text.disabled" display="block" mb={0.5}>Due date</Typography><Typography variant="body2">{dateOnly(value(selected.row, 'dueDate'))}</Typography></Box>
+                      <Box><Typography variant="caption" color="text.disabled" display="block" mb={0.5}>Account</Typography><Typography variant="body2">{textValue(selected.row, 'accountName')}</Typography></Box>
+                      <Box><Typography variant="caption" color="text.disabled" display="block" mb={0.5}>Payment method</Typography><Typography variant="body2">{textValue(selected.row, 'paymentMethod')}</Typography></Box>
+                      <Box><Typography variant="caption" color="text.disabled" display="block" mb={0.5}>Memo</Typography><Typography variant="body2" sx={{ whiteSpace: 'pre-wrap' }}>{textValue(selected.row, 'memo')}</Typography></Box>
+                    </>
+                  ) : null}
+                  {selectedIsTransaction && !selectedIsInvoice ? (
+                    <Box>
+                      <Typography fontWeight={700} mb={1}>Receipt evidence</Typography>
+                      {transactionAttachmentsLoading ? <CircularProgress size={24} /> : null}
+                      {transactionAttachmentsError ? <Alert severity="warning">{transactionAttachmentsError}</Alert> : null}
+                      {!transactionAttachmentsLoading && !transactionAttachmentsError && !transactionAttachments.length ? (
+                        <Typography variant="body2" color="text.secondary">No QuickBooks attachment is linked to this record.</Typography>
+                      ) : null}
+                      {transactionAttachments.length ? (
+                        <Stack spacing={1.5}>
+                          {transactionAttachments.map((attachment) => <AttachmentPreview key={attachment.id} attachment={attachment} />)}
+                        </Stack>
+                      ) : null}
+                    </Box>
+                  ) : null}
+                </Stack>
+              )}
             </Box>
           </Box>
         ) : null}

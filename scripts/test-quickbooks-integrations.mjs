@@ -7,6 +7,8 @@ import {
   parseQuickBooksAttachments,
   parseQuickBooksCompanyInfo,
   parseQuickBooksCustomers,
+  parseQuickBooksFinancialReport,
+  parseQuickBooksInvoiceDetail,
   parseQuickBooksItems,
   parseQuickBooksTransactions,
   parseQuickBooksVendors,
@@ -24,7 +26,14 @@ function includes(source, fragment, label) {
 
 assert.deepEqual(
   parseQuickBooksCompanyInfo({ CompanyInfo: { CompanyName: ' Example Co ', Country: 'US' } }),
-  { companyName: 'Example Co', country: 'US' },
+  {
+    companyName: 'Example Co',
+    country: 'US',
+    legalName: null,
+    email: null,
+    phone: null,
+    address: { lines: [], city: null, region: null, postalCode: null, country: null },
+  },
 )
 assert.throws(() => parseQuickBooksCompanyInfo({ CompanyInfo: {} }), /company name/)
 
@@ -85,6 +94,45 @@ assert.equal(invoices[0].entityType, 'Invoice')
 assert.equal(invoices[0].partyName, 'Acme Buyer')
 assert.equal(invoices[0].status, 'Open')
 
+const invoiceDetail = parseQuickBooksInvoiceDetail({
+  Id: '40', DocNumber: '1001', TxnDate: '2026-07-18', DueDate: '2026-08-18',
+  CustomerRef: { value: '20', name: 'Acme Buyer' }, TotalAmt: 527.5, Balance: 527.5,
+  CurrencyRef: { value: 'USD' }, BillEmail: { Address: 'buyer@example.com' },
+  BillAddr: { Line1: '100 Main St', City: 'Boston', CountrySubDivisionCode: 'MA', PostalCode: '02110' },
+  TxnTaxDetail: { TotalTax: 27.5 },
+  Line: [
+    {
+      Id: '1', DetailType: 'SalesItemLineDetail', Description: 'Implementation services', Amount: 500,
+      SalesItemLineDetail: { ItemRef: { value: '10', name: 'Consulting' }, Qty: 4, UnitPrice: 125 },
+    },
+    { Id: '2', DetailType: 'SubTotalLineDetail', Amount: 500, SubTotalLineDetail: {} },
+  ],
+})
+assert.equal(invoiceDetail.lines[0].itemName, 'Consulting')
+assert.equal(invoiceDetail.lines[0].quantity, 4)
+assert.equal(invoiceDetail.lines[0].unitPrice, 125)
+assert.equal(invoiceDetail.subtotal, 500)
+assert.equal(invoiceDetail.totalTax, 27.5)
+
+const financialReport = parseQuickBooksFinancialReport({
+  Header: {
+    ReportName: 'ProfitAndLoss', ReportBasis: 'Accrual', StartPeriod: '2026-01-01',
+    EndPeriod: '2026-07-18', Currency: 'USD', Time: '2026-07-18T12:00:00Z',
+    Option: [{ Name: 'NoReportData', Value: 'false' }],
+  },
+  Columns: { Column: [{ ColTitle: 'Account', ColType: 'Account' }, { ColTitle: 'Total', ColType: 'Money' }] },
+  Rows: {
+    Row: [{
+      type: 'Section', group: 'Income', Header: { ColData: [{ value: 'Income' }] },
+      Rows: { Row: [{ type: 'Data', ColData: [{ value: 'Sales' }, { value: '500.00' }] }] },
+      Summary: { ColData: [{ value: 'Total Income' }, { value: '500.00' }] },
+    }],
+  },
+})
+assert.equal(financialReport.reportBasis, 'Accrual')
+assert.equal(financialReport.rows.length, 3)
+assert.deepEqual(financialReport.rows.map((row) => row.kind), ['section', 'data', 'summary'])
+
 const attachments = parseQuickBooksAttachments({
   QueryResponse: {
     Attachable: [{
@@ -117,6 +165,14 @@ for (const fragment of [
   'idx_quickbooks_transactions_open',
 ]) includes(explorerMigration, fragment, 'QuickBooks explorer migration')
 
+const reportMigration = read('db/migrations/0063_quickbooks_financial_reports.sql')
+for (const fragment of [
+  "ADD COLUMN IF NOT EXISTS company_profile jsonb",
+  'CREATE TABLE IF NOT EXISTS quickbooks_financial_reports',
+  "report_key IN ('profit_loss', 'balance_sheet', 'cash_flow', 'ar_aging', 'ap_aging')",
+  'PRIMARY KEY (organization_id, report_key, period_key)',
+]) includes(reportMigration, fragment, 'QuickBooks financial report migration')
+
 const client = read('app_src/lib/integrations/quickBooksClient.ts')
 for (const fragment of [
   "app: 'quickbooks'",
@@ -133,6 +189,12 @@ for (const fragment of [
   "'Invoice'",
   "'Attachable'",
   'parseQuickBooksTransactions',
+  '/reports/${reportRequest.endpoint}',
+  "'ProfitAndLoss'",
+  "'CashFlow'",
+  "'AgedReceivables'",
+  "'attachable-thumbnail'",
+  'readQuickBooksAttachmentDownloadUrl',
 ]) includes(client + read('app_src/lib/maton.ts'), fragment, 'QuickBooks client')
 assert.ok(!client.includes("method: 'POST'"), 'QuickBooks catalog client must remain read-only')
 assert.ok(!client.includes('TRANSACTION_ENTITIES.map'), 'QuickBooks entity reads must remain paced')
@@ -150,6 +212,8 @@ for (const fragment of [
   "status = 'needs_mapping'",
   'readQuickBooksWorkerHeartbeatFromPostgres',
   'quickbooks_transactions',
+  'quickbooks_financial_reports',
+  'reportsReady',
   'jsonb_to_recordset',
 ]) includes(persistence, fragment, 'QuickBooks persistence')
 assert.ok(!persistence.includes('console.'), 'QuickBooks persistence must not log credentials or source payloads')
@@ -201,6 +265,11 @@ const explorerPersistence = read('app_src/lib/persistence/quickBooksExplorer.ts'
 for (const fragment of [
   'readQuickBooksExplorerOverviewInPostgres',
   'readQuickBooksExplorerListInPostgres',
+  'readQuickBooksFinancialReportInPostgres',
+  'readQuickBooksInvoiceDetailInPostgres',
+  'readQuickBooksAttachmentAccessInPostgres',
+  'readQuickBooksTransactionAttachmentsInPostgres',
+  'parseQuickBooksInvoiceDetail',
   "'Overdue'",
   'organization_id = $1::uuid',
   'LIMIT $6 OFFSET $7',
@@ -212,8 +281,21 @@ for (const fragment of [
   'ACCOUNTING_VIEW_REQUIRED',
   'readQuickBooksExplorerOverviewInPostgres',
   'readQuickBooksExplorerListInPostgres',
+  "viewValue === 'reports'",
+  "viewValue === 'invoice'",
+  "viewValue === 'transaction-attachments'",
   "'Cache-Control': 'no-store'",
 ]) includes(explorerRoute, fragment, 'QuickBooks explorer API')
+
+const attachmentRoute = read('app_src/app/api/accounting/quickbooks/attachments/[attachmentId]/route.ts')
+for (const fragment of [
+  'requireRequestUser',
+  'permissions.viewAccounting',
+  'readQuickBooksAttachmentAccessInPostgres',
+  'readQuickBooksAttachmentDownloadUrl',
+  "'Cache-Control': 'private, no-store'",
+  "'Referrer-Policy': 'no-referrer'",
+]) includes(attachmentRoute, fragment, 'QuickBooks attachment API')
 
 const explorer = read('app_src/components/accounting/AccountingSection.tsx')
 for (const fragment of [
@@ -221,7 +303,13 @@ for (const fragment of [
   'Products & services',
   'Chart of accounts',
   'All transactions',
-  'Activity totals are operational views',
+  'Financial reports',
+  'FinancialReportPanel',
+  'InvoiceDocument',
+  'Invoice line items',
+  'AttachmentPreview',
+  'Receipt evidence',
+  'authoritative QuickBooks statements',
   '/api/accounting/quickbooks',
 ]) includes(explorer, fragment, 'QuickBooks explorer UI')
 
@@ -249,9 +337,10 @@ const health = read('app_src/app/api/health/route.ts')
 for (const fragment of [
   "filename = '0061_quickbooks_organization_connector.sql'",
   "filename = '0062_quickbooks_financial_explorer.sql'",
+  "filename = '0063_quickbooks_financial_reports.sql'",
   'readQuickBooksWorkerHeartbeatFromPostgres',
   'QuickBooks sync worker heartbeat is missing or stale.',
   'quickBooks: true',
 ]) includes(health, fragment, 'QuickBooks health contract')
 
-console.log('PASS QuickBooks organization connector, read-only explorer, Toast mappings, and worker contracts')
+console.log('PASS QuickBooks organization connector, financial statements, invoice documents, receipt previews, Toast mappings, and worker contracts')
