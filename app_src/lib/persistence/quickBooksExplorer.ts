@@ -1,4 +1,5 @@
 import { query } from '@/lib/persistence/postgres'
+import { parseQuickBooksInvoiceDetail } from '@/lib/integrations/quickBooksCatalog.mjs'
 
 export const QUICKBOOKS_EXPLORER_VIEWS = [
   'accounts', 'products', 'customers', 'vendors', 'invoices', 'receipts', 'transactions', 'attachments',
@@ -6,8 +7,27 @@ export const QUICKBOOKS_EXPLORER_VIEWS = [
 
 export const QUICKBOOKS_EXPLORER_RANGES = ['30d', '90d', 'ytd', '12m', 'all'] as const
 
+export const QUICKBOOKS_FINANCIAL_REPORT_KEYS = [
+  'profit_loss', 'balance_sheet', 'cash_flow', 'ar_aging', 'ap_aging',
+] as const
+
+export const QUICKBOOKS_FINANCIAL_REPORT_PERIODS = [
+  'mtd', 'qtd', 'ytd', 'six_months', 'as_of_today',
+] as const
+
 export type QuickBooksExplorerView = typeof QUICKBOOKS_EXPLORER_VIEWS[number]
 export type QuickBooksExplorerRange = typeof QUICKBOOKS_EXPLORER_RANGES[number]
+export type QuickBooksFinancialReportKey = typeof QUICKBOOKS_FINANCIAL_REPORT_KEYS[number]
+export type QuickBooksFinancialReportPeriod = typeof QUICKBOOKS_FINANCIAL_REPORT_PERIODS[number]
+
+export function normalizeQuickBooksReportPeriod(
+  reportKey: QuickBooksFinancialReportKey,
+  period: QuickBooksFinancialReportPeriod,
+) {
+  return reportKey === 'profit_loss' || reportKey === 'cash_flow'
+    ? period === 'as_of_today' ? 'ytd' : period
+    : 'as_of_today'
+}
 
 const TRANSACTION_STATUS_SQL = `CASE
   WHEN entity_type IN ('Invoice', 'Bill') AND open_balance <> 0 AND due_date < current_date THEN 'Overdue'
@@ -54,7 +74,7 @@ export async function readQuickBooksExplorerOverviewInPostgres(input: {
     ),
     query<{
       accounts: string; products: string; customers: string; vendors: string
-      transactions: string; attachments: string
+      transactions: string; attachments: string; reports: string; report_errors: string
     }>(
       `SELECT
          (SELECT count(*) FROM quickbooks_accounts WHERE organization_id = $1::uuid)::text AS accounts,
@@ -62,7 +82,11 @@ export async function readQuickBooksExplorerOverviewInPostgres(input: {
          (SELECT count(*) FROM quickbooks_customers WHERE organization_id = $1::uuid)::text AS customers,
          (SELECT count(*) FROM quickbooks_vendors WHERE organization_id = $1::uuid)::text AS vendors,
          (SELECT count(*) FROM quickbooks_transactions WHERE organization_id = $1::uuid)::text AS transactions,
-         (SELECT count(*) FROM quickbooks_attachments WHERE organization_id = $1::uuid)::text AS attachments`,
+         (SELECT count(*) FROM quickbooks_attachments WHERE organization_id = $1::uuid)::text AS attachments,
+         (SELECT count(*) FROM quickbooks_financial_reports
+           WHERE organization_id = $1::uuid AND status = 'ready')::text AS reports,
+         (SELECT count(*) FROM quickbooks_financial_reports
+           WHERE organization_id = $1::uuid AND last_error_code IS NOT NULL)::text AS report_errors`,
       [input.organizationId],
     ),
     query<{
@@ -162,6 +186,8 @@ export async function readQuickBooksExplorerOverviewInPostgres(input: {
       vendors: Number(countRow?.vendors || 0),
       transactions: Number(countRow?.transactions || 0),
       attachments: Number(countRow?.attachments || 0),
+      reports: Number(countRow?.reports || 0),
+      reportErrors: Number(countRow?.report_errors || 0),
     },
     metrics: {
       invoiced: Number(metricRow?.invoiced || 0),
@@ -195,6 +221,198 @@ export async function readQuickBooksExplorerOverviewInPostgres(input: {
       currencyCode: row.currency_code,
     })),
   }
+}
+
+export async function readQuickBooksFinancialReportInPostgres(input: {
+  organizationId: string
+  reportKey: QuickBooksFinancialReportKey
+  periodKey: QuickBooksFinancialReportPeriod
+}) {
+  const periodKey = normalizeQuickBooksReportPeriod(input.reportKey, input.periodKey)
+  const result = await query<{
+    report_key: QuickBooksFinancialReportKey
+    period_key: QuickBooksFinancialReportPeriod
+    report_name: string
+    report_basis: string | null
+    start_period: string | null
+    end_period: string | null
+    currency_code: string | null
+    generated_at: string | null
+    columns_payload: Array<{ title?: string; type?: string | null }>
+    rows_payload: Array<{
+      kind?: 'section' | 'data' | 'summary'
+      depth?: number
+      group?: string | null
+      cells?: Array<{ value?: string; id?: string | null; href?: string | null }>
+    }>
+    report_options: Record<string, unknown>
+    status: 'ready' | 'error'
+    last_error_code: string | null
+    last_attempted_at: string
+    synced_at: string | null
+  }>(
+    `SELECT report_key, period_key, report_name, report_basis,
+       start_period::text, end_period::text, currency_code, generated_at::text,
+       columns_payload, rows_payload, report_options, status, last_error_code,
+       last_attempted_at::text, synced_at::text
+     FROM quickbooks_financial_reports
+     WHERE organization_id = $1::uuid AND report_key = $2 AND period_key = $3
+     LIMIT 1`,
+    [input.organizationId, input.reportKey, periodKey],
+  )
+  const row = result.rows[0]
+  if (!row) return null
+  return {
+    reportKey: row.report_key,
+    periodKey: row.period_key,
+    reportName: row.report_name,
+    reportBasis: row.report_basis,
+    startPeriod: row.start_period,
+    endPeriod: row.end_period,
+    currencyCode: row.currency_code,
+    generatedAt: row.generated_at,
+    columns: Array.isArray(row.columns_payload) ? row.columns_payload : [],
+    rows: Array.isArray(row.rows_payload) ? row.rows_payload : [],
+    noData: row.report_options?.NoReportData === 'true' || row.report_options?.noData === true,
+    status: row.status,
+    lastErrorCode: row.last_error_code,
+    lastAttemptedAt: row.last_attempted_at,
+    syncedAt: row.synced_at,
+  }
+}
+
+export async function readQuickBooksInvoiceDetailInPostgres(input: {
+  organizationId: string
+  invoiceId: string
+}) {
+  const [invoice, attachments] = await Promise.all([
+    query<{
+      source_payload: Record<string, unknown>
+      company_name: string
+      company_profile: {
+        legalName?: string | null
+        email?: string | null
+        phone?: string | null
+        address?: {
+          lines?: string[]
+          city?: string | null
+          region?: string | null
+          postalCode?: string | null
+          country?: string | null
+        }
+      }
+    }>(
+      `SELECT transaction.source_payload, connection.company_name, connection.company_profile
+       FROM quickbooks_transactions transaction
+       JOIN organization_quickbooks_connections connection
+         ON connection.organization_id = transaction.organization_id
+       WHERE transaction.organization_id = $1::uuid
+         AND transaction.entity_type = 'Invoice'
+         AND transaction.quickbooks_transaction_id = $2
+       LIMIT 1`,
+      [input.organizationId, input.invoiceId],
+    ),
+    query<{
+      id: string
+      file_name: string | null
+      content_type: string | null
+      size_bytes: string | null
+      note: string | null
+    }>(
+      `SELECT attachment.quickbooks_attachment_id AS id, attachment.file_name,
+         attachment.content_type, attachment.size_bytes::text, attachment.note
+       FROM quickbooks_attachments attachment
+       WHERE attachment.organization_id = $1::uuid
+         AND EXISTS (
+           SELECT 1 FROM jsonb_array_elements(attachment.entity_references) reference
+           WHERE lower(reference->>'type') = 'invoice' AND reference->>'id' = $2
+         )
+       ORDER BY attachment.file_name NULLS LAST, attachment.quickbooks_attachment_id`,
+      [input.organizationId, input.invoiceId],
+    ),
+  ])
+  const row = invoice.rows[0]
+  if (!row) return null
+  return {
+    company: {
+      companyName: row.company_name,
+      legalName: row.company_profile?.legalName || null,
+      email: row.company_profile?.email || null,
+      phone: row.company_profile?.phone || null,
+      address: row.company_profile?.address || { lines: [], city: null, region: null, postalCode: null, country: null },
+    },
+    invoice: parseQuickBooksInvoiceDetail(row.source_payload),
+    attachments: attachments.rows.map((attachment) => ({
+      id: attachment.id,
+      fileName: attachment.file_name,
+      contentType: attachment.content_type,
+      sizeBytes: attachment.size_bytes === null ? null : Number(attachment.size_bytes),
+      note: attachment.note,
+    })),
+  }
+}
+
+export async function readQuickBooksAttachmentAccessInPostgres(input: {
+  organizationId: string
+  attachmentId: string
+}) {
+  const result = await query<{
+    attachment_id: string
+    file_name: string | null
+    content_type: string | null
+    credential_owner_email: string
+    maton_connection_id: string
+  }>(
+    `SELECT attachment.quickbooks_attachment_id AS attachment_id, attachment.file_name,
+       attachment.content_type, connection.credential_owner_email, connection.maton_connection_id
+     FROM quickbooks_attachments attachment
+     JOIN organization_quickbooks_connections connection
+       ON connection.organization_id = attachment.organization_id
+     WHERE attachment.organization_id = $1::uuid
+       AND attachment.quickbooks_attachment_id = $2
+     LIMIT 1`,
+    [input.organizationId, input.attachmentId],
+  )
+  const row = result.rows[0]
+  return row ? {
+    attachmentId: row.attachment_id,
+    fileName: row.file_name,
+    contentType: row.content_type,
+    ownerEmail: row.credential_owner_email,
+    connectionId: row.maton_connection_id,
+  } : null
+}
+
+export async function readQuickBooksTransactionAttachmentsInPostgres(input: {
+  organizationId: string
+  entityType: string
+  transactionId: string
+}) {
+  const result = await query<{
+    id: string
+    file_name: string | null
+    content_type: string | null
+    size_bytes: string | null
+    note: string | null
+  }>(
+    `SELECT attachment.quickbooks_attachment_id AS id, attachment.file_name,
+       attachment.content_type, attachment.size_bytes::text, attachment.note
+     FROM quickbooks_attachments attachment
+     WHERE attachment.organization_id = $1::uuid
+       AND EXISTS (
+         SELECT 1 FROM jsonb_array_elements(attachment.entity_references) reference
+         WHERE lower(reference->>'type') = lower($2) AND reference->>'id' = $3
+       )
+     ORDER BY attachment.file_name NULLS LAST, attachment.quickbooks_attachment_id`,
+    [input.organizationId, input.entityType, input.transactionId],
+  )
+  return result.rows.map((attachment) => ({
+    id: attachment.id,
+    fileName: attachment.file_name,
+    contentType: attachment.content_type,
+    sizeBytes: attachment.size_bytes === null ? null : Number(attachment.size_bytes),
+    note: attachment.note,
+  }))
 }
 
 export async function readQuickBooksExplorerListInPostgres(input: {

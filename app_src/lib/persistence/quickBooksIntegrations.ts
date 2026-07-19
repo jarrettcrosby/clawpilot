@@ -5,6 +5,7 @@ import type {
   QuickBooksAttachment,
   QuickBooksCompanyInfo,
   QuickBooksCustomer,
+  QuickBooksFinancialReportSnapshot,
   QuickBooksItem,
   QuickBooksTransaction,
   QuickBooksVendor,
@@ -52,7 +53,7 @@ export async function readQuickBooksIntegrationStateFromPostgres(organizationId:
     ),
     query<{
       accounts: string; items: string; customers: string; vendors: string
-      transactions: string; attachments: string
+      transactions: string; attachments: string; reports: string
     }>(
       `SELECT
          (SELECT count(*) FROM quickbooks_accounts WHERE organization_id = $1::uuid)::text AS accounts,
@@ -60,7 +61,9 @@ export async function readQuickBooksIntegrationStateFromPostgres(organizationId:
          (SELECT count(*) FROM quickbooks_customers WHERE organization_id = $1::uuid)::text AS customers,
          (SELECT count(*) FROM quickbooks_vendors WHERE organization_id = $1::uuid)::text AS vendors,
          (SELECT count(*) FROM quickbooks_transactions WHERE organization_id = $1::uuid)::text AS transactions,
-         (SELECT count(*) FROM quickbooks_attachments WHERE organization_id = $1::uuid)::text AS attachments`,
+         (SELECT count(*) FROM quickbooks_attachments WHERE organization_id = $1::uuid)::text AS attachments,
+         (SELECT count(*) FROM quickbooks_financial_reports
+           WHERE organization_id = $1::uuid AND status = 'ready')::text AS reports`,
       [organizationId],
     ),
     query<{
@@ -137,6 +140,7 @@ export async function readQuickBooksIntegrationStateFromPostgres(organizationId:
       vendors: Number(counts.rows[0]?.vendors || 0),
       transactions: Number(counts.rows[0]?.transactions || 0),
       attachments: Number(counts.rows[0]?.attachments || 0),
+      reports: Number(counts.rows[0]?.reports || 0),
     },
     accounts: accounts.rows.map((row) => ({
       id: row.id,
@@ -196,20 +200,34 @@ export async function bindQuickBooksConnectionInPostgres(input: {
     await client.query(
       `INSERT INTO organization_quickbooks_connections (
          organization_id, credential_owner_email, maton_connection_id, company_name, country,
-         status, catalog_sync_enabled, verified_at, created_by, updated_by, created_at, updated_at
-       ) VALUES ($1::uuid, lower($2), $3, $4, $5, 'active', true, now(), lower($6), lower($6), now(), now())
+         company_profile, status, catalog_sync_enabled, verified_at, created_by, updated_by, created_at, updated_at
+       ) VALUES ($1::uuid, lower($2), $3, $4, $5, $6::jsonb, 'active', true, now(), lower($7), lower($7), now(), now())
        ON CONFLICT (organization_id) DO UPDATE SET
          credential_owner_email = EXCLUDED.credential_owner_email,
          maton_connection_id = EXCLUDED.maton_connection_id,
          company_name = EXCLUDED.company_name,
          country = EXCLUDED.country,
+         company_profile = EXCLUDED.company_profile,
          status = 'active',
          catalog_sync_enabled = true,
          verified_at = now(),
          last_error_code = NULL,
          updated_by = EXCLUDED.updated_by,
          updated_at = now()`,
-      [input.organizationId, input.ownerEmail, input.connectionId, input.company.companyName, input.company.country, input.actorEmail],
+      [
+        input.organizationId,
+        input.ownerEmail,
+        input.connectionId,
+        input.company.companyName,
+        input.company.country,
+        JSON.stringify({
+          legalName: input.company.legalName,
+          email: input.company.email,
+          phone: input.company.phone,
+          address: input.company.address,
+        }),
+        input.actorEmail,
+      ],
     )
     await client.query(
       `UPDATE quickbooks_sync_outbox SET
@@ -226,6 +244,7 @@ export async function bindQuickBooksConnectionInPostgres(input: {
     await client.query('DELETE FROM quickbooks_vendors WHERE organization_id = $1::uuid', [input.organizationId])
     await client.query('DELETE FROM quickbooks_transactions WHERE organization_id = $1::uuid', [input.organizationId])
     await client.query('DELETE FROM quickbooks_attachments WHERE organization_id = $1::uuid', [input.organizationId])
+    await client.query('DELETE FROM quickbooks_financial_reports WHERE organization_id = $1::uuid', [input.organizationId])
     await client.query(
       `UPDATE toast_accounting_mappings SET
          quickbooks_account_id = NULL, quickbooks_account_name = NULL,
@@ -410,6 +429,7 @@ export async function completeQuickBooksCatalogSyncInPostgres(input: {
   vendors: QuickBooksVendor[]
   transactions: QuickBooksTransaction[]
   attachments: QuickBooksAttachment[]
+  reports: QuickBooksFinancialReportSnapshot[]
 }) {
   await withTransaction(async (client) => {
     await client.query('DELETE FROM quickbooks_accounts WHERE organization_id = $1::uuid', [input.job.organizationId])
@@ -514,6 +534,63 @@ export async function completeQuickBooksCatalogSyncInPostgres(input: {
         [input.job.organizationId, JSON.stringify(input.attachments.slice(offset, offset + 500))],
       )
     }
+    for (const snapshot of input.reports) {
+      if (snapshot.status === 'ready' && snapshot.report) {
+        await client.query(
+          `INSERT INTO quickbooks_financial_reports (
+             organization_id, report_key, period_key, report_name, report_basis,
+             start_period, end_period, currency_code, generated_at, columns_payload,
+             rows_payload, report_options, status, last_error_code, last_attempted_at, synced_at
+           ) VALUES (
+             $1::uuid, $2, $3, $4, $5, $6::date, $7::date, $8, $9::timestamptz,
+             $10::jsonb, $11::jsonb, $12::jsonb, 'ready', NULL, now(), now()
+           )
+           ON CONFLICT (organization_id, report_key, period_key) DO UPDATE SET
+             report_name = EXCLUDED.report_name,
+             report_basis = EXCLUDED.report_basis,
+             start_period = EXCLUDED.start_period,
+             end_period = EXCLUDED.end_period,
+             currency_code = EXCLUDED.currency_code,
+             generated_at = EXCLUDED.generated_at,
+             columns_payload = EXCLUDED.columns_payload,
+             rows_payload = EXCLUDED.rows_payload,
+             report_options = EXCLUDED.report_options,
+             status = 'ready',
+             last_error_code = NULL,
+             last_attempted_at = now(),
+             synced_at = now()`,
+          [
+            input.job.organizationId,
+            snapshot.reportKey,
+            snapshot.periodKey,
+            snapshot.report.reportName,
+            snapshot.report.reportBasis,
+            snapshot.report.startPeriod,
+            snapshot.report.endPeriod,
+            snapshot.report.currencyCode,
+            snapshot.report.generatedAt,
+            JSON.stringify(snapshot.report.columns),
+            JSON.stringify(snapshot.report.rows),
+            JSON.stringify({ noData: snapshot.report.noData, ...snapshot.report.options }),
+          ],
+        )
+        continue
+      }
+      await client.query(
+        `INSERT INTO quickbooks_financial_reports (
+           organization_id, report_key, period_key, report_name, status,
+           last_error_code, last_attempted_at
+         ) VALUES ($1::uuid, $2, $3, 'QuickBooks report', 'error', $4, now())
+         ON CONFLICT (organization_id, report_key, period_key) DO UPDATE SET
+           status = CASE
+             WHEN quickbooks_financial_reports.synced_at IS NOT NULL THEN quickbooks_financial_reports.status
+             ELSE 'error'
+           END,
+           last_error_code = EXCLUDED.last_error_code,
+           last_attempted_at = now()`,
+        [input.job.organizationId, snapshot.reportKey, snapshot.periodKey, snapshot.errorCode],
+      )
+    }
     await client.query(
       `UPDATE toast_accounting_mappings mapping SET
          quickbooks_account_id = NULL, quickbooks_account_name = NULL, updated_at = now()
@@ -529,10 +606,21 @@ export async function completeQuickBooksCatalogSyncInPostgres(input: {
     )
     await client.query(
       `UPDATE organization_quickbooks_connections SET
-         company_name = $2, country = $3, status = 'active', verified_at = now(),
+         company_name = $2, country = $3, company_profile = $4::jsonb,
+         status = 'active', verified_at = now(),
          last_catalog_synced_at = now(), last_error_code = NULL, updated_at = now()
        WHERE organization_id = $1::uuid`,
-      [input.job.organizationId, input.company.companyName, input.company.country],
+      [
+        input.job.organizationId,
+        input.company.companyName,
+        input.company.country,
+        JSON.stringify({
+          legalName: input.company.legalName,
+          email: input.company.email,
+          phone: input.company.phone,
+          address: input.company.address,
+        }),
+      ],
     )
     const completed = await client.query(
       `UPDATE quickbooks_sync_outbox SET
@@ -546,6 +634,8 @@ export async function completeQuickBooksCatalogSyncInPostgres(input: {
         vendors: input.vendors.length,
         transactions: input.transactions.length,
         attachments: input.attachments.length,
+        reportsReady: input.reports.filter((report) => report.status === 'ready').length,
+        reportsFailed: input.reports.filter((report) => report.status === 'error').length,
       })],
     )
     if (!completed.rowCount) throw new Error('QuickBooks sync lease was lost')
@@ -564,6 +654,8 @@ export async function completeQuickBooksCatalogSyncInPostgres(input: {
         vendors: input.vendors.length,
         transactions: input.transactions.length,
         attachments: input.attachments.length,
+        reportsReady: input.reports.filter((report) => report.status === 'ready').length,
+        reportsFailed: input.reports.filter((report) => report.status === 'error').length,
       },
     }, client)
   })

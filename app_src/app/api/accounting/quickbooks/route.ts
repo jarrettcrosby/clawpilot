@@ -3,10 +3,17 @@ import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import {
   QUICKBOOKS_EXPLORER_RANGES,
   QUICKBOOKS_EXPLORER_VIEWS,
+  QUICKBOOKS_FINANCIAL_REPORT_KEYS,
+  QUICKBOOKS_FINANCIAL_REPORT_PERIODS,
   readQuickBooksExplorerListInPostgres,
   readQuickBooksExplorerOverviewInPostgres,
+  readQuickBooksFinancialReportInPostgres,
+  readQuickBooksInvoiceDetailInPostgres,
+  readQuickBooksTransactionAttachmentsInPostgres,
   type QuickBooksExplorerRange,
   type QuickBooksExplorerView,
+  type QuickBooksFinancialReportKey,
+  type QuickBooksFinancialReportPeriod,
 } from '@/lib/persistence/quickBooksExplorer'
 import { requireRequestUser } from '@/lib/requestUser'
 import { effectiveAuthorizationRole, effectiveUserPermissions, type AppUser } from '@/lib/users'
@@ -66,6 +73,55 @@ export async function GET(req: NextRequest) {
         ok: true,
         capabilities,
         overview: await readQuickBooksExplorerOverviewInPostgres({ organizationId: organization, range }),
+      })
+    }
+    if (viewValue === 'reports') {
+      const reportValue = String(req.nextUrl.searchParams.get('report') || 'profit_loss') as QuickBooksFinancialReportKey
+      const reportKey = QUICKBOOKS_FINANCIAL_REPORT_KEYS.includes(reportValue) ? reportValue : 'profit_loss'
+      const periodValue = String(req.nextUrl.searchParams.get('period') || 'ytd') as QuickBooksFinancialReportPeriod
+      const periodKey = QUICKBOOKS_FINANCIAL_REPORT_PERIODS.includes(periodValue) ? periodValue : 'ytd'
+      return json({
+        ok: true,
+        capabilities,
+        view: 'reports',
+        report: await readQuickBooksFinancialReportInPostgres({
+          organizationId: organization,
+          reportKey,
+          periodKey,
+        }),
+      })
+    }
+    if (viewValue === 'invoice') {
+      const invoiceId = String(req.nextUrl.searchParams.get('id') || '').trim()
+      if (!invoiceId || invoiceId.length > 200 || /[^\x20-\x7e]/.test(invoiceId)) {
+        return json({ ok: false, error: 'Invoice id is invalid', code: 'ACCOUNTING_INVOICE_ID_INVALID' }, 400)
+      }
+      const invoice = await readQuickBooksInvoiceDetailInPostgres({
+        organizationId: organization,
+        invoiceId,
+      })
+      return invoice
+        ? json({ ok: true, capabilities, view: 'invoice', invoice })
+        : json({ ok: false, error: 'Invoice was not found', code: 'ACCOUNTING_INVOICE_NOT_FOUND' }, 404)
+    }
+    if (viewValue === 'transaction-attachments') {
+      const transactionId = String(req.nextUrl.searchParams.get('id') || '').trim()
+      const entityType = String(req.nextUrl.searchParams.get('entityType') || '').trim()
+      if (!transactionId || transactionId.length > 200 || /[^\x20-\x7e]/.test(transactionId)) {
+        return json({ ok: false, error: 'Transaction id is invalid', code: 'ACCOUNTING_TRANSACTION_ID_INVALID' }, 400)
+      }
+      if (!TRANSACTION_ENTITY_TYPES.has(entityType)) {
+        return json({ ok: false, error: 'Transaction type is invalid', code: 'ACCOUNTING_TRANSACTION_TYPE_INVALID' }, 400)
+      }
+      return json({
+        ok: true,
+        capabilities,
+        view: 'transaction-attachments',
+        attachments: await readQuickBooksTransactionAttachmentsInPostgres({
+          organizationId: organization,
+          entityType,
+          transactionId,
+        }),
       })
     }
     const view = viewValue as QuickBooksExplorerView
