@@ -33,8 +33,9 @@ import RefreshRounded from '@mui/icons-material/RefreshRounded'
 import SearchRounded from '@mui/icons-material/SearchRounded'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import { formatUserDateTime } from '@/lib/userDateTime'
+import QuickBooksActionsPanel from './QuickBooksActionsPanel'
 
-type View = 'overview' | 'reports' | 'invoices' | 'receipts' | 'transactions' | 'products' | 'accounts' | 'customers' | 'vendors' | 'attachments'
+type View = 'overview' | 'actions' | 'reports' | 'invoices' | 'receipts' | 'transactions' | 'products' | 'accounts' | 'customers' | 'vendors' | 'attachments'
 type Range = '30d' | '90d' | 'ytd' | '12m' | 'all'
 type ReportKey = 'profit_loss' | 'balance_sheet' | 'cash_flow' | 'ar_aging' | 'ap_aging'
 type ReportPeriod = 'mtd' | 'qtd' | 'ytd' | 'six_months' | 'as_of_today'
@@ -149,7 +150,7 @@ type Overview = {
   recent: ExplorerRow[]
 }
 
-type Capabilities = { canView: boolean; canManage: boolean }
+type Capabilities = { canView: boolean; canManage: boolean; canPrepare: boolean; canApprove: boolean }
 
 type ListResult = {
   page: number
@@ -167,6 +168,7 @@ type Column = {
 
 const VIEWS: Array<{ id: View; label: string }> = [
   { id: 'overview', label: 'Overview' },
+  { id: 'actions', label: 'Actions' },
   { id: 'reports', label: 'Financial reports' },
   { id: 'invoices', label: 'Invoices' },
   { id: 'receipts', label: 'Receipts' },
@@ -726,6 +728,11 @@ export default function AccountingSection() {
   }, [searchInput])
 
   useEffect(() => {
+    if (view === 'actions') {
+      setLoading(false)
+      setError(null)
+      return
+    }
     const controller = new AbortController()
     setLoading(true)
     setError(null)
@@ -954,7 +961,7 @@ export default function AccountingSection() {
             <Box display="flex" alignItems="center" gap={1.25}>
               <AccountBalanceRounded sx={{ color: '#A8C7FA' }} />
               <Typography variant="h5" fontWeight={700}>Accounting</Typography>
-              <Chip size="small" label="Read only" variant="outlined" />
+              <Chip size="small" label="Approval controlled" variant="outlined" />
             </Box>
             <Typography variant="body2" color="text.secondary" mt={0.25} noWrap>
               {connection?.configured ? connection.companyName : 'QuickBooks company not connected'}
@@ -1007,7 +1014,9 @@ export default function AccountingSection() {
             <Alert severity="info">QuickBooks is not connected for this organization. An organization administrator can connect it in Settings.</Alert>
           ) : null}
 
-          {view === 'overview' ? (
+          {view === 'actions' ? (
+            <QuickBooksActionsPanel />
+          ) : view === 'overview' ? (
             loading && !overview ? (
               <Box display="grid" sx={{ placeItems: 'center' }} minHeight={300}><CircularProgress /></Box>
             ) : overview ? (

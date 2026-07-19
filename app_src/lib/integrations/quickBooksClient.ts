@@ -9,6 +9,12 @@ import {
   parseQuickBooksTransactions,
   parseQuickBooksVendors,
 } from '@/lib/integrations/quickBooksCatalog.mjs'
+import {
+  buildQuickBooksProviderPayload,
+  quickBooksProviderEntity,
+  type QuickBooksWriteDraftPayload,
+  type QuickBooksWriteOperationKind,
+} from '@/lib/integrations/quickBooksWritePayloads'
 
 const MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 const MINOR_VERSION = '75'
@@ -105,10 +111,10 @@ async function paceRequest() {
   lastRequestStartedAt = Date.now()
 }
 
-async function requestResponse(pathname: string, ownerEmail: string, connectionId: string) {
+async function requestResponse(pathname: string, ownerEmail: string, connectionId: string, init?: RequestInit) {
   for (let attempt = 0; attempt < MAX_REQUEST_ATTEMPTS; attempt += 1) {
     await paceRequest()
-    const response = await matonFetch(pathname, { method: 'GET' }, {
+    const response = await matonFetch(pathname, init || { method: 'GET' }, {
       ownerEmail,
       app: 'quickbooks',
       boundConnectionId: connectionId,
@@ -121,6 +127,73 @@ async function requestResponse(pathname: string, ownerEmail: string, connectionI
     await sleep(Math.max(exponentialBackoff, retryAfterMs(response.headers.get('retry-after'))))
   }
   throw new Error('QuickBooks request retry budget exhausted')
+}
+
+export class QuickBooksProviderWriteError extends Error {
+  code: string
+
+  constructor(code: string, message: string) {
+    super(message)
+    this.name = 'QuickBooksProviderWriteError'
+    this.code = code
+  }
+}
+
+export async function createQuickBooksEntity(input: {
+  ownerEmail: string
+  connectionId: string
+  operationKind: QuickBooksWriteOperationKind
+  payload: QuickBooksWriteDraftPayload
+  providerRequestId: string
+}) {
+  const entity = quickBooksProviderEntity(input.operationKind)
+  const providerPayload = buildQuickBooksProviderPayload(input.operationKind, input.payload)
+  const body = JSON.stringify(providerPayload)
+  if (Buffer.byteLength(body, 'utf8') > 64 * 1024) {
+    throw new QuickBooksProviderWriteError('QUICKBOOKS_WRITE_PAYLOAD_TOO_LARGE', 'QuickBooks write payload exceeded the supported size')
+  }
+  const search = new URLSearchParams({ requestid: input.providerRequestId, minorversion: MINOR_VERSION })
+  let response: Response
+  try {
+    response = await requestResponse(
+      `/quickbooks/v3/company/:realmId/${entity.path}?${search.toString()}`,
+      input.ownerEmail,
+      input.connectionId,
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body },
+    )
+  } catch {
+    throw new QuickBooksProviderWriteError('QUICKBOOKS_WRITE_GATEWAY_FAILED', 'QuickBooks write gateway request failed')
+  }
+  const raw = await response.text()
+  if (Buffer.byteLength(raw, 'utf8') > MAX_RESPONSE_BYTES) {
+    throw new QuickBooksProviderWriteError('QUICKBOOKS_WRITE_RESPONSE_TOO_LARGE', 'QuickBooks write response exceeded the supported size')
+  }
+  let responsePayload: Record<string, unknown>
+  try {
+    responsePayload = JSON.parse(raw) as Record<string, unknown>
+  } catch {
+    throw new QuickBooksProviderWriteError('QUICKBOOKS_WRITE_RESPONSE_INVALID', 'QuickBooks returned an invalid write response')
+  }
+  if (!response.ok) {
+    const fault = responsePayload.Fault as { Error?: Array<{ code?: string; Message?: string; Detail?: string }> } | undefined
+    const providerError = fault?.Error?.[0]
+    throw new QuickBooksProviderWriteError(
+      providerError?.code ? `QUICKBOOKS_${providerError.code}` : `QUICKBOOKS_HTTP_${response.status}`,
+      providerError?.Message || providerError?.Detail || `QuickBooks write failed with HTTP ${response.status}`,
+    )
+  }
+  const record = responsePayload[entity.responseKey]
+  if (!record || typeof record !== 'object' || Array.isArray(record)) {
+    throw new QuickBooksProviderWriteError('QUICKBOOKS_WRITE_ENTITY_MISSING', 'QuickBooks did not return the created record')
+  }
+  const providerRecord = record as Record<string, unknown>
+  const id = String(providerRecord.Id || '').trim()
+  if (!id) throw new QuickBooksProviderWriteError('QUICKBOOKS_WRITE_ID_MISSING', 'QuickBooks did not return a record identifier')
+  return {
+    entityType: entity.responseKey,
+    entityId: id,
+    syncToken: providerRecord.SyncToken === undefined ? null : String(providerRecord.SyncToken),
+  }
 }
 
 async function request(pathname: string, ownerEmail: string, connectionId: string) {

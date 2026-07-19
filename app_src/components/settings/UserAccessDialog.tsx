@@ -66,6 +66,8 @@ type UserPermissions = {
   manageBackups: boolean
   manageLinks: boolean
   viewAccounting: boolean
+  prepareAccounting: boolean
+  approveAccounting: boolean
   viewOrganizationAudit: boolean
   viewSystemAudit: boolean
 }
@@ -229,6 +231,8 @@ const PERMISSIONS: Array<{ key: PermissionKey; label: string; adminOnly?: boolea
   { key: 'manageBackups', label: 'Manage data checkpoints', adminOnly: true },
   { key: 'manageLinks', label: 'Manage organization short links', adminOnly: true },
   { key: 'viewAccounting', label: 'View accounting data' },
+  { key: 'prepareAccounting', label: 'Prepare accounting drafts' },
+  { key: 'approveAccounting', label: 'Approve accounting changes', adminOnly: true },
   { key: 'viewOrganizationAudit', label: 'View organization activity', adminOnly: true },
   { key: 'viewSystemAudit', label: 'View global system activity', adminOnly: true },
 ]
@@ -1299,8 +1303,8 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
                             onChange={(event) => {
                               const role = event.target.value as EditableRole
                               const permissions = role === 'admin'
-                                ? { ...user.permissions, inviteUsers: true, manageUserAccess: true, viewFullReleaseHistory: true, manageBackups: true, manageLinks: true, viewAccounting: true, viewOrganizationAudit: true, viewSystemAudit: true }
-                                : { ...user.permissions, inviteUsers: false, manageUserAccess: false, viewFullReleaseHistory: false, manageBackups: false, manageLinks: false, viewAccounting: false, viewOrganizationAudit: false, viewSystemAudit: false }
+                                ? { ...user.permissions, inviteUsers: true, manageUserAccess: true, viewFullReleaseHistory: true, manageBackups: true, manageLinks: true, viewAccounting: true, prepareAccounting: true, approveAccounting: true, viewOrganizationAudit: true, viewSystemAudit: true }
+                                : { ...user.permissions, inviteUsers: false, manageUserAccess: false, viewFullReleaseHistory: false, manageBackups: false, manageLinks: false, viewAccounting: false, prepareAccounting: false, approveAccounting: false, viewOrganizationAudit: false, viewSystemAudit: false }
                               void updateAccess(user, role, permissions)
                             }}
                             disabled={busy}

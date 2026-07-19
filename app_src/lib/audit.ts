@@ -21,6 +21,9 @@ const SAFE_DETAIL_KEYS = new Set([
   'syncStatus', 'opportunityId', 'opportunityName', 'organization', 'fromStage', 'toStage',
   'reinvited', 'previousOrganizationId', 'dispatchId', 'agentId', 'trigger', 'sourceKey',
   'recordTitle', 'recordType', 'entity', 'globalId',
+  'operationKind', 'requestStatus', 'providerRequestId', 'providerEntityType',
+  'providerEntityId', 'requestFingerprint', 'approvalNote', 'errorCode', 'attemptCount',
+  'customerName', 'totalAmount', 'name',
   'eligible', 'queued', 'deletedReferenceCodes', 'matchedReferenceCodes', 'suiteCrmDeletesQueued',
   'sessionId', 'deviceLabel', 'authMethod', 'idleExpiresAt', 'absoluteExpiresAt',
   'revokeReason', 'revokedCount', 'authenticatedUser', 'effectiveUser', 'impersonated',
@@ -142,7 +145,7 @@ function eventModule(eventType: string): ActivityLogEvent['module'] {
   if (prefix === 'agent') return 'agents'
   if (prefix === 'document' || prefix === 'documents') return 'docs'
   if (prefix === 'user' || prefix === 'organization' || prefix === 'invitation') return 'users'
-  if (prefix === 'google_workspace' || prefix === 'maton') return 'integrations'
+  if (prefix === 'google_workspace' || prefix === 'maton' || prefix === 'quickbooks' || prefix === 'toast') return 'integrations'
   if (prefix === 'release' || prefix === 'checkpoint') return 'versions'
   return 'system'
 }
@@ -231,6 +234,14 @@ function auditMessage(row: AuditRow): string {
   if (row.event_type === 'auth.code.requested') return 'Sign-in code requested'
   if (row.event_type === 'auth.code.request.denied') return 'Sign-in code request denied'
   if (row.event_type === 'crm.record.staged') return 'CRM record queued for synchronization'
+  if (row.event_type === 'quickbooks.write.drafted') return 'QuickBooks change drafted'
+  if (row.event_type === 'quickbooks.write.submitted') return 'QuickBooks change submitted for approval'
+  if (row.event_type === 'quickbooks.write.approved') return 'QuickBooks change approved'
+  if (row.event_type === 'quickbooks.write.cancelled') return 'QuickBooks change cancelled'
+  if (row.event_type === 'quickbooks.write.retry_approved') return 'QuickBooks change approved for retry'
+  if (row.event_type === 'quickbooks.write.succeeded') return 'QuickBooks change posted'
+  if (row.event_type === 'quickbooks.write.failed') return 'QuickBooks change posting failed'
+  if (row.event_type === 'quickbooks.write.dead') return 'QuickBooks change requires review'
   if (row.event_type === 'organization.parent.updated') return 'Organization hierarchy updated'
   if (row.event_type === 'user.profile.updated') return 'User profile updated'
   if (row.event_type === 'user.access.updated') return 'User access updated'

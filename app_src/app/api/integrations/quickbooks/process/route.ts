@@ -3,6 +3,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import { quickBooksWorkerId, recordQuickBooksWorkerHeartbeatInPostgres } from '@/lib/persistence/quickBooksIntegrations'
 import { processQuickBooksSyncOutbox } from '@/lib/quickBooksSyncWorker'
+import { processQuickBooksWriteOutbox } from '@/lib/quickBooksWriteWorker'
 
 export const runtime = 'nodejs'
 export const maxDuration = 300
@@ -24,7 +25,8 @@ export async function POST(req: NextRequest) {
   const body = await req.json().catch(() => ({})) as { limit?: number }
   const workerId = quickBooksWorkerId()
   await recordQuickBooksWorkerHeartbeatInPostgres({ phase: 'started', workerId })
-  const result = await processQuickBooksSyncOutbox({ limit: body.limit, workerId })
-  const heartbeat = await recordQuickBooksWorkerHeartbeatInPostgres({ phase: 'completed', workerId, ...result })
-  return NextResponse.json({ ok: true, ...result, heartbeatAt: heartbeat.checkedAt })
+  const writes = await processQuickBooksWriteOutbox({ limit: body.limit, workerId })
+  const catalog = await processQuickBooksSyncOutbox({ limit: body.limit, workerId })
+  const heartbeat = await recordQuickBooksWorkerHeartbeatInPostgres({ phase: 'completed', workerId, writes, catalog })
+  return NextResponse.json({ ok: true, writes, catalog, heartbeatAt: heartbeat.checkedAt })
 }

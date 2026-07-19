@@ -30,6 +30,8 @@ export type AppUserPermissions = {
   manageBackups: boolean
   manageLinks: boolean
   viewAccounting: boolean
+  prepareAccounting: boolean
+  approveAccounting: boolean
   viewOrganizationAudit: boolean
   viewSystemAudit: boolean
 }
@@ -43,6 +45,8 @@ export const MEMBER_PERMISSIONS: AppUserPermissions = {
   manageBackups: false,
   manageLinks: false,
   viewAccounting: false,
+  prepareAccounting: false,
+  approveAccounting: false,
   viewOrganizationAudit: false,
   viewSystemAudit: false,
 }
@@ -56,6 +60,8 @@ export const OWNER_PERMISSIONS: AppUserPermissions = {
   manageBackups: true,
   manageLinks: true,
   viewAccounting: true,
+  prepareAccounting: true,
+  approveAccounting: true,
   viewOrganizationAudit: true,
   viewSystemAudit: true,
 }
@@ -157,6 +163,8 @@ function normalizePermissions(value: unknown): AppUserPermissions {
     manageBackups: input.manageBackups === true,
     manageLinks: input.manageLinks === true,
     viewAccounting: input.viewAccounting === true,
+    prepareAccounting: input.prepareAccounting === true,
+    approveAccounting: input.approveAccounting === true,
     viewOrganizationAudit: input.viewOrganizationAudit === true,
     viewSystemAudit: input.viewSystemAudit === true,
   }
@@ -171,6 +179,7 @@ export function permissionsForRole(role: AppUserRole, value: unknown): AppUserPe
     permissions.viewFullReleaseHistory = false
     permissions.manageBackups = false
     permissions.manageLinks = false
+    permissions.approveAccounting = false
     permissions.viewOrganizationAudit = false
     permissions.viewSystemAudit = false
   }

@@ -16,7 +16,7 @@ import {
   type QuickBooksFinancialReportPeriod,
 } from '@/lib/persistence/quickBooksExplorer'
 import { requireRequestUser } from '@/lib/requestUser'
-import { effectiveAuthorizationRole, effectiveUserPermissions, type AppUser } from '@/lib/users'
+import { accountingCapabilities, activeAccountingOrganizationId } from '@/lib/accountingAuthorization'
 
 export const dynamic = 'force-dynamic'
 export const revalidate = 0
@@ -28,21 +28,6 @@ const TRANSACTION_ENTITY_TYPES = new Set([
 
 function json(payload: Record<string, unknown>, status = 200) {
   return NextResponse.json(payload, { status, headers: { 'Cache-Control': 'no-store' } })
-}
-
-function organizationId(actor: AppUser) {
-  const organizationId = String(actor.organizationId || '').trim()
-  if (!organizationId) throw new Error('ACTIVE_ORGANIZATION_REQUIRED')
-  return organizationId
-}
-
-function accountingCapabilities(actor: AppUser) {
-  const role = effectiveAuthorizationRole(actor)
-  const permissions = effectiveUserPermissions(actor)
-  return {
-    canView: role === 'owner' || permissions.viewAccounting,
-    canManage: role === 'owner' || (role === 'admin' && permissions.manageUserAccess),
-  }
 }
 
 function numberParam(value: string | null, fallback: number) {
@@ -64,7 +49,7 @@ export async function GET(req: NextRequest) {
         code: 'ACCOUNTING_VIEW_REQUIRED',
       }, 403)
     }
-    const organization = organizationId(actor)
+    const organization = activeAccountingOrganizationId(actor)
     const rangeValue = String(req.nextUrl.searchParams.get('range') || 'ytd') as QuickBooksExplorerRange
     const range = QUICKBOOKS_EXPLORER_RANGES.includes(rangeValue) ? rangeValue : 'ytd'
     const viewValue = req.nextUrl.searchParams.get('view')
