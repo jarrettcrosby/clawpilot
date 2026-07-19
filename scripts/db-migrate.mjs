@@ -57,7 +57,9 @@ async function main() {
       if (appliedChecksums.has(file)) {
         const storedChecksum = appliedChecksums.get(file)
         if (storedChecksum && storedChecksum !== checksum) {
-          throw new Error(`migration checksum mismatch for ${file}`)
+          throw new Error(
+            `migration checksum mismatch for ${file}: database=${storedChecksum} source=${checksum}`,
+          )
         }
         if (!storedChecksum) {
           await client.query('UPDATE schema_migrations SET checksum = $2 WHERE filename = $1', [file, checksum])
