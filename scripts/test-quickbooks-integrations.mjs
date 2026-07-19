@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict'
+import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
+import vm from 'node:vm'
 import {
   parseQuickBooksAccounts,
   parseQuickBooksAttachments,
@@ -15,6 +17,9 @@ import {
 } from '../app_src/lib/integrations/quickBooksCatalog.mjs'
 
 const root = process.cwd()
+const nodeRequire = createRequire(import.meta.url)
+const requireFromApp = createRequire(new URL('../app_src/package.json', import.meta.url))
+const ts = requireFromApp('typescript')
 
 function read(path) {
   return readFileSync(resolve(root, path), 'utf8')
@@ -22,6 +27,31 @@ function read(path) {
 
 function includes(source, fragment, label) {
   assert.ok(source.includes(fragment), `${label} missing ${fragment}`)
+}
+
+function loadTypeScriptModule(path, mocks = {}) {
+  const output = ts.transpileModule(read(path), {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+      esModuleInterop: true,
+    },
+    fileName: path,
+  }).outputText
+  const module = { exports: {} }
+  const sandbox = {
+    Buffer,
+    console,
+    exports: module.exports,
+    module,
+    process,
+    require(specifier) {
+      if (Object.prototype.hasOwnProperty.call(mocks, specifier)) return mocks[specifier]
+      return nodeRequire(specifier)
+    },
+  }
+  vm.runInNewContext(output, sandbox, { filename: path })
+  return module.exports
 }
 
 assert.deepEqual(
@@ -173,6 +203,22 @@ for (const fragment of [
   'PRIMARY KEY (organization_id, report_key, period_key)',
 ]) includes(reportMigration, fragment, 'QuickBooks financial report migration')
 
+const writeMigration = read('db/migrations/0064_quickbooks_write_control.sql')
+for (const fragment of [
+  "write_mode IN ('sandbox', 'production')",
+  'write_verified_at IS NOT NULL',
+  'write_verified_by IS NOT NULL',
+  'CREATE TABLE IF NOT EXISTS quickbooks_write_requests',
+  "operation_kind IN ('customer.create', 'item.create', 'invoice.create')",
+  "status IN ('draft', 'pending_approval', 'approved', 'processing', 'succeeded', 'failed', 'dead', 'cancelled')",
+  'REFERENCES workspace_organizations(id) ON DELETE CASCADE',
+  'UNIQUE (organization_id, client_request_id)',
+  'UNIQUE (organization_id, provider_request_id)',
+  "request_fingerprint ~ '^[0-9a-f]{64}$'",
+  'attempt_count <= max_attempts',
+  'idx_quickbooks_write_requests_due',
+]) includes(writeMigration, fragment, 'QuickBooks write-control migration')
+
 const client = read('app_src/lib/integrations/quickBooksClient.ts')
 for (const fragment of [
   "app: 'quickbooks'",
@@ -199,9 +245,101 @@ for (const fragment of [
   "Fall through to Maton's dedicated download resource.",
   'validatedAttachmentUrl',
   'readQuickBooksAttachmentDownloadUrl',
+  'createQuickBooksEntity',
+  'requestid: input.providerRequestId',
+  "method: 'POST'",
+  'buildQuickBooksProviderPayload',
+  'QuickBooksProviderWriteError',
 ]) includes(client + read('app_src/lib/maton.ts'), fragment, 'QuickBooks client')
-assert.ok(!client.includes("method: 'POST'"), 'QuickBooks catalog client must remain read-only')
 assert.ok(!client.includes('TRANSACTION_ENTITIES.map'), 'QuickBooks entity reads must remain paced')
+
+const writePayloads = read('app_src/lib/integrations/quickBooksWritePayloads.ts')
+for (const fragment of [
+  'validateQuickBooksWriteDraft',
+  'buildQuickBooksProviderPayload',
+  "'customer.create', 'item.create', 'invoice.create'",
+  "itemType !== 'Service' && itemType !== 'NonInventory'",
+  'Line ${index + 1} requires an active QuickBooks product or service',
+  'Due date cannot be before the invoice date',
+  "crypto.createHash('sha256')",
+  "DetailType: 'SalesItemLineDetail'",
+]) includes(writePayloads, fragment, 'QuickBooks write payload validation')
+
+const writePayloadModule = loadTypeScriptModule('app_src/lib/integrations/quickBooksWritePayloads.ts', {
+  '@/lib/persistence/postgres': {
+    query: async (sql, params = []) => {
+      const source = String(sql)
+      if (source.includes('FROM quickbooks_accounts')) {
+        return { rows: (params[1] || []).map((id) => ({
+          quickbooks_account_id: id,
+          fully_qualified_name: id === 'income-1' ? 'Sales' : 'Cost of goods sold',
+          classification: id === 'income-1' ? 'Revenue' : 'Expense',
+          account_type: id === 'income-1' ? 'Income' : 'Cost of Goods Sold',
+        })) }
+      }
+      if (source.includes('FROM quickbooks_customers')) {
+        return { rows: params[1] === 'customer-1' ? [{ display_name: 'Acme Buyer', email: 'buyer@example.com' }] : [] }
+      }
+      if (source.includes('FROM quickbooks_items')) {
+        return { rows: (params[1] || []).map((id) => ({ quickbooks_item_id: id, name: 'Consulting', item_type: 'Service' })) }
+      }
+      return { rows: [] }
+    },
+  },
+})
+
+const customerDraft = await writePayloadModule.validateQuickBooksWriteDraft({
+  organizationId: '11111111-1111-4111-8111-111111111111',
+  operationKind: 'customer.create',
+  payload: { displayName: ' Acme Buyer ', email: 'buyer@example.com', billingAddress: { city: 'Boston' } },
+})
+assert.equal(customerDraft.payload.displayName, 'Acme Buyer')
+assert.match(customerDraft.requestFingerprint, /^[0-9a-f]{64}$/)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(writePayloadModule.buildQuickBooksProviderPayload('customer.create', customerDraft.payload))),
+  { DisplayName: 'Acme Buyer', PrimaryEmailAddr: { Address: 'buyer@example.com' }, BillAddr: { City: 'Boston' } },
+)
+
+const itemDraft = await writePayloadModule.validateQuickBooksWriteDraft({
+  organizationId: '11111111-1111-4111-8111-111111111111',
+  operationKind: 'item.create',
+  payload: {
+    name: 'Consulting', itemType: 'Service', unitPrice: 125, purchaseCost: 25,
+    incomeAccountId: 'income-1', expenseAccountId: 'expense-1', taxable: false,
+  },
+})
+assert.equal(itemDraft.payload.incomeAccountName, 'Sales')
+assert.equal(writePayloadModule.buildQuickBooksProviderPayload('item.create', itemDraft.payload).Type, 'Service')
+
+const invoiceDraft = await writePayloadModule.validateQuickBooksWriteDraft({
+  organizationId: '11111111-1111-4111-8111-111111111111',
+  operationKind: 'invoice.create',
+  payload: {
+    customerId: 'customer-1', transactionDate: '2026-07-19', dueDate: '2026-08-19',
+    lines: [{ itemId: 'item-1', quantity: 2, unitPrice: 125, description: 'Implementation' }],
+  },
+})
+assert.equal(invoiceDraft.payload.totalAmount, 250)
+const providerInvoice = writePayloadModule.buildQuickBooksProviderPayload('invoice.create', invoiceDraft.payload)
+assert.equal(providerInvoice.CustomerRef.value, 'customer-1')
+assert.equal(providerInvoice.Line[0].SalesItemLineDetail.ItemRef.value, 'item-1')
+assert.equal(providerInvoice.Line[0].Amount, 250)
+await assert.rejects(
+  writePayloadModule.validateQuickBooksWriteDraft({
+    organizationId: '11111111-1111-4111-8111-111111111111',
+    operationKind: 'invoice.create',
+    payload: { customerId: 'customer-1', transactionDate: '2026-07-19', dueDate: '2026-07-18', lines: [{ itemId: 'item-1', quantity: 1, unitPrice: 1 }] },
+  }),
+  /Due date cannot be before/,
+)
+await assert.rejects(
+  writePayloadModule.validateQuickBooksWriteDraft({
+    organizationId: '11111111-1111-4111-8111-111111111111',
+    operationKind: 'invoice.create',
+    payload: { customerId: 'customer-1', transactionDate: '2026-02-31', lines: [{ itemId: 'item-1', quantity: 1, unitPrice: 1 }] },
+  }),
+  /must be a valid date/,
+)
 
 const persistence = read('app_src/lib/persistence/quickBooksIntegrations.ts')
 for (const fragment of [
@@ -221,6 +359,25 @@ for (const fragment of [
   'jsonb_to_recordset',
 ]) includes(persistence, fragment, 'QuickBooks persistence')
 assert.ok(!persistence.includes('console.'), 'QuickBooks persistence must not log credentials or source payloads')
+
+const writePersistence = read('app_src/lib/persistence/quickBooksWrites.ts')
+for (const fragment of [
+  'readQuickBooksWriteWorkspaceInPostgres',
+  'createQuickBooksWriteRequestInPostgres',
+  'transitionQuickBooksWriteRequestInPostgres',
+  'claimQuickBooksWriteJobsInPostgres',
+  'completeQuickBooksWriteJobInPostgres',
+  'failQuickBooksWriteJobInPostgres',
+  'FOR UPDATE OF request SKIP LOCKED',
+  "status = 'processing'",
+  'request.attempt_count < request.max_attempts',
+  'connection.write_verified_at IS NOT NULL',
+  "eventType: 'quickbooks.write.drafted'",
+  "eventType: 'quickbooks.write.succeeded'",
+  'request_fingerprint',
+  "'cp-' || $3::text",
+]) includes(writePersistence, fragment, 'QuickBooks write persistence')
+assert.ok(!writePersistence.includes('console.'), 'QuickBooks write persistence must not log accounting payloads')
 
 const service = read('app_src/lib/integrations/quickBooksIntegrations.ts')
 for (const fragment of [
@@ -255,15 +412,29 @@ for (const fragment of [
   'failQuickBooksSyncJobInPostgres',
 ]) includes(worker, fragment, 'QuickBooks worker')
 
+const writeWorker = read('app_src/lib/quickBooksWriteWorker.ts')
+for (const fragment of [
+  "process.env.QUICKBOOKS_WRITES_ENABLED !== '1'",
+  'QUICKBOOKS_WRITE_MODE',
+  'claimQuickBooksWriteJobsInPostgres',
+  'createQuickBooksEntity',
+  'completeQuickBooksWriteJobInPostgres',
+  'failQuickBooksWriteJobInPostgres',
+  'queueQuickBooksCatalogSyncInPostgres',
+]) includes(writeWorker, fragment, 'QuickBooks write worker')
+
 const processRoute = read('app_src/app/api/integrations/quickbooks/process/route.ts')
 for (const fragment of [
   'PIPELINE_OUTBOX_WORKER_SECRET',
   'crypto.timingSafeEqual',
   'recordQuickBooksWorkerHeartbeatInPostgres',
+  'processQuickBooksWriteOutbox',
+  'writes, catalog',
 ]) includes(processRoute, fragment, 'QuickBooks worker route')
 
 const authProxy = read('app_src/proxy.ts')
 includes(authProxy, '/api/integrations/quickbooks/process', 'QuickBooks worker proxy allowlist')
+includes(authProxy, "'/api/accounting/'", 'QuickBooks impersonation mutation boundary')
 
 const explorerPersistence = read('app_src/lib/persistence/quickBooksExplorer.ts')
 for (const fragment of [
@@ -281,7 +452,8 @@ for (const fragment of [
 
 const explorerRoute = read('app_src/app/api/accounting/quickbooks/route.ts')
 for (const fragment of [
-  'permissions.viewAccounting',
+  'accountingCapabilities',
+  'activeAccountingOrganizationId',
   'ACCOUNTING_VIEW_REQUIRED',
   'readQuickBooksExplorerOverviewInPostgres',
   'readQuickBooksExplorerListInPostgres',
@@ -290,6 +462,116 @@ for (const fragment of [
   "viewValue === 'transaction-attachments'",
   "'Cache-Control': 'no-store'",
 ]) includes(explorerRoute, fragment, 'QuickBooks explorer API')
+
+const actionsRoute = read('app_src/app/api/accounting/quickbooks/actions/route.ts')
+for (const fragment of [
+  'capabilities.canPrepare',
+  'capabilities.canApprove',
+  'validateQuickBooksWriteDraft',
+  'createQuickBooksWriteRequestInPostgres',
+  'transitionQuickBooksWriteRequestInPostgres',
+  'confirmFingerprint',
+  'MAX_REQUEST_BYTES',
+  "'Cache-Control': 'no-store'",
+]) includes(actionsRoute, fragment, 'QuickBooks write API')
+
+let routeCapabilities = { canView: true, canManage: false, canPrepare: true, canApprove: false }
+let transitioned = null
+const actionsRouteModule = loadTypeScriptModule('app_src/app/api/accounting/quickbooks/actions/route.ts', {
+  'next/server': { NextResponse: { json: (body, init = {}) => ({ body, status: init.status || 200, headers: init.headers || {} }) } },
+  '@/lib/accountingAuthorization': {
+    accountingCapabilities: () => routeCapabilities,
+    activeAccountingOrganizationId: () => '11111111-1111-4111-8111-111111111111',
+  },
+  '@/lib/integrations/quickBooksWritePayloads': {
+    QuickBooksWriteValidationError: class extends Error {},
+    validateQuickBooksWriteDraft: async () => ({
+      operationKind: 'customer.create', payload: { displayName: 'Acme Buyer' }, requestFingerprint: 'a'.repeat(64),
+    }),
+  },
+  '@/lib/persistence/config': { isPostgresStorageEnabled: () => true },
+  '@/lib/persistence/quickBooksWrites': {
+    QuickBooksWriteRequestError: class extends Error {},
+    readQuickBooksWriteWorkspaceInPostgres: async () => ({ requests: [] }),
+    createQuickBooksWriteRequestInPostgres: async (input) => ({ id: 'write-1', ...input }),
+    transitionQuickBooksWriteRequestInPostgres: async (input) => { transitioned = input; return { id: input.requestId } },
+  },
+  '@/lib/requestUser': { requireRequestUser: async () => ({ email: 'member@example.com' }) },
+})
+
+function jsonRequest(body) {
+  const raw = JSON.stringify(body)
+  return { headers: new Headers({ 'content-length': String(Buffer.byteLength(raw)), 'content-type': 'application/json' }), text: async () => raw }
+}
+
+const draftResponse = await actionsRouteModule.POST(jsonRequest({
+  clientRequestId: '11111111-1111-4111-8111-111111111111', operationKind: 'customer.create', payload: { displayName: 'Acme Buyer' },
+}))
+assert.equal(draftResponse.status, 201)
+assert.equal(draftResponse.body.ok, true)
+
+const deniedApproval = await actionsRouteModule.PATCH(jsonRequest({
+  requestId: '22222222-2222-4222-8222-222222222222', action: 'approve', confirmFingerprint: 'a'.repeat(64),
+}))
+assert.equal(deniedApproval.status, 403)
+assert.equal(deniedApproval.body.code, 'ACCOUNTING_APPROVAL_REQUIRED')
+
+routeCapabilities = { ...routeCapabilities, canApprove: true }
+const approvedResponse = await actionsRouteModule.PATCH(jsonRequest({
+  requestId: '22222222-2222-4222-8222-222222222222', action: 'approve', confirmFingerprint: 'a'.repeat(64),
+}))
+assert.equal(approvedResponse.status, 200)
+assert.equal(transitioned.action, 'approve')
+assert.equal(transitioned.confirmFingerprint, 'a'.repeat(64))
+
+let writeClaims = 0
+const writeWorkerModule = loadTypeScriptModule('app_src/lib/quickBooksWriteWorker.ts', {
+  '@/lib/integrations/quickBooksClient': { QuickBooksProviderWriteError: class extends Error {}, createQuickBooksEntity: async () => ({}) },
+  '@/lib/persistence/quickBooksWrites': {
+    claimQuickBooksWriteJobsInPostgres: async () => { writeClaims += 1; return [] },
+    completeQuickBooksWriteJobInPostgres: async () => undefined,
+    failQuickBooksWriteJobInPostgres: async () => false,
+  },
+  '@/lib/persistence/quickBooksIntegrations': { queueQuickBooksCatalogSyncInPostgres: async () => undefined },
+})
+const previousWriteEnabled = process.env.QUICKBOOKS_WRITES_ENABLED
+const previousWriteMode = process.env.QUICKBOOKS_WRITE_MODE
+delete process.env.QUICKBOOKS_WRITES_ENABLED
+delete process.env.QUICKBOOKS_WRITE_MODE
+const gatedWrites = await writeWorkerModule.processQuickBooksWriteOutbox({ workerId: 'test-worker' })
+assert.equal(gatedWrites.enabled, false)
+assert.equal(writeClaims, 0)
+
+let failedJobs = 0
+process.env.QUICKBOOKS_WRITES_ENABLED = '1'
+process.env.QUICKBOOKS_WRITE_MODE = 'sandbox'
+const retryWorkerModule = loadTypeScriptModule('app_src/lib/quickBooksWriteWorker.ts', {
+  '@/lib/integrations/quickBooksClient': {
+    QuickBooksProviderWriteError: class extends Error {},
+    createQuickBooksEntity: async () => { throw new Error('temporary provider failure') },
+  },
+  '@/lib/persistence/quickBooksWrites': {
+    claimQuickBooksWriteJobsInPostgres: async () => [{
+      id: 'write-1', organizationId: '11111111-1111-4111-8111-111111111111',
+      ownerEmail: 'owner@example.com', connectionId: 'connection-1',
+      operationKind: 'customer.create', requestPayload: { displayName: 'Acme Buyer' },
+      providerRequestId: 'cp-11111111-1111-4111-8111-111111111111',
+      requestFingerprint: 'a'.repeat(64), attemptCount: 1, maxAttempts: 5,
+      lockToken: '33333333-3333-4333-8333-333333333333', writeMode: 'sandbox',
+    }],
+    completeQuickBooksWriteJobInPostgres: async () => undefined,
+    failQuickBooksWriteJobInPostgres: async () => { failedJobs += 1; return false },
+  },
+  '@/lib/persistence/quickBooksIntegrations': { queueQuickBooksCatalogSyncInPostgres: async () => undefined },
+})
+const retryResult = await retryWorkerModule.processQuickBooksWriteOutbox({ workerId: 'test-worker' })
+assert.equal(retryResult.failed, 1)
+assert.equal(retryResult.dead, 0)
+assert.equal(failedJobs, 1)
+if (previousWriteEnabled === undefined) delete process.env.QUICKBOOKS_WRITES_ENABLED
+else process.env.QUICKBOOKS_WRITES_ENABLED = previousWriteEnabled
+if (previousWriteMode === undefined) delete process.env.QUICKBOOKS_WRITE_MODE
+else process.env.QUICKBOOKS_WRITE_MODE = previousWriteMode
 
 const attachmentRoute = read('app_src/app/api/accounting/quickbooks/attachments/[attachmentId]/route.ts')
 for (const fragment of [
@@ -315,10 +597,25 @@ for (const fragment of [
   'Receipt evidence',
   'authoritative QuickBooks statements',
   '/api/accounting/quickbooks',
+  'QuickBooksActionsPanel',
+  'Approval controlled',
 ]) includes(explorer, fragment, 'QuickBooks explorer UI')
+
+const actionsUi = read('app_src/components/accounting/QuickBooksActionsPanel.tsx')
+for (const fragment of [
+  'Accounting actions',
+  'Provider posting disabled',
+  'Create draft',
+  'Invoice line items',
+  'Request fingerprint',
+  "action === 'approve' ? request.requestFingerprint",
+  '/api/accounting/quickbooks/actions',
+]) includes(actionsUi, fragment, 'QuickBooks actions UI')
 
 includes(read('app_src/components/Navigation.tsx'), "{ id: 'accounting'", 'Accounting navigation')
 includes(read('app_src/lib/users.ts'), 'viewAccounting: boolean', 'Accounting permission')
+includes(read('app_src/lib/users.ts'), 'prepareAccounting: boolean', 'Accounting preparation permission')
+includes(read('app_src/lib/users.ts'), 'approveAccounting: boolean', 'Accounting approval permission')
 
 const panel = read('app_src/components/settings/QuickBooksIntegrationPanel.tsx')
 for (const fragment of [
@@ -327,7 +624,7 @@ for (const fragment of [
   'Product and service catalog',
   'Toast accounting mappings',
   'Import only selected active items',
-  'QuickBooks access is read-only in this release',
+  'Customers, products, and invoices can be prepared in Accounting as immutable review drafts',
   'Disconnect QuickBooks?',
 ]) includes(panel, fragment, 'QuickBooks settings panel')
 
@@ -342,9 +639,10 @@ for (const fragment of [
   "filename = '0061_quickbooks_organization_connector.sql'",
   "filename = '0062_quickbooks_financial_explorer.sql'",
   "filename = '0063_quickbooks_financial_reports.sql'",
+  "filename = '0064_quickbooks_write_control.sql'",
   'readQuickBooksWorkerHeartbeatFromPostgres',
   'QuickBooks sync worker heartbeat is missing or stale.',
   'quickBooks: true',
 ]) includes(health, fragment, 'QuickBooks health contract')
 
-console.log('PASS QuickBooks organization connector, financial statements, invoice documents, receipt previews, Toast mappings, and worker contracts')
+console.log('PASS QuickBooks organization connector, financial statements, controlled writes, invoice documents, receipt previews, Toast mappings, and worker contracts')

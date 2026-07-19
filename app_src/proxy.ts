@@ -72,6 +72,7 @@ function sensitiveMutationDuringImpersonation(req: NextRequest, session: Browser
     '/api/workspaces',
     '/api/settings/',
     '/api/integrations/',
+    '/api/accounting/',
     '/api/agents/auth',
     '/api/railway-backups',
   ].some((prefix) => path === prefix || path.startsWith(prefix))

@@ -448,7 +448,7 @@ export default function QuickBooksIntegrationPanel() {
       </Box>
 
       <Alert severity="info" sx={{ mt: 3, borderRadius: '8px' }}>
-        QuickBooks access is read-only in this release. Invoices, receipts, and Toast journal entries remain review drafts until sandbox posting is validated and approved.
+        Customers, products, and invoices can be prepared in Accounting as immutable review drafts. Provider posting remains disabled until this organization and the server runtime are verified for the same QuickBooks environment.
       </Alert>
 
       <Dialog
