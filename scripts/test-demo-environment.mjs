@@ -26,71 +26,89 @@ const serialized = JSON.stringify(dataset).toLowerCase()
 for (const forbidden of ['episcs', 'suburbia sandwich', 'jarrett', 'olivia', 'gmail.com']) {
   assert.ok(!serialized.includes(forbidden), `synthetic dataset leaked donor token: ${forbidden}`)
 }
-assert.ok(dataset.organizations.every((item) => item.email.endsWith('@example.com')))
-assert.ok(dataset.people.every((item) => item.email.endsWith('@example.com')))
+assert.ok(dataset.organizations.every((item) => item.email.endsWith('@demo.clawpilot.example')))
+assert.ok(dataset.people.every((item) => item.email.endsWith('@demo.clawpilot.example')))
+assert.ok(dataset.vendors.every((item) => item.email.endsWith('@demo.clawpilot.example')))
 assert.ok(dataset.organizations.every((item) => item.phone.includes('-555-')))
 assert.equal(new Set(dataset.organizations.map((item) => item.name)).size, dataset.organizations.length)
 assert.equal(new Set(dataset.products.map((item) => item.providerId)).size, dataset.products.length)
 
-const migration = read('db/migrations/0065_demo_and_quickbooks_crm_reconciliation.sql')
-for (const fragment of [
-  "'legacy_upgrade', 'demo'",
-  'CREATE TABLE IF NOT EXISTS demo_dataset_metadata',
-  'crm_customer_sync_enabled boolean NOT NULL DEFAULT false',
-  'crm_product_sync_enabled boolean NOT NULL DEFAULT false',
-  'CREATE TABLE IF NOT EXISTS quickbooks_crm_links',
-]) assert.ok(migration.includes(fragment), `demo migration missing ${fragment}`)
+const migration = read('db/migrations/0066_demo_workspace_account.sql')
+assert.ok(migration.includes('ADD COLUMN IF NOT EXISTS is_demo boolean'))
+assert.ok(migration.includes('idx_workspace_organizations_one_demo'))
+assert.ok(migration.includes("'{\"accessDemo\":true}'::jsonb"))
 
 const demoMode = read('app_src/lib/demoMode.ts')
-assert.ok(demoMode.includes("CLAWPILOT_DEMO_MODE === '1'"))
-assert.ok(demoMode.includes("RAILWAY_ENVIRONMENT_NAME || '').toLowerCase() === 'demo'"))
-assert.ok(demoMode.includes('https://demo.aiapp.eigenracing.com/login?demo=1'))
-assert.ok(demoMode.includes('CLAWPILOT_DEMO_URL'))
-assert.ok(demoMode.includes("'/api/integrations/'"))
-assert.ok(demoMode.includes("'/api/agents/'"))
+assert.ok(demoMode.includes("DEMO_WORKSPACE_ID = '10000000-0000-4000-8000-000000000001'"))
+assert.ok(demoMode.includes('demoMutationIsRestricted'))
+assert.ok(demoMode.includes("'/api/auth/logout'"))
+assert.ok(!demoMode.includes('CLAWPILOT_DEMO_MODE'))
+assert.ok(!demoMode.includes('demo.aiapp.eigenracing.com'))
 
 const crmPersistence = read('app_src/lib/persistence/crm.ts')
-assert.ok(crmPersistence.includes("input.emitSuiteCrmOutbox !== false && !isDemoMode()"))
-
-const demoRoute = read('app_src/app/api/auth/demo/route.ts')
-assert.ok(demoRoute.includes("authMethod: 'demo'"))
-assert.ok(demoRoute.includes('assertDemoEnvironment()'))
-assert.ok(!demoRoute.includes('entryUrl: demoEntryUrl()'), 'public demo status cannot advertise the entry URL')
+assert.ok(crmPersistence.includes('input.emitSuiteCrmOutbox !== false'))
+assert.ok(!crmPersistence.includes('isDemoMode'))
 
 const loginPage = read('app_src/app/login/page.tsx')
-assert.ok(!loginPage.includes('Explore demo'), 'normal login cannot advertise demo access')
-assert.ok(loginPage.includes("get('demo') === '1'"))
-assert.ok(loginPage.includes('createDemoSession()'))
+assert.ok(!loginPage.includes('/api/auth/demo'))
+assert.ok(!loginPage.includes("get('demo')"))
+assert.ok(!loginPage.includes('Explore demo'))
 
 const demoEntryRoute = read('app_src/app/api/workspaces/demo-entry/route.ts')
-assert.ok(demoEntryRoute.includes('await requireRequestUser(req)'))
-assert.ok(demoEntryRoute.includes("new URL('/api/health', entryUrl)"))
-assert.ok(demoEntryRoute.includes('The demo workspace is temporarily unavailable.'))
+assert.ok(demoEntryRoute.includes('ensureDemoWorkspaceMembership(actor)'))
+assert.ok(demoEntryRoute.includes('switchBrowserSessionWorkspace'))
+assert.ok(demoEntryRoute.includes('export async function POST'))
+assert.ok(!demoEntryRoute.includes('entryUrl'))
 
 const workspaceSwitcher = read('app_src/components/workspaces/ActiveWorkspaceSwitcher.tsx')
-assert.ok(workspaceSwitcher.includes('Open demo workspace'))
-assert.ok(workspaceSwitcher.includes("fetch('/api/workspaces/demo-entry'"))
-assert.ok(workspaceSwitcher.includes('Synthetic data, isolated from your businesses'))
+assert.ok(workspaceSwitcher.includes('Open demo account'))
+assert.ok(workspaceSwitcher.includes('payload?.canAccessDemo'))
+assert.ok(workspaceSwitcher.includes("fetch('/api/workspaces/demo-entry', { method: 'POST' })"))
+assert.ok(workspaceSwitcher.includes('Synthetic, read-only customer example'))
+
+const accessDialog = read('app_src/components/settings/UserAccessDialog.tsx')
+assert.ok(accessDialog.includes("{ key: 'accessDemo', label: 'Open demo account' }"))
+assert.ok(accessDialog.includes('const [inviteDemoAccess, setInviteDemoAccess] = useState(false)'))
+assert.ok(accessDialog.includes('demoAccess: inviteDemoAccess'))
+assert.ok(accessDialog.includes('Off by default.'))
+
+const users = read('app_src/lib/users.ts')
+assert.ok(users.includes('{ ...OWNER_PERMISSIONS, accessDemo: target.permissions.accessDemo }'))
+assert.ok(users.includes('{ ...MEMBER_PERMISSIONS, accessDemo: target.permissions.accessDemo }'))
 
 const seed = read('scripts/seed-demo-environment.mjs')
-assert.ok(seed.includes("CLAWPILOT_DEMO_MODE !== '1'"))
-assert.ok(seed.includes("environment !== 'demo'"))
-assert.ok(seed.includes('demo_dataset_metadata'))
+assert.ok(seed.includes("'ClawPilot Demo Company'"))
+assert.ok(seed.includes('is_demo'))
+assert.ok(seed.includes('demo-system@clawpilot.example'))
+assert.ok(seed.includes("dataset_key IN ('workspace-demo', 'public-demo')"))
+assert.ok(seed.includes('DELETE FROM pipeline_spaces WHERE workspace_organization_id'))
 assert.ok(seed.includes('quickbooks_crm_links'))
-assert.ok(seed.includes('TRUNCATE TABLE app_users, workspace_organizations'))
+assert.ok(!seed.includes('TRUNCATE TABLE'))
+assert.ok(!seed.includes('CLAWPILOT_DEMO_MODE'))
+
+const verifier = read('scripts/verify-demo-environment.mjs')
+assert.ok(verifier.includes('unsafe_emails'))
+assert.ok(verifier.includes('live_identity_overlaps'))
+assert.ok(verifier.includes("dataset_key = 'workspace-demo'"))
 
 const predeploy = read('scripts/predeploy-railway.sh')
 assert.ok(predeploy.includes('npm run demo:seed'))
 assert.ok(predeploy.includes('npm run demo:verify'))
 assert.ok(predeploy.includes('npm run mail:verify'))
+assert.ok(!predeploy.includes('CLAWPILOT_DEMO_MODE'))
 
 const railwayStart = read('scripts/start-railway.sh')
-assert.ok(railwayStart.includes('DEMO_REFRESH_INTERVAL_SECONDS:-86400'))
-assert.ok(railwayStart.includes('CLAWPILOT_DEMO_MODE=1 is only valid in the demo environment'))
+assert.ok(!railwayStart.includes('DEMO_REFRESH_INTERVAL_SECONDS'))
+assert.ok(!railwayStart.includes('CLAWPILOT_DEMO_MODE'))
 
 const health = read('app_src/app/api/health/route.ts')
 assert.ok(health.includes("filename = '0065_demo_and_quickbooks_crm_reconciliation.sql'"))
-assert.ok(health.includes('!demoEnvironment && String(process.env.MATON_API_KEY'))
+assert.ok(health.includes("filename = '0066_demo_workspace_account.sql'"))
+assert.ok(!health.includes('demoEnvironment'))
+
+const proxy = read('app_src/proxy.ts')
+assert.ok(proxy.includes('session.activeWorkspaceOrganizationId'))
+assert.ok(proxy.includes('This demo account is read-only.'))
 
 const reconciliation = read('app_src/lib/persistence/quickBooksCrmSync.ts')
 for (const fragment of [
@@ -102,4 +120,4 @@ for (const fragment of [
   'syncPipelineProductDropdownCatalogInPostgres',
 ]) assert.ok(reconciliation.includes(fragment), `QuickBooks CRM reconciliation missing ${fragment}`)
 
-console.log('demo environment contract tests passed')
+console.log('demo account contract tests passed')

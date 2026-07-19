@@ -22,6 +22,7 @@ import BusinessRounded from '@mui/icons-material/BusinessRounded'
 import CheckRounded from '@mui/icons-material/CheckRounded'
 import ExpandMoreRounded from '@mui/icons-material/ExpandMoreRounded'
 import ScienceRounded from '@mui/icons-material/ScienceRounded'
+import { DEMO_WORKSPACE_ID } from '@/lib/demoMode'
 import {
   announceWorkspaceChange,
   prefetchWorkspaceBootstrap,
@@ -34,6 +35,7 @@ type Workspace = {
   organizationReferenceCode: string
   organizationName: string
   organizationType: 'root' | 'member'
+  isDemo: boolean
   role: 'owner' | 'admin' | 'member'
   isDefault: boolean
 }
@@ -42,6 +44,7 @@ type WorkspaceResponse = {
   ok: boolean
   activeOrganizationId: string | null
   canCreateRoot: boolean
+  canAccessDemo: boolean
   workspaces: Workspace[]
 }
 
@@ -61,7 +64,7 @@ type WorkspaceMutationResponse = {
 type DemoEntryResponse = {
   ok?: boolean
   error?: string
-  entryUrl?: string
+  activeWorkspace?: ActiveWorkspace
 }
 
 export default function ActiveWorkspaceSwitcher() {
@@ -106,6 +109,7 @@ export default function ActiveWorkspaceSwitcher() {
         organizationReferenceCode: activeWorkspace.referenceCode,
         organizationName: activeWorkspace.name,
         organizationType: existing?.organizationType || organizationType,
+        isDemo: existing?.isDemo || activeWorkspace.organizationId === DEMO_WORKSPACE_ID,
         role: activeWorkspace.role,
         isDefault: existing?.isDefault || false,
       }
@@ -195,22 +199,23 @@ export default function ActiveWorkspaceSwitcher() {
     setDemoOpening(true)
     setError('')
     try {
-      const response = await fetch('/api/workspaces/demo-entry', { cache: 'no-store' })
+      const response = await fetch('/api/workspaces/demo-entry', { method: 'POST' })
       const result = await response.json() as DemoEntryResponse
-      if (!response.ok || !result.ok || !result.entryUrl) {
-        throw new Error(result.error || 'The demo workspace is temporarily unavailable.')
+      if (!response.ok || !result.ok || !result.activeWorkspace) {
+        throw new Error(result.error || 'The demo account is temporarily unavailable.')
       }
-      window.location.href = result.entryUrl
+      finishWorkspaceChange(result.activeWorkspace, 'root')
+      setDemoOpening(false)
     } catch (caught) {
       setAnchor(null)
       setDemoOpening(false)
-      setError(caught instanceof Error ? caught.message : 'The demo workspace is temporarily unavailable.')
+      setError(caught instanceof Error ? caught.message : 'The demo account is temporarily unavailable.')
     }
   }
 
   return (
     <>
-      <Tooltip title="Switch business or open demo">
+      <Tooltip title={payload?.canAccessDemo ? 'Switch business or open demo account' : 'Switch business'}>
         <Button
           data-testid="active-workspace-switcher"
           aria-label={`Active business: ${current.organizationName}`}
@@ -264,7 +269,7 @@ export default function ActiveWorkspaceSwitcher() {
           },
         }}
       >
-        {payload?.workspaces.map((workspace) => {
+        {payload?.workspaces.filter((workspace) => !workspace.isDemo).map((workspace) => {
           const selected = workspace.organizationId === current.organizationId
           return (
             <MenuItem
@@ -307,23 +312,25 @@ export default function ActiveWorkspaceSwitcher() {
             <ListItemText primary="Add business" primaryTypographyProps={{ variant: 'body2' }} />
           </MenuItem>
         )}
-        <MenuItem
-          disabled={Boolean(switching) || demoOpening}
-          onClick={() => { void openDemoWorkspace() }}
-          sx={{ py: 1.1 }}
-        >
-          <ListItemIcon sx={{ minWidth: 34 }}>
-            {demoOpening
-              ? <CircularProgress size={17} />
-              : <ScienceRounded sx={{ fontSize: 19, color: '#A8C7FA' }} />}
-          </ListItemIcon>
-          <ListItemText
-            primary="Open demo workspace"
-            secondary="Synthetic data, isolated from your businesses"
-            primaryTypographyProps={{ variant: 'body2' }}
-            secondaryTypographyProps={{ variant: 'caption' }}
-          />
-        </MenuItem>
+        {payload?.canAccessDemo && !current.isDemo ? (
+          <MenuItem
+            disabled={Boolean(switching) || demoOpening}
+            onClick={() => { void openDemoWorkspace() }}
+            sx={{ py: 1.1 }}
+          >
+            <ListItemIcon sx={{ minWidth: 34 }}>
+              {demoOpening
+                ? <CircularProgress size={17} />
+                : <ScienceRounded sx={{ fontSize: 19, color: '#A8C7FA' }} />}
+            </ListItemIcon>
+            <ListItemText
+              primary="Open demo account"
+              secondary="Synthetic, read-only customer example"
+              primaryTypographyProps={{ variant: 'body2' }}
+              secondaryTypographyProps={{ variant: 'caption' }}
+            />
+          </MenuItem>
+        ) : null}
       </Menu>
 
       <Dialog

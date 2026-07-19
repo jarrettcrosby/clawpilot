@@ -14,7 +14,7 @@ app_visible: true
 ## Runtime And Promotion
 
 - [ClawPilot Environments and Deployment](../operations/clawpilot-environments.md) is the source for local, development, and production topology and promotion gates.
-- [Public Demo Environment](../operations/public-demo-environment.md) defines the isolated synthetic dataset, rolling date windows, reset controls, and provider restrictions.
+- [Demo Account](../operations/public-demo-environment.md) defines the permissioned synthetic workspace, rolling date windows, read-only controls, and provider restrictions.
 - [Release Documentation Contract](../releases/README.md) defines release copy and durable Versions records.
 - Development runs from `dev`; production promotion is a reviewed `dev` to `main` pull request.
 

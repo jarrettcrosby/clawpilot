@@ -1,6 +1,7 @@
 import { query, withTransaction } from '@/lib/persistence/postgres'
 import { recordAuditEvent } from '@/lib/auditWriter'
 import { findSuiteCrmUser } from '@/lib/crm/suiteCrmClient'
+import { DEMO_WORKSPACE_ID } from '@/lib/demoMode'
 
 const EMAIL_PATTERN = /^[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+$/i
 
@@ -22,6 +23,7 @@ export class AppUserNotFoundError extends Error {
 }
 
 export type AppUserPermissions = {
+  accessDemo: boolean
   inviteUsers: boolean
   manageUserAccess: boolean
   createBoards: boolean
@@ -37,6 +39,7 @@ export type AppUserPermissions = {
 }
 
 export const MEMBER_PERMISSIONS: AppUserPermissions = {
+  accessDemo: false,
   inviteUsers: false,
   manageUserAccess: false,
   createBoards: true,
@@ -52,6 +55,7 @@ export const MEMBER_PERMISSIONS: AppUserPermissions = {
 }
 
 export const OWNER_PERMISSIONS: AppUserPermissions = {
+  accessDemo: true,
   inviteUsers: true,
   manageUserAccess: true,
   createBoards: true,
@@ -155,6 +159,7 @@ export function isRootAppOwner(user: Pick<AppUser, 'email' | 'role'>): boolean {
 function normalizePermissions(value: unknown): AppUserPermissions {
   const input = value && typeof value === 'object' ? value as Record<string, unknown> : {}
   return {
+    accessDemo: input.accessDemo === true,
     inviteUsers: input.inviteUsers === true,
     manageUserAccess: input.manageUserAccess === true,
     createBoards: input.createBoards !== false,
@@ -208,6 +213,26 @@ export function canInviteUsers(user: AuthorizationUser): boolean {
 export function canManageUserAccess(user: AuthorizationUser): boolean {
   const role = effectiveAuthorizationRole(user)
   return (role === 'owner' || role === 'admin') && effectiveUserPermissions(user).manageUserAccess
+}
+
+export async function appUserHasDemoAccess(emailValue: unknown): Promise<boolean> {
+  const email = normalizeUserEmail(emailValue)
+  const result = await query<{ allowed: boolean }>(
+    `SELECT EXISTS (
+       SELECT 1
+       FROM app_user_organization_memberships membership
+       JOIN workspace_organizations organization ON organization.id = membership.organization_id
+       WHERE membership.user_email = $1
+         AND membership.status = 'active'
+         AND organization.is_demo = false
+         AND (
+           membership.role = 'owner'
+           OR COALESCE((membership.permissions ->> 'accessDemo')::boolean, false)
+         )
+     ) AS allowed`,
+    [email],
+  )
+  return result.rows[0]?.allowed === true
 }
 
 async function requireOrganizationInActorScope(actor: AppUser, organizationId: string | null) {
@@ -409,11 +434,16 @@ export async function inviteAppUser(input: {
   email: unknown
   organizationId: unknown
   crmUserEnabled?: unknown
+  demoAccess?: unknown
 }): Promise<InviteAppUserResult> {
   const actor = await resolveAppUserActor(input.actorEmail)
   if (!canInviteUsers(actor)) throw new AppUserAuthorizationError('You do not have permission to invite users')
   const email = normalizeUserEmail(input.email)
   const crmUserEnabled = input.crmUserEnabled === true
+  const invitedPermissions = {
+    ...MEMBER_PERMISSIONS,
+    accessDemo: input.demoAccess === true,
+  }
   const organizationId = String(input.organizationId || '').trim()
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(organizationId)) {
     throw new Error('A valid invitation organization is required')
@@ -511,7 +541,7 @@ export async function inviteAppUser(input: {
           updated_at = now()
         RETURNING *
       `,
-      [email, actor.email, JSON.stringify(MEMBER_PERMISSIONS), organizationId, organization.rows[0].name, invitedCrmUserEnabled],
+      [email, actor.email, JSON.stringify(invitedPermissions), organizationId, organization.rows[0].name, invitedCrmUserEnabled],
     )
     const membership = await client.query<{
       role: AppUserRole
@@ -531,11 +561,13 @@ export async function inviteAppUser(input: {
          $4, $4, now(), now()
        )
        ON CONFLICT (user_email, organization_id) DO UPDATE SET
+         role = 'member',
+         permissions = EXCLUDED.permissions,
          status = 'invited',
          updated_by = EXCLUDED.updated_by,
          updated_at = now()
        RETURNING role, permissions, status, is_default`,
-      [email, organizationId, JSON.stringify(MEMBER_PERMISSIONS), actor.email],
+      [email, organizationId, JSON.stringify(invitedPermissions), actor.email],
     )
     const invitedMembership = membership.rows[0]
     const invitedUser = {
@@ -653,6 +685,36 @@ export async function setAppUserStatus(input: {
       [email, organizationId, input.status, actor.email],
     )
     if (!result.rows[0]) throw new AppUserNotFoundError()
+    if (input.status === 'disabled') {
+      const remaining = await client.query<{ allowed: boolean }>(
+        `SELECT EXISTS (
+           SELECT 1
+           FROM app_user_organization_memberships membership
+           JOIN workspace_organizations organization ON organization.id = membership.organization_id
+           WHERE membership.user_email = $1
+             AND membership.status = 'active'
+             AND organization.is_demo = false
+             AND (
+               membership.role = 'owner'
+               OR COALESCE((membership.permissions ->> 'accessDemo')::boolean, false)
+             )
+         ) AS allowed`,
+        [email],
+      )
+      if (!remaining.rows[0]?.allowed) {
+        await client.query(
+          `DELETE FROM app_sessions
+           WHERE effective_user_email = $1
+             AND active_workspace_organization_id = $2::uuid`,
+          [email, DEMO_WORKSPACE_ID],
+        )
+        await client.query(
+          `DELETE FROM app_user_organization_memberships
+           WHERE user_email = $1 AND organization_id = $2::uuid`,
+          [email, DEMO_WORKSPACE_ID],
+        )
+      }
+    }
     await client.query(
       `UPDATE app_users app_user
        SET status = CASE
@@ -1040,7 +1102,9 @@ export async function updateAppUserAccess(input: {
 
   const role = input.role || target.role
   const base = input.role && input.role !== target.role
-    ? role === 'admin' ? { ...OWNER_PERMISSIONS } : { ...MEMBER_PERMISSIONS }
+    ? role === 'admin'
+      ? { ...OWNER_PERMISSIONS, accessDemo: target.permissions.accessDemo }
+      : { ...MEMBER_PERMISSIONS, accessDemo: target.permissions.accessDemo }
     : target.permissions
   const requested = input.permissions && typeof input.permissions === 'object' ? input.permissions : {}
   const permissions = permissionsForRole(role, { ...base, ...requested })
@@ -1058,6 +1122,36 @@ export async function updateAppUserAccess(input: {
       [email, role, JSON.stringify(permissions), organizationId, actor.email],
     )
     if (!result.rows[0]) throw new AppUserNotFoundError()
+    if (!permissions.accessDemo) {
+      const remaining = await client.query<{ allowed: boolean }>(
+        `SELECT EXISTS (
+           SELECT 1
+           FROM app_user_organization_memberships membership
+           JOIN workspace_organizations organization ON organization.id = membership.organization_id
+           WHERE membership.user_email = $1
+             AND membership.status = 'active'
+             AND organization.is_demo = false
+             AND (
+               membership.role = 'owner'
+               OR COALESCE((membership.permissions ->> 'accessDemo')::boolean, false)
+             )
+         ) AS allowed`,
+        [email],
+      )
+      if (!remaining.rows[0]?.allowed) {
+        await client.query(
+          `DELETE FROM app_sessions
+           WHERE effective_user_email = $1
+             AND active_workspace_organization_id = $2::uuid`,
+          [email, DEMO_WORKSPACE_ID],
+        )
+        await client.query(
+          `DELETE FROM app_user_organization_memberships
+           WHERE user_email = $1 AND organization_id = $2::uuid`,
+          [email, DEMO_WORKSPACE_ID],
+        )
+      }
+    }
     await recordAuditEvent({
       actor: actor.email,
       eventType: 'user.access.updated',

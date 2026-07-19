@@ -1,31 +1,58 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { demoEntryUrl } from '@/lib/demoMode'
-import { requireRequestUser } from '@/lib/requestUser'
+import { setBrowserSessionCookie, switchBrowserSessionWorkspace } from '@/lib/authSessions'
+import { DEMO_WORKSPACE_ID } from '@/lib/demoMode'
+import { requireRequestSession, requireRequestUser } from '@/lib/requestUser'
+import { BOARD_SELECTION_COOKIE, PIPELINE_SELECTION_COOKIE } from '@/lib/tenancy'
+import { AppUserAuthorizationError } from '@/lib/users'
+import { ensureDemoWorkspaceMembership } from '@/lib/workspaceMemberships'
 
 export const dynamic = 'force-dynamic'
 export const revalidate = 0
 export const runtime = 'nodejs'
 
-const DEMO_HEALTH_TIMEOUT_MS = 3_000
-
 function json(payload: Record<string, unknown>, status = 200) {
   return NextResponse.json(payload, { status, headers: { 'Cache-Control': 'private, no-store, max-age=0' } })
 }
 
-export async function GET(req: NextRequest) {
+function clearWorkspaceSelectionCookies(response: NextResponse) {
+  const options = {
+    httpOnly: true,
+    sameSite: 'lax' as const,
+    secure: process.env.NODE_ENV === 'production',
+    path: '/',
+    maxAge: 0,
+  }
+  response.cookies.set(BOARD_SELECTION_COOKIE, '', options)
+  response.cookies.set(PIPELINE_SELECTION_COOKIE, '', options)
+}
+
+export async function POST(req: NextRequest) {
   try {
-    await requireRequestUser(req)
-    const entryUrl = demoEntryUrl()
-    const healthUrl = new URL('/api/health', entryUrl).toString()
-    const response = await fetch(healthUrl, {
-      cache: 'no-store',
-      signal: AbortSignal.timeout(DEMO_HEALTH_TIMEOUT_MS),
+    const [session, actor] = await Promise.all([
+      requireRequestSession(req),
+      requireRequestUser(req),
+    ])
+    await ensureDemoWorkspaceMembership(actor)
+    const issued = await switchBrowserSessionWorkspace({
+      session,
+      organizationId: DEMO_WORKSPACE_ID,
     })
-    if (!response.ok) throw new Error('Demo health check failed')
-    return json({ ok: true, entryUrl })
+    const response = json({
+      ok: true,
+      activeWorkspace: {
+        organizationId: issued.session.activeWorkspaceOrganizationId,
+        referenceCode: issued.session.activeWorkspaceReferenceCode,
+        name: issued.session.activeWorkspaceName,
+        role: issued.session.activeWorkspaceRole,
+      },
+    })
+    setBrowserSessionCookie(response, issued)
+    clearWorkspaceSelectionCookies(response)
+    return response
   } catch (error) {
     const message = error instanceof Error ? error.message : ''
     if (message === 'Unauthorized') return json({ ok: false, error: 'Unauthorized' }, 401)
-    return json({ ok: false, error: 'The demo workspace is temporarily unavailable.' }, 503)
+    if (error instanceof AppUserAuthorizationError) return json({ ok: false, error: message }, 403)
+    return json({ ok: false, error: 'The demo account is temporarily unavailable.' }, 503)
   }
 }

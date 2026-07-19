@@ -239,6 +239,7 @@ export async function createUserInvitation(input: {
   organizationName?: unknown
   parentOrganizationId?: unknown
   crmUserEnabled?: unknown
+  demoAccess?: unknown
 }): Promise<{ user: AppUser; delivery: 'sent'; expiresAt: string }> {
   const actor = await resolveAppUserActor(input.actorEmail)
   const email = normalizeUserEmail(input.email)
@@ -260,6 +261,7 @@ export async function createUserInvitation(input: {
       email,
       organizationId: assignment.organization.id,
       crmUserEnabled: input.crmUserEnabled,
+      demoAccess: input.demoAccess,
     })
     user = invited.user
     userCreated = invited.created

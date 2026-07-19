@@ -52,7 +52,7 @@ Current product behavior is defined by active module and operating contracts. Op
 ### Operations
 
 - [ClawPilot environments and deployment](operations/clawpilot-environments.md)
-- [Public demo environment](operations/public-demo-environment.md)
+- [Demo account](operations/public-demo-environment.md)
 - [Agent security and integration isolation](operations/agent-security-and-isolation.md)
 - [Knowledge vault organization](operations/knowledge-vault-organization.md)
 - [ChatGPT agent authorization](operations/chatgpt-agent-auth.md)

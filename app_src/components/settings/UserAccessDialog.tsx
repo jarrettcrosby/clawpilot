@@ -58,6 +58,7 @@ type ResourceKind = 'board' | 'pipeline'
 type PipelineProvisioningStatus = 'not_requested' | 'queued' | 'provisioning' | 'ready' | 'failed'
 
 type UserPermissions = {
+  accessDemo: boolean
   inviteUsers: boolean
   manageUserAccess: boolean
   createBoards: boolean
@@ -223,6 +224,7 @@ const LOCALES = [
 ]
 
 const PERMISSIONS: Array<{ key: PermissionKey; label: string; adminOnly?: boolean }> = [
+  { key: 'accessDemo', label: 'Open demo account' },
   { key: 'inviteUsers', label: 'Invite users', adminOnly: true },
   { key: 'manageUserAccess', label: 'Manage access', adminOnly: true },
   { key: 'createBoards', label: 'Create boards' },
@@ -333,6 +335,7 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
   const [profile, setProfile] = useState<ProfileForm>(EMPTY_PROFILE)
   const [inviteEmail, setInviteEmail] = useState('')
   const [inviteCrmEmployee, setInviteCrmEmployee] = useState(false)
+  const [inviteDemoAccess, setInviteDemoAccess] = useState(false)
   const [inviteOrganizationId, setInviteOrganizationId] = useState('')
   const [newOrganizationName, setNewOrganizationName] = useState('')
   const [newOrganizationParentId, setNewOrganizationParentId] = useState('')
@@ -390,6 +393,7 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
     setProfile(EMPTY_PROFILE)
     setInviteEmail('')
     setInviteCrmEmployee(false)
+    setInviteDemoAccess(false)
     setInviteOrganizationId('')
     setNewOrganizationName('')
     setNewOrganizationParentId('')
@@ -551,6 +555,7 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
           organizationName: creatingOrganization ? newOrganizationName.trim() : undefined,
           parentOrganizationId: creatingOrganization ? newOrganizationParentId : undefined,
           crmUserEnabled: inviteCrmEmployee,
+          demoAccess: inviteDemoAccess,
         }),
       })
       if (result.user) upsertUser(result.user)
@@ -558,6 +563,7 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
       setUsersPayload(refreshed)
       setInviteEmail('')
       setInviteCrmEmployee(false)
+      setInviteDemoAccess(false)
       setInviteOrganizationId(refreshed.currentUser?.organizationId || '')
       setNewOrganizationName('')
       setNewOrganizationParentId(refreshed.currentUser?.organizationId || '')
@@ -1160,6 +1166,22 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
                     />
                     <Typography variant="caption" color="text.disabled" display="block">
                       Creates a permanent gu identity. Link the employee to an existing SuiteCRM user after invitation if needed.
+                    </Typography>
+                    <FormControlLabel
+                      control={(
+                        <Switch
+                          size="small"
+                          checked={inviteDemoAccess}
+                          onChange={(event) => setInviteDemoAccess(event.target.checked)}
+                          disabled={busy}
+                          inputProps={{ 'aria-label': 'Allow invited user to open the demo account' }}
+                        />
+                      )}
+                      label="Demo account access"
+                      sx={{ mt: 1 }}
+                    />
+                    <Typography variant="caption" color="text.disabled" display="block">
+                      Off by default. When enabled, the user can open the shared synthetic, read-only account after signing in.
                     </Typography>
                   </Box>
                 </Box>
