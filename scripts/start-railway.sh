@@ -3,6 +3,8 @@ set -euo pipefail
 
 APP_PID=""
 WORKER_PID=""
+DEMO_REFRESH_PID=""
+DEMO_MODE="${CLAWPILOT_DEMO_MODE:-0}"
 
 fail() {
   echo "[railway-start] $1" >&2
@@ -30,13 +32,17 @@ require_value APP_LOGIN_EMAIL 5
 require_value APP_SESSION_SECRET 32
 require_value AGENT_CREDENTIAL_ENCRYPTION_KEY 32
 require_value AGENT_CREDENTIAL_DATABASE_URL 16
-require_value MATON_API_KEY 16
-require_value MATON_GMAIL_CONNECTION_ID 8
-require_value CLAWPILOT_MAIL_FROM 5
 require_value CLAWPILOT_PUBLIC_URL 16
-require_value PIPELINE_SHEET_ID 20
 require_value PIPELINE_OUTBOX_WORKER_SECRET 32
 require_value SHORTLINK_PUBLIC_ORIGIN 16
+if [[ "$DEMO_MODE" == "1" ]]; then
+  [[ "${RAILWAY_ENVIRONMENT_NAME:-}" == "demo" ]] || fail "CLAWPILOT_DEMO_MODE=1 is only valid in the demo environment"
+else
+  require_value MATON_API_KEY 16
+  require_value MATON_GMAIL_CONNECTION_ID 8
+  require_value CLAWPILOT_MAIL_FROM 5
+  require_value PIPELINE_SHEET_ID 20
+fi
 if [[ "${CLAWPILOT_REPOSITORY_RUNNER_ENABLED:-0}" == "1" ]]; then
   require_value CLAWPILOT_GITHUB_APP_ID 1
   require_value CLAWPILOT_GITHUB_APP_BOT_USER 1
@@ -59,11 +65,14 @@ if (( ${#SHORTLINK_CLIENTS_VALUE} < 32 )) && (( ${#SHORTLINK_SECRET_VALUE} < 32 
   fail "SHORTLINK_SERVICE_CLIENTS_JSON or SHORTLINK_SERVICE_SECRET must be configured"
 fi
 
-[[ "$CLAWPILOT_MAIL_FROM" == *@* ]] || fail "CLAWPILOT_MAIL_FROM must be an email address"
+if [[ "$DEMO_MODE" != "1" ]]; then
+  [[ "$CLAWPILOT_MAIL_FROM" == *@* ]] || fail "CLAWPILOT_MAIL_FROM must be an email address"
+fi
 [[ "$CLAWPILOT_PUBLIC_URL" == https://* ]] || fail "CLAWPILOT_PUBLIC_URL must use HTTPS"
 node scripts/validate-runtime-config.mjs
 
 cleanup() {
+  [[ -n "$DEMO_REFRESH_PID" ]] && kill "$DEMO_REFRESH_PID" 2>/dev/null || true
   [[ -n "$WORKER_PID" ]] && kill "$WORKER_PID" 2>/dev/null || true
   [[ -n "$APP_PID" ]] && kill "$APP_PID" 2>/dev/null || true
 }
@@ -87,10 +96,22 @@ done
 node scripts/pipeline-outbox-poller.mjs &
 WORKER_PID=$!
 
+if [[ "$DEMO_MODE" == "1" ]]; then
+  (
+    while sleep "${DEMO_REFRESH_INTERVAL_SECONDS:-86400}"; do
+      npm run demo:seed || echo "[railway-start] demo refresh failed; existing synthetic dataset remains active" >&2
+    done
+  ) &
+  DEMO_REFRESH_PID=$!
+fi
+
 HEALTHY=0
 for _attempt in $(seq 1 120); do
   kill -0 "$APP_PID" 2>/dev/null || fail "application exited before health validation"
   kill -0 "$WORKER_PID" 2>/dev/null || fail "runtime worker exited before health validation"
+  if [[ -n "$DEMO_REFRESH_PID" ]]; then
+    kill -0 "$DEMO_REFRESH_PID" 2>/dev/null || fail "demo refresh loop exited before health validation"
+  fi
   if node -e 'fetch(process.argv[1], { signal: AbortSignal.timeout(3000) }).then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))' "$HEALTH_URL"; then
     HEALTHY=1
     break
@@ -104,6 +125,10 @@ npm run release:record
 while kill -0 "$APP_PID" 2>/dev/null; do
   if [[ -n "$WORKER_PID" ]] && ! kill -0 "$WORKER_PID" 2>/dev/null; then
     echo "[railway-start] pipeline outbox poller exited unexpectedly"
+    exit 1
+  fi
+  if [[ -n "$DEMO_REFRESH_PID" ]] && ! kill -0 "$DEMO_REFRESH_PID" 2>/dev/null; then
+    echo "[railway-start] demo refresh loop exited unexpectedly"
     exit 1
   fi
   sleep 1

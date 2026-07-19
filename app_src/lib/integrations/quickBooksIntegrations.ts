@@ -3,6 +3,7 @@ import { resolveUserMatonGatewayCredential } from '@/lib/integrations/matonGatew
 import { stageCrmRecordWithClient } from '@/lib/persistence/crm'
 import { syncPipelineProductDropdownCatalogInPostgres } from '@/lib/persistence/pipeline'
 import { withTransaction } from '@/lib/persistence/postgres'
+import { configureQuickBooksCrmSyncInPostgres } from '@/lib/persistence/quickBooksCrmSync'
 import {
   bindQuickBooksConnectionInPostgres,
   disconnectQuickBooksConnectionInPostgres,
@@ -90,6 +91,17 @@ export async function configureQuickBooksCatalogSync(input: {
   actorEmail: string
 }) {
   await setQuickBooksCatalogSyncEnabledInPostgres(input)
+  return readQuickBooksIntegrationStateFromPostgres(input.organizationId)
+}
+
+export async function configureQuickBooksCrmSync(input: {
+  organizationId: string
+  pipelineId: string
+  customerSyncEnabled: boolean
+  productSyncEnabled: boolean
+  actorEmail: string
+}) {
+  await configureQuickBooksCrmSyncInPostgres(input)
   return readQuickBooksIntegrationStateFromPostgres(input.organizationId)
 }
 

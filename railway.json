@@ -14,7 +14,7 @@
   },
   "deploy": {
     "startCommand": "npm run start:railway",
-    "preDeployCommand": "npm run mail:verify && npm run db:migrate",
+    "preDeployCommand": "bash scripts/predeploy-railway.sh",
     "healthcheckPath": "/api/health",
     "healthcheckTimeout": 300,
     "restartPolicyType": "ON_FAILURE",

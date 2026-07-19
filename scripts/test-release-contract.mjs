@@ -452,7 +452,21 @@ assert.ok(runtimeRouteSource.includes('Hosted build identity is not configured')
 assert.ok(runtimeRouteSource.includes('!commit && !hosted'))
 
 const railwayConfig = JSON.parse(read('railway.json'))
-assert.equal(railwayConfig.deploy.preDeployCommand, 'npm run mail:verify && npm run db:migrate')
+assert.equal(railwayConfig.deploy.preDeployCommand, 'bash scripts/predeploy-railway.sh')
+const railwayPredeploy = read('scripts/predeploy-railway.sh')
+for (const fragment of [
+  'npm run mail:verify',
+  'npm run db:migrate',
+  'npm run demo:seed',
+  'npm run demo:verify',
+  'RAILWAY_ENVIRONMENT_NAME:-',
+]) {
+  assert.ok(railwayPredeploy.includes(fragment), `Railway predeploy wrapper missing ${fragment}`)
+}
+assert.ok(
+  railwayPredeploy.indexOf('npm run db:migrate') < railwayPredeploy.indexOf('npm run demo:seed'),
+  'demo data must only be seeded after migrations complete',
+)
 const railwayStart = read('scripts/start-railway.sh')
 assert.ok(railwayStart.indexOf('/api/health') < railwayStart.indexOf('npm run release:record'))
 assert.ok(railwayStart.includes('application did not pass health validation'))

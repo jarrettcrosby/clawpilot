@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import {
   bindSelectedQuickBooksConnection,
   configureQuickBooksCatalogSync,
+  configureQuickBooksCrmSync,
   disconnectQuickBooksConnection,
   getQuickBooksIntegrationState,
   importQuickBooksProducts,
@@ -122,6 +123,20 @@ export async function PATCH(req: NextRequest) {
       return json({
         ok: true,
         integration: await configureQuickBooksCatalogSync({ organizationId: organization, enabled: body.enabled === true, actorEmail: actor.email }),
+      })
+    }
+    if (action === 'configure-crm-sync') {
+      only(body, ['action', 'customers', 'products'])
+      const pipeline = await selectedPipeline(req, actor)
+      return json({
+        ok: true,
+        integration: await configureQuickBooksCrmSync({
+          organizationId: organization,
+          pipelineId: pipeline.id,
+          customerSyncEnabled: body.customers === true,
+          productSyncEnabled: body.products === true,
+          actorEmail: actor.email,
+        }),
       })
     }
     if (action === 'save-mappings') {

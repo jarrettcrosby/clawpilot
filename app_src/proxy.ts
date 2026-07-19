@@ -12,6 +12,7 @@ import {
   type IssuedBrowserSession,
 } from '@/lib/authSessions'
 import { resolveAgentDispatchWorker } from '@/lib/workerAuth'
+import { demoMutationIsRestricted } from '@/lib/demoMode'
 
 const HOSTED_RUNTIME = Boolean(
   process.env.RAILWAY_ENVIRONMENT_NAME
@@ -152,6 +153,12 @@ export async function proxy(req: NextRequest) {
   }
 
   if (session) {
+    if (demoMutationIsRestricted(pathname, req.method)) {
+      return NextResponse.json(
+        { ok: false, error: 'This action is disabled in the public demo. Demo data resets automatically.' },
+        { status: 403 },
+      )
+    }
     if (sensitiveMutationDuringImpersonation(req, session)) {
       return NextResponse.json(
         { ok: false, error: 'Exit user view before changing account access, integrations, or security settings.' },

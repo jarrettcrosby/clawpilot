@@ -5,6 +5,7 @@ import {
   failQuickBooksSyncJobInPostgres,
   queueAutomaticQuickBooksCatalogSyncsInPostgres,
 } from '@/lib/persistence/quickBooksIntegrations'
+import { reconcileQuickBooksCatalogToCrmInPostgres } from '@/lib/persistence/quickBooksCrmSync'
 
 export async function processQuickBooksSyncOutbox(input: { limit?: number; workerId: string }) {
   const autoQueued = await queueAutomaticQuickBooksCatalogSyncsInPostgres()
@@ -15,10 +16,18 @@ export async function processQuickBooksSyncOutbox(input: { limit?: number; worke
   let succeeded = 0
   let failed = 0
   let dead = 0
+  let crmReconciled = 0
+  let crmFailed = 0
   for (const job of jobs) {
     try {
       const catalog = await readQuickBooksCatalog(job.ownerEmail, job.connectionId)
       await completeQuickBooksCatalogSyncInPostgres({ job, ...catalog })
+      try {
+        const crm = await reconcileQuickBooksCatalogToCrmInPostgres({ organizationId: job.organizationId })
+        if (crm.configured) crmReconciled += 1
+      } catch {
+        crmFailed += 1
+      }
       succeeded += 1
     } catch (error) {
       const becameDead = await failQuickBooksSyncJobInPostgres({ job, error })
@@ -26,5 +35,5 @@ export async function processQuickBooksSyncOutbox(input: { limit?: number; worke
       else failed += 1
     }
   }
-  return { autoQueued, claimed: jobs.length, succeeded, failed, dead }
+  return { autoQueued, claimed: jobs.length, succeeded, failed, dead, crmReconciled, crmFailed }
 }

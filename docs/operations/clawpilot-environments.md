@@ -31,12 +31,12 @@ Use `http://localhost:4002`. The start script supplies isolated `data-dev` paths
 
 ## Hosted Topology
 
-| Surface | Production | Development |
-|---|---|---|
-| Branch | `main` | `dev` |
-| Railway environment | `production` | `development` |
-| ClawPilot | `https://aiapp.eigenracing.com` | `https://dev.aiapp.eigenracing.com` |
-| SuiteCRM | `https://crm.eigenracing.com` | `https://dev.crm.eigenracing.com` |
+| Surface | Production | Development | Public demo |
+|---|---|---|---|
+| Branch | `main` | `dev` | reviewed `dev` candidate |
+| Railway environment | `production` | `development` | `demo` |
+| ClawPilot | `https://aiapp.eigenracing.com` | `https://dev.aiapp.eigenracing.com` | `https://demo.aiapp.eigenracing.com` |
+| SuiteCRM | `https://crm.eigenracing.com` | `https://dev.crm.eigenracing.com` | disabled |
 
 Railway runs the Next.js server, background outbox and agent workers, environment-specific Postgres, private SuiteCRM service, dedicated SuiteCRM MariaDB, and SuiteCRM volume. Vercel provides protected Next.js previews and an independent build/deployment check; it does not replace Railway workers or own durable writes.
 
@@ -44,7 +44,7 @@ The `eigenracing.com` DNS zone is managed through Squarespace. Each Railway cust
 
 ## Environment Isolation
 
-Development and production have separate Postgres and MariaDB databases, SuiteCRM volumes, users, sessions, platform credentials, boards, pipelines, Sheets, CRM projections, documents, releases, checkpoints, worker secrets, and short links. They may share only the restricted per-user ChatGPT credential store and its encryption key so one user authorization works in both lanes. No application data, database row, Sheet ID, or provider secret is copied between environments as part of promotion.
+Development and production have separate Postgres and MariaDB databases, SuiteCRM volumes, users, sessions, platform credentials, boards, pipelines, Sheets, CRM projections, documents, releases, checkpoints, worker secrets, and short links. They may share only the restricted per-user ChatGPT credential store and its encryption key so one user authorization works in both lanes. The public demo shares neither that credential store nor any provider credential. It uses generated records in a dedicated Postgres database under the [public demo contract](public-demo-environment.md). No application data, database row, Sheet ID, or provider secret is copied between environments as part of promotion.
 
 ## Implementation Gate
 
