@@ -41,6 +41,7 @@ flowchart LR
 ```
 
 - The shared Railway poller claims snapshot jobs with a lease and bounded retries.
+- Entity pages are fetched serially with provider pacing. Rate limits and temporary provider failures honor `Retry-After` plus capped exponential backoff; a failed refresh leaves the last complete snapshot intact.
 - Automatic refresh runs no more often than once every 24 hours for enabled active bindings. A manager can queue a refresh from Settings.
 - Provider responses are size-bounded and parsed into sanitized projections before Postgres persistence.
 - The Accounting workspace supports an overview, invoices, receipts, all transaction types, products and services, the chart of accounts, customers, vendors, and attachment metadata. Lists are paginated and searched server-side.
