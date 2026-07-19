@@ -196,6 +196,7 @@ for (const fragment of [
   "'attachable-thumbnail'",
   "SELECT * FROM Attachable WHERE Id = '${escapedAttachmentId}'",
   'ThumbnailTempDownloadUri',
+  "Fall through to Maton's dedicated download resource.",
   'validatedAttachmentUrl',
   'readQuickBooksAttachmentDownloadUrl',
 ]) includes(client + read('app_src/lib/maton.ts'), fragment, 'QuickBooks client')

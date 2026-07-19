@@ -276,18 +276,22 @@ export async function readQuickBooksAttachmentDownloadUrl(input: {
   // a gateway error. A targeted query refreshes the short-lived Intuit URLs.
   const escapedAttachmentId = attachmentId.replaceAll("'", "''")
   const query = encodeURIComponent(`SELECT * FROM Attachable WHERE Id = '${escapedAttachmentId}'`)
-  const attachmentPayload = await request(
-    `/quickbooks/v3/company/:realmId/query?query=${query}&minorversion=${MINOR_VERSION}`,
-    input.ownerEmail,
-    input.connectionId,
-  )
-  const source = parseQuickBooksAttachments(attachmentPayload)
-    .find((attachment) => attachment.id === attachmentId)
-    ?.sourcePayload as Record<string, unknown> | undefined
-  const queriedCandidate = input.thumbnail
-    ? source?.ThumbnailTempDownloadUri || source?.TempDownloadUri
-    : source?.TempDownloadUri
-  if (queriedCandidate) return validatedAttachmentUrl(queriedCandidate)
+  try {
+    const attachmentPayload = await request(
+      `/quickbooks/v3/company/:realmId/query?query=${query}&minorversion=${MINOR_VERSION}`,
+      input.ownerEmail,
+      input.connectionId,
+    )
+    const source = parseQuickBooksAttachments(attachmentPayload)
+      .find((attachment) => attachment.id === attachmentId)
+      ?.sourcePayload as Record<string, unknown> | undefined
+    const queriedCandidate = input.thumbnail
+      ? source?.ThumbnailTempDownloadUri || source?.TempDownloadUri
+      : source?.TempDownloadUri
+    if (queriedCandidate) return validatedAttachmentUrl(queriedCandidate)
+  } catch {
+    // Fall through to Maton's dedicated download resource.
+  }
 
   const endpoint = input.thumbnail ? 'attachable-thumbnail' : 'download'
   const response = await requestResponse(
