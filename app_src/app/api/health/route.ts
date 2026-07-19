@@ -221,6 +221,7 @@ export async function GET() {
           toast_sync_rerun_migration_applied: boolean
           toast_sync_worker_hardening_migration_applied: boolean
           pos_accounting_notifications_migration_applied: boolean
+          quickbooks_write_binding_compatibility_migration_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -521,6 +522,11 @@ export async function GET() {
                 FROM schema_migrations
                 WHERE filename = '0074_pos_accounting_issue_notifications.sql'
               ) AS pos_accounting_notifications_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0075_quickbooks_write_binding_compatibility.sql'
+              ) AS quickbooks_write_binding_compatibility_migration_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -592,6 +598,7 @@ export async function GET() {
             && row?.toast_sync_rerun_migration_applied
             && row?.toast_sync_worker_hardening_migration_applied
             && row?.pos_accounting_notifications_migration_applied
+            && row?.quickbooks_write_binding_compatibility_migration_applied
             && row?.migration_checksums_present
           ),
         }
@@ -655,6 +662,7 @@ export async function GET() {
           || !row?.toast_sync_rerun_migration_applied
           || !row?.toast_sync_worker_hardening_migration_applied
           || !row?.pos_accounting_notifications_migration_applied
+          || !row?.quickbooks_write_binding_compatibility_migration_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')
@@ -667,6 +675,7 @@ export async function GET() {
           && row?.quickbooks_write_control_migration_applied
           && row?.quickbooks_write_connection_binding_migration_applied
           && row?.pos_accounting_notifications_migration_applied
+          && row?.quickbooks_write_binding_compatibility_migration_applied
         ) {
           const queueResult = await query<{
             toast_pending: number

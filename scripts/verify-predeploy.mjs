@@ -176,6 +176,7 @@ for (const requiredPath of [
   'db/migrations/0072_toast_sync_rerun_requests.sql',
   'db/migrations/0073_toast_sync_worker_hardening.sql',
   'db/migrations/0074_pos_accounting_issue_notifications.sql',
+  'db/migrations/0075_quickbooks_write_binding_compatibility.sql',
   '.github/workflows/clawpilot-repository-runner.yml',
   '.github/workflows/deployed-runtime-monitor.yml',
   'scripts/start-railway.sh',

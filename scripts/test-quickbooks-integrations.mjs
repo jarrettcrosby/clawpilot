@@ -252,11 +252,18 @@ const writeBindingMigration = read('db/migrations/0068_quickbooks_write_connecti
 for (const fragment of [
   'ADD COLUMN IF NOT EXISTS reviewed_maton_connection_id text',
   'DROP CONSTRAINT IF EXISTS quickbooks_write_reviewed_connection_required',
-  'reviewed_maton_connection_id IS NULL',
+  "SET status = 'cancelled'",
+  "RAISE EXCEPTION 'Cannot bind QuickBooks write requests while a legacy write is processing'",
+  "reviewed_maton_connection_id IS NOT NULL OR status IN ('succeeded', 'cancelled')",
   'idx_quickbooks_write_requests_reviewed_connection',
 ]) includes(writeBindingMigration, fragment, 'QuickBooks write connection-binding migration')
-assert.ok(!writeBindingMigration.includes("SET status = 'cancelled'"), 'connection-binding migration must preserve legacy write requests')
-assert.ok(!writeBindingMigration.includes('RAISE EXCEPTION'), 'connection-binding migration must remain compatible with in-flight old application versions')
+
+const writeBindingCompatibilityMigration = read('db/migrations/0075_quickbooks_write_binding_compatibility.sql')
+includes(
+  writeBindingCompatibilityMigration,
+  'DROP CONSTRAINT IF EXISTS quickbooks_write_reviewed_connection_required',
+  'QuickBooks write connection-binding compatibility migration',
+)
 
 const crmReconciliationMigration = read('db/migrations/0065_demo_and_quickbooks_crm_reconciliation.sql')
 for (const fragment of [
