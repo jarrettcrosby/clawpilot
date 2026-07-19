@@ -104,13 +104,18 @@ assert.ok(!persistence.includes("status = 'pending', attempt_count = 0"), 'autom
 const posMigration = read('db/migrations/0067_toast_pos_orders.sql')
 for (const fragment of [
   'ADD COLUMN IF NOT EXISTS lock_token uuid',
-  'ADD COLUMN IF NOT EXISTS rerun_requested_at timestamptz',
   "'standard_order_updates'",
   "'deployment.database.identity'",
   'CREATE TABLE IF NOT EXISTS toast_pos_orders',
 ]) {
   assert.ok(posMigration.includes(fragment), `Toast POS migration missing ${fragment}`)
 }
+
+const rerunMigration = read('db/migrations/0072_toast_sync_rerun_requests.sql')
+assert.ok(
+  rerunMigration.includes('ADD COLUMN IF NOT EXISTS rerun_requested_at timestamptz'),
+  'Toast rerun migration must add the durable follow-up marker',
+)
 
 const tenantQueries = []
 const toastOrderProjection = loadTypeScriptModule('app_src/lib/integrations/toastOrderProjection.ts')

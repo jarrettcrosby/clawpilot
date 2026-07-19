@@ -2,9 +2,6 @@ ALTER TABLE toast_sync_outbox
   ADD COLUMN IF NOT EXISTS lock_token uuid;
 
 ALTER TABLE toast_sync_outbox
-  ADD COLUMN IF NOT EXISTS rerun_requested_at timestamptz;
-
-ALTER TABLE toast_sync_outbox
   DROP CONSTRAINT IF EXISTS toast_sync_outbox_sync_kind_check;
 
 ALTER TABLE toast_sync_outbox
