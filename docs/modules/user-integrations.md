@@ -47,7 +47,7 @@ Keep user-owned Maton accounts separate from the platform Google Workspace crede
 - Analytics and Standard API credentials are separate encrypted records. Encryption binds each secret to its organization and access type so one credential cannot be decrypted as the other or across tenants.
 - Analytics discovers management-group restaurants and supplies reporting data. Standard access verifies each restaurant GUID and supplies location-scoped operational records.
 - Selected restaurants synchronize through a leased, retryable Postgres outbox. Raw provider records are immutable snapshots; daily sales are normalized projections.
-- Toast ingestion only creates a reviewable accounting draft. It cannot post to QuickBooks. See [Toast Sales and Accounting](toast-and-accounting.md) for the data flow and release boundary.
+- Toast ingestion only creates sanitized POS projections and a reviewable accounting draft. It cannot post to QuickBooks. See [Toast POS and Accounting](toast-and-accounting.md) for the data flow and release boundary.
 
 ## QuickBooks Organization Contract
 

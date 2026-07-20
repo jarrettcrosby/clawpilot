@@ -68,5 +68,5 @@ Personal authentication such as the user's ChatGPT connection remains attached t
 - [Organization-Rooted Tenancy](0002-organization-rooted-tenancy.md)
 - [Application Shell and Access](../modules/application-shell-and-access.md)
 - [Projects and Tenancy](../modules/projects-and-tenancy.md)
-- [Toast Sales and Accounting](../modules/toast-and-accounting.md)
+- [Toast POS and Accounting](../modules/toast-and-accounting.md)
 - [Platform and Data Map](../maps/platform-data-map.md)

@@ -1,5 +1,6 @@
 import crypto from 'crypto'
 import type { PoolClient } from 'pg'
+import { projectToastOrders } from '@/lib/integrations/toastOrderProjection'
 import { query, withTransaction } from '@/lib/persistence/postgres'
 import type { EncryptedToastClientSecret, ToastAccessType } from '@/lib/integrations/toastCredentialCrypto'
 
@@ -134,12 +135,13 @@ export type ToastSyncJob = {
   id: string
   organizationId: string
   restaurantGuid: string
-  syncKind: 'analytics_sales' | 'analytics_payouts' | 'standard_orders'
+  syncKind: 'analytics_sales' | 'analytics_payouts' | 'standard_orders' | 'standard_order_updates'
   businessDate: string
   attemptCount: number
   maxAttempts: number
   requestState: Record<string, unknown>
   requestedBy: string | null
+  lockToken: string
 }
 
 function iso(value: TimestampValue | null | undefined) {
@@ -297,7 +299,7 @@ export async function readToastIntegrationStateFromPostgres(organizationId: stri
       latest_business_date: TimestampValue | null
     }>(
       `SELECT
-         sync_kind,
+         CASE WHEN sync_kind = 'standard_order_updates' THEN 'standard_orders' ELSE sync_kind END AS sync_kind,
          count(*) FILTER (WHERE status = 'succeeded')::text AS successful_jobs,
          count(*) FILTER (WHERE status IN ('failed', 'dead'))::text AS failed_jobs,
          count(DISTINCT business_date) FILTER (WHERE status = 'succeeded')::text AS business_dates,
@@ -311,7 +313,7 @@ export async function readToastIntegrationStateFromPostgres(organizationId: stri
          max(business_date) FILTER (WHERE status = 'succeeded') AS latest_business_date
        FROM toast_sync_outbox
        WHERE organization_id = $1::uuid
-       GROUP BY sync_kind`,
+       GROUP BY CASE WHEN sync_kind = 'standard_order_updates' THEN 'standard_orders' ELSE sync_kind END`,
       [organizationId],
     ),
   ])
@@ -347,6 +349,7 @@ export async function readToastIntegrationStateFromPostgres(organizationId: stri
   datasets.analyticsPayouts.available = datasets.analyticsSales.available
   const datasetKeys: Record<ToastSyncJob['syncKind'], keyof Omit<typeof datasets, 'restaurantProfiles'>> = {
     standard_orders: 'standardOrders',
+    standard_order_updates: 'standardOrders',
     analytics_sales: 'analyticsSales',
     analytics_payouts: 'analyticsPayouts',
   }
@@ -625,21 +628,65 @@ async function queueToastJobWithClient(client: PoolClient, input: {
   syncKind: ToastSyncJob['syncKind']
   businessDate: string
   requestedBy?: string | null
+  rerunAfterSeconds?: number | null
 }) {
+  const rerunAfterSeconds = input.rerunAfterSeconds === null || input.rerunAfterSeconds === undefined
+    ? null
+    : Math.max(0, Math.min(Math.round(input.rerunAfterSeconds), 86400))
   await client.query(
     `INSERT INTO toast_sync_outbox (
        organization_id, restaurant_guid, sync_kind, business_date, status, requested_by, created_at, updated_at
      ) VALUES ($1::uuid, $2::uuid, $3, $4::date, 'pending', $5, now(), now())
      ON CONFLICT (organization_id, restaurant_guid, sync_kind, business_date) DO UPDATE SET
-       status = CASE WHEN toast_sync_outbox.status IN ('failed', 'dead') THEN 'pending' ELSE toast_sync_outbox.status END,
-       attempt_count = CASE WHEN toast_sync_outbox.status IN ('failed', 'dead') THEN 0 ELSE toast_sync_outbox.attempt_count END,
-       available_at = CASE WHEN toast_sync_outbox.status IN ('failed', 'dead') THEN now() ELSE toast_sync_outbox.available_at END,
-       locked_at = CASE WHEN toast_sync_outbox.status IN ('failed', 'dead') THEN NULL ELSE toast_sync_outbox.locked_at END,
-       locked_by = CASE WHEN toast_sync_outbox.status IN ('failed', 'dead') THEN NULL ELSE toast_sync_outbox.locked_by END,
-       last_error = CASE WHEN toast_sync_outbox.status IN ('failed', 'dead') THEN NULL ELSE toast_sync_outbox.last_error END,
        requested_by = COALESCE(EXCLUDED.requested_by, toast_sync_outbox.requested_by),
+       rerun_requested_at = CASE
+         WHEN $6::integer = 0 AND toast_sync_outbox.status = 'processing' THEN now()
+         ELSE toast_sync_outbox.rerun_requested_at
+       END,
+       status = CASE
+         WHEN $6::integer IS NOT NULL
+           AND toast_sync_outbox.status = 'succeeded'
+           AND COALESCE(toast_sync_outbox.completed_at, toast_sync_outbox.updated_at) <= now() - make_interval(secs => $6::integer)
+           THEN 'pending'
+         ELSE toast_sync_outbox.status
+       END,
+       attempt_count = CASE
+         WHEN $6::integer IS NOT NULL
+           AND toast_sync_outbox.status = 'succeeded'
+           AND COALESCE(toast_sync_outbox.completed_at, toast_sync_outbox.updated_at) <= now() - make_interval(secs => $6::integer)
+           THEN 0
+         ELSE toast_sync_outbox.attempt_count
+       END,
+       available_at = CASE
+         WHEN $6::integer IS NOT NULL
+           AND toast_sync_outbox.status = 'succeeded'
+           AND COALESCE(toast_sync_outbox.completed_at, toast_sync_outbox.updated_at) <= now() - make_interval(secs => $6::integer)
+           THEN now()
+         ELSE toast_sync_outbox.available_at
+       END,
+       completed_at = CASE
+         WHEN $6::integer IS NOT NULL
+           AND toast_sync_outbox.status = 'succeeded'
+           AND COALESCE(toast_sync_outbox.completed_at, toast_sync_outbox.updated_at) <= now() - make_interval(secs => $6::integer)
+           THEN NULL
+         ELSE toast_sync_outbox.completed_at
+       END,
+       request_state = CASE
+         WHEN $6::integer IS NOT NULL
+           AND toast_sync_outbox.status = 'succeeded'
+           AND COALESCE(toast_sync_outbox.completed_at, toast_sync_outbox.updated_at) <= now() - make_interval(secs => $6::integer)
+           THEN '{}'::jsonb
+         ELSE toast_sync_outbox.request_state
+       END,
        updated_at = now()`,
-    [input.organizationId, input.restaurantGuid, input.syncKind, input.businessDate, input.requestedBy || null],
+    [
+      input.organizationId,
+      input.restaurantGuid,
+      input.syncKind,
+      input.businessDate,
+      input.requestedBy || null,
+      rerunAfterSeconds,
+    ],
   )
 }
 
@@ -665,13 +712,20 @@ export async function queueToastSyncForDateInPostgres(input: {
     for (const location of locations.rows) {
       if (access.has('analytics') && location.analytics_access) {
         for (const syncKind of ['analytics_sales', 'analytics_payouts'] as const) {
-          await queueToastJobWithClient(client, { ...input, restaurantGuid: location.restaurant_guid, syncKind, requestedBy: input.actorEmail })
+          await queueToastJobWithClient(client, {
+            ...input,
+            restaurantGuid: location.restaurant_guid,
+            syncKind,
+            requestedBy: input.actorEmail,
+            rerunAfterSeconds: 0,
+          })
           count += 1
         }
       }
       if (access.has('standard') && location.standard_access) {
         await queueToastJobWithClient(client, {
           ...input, restaurantGuid: location.restaurant_guid, syncKind: 'standard_orders', requestedBy: input.actorEmail,
+          rerunAfterSeconds: 0,
         })
         count += 1
       }
@@ -691,12 +745,19 @@ export async function listToastAutomaticSyncTargetsInPostgres() {
     timezone: string | null
     analytics_enabled: boolean
     standard_enabled: boolean
+    latest_standard_update_date: string | null
   }>(
     `SELECT location.organization_id::text, location.restaurant_guid::text, location.timezone,
        bool_or(credential.access_type = 'analytics' AND credential.sync_enabled AND location.analytics_access) AS analytics_enabled,
-       bool_or(credential.access_type = 'standard' AND credential.sync_enabled AND location.standard_access) AS standard_enabled
+       bool_or(credential.access_type = 'standard' AND credential.sync_enabled AND location.standard_access) AS standard_enabled,
+       (max(job.business_date) FILTER (
+         WHERE job.sync_kind = 'standard_order_updates' AND job.status = 'succeeded'
+       ))::text AS latest_standard_update_date
      FROM toast_locations location
      JOIN organization_toast_credentials credential ON credential.organization_id = location.organization_id
+     LEFT JOIN toast_sync_outbox job
+       ON job.organization_id = location.organization_id
+      AND job.restaurant_guid = location.restaurant_guid
      WHERE location.selected AND location.active AND NOT location.archived
      GROUP BY location.organization_id, location.restaurant_guid, location.timezone`,
   )
@@ -706,6 +767,7 @@ export async function listToastAutomaticSyncTargetsInPostgres() {
     timezone: row.timezone,
     analyticsEnabled: row.analytics_enabled,
     standardEnabled: row.standard_enabled,
+    latestStandardUpdateDate: row.latest_standard_update_date,
   }))
 }
 
@@ -723,12 +785,32 @@ export async function queueAutomaticToastSyncInPostgres(input: {
     }
     if (input.standardEnabled) {
       await queueToastJobWithClient(client, { ...input, syncKind: 'standard_orders' })
+      await queueToastJobWithClient(client, { ...input, syncKind: 'standard_order_updates', rerunAfterSeconds: 900 })
     }
+  })
+}
+
+export async function queueAutomaticToastOrderUpdateInPostgres(input: {
+  organizationId: string
+  restaurantGuid: string
+  businessDate: string
+}) {
+  await withTransaction(async (client) => {
+    await queueToastJobWithClient(client, { ...input, syncKind: 'standard_order_updates', rerunAfterSeconds: 900 })
   })
 }
 
 export async function claimToastSyncJobsInPostgres(input: { limit: number; workerId: string }) {
   return withTransaction(async (client) => {
+    await client.query(
+      `UPDATE toast_sync_outbox
+       SET status = CASE WHEN attempt_count >= max_attempts THEN 'dead' ELSE 'failed' END,
+           available_at = CASE WHEN attempt_count >= max_attempts THEN available_at ELSE now() END,
+           locked_at = NULL, locked_by = NULL, lock_token = NULL,
+           last_error = 'Worker lease expired before completion.', updated_at = now()
+       WHERE status = 'processing'
+         AND COALESCE(locked_at, updated_at) < now() - interval '15 minutes'`,
+    )
     const result = await client.query<{
       id: string
       organization_id: string
@@ -739,21 +821,24 @@ export async function claimToastSyncJobsInPostgres(input: { limit: number; worke
       max_attempts: number
       request_state: Record<string, unknown>
       requested_by: string | null
+      lock_token: string
     }>(
       `WITH due AS (
          SELECT id FROM toast_sync_outbox
-         WHERE status IN ('pending', 'failed') AND available_at <= now()
+         WHERE status IN ('pending', 'failed')
+           AND attempt_count < max_attempts
+           AND available_at <= now()
          ORDER BY available_at, created_at
          FOR UPDATE SKIP LOCKED
          LIMIT $1
        )
        UPDATE toast_sync_outbox job
        SET status = 'processing', attempt_count = attempt_count + 1,
-           locked_at = now(), locked_by = $2, updated_at = now()
+           locked_at = now(), locked_by = $2, lock_token = gen_random_uuid(), updated_at = now()
        FROM due WHERE job.id = due.id
        RETURNING job.id::text, job.organization_id::text, job.restaurant_guid::text,
          job.sync_kind, job.business_date::text, job.attempt_count, job.max_attempts,
-         job.request_state, job.requested_by`,
+         job.request_state, job.requested_by, job.lock_token::text`,
       [Math.max(1, Math.min(input.limit, 20)), input.workerId],
     )
     return result.rows.map((row): ToastSyncJob => ({
@@ -766,24 +851,27 @@ export async function claimToastSyncJobsInPostgres(input: { limit: number; worke
       maxAttempts: row.max_attempts,
       requestState: row.request_state || {},
       requestedBy: row.requested_by,
+      lockToken: row.lock_token,
     }))
   })
 }
 
 export async function deferToastSyncJobInPostgres(input: {
-  id: string
+  job: ToastSyncJob
   requestState: Record<string, unknown>
   delaySeconds?: number
 }) {
-  await query(
+  const result = await query(
     `UPDATE toast_sync_outbox
      SET status = 'pending', request_state = $2::jsonb,
          attempt_count = greatest(0, attempt_count - 1),
          available_at = now() + ($3::text || ' seconds')::interval,
-         locked_at = NULL, locked_by = NULL, updated_at = now()
-     WHERE id = $1::uuid`,
-    [input.id, JSON.stringify(input.requestState), Math.max(5, Math.min(input.delaySeconds || 15, 300))],
+         locked_at = NULL, locked_by = NULL, updated_at = now(),
+         lock_token = NULL
+     WHERE id = $1::uuid AND status = 'processing' AND lock_token = $4::uuid`,
+    [input.job.id, JSON.stringify(input.requestState), Math.max(5, Math.min(input.delaySeconds || 15, 300)), input.job.lockToken],
   )
+  return result.rowCount === 1
 }
 
 export async function failToastSyncJobInPostgres(input: {
@@ -791,28 +879,46 @@ export async function failToastSyncJobInPostgres(input: {
   error: string
 }) {
   const dead = input.job.attemptCount >= input.job.maxAttempts
-  await query(
+  const result = await query<{ status: string }>(
     `UPDATE toast_sync_outbox
      SET status = $2, last_error = $3,
          available_at = CASE WHEN $2 = 'failed' THEN now() + (least(300, power(2, attempt_count))::text || ' seconds')::interval ELSE available_at END,
-         locked_at = NULL, locked_by = NULL, updated_at = now()
-     WHERE id = $1::uuid`,
-    [input.job.id, dead ? 'dead' : 'failed', input.error.slice(0, 1000)],
+         locked_at = NULL, locked_by = NULL, lock_token = NULL, updated_at = now()
+     WHERE id = $1::uuid AND status = 'processing' AND lock_token = $4::uuid
+     RETURNING status`,
+    [input.job.id, dead ? 'dead' : 'failed', input.error.slice(0, 1000), input.job.lockToken],
   )
-  return dead
+  return { accepted: result.rowCount === 1, dead: result.rows[0]?.status === 'dead' }
 }
 
 export async function completeToastSyncJobInPostgres(input: {
   job: ToastSyncJob
   resultSummary: Record<string, unknown>
 }) {
-  await query(
+  const result = await query(
     `UPDATE toast_sync_outbox
-     SET status = 'succeeded', result_summary = $2::jsonb, last_error = NULL,
-         locked_at = NULL, locked_by = NULL, completed_at = now(), updated_at = now()
-     WHERE id = $1::uuid`,
-    [input.job.id, JSON.stringify(input.resultSummary)],
+     SET status = CASE WHEN rerun_requested_at IS NULL THEN 'succeeded' ELSE 'pending' END,
+         result_summary = $2::jsonb, last_error = NULL,
+         attempt_count = CASE WHEN rerun_requested_at IS NULL THEN attempt_count ELSE 0 END,
+         available_at = CASE WHEN rerun_requested_at IS NULL THEN available_at ELSE now() END,
+         request_state = CASE WHEN rerun_requested_at IS NULL THEN request_state ELSE '{}'::jsonb END,
+         locked_at = NULL, locked_by = NULL, lock_token = NULL,
+         completed_at = CASE WHEN rerun_requested_at IS NULL THEN now() ELSE NULL END,
+         rerun_requested_at = NULL, updated_at = now()
+     WHERE id = $1::uuid AND status = 'processing' AND lock_token = $3::uuid`,
+    [input.job.id, JSON.stringify(input.resultSummary), input.job.lockToken],
   )
+  return result.rowCount === 1
+}
+
+async function assertToastJobLease(client: PoolClient, job: ToastSyncJob) {
+  const lease = await client.query(
+    `SELECT id FROM toast_sync_outbox
+     WHERE id = $1::uuid AND status = 'processing' AND lock_token = $2::uuid
+     FOR UPDATE`,
+    [job.id, job.lockToken],
+  )
+  if (lease.rowCount !== 1) throw new Error('Toast sync worker lease expired')
 }
 
 export async function storeToastSnapshotsInPostgres(input: {
@@ -821,6 +927,7 @@ export async function storeToastSnapshotsInPostgres(input: {
   records: Array<{ sourceId: string; payload: unknown }>
 }) {
   await withTransaction(async (client) => {
+    await assertToastJobLease(client, input.job)
     for (const record of input.records) {
       const serialized = JSON.stringify(record.payload)
       const payloadHash = crypto.createHash('sha256').update(serialized).digest('hex')
@@ -869,7 +976,9 @@ export async function upsertToastAnalyticsSalesInPostgres(input: {
     sum.guests += numberValue(record.guestCount)
     return sum
   }, { grossSales: 0, netSales: 0, discounts: 0, voids: 0, refunds: 0, orders: 0, guests: 0 })
-  await query(
+  await withTransaction(async (client) => {
+    await assertToastJobLease(client, input.job)
+    await client.query(
     `INSERT INTO toast_daily_sales (
        organization_id, restaurant_guid, business_date, gross_sales, net_sales,
        discounts, voids, refunds, orders_count, guest_count, analytics_rows, source_revision, updated_at
@@ -885,23 +994,100 @@ export async function upsertToastAnalyticsSalesInPostgres(input: {
       totals.grossSales, totals.netSales, totals.discounts, totals.voids, totals.refunds,
       Math.round(totals.orders), Math.round(totals.guests), input.records.length,
     ],
-  )
+    )
+  })
   return totals
 }
 
-export async function updateToastStandardOrdersCountInPostgres(input: {
+export async function projectToastStandardOrdersInPostgres(input: {
   job: ToastSyncJob
-  count: number
+  orders: unknown[]
+  replaceBusinessDate?: boolean
 }) {
-  await query(
-    `INSERT INTO toast_daily_sales (
-       organization_id, restaurant_guid, business_date, standard_orders_count, updated_at
-     ) VALUES ($1::uuid, $2::uuid, $3::date, $4, now())
-     ON CONFLICT (organization_id, restaurant_guid, business_date) DO UPDATE SET
-       standard_orders_count = EXCLUDED.standard_orders_count,
-       source_revision = toast_daily_sales.source_revision + 1, updated_at = now()`,
-    [input.job.organizationId, input.job.restaurantGuid, input.job.businessDate, input.count],
-  )
+  const projection = projectToastOrders(input.orders)
+  await withTransaction(async (client) => {
+    await assertToastJobLease(client, input.job)
+    for (const order of projection.orders) {
+      await client.query(
+        `INSERT INTO toast_pos_orders (
+           organization_id, restaurant_guid, order_guid, business_date, display_number,
+           source, dining_option, approval_status, payment_status, opened_at, closed_at, paid_at,
+           guest_count, check_count, item_count, gross_sales, net_sales, discounts, tax,
+           service_charges, tips, refunds, tendered, total, cash_tender, card_tender,
+           other_tender, voided, deleted, details, payload_hash, updated_at
+         ) VALUES (
+           $1::uuid, $2::uuid, $3, $4::date, $5, $6, $7, $8, $9, $10::timestamptz,
+           $11::timestamptz, $12::timestamptz, $13, $14, $15, $16, $17, $18, $19, $20,
+           $21, $22, $23, $24, $25, $26, $27, $28, $29, $30::jsonb, $31, now()
+         ) ON CONFLICT (organization_id, restaurant_guid, order_guid) DO UPDATE SET
+           business_date = EXCLUDED.business_date, display_number = EXCLUDED.display_number,
+           source = EXCLUDED.source, dining_option = EXCLUDED.dining_option,
+           approval_status = EXCLUDED.approval_status, payment_status = EXCLUDED.payment_status,
+           opened_at = EXCLUDED.opened_at, closed_at = EXCLUDED.closed_at, paid_at = EXCLUDED.paid_at,
+           guest_count = EXCLUDED.guest_count, check_count = EXCLUDED.check_count,
+           item_count = EXCLUDED.item_count, gross_sales = EXCLUDED.gross_sales,
+           net_sales = EXCLUDED.net_sales, discounts = EXCLUDED.discounts, tax = EXCLUDED.tax,
+           service_charges = EXCLUDED.service_charges, tips = EXCLUDED.tips,
+           refunds = EXCLUDED.refunds, tendered = EXCLUDED.tendered, total = EXCLUDED.total,
+           cash_tender = EXCLUDED.cash_tender, card_tender = EXCLUDED.card_tender,
+           other_tender = EXCLUDED.other_tender, voided = EXCLUDED.voided,
+           deleted = EXCLUDED.deleted, details = EXCLUDED.details,
+           payload_hash = EXCLUDED.payload_hash, updated_at = now()`,
+        [
+          input.job.organizationId, input.job.restaurantGuid, order.orderGuid, input.job.businessDate,
+          order.displayNumber, order.source, order.diningOption, order.approvalStatus, order.paymentStatus,
+          order.openedAt, order.closedAt, order.paidAt, order.guestCount, order.checkCount,
+          order.itemCount, order.grossSales, order.netSales, order.discounts, order.tax,
+          order.serviceCharges, order.tips, order.refunds, order.tendered, order.total,
+          order.cashTender, order.cardTender, order.otherTender, order.voided, order.deleted,
+          JSON.stringify(order.details), order.payloadHash,
+        ],
+      )
+    }
+    if (input.replaceBusinessDate !== false) {
+      await client.query(
+        `DELETE FROM toast_pos_orders
+         WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid AND business_date = $3::date
+           AND NOT (order_guid = ANY($4::text[]))`,
+        [input.job.organizationId, input.job.restaurantGuid, input.job.businessDate, projection.orders.map((order) => order.orderGuid)],
+      )
+    }
+    const totals = projection.totals
+    await client.query(
+      `INSERT INTO toast_daily_sales (
+         organization_id, restaurant_guid, business_date, standard_orders_count,
+         standard_gross_sales, standard_net_sales, standard_discounts, standard_voids,
+         standard_refunds, standard_tax, standard_tips, standard_service_charges,
+         standard_tendered, standard_total, standard_cash, standard_card,
+         standard_other_tender, source_revision, updated_at
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::date, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+         $13, $14, $15, $16, $17, 1, now()
+       ) ON CONFLICT (organization_id, restaurant_guid, business_date) DO UPDATE SET
+         standard_orders_count = EXCLUDED.standard_orders_count,
+         standard_gross_sales = EXCLUDED.standard_gross_sales,
+         standard_net_sales = EXCLUDED.standard_net_sales,
+         standard_discounts = EXCLUDED.standard_discounts,
+         standard_voids = EXCLUDED.standard_voids,
+         standard_refunds = EXCLUDED.standard_refunds,
+         standard_tax = EXCLUDED.standard_tax,
+         standard_tips = EXCLUDED.standard_tips,
+         standard_service_charges = EXCLUDED.standard_service_charges,
+         standard_tendered = EXCLUDED.standard_tendered,
+         standard_total = EXCLUDED.standard_total,
+         standard_cash = EXCLUDED.standard_cash,
+         standard_card = EXCLUDED.standard_card,
+         standard_other_tender = EXCLUDED.standard_other_tender,
+         source_revision = toast_daily_sales.source_revision + 1, updated_at = now()`,
+      [
+        input.job.organizationId, input.job.restaurantGuid, input.job.businessDate,
+        totals.orderCount, totals.grossSales, totals.netSales, totals.discounts, totals.voids,
+        totals.refunds, totals.tax, totals.tips, totals.serviceCharges, totals.tendered,
+        totals.total, totals.cashTender, totals.cardTender, totals.otherTender,
+      ],
+    )
+  })
+  return projection.totals
 }
 
 export async function refreshToastAccountingDraftInPostgres(job: ToastSyncJob) {
@@ -909,9 +1095,17 @@ export async function refreshToastAccountingDraftInPostgres(job: ToastSyncJob) {
     query<{
       gross_sales: string; net_sales: string; discounts: string; voids: string; refunds: string
       orders_count: number; standard_orders_count: number
+      standard_gross_sales: string; standard_net_sales: string; standard_discounts: string
+      standard_voids: string; standard_refunds: string; standard_tax: string; standard_tips: string
+      standard_service_charges: string; standard_tendered: string; standard_total: string
+      standard_cash: string; standard_card: string; standard_other_tender: string
     }>(
       `SELECT gross_sales::text, net_sales::text, discounts::text, voids::text, refunds::text,
-         orders_count, standard_orders_count
+         orders_count, standard_orders_count,
+         standard_gross_sales::text, standard_net_sales::text, standard_discounts::text,
+         standard_voids::text, standard_refunds::text, standard_tax::text, standard_tips::text,
+         standard_service_charges::text, standard_tendered::text, standard_total::text,
+         standard_cash::text, standard_card::text, standard_other_tender::text
        FROM toast_daily_sales
        WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid AND business_date = $3::date`,
       [job.organizationId, job.restaurantGuid, job.businessDate],
@@ -933,15 +1127,29 @@ export async function refreshToastAccountingDraftInPostgres(job: ToastSyncJob) {
   const succeeded = new Set(jobsResult.rows.filter((row) => row.status === 'succeeded').map((row) => row.sync_kind))
   const analyticsReady = succeeded.has('analytics_sales')
   const ordersReady = succeeded.has('standard_orders')
+  const analyticsNet = Number(sales.net_sales)
+  const standardNet = Number(sales.standard_net_sales)
+  const variance = analyticsReady && ordersReady ? Math.abs(analyticsNet - standardNet) : 0
+  const varianceTolerance = Math.max(1, Math.abs(analyticsNet) * 0.005)
   const reconciliationStatus = analyticsReady && ordersReady
-    ? 'ready'
+    ? variance > varianceTolerance ? 'variance' : 'ready'
     : analyticsReady ? 'analytics_only' : ordersReady ? 'orders_only' : 'pending'
   const mappings = new Map(mappingsResult.rows.map((row) => [row.mapping_key, row]))
+  const grossSales = analyticsReady ? Number(sales.gross_sales) : Number(sales.standard_gross_sales)
+  const discounts = analyticsReady ? Number(sales.discounts) : Number(sales.standard_discounts)
+  const voids = analyticsReady ? Number(sales.voids) : Number(sales.standard_voids)
+  const refunds = analyticsReady ? Number(sales.refunds) : Number(sales.standard_refunds)
   const lines = [
-    ['gross_sales', Number(sales.gross_sales), 'credit'],
-    ['discounts', Number(sales.discounts), 'debit'],
-    ['voids', Number(sales.voids), 'debit'],
-    ['refunds', Number(sales.refunds), 'debit'],
+    ['gross_sales', grossSales, 'credit'],
+    ['discounts', discounts, 'debit'],
+    ['voids', voids, 'debit'],
+    ['refunds', refunds, 'debit'],
+    ['taxes', ordersReady ? Number(sales.standard_tax) : 0, 'credit'],
+    ['tips', ordersReady ? Number(sales.standard_tips) : 0, 'credit'],
+    ['service_charges', ordersReady ? Number(sales.standard_service_charges) : 0, 'credit'],
+    ['cash', ordersReady ? Number(sales.standard_cash) : 0, 'debit'],
+    ['card', ordersReady ? Number(sales.standard_card) : 0, 'debit'],
+    ['other_tender', ordersReady ? Number(sales.standard_other_tender) : 0, 'debit'],
   ].filter(([, amount]) => Number(amount) !== 0).map(([key, amount, direction]) => ({
     key,
     amount,
@@ -950,7 +1158,7 @@ export async function refreshToastAccountingDraftInPostgres(job: ToastSyncJob) {
     quickbooksAccountName: mappings.get(String(key))?.quickbooks_account_name || null,
   }))
   const allMapped = lines.length > 0 && lines.every((line) => line.quickbooksAccountId)
-  const status = allMapped && reconciliationStatus === 'ready' ? 'needs_review' : 'needs_mapping'
+  const status = 'needs_mapping'
   const idempotencyKey = crypto.createHash('sha256')
     .update(`clawpilot:toast-accounting:v1:${job.organizationId}:${job.restaurantGuid}:${job.businessDate}`)
     .digest('hex')
@@ -964,10 +1172,22 @@ export async function refreshToastAccountingDraftInPostgres(job: ToastSyncJob) {
          WHEN toast_accounting_export_drafts.status IN ('approved', 'posting', 'posted') THEN toast_accounting_export_drafts.status
          ELSE EXCLUDED.status
        END,
-       reconciliation_status = EXCLUDED.reconciliation_status,
-       source_summary = EXCLUDED.source_summary,
-       proposed_lines = EXCLUDED.proposed_lines,
-       updated_at = now()`,
+       reconciliation_status = CASE
+         WHEN toast_accounting_export_drafts.status IN ('approved', 'posting', 'posted') THEN toast_accounting_export_drafts.reconciliation_status
+         ELSE EXCLUDED.reconciliation_status
+       END,
+       source_summary = CASE
+         WHEN toast_accounting_export_drafts.status IN ('approved', 'posting', 'posted') THEN toast_accounting_export_drafts.source_summary
+         ELSE EXCLUDED.source_summary
+       END,
+       proposed_lines = CASE
+         WHEN toast_accounting_export_drafts.status IN ('approved', 'posting', 'posted') THEN toast_accounting_export_drafts.proposed_lines
+         ELSE EXCLUDED.proposed_lines
+       END,
+       updated_at = CASE
+         WHEN toast_accounting_export_drafts.status IN ('approved', 'posting', 'posted') THEN toast_accounting_export_drafts.updated_at
+         ELSE now()
+       END`,
     [
       job.organizationId, job.restaurantGuid, job.businessDate, idempotencyKey, status, reconciliationStatus,
       JSON.stringify({
@@ -975,6 +1195,19 @@ export async function refreshToastAccountingDraftInPostgres(job: ToastSyncJob) {
         discounts: Number(sales.discounts), voids: Number(sales.voids), refunds: Number(sales.refunds),
         analyticsOrders: sales.orders_count, standardOrders: sales.standard_orders_count,
         analyticsReady, standardOrdersReady: ordersReady,
+        legacyMappingsComplete: allMapped,
+        canonicalReadinessVerified: false,
+        canonicalReadinessReason: 'Use the canonical POS accounting preview to validate mappings, allocation, holds, and open checks.',
+        standard: {
+          grossSales: Number(sales.standard_gross_sales), netSales: standardNet,
+          discounts: Number(sales.standard_discounts), voids: Number(sales.standard_voids),
+          refunds: Number(sales.standard_refunds), tax: Number(sales.standard_tax),
+          tips: Number(sales.standard_tips), serviceCharges: Number(sales.standard_service_charges),
+          tendered: Number(sales.standard_tendered), total: Number(sales.standard_total),
+          cash: Number(sales.standard_cash), card: Number(sales.standard_card),
+          otherTender: Number(sales.standard_other_tender),
+        },
+        variance: { netSales: variance, tolerance: varianceTolerance },
       }),
       JSON.stringify(lines),
     ],

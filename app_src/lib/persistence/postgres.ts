@@ -33,6 +33,13 @@ export async function query<T extends QueryResultRow = QueryResultRow>(
   return getPostgresPool().query<T>(text, values)
 }
 
+export async function acquireTransactionAdvisoryLock(client: PoolClient, key: string) {
+  await client.query(
+    'SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))',
+    [key],
+  )
+}
+
 export async function withTransaction<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
   const client = await getPostgresPool().connect()
   try {

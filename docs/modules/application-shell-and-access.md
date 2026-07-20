@@ -17,7 +17,7 @@ Provide a responsive, authenticated ClawPilot workspace with clear user identity
 
 ## Current Contract
 
-- Dashboard, Docs, Projects, Pipeline, CRM, Links, Agents, and Versions are authenticated workspace surfaces. Dashboard links open the corresponding record or module rather than acting as static summaries.
+- Dashboard, Docs, Projects, Pipeline, CRM, Accounting, POS, Links, Agents, and Versions are authenticated workspace surfaces. Dashboard links open the corresponding record or module rather than acting as static summaries.
 - The dashboard board and pipeline selectors are independent per-user defaults. Selecting either resource persists it for the signed-in user, refreshes only the scoped dashboard data, and does not reload the full application.
 - Dashboard project-board status counts request the selected board explicitly and include CRM-projected cards. Operational task and agent metrics continue to exclude CRM reference cards.
 - The pipeline selector loads the selected pipeline explicitly and presents its opportunity, organization, contact, and open-value summary alongside the selected project board.

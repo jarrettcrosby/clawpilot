@@ -11,6 +11,7 @@ import { crmDateOnly } from '@/lib/crm/dateOnly.mjs'
 import type {
   CrmContact,
   CrmCampaign,
+  CrmCampaignRecipient,
   CrmEntity,
   CrmInteraction,
   CrmLead,
@@ -47,6 +48,10 @@ const ENTITY_TABLE: Record<CrmEntity, string> = {
   meetings: 'crm_meetings',
   interactions: 'crm_interactions',
   campaigns: 'crm_campaigns',
+}
+
+function activeCrmRecordSql(alias: string) {
+  return `COALESCE(lower(${alias}.source_payload->>'archived'), 'false') NOT IN ('true', '1', 'yes')`
 }
 
 type CommonStageInput = {
@@ -1726,6 +1731,381 @@ async function lockCrmMutation(client: PoolClient, key: string) {
   await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [key])
 }
 
+export async function archiveCrmRecordInPostgres(input: {
+  pipelineId: string
+  entity: 'leads' | 'campaigns'
+  id: string
+  actorEmail: string
+}) {
+  return withTransaction(async (client) => {
+    const table = ENTITY_TABLE[input.entity]
+    await lockCrmMutation(client, `crm-archive:${input.pipelineId}:${input.entity}:${input.id}`)
+    const selected = await client.query<{
+      id: string
+      reference_code: string
+      suitecrm_id: string | null
+      source_payload: Record<string, unknown> | null
+    }>(
+      `SELECT id::text, reference_code, suitecrm_id, source_payload
+       FROM ${table}
+       WHERE pipeline_id = $1::uuid AND id = $2::uuid
+       FOR UPDATE`,
+      [input.pipelineId, input.id],
+    )
+    const record = selected.rows[0]
+    if (!record) throw new Error('CRM record not found')
+    const sourcePayload = record.source_payload && typeof record.source_payload === 'object'
+      ? record.source_payload
+      : {}
+    if (sourcePayload.archived === true) {
+      return { archived: true, changed: false, referenceCode: record.reference_code }
+    }
+
+    const archivedAt = new Date().toISOString()
+    await client.query(
+      `UPDATE ${table}
+       SET source_payload = source_payload || $3::jsonb,
+         updated_by = $4, updated_at = now()
+       WHERE pipeline_id = $1::uuid AND id = $2::uuid`,
+      [
+        input.pipelineId,
+        input.id,
+        JSON.stringify({ archived: true, archivedAt, archivedBy: input.actorEmail }),
+        input.actorEmail,
+      ],
+    )
+    await client.query(
+      `DELETE FROM sync_outbox
+       WHERE target_system = 'suitecrm'
+         AND aggregate_type = $1
+         AND aggregate_id = $2
+         AND operation = 'upsert_record'
+         AND status <> 'processing'`,
+      [`crm_${input.entity}`, input.id],
+    )
+    if (record.suitecrm_id) {
+      await client.query(
+        `INSERT INTO sync_outbox (
+           aggregate_type, aggregate_id, operation, target_system, payload,
+           status, idempotency_key, attempts, created_at, available_at, updated_at
+         )
+         VALUES ($1, $2, 'delete_record', 'suitecrm', $3::jsonb,
+           'queued', $4, 0, now(), now(), now())
+         ON CONFLICT (target_system, idempotency_key)
+         WHERE idempotency_key IS NOT NULL
+         DO UPDATE SET
+           payload = EXCLUDED.payload,
+           status = CASE WHEN sync_outbox.status = 'processing' THEN sync_outbox.status ELSE 'queued' END,
+           attempts = CASE WHEN sync_outbox.status = 'processing' THEN sync_outbox.attempts ELSE 0 END,
+           last_error = CASE WHEN sync_outbox.status = 'processing' THEN sync_outbox.last_error ELSE NULL END,
+           available_at = CASE WHEN sync_outbox.status = 'processing' THEN sync_outbox.available_at ELSE now() END,
+           processed_at = CASE WHEN sync_outbox.status = 'processing' THEN sync_outbox.processed_at ELSE NULL END,
+           updated_at = now()`,
+        [
+          `crm_${input.entity}`,
+          input.id,
+          JSON.stringify({
+            entity: input.entity,
+            pipelineId: input.pipelineId,
+            localId: input.id,
+            suiteCrmId: record.suitecrm_id,
+            attributes: {},
+          }),
+          `crm-archive:${input.entity}:${input.id}`,
+        ],
+      )
+    }
+    await client.query(
+      `UPDATE short_links
+       SET deleted_at = COALESCE(deleted_at, now()), disabled_at = COALESCE(disabled_at, now()), updated_at = now()
+       WHERE source_app = 'clawpilot-crm'
+         AND slug = ANY($1::text[])
+         AND deleted_at IS NULL`,
+      [[record.reference_code, `mail-${record.reference_code}`]],
+    )
+    await recordAuditEvent({
+      actor: input.actorEmail,
+      eventType: 'crm.record.archived',
+      aggregateType: `crm_${input.entity}`,
+      aggregateId: input.id,
+      eventKey: `crm-archive:${input.entity}:${input.id}`,
+      payload: {
+        pipelineId: input.pipelineId,
+        referenceCode: record.reference_code,
+        archivedAt,
+        suiteCrmDeleteQueued: Boolean(record.suitecrm_id),
+        message: `${record.reference_code} archived`,
+      },
+    }, client)
+    return { archived: true, changed: true, referenceCode: record.reference_code }
+  })
+}
+
+export async function convertCrmLeadInPostgres(input: {
+  pipelineId: string
+  leadId: string
+  actorEmail: string
+  customerParentId: string
+  customerParentSuiteCrmId: string
+  accountName?: string
+  opportunityName?: string
+  opportunityValue?: number
+}) {
+  return withTransaction(async (client) => {
+    await lockCrmMutation(client, `crm-lead-convert:${input.pipelineId}:${input.leadId}`)
+    const selected = await client.query<Record<string, unknown>>(
+      `SELECT lead.*, organization.name AS organization_name,
+         organization.suitecrm_id AS organization_suitecrm_id
+       FROM crm_leads lead
+       LEFT JOIN crm_organizations organization
+         ON organization.pipeline_id = lead.pipeline_id
+        AND organization.id = lead.organization_id
+       WHERE lead.pipeline_id = $1::uuid AND lead.id = $2::uuid
+         AND ${activeCrmRecordSql('lead')}
+       FOR UPDATE OF lead`,
+      [input.pipelineId, input.leadId],
+    )
+    const lead = selected.rows[0]
+    if (!lead) throw new Error('CRM lead not found')
+    const convertedContactId = nullable(lead.converted_contact_id)
+    const convertedOpportunityId = nullable(lead.converted_opportunity_id)
+    if (Boolean(convertedContactId) !== Boolean(convertedOpportunityId)) {
+      throw new Error('CRM lead conversion state is incomplete')
+    }
+    if (convertedContactId && convertedOpportunityId) {
+      const existing = await client.query<{
+        contact_reference_code: string
+        opportunity_reference_code: string
+        organization_reference_code: string
+      }>(
+        `SELECT contact.reference_code AS contact_reference_code,
+           opportunity.reference_code AS opportunity_reference_code,
+           organization.reference_code AS organization_reference_code
+         FROM crm_contacts contact
+         JOIN crm_opportunities opportunity
+           ON opportunity.pipeline_id = contact.pipeline_id
+          AND opportunity.id = $3::uuid
+         JOIN crm_organizations organization
+           ON organization.pipeline_id = contact.pipeline_id
+          AND organization.id = contact.organization_id
+         WHERE contact.pipeline_id = $1::uuid AND contact.id = $2::uuid
+         LIMIT 1`,
+        [input.pipelineId, convertedContactId, convertedOpportunityId],
+      )
+      if (!existing.rows[0]) throw new Error('CRM lead conversion relationships were not found')
+      return {
+        created: false,
+        leadReferenceCode: clean(lead.reference_code),
+        accountReferenceCode: existing.rows[0].organization_reference_code,
+        contactReferenceCode: existing.rows[0].contact_reference_code,
+        opportunityReferenceCode: existing.rows[0].opportunity_reference_code,
+      }
+    }
+
+    const fullName = clean(lead.full_name)
+    const nameParts = fullName.split(/\s+/).filter(Boolean)
+    const firstName = clean(lead.first_name) || nameParts[0] || fullName
+    const lastName = clean(lead.last_name) || nameParts.slice(1).join(' ')
+    const companyName = clean(input.accountName) || clean(lead.company_name) || `${fullName} Account`
+    const owner = clean(lead.assigned_to)
+    const sourcePayload = lead.source_payload && typeof lead.source_payload === 'object' && !Array.isArray(lead.source_payload)
+      ? lead.source_payload as Record<string, unknown>
+      : {}
+
+    let organization = {
+      id: nullable(lead.organization_id),
+      suiteCrmId: nullable(lead.organization_suitecrm_id),
+      referenceCode: '',
+      name: clean(lead.organization_name),
+    }
+    let accountCreated = false
+    if (organization.id) {
+      const existingOrganization = await client.query<{ reference_code: string }>(
+        `SELECT reference_code FROM crm_organizations
+         WHERE pipeline_id = $1::uuid AND id = $2::uuid LIMIT 1`,
+        [input.pipelineId, organization.id],
+      )
+      organization.referenceCode = existingOrganization.rows[0]?.reference_code || ''
+    } else {
+      const stagedOrganization = await stageCrmRecordWithClient(client, {
+        entity: 'organizations',
+        pipelineId: input.pipelineId,
+        sourceKey: `lead-conversion:${input.leadId}:organization`,
+        actorEmail: input.actorEmail,
+        sourcePayload: { source: 'clawpilot_lead_conversion', leadId: input.leadId },
+        fields: {
+          parentOrganizationId: input.customerParentId,
+          parentOrganizationSuiteCrmId: input.customerParentSuiteCrmId,
+          relationshipType: 'customer',
+          name: companyName,
+          accountManager: owner,
+          description: clean(lead.description),
+        },
+      })
+      organization = {
+        id: stagedOrganization.id,
+        suiteCrmId: stagedOrganization.suiteCrmId,
+        referenceCode: stagedOrganization.referenceCode,
+        name: companyName,
+      }
+      accountCreated = true
+    }
+    if (!organization.id || !organization.suiteCrmId) throw new Error('CRM lead account could not be resolved')
+
+    const contact = await stageCrmRecordWithClient(client, {
+      entity: 'contacts',
+      pipelineId: input.pipelineId,
+      sourceKey: `lead-conversion:${input.leadId}:contact`,
+      actorEmail: input.actorEmail,
+      sourcePayload: { source: 'clawpilot_lead_conversion', leadId: input.leadId },
+      fields: {
+        organizationId: organization.id,
+        organizationSuiteCrmId: organization.suiteCrmId,
+        firstName,
+        lastName,
+        fullName,
+        accountManager: owner,
+        jobTitle: clean(lead.job_title),
+        email: clean(lead.email),
+        phoneWork: clean(lead.phone_work),
+        phoneMobile: clean(lead.phone_mobile),
+        description: clean(lead.description),
+        emailOptOut: lead.email_opt_out === true,
+      },
+    })
+    const opportunityName = clean(input.opportunityName) || `${organization.name || companyName} - ${fullName}`
+    const opportunity = await stageCrmRecordWithClient(client, {
+      entity: 'opportunities',
+      pipelineId: input.pipelineId,
+      sourceKey: `lead-conversion:${input.leadId}:opportunity`,
+      actorEmail: input.actorEmail,
+      sourcePayload: { source: 'clawpilot_lead_conversion', leadId: input.leadId },
+      fields: {
+        organizationId: organization.id,
+        organizationSuiteCrmId: organization.suiteCrmId,
+        contactIds: [contact.id],
+        name: opportunityName,
+        organization: organization.name || companyName,
+        owner,
+        status: 'Open',
+        stage: 'Identified Lead',
+        source: clean(lead.lead_source),
+        value: Math.max(0, finite(input.opportunityValue)),
+        probability: 10,
+        notes: clean(lead.description),
+      },
+    })
+    const convertedAt = new Date().toISOString()
+    await stageCrmRecordWithClient(client, {
+      entity: 'leads',
+      pipelineId: input.pipelineId,
+      localId: input.leadId,
+      sourceKey: clean(lead.source_key),
+      actorEmail: input.actorEmail,
+      sourcePayload: {
+        ...sourcePayload,
+        source: clean(sourcePayload.source) || 'clawpilot',
+        convertedAt,
+        convertedBy: input.actorEmail,
+        conversion: {
+          organizationId: organization.id,
+          contactId: contact.id,
+          opportunityId: opportunity.id,
+        },
+      },
+      fields: {
+        organizationId: organization.id,
+        organizationSuiteCrmId: organization.suiteCrmId,
+        convertedContactId: contact.id,
+        convertedOpportunityId: opportunity.id,
+        firstName,
+        lastName,
+        fullName,
+        companyName,
+        jobTitle: clean(lead.job_title),
+        email: clean(lead.email),
+        phoneWork: clean(lead.phone_work),
+        phoneMobile: clean(lead.phone_mobile),
+        status: 'Converted',
+        source: clean(lead.lead_source),
+        assignedTo: owner,
+        description: clean(lead.description),
+        emailOptOut: lead.email_opt_out === true,
+      },
+    })
+    const meetings = await client.query(
+      `UPDATE crm_meetings
+       SET organization_id = COALESCE(organization_id, $3::uuid),
+         contact_id = COALESCE(contact_id, $4::uuid),
+         opportunity_id = COALESCE(opportunity_id, $5::uuid), updated_at = now()
+       WHERE pipeline_id = $1::uuid AND lead_id = $2::uuid`,
+      [input.pipelineId, input.leadId, organization.id, contact.id, opportunity.id],
+    )
+    const interactions = await client.query(
+      `UPDATE crm_interactions
+       SET organization_id = COALESCE(organization_id, $3::uuid),
+         contact_id = COALESCE(contact_id, $4::uuid),
+         opportunity_id = COALESCE(opportunity_id, $5::uuid), updated_at = now()
+       WHERE pipeline_id = $1::uuid AND lead_id = $2::uuid`,
+      [input.pipelineId, input.leadId, organization.id, contact.id, opportunity.id],
+    )
+    const activity = await stageCrmRecordWithClient(client, {
+      entity: 'interactions',
+      pipelineId: input.pipelineId,
+      sourceKey: `lead-conversion:${input.leadId}:activity`,
+      actorEmail: input.actorEmail,
+      sourcePayload: { source: 'clawpilot_lead_conversion', leadId: input.leadId },
+      fields: {
+        organizationId: organization.id,
+        contactId: contact.id,
+        leadId: input.leadId,
+        opportunityId: opportunity.id,
+        parentSuiteCrmId: opportunity.suiteCrmId,
+        parentSuiteCrmType: 'Opportunities',
+        interactionType: 'note',
+        subject: `Lead converted: ${fullName}`,
+        agentEmail: input.actorEmail,
+        agentName: input.actorEmail,
+        occurredAt: convertedAt,
+        description: `Converted to ${organization.referenceCode}, ${contact.referenceCode}, and ${opportunity.referenceCode}.`,
+        direction: 'internal',
+        deliveryStatus: 'logged',
+      },
+    })
+    await recordAuditEvent({
+      actor: input.actorEmail,
+      eventType: 'crm.lead.converted',
+      aggregateType: 'crm_leads',
+      aggregateId: input.leadId,
+      eventKey: `crm-lead-convert:${input.leadId}`,
+      payload: {
+        pipelineId: input.pipelineId,
+        leadReferenceCode: clean(lead.reference_code),
+        organizationId: organization.id,
+        organizationReferenceCode: organization.referenceCode,
+        contactId: contact.id,
+        contactReferenceCode: contact.referenceCode,
+        opportunityId: opportunity.id,
+        opportunityReferenceCode: opportunity.referenceCode,
+        owner,
+        activityId: activity.id,
+        relatedMeetingsUpdated: meetings.rowCount || 0,
+        relatedInteractionsUpdated: interactions.rowCount || 0,
+        message: `${fullName} converted to an account, contact, and opportunity`,
+      },
+    }, client)
+    return {
+      created: true,
+      accountCreated,
+      leadReferenceCode: clean(lead.reference_code),
+      accountReferenceCode: organization.referenceCode,
+      contactReferenceCode: contact.referenceCode,
+      opportunityReferenceCode: opportunity.referenceCode,
+      activityReferenceCode: activity.referenceCode,
+    }
+  })
+}
+
 export async function createCrmOpportunityInPostgres(input: StageOpportunityInput): Promise<{
   opportunity: CrmOpportunity
   created: boolean
@@ -2474,9 +2854,12 @@ function interactionFromRow(row: Record<string, unknown>): CrmInteraction {
   return {
     id: String(row.id), referenceCode: clean(row.reference_code), shortUrl: crmReferenceShortUrl(row.reference_code),
     pipelineId: String(row.pipeline_id), organizationId: nullable(row.organization_id), organizationName: clean(row.organization_name),
-    contactId: nullable(row.contact_id),
-    opportunityId: nullable(row.opportunity_id), leadId: nullable(row.lead_id), meetingId: nullable(row.meeting_id),
-    campaignId: nullable(row.campaign_id), suiteCrmId: nullable(row.suitecrm_id), sourceKey: String(row.source_key),
+    contactId: nullable(row.contact_id), contactName: clean(row.contact_name),
+    opportunityId: nullable(row.opportunity_id), opportunityName: clean(row.opportunity_name),
+    leadId: nullable(row.lead_id), leadName: clean(row.lead_name),
+    meetingId: nullable(row.meeting_id), meetingName: clean(row.meeting_name),
+    campaignId: nullable(row.campaign_id), campaignName: clean(row.campaign_name),
+    suiteCrmId: nullable(row.suitecrm_id), sourceKey: String(row.source_key),
     sourceRowNumber: row.source_row_number === null ? null : Number(row.source_row_number), interactionType: clean(row.interaction_type),
     subject: clean(row.subject), agentEmail: nullable(row.agent_email), agentName: clean(row.agent_name),
     occurredAt: row.occurred_at ? String(row.occurred_at) : null,
@@ -2491,7 +2874,13 @@ function leadFromRow(row: Record<string, unknown>): CrmLead {
   return {
     id: String(row.id), referenceCode: clean(row.reference_code), shortUrl: crmReferenceShortUrl(row.reference_code),
     pipelineId: String(row.pipeline_id), organizationId: nullable(row.organization_id), organizationName: clean(row.organization_name),
-    convertedContactId: nullable(row.converted_contact_id), convertedOpportunityId: nullable(row.converted_opportunity_id),
+    organizationReferenceCode: nullable(row.organization_reference_code),
+    convertedContactId: nullable(row.converted_contact_id),
+    convertedContactReferenceCode: nullable(row.converted_contact_reference_code),
+    convertedContactName: clean(row.converted_contact_name),
+    convertedOpportunityId: nullable(row.converted_opportunity_id),
+    convertedOpportunityReferenceCode: nullable(row.converted_opportunity_reference_code),
+    convertedOpportunityName: clean(row.converted_opportunity_name),
     suiteCrmId: nullable(row.suitecrm_id), sourceKey: String(row.source_key), firstName: clean(row.first_name),
     lastName: clean(row.last_name), fullName: clean(row.full_name), companyName: clean(row.company_name),
     jobTitle: clean(row.job_title), email: clean(row.email), phoneWork: clean(row.phone_work), phoneMobile: clean(row.phone_mobile),
@@ -2530,12 +2919,24 @@ function campaignFromRow(row: Record<string, unknown>): CrmCampaign {
   }
 }
 
+function campaignRecipientFromRow(row: Record<string, unknown>): CrmCampaignRecipient {
+  return {
+    id: String(row.id), campaignId: String(row.campaign_id), contactId: nullable(row.contact_id),
+    leadId: nullable(row.lead_id), referenceCode: clean(row.reference_code), name: clean(row.record_name),
+    email: clean(row.email), status: row.status as CrmCampaignRecipient['status'],
+    sentAt: row.sent_at ? String(row.sent_at) : null, lastError: nullable(row.last_error),
+    updatedAt: String(row.updated_at),
+  }
+}
+
 export async function listCrmRecordsInPostgres(input: {
   pipelineId: string
   entity: CrmEntity
   query?: string
   limit?: number
   needsReview?: boolean
+  relatedEntity?: Exclude<CrmEntity, 'interactions' | 'products'>
+  relatedId?: string
 }): Promise<CrmRecord[]> {
   const search = clean(input.query).slice(0, 200)
   const limit = Math.max(1, Math.min(Math.trunc(Number(input.limit) || 250), 1000))
@@ -2583,12 +2984,27 @@ export async function listCrmRecordsInPostgres(input: {
   }
   if (input.entity === 'leads') {
     const result = await query<Record<string, unknown>>(
-      `SELECT lead.*, organization.name AS organization_name
+      `SELECT lead.*, organization.name AS organization_name,
+         organization.reference_code AS organization_reference_code,
+         converted_contact.reference_code AS converted_contact_reference_code,
+         converted_contact.full_name AS converted_contact_name,
+         converted_opportunity.reference_code AS converted_opportunity_reference_code,
+         converted_opportunity.name AS converted_opportunity_name
        FROM crm_leads lead
        LEFT JOIN crm_organizations organization ON organization.id = lead.organization_id
+       LEFT JOIN crm_contacts converted_contact
+         ON converted_contact.pipeline_id = lead.pipeline_id
+        AND converted_contact.id = lead.converted_contact_id
+       LEFT JOIN crm_opportunities converted_opportunity
+         ON converted_opportunity.pipeline_id = lead.pipeline_id
+        AND converted_opportunity.id = lead.converted_opportunity_id
        WHERE lead.pipeline_id = $1::uuid
+         AND ${activeCrmRecordSql('lead')}
          AND ($2 = '' OR lead.reference_code ILIKE '%' || $2 || '%' OR lead.full_name ILIKE '%' || $2 || '%'
-           OR lead.email ILIKE '%' || $2 || '%' OR lead.company_name ILIKE '%' || $2 || '%' OR organization.name ILIKE '%' || $2 || '%')
+           OR lead.email ILIKE '%' || $2 || '%' OR lead.company_name ILIKE '%' || $2 || '%'
+           OR lead.status ILIKE '%' || $2 || '%' OR lead.lead_source ILIKE '%' || $2 || '%'
+           OR lead.assigned_to ILIKE '%' || $2 || '%' OR lead.phone_work ILIKE '%' || $2 || '%'
+           OR lead.phone_mobile ILIKE '%' || $2 || '%' OR organization.name ILIKE '%' || $2 || '%')
        ORDER BY lead.updated_at DESC, lead.id LIMIT $3`,
       [input.pipelineId, search, limit],
     )
@@ -2629,10 +3045,14 @@ export async function listCrmRecordsInPostgres(input: {
   }
   if (input.entity === 'campaigns') {
     const result = await query<Record<string, unknown>>(
-      `SELECT * FROM crm_campaigns
-       WHERE pipeline_id = $1::uuid
-         AND ($2 = '' OR reference_code ILIKE '%' || $2 || '%' OR name ILIKE '%' || $2 || '%' OR description ILIKE '%' || $2 || '%')
-       ORDER BY updated_at DESC, id LIMIT $3`,
+      `SELECT campaign.* FROM crm_campaigns campaign
+       WHERE campaign.pipeline_id = $1::uuid
+         AND ${activeCrmRecordSql('campaign')}
+         AND ($2 = '' OR campaign.reference_code ILIKE '%' || $2 || '%'
+           OR campaign.name ILIKE '%' || $2 || '%' OR campaign.description ILIKE '%' || $2 || '%'
+           OR campaign.status ILIKE '%' || $2 || '%' OR campaign.subject_template ILIKE '%' || $2 || '%'
+           OR campaign.sender_email ILIKE '%' || $2 || '%')
+       ORDER BY campaign.updated_at DESC, campaign.id LIMIT $3`,
       [input.pipelineId, search, limit],
     )
     return result.rows.map(campaignFromRow)
@@ -2641,29 +3061,81 @@ export async function listCrmRecordsInPostgres(input: {
     `SELECT interaction.*,
        COALESCE(interaction.organization_id, contact.organization_id, lead.organization_id,
          opportunity.organization_id, meeting.organization_id) AS organization_id,
-       organization.name AS organization_name
+       organization.name AS organization_name, contact.full_name AS contact_name,
+       lead.full_name AS lead_name, opportunity.name AS opportunity_name,
+       meeting.subject AS meeting_name, campaign.name AS campaign_name
      FROM crm_interactions interaction
      LEFT JOIN crm_contacts contact ON contact.id = interaction.contact_id
      LEFT JOIN crm_leads lead ON lead.id = interaction.lead_id
      LEFT JOIN crm_opportunities opportunity ON opportunity.id = interaction.opportunity_id
      LEFT JOIN crm_meetings meeting ON meeting.id = interaction.meeting_id
+     LEFT JOIN crm_campaigns campaign ON campaign.id = interaction.campaign_id
      LEFT JOIN crm_organizations organization ON organization.id = COALESCE(
        interaction.organization_id, contact.organization_id, lead.organization_id,
        opportunity.organization_id, meeting.organization_id
      )
      WHERE interaction.pipeline_id = $1::uuid
        AND (NOT $3::boolean OR COALESCE(
-         interaction.organization_id, contact.organization_id, lead.organization_id,
-         opportunity.organization_id, meeting.organization_id
+       interaction.organization_id, contact.organization_id, lead.organization_id,
+       opportunity.organization_id, meeting.organization_id
        ) IS NULL)
+       AND ($5 = '' OR CASE $5
+         WHEN 'organizations' THEN COALESCE(
+           interaction.organization_id, contact.organization_id, lead.organization_id,
+           opportunity.organization_id, meeting.organization_id
+         ) = $6::uuid
+         WHEN 'contacts' THEN interaction.contact_id = $6::uuid
+         WHEN 'leads' THEN interaction.lead_id = $6::uuid
+         WHEN 'opportunities' THEN interaction.opportunity_id = $6::uuid
+         WHEN 'meetings' THEN interaction.meeting_id = $6::uuid
+         WHEN 'campaigns' THEN interaction.campaign_id = $6::uuid
+         ELSE false
+       END)
        AND ($2 = '' OR interaction.reference_code ILIKE '%' || $2 || '%'
          OR interaction.subject ILIKE '%' || $2 || '%'
          OR interaction.description ILIKE '%' || $2 || '%'
-         OR organization.name ILIKE '%' || $2 || '%')
+         OR organization.name ILIKE '%' || $2 || '%' OR contact.full_name ILIKE '%' || $2 || '%'
+         OR lead.full_name ILIKE '%' || $2 || '%' OR opportunity.name ILIKE '%' || $2 || '%'
+         OR meeting.subject ILIKE '%' || $2 || '%' OR campaign.name ILIKE '%' || $2 || '%'
+         OR contact.reference_code ILIKE '%' || $2 || '%' OR lead.reference_code ILIKE '%' || $2 || '%'
+         OR opportunity.reference_code ILIKE '%' || $2 || '%' OR meeting.reference_code ILIKE '%' || $2 || '%'
+         OR campaign.reference_code ILIKE '%' || $2 || '%')
      ORDER BY interaction.occurred_at DESC NULLS LAST, interaction.updated_at DESC, interaction.id LIMIT $4`,
-    [input.pipelineId, search, input.needsReview === true, limit],
+    [input.pipelineId, search, input.needsReview === true, limit, input.relatedEntity || '', input.relatedId || null],
   )
   return result.rows.map(interactionFromRow)
+}
+
+export async function listCrmCampaignRecipientsInPostgres(input: {
+  pipelineId: string
+  campaignId: string
+  limit?: number
+}): Promise<CrmCampaignRecipient[]> {
+  const limit = Math.max(1, Math.min(Math.trunc(Number(input.limit) || 500), 500))
+  const result = await query<Record<string, unknown>>(
+    `SELECT recipient.id::text, recipient.campaign_id::text, recipient.contact_id::text,
+       recipient.lead_id::text, recipient.email, recipient.status, recipient.sent_at,
+       recipient.last_error, recipient.updated_at,
+       COALESCE(contact.reference_code, lead.reference_code, '') AS reference_code,
+       COALESCE(contact.full_name, lead.full_name, recipient.email) AS record_name
+     FROM crm_campaign_recipients recipient
+     JOIN crm_campaigns campaign
+       ON campaign.pipeline_id = recipient.pipeline_id
+      AND campaign.id = recipient.campaign_id
+     LEFT JOIN crm_contacts contact
+       ON contact.pipeline_id = recipient.pipeline_id
+      AND contact.id = recipient.contact_id
+     LEFT JOIN crm_leads lead
+       ON lead.pipeline_id = recipient.pipeline_id
+      AND lead.id = recipient.lead_id
+     WHERE recipient.pipeline_id = $1::uuid
+       AND recipient.campaign_id = $2::uuid
+       AND ${activeCrmRecordSql('campaign')}
+     ORDER BY recipient.updated_at DESC, recipient.email, recipient.id
+     LIMIT $3`,
+    [input.pipelineId, input.campaignId, limit],
+  )
+  return result.rows.map(campaignRecipientFromRow)
 }
 
 export async function readCrmOpportunityInPostgres(input: {
@@ -3418,7 +3890,7 @@ export async function readCrmSummaryFromPostgres(pipelineId: string): Promise<Cr
         (SELECT count(*) FROM crm_organizations WHERE pipeline_id = $1::uuid)::text AS organizations,
         (SELECT count(*) FROM crm_contacts WHERE pipeline_id = $1::uuid)::text AS contacts,
         (SELECT count(*) FROM crm_products WHERE pipeline_id = $1::uuid)::text AS products,
-        (SELECT count(*) FROM crm_leads WHERE pipeline_id = $1::uuid)::text AS leads,
+        (SELECT count(*) FROM crm_leads lead WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('lead')})::text AS leads,
         (SELECT count(*) FROM crm_opportunities WHERE pipeline_id = $1::uuid)::text AS opportunities,
         (SELECT count(*) FROM crm_meetings WHERE pipeline_id = $1::uuid)::text AS meetings,
         (SELECT count(*) FROM crm_interactions WHERE pipeline_id = $1::uuid)::text AS interactions,
@@ -3433,28 +3905,28 @@ export async function readCrmSummaryFromPostgres(pipelineId: string): Promise<Cr
              interaction.organization_id, contact.organization_id, lead.organization_id,
              opportunity.organization_id, meeting.organization_id
            ) IS NULL)::text AS needs_review_interactions,
-        (SELECT count(*) FROM crm_campaigns WHERE pipeline_id = $1::uuid)::text AS campaigns,
+        (SELECT count(*) FROM crm_campaigns campaign WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('campaign')})::text AS campaigns,
         (SELECT COALESCE(sum(amount), 0) FROM crm_opportunities WHERE pipeline_id = $1::uuid AND lower(COALESCE(status, '')) NOT IN ('won', 'lost', 'closed', 'abandoned'))::text AS open_pipeline_value,
         (SELECT COALESCE(sum(amount * probability / 100), 0) FROM crm_opportunities WHERE pipeline_id = $1::uuid AND lower(COALESCE(status, '')) NOT IN ('won', 'lost', 'closed', 'abandoned'))::text AS weighted_pipeline_value,
         (SELECT count(*) FROM (
           SELECT sync_status FROM crm_organizations WHERE pipeline_id = $1::uuid
           UNION ALL SELECT sync_status FROM crm_contacts WHERE pipeline_id = $1::uuid
           UNION ALL SELECT sync_status FROM crm_products WHERE pipeline_id = $1::uuid
-          UNION ALL SELECT sync_status FROM crm_leads WHERE pipeline_id = $1::uuid
+          UNION ALL SELECT sync_status FROM crm_leads lead WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('lead')}
           UNION ALL SELECT sync_status FROM crm_opportunities WHERE pipeline_id = $1::uuid
           UNION ALL SELECT sync_status FROM crm_meetings WHERE pipeline_id = $1::uuid
           UNION ALL SELECT sync_status FROM crm_interactions WHERE pipeline_id = $1::uuid
-          UNION ALL SELECT sync_status FROM crm_campaigns WHERE pipeline_id = $1::uuid
+          UNION ALL SELECT sync_status FROM crm_campaigns campaign WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('campaign')}
         ) records WHERE sync_status IN ('pending', 'syncing'))::text AS pending_sync,
         (SELECT count(*) FROM (
           SELECT sync_status FROM crm_organizations WHERE pipeline_id = $1::uuid
           UNION ALL SELECT sync_status FROM crm_contacts WHERE pipeline_id = $1::uuid
           UNION ALL SELECT sync_status FROM crm_products WHERE pipeline_id = $1::uuid
-          UNION ALL SELECT sync_status FROM crm_leads WHERE pipeline_id = $1::uuid
+          UNION ALL SELECT sync_status FROM crm_leads lead WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('lead')}
           UNION ALL SELECT sync_status FROM crm_opportunities WHERE pipeline_id = $1::uuid
           UNION ALL SELECT sync_status FROM crm_meetings WHERE pipeline_id = $1::uuid
           UNION ALL SELECT sync_status FROM crm_interactions WHERE pipeline_id = $1::uuid
-          UNION ALL SELECT sync_status FROM crm_campaigns WHERE pipeline_id = $1::uuid
+          UNION ALL SELECT sync_status FROM crm_campaigns campaign WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('campaign')}
         ) records WHERE sync_status = 'failed')::text AS failed_sync
     `,
     [pipelineId],
@@ -3496,7 +3968,10 @@ export async function readCrmRecordReference(input: {
        COALESCE(to_jsonb(record)->'source_payload', '{}'::jsonb) AS source_payload,
        to_jsonb(record)->>'external_event_id' AS external_event_id,
        COALESCE(to_jsonb(record)->>'status', '') AS record_status
-     FROM ${table} record WHERE pipeline_id = $1::uuid AND id = $2::uuid LIMIT 1`,
+     FROM ${table} record
+     WHERE pipeline_id = $1::uuid AND id = $2::uuid
+       AND ${activeCrmRecordSql('record')}
+     LIMIT 1`,
     [input.pipelineId, input.id],
   )
   const row = result.rows[0]
@@ -3569,7 +4044,7 @@ export async function resolveCrmReferenceRoute(referenceValue: unknown, options:
 } = {}) {
   const referenceCode = await resolveCrmReferenceCode(referenceValue)
   const entity = crmEntityForReferenceCode(referenceCode)
-  if (!entity || !isPostgresStorageEnabled()) return { referenceCode, pipelineId: null }
+  if (!entity || !isPostgresStorageEnabled()) return { referenceCode, pipelineId: null, found: false }
   const actorEmail = clean(options.actorEmail).toLowerCase()
   const requestedPipelineId = /^[0-9a-f-]{36}$/i.test(clean(options.requestedPipelineId))
     ? clean(options.requestedPipelineId)
@@ -3582,6 +4057,7 @@ export async function resolveCrmReferenceRoute(referenceValue: unknown, options:
        LEFT JOIN pipeline_space_members membership
          ON membership.pipeline_id = pipeline.id AND membership.user_email = $2
        WHERE record.reference_code = $1
+         AND ${activeCrmRecordSql('record')}
          AND ($2 = '' OR pipeline.owner_email = $2 OR membership.user_email = $2)
        ORDER BY
          CASE
@@ -3596,9 +4072,10 @@ export async function resolveCrmReferenceRoute(referenceValue: unknown, options:
        LIMIT 1`,
       [referenceCode, actorEmail, requestedPipelineId],
     )
-    return { referenceCode, pipelineId: result.rows[0]?.pipeline_id || null }
+    const pipelineId = result.rows[0]?.pipeline_id || null
+    return { referenceCode, pipelineId, found: Boolean(pipelineId) }
   } catch (error) {
-    if ((error as { code?: string })?.code === '42P01') return { referenceCode, pipelineId: null }
+    if ((error as { code?: string })?.code === '42P01') return { referenceCode, pipelineId: null, found: false }
     throw error
   }
 }
@@ -3612,7 +4089,10 @@ export async function readCrmRecordByReference(input: {
   if (!entity || !/^g[aciklmop][0-9]{7}$/.test(referenceCode)) throw new Error('CRM reference is invalid')
   const table = ENTITY_TABLE[entity]
   const result = await query<{ id: string }>(
-    `SELECT id::text FROM ${table} WHERE pipeline_id = $1::uuid AND reference_code = $2 LIMIT 1`,
+    `SELECT id::text FROM ${table} record
+     WHERE pipeline_id = $1::uuid AND reference_code = $2
+       AND ${activeCrmRecordSql('record')}
+     LIMIT 1`,
     [input.pipelineId, referenceCode],
   )
   if (!result.rows[0]) throw new Error('CRM record not found')
@@ -3630,11 +4110,13 @@ export async function ensurePipelineCrmReferenceLinks(pipelineId: string) {
        SELECT reference_code, name AS title, 'organizations'::text AS entity, email FROM crm_organizations WHERE pipeline_id = $1::uuid
        UNION ALL SELECT reference_code, full_name, 'contacts', email FROM crm_contacts WHERE pipeline_id = $1::uuid
        UNION ALL SELECT reference_code, name, 'products', NULL::text FROM crm_products WHERE pipeline_id = $1::uuid
-       UNION ALL SELECT reference_code, full_name, 'leads', email FROM crm_leads WHERE pipeline_id = $1::uuid
+       UNION ALL SELECT reference_code, full_name, 'leads', email FROM crm_leads lead
+         WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('lead')}
        UNION ALL SELECT reference_code, name, 'opportunities', NULL::text FROM crm_opportunities WHERE pipeline_id = $1::uuid
        UNION ALL SELECT reference_code, subject, 'meetings', NULL::text FROM crm_meetings WHERE pipeline_id = $1::uuid
        UNION ALL SELECT reference_code, subject, 'interactions', NULL::text FROM crm_interactions WHERE pipeline_id = $1::uuid
-       UNION ALL SELECT reference_code, name, 'campaigns', NULL::text FROM crm_campaigns WHERE pipeline_id = $1::uuid
+       UNION ALL SELECT reference_code, name, 'campaigns', NULL::text FROM crm_campaigns campaign
+         WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('campaign')}
      ), owner AS (
        SELECT pipeline.owner_email, pipeline.workspace_organization_id AS organization_id
        FROM pipeline_spaces pipeline

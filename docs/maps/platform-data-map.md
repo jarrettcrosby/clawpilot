@@ -21,7 +21,7 @@ app_visible: true
 | Calendar and email provider state | Connected user account | ClawPilot CRM interactions and meetings |
 | Deployment history | Postgres release entries | Versions and Build Brief |
 | Repository knowledge | Git-tracked Markdown | Owner Docs catalog and vectors |
-| Toast restaurant sales and orders | Toast read-only APIs | Immutable snapshots, daily projections, and accounting drafts in Postgres |
+| Toast restaurant sales and orders | Toast read-only APIs | Immutable snapshots, sanitized POS orders, daily projections, and accounting drafts in Postgres |
 | Posted accounting transactions | Connected QuickBooks company | Approved accounting outbox and provider transaction reference |
 
 ## Identity Graph
@@ -57,7 +57,7 @@ flowchart LR
 - [Pipeline and Synchronization](../modules/pipeline-and-sync.md)
 - [CRM and Workbook Reporting](../modules/crm-and-reporting.md)
 - [User Integrations and Credentials](../modules/user-integrations.md)
-- [Toast Sales and Accounting](../modules/toast-and-accounting.md)
+- [Toast POS and Accounting](../modules/toast-and-accounting.md)
 - [QuickBooks Accounting Connector](../modules/quickbooks-accounting.md)
 - [Shared Short Links](../modules/short-links.md)
 - [Postgres and Sheets Authority](../decisions/0001-postgres-and-sheets-authority.md)

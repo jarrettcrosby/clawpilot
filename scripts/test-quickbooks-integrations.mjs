@@ -8,10 +8,13 @@ import {
   parseQuickBooksAccounts,
   parseQuickBooksAttachments,
   parseQuickBooksCompanyInfo,
+  parseQuickBooksClasses,
   parseQuickBooksCustomers,
+  parseQuickBooksDepartments,
   parseQuickBooksFinancialReport,
   parseQuickBooksInvoiceDetail,
   parseQuickBooksItems,
+  parseQuickBooksTaxCodes,
   parseQuickBooksTransactions,
   parseQuickBooksVendors,
 } from '../app_src/lib/integrations/quickBooksCatalog.mjs'
@@ -111,6 +114,24 @@ const vendors = parseQuickBooksVendors({
 })
 assert.equal(vendors[0].displayName, 'Supply Co')
 
+const classes = parseQuickBooksClasses({
+  QueryResponse: { Class: [{ Id: '31', Name: 'Food truck', FullyQualifiedName: 'Operations:Food truck', SubClass: true, ParentRef: { value: '30' } }] },
+})
+assert.equal(classes[0].fullyQualifiedName, 'Operations:Food truck')
+assert.equal(classes[0].parentId, '30')
+
+const departments = parseQuickBooksDepartments({
+  QueryResponse: { Department: [{ Id: '32', Name: 'Hartford', Active: true }] },
+})
+assert.equal(departments[0].name, 'Hartford')
+assert.equal(departments[0].active, true)
+
+const taxCodes = parseQuickBooksTaxCodes({
+  QueryResponse: { TaxCode: [{ Id: '33', Name: 'CT Meals', Description: 'Connecticut meals tax', Taxable: true }] },
+})
+assert.equal(taxCodes[0].taxable, true)
+assert.equal(taxCodes[0].description, 'Connecticut meals tax')
+
 const invoices = parseQuickBooksTransactions({
   QueryResponse: {
     Invoice: [{
@@ -195,6 +216,14 @@ for (const fragment of [
   'idx_quickbooks_transactions_open',
 ]) includes(explorerMigration, fragment, 'QuickBooks explorer migration')
 
+const accountingCatalogMigration = read('db/migrations/0071_quickbooks_accounting_reference_catalogs.sql')
+for (const fragment of [
+  'CREATE TABLE IF NOT EXISTS quickbooks_tax_codes',
+  'CREATE TABLE IF NOT EXISTS quickbooks_classes',
+  'CREATE TABLE IF NOT EXISTS quickbooks_departments',
+  'REFERENCES organization_quickbooks_connections(organization_id) ON DELETE CASCADE',
+]) includes(accountingCatalogMigration, fragment, 'QuickBooks accounting reference catalogs migration')
+
 const reportMigration = read('db/migrations/0063_quickbooks_financial_reports.sql')
 for (const fragment of [
   "ADD COLUMN IF NOT EXISTS company_profile jsonb",
@@ -218,6 +247,23 @@ for (const fragment of [
   'attempt_count <= max_attempts',
   'idx_quickbooks_write_requests_due',
 ]) includes(writeMigration, fragment, 'QuickBooks write-control migration')
+
+const writeBindingMigration = read('db/migrations/0068_quickbooks_write_connection_binding.sql')
+for (const fragment of [
+  'ADD COLUMN IF NOT EXISTS reviewed_maton_connection_id text',
+  'DROP CONSTRAINT IF EXISTS quickbooks_write_reviewed_connection_required',
+  "SET status = 'cancelled'",
+  "RAISE EXCEPTION 'Cannot bind QuickBooks write requests while a legacy write is processing'",
+  "reviewed_maton_connection_id IS NOT NULL OR status IN ('succeeded', 'cancelled')",
+  'idx_quickbooks_write_requests_reviewed_connection',
+]) includes(writeBindingMigration, fragment, 'QuickBooks write connection-binding migration')
+
+const writeBindingCompatibilityMigration = read('db/migrations/0075_quickbooks_write_binding_compatibility.sql')
+includes(
+  writeBindingCompatibilityMigration,
+  'DROP CONSTRAINT IF EXISTS quickbooks_write_reviewed_connection_required',
+  'QuickBooks write connection-binding compatibility migration',
+)
 
 const crmReconciliationMigration = read('db/migrations/0065_demo_and_quickbooks_crm_reconciliation.sql')
 for (const fragment of [
@@ -257,6 +303,12 @@ for (const fragment of [
   "cache: 'no-store'",
   "'Invoice'",
   "'Attachable'",
+  "'Class'",
+  "'Department'",
+  "'TaxCode'",
+  'parseQuickBooksClasses',
+  'parseQuickBooksDepartments',
+  'parseQuickBooksTaxCodes',
   'parseQuickBooksTransactions',
   '/reports/${reportRequest.endpoint}',
   "'ProfitAndLoss'",
@@ -380,6 +432,18 @@ for (const fragment of [
   'quickbooks_financial_reports',
   'reportsReady',
   'jsonb_to_recordset',
+  'write_mode = CASE',
+  'write_verified_at = CASE',
+  'write_verified_by = CASE',
+  "reason: 'connection_rebound'",
+  "reason: 'connection_disconnected'",
+  'invalidatePosAccountingQuickBooksBinding',
+  'acquireTransactionAdvisoryLock',
+  'FROM pos_accounting_profiles',
+  "'unbound', NULL, NULL, NULL, NULL",
+  'UPDATE pos_accounting_catalog_mappings SET effective_to = clock_timestamp()',
+  "status IN ('draft', 'pending_approval', 'approved', 'failed', 'dead')",
+  "status = 'processing'",
 ]) includes(persistence, fragment, 'QuickBooks persistence')
 assert.ok(!persistence.includes('console.'), 'QuickBooks persistence must not log credentials or source payloads')
 
@@ -391,7 +455,7 @@ for (const fragment of [
   'claimQuickBooksWriteJobsInPostgres',
   'completeQuickBooksWriteJobInPostgres',
   'failQuickBooksWriteJobInPostgres',
-  'FOR UPDATE OF request SKIP LOCKED',
+  'FOR UPDATE OF request, connection SKIP LOCKED',
   "status = 'processing'",
   'request.attempt_count < request.max_attempts',
   'connection.write_verified_at IS NOT NULL',
@@ -399,8 +463,261 @@ for (const fragment of [
   "eventType: 'quickbooks.write.succeeded'",
   'request_fingerprint',
   "'cp-' || $3::text",
+  'reviewed_maton_connection_id',
+  'connection.maton_connection_id = request.reviewed_maton_connection_id',
+  'AND reviewed_maton_connection_id = $7',
+  'AND reviewed_maton_connection_id = $6',
 ]) includes(writePersistence, fragment, 'QuickBooks write persistence')
 assert.ok(!writePersistence.includes('console.'), 'QuickBooks write persistence must not log accounting payloads')
+
+const organizationId = '11111111-1111-4111-8111-111111111111'
+const actorEmail = 'manager@example.com'
+const company = {
+  companyName: 'Replacement Books',
+  country: 'US',
+  legalName: null,
+  email: null,
+  phone: null,
+  address: { lines: [], city: null, region: null, postalCode: null, country: null },
+}
+const integrationSqlCalls = []
+const integrationAuditEvents = []
+let integrationScenario = 'rebind'
+const integrationPersistenceModule = loadTypeScriptModule('app_src/lib/persistence/quickBooksIntegrations.ts', {
+  '@/lib/auditWriter': {
+    recordAuditEvent: async (event) => { integrationAuditEvents.push(event) },
+  },
+  '@/lib/persistence/postgres': {
+    acquireTransactionAdvisoryLock: async (client, key) => client.query(
+      'SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))',
+      [key],
+    ),
+    query: async () => ({ rows: [], rowCount: 0 }),
+    withTransaction: async (work) => work({
+      query: async (sql, params = []) => {
+        const source = String(sql)
+        integrationSqlCalls.push({ source, params })
+        if (source.includes('SELECT maton_connection_id, company_name, country')) {
+          return {
+            rows: [{ maton_connection_id: 'connection-old', company_name: 'Original Books', country: 'US' }],
+            rowCount: 1,
+          }
+        }
+        if (source.includes('SELECT EXISTS') && source.includes("status = 'processing'")) {
+          const exists = integrationScenario === 'processing'
+          return { rows: [{ exists }], rowCount: 1 }
+        }
+        if (source.includes('FROM pos_accounting_profiles') && source.includes('FOR UPDATE')) {
+          return {
+            rows: [{ id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' }],
+            rowCount: 1,
+          }
+        }
+        if (source.includes('WITH cancellable AS')) {
+          return {
+            rows: integrationScenario === 'rebind' ? [{
+              id: '22222222-2222-4222-8222-222222222222',
+              operation_kind: 'customer.create',
+              previous_status: 'approved',
+              provider_request_id: 'cp-22222222-2222-4222-8222-222222222222',
+              request_fingerprint: 'a'.repeat(64),
+            }] : [],
+            rowCount: integrationScenario === 'rebind' ? 1 : 0,
+          }
+        }
+        if (source.includes('organization_id <> $2::uuid')) return { rows: [], rowCount: 0 }
+        if (source.includes('DELETE FROM organization_quickbooks_connections')) {
+          return { rows: [{ company_name: 'Original Books' }], rowCount: 1 }
+        }
+        return { rows: [], rowCount: 1 }
+      },
+    }),
+  },
+})
+
+await integrationPersistenceModule.bindQuickBooksConnectionInPostgres({
+  organizationId,
+  ownerEmail: 'owner@example.com',
+  connectionId: 'connection-new',
+  company,
+  actorEmail,
+})
+assert.ok(integrationSqlCalls[0].source.includes('pg_advisory_xact_lock'))
+assert.equal(integrationSqlCalls[0].params[0], `quickbooks-binding:${organizationId}`)
+const rebindUpsert = integrationSqlCalls.find((call) => call.source.includes('INSERT INTO organization_quickbooks_connections'))
+assert.ok(rebindUpsert)
+includes(rebindUpsert.source, "THEN 'disabled'", 'QuickBooks rebind write-mode reset')
+assert.equal((integrationAuditEvents.find((event) => event.eventType === 'quickbooks.connection.bound')).payload.writeVerificationReset, true)
+assert.equal((integrationAuditEvents.find((event) => event.eventType === 'quickbooks.write.cancelled')).payload.reason, 'connection_rebound')
+const rebindProfileClose = integrationSqlCalls.find((call) => call.source.includes('UPDATE pos_accounting_profiles SET effective_to'))
+const rebindProfileReplacement = integrationSqlCalls.find((call) => call.source.includes('INSERT INTO pos_accounting_profiles'))
+const rebindMappingInvalidation = integrationSqlCalls.find((call) => call.source.includes('UPDATE pos_accounting_catalog_mappings SET effective_to'))
+assert.ok(rebindProfileClose, 'QuickBooks rebind must close the old fingerprinted profile revision')
+assert.ok(rebindProfileReplacement, 'QuickBooks rebind must create an unbound profile revision')
+assert.ok(rebindMappingInvalidation, 'QuickBooks rebind must invalidate current POS catalog mappings')
+includes(rebindProfileReplacement.source, "'unbound', NULL, NULL, NULL, NULL", 'QuickBooks rebind profile fingerprint reset')
+assert.equal(
+  integrationAuditEvents.find((event) => event.eventType === 'quickbooks.connection.bound').payload.invalidatedPosAccountingProfileCount,
+  1,
+)
+
+integrationScenario = 'processing'
+const sqlCountBeforeBlockedRebind = integrationSqlCalls.length
+await assert.rejects(
+  integrationPersistenceModule.bindQuickBooksConnectionInPostgres({
+    organizationId,
+    ownerEmail: 'owner@example.com',
+    connectionId: 'connection-newer',
+    company: { ...company, companyName: 'Blocked Replacement' },
+    actorEmail,
+  }),
+  /in-progress QuickBooks write/,
+)
+assert.equal(
+  integrationSqlCalls.slice(sqlCountBeforeBlockedRebind).some((call) => call.source.includes('INSERT INTO organization_quickbooks_connections')),
+  false,
+)
+await assert.rejects(
+  integrationPersistenceModule.disconnectQuickBooksConnectionInPostgres({ organizationId, actorEmail }),
+  /in-progress QuickBooks write/,
+)
+
+integrationScenario = 'disconnect'
+const sqlCountBeforeDisconnect = integrationSqlCalls.length
+await integrationPersistenceModule.disconnectQuickBooksConnectionInPostgres({ organizationId, actorEmail })
+const disconnectCancellation = integrationSqlCalls.find((call) => (
+  call.source.includes('WITH cancellable AS') && call.params[2] === 'QUICKBOOKS_WRITE_CONNECTION_DISCONNECTED'
+))
+assert.ok(disconnectCancellation)
+includes(disconnectCancellation.source, "status IN ('draft', 'pending_approval', 'approved', 'failed', 'dead')", 'QuickBooks disconnect cancellation states')
+assert.ok(!disconnectCancellation.source.includes("'succeeded'"), 'QuickBooks disconnect must preserve posted writes')
+const disconnectSql = integrationSqlCalls.slice(sqlCountBeforeDisconnect)
+assert.ok(disconnectSql.some((call) => call.source.includes('UPDATE pos_accounting_profiles SET effective_to')))
+assert.ok(disconnectSql.some((call) => call.source.includes('INSERT INTO pos_accounting_profiles')))
+assert.ok(disconnectSql.some((call) => call.source.includes('UPDATE pos_accounting_catalog_mappings SET effective_to')))
+
+function writeRequestRow(overrides = {}) {
+  return {
+    id: '33333333-3333-4333-8333-333333333333',
+    reviewed_maton_connection_id: 'connection-reviewed',
+    operation_kind: 'customer.create',
+    status: 'draft',
+    client_request_id: '44444444-4444-4444-8444-444444444444',
+    provider_request_id: 'cp-44444444-4444-4444-8444-444444444444',
+    request_payload: { displayName: 'Acme Buyer' },
+    request_fingerprint: 'b'.repeat(64),
+    provider_entity_type: null,
+    provider_entity_id: null,
+    provider_sync_token: null,
+    requested_by: actorEmail,
+    requested_by_name: null,
+    submitted_by: null,
+    approved_by: null,
+    approved_by_name: null,
+    cancelled_by: null,
+    approval_note: null,
+    attempt_count: 0,
+    max_attempts: 5,
+    last_error_code: null,
+    last_error_message: null,
+    created_at: '2026-07-19T12:00:00.000Z',
+    submitted_at: null,
+    approved_at: null,
+    posted_at: null,
+    cancelled_at: null,
+    updated_at: '2026-07-19T12:00:00.000Z',
+    ...overrides,
+  }
+}
+
+const writeSqlCalls = []
+let writeScenario = 'create'
+let currentReviewedConnectionId = 'connection-reviewed'
+const writePersistenceModule = loadTypeScriptModule('app_src/lib/persistence/quickBooksWrites.ts', {
+  '@/lib/auditWriter': { recordAuditEvent: async () => undefined },
+  '@/lib/persistence/postgres': {
+    query: async () => ({ rows: [], rowCount: 0 }),
+    withTransaction: async (work) => work({
+      query: async (sql, params = []) => {
+        const source = String(sql)
+        writeSqlCalls.push({ source, params })
+        if (source.includes('SELECT maton_connection_id') && source.includes('FOR SHARE')) {
+          return { rows: [{ maton_connection_id: currentReviewedConnectionId }], rowCount: 1 }
+        }
+        if (source.includes('INSERT INTO quickbooks_write_requests')) {
+          return writeScenario === 'idempotency-conflict'
+            ? { rows: [], rowCount: 0 }
+            : { rows: [writeRequestRow()], rowCount: 1 }
+        }
+        if (source.includes('request.client_request_id = $2::uuid')) {
+          return { rows: [writeRequestRow()], rowCount: 1 }
+        }
+        if (source.includes('WITH candidate AS')) return { rows: [], rowCount: 0 }
+        if (source.includes("status = 'succeeded'") || source.includes('status = $3')) {
+          return { rows: [], rowCount: 1 }
+        }
+        return { rows: [], rowCount: 0 }
+      },
+    }),
+  },
+})
+
+await writePersistenceModule.createQuickBooksWriteRequestInPostgres({
+  organizationId,
+  operationKind: 'customer.create',
+  clientRequestId: '44444444-4444-4444-8444-444444444444',
+  payload: { displayName: 'Acme Buyer' },
+  requestFingerprint: 'b'.repeat(64),
+  actorEmail,
+})
+const createWriteCall = writeSqlCalls.find((call) => call.source.includes('INSERT INTO quickbooks_write_requests'))
+assert.equal(createWriteCall.params[6], 'connection-reviewed')
+
+writeScenario = 'idempotency-conflict'
+currentReviewedConnectionId = 'connection-replacement'
+await assert.rejects(
+  writePersistenceModule.createQuickBooksWriteRequestInPostgres({
+    organizationId,
+    operationKind: 'customer.create',
+    clientRequestId: '44444444-4444-4444-8444-444444444444',
+    payload: { displayName: 'Acme Buyer' },
+    requestFingerprint: 'b'.repeat(64),
+    actorEmail,
+  }),
+  (error) => error.code === 'QUICKBOOKS_WRITE_CONNECTION_CONFLICT',
+)
+
+writeScenario = 'claim'
+await writePersistenceModule.claimQuickBooksWriteJobsInPostgres({ limit: 2, workerId: 'worker-1', writeMode: 'sandbox' })
+const claimWriteCall = writeSqlCalls.find((call) => call.source.includes('WITH candidate AS'))
+includes(claimWriteCall.source, 'connection.maton_connection_id = request.reviewed_maton_connection_id', 'QuickBooks claim reviewed binding')
+includes(claimWriteCall.source, 'FOR UPDATE OF request, connection SKIP LOCKED', 'QuickBooks claim connection lock')
+
+const writeJob = {
+  id: '33333333-3333-4333-8333-333333333333',
+  organizationId,
+  ownerEmail: 'owner@example.com',
+  connectionId: 'connection-reviewed',
+  operationKind: 'customer.create',
+  requestPayload: { displayName: 'Acme Buyer' },
+  providerRequestId: 'cp-44444444-4444-4444-8444-444444444444',
+  requestFingerprint: 'b'.repeat(64),
+  attemptCount: 1,
+  maxAttempts: 5,
+  lockToken: '55555555-5555-4555-8555-555555555555',
+  writeMode: 'sandbox',
+}
+await writePersistenceModule.completeQuickBooksWriteJobInPostgres({
+  job: writeJob,
+  providerEntityType: 'Customer',
+  providerEntityId: 'customer-1',
+  providerSyncToken: '0',
+})
+await writePersistenceModule.failQuickBooksWriteJobInPostgres({ job: writeJob, errorCode: 'TEMPORARY', error: 'retry' })
+const completeWriteCall = writeSqlCalls.find((call) => call.source.includes("status = 'succeeded'"))
+const failWriteCall = writeSqlCalls.find((call) => call.source.includes('status = $3'))
+assert.equal(completeWriteCall.params[6], 'connection-reviewed')
+assert.equal(failWriteCall.params[5], 'connection-reviewed')
 
 const service = read('app_src/lib/integrations/quickBooksIntegrations.ts')
 for (const fragment of [
@@ -666,6 +983,9 @@ for (const fragment of [
   "filename = '0065_demo_and_quickbooks_crm_reconciliation.sql'",
   'readQuickBooksWorkerHeartbeatFromPostgres',
   'QuickBooks sync worker heartbeat is missing or stale.',
+  'QuickBooks sync queue has terminal failed jobs.',
+  'QuickBooks sync queue has stale processing jobs.',
+  "WHERE organization.is_demo = false",
   'quickBooks: true',
 ]) includes(health, fragment, 'QuickBooks health contract')
 

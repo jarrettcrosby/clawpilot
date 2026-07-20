@@ -1400,6 +1400,25 @@ assertIncludes(healthRoute, 'readAgentDispatchWorkerHeartbeatFromPostgres', 'hos
 assertIncludes(healthRoute, 'readAgentResearchWorkerHeartbeatFromPostgres', 'hosted agent research worker health')
 assertIncludes(healthRoute, 'readToastWorkerHeartbeatFromPostgres', 'hosted Toast worker health')
 assertIncludes(healthRoute, 'getAgentRuntime', 'hosted agent runtime health')
+for (const migration of [
+  '0067_toast_pos_orders.sql',
+  '0068_quickbooks_write_connection_binding.sql',
+  '0069_pos_accounting_profiles_and_catalog_mappings.sql',
+  '0070_toast_menu_catalog.sql',
+  '0071_quickbooks_accounting_reference_catalogs.sql',
+  '0072_toast_sync_rerun_requests.sql',
+  '0073_toast_sync_worker_hardening.sql',
+  '0074_pos_accounting_issue_notifications.sql',
+  '0075_quickbooks_write_binding_compatibility.sql',
+  '0076_pos_accounting_notification_consent.sql',
+]) {
+  assertIncludes(healthRoute, migration, 'hosted POS and accounting migration health')
+}
+
+const persistenceStatusRoute = read('app_src/app/api/persistence/status/route.ts')
+assertIncludes(persistenceStatusRoute, 'deployment.database.identity', 'deployment database identity lookup')
+assertIncludes(persistenceStatusRoute, 'Boolean(databaseFingerprint)', 'missing database identity health failure')
+assertIncludes(persistenceStatusRoute, "status: hosted ? 503 : 200", 'hosted file-storage health failure')
 
 const agentProvider = read('app_src/lib/agents/provider.ts')
 assertIncludes(agentProvider, 'https://api.openai.com/v1/responses', 'OpenAI agent provider')

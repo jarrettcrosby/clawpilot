@@ -74,6 +74,7 @@ export class QuickBooksWriteRequestError extends Error {
 
 type WriteRequestRow = {
   id: string
+  reviewed_maton_connection_id: string | null
   operation_kind: QuickBooksWriteOperationKind
   status: QuickBooksWriteRequestStatus
   client_request_id: string
@@ -135,7 +136,7 @@ function toWriteRequest(row: WriteRequestRow): QuickBooksWriteRequest {
 }
 
 const WRITE_REQUEST_SELECT = `
-  request.id::text, request.operation_kind, request.status,
+  request.id::text, request.reviewed_maton_connection_id, request.operation_kind, request.status,
   request.client_request_id::text, request.provider_request_id,
   request.request_payload, request.request_fingerprint,
   request.provider_entity_type, request.provider_entity_id, request.provider_sync_token,
@@ -284,21 +285,39 @@ export async function createQuickBooksWriteRequestInPostgres(input: {
   actorEmail: string
 }) {
   return withTransaction(async (client) => {
+    const connection = await client.query<{ maton_connection_id: string }>(
+      `SELECT maton_connection_id
+       FROM organization_quickbooks_connections
+       WHERE organization_id = $1::uuid AND status = 'active'
+       FOR SHARE`,
+      [input.organizationId],
+    )
+    const reviewedConnectionId = connection.rows[0]?.maton_connection_id
+    if (!reviewedConnectionId) {
+      throw new QuickBooksWriteRequestError('QUICKBOOKS_NOT_CONNECTED', 'Connect QuickBooks before preparing accounting changes', 409)
+    }
     const inserted = await client.query<WriteRequestRow>(
       `INSERT INTO quickbooks_write_requests (
-         organization_id, operation_kind, client_request_id, provider_request_id,
+         organization_id, reviewed_maton_connection_id, operation_kind, client_request_id, provider_request_id,
          request_payload, request_fingerprint, requested_by, created_at, updated_at
        )
-       SELECT $1::uuid, $2, $3::uuid, 'cp-' || $3::text, $4::jsonb, $5, lower($6), now(), now()
-       FROM organization_quickbooks_connections WHERE organization_id = $1::uuid
+       VALUES ($1::uuid, $7, $2, $3::uuid, 'cp-' || $3::text, $4::jsonb, $5, lower($6), now(), now())
        ON CONFLICT (organization_id, client_request_id) DO NOTHING
-       RETURNING id::text, operation_kind, status, client_request_id::text, provider_request_id,
+       RETURNING id::text, reviewed_maton_connection_id, operation_kind, status, client_request_id::text, provider_request_id,
          request_payload, request_fingerprint, provider_entity_type, provider_entity_id, provider_sync_token,
          requested_by, NULL::text AS requested_by_name, submitted_by, approved_by,
          NULL::text AS approved_by_name, cancelled_by, approval_note, attempt_count, max_attempts,
          last_error_code, last_error_message, created_at::text, submitted_at::text, approved_at::text,
          posted_at::text, cancelled_at::text, updated_at::text`,
-      [input.organizationId, input.operationKind, input.clientRequestId, JSON.stringify(input.payload), input.requestFingerprint, input.actorEmail],
+      [
+        input.organizationId,
+        input.operationKind,
+        input.clientRequestId,
+        JSON.stringify(input.payload),
+        input.requestFingerprint,
+        input.actorEmail,
+        reviewedConnectionId,
+      ],
     )
     let row = inserted.rows[0]
     if (!row) {
@@ -317,6 +336,13 @@ export async function createQuickBooksWriteRequestInPostgres(input: {
         throw new QuickBooksWriteRequestError(
           'QUICKBOOKS_WRITE_IDEMPOTENCY_CONFLICT',
           'This draft request identifier was already used for different accounting content',
+          409,
+        )
+      }
+      if (row.reviewed_maton_connection_id !== reviewedConnectionId) {
+        throw new QuickBooksWriteRequestError(
+          'QUICKBOOKS_WRITE_CONNECTION_CONFLICT',
+          'This draft request identifier was reviewed for a different QuickBooks connection',
           409,
         )
       }
@@ -454,6 +480,7 @@ export async function claimQuickBooksWriteJobsInPostgres(input: {
          FROM quickbooks_write_requests request
          JOIN organization_quickbooks_connections connection
            ON connection.organization_id = request.organization_id
+          AND connection.maton_connection_id = request.reviewed_maton_connection_id
          WHERE connection.status = 'active'
            AND connection.write_mode = $3
            AND connection.write_verified_at IS NOT NULL
@@ -466,14 +493,16 @@ export async function claimQuickBooksWriteJobsInPostgres(input: {
             )
            )
          ORDER BY request.available_at, request.created_at
-         FOR UPDATE OF request SKIP LOCKED
+         FOR UPDATE OF request, connection SKIP LOCKED
          LIMIT $1
        )
        UPDATE quickbooks_write_requests request SET
          status = 'processing', attempt_count = request.attempt_count + 1,
          locked_at = now(), locked_by = $2, lock_token = gen_random_uuid(), updated_at = now()
        FROM candidate, organization_quickbooks_connections connection
-       WHERE request.id = candidate.id AND connection.organization_id = request.organization_id
+       WHERE request.id = candidate.id
+         AND connection.organization_id = request.organization_id
+         AND connection.maton_connection_id = request.reviewed_maton_connection_id
        RETURNING request.id::text, request.organization_id::text, request.operation_kind,
          request.request_payload, request.provider_request_id, request.request_fingerprint,
          request.attempt_count, request.max_attempts, request.lock_token::text,
@@ -511,7 +540,8 @@ export async function completeQuickBooksWriteJobInPostgres(input: {
          last_error_code = NULL, last_error_message = NULL,
          locked_at = NULL, locked_by = NULL, lock_token = NULL,
          posted_at = now(), updated_at = now()
-       WHERE id = $1::uuid AND lock_token = $2::uuid`,
+       WHERE id = $1::uuid AND lock_token = $2::uuid
+         AND reviewed_maton_connection_id = $7`,
       [
         input.job.id,
         input.job.lockToken,
@@ -524,6 +554,7 @@ export async function completeQuickBooksWriteJobInPostgres(input: {
           syncToken: input.providerSyncToken,
           requestFingerprint: input.job.requestFingerprint,
         }),
+        input.job.connectionId,
       ],
     )
     if (!completed.rowCount) throw new Error('QuickBooks write lease was lost')
@@ -564,8 +595,9 @@ export async function failQuickBooksWriteJobInPostgres(input: {
          status = $3, last_error_code = $4, last_error_message = $5,
          available_at = now() + make_interval(secs => LEAST(3600, 30 * power(2, LEAST(attempt_count, 7)))::integer),
          locked_at = NULL, locked_by = NULL, lock_token = NULL, updated_at = now()
-       WHERE id = $1::uuid AND lock_token = $2::uuid`,
-      [input.job.id, input.job.lockToken, dead ? 'dead' : 'failed', input.errorCode, message],
+       WHERE id = $1::uuid AND lock_token = $2::uuid
+         AND reviewed_maton_connection_id = $6`,
+      [input.job.id, input.job.lockToken, dead ? 'dead' : 'failed', input.errorCode, message, input.job.connectionId],
     )
     if (!failed.rowCount) return false
     await recordAuditEvent({

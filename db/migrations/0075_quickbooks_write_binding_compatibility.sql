@@ -1,0 +1,2 @@
+ALTER TABLE quickbooks_write_requests
+  DROP CONSTRAINT IF EXISTS quickbooks_write_reviewed_connection_required;

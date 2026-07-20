@@ -3,9 +3,12 @@ import {
   parseQuickBooksAccounts,
   parseQuickBooksAttachments,
   parseQuickBooksCompanyInfo,
+  parseQuickBooksClasses,
   parseQuickBooksCustomers,
+  parseQuickBooksDepartments,
   parseQuickBooksFinancialReport,
   parseQuickBooksItems,
+  parseQuickBooksTaxCodes,
   parseQuickBooksTransactions,
   parseQuickBooksVendors,
 } from '@/lib/integrations/quickBooksCatalog.mjs'
@@ -41,12 +44,18 @@ const TRANSACTION_ENTITIES = [
 ] as const
 
 type QuickBooksTransactionEntity = typeof TRANSACTION_ENTITIES[number]
-type QuickBooksQueryEntity = 'Account' | 'Item' | 'Customer' | 'Vendor' | 'Attachable' | QuickBooksTransactionEntity
+type QuickBooksQueryEntity =
+  | 'Account' | 'Item' | 'Customer' | 'Vendor' | 'Attachable'
+  | 'Class' | 'Department' | 'TaxCode'
+  | QuickBooksTransactionEntity
 
 export type QuickBooksCompanyInfo = ReturnType<typeof parseQuickBooksCompanyInfo>
 export type QuickBooksAccount = ReturnType<typeof parseQuickBooksAccounts>[number]
+export type QuickBooksClass = ReturnType<typeof parseQuickBooksClasses>[number]
 export type QuickBooksItem = ReturnType<typeof parseQuickBooksItems>[number]
 export type QuickBooksCustomer = ReturnType<typeof parseQuickBooksCustomers>[number]
+export type QuickBooksDepartment = ReturnType<typeof parseQuickBooksDepartments>[number]
+export type QuickBooksTaxCode = ReturnType<typeof parseQuickBooksTaxCodes>[number]
 export type QuickBooksVendor = ReturnType<typeof parseQuickBooksVendors>[number]
 export type QuickBooksTransaction = ReturnType<typeof parseQuickBooksTransactions>[number]
 export type QuickBooksAttachment = ReturnType<typeof parseQuickBooksAttachments>[number]
@@ -231,7 +240,7 @@ async function queryAllEntities<T>(
   parse: (payload: Record<string, unknown>) => T[],
 ) {
   const records = new Map<string, T>()
-  const pageSize = entity === 'Account' || entity === 'Item' || entity === 'Customer' || entity === 'Vendor'
+  const pageSize = ['Account', 'Item', 'Customer', 'Vendor', 'Class', 'Department', 'TaxCode'].includes(entity)
     ? QUERY_PAGE_SIZE
     : TRANSACTION_PAGE_SIZE
   for (let startPosition = 1; startPosition <= MAX_CATALOG_RECORDS; startPosition += pageSize) {
@@ -399,6 +408,9 @@ export async function readQuickBooksCatalog(ownerEmail: string, connectionId: st
   const items = await queryAllEntities('Item', ownerEmail, connectionId, parseQuickBooksItems)
   const customers = await queryAllEntities('Customer', ownerEmail, connectionId, parseQuickBooksCustomers)
   const vendors = await queryAllEntities('Vendor', ownerEmail, connectionId, parseQuickBooksVendors)
+  const classes = await queryAllEntities('Class', ownerEmail, connectionId, parseQuickBooksClasses)
+  const departments = await queryAllEntities('Department', ownerEmail, connectionId, parseQuickBooksDepartments)
+  const taxCodes = await queryAllEntities('TaxCode', ownerEmail, connectionId, parseQuickBooksTaxCodes)
   const transactionGroups: QuickBooksTransaction[][] = []
   for (const entity of TRANSACTION_ENTITIES) {
     transactionGroups.push(await queryAllEntities(
@@ -421,6 +433,9 @@ export async function readQuickBooksCatalog(ownerEmail: string, connectionId: st
     items,
     customers,
     vendors,
+    classes,
+    departments,
+    taxCodes,
     transactions: transactionGroups.flat(),
     attachments,
     reports,

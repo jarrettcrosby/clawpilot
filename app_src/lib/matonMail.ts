@@ -19,6 +19,16 @@ export type SendInvitationEmailInput = {
   expiresAt: string
 }
 
+export type SendPosAccountingIssueEmailInput = {
+  to: string
+  recipientName?: string | null
+  organizationName: string
+  restaurantName: string
+  restaurantGuid: string
+  businessDate: string
+  issues: Array<{ title: string; detail: string }>
+}
+
 function assertEmail(value: string): string {
   const email = String(value || '').trim()
   if (!email || /[\r\n]/.test(email) || !/^[\x21-\x7e]+$/.test(email)) {
@@ -202,4 +212,75 @@ export async function sendInvitationEmail(input: SendInvitationEmailInput): Prom
     '</div></body></html>',
   ].join('')
   return sendMessage({ to, subject: `${inviterName} invited you to ClawPilot`, text, html })
+}
+
+export async function sendPosAccountingIssueEmail(
+  input: SendPosAccountingIssueEmailInput,
+): Promise<{ messageId: string | null }> {
+  const to = assertEmail(input.to)
+  const recipientName = String(input.recipientName || '').replace(/[\r\n]/g, ' ').trim().slice(0, 100)
+  const organizationName = cleanHeader(String(input.organizationName || '').slice(0, 200), 'Organization name')
+  const restaurantName = cleanHeader(String(input.restaurantName || '').slice(0, 200), 'Restaurant name')
+  const restaurantGuid = String(input.restaurantGuid || '').trim().toLowerCase()
+  const businessDate = String(input.businessDate || '').trim()
+  if (!/^[0-9a-f-]{36}$/.test(restaurantGuid)) throw new Error('Restaurant location is invalid')
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(businessDate)) throw new Error('Business date is invalid')
+  const issues = input.issues.slice(0, 25).map((issue) => ({
+    title: String(issue.title || 'Accounting item').replace(/[\r\n]/g, ' ').trim().slice(0, 240),
+    detail: String(issue.detail || 'Review this accounting item in ClawPilot').replace(/[\r\n]/g, ' ').trim().slice(0, 600),
+  }))
+  if (!issues.length) throw new Error('At least one accounting issue is required')
+
+  const actionUrl = new URL(appPublicUrl())
+  actionUrl.searchParams.set('posView', 'accounting')
+  actionUrl.searchParams.set('date', businessDate)
+  actionUrl.searchParams.set('location', restaurantGuid)
+  actionUrl.hash = 'pos'
+  const dateLabel = new Intl.DateTimeFormat('en-US', {
+    month: 'long', day: 'numeric', year: 'numeric', timeZone: 'UTC',
+  }).format(new Date(`${businessDate}T12:00:00.000Z`))
+  const greeting = recipientName ? `Hi ${recipientName},` : 'Hello,'
+  const issueLines = issues.map((issue) => `- ${issue.title}: ${issue.detail}`)
+  const text = [
+    `ClawPilot accounting action required for ${restaurantName}`,
+    '',
+    greeting,
+    '',
+    `${issues.length} accounting ${issues.length === 1 ? 'item requires' : 'items require'} review for ${dateLabel}.`,
+    '',
+    ...issueLines,
+    '',
+    `Review POS accounting: ${actionUrl.toString()}`,
+    '',
+    `Organization: ${organizationName}`,
+    'Once the underlying issue is corrected, ClawPilot will re-evaluate the business date automatically.',
+  ].join('\r\n')
+  const logoUrl = `${appPublicUrl()}/brand/email/clawpilot-mark-email.png`
+  const issueHtml = issues.map((issue) => (
+    `<li style="margin:0 0 12px"><strong>${escapeHtml(issue.title)}</strong><br><span style="color:#b9bdc8;line-height:1.5">${escapeHtml(issue.detail)}</span></li>`
+  )).join('')
+  const html = [
+    '<!doctype html>',
+    '<html><body style="margin:0;padding:24px;background:#0f0f13;color:#e4e1ec;font-family:Arial,sans-serif">',
+    '<div style="max-width:600px;margin:0 auto;background:#1a1a23;border:1px solid #343741;border-radius:8px;overflow:hidden">',
+    '<div style="padding:24px 28px 20px;border-bottom:3px solid #f2b76d">',
+    `<img src="${escapeHtml(logoUrl)}" width="52" height="52" alt="" style="display:block;margin:0 0 16px">`,
+    '<p style="margin:0 0 8px;color:#f2b76d;font-size:12px;font-weight:700;text-transform:uppercase">Accounting action required</p>',
+    `<h1 style="margin:0;font-size:25px;line-height:1.25">${escapeHtml(restaurantName)}</h1>`,
+    `<p style="margin:8px 0 0;color:#b9bdc8">${escapeHtml(dateLabel)} · ${escapeHtml(organizationName)}</p>`,
+    '</div>',
+    '<div style="padding:24px 28px 28px">',
+    `<p style="margin:0 0 16px;line-height:1.6">${escapeHtml(greeting)}</p>`,
+    `<p style="margin:0 0 18px;line-height:1.6">${issues.length} accounting ${issues.length === 1 ? 'item requires' : 'items require'} review before this business date can be posted.</p>`,
+    `<ul style="margin:0 0 22px;padding-left:20px">${issueHtml}</ul>`,
+    `<p style="margin:0 0 22px"><a href="${escapeHtml(actionUrl.toString())}" style="display:inline-block;padding:12px 18px;border-radius:6px;background:#a8c7fa;color:#071728;text-decoration:none;font-weight:700">Review POS accounting</a></p>`,
+    '<p style="margin:0;color:#8f94a1;font-size:13px;line-height:1.5">After the underlying issue is corrected, ClawPilot will re-evaluate the business date automatically. Repeated checks do not create duplicate alerts unless the issue changes or recurs.</p>',
+    '</div></div></body></html>',
+  ].join('')
+  return sendMessage({
+    to,
+    subject: `Action required: ${restaurantName} accounting for ${businessDate}`,
+    text,
+    html,
+  })
 }

@@ -116,4 +116,4 @@ The following remain outside this accepted boundary:
 
 QuickBooks report, attachment, and controlled-write behavior follows Intuit's official [Reports API workflow](https://developer.intuit.com/app/developer/qbo/docs/workflows/run-reports), [attachment workflow](https://developer.intuit.com/app/developer/qbo/docs/workflows/attach-images-and-notes), [invoice workflow](https://developer.intuit.com/app/developer/qbo/docs/workflows/create-an-invoice), and [`requestid` idempotency guidance](https://developer.intuit.com/app/developer/qbo/docs/learn/learn-basic-field-definitions).
 
-See [User Integrations and Credentials](user-integrations.md), [Toast Sales and Accounting](toast-and-accounting.md), and [Platform and Data Map](../maps/platform-data-map.md).
+See [User Integrations and Credentials](user-integrations.md), [Toast POS and Accounting](toast-and-accounting.md), and [Platform and Data Map](../maps/platform-data-map.md).

@@ -103,12 +103,27 @@ for (const fragment of [
   'searchableDetailText(event.details)',
   'Record type:',
   'Global ID:',
+  "url.searchParams.set('posView', 'accounting')",
+  "url.searchParams.set('location'",
+  "url.searchParams.set('date'",
+  "target.section === 'pos'",
 ]) {
   assert.ok(activityUi.includes(fragment), `activity UI missing ${fragment}`)
 }
 assert.ok(activityUi.includes('append ? [...current, ...nextEvents] : nextEvents'), 'activity pagination must preserve every returned event')
 assert.ok(!activityUi.includes('defaultModule'), 'activity must not default to the currently selected module')
 assert.ok(!activityUi.includes('/api/pipeline/activity'), 'activity must not depend on selected pipeline history')
+
+const auditSource = read('app_src/lib/audit.ts')
+for (const fragment of [
+  "if (prefix === 'pos') return 'pos'",
+  "COALESCE(event.payload->'recipientEmails', '[]'::jsonb) ? $1",
+  "section: 'pos'",
+  'restaurantGuid',
+  'businessDate',
+]) {
+  assert.ok(auditSource.includes(fragment), `POS accounting activity contract missing ${fragment}`)
+}
 
 const header = read('app_src/components/AppHeader.tsx')
 assert.ok(header.includes("fetch('/api/activity?limit=100'"), 'header badge must use the scoped activity endpoint')

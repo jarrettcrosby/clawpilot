@@ -2,10 +2,16 @@ import crypto from 'crypto'
 import {
   getToastAnalyticsPayouts,
   getToastAnalyticsSales,
+  getToastStandardOrderUpdates,
   getToastStandardOrders,
   type ToastRuntimeCredential,
 } from '@/lib/integrations/toastClient'
 import { decryptToastClientSecret } from '@/lib/integrations/toastCredentialCrypto'
+import {
+  processPosAccountingNotificationOutbox,
+  reconcilePosAccountingIssueForDateInPostgres,
+  reconcileStaleOpenPosAccountingIssuesInPostgres,
+} from '@/lib/persistence/posAccountingNotifications'
 import {
   claimToastSyncJobsInPostgres,
   completeToastSyncJobInPostgres,
@@ -13,10 +19,11 @@ import {
   failToastSyncJobInPostgres,
   listToastAutomaticSyncTargetsInPostgres,
   queueAutomaticToastSyncInPostgres,
+  queueAutomaticToastOrderUpdateInPostgres,
   readToastRuntimeCredentialFromPostgres,
   refreshToastAccountingDraftInPostgres,
   storeToastSnapshotsInPostgres,
-  updateToastStandardOrdersCountInPostgres,
+  projectToastStandardOrdersInPostgres,
   upsertToastAnalyticsSalesInPostgres,
   type ToastSyncJob,
 } from '@/lib/persistence/toastIntegrations'
@@ -38,6 +45,41 @@ function previousBusinessDate(timezoneValue: string | null) {
     const yesterday = new Date(Date.now() - 86_400_000)
     return yesterday.toISOString().slice(0, 10)
   }
+}
+
+function offsetDate(dateValue: string, days: number) {
+  const date = new Date(`${dateValue}T00:00:00.000Z`)
+  date.setUTCDate(date.getUTCDate() + days)
+  return date.toISOString().slice(0, 10)
+}
+
+function modifiedWindow(dateValue: string) {
+  return {
+    startDate: `${dateValue}T00:00:00.000Z`,
+    endDate: `${offsetDate(dateValue, 1)}T00:00:00.000Z`,
+  }
+}
+
+function orderBusinessDate(value: unknown) {
+  const raw = String(record(value).businessDate || '').replace(/[^0-9]/g, '')
+  if (!/^\d{8}$/.test(raw)) return null
+  const normalized = `${raw.slice(0, 4)}-${raw.slice(4, 6)}-${raw.slice(6, 8)}`
+  return Number.isFinite(new Date(`${normalized}T00:00:00.000Z`).getTime()) ? normalized : null
+}
+
+function catchUpDates(latestDate: string | null, targetDate: string) {
+  if (!latestDate || latestDate >= targetDate) return []
+  const first = offsetDate(latestDate, 1)
+  const floor = offsetDate(targetDate, -30)
+  const dates: string[] = []
+  for (let cursor = first < floor ? floor : first; cursor <= targetDate; cursor = offsetDate(cursor, 1)) {
+    dates.push(cursor)
+  }
+  return dates
+}
+
+function delay(milliseconds: number) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds))
 }
 
 async function runtimeCredential(job: ToastSyncJob): Promise<ToastRuntimeCredential> {
@@ -64,6 +106,19 @@ function sourceId(value: unknown, fallback: string) {
   return (candidate || fallback).slice(0, 512)
 }
 
+async function refreshAccountingState(job: ToastSyncJob, businessDates: string[]) {
+  const dates = [...new Set(businessDates)].sort()
+  for (const businessDate of dates) {
+    const datedJob = { ...job, businessDate }
+    await refreshToastAccountingDraftInPostgres(datedJob)
+    await reconcilePosAccountingIssueForDateInPostgres({
+      organizationId: job.organizationId,
+      restaurantGuid: job.restaurantGuid,
+      businessDate,
+    })
+  }
+}
+
 async function processJob(job: ToastSyncJob) {
   const credential = await runtimeCredential(job)
   if (job.syncKind === 'analytics_sales') {
@@ -74,11 +129,12 @@ async function processJob(job: ToastSyncJob) {
       requestGuid: typeof job.requestState.reportRequestGuid === 'string' ? job.requestState.reportRequestGuid : null,
     })
     if (!report.ready) {
-      await deferToastSyncJobInPostgres({
-        id: job.id,
+      const accepted = await deferToastSyncJobInPostgres({
+        job,
         requestState: { reportRequestGuid: report.requestGuid },
         delaySeconds: 15,
       })
+      if (!accepted) throw new Error('Toast sync worker lease expired')
       return { deferred: true }
     }
     await storeToastSnapshotsInPostgres({
@@ -89,8 +145,10 @@ async function processJob(job: ToastSyncJob) {
       })),
     })
     const totals = await upsertToastAnalyticsSalesInPostgres({ job, records: report.records })
-    await completeToastSyncJobInPostgres({ job, resultSummary: { records: report.records.length, totals } })
-    await refreshToastAccountingDraftInPostgres(job)
+    await refreshAccountingState(job, [job.businessDate])
+    if (!await completeToastSyncJobInPostgres({ job, resultSummary: { records: report.records.length, totals } })) {
+      throw new Error('Toast sync worker lease expired')
+    }
     return { deferred: false }
   }
   if (job.syncKind === 'analytics_payouts') {
@@ -101,11 +159,12 @@ async function processJob(job: ToastSyncJob) {
       requestGuid: typeof job.requestState.reportRequestGuid === 'string' ? job.requestState.reportRequestGuid : null,
     })
     if (!report.ready) {
-      await deferToastSyncJobInPostgres({
-        id: job.id,
+      const accepted = await deferToastSyncJobInPostgres({
+        job,
         requestState: { reportRequestGuid: report.requestGuid },
         delaySeconds: 20,
       })
+      if (!accepted) throw new Error('Toast sync worker lease expired')
       return { deferred: true }
     }
     await storeToastSnapshotsInPostgres({
@@ -115,7 +174,36 @@ async function processJob(job: ToastSyncJob) {
         sourceId: sourceId(payload, `${report.requestGuid}:${index}`), payload,
       })),
     })
-    await completeToastSyncJobInPostgres({ job, resultSummary: { records: report.records.length } })
+    if (!await completeToastSyncJobInPostgres({ job, resultSummary: { records: report.records.length } })) {
+      throw new Error('Toast sync worker lease expired')
+    }
+    return { deferred: false }
+  }
+  if (job.syncKind === 'standard_order_updates') {
+    const updates = await getToastStandardOrderUpdates({
+      credential,
+      restaurantGuid: job.restaurantGuid,
+      ...modifiedWindow(job.businessDate),
+    })
+    const affectedDates = [...new Set(updates.map(orderBusinessDate).filter((value): value is string => Boolean(value)))].sort()
+    for (const [index, businessDate] of affectedDates.entries()) {
+      if (index > 0) await delay(250)
+      const orders = await getToastStandardOrders({ credential, restaurantGuid: job.restaurantGuid, businessDate })
+      const datedJob = { ...job, businessDate }
+      await storeToastSnapshotsInPostgres({
+        job: datedJob,
+        sourceKind: 'standard_order',
+        records: orders.map((payload, recordIndex) => ({
+          sourceId: sourceId(payload, `${job.restaurantGuid}:${businessDate}:${recordIndex}`), payload,
+        })),
+      })
+      await projectToastStandardOrdersInPostgres({ job: datedJob, orders })
+    }
+    await refreshAccountingState(job, affectedDates)
+    if (!await completeToastSyncJobInPostgres({
+      job,
+      resultSummary: { records: updates.length, affectedBusinessDates: affectedDates },
+    })) throw new Error('Toast sync worker lease expired')
     return { deferred: false }
   }
   const orders = await getToastStandardOrders({
@@ -130,19 +218,27 @@ async function processJob(job: ToastSyncJob) {
       sourceId: sourceId(payload, `${job.restaurantGuid}:${job.businessDate}:${index}`), payload,
     })),
   })
-  await updateToastStandardOrdersCountInPostgres({ job, count: orders.length })
-  await completeToastSyncJobInPostgres({ job, resultSummary: { records: orders.length } })
-  await refreshToastAccountingDraftInPostgres(job)
+  const totals = await projectToastStandardOrdersInPostgres({ job, orders })
+  await refreshAccountingState(job, [job.businessDate])
+  if (!await completeToastSyncJobInPostgres({ job, resultSummary: { records: orders.length, totals } })) {
+    throw new Error('Toast sync worker lease expired')
+  }
   return { deferred: false }
 }
 
 async function queueAutomaticSyncs() {
   const targets = await listToastAutomaticSyncTargetsInPostgres()
   for (const target of targets) {
+    const businessDate = previousBusinessDate(target.timezone)
     await queueAutomaticToastSyncInPostgres({
       ...target,
-      businessDate: previousBusinessDate(target.timezone),
+      businessDate,
     })
+    if (target.standardEnabled) {
+      for (const catchUpDate of catchUpDates(target.latestStandardUpdateDate, businessDate)) {
+        await queueAutomaticToastOrderUpdateInPostgres({ ...target, businessDate: catchUpDate })
+      }
+    }
   }
   return targets.length
 }
@@ -166,10 +262,29 @@ export async function processToastSyncOutbox(input: { limit?: number; workerId?:
       if (result.deferred) deferred += 1
       else succeeded += 1
     } catch (error) {
-      const becameDead = await failToastSyncJobInPostgres({ job, error: safeError(error) })
-      failed += 1
-      if (becameDead) dead += 1
+      const outcome = await failToastSyncJobInPostgres({ job, error: safeError(error) })
+      if (outcome.accepted) failed += 1
+      if (outcome.dead) dead += 1
     }
   }
-  return { claimed: jobs.length, succeeded, failed, dead, deferred, automaticTargets }
+  let staleAccountingIssues = { checked: 0, reconciled: 0, failed: 0 }
+  let accountingNotifications = { claimed: 0, succeeded: 0, failed: 0, dead: 0 }
+  let accountingNotificationError: string | null = null
+  try {
+    staleAccountingIssues = await reconcileStaleOpenPosAccountingIssuesInPostgres({ limit: 1 })
+    accountingNotifications = await processPosAccountingNotificationOutbox({ limit: 2, workerId })
+  } catch (error) {
+    accountingNotificationError = safeError(error)
+  }
+  return {
+    claimed: jobs.length,
+    succeeded,
+    failed,
+    dead,
+    deferred,
+    automaticTargets,
+    staleAccountingIssues,
+    accountingNotifications,
+    accountingNotificationError,
+  }
 }

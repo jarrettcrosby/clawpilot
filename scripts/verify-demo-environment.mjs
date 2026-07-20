@@ -55,6 +55,25 @@ try {
         WHERE organization_id = $1::uuid AND entity_type = 'Invoice')::integer AS invoices,
       (SELECT count(*) FROM quickbooks_items
         WHERE organization_id = $1::uuid)::integer AS products,
+      (SELECT count(*) FROM toast_pos_orders
+        WHERE organization_id = $1::uuid
+          AND business_date BETWEEN metadata.anchor_date - 29 AND metadata.anchor_date)::integer AS pos_orders,
+      (SELECT count(DISTINCT business_date) FROM toast_pos_orders
+        WHERE organization_id = $1::uuid
+          AND business_date BETWEEN metadata.anchor_date - 29 AND metadata.anchor_date)::integer AS pos_business_days,
+      (SELECT count(*) FROM toast_menu_catalog_items
+        WHERE organization_id = $1::uuid AND active = true)::integer AS pos_menu_items,
+      (SELECT count(*) FROM pos_accounting_profiles
+        WHERE organization_id = $1::uuid AND effective_to IS NULL)::integer AS accounting_profiles,
+      (SELECT count(*) FROM pos_accounting_catalog_mappings
+        WHERE organization_id = $1::uuid AND effective_to IS NULL
+          AND validation_status = 'valid')::integer AS accounting_mappings,
+      (SELECT count(*) FROM quickbooks_tax_codes
+        WHERE organization_id = $1::uuid AND active = true)::integer AS quickbooks_tax_codes,
+      (SELECT count(*) FROM quickbooks_classes
+        WHERE organization_id = $1::uuid AND active = true)::integer AS quickbooks_classes,
+      (SELECT count(*) FROM quickbooks_departments
+        WHERE organization_id = $1::uuid AND active = true)::integer AS quickbooks_departments,
       (SELECT count(*) FROM organization_quickbooks_connections
         WHERE organization_id = $1::uuid
           AND maton_connection_id = 'demo-synthetic-no-provider'
@@ -101,7 +120,10 @@ try {
     || row.organizations < 5 || row.contacts < 5
     || row.opportunities < 5 || row.interactions < 12 || row.invoices < 6
     || row.interactions_recent < 1 || row.interactions_follow_up < 1 || row.interactions_context < 1
-    || row.products < 5 || row.isolated_connections !== 1
+    || row.products < 11 || row.pos_orders < 180 || row.pos_business_days !== 30
+    || row.pos_menu_items !== 5 || row.accounting_profiles !== 1 || row.accounting_mappings < 11
+    || row.quickbooks_tax_codes < 1 || row.quickbooks_classes < 1 || row.quickbooks_departments < 1
+    || row.isolated_connections !== 1
     || row.unsafe_emails !== 0 || row.live_identity_overlaps !== 0) {
     throw new Error(`demo account verification failed: ${JSON.stringify(row || {})}`)
   }

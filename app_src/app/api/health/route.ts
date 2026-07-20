@@ -72,6 +72,7 @@ export async function GET() {
     let agentResearchWorker: Record<string, unknown> = { status: 'not-owned' }
     let toastWorker: Record<string, unknown> = { status: 'not-owned' }
     let quickBooksWorker: Record<string, unknown> = { status: 'not-owned' }
+    let integrationQueues: Record<string, unknown> = { status: 'not-configured' }
     let crm: Record<string, unknown> = { status: 'disabled' }
     let knowledgeWorkers: Array<Record<string, unknown>> = []
     const repositoryRunner = getRepositoryRunnerConfiguration()
@@ -212,6 +213,16 @@ export async function GET() {
           quickbooks_write_control_migration_applied: boolean
           demo_quickbooks_crm_migration_applied: boolean
           demo_workspace_account_migration_applied: boolean
+          toast_pos_orders_migration_applied: boolean
+          quickbooks_write_connection_binding_migration_applied: boolean
+          pos_accounting_profiles_migration_applied: boolean
+          toast_menu_catalog_migration_applied: boolean
+          quickbooks_reference_catalogs_migration_applied: boolean
+          toast_sync_rerun_migration_applied: boolean
+          toast_sync_worker_hardening_migration_applied: boolean
+          pos_accounting_notifications_migration_applied: boolean
+          quickbooks_write_binding_compatibility_migration_applied: boolean
+          pos_accounting_notification_consent_migration_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -472,6 +483,56 @@ export async function GET() {
                 FROM schema_migrations
                 WHERE filename = '0066_demo_workspace_account.sql'
               ) AS demo_workspace_account_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0067_toast_pos_orders.sql'
+              ) AS toast_pos_orders_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0068_quickbooks_write_connection_binding.sql'
+              ) AS quickbooks_write_connection_binding_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0069_pos_accounting_profiles_and_catalog_mappings.sql'
+              ) AS pos_accounting_profiles_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0070_toast_menu_catalog.sql'
+              ) AS toast_menu_catalog_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0071_quickbooks_accounting_reference_catalogs.sql'
+              ) AS quickbooks_reference_catalogs_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0072_toast_sync_rerun_requests.sql'
+              ) AS toast_sync_rerun_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0073_toast_sync_worker_hardening.sql'
+              ) AS toast_sync_worker_hardening_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0074_pos_accounting_issue_notifications.sql'
+              ) AS pos_accounting_notifications_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0075_quickbooks_write_binding_compatibility.sql'
+              ) AS quickbooks_write_binding_compatibility_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0076_pos_accounting_notification_consent.sql'
+              ) AS pos_accounting_notification_consent_migration_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -535,6 +596,16 @@ export async function GET() {
             && row?.quickbooks_write_control_migration_applied
             && row?.demo_quickbooks_crm_migration_applied
             && row?.demo_workspace_account_migration_applied
+            && row?.toast_pos_orders_migration_applied
+            && row?.quickbooks_write_connection_binding_migration_applied
+            && row?.pos_accounting_profiles_migration_applied
+            && row?.toast_menu_catalog_migration_applied
+            && row?.quickbooks_reference_catalogs_migration_applied
+            && row?.toast_sync_rerun_migration_applied
+            && row?.toast_sync_worker_hardening_migration_applied
+            && row?.pos_accounting_notifications_migration_applied
+            && row?.quickbooks_write_binding_compatibility_migration_applied
+            && row?.pos_accounting_notification_consent_migration_applied
             && row?.migration_checksums_present
           ),
         }
@@ -590,9 +661,203 @@ export async function GET() {
           || !row?.quickbooks_write_control_migration_applied
           || !row?.demo_quickbooks_crm_migration_applied
           || !row?.demo_workspace_account_migration_applied
+          || !row?.toast_pos_orders_migration_applied
+          || !row?.quickbooks_write_connection_binding_migration_applied
+          || !row?.pos_accounting_profiles_migration_applied
+          || !row?.toast_menu_catalog_migration_applied
+          || !row?.quickbooks_reference_catalogs_migration_applied
+          || !row?.toast_sync_rerun_migration_applied
+          || !row?.toast_sync_worker_hardening_migration_applied
+          || !row?.pos_accounting_notifications_migration_applied
+          || !row?.quickbooks_write_binding_compatibility_migration_applied
+          || !row?.pos_accounting_notification_consent_migration_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')
+        }
+
+        if (
+          row?.toast_integrations_migration_applied
+          && row?.quickbooks_connector_migration_applied
+          && row?.demo_workspace_account_migration_applied
+          && row?.quickbooks_write_control_migration_applied
+          && row?.quickbooks_write_connection_binding_migration_applied
+          && row?.pos_accounting_notifications_migration_applied
+          && row?.quickbooks_write_binding_compatibility_migration_applied
+          && row?.pos_accounting_notification_consent_migration_applied
+        ) {
+          const queueResult = await query<{
+            toast_pending: number
+            toast_failed: number
+            toast_dead: number
+            toast_stale_processing: number
+            toast_overdue: number
+            quickbooks_pending: number
+            quickbooks_failed: number
+            quickbooks_dead: number
+            quickbooks_stale_processing: number
+            quickbooks_overdue: number
+            quickbooks_write_processing: number
+            quickbooks_write_failed: number
+            quickbooks_write_dead: number
+            quickbooks_write_stale_processing: number
+            quickbooks_write_unbound_active: number
+            pos_notification_pending: number
+            pos_notification_failed: number
+            pos_notification_dead: number
+            pos_notification_stale_processing: number
+            pos_notification_overdue: number
+          }>(
+            `WITH toast_queue AS (
+               SELECT
+                 count(*) FILTER (WHERE job.status = 'pending')::integer AS pending,
+                 count(*) FILTER (WHERE job.status = 'failed')::integer AS failed,
+                 count(*) FILTER (WHERE job.status = 'dead')::integer AS dead,
+                 count(*) FILTER (
+                   WHERE job.status = 'processing'
+                     AND COALESCE(job.locked_at, job.updated_at) < now() - interval '15 minutes'
+                 )::integer AS stale_processing,
+                 count(*) FILTER (
+                   WHERE job.status IN ('pending', 'failed')
+                     AND job.available_at < now() - interval '15 minutes'
+                 )::integer AS overdue
+               FROM toast_sync_outbox job
+               JOIN workspace_organizations organization ON organization.id = job.organization_id
+               WHERE organization.is_demo = false
+             ), quickbooks_queue AS (
+               SELECT
+                 count(*) FILTER (WHERE job.status = 'pending')::integer AS pending,
+                 count(*) FILTER (WHERE job.status = 'failed')::integer AS failed,
+                 count(*) FILTER (WHERE job.status = 'dead')::integer AS dead,
+                 count(*) FILTER (
+                   WHERE job.status = 'processing'
+                     AND COALESCE(job.locked_at, job.updated_at) < now() - interval '15 minutes'
+                 )::integer AS stale_processing,
+                 count(*) FILTER (
+                   WHERE job.status IN ('pending', 'failed')
+                     AND job.available_at < now() - interval '15 minutes'
+                 )::integer AS overdue
+               FROM quickbooks_sync_outbox job
+               JOIN workspace_organizations organization ON organization.id = job.organization_id
+               WHERE organization.is_demo = false
+             ), quickbooks_write_queue AS (
+               SELECT
+                 count(*) FILTER (WHERE request.status = 'processing')::integer AS processing,
+                 count(*) FILTER (WHERE request.status = 'failed')::integer AS failed,
+                 count(*) FILTER (WHERE request.status = 'dead')::integer AS dead,
+                 count(*) FILTER (
+                   WHERE request.status = 'processing'
+                     AND COALESCE(request.locked_at, request.updated_at) < now() - interval '15 minutes'
+                 )::integer AS stale_processing,
+                 count(*) FILTER (
+                   WHERE request.reviewed_maton_connection_id IS NULL
+                     AND request.status NOT IN ('succeeded', 'cancelled')
+                 )::integer AS unbound_active
+               FROM quickbooks_write_requests request
+               JOIN workspace_organizations organization ON organization.id = request.organization_id
+               WHERE organization.is_demo = false
+             ), pos_notification_queue AS (
+               SELECT
+                 count(*) FILTER (WHERE notification.status = 'pending')::integer AS pending,
+                 count(*) FILTER (WHERE notification.status = 'failed')::integer AS failed,
+                 count(*) FILTER (WHERE notification.status = 'dead')::integer AS dead,
+                 count(*) FILTER (
+                   WHERE notification.status = 'processing'
+                     AND notification.locked_at < now() - interval '15 minutes'
+                 )::integer AS stale_processing,
+                 count(*) FILTER (
+                   WHERE notification.status IN ('pending', 'failed')
+                     AND notification.available_at < now() - interval '15 minutes'
+                 )::integer AS overdue
+               FROM pos_accounting_notification_outbox notification
+               JOIN pos_accounting_issue_states issue ON issue.id = notification.issue_state_id
+               JOIN workspace_organizations organization ON organization.id = issue.organization_id
+               WHERE organization.is_demo = false
+             )
+             SELECT
+               toast_queue.pending AS toast_pending,
+               toast_queue.failed AS toast_failed,
+               toast_queue.dead AS toast_dead,
+               toast_queue.stale_processing AS toast_stale_processing,
+               toast_queue.overdue AS toast_overdue,
+               quickbooks_queue.pending AS quickbooks_pending,
+               quickbooks_queue.failed AS quickbooks_failed,
+               quickbooks_queue.dead AS quickbooks_dead,
+               quickbooks_queue.stale_processing AS quickbooks_stale_processing,
+               quickbooks_queue.overdue AS quickbooks_overdue,
+               quickbooks_write_queue.processing AS quickbooks_write_processing,
+               quickbooks_write_queue.failed AS quickbooks_write_failed,
+               quickbooks_write_queue.dead AS quickbooks_write_dead,
+               quickbooks_write_queue.stale_processing AS quickbooks_write_stale_processing,
+               quickbooks_write_queue.unbound_active AS quickbooks_write_unbound_active,
+               pos_notification_queue.pending AS pos_notification_pending,
+               pos_notification_queue.failed AS pos_notification_failed,
+               pos_notification_queue.dead AS pos_notification_dead,
+               pos_notification_queue.stale_processing AS pos_notification_stale_processing,
+               pos_notification_queue.overdue AS pos_notification_overdue
+             FROM toast_queue
+             CROSS JOIN quickbooks_queue
+             CROSS JOIN quickbooks_write_queue
+             CROSS JOIN pos_notification_queue`,
+          )
+          const queue = queueResult.rows[0]
+          const queueErrors = Number(queue?.toast_dead || 0)
+            + Number(queue?.toast_stale_processing || 0)
+            + Number(queue?.toast_overdue || 0)
+            + Number(queue?.quickbooks_dead || 0)
+            + Number(queue?.quickbooks_stale_processing || 0)
+            + Number(queue?.quickbooks_overdue || 0)
+            + Number(queue?.quickbooks_write_dead || 0)
+            + Number(queue?.quickbooks_write_stale_processing || 0)
+            + Number(queue?.quickbooks_write_unbound_active || 0)
+            + Number(queue?.pos_notification_dead || 0)
+            + Number(queue?.pos_notification_stale_processing || 0)
+            + Number(queue?.pos_notification_overdue || 0)
+          integrationQueues = {
+            status: queueErrors > 0 ? 'error' : 'healthy',
+            toast: {
+              pending: Number(queue?.toast_pending || 0),
+              failed: Number(queue?.toast_failed || 0),
+              dead: Number(queue?.toast_dead || 0),
+              staleProcessing: Number(queue?.toast_stale_processing || 0),
+              overdue: Number(queue?.toast_overdue || 0),
+            },
+            quickBooks: {
+              pending: Number(queue?.quickbooks_pending || 0),
+              failed: Number(queue?.quickbooks_failed || 0),
+              dead: Number(queue?.quickbooks_dead || 0),
+              staleProcessing: Number(queue?.quickbooks_stale_processing || 0),
+              overdue: Number(queue?.quickbooks_overdue || 0),
+            },
+            quickBooksWrites: {
+              processing: Number(queue?.quickbooks_write_processing || 0),
+              failed: Number(queue?.quickbooks_write_failed || 0),
+              dead: Number(queue?.quickbooks_write_dead || 0),
+              staleProcessing: Number(queue?.quickbooks_write_stale_processing || 0),
+              unboundActive: Number(queue?.quickbooks_write_unbound_active || 0),
+            },
+            posAccountingNotifications: {
+              pending: Number(queue?.pos_notification_pending || 0),
+              failed: Number(queue?.pos_notification_failed || 0),
+              dead: Number(queue?.pos_notification_dead || 0),
+              staleProcessing: Number(queue?.pos_notification_stale_processing || 0),
+              overdue: Number(queue?.pos_notification_overdue || 0),
+            },
+          }
+          if (cloudProvider === 'railway') {
+            if (Number(queue?.toast_dead || 0) > 0) errors.push('Toast sync queue has terminal failed jobs.')
+            if (Number(queue?.toast_stale_processing || 0) > 0) errors.push('Toast sync queue has stale processing jobs.')
+            if (Number(queue?.toast_overdue || 0) > 0) errors.push('Toast sync queue has overdue jobs.')
+            if (Number(queue?.quickbooks_dead || 0) > 0) errors.push('QuickBooks sync queue has terminal failed jobs.')
+            if (Number(queue?.quickbooks_stale_processing || 0) > 0) errors.push('QuickBooks sync queue has stale processing jobs.')
+            if (Number(queue?.quickbooks_overdue || 0) > 0) errors.push('QuickBooks sync queue has overdue jobs.')
+            if (Number(queue?.quickbooks_write_dead || 0) > 0) errors.push('QuickBooks write queue has terminal failed requests.')
+            if (Number(queue?.quickbooks_write_stale_processing || 0) > 0) errors.push('QuickBooks write queue has stale processing requests.')
+            if (Number(queue?.quickbooks_write_unbound_active || 0) > 0) errors.push('QuickBooks write queue has requests without a reviewed connection binding.')
+            if (Number(queue?.pos_notification_dead || 0) > 0) errors.push('POS accounting notification queue has terminal failed deliveries.')
+            if (Number(queue?.pos_notification_stale_processing || 0) > 0) errors.push('POS accounting notification queue has stale processing deliveries.')
+            if (Number(queue?.pos_notification_overdue || 0) > 0) errors.push('POS accounting notification queue has overdue deliveries.')
+          }
         }
 
         if (cloudProvider === 'railway') {
@@ -756,6 +1021,7 @@ export async function GET() {
       agentResearchWorker,
       toastWorker,
       quickBooksWorker,
+      integrationQueues,
       crm,
       knowledgeWorkers,
       capabilities: {

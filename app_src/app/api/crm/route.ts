@@ -4,8 +4,11 @@ import { CRM_ENTITIES, type CrmEntity } from '@/lib/crm/types'
 import { enqueueCrmIntegrationAction } from '@/lib/crm/integrationActions'
 import { reconcileCrmBoardProjectionsForPipeline } from '@/lib/crm/boardProjection'
 import {
+  archiveCrmRecordInPostgres,
+  convertCrmLeadInPostgres,
   ensurePipelineCrmHierarchy,
   ensurePipelineCrmReferenceLinks,
+  listCrmCampaignRecipientsInPostgres,
   listCrmPipelineUsersInPostgres,
   listCrmRecordsInPostgres,
   readCrmRecordReference,
@@ -72,6 +75,23 @@ function uuidList(value: unknown, label: string) {
   return [...new Set(ids)]
 }
 
+function uuidValue(value: unknown, label: string) {
+  const id = stringValue(value, 50)
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id)) {
+    throw new Error(`${label} is invalid`)
+  }
+  return id
+}
+
+function relatedEntityValue(value: unknown): Exclude<CrmEntity, 'interactions' | 'products'> | undefined {
+  const entity = stringValue(value, 50)
+  if (!entity) return undefined
+  if (entity === 'interactions' || entity === 'products' || !CRM_ENTITIES.includes(entity as CrmEntity)) {
+    throw new Error('CRM activity relationship is invalid')
+  }
+  return entity as Exclude<CrmEntity, 'interactions' | 'products'>
+}
+
 function timezoneValue(value: unknown) {
   const timezone = stringValue(value, 100) || 'America/New_York'
   try {
@@ -100,6 +120,12 @@ export async function GET(req: NextRequest) {
     const actor = await requireRequestUser(req)
     const pipeline = await selectedPipeline(req, actor)
     const entity = entityValue(req.nextUrl.searchParams.get('entity') || 'organizations')
+    const relatedEntity = entity === 'interactions'
+      ? relatedEntityValue(req.nextUrl.searchParams.get('relatedEntity'))
+      : undefined
+    const relatedId = relatedEntity
+      ? uuidValue(req.nextUrl.searchParams.get('relatedId'), 'CRM activity record')
+      : undefined
     const currentOrganization = actor.organizationId
       ? await workspaceOrganizationById(actor.organizationId)
       : null
@@ -108,18 +134,23 @@ export async function GET(req: NextRequest) {
       && currentOrganization?.parentId === null
     await syncAppUserProfileToCrm({ email: actor.email, pipelineId: pipeline.id })
     await ensurePipelineCrmReferenceLinks(pipeline.id)
-    const [records, summary, workspaceHierarchy, matonCredential, pipelineUsers] = await Promise.all([
+    const [records, summary, workspaceHierarchy, matonCredential, pipelineUsers, campaignRecipients] = await Promise.all([
       listCrmRecordsInPostgres({
         pipelineId: pipeline.id,
         entity,
         query: req.nextUrl.searchParams.get('query') || '',
         limit: Number(req.nextUrl.searchParams.get('limit') || 250),
         needsReview: req.nextUrl.searchParams.get('needsReview') === 'true',
+        relatedEntity,
+        relatedId,
       }),
       readCrmSummaryFromPostgres(pipeline.id),
       listWorkspaceOrganizationHierarchy(actor),
       readMatonCredentialStateFromPostgres(actor.email),
       listCrmPipelineUsersInPostgres(pipeline.id),
+      relatedEntity === 'campaigns' && relatedId
+        ? listCrmCampaignRecipientsInPostgres({ pipelineId: pipeline.id, campaignId: relatedId })
+        : Promise.resolve([]),
     ])
     const selectedProviderEmail = (app: string) => matonCredential.connections.find((connection) => (
       connection.app === app
@@ -141,6 +172,7 @@ export async function GET(req: NextRequest) {
       },
       workspaceHierarchy,
       pipelineUsers,
+      campaignRecipients,
       canManageHierarchy: organizationRole === 'owner' || organizationRole === 'admin',
       providerIdentities: {
         googleMail: selectedProviderEmail('google-mail'),
@@ -232,12 +264,14 @@ export async function POST(req: NextRequest) {
     if (entity === 'leads') {
       const fullName = stringValue(fields.fullName, 250)
       if (!fullName) throw new Error('Lead name is required')
+      const nameParts = fullName.split(/\s+/).filter(Boolean)
       const staged = await stageCrmRecordInPostgres({
         entity, pipelineId: pipeline.id, localId: current?.id, sourceKey, actorEmail: actor.email,
-        sourcePayload: { source: 'clawpilot' },
+        sourcePayload: { ...(current?.sourcePayload || {}), source: 'clawpilot' },
         fields: {
           organizationId: organization?.id || null, organizationSuiteCrmId: organization?.suiteCrmId || null,
-          firstName: stringValue(fields.firstName, 100), lastName: stringValue(fields.lastName, 150), fullName,
+          firstName: stringValue(fields.firstName, 100) || nameParts[0] || fullName,
+          lastName: stringValue(fields.lastName, 150) || nameParts.slice(1).join(' '), fullName,
           companyName: organization?.name || stringValue(fields.companyName, 250), jobTitle: stringValue(fields.jobTitle, 250),
           email: validEmail(fields.email), phoneWork: stringValue(fields.phoneWork, 100),
           phoneMobile: stringValue(fields.phoneMobile, 100), status: stringValue(fields.status, 100),
@@ -301,18 +335,20 @@ export async function POST(req: NextRequest) {
 
 
     let contact: Awaited<ReturnType<typeof readCrmRecordReference>> | null = null
-    const contactId = fields.contactId || current?.contactId || null
+    const contactId = fields.contactId === undefined ? current?.contactId || null : stringValue(fields.contactId, 50) || null
     if (contactId) {
       contact = await readCrmRecordReference({ pipelineId: pipeline.id, entity: 'contacts', id: String(contactId) })
     }
     let lead: Awaited<ReturnType<typeof readCrmRecordReference>> | null = null
-    const leadId = fields.leadId || current?.leadId || null
+    const leadId = fields.leadId === undefined ? current?.leadId || null : stringValue(fields.leadId, 50) || null
     if (leadId) {
       lead = await readCrmRecordReference({ pipelineId: pipeline.id, entity: 'leads', id: String(leadId) })
     }
 
     let opportunity: Awaited<ReturnType<typeof readCrmRecordReference>> | null = null
-    const opportunityId = fields.opportunityId || current?.opportunityId || null
+    const opportunityId = fields.opportunityId === undefined
+      ? current?.opportunityId || null
+      : stringValue(fields.opportunityId, 50) || null
     if (opportunityId) {
       opportunity = await readCrmRecordReference({ pipelineId: pipeline.id, entity: 'opportunities', id: String(opportunityId) })
     }
@@ -396,20 +432,31 @@ export async function POST(req: NextRequest) {
     if (entity === 'campaigns') {
       const name = stringValue(fields.name, 250)
       if (!name) throw new Error('Campaign name is required')
+      const startDate = stringValue(fields.startDate, 20) || null
+      const endDate = stringValue(fields.endDate, 20) || null
+      if (startDate && endDate && endDate < startDate) throw new Error('Campaign end date must be on or after its start date')
       const staged = await stageCrmRecordInPostgres({
         entity, pipelineId: pipeline.id, localId: current?.id, sourceKey, actorEmail: actor.email,
-        sourcePayload: { source: 'clawpilot' },
+        sourcePayload: { ...(current?.sourcePayload || {}), source: 'clawpilot' },
         fields: {
           name, campaignType: 'email',
           status: ['draft', 'queued', 'sending', 'sent', 'paused', 'failed'].includes(String(fields.status))
             ? fields.status as 'draft' | 'queued' | 'sending' | 'sent' | 'paused' | 'failed'
             : 'draft',
-          startDate: stringValue(fields.startDate, 20) || null, endDate: stringValue(fields.endDate, 20) || null,
+          startDate, endDate,
           subjectTemplate: stringValue(fields.subjectTemplate, 500), bodyTemplate: stringValue(fields.bodyTemplate, 50_000),
           senderEmail: validEmail(fields.senderEmail), description: stringValue(fields.description, 10_000),
         },
       })
       return NextResponse.json({ ok: true, queued: true, record: staged }, { status: body?.id ? 200 : 201 })
+    }
+
+    let campaign: Awaited<ReturnType<typeof readCrmRecordReference>> | null = null
+    const campaignId = fields.campaignId === undefined
+      ? current?.campaignId || null
+      : stringValue(fields.campaignId, 50) || null
+    if (campaignId) {
+      campaign = await readCrmRecordReference({ pipelineId: pipeline.id, entity: 'campaigns', id: campaignId })
     }
 
     const subject = stringValue(fields.subject, 250)
@@ -418,6 +465,7 @@ export async function POST(req: NextRequest) {
       || contact?.suiteCrmId
       || lead?.suiteCrmId
       || organization?.suiteCrmId
+      || campaign?.suiteCrmId
       || null
     const parentSuiteCrmType = opportunity?.suiteCrmId
       ? 'Opportunities' as const
@@ -427,15 +475,19 @@ export async function POST(req: NextRequest) {
           ? 'Leads' as const
           : organization?.suiteCrmId
             ? 'Accounts' as const
-            : undefined
+            : campaign?.suiteCrmId
+              ? 'Campaigns' as const
+              : undefined
     const staged = await stageCrmRecordInPostgres({
       entity, pipelineId: pipeline.id, localId: current?.id, sourceKey, actorEmail: actor.email,
       sourcePayload: { ...(current?.sourcePayload || {}), source: 'clawpilot' },
       fields: {
         organizationId: organization?.id || contact?.organizationId || lead?.organizationId || current?.organizationId || null,
         contactId: contact?.id || null, leadId: lead?.id || null, opportunityId: opportunity?.id || null,
-        meetingId: stringValue(fields.meetingId || current?.meetingId) || null,
-        campaignId: stringValue(fields.campaignId || current?.campaignId) || null,
+        meetingId: fields.meetingId === undefined
+          ? current?.meetingId || null
+          : stringValue(fields.meetingId, 50) || null,
+        campaignId: campaign?.id || null,
         parentSuiteCrmId, parentSuiteCrmType, interactionType: stringValue(fields.interactionType, 100),
         subject, agentEmail: validEmail(fields.agentEmail || current?.agentEmail),
         agentName: stringValue(fields.agentName || current?.agentName, 200),
@@ -448,6 +500,55 @@ export async function POST(req: NextRequest) {
       },
     })
     return NextResponse.json({ ok: true, queued: true, record: staged }, { status: body?.id ? 200 : 201 })
+  } catch (error) {
+    return errorResponse(error)
+  }
+}
+
+export async function PATCH(req: NextRequest) {
+  if (!isPostgresStorageEnabled()) return NextResponse.json({ ok: false, error: 'CRM requires Postgres storage' }, { status: 409 })
+  try {
+    const actor = await requireRequestUser(req)
+    const pipeline = await selectedPipeline(req, actor)
+    requireResourceEditor(pipeline)
+    const body = await req.json()
+    const action = stringValue(body?.action, 50)
+    const id = uuidValue(body?.id, 'CRM record')
+
+    if (action === 'archive') {
+      const entity = entityValue(body?.entity)
+      if (entity !== 'leads' && entity !== 'campaigns') {
+        throw new Error('Only leads and campaigns can be archived from this workflow')
+      }
+      const result = await archiveCrmRecordInPostgres({
+        pipelineId: pipeline.id,
+        entity,
+        id,
+        actorEmail: actor.email,
+      })
+      return NextResponse.json({ ok: true, result })
+    }
+
+    if (action === 'convert-lead') {
+      if (body?.entity !== undefined && entityValue(body.entity) !== 'leads') {
+        throw new Error('Lead conversion requires a lead record')
+      }
+      const hierarchy = await ensurePipelineCrmHierarchy({ pipelineId: pipeline.id, actorEmail: actor.email })
+      const fields = body?.fields === undefined ? {} : objectValue(body.fields)
+      const result = await convertCrmLeadInPostgres({
+        pipelineId: pipeline.id,
+        leadId: id,
+        actorEmail: actor.email,
+        customerParentId: hierarchy.customerParent.id,
+        customerParentSuiteCrmId: hierarchy.customerParent.suiteCrmId,
+        accountName: stringValue(fields.accountName, 250),
+        opportunityName: stringValue(fields.opportunityName, 250),
+        opportunityValue: numberValue(fields.opportunityValue),
+      })
+      return NextResponse.json({ ok: true, result })
+    }
+
+    throw new Error('CRM lifecycle action is invalid')
   } catch (error) {
     return errorResponse(error)
   }

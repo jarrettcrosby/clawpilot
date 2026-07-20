@@ -156,10 +156,15 @@ export type CrmInteraction = {
   organizationId: string | null
   organizationName: string
   contactId: string | null
+  contactName: string
   opportunityId: string | null
+  opportunityName: string
   leadId: string | null
+  leadName: string
   meetingId: string | null
+  meetingName: string
   campaignId: string | null
+  campaignName: string
   suiteCrmId: string | null
   sourceKey: string
   sourceRowNumber: number | null
@@ -185,8 +190,13 @@ export type CrmLead = {
   pipelineId: string
   organizationId: string | null
   organizationName: string
+  organizationReferenceCode: string | null
   convertedContactId: string | null
+  convertedContactReferenceCode: string | null
+  convertedContactName: string
   convertedOpportunityId: string | null
+  convertedOpportunityReferenceCode: string | null
+  convertedOpportunityName: string
   suiteCrmId: string | null
   sourceKey: string
   firstName: string
@@ -260,6 +270,20 @@ export type CrmCampaign = {
   failedCount: number
   syncStatus: CrmSyncStatus
   syncError: string | null
+  updatedAt: string
+}
+
+export type CrmCampaignRecipient = {
+  id: string
+  campaignId: string
+  contactId: string | null
+  leadId: string | null
+  referenceCode: string
+  name: string
+  email: string
+  status: 'pending' | 'queued' | 'sent' | 'failed' | 'suppressed'
+  sentAt: string | null
+  lastError: string | null
   updatedAt: string
 }
 

@@ -21,7 +21,7 @@ const healthy = {
     ],
     capabilities: { quickBooks: true },
   },
-  persistence: { ok: true, driver: 'postgres', database: 'reachable' },
+  persistence: { ok: true, driver: 'postgres', database: 'reachable', databaseFingerprint: 'database-test-id' },
   runtime: { branch: 'main', environment: 'production' },
 }
 
@@ -32,12 +32,14 @@ unhealthy.health.quickBooksWorker.status = 'stale'
 unhealthy.health.knowledgeWorkers[1].phase = 'failed'
 unhealthy.boundary.tasksRejected = false
 unhealthy.runtime.branch = 'dev'
+unhealthy.persistence.databaseFingerprint = null
 assert.deepEqual(
   validateMonitorSnapshot(unhealthy, { branch: 'main', environment: 'production' }),
   [
     'unauthenticated tasks request was not rejected',
     'QuickBooks sync worker is not reachable',
     'document-embeddings worker is not healthy',
+    'persistence database identity is missing',
     'runtime branch is dev, expected main',
   ],
 )

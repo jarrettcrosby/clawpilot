@@ -3,14 +3,17 @@ import { recordAuditEvent } from '@/lib/auditWriter'
 import type {
   QuickBooksAccount,
   QuickBooksAttachment,
+  QuickBooksClass,
   QuickBooksCompanyInfo,
   QuickBooksCustomer,
+  QuickBooksDepartment,
   QuickBooksFinancialReportSnapshot,
   QuickBooksItem,
+  QuickBooksTaxCode,
   QuickBooksTransaction,
   QuickBooksVendor,
 } from '@/lib/integrations/quickBooksClient'
-import { query, withTransaction } from '@/lib/persistence/postgres'
+import { acquireTransactionAdvisoryLock, query, withTransaction } from '@/lib/persistence/postgres'
 
 export const QUICKBOOKS_MAPPING_KEYS = [
   'gross_sales', 'discounts', 'voids', 'refunds', 'taxes', 'tips', 'service_charges',
@@ -31,6 +34,149 @@ export type QuickBooksSyncJob = {
 
 function safeError(value: unknown) {
   return String(value || 'QuickBooks sync failed').replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 1000)
+}
+
+type TransactionClient = Parameters<Parameters<typeof withTransaction>[0]>[0]
+
+type QuickBooksConnectionBindingRow = {
+  maton_connection_id: string
+  company_name: string
+  country: string | null
+}
+
+type CancelledQuickBooksWriteRow = {
+  id: string
+  operation_kind: string
+  previous_status: string
+  provider_request_id: string
+  request_fingerprint: string
+}
+
+async function assertNoProcessingQuickBooksWrites(client: TransactionClient, organizationId: string) {
+  const processing = await client.query<{ exists: boolean }>(
+    `SELECT EXISTS (
+       SELECT 1 FROM quickbooks_write_requests
+       WHERE organization_id = $1::uuid AND status = 'processing'
+     ) AS exists`,
+    [organizationId],
+  )
+  if (processing.rows[0]?.exists) {
+    throw new Error('Wait for the in-progress QuickBooks write to finish before changing the connection')
+  }
+}
+
+async function cancelUnpostedQuickBooksWrites(input: {
+  client: TransactionClient
+  organizationId: string
+  actorEmail: string
+  reason: 'connection_rebound' | 'connection_disconnected'
+}) {
+  const errorCode = input.reason === 'connection_rebound'
+    ? 'QUICKBOOKS_WRITE_CONNECTION_REBOUND'
+    : 'QUICKBOOKS_WRITE_CONNECTION_DISCONNECTED'
+  const errorMessage = input.reason === 'connection_rebound'
+    ? 'Accounting change cancelled because the reviewed QuickBooks connection was replaced.'
+    : 'Accounting change cancelled because QuickBooks was disconnected.'
+  const cancelled = await input.client.query<CancelledQuickBooksWriteRow>(
+    `WITH cancellable AS (
+       SELECT id, status AS previous_status
+       FROM quickbooks_write_requests
+       WHERE organization_id = $1::uuid
+         AND status IN ('draft', 'pending_approval', 'approved', 'failed', 'dead')
+       FOR UPDATE
+     )
+     UPDATE quickbooks_write_requests request SET
+       status = 'cancelled', cancelled_by = lower($2), cancelled_at = COALESCE(request.cancelled_at, now()),
+       locked_at = NULL, locked_by = NULL, lock_token = NULL,
+       last_error_code = $3, last_error_message = $4, updated_at = now()
+     FROM cancellable
+     WHERE request.id = cancellable.id
+     RETURNING request.id::text, request.operation_kind, cancellable.previous_status,
+       request.provider_request_id, request.request_fingerprint`,
+    [input.organizationId, input.actorEmail, errorCode, errorMessage],
+  )
+  for (const request of cancelled.rows) {
+    await recordAuditEvent({
+      actor: input.actorEmail,
+      eventType: 'quickbooks.write.cancelled',
+      aggregateType: 'quickbooks_write_request',
+      aggregateId: request.id,
+      organizationId: input.organizationId,
+      payload: {
+        operationKind: request.operation_kind,
+        previousStatus: request.previous_status,
+        requestStatus: 'cancelled',
+        providerRequestId: request.provider_request_id,
+        requestFingerprint: request.request_fingerprint,
+        reason: input.reason,
+      },
+    }, input.client)
+  }
+  return cancelled.rowCount || 0
+}
+
+async function invalidatePosAccountingQuickBooksBinding(input: {
+  client: TransactionClient
+  organizationId: string
+  actorEmail: string
+}) {
+  const currentProfiles = await input.client.query<{ id: string }>(
+    `SELECT id::text
+     FROM pos_accounting_profiles
+     WHERE organization_id = $1::uuid AND effective_to IS NULL
+     ORDER BY restaurant_guid NULLS FIRST, profile_revision
+     FOR UPDATE`,
+    [input.organizationId],
+  )
+  for (const profile of currentProfiles.rows) {
+    await input.client.query(
+      `UPDATE pos_accounting_profiles SET effective_to = clock_timestamp()
+       WHERE id = $1::uuid AND effective_to IS NULL`,
+      [profile.id],
+    )
+    await input.client.query(
+      `INSERT INTO pos_accounting_profiles (
+         organization_id, restaurant_guid, profile_revision, schema_version,
+         quickbooks_binding_status, quickbooks_connection_fingerprint,
+         quickbooks_company_name, quickbooks_connection_verified_at, quickbooks_catalog_synced_at,
+         posting_method, quickbooks_class_id, quickbooks_class_name,
+         quickbooks_department_id, quickbooks_department_name,
+         quickbooks_customer_id, quickbooks_customer_name,
+         quickbooks_clearing_account_id, quickbooks_clearing_account_name,
+         track_sales_tax, breakout_dimensions, memo_mode, custom_memo,
+         custom_transaction_number, transaction_number_suffix,
+         suppress_zero_over_short, auto_payout_tips, deposit_checks_with_cash,
+         open_check_policy, batch_hold_policy,
+         email_notifications_enabled, email_notifications_enabled_at, created_by
+       )
+       SELECT previous.organization_id, previous.restaurant_guid,
+         (SELECT COALESCE(MAX(candidate.profile_revision), 0)::integer + 1
+          FROM pos_accounting_profiles candidate
+          WHERE candidate.organization_id = previous.organization_id
+            AND candidate.restaurant_guid IS NOT DISTINCT FROM previous.restaurant_guid),
+         previous.schema_version,
+         'unbound', NULL, NULL, NULL, NULL,
+         previous.posting_method, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+         previous.track_sales_tax, previous.breakout_dimensions, previous.memo_mode, previous.custom_memo,
+         previous.custom_transaction_number, previous.transaction_number_suffix,
+         previous.suppress_zero_over_short, previous.auto_payout_tips, previous.deposit_checks_with_cash,
+         previous.open_check_policy, previous.batch_hold_policy,
+         previous.email_notifications_enabled, previous.email_notifications_enabled_at, lower($2)
+       FROM pos_accounting_profiles previous
+       WHERE previous.id = $1::uuid`,
+      [profile.id, input.actorEmail],
+    )
+  }
+  const invalidatedMappings = await input.client.query<{ id: string }>(
+    `UPDATE pos_accounting_catalog_mappings SET effective_to = clock_timestamp()
+     WHERE organization_id = $1::uuid AND effective_to IS NULL
+     RETURNING id::text`,
+    [input.organizationId],
+  )
+  return {
+    profileCount: currentProfiles.rowCount || 0,
+    mappingCount: invalidatedMappings.rowCount || 0,
+  }
 }
 
 export async function readQuickBooksIntegrationStateFromPostgres(organizationId: string) {
@@ -60,6 +206,7 @@ export async function readQuickBooksIntegrationStateFromPostgres(organizationId:
     ),
     query<{
       accounts: string; items: string; customers: string; vendors: string
+      classes: string; departments: string; tax_codes: string
       transactions: string; attachments: string; reports: string
     }>(
       `SELECT
@@ -67,6 +214,9 @@ export async function readQuickBooksIntegrationStateFromPostgres(organizationId:
          (SELECT count(*) FROM quickbooks_items WHERE organization_id = $1::uuid)::text AS items,
          (SELECT count(*) FROM quickbooks_customers WHERE organization_id = $1::uuid)::text AS customers,
          (SELECT count(*) FROM quickbooks_vendors WHERE organization_id = $1::uuid)::text AS vendors,
+         (SELECT count(*) FROM quickbooks_classes WHERE organization_id = $1::uuid)::text AS classes,
+         (SELECT count(*) FROM quickbooks_departments WHERE organization_id = $1::uuid)::text AS departments,
+         (SELECT count(*) FROM quickbooks_tax_codes WHERE organization_id = $1::uuid)::text AS tax_codes,
          (SELECT count(*) FROM quickbooks_transactions WHERE organization_id = $1::uuid)::text AS transactions,
          (SELECT count(*) FROM quickbooks_attachments WHERE organization_id = $1::uuid)::text AS attachments,
          (SELECT count(*) FROM quickbooks_financial_reports
@@ -145,6 +295,9 @@ export async function readQuickBooksIntegrationStateFromPostgres(organizationId:
       items: Number(counts.rows[0]?.items || 0),
       customers: Number(counts.rows[0]?.customers || 0),
       vendors: Number(counts.rows[0]?.vendors || 0),
+      classes: Number(counts.rows[0]?.classes || 0),
+      departments: Number(counts.rows[0]?.departments || 0),
+      taxCodes: Number(counts.rows[0]?.tax_codes || 0),
       transactions: Number(counts.rows[0]?.transactions || 0),
       attachments: Number(counts.rows[0]?.attachments || 0),
       reports: Number(counts.rows[0]?.reports || 0),
@@ -211,12 +364,43 @@ export async function bindQuickBooksConnectionInPostgres(input: {
   actorEmail: string
 }) {
   await withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(client, `quickbooks-binding:${input.organizationId}`)
+    const current = await client.query<QuickBooksConnectionBindingRow>(
+      `SELECT maton_connection_id, company_name, country
+       FROM organization_quickbooks_connections
+       WHERE organization_id = $1::uuid
+       FOR UPDATE`,
+      [input.organizationId],
+    )
+    const currentBinding = current.rows[0]
+    const bindingChanged = Boolean(currentBinding) && (
+      currentBinding.maton_connection_id !== input.connectionId
+      || currentBinding.company_name !== input.company.companyName
+      || currentBinding.country !== input.company.country
+    )
+    let cancelledWriteRequestCount = 0
+    if (bindingChanged) {
+      await assertNoProcessingQuickBooksWrites(client, input.organizationId)
+      cancelledWriteRequestCount = await cancelUnpostedQuickBooksWrites({
+        client,
+        organizationId: input.organizationId,
+        actorEmail: input.actorEmail,
+        reason: 'connection_rebound',
+      })
+    }
     const conflict = await client.query<{ organization_id: string }>(
       `SELECT organization_id::text FROM organization_quickbooks_connections
        WHERE maton_connection_id = $1 AND organization_id <> $2::uuid LIMIT 1`,
       [input.connectionId, input.organizationId],
     )
     if (conflict.rowCount) throw new Error('This QuickBooks company is already bound to another ClawPilot organization')
+    const invalidatedPosAccounting = bindingChanged || !currentBinding
+      ? await invalidatePosAccountingQuickBooksBinding({
+          client,
+          organizationId: input.organizationId,
+          actorEmail: input.actorEmail,
+        })
+      : { profileCount: 0, mappingCount: 0 }
     await client.query(
       `INSERT INTO organization_quickbooks_connections (
          organization_id, credential_owner_email, maton_connection_id, company_name, country,
@@ -231,6 +415,27 @@ export async function bindQuickBooksConnectionInPostgres(input: {
          status = 'active',
          catalog_sync_enabled = true,
          verified_at = now(),
+         write_mode = CASE
+           WHEN organization_quickbooks_connections.maton_connection_id IS DISTINCT FROM EXCLUDED.maton_connection_id
+             OR organization_quickbooks_connections.company_name IS DISTINCT FROM EXCLUDED.company_name
+             OR organization_quickbooks_connections.country IS DISTINCT FROM EXCLUDED.country
+             THEN 'disabled'
+           ELSE organization_quickbooks_connections.write_mode
+         END,
+         write_verified_at = CASE
+           WHEN organization_quickbooks_connections.maton_connection_id IS DISTINCT FROM EXCLUDED.maton_connection_id
+             OR organization_quickbooks_connections.company_name IS DISTINCT FROM EXCLUDED.company_name
+             OR organization_quickbooks_connections.country IS DISTINCT FROM EXCLUDED.country
+             THEN NULL
+           ELSE organization_quickbooks_connections.write_verified_at
+         END,
+         write_verified_by = CASE
+           WHEN organization_quickbooks_connections.maton_connection_id IS DISTINCT FROM EXCLUDED.maton_connection_id
+             OR organization_quickbooks_connections.company_name IS DISTINCT FROM EXCLUDED.company_name
+             OR organization_quickbooks_connections.country IS DISTINCT FROM EXCLUDED.country
+             THEN NULL
+           ELSE organization_quickbooks_connections.write_verified_by
+         END,
          last_error_code = NULL,
          updated_by = EXCLUDED.updated_by,
          updated_at = now()`,
@@ -262,6 +467,9 @@ export async function bindQuickBooksConnectionInPostgres(input: {
     await client.query('DELETE FROM quickbooks_items WHERE organization_id = $1::uuid', [input.organizationId])
     await client.query('DELETE FROM quickbooks_customers WHERE organization_id = $1::uuid', [input.organizationId])
     await client.query('DELETE FROM quickbooks_vendors WHERE organization_id = $1::uuid', [input.organizationId])
+    await client.query('DELETE FROM quickbooks_classes WHERE organization_id = $1::uuid', [input.organizationId])
+    await client.query('DELETE FROM quickbooks_departments WHERE organization_id = $1::uuid', [input.organizationId])
+    await client.query('DELETE FROM quickbooks_tax_codes WHERE organization_id = $1::uuid', [input.organizationId])
     await client.query('DELETE FROM quickbooks_transactions WHERE organization_id = $1::uuid', [input.organizationId])
     await client.query('DELETE FROM quickbooks_attachments WHERE organization_id = $1::uuid', [input.organizationId])
     await client.query('DELETE FROM quickbooks_financial_reports WHERE organization_id = $1::uuid', [input.organizationId])
@@ -278,19 +486,49 @@ export async function bindQuickBooksConnectionInPostgres(input: {
       aggregateType: 'workspace_organization',
       aggregateId: input.organizationId,
       organizationId: input.organizationId,
-      payload: { companyName: input.company.companyName, country: input.company.country },
+      payload: {
+        companyName: input.company.companyName,
+        country: input.company.country,
+        bindingChanged,
+        writeVerificationReset: bindingChanged,
+        cancelledWriteRequestCount,
+        invalidatedPosAccountingProfileCount: invalidatedPosAccounting.profileCount,
+        invalidatedPosAccountingMappingCount: invalidatedPosAccounting.mappingCount,
+      },
     }, client)
   })
 }
 
 export async function disconnectQuickBooksConnectionInPostgres(input: { organizationId: string; actorEmail: string }) {
   await withTransaction(async (client) => {
-    const removed = await client.query<{ company_name: string }>(
-      `DELETE FROM organization_quickbooks_connections
-       WHERE organization_id = $1::uuid RETURNING company_name`,
+    await acquireTransactionAdvisoryLock(client, `quickbooks-binding:${input.organizationId}`)
+    const current = await client.query<QuickBooksConnectionBindingRow>(
+      `SELECT maton_connection_id, company_name, country
+       FROM organization_quickbooks_connections
+       WHERE organization_id = $1::uuid
+       FOR UPDATE`,
       [input.organizationId],
     )
-    if (!removed.rowCount) return
+    if (!current.rowCount) return
+    await assertNoProcessingQuickBooksWrites(client, input.organizationId)
+    const cancelledWriteRequestCount = await cancelUnpostedQuickBooksWrites({
+      client,
+      organizationId: input.organizationId,
+      actorEmail: input.actorEmail,
+      reason: 'connection_disconnected',
+    })
+    const invalidatedPosAccounting = await invalidatePosAccountingQuickBooksBinding({
+      client,
+      organizationId: input.organizationId,
+      actorEmail: input.actorEmail,
+    })
+    const removed = await client.query<{ company_name: string }>(
+      `DELETE FROM organization_quickbooks_connections
+       WHERE organization_id = $1::uuid AND maton_connection_id = $2
+       RETURNING company_name`,
+      [input.organizationId, current.rows[0].maton_connection_id],
+    )
+    if (!removed.rowCount) throw new Error('QuickBooks connection changed before it could be disconnected')
     await client.query(
       `UPDATE toast_accounting_mappings SET
          quickbooks_account_id = NULL, quickbooks_account_name = NULL,
@@ -309,7 +547,12 @@ export async function disconnectQuickBooksConnectionInPostgres(input: { organiza
       aggregateType: 'workspace_organization',
       aggregateId: input.organizationId,
       organizationId: input.organizationId,
-      payload: { companyName: removed.rows[0].company_name },
+      payload: {
+        companyName: removed.rows[0].company_name,
+        cancelledWriteRequestCount,
+        invalidatedPosAccountingProfileCount: invalidatedPosAccounting.profileCount,
+        invalidatedPosAccountingMappingCount: invalidatedPosAccounting.mappingCount,
+      },
     }, client)
   })
 }
@@ -447,11 +690,32 @@ export async function completeQuickBooksCatalogSyncInPostgres(input: {
   items: QuickBooksItem[]
   customers: QuickBooksCustomer[]
   vendors: QuickBooksVendor[]
+  classes: QuickBooksClass[]
+  departments: QuickBooksDepartment[]
+  taxCodes: QuickBooksTaxCode[]
   transactions: QuickBooksTransaction[]
   attachments: QuickBooksAttachment[]
   reports: QuickBooksFinancialReportSnapshot[]
 }) {
   await withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(client, `quickbooks-binding:${input.job.organizationId}`)
+    const activeBinding = await client.query(
+      `SELECT organization_id
+       FROM organization_quickbooks_connections
+       WHERE organization_id = $1::uuid AND maton_connection_id = $2
+       FOR SHARE`,
+      [input.job.organizationId, input.job.connectionId],
+    )
+    if (activeBinding.rowCount !== 1) throw new Error('QuickBooks connection changed before catalog completion')
+    const activeLease = await client.query(
+      `SELECT id
+       FROM quickbooks_sync_outbox
+       WHERE id = $1::uuid AND organization_id = $2::uuid
+         AND status = 'processing' AND lock_token = $3::uuid
+       FOR UPDATE`,
+      [input.job.id, input.job.organizationId, input.job.lockToken],
+    )
+    if (activeLease.rowCount !== 1) throw new Error('QuickBooks sync lease was lost')
     await client.query('DELETE FROM quickbooks_accounts WHERE organization_id = $1::uuid', [input.job.organizationId])
     for (const account of input.accounts) {
       await client.query(
@@ -512,6 +776,45 @@ export async function completeQuickBooksCatalogSyncInPostgres(input: {
            "currencyCode" text, balance numeric, active boolean, "sourcePayload" jsonb
          )`,
         [input.job.organizationId, JSON.stringify(input.vendors.slice(offset, offset + 500))],
+      )
+    }
+    await client.query('DELETE FROM quickbooks_classes WHERE organization_id = $1::uuid', [input.job.organizationId])
+    for (const dimension of input.classes) {
+      await client.query(
+        `INSERT INTO quickbooks_classes (
+           organization_id, quickbooks_class_id, name, fully_qualified_name,
+           child, parent_id, active, source_payload, synced_at
+         ) VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8::jsonb, now())`,
+        [
+          input.job.organizationId, dimension.id, dimension.name, dimension.fullyQualifiedName,
+          dimension.child, dimension.parentId, dimension.active, JSON.stringify(dimension.sourcePayload),
+        ],
+      )
+    }
+    await client.query('DELETE FROM quickbooks_departments WHERE organization_id = $1::uuid', [input.job.organizationId])
+    for (const dimension of input.departments) {
+      await client.query(
+        `INSERT INTO quickbooks_departments (
+           organization_id, quickbooks_department_id, name, fully_qualified_name,
+           child, parent_id, active, source_payload, synced_at
+         ) VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8::jsonb, now())`,
+        [
+          input.job.organizationId, dimension.id, dimension.name, dimension.fullyQualifiedName,
+          dimension.child, dimension.parentId, dimension.active, JSON.stringify(dimension.sourcePayload),
+        ],
+      )
+    }
+    await client.query('DELETE FROM quickbooks_tax_codes WHERE organization_id = $1::uuid', [input.job.organizationId])
+    for (const taxCode of input.taxCodes) {
+      await client.query(
+        `INSERT INTO quickbooks_tax_codes (
+           organization_id, quickbooks_tax_code_id, name, description,
+           taxable, active, source_payload, synced_at
+         ) VALUES ($1::uuid, $2, $3, $4, $5, $6, $7::jsonb, now())`,
+        [
+          input.job.organizationId, taxCode.id, taxCode.name, taxCode.description,
+          taxCode.taxable, taxCode.active, JSON.stringify(taxCode.sourcePayload),
+        ],
       )
     }
     await client.query('DELETE FROM quickbooks_transactions WHERE organization_id = $1::uuid', [input.job.organizationId])
@@ -652,6 +955,9 @@ export async function completeQuickBooksCatalogSyncInPostgres(input: {
         items: input.items.length,
         customers: input.customers.length,
         vendors: input.vendors.length,
+        classes: input.classes.length,
+        departments: input.departments.length,
+        taxCodes: input.taxCodes.length,
         transactions: input.transactions.length,
         attachments: input.attachments.length,
         reportsReady: input.reports.filter((report) => report.status === 'ready').length,
@@ -672,6 +978,9 @@ export async function completeQuickBooksCatalogSyncInPostgres(input: {
         items: input.items.length,
         customers: input.customers.length,
         vendors: input.vendors.length,
+        classes: input.classes.length,
+        departments: input.departments.length,
+        taxCodes: input.taxCodes.length,
         transactions: input.transactions.length,
         attachments: input.attachments.length,
         reportsReady: input.reports.filter((report) => report.status === 'ready').length,

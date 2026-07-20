@@ -329,11 +329,13 @@ async function readCampaignTargets(pipelineId: string, references: string[]): Pr
        full_name, email, email_opt_out, organization_id::text, suitecrm_id
      FROM crm_contacts
      WHERE pipeline_id = $1::uuid AND reference_code = ANY($2::text[])
+       AND COALESCE(lower(source_payload->>'archived'), 'false') NOT IN ('true', '1', 'yes')
      UNION ALL
      SELECT 'leads'::text AS entity, id::text, reference_code, first_name, last_name,
        full_name, email, email_opt_out, organization_id::text, suitecrm_id
      FROM crm_leads
-     WHERE pipeline_id = $1::uuid AND reference_code = ANY($2::text[])`,
+     WHERE pipeline_id = $1::uuid AND reference_code = ANY($2::text[])
+       AND COALESCE(lower(source_payload->>'archived'), 'false') NOT IN ('true', '1', 'yes')`,
     [pipelineId, references],
   )
   const found = new Set(result.rows.map((row) => row.reference_code))
@@ -1672,7 +1674,16 @@ async function expandCampaignAction(action: LeasedCrmIntegrationAction, target: 
            last_error = CASE WHEN EXCLUDED.status = 'suppressed' THEN NULL ELSE crm_campaign_recipients.last_error END,
            updated_at = now()
          RETURNING id::text, email, status`,
-        [action.pipelineId, target.id, JSON.stringify(recipientWrites)],
+        [
+          action.pipelineId,
+          target.id,
+          JSON.stringify(recipientWrites.map(({ contactId, leadId, mergeData, ...recipient }) => ({
+            ...recipient,
+            contact_id: contactId,
+            lead_id: leadId,
+            merge_data: mergeData,
+          }))),
+        ],
       )
     const writeByEmail = new Map(recipientWrites.map((recipient) => [recipient.email, recipient]))
     let queuedCount = 0

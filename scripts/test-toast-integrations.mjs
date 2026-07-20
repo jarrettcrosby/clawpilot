@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict'
 import crypto from 'node:crypto'
+import { spawnSync } from 'node:child_process'
 import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
@@ -10,6 +11,7 @@ const root = process.cwd()
 const nodeRequire = createRequire(import.meta.url)
 const requireFromApp = createRequire(new URL('../app_src/package.json', import.meta.url))
 const ts = requireFromApp('typescript')
+const { Pool } = requireFromApp('pg')
 const organizationId = '11111111-1111-4111-8111-111111111111'
 const otherOrganizationId = '22222222-2222-4222-8222-222222222222'
 const restaurantGuid = '33333333-3333-4333-8333-333333333333'
@@ -84,15 +86,80 @@ for (const fragment of [
   'idempotency_key',
   'reporting: ToastReportingState',
   "result_summary ->> 'records'",
-  'WHERE organization_id = $1::uuid\n       GROUP BY sync_kind',
+  "GROUP BY CASE WHEN sync_kind = 'standard_order_updates' THEN 'standard_orders' ELSE sync_kind END",
+  "syncKind: 'analytics_sales' | 'analytics_payouts' | 'standard_orders' | 'standard_order_updates'",
+  "COALESCE(locked_at, updated_at) < now() - interval '15 minutes'",
+  'AND lock_token = $4::uuid',
+  'AND lock_token = $3::uuid',
+  'rerun_requested_at',
+  'make_interval(secs => $6::integer)',
+  "CASE WHEN rerun_requested_at IS NULL THEN 'succeeded' ELSE 'pending' END",
+  'canonicalReadinessVerified: false',
 ]) {
   assert.ok(persistence.includes(fragment), `Toast persistence contract missing ${fragment}`)
 }
 assert.ok(!persistence.includes('console.'), 'Toast persistence must not log credentials or payloads')
+assert.ok(!persistence.includes("status = 'pending', attempt_count = 0"), 'automatic Toast sync must not resurrect terminal jobs')
+
+const posMigration = read('db/migrations/0067_toast_pos_orders.sql')
+for (const fragment of [
+  'CREATE TABLE IF NOT EXISTS toast_pos_orders',
+]) {
+  assert.ok(posMigration.includes(fragment), `Toast POS migration missing ${fragment}`)
+}
+
+const workerHardeningMigration = read('db/migrations/0073_toast_sync_worker_hardening.sql')
+for (const fragment of [
+  'ADD COLUMN IF NOT EXISTS lock_token uuid',
+  "'standard_order_updates'",
+  "'deployment.database.identity'",
+]) {
+  assert.ok(workerHardeningMigration.includes(fragment), `Toast worker hardening migration missing ${fragment}`)
+}
+
+const rerunMigration = read('db/migrations/0072_toast_sync_rerun_requests.sql')
+assert.ok(
+  rerunMigration.includes('ADD COLUMN IF NOT EXISTS rerun_requested_at timestamptz'),
+  'Toast rerun migration must add the durable follow-up marker',
+)
+
+const notificationMigration = read('db/migrations/0074_pos_accounting_issue_notifications.sql')
+for (const fragment of [
+  'CREATE TABLE IF NOT EXISTS pos_accounting_issue_states',
+  'CREATE TABLE IF NOT EXISTS pos_accounting_notification_outbox',
+  'issue_fingerprint text NOT NULL',
+  'issues jsonb NOT NULL',
+  'pos_accounting_notification_delivery_unique',
+  "status IN ('pending', 'processing', 'failed', 'succeeded', 'dead', 'cancelled')",
+]) {
+  assert.ok(notificationMigration.includes(fragment), `POS accounting notification migration missing ${fragment}`)
+}
+
+const notificationConsentMigration = read('db/migrations/0076_pos_accounting_notification_consent.sql')
+for (const fragment of [
+  'email_notifications_enabled boolean NOT NULL DEFAULT false',
+  'email_notifications_enabled_at timestamptz',
+  'pos_accounting_notification_recipient_deliverable',
+  "recipient_email = 'demo-system@clawpilot.example'",
+]) {
+  assert.ok(notificationConsentMigration.includes(fragment), `POS accounting notification consent migration missing ${fragment}`)
+}
+
+const toastWorker = read('app_src/lib/toastSyncWorker.ts')
+for (const fragment of [
+  'reconcilePosAccountingIssueForDateInPostgres',
+  'processPosAccountingNotificationOutbox',
+  'reconcileStaleOpenPosAccountingIssuesInPostgres',
+  'refreshAccountingState',
+]) {
+  assert.ok(toastWorker.includes(fragment), `Toast worker notification integration missing ${fragment}`)
+}
 
 const tenantQueries = []
+const toastOrderProjection = loadTypeScriptModule('app_src/lib/integrations/toastOrderProjection.ts')
 const tenantPersistence = loadTypeScriptModule('app_src/lib/persistence/toastIntegrations.ts', {
   mocks: {
+    '@/lib/integrations/toastOrderProjection': toastOrderProjection,
     '@/lib/persistence/postgres': {
       query: async (sql, params = []) => {
         tenantQueries.push({ sql: String(sql), params: [...params] })
@@ -139,7 +206,7 @@ const tenantPersistence = loadTypeScriptModule('app_src/lib/persistence/toastInt
             rowCount: 1,
           }
         }
-        if (String(sql).includes('GROUP BY sync_kind')) {
+        if (String(sql).includes("GROUP BY CASE WHEN sync_kind = 'standard_order_updates'")) {
           return {
             rows: [{
               sync_kind: 'standard_orders',
@@ -190,6 +257,41 @@ await tenantPersistence.readToastIntegrationStateFromPostgres(otherOrganizationI
 assert.ok(tenantQueries.slice(0, firstTenantQueryCount).every((entry) => entry.params[0] === organizationId))
 assert.ok(tenantQueries.slice(firstTenantQueryCount).every((entry) => entry.params[0] === otherOrganizationId))
 assert.equal(tenantState.organizationId, organizationId)
+
+const queueQueries = []
+const queuePersistence = loadTypeScriptModule('app_src/lib/persistence/toastIntegrations.ts', {
+  mocks: {
+    '@/lib/integrations/toastOrderProjection': toastOrderProjection,
+    '@/lib/persistence/postgres': {
+      query: async () => ({ rows: [], rowCount: 0 }),
+      withTransaction: async (work) => work({
+        query: async (sql, params = []) => {
+          const source = String(sql)
+          queueQueries.push({ source, params: [...params] })
+          if (source.includes('SELECT access_type FROM organization_toast_credentials')) {
+            return { rows: [{ access_type: 'analytics' }, { access_type: 'standard' }], rowCount: 2 }
+          }
+          if (source.includes('SELECT restaurant_guid::text, analytics_access, standard_access')) {
+            return {
+              rows: [{ restaurant_guid: restaurantGuid, analytics_access: true, standard_access: true }],
+              rowCount: 1,
+            }
+          }
+          return { rows: [], rowCount: 1 }
+        },
+      }),
+    },
+  },
+})
+await queuePersistence.queueToastSyncForDateInPostgres({
+  organizationId,
+  businessDate: '2026-07-18',
+  actorEmail: 'manager@example.test',
+})
+const manualQueueCalls = queueQueries.filter((entry) => entry.source.includes('INSERT INTO toast_sync_outbox'))
+assert.equal(manualQueueCalls.length, 3)
+assert.ok(manualQueueCalls.every((entry) => entry.params[5] === 0), 'manual Toast sync must rerun completed jobs')
+assert.ok(manualQueueCalls.every((entry) => entry.source.includes("status = 'processing' THEN now()")))
 
 const panel = read('app_src/components/settings/ToastIntegrationPanel.tsx')
 for (const fragment of [
@@ -333,9 +435,207 @@ assert.equal(orders.length, 0)
 const ordersRequest = requests.find((entry) => entry.url.includes('/orders/v2/ordersBulk'))
 assert.equal(ordersRequest.init.headers.get('Toast-Restaurant-External-ID'), restaurantGuid)
 
+const updatedOrders = await clientModule.getToastStandardOrderUpdates({
+  credential: standardCredential,
+  restaurantGuid,
+  startDate: '2026-07-16T00:00:00.000Z',
+  endDate: '2026-07-17T00:00:00.000Z',
+})
+assert.equal(updatedOrders.length, 0)
+const updateRequest = requests.find((entry) => entry.url.includes('startDate=2026-07-16T00%3A00%3A00.000Z'))
+assert.ok(updateRequest, 'Toast modified-order query must use an explicit modification window')
+assert.ok(updateRequest.url.includes('endDate=2026-07-17T00%3A00%3A00.000Z'))
+
 const worker = read('app_src/lib/toastSyncWorker.ts')
 assert.ok(worker.includes('refreshToastAccountingDraftInPostgres'), 'Toast worker must produce reviewable accounting drafts')
 assert.ok(worker.includes('deferToastSyncJobInPostgres'), 'Toast worker must support asynchronous Analytics reports')
+assert.ok(worker.includes("job.syncKind === 'standard_order_updates'"), 'Toast worker must poll modified orders')
+assert.ok(worker.includes('getToastStandardOrders({ credential, restaurantGuid: job.restaurantGuid, businessDate })'),
+  'modified-order sync must refresh complete affected business days')
+assert.ok(worker.includes('catchUpDates(target.latestStandardUpdateDate, businessDate)'),
+  'Toast worker must catch up missed modified-order windows')
 assert.ok(!worker.includes('quickbooks'), 'Toast ingestion worker must not post directly to QuickBooks')
+
+const health = read('app_src/app/api/health/route.ts')
+assert.ok(health.includes('Toast sync queue has terminal failed jobs.'))
+assert.ok(health.includes('Toast sync queue has stale processing jobs.'))
+assert.ok(health.includes('integrationQueues'))
+assert.ok(health.includes("WHERE organization.is_demo = false"))
+
+function command(commandName, args, options = {}) {
+  const result = spawnSync(commandName, args, {
+    cwd: root,
+    env: { ...process.env, ...options.env },
+    encoding: 'utf8',
+    timeout: options.timeout || 120_000,
+  })
+  if (result.status !== 0) {
+    const detail = [result.stdout, result.stderr].filter(Boolean).join('\n').trim()
+    throw new Error(`${commandName} ${args.join(' ')} failed${detail ? `:\n${detail}` : ''}`)
+  }
+  return String(result.stdout || '').trim()
+}
+
+async function waitForPostgres(pool) {
+  const deadline = Date.now() + 45_000
+  let lastError
+  while (Date.now() < deadline) {
+    try {
+      await pool.query('SELECT 1')
+      return
+    } catch (error) {
+      lastError = error
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 500))
+    }
+  }
+  throw lastError || new Error('PostgreSQL did not become ready')
+}
+
+async function runToastOutboxPostgresAcceptance() {
+  const dockerInfo = spawnSync('docker', ['info'], { cwd: root, encoding: 'utf8', timeout: 30_000 })
+  if (dockerInfo.status !== 0) {
+    console.log('Toast outbox disposable PostgreSQL acceptance skipped: Docker is unavailable')
+    return
+  }
+  const container = `clawpilot-toast-outbox-${process.pid}-${crypto.randomBytes(3).toString('hex')}`
+  let pool
+  try {
+    command('docker', [
+      'run', '--rm', '-d', '--name', container,
+      '-e', 'POSTGRES_PASSWORD=clawpilot_toast',
+      '-e', 'POSTGRES_DB=clawpilot_toast',
+      '-p', '127.0.0.1::5432',
+      'pgvector/pgvector:pg16',
+    ], { timeout: 180_000 })
+    const portOutput = command('docker', ['port', container, '5432/tcp'])
+    const postgresPort = Number(portOutput.match(/:(\d+)\s*$/)?.[1])
+    assert.ok(postgresPort > 0, `Unable to resolve disposable PostgreSQL port from ${portOutput}`)
+    const databaseUrl = `postgresql://postgres:clawpilot_toast@127.0.0.1:${postgresPort}/clawpilot_toast`
+    pool = new Pool({ connectionString: databaseUrl, connectionTimeoutMillis: 2000 })
+    await waitForPostgres(pool)
+    command('node', ['scripts/db-migrate.mjs'], {
+      env: { DATABASE_URL: databaseUrl, PGSSLMODE: 'disable' },
+      timeout: 180_000,
+    })
+    const actorEmail = 'toast-manager@example.test'
+    await pool.query(
+      `INSERT INTO app_users (email, role, status) VALUES ($1, 'owner', 'active')`,
+      [actorEmail],
+    )
+    await pool.query(
+      `INSERT INTO workspace_organizations (id, name, organization_type, created_by)
+       VALUES ($1::uuid, 'Toast Queue Acceptance', 'root', $2)`,
+      [organizationId, actorEmail],
+    )
+    await pool.query(
+      `INSERT INTO organization_toast_credentials (
+         organization_id, access_type, api_base_url, client_id,
+         client_secret_ciphertext, client_secret_iv, client_secret_tag, client_secret_last_four,
+         sync_enabled, verified_at, created_by, updated_by
+       ) VALUES
+         ($1::uuid, 'analytics', 'https://ws-api.toasttab.com', 'analytics-client', '\\x01', decode(repeat('00', 12), 'hex'), decode(repeat('00', 16), 'hex'), '0001', true, now(), $2, $2),
+         ($1::uuid, 'standard', 'https://ws-api.toasttab.com', 'standard-client', '\\x02', decode(repeat('00', 12), 'hex'), decode(repeat('00', 16), 'hex'), '0002', true, now(), $2, $2)`,
+      [organizationId, actorEmail],
+    )
+    await pool.query(
+      `INSERT INTO toast_locations (
+         organization_id, restaurant_guid, restaurant_name, active,
+         analytics_access, standard_access, selected, last_verified_at
+       ) VALUES ($1::uuid, $2::uuid, 'Toast Acceptance Restaurant', true, true, true, true, now())`,
+      [organizationId, restaurantGuid],
+    )
+
+    const databasePersistence = loadTypeScriptModule('app_src/lib/persistence/toastIntegrations.ts', {
+      mocks: {
+        '@/lib/integrations/toastOrderProjection': toastOrderProjection,
+        '@/lib/persistence/postgres': {
+          query: (sql, params) => pool.query(sql, params),
+          withTransaction: async (work) => {
+            const client = await pool.connect()
+            try {
+              await client.query('BEGIN')
+              const result = await work(client)
+              await client.query('COMMIT')
+              return result
+            } catch (error) {
+              await client.query('ROLLBACK')
+              throw error
+            } finally {
+              client.release()
+            }
+          },
+        },
+      },
+    })
+
+    await databasePersistence.queueToastSyncForDateInPostgres({
+      organizationId, businessDate: '2026-07-18', actorEmail,
+    })
+    const firstClaims = await databasePersistence.claimToastSyncJobsInPostgres({ limit: 3, workerId: 'acceptance-worker-1' })
+    assert.equal(firstClaims.length, 3)
+    const standardJob = firstClaims.find((job) => job.syncKind === 'standard_orders')
+    assert.ok(standardJob)
+    await databasePersistence.queueToastSyncForDateInPostgres({
+      organizationId, businessDate: '2026-07-18', actorEmail,
+    })
+    const processingRefresh = await pool.query(
+      `SELECT status, rerun_requested_at IS NOT NULL AS rerun_requested
+       FROM toast_sync_outbox WHERE id = $1::uuid`,
+      [standardJob.id],
+    )
+    assert.deepEqual(processingRefresh.rows[0], { status: 'processing', rerun_requested: true })
+    assert.equal(await databasePersistence.completeToastSyncJobInPostgres({ job: standardJob, resultSummary: { records: 1 } }), true)
+    const followUp = await pool.query(
+      `SELECT status, attempt_count, rerun_requested_at
+       FROM toast_sync_outbox WHERE id = $1::uuid`,
+      [standardJob.id],
+    )
+    assert.equal(followUp.rows[0].status, 'pending')
+    assert.equal(followUp.rows[0].attempt_count, 0)
+    assert.equal(followUp.rows[0].rerun_requested_at, null)
+    const followUpClaims = await databasePersistence.claimToastSyncJobsInPostgres({ limit: 1, workerId: 'acceptance-worker-2' })
+    assert.equal(followUpClaims[0].id, standardJob.id)
+    assert.equal(await databasePersistence.completeToastSyncJobInPostgres({ job: followUpClaims[0], resultSummary: { records: 2 } }), true)
+    await databasePersistence.queueToastSyncForDateInPostgres({
+      organizationId, businessDate: '2026-07-18', actorEmail,
+    })
+    assert.equal((await pool.query('SELECT status FROM toast_sync_outbox WHERE id = $1::uuid', [standardJob.id])).rows[0].status, 'pending')
+    await pool.query("UPDATE toast_sync_outbox SET status = 'dead' WHERE id = $1::uuid", [standardJob.id])
+    await databasePersistence.queueToastSyncForDateInPostgres({
+      organizationId, businessDate: '2026-07-18', actorEmail,
+    })
+    assert.equal((await pool.query('SELECT status FROM toast_sync_outbox WHERE id = $1::uuid', [standardJob.id])).rows[0].status, 'dead')
+
+    await databasePersistence.queueAutomaticToastOrderUpdateInPostgres({
+      organizationId, restaurantGuid, businessDate: '2026-07-18',
+    })
+    const updateClaims = await databasePersistence.claimToastSyncJobsInPostgres({ limit: 10, workerId: 'acceptance-worker-3' })
+    const updateJob = updateClaims.find((job) => job.syncKind === 'standard_order_updates')
+    assert.ok(updateJob)
+    await databasePersistence.queueAutomaticToastOrderUpdateInPostgres({
+      organizationId, restaurantGuid, businessDate: '2026-07-18',
+    })
+    assert.equal(
+      (await pool.query('SELECT rerun_requested_at FROM toast_sync_outbox WHERE id = $1::uuid', [updateJob.id])).rows[0].rerun_requested_at,
+      null,
+    )
+    assert.equal(await databasePersistence.completeToastSyncJobInPostgres({ job: updateJob, resultSummary: { records: 0 } }), true)
+    await databasePersistence.queueAutomaticToastOrderUpdateInPostgres({
+      organizationId, restaurantGuid, businessDate: '2026-07-18',
+    })
+    assert.equal((await pool.query('SELECT status FROM toast_sync_outbox WHERE id = $1::uuid', [updateJob.id])).rows[0].status, 'succeeded')
+    await pool.query("UPDATE toast_sync_outbox SET completed_at = now() - interval '20 minutes' WHERE id = $1::uuid", [updateJob.id])
+    await databasePersistence.queueAutomaticToastOrderUpdateInPostgres({
+      organizationId, restaurantGuid, businessDate: '2026-07-18',
+    })
+    assert.equal((await pool.query('SELECT status FROM toast_sync_outbox WHERE id = $1::uuid', [updateJob.id])).rows[0].status, 'pending')
+    console.log('Toast outbox disposable PostgreSQL rerun acceptance passed')
+  } finally {
+    if (pool) await pool.end().catch(() => undefined)
+    spawnSync('docker', ['stop', '-t', '1', container], { cwd: root, encoding: 'utf8', timeout: 20_000 })
+  }
+}
+
+await runToastOutboxPostgresAcceptance()
 
 console.log('Toast integration contracts passed')

@@ -28,13 +28,14 @@ const SAFE_DETAIL_KEYS = new Set([
   'sessionId', 'deviceLabel', 'authMethod', 'idleExpiresAt', 'absoluteExpiresAt',
   'revokeReason', 'revokedCount', 'authenticatedUser', 'effectiveUser', 'impersonated',
   'impersonationExpiresAt',
+  'restaurantGuid', 'restaurantName', 'businessDate', 'issueCount', 'issueCodes', 'issueSummary',
 ])
 
 export type ActivityScope = 'self' | 'organization' | 'global'
 
 export type ActivityLogEvent = {
   id: string
-  module: 'auth' | 'projects' | 'pipeline' | 'crm' | 'agents' | 'docs' | 'users' | 'integrations' | 'versions' | 'system'
+  module: 'auth' | 'projects' | 'pipeline' | 'crm' | 'pos' | 'agents' | 'docs' | 'users' | 'integrations' | 'versions' | 'system'
   type: string
   eventType: string
   message: string
@@ -42,10 +43,13 @@ export type ActivityLogEvent = {
   actor: string
   actorName: string | null
   target: {
-    section: 'projects' | 'pipeline' | 'crm' | 'agents' | 'docs' | 'versions'
+    section: 'projects' | 'pipeline' | 'crm' | 'pos' | 'agents' | 'docs' | 'versions'
     id?: string
     resourceId?: string
     label?: string
+    organizationId?: string
+    restaurantGuid?: string
+    businessDate?: string
   } | null
   details: Record<string, unknown>
 }
@@ -60,6 +64,7 @@ type AuditRow = {
   id: string
   actor: string | null
   actor_name: string | null
+  organization_id: string | null
   event_type: string
   aggregate_type: string | null
   aggregate_id: string | null
@@ -142,6 +147,7 @@ function eventModule(eventType: string): ActivityLogEvent['module'] {
   if (prefix === 'project' || prefix === 'task') return 'projects'
   if (prefix === 'pipeline') return 'pipeline'
   if (prefix === 'crm') return 'crm'
+  if (prefix === 'pos') return 'pos'
   if (prefix === 'agent') return 'agents'
   if (prefix === 'document' || prefix === 'documents') return 'docs'
   if (prefix === 'user' || prefix === 'organization' || prefix === 'invitation') return 'users'
@@ -154,7 +160,7 @@ function eventTypeGroup(eventType: string): string {
   const parts = eventType.split('.')
   const terminal = parts[parts.length - 1] || 'updated'
   if (['failed', 'dead', 'denied', 'locked'].includes(terminal)) return 'failed'
-  if (['succeeded', 'verified', 'ready', 'completed'].includes(terminal)) return 'succeeded'
+  if (['succeeded', 'verified', 'ready', 'completed', 'resolved'].includes(terminal)) return 'succeeded'
   if (['queued', 'requested', 'leased'].includes(terminal)) return 'queued'
   if (['created', 'staged', 'invited'].includes(terminal)) return 'created'
   if (['deleted', 'disabled', 'revoked', 'removed'].includes(terminal)) return 'deleted'
@@ -355,7 +361,9 @@ async function readAuditRows(scope: ActivityScope, context: ScopeContext, snapsh
     ? 'event.is_system = true AND event.created_at <= $1::timestamptz'
     : scope === 'organization'
       ? `event.organization_id = ANY($1::uuid[]) AND event.created_at <= $2::timestamptz`
-      : `(lower(COALESCE(event.actor, '')) = $1 OR lower(COALESCE(event.subject, '')) = $1)
+      : `(lower(COALESCE(event.actor, '')) = $1
+          OR lower(COALESCE(event.subject, '')) = $1
+          OR COALESCE(event.payload->'recipientEmails', '[]'::jsonb) ? $1)
          AND event.organization_id = ANY($2::uuid[])
          AND event.created_at <= $3::timestamptz`
   const values = scope === 'global'
@@ -366,7 +374,7 @@ async function readAuditRows(scope: ActivityScope, context: ScopeContext, snapsh
   const limitParameter = scope === 'global' ? '$2' : scope === 'organization' ? '$3' : '$4'
   const result = await query<AuditRow>(
     `SELECT event.id::text, event.actor, actor_user.display_name AS actor_name,
-       event.event_type, event.aggregate_type, event.aggregate_id, event.payload,
+       event.organization_id::text, event.event_type, event.aggregate_type, event.aggregate_id, event.payload,
        CASE
          WHEN COALESCE(event.payload->>'occurredAt', '') ~ '^\\d{4}-\\d{2}-\\d{2}T'
            THEN (event.payload->>'occurredAt')::timestamptz
@@ -417,6 +425,18 @@ async function readAuditRows(scope: ActivityScope, context: ScopeContext, snapsh
             resourceId,
             label: String(row.payload?.recordTitle || crmMetadata?.referenceCode || row.aggregate_id || 'CRM record'),
           }
+          : activityModule === 'pos'
+            && typeof row.payload?.restaurantGuid === 'string'
+            && typeof row.payload?.businessDate === 'string'
+            ? {
+              section: 'pos',
+              id: row.payload.businessDate,
+              resourceId: row.payload.restaurantGuid,
+              organizationId: row.organization_id || undefined,
+              restaurantGuid: row.payload.restaurantGuid,
+              businessDate: row.payload.businessDate,
+              label: String(row.payload?.restaurantName || 'POS accounting'),
+            }
           : activityModule === 'agents'
             ? { section: 'agents', id: row.aggregate_id || undefined, label: 'Agent activity' }
             : activityModule === 'docs'
