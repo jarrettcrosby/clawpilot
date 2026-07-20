@@ -571,6 +571,7 @@ export default function PosSection() {
 
   const drafts = snapshot?.drafts
   const accountingDrafts = draftItems(drafts)
+  const accountingBusinessDate = textValue(record(accountingDrafts[0]), ['businessDate', 'date'])
   const draftMetrics = [
     { label: 'Needs mapping', value: draftCount(drafts, ['needsMapping', 'needs_mapping']), color: '#F2B76D' },
     { label: 'Needs review', value: draftCount(drafts, ['needsReview', 'needs_review']), color: '#A8C7FA' },
@@ -947,7 +948,8 @@ export default function PosSection() {
 
               <PosAccountingPanel
                 location={location}
-                businessDate={to}
+                businessDate={accountingBusinessDate || to}
+                hasAccountingDraft={Boolean(accountingBusinessDate)}
                 revision={revision}
                 money={money}
                 number={number}
