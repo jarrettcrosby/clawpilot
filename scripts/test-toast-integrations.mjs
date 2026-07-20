@@ -145,6 +145,20 @@ for (const fragment of [
   assert.ok(notificationConsentMigration.includes(fragment), `POS accounting notification consent migration missing ${fragment}`)
 }
 
+const zeroSalesDraftMigration = read('db/migrations/0077_zero_sales_accounting_draft_suppression.sql')
+for (const fragment of [
+  "draft.status NOT IN ('approved', 'posting', 'posted')",
+  'sales.orders_count = 0',
+  'sales.standard_orders_count = 0',
+  'sales.refunds = 0',
+  'sales.standard_refunds = 0',
+  "SET status = 'resolved'",
+  "SET status = 'cancelled'",
+  'DELETE FROM toast_accounting_export_drafts draft',
+]) {
+  assert.ok(zeroSalesDraftMigration.includes(fragment), `Zero-sales draft migration missing ${fragment}`)
+}
+
 const toastWorker = read('app_src/lib/toastSyncWorker.ts')
 for (const fragment of [
   'reconcilePosAccountingIssueForDateInPostgres',
@@ -292,6 +306,62 @@ const manualQueueCalls = queueQueries.filter((entry) => entry.source.includes('I
 assert.equal(manualQueueCalls.length, 3)
 assert.ok(manualQueueCalls.every((entry) => entry.params[5] === 0), 'manual Toast sync must rerun completed jobs')
 assert.ok(manualQueueCalls.every((entry) => entry.source.includes("status = 'processing' THEN now()")))
+
+const zeroAccountingSales = {
+  gross_sales: '0', net_sales: '0', discounts: '0', voids: '0', refunds: '0',
+  orders_count: 0, standard_orders_count: 0,
+  standard_gross_sales: '0', standard_net_sales: '0', standard_discounts: '0',
+  standard_voids: '0', standard_refunds: '0', standard_tax: '0', standard_tips: '0',
+  standard_service_charges: '0', standard_tendered: '0', standard_total: '0',
+  standard_cash: '0', standard_card: '0', standard_other_tender: '0',
+}
+let accountingSales = zeroAccountingSales
+const accountingDraftQueries = []
+const accountingDraftPersistence = loadTypeScriptModule('app_src/lib/persistence/toastIntegrations.ts', {
+  mocks: {
+    '@/lib/integrations/toastOrderProjection': toastOrderProjection,
+    '@/lib/persistence/postgres': {
+      query: async (sql, params = []) => {
+        const source = String(sql)
+        accountingDraftQueries.push({ source, params: [...params] })
+        if (source.includes('FROM toast_daily_sales')) return { rows: [accountingSales], rowCount: 1 }
+        if (source.includes('FROM toast_sync_outbox')) {
+          return { rows: [{ sync_kind: 'standard_orders', status: 'succeeded' }], rowCount: 1 }
+        }
+        if (source.includes('FROM toast_accounting_mappings')) return { rows: [], rowCount: 0 }
+        return { rows: [], rowCount: 1 }
+      },
+      withTransaction: async (work) => work({ query: async () => ({ rows: [], rowCount: 0 }) }),
+    },
+  },
+})
+async function accountingDraftRefreshQueries(sales, businessDate) {
+  accountingSales = { ...zeroAccountingSales, ...sales }
+  accountingDraftQueries.length = 0
+  await accountingDraftPersistence.refreshToastAccountingDraftInPostgres({
+    organizationId,
+    restaurantGuid,
+    businessDate,
+    syncKind: 'standard_orders',
+  })
+  return [...accountingDraftQueries]
+}
+
+const zeroDraftQueries = await accountingDraftRefreshQueries({}, '2026-08-01')
+assert.equal(zeroDraftQueries.filter((entry) => entry.source.includes('DELETE FROM toast_accounting_export_drafts')).length, 1)
+assert.equal(zeroDraftQueries.filter((entry) => entry.source.includes('INSERT INTO toast_accounting_export_drafts')).length, 0)
+assert.ok(zeroDraftQueries.some((entry) => entry.source.includes("status NOT IN ('approved', 'posting', 'posted')")))
+
+for (const [label, businessDate, activity] of [
+  ['standard refund', '2026-08-02', { standard_refunds: '12.34' }],
+  ['Analytics refund', '2026-08-03', { refunds: '-9.87' }],
+  ['nonzero accounting amount', '2026-08-04', { standard_tax: '0.01' }],
+  ['zero-value order', '2026-08-05', { orders_count: 1 }],
+]) {
+  const queries = await accountingDraftRefreshQueries(activity, businessDate)
+  assert.equal(queries.filter((entry) => entry.source.includes('DELETE FROM toast_accounting_export_drafts')).length, 0, `${label} must not delete a draft`)
+  assert.equal(queries.filter((entry) => entry.source.includes('INSERT INTO toast_accounting_export_drafts')).length, 1, `${label} must retain a draft`)
+}
 
 const panel = read('app_src/components/settings/ToastIntegrationPanel.tsx')
 for (const fragment of [
@@ -567,6 +637,185 @@ async function runToastOutboxPostgresAcceptance() {
         },
       },
     })
+
+    const runtimeDraftDates = [
+      '2026-08-01',
+      '2026-08-02',
+      '2026-08-03',
+      '2026-08-04',
+      '2026-08-05',
+      '2026-08-06',
+      '2026-08-07',
+      '2026-08-08',
+      '2026-08-09',
+    ]
+    await pool.query(
+      `INSERT INTO toast_daily_sales (organization_id, restaurant_guid, business_date)
+       SELECT $1::uuid, $2::uuid, dates.business_date
+       FROM unnest($3::date[]) AS dates(business_date)`,
+      [organizationId, restaurantGuid, runtimeDraftDates],
+    )
+    await pool.query(
+      `UPDATE toast_daily_sales SET standard_refunds = 5.25
+       WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid AND business_date = '2026-08-03'::date`,
+      [organizationId, restaurantGuid],
+    )
+    await pool.query(
+      `UPDATE toast_daily_sales SET refunds = -4.75
+       WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid AND business_date = '2026-08-04'::date`,
+      [organizationId, restaurantGuid],
+    )
+    await pool.query(
+      `UPDATE toast_daily_sales SET standard_tax = 0.01
+       WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid AND business_date = '2026-08-05'::date`,
+      [organizationId, restaurantGuid],
+    )
+    await pool.query(
+      `UPDATE toast_daily_sales SET orders_count = 1
+       WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid AND business_date = '2026-08-06'::date`,
+      [organizationId, restaurantGuid],
+    )
+    await pool.query(
+      `INSERT INTO toast_accounting_export_drafts (
+         organization_id, restaurant_guid, business_date, idempotency_key, status, source_summary
+       ) VALUES
+         ($1::uuid, $2::uuid, '2026-08-01'::date, 'runtime-zero-existing', 'needs_mapping', '{"sentinel":"delete"}'::jsonb),
+         ($1::uuid, $2::uuid, '2026-08-07'::date, 'runtime-zero-approved', 'approved', '{"sentinel":"approved"}'::jsonb),
+         ($1::uuid, $2::uuid, '2026-08-08'::date, 'runtime-zero-posting', 'posting', '{"sentinel":"posting"}'::jsonb),
+         ($1::uuid, $2::uuid, '2026-08-09'::date, 'runtime-zero-posted', 'posted', '{"sentinel":"posted"}'::jsonb)`,
+      [organizationId, restaurantGuid],
+    )
+
+    for (const businessDate of runtimeDraftDates) {
+      await databasePersistence.refreshToastAccountingDraftInPostgres({
+        organizationId,
+        restaurantGuid,
+        businessDate,
+        syncKind: 'standard_orders',
+      })
+    }
+    const runtimeDrafts = await pool.query(
+      `SELECT business_date::text, status, source_summary
+       FROM toast_accounting_export_drafts
+       WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid
+         AND business_date = ANY($3::date[])
+       ORDER BY business_date`,
+      [organizationId, restaurantGuid, runtimeDraftDates],
+    )
+    const runtimeDraftByDate = new Map(runtimeDrafts.rows.map((row) => [row.business_date, row]))
+    assert.equal(runtimeDraftByDate.has('2026-08-01'), false, 'an existing zero-activity draft must be deleted')
+    assert.equal(runtimeDraftByDate.has('2026-08-02'), false, 'a zero-activity date must not create a draft')
+    assert.equal(runtimeDraftByDate.get('2026-08-03')?.source_summary?.standard?.refunds, 5.25)
+    assert.equal(runtimeDraftByDate.get('2026-08-04')?.source_summary?.refunds, -4.75)
+    assert.equal(runtimeDraftByDate.get('2026-08-05')?.source_summary?.standard?.tax, 0.01)
+    assert.equal(runtimeDraftByDate.has('2026-08-06'), true, 'an order with zero amounts must retain a draft')
+    for (const [businessDate, status] of [
+      ['2026-08-07', 'approved'],
+      ['2026-08-08', 'posting'],
+      ['2026-08-09', 'posted'],
+    ]) {
+      assert.equal(runtimeDraftByDate.get(businessDate)?.status, status, `${status} zero-activity evidence must remain`)
+      assert.equal(runtimeDraftByDate.get(businessDate)?.source_summary?.sentinel, status)
+    }
+
+    const migrationDates = ['2026-09-01', '2026-09-02', '2026-09-03']
+    await pool.query(
+      `INSERT INTO toast_daily_sales (organization_id, restaurant_guid, business_date)
+       SELECT $1::uuid, $2::uuid, dates.business_date
+       FROM unnest($3::date[]) AS dates(business_date)`,
+      [organizationId, restaurantGuid, migrationDates],
+    )
+    await pool.query(
+      `UPDATE toast_daily_sales SET standard_refunds = 1.00
+       WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid AND business_date = '2026-09-03'::date`,
+      [organizationId, restaurantGuid],
+    )
+    await pool.query(
+      `INSERT INTO toast_accounting_export_drafts (
+         organization_id, restaurant_guid, business_date, idempotency_key, status, source_summary
+       ) VALUES
+         ($1::uuid, $2::uuid, '2026-09-01'::date, 'migration-zero-unprotected', 'needs_review', '{"sentinel":"delete"}'::jsonb),
+         ($1::uuid, $2::uuid, '2026-09-02'::date, 'migration-zero-approved', 'approved', '{"sentinel":"approved"}'::jsonb),
+         ($1::uuid, $2::uuid, '2026-09-03'::date, 'migration-refund-unprotected', 'failed', '{"sentinel":"refund"}'::jsonb)`,
+      [organizationId, restaurantGuid],
+    )
+    const migrationIssues = await pool.query(
+      `INSERT INTO pos_accounting_issue_states (
+         organization_id, restaurant_guid, business_date, status, issue_fingerprint, issues
+       ) VALUES
+         ($1::uuid, $2::uuid, '2026-09-01'::date, 'open', $3, $4::jsonb),
+         ($1::uuid, $2::uuid, '2026-09-02'::date, 'open', $3, $4::jsonb),
+         ($1::uuid, $2::uuid, '2026-09-03'::date, 'open', $3, $4::jsonb)
+       RETURNING id::text, business_date::text`,
+      [
+        organizationId,
+        restaurantGuid,
+        'a'.repeat(64),
+        JSON.stringify([{ code: 'migration-test', title: 'Migration test', detail: 'Migration test issue' }]),
+      ],
+    )
+    const migrationIssueByDate = new Map(migrationIssues.rows.map((row) => [row.business_date, row.id]))
+    await pool.query(
+      `INSERT INTO pos_accounting_notification_outbox (
+         issue_state_id, occurrence, issue_fingerprint, issues, recipient_email,
+         status, locked_at, locked_by, lock_token
+       ) VALUES
+         ($1::uuid, 1, $4, $5::jsonb, 'accounting-alerts@clawpilot.com', 'processing', now(), 'migration-test', gen_random_uuid()),
+         ($2::uuid, 1, $4, $5::jsonb, 'accounting-alerts@clawpilot.com', 'pending', NULL, NULL, NULL),
+         ($3::uuid, 1, $4, $5::jsonb, 'accounting-alerts@clawpilot.com', 'pending', NULL, NULL, NULL)`,
+      [
+        migrationIssueByDate.get('2026-09-01'),
+        migrationIssueByDate.get('2026-09-02'),
+        migrationIssueByDate.get('2026-09-03'),
+        'a'.repeat(64),
+        JSON.stringify([{ code: 'migration-test', title: 'Migration test', detail: 'Migration test issue' }]),
+      ],
+    )
+
+    await pool.query(zeroSalesDraftMigration)
+    const migrationDrafts = await pool.query(
+      `SELECT business_date::text, status FROM toast_accounting_export_drafts
+       WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid
+         AND business_date = ANY($3::date[])
+       ORDER BY business_date`,
+      [organizationId, restaurantGuid, migrationDates],
+    )
+    assert.deepEqual(migrationDrafts.rows, [
+      { business_date: '2026-09-02', status: 'approved' },
+      { business_date: '2026-09-03', status: 'failed' },
+    ])
+    const migratedIssues = await pool.query(
+      `SELECT business_date::text, status, resolved_at IS NOT NULL AS resolved
+       FROM pos_accounting_issue_states
+       WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid
+         AND business_date = ANY($3::date[])
+       ORDER BY business_date`,
+      [organizationId, restaurantGuid, migrationDates],
+    )
+    assert.deepEqual(migratedIssues.rows, [
+      { business_date: '2026-09-01', status: 'resolved', resolved: true },
+      { business_date: '2026-09-02', status: 'open', resolved: false },
+      { business_date: '2026-09-03', status: 'open', resolved: false },
+    ])
+    const migratedNotifications = await pool.query(
+      `SELECT issue.business_date::text, notification.status,
+         notification.locked_at, notification.locked_by, notification.lock_token
+       FROM pos_accounting_notification_outbox notification
+       JOIN pos_accounting_issue_states issue ON issue.id = notification.issue_state_id
+       WHERE issue.organization_id = $1::uuid AND issue.restaurant_guid = $2::uuid
+         AND issue.business_date = ANY($3::date[])
+       ORDER BY issue.business_date`,
+      [organizationId, restaurantGuid, migrationDates],
+    )
+    assert.equal(migratedNotifications.rows[0].business_date, '2026-09-01')
+    assert.equal(migratedNotifications.rows[0].status, 'cancelled')
+    assert.equal(migratedNotifications.rows[0].locked_at, null)
+    assert.equal(migratedNotifications.rows[0].locked_by, null)
+    assert.equal(migratedNotifications.rows[0].lock_token, null)
+    assert.deepEqual(migratedNotifications.rows.slice(1).map((row) => [row.business_date, row.status]), [
+      ['2026-09-02', 'pending'],
+      ['2026-09-03', 'pending'],
+    ])
 
     await databasePersistence.queueToastSyncForDateInPostgres({
       organizationId, businessDate: '2026-07-18', actorEmail,

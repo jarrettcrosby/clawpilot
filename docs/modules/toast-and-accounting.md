@@ -83,6 +83,7 @@ Toast selections include stable menu-item, item-group, and sales-category identi
 3. Normalize menu, group, item, category, PLU, price, visibility, and active state without storing order or customer identity.
 4. Keep the last valid catalog if Toast rejects the scope or temporarily returns no published menu.
 5. Use provider identifiers for reporting and accounting mappings; a renamed menu item does not create a new mapping.
+6. Merge the stable menu catalog with observed sales before presenting accounting mappings. An active menu item remains configurable even when it has not appeared in the selected sales window.
 
 ## Accounting Configuration And Preview
 
@@ -92,9 +93,11 @@ Accounting is configured by organization with an optional restaurant override. A
 - Policies cover cash deposits, zero over/short suppression, tip payout behavior, open checks, refunds, fees, and delayed batches.
 - Mapping rules support Toast item, item group, sales category, discount, tax, service charge, tender, card brand, payout, fee, and cash-operation sources. Destinations may be a QuickBooks item, account, tax code, class, department, location, customer, or vendor.
 - Rules store both provider IDs and name snapshots. Provider ID and restaurant-specific scope determine precedence; name-only imports require review.
+- ClawPilot may prefill a QuickBooks product suggestion only when an exact or normalized name resolves to one active QuickBooks item. The operator must still save the mapping; ambiguous matches remain unresolved.
+- An unmatched Toast sales item can prepare an immutable QuickBooks product draft from its menu name, PLU, price, and location context. Product creation follows the normal submit, approval, provider-write, and catalog-refresh controls before the new item can be selected as a mapping target.
 - Validation records the Toast catalog revision, QuickBooks catalog revision, outcome, reason, actor, and timestamp.
 
-The attached legacy mapping workbook is an import source, not the runtime database. Its accepted baseline is Itemized Sales Receipt, per-line tax, a clearing account, a separate payments journal, 28 mapped sales-item targets, and six unresolved item mappings. Import must preserve aliases and mark unresolved rows for review rather than guessing QuickBooks destinations.
+The attached legacy mapping workbook is an import source, not the runtime database. Its accepted baseline is Itemized Sales Receipt, per-line tax, a clearing account, a separate payments journal, 29 mapped sales-item targets, and six unresolved item mappings. Import must preserve aliases and mark unresolved rows for review rather than guessing QuickBooks destinations.
 
 The preview produces two immutable documents for a business date:
 
@@ -108,6 +111,8 @@ An unresolved item, missing destination, unavailable payout, source variance, or
 The integration settings expose a reporting-readiness summary for the signed-in organization. It reports verified location profiles, successful business-date coverage, source record counts, daily order and guest totals, Analytics sales totals when available, sync failures, and accounting draft state. A completed sync that returns no orders is shown as a valid no-data result rather than a connection failure.
 
 Standard and Analytics readiness remain independent. Standard Orders is sufficient for the POS operational view. Analytics remains optional for management reporting, payouts, and cross-source reconciliation. When both are present, a material net-sales difference marks the accounting draft as `variance` instead of silently treating the feeds as equal. Queries and API responses remain filtered by `organization_id`.
+
+A completed sync with no Toast sales, tenders, tax, tips, discounts, fees, or refunds is retained as a valid no-data operational result but does not create a dated accounting draft. Reconciliation removes only empty drafts that have not entered the protected approval lifecycle; approved, posting, and posted evidence is never deleted by no-sales cleanup.
 
 ## Accounting Issue Notifications
 
@@ -175,6 +180,8 @@ This release implements both Toast credential connections, location verification
 7. Confirm the legacy accounting draft is not posted and reports `needs_mapping`; then confirm the canonical POS accounting preview independently reports mapping, allocation, reconciliation, and hold evidence.
 8. Confirm `/api/health` reports the Toast worker heartbeat in Railway.
 9. Bind the intended organization to QuickBooks, save one location's account mappings, and confirm financial posting remains unavailable.
-10. Enable **Email issue alerts**, leave one confirmed current-date mapping issue, run the worker twice, and confirm one Activity item and one email delivery are created for that occurrence. Open the action and confirm the correct organization, location, date, and Accounting view load.
-11. Resolve the issue and confirm Activity records the resolution. Reintroduce the issue and confirm exactly one new occurrence is queued.
-12. Disable email alerts and confirm issue Activity continues without an outbox row. Confirm a demo or reserved recipient is rejected even if it has owner permissions.
+10. Confirm an active Toast menu item with no observed sales remains available for mapping. Prepare a missing QuickBooks product draft, submit and approve it in Accounting, refresh the catalog after posting, and then save the Toast mapping.
+11. Sync a business date with no sales or refund activity and confirm it produces no dated accounting draft.
+12. Enable **Email issue alerts**, leave one confirmed current-date mapping issue, run the worker twice, and confirm one Activity item and one email delivery are created for that occurrence. Open the action and confirm the correct organization, location, date, and Accounting view load.
+13. Resolve the issue and confirm Activity records the resolution. Reintroduce the issue and confirm exactly one new occurrence is queued.
+14. Disable email alerts and confirm issue Activity continues without an outbox row. Confirm a demo or reserved recipient is rejected even if it has owner permissions.

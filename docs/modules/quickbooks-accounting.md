@@ -69,6 +69,8 @@ Refreshing the chart of accounts clears any mapping whose provider account no lo
 
 ClawPilot now supports controlled drafts for creating QuickBooks customers, service or non-inventory items, and invoices. Draft content is normalized and fingerprinted on the server and cannot be edited after creation. A preparer submits the draft; an owner or administrator with `approveAccounting` reviews the same fingerprint before approval. Every transition is written to `audit_events` and successful provider responses retain the QuickBooks entity ID and sync token.
 
+The POS accounting mapper uses this same controlled path for missing Toast products. It may prepare a service or non-inventory item draft with a suggested name, SKU, sales price, expense cost, income account, and description, but it never creates a QuickBooks item merely because a name is absent. After approval and provider posting, the normal catalog refresh makes the new item available for explicit Toast mapping.
+
 Provider posting has two independent gates and is disabled by default:
 
 1. The organization connection must have `write_mode` set to the verified environment: `sandbox` or `production`.

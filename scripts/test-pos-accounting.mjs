@@ -100,6 +100,10 @@ for (const fragment of [
   'FROM quickbooks_departments',
   'acquireTransactionAdvisoryLock',
   'summarizeToastProjectedChecks',
+  'FROM toast_menu_catalog_items',
+  'mergeStableToastMenuCatalog',
+  'suggestQuickBooksItemForPosSource',
+  'productCreationSuggestion',
 ]) {
   assert.ok(persistenceSource.includes(fragment), `POS accounting persistence missing ${fragment}`)
 }
@@ -128,7 +132,10 @@ for (const fragment of [
   "capabilities.canPrepare === true && scope === 'location_override'",
   'disabled={capabilities.canManage !== true}',
   'mapping.active',
-  ': { active: false }',
+  ": { targetId: '', targetName: '', active: false }",
+  "operationKind: 'item.create'",
+  'Prepare QuickBooks product',
+  "window.location.hash = 'accounting'",
 ]) {
   assert.ok(panel.includes(fragment), `POS accounting panel missing ${fragment}`)
 }
@@ -545,6 +552,50 @@ const multiBrandPreview = accounting.buildPosAccountingPreview({
 const settlementLine = multiBrandPreview.journal.lines.find((line) => line.code === 'calculated_net_card_settlement')
 assert.equal(settlementLine?.sourceId, 'summary:card_settlement')
 assert.equal(settlementLine?.target?.id, '1000')
+
+const stableMenuCatalog = accounting.mergeStableToastMenuCatalog(
+  accounting.discoverSafePosSourceCatalog([july18Order]),
+  [{
+    itemGuid: '11111111-1111-4111-8111-111111111111',
+    providerItemId: '11111111-1111-4111-8111-111111111111',
+    name: 'Daily sales',
+    plu: 'DAILY-1',
+    price: 12.5,
+  }, {
+    itemGuid: '12121212-1212-4121-8121-121212121212',
+    providerItemId: '12121212-1212-4121-8121-121212121212',
+    name: 'ICED TEA | Blueberry Green',
+    plu: 'TEA-1',
+    price: 5.75,
+  }],
+)
+const observedMenuItem = stableMenuCatalog.find((entry) => entry.sourceName === 'Daily sales')
+assert.equal(observedMenuItem.catalogOrigin, 'observed_and_menu')
+assert.equal(observedMenuItem.sku, 'DAILY-1')
+assert.equal(observedMenuItem.unitPrice, 12.5)
+const unobservedMenuItem = stableMenuCatalog.find((entry) => entry.sourceName === 'ICED TEA | Blueberry Green')
+assert.equal(unobservedMenuItem.catalogOrigin, 'menu')
+assert.equal(unobservedMenuItem.occurrenceCount, 0)
+assert.equal(unobservedMenuItem.unitPrice, 5.75)
+
+const exactQuickBooksSuggestion = accounting.suggestQuickBooksItemForPosSource(unobservedMenuItem, [{
+  quickbooks_item_id: 'qb-tea',
+  name: 'ICED TEA | Blueberry Green',
+  fully_qualified_name: 'Beverages:ICED TEA | Blueberry Green',
+  item_type: 'NonInventory',
+  sku: null,
+  taxable: true,
+}])
+assert.equal(exactQuickBooksSuggestion.id, 'qb-tea')
+assert.equal(exactQuickBooksSuggestion.confidence, 'exact')
+assert.equal(accounting.suggestQuickBooksItemForPosSource(unobservedMenuItem, []), null)
+assert.equal(accounting.suggestQuickBooksItemForPosSource(unobservedMenuItem, [{
+  quickbooks_item_id: 'qb-tea-1', name: 'ICED TEA - Blueberry Green',
+  fully_qualified_name: 'ICED TEA - Blueberry Green', item_type: 'NonInventory', sku: null, taxable: true,
+}, {
+  quickbooks_item_id: 'qb-tea-2', name: 'ICED TEA Blueberry Green',
+  fully_qualified_name: 'ICED TEA Blueberry Green', item_type: 'NonInventory', sku: null, taxable: true,
+}]), null, 'ambiguous normalized product matches must require operator review')
 
 const mixedRefundSummary = projection.summarizeToastProjectedChecks([{
   amount: 100,
