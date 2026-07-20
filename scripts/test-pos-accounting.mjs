@@ -135,6 +135,9 @@ for (const fragment of [
   ": { targetId: '', targetName: '', active: false }",
   "operationKind: 'item.create'",
   'Prepare QuickBooks product',
+  '.map(mappingPayload)',
+  'sourceKind: mapping.sourceKind',
+  'active: mapping.active',
   "window.location.hash = 'accounting'",
 ]) {
   assert.ok(panel.includes(fragment), `POS accounting panel missing ${fragment}`)
