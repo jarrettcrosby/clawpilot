@@ -32,7 +32,7 @@ const PROFILE_FIELDS = new Set([
   'trackSalesTax', 'breakoutDimensions', 'memoMode', 'customMemo',
   'customTransactionNumber', 'transactionNumberSuffix',
   'suppressZeroOverShort', 'autoPayoutTips', 'depositChecksWithCash',
-  'openCheckPolicy', 'batchHoldPolicy',
+  'openCheckPolicy', 'batchHoldPolicy', 'emailNotificationsEnabled',
 ])
 const MAPPING_FIELDS = new Set([
   'sourceKind', 'sourceId', 'sourceName', 'targetType', 'targetId', 'targetName', 'active',

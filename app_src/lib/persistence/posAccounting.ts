@@ -103,6 +103,8 @@ export type PosAccountingProfile = {
   depositChecksWithCash: boolean
   openCheckPolicy: PosOpenCheckPolicy
   batchHoldPolicy: PosBatchHoldPolicy
+  emailNotificationsEnabled: boolean
+  emailNotificationsEnabledAt: string | null
   createdBy: string | null
   createdAt: string | null
 }
@@ -164,6 +166,8 @@ type ProfileRow = {
   deposit_checks_with_cash: boolean
   open_check_policy: PosOpenCheckPolicy
   batch_hold_policy: PosBatchHoldPolicy
+  email_notifications_enabled: boolean
+  email_notifications_enabled_at: TimestampValue | null
   created_by: string | null
   created_at: TimestampValue
 }
@@ -360,6 +364,11 @@ export function validatePosAccountingProfile(value: unknown) {
     depositChecksWithCash: booleanValue(input.depositChecksWithCash, 'POS_DEPOSIT_CHECKS_INVALID', 'Deposit checks with cash'),
     openCheckPolicy: enumValue(input.openCheckPolicy, POS_OPEN_CHECK_POLICIES, 'POS_OPEN_CHECK_POLICY_INVALID', 'Open check policy'),
     batchHoldPolicy: enumValue(input.batchHoldPolicy, POS_BATCH_HOLD_POLICIES, 'POS_BATCH_HOLD_POLICY_INVALID', 'Batch hold policy'),
+    emailNotificationsEnabled: booleanValue(
+      input.emailNotificationsEnabled,
+      'POS_EMAIL_NOTIFICATIONS_INVALID',
+      'Email issue alerts',
+    ),
   }
 }
 
@@ -428,6 +437,8 @@ function defaultProfile(): PosAccountingProfile {
     depositChecksWithCash: false,
     openCheckPolicy: 'hold',
     batchHoldPolicy: 'hold_until_closed',
+    emailNotificationsEnabled: false,
+    emailNotificationsEnabledAt: null,
     createdBy: null,
     createdAt: null,
   }
@@ -468,6 +479,8 @@ function profileFromRow(row: ProfileRow | undefined): PosAccountingProfile {
     depositChecksWithCash: row.deposit_checks_with_cash,
     openCheckPolicy: row.open_check_policy,
     batchHoldPolicy: row.batch_hold_policy,
+    emailNotificationsEnabled: row.email_notifications_enabled,
+    emailNotificationsEnabledAt: iso(row.email_notifications_enabled_at),
     createdBy: row.created_by,
     createdAt: iso(row.created_at),
   }
@@ -1154,7 +1167,8 @@ const PROFILE_SELECT = `id::text, restaurant_guid::text, profile_revision, schem
   quickbooks_customer_name, quickbooks_clearing_account_id, quickbooks_clearing_account_name,
   track_sales_tax, breakout_dimensions, memo_mode, custom_memo, custom_transaction_number,
   transaction_number_suffix, suppress_zero_over_short, auto_payout_tips,
-  deposit_checks_with_cash, open_check_policy, batch_hold_policy, created_by, created_at`
+  deposit_checks_with_cash, open_check_policy, batch_hold_policy,
+  email_notifications_enabled, email_notifications_enabled_at, created_by, created_at`
 
 const MAPPING_SELECT = `id::text, restaurant_guid::text, source_kind, source_id, source_name,
   target_type, target_id, target_name, active, mapping_revision, effective_from, effective_to,
@@ -1520,8 +1534,14 @@ export async function savePosAccountingProfileInPostgres(input: {
         })
       : null
     await requireLocation(client, input.organizationId, restaurantGuid)
-    const currentResult = await client.query<{ id: string; profile_revision: number }>(
-      `SELECT id::text, profile_revision
+    const currentResult = await client.query<{
+      id: string
+      profile_revision: number
+      email_notifications_enabled: boolean
+      email_notifications_enabled_at: TimestampValue | null
+    }>(
+      `SELECT id::text, profile_revision,
+         email_notifications_enabled, email_notifications_enabled_at
        FROM pos_accounting_profiles
        WHERE organization_id = $1::uuid
          AND restaurant_guid IS NOT DISTINCT FROM $2::uuid
@@ -1556,11 +1576,13 @@ export async function savePosAccountingProfileInPostgres(input: {
          track_sales_tax, breakout_dimensions, memo_mode, custom_memo,
          custom_transaction_number, transaction_number_suffix,
          suppress_zero_over_short, auto_payout_tips, deposit_checks_with_cash,
-         open_check_policy, batch_hold_policy, created_by
+         open_check_policy, batch_hold_policy,
+         email_notifications_enabled, email_notifications_enabled_at, created_by
        ) VALUES (
          $1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8,
          $9, $10, $11, $12, $13, $14, $15, $16, $17,
-         $18, $19::text[], $20, $21, $22, $23, $24, $25, $26, $27, $28, $29
+         $18, $19::text[], $20, $21, $22, $23, $24, $25, $26, $27, $28,
+         $29, $30, $31
        )
        RETURNING ${PROFILE_SELECT}`,
       [
@@ -1592,6 +1614,12 @@ export async function savePosAccountingProfileInPostgres(input: {
         profile.depositChecksWithCash,
         profile.openCheckPolicy,
         profile.batchHoldPolicy,
+        profile.emailNotificationsEnabled,
+        profile.emailNotificationsEnabled
+          ? currentResult.rows[0]?.email_notifications_enabled === true
+            ? currentResult.rows[0].email_notifications_enabled_at
+            : new Date()
+          : null,
         input.actorEmail,
       ],
     )
@@ -1610,6 +1638,7 @@ export async function savePosAccountingProfileInPostgres(input: {
         breakoutDimensions: profile.breakoutDimensions,
         trackSalesTax: profile.trackSalesTax,
         quickBooksBindingStatus: bindingVerified ? 'verified' : 'unbound',
+        emailNotificationsEnabled: profile.emailNotificationsEnabled,
       },
     }, client)
     return profileFromRow(result.rows[0])

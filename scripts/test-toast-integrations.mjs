@@ -135,6 +135,16 @@ for (const fragment of [
   assert.ok(notificationMigration.includes(fragment), `POS accounting notification migration missing ${fragment}`)
 }
 
+const notificationConsentMigration = read('db/migrations/0076_pos_accounting_notification_consent.sql')
+for (const fragment of [
+  'email_notifications_enabled boolean NOT NULL DEFAULT false',
+  'email_notifications_enabled_at timestamptz',
+  'pos_accounting_notification_recipient_deliverable',
+  "recipient_email = 'demo-system@clawpilot.example'",
+]) {
+  assert.ok(notificationConsentMigration.includes(fragment), `POS accounting notification consent migration missing ${fragment}`)
+}
+
 const toastWorker = read('app_src/lib/toastSyncWorker.ts')
 for (const fragment of [
   'reconcilePosAccountingIssueForDateInPostgres',

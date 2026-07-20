@@ -146,7 +146,8 @@ async function invalidatePosAccountingQuickBooksBinding(input: {
          track_sales_tax, breakout_dimensions, memo_mode, custom_memo,
          custom_transaction_number, transaction_number_suffix,
          suppress_zero_over_short, auto_payout_tips, deposit_checks_with_cash,
-         open_check_policy, batch_hold_policy, created_by
+         open_check_policy, batch_hold_policy,
+         email_notifications_enabled, email_notifications_enabled_at, created_by
        )
        SELECT previous.organization_id, previous.restaurant_guid,
          (SELECT COALESCE(MAX(candidate.profile_revision), 0)::integer + 1
@@ -159,7 +160,8 @@ async function invalidatePosAccountingQuickBooksBinding(input: {
          previous.track_sales_tax, previous.breakout_dimensions, previous.memo_mode, previous.custom_memo,
          previous.custom_transaction_number, previous.transaction_number_suffix,
          previous.suppress_zero_over_short, previous.auto_payout_tips, previous.deposit_checks_with_cash,
-         previous.open_check_policy, previous.batch_hold_policy, lower($2)
+         previous.open_check_policy, previous.batch_hold_policy,
+         previous.email_notifications_enabled, previous.email_notifications_enabled_at, lower($2)
        FROM pos_accounting_profiles previous
        WHERE previous.id = $1::uuid`,
       [profile.id, input.actorEmail],

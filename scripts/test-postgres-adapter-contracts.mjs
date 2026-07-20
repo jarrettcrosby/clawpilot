@@ -1410,6 +1410,7 @@ for (const migration of [
   '0073_toast_sync_worker_hardening.sql',
   '0074_pos_accounting_issue_notifications.sql',
   '0075_quickbooks_write_binding_compatibility.sql',
+  '0076_pos_accounting_notification_consent.sql',
 ]) {
   assertIncludes(healthRoute, migration, 'hosted POS and accounting migration health')
 }

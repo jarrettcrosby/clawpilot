@@ -272,7 +272,7 @@ export async function processToastSyncOutbox(input: { limit?: number; workerId?:
   let accountingNotificationError: string | null = null
   try {
     staleAccountingIssues = await reconcileStaleOpenPosAccountingIssuesInPostgres({ limit: 1 })
-    accountingNotifications = await processPosAccountingNotificationOutbox({ limit: 10, workerId })
+    accountingNotifications = await processPosAccountingNotificationOutbox({ limit: 2, workerId })
   } catch (error) {
     accountingNotificationError = safeError(error)
   }

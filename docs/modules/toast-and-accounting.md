@@ -129,6 +129,8 @@ Toast Analytics reporting is operational information, not a GAAP ledger. ClawPil
 - A draft must reconcile source coverage and pass mapping validation before approval is possible.
 - Posting requires a separately connected QuickBooks company, current organization authorization, an explicit approval, and an idempotency key.
 - Failed or ambiguous exports remain reviewable and retryable; they never silently fall back to another restaurant, organization, or QuickBooks company.
+- Accounting issue email is disabled by default and requires an organization accounting administrator to enable **Email issue alerts** on the effective accounting profile. Enabling it establishes a notification start date; ClawPilot does not backfill older business dates.
+- Demo workspaces and reserved `.example`, `.invalid`, and `.test` recipients never enter the delivery queue. Activity remains available in-app without email delivery.
 - Agents may summarize a normalized draft but cannot retrieve Toast or QuickBooks credentials, change mappings, approve a draft, or post a transaction.
 - Account mapping uses the active organization's read-only QuickBooks catalog described in [QuickBooks Accounting Connector](quickbooks-accounting.md).
 
@@ -173,5 +175,6 @@ This release implements both Toast credential connections, location verification
 7. Confirm the legacy accounting draft is not posted and reports `needs_mapping`; then confirm the canonical POS accounting preview independently reports mapping, allocation, reconciliation, and hold evidence.
 8. Confirm `/api/health` reports the Toast worker heartbeat in Railway.
 9. Bind the intended organization to QuickBooks, save one location's account mappings, and confirm financial posting remains unavailable.
-10. Leave one confirmed mapping issue, run the worker twice, and confirm one Activity item and one email delivery are created for that occurrence. Open the action and confirm the correct organization, location, date, and Accounting view load.
+10. Enable **Email issue alerts**, leave one confirmed current-date mapping issue, run the worker twice, and confirm one Activity item and one email delivery are created for that occurrence. Open the action and confirm the correct organization, location, date, and Accounting view load.
 11. Resolve the issue and confirm Activity records the resolution. Reintroduce the issue and confirm exactly one new occurrence is queued.
+12. Disable email alerts and confirm issue Activity continues without an outbox row. Confirm a demo or reserved recipient is rejected even if it has owner permissions.

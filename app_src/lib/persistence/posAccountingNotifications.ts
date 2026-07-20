@@ -1,6 +1,7 @@
 import crypto from 'crypto'
 import type { PoolClient } from 'pg'
 import { recordAuditEvent } from '@/lib/auditWriter'
+import { DEMO_SYSTEM_EMAIL } from '@/lib/demoMode'
 import { sendPosAccountingIssueEmail } from '@/lib/matonMail'
 import {
   readPosAccountingWorkspaceFromPostgres,
@@ -139,15 +140,47 @@ function issueSummary(issues: PosAccountingIssue[]) {
   return `${issues.length} accounting items require review`
 }
 
+const RESERVED_RECIPIENT_DOMAIN = /(?:^|\.)(?:example|invalid|test)$/i
+const RESERVED_EXAMPLE_DOMAIN = /^example\.(?:com|org|net)$/i
+
+export function isDeliverablePosAccountingRecipient(value: unknown) {
+  const email = String(value || '').trim().toLowerCase()
+  const parts = email.split('@')
+  if (parts.length !== 2 || !parts[0] || !parts[1] || email.length > 254) return false
+  const domain = parts[1]
+  return email !== DEMO_SYSTEM_EMAIL
+    && domain !== 'localhost'
+    && !RESERVED_RECIPIENT_DOMAIN.test(domain)
+    && !RESERVED_EXAMPLE_DOMAIN.test(domain)
+}
+
 async function authorizedRecipients(
   client: PoolClient,
   organizationId: string,
+  restaurantGuid: string,
+  businessDate: string,
 ) {
-  return client.query<NotificationRecipientRow>(
-    `SELECT app_user.email
+  const result = await client.query<NotificationRecipientRow>(
+    `WITH effective_policy AS (
+       SELECT profile.email_notifications_enabled, profile.email_notifications_enabled_at
+       FROM pos_accounting_profiles profile
+       WHERE profile.organization_id = $1::uuid
+         AND profile.effective_to IS NULL
+         AND (profile.restaurant_guid IS NULL OR profile.restaurant_guid = $2::uuid)
+       ORDER BY (profile.restaurant_guid = $2::uuid) DESC NULLS LAST,
+         profile.profile_revision DESC
+       LIMIT 1
+     )
+     SELECT lower(app_user.email) AS email
      FROM app_user_organization_memberships membership
      JOIN app_users app_user ON app_user.email = membership.user_email
+     JOIN workspace_organizations organization ON organization.id = membership.organization_id
+     CROSS JOIN effective_policy policy
      WHERE membership.organization_id = $1::uuid
+       AND organization.is_demo = false
+       AND policy.email_notifications_enabled = true
+       AND policy.email_notifications_enabled_at IS NOT NULL
+       AND $3::date >= (policy.email_notifications_enabled_at AT TIME ZONE 'UTC')::date
        AND app_user.status = 'active'
        AND membership.status = 'active'
        AND membership.role IN ('owner', 'admin')
@@ -158,8 +191,9 @@ async function authorizedRecipients(
          )
        )
      ORDER BY app_user.email`,
-    [organizationId],
+    [organizationId, restaurantGuid, businessDate],
   )
+  return result.rows.filter((recipient) => isDeliverablePosAccountingRecipient(recipient.email))
 }
 
 async function queueRecipients(
@@ -218,8 +252,13 @@ export async function reconcilePosAccountingIssueForDateInPostgres(input: {
       [input.organizationId, input.restaurantGuid, input.businessDate],
     )
     const current = currentResult.rows[0]
-    const recipients = await authorizedRecipients(client, input.organizationId)
-    const recipientEmails = recipients.rows.map((recipient) => recipient.email.toLowerCase())
+    const recipients = await authorizedRecipients(
+      client,
+      input.organizationId,
+      input.restaurantGuid,
+      input.businessDate,
+    )
+    const recipientEmails = recipients.map((recipient) => recipient.email.toLowerCase())
 
     if (!fingerprint) {
       if (!current) {
@@ -314,7 +353,7 @@ export async function reconcilePosAccountingIssueForDateInPostgres(input: {
       occurrence,
       issueFingerprint: fingerprint,
       issues,
-      recipients: recipients.rows,
+      recipients,
     })
 
     if (changed) {
@@ -358,7 +397,9 @@ export async function reconcileStaleOpenPosAccountingIssuesInPostgres(input: { l
        SELECT issue.organization_id, issue.restaurant_guid, issue.business_date,
          issue.last_seen_at AS priority_at
        FROM pos_accounting_issue_states issue
-       WHERE issue.status = 'open' AND issue.last_seen_at < now() - interval '30 minutes'
+       WHERE issue.status = 'open'
+         AND issue.business_date >= current_date - interval '1 day'
+         AND issue.last_seen_at < now() - interval '30 minutes'
        UNION ALL
        SELECT source.organization_id, source.restaurant_guid, source.business_date,
          MIN(source.updated_at) AS priority_at
@@ -368,7 +409,7 @@ export async function reconcileStaleOpenPosAccountingIssuesInPostgres(input: { l
         AND issue.restaurant_guid = source.restaurant_guid
         AND issue.business_date = source.business_date
        WHERE source.deleted = false
-         AND source.business_date >= current_date - interval '31 days'
+         AND source.business_date >= current_date - interval '1 day'
          AND issue.id IS NULL
        GROUP BY source.organization_id, source.restaurant_guid, source.business_date
      )
@@ -427,9 +468,38 @@ export async function claimPosAccountingNotificationsInPostgres(input: { limit: 
        status = 'cancelled', locked_at = NULL, locked_by = NULL, lock_token = NULL,
        last_error = 'Recipient no longer has accounting administration access', updated_at = now()
      FROM pos_accounting_issue_states issue
+     JOIN workspace_organizations organization ON organization.id = issue.organization_id
      WHERE issue.id = outbox.issue_state_id
        AND outbox.status IN ('pending', 'failed')
-       AND NOT EXISTS (
+       AND (
+         organization.is_demo = true
+         OR outbox.recipient_email = 'demo-system@clawpilot.example'
+         OR outbox.recipient_email ~* '@[^@]*\.(example|invalid|test)$'
+         OR outbox.recipient_email ~* '@example\.(com|org|net)$'
+         OR outbox.recipient_email ~* '@localhost$'
+         OR NOT EXISTS (
+           SELECT 1
+           FROM pos_accounting_profiles profile
+           WHERE profile.id = (
+             SELECT candidate.id
+             FROM pos_accounting_profiles candidate
+             WHERE candidate.organization_id = issue.organization_id
+               AND candidate.effective_to IS NULL
+               AND (
+                 candidate.restaurant_guid IS NULL
+                 OR candidate.restaurant_guid = issue.restaurant_guid
+               )
+             ORDER BY (candidate.restaurant_guid = issue.restaurant_guid) DESC NULLS LAST,
+               candidate.profile_revision DESC
+             LIMIT 1
+           )
+             AND profile.email_notifications_enabled = true
+             AND profile.email_notifications_enabled_at IS NOT NULL
+             AND issue.business_date >= (
+               profile.email_notifications_enabled_at AT TIME ZONE 'UTC'
+             )::date
+         )
+         OR NOT EXISTS (
          SELECT 1
          FROM app_user_organization_memberships membership
          JOIN app_users app_user ON app_user.email = membership.user_email
@@ -444,6 +514,7 @@ export async function claimPosAccountingNotificationsInPostgres(input: { limit: 
                membership.permissions @> '{"viewAccounting":true,"manageUserAccess":true}'::jsonb
              )
            )
+         )
        )`,
   )
   const result = await query<NotificationJobRow>(
@@ -451,10 +522,16 @@ export async function claimPosAccountingNotificationsInPostgres(input: { limit: 
        SELECT outbox.id
        FROM pos_accounting_notification_outbox outbox
        JOIN pos_accounting_issue_states issue ON issue.id = outbox.issue_state_id
+       JOIN workspace_organizations organization ON organization.id = issue.organization_id
        WHERE outbox.status IN ('pending', 'failed')
          AND outbox.available_at <= now()
          AND issue.status = 'open'
          AND issue.occurrence = outbox.occurrence
+         AND organization.is_demo = false
+         AND outbox.recipient_email <> 'demo-system@clawpilot.example'
+         AND outbox.recipient_email !~* '@[^@]*\.(example|invalid|test)$'
+         AND outbox.recipient_email !~* '@example\.(com|org|net)$'
+         AND outbox.recipient_email !~* '@localhost$'
        ORDER BY outbox.available_at, outbox.created_at, outbox.id
        FOR UPDATE OF outbox SKIP LOCKED
        LIMIT $1
@@ -537,7 +614,7 @@ export async function processPosAccountingNotificationOutbox(input: {
     'pos-notification-worker',
     200,
   )
-  const jobs = await claimPosAccountingNotificationsInPostgres({ limit: input.limit || 10, workerId })
+  const jobs = await claimPosAccountingNotificationsInPostgres({ limit: input.limit || 2, workerId })
   let succeeded = 0
   let failed = 0
   let dead = 0

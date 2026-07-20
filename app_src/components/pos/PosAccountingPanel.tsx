@@ -72,6 +72,7 @@ const PROFILE_FIELDS = [
   'trackSalesTax', 'breakoutDimensions', 'memoMode', 'customMemo',
   'customTransactionNumber', 'transactionNumberSuffix', 'suppressZeroOverShort',
   'autoPayoutTips', 'depositChecksWithCash', 'openCheckPolicy', 'batchHoldPolicy',
+  'emailNotificationsEnabled',
 ] as const
 
 const DIMENSION_TARGET_TYPES = ['class', 'department', 'location', 'customer', 'vendor']
@@ -510,6 +511,18 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
           ].map(([field, label]) => (
             <FormControlLabel key={field} control={<Switch checked={profile[field] === true} onChange={(event) => updateProfile(field, event.target.checked)} disabled={!canEdit} />} label={label} />
           ))}
+          <Tooltip title="Email verified organization owners and accounting administrators when a new issue is detected. Existing historical issues are not backfilled.">
+            <FormControlLabel
+              control={(
+                <Switch
+                  checked={profile.emailNotificationsEnabled === true}
+                  onChange={(event) => updateProfile('emailNotificationsEnabled', event.target.checked)}
+                  disabled={capabilities.canManage !== true}
+                />
+              )}
+              label="Email issue alerts"
+            />
+          </Tooltip>
         </Box>
         <Divider sx={{ my: 1.5 }} />
         <Typography variant="caption" color="text.secondary" display="block" mb={0.5}>Break out sales by</Typography>

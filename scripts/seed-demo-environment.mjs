@@ -750,7 +750,8 @@ async function main() {
          quickbooks_clearing_account_name, track_sales_tax, breakout_dimensions,
          memo_mode, custom_transaction_number, transaction_number_suffix,
          suppress_zero_over_short, auto_payout_tips, deposit_checks_with_cash,
-         open_check_policy, batch_hold_policy, created_by, created_at
+         open_check_policy, batch_hold_policy,
+         email_notifications_enabled, email_notifications_enabled_at, created_by, created_at
        ) VALUES (
          $1::uuid, NULL, 1, 1, $2::timestamptz, 'verified', $3,
          'ClawPilot Demo Company', $2::timestamptz, $2::timestamptz,
@@ -758,7 +759,7 @@ async function main() {
          'qb-department-mobile-kitchen', 'Mobile kitchen', 'qb-pos-account-clearing',
          'POS Clearing', true, ARRAY['order_source','payment_type']::text[],
          'pos_date', true, 'POS', true, false, false, 'hold', 'hold_until_settled',
-         $4, $2::timestamptz
+         false, NULL, $4, $2::timestamptz
        )`,
       [ROOT_ORGANIZATION_ID, dataset.generatedAt, digest('demo-synthetic-no-provider'), DEMO_EMAIL],
     )

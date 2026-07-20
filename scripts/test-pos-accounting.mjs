@@ -227,6 +227,7 @@ const profileInput = {
   depositChecksWithCash: false,
   openCheckPolicy: 'hold',
   batchHoldPolicy: 'hold_until_settled',
+  emailNotificationsEnabled: false,
 }
 const validatedProfile = accounting.validatePosAccountingProfile(profileInput)
 assert.equal(validatedProfile.transactionNumberSuffix, 'POS')
