@@ -155,6 +155,18 @@ function profilePayload(profile: DataRecord) {
   return Object.fromEntries(PROFILE_FIELDS.map((field) => [field, profile[field]]))
 }
 
+function mappingPayload(mapping: MappingDraft) {
+  return {
+    sourceKind: mapping.sourceKind,
+    sourceId: mapping.sourceId,
+    sourceName: mapping.sourceName,
+    targetType: mapping.targetType,
+    targetId: mapping.targetId,
+    targetName: mapping.targetName,
+    active: mapping.active,
+  }
+}
+
 function mappingFromSource(source: DataRecord, current: DataRecord | undefined): MappingDraft {
   const sourceKind = text(source.sourceKind)
   const suggestedTarget = record(source.suggestedTarget)
@@ -408,7 +420,9 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
     setError(null)
     setNotice(null)
     try {
-      const mappings = mappingDrafts.filter((entry) => entry.targetId && entry.targetName)
+      const mappings = mappingDrafts
+        .filter((entry) => entry.targetId && entry.targetName)
+        .map(mappingPayload)
       const response = await fetch('/api/pos/accounting', {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
