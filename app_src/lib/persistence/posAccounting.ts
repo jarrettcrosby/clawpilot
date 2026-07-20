@@ -557,7 +557,7 @@ function sourceIdentity(kind: PosSourceKind, providerId: unknown, name: string) 
     : derivedSourceId(kind, name)
 }
 
-type CatalogEntry = {
+export type PosAccountingCatalogEntry = {
   sourceKind: PosSourceKind
   sourceId: string
   sourceName: string
@@ -566,6 +566,26 @@ type CatalogEntry = {
   amount: number
   firstSeenDate: string
   lastSeenDate: string
+  catalogOrigin: 'observed' | 'menu' | 'observed_and_menu'
+  sku: string | null
+  unitPrice: number | null
+}
+
+export type StableToastMenuCatalogItem = {
+  itemGuid: string
+  providerItemId: string
+  name: string
+  plu: string | null
+  price: number | null
+}
+
+type QuickBooksCatalogItem = {
+  quickbooks_item_id: string
+  name: string
+  fully_qualified_name: string
+  item_type: string
+  sku: string | null
+  taxable: boolean
 }
 
 function safeSourceName(value: unknown, fallback: string) {
@@ -641,8 +661,8 @@ export function evaluatePosAccountingReadiness(input: {
   }
 }
 
-export function discoverSafePosSourceCatalog(orders: SourceOrderRow[]): CatalogEntry[] {
-  const catalog = new Map<string, CatalogEntry>()
+export function discoverSafePosSourceCatalog(orders: SourceOrderRow[]): PosAccountingCatalogEntry[] {
+  const catalog = new Map<string, PosAccountingCatalogEntry>()
   const add = (
     kind: PosSourceKind,
     providerId: unknown,
@@ -674,6 +694,9 @@ export function discoverSafePosSourceCatalog(orders: SourceOrderRow[]): CatalogE
       amount,
       firstSeenDate: businessDate,
       lastSeenDate: businessDate,
+      catalogOrigin: 'observed',
+      sku: null,
+      unitPrice: null,
     })
   }
 
@@ -762,9 +785,70 @@ export function discoverSafePosSourceCatalog(orders: SourceOrderRow[]): CatalogE
       cardBrandEntries.reduce((latest, entry) => latest > entry.lastSeenDate ? latest : entry.lastSeenDate, ''),
     )
   }
+  return [...catalog.values()].map((entry) => ({
+    ...entry,
+    unitPrice: entry.quantity ? money(entry.amount / entry.quantity) : null,
+  })).sort((left, right) => (
+    left.sourceKind.localeCompare(right.sourceKind) || left.sourceName.localeCompare(right.sourceName)
+  ))
+}
+
+export function mergeStableToastMenuCatalog(
+  observed: PosAccountingCatalogEntry[],
+  menuItems: StableToastMenuCatalogItem[],
+) {
+  const catalog = new Map(observed.map((entry) => [`${entry.sourceKind}:${entry.sourceId}`, { ...entry }]))
+  for (const menuItem of menuItems) {
+    const sourceName = safeSourceName(menuItem.name, 'POS item')
+    const sourceId = sourceIdentity('sales_item', menuItem.itemGuid || menuItem.providerItemId, sourceName)
+    const key = `sales_item:${sourceId}`
+    const current = catalog.get(key)
+    if (current) {
+      current.catalogOrigin = 'observed_and_menu'
+      current.sku = menuItem.plu || current.sku
+      current.unitPrice = menuItem.price === null ? current.unitPrice : money(menuItem.price)
+      continue
+    }
+    catalog.set(key, {
+      sourceKind: 'sales_item',
+      sourceId,
+      sourceName,
+      occurrenceCount: 0,
+      quantity: 0,
+      amount: 0,
+      firstSeenDate: '',
+      lastSeenDate: '',
+      catalogOrigin: 'menu',
+      sku: menuItem.plu,
+      unitPrice: menuItem.price === null ? null : money(menuItem.price),
+    })
+  }
   return [...catalog.values()].sort((left, right) => (
     left.sourceKind.localeCompare(right.sourceKind) || left.sourceName.localeCompare(right.sourceName)
   ))
+}
+
+function normalizedCatalogName(value: string) {
+  return value.normalize('NFKC').toLocaleLowerCase('en-US').replace(/[^a-z0-9]+/g, ' ').trim()
+}
+
+export function suggestQuickBooksItemForPosSource(
+  source: PosAccountingCatalogEntry,
+  items: QuickBooksCatalogItem[],
+) {
+  if (source.sourceKind !== 'sales_item') return null
+  const exact = items.filter((item) => item.name.trim().toLocaleLowerCase('en-US') === source.sourceName.trim().toLocaleLowerCase('en-US'))
+  const normalized = exact.length
+    ? exact
+    : items.filter((item) => normalizedCatalogName(item.name) === normalizedCatalogName(source.sourceName))
+  if (normalized.length !== 1) return null
+  const item = normalized[0]
+  return {
+    type: 'item' as const,
+    id: item.quickbooks_item_id,
+    name: item.fully_qualified_name || item.name,
+    confidence: exact.length === 1 ? 'exact' as const : 'normalized' as const,
+  }
 }
 
 function mappingKey(kind: PosSourceKind, sourceId: string, targetType: PosTargetType) {
@@ -1210,6 +1294,7 @@ export async function readPosAccountingWorkspaceFromPostgres(input: {
     previewResult,
     accountResult,
     itemResult,
+    menuItemResult,
     customerResult,
     vendorResult,
     taxCodeResult,
@@ -1272,9 +1357,21 @@ export async function readPosAccountingWorkspaceFromPostgres(input: {
       `SELECT quickbooks_item_id, name, fully_qualified_name, item_type, sku, taxable
        FROM quickbooks_items
        WHERE organization_id = $1::uuid AND active = true
-       ORDER BY fully_qualified_name, quickbooks_item_id
+      ORDER BY fully_qualified_name, quickbooks_item_id
        LIMIT 5000`,
       [input.organizationId],
+    ),
+    query<{
+      item_guid: string; provider_item_id: string; name: string; plu: string | null
+      price: string | null
+    }>(
+      `SELECT DISTINCT ON (item_guid) item_guid::text, provider_item_id, name, plu, price::text
+       FROM toast_menu_catalog_items
+       WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid
+         AND active = true AND archived = false
+       ORDER BY item_guid, source_revision DESC, updated_at DESC, menu_guid, group_guid
+       LIMIT 5000`,
+      params,
     ),
     query<{ quickbooks_customer_id: string; display_name: string; company_name: string | null }>(
       `SELECT quickbooks_customer_id, display_name, company_name
@@ -1357,12 +1454,38 @@ export async function readPosAccountingWorkspaceFromPostgres(input: {
   const profile = locationOverride || organizationDefault
   const scopedMappings = effectiveMappings(mappingResult.rows)
   const mappings = scopedMappings.effective
-  const sourceCatalog = discoverSafePosSourceCatalog(sourceResult.rows).map((entry) => ({
-    ...entry,
-    mappings: mappings.filter((mapping) => (
+  const sourceCatalog = mergeStableToastMenuCatalog(
+    discoverSafePosSourceCatalog(sourceResult.rows),
+    menuItemResult.rows.map((row) => ({
+      itemGuid: row.item_guid,
+      providerItemId: row.provider_item_id,
+      name: row.name,
+      plu: row.plu,
+      price: row.price === null ? null : money(row.price),
+    })),
+  ).map((entry) => {
+    const sourceMappings = mappings.filter((mapping) => (
       mapping.sourceKind === entry.sourceKind && mapping.sourceId === entry.sourceId
-    )),
-  }))
+    ))
+    const hasActiveMapping = sourceMappings.some((mapping) => mapping.active)
+    const suggestedTarget = hasActiveMapping ? null : suggestQuickBooksItemForPosSource(entry, itemResult.rows)
+    return {
+      ...entry,
+      mappings: sourceMappings,
+      suggestedTarget,
+      productCreationSuggestion: entry.sourceKind === 'sales_item' && !hasActiveMapping && !suggestedTarget
+        ? {
+            name: entry.sourceName,
+            itemType: 'NonInventory' as const,
+            sku: entry.sku,
+            description: `Toast menu item from ${location.location_name || location.restaurant_name}`,
+            unitPrice: entry.unitPrice || 0,
+            purchaseCost: 0,
+            taxable: true,
+          }
+        : null,
+    }
+  })
   const targetRevision = connection?.last_catalog_synced_at
     ? new Date(connection.last_catalog_synced_at).getTime()
     : 0

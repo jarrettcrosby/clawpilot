@@ -1090,26 +1090,69 @@ export async function projectToastStandardOrdersInPostgres(input: {
   return projection.totals
 }
 
+type ToastAccountingSalesRow = {
+  gross_sales: string; net_sales: string; discounts: string; voids: string; refunds: string
+  orders_count: number; standard_orders_count: number
+  standard_gross_sales: string; standard_net_sales: string; standard_discounts: string
+  standard_voids: string; standard_refunds: string; standard_tax: string; standard_tips: string
+  standard_service_charges: string; standard_tendered: string; standard_total: string
+  standard_cash: string; standard_card: string; standard_other_tender: string
+}
+
+function hasToastAccountingDraftActivity(sales: ToastAccountingSalesRow) {
+  const isFiniteZero = (value: unknown) => {
+    const number = Number(value)
+    return Number.isFinite(number) && number === 0
+  }
+  const noOrders = [sales.orders_count, sales.standard_orders_count].every(isFiniteZero)
+  const allAmountsZero = [
+    sales.gross_sales,
+    sales.net_sales,
+    sales.discounts,
+    sales.voids,
+    sales.refunds,
+    sales.standard_gross_sales,
+    sales.standard_net_sales,
+    sales.standard_discounts,
+    sales.standard_voids,
+    sales.standard_refunds,
+    sales.standard_tax,
+    sales.standard_tips,
+    sales.standard_service_charges,
+    sales.standard_tendered,
+    sales.standard_total,
+    sales.standard_cash,
+    sales.standard_card,
+    sales.standard_other_tender,
+  ].every(isFiniteZero)
+  return !noOrders || !allAmountsZero
+}
+
 export async function refreshToastAccountingDraftInPostgres(job: ToastSyncJob) {
-  const [salesResult, jobsResult, mappingsResult] = await Promise.all([
-    query<{
-      gross_sales: string; net_sales: string; discounts: string; voids: string; refunds: string
-      orders_count: number; standard_orders_count: number
-      standard_gross_sales: string; standard_net_sales: string; standard_discounts: string
-      standard_voids: string; standard_refunds: string; standard_tax: string; standard_tips: string
-      standard_service_charges: string; standard_tendered: string; standard_total: string
-      standard_cash: string; standard_card: string; standard_other_tender: string
-    }>(
-      `SELECT gross_sales::text, net_sales::text, discounts::text, voids::text, refunds::text,
-         orders_count, standard_orders_count,
-         standard_gross_sales::text, standard_net_sales::text, standard_discounts::text,
-         standard_voids::text, standard_refunds::text, standard_tax::text, standard_tips::text,
-         standard_service_charges::text, standard_tendered::text, standard_total::text,
-         standard_cash::text, standard_card::text, standard_other_tender::text
-       FROM toast_daily_sales
-       WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid AND business_date = $3::date`,
+  const salesResult = await query<ToastAccountingSalesRow>(
+    `SELECT gross_sales::text, net_sales::text, discounts::text, voids::text, refunds::text,
+       orders_count, standard_orders_count,
+       standard_gross_sales::text, standard_net_sales::text, standard_discounts::text,
+       standard_voids::text, standard_refunds::text, standard_tax::text, standard_tips::text,
+       standard_service_charges::text, standard_tendered::text, standard_total::text,
+       standard_cash::text, standard_card::text, standard_other_tender::text
+     FROM toast_daily_sales
+     WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid AND business_date = $3::date`,
+    [job.organizationId, job.restaurantGuid, job.businessDate],
+  )
+  const sales = salesResult.rows[0]
+  if (!sales) return
+  if (!hasToastAccountingDraftActivity(sales)) {
+    await query(
+      `DELETE FROM toast_accounting_export_drafts
+       WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid AND business_date = $3::date
+         AND status NOT IN ('approved', 'posting', 'posted')`,
       [job.organizationId, job.restaurantGuid, job.businessDate],
-    ),
+    )
+    return
+  }
+
+  const [jobsResult, mappingsResult] = await Promise.all([
     query<{ sync_kind: ToastSyncJob['syncKind']; status: string }>(
       `SELECT sync_kind, status FROM toast_sync_outbox
        WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid AND business_date = $3::date`,
@@ -1122,8 +1165,6 @@ export async function refreshToastAccountingDraftInPostgres(job: ToastSyncJob) {
       [job.organizationId, job.restaurantGuid],
     ),
   ])
-  const sales = salesResult.rows[0]
-  if (!sales) return
   const succeeded = new Set(jobsResult.rows.filter((row) => row.status === 'succeeded').map((row) => row.sync_kind))
   const analyticsReady = succeeded.has('analytics_sales')
   const ordersReady = succeeded.has('standard_orders')

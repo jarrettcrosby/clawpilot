@@ -7,6 +7,10 @@ import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
 import Chip from '@mui/material/Chip'
 import CircularProgress from '@mui/material/CircularProgress'
+import Dialog from '@mui/material/Dialog'
+import DialogActions from '@mui/material/DialogActions'
+import DialogContent from '@mui/material/DialogContent'
+import DialogTitle from '@mui/material/DialogTitle'
 import Divider from '@mui/material/Divider'
 import FormControlLabel from '@mui/material/FormControlLabel'
 import InputAdornment from '@mui/material/InputAdornment'
@@ -17,6 +21,7 @@ import TextField from '@mui/material/TextField'
 import Tooltip from '@mui/material/Tooltip'
 import Typography from '@mui/material/Typography'
 import AccountBalanceRounded from '@mui/icons-material/AccountBalanceRounded'
+import AddRounded from '@mui/icons-material/AddRounded'
 import CheckCircleRounded from '@mui/icons-material/CheckCircleRounded'
 import ErrorOutlineRounded from '@mui/icons-material/ErrorOutlineRounded'
 import Inventory2Rounded from '@mui/icons-material/Inventory2Rounded'
@@ -40,6 +45,8 @@ type TargetOption = {
   id: string
   name: string
   detail: string
+  classification: string
+  accountType: string
 }
 
 type MappingDraft = {
@@ -50,6 +57,22 @@ type MappingDraft = {
   targetId: string
   targetName: string
   active: boolean
+  suggested: boolean
+  suggestionConfidence: string
+}
+
+type ProductDraft = {
+  sourceKind: string
+  sourceId: string
+  name: string
+  itemType: 'Service' | 'NonInventory'
+  sku: string
+  description: string
+  unitPrice: string
+  purchaseCost: string
+  incomeAccountId: string
+  expenseAccountId: string
+  taxable: boolean
 }
 
 const panelSx = {
@@ -123,6 +146,8 @@ function option(value: DataRecord, fallbackName = 'QuickBooks target'): TargetOp
     id: text(value.id),
     name,
     detail: text(value.accountType || value.itemType || value.companyName),
+    classification: text(value.classification),
+    accountType: text(value.accountType),
   }
 }
 
@@ -132,14 +157,19 @@ function profilePayload(profile: DataRecord) {
 
 function mappingFromSource(source: DataRecord, current: DataRecord | undefined): MappingDraft {
   const sourceKind = text(source.sourceKind)
+  const suggestedTarget = record(source.suggestedTarget)
+  const hasCurrent = Boolean(current)
+  const suggested = !hasCurrent && Boolean(suggestedTarget.id)
   return {
     sourceKind,
     sourceId: text(source.sourceId),
     sourceName: text(source.sourceName, 'POS source'),
     targetType: targetTypeFor(sourceKind, text(current?.targetType)),
-    targetId: text(current?.targetId),
-    targetName: text(current?.targetName),
+    targetId: text(current?.targetId || suggestedTarget.id),
+    targetName: text(current?.targetName || suggestedTarget.name),
     active: current ? current.active !== false : true,
+    suggested,
+    suggestionConfidence: suggested ? text(suggestedTarget.confidence, 'normalized') : '',
   }
 }
 
@@ -162,6 +192,9 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
   const [savingMappings, setSavingMappings] = useState(false)
   const [refreshingCatalog, setRefreshingCatalog] = useState(false)
   const [refreshingQuickBooks, setRefreshingQuickBooks] = useState(false)
+  const [preparingProduct, setPreparingProduct] = useState(false)
+  const [productDraft, setProductDraft] = useState<ProductDraft | null>(null)
+  const [productDraftPrepared, setProductDraftPrepared] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
   const [reload, setReload] = useState(0)
@@ -235,6 +268,18 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
     } as Record<string, TargetOption[]>
   }, [targets])
 
+  const incomeAccounts = useMemo(() => targetOptions.account.filter((entry) => (
+    entry.classification === 'Revenue' || /income|sales/i.test(`${entry.accountType} ${entry.name}`)
+  )), [targetOptions.account])
+  const expenseAccounts = useMemo(() => targetOptions.account.filter((entry) => (
+    entry.classification === 'Expense' || /expense|cost of goods sold/i.test(`${entry.accountType} ${entry.name}`)
+  )), [targetOptions.account])
+
+  const sourceByKey = useMemo(() => new Map(sourceCatalog.map((source) => [
+    `${text(source.sourceKind)}:${text(source.sourceId)}`,
+    source,
+  ])), [sourceCatalog])
+
   const visibleMappings = useMemo(() => {
     const term = search.trim().toLowerCase()
     return mappingDrafts.filter((entry) => !term || `${entry.sourceName} ${entry.sourceKind} ${entry.targetName}`.toLowerCase().includes(term))
@@ -261,8 +306,74 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
 
   function updateMapping(sourceKind: string, sourceId: string, patch: Partial<MappingDraft>) {
     setMappingDrafts((current) => current.map((entry) => (
-      entry.sourceKind === sourceKind && entry.sourceId === sourceId ? { ...entry, ...patch } : entry
+      entry.sourceKind === sourceKind && entry.sourceId === sourceId
+        ? { ...entry, ...patch, suggested: patch.suggested ?? false, suggestionConfidence: patch.suggestionConfidence ?? '' }
+        : entry
     )))
+  }
+
+  function openProductDraft(mapping: MappingDraft) {
+    const source = sourceByKey.get(`${mapping.sourceKind}:${mapping.sourceId}`)
+    const suggestion = record(source?.productCreationSuggestion)
+    const preferredIncomeAccount = incomeAccounts.find((entry) => /sales of product income/i.test(entry.name))
+      || incomeAccounts.find((entry) => /sales|food|beverage/i.test(entry.name))
+      || (incomeAccounts.length === 1 ? incomeAccounts[0] : null)
+    setProductDraft({
+      sourceKind: mapping.sourceKind,
+      sourceId: mapping.sourceId,
+      name: text(suggestion.name, mapping.sourceName),
+      itemType: text(suggestion.itemType) === 'Service' ? 'Service' : 'NonInventory',
+      sku: text(suggestion.sku),
+      description: text(suggestion.description, 'Toast menu item prepared by ClawPilot'),
+      unitPrice: String(amount(suggestion.unitPrice) || ''),
+      purchaseCost: String(amount(suggestion.purchaseCost) || ''),
+      incomeAccountId: preferredIncomeAccount?.id || '',
+      expenseAccountId: '',
+      taxable: suggestion.taxable !== false,
+    })
+    setProductDraftPrepared(false)
+    setError(null)
+  }
+
+  function updateProductDraft(patch: Partial<ProductDraft>) {
+    setProductDraft((current) => current ? { ...current, ...patch } : current)
+  }
+
+  async function prepareQuickBooksProduct() {
+    if (!productDraft) return
+    setPreparingProduct(true)
+    setError(null)
+    setNotice(null)
+    try {
+      const response = await fetch('/api/accounting/quickbooks/actions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          clientRequestId: globalThis.crypto.randomUUID(),
+          operationKind: 'item.create',
+          payload: {
+            name: productDraft.name,
+            itemType: productDraft.itemType,
+            sku: productDraft.sku,
+            description: productDraft.description,
+            unitPrice: productDraft.unitPrice,
+            purchaseCost: productDraft.purchaseCost,
+            incomeAccountId: productDraft.incomeAccountId,
+            expenseAccountId: productDraft.expenseAccountId,
+            taxable: productDraft.taxable,
+          },
+        }),
+      })
+      const payload = await response.json().catch(() => ({})) as DataRecord
+      if (!response.ok || payload.ok !== true) throw new Error(text(payload.error, 'QuickBooks product draft could not be prepared'))
+      setProductDraft(null)
+      setProductDraftPrepared(true)
+      setNotice('QuickBooks product draft prepared. Review and approve it before the product is created.')
+    } catch (saveError) {
+      setError((saveError as Error).message)
+    } finally {
+      setPreparingProduct(false)
+    }
   }
 
   async function saveProfile() {
@@ -369,7 +480,16 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
   return (
     <Stack spacing={2}>
       {error ? <Alert severity="error" sx={{ borderRadius: '8px' }}>{error}</Alert> : null}
-      {notice ? <Alert severity="success" onClose={() => setNotice(null)} sx={{ borderRadius: '8px' }}>{notice}</Alert> : null}
+      {notice ? (
+        <Alert
+          severity="success"
+          onClose={() => setNotice(null)}
+          action={productDraftPrepared ? <Button color="inherit" size="small" onClick={() => { window.location.hash = 'accounting' }}>Review draft</Button> : undefined}
+          sx={{ borderRadius: '8px' }}
+        >
+          {notice}
+        </Alert>
+      ) : null}
 
       <Box sx={{ ...panelSx, p: { xs: 1.5, sm: 2 } }}>
         <Box display="flex" flexDirection={{ xs: 'column', sm: 'row' }} justifyContent="space-between" alignItems={{ xs: 'stretch', sm: 'flex-start' }} gap={1.5}>
@@ -571,6 +691,8 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
         </Box>
         {visibleMappings.map((mapping) => {
           const options = targetOptions[mapping.targetType] || []
+          const source = sourceByKey.get(`${mapping.sourceKind}:${mapping.sourceId}`)
+          const productSuggestion = record(source?.productCreationSuggestion)
           const selected = mapping.active
             ? options.find((entry) => entry.id === mapping.targetId)
               || (mapping.targetId ? { id: mapping.targetId, name: mapping.targetName || mapping.targetId, detail: 'Saved target' } : null)
@@ -578,8 +700,14 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
           return (
             <Box key={`${mapping.sourceKind}:${mapping.sourceId}`} px={{ xs: 1.5, sm: 2 }} py={1.25} borderTop="1px solid rgba(255,255,255,0.065)" display="grid" gridTemplateColumns={{ xs: '1fr', md: 'minmax(180px, 0.8fr) 150px minmax(240px, 1.2fr)' }} gap={1.25} alignItems="center">
               <Box minWidth={0}>
-                <Typography variant="body2" fontWeight={650} noWrap>{mapping.sourceName}</Typography>
-                <Typography variant="caption" color="text.secondary" display="block" noWrap>{mapping.sourceKind.replaceAll('_', ' ')}</Typography>
+                <Box display="flex" gap={0.6} alignItems="center" minWidth={0}>
+                  <Typography variant="body2" fontWeight={650} noWrap>{mapping.sourceName}</Typography>
+                  {mapping.suggested ? <Chip size="small" color="info" variant="outlined" label="Suggested" /> : null}
+                  {text(source?.catalogOrigin) === 'menu' ? <Chip size="small" variant="outlined" label="Menu" /> : null}
+                </Box>
+                <Typography variant="caption" color="text.secondary" display="block" noWrap>
+                  {mapping.sourceKind.replaceAll('_', ' ')}{mapping.suggested ? ` | ${mapping.suggestionConfidence} name match` : ''}
+                </Typography>
               </Box>
               <TextField
                 select
@@ -592,17 +720,36 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
               >
                 {targetTypesFor(mapping.sourceKind).map((entry) => <MenuItem key={entry} value={entry}>{entry.replaceAll('_', ' ')}</MenuItem>)}
               </TextField>
-              <Autocomplete
-                options={options}
-                value={selected}
-                getOptionLabel={(entry) => entry.name}
-                isOptionEqualToValue={(left, right) => left.id === right.id}
-                onChange={(_, value) => updateMapping(mapping.sourceKind, mapping.sourceId, value
-                  ? { targetId: value.id, targetName: value.name, active: true }
-                  : { active: false })}
-                disabled={!canEdit || !options.length}
-                renderInput={(params) => <TextField {...params} label={options.length ? 'QuickBooks target' : 'Refresh QuickBooks catalog'} size="small" sx={controlSx} />}
-              />
+              <Stack direction={{ xs: 'column', sm: 'row' }} spacing={0.75} alignItems={{ xs: 'stretch', sm: 'center' }}>
+                <Autocomplete
+                  options={options}
+                  value={selected}
+                  getOptionLabel={(entry) => entry.name}
+                  isOptionEqualToValue={(left, right) => left.id === right.id}
+                  onChange={(_, value) => updateMapping(mapping.sourceKind, mapping.sourceId, value
+                    ? { targetId: value.id, targetName: value.name, active: true }
+                    : { targetId: '', targetName: '', active: false })}
+                  disabled={!canEdit || !options.length}
+                  sx={{ flex: 1, minWidth: 0 }}
+                  renderInput={(params) => <TextField {...params} label={options.length ? 'QuickBooks target' : 'Refresh QuickBooks catalog'} size="small" sx={controlSx} />}
+                />
+                {Object.keys(productSuggestion).length ? (
+                  <Tooltip title="Prepare a reviewable QuickBooks product draft using this Toast menu item">
+                    <span>
+                      <Button
+                        variant="outlined"
+                        size="small"
+                        startIcon={<AddRounded />}
+                        onClick={() => openProductDraft(mapping)}
+                        disabled={capabilities.canPrepare !== true || quickBooks.bound !== true}
+                        sx={{ whiteSpace: 'nowrap', minHeight: 40 }}
+                      >
+                        Product
+                      </Button>
+                    </span>
+                  </Tooltip>
+                ) : null}
+              </Stack>
             </Box>
           )
         })}
@@ -657,6 +804,64 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
           </Stack>
         </Box>
       </Box>
+
+      <Dialog
+        open={Boolean(productDraft)}
+        onClose={() => { if (!preparingProduct) setProductDraft(null) }}
+        fullWidth
+        maxWidth="sm"
+        PaperProps={{ sx: { borderRadius: '8px', bgcolor: '#171821', backgroundImage: 'none' } }}
+      >
+        <DialogTitle>Prepare QuickBooks product</DialogTitle>
+        <DialogContent dividers>
+          {productDraft ? (
+            <Stack spacing={1.5} pt={0.5}>
+              <Alert severity="info" sx={{ borderRadius: '8px' }}>
+                This creates an immutable draft only. The product is not added to QuickBooks until an authorized user reviews and approves it.
+              </Alert>
+              <TextField label="Product name" value={productDraft.name} onChange={(event) => updateProductDraft({ name: event.target.value })} required sx={controlSx} />
+              <Box display="grid" gridTemplateColumns={{ xs: '1fr', sm: '1fr 1fr' }} gap={1.25}>
+                <TextField select label="Product type" value={productDraft.itemType} onChange={(event) => updateProductDraft({ itemType: event.target.value as ProductDraft['itemType'] })} sx={controlSx}>
+                  <MenuItem value="NonInventory">Non-inventory</MenuItem>
+                  <MenuItem value="Service">Service</MenuItem>
+                </TextField>
+                <TextField label="SKU (optional)" value={productDraft.sku} onChange={(event) => updateProductDraft({ sku: event.target.value })} sx={controlSx} />
+                <TextField label="Sales price" type="number" inputProps={{ min: 0, step: '0.01' }} value={productDraft.unitPrice} onChange={(event) => updateProductDraft({ unitPrice: event.target.value })} sx={controlSx} />
+                <TextField label="Purchase cost" type="number" inputProps={{ min: 0, step: '0.01' }} value={productDraft.purchaseCost} onChange={(event) => updateProductDraft({ purchaseCost: event.target.value })} sx={controlSx} />
+              </Box>
+              <Autocomplete
+                options={incomeAccounts}
+                value={incomeAccounts.find((entry) => entry.id === productDraft.incomeAccountId) || null}
+                getOptionLabel={(entry) => entry.name}
+                isOptionEqualToValue={(left, right) => left.id === right.id}
+                onChange={(_, value) => updateProductDraft({ incomeAccountId: value?.id || '' })}
+                renderInput={(params) => <TextField {...params} label="Income account" required sx={controlSx} />}
+              />
+              <Autocomplete
+                options={expenseAccounts}
+                value={expenseAccounts.find((entry) => entry.id === productDraft.expenseAccountId) || null}
+                getOptionLabel={(entry) => entry.name}
+                isOptionEqualToValue={(left, right) => left.id === right.id}
+                onChange={(_, value) => updateProductDraft({ expenseAccountId: value?.id || '' })}
+                renderInput={(params) => <TextField {...params} label="Expense account (optional)" sx={controlSx} />}
+              />
+              <TextField label="Description" value={productDraft.description} onChange={(event) => updateProductDraft({ description: event.target.value })} multiline minRows={2} sx={controlSx} />
+              <FormControlLabel control={<Switch checked={productDraft.taxable} onChange={(event) => updateProductDraft({ taxable: event.target.checked })} />} label="Taxable" />
+            </Stack>
+          ) : null}
+        </DialogContent>
+        <DialogActions sx={{ px: 3, py: 2 }}>
+          <Button onClick={() => setProductDraft(null)} disabled={preparingProduct}>Cancel</Button>
+          <Button
+            variant="contained"
+            startIcon={preparingProduct ? <CircularProgress size={16} /> : <AddRounded />}
+            onClick={() => { void prepareQuickBooksProduct() }}
+            disabled={preparingProduct || !productDraft?.name.trim() || !productDraft?.incomeAccountId}
+          >
+            Prepare draft
+          </Button>
+        </DialogActions>
+      </Dialog>
     </Stack>
   )
 }
