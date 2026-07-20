@@ -36,6 +36,7 @@ type NumberFormatter = (value: number, maximumFractionDigits?: number) => string
 type PosAccountingPanelProps = {
   location: string
   businessDate: string
+  hasAccountingDraft: boolean
   revision: number
   money: MoneyFormatter
   number: NumberFormatter
@@ -193,7 +194,7 @@ function ReadinessChip({ ready, readyLabel, waitingLabel }: {
   return <Chip size="small" variant="outlined" color={ready ? 'success' : 'warning'} label={ready ? readyLabel : waitingLabel} />
 }
 
-export default function PosAccountingPanel({ location, businessDate, revision, money, number }: PosAccountingPanelProps) {
+export default function PosAccountingPanel({ location, businessDate, hasAccountingDraft, revision, money, number }: PosAccountingPanelProps) {
   const [workspace, setWorkspace] = useState<DataRecord | null>(null)
   const [profile, setProfile] = useState<DataRecord>({})
   const [scope, setScope] = useState('organization_default')
@@ -770,54 +771,60 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
         {!visibleMappings.length ? <Typography variant="body2" color="text.secondary" px={2} py={2}>{search ? 'No mappings match this search.' : 'No Toast sources are available yet.'}</Typography> : null}
       </Box>
 
-      <Box display="grid" gridTemplateColumns={{ xs: '1fr', lg: 'minmax(0, 1.35fr) minmax(300px, 0.65fr)' }} gap={2}>
-        <Box sx={{ ...panelSx, overflow: 'hidden' }}>
-          <Box px={{ xs: 1.5, sm: 2 }} py={1.5} display="flex" justifyContent="space-between" alignItems="center" gap={1.5}>
-            <Box>
-              <Typography fontWeight={700}>Posting preview</Typography>
-              <Typography variant="caption" color="text.secondary">{text(receipt.memo, `POS ${businessDate}`)}</Typography>
-            </Box>
-            <ReadinessChip ready={readiness.readyForReview === true} readyLabel="Ready for review" waitingLabel="On hold" />
-          </Box>
-          <Box display="grid" gridTemplateColumns={{ xs: 'repeat(2, minmax(0, 1fr))', sm: 'repeat(4, minmax(0, 1fr))' }} gap={1.25} px={{ xs: 1.5, sm: 2 }} pb={1.5}>
-            <Box><Typography variant="caption" color="text.disabled">Subtotal</Typography><Typography fontWeight={700}>{money(amount(receipt.subtotal))}</Typography></Box>
-            <Box><Typography variant="caption" color="text.disabled">Tax</Typography><Typography fontWeight={700}>{money(amount(receipt.tax))}</Typography></Box>
-            <Box><Typography variant="caption" color="text.disabled">Tips</Typography><Typography fontWeight={700}>{money(amount(receipt.tips))}</Typography></Box>
-            <Box><Typography variant="caption" color="text.disabled">Total</Typography><Typography fontWeight={700}>{money(amount(receipt.total))}</Typography></Box>
-          </Box>
-          <Divider />
-          {rows(journal.lines).map((line, index) => {
-            const target = record(line.target)
-            return (
-              <Box key={`${text(line.code)}-${index}`} px={{ xs: 1.5, sm: 2 }} py={1} display="grid" gridTemplateColumns="auto minmax(0, 1fr) auto" gap={1} alignItems="center" borderBottom="1px solid rgba(255,255,255,0.055)">
-                <Typography variant="caption" color={text(line.side) === 'debit' ? '#A8C7FA' : '#CFC6EA'} fontWeight={700}>{text(line.side).toUpperCase()}</Typography>
-                <Box minWidth={0}><Typography variant="body2" noWrap>{text(line.label)}</Typography><Typography variant="caption" color={target.id ? 'text.secondary' : 'warning.main'} display="block" noWrap>{target.name ? text(target.name) : 'Mapping required'}</Typography></Box>
-                <Typography variant="body2" fontWeight={650}>{money(amount(line.amount))}</Typography>
+      {hasAccountingDraft ? (
+        <Box display="grid" gridTemplateColumns={{ xs: '1fr', lg: 'minmax(0, 1.35fr) minmax(300px, 0.65fr)' }} gap={2}>
+          <Box sx={{ ...panelSx, overflow: 'hidden' }}>
+            <Box px={{ xs: 1.5, sm: 2 }} py={1.5} display="flex" justifyContent="space-between" alignItems="center" gap={1.5}>
+              <Box>
+                <Typography fontWeight={700}>Posting preview</Typography>
+                <Typography variant="caption" color="text.secondary">{text(receipt.memo, `POS ${businessDate}`)}</Typography>
               </Box>
-            )
-          })}
-          <Box px={{ xs: 1.5, sm: 2 }} py={1.25} display="flex" justifyContent="space-between" alignItems="center" gap={1.5}>
-            <Typography variant="body2" fontWeight={700}>Balance</Typography>
-            <Chip size="small" variant="outlined" color={journal.balanced === true ? 'success' : 'error'} label={money(amount(journal.balance))} />
+              <ReadinessChip ready={readiness.readyForReview === true} readyLabel="Ready for review" waitingLabel="On hold" />
+            </Box>
+            <Box display="grid" gridTemplateColumns={{ xs: 'repeat(2, minmax(0, 1fr))', sm: 'repeat(4, minmax(0, 1fr))' }} gap={1.25} px={{ xs: 1.5, sm: 2 }} pb={1.5}>
+              <Box><Typography variant="caption" color="text.disabled">Subtotal</Typography><Typography fontWeight={700}>{money(amount(receipt.subtotal))}</Typography></Box>
+              <Box><Typography variant="caption" color="text.disabled">Tax</Typography><Typography fontWeight={700}>{money(amount(receipt.tax))}</Typography></Box>
+              <Box><Typography variant="caption" color="text.disabled">Tips</Typography><Typography fontWeight={700}>{money(amount(receipt.tips))}</Typography></Box>
+              <Box><Typography variant="caption" color="text.disabled">Total</Typography><Typography fontWeight={700}>{money(amount(receipt.total))}</Typography></Box>
+            </Box>
+            <Divider />
+            {rows(journal.lines).map((line, index) => {
+              const target = record(line.target)
+              return (
+                <Box key={`${text(line.code)}-${index}`} px={{ xs: 1.5, sm: 2 }} py={1} display="grid" gridTemplateColumns="auto minmax(0, 1fr) auto" gap={1} alignItems="center" borderBottom="1px solid rgba(255,255,255,0.055)">
+                  <Typography variant="caption" color={text(line.side) === 'debit' ? '#A8C7FA' : '#CFC6EA'} fontWeight={700}>{text(line.side).toUpperCase()}</Typography>
+                  <Box minWidth={0}><Typography variant="body2" noWrap>{text(line.label)}</Typography><Typography variant="caption" color={target.id ? 'text.secondary' : 'warning.main'} display="block" noWrap>{target.name ? text(target.name) : 'Mapping required'}</Typography></Box>
+                  <Typography variant="body2" fontWeight={650}>{money(amount(line.amount))}</Typography>
+                </Box>
+              )
+            })}
+            <Box px={{ xs: 1.5, sm: 2 }} py={1.25} display="flex" justifyContent="space-between" alignItems="center" gap={1.5}>
+              <Typography variant="body2" fontWeight={700}>Balance</Typography>
+              <Chip size="small" variant="outlined" color={journal.balanced === true ? 'success' : 'error'} label={money(amount(journal.balance))} />
+            </Box>
           </Box>
-        </Box>
 
-        <Box sx={{ ...panelSx, p: { xs: 1.5, sm: 2 }, alignSelf: 'start' }}>
-          <Box display="flex" alignItems="center" gap={0.75} mb={1}>
-            {readiness.hold === true ? <ErrorOutlineRounded color="warning" /> : <CheckCircleRounded color="success" />}
-            <Typography fontWeight={700}>Review controls</Typography>
+          <Box sx={{ ...panelSx, p: { xs: 1.5, sm: 2 }, alignSelf: 'start' }}>
+            <Box display="flex" alignItems="center" gap={0.75} mb={1}>
+              {readiness.hold === true ? <ErrorOutlineRounded color="warning" /> : <CheckCircleRounded color="success" />}
+              <Typography fontWeight={700}>Review controls</Typography>
+            </Box>
+            <Stack spacing={1}>
+              {(Array.isArray(readiness.holdReasons) ? readiness.holdReasons : []).map((reason, index) => (
+                <Typography key={`${text(reason)}-${index}`} variant="body2" color="text.secondary">{text(reason)}</Typography>
+              ))}
+              {evidence.protected === true ? <Alert severity="info" sx={{ borderRadius: '8px' }}>Approved or posted evidence is immutable.</Alert> : null}
+              <Alert severity="info" sx={{ borderRadius: '8px' }}>
+                Posting is disabled. This screen prepares and validates accounting evidence only.
+              </Alert>
+            </Stack>
           </Box>
-          <Stack spacing={1}>
-            {(Array.isArray(readiness.holdReasons) ? readiness.holdReasons : []).map((reason, index) => (
-              <Typography key={`${text(reason)}-${index}`} variant="body2" color="text.secondary">{text(reason)}</Typography>
-            ))}
-            {evidence.protected === true ? <Alert severity="info" sx={{ borderRadius: '8px' }}>Approved or posted evidence is immutable.</Alert> : null}
-            <Alert severity="info" sx={{ borderRadius: '8px' }}>
-              Posting is disabled. This screen prepares and validates accounting evidence only.
-            </Alert>
-          </Stack>
         </Box>
-      </Box>
+      ) : (
+        <Alert severity="info" sx={{ borderRadius: '8px' }}>
+          No sales-backed accounting draft is available in this date range. Posting configuration remains available.
+        </Alert>
+      )}
 
       <Dialog
         open={Boolean(productDraft)}

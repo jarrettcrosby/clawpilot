@@ -138,9 +138,20 @@ for (const fragment of [
   '.map(mappingPayload)',
   'sourceKind: mapping.sourceKind',
   'active: mapping.active',
+  'hasAccountingDraft ? (',
+  'No sales-backed accounting draft is available in this date range.',
   "window.location.hash = 'accounting'",
 ]) {
   assert.ok(panel.includes(fragment), `POS accounting panel missing ${fragment}`)
+}
+
+const posSection = read('app_src/components/pos/PosSection.tsx')
+for (const fragment of [
+  "const accountingBusinessDate = textValue(record(accountingDrafts[0]), ['businessDate', 'date'])",
+  'businessDate={accountingBusinessDate || to}',
+  'hasAccountingDraft={Boolean(accountingBusinessDate)}',
+]) {
+  assert.ok(posSection.includes(fragment), `POS section missing ${fragment}`)
 }
 
 const authorization = loadTypeScriptModule('app_src/lib/accountingAuthorization.ts', {
