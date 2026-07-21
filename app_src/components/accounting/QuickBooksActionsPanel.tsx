@@ -45,6 +45,7 @@ type WriteRequest = {
   status: RequestStatus
   providerRequestId: string
   requestPayload: Record<string, unknown>
+  resultPayload: Record<string, unknown>
   requestFingerprint: string
   providerEntityType: string | null
   providerEntityId: string | null
@@ -159,6 +160,10 @@ function requestAmount(request: WriteRequest) {
   return request.operationKind === 'invoice.create' ? Number(request.requestPayload.totalAmount || 0) : null
 }
 
+function dataRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
+}
+
 function DetailField({ label, value }: { label: string; value: unknown }) {
   if (value === null || value === undefined || value === '') return null
   return (
@@ -171,6 +176,7 @@ function DetailField({ label, value }: { label: string; value: unknown }) {
 
 function RequestReview({ request, money }: { request: WriteRequest; money: (value: number) => string }) {
   const payload = request.requestPayload
+  const mappingResult = dataRecord(request.resultPayload.posAccountingMapping)
   const lines = Array.isArray(payload.lines) ? payload.lines as Array<Record<string, unknown>> : []
   return (
     <Stack spacing={2}>
@@ -185,6 +191,9 @@ function RequestReview({ request, money }: { request: WriteRequest; money: (valu
       <DetailField label="Type" value={payload.itemType} />
       <DetailField label="SKU" value={payload.sku} />
       <DetailField label="Category" value={payload.parentCategoryName} />
+      <DetailField label="Toast source" value={payload.sourceName} />
+      <DetailField label="Toast location" value={payload.sourceRestaurantGuid} />
+      <DetailField label="Mapping scope" value={payload.mappingScope === 'location_override' ? 'Location override' : payload.mappingScope === 'organization_default' ? 'Organization default' : null} />
       <DetailField label="Description" value={payload.description || payload.notes} />
       <DetailField label="Invoice date" value={payload.transactionDate} />
       <DetailField label="Due date" value={payload.dueDate} />
@@ -216,6 +225,14 @@ function RequestReview({ request, money }: { request: WriteRequest; money: (valu
       <DetailField label="Approval note" value={request.approvalNote} />
       <DetailField label="Provider request ID" value={request.providerRequestId} />
       <DetailField label="QuickBooks record" value={request.providerEntityId ? `${request.providerEntityType || 'Record'} ${request.providerEntityId}` : null} />
+      <DetailField
+        label="POS catalog mapping"
+        value={mappingResult.status === 'created'
+          ? `Created for QuickBooks item ${String(mappingResult.targetId || '')}`
+          : mappingResult.status === 'skipped_existing'
+            ? `Existing mapping preserved for QuickBooks item ${String(mappingResult.targetId || '')}`
+            : null}
+      />
       <DetailField label="Request fingerprint" value={request.requestFingerprint} />
       {request.lastErrorMessage ? <Alert severity="error">{request.lastErrorMessage}</Alert> : null}
     </Stack>

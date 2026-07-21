@@ -214,6 +214,22 @@ function firstReference(source, keys) {
   return { id: null, name: null }
 }
 
+function journalEntrySummary(transaction) {
+  let debitTotal = 0
+  let creditTotal = 0
+  let account = { id: null, name: null }
+  for (const lineValue of Array.isArray(transaction.Line) ? transaction.Line : []) {
+    const line = record(lineValue)
+    const detail = record(line.JournalEntryLineDetail)
+    const postingType = text(detail.PostingType, 20).toLowerCase()
+    const lineAmount = signedAmount(line.Amount)
+    if (postingType === 'debit') debitTotal += lineAmount
+    if (postingType === 'credit') creditTotal += lineAmount
+    if (!account.id && !account.name) account = reference(detail.AccountRef)
+  }
+  return { debitTotal, creditTotal, account }
+}
+
 export function parseQuickBooksTransactions(payload, entityType) {
   const rows = record(record(payload).QueryResponse)[entityType]
   if (!Array.isArray(rows)) return []
@@ -224,9 +240,11 @@ export function parseQuickBooksTransactions(payload, entityType) {
     const party = firstReference(transaction, [
       'CustomerRef', 'VendorRef', 'EntityRef', 'EmployeeRef',
     ])
-    const account = firstReference(transaction, [
+    const journal = entityType === 'JournalEntry' ? journalEntrySummary(transaction) : null
+    const directAccount = firstReference(transaction, [
       'AccountRef', 'DepositToAccountRef', 'APAccountRef', 'ARAccountRef', 'BankAccountRef',
     ])
+    const account = directAccount.id || directAccount.name ? directAccount : journal?.account || directAccount
     const openBalance = signedAmount(transaction.Balance ?? transaction.UnappliedAmt)
     const lifecycleStatus = ['Invoice', 'Bill'].includes(entityType)
       ? openBalance === 0 ? 'Paid' : 'Open'
@@ -242,7 +260,7 @@ export function parseQuickBooksTransactions(payload, entityType) {
       accountId: account.id,
       accountName: account.name,
       currencyCode: text(record(transaction.CurrencyRef).value, 10) || null,
-      totalAmount: signedAmount(transaction.TotalAmt ?? transaction.PaymentAmount),
+      totalAmount: journal ? journal.debitTotal : signedAmount(transaction.TotalAmt ?? transaction.PaymentAmount),
       openBalance,
       status: text(transaction.TxnStatus, 100) || lifecycleStatus,
       emailStatus: text(transaction.EmailStatus, 100) || null,

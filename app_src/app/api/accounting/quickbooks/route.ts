@@ -24,6 +24,7 @@ export const runtime = 'nodejs'
 
 const TRANSACTION_ENTITY_TYPES = new Set([
   'Invoice', 'Payment', 'SalesReceipt', 'Purchase', 'Bill', 'BillPayment', 'CreditMemo', 'RefundReceipt',
+  'JournalEntry',
 ])
 
 function json(payload: Record<string, unknown>, status = 200) {

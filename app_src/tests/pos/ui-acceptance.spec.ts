@@ -152,6 +152,16 @@ async function mockPos(page: Page) {
   }))
 }
 
+async function activatePos(page: Page) {
+  await page.evaluate(() => {
+    const oldURL = window.location.href
+    const nextURL = new URL(oldURL)
+    nextURL.hash = 'pos'
+    window.history.replaceState({}, '', nextURL)
+    window.dispatchEvent(new HashChangeEvent('hashchange', { oldURL, newURL: nextURL.toString() }))
+  })
+}
+
 async function gotoPos(page: Page) {
   await authenticateIfConfigured(page)
   await mockPos(page)
@@ -160,7 +170,12 @@ async function gotoPos(page: Page) {
     throw new Error('Target requires authentication; set UI_AUTH_PASSWORD and UI_OPERATOR_SECRET together')
   }
   await expect(page.getByTestId('app-shell')).toBeVisible()
+  const closeGuide = page.getByRole('button', { name: 'Close POS guide' })
+  await closeGuide.waitFor({ state: 'visible', timeout: 2000 }).catch(() => {})
+  if (await closeGuide.isVisible()) await closeGuide.click()
+  await activatePos(page)
   await expect(page.getByRole('tablist', { name: 'POS views' })).toBeVisible()
+  if (await closeGuide.isVisible()) await closeGuide.click()
   await page.getByRole('tab', { name: 'Reports', exact: true }).click()
   await expect(page.getByRole('tablist', { name: 'POS report views' })).toBeVisible()
 }
@@ -208,3 +223,114 @@ for (const viewport of [
     await expectNoDocumentOverflow(page)
   })
 }
+
+test('POS accounting saves only one exact changed mapping from a catalog larger than 250 rows', async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 900 })
+  await authenticateIfConfigured(page)
+  await mockPos(page)
+  await page.addInitScript((organizationId) => {
+    window.localStorage.setItem(`clawpilot.pos.guide.seen:${organizationId}`, '1')
+  }, posSnapshot.organizationId)
+
+  const sourceId = '14351ea1-ad68-4f2c-85e6-da00661bab4e'
+  const sourceName = 'Saratoga Springs - Sparkling Water'
+  const targetId = '35'
+  const targetName = 'Saratoga Sparkling 12 oz'
+  const sourceCatalog = Array.from({ length: 251 }, (_, index) => ({
+    sourceKind: 'sales_item',
+    sourceId: index === 0 ? sourceId : `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`,
+    sourceName: index === 0 ? sourceName : `Menu item ${index}`,
+    catalogOrigin: 'menu',
+    suggestedTarget: null,
+    productCreationSuggestion: null,
+  }))
+  let savedMapping: Record<string, unknown> | null = null
+  const submittedBodies: Array<Record<string, unknown>> = []
+
+  await page.route((url) => url.pathname === '/api/pos/accounting', async (route) => {
+    if (route.request().method() === 'PATCH') {
+      const body = route.request().postDataJSON() as Record<string, unknown>
+      submittedBodies.push(body)
+      const mappings = body.mappings as Array<Record<string, unknown>>
+      savedMapping = {
+        ...mappings[0],
+        scope: body.scope,
+        mappingRevision: submittedBodies.length,
+        validationStatus: mappings[0].active === false ? 'unvalidated' : 'valid',
+        validationReason: mappings[0].active === false ? 'Inactive mapping' : null,
+      }
+      await route.fulfill({ json: { ok: true, mappings: [savedMapping], changedCount: 1 } })
+      return
+    }
+    await route.fulfill({
+      json: {
+        ok: true,
+        capabilities: { canView: true, canManage: true, canPrepare: true, canApprove: true },
+        accounting: {
+          location: { restaurantGuid: locationId, restaurantName: 'Acceptance Restaurant', locationName: 'Downtown' },
+          profile: {
+            scope: 'organization_default', profileRevision: 1, postingMethod: 'itemized_sales_receipt',
+            breakoutDimensions: [], trackSalesTax: true, memoMode: 'standard', customMemo: null,
+            customTransactionNumber: false, transactionNumberSuffix: null, suppressZeroOverShort: true,
+            autoPayoutTips: false, depositChecksWithCash: false, openCheckPolicy: 'hold',
+            batchHoldPolicy: 'hold', emailNotificationsEnabled: false,
+          },
+          quickBooks: {
+            configured: true, bound: true, companyName: 'Acceptance Books', status: 'active',
+            catalog: { accounts: 0, items: 1, taxCodes: 0, classes: 0, departments: 0 },
+          },
+          sourceCatalog,
+          mappings: savedMapping ? [savedMapping] : [],
+          targets: {
+            accounts: [], customers: [], vendors: [], taxCodes: [], classes: [], departments: [], locations: [],
+            items: [{ id: targetId, name: targetName, fullyQualifiedName: targetName, itemType: 'NonInventory' }],
+          },
+          preview: { readiness: { missingMappings: [] }, salesReceipt: {}, journal: {}, evidence: {} },
+          draft: null,
+          draftHistory: [],
+          latestCommand: null,
+        },
+      },
+    })
+  })
+
+  await page.goto('/#pos')
+  if (new URL(page.url()).pathname === '/login') {
+    throw new Error('Target requires authentication; set UI_AUTH_PASSWORD and UI_OPERATOR_SECRET together')
+  }
+  await expect(page.getByTestId('app-shell')).toBeVisible()
+  const closeGuide = page.getByRole('button', { name: 'Close POS guide' })
+  if (await closeGuide.isVisible()) await closeGuide.click()
+  await activatePos(page)
+  await page.getByRole('tab', { name: 'Accounting', exact: true }).click()
+  await page.getByPlaceholder('Search mappings').fill(sourceName)
+
+  const target = page.getByRole('combobox', { name: 'QuickBooks target' })
+  await target.fill(targetName)
+  await target.press('Escape')
+  await page.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect(page.getByText(`Select a QuickBooks target from the list for "${sourceName}" before saving.`)).toBeVisible()
+  expect(submittedBodies).toHaveLength(0)
+
+  await target.fill(targetName)
+  await page.getByRole('option', { name: targetName, exact: true }).click()
+  await page.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect.poll(() => submittedBodies.length).toBe(1)
+  const submittedMappings = submittedBodies[0].mappings as Array<Record<string, unknown>>
+  expect(submittedMappings).toHaveLength(1)
+  expect(submittedMappings[0]).toMatchObject({
+    sourceKind: 'sales_item', sourceId, sourceName,
+    targetType: 'item', targetId, targetName, active: true,
+  })
+  await expect(target).toHaveValue(targetName)
+  await expect(page.getByRole('button', { name: 'Save', exact: true })).toBeDisabled()
+
+  const autocomplete = target.locator('xpath=ancestor::div[contains(@class,"MuiAutocomplete-root")]')
+  await autocomplete.hover()
+  await autocomplete.getByTitle('Clear').click()
+  await page.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect.poll(() => submittedBodies.length).toBe(2)
+  const clearedMappings = submittedBodies[1].mappings as Array<Record<string, unknown>>
+  expect(clearedMappings).toHaveLength(1)
+  expect(clearedMappings[0]).toMatchObject({ targetId, targetName, active: false })
+})

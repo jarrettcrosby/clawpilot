@@ -15,6 +15,17 @@ const { Pool } = requireFromApp('pg')
 const organizationId = '11111111-1111-4111-8111-111111111111'
 const otherOrganizationId = '22222222-2222-4222-8222-222222222222'
 const restaurantGuid = '33333333-3333-4333-8333-333333333333'
+class PosAccountingRequestError extends Error {
+  constructor(code, message, status = 400) {
+    super(message)
+    this.code = code
+    this.status = status
+  }
+}
+const toastPersistenceMocks = {
+  '@/lib/auditWriter': { recordAuditEvent: async () => {} },
+  '@/lib/persistence/posAccounting': { PosAccountingRequestError },
+}
 
 function read(path) {
   return readFileSync(resolve(root, path), 'utf8')
@@ -82,8 +93,8 @@ for (const fragment of [
   'FOR UPDATE SKIP LOCKED',
   "'toast.credential.updated'",
   "'toast.sync.queued'",
-  'refreshToastAccountingDraftInPostgres',
-  'idempotency_key',
+  'queuePosAccountingSalesReloadInPostgres',
+  'pos_accounting_commands',
   'reporting: ToastReportingState',
   "result_summary ->> 'records'",
   "GROUP BY CASE WHEN sync_kind = 'standard_order_updates' THEN 'standard_orders' ELSE sync_kind END",
@@ -94,7 +105,8 @@ for (const fragment of [
   'rerun_requested_at',
   'make_interval(secs => $6::integer)',
   "CASE WHEN rerun_requested_at IS NULL THEN 'succeeded' ELSE 'pending' END",
-  'canonicalReadinessVerified: false',
+  "syncKind: 'analytics_sales'",
+  "syncKind: 'standard_orders'",
 ]) {
   assert.ok(persistence.includes(fragment), `Toast persistence contract missing ${fragment}`)
 }
@@ -173,6 +185,7 @@ const tenantQueries = []
 const toastOrderProjection = loadTypeScriptModule('app_src/lib/integrations/toastOrderProjection.ts')
 const tenantPersistence = loadTypeScriptModule('app_src/lib/persistence/toastIntegrations.ts', {
   mocks: {
+    ...toastPersistenceMocks,
     '@/lib/integrations/toastOrderProjection': toastOrderProjection,
     '@/lib/persistence/postgres': {
       query: async (sql, params = []) => {
@@ -275,6 +288,7 @@ assert.equal(tenantState.organizationId, organizationId)
 const queueQueries = []
 const queuePersistence = loadTypeScriptModule('app_src/lib/persistence/toastIntegrations.ts', {
   mocks: {
+    ...toastPersistenceMocks,
     '@/lib/integrations/toastOrderProjection': toastOrderProjection,
     '@/lib/persistence/postgres': {
       query: async () => ({ rows: [], rowCount: 0 }),
@@ -282,12 +296,35 @@ const queuePersistence = loadTypeScriptModule('app_src/lib/persistence/toastInte
         query: async (sql, params = []) => {
           const source = String(sql)
           queueQueries.push({ source, params: [...params] })
-          if (source.includes('SELECT access_type FROM organization_toast_credentials')) {
+          if (source.includes('SELECT access_type') && source.includes('FROM organization_toast_credentials')) {
             return { rows: [{ access_type: 'analytics' }, { access_type: 'standard' }], rowCount: 2 }
           }
           if (source.includes('SELECT restaurant_guid::text, analytics_access, standard_access')) {
             return {
               rows: [{ restaurant_guid: restaurantGuid, analytics_access: true, standard_access: true }],
+              rowCount: 1,
+            }
+          }
+          if (source.includes('SELECT restaurant_guid::text, restaurant_name, location_name')) {
+            return {
+              rows: [{
+                restaurant_guid: restaurantGuid,
+                restaurant_name: 'Test Restaurant',
+                location_name: 'Downtown',
+                analytics_access: true,
+                standard_access: true,
+              }],
+              rowCount: 1,
+            }
+          }
+          if (source.includes('INSERT INTO pos_accounting_commands')) {
+            return {
+              rows: [{
+                id: '44444444-4444-4444-8444-444444444444',
+                status: 'queued',
+                created_at: '2026-07-18T12:00:00.000Z',
+                updated_at: '2026-07-18T12:00:00.000Z',
+              }],
               rowCount: 1,
             }
           }
@@ -306,62 +343,23 @@ const manualQueueCalls = queueQueries.filter((entry) => entry.source.includes('I
 assert.equal(manualQueueCalls.length, 3)
 assert.ok(manualQueueCalls.every((entry) => entry.params[5] === 0), 'manual Toast sync must rerun completed jobs')
 assert.ok(manualQueueCalls.every((entry) => entry.source.includes("status = 'processing' THEN now()")))
-
-const zeroAccountingSales = {
-  gross_sales: '0', net_sales: '0', discounts: '0', voids: '0', refunds: '0',
-  orders_count: 0, standard_orders_count: 0,
-  standard_gross_sales: '0', standard_net_sales: '0', standard_discounts: '0',
-  standard_voids: '0', standard_refunds: '0', standard_tax: '0', standard_tips: '0',
-  standard_service_charges: '0', standard_tendered: '0', standard_total: '0',
-  standard_cash: '0', standard_card: '0', standard_other_tender: '0',
-}
-let accountingSales = zeroAccountingSales
-const accountingDraftQueries = []
-const accountingDraftPersistence = loadTypeScriptModule('app_src/lib/persistence/toastIntegrations.ts', {
-  mocks: {
-    '@/lib/integrations/toastOrderProjection': toastOrderProjection,
-    '@/lib/persistence/postgres': {
-      query: async (sql, params = []) => {
-        const source = String(sql)
-        accountingDraftQueries.push({ source, params: [...params] })
-        if (source.includes('FROM toast_daily_sales')) return { rows: [accountingSales], rowCount: 1 }
-        if (source.includes('FROM toast_sync_outbox')) {
-          return { rows: [{ sync_kind: 'standard_orders', status: 'succeeded' }], rowCount: 1 }
-        }
-        if (source.includes('FROM toast_accounting_mappings')) return { rows: [], rowCount: 0 }
-        return { rows: [], rowCount: 1 }
-      },
-      withTransaction: async (work) => work({ query: async () => ({ rows: [], rowCount: 0 }) }),
-    },
-  },
+const accountingReloadQueryStart = queueQueries.length
+const accountingReload = await queuePersistence.queuePosAccountingSalesReloadInPostgres({
+  organizationId,
+  restaurantGuid,
+  businessDate: '2026-07-19',
+  actorEmail: 'preparer@example.test',
 })
-async function accountingDraftRefreshQueries(sales, businessDate) {
-  accountingSales = { ...zeroAccountingSales, ...sales }
-  accountingDraftQueries.length = 0
-  await accountingDraftPersistence.refreshToastAccountingDraftInPostgres({
-    organizationId,
-    restaurantGuid,
-    businessDate,
-    syncKind: 'standard_orders',
-  })
-  return [...accountingDraftQueries]
-}
-
-const zeroDraftQueries = await accountingDraftRefreshQueries({}, '2026-08-01')
-assert.equal(zeroDraftQueries.filter((entry) => entry.source.includes('DELETE FROM toast_accounting_export_drafts')).length, 1)
-assert.equal(zeroDraftQueries.filter((entry) => entry.source.includes('INSERT INTO toast_accounting_export_drafts')).length, 0)
-assert.ok(zeroDraftQueries.some((entry) => entry.source.includes("status NOT IN ('approved', 'posting', 'posted')")))
-
-for (const [label, businessDate, activity] of [
-  ['standard refund', '2026-08-02', { standard_refunds: '12.34' }],
-  ['Analytics refund', '2026-08-03', { refunds: '-9.87' }],
-  ['nonzero accounting amount', '2026-08-04', { standard_tax: '0.01' }],
-  ['zero-value order', '2026-08-05', { orders_count: 1 }],
-]) {
-  const queries = await accountingDraftRefreshQueries(activity, businessDate)
-  assert.equal(queries.filter((entry) => entry.source.includes('DELETE FROM toast_accounting_export_drafts')).length, 0, `${label} must not delete a draft`)
-  assert.equal(queries.filter((entry) => entry.source.includes('INSERT INTO toast_accounting_export_drafts')).length, 1, `${label} must retain a draft`)
-}
+assert.equal(accountingReload.commandType, 'reload_sales')
+assert.deepEqual([...accountingReload.expectedSyncKinds], ['analytics_sales', 'standard_orders'])
+const accountingReloadQueries = queueQueries.slice(accountingReloadQueryStart)
+const accountingReloadJobs = accountingReloadQueries.filter((entry) => entry.source.includes('INSERT INTO toast_sync_outbox'))
+assert.equal(accountingReloadJobs.length, 2, 'accounting reload must queue sales sources only')
+assert.deepEqual(accountingReloadJobs.map((entry) => entry.params[2]), ['analytics_sales', 'standard_orders'])
+assert.ok(accountingReloadJobs.every((entry) => entry.params[0] === organizationId))
+assert.ok(accountingReloadJobs.every((entry) => entry.params[1] === restaurantGuid))
+assert.ok(accountingReloadJobs.every((entry) => entry.params[3] === '2026-07-19'))
+assert.ok(accountingReloadJobs.every((entry) => entry.params[5] === 0))
 
 const panel = read('app_src/components/settings/ToastIntegrationPanel.tsx')
 for (const fragment of [
@@ -517,7 +515,12 @@ assert.ok(updateRequest, 'Toast modified-order query must use an explicit modifi
 assert.ok(updateRequest.url.includes('endDate=2026-07-17T00%3A00%3A00.000Z'))
 
 const worker = read('app_src/lib/toastSyncWorker.ts')
-assert.ok(worker.includes('refreshToastAccountingDraftInPostgres'), 'Toast worker must produce reviewable accounting drafts')
+assert.ok(worker.includes('regeneratePosAccountingDraftInPostgres'), 'Toast worker must regenerate canonical accounting drafts')
+assert.ok(worker.includes('finalizePosAccountingReloadForDateInPostgres'), 'Toast worker must finalize date-scoped accounting reloads')
+assert.ok(
+  worker.indexOf('completeToastSyncJobInPostgres') < worker.indexOf('await refreshAccountingState(job, [job.businessDate])'),
+  'Toast jobs must complete before accounting evaluates multi-source reload readiness',
+)
 assert.ok(worker.includes('deferToastSyncJobInPostgres'), 'Toast worker must support asynchronous Analytics reports')
 assert.ok(worker.includes("job.syncKind === 'standard_order_updates'"), 'Toast worker must poll modified orders')
 assert.ok(worker.includes('getToastStandardOrders({ credential, restaurantGuid: job.restaurantGuid, businessDate })'),
@@ -617,6 +620,7 @@ async function runToastOutboxPostgresAcceptance() {
 
     const databasePersistence = loadTypeScriptModule('app_src/lib/persistence/toastIntegrations.ts', {
       mocks: {
+        ...toastPersistenceMocks,
         '@/lib/integrations/toastOrderProjection': toastOrderProjection,
         '@/lib/persistence/postgres': {
           query: (sql, params) => pool.query(sql, params),
@@ -638,85 +642,57 @@ async function runToastOutboxPostgresAcceptance() {
       },
     })
 
-    const runtimeDraftDates = [
-      '2026-08-01',
-      '2026-08-02',
-      '2026-08-03',
-      '2026-08-04',
-      '2026-08-05',
-      '2026-08-06',
-      '2026-08-07',
-      '2026-08-08',
-      '2026-08-09',
-    ]
-    await pool.query(
-      `INSERT INTO toast_daily_sales (organization_id, restaurant_guid, business_date)
-       SELECT $1::uuid, $2::uuid, dates.business_date
-       FROM unnest($3::date[]) AS dates(business_date)`,
-      [organizationId, restaurantGuid, runtimeDraftDates],
+    const legacyDraftUniqueness = await pool.query(
+      `SELECT constraint_row.conname
+       FROM pg_constraint constraint_row
+       WHERE constraint_row.conrelid = 'toast_accounting_export_drafts'::regclass
+         AND constraint_row.contype = 'u'
+         AND (
+           SELECT array_agg(attribute_row.attname::text ORDER BY key_column.ordinality)
+           FROM unnest(constraint_row.conkey) WITH ORDINALITY AS key_column(attnum, ordinality)
+           JOIN pg_attribute attribute_row
+             ON attribute_row.attrelid = constraint_row.conrelid
+            AND attribute_row.attnum = key_column.attnum
+         ) = ARRAY['organization_id', 'restaurant_guid', 'business_date']::text[]`,
     )
-    await pool.query(
-      `UPDATE toast_daily_sales SET standard_refunds = 5.25
-       WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid AND business_date = '2026-08-03'::date`,
-      [organizationId, restaurantGuid],
-    )
-    await pool.query(
-      `UPDATE toast_daily_sales SET refunds = -4.75
-       WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid AND business_date = '2026-08-04'::date`,
-      [organizationId, restaurantGuid],
-    )
-    await pool.query(
-      `UPDATE toast_daily_sales SET standard_tax = 0.01
-       WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid AND business_date = '2026-08-05'::date`,
-      [organizationId, restaurantGuid],
-    )
-    await pool.query(
-      `UPDATE toast_daily_sales SET orders_count = 1
-       WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid AND business_date = '2026-08-06'::date`,
-      [organizationId, restaurantGuid],
-    )
+    assert.equal(legacyDraftUniqueness.rowCount, 0, 'date scope must allow immutable draft revision history')
     await pool.query(
       `INSERT INTO toast_accounting_export_drafts (
-         organization_id, restaurant_guid, business_date, idempotency_key, status, source_summary
+         organization_id, restaurant_guid, business_date, idempotency_key, status,
+         source_summary, draft_revision, is_current, superseded_at
        ) VALUES
-         ($1::uuid, $2::uuid, '2026-08-01'::date, 'runtime-zero-existing', 'needs_mapping', '{"sentinel":"delete"}'::jsonb),
-         ($1::uuid, $2::uuid, '2026-08-07'::date, 'runtime-zero-approved', 'approved', '{"sentinel":"approved"}'::jsonb),
-         ($1::uuid, $2::uuid, '2026-08-08'::date, 'runtime-zero-posting', 'posting', '{"sentinel":"posting"}'::jsonb),
-         ($1::uuid, $2::uuid, '2026-08-09'::date, 'runtime-zero-posted', 'posted', '{"sentinel":"posted"}'::jsonb)`,
+         ($1::uuid, $2::uuid, '2026-10-01'::date, 'protected-revision-1', 'approved',
+          '{"sentinel":"protected"}'::jsonb, 1, false, now()),
+         ($1::uuid, $2::uuid, '2026-10-01'::date, 'correction-revision-2', 'needs_review',
+          '{"sentinel":"correction"}'::jsonb, 2, true, NULL)`,
       [organizationId, restaurantGuid],
     )
-
-    for (const businessDate of runtimeDraftDates) {
-      await databasePersistence.refreshToastAccountingDraftInPostgres({
-        organizationId,
-        restaurantGuid,
-        businessDate,
-        syncKind: 'standard_orders',
-      })
-    }
-    const runtimeDrafts = await pool.query(
-      `SELECT business_date::text, status, source_summary
+    await pool.query(
+      `UPDATE toast_accounting_export_drafts
+       SET source_summary = '{"sentinel":"changed"}'::jsonb
+       WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid
+         AND business_date = '2026-10-01'::date AND draft_revision = 1`,
+      [organizationId, restaurantGuid],
+    )
+    const revisionEvidence = await pool.query(
+      `SELECT draft_revision, status, source_summary, is_current
        FROM toast_accounting_export_drafts
        WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid
-         AND business_date = ANY($3::date[])
-       ORDER BY business_date`,
-      [organizationId, restaurantGuid, runtimeDraftDates],
+         AND business_date = '2026-10-01'::date
+       ORDER BY draft_revision`,
+      [organizationId, restaurantGuid],
     )
-    const runtimeDraftByDate = new Map(runtimeDrafts.rows.map((row) => [row.business_date, row]))
-    assert.equal(runtimeDraftByDate.has('2026-08-01'), false, 'an existing zero-activity draft must be deleted')
-    assert.equal(runtimeDraftByDate.has('2026-08-02'), false, 'a zero-activity date must not create a draft')
-    assert.equal(runtimeDraftByDate.get('2026-08-03')?.source_summary?.standard?.refunds, 5.25)
-    assert.equal(runtimeDraftByDate.get('2026-08-04')?.source_summary?.refunds, -4.75)
-    assert.equal(runtimeDraftByDate.get('2026-08-05')?.source_summary?.standard?.tax, 0.01)
-    assert.equal(runtimeDraftByDate.has('2026-08-06'), true, 'an order with zero amounts must retain a draft')
-    for (const [businessDate, status] of [
-      ['2026-08-07', 'approved'],
-      ['2026-08-08', 'posting'],
-      ['2026-08-09', 'posted'],
-    ]) {
-      assert.equal(runtimeDraftByDate.get(businessDate)?.status, status, `${status} zero-activity evidence must remain`)
-      assert.equal(runtimeDraftByDate.get(businessDate)?.source_summary?.sentinel, status)
-    }
+    assert.deepEqual(revisionEvidence.rows, [{
+      draft_revision: 1,
+      status: 'approved',
+      source_summary: { sentinel: 'protected' },
+      is_current: false,
+    }, {
+      draft_revision: 2,
+      status: 'needs_review',
+      source_summary: { sentinel: 'correction' },
+      is_current: true,
+    }])
 
     const migrationDates = ['2026-09-01', '2026-09-02', '2026-09-03']
     await pool.query(
@@ -853,7 +829,7 @@ async function runToastOutboxPostgresAcceptance() {
     await databasePersistence.queueToastSyncForDateInPostgres({
       organizationId, businessDate: '2026-07-18', actorEmail,
     })
-    assert.equal((await pool.query('SELECT status FROM toast_sync_outbox WHERE id = $1::uuid', [standardJob.id])).rows[0].status, 'dead')
+    assert.equal((await pool.query('SELECT status FROM toast_sync_outbox WHERE id = $1::uuid', [standardJob.id])).rows[0].status, 'pending')
 
     await databasePersistence.queueAutomaticToastOrderUpdateInPostgres({
       organizationId, restaurantGuid, businessDate: '2026-07-18',

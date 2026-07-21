@@ -29,6 +29,8 @@ const SAFE_DETAIL_KEYS = new Set([
   'revokeReason', 'revokedCount', 'authenticatedUser', 'effectiveUser', 'impersonated',
   'impersonationExpiresAt',
   'restaurantGuid', 'restaurantName', 'businessDate', 'issueCount', 'issueCodes', 'issueSummary',
+  'commandType', 'commandId', 'expectedSyncKinds', 'draftId', 'draftRevision',
+  'sourceRevision', 'supersedesDraftId',
 ])
 
 export type ActivityScope = 'self' | 'organization' | 'global'

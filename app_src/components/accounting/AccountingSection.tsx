@@ -214,6 +214,7 @@ const TRANSACTION_TYPES = [
   ['Bill payments', 'BillPayment'],
   ['Credits', 'CreditMemo'],
   ['Refunds', 'RefundReceipt'],
+  ['Journal entries', 'JournalEntry'],
 ] as const
 
 const panelSx = {

@@ -148,6 +148,28 @@ assert.equal(invoices[0].entityType, 'Invoice')
 assert.equal(invoices[0].partyName, 'Acme Buyer')
 assert.equal(invoices[0].status, 'Open')
 
+const journalEntries = parseQuickBooksTransactions({
+  QueryResponse: {
+    JournalEntry: [{
+      Id: '41', DocNumber: '260718POS-JE', TxnDate: '2026-07-18', PrivateNote: 'Toast 2026-07-18',
+      Line: [{
+        Id: '1', Amount: 592.32, DetailType: 'JournalEntryLineDetail',
+        JournalEntryLineDetail: { PostingType: 'Debit', AccountRef: { value: '100', name: 'Clearing Account' } },
+      }, {
+        Id: '2', Amount: 592.32, DetailType: 'JournalEntryLineDetail',
+        JournalEntryLineDetail: { PostingType: 'Credit', AccountRef: { value: '101', name: 'POS Sales' } },
+      }],
+    }],
+  },
+}, 'JournalEntry')
+assert.equal(journalEntries[0].entityType, 'JournalEntry')
+assert.equal(journalEntries[0].documentNumber, '260718POS-JE')
+assert.equal(journalEntries[0].transactionDate, '2026-07-18')
+assert.equal(journalEntries[0].memo, 'Toast 2026-07-18')
+assert.equal(journalEntries[0].totalAmount, 592.32)
+assert.equal(journalEntries[0].accountName, 'Clearing Account')
+assert.equal(journalEntries[0].sourcePayload.Line.length, 2)
+
 const invoiceDetail = parseQuickBooksInvoiceDetail({
   Id: '40', DocNumber: '1001', TxnDate: '2026-07-18', DueDate: '2026-08-18',
   CustomerRef: { value: '20', name: 'Acme Buyer' }, TotalAmt: 527.5, Balance: 527.5,
@@ -309,6 +331,7 @@ for (const fragment of [
   "'Class'",
   "'Department'",
   "'TaxCode'",
+  "'JournalEntry'",
   'parseQuickBooksClasses',
   'parseQuickBooksDepartments',
   'parseQuickBooksTaxCodes',
@@ -346,6 +369,8 @@ for (const fragment of [
 ]) includes(writePayloads, fragment, 'QuickBooks write payload validation')
 
 const writeOrganizationId = '11111111-1111-4111-8111-111111111111'
+const toastRestaurantGuid = '22222222-2222-4222-8222-222222222222'
+const toastSourceId = '14351ea1-ad68-4f2c-85e6-da00661bab4e'
 const writePayloadModule = loadTypeScriptModule('app_src/lib/integrations/quickBooksWritePayloads.ts', {
   '@/lib/persistence/postgres': {
     query: async (sql, params = []) => {
@@ -369,6 +394,13 @@ const writePayloadModule = loadTypeScriptModule('app_src/lib/integrations/quickB
           }] : [] }
         }
         return { rows: (params[1] || []).map((id) => ({ quickbooks_item_id: id, name: 'Consulting', item_type: 'Service' })) }
+      }
+      if (source.includes('FROM toast_menu_catalog_items')) {
+        return {
+          rows: params[0] === writeOrganizationId && params[1] === toastRestaurantGuid && params[2] === toastSourceId
+            ? [{ provider_item_id: toastSourceId, name: 'Saratoga Springs - Sparkling Water' }]
+            : [],
+        }
       }
       return { rows: [] }
     },
@@ -408,6 +440,59 @@ const uncategorizedProviderItem = writePayloadModule.buildQuickBooksProviderPayl
 })
 assert.equal(Object.hasOwn(uncategorizedProviderItem, 'SubItem'), false)
 assert.equal(Object.hasOwn(uncategorizedProviderItem, 'ParentRef'), false)
+
+const mappedItemPayload = {
+  name: 'Saratoga Sparkling 12 oz', itemType: 'NonInventory', unitPrice: 3.5,
+  incomeAccountId: 'income-1', taxable: true,
+  sourceKind: 'sales_item', sourceId: toastSourceId, sourceName: 'Untrusted client label',
+  sourceRestaurantGuid: toastRestaurantGuid, mappingScope: 'location_override',
+}
+const mappedItemDraft = await writePayloadModule.validateQuickBooksWriteDraft({
+  organizationId: writeOrganizationId,
+  operationKind: 'item.create',
+  payload: mappedItemPayload,
+})
+assert.equal(mappedItemDraft.payload.sourceName, 'Saratoga Springs - Sparkling Water')
+assert.equal(mappedItemDraft.payload.sourceId, toastSourceId)
+assert.equal(mappedItemDraft.payload.sourceRestaurantGuid, toastRestaurantGuid)
+assert.equal(mappedItemDraft.payload.mappingScope, 'location_override')
+const mappedProviderItem = writePayloadModule.buildQuickBooksProviderPayload('item.create', mappedItemDraft.payload)
+for (const metadataField of ['sourceKind', 'sourceId', 'sourceName', 'sourceRestaurantGuid', 'mappingScope']) {
+  assert.equal(Object.hasOwn(mappedProviderItem, metadataField), false, `provider item payload leaked ${metadataField}`)
+}
+const mappedItemRetry = await writePayloadModule.validateQuickBooksWriteDraft({
+  organizationId: writeOrganizationId,
+  operationKind: 'item.create',
+  payload: { ...mappedItemPayload, sourceName: 'A different untrusted label' },
+})
+assert.equal(mappedItemRetry.requestFingerprint, mappedItemDraft.requestFingerprint)
+const organizationMappingDraft = await writePayloadModule.validateQuickBooksWriteDraft({
+  organizationId: writeOrganizationId,
+  operationKind: 'item.create',
+  payload: { ...mappedItemPayload, mappingScope: 'organization_default' },
+})
+assert.notEqual(
+  organizationMappingDraft.requestFingerprint,
+  mappedItemDraft.requestFingerprint,
+  'mapping scope must participate in QuickBooks write idempotency',
+)
+await assert.rejects(
+  writePayloadModule.validateQuickBooksWriteDraft({
+    organizationId: '99999999-9999-4999-8999-999999999999',
+    operationKind: 'item.create',
+    payload: mappedItemPayload,
+  }),
+  (error) => error.code === 'QUICKBOOKS_WRITE_TOAST_SOURCE_INVALID',
+  'a Toast menu item owned by another organization must be rejected',
+)
+await assert.rejects(
+  writePayloadModule.validateQuickBooksWriteDraft({
+    organizationId: writeOrganizationId,
+    operationKind: 'item.create',
+    payload: { ...mappedItemPayload, sourceId: `derived:${'a'.repeat(32)}` },
+  }),
+  (error) => error.code === 'QUICKBOOKS_WRITE_TOAST_SOURCE_DERIVED',
+)
 await assert.rejects(
   writePayloadModule.validateQuickBooksWriteDraft({
     organizationId: '11111111-1111-4111-8111-111111111111',
@@ -461,6 +546,62 @@ await assert.rejects(
   }),
   /must be a valid date/,
 )
+
+const preparedQuickBooksWrites = []
+const actionsRouteCapabilities = { canView: true, canManage: false, canPrepare: true, canApprove: false }
+const quickBooksActionsRoute = loadTypeScriptModule('app_src/app/api/accounting/quickbooks/actions/route.ts', {
+  'next/server': {
+    NextResponse: { json: (payload, init) => ({ status: init.status, json: async () => payload }) },
+  },
+  '@/lib/accountingAuthorization': {
+    accountingCapabilities: () => actionsRouteCapabilities,
+    activeAccountingOrganizationId: () => writeOrganizationId,
+    canConfigureAccountingScope: (capabilities, scope) => capabilities.canManage || (capabilities.canPrepare && scope === 'location_override'),
+  },
+  '@/lib/integrations/quickBooksWritePayloads': {
+    QuickBooksWriteValidationError: writePayloadModule.QuickBooksWriteValidationError,
+    validateQuickBooksWriteDraft: async (input) => ({
+      operationKind: input.operationKind,
+      payload: input.payload,
+      requestFingerprint: 'f'.repeat(64),
+    }),
+  },
+  '@/lib/persistence/config': { isPostgresStorageEnabled: () => true },
+  '@/lib/persistence/quickBooksWrites': {
+    QuickBooksWriteRequestError: class QuickBooksWriteRequestError extends Error {
+      constructor(code, message, status = 400) {
+        super(message)
+        this.code = code
+        this.status = status
+      }
+    },
+    createQuickBooksWriteRequestInPostgres: async (input) => {
+      preparedQuickBooksWrites.push(input)
+      return { id: '77777777-7777-4777-8777-777777777777' }
+    },
+    readQuickBooksWriteWorkspaceInPostgres: async () => ({}),
+    transitionQuickBooksWriteRequestInPostgres: async () => ({}),
+  },
+  '@/lib/requestUser': { requireRequestUser: async () => ({ email: 'preparer@example.test' }) },
+})
+function quickBooksActionRequest(mappingScope) {
+  const body = JSON.stringify({
+    clientRequestId: '88888888-8888-4888-8888-888888888888',
+    operationKind: 'item.create',
+    payload: { ...mappedItemDraft.payload, mappingScope },
+  })
+  return {
+    headers: { get: (name) => name === 'content-type' ? 'application/json' : String(Buffer.byteLength(body)) },
+    text: async () => body,
+  }
+}
+const deniedOrganizationMapping = await quickBooksActionsRoute.POST(quickBooksActionRequest('organization_default'))
+assert.equal(deniedOrganizationMapping.status, 403)
+assert.equal((await deniedOrganizationMapping.json()).code, 'POS_ACCOUNTING_ORGANIZATION_CONFIG_REQUIRED')
+assert.equal(preparedQuickBooksWrites.length, 0)
+const allowedLocationMapping = await quickBooksActionsRoute.POST(quickBooksActionRequest('location_override'))
+assert.equal(allowedLocationMapping.status, 201)
+assert.equal(preparedQuickBooksWrites.length, 1)
 
 const persistence = read('app_src/lib/persistence/quickBooksIntegrations.ts')
 for (const fragment of [
@@ -651,6 +792,7 @@ function writeRequestRow(overrides = {}) {
     client_request_id: '44444444-4444-4444-8444-444444444444',
     provider_request_id: 'cp-44444444-4444-4444-8444-444444444444',
     request_payload: { displayName: 'Acme Buyer' },
+    result_payload: {},
     request_fingerprint: 'b'.repeat(64),
     provider_entity_type: null,
     provider_entity_id: null,
@@ -677,17 +819,31 @@ function writeRequestRow(overrides = {}) {
 }
 
 const writeSqlCalls = []
+const writeAuditEvents = []
 let writeScenario = 'create'
 let writeReadScenario = 'off'
+let writeMappingScenario = 'none'
+let existingWriteMapping = {
+  id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+  source_name: 'Saratoga Springs - Sparkling Water',
+  target_id: 'existing-item-9',
+  target_name: 'Existing Saratoga Item',
+  active: true,
+  mapping_revision: 4,
+}
 let currentReviewedConnectionId = 'connection-reviewed'
 const recentWriteRequestId = '33333333-3333-4333-8333-333333333333'
 const targetedWriteRequestId = '77777777-7777-4777-8777-777777777777'
 const writePersistenceModule = loadTypeScriptModule('app_src/lib/persistence/quickBooksWrites.ts', {
-  '@/lib/auditWriter': { recordAuditEvent: async () => undefined },
+  '@/lib/auditWriter': { recordAuditEvent: async (event) => { writeAuditEvents.push(event) } },
   '@/lib/quickBooksWritePolicy': {
     configuredQuickBooksWritePolicy: () => ({ enabled: true, mode: 'sandbox', allowedOperations: ['item.create'] }),
   },
   '@/lib/persistence/postgres': {
+    acquireTransactionAdvisoryLock: async (client, key) => client.query(
+      'SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))',
+      [key],
+    ),
     query: async (sql, params = []) => {
       if (writeReadScenario === 'off') return { rows: [], rowCount: 0 }
       const source = String(sql)
@@ -724,6 +880,33 @@ const writePersistenceModule = loadTypeScriptModule('app_src/lib/persistence/qui
           return { rows: [writeRequestRow()], rowCount: 1 }
         }
         if (source.includes('WITH candidate AS')) return { rows: [], rowCount: 0 }
+        if (source.includes('SELECT approved_by') && source.includes("status = 'processing'")) {
+          return { rows: [{ approved_by: 'approver@example.com' }], rowCount: 1 }
+        }
+        if (source.includes('FROM pos_accounting_catalog_mappings') && source.includes('effective_to IS NULL')) {
+          return writeMappingScenario === 'existing'
+            ? {
+                rows: [existingWriteMapping],
+                rowCount: 1,
+              }
+            : { rows: [], rowCount: 0 }
+        }
+        if (source.includes('COALESCE(max(mapping_revision)')) {
+          return { rows: [{ revision: 0 }], rowCount: 1 }
+        }
+        if (source.includes('INSERT INTO pos_accounting_catalog_mappings')) {
+          return {
+            rows: [{
+              id: '99999999-9999-4999-8999-999999999999',
+              source_name: params[3],
+              target_id: params[4],
+              target_name: params[5],
+              active: true,
+              mapping_revision: params[6],
+            }],
+            rowCount: 1,
+          }
+        }
         if (source.includes("status = 'succeeded'") || source.includes('status = $3')) {
           return { rows: [], rowCount: 1 }
         }
@@ -822,6 +1005,98 @@ const completeWriteCall = writeSqlCalls.find((call) => call.source.includes("sta
 const failWriteCall = writeSqlCalls.find((call) => call.source.includes('status = $3'))
 assert.equal(completeWriteCall.params[6], 'connection-reviewed')
 assert.equal(failWriteCall.params[5], 'connection-reviewed')
+
+const mappedWriteJob = {
+  ...writeJob,
+  id: '12121212-1212-4212-8212-121212121212',
+  operationKind: 'item.create',
+  requestPayload: mappedItemDraft.payload,
+  providerRequestId: 'cp-13131313-1313-4313-8313-131313131313',
+  requestFingerprint: mappedItemDraft.requestFingerprint,
+  lockToken: '14141414-1414-4414-8414-141414141414',
+}
+writeMappingScenario = 'create'
+const createMappingCallStart = writeSqlCalls.length
+const mappedWriteResult = await writePersistenceModule.completeQuickBooksWriteJobInPostgres({
+  job: mappedWriteJob,
+  providerEntityType: 'Item',
+  providerEntityId: '35',
+  providerSyncToken: '0',
+})
+assert.equal(mappedWriteResult.posAccountingMapping.status, 'created')
+assert.equal(mappedWriteResult.posAccountingMapping.sourceId, toastSourceId)
+assert.equal(mappedWriteResult.posAccountingMapping.sourceName, 'Saratoga Springs - Sparkling Water')
+assert.equal(mappedWriteResult.posAccountingMapping.targetId, '35')
+assert.equal(mappedWriteResult.posAccountingMapping.mappingRestaurantGuid, toastRestaurantGuid)
+const createMappingCalls = writeSqlCalls.slice(createMappingCallStart)
+const mappingLock = createMappingCalls.find((call) => call.source.includes('pg_advisory_xact_lock'))
+assert.ok(mappingLock)
+assert.equal(mappingLock.params[0], `quickbooks-binding:${organizationId}`)
+const mappingInsert = createMappingCalls.find((call) => call.source.includes('INSERT INTO pos_accounting_catalog_mappings'))
+assert.ok(mappingInsert)
+assert.deepEqual(
+  Array.from(mappingInsert.params),
+  [organizationId, toastRestaurantGuid, toastSourceId, 'Saratoga Springs - Sparkling Water', '35', 'Saratoga Sparkling 12 oz', 1, 'approver@example.com'],
+)
+const mappedCompletion = createMappingCalls.find((call) => call.source.includes("status = 'succeeded'"))
+const mappedCompletionResult = JSON.parse(mappedCompletion.params[5])
+assert.equal(mappedCompletionResult.posAccountingMapping.status, 'created')
+assert.equal(mappedCompletionResult.posAccountingMapping.targetId, '35')
+const mappedAudit = writeAuditEvents.find((event) => (
+  event.eventType === 'quickbooks.write.succeeded' && event.aggregateId === mappedWriteJob.id
+))
+assert.equal(mappedAudit.payload.posAccountingMapping.status, 'created')
+
+writeMappingScenario = 'existing'
+existingWriteMapping = {
+  id: '99999999-9999-4999-8999-999999999999',
+  source_name: 'Saratoga Springs - Sparkling Water',
+  target_id: '35',
+  target_name: 'Saratoga Sparkling 12 oz',
+  active: true,
+  mapping_revision: 1,
+}
+const retryMappingCallStart = writeSqlCalls.length
+const retriedMappedWriteResult = await writePersistenceModule.completeQuickBooksWriteJobInPostgres({
+  job: { ...mappedWriteJob, attemptCount: 2, lockToken: '15151515-1515-4515-8515-151515151515' },
+  providerEntityType: 'Item',
+  providerEntityId: '35',
+  providerSyncToken: '0',
+})
+assert.equal(retriedMappedWriteResult.posAccountingMapping.status, 'skipped_existing')
+assert.equal(
+  writeSqlCalls.slice(retryMappingCallStart).some((call) => call.source.includes('INSERT INTO pos_accounting_catalog_mappings')),
+  false,
+  'an idempotent provider retry must not create another current mapping',
+)
+
+existingWriteMapping = {
+  ...existingWriteMapping,
+  id: '16161616-1616-4616-8616-161616161616',
+  target_id: 'legacy-item-7',
+  target_name: 'Manually mapped Saratoga item',
+  mapping_revision: 3,
+}
+const preserveMappingCallStart = writeSqlCalls.length
+const preservedMappingResult = await writePersistenceModule.completeQuickBooksWriteJobInPostgres({
+  job: {
+    ...mappedWriteJob,
+    id: '17171717-1717-4717-8717-171717171717',
+    providerRequestId: 'cp-17171717-1717-4717-8717-171717171717',
+    lockToken: '18181818-1818-4818-8818-181818181818',
+  },
+  providerEntityType: 'Item',
+  providerEntityId: 'new-item-99',
+  providerSyncToken: '0',
+})
+assert.equal(preservedMappingResult.posAccountingMapping.status, 'skipped_existing')
+assert.equal(preservedMappingResult.posAccountingMapping.targetId, 'legacy-item-7')
+assert.equal(preservedMappingResult.posAccountingMapping.createdQuickBooksItemId, 'new-item-99')
+assert.equal(
+  writeSqlCalls.slice(preserveMappingCallStart).some((call) => call.source.includes('INSERT INTO pos_accounting_catalog_mappings')),
+  false,
+  'an existing current mapping must never be overwritten',
+)
 
 const service = read('app_src/lib/integrations/quickBooksIntegrations.ts')
 for (const fragment of [
