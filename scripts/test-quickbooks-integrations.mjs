@@ -90,13 +90,16 @@ const items = parseQuickBooksItems({
         IncomeAccountRef: { value: '1' }, Active: true,
       },
       { Id: '11', Name: 'Negative price', Type: 'Service', UnitPrice: -1 },
+      { Id: '12', Name: 'Breakfast Sandwiches', FullyQualifiedName: 'Breakfast:Breakfast Sandwiches', Type: 'Category', Active: true },
       { Name: 'Invalid' },
     ],
   },
 })
-assert.equal(items.length, 2)
+assert.equal(items.length, 3)
 assert.equal(items[0].incomeAccountId, '1')
 assert.equal(items[1].unitPrice, 0)
+assert.equal(items[2].itemType, 'Category')
+assert.equal(items[2].fullyQualifiedName, 'Breakfast:Breakfast Sandwiches')
 
 const customers = parseQuickBooksCustomers({
   QueryResponse: {
@@ -334,6 +337,8 @@ for (const fragment of [
   'buildQuickBooksProviderPayload',
   "'customer.create', 'item.create', 'invoice.create'",
   "itemType !== 'Service' && itemType !== 'NonInventory'",
+  "lower(item_type) = 'category'",
+  'QUICKBOOKS_WRITE_PARENT_CATEGORY_INVALID',
   'Line ${index + 1} requires an active QuickBooks product or service',
   'Due date cannot be before the invoice date',
   "crypto.createHash('sha256')",
@@ -356,6 +361,12 @@ const writePayloadModule = loadTypeScriptModule('app_src/lib/integrations/quickB
         return { rows: params[1] === 'customer-1' ? [{ display_name: 'Acme Buyer', email: 'buyer@example.com' }] : [] }
       }
       if (source.includes('FROM quickbooks_items')) {
+        if (source.includes("lower(item_type) = 'category'")) {
+          return { rows: params[1] === 'category-1' ? [{
+            quickbooks_item_id: 'category-1',
+            fully_qualified_name: 'Breakfast:Breakfast Sandwiches',
+          }] : [] }
+        }
         return { rows: (params[1] || []).map((id) => ({ quickbooks_item_id: id, name: 'Consulting', item_type: 'Service' })) }
       }
       return { rows: [] }
@@ -380,11 +391,33 @@ const itemDraft = await writePayloadModule.validateQuickBooksWriteDraft({
   operationKind: 'item.create',
   payload: {
     name: 'Consulting', itemType: 'Service', unitPrice: 125, purchaseCost: 25,
-    incomeAccountId: 'income-1', expenseAccountId: 'expense-1', taxable: false,
+    incomeAccountId: 'income-1', expenseAccountId: 'expense-1', parentCategoryId: 'category-1', taxable: false,
   },
 })
 assert.equal(itemDraft.payload.incomeAccountName, 'Sales')
-assert.equal(writePayloadModule.buildQuickBooksProviderPayload('item.create', itemDraft.payload).Type, 'Service')
+assert.equal(itemDraft.payload.parentCategoryName, 'Breakfast:Breakfast Sandwiches')
+const providerItem = writePayloadModule.buildQuickBooksProviderPayload('item.create', itemDraft.payload)
+assert.equal(providerItem.Type, 'Service')
+assert.equal(providerItem.SubItem, true)
+assert.equal(providerItem.ParentRef.value, 'category-1')
+const uncategorizedProviderItem = writePayloadModule.buildQuickBooksProviderPayload('item.create', {
+  ...itemDraft.payload,
+  parentCategoryId: null,
+  parentCategoryName: null,
+})
+assert.equal(Object.hasOwn(uncategorizedProviderItem, 'SubItem'), false)
+assert.equal(Object.hasOwn(uncategorizedProviderItem, 'ParentRef'), false)
+await assert.rejects(
+  writePayloadModule.validateQuickBooksWriteDraft({
+    organizationId: '11111111-1111-4111-8111-111111111111',
+    operationKind: 'item.create',
+    payload: {
+      name: 'Consulting', itemType: 'Service', unitPrice: 125,
+      incomeAccountId: 'income-1', parentCategoryId: 'stale-category',
+    },
+  }),
+  /active QuickBooks product category/,
+)
 
 const invoiceDraft = await writePayloadModule.validateQuickBooksWriteDraft({
   organizationId: '11111111-1111-4111-8111-111111111111',
