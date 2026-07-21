@@ -289,4 +289,33 @@ const worker = read('app_src/lib/toastSyncWorker.ts')
 assert.ok(worker.includes('projectToastStandardOrdersInPostgres({ job, orders })'))
 assert.ok(!worker.includes('updateToastStandardOrdersCountInPostgres'))
 
+const posSection = read('app_src/components/pos/PosSection.tsx')
+for (const fragment of [
+  'aria-label="Open POS guide"',
+  'clawpilot.pos.guide.seen:',
+  'isDemoWorkspaceId',
+  '<PosGuideDialog',
+]) {
+  assert.ok(posSection.includes(fragment), `POS workspace guide entrypoint missing ${fragment}`)
+}
+
+const posGuide = read('app_src/components/pos/PosGuideDialog.tsx')
+for (const fragment of [
+  'How POS works',
+  'Demo account',
+  'Live business',
+  'Current workspace',
+  'role="tabpanel"',
+  'aria-controls="pos-guide-panel-accounting"',
+  "openView('orders')",
+  "openView('reports')",
+  "openView('accounting')",
+  'No sales-backed accounting draft exists in this date range',
+  'Posting is currently locked',
+  'When a manager enables catalog synchronization for a selected pipeline',
+  'Mapping changes regenerate only unapproved drafts',
+]) {
+  assert.ok(posGuide.includes(fragment), `POS guide missing ${fragment}`)
+}
+
 console.log('POS module contracts passed')

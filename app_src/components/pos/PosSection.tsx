@@ -27,13 +27,16 @@ import Typography from '@mui/material/Typography'
 import ChevronLeftRounded from '@mui/icons-material/ChevronLeftRounded'
 import ChevronRightRounded from '@mui/icons-material/ChevronRightRounded'
 import CloseRounded from '@mui/icons-material/CloseRounded'
+import HelpOutlineRounded from '@mui/icons-material/HelpOutlineRounded'
 import PointOfSaleRounded from '@mui/icons-material/PointOfSaleRounded'
 import RefreshRounded from '@mui/icons-material/RefreshRounded'
 import SearchRounded from '@mui/icons-material/SearchRounded'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import { formatUserDateTime } from '@/lib/userDateTime'
 import PosAccountingPanel from '@/components/pos/PosAccountingPanel'
+import PosGuideDialog from '@/components/pos/PosGuideDialog'
 import PosReportsPanel from '@/components/pos/PosReportsPanel'
+import { isDemoWorkspaceId } from '@/lib/demoMode'
 
 type PosView = 'overview' | 'orders' | 'reports' | 'accounting'
 type DataRecord = Record<string, unknown>
@@ -376,6 +379,8 @@ export default function PosSection() {
   const [orderLoading, setOrderLoading] = useState(false)
   const [orderError, setOrderError] = useState<string | null>(null)
   const [queryReady, setQueryReady] = useState(false)
+  const [guideOpen, setGuideOpen] = useState(false)
+  const [guideHandledOrganization, setGuideHandledOrganization] = useState('')
 
   const invalidRange = Boolean(from && to && from > to)
 
@@ -401,6 +406,19 @@ export default function PosSection() {
     const timer = window.setTimeout(() => setSearch(searchInput.trim()), 300)
     return () => window.clearTimeout(timer)
   }, [searchInput])
+
+  useEffect(() => {
+    const organizationId = snapshot?.organizationId || ''
+    if (!organizationId || guideHandledOrganization === organizationId) return
+    setGuideHandledOrganization(organizationId)
+    try {
+      if (window.localStorage.getItem(`clawpilot.pos.guide.seen:${organizationId}`) !== '1') {
+        setGuideOpen(true)
+      }
+    } catch {
+      setGuideOpen(true)
+    }
+  }, [guideHandledOrganization, snapshot?.organizationId])
 
   useEffect(() => {
     if (!queryReady || !from || !to || invalidRange) return
@@ -613,6 +631,18 @@ export default function PosSection() {
     closeOrder()
   }
 
+  function closeGuide() {
+    const organizationId = snapshot?.organizationId || ''
+    if (organizationId) {
+      try {
+        window.localStorage.setItem(`clawpilot.pos.guide.seen:${organizationId}`, '1')
+      } catch {
+        // The guide remains available from the toolbar when storage is restricted.
+      }
+    }
+    setGuideOpen(false)
+  }
+
   return (
     <Box height="100%" display="flex" flexDirection="column" minWidth={0} bgcolor="#0F0F13">
       <Box
@@ -632,25 +662,36 @@ export default function PosSection() {
             <Box display="flex" alignItems="center" gap={1} minWidth={0}>
               <PointOfSaleRounded sx={{ color: '#A8C7FA', fontSize: 23, flexShrink: 0 }} />
               <Typography variant="h5" fontWeight={700} noWrap>POS</Typography>
-              <Chip size="small" variant="outlined" label="Toast" />
+              <Chip size="small" variant="outlined" label="Toast" sx={{ display: { xs: 'none', sm: 'inline-flex' } }} />
               {capabilities && !capabilities.canManage ? <Chip size="small" variant="outlined" label="Read only" /> : null}
             </Box>
             <Typography variant="caption" color="text.secondary" display="block" mt={0.15} noWrap>
               {latestSync ? `Updated ${dateTimeLabel(latestSync)}` : 'Sales, orders, and accounting drafts'}
             </Typography>
           </Box>
-          <Tooltip title="Refresh POS data">
-            <span>
+          <Box display="flex" alignItems="center" gap={0.75}>
+            <Tooltip title="How POS works">
               <IconButton
-                aria-label="Refresh POS data"
-                onClick={() => setRevision((value) => value + 1)}
-                disabled={loading}
+                aria-label="Open POS guide"
+                onClick={() => setGuideOpen(true)}
                 sx={{ border: '1px solid rgba(255,255,255,0.12)', borderRadius: '8px', width: 40, height: 40 }}
               >
-                {loading ? <CircularProgress size={18} /> : <RefreshRounded fontSize="small" />}
+                <HelpOutlineRounded fontSize="small" />
               </IconButton>
-            </span>
-          </Tooltip>
+            </Tooltip>
+            <Tooltip title="Refresh POS data">
+              <span>
+                <IconButton
+                  aria-label="Refresh POS data"
+                  onClick={() => setRevision((value) => value + 1)}
+                  disabled={loading}
+                  sx={{ border: '1px solid rgba(255,255,255,0.12)', borderRadius: '8px', width: 40, height: 40 }}
+                >
+                  {loading ? <CircularProgress size={18} /> : <RefreshRounded fontSize="small" />}
+                </IconButton>
+              </span>
+            </Tooltip>
+          </Box>
         </Box>
 
         <Box
@@ -958,6 +999,18 @@ export default function PosSection() {
           ) : null}
         </Box>
       </Box>
+
+      <PosGuideDialog
+        open={guideOpen}
+        onClose={closeGuide}
+        onOpenView={(nextView) => setView(nextView)}
+        isDemo={snapshot ? isDemoWorkspaceId(snapshot.organizationId) : null}
+        canManage={capabilities?.canManage === true}
+        standardStatus={standardReadiness.label}
+        analyticsStatus={analyticsReadiness.label}
+        accountingStatus={accountingReadiness.label}
+        hasAccountingDraft={accountingDrafts.length > 0}
+      />
 
       <Drawer
         anchor="right"
