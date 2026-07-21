@@ -36,6 +36,8 @@ export type QuickBooksItemDraft = {
   incomeAccountName: string
   expenseAccountId: string | null
   expenseAccountName: string | null
+  parentCategoryId: string | null
+  parentCategoryName: string | null
   taxable: boolean
 }
 
@@ -160,6 +162,7 @@ async function validateItemDraft(organizationId: string, raw: Record<string, unk
   }
   const incomeAccountId = cleanText(raw.incomeAccountId, 'Income account', 200, true)!
   const expenseAccountId = cleanText(raw.expenseAccountId, 'Expense account', 200)
+  const parentCategoryId = cleanText(raw.parentCategoryId, 'QuickBooks category', 200)
   const ids = [incomeAccountId, expenseAccountId].filter(Boolean) as string[]
   const accounts = await query<{
     quickbooks_account_id: string
@@ -181,6 +184,20 @@ async function validateItemDraft(organizationId: string, raw: Record<string, unk
   if (expenseAccountId && (!expense || (expense.classification !== 'Expense' && !/expense|cost of goods sold/i.test(expense.account_type || '')))) {
     throw new QuickBooksWriteValidationError('QUICKBOOKS_WRITE_EXPENSE_ACCOUNT_INVALID', 'Select an active QuickBooks expense account')
   }
+  const categoryResult = parentCategoryId
+    ? await query<{ quickbooks_item_id: string; fully_qualified_name: string }>(
+        `SELECT quickbooks_item_id, fully_qualified_name
+         FROM quickbooks_items
+         WHERE organization_id = $1::uuid AND quickbooks_item_id = $2
+           AND active = true AND lower(item_type) = 'category'
+         LIMIT 1`,
+        [organizationId, parentCategoryId],
+      )
+    : { rows: [] }
+  const parentCategory = categoryResult.rows[0]
+  if (parentCategoryId && !parentCategory) {
+    throw new QuickBooksWriteValidationError('QUICKBOOKS_WRITE_PARENT_CATEGORY_INVALID', 'Select an active QuickBooks product category')
+  }
   return {
     name: cleanText(raw.name, 'Product or service name', 100, true)!,
     itemType,
@@ -192,6 +209,8 @@ async function validateItemDraft(organizationId: string, raw: Record<string, unk
     incomeAccountName: income.fully_qualified_name,
     expenseAccountId,
     expenseAccountName: expense?.fully_qualified_name || null,
+    parentCategoryId,
+    parentCategoryName: parentCategory?.fully_qualified_name || null,
     taxable: raw.taxable === true,
   }
 }
@@ -316,6 +335,8 @@ export function buildQuickBooksProviderPayload(
       PurchaseCost: item.purchaseCost,
       IncomeAccountRef: { value: item.incomeAccountId },
       ExpenseAccountRef: item.expenseAccountId ? { value: item.expenseAccountId } : null,
+      SubItem: item.parentCategoryId ? true : null,
+      ParentRef: item.parentCategoryId ? { value: item.parentCategoryId } : null,
       Taxable: item.taxable,
     })
   }

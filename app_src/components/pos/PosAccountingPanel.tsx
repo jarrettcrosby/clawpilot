@@ -48,6 +48,7 @@ type TargetOption = {
   detail: string
   classification: string
   accountType: string
+  itemType: string
 }
 
 type MappingDraft = {
@@ -73,6 +74,7 @@ type ProductDraft = {
   purchaseCost: string
   incomeAccountId: string
   expenseAccountId: string
+  parentCategoryId: string
   taxable: boolean
 }
 
@@ -149,6 +151,7 @@ function option(value: DataRecord, fallbackName = 'QuickBooks target'): TargetOp
     detail: text(value.accountType || value.itemType || value.companyName),
     classification: text(value.classification),
     accountType: text(value.accountType),
+    itemType: text(value.itemType),
   }
 }
 
@@ -271,7 +274,7 @@ export default function PosAccountingPanel({ location, businessDate, hasAccounti
     const make = (value: unknown) => rows(value).map((entry) => option(entry)).filter((entry) => entry.id)
     return {
       account: make(targets.accounts),
-      item: make(targets.items),
+      item: make(targets.items).filter((entry) => entry.itemType.toLowerCase() !== 'category'),
       customer: make(targets.customers),
       vendor: make(targets.vendors),
       tax_code: make(targets.taxCodes),
@@ -280,6 +283,10 @@ export default function PosAccountingPanel({ location, businessDate, hasAccounti
       location: make(targets.locations),
     } as Record<string, TargetOption[]>
   }, [targets])
+
+  const quickBooksCategories = useMemo(() => rows(targets.items)
+    .map((entry) => option(entry))
+    .filter((entry) => entry.id && entry.itemType.toLowerCase() === 'category'), [targets.items])
 
   const incomeAccounts = useMemo(() => targetOptions.account.filter((entry) => (
     entry.classification === 'Revenue' || /income|sales/i.test(`${entry.accountType} ${entry.name}`)
@@ -342,6 +349,7 @@ export default function PosAccountingPanel({ location, businessDate, hasAccounti
       purchaseCost: String(amount(suggestion.purchaseCost) || ''),
       incomeAccountId: preferredIncomeAccount?.id || '',
       expenseAccountId: '',
+      parentCategoryId: '',
       taxable: suggestion.taxable !== false,
     })
     setProductDraftPrepared(false)
@@ -373,6 +381,7 @@ export default function PosAccountingPanel({ location, businessDate, hasAccounti
             purchaseCost: productDraft.purchaseCost,
             incomeAccountId: productDraft.incomeAccountId,
             expenseAccountId: productDraft.expenseAccountId,
+            parentCategoryId: productDraft.parentCategoryId,
             taxable: productDraft.taxable,
           },
         }),
@@ -850,6 +859,21 @@ export default function PosAccountingPanel({ location, businessDate, hasAccounti
                 <TextField label="Sales price" type="number" inputProps={{ min: 0, step: '0.01' }} value={productDraft.unitPrice} onChange={(event) => updateProductDraft({ unitPrice: event.target.value })} sx={controlSx} />
                 <TextField label="Purchase cost" type="number" inputProps={{ min: 0, step: '0.01' }} value={productDraft.purchaseCost} onChange={(event) => updateProductDraft({ purchaseCost: event.target.value })} sx={controlSx} />
               </Box>
+              <Autocomplete
+                options={quickBooksCategories}
+                value={quickBooksCategories.find((entry) => entry.id === productDraft.parentCategoryId) || null}
+                getOptionLabel={(entry) => entry.name}
+                isOptionEqualToValue={(left, right) => left.id === right.id}
+                onChange={(_, value) => updateProductDraft({ parentCategoryId: value?.id || '' })}
+                renderInput={(params) => (
+                  <TextField
+                    {...params}
+                    label="QuickBooks category (optional)"
+                    helperText="Nested category paths use QuickBooks names such as Breakfast:Breakfast Sandwiches."
+                    sx={controlSx}
+                  />
+                )}
+              />
               <Autocomplete
                 options={incomeAccounts}
                 value={incomeAccounts.find((entry) => entry.id === productDraft.incomeAccountId) || null}
