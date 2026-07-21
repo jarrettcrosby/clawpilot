@@ -76,10 +76,12 @@ export async function GET(req: NextRequest) {
     if (!capabilities.canView) {
       return json({ ok: false, error: 'Your organization administrator has not granted access to accounting data', code: 'ACCOUNTING_VIEW_REQUIRED' }, 403)
     }
+    const requestIdValue = req.nextUrl.searchParams.get('requestId')
     const workspace = await readQuickBooksWriteWorkspaceInPostgres({
       organizationId: activeAccountingOrganizationId(actor),
       page: Number(req.nextUrl.searchParams.get('page') || 1),
       pageSize: Number(req.nextUrl.searchParams.get('pageSize') || 50),
+      requestId: requestIdValue ? uuidValue(requestIdValue, 'Accounting request id') : null,
     })
     return json({ ok: true, capabilities, ...workspace })
   } catch (error) {

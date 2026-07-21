@@ -1,6 +1,6 @@
 'use client'
 
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import Alert from '@mui/material/Alert'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
@@ -221,8 +221,16 @@ function RequestReview({ request, money }: { request: WriteRequest; money: (valu
   )
 }
 
-export default function QuickBooksActionsPanel() {
+export default function QuickBooksActionsPanel({
+  initialRequestId = null,
+  onInitialRequestHandled,
+}: {
+  initialRequestId?: string | null
+  onInitialRequestHandled?: () => void
+}) {
   const dateTimeSettings = useUserDateTime()
+  const initialRequestHandled = useRef('')
+  const initialRequestToLoad = useRef(initialRequestId)
   const [workspace, setWorkspace] = useState<Workspace | null>(null)
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState(false)
@@ -255,7 +263,9 @@ export default function QuickBooksActionsPanel() {
     setLoading(true)
     setError(null)
     try {
-      const response = await fetch('/api/accounting/quickbooks/actions?pageSize=100', { cache: 'no-store' })
+      const parameters = new URLSearchParams({ pageSize: '100' })
+      if (initialRequestToLoad.current) parameters.set('requestId', initialRequestToLoad.current)
+      const response = await fetch(`/api/accounting/quickbooks/actions?${parameters}`, { cache: 'no-store' })
       const payload = await response.json() as ({ ok?: boolean; error?: string } & Partial<Workspace>)
       if (!response.ok || !payload.ok || !payload.connection || !payload.capabilities || !payload.requests || !payload.referenceData) {
         throw new Error(payload.error || 'Accounting actions are unavailable')
@@ -270,6 +280,18 @@ export default function QuickBooksActionsPanel() {
   }, [])
 
   useEffect(() => { void load() }, [load])
+
+  useEffect(() => {
+    if (!initialRequestId || !workspace || initialRequestHandled.current === initialRequestId) return
+    const request = workspace.requests.find((candidate) => candidate.id === initialRequestId)
+    initialRequestHandled.current = initialRequestId
+    onInitialRequestHandled?.()
+    if (!request) {
+      setError('This accounting draft was not found in the active organization.')
+      return
+    }
+    setSelected(request)
+  }, [initialRequestId, onInitialRequestHandled, workspace])
 
   function openForm(kind: OperationKind) {
     setFormRequestId(newClientRequestId())
