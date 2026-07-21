@@ -1052,7 +1052,6 @@ export function buildPosAccountingPreview(input: {
       }
     }
   }
-  requireCatalogMappings('discount', 'item', totals.discounts !== 0)
   requireCatalogMappings('tax', 'tax_code', input.profile.trackSalesTax && totals.tax !== 0)
   requireCatalogMappings('service_charge', 'account', totals.serviceCharges !== 0 || totals.tips !== 0)
 
@@ -1192,7 +1191,8 @@ export function buildPosAccountingPreview(input: {
       })
     }
   }
-  const sourceVariance = money(totals.total - totals.subtotal - totals.tax - totals.tips)
+  const salesReceiptTotal = money(totals.subtotal + totals.tax)
+  const sourceVariance = money(totals.total - salesReceiptTotal - totals.tips)
   const itemizedTotal = money(lineItems.reduce((sum, line) => sum + line.amount, 0))
   const unavailableInputs = [{
       key: 'payout_deposit',
@@ -1251,7 +1251,7 @@ export function buildPosAccountingPreview(input: {
       tax: totals.tax,
       tender: totals.tender,
       tips: totals.tips,
-      total: totals.total,
+      total: salesReceiptTotal,
       lineItems,
       itemizedTotal,
       unallocatedSubtotal,

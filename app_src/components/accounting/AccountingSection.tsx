@@ -34,9 +34,10 @@ import SearchRounded from '@mui/icons-material/SearchRounded'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import { accountingExplorerViewParameter, consumeAccountingDraftTarget } from '@/lib/accountingDraftNavigation'
 import { formatUserDateTime } from '@/lib/userDateTime'
+import PosAccountingParityPanel from './PosAccountingParityPanel'
 import QuickBooksActionsPanel from './QuickBooksActionsPanel'
 
-type View = 'overview' | 'actions' | 'reports' | 'invoices' | 'receipts' | 'transactions' | 'products' | 'accounts' | 'customers' | 'vendors' | 'attachments'
+type View = 'overview' | 'actions' | 'pos-parity' | 'reports' | 'invoices' | 'receipts' | 'transactions' | 'products' | 'accounts' | 'customers' | 'vendors' | 'attachments'
 type Range = '30d' | '90d' | 'ytd' | '12m' | 'all'
 type ReportKey = 'profit_loss' | 'balance_sheet' | 'cash_flow' | 'ar_aging' | 'ap_aging'
 type ReportPeriod = 'mtd' | 'qtd' | 'ytd' | 'six_months' | 'as_of_today'
@@ -170,6 +171,7 @@ type Column = {
 const VIEWS: Array<{ id: View; label: string }> = [
   { id: 'overview', label: 'Overview' },
   { id: 'actions', label: 'Actions' },
+  { id: 'pos-parity', label: 'POS posting parity' },
   { id: 'reports', label: 'Financial reports' },
   { id: 'invoices', label: 'Invoices' },
   { id: 'receipts', label: 'Receipts' },
@@ -731,6 +733,11 @@ export default function AccountingSection() {
   }, [searchInput])
 
   useEffect(() => {
+    if (view === 'pos-parity') {
+      setLoading(false)
+      setError(null)
+      return
+    }
     const controller = new AbortController()
     setLoading(true)
     setError(null)
@@ -1030,6 +1037,8 @@ export default function AccountingSection() {
               initialRequestId={initialActionRequestId}
               onInitialRequestHandled={() => setInitialActionRequestId(null)}
             />
+          ) : view === 'pos-parity' ? (
+            <PosAccountingParityPanel />
           ) : view === 'overview' ? (
             loading && !overview ? (
               <Box display="grid" sx={{ placeItems: 'center' }} minHeight={300}><CircularProgress /></Box>

@@ -107,7 +107,7 @@ The attached legacy mapping workbook is an import source, not the runtime databa
 
 The preview produces two immutable documents for a business date:
 
-1. An itemized Sales Receipt with mapped products, discounts, service charges, and tax.
+1. An itemized Sales Receipt with mapped net product sales and tax. Item-level discounts and refunds are already reflected in normalized net item amounts and are not subtracted a second time. Tips remain outside the receipt.
 2. A balanced Payments Journal that clears tenders, tips, deposits, fees, cash, and over/short only when their required sources are available.
 
 An unresolved item, missing destination, unavailable payout, source variance, or unbalanced journal places the preview on hold. Profile and mapping saves create configuration revisions; the operator explicitly regenerates accounting when the revised rules should be applied to a business date. Approved, posting, and posted evidence is never overwritten.
@@ -121,6 +121,17 @@ The Accounting view provides two bounded Shogo-parity controls for the resolved 
 - A durable command row reports `queued`, `running`, `succeeded`, or `failed` for that exact date. A reload remains queued until every required sales source completes, then the worker regenerates accounting once and reconciles the date's issue state.
 - Both commands require `prepareAccounting` through the active organization membership. Organization identity comes from the signed-in workspace session; it is never accepted from the request body. Toast credential configuration remains restricted to owners and access administrators.
 - Every explicit command records the actor, organization, restaurant GUID, business date, source revision, resulting draft revision, and outcome in Activity. Activity opens the same organization/location/date Accounting view.
+
+### Historical Posting Parity
+
+The Accounting workspace includes a read-only comparison against the active organization's complete cached Toast-marked QuickBooks corpus. Recent postings are useful debugging fixtures, but acceptance is based on all available history rather than one or two selected dates.
+
+- Exact business-date and document evidence is preferred. A one-to-one date fallback is allowed only when it cannot hide ambiguity.
+- Receipt and settlement-journal variances are reported separately. A balanced journal is validated from its account lines because historical postings may include cash, card, fees, tips, payouts, or other settlement entries.
+- Unmatched and ambiguous records remain visible. ClawPilot does not manufacture a pair to make coverage appear complete.
+- The comparison returns normalized summaries and line evidence, never raw QuickBooks source payloads, and cannot post, approve, regenerate, or change a mapping.
+- Full-corpus metrics remain independent of the selected detail page. Historical pair and exception details are server-paged so a growing posting history does not inflate every browser response.
+- Historical mapping targets are evidence for investigation, not instructions to mutate the current mapping.
 
 Accounting drafts have a monotonically increasing revision per organization, location, and business date. Only one revision is current. Regeneration may refresh an unprotected automatic draft in place, but every explicit command creates a fresh revision. If the current draft is `approved`, `posting`, or `posted`, ClawPilot marks it historical without changing its source summary, proposed lines, QuickBooks payload, approval identity, or provider evidence, then creates a separate correction draft. A zero-sales reload likewise retains protected evidence and creates a reviewable correction rather than deleting that evidence.
 
@@ -204,3 +215,4 @@ This release implements both Toast credential connections, location verification
 12. Enable **Email issue alerts**, leave one confirmed current-date mapping issue, run the worker twice, and confirm one Activity item and one email delivery are created for that occurrence. Open the action and confirm the correct organization, location, date, and Accounting view load.
 13. Resolve the issue and confirm Activity records the resolution. Reintroduce the issue and confirm exactly one new occurrence is queued.
 14. Disable email alerts and confirm issue Activity continues without an outbox row. Confirm a demo or reserved recipient is rejected even if it has owner permissions.
+15. Open the full-range historical parity view and verify matched, unmatched, and ambiguous receipt/journal evidence is organization scoped, read-only, and free of raw provider payloads.

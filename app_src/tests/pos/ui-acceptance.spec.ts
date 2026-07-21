@@ -195,6 +195,134 @@ async function expectOneVisibleExactText(page: Page, value: string) {
   }).toBe(1)
 }
 
+async function mockAccountingParity(page: Page) {
+  await page.route((url) => url.pathname === '/api/accounting/quickbooks', (route) => {
+    if (route.request().url().includes('view=pos-parity')) {
+      return route.fulfill({
+        json: {
+          ok: true,
+          capabilities: { canView: true, canManage: true, canPrepare: true, canApprove: true },
+          view: 'pos-parity',
+          report: {
+            historicalBaseline: {
+              summary: {
+                cachedTransactions: 125,
+                pairCount: 45,
+                exactDocumentPairs: 44,
+                dateFallbackPairs: 1,
+                unmatchedGroups: 29,
+                unmatchedEvidence: 29,
+                ambiguousGroups: 2,
+                ambiguousEvidence: 6,
+                receiptArithmetic: { match: 49, variance: 0, insufficientEvidence: 0 },
+                journalBalance: { match: 76, variance: 0, insufficientEvidence: 0 },
+              },
+              pairs: [{
+                basis: 'business_date_and_document',
+                businessDate: '2026-07-18',
+                salesReceipt: {
+                  evidenceId: 'receipt-1534', entityType: 'SalesReceipt', providerTransactionId: '1534',
+                  businessDate: '2026-07-18', documentNumber: '260718POS', memo: 'Toast 2026-07-18',
+                },
+                journalEntry: {
+                  evidenceId: 'journal-1531', entityType: 'JournalEntry', providerTransactionId: '1531',
+                  businessDate: '2026-07-18', documentNumber: '260718POS', memo: 'Toast 2026-07-18',
+                },
+                receiptArithmetic: { status: 'match', deltaCents: 0 },
+                journalBalance: { status: 'match', deltaCents: 0 },
+              }],
+              unmatchedGroups: [{
+                businessDate: '2026-06-22', documentNumber: '260622POS', entityType: 'JournalEntry',
+                evidence: [{
+                  evidenceId: 'journal-unmatched', entityType: 'JournalEntry', providerTransactionId: '1490',
+                  businessDate: '2026-06-22', documentNumber: '260622POS', memo: 'Toast 2026-06-22',
+                }],
+              }],
+              ambiguousGroups: [{
+                basis: 'business_date_only', businessDate: '2025-07-17', documentNumber: null,
+                salesReceipts: [{
+                  evidenceId: 'receipt-ambiguous', entityType: 'SalesReceipt', providerTransactionId: '1200',
+                  businessDate: '2025-07-17', documentNumber: null, memo: 'Toast',
+                }],
+                journalEntries: [{
+                  evidenceId: 'journal-ambiguous-a', entityType: 'JournalEntry', providerTransactionId: '1201',
+                  businessDate: '2025-07-17', documentNumber: null, memo: 'Toast',
+                }, {
+                  evidenceId: 'journal-ambiguous-b', entityType: 'JournalEntry', providerTransactionId: '1202',
+                  businessDate: '2025-07-17', documentNumber: null, memo: 'Toast',
+                }],
+              }],
+            },
+            rows: [{
+              expected: {
+                expectedId: 'draft-receipt', entityType: 'SalesReceipt', businessDate: '2026-07-18',
+                documentNumber: '260718POS', memo: 'Toast 2026-07-18',
+                draft: {
+                  id: 'draft-1', restaurantName: 'Acceptance Restaurant', locationName: 'Downtown',
+                  status: 'needs_review', revision: 3,
+                },
+              },
+              actual: null,
+              match: { status: 'matched', basis: 'document_number', candidateTransactionIds: [] },
+              comparison: { status: 'match' },
+            }],
+            summary: {
+              drafts: 1, expectedDocuments: 2, cachedTransactions: 2, matched: 2, ambiguous: 0,
+              missingQuickBooks: 0, unmatchedQuickBooks: 0, comparisonsMatched: 2,
+              comparisonsWithVariance: 0, comparisonsWithInsufficientEvidence: 0,
+            },
+            pagination: { page: 1, pageSize: 60, totalDates: 76, totalPages: 2, dates: ['2026-07-18'] },
+            historicalPagination: {
+              page: 1, pageSize: 20, totalPages: 3, pairPages: 3, unmatchedPages: 2, ambiguousPages: 1,
+            },
+            cache: {
+              configured: true, connectionStatus: 'active', lastCatalogSyncedAt: '2026-07-21T20:30:56.605Z',
+              syncStatus: 'succeeded', syncCompletedAt: '2026-07-21T20:30:56.605Z',
+              salesReceiptCount: 49, journalEntryCount: 76,
+            },
+            warnings: [],
+          },
+        },
+      })
+    }
+    return route.fulfill({
+      json: {
+        ok: true,
+        capabilities: { canView: true, canManage: true, canPrepare: true, canApprove: true },
+        overview: {
+          connection: { configured: true, companyName: 'Acceptance Books', status: 'active', lastSyncedAt: '2026-07-21T20:30:56.605Z' },
+          currencyCode: 'USD',
+          counts: { accounts: 12, products: 20, customers: 10, vendors: 4, transactions: 125, attachments: 0, reports: 5, reportErrors: 0 },
+          metrics: { invoiced: 0, receivedSales: 0, expenses: 0, openInvoices: 0, overdueInvoices: 0, openInvoiceCount: 0, overdueInvoiceCount: 0 },
+          trend: [], transactionTypes: [], recent: [],
+        },
+      },
+    })
+  })
+}
+
+for (const viewport of [
+  { name: 'phone portrait', width: 390, height: 844 },
+  { name: 'phone landscape', width: 844, height: 390 },
+]) {
+  test(`Accounting POS parity remains usable on ${viewport.name}`, async ({ page }) => {
+    await page.setViewportSize({ width: viewport.width, height: viewport.height })
+    await authenticateIfConfigured(page)
+    await mockAccountingParity(page)
+    await page.goto('/#accounting')
+    if (new URL(page.url()).pathname === '/login') {
+      throw new Error('Target requires authentication; set UI_AUTH_PASSWORD and UI_OPERATOR_SECRET together')
+    }
+    await expect(page.getByTestId('app-shell')).toBeVisible()
+    await page.getByRole('tab', { name: 'POS posting parity', exact: true }).click()
+    await expect(page.getByText('Historical Shogo baseline', { exact: true })).toBeVisible()
+    await expect(page.getByText('125', { exact: true })).toBeVisible()
+    await expect(page.getByText('Historical exceptions', { exact: true })).toBeVisible()
+    await expect(page.getByText('Current ClawPilot drafts', { exact: true })).toBeVisible()
+    await expectNoDocumentOverflow(page)
+  })
+}
+
 for (const viewport of [
   { name: 'desktop', width: 1280, height: 720 },
   { name: 'phone portrait', width: 390, height: 844 },
