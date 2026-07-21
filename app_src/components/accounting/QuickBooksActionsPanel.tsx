@@ -75,6 +75,7 @@ type Workspace = {
     writeMode: 'disabled' | 'sandbox' | 'production'
     writeVerifiedAt: string | null
     postingEnabled: boolean
+    postingOperations: OperationKind[]
     currencyCode: string | null
   }
   requests: WriteRequest[]
@@ -387,6 +388,8 @@ export default function QuickBooksActionsPanel({
   const incomeAccounts = workspace?.referenceData.accounts.filter((account) => account.classification === 'Revenue' || /income/i.test(account.accountType || '')) || []
   const expenseAccounts = workspace?.referenceData.accounts.filter((account) => account.classification === 'Expense' || /expense|cost of goods sold/i.test(account.accountType || '')) || []
   const invoiceTotal = invoiceLines.reduce((sum, line) => sum + Number(line.quantity || 0) * Number(line.unitPrice || 0), 0)
+  const productPostingOnly = workspace?.connection.postingOperations.length === 1
+    && workspace.connection.postingOperations[0] === 'item.create'
 
   if (loading && !workspace) return <Box display="grid" sx={{ placeItems: 'center' }} minHeight={320}><CircularProgress /></Box>
 
@@ -405,7 +408,9 @@ export default function QuickBooksActionsPanel({
                   size="small"
                   color={workspace.connection.postingEnabled ? 'success' : 'warning'}
                   variant="outlined"
-                  label={workspace.connection.postingEnabled ? `${workspace.connection.writeMode} posting enabled` : 'Provider posting disabled'}
+                  label={workspace.connection.postingEnabled
+                    ? productPostingOnly ? 'Product posting enabled' : `${workspace.connection.writeMode} posting enabled`
+                    : 'Provider posting disabled'}
                 />
               </Box>
               <Typography variant="body2" color="text.secondary" mt={0.25}>
@@ -426,7 +431,11 @@ export default function QuickBooksActionsPanel({
 
           {!workspace.connection.postingEnabled ? (
             <Alert severity="info" variant="outlined">
-              Drafting and approval are available. Posting remains held until the organization connection and server runtime are verified for the same QuickBooks environment.
+              Drafting and submission are available. Approval remains held until the organization connection and server runtime authorize this change type for the same QuickBooks environment.
+            </Alert>
+          ) : productPostingOnly ? (
+            <Alert severity="info" variant="outlined">
+              Approved products can post to QuickBooks. Customer and invoice drafts remain review-only.
             </Alert>
           ) : null}
 
@@ -446,7 +455,7 @@ export default function QuickBooksActionsPanel({
                       <TableCell>{request.requestedByName || request.requestedBy}</TableCell>
                       <TableCell>{formatUserDateTime(request.createdAt, dateTimeSettings, { dateStyle: 'medium', timeStyle: 'short' })}</TableCell>
                       <TableCell><Chip size="small" color={statusColors[request.status]} label={statusLabels[request.status]} /></TableCell>
-                      <TableCell onClick={(event) => event.stopPropagation()}><RequestActions request={request} capabilities={workspace.capabilities} busy={busy} onAction={transition} onReview={() => setSelected(request)} /></TableCell>
+                      <TableCell onClick={(event) => event.stopPropagation()}><RequestActions request={request} capabilities={workspace.capabilities} postingOperations={workspace.connection.postingOperations} busy={busy} onAction={transition} onReview={() => setSelected(request)} /></TableCell>
                     </TableRow>
                   ))}
                 </TableBody>
@@ -463,7 +472,7 @@ export default function QuickBooksActionsPanel({
                     </Box>
                     <Typography variant="caption" color="text.disabled" display="block" mt={0.75}>{request.requestedByName || request.requestedBy} · {formatUserDateTime(request.createdAt, dateTimeSettings, { dateStyle: 'medium', timeStyle: 'short' })}</Typography>
                   </Box>
-                  <Box mt={1.25}><RequestActions request={request} capabilities={workspace.capabilities} busy={busy} onAction={transition} onReview={() => setSelected(request)} /></Box>
+                  <Box mt={1.25}><RequestActions request={request} capabilities={workspace.capabilities} postingOperations={workspace.connection.postingOperations} busy={busy} onAction={transition} onReview={() => setSelected(request)} /></Box>
                 </Box>
               ))}
             </Box>
@@ -514,7 +523,7 @@ export default function QuickBooksActionsPanel({
             </Box>
             <Divider />
             <Box flex={1} overflow="auto" p={2.5}><RequestReview request={selected} money={money} /></Box>
-            {workspace ? <><Divider /><Box p={2}><RequestActions request={selected} capabilities={workspace.capabilities} busy={busy} onAction={transition} reviewMode /></Box></> : null}
+            {workspace ? <><Divider /><Box p={2}><RequestActions request={selected} capabilities={workspace.capabilities} postingOperations={workspace.connection.postingOperations} busy={busy} onAction={transition} reviewMode /></Box></> : null}
           </Box>
         ) : null}
       </Drawer>
@@ -522,19 +531,21 @@ export default function QuickBooksActionsPanel({
   )
 }
 
-function RequestActions({ request, capabilities, busy, onAction, onReview, reviewMode = false }: {
+function RequestActions({ request, capabilities, postingOperations, busy, onAction, onReview, reviewMode = false }: {
   request: WriteRequest
   capabilities: Capabilities
+  postingOperations: OperationKind[]
   busy: boolean
   onAction: (request: WriteRequest, action: 'submit' | 'approve' | 'cancel' | 'retry') => Promise<void>
   onReview?: () => void
   reviewMode?: boolean
 }) {
+  const postingAllowed = postingOperations.includes(request.operationKind)
   return (
     <Box display="flex" gap={0.75} flexWrap="wrap">
       {request.status === 'draft' && capabilities.canPrepare ? <Button size="small" startIcon={<SendRounded />} onClick={() => { void onAction(request, 'submit') }} disabled={busy}>Submit</Button> : null}
-      {request.status === 'pending_approval' && capabilities.canApprove && reviewMode ? <Button size="small" variant="contained" color="success" startIcon={<VerifiedOutlined />} onClick={() => { void onAction(request, 'approve') }} disabled={busy}>Approve & queue</Button> : null}
-      {(request.status === 'failed' || request.status === 'dead') && capabilities.canApprove && reviewMode ? <Button size="small" variant="outlined" startIcon={<RefreshRounded />} onClick={() => { void onAction(request, 'retry') }} disabled={busy}>Approve retry</Button> : null}
+      {request.status === 'pending_approval' && capabilities.canApprove && reviewMode ? <Tooltip title={postingAllowed ? 'Approve and send this change to the provider queue' : 'Provider posting is not enabled for this change type'}><span><Button size="small" variant="contained" color="success" startIcon={<VerifiedOutlined />} onClick={() => { void onAction(request, 'approve') }} disabled={busy || !postingAllowed}>Approve & queue</Button></span></Tooltip> : null}
+      {(request.status === 'failed' || request.status === 'dead') && capabilities.canApprove && reviewMode ? <Tooltip title={postingAllowed ? 'Approve another provider attempt' : 'Provider posting is not enabled for this change type'}><span><Button size="small" variant="outlined" startIcon={<RefreshRounded />} onClick={() => { void onAction(request, 'retry') }} disabled={busy || !postingAllowed}>Approve retry</Button></span></Tooltip> : null}
       {(['pending_approval', 'failed', 'dead'].includes(request.status)) && capabilities.canApprove && !reviewMode && onReview ? <Button size="small" variant="outlined" startIcon={<VerifiedOutlined />} onClick={onReview} disabled={busy}>Review</Button> : null}
       {['draft', 'pending_approval', 'approved', 'failed', 'dead'].includes(request.status) && (capabilities.canPrepare || capabilities.canApprove) ? <Button size="small" color="inherit" startIcon={<CancelOutlined />} onClick={() => { void onAction(request, 'cancel') }} disabled={busy}>Cancel</Button> : null}
     </Box>

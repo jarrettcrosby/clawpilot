@@ -75,6 +75,9 @@ Provider posting has two independent gates and is disabled by default:
 
 1. The organization connection must have `write_mode` set to the verified environment: `sandbox` or `production`.
 2. The worker must have `QUICKBOOKS_WRITES_ENABLED=1` and a matching `QUICKBOOKS_WRITE_MODE`.
+3. `QUICKBOOKS_WRITE_OPERATIONS` must explicitly allow the operation, using a comma-separated subset of `customer.create`, `item.create`, and `invoice.create`.
+
+Production currently authorizes `item.create` only. This lets an approved missing Toast product enter the QuickBooks catalog while customer and invoice drafts remain review-only. Journal and sales-receipt previews are built from normalized POS data and mappings; they do not require permission to post those transaction types.
 
 The worker sends the same durable `requestid` on every retry so an ambiguous network response cannot create a second provider record. Successful writes queue a complete catalog refresh before the new provider record is shown as current projection data. Failed attempts retain bounded retry state and become `dead` for explicit operator review after the retry budget is exhausted.
 

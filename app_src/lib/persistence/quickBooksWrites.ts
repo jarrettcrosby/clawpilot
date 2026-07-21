@@ -4,6 +4,7 @@ import type {
   QuickBooksWriteOperationKind,
 } from '@/lib/integrations/quickBooksWritePayloads'
 import { query, withTransaction } from '@/lib/persistence/postgres'
+import { configuredQuickBooksWritePolicy } from '@/lib/quickBooksWritePolicy'
 
 export type QuickBooksWriteRequestStatus =
   | 'draft'
@@ -232,9 +233,12 @@ export async function readQuickBooksWriteWorkspaceInPostgres(input: {
   ])
   const connectionRow = connection.rows[0]
   if (!connectionRow) throw new QuickBooksWriteRequestError('QUICKBOOKS_NOT_CONNECTED', 'Connect QuickBooks before preparing accounting changes', 409)
-  const runtimeMode = String(process.env.QUICKBOOKS_WRITE_MODE || '').trim()
-  const runtimeEnabled = process.env.QUICKBOOKS_WRITES_ENABLED === '1'
-    && (runtimeMode === 'sandbox' || runtimeMode === 'production')
+  const policy = configuredQuickBooksWritePolicy()
+  const postingOperations = connectionRow?.write_verified_at
+    && policy.enabled
+    && policy.mode === connectionRow.write_mode
+    ? policy.allowedOperations
+    : []
   const requestRows = [...requests.rows]
   const targetedRow = targetRequest.rows[0]
   if (targetedRow && !requestRows.some((row) => row.id === targetedRow.id)) requestRows.unshift(targetedRow)
@@ -243,9 +247,8 @@ export async function readQuickBooksWriteWorkspaceInPostgres(input: {
       companyName: connectionRow.company_name,
       writeMode: connectionRow.write_mode,
       writeVerifiedAt: connectionRow.write_verified_at,
-      postingEnabled: Boolean(connectionRow.write_verified_at)
-        && runtimeEnabled
-        && runtimeMode === connectionRow.write_mode,
+      postingEnabled: postingOperations.length > 0,
+      postingOperations,
       currencyCode: connectionRow.currency_code,
     },
     page,
@@ -412,6 +415,34 @@ export async function transitionQuickBooksWriteRequestInPostgres(input: {
       nextStatus = 'cancelled'
     }
 
+    if (input.action === 'approve' || input.action === 'retry') {
+      const connection = await client.query<{
+        write_mode: 'disabled' | 'sandbox' | 'production'
+        write_verified_at: string | null
+      }>(
+        `SELECT write_mode, write_verified_at::text
+         FROM organization_quickbooks_connections
+         WHERE organization_id = $1::uuid AND status = 'active'
+         FOR SHARE`,
+        [input.organizationId],
+      )
+      const policy = configuredQuickBooksWritePolicy()
+      const binding = connection.rows[0]
+      const operationAllowed = Boolean(
+        binding?.write_verified_at
+        && policy.enabled
+        && policy.mode === binding.write_mode
+        && policy.allowedOperations.includes(current.operation_kind),
+      )
+      if (!operationAllowed) {
+        throw new QuickBooksWriteRequestError(
+          'QUICKBOOKS_WRITE_OPERATION_DISABLED',
+          'Provider posting is not enabled for this type of accounting change',
+          409,
+        )
+      }
+    }
+
     const result = await client.query<WriteRequestRow>(
       `UPDATE quickbooks_write_requests request SET
          status = $3,
@@ -473,7 +504,9 @@ export async function claimQuickBooksWriteJobsInPostgres(input: {
   limit: number
   workerId: string
   writeMode: 'sandbox' | 'production'
+  allowedOperations: QuickBooksWriteOperationKind[]
 }) {
+  if (input.allowedOperations.length === 0) return []
   return withTransaction(async (client) => {
     const claimed = await client.query<{
       id: string
@@ -498,6 +531,7 @@ export async function claimQuickBooksWriteJobsInPostgres(input: {
          WHERE connection.status = 'active'
            AND connection.write_mode = $3
            AND connection.write_verified_at IS NOT NULL
+           AND request.operation_kind = ANY($4::text[])
            AND (
              (request.status IN ('approved', 'failed') AND request.available_at <= now() AND request.attempt_count < request.max_attempts)
             OR (
@@ -521,7 +555,7 @@ export async function claimQuickBooksWriteJobsInPostgres(input: {
          request.request_payload, request.provider_request_id, request.request_fingerprint,
          request.attempt_count, request.max_attempts, request.lock_token::text,
          connection.credential_owner_email, connection.maton_connection_id, connection.write_mode`,
-      [Math.max(1, Math.min(input.limit, 10)), input.workerId, input.writeMode],
+      [Math.max(1, Math.min(input.limit, 10)), input.workerId, input.writeMode, input.allowedOperations],
     )
     return claimed.rows.map((row): QuickBooksWriteJob => ({
       id: row.id,
