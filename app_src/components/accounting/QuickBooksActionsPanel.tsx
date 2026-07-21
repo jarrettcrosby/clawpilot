@@ -183,6 +183,7 @@ function RequestReview({ request, money }: { request: WriteRequest; money: (valu
       <DetailField label="Phone" value={payload.phone} />
       <DetailField label="Type" value={payload.itemType} />
       <DetailField label="SKU" value={payload.sku} />
+      <DetailField label="Category" value={payload.parentCategoryName} />
       <DetailField label="Description" value={payload.description || payload.notes} />
       <DetailField label="Invoice date" value={payload.transactionDate} />
       <DetailField label="Due date" value={payload.dueDate} />

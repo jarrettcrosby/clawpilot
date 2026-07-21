@@ -837,10 +837,11 @@ export function suggestQuickBooksItemForPosSource(
   items: QuickBooksCatalogItem[],
 ) {
   if (source.sourceKind !== 'sales_item') return null
-  const exact = items.filter((item) => item.name.trim().toLocaleLowerCase('en-US') === source.sourceName.trim().toLocaleLowerCase('en-US'))
+  const products = items.filter((item) => item.item_type.trim().toLocaleLowerCase('en-US') !== 'category')
+  const exact = products.filter((item) => item.name.trim().toLocaleLowerCase('en-US') === source.sourceName.trim().toLocaleLowerCase('en-US'))
   const normalized = exact.length
     ? exact
-    : items.filter((item) => normalizedCatalogName(item.name) === normalizedCatalogName(source.sourceName))
+    : products.filter((item) => normalizedCatalogName(item.name) === normalizedCatalogName(source.sourceName))
   if (normalized.length !== 1) return null
   const item = normalized[0]
   return {
@@ -1280,6 +1281,22 @@ function effectiveMappings(rows: MappingRow[]) {
   return { defaults, overrides, effective: [...merged.values()] }
 }
 
+export function invalidateQuickBooksCategoryTargets(
+  mappings: PosAccountingMapping[],
+  categoryItemIds: Iterable<string>,
+) {
+  const categoryIds = new Set(categoryItemIds)
+  return mappings.map((mapping) => (
+    mapping.targetType === 'item' && categoryIds.has(mapping.targetId)
+      ? {
+          ...mapping,
+          validationStatus: 'missing_target' as const,
+          validationReason: 'QuickBooks categories organize products and cannot be used as POS transaction items.',
+        }
+      : mapping
+  ))
+}
+
 export async function readPosAccountingWorkspaceFromPostgres(input: {
   organizationId: string
   restaurantGuid: string | null
@@ -1452,7 +1469,15 @@ export async function readPosAccountingWorkspaceFromPostgres(input: {
     ? profileForQuickBooksConnection(profileFromRow(overrideProfileRow), currentConnectionFingerprint)
     : null
   const profile = locationOverride || organizationDefault
-  const scopedMappings = effectiveMappings(mappingResult.rows)
+  const rawMappingScopes = effectiveMappings(mappingResult.rows)
+  const categoryItemIds = itemResult.rows
+    .filter((item) => item.item_type.trim().toLocaleLowerCase('en-US') === 'category')
+    .map((item) => item.quickbooks_item_id)
+  const scopedMappings = {
+    defaults: invalidateQuickBooksCategoryTargets(rawMappingScopes.defaults, categoryItemIds),
+    overrides: invalidateQuickBooksCategoryTargets(rawMappingScopes.overrides, categoryItemIds),
+    effective: invalidateQuickBooksCategoryTargets(rawMappingScopes.effective, categoryItemIds),
+  }
   const mappings = scopedMappings.effective
   const sourceCatalog = mergeStableToastMenuCatalog(
     discoverSafePosSourceCatalog(sourceResult.rows),
@@ -1808,7 +1833,8 @@ export async function savePosAccountingMappingsInPostgres(input: {
     ] = await Promise.all([
       client.query<{ id: string }>(
         `SELECT quickbooks_item_id AS id FROM quickbooks_items
-         WHERE organization_id = $1::uuid AND active = true`,
+         WHERE organization_id = $1::uuid AND active = true
+           AND lower(COALESCE(item_type, '')) <> 'category'`,
         [input.organizationId],
       ),
       client.query<{ id: string }>(

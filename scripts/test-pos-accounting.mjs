@@ -103,6 +103,8 @@ for (const fragment of [
   'FROM toast_menu_catalog_items',
   'mergeStableToastMenuCatalog',
   'suggestQuickBooksItemForPosSource',
+  'invalidateQuickBooksCategoryTargets',
+  "lower(COALESCE(item_type, '')) <> 'category'",
   'productCreationSuggestion',
 ]) {
   assert.ok(persistenceSource.includes(fragment), `POS accounting persistence missing ${fragment}`)
@@ -138,6 +140,7 @@ for (const fragment of [
   'parentCategoryId',
   'QuickBooks category (optional)',
   "entry.itemType.toLowerCase() !== 'category'",
+  "['valid', 'unvalidated'].includes(text(current.validationStatus, 'unvalidated'))",
   '.map(mappingPayload)',
   'sourceKind: mapping.sourceKind',
   'active: mapping.active',
@@ -613,6 +616,21 @@ assert.equal(accounting.suggestQuickBooksItemForPosSource(unobservedMenuItem, [{
   quickbooks_item_id: 'qb-tea-2', name: 'ICED TEA Blueberry Green',
   fully_qualified_name: 'ICED TEA Blueberry Green', item_type: 'NonInventory', sku: null, taxable: true,
 }]), null, 'ambiguous normalized product matches must require operator review')
+assert.equal(accounting.suggestQuickBooksItemForPosSource(unobservedMenuItem, [{
+  quickbooks_item_id: 'qb-category', name: 'ICED TEA | Blueberry Green',
+  fully_qualified_name: 'Beverages:ICED TEA | Blueberry Green', item_type: 'Category', sku: null, taxable: false,
+}]), null, 'QuickBooks categories must not be suggested as transaction items')
+const categoryGuardedMappings = accounting.invalidateQuickBooksCategoryTargets([{
+  id: 'mapping-category', scope: 'organization_default', sourceKind: 'sales_item', sourceId: 'toast-item', sourceName: 'Toast item',
+  targetType: 'item', targetId: 'qb-category', targetName: 'Beverages', active: true, mappingRevision: 1,
+  effectiveFrom: '2026-07-21T00:00:00.000Z', effectiveTo: null, validationStatus: 'valid', validationReason: null,
+  sourceCatalogRevision: 1, targetCatalogRevision: 1, lastValidatedAt: null, createdBy: 'manager@example.com', createdAt: '2026-07-21T00:00:00.000Z',
+}], ['qb-category'])
+assert.equal(categoryGuardedMappings[0].validationStatus, 'missing_target')
+assert.match(categoryGuardedMappings[0].validationReason, /cannot be used as POS transaction items/)
+
+const quickBooksActionsPanel = read('app_src/components/accounting/QuickBooksActionsPanel.tsx')
+assert.ok(quickBooksActionsPanel.includes('<DetailField label="Category" value={payload.parentCategoryName} />'))
 
 const mixedRefundSummary = projection.summarizeToastProjectedChecks([{
   amount: 100,

@@ -345,6 +345,7 @@ for (const fragment of [
   "DetailType: 'SalesItemLineDetail'",
 ]) includes(writePayloads, fragment, 'QuickBooks write payload validation')
 
+const writeOrganizationId = '11111111-1111-4111-8111-111111111111'
 const writePayloadModule = loadTypeScriptModule('app_src/lib/integrations/quickBooksWritePayloads.ts', {
   '@/lib/persistence/postgres': {
     query: async (sql, params = []) => {
@@ -362,7 +363,7 @@ const writePayloadModule = loadTypeScriptModule('app_src/lib/integrations/quickB
       }
       if (source.includes('FROM quickbooks_items')) {
         if (source.includes("lower(item_type) = 'category'")) {
-          return { rows: params[1] === 'category-1' ? [{
+          return { rows: params[0] === writeOrganizationId && params[1] === 'category-1' ? [{
             quickbooks_item_id: 'category-1',
             fully_qualified_name: 'Breakfast:Breakfast Sandwiches',
           }] : [] }
@@ -375,7 +376,7 @@ const writePayloadModule = loadTypeScriptModule('app_src/lib/integrations/quickB
 })
 
 const customerDraft = await writePayloadModule.validateQuickBooksWriteDraft({
-  organizationId: '11111111-1111-4111-8111-111111111111',
+  organizationId: writeOrganizationId,
   operationKind: 'customer.create',
   payload: { displayName: ' Acme Buyer ', email: 'buyer@example.com', billingAddress: { city: 'Boston' } },
 })
@@ -387,7 +388,7 @@ assert.deepEqual(
 )
 
 const itemDraft = await writePayloadModule.validateQuickBooksWriteDraft({
-  organizationId: '11111111-1111-4111-8111-111111111111',
+  organizationId: writeOrganizationId,
   operationKind: 'item.create',
   payload: {
     name: 'Consulting', itemType: 'Service', unitPrice: 125, purchaseCost: 25,
@@ -417,6 +418,18 @@ await assert.rejects(
     },
   }),
   /active QuickBooks product category/,
+)
+await assert.rejects(
+  writePayloadModule.validateQuickBooksWriteDraft({
+    organizationId: '22222222-2222-4222-8222-222222222222',
+    operationKind: 'item.create',
+    payload: {
+      name: 'Consulting', itemType: 'Service', unitPrice: 125,
+      incomeAccountId: 'income-1', parentCategoryId: 'category-1',
+    },
+  }),
+  /active QuickBooks product category/,
+  'a category owned by another organization must not be accepted',
 )
 
 const invoiceDraft = await writePayloadModule.validateQuickBooksWriteDraft({
