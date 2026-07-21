@@ -8,22 +8,18 @@ import {
   failQuickBooksWriteJobInPostgres,
 } from '@/lib/persistence/quickBooksWrites'
 import { queueQuickBooksCatalogSyncInPostgres } from '@/lib/persistence/quickBooksIntegrations'
-
-function configuredWriteMode(): 'sandbox' | 'production' | null {
-  if (process.env.QUICKBOOKS_WRITES_ENABLED !== '1') return null
-  const mode = String(process.env.QUICKBOOKS_WRITE_MODE || '').trim()
-  return mode === 'sandbox' || mode === 'production' ? mode : null
-}
+import { configuredQuickBooksWritePolicy } from '@/lib/quickBooksWritePolicy'
 
 export async function processQuickBooksWriteOutbox(input: { limit?: number; workerId: string }) {
-  const writeMode = configuredWriteMode()
-  if (!writeMode) {
+  const policy = configuredQuickBooksWritePolicy()
+  if (!policy.enabled || !policy.mode) {
     return { enabled: false, mode: 'disabled', claimed: 0, succeeded: 0, failed: 0, dead: 0 }
   }
   const jobs = await claimQuickBooksWriteJobsInPostgres({
     limit: Math.max(1, Math.min(Number(input.limit || 2), 10)),
     workerId: input.workerId,
-    writeMode,
+    writeMode: policy.mode,
+    allowedOperations: policy.allowedOperations,
   })
   let succeeded = 0
   let failed = 0
@@ -55,5 +51,13 @@ export async function processQuickBooksWriteOutbox(input: { limit?: number; work
       else failed += 1
     }
   }
-  return { enabled: true, mode: writeMode, claimed: jobs.length, succeeded, failed, dead }
+  return {
+    enabled: true,
+    mode: policy.mode,
+    allowedOperations: policy.allowedOperations,
+    claimed: jobs.length,
+    succeeded,
+    failed,
+    dead,
+  }
 }

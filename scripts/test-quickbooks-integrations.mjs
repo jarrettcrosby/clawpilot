@@ -684,6 +684,9 @@ const recentWriteRequestId = '33333333-3333-4333-8333-333333333333'
 const targetedWriteRequestId = '77777777-7777-4777-8777-777777777777'
 const writePersistenceModule = loadTypeScriptModule('app_src/lib/persistence/quickBooksWrites.ts', {
   '@/lib/auditWriter': { recordAuditEvent: async () => undefined },
+  '@/lib/quickBooksWritePolicy': {
+    configuredQuickBooksWritePolicy: () => ({ enabled: true, mode: 'sandbox', allowedOperations: ['item.create'] }),
+  },
   '@/lib/persistence/postgres': {
     query: async (sql, params = []) => {
       if (writeReadScenario === 'off') return { rows: [], rowCount: 0 }
@@ -782,10 +785,17 @@ await assert.rejects(
 )
 
 writeScenario = 'claim'
-await writePersistenceModule.claimQuickBooksWriteJobsInPostgres({ limit: 2, workerId: 'worker-1', writeMode: 'sandbox' })
+await writePersistenceModule.claimQuickBooksWriteJobsInPostgres({
+  limit: 2,
+  workerId: 'worker-1',
+  writeMode: 'sandbox',
+  allowedOperations: ['item.create'],
+})
 const claimWriteCall = writeSqlCalls.find((call) => call.source.includes('WITH candidate AS'))
 includes(claimWriteCall.source, 'connection.maton_connection_id = request.reviewed_maton_connection_id', 'QuickBooks claim reviewed binding')
+includes(claimWriteCall.source, 'request.operation_kind = ANY($4::text[])', 'QuickBooks claim operation allowlist')
 includes(claimWriteCall.source, 'FOR UPDATE OF request, connection SKIP LOCKED', 'QuickBooks claim connection lock')
+assert.deepEqual(claimWriteCall.params[3], ['item.create'])
 
 const writeJob = {
   id: '33333333-3333-4333-8333-333333333333',
@@ -848,14 +858,28 @@ for (const fragment of [
 
 const writeWorker = read('app_src/lib/quickBooksWriteWorker.ts')
 for (const fragment of [
-  "process.env.QUICKBOOKS_WRITES_ENABLED !== '1'",
-  'QUICKBOOKS_WRITE_MODE',
+  'configuredQuickBooksWritePolicy',
+  'allowedOperations: policy.allowedOperations',
   'claimQuickBooksWriteJobsInPostgres',
   'createQuickBooksEntity',
   'completeQuickBooksWriteJobInPostgres',
   'failQuickBooksWriteJobInPostgres',
   'queueQuickBooksCatalogSyncInPostgres',
 ]) includes(writeWorker, fragment, 'QuickBooks write worker')
+
+const writePolicyModule = loadTypeScriptModule('app_src/lib/quickBooksWritePolicy.ts')
+const productOnlyPolicy = writePolicyModule.configuredQuickBooksWritePolicy({
+  QUICKBOOKS_WRITES_ENABLED: '1',
+  QUICKBOOKS_WRITE_MODE: 'production',
+  QUICKBOOKS_WRITE_OPERATIONS: 'item.create,item.create,unsupported',
+})
+assert.equal(productOnlyPolicy.enabled, true)
+assert.equal(productOnlyPolicy.mode, 'production')
+assert.equal(JSON.stringify(productOnlyPolicy.allowedOperations), JSON.stringify(['item.create']))
+assert.equal(writePolicyModule.configuredQuickBooksWritePolicy({
+  QUICKBOOKS_WRITES_ENABLED: '1',
+  QUICKBOOKS_WRITE_MODE: 'production',
+}).enabled, false)
 
 const processRoute = read('app_src/app/api/integrations/quickbooks/process/route.ts')
 for (const fragment of [
@@ -975,18 +999,15 @@ const writeWorkerModule = loadTypeScriptModule('app_src/lib/quickBooksWriteWorke
     failQuickBooksWriteJobInPostgres: async () => false,
   },
   '@/lib/persistence/quickBooksIntegrations': { queueQuickBooksCatalogSyncInPostgres: async () => undefined },
+  '@/lib/quickBooksWritePolicy': {
+    configuredQuickBooksWritePolicy: () => ({ enabled: false, mode: null, allowedOperations: [] }),
+  },
 })
-const previousWriteEnabled = process.env.QUICKBOOKS_WRITES_ENABLED
-const previousWriteMode = process.env.QUICKBOOKS_WRITE_MODE
-delete process.env.QUICKBOOKS_WRITES_ENABLED
-delete process.env.QUICKBOOKS_WRITE_MODE
 const gatedWrites = await writeWorkerModule.processQuickBooksWriteOutbox({ workerId: 'test-worker' })
 assert.equal(gatedWrites.enabled, false)
 assert.equal(writeClaims, 0)
 
 let failedJobs = 0
-process.env.QUICKBOOKS_WRITES_ENABLED = '1'
-process.env.QUICKBOOKS_WRITE_MODE = 'sandbox'
 const retryWorkerModule = loadTypeScriptModule('app_src/lib/quickBooksWriteWorker.ts', {
   '@/lib/integrations/quickBooksClient': {
     QuickBooksProviderWriteError: class extends Error {},
@@ -1005,15 +1026,14 @@ const retryWorkerModule = loadTypeScriptModule('app_src/lib/quickBooksWriteWorke
     failQuickBooksWriteJobInPostgres: async () => { failedJobs += 1; return false },
   },
   '@/lib/persistence/quickBooksIntegrations': { queueQuickBooksCatalogSyncInPostgres: async () => undefined },
+  '@/lib/quickBooksWritePolicy': {
+    configuredQuickBooksWritePolicy: () => ({ enabled: true, mode: 'sandbox', allowedOperations: ['customer.create'] }),
+  },
 })
 const retryResult = await retryWorkerModule.processQuickBooksWriteOutbox({ workerId: 'test-worker' })
 assert.equal(retryResult.failed, 1)
 assert.equal(retryResult.dead, 0)
 assert.equal(failedJobs, 1)
-if (previousWriteEnabled === undefined) delete process.env.QUICKBOOKS_WRITES_ENABLED
-else process.env.QUICKBOOKS_WRITES_ENABLED = previousWriteEnabled
-if (previousWriteMode === undefined) delete process.env.QUICKBOOKS_WRITE_MODE
-else process.env.QUICKBOOKS_WRITE_MODE = previousWriteMode
 
 const attachmentRoute = read('app_src/app/api/accounting/quickbooks/attachments/[attachmentId]/route.ts')
 for (const fragment of [
