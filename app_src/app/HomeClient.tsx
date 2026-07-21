@@ -20,6 +20,7 @@ import { Box } from '@mui/material'
 import type { BoardFilter } from '@/components/projects/FilterBar'
 import { emptyFilter } from '@/components/projects/FilterBar'
 import { WORKSPACE_CHANGED_EVENT, type WorkspaceChangedDetail } from '@/lib/workspaceClient'
+import { accountingSectionFromNavigationUrl } from '@/lib/accountingDraftNavigation'
 
 const SECTIONS = ['dashboard', 'docs', 'projects', 'pipeline', 'crm', 'accounting', 'pos', 'links', 'agents', 'versions']
 const DESKTOP_NAV_COLLAPSED_KEY = 'clawpilot_desktop_nav_collapsed'
@@ -27,6 +28,8 @@ const DESKTOP_NAV_PREFERENCE_EVENT = 'clawpilot:desktop-nav-preference'
 
 function getSectionFromHash(): string {
   if (typeof window === 'undefined') return 'dashboard'
+  const accountingSection = accountingSectionFromNavigationUrl(window.location.href)
+  if (accountingSection) return accountingSection
   const hash = window.location.hash.replace('#', '')
   return SECTIONS.includes(hash) ? hash : 'dashboard'
 }

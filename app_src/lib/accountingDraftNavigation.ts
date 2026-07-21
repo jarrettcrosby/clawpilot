@@ -4,6 +4,15 @@ export function accountingExplorerViewParameter(view: string) {
   return view === 'overview' || view === 'actions' ? null : view
 }
 
+export function accountingSectionFromNavigationUrl(currentHref: string): 'accounting' | null {
+  const currentURL = new URL(currentHref)
+  const view = currentURL.searchParams.get('accountingView')
+  const requestId = currentURL.searchParams.get('accountingRequest')
+  return view === 'actions' || Boolean(requestId && ACCOUNTING_REQUEST_ID_PATTERN.test(requestId))
+    ? 'accounting'
+    : null
+}
+
 export function buildAccountingDraftReviewUrl(currentHref: string, requestId: string) {
   const normalizedRequestId = String(requestId || '').trim().toLowerCase()
   if (!ACCOUNTING_REQUEST_ID_PATTERN.test(normalizedRequestId)) {
@@ -19,6 +28,7 @@ export function buildAccountingDraftReviewUrl(currentHref: string, requestId: st
 
 export function consumeAccountingDraftTarget(currentHref: string) {
   const currentURL = new URL(currentHref)
+  const targetSection = accountingSectionFromNavigationUrl(currentHref)
   const view = currentURL.searchParams.get('accountingView')
   const rawRequestId = currentURL.searchParams.get('accountingRequest')
   const requestId = rawRequestId && ACCOUNTING_REQUEST_ID_PATTERN.test(rawRequestId)
@@ -27,6 +37,7 @@ export function consumeAccountingDraftTarget(currentHref: string) {
   const hasTarget = currentURL.searchParams.has('accountingView') || currentURL.searchParams.has('accountingRequest')
   currentURL.searchParams.delete('accountingView')
   currentURL.searchParams.delete('accountingRequest')
+  if (targetSection) currentURL.hash = targetSection
   return {
     view,
     requestId,

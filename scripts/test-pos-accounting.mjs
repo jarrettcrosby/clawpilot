@@ -657,6 +657,24 @@ assert.equal(accountingDraftNavigation.accountingExplorerViewParameter('overview
 assert.equal(accountingDraftNavigation.accountingExplorerViewParameter('actions'), null)
 assert.equal(accountingDraftNavigation.accountingExplorerViewParameter('products'), 'products')
 const draftRequestId = '3C788366-C864-43C7-87B4-ADF481C94943'
+assert.equal(
+  accountingDraftNavigation.accountingSectionFromNavigationUrl(
+    `https://aiapp.eigenracing.com/?accountingView=actions&accountingRequest=${draftRequestId}`,
+  ),
+  'accounting',
+)
+assert.equal(
+  accountingDraftNavigation.accountingSectionFromNavigationUrl(
+    'https://aiapp.eigenracing.com/?accountingView=actions&accountingRequest=invalid',
+  ),
+  'accounting',
+)
+assert.equal(
+  accountingDraftNavigation.accountingSectionFromNavigationUrl(
+    'https://aiapp.eigenracing.com/?accountingRequest=invalid',
+  ),
+  null,
+)
 const draftReviewUrl = accountingDraftNavigation.buildAccountingDraftReviewUrl(
   'https://aiapp.eigenracing.com/?posView=accounting&location=truck&date=2026-07-21#pos',
   draftRequestId,
@@ -672,6 +690,13 @@ assert.equal(consumedDraftTarget.view, 'actions')
 assert.equal(consumedDraftTarget.requestId, draftRequestId.toLowerCase())
 assert.equal(consumedDraftTarget.hasTarget, true)
 assert.equal(consumedDraftTarget.cleanUrl, '/#accounting')
+const consumedQueryOnlyTarget = accountingDraftNavigation.consumeAccountingDraftTarget(
+  `https://aiapp.eigenracing.com/?accountingView=actions&accountingRequest=${draftRequestId}`,
+)
+assert.equal(consumedQueryOnlyTarget.cleanUrl, '/#accounting')
+
+const homeClient = read('app_src/app/HomeClient.tsx')
+assert.ok(homeClient.includes('accountingSectionFromNavigationUrl(window.location.href)'))
 
 const mixedRefundSummary = projection.summarizeToastProjectedChecks([{
   amount: 100,
