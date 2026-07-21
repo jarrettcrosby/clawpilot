@@ -175,6 +175,11 @@ function mappingFromSource(source: DataRecord, current: DataRecord | undefined):
   const sourceKind = text(source.sourceKind)
   const suggestedTarget = record(source.suggestedTarget)
   const hasCurrent = Boolean(current)
+  const currentIsUsable = Boolean(
+    current
+      && current.active !== false
+      && ['valid', 'unvalidated'].includes(text(current.validationStatus, 'unvalidated')),
+  )
   const suggested = !hasCurrent && Boolean(suggestedTarget.id)
   return {
     sourceKind,
@@ -183,7 +188,7 @@ function mappingFromSource(source: DataRecord, current: DataRecord | undefined):
     targetType: targetTypeFor(sourceKind, text(current?.targetType)),
     targetId: text(current?.targetId || suggestedTarget.id),
     targetName: text(current?.targetName || suggestedTarget.name),
-    active: current ? current.active !== false : true,
+    active: hasCurrent ? currentIsUsable : suggested,
     suggested,
     suggestionConfidence: suggested ? text(suggestedTarget.confidence, 'normalized') : '',
   }
