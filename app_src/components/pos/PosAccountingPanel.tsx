@@ -37,7 +37,6 @@ type NumberFormatter = (value: number, maximumFractionDigits?: number) => string
 type PosAccountingPanelProps = {
   location: string
   businessDate: string
-  hasAccountingDraft: boolean
   revision: number
   money: MoneyFormatter
   number: NumberFormatter
@@ -208,7 +207,7 @@ function ReadinessChip({ ready, readyLabel, waitingLabel }: {
   return <Chip size="small" variant="outlined" color={ready ? 'success' : 'warning'} label={ready ? readyLabel : waitingLabel} />
 }
 
-export default function PosAccountingPanel({ location, businessDate, hasAccountingDraft, revision, money, number }: PosAccountingPanelProps) {
+export default function PosAccountingPanel({ location, businessDate, revision, money, number }: PosAccountingPanelProps) {
   const [workspace, setWorkspace] = useState<DataRecord | null>(null)
   const [profile, setProfile] = useState<DataRecord>({})
   const [scope, setScope] = useState('organization_default')
@@ -219,6 +218,7 @@ export default function PosAccountingPanel({ location, businessDate, hasAccounti
   const [savingMappings, setSavingMappings] = useState(false)
   const [refreshingCatalog, setRefreshingCatalog] = useState(false)
   const [refreshingQuickBooks, setRefreshingQuickBooks] = useState(false)
+  const [runningAccountingCommand, setRunningAccountingCommand] = useState<'reload-sales' | 'regenerate-accounting' | null>(null)
   const [preparingProduct, setPreparingProduct] = useState(false)
   const [productDraft, setProductDraft] = useState<ProductDraft | null>(null)
   const [preparedProductDraft, setPreparedProductDraft] = useState<PreparedProductDraft | null>(null)
@@ -279,8 +279,23 @@ export default function PosAccountingPanel({ location, businessDate, hasAccounti
   const journal = record(preview.journal)
   const readiness = record(preview.readiness)
   const evidence = record(preview.evidence)
+  const currentDraft = record(workspace?.draft)
+  const draftHistory = rows(workspace?.draftHistory)
+  const latestCommand = record(workspace?.latestCommand)
   const sourceCatalog = rows(workspace?.sourceCatalog)
   const missingMappings = rows(readiness.missingMappings)
+  const commandStatus = text(latestCommand.status)
+  const commandActive = ['queued', 'running'].includes(commandStatus)
+  const hasAccountingDraft = Boolean(currentDraft.id)
+  const protectedRevisionCount = draftHistory.filter((draft) => (
+    ['approved', 'posting', 'posted'].includes(text(draft.status))
+  )).length
+
+  useEffect(() => {
+    if (!commandActive) return
+    const timer = window.setTimeout(() => setReload((value) => value + 1), 2500)
+    return () => window.clearTimeout(timer)
+  }, [commandActive, latestCommand.id, latestCommand.updatedAt])
 
   const targetOptions = useMemo(() => {
     const make = (value: unknown) => rows(value).map((entry) => option(entry)).filter((entry) => entry.id)
@@ -522,6 +537,33 @@ export default function PosAccountingPanel({ location, businessDate, hasAccounti
     }
   }
 
+  async function runAccountingCommand(action: 'reload-sales' | 'regenerate-accounting') {
+    setRunningAccountingCommand(action)
+    setError(null)
+    setNotice(null)
+    try {
+      const response = await fetch('/api/pos/accounting', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action, restaurantGuid: locationGuid, businessDate }),
+      })
+      const payload = await response.json().catch(() => ({})) as DataRecord
+      if (!response.ok || payload.ok !== true) {
+        throw new Error(text(payload.error, action === 'reload-sales'
+          ? 'Toast sales could not be reloaded'
+          : 'POS accounting could not be regenerated'))
+      }
+      setNotice(action === 'reload-sales'
+        ? `Toast sales reload queued for ${businessDate}. Accounting regenerates after every required sales source finishes.`
+        : `POS accounting regenerated from stored sales for ${businessDate}.`)
+      setReload((value) => value + 1)
+    } catch (commandError) {
+      setError((commandError as Error).message)
+    } finally {
+      setRunningAccountingCommand(null)
+    }
+  }
+
   if (loading && !workspace) {
     return <Box minHeight={220} display="grid" sx={{ placeItems: 'center' }}><CircularProgress size={28} /></Box>
   }
@@ -539,6 +581,68 @@ export default function PosAccountingPanel({ location, businessDate, hasAccounti
           {notice}
         </Alert>
       ) : null}
+
+      <Box sx={{ ...panelSx, p: { xs: 1.5, sm: 2 } }}>
+        <Box display="flex" flexDirection={{ xs: 'column', md: 'row' }} justifyContent="space-between" alignItems={{ xs: 'stretch', md: 'center' }} gap={1.5}>
+          <Box minWidth={0}>
+            <Box display="flex" alignItems="center" gap={0.75} flexWrap="wrap">
+              <Typography fontWeight={700}>Date accounting controls</Typography>
+              <Chip size="small" variant="outlined" label={businessDate} />
+              {currentDraft.id ? <Chip size="small" variant="outlined" label={`Draft revision ${number(amount(currentDraft.draftRevision))}`} /> : null}
+              {currentDraft.status ? <Chip size="small" variant="outlined" label={text(currentDraft.status).replaceAll('_', ' ')} /> : null}
+            </Box>
+            <Typography variant="caption" color="text.secondary" display="block" mt={0.4}>
+              {text(locationRecord.locationName || locationRecord.restaurantName, 'Selected Toast location')}
+            </Typography>
+          </Box>
+          <Box display="flex" gap={1} flexWrap="wrap">
+            <Tooltip title="Fetch this location and business date from Toast, replace the normalized date projection, then regenerate accounting">
+              <span>
+                <Button
+                  variant="outlined"
+                  size="small"
+                  startIcon={runningAccountingCommand === 'reload-sales' || (commandActive && text(latestCommand.commandType) === 'reload_sales') ? <CircularProgress size={16} /> : <RefreshRounded />}
+                  onClick={() => runAccountingCommand('reload-sales')}
+                  disabled={capabilities.canPrepare !== true || !locationGuid || commandActive || runningAccountingCommand !== null}
+                >
+                  Reload sales
+                </Button>
+              </span>
+            </Tooltip>
+            <Tooltip title="Create a new accounting revision from stored sales and the current profile and mappings without contacting Toast">
+              <span>
+                <Button
+                  variant="contained"
+                  size="small"
+                  startIcon={runningAccountingCommand === 'regenerate-accounting' ? <CircularProgress size={16} /> : <AccountBalanceRounded />}
+                  onClick={() => runAccountingCommand('regenerate-accounting')}
+                  disabled={capabilities.canPrepare !== true || !locationGuid || commandActive || runningAccountingCommand !== null}
+                >
+                  Regenerate accounting
+                </Button>
+              </span>
+            </Tooltip>
+          </Box>
+        </Box>
+        {latestCommand.id ? (
+          <Box display="flex" gap={0.75} alignItems="center" flexWrap="wrap" mt={1.25}>
+            <Chip
+              size="small"
+              color={commandStatus === 'failed' ? 'error' : commandStatus === 'succeeded' ? 'success' : 'info'}
+              variant="outlined"
+              label={`${text(latestCommand.commandType).replaceAll('_', ' ')}: ${commandStatus}`}
+            />
+            {latestCommand.resultDraftRevision ? <Typography variant="caption" color="text.secondary">Revision {number(amount(latestCommand.resultDraftRevision))}</Typography> : null}
+            {latestCommand.completedAt ? <Typography variant="caption" color="text.disabled">Completed {new Date(text(latestCommand.completedAt)).toLocaleString()}</Typography> : null}
+          </Box>
+        ) : null}
+        {commandStatus === 'failed' && latestCommand.lastError ? <Alert severity="error" sx={{ mt: 1.25, borderRadius: '8px' }}>{text(latestCommand.lastError)}</Alert> : null}
+        {protectedRevisionCount > 0 ? (
+          <Alert severity="info" variant="outlined" sx={{ mt: 1.25, borderRadius: '8px' }}>
+            {number(protectedRevisionCount)} approved, posting, or posted revision{protectedRevisionCount === 1 ? '' : 's'} retained as immutable evidence.
+          </Alert>
+        ) : null}
+      </Box>
 
       <Dialog
         open={Boolean(preparedProductDraft) && preparedProductDraftDialogOpen}

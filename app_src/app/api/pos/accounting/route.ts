@@ -6,10 +6,12 @@ import {
 } from '@/lib/accountingAuthorization'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import { reconcilePosAccountingIssueForDateInPostgres } from '@/lib/persistence/posAccountingNotifications'
+import { queuePosAccountingSalesReloadInPostgres } from '@/lib/persistence/toastIntegrations'
 import {
   POS_ACCOUNTING_SCOPES,
   PosAccountingRequestError,
   readPosAccountingWorkspaceFromPostgres,
+  runPosAccountingRegenerationCommandInPostgres,
   savePosAccountingMappingsInPostgres,
   savePosAccountingProfileInPostgres,
   validatePosAccountingMappings,
@@ -216,6 +218,54 @@ export async function PATCH(req: NextRequest) {
         businessDate,
       })
       return json({ ok: true, capabilities, mappings, issueState })
+    }
+    throw new PosAccountingRequestError('POS_ACCOUNTING_ACTION_INVALID', 'POS accounting action is invalid')
+  } catch (error) {
+    return errorResponse(error)
+  }
+}
+
+export async function POST(req: NextRequest) {
+  try {
+    requirePostgres()
+    const actor = await requireRequestUser(req)
+    const capabilities = accountingCapabilities(actor)
+    if (!capabilities.canPrepare) {
+      return json({
+        ok: false,
+        error: 'You do not have permission to run POS accounting commands',
+        code: 'POS_ACCOUNTING_PREPARE_REQUIRED',
+      }, 403)
+    }
+    const organizationId = activeAccountingOrganizationId(actor)
+    const body = await requestBody(req)
+    assertFields(
+      body,
+      new Set(['action', 'restaurantGuid', 'businessDate']),
+      'POS_ACCOUNTING_REQUEST_INVALID',
+      'POS accounting command',
+    )
+    const action = String(body.action || '')
+    const restaurantGuid = restaurantGuidValue(body.restaurantGuid, true)!
+    const businessDate = dateValue(body.businessDate)
+    if (action === 'reload-sales') {
+      const command = await queuePosAccountingSalesReloadInPostgres({
+        organizationId,
+        restaurantGuid,
+        businessDate,
+        actorEmail: actor.email,
+      })
+      return json({ ok: true, capabilities, command }, 202)
+    }
+    if (action === 'regenerate-accounting') {
+      const result = await runPosAccountingRegenerationCommandInPostgres({
+        organizationId,
+        restaurantGuid,
+        businessDate,
+        actorEmail: actor.email,
+      })
+      const issueState = await reconcileIssueState({ organizationId, restaurantGuid, businessDate })
+      return json({ ok: true, capabilities, ...result, issueState })
     }
     throw new PosAccountingRequestError('POS_ACCOUNTING_ACTION_INVALID', 'POS accounting action is invalid')
   } catch (error) {

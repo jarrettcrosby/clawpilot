@@ -1,6 +1,8 @@
 import crypto from 'crypto'
 import type { PoolClient } from 'pg'
+import { recordAuditEvent } from '@/lib/auditWriter'
 import { projectToastOrders } from '@/lib/integrations/toastOrderProjection'
+import { PosAccountingRequestError } from '@/lib/persistence/posAccounting'
 import { query, withTransaction } from '@/lib/persistence/postgres'
 import type { EncryptedToastClientSecret, ToastAccessType } from '@/lib/integrations/toastCredentialCrypto'
 
@@ -249,7 +251,9 @@ export async function readToastIntegrationStateFromPostgres(organizationId: stri
     ),
     query<{ status: string; count: string }>(
       `SELECT status, count(*)::text AS count
-       FROM toast_accounting_export_drafts WHERE organization_id = $1::uuid GROUP BY status`,
+       FROM toast_accounting_export_drafts
+       WHERE organization_id = $1::uuid AND is_current
+       GROUP BY status`,
       [organizationId],
     ),
     query<{ latest: TimestampValue | null }>(
@@ -641,9 +645,11 @@ async function queueToastJobWithClient(client: PoolClient, input: {
        requested_by = COALESCE(EXCLUDED.requested_by, toast_sync_outbox.requested_by),
        rerun_requested_at = CASE
          WHEN $6::integer = 0 AND toast_sync_outbox.status = 'processing' THEN now()
+         WHEN $6::integer = 0 THEN NULL
          ELSE toast_sync_outbox.rerun_requested_at
        END,
        status = CASE
+         WHEN $6::integer = 0 AND toast_sync_outbox.status <> 'processing' THEN 'pending'
          WHEN $6::integer IS NOT NULL
            AND toast_sync_outbox.status = 'succeeded'
            AND COALESCE(toast_sync_outbox.completed_at, toast_sync_outbox.updated_at) <= now() - make_interval(secs => $6::integer)
@@ -651,6 +657,7 @@ async function queueToastJobWithClient(client: PoolClient, input: {
          ELSE toast_sync_outbox.status
        END,
        attempt_count = CASE
+         WHEN $6::integer = 0 AND toast_sync_outbox.status <> 'processing' THEN 0
          WHEN $6::integer IS NOT NULL
            AND toast_sync_outbox.status = 'succeeded'
            AND COALESCE(toast_sync_outbox.completed_at, toast_sync_outbox.updated_at) <= now() - make_interval(secs => $6::integer)
@@ -658,6 +665,7 @@ async function queueToastJobWithClient(client: PoolClient, input: {
          ELSE toast_sync_outbox.attempt_count
        END,
        available_at = CASE
+         WHEN $6::integer = 0 AND toast_sync_outbox.status <> 'processing' THEN now()
          WHEN $6::integer IS NOT NULL
            AND toast_sync_outbox.status = 'succeeded'
            AND COALESCE(toast_sync_outbox.completed_at, toast_sync_outbox.updated_at) <= now() - make_interval(secs => $6::integer)
@@ -665,6 +673,7 @@ async function queueToastJobWithClient(client: PoolClient, input: {
          ELSE toast_sync_outbox.available_at
        END,
        completed_at = CASE
+         WHEN $6::integer = 0 AND toast_sync_outbox.status <> 'processing' THEN NULL
          WHEN $6::integer IS NOT NULL
            AND toast_sync_outbox.status = 'succeeded'
            AND COALESCE(toast_sync_outbox.completed_at, toast_sync_outbox.updated_at) <= now() - make_interval(secs => $6::integer)
@@ -672,11 +681,16 @@ async function queueToastJobWithClient(client: PoolClient, input: {
          ELSE toast_sync_outbox.completed_at
        END,
        request_state = CASE
+         WHEN $6::integer = 0 AND toast_sync_outbox.status <> 'processing' THEN '{}'::jsonb
          WHEN $6::integer IS NOT NULL
            AND toast_sync_outbox.status = 'succeeded'
            AND COALESCE(toast_sync_outbox.completed_at, toast_sync_outbox.updated_at) <= now() - make_interval(secs => $6::integer)
            THEN '{}'::jsonb
          ELSE toast_sync_outbox.request_state
+       END,
+       last_error = CASE
+         WHEN $6::integer = 0 AND toast_sync_outbox.status <> 'processing' THEN NULL
+         ELSE toast_sync_outbox.last_error
        END,
        updated_at = now()`,
     [
@@ -736,6 +750,126 @@ export async function queueToastSyncForDateInPostgres(input: {
     return count
   })
   return { queued, state: await readToastIntegrationStateFromPostgres(input.organizationId) }
+}
+
+export async function queuePosAccountingSalesReloadInPostgres(input: {
+  organizationId: string
+  restaurantGuid: string
+  businessDate: string
+  actorEmail: string
+}) {
+  return withTransaction(async (client) => {
+    const [locationResult, credentialResult] = await Promise.all([
+      client.query<{
+        restaurant_guid: string
+        restaurant_name: string
+        location_name: string | null
+        analytics_access: boolean
+        standard_access: boolean
+      }>(
+        `SELECT restaurant_guid::text, restaurant_name, location_name,
+           analytics_access, standard_access
+         FROM toast_locations
+         WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid
+           AND active = true AND archived = false
+         FOR SHARE`,
+        [input.organizationId, input.restaurantGuid],
+      ),
+      client.query<{ access_type: ToastAccessType }>(
+        `SELECT access_type
+         FROM organization_toast_credentials
+         WHERE organization_id = $1::uuid`,
+        [input.organizationId],
+      ),
+    ])
+    const location = locationResult.rows[0]
+    if (!location) {
+      throw new PosAccountingRequestError('POS_LOCATION_NOT_FOUND', 'The selected Toast location was not found', 404)
+    }
+    const access = new Set(credentialResult.rows.map((row) => row.access_type))
+    const expectedSyncKinds: ToastSyncJob['syncKind'][] = []
+    if (access.has('analytics') && location.analytics_access) expectedSyncKinds.push('analytics_sales')
+    if (access.has('standard') && location.standard_access) expectedSyncKinds.push('standard_orders')
+    if (!expectedSyncKinds.length) {
+      throw new PosAccountingRequestError(
+        'POS_ACCOUNTING_SALES_SOURCE_REQUIRED',
+        'Configure Analytics or Standard Orders access for this Toast location before reloading sales',
+        409,
+      )
+    }
+
+    await client.query(
+      `UPDATE pos_accounting_commands
+       SET status = 'failed', last_error = 'Accounting command was interrupted before completion',
+         completed_at = now(), updated_at = now()
+       WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid
+         AND business_date = $3::date AND status = 'running'
+         AND updated_at < now() - interval '15 minutes'`,
+      [input.organizationId, input.restaurantGuid, input.businessDate],
+    )
+
+    const commandResult = await client.query<{
+      id: string
+      status: string
+      created_at: TimestampValue
+      updated_at: TimestampValue
+    }>(
+      `INSERT INTO pos_accounting_commands (
+         organization_id, restaurant_guid, business_date, command_type,
+         status, requested_by, expected_sync_kinds, created_at, updated_at
+       ) VALUES ($1::uuid, $2::uuid, $3::date, 'reload_sales', 'queued', $4, $5::text[], now(), now())
+       ON CONFLICT DO NOTHING
+       RETURNING id::text, status, created_at, updated_at`,
+      [input.organizationId, input.restaurantGuid, input.businessDate, input.actorEmail, expectedSyncKinds],
+    )
+    const command = commandResult.rows[0]
+    if (!command) {
+      throw new PosAccountingRequestError(
+        'POS_ACCOUNTING_RELOAD_IN_PROGRESS',
+        'An accounting command is already running for this location and business date',
+        409,
+      )
+    }
+    for (const syncKind of expectedSyncKinds) {
+      await queueToastJobWithClient(client, {
+        ...input,
+        syncKind,
+        requestedBy: input.actorEmail,
+        rerunAfterSeconds: 0,
+      })
+    }
+    await recordAuditEvent({
+      actor: input.actorEmail,
+      subject: input.actorEmail,
+      organizationId: input.organizationId,
+      eventType: 'pos.accounting.sales_reload.queued',
+      aggregateType: 'pos_accounting_command',
+      aggregateId: command.id,
+      payload: {
+        message: 'Toast sales reload queued for POS accounting',
+        commandType: 'reload_sales',
+        commandId: command.id,
+        restaurantGuid: input.restaurantGuid,
+        restaurantName: location.location_name || location.restaurant_name,
+        businessDate: input.businessDate,
+        expectedSyncKinds,
+      },
+    }, client)
+    return {
+      id: command.id,
+      commandType: 'reload_sales' as const,
+      status: 'queued' as const,
+      requestedBy: input.actorEmail,
+      expectedSyncKinds,
+      resultDraftId: null,
+      resultDraftRevision: null,
+      lastError: null,
+      startedAt: null,
+      completedAt: null,
+      createdAt: new Date(command.created_at).toISOString(),
+      updatedAt: new Date(command.updated_at).toISOString(),
+    }
+  })
 }
 
 export async function listToastAutomaticSyncTargetsInPostgres() {
@@ -1088,171 +1222,6 @@ export async function projectToastStandardOrdersInPostgres(input: {
     )
   })
   return projection.totals
-}
-
-type ToastAccountingSalesRow = {
-  gross_sales: string; net_sales: string; discounts: string; voids: string; refunds: string
-  orders_count: number; standard_orders_count: number
-  standard_gross_sales: string; standard_net_sales: string; standard_discounts: string
-  standard_voids: string; standard_refunds: string; standard_tax: string; standard_tips: string
-  standard_service_charges: string; standard_tendered: string; standard_total: string
-  standard_cash: string; standard_card: string; standard_other_tender: string
-}
-
-function hasToastAccountingDraftActivity(sales: ToastAccountingSalesRow) {
-  const isFiniteZero = (value: unknown) => {
-    const number = Number(value)
-    return Number.isFinite(number) && number === 0
-  }
-  const noOrders = [sales.orders_count, sales.standard_orders_count].every(isFiniteZero)
-  const allAmountsZero = [
-    sales.gross_sales,
-    sales.net_sales,
-    sales.discounts,
-    sales.voids,
-    sales.refunds,
-    sales.standard_gross_sales,
-    sales.standard_net_sales,
-    sales.standard_discounts,
-    sales.standard_voids,
-    sales.standard_refunds,
-    sales.standard_tax,
-    sales.standard_tips,
-    sales.standard_service_charges,
-    sales.standard_tendered,
-    sales.standard_total,
-    sales.standard_cash,
-    sales.standard_card,
-    sales.standard_other_tender,
-  ].every(isFiniteZero)
-  return !noOrders || !allAmountsZero
-}
-
-export async function refreshToastAccountingDraftInPostgres(job: ToastSyncJob) {
-  const salesResult = await query<ToastAccountingSalesRow>(
-    `SELECT gross_sales::text, net_sales::text, discounts::text, voids::text, refunds::text,
-       orders_count, standard_orders_count,
-       standard_gross_sales::text, standard_net_sales::text, standard_discounts::text,
-       standard_voids::text, standard_refunds::text, standard_tax::text, standard_tips::text,
-       standard_service_charges::text, standard_tendered::text, standard_total::text,
-       standard_cash::text, standard_card::text, standard_other_tender::text
-     FROM toast_daily_sales
-     WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid AND business_date = $3::date`,
-    [job.organizationId, job.restaurantGuid, job.businessDate],
-  )
-  const sales = salesResult.rows[0]
-  if (!sales) return
-  if (!hasToastAccountingDraftActivity(sales)) {
-    await query(
-      `DELETE FROM toast_accounting_export_drafts
-       WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid AND business_date = $3::date
-         AND status NOT IN ('approved', 'posting', 'posted')`,
-      [job.organizationId, job.restaurantGuid, job.businessDate],
-    )
-    return
-  }
-
-  const [jobsResult, mappingsResult] = await Promise.all([
-    query<{ sync_kind: ToastSyncJob['syncKind']; status: string }>(
-      `SELECT sync_kind, status FROM toast_sync_outbox
-       WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid AND business_date = $3::date`,
-      [job.organizationId, job.restaurantGuid, job.businessDate],
-    ),
-    query<{ mapping_key: string; quickbooks_account_id: string | null; quickbooks_account_name: string | null }>(
-      `SELECT mapping_key, quickbooks_account_id, quickbooks_account_name
-       FROM toast_accounting_mappings
-       WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid`,
-      [job.organizationId, job.restaurantGuid],
-    ),
-  ])
-  const succeeded = new Set(jobsResult.rows.filter((row) => row.status === 'succeeded').map((row) => row.sync_kind))
-  const analyticsReady = succeeded.has('analytics_sales')
-  const ordersReady = succeeded.has('standard_orders')
-  const analyticsNet = Number(sales.net_sales)
-  const standardNet = Number(sales.standard_net_sales)
-  const variance = analyticsReady && ordersReady ? Math.abs(analyticsNet - standardNet) : 0
-  const varianceTolerance = Math.max(1, Math.abs(analyticsNet) * 0.005)
-  const reconciliationStatus = analyticsReady && ordersReady
-    ? variance > varianceTolerance ? 'variance' : 'ready'
-    : analyticsReady ? 'analytics_only' : ordersReady ? 'orders_only' : 'pending'
-  const mappings = new Map(mappingsResult.rows.map((row) => [row.mapping_key, row]))
-  const grossSales = analyticsReady ? Number(sales.gross_sales) : Number(sales.standard_gross_sales)
-  const discounts = analyticsReady ? Number(sales.discounts) : Number(sales.standard_discounts)
-  const voids = analyticsReady ? Number(sales.voids) : Number(sales.standard_voids)
-  const refunds = analyticsReady ? Number(sales.refunds) : Number(sales.standard_refunds)
-  const lines = [
-    ['gross_sales', grossSales, 'credit'],
-    ['discounts', discounts, 'debit'],
-    ['voids', voids, 'debit'],
-    ['refunds', refunds, 'debit'],
-    ['taxes', ordersReady ? Number(sales.standard_tax) : 0, 'credit'],
-    ['tips', ordersReady ? Number(sales.standard_tips) : 0, 'credit'],
-    ['service_charges', ordersReady ? Number(sales.standard_service_charges) : 0, 'credit'],
-    ['cash', ordersReady ? Number(sales.standard_cash) : 0, 'debit'],
-    ['card', ordersReady ? Number(sales.standard_card) : 0, 'debit'],
-    ['other_tender', ordersReady ? Number(sales.standard_other_tender) : 0, 'debit'],
-  ].filter(([, amount]) => Number(amount) !== 0).map(([key, amount, direction]) => ({
-    key,
-    amount,
-    direction,
-    quickbooksAccountId: mappings.get(String(key))?.quickbooks_account_id || null,
-    quickbooksAccountName: mappings.get(String(key))?.quickbooks_account_name || null,
-  }))
-  const allMapped = lines.length > 0 && lines.every((line) => line.quickbooksAccountId)
-  const status = 'needs_mapping'
-  const idempotencyKey = crypto.createHash('sha256')
-    .update(`clawpilot:toast-accounting:v1:${job.organizationId}:${job.restaurantGuid}:${job.businessDate}`)
-    .digest('hex')
-  await query(
-    `INSERT INTO toast_accounting_export_drafts (
-       organization_id, restaurant_guid, business_date, idempotency_key, status,
-       reconciliation_status, source_summary, proposed_lines, created_at, updated_at
-     ) VALUES ($1::uuid, $2::uuid, $3::date, $4, $5, $6, $7::jsonb, $8::jsonb, now(), now())
-     ON CONFLICT (organization_id, restaurant_guid, business_date) DO UPDATE SET
-       status = CASE
-         WHEN toast_accounting_export_drafts.status IN ('approved', 'posting', 'posted') THEN toast_accounting_export_drafts.status
-         ELSE EXCLUDED.status
-       END,
-       reconciliation_status = CASE
-         WHEN toast_accounting_export_drafts.status IN ('approved', 'posting', 'posted') THEN toast_accounting_export_drafts.reconciliation_status
-         ELSE EXCLUDED.reconciliation_status
-       END,
-       source_summary = CASE
-         WHEN toast_accounting_export_drafts.status IN ('approved', 'posting', 'posted') THEN toast_accounting_export_drafts.source_summary
-         ELSE EXCLUDED.source_summary
-       END,
-       proposed_lines = CASE
-         WHEN toast_accounting_export_drafts.status IN ('approved', 'posting', 'posted') THEN toast_accounting_export_drafts.proposed_lines
-         ELSE EXCLUDED.proposed_lines
-       END,
-       updated_at = CASE
-         WHEN toast_accounting_export_drafts.status IN ('approved', 'posting', 'posted') THEN toast_accounting_export_drafts.updated_at
-         ELSE now()
-       END`,
-    [
-      job.organizationId, job.restaurantGuid, job.businessDate, idempotencyKey, status, reconciliationStatus,
-      JSON.stringify({
-        grossSales: Number(sales.gross_sales), netSales: Number(sales.net_sales),
-        discounts: Number(sales.discounts), voids: Number(sales.voids), refunds: Number(sales.refunds),
-        analyticsOrders: sales.orders_count, standardOrders: sales.standard_orders_count,
-        analyticsReady, standardOrdersReady: ordersReady,
-        legacyMappingsComplete: allMapped,
-        canonicalReadinessVerified: false,
-        canonicalReadinessReason: 'Use the canonical POS accounting preview to validate mappings, allocation, holds, and open checks.',
-        standard: {
-          grossSales: Number(sales.standard_gross_sales), netSales: standardNet,
-          discounts: Number(sales.standard_discounts), voids: Number(sales.standard_voids),
-          refunds: Number(sales.standard_refunds), tax: Number(sales.standard_tax),
-          tips: Number(sales.standard_tips), serviceCharges: Number(sales.standard_service_charges),
-          tendered: Number(sales.standard_tendered), total: Number(sales.standard_total),
-          cash: Number(sales.standard_cash), card: Number(sales.standard_card),
-          otherTender: Number(sales.standard_other_tender),
-        },
-        variance: { netSales: variance, tolerance: varianceTolerance },
-      }),
-      JSON.stringify(lines),
-    ],
-  )
 }
 
 const TOAST_WORKER_HEARTBEAT_KEY = 'toast.sync.worker.heartbeat'

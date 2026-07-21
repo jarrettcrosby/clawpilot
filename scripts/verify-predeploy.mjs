@@ -179,6 +179,7 @@ for (const requiredPath of [
   'db/migrations/0075_quickbooks_write_binding_compatibility.sql',
   'db/migrations/0076_pos_accounting_notification_consent.sql',
   'db/migrations/0077_zero_sales_accounting_draft_suppression.sql',
+  'db/migrations/0078_pos_accounting_date_commands.sql',
   '.github/workflows/clawpilot-repository-runner.yml',
   '.github/workflows/deployed-runtime-monitor.yml',
   'scripts/start-railway.sh',

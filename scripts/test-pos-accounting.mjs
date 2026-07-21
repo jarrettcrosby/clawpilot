@@ -82,6 +82,23 @@ for (const fragment of [
   assert.ok(quickBooksReferenceMigration.includes(fragment), `QuickBooks reference migration missing ${fragment}`)
 }
 
+const dateCommandsMigration = read('db/migrations/0078_pos_accounting_date_commands.sql')
+for (const fragment of [
+  'draft_revision integer NOT NULL DEFAULT 1',
+  "generation_reason IN ('automatic_sync', 'reload_sales', 'regenerate_accounting')",
+  'supersedes_draft_id uuid',
+  'WHERE is_current',
+  'CREATE TABLE IF NOT EXISTS pos_accounting_commands',
+  "command_type IN ('reload_sales', 'regenerate_accounting')",
+  'uq_pos_accounting_active_command',
+  'NEW.source_summary := OLD.source_summary',
+  'NEW.quickbooks_payload := OLD.quickbooks_payload',
+  'NEW.approved_by := OLD.approved_by',
+  'NEW.created_at := OLD.created_at',
+]) {
+  assert.ok(dateCommandsMigration.includes(fragment), `POS accounting date command migration missing ${fragment}`)
+}
+
 const persistenceSource = read('app_src/lib/persistence/posAccounting.ts')
 for (const fragment of [
   'WHERE organization_id = $1::uuid',
@@ -108,6 +125,16 @@ for (const fragment of [
   'invalidateUnavailableQuickBooksItemTargets',
   "lower(COALESCE(item_type, '')) <> 'category'",
   'productCreationSuggestion',
+  'regeneratePosAccountingDraftInPostgres',
+  'runPosAccountingRegenerationCommandInPostgres',
+  'finalizePosAccountingReloadForDateInPostgres',
+  "generatedFrom: 'stored_pos_sales'",
+  "generationReason: 'regenerate_accounting'",
+  'forceNewRevision: true',
+  'SET is_current = false, superseded_at = now()',
+  'status NOT IN (\'approved\', \'posting\', \'posted\')',
+  'pos.accounting.sales_reload.completed',
+  'pos.accounting.regenerated',
 ]) {
   assert.ok(persistenceSource.includes(fragment), `POS accounting persistence missing ${fragment}`)
 }
@@ -122,6 +149,11 @@ for (const fragment of [
   'POS_ACCOUNTING_ORGANIZATION_CONFIG_REQUIRED',
   "action === 'save-profile'",
   "action === 'save-mappings'",
+  "action === 'reload-sales'",
+  "action === 'regenerate-accounting'",
+  'capabilities.canPrepare',
+  'queuePosAccountingSalesReloadInPostgres',
+  'runPosAccountingRegenerationCommandInPostgres',
   'PROFILE_FIELDS',
   'MAPPING_FIELDS',
   'MAX_REQUEST_BYTES',
@@ -129,7 +161,8 @@ for (const fragment of [
 ]) {
   assert.ok(route.includes(fragment), `POS accounting route missing ${fragment}`)
 }
-assert.equal(route.includes('export async function POST'), false, 'Accounting route must not expose a posting endpoint')
+assert.equal(route.includes('export async function POST'), true, 'Accounting route must expose bounded date commands')
+assert.equal(route.includes('quickbooks_payload'), false, 'Accounting date commands must not post to QuickBooks')
 
 const panel = read('app_src/components/pos/PosAccountingPanel.tsx')
 for (const fragment of [
@@ -150,15 +183,18 @@ for (const fragment of [
   'active: mapping.active',
   'hasAccountingDraft ? (',
   'No sales-backed accounting draft is available in this date range.',
+  'Date accounting controls',
+  'Reload sales',
+  'Regenerate accounting',
+  "method: 'POST'",
+  "action === 'reload-sales'",
 ]) {
   assert.ok(panel.includes(fragment), `POS accounting panel missing ${fragment}`)
 }
 
 const posSection = read('app_src/components/pos/PosSection.tsx')
 for (const fragment of [
-  "const accountingBusinessDate = textValue(record(accountingDrafts[0]), ['businessDate', 'date'])",
-  'businessDate={accountingBusinessDate || to}',
-  'hasAccountingDraft={Boolean(accountingBusinessDate)}',
+  'businessDate={to}',
 ]) {
   assert.ok(posSection.includes(fragment), `POS section missing ${fragment}`)
 }
@@ -175,6 +211,9 @@ assert.equal(authorization.canConfigureAccountingScope(prepareOnlyCapabilities, 
 assert.equal(authorization.canConfigureAccountingScope({ ...prepareOnlyCapabilities, canManage: true }, 'organization_default'), true)
 
 let unauthorizedProfileSaveCalls = 0
+let routeCapabilities = prepareOnlyCapabilities
+const reloadCommandCalls = []
+const regenerationCommandCalls = []
 const accountingRoute = loadTypeScriptModule('app_src/app/api/pos/accounting/route.ts', {
   'next/server': {
     NextResponse: {
@@ -182,7 +221,7 @@ const accountingRoute = loadTypeScriptModule('app_src/app/api/pos/accounting/rou
     },
   },
   '@/lib/accountingAuthorization': {
-    accountingCapabilities: () => prepareOnlyCapabilities,
+    accountingCapabilities: () => routeCapabilities,
     activeAccountingOrganizationId: () => '11111111-1111-4111-8111-111111111111',
     canConfigureAccountingScope: authorization.canConfigureAccountingScope,
   },
@@ -192,12 +231,28 @@ const accountingRoute = loadTypeScriptModule('app_src/app/api/pos/accounting/rou
   },
   '@/lib/persistence/posAccounting': {
     POS_ACCOUNTING_SCOPES: ['organization_default', 'location_override'],
-    PosAccountingRequestError: class PosAccountingRequestError extends Error {},
+    PosAccountingRequestError: class PosAccountingRequestError extends Error {
+      constructor(code, message, status = 400) {
+        super(message)
+        this.code = code
+        this.status = status
+      }
+    },
     readPosAccountingWorkspaceFromPostgres: async () => ({}),
+    runPosAccountingRegenerationCommandInPostgres: async (input) => {
+      regenerationCommandCalls.push(input)
+      return { draft: { id: 'draft-2', draftRevision: 2 }, command: { id: 'command-2', status: 'succeeded' } }
+    },
     savePosAccountingMappingsInPostgres: async () => [],
     savePosAccountingProfileInPostgres: async () => { unauthorizedProfileSaveCalls += 1 },
     validatePosAccountingMappings: (value) => value,
     validatePosAccountingProfile: (value) => value,
+  },
+  '@/lib/persistence/toastIntegrations': {
+    queuePosAccountingSalesReloadInPostgres: async (input) => {
+      reloadCommandCalls.push(input)
+      return { id: 'command-1', commandType: 'reload_sales', status: 'queued' }
+    },
   },
   '@/lib/requestUser': { requireRequestUser: async () => ({ email: 'preparer@example.test' }) },
 })
@@ -215,6 +270,46 @@ assert.equal(organizationConfigResponse.status, 403)
 assert.equal((await organizationConfigResponse.json()).code, 'POS_ACCOUNTING_ORGANIZATION_CONFIG_REQUIRED')
 assert.equal(unauthorizedProfileSaveCalls, 0)
 
+const dateCommandBody = (action) => JSON.stringify({
+  action,
+  restaurantGuid: '22222222-2222-4222-8222-222222222222',
+  businessDate: '2026-07-18',
+})
+const commandRequest = (action) => {
+  const body = dateCommandBody(action)
+  return {
+    headers: { get: (name) => name === 'content-type' ? 'application/json' : String(Buffer.byteLength(body)) },
+    text: async () => body,
+  }
+}
+routeCapabilities = { canView: true, canManage: false, canPrepare: false, canApprove: false }
+const deniedCommandResponse = await accountingRoute.POST(commandRequest('reload-sales'))
+assert.equal(deniedCommandResponse.status, 403)
+assert.equal((await deniedCommandResponse.json()).code, 'POS_ACCOUNTING_PREPARE_REQUIRED')
+assert.equal(reloadCommandCalls.length, 0)
+
+routeCapabilities = prepareOnlyCapabilities
+const reloadCommandResponse = await accountingRoute.POST(commandRequest('reload-sales'))
+assert.equal(reloadCommandResponse.status, 202)
+assert.equal(reloadCommandCalls.length, 1)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(reloadCommandCalls[0])),
+  {
+    organizationId: '11111111-1111-4111-8111-111111111111',
+    restaurantGuid: '22222222-2222-4222-8222-222222222222',
+    businessDate: '2026-07-18',
+    actorEmail: 'preparer@example.test',
+  },
+)
+const reloadCallsBeforeRegeneration = reloadCommandCalls.length
+const regenerationResponse = await accountingRoute.POST(commandRequest('regenerate-accounting'))
+assert.equal(regenerationResponse.status, 200)
+assert.equal(regenerationCommandCalls.length, 1)
+assert.equal(reloadCommandCalls.length, reloadCallsBeforeRegeneration, 'regeneration must not queue or call Toast')
+assert.equal(regenerationCommandCalls[0].organizationId, '11111111-1111-4111-8111-111111111111')
+assert.equal(regenerationCommandCalls[0].restaurantGuid, '22222222-2222-4222-8222-222222222222')
+assert.equal(regenerationCommandCalls[0].businessDate, '2026-07-18')
+
 const projection = loadTypeScriptModule('app_src/lib/integrations/toastOrderProjection.ts')
 const accounting = loadTypeScriptModule('app_src/lib/persistence/posAccounting.ts', {
   '@/lib/auditWriter': { recordAuditEvent: async () => {} },
@@ -225,6 +320,126 @@ const accounting = loadTypeScriptModule('app_src/lib/persistence/posAccounting.t
     withTransaction: async () => { throw new Error('database access is not expected in focused unit tests') },
   },
 })
+assert.equal(
+  persistenceSource.includes('@/lib/integrations/toastClient'),
+  false,
+  'stored-sales accounting regeneration must not import or call the Toast client',
+)
+
+const protectedDraft = {
+  id: '55555555-5555-4555-8555-555555555555',
+  status: 'approved',
+  reconciliation_status: 'ready',
+  approved_by: 'approver@example.test',
+  approved_at: '2026-07-19T12:00:00.000Z',
+  posted_at: null,
+  quickbooks_transaction_id: null,
+  draft_revision: 4,
+  generation_reason: 'automatic_sync',
+  generated_by: null,
+  source_revision: 8,
+  supersedes_draft_id: null,
+  is_current: true,
+  created_at: '2026-07-19T11:00:00.000Z',
+  updated_at: '2026-07-19T12:00:00.000Z',
+}
+const regenerationQueries = []
+const regenerationAccounting = loadTypeScriptModule('app_src/lib/persistence/posAccounting.ts', {
+  '@/lib/auditWriter': { recordAuditEvent: async () => {} },
+  '@/lib/integrations/toastOrderProjection': projection,
+  '@/lib/persistence/postgres': {
+    acquireTransactionAdvisoryLock: async () => {},
+    query: async (sql, params = []) => {
+      const source = String(sql)
+      regenerationQueries.push({ source, params: [...params], client: false })
+      if (source.includes('FROM toast_locations')) {
+        return {
+          rows: [{
+            restaurant_guid: '22222222-2222-4222-8222-222222222222',
+            restaurant_name: 'Test Restaurant',
+            location_name: 'Downtown',
+            analytics_access: false,
+            standard_access: true,
+          }],
+          rowCount: 1,
+        }
+      }
+      return { rows: [], rowCount: 0 }
+    },
+    withTransaction: async (work) => work({
+      query: async (sql, params = []) => {
+        const source = String(sql)
+        regenerationQueries.push({ source, params: [...params], client: true })
+        if (source.includes('FROM toast_daily_sales')) {
+          return {
+            rows: [{
+              gross_sales: '0', net_sales: '0', discounts: '0', voids: '0', refunds: '0',
+              orders_count: 0, standard_orders_count: 1,
+              standard_gross_sales: '20', standard_net_sales: '20', standard_discounts: '0',
+              standard_voids: '0', standard_refunds: '0', standard_tax: '1.2', standard_tips: '3',
+              standard_service_charges: '0', standard_tendered: '21.2', standard_total: '24.2',
+              standard_cash: '0', standard_card: '24.2', standard_other_tender: '0',
+              source_revision: 9, updated_at: '2026-07-20T12:00:00.000Z',
+            }],
+            rowCount: 1,
+          }
+        }
+        if (source.includes('FROM toast_sync_outbox')) {
+          return { rows: [{ sync_kind: 'standard_orders', status: 'succeeded' }], rowCount: 1 }
+        }
+        if (source.includes('FROM toast_accounting_export_drafts')) {
+          return { rows: [protectedDraft], rowCount: 1 }
+        }
+        if (source.includes('SET is_current = false, superseded_at = now()')) {
+          return { rows: [], rowCount: 1 }
+        }
+        if (source.includes('INSERT INTO toast_accounting_export_drafts')) {
+          return {
+            rows: [{
+              ...protectedDraft,
+              id: '66666666-6666-4666-8666-666666666666',
+              status: 'needs_review',
+              reconciliation_status: 'orders_only',
+              approved_by: null,
+              approved_at: null,
+              draft_revision: 5,
+              generation_reason: 'regenerate_accounting',
+              generated_by: 'preparer@example.test',
+              source_revision: 9,
+              supersedes_draft_id: protectedDraft.id,
+              created_at: '2026-07-20T12:01:00.000Z',
+              updated_at: '2026-07-20T12:01:00.000Z',
+            }],
+            rowCount: 1,
+          }
+        }
+        return { rows: [], rowCount: 1 }
+      },
+    }),
+  },
+})
+const regenerated = await regenerationAccounting.regeneratePosAccountingDraftInPostgres({
+  organizationId: '11111111-1111-4111-8111-111111111111',
+  restaurantGuid: '22222222-2222-4222-8222-222222222222',
+  businessDate: '2026-07-20',
+  actorEmail: 'preparer@example.test',
+  generationReason: 'regenerate_accounting',
+  forceNewRevision: true,
+})
+assert.equal(regenerated.createdRevision, true)
+assert.equal(regenerated.draft.draftRevision, 5)
+assert.equal(regenerated.draft.supersedesDraftId, protectedDraft.id)
+assert.ok(regenerationQueries.some((entry) => entry.source.includes('SET is_current = false, superseded_at = now()')))
+const insertedRevision = regenerationQueries.find((entry) => entry.source.includes('INSERT INTO toast_accounting_export_drafts'))
+assert.ok(insertedRevision)
+assert.equal(insertedRevision.params[8], 5)
+assert.equal(insertedRevision.params[9], 'regenerate_accounting')
+assert.equal(insertedRevision.params[12], protectedDraft.id)
+const regeneratedSummary = JSON.parse(insertedRevision.params[6])
+assert.equal(regeneratedSummary.canonical.generatedFrom, 'stored_pos_sales')
+assert.equal(regeneratedSummary.canonical.sourceRevision, 9)
+assert.equal(regeneratedSummary.standard.total, 24.2)
+
 const companyFingerprint = accounting.posQuickBooksConnectionFingerprint({
   connectionId: 'connection-1', companyName: 'Suburbia Sandwich Co', country: 'US',
 })

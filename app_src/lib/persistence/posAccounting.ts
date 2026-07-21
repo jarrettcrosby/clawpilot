@@ -59,6 +59,9 @@ export type PosTargetType = typeof POS_TARGET_TYPES[number]
 export type PosOpenCheckPolicy = typeof POS_OPEN_CHECK_POLICIES[number]
 export type PosBatchHoldPolicy = typeof POS_BATCH_HOLD_POLICIES[number]
 export type PosAccountingScope = typeof POS_ACCOUNTING_SCOPES[number]
+export type PosAccountingCommandType = 'reload_sales' | 'regenerate_accounting'
+export type PosAccountingCommandStatus = 'queued' | 'running' | 'succeeded' | 'failed'
+export type PosAccountingGenerationReason = 'automatic_sync' | PosAccountingCommandType
 
 export class PosAccountingRequestError extends Error {
   constructor(
@@ -222,6 +225,39 @@ type LocationRow = {
   standard_access: boolean
 }
 
+type DraftRow = {
+  id: string
+  status: string
+  reconciliation_status: string
+  approved_by: string | null
+  approved_at: TimestampValue | null
+  posted_at: TimestampValue | null
+  quickbooks_transaction_id: string | null
+  draft_revision: number
+  generation_reason: PosAccountingGenerationReason
+  generated_by: string | null
+  source_revision: number
+  supersedes_draft_id: string | null
+  is_current: boolean
+  created_at: TimestampValue
+  updated_at: TimestampValue
+}
+
+type CommandRow = {
+  id: string
+  command_type: PosAccountingCommandType
+  status: PosAccountingCommandStatus
+  requested_by: string
+  expected_sync_kinds: string[]
+  result_draft_id: string | null
+  result_draft_revision: number | null
+  last_error: string | null
+  started_at: TimestampValue | null
+  completed_at: TimestampValue | null
+  created_at: TimestampValue
+  updated_at: TimestampValue
+}
+
 const IDENTIFIER_PATTERN = /^[!-~]+$/
 const SUFFIX_PATTERN = /^[A-Za-z0-9._-]+$/
 const TARGETS_BY_SOURCE: Record<PosSourceKind, readonly PosTargetType[]> = {
@@ -250,6 +286,43 @@ function record(value: unknown): JsonRecord {
 
 function list(value: unknown): unknown[] {
   return Array.isArray(value) ? value : []
+}
+
+function draftFromRow(row: DraftRow | undefined) {
+  return row ? {
+    id: row.id,
+    status: row.status,
+    reconciliationStatus: row.reconciliation_status,
+    approvedBy: row.approved_by,
+    approvedAt: iso(row.approved_at),
+    postedAt: iso(row.posted_at),
+    quickBooksTransactionId: row.quickbooks_transaction_id,
+    draftRevision: row.draft_revision,
+    generationReason: row.generation_reason,
+    generatedBy: row.generated_by,
+    sourceRevision: row.source_revision,
+    supersedesDraftId: row.supersedes_draft_id,
+    current: row.is_current,
+    createdAt: iso(row.created_at),
+    updatedAt: iso(row.updated_at),
+  } : null
+}
+
+function commandFromRow(row: CommandRow | undefined) {
+  return row ? {
+    id: row.id,
+    commandType: row.command_type,
+    status: row.status,
+    requestedBy: row.requested_by,
+    expectedSyncKinds: row.expected_sync_kinds || [],
+    resultDraftId: row.result_draft_id,
+    resultDraftRevision: row.result_draft_revision,
+    lastError: row.last_error,
+    startedAt: iso(row.started_at),
+    completedAt: iso(row.completed_at),
+    createdAt: iso(row.created_at),
+    updatedAt: iso(row.updated_at),
+  } : null
 }
 
 function money(value: unknown) {
@@ -1301,6 +1374,7 @@ export async function readPosAccountingWorkspaceFromPostgres(input: {
   organizationId: string
   restaurantGuid: string | null
   businessDate: string
+  includeProtectedDraftEvidence?: boolean
 }) {
   const location = await resolveLocation(input.organizationId, input.restaurantGuid)
   const params = [input.organizationId, location.restaurant_guid]
@@ -1320,6 +1394,7 @@ export async function readPosAccountingWorkspaceFromPostgres(input: {
     departmentResult,
     quickBooksConnectionResult,
     draftResult,
+    commandResult,
   ] = await Promise.all([
     query<ProfileRow>(
       `SELECT ${PROFILE_SELECT}
@@ -1448,16 +1523,25 @@ export async function readPosAccountingWorkspaceFromPostgres(input: {
       LIMIT 1`,
       [input.organizationId],
     ),
-    query<{
-      status: string; reconciliation_status: string; approved_by: string | null
-      approved_at: TimestampValue | null; posted_at: TimestampValue | null
-      quickbooks_transaction_id: string | null; updated_at: TimestampValue
-    }>(
-      `SELECT status, reconciliation_status, approved_by, approved_at, posted_at,
-         quickbooks_transaction_id, updated_at
+    query<DraftRow>(
+      `SELECT id::text, status, reconciliation_status, approved_by, approved_at, posted_at,
+         quickbooks_transaction_id, draft_revision, generation_reason, generated_by,
+         source_revision, supersedes_draft_id::text, is_current, created_at, updated_at
        FROM toast_accounting_export_drafts
        WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid
          AND business_date = $3::date
+       ORDER BY draft_revision DESC, created_at DESC
+       LIMIT 20`,
+      [...params, input.businessDate],
+    ),
+    query<CommandRow>(
+      `SELECT id::text, command_type, status, requested_by, expected_sync_kinds,
+         result_draft_id::text, result_draft_revision, last_error,
+         started_at, completed_at, created_at, updated_at
+       FROM pos_accounting_commands
+       WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid
+         AND business_date = $3::date
+       ORDER BY created_at DESC, id DESC
        LIMIT 1`,
       [...params, input.businessDate],
     ),
@@ -1520,16 +1604,10 @@ export async function readPosAccountingWorkspaceFromPostgres(input: {
   const targetRevision = connection?.last_catalog_synced_at
     ? new Date(connection.last_catalog_synced_at).getTime()
     : 0
-  const draft = draftResult.rows[0]
-  const draftEvidence = draft ? {
-    status: draft.status,
-    reconciliationStatus: draft.reconciliation_status,
-    approvedBy: draft.approved_by,
-    approvedAt: iso(draft.approved_at),
-    postedAt: iso(draft.posted_at),
-    quickBooksTransactionId: draft.quickbooks_transaction_id,
-    updatedAt: iso(draft.updated_at),
-  } : null
+  const currentDraftRow = draftResult.rows.find((row) => row.is_current)
+  const currentDraft = draftFromRow(currentDraftRow)
+  const draftHistory = draftResult.rows.map(draftFromRow).filter((draft) => draft !== null)
+  const draftEvidence = input.includeProtectedDraftEvidence === false ? null : currentDraft
   return {
     organizationId: input.organizationId,
     location: {
@@ -1580,6 +1658,9 @@ export async function readPosAccountingWorkspaceFromPostgres(input: {
       locationOverride: scopedMappings.overrides,
       effective: mappings,
     },
+    draft: currentDraft,
+    draftHistory,
+    latestCommand: commandFromRow(commandResult.rows[0]),
     targets: {
       accounts: accountResult.rows.map((row) => ({
         id: row.quickbooks_account_id,
@@ -1638,6 +1719,631 @@ export async function readPosAccountingWorkspaceFromPostgres(input: {
       orders: previewResult.rows,
       draftEvidence,
     }),
+  }
+}
+
+type DailySalesRow = {
+  gross_sales: string
+  net_sales: string
+  discounts: string
+  voids: string
+  refunds: string
+  orders_count: number
+  standard_orders_count: number
+  standard_gross_sales: string
+  standard_net_sales: string
+  standard_discounts: string
+  standard_voids: string
+  standard_refunds: string
+  standard_tax: string
+  standard_tips: string
+  standard_service_charges: string
+  standard_tendered: string
+  standard_total: string
+  standard_cash: string
+  standard_card: string
+  standard_other_tender: string
+  source_revision: number
+  updated_at: TimestampValue
+}
+
+const PROTECTED_DRAFT_STATUSES = new Set(['approved', 'posting', 'posted'])
+
+function hasDailySalesActivity(sales: DailySalesRow | undefined) {
+  if (!sales) return false
+  const counts = [sales.orders_count, sales.standard_orders_count]
+  const amounts = [
+    sales.gross_sales,
+    sales.net_sales,
+    sales.discounts,
+    sales.voids,
+    sales.refunds,
+    sales.standard_gross_sales,
+    sales.standard_net_sales,
+    sales.standard_discounts,
+    sales.standard_voids,
+    sales.standard_refunds,
+    sales.standard_tax,
+    sales.standard_tips,
+    sales.standard_service_charges,
+    sales.standard_tendered,
+    sales.standard_total,
+    sales.standard_cash,
+    sales.standard_card,
+    sales.standard_other_tender,
+  ]
+  return counts.some((value) => Number(value) !== 0)
+    || amounts.some((value) => Number(value) !== 0)
+}
+
+function sourceSummaryForDraft(input: {
+  sales: DailySalesRow | undefined
+  workspace: Awaited<ReturnType<typeof readPosAccountingWorkspaceFromPostgres>>
+  generationReason: PosAccountingGenerationReason
+}) {
+  const sales = input.sales
+  return {
+    grossSales: Number(sales?.gross_sales || 0),
+    netSales: Number(sales?.net_sales || 0),
+    discounts: Number(sales?.discounts || 0),
+    voids: Number(sales?.voids || 0),
+    refunds: Number(sales?.refunds || 0),
+    analyticsOrders: Number(sales?.orders_count || 0),
+    standardOrders: Number(sales?.standard_orders_count || 0),
+    standard: {
+      grossSales: Number(sales?.standard_gross_sales || 0),
+      netSales: Number(sales?.standard_net_sales || 0),
+      discounts: Number(sales?.standard_discounts || 0),
+      voids: Number(sales?.standard_voids || 0),
+      refunds: Number(sales?.standard_refunds || 0),
+      tax: Number(sales?.standard_tax || 0),
+      tips: Number(sales?.standard_tips || 0),
+      serviceCharges: Number(sales?.standard_service_charges || 0),
+      tendered: Number(sales?.standard_tendered || 0),
+      total: Number(sales?.standard_total || 0),
+      cash: Number(sales?.standard_cash || 0),
+      card: Number(sales?.standard_card || 0),
+      otherTender: Number(sales?.standard_other_tender || 0),
+    },
+    canonical: {
+      generatedFrom: 'stored_pos_sales',
+      generationReason: input.generationReason,
+      sourceRevision: Number(sales?.source_revision || 0),
+      sourceUpdatedAt: iso(sales?.updated_at),
+      profileId: input.workspace.profile.id,
+      profileRevision: input.workspace.profile.profileRevision,
+      mappingRevisions: input.workspace.mappings.map((mapping) => ({
+        id: mapping.id,
+        sourceKind: mapping.sourceKind,
+        sourceId: mapping.sourceId,
+        targetType: mapping.targetType,
+        mappingRevision: mapping.mappingRevision,
+      })),
+      readiness: input.workspace.preview.readiness,
+    },
+  }
+}
+
+function proposedLinesForPreview(preview: Awaited<ReturnType<typeof readPosAccountingWorkspaceFromPostgres>>['preview']) {
+  return [
+    ...preview.salesReceipt.lineItems.map((line) => ({ document: 'sales_receipt', ...line })),
+    ...preview.journal.lines.map((line) => ({ document: 'payments_journal', ...line })),
+  ]
+}
+
+function reconciliationStatusForDraft(
+  sales: DailySalesRow | undefined,
+  completedKinds: Set<string>,
+) {
+  const analyticsReady = completedKinds.has('analytics_sales')
+  const standardReady = completedKinds.has('standard_orders')
+  if (!analyticsReady && !standardReady) return 'pending'
+  if (!analyticsReady) return 'orders_only'
+  if (!standardReady) return 'analytics_only'
+  const analyticsNet = Number(sales?.net_sales || 0)
+  const standardNet = Number(sales?.standard_net_sales || 0)
+  const tolerance = Math.max(1, Math.abs(analyticsNet) * 0.005)
+  return Math.abs(analyticsNet - standardNet) > tolerance ? 'variance' : 'ready'
+}
+
+export async function regeneratePosAccountingDraftInPostgres(input: {
+  organizationId: string
+  restaurantGuid: string
+  businessDate: string
+  actorEmail?: string | null
+  generationReason: PosAccountingGenerationReason
+  forceNewRevision?: boolean
+  commandId?: string | null
+}) {
+  const location = await resolveLocation(input.organizationId, input.restaurantGuid)
+  return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `pos-accounting-draft:${input.organizationId}:${location.restaurant_guid}:${input.businessDate}`,
+    )
+    await acquireTransactionAdvisoryLock(client, `quickbooks-binding:${input.organizationId}`)
+    const workspace = await readPosAccountingWorkspaceFromPostgres({
+      organizationId: input.organizationId,
+      restaurantGuid: location.restaurant_guid,
+      businessDate: input.businessDate,
+      includeProtectedDraftEvidence: false,
+    })
+    const [salesResult, jobResult, draftResult] = await Promise.all([
+      client.query<DailySalesRow>(
+        `SELECT gross_sales::text, net_sales::text, discounts::text, voids::text, refunds::text,
+           orders_count, standard_orders_count,
+           standard_gross_sales::text, standard_net_sales::text, standard_discounts::text,
+           standard_voids::text, standard_refunds::text, standard_tax::text, standard_tips::text,
+           standard_service_charges::text, standard_tendered::text, standard_total::text,
+           standard_cash::text, standard_card::text, standard_other_tender::text,
+           source_revision, updated_at
+         FROM toast_daily_sales
+         WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid
+           AND business_date = $3::date`,
+        [input.organizationId, location.restaurant_guid, input.businessDate],
+      ),
+      client.query<{ sync_kind: string; status: string }>(
+        `SELECT sync_kind, status
+         FROM toast_sync_outbox
+         WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid
+           AND business_date = $3::date`,
+        [input.organizationId, location.restaurant_guid, input.businessDate],
+      ),
+      client.query<DraftRow>(
+        `SELECT id::text, status, reconciliation_status, approved_by, approved_at, posted_at,
+           quickbooks_transaction_id, draft_revision, generation_reason, generated_by,
+           source_revision, supersedes_draft_id::text, is_current, created_at, updated_at
+         FROM toast_accounting_export_drafts
+         WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid
+           AND business_date = $3::date
+         ORDER BY draft_revision DESC, created_at DESC
+         FOR UPDATE`,
+        [input.organizationId, location.restaurant_guid, input.businessDate],
+      ),
+    ])
+    const sales = salesResult.rows[0]
+    const current = draftResult.rows.find((row) => row.is_current)
+    const protectedHistory = draftResult.rows.some((row) => PROTECTED_DRAFT_STATUSES.has(row.status))
+    const hasActivity = hasDailySalesActivity(sales) || workspace.preview.available
+    const shouldRetainCorrection = protectedHistory && !hasActivity
+    const completedKinds = new Set(
+      jobResult.rows.filter((row) => row.status === 'succeeded').map((row) => row.sync_kind),
+    )
+    const reconciliationStatus = reconciliationStatusForDraft(sales, completedKinds)
+    const commandType = input.generationReason === 'automatic_sync' ? null : input.generationReason
+
+    if (!hasActivity && !shouldRetainCorrection) {
+      await client.query(
+        `DELETE FROM toast_accounting_export_drafts
+         WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid
+           AND business_date = $3::date
+           AND status NOT IN ('approved', 'posting', 'posted')`,
+        [input.organizationId, location.restaurant_guid, input.businessDate],
+      )
+      let command = null
+      if (input.commandId) {
+        const commandResult = await client.query<CommandRow>(
+          `UPDATE pos_accounting_commands
+           SET status = 'succeeded', result_draft_id = NULL, result_draft_revision = NULL,
+             last_error = NULL, completed_at = now(), updated_at = now()
+           WHERE id = $1::uuid AND organization_id = $2::uuid
+             AND restaurant_guid = $3::uuid AND business_date = $4::date
+           RETURNING id::text, command_type, status, requested_by, expected_sync_kinds,
+             result_draft_id::text, result_draft_revision, last_error,
+             started_at, completed_at, created_at, updated_at`,
+          [input.commandId, input.organizationId, location.restaurant_guid, input.businessDate],
+        )
+        command = commandFromRow(commandResult.rows[0])
+      }
+      if (commandType && input.actorEmail) {
+        await recordAuditEvent({
+          actor: input.actorEmail,
+          subject: input.actorEmail,
+          organizationId: input.organizationId,
+          eventType: commandType === 'reload_sales'
+            ? 'pos.accounting.sales_reload.completed'
+            : 'pos.accounting.regenerated',
+          aggregateType: 'pos_accounting_command',
+          aggregateId: input.commandId || `${location.restaurant_guid}:${input.businessDate}`,
+          payload: {
+            message: 'Regenerated POS accounting from stored sales; no sales-backed draft was required',
+            commandType,
+            commandId: input.commandId || null,
+            restaurantGuid: location.restaurant_guid,
+            restaurantName: location.location_name || location.restaurant_name,
+            businessDate: input.businessDate,
+            sourceRevision: Number(sales?.source_revision || 0),
+          },
+        }, client)
+      }
+      return { draft: null, command, createdRevision: false, noSales: true }
+    }
+
+    const sourceSummary = sourceSummaryForDraft({ sales, workspace, generationReason: input.generationReason })
+    const proposedLines = proposedLinesForPreview(workspace.preview)
+    const status = workspace.preview.readiness.missingMappings.length > 0 ? 'needs_mapping' : 'needs_review'
+    const forceNewRevision = input.forceNewRevision === true || Boolean(current && PROTECTED_DRAFT_STATUSES.has(current.status))
+    let storedDraft: DraftRow
+    let createdRevision = false
+
+    if (current && !forceNewRevision) {
+      const updated = await client.query<DraftRow>(
+        `UPDATE toast_accounting_export_drafts
+         SET status = $2, reconciliation_status = $3, source_summary = $4::jsonb,
+           proposed_lines = $5::jsonb, generation_reason = $6, generated_by = $7,
+           source_revision = $8, last_error = NULL, updated_at = now()
+         WHERE id = $1::uuid AND is_current
+           AND status NOT IN ('approved', 'posting', 'posted')
+         RETURNING id::text, status, reconciliation_status, approved_by, approved_at, posted_at,
+           quickbooks_transaction_id, draft_revision, generation_reason, generated_by,
+           source_revision, supersedes_draft_id::text, is_current, created_at, updated_at`,
+        [
+          current.id,
+          status,
+          reconciliationStatus,
+          JSON.stringify(sourceSummary),
+          JSON.stringify(proposedLines),
+          input.generationReason,
+          input.actorEmail || null,
+          Number(sales?.source_revision || 0),
+        ],
+      )
+      if (!updated.rows[0]) throw new Error('The current POS accounting draft changed during regeneration')
+      storedDraft = updated.rows[0]
+    } else {
+      const nextRevision = (draftResult.rows[0]?.draft_revision || 0) + 1
+      if (current) {
+        await client.query(
+          `UPDATE toast_accounting_export_drafts
+           SET is_current = false, superseded_at = now()
+           WHERE id = $1::uuid AND is_current`,
+          [current.id],
+        )
+      }
+      const idempotencyKey = crypto.createHash('sha256')
+        .update(`clawpilot:pos-accounting:v2:${input.organizationId}:${location.restaurant_guid}:${input.businessDate}:${nextRevision}`)
+        .digest('hex')
+      const inserted = await client.query<DraftRow>(
+        `INSERT INTO toast_accounting_export_drafts (
+           organization_id, restaurant_guid, business_date, idempotency_key,
+           status, reconciliation_status, source_summary, proposed_lines,
+           draft_revision, generation_reason, generated_by, source_revision,
+           supersedes_draft_id, is_current, created_at, updated_at
+         ) VALUES (
+           $1::uuid, $2::uuid, $3::date, $4, $5, $6, $7::jsonb, $8::jsonb,
+           $9, $10, $11, $12, $13::uuid, true, now(), now()
+         )
+         RETURNING id::text, status, reconciliation_status, approved_by, approved_at, posted_at,
+           quickbooks_transaction_id, draft_revision, generation_reason, generated_by,
+           source_revision, supersedes_draft_id::text, is_current, created_at, updated_at`,
+        [
+          input.organizationId,
+          location.restaurant_guid,
+          input.businessDate,
+          idempotencyKey,
+          status,
+          reconciliationStatus,
+          JSON.stringify(sourceSummary),
+          JSON.stringify(proposedLines),
+          nextRevision,
+          input.generationReason,
+          input.actorEmail || null,
+          Number(sales?.source_revision || 0),
+          current?.id || null,
+        ],
+      )
+      storedDraft = inserted.rows[0]
+      createdRevision = true
+    }
+
+    let command = null
+    if (input.commandId) {
+      const commandResult = await client.query<CommandRow>(
+        `UPDATE pos_accounting_commands
+         SET status = 'succeeded', result_draft_id = $2::uuid,
+           result_draft_revision = $3, last_error = NULL,
+           completed_at = now(), updated_at = now()
+         WHERE id = $1::uuid AND organization_id = $4::uuid
+           AND restaurant_guid = $5::uuid AND business_date = $6::date
+         RETURNING id::text, command_type, status, requested_by, expected_sync_kinds,
+           result_draft_id::text, result_draft_revision, last_error,
+           started_at, completed_at, created_at, updated_at`,
+        [
+          input.commandId,
+          storedDraft.id,
+          storedDraft.draft_revision,
+          input.organizationId,
+          location.restaurant_guid,
+          input.businessDate,
+        ],
+      )
+      command = commandFromRow(commandResult.rows[0])
+    }
+    if (commandType && input.actorEmail) {
+      await recordAuditEvent({
+        actor: input.actorEmail,
+        subject: input.actorEmail,
+        organizationId: input.organizationId,
+        eventType: commandType === 'reload_sales'
+          ? 'pos.accounting.sales_reload.completed'
+          : 'pos.accounting.regenerated',
+        aggregateType: 'pos_accounting_draft',
+        aggregateId: storedDraft.id,
+        payload: {
+          message: commandType === 'reload_sales'
+            ? `Reloaded Toast sales and generated POS accounting revision ${storedDraft.draft_revision}`
+            : `Regenerated POS accounting revision ${storedDraft.draft_revision} from stored sales`,
+          commandType,
+          commandId: input.commandId || null,
+          restaurantGuid: location.restaurant_guid,
+          restaurantName: location.location_name || location.restaurant_name,
+          businessDate: input.businessDate,
+          draftId: storedDraft.id,
+          draftRevision: storedDraft.draft_revision,
+          sourceRevision: storedDraft.source_revision,
+          supersedesDraftId: storedDraft.supersedes_draft_id,
+        },
+      }, client)
+    }
+    return {
+      draft: draftFromRow(storedDraft),
+      command,
+      createdRevision,
+      noSales: !hasActivity,
+    }
+  })
+}
+
+export async function runPosAccountingRegenerationCommandInPostgres(input: {
+  organizationId: string
+  restaurantGuid: string
+  businessDate: string
+  actorEmail: string
+}) {
+  const location = await resolveLocation(input.organizationId, input.restaurantGuid)
+  const command = await withTransaction(async (client) => {
+    await client.query(
+      `UPDATE pos_accounting_commands
+       SET status = 'failed', last_error = 'Accounting command was interrupted before completion',
+         completed_at = now(), updated_at = now()
+       WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid
+         AND business_date = $3::date AND status = 'running'
+         AND updated_at < now() - interval '15 minutes'`,
+      [input.organizationId, location.restaurant_guid, input.businessDate],
+    )
+    const activeReload = await client.query(
+      `SELECT id
+       FROM pos_accounting_commands
+       WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid
+         AND business_date = $3::date AND command_type = 'reload_sales'
+         AND status IN ('queued', 'running')
+       LIMIT 1
+       FOR UPDATE`,
+      [input.organizationId, location.restaurant_guid, input.businessDate],
+    )
+    if (activeReload.rowCount) {
+      throw new PosAccountingRequestError(
+        'POS_ACCOUNTING_RELOAD_IN_PROGRESS',
+        'Wait for the active sales reload to finish before regenerating accounting',
+        409,
+      )
+    }
+    const result = await client.query<CommandRow>(
+      `INSERT INTO pos_accounting_commands (
+         organization_id, restaurant_guid, business_date, command_type,
+         status, requested_by, started_at, created_at, updated_at
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::date, 'regenerate_accounting',
+         'running', $4, now(), now(), now()
+       )
+       ON CONFLICT DO NOTHING
+       RETURNING id::text, command_type, status, requested_by, expected_sync_kinds,
+         result_draft_id::text, result_draft_revision, last_error,
+         started_at, completed_at, created_at, updated_at`,
+      [input.organizationId, location.restaurant_guid, input.businessDate, input.actorEmail],
+    )
+    if (!result.rows[0]) {
+      throw new PosAccountingRequestError(
+        'POS_ACCOUNTING_COMMAND_IN_PROGRESS',
+        'An accounting command is already running for this location and business date',
+        409,
+      )
+    }
+    await recordAuditEvent({
+      actor: input.actorEmail,
+      subject: input.actorEmail,
+      organizationId: input.organizationId,
+      eventType: 'pos.accounting.regeneration.requested',
+      aggregateType: 'pos_accounting_command',
+      aggregateId: result.rows[0].id,
+      payload: {
+        message: 'POS accounting regeneration requested from stored sales',
+        commandType: 'regenerate_accounting',
+        commandId: result.rows[0].id,
+        restaurantGuid: location.restaurant_guid,
+        restaurantName: location.location_name || location.restaurant_name,
+        businessDate: input.businessDate,
+      },
+    }, client)
+    return result.rows[0]
+  })
+  try {
+    return await regeneratePosAccountingDraftInPostgres({
+      ...input,
+      restaurantGuid: location.restaurant_guid,
+      generationReason: 'regenerate_accounting',
+      forceNewRevision: true,
+      commandId: command.id,
+    })
+  } catch (error) {
+    const message = error instanceof Error ? error.message.slice(0, 1000) : 'POS accounting regeneration failed'
+    await withTransaction(async (client) => {
+      await client.query(
+        `UPDATE pos_accounting_commands
+         SET status = 'failed', last_error = $2, completed_at = now(), updated_at = now()
+         WHERE id = $1::uuid AND status = 'running'`,
+        [command.id, message],
+      )
+      await recordAuditEvent({
+        actor: input.actorEmail,
+        subject: input.actorEmail,
+        organizationId: input.organizationId,
+        eventType: 'pos.accounting.regeneration.failed',
+        aggregateType: 'pos_accounting_command',
+        aggregateId: command.id,
+        payload: {
+          message: 'POS accounting regeneration from stored sales failed',
+          commandType: 'regenerate_accounting',
+          commandId: command.id,
+          restaurantGuid: location.restaurant_guid,
+          restaurantName: location.location_name || location.restaurant_name,
+          businessDate: input.businessDate,
+          reason: message,
+        },
+      }, client)
+    })
+    throw error
+  }
+}
+
+export async function finalizePosAccountingReloadForDateInPostgres(input: {
+  organizationId: string
+  restaurantGuid: string
+  businessDate: string
+}) {
+  const commandResult = await query<CommandRow>(
+    `SELECT id::text, command_type, status, requested_by, expected_sync_kinds,
+       result_draft_id::text, result_draft_revision, last_error,
+       started_at, completed_at, created_at, updated_at
+     FROM pos_accounting_commands
+     WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid
+       AND business_date = $3::date AND command_type = 'reload_sales'
+       AND status IN ('queued', 'running')
+     ORDER BY created_at
+     LIMIT 1`,
+    [input.organizationId, input.restaurantGuid, input.businessDate],
+  )
+  let command = commandResult.rows[0]
+  if (!command) return { pending: false, finalized: false, failed: false }
+  if (command.status === 'running') {
+    const stale = new Date(command.updated_at).getTime() < Date.now() - 15 * 60 * 1000
+    if (!stale) return { pending: true, finalized: false, failed: false }
+    const reset = await query<CommandRow>(
+      `UPDATE pos_accounting_commands
+       SET status = 'queued', started_at = NULL,
+         last_error = 'Retrying an interrupted accounting regeneration', updated_at = now()
+       WHERE id = $1::uuid AND status = 'running'
+         AND updated_at < now() - interval '15 minutes'
+       RETURNING id::text, command_type, status, requested_by, expected_sync_kinds,
+         result_draft_id::text, result_draft_revision, last_error,
+         started_at, completed_at, created_at, updated_at`,
+      [command.id],
+    )
+    if (!reset.rows[0]) return { pending: true, finalized: false, failed: false }
+    command = reset.rows[0]
+  }
+
+  const jobResult = await query<{
+    sync_kind: string
+    status: string
+    completed_at: TimestampValue | null
+    updated_at: TimestampValue
+    last_error: string | null
+  }>(
+    `SELECT sync_kind, status, completed_at, updated_at, last_error
+     FROM toast_sync_outbox
+     WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid
+       AND business_date = $3::date AND sync_kind = ANY($4::text[])`,
+    [input.organizationId, input.restaurantGuid, input.businessDate, command.expected_sync_kinds],
+  )
+  const jobs = new Map(jobResult.rows.map((row) => [row.sync_kind, row]))
+  const requestedAt = new Date(command.created_at).getTime()
+  const terminalFailure = command.expected_sync_kinds
+    .map((kind) => jobs.get(kind))
+    .find((job) => job?.status === 'dead' && new Date(job.updated_at).getTime() >= requestedAt)
+  if (terminalFailure) {
+    const message = String(terminalFailure.last_error || 'Toast sales reload reached a terminal failure').slice(0, 1000)
+    await withTransaction(async (client) => {
+      await client.query(
+        `UPDATE pos_accounting_commands
+         SET status = 'failed', last_error = $2, completed_at = now(), updated_at = now()
+         WHERE id = $1::uuid AND status = 'queued'`,
+        [command.id, message],
+      )
+      await recordAuditEvent({
+        actor: command.requested_by,
+        subject: command.requested_by,
+        organizationId: input.organizationId,
+        eventType: 'pos.accounting.sales_reload.failed',
+        aggregateType: 'pos_accounting_command',
+        aggregateId: command.id,
+        payload: {
+          message: 'Toast sales reload failed before accounting could be regenerated',
+          commandType: command.command_type,
+          commandId: command.id,
+          restaurantGuid: input.restaurantGuid,
+          businessDate: input.businessDate,
+          reason: message,
+        },
+      }, client)
+    })
+    return { pending: false, finalized: false, failed: true }
+  }
+
+  const allComplete = command.expected_sync_kinds.every((kind) => {
+    const job = jobs.get(kind)
+    return job?.status === 'succeeded'
+      && Boolean(job.completed_at)
+      && new Date(job.completed_at!).getTime() >= requestedAt
+  })
+  if (!allComplete) return { pending: true, finalized: false, failed: false }
+
+  const claimed = await query<CommandRow>(
+    `UPDATE pos_accounting_commands
+     SET status = 'running', started_at = now(), updated_at = now()
+     WHERE id = $1::uuid AND status = 'queued'
+     RETURNING id::text, command_type, status, requested_by, expected_sync_kinds,
+       result_draft_id::text, result_draft_revision, last_error,
+       started_at, completed_at, created_at, updated_at`,
+    [command.id],
+  )
+  if (!claimed.rows[0]) return { pending: true, finalized: false, failed: false }
+  try {
+    await regeneratePosAccountingDraftInPostgres({
+      ...input,
+      actorEmail: command.requested_by,
+      generationReason: 'reload_sales',
+      forceNewRevision: true,
+      commandId: command.id,
+    })
+    return { pending: false, finalized: true, failed: false }
+  } catch (error) {
+    const message = error instanceof Error ? error.message.slice(0, 1000) : 'POS accounting regeneration failed'
+    await withTransaction(async (client) => {
+      await client.query(
+        `UPDATE pos_accounting_commands
+         SET status = 'failed', last_error = $2, completed_at = now(), updated_at = now()
+         WHERE id = $1::uuid AND status = 'running'`,
+        [command.id, message],
+      )
+      await recordAuditEvent({
+        actor: command.requested_by,
+        subject: command.requested_by,
+        organizationId: input.organizationId,
+        eventType: 'pos.accounting.sales_reload.failed',
+        aggregateType: 'pos_accounting_command',
+        aggregateId: command.id,
+        payload: {
+          message: 'Toast sales reloaded, but accounting regeneration failed',
+          commandType: command.command_type,
+          commandId: command.id,
+          restaurantGuid: input.restaurantGuid,
+          businessDate: input.businessDate,
+          reason: message,
+        },
+      }, client)
+    })
+    return { pending: false, finalized: false, failed: true }
   }
 }
 

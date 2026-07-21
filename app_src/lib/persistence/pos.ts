@@ -201,14 +201,16 @@ export async function readPosWorkspaceFromPostgres(input: {
       : Promise.resolve({ rows: [], rowCount: 0 }),
     query<{
       id: string; restaurant_guid: string; restaurant_name: string; business_date: TimestampValue
-      status: string; reconciliation_status: string; source_summary: Record<string, unknown>; updated_at: TimestampValue
+      status: string; reconciliation_status: string; source_summary: Record<string, unknown>
+      draft_revision: number; generation_reason: string; source_revision: number; updated_at: TimestampValue
     }>(
       `SELECT d.id::text, d.restaurant_guid::text, l.restaurant_name, d.business_date,
-         d.status, d.reconciliation_status, d.source_summary, d.updated_at
+         d.status, d.reconciliation_status, d.source_summary, d.draft_revision,
+         d.generation_reason, d.source_revision, d.updated_at
        FROM toast_accounting_export_drafts d
        JOIN toast_locations l ON l.organization_id = d.organization_id AND l.restaurant_guid = d.restaurant_guid
        WHERE d.organization_id = $1::uuid AND d.business_date BETWEEN $2::date AND $3::date
-         AND ($4::uuid IS NULL OR d.restaurant_guid = $4::uuid)
+         AND ($4::uuid IS NULL OR d.restaurant_guid = $4::uuid) AND d.is_current
        ORDER BY d.business_date DESC, d.updated_at DESC LIMIT 50`,
       params,
     ),
@@ -276,6 +278,9 @@ export async function readPosWorkspaceFromPostgres(input: {
       status: row.status,
       reconciliationStatus: row.reconciliation_status,
       sourceSummary: row.source_summary,
+      draftRevision: row.draft_revision,
+      generationReason: row.generation_reason,
+      sourceRevision: row.source_revision,
       updatedAt: iso(row.updated_at),
     })),
     readiness: {

@@ -47,7 +47,7 @@ flowchart LR
 5. Standard orders are normalized into tenant-scoped order, check, item, tender, tax, tip, discount, service-charge, refund, and total fields. Guest identity, customer contact data, card numbers, and provider payment identifiers are not exposed through the POS projection.
 6. Normalized order rows and daily sales are atomically replaced per organization, restaurant, and business date. The daily update job reads Toast's modified-order feed, then retrieves and replaces every affected business day so refunds or edits to older orders do not leave stale projections. Immutable source snapshots remain backend evidence for recalculation.
 7. Automatic scheduling never revives failed or dead work. An operator must review the specific error before retrying a terminal job.
-8. Each completed projection refreshes one idempotent legacy accounting draft. That draft remains `needs_mapping` and records that canonical readiness has not been verified. Only the canonical POS accounting preview may report review readiness after checking effective mappings, allocation, reconciliation, holds, open checks, and the current QuickBooks company binding. Neither path has a posting action.
+8. Each completed sales projection refreshes the current canonical accounting draft from stored normalized orders, effective mappings, the active posting profile, allocation, reconciliation, holds, open checks, and the current QuickBooks company binding. A correlated accounting reload waits for every required sales source before generating one final revision. Neither path has a posting action.
 
 ## POS Workspace
 
@@ -56,7 +56,7 @@ POS is a first-class authenticated module in the desktop navigation and mobile M
 - **Overview** shows business-date sales, order and guest counts, average check, discounts, refunds, and a daily trend for the selected location and date range.
 - **Orders** provides server-paginated order search and an order drawer with checks, line items, modifiers, tax, tenders, and tips. All timestamps use the signed-in user's timezone.
 - **Reports** provides business-day sales, check status, product and category performance, tender and card summaries, cash evidence, prior-period comparisons, and a transparent sales run rate. Wide tables collapse into stacked operational rows on phones.
-- **Accounting** shows location/date reconciliation drafts, versioned posting profiles, QuickBooks reference catalogs, item/account mappings, immutable previews, and any missing mapping or source variance. It does not expose a posting shortcut.
+- **Accounting** shows location/date reconciliation drafts, versioned posting profiles, QuickBooks reference catalogs, item/account mappings, immutable previews, any missing mapping or source variance, and separate date-scoped sales reload and accounting regeneration controls. It does not expose a posting shortcut.
 - Owners receive access by role. Administrators can grant `viewAccounting` to selected members. Managing Toast credentials and selected locations remains limited to organization owners and access administrators.
 - The protected demo workspace contains rolling synthetic POS data and no provider credential, provider identifier, customer identity, or live restaurant data.
 
@@ -110,7 +110,19 @@ The preview produces two immutable documents for a business date:
 1. An itemized Sales Receipt with mapped products, discounts, service charges, and tax.
 2. A balanced Payments Journal that clears tenders, tips, deposits, fees, cash, and over/short only when their required sources are available.
 
-An unresolved item, missing destination, unavailable payout, source variance, or unbalanced journal places the preview on hold. Saving a mapping regenerates only unapproved drafts; approved or posted evidence is never overwritten.
+An unresolved item, missing destination, unavailable payout, source variance, or unbalanced journal places the preview on hold. Profile and mapping saves create configuration revisions; the operator explicitly regenerates accounting when the revised rules should be applied to a business date. Approved, posting, and posted evidence is never overwritten.
+
+### Date-Scoped Accounting Commands
+
+The Accounting view provides two bounded Shogo-parity controls for the resolved organization, Toast location, and selected business date:
+
+- **Reload sales** queues only the available `analytics_sales` and `standard_orders` jobs for that location and date. Toast payouts, menu catalogs, other locations, and other dates are outside the command. Analytics totals are replaced by the date-keyed projection; Standard orders are upserted by order GUID and stale orders for the date are removed. Retries and repeated reloads therefore do not append duplicate normalized sales.
+- **Regenerate accounting** does not call Toast. It reads the stored daily sales and normalized Standard orders, then applies the currently effective organization/location profile and catalog mappings to produce a new canonical accounting revision.
+- A durable command row reports `queued`, `running`, `succeeded`, or `failed` for that exact date. A reload remains queued until every required sales source completes, then the worker regenerates accounting once and reconciles the date's issue state.
+- Both commands require `prepareAccounting` through the active organization membership. Organization identity comes from the signed-in workspace session; it is never accepted from the request body. Toast credential configuration remains restricted to owners and access administrators.
+- Every explicit command records the actor, organization, restaurant GUID, business date, source revision, resulting draft revision, and outcome in Activity. Activity opens the same organization/location/date Accounting view.
+
+Accounting drafts have a monotonically increasing revision per organization, location, and business date. Only one revision is current. Regeneration may refresh an unprotected automatic draft in place, but every explicit command creates a fresh revision. If the current draft is `approved`, `posting`, or `posted`, ClawPilot marks it historical without changing its source summary, proposed lines, QuickBooks payload, approval identity, or provider evidence, then creates a separate correction draft. A zero-sales reload likewise retains protected evidence and creates a reviewable correction rather than deleting that evidence.
 
 ## Organization Reporting
 
@@ -159,6 +171,7 @@ Toast Analytics reporting is operational information, not a GAAP ledger. ClawPil
 - `toast_menu_categories`
 - `toast_accounting_mappings`
 - `toast_accounting_export_drafts`
+- `pos_accounting_commands`
 - `pos_accounting_profiles`
 - `pos_accounting_catalog_mappings`
 - `pos_accounting_issue_states`
@@ -173,11 +186,11 @@ All rows are organization-scoped. A multi-business user connects, selects, and r
 
 ## Current Release Boundary
 
-This release implements both Toast credential connections, location verification, scheduled and manual read-only ingestion, immutable source snapshots, sanitized order/check/item projections, menu catalogs, a dedicated responsive POS workspace, operational reports, daily projections, versioned accounting profiles, QuickBooks reference catalogs, immutable accounting previews, deduplicated accounting-issue notifications, worker health, and audit events. Organization-bound QuickBooks authorization and mapping management are available. Toast-to-QuickBooks financial posting remains intentionally locked pending complete mapping, reconciliation, independent approval, and sandbox acceptance.
+This release implements both Toast credential connections, location verification, scheduled and manual read-only ingestion, immutable source snapshots, sanitized order/check/item projections, menu catalogs, a dedicated responsive POS workspace, operational reports, daily projections, versioned accounting profiles and date drafts, separate sales reload and stored-data regeneration commands, QuickBooks reference catalogs, immutable accounting previews, deduplicated accounting-issue notifications, worker health, and audit events. Organization-bound QuickBooks authorization and mapping management are available. Toast-to-QuickBooks financial posting remains intentionally locked pending complete mapping, reconciliation, independent approval, and sandbox acceptance.
 
 ## Verification
 
-1. Run `npm run test:toast` and `npm run test:pos`.
+1. Run `npm run test:toast`, `npm run test:pos`, and `npm run test:pos-accounting`.
 2. Connect Analytics and Standard credentials independently and confirm no full secret returns from the API.
 3. Refresh Analytics locations, verify a Standard location GUID, and select only the intended restaurants.
 4. Queue one completed business date and confirm all jobs reach `succeeded` or a specific retryable error.
