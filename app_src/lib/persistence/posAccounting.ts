@@ -2519,20 +2519,41 @@ export async function savePosAccountingMappingsInPostgres(input: {
       throw new PosAccountingRequestError('POS_LOCATION_REQUIRED', 'A Toast location is required for a location override')
     }
     await requireLocation(client, input.organizationId, restaurantGuid)
-    const sourceResult = await client.query<SourceOrderRow>(
-      `SELECT ${SOURCE_ORDER_SELECT}
-       FROM toast_pos_orders
-       WHERE organization_id = $1::uuid
-         AND ($2::uuid IS NULL OR restaurant_guid = $2::uuid)
-         AND deleted = false
-       ORDER BY business_date DESC, updated_at DESC
-       LIMIT 10000`,
-      [input.organizationId, restaurantGuid],
-    )
-    const sourceRevision = catalogRevision(sourceResult.rows)
-    const sourceKeys = new Set(discoverSafePosSourceCatalog(sourceResult.rows).map((entry) => (
-      `${entry.sourceKind}:${entry.sourceId}`
-    )))
+    const [sourceResult, menuItemSourceResult] = await Promise.all([
+      client.query<SourceOrderRow>(
+        `SELECT ${SOURCE_ORDER_SELECT}
+         FROM toast_pos_orders
+         WHERE organization_id = $1::uuid
+           AND ($2::uuid IS NULL OR restaurant_guid = $2::uuid)
+           AND deleted = false
+         ORDER BY business_date DESC, updated_at DESC
+         LIMIT 10000`,
+        [input.organizationId, restaurantGuid],
+      ),
+      client.query<{ provider_item_id: string; name: string; source_revision: TimestampValue }>(
+        `SELECT DISTINCT ON (provider_item_id) provider_item_id, name, source_revision
+         FROM toast_menu_catalog_items
+         WHERE organization_id = $1::uuid
+           AND ($2::uuid IS NULL OR restaurant_guid = $2::uuid)
+           AND source_provider = 'toast'
+           AND active = true AND archived = false
+         ORDER BY provider_item_id, source_revision DESC, updated_at DESC, restaurant_guid, menu_guid, group_guid`,
+        [input.organizationId, restaurantGuid],
+      ),
+    ])
+    const observedSources = discoverSafePosSourceCatalog(sourceResult.rows)
+    const canonicalSourceNames = new Map(observedSources.map((entry) => [
+      `${entry.sourceKind}:${entry.sourceId}`,
+      entry.sourceName,
+    ]))
+    for (const item of menuItemSourceResult.rows) {
+      canonicalSourceNames.set(`sales_item:${item.provider_item_id}`, item.name)
+    }
+    const sourceRevision = menuItemSourceResult.rows.reduce((latest, item) => {
+      const timestamp = item.source_revision ? new Date(item.source_revision).getTime() : 0
+      return Number.isFinite(timestamp) ? Math.max(latest, timestamp) : latest
+    }, catalogRevision(sourceResult.rows))
+    const sourceKeys = new Set(canonicalSourceNames.keys())
     const [
       itemResult,
       accountResult,
@@ -2608,7 +2629,9 @@ export async function savePosAccountingMappingsInPostgres(input: {
       )
     }
     const saved: PosAccountingMapping[] = []
+    const changed: PosAccountingMapping[] = []
     for (const mapping of input.mappings) {
+      const sourceName = canonicalSourceNames.get(`${mapping.sourceKind}:${mapping.sourceId}`) || mapping.sourceName
       let validationStatus: PosAccountingMapping['validationStatus'] = 'unvalidated'
       let validationReason: string | null = null
       let lastValidatedAt: Date | null = null
@@ -2628,10 +2651,8 @@ export async function savePosAccountingMappingsInPostgres(input: {
         validationStatus = 'valid'
         lastValidatedAt = new Date()
       }
-      const historyResult = await client.query<{
-        id: string; target_type: PosTargetType; mapping_revision: number; effective_to: TimestampValue | null
-      }>(
-        `SELECT id::text, target_type, mapping_revision, effective_to
+      const historyResult = await client.query<MappingRow>(
+        `SELECT ${MAPPING_SELECT}
          FROM pos_accounting_catalog_mappings
          WHERE organization_id = $1::uuid
            AND restaurant_guid IS NOT DISTINCT FROM $2::uuid
@@ -2640,6 +2661,20 @@ export async function savePosAccountingMappingsInPostgres(input: {
          FOR UPDATE`,
         [input.organizationId, restaurantGuid, mapping.sourceKind, mapping.sourceId],
       )
+      const currentMapping = historyResult.rows.find((entry) => !entry.effective_to)
+      if (
+        currentMapping
+        && currentMapping.source_name === sourceName
+        && currentMapping.target_type === mapping.targetType
+        && currentMapping.target_id === mapping.targetId
+        && currentMapping.target_name === mapping.targetName
+        && currentMapping.active === mapping.active
+        && currentMapping.validation_status === validationStatus
+        && currentMapping.validation_reason === validationReason
+      ) {
+        saved.push(mappingFromRow(currentMapping))
+        continue
+      }
       const previousRevision = historyResult.rows.find((entry) => entry.target_type === mapping.targetType)?.mapping_revision || 0
       const currentIds = historyResult.rows.filter((entry) => !entry.effective_to).map((entry) => entry.id)
       if (currentIds.length > 0) {
@@ -2665,7 +2700,7 @@ export async function savePosAccountingMappingsInPostgres(input: {
           restaurantGuid,
           mapping.sourceKind,
           mapping.sourceId,
-          mapping.sourceName,
+          sourceName,
           mapping.targetType,
           mapping.targetId,
           mapping.targetName,
@@ -2679,29 +2714,34 @@ export async function savePosAccountingMappingsInPostgres(input: {
           input.actorEmail,
         ],
       )
-      saved.push(mappingFromRow(result.rows[0]))
+      const savedMapping = mappingFromRow(result.rows[0])
+      saved.push(savedMapping)
+      changed.push(savedMapping)
     }
-    await recordAuditEvent({
-      actor: input.actorEmail,
-      subject: input.actorEmail,
-      organizationId: input.organizationId,
-      eventType: 'pos.accounting.mappings.updated',
-      aggregateType: 'pos_accounting_profile',
-      aggregateId: restaurantGuid || `${input.organizationId}:default`,
-      payload: {
-        scope: input.scope,
-        restaurantGuid,
-        mappingCount: input.mappings.length,
-        activeCount: input.mappings.filter((entry) => entry.active).length,
-        sourceKinds: [...new Set(input.mappings.map((entry) => entry.sourceKind))],
-        sourceCatalogRevision: sourceRevision,
-        targetCatalogRevision: Number.isFinite(targetCatalogRevision) ? targetCatalogRevision : 0,
-        validationStatuses: saved.reduce<Record<string, number>>((summary, mapping) => {
-          summary[mapping.validationStatus] = (summary[mapping.validationStatus] || 0) + 1
-          return summary
-        }, {}),
-      },
-    }, client)
-    return saved
+    const changedCount = changed.length
+    if (changedCount > 0) {
+      await recordAuditEvent({
+        actor: input.actorEmail,
+        subject: input.actorEmail,
+        organizationId: input.organizationId,
+        eventType: 'pos.accounting.mappings.updated',
+        aggregateType: 'pos_accounting_profile',
+        aggregateId: restaurantGuid || `${input.organizationId}:default`,
+        payload: {
+          scope: input.scope,
+          restaurantGuid,
+          mappingCount: changedCount,
+          activeCount: changed.filter((entry) => entry.active).length,
+          sourceKinds: [...new Set(changed.map((entry) => entry.sourceKind))],
+          sourceCatalogRevision: sourceRevision,
+          targetCatalogRevision: Number.isFinite(targetCatalogRevision) ? targetCatalogRevision : 0,
+          validationStatuses: changed.reduce<Record<string, number>>((summary, mapping) => {
+            summary[mapping.validationStatus] = (summary[mapping.validationStatus] || 0) + 1
+            return summary
+          }, {}),
+        },
+      }, client)
+    }
+    return { mappings: saved, changedCount }
   })
 }

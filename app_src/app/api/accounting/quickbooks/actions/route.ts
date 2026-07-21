@@ -1,6 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { accountingCapabilities, activeAccountingOrganizationId } from '@/lib/accountingAuthorization'
 import {
+  accountingCapabilities,
+  activeAccountingOrganizationId,
+  canConfigureAccountingScope,
+} from '@/lib/accountingAuthorization'
+import {
+  type QuickBooksItemDraft,
   QuickBooksWriteValidationError,
   validateQuickBooksWriteDraft,
 } from '@/lib/integrations/quickBooksWritePayloads'
@@ -105,6 +110,16 @@ export async function POST(req: NextRequest) {
       operationKind: body.operationKind,
       payload: body.payload,
     })
+    const mappingScope = validated.operationKind === 'item.create'
+      ? (validated.payload as QuickBooksItemDraft).mappingScope
+      : null
+    if (mappingScope && !canConfigureAccountingScope(capabilities, mappingScope)) {
+      return json({
+        ok: false,
+        error: 'Accounting preparers may only create mappings for a selected location',
+        code: 'POS_ACCOUNTING_ORGANIZATION_CONFIG_REQUIRED',
+      }, 403)
+    }
     const request = await createQuickBooksWriteRequestInPostgres({
       organizationId,
       operationKind: validated.operationKind,

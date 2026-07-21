@@ -41,6 +41,7 @@ const TRANSACTION_ENTITIES = [
   'BillPayment',
   'CreditMemo',
   'RefundReceipt',
+  'JournalEntry',
 ] as const
 
 type QuickBooksTransactionEntity = typeof TRANSACTION_ENTITIES[number]

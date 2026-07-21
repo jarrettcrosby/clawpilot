@@ -1,9 +1,10 @@
 import { recordAuditEvent } from '@/lib/auditWriter'
 import type {
+  QuickBooksItemDraft,
   QuickBooksWriteDraftPayload,
   QuickBooksWriteOperationKind,
 } from '@/lib/integrations/quickBooksWritePayloads'
-import { query, withTransaction } from '@/lib/persistence/postgres'
+import { acquireTransactionAdvisoryLock, query, withTransaction } from '@/lib/persistence/postgres'
 import { configuredQuickBooksWritePolicy } from '@/lib/quickBooksWritePolicy'
 
 export type QuickBooksWriteRequestStatus =
@@ -23,6 +24,7 @@ export type QuickBooksWriteRequest = {
   clientRequestId: string
   providerRequestId: string
   requestPayload: QuickBooksWriteDraftPayload
+  resultPayload: Record<string, unknown>
   requestFingerprint: string
   providerEntityType: string | null
   providerEntityId: string | null
@@ -81,6 +83,7 @@ type WriteRequestRow = {
   client_request_id: string
   provider_request_id: string
   request_payload: QuickBooksWriteDraftPayload
+  result_payload: Record<string, unknown>
   request_fingerprint: string
   provider_entity_type: string | null
   provider_entity_id: string | null
@@ -112,6 +115,7 @@ function toWriteRequest(row: WriteRequestRow): QuickBooksWriteRequest {
     clientRequestId: row.client_request_id,
     providerRequestId: row.provider_request_id,
     requestPayload: row.request_payload,
+    resultPayload: row.result_payload || {},
     requestFingerprint: row.request_fingerprint,
     providerEntityType: row.provider_entity_type,
     providerEntityId: row.provider_entity_id,
@@ -139,7 +143,7 @@ function toWriteRequest(row: WriteRequestRow): QuickBooksWriteRequest {
 const WRITE_REQUEST_SELECT = `
   request.id::text, request.reviewed_maton_connection_id, request.operation_kind, request.status,
   request.client_request_id::text, request.provider_request_id,
-  request.request_payload, request.request_fingerprint,
+  request.request_payload, request.result_payload, request.request_fingerprint,
   request.provider_entity_type, request.provider_entity_id, request.provider_sync_token,
   request.requested_by, requested.display_name AS requested_by_name,
   request.submitted_by, request.approved_by, approved.display_name AS approved_by_name,
@@ -321,7 +325,7 @@ export async function createQuickBooksWriteRequestInPostgres(input: {
        VALUES ($1::uuid, $7, $2, $3::uuid, 'cp-' || $3::text, $4::jsonb, $5, lower($6), now(), now())
        ON CONFLICT (organization_id, client_request_id) DO NOTHING
        RETURNING id::text, reviewed_maton_connection_id, operation_kind, status, client_request_id::text, provider_request_id,
-         request_payload, request_fingerprint, provider_entity_type, provider_entity_id, provider_sync_token,
+         request_payload, result_payload, request_fingerprint, provider_entity_type, provider_entity_id, provider_sync_token,
          requested_by, NULL::text AS requested_by_name, submitted_by, approved_by,
          NULL::text AS approved_by_name, cancelled_by, approval_note, attempt_count, max_attempts,
          last_error_code, last_error_message, created_at::text, submitted_at::text, approved_at::text,
@@ -464,7 +468,7 @@ export async function transitionQuickBooksWriteRequestInPostgres(input: {
          AND requested.email = request.requested_by
        RETURNING request.id::text, request.operation_kind, request.status,
          request.client_request_id::text, request.provider_request_id, request.request_payload,
-         request.request_fingerprint, request.provider_entity_type, request.provider_entity_id,
+         request.result_payload, request.request_fingerprint, request.provider_entity_type, request.provider_entity_id,
          request.provider_sync_token, request.requested_by, requested.display_name AS requested_by_name,
          request.submitted_by, request.approved_by, NULL::text AS approved_by_name,
          request.cancelled_by, request.approval_note, request.attempt_count, request.max_attempts,
@@ -574,6 +578,159 @@ export async function claimQuickBooksWriteJobsInPostgres(input: {
   })
 }
 
+type PosAccountingMappingResult = {
+  status: 'created' | 'skipped_existing'
+  mappingId: string
+  mappingScope: 'organization_default' | 'location_override'
+  mappingRestaurantGuid: string | null
+  sourceRestaurantGuid: string
+  sourceKind: 'sales_item'
+  sourceId: string
+  sourceName: string
+  targetType: 'item'
+  targetId: string
+  targetName: string
+  createdQuickBooksItemId: string
+  mappingRevision: number
+  active: boolean
+}
+
+function mappedItemSource(payload: QuickBooksWriteDraftPayload): QuickBooksItemDraft | null {
+  const item = payload as QuickBooksItemDraft
+  return item.sourceKind === 'sales_item'
+    && Boolean(item.sourceId)
+    && Boolean(item.sourceName)
+    && Boolean(item.sourceRestaurantGuid)
+    && Boolean(item.mappingScope)
+    ? item
+    : null
+}
+
+async function createPosAccountingItemMappingIfAbsent(
+  client: Parameters<Parameters<typeof withTransaction>[0]>[0],
+  input: {
+    job: QuickBooksWriteJob
+    providerEntityId: string
+    createdBy: string | null
+  },
+): Promise<PosAccountingMappingResult | null> {
+  if (input.job.operationKind !== 'item.create') return null
+  const item = mappedItemSource(input.job.requestPayload)
+  if (!item || !item.sourceId || !item.sourceName || !item.sourceRestaurantGuid || !item.mappingScope) return null
+  const mappingRestaurantGuid = item.mappingScope === 'location_override' ? item.sourceRestaurantGuid : null
+  await acquireTransactionAdvisoryLock(client, `quickbooks-binding:${input.job.organizationId}`)
+
+  type CurrentMappingRow = {
+    id: string
+    source_name: string
+    target_id: string
+    target_name: string
+    active: boolean
+    mapping_revision: number
+  }
+  const readCurrent = () => client.query<CurrentMappingRow>(
+    `SELECT id::text, source_name, target_id, target_name, active, mapping_revision
+     FROM pos_accounting_catalog_mappings
+     WHERE organization_id = $1::uuid
+       AND restaurant_guid IS NOT DISTINCT FROM $2::uuid
+       AND source_kind = 'sales_item' AND source_id = $3
+       AND effective_to IS NULL
+     LIMIT 1
+     FOR UPDATE`,
+    [input.job.organizationId, mappingRestaurantGuid, item.sourceId],
+  )
+  const existing = (await readCurrent()).rows[0]
+  if (existing) {
+    return {
+      status: 'skipped_existing',
+      mappingId: existing.id,
+      mappingScope: item.mappingScope,
+      mappingRestaurantGuid,
+      sourceRestaurantGuid: item.sourceRestaurantGuid,
+      sourceKind: 'sales_item',
+      sourceId: item.sourceId,
+      sourceName: existing.source_name,
+      targetType: 'item',
+      targetId: existing.target_id,
+      targetName: existing.target_name,
+      createdQuickBooksItemId: input.providerEntityId,
+      mappingRevision: existing.mapping_revision,
+      active: existing.active,
+    }
+  }
+
+  const revisionResult = await client.query<{ revision: number }>(
+    `SELECT COALESCE(max(mapping_revision), 0)::integer AS revision
+     FROM pos_accounting_catalog_mappings
+     WHERE organization_id = $1::uuid
+       AND restaurant_guid IS NOT DISTINCT FROM $2::uuid
+       AND source_kind = 'sales_item' AND source_id = $3 AND target_type = 'item'`,
+    [input.job.organizationId, mappingRestaurantGuid, item.sourceId],
+  )
+  const mappingRevision = Number(revisionResult.rows[0]?.revision || 0) + 1
+  const inserted = await client.query<CurrentMappingRow>(
+    `INSERT INTO pos_accounting_catalog_mappings (
+       organization_id, restaurant_guid, source_kind, source_id, source_name,
+       target_type, target_id, target_name, active, mapping_revision,
+       validation_status, validation_reason, source_catalog_revision,
+       target_catalog_revision, last_validated_at, created_by
+     ) VALUES (
+       $1::uuid, $2::uuid, 'sales_item', $3, $4,
+       'item', $5, $6, true, $7,
+       'valid', NULL, 0, 0, now(), $8
+     )
+     ON CONFLICT DO NOTHING
+     RETURNING id::text, source_name, target_id, target_name, active, mapping_revision`,
+    [
+      input.job.organizationId,
+      mappingRestaurantGuid,
+      item.sourceId,
+      item.sourceName,
+      input.providerEntityId,
+      item.name,
+      mappingRevision,
+      input.createdBy,
+    ],
+  )
+  const mapping = inserted.rows[0]
+  if (!mapping) {
+    const concurrent = (await readCurrent()).rows[0]
+    if (!concurrent) throw new Error('QuickBooks item was created but its POS accounting mapping could not be recorded')
+    return {
+      status: 'skipped_existing',
+      mappingId: concurrent.id,
+      mappingScope: item.mappingScope,
+      mappingRestaurantGuid,
+      sourceRestaurantGuid: item.sourceRestaurantGuid,
+      sourceKind: 'sales_item',
+      sourceId: item.sourceId,
+      sourceName: concurrent.source_name,
+      targetType: 'item',
+      targetId: concurrent.target_id,
+      targetName: concurrent.target_name,
+      createdQuickBooksItemId: input.providerEntityId,
+      mappingRevision: concurrent.mapping_revision,
+      active: concurrent.active,
+    }
+  }
+  return {
+    status: 'created',
+    mappingId: mapping.id,
+    mappingScope: item.mappingScope,
+    mappingRestaurantGuid,
+    sourceRestaurantGuid: item.sourceRestaurantGuid,
+    sourceKind: 'sales_item',
+    sourceId: item.sourceId,
+    sourceName: mapping.source_name,
+    targetType: 'item',
+    targetId: mapping.target_id,
+    targetName: mapping.target_name,
+    createdQuickBooksItemId: input.providerEntityId,
+    mappingRevision: mapping.mapping_revision,
+    active: mapping.active,
+  }
+}
+
 export async function completeQuickBooksWriteJobInPostgres(input: {
   job: QuickBooksWriteJob
   providerEntityType: string
@@ -581,6 +738,27 @@ export async function completeQuickBooksWriteJobInPostgres(input: {
   providerSyncToken: string | null
 }) {
   return withTransaction(async (client) => {
+    const lease = await client.query<{ approved_by: string | null }>(
+      `SELECT approved_by
+       FROM quickbooks_write_requests
+       WHERE id = $1::uuid AND lock_token = $2::uuid
+         AND reviewed_maton_connection_id = $3 AND status = 'processing'
+       FOR UPDATE`,
+      [input.job.id, input.job.lockToken, input.job.connectionId],
+    )
+    if (!lease.rows[0]) throw new Error('QuickBooks write lease was lost')
+    const posAccountingMapping = await createPosAccountingItemMappingIfAbsent(client, {
+      job: input.job,
+      providerEntityId: input.providerEntityId,
+      createdBy: lease.rows[0].approved_by,
+    })
+    const resultPayload = {
+      entityType: input.providerEntityType,
+      entityId: input.providerEntityId,
+      syncToken: input.providerSyncToken,
+      requestFingerprint: input.job.requestFingerprint,
+      posAccountingMapping,
+    }
     const completed = await client.query(
       `UPDATE quickbooks_write_requests SET
          status = 'succeeded', provider_entity_type = $3, provider_entity_id = $4,
@@ -596,12 +774,7 @@ export async function completeQuickBooksWriteJobInPostgres(input: {
         input.providerEntityType,
         input.providerEntityId,
         input.providerSyncToken,
-        JSON.stringify({
-          entityType: input.providerEntityType,
-          entityId: input.providerEntityId,
-          syncToken: input.providerSyncToken,
-          requestFingerprint: input.job.requestFingerprint,
-        }),
+        JSON.stringify(resultPayload),
         input.job.connectionId,
       ],
     )
@@ -620,9 +793,11 @@ export async function completeQuickBooksWriteJobInPostgres(input: {
         providerEntityType: input.providerEntityType,
         providerEntityId: input.providerEntityId,
         requestFingerprint: input.job.requestFingerprint,
+        posAccountingMapping,
         ...requestSummary(input.job.operationKind, input.job.requestPayload),
       },
     }, client)
+    return resultPayload
   })
 }
 

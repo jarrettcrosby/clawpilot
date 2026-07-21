@@ -25,6 +25,8 @@ export type QuickBooksCustomerDraft = {
   }
 }
 
+export type QuickBooksItemMappingScope = 'organization_default' | 'location_override'
+
 export type QuickBooksItemDraft = {
   name: string
   itemType: 'Service' | 'NonInventory'
@@ -39,7 +41,17 @@ export type QuickBooksItemDraft = {
   parentCategoryId: string | null
   parentCategoryName: string | null
   taxable: boolean
+  sourceKind: 'sales_item' | null
+  sourceId: string | null
+  sourceName: string | null
+  sourceRestaurantGuid: string | null
+  mappingScope: QuickBooksItemMappingScope | null
 }
+
+type QuickBooksItemSourceContext = Pick<
+  QuickBooksItemDraft,
+  'sourceKind' | 'sourceId' | 'sourceName' | 'sourceRestaurantGuid' | 'mappingScope'
+>
 
 export type QuickBooksInvoiceDraft = {
   customerId: string
@@ -70,6 +82,11 @@ export class QuickBooksWriteValidationError extends Error {
     this.code = code
   }
 }
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+const ITEM_SOURCE_CONTEXT_FIELDS = [
+  'sourceKind', 'sourceId', 'sourceName', 'sourceRestaurantGuid', 'mappingScope',
+] as const
 
 function objectValue(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -131,6 +148,89 @@ function operationValue(value: unknown): QuickBooksWriteOperationKind {
     throw new QuickBooksWriteValidationError('QUICKBOOKS_WRITE_OPERATION_INVALID', 'The accounting operation is not supported')
   }
   return operation
+}
+
+async function validateItemSourceContext(
+  organizationId: string,
+  raw: Record<string, unknown>,
+): Promise<QuickBooksItemSourceContext> {
+  const requested = ITEM_SOURCE_CONTEXT_FIELDS.some((field) => (
+    raw[field] !== undefined && raw[field] !== null && String(raw[field]).trim() !== ''
+  ))
+  if (!requested) {
+    return {
+      sourceKind: null,
+      sourceId: null,
+      sourceName: null,
+      sourceRestaurantGuid: null,
+      mappingScope: null,
+    }
+  }
+
+  const sourceKind = cleanText(raw.sourceKind, 'POS source kind', 80, true)
+  if (sourceKind !== 'sales_item') {
+    throw new QuickBooksWriteValidationError(
+      'QUICKBOOKS_WRITE_TOAST_SOURCE_KIND_INVALID',
+      'QuickBooks product mapping requires a Toast sales item source',
+    )
+  }
+  const requestedSourceId = cleanText(raw.sourceId, 'Toast source item ID', 200, true)!
+  if (requestedSourceId.startsWith('derived:')) {
+    throw new QuickBooksWriteValidationError(
+      'QUICKBOOKS_WRITE_TOAST_SOURCE_DERIVED',
+      'A derived POS source cannot be mapped automatically; select an exact Toast menu item',
+    )
+  }
+  if (!UUID_PATTERN.test(requestedSourceId)) {
+    throw new QuickBooksWriteValidationError(
+      'QUICKBOOKS_WRITE_TOAST_SOURCE_INVALID',
+      'Select an exact Toast menu item before preparing a mapped QuickBooks product',
+    )
+  }
+  const sourceRestaurantGuid = cleanText(raw.sourceRestaurantGuid, 'Toast restaurant', 36, true)!
+  if (!UUID_PATTERN.test(sourceRestaurantGuid)) {
+    throw new QuickBooksWriteValidationError(
+      'QUICKBOOKS_WRITE_TOAST_RESTAURANT_INVALID',
+      'Select a valid Toast location before preparing a mapped QuickBooks product',
+    )
+  }
+  const mappingScopeValue = cleanText(raw.mappingScope, 'POS accounting mapping scope', 32, true)
+  if (mappingScopeValue !== 'organization_default' && mappingScopeValue !== 'location_override') {
+    throw new QuickBooksWriteValidationError(
+      'QUICKBOOKS_WRITE_MAPPING_SCOPE_INVALID',
+      'POS accounting mapping scope must be an organization default or location override',
+    )
+  }
+  const mappingScope: QuickBooksItemMappingScope = mappingScopeValue
+
+  const sourceId = requestedSourceId.toLowerCase()
+  const restaurantGuid = sourceRestaurantGuid.toLowerCase()
+  const sourceResult = await query<{ provider_item_id: string; name: string }>(
+    `SELECT provider_item_id, name
+     FROM toast_menu_catalog_items
+     WHERE organization_id = $1::uuid
+       AND restaurant_guid = $2::uuid
+       AND source_provider = 'toast'
+       AND provider_item_id = $3
+       AND active = true AND archived = false
+     ORDER BY source_revision DESC, updated_at DESC, menu_guid, group_guid
+     LIMIT 1`,
+    [organizationId, restaurantGuid, sourceId],
+  )
+  const source = sourceResult.rows[0]
+  if (!source || source.provider_item_id.toLowerCase() !== sourceId) {
+    throw new QuickBooksWriteValidationError(
+      'QUICKBOOKS_WRITE_TOAST_SOURCE_INVALID',
+      'The Toast menu item was not found in the selected organization and location',
+    )
+  }
+  return {
+    sourceKind: 'sales_item' as const,
+    sourceId,
+    sourceName: cleanText(source.name, 'Toast source item name', 240, true)!,
+    sourceRestaurantGuid: restaurantGuid,
+    mappingScope,
+  }
 }
 
 async function validateCustomerDraft(organizationId: string, raw: Record<string, unknown>): Promise<QuickBooksCustomerDraft> {
@@ -198,6 +298,7 @@ async function validateItemDraft(organizationId: string, raw: Record<string, unk
   if (parentCategoryId && !parentCategory) {
     throw new QuickBooksWriteValidationError('QUICKBOOKS_WRITE_PARENT_CATEGORY_INVALID', 'Select an active QuickBooks product category')
   }
+  const sourceContext = await validateItemSourceContext(organizationId, raw)
   return {
     name: cleanText(raw.name, 'Product or service name', 100, true)!,
     itemType,
@@ -212,6 +313,7 @@ async function validateItemDraft(organizationId: string, raw: Record<string, unk
     parentCategoryId,
     parentCategoryName: parentCategory?.fully_qualified_name || null,
     taxable: raw.taxable === true,
+    ...sourceContext,
   }
 }
 

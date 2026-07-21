@@ -171,6 +171,8 @@ for (const fragment of [
   'mapping.active',
   ": { targetId: '', targetName: '', active: false }",
   "operationKind: 'item.create'",
+  'clientRequestId: productDraft.clientRequestId',
+  "setTargetInputBySource((current) => ({ ...current, [sourceKey]: '' }))",
   'Prepare QuickBooks product',
   'parentCategoryId',
   'QuickBooks category (optional)',
@@ -243,7 +245,7 @@ const accountingRoute = loadTypeScriptModule('app_src/app/api/pos/accounting/rou
       regenerationCommandCalls.push(input)
       return { draft: { id: 'draft-2', draftRevision: 2 }, command: { id: 'command-2', status: 'succeeded' } }
     },
-    savePosAccountingMappingsInPostgres: async () => [],
+    savePosAccountingMappingsInPostgres: async () => ({ mappings: [], changedCount: 0 }),
     savePosAccountingProfileInPostgres: async () => { unauthorizedProfileSaveCalls += 1 },
     validatePosAccountingMappings: (value) => value,
     validatePosAccountingProfile: (value) => value,
@@ -660,9 +662,19 @@ assert.equal(exclusionPreview.readiness.openChecks, 1)
 assert.equal(exclusionPreview.readiness.excludedOpenChecks, 1)
 
 const mappingSqlCalls = []
+const mappingAuditEvents = []
 let mappingConnectionStatus = 'active'
+let mappingMenuItemSources = []
+let mappingQuickBooksItemIds = []
+let mappingHistoryRowsBySource = null
+let mappingHistoryRows = [{
+  id: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+  target_type: 'account',
+  mapping_revision: 1,
+  effective_to: null,
+}]
 const accountingPersistence = loadTypeScriptModule('app_src/lib/persistence/posAccounting.ts', {
-  '@/lib/auditWriter': { recordAuditEvent: async () => {} },
+  '@/lib/auditWriter': { recordAuditEvent: async (event) => { mappingAuditEvents.push(event) } },
   '@/lib/integrations/toastOrderProjection': projection,
   '@/lib/persistence/postgres': {
     acquireTransactionAdvisoryLock: async (client, key) => client.query(
@@ -675,35 +687,33 @@ const accountingPersistence = loadTypeScriptModule('app_src/lib/persistence/posA
         const source = String(sql)
         mappingSqlCalls.push({ source, params })
         if (source.includes('FROM toast_pos_orders')) return { rows: [july18Order], rowCount: 1 }
+        if (source.includes('FROM toast_menu_catalog_items')) {
+          return { rows: mappingMenuItemSources, rowCount: mappingMenuItemSources.length }
+        }
+        if (source.includes('SELECT quickbooks_item_id AS id FROM quickbooks_items')) {
+          return { rows: mappingQuickBooksItemIds.map((id) => ({ id })), rowCount: mappingQuickBooksItemIds.length }
+        }
         if (source.includes('FROM organization_quickbooks_connections')) {
           return {
             rows: [{ status: mappingConnectionStatus, last_catalog_synced_at: '2026-07-18T23:00:00.000Z' }],
             rowCount: 1,
           }
         }
-        if (source.includes('SELECT id::text, target_type, mapping_revision, effective_to')) {
-          return {
-            rows: [{
-              id: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
-              target_type: 'account',
-              mapping_revision: 1,
-              effective_to: null,
-            }],
-            rowCount: 1,
-          }
+        if (source.includes('FROM pos_accounting_catalog_mappings') && source.includes('FOR UPDATE')) {
+          const rows = mappingHistoryRowsBySource?.get(String(params[3])) || mappingHistoryRows
+          return { rows, rowCount: rows.length }
         }
         if (source.includes('INSERT INTO pos_accounting_catalog_mappings')) {
           return {
             rows: [{
-              id: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', restaurant_guid: null,
-              source_kind: 'fee', source_id: 'summary:processing_fees', source_name: 'Processing fees',
-              target_type: 'account', target_id: 'fee-account', target_name: 'Merchant fees',
-              active: false, mapping_revision: 2,
+              id: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', restaurant_guid: params[1],
+              source_kind: params[2], source_id: params[3], source_name: params[4],
+              target_type: params[5], target_id: params[6], target_name: params[7],
+              active: params[8], mapping_revision: params[9],
               effective_from: '2026-07-19T00:00:00.000Z', effective_to: null,
-              validation_status: 'unvalidated',
-              validation_reason: 'Inactive mappings are retained but are not used by previews.',
-              source_catalog_revision: 1, target_catalog_revision: 1, last_validated_at: null,
-              created_by: 'manager@example.test', created_at: '2026-07-19T00:00:00.000Z',
+              validation_status: params[10], validation_reason: params[11],
+              source_catalog_revision: params[12], target_catalog_revision: params[13],
+              last_validated_at: params[14], created_by: params[15], created_at: '2026-07-19T00:00:00.000Z',
             }],
             rowCount: 1,
           }
@@ -713,7 +723,7 @@ const accountingPersistence = loadTypeScriptModule('app_src/lib/persistence/posA
     }),
   },
 })
-const clearedMappings = await accountingPersistence.savePosAccountingMappingsInPostgres({
+const clearedMappingResult = await accountingPersistence.savePosAccountingMappingsInPostgres({
   organizationId: '11111111-1111-4111-8111-111111111111',
   restaurantGuid: null,
   scope: 'organization_default',
@@ -728,13 +738,171 @@ assert.ok(
   'POS mapping validation must serialize against QuickBooks rebinding',
 )
 assert.equal(mappingSqlCalls[0].params[0], 'quickbooks-binding:11111111-1111-4111-8111-111111111111')
-assert.equal(clearedMappings[0].active, false)
-assert.equal(clearedMappings[0].mappingRevision, 2)
+assert.equal(clearedMappingResult.changedCount, 1)
+assert.equal(clearedMappingResult.mappings[0].active, false)
+assert.equal(clearedMappingResult.mappings[0].mappingRevision, 2)
 const closePriorMapping = mappingSqlCalls.find((call) => call.source.includes('id = ANY($1::uuid[])'))
 const insertClearedMapping = mappingSqlCalls.find((call) => call.source.includes('INSERT INTO pos_accounting_catalog_mappings'))
 assert.deepEqual(Array.from(closePriorMapping.params[0]), ['cccccccc-cccc-4ccc-8ccc-cccccccccccc'])
 assert.equal(insertClearedMapping.params[8], false)
 assert.equal(insertClearedMapping.params[9], 2)
+
+const saratogaSourceId = '14351ea1-ad68-4f2c-85e6-da00661bab4e'
+const pistachioSourceId = '363eb9aa-f494-4823-a1c2-8046370fd610'
+mappingMenuItemSources = [{
+  provider_item_id: saratogaSourceId,
+  name: 'Saratoga Springs - Sparkling Water',
+  source_revision: '2026-07-20T12:00:00.000Z',
+}, {
+  provider_item_id: pistachioSourceId,
+  name: 'HOT | Pistachio Latte',
+  source_revision: '2026-07-20T11:00:00.000Z',
+}]
+mappingQuickBooksItemIds = ['35', '63']
+mappingHistoryRows = []
+const menuMappingCallStart = mappingSqlCalls.length
+const menuOnlyMappingResult = await accountingPersistence.savePosAccountingMappingsInPostgres({
+  organizationId: '11111111-1111-4111-8111-111111111111',
+  restaurantGuid: null,
+  scope: 'organization_default',
+  actorEmail: 'manager@example.test',
+  mappings: accountingPersistence.validatePosAccountingMappings([{
+    sourceKind: 'sales_item', sourceId: saratogaSourceId, sourceName: 'Client-supplied alias',
+    targetType: 'item', targetId: '35', targetName: 'Saratoga Sparkling 12 oz', active: true,
+  }, {
+    sourceKind: 'sales_item', sourceId: pistachioSourceId, sourceName: 'Another client-supplied alias',
+    targetType: 'item', targetId: '63', targetName: 'Coffee:Hot:Pistachio Latte', active: true,
+  }]),
+})
+const menuOnlyMappings = menuOnlyMappingResult.mappings
+assert.equal(menuOnlyMappingResult.changedCount, 2)
+assert.equal(menuOnlyMappings[0].sourceName, 'Saratoga Springs - Sparkling Water')
+assert.equal(menuOnlyMappings[0].targetId, '35')
+assert.equal(menuOnlyMappings[0].validationStatus, 'valid')
+assert.equal(menuOnlyMappings[0].active, true)
+assert.equal(menuOnlyMappings[1].sourceName, 'HOT | Pistachio Latte')
+assert.equal(menuOnlyMappings[1].targetId, '63')
+assert.equal(menuOnlyMappings[1].targetName, 'Coffee:Hot:Pistachio Latte')
+assert.equal(menuOnlyMappings[1].validationStatus, 'valid')
+assert.equal(menuOnlyMappings[1].active, true)
+const menuMappingCalls = mappingSqlCalls.slice(menuMappingCallStart)
+const menuSourceRead = menuMappingCalls.find((call) => call.source.includes('FROM toast_menu_catalog_items'))
+assert.ok(menuSourceRead.source.includes('($2::uuid IS NULL OR restaurant_guid = $2::uuid)'))
+assert.deepEqual(Array.from(menuSourceRead.params), ['11111111-1111-4111-8111-111111111111', null])
+const insertMenuMappings = menuMappingCalls.filter((call) => call.source.includes('INSERT INTO pos_accounting_catalog_mappings'))
+assert.equal(insertMenuMappings.length, 2)
+assert.deepEqual(
+  insertMenuMappings.map((call) => [call.params[4], call.params[6], call.params[7], call.params[10]]),
+  [
+    ['Saratoga Springs - Sparkling Water', '35', 'Saratoga Sparkling 12 oz', 'valid'],
+    ['HOT | Pistachio Latte', '63', 'Coffee:Hot:Pistachio Latte', 'valid'],
+  ],
+)
+for (const mapping of menuOnlyMappings) {
+  assert.equal(
+    mapping.active !== false && ['valid', 'unvalidated'].includes(mapping.validationStatus),
+    true,
+    'a menu-only mapping must remain usable when the UI reloads it',
+  )
+}
+
+const currentSaratogaMapping = menuOnlyMappings[0]
+mappingHistoryRows = [{
+  id: currentSaratogaMapping.id,
+  restaurant_guid: null,
+  source_kind: currentSaratogaMapping.sourceKind,
+  source_id: currentSaratogaMapping.sourceId,
+  source_name: currentSaratogaMapping.sourceName,
+  target_type: currentSaratogaMapping.targetType,
+  target_id: currentSaratogaMapping.targetId,
+  target_name: currentSaratogaMapping.targetName,
+  active: currentSaratogaMapping.active,
+  mapping_revision: currentSaratogaMapping.mappingRevision,
+  effective_from: currentSaratogaMapping.effectiveFrom,
+  effective_to: null,
+  validation_status: currentSaratogaMapping.validationStatus,
+  validation_reason: currentSaratogaMapping.validationReason,
+  source_catalog_revision: currentSaratogaMapping.sourceCatalogRevision,
+  target_catalog_revision: currentSaratogaMapping.targetCatalogRevision,
+  last_validated_at: currentSaratogaMapping.lastValidatedAt,
+  created_by: currentSaratogaMapping.createdBy,
+  created_at: currentSaratogaMapping.createdAt,
+}]
+const retryCallStart = mappingSqlCalls.length
+const retryAuditStart = mappingAuditEvents.length
+const retriedMappingResult = await accountingPersistence.savePosAccountingMappingsInPostgres({
+  organizationId: '11111111-1111-4111-8111-111111111111',
+  restaurantGuid: null,
+  scope: 'organization_default',
+  actorEmail: 'manager@example.test',
+  mappings: accountingPersistence.validatePosAccountingMappings([{
+    sourceKind: 'sales_item', sourceId: saratogaSourceId, sourceName: 'Saratoga Springs - Sparkling Water',
+    targetType: 'item', targetId: '35', targetName: 'Saratoga Sparkling 12 oz', active: true,
+  }]),
+})
+assert.equal(retriedMappingResult.changedCount, 0)
+assert.equal(retriedMappingResult.mappings[0].id, currentSaratogaMapping.id)
+assert.equal(retriedMappingResult.mappings[0].mappingRevision, currentSaratogaMapping.mappingRevision)
+const retryCalls = mappingSqlCalls.slice(retryCallStart)
+assert.equal(retryCalls.some((call) => call.source.includes('UPDATE pos_accounting_catalog_mappings SET effective_to')), false)
+assert.equal(retryCalls.some((call) => call.source.includes('INSERT INTO pos_accounting_catalog_mappings')), false)
+assert.equal(mappingAuditEvents.length, retryAuditStart)
+
+const currentPistachioMapping = menuOnlyMappings[1]
+mappingHistoryRowsBySource = new Map([
+  [saratogaSourceId, mappingHistoryRows],
+  [pistachioSourceId, [{
+    id: currentPistachioMapping.id,
+    restaurant_guid: null,
+    source_kind: currentPistachioMapping.sourceKind,
+    source_id: currentPistachioMapping.sourceId,
+    source_name: currentPistachioMapping.sourceName,
+    target_type: currentPistachioMapping.targetType,
+    target_id: '60',
+    target_name: 'Coffee:Cold:Cold Latte Pistachio Latte',
+    active: true,
+    mapping_revision: currentPistachioMapping.mappingRevision,
+    effective_from: currentPistachioMapping.effectiveFrom,
+    effective_to: null,
+    validation_status: 'valid',
+    validation_reason: null,
+    source_catalog_revision: currentPistachioMapping.sourceCatalogRevision,
+    target_catalog_revision: currentPistachioMapping.targetCatalogRevision,
+    last_validated_at: currentPistachioMapping.lastValidatedAt,
+    created_by: currentPistachioMapping.createdBy,
+    created_at: currentPistachioMapping.createdAt,
+  }]],
+])
+const mixedAuditStart = mappingAuditEvents.length
+const mixedMappingResult = await accountingPersistence.savePosAccountingMappingsInPostgres({
+  organizationId: '11111111-1111-4111-8111-111111111111',
+  restaurantGuid: null,
+  scope: 'organization_default',
+  actorEmail: 'manager@example.test',
+  mappings: accountingPersistence.validatePosAccountingMappings([{
+    sourceKind: 'sales_item', sourceId: saratogaSourceId, sourceName: 'Saratoga Springs - Sparkling Water',
+    targetType: 'item', targetId: '35', targetName: 'Saratoga Sparkling 12 oz', active: true,
+  }, {
+    sourceKind: 'sales_item', sourceId: pistachioSourceId, sourceName: 'HOT | Pistachio Latte',
+    targetType: 'item', targetId: '63', targetName: 'Coffee:Hot:Pistachio Latte', active: true,
+  }]),
+})
+assert.equal(mixedMappingResult.changedCount, 1)
+assert.equal(mappingAuditEvents.length, mixedAuditStart + 1)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(mappingAuditEvents.at(-1).payload)),
+  {
+    scope: 'organization_default',
+    restaurantGuid: null,
+    mappingCount: 1,
+    activeCount: 1,
+    sourceKinds: ['sales_item'],
+    sourceCatalogRevision: new Date('2026-07-20T12:00:00.000Z').getTime(),
+    targetCatalogRevision: new Date('2026-07-18T23:00:00.000Z').getTime(),
+    validationStatuses: { valid: 1 },
+  },
+)
+mappingHistoryRowsBySource = null
 
 mappingConnectionStatus = 'disconnected'
 await assert.rejects(

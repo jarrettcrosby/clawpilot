@@ -205,7 +205,7 @@ export async function PATCH(req: NextRequest) {
       for (const mapping of body.mappings) {
         assertFields(mapping, MAPPING_FIELDS, 'POS_MAPPINGS_INVALID', 'POS accounting mapping')
       }
-      const mappings = await savePosAccountingMappingsInPostgres({
+      const mappingResult = await savePosAccountingMappingsInPostgres({
         organizationId,
         restaurantGuid,
         scope,
@@ -217,7 +217,13 @@ export async function PATCH(req: NextRequest) {
         restaurantGuid: selectedRestaurantGuid!,
         businessDate,
       })
-      return json({ ok: true, capabilities, mappings, issueState })
+      return json({
+        ok: true,
+        capabilities,
+        mappings: mappingResult.mappings,
+        changedCount: mappingResult.changedCount,
+        issueState,
+      })
     }
     throw new PosAccountingRequestError('POS_ACCOUNTING_ACTION_INVALID', 'POS accounting action is invalid')
   } catch (error) {
