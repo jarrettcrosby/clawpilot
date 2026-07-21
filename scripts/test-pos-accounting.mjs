@@ -642,6 +642,10 @@ assert.ok(quickBooksActionsPanel.includes('This accounting draft was not found i
 const posAccountingPanel = read('app_src/components/pos/PosAccountingPanel.tsx')
 assert.ok(posAccountingPanel.includes('buildAccountingDraftReviewUrl(oldURL, prepared.id)'))
 assert.ok(posAccountingPanel.includes('QuickBooks has not been changed yet.'))
+assert.ok(posAccountingPanel.includes('open={Boolean(preparedProductDraft) && preparedProductDraftDialogOpen}'))
+assert.ok(posAccountingPanel.includes('onClose={() => setPreparedProductDraftDialogOpen(false)}'))
+assert.ok(posAccountingPanel.includes('<Button onClick={() => setPreparedProductDraftDialogOpen(false)}>Later</Button>'))
+assert.ok(posAccountingPanel.includes('preparedProductDraft ? <Button color="inherit" size="small" onClick={() => reviewPreparedProductDraft(preparedProductDraft)}>Review draft</Button>'))
 
 const accountingSection = read('app_src/components/accounting/AccountingSection.tsx')
 assert.ok(accountingSection.includes('consumeAccountingDraftTarget(window.location.href)'))
