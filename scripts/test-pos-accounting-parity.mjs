@@ -197,6 +197,8 @@ function accountingDraft({
   journalMemo = `Toast ${date}`,
   receiptProviderTransactionId = null,
   journalProviderTransactionId = null,
+  standard = { total: '18.75', tax: '1.25' },
+  extraProposedLines = [],
 }) {
   return {
     id,
@@ -210,7 +212,7 @@ function accountingDraft({
     source_revision: 7,
     updated_at: '2026-09-16T12:00:00.000Z',
     source_summary: {
-      standard: { total: '18.75', tax: '1.25' },
+      standard,
       canonical: {
         parity: {
           documents: {
@@ -252,7 +254,7 @@ function accountingDraft({
     }, {
       document: 'payments_journal', side: 'credit', amount: '2.50',
       target: { type: 'account', id: 'account-tips', name: 'Tips payable' },
-    }],
+    }, ...extraProposedLines],
   }
 }
 
@@ -304,6 +306,24 @@ assert.equal(
 )
 assert.equal(JSON.stringify(normalizedJournal).includes('rawSourcePayloadSecret'), false)
 assert.equal(pure.compareJournalEntryBalance(normalizedJournal).status, 'match')
+
+const journalWithZeroLine = pure.normalizeJournalEntryEvidence(journalTransaction({
+  id: 'journal-zero-line',
+  date: '2025-03-14',
+  documentNumber: '250314POS',
+  lines: [...defaultJournalLines(), {
+    Id: '7', Amount: '0.00', DetailType: 'JournalEntryLineDetail',
+    JournalEntryLineDetail: {
+      PostingType: 'Debit',
+      AccountRef: { value: 'account-over-short', name: 'Cash Over/Short' },
+    },
+  }],
+}))
+assert.equal(journalWithZeroLine.lineGroups.length, 5)
+assert.equal(
+  journalWithZeroLine.lineGroups.some((line) => line.accountId === 'account-over-short'),
+  false,
+)
 assert.equal(pure.isToastMarkedQuickBooksTransaction(receiptTransaction({
   id: 'toast-marker', date: '2025-03-14', documentNumber: 'TOAST-1',
 })), true)
@@ -326,6 +346,28 @@ const receiptComparison = pure.compareSalesReceiptEvidence(
 )
 assert.equal(receiptComparison.status, 'match')
 assert.equal(receiptComparison.lines.length, 2)
+
+const tipsExcludedDraft = pure.normalizePosAccountingDraftEvidence(accountingDraft({
+  id: 'draft-tips-excluded',
+  date: '2025-03-14',
+  receiptDocumentNumber: '250314POS',
+  journalDocumentNumber: '250314POS',
+  standard: { total: '21.25', tendered: '18.75', tax: '1.25', tips: '2.50' },
+  extraProposedLines: [{
+    document: 'payments_journal', side: 'debit', amount: '0.00',
+    target: { type: 'account', id: 'account-over-short', name: 'Cash Over/Short' },
+  }],
+}))
+assert.equal(tipsExcludedDraft.documents[0].totalCents, 1875)
+assert.equal(tipsExcludedDraft.documents[1].lineGroups.length, 5)
+assert.equal(
+  pure.compareSalesReceiptEvidence(tipsExcludedDraft.documents[0], normalizedReceipt).status,
+  'match',
+)
+assert.equal(
+  pure.compareJournalEntryEvidence(tipsExcludedDraft.documents[1], journalWithZeroLine).status,
+  'match',
+)
 
 const journalComparison = pure.compareJournalEntryEvidence(
   parityDraft.documents[1],
