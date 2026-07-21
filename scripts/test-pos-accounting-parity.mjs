@@ -328,11 +328,24 @@ assert.equal(pure.isToastMarkedQuickBooksTransaction(receiptTransaction({
   id: 'toast-marker', date: '2025-03-14', documentNumber: 'TOAST-1',
 })), true)
 assert.equal(pure.isToastMarkedQuickBooksTransaction(receiptTransaction({
+  id: 'toast-marker-leading-space', date: '2025-03-14', documentNumber: 'TOAST-2',
+  memo: '  Toast 2025-03-14',
+})), true)
+assert.equal(pure.isToastMarkedQuickBooksTransaction(receiptTransaction({
   id: 'unrelated', date: '2025-03-14', documentNumber: 'OTHER-1', memo: 'Retail counter',
 })), false)
 assert.equal(pure.isToastMarkedQuickBooksTransaction(receiptTransaction({
   id: 'pos-suffix', date: '2025-03-14', documentNumber: '250314pos', memo: 'Settlement batch',
-})), true)
+})), false)
+assert.equal(pure.isToastMarkedQuickBooksTransaction(receiptTransaction({
+  id: 'wrong-toast-date', date: '2025-03-14', documentNumber: '250314POS', memo: 'Toast 2025-03-13',
+})), false)
+assert.equal(pure.classifyPosAccountingQuickBooksTransaction(receiptTransaction({
+  id: 'linked-clawpilot-receipt',
+  date: '2025-03-14',
+  documentNumber: 'UNRELATED-SEQUENCE',
+  memo: 'POS 2025-03-14',
+}), new Set(['linked-clawpilot-receipt'])), 'clawpilot')
 
 const parityDraft = pure.normalizePosAccountingDraftEvidence(accountingDraft({
   id: 'draft-comparison',
@@ -560,20 +573,20 @@ const historicalReport = pure.buildPosAccountingParityReport({
   drafts: [],
   transactions: [...historicalTransactions, unrelatedTransaction],
 })
-assert.equal(historicalReport.summary.cachedTransactions, 125)
-assert.equal(historicalReport.summary.unmatchedQuickBooks, 125)
-assert.equal(historicalReport.discardedEvidence.nonToastQuickBooksTransactions, 1)
+assert.equal(historicalReport.summary.cachedTransactions, 97)
+assert.equal(historicalReport.summary.unmatchedQuickBooks, 97)
+assert.equal(historicalReport.discardedEvidence.nonToastQuickBooksTransactions, 29)
 assert.equal(historicalReport.dates.at(-1), '2025-03-14')
 assert.equal(historicalReport.dates[0], '2026-09-15')
-assert.equal(historicalReport.dates.length, 81)
+assert.equal(historicalReport.dates.length, 53)
 assert.equal(historicalReport.historicalBaseline.summary.pairCount, 44)
 assert.equal(historicalReport.historicalBaseline.summary.exactDocumentPairs, 44)
 assert.equal(historicalReport.historicalBaseline.summary.dateFallbackPairs, 0)
-assert.equal(historicalReport.historicalBaseline.summary.unmatchedGroups, 37)
-assert.equal(historicalReport.historicalBaseline.summary.unmatchedEvidence, 37)
+assert.equal(historicalReport.historicalBaseline.summary.unmatchedGroups, 9)
+assert.equal(historicalReport.historicalBaseline.summary.unmatchedEvidence, 9)
 assert.equal(historicalReport.historicalBaseline.summary.ambiguousGroups, 0)
-assert.equal(historicalReport.historicalBaseline.summary.receiptArithmetic.match, 63)
-assert.equal(historicalReport.historicalBaseline.summary.journalBalance.match, 62)
+assert.equal(historicalReport.historicalBaseline.summary.receiptArithmetic.match, 49)
+assert.equal(historicalReport.historicalBaseline.summary.journalBalance.match, 48)
 assert.equal(JSON.stringify(historicalReport).includes('rawSourcePayloadSecret'), false)
 assert.equal(JSON.stringify(historicalReport).includes('secret-historical'), false)
 
@@ -595,10 +608,14 @@ assert.equal(conflictingHistoricalFallback.summary.pairCount, 0)
 assert.equal(conflictingHistoricalFallback.summary.ambiguousGroups, 1)
 assert.equal(conflictingHistoricalFallback.summary.ambiguousEvidence, 2)
 
-const descendingHistoricalDates = [...historicalDates].reverse()
+const qualifyingHistoricalTransactions = historicalTransactions.filter(
+  pure.isToastMarkedQuickBooksTransaction,
+)
+const descendingHistoricalDates = [...new Set(qualifyingHistoricalTransactions
+  .map((transaction) => transaction.transaction_date))].sort().reverse()
 const secondPageDates = descendingHistoricalDates.slice(10, 20)
 const secondPageDateSet = new Set(secondPageDates)
-const secondPageTransactions = historicalTransactions.filter(
+const secondPageTransactions = qualifyingHistoricalTransactions.filter(
   (transaction) => secondPageDateSet.has(transaction.transaction_date),
 )
 const independentlyScopedReport = pure.buildPosAccountingParityReport({
@@ -608,9 +625,9 @@ const independentlyScopedReport = pure.buildPosAccountingParityReport({
 })
 assert.equal(independentlyScopedReport.summary.cachedTransactions, secondPageTransactions.length)
 assert.equal(independentlyScopedReport.dates.length, secondPageDates.length)
-assert.equal(independentlyScopedReport.historicalBaseline.summary.cachedTransactions, 125)
+assert.equal(independentlyScopedReport.historicalBaseline.summary.cachedTransactions, 97)
 assert.equal(independentlyScopedReport.historicalBaseline.summary.exactDocumentPairs, 44)
-assert.equal(independentlyScopedReport.historicalBaseline.summary.unmatchedGroups, 37)
+assert.equal(independentlyScopedReport.historicalBaseline.summary.unmatchedGroups, 9)
 assert.equal(JSON.stringify(independentlyScopedReport).includes('rawSourcePayloadSecret'), false)
 
 const fallbackAndAmbiguousBaseline = pure.buildHistoricalPosAccountingBaseline([
@@ -640,7 +657,7 @@ const sqlCalls = []
 async function queryMock(source, parameters = []) {
   sqlCalls.push({ source, parameters })
   if (source.includes('count(*)::text AS total_dates FROM evidence_dates')) {
-    return { rows: [{ total_dates: String(historicalDates.length) }] }
+    return { rows: [{ total_dates: String(descendingHistoricalDates.length) }] }
   }
   if (source.includes('SELECT evidence_date::text AS business_date')) {
     const limit = Number(parameters[3])
@@ -658,8 +675,8 @@ async function queryMock(source, parameters = []) {
       last_catalog_synced_at: '2026-09-16T12:00:00.000Z',
       sync_status: 'succeeded',
       sync_completed_at: '2026-09-16T12:00:00.000Z',
-      sales_receipt_count: '63',
-      journal_entry_count: '62',
+      sales_receipt_count: '49',
+      journal_entry_count: '48',
     }] }
   }
   if (source.includes('LEFT JOIN toast_locations location')) return { rows: [] }
@@ -680,24 +697,24 @@ const postgresReport = await reader.readPosAccountingParityReportInPostgres({
   historyPageSize: 10,
 })
 assert.equal(postgresReport.summary.cachedTransactions, secondPageTransactions.length)
-assert.equal(postgresReport.pagination.totalDates, 81)
-assert.equal(postgresReport.pagination.totalPages, 9)
+assert.equal(postgresReport.pagination.totalDates, 53)
+assert.equal(postgresReport.pagination.totalPages, 6)
 assert.equal(postgresReport.pagination.dates.length, 10)
 assert.equal(postgresReport.pagination.dates[0], secondPageDates[0])
 assert.equal(postgresReport.pagination.dates.at(-1), secondPageDates.at(-1))
-assert.equal(postgresReport.cache.salesReceiptCount, 63)
-assert.equal(postgresReport.cache.journalEntryCount, 62)
+assert.equal(postgresReport.cache.salesReceiptCount, 49)
+assert.equal(postgresReport.cache.journalEntryCount, 48)
 assert.equal(postgresReport.unmatchedQuickBooks.length, secondPageTransactions.length)
-assert.equal(postgresReport.historicalBaseline.summary.cachedTransactions, 125)
+assert.equal(postgresReport.historicalBaseline.summary.cachedTransactions, 97)
 assert.equal(postgresReport.historicalBaseline.summary.exactDocumentPairs, 44)
-assert.equal(postgresReport.historicalBaseline.summary.unmatchedGroups, 37)
+assert.equal(postgresReport.historicalBaseline.summary.unmatchedGroups, 9)
 assert.equal(postgresReport.historicalBaseline.pairs.length, 10)
-assert.equal(postgresReport.historicalBaseline.unmatchedGroups.length, 10)
+assert.equal(postgresReport.historicalBaseline.unmatchedGroups.length, 0)
 assert.equal(postgresReport.historicalPagination.page, 2)
 assert.equal(postgresReport.historicalPagination.pageSize, 10)
 assert.equal(postgresReport.historicalPagination.totalPages, 5)
 assert.equal(postgresReport.historicalPagination.pairPages, 5)
-assert.equal(postgresReport.historicalPagination.unmatchedPages, 4)
+assert.equal(postgresReport.historicalPagination.unmatchedPages, 1)
 assert.equal(JSON.stringify(postgresReport).includes('source_payload'), false)
 assert.equal(JSON.stringify(postgresReport).includes('rawSourcePayloadSecret'), false)
 
@@ -707,8 +724,10 @@ for (const call of sqlCalls) {
   assert.doesNotMatch(call.source, /\b(INSERT|UPDATE|DELETE|MERGE|TRUNCATE)\b/i)
   assert.equal(call.parameters[0], ORGANIZATION_ID)
 }
-assert.equal(sqlCalls.filter((call) => call.source.includes("toast([^[:alnum:]]|$)")).length, 4)
-assert.equal(sqlCalls.filter((call) => call.source.includes("btrim(transaction.document_number), '') ~* 'pos$'")).length, 4)
+assert.equal(sqlCalls.some((call) => call.source.includes("from '^[[:space:]]*toast[[:space:]]+([0-9]{4}-[0-9]{2}-[0-9]{2})'")), true)
+assert.equal(sqlCalls.some((call) => call.source.includes("source_payload #>> '{CustomerMemo,value}'")), true)
+assert.equal(sqlCalls.some((call) => call.source.includes('toast_accounting_export_drafts linked_draft')), true)
+assert.equal(sqlCalls.some((call) => /document_number[\s\S]*pos\$/i.test(call.source)), false)
 assert.equal(sqlCalls.some((call) => call.source.includes('draft.is_current = true')), true)
 assert.equal(sqlCalls.some((call) => call.source.includes("IN ('SalesReceipt', 'JournalEntry')")), true)
 const fullHistoryQuery = sqlCalls.find((call) =>
@@ -722,6 +741,39 @@ assert.deepEqual([...fullHistoryQuery.parameters], [
 ])
 assert.doesNotMatch(fullHistoryQuery.source, /ANY\(\$2::date\[\]\)/)
 assert.doesNotMatch(fullHistoryQuery.source, /\bLIMIT\b/)
+
+const detailCalls = []
+const detailReader = loadTypeScriptModule('app_src/lib/persistence/posAccountingParity.ts', {
+  '@/lib/persistence/postgres': {
+    query: async (source, parameters = []) => {
+      detailCalls.push({ source, parameters })
+      return { rows: [{
+        ...receiptTransaction({
+          id: '1534',
+          date: '2026-07-18',
+          documentNumber: '260718POS',
+        }),
+        party_name: 'Toast clearing customer',
+        account_name: 'Clearing account',
+        pos_accounting_origin: 'shogo',
+      }] }
+    },
+  },
+})
+const detail = await detailReader.readPosAccountingParityEvidenceDetailInPostgres({
+  organizationId: ORGANIZATION_ID,
+  entityType: 'SalesReceipt',
+  providerTransactionId: '1534',
+})
+assert.equal(detail.evidence.providerTransactionId, '1534')
+assert.equal(detail.evidence.postingOrigin, 'shogo')
+assert.equal(detail.evidence.partyName, 'Toast clearing customer')
+assert.equal(detail.integrity.status, 'match')
+assert.equal(JSON.stringify(detail).includes('rawSourcePayloadSecret'), false)
+assert.equal(detailCalls.length, 1)
+assert.deepEqual([...detailCalls[0].parameters], [ORGANIZATION_ID, 'SalesReceipt', '1534'])
+assert.match(detailCalls[0].source, /toast_accounting_export_drafts linked_draft/)
+assert.doesNotMatch(detailCalls[0].source, /document_number[\s\S]*pos\$/i)
 
 await assert.rejects(
   () => reader.readPosAccountingParityReportInPostgres({ organizationId: 'not-an-organization' }),
@@ -739,18 +791,25 @@ await assert.rejects(
 const accountingRoute = read('app_src/app/api/accounting/quickbooks/route.ts')
 assert.match(accountingRoute, /viewValue === 'pos-parity'/)
 assert.match(accountingRoute, /readPosAccountingParityReportInPostgres/)
+assert.match(accountingRoute, /viewValue === 'pos-parity-evidence'/)
+assert.match(accountingRoute, /readPosAccountingParityEvidenceDetailInPostgres/)
 assert.match(accountingRoute, /activeAccountingOrganizationId\(actor\)/)
 assert.match(accountingRoute, /ACCOUNTING_PARITY_DATE_INVALID/)
+assert.match(accountingRoute, /ACCOUNTING_PARITY_TRANSACTION_ID_INVALID/)
+assert.match(accountingRoute, /ACCOUNTING_PARITY_TRANSACTION_TYPE_INVALID/)
 assert.doesNotMatch(accountingRoute, /viewValue === 'pos-parity'[\s\S]*?(INSERT|UPDATE|DELETE|MERGE|TRUNCATE)/i)
 
 const accountingSection = read('app_src/components/accounting/AccountingSection.tsx')
 const parityPanel = read('app_src/components/accounting/PosAccountingParityPanel.tsx')
 assert.match(accountingSection, /id: 'pos-parity', label: 'POS posting parity'/)
 assert.match(accountingSection, /<PosAccountingParityPanel \/>/)
-assert.match(parityPanel, /Historical Shogo baseline/)
+assert.match(parityPanel, /Toast posting history/)
 assert.match(parityPanel, /Current ClawPilot drafts/)
-assert.match(parityPanel, /Historical detail page/)
+assert.match(parityPanel, /Posting history detail page/)
 assert.match(parityPanel, /historyPageSize: '20'/)
 assert.match(parityPanel, /view: 'pos-parity'/)
+assert.match(parityPanel, /view: 'pos-parity-evidence'/)
+assert.match(parityPanel, /document numbers are shown for reference and never establish posting origin/)
+assert.match(parityPanel, /their totals are not compared to each other/)
 
 console.log('PASS POS accounting parity normalization, matching, comparison, historical corpus, and read-only Postgres contracts')

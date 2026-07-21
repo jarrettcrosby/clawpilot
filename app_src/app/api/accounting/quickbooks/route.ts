@@ -17,7 +17,11 @@ import {
 } from '@/lib/persistence/quickBooksExplorer'
 import { requireRequestUser } from '@/lib/requestUser'
 import { accountingCapabilities, activeAccountingOrganizationId } from '@/lib/accountingAuthorization'
-import { readPosAccountingParityReportInPostgres } from '@/lib/persistence/posAccountingParity'
+import {
+  readPosAccountingParityEvidenceDetailInPostgres,
+  readPosAccountingParityReportInPostgres,
+  type PosAccountingParityEntityType,
+} from '@/lib/persistence/posAccountingParity'
 
 export const dynamic = 'force-dynamic'
 export const revalidate = 0
@@ -123,6 +127,36 @@ export async function GET(req: NextRequest) {
           historyPageSize,
         }),
       })
+    }
+    if (viewValue === 'pos-parity-evidence') {
+      const transactionId = String(req.nextUrl.searchParams.get('id') || '').trim()
+      const entityType = String(req.nextUrl.searchParams.get('entityType') || '').trim()
+      if (!transactionId || transactionId.length > 200 || /[^\x20-\x7e]/.test(transactionId)) {
+        return json({
+          ok: false,
+          error: 'Parity transaction id is invalid',
+          code: 'ACCOUNTING_PARITY_TRANSACTION_ID_INVALID',
+        }, 400)
+      }
+      if (entityType !== 'SalesReceipt' && entityType !== 'JournalEntry') {
+        return json({
+          ok: false,
+          error: 'Parity transaction type is invalid',
+          code: 'ACCOUNTING_PARITY_TRANSACTION_TYPE_INVALID',
+        }, 400)
+      }
+      const detail = await readPosAccountingParityEvidenceDetailInPostgres({
+        organizationId: organization,
+        entityType: entityType as PosAccountingParityEntityType,
+        providerTransactionId: transactionId,
+      })
+      return detail
+        ? json({ ok: true, capabilities, view: 'pos-parity-evidence', detail })
+        : json({
+          ok: false,
+          error: 'Toast posting evidence was not found',
+          code: 'ACCOUNTING_PARITY_EVIDENCE_NOT_FOUND',
+        }, 404)
     }
     if (viewValue === 'invoice') {
       const invoiceId = String(req.nextUrl.searchParams.get('id') || '').trim()
