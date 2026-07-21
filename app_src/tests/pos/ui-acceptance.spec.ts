@@ -197,6 +197,27 @@ async function expectOneVisibleExactText(page: Page, value: string) {
 
 async function mockAccountingParity(page: Page) {
   await page.route((url) => url.pathname === '/api/accounting/quickbooks', (route) => {
+    if (route.request().url().includes('view=pos-parity-evidence')) {
+      return route.fulfill({
+        json: {
+          ok: true,
+          capabilities: { canView: true, canManage: true, canPrepare: true, canApprove: true },
+          view: 'pos-parity-evidence',
+          detail: {
+            evidence: {
+              evidenceId: 'SalesReceipt:1534', entityType: 'SalesReceipt', providerTransactionId: '1534',
+              businessDate: '2026-07-18', documentNumber: '260718POS', memo: 'Toast 2026-07-18',
+              postingOrigin: 'shogo', partyName: 'Toast clearing customer', accountName: 'Clearing account',
+              currencyCode: 'USD', syncedAt: '2026-07-21T20:30:56.605Z', subtotalCents: 55174,
+              subtotalSource: 'line_sum', totalCents: 59232, taxCents: 4058,
+              lineGroups: [{ itemId: 'item-breakfast', itemName: 'Breakfast Sandwich', amountCents: 8000, quantityMillis: 8000 }],
+              unidentifiedLineCount: 0, unsupportedLineCount: 0,
+            },
+            integrity: { status: 'match', subtotalCents: 55174, taxCents: 4058, totalCents: 59232, deltaCents: 0 },
+          },
+        },
+      })
+    }
     if (route.request().url().includes('view=pos-parity')) {
       return route.fulfill({
         json: {
@@ -206,16 +227,16 @@ async function mockAccountingParity(page: Page) {
           report: {
             historicalBaseline: {
               summary: {
-                cachedTransactions: 125,
-                pairCount: 45,
+                cachedTransactions: 97,
+                pairCount: 44,
                 exactDocumentPairs: 44,
-                dateFallbackPairs: 1,
-                unmatchedGroups: 29,
-                unmatchedEvidence: 29,
-                ambiguousGroups: 2,
-                ambiguousEvidence: 6,
+                dateFallbackPairs: 0,
+                unmatchedGroups: 9,
+                unmatchedEvidence: 9,
+                ambiguousGroups: 0,
+                ambiguousEvidence: 0,
                 receiptArithmetic: { match: 49, variance: 0, insufficientEvidence: 0 },
-                journalBalance: { match: 76, variance: 0, insufficientEvidence: 0 },
+                journalBalance: { match: 48, variance: 0, insufficientEvidence: 0 },
               },
               pairs: [{
                 basis: 'business_date_and_document',
@@ -223,10 +244,12 @@ async function mockAccountingParity(page: Page) {
                 salesReceipt: {
                   evidenceId: 'receipt-1534', entityType: 'SalesReceipt', providerTransactionId: '1534',
                   businessDate: '2026-07-18', documentNumber: '260718POS', memo: 'Toast 2026-07-18',
+                  postingOrigin: 'shogo',
                 },
                 journalEntry: {
                   evidenceId: 'journal-1531', entityType: 'JournalEntry', providerTransactionId: '1531',
                   businessDate: '2026-07-18', documentNumber: '260718POS', memo: 'Toast 2026-07-18',
+                  postingOrigin: 'shogo',
                 },
                 receiptArithmetic: { status: 'match', deltaCents: 0 },
                 journalBalance: { status: 'match', deltaCents: 0 },
@@ -236,35 +259,45 @@ async function mockAccountingParity(page: Page) {
                 evidence: [{
                   evidenceId: 'journal-unmatched', entityType: 'JournalEntry', providerTransactionId: '1490',
                   businessDate: '2026-06-22', documentNumber: '260622POS', memo: 'Toast 2026-06-22',
+                  postingOrigin: 'shogo',
                 }],
               }],
-              ambiguousGroups: [{
-                basis: 'business_date_only', businessDate: '2025-07-17', documentNumber: null,
-                salesReceipts: [{
-                  evidenceId: 'receipt-ambiguous', entityType: 'SalesReceipt', providerTransactionId: '1200',
-                  businessDate: '2025-07-17', documentNumber: null, memo: 'Toast',
-                }],
-                journalEntries: [{
-                  evidenceId: 'journal-ambiguous-a', entityType: 'JournalEntry', providerTransactionId: '1201',
-                  businessDate: '2025-07-17', documentNumber: null, memo: 'Toast',
-                }, {
-                  evidenceId: 'journal-ambiguous-b', entityType: 'JournalEntry', providerTransactionId: '1202',
-                  businessDate: '2025-07-17', documentNumber: null, memo: 'Toast',
-                }],
-              }],
+              ambiguousGroups: [],
             },
             rows: [{
               expected: {
                 expectedId: 'draft-receipt', entityType: 'SalesReceipt', businessDate: '2026-07-18',
-                documentNumber: '260718POS', memo: 'Toast 2026-07-18',
+                providerTransactionId: '1534', documentNumber: '260718POS', memo: 'POS 2026-07-18',
+                totalCents: 59232, taxCents: 4058,
+                lineGroups: [{ itemId: 'item-breakfast', itemName: 'Breakfast Sandwich', amountCents: 8000, quantityMillis: 8000 }],
+                lineEvidenceAvailable: true, unmappedLineCount: 0,
                 draft: {
                   id: 'draft-1', restaurantName: 'Acceptance Restaurant', locationName: 'Downtown',
-                  status: 'needs_review', revision: 3,
+                  status: 'needs_review', reconciliationStatus: 'ready', revision: 3, sourceRevision: 7,
+                  updatedAt: '2026-07-21T20:30:56.605Z',
                 },
               },
-              actual: null,
+              actual: {
+                evidenceId: 'SalesReceipt:1534', entityType: 'SalesReceipt', providerTransactionId: '1534',
+                businessDate: '2026-07-18', documentNumber: '260718POS', memo: 'POS 2026-07-18',
+                postingOrigin: 'clawpilot', partyName: 'Toast clearing customer', accountName: 'Clearing account',
+                currencyCode: 'USD', syncedAt: '2026-07-21T20:30:56.605Z', subtotalCents: 55174,
+                subtotalSource: 'line_sum', totalCents: 59232, taxCents: 4058,
+                lineGroups: [{ itemId: 'item-breakfast', itemName: 'Breakfast Sandwich', amountCents: 8000, quantityMillis: 8000 }],
+                unidentifiedLineCount: 0, unsupportedLineCount: 0,
+              },
               match: { status: 'matched', basis: 'document_number', candidateTransactionIds: [] },
-              comparison: { status: 'match' },
+              comparison: {
+                status: 'match',
+                total: { status: 'match', expectedCents: 59232, actualCents: 59232, deltaCents: 0 },
+                tax: { status: 'match', expectedCents: 4058, actualCents: 4058, deltaCents: 0 },
+                lines: [{
+                  itemId: 'item-breakfast', itemName: 'Breakfast Sandwich', expectedAmountCents: 8000,
+                  actualAmountCents: 8000, deltaAmountCents: 0, expectedQuantityMillis: 8000,
+                  actualQuantityMillis: 8000, deltaQuantityMillis: 0, status: 'match',
+                }],
+                coverageIncomplete: false,
+              },
             }],
             summary: {
               drafts: 1, expectedDocuments: 2, cachedTransactions: 2, matched: 2, ambiguous: 0,
@@ -278,7 +311,7 @@ async function mockAccountingParity(page: Page) {
             cache: {
               configured: true, connectionStatus: 'active', lastCatalogSyncedAt: '2026-07-21T20:30:56.605Z',
               syncStatus: 'succeeded', syncCompletedAt: '2026-07-21T20:30:56.605Z',
-              salesReceiptCount: 49, journalEntryCount: 76,
+              salesReceiptCount: 49, journalEntryCount: 48,
             },
             warnings: [],
           },
@@ -315,10 +348,15 @@ for (const viewport of [
     }
     await expect(page.getByTestId('app-shell')).toBeVisible()
     await page.getByRole('tab', { name: 'POS posting parity', exact: true }).click()
-    await expect(page.getByText('Historical Shogo baseline', { exact: true })).toBeVisible()
-    await expect(page.getByText('125', { exact: true })).toBeVisible()
-    await expect(page.getByText('Historical exceptions', { exact: true })).toBeVisible()
+    await expect(page.getByText('Toast posting history', { exact: true })).toBeVisible()
+    await expect(page.getByText('97', { exact: true })).toBeVisible()
+    await expect(page.getByText('Posting history exceptions', { exact: true })).toBeVisible()
     await expect(page.getByText('Current ClawPilot drafts', { exact: true })).toBeVisible()
+    await page.getByRole('button', { name: 'Open Sales receipt 260718POS' }).click()
+    await expect(page.getByText('QuickBooks evidence', { exact: true })).toBeVisible()
+    await expect(page.getByText('Breakfast Sandwich', { exact: true })).toBeVisible()
+    await expect(page.getByText('Receipt arithmetic delta $0.00', { exact: true })).toBeVisible()
+    await page.getByRole('button', { name: 'Close posting details' }).click()
     await expectNoDocumentOverflow(page)
   })
 }

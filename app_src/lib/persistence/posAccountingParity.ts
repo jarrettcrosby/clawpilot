@@ -1,6 +1,7 @@
 import { query } from '@/lib/persistence/postgres'
 
 export type PosAccountingParityEntityType = 'SalesReceipt' | 'JournalEntry'
+export type PosAccountingPostingOrigin = 'shogo' | 'clawpilot'
 export type PosAccountingParityMatchBasis =
   | 'provider_id'
   | 'document_and_memo'
@@ -79,6 +80,9 @@ interface NormalizedQuickBooksBase extends PosAccountingIdentity {
   evidenceId: string
   entityType: PosAccountingParityEntityType
   businessDate: string
+  postingOrigin: PosAccountingPostingOrigin | null
+  partyName: string | null
+  accountName: string | null
   currencyCode: string | null
   syncedAt: string | null
 }
@@ -178,6 +182,7 @@ interface PosAccountingHistoricalEvidenceReference {
   businessDate: string
   documentNumber: string | null
   memo: string | null
+  postingOrigin: PosAccountingPostingOrigin | null
 }
 
 export interface PosAccountingHistoricalBaseline {
@@ -269,6 +274,17 @@ export interface ReadPosAccountingParityInput {
   pageSize?: number
   historyPage?: number
   historyPageSize?: number
+}
+
+export interface ReadPosAccountingParityEvidenceInput {
+  organizationId: string
+  entityType: PosAccountingParityEntityType
+  providerTransactionId: string
+}
+
+export type PosAccountingParityEvidenceDetail = {
+  evidence: NormalizedQuickBooksPosAccountingEvidence
+  integrity: PosAccountingReceiptArithmeticCheck | PosAccountingJournalBalanceCheck
 }
 
 export interface PosAccountingParityPostgresReport extends PosAccountingParityReport {
@@ -470,28 +486,48 @@ function transactionPayload(row: UnknownRecord, type: PosAccountingParityEntityT
   return fromResponse && Object.keys(fromResponse).length > 0 ? fromResponse : root
 }
 
-export function isToastMarkedQuickBooksTransaction(input: unknown): boolean {
+function providerTransactionId(row: UnknownRecord, payload: UnknownRecord): string | null {
+  return firstText([
+    row.quickbooks_transaction_id,
+    row.providerTransactionId,
+    payload.Id,
+  ], 200)
+}
+
+function toastMarkerDate(value: unknown): string | null {
+  const candidate = text(value, 4000)
+  if (!candidate) return null
+  const match = /^\s*toast\s+(\d{4}-\d{2}-\d{2})(?:\s|$)/i.exec(candidate)
+  return match ? businessDate(match[1]) : null
+}
+
+export function classifyPosAccountingQuickBooksTransaction(
+  input: unknown,
+  linkedProviderIds: ReadonlySet<string> = new Set<string>(),
+): PosAccountingPostingOrigin | null {
   const row = asRecord(input)
   const type = entityType(row.entity_type ?? row.entityType)
-  if (!type) return false
+  if (!type) return null
   const payload = transactionPayload(row, type)
-  const memoMarked = [
+  const providerId = providerTransactionId(row, payload)
+  if (providerId && linkedProviderIds.has(providerId)) return 'clawpilot'
+
+  const trustedOrigin = text(row.pos_accounting_origin ?? row.posAccountingOrigin, 40)
+  if (trustedOrigin === 'clawpilot' || trustedOrigin === 'shogo') return trustedOrigin
+
+  const date = businessDate(row.transaction_date ?? row.businessDate ?? payload.TxnDate)
+  if (!date) return null
+  const markerDate = [
     row.memo,
     payload.PrivateNote,
     asRecord(payload.CustomerMemo).value,
     payload.Memo,
-  ].some((value) => {
-    const candidate = text(value, 4000)
-    return candidate ? /(^|[^a-z0-9])toast([^a-z0-9]|$)/i.test(candidate) : false
-  })
-  const documentNumber = firstText([
-    row.document_number,
-    row.documentNumber,
-    payload.DocNumber,
-  ], 200)
-  return Boolean(
-    memoMarked || (documentNumber && /pos$/i.test(documentNumber)),
-  )
+  ].map(toastMarkerDate).find(Boolean)
+  return markerDate === date ? 'shogo' : null
+}
+
+export function isToastMarkedQuickBooksTransaction(input: unknown): boolean {
+  return classifyPosAccountingQuickBooksTransaction(input) !== null
 }
 
 function collectTransactionLines(value: unknown, output: UnknownRecord[]) {
@@ -516,7 +552,10 @@ function sortJournalGroups(groups: Iterable<PosAccountingJournalLineGroup>) {
     left.side.localeCompare(right.side) || left.accountId.localeCompare(right.accountId))
 }
 
-export function normalizeSalesReceiptEvidence(input: unknown): NormalizedQuickBooksSalesReceipt | null {
+export function normalizeSalesReceiptEvidence(
+  input: unknown,
+  linkedProviderIds: ReadonlySet<string> = new Set<string>(),
+): NormalizedQuickBooksSalesReceipt | null {
   const row = asRecord(input)
   const payload = transactionPayload(row, 'SalesReceipt')
   const providerTransactionId = firstText([
@@ -575,6 +614,17 @@ export function normalizeSalesReceiptEvidence(input: unknown): NormalizedQuickBo
     entityType: 'SalesReceipt',
     providerTransactionId,
     businessDate: date,
+    postingOrigin: classifyPosAccountingQuickBooksTransaction(input, linkedProviderIds),
+    partyName: firstText([
+      row.party_name,
+      row.partyName,
+      asRecord(payload.CustomerRef).name,
+    ], 300),
+    accountName: firstText([
+      row.account_name,
+      row.accountName,
+      asRecord(payload.DepositToAccountRef).name,
+    ], 300),
     documentNumber: firstText([payload.DocNumber, row.document_number, row.documentNumber], 200),
     memo: firstText([
       payload.PrivateNote,
@@ -601,7 +651,10 @@ export function normalizeSalesReceiptEvidence(input: unknown): NormalizedQuickBo
   }
 }
 
-export function normalizeJournalEntryEvidence(input: unknown): NormalizedQuickBooksJournalEntry | null {
+export function normalizeJournalEntryEvidence(
+  input: unknown,
+  linkedProviderIds: ReadonlySet<string> = new Set<string>(),
+): NormalizedQuickBooksJournalEntry | null {
   const row = asRecord(input)
   const payload = transactionPayload(row, 'JournalEntry')
   const providerTransactionId = firstText([
@@ -650,6 +703,9 @@ export function normalizeJournalEntryEvidence(input: unknown): NormalizedQuickBo
     entityType: 'JournalEntry',
     providerTransactionId,
     businessDate: date,
+    postingOrigin: classifyPosAccountingQuickBooksTransaction(input, linkedProviderIds),
+    partyName: firstText([row.party_name, row.partyName], 300),
+    accountName: firstText([row.account_name, row.accountName], 300),
     documentNumber: firstText([payload.DocNumber, row.document_number, row.documentNumber], 200),
     memo: firstText([payload.PrivateNote, payload.Memo, row.memo], 1000),
     currencyCode: firstText([
@@ -672,13 +728,14 @@ export function normalizeJournalEntryEvidence(input: unknown): NormalizedQuickBo
 
 export function normalizeQuickBooksPosAccountingEvidence(
   input: unknown,
+  linkedProviderIds: ReadonlySet<string> = new Set<string>(),
 ): NormalizedQuickBooksPosAccountingEvidence | null {
   const row = asRecord(input)
   const type = entityType(row.entity_type ?? row.entityType)
   if (!type || !ENTITY_TYPES.has(type)) return null
   return type === 'SalesReceipt'
-    ? normalizeSalesReceiptEvidence(row)
-    : normalizeJournalEntryEvidence(row)
+    ? normalizeSalesReceiptEvidence(row, linkedProviderIds)
+    : normalizeJournalEntryEvidence(row, linkedProviderIds)
 }
 
 function normalizeExpectedReceiptLines(lines: UnknownRecord[]) {
@@ -1229,6 +1286,7 @@ function historicalEvidenceReference(
     businessDate: evidence.businessDate,
     documentNumber: evidence.documentNumber,
     memo: evidence.memo,
+    postingOrigin: evidence.postingOrigin,
   }
 }
 
@@ -1418,14 +1476,19 @@ export function buildPosAccountingParityReport(input: {
   const drafts = input.drafts
     .map(normalizePosAccountingDraftEvidence)
     .filter((item): item is NormalizedPosAccountingDraftEvidence => Boolean(item))
-  const toastTransactions = input.transactions.filter(isToastMarkedQuickBooksTransaction)
+  const linkedProviderIds = new Set(drafts.flatMap((draft) => draft.documents
+    .map((document) => document.providerTransactionId)
+    .filter((providerId): providerId is string => Boolean(providerId))))
+  const toastTransactions = input.transactions.filter(
+    (transaction) => classifyPosAccountingQuickBooksTransaction(transaction, linkedProviderIds) !== null,
+  )
   const transactions = toastTransactions
-    .map(normalizeQuickBooksPosAccountingEvidence)
+    .map((transaction) => normalizeQuickBooksPosAccountingEvidence(transaction, linkedProviderIds))
     .filter((item): item is NormalizedQuickBooksPosAccountingEvidence => Boolean(item))
   const fullHistoryInput = input.fullHistoryTransactions ?? input.transactions
   const fullHistoryTransactions = fullHistoryInput
-    .filter(isToastMarkedQuickBooksTransaction)
-    .map(normalizeQuickBooksPosAccountingEvidence)
+    .filter((transaction) => classifyPosAccountingQuickBooksTransaction(transaction, linkedProviderIds) !== null)
+    .map((transaction) => normalizeQuickBooksPosAccountingEvidence(transaction, linkedProviderIds))
     .filter((item): item is NormalizedQuickBooksPosAccountingEvidence => Boolean(item))
   const expected = drafts.flatMap((draft) => draft.documents)
   const matched = matchPosAccountingParityDocuments({ expected, actual: transactions })
@@ -1512,6 +1575,49 @@ function numberFromDatabase(value: unknown): number {
   return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : 0
 }
 
+const SHOGO_TRANSACTION_MARKER_SQL = `(
+  substring(lower(coalesce(transaction.memo, ''))
+    from '^[[:space:]]*toast[[:space:]]+([0-9]{4}-[0-9]{2}-[0-9]{2})')
+    = to_char(transaction.transaction_date, 'YYYY-MM-DD')
+  OR substring(lower(coalesce(transaction.source_payload ->> 'PrivateNote', ''))
+    from '^[[:space:]]*toast[[:space:]]+([0-9]{4}-[0-9]{2}-[0-9]{2})')
+    = to_char(transaction.transaction_date, 'YYYY-MM-DD')
+  OR substring(lower(coalesce(transaction.source_payload #>> '{CustomerMemo,value}', ''))
+    from '^[[:space:]]*toast[[:space:]]+([0-9]{4}-[0-9]{2}-[0-9]{2})')
+    = to_char(transaction.transaction_date, 'YYYY-MM-DD')
+  OR substring(lower(coalesce(transaction.source_payload ->> 'Memo', ''))
+    from '^[[:space:]]*toast[[:space:]]+([0-9]{4}-[0-9]{2}-[0-9]{2})')
+    = to_char(transaction.transaction_date, 'YYYY-MM-DD')
+)`
+
+const CLAWPILOT_DRAFT_LINK_SQL = `EXISTS (
+  SELECT 1
+  FROM toast_accounting_export_drafts linked_draft
+  WHERE linked_draft.organization_id = transaction.organization_id
+    AND transaction.quickbooks_transaction_id = ANY(ARRAY[
+      linked_draft.quickbooks_transaction_id,
+      linked_draft.source_summary #>> '{canonical,parity,documents,salesReceipt,providerTransactionId}',
+      linked_draft.source_summary #>> '{canonical,parity,documents,journalEntry,providerTransactionId}',
+      linked_draft.source_summary #>> '{canonical,documents,salesReceipt,providerTransactionId}',
+      linked_draft.source_summary #>> '{canonical,documents,journalEntry,providerTransactionId}',
+      linked_draft.quickbooks_payload #>> '{SalesReceipt,Id}',
+      linked_draft.quickbooks_payload #>> '{JournalEntry,Id}',
+      linked_draft.quickbooks_payload #>> '{salesReceipt,providerTransactionId}',
+      linked_draft.quickbooks_payload #>> '{journalEntry,providerTransactionId}'
+    ])
+)`
+
+const POS_ACCOUNTING_TRANSACTION_SQL = `(
+  ${SHOGO_TRANSACTION_MARKER_SQL}
+  OR ${CLAWPILOT_DRAFT_LINK_SQL}
+)`
+
+const POS_ACCOUNTING_ORIGIN_SQL = `CASE
+  WHEN ${CLAWPILOT_DRAFT_LINK_SQL} THEN 'clawpilot'
+  WHEN ${SHOGO_TRANSACTION_MARKER_SQL} THEN 'shogo'
+  ELSE NULL
+END`
+
 const EVIDENCE_DATES_CTE = `WITH evidence_dates AS (
   SELECT draft.business_date AS evidence_date
   FROM toast_accounting_export_drafts draft
@@ -1525,16 +1631,7 @@ const EVIDENCE_DATES_CTE = `WITH evidence_dates AS (
   WHERE transaction.organization_id = $1::uuid
     AND transaction.entity_type IN ('SalesReceipt', 'JournalEntry')
     AND transaction.transaction_date IS NOT NULL
-    AND (
-      coalesce(btrim(transaction.document_number), '') ~* 'pos$'
-      OR coalesce(transaction.memo, '') ~* '(^|[^[:alnum:]])toast([^[:alnum:]]|$)'
-      OR coalesce(transaction.source_payload ->> 'PrivateNote', '')
-        ~* '(^|[^[:alnum:]])toast([^[:alnum:]]|$)'
-      OR coalesce(transaction.source_payload #>> '{CustomerMemo,value}', '')
-        ~* '(^|[^[:alnum:]])toast([^[:alnum:]]|$)'
-      OR coalesce(transaction.source_payload ->> 'Memo', '')
-        ~* '(^|[^[:alnum:]])toast([^[:alnum:]]|$)'
-    )
+    AND ${POS_ACCOUNTING_TRANSACTION_SQL}
     AND ($2::date IS NULL OR transaction.transaction_date >= $2::date)
     AND ($3::date IS NULL OR transaction.transaction_date <= $3::date)
 )`
@@ -1603,31 +1700,13 @@ export async function readPosAccountingParityReportInPostgres(
            SELECT count(*)::text FROM quickbooks_transactions transaction
            WHERE transaction.organization_id = $1::uuid
              AND transaction.entity_type = 'SalesReceipt'
-             AND (
-               coalesce(btrim(transaction.document_number), '') ~* 'pos$'
-               OR coalesce(transaction.memo, '') ~* '(^|[^[:alnum:]])toast([^[:alnum:]]|$)'
-               OR coalesce(transaction.source_payload ->> 'PrivateNote', '')
-                 ~* '(^|[^[:alnum:]])toast([^[:alnum:]]|$)'
-               OR coalesce(transaction.source_payload #>> '{CustomerMemo,value}', '')
-                 ~* '(^|[^[:alnum:]])toast([^[:alnum:]]|$)'
-               OR coalesce(transaction.source_payload ->> 'Memo', '')
-                 ~* '(^|[^[:alnum:]])toast([^[:alnum:]]|$)'
-             )
+             AND ${POS_ACCOUNTING_TRANSACTION_SQL}
          ) AS sales_receipt_count,
          (
            SELECT count(*)::text FROM quickbooks_transactions transaction
            WHERE transaction.organization_id = $1::uuid
              AND transaction.entity_type = 'JournalEntry'
-             AND (
-               coalesce(btrim(transaction.document_number), '') ~* 'pos$'
-               OR coalesce(transaction.memo, '') ~* '(^|[^[:alnum:]])toast([^[:alnum:]]|$)'
-               OR coalesce(transaction.source_payload ->> 'PrivateNote', '')
-                 ~* '(^|[^[:alnum:]])toast([^[:alnum:]]|$)'
-               OR coalesce(transaction.source_payload #>> '{CustomerMemo,value}', '')
-                 ~* '(^|[^[:alnum:]])toast([^[:alnum:]]|$)'
-               OR coalesce(transaction.source_payload ->> 'Memo', '')
-                 ~* '(^|[^[:alnum:]])toast([^[:alnum:]]|$)'
-             )
+             AND ${POS_ACCOUNTING_TRANSACTION_SQL}
          ) AS journal_entry_count`,
       [organizationId],
     ),
@@ -1641,27 +1720,23 @@ export async function readPosAccountingParityReportInPostgres(
       memo: string | null
       source_payload: unknown
       synced_at: string
+      party_name: string | null
+      account_name: string | null
+      pos_accounting_origin: PosAccountingPostingOrigin
     }>(
       `SELECT transaction.entity_type, transaction.quickbooks_transaction_id,
          transaction.document_number, transaction.transaction_date::text,
          transaction.currency_code, transaction.total_amount::text,
-         transaction.memo, transaction.source_payload, transaction.synced_at::text
+         transaction.memo, transaction.source_payload, transaction.synced_at::text,
+         transaction.party_name, transaction.account_name,
+         ${POS_ACCOUNTING_ORIGIN_SQL} AS pos_accounting_origin
        FROM quickbooks_transactions transaction
        WHERE transaction.organization_id = $1::uuid
          AND transaction.entity_type IN ('SalesReceipt', 'JournalEntry')
          AND transaction.transaction_date IS NOT NULL
          AND ($2::date IS NULL OR transaction.transaction_date >= $2::date)
          AND ($3::date IS NULL OR transaction.transaction_date <= $3::date)
-         AND (
-           coalesce(btrim(transaction.document_number), '') ~* 'pos$'
-           OR coalesce(transaction.memo, '') ~* '(^|[^[:alnum:]])toast([^[:alnum:]]|$)'
-           OR coalesce(transaction.source_payload ->> 'PrivateNote', '')
-             ~* '(^|[^[:alnum:]])toast([^[:alnum:]]|$)'
-           OR coalesce(transaction.source_payload #>> '{CustomerMemo,value}', '')
-             ~* '(^|[^[:alnum:]])toast([^[:alnum:]]|$)'
-           OR coalesce(transaction.source_payload ->> 'Memo', '')
-             ~* '(^|[^[:alnum:]])toast([^[:alnum:]]|$)'
-         )
+         AND ${POS_ACCOUNTING_TRANSACTION_SQL}
        ORDER BY transaction.transaction_date DESC, transaction.entity_type,
          transaction.quickbooks_transaction_id`,
       baseValues,
@@ -1761,9 +1836,7 @@ export async function readPosAccountingParityReportInPostgres(
     salesReceiptCount: numberFromDatabase(cacheRow?.sales_receipt_count),
     journalEntryCount: numberFromDatabase(cacheRow?.journal_entry_count),
   }
-  const warnings = [
-    'The historical baseline uses every SalesReceipt or JournalEntry in the requested date range marked by a Toast memo or POS document suffix; draft comparisons use only the selected date page.',
-  ]
+  const warnings: string[] = []
   if (!cache.configured) warnings.push('QuickBooks is not configured for this organization.')
   else if (cache.connectionStatus !== 'active') warnings.push('The QuickBooks connection is not active.')
   if (cache.syncStatus !== 'succeeded') {
@@ -1785,5 +1858,54 @@ export async function readPosAccountingParityReportInPostgres(
     historicalPagination,
     cache,
     warnings,
+  }
+}
+
+export async function readPosAccountingParityEvidenceDetailInPostgres(
+  input: ReadPosAccountingParityEvidenceInput,
+): Promise<PosAccountingParityEvidenceDetail | null> {
+  const organizationId = requiredOrganizationId(input.organizationId)
+  const type = entityType(input.entityType)
+  if (!type) throw new Error('A valid parity entityType is required')
+  const transactionId = text(input.providerTransactionId, 200)
+  if (!transactionId || /[^\x20-\x7e]/.test(transactionId)) {
+    throw new Error('A valid providerTransactionId is required')
+  }
+  const result = await query<{
+    entity_type: string
+    quickbooks_transaction_id: string
+    document_number: string | null
+    transaction_date: string
+    currency_code: string | null
+    total_amount: string
+    memo: string | null
+    source_payload: unknown
+    synced_at: string
+    party_name: string | null
+    account_name: string | null
+    pos_accounting_origin: PosAccountingPostingOrigin
+  }>(
+    `SELECT transaction.entity_type, transaction.quickbooks_transaction_id,
+       transaction.document_number, transaction.transaction_date::text,
+       transaction.currency_code, transaction.total_amount::text,
+       transaction.memo, transaction.source_payload, transaction.synced_at::text,
+       transaction.party_name, transaction.account_name,
+       ${POS_ACCOUNTING_ORIGIN_SQL} AS pos_accounting_origin
+     FROM quickbooks_transactions transaction
+     WHERE transaction.organization_id = $1::uuid
+       AND transaction.entity_type = $2
+       AND transaction.quickbooks_transaction_id = $3
+       AND transaction.transaction_date IS NOT NULL
+       AND ${POS_ACCOUNTING_TRANSACTION_SQL}
+     LIMIT 1`,
+    [organizationId, type, transactionId],
+  )
+  const evidence = normalizeQuickBooksPosAccountingEvidence(result.rows[0])
+  if (!evidence) return null
+  return {
+    evidence,
+    integrity: evidence.entityType === 'SalesReceipt'
+      ? compareSalesReceiptInternalArithmetic(evidence)
+      : compareJournalEntryBalance(evidence),
   }
 }
