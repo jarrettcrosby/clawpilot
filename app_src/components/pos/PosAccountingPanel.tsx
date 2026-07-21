@@ -174,21 +174,21 @@ function mappingPayload(mapping: MappingDraft) {
 function mappingFromSource(source: DataRecord, current: DataRecord | undefined): MappingDraft {
   const sourceKind = text(source.sourceKind)
   const suggestedTarget = record(source.suggestedTarget)
+  const hasCurrent = Boolean(current)
   const currentIsUsable = Boolean(
     current
       && current.active !== false
       && ['valid', 'unvalidated'].includes(text(current.validationStatus, 'unvalidated')),
   )
-  const hasCurrent = currentIsUsable
   const suggested = !hasCurrent && Boolean(suggestedTarget.id)
   return {
     sourceKind,
     sourceId: text(source.sourceId),
     sourceName: text(source.sourceName, 'POS source'),
-    targetType: targetTypeFor(sourceKind, currentIsUsable ? text(current?.targetType) : ''),
-    targetId: text((currentIsUsable ? current?.targetId : '') || suggestedTarget.id),
-    targetName: text((currentIsUsable ? current?.targetName : '') || suggestedTarget.name),
-    active: currentIsUsable || suggested,
+    targetType: targetTypeFor(sourceKind, text(current?.targetType)),
+    targetId: text(current?.targetId || suggestedTarget.id),
+    targetName: text(current?.targetName || suggestedTarget.name),
+    active: hasCurrent ? currentIsUsable : suggested,
     suggested,
     suggestionConfidence: suggested ? text(suggestedTarget.confidence, 'normalized') : '',
   }

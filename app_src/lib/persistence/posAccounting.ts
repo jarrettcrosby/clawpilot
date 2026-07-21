@@ -1281,17 +1281,17 @@ function effectiveMappings(rows: MappingRow[]) {
   return { defaults, overrides, effective: [...merged.values()] }
 }
 
-export function invalidateQuickBooksCategoryTargets(
+export function invalidateUnavailableQuickBooksItemTargets(
   mappings: PosAccountingMapping[],
-  categoryItemIds: Iterable<string>,
+  activeProductItemIds: Iterable<string>,
 ) {
-  const categoryIds = new Set(categoryItemIds)
+  const productItemIds = new Set(activeProductItemIds)
   return mappings.map((mapping) => (
-    mapping.targetType === 'item' && categoryIds.has(mapping.targetId)
+    mapping.targetType === 'item' && !productItemIds.has(mapping.targetId)
       ? {
           ...mapping,
           validationStatus: 'missing_target' as const,
-          validationReason: 'QuickBooks categories organize products and cannot be used as POS transaction items.',
+          validationReason: 'The target must be an active QuickBooks product or service; categories cannot be used as POS transaction items.',
         }
       : mapping
   ))
@@ -1311,6 +1311,7 @@ export async function readPosAccountingWorkspaceFromPostgres(input: {
     previewResult,
     accountResult,
     itemResult,
+    activeProductItemResult,
     menuItemResult,
     customerResult,
     vendorResult,
@@ -1376,6 +1377,13 @@ export async function readPosAccountingWorkspaceFromPostgres(input: {
        WHERE organization_id = $1::uuid AND active = true
       ORDER BY fully_qualified_name, quickbooks_item_id
        LIMIT 5000`,
+      [input.organizationId],
+    ),
+    query<{ id: string }>(
+      `SELECT quickbooks_item_id AS id
+       FROM quickbooks_items
+       WHERE organization_id = $1::uuid AND active = true
+         AND lower(COALESCE(item_type, '')) <> 'category'`,
       [input.organizationId],
     ),
     query<{
@@ -1470,13 +1478,11 @@ export async function readPosAccountingWorkspaceFromPostgres(input: {
     : null
   const profile = locationOverride || organizationDefault
   const rawMappingScopes = effectiveMappings(mappingResult.rows)
-  const categoryItemIds = itemResult.rows
-    .filter((item) => item.item_type.trim().toLocaleLowerCase('en-US') === 'category')
-    .map((item) => item.quickbooks_item_id)
+  const activeProductItemIds = activeProductItemResult.rows.map((item) => item.id)
   const scopedMappings = {
-    defaults: invalidateQuickBooksCategoryTargets(rawMappingScopes.defaults, categoryItemIds),
-    overrides: invalidateQuickBooksCategoryTargets(rawMappingScopes.overrides, categoryItemIds),
-    effective: invalidateQuickBooksCategoryTargets(rawMappingScopes.effective, categoryItemIds),
+    defaults: invalidateUnavailableQuickBooksItemTargets(rawMappingScopes.defaults, activeProductItemIds),
+    overrides: invalidateUnavailableQuickBooksItemTargets(rawMappingScopes.overrides, activeProductItemIds),
+    effective: invalidateUnavailableQuickBooksItemTargets(rawMappingScopes.effective, activeProductItemIds),
   }
   const mappings = scopedMappings.effective
   const sourceCatalog = mergeStableToastMenuCatalog(
