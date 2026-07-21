@@ -17,6 +17,7 @@ import {
 } from '@/lib/persistence/quickBooksExplorer'
 import { requireRequestUser } from '@/lib/requestUser'
 import { accountingCapabilities, activeAccountingOrganizationId } from '@/lib/accountingAuthorization'
+import { readPosAccountingParityReportInPostgres } from '@/lib/persistence/posAccountingParity'
 
 export const dynamic = 'force-dynamic'
 export const revalidate = 0
@@ -34,6 +35,16 @@ function json(payload: Record<string, unknown>, status = 200) {
 function numberParam(value: string | null, fallback: number) {
   const parsed = Number(value)
   return Number.isFinite(parsed) ? parsed : fallback
+}
+
+function businessDateParam(value: string | null) {
+  const candidate = String(value || '').trim()
+  if (!candidate) return null
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(candidate)) return undefined
+  const parsed = new Date(`${candidate}T00:00:00.000Z`)
+  return Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === candidate
+    ? candidate
+    : undefined
 }
 
 export async function GET(req: NextRequest) {
@@ -74,6 +85,42 @@ export async function GET(req: NextRequest) {
           organizationId: organization,
           reportKey,
           periodKey,
+        }),
+      })
+    }
+    if (viewValue === 'pos-parity') {
+      const fromBusinessDate = businessDateParam(req.nextUrl.searchParams.get('from'))
+      const toBusinessDate = businessDateParam(req.nextUrl.searchParams.get('to'))
+      if (fromBusinessDate === undefined || toBusinessDate === undefined) {
+        return json({
+          ok: false,
+          error: 'Parity dates must use valid YYYY-MM-DD values',
+          code: 'ACCOUNTING_PARITY_DATE_INVALID',
+        }, 400)
+      }
+      if (fromBusinessDate && toBusinessDate && fromBusinessDate > toBusinessDate) {
+        return json({
+          ok: false,
+          error: 'The parity start date must be on or before the end date',
+          code: 'ACCOUNTING_PARITY_DATE_RANGE_INVALID',
+        }, 400)
+      }
+      const page = Math.max(1, Math.min(100000, Math.floor(numberParam(req.nextUrl.searchParams.get('page'), 1))))
+      const pageSize = Math.max(10, Math.min(366, Math.floor(numberParam(req.nextUrl.searchParams.get('pageSize'), 90))))
+      const historyPage = Math.max(1, Math.min(100000, Math.floor(numberParam(req.nextUrl.searchParams.get('historyPage'), 1))))
+      const historyPageSize = Math.max(10, Math.min(100, Math.floor(numberParam(req.nextUrl.searchParams.get('historyPageSize'), 20))))
+      return json({
+        ok: true,
+        capabilities,
+        view: 'pos-parity',
+        report: await readPosAccountingParityReportInPostgres({
+          organizationId: organization,
+          fromBusinessDate,
+          toBusinessDate,
+          page,
+          pageSize,
+          historyPage,
+          historyPageSize,
         }),
       })
     }

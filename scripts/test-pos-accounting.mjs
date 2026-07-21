@@ -586,7 +586,9 @@ assert.equal(preview.salesReceipt.subtotal, 551.74)
 assert.equal(preview.salesReceipt.tax, 40.58)
 assert.equal(preview.salesReceipt.tender, 592.32)
 assert.equal(preview.salesReceipt.tips, 65.42)
-assert.equal(preview.salesReceipt.total, 657.74)
+assert.equal(preview.salesReceipt.total, 592.32)
+assert.equal(preview.salesReceipt.total, preview.salesReceipt.tender)
+assert.equal(Math.round((preview.salesReceipt.total + preview.salesReceipt.tips) * 100) / 100, 657.74)
 assert.equal(preview.journal.calculatedNetCardSettlement, 629.53)
 assert.equal(preview.journal.processingFees, 28.21)
 assert.equal(preview.journal.feeEvidenceComplete, true)
@@ -604,6 +606,88 @@ assert.equal(preview.postingSideEffect, false)
 assert.equal(preview.readiness.hold, true)
 assert.equal(preview.readiness.readyForReview, false)
 assert.equal(preview.readiness.mappingsComplete, false)
+
+const discountRefundPreview = accounting.buildPosAccountingPreview({
+  businessDate: '2026-07-18',
+  restaurantName: 'Suburbia Sandwich Co',
+  standardOnly: true,
+  profile,
+  mappings: [],
+  orders: [{
+    ...july18Order,
+    gross_sales: 120,
+    net_sales: 90,
+    discounts: 10,
+    tax: 6,
+    tips: 6,
+    refunds: 20,
+    tendered: 96,
+    total: 102,
+    card_tender: 96,
+    details: { checks: [] },
+  }],
+})
+assert.equal(discountRefundPreview.salesReceipt.subtotal, 90)
+assert.equal(discountRefundPreview.salesReceipt.discounts, 10)
+assert.equal(discountRefundPreview.salesReceipt.tax, 6)
+assert.equal(discountRefundPreview.salesReceipt.tender, 96)
+assert.equal(discountRefundPreview.salesReceipt.tips, 6)
+assert.equal(discountRefundPreview.salesReceipt.total, 96, 'net sales must not have discounts or refunds subtracted twice')
+assert.equal(discountRefundPreview.journal.debits, 102)
+assert.equal(discountRefundPreview.journal.credits, 102)
+assert.equal(discountRefundPreview.journal.balanced, true)
+assert.equal(discountRefundPreview.postingSideEffect, false)
+
+const netDiscountOrder = structuredClone(july18Order)
+netDiscountOrder.gross_sales = 559
+netDiscountOrder.discounts = 7.26
+netDiscountOrder.details.checks[0].selections[0].gross = 559
+netDiscountOrder.details.checks[0].selections[0].discounts = [{
+  providerGuid: '33333333-3333-4333-8333-333333333333',
+  name: 'Open % Item',
+  amount: 5.76,
+}, {
+  providerGuid: '44444444-4444-4444-8444-444444444444',
+  name: 'Open $ Item',
+  amount: 1.5,
+}]
+const unmappedNetDiscountPreview = accounting.buildPosAccountingPreview({
+  businessDate: '2026-07-18',
+  restaurantName: 'Suburbia Sandwich Co',
+  standardOnly: true,
+  profile,
+  mappings: [],
+  orders: [netDiscountOrder],
+})
+assert.equal(unmappedNetDiscountPreview.salesReceipt.discounts, 7.26)
+assert.equal(unmappedNetDiscountPreview.salesReceipt.itemizedTotal, 551.74)
+assert.equal(unmappedNetDiscountPreview.salesReceipt.unallocatedSubtotal, 0)
+assert.equal(
+  unmappedNetDiscountPreview.readiness.missingMappings.some((entry) => entry.sourceKind === 'discount'),
+  false,
+  'discounts already netted into item lines must not require a separate QuickBooks target',
+)
+const netDiscountPreview = accounting.buildPosAccountingPreview({
+  businessDate: '2026-07-18',
+  restaurantName: 'Suburbia Sandwich Co',
+  standardOnly: true,
+  profile,
+  mappings: unmappedNetDiscountPreview.readiness.missingMappings.map((entry, index) => ({
+    ...entry,
+    targetId: `net-discount-target-${index}`,
+    targetName: `Net discount target ${index}`,
+    active: true,
+    validationStatus: 'valid',
+  })),
+  orders: [netDiscountOrder],
+})
+assert.equal(netDiscountPreview.readiness.mappingsComplete, true)
+assert.equal(netDiscountPreview.readiness.allocationComplete, true)
+assert.deepEqual(Array.from(netDiscountPreview.readiness.missingMappings), [])
+assert.equal(netDiscountPreview.salesReceipt.total, 592.32)
+assert.equal(netDiscountPreview.journal.debits, 657.74)
+assert.equal(netDiscountPreview.journal.credits, 657.74)
+assert.equal(netDiscountPreview.postingSideEffect, false)
 
 const legacyReadyPreview = accounting.buildPosAccountingPreview({
   businessDate: '2026-07-18',
