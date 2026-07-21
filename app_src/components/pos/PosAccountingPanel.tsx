@@ -222,6 +222,7 @@ export default function PosAccountingPanel({ location, businessDate, hasAccounti
   const [preparingProduct, setPreparingProduct] = useState(false)
   const [productDraft, setProductDraft] = useState<ProductDraft | null>(null)
   const [preparedProductDraft, setPreparedProductDraft] = useState<PreparedProductDraft | null>(null)
+  const [preparedProductDraftDialogOpen, setPreparedProductDraftDialogOpen] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
   const [reload, setReload] = useState(0)
@@ -364,6 +365,7 @@ export default function PosAccountingPanel({ location, businessDate, hasAccounti
       taxable: suggestion.taxable !== false,
     })
     setPreparedProductDraft(null)
+    setPreparedProductDraftDialogOpen(false)
     setError(null)
   }
 
@@ -372,6 +374,7 @@ export default function PosAccountingPanel({ location, businessDate, hasAccounti
   }
 
   function reviewPreparedProductDraft(prepared: PreparedProductDraft) {
+    setPreparedProductDraftDialogOpen(false)
     const oldURL = window.location.href
     const nextURL = buildAccountingDraftReviewUrl(oldURL, prepared.id)
     window.history.pushState({}, '', `${nextURL.pathname}${nextURL.search}${nextURL.hash}`)
@@ -411,6 +414,7 @@ export default function PosAccountingPanel({ location, businessDate, hasAccounti
       const prepared = { id: requestId, name: productDraft.name }
       setProductDraft(null)
       setPreparedProductDraft(prepared)
+      setPreparedProductDraftDialogOpen(true)
       setNotice('QuickBooks product draft prepared. Review and approve it before the product is created.')
     } catch (saveError) {
       setError((saveError as Error).message)
@@ -537,8 +541,8 @@ export default function PosAccountingPanel({ location, businessDate, hasAccounti
       ) : null}
 
       <Dialog
-        open={Boolean(preparedProductDraft)}
-        onClose={() => setPreparedProductDraft(null)}
+        open={Boolean(preparedProductDraft) && preparedProductDraftDialogOpen}
+        onClose={() => setPreparedProductDraftDialogOpen(false)}
         fullWidth
         maxWidth="xs"
         PaperProps={{ sx: { borderRadius: '8px' } }}
@@ -556,7 +560,7 @@ export default function PosAccountingPanel({ location, businessDate, hasAccounti
           </Stack>
         </DialogContent>
         <DialogActions>
-          <Button onClick={() => setPreparedProductDraft(null)}>Later</Button>
+          <Button onClick={() => setPreparedProductDraftDialogOpen(false)}>Later</Button>
           <Button
             variant="contained"
             onClick={() => {
