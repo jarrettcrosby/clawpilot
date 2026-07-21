@@ -60,6 +60,12 @@ POS is a first-class authenticated module in the desktop navigation and mobile M
 - Owners receive access by role. Administrators can grant `viewAccounting` to selected members. Managing Toast credentials and selected locations remains limited to organization owners and access administrators.
 - The protected demo workspace contains rolling synthetic POS data and no provider credential, provider identifier, customer identity, or live restaurant data.
 
+### In-App Guide
+
+The POS toolbar includes **How POS works**. The guide opens automatically the first time a browser visits POS for each active organization, then remains available from the help icon. It adapts its source-status labels to the current workspace and clearly identifies a protected demo account versus a live business.
+
+The guide explains the Toast-to-ClawPilot data path, date and location scope, Orders drill-down, operational Reports, QuickBooks mapping and accounting-review workflow, manager-enabled CRM catalog synchronization, and the current posting boundary. Its section actions open the corresponding POS view. Demo users see the same workflow against rolling synthetic, read-only data without any provider credential.
+
 ## Operational Reports
 
 The POS workspace replaces the useful reporting surfaces of the operator's previous Toast-to-accounting tool without reproducing its desktop tables on a phone. Reports are calculated server-side from organization-scoped projections and rendered as mobile-first summaries with drill-down detail.
