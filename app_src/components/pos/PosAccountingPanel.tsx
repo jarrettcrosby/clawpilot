@@ -28,6 +28,7 @@ import Inventory2Rounded from '@mui/icons-material/Inventory2Rounded'
 import RefreshRounded from '@mui/icons-material/RefreshRounded'
 import SaveRounded from '@mui/icons-material/SaveRounded'
 import SearchRounded from '@mui/icons-material/SearchRounded'
+import { buildAccountingDraftReviewUrl } from '@/lib/accountingDraftNavigation'
 
 type DataRecord = Record<string, unknown>
 type MoneyFormatter = (amount: number, compact?: boolean) => string
@@ -76,6 +77,11 @@ type ProductDraft = {
   expenseAccountId: string
   parentCategoryId: string
   taxable: boolean
+}
+
+type PreparedProductDraft = {
+  id: string
+  name: string
 }
 
 const panelSx = {
@@ -215,7 +221,7 @@ export default function PosAccountingPanel({ location, businessDate, hasAccounti
   const [refreshingQuickBooks, setRefreshingQuickBooks] = useState(false)
   const [preparingProduct, setPreparingProduct] = useState(false)
   const [productDraft, setProductDraft] = useState<ProductDraft | null>(null)
-  const [productDraftPrepared, setProductDraftPrepared] = useState(false)
+  const [preparedProductDraft, setPreparedProductDraft] = useState<PreparedProductDraft | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
   const [reload, setReload] = useState(0)
@@ -357,12 +363,19 @@ export default function PosAccountingPanel({ location, businessDate, hasAccounti
       parentCategoryId: '',
       taxable: suggestion.taxable !== false,
     })
-    setProductDraftPrepared(false)
+    setPreparedProductDraft(null)
     setError(null)
   }
 
   function updateProductDraft(patch: Partial<ProductDraft>) {
     setProductDraft((current) => current ? { ...current, ...patch } : current)
+  }
+
+  function reviewPreparedProductDraft(prepared: PreparedProductDraft) {
+    const oldURL = window.location.href
+    const nextURL = buildAccountingDraftReviewUrl(oldURL, prepared.id)
+    window.history.pushState({}, '', `${nextURL.pathname}${nextURL.search}${nextURL.hash}`)
+    window.dispatchEvent(new HashChangeEvent('hashchange', { oldURL, newURL: nextURL.toString() }))
   }
 
   async function prepareQuickBooksProduct() {
@@ -393,8 +406,11 @@ export default function PosAccountingPanel({ location, businessDate, hasAccounti
       })
       const payload = await response.json().catch(() => ({})) as DataRecord
       if (!response.ok || payload.ok !== true) throw new Error(text(payload.error, 'QuickBooks product draft could not be prepared'))
+      const requestId = text(record(payload.request).id)
+      if (!requestId) throw new Error('QuickBooks product draft was prepared without a review reference')
+      const prepared = { id: requestId, name: productDraft.name }
       setProductDraft(null)
-      setProductDraftPrepared(true)
+      setPreparedProductDraft(prepared)
       setNotice('QuickBooks product draft prepared. Review and approve it before the product is created.')
     } catch (saveError) {
       setError((saveError as Error).message)
@@ -513,12 +529,44 @@ export default function PosAccountingPanel({ location, businessDate, hasAccounti
         <Alert
           severity="success"
           onClose={() => setNotice(null)}
-          action={productDraftPrepared ? <Button color="inherit" size="small" onClick={() => { window.location.hash = 'accounting' }}>Review draft</Button> : undefined}
+          action={preparedProductDraft ? <Button color="inherit" size="small" onClick={() => reviewPreparedProductDraft(preparedProductDraft)}>Review draft</Button> : undefined}
           sx={{ borderRadius: '8px' }}
         >
           {notice}
         </Alert>
       ) : null}
+
+      <Dialog
+        open={Boolean(preparedProductDraft)}
+        onClose={() => setPreparedProductDraft(null)}
+        fullWidth
+        maxWidth="xs"
+        PaperProps={{ sx: { borderRadius: '8px' } }}
+      >
+        <DialogTitle>Product draft prepared</DialogTitle>
+        <DialogContent>
+          <Stack spacing={1.5} pt={0.5}>
+            <Box display="flex" alignItems="center" gap={1}>
+              <CheckCircleRounded color="success" />
+              <Typography fontWeight={700}>{preparedProductDraft?.name}</Typography>
+            </Box>
+            <Alert severity="info" variant="outlined">
+              QuickBooks has not been changed yet. Review and submit this draft from Accounting Actions, then approve it before posting.
+            </Alert>
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setPreparedProductDraft(null)}>Later</Button>
+          <Button
+            variant="contained"
+            onClick={() => {
+              if (preparedProductDraft) reviewPreparedProductDraft(preparedProductDraft)
+            }}
+          >
+            Review draft
+          </Button>
+        </DialogActions>
+      </Dialog>
 
       <Box sx={{ ...panelSx, p: { xs: 1.5, sm: 2 } }}>
         <Box display="flex" flexDirection={{ xs: 'column', sm: 'row' }} justifyContent="space-between" alignItems={{ xs: 'stretch', sm: 'flex-start' }} gap={1.5}>

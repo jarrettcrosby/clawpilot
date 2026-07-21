@@ -32,6 +32,7 @@ import OpenInNewRounded from '@mui/icons-material/OpenInNewRounded'
 import RefreshRounded from '@mui/icons-material/RefreshRounded'
 import SearchRounded from '@mui/icons-material/SearchRounded'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
+import { accountingExplorerViewParameter, consumeAccountingDraftTarget } from '@/lib/accountingDraftNavigation'
 import { formatUserDateTime } from '@/lib/userDateTime'
 import QuickBooksActionsPanel from './QuickBooksActionsPanel'
 
@@ -691,6 +692,7 @@ function InvoiceDocument({ detail, money, dateOnly }: {
 export default function AccountingSection() {
   const dateTimeSettings = useUserDateTime()
   const [view, setView] = useState<View>('overview')
+  const [initialActionRequestId, setInitialActionRequestId] = useState<string | null>(null)
   const [range, setRange] = useState<Range>('ytd')
   const [overview, setOverview] = useState<Overview | null>(null)
   const [capabilities, setCapabilities] = useState<Capabilities | null>(null)
@@ -728,22 +730,18 @@ export default function AccountingSection() {
   }, [searchInput])
 
   useEffect(() => {
-    if (view === 'actions') {
-      setLoading(false)
-      setError(null)
-      return
-    }
     const controller = new AbortController()
     setLoading(true)
     setError(null)
     const params = new URLSearchParams({ range })
+    const explorerView = accountingExplorerViewParameter(view)
     if (view === 'reports') {
       params.set('view', 'reports')
       params.set('report', reportKey)
       params.set('period', effectiveReportPeriod)
       setFinancialReport(null)
-    } else if (view !== 'overview') {
-      params.set('view', view)
+    } else if (explorerView) {
+      params.set('view', explorerView)
       params.set('page', String(page))
       params.set('pageSize', '25')
       if (search) params.set('search', search)
@@ -953,6 +951,18 @@ export default function AccountingSection() {
     selected && ['invoices', 'receipts', 'transactions'].includes(selected.view),
   )
 
+  useEffect(() => {
+    const target = consumeAccountingDraftTarget(window.location.href)
+    const targetView = target.view
+    const targetRequest = target.requestId
+    if (targetView && VIEWS.some((candidate) => candidate.id === targetView)) setView(targetView as View)
+    if (targetRequest) {
+      setInitialActionRequestId(targetRequest)
+      setView('actions')
+    }
+    if (target.hasTarget) window.history.replaceState({}, '', target.cleanUrl)
+  }, [])
+
   return (
     <Box height="100%" display="flex" flexDirection="column" minWidth={0} bgcolor="#0F0F13">
       <Box sx={{ px: { xs: 2, md: 3 }, pt: { xs: 2, md: 2.5 }, pb: 1.5, flexShrink: 0 }}>
@@ -1015,7 +1025,10 @@ export default function AccountingSection() {
           ) : null}
 
           {view === 'actions' ? (
-            <QuickBooksActionsPanel />
+            <QuickBooksActionsPanel
+              initialRequestId={initialActionRequestId}
+              onInitialRequestHandled={() => setInitialActionRequestId(null)}
+            />
           ) : view === 'overview' ? (
             loading && !overview ? (
               <Box display="grid" sx={{ placeItems: 'center' }} minHeight={300}><CircularProgress /></Box>

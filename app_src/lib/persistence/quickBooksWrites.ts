@@ -160,11 +160,12 @@ export async function readQuickBooksWriteWorkspaceInPostgres(input: {
   organizationId: string
   page?: number
   pageSize?: number
+  requestId?: string | null
 }) {
   const pageSize = Math.max(1, Math.min(Number(input.pageSize || 50), 100))
   const page = Math.max(1, Number(input.page || 1))
   const offset = (page - 1) * pageSize
-  const [connection, count, requests, customers, items, accounts] = await Promise.all([
+  const [connection, count, requests, targetRequest, customers, items, accounts] = await Promise.all([
     query<{
       write_mode: 'disabled' | 'sandbox' | 'production'
       write_verified_at: string | null
@@ -197,6 +198,16 @@ export async function readQuickBooksWriteWorkspaceInPostgres(input: {
        LIMIT $2 OFFSET $3`,
       [input.organizationId, pageSize, offset],
     ),
+    query<WriteRequestRow>(
+      `SELECT ${WRITE_REQUEST_SELECT}
+       FROM quickbooks_write_requests request
+       LEFT JOIN app_users requested ON requested.email = request.requested_by
+       LEFT JOIN app_users approved ON approved.email = request.approved_by
+       WHERE request.organization_id = $1::uuid
+         AND request.id = NULLIF($2, '')::uuid
+       LIMIT 1`,
+      [input.organizationId, input.requestId || ''],
+    ),
     query<{ id: string; display_name: string; company_name: string | null; email: string | null }>(
       `SELECT quickbooks_customer_id AS id, display_name, company_name, email
        FROM quickbooks_customers
@@ -224,6 +235,9 @@ export async function readQuickBooksWriteWorkspaceInPostgres(input: {
   const runtimeMode = String(process.env.QUICKBOOKS_WRITE_MODE || '').trim()
   const runtimeEnabled = process.env.QUICKBOOKS_WRITES_ENABLED === '1'
     && (runtimeMode === 'sandbox' || runtimeMode === 'production')
+  const requestRows = [...requests.rows]
+  const targetedRow = targetRequest.rows[0]
+  if (targetedRow && !requestRows.some((row) => row.id === targetedRow.id)) requestRows.unshift(targetedRow)
   return {
     connection: {
       companyName: connectionRow.company_name,
@@ -237,7 +251,7 @@ export async function readQuickBooksWriteWorkspaceInPostgres(input: {
     page,
     pageSize,
     total: Number(count.rows[0]?.count || 0),
-    requests: requests.rows.map(toWriteRequest),
+    requests: requestRows.map(toWriteRequest),
     referenceData: {
       customers: customers.rows.map((row) => ({
         id: row.id,

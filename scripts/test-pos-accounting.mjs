@@ -37,6 +37,8 @@ function loadTypeScriptModule(path, mocks = {}) {
     console,
     Date,
     Error,
+    URL,
+    URLSearchParams,
     exports: module.exports,
     module,
     process,
@@ -148,7 +150,6 @@ for (const fragment of [
   'active: mapping.active',
   'hasAccountingDraft ? (',
   'No sales-backed accounting draft is available in this date range.',
-  "window.location.hash = 'accounting'",
 ]) {
   assert.ok(panel.includes(fragment), `POS accounting panel missing ${fragment}`)
 }
@@ -633,6 +634,40 @@ assert.match(categoryGuardedMappings[0].validationReason, /active QuickBooks pro
 
 const quickBooksActionsPanel = read('app_src/components/accounting/QuickBooksActionsPanel.tsx')
 assert.ok(quickBooksActionsPanel.includes('<DetailField label="Category" value={payload.parentCategoryName} />'))
+assert.ok(quickBooksActionsPanel.includes('initialRequestId?: string | null'))
+assert.ok(quickBooksActionsPanel.includes('setSelected(request)'))
+assert.ok(quickBooksActionsPanel.includes("parameters.set('requestId', initialRequestToLoad.current)"))
+assert.ok(quickBooksActionsPanel.includes('This accounting draft was not found in the active organization.'))
+
+const posAccountingPanel = read('app_src/components/pos/PosAccountingPanel.tsx')
+assert.ok(posAccountingPanel.includes('buildAccountingDraftReviewUrl(oldURL, prepared.id)'))
+assert.ok(posAccountingPanel.includes('QuickBooks has not been changed yet.'))
+
+const accountingSection = read('app_src/components/accounting/AccountingSection.tsx')
+assert.ok(accountingSection.includes('consumeAccountingDraftTarget(window.location.href)'))
+assert.ok(accountingSection.includes('initialRequestId={initialActionRequestId}'))
+assert.ok(accountingSection.includes('onInitialRequestHandled={() => setInitialActionRequestId(null)}'))
+
+const accountingDraftNavigation = loadTypeScriptModule('app_src/lib/accountingDraftNavigation.ts')
+assert.equal(accountingDraftNavigation.accountingExplorerViewParameter('overview'), null)
+assert.equal(accountingDraftNavigation.accountingExplorerViewParameter('actions'), null)
+assert.equal(accountingDraftNavigation.accountingExplorerViewParameter('products'), 'products')
+const draftRequestId = '3C788366-C864-43C7-87B4-ADF481C94943'
+const draftReviewUrl = accountingDraftNavigation.buildAccountingDraftReviewUrl(
+  'https://aiapp.eigenracing.com/?posView=accounting&location=truck&date=2026-07-21#pos',
+  draftRequestId,
+)
+assert.equal(draftReviewUrl.hash, '#accounting')
+assert.equal(draftReviewUrl.searchParams.get('accountingView'), 'actions')
+assert.equal(draftReviewUrl.searchParams.get('accountingRequest'), draftRequestId.toLowerCase())
+assert.equal(draftReviewUrl.searchParams.has('posView'), false)
+assert.equal(draftReviewUrl.searchParams.has('location'), false)
+assert.equal(draftReviewUrl.searchParams.has('date'), false)
+const consumedDraftTarget = accountingDraftNavigation.consumeAccountingDraftTarget(draftReviewUrl.toString())
+assert.equal(consumedDraftTarget.view, 'actions')
+assert.equal(consumedDraftTarget.requestId, draftRequestId.toLowerCase())
+assert.equal(consumedDraftTarget.hasTarget, true)
+assert.equal(consumedDraftTarget.cleanUrl, '/#accounting')
 
 const mixedRefundSummary = projection.summarizeToastProjectedChecks([{
   amount: 100,

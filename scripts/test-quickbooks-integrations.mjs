@@ -678,11 +678,33 @@ function writeRequestRow(overrides = {}) {
 
 const writeSqlCalls = []
 let writeScenario = 'create'
+let writeReadScenario = 'off'
 let currentReviewedConnectionId = 'connection-reviewed'
+const recentWriteRequestId = '33333333-3333-4333-8333-333333333333'
+const targetedWriteRequestId = '77777777-7777-4777-8777-777777777777'
 const writePersistenceModule = loadTypeScriptModule('app_src/lib/persistence/quickBooksWrites.ts', {
   '@/lib/auditWriter': { recordAuditEvent: async () => undefined },
   '@/lib/persistence/postgres': {
-    query: async () => ({ rows: [], rowCount: 0 }),
+    query: async (sql, params = []) => {
+      if (writeReadScenario === 'off') return { rows: [], rowCount: 0 }
+      const source = String(sql)
+      if (source.includes('FROM organization_quickbooks_connections connection')) {
+        return { rows: [{ write_mode: 'sandbox', write_verified_at: '2026-07-19T12:00:00.000Z', company_name: 'Acme Books', currency_code: 'USD' }], rowCount: 1 }
+      }
+      if (source.includes('SELECT count(*)::text AS count FROM quickbooks_write_requests')) {
+        return { rows: [{ count: '101' }], rowCount: 1 }
+      }
+      if (source.includes("request.id = NULLIF($2, '')::uuid")) {
+        return params[0] === organizationId && params[1] === targetedWriteRequestId
+          ? { rows: [writeRequestRow({ id: targetedWriteRequestId })], rowCount: 1 }
+          : { rows: [], rowCount: 0 }
+      }
+      if (source.includes('ORDER BY request.created_at DESC, request.id DESC')) {
+        const id = writeReadScenario === 'dedupe' ? targetedWriteRequestId : recentWriteRequestId
+        return { rows: [writeRequestRow({ id })], rowCount: 1 }
+      }
+      return { rows: [], rowCount: 0 }
+    },
     withTransaction: async (work) => work({
       query: async (sql, params = []) => {
         const source = String(sql)
@@ -707,6 +729,32 @@ const writePersistenceModule = loadTypeScriptModule('app_src/lib/persistence/qui
     }),
   },
 })
+
+writeReadScenario = 'target'
+const targetedWriteWorkspace = await writePersistenceModule.readQuickBooksWriteWorkspaceInPostgres({
+  organizationId,
+  pageSize: 100,
+  requestId: targetedWriteRequestId,
+})
+assert.equal(targetedWriteWorkspace.requests.length, 2)
+assert.equal(targetedWriteWorkspace.requests[0].id, targetedWriteRequestId)
+assert.equal(targetedWriteWorkspace.requests[1].id, recentWriteRequestId)
+writeReadScenario = 'dedupe'
+const deduplicatedWriteWorkspace = await writePersistenceModule.readQuickBooksWriteWorkspaceInPostgres({
+  organizationId,
+  pageSize: 100,
+  requestId: targetedWriteRequestId,
+})
+assert.equal(deduplicatedWriteWorkspace.requests.length, 1)
+assert.equal(deduplicatedWriteWorkspace.requests[0].id, targetedWriteRequestId)
+writeReadScenario = 'target'
+const crossTenantWriteWorkspace = await writePersistenceModule.readQuickBooksWriteWorkspaceInPostgres({
+  organizationId: '99999999-9999-4999-8999-999999999999',
+  pageSize: 100,
+  requestId: targetedWriteRequestId,
+})
+assert.equal(crossTenantWriteWorkspace.requests.some((request) => request.id === targetedWriteRequestId), false)
+writeReadScenario = 'off'
 
 await writePersistenceModule.createQuickBooksWriteRequestInPostgres({
   organizationId,
@@ -857,12 +905,14 @@ for (const fragment of [
   'createQuickBooksWriteRequestInPostgres',
   'transitionQuickBooksWriteRequestInPostgres',
   'confirmFingerprint',
+  "uuidValue(requestIdValue, 'Accounting request id')",
   'MAX_REQUEST_BYTES',
   "'Cache-Control': 'no-store'",
 ]) includes(actionsRoute, fragment, 'QuickBooks write API')
 
 let routeCapabilities = { canView: true, canManage: false, canPrepare: true, canApprove: false }
 let transitioned = null
+let workspaceReadInput = null
 const actionsRouteModule = loadTypeScriptModule('app_src/app/api/accounting/quickbooks/actions/route.ts', {
   'next/server': { NextResponse: { json: (body, init = {}) => ({ body, status: init.status || 200, headers: init.headers || {} }) } },
   '@/lib/accountingAuthorization': {
@@ -878,7 +928,7 @@ const actionsRouteModule = loadTypeScriptModule('app_src/app/api/accounting/quic
   '@/lib/persistence/config': { isPostgresStorageEnabled: () => true },
   '@/lib/persistence/quickBooksWrites': {
     QuickBooksWriteRequestError: class extends Error {},
-    readQuickBooksWriteWorkspaceInPostgres: async () => ({ requests: [] }),
+    readQuickBooksWriteWorkspaceInPostgres: async (input) => { workspaceReadInput = input; return { requests: [] } },
     createQuickBooksWriteRequestInPostgres: async (input) => ({ id: 'write-1', ...input }),
     transitionQuickBooksWriteRequestInPostgres: async (input) => { transitioned = input; return { id: input.requestId } },
   },
@@ -889,6 +939,12 @@ function jsonRequest(body) {
   const raw = JSON.stringify(body)
   return { headers: new Headers({ 'content-length': String(Buffer.byteLength(raw)), 'content-type': 'application/json' }), text: async () => raw }
 }
+
+const targetedGetResponse = await actionsRouteModule.GET({
+  nextUrl: new URL(`https://clawpilot.test/api/accounting/quickbooks/actions?pageSize=100&requestId=${targetedWriteRequestId}`),
+})
+assert.equal(targetedGetResponse.status, 200)
+assert.equal(workspaceReadInput.requestId, targetedWriteRequestId)
 
 const draftResponse = await actionsRouteModule.POST(jsonRequest({
   clientRequestId: '11111111-1111-4111-8111-111111111111', operationKind: 'customer.create', payload: { displayName: 'Acme Buyer' },
