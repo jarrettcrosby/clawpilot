@@ -621,8 +621,9 @@ export function normalizeJournalEntryEvidence(input: unknown): NormalizedQuickBo
   for (const line of flattenedLines) {
     const detail = asRecord(line.JournalEntryLineDetail)
     const amountCents = moneyToCents(line.Amount) ?? 0
+    if (amountCents === 0) continue
     if (Object.keys(detail).length === 0) {
-      if (amountCents !== 0) unsupportedLineCount += 1
+      unsupportedLineCount += 1
       continue
     }
     const postingType = normalizedIdentity(text(detail.PostingType, 20))
@@ -719,6 +720,8 @@ function normalizeExpectedJournalLines(lines: UnknownRecord[]) {
   const groups = new Map<string, PosAccountingJournalLineGroup>()
   let unmappedLineCount = 0
   for (const line of journalLines) {
+    const amountCents = moneyToCents(line.amount) ?? 0
+    if (amountCents === 0) continue
     const sideText = normalizedIdentity(text(line.side, 20))
     const side = sideText === 'debit' || sideText === 'credit' ? sideText : null
     const target = asRecord(line.target)
@@ -727,7 +730,6 @@ function normalizeExpectedJournalLines(lines: UnknownRecord[]) {
       unmappedLineCount += 1
       continue
     }
-    const amountCents = moneyToCents(line.amount) ?? 0
     const key = `${side}:${accountId}`
     const existing = groups.get(key)
     groups.set(key, {
@@ -788,19 +790,25 @@ export function normalizePosAccountingDraftEvidence(
     updatedAt: timestamp(row.updated_at ?? row.updatedAt),
   }
 
-  const receiptLineTotal = receiptLines.lineEvidenceAvailable
+  const receiptLineTotal = receiptLines.lineEvidenceAvailable && receiptLines.unmappedLineCount === 0
     ? receiptLines.groups.reduce((total, line) => total + line.amountCents, 0)
     : null
-  const receiptTotal = firstMoney(
-    receiptDocument,
-    ['totalCents', 'totalAmountCents'],
-    ['total', 'totalAmount', 'TotalAmt'],
-  ) ?? firstMoney(standard, ['totalCents'], ['total']) ?? receiptLineTotal
   const receiptTax = firstMoney(
     receiptDocument,
     ['taxCents', 'totalTaxCents'],
     ['tax', 'totalTax', 'TotalTax'],
   ) ?? firstMoney(standard, ['taxCents'], ['tax'])
+  const receiptTotal = firstMoney(
+    receiptDocument,
+    ['totalCents', 'totalAmountCents'],
+    ['total', 'totalAmount', 'TotalAmt'],
+  ) ?? (
+    receiptLineTotal !== null && receiptTax !== null
+      ? receiptLineTotal + receiptTax
+      : null
+  ) ?? firstMoney(standard, ['tenderedCents'], ['tendered'])
+    ?? firstMoney(standard, ['totalCents'], ['total'])
+    ?? receiptLineTotal
 
   const receipt: NormalizedExpectedSalesReceipt = {
     expectedId: `${draftId}:SalesReceipt`,
