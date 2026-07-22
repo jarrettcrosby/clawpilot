@@ -3,32 +3,17 @@
   "releases": {
     "default": {
       "oncePerEnvironment": true,
-      "title": "Restaurant operations, controlled accounting, and complete CRM lifecycle",
-      "summary": "ClawPilot now provides an organization-scoped POS workspace for Toast orders, checks, products, payments, daily reporting, and accounting preparation. QuickBooks reference catalogs and versioned mappings support reviewable Sales Receipt and Payments Journal previews without enabling financial posting, while CRM adds durable Leads and Campaigns workflows and the demo account includes rolling synthetic operations data.",
+      "title": "Personalized ClawPilot user guide",
+      "summary": "Every active workspace membership now receives a private, continuously refreshed ClawPilot User Guide in Docs. It provides direct module navigation and role-aware instructions for projects and agents, pipeline and CRM, accounting and POS, sharing, mobile use, browser sessions, and troubleshooting.",
       "features": [
-        "A first-class POS workspace with Overview, Orders, Reports, and Accounting views on desktop and mobile",
-        "Toast Standard order, modified-order, and menu-catalog ingestion with optional Analytics reconciliation",
-        "Business-day receipts, check detail, product/category performance, payment, card-brand, cash, comparison, and run-rate reports",
-        "Itemized Sales Receipt and balanced Payments Journal previews built from sanitized order evidence",
-        "Versioned organization defaults and restaurant overrides for QuickBooks company, account, item, tax, class, department, customer, and memo mappings",
-        "Read-only QuickBooks reference catalogs used to validate POS accounting destinations",
-        "Deduplicated POS accounting alerts with exact-date remediation links, resolution tracking, and retry-safe email delivery",
-        "CRM Leads and Campaigns with Global IDs, search, edit, archive, lead conversion, recipient membership, activity history, and SuiteCRM synchronization",
-        "Rolling synthetic POS and accounting data in the protected demo account without live provider credentials or customer identity",
-        "Environment database fingerprints for Railway and Vercel isolation verification",
-        "A release regression gate covering disposable Postgres CRM and POS workflows plus 38 responsive browser scenarios"
+        "A private ClawPilot User Guide automatically available as the first document for every active user membership",
+        "Direct links and concise workflow guidance for Dashboard, Docs, Projects, Pipeline, CRM, Accounting, POS, Links, Agents, and Versions",
+        "Workspace- and role-aware guidance for permissions, integrations, agent dispatch, controlled provider writes, browser sessions, and support evidence",
+        "Responsive guide reading in phone portrait, phone landscape, and desktop layouts"
       ],
       "fixes": [
-        "Refreshes every affected business day when Toast reports a modified historical order",
-        "Prevents stale Toast workers from writing or completing a lease claimed by another worker",
-        "Keeps failed and dead Toast work terminal until an operator explicitly reviews and retries it",
-        "Prevents repeated accounting checks from sending duplicate alerts and rechecks recipient authorization before delivery",
-        "Excludes voided and deleted orders or checks and accounts for partial refunds and refunded tips in POS totals",
-        "Preserves approved, posting, and posted accounting evidence when projections or previews refresh",
-        "Invalidates stale POS mappings and cancels only unposted QuickBooks writes when a company connection is replaced or disconnected",
-        "Blocks accounting preparers from changing organization-wide defaults while allowing authorized location overrides",
-        "Fails deployed persistence health when Postgres or the environment database identity is missing",
-        "Keeps CRM editors, campaign recipients, converted records, and related activity contained in phone portrait and landscape layouts"
+        "Provisioning no longer depends on a user first opening Docs or waiting for a background document refresh",
+        "Guide content remains current when a user's active workspace role or relevant permissions change"
       ]
     }
   }
