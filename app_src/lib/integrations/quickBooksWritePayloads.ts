@@ -3,6 +3,7 @@ import { query } from '@/lib/persistence/postgres'
 
 export const QUICKBOOKS_WRITE_OPERATIONS = [
   'customer.create', 'item.create', 'invoice.create',
+  'sales_receipt.create', 'journal_entry.create',
 ] as const
 
 export type QuickBooksWriteOperationKind = typeof QUICKBOOKS_WRITE_OPERATIONS[number]
@@ -71,7 +72,48 @@ export type QuickBooksInvoiceDraft = {
   totalAmount: number
 }
 
-export type QuickBooksWriteDraftPayload = QuickBooksCustomerDraft | QuickBooksItemDraft | QuickBooksInvoiceDraft
+export type QuickBooksSalesReceiptDraft = {
+  transactionDate: string
+  customerId: string | null
+  customerName: string | null
+  depositToAccountId: string
+  depositToAccountName: string
+  taxCodeId: string | null
+  taxCodeName: string | null
+  taxAmount: number
+  memo: string
+  lines: Array<{
+    itemId: string
+    itemName: string
+    description: string | null
+    quantity: number
+    unitPrice: number
+    amount: number
+    taxable: boolean
+  }>
+  totalAmount: number
+}
+
+export type QuickBooksJournalEntryDraft = {
+  transactionDate: string
+  memo: string
+  lines: Array<{
+    accountId: string
+    accountName: string
+    description: string | null
+    postingType: 'Debit' | 'Credit'
+    amount: number
+  }>
+  debitAmount: number
+  creditAmount: number
+}
+
+export type QuickBooksWriteDraftPayload =
+  | QuickBooksCustomerDraft
+  | QuickBooksItemDraft
+  | QuickBooksInvoiceDraft
+  | QuickBooksSalesReceiptDraft
+  | QuickBooksJournalEntryDraft
 
 export class QuickBooksWriteValidationError extends Error {
   code: string
@@ -144,7 +186,9 @@ function dateValue(value: unknown, label: string, required = false): string | nu
 
 function operationValue(value: unknown): QuickBooksWriteOperationKind {
   const operation = String(value || '') as QuickBooksWriteOperationKind
-  if (!QUICKBOOKS_WRITE_OPERATIONS.includes(operation)) {
+  if (!(['customer.create', 'item.create', 'invoice.create'] as const).includes(
+    operation as 'customer.create' | 'item.create' | 'invoice.create',
+  )) {
     throw new QuickBooksWriteValidationError('QUICKBOOKS_WRITE_OPERATION_INVALID', 'The accounting operation is not supported')
   }
   return operation
@@ -397,6 +441,10 @@ export async function validateQuickBooksWriteDraft(input: {
   }
 }
 
+export function fingerprintQuickBooksWritePayload(payload: QuickBooksWriteDraftPayload) {
+  return crypto.createHash('sha256').update(JSON.stringify(payload)).digest('hex')
+}
+
 function compactObject(value: Record<string, unknown>) {
   return Object.fromEntries(Object.entries(value).filter(([, candidate]) => candidate !== null && candidate !== undefined && candidate !== ''))
 }
@@ -442,6 +490,47 @@ export function buildQuickBooksProviderPayload(
       Taxable: item.taxable,
     })
   }
+  if (operationKind === 'sales_receipt.create') {
+    const receipt = payload as QuickBooksSalesReceiptDraft
+    const taxable = Boolean(receipt.taxCodeId && receipt.taxAmount > 0)
+    return compactObject({
+      CustomerRef: receipt.customerId ? { value: receipt.customerId } : null,
+      DepositToAccountRef: { value: receipt.depositToAccountId },
+      TxnDate: receipt.transactionDate,
+      PrivateNote: receipt.memo,
+      CustomerMemo: { value: receipt.memo },
+      Line: receipt.lines.map((line) => compactObject({
+        Amount: line.amount,
+        DetailType: 'SalesItemLineDetail',
+        Description: line.description,
+        SalesItemLineDetail: compactObject({
+          ItemRef: { value: line.itemId },
+          Qty: line.quantity,
+          UnitPrice: line.unitPrice,
+          TaxCodeRef: taxable && line.taxable ? { value: 'TAX' } : { value: 'NON' },
+        }),
+      })),
+      TxnTaxDetail: taxable ? {
+        TxnTaxCodeRef: { value: receipt.taxCodeId },
+      } : null,
+    })
+  }
+  if (operationKind === 'journal_entry.create') {
+    const journal = payload as QuickBooksJournalEntryDraft
+    return {
+      TxnDate: journal.transactionDate,
+      PrivateNote: journal.memo,
+      Line: journal.lines.map((line) => ({
+        Amount: line.amount,
+        DetailType: 'JournalEntryLineDetail',
+        Description: line.description,
+        JournalEntryLineDetail: {
+          PostingType: line.postingType,
+          AccountRef: { value: line.accountId },
+        },
+      })),
+    }
+  }
   const invoice = payload as QuickBooksInvoiceDraft
   return compactObject({
     CustomerRef: { value: invoice.customerId },
@@ -465,5 +554,7 @@ export function buildQuickBooksProviderPayload(
 export function quickBooksProviderEntity(operationKind: QuickBooksWriteOperationKind) {
   if (operationKind === 'customer.create') return { path: 'customer', responseKey: 'Customer' }
   if (operationKind === 'item.create') return { path: 'item', responseKey: 'Item' }
+  if (operationKind === 'sales_receipt.create') return { path: 'salesreceipt', responseKey: 'SalesReceipt' }
+  if (operationKind === 'journal_entry.create') return { path: 'journalentry', responseKey: 'JournalEntry' }
   return { path: 'invoice', responseKey: 'Invoice' }
 }

@@ -4,8 +4,6 @@ export type PosAccountingParityEntityType = 'SalesReceipt' | 'JournalEntry'
 export type PosAccountingPostingOrigin = 'shogo' | 'clawpilot'
 export type PosAccountingParityMatchBasis =
   | 'provider_id'
-  | 'document_and_memo'
-  | 'document_number'
   | 'memo'
   | 'date_only'
 
@@ -45,6 +43,38 @@ interface PosAccountingExpectedBase extends PosAccountingIdentity {
     reconciliationStatus: string
     sourceRevision: number
     updatedAt: string | null
+    reviewOutcome: string | null
+    postingOrigin: PosAccountingPostingOrigin | null
+    reviewedBy: string | null
+    reviewedAt: string | null
+    reviewNote: string | null
+    quickBooksSalesReceiptId: string | null
+    quickBooksJournalEntryId: string | null
+    postingBatch: {
+      id: string
+      status: string
+      requestFingerprint: string
+      requestedBy: string
+      approvedBy: string | null
+      approvalNote: string | null
+      lastError: string | null
+      submittedAt: string | null
+      approvedAt: string | null
+      postedAt: string | null
+      updatedAt: string | null
+      salesReceipt: {
+        requestId: string
+        status: string
+        providerEntityId: string | null
+        error: string | null
+      }
+      journalEntry: {
+        requestId: string
+        status: string
+        providerEntityId: string | null
+        error: string | null
+      }
+    } | null
   }
 }
 
@@ -189,7 +219,7 @@ export interface PosAccountingHistoricalBaseline {
   summary: {
     cachedTransactions: number
     pairCount: number
-    exactDocumentPairs: number
+    exactMarkerPairs: number
     dateFallbackPairs: number
     unmatchedGroups: number
     unmatchedEvidence: number
@@ -199,7 +229,7 @@ export interface PosAccountingHistoricalBaseline {
     journalBalance: Record<'match' | 'variance' | 'insufficientEvidence', number>
   }
   pairs: Array<{
-    basis: 'business_date_and_document' | 'business_date_only'
+    basis: 'business_date_and_marker' | 'business_date_only'
     businessDate: string
     salesReceipt: PosAccountingHistoricalEvidenceReference
     journalEntry: PosAccountingHistoricalEvidenceReference
@@ -213,7 +243,7 @@ export interface PosAccountingHistoricalBaseline {
     evidence: PosAccountingHistoricalEvidenceReference[]
   }>
   ambiguousGroups: Array<{
-    basis: 'business_date_and_document' | 'business_date_only'
+    basis: 'business_date_and_marker' | 'business_date_only'
     businessDate: string
     documentNumber: string | null
     salesReceipts: PosAccountingHistoricalEvidenceReference[]
@@ -376,6 +406,11 @@ function entityType(value: unknown): PosAccountingParityEntityType | null {
   return null
 }
 
+function postingOrigin(value: unknown): PosAccountingPostingOrigin | null {
+  const candidate = text(value, 40)
+  return candidate === 'shogo' || candidate === 'clawpilot' ? candidate : null
+}
+
 function decimalToScaledInteger(value: unknown, scale: number): number | null {
   if (value === null || value === undefined || value === '') return null
   if (typeof value === 'number' && !Number.isFinite(value)) return null
@@ -441,8 +476,7 @@ function evidenceIdentifiersConflict(
   left: { documentNumber: string | null; memo: string | null },
   right: { documentNumber: string | null; memo: string | null },
 ): boolean {
-  return populatedIdentifiersConflict(left.documentNumber, right.documentNumber)
-    || populatedIdentifiersConflict(left.memo, right.memo)
+  return populatedIdentifiersConflict(left.memo, right.memo)
 }
 
 function recordAt(root: UnknownRecord, path: string[]): UnknownRecord {
@@ -832,6 +866,32 @@ export function normalizePosAccountingDraftEvidence(
     row.quickbooks_transaction_id,
     row.providerTransactionId,
   ], 200)
+  const postingBatchId = firstText([row.posting_batch_id, row.postingBatchId], 200)
+  const postingBatch = postingBatchId ? {
+    id: postingBatchId,
+    status: firstText([row.posting_batch_status, row.postingBatchStatus], 80) || 'unknown',
+    requestFingerprint: firstText([row.posting_batch_fingerprint, row.postingBatchFingerprint], 128) || '',
+    requestedBy: firstText([row.posting_batch_requested_by, row.postingBatchRequestedBy], 254) || '',
+    approvedBy: firstText([row.posting_batch_approved_by, row.postingBatchApprovedBy], 254),
+    approvalNote: firstText([row.posting_batch_approval_note, row.postingBatchApprovalNote], 1_000),
+    lastError: firstText([row.posting_batch_last_error, row.postingBatchLastError], 2_000),
+    submittedAt: timestamp(row.posting_batch_submitted_at ?? row.postingBatchSubmittedAt),
+    approvedAt: timestamp(row.posting_batch_approved_at ?? row.postingBatchApprovedAt),
+    postedAt: timestamp(row.posting_batch_posted_at ?? row.postingBatchPostedAt),
+    updatedAt: timestamp(row.posting_batch_updated_at ?? row.postingBatchUpdatedAt),
+    salesReceipt: {
+      requestId: firstText([row.sales_receipt_request_id, row.salesReceiptRequestId], 200) || '',
+      status: firstText([row.sales_receipt_request_status, row.salesReceiptRequestStatus], 80) || 'unknown',
+      providerEntityId: firstText([row.sales_receipt_provider_entity_id, row.salesReceiptProviderEntityId], 200),
+      error: firstText([row.sales_receipt_request_error, row.salesReceiptRequestError], 2_000),
+    },
+    journalEntry: {
+      requestId: firstText([row.journal_entry_request_id, row.journalEntryRequestId], 200) || '',
+      status: firstText([row.journal_entry_request_status, row.journalEntryRequestStatus], 80) || 'unknown',
+      providerEntityId: firstText([row.journal_entry_provider_entity_id, row.journalEntryProviderEntityId], 200),
+      error: firstText([row.journal_entry_request_error, row.journalEntryRequestError], 2_000),
+    },
+  } : null
   const draft = {
     id: draftId,
     revision: Math.max(1, integer(row.draft_revision ?? row.draftRevision, 1)),
@@ -845,6 +905,20 @@ export function normalizePosAccountingDraftEvidence(
     ], 80) || 'unknown',
     sourceRevision: Math.max(0, integer(row.source_revision ?? row.sourceRevision, 0)),
     updatedAt: timestamp(row.updated_at ?? row.updatedAt),
+    reviewOutcome: firstText([row.review_outcome, row.reviewOutcome], 80),
+    postingOrigin: postingOrigin(row.posting_origin ?? row.postingOrigin),
+    reviewedBy: firstText([row.reviewed_by, row.reviewedBy], 254),
+    reviewedAt: timestamp(row.reviewed_at ?? row.reviewedAt),
+    reviewNote: firstText([row.review_note, row.reviewNote], 1_000),
+    quickBooksSalesReceiptId: firstText([
+      row.quickbooks_sales_receipt_id,
+      row.quickBooksSalesReceiptId,
+    ], 200),
+    quickBooksJournalEntryId: firstText([
+      row.quickbooks_journal_entry_id,
+      row.quickBooksJournalEntryId,
+    ], 200),
+    postingBatch,
   }
 
   const receiptLineTotal = receiptLines.lineEvidenceAvailable && receiptLines.unmappedLineCount === 0
@@ -873,6 +947,8 @@ export function normalizePosAccountingDraftEvidence(
     businessDate: date,
     draft,
     providerTransactionId: firstText([
+      row.quickbooks_sales_receipt_id,
+      row.quickBooksSalesReceiptId,
       receiptDocument.providerTransactionId,
       receiptDocument.Id,
       providerTransactionId,
@@ -900,6 +976,8 @@ export function normalizePosAccountingDraftEvidence(
     businessDate: date,
     draft,
     providerTransactionId: firstText([
+      row.quickbooks_journal_entry_id,
+      row.quickBooksJournalEntryId,
       journalDocument.providerTransactionId,
       journalDocument.Id,
       providerTransactionId,
@@ -1132,24 +1210,6 @@ export function matchPosAccountingParityDocuments(input: {
     (item) => item.providerTransactionId,
   )
   applyExactPhase(
-    'document_and_memo',
-    (item) => {
-      const document = normalizedIdentity(item.documentNumber)
-      const memo = normalizedIdentity(item.memo)
-      return document && memo ? `${document}\u0000${memo}` : null
-    },
-    (item) => {
-      const document = normalizedIdentity(item.documentNumber)
-      const memo = normalizedIdentity(item.memo)
-      return document && memo ? `${document}\u0000${memo}` : null
-    },
-  )
-  applyExactPhase(
-    'document_number',
-    (item) => normalizedIdentity(item.documentNumber),
-    (item) => normalizedIdentity(item.documentNumber),
-  )
-  applyExactPhase(
     'memo',
     (item) => normalizedIdentity(item.memo),
     (item) => normalizedIdentity(item.memo),
@@ -1320,7 +1380,7 @@ export function buildHistoricalPosAccountingBaseline(
   const appendPair = (
     receipt: NormalizedQuickBooksSalesReceipt,
     journal: NormalizedQuickBooksJournalEntry,
-    basis: 'business_date_and_document' | 'business_date_only',
+    basis: 'business_date_and_marker' | 'business_date_only',
   ) => {
     pairs.push({
       basis,
@@ -1334,30 +1394,30 @@ export function buildHistoricalPosAccountingBaseline(
     remainingJournals.delete(journal.evidenceId)
   }
 
-  const documentReceiptGroups = new Map<string, NormalizedQuickBooksSalesReceipt[]>()
-  const documentJournalGroups = new Map<string, NormalizedQuickBooksJournalEntry[]>()
+  const markerReceiptGroups = new Map<string, NormalizedQuickBooksSalesReceipt[]>()
+  const markerJournalGroups = new Map<string, NormalizedQuickBooksJournalEntry[]>()
   for (const receipt of receipts) {
-    const document = normalizedIdentity(receipt.documentNumber)
-    if (!document) continue
-    const key = `${receipt.businessDate}\u0000${document}`
-    documentReceiptGroups.set(key, [...(documentReceiptGroups.get(key) || []), receipt])
+    const marker = normalizedIdentity(receipt.memo)
+    if (!marker) continue
+    const key = `${receipt.businessDate}\u0000${marker}`
+    markerReceiptGroups.set(key, [...(markerReceiptGroups.get(key) || []), receipt])
   }
   for (const journal of journals) {
-    const document = normalizedIdentity(journal.documentNumber)
-    if (!document) continue
-    const key = `${journal.businessDate}\u0000${document}`
-    documentJournalGroups.set(key, [...(documentJournalGroups.get(key) || []), journal])
+    const marker = normalizedIdentity(journal.memo)
+    if (!marker) continue
+    const key = `${journal.businessDate}\u0000${marker}`
+    markerJournalGroups.set(key, [...(markerJournalGroups.get(key) || []), journal])
   }
-  const documentKeys = [...new Set([
-    ...documentReceiptGroups.keys(),
-    ...documentJournalGroups.keys(),
+  const markerKeys = [...new Set([
+    ...markerReceiptGroups.keys(),
+    ...markerJournalGroups.keys(),
   ])].sort()
-  for (const key of documentKeys) {
-    const groupReceipts = documentReceiptGroups.get(key) || []
-    const groupJournals = documentJournalGroups.get(key) || []
+  for (const key of markerKeys) {
+    const groupReceipts = markerReceiptGroups.get(key) || []
+    const groupJournals = markerJournalGroups.get(key) || []
     if (groupReceipts.length === 0 || groupJournals.length === 0) continue
     if (groupReceipts.length === 1 && groupJournals.length === 1) {
-      appendPair(groupReceipts[0], groupJournals[0], 'business_date_and_document')
+      appendPair(groupReceipts[0], groupJournals[0], 'business_date_and_marker')
       continue
     }
     const groupEvidence = [...groupReceipts, ...groupJournals]
@@ -1367,9 +1427,9 @@ export function buildHistoricalPosAccountingBaseline(
       remainingJournals.delete(item.evidenceId)
     })
     ambiguousGroups.push({
-      basis: 'business_date_and_document',
+      basis: 'business_date_and_marker',
       businessDate: groupEvidence[0].businessDate,
-      documentNumber: groupEvidence[0].documentNumber,
+      documentNumber: null,
       salesReceipts: groupReceipts.map(historicalEvidenceReference),
       journalEntries: groupJournals.map(historicalEvidenceReference),
     })
@@ -1452,8 +1512,8 @@ export function buildHistoricalPosAccountingBaseline(
     summary: {
       cachedTransactions: evidence.length,
       pairCount: pairs.length,
-      exactDocumentPairs: pairs
-        .filter((pair) => pair.basis === 'business_date_and_document').length,
+      exactMarkerPairs: pairs
+        .filter((pair) => pair.basis === 'business_date_and_marker').length,
       dateFallbackPairs: pairs.filter((pair) => pair.basis === 'business_date_only').length,
       unmatchedGroups: unmatchedGroups.length,
       unmatchedEvidence: unmatchedEvidence.length,
@@ -1595,6 +1655,8 @@ const CLAWPILOT_DRAFT_LINK_SQL = `EXISTS (
   FROM toast_accounting_export_drafts linked_draft
   WHERE linked_draft.organization_id = transaction.organization_id
     AND transaction.quickbooks_transaction_id = ANY(ARRAY[
+      linked_draft.quickbooks_sales_receipt_id,
+      linked_draft.quickbooks_journal_entry_id,
       linked_draft.quickbooks_transaction_id,
       linked_draft.source_summary #>> '{canonical,parity,documents,salesReceipt,providerTransactionId}',
       linked_draft.source_summary #>> '{canonical,parity,documents,journalEntry,providerTransactionId}',
@@ -1765,6 +1827,32 @@ export async function readPosAccountingParityReportInPostgres(
       proposed_lines: unknown
       quickbooks_payload: unknown
       quickbooks_transaction_id: string | null
+      quickbooks_sales_receipt_id: string | null
+      quickbooks_journal_entry_id: string | null
+      review_outcome: string | null
+      posting_origin: PosAccountingPostingOrigin | null
+      reviewed_by: string | null
+      reviewed_at: string | null
+      review_note: string | null
+      posting_batch_id: string | null
+      posting_batch_status: string | null
+      posting_batch_fingerprint: string | null
+      posting_batch_requested_by: string | null
+      posting_batch_approved_by: string | null
+      posting_batch_approval_note: string | null
+      posting_batch_last_error: string | null
+      posting_batch_submitted_at: string | null
+      posting_batch_approved_at: string | null
+      posting_batch_posted_at: string | null
+      posting_batch_updated_at: string | null
+      sales_receipt_request_id: string | null
+      sales_receipt_request_status: string | null
+      sales_receipt_provider_entity_id: string | null
+      sales_receipt_request_error: string | null
+      journal_entry_request_id: string | null
+      journal_entry_request_status: string | null
+      journal_entry_provider_entity_id: string | null
+      journal_entry_request_error: string | null
       draft_revision: number
       source_revision: number
       updated_at: string
@@ -1773,12 +1861,43 @@ export async function readPosAccountingParityReportInPostgres(
          location.restaurant_name, location.location_name,
          draft.business_date::text, draft.status, draft.reconciliation_status,
          draft.source_summary, draft.proposed_lines, draft.quickbooks_payload,
-         draft.quickbooks_transaction_id, draft.draft_revision, draft.source_revision,
+         draft.quickbooks_transaction_id, draft.quickbooks_sales_receipt_id,
+         draft.quickbooks_journal_entry_id, draft.review_outcome, draft.posting_origin,
+         draft.reviewed_by, draft.reviewed_at::text, draft.review_note,
+         posting_batch.id::text AS posting_batch_id,
+         posting_batch.status AS posting_batch_status,
+         posting_batch.request_fingerprint AS posting_batch_fingerprint,
+         posting_batch.requested_by AS posting_batch_requested_by,
+         posting_batch.approved_by AS posting_batch_approved_by,
+         posting_batch.approval_note AS posting_batch_approval_note,
+         posting_batch.last_error AS posting_batch_last_error,
+         posting_batch.submitted_at::text AS posting_batch_submitted_at,
+         posting_batch.approved_at::text AS posting_batch_approved_at,
+         posting_batch.posted_at::text AS posting_batch_posted_at,
+         posting_batch.updated_at::text AS posting_batch_updated_at,
+         receipt_request.id::text AS sales_receipt_request_id,
+         receipt_request.status AS sales_receipt_request_status,
+         receipt_request.provider_entity_id AS sales_receipt_provider_entity_id,
+         receipt_request.last_error_message AS sales_receipt_request_error,
+         journal_request.id::text AS journal_entry_request_id,
+         journal_request.status AS journal_entry_request_status,
+         journal_request.provider_entity_id AS journal_entry_provider_entity_id,
+         journal_request.last_error_message AS journal_entry_request_error,
+         draft.draft_revision, draft.source_revision,
          draft.updated_at::text
        FROM toast_accounting_export_drafts draft
        LEFT JOIN toast_locations location
-         ON location.organization_id = draft.organization_id
+        ON location.organization_id = draft.organization_id
         AND location.restaurant_guid = draft.restaurant_guid
+       LEFT JOIN pos_accounting_posting_batches posting_batch
+         ON posting_batch.organization_id = draft.organization_id
+        AND posting_batch.id = draft.posting_batch_id
+       LEFT JOIN quickbooks_write_requests receipt_request
+         ON receipt_request.organization_id = posting_batch.organization_id
+        AND receipt_request.id = posting_batch.sales_receipt_request_id
+       LEFT JOIN quickbooks_write_requests journal_request
+         ON journal_request.organization_id = posting_batch.organization_id
+        AND journal_request.id = posting_batch.journal_entry_request_id
        WHERE draft.organization_id = $1::uuid
          AND draft.is_current = true
          AND draft.business_date = ANY($2::date[])

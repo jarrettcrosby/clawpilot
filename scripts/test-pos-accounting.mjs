@@ -99,6 +99,17 @@ for (const fragment of [
   assert.ok(dateCommandsMigration.includes(fragment), `POS accounting date command migration missing ${fragment}`)
 }
 
+const postingOutcomesMigration = read('db/migrations/0079_pos_accounting_posting_outcomes.sql')
+for (const fragment of [
+  'CREATE TABLE IF NOT EXISTS pos_accounting_posting_batches',
+  'quickbooks_sales_receipt_id text',
+  'quickbooks_journal_entry_id text',
+  "review_outcome = 'shogo_posted'",
+  "OLD.status IN ('approved', 'posting', 'posted', 'failed')",
+]) {
+  assert.ok(postingOutcomesMigration.includes(fragment), `POS accounting posting migration missing ${fragment}`)
+}
+
 const persistenceSource = read('app_src/lib/persistence/posAccounting.ts')
 for (const fragment of [
   'WHERE organization_id = $1::uuid',
@@ -132,7 +143,7 @@ for (const fragment of [
   "generationReason: 'regenerate_accounting'",
   'forceNewRevision: true',
   'SET is_current = false, superseded_at = now()',
-  'status NOT IN (\'approved\', \'posting\', \'posted\')',
+  'status NOT IN (\'approved\', \'posting\', \'posted\', \'failed\')',
   'pos.accounting.sales_reload.completed',
   'pos.accounting.regenerated',
 ]) {

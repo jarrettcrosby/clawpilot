@@ -28,6 +28,38 @@ import { formatUserDateTime } from '@/lib/userDateTime'
 type CheckStatus = 'match' | 'variance' | 'insufficient_evidence'
 type EntityType = 'SalesReceipt' | 'JournalEntry'
 type PostingOrigin = 'shogo' | 'clawpilot'
+type AccountingCapabilities = {
+  canView: boolean
+  canManage: boolean
+  canPrepare: boolean
+  canApprove: boolean
+}
+
+type PostingBatch = {
+  id: string
+  status: string
+  requestFingerprint: string
+  requestedBy: string
+  approvedBy: string | null
+  approvalNote: string | null
+  lastError: string | null
+  submittedAt: string | null
+  approvedAt: string | null
+  postedAt: string | null
+  updatedAt: string | null
+  salesReceipt: {
+    requestId: string
+    status: string
+    providerEntityId: string | null
+    error: string | null
+  }
+  journalEntry: {
+    requestId: string
+    status: string
+    providerEntityId: string | null
+    error: string | null
+  }
+}
 
 type ReceiptLineGroup = {
   itemId: string
@@ -143,6 +175,14 @@ type ExpectedBase = {
     revision: number
     sourceRevision: number
     updatedAt: string | null
+    reviewOutcome: string | null
+    postingOrigin: PostingOrigin | null
+    reviewedBy: string | null
+    reviewedAt: string | null
+    reviewNote: string | null
+    quickBooksSalesReceiptId: string | null
+    quickBooksJournalEntryId: string | null
+    postingBatch: PostingBatch | null
   }
 }
 
@@ -167,7 +207,7 @@ type ExpectedJournalEntry = ExpectedBase & {
 type ExpectedEvidence = ExpectedSalesReceipt | ExpectedJournalEntry
 
 type HistoricalPair = {
-  basis: 'business_date_and_document' | 'business_date_only'
+  basis: 'business_date_and_marker' | 'business_date_only'
   businessDate: string
   salesReceipt: EvidenceReference
   journalEntry: EvidenceReference
@@ -183,7 +223,7 @@ type EvidenceGroup = {
 }
 
 type AmbiguousGroup = {
-  basis: 'business_date_and_document' | 'business_date_only'
+  basis: 'business_date_and_marker' | 'business_date_only'
   businessDate: string
   documentNumber: string | null
   salesReceipts: EvidenceReference[]
@@ -206,7 +246,7 @@ type ParityReport = {
     summary: {
       cachedTransactions: number
       pairCount: number
-      exactDocumentPairs: number
+      exactMarkerPairs: number
       dateFallbackPairs: number
       unmatchedGroups: number
       unmatchedEvidence: number
@@ -262,7 +302,21 @@ type ParityReport = {
 type ResponsePayload = {
   ok?: boolean
   error?: string
+  capabilities?: AccountingCapabilities
   report?: ParityReport
+}
+
+type PostingActionResponse = {
+  ok?: boolean
+  error?: string
+  batch?: PostingBatch
+  result?: {
+    recorded: number
+    alreadyRecorded: number
+    eligible: number
+    unresolved: number
+    recordedDates: string[]
+  }
 }
 
 type ReceiptIntegrity = {
@@ -545,6 +599,96 @@ function ExpectedDocumentDetails({ expected, formatCents }: {
   )
 }
 
+function PostingControls({
+  expected,
+  capabilities,
+  pending,
+  onPrepare,
+  onApprove,
+}: {
+  expected: ExpectedEvidence
+  capabilities: AccountingCapabilities
+  pending: boolean
+  onPrepare: (draftId: string) => void
+  onApprove: (batch: PostingBatch) => void
+}) {
+  const draft = expected.draft
+  const batch = draft.postingBatch
+  const canPrepare = capabilities.canPrepare
+    && !batch
+    && (draft.status === 'needs_review' || draft.status === 'failed')
+    && draft.reviewOutcome !== 'shogo_posted'
+  const canApprove = capabilities.canApprove
+    && Boolean(batch)
+    && ['pending_approval', 'failed', 'partial_failed'].includes(batch?.status || '')
+  const retry = batch?.status === 'failed' || batch?.status === 'partial_failed'
+
+  return (
+    <Box component="section">
+      <Box display="flex" alignItems="center" justifyContent="space-between" gap={1.5} mb={1.5}>
+        <Box display="flex" alignItems="center" gap={1} minWidth={0}>
+          <AccountBalanceRounded fontSize="small" color="action" />
+          <Typography fontWeight={700}>Posting outcome</Typography>
+        </Box>
+        <Chip
+          size="small"
+          variant="outlined"
+          color={draft.status === 'posted' ? 'success' : batch?.status === 'partial_failed' || batch?.status === 'failed' ? 'error' : 'info'}
+          label={statusLabel(draft.reviewOutcome || batch?.status || draft.status)}
+        />
+      </Box>
+
+      {draft.reviewOutcome === 'shogo_posted' ? (
+        <Alert severity="success">
+          This date was already posted by Shogo. ClawPilot recorded the exact Sales Receipt and Journal Entry IDs and will not repost them.
+        </Alert>
+      ) : batch ? (
+        <Stack spacing={1.5}>
+          <Box display="grid" gridTemplateColumns={{ xs: '1fr', sm: 'repeat(2, minmax(0, 1fr))' }} gap={1.5}>
+            <DetailField label="Batch status" value={statusLabel(batch.status)} />
+            <DetailField label="Requested by" value={batch.requestedBy} />
+            <DetailField label="Sales Receipt" value={`${statusLabel(batch.salesReceipt.status)}${batch.salesReceipt.providerEntityId ? ` · ${batch.salesReceipt.providerEntityId}` : ''}`} wrap />
+            <DetailField label="Journal Entry" value={`${statusLabel(batch.journalEntry.status)}${batch.journalEntry.providerEntityId ? ` · ${batch.journalEntry.providerEntityId}` : ''}`} wrap />
+          </Box>
+          {batch.lastError ? <Alert severity="error">{batch.lastError}</Alert> : null}
+          {batch.status === 'approved' || batch.status === 'posting' ? (
+            <Alert severity="info">The worker is posting the two documents. Each document has its own idempotency key.</Alert>
+          ) : null}
+          {batch.status === 'posted' ? (
+            <Alert severity="success">Both QuickBooks documents posted successfully.</Alert>
+          ) : null}
+          {canApprove ? (
+            <Button
+              variant="contained"
+              disabled={pending}
+              onClick={() => onApprove(batch)}
+              startIcon={pending ? <CircularProgress size={16} /> : <AccountBalanceRounded />}
+            >
+              {retry ? 'Retry failed document' : 'Approve & queue 2 documents'}
+            </Button>
+          ) : null}
+        </Stack>
+      ) : (
+        <Stack spacing={1.5}>
+          <Alert severity="info">
+            ClawPilot posts one recoverable batch per business date: a Sales Receipt for sales and tax, plus a Journal Entry for tender, tips, and fees. Their totals serve different purposes and are validated independently.
+          </Alert>
+          {canPrepare ? (
+            <Button
+              variant="outlined"
+              disabled={pending}
+              onClick={() => onPrepare(draft.id)}
+              startIcon={pending ? <CircularProgress size={16} /> : <DescriptionRounded />}
+            >
+              Prepare 2-document posting
+            </Button>
+          ) : null}
+        </Stack>
+      )}
+    </Box>
+  )
+}
+
 function QuickBooksEvidenceDetails({ evidence, integrity, contextStatus, formatCents }: {
   evidence: QuickBooksEvidence
   integrity?: ReceiptIntegrity | JournalIntegrity | null
@@ -677,7 +821,15 @@ function ComparisonDetails({ expected, comparison, formatCents }: {
 export default function PosAccountingParityPanel() {
   const dateTimeSettings = useUserDateTime()
   const [report, setReport] = useState<ParityReport | null>(null)
+  const [capabilities, setCapabilities] = useState<AccountingCapabilities>({
+    canView: false,
+    canManage: false,
+    canPrepare: false,
+    canApprove: false,
+  })
   const [loading, setLoading] = useState(true)
+  const [actionPending, setActionPending] = useState(false)
+  const [actionNotice, setActionNotice] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [page, setPage] = useState(1)
   const [historyPage, setHistoryPage] = useState(1)
@@ -708,6 +860,7 @@ export default function PosAccountingParityPanel() {
         if (!response.ok || !payload.ok || !payload.report) {
           throw new Error(payload.error || 'POS posting parity is unavailable')
         }
+        if (payload.capabilities) setCapabilities(payload.capabilities)
         setReport(payload.report)
       })
       .catch((fetchError) => {
@@ -814,6 +967,78 @@ export default function PosAccountingParityPanel() {
     setHistoryPage(1)
   }
 
+  const postPostingAction = async (body: Record<string, unknown>) => {
+    setActionPending(true)
+    setActionNotice(null)
+    setError(null)
+    try {
+      const response = await fetch('/api/accounting/quickbooks/pos-posting', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        cache: 'no-store',
+        body: JSON.stringify(body),
+      })
+      const payload = await response.json() as PostingActionResponse
+      if (!response.ok || !payload.ok) throw new Error(payload.error || 'POS posting action failed')
+      return payload
+    } catch (actionError) {
+      setError((actionError as Error).message)
+      return null
+    } finally {
+      setActionPending(false)
+    }
+  }
+
+  const recordShogoRange = async () => {
+    if (!from || !to) return
+    const confirmed = window.confirm(
+      `Record complete, exact Shogo matches from ${from} through ${to}? This records reconciliation evidence only and does not write to QuickBooks.`,
+    )
+    if (!confirmed) return
+    const payload = await postPostingAction({
+      action: 'record-shogo-range',
+      fromBusinessDate: from,
+      toBusinessDate: to,
+    })
+    if (!payload?.result) return
+    setActionNotice(
+      `${payload.result.recorded} Shogo posting${payload.result.recorded === 1 ? '' : 's'} recorded; ${payload.result.alreadyRecorded} already recorded; ${payload.result.unresolved} still require review.`,
+    )
+    closeDrawer()
+    setLoading(true)
+    setRefreshToken((value) => value + 1)
+  }
+
+  const preparePosting = async (draftId: string) => {
+    const payload = await postPostingAction({ action: 'prepare-clawpilot', draftId })
+    if (!payload?.batch) return
+    setActionNotice('Prepared one Sales Receipt and one Journal Entry for review. Nothing has been posted yet.')
+    closeDrawer()
+    setLoading(true)
+    setRefreshToken((value) => value + 1)
+  }
+
+  const approvePosting = async (batch: PostingBatch) => {
+    const retry = batch.status === 'failed' || batch.status === 'partial_failed'
+    const confirmed = window.confirm(retry
+      ? 'Retry only the failed QuickBooks document? Any successful document will not be posted again.'
+      : 'Approve and queue this Sales Receipt and Journal Entry for QuickBooks posting?')
+    if (!confirmed) return
+    const payload = await postPostingAction({
+      action: 'approve-clawpilot',
+      batchId: batch.id,
+      confirmFingerprint: batch.requestFingerprint,
+      approvalNote: retry ? 'Retry failed POS accounting document' : 'Approved from POS posting parity',
+    })
+    if (!payload?.batch) return
+    setActionNotice(retry
+      ? 'The failed document was requeued; any successful document was left unchanged.'
+      : 'The two-document posting was approved and queued for QuickBooks.')
+    closeDrawer()
+    setLoading(true)
+    setRefreshToken((value) => value + 1)
+  }
+
   return (
     <Stack spacing={2}>
       <Box display="flex" alignItems={{ xs: 'flex-start', sm: 'center' }} justifyContent="space-between" gap={2} flexWrap="wrap">
@@ -821,7 +1046,7 @@ export default function PosAccountingParityPanel() {
           <Box display="flex" alignItems="center" gap={1}>
             <CompareArrowsRounded sx={{ color: '#A8C7FA' }} />
             <Typography variant="h6" fontWeight={700}>POS posting parity</Typography>
-            <Chip size="small" label="Read only" variant="outlined" />
+            <Chip size="small" label={capabilities.canApprove ? 'Review & post' : 'Read only'} variant="outlined" />
           </Box>
           <Typography variant="body2" color="text.secondary" mt={0.25}>
             Toast posting history and current ClawPilot accounting drafts
@@ -868,9 +1093,23 @@ export default function PosAccountingParityPanel() {
         />
         <Button variant="contained" disabled={dateRangeInvalid || loading} onClick={applyRange}>Apply</Button>
         {(from || to) ? <Button variant="text" onClick={clearRange}>Clear</Button> : null}
+        {capabilities.canApprove ? (
+          <Tooltip title={from && to ? 'Record strict Shogo matches without writing to QuickBooks' : 'Apply both dates before recording Shogo results'}>
+            <span>
+              <Button
+                variant="outlined"
+                disabled={!from || !to || dateRangeInvalid || loading || actionPending}
+                onClick={recordShogoRange}
+              >
+                Record matched Shogo results
+              </Button>
+            </span>
+          </Tooltip>
+        ) : null}
       </Box>
 
       {error ? <Alert severity="error">{error}</Alert> : null}
+      {actionNotice ? <Alert severity="success" onClose={() => setActionNotice(null)}>{actionNotice}</Alert> : null}
       {report?.warnings.map((warning) => <Alert key={warning} severity="warning" variant="outlined">{warning}</Alert>)}
 
       {!report && loading ? (
@@ -889,7 +1128,7 @@ export default function PosAccountingParityPanel() {
             <Box display="grid" gridTemplateColumns={{ xs: 'repeat(2, minmax(0, 1fr))', sm: 'repeat(4, minmax(0, 1fr))', lg: 'repeat(7, minmax(0, 1fr))' }} gap={2} px={{ xs: 1.5, sm: 2 }} py={2}>
               <Metric label="Records" value={baseline.summary.cachedTransactions} />
               <Metric label="Paired dates" value={baseline.summary.pairCount} tone="#A8C7FA" />
-              <Metric label="Exact pairs" value={baseline.summary.exactDocumentPairs} tone="#70D6A7" />
+              <Metric label="Exact marker pairs" value={baseline.summary.exactMarkerPairs} tone="#70D6A7" />
               <Metric label="Date fallback" value={baseline.summary.dateFallbackPairs} />
               <Metric label="Unmatched" value={baseline.summary.unmatchedEvidence} tone={baseline.summary.unmatchedEvidence ? '#F2B76D' : '#70D6A7'} />
               <Metric label="Ambiguous" value={baseline.summary.ambiguousEvidence} tone={baseline.summary.ambiguousEvidence ? '#FF8A80' : '#70D6A7'} />
@@ -927,7 +1166,7 @@ export default function PosAccountingParityPanel() {
               >
                 <Box>
                   <Typography variant="body2" fontWeight={700}>{pair.businessDate}</Typography>
-                  <Typography variant="caption" color="text.disabled">{pair.basis === 'business_date_and_document' ? 'Exact document' : 'Date fallback'}</Typography>
+                  <Typography variant="caption" color="text.disabled">{pair.basis === 'business_date_and_marker' ? 'Exact Toast marker' : 'Date fallback'}</Typography>
                 </Box>
                 <EvidenceButton evidence={pair.salesReceipt} status={pair.receiptArithmetic.status} onOpen={openHistoricalEvidence} />
                 <EvidenceButton evidence={pair.journalEntry} status={pair.journalBalance.status} onOpen={openHistoricalEvidence} />
@@ -1157,6 +1396,13 @@ export default function PosAccountingParityPanel() {
                       ) : null}
                     </Box>
                   </Box>
+                  <PostingControls
+                    expected={selection.row.expected}
+                    capabilities={capabilities}
+                    pending={actionPending}
+                    onPrepare={preparePosting}
+                    onApprove={approvePosting}
+                  />
                   <ExpectedDocumentDetails expected={selection.row.expected} formatCents={formatDelta} />
                   {selection.row.actual ? (
                     <QuickBooksEvidenceDetails
