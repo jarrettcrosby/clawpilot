@@ -325,16 +325,9 @@ function getAssociatedContacts(deal: Deal | null): Contact[] {
   return contacts
 }
 
-function contactActionScore(contact: Contact) {
-  let score = 0
-  if (contact.phone) score += 2
-  if (contact.email) score += 2
-  if (contact.title) score += 1
-  return score
-}
-
 function normalizeContactsForActionability(contacts: Contact[]) {
-  return [...contacts].sort((a, b) => contactActionScore(b) - contactActionScore(a))
+  // Relationship order is meaningful: the first selected contact is primary.
+  return [...contacts]
 }
 
 function DealCard({ deal, onClick, onMoveStage }: { deal: Deal; onClick: () => void; onMoveStage: (deal: Deal, direction: -1 | 1) => void }) {
@@ -482,28 +475,6 @@ function DealDrawer({
             }
             renderInput={(params) => <TextField {...params} label="Product" size="small" placeholder="Select configured products" helperText={products.length ? undefined : 'Add products in Pipeline setup.'} />}
           />
-          <Autocomplete
-            disabled={readOnly}
-            multiple
-            options={contactOptions.filter((contact) => !form.organizationId || contact.organizationId === form.organizationId)}
-            value={contactOptions.filter((contact) => (form.contactIds || []).includes(contact.id))}
-            getOptionLabel={(contact) => contact.name}
-            isOptionEqualToValue={(option, value) => option.id === value.id}
-            onChange={(_, contacts) => setForm({
-              ...form,
-              contactIds: contacts.map((contact) => contact.id),
-              contacts,
-            })}
-            renderOption={(props, contact) => (
-              <Box component="li" {...props} key={contact.id}>
-                <Box sx={{ minWidth: 0 }}>
-                  <Typography variant="body2" noWrap>{contact.name}</Typography>
-                  <Typography variant="caption" color="text.secondary">{contact.title || contact.email || contact.referenceCode}</Typography>
-                </Box>
-              </Box>
-            )}
-            renderInput={(params) => <TextField {...params} label="Associated contacts" size="small" placeholder="Select contacts" />}
-          />
           <TextField disabled={readOnly} label="Priority" select size="small" value={form.priority || ''} onChange={e => setForm({ ...form, priority: e.target.value })}>
             {priorities.map(p => <MenuItem key={p} value={p}>{p}</MenuItem>)}
           </TextField>
@@ -594,20 +565,6 @@ function DealDrawer({
           </TextField>
         </Stack>
 
-        {!readOnly ? <Stack direction="row" spacing={1} mt={2}>
-          <Button variant="contained" disabled={saving || !form.name.trim()} onClick={async () => {
-            try {
-              setSaving(true)
-              setError('')
-              await onSave(form)
-            } catch (error: unknown) {
-              setError(String(error instanceof Error ? error.message : error))
-            } finally {
-              setSaving(false)
-            }
-          }}>Save</Button>
-        </Stack> : null}
-
         <Divider sx={{ my: 2, borderColor: 'rgba(255,255,255,0.08)' }} />
 
         <Stack direction="row" justifyContent="space-between" alignItems="center" mb={1}>
@@ -620,6 +577,40 @@ function DealDrawer({
             />
           )}
         </Stack>
+        {!readOnly ? (
+          <Autocomplete
+            multiple
+            options={contactOptions.filter((contact) => !form.organizationId || contact.organizationId === form.organizationId)}
+            value={(form.contactIds || [])
+              .map((contactId) => contactOptions.find((contact) => contact.id === contactId))
+              .filter((contact): contact is Contact => Boolean(contact))}
+            getOptionLabel={(contact) => contact.name}
+            isOptionEqualToValue={(option, value) => option.id === value.id}
+            onChange={(_, contacts) => setForm({
+              ...form,
+              contactIds: contacts.map((contact) => contact.id),
+              contacts,
+            })}
+            renderOption={(props, contact) => (
+              <Box component="li" {...props} key={contact.id}>
+                <Box sx={{ minWidth: 0 }}>
+                  <Typography variant="body2" noWrap>{contact.name}</Typography>
+                  <Typography variant="caption" color="text.secondary">{contact.title || contact.email || contact.referenceCode}</Typography>
+                </Box>
+              </Box>
+            )}
+            renderInput={(params) => (
+              <TextField
+                {...params}
+                label="Associated contacts"
+                size="small"
+                placeholder="Select contacts"
+                helperText="Select one or more contacts, then save the opportunity. The first contact is primary."
+              />
+            )}
+            sx={{ mb: 1.5 }}
+          />
+        ) : null}
         {associatedContacts.length === 0 ? (
           <Typography variant="body2" color="text.disabled">No associated contacts on this opportunity yet.</Typography>
         ) : (
@@ -690,6 +681,20 @@ function DealDrawer({
             })}
           </Stack>
         )}
+
+        {!readOnly ? <Stack direction="row" spacing={1} mt={2}>
+          <Button variant="contained" disabled={saving || !form.name.trim()} onClick={async () => {
+            try {
+              setSaving(true)
+              setError('')
+              await onSave(form)
+            } catch (error: unknown) {
+              setError(String(error instanceof Error ? error.message : error))
+            } finally {
+              setSaving(false)
+            }
+          }}>Save opportunity</Button>
+        </Stack> : null}
 
         <Divider sx={{ my: 2, borderColor: 'rgba(255,255,255,0.08)' }} />
 

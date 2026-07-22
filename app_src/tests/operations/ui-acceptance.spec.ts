@@ -30,7 +30,7 @@ const selectedOrder = {
   status: 'shipped',
   warehouseName: 'Primary Warehouse',
   promisedDeliveryAt: '2026-08-04T21:00:00.000Z',
-  lineCount: 1,
+  lineCount: 2,
   exceptionCount: 1,
   expectedCostMinor: '1066',
   expectedRevenueMinor: '1335',
@@ -53,6 +53,14 @@ const selectedOrder = {
     productName: 'Trail Pack',
     channelSku: 'TRAIL-001',
     quantity: 2,
+    reservedQuantity: 0,
+    pickStatus: 'completed',
+  }, {
+    globalId: 'gol7654321',
+    productGlobalId: 'gp7654321',
+    productName: 'Camp Lantern',
+    channelSku: 'LANTERN-002',
+    quantity: 1,
     reservedQuantity: 0,
     pickStatus: 'completed',
   }],
@@ -109,7 +117,14 @@ function workspace(exceptionStatus: OperationsExceptionStatus = 'open') {
   return {
     organizationId: '11111111-1111-4111-8111-111111111111',
     configured: true,
-    capabilities: { canView: true, canManage: true, canExecute: true },
+    capabilities: { canView: true, canManage: true, canExecute: true, canActivate: true },
+    dataPipeline: { id: 'pipeline-id', name: 'CRM pipeline' },
+    activation: {
+      state: 'shadow',
+      revision: 1,
+      reason: 'Acceptance validation',
+      updatedAt: '2026-07-22T18:00:00.000Z',
+    },
     summary: {
       openOrders: 0,
       exceptions: exceptionStatus === 'open' || exceptionStatus === 'acknowledged' ? 1 : 0,
@@ -125,7 +140,10 @@ function workspace(exceptionStatus: OperationsExceptionStatus = 'open') {
     warehouses: [{ id: 'warehouse-id', globalId: 'gwh1234567', name: 'Primary Warehouse' }],
     catalog: {
       customers: [{ id: 'customer-id', globalId: 'ga1234567', name: 'Northstar Outfitters' }],
-      products: [{ id: 'product-id', globalId: 'gp1234567', name: 'Trail Pack', sku: 'TRAIL-001' }],
+      products: [
+        { id: 'product-id', globalId: 'gp1234567', name: 'Trail Pack', sku: 'TRAIL-001' },
+        { id: 'product-id-2', globalId: 'gp7654321', name: 'Camp Lantern', sku: 'LANTERN-002' },
+      ],
     },
     generatedAt: '2026-07-22T18:00:00.000Z',
   }
@@ -137,7 +155,10 @@ async function installOperationsRoutes(page: Page) {
     if (route.request().method() === 'POST') {
       const request = route.request().postDataJSON() as {
         action?: string
-        proof?: Record<string, unknown>
+        proof?: {
+          customerGlobalId?: string
+          lines?: Array<{ productGlobalId: string; quantity: number; openingQuantity: number }>
+        }
         exceptionGlobalId?: string
         status?: OperationsExceptionStatus
       }
@@ -152,6 +173,10 @@ async function installOperationsRoutes(page: Page) {
       }
       expect(request.action).toBe('run-proof-order')
       expect(request.proof?.customerGlobalId).toBe('ga1234567')
+      expect(request.proof?.lines).toEqual([
+        { productGlobalId: 'gp1234567', quantity: 2, openingQuantity: 12 },
+        { productGlobalId: 'gp7654321', quantity: 1, openingQuantity: 12 },
+      ])
       return route.fulfill({
         status: 201,
         json: {
@@ -176,7 +201,7 @@ test('operations workbench renders dense desktop evidence and order drill-in', a
   await gotoApp(page, '/#operations')
 
   await expect(page.getByRole('heading', { name: 'Order Workbench' })).toBeVisible()
-  await expect(page.getByText('Mock adapters')).toBeVisible()
+  await expect(page.getByText('Distributed fulfillment · CRM: CRM pipeline')).toBeVisible()
   await expect(page.getByRole('table', { name: 'Operations orders' })).toBeVisible()
   await expect(page.getByText('Northstar Outfitters').first()).toBeVisible()
   await expect(page.getByText('$13.35').first()).toBeVisible()
@@ -184,6 +209,7 @@ test('operations workbench renders dense desktop evidence and order drill-in', a
   await page.getByRole('row', { name: /PROOF-1042/ }).click()
   await expect(page.getByRole('heading', { name: 'Order PROOF-1042' })).toBeVisible()
   await expect(page.getByText('Trail Pack')).toBeVisible()
+  await expect(page.getByText('Camp Lantern')).toBeVisible()
   await expect(page.getByText('UPS · UPS Ground')).toBeVisible()
   await expect(page.getByText('Order Shipped')).toBeVisible()
   await page.getByRole('button', { name: 'Close order details' }).click()
@@ -215,6 +241,9 @@ test('operations mobile workflow has no page overflow and executes a proof order
 
   await page.getByRole('button', { name: 'Proof order' }).click()
   await expect(page.getByRole('heading', { name: 'Run proof order', exact: true })).toBeVisible()
+  await page.getByRole('button', { name: 'Add product' }).click()
+  await expect(page.getByRole('combobox', { name: 'Product 1' })).toContainText('Trail Pack')
+  await expect(page.getByRole('combobox', { name: 'Product 2' })).toContainText('Camp Lantern')
   await page.getByRole('textbox', { name: 'Address', exact: true }).fill('200 Customer Lane')
   await page.getByRole('textbox', { name: 'City', exact: true }).fill('New York')
   await page.getByRole('textbox', { name: 'State or region', exact: true }).fill('NY')

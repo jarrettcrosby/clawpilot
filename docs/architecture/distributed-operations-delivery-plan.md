@@ -15,7 +15,7 @@ app_visible: false
 
 This plan converts the distributed operations target into independently reviewable slices. Each phase must leave the database consistent, the module disabled or usable for its approved scope, and the next phase optional. No phase may claim a production provider based only on a mock, fixture, sandbox, compiled adapter, or unverified credential.
 
-The [Distributed Operations](../modules/distributed-operations.md) contract defines target behavior. The [integration and gap map](../maps/distributed-operations-integration-gap-map.md) distinguishes existing ClawPilot services from the untracked `0081_distributed_operations_foundation.sql` proposal and unimplemented gaps.
+The [Distributed Operations](../modules/distributed-operations.md) contract defines target behavior. The [integration and gap map](../maps/distributed-operations-integration-gap-map.md) distinguishes existing ClawPilot services, the implemented `0081`/`0082` development foundation, and the remaining provider and operating gaps.
 
 ## Cross-Phase Gates
 
@@ -33,7 +33,7 @@ Operations stays fail-closed on file storage. Hosted activation requires Postgre
 
 ## Current Delivery State
 
-As of 2026-07-22, the development environment has completed the bounded Phase 2 mock proof described below and exposes its tenant-scoped order workbench. The next development slice adds the first Phase 4 support capability early: a durable exception queue with audited disposition transitions. This does not advance production-provider certification or mark Phase 4 complete; command receipts, provider attempts, warehouse recovery commands, print-agent enrollment, task bridging, and live adapters remain open.
+As of 2026-07-22, the development environment has completed the bounded Phase 2 mock proof, durable exception dispositions, one canonical CRM projection per workspace, deterministic provider-customer resolution, organization activation state, and request-hashed command receipts. The full migration chain and transaction behavior run against disposable PostgreSQL in the standard Operations test. This does not advance production-provider certification or mark Phase 4 complete; webhook receipts, provider attempts, warehouse recovery commands, print-agent enrollment, task bridging, complete reconciliation health, and live adapters remain open.
 
 The exception queue deliberately stays separate from Projects tasks. An exception owns operational status and evidence. A later adapter may create or link a Projects task for collaborative work without transferring exception authority to the task module.
 
@@ -59,9 +59,9 @@ The exception queue deliberately stays separate from Projects tasks. An exceptio
 
 - Finalize typed Global ID entity registration and contract tests.
 - Correct foundation lifecycle contradictions, including immutable contract versions/directives and mutable billing status.
-- Add command receipts, webhook receipts, provider attempts, adapter capability/health state, optimizer input/candidate snapshots, and required quote identity.
+- Extend implemented command receipts with webhook receipts, provider attempts, adapter capability/health state, optimizer input/candidate snapshots, and required quote identity.
 - Add typed server permissions and least-privilege presets; keep existing non-owners denied.
-- Implement operations persistence adapters, domain transition guards, event writer, outbox writer, and feature activation control.
+- Extend the implemented operations persistence, domain transition, event, outbox, and organization activation boundaries to every production command and integration/warehouse subscope.
 - Add explicit tenant constraints and indexes for every new relationship; verify pipeline binding only resolves CRM projections and does not become operations authority.
 
 **Exit**

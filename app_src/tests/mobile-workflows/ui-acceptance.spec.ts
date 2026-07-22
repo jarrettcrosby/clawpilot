@@ -681,7 +681,7 @@ for (const viewport of MOBILE_VIEWPORTS) {
         .locator('xpath=ancestor::*[contains(@class,"MuiDrawer-paper")][1]')
       await expectUsableGeometry(drawer, 'Interaction editor drawer', 160, 280)
       await expect(drawer.getByRole('combobox', { name: 'Organization' })).toContainText('Acceptance Organization')
-      await expect(drawer.getByRole('combobox', { name: 'Contact' })).toContainText('Acceptance Contact')
+      await expect(drawer.getByText('Acceptance Contact', { exact: true })).toBeVisible()
       await expect(drawer.getByRole('combobox', { name: 'Type' })).toContainText('Call')
       await expect(drawer.getByRole('combobox', { name: 'Agent' })).toContainText('Mobile Operator')
       await expect.poll(() => organizationRequests).toBeGreaterThan(0)
@@ -818,6 +818,8 @@ for (const viewport of MOBILE_VIEWPORTS) {
       const discussionButton = page.getByRole('button', { name: 'Send discussion message' })
       await expect(discussionButton).toBeVisible()
       if (await page.getByPlaceholder(/Discuss this task with/).count()) {
+        await expect(discussionButton).toBeDisabled()
+        await discussionComposer.fill('Acceptance discussion')
         await expect(discussionButton).toBeEnabled()
       } else {
         await expect(discussionComposer).toBeDisabled()

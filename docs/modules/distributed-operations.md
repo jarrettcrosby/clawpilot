@@ -15,7 +15,7 @@ app_visible: false
 
 Provide native distributed order management, warehouse execution, carrier shipping, and 3PL billing inside ClawPilot. The module serves 3PL operators, retailers, distributors, manufacturers, and fulfillment operators without creating a second application or duplicating CRM, product, identity, audit, task, document, notification, or accounting masters.
 
-This document remains the **target contract** for the full module. The first development slice is implemented on `dev`: migration `0081_distributed_operations_foundation.sql`, a tenant-scoped order workbench, a deterministic 20-step mock order-to-ship proof, and a durable exception queue. These features prove PostgreSQL authority and application boundaries; they do not establish a production commerce, carrier, printer, optimizer, warehouse, or accounting provider.
+This document remains the **target contract** for the full module. The current development slice includes migrations `0081_distributed_operations_foundation.sql` and `0082_operations_activation_and_command_safety.sql`, a tenant-scoped order workbench, a deterministic 20-step mock order-to-ship proof, a durable exception queue, scoped activation controls, canonical CRM catalog projection, provider-customer resolution, and command receipts. These features prove PostgreSQL authority and application boundaries; they do not establish a production commerce, carrier, printer, optimizer, warehouse, or accounting provider.
 
 ## Current Development Slice
 
@@ -23,12 +23,16 @@ The implemented slice provides:
 
 - Postgres-only operations access scoped to the active workspace and explicit `viewOperations`, `manageOperations`, and execution permissions;
 - CRM organization and `gp` product resolution without cloning customer or catalog masters;
+- one explicit CRM data pipeline per workspace, deduplicated customer and product catalogs by permanent Global ID, and deterministic provider-customer matching with review-required staging for ambiguous or unmatched identities;
 - idempotent mock order import, reservation, deterministic warehouse planning, cartonization, carrier selection, pick/pack/ship, inventory-ledger evidence, billable facts, domain events, audit, and fulfillment outbox intent;
+- organization-scoped `disabled`, `shadow`, `read_only`, `active`, and `frozen` activation state with revision, reason, actor, and audit history;
+- durable command receipts that bind idempotency key, request hash, actor, correlation, status, result, attempts, and safe failure evidence;
 - responsive Orders and Exceptions views with permanent `gor` and `gex` identities;
 - audited exception transitions for acknowledge, resolve, dismiss, and reopen, with tenant isolation and retained resolution history;
-- an in-module guide that clearly labels all active providers as mocks.
+- an in-module guide that clearly labels all active providers as mocks;
+- disposable PostgreSQL acceptance coverage that applies the full migration chain and validates atomic writes, replay, rollback, append-only evidence, money totals, and cross-workspace isolation.
 
-Production activation remains out of scope until the later delivery gates verify provider credentials, webhook receipts, command receipts, provider attempts, reconciliation, operational health, and an explicitly approved organization cohort.
+Production activation remains out of scope until later delivery gates verify provider credentials, webhook receipts, provider attempts, reconciliation, complete operational health, recovery commands, and an explicitly approved integration and warehouse cohort.
 
 Normative terms in this document use **must** for an invariant, **should** for the default, and **may** for an allowed option.
 

@@ -36,6 +36,10 @@ try {
       (SELECT count(*) FROM pipeline_spaces
         WHERE id = $3::uuid AND workspace_organization_id = $1::uuid
           AND sheet_id IS NULL AND sync_enabled = false)::integer AS pipelines,
+      (SELECT count(*) FROM operations_activation_scopes
+        WHERE organization_id = $1::uuid
+          AND data_pipeline_id = $3::uuid
+          AND state = 'shadow')::integer AS operations_activation_scopes,
       (SELECT count(*) FROM project_boards
         WHERE id = $4::uuid AND workspace_organization_id = $1::uuid)::integer AS boards,
       (SELECT count(*) FROM crm_organizations WHERE pipeline_id = $3::uuid)::integer AS organizations,
@@ -116,7 +120,7 @@ try {
   `, [DEMO_WORKSPACE_ID, DEMO_EMAIL, DEMO_PIPELINE_ID, DEMO_BOARD_ID])
   const row = result.rows[0]
   if (!row || row.workspaces !== 1 || row.system_users !== 1 || row.memberships < 1
-    || row.pipelines !== 1 || row.boards !== 1
+    || row.pipelines !== 1 || row.operations_activation_scopes !== 1 || row.boards !== 1
     || row.organizations < 5 || row.contacts < 5
     || row.opportunities < 5 || row.interactions < 12 || row.invoices < 6
     || row.interactions_recent < 1 || row.interactions_follow_up < 1 || row.interactions_context < 1

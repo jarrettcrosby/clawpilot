@@ -13,13 +13,13 @@ app_visible: false
 
 ## Status And Scope
 
-This runbook governs the target distributed order, inventory, warehouse, carrier, printing, shipment, and 3PL billing module. The development environment has a Postgres-backed mock proof workbench and an audited exception queue. This runbook remains `draft` until the module has an operations health surface, scoped activation control, tested production adapters, and on-call ownership. Current general environment, backup, promotion, and restore procedures remain authoritative:
+This runbook governs the target distributed order, inventory, warehouse, carrier, printing, shipment, and 3PL billing module. The development environment has a Postgres-backed mock proof workbench, an audited exception queue, organization-scoped activation, command-receipt health, and disposable PostgreSQL acceptance. This runbook remains `draft` until the module has complete reconciliation and adapter health, tested production adapters, integration/warehouse activation subscopes, and on-call ownership. Current general environment, backup, promotion, and restore procedures remain authoritative:
 
 - [ClawPilot Environments and Deployment](clawpilot-environments.md)
 - [Railway Postgres Backups](railway-postgres-backups.md)
 - [Agent Security and Integration Isolation](agent-security-and-isolation.md)
 
-Migration `0081` and the mock workbench are development evidence only. Do not use this document as evidence that an operations worker, production provider integration, checkout callback, enrolled print agent, or live warehouse workflow is deployed.
+Migrations `0081` and `0082` and the mock workbench are development evidence only. Do not use this document as evidence that an operations worker, production provider integration, checkout callback, enrolled print agent, or live warehouse workflow is deployed.
 
 ## Exception Queue Procedure
 
@@ -58,7 +58,7 @@ One person may hold several roles for a small deployment, but the same person mu
 
 ## Activation States
 
-Runtime delivery must provide a durable, audited activation control at organization plus integration/warehouse scope:
+Runtime delivery provides durable audited organization activation. Production delivery must extend it to integration and warehouse subscopes:
 
 | State | Allowed behavior |
 | --- | --- |
@@ -77,7 +77,7 @@ The existing endpoints remain required:
 - `/api/persistence/status`: Postgres driver, reachability, and non-empty environment database fingerprint.
 - `/api/health`: migration, worker, provider, queue, and dependency health.
 
-Before activation, `/api/health` must add an `operations` section with:
+Current `/api/health` reports the `0081`/`0082` migration state, command failures, stale processing, and active/shadow organization counts. Before production activation it must additionally report:
 
 - foundation and corrective migration applied/checksum state;
 - activation state by cohort without exposing credentials;
@@ -122,7 +122,7 @@ Health reports safe codes and counts, not source payloads, addresses, labels, to
 
 ### Before Development Application
 
-1. Confirm whether `0081_distributed_operations_foundation.sql` exists in `schema_migrations` as described in the [delivery plan](../architecture/distributed-operations-delivery-plan.md).
+1. Confirm whether `0081_distributed_operations_foundation.sql` and `0082_operations_activation_and_command_safety.sql` exist in `schema_migrations` as described in the [delivery plan](../architecture/distributed-operations-delivery-plan.md).
 2. If it has applied anywhere, do not edit it. Require a later corrective migration.
 3. Run schema tests against an empty database and a restored current snapshot.
 4. Resolve every blocker in the [integration and gap map](../maps/distributed-operations-integration-gap-map.md) required for the enabled slice.

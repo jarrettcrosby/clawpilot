@@ -162,6 +162,17 @@ for (const contract of [
   assertIncludes(crmOpportunityContactsMigration, contract, 'CRM opportunity contacts migration')
 }
 
+const crmInteractionContactsMigration = read('db/migrations/0083_crm_interaction_contacts.sql')
+for (const contract of [
+  'CREATE TABLE IF NOT EXISTS crm_interaction_contacts',
+  'REFERENCES crm_interactions (pipeline_id, id)',
+  'REFERENCES crm_contacts (pipeline_id, id)',
+  'idx_crm_interaction_contacts_primary',
+  'INSERT INTO crm_interaction_contacts',
+]) {
+  assertIncludes(crmInteractionContactsMigration, contract, 'CRM interaction contacts migration')
+}
+
 const crmInteractionUserMappingMigration = read('db/migrations/0043_crm_interaction_user_mapping.sql')
 for (const contract of [
   'ADD COLUMN IF NOT EXISTS suitecrm_user_id text',
@@ -674,7 +685,7 @@ assertIncludes(crmAdapter, 'ownerUserReferenceCode: owner.referenceCode', 'stabl
 assertIncludes(crmAdapter, 'Contact owner must be an active ClawPilot user with pipeline access', 'Contact owner pipeline-access boundary')
 assertIncludes(crmAdapter, 'owner_display_name = $32', 'Contact owner identity snapshot persistence')
 assertIncludes(crmAdapter, 'Interaction agent must be an active ClawPilot user with pipeline access', 'interaction ClawPilot-user boundary')
-assertIncludes(crmAdapter, 'Interaction contact must belong to the selected organization', 'interaction contact organization boundary')
+assertIncludes(crmAdapter, 'Interaction contacts must belong to the selected organization', 'interaction contact organization boundary')
 assertIncludes(crmAdapter, 'listCrmPipelineUsersInPostgres', 'interaction agent user catalog')
 assertIncludes(crmAdapter, 'contact_id: clean(fields.contactSuiteCrmId)', 'SuiteCRM Note contact field')
 assertIncludes(crmAdapter, 'global_id_c: referenceCode', 'SuiteCRM Global ID projection')
@@ -1070,7 +1081,10 @@ assertIncludes(crmUi, 'LinkedIn URL', 'organization and contact metadata editing
 assertIncludes(crmUi, 'Postal code', 'organization and contact address metadata editing')
 assertIncludes(crmUi, 'pipelineUsers', 'interaction ClawPilot agent catalog')
 assertIncludes(crmUi, 'select required label="Type"', 'interaction controlled type selector')
-assertIncludes(crmUi, 'select label="Contact"', 'interaction contact selector')
+assertIncludes(crmUi, 'label="Contacts"', 'interaction multi-contact selector')
+assertIncludes(crmUi, 'contactIds: idList(fields.contactIds)', 'interaction multi-contact request')
+assertIncludes(crmUi, 'Use organization address', 'contact organization-address inheritance')
+assertIncludes(crmUi, 'organizationTypeOptions.map', 'organization type catalog selector')
 assertIncludes(crmUi, 'label="Agent"', 'interaction ClawPilot user selector')
 assertIncludes(crmUi, 'LEGACY_CONTACT_OWNER', 'legacy Contact owner display state')
 assertIncludes(crmUi, 'ownerUserReferenceCode: referenceCode', 'Contact owner stable-identity selection')
@@ -1096,6 +1110,8 @@ const pipelineUi = read('app_src/components/pipeline/PipelineSection.tsx')
 assertIncludes(pipelineUi, 'Open Sheet', 'pipeline Sheet command')
 assertIncludes(pipelineUi, 'Create Sheet', 'pipeline Sheet setup command')
 assertIncludes(pipelineUi, 'Restore Sheet Link', 'pipeline Sheet-link repair command')
+assertIncludes(pipelineUi, 'Select one or more contacts, then save the opportunity.', 'visible opportunity contact editor')
+assertIncludes(pipelineUi, 'Save opportunity', 'opportunity relationship save command')
 
 const crmHierarchyRoute = read('app_src/app/api/crm/hierarchy/route.ts')
 assertIncludes(crmHierarchyRoute, 'updateWorkspaceOrganizationParent', 'admin-managed organization hierarchy')
@@ -1441,6 +1457,9 @@ for (const migration of [
   '0078_pos_accounting_date_commands.sql',
   '0079_pos_accounting_posting_outcomes.sql',
   '0080_external_pos_accounting_outcomes.sql',
+  '0081_distributed_operations_foundation.sql',
+  '0082_operations_activation_and_command_safety.sql',
+  '0083_crm_interaction_contacts.sql',
 ]) {
   assertIncludes(healthRoute, migration, 'hosted POS and accounting migration health')
 }

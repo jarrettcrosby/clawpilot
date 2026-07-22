@@ -1,6 +1,7 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import type { PoolClient, QueryResultRow } from 'pg'
 import { recordAuditEvent } from '@/lib/auditWriter'
+import { normalizedCrmIdentityText } from '@/lib/crm/stableId'
 import {
   MockCarrierAdapter,
   MockCommerceAdapter,
@@ -18,9 +19,14 @@ import {
 import type { OperationsCapabilities } from '@/lib/operations/authorization'
 import type {
   Address,
+  CommerceCustomerIdentity,
+  CommerceCustomerResolution,
   CommerceOrderInput,
   MockOperationsProofInput,
+  MockOperationsProofLineInput,
   MockOperationsProofResult,
+  OperationsActivationState,
+  OperationsActivationUpdateResult,
   OperationsExceptionListItem,
   OperationsExceptionStatus,
   OperationsExceptionUpdateResult,
@@ -30,14 +36,20 @@ import type {
   OperationsWorkspace,
   PricingDirective,
 } from '@/lib/operations/types'
+import { stageCrmRecordWithClient } from '@/lib/persistence/crm'
 import {
   acquireTransactionAdvisoryLock,
   query,
   withTransaction,
 } from '@/lib/persistence/postgres'
 
-type PipelineRow = QueryResultRow & { id: string; name: string }
+type PipelineRow = QueryResultRow & { id: string; name: string; owner_email: string }
 type CustomerRow = QueryResultRow & { id: string; reference_code: string; name: string }
+type CustomerIdentityRow = CustomerRow & {
+  email: string | null
+  phone: string | null
+  website: string | null
+}
 type ProductRow = QueryResultRow & {
   id: string
   reference_code: string
@@ -63,6 +75,26 @@ type OrderIdentityRow = QueryResultRow & {
   tracking_number?: string | null
 }
 
+type ActivationRow = QueryResultRow & {
+  data_pipeline_id: string
+  pipeline_name: string
+  pipeline_owner_email: string
+  state: OperationsActivationState
+  revision: number
+  reason: string | null
+  updated_at: Date
+}
+
+type CommandReceiptRow = QueryResultRow & {
+  id: string
+  request_hash: string
+  status: 'processing' | 'succeeded' | 'failed'
+  correlation_id: string
+  result_global_id: string | null
+  attempts: number
+  updated_at: Date
+}
+
 type ExceptionRow = QueryResultRow & {
   id: string
   global_id: string
@@ -86,7 +118,7 @@ type ProofConfiguration = {
   warehouse: IdRow & { name: string; address: Record<string, unknown> }
   location: IdRow
   pool: IdRow
-  position: PositionRow
+  positions: Map<string, PositionRow>
   contractVersion: IdRow
   directives: PricingDirective[]
   printer: IdRow
@@ -183,18 +215,38 @@ function moneyMinorFromDecimal(value: unknown): number {
   return minor
 }
 
+function uniqueReferenceRows<T extends { reference_code: string }>(rows: T[]): T[] {
+  return [...new Map(rows.map((row) => [row.reference_code, row])).values()]
+}
+
 function requireOrganizationId(value: string) {
   const organizationId = String(value || '').trim()
   if (!organizationId) throw new OperationsRequestError('ACTIVE_ORGANIZATION_REQUIRED', 'Select an active organization first', 409)
   return organizationId
 }
 
-async function resolvePipeline(client: PoolClient, organizationId: string): Promise<PipelineRow> {
+const ACTIVATION_STATES = new Set<OperationsActivationState>([
+  'disabled', 'shadow', 'read_only', 'active', 'frozen',
+])
+
+async function fallbackPipeline(client: PoolClient, organizationId: string): Promise<PipelineRow> {
   const result = await client.query<PipelineRow>(
-    `SELECT id::text, name
-     FROM pipeline_spaces
-     WHERE workspace_organization_id = $1::uuid
-     ORDER BY is_default DESC, updated_at DESC, id
+    `SELECT pipeline.id::text, pipeline.name, pipeline.owner_email
+     FROM pipeline_spaces pipeline
+     LEFT JOIN app_user_organization_memberships membership
+       ON membership.user_email = pipeline.owner_email
+      AND membership.organization_id = pipeline.workspace_organization_id
+     WHERE pipeline.workspace_organization_id = $1::uuid
+     ORDER BY
+       CASE
+         WHEN membership.status = 'active' AND membership.role = 'owner' THEN 0
+         WHEN membership.status = 'active' AND membership.role = 'admin' THEN 1
+         WHEN membership.status = 'active' AND membership.role = 'member' THEN 2
+         ELSE 3
+       END,
+       pipeline.is_default DESC,
+       pipeline.updated_at DESC,
+       pipeline.id
      LIMIT 1`,
     [organizationId],
   )
@@ -206,6 +258,61 @@ async function resolvePipeline(client: PoolClient, organizationId: string): Prom
     )
   }
   return result.rows[0]
+}
+
+async function resolveActivation(
+  client: PoolClient,
+  organizationId: string,
+  lock = false,
+): Promise<ActivationRow> {
+  const read = () => client.query<ActivationRow>(
+    `SELECT activation.data_pipeline_id::text, pipeline.name AS pipeline_name,
+            pipeline.owner_email AS pipeline_owner_email,
+            activation.state, activation.revision, activation.reason,
+            activation.updated_at
+     FROM operations_activation_scopes activation
+     JOIN pipeline_spaces pipeline
+       ON pipeline.workspace_organization_id = activation.organization_id
+      AND pipeline.id = activation.data_pipeline_id
+     WHERE activation.organization_id = $1::uuid
+     ${lock ? 'FOR UPDATE OF activation' : ''}`,
+    [organizationId],
+  )
+  const existing = await read()
+  if (existing.rows[0]) return existing.rows[0]
+
+  const pipeline = await fallbackPipeline(client, organizationId)
+  await client.query(
+    `INSERT INTO operations_activation_scopes (
+       organization_id, data_pipeline_id, state, reason
+     ) VALUES ($1::uuid, $2::uuid, 'shadow', $3)
+     ON CONFLICT (organization_id) DO NOTHING`,
+    [organizationId, pipeline.id, 'Initial authoritative CRM projection selected by Operations'],
+  )
+  const created = await read()
+  if (!created.rows[0]) {
+    throw new OperationsRequestError('OPERATIONS_ACTIVATION_UNAVAILABLE', 'Operations activation could not be initialized', 409)
+  }
+  return created.rows[0]
+}
+
+async function resolvePipeline(client: PoolClient, organizationId: string): Promise<PipelineRow> {
+  const activation = await resolveActivation(client, organizationId)
+  return {
+    id: activation.data_pipeline_id,
+    name: activation.pipeline_name,
+    owner_email: activation.pipeline_owner_email,
+  }
+}
+
+function activationPayload(row: ActivationRow): OperationsActivationUpdateResult {
+  return {
+    state: row.state,
+    revision: row.revision,
+    reason: row.reason,
+    updatedAt: row.updated_at.toISOString(),
+    dataPipeline: { id: row.data_pipeline_id, name: row.pipeline_name },
+  }
 }
 
 async function resolveCustomer(
@@ -242,6 +349,369 @@ async function resolveProduct(
     throw new OperationsRequestError('OPERATIONS_PRODUCT_NOT_FOUND', 'Select an active CRM product from the active workspace', 404)
   }
   return result.rows[0]
+}
+
+const GENERIC_EMAIL_DOMAINS = new Set([
+  'aol.com', 'gmail.com', 'hotmail.com', 'icloud.com', 'live.com', 'me.com',
+  'msn.com', 'outlook.com', 'proton.me', 'protonmail.com', 'yahoo.com',
+])
+
+function trimmed(value: unknown, maximum = 500): string {
+  const result = String(value ?? '').trim()
+  if (result.length > maximum || /[\u0000-\u001f\u007f]/.test(result)) {
+    throw new OperationsRequestError('OPERATIONS_CUSTOMER_IDENTITY_INVALID', 'Commerce customer identity is invalid')
+  }
+  return result
+}
+
+function normalizedPhone(value: unknown): string {
+  const digits = trimmed(value, 50).replace(/\D/g, '')
+  return digits.length >= 7 ? digits : ''
+}
+
+function emailDomain(value: unknown): string {
+  const email = normalizedCrmIdentityText(value)
+  const domain = email.includes('@') ? email.split('@').at(-1) || '' : ''
+  return domain && !GENERIC_EMAIL_DOMAINS.has(domain) ? domain : ''
+}
+
+function websiteDomain(value: unknown): string {
+  const website = trimmed(value, 300).toLowerCase()
+  if (!website) return ''
+  try {
+    const parsed = new URL(website.includes('://') ? website : `https://${website}`)
+    return parsed.hostname.replace(/^www\./, '')
+  } catch {
+    return ''
+  }
+}
+
+function customerDomains(customer: CustomerIdentityRow): Set<string> {
+  return new Set([
+    websiteDomain(customer.website),
+    emailDomain(customer.email),
+  ].filter(Boolean))
+}
+
+function customerResolution(
+  method: CommerceCustomerResolution['method'],
+  candidates: CustomerIdentityRow[],
+): CommerceCustomerResolution | null {
+  const unique = [...new Map(candidates.map((candidate) => [candidate.reference_code, candidate])).values()]
+  if (unique.length === 0) return null
+  if (unique.length > 1) {
+    return {
+      status: 'ambiguous',
+      method: 'ambiguous',
+      customer: null,
+      candidateGlobalIds: unique.map((candidate) => candidate.reference_code).sort(),
+    }
+  }
+  const customer = unique[0]
+  return {
+    status: 'matched',
+    method,
+    customer: { id: customer.id, globalId: customer.reference_code, name: customer.name },
+    candidateGlobalIds: [],
+  }
+}
+
+function customerIdentityLockKey(identity: CommerceCustomerIdentity, companyName: string): string {
+  const identityFingerprint = JSON.stringify({
+    name: normalizedCrmIdentityText(companyName),
+    email: normalizedCrmIdentityText(identity.email),
+    phone: normalizedPhone(identity.phone),
+    domain: websiteDomain(identity.website) || emailDomain(identity.email),
+    postalCode: normalizedCrmIdentityText(identity.postalCode),
+  })
+  return createHash('sha256').update(identityFingerprint).digest('hex')
+}
+
+async function resolveCrmMutationActor(
+  client: PoolClient,
+  pipeline: PipelineRow,
+  requestedActor: string,
+): Promise<string> {
+  const result = await client.query<QueryResultRow & { email: string }>(
+    `SELECT email
+     FROM app_users
+     WHERE lower(email) IN (lower($1), lower($2))
+       AND status = 'active'
+     ORDER BY CASE WHEN lower(email) = lower($1) THEN 0 ELSE 1 END
+     LIMIT 1`,
+    [requestedActor, pipeline.owner_email],
+  )
+  if (!result.rows[0]?.email) {
+    throw new OperationsRequestError(
+      'OPERATIONS_CUSTOMER_ACTOR_UNAVAILABLE',
+      'The authoritative CRM projection has no active application owner for customer creation',
+      409,
+    )
+  }
+  return result.rows[0].email
+}
+
+async function bindCommerceCustomerExternalId(
+  client: PoolClient,
+  input: {
+    organizationId: string
+    integrationAccountId: string
+    externalCustomerId: string
+    customer: { globalId: string }
+    method: CommerceCustomerResolution['method']
+    evidence: Record<string, unknown>
+  },
+) {
+  await client.query(
+    `INSERT INTO operations_external_identifiers (
+       organization_id, integration_account_id, entity_type, entity_global_id,
+       external_id, status, match_method, match_evidence, last_verified_at
+     ) VALUES ($1::uuid, $2::uuid, 'crm.organization', $3, $4,
+       'active', $5, $6::jsonb, now())
+     ON CONFLICT (organization_id, integration_account_id, entity_type, external_id)
+     DO UPDATE SET entity_global_id = EXCLUDED.entity_global_id,
+                   status = 'active',
+                   match_method = EXCLUDED.match_method,
+                   match_evidence = EXCLUDED.match_evidence,
+                   last_verified_at = now()`,
+    [
+      input.organizationId,
+      input.integrationAccountId,
+      input.customer.globalId,
+      input.externalCustomerId,
+      input.method,
+      JSON.stringify(input.evidence),
+    ],
+  )
+}
+
+export async function resolveCommerceCustomerInPostgres(input: {
+  organizationId: string
+  integrationAccountGlobalId: string
+  actorEmail: string
+  identity: CommerceCustomerIdentity
+}): Promise<CommerceCustomerResolution> {
+  const organizationId = requireOrganizationId(input.organizationId)
+  const actorEmail = trimmed(input.actorEmail, 320).toLowerCase()
+  const integrationAccountGlobalId = trimmed(input.integrationAccountGlobalId, 20)
+  const provider = trimmed(input.identity.provider, 100).toLowerCase()
+  const externalCustomerId = trimmed(input.identity.externalCustomerId, 300)
+  const companyName = trimmed(input.identity.companyName, 200)
+  if (!actorEmail || !integrationAccountGlobalId || !provider || !externalCustomerId || !companyName) {
+    throw new OperationsRequestError('OPERATIONS_CUSTOMER_IDENTITY_INVALID', 'Commerce customer identity is incomplete')
+  }
+
+  return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `operations:commerce-customer:${organizationId}:${integrationAccountGlobalId}:${externalCustomerId}`,
+    )
+    await acquireTransactionAdvisoryLock(
+      client,
+      `operations:commerce-customer-identity:${organizationId}:${customerIdentityLockKey(input.identity, companyName)}`,
+    )
+    const integrationResult = await client.query<IdRow & { provider: string }>(
+      `SELECT id::text, global_id, provider
+       FROM operations_integration_accounts
+       WHERE organization_id = $1::uuid AND global_id = $2
+         AND integration_type = 'commerce' AND status = 'active'
+       LIMIT 1`,
+      [organizationId, integrationAccountGlobalId],
+    )
+    const integration = integrationResult.rows[0]
+    if (!integration || integration.provider.toLowerCase() !== provider) {
+      throw new OperationsRequestError(
+        'OPERATIONS_COMMERCE_INTEGRATION_NOT_FOUND',
+        'Select an active commerce integration for this provider',
+        404,
+      )
+    }
+    const pipeline = await resolvePipeline(client, organizationId)
+    const mapped = await client.query<CustomerIdentityRow>(
+      `SELECT customer.id::text, customer.reference_code, customer.name,
+              customer.email, customer.phone, customer.website
+       FROM operations_external_identifiers external_id
+       JOIN crm_organizations customer
+         ON customer.pipeline_id = $3::uuid
+        AND customer.reference_code = external_id.entity_global_id
+       WHERE external_id.organization_id = $1::uuid
+         AND external_id.integration_account_id = $2::uuid
+         AND external_id.entity_type = 'crm.organization'
+         AND external_id.external_id = $4
+         AND external_id.status = 'active'
+       LIMIT 1`,
+      [organizationId, integration.id, pipeline.id, externalCustomerId],
+    )
+    if (mapped.rows[0]) {
+      const customer = mapped.rows[0]
+      await bindCommerceCustomerExternalId(client, {
+        organizationId,
+        integrationAccountId: integration.id,
+        externalCustomerId,
+        customer: { globalId: customer.reference_code },
+        method: 'external_id',
+        evidence: { provider, externalCustomerId },
+      })
+      return {
+        status: 'matched',
+        method: 'external_id',
+        customer: { id: customer.id, globalId: customer.reference_code, name: customer.name },
+        candidateGlobalIds: [],
+      }
+    }
+
+    const candidates = await client.query<CustomerIdentityRow>(
+      `SELECT id::text, reference_code, name, email, phone, website
+       FROM crm_organizations
+       WHERE pipeline_id = $1::uuid
+         AND COALESCE(lower(source_payload->>'archived'), 'false') NOT IN ('true', '1', 'yes')
+       ORDER BY updated_at DESC, id
+       LIMIT 1000`,
+      [pipeline.id],
+    )
+    const normalizedEmail = normalizedCrmIdentityText(input.identity.email)
+    const normalizedName = normalizedCrmIdentityText(companyName)
+    const phone = normalizedPhone(input.identity.phone)
+    const contactCandidates = normalizedEmail
+      ? await client.query<CustomerIdentityRow>(
+        `SELECT organization.id::text, organization.reference_code, organization.name,
+                organization.email, organization.phone, organization.website
+         FROM crm_contacts contact
+         JOIN crm_organizations organization
+           ON organization.pipeline_id = contact.pipeline_id
+          AND organization.id = contact.organization_id
+         WHERE contact.pipeline_id = $1::uuid
+           AND lower(btrim(contact.email)) = $2
+           AND COALESCE(lower(contact.source_payload->>'archived'), 'false') NOT IN ('true', '1', 'yes')
+           AND COALESCE(lower(organization.source_payload->>'archived'), 'false') NOT IN ('true', '1', 'yes')
+         ORDER BY organization.updated_at DESC, organization.id`,
+        [pipeline.id, normalizedEmail],
+      )
+      : { rows: [] as CustomerIdentityRow[] }
+    const domains = new Set([
+      websiteDomain(input.identity.website),
+      emailDomain(input.identity.email),
+    ].filter(Boolean))
+    const matchTiers: Array<{
+      method: CommerceCustomerResolution['method']
+      candidates: CustomerIdentityRow[]
+    }> = [
+      {
+        method: 'email',
+        candidates: normalizedEmail
+          ? candidates.rows.filter((candidate) => normalizedCrmIdentityText(candidate.email) === normalizedEmail)
+          : [],
+      },
+      {
+        method: 'contact_email',
+        candidates: contactCandidates.rows,
+      },
+      {
+        method: 'website_domain',
+        candidates: domains.size
+          ? candidates.rows.filter((candidate) => [...customerDomains(candidate)].some((domain) => domains.has(domain)))
+          : [],
+      },
+      {
+        method: 'name_phone',
+        candidates: phone
+          ? candidates.rows.filter((candidate) => (
+            normalizedCrmIdentityText(candidate.name) === normalizedName
+            && normalizedPhone(candidate.phone) === phone
+          ))
+          : [],
+      },
+      {
+        method: 'exact_name',
+        candidates: candidates.rows.filter((candidate) => normalizedCrmIdentityText(candidate.name) === normalizedName),
+      },
+    ]
+
+    for (const tier of matchTiers) {
+      const resolution = customerResolution(tier.method, tier.candidates)
+      if (!resolution) continue
+      if (resolution.status === 'ambiguous') {
+        await recordAuditEvent({
+          actor: actorEmail,
+          eventType: 'operations.customer_resolution.review_required',
+          aggregateType: 'operations.integration_account',
+          aggregateId: integration.global_id,
+          subject: companyName,
+          organizationId,
+          eventKey: `operations:customer-resolution:${integration.global_id}:${externalCustomerId}:ambiguous`,
+          payload: {
+            provider,
+            externalCustomerId,
+            attemptedMethod: tier.method,
+            candidateGlobalIds: resolution.candidateGlobalIds,
+          },
+        }, client)
+        return resolution
+      }
+      await bindCommerceCustomerExternalId(client, {
+        organizationId,
+        integrationAccountId: integration.id,
+        externalCustomerId,
+        customer: { globalId: resolution.customer!.globalId },
+        method: resolution.method,
+        evidence: { provider, externalCustomerId, matchedBy: resolution.method },
+      })
+      return resolution
+    }
+
+    const workspaceRoot = await client.query<QueryResultRow & { id: string; suitecrm_id: string | null }>(
+      `SELECT id::text, suitecrm_id
+       FROM crm_organizations
+       WHERE pipeline_id = $1::uuid AND workspace_organization_id = $2::uuid
+       ORDER BY CASE relationship_type WHEN 'workspace_root' THEN 0 ELSE 1 END, updated_at DESC
+       LIMIT 1`,
+      [pipeline.id, organizationId],
+    )
+    const root = workspaceRoot.rows[0]
+    const crmMutationActor = await resolveCrmMutationActor(client, pipeline, actorEmail)
+    const staged = await stageCrmRecordWithClient(client, {
+      entity: 'organizations',
+      pipelineId: pipeline.id,
+      sourceKey: `commerce:${provider}:${externalCustomerId}`,
+      sourcePayload: {
+        source: 'commerce_provider',
+        provider,
+        externalCustomerId,
+        requestedActor: actorEmail,
+      },
+      actorEmail: crmMutationActor,
+      fields: {
+        parentOrganizationId: root?.id || null,
+        parentOrganizationSuiteCrmId: root?.suitecrm_id || null,
+        relationshipType: 'customer',
+        name: companyName,
+        website: trimmed(input.identity.website, 300) || undefined,
+        phone: trimmed(input.identity.phone, 50) || undefined,
+        email: trimmed(input.identity.email, 320) || undefined,
+        address: trimmed(input.identity.address, 300) || undefined,
+        city: trimmed(input.identity.city, 100) || undefined,
+        state: trimmed(input.identity.region, 100) || undefined,
+        postalCode: trimmed(input.identity.postalCode, 30) || undefined,
+        country: trimmed(input.identity.country, 100) || undefined,
+        description: `Created from ${provider} customer ${externalCustomerId}.`,
+      },
+    })
+    const created: CommerceCustomerResolution = {
+      status: 'created',
+      method: 'created',
+      customer: { id: staged.id, globalId: staged.referenceCode, name: companyName },
+      candidateGlobalIds: [],
+    }
+    await bindCommerceCustomerExternalId(client, {
+      organizationId,
+      integrationAccountId: integration.id,
+      externalCustomerId,
+      customer: { globalId: staged.referenceCode },
+      method: 'created',
+      evidence: { provider, externalCustomerId, created: true },
+    })
+    return created
+  })
 }
 
 async function appendDomainEvent(client: PoolClient, input: {
@@ -281,7 +751,7 @@ async function ensureProofConfiguration(
     organizationId: string
     pipeline: PipelineRow
     customer: CustomerRow
-    product: ProductRow
+    products: ProductRow[]
     actorEmail: string
     currency: string
   },
@@ -372,47 +842,50 @@ async function ensureProofConfiguration(
     [input.organizationId, pool.id, input.pipeline.id, input.customer.id, input.actorEmail],
   )
 
-  await client.query(
-    `INSERT INTO operations_product_mappings (
-       organization_id, integration_account_id, pipeline_id, product_id,
-       channel_sku, external_product_id, active, created_by
-     ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, true, $7)
-     ON CONFLICT (organization_id, integration_account_id, channel_sku)
-     DO UPDATE SET pipeline_id = EXCLUDED.pipeline_id, product_id = EXCLUDED.product_id,
-       external_product_id = EXCLUDED.external_product_id, active = true, updated_at = now()`,
-    [
-      input.organizationId,
-      integration.id,
-      input.pipeline.id,
-      input.product.id,
-      input.product.sku || input.product.reference_code,
-      input.product.reference_code,
-      input.actorEmail,
-    ],
-  )
+  const positions = new Map<string, PositionRow>()
+  for (const product of [...input.products].sort((left, right) => left.id.localeCompare(right.id))) {
+    await client.query(
+      `INSERT INTO operations_product_mappings (
+         organization_id, integration_account_id, pipeline_id, product_id,
+         channel_sku, external_product_id, active, created_by
+       ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, true, $7)
+       ON CONFLICT (organization_id, integration_account_id, channel_sku)
+       DO UPDATE SET pipeline_id = EXCLUDED.pipeline_id, product_id = EXCLUDED.product_id,
+         external_product_id = EXCLUDED.external_product_id, active = true, updated_at = now()`,
+      [
+        input.organizationId,
+        integration.id,
+        input.pipeline.id,
+        product.id,
+        product.sku || product.reference_code,
+        product.reference_code,
+        input.actorEmail,
+      ],
+    )
 
-  const positionInsert = await client.query<IdRow>(
-    `INSERT INTO operations_inventory_positions (
-       organization_id, pipeline_id, warehouse_id, location_id, pool_id, product_id
-     ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6::uuid)
-     ON CONFLICT (organization_id, warehouse_id, location_id, pool_id, product_id, lot_code)
-     DO UPDATE SET updated_at = operations_inventory_positions.updated_at
-     RETURNING id::text, global_id`,
-    [input.organizationId, input.pipeline.id, warehouse.id, location.id, pool.id, input.product.id],
-  )
-  const positionResult = await client.query<PositionRow>(
-    `SELECT position.id::text, position.global_id,
-            position.warehouse_id::text, warehouse.global_id AS warehouse_global_id,
-            warehouse.name AS warehouse_name, position.location_id::text,
-            position.on_hand_quantity::text, position.reserved_quantity::text
-     FROM operations_inventory_positions position
-     JOIN operations_warehouses warehouse
-       ON warehouse.organization_id = position.organization_id AND warehouse.id = position.warehouse_id
-     WHERE position.organization_id = $1::uuid AND position.id = $2::uuid
-     FOR UPDATE OF position`,
-    [input.organizationId, positionInsert.rows[0].id],
-  )
-  const position = positionResult.rows[0]
+    const positionInsert = await client.query<IdRow>(
+      `INSERT INTO operations_inventory_positions (
+         organization_id, pipeline_id, warehouse_id, location_id, pool_id, product_id
+       ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6::uuid)
+       ON CONFLICT (organization_id, warehouse_id, location_id, pool_id, product_id, lot_code)
+       DO UPDATE SET updated_at = operations_inventory_positions.updated_at
+       RETURNING id::text, global_id`,
+      [input.organizationId, input.pipeline.id, warehouse.id, location.id, pool.id, product.id],
+    )
+    const positionResult = await client.query<PositionRow>(
+      `SELECT position.id::text, position.global_id,
+              position.warehouse_id::text, warehouse.global_id AS warehouse_global_id,
+              warehouse.name AS warehouse_name, position.location_id::text,
+              position.on_hand_quantity::text, position.reserved_quantity::text
+       FROM operations_inventory_positions position
+       JOIN operations_warehouses warehouse
+         ON warehouse.organization_id = position.organization_id AND warehouse.id = position.warehouse_id
+       WHERE position.organization_id = $1::uuid AND position.id = $2::uuid
+       FOR UPDATE OF position`,
+      [input.organizationId, positionInsert.rows[0].id],
+    )
+    positions.set(product.id, positionResult.rows[0])
+  }
 
   const contractName = `Mock proof fulfillment ${input.currency}`
   const contractResult = await client.query<IdRow>(
@@ -506,7 +979,7 @@ async function ensureProofConfiguration(
     [input.organizationId, JSON.stringify({ printerGlobalId: printer.global_id }), input.actorEmail],
   )
 
-  return { integration, warehouse, location, pool, position, contractVersion, directives, printer }
+  return { integration, warehouse, location, pool, positions, contractVersion, directives, printer }
 }
 
 async function transitionOrder(
@@ -581,7 +1054,7 @@ async function prepareAndReserveInventory(
         onHand,
         reserved,
         input.order.global_id,
-        `${input.order.global_id}:opening-balance`,
+        `${input.order.global_id}:${input.orderLine.global_id}:opening-balance`,
         input.actorEmail,
       ],
     )
@@ -616,7 +1089,7 @@ async function prepareAndReserveInventory(
       input.orderLine.id,
       input.position.id,
       input.quantity,
-      `${input.order.global_id}:reservation`,
+      `${input.order.global_id}:${input.orderLine.global_id}:reservation`,
       input.actorEmail,
     ],
   )
@@ -633,7 +1106,7 @@ async function prepareAndReserveInventory(
       onHand,
       reserved,
       input.order.global_id,
-      `${input.order.global_id}:reservation-ledger`,
+      `${input.order.global_id}:${input.orderLine.global_id}:reservation-ledger`,
       input.actorEmail,
     ],
   )
@@ -696,7 +1169,7 @@ async function consumeReservedInventory(
       onHand,
       reserved,
       input.order.global_id,
-      `${input.order.global_id}:shipment-ledger`,
+      `${input.order.global_id}:${input.reservation.global_id}:shipment-ledger`,
       input.actorEmail,
     ],
   )
@@ -897,6 +1370,7 @@ export async function readOperationsWorkspaceFromPostgres(input: {
   selectedOrderGlobalId?: string | null
 }): Promise<OperationsWorkspace> {
   const organizationId = requireOrganizationId(input.organizationId)
+  const activation = await withTransaction((client) => resolveActivation(client, organizationId))
   const values: unknown[] = [organizationId]
   const where = ['orders.organization_id = $1::uuid']
   const exceptionValues: unknown[] = [organizationId]
@@ -1015,18 +1489,16 @@ export async function readOperationsWorkspaceFromPostgres(input: {
     query<CustomerRow>(
       `SELECT customer.id::text, customer.reference_code, customer.name
        FROM crm_organizations customer
-       JOIN pipeline_spaces pipeline ON pipeline.id = customer.pipeline_id
-       WHERE pipeline.workspace_organization_id = $1::uuid
+       WHERE customer.pipeline_id = $1::uuid
        ORDER BY lower(customer.name), customer.id LIMIT 500`,
-      [organizationId],
+      [activation.data_pipeline_id],
     ),
     query<ProductRow>(
       `SELECT product.id::text, product.reference_code, product.name, NULLIF(btrim(product.sku), '') AS sku, product.price::text
        FROM crm_products product
-       JOIN pipeline_spaces pipeline ON pipeline.id = product.pipeline_id
-       WHERE pipeline.workspace_organization_id = $1::uuid AND product.active = true
+       WHERE product.pipeline_id = $1::uuid AND product.active = true
        ORDER BY lower(product.name), product.id LIMIT 500`,
-      [organizationId],
+      [activation.data_pipeline_id],
     ),
   ])
 
@@ -1054,6 +1526,16 @@ export async function readOperationsWorkspaceFromPostgres(input: {
     organizationId,
     configured: configuredResult.rows[0]?.configured === true,
     capabilities: input.capabilities,
+    dataPipeline: {
+      id: activation.data_pipeline_id,
+      name: activation.pipeline_name,
+    },
+    activation: {
+      state: activation.state,
+      revision: activation.revision,
+      reason: activation.reason,
+      updatedAt: activation.updated_at.toISOString(),
+    },
     summary: {
       openOrders: Number(summary?.open_orders || 0),
       exceptions: Number(summary?.exceptions || 0),
@@ -1068,11 +1550,77 @@ export async function readOperationsWorkspaceFromPostgres(input: {
     selectedOrder: selectedGlobalId ? await readOrderDetail(organizationId, selectedGlobalId) : null,
     warehouses: warehouseResult.rows.map((row) => ({ id: row.id, globalId: row.global_id, name: row.name })),
     catalog: {
-      customers: customerResult.rows.map((row) => ({ id: row.id, globalId: row.reference_code, name: row.name })),
-      products: productResult.rows.map((row) => ({ id: row.id, globalId: row.reference_code, name: row.name, sku: row.sku })),
+      customers: uniqueReferenceRows(customerResult.rows).map((row) => ({ id: row.id, globalId: row.reference_code, name: row.name })),
+      products: uniqueReferenceRows(productResult.rows).map((row) => ({ id: row.id, globalId: row.reference_code, name: row.name, sku: row.sku })),
     },
     generatedAt: new Date().toISOString(),
   }
+}
+
+export async function updateOperationsActivationInPostgres(input: {
+  organizationId: string
+  actorEmail: string
+  state: OperationsActivationState
+  reason?: string | null
+}): Promise<OperationsActivationUpdateResult> {
+  const organizationId = requireOrganizationId(input.organizationId)
+  const actorEmail = trimmed(input.actorEmail, 320).toLowerCase()
+  if (!actorEmail) throw new OperationsRequestError('OPERATIONS_ACTOR_REQUIRED', 'A signed-in user is required', 401)
+  if (!ACTIVATION_STATES.has(input.state)) {
+    throw new OperationsRequestError('OPERATIONS_ACTIVATION_STATE_INVALID', 'Operations activation state is invalid')
+  }
+  const reason = trimmed(input.reason, 500) || null
+
+  return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(client, `operations:activation:${organizationId}`)
+    const current = await resolveActivation(client, organizationId, true)
+    if (input.state === 'active') {
+      const providers = await client.query<QueryResultRow & { integration_type: string }>(
+        `SELECT DISTINCT integration_type
+         FROM operations_integration_accounts
+         WHERE organization_id = $1::uuid AND environment = 'production'
+           AND status = 'active'
+           AND integration_type IN ('commerce', 'carrier', 'printing')`,
+        [organizationId],
+      )
+      const available = new Set(providers.rows.map((row) => row.integration_type))
+      const missing = ['commerce', 'carrier', 'printing'].filter((type) => !available.has(type))
+      if (missing.length) {
+        throw new OperationsRequestError(
+          'OPERATIONS_LIVE_PROVIDER_REQUIRED',
+          `Live activation requires production ${missing.join(', ')} integration${missing.length === 1 ? '' : 's'}`,
+          409,
+        )
+      }
+    }
+    if (current.state === input.state && current.reason === reason) return activationPayload(current)
+
+    await client.query(
+      `UPDATE operations_activation_scopes
+       SET state = $2, reason = $3, revision = revision + 1,
+           updated_by = $4, updated_at = now()
+       WHERE organization_id = $1::uuid`,
+      [organizationId, input.state, reason, actorEmail],
+    )
+    const updated = await resolveActivation(client, organizationId)
+    await recordAuditEvent({
+      actor: actorEmail,
+      eventType: 'operations.activation.updated',
+      aggregateType: 'operations.activation',
+      aggregateId: organizationId,
+      subject: updated.pipeline_name,
+      organizationId,
+      eventKey: `operations:activation:${organizationId}:revision:${updated.revision}`,
+      payload: {
+        previousState: current.state,
+        state: updated.state,
+        revision: updated.revision,
+        reason: updated.reason,
+        dataPipelineId: updated.data_pipeline_id,
+      },
+    }, client)
+    return activationPayload(updated)
+  })
 }
 
 async function readException(
@@ -1188,6 +1736,190 @@ export async function updateOperationsExceptionInPostgres(input: {
   })
 }
 
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
+  if (value && typeof value === 'object') {
+    const source = value as Record<string, unknown>
+    return `{${Object.keys(source).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(source[key])}`).join(',')}}`
+  }
+  return JSON.stringify(value) ?? 'null'
+}
+
+function commandRequestHash(value: unknown): string {
+  return createHash('sha256').update(canonicalJson(value)).digest('hex')
+}
+
+async function prepareCommandReceipt(input: {
+  organizationId: string
+  commandType: string
+  idempotencyKey: string
+  requestHash: string
+  actorEmail: string
+}): Promise<{ receipt: CommandReceiptRow; completed: boolean }> {
+  return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `operations:command-receipt:${input.organizationId}:${input.commandType}:${input.idempotencyKey}`,
+    )
+    const existing = await client.query<CommandReceiptRow>(
+      `SELECT id::text, request_hash, status, correlation_id::text,
+              result_global_id, attempts, updated_at
+       FROM operations_command_receipts
+       WHERE organization_id = $1::uuid AND command_type = $2 AND idempotency_key = $3
+       FOR UPDATE`,
+      [input.organizationId, input.commandType, input.idempotencyKey],
+    )
+    const receipt = existing.rows[0]
+    if (receipt) {
+      if (receipt.request_hash !== input.requestHash) {
+        throw new OperationsRequestError(
+          'OPERATIONS_IDEMPOTENCY_CONFLICT',
+          'This external order ID was already used with different order data',
+          409,
+        )
+      }
+      if (receipt.status === 'succeeded') return { receipt, completed: true }
+      if (receipt.status === 'processing' && Date.now() - receipt.updated_at.getTime() < 5 * 60_000) {
+        throw new OperationsRequestError(
+          'OPERATIONS_COMMAND_IN_PROGRESS',
+          'This order command is already being processed',
+          409,
+        )
+      }
+      const retried = await client.query<CommandReceiptRow>(
+        `UPDATE operations_command_receipts
+         SET status = 'processing', actor_email = $2, attempts = attempts + 1,
+             error_code = NULL, error_message = NULL, completed_at = NULL,
+             started_at = now(), updated_at = now()
+         WHERE id = $1::uuid
+         RETURNING id::text, request_hash, status, correlation_id::text,
+                   result_global_id, attempts, updated_at`,
+        [receipt.id, input.actorEmail],
+      )
+      return { receipt: retried.rows[0], completed: false }
+    }
+    const created = await client.query<CommandReceiptRow>(
+      `INSERT INTO operations_command_receipts (
+         organization_id, command_type, idempotency_key, request_hash,
+         actor_email, status, correlation_id
+       ) VALUES ($1::uuid, $2, $3, $4, $5, 'processing', $6::uuid)
+       RETURNING id::text, request_hash, status, correlation_id::text,
+                 result_global_id, attempts, updated_at`,
+      [
+        input.organizationId,
+        input.commandType,
+        input.idempotencyKey,
+        input.requestHash,
+        input.actorEmail,
+        randomUUID(),
+      ],
+    )
+    return { receipt: created.rows[0], completed: false }
+  })
+}
+
+async function completeCommandReceipt(
+  client: PoolClient,
+  receiptId: string,
+  resultGlobalId: string,
+) {
+  await client.query(
+    `UPDATE operations_command_receipts
+     SET status = 'succeeded', result_global_id = $2,
+         error_code = NULL, error_message = NULL,
+         completed_at = now(), updated_at = now()
+     WHERE id = $1::uuid`,
+    [receiptId, resultGlobalId],
+  )
+}
+
+async function failCommandReceipt(receiptId: string, error: unknown) {
+  const code = error instanceof OperationsRequestError
+    ? error.code
+    : 'OPERATIONS_REQUEST_FAILED'
+  const message = error instanceof Error
+    ? error.message.slice(0, 500)
+    : 'Operations request failed'
+  try {
+    await query(
+      `UPDATE operations_command_receipts
+       SET status = 'failed', error_code = $2, error_message = $3,
+           completed_at = now(), updated_at = now()
+       WHERE id = $1::uuid AND status = 'processing'`,
+      [receiptId, code, message],
+    )
+  } catch {
+    // Preserve the command failure even if receipt persistence is unavailable.
+  }
+}
+
+async function completedProofResult(
+  organizationId: string,
+  orderGlobalId: string | null,
+): Promise<MockOperationsProofResult> {
+  if (!orderGlobalId) {
+    throw new OperationsRequestError('OPERATIONS_COMMAND_RECEIPT_INVALID', 'Completed command receipt has no order result', 409)
+  }
+  const result = await query<OrderIdentityRow>(
+    `SELECT orders.id::text, orders.global_id, orders.status, shipment.tracking_number
+     FROM operations_orders orders
+     LEFT JOIN LATERAL (
+       SELECT tracking_number FROM operations_shipments candidate
+       WHERE candidate.organization_id = orders.organization_id
+         AND candidate.order_id = orders.id
+       ORDER BY candidate.shipped_at DESC LIMIT 1
+     ) shipment ON true
+     WHERE orders.organization_id = $1::uuid AND orders.global_id = $2
+     LIMIT 1`,
+    [organizationId, orderGlobalId],
+  )
+  const order = result.rows[0]
+  if (!order) {
+    throw new OperationsRequestError('OPERATIONS_COMMAND_RECEIPT_INVALID', 'Completed order result is unavailable', 409)
+  }
+  return {
+    orderGlobalId: order.global_id,
+    orderStatus: order.status,
+    duplicate: true,
+    trackingNumber: order.tracking_number || null,
+    steps: [...MOCK_PROOF_STEPS],
+  }
+}
+
+function canonicalProofLines(proof: MockOperationsProofInput): MockOperationsProofLineInput[] {
+  const suppliedLines = proof.lines?.length
+    ? proof.lines
+    : [{
+        productGlobalId: proof.productGlobalId || '',
+        quantity: Number(proof.quantity),
+        openingQuantity: Number(proof.openingQuantity),
+      }]
+  if (suppliedLines.length < 1 || suppliedLines.length > 25) {
+    throw new OperationsRequestError(
+      'OPERATIONS_ORDER_LINES_INVALID',
+      'A proof order must contain from 1 to 25 product lines',
+    )
+  }
+  const seen = new Set<string>()
+  return suppliedLines.map((line) => {
+    const productGlobalId = String(line.productGlobalId || '').trim()
+    if (!/^gp\d{7}$/.test(productGlobalId)) {
+      throw new OperationsRequestError('OPERATIONS_PRODUCT_NOT_FOUND', 'Select an active CRM product from the active workspace', 404)
+    }
+    if (seen.has(productGlobalId)) {
+      throw new OperationsRequestError('OPERATIONS_ORDER_LINES_INVALID', 'Each product may appear only once on an order')
+    }
+    seen.add(productGlobalId)
+    const quantity = assertPositiveQuantity(line.quantity)
+    const openingQuantity = assertPositiveQuantity(line.openingQuantity)
+    if (!Number.isSafeInteger(quantity) || quantity > 1_000
+      || !Number.isSafeInteger(openingQuantity) || openingQuantity > 100_000) {
+      throw new OperationsRequestError('OPERATIONS_ORDER_LINES_INVALID', 'Order quantities are outside the supported range')
+    }
+    return { productGlobalId, quantity, openingQuantity }
+  })
+}
+
 export async function runMockOperationsProofFromPostgres(input: {
   organizationId: string
   actorEmail: string
@@ -1196,17 +1928,55 @@ export async function runMockOperationsProofFromPostgres(input: {
   const organizationId = requireOrganizationId(input.organizationId)
   const actorEmail = String(input.actorEmail || '').trim().toLowerCase()
   if (!actorEmail) throw new OperationsRequestError('OPERATIONS_ACTOR_REQUIRED', 'A signed-in user is required', 401)
+  const proofLines = canonicalProofLines(input.proof)
+  const canonicalProof: MockOperationsProofInput = {
+    customerGlobalId: input.proof.customerGlobalId,
+    externalOrderId: input.proof.externalOrderId,
+    orderNumber: input.proof.orderNumber,
+    lines: proofLines,
+    requestedDeliveryAt: input.proof.requestedDeliveryAt,
+    shipTo: input.proof.shipTo,
+  }
 
-  return withTransaction(async (client) => {
+  const command = await prepareCommandReceipt({
+    organizationId,
+    commandType: 'run_mock_operations_proof',
+    idempotencyKey: `mock-commerce:${input.proof.externalOrderId}`,
+    requestHash: commandRequestHash(canonicalProof),
+    actorEmail,
+  })
+  if (command.completed) {
+    return completedProofResult(organizationId, command.receipt.result_global_id)
+  }
+
+  try {
+    return await withTransaction(async (client) => {
     await acquireTransactionAdvisoryLock(
       client,
       `operations:proof-order:${organizationId}:${input.proof.externalOrderId}`,
     )
-    const pipeline = await resolvePipeline(client, organizationId)
+    const activation = await resolveActivation(client, organizationId)
+    if (activation.state !== 'shadow') {
+      throw new OperationsRequestError(
+        'OPERATIONS_PROOF_REQUIRES_SHADOW',
+        'Mock proof orders are available only while Operations is in shadow mode',
+        409,
+      )
+    }
+    const pipeline = {
+      id: activation.data_pipeline_id,
+      name: activation.pipeline_name,
+      owner_email: activation.pipeline_owner_email,
+    }
     const customer = await resolveCustomer(client, pipeline.id, input.proof.customerGlobalId)
-    const product = await resolveProduct(client, pipeline.id, input.proof.productGlobalId)
-    const quantity = assertPositiveQuantity(input.proof.quantity)
-    const openingQuantity = Math.max(0, assertPositiveQuantity(input.proof.openingQuantity))
+    const products = new Map<string, ProductRow>()
+    for (const proofLine of proofLines) {
+      products.set(
+        proofLine.productGlobalId,
+        await resolveProduct(client, pipeline.id, proofLine.productGlobalId),
+      )
+    }
+    const totalQuantity = proofLines.reduce((sum, line) => sum + line.quantity, 0)
     const currency = assertCurrency('USD')
     const requestedDeliveryAt = new Date(input.proof.requestedDeliveryAt)
     if (Number.isNaN(requestedDeliveryAt.getTime())) {
@@ -1215,6 +1985,10 @@ export async function runMockOperationsProofFromPostgres(input: {
     const commerce = new MockCommerceAdapter()
     const carrier = new MockCarrierAdapter()
     const printerAdapter = new MockPrintAdapter()
+    const proofLineByExternalId = new Map(proofLines.map((proofLine, index) => [
+      `${input.proof.externalOrderId}:${index + 1}`,
+      proofLine,
+    ]))
     const normalized: CommerceOrderInput = commerce.normalizeOrder({
       provider: 'mock-commerce',
       externalOrderId: input.proof.externalOrderId,
@@ -1223,22 +1997,26 @@ export async function runMockOperationsProofFromPostgres(input: {
       currency,
       requestedDeliveryAt: requestedDeliveryAt.toISOString(),
       shipTo: input.proof.shipTo,
-      lines: [{
-        externalLineId: `${input.proof.externalOrderId}:1`,
-        channelSku: product.sku || product.reference_code,
-        description: product.name,
-        quantity,
-        unitPriceMinor: moneyMinorFromDecimal(product.price),
-        weightGrams: 350,
-        dimensionsMm: { length: 220, width: 160, height: 90 },
-      }],
-      sourcePayload: { proof: true },
+      lines: proofLines.map((proofLine, index) => {
+        const product = products.get(proofLine.productGlobalId)
+        if (!product) throw new Error('OPERATIONS_PRODUCT_RESOLUTION_MISSING')
+        return {
+          externalLineId: `${input.proof.externalOrderId}:${index + 1}`,
+          channelSku: product.sku || product.reference_code,
+          description: product.name,
+          quantity: proofLine.quantity,
+          unitPriceMinor: moneyMinorFromDecimal(product.price),
+          weightGrams: 350,
+          dimensionsMm: { length: 220, width: 160, height: 90 },
+        }
+      }),
+      sourcePayload: { proof: true, lineCount: proofLines.length },
     })
     const configuration = await ensureProofConfiguration(client, {
       organizationId,
       pipeline,
       customer,
-      product,
+      products: [...products.values()],
       actorEmail,
       currency,
     })
@@ -1261,6 +2039,7 @@ export async function runMockOperationsProofFromPostgres(input: {
     )
     const duplicate = duplicateResult.rows[0]
     if (duplicate) {
+      await completeCommandReceipt(client, command.receipt.id, duplicate.global_id)
       return {
         orderGlobalId: duplicate.global_id,
         orderStatus: duplicate.status,
@@ -1270,7 +2049,7 @@ export async function runMockOperationsProofFromPostgres(input: {
       }
     }
 
-    const correlationId = randomUUID()
+    const correlationId = command.receipt.correlation_id
     const merchandiseTotalMinor = normalized.lines.reduce((sum, line) => (
       sum + integerMinor(line.unitPriceMinor) * BigInt(Math.ceil(line.quantity))
     ), BigInt(0))
@@ -1325,29 +2104,49 @@ export async function runMockOperationsProofFromPostgres(input: {
       },
     })
 
-    const line = normalized.lines[0]
-    const orderLineResult = await client.query<IdRow>(
-      `INSERT INTO operations_order_lines (
-         organization_id, order_id, pipeline_id, product_id, external_line_id,
-         channel_sku, description, quantity, unit_price_minor, weight_grams, dimensions_mm
-       ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5,
-         $6, $7, $8, $9, $10, $11::jsonb)
-       RETURNING id::text, global_id`,
-      [
-        organizationId,
-        order.id,
-        pipeline.id,
-        product.id,
-        line.externalLineId,
-        line.channelSku,
-        line.description,
-        line.quantity,
-        line.unitPriceMinor,
-        line.weightGrams,
-        JSON.stringify(line.dimensionsMm),
-      ],
-    )
-    const orderLine = orderLineResult.rows[0]
+    const fulfillmentLines: Array<{
+      orderLine: IdRow
+      product: ProductRow
+      position: PositionRow
+      quantity: number
+      openingQuantity: number
+    }> = []
+    for (const line of normalized.lines) {
+      const proofLine = proofLineByExternalId.get(line.externalLineId)
+      if (!proofLine) throw new Error('OPERATIONS_ORDER_LINE_RESOLUTION_MISSING')
+      const product = products.get(proofLine.productGlobalId)
+      if (!product) throw new Error('OPERATIONS_PRODUCT_RESOLUTION_MISSING')
+      const position = configuration.positions.get(product.id)
+      if (!position) throw new Error('OPERATIONS_INVENTORY_POSITION_MISSING')
+      const orderLineResult = await client.query<IdRow>(
+        `INSERT INTO operations_order_lines (
+           organization_id, order_id, pipeline_id, product_id, external_line_id,
+           channel_sku, description, quantity, unit_price_minor, weight_grams, dimensions_mm
+         ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5,
+           $6, $7, $8, $9, $10, $11::jsonb)
+         RETURNING id::text, global_id`,
+        [
+          organizationId,
+          order.id,
+          pipeline.id,
+          product.id,
+          line.externalLineId,
+          line.channelSku,
+          line.description,
+          line.quantity,
+          line.unitPriceMinor,
+          line.weightGrams,
+          JSON.stringify(line.dimensionsMm),
+        ],
+      )
+      fulfillmentLines.push({
+        orderLine: orderLineResult.rows[0],
+        product,
+        position,
+        quantity: proofLine.quantity,
+        openingQuantity: proofLine.openingQuantity,
+      })
+    }
     await transitionOrder(client, {
       organizationId,
       order,
@@ -1356,22 +2155,27 @@ export async function runMockOperationsProofFromPostgres(input: {
       actorEmail,
       correlationId,
       eventKey: 'validated',
-      payload: { productGlobalId: product.reference_code, mapping: 'resolved' },
+      payload: {
+        productGlobalIds: fulfillmentLines.map((item) => item.product.reference_code),
+        lineCount: fulfillmentLines.length,
+        mapping: 'resolved',
+      },
     })
 
-    const availableAfterSetup = Math.max(
-      numberValue(configuration.position.on_hand_quantity),
-      openingQuantity,
-    ) - numberValue(configuration.position.reserved_quantity)
+    const availableByProductId = new Map(fulfillmentLines.map((item) => [
+      item.product.id,
+      Math.max(numberValue(item.position.on_hand_quantity), item.openingQuantity)
+        - numberValue(item.position.reserved_quantity),
+    ]))
     const optimizer = new DeterministicFulfillmentOptimizer()
     const optimization = await optimizer.plan({
       orderGlobalId: order.global_id,
-      demand: [{ productId: product.id, quantity }],
+      demand: fulfillmentLines.map((item) => ({ productId: item.product.id, quantity: item.quantity })),
       candidates: [{
-        warehouseId: configuration.position.warehouse_id,
-        warehouseGlobalId: configuration.position.warehouse_global_id,
-        warehouseName: configuration.position.warehouse_name,
-        availableByProductId: new Map([[product.id, availableAfterSetup]]),
+        warehouseId: configuration.warehouse.id,
+        warehouseGlobalId: configuration.warehouse.global_id,
+        warehouseName: configuration.warehouse.name,
+        availableByProductId,
         handlingCostMinor: BigInt(0),
       }],
       allowMultiWarehouse: false,
@@ -1406,7 +2210,7 @@ export async function runMockOperationsProofFromPostgres(input: {
     }
     const pricing = priceContract({
       directives: configuration.directives,
-      totalUnits: quantity,
+      totalUnits: totalQuantity,
       freightCostMinor: selectedRate.internalCostMinor,
       packageCount: packages.length,
     })
@@ -1427,15 +2231,19 @@ export async function runMockOperationsProofFromPostgres(input: {
       },
     })
 
-    const reservation = await prepareAndReserveInventory(client, {
-      organizationId,
-      order,
-      orderLine,
-      position: configuration.position,
-      quantity,
-      openingQuantity,
-      actorEmail,
-    })
+    const reservedLines: Array<(typeof fulfillmentLines)[number] & { reservation: IdRow }> = []
+    for (const item of fulfillmentLines) {
+      const reservation = await prepareAndReserveInventory(client, {
+        organizationId,
+        order,
+        orderLine: item.orderLine,
+        position: item.position,
+        quantity: item.quantity,
+        openingQuantity: item.openingQuantity,
+        actorEmail,
+      })
+      reservedLines.push({ ...item, reservation })
+    }
     await transitionOrder(client, {
       organizationId,
       order,
@@ -1445,9 +2253,13 @@ export async function runMockOperationsProofFromPostgres(input: {
       correlationId,
       eventKey: 'reserved',
       payload: {
-        reservationGlobalId: reservation.global_id,
-        inventoryPositionGlobalId: configuration.position.global_id,
-        quantity,
+        reservations: reservedLines.map((item) => ({
+          reservationGlobalId: item.reservation.global_id,
+          inventoryPositionGlobalId: item.position.global_id,
+          productGlobalId: item.product.reference_code,
+          quantity: item.quantity,
+        })),
+        totalQuantity,
       },
     })
 
@@ -1476,14 +2288,24 @@ export async function runMockOperationsProofFromPostgres(input: {
       ],
     )
     const plan = planResult.rows[0]
-    const allocationResult = await client.query<IdRow>(
-      `INSERT INTO operations_fulfillment_allocations (
-         organization_id, plan_id, order_line_id, reservation_id, position_id, quantity
-       ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6)
-       RETURNING id::text, global_id`,
-      [organizationId, plan.id, orderLine.id, reservation.id, configuration.position.id, quantity],
-    )
-    const allocation = allocationResult.rows[0]
+    const allocatedLines: Array<(typeof reservedLines)[number] & { allocation: IdRow }> = []
+    for (const item of reservedLines) {
+      const allocationResult = await client.query<IdRow>(
+        `INSERT INTO operations_fulfillment_allocations (
+           organization_id, plan_id, order_line_id, reservation_id, position_id, quantity
+         ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6)
+         RETURNING id::text, global_id`,
+        [
+          organizationId,
+          plan.id,
+          item.orderLine.id,
+          item.reservation.id,
+          item.position.id,
+          item.quantity,
+        ],
+      )
+      allocatedLines.push({ ...item, allocation: allocationResult.rows[0] })
+    }
     await client.query(
       `INSERT INTO operations_carton_plans (
          organization_id, plan_id, algorithm, package_count, total_weight_grams, packages
@@ -1593,24 +2415,28 @@ export async function runMockOperationsProofFromPostgres(input: {
       payload: { waveGlobalId: wave.global_id },
     })
 
-    const pickResult = await client.query<IdRow>(
-      `INSERT INTO operations_pick_tasks (
-         organization_id, wave_id, plan_id, allocation_id, from_location_id,
-         quantity, sequence_number, status, assigned_to
-       ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid,
-         $6, 1, 'ready', $7)
-       RETURNING id::text, global_id`,
-      [
-        organizationId,
-        wave.id,
-        plan.id,
-        allocation.id,
-        configuration.location.id,
-        quantity,
-        actorEmail,
-      ],
-    )
-    const pick = pickResult.rows[0]
+    const pickLines: Array<(typeof allocatedLines)[number] & { pick: IdRow }> = []
+    for (const [index, item] of allocatedLines.entries()) {
+      const pickResult = await client.query<IdRow>(
+        `INSERT INTO operations_pick_tasks (
+           organization_id, wave_id, plan_id, allocation_id, from_location_id,
+           quantity, sequence_number, status, assigned_to
+         ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid,
+           $6, $7, 'ready', $8)
+         RETURNING id::text, global_id`,
+        [
+          organizationId,
+          wave.id,
+          plan.id,
+          item.allocation.id,
+          configuration.location.id,
+          item.quantity,
+          index + 1,
+          actorEmail,
+        ],
+      )
+      pickLines.push({ ...item, pick: pickResult.rows[0] })
+    }
     await transitionOrder(client, {
       organizationId,
       order,
@@ -1619,31 +2445,36 @@ export async function runMockOperationsProofFromPostgres(input: {
       actorEmail,
       correlationId,
       eventKey: 'pick-started',
-      payload: { pickGlobalId: pick.global_id },
+      payload: {
+        pickGlobalIds: pickLines.map((item) => item.pick.global_id),
+        totalQuantity,
+      },
     })
-    await client.query(
-      `UPDATE operations_pick_tasks
-       SET status = 'picked', picked_quantity = quantity, picked_at = now(), updated_at = now()
-       WHERE organization_id = $1::uuid AND id = $2::uuid`,
-      [organizationId, pick.id],
-    )
-    await client.query(
-      `INSERT INTO operations_inventory_ledger (
-         organization_id, position_id, event_type, on_hand_delta, reserved_delta,
-         on_hand_after, reserved_after, source_global_id, reason, idempotency_key, actor_email
-       ) SELECT $1::uuid, position.id, 'pick', 0, 0,
-         position.on_hand_quantity, position.reserved_quantity,
-         $3, 'Picked mock proof order', $4, $5
-       FROM operations_inventory_positions position
-       WHERE position.organization_id = $1::uuid AND position.id = $2::uuid`,
-      [
-        organizationId,
-        configuration.position.id,
-        order.global_id,
-        `${order.global_id}:pick-ledger`,
-        actorEmail,
-      ],
-    )
+    for (const item of pickLines) {
+      await client.query(
+        `UPDATE operations_pick_tasks
+         SET status = 'picked', picked_quantity = quantity, picked_at = now(), updated_at = now()
+         WHERE organization_id = $1::uuid AND id = $2::uuid`,
+        [organizationId, item.pick.id],
+      )
+      await client.query(
+        `INSERT INTO operations_inventory_ledger (
+           organization_id, position_id, event_type, on_hand_delta, reserved_delta,
+           on_hand_after, reserved_after, source_global_id, reason, idempotency_key, actor_email
+         ) SELECT $1::uuid, position.id, 'pick', 0, 0,
+           position.on_hand_quantity, position.reserved_quantity,
+           $3, 'Picked mock proof order line', $4, $5
+         FROM operations_inventory_positions position
+         WHERE position.organization_id = $1::uuid AND position.id = $2::uuid`,
+        [
+          organizationId,
+          item.position.id,
+          item.orderLine.global_id,
+          `${order.global_id}:${item.pick.global_id}:pick-ledger`,
+          actorEmail,
+        ],
+      )
+    }
     await appendDomainEvent(client, {
       organizationId,
       aggregateType: 'operations.order',
@@ -1653,7 +2484,15 @@ export async function runMockOperationsProofFromPostgres(input: {
       actorEmail,
       correlationId,
       idempotencyKey: `${order.global_id}:pick-completed`,
-      payload: { pickGlobalId: pick.global_id, quantity },
+      payload: {
+        picks: pickLines.map((item) => ({
+          pickGlobalId: item.pick.global_id,
+          orderLineGlobalId: item.orderLine.global_id,
+          productGlobalId: item.product.reference_code,
+          quantity: item.quantity,
+        })),
+        totalQuantity,
+      },
     })
 
     await client.query(
@@ -1787,14 +2626,16 @@ export async function runMockOperationsProofFromPostgres(input: {
       ],
     )
     const shipment = shipmentResult.rows[0]
-    await consumeReservedInventory(client, {
-      organizationId,
-      order,
-      position: configuration.position,
-      reservation,
-      quantity,
-      actorEmail,
-    })
+    for (const item of reservedLines) {
+      await consumeReservedInventory(client, {
+        organizationId,
+        order,
+        position: item.position,
+        reservation: item.reservation,
+        quantity: item.quantity,
+        actorEmail,
+      })
+    }
     await client.query(
       `UPDATE operations_packages SET status = 'shipped'
        WHERE organization_id = $1::uuid AND id = $2::uuid`,
@@ -1834,7 +2675,14 @@ export async function runMockOperationsProofFromPostgres(input: {
       actorEmail,
       correlationId,
       idempotencyKey: `${order.global_id}:inventory-consumed`,
-      payload: { inventoryPositionGlobalId: configuration.position.global_id, quantity },
+      payload: {
+        positions: reservedLines.map((item) => ({
+          inventoryPositionGlobalId: item.position.global_id,
+          productGlobalId: item.product.reference_code,
+          quantity: item.quantity,
+        })),
+        totalQuantity,
+      },
     })
 
     const eventTypeForDirective: Record<PricingDirective['type'], string> = {
@@ -1970,12 +2818,15 @@ export async function runMockOperationsProofFromPostgres(input: {
       eventKey: `operations:proof-order:${organizationId}:${normalized.externalOrderId}`,
       payload: {
         customerGlobalId: customer.reference_code,
-        productGlobalId: product.reference_code,
+        productGlobalIds: fulfillmentLines.map((item) => item.product.reference_code),
+        lineCount: fulfillmentLines.length,
+        totalQuantity,
         warehouseGlobalId: configuration.warehouse.global_id,
         trackingNumber: labelOutput.trackingNumber,
         mock: true,
       },
     }, client)
+    await completeCommandReceipt(client, command.receipt.id, order.global_id)
 
     return {
       orderGlobalId: order.global_id,
@@ -1984,5 +2835,9 @@ export async function runMockOperationsProofFromPostgres(input: {
       trackingNumber: labelOutput.trackingNumber,
       steps: [...MOCK_PROOF_STEPS],
     }
-  })
+    })
+  } catch (error) {
+    await failCommandReceipt(command.receipt.id, error)
+    throw error
+  }
 }
