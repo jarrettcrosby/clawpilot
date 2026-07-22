@@ -861,7 +861,9 @@ export async function recordExternalPostingInPostgres(input: {
       )
     }
     const transactionResult = await client.query<Record<string, unknown>>(
-      `SELECT transaction.*, 'external'::text AS pos_accounting_origin
+      `SELECT transaction.*,
+         to_char(transaction.transaction_date, 'YYYY-MM-DD') AS pos_accounting_business_date,
+         'external'::text AS pos_accounting_origin
        FROM quickbooks_transactions transaction
        WHERE transaction.organization_id = $1::uuid
          AND transaction.quickbooks_transaction_id = ANY($2::text[])
@@ -880,8 +882,8 @@ export async function recordExternalPostingInPostgres(input: {
         409,
       )
     }
-    if (String(receipt.transaction_date) !== draft.business_date
-      || String(journal.transaction_date) !== draft.business_date) {
+    if (String(receipt.pos_accounting_business_date) !== draft.business_date
+      || String(journal.pos_accounting_business_date) !== draft.business_date) {
       throw new PosAccountingPostingError(
         'POS_ACCOUNTING_EXTERNAL_EVIDENCE_DATE_MISMATCH',
         'Both QuickBooks records must use the draft business date',

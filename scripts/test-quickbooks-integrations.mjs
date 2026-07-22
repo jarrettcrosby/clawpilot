@@ -1308,10 +1308,16 @@ const externalPostingClient = {
         updated_at: '2026-07-21T12:00:00.000Z',
       }] }
     }
-    if (source.includes("SELECT transaction.*, 'external'::text AS pos_accounting_origin")) {
+    if (source.includes("'external'::text AS pos_accounting_origin")) {
       return { rows: [
-        { entity_type: 'SalesReceipt', quickbooks_transaction_id: 'receipt-19', transaction_date: '2026-07-19' },
-        { entity_type: 'JournalEntry', quickbooks_transaction_id: 'journal-19', transaction_date: '2026-07-19' },
+        {
+          entity_type: 'SalesReceipt', quickbooks_transaction_id: 'receipt-19',
+          transaction_date: new Date('2026-07-19T00:00:00.000Z'), pos_accounting_business_date: '2026-07-19',
+        },
+        {
+          entity_type: 'JournalEntry', quickbooks_transaction_id: 'journal-19',
+          transaction_date: new Date('2026-07-19T00:00:00.000Z'), pos_accounting_business_date: '2026-07-19',
+        },
       ] }
     }
     if (source.includes('FROM pos_accounting_posting_batches batch')) {
