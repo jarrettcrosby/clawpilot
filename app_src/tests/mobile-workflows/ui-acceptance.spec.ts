@@ -813,8 +813,16 @@ for (const viewport of MOBILE_VIEWPORTS) {
       await expect(page.getByRole('button', { name: 'Queue agent work' })).toBeVisible()
 
       await page.getByRole('button', { name: 'Discuss mode' }).click()
-      await expect(page.getByPlaceholder(/Discuss this task with/)).toBeVisible()
-      await expect(page.getByRole('button', { name: 'Send discussion message' })).toBeVisible()
+      const discussionComposer = page.getByPlaceholder(/Discuss this task with|Assign a task to start a thread/)
+      await expect(discussionComposer).toBeVisible()
+      const discussionButton = page.getByRole('button', { name: 'Send discussion message' })
+      await expect(discussionButton).toBeVisible()
+      if (await page.getByPlaceholder(/Discuss this task with/).count()) {
+        await expect(discussionButton).toBeEnabled()
+      } else {
+        await expect(discussionComposer).toBeDisabled()
+        await expect(discussionButton).toBeDisabled()
+      }
       await expectNoDocumentOverflow(page)
     })
 
