@@ -225,6 +225,7 @@ export async function GET() {
           pos_accounting_notification_consent_migration_applied: boolean
           pos_accounting_date_commands_migration_applied: boolean
           pos_accounting_posting_outcomes_migration_applied: boolean
+          external_pos_accounting_outcomes_migration_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -545,6 +546,11 @@ export async function GET() {
                 FROM schema_migrations
                 WHERE filename = '0079_pos_accounting_posting_outcomes.sql'
               ) AS pos_accounting_posting_outcomes_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0080_external_pos_accounting_outcomes.sql'
+              ) AS external_pos_accounting_outcomes_migration_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -620,6 +626,7 @@ export async function GET() {
             && row?.pos_accounting_notification_consent_migration_applied
             && row?.pos_accounting_date_commands_migration_applied
             && row?.pos_accounting_posting_outcomes_migration_applied
+            && row?.external_pos_accounting_outcomes_migration_applied
             && row?.migration_checksums_present
           ),
         }
@@ -687,6 +694,7 @@ export async function GET() {
           || !row?.pos_accounting_notification_consent_migration_applied
           || !row?.pos_accounting_date_commands_migration_applied
           || !row?.pos_accounting_posting_outcomes_migration_applied
+          || !row?.external_pos_accounting_outcomes_migration_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')
@@ -703,6 +711,7 @@ export async function GET() {
           && row?.pos_accounting_notification_consent_migration_applied
           && row?.pos_accounting_date_commands_migration_applied
           && row?.pos_accounting_posting_outcomes_migration_applied
+          && row?.external_pos_accounting_outcomes_migration_applied
         ) {
           const queueResult = await query<{
             toast_pending: number

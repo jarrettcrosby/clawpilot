@@ -8,6 +8,8 @@ import {
   approvePosAccountingPostingBatchInPostgres,
   PosAccountingPostingError,
   preparePosAccountingPostingBatchInPostgres,
+  recordExternalPostingInPostgres,
+  recordMatchedExternalResultsInPostgres,
   recordMatchedShogoResultsInPostgres,
 } from '@/lib/persistence/posAccountingPosting'
 import { requireRequestUser } from '@/lib/requestUser'
@@ -47,7 +49,7 @@ function noteValue(value: unknown) {
   const note = String(value || '').trim()
   if (!note) return null
   if (note.length > 500 || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(note)) {
-    throw new PosAccountingPostingError('POS_ACCOUNTING_POSTING_NOTE_INVALID', 'Approval note is invalid')
+    throw new PosAccountingPostingError('POS_ACCOUNTING_POSTING_NOTE_INVALID', 'Review note is invalid')
   }
   return note
 }
@@ -63,6 +65,40 @@ export async function POST(req: NextRequest) {
     const body = await requestBody(req)
     const action = String(body.action || '')
 
+    if (action === 'record-external-draft') {
+      if (!capabilities.canApprove) {
+        return json({ ok: false, error: 'You do not have permission to record accounting outcomes', code: 'ACCOUNTING_APPROVAL_REQUIRED' }, 403)
+      }
+      const result = await recordExternalPostingInPostgres({
+        organizationId,
+        draftId: String(body.draftId || ''),
+        salesReceiptId: String(body.salesReceiptId || ''),
+        journalEntryId: String(body.journalEntryId || ''),
+        providerName: String(body.providerName || ''),
+        providerReference: body.providerReference == null ? null : String(body.providerReference),
+        reviewNote: noteValue(body.reviewNote),
+        actorEmail: actor.email,
+      })
+      return json({ ok: true, capabilities, result })
+    }
+
+    if (action === 'record-external-range') {
+      if (!capabilities.canApprove) {
+        return json({ ok: false, error: 'You do not have permission to record accounting outcomes', code: 'ACCOUNTING_APPROVAL_REQUIRED' }, 403)
+      }
+      const result = await recordMatchedExternalResultsInPostgres({
+        organizationId,
+        fromBusinessDate: String(body.fromBusinessDate || ''),
+        toBusinessDate: String(body.toBusinessDate || ''),
+        providerName: String(body.providerName || ''),
+        providerReference: body.providerReference == null ? null : String(body.providerReference),
+        reviewNote: noteValue(body.reviewNote),
+        actorEmail: actor.email,
+      })
+      return json({ ok: true, capabilities, result })
+    }
+
+    // Preserve the pre-0080 action while older clients finish rolling forward.
     if (action === 'record-shogo-range') {
       if (!capabilities.canApprove) {
         return json({ ok: false, error: 'You do not have permission to record accounting outcomes', code: 'ACCOUNTING_APPROVAL_REQUIRED' }, 403)

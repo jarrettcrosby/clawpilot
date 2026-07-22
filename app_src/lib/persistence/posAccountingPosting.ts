@@ -8,7 +8,10 @@ import {
   type QuickBooksWriteDraftPayload,
   type QuickBooksWriteOperationKind,
 } from '@/lib/integrations/quickBooksWritePayloads'
-import { readPosAccountingParityReportInPostgres } from '@/lib/persistence/posAccountingParity'
+import {
+  buildPosAccountingParityReport,
+  readPosAccountingParityReportInPostgres,
+} from '@/lib/persistence/posAccountingParity'
 import { acquireTransactionAdvisoryLock, withTransaction } from '@/lib/persistence/postgres'
 import { configuredQuickBooksWritePolicy } from '@/lib/quickBooksWritePolicy'
 
@@ -32,6 +35,23 @@ type DraftRow = {
   proposed_lines: unknown
   posting_batch_id: string | null
   is_current: boolean
+}
+
+type ExternalPostingDraftRow = DraftRow & {
+  review_outcome: string | null
+  posting_origin: string | null
+  reviewed_by: string | null
+  reviewed_at: string | null
+  review_note: string | null
+  external_posting_provider: string | null
+  external_posting_reference: string | null
+  quickbooks_sales_receipt_id: string | null
+  quickbooks_journal_entry_id: string | null
+  draft_revision: number
+  source_revision: number
+  updated_at: string
+  restaurant_name: string | null
+  location_name: string | null
 }
 
 type PostingBatchRow = {
@@ -117,6 +137,37 @@ function requiredDate(value: unknown, label: string) {
     throw new PosAccountingPostingError('POS_ACCOUNTING_POSTING_DATE_INVALID', `${label} must be a valid date`)
   }
   return date
+}
+
+function requiredProviderId(value: unknown, label: string) {
+  const id = text(value, 200)
+  if (!id) {
+    throw new PosAccountingPostingError('POS_ACCOUNTING_EXTERNAL_EVIDENCE_ID_INVALID', `${label} is required`)
+  }
+  return id
+}
+
+function requiredExternalProvider(value: unknown) {
+  const provider = text(value, 120)
+  if (!provider) {
+    throw new PosAccountingPostingError(
+      'POS_ACCOUNTING_EXTERNAL_PROVIDER_INVALID',
+      'Name the system that posted these QuickBooks documents',
+    )
+  }
+  return provider
+}
+
+function optionalExternalReference(value: unknown) {
+  if (value === null || value === undefined || String(value).trim() === '') return null
+  const reference = text(value, 200)
+  if (!reference) {
+    throw new PosAccountingPostingError(
+      'POS_ACCOUNTING_EXTERNAL_REFERENCE_INVALID',
+      'External posting reference is invalid',
+    )
+  }
+  return reference
 }
 
 function deterministicUuid(seed: string) {
@@ -668,25 +719,266 @@ export async function approvePosAccountingPostingBatchInPostgres(input: {
   })
 }
 
-function toastDateMarker(transaction: { businessDate: string; memo: string | null; sourcePayload: unknown }) {
-  const payload = record(transaction.sourcePayload)
-  const values = [
-    transaction.memo,
-    text(payload.PrivateNote),
-    text(record(payload.CustomerMemo).value),
-    text(payload.Memo),
-  ].filter(Boolean) as string[]
-  return values.some((value) => value.trim().toLowerCase().startsWith(`toast ${transaction.businessDate}`))
+async function cancelPreparedPostingBatchForExternalEvidence(
+  client: PoolClient,
+  input: {
+    organizationId: string
+    postingBatchId: string | null
+    actorEmail: string
+  },
+) {
+  if (!input.postingBatchId) return null
+  const batch = await readBatch(client, input.organizationId, input.postingBatchId)
+  if (!batch) {
+    throw new PosAccountingPostingError(
+      'POS_ACCOUNTING_POSTING_BATCH_NOT_FOUND',
+      'The prepared ClawPilot posting batch could not be verified',
+      409,
+    )
+  }
+  if (batch.status === 'cancelled') return batch.id
+  if (batch.status !== 'pending_approval') {
+    throw new PosAccountingPostingError(
+      'POS_ACCOUNTING_EXTERNAL_POSTING_CONFLICT',
+      'ClawPilot already started this posting. Resolve that posting batch before recording external evidence.',
+      409,
+    )
+  }
+  const children = await client.query<{ id: string }>(
+    `UPDATE quickbooks_write_requests request SET
+       status = 'cancelled', cancelled_by = lower($4),
+       cancelled_at = COALESCE(request.cancelled_at, now()), updated_at = now()
+     WHERE request.organization_id = $1::uuid
+       AND request.id IN ($2::uuid, $3::uuid)
+       AND request.status IN ('draft', 'pending_approval', 'cancelled')
+     RETURNING request.id::text`,
+    [
+      input.organizationId,
+      batch.sales_receipt_request_id,
+      batch.journal_entry_request_id,
+      input.actorEmail,
+    ],
+  )
+  if (children.rows.length !== 2) {
+    throw new PosAccountingPostingError(
+      'POS_ACCOUNTING_EXTERNAL_POSTING_CONFLICT',
+      'One of the prepared ClawPilot documents is no longer safe to cancel',
+      409,
+    )
+  }
+  await client.query(
+    `UPDATE pos_accounting_posting_batches SET
+       status = 'cancelled', cancelled_by = lower($3), cancelled_at = now(),
+       last_error = NULL, updated_at = now()
+     WHERE organization_id = $1::uuid AND id = $2::uuid`,
+    [input.organizationId, batch.id, input.actorEmail],
+  )
+  return batch.id
 }
 
-export async function recordMatchedShogoResultsInPostgres(input: {
+export async function recordExternalPostingInPostgres(input: {
+  organizationId: string
+  draftId: string
+  salesReceiptId: string
+  journalEntryId: string
+  providerName: string
+  providerReference?: string | null
+  reviewNote?: string | null
+  actorEmail: string
+}) {
+  const draftId = requiredUuid(input.draftId, 'Accounting draft')
+  const salesReceiptId = requiredProviderId(input.salesReceiptId, 'QuickBooks Sales Receipt ID')
+  const journalEntryId = requiredProviderId(input.journalEntryId, 'QuickBooks Journal Entry ID')
+  const providerName = requiredExternalProvider(input.providerName)
+  const providerReference = optionalExternalReference(input.providerReference)
+  return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(client, `pos-accounting-posting:${input.organizationId}:${draftId}`)
+    const draftResult = await client.query<ExternalPostingDraftRow>(
+      `SELECT draft.id::text, draft.restaurant_guid::text, draft.business_date::text,
+         draft.status, draft.reconciliation_status, draft.source_summary,
+         draft.proposed_lines, draft.posting_batch_id::text, draft.is_current,
+         draft.review_outcome, draft.posting_origin, draft.reviewed_by,
+         draft.reviewed_at::text, draft.review_note,
+         draft.external_posting_provider, draft.external_posting_reference,
+         draft.quickbooks_sales_receipt_id, draft.quickbooks_journal_entry_id,
+         draft.draft_revision, draft.source_revision, draft.updated_at::text,
+         location.restaurant_name, location.location_name
+       FROM toast_accounting_export_drafts draft
+       LEFT JOIN toast_locations location
+         ON location.organization_id = draft.organization_id
+        AND location.restaurant_guid = draft.restaurant_guid
+       WHERE draft.organization_id = $1::uuid AND draft.id = $2::uuid
+       FOR UPDATE OF draft`,
+      [input.organizationId, draftId],
+    )
+    const draft = draftResult.rows[0]
+    if (!draft || !draft.is_current) {
+      throw new PosAccountingPostingError(
+        'POS_ACCOUNTING_POSTING_DRAFT_NOT_FOUND',
+        'The current accounting draft was not found',
+        404,
+      )
+    }
+    const alreadyExternal = draft.review_outcome === 'externally_posted'
+      || draft.review_outcome === 'shogo_posted'
+    if (alreadyExternal) {
+      const sameProvider = draft.review_outcome === 'shogo_posted'
+        ? providerName.toLowerCase() === 'shogo'
+        : draft.external_posting_provider?.toLowerCase() === providerName.toLowerCase()
+      if (sameProvider
+        && draft.quickbooks_sales_receipt_id === salesReceiptId
+        && draft.quickbooks_journal_entry_id === journalEntryId) {
+        return {
+          recorded: false,
+          alreadyRecorded: true,
+          draftId,
+          businessDate: draft.business_date,
+          providerName: draft.external_posting_provider || 'Shogo',
+          salesReceiptId,
+          journalEntryId,
+        }
+      }
+      throw new PosAccountingPostingError(
+        'POS_ACCOUNTING_EXTERNAL_POSTING_CONFLICT',
+        'This draft already has different external posting evidence',
+        409,
+      )
+    }
+    if (!['needs_review', 'failed'].includes(draft.status)) {
+      throw new PosAccountingPostingError(
+        'POS_ACCOUNTING_POSTING_STATE_CONFLICT',
+        'Only a review-ready or failed accounting draft can be acknowledged as externally posted',
+        409,
+      )
+    }
+    if (draft.reconciliation_status !== 'ready') {
+      throw new PosAccountingPostingError(
+        'POS_ACCOUNTING_EXTERNAL_EVIDENCE_INCOMPLETE',
+        'Resolve the POS source reconciliation before recording external posting evidence',
+        409,
+      )
+    }
+    const transactionResult = await client.query<Record<string, unknown>>(
+      `SELECT transaction.*, 'external'::text AS pos_accounting_origin
+       FROM quickbooks_transactions transaction
+       WHERE transaction.organization_id = $1::uuid
+         AND transaction.quickbooks_transaction_id = ANY($2::text[])
+         AND transaction.entity_type IN ('SalesReceipt', 'JournalEntry')
+       FOR SHARE OF transaction`,
+      [input.organizationId, [salesReceiptId, journalEntryId]],
+    )
+    const receipt = transactionResult.rows.find((row) =>
+      row.entity_type === 'SalesReceipt' && row.quickbooks_transaction_id === salesReceiptId)
+    const journal = transactionResult.rows.find((row) =>
+      row.entity_type === 'JournalEntry' && row.quickbooks_transaction_id === journalEntryId)
+    if (!receipt || !journal) {
+      throw new PosAccountingPostingError(
+        'POS_ACCOUNTING_EXTERNAL_EVIDENCE_NOT_FOUND',
+        'Both exact QuickBooks records must be present in the current QuickBooks cache',
+        409,
+      )
+    }
+    if (String(receipt.transaction_date) !== draft.business_date
+      || String(journal.transaction_date) !== draft.business_date) {
+      throw new PosAccountingPostingError(
+        'POS_ACCOUNTING_EXTERNAL_EVIDENCE_DATE_MISMATCH',
+        'Both QuickBooks records must use the draft business date',
+        409,
+      )
+    }
+    const parity = buildPosAccountingParityReport({
+      drafts: [draft],
+      transactions: [receipt, journal],
+      fullHistoryTransactions: [receipt, journal],
+    })
+    const rows = parity.rows.filter((row) => row.expected.draft.id === draftId)
+    const receiptRow = rows.find((row) => row.expected.entityType === 'SalesReceipt')
+    const journalRow = rows.find((row) => row.expected.entityType === 'JournalEntry')
+    const exactMatch = rows.length === 2
+      && receiptRow?.match.status === 'matched'
+      && journalRow?.match.status === 'matched'
+      && receiptRow.comparison?.status === 'match'
+      && journalRow.comparison?.status === 'match'
+      && receiptRow.actual?.providerTransactionId === salesReceiptId
+      && journalRow.actual?.providerTransactionId === journalEntryId
+    if (!exactMatch) {
+      throw new PosAccountingPostingError(
+        'POS_ACCOUNTING_EXTERNAL_EVIDENCE_MISMATCH',
+        'The selected QuickBooks records do not exactly match both ClawPilot posting documents',
+        409,
+      )
+    }
+    const cancelledBatchId = await cancelPreparedPostingBatchForExternalEvidence(client, {
+      organizationId: input.organizationId,
+      postingBatchId: draft.posting_batch_id,
+      actorEmail: input.actorEmail,
+    })
+    const reviewNote = input.reviewNote
+      || `Matched to ${providerName}-posted QuickBooks evidence`
+    await client.query(
+      `UPDATE toast_accounting_export_drafts SET
+         status = 'posted', review_outcome = 'externally_posted', posting_origin = 'external',
+         external_posting_provider = $4, external_posting_reference = $5,
+         reviewed_by = lower($3), reviewed_at = now(), review_note = $6,
+         quickbooks_sales_receipt_id = $7,
+         quickbooks_journal_entry_id = $8,
+         quickbooks_transaction_id = $7,
+         approved_by = lower($3), approved_at = now(), posted_at = now(),
+         last_error = NULL, updated_at = now()
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [
+        input.organizationId,
+        draftId,
+        input.actorEmail,
+        providerName,
+        providerReference,
+        reviewNote,
+        salesReceiptId,
+        journalEntryId,
+      ],
+    )
+    await recordAuditEvent({
+      actor: input.actorEmail,
+      eventType: 'pos.accounting.external_posting.recorded',
+      aggregateType: 'toast_accounting_export_draft',
+      aggregateId: draftId,
+      organizationId: input.organizationId,
+      payload: {
+        message: `Recorded ${providerName} posting evidence for POS ${draft.business_date}`,
+        businessDate: draft.business_date,
+        providerName,
+        providerReference,
+        salesReceiptId,
+        journalEntryId,
+        cancelledClawPilotBatchId: cancelledBatchId,
+        postingOrigin: 'external',
+      },
+    }, client)
+    return {
+      recorded: true,
+      alreadyRecorded: false,
+      draftId,
+      businessDate: draft.business_date,
+      providerName,
+      salesReceiptId,
+      journalEntryId,
+    }
+  })
+}
+
+export async function recordMatchedExternalResultsInPostgres(input: {
   organizationId: string
   fromBusinessDate: string
   toBusinessDate: string
+  providerName: string
+  providerReference?: string | null
+  reviewNote?: string | null
   actorEmail: string
 }) {
   const fromBusinessDate = requiredDate(input.fromBusinessDate, 'From date')
   const toBusinessDate = requiredDate(input.toBusinessDate, 'To date')
+  const providerName = requiredExternalProvider(input.providerName)
+  const providerReference = optionalExternalReference(input.providerReference)
   if (fromBusinessDate > toBusinessDate) {
     throw new PosAccountingPostingError('POS_ACCOUNTING_POSTING_RANGE_INVALID', 'From date must be on or before to date')
   }
@@ -720,10 +1012,12 @@ export async function recordMatchedShogoResultsInPostgres(input: {
       && journal?.match.status === 'matched'
       && receipt.comparison?.status === 'match'
       && journal.comparison?.status === 'match'
-      && receipt.actual?.postingOrigin === 'shogo'
-      && journal.actual?.postingOrigin === 'shogo'
-      && Boolean(receipt.actual.providerTransactionId)
-      && Boolean(journal.actual.providerTransactionId)
+      && Boolean(receipt.actual)
+      && Boolean(journal.actual)
+      && receipt.actual?.postingOrigin !== 'clawpilot'
+      && journal.actual?.postingOrigin !== 'clawpilot'
+      && Boolean(receipt.actual?.providerTransactionId)
+      && Boolean(journal.actual?.providerTransactionId)
     return accepted ? [{
       draftId,
       businessDate: receipt!.expected.businessDate,
@@ -731,94 +1025,68 @@ export async function recordMatchedShogoResultsInPostgres(input: {
       journalId: journal!.actual!.providerTransactionId!,
     }] : []
   })
-  const result = await withTransaction(async (client) => {
-    let recorded = 0
-    let alreadyRecorded = 0
-    const recordedDates: string[] = []
-    for (const candidate of candidates) {
-      await acquireTransactionAdvisoryLock(client, `pos-accounting-posting:${input.organizationId}:${candidate.draftId}`)
-      const evidence = await client.query<{
-        entity_type: string
-        quickbooks_transaction_id: string
-        transaction_date: string
-        memo: string | null
-        source_payload: unknown
-      }>(
-        `SELECT entity_type, quickbooks_transaction_id, transaction_date::text, memo, source_payload
-         FROM quickbooks_transactions
-         WHERE organization_id = $1::uuid
-           AND quickbooks_transaction_id = ANY($2::text[])
-           AND entity_type IN ('SalesReceipt', 'JournalEntry')
-         FOR SHARE`,
-        [input.organizationId, [candidate.receiptId, candidate.journalId]],
-      )
-      const validEvidence = evidence.rows.length === 2
-        && evidence.rows.every((row) => row.transaction_date === candidate.businessDate && toastDateMarker({
-          businessDate: candidate.businessDate,
-          memo: row.memo,
-          sourcePayload: row.source_payload,
-        }))
-      if (!validEvidence) continue
-      const draft = await client.query<{
-        status: string
-        review_outcome: string | null
-        quickbooks_sales_receipt_id: string | null
-        quickbooks_journal_entry_id: string | null
-      }>(
-        `SELECT status, review_outcome, quickbooks_sales_receipt_id, quickbooks_journal_entry_id
-         FROM toast_accounting_export_drafts
-         WHERE organization_id = $1::uuid AND id = $2::uuid AND is_current = true
-         FOR UPDATE`,
-        [input.organizationId, candidate.draftId],
-      )
-      const current = draft.rows[0]
-      if (!current) continue
-      if (current.review_outcome === 'shogo_posted'
-        && current.quickbooks_sales_receipt_id === candidate.receiptId
-        && current.quickbooks_journal_entry_id === candidate.journalId) {
-        alreadyRecorded += 1
-        continue
-      }
-      if (!['needs_review', 'failed'].includes(current.status)) continue
-      await client.query(
-        `UPDATE toast_accounting_export_drafts SET
-           status = 'posted', review_outcome = 'shogo_posted', posting_origin = 'shogo',
-           reviewed_by = lower($3), reviewed_at = now(),
-           review_note = 'Matched to Shogo-posted QuickBooks evidence',
-           quickbooks_sales_receipt_id = $4,
-           quickbooks_journal_entry_id = $5,
-           quickbooks_transaction_id = $4,
-           approved_by = lower($3), approved_at = now(), posted_at = now(),
-           last_error = NULL, updated_at = now()
-         WHERE organization_id = $1::uuid AND id = $2::uuid`,
-        [input.organizationId, candidate.draftId, input.actorEmail, candidate.receiptId, candidate.journalId],
-      )
-      await recordAuditEvent({
-        actor: input.actorEmail,
-        eventType: 'pos.accounting.shogo_result.recorded',
-        aggregateType: 'toast_accounting_export_draft',
-        aggregateId: candidate.draftId,
+  let recorded = 0
+  let alreadyRecorded = 0
+  const recordedDates: string[] = []
+  const failures: Array<{
+    draftId: string
+    businessDate: string
+    code: string
+    message: string
+  }> = []
+  for (const candidate of candidates) {
+    try {
+      const outcome = await recordExternalPostingInPostgres({
         organizationId: input.organizationId,
-        payload: {
-          message: `Recorded matched Shogo posting for Toast ${candidate.businessDate}`,
-          businessDate: candidate.businessDate,
-          salesReceiptId: candidate.receiptId,
-          journalEntryId: candidate.journalId,
-          postingOrigin: 'shogo',
-        },
-      }, client)
-      recorded += 1
-      recordedDates.push(candidate.businessDate)
+        draftId: candidate.draftId,
+        salesReceiptId: candidate.receiptId,
+        journalEntryId: candidate.journalId,
+        providerName,
+        providerReference,
+        reviewNote: input.reviewNote,
+        actorEmail: input.actorEmail,
+      })
+      if (outcome.recorded) {
+        recorded += 1
+        recordedDates.push(candidate.businessDate)
+      } else if (outcome.alreadyRecorded) {
+        alreadyRecorded += 1
+      }
+    } catch (error) {
+      if (!(error instanceof PosAccountingPostingError)) throw error
+      failures.push({
+        draftId: candidate.draftId,
+        businessDate: candidate.businessDate,
+        code: error.code,
+        message: error.message,
+      })
     }
-    return { recorded, alreadyRecorded, recordedDates }
-  })
+  }
   return {
-    ...result,
+    recorded,
+    alreadyRecorded,
+    recordedDates,
     eligible: candidates.length,
-    unresolved: Math.max(0, grouped.size - candidates.length),
+    unresolved: Math.max(0, grouped.size - recorded - alreadyRecorded),
+    failedValidation: failures.length,
+    failures,
     fromBusinessDate,
     toBusinessDate,
+    providerName,
   }
+}
+
+// Backward-compatible entrypoint for older callers while the UI moves to provider-neutral outcomes.
+export async function recordMatchedShogoResultsInPostgres(input: {
+  organizationId: string
+  fromBusinessDate: string
+  toBusinessDate: string
+  actorEmail: string
+}) {
+  return recordMatchedExternalResultsInPostgres({
+    ...input,
+    providerName: 'Shogo',
+  })
 }
 
 export async function synchronizePosAccountingPostingBatchForRequest(

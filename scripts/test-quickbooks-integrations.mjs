@@ -306,6 +306,17 @@ for (const fragment of [
   "status IN ('pending_approval', 'approved', 'posting', 'posted', 'partial_failed', 'failed', 'cancelled')",
 ]) includes(posPostingMigration, fragment, 'POS accounting posting migration')
 
+const externalPostingMigration = read('db/migrations/0080_external_pos_accounting_outcomes.sql')
+for (const fragment of [
+  'external_posting_provider text',
+  'external_posting_reference text',
+  "'shogo_posted', 'externally_posted', 'clawpilot_post'",
+  "posting_origin IS NULL OR posting_origin IN ('shogo', 'external', 'clawpilot')",
+  "review_outcome = 'externally_posted'",
+  'quickbooks_sales_receipt_id IS NOT NULL',
+  'quickbooks_journal_entry_id IS NOT NULL',
+]) includes(externalPostingMigration, fragment, 'external POS accounting outcome migration')
+
 const crmReconciliationMigration = read('db/migrations/0065_demo_and_quickbooks_crm_reconciliation.sql')
 for (const fragment of [
   'crm_pipeline_id uuid REFERENCES pipeline_spaces(id) ON DELETE SET NULL',
@@ -1230,19 +1241,29 @@ const posPostingPersistence = read('app_src/lib/persistence/posAccountingPosting
 for (const fragment of [
   'preparePosAccountingPostingBatchInPostgres',
   'approvePosAccountingPostingBatchInPostgres',
+  'recordExternalPostingInPostgres',
+  'recordMatchedExternalResultsInPostgres',
   'recordMatchedShogoResultsInPostgres',
+  'cancelPreparedPostingBatchForExternalEvidence',
   'synchronizePosAccountingPostingBatchForRequest',
   "operationKind: 'sales_receipt.create'",
   "operationKind: 'journal_entry.create'",
   "'partial_failed'",
-  "receipt.actual?.postingOrigin === 'shogo'",
-  "journal.actual?.postingOrigin === 'shogo'",
+  "receipt.actual?.postingOrigin !== 'clawpilot'",
+  "journal.actual?.postingOrigin !== 'clawpilot'",
+  "review_outcome = 'externally_posted'",
+  "posting_origin = 'external'",
+  'POS_ACCOUNTING_EXTERNAL_EVIDENCE_MISMATCH',
+  'failedValidation: failures.length',
+  'failures.push({',
   'quickbooks_sales_receipt_id',
   'quickbooks_journal_entry_id',
 ]) includes(posPostingPersistence, fragment, 'POS accounting posting persistence')
 
 const posPostingRoute = read('app_src/app/api/accounting/quickbooks/pos-posting/route.ts')
 for (const fragment of [
+  "action === 'record-external-draft'",
+  "action === 'record-external-range'",
   "action === 'record-shogo-range'",
   "action === 'prepare-clawpilot'",
   "action === 'approve-clawpilot'",
@@ -1251,6 +1272,132 @@ for (const fragment of [
   'confirmFingerprint',
   'MAX_REQUEST_BYTES',
 ]) includes(posPostingRoute, fragment, 'POS accounting posting API')
+
+const externalPostingQueries = []
+const externalPostingAuditEvents = []
+const externalPostingDraftId = '22222222-2222-4222-8222-222222222222'
+const externalPostingBatchId = '33333333-3333-4333-8333-333333333333'
+const externalPostingClient = {
+  async query(source, parameters = []) {
+    externalPostingQueries.push({ source, parameters })
+    if (source.includes('FROM toast_accounting_export_drafts draft')) {
+      return { rows: [{
+        id: externalPostingDraftId,
+        restaurant_guid: '11111111-1111-4111-8111-111111111111',
+        restaurant_name: 'Example Restaurant',
+        location_name: 'Main',
+        business_date: '2026-07-19',
+        status: 'needs_review',
+        reconciliation_status: 'ready',
+        source_summary: {},
+        proposed_lines: [],
+        posting_batch_id: externalPostingBatchId,
+        is_current: true,
+        review_outcome: null,
+        posting_origin: null,
+        reviewed_by: null,
+        reviewed_at: null,
+        review_note: null,
+        external_posting_provider: null,
+        external_posting_reference: null,
+        quickbooks_sales_receipt_id: null,
+        quickbooks_journal_entry_id: null,
+        draft_revision: 1,
+        source_revision: 1,
+        updated_at: '2026-07-21T12:00:00.000Z',
+      }] }
+    }
+    if (source.includes("SELECT transaction.*, 'external'::text AS pos_accounting_origin")) {
+      return { rows: [
+        { entity_type: 'SalesReceipt', quickbooks_transaction_id: 'receipt-19', transaction_date: '2026-07-19' },
+        { entity_type: 'JournalEntry', quickbooks_transaction_id: 'journal-19', transaction_date: '2026-07-19' },
+      ] }
+    }
+    if (source.includes('FROM pos_accounting_posting_batches batch')) {
+      return { rows: [{
+        id: externalPostingBatchId,
+        draft_id: externalPostingDraftId,
+        restaurant_guid: '11111111-1111-4111-8111-111111111111',
+        business_date: '2026-07-19',
+        status: 'pending_approval',
+        request_fingerprint: 'a'.repeat(64),
+        sales_receipt_request_id: '44444444-4444-4444-8444-444444444444',
+        sales_receipt_status: 'pending_approval',
+        sales_receipt_provider_entity_id: null,
+        sales_receipt_error: null,
+        journal_entry_request_id: '55555555-5555-4555-8555-555555555555',
+        journal_entry_status: 'pending_approval',
+        journal_entry_provider_entity_id: null,
+        journal_entry_error: null,
+        requested_by: 'operator@example.com',
+        approved_by: null,
+        approval_note: null,
+        last_error: null,
+        submitted_at: '2026-07-21T12:00:00.000Z',
+        approved_at: null,
+        posted_at: null,
+        updated_at: '2026-07-21T12:00:00.000Z',
+      }] }
+    }
+    if (source.includes('UPDATE quickbooks_write_requests request SET')) {
+      return { rows: [{ id: '44444444-4444-4444-8444-444444444444' }, { id: '55555555-5555-4555-8555-555555555555' }] }
+    }
+    if (source.includes('UPDATE pos_accounting_posting_batches SET')) return { rows: [] }
+    if (source.includes('UPDATE toast_accounting_export_drafts SET')) return { rows: [] }
+    throw new Error(`Unexpected external posting query: ${source}`)
+  },
+}
+const externalPostingModule = loadTypeScriptModule('app_src/lib/persistence/posAccountingPosting.ts', {
+  '@/lib/auditWriter': {
+    recordAuditEvent: async (event) => { externalPostingAuditEvents.push(event) },
+  },
+  '@/lib/integrations/quickBooksWritePayloads': {
+    fingerprintQuickBooksWritePayload: () => 'a'.repeat(64),
+  },
+  '@/lib/persistence/posAccountingParity': {
+    buildPosAccountingParityReport: () => ({
+      rows: [
+        {
+          expected: { entityType: 'SalesReceipt', draft: { id: externalPostingDraftId } },
+          match: { status: 'matched' },
+          comparison: { status: 'match' },
+          actual: { providerTransactionId: 'receipt-19' },
+        },
+        {
+          expected: { entityType: 'JournalEntry', draft: { id: externalPostingDraftId } },
+          match: { status: 'matched' },
+          comparison: { status: 'match' },
+          actual: { providerTransactionId: 'journal-19' },
+        },
+      ],
+    }),
+    readPosAccountingParityReportInPostgres: async () => ({ rows: [], pagination: { totalPages: 1 } }),
+  },
+  '@/lib/persistence/postgres': {
+    acquireTransactionAdvisoryLock: async () => {},
+    withTransaction: async (callback) => callback(externalPostingClient),
+  },
+  '@/lib/quickBooksWritePolicy': {
+    configuredQuickBooksWritePolicy: () => ({ enabled: false, mode: null, allowedOperations: [] }),
+  },
+})
+const externalPostingOutcome = await externalPostingModule.recordExternalPostingInPostgres({
+  organizationId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+  draftId: externalPostingDraftId,
+  salesReceiptId: 'receipt-19',
+  journalEntryId: 'journal-19',
+  providerName: 'Accounting middleware',
+  providerReference: 'batch-19',
+  actorEmail: 'operator@example.com',
+})
+assert.equal(externalPostingOutcome.recorded, true)
+assert.equal(externalPostingOutcome.providerName, 'Accounting middleware')
+assert.equal(externalPostingAuditEvents.length, 1)
+assert.equal(externalPostingAuditEvents[0].eventType, 'pos.accounting.external_posting.recorded')
+assert.equal(externalPostingAuditEvents[0].payload.postingOrigin, 'external')
+assert.ok(externalPostingQueries.some(({ source }) => source.includes("status = 'cancelled'")))
+assert.ok(externalPostingQueries.some(({ source }) => source.includes("review_outcome = 'externally_posted'")))
+assert.equal(externalPostingQueries.some(({ source }) => source.includes("status = 'approved'")), false)
 
 const writePolicyModule = loadTypeScriptModule('app_src/lib/quickBooksWritePolicy.ts')
 const productOnlyPolicy = writePolicyModule.configuredQuickBooksWritePolicy({
@@ -1489,6 +1636,7 @@ for (const fragment of [
   "filename = '0064_quickbooks_write_control.sql'",
   "filename = '0065_demo_and_quickbooks_crm_reconciliation.sql'",
   "filename = '0079_pos_accounting_posting_outcomes.sql'",
+  "filename = '0080_external_pos_accounting_outcomes.sql'",
   'readQuickBooksWorkerHeartbeatFromPostgres',
   'QuickBooks sync worker heartbeat is missing or stale.',
   'QuickBooks sync queue has terminal failed jobs.',

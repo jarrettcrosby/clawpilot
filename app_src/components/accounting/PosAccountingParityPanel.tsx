@@ -8,6 +8,10 @@ import ButtonBase from '@mui/material/ButtonBase'
 import Chip from '@mui/material/Chip'
 import CircularProgress from '@mui/material/CircularProgress'
 import Divider from '@mui/material/Divider'
+import Dialog from '@mui/material/Dialog'
+import DialogActions from '@mui/material/DialogActions'
+import DialogContent from '@mui/material/DialogContent'
+import DialogTitle from '@mui/material/DialogTitle'
 import Drawer from '@mui/material/Drawer'
 import IconButton from '@mui/material/IconButton'
 import Stack from '@mui/material/Stack'
@@ -27,7 +31,7 @@ import { formatUserDateTime } from '@/lib/userDateTime'
 
 type CheckStatus = 'match' | 'variance' | 'insufficient_evidence'
 type EntityType = 'SalesReceipt' | 'JournalEntry'
-type PostingOrigin = 'shogo' | 'clawpilot'
+type PostingOrigin = 'shogo' | 'external' | 'clawpilot'
 type AccountingCapabilities = {
   canView: boolean
   canManage: boolean
@@ -180,6 +184,8 @@ type ExpectedBase = {
     reviewedBy: string | null
     reviewedAt: string | null
     reviewNote: string | null
+    externalPostingProvider: string | null
+    externalPostingReference: string | null
     quickBooksSalesReceiptId: string | null
     quickBooksJournalEntryId: string | null
     postingBatch: PostingBatch | null
@@ -311,13 +317,33 @@ type PostingActionResponse = {
   error?: string
   batch?: PostingBatch
   result?: {
-    recorded: number
-    alreadyRecorded: number
-    eligible: number
-    unresolved: number
-    recordedDates: string[]
+    recorded: number | boolean
+    alreadyRecorded: number | boolean
+    eligible?: number
+    unresolved?: number
+    failedValidation?: number
+    failures?: Array<{
+      draftId: string
+      businessDate: string
+      code: string
+      message: string
+    }>
+    recordedDates?: string[]
+    providerName?: string
+    businessDate?: string
+    salesReceiptId?: string
+    journalEntryId?: string
   }
 }
+
+type ExternalPostingDialogTarget =
+  | {
+    mode: 'draft'
+    draftId: string
+    businessDate: string
+    evidenceDetected: boolean
+  }
+  | { mode: 'range' }
 
 type ReceiptIntegrity = {
   status: CheckStatus
@@ -378,7 +404,34 @@ function entityLabel(entityType: EntityType) {
 }
 
 function originLabel(origin: PostingOrigin | null | undefined, fallback: PostingOrigin = 'shogo') {
-  return (origin || fallback) === 'clawpilot' ? 'ClawPilot' : 'Shogo'
+  const value = origin || fallback
+  if (value === 'clawpilot') return 'ClawPilot'
+  if (value === 'external') return 'External provider'
+  return 'Shogo'
+}
+
+function externalPostingEvidence(rows: DraftParityRow[], draftId: string) {
+  const draftRows = rows.filter((row) => row.expected.draft.id === draftId)
+  const receipt = draftRows.find((row) => row.expected.entityType === 'SalesReceipt')
+  const journal = draftRows.find((row) => row.expected.entityType === 'JournalEntry')
+  const eligible = draftRows.length === 2
+    && receipt?.match.status === 'matched'
+    && journal?.match.status === 'matched'
+    && receipt.comparison?.status === 'match'
+    && journal.comparison?.status === 'match'
+    && receipt.actual?.postingOrigin !== 'clawpilot'
+    && journal.actual?.postingOrigin !== 'clawpilot'
+    && Boolean(receipt.actual?.providerTransactionId)
+    && Boolean(journal.actual?.providerTransactionId)
+  if (!eligible) return null
+  return {
+    salesReceiptId: receipt!.actual!.providerTransactionId!,
+    journalEntryId: journal!.actual!.providerTransactionId!,
+    suggestedProvider: receipt!.actual!.postingOrigin === 'shogo'
+      && journal!.actual!.postingOrigin === 'shogo'
+      ? 'Shogo'
+      : '',
+  }
 }
 
 function quantityLabel(quantityMillis: number | null | undefined) {
@@ -603,25 +656,53 @@ function PostingControls({
   expected,
   capabilities,
   pending,
+  externalEvidence,
   onPrepare,
   onApprove,
+  onRecordExternal,
 }: {
   expected: ExpectedEvidence
   capabilities: AccountingCapabilities
   pending: boolean
+  externalEvidence: ReturnType<typeof externalPostingEvidence>
   onPrepare: (draftId: string) => void
   onApprove: (batch: PostingBatch) => void
+  onRecordExternal: (input: ReturnType<typeof externalPostingEvidence>) => void
 }) {
   const draft = expected.draft
   const batch = draft.postingBatch
+  const externallyPosted = draft.reviewOutcome === 'externally_posted'
+    || draft.reviewOutcome === 'shogo_posted'
+  const externalProvider = draft.externalPostingProvider
+    || (draft.reviewOutcome === 'shogo_posted' ? 'Shogo' : 'External provider')
   const canPrepare = capabilities.canPrepare
     && !batch
     && (draft.status === 'needs_review' || draft.status === 'failed')
-    && draft.reviewOutcome !== 'shogo_posted'
+    && !externallyPosted
   const canApprove = capabilities.canApprove
     && Boolean(batch)
     && ['pending_approval', 'failed', 'partial_failed'].includes(batch?.status || '')
   const retry = batch?.status === 'failed' || batch?.status === 'partial_failed'
+  const canRecordExternal = capabilities.canApprove
+    && (draft.status === 'needs_review' || draft.status === 'failed')
+    && !externallyPosted
+  const externalOption = canRecordExternal ? (
+    <Stack spacing={1}>
+      <Alert severity={externalEvidence ? 'info' : 'warning'} variant="outlined">
+        {externalEvidence
+          ? 'Both QuickBooks documents match this draft with no variance. If another system posted them, acknowledge that evidence to retain the audit trail and prevent a duplicate ClawPilot posting.'
+          : 'If another system posted this date, enter its exact QuickBooks Sales Receipt and Journal Entry IDs. ClawPilot will acknowledge them only after both records, the business date, and all compared amounts match.'}
+      </Alert>
+      <Button
+        variant="outlined"
+        disabled={pending}
+        onClick={() => onRecordExternal(externalEvidence)}
+        startIcon={pending ? <CircularProgress size={16} /> : <CompareArrowsRounded />}
+      >
+        Acknowledge external posting
+      </Button>
+    </Stack>
+  ) : null
 
   return (
     <Box component="section">
@@ -638,12 +719,21 @@ function PostingControls({
         />
       </Box>
 
-      {draft.reviewOutcome === 'shogo_posted' ? (
-        <Alert severity="success">
-          This date was already posted by Shogo. ClawPilot recorded the exact Sales Receipt and Journal Entry IDs and will not repost them.
-        </Alert>
+      {externallyPosted ? (
+        <Stack spacing={1.5}>
+          <Alert severity="success">
+            This date was posted by {externalProvider}. ClawPilot retained the exact QuickBooks evidence and will not post it again.
+          </Alert>
+          <Box display="grid" gridTemplateColumns={{ xs: '1fr', sm: 'repeat(2, minmax(0, 1fr))' }} gap={1.5}>
+            <DetailField label="Sales Receipt ID" value={draft.quickBooksSalesReceiptId} />
+            <DetailField label="Journal Entry ID" value={draft.quickBooksJournalEntryId} />
+            <DetailField label="Acknowledged by" value={draft.reviewedBy} />
+            <DetailField label="Provider reference" value={draft.externalPostingReference} />
+          </Box>
+        </Stack>
       ) : batch ? (
         <Stack spacing={1.5}>
+          {externalOption}
           <Box display="grid" gridTemplateColumns={{ xs: '1fr', sm: 'repeat(2, minmax(0, 1fr))' }} gap={1.5}>
             <DetailField label="Batch status" value={statusLabel(batch.status)} />
             <DetailField label="Requested by" value={batch.requestedBy} />
@@ -670,6 +760,7 @@ function PostingControls({
         </Stack>
       ) : (
         <Stack spacing={1.5}>
+          {externalOption}
           <Alert severity="info">
             ClawPilot posts one recoverable batch per business date: a Sales Receipt for sales and tax, plus a Journal Entry for tender, tips, and fees. Their totals serve different purposes and are validated independently.
           </Alert>
@@ -842,6 +933,12 @@ export default function PosAccountingParityPanel() {
   const [historicalDetail, setHistoricalDetail] = useState<EvidenceDetail | null>(null)
   const [detailLoading, setDetailLoading] = useState(false)
   const [detailError, setDetailError] = useState<string | null>(null)
+  const [externalDialogTarget, setExternalDialogTarget] = useState<ExternalPostingDialogTarget | null>(null)
+  const [externalProviderName, setExternalProviderName] = useState('Shogo')
+  const [externalProviderReference, setExternalProviderReference] = useState('')
+  const [externalReviewNote, setExternalReviewNote] = useState('')
+  const [externalSalesReceiptId, setExternalSalesReceiptId] = useState('')
+  const [externalJournalEntryId, setExternalJournalEntryId] = useState('')
 
   useEffect(() => {
     const controller = new AbortController()
@@ -924,6 +1021,33 @@ export default function PosAccountingParityPanel() {
     setDetailError(null)
     setDetailLoading(false)
   }
+  const openExternalDraftDialog = (evidence: ReturnType<typeof externalPostingEvidence>) => {
+    if (!selection || selection.kind !== 'current') return
+    setExternalProviderName(evidence?.suggestedProvider || '')
+    setExternalProviderReference('')
+    setExternalReviewNote('')
+    setExternalSalesReceiptId(evidence?.salesReceiptId || '')
+    setExternalJournalEntryId(evidence?.journalEntryId || '')
+    setExternalDialogTarget({
+      mode: 'draft',
+      draftId: selection.row.expected.draft.id,
+      businessDate: selection.row.expected.businessDate,
+      evidenceDetected: Boolean(evidence),
+    })
+  }
+  const openExternalRangeDialog = () => {
+    if (!from || !to) return
+    setExternalProviderName('Shogo')
+    setExternalProviderReference('')
+    setExternalReviewNote('')
+    setExternalSalesReceiptId('')
+    setExternalJournalEntryId('')
+    setExternalDialogTarget({ mode: 'range' })
+  }
+  const closeExternalDialog = () => {
+    if (actionPending) return
+    setExternalDialogTarget(null)
+  }
   const baseline = report?.historicalBaseline
   const visiblePairs = baseline?.pairs || []
   const visibleUnmatched = baseline?.unmatchedGroups || []
@@ -943,6 +1067,9 @@ export default function PosAccountingParityPanel() {
   const drawerOrigin = selection?.kind === 'current'
     ? 'ClawPilot'
     : originLabel(selectedHistoricalEvidence?.postingOrigin)
+  const selectedExternalEvidence = selection?.kind === 'current' && report
+    ? externalPostingEvidence(report.rows, selection.row.expected.draft.id)
+    : null
 
   const applyRange = () => {
     if (dateRangeInvalid) return
@@ -989,21 +1116,43 @@ export default function PosAccountingParityPanel() {
     }
   }
 
-  const recordShogoRange = async () => {
-    if (!from || !to) return
-    const confirmed = window.confirm(
-      `Record complete, exact Shogo matches from ${from} through ${to}? This records reconciliation evidence only and does not write to QuickBooks.`,
-    )
-    if (!confirmed) return
-    const payload = await postPostingAction({
-      action: 'record-shogo-range',
-      fromBusinessDate: from,
-      toBusinessDate: to,
-    })
+  const recordExternalPosting = async () => {
+    if (!externalDialogTarget || !externalProviderName.trim()) return
+    const common = {
+      providerName: externalProviderName.trim(),
+      providerReference: externalProviderReference.trim() || null,
+      reviewNote: externalReviewNote.trim() || null,
+    }
+    const payload = externalDialogTarget.mode === 'draft'
+      ? await postPostingAction({
+        action: 'record-external-draft',
+        draftId: externalDialogTarget.draftId,
+        salesReceiptId: externalSalesReceiptId.trim(),
+        journalEntryId: externalJournalEntryId.trim(),
+        ...common,
+      })
+      : await postPostingAction({
+        action: 'record-external-range',
+        fromBusinessDate: from,
+        toBusinessDate: to,
+        ...common,
+      })
     if (!payload?.result) return
-    setActionNotice(
-      `${payload.result.recorded} Shogo posting${payload.result.recorded === 1 ? '' : 's'} recorded; ${payload.result.alreadyRecorded} already recorded; ${payload.result.unresolved} still require review.`,
-    )
+    if (externalDialogTarget.mode === 'draft') {
+      setActionNotice(
+        payload.result.alreadyRecorded
+          ? `This ${externalProviderName.trim()} posting was already acknowledged.`
+          : `${externalProviderName.trim()} posting acknowledged. ClawPilot retained both QuickBooks IDs and will not post this date again.`,
+      )
+    } else {
+      const failureSummary = payload.result.failedValidation
+        ? ` ${payload.result.failedValidation} exact-match candidate${payload.result.failedValidation === 1 ? '' : 's'} failed validation and remain in Needs Review.`
+        : ''
+      setActionNotice(
+        `${payload.result.recorded} external posting${payload.result.recorded === 1 ? '' : 's'} acknowledged; ${payload.result.alreadyRecorded} already recorded; ${payload.result.unresolved} still require review.${failureSummary}`,
+      )
+    }
+    setExternalDialogTarget(null)
     closeDrawer()
     setLoading(true)
     setRefreshToken((value) => value + 1)
@@ -1094,14 +1243,14 @@ export default function PosAccountingParityPanel() {
         <Button variant="contained" disabled={dateRangeInvalid || loading} onClick={applyRange}>Apply</Button>
         {(from || to) ? <Button variant="text" onClick={clearRange}>Clear</Button> : null}
         {capabilities.canApprove ? (
-          <Tooltip title={from && to ? 'Record strict Shogo matches without writing to QuickBooks' : 'Apply both dates before recording Shogo results'}>
+          <Tooltip title={from && to ? 'Acknowledge exact external posting matches without writing to QuickBooks' : 'Apply both dates before acknowledging external postings'}>
             <span>
               <Button
                 variant="outlined"
                 disabled={!from || !to || dateRangeInvalid || loading || actionPending}
-                onClick={recordShogoRange}
+                onClick={openExternalRangeDialog}
               >
-                Record matched Shogo results
+                Acknowledge external postings
               </Button>
             </span>
           </Tooltip>
@@ -1296,6 +1445,11 @@ export default function PosAccountingParityPanel() {
                 <Box minWidth={0} sx={{ gridColumn: { xs: '1 / -1', sm: 'auto' } }}>
                   <Typography variant="body2" noWrap>{entityLabel(row.expected.entityType)}</Typography>
                   <Typography variant="caption" color="text.secondary" noWrap display="block">{row.expected.draft.locationName || row.expected.draft.restaurantName || 'POS location'}</Typography>
+                  {row.expected.draft.reviewOutcome === 'externally_posted' || row.expected.draft.reviewOutcome === 'shogo_posted' ? (
+                    <Typography variant="caption" color="success.main" noWrap display="block">
+                      Posted by {row.expected.draft.externalPostingProvider || 'Shogo'}
+                    </Typography>
+                  ) : null}
                 </Box>
                 <Box sx={{ display: { xs: 'none', sm: 'block' } }}>
                   <Typography variant="caption" color="text.secondary">Evidence match</Typography>
@@ -1400,8 +1554,10 @@ export default function PosAccountingParityPanel() {
                     expected={selection.row.expected}
                     capabilities={capabilities}
                     pending={actionPending}
+                    externalEvidence={selectedExternalEvidence}
                     onPrepare={preparePosting}
                     onApprove={approvePosting}
+                    onRecordExternal={openExternalDraftDialog}
                   />
                   <ExpectedDocumentDetails expected={selection.row.expected} formatCents={formatDelta} />
                   {selection.row.actual ? (
@@ -1430,6 +1586,94 @@ export default function PosAccountingParityPanel() {
           </Box>
         ) : null}
       </Drawer>
+
+      <Dialog
+        open={Boolean(externalDialogTarget)}
+        onClose={closeExternalDialog}
+        fullWidth
+        maxWidth="sm"
+        aria-labelledby="external-posting-dialog-title"
+        PaperProps={{ sx: { borderRadius: '8px', bgcolor: '#1B1C25', backgroundImage: 'none' } }}
+      >
+        <DialogTitle id="external-posting-dialog-title">Acknowledge external posting</DialogTitle>
+        <DialogContent>
+          <Stack spacing={2} pt={0.5}>
+            <Alert severity="info" variant="outlined">
+              This records existing QuickBooks evidence only. ClawPilot will not create, approve, or resend a QuickBooks transaction.
+            </Alert>
+            {externalDialogTarget?.mode === 'draft' ? (
+              <Stack spacing={1.5}>
+                <DetailField label="Business date" value={externalDialogTarget.businessDate} />
+                {!externalDialogTarget.evidenceDetected ? (
+                  <Alert severity="warning" variant="outlined">
+                    No exact pair was auto-detected. Enter the QuickBooks record IDs from the external posting; acknowledgment will fail safely if either record does not match.
+                  </Alert>
+                ) : null}
+                <Box display="grid" gridTemplateColumns={{ xs: '1fr', sm: 'repeat(2, minmax(0, 1fr))' }} gap={1.5}>
+                  <TextField
+                    required
+                    label="Sales Receipt ID"
+                    value={externalSalesReceiptId}
+                    onChange={(event) => setExternalSalesReceiptId(event.target.value)}
+                    inputProps={{ maxLength: 200 }}
+                  />
+                  <TextField
+                    required
+                    label="Journal Entry ID"
+                    value={externalJournalEntryId}
+                    onChange={(event) => setExternalJournalEntryId(event.target.value)}
+                    inputProps={{ maxLength: 200 }}
+                  />
+                </Box>
+              </Stack>
+            ) : (
+              <Alert severity="warning" variant="outlined">
+                ClawPilot will acknowledge only dates in the applied range that have one exact Sales Receipt match and one exact Journal Entry match with no amount variance. Every unresolved date stays in Needs Review.
+              </Alert>
+            )}
+            <TextField
+              autoFocus
+              required
+              label="Posting provider"
+              placeholder="Shogo, middleware, or another system"
+              value={externalProviderName}
+              onChange={(event) => setExternalProviderName(event.target.value)}
+              inputProps={{ maxLength: 120 }}
+              helperText="The system that created the QuickBooks records."
+            />
+            <TextField
+              label="Provider reference"
+              placeholder="Optional batch, run, or posting reference"
+              value={externalProviderReference}
+              onChange={(event) => setExternalProviderReference(event.target.value)}
+              inputProps={{ maxLength: 200 }}
+            />
+            <TextField
+              label="Review note"
+              placeholder="Optional reconciliation note"
+              value={externalReviewNote}
+              onChange={(event) => setExternalReviewNote(event.target.value)}
+              inputProps={{ maxLength: 500 }}
+              multiline
+              minRows={3}
+            />
+          </Stack>
+        </DialogContent>
+        <DialogActions sx={{ px: 3, pb: 2.5 }}>
+          <Button onClick={closeExternalDialog} disabled={actionPending}>Cancel</Button>
+          <Button
+            variant="contained"
+            onClick={recordExternalPosting}
+            disabled={actionPending
+              || !externalProviderName.trim()
+              || (externalDialogTarget?.mode === 'draft'
+                && (!externalSalesReceiptId.trim() || !externalJournalEntryId.trim()))}
+            startIcon={actionPending ? <CircularProgress size={16} /> : <CompareArrowsRounded />}
+          >
+            Acknowledge posting
+          </Button>
+        </DialogActions>
+      </Dialog>
     </Stack>
   )
 }
