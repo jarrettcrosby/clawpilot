@@ -28,6 +28,13 @@ Do not use Eigen Racing project assumptions, docs, ports, validation gates, or d
 - Use pull requests from `dev` to `main` for promotion.
 - For private-project validation, GitHub CI plus Vercel protected previews are sufficient guardrails unless the operator asks for stricter branch protection.
 
+## Local Development
+
+- Start the local app from the repository root with `./scripts/dev-start.sh`.
+- Do not use `npm run dev` for normal local validation. It omits the isolated data environment variables required by the dev runtime.
+- The supported local URL is `http://localhost:4002`.
+- For browser testing launched from a tool-managed shell, keep the startup shell alive for the duration of the test so the background app process is not cleaned up when the shell exits.
+
 ## Validation
 
 Before completing code changes, run the smallest relevant gate and record the result:

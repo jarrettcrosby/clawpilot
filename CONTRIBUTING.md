@@ -29,6 +29,7 @@
 Before a normal development handoff:
 
 ```bash
+npm run verify:repo
 npm run lint
 npm run build
 npm run test
@@ -42,6 +43,8 @@ Before a promotion candidate or GitHub push:
 npm run verify:regression
 npm run verify:predeploy
 ```
+
+`verify:repo` rejects tracked secrets, runtime data, generated builds, test reports, logs, backups, platform-local state, and oversized artifacts. Fix the source boundary; do not weaken the check to accommodate generated files.
 
 ## Pull Request Expectations
 

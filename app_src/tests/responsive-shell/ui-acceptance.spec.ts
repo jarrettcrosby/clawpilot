@@ -262,6 +262,51 @@ test('agent card comments open the linked task working document', async ({ page 
   await expect(page.getByText('The task-linked working document is open.')).toBeVisible()
 })
 
+test('application user guide is readable and module-linked on mobile', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 })
+  await page.route((url) => url.pathname === '/api/docs', (route) => route.fulfill({
+    json: [{
+      id: 'system:application-user-guide',
+      title: 'ClawPilot User Guide',
+      category: 'getting-started',
+      date: '2026-07-22',
+      slug: 'clawpilot-user-guide',
+      tags: ['user-guide', 'onboarding', 'help', 'modules'],
+      status: 'active',
+      source: 'system',
+      content: [
+        '# ClawPilot User Guide',
+        '',
+        'Prepared for: Test User',
+        'Active workspace: Test Workspace',
+        '',
+        '## Application Map',
+        '',
+        '| Module | Use it for | Open |',
+        '| --- | --- | --- |',
+        '| Dashboard | Current work and workspace defaults | [Open Dashboard](/#dashboard) |',
+        '| Projects | Boards, tasks, comments, and agent assignment | [Open Projects](/#projects) |',
+        '| Pipeline | Opportunities, insights, and sync status | [Open Pipeline](/#pipeline) |',
+        '',
+        '## Projects and Agents',
+        '',
+        'Use Discuss for questions and Work for durable execution.',
+      ].join('\n'),
+    }],
+  }))
+
+  await gotoApp(page, '/#docs')
+  await expect(page.getByRole('heading', { name: 'ClawPilot User Guide' })).toBeVisible()
+  await expect(page.getByText('Prepared for: Test User')).toBeVisible()
+  await expect(page.getByRole('link', { name: 'Open Dashboard' })).toHaveAttribute('href', '/#dashboard')
+  await expect(page.getByText('Use Discuss for questions and Work for durable execution.')).toBeVisible()
+  await expectNoHorizontalOverflow(page)
+
+  await page.setViewportSize({ width: 844, height: 390 })
+  await expect(page.getByTestId('docs-reader')).toBeVisible()
+  await expectNoHorizontalOverflow(page)
+})
+
 test('responsive shell: 390x844 exposes compact navigation and dismissible drawers', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 })
   await gotoApp(page, '/#dashboard')

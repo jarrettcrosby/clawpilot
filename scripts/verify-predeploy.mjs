@@ -193,6 +193,7 @@ for (const requiredPath of [
   'scripts/monitor-deployed-runtime.mjs',
   'scripts/test-deployed-runtime-monitor.mjs',
   'scripts/record-release.mjs',
+  'scripts/verify-repository-hygiene.mjs',
   'scripts/vercel-build.mjs',
   'scripts/verify-mail-sender.mjs',
   'docs/index.md',

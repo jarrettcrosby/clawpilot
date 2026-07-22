@@ -406,6 +406,12 @@ assertIncludes(documentsAdapter, 'ON CONFLICT (owner_email, workspace_organizati
 assertIncludes(documentsAdapter, "sourceKey: 'system:build-brief'", 'generated build brief')
 assertIncludes(documentsAdapter, "sourceKey: 'system:project-brief'", 'generated project brief')
 assertIncludes(documentsAdapter, "sourceKey: 'system:pipeline-brief'", 'generated pipeline brief')
+assertIncludes(documentsAdapter, "APPLICATION_USER_GUIDE_SOURCE_KEY = 'system:application-user-guide'", 'stable application user guide identity')
+assertIncludes(documentsAdapter, "title: 'ClawPilot User Guide'", 'application user guide document')
+assertIncludes(documentsAdapter, 'ensureApplicationUserGuide(user)', 'active membership user guide refresh')
+for (const moduleName of ['Dashboard', 'Docs', 'Projects', 'Pipeline', 'CRM', 'Accounting', 'POS', 'Links', 'Agents', 'Versions']) {
+  assertIncludes(documentsAdapter, `| ${moduleName} |`, `${moduleName} user guide coverage`)
+}
 assertIncludes(documentsAdapter, 'document.content', 'local full-document search')
 assertIncludes(documentsAdapter, 'document_embedding_jobs', 'document embedding enqueue')
 assertIncludes(documentsAdapter, 'listAiRadarItems', 'AI Radar generated brief')
@@ -422,6 +428,12 @@ assertIncludes(documentsAdapter, 'const area = singleLine(parsed.data.area)', 'd
 assertIncludes(documentsAdapter, 'generateUserDocument', 'user-triggered document generation')
 assertIncludes(documentsAdapter, 'user-generated:', 'immutable user-generated document source identity')
 assertIncludes(documentsAdapter, 'generated-on-demand', 'on-demand document classification')
+
+const documentsRoute = read('app_src/app/api/docs/route.ts')
+assertIncludes(documentsRoute, 'await ensureApplicationUserGuide(actor)', 'user guide provisioning before every document read')
+
+const dashboardBootstrap = read('app_src/lib/dashboardBootstrapServer.ts')
+assertIncludes(dashboardBootstrap, 'await ensureApplicationUserGuide(actor)', 'user guide provisioning before dashboard document read')
 
 const generatedDocumentRoute = read('app_src/app/api/docs/generate/route.ts')
 assertIncludes(generatedDocumentRoute, 'requireRequestUser(req)', 'signed user document generation boundary')

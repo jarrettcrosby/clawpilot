@@ -4,7 +4,7 @@ import type {
   DashboardPipelineSnapshot,
 } from '@/lib/dashboardBootstrapTypes'
 import { readDashboardWorkspace } from '@/lib/dashboardWorkspace'
-import { listUserDocuments } from '@/lib/documents'
+import { ensureApplicationUserGuide, listUserDocuments } from '@/lib/documents'
 import { isPostgresPipelineStoreEnabled } from '@/lib/persistence/pipeline'
 import { readCrmSummaryFromPostgres } from '@/lib/persistence/crm'
 import { isPostgresTaskStoreEnabled, readTasksFromPostgres } from '@/lib/persistence/tasks'
@@ -17,6 +17,7 @@ async function readTasks(boardId: string | null) {
 }
 
 async function readDocs(actor: AppUser): Promise<DashboardDocMeta[]> {
+  await ensureApplicationUserGuide(actor)
   const docs = await listUserDocuments(actor)
   return docs.map(({ id, title, category, date, slug }) => ({ id, title, category, date, slug }))
 }

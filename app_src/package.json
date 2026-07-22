@@ -21,7 +21,7 @@
     "@mui/icons-material": "^7.3.8",
     "@mui/material": "^7.3.8",
     "csv-parse": "^7.0.1",
-    "fast-xml-parser": "5.10.0",
+    "fast-xml-parser": "5.10.1",
     "google-auth-library": "^10.9.0",
     "gray-matter": "^4.0.3",
     "next": "16.2.10",
@@ -32,7 +32,8 @@
     "remark-gfm": "^4.0.1"
   },
   "overrides": {
-    "postcss": "8.5.10"
+    "postcss": "8.5.10",
+    "sharp": "0.35.3"
   },
   "devDependencies": {
     "@playwright/test": "^1.53.0",

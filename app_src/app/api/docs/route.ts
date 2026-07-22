@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import {
+  ensureApplicationUserGuide,
   ensureUserBriefs,
   listLocalRepositoryDocuments,
   listUserDocuments,
@@ -24,6 +25,7 @@ async function documentPayload(req: NextRequest, refresh: boolean) {
   const search = new URL(req.url).searchParams.get('q') || ''
   if (!isPostgresStorageEnabled()) return listLocalRepositoryDocuments(search)
   const actor = await requireRequestUser(req)
+  await ensureApplicationUserGuide(actor)
   const selection = {
     boardId: req.cookies.get(BOARD_SELECTION_COOKIE)?.value || null,
     pipelineId: req.cookies.get(PIPELINE_SELECTION_COOKIE)?.value || null,

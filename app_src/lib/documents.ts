@@ -166,6 +166,10 @@ function markdownList(items: string[], empty: string): string {
   return items.length > 0 ? items.map((item) => `- ${singleLine(item)}`).join('\n') : `- ${empty}`
 }
 
+function markdownInline(value: unknown, fallback: string): string {
+  return singleLine(value || fallback).replace(/([\\`*_\[\]<>])/g, '\\$1')
+}
+
 function money(value: number): string {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(value || 0)
 }
@@ -269,6 +273,145 @@ async function upsertDocument(input: {
     ? await client.query<{ document_id: string }>(sql, parameters)
     : await query<{ document_id: string }>(sql, parameters)
   return result.rows[0]?.document_id || null
+}
+
+export const APPLICATION_USER_GUIDE_SOURCE_KEY = 'system:application-user-guide'
+
+type ApplicationGuideUser = Pick<AppUser,
+  'displayName' | 'organizationName' | 'organizationRole' | 'role'> & {
+    permissions: Pick<AppUser['permissions'], 'viewAccounting' | 'manageLinks'>
+  }
+
+function applicationUserGuideContent(user: ApplicationGuideUser): string {
+  const displayName = markdownInline(user.displayName, 'ClawPilot user')
+  const organizationName = markdownInline(user.organizationName, 'Current workspace')
+  const organizationRole = markdownInline(user.organizationRole || user.role, 'member')
+  const accountingAccess = user.permissions.viewAccounting
+    ? 'Your current access includes Accounting. Preparing, approving, and posting still depend on the separate accounting permissions shown in Settings.'
+    : 'Accounting data is restricted in this workspace. Ask a workspace administrator if your role requires it.'
+  const linkAccess = user.permissions.manageLinks
+    ? 'You can create and manage organization-scoped short links.'
+    : 'You can open links shared with you, while link management remains restricted to authorized users.'
+
+  return [
+    '# ClawPilot User Guide',
+    '',
+    `Prepared for: ${displayName}`,
+    `Active workspace: ${organizationName}`,
+    `Workspace role: ${organizationRole}`,
+    '',
+    '> ClawPilot keeps boards, pipelines, CRM records, documents, integrations, and agent context inside the active workspace. Check the workspace selector before creating or changing business data.',
+    '',
+    '## Start Here',
+    '',
+    '1. Open **Settings > Profile** and confirm your display name, job title, timezone, and locale.',
+    '2. Check the workspace selector in the application header. Users with more than one business switch workspaces there; data does not combine across peer workspaces.',
+    '3. On **Dashboard**, choose the board and pipeline you use most often. Those choices become your workspace defaults.',
+    '4. Open **Settings > Integrations** to connect only the services you are authorized to use. Each user connects their own ChatGPT/Codex authorization.',
+    '5. Return to this guide from **Docs** at any time. Search for `user guide`, `onboarding`, or a module name.',
+    '',
+    '## Application Map',
+    '',
+    '| Module | Use it for | Open |',
+    '| --- | --- | --- |',
+    '| Dashboard | Current work, agent attention, pipeline summary, recent documents, and workspace defaults | [Open Dashboard](/#dashboard) |',
+    '| Docs | This guide, generated briefs, task working documents, release context, and private search | [Open Docs](/#docs) |',
+    '| Projects | Personal or shared boards, tasks, checklists, comments, status, and agent assignment | [Open Projects](/#projects) |',
+    '| Pipeline | Opportunities, stages, products, owners, insights, Google Sheet access, and sync status | [Open Pipeline](/#pipeline) |',
+    '| CRM | Organizations, contacts, leads, opportunities, meetings, interactions, campaigns, and record relationships | [Open CRM](/#crm) |',
+    '| Accounting | QuickBooks reports, invoices, receipts, attachments, products, customers, and controlled write reviews | [Open Accounting](/#accounting) |',
+    '| POS | Toast orders, menu reporting, accounting mappings, draft generation, parity evidence, and posting controls | [Open POS](/#pos) |',
+    '| Links | Organization-scoped short links, slugs, expiration, click limits, and search | [Open Links](/#links) |',
+    '| Agents | Task-specific discussion, durable work dispatches, execution state, and working-document results | [Open Agents](/#agents) |',
+    '| Versions | User-facing releases, fixes, checkpoints, and authorized activity history | [Open Versions](/#versions) |',
+    '',
+    '## Projects and Agents',
+    '',
+    '1. Create a task with a concrete outcome, enough context to act, and a useful next action or checklist.',
+    '2. Assign the product agent that matches the work: ClawPilot, Projects, Pipeline, Docs, or Calendar.',
+    '3. Use **Discuss** in Agents when you want an answer or want to refine scope. Discussion does not change the card.',
+    '4. Use **Work** when you want a durable execution. Work can update allowed task evidence, continue through checklist steps, and create or update one task-linked working document.',
+    '5. On a card, explicitly mention the assigned agent when a new comment should start work. Ordinary comments remain human discussion.',
+    '6. Review the status and linked document. `Input needed` requires a specific user decision; `Blocked` means a real capability or dependency is unavailable; `Review` means evidence is ready for a person.',
+    '',
+    'Agent roles are stable ClawPilot profiles, not separate custom GPTs. Every run rebuilds context from the role instruction, selected task, private workspace memory, and approved shared operating principles. Your ChatGPT/Codex credential is never shared with another user.',
+    '',
+    '## Pipeline and CRM',
+    '',
+    '1. Create or select the customer organization before adding an opportunity.',
+    '2. Select one or more active products, an owner, stage, lifecycle status, probability, value, source, priority, and expected close date as applicable.',
+    '3. Use stage for board position and status for lifecycle reporting. Open and On Hold remain active; Won/Closed are wins; Lost/Abandoned are losses.',
+    '4. Record contacts and interactions against the correct organization and, when known, the related opportunity. This makes touchpoint and cadence insights actionable.',
+    '5. Watch sync state. A queued or failed record is not yet synchronized with SuiteCRM or Google Sheets.',
+    '6. Use **Open Sheet** for the managed workbook. Only the Opportunities operator table is writable; CRM and reporting tabs are generated projections.',
+    '',
+    'Global IDs are permanent record references: `ga` organizations, `gc` contacts, `gu` CRM employees, `go` opportunities, `gm` meetings, and related module prefixes. Use the Global ID or its short link when referring to an exact record.',
+    '',
+    '## Accounting and POS',
+    '',
+    accountingAccess,
+    '',
+    '1. Connect QuickBooks and Toast to the correct active workspace before reviewing data.',
+    '2. In POS Accounting, bind the Toast location to the intended QuickBooks company and configure posting method, customer, clearing account, tax, memo, and optional class/location choices.',
+    '3. Map every Toast sales item, service charge, tax, and tender to an exact QuickBooks item, account, or tax code. Create missing products through a reviewable draft.',
+    '4. Reload sales when source data for one business date changed. Regenerate accounting when mappings or posting configuration changed but stored Toast sales are already current.',
+    '5. Review the reconstructed Sales Receipt and Journal Entry, totals, mapping evidence, and parity details before any write.',
+    '6. During a parallel run with another posting system, record the exact external result and QuickBooks references. Do not post the same business date again from ClawPilot.',
+    '7. ClawPilot writes only after an authorized user prepares, submits, and approves the supported operation. A preview, draft, match, or provider response is not proof that QuickBooks changed.',
+    '',
+    '## Documents and Reports',
+    '',
+    '- System documents stay private to you inside this workspace.',
+    '- **Build Brief** summarizes recent application releases.',
+    '- **Project Board Brief** summarizes the selected board and next actions.',
+    '- **Pipeline Brief** combines opportunities with linked interaction cadence, stale work, close-date risk, and an action queue.',
+    '- **AI and Opportunity Radar** contains verified platform updates and the research queue.',
+    '- **New document** creates a point-in-time snapshot without replacing the live brief.',
+    '- Agent research and design work belongs in the linked working document; card comments remain concise status and navigation evidence.',
+    '',
+    '## People, Permissions, and Sharing',
+    '',
+    '- **Profile** controls your personal name, job title, timezone, and locale.',
+    '- **People** is where authorized administrators invite users, choose an organization, set role and granular permissions, enable CRM employee identity, disable access, or manage existing users.',
+    '- **Sharing** grants explicit board or pipeline viewer/editor access. Application administration does not automatically grant every organization record.',
+    '- **Integrations** stores and tests the active workspace or user credentials allowed by the connector contract.',
+    `- ${linkAccess}`,
+    '- Demo access is off by default and appears only when an administrator grants it. Demo data is synthetic and separate from live business workspaces.',
+    '',
+    '## Mobile and Browser Sessions',
+    '',
+    '- On mobile, use the bottom navigation for frequent modules and **More** for the full menu.',
+    '- Tables and boards may use a selected-stage or horizontal detail view on narrow screens; detail drawers retain their own vertical scrolling.',
+    '- Each browser creates a separate authenticated session with device, browser, last activity, and IP attribution. Review or revoke sessions from Settings if a device is no longer trusted.',
+    '- A root administrator may use audited impersonation for support. Activity records both the effective user and the impersonating administrator.',
+    '',
+    '## When Something Looks Wrong',
+    '',
+    '1. Confirm the active workspace, selected board, selected pipeline, and date range.',
+    '2. Read the visible status before retrying. `Queued`, `syncing`, `needs review`, and `failed` represent different recovery paths.',
+    '3. Refresh the module once. Avoid repeated submission while an operation is queued or working.',
+    '4. Open the Activity detail or related Global ID to identify the exact record and last durable event.',
+    '5. Send the administrator the module, workspace, Global ID, timestamp, visible error, and action you attempted. Do not send passwords, API keys, device codes, or service-account files.',
+  ].join('\n')
+}
+
+export async function ensureApplicationUserGuide(user: AppUser): Promise<void> {
+  const ownerEmail = normalizeUserEmail(user.email)
+  const organizationId = String(user.organizationId || '').trim()
+  if (!organizationId) throw new Error('Active workspace is required for documents')
+  await upsertDocument({
+    ownerEmail,
+    organizationId,
+    sourceKey: APPLICATION_USER_GUIDE_SOURCE_KEY,
+    source: 'system',
+    kind: 'application-user-guide',
+    status: 'active',
+    title: 'ClawPilot User Guide',
+    slug: 'clawpilot-user-guide',
+    category: 'getting-started',
+    content: applicationUserGuideContent(user),
+    tags: ['user-guide', 'onboarding', 'help', 'modules'],
+  })
 }
 
 export type AgentTaskDocumentReference = {
@@ -716,7 +859,10 @@ export async function refreshActiveUserBriefs(): Promise<{ refreshed: number; er
   const users = await Promise.all(activeUsers.rows.map((row) => (
     requireWorkspaceAppUser(row.email, row.organization_id)
   )))
-  const settled = await Promise.allSettled(users.map((user) => refreshUserBriefs(user)))
+  const settled = await Promise.allSettled(users.map((user) => Promise.all([
+    ensureApplicationUserGuide(user),
+    refreshUserBriefs(user),
+  ])))
   return {
     refreshed: settled.filter((result) => result.status === 'fulfilled').length,
     errors: settled.flatMap((result) => result.status === 'rejected'
@@ -984,7 +1130,33 @@ export async function listLocalRepositoryDocuments(searchValue?: unknown): Promi
     return document
   }))).filter((document): document is AppDocument => document !== null)
 
+  const localGuideContent = applicationUserGuideContent({
+    displayName: 'Local developer',
+    organizationName: 'Local development workspace',
+    organizationRole: 'owner',
+    role: 'owner',
+    permissions: { viewAccounting: true, manageLinks: true },
+  })
+  const localGuide: AppDocument = {
+    id: APPLICATION_USER_GUIDE_SOURCE_KEY,
+    title: 'ClawPilot User Guide',
+    date: '',
+    tags: ['user-guide', 'onboarding', 'help', 'modules'],
+    category: 'getting-started',
+    slug: 'clawpilot-user-guide',
+    content: localGuideContent,
+    excerpt: excerptFor(localGuideContent),
+    kind: 'application-user-guide',
+    status: 'active',
+    source: 'system',
+    sourcePath: null,
+  }
+  if (!search || [localGuide.title, localGuide.category, localGuide.excerpt, localGuide.content, ...localGuide.tags]
+    .some(value => value.toLowerCase().includes(search))) documents.unshift(localGuide)
+
   return documents.sort((left, right) => {
+    if (left.id === APPLICATION_USER_GUIDE_SOURCE_KEY) return -1
+    if (right.id === APPLICATION_USER_GUIDE_SOURCE_KEY) return 1
     const statusOrder = (status: string) => status === 'active' ? 0 : status === 'generated' ? 1 : status === 'draft' ? 2 : 3
     return statusOrder(left.status) - statusOrder(right.status)
       || right.date.localeCompare(left.date)
@@ -1056,11 +1228,12 @@ export async function listUserDocuments(user: AppUser, searchValue?: unknown): P
           END
         ) END DESC,
         CASE source_key
-          WHEN 'system:build-brief' THEN 0
-          WHEN 'system:project-brief' THEN 1
-          WHEN 'system:pipeline-brief' THEN 2
-          WHEN 'system:ai-opportunity-radar' THEN 3
-          ELSE 4
+          WHEN 'system:application-user-guide' THEN 0
+          WHEN 'system:build-brief' THEN 1
+          WHEN 'system:project-brief' THEN 2
+          WHEN 'system:pipeline-brief' THEN 3
+          WHEN 'system:ai-opportunity-radar' THEN 4
+          ELSE 5
         END,
         CASE status WHEN 'active' THEN 0 WHEN 'generated' THEN 1 WHEN 'draft' THEN 2 ELSE 3 END,
         updated_at DESC,
