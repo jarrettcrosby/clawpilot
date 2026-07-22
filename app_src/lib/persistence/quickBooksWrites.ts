@@ -5,6 +5,7 @@ import type {
   QuickBooksWriteOperationKind,
 } from '@/lib/integrations/quickBooksWritePayloads'
 import { acquireTransactionAdvisoryLock, query, withTransaction } from '@/lib/persistence/postgres'
+import { synchronizePosAccountingPostingBatchForRequest } from '@/lib/persistence/posAccountingPosting'
 import { configuredQuickBooksWritePolicy } from '@/lib/quickBooksWritePolicy'
 
 export type QuickBooksWriteRequestStatus =
@@ -158,6 +159,16 @@ function requestSummary(operationKind: QuickBooksWriteOperationKind, payload: Qu
   if (operationKind === 'invoice.create') {
     return { customerName: record.customerName, totalAmount: record.totalAmount }
   }
+  if (operationKind === 'sales_receipt.create') {
+    return { businessDate: record.transactionDate, totalAmount: record.totalAmount }
+  }
+  if (operationKind === 'journal_entry.create') {
+    return {
+      businessDate: record.transactionDate,
+      debitAmount: record.debitAmount,
+      creditAmount: record.creditAmount,
+    }
+  }
   return { name: record.displayName || record.name }
 }
 
@@ -190,7 +201,9 @@ export async function readQuickBooksWriteWorkspaceInPostgres(input: {
       [input.organizationId],
     ),
     query<{ count: string }>(
-      'SELECT count(*)::text AS count FROM quickbooks_write_requests WHERE organization_id = $1::uuid',
+      `SELECT count(*)::text AS count FROM quickbooks_write_requests
+       WHERE organization_id = $1::uuid
+         AND operation_kind NOT IN ('sales_receipt.create', 'journal_entry.create')`,
       [input.organizationId],
     ),
     query<WriteRequestRow>(
@@ -199,6 +212,7 @@ export async function readQuickBooksWriteWorkspaceInPostgres(input: {
        LEFT JOIN app_users requested ON requested.email = request.requested_by
        LEFT JOIN app_users approved ON approved.email = request.approved_by
        WHERE request.organization_id = $1::uuid
+         AND request.operation_kind NOT IN ('sales_receipt.create', 'journal_entry.create')
        ORDER BY request.created_at DESC, request.id DESC
        LIMIT $2 OFFSET $3`,
       [input.organizationId, pageSize, offset],
@@ -209,6 +223,7 @@ export async function readQuickBooksWriteWorkspaceInPostgres(input: {
        LEFT JOIN app_users requested ON requested.email = request.requested_by
        LEFT JOIN app_users approved ON approved.email = request.approved_by
        WHERE request.organization_id = $1::uuid
+         AND request.operation_kind NOT IN ('sales_receipt.create', 'journal_entry.create')
          AND request.id = NULLIF($2, '')::uuid
        LIMIT 1`,
       [input.organizationId, input.requestId || ''],
@@ -779,6 +794,11 @@ export async function completeQuickBooksWriteJobInPostgres(input: {
       ],
     )
     if (!completed.rowCount) throw new Error('QuickBooks write lease was lost')
+    await synchronizePosAccountingPostingBatchForRequest(client, {
+      organizationId: input.job.organizationId,
+      requestId: input.job.id,
+      providerEntityId: input.providerEntityId,
+    })
     await recordAuditEvent({
       actor: 'system',
       eventType: 'quickbooks.write.succeeded',
@@ -823,6 +843,10 @@ export async function failQuickBooksWriteJobInPostgres(input: {
       [input.job.id, input.job.lockToken, dead ? 'dead' : 'failed', input.errorCode, message, input.job.connectionId],
     )
     if (!failed.rowCount) return false
+    await synchronizePosAccountingPostingBatchForRequest(client, {
+      organizationId: input.job.organizationId,
+      requestId: input.job.id,
+    })
     await recordAuditEvent({
       actor: 'system',
       eventType: dead ? 'quickbooks.write.dead' : 'quickbooks.write.failed',

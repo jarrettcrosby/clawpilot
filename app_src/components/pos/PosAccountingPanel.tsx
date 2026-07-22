@@ -1090,7 +1090,7 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
               ))}
               {evidence.protected === true ? <Alert severity="info" sx={{ borderRadius: '8px' }}>Approved or posted evidence is immutable.</Alert> : null}
               <Alert severity="info" sx={{ borderRadius: '8px' }}>
-                Posting is disabled. This screen prepares and validates accounting evidence only.
+                This screen prepares and validates accounting evidence. Review the completed draft in Accounting &gt; POS posting parity to record a Shogo result or post the Sales Receipt and Journal Entry with ClawPilot.
               </Alert>
             </Stack>
           </Box>

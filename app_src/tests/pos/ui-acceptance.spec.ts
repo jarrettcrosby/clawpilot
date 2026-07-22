@@ -229,7 +229,7 @@ async function mockAccountingParity(page: Page) {
               summary: {
                 cachedTransactions: 97,
                 pairCount: 44,
-                exactDocumentPairs: 44,
+                exactMarkerPairs: 44,
                 dateFallbackPairs: 0,
                 unmatchedGroups: 9,
                 unmatchedEvidence: 9,
@@ -239,7 +239,7 @@ async function mockAccountingParity(page: Page) {
                 journalBalance: { match: 48, variance: 0, insufficientEvidence: 0 },
               },
               pairs: [{
-                basis: 'business_date_and_document',
+                basis: 'business_date_and_marker',
                 businessDate: '2026-07-18',
                 salesReceipt: {
                   evidenceId: 'receipt-1534', entityType: 'SalesReceipt', providerTransactionId: '1534',
@@ -286,7 +286,7 @@ async function mockAccountingParity(page: Page) {
                 lineGroups: [{ itemId: 'item-breakfast', itemName: 'Breakfast Sandwich', amountCents: 8000, quantityMillis: 8000 }],
                 unidentifiedLineCount: 0, unsupportedLineCount: 0,
               },
-              match: { status: 'matched', basis: 'document_number', candidateTransactionIds: [] },
+              match: { status: 'matched', basis: 'provider_id', candidateTransactionIds: [] },
               comparison: {
                 status: 'match',
                 total: { status: 'match', expectedCents: 59232, actualCents: 59232, deltaCents: 0 },

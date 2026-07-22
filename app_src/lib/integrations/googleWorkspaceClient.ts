@@ -32,6 +32,11 @@ type GoogleRequestInput = {
   idempotent?: boolean
 }
 
+type GoogleUpstreamErrorDetails = {
+  reason: string
+  message: string
+}
+
 export class GoogleWorkspaceClientError extends Error {
   constructor(
     message: string,
@@ -127,17 +132,47 @@ async function readBoundedResponse(response: Response) {
   return bytes
 }
 
-function upstreamError(status: number) {
+function googleUpstreamErrorDetails(bytes: Uint8Array): GoogleUpstreamErrorDetails {
+  if (bytes.byteLength === 0) return { reason: '', message: '' }
+  try {
+    const payload = JSON.parse(new TextDecoder().decode(bytes)) as {
+      error?: {
+        message?: unknown
+        status?: unknown
+        errors?: Array<{ reason?: unknown }>
+      }
+    }
+    const reasonValue = payload.error?.errors?.[0]?.reason || payload.error?.status
+    const reason = typeof reasonValue === 'string' && /^[A-Za-z0-9_.-]{1,80}$/.test(reasonValue)
+      ? reasonValue
+      : ''
+    const rawMessage = typeof payload.error?.message === 'string' ? payload.error.message : ''
+    const message = rawMessage
+      .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '[email]')
+      .replace(/\b[A-Za-z0-9_-]{32,}\b/g, '[redacted]')
+      .replace(/[\u0000-\u001f\u007f]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 240)
+    return { reason, message }
+  } catch {
+    return { reason: '', message: '' }
+  }
+}
+
+function upstreamError(status: number, details: GoogleUpstreamErrorDetails = { reason: '', message: '' }) {
+  const reason = details.reason ? ` (${details.reason})` : ''
+  const detail = details.message ? `: ${details.message}` : ''
   if (status === 400) {
     return new GoogleWorkspaceClientError(
-      'Google rejected the integration credential or request',
+      `Google rejected the integration request${reason}${detail}`,
       422,
       'GOOGLE_REQUEST_REJECTED',
     )
   }
   if (status === 401 || status === 403) {
     return new GoogleWorkspaceClientError(
-      'Google denied access for the configured service account',
+      `Google denied access for the configured service account${reason}${detail}`,
       422,
       'GOOGLE_ACCESS_DENIED',
     )
@@ -187,7 +222,7 @@ async function googleJson<T>(
       })
       const bytes = await readBoundedResponse(response)
       if (!response.ok) {
-        const error = upstreamError(response.status)
+        const error = upstreamError(response.status, googleUpstreamErrorDetails(bytes))
         if (attempt < attempts && error.retryable) {
           await delay(250 * (2 ** (attempt - 1)))
           continue
@@ -282,7 +317,7 @@ export async function validateGoogleApiKey(apiKey: string) {
             'GOOGLE_API_KEY_INVALID',
           )
         }
-        const error = upstreamError(response.status)
+        const error = upstreamError(response.status, googleUpstreamErrorDetails(bytes))
         if (attempt < 3 && error.retryable) {
           await delay(250 * (2 ** (attempt - 1)))
           continue

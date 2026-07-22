@@ -24,6 +24,7 @@ export async function processQuickBooksWriteOutbox(input: { limit?: number; work
   let succeeded = 0
   let failed = 0
   let dead = 0
+  let catalogSyncWarnings = 0
   for (const job of jobs) {
     try {
       const provider = await createQuickBooksEntity({
@@ -39,8 +40,12 @@ export async function processQuickBooksWriteOutbox(input: { limit?: number; work
         providerEntityId: provider.entityId,
         providerSyncToken: provider.syncToken,
       })
-      await queueQuickBooksCatalogSyncInPostgres({ organizationId: job.organizationId, actorEmail: null })
       succeeded += 1
+      try {
+        await queueQuickBooksCatalogSyncInPostgres({ organizationId: job.organizationId, actorEmail: null })
+      } catch {
+        catalogSyncWarnings += 1
+      }
     } catch (error) {
       const becameDead = await failQuickBooksWriteJobInPostgres({
         job,
@@ -59,5 +64,6 @@ export async function processQuickBooksWriteOutbox(input: { limit?: number; work
     succeeded,
     failed,
     dead,
+    catalogSyncWarnings,
   }
 }

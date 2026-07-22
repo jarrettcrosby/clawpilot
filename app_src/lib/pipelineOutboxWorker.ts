@@ -1,6 +1,10 @@
 import { getErrorMessage } from '@/lib/errorUtils'
 import { resolveManagedGoogleWorkspaceRuntime } from '@/lib/integrations/googleWorkspace'
-import { googleSheetsJson, type GoogleWorkspaceRuntime } from '@/lib/integrations/googleWorkspaceClient'
+import {
+  GoogleWorkspaceClientError,
+  googleSheetsJson,
+  type GoogleWorkspaceRuntime,
+} from '@/lib/integrations/googleWorkspaceClient'
 import { matonFetch } from '@/lib/maton'
 import { projectCrmWorkbook } from '@/lib/crm/workbookProjection'
 import { syncPipelineOwnerProfileToCrm } from '@/lib/persistence/crm'
@@ -314,7 +318,9 @@ export async function processPipelineSyncOutbox(input: {
       const status = await failPipelineSyncOutboxInPostgres({
         item,
         error: managedWorkspaceOperation ? sanitizePipelineProvisioningError(error) : getErrorMessage(error),
-        maxAttempts: error instanceof PermanentOutboxError || error instanceof InvalidPipelineOutboxContextError
+        maxAttempts: error instanceof PermanentOutboxError
+          || error instanceof InvalidPipelineOutboxContextError
+          || (error instanceof GoogleWorkspaceClientError && !error.retryable)
           ? item.attempts
           : maxAttempts,
       })

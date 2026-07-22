@@ -88,6 +88,16 @@ async function main() {
       [ROOT_ORGANIZATION_ID],
     )
     await client.query(
+      `DELETE FROM sync_outbox
+       WHERE target_system = 'suitecrm'
+         AND payload->>'pipelineId' IN (
+           SELECT id::text
+           FROM pipeline_spaces
+           WHERE workspace_organization_id = $1::uuid
+         )`,
+      [ROOT_ORGANIZATION_ID],
+    )
+    await client.query(
       `DELETE FROM pipeline_spaces WHERE workspace_organization_id = $1::uuid`,
       [ROOT_ORGANIZATION_ID],
     )

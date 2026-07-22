@@ -11,6 +11,8 @@ const supportedOperations = new Set<QuickBooksWriteOperationKind>([
   'customer.create',
   'item.create',
   'invoice.create',
+  'sales_receipt.create',
+  'journal_entry.create',
 ])
 
 export function configuredQuickBooksWritePolicy(

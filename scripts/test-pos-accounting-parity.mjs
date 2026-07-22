@@ -457,8 +457,10 @@ const priorityMatches = pure.matchPosAccountingParityDocuments({
 }).matches
 assert.deepEqual(
   [...priorityMatches].map((match) => match.basis),
-  ['provider_id', 'document_and_memo', 'document_number', 'memo', 'date_only'],
+  ['provider_id', 'memo', null, 'memo', 'date_only'],
 )
+assert.equal(priorityMatches[2].status, 'ambiguous')
+assert.deepEqual([...priorityMatches[2].candidateTransactionIds], ['actual-document'])
 
 const conflictingFallback = pure.matchPosAccountingParityDocuments({
   expected: [expectedReceipt({
@@ -580,7 +582,7 @@ assert.equal(historicalReport.dates.at(-1), '2025-03-14')
 assert.equal(historicalReport.dates[0], '2026-09-15')
 assert.equal(historicalReport.dates.length, 53)
 assert.equal(historicalReport.historicalBaseline.summary.pairCount, 44)
-assert.equal(historicalReport.historicalBaseline.summary.exactDocumentPairs, 44)
+assert.equal(historicalReport.historicalBaseline.summary.exactMarkerPairs, 44)
 assert.equal(historicalReport.historicalBaseline.summary.dateFallbackPairs, 0)
 assert.equal(historicalReport.historicalBaseline.summary.unmatchedGroups, 9)
 assert.equal(historicalReport.historicalBaseline.summary.unmatchedEvidence, 9)
@@ -626,7 +628,7 @@ const independentlyScopedReport = pure.buildPosAccountingParityReport({
 assert.equal(independentlyScopedReport.summary.cachedTransactions, secondPageTransactions.length)
 assert.equal(independentlyScopedReport.dates.length, secondPageDates.length)
 assert.equal(independentlyScopedReport.historicalBaseline.summary.cachedTransactions, 97)
-assert.equal(independentlyScopedReport.historicalBaseline.summary.exactDocumentPairs, 44)
+assert.equal(independentlyScopedReport.historicalBaseline.summary.exactMarkerPairs, 44)
 assert.equal(independentlyScopedReport.historicalBaseline.summary.unmatchedGroups, 9)
 assert.equal(JSON.stringify(independentlyScopedReport).includes('rawSourcePayloadSecret'), false)
 
@@ -648,7 +650,8 @@ const fallbackAndAmbiguousBaseline = pure.buildHistoricalPosAccountingBaseline([
   })),
 ])
 assert.equal(fallbackAndAmbiguousBaseline.summary.pairCount, 1)
-assert.equal(fallbackAndAmbiguousBaseline.summary.dateFallbackPairs, 1)
+assert.equal(fallbackAndAmbiguousBaseline.summary.exactMarkerPairs, 1)
+assert.equal(fallbackAndAmbiguousBaseline.summary.dateFallbackPairs, 0)
 assert.equal(fallbackAndAmbiguousBaseline.summary.ambiguousGroups, 1)
 assert.equal(fallbackAndAmbiguousBaseline.summary.ambiguousEvidence, 3)
 assert.equal(fallbackAndAmbiguousBaseline.summary.unmatchedEvidence, 0)
@@ -706,7 +709,7 @@ assert.equal(postgresReport.cache.salesReceiptCount, 49)
 assert.equal(postgresReport.cache.journalEntryCount, 48)
 assert.equal(postgresReport.unmatchedQuickBooks.length, secondPageTransactions.length)
 assert.equal(postgresReport.historicalBaseline.summary.cachedTransactions, 97)
-assert.equal(postgresReport.historicalBaseline.summary.exactDocumentPairs, 44)
+assert.equal(postgresReport.historicalBaseline.summary.exactMarkerPairs, 44)
 assert.equal(postgresReport.historicalBaseline.summary.unmatchedGroups, 9)
 assert.equal(postgresReport.historicalBaseline.pairs.length, 10)
 assert.equal(postgresReport.historicalBaseline.unmatchedGroups.length, 0)

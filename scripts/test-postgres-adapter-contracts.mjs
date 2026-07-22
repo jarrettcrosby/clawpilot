@@ -1131,6 +1131,12 @@ assertIncludes(outboxWorker, "item.operation === 'reconcile_pipeline_hierarchy_v
 assertIncludes(outboxWorker, "item.operation === 'sync_pipeline_permissions'", 'pipeline permission worker dispatch')
 assertIncludes(outboxWorker, 'resolveManagedGoogleWorkspaceRuntime', 'bound managed pipeline runtime resolution')
 assertIncludes(outboxWorker, 'googleSheetsJson', 'bound managed pipeline Sheet writes')
+assertIncludes(
+  outboxWorker,
+  'error instanceof GoogleWorkspaceClientError && !error.retryable',
+  'terminal Google Workspace failure classification',
+)
+assertIncludes(outboxWorker, '? item.attempts', 'terminal Google Workspace failure retry suppression')
 assert.ok(
   outboxWorker.indexOf("item.operation === 'provision_pipeline'")
     < outboxWorker.indexOf('resolvePipelineOutboxSheetContextInPostgres(item)'),
@@ -1188,6 +1194,10 @@ assertIncludes(googleWorkspaceClient, 'GOOGLE_SHEETS_ACCESS_DENIED', 'actionable
 assertIncludes(googleWorkspaceClient, 'capabilities(canAddChildren,canShare)', 'Shared Drive capability validation')
 assertIncludes(googleWorkspaceClient, 'GOOGLE_SHARED_DRIVE_INSUFFICIENT_ACCESS', 'actionable Shared Drive role error')
 assertIncludes(googleWorkspaceClient, 'nextPageToken', 'Shared Drive pagination')
+assertIncludes(googleWorkspaceClient, 'googleUpstreamErrorDetails', 'bounded Google upstream error details')
+assertIncludes(googleWorkspaceClient, 'GOOGLE_REQUEST_REJECTED', 'actionable Google request rejection')
+assertIncludes(googleWorkspaceClient, "'[email]'", 'Google upstream email redaction')
+assertIncludes(googleWorkspaceClient, "'[redacted]'", 'Google upstream token redaction')
 
 const googleWorkspaceIntegration = read('app_src/lib/integrations/googleWorkspace.ts')
 const integrationStateBlock = googleWorkspaceIntegration.slice(
@@ -1412,6 +1422,7 @@ for (const migration of [
   '0075_quickbooks_write_binding_compatibility.sql',
   '0076_pos_accounting_notification_consent.sql',
   '0078_pos_accounting_date_commands.sql',
+  '0079_pos_accounting_posting_outcomes.sql',
 ]) {
   assertIncludes(healthRoute, migration, 'hosted POS and accounting migration health')
 }

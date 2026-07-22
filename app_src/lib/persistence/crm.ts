@@ -1664,8 +1664,18 @@ export async function stageCrmRecordWithClient(client: PoolClient, rawInput: Sta
       row = await stageInteraction(client, input, suiteCrmId, sourceHash)
       break
   }
+  const demoWorkspace = await client.query<{ is_demo: boolean }>(
+    `SELECT COALESCE(wo.is_demo, false) AS is_demo
+     FROM pipeline_spaces ps
+     LEFT JOIN workspace_organizations wo ON wo.id = ps.workspace_organization_id
+     WHERE ps.id = $1::uuid
+     LIMIT 1`,
+    [input.pipelineId],
+  )
+  const emitSuiteCrmOutbox = input.emitSuiteCrmOutbox !== false
+    && demoWorkspace.rows[0]?.is_demo !== true
   let suiteCrmOutboxKey: string | null = null
-  if (input.emitSuiteCrmOutbox !== false) {
+  if (emitSuiteCrmOutbox) {
     suiteCrmOutboxKey = await enqueueSuiteCrmRecord(
       client,
       input,

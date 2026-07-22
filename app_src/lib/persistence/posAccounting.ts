@@ -1211,7 +1211,7 @@ export function buildPosAccountingPreview(input: {
     ...(input.profile.quickBooksBindingStatus !== 'verified' ? ['No verified QuickBooks company is bound to this profile revision.'] : []),
     ...(input.profile.openCheckPolicy === 'hold' && batch.openChecks > 0 ? [`${batch.openChecks} open checks require this batch to remain on hold.`] : []),
   ]
-  const protectedEvidence = Boolean(input.draftEvidence && ['approved', 'posting', 'posted'].includes(input.draftEvidence.status))
+  const protectedEvidence = Boolean(input.draftEvidence && ['approved', 'posting', 'posted', 'failed'].includes(input.draftEvidence.status))
   const finalHoldReasons = [
     ...holdReasons,
     ...(protectedEvidence ? ['Approved or posted evidence is immutable and cannot be replaced by a preview.'] : []),
@@ -1747,7 +1747,7 @@ type DailySalesRow = {
   updated_at: TimestampValue
 }
 
-const PROTECTED_DRAFT_STATUSES = new Set(['approved', 'posting', 'posted'])
+const PROTECTED_DRAFT_STATUSES = new Set(['approved', 'posting', 'posted', 'failed'])
 
 function hasDailySalesActivity(sales: DailySalesRow | undefined) {
   if (!sales) return false
@@ -1917,7 +1917,7 @@ export async function regeneratePosAccountingDraftInPostgres(input: {
         `DELETE FROM toast_accounting_export_drafts
          WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid
            AND business_date = $3::date
-           AND status NOT IN ('approved', 'posting', 'posted')`,
+           AND status NOT IN ('approved', 'posting', 'posted', 'failed')`,
         [input.organizationId, location.restaurant_guid, input.businessDate],
       )
       let command = null
@@ -1973,7 +1973,7 @@ export async function regeneratePosAccountingDraftInPostgres(input: {
            proposed_lines = $5::jsonb, generation_reason = $6, generated_by = $7,
            source_revision = $8, last_error = NULL, updated_at = now()
          WHERE id = $1::uuid AND is_current
-           AND status NOT IN ('approved', 'posting', 'posted')
+           AND status NOT IN ('approved', 'posting', 'posted', 'failed')
          RETURNING id::text, status, reconciliation_status, approved_by, approved_at, posted_at,
            quickbooks_transaction_id, draft_revision, generation_reason, generated_by,
            source_revision, supersedes_draft_id::text, is_current, created_at, updated_at`,

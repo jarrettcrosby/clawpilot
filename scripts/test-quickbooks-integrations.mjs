@@ -57,6 +57,12 @@ function loadTypeScriptModule(path, mocks = {}) {
   return module.exports
 }
 
+const quickBooksWritePersistenceMocks = {
+  '@/lib/persistence/posAccountingPosting': {
+    synchronizePosAccountingPostingBatchForRequest: async () => null,
+  },
+}
+
 assert.deepEqual(
   parseQuickBooksCompanyInfo({ CompanyInfo: { CompanyName: ' Example Co ', Country: 'US' } }),
   {
@@ -289,6 +295,16 @@ includes(
   'DROP CONSTRAINT IF EXISTS quickbooks_write_reviewed_connection_required',
   'QuickBooks write connection-binding compatibility migration',
 )
+
+const posPostingMigration = read('db/migrations/0079_pos_accounting_posting_outcomes.sql')
+for (const fragment of [
+  "'sales_receipt.create', 'journal_entry.create'",
+  'CREATE TABLE IF NOT EXISTS pos_accounting_posting_batches',
+  'sales_receipt_request_id uuid NOT NULL UNIQUE',
+  'journal_entry_request_id uuid NOT NULL UNIQUE',
+  "review_outcome IN ('shogo_posted', 'clawpilot_post', 'needs_correction', 'skipped')",
+  "status IN ('pending_approval', 'approved', 'posting', 'posted', 'partial_failed', 'failed', 'cancelled')",
+]) includes(posPostingMigration, fragment, 'POS accounting posting migration')
 
 const crmReconciliationMigration = read('db/migrations/0065_demo_and_quickbooks_crm_reconciliation.sql')
 for (const fragment of [
@@ -530,6 +546,72 @@ const providerInvoice = writePayloadModule.buildQuickBooksProviderPayload('invoi
 assert.equal(providerInvoice.CustomerRef.value, 'customer-1')
 assert.equal(providerInvoice.Line[0].SalesItemLineDetail.ItemRef.value, 'item-1')
 assert.equal(providerInvoice.Line[0].Amount, 250)
+
+const salesReceiptPayload = {
+  transactionDate: '2026-07-18',
+  customerId: 'customer-1',
+  customerName: 'Toast clearing customer',
+  depositToAccountId: 'clearing-1',
+  depositToAccountName: 'POS clearing',
+  taxCodeId: 'tax-code-1',
+  taxCodeName: 'Sales Tax Meals',
+  taxAmount: 4.06,
+  memo: 'Toast 2026-07-18 - ClawPilot POS accounting',
+  lines: [{
+    itemId: 'item-breakfast', itemName: 'Breakfast Sandwich', description: 'B.E.C',
+    quantity: 8, unitPrice: 10, amount: 80, taxable: true,
+  }],
+  totalAmount: 84.06,
+}
+const providerSalesReceipt = writePayloadModule.buildQuickBooksProviderPayload(
+  'sales_receipt.create',
+  salesReceiptPayload,
+)
+assert.equal(providerSalesReceipt.TxnDate, '2026-07-18')
+assert.equal(providerSalesReceipt.PrivateNote, salesReceiptPayload.memo)
+assert.equal(providerSalesReceipt.DepositToAccountRef.value, 'clearing-1')
+assert.equal(providerSalesReceipt.Line.length, 1)
+assert.equal(providerSalesReceipt.Line[0].SalesItemLineDetail.ItemRef.value, 'item-breakfast')
+assert.equal(providerSalesReceipt.Line[0].SalesItemLineDetail.TaxCodeRef.value, 'TAX')
+assert.equal(providerSalesReceipt.TxnTaxDetail.TxnTaxCodeRef.value, 'tax-code-1')
+assert.equal(writePayloadModule.quickBooksProviderEntity('sales_receipt.create').path, 'salesreceipt')
+
+const journalEntryPayload = {
+  transactionDate: '2026-07-18',
+  memo: 'Toast 2026-07-18 - ClawPilot POS accounting',
+  lines: [{
+    accountId: 'deposit-1', accountName: 'Bank deposit', description: 'Toast card deposit',
+    postingType: 'Debit', amount: 81,
+  }, {
+    accountId: 'clearing-1', accountName: 'POS clearing', description: 'Toast card settlement',
+    postingType: 'Credit', amount: 81,
+  }],
+  debitAmount: 81,
+  creditAmount: 81,
+}
+const providerJournalEntry = writePayloadModule.buildQuickBooksProviderPayload(
+  'journal_entry.create',
+  journalEntryPayload,
+)
+assert.equal(providerJournalEntry.TxnDate, '2026-07-18')
+assert.equal(providerJournalEntry.PrivateNote, journalEntryPayload.memo)
+assert.equal(providerJournalEntry.Line.length, 2)
+assert.equal(providerJournalEntry.Line[0].JournalEntryLineDetail.PostingType, 'Debit')
+assert.equal(providerJournalEntry.Line[1].JournalEntryLineDetail.PostingType, 'Credit')
+assert.equal(writePayloadModule.quickBooksProviderEntity('journal_entry.create').path, 'journalentry')
+assert.notEqual(
+  writePayloadModule.fingerprintQuickBooksWritePayload(salesReceiptPayload),
+  writePayloadModule.fingerprintQuickBooksWritePayload(journalEntryPayload),
+)
+await assert.rejects(
+  writePayloadModule.validateQuickBooksWriteDraft({
+    organizationId: writeOrganizationId,
+    operationKind: 'sales_receipt.create',
+    payload: salesReceiptPayload,
+  }),
+  /operation is not supported/,
+  'generic client-authored writes must not prepare internal POS posting operations',
+)
 await assert.rejects(
   writePayloadModule.validateQuickBooksWriteDraft({
     organizationId: '11111111-1111-4111-8111-111111111111',
@@ -835,6 +917,7 @@ let currentReviewedConnectionId = 'connection-reviewed'
 const recentWriteRequestId = '33333333-3333-4333-8333-333333333333'
 const targetedWriteRequestId = '77777777-7777-4777-8777-777777777777'
 const writePersistenceModule = loadTypeScriptModule('app_src/lib/persistence/quickBooksWrites.ts', {
+  ...quickBooksWritePersistenceMocks,
   '@/lib/auditWriter': { recordAuditEvent: async (event) => { writeAuditEvents.push(event) } },
   '@/lib/quickBooksWritePolicy': {
     configuredQuickBooksWritePolicy: () => ({ enabled: true, mode: 'sandbox', allowedOperations: ['item.create'] }),
@@ -1140,7 +1223,34 @@ for (const fragment of [
   'completeQuickBooksWriteJobInPostgres',
   'failQuickBooksWriteJobInPostgres',
   'queueQuickBooksCatalogSyncInPostgres',
+  'catalogSyncWarnings',
 ]) includes(writeWorker, fragment, 'QuickBooks write worker')
+
+const posPostingPersistence = read('app_src/lib/persistence/posAccountingPosting.ts')
+for (const fragment of [
+  'preparePosAccountingPostingBatchInPostgres',
+  'approvePosAccountingPostingBatchInPostgres',
+  'recordMatchedShogoResultsInPostgres',
+  'synchronizePosAccountingPostingBatchForRequest',
+  "operationKind: 'sales_receipt.create'",
+  "operationKind: 'journal_entry.create'",
+  "'partial_failed'",
+  "receipt.actual?.postingOrigin === 'shogo'",
+  "journal.actual?.postingOrigin === 'shogo'",
+  'quickbooks_sales_receipt_id',
+  'quickbooks_journal_entry_id',
+]) includes(posPostingPersistence, fragment, 'POS accounting posting persistence')
+
+const posPostingRoute = read('app_src/app/api/accounting/quickbooks/pos-posting/route.ts')
+for (const fragment of [
+  "action === 'record-shogo-range'",
+  "action === 'prepare-clawpilot'",
+  "action === 'approve-clawpilot'",
+  'capabilities.canPrepare',
+  'capabilities.canApprove',
+  'confirmFingerprint',
+  'MAX_REQUEST_BYTES',
+]) includes(posPostingRoute, fragment, 'POS accounting posting API')
 
 const writePolicyModule = loadTypeScriptModule('app_src/lib/quickBooksWritePolicy.ts')
 const productOnlyPolicy = writePolicyModule.configuredQuickBooksWritePolicy({
@@ -1378,6 +1488,7 @@ for (const fragment of [
   "filename = '0063_quickbooks_financial_reports.sql'",
   "filename = '0064_quickbooks_write_control.sql'",
   "filename = '0065_demo_and_quickbooks_crm_reconciliation.sql'",
+  "filename = '0079_pos_accounting_posting_outcomes.sql'",
   'readQuickBooksWorkerHeartbeatFromPostgres',
   'QuickBooks sync worker heartbeat is missing or stale.',
   'QuickBooks sync queue has terminal failed jobs.',
