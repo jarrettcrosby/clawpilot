@@ -185,6 +185,7 @@ for (const requiredPath of [
   'db/migrations/0081_distributed_operations_foundation.sql',
   'db/migrations/0082_operations_activation_and_command_safety.sql',
   'db/migrations/0083_crm_interaction_contacts.sql',
+  'db/migrations/0084_operations_command_results.sql',
   '.github/workflows/clawpilot-repository-runner.yml',
   '.github/workflows/deployed-runtime-monitor.yml',
   'scripts/start-railway.sh',

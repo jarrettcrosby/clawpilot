@@ -19,4 +19,5 @@ npx playwright test \
   tests/responsive-shell/ui-acceptance.spec.ts \
   tests/mobile-workflows/ui-acceptance.spec.ts \
   tests/pos/ui-acceptance.spec.ts \
+  tests/operations/ui-acceptance.spec.ts \
   "$@"

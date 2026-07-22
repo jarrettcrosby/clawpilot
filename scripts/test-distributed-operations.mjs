@@ -106,11 +106,19 @@ function verifySourceContracts() {
     'Background provider commands must support attributable service actors',
   )
 
+  const commandResultsMigration = read('db/migrations/0084_operations_command_results.sql')
+  assert.ok(
+    commandResultsMigration.includes('ADD COLUMN IF NOT EXISTS result_payload jsonb'),
+    'Operations command results migration must persist exact idempotent responses',
+  )
+
   const persistence = read('app_src/lib/persistence/operations.ts')
   for (const fragment of [
     'readOperationsWorkspaceFromPostgres',
     'resolveCommerceCustomerInPostgres',
     'runMockOperationsProofFromPostgres',
+    'releaseOperationsOrderFromPostgres',
+    'confirmOperationsOrderPicksFromPostgres',
     'updateOperationsActivationInPostgres',
     'updateOperationsExceptionInPostgres',
     'operations_command_receipts',
@@ -127,6 +135,12 @@ function verifySourceContracts() {
     'operations_billable_events',
     "target_system, idempotency_key",
     "eventType: 'operations.proof_order.completed'",
+    "commandType: 'release_operations_order'",
+    "eventType: 'operations.order.released'",
+    'result_payload',
+    "commandType: 'confirm_operations_order_picks'",
+    "eventType: 'operations.pick.completed'",
+    "eventType: 'operations.order.picks_confirmed'",
   ]) assert.ok(persistence.includes(fragment), `Operations persistence missing ${fragment}`)
   assert.ok(!persistence.includes('console.'), 'Operations persistence must not log tenant data')
 
@@ -136,7 +150,7 @@ function verifySourceContracts() {
   }
 
   const domain = read('app_src/lib/operations/domain.ts')
-  for (const fragment of ['DeterministicFulfillmentOptimizer', 'cartonizeSinglePackage', 'selectPromiseRate', 'priceContract']) {
+  for (const fragment of ['availableOperationsOrderActions', 'DeterministicFulfillmentOptimizer', 'cartonizeSinglePackage', 'selectPromiseRate', 'priceContract']) {
     assert.ok(domain.includes(fragment), `Operations domain missing ${fragment}`)
   }
 
@@ -148,10 +162,15 @@ function verifySourceContracts() {
     'isPostgresStorageEnabled',
     'readOperationsWorkspaceFromPostgres',
     'runMockOperationsProofFromPostgres',
+    'releaseOperationsOrderFromPostgres',
+    'confirmOperationsOrderPicksFromPostgres',
     'updateOperationsExceptionInPostgres',
     "'Cache-Control': 'private, no-store'",
     'MAX_REQUEST_BYTES',
     "action === 'run-proof-order'",
+    "action === 'release-order'",
+    "action === 'confirm-picks'",
+    'Idempotency-Key',
     "action === 'update-exception'",
     "action === 'update-activation'",
   ]) assert.ok(route.includes(fragment), `Operations route missing ${fragment}`)
@@ -174,6 +193,14 @@ function verifySourceContracts() {
     health.includes('operationsCommands'),
     'Health must report operations command receipt state',
   )
+  assert.ok(
+    health.includes("WHERE filename = '0084_operations_command_results.sql'"),
+    'Health must require the operations command results migration',
+  )
+  assert.ok(
+    health.includes('row?.operations_command_results_migration_applied'),
+    'Health migration status must include operations command result persistence',
+  )
 
   const predeploy = read('scripts/verify-predeploy.mjs')
   assert.ok(
@@ -183,6 +210,10 @@ function verifySourceContracts() {
   assert.ok(
     predeploy.includes("'db/migrations/0082_operations_activation_and_command_safety.sql'"),
     'Predeploy must require the operations hardening migration',
+  )
+  assert.ok(
+    predeploy.includes("'db/migrations/0084_operations_command_results.sql'"),
+    'Predeploy must require the operations command results migration',
   )
 }
 
@@ -194,7 +225,7 @@ async function verifyRouteBehavior() {
       this.status = status
     }
   }
-  const calls = { reads: [], proofs: [], exceptions: [], activations: [] }
+  const calls = { reads: [], proofs: [], releases: [], picks: [], exceptions: [], activations: [] }
   const route = loadTypeScriptModule('app_src/app/api/operations/route.ts', {
     mocks: {
       'next/server': {
@@ -225,10 +256,28 @@ async function verifyRouteBehavior() {
           calls.proofs.push(input)
           return {
             orderGlobalId: 'gor1234567',
-            orderStatus: 'shipped',
+            orderStatus: 'planned',
             duplicate: input.proof.externalOrderId === 'duplicate-order',
-            trackingNumber: 'MOCKTRACKING',
-            steps: Array.from({ length: 20 }, (_, index) => `step-${index + 1}`),
+            trackingNumber: null,
+            steps: Array.from({ length: 11 }, (_, index) => `step-${index + 1}`),
+          }
+        },
+        releaseOperationsOrderFromPostgres: async (input) => {
+          calls.releases.push(input)
+          return {
+            orderGlobalId: input.orderGlobalId,
+            orderStatus: 'released',
+            rowVersion: input.expectedRowVersion + 1,
+            replayed: false,
+          }
+        },
+        confirmOperationsOrderPicksFromPostgres: async (input) => {
+          calls.picks.push(input)
+          return {
+            orderGlobalId: input.orderGlobalId,
+            orderStatus: 'picking',
+            rowVersion: input.expectedRowVersion + 1,
+            replayed: false,
           }
         },
         updateOperationsActivationInPostgres: async (input) => {
@@ -329,6 +378,7 @@ async function verifyRouteBehavior() {
   assert.equal(calls.proofs.length, 1)
   assert.equal(calls.proofs[0].organizationId, actor.organizationId)
   assert.equal(calls.proofs[0].actorEmail, actor.email)
+  assert.equal(calls.proofs[0].proof.executionMode, 'planned')
   assert.equal(calls.proofs[0].proof.shipTo.country, 'US')
   assert.deepEqual(JSON.parse(JSON.stringify(calls.proofs[0].proof.lines)), [{
     productGlobalId: 'gp1234567',
@@ -359,6 +409,96 @@ async function verifyRouteBehavior() {
     JSON.parse(JSON.stringify(calls.proofs[1].proof.lines.map((line) => line.productGlobalId))),
     ['gp1234567', 'gp7654321'],
   )
+
+  const deniedRelease = await route.POST(request('http://localhost/api/operations', {
+    actor: { ...actor, capabilities: { canView: true, canManage: false, canExecute: false, canActivate: false } },
+    headers: { 'Content-Type': 'application/json', 'Idempotency-Key': 'release-denied-1' },
+    body: JSON.stringify({
+      action: 'release-order',
+      orderGlobalId: 'gor1234567',
+      expectedRowVersion: 4,
+      reason: 'Reviewed plan',
+    }),
+  }))
+  assert.equal(deniedRelease.status, 403)
+  assert.equal((await payload(deniedRelease)).code, 'OPERATIONS_EXECUTE_REQUIRED')
+
+  const releaseWithoutKey = await route.POST(request('http://localhost/api/operations', {
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      action: 'release-order',
+      orderGlobalId: 'gor1234567',
+      expectedRowVersion: 4,
+      reason: 'Reviewed plan',
+    }),
+  }))
+  assert.equal(releaseWithoutKey.status, 400)
+  assert.equal((await payload(releaseWithoutKey)).code, 'OPERATIONS_IDEMPOTENCY_KEY_INVALID')
+
+  const validRelease = await route.POST(request('http://localhost/api/operations', {
+    headers: { 'Content-Type': 'application/json', 'Idempotency-Key': 'release-route-proof-1' },
+    body: JSON.stringify({
+      action: 'release-order',
+      orderGlobalId: 'gor1234567',
+      expectedRowVersion: 4,
+      reason: 'Reviewed plan',
+    }),
+  }))
+  assert.equal(validRelease.status, 200)
+  assert.equal(calls.releases.length, 1)
+  assert.deepEqual(JSON.parse(JSON.stringify(calls.releases[0])), {
+    organizationId: actor.organizationId,
+    actorEmail: actor.email,
+    orderGlobalId: 'gor1234567',
+    expectedRowVersion: 4,
+    reason: 'Reviewed plan',
+    idempotencyKey: 'release-route-proof-1',
+  })
+
+  const deniedPickConfirmation = await route.POST(request('http://localhost/api/operations', {
+    actor: { ...actor, capabilities: { canView: true, canManage: true, canExecute: false, canActivate: false } },
+    headers: { 'Content-Type': 'application/json', 'Idempotency-Key': 'picks-route-denied-1' },
+    body: JSON.stringify({
+      action: 'confirm-picks',
+      orderGlobalId: 'gor1234567',
+      expectedRowVersion: 5,
+      reason: 'Picker verified every ready task',
+    }),
+  }))
+  assert.equal(deniedPickConfirmation.status, 403)
+  assert.equal((await payload(deniedPickConfirmation)).code, 'OPERATIONS_EXECUTE_REQUIRED')
+
+  const pickConfirmationWithoutKey = await route.POST(request('http://localhost/api/operations', {
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      action: 'confirm-picks',
+      orderGlobalId: 'gor1234567',
+      expectedRowVersion: 5,
+      reason: 'Picker verified every ready task',
+    }),
+  }))
+  assert.equal(pickConfirmationWithoutKey.status, 400)
+  assert.equal((await payload(pickConfirmationWithoutKey)).code, 'OPERATIONS_IDEMPOTENCY_KEY_INVALID')
+
+  const validPickConfirmation = await route.POST(request('http://localhost/api/operations', {
+    headers: { 'Content-Type': 'application/json', 'Idempotency-Key': 'picks-route-proof-1' },
+    body: JSON.stringify({
+      action: 'confirm-picks',
+      orderGlobalId: 'gor1234567',
+      expectedRowVersion: 5,
+      reason: 'Picker verified every ready task',
+    }),
+  }))
+  assert.equal(validPickConfirmation.status, 200)
+  assert.equal(calls.picks.length, 1)
+  assert.deepEqual(JSON.parse(JSON.stringify(calls.picks[0])), {
+    organizationId: actor.organizationId,
+    actorEmail: actor.email,
+    orderGlobalId: 'gor1234567',
+    expectedRowVersion: 5,
+    reason: 'Picker verified every ready task',
+    idempotencyKey: 'picks-route-proof-1',
+  })
 
   const validExceptionUpdate = await route.POST(request('http://localhost/api/operations', {
     actor: { ...actor, capabilities: { canView: true, canManage: true, canExecute: false, canActivate: false } },
@@ -695,7 +835,7 @@ async function verifyPostgresAcceptance(databaseUrl) {
     const primary = await seedWorkspace(pool, 'primary')
     const other = await seedWorkspace(pool, 'other')
     const externalOrderId = `mock-${randomUUID()}`
-    const primaryProof = proofInput(primary, externalOrderId)
+    const primaryProof = proofInput(primary, externalOrderId, { executionMode: 'shipped' })
     const first = await persistence.runMockOperationsProofFromPostgres({
       organizationId: primary.organizationId,
       actorEmail: primary.email,
@@ -892,7 +1032,7 @@ async function verifyPostgresAcceptance(databaseUrl) {
     assert.equal(workspace.summary.unbilledMinor, '1335')
 
     const multiExternalOrderId = `multi-${randomUUID()}`
-    const multiProof = proofInput(primary, multiExternalOrderId)
+    const multiProof = proofInput(primary, multiExternalOrderId, { executionMode: 'shipped' })
     delete multiProof.productGlobalId
     delete multiProof.quantity
     delete multiProof.openingQuantity
@@ -971,6 +1111,251 @@ async function verifyPostgresAcceptance(databaseUrl) {
       [primary.organizationId, multi.orderGlobalId],
     )
     assert.deepEqual(multiAfterRetry.rows[0], { lines: 2, shipments: 1 })
+
+    const plannedExternalOrderId = `planned-${randomUUID()}`
+    const planned = await persistence.runMockOperationsProofFromPostgres({
+      organizationId: primary.organizationId,
+      actorEmail: primary.email,
+      proof: proofInput(primary, plannedExternalOrderId, {
+        executionMode: 'planned',
+        quantity: 1,
+      }),
+    })
+    assert.equal(planned.orderStatus, 'planned')
+    assert.equal(planned.duplicate, false)
+    assert.equal(planned.trackingNumber, null)
+    assert.equal(planned.steps.length, 11)
+
+    const plannedWorkspace = await persistence.readOperationsWorkspaceFromPostgres({
+      organizationId: primary.organizationId,
+      capabilities: { canView: true, canManage: true, canExecute: true },
+      selectedOrderGlobalId: planned.orderGlobalId,
+    })
+    assert.equal(plannedWorkspace.selectedOrder.status, 'planned')
+    assert.equal(plannedWorkspace.selectedOrder.planStatus, 'planned')
+    assert.equal(plannedWorkspace.selectedOrder.waveStatus, null)
+    assert.equal(plannedWorkspace.selectedOrder.lines.length, 1)
+    assert.equal(plannedWorkspace.selectedOrder.lines[0].reservedQuantity, 1)
+    assert.equal(plannedWorkspace.selectedOrder.lines[0].pickStatus, null)
+    assert.equal(plannedWorkspace.selectedOrder.packages[0].status, 'planned')
+    assert.equal(plannedWorkspace.selectedOrder.pickTaskCount, 0)
+    assert.equal(plannedWorkspace.selectedOrder.readyPickTaskCount, 0)
+    const plannedReleaseAction = plannedWorkspace.selectedOrder.availableActions.find(
+      (action) => action.action === 'release_to_warehouse',
+    )
+    const plannedPickAction = plannedWorkspace.selectedOrder.availableActions.find(
+      (action) => action.action === 'confirm_picks',
+    )
+    assert.equal(plannedReleaseAction.enabled, true)
+    assert.equal(plannedPickAction.enabled, false)
+
+    const expectedRowVersion = plannedWorkspace.selectedOrder.rowVersion
+    const releaseInput = {
+      organizationId: primary.organizationId,
+      actorEmail: primary.email,
+      orderGlobalId: planned.orderGlobalId,
+      expectedRowVersion,
+      reason: 'Acceptance review completed',
+      idempotencyKey: `release-acceptance-${randomUUID()}`,
+    }
+    const released = await persistence.releaseOperationsOrderFromPostgres(releaseInput)
+    assert.equal(released.orderGlobalId, planned.orderGlobalId)
+    assert.equal(released.orderStatus, 'released')
+    assert.equal(released.rowVersion, expectedRowVersion + 1)
+    assert.equal(released.replayed, false)
+
+    const replayedRelease = await persistence.releaseOperationsOrderFromPostgres(releaseInput)
+    assert.deepEqual(JSON.parse(JSON.stringify(replayedRelease)), {
+      ...JSON.parse(JSON.stringify(released)),
+      replayed: true,
+    })
+
+    const releaseEvidence = await pool.query(
+      `SELECT orders.status, orders.row_version::int,
+              plan.status AS plan_status,
+              count(DISTINCT wave.id)::int AS waves,
+              min(wave.status) AS wave_status,
+              count(DISTINCT pick.id)::int AS picks,
+              min(pick.status) AS pick_status,
+              (SELECT count(*) FROM operations_domain_events event
+               WHERE event.organization_id = orders.organization_id
+                 AND event.aggregate_global_id = orders.global_id
+                 AND event.event_type = 'operations.wave.released')::int AS release_events,
+              (SELECT count(*) FROM audit_events audit
+               WHERE audit.organization_id = orders.organization_id
+                 AND audit.aggregate_id = orders.global_id
+                 AND audit.event_type = 'operations.order.released')::int AS release_audits
+       FROM operations_orders orders
+       JOIN operations_fulfillment_plans plan
+         ON plan.organization_id = orders.organization_id AND plan.order_id = orders.id
+       JOIN operations_pick_tasks pick
+         ON pick.organization_id = plan.organization_id AND pick.plan_id = plan.id
+       JOIN operations_waves wave
+         ON wave.organization_id = pick.organization_id AND wave.id = pick.wave_id
+       WHERE orders.organization_id = $1::uuid AND orders.global_id = $2
+       GROUP BY orders.id, plan.id`,
+      [primary.organizationId, planned.orderGlobalId],
+    )
+    assert.deepEqual(releaseEvidence.rows[0], {
+      status: 'released',
+      row_version: expectedRowVersion + 1,
+      plan_status: 'released',
+      waves: 1,
+      wave_status: 'released',
+      picks: 1,
+      pick_status: 'ready',
+      release_events: 1,
+      release_audits: 1,
+    })
+
+    const releasedWorkspace = await persistence.readOperationsWorkspaceFromPostgres({
+      organizationId: primary.organizationId,
+      capabilities: { canView: true, canManage: true, canExecute: true },
+      selectedOrderGlobalId: planned.orderGlobalId,
+    })
+    assert.equal(releasedWorkspace.selectedOrder.status, 'released')
+    assert.equal(releasedWorkspace.selectedOrder.planStatus, 'released')
+    assert.equal(releasedWorkspace.selectedOrder.waveStatus, 'released')
+    assert.equal(releasedWorkspace.selectedOrder.lines[0].pickStatus, 'ready')
+    assert.equal(releasedWorkspace.selectedOrder.pickTaskCount, 1)
+    assert.equal(releasedWorkspace.selectedOrder.readyPickTaskCount, 1)
+    const releasedReleaseAction = releasedWorkspace.selectedOrder.availableActions.find(
+      (action) => action.action === 'release_to_warehouse',
+    )
+    const releasedPickAction = releasedWorkspace.selectedOrder.availableActions.find(
+      (action) => action.action === 'confirm_picks',
+    )
+    assert.equal(releasedReleaseAction.enabled, false)
+    assert.match(releasedReleaseAction.blockedReason, /already released/i)
+    assert.equal(releasedPickAction.enabled, true)
+
+    const pickInput = {
+      organizationId: primary.organizationId,
+      actorEmail: primary.email,
+      orderGlobalId: planned.orderGlobalId,
+      expectedRowVersion: released.rowVersion,
+      reason: 'Acceptance picker verified the released wave',
+      idempotencyKey: `picks-acceptance-${randomUUID()}`,
+    }
+    const picked = await persistence.confirmOperationsOrderPicksFromPostgres(pickInput)
+    assert.equal(picked.orderGlobalId, planned.orderGlobalId)
+    assert.equal(picked.orderStatus, 'picking')
+    assert.equal(picked.rowVersion, released.rowVersion + 1)
+    assert.equal(picked.replayed, false)
+
+    const replayedPicks = await persistence.confirmOperationsOrderPicksFromPostgres(pickInput)
+    assert.deepEqual(JSON.parse(JSON.stringify(replayedPicks)), {
+      ...JSON.parse(JSON.stringify(picked)),
+      replayed: true,
+    })
+
+    const releaseReplayAfterPick = await persistence.releaseOperationsOrderFromPostgres(releaseInput)
+    assert.deepEqual(JSON.parse(JSON.stringify(releaseReplayAfterPick)), {
+      ...JSON.parse(JSON.stringify(released)),
+      replayed: true,
+    })
+
+    const pickEvidence = await pool.query(
+      `SELECT orders.status, orders.row_version::int,
+              plan.status AS plan_status,
+              count(DISTINCT wave.id)::int AS waves,
+              min(wave.status) AS wave_status,
+              count(DISTINCT pick.id)::int AS picks,
+              min(pick.status) AS pick_status,
+              bool_and(pick.picked_quantity = pick.quantity) AS picks_complete,
+              (SELECT count(*) FROM operations_domain_events event
+               WHERE event.organization_id = orders.organization_id
+                 AND event.aggregate_global_id = orders.global_id
+                 AND event.event_type = 'operations.pick.completed')::int AS pick_events,
+              (SELECT count(*) FROM audit_events audit
+               WHERE audit.organization_id = orders.organization_id
+                 AND audit.aggregate_id = orders.global_id
+                 AND audit.event_type = 'operations.order.picks_confirmed')::int AS pick_audits,
+              (SELECT count(*) FROM operations_inventory_ledger ledger
+               JOIN operations_pick_tasks ledger_pick
+                 ON ledger_pick.organization_id = ledger.organization_id
+                AND ledger_pick.global_id = ledger.source_global_id
+               WHERE ledger.organization_id = orders.organization_id
+                 AND ledger_pick.plan_id = plan.id
+                 AND ledger.event_type = 'pick')::int AS pick_ledger_events,
+              (SELECT count(*) FROM operations_reservations reservation
+               JOIN operations_order_lines line
+                 ON line.organization_id = reservation.organization_id
+                AND line.id = reservation.order_line_id
+               WHERE line.organization_id = orders.organization_id
+                 AND line.order_id = orders.id
+                 AND reservation.status = 'active')::int AS active_reservations,
+              (SELECT sum(position.reserved_quantity)::text
+               FROM operations_inventory_positions position
+               JOIN operations_fulfillment_allocations allocation
+                 ON allocation.organization_id = position.organization_id
+                AND allocation.position_id = position.id
+               JOIN operations_order_lines line
+                 ON line.organization_id = allocation.organization_id
+                AND line.id = allocation.order_line_id
+               WHERE line.organization_id = orders.organization_id
+                 AND line.order_id = orders.id) AS reserved_quantity
+       FROM operations_orders orders
+       JOIN operations_fulfillment_plans plan
+         ON plan.organization_id = orders.organization_id AND plan.order_id = orders.id
+       JOIN operations_pick_tasks pick
+         ON pick.organization_id = plan.organization_id AND pick.plan_id = plan.id
+       JOIN operations_waves wave
+         ON wave.organization_id = pick.organization_id AND wave.id = pick.wave_id
+       WHERE orders.organization_id = $1::uuid AND orders.global_id = $2
+       GROUP BY orders.id, plan.id`,
+      [primary.organizationId, planned.orderGlobalId],
+    )
+    assert.deepEqual(pickEvidence.rows[0], {
+      status: 'picking',
+      row_version: released.rowVersion + 1,
+      plan_status: 'released',
+      waves: 1,
+      wave_status: 'completed',
+      picks: 1,
+      pick_status: 'picked',
+      picks_complete: true,
+      pick_events: 1,
+      pick_audits: 1,
+      pick_ledger_events: 1,
+      active_reservations: 1,
+      reserved_quantity: '1.000000',
+    })
+
+    const pickingWorkspace = await persistence.readOperationsWorkspaceFromPostgres({
+      organizationId: primary.organizationId,
+      capabilities: { canView: true, canManage: true, canExecute: true },
+      selectedOrderGlobalId: planned.orderGlobalId,
+    })
+    assert.equal(pickingWorkspace.selectedOrder.status, 'picking')
+    assert.equal(pickingWorkspace.selectedOrder.planStatus, 'released')
+    assert.equal(pickingWorkspace.selectedOrder.waveStatus, 'completed')
+    assert.equal(pickingWorkspace.selectedOrder.lines[0].pickStatus, 'picked')
+    assert.equal(pickingWorkspace.selectedOrder.pickTaskCount, 1)
+    assert.equal(pickingWorkspace.selectedOrder.readyPickTaskCount, 0)
+    const pickingPickAction = pickingWorkspace.selectedOrder.availableActions.find(
+      (action) => action.action === 'confirm_picks',
+    )
+    assert.equal(pickingPickAction.enabled, false)
+    assert.match(pickingPickAction.blockedReason, /already confirmed/i)
+
+    await expectRejected(
+      () => persistence.confirmOperationsOrderPicksFromPostgres({
+        ...pickInput,
+        idempotencyKey: `picks-stale-${randomUUID()}`,
+      }),
+      (error) => error.code === 'OPERATIONS_ORDER_VERSION_CONFLICT',
+      'A stale order version must not confirm warehouse picks twice',
+    )
+
+    await expectRejected(
+      () => persistence.releaseOperationsOrderFromPostgres({
+        ...releaseInput,
+        idempotencyKey: `release-stale-${randomUUID()}`,
+      }),
+      (error) => error.code === 'OPERATIONS_ORDER_VERSION_CONFLICT',
+      'A stale order version must not release warehouse work twice',
+    )
 
     const exceptionSeed = await pool.query(
       `INSERT INTO operations_exceptions (

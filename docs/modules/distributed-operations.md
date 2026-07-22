@@ -15,7 +15,7 @@ app_visible: false
 
 Provide native distributed order management, warehouse execution, carrier shipping, and 3PL billing inside ClawPilot. The module serves 3PL operators, retailers, distributors, manufacturers, and fulfillment operators without creating a second application or duplicating CRM, product, identity, audit, task, document, notification, or accounting masters.
 
-This document remains the **target contract** for the full module. The current development slice includes migrations `0081_distributed_operations_foundation.sql` and `0082_operations_activation_and_command_safety.sql`, a tenant-scoped order workbench, a deterministic 20-step mock order-to-ship proof, a durable exception queue, scoped activation controls, canonical CRM catalog projection, provider-customer resolution, and command receipts. These features prove PostgreSQL authority and application boundaries; they do not establish a production commerce, carrier, printer, optimizer, warehouse, or accounting provider.
+This document remains the **target contract** for the full module. The current development slice includes migrations `0081_distributed_operations_foundation.sql`, `0082_operations_activation_and_command_safety.sql`, and `0084_operations_command_results.sql`, a tenant-scoped order workbench, an operator-reviewed planned proof, explicit idempotent warehouse-release and bulk all-ready pick-confirmation commands, a separate deterministic 20-step shipped mock proof, a durable exception queue, scoped activation controls, canonical CRM catalog projection, provider-customer resolution, and exact command-result receipts. The normal proof path stops after planning so review does not simulate warehouse work. Warehouse execution requires separate operator commands, while the shipped proof remains test evidence only. These features prove PostgreSQL authority and application boundaries; they do not establish a production commerce, carrier, printer, optimizer, warehouse, or accounting provider.
 
 ## Current Development Slice
 
@@ -24,9 +24,12 @@ The implemented slice provides:
 - Postgres-only operations access scoped to the active workspace and explicit `viewOperations`, `manageOperations`, and execution permissions;
 - CRM organization and `gp` product resolution without cloning customer or catalog masters;
 - one explicit CRM data pipeline per workspace, deduplicated customer and product catalogs by permanent Global ID, and deterministic provider-customer matching with review-required staging for ambiguous or unmatched identities;
-- idempotent mock order import, reservation, deterministic warehouse planning, cartonization, carrier selection, pick/pack/ship, inventory-ledger evidence, billable facts, domain events, audit, and fulfillment outbox intent;
+- idempotent mock order import, reservation, deterministic warehouse planning, cartonization, and carrier selection with explicit review evidence;
+- operator-controlled warehouse release with exact-version concurrency, readiness and exception checks, one released wave, ready pick tasks, domain event, audit evidence, and replay-safe command receipts;
+- operator-controlled bulk pick confirmation with exact-version concurrency, affected-position locks, all-ready validation, one completed wave, picked tasks, retained reservations, immutable pick ledger evidence, domain event, audit evidence, and replay-safe exact result payloads;
+- an explicit shipped mock proof for pick/pack/ship, inventory-ledger evidence, billable facts, and fulfillment outbox test coverage only;
 - organization-scoped `disabled`, `shadow`, `read_only`, `active`, and `frozen` activation state with revision, reason, actor, and audit history;
-- durable command receipts that bind idempotency key, request hash, actor, correlation, status, result, attempts, and safe failure evidence;
+- durable command receipts that bind idempotency key, request hash, actor, correlation, status, exact result payload, attempts, and safe failure evidence;
 - responsive Orders and Exceptions views with permanent `gor` and `gex` identities;
 - audited exception transitions for acknowledge, resolve, dismiss, and reopen, with tenant isolation and retained resolution history;
 - an in-module guide that clearly labels all active providers as mocks;

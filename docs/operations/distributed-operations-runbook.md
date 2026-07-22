@@ -13,13 +13,26 @@ app_visible: false
 
 ## Status And Scope
 
-This runbook governs the target distributed order, inventory, warehouse, carrier, printing, shipment, and 3PL billing module. The development environment has a Postgres-backed mock proof workbench, an audited exception queue, organization-scoped activation, command-receipt health, and disposable PostgreSQL acceptance. This runbook remains `draft` until the module has complete reconciliation and adapter health, tested production adapters, integration/warehouse activation subscopes, and on-call ownership. Current general environment, backup, promotion, and restore procedures remain authoritative:
+This runbook governs the target distributed order, inventory, warehouse, carrier, printing, shipment, and 3PL billing module. The development environment has a Postgres-backed planned-proof workbench, explicit warehouse-release and bulk all-ready pick-confirmation commands, an audited exception queue, organization-scoped activation, command-receipt health, and disposable PostgreSQL acceptance. The separate shipped mock proof is automated test evidence and is not the operator execution workflow. This runbook remains `draft` until the module has complete reconciliation and adapter health, tested production adapters, integration/warehouse activation subscopes, and on-call ownership. Current general environment, backup, promotion, and restore procedures remain authoritative:
 
 - [ClawPilot Environments and Deployment](clawpilot-environments.md)
 - [Railway Postgres Backups](railway-postgres-backups.md)
 - [Agent Security and Integration Isolation](agent-security-and-isolation.md)
 
-Migrations `0081` and `0082` and the mock workbench are development evidence only. Do not use this document as evidence that an operations worker, production provider integration, checkout callback, enrolled print agent, or live warehouse workflow is deployed.
+Migrations `0081`, `0082`, and `0084` and the mock workbench are development evidence only. Do not use this document as evidence that an operations worker, production provider integration, checkout callback, enrolled print agent, or live warehouse workflow is deployed.
+
+## Planned Order, Warehouse Release, And Pick Confirmation
+
+1. Open **Operations**, select **Orders**, and prepare a proof order. The default proof stops at `planned`; it does not pick, pack, buy a label, print, or ship.
+2. Open the planned order and verify the customer, lines, warehouse plan, reservation and allocation quantities, package and selected-rate evidence, promise, and estimated cost/revenue/margin.
+3. Resolve every open high or critical exception before release. Do not bypass an incomplete reservation or allocation with direct SQL.
+4. Use **Release to warehouse**, record a specific operational reason, and submit once. The client keeps one idempotency key for safe retries of that release attempt.
+5. On success, confirm the order and selected plan are `released`, exactly one released wave exists, and the expected pick tasks are `ready`.
+6. Verify that every expected task is ready and that the displayed pick count matches the order lines. **Confirm all picks** is intentionally unavailable for partial, short, blocked, or already confirmed work.
+7. Use **Confirm all picks**, record a specific operational reason, and submit once. The client keeps one idempotency key for safe retries. The command rechecks the exact order version, released plan and wave, all ready picks, active organization, inventory positions, and blocking exceptions before changing state.
+8. On success, confirm the order is `picking`, the wave is `completed`, every pick task is `picked`, and the active reservation remains intact for the later pack/ship consumption command.
+9. If the screen reports a stale version, reload and re-review the current evidence before issuing a new command. Never change the idempotency key merely to bypass an uncertain result.
+10. Current operator capability stops after deterministic bulk pick confirmation. Scanner claims, per-task scans, short-pick handling, pack verification, label purchase, printing, and shipment confirmation remain unavailable until their explicit commands and reconciliation controls pass Phase 4 acceptance.
 
 ## Exception Queue Procedure
 
@@ -77,7 +90,7 @@ The existing endpoints remain required:
 - `/api/persistence/status`: Postgres driver, reachability, and non-empty environment database fingerprint.
 - `/api/health`: migration, worker, provider, queue, and dependency health.
 
-Current `/api/health` reports the `0081`/`0082` migration state, command failures, stale processing, and active/shadow organization counts. Before production activation it must additionally report:
+Current `/api/health` reports the `0081`/`0082`/`0084` migration state, command failures, stale processing, and active/shadow organization counts. Before production activation it must additionally report:
 
 - foundation and corrective migration applied/checksum state;
 - activation state by cohort without exposing credentials;

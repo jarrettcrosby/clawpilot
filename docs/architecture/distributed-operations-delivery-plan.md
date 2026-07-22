@@ -15,7 +15,7 @@ app_visible: false
 
 This plan converts the distributed operations target into independently reviewable slices. Each phase must leave the database consistent, the module disabled or usable for its approved scope, and the next phase optional. No phase may claim a production provider based only on a mock, fixture, sandbox, compiled adapter, or unverified credential.
 
-The [Distributed Operations](../modules/distributed-operations.md) contract defines target behavior. The [integration and gap map](../maps/distributed-operations-integration-gap-map.md) distinguishes existing ClawPilot services, the implemented `0081`/`0082` development foundation, and the remaining provider and operating gaps.
+The [Distributed Operations](../modules/distributed-operations.md) contract defines target behavior. The [integration and gap map](../maps/distributed-operations-integration-gap-map.md) distinguishes existing ClawPilot services, the implemented `0081`/`0082` foundation plus `0084` command-result hardening, and the remaining provider and operating gaps.
 
 ## Cross-Phase Gates
 
@@ -33,7 +33,7 @@ Operations stays fail-closed on file storage. Hosted activation requires Postgre
 
 ## Current Delivery State
 
-As of 2026-07-22, the development environment has completed the bounded Phase 2 mock proof, durable exception dispositions, one canonical CRM projection per workspace, deterministic provider-customer resolution, organization activation state, and request-hashed command receipts. The full migration chain and transaction behavior run against disposable PostgreSQL in the standard Operations test. This does not advance production-provider certification or mark Phase 4 complete; webhook receipts, provider attempts, warehouse recovery commands, print-agent enrollment, task bridging, complete reconciliation health, and live adapters remain open.
+As of 2026-07-22, the development environment has completed the bounded Phase 2 shipped mock proof plus an operator-reviewed planned-order path and two explicit warehouse commands. Warehouse release uses an advisory lock, exact row-version check, request-hashed command receipt, complete reservation/allocation validation, blocking-exception validation, and one transaction to release the plan, create the wave and pick tasks, advance the order, and write event/audit evidence. Bulk all-ready pick confirmation locks every affected inventory position, revalidates the released plan, wave, picks, activation, row version, and blocking exceptions, then marks every ready pick `picked`, completes the wave, advances the order to `picking`, and records immutable ledger, event, audit, and exact replay-result evidence in one transaction. Durable exception dispositions, one canonical CRM projection per workspace, deterministic provider-customer resolution, and organization activation state also exist. The full migration chain and transaction behavior run against disposable PostgreSQL in the standard Operations test. This does not advance production-provider certification or mark Phase 4 complete; scanner claims and per-task confirmation, short-pick recovery, pack verification, label/print/ship commands, webhook receipts, provider attempts, print-agent enrollment, task bridging, complete reconciliation health, and live adapters remain open.
 
 The exception queue deliberately stays separate from Projects tasks. An exception owns operational status and evidence. A later adapter may create or link a Projects task for collaborative work without transferring exception authority to the task module.
 
@@ -85,6 +85,14 @@ The exception queue deliberately stays separate from Projects tasks. An exceptio
 - The 20-step first vertical slice completes in Postgres without direct table repair.
 - Replaying every command and worker job produces no duplicate order, reservation, ledger fact, label, shipment, billable fact, or provider export.
 - S01-S03 and S07-S09 pass with provider fixtures; these are not yet production Shopify claims.
+
+**Implemented operator checkpoint**
+
+- The default proof prepares a planned order and stops before warehouse execution.
+- The workbench exposes reservations, allocations, package/rate evidence, estimated financials, blocking exceptions, and the current row version before release.
+- An authorized operator supplies a reason and stable idempotency key to release an eligible current version. An exact retry replays its completed receipt without a duplicate wave or pick task.
+- After release, an authorized operator can confirm all ready picks for the exact current version. The command is replay-safe, fails closed on partial or blocked work, retains the active reservation for later consumption, and returns the original receipt result even after later commands advance the order.
+- Scanner claims, per-task scans, short picks, pack, label, print, and shipment transitions remain explicit Phase 4 work; the 20-step shipped proof is not their operator interface.
 
 ### Phase 3 - Promise, Quote, Cartonization, Rating, And Optimization
 

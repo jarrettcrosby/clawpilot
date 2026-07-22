@@ -4,12 +4,80 @@ import type {
   CommerceOrderLineInput,
   EstimatedCharges,
   FulfillmentOptimizer,
+  OperationsActivationState,
+  OperationsOrderActionAvailability,
+  OperationsOrderStatus,
   OptimizationRequest,
   OptimizationResult,
   PackagePlan,
   PricedCarrierRate,
   PricingDirective,
 } from '@/lib/operations/types'
+
+export function availableOperationsOrderActions(input: {
+  status: OperationsOrderStatus
+  activationState: OperationsActivationState
+  canExecute: boolean
+  planStatus: string | null
+  waveStatus: string | null
+  lineCount: number
+  fullyReservedLineCount: number
+  allocatedLineCount: number
+  pickTaskCount: number
+  readyPickTaskCount: number
+  blockingExceptionCount: number
+}): OperationsOrderActionAvailability[] {
+  let releaseBlockedReason: string | null = null
+  if (!input.canExecute) {
+    releaseBlockedReason = 'Operations execute permission is required.'
+  } else if (!['shadow', 'active'].includes(input.activationState)) {
+    releaseBlockedReason = 'Set Operations to Shadow or Active before releasing warehouse work.'
+  } else if (input.status !== 'planned') {
+    releaseBlockedReason = input.status === 'released' || input.status === 'picking'
+      ? 'This order is already released to warehouse execution.'
+      : 'The order must have a completed fulfillment plan before release.'
+  } else if (input.planStatus !== 'planned') {
+    releaseBlockedReason = 'The latest fulfillment plan is not ready for release.'
+  } else if (input.lineCount < 1 || input.fullyReservedLineCount !== input.lineCount) {
+    releaseBlockedReason = 'Every order line must have an active reservation before release.'
+  } else if (input.allocatedLineCount !== input.lineCount) {
+    releaseBlockedReason = 'Every order line must be allocated to the fulfillment plan before release.'
+  } else if (input.blockingExceptionCount > 0) {
+    releaseBlockedReason = 'Resolve high or critical order exceptions before release.'
+  }
+
+  let pickBlockedReason: string | null = null
+  if (!input.canExecute) {
+    pickBlockedReason = 'Operations execute permission is required.'
+  } else if (!['shadow', 'active'].includes(input.activationState)) {
+    pickBlockedReason = 'Set Operations to Shadow or Active before confirming warehouse work.'
+  } else if (input.status !== 'released') {
+    pickBlockedReason = input.status === 'picking'
+      ? 'Every pick on this wave is already confirmed.'
+      : 'Release the order to warehouse execution before confirming picks.'
+  } else if (input.planStatus !== 'released' || input.waveStatus !== 'released') {
+    pickBlockedReason = 'The fulfillment plan and wave must both be released before picking.'
+  } else if (input.pickTaskCount < 1 || input.readyPickTaskCount !== input.pickTaskCount) {
+    pickBlockedReason = 'Every pick task must be ready before confirming this wave.'
+  } else if (input.blockingExceptionCount > 0) {
+    pickBlockedReason = 'Resolve high or critical order exceptions before confirming picks.'
+  }
+
+  return [
+    {
+      action: 'release_to_warehouse',
+      label: 'Release to warehouse',
+      enabled: releaseBlockedReason === null,
+      blockedReason: releaseBlockedReason,
+    },
+    {
+      action: 'confirm_picks',
+      label: 'Confirm all picks',
+      enabled: pickBlockedReason === null,
+      blockedReason: pickBlockedReason,
+    },
+  ]
+}
 
 function integer(value: unknown, fallback = 0): number {
   const parsed = Number(value)

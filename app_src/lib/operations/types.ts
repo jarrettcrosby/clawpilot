@@ -20,6 +20,15 @@ export type OperationsExceptionStatus = 'open' | 'acknowledged' | 'resolved' | '
 
 export type OperationsActivationState = 'disabled' | 'shadow' | 'read_only' | 'active' | 'frozen'
 
+export type OperationsOrderAction = 'release_to_warehouse' | 'confirm_picks'
+
+export type OperationsOrderActionAvailability = {
+  action: OperationsOrderAction
+  label: string
+  enabled: boolean
+  blockedReason: string | null
+}
+
 export type CommerceCustomerMatchMethod =
   | 'external_id'
   | 'email'
@@ -235,6 +244,12 @@ export type OperationsExceptionListItem = {
 export type OperationsOrderDetail = OperationsOrderListItem & {
   externalOrderId: string
   currency: string
+  rowVersion: number
+  planStatus: string | null
+  waveStatus: string | null
+  pickTaskCount: number
+  readyPickTaskCount: number
+  availableActions: OperationsOrderActionAvailability[]
   shipTo: Address
   lines: Array<{
     globalId: string
@@ -321,6 +336,7 @@ export type MockOperationsProofInput = {
   openingQuantity?: number
   requestedDeliveryAt: string
   shipTo: Address
+  executionMode?: 'planned' | 'shipped'
 }
 
 export type MockOperationsProofResult = {
@@ -329,6 +345,13 @@ export type MockOperationsProofResult = {
   duplicate: boolean
   trackingNumber: string | null
   steps: string[]
+}
+
+export type OperationsOrderCommandResult = {
+  orderGlobalId: string
+  orderStatus: OperationsOrderStatus
+  rowVersion: number
+  replayed: boolean
 }
 
 export type OperationsExceptionUpdateResult = {
