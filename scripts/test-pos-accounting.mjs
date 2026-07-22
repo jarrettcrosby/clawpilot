@@ -110,6 +110,18 @@ for (const fragment of [
   assert.ok(postingOutcomesMigration.includes(fragment), `POS accounting posting migration missing ${fragment}`)
 }
 
+const externalPostingOutcomesMigration = read('db/migrations/0080_external_pos_accounting_outcomes.sql')
+for (const fragment of [
+  'external_posting_provider text',
+  'external_posting_reference text',
+  "review_outcome = 'externally_posted'",
+  "posting_origin = 'external'",
+  'quickbooks_sales_receipt_id IS NOT NULL',
+  'quickbooks_journal_entry_id IS NOT NULL',
+]) {
+  assert.ok(externalPostingOutcomesMigration.includes(fragment), `External POS accounting outcome migration missing ${fragment}`)
+}
+
 const persistenceSource = read('app_src/lib/persistence/posAccounting.ts')
 for (const fragment of [
   'WHERE organization_id = $1::uuid',
@@ -203,6 +215,19 @@ for (const fragment of [
   "action === 'reload-sales'",
 ]) {
   assert.ok(panel.includes(fragment), `POS accounting panel missing ${fragment}`)
+}
+
+const parityPanel = read('app_src/components/accounting/PosAccountingParityPanel.tsx')
+for (const fragment of [
+  'Acknowledge external posting',
+  "action: 'record-external-draft'",
+  "action: 'record-external-range'",
+  'ClawPilot will not create, approve, or resend a QuickBooks transaction.',
+  'Sales Receipt ID',
+  'Journal Entry ID',
+  'failed validation and remain in Needs Review',
+]) {
+  assert.ok(parityPanel.includes(fragment), `POS accounting parity panel missing ${fragment}`)
 }
 
 const posSection = read('app_src/components/pos/PosSection.tsx')

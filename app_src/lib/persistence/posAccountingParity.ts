@@ -1,7 +1,7 @@
 import { query } from '@/lib/persistence/postgres'
 
 export type PosAccountingParityEntityType = 'SalesReceipt' | 'JournalEntry'
-export type PosAccountingPostingOrigin = 'shogo' | 'clawpilot'
+export type PosAccountingPostingOrigin = 'shogo' | 'external' | 'clawpilot'
 export type PosAccountingParityMatchBasis =
   | 'provider_id'
   | 'memo'
@@ -48,6 +48,8 @@ interface PosAccountingExpectedBase extends PosAccountingIdentity {
     reviewedBy: string | null
     reviewedAt: string | null
     reviewNote: string | null
+    externalPostingProvider: string | null
+    externalPostingReference: string | null
     quickBooksSalesReceiptId: string | null
     quickBooksJournalEntryId: string | null
     postingBatch: {
@@ -408,7 +410,9 @@ function entityType(value: unknown): PosAccountingParityEntityType | null {
 
 function postingOrigin(value: unknown): PosAccountingPostingOrigin | null {
   const candidate = text(value, 40)
-  return candidate === 'shogo' || candidate === 'clawpilot' ? candidate : null
+  return candidate === 'shogo' || candidate === 'external' || candidate === 'clawpilot'
+    ? candidate
+    : null
 }
 
 function decimalToScaledInteger(value: unknown, scale: number): number | null {
@@ -547,7 +551,9 @@ export function classifyPosAccountingQuickBooksTransaction(
   if (providerId && linkedProviderIds.has(providerId)) return 'clawpilot'
 
   const trustedOrigin = text(row.pos_accounting_origin ?? row.posAccountingOrigin, 40)
-  if (trustedOrigin === 'clawpilot' || trustedOrigin === 'shogo') return trustedOrigin
+  if (trustedOrigin === 'clawpilot' || trustedOrigin === 'external' || trustedOrigin === 'shogo') {
+    return trustedOrigin
+  }
 
   const date = businessDate(row.transaction_date ?? row.businessDate ?? payload.TxnDate)
   if (!date) return null
@@ -910,6 +916,14 @@ export function normalizePosAccountingDraftEvidence(
     reviewedBy: firstText([row.reviewed_by, row.reviewedBy], 254),
     reviewedAt: timestamp(row.reviewed_at ?? row.reviewedAt),
     reviewNote: firstText([row.review_note, row.reviewNote], 1_000),
+    externalPostingProvider: firstText([
+      row.external_posting_provider,
+      row.externalPostingProvider,
+    ], 120),
+    externalPostingReference: firstText([
+      row.external_posting_reference,
+      row.externalPostingReference,
+    ], 200),
     quickBooksSalesReceiptId: firstText([
       row.quickbooks_sales_receipt_id,
       row.quickBooksSalesReceiptId,
@@ -1537,6 +1551,7 @@ export function buildPosAccountingParityReport(input: {
     .map(normalizePosAccountingDraftEvidence)
     .filter((item): item is NormalizedPosAccountingDraftEvidence => Boolean(item))
   const linkedProviderIds = new Set(drafts.flatMap((draft) => draft.documents
+    .filter((document) => document.draft.postingOrigin === 'clawpilot')
     .map((document) => document.providerTransactionId)
     .filter((providerId): providerId is string => Boolean(providerId))))
   const toastTransactions = input.transactions.filter(
@@ -1650,7 +1665,7 @@ const SHOGO_TRANSACTION_MARKER_SQL = `(
     = to_char(transaction.transaction_date, 'YYYY-MM-DD')
 )`
 
-const CLAWPILOT_DRAFT_LINK_SQL = `EXISTS (
+const DRAFT_EVIDENCE_LINK_SQL = `EXISTS (
   SELECT 1
   FROM toast_accounting_export_drafts linked_draft
   WHERE linked_draft.organization_id = transaction.organization_id
@@ -1669,16 +1684,32 @@ const CLAWPILOT_DRAFT_LINK_SQL = `EXISTS (
     ])
 )`
 
-const POS_ACCOUNTING_TRANSACTION_SQL = `(
-  ${SHOGO_TRANSACTION_MARKER_SQL}
-  OR ${CLAWPILOT_DRAFT_LINK_SQL}
+const DRAFT_EVIDENCE_ORIGIN_SQL = `(
+  SELECT (array_agg(
+    linked_draft.posting_origin
+    ORDER BY linked_draft.is_current DESC, linked_draft.reviewed_at DESC NULLS LAST,
+      linked_draft.updated_at DESC
+  ))[1]
+  FROM toast_accounting_export_drafts linked_draft
+  WHERE linked_draft.organization_id = transaction.organization_id
+    AND linked_draft.posting_origin IN ('shogo', 'external', 'clawpilot')
+    AND transaction.quickbooks_transaction_id = ANY(ARRAY[
+      linked_draft.quickbooks_sales_receipt_id,
+      linked_draft.quickbooks_journal_entry_id,
+      linked_draft.quickbooks_transaction_id
+    ])
 )`
 
-const POS_ACCOUNTING_ORIGIN_SQL = `CASE
-  WHEN ${CLAWPILOT_DRAFT_LINK_SQL} THEN 'clawpilot'
-  WHEN ${SHOGO_TRANSACTION_MARKER_SQL} THEN 'shogo'
-  ELSE NULL
-END`
+const POS_ACCOUNTING_TRANSACTION_SQL = `(
+  ${SHOGO_TRANSACTION_MARKER_SQL}
+  OR ${DRAFT_EVIDENCE_LINK_SQL}
+)`
+
+const POS_ACCOUNTING_ORIGIN_SQL = `COALESCE(
+  ${DRAFT_EVIDENCE_ORIGIN_SQL},
+  CASE WHEN ${SHOGO_TRANSACTION_MARKER_SQL} THEN 'shogo' END,
+  CASE WHEN ${DRAFT_EVIDENCE_LINK_SQL} THEN 'external' END
+)`
 
 const EVIDENCE_DATES_CTE = `WITH evidence_dates AS (
   SELECT draft.business_date AS evidence_date
@@ -1834,6 +1865,8 @@ export async function readPosAccountingParityReportInPostgres(
       reviewed_by: string | null
       reviewed_at: string | null
       review_note: string | null
+      external_posting_provider: string | null
+      external_posting_reference: string | null
       posting_batch_id: string | null
       posting_batch_status: string | null
       posting_batch_fingerprint: string | null
@@ -1864,6 +1897,7 @@ export async function readPosAccountingParityReportInPostgres(
          draft.quickbooks_transaction_id, draft.quickbooks_sales_receipt_id,
          draft.quickbooks_journal_entry_id, draft.review_outcome, draft.posting_origin,
          draft.reviewed_by, draft.reviewed_at::text, draft.review_note,
+         draft.external_posting_provider, draft.external_posting_reference,
          posting_batch.id::text AS posting_batch_id,
          posting_batch.status AS posting_batch_status,
          posting_batch.request_fingerprint AS posting_batch_fingerprint,

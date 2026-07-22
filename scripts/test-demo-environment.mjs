@@ -131,6 +131,7 @@ assert.ok(health.includes("filename = '0073_toast_sync_worker_hardening.sql'"))
 assert.ok(health.includes("filename = '0074_pos_accounting_issue_notifications.sql'"))
 assert.ok(health.includes("filename = '0075_quickbooks_write_binding_compatibility.sql'"))
 assert.ok(health.includes("filename = '0079_pos_accounting_posting_outcomes.sql'"))
+assert.ok(health.includes("filename = '0080_external_pos_accounting_outcomes.sql'"))
 assert.ok(!health.includes('demoEnvironment'))
 
 const proxy = read('app_src/proxy.ts')

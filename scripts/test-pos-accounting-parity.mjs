@@ -346,6 +346,15 @@ assert.equal(pure.classifyPosAccountingQuickBooksTransaction(receiptTransaction(
   documentNumber: 'UNRELATED-SEQUENCE',
   memo: 'POS 2025-03-14',
 }), new Set(['linked-clawpilot-receipt'])), 'clawpilot')
+assert.equal(pure.classifyPosAccountingQuickBooksTransaction({
+  ...receiptTransaction({
+    id: 'trusted-external-receipt',
+    date: '2025-03-14',
+    documentNumber: 'MIDDLEWARE-42',
+    memo: 'External accounting bridge',
+  }),
+  pos_accounting_origin: 'external',
+}), 'external')
 
 const parityDraft = pure.normalizePosAccountingDraftEvidence(accountingDraft({
   id: 'draft-comparison',
@@ -730,6 +739,7 @@ for (const call of sqlCalls) {
 assert.equal(sqlCalls.some((call) => call.source.includes("from '^[[:space:]]*toast[[:space:]]+([0-9]{4}-[0-9]{2}-[0-9]{2})'")), true)
 assert.equal(sqlCalls.some((call) => call.source.includes("source_payload #>> '{CustomerMemo,value}'")), true)
 assert.equal(sqlCalls.some((call) => call.source.includes('toast_accounting_export_drafts linked_draft')), true)
+assert.equal(sqlCalls.some((call) => call.source.includes("linked_draft.posting_origin IN ('shogo', 'external', 'clawpilot')")), true)
 assert.equal(sqlCalls.some((call) => /document_number[\s\S]*pos\$/i.test(call.source)), false)
 assert.equal(sqlCalls.some((call) => call.source.includes('draft.is_current = true')), true)
 assert.equal(sqlCalls.some((call) => call.source.includes("IN ('SalesReceipt', 'JournalEntry')")), true)
@@ -814,5 +824,9 @@ assert.match(parityPanel, /view: 'pos-parity'/)
 assert.match(parityPanel, /view: 'pos-parity-evidence'/)
 assert.match(parityPanel, /document numbers are shown for reference and never establish posting origin/)
 assert.match(parityPanel, /their totals are not compared to each other/)
+assert.match(parityPanel, /Acknowledge external posting/)
+assert.match(parityPanel, /record-external-draft/)
+assert.match(parityPanel, /record-external-range/)
+assert.match(parityPanel, /ClawPilot will not create, approve, or resend a QuickBooks transaction/)
 
 console.log('PASS POS accounting parity normalization, matching, comparison, historical corpus, and read-only Postgres contracts')

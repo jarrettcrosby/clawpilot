@@ -1428,6 +1428,7 @@ for (const migration of [
   '0076_pos_accounting_notification_consent.sql',
   '0078_pos_accounting_date_commands.sql',
   '0079_pos_accounting_posting_outcomes.sql',
+  '0080_external_pos_accounting_outcomes.sql',
 ]) {
   assertIncludes(healthRoute, migration, 'hosted POS and accounting migration health')
 }
