@@ -51,6 +51,7 @@ const MODULE_LABELS: Record<string, string> = {
   crm: 'CRM',
   accounting: 'Accounting',
   pos: 'POS',
+  operations: 'Operations',
   links: 'Short Links',
   agents: 'Agents',
   versions: 'Versions',

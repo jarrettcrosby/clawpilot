@@ -21,6 +21,7 @@ import MoreHorizRounded from '@mui/icons-material/MoreHorizRounded'
 import ContactsRounded from '@mui/icons-material/ContactsRounded'
 import AccountBalanceRounded from '@mui/icons-material/AccountBalanceRounded'
 import PointOfSaleRounded from '@mui/icons-material/PointOfSaleRounded'
+import LocalShippingRounded from '@mui/icons-material/LocalShippingRounded'
 import BrandMark from '@/components/BrandMark'
 import { DashboardIcon, DocsIcon, ProjectsIcon, PipelineIcon, AgentsIcon, VersionsIcon } from '@/lib/icons'
 
@@ -32,6 +33,7 @@ const NAV_ITEMS = [
   { id: 'crm', label: 'CRM', Icon: ContactsRounded },
   { id: 'accounting', label: 'Accounting', Icon: AccountBalanceRounded },
   { id: 'pos', label: 'POS', Icon: PointOfSaleRounded },
+  { id: 'operations', label: 'Operations', Icon: LocalShippingRounded },
   { id: 'links', label: 'Links', Icon: LinkRounded },
   { id: 'agents', label: 'Agents', Icon: AgentsIcon },
   { id: 'versions', label: 'Versions', Icon: VersionsIcon },
@@ -61,7 +63,7 @@ type NavigationListProps = {
 function NavigationList({ activeSection, collapsed = false, onSelect, surface, showLinks }: NavigationListProps) {
   const items = showLinks ? NAV_ITEMS : NAV_ITEMS.filter((item) => item.id !== 'links')
   return (
-    <List sx={{ px: collapsed ? 1.25 : 1.5, py: 1, flex: 1 }}>
+    <List sx={{ px: collapsed ? 1.25 : 1.5, py: 1, flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden' }}>
       {items.map((item) => (
         <Tooltip
           key={item.id}

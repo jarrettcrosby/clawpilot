@@ -182,6 +182,7 @@ for (const requiredPath of [
   'db/migrations/0078_pos_accounting_date_commands.sql',
   'db/migrations/0079_pos_accounting_posting_outcomes.sql',
   'db/migrations/0080_external_pos_accounting_outcomes.sql',
+  'db/migrations/0081_distributed_operations_foundation.sql',
   '.github/workflows/clawpilot-repository-runner.yml',
   '.github/workflows/deployed-runtime-monitor.yml',
   'scripts/start-railway.sh',

@@ -13,6 +13,7 @@ import ShortLinksSection from '@/components/links/ShortLinksSection'
 import CrmSection from '@/components/crm/CrmSection'
 import AccountingSection from '@/components/accounting/AccountingSection'
 import PosSection from '@/components/pos/PosSection'
+import OperationsSection from '@/components/operations/OperationsSection'
 import ShortcutsModal from '@/components/help/ShortcutsModal'
 import SessionGuard from '@/components/auth/SessionGuard'
 import ImpersonationBanner from '@/components/auth/ImpersonationBanner'
@@ -22,7 +23,7 @@ import { emptyFilter } from '@/components/projects/FilterBar'
 import { WORKSPACE_CHANGED_EVENT, type WorkspaceChangedDetail } from '@/lib/workspaceClient'
 import { accountingSectionFromNavigationUrl } from '@/lib/accountingDraftNavigation'
 
-const SECTIONS = ['dashboard', 'docs', 'projects', 'pipeline', 'crm', 'accounting', 'pos', 'links', 'agents', 'versions']
+const SECTIONS = ['dashboard', 'docs', 'projects', 'pipeline', 'crm', 'accounting', 'pos', 'operations', 'links', 'agents', 'versions']
 const DESKTOP_NAV_COLLAPSED_KEY = 'clawpilot_desktop_nav_collapsed'
 const DESKTOP_NAV_PREFERENCE_EVENT = 'clawpilot:desktop-nav-preference'
 
@@ -225,8 +226,8 @@ export default function HomeClient({
           key={`workspace-${workspaceRevision}`}
           sx={{
             flex: 1,
-            overflow: ['docs', 'projects', 'pipeline', 'crm', 'accounting', 'pos'].includes(section) ? 'hidden' : 'auto',
-            pb: ['docs', 'projects', 'pipeline', 'crm', 'accounting', 'pos'].includes(section)
+            overflow: ['docs', 'projects', 'pipeline', 'crm', 'accounting', 'pos', 'operations'].includes(section) ? 'hidden' : 'auto',
+            pb: ['docs', 'projects', 'pipeline', 'crm', 'accounting', 'pos', 'operations'].includes(section)
               ? { xs: 'calc(var(--mobile-navigation-height) + env(safe-area-inset-bottom) + 8px)', md: 0 }
               : { xs: 'calc(var(--mobile-navigation-height) + env(safe-area-inset-bottom) + 16px)', md: 2 },
           }}
@@ -268,6 +269,11 @@ export default function HomeClient({
           {section === 'pos' && (
             <Box sx={{ height: '100%', overflow: 'hidden' }}>
               <PosSection />
+            </Box>
+          )}
+          {section === 'operations' && (
+            <Box sx={{ height: '100%', overflow: 'hidden' }}>
+              <OperationsSection />
             </Box>
           )}
           {shortLinksEnabled && section === 'links' && (

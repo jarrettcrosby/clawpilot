@@ -28,6 +28,9 @@ export type AppUserPermissions = {
   manageUserAccess: boolean
   createBoards: boolean
   createPipelines: boolean
+  viewOperations: boolean
+  manageOperations: boolean
+  executeWarehouse: boolean
   viewFullReleaseHistory: boolean
   manageBackups: boolean
   manageLinks: boolean
@@ -44,6 +47,9 @@ export const MEMBER_PERMISSIONS: AppUserPermissions = {
   manageUserAccess: false,
   createBoards: true,
   createPipelines: true,
+  viewOperations: false,
+  manageOperations: false,
+  executeWarehouse: false,
   viewFullReleaseHistory: false,
   manageBackups: false,
   manageLinks: false,
@@ -60,6 +66,9 @@ export const OWNER_PERMISSIONS: AppUserPermissions = {
   manageUserAccess: true,
   createBoards: true,
   createPipelines: true,
+  viewOperations: true,
+  manageOperations: true,
+  executeWarehouse: true,
   viewFullReleaseHistory: true,
   manageBackups: true,
   manageLinks: true,
@@ -164,6 +173,9 @@ function normalizePermissions(value: unknown): AppUserPermissions {
     manageUserAccess: input.manageUserAccess === true,
     createBoards: input.createBoards !== false,
     createPipelines: input.createPipelines !== false,
+    viewOperations: input.viewOperations === true,
+    manageOperations: input.manageOperations === true,
+    executeWarehouse: input.executeWarehouse === true,
     viewFullReleaseHistory: input.viewFullReleaseHistory === true,
     manageBackups: input.manageBackups === true,
     manageLinks: input.manageLinks === true,
@@ -184,6 +196,7 @@ export function permissionsForRole(role: AppUserRole, value: unknown): AppUserPe
     permissions.viewFullReleaseHistory = false
     permissions.manageBackups = false
     permissions.manageLinks = false
+    permissions.manageOperations = false
     permissions.approveAccounting = false
     permissions.viewOrganizationAudit = false
     permissions.viewSystemAudit = false

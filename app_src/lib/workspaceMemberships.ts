@@ -88,6 +88,9 @@ export async function ensureDemoWorkspaceMembership(actor: AppUser): Promise<Wor
     accessDemo: true,
     createBoards: false,
     createPipelines: false,
+    viewOperations: true,
+    manageOperations: false,
+    executeWarehouse: false,
     viewAccounting: true,
   }
   return withTransaction(async (client) => {

@@ -63,6 +63,9 @@ type UserPermissions = {
   manageUserAccess: boolean
   createBoards: boolean
   createPipelines: boolean
+  viewOperations: boolean
+  manageOperations: boolean
+  executeWarehouse: boolean
   viewFullReleaseHistory: boolean
   manageBackups: boolean
   manageLinks: boolean
@@ -229,6 +232,9 @@ const PERMISSIONS: Array<{ key: PermissionKey; label: string; adminOnly?: boolea
   { key: 'manageUserAccess', label: 'Manage access', adminOnly: true },
   { key: 'createBoards', label: 'Create boards' },
   { key: 'createPipelines', label: 'Create pipelines' },
+  { key: 'viewOperations', label: 'View operations' },
+  { key: 'manageOperations', label: 'Manage operations', adminOnly: true },
+  { key: 'executeWarehouse', label: 'Execute warehouse work' },
   { key: 'viewFullReleaseHistory', label: 'View full release history', adminOnly: true },
   { key: 'manageBackups', label: 'Manage data checkpoints', adminOnly: true },
   { key: 'manageLinks', label: 'Manage organization short links', adminOnly: true },
@@ -238,6 +244,26 @@ const PERMISSIONS: Array<{ key: PermissionKey; label: string; adminOnly?: boolea
   { key: 'viewOrganizationAudit', label: 'View organization activity', adminOnly: true },
   { key: 'viewSystemAudit', label: 'View global system activity', adminOnly: true },
 ]
+
+function permissionsForRolePreset(role: EditableRole, current: UserPermissions): UserPermissions {
+  const enabled = role === 'admin'
+  return {
+    ...current,
+    inviteUsers: enabled,
+    manageUserAccess: enabled,
+    viewOperations: enabled,
+    manageOperations: enabled,
+    executeWarehouse: enabled,
+    viewFullReleaseHistory: enabled,
+    manageBackups: enabled,
+    manageLinks: enabled,
+    viewAccounting: enabled,
+    prepareAccounting: enabled,
+    approveAccounting: enabled,
+    viewOrganizationAudit: enabled,
+    viewSystemAudit: enabled,
+  }
+}
 
 const panelSx = {
   border: '1px solid rgba(255,255,255,0.09)',
@@ -1324,10 +1350,7 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
                             value={user.role === 'owner' ? 'admin' : user.role}
                             onChange={(event) => {
                               const role = event.target.value as EditableRole
-                              const permissions = role === 'admin'
-                                ? { ...user.permissions, inviteUsers: true, manageUserAccess: true, viewFullReleaseHistory: true, manageBackups: true, manageLinks: true, viewAccounting: true, prepareAccounting: true, approveAccounting: true, viewOrganizationAudit: true, viewSystemAudit: true }
-                                : { ...user.permissions, inviteUsers: false, manageUserAccess: false, viewFullReleaseHistory: false, manageBackups: false, manageLinks: false, viewAccounting: false, prepareAccounting: false, approveAccounting: false, viewOrganizationAudit: false, viewSystemAudit: false }
-                              void updateAccess(user, role, permissions)
+                              void updateAccess(user, role, permissionsForRolePreset(role, user.permissions))
                             }}
                             disabled={busy}
                             sx={{ ...fieldSx, width: 132 }}

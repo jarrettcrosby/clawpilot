@@ -20,6 +20,7 @@ Use this note when the question spans more than one module. It is the root of th
 - [Operations Map](operations-map.md): environments, deployment, recovery, credentials, and provider runbooks.
 - [Evolution Map](evolution-map.md): decisions, releases, incidents, and implementation evidence.
 - [Decision Index](../decisions/index.md): accepted architecture and product decisions.
+- [Distributed Operations Integration and Gap Map](distributed-operations-integration-gap-map.md): pre-activation DOM, WMS, 3PL, and adapter discovery.
 
 ## Context Graph
 
@@ -29,12 +30,16 @@ flowchart TD
   Context --> Platform[Platform and Data Map]
   Context --> Operations[Operations Map]
   Context --> Evolution[Evolution Map]
+  Context --> Distributed[Distributed Operations Design]
   Product --> Modules[Module Contracts]
   Platform --> Data[Postgres, Sheets, SuiteCRM]
   Operations --> Runtime[Dev and Production]
   Evolution --> Decisions[Decision Records]
   Evolution --> Releases[Versions and Releases]
   Evolution --> Evidence[Incidents and Git History]
+  Distributed --> Modules
+  Distributed --> Data
+  Distributed --> Runtime
 ```
 
 ## Retrieval Rules
