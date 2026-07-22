@@ -1277,6 +1277,7 @@ const externalPostingQueries = []
 const externalPostingAuditEvents = []
 const externalPostingDraftId = '22222222-2222-4222-8222-222222222222'
 const externalPostingBatchId = '33333333-3333-4333-8333-333333333333'
+let externalPostingReconciliationStatus = 'orders_only'
 const externalPostingClient = {
   async query(source, parameters = []) {
     externalPostingQueries.push({ source, parameters })
@@ -1288,7 +1289,7 @@ const externalPostingClient = {
         location_name: 'Main',
         business_date: '2026-07-19',
         status: 'needs_review',
-        reconciliation_status: 'ready',
+        reconciliation_status: externalPostingReconciliationStatus,
         source_summary: {},
         proposed_lines: [],
         posting_batch_id: externalPostingBatchId,
@@ -1392,12 +1393,27 @@ const externalPostingOutcome = await externalPostingModule.recordExternalPosting
 })
 assert.equal(externalPostingOutcome.recorded, true)
 assert.equal(externalPostingOutcome.providerName, 'Accounting middleware')
+assert.equal(externalPostingOutcome.sourceReconciliationStatus, 'orders_only')
 assert.equal(externalPostingAuditEvents.length, 1)
 assert.equal(externalPostingAuditEvents[0].eventType, 'pos.accounting.external_posting.recorded')
 assert.equal(externalPostingAuditEvents[0].payload.postingOrigin, 'external')
+assert.equal(externalPostingAuditEvents[0].payload.sourceReconciliationStatus, 'orders_only')
 assert.ok(externalPostingQueries.some(({ source }) => source.includes("status = 'cancelled'")))
 assert.ok(externalPostingQueries.some(({ source }) => source.includes("review_outcome = 'externally_posted'")))
 assert.equal(externalPostingQueries.some(({ source }) => source.includes("status = 'approved'")), false)
+
+externalPostingReconciliationStatus = 'variance'
+await assert.rejects(
+  () => externalPostingModule.recordExternalPostingInPostgres({
+    organizationId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    draftId: externalPostingDraftId,
+    salesReceiptId: 'receipt-19',
+    journalEntryId: 'journal-19',
+    providerName: 'Accounting middleware',
+    actorEmail: 'operator@example.test',
+  }),
+  (error) => error?.code === 'POS_ACCOUNTING_EXTERNAL_EVIDENCE_INCOMPLETE',
+)
 
 const writePolicyModule = loadTypeScriptModule('app_src/lib/quickBooksWritePolicy.ts')
 const productOnlyPolicy = writePolicyModule.configuredQuickBooksWritePolicy({
