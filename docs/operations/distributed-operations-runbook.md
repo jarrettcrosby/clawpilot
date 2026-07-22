@@ -13,13 +13,23 @@ app_visible: false
 
 ## Status And Scope
 
-This runbook governs the target distributed order, inventory, warehouse, carrier, printing, shipment, and 3PL billing module. It remains `draft` until the module has an operations health surface, scoped activation control, tested adapters, and on-call ownership. Current general environment, backup, promotion, and restore procedures remain authoritative:
+This runbook governs the target distributed order, inventory, warehouse, carrier, printing, shipment, and 3PL billing module. The development environment has a Postgres-backed mock proof workbench and an audited exception queue. This runbook remains `draft` until the module has an operations health surface, scoped activation control, tested production adapters, and on-call ownership. Current general environment, backup, promotion, and restore procedures remain authoritative:
 
 - [ClawPilot Environments and Deployment](clawpilot-environments.md)
 - [Railway Postgres Backups](railway-postgres-backups.md)
 - [Agent Security and Integration Isolation](agent-security-and-isolation.md)
 
-Do not use this document as evidence that migration `0081`, an operations worker, provider integration, checkout callback, print agent, or warehouse UI is deployed.
+Migration `0081` and the mock workbench are development evidence only. Do not use this document as evidence that an operations worker, production provider integration, checkout callback, enrolled print agent, or live warehouse workflow is deployed.
+
+## Exception Queue Procedure
+
+1. Open **Operations**, then select **Exceptions**.
+2. Filter by status or search by exception Global ID, order number, title, or customer.
+3. Open the exception and review its linked order, recommendation, and evidence before changing status.
+4. Use **Acknowledge** when an operator has accepted ownership but work remains. Use **Resolve** only after the underlying operational state is verified. Use **Dismiss** only when the signal is invalid or non-actionable, and record supporting evidence at the source.
+5. Reopen a resolved or dismissed exception when new evidence changes the disposition. ClawPilot retains the prior transitions in operations domain events and the global audit log.
+
+Exception updates require operations-management permission. They never alter immutable inventory ledger, shipment, or billing evidence, and they do not silently create Projects tasks.
 
 ## Non-Negotiable Controls
 

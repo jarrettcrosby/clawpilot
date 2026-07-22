@@ -94,6 +94,9 @@ function verifySourceContracts() {
   for (const fragment of [
     'readOperationsWorkspaceFromPostgres',
     'runMockOperationsProofFromPostgres',
+    'updateOperationsExceptionInPostgres',
+    'operations:exception:',
+    "aggregateType: 'operations.exception'",
     'operations:proof-order:',
     'FOR UPDATE OF position',
     'OPERATIONS_FULFILLMENT_INFEASIBLE',
@@ -122,9 +125,11 @@ function verifySourceContracts() {
     'isPostgresStorageEnabled',
     'readOperationsWorkspaceFromPostgres',
     'runMockOperationsProofFromPostgres',
+    'updateOperationsExceptionInPostgres',
     "'Cache-Control': 'private, no-store'",
     'MAX_REQUEST_BYTES',
-    "body.action !== 'run-proof-order'",
+    "action === 'run-proof-order'",
+    "action === 'update-exception'",
   ]) assert.ok(route.includes(fragment), `Operations route missing ${fragment}`)
   assert.ok(!/clientSecret|accessToken|privateKey/i.test(route), 'Operations route must not handle credentials')
 
@@ -153,7 +158,7 @@ async function verifyRouteBehavior() {
       this.status = status
     }
   }
-  const calls = { reads: [], proofs: [] }
+  const calls = { reads: [], proofs: [], exceptions: [] }
   const route = loadTypeScriptModule('app_src/app/api/operations/route.ts', {
     mocks: {
       'next/server': {
@@ -190,6 +195,17 @@ async function verifyRouteBehavior() {
             steps: Array.from({ length: 20 }, (_, index) => `step-${index + 1}`),
           }
         },
+        updateOperationsExceptionInPostgres: async (input) => {
+          calls.exceptions.push(input)
+          return {
+            changed: true,
+            exception: {
+              globalId: input.exceptionGlobalId,
+              status: input.status,
+              title: 'Inventory review',
+            },
+          }
+        },
       },
       '@/lib/requestUser': {
         requireRequestUser: async (request) => request.actor,
@@ -220,7 +236,7 @@ async function verifyRouteBehavior() {
   assert.equal(invalidStatus.status, 400)
   assert.equal((await payload(invalidStatus)).code, 'OPERATIONS_STATUS_INVALID')
 
-  const validRead = await route.GET(request('http://localhost/api/operations?status=shipped&search=proof&order=gor1234567'))
+  const validRead = await route.GET(request('http://localhost/api/operations?status=shipped&exceptionStatus=open&search=proof&order=gor1234567'))
   assert.equal(validRead.status, 200)
   assert.equal(validRead.headers.get('cache-control'), 'private, no-store')
   assert.equal(calls.reads.length, 1)
@@ -229,14 +245,9 @@ async function verifyRouteBehavior() {
     capabilities: actor.capabilities,
     search: 'proof',
     status: 'shipped',
+    exceptionStatus: 'open',
     selectedOrderGlobalId: 'gor1234567',
   })
-
-  const deniedWrite = await route.POST(request('http://localhost/api/operations', {
-    actor: { ...actor, capabilities: { canView: true, canManage: true, canExecute: false } },
-  }))
-  assert.equal(deniedWrite.status, 403)
-  assert.equal((await payload(deniedWrite)).code, 'OPERATIONS_EXECUTE_REQUIRED')
 
   const requested = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString()
   const proof = {
@@ -256,6 +267,14 @@ async function verifyRouteBehavior() {
       country: 'us',
     },
   }
+  const deniedWrite = await route.POST(request('http://localhost/api/operations', {
+    actor: { ...actor, capabilities: { canView: true, canManage: true, canExecute: false } },
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'run-proof-order', proof }),
+  }))
+  assert.equal(deniedWrite.status, 403)
+  assert.equal((await payload(deniedWrite)).code, 'OPERATIONS_EXECUTE_REQUIRED')
+
   const validWrite = await route.POST(request('http://localhost/api/operations', {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ action: 'run-proof-order', proof }),
@@ -265,6 +284,28 @@ async function verifyRouteBehavior() {
   assert.equal(calls.proofs[0].organizationId, actor.organizationId)
   assert.equal(calls.proofs[0].actorEmail, actor.email)
   assert.equal(calls.proofs[0].proof.shipTo.country, 'US')
+
+  const validExceptionUpdate = await route.POST(request('http://localhost/api/operations', {
+    actor: { ...actor, capabilities: { canView: true, canManage: true, canExecute: false } },
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'update-exception', exceptionGlobalId: 'gex1234567', status: 'acknowledged' }),
+  }))
+  assert.equal(validExceptionUpdate.status, 200)
+  assert.equal(calls.exceptions.length, 1)
+  assert.deepEqual(JSON.parse(JSON.stringify(calls.exceptions[0])), {
+    organizationId: actor.organizationId,
+    actorEmail: actor.email,
+    exceptionGlobalId: 'gex1234567',
+    status: 'acknowledged',
+  })
+
+  const deniedExceptionUpdate = await route.POST(request('http://localhost/api/operations', {
+    actor: { ...actor, capabilities: { canView: true, canManage: false, canExecute: false } },
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'update-exception', exceptionGlobalId: 'gex1234567', status: 'resolved' }),
+  }))
+  assert.equal(deniedExceptionUpdate.status, 403)
+  assert.equal((await payload(deniedExceptionUpdate)).code, 'OPERATIONS_MANAGE_REQUIRED')
 
   const invalidProduct = await route.POST(request('http://localhost/api/operations', {
     headers: { 'Content-Type': 'application/json' },
@@ -553,6 +594,95 @@ async function verifyPostgresAcceptance() {
     assert.equal(workspace.summary.availableUnits, 10)
     assert.equal(workspace.summary.reservedUnits, 0)
     assert.equal(workspace.summary.unbilledMinor, '1335')
+
+    const exceptionSeed = await pool.query(
+      `INSERT INTO operations_exceptions (
+         organization_id, order_id, exception_type, severity, title, details, assigned_to
+       ) SELECT $1::uuid, orders.id, 'inventory_variance', 'high',
+           'Verify reserved inventory', $3::jsonb, $4
+         FROM operations_orders orders
+        WHERE orders.organization_id = $1::uuid AND orders.global_id = $2
+       RETURNING global_id`,
+      [
+        primary.organizationId,
+        first.orderGlobalId,
+        JSON.stringify({ recommendedAction: 'Reconcile the location count.', evidence: { expected: 12, observed: 10 } }),
+        primary.email,
+      ],
+    )
+    assert.match(exceptionSeed.rows[0].global_id, /^gex\d{7}$/)
+    const exceptionWorkspace = await persistence.readOperationsWorkspaceFromPostgres({
+      organizationId: primary.organizationId,
+      capabilities: { canView: true, canManage: true, canExecute: true },
+      exceptionStatus: 'open',
+    })
+    assert.equal(exceptionWorkspace.exceptions.length, 1)
+    assert.equal(exceptionWorkspace.exceptions[0].orderGlobalId, first.orderGlobalId)
+    assert.equal(exceptionWorkspace.exceptions[0].customerGlobalId, primary.customer.reference_code)
+    assert.equal(exceptionWorkspace.exceptions[0].details.recommendedAction, 'Reconcile the location count.')
+    assert.equal(exceptionWorkspace.summary.exceptions, 1)
+
+    const acknowledged = await persistence.updateOperationsExceptionInPostgres({
+      organizationId: primary.organizationId,
+      actorEmail: primary.email,
+      exceptionGlobalId: exceptionSeed.rows[0].global_id,
+      status: 'acknowledged',
+    })
+    assert.equal(acknowledged.changed, true)
+    assert.equal(acknowledged.exception.status, 'acknowledged')
+    const acknowledgedAgain = await persistence.updateOperationsExceptionInPostgres({
+      organizationId: primary.organizationId,
+      actorEmail: primary.email,
+      exceptionGlobalId: exceptionSeed.rows[0].global_id,
+      status: 'acknowledged',
+    })
+    assert.equal(acknowledgedAgain.changed, false)
+    const resolved = await persistence.updateOperationsExceptionInPostgres({
+      organizationId: primary.organizationId,
+      actorEmail: primary.email,
+      exceptionGlobalId: exceptionSeed.rows[0].global_id,
+      status: 'resolved',
+    })
+    assert.equal(resolved.exception.status, 'resolved')
+    assert.ok(resolved.exception.resolvedAt)
+    await expectRejected(
+      () => persistence.updateOperationsExceptionInPostgres({
+        organizationId: primary.organizationId,
+        actorEmail: primary.email,
+        exceptionGlobalId: exceptionSeed.rows[0].global_id,
+        status: 'dismissed',
+      }),
+      (error) => error.code === 'OPERATIONS_EXCEPTION_TRANSITION_INVALID',
+      'Resolved exceptions must be reopened before a new disposition',
+    )
+    const reopened = await persistence.updateOperationsExceptionInPostgres({
+      organizationId: primary.organizationId,
+      actorEmail: primary.email,
+      exceptionGlobalId: exceptionSeed.rows[0].global_id,
+      status: 'open',
+    })
+    assert.equal(reopened.exception.status, 'open')
+    assert.equal(reopened.exception.resolvedAt, null)
+    const exceptionEvidence = await pool.query(
+      `SELECT
+         (SELECT count(*) FROM operations_domain_events
+          WHERE organization_id = $1::uuid AND aggregate_global_id = $2)::int AS domain_events,
+         (SELECT count(*) FROM audit_events
+          WHERE organization_id = $1::uuid AND aggregate_id = $2)::int AS audit_events`,
+      [primary.organizationId, exceptionSeed.rows[0].global_id],
+    )
+    assert.deepEqual(exceptionEvidence.rows[0], { domain_events: 3, audit_events: 3 })
+
+    await expectRejected(
+      () => persistence.updateOperationsExceptionInPostgres({
+        organizationId: other.organizationId,
+        actorEmail: other.email,
+        exceptionGlobalId: exceptionSeed.rows[0].global_id,
+        status: 'acknowledged',
+      }),
+      (error) => error.code === 'OPERATIONS_EXCEPTION_NOT_FOUND',
+      'Cross-workspace exception updates must fail',
+    )
 
     const isolated = await persistence.readOperationsWorkspaceFromPostgres({
       organizationId: other.organizationId,

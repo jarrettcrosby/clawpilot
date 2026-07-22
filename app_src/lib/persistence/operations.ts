@@ -21,6 +21,9 @@ import type {
   CommerceOrderInput,
   MockOperationsProofInput,
   MockOperationsProofResult,
+  OperationsExceptionListItem,
+  OperationsExceptionStatus,
+  OperationsExceptionUpdateResult,
   OperationsOrderDetail,
   OperationsOrderListItem,
   OperationsOrderStatus,
@@ -58,6 +61,24 @@ type OrderIdentityRow = QueryResultRow & {
   global_id: string
   status: OperationsOrderStatus
   tracking_number?: string | null
+}
+
+type ExceptionRow = QueryResultRow & {
+  id: string
+  global_id: string
+  exception_type: string
+  severity: OperationsExceptionListItem['severity']
+  status: OperationsExceptionStatus
+  title: string
+  details: Record<string, unknown>
+  assigned_to: string | null
+  order_global_id: string | null
+  order_number: string | null
+  customer_name: string | null
+  customer_global_id: string | null
+  created_at: Date
+  updated_at: Date
+  resolved_at: Date | null
 }
 
 type ProofConfiguration = {
@@ -131,6 +152,26 @@ function address(value: unknown): Address {
     region: String(source.region || ''),
     postalCode: String(source.postalCode || ''),
     country: String(source.country || ''),
+  }
+}
+
+function exceptionListItem(row: ExceptionRow): OperationsExceptionListItem {
+  return {
+    id: row.id,
+    globalId: row.global_id,
+    exceptionType: row.exception_type,
+    severity: row.severity,
+    status: row.status,
+    title: row.title,
+    details: json(row.details),
+    assignedTo: row.assigned_to,
+    orderGlobalId: row.order_global_id,
+    orderNumber: row.order_number,
+    customerName: row.customer_name,
+    customerGlobalId: row.customer_global_id,
+    createdAt: row.created_at.toISOString(),
+    updatedAt: row.updated_at.toISOString(),
+    resolvedAt: row.resolved_at?.toISOString() || null,
   }
 }
 
@@ -689,7 +730,8 @@ async function readOrderDetail(organizationId: string, orderGlobalId: string): P
        orders.source_provider, orders.status, orders.currency, orders.ship_to,
        plan_warehouse.name AS warehouse_name, orders.promised_delivery_at,
        (SELECT count(*) FROM operations_order_lines line WHERE line.order_id = orders.id)::text AS line_count,
-       (SELECT count(*) FROM operations_exceptions exception WHERE exception.order_id = orders.id AND exception.status = 'open')::text AS exception_count,
+       (SELECT count(*) FROM operations_exceptions exception
+        WHERE exception.order_id = orders.id AND exception.status IN ('open', 'acknowledged'))::text AS exception_count,
        plan.estimated_cost_minor::text, plan.estimated_revenue_minor::text, plan.estimated_margin_minor::text,
        shipment.tracking_number, orders.updated_at
      FROM operations_orders orders
@@ -851,21 +893,30 @@ export async function readOperationsWorkspaceFromPostgres(input: {
   capabilities: OperationsCapabilities
   search?: string
   status?: string | null
+  exceptionStatus?: OperationsExceptionStatus | null
   selectedOrderGlobalId?: string | null
 }): Promise<OperationsWorkspace> {
   const organizationId = requireOrganizationId(input.organizationId)
   const values: unknown[] = [organizationId]
   const where = ['orders.organization_id = $1::uuid']
+  const exceptionValues: unknown[] = [organizationId]
+  const exceptionWhere = ['exception.organization_id = $1::uuid']
   if (input.search) {
     values.push(`%${input.search.toLowerCase()}%`)
     where.push(`(lower(orders.order_number) LIKE $${values.length} OR lower(orders.global_id) LIKE $${values.length} OR lower(customer.name) LIKE $${values.length})`)
+    exceptionValues.push(`%${input.search.toLowerCase()}%`)
+    exceptionWhere.push(`(lower(exception.title) LIKE $${exceptionValues.length} OR lower(exception.global_id) LIKE $${exceptionValues.length} OR lower(COALESCE(orders.order_number, '')) LIKE $${exceptionValues.length} OR lower(COALESCE(customer.name, '')) LIKE $${exceptionValues.length})`)
   }
   if (input.status) {
     values.push(input.status)
     where.push(`orders.status = $${values.length}`)
   }
+  if (input.exceptionStatus) {
+    exceptionValues.push(input.exceptionStatus)
+    exceptionWhere.push(`exception.status = $${exceptionValues.length}`)
+  }
 
-  const [configuredResult, summaryResult, orderResult, warehouseResult, customerResult, productResult] = await Promise.all([
+  const [configuredResult, summaryResult, orderResult, exceptionResult, warehouseResult, customerResult, productResult] = await Promise.all([
     query<QueryResultRow & { configured: boolean }>(
       `SELECT EXISTS (
          SELECT 1 FROM operations_integration_accounts integration
@@ -886,7 +937,7 @@ export async function readOperationsWorkspaceFromPostgres(input: {
     }>(
       `SELECT
          (SELECT count(*) FROM operations_orders WHERE organization_id = $1::uuid AND status NOT IN ('shipped', 'cancelled'))::text AS open_orders,
-         (SELECT count(*) FROM operations_exceptions WHERE organization_id = $1::uuid AND status = 'open')::text AS exceptions,
+         (SELECT count(*) FROM operations_exceptions WHERE organization_id = $1::uuid AND status IN ('open', 'acknowledged'))::text AS exceptions,
          (SELECT count(*) FROM operations_orders WHERE organization_id = $1::uuid AND status NOT IN ('shipped', 'cancelled') AND promised_delivery_at <= now() + interval '2 days')::text AS due_soon,
          (SELECT count(*) FROM operations_orders WHERE organization_id = $1::uuid AND status = 'shipped' AND updated_at >= date_trunc('day', now()))::text AS shipped_today,
          COALESCE((SELECT sum(reserved_quantity) FROM operations_inventory_positions WHERE organization_id = $1::uuid), 0)::text AS reserved_units,
@@ -917,7 +968,7 @@ export async function readOperationsWorkspaceFromPostgres(input: {
               orders.source_provider, orders.status, warehouse.name AS warehouse_name,
               orders.promised_delivery_at,
               (SELECT count(*) FROM operations_order_lines line WHERE line.order_id = orders.id)::text AS line_count,
-              (SELECT count(*) FROM operations_exceptions exception WHERE exception.order_id = orders.id AND exception.status = 'open')::text AS exception_count,
+              (SELECT count(*) FROM operations_exceptions exception WHERE exception.order_id = orders.id AND exception.status IN ('open', 'acknowledged'))::text AS exception_count,
               plan.estimated_cost_minor::text, plan.estimated_revenue_minor::text,
               plan.estimated_margin_minor::text, shipment.tracking_number, orders.updated_at
        FROM operations_orders orders
@@ -935,6 +986,26 @@ export async function readOperationsWorkspaceFromPostgres(input: {
        ORDER BY orders.updated_at DESC, orders.id DESC
        LIMIT 100`,
       values,
+    ),
+    query<ExceptionRow>(
+      `SELECT exception.id::text, exception.global_id, exception.exception_type,
+              exception.severity, exception.status, exception.title, exception.details,
+              exception.assigned_to, exception.created_at, exception.updated_at,
+              exception.resolved_at, orders.global_id AS order_global_id,
+              orders.order_number, customer.name AS customer_name,
+              customer.reference_code AS customer_global_id
+       FROM operations_exceptions exception
+       LEFT JOIN operations_orders orders
+         ON orders.organization_id = exception.organization_id AND orders.id = exception.order_id
+       LEFT JOIN crm_organizations customer
+         ON customer.id = orders.customer_id AND customer.pipeline_id = orders.pipeline_id
+       WHERE ${exceptionWhere.join(' AND ')}
+       ORDER BY
+         CASE exception.status WHEN 'open' THEN 0 WHEN 'acknowledged' THEN 1 ELSE 2 END,
+         CASE exception.severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
+         exception.updated_at DESC, exception.id DESC
+       LIMIT 100`,
+      exceptionValues,
     ),
     query<QueryResultRow & { id: string; global_id: string; name: string }>(
       `SELECT id::text, global_id, name FROM operations_warehouses
@@ -993,6 +1064,7 @@ export async function readOperationsWorkspaceFromPostgres(input: {
       unbilledMinor: summary?.unbilled_minor || '0',
     },
     orders,
+    exceptions: exceptionResult.rows.map(exceptionListItem),
     selectedOrder: selectedGlobalId ? await readOrderDetail(organizationId, selectedGlobalId) : null,
     warehouses: warehouseResult.rows.map((row) => ({ id: row.id, globalId: row.global_id, name: row.name })),
     catalog: {
@@ -1001,6 +1073,119 @@ export async function readOperationsWorkspaceFromPostgres(input: {
     },
     generatedAt: new Date().toISOString(),
   }
+}
+
+async function readException(
+  client: PoolClient,
+  organizationId: string,
+  globalId: string,
+  lock = false,
+): Promise<ExceptionRow | null> {
+  const result = await client.query<ExceptionRow>(
+    `SELECT exception.id::text, exception.global_id, exception.exception_type,
+            exception.severity, exception.status, exception.title, exception.details,
+            exception.assigned_to, exception.created_at, exception.updated_at,
+            exception.resolved_at, orders.global_id AS order_global_id,
+            orders.order_number, customer.name AS customer_name,
+            customer.reference_code AS customer_global_id
+     FROM operations_exceptions exception
+     LEFT JOIN operations_orders orders
+       ON orders.organization_id = exception.organization_id AND orders.id = exception.order_id
+     LEFT JOIN crm_organizations customer
+       ON customer.id = orders.customer_id AND customer.pipeline_id = orders.pipeline_id
+     WHERE exception.organization_id = $1::uuid AND exception.global_id = $2
+     LIMIT 1
+     ${lock ? 'FOR UPDATE OF exception' : ''}`,
+    [organizationId, globalId],
+  )
+  return result.rows[0] || null
+}
+
+const EXCEPTION_TRANSITIONS: Record<OperationsExceptionStatus, Set<OperationsExceptionStatus>> = {
+  open: new Set(['acknowledged', 'resolved', 'dismissed']),
+  acknowledged: new Set(['open', 'resolved', 'dismissed']),
+  resolved: new Set(['open']),
+  dismissed: new Set(['open']),
+}
+
+export async function updateOperationsExceptionInPostgres(input: {
+  organizationId: string
+  actorEmail: string
+  exceptionGlobalId: string
+  status: OperationsExceptionStatus
+}): Promise<OperationsExceptionUpdateResult> {
+  const organizationId = requireOrganizationId(input.organizationId)
+  const actorEmail = String(input.actorEmail || '').trim().toLowerCase()
+  if (!actorEmail) throw new OperationsRequestError('OPERATIONS_ACTOR_REQUIRED', 'A signed-in user is required', 401)
+  if (!Object.prototype.hasOwnProperty.call(EXCEPTION_TRANSITIONS, input.status)) {
+    throw new OperationsRequestError('OPERATIONS_EXCEPTION_STATUS_INVALID', 'Exception status is invalid')
+  }
+
+  return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `operations:exception:${organizationId}:${input.exceptionGlobalId}`,
+    )
+    const current = await readException(client, organizationId, input.exceptionGlobalId, true)
+    if (!current) {
+      throw new OperationsRequestError('OPERATIONS_EXCEPTION_NOT_FOUND', 'Operations exception was not found', 404)
+    }
+    if (current.status === input.status) {
+      return { exception: exceptionListItem(current), changed: false }
+    }
+    if (!EXCEPTION_TRANSITIONS[current.status].has(input.status)) {
+      throw new OperationsRequestError(
+        'OPERATIONS_EXCEPTION_TRANSITION_INVALID',
+        `Exception cannot move from ${current.status} to ${input.status}`,
+        409,
+      )
+    }
+
+    const correlationId = randomUUID()
+    await client.query(
+      `UPDATE operations_exceptions
+       SET status = $3,
+           resolved_by = CASE WHEN $3 = 'resolved' THEN $4 ELSE NULL END,
+           resolved_at = CASE WHEN $3 = 'resolved' THEN now() ELSE NULL END,
+           updated_at = now()
+       WHERE organization_id = $1::uuid AND global_id = $2`,
+      [organizationId, input.exceptionGlobalId, input.status, actorEmail],
+    )
+    const updated = await readException(client, organizationId, input.exceptionGlobalId)
+    if (!updated) throw new OperationsRequestError('OPERATIONS_EXCEPTION_NOT_FOUND', 'Operations exception was not found', 404)
+
+    await appendDomainEvent(client, {
+      organizationId,
+      aggregateType: 'operations.exception',
+      aggregateId: updated.id,
+      aggregateGlobalId: updated.global_id,
+      eventType: `operations.exception.${input.status}`,
+      actorEmail,
+      correlationId,
+      idempotencyKey: `${updated.global_id}:status:${current.status}:${input.status}:${correlationId}`,
+      payload: {
+        previousStatus: current.status,
+        status: input.status,
+        orderGlobalId: updated.order_global_id,
+      },
+    })
+    await recordAuditEvent({
+      actor: actorEmail,
+      eventType: `operations.exception.${input.status}`,
+      aggregateType: 'operations.exception',
+      aggregateId: updated.global_id,
+      subject: updated.title,
+      organizationId,
+      eventKey: `operations:exception:${updated.global_id}:${correlationId}`,
+      payload: {
+        previousStatus: current.status,
+        status: input.status,
+        orderGlobalId: updated.order_global_id,
+      },
+    }, client)
+
+    return { exception: exceptionListItem(updated), changed: true }
+  })
 }
 
 export async function runMockOperationsProofFromPostgres(input: {

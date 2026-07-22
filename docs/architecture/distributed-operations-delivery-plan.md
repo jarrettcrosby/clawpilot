@@ -31,6 +31,12 @@ Every phase supplies:
 
 Operations stays fail-closed on file storage. Hosted activation requires Postgres, migration health, typed permissions, an explicit tenant/channel/warehouse enablement, and no critical reconciliation drift.
 
+## Current Delivery State
+
+As of 2026-07-22, the development environment has completed the bounded Phase 2 mock proof described below and exposes its tenant-scoped order workbench. The next development slice adds the first Phase 4 support capability early: a durable exception queue with audited disposition transitions. This does not advance production-provider certification or mark Phase 4 complete; command receipts, provider attempts, warehouse recovery commands, print-agent enrollment, task bridging, and live adapters remain open.
+
+The exception queue deliberately stays separate from Projects tasks. An exception owns operational status and evidence. A later adapter may create or link a Projects task for collaborative work without transferring exception authority to the task module.
+
 ## Delivery Phases
 
 ### Phase 0 - Discovery And Architecture

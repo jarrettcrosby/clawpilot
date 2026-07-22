@@ -3,12 +3,18 @@ import {
   activeOperationsOrganizationId,
   operationsCapabilities,
 } from '@/lib/operations/authorization'
-import type { Address, MockOperationsProofInput, OperationsOrderStatus } from '@/lib/operations/types'
+import type {
+  Address,
+  MockOperationsProofInput,
+  OperationsExceptionStatus,
+  OperationsOrderStatus,
+} from '@/lib/operations/types'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import {
   OperationsRequestError,
   readOperationsWorkspaceFromPostgres,
   runMockOperationsProofFromPostgres,
+  updateOperationsExceptionInPostgres,
 } from '@/lib/persistence/operations'
 import { requireRequestUser } from '@/lib/requestUser'
 
@@ -20,9 +26,13 @@ const MAX_REQUEST_BYTES = 8 * 1024
 const CUSTOMER_GLOBAL_ID = /^ga\d{7}$/
 const PRODUCT_GLOBAL_ID = /^gp\d{7}$/
 const ORDER_GLOBAL_ID = /^gor\d{7}$/
+const EXCEPTION_GLOBAL_ID = /^gex\d{7}$/
 const ORDER_STATUSES = new Set<OperationsOrderStatus>([
   'imported', 'validated', 'held', 'promised', 'reserved', 'planned',
   'released', 'picking', 'packed', 'shipped', 'cancelled', 'exception',
+])
+const EXCEPTION_STATUSES = new Set<OperationsExceptionStatus>([
+  'open', 'acknowledged', 'resolved', 'dismissed',
 ])
 const PROOF_FIELDS = new Set([
   'customerGlobalId', 'productGlobalId', 'externalOrderId', 'orderNumber',
@@ -173,6 +183,10 @@ export async function GET(req: NextRequest) {
     if (statusValue && !ORDER_STATUSES.has(statusValue as OperationsOrderStatus)) {
       requestError('OPERATIONS_STATUS_INVALID', 'Order status is invalid')
     }
+    const exceptionStatusValue = String(req.nextUrl.searchParams.get('exceptionStatus') || '').trim()
+    if (exceptionStatusValue && !EXCEPTION_STATUSES.has(exceptionStatusValue as OperationsExceptionStatus)) {
+      requestError('OPERATIONS_EXCEPTION_STATUS_INVALID', 'Exception status is invalid')
+    }
     const selectedValue = String(req.nextUrl.searchParams.get('order') || '').trim()
     if (selectedValue && !ORDER_GLOBAL_ID.test(selectedValue)) {
       requestError('OPERATIONS_ORDER_INVALID', 'Order is invalid')
@@ -186,6 +200,7 @@ export async function GET(req: NextRequest) {
       capabilities,
       search,
       status: statusValue || null,
+      exceptionStatus: (exceptionStatusValue as OperationsExceptionStatus) || null,
       selectedOrderGlobalId: selectedValue || null,
     })
     return json({ ok: true, operations })
@@ -199,24 +214,46 @@ export async function POST(req: NextRequest) {
     requirePostgres()
     const actor = await requireRequestUser(req)
     const capabilities = operationsCapabilities(actor)
-    if (!capabilities.canManage || !capabilities.canExecute) {
-      return json({
-        ok: false,
-        error: 'You do not have permission to prepare and execute warehouse operations',
-        code: 'OPERATIONS_EXECUTE_REQUIRED',
-      }, 403)
-    }
     const body = await requestBody(req)
-    assertFields(body, new Set(['action', 'proof']), 'OPERATIONS_REQUEST_INVALID', 'Operations command')
-    if (body.action !== 'run-proof-order') {
-      requestError('OPERATIONS_ACTION_INVALID', 'Operations action is invalid')
+    const action = textValue(body.action, 'Operations action', 50)
+    if (action === 'run-proof-order') {
+      if (!capabilities.canManage || !capabilities.canExecute) {
+        return json({
+          ok: false,
+          error: 'You do not have permission to prepare and execute warehouse operations',
+          code: 'OPERATIONS_EXECUTE_REQUIRED',
+        }, 403)
+      }
+      assertFields(body, new Set(['action', 'proof']), 'OPERATIONS_REQUEST_INVALID', 'Operations command')
+      const result = await runMockOperationsProofFromPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        proof: proofValue(body.proof),
+      })
+      return json({ ok: true, capabilities, result }, result.duplicate ? 200 : 201)
     }
-    const result = await runMockOperationsProofFromPostgres({
-      organizationId: activeOperationsOrganizationId(actor),
-      actorEmail: actor.email,
-      proof: proofValue(body.proof),
-    })
-    return json({ ok: true, capabilities, result }, result.duplicate ? 200 : 201)
+    if (action === 'update-exception') {
+      if (!capabilities.canManage) {
+        return json({
+          ok: false,
+          error: 'You do not have permission to manage operations exceptions',
+          code: 'OPERATIONS_MANAGE_REQUIRED',
+        }, 403)
+      }
+      assertFields(body, new Set(['action', 'exceptionGlobalId', 'status']), 'OPERATIONS_REQUEST_INVALID', 'Operations command')
+      const status = textValue(body.status, 'Exception status', 20) as OperationsExceptionStatus
+      if (!EXCEPTION_STATUSES.has(status)) {
+        requestError('OPERATIONS_EXCEPTION_STATUS_INVALID', 'Exception status is invalid')
+      }
+      const result = await updateOperationsExceptionInPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        exceptionGlobalId: globalIdValue(body.exceptionGlobalId, 'Operations exception', EXCEPTION_GLOBAL_ID),
+        status,
+      })
+      return json({ ok: true, capabilities, result })
+    }
+    requestError('OPERATIONS_ACTION_INVALID', 'Operations action is invalid')
   } catch (error) {
     return errorResponse(error)
   }

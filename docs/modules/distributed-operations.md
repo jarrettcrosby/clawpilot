@@ -15,7 +15,20 @@ app_visible: false
 
 Provide native distributed order management, warehouse execution, carrier shipping, and 3PL billing inside ClawPilot. The module serves 3PL operators, retailers, distributors, manufacturers, and fulfillment operators without creating a second application or duplicating CRM, product, identity, audit, task, document, notification, or accounting masters.
 
-This is a **target contract**. It remains `draft` until the delivery gates in the [delivery plan](../architecture/distributed-operations-delivery-plan.md) prove the corresponding behavior. The untracked `0081_distributed_operations_foundation.sql` migration and parallel untracked `app_src/lib/operations` foundation are design/implementation inputs only; tables, types, mocks, and read queries do not establish a working module.
+This document remains the **target contract** for the full module. The first development slice is implemented on `dev`: migration `0081_distributed_operations_foundation.sql`, a tenant-scoped order workbench, a deterministic 20-step mock order-to-ship proof, and a durable exception queue. These features prove PostgreSQL authority and application boundaries; they do not establish a production commerce, carrier, printer, optimizer, warehouse, or accounting provider.
+
+## Current Development Slice
+
+The implemented slice provides:
+
+- Postgres-only operations access scoped to the active workspace and explicit `viewOperations`, `manageOperations`, and execution permissions;
+- CRM organization and `gp` product resolution without cloning customer or catalog masters;
+- idempotent mock order import, reservation, deterministic warehouse planning, cartonization, carrier selection, pick/pack/ship, inventory-ledger evidence, billable facts, domain events, audit, and fulfillment outbox intent;
+- responsive Orders and Exceptions views with permanent `gor` and `gex` identities;
+- audited exception transitions for acknowledge, resolve, dismiss, and reopen, with tenant isolation and retained resolution history;
+- an in-module guide that clearly labels all active providers as mocks.
+
+Production activation remains out of scope until the later delivery gates verify provider credentials, webhook receipts, command receipts, provider attempts, reconciliation, operational health, and an explicitly approved organization cohort.
 
 Normative terms in this document use **must** for an invariant, **should** for the default, and **may** for an allowed option.
 

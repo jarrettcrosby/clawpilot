@@ -14,6 +14,10 @@ export type OperationsOrderStatus =
   | 'cancelled'
   | 'exception'
 
+export type OperationsExceptionSeverity = 'low' | 'medium' | 'high' | 'critical'
+
+export type OperationsExceptionStatus = 'open' | 'acknowledged' | 'resolved' | 'dismissed'
+
 export type Millimeters = {
   length: number
   width: number
@@ -178,6 +182,24 @@ export type OperationsOrderListItem = {
   updatedAt: string
 }
 
+export type OperationsExceptionListItem = {
+  id: string
+  globalId: string
+  exceptionType: string
+  severity: OperationsExceptionSeverity
+  status: OperationsExceptionStatus
+  title: string
+  details: Record<string, unknown>
+  assignedTo: string | null
+  orderGlobalId: string | null
+  orderNumber: string | null
+  customerName: string | null
+  customerGlobalId: string | null
+  createdAt: string
+  updatedAt: string
+  resolvedAt: string | null
+}
+
 export type OperationsOrderDetail = OperationsOrderListItem & {
   externalOrderId: string
   currency: string
@@ -232,6 +254,7 @@ export type OperationsWorkspace = {
   }
   summary: OperationsSummary
   orders: OperationsOrderListItem[]
+  exceptions: OperationsExceptionListItem[]
   selectedOrder: OperationsOrderDetail | null
   warehouses: Array<{ id: string; globalId: string; name: string }>
   catalog: {
@@ -258,4 +281,9 @@ export type MockOperationsProofResult = {
   duplicate: boolean
   trackingNumber: string | null
   steps: string[]
+}
+
+export type OperationsExceptionUpdateResult = {
+  exception: OperationsExceptionListItem
+  changed: boolean
 }
