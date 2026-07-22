@@ -409,7 +409,7 @@ assertIncludes(documentsAdapter, "sourceKey: 'system:pipeline-brief'", 'generate
 assertIncludes(documentsAdapter, "APPLICATION_USER_GUIDE_SOURCE_KEY = 'system:application-user-guide'", 'stable application user guide identity')
 assertIncludes(documentsAdapter, "title: 'ClawPilot User Guide'", 'application user guide document')
 assertIncludes(documentsAdapter, 'ensureApplicationUserGuide(user)', 'active membership user guide refresh')
-for (const moduleName of ['Dashboard', 'Docs', 'Projects', 'Pipeline', 'CRM', 'Accounting', 'POS', 'Links', 'Agents', 'Versions']) {
+for (const moduleName of ['Dashboard', 'Docs', 'Projects', 'Pipeline', 'CRM', 'Accounting', 'POS', 'Operations', 'Links', 'Agents', 'Versions']) {
   assertIncludes(documentsAdapter, `| ${moduleName} |`, `${moduleName} user guide coverage`)
 }
 assertIncludes(documentsAdapter, 'document.content', 'local full-document search')

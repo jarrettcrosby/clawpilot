@@ -287,6 +287,7 @@ test('application user guide is readable and module-linked on mobile', async ({ 
         '| Dashboard | Current work and workspace defaults | [Open Dashboard](/#dashboard) |',
         '| Projects | Boards, tasks, comments, and agent assignment | [Open Projects](/#projects) |',
         '| Pipeline | Opportunities, insights, and sync status | [Open Pipeline](/#pipeline) |',
+        '| Operations | Orders, inventory, fulfillment, and billing evidence | [Open Operations](/#operations) |',
         '',
         '## Projects and Agents',
         '',
@@ -299,6 +300,7 @@ test('application user guide is readable and module-linked on mobile', async ({ 
   await expect(page.getByRole('heading', { name: 'ClawPilot User Guide' })).toBeVisible()
   await expect(page.getByText('Prepared for: Test User')).toBeVisible()
   await expect(page.getByRole('link', { name: 'Open Dashboard' })).toHaveAttribute('href', '/#dashboard')
+  await expect(page.getByRole('link', { name: 'Open Operations' })).toHaveAttribute('href', '/#operations')
   await expect(page.getByText('Use Discuss for questions and Work for durable execution.')).toBeVisible()
   await expectNoHorizontalOverflow(page)
 

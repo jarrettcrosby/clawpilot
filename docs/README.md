@@ -31,6 +31,7 @@ Maps connect topics across folders. The repository uses PARA semantics rather th
 - [CRM Global Identity and synchronization](decisions/0003-crm-global-identity-and-sync.md)
 - [Local-first knowledge retrieval](decisions/0004-local-first-knowledge-retrieval.md)
 - [Multi-workspace user membership](decisions/0005-multi-workspace-membership.md)
+- [Native distributed operations authority and adapter boundaries](decisions/0006-native-distributed-operations-authority.md)
 
 ## Current Contracts
 
@@ -63,6 +64,16 @@ Current product behavior is defined by active module and operating contracts. Op
 - [Sales pipeline EPISCS migration](operations/sales-pipeline-episcs-migration.md)
 - [Release documentation contract](releases/README.md)
 - [ClawPilot identity](brand/clawpilot-identity.md)
+
+### Distributed Operations Design
+
+These documents define the accepted authority boundary and the pre-activation design for DOM, WMS, shipping, and 3PL billing. They do not claim that migration `0081`, provider adapters, operations workers, or warehouse workflows are deployed.
+
+- [Distributed operations integration and gap map](maps/distributed-operations-integration-gap-map.md)
+- [Distributed operations domain and architecture contract](modules/distributed-operations.md)
+- [Distributed operations delivery, migration, and test plan](architecture/distributed-operations-delivery-plan.md)
+- [Distributed operations runbook](operations/distributed-operations-runbook.md)
+- [Native distributed operations authority and adapter boundaries](decisions/0006-native-distributed-operations-authority.md)
 
 ### Authority
 

@@ -33,6 +33,14 @@ app_visible: true
 - [Application Shell and Access](../modules/application-shell-and-access.md): roles, permissions, login history, and security boundaries.
 - [2026-03-20 Stable Build Integrity Outage](../incidents/2026-03-20-stable-build-integrity-outage.md): retained release-safety evidence.
 
+## Distributed Operations Pre-Activation
+
+- [Distributed Operations Runbook](../operations/distributed-operations-runbook.md): target activation, monitoring, reconciliation, incidents, recovery, and rollback.
+- [Distributed Operations Delivery, Migration, and Test Plan](../architecture/distributed-operations-delivery-plan.md): phased gates, migration/cutover strategy, and S01-S25 acceptance.
+- [Distributed Operations Integration and Gap Map](distributed-operations-integration-gap-map.md): current platform reuse, `0081` foundation coverage, and blockers.
+
+These documents remain pre-activation. Existing environment and backup procedures stay authoritative until operations health, scoped activation, and on-call ownership are implemented.
+
 ## Standard Verification Path
 
 1. Run focused tests for the changed boundary.

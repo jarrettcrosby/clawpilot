@@ -1743,9 +1743,11 @@ async function lockCrmMutation(client: PoolClient, key: string) {
 
 export async function archiveCrmRecordInPostgres(input: {
   pipelineId: string
-  entity: 'leads' | 'campaigns'
+  entity: 'leads' | 'interactions' | 'campaigns'
   id: string
   actorEmail: string
+  emitSuiteCrmOutbox?: boolean
+  archiveSource?: 'clawpilot' | 'suitecrm'
 }) {
   return withTransaction(async (client) => {
     const table = ENTITY_TABLE[input.entity]
@@ -1780,7 +1782,12 @@ export async function archiveCrmRecordInPostgres(input: {
       [
         input.pipelineId,
         input.id,
-        JSON.stringify({ archived: true, archivedAt, archivedBy: input.actorEmail }),
+        JSON.stringify({
+          archived: true,
+          archivedAt,
+          archivedBy: input.actorEmail,
+          archivedSource: input.archiveSource || 'clawpilot',
+        }),
         input.actorEmail,
       ],
     )
@@ -1793,7 +1800,7 @@ export async function archiveCrmRecordInPostgres(input: {
          AND status <> 'processing'`,
       [`crm_${input.entity}`, input.id],
     )
-    if (record.suitecrm_id) {
+    if (record.suitecrm_id && input.emitSuiteCrmOutbox !== false) {
       await client.query(
         `INSERT INTO sync_outbox (
            aggregate_type, aggregate_id, operation, target_system, payload,
@@ -1843,7 +1850,8 @@ export async function archiveCrmRecordInPostgres(input: {
         pipelineId: input.pipelineId,
         referenceCode: record.reference_code,
         archivedAt,
-        suiteCrmDeleteQueued: Boolean(record.suitecrm_id),
+        suiteCrmDeleteQueued: Boolean(record.suitecrm_id && input.emitSuiteCrmOutbox !== false),
+        archiveSource: input.archiveSource || 'clawpilot',
         message: `${record.reference_code} archived`,
       },
     }, client)
@@ -3085,6 +3093,7 @@ export async function listCrmRecordsInPostgres(input: {
        opportunity.organization_id, meeting.organization_id
      )
      WHERE interaction.pipeline_id = $1::uuid
+       AND ${activeCrmRecordSql('interaction')}
        AND (NOT $3::boolean OR COALESCE(
        interaction.organization_id, contact.organization_id, lead.organization_id,
        opportunity.organization_id, meeting.organization_id
@@ -3903,7 +3912,7 @@ export async function readCrmSummaryFromPostgres(pipelineId: string): Promise<Cr
         (SELECT count(*) FROM crm_leads lead WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('lead')})::text AS leads,
         (SELECT count(*) FROM crm_opportunities WHERE pipeline_id = $1::uuid)::text AS opportunities,
         (SELECT count(*) FROM crm_meetings WHERE pipeline_id = $1::uuid)::text AS meetings,
-        (SELECT count(*) FROM crm_interactions WHERE pipeline_id = $1::uuid)::text AS interactions,
+        (SELECT count(*) FROM crm_interactions interaction WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('interaction')})::text AS interactions,
         (SELECT count(*)
          FROM crm_interactions interaction
          LEFT JOIN crm_contacts contact ON contact.id = interaction.contact_id
@@ -3911,6 +3920,7 @@ export async function readCrmSummaryFromPostgres(pipelineId: string): Promise<Cr
          LEFT JOIN crm_opportunities opportunity ON opportunity.id = interaction.opportunity_id
          LEFT JOIN crm_meetings meeting ON meeting.id = interaction.meeting_id
          WHERE interaction.pipeline_id = $1::uuid
+           AND ${activeCrmRecordSql('interaction')}
            AND COALESCE(
              interaction.organization_id, contact.organization_id, lead.organization_id,
              opportunity.organization_id, meeting.organization_id
@@ -3925,7 +3935,7 @@ export async function readCrmSummaryFromPostgres(pipelineId: string): Promise<Cr
           UNION ALL SELECT sync_status FROM crm_leads lead WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('lead')}
           UNION ALL SELECT sync_status FROM crm_opportunities WHERE pipeline_id = $1::uuid
           UNION ALL SELECT sync_status FROM crm_meetings WHERE pipeline_id = $1::uuid
-          UNION ALL SELECT sync_status FROM crm_interactions WHERE pipeline_id = $1::uuid
+          UNION ALL SELECT sync_status FROM crm_interactions interaction WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('interaction')}
           UNION ALL SELECT sync_status FROM crm_campaigns campaign WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('campaign')}
         ) records WHERE sync_status IN ('pending', 'syncing'))::text AS pending_sync,
         (SELECT count(*) FROM (
@@ -3935,7 +3945,7 @@ export async function readCrmSummaryFromPostgres(pipelineId: string): Promise<Cr
           UNION ALL SELECT sync_status FROM crm_leads lead WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('lead')}
           UNION ALL SELECT sync_status FROM crm_opportunities WHERE pipeline_id = $1::uuid
           UNION ALL SELECT sync_status FROM crm_meetings WHERE pipeline_id = $1::uuid
-          UNION ALL SELECT sync_status FROM crm_interactions WHERE pipeline_id = $1::uuid
+          UNION ALL SELECT sync_status FROM crm_interactions interaction WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('interaction')}
           UNION ALL SELECT sync_status FROM crm_campaigns campaign WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('campaign')}
         ) records WHERE sync_status = 'failed')::text AS failed_sync
     `,
@@ -4124,7 +4134,8 @@ export async function ensurePipelineCrmReferenceLinks(pipelineId: string) {
          WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('lead')}
        UNION ALL SELECT reference_code, name, 'opportunities', NULL::text FROM crm_opportunities WHERE pipeline_id = $1::uuid
        UNION ALL SELECT reference_code, subject, 'meetings', NULL::text FROM crm_meetings WHERE pipeline_id = $1::uuid
-       UNION ALL SELECT reference_code, subject, 'interactions', NULL::text FROM crm_interactions WHERE pipeline_id = $1::uuid
+       UNION ALL SELECT reference_code, subject, 'interactions', NULL::text FROM crm_interactions interaction
+         WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('interaction')}
        UNION ALL SELECT reference_code, name, 'campaigns', NULL::text FROM crm_campaigns campaign
          WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('campaign')}
      ), owner AS (

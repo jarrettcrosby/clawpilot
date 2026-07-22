@@ -174,6 +174,19 @@ async function mockCrmRecords(page: Page) {
       email: 'organization@example.test',
       emailOptOut: false,
       syncStatus: 'synced',
+    }, {
+      id: '00000000-0000-4000-8000-000000000201',
+      referenceCode: 'ga9753102',
+      shortUrl: null,
+      name: 'Other Organization',
+      parentOrganizationName: 'Acceptance Workspace',
+      relationshipType: 'customer',
+      workspaceOrganizationId: null,
+      accountManager: 'Support Operator',
+      phone: '+1 555 0202',
+      email: 'other-organization@example.test',
+      emailOptOut: false,
+      syncStatus: 'synced',
     }],
     contacts: [{
       id: '00000000-0000-4000-8000-000000000102',
@@ -189,6 +202,21 @@ async function mockCrmRecords(page: Page) {
       jobTitle: 'Mobile Lead',
       email: 'contact@example.test',
       emailOptOut: true,
+      syncStatus: 'synced',
+    }, {
+      id: '00000000-0000-4000-8000-000000000202',
+      referenceCode: 'gc9753102',
+      shortUrl: null,
+      fullName: 'Other Contact',
+      organizationId: '00000000-0000-4000-8000-000000000201',
+      organizationName: 'Other Organization',
+      accountManager: 'Support Operator',
+      ownerUserReferenceCode: 'gu9753102',
+      ownerEmail: 'support@example.test',
+      ownerDisplayName: 'Support Operator',
+      jobTitle: 'Other Lead',
+      email: 'other-contact@example.test',
+      emailOptOut: false,
       syncStatus: 'synced',
     }],
     meetings: [{
@@ -214,7 +242,37 @@ async function mockCrmRecords(page: Page) {
       syncStatus: 'synced',
     }],
     leads: [],
-    opportunities: [],
+    opportunities: [{
+      id: '00000000-0000-4000-8000-000000000108',
+      referenceCode: 'go7654321',
+      shortUrl: null,
+      name: 'Acceptance opportunity',
+      organizationId: '00000000-0000-4000-8000-000000000101',
+      organization: 'Acceptance Organization',
+      stage: 'Qualified Lead',
+      status: 'Open',
+      products: [{
+        id: '00000000-0000-4000-8000-000000000106',
+        referenceCode: 'gp7654321',
+        name: 'Acceptance Product',
+      }],
+      syncStatus: 'synced',
+    }, {
+      id: '00000000-0000-4000-8000-000000000208',
+      referenceCode: 'go9753102',
+      shortUrl: null,
+      name: 'Other opportunity',
+      organizationId: '00000000-0000-4000-8000-000000000201',
+      organization: 'Other Organization',
+      stage: 'Proposal',
+      status: 'Open',
+      products: [{
+        id: '00000000-0000-4000-8000-000000000206',
+        referenceCode: 'gp9753102',
+        name: 'Other Product',
+      }],
+      syncStatus: 'synced',
+    }],
     products: [{
       id: '00000000-0000-4000-8000-000000000106',
       referenceCode: 'gp7654321',
@@ -275,10 +333,10 @@ async function mockCrmRecords(page: Page) {
         entity,
         records: recordsByEntity[entity] || [],
         summary: {
-          organizations: 1,
-          contacts: 1,
+          organizations: 2,
+          contacts: 2,
           leads: 0,
-          opportunities: 0,
+          opportunities: 2,
           products: 1,
           meetings: 1,
           interactions: 1,
@@ -688,6 +746,20 @@ for (const viewport of MOBILE_VIEWPORTS) {
       await expect(drawer.getByLabel('Timezone')).toHaveValue('America/New_York')
       await expect(drawer.getByLabel('Attendee emails')).toHaveValue('contact@example.test')
 
+      await drawer.getByRole('combobox', { name: 'Contact' }).click()
+      await expect(page.getByRole('option', { name: 'Acceptance Contact' })).toBeVisible()
+      await expect(page.getByRole('option', { name: 'Other Contact' })).toHaveCount(0)
+      await page.keyboard.press('Escape')
+
+      await drawer.getByRole('combobox', { name: 'Pipeline opportunity' }).click()
+      await expect(page.getByRole('option', {
+        name: 'Acceptance Product - Acceptance Organization · Qualified Lead · go7654321',
+      })).toBeVisible()
+      await expect(page.getByRole('option', {
+        name: 'Other Product - Other Organization · Proposal · go9753102',
+      })).toHaveCount(0)
+      await page.keyboard.press('Escape')
+
       await drawer.getByRole('button', { name: 'Schedule', exact: true }).click()
       const meetingScheduleDialog = page.getByRole('dialog', { name: 'Schedule meeting' })
       await expectUsableGeometry(meetingScheduleDialog, 'Meeting scheduling dialog', 160, 280)
@@ -697,6 +769,28 @@ for (const viewport of MOBILE_VIEWPORTS) {
       await expect(meetingScheduleDialog.getByLabel('Timezone')).toHaveValue('America/New_York')
       await expect(meetingScheduleDialog.getByLabel('Attendee emails')).toHaveValue('contact@example.test')
       await meetingScheduleDialog.getByRole('button', { name: 'Cancel' }).click()
+      await closeEditor.click()
+
+      await page.getByRole('tab', { name: 'Interactions' }).click()
+      await page.getByRole('cell', { name: 'Acceptance Interaction', exact: true }).click()
+      closeEditor = page.getByRole('button', { name: 'Close editor' })
+      drawer = closeEditor.locator('xpath=ancestor::*[contains(@class,"MuiDrawer-paper")][1]')
+      await expectUsableGeometry(drawer, 'Interaction editor drawer', 160, 280)
+      await expect(drawer.getByRole('button', { name: 'Archive interaction' })).toBeVisible()
+
+      await drawer.getByRole('combobox', { name: 'Contact' }).click()
+      await expect(page.getByRole('option', { name: 'Acceptance Contact' })).toBeVisible()
+      await expect(page.getByRole('option', { name: 'Other Contact' })).toHaveCount(0)
+      await page.keyboard.press('Escape')
+
+      await drawer.getByRole('combobox', { name: 'Pipeline opportunity' }).click()
+      await expect(page.getByRole('option', {
+        name: 'Acceptance Product - Acceptance Organization · Qualified Lead · go7654321',
+      })).toBeVisible()
+      await expect(page.getByRole('option', {
+        name: 'Other Product - Other Organization · Proposal · go9753102',
+      })).toHaveCount(0)
+      await page.keyboard.press('Escape')
       await closeEditor.click()
       await expectNoDocumentOverflow(page)
     })

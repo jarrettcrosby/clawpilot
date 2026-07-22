@@ -28,6 +28,10 @@ ClawPilot is a private operating workspace that connects work boards, pipeline d
 
 The [ClawPilot Identity](../brand/clawpilot-identity.md) contract keeps those surfaces visually and verbally consistent.
 
+## Planned Distributed Operations
+
+[Distributed Operations](../modules/distributed-operations.md) defines the draft native order, inventory, fulfillment, warehouse, shipping, and 3PL billing contract. Its [integration and gap map](distributed-operations-integration-gap-map.md) records which current ClawPilot services can be reused and which capabilities remain unimplemented. This design is not part of the current user journey until its phased gates pass.
+
 ## Cross-Module Paths
 
 - CRM organization, contact, or product -> Global ID -> short link -> ClawPilot editor -> SuiteCRM projection.
@@ -37,6 +41,7 @@ The [ClawPilot Identity](../brand/clawpilot-identity.md) contract keeps those su
 - Release -> Versions entry -> Build Brief -> searchable knowledge catalog.
 - Toast restaurant -> immutable source snapshot -> sanitized POS order/check projection -> daily sales -> reviewable accounting draft.
 - User QuickBooks authorization -> active organization binding -> read-only catalog -> configurable CRM customer/product reconciliation and Toast account mappings.
+- Commerce order -> canonical operations order -> eligible inventory reservation -> fulfillment/package/rate plan -> warehouse execution -> shipment and billable facts (planned).
 
 ## Product Authority
 

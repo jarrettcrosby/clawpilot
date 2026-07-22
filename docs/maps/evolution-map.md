@@ -19,6 +19,14 @@ Read the [Decision Index](../decisions/index.md) for accepted product and archit
 - [Organization-Rooted Tenancy](../decisions/0002-organization-rooted-tenancy.md)
 - [CRM Global Identity and Synchronization](../decisions/0003-crm-global-identity-and-sync.md)
 - [Local-First Knowledge Retrieval](../decisions/0004-local-first-knowledge-retrieval.md)
+- [Native Distributed Operations Authority and Adapter Boundaries](../decisions/0006-native-distributed-operations-authority.md)
+
+## Distributed Operations Design Trail
+
+- The [integration and gap map](distributed-operations-integration-gap-map.md) records current reusable services and unresolved platform/domain gaps.
+- The [domain contract](../modules/distributed-operations.md) defines target state machines, events, security, concurrency, and optimization boundaries.
+- The [delivery plan](../architecture/distributed-operations-delivery-plan.md) maps phased migration and acceptance through stable scenarios S01-S25.
+- The [runbook](../operations/distributed-operations-runbook.md) remains draft until activation, health, reconciliation, and on-call controls exist.
 
 ## What Shipped
 

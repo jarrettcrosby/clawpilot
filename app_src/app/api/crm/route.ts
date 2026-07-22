@@ -517,8 +517,8 @@ export async function PATCH(req: NextRequest) {
 
     if (action === 'archive') {
       const entity = entityValue(body?.entity)
-      if (entity !== 'leads' && entity !== 'campaigns') {
-        throw new Error('Only leads and campaigns can be archived from this workflow')
+      if (entity !== 'leads' && entity !== 'interactions' && entity !== 'campaigns') {
+        throw new Error('Only leads, interactions, and campaigns can be archived from this workflow')
       }
       const result = await archiveCrmRecordInPostgres({
         pipelineId: pipeline.id,

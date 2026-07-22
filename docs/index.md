@@ -29,6 +29,7 @@ This repository is the canonical source for ClawPilot product, engineering, and 
 - [CRM Global Identity and synchronization](decisions/0003-crm-global-identity-and-sync.md)
 - [Local-first knowledge retrieval](decisions/0004-local-first-knowledge-retrieval.md)
 - [Multi-workspace user membership](decisions/0005-multi-workspace-membership.md)
+- [Native distributed operations authority and adapter boundaries](decisions/0006-native-distributed-operations-authority.md)
 
 ## Active Module Contracts
 
@@ -42,6 +43,16 @@ This repository is the canonical source for ClawPilot product, engineering, and 
 - [Agents and execution](modules/agents-and-execution.md)
 - [Knowledge, releases, and checkpoints](modules/knowledge-releases-and-checkpoints.md)
 - [Shared short links](modules/short-links.md)
+
+## Distributed Operations Design
+
+The following set defines the accepted authority boundary and draft implementation/operating contract for DOM, WMS, shipping, and 3PL billing. It is pre-activation design, not shipped product behavior.
+
+- [Distributed operations integration and gap map](maps/distributed-operations-integration-gap-map.md)
+- [Distributed operations domain and architecture contract](modules/distributed-operations.md)
+- [Distributed operations delivery, migration, and test plan](architecture/distributed-operations-delivery-plan.md)
+- [Distributed operations runbook](operations/distributed-operations-runbook.md)
+- [Native distributed operations authority and adapter boundaries](decisions/0006-native-distributed-operations-authority.md)
 
 ## Active Operating Contracts
 

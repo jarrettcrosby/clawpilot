@@ -78,6 +78,15 @@ const users = read('app_src/lib/users.ts')
 assert.ok(users.includes('{ ...OWNER_PERMISSIONS, accessDemo: target.permissions.accessDemo }'))
 assert.ok(users.includes('{ ...MEMBER_PERMISSIONS, accessDemo: target.permissions.accessDemo }'))
 
+const workspaceMemberships = read('app_src/lib/workspaceMemberships.ts')
+for (const permission of [
+  'viewOperations: true',
+  'manageOperations: false',
+  'executeWarehouse: false',
+]) {
+  assert.ok(workspaceMemberships.includes(permission), `demo workspace must set ${permission}`)
+}
+
 const seed = read('scripts/seed-demo-environment.mjs')
 assert.ok(seed.includes("'ClawPilot Demo Company'"))
 assert.ok(seed.includes('is_demo'))

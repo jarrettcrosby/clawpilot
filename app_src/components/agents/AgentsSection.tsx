@@ -665,7 +665,16 @@ export default function AgentsSection() {
   ].filter(Boolean).join(' | ')
 
   return (
-    <Box p={shortLandscape ? 1 : { xs: 2, md: 3 }}>
+    <Box
+      p={shortLandscape ? 1 : { xs: 2, md: 3 }}
+      sx={shortLandscape ? {
+        height: '100%',
+        minHeight: 0,
+        overflowY: 'auto',
+        WebkitOverflowScrolling: 'touch',
+        pb: 'calc(env(safe-area-inset-bottom) + 60px)',
+      } : undefined}
+    >
       <Stack direction="row" justifyContent="space-between" spacing={shortLandscape ? 0.75 : 1.5} mb={shortLandscape ? 0.75 : 2} alignItems="center">
         <Box>
           <Typography variant="h5" fontWeight={700} color="text.primary" sx={shortLandscape ? { fontSize: '1rem' } : undefined}>Agents</Typography>
