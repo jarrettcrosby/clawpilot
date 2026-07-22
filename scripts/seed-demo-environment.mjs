@@ -98,6 +98,10 @@ async function main() {
       [ROOT_ORGANIZATION_ID],
     )
     await client.query(
+      `DELETE FROM operations_activation_scopes WHERE organization_id = $1::uuid`,
+      [ROOT_ORGANIZATION_ID],
+    )
+    await client.query(
       `DELETE FROM pipeline_spaces WHERE workspace_organization_id = $1::uuid`,
       [ROOT_ORGANIZATION_ID],
     )
@@ -431,6 +435,17 @@ async function main() {
       `INSERT INTO pipeline_space_members (pipeline_id, user_email, access_role, shared_by, created_at, updated_at)
        VALUES ($1::uuid, $2, 'editor', $2, $3::timestamptz, $3::timestamptz)`,
       [PIPELINE_ID, DEMO_EMAIL, dataset.generatedAt],
+    )
+    await client.query(
+      `INSERT INTO operations_activation_scopes (
+         organization_id, data_pipeline_id, state, revision, reason, updated_by,
+         created_at, updated_at
+       ) VALUES (
+         $1::uuid, $2::uuid, 'shadow', 1,
+         'Synthetic demo projection managed by the idempotent demo seed',
+         $3, $4::timestamptz, $4::timestamptz
+       )`,
+      [ROOT_ORGANIZATION_ID, PIPELINE_ID, DEMO_EMAIL, dataset.generatedAt],
     )
     await client.query(
       `INSERT INTO project_boards (
