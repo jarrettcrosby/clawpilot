@@ -25,6 +25,8 @@ type PostingBatchStatus =
   | 'failed'
   | 'cancelled'
 
+const EXTERNAL_POSTING_RECONCILIATION_STATUSES = new Set(['ready', 'orders_only'])
+
 type DraftRow = {
   id: string
   restaurant_guid: string
@@ -851,10 +853,10 @@ export async function recordExternalPostingInPostgres(input: {
         409,
       )
     }
-    if (draft.reconciliation_status !== 'ready') {
+    if (!EXTERNAL_POSTING_RECONCILIATION_STATUSES.has(draft.reconciliation_status)) {
       throw new PosAccountingPostingError(
         'POS_ACCOUNTING_EXTERNAL_EVIDENCE_INCOMPLETE',
-        'Resolve the POS source reconciliation before recording external posting evidence',
+        'External posting acknowledgment requires complete order evidence without a source variance',
         409,
       )
     }
@@ -952,6 +954,7 @@ export async function recordExternalPostingInPostgres(input: {
         journalEntryId,
         cancelledClawPilotBatchId: cancelledBatchId,
         postingOrigin: 'external',
+        sourceReconciliationStatus: draft.reconciliation_status,
       },
     }, client)
     return {
@@ -962,6 +965,7 @@ export async function recordExternalPostingInPostgres(input: {
       providerName,
       salesReceiptId,
       journalEntryId,
+      sourceReconciliationStatus: draft.reconciliation_status,
     }
   })
 }
@@ -1008,6 +1012,7 @@ export async function recordMatchedExternalResultsInPostgres(input: {
     const receipt = rows.find((row) => row.expected.entityType === 'SalesReceipt')
     const journal = rows.find((row) => row.expected.entityType === 'JournalEntry')
     const accepted = rows.length === 2
+      && EXTERNAL_POSTING_RECONCILIATION_STATUSES.has(receipt?.expected.draft.reconciliationStatus || '')
       && receipt?.match.status === 'matched'
       && journal?.match.status === 'matched'
       && receipt.comparison?.status === 'match'

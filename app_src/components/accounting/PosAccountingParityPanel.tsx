@@ -415,6 +415,7 @@ function externalPostingEvidence(rows: DraftParityRow[], draftId: string) {
   const receipt = draftRows.find((row) => row.expected.entityType === 'SalesReceipt')
   const journal = draftRows.find((row) => row.expected.entityType === 'JournalEntry')
   const eligible = draftRows.length === 2
+    && ['ready', 'orders_only'].includes(receipt?.expected.draft.reconciliationStatus || '')
     && receipt?.match.status === 'matched'
     && journal?.match.status === 'matched'
     && receipt.comparison?.status === 'match'
