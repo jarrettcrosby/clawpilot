@@ -71,11 +71,9 @@ type OperationsPayload = {
 
 type ProofForm = {
   customerGlobalId: string
-  productGlobalId: string
+  lines: ProofFormLine[]
   externalOrderId: string
   orderNumber: string
-  quantity: string
-  openingQuantity: string
   requestedDeliveryAt: string
   name: string
   line1: string
@@ -84,6 +82,13 @@ type ProofForm = {
   region: string
   postalCode: string
   country: string
+}
+
+type ProofFormLine = {
+  id: string
+  productGlobalId: string
+  quantity: string
+  openingQuantity: string
 }
 
 const ORDER_STATUSES: Array<{ value: '' | OperationsOrderStatus; label: string }> = [
@@ -139,11 +144,14 @@ function newProofForm(): ProofForm {
   const token = Date.now().toString().slice(-9)
   return {
     customerGlobalId: '',
-    productGlobalId: '',
+    lines: [{
+      id: `line-${token}-1`,
+      productGlobalId: '',
+      quantity: '2',
+      openingQuantity: '12',
+    }],
     externalOrderId: `mock-${token}`,
     orderNumber: `PROOF-${token}`,
-    quantity: '2',
-    openingQuantity: '12',
     requestedDeliveryAt: localDateTime(7),
     name: '',
     line1: '',
@@ -535,7 +543,7 @@ export default function OperationsSection() {
   const openProof = () => {
     const next = newProofForm()
     next.customerGlobalId = workspace?.catalog.customers[0]?.globalId || ''
-    next.productGlobalId = workspace?.catalog.products[0]?.globalId || ''
+    next.lines[0].productGlobalId = workspace?.catalog.products[0]?.globalId || ''
     next.name = workspace?.catalog.customers[0]?.name || ''
     setProof(next)
     setProofResult(null)
@@ -569,8 +577,38 @@ export default function OperationsSection() {
     setDrawerOpen(true)
   }
 
-  const updateProof = (field: keyof ProofForm, value: string) => {
+  const updateProof = (field: Exclude<keyof ProofForm, 'lines'>, value: string) => {
     setProof((current) => ({ ...current, [field]: value }))
+  }
+
+  const updateProofLine = (id: string, field: keyof Omit<ProofFormLine, 'id'>, value: string) => {
+    setProof((current) => ({
+      ...current,
+      lines: current.lines.map((line) => line.id === id ? { ...line, [field]: value } : line),
+    }))
+  }
+
+  const addProofLine = () => {
+    setProof((current) => {
+      const selected = new Set(current.lines.map((line) => line.productGlobalId))
+      const productGlobalId = workspace?.catalog.products.find((item) => !selected.has(item.globalId))?.globalId || ''
+      if (!productGlobalId || current.lines.length >= 25) return current
+      return {
+        ...current,
+        lines: [...current.lines, {
+          id: `line-${Date.now()}-${current.lines.length + 1}`,
+          productGlobalId,
+          quantity: '1',
+          openingQuantity: '12',
+        }],
+      }
+    })
+  }
+
+  const removeProofLine = (id: string) => {
+    setProof((current) => current.lines.length === 1
+      ? current
+      : { ...current, lines: current.lines.filter((line) => line.id !== id) })
   }
 
   const submitProof = async (event: FormEvent) => {
@@ -579,11 +617,13 @@ export default function OperationsSection() {
     setError('')
     const body: MockOperationsProofInput = {
       customerGlobalId: proof.customerGlobalId,
-      productGlobalId: proof.productGlobalId,
+      lines: proof.lines.map((line) => ({
+        productGlobalId: line.productGlobalId,
+        quantity: Number(line.quantity),
+        openingQuantity: Number(line.openingQuantity),
+      })),
       externalOrderId: proof.externalOrderId,
       orderNumber: proof.orderNumber,
-      quantity: Number(proof.quantity),
-      openingQuantity: Number(proof.openingQuantity),
       requestedDeliveryAt: new Date(proof.requestedDeliveryAt).toISOString(),
       shipTo: {
         name: proof.name,
@@ -958,17 +998,87 @@ export default function OperationsSection() {
             ) : (
               <Stack spacing={2.5}>
                 <Alert severity="warning" icon={<ErrorOutlineRounded />}>This command writes a complete mock order-to-ship proof into the active organization.</Alert>
+                <Stack spacing={1.25}>
+                  <Stack direction="row" alignItems="center" justifyContent="space-between" gap={1}>
+                    <Box>
+                      <Typography variant="subtitle2" fontWeight={700}>Order products</Typography>
+                      <Typography variant="caption" color="text.secondary">Add every product and quantity required by this order.</Typography>
+                    </Box>
+                    <Button
+                      size="small"
+                      startIcon={<AddRounded />}
+                      onClick={addProofLine}
+                      disabled={proof.lines.length >= Math.min(25, workspace?.catalog.products.length || 0)}
+                    >
+                      Add product
+                    </Button>
+                  </Stack>
+                  {proof.lines.map((line, index) => {
+                    const selectedByOtherLine = new Set(proof.lines
+                      .filter((candidate) => candidate.id !== line.id)
+                      .map((candidate) => candidate.productGlobalId))
+                    return (
+                      <Box
+                        key={line.id}
+                        sx={{
+                          display: 'grid',
+                          gridTemplateColumns: { xs: 'minmax(0, 1fr) 40px', sm: 'minmax(220px, 2fr) minmax(110px, 0.75fr) minmax(140px, 1fr) 40px' },
+                          gap: 1,
+                          alignItems: 'center',
+                        }}
+                      >
+                        <TextField
+                          select
+                          required
+                          label={`Product ${index + 1}`}
+                          value={line.productGlobalId}
+                          onChange={(event) => updateProofLine(line.id, 'productGlobalId', event.target.value)}
+                          sx={{ gridColumn: { xs: '1 / 2', sm: 'auto' } }}
+                        >
+                          {workspace?.catalog.products
+                            .filter((item) => item.globalId === line.productGlobalId || !selectedByOtherLine.has(item.globalId))
+                            .map((item) => <MenuItem key={item.globalId} value={item.globalId}>{item.name}{item.sku ? ` · ${item.sku}` : ''}</MenuItem>)}
+                        </TextField>
+                        <TextField
+                          required
+                          type="number"
+                          label="Quantity"
+                          value={line.quantity}
+                          onChange={(event) => updateProofLine(line.id, 'quantity', event.target.value)}
+                          inputProps={{ min: 1, max: 1000, step: 1 }}
+                          sx={{ gridColumn: { xs: '1 / 2', sm: 'auto' } }}
+                        />
+                        <TextField
+                          required
+                          type="number"
+                          label="Opening inventory"
+                          value={line.openingQuantity}
+                          onChange={(event) => updateProofLine(line.id, 'openingQuantity', event.target.value)}
+                          inputProps={{ min: 1, max: 100000, step: 1 }}
+                          sx={{ gridColumn: { xs: '1 / 2', sm: 'auto' } }}
+                        />
+                        <Tooltip title={proof.lines.length === 1 ? 'An order needs at least one product' : 'Remove product'}>
+                          <span>
+                            <IconButton
+                              aria-label={`Remove product ${index + 1}`}
+                              onClick={() => removeProofLine(line.id)}
+                              disabled={proof.lines.length === 1}
+                              sx={{ width: 40, height: 40 }}
+                            >
+                              <CloseRounded />
+                            </IconButton>
+                          </span>
+                        </Tooltip>
+                      </Box>
+                    )
+                  })}
+                </Stack>
                 <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', sm: 'repeat(2, minmax(0, 1fr))' }, gap: 1.5 }}>
                   <TextField select required label="CRM customer" value={proof.customerGlobalId} onChange={(event) => { updateProof('customerGlobalId', event.target.value); const customer = workspace?.catalog.customers.find((item) => item.globalId === event.target.value); if (customer) updateProof('name', customer.name) }}>
                     {workspace?.catalog.customers.map((item) => <MenuItem key={item.globalId} value={item.globalId}>{item.name} · {item.globalId}</MenuItem>)}
                   </TextField>
-                  <TextField select required label="CRM product" value={proof.productGlobalId} onChange={(event) => updateProof('productGlobalId', event.target.value)}>
-                    {workspace?.catalog.products.map((item) => <MenuItem key={item.globalId} value={item.globalId}>{item.name}{item.sku ? ` · ${item.sku}` : ''}</MenuItem>)}
-                  </TextField>
                   <TextField required label="External order ID" value={proof.externalOrderId} onChange={(event) => updateProof('externalOrderId', event.target.value)} inputProps={{ maxLength: 120 }} />
                   <TextField required label="Order number" value={proof.orderNumber} onChange={(event) => updateProof('orderNumber', event.target.value)} inputProps={{ maxLength: 100 }} />
-                  <TextField required type="number" label="Quantity" value={proof.quantity} onChange={(event) => updateProof('quantity', event.target.value)} inputProps={{ min: 1, max: 1000, step: 1 }} />
-                  <TextField required type="number" label="Opening inventory" value={proof.openingQuantity} onChange={(event) => updateProof('openingQuantity', event.target.value)} inputProps={{ min: 1, max: 100000, step: 1 }} />
                   <TextField required type="datetime-local" label="Requested delivery" value={proof.requestedDeliveryAt} onChange={(event) => updateProof('requestedDeliveryAt', event.target.value)} InputLabelProps={{ shrink: true }} />
                   <TextField required label="Ship-to name" value={proof.name || proofCustomer?.name || ''} onChange={(event) => updateProof('name', event.target.value)} inputProps={{ maxLength: 120 }} />
                   <TextField required label="Address" value={proof.line1} onChange={(event) => updateProof('line1', event.target.value)} inputProps={{ maxLength: 160 }} />

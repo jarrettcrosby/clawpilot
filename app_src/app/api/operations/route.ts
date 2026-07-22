@@ -6,6 +6,7 @@ import {
 import type {
   Address,
   MockOperationsProofInput,
+  MockOperationsProofLineInput,
   OperationsActivationState,
   OperationsExceptionStatus,
   OperationsOrderStatus,
@@ -40,9 +41,10 @@ const ACTIVATION_STATES = new Set<OperationsActivationState>([
   'disabled', 'shadow', 'read_only', 'active', 'frozen',
 ])
 const PROOF_FIELDS = new Set([
-  'customerGlobalId', 'productGlobalId', 'externalOrderId', 'orderNumber',
+  'customerGlobalId', 'lines', 'productGlobalId', 'externalOrderId', 'orderNumber',
   'quantity', 'openingQuantity', 'requestedDeliveryAt', 'shipTo',
 ])
+const PROOF_LINE_FIELDS = new Set(['productGlobalId', 'quantity', 'openingQuantity'])
 const ADDRESS_FIELDS = new Set(['name', 'line1', 'line2', 'city', 'region', 'postalCode', 'country'])
 
 function json(payload: Record<string, unknown>, status = 200) {
@@ -120,16 +122,51 @@ function addressValue(value: unknown): Address {
   }
 }
 
+function proofLinesValue(input: Record<string, unknown>): MockOperationsProofLineInput[] {
+  const hasLines = input.lines !== undefined
+  const hasLegacyLine = input.productGlobalId !== undefined
+    || input.quantity !== undefined
+    || input.openingQuantity !== undefined
+  if (hasLines && hasLegacyLine) {
+    requestError('OPERATIONS_REQUEST_INVALID', 'Use either proof order lines or the legacy single product fields')
+  }
+
+  const rawLines = hasLines
+    ? input.lines
+    : [{
+        productGlobalId: input.productGlobalId,
+        quantity: input.quantity,
+        openingQuantity: input.openingQuantity,
+      }]
+  if (!Array.isArray(rawLines) || rawLines.length < 1 || rawLines.length > 25) {
+    requestError('OPERATIONS_REQUEST_INVALID', 'Proof order must include from 1 to 25 product lines')
+  }
+
+  const seen = new Set<string>()
+  return rawLines.map((value, index) => {
+    const line = record(value, 'OPERATIONS_REQUEST_INVALID', `Proof order line ${index + 1}`)
+    assertFields(line, PROOF_LINE_FIELDS, 'OPERATIONS_REQUEST_INVALID', `Proof order line ${index + 1}`)
+    const productGlobalId = globalIdValue(line.productGlobalId, `Product on line ${index + 1}`, PRODUCT_GLOBAL_ID)
+    if (seen.has(productGlobalId)) {
+      requestError('OPERATIONS_REQUEST_INVALID', 'Each product may appear only once on a proof order')
+    }
+    seen.add(productGlobalId)
+    return {
+      productGlobalId,
+      quantity: integerValue(line.quantity, `Quantity on line ${index + 1}`, 1, 1_000),
+      openingQuantity: integerValue(line.openingQuantity, `Opening inventory on line ${index + 1}`, 1, 100_000),
+    }
+  })
+}
+
 function proofValue(value: unknown): MockOperationsProofInput {
   const input = record(value, 'OPERATIONS_REQUEST_INVALID', 'Proof order')
   assertFields(input, PROOF_FIELDS, 'OPERATIONS_REQUEST_INVALID', 'Proof order')
   return {
     customerGlobalId: globalIdValue(input.customerGlobalId, 'CRM customer', CUSTOMER_GLOBAL_ID),
-    productGlobalId: globalIdValue(input.productGlobalId, 'CRM product', PRODUCT_GLOBAL_ID),
+    lines: proofLinesValue(input),
     externalOrderId: textValue(input.externalOrderId, 'External order ID', 120),
     orderNumber: textValue(input.orderNumber, 'Order number', 100),
-    quantity: integerValue(input.quantity, 'Quantity', 1, 1_000),
-    openingQuantity: integerValue(input.openingQuantity, 'Opening inventory', 1, 100_000),
     requestedDeliveryAt: requestedDeliveryValue(input.requestedDeliveryAt),
     shipTo: addressValue(input.shipTo),
   }

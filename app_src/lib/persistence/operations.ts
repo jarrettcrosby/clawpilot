@@ -23,6 +23,7 @@ import type {
   CommerceCustomerResolution,
   CommerceOrderInput,
   MockOperationsProofInput,
+  MockOperationsProofLineInput,
   MockOperationsProofResult,
   OperationsActivationState,
   OperationsActivationUpdateResult,
@@ -117,7 +118,7 @@ type ProofConfiguration = {
   warehouse: IdRow & { name: string; address: Record<string, unknown> }
   location: IdRow
   pool: IdRow
-  position: PositionRow
+  positions: Map<string, PositionRow>
   contractVersion: IdRow
   directives: PricingDirective[]
   printer: IdRow
@@ -750,7 +751,7 @@ async function ensureProofConfiguration(
     organizationId: string
     pipeline: PipelineRow
     customer: CustomerRow
-    product: ProductRow
+    products: ProductRow[]
     actorEmail: string
     currency: string
   },
@@ -841,47 +842,50 @@ async function ensureProofConfiguration(
     [input.organizationId, pool.id, input.pipeline.id, input.customer.id, input.actorEmail],
   )
 
-  await client.query(
-    `INSERT INTO operations_product_mappings (
-       organization_id, integration_account_id, pipeline_id, product_id,
-       channel_sku, external_product_id, active, created_by
-     ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, true, $7)
-     ON CONFLICT (organization_id, integration_account_id, channel_sku)
-     DO UPDATE SET pipeline_id = EXCLUDED.pipeline_id, product_id = EXCLUDED.product_id,
-       external_product_id = EXCLUDED.external_product_id, active = true, updated_at = now()`,
-    [
-      input.organizationId,
-      integration.id,
-      input.pipeline.id,
-      input.product.id,
-      input.product.sku || input.product.reference_code,
-      input.product.reference_code,
-      input.actorEmail,
-    ],
-  )
+  const positions = new Map<string, PositionRow>()
+  for (const product of [...input.products].sort((left, right) => left.id.localeCompare(right.id))) {
+    await client.query(
+      `INSERT INTO operations_product_mappings (
+         organization_id, integration_account_id, pipeline_id, product_id,
+         channel_sku, external_product_id, active, created_by
+       ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, true, $7)
+       ON CONFLICT (organization_id, integration_account_id, channel_sku)
+       DO UPDATE SET pipeline_id = EXCLUDED.pipeline_id, product_id = EXCLUDED.product_id,
+         external_product_id = EXCLUDED.external_product_id, active = true, updated_at = now()`,
+      [
+        input.organizationId,
+        integration.id,
+        input.pipeline.id,
+        product.id,
+        product.sku || product.reference_code,
+        product.reference_code,
+        input.actorEmail,
+      ],
+    )
 
-  const positionInsert = await client.query<IdRow>(
-    `INSERT INTO operations_inventory_positions (
-       organization_id, pipeline_id, warehouse_id, location_id, pool_id, product_id
-     ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6::uuid)
-     ON CONFLICT (organization_id, warehouse_id, location_id, pool_id, product_id, lot_code)
-     DO UPDATE SET updated_at = operations_inventory_positions.updated_at
-     RETURNING id::text, global_id`,
-    [input.organizationId, input.pipeline.id, warehouse.id, location.id, pool.id, input.product.id],
-  )
-  const positionResult = await client.query<PositionRow>(
-    `SELECT position.id::text, position.global_id,
-            position.warehouse_id::text, warehouse.global_id AS warehouse_global_id,
-            warehouse.name AS warehouse_name, position.location_id::text,
-            position.on_hand_quantity::text, position.reserved_quantity::text
-     FROM operations_inventory_positions position
-     JOIN operations_warehouses warehouse
-       ON warehouse.organization_id = position.organization_id AND warehouse.id = position.warehouse_id
-     WHERE position.organization_id = $1::uuid AND position.id = $2::uuid
-     FOR UPDATE OF position`,
-    [input.organizationId, positionInsert.rows[0].id],
-  )
-  const position = positionResult.rows[0]
+    const positionInsert = await client.query<IdRow>(
+      `INSERT INTO operations_inventory_positions (
+         organization_id, pipeline_id, warehouse_id, location_id, pool_id, product_id
+       ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6::uuid)
+       ON CONFLICT (organization_id, warehouse_id, location_id, pool_id, product_id, lot_code)
+       DO UPDATE SET updated_at = operations_inventory_positions.updated_at
+       RETURNING id::text, global_id`,
+      [input.organizationId, input.pipeline.id, warehouse.id, location.id, pool.id, product.id],
+    )
+    const positionResult = await client.query<PositionRow>(
+      `SELECT position.id::text, position.global_id,
+              position.warehouse_id::text, warehouse.global_id AS warehouse_global_id,
+              warehouse.name AS warehouse_name, position.location_id::text,
+              position.on_hand_quantity::text, position.reserved_quantity::text
+       FROM operations_inventory_positions position
+       JOIN operations_warehouses warehouse
+         ON warehouse.organization_id = position.organization_id AND warehouse.id = position.warehouse_id
+       WHERE position.organization_id = $1::uuid AND position.id = $2::uuid
+       FOR UPDATE OF position`,
+      [input.organizationId, positionInsert.rows[0].id],
+    )
+    positions.set(product.id, positionResult.rows[0])
+  }
 
   const contractName = `Mock proof fulfillment ${input.currency}`
   const contractResult = await client.query<IdRow>(
@@ -975,7 +979,7 @@ async function ensureProofConfiguration(
     [input.organizationId, JSON.stringify({ printerGlobalId: printer.global_id }), input.actorEmail],
   )
 
-  return { integration, warehouse, location, pool, position, contractVersion, directives, printer }
+  return { integration, warehouse, location, pool, positions, contractVersion, directives, printer }
 }
 
 async function transitionOrder(
@@ -1050,7 +1054,7 @@ async function prepareAndReserveInventory(
         onHand,
         reserved,
         input.order.global_id,
-        `${input.order.global_id}:opening-balance`,
+        `${input.order.global_id}:${input.orderLine.global_id}:opening-balance`,
         input.actorEmail,
       ],
     )
@@ -1085,7 +1089,7 @@ async function prepareAndReserveInventory(
       input.orderLine.id,
       input.position.id,
       input.quantity,
-      `${input.order.global_id}:reservation`,
+      `${input.order.global_id}:${input.orderLine.global_id}:reservation`,
       input.actorEmail,
     ],
   )
@@ -1102,7 +1106,7 @@ async function prepareAndReserveInventory(
       onHand,
       reserved,
       input.order.global_id,
-      `${input.order.global_id}:reservation-ledger`,
+      `${input.order.global_id}:${input.orderLine.global_id}:reservation-ledger`,
       input.actorEmail,
     ],
   )
@@ -1165,7 +1169,7 @@ async function consumeReservedInventory(
       onHand,
       reserved,
       input.order.global_id,
-      `${input.order.global_id}:shipment-ledger`,
+      `${input.order.global_id}:${input.reservation.global_id}:shipment-ledger`,
       input.actorEmail,
     ],
   )
@@ -1882,6 +1886,40 @@ async function completedProofResult(
   }
 }
 
+function canonicalProofLines(proof: MockOperationsProofInput): MockOperationsProofLineInput[] {
+  const suppliedLines = proof.lines?.length
+    ? proof.lines
+    : [{
+        productGlobalId: proof.productGlobalId || '',
+        quantity: Number(proof.quantity),
+        openingQuantity: Number(proof.openingQuantity),
+      }]
+  if (suppliedLines.length < 1 || suppliedLines.length > 25) {
+    throw new OperationsRequestError(
+      'OPERATIONS_ORDER_LINES_INVALID',
+      'A proof order must contain from 1 to 25 product lines',
+    )
+  }
+  const seen = new Set<string>()
+  return suppliedLines.map((line) => {
+    const productGlobalId = String(line.productGlobalId || '').trim()
+    if (!/^gp\d{7}$/.test(productGlobalId)) {
+      throw new OperationsRequestError('OPERATIONS_PRODUCT_NOT_FOUND', 'Select an active CRM product from the active workspace', 404)
+    }
+    if (seen.has(productGlobalId)) {
+      throw new OperationsRequestError('OPERATIONS_ORDER_LINES_INVALID', 'Each product may appear only once on an order')
+    }
+    seen.add(productGlobalId)
+    const quantity = assertPositiveQuantity(line.quantity)
+    const openingQuantity = assertPositiveQuantity(line.openingQuantity)
+    if (!Number.isSafeInteger(quantity) || quantity > 1_000
+      || !Number.isSafeInteger(openingQuantity) || openingQuantity > 100_000) {
+      throw new OperationsRequestError('OPERATIONS_ORDER_LINES_INVALID', 'Order quantities are outside the supported range')
+    }
+    return { productGlobalId, quantity, openingQuantity }
+  })
+}
+
 export async function runMockOperationsProofFromPostgres(input: {
   organizationId: string
   actorEmail: string
@@ -1890,12 +1928,21 @@ export async function runMockOperationsProofFromPostgres(input: {
   const organizationId = requireOrganizationId(input.organizationId)
   const actorEmail = String(input.actorEmail || '').trim().toLowerCase()
   if (!actorEmail) throw new OperationsRequestError('OPERATIONS_ACTOR_REQUIRED', 'A signed-in user is required', 401)
+  const proofLines = canonicalProofLines(input.proof)
+  const canonicalProof: MockOperationsProofInput = {
+    customerGlobalId: input.proof.customerGlobalId,
+    externalOrderId: input.proof.externalOrderId,
+    orderNumber: input.proof.orderNumber,
+    lines: proofLines,
+    requestedDeliveryAt: input.proof.requestedDeliveryAt,
+    shipTo: input.proof.shipTo,
+  }
 
   const command = await prepareCommandReceipt({
     organizationId,
     commandType: 'run_mock_operations_proof',
     idempotencyKey: `mock-commerce:${input.proof.externalOrderId}`,
-    requestHash: commandRequestHash(input.proof),
+    requestHash: commandRequestHash(canonicalProof),
     actorEmail,
   })
   if (command.completed) {
@@ -1922,9 +1969,14 @@ export async function runMockOperationsProofFromPostgres(input: {
       owner_email: activation.pipeline_owner_email,
     }
     const customer = await resolveCustomer(client, pipeline.id, input.proof.customerGlobalId)
-    const product = await resolveProduct(client, pipeline.id, input.proof.productGlobalId)
-    const quantity = assertPositiveQuantity(input.proof.quantity)
-    const openingQuantity = Math.max(0, assertPositiveQuantity(input.proof.openingQuantity))
+    const products = new Map<string, ProductRow>()
+    for (const proofLine of proofLines) {
+      products.set(
+        proofLine.productGlobalId,
+        await resolveProduct(client, pipeline.id, proofLine.productGlobalId),
+      )
+    }
+    const totalQuantity = proofLines.reduce((sum, line) => sum + line.quantity, 0)
     const currency = assertCurrency('USD')
     const requestedDeliveryAt = new Date(input.proof.requestedDeliveryAt)
     if (Number.isNaN(requestedDeliveryAt.getTime())) {
@@ -1933,6 +1985,10 @@ export async function runMockOperationsProofFromPostgres(input: {
     const commerce = new MockCommerceAdapter()
     const carrier = new MockCarrierAdapter()
     const printerAdapter = new MockPrintAdapter()
+    const proofLineByExternalId = new Map(proofLines.map((proofLine, index) => [
+      `${input.proof.externalOrderId}:${index + 1}`,
+      proofLine,
+    ]))
     const normalized: CommerceOrderInput = commerce.normalizeOrder({
       provider: 'mock-commerce',
       externalOrderId: input.proof.externalOrderId,
@@ -1941,22 +1997,26 @@ export async function runMockOperationsProofFromPostgres(input: {
       currency,
       requestedDeliveryAt: requestedDeliveryAt.toISOString(),
       shipTo: input.proof.shipTo,
-      lines: [{
-        externalLineId: `${input.proof.externalOrderId}:1`,
-        channelSku: product.sku || product.reference_code,
-        description: product.name,
-        quantity,
-        unitPriceMinor: moneyMinorFromDecimal(product.price),
-        weightGrams: 350,
-        dimensionsMm: { length: 220, width: 160, height: 90 },
-      }],
-      sourcePayload: { proof: true },
+      lines: proofLines.map((proofLine, index) => {
+        const product = products.get(proofLine.productGlobalId)
+        if (!product) throw new Error('OPERATIONS_PRODUCT_RESOLUTION_MISSING')
+        return {
+          externalLineId: `${input.proof.externalOrderId}:${index + 1}`,
+          channelSku: product.sku || product.reference_code,
+          description: product.name,
+          quantity: proofLine.quantity,
+          unitPriceMinor: moneyMinorFromDecimal(product.price),
+          weightGrams: 350,
+          dimensionsMm: { length: 220, width: 160, height: 90 },
+        }
+      }),
+      sourcePayload: { proof: true, lineCount: proofLines.length },
     })
     const configuration = await ensureProofConfiguration(client, {
       organizationId,
       pipeline,
       customer,
-      product,
+      products: [...products.values()],
       actorEmail,
       currency,
     })
@@ -2044,29 +2104,49 @@ export async function runMockOperationsProofFromPostgres(input: {
       },
     })
 
-    const line = normalized.lines[0]
-    const orderLineResult = await client.query<IdRow>(
-      `INSERT INTO operations_order_lines (
-         organization_id, order_id, pipeline_id, product_id, external_line_id,
-         channel_sku, description, quantity, unit_price_minor, weight_grams, dimensions_mm
-       ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5,
-         $6, $7, $8, $9, $10, $11::jsonb)
-       RETURNING id::text, global_id`,
-      [
-        organizationId,
-        order.id,
-        pipeline.id,
-        product.id,
-        line.externalLineId,
-        line.channelSku,
-        line.description,
-        line.quantity,
-        line.unitPriceMinor,
-        line.weightGrams,
-        JSON.stringify(line.dimensionsMm),
-      ],
-    )
-    const orderLine = orderLineResult.rows[0]
+    const fulfillmentLines: Array<{
+      orderLine: IdRow
+      product: ProductRow
+      position: PositionRow
+      quantity: number
+      openingQuantity: number
+    }> = []
+    for (const line of normalized.lines) {
+      const proofLine = proofLineByExternalId.get(line.externalLineId)
+      if (!proofLine) throw new Error('OPERATIONS_ORDER_LINE_RESOLUTION_MISSING')
+      const product = products.get(proofLine.productGlobalId)
+      if (!product) throw new Error('OPERATIONS_PRODUCT_RESOLUTION_MISSING')
+      const position = configuration.positions.get(product.id)
+      if (!position) throw new Error('OPERATIONS_INVENTORY_POSITION_MISSING')
+      const orderLineResult = await client.query<IdRow>(
+        `INSERT INTO operations_order_lines (
+           organization_id, order_id, pipeline_id, product_id, external_line_id,
+           channel_sku, description, quantity, unit_price_minor, weight_grams, dimensions_mm
+         ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5,
+           $6, $7, $8, $9, $10, $11::jsonb)
+         RETURNING id::text, global_id`,
+        [
+          organizationId,
+          order.id,
+          pipeline.id,
+          product.id,
+          line.externalLineId,
+          line.channelSku,
+          line.description,
+          line.quantity,
+          line.unitPriceMinor,
+          line.weightGrams,
+          JSON.stringify(line.dimensionsMm),
+        ],
+      )
+      fulfillmentLines.push({
+        orderLine: orderLineResult.rows[0],
+        product,
+        position,
+        quantity: proofLine.quantity,
+        openingQuantity: proofLine.openingQuantity,
+      })
+    }
     await transitionOrder(client, {
       organizationId,
       order,
@@ -2075,22 +2155,27 @@ export async function runMockOperationsProofFromPostgres(input: {
       actorEmail,
       correlationId,
       eventKey: 'validated',
-      payload: { productGlobalId: product.reference_code, mapping: 'resolved' },
+      payload: {
+        productGlobalIds: fulfillmentLines.map((item) => item.product.reference_code),
+        lineCount: fulfillmentLines.length,
+        mapping: 'resolved',
+      },
     })
 
-    const availableAfterSetup = Math.max(
-      numberValue(configuration.position.on_hand_quantity),
-      openingQuantity,
-    ) - numberValue(configuration.position.reserved_quantity)
+    const availableByProductId = new Map(fulfillmentLines.map((item) => [
+      item.product.id,
+      Math.max(numberValue(item.position.on_hand_quantity), item.openingQuantity)
+        - numberValue(item.position.reserved_quantity),
+    ]))
     const optimizer = new DeterministicFulfillmentOptimizer()
     const optimization = await optimizer.plan({
       orderGlobalId: order.global_id,
-      demand: [{ productId: product.id, quantity }],
+      demand: fulfillmentLines.map((item) => ({ productId: item.product.id, quantity: item.quantity })),
       candidates: [{
-        warehouseId: configuration.position.warehouse_id,
-        warehouseGlobalId: configuration.position.warehouse_global_id,
-        warehouseName: configuration.position.warehouse_name,
-        availableByProductId: new Map([[product.id, availableAfterSetup]]),
+        warehouseId: configuration.warehouse.id,
+        warehouseGlobalId: configuration.warehouse.global_id,
+        warehouseName: configuration.warehouse.name,
+        availableByProductId,
         handlingCostMinor: BigInt(0),
       }],
       allowMultiWarehouse: false,
@@ -2125,7 +2210,7 @@ export async function runMockOperationsProofFromPostgres(input: {
     }
     const pricing = priceContract({
       directives: configuration.directives,
-      totalUnits: quantity,
+      totalUnits: totalQuantity,
       freightCostMinor: selectedRate.internalCostMinor,
       packageCount: packages.length,
     })
@@ -2146,15 +2231,19 @@ export async function runMockOperationsProofFromPostgres(input: {
       },
     })
 
-    const reservation = await prepareAndReserveInventory(client, {
-      organizationId,
-      order,
-      orderLine,
-      position: configuration.position,
-      quantity,
-      openingQuantity,
-      actorEmail,
-    })
+    const reservedLines: Array<(typeof fulfillmentLines)[number] & { reservation: IdRow }> = []
+    for (const item of fulfillmentLines) {
+      const reservation = await prepareAndReserveInventory(client, {
+        organizationId,
+        order,
+        orderLine: item.orderLine,
+        position: item.position,
+        quantity: item.quantity,
+        openingQuantity: item.openingQuantity,
+        actorEmail,
+      })
+      reservedLines.push({ ...item, reservation })
+    }
     await transitionOrder(client, {
       organizationId,
       order,
@@ -2164,9 +2253,13 @@ export async function runMockOperationsProofFromPostgres(input: {
       correlationId,
       eventKey: 'reserved',
       payload: {
-        reservationGlobalId: reservation.global_id,
-        inventoryPositionGlobalId: configuration.position.global_id,
-        quantity,
+        reservations: reservedLines.map((item) => ({
+          reservationGlobalId: item.reservation.global_id,
+          inventoryPositionGlobalId: item.position.global_id,
+          productGlobalId: item.product.reference_code,
+          quantity: item.quantity,
+        })),
+        totalQuantity,
       },
     })
 
@@ -2195,14 +2288,24 @@ export async function runMockOperationsProofFromPostgres(input: {
       ],
     )
     const plan = planResult.rows[0]
-    const allocationResult = await client.query<IdRow>(
-      `INSERT INTO operations_fulfillment_allocations (
-         organization_id, plan_id, order_line_id, reservation_id, position_id, quantity
-       ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6)
-       RETURNING id::text, global_id`,
-      [organizationId, plan.id, orderLine.id, reservation.id, configuration.position.id, quantity],
-    )
-    const allocation = allocationResult.rows[0]
+    const allocatedLines: Array<(typeof reservedLines)[number] & { allocation: IdRow }> = []
+    for (const item of reservedLines) {
+      const allocationResult = await client.query<IdRow>(
+        `INSERT INTO operations_fulfillment_allocations (
+           organization_id, plan_id, order_line_id, reservation_id, position_id, quantity
+         ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6)
+         RETURNING id::text, global_id`,
+        [
+          organizationId,
+          plan.id,
+          item.orderLine.id,
+          item.reservation.id,
+          item.position.id,
+          item.quantity,
+        ],
+      )
+      allocatedLines.push({ ...item, allocation: allocationResult.rows[0] })
+    }
     await client.query(
       `INSERT INTO operations_carton_plans (
          organization_id, plan_id, algorithm, package_count, total_weight_grams, packages
@@ -2312,24 +2415,28 @@ export async function runMockOperationsProofFromPostgres(input: {
       payload: { waveGlobalId: wave.global_id },
     })
 
-    const pickResult = await client.query<IdRow>(
-      `INSERT INTO operations_pick_tasks (
-         organization_id, wave_id, plan_id, allocation_id, from_location_id,
-         quantity, sequence_number, status, assigned_to
-       ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid,
-         $6, 1, 'ready', $7)
-       RETURNING id::text, global_id`,
-      [
-        organizationId,
-        wave.id,
-        plan.id,
-        allocation.id,
-        configuration.location.id,
-        quantity,
-        actorEmail,
-      ],
-    )
-    const pick = pickResult.rows[0]
+    const pickLines: Array<(typeof allocatedLines)[number] & { pick: IdRow }> = []
+    for (const [index, item] of allocatedLines.entries()) {
+      const pickResult = await client.query<IdRow>(
+        `INSERT INTO operations_pick_tasks (
+           organization_id, wave_id, plan_id, allocation_id, from_location_id,
+           quantity, sequence_number, status, assigned_to
+         ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid,
+           $6, $7, 'ready', $8)
+         RETURNING id::text, global_id`,
+        [
+          organizationId,
+          wave.id,
+          plan.id,
+          item.allocation.id,
+          configuration.location.id,
+          item.quantity,
+          index + 1,
+          actorEmail,
+        ],
+      )
+      pickLines.push({ ...item, pick: pickResult.rows[0] })
+    }
     await transitionOrder(client, {
       organizationId,
       order,
@@ -2338,31 +2445,36 @@ export async function runMockOperationsProofFromPostgres(input: {
       actorEmail,
       correlationId,
       eventKey: 'pick-started',
-      payload: { pickGlobalId: pick.global_id },
+      payload: {
+        pickGlobalIds: pickLines.map((item) => item.pick.global_id),
+        totalQuantity,
+      },
     })
-    await client.query(
-      `UPDATE operations_pick_tasks
-       SET status = 'picked', picked_quantity = quantity, picked_at = now(), updated_at = now()
-       WHERE organization_id = $1::uuid AND id = $2::uuid`,
-      [organizationId, pick.id],
-    )
-    await client.query(
-      `INSERT INTO operations_inventory_ledger (
-         organization_id, position_id, event_type, on_hand_delta, reserved_delta,
-         on_hand_after, reserved_after, source_global_id, reason, idempotency_key, actor_email
-       ) SELECT $1::uuid, position.id, 'pick', 0, 0,
-         position.on_hand_quantity, position.reserved_quantity,
-         $3, 'Picked mock proof order', $4, $5
-       FROM operations_inventory_positions position
-       WHERE position.organization_id = $1::uuid AND position.id = $2::uuid`,
-      [
-        organizationId,
-        configuration.position.id,
-        order.global_id,
-        `${order.global_id}:pick-ledger`,
-        actorEmail,
-      ],
-    )
+    for (const item of pickLines) {
+      await client.query(
+        `UPDATE operations_pick_tasks
+         SET status = 'picked', picked_quantity = quantity, picked_at = now(), updated_at = now()
+         WHERE organization_id = $1::uuid AND id = $2::uuid`,
+        [organizationId, item.pick.id],
+      )
+      await client.query(
+        `INSERT INTO operations_inventory_ledger (
+           organization_id, position_id, event_type, on_hand_delta, reserved_delta,
+           on_hand_after, reserved_after, source_global_id, reason, idempotency_key, actor_email
+         ) SELECT $1::uuid, position.id, 'pick', 0, 0,
+           position.on_hand_quantity, position.reserved_quantity,
+           $3, 'Picked mock proof order line', $4, $5
+         FROM operations_inventory_positions position
+         WHERE position.organization_id = $1::uuid AND position.id = $2::uuid`,
+        [
+          organizationId,
+          item.position.id,
+          item.orderLine.global_id,
+          `${order.global_id}:${item.pick.global_id}:pick-ledger`,
+          actorEmail,
+        ],
+      )
+    }
     await appendDomainEvent(client, {
       organizationId,
       aggregateType: 'operations.order',
@@ -2372,7 +2484,15 @@ export async function runMockOperationsProofFromPostgres(input: {
       actorEmail,
       correlationId,
       idempotencyKey: `${order.global_id}:pick-completed`,
-      payload: { pickGlobalId: pick.global_id, quantity },
+      payload: {
+        picks: pickLines.map((item) => ({
+          pickGlobalId: item.pick.global_id,
+          orderLineGlobalId: item.orderLine.global_id,
+          productGlobalId: item.product.reference_code,
+          quantity: item.quantity,
+        })),
+        totalQuantity,
+      },
     })
 
     await client.query(
@@ -2506,14 +2626,16 @@ export async function runMockOperationsProofFromPostgres(input: {
       ],
     )
     const shipment = shipmentResult.rows[0]
-    await consumeReservedInventory(client, {
-      organizationId,
-      order,
-      position: configuration.position,
-      reservation,
-      quantity,
-      actorEmail,
-    })
+    for (const item of reservedLines) {
+      await consumeReservedInventory(client, {
+        organizationId,
+        order,
+        position: item.position,
+        reservation: item.reservation,
+        quantity: item.quantity,
+        actorEmail,
+      })
+    }
     await client.query(
       `UPDATE operations_packages SET status = 'shipped'
        WHERE organization_id = $1::uuid AND id = $2::uuid`,
@@ -2553,7 +2675,14 @@ export async function runMockOperationsProofFromPostgres(input: {
       actorEmail,
       correlationId,
       idempotencyKey: `${order.global_id}:inventory-consumed`,
-      payload: { inventoryPositionGlobalId: configuration.position.global_id, quantity },
+      payload: {
+        positions: reservedLines.map((item) => ({
+          inventoryPositionGlobalId: item.position.global_id,
+          productGlobalId: item.product.reference_code,
+          quantity: item.quantity,
+        })),
+        totalQuantity,
+      },
     })
 
     const eventTypeForDirective: Record<PricingDirective['type'], string> = {
@@ -2689,7 +2818,9 @@ export async function runMockOperationsProofFromPostgres(input: {
       eventKey: `operations:proof-order:${organizationId}:${normalized.externalOrderId}`,
       payload: {
         customerGlobalId: customer.reference_code,
-        productGlobalId: product.reference_code,
+        productGlobalIds: fulfillmentLines.map((item) => item.product.reference_code),
+        lineCount: fulfillmentLines.length,
+        totalQuantity,
         warehouseGlobalId: configuration.warehouse.global_id,
         trackingNumber: labelOutput.trackingNumber,
         mock: true,

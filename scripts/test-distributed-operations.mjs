@@ -330,6 +330,35 @@ async function verifyRouteBehavior() {
   assert.equal(calls.proofs[0].organizationId, actor.organizationId)
   assert.equal(calls.proofs[0].actorEmail, actor.email)
   assert.equal(calls.proofs[0].proof.shipTo.country, 'US')
+  assert.deepEqual(JSON.parse(JSON.stringify(calls.proofs[0].proof.lines)), [{
+    productGlobalId: 'gp1234567',
+    quantity: 2,
+    openingQuantity: 12,
+  }])
+
+  const { productGlobalId: _productGlobalId, quantity: _quantity, openingQuantity: _openingQuantity, ...proofBase } = proof
+  const multiLineWrite = await route.POST(request('http://localhost/api/operations', {
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      action: 'run-proof-order',
+      proof: {
+        ...proofBase,
+        externalOrderId: 'route-proof-multi',
+        orderNumber: 'ROUTE-2',
+        lines: [
+          { productGlobalId: 'gp1234567', quantity: 2, openingQuantity: 12 },
+          { productGlobalId: 'gp7654321', quantity: 3, openingQuantity: 9 },
+        ],
+      },
+    }),
+  }))
+  assert.equal(multiLineWrite.status, 201)
+  assert.equal(calls.proofs.length, 2)
+  assert.equal(calls.proofs[1].proof.lines.length, 2)
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(calls.proofs[1].proof.lines.map((line) => line.productGlobalId))),
+    ['gp1234567', 'gp7654321'],
+  )
 
   const validExceptionUpdate = await route.POST(request('http://localhost/api/operations', {
     actor: { ...actor, capabilities: { canView: true, canManage: true, canExecute: false, canActivate: false } },
@@ -380,6 +409,22 @@ async function verifyRouteBehavior() {
   }))
   assert.equal(invalidProduct.status, 400)
   assert.equal((await payload(invalidProduct)).code, 'OPERATIONS_REQUEST_INVALID')
+
+  const duplicateProduct = await route.POST(request('http://localhost/api/operations', {
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      action: 'run-proof-order',
+      proof: {
+        ...proofBase,
+        lines: [
+          { productGlobalId: 'gp1234567', quantity: 1, openingQuantity: 10 },
+          { productGlobalId: 'gp1234567', quantity: 2, openingQuantity: 10 },
+        ],
+      },
+    }),
+  }))
+  assert.equal(duplicateProduct.status, 400)
+  assert.equal((await payload(duplicateProduct)).code, 'OPERATIONS_REQUEST_INVALID')
 
   const invalidContentType = await route.POST(request('http://localhost/api/operations', {
     headers: { 'Content-Type': 'text/plain' },
@@ -486,6 +531,14 @@ async function seedWorkspace(pool, label) {
      RETURNING id::text, reference_code, name`,
     [pipelineId, `operations-${label}-product-${suffix}`, `${label} Product ${suffix}`, `OPS-${label}-${suffix}`, email],
   )
+  const secondProduct = await pool.query(
+    `INSERT INTO crm_products (
+       pipeline_id, source_key, name, sku, product_type, price, cost,
+       currency, source_hash, created_by, updated_by
+     ) VALUES ($1::uuid, $2, $3, $4, 'Good', 18.00, 6.50, 'USD', $2, $5, $5)
+     RETURNING id::text, reference_code, name`,
+    [pipelineId, `operations-${label}-product-2-${suffix}`, `${label} Product Two ${suffix}`, `OPS2-${label}-${suffix}`, email],
+  )
   return {
     email,
     organizationId,
@@ -493,6 +546,7 @@ async function seedWorkspace(pool, label) {
     pipelineId,
     customer: customer.rows[0],
     product: product.rows[0],
+    secondProduct: secondProduct.rows[0],
   }
 }
 
@@ -837,6 +891,87 @@ async function verifyPostgresAcceptance(databaseUrl) {
     assert.equal(workspace.summary.reservedUnits, 0)
     assert.equal(workspace.summary.unbilledMinor, '1335')
 
+    const multiExternalOrderId = `multi-${randomUUID()}`
+    const multiProof = proofInput(primary, multiExternalOrderId)
+    delete multiProof.productGlobalId
+    delete multiProof.quantity
+    delete multiProof.openingQuantity
+    multiProof.lines = [
+      { productGlobalId: primary.product.reference_code, quantity: 2, openingQuantity: 12 },
+      { productGlobalId: primary.secondProduct.reference_code, quantity: 3, openingQuantity: 9 },
+    ]
+    const multi = await persistence.runMockOperationsProofFromPostgres({
+      organizationId: primary.organizationId,
+      actorEmail: primary.email,
+      proof: multiProof,
+    })
+    assert.equal(multi.orderStatus, 'shipped')
+    assert.equal(multi.duplicate, false)
+
+    const multiEvidence = await pool.query(
+      `SELECT
+         (SELECT count(*) FROM operations_order_lines line
+           WHERE line.organization_id = orders.organization_id AND line.order_id = orders.id)::int AS lines,
+         (SELECT count(*) FROM operations_reservations reservation
+           JOIN operations_order_lines line ON line.organization_id = reservation.organization_id
+            AND line.id = reservation.order_line_id
+          WHERE line.organization_id = orders.organization_id AND line.order_id = orders.id)::int AS reservations,
+         (SELECT count(*) FROM operations_fulfillment_allocations allocation
+           JOIN operations_order_lines line ON line.organization_id = allocation.organization_id
+            AND line.id = allocation.order_line_id
+          WHERE line.organization_id = orders.organization_id AND line.order_id = orders.id)::int AS allocations,
+         (SELECT count(*) FROM operations_pick_tasks pick
+           JOIN operations_fulfillment_allocations allocation ON allocation.organization_id = pick.organization_id
+            AND allocation.id = pick.allocation_id
+           JOIN operations_order_lines line ON line.organization_id = allocation.organization_id
+            AND line.id = allocation.order_line_id
+          WHERE line.organization_id = orders.organization_id AND line.order_id = orders.id)::int AS picks,
+         (SELECT count(*) FROM operations_shipments shipment
+           WHERE shipment.organization_id = orders.organization_id AND shipment.order_id = orders.id)::int AS shipments
+       FROM operations_orders orders
+       WHERE orders.organization_id = $1::uuid AND orders.global_id = $2`,
+      [primary.organizationId, multi.orderGlobalId],
+    )
+    assert.deepEqual(multiEvidence.rows[0], {
+      lines: 2,
+      reservations: 2,
+      allocations: 2,
+      picks: 2,
+      shipments: 1,
+    })
+    const multiWorkspace = await persistence.readOperationsWorkspaceFromPostgres({
+      organizationId: primary.organizationId,
+      capabilities: { canView: true, canManage: true, canExecute: true },
+      selectedOrderGlobalId: multi.orderGlobalId,
+    })
+    assert.equal(multiWorkspace.selectedOrder.lines.length, 2)
+    assert.deepEqual(
+      multiWorkspace.selectedOrder.lines.map((line) => line.productGlobalId).sort(),
+      [primary.product.reference_code, primary.secondProduct.reference_code].sort(),
+    )
+    assert.equal(multiWorkspace.selectedOrder.lines.every((line) => line.reservedQuantity === 0), true)
+    assert.equal(multiWorkspace.selectedOrder.packages.length, 1)
+    assert.equal(multiWorkspace.selectedOrder.packages[0].status, 'shipped')
+
+    const multiDuplicate = await persistence.runMockOperationsProofFromPostgres({
+      organizationId: primary.organizationId,
+      actorEmail: primary.email,
+      proof: multiProof,
+    })
+    assert.equal(multiDuplicate.duplicate, true)
+    assert.equal(multiDuplicate.orderGlobalId, multi.orderGlobalId)
+    const multiAfterRetry = await pool.query(
+      `SELECT
+         (SELECT count(*) FROM operations_order_lines line
+           JOIN operations_orders orders ON orders.organization_id = line.organization_id AND orders.id = line.order_id
+          WHERE orders.organization_id = $1::uuid AND orders.global_id = $2)::int AS lines,
+         (SELECT count(*) FROM operations_shipments shipment
+           JOIN operations_orders orders ON orders.organization_id = shipment.organization_id AND orders.id = shipment.order_id
+          WHERE orders.organization_id = $1::uuid AND orders.global_id = $2)::int AS shipments`,
+      [primary.organizationId, multi.orderGlobalId],
+    )
+    assert.deepEqual(multiAfterRetry.rows[0], { lines: 2, shipments: 1 })
+
     const exceptionSeed = await pool.query(
       `INSERT INTO operations_exceptions (
          organization_id, order_id, exception_type, severity, title, details, assigned_to
@@ -932,7 +1067,7 @@ async function verifyPostgresAcceptance(databaseUrl) {
     })
     assert.equal(isolated.orders.length, 0)
     assert.equal(isolated.catalog.customers.length, 1)
-    assert.equal(isolated.catalog.products.length, 1)
+    assert.equal(isolated.catalog.products.length, 2)
     assert.equal(JSON.stringify(isolated).includes(first.orderGlobalId), false)
 
     await expectRejected(

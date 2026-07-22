@@ -304,13 +304,21 @@ export type OperationsWorkspace = {
   generatedAt: string
 }
 
-export type MockOperationsProofInput = {
-  customerGlobalId: string
+export type MockOperationsProofLineInput = {
   productGlobalId: string
-  externalOrderId: string
-  orderNumber: string
   quantity: number
   openingQuantity: number
+}
+
+export type MockOperationsProofInput = {
+  customerGlobalId: string
+  externalOrderId: string
+  orderNumber: string
+  lines?: MockOperationsProofLineInput[]
+  // Temporary compatibility fields for callers deployed before multi-line orders.
+  productGlobalId?: string
+  quantity?: number
+  openingQuantity?: number
   requestedDeliveryAt: string
   shipTo: Address
 }
