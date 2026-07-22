@@ -1,6 +1,7 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import type { PoolClient, QueryResultRow } from 'pg'
 import { recordAuditEvent } from '@/lib/auditWriter'
+import { normalizedCrmIdentityText } from '@/lib/crm/stableId'
 import {
   MockCarrierAdapter,
   MockCommerceAdapter,
@@ -18,9 +19,13 @@ import {
 import type { OperationsCapabilities } from '@/lib/operations/authorization'
 import type {
   Address,
+  CommerceCustomerIdentity,
+  CommerceCustomerResolution,
   CommerceOrderInput,
   MockOperationsProofInput,
   MockOperationsProofResult,
+  OperationsActivationState,
+  OperationsActivationUpdateResult,
   OperationsExceptionListItem,
   OperationsExceptionStatus,
   OperationsExceptionUpdateResult,
@@ -30,14 +35,20 @@ import type {
   OperationsWorkspace,
   PricingDirective,
 } from '@/lib/operations/types'
+import { stageCrmRecordWithClient } from '@/lib/persistence/crm'
 import {
   acquireTransactionAdvisoryLock,
   query,
   withTransaction,
 } from '@/lib/persistence/postgres'
 
-type PipelineRow = QueryResultRow & { id: string; name: string }
+type PipelineRow = QueryResultRow & { id: string; name: string; owner_email: string }
 type CustomerRow = QueryResultRow & { id: string; reference_code: string; name: string }
+type CustomerIdentityRow = CustomerRow & {
+  email: string | null
+  phone: string | null
+  website: string | null
+}
 type ProductRow = QueryResultRow & {
   id: string
   reference_code: string
@@ -61,6 +72,26 @@ type OrderIdentityRow = QueryResultRow & {
   global_id: string
   status: OperationsOrderStatus
   tracking_number?: string | null
+}
+
+type ActivationRow = QueryResultRow & {
+  data_pipeline_id: string
+  pipeline_name: string
+  pipeline_owner_email: string
+  state: OperationsActivationState
+  revision: number
+  reason: string | null
+  updated_at: Date
+}
+
+type CommandReceiptRow = QueryResultRow & {
+  id: string
+  request_hash: string
+  status: 'processing' | 'succeeded' | 'failed'
+  correlation_id: string
+  result_global_id: string | null
+  attempts: number
+  updated_at: Date
 }
 
 type ExceptionRow = QueryResultRow & {
@@ -183,18 +214,38 @@ function moneyMinorFromDecimal(value: unknown): number {
   return minor
 }
 
+function uniqueReferenceRows<T extends { reference_code: string }>(rows: T[]): T[] {
+  return [...new Map(rows.map((row) => [row.reference_code, row])).values()]
+}
+
 function requireOrganizationId(value: string) {
   const organizationId = String(value || '').trim()
   if (!organizationId) throw new OperationsRequestError('ACTIVE_ORGANIZATION_REQUIRED', 'Select an active organization first', 409)
   return organizationId
 }
 
-async function resolvePipeline(client: PoolClient, organizationId: string): Promise<PipelineRow> {
+const ACTIVATION_STATES = new Set<OperationsActivationState>([
+  'disabled', 'shadow', 'read_only', 'active', 'frozen',
+])
+
+async function fallbackPipeline(client: PoolClient, organizationId: string): Promise<PipelineRow> {
   const result = await client.query<PipelineRow>(
-    `SELECT id::text, name
-     FROM pipeline_spaces
-     WHERE workspace_organization_id = $1::uuid
-     ORDER BY is_default DESC, updated_at DESC, id
+    `SELECT pipeline.id::text, pipeline.name, pipeline.owner_email
+     FROM pipeline_spaces pipeline
+     LEFT JOIN app_user_organization_memberships membership
+       ON membership.user_email = pipeline.owner_email
+      AND membership.organization_id = pipeline.workspace_organization_id
+     WHERE pipeline.workspace_organization_id = $1::uuid
+     ORDER BY
+       CASE
+         WHEN membership.status = 'active' AND membership.role = 'owner' THEN 0
+         WHEN membership.status = 'active' AND membership.role = 'admin' THEN 1
+         WHEN membership.status = 'active' AND membership.role = 'member' THEN 2
+         ELSE 3
+       END,
+       pipeline.is_default DESC,
+       pipeline.updated_at DESC,
+       pipeline.id
      LIMIT 1`,
     [organizationId],
   )
@@ -206,6 +257,61 @@ async function resolvePipeline(client: PoolClient, organizationId: string): Prom
     )
   }
   return result.rows[0]
+}
+
+async function resolveActivation(
+  client: PoolClient,
+  organizationId: string,
+  lock = false,
+): Promise<ActivationRow> {
+  const read = () => client.query<ActivationRow>(
+    `SELECT activation.data_pipeline_id::text, pipeline.name AS pipeline_name,
+            pipeline.owner_email AS pipeline_owner_email,
+            activation.state, activation.revision, activation.reason,
+            activation.updated_at
+     FROM operations_activation_scopes activation
+     JOIN pipeline_spaces pipeline
+       ON pipeline.workspace_organization_id = activation.organization_id
+      AND pipeline.id = activation.data_pipeline_id
+     WHERE activation.organization_id = $1::uuid
+     ${lock ? 'FOR UPDATE OF activation' : ''}`,
+    [organizationId],
+  )
+  const existing = await read()
+  if (existing.rows[0]) return existing.rows[0]
+
+  const pipeline = await fallbackPipeline(client, organizationId)
+  await client.query(
+    `INSERT INTO operations_activation_scopes (
+       organization_id, data_pipeline_id, state, reason
+     ) VALUES ($1::uuid, $2::uuid, 'shadow', $3)
+     ON CONFLICT (organization_id) DO NOTHING`,
+    [organizationId, pipeline.id, 'Initial authoritative CRM projection selected by Operations'],
+  )
+  const created = await read()
+  if (!created.rows[0]) {
+    throw new OperationsRequestError('OPERATIONS_ACTIVATION_UNAVAILABLE', 'Operations activation could not be initialized', 409)
+  }
+  return created.rows[0]
+}
+
+async function resolvePipeline(client: PoolClient, organizationId: string): Promise<PipelineRow> {
+  const activation = await resolveActivation(client, organizationId)
+  return {
+    id: activation.data_pipeline_id,
+    name: activation.pipeline_name,
+    owner_email: activation.pipeline_owner_email,
+  }
+}
+
+function activationPayload(row: ActivationRow): OperationsActivationUpdateResult {
+  return {
+    state: row.state,
+    revision: row.revision,
+    reason: row.reason,
+    updatedAt: row.updated_at.toISOString(),
+    dataPipeline: { id: row.data_pipeline_id, name: row.pipeline_name },
+  }
 }
 
 async function resolveCustomer(
@@ -242,6 +348,369 @@ async function resolveProduct(
     throw new OperationsRequestError('OPERATIONS_PRODUCT_NOT_FOUND', 'Select an active CRM product from the active workspace', 404)
   }
   return result.rows[0]
+}
+
+const GENERIC_EMAIL_DOMAINS = new Set([
+  'aol.com', 'gmail.com', 'hotmail.com', 'icloud.com', 'live.com', 'me.com',
+  'msn.com', 'outlook.com', 'proton.me', 'protonmail.com', 'yahoo.com',
+])
+
+function trimmed(value: unknown, maximum = 500): string {
+  const result = String(value ?? '').trim()
+  if (result.length > maximum || /[\u0000-\u001f\u007f]/.test(result)) {
+    throw new OperationsRequestError('OPERATIONS_CUSTOMER_IDENTITY_INVALID', 'Commerce customer identity is invalid')
+  }
+  return result
+}
+
+function normalizedPhone(value: unknown): string {
+  const digits = trimmed(value, 50).replace(/\D/g, '')
+  return digits.length >= 7 ? digits : ''
+}
+
+function emailDomain(value: unknown): string {
+  const email = normalizedCrmIdentityText(value)
+  const domain = email.includes('@') ? email.split('@').at(-1) || '' : ''
+  return domain && !GENERIC_EMAIL_DOMAINS.has(domain) ? domain : ''
+}
+
+function websiteDomain(value: unknown): string {
+  const website = trimmed(value, 300).toLowerCase()
+  if (!website) return ''
+  try {
+    const parsed = new URL(website.includes('://') ? website : `https://${website}`)
+    return parsed.hostname.replace(/^www\./, '')
+  } catch {
+    return ''
+  }
+}
+
+function customerDomains(customer: CustomerIdentityRow): Set<string> {
+  return new Set([
+    websiteDomain(customer.website),
+    emailDomain(customer.email),
+  ].filter(Boolean))
+}
+
+function customerResolution(
+  method: CommerceCustomerResolution['method'],
+  candidates: CustomerIdentityRow[],
+): CommerceCustomerResolution | null {
+  const unique = [...new Map(candidates.map((candidate) => [candidate.reference_code, candidate])).values()]
+  if (unique.length === 0) return null
+  if (unique.length > 1) {
+    return {
+      status: 'ambiguous',
+      method: 'ambiguous',
+      customer: null,
+      candidateGlobalIds: unique.map((candidate) => candidate.reference_code).sort(),
+    }
+  }
+  const customer = unique[0]
+  return {
+    status: 'matched',
+    method,
+    customer: { id: customer.id, globalId: customer.reference_code, name: customer.name },
+    candidateGlobalIds: [],
+  }
+}
+
+function customerIdentityLockKey(identity: CommerceCustomerIdentity, companyName: string): string {
+  const identityFingerprint = JSON.stringify({
+    name: normalizedCrmIdentityText(companyName),
+    email: normalizedCrmIdentityText(identity.email),
+    phone: normalizedPhone(identity.phone),
+    domain: websiteDomain(identity.website) || emailDomain(identity.email),
+    postalCode: normalizedCrmIdentityText(identity.postalCode),
+  })
+  return createHash('sha256').update(identityFingerprint).digest('hex')
+}
+
+async function resolveCrmMutationActor(
+  client: PoolClient,
+  pipeline: PipelineRow,
+  requestedActor: string,
+): Promise<string> {
+  const result = await client.query<QueryResultRow & { email: string }>(
+    `SELECT email
+     FROM app_users
+     WHERE lower(email) IN (lower($1), lower($2))
+       AND status = 'active'
+     ORDER BY CASE WHEN lower(email) = lower($1) THEN 0 ELSE 1 END
+     LIMIT 1`,
+    [requestedActor, pipeline.owner_email],
+  )
+  if (!result.rows[0]?.email) {
+    throw new OperationsRequestError(
+      'OPERATIONS_CUSTOMER_ACTOR_UNAVAILABLE',
+      'The authoritative CRM projection has no active application owner for customer creation',
+      409,
+    )
+  }
+  return result.rows[0].email
+}
+
+async function bindCommerceCustomerExternalId(
+  client: PoolClient,
+  input: {
+    organizationId: string
+    integrationAccountId: string
+    externalCustomerId: string
+    customer: { globalId: string }
+    method: CommerceCustomerResolution['method']
+    evidence: Record<string, unknown>
+  },
+) {
+  await client.query(
+    `INSERT INTO operations_external_identifiers (
+       organization_id, integration_account_id, entity_type, entity_global_id,
+       external_id, status, match_method, match_evidence, last_verified_at
+     ) VALUES ($1::uuid, $2::uuid, 'crm.organization', $3, $4,
+       'active', $5, $6::jsonb, now())
+     ON CONFLICT (organization_id, integration_account_id, entity_type, external_id)
+     DO UPDATE SET entity_global_id = EXCLUDED.entity_global_id,
+                   status = 'active',
+                   match_method = EXCLUDED.match_method,
+                   match_evidence = EXCLUDED.match_evidence,
+                   last_verified_at = now()`,
+    [
+      input.organizationId,
+      input.integrationAccountId,
+      input.customer.globalId,
+      input.externalCustomerId,
+      input.method,
+      JSON.stringify(input.evidence),
+    ],
+  )
+}
+
+export async function resolveCommerceCustomerInPostgres(input: {
+  organizationId: string
+  integrationAccountGlobalId: string
+  actorEmail: string
+  identity: CommerceCustomerIdentity
+}): Promise<CommerceCustomerResolution> {
+  const organizationId = requireOrganizationId(input.organizationId)
+  const actorEmail = trimmed(input.actorEmail, 320).toLowerCase()
+  const integrationAccountGlobalId = trimmed(input.integrationAccountGlobalId, 20)
+  const provider = trimmed(input.identity.provider, 100).toLowerCase()
+  const externalCustomerId = trimmed(input.identity.externalCustomerId, 300)
+  const companyName = trimmed(input.identity.companyName, 200)
+  if (!actorEmail || !integrationAccountGlobalId || !provider || !externalCustomerId || !companyName) {
+    throw new OperationsRequestError('OPERATIONS_CUSTOMER_IDENTITY_INVALID', 'Commerce customer identity is incomplete')
+  }
+
+  return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `operations:commerce-customer:${organizationId}:${integrationAccountGlobalId}:${externalCustomerId}`,
+    )
+    await acquireTransactionAdvisoryLock(
+      client,
+      `operations:commerce-customer-identity:${organizationId}:${customerIdentityLockKey(input.identity, companyName)}`,
+    )
+    const integrationResult = await client.query<IdRow & { provider: string }>(
+      `SELECT id::text, global_id, provider
+       FROM operations_integration_accounts
+       WHERE organization_id = $1::uuid AND global_id = $2
+         AND integration_type = 'commerce' AND status = 'active'
+       LIMIT 1`,
+      [organizationId, integrationAccountGlobalId],
+    )
+    const integration = integrationResult.rows[0]
+    if (!integration || integration.provider.toLowerCase() !== provider) {
+      throw new OperationsRequestError(
+        'OPERATIONS_COMMERCE_INTEGRATION_NOT_FOUND',
+        'Select an active commerce integration for this provider',
+        404,
+      )
+    }
+    const pipeline = await resolvePipeline(client, organizationId)
+    const mapped = await client.query<CustomerIdentityRow>(
+      `SELECT customer.id::text, customer.reference_code, customer.name,
+              customer.email, customer.phone, customer.website
+       FROM operations_external_identifiers external_id
+       JOIN crm_organizations customer
+         ON customer.pipeline_id = $3::uuid
+        AND customer.reference_code = external_id.entity_global_id
+       WHERE external_id.organization_id = $1::uuid
+         AND external_id.integration_account_id = $2::uuid
+         AND external_id.entity_type = 'crm.organization'
+         AND external_id.external_id = $4
+         AND external_id.status = 'active'
+       LIMIT 1`,
+      [organizationId, integration.id, pipeline.id, externalCustomerId],
+    )
+    if (mapped.rows[0]) {
+      const customer = mapped.rows[0]
+      await bindCommerceCustomerExternalId(client, {
+        organizationId,
+        integrationAccountId: integration.id,
+        externalCustomerId,
+        customer: { globalId: customer.reference_code },
+        method: 'external_id',
+        evidence: { provider, externalCustomerId },
+      })
+      return {
+        status: 'matched',
+        method: 'external_id',
+        customer: { id: customer.id, globalId: customer.reference_code, name: customer.name },
+        candidateGlobalIds: [],
+      }
+    }
+
+    const candidates = await client.query<CustomerIdentityRow>(
+      `SELECT id::text, reference_code, name, email, phone, website
+       FROM crm_organizations
+       WHERE pipeline_id = $1::uuid
+         AND COALESCE(lower(source_payload->>'archived'), 'false') NOT IN ('true', '1', 'yes')
+       ORDER BY updated_at DESC, id
+       LIMIT 1000`,
+      [pipeline.id],
+    )
+    const normalizedEmail = normalizedCrmIdentityText(input.identity.email)
+    const normalizedName = normalizedCrmIdentityText(companyName)
+    const phone = normalizedPhone(input.identity.phone)
+    const contactCandidates = normalizedEmail
+      ? await client.query<CustomerIdentityRow>(
+        `SELECT organization.id::text, organization.reference_code, organization.name,
+                organization.email, organization.phone, organization.website
+         FROM crm_contacts contact
+         JOIN crm_organizations organization
+           ON organization.pipeline_id = contact.pipeline_id
+          AND organization.id = contact.organization_id
+         WHERE contact.pipeline_id = $1::uuid
+           AND lower(btrim(contact.email)) = $2
+           AND COALESCE(lower(contact.source_payload->>'archived'), 'false') NOT IN ('true', '1', 'yes')
+           AND COALESCE(lower(organization.source_payload->>'archived'), 'false') NOT IN ('true', '1', 'yes')
+         ORDER BY organization.updated_at DESC, organization.id`,
+        [pipeline.id, normalizedEmail],
+      )
+      : { rows: [] as CustomerIdentityRow[] }
+    const domains = new Set([
+      websiteDomain(input.identity.website),
+      emailDomain(input.identity.email),
+    ].filter(Boolean))
+    const matchTiers: Array<{
+      method: CommerceCustomerResolution['method']
+      candidates: CustomerIdentityRow[]
+    }> = [
+      {
+        method: 'email',
+        candidates: normalizedEmail
+          ? candidates.rows.filter((candidate) => normalizedCrmIdentityText(candidate.email) === normalizedEmail)
+          : [],
+      },
+      {
+        method: 'contact_email',
+        candidates: contactCandidates.rows,
+      },
+      {
+        method: 'website_domain',
+        candidates: domains.size
+          ? candidates.rows.filter((candidate) => [...customerDomains(candidate)].some((domain) => domains.has(domain)))
+          : [],
+      },
+      {
+        method: 'name_phone',
+        candidates: phone
+          ? candidates.rows.filter((candidate) => (
+            normalizedCrmIdentityText(candidate.name) === normalizedName
+            && normalizedPhone(candidate.phone) === phone
+          ))
+          : [],
+      },
+      {
+        method: 'exact_name',
+        candidates: candidates.rows.filter((candidate) => normalizedCrmIdentityText(candidate.name) === normalizedName),
+      },
+    ]
+
+    for (const tier of matchTiers) {
+      const resolution = customerResolution(tier.method, tier.candidates)
+      if (!resolution) continue
+      if (resolution.status === 'ambiguous') {
+        await recordAuditEvent({
+          actor: actorEmail,
+          eventType: 'operations.customer_resolution.review_required',
+          aggregateType: 'operations.integration_account',
+          aggregateId: integration.global_id,
+          subject: companyName,
+          organizationId,
+          eventKey: `operations:customer-resolution:${integration.global_id}:${externalCustomerId}:ambiguous`,
+          payload: {
+            provider,
+            externalCustomerId,
+            attemptedMethod: tier.method,
+            candidateGlobalIds: resolution.candidateGlobalIds,
+          },
+        }, client)
+        return resolution
+      }
+      await bindCommerceCustomerExternalId(client, {
+        organizationId,
+        integrationAccountId: integration.id,
+        externalCustomerId,
+        customer: { globalId: resolution.customer!.globalId },
+        method: resolution.method,
+        evidence: { provider, externalCustomerId, matchedBy: resolution.method },
+      })
+      return resolution
+    }
+
+    const workspaceRoot = await client.query<QueryResultRow & { id: string; suitecrm_id: string | null }>(
+      `SELECT id::text, suitecrm_id
+       FROM crm_organizations
+       WHERE pipeline_id = $1::uuid AND workspace_organization_id = $2::uuid
+       ORDER BY CASE relationship_type WHEN 'workspace_root' THEN 0 ELSE 1 END, updated_at DESC
+       LIMIT 1`,
+      [pipeline.id, organizationId],
+    )
+    const root = workspaceRoot.rows[0]
+    const crmMutationActor = await resolveCrmMutationActor(client, pipeline, actorEmail)
+    const staged = await stageCrmRecordWithClient(client, {
+      entity: 'organizations',
+      pipelineId: pipeline.id,
+      sourceKey: `commerce:${provider}:${externalCustomerId}`,
+      sourcePayload: {
+        source: 'commerce_provider',
+        provider,
+        externalCustomerId,
+        requestedActor: actorEmail,
+      },
+      actorEmail: crmMutationActor,
+      fields: {
+        parentOrganizationId: root?.id || null,
+        parentOrganizationSuiteCrmId: root?.suitecrm_id || null,
+        relationshipType: 'customer',
+        name: companyName,
+        website: trimmed(input.identity.website, 300) || undefined,
+        phone: trimmed(input.identity.phone, 50) || undefined,
+        email: trimmed(input.identity.email, 320) || undefined,
+        address: trimmed(input.identity.address, 300) || undefined,
+        city: trimmed(input.identity.city, 100) || undefined,
+        state: trimmed(input.identity.region, 100) || undefined,
+        postalCode: trimmed(input.identity.postalCode, 30) || undefined,
+        country: trimmed(input.identity.country, 100) || undefined,
+        description: `Created from ${provider} customer ${externalCustomerId}.`,
+      },
+    })
+    const created: CommerceCustomerResolution = {
+      status: 'created',
+      method: 'created',
+      customer: { id: staged.id, globalId: staged.referenceCode, name: companyName },
+      candidateGlobalIds: [],
+    }
+    await bindCommerceCustomerExternalId(client, {
+      organizationId,
+      integrationAccountId: integration.id,
+      externalCustomerId,
+      customer: { globalId: staged.referenceCode },
+      method: 'created',
+      evidence: { provider, externalCustomerId, created: true },
+    })
+    return created
+  })
 }
 
 async function appendDomainEvent(client: PoolClient, input: {
@@ -897,6 +1366,7 @@ export async function readOperationsWorkspaceFromPostgres(input: {
   selectedOrderGlobalId?: string | null
 }): Promise<OperationsWorkspace> {
   const organizationId = requireOrganizationId(input.organizationId)
+  const activation = await withTransaction((client) => resolveActivation(client, organizationId))
   const values: unknown[] = [organizationId]
   const where = ['orders.organization_id = $1::uuid']
   const exceptionValues: unknown[] = [organizationId]
@@ -1015,18 +1485,16 @@ export async function readOperationsWorkspaceFromPostgres(input: {
     query<CustomerRow>(
       `SELECT customer.id::text, customer.reference_code, customer.name
        FROM crm_organizations customer
-       JOIN pipeline_spaces pipeline ON pipeline.id = customer.pipeline_id
-       WHERE pipeline.workspace_organization_id = $1::uuid
+       WHERE customer.pipeline_id = $1::uuid
        ORDER BY lower(customer.name), customer.id LIMIT 500`,
-      [organizationId],
+      [activation.data_pipeline_id],
     ),
     query<ProductRow>(
       `SELECT product.id::text, product.reference_code, product.name, NULLIF(btrim(product.sku), '') AS sku, product.price::text
        FROM crm_products product
-       JOIN pipeline_spaces pipeline ON pipeline.id = product.pipeline_id
-       WHERE pipeline.workspace_organization_id = $1::uuid AND product.active = true
+       WHERE product.pipeline_id = $1::uuid AND product.active = true
        ORDER BY lower(product.name), product.id LIMIT 500`,
-      [organizationId],
+      [activation.data_pipeline_id],
     ),
   ])
 
@@ -1054,6 +1522,16 @@ export async function readOperationsWorkspaceFromPostgres(input: {
     organizationId,
     configured: configuredResult.rows[0]?.configured === true,
     capabilities: input.capabilities,
+    dataPipeline: {
+      id: activation.data_pipeline_id,
+      name: activation.pipeline_name,
+    },
+    activation: {
+      state: activation.state,
+      revision: activation.revision,
+      reason: activation.reason,
+      updatedAt: activation.updated_at.toISOString(),
+    },
     summary: {
       openOrders: Number(summary?.open_orders || 0),
       exceptions: Number(summary?.exceptions || 0),
@@ -1068,11 +1546,77 @@ export async function readOperationsWorkspaceFromPostgres(input: {
     selectedOrder: selectedGlobalId ? await readOrderDetail(organizationId, selectedGlobalId) : null,
     warehouses: warehouseResult.rows.map((row) => ({ id: row.id, globalId: row.global_id, name: row.name })),
     catalog: {
-      customers: customerResult.rows.map((row) => ({ id: row.id, globalId: row.reference_code, name: row.name })),
-      products: productResult.rows.map((row) => ({ id: row.id, globalId: row.reference_code, name: row.name, sku: row.sku })),
+      customers: uniqueReferenceRows(customerResult.rows).map((row) => ({ id: row.id, globalId: row.reference_code, name: row.name })),
+      products: uniqueReferenceRows(productResult.rows).map((row) => ({ id: row.id, globalId: row.reference_code, name: row.name, sku: row.sku })),
     },
     generatedAt: new Date().toISOString(),
   }
+}
+
+export async function updateOperationsActivationInPostgres(input: {
+  organizationId: string
+  actorEmail: string
+  state: OperationsActivationState
+  reason?: string | null
+}): Promise<OperationsActivationUpdateResult> {
+  const organizationId = requireOrganizationId(input.organizationId)
+  const actorEmail = trimmed(input.actorEmail, 320).toLowerCase()
+  if (!actorEmail) throw new OperationsRequestError('OPERATIONS_ACTOR_REQUIRED', 'A signed-in user is required', 401)
+  if (!ACTIVATION_STATES.has(input.state)) {
+    throw new OperationsRequestError('OPERATIONS_ACTIVATION_STATE_INVALID', 'Operations activation state is invalid')
+  }
+  const reason = trimmed(input.reason, 500) || null
+
+  return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(client, `operations:activation:${organizationId}`)
+    const current = await resolveActivation(client, organizationId, true)
+    if (input.state === 'active') {
+      const providers = await client.query<QueryResultRow & { integration_type: string }>(
+        `SELECT DISTINCT integration_type
+         FROM operations_integration_accounts
+         WHERE organization_id = $1::uuid AND environment = 'production'
+           AND status = 'active'
+           AND integration_type IN ('commerce', 'carrier', 'printing')`,
+        [organizationId],
+      )
+      const available = new Set(providers.rows.map((row) => row.integration_type))
+      const missing = ['commerce', 'carrier', 'printing'].filter((type) => !available.has(type))
+      if (missing.length) {
+        throw new OperationsRequestError(
+          'OPERATIONS_LIVE_PROVIDER_REQUIRED',
+          `Live activation requires production ${missing.join(', ')} integration${missing.length === 1 ? '' : 's'}`,
+          409,
+        )
+      }
+    }
+    if (current.state === input.state && current.reason === reason) return activationPayload(current)
+
+    await client.query(
+      `UPDATE operations_activation_scopes
+       SET state = $2, reason = $3, revision = revision + 1,
+           updated_by = $4, updated_at = now()
+       WHERE organization_id = $1::uuid`,
+      [organizationId, input.state, reason, actorEmail],
+    )
+    const updated = await resolveActivation(client, organizationId)
+    await recordAuditEvent({
+      actor: actorEmail,
+      eventType: 'operations.activation.updated',
+      aggregateType: 'operations.activation',
+      aggregateId: organizationId,
+      subject: updated.pipeline_name,
+      organizationId,
+      eventKey: `operations:activation:${organizationId}:revision:${updated.revision}`,
+      payload: {
+        previousState: current.state,
+        state: updated.state,
+        revision: updated.revision,
+        reason: updated.reason,
+        dataPipelineId: updated.data_pipeline_id,
+      },
+    }, client)
+    return activationPayload(updated)
+  })
 }
 
 async function readException(
@@ -1188,6 +1732,156 @@ export async function updateOperationsExceptionInPostgres(input: {
   })
 }
 
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
+  if (value && typeof value === 'object') {
+    const source = value as Record<string, unknown>
+    return `{${Object.keys(source).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(source[key])}`).join(',')}}`
+  }
+  return JSON.stringify(value) ?? 'null'
+}
+
+function commandRequestHash(value: unknown): string {
+  return createHash('sha256').update(canonicalJson(value)).digest('hex')
+}
+
+async function prepareCommandReceipt(input: {
+  organizationId: string
+  commandType: string
+  idempotencyKey: string
+  requestHash: string
+  actorEmail: string
+}): Promise<{ receipt: CommandReceiptRow; completed: boolean }> {
+  return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `operations:command-receipt:${input.organizationId}:${input.commandType}:${input.idempotencyKey}`,
+    )
+    const existing = await client.query<CommandReceiptRow>(
+      `SELECT id::text, request_hash, status, correlation_id::text,
+              result_global_id, attempts, updated_at
+       FROM operations_command_receipts
+       WHERE organization_id = $1::uuid AND command_type = $2 AND idempotency_key = $3
+       FOR UPDATE`,
+      [input.organizationId, input.commandType, input.idempotencyKey],
+    )
+    const receipt = existing.rows[0]
+    if (receipt) {
+      if (receipt.request_hash !== input.requestHash) {
+        throw new OperationsRequestError(
+          'OPERATIONS_IDEMPOTENCY_CONFLICT',
+          'This external order ID was already used with different order data',
+          409,
+        )
+      }
+      if (receipt.status === 'succeeded') return { receipt, completed: true }
+      if (receipt.status === 'processing' && Date.now() - receipt.updated_at.getTime() < 5 * 60_000) {
+        throw new OperationsRequestError(
+          'OPERATIONS_COMMAND_IN_PROGRESS',
+          'This order command is already being processed',
+          409,
+        )
+      }
+      const retried = await client.query<CommandReceiptRow>(
+        `UPDATE operations_command_receipts
+         SET status = 'processing', actor_email = $2, attempts = attempts + 1,
+             error_code = NULL, error_message = NULL, completed_at = NULL,
+             started_at = now(), updated_at = now()
+         WHERE id = $1::uuid
+         RETURNING id::text, request_hash, status, correlation_id::text,
+                   result_global_id, attempts, updated_at`,
+        [receipt.id, input.actorEmail],
+      )
+      return { receipt: retried.rows[0], completed: false }
+    }
+    const created = await client.query<CommandReceiptRow>(
+      `INSERT INTO operations_command_receipts (
+         organization_id, command_type, idempotency_key, request_hash,
+         actor_email, status, correlation_id
+       ) VALUES ($1::uuid, $2, $3, $4, $5, 'processing', $6::uuid)
+       RETURNING id::text, request_hash, status, correlation_id::text,
+                 result_global_id, attempts, updated_at`,
+      [
+        input.organizationId,
+        input.commandType,
+        input.idempotencyKey,
+        input.requestHash,
+        input.actorEmail,
+        randomUUID(),
+      ],
+    )
+    return { receipt: created.rows[0], completed: false }
+  })
+}
+
+async function completeCommandReceipt(
+  client: PoolClient,
+  receiptId: string,
+  resultGlobalId: string,
+) {
+  await client.query(
+    `UPDATE operations_command_receipts
+     SET status = 'succeeded', result_global_id = $2,
+         error_code = NULL, error_message = NULL,
+         completed_at = now(), updated_at = now()
+     WHERE id = $1::uuid`,
+    [receiptId, resultGlobalId],
+  )
+}
+
+async function failCommandReceipt(receiptId: string, error: unknown) {
+  const code = error instanceof OperationsRequestError
+    ? error.code
+    : 'OPERATIONS_REQUEST_FAILED'
+  const message = error instanceof Error
+    ? error.message.slice(0, 500)
+    : 'Operations request failed'
+  try {
+    await query(
+      `UPDATE operations_command_receipts
+       SET status = 'failed', error_code = $2, error_message = $3,
+           completed_at = now(), updated_at = now()
+       WHERE id = $1::uuid AND status = 'processing'`,
+      [receiptId, code, message],
+    )
+  } catch {
+    // Preserve the command failure even if receipt persistence is unavailable.
+  }
+}
+
+async function completedProofResult(
+  organizationId: string,
+  orderGlobalId: string | null,
+): Promise<MockOperationsProofResult> {
+  if (!orderGlobalId) {
+    throw new OperationsRequestError('OPERATIONS_COMMAND_RECEIPT_INVALID', 'Completed command receipt has no order result', 409)
+  }
+  const result = await query<OrderIdentityRow>(
+    `SELECT orders.id::text, orders.global_id, orders.status, shipment.tracking_number
+     FROM operations_orders orders
+     LEFT JOIN LATERAL (
+       SELECT tracking_number FROM operations_shipments candidate
+       WHERE candidate.organization_id = orders.organization_id
+         AND candidate.order_id = orders.id
+       ORDER BY candidate.shipped_at DESC LIMIT 1
+     ) shipment ON true
+     WHERE orders.organization_id = $1::uuid AND orders.global_id = $2
+     LIMIT 1`,
+    [organizationId, orderGlobalId],
+  )
+  const order = result.rows[0]
+  if (!order) {
+    throw new OperationsRequestError('OPERATIONS_COMMAND_RECEIPT_INVALID', 'Completed order result is unavailable', 409)
+  }
+  return {
+    orderGlobalId: order.global_id,
+    orderStatus: order.status,
+    duplicate: true,
+    trackingNumber: order.tracking_number || null,
+    steps: [...MOCK_PROOF_STEPS],
+  }
+}
+
 export async function runMockOperationsProofFromPostgres(input: {
   organizationId: string
   actorEmail: string
@@ -1197,12 +1891,36 @@ export async function runMockOperationsProofFromPostgres(input: {
   const actorEmail = String(input.actorEmail || '').trim().toLowerCase()
   if (!actorEmail) throw new OperationsRequestError('OPERATIONS_ACTOR_REQUIRED', 'A signed-in user is required', 401)
 
-  return withTransaction(async (client) => {
+  const command = await prepareCommandReceipt({
+    organizationId,
+    commandType: 'run_mock_operations_proof',
+    idempotencyKey: `mock-commerce:${input.proof.externalOrderId}`,
+    requestHash: commandRequestHash(input.proof),
+    actorEmail,
+  })
+  if (command.completed) {
+    return completedProofResult(organizationId, command.receipt.result_global_id)
+  }
+
+  try {
+    return await withTransaction(async (client) => {
     await acquireTransactionAdvisoryLock(
       client,
       `operations:proof-order:${organizationId}:${input.proof.externalOrderId}`,
     )
-    const pipeline = await resolvePipeline(client, organizationId)
+    const activation = await resolveActivation(client, organizationId)
+    if (activation.state !== 'shadow') {
+      throw new OperationsRequestError(
+        'OPERATIONS_PROOF_REQUIRES_SHADOW',
+        'Mock proof orders are available only while Operations is in shadow mode',
+        409,
+      )
+    }
+    const pipeline = {
+      id: activation.data_pipeline_id,
+      name: activation.pipeline_name,
+      owner_email: activation.pipeline_owner_email,
+    }
     const customer = await resolveCustomer(client, pipeline.id, input.proof.customerGlobalId)
     const product = await resolveProduct(client, pipeline.id, input.proof.productGlobalId)
     const quantity = assertPositiveQuantity(input.proof.quantity)
@@ -1261,6 +1979,7 @@ export async function runMockOperationsProofFromPostgres(input: {
     )
     const duplicate = duplicateResult.rows[0]
     if (duplicate) {
+      await completeCommandReceipt(client, command.receipt.id, duplicate.global_id)
       return {
         orderGlobalId: duplicate.global_id,
         orderStatus: duplicate.status,
@@ -1270,7 +1989,7 @@ export async function runMockOperationsProofFromPostgres(input: {
       }
     }
 
-    const correlationId = randomUUID()
+    const correlationId = command.receipt.correlation_id
     const merchandiseTotalMinor = normalized.lines.reduce((sum, line) => (
       sum + integerMinor(line.unitPriceMinor) * BigInt(Math.ceil(line.quantity))
     ), BigInt(0))
@@ -1976,6 +2695,7 @@ export async function runMockOperationsProofFromPostgres(input: {
         mock: true,
       },
     }, client)
+    await completeCommandReceipt(client, command.receipt.id, order.global_id)
 
     return {
       orderGlobalId: order.global_id,
@@ -1984,5 +2704,9 @@ export async function runMockOperationsProofFromPostgres(input: {
       trackingNumber: labelOutput.trackingNumber,
       steps: [...MOCK_PROOF_STEPS],
     }
-  })
+    })
+  } catch (error) {
+    await failCommandReceipt(command.receipt.id, error)
+    throw error
+  }
 }

@@ -73,6 +73,7 @@ export async function GET() {
     let toastWorker: Record<string, unknown> = { status: 'not-owned' }
     let quickBooksWorker: Record<string, unknown> = { status: 'not-owned' }
     let integrationQueues: Record<string, unknown> = { status: 'not-configured' }
+    let operationsCommands: Record<string, unknown> = { status: 'not-configured' }
     let crm: Record<string, unknown> = { status: 'disabled' }
     let knowledgeWorkers: Array<Record<string, unknown>> = []
     const repositoryRunner = getRepositoryRunnerConfiguration()
@@ -227,6 +228,8 @@ export async function GET() {
           pos_accounting_posting_outcomes_migration_applied: boolean
           external_pos_accounting_outcomes_migration_applied: boolean
           distributed_operations_migration_applied: boolean
+          operations_hardening_migration_applied: boolean
+          crm_interaction_contacts_migration_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -557,6 +560,16 @@ export async function GET() {
                 FROM schema_migrations
                 WHERE filename = '0081_distributed_operations_foundation.sql'
               ) AS distributed_operations_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0082_operations_activation_and_command_safety.sql'
+              ) AS operations_hardening_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0083_crm_interaction_contacts.sql'
+              ) AS crm_interaction_contacts_migration_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -634,6 +647,8 @@ export async function GET() {
             && row?.pos_accounting_posting_outcomes_migration_applied
             && row?.external_pos_accounting_outcomes_migration_applied
             && row?.distributed_operations_migration_applied
+            && row?.operations_hardening_migration_applied
+            && row?.crm_interaction_contacts_migration_applied
             && row?.migration_checksums_present
           ),
         }
@@ -703,9 +718,49 @@ export async function GET() {
           || !row?.pos_accounting_posting_outcomes_migration_applied
           || !row?.external_pos_accounting_outcomes_migration_applied
           || !row?.distributed_operations_migration_applied
+          || !row?.operations_hardening_migration_applied
+          || !row?.crm_interaction_contacts_migration_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')
+        }
+
+        if (row?.operations_hardening_migration_applied) {
+          const commandResult = await query<{
+            processing: number
+            failed: number
+            stale_processing: number
+            active_organizations: number
+            shadow_organizations: number
+          }>(
+            `SELECT
+               count(*) FILTER (WHERE receipt.status = 'processing')::integer AS processing,
+               count(*) FILTER (WHERE receipt.status = 'failed')::integer AS failed,
+               count(*) FILTER (
+                 WHERE receipt.status = 'processing'
+                   AND receipt.updated_at < now() - interval '15 minutes'
+               )::integer AS stale_processing,
+               (SELECT count(*)::integer FROM operations_activation_scopes WHERE state = 'active') AS active_organizations,
+               (SELECT count(*)::integer FROM operations_activation_scopes WHERE state = 'shadow') AS shadow_organizations
+             FROM operations_command_receipts receipt
+             JOIN workspace_organizations organization ON organization.id = receipt.organization_id
+             WHERE organization.is_demo = false`,
+          )
+          const commands = commandResult.rows[0]
+          const staleProcessing = Number(commands?.stale_processing || 0)
+          const failed = Number(commands?.failed || 0)
+          operationsCommands = {
+            status: staleProcessing > 0 ? 'error' : failed > 0 ? 'degraded' : 'healthy',
+            processing: Number(commands?.processing || 0),
+            failed,
+            staleProcessing,
+            activation: {
+              activeOrganizations: Number(commands?.active_organizations || 0),
+              shadowOrganizations: Number(commands?.shadow_organizations || 0),
+            },
+          }
+          if (staleProcessing > 0) errors.push('Operations command queue has stale processing commands.')
+          if (failed > 0) warnings.push('Operations command queue has failed commands available for review or retry.')
         }
 
         if (
@@ -1057,6 +1112,7 @@ export async function GET() {
       toastWorker,
       quickBooksWorker,
       integrationQueues,
+      operationsCommands,
       crm,
       knowledgeWorkers,
       capabilities: {

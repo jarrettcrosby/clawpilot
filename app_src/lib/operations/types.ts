@@ -18,6 +18,38 @@ export type OperationsExceptionSeverity = 'low' | 'medium' | 'high' | 'critical'
 
 export type OperationsExceptionStatus = 'open' | 'acknowledged' | 'resolved' | 'dismissed'
 
+export type OperationsActivationState = 'disabled' | 'shadow' | 'read_only' | 'active' | 'frozen'
+
+export type CommerceCustomerMatchMethod =
+  | 'external_id'
+  | 'email'
+  | 'contact_email'
+  | 'website_domain'
+  | 'name_phone'
+  | 'exact_name'
+  | 'created'
+
+export type CommerceCustomerIdentity = {
+  provider: string
+  externalCustomerId: string
+  companyName: string
+  email?: string | null
+  phone?: string | null
+  website?: string | null
+  address?: string | null
+  city?: string | null
+  region?: string | null
+  postalCode?: string | null
+  country?: string | null
+}
+
+export type CommerceCustomerResolution = {
+  status: 'matched' | 'created' | 'ambiguous'
+  method: CommerceCustomerMatchMethod | 'ambiguous'
+  customer: { id: string; globalId: string; name: string } | null
+  candidateGlobalIds: string[]
+}
+
 export type Millimeters = {
   length: number
   width: number
@@ -251,6 +283,14 @@ export type OperationsWorkspace = {
     canView: boolean
     canManage: boolean
     canExecute: boolean
+    canActivate: boolean
+  }
+  dataPipeline: { id: string; name: string }
+  activation: {
+    state: OperationsActivationState
+    revision: number
+    reason: string | null
+    updatedAt: string
   }
   summary: OperationsSummary
   orders: OperationsOrderListItem[]
@@ -286,4 +326,8 @@ export type MockOperationsProofResult = {
 export type OperationsExceptionUpdateResult = {
   exception: OperationsExceptionListItem
   changed: boolean
+}
+
+export type OperationsActivationUpdateResult = OperationsWorkspace['activation'] & {
+  dataPipeline: OperationsWorkspace['dataPipeline']
 }

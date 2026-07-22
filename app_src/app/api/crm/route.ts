@@ -335,7 +335,20 @@ export async function POST(req: NextRequest) {
 
 
     let contact: Awaited<ReturnType<typeof readCrmRecordReference>> | null = null
-    const contactId = fields.contactId === undefined ? current?.contactId || null : stringValue(fields.contactId, 50) || null
+    const interactionContactIds = entity === 'interactions'
+      ? fields.contactIds === undefined
+        ? current?.contactIds?.length
+          ? current.contactIds
+          : current?.contactId
+            ? [current.contactId]
+            : []
+        : uuidList(fields.contactIds, 'Interaction contacts')
+      : []
+    const contactId = entity === 'interactions'
+      ? interactionContactIds[0] || null
+      : fields.contactId === undefined
+        ? current?.contactId || null
+        : stringValue(fields.contactId, 50) || null
     if (contactId) {
       contact = await readCrmRecordReference({ pipelineId: pipeline.id, entity: 'contacts', id: String(contactId) })
     }
@@ -483,7 +496,8 @@ export async function POST(req: NextRequest) {
       sourcePayload: { ...(current?.sourcePayload || {}), source: 'clawpilot' },
       fields: {
         organizationId: organization?.id || contact?.organizationId || lead?.organizationId || current?.organizationId || null,
-        contactId: contact?.id || null, leadId: lead?.id || null, opportunityId: opportunity?.id || null,
+        contactId: contact?.id || null, contactIds: interactionContactIds,
+        leadId: lead?.id || null, opportunityId: opportunity?.id || null,
         meetingId: fields.meetingId === undefined
           ? current?.meetingId || null
           : stringValue(fields.meetingId, 50) || null,

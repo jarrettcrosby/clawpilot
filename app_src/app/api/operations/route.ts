@@ -6,6 +6,7 @@ import {
 import type {
   Address,
   MockOperationsProofInput,
+  OperationsActivationState,
   OperationsExceptionStatus,
   OperationsOrderStatus,
 } from '@/lib/operations/types'
@@ -14,6 +15,7 @@ import {
   OperationsRequestError,
   readOperationsWorkspaceFromPostgres,
   runMockOperationsProofFromPostgres,
+  updateOperationsActivationInPostgres,
   updateOperationsExceptionInPostgres,
 } from '@/lib/persistence/operations'
 import { requireRequestUser } from '@/lib/requestUser'
@@ -33,6 +35,9 @@ const ORDER_STATUSES = new Set<OperationsOrderStatus>([
 ])
 const EXCEPTION_STATUSES = new Set<OperationsExceptionStatus>([
   'open', 'acknowledged', 'resolved', 'dismissed',
+])
+const ACTIVATION_STATES = new Set<OperationsActivationState>([
+  'disabled', 'shadow', 'read_only', 'active', 'frozen',
 ])
 const PROOF_FIELDS = new Set([
   'customerGlobalId', 'productGlobalId', 'externalOrderId', 'orderNumber',
@@ -250,6 +255,27 @@ export async function POST(req: NextRequest) {
         actorEmail: actor.email,
         exceptionGlobalId: globalIdValue(body.exceptionGlobalId, 'Operations exception', EXCEPTION_GLOBAL_ID),
         status,
+      })
+      return json({ ok: true, capabilities, result })
+    }
+    if (action === 'update-activation') {
+      if (!capabilities.canActivate) {
+        return json({
+          ok: false,
+          error: 'Only an organization owner or authorized administrator may change Operations activation',
+          code: 'OPERATIONS_ACTIVATION_REQUIRED',
+        }, 403)
+      }
+      assertFields(body, new Set(['action', 'state', 'reason']), 'OPERATIONS_REQUEST_INVALID', 'Operations command')
+      const state = textValue(body.state, 'Activation state', 20) as OperationsActivationState
+      if (!ACTIVATION_STATES.has(state)) {
+        requestError('OPERATIONS_ACTIVATION_STATE_INVALID', 'Operations activation state is invalid')
+      }
+      const result = await updateOperationsActivationInPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        state,
+        reason: textValue(body.reason, 'Activation reason', 500, false) || null,
       })
       return json({ ok: true, capabilities, result })
     }

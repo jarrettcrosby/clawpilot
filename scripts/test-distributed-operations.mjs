@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
@@ -11,7 +12,7 @@ const nodeRequire = createRequire(import.meta.url)
 const requireFromApp = createRequire(new URL('../app_src/package.json', import.meta.url))
 const ts = requireFromApp('typescript')
 const { Pool } = requireFromApp('pg')
-const contractsOnly = process.argv.includes('--contracts-only') || !process.env.DATABASE_URL
+const contractsOnly = process.argv.includes('--contracts-only')
 
 function read(path) {
   return readFileSync(resolve(root, path), 'utf8')
@@ -90,11 +91,33 @@ function verifySourceContracts() {
     assert.ok(!migration.toLowerCase().includes(forbidden), `Operations migration must not persist ${forbidden}`)
   }
 
+  const hardeningMigration = read('db/migrations/0082_operations_activation_and_command_safety.sql')
+  for (const fragment of [
+    'CREATE TABLE IF NOT EXISTS operations_activation_scopes',
+    'CREATE TABLE IF NOT EXISTS operations_command_receipts',
+    'operations_command_receipts_idempotency_unique',
+    'operations_activation_scopes_pipeline_fkey',
+    'match_method text',
+    'match_evidence jsonb',
+    'last_verified_at timestamptz',
+  ]) assert.ok(hardeningMigration.includes(fragment), `Operations hardening migration missing ${fragment}`)
+  assert.ok(
+    !hardeningMigration.includes('actor_email text NOT NULL REFERENCES app_users'),
+    'Background provider commands must support attributable service actors',
+  )
+
   const persistence = read('app_src/lib/persistence/operations.ts')
   for (const fragment of [
     'readOperationsWorkspaceFromPostgres',
+    'resolveCommerceCustomerInPostgres',
     'runMockOperationsProofFromPostgres',
+    'updateOperationsActivationInPostgres',
     'updateOperationsExceptionInPostgres',
+    'operations_command_receipts',
+    'OPERATIONS_IDEMPOTENCY_CONFLICT',
+    'operations.customer_resolution.review_required',
+    "status: 'ambiguous'",
+    'uniqueReferenceRows',
     'operations:exception:',
     "aggregateType: 'operations.exception'",
     'operations:proof-order:',
@@ -130,6 +153,7 @@ function verifySourceContracts() {
     'MAX_REQUEST_BYTES',
     "action === 'run-proof-order'",
     "action === 'update-exception'",
+    "action === 'update-activation'",
   ]) assert.ok(route.includes(fragment), `Operations route missing ${fragment}`)
   assert.ok(!/clientSecret|accessToken|privateKey/i.test(route), 'Operations route must not handle credentials')
 
@@ -142,11 +166,23 @@ function verifySourceContracts() {
     health.includes('row?.distributed_operations_migration_applied'),
     'Health migration status must include distributed operations',
   )
+  assert.ok(
+    health.includes("WHERE filename = '0082_operations_activation_and_command_safety.sql'"),
+    'Health must require the operations hardening migration',
+  )
+  assert.ok(
+    health.includes('operationsCommands'),
+    'Health must report operations command receipt state',
+  )
 
   const predeploy = read('scripts/verify-predeploy.mjs')
   assert.ok(
     predeploy.includes("'db/migrations/0081_distributed_operations_foundation.sql'"),
     'Predeploy must require the distributed operations migration',
+  )
+  assert.ok(
+    predeploy.includes("'db/migrations/0082_operations_activation_and_command_safety.sql'"),
+    'Predeploy must require the operations hardening migration',
   )
 }
 
@@ -158,7 +194,7 @@ async function verifyRouteBehavior() {
       this.status = status
     }
   }
-  const calls = { reads: [], proofs: [], exceptions: [] }
+  const calls = { reads: [], proofs: [], exceptions: [], activations: [] }
   const route = loadTypeScriptModule('app_src/app/api/operations/route.ts', {
     mocks: {
       'next/server': {
@@ -195,6 +231,16 @@ async function verifyRouteBehavior() {
             steps: Array.from({ length: 20 }, (_, index) => `step-${index + 1}`),
           }
         },
+        updateOperationsActivationInPostgres: async (input) => {
+          calls.activations.push(input)
+          return {
+            state: input.state,
+            revision: 2,
+            reason: input.reason,
+            updatedAt: new Date().toISOString(),
+            dataPipeline: { id: randomUUID(), name: 'CRM pipeline' },
+          }
+        },
         updateOperationsExceptionInPostgres: async (input) => {
           calls.exceptions.push(input)
           return {
@@ -216,7 +262,7 @@ async function verifyRouteBehavior() {
   const actor = {
     email: 'operator@example.com',
     organizationId: randomUUID(),
-    capabilities: { canView: true, canManage: true, canExecute: true },
+    capabilities: { canView: true, canManage: true, canExecute: true, canActivate: true },
   }
   const request = (url, options = {}) => ({
     actor: options.actor || actor,
@@ -227,7 +273,7 @@ async function verifyRouteBehavior() {
   const payload = async (response) => JSON.parse(await response.text())
 
   const deniedRead = await route.GET(request('http://localhost/api/operations', {
-    actor: { ...actor, capabilities: { canView: false, canManage: false, canExecute: false } },
+    actor: { ...actor, capabilities: { canView: false, canManage: false, canExecute: false, canActivate: false } },
   }))
   assert.equal(deniedRead.status, 403)
   assert.equal((await payload(deniedRead)).code, 'OPERATIONS_VIEW_REQUIRED')
@@ -268,7 +314,7 @@ async function verifyRouteBehavior() {
     },
   }
   const deniedWrite = await route.POST(request('http://localhost/api/operations', {
-    actor: { ...actor, capabilities: { canView: true, canManage: true, canExecute: false } },
+    actor: { ...actor, capabilities: { canView: true, canManage: true, canExecute: false, canActivate: false } },
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ action: 'run-proof-order', proof }),
   }))
@@ -286,7 +332,7 @@ async function verifyRouteBehavior() {
   assert.equal(calls.proofs[0].proof.shipTo.country, 'US')
 
   const validExceptionUpdate = await route.POST(request('http://localhost/api/operations', {
-    actor: { ...actor, capabilities: { canView: true, canManage: true, canExecute: false } },
+    actor: { ...actor, capabilities: { canView: true, canManage: true, canExecute: false, canActivate: false } },
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ action: 'update-exception', exceptionGlobalId: 'gex1234567', status: 'acknowledged' }),
   }))
@@ -300,12 +346,33 @@ async function verifyRouteBehavior() {
   })
 
   const deniedExceptionUpdate = await route.POST(request('http://localhost/api/operations', {
-    actor: { ...actor, capabilities: { canView: true, canManage: false, canExecute: false } },
+    actor: { ...actor, capabilities: { canView: true, canManage: false, canExecute: false, canActivate: false } },
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ action: 'update-exception', exceptionGlobalId: 'gex1234567', status: 'resolved' }),
   }))
   assert.equal(deniedExceptionUpdate.status, 403)
   assert.equal((await payload(deniedExceptionUpdate)).code, 'OPERATIONS_MANAGE_REQUIRED')
+
+  const validActivation = await route.POST(request('http://localhost/api/operations', {
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'update-activation', state: 'read_only', reason: 'Provider reconciliation only' }),
+  }))
+  assert.equal(validActivation.status, 200)
+  assert.equal(calls.activations.length, 1)
+  assert.deepEqual(JSON.parse(JSON.stringify(calls.activations[0])), {
+    organizationId: actor.organizationId,
+    actorEmail: actor.email,
+    state: 'read_only',
+    reason: 'Provider reconciliation only',
+  })
+
+  const deniedActivation = await route.POST(request('http://localhost/api/operations', {
+    actor: { ...actor, capabilities: { canView: true, canManage: true, canExecute: true, canActivate: false } },
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'update-activation', state: 'active', reason: 'Unauthorized change' }),
+  }))
+  assert.equal(deniedActivation.status, 403)
+  assert.equal((await payload(deniedActivation)).code, 'OPERATIONS_ACTIVATION_REQUIRED')
 
   const invalidProduct = await route.POST(request('http://localhost/api/operations', {
     headers: { 'Content-Type': 'application/json' },
@@ -429,6 +496,58 @@ async function seedWorkspace(pool, label) {
   }
 }
 
+async function stageCommerceCustomerForAcceptance(client, input) {
+  assert.equal(input.entity, 'organizations')
+  const fields = input.fields || {}
+  const result = await client.query(
+    `INSERT INTO crm_organizations (
+       pipeline_id, suitecrm_id, source_key, identity_key,
+       parent_organization_id, relationship_type, name, website, phone, email,
+       billing_address_street, billing_address_city, billing_address_state,
+       billing_address_postal_code, billing_address_country, description,
+       source_payload, source_hash, created_by, updated_by
+     ) VALUES (
+       $1::uuid, $2, $3, $3,
+       $4::uuid, 'customer', $5, $6, $7, $8,
+       $9, $10, $11, $12, $13, $14,
+       $15::jsonb, $3, $16, $16
+     )
+     ON CONFLICT (pipeline_id, identity_key) DO UPDATE SET
+       name = EXCLUDED.name,
+       website = EXCLUDED.website,
+       phone = EXCLUDED.phone,
+       email = EXCLUDED.email,
+       updated_by = EXCLUDED.updated_by,
+       updated_at = now()
+     RETURNING id::text, suitecrm_id, reference_code`,
+    [
+      input.pipelineId,
+      `acceptance-${randomUUID()}`,
+      input.sourceKey,
+      fields.parentOrganizationId || null,
+      fields.name,
+      fields.website || null,
+      fields.phone || null,
+      fields.email || null,
+      fields.address || null,
+      fields.city || null,
+      fields.state || null,
+      fields.postalCode || null,
+      fields.country || null,
+      fields.description || null,
+      JSON.stringify(input.sourcePayload || {}),
+      input.actorEmail,
+    ],
+  )
+  return {
+    id: result.rows[0].id,
+    suiteCrmId: result.rows[0].suitecrm_id,
+    referenceCode: result.rows[0].reference_code,
+    shortUrl: null,
+    sourceHash: input.sourceKey,
+  }
+}
+
 function proofInput(fixture, externalOrderId, overrides = {}) {
   const requested = new Date()
   requested.setUTCDate(requested.getUTCDate() + 10)
@@ -463,10 +582,40 @@ async function expectRejected(work, predicate, message) {
   if (predicate) assert.ok(predicate(error), `${message}: ${String(error?.message || error)}`)
 }
 
-async function verifyPostgresAcceptance() {
+function command(commandName, args, options = {}) {
+  const result = spawnSync(commandName, args, {
+    cwd: root,
+    encoding: 'utf8',
+    timeout: options.timeout || 30_000,
+    env: { ...process.env, ...options.env },
+  })
+  if (result.error || result.status !== 0) {
+    throw result.error || new Error(`${commandName} ${args.join(' ')} failed: ${result.stderr || result.stdout}`)
+  }
+  return String(result.stdout || '').trim()
+}
+
+async function waitForPostgres(connectionString) {
+  const pool = new Pool({ connectionString, connectionTimeoutMillis: 2000 })
+  const deadline = Date.now() + 60_000
+  try {
+    while (Date.now() < deadline) {
+      try {
+        await pool.query('SELECT 1')
+        return
+      } catch {
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, 250))
+      }
+    }
+  } finally {
+    await pool.end().catch(() => undefined)
+  }
+  throw new Error('Disposable PostgreSQL did not become ready')
+}
+
+async function verifyPostgresAcceptance(databaseUrl) {
   const pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: String(process.env.PGSSLMODE || '').toLowerCase() === 'require' ? { rejectUnauthorized: false } : undefined,
+    connectionString: databaseUrl,
     connectionTimeoutMillis: 5000,
     query_timeout: 20_000,
   })
@@ -476,27 +625,120 @@ async function verifyPostgresAcceptance() {
     const adapters = loadTypeScriptModule('app_src/lib/operations/adapters.ts', {
       mocks: { '@/lib/operations/domain': domain },
     })
+    const stableId = loadTypeScriptModule('app_src/lib/crm/stableId.ts')
     const persistence = loadTypeScriptModule('app_src/lib/persistence/operations.ts', {
       mocks: {
         '@/lib/auditWriter': auditWriterMock(),
+        '@/lib/crm/stableId': stableId,
         '@/lib/operations/adapters': adapters,
         '@/lib/operations/domain': domain,
+        '@/lib/persistence/crm': {
+          stageCrmRecordWithClient: stageCommerceCustomerForAcceptance,
+        },
         '@/lib/persistence/postgres': postgresMock(pool),
       },
     })
     const primary = await seedWorkspace(pool, 'primary')
     const other = await seedWorkspace(pool, 'other')
     const externalOrderId = `mock-${randomUUID()}`
+    const primaryProof = proofInput(primary, externalOrderId)
     const first = await persistence.runMockOperationsProofFromPostgres({
       organizationId: primary.organizationId,
       actorEmail: primary.email,
-      proof: proofInput(primary, externalOrderId),
+      proof: primaryProof,
     })
     assert.match(first.orderGlobalId, /^gor\d{7}$/)
     assert.equal(first.orderStatus, 'shipped')
     assert.equal(first.duplicate, false)
     assert.match(first.trackingNumber, /^MOCK[A-F0-9]{18}$/)
     assert.equal(first.steps.length, 20)
+
+    const commerceIntegration = await pool.query(
+      `SELECT global_id
+       FROM operations_integration_accounts
+       WHERE organization_id = $1::uuid
+         AND provider = 'mock-commerce'
+         AND integration_type = 'commerce'
+         AND status = 'active'`,
+      [primary.organizationId],
+    )
+    assert.equal(commerceIntegration.rowCount, 1)
+    await pool.query(
+      `UPDATE crm_organizations
+       SET email = $3, phone = $4, website = $5, updated_at = now()
+       WHERE pipeline_id = $1::uuid AND id = $2::uuid`,
+      [
+        primary.pipelineId,
+        primary.customer.id,
+        `buyer-${primary.organizationId}@example.com`,
+        '+1 (203) 555-0188',
+        'https://existing-customer.example.com',
+      ],
+    )
+    const existingExternalId = `existing-${randomUUID()}`
+    const matchedCustomer = await persistence.resolveCommerceCustomerInPostgres({
+      organizationId: primary.organizationId,
+      integrationAccountGlobalId: commerceIntegration.rows[0].global_id,
+      actorEmail: `system:mock-commerce`,
+      identity: {
+        provider: 'mock-commerce',
+        externalCustomerId: existingExternalId,
+        companyName: 'Provider display name does not control identity',
+        email: `buyer-${primary.organizationId}@example.com`,
+      },
+    })
+    assert.equal(matchedCustomer.status, 'matched')
+    assert.equal(matchedCustomer.method, 'email')
+    assert.equal(matchedCustomer.customer.globalId, primary.customer.reference_code)
+    const matchedAgain = await persistence.resolveCommerceCustomerInPostgres({
+      organizationId: primary.organizationId,
+      integrationAccountGlobalId: commerceIntegration.rows[0].global_id,
+      actorEmail: `system:mock-commerce`,
+      identity: {
+        provider: 'mock-commerce',
+        externalCustomerId: existingExternalId,
+        companyName: 'Renamed at provider',
+      },
+    })
+    assert.equal(matchedAgain.status, 'matched')
+    assert.equal(matchedAgain.method, 'external_id')
+    assert.equal(matchedAgain.customer.globalId, primary.customer.reference_code)
+
+    const createdExternalId = `new-customer-${randomUUID()}`
+    const createdCustomer = await persistence.resolveCommerceCustomerInPostgres({
+      organizationId: primary.organizationId,
+      integrationAccountGlobalId: commerceIntegration.rows[0].global_id,
+      actorEmail: `system:mock-commerce`,
+      identity: {
+        provider: 'mock-commerce',
+        externalCustomerId: createdExternalId,
+        companyName: `New Provider Customer ${randomUUID().slice(0, 8)}`,
+        email: `new-provider-${randomUUID().slice(0, 8)}@example.net`,
+      },
+    })
+    assert.equal(createdCustomer.status, 'created')
+    assert.equal(createdCustomer.method, 'created')
+    assert.match(createdCustomer.customer.globalId, /^ga\d{7}$/)
+    const createdAgain = await persistence.resolveCommerceCustomerInPostgres({
+      organizationId: primary.organizationId,
+      integrationAccountGlobalId: commerceIntegration.rows[0].global_id,
+      actorEmail: `system:mock-commerce`,
+      identity: {
+        provider: 'mock-commerce',
+        externalCustomerId: createdExternalId,
+        companyName: 'Provider later changed the company name',
+      },
+    })
+    assert.equal(createdAgain.status, 'matched')
+    assert.equal(createdAgain.method, 'external_id')
+    assert.equal(createdAgain.customer.globalId, createdCustomer.customer.globalId)
+    const customerCount = await pool.query(
+      `SELECT count(*)::int AS count
+       FROM crm_organizations
+       WHERE pipeline_id = $1::uuid`,
+      [primary.pipelineId],
+    )
+    assert.equal(customerCount.rows[0].count, 2)
 
     const baseline = await pool.query(
       `SELECT
@@ -522,7 +764,7 @@ async function verifyPostgresAcceptance() {
     const duplicate = await persistence.runMockOperationsProofFromPostgres({
       organizationId: primary.organizationId,
       actorEmail: primary.email,
-      proof: proofInput(primary, externalOrderId),
+      proof: primaryProof,
     })
     assert.equal(duplicate.duplicate, true)
     assert.equal(duplicate.orderGlobalId, first.orderGlobalId)
@@ -769,11 +1011,41 @@ async function verifyPostgresAcceptance() {
   }
 }
 
+async function verifyDisposablePostgres() {
+  command('docker', ['info'], { timeout: 30_000 })
+  const container = `clawpilot-operations-${process.pid}-${randomUUID().slice(0, 8)}`
+  try {
+    command('docker', [
+      'run', '--rm', '-d', '--name', container,
+      '-e', 'POSTGRES_PASSWORD=clawpilot_operations',
+      '-e', 'POSTGRES_DB=clawpilot_operations',
+      '-p', '127.0.0.1::5432',
+      'pgvector/pgvector:pg16',
+    ], { timeout: 180_000 })
+    const portOutput = command('docker', ['port', container, '5432/tcp'])
+    const port = Number(portOutput.match(/:(\d+)\s*$/)?.[1])
+    assert.ok(port > 0, `Unable to resolve disposable PostgreSQL port from ${portOutput}`)
+    const databaseUrl = `postgresql://postgres:clawpilot_operations@127.0.0.1:${port}/clawpilot_operations`
+    await waitForPostgres(databaseUrl)
+    command('node', ['scripts/db-migrate.mjs'], {
+      env: { DATABASE_URL: databaseUrl, PGSSLMODE: 'disable' },
+      timeout: 180_000,
+    })
+    await verifyPostgresAcceptance(databaseUrl)
+  } finally {
+    spawnSync('docker', ['stop', '-t', '1', container], {
+      cwd: root,
+      encoding: 'utf8',
+      timeout: 20_000,
+    })
+  }
+}
+
 async function main() {
   verifySourceContracts()
   await verifyRouteBehavior()
-  if (!contractsOnly) await verifyPostgresAcceptance()
-  console.log(`Distributed operations contracts passed${contractsOnly ? '' : ' with PostgreSQL acceptance'}`)
+  if (!contractsOnly) await verifyDisposablePostgres()
+  console.log(`Distributed operations contracts passed${contractsOnly ? '' : ' with disposable PostgreSQL acceptance'}`)
 }
 
 main().catch((error) => {

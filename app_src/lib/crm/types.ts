@@ -157,6 +157,8 @@ export type CrmInteraction = {
   organizationName: string
   contactId: string | null
   contactName: string
+  contactIds: string[]
+  contacts: CrmOpportunityContact[]
   opportunityId: string | null
   opportunityName: string
   leadId: string | null

@@ -4,6 +4,7 @@ export type OperationsCapabilities = {
   canView: boolean
   canManage: boolean
   canExecute: boolean
+  canActivate: boolean
 }
 
 export function operationsCapabilities(user: AppUser): OperationsCapabilities {
@@ -13,6 +14,7 @@ export function operationsCapabilities(user: AppUser): OperationsCapabilities {
     canView: role === 'owner' || permissions.viewOperations === true,
     canManage: role === 'owner' || ((role === 'admin' || role === 'member') && permissions.manageOperations === true),
     canExecute: role === 'owner' || permissions.executeWarehouse === true,
+    canActivate: role === 'owner' || (role === 'admin' && permissions.manageOperations === true),
   }
 }
 

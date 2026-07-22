@@ -232,6 +232,7 @@ export type StageInteractionInput = CommonStageInput & {
   fields: {
     organizationId?: string | null
     contactId?: string | null
+    contactIds?: string[]
     contactSuiteCrmId?: string | null
     opportunityId?: string | null
     leadId?: string | null
@@ -467,11 +468,19 @@ async function suiteCrmRelationships(
       related_bean_id: string
     }>(
       `SELECT 'contact'::text AS link_field_name, 'Contacts'::text AS related_module_name,
-         suitecrm_id AS related_bean_id
-       FROM crm_contacts
-       WHERE pipeline_id = $1::uuid AND id = $2::uuid AND suitecrm_id IS NOT NULL`,
-      [input.pipelineId, input.fields.contactId || null],
+         contact.suitecrm_id AS related_bean_id
+       FROM crm_interactions interaction
+       JOIN crm_contacts contact
+         ON contact.pipeline_id = interaction.pipeline_id
+        AND contact.id = interaction.contact_id
+       WHERE interaction.pipeline_id = $1::uuid
+         AND interaction.id = $2::uuid
+         AND contact.suitecrm_id IS NOT NULL`,
+      [input.pipelineId, input.localId || null],
     )
+    // SuiteCRM Notes expose one canonical Contact relationship. ClawPilot keeps
+    // the complete contact set locally while the first selected contact remains
+    // the SuiteCRM-compatible primary relationship.
     return result.rows.map((row) => ({
       linkFieldName: row.link_field_name,
       relatedModuleName: row.related_module_name,
@@ -1264,7 +1273,35 @@ async function stageInteraction(client: PoolClient, input: StageInteractionInput
       JSON.stringify(input.sourcePayload || {}), sourceHash, input.actorEmail,
     ],
   )
-  return result.rows[0]
+  const row = result.rows[0]
+  const contactSelectionWasProvided = fields.contactIds !== undefined || fields.contactId !== undefined
+  if (contactSelectionWasProvided) {
+    const selectedContactIds = fields.contactIds !== undefined
+      ? uniqueUuidList(fields.contactIds)
+      : uniqueUuidList(fields.contactId ? [fields.contactId] : [])
+    const expectedSelectionSize = fields.contactIds !== undefined
+      ? fields.contactIds.length
+      : fields.contactId
+        ? 1
+        : 0
+    if (selectedContactIds.length !== expectedSelectionSize) {
+      throw new Error('Interaction contact selection is invalid')
+    }
+    await client.query(
+      `DELETE FROM crm_interaction_contacts
+       WHERE pipeline_id = $1::uuid AND interaction_id = $2::uuid`,
+      [input.pipelineId, row.id],
+    )
+    for (const [index, contactId] of selectedContactIds.entries()) {
+      await client.query(
+        `INSERT INTO crm_interaction_contacts (
+           pipeline_id, interaction_id, contact_id, is_primary, sort_order, created_by, updated_at
+         ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6, now())`,
+        [input.pipelineId, row.id, contactId, index === 0, index, input.actorEmail],
+      )
+    }
+  }
+  return row
 }
 
 function crmReferenceDestination(referenceCode: string) {
@@ -1534,6 +1571,18 @@ async function normalizeStageCrmRecordInput(
   }
   if (input.entity === 'interactions') {
     const fields = input.fields
+    const contactIds = fields.contactIds !== undefined
+      ? uniqueUuidList(fields.contactIds)
+      : uniqueUuidList(fields.contactId ? [fields.contactId] : [])
+    const expectedContactCount = fields.contactIds !== undefined
+      ? fields.contactIds.length
+      : fields.contactId
+        ? 1
+        : 0
+    if (contactIds.length !== expectedContactCount) {
+      throw new Error('Interaction contact selection is invalid')
+    }
+    const primaryContactId = contactIds[0] || null
     const agentEmail = clean(fields.agentEmail).toLowerCase()
     const agentLookup = agentEmail || clean(fields.agentName)
     const agent = agentLookup
@@ -1587,24 +1636,37 @@ async function normalizeStageCrmRecordInput(
       [
         input.pipelineId,
         fields.organizationId || null,
-        fields.contactId || null,
+        primaryContactId,
         fields.leadId || null,
         fields.opportunityId || null,
         fields.meetingId || null,
       ],
     )
     const organization = relationship.rows[0]
-    if (
-      fields.organizationId
-      && fields.contactId
-      && organization?.contact_organization_id !== organization?.organization_id
-    ) {
-      throw new Error('Interaction contact must belong to the selected organization')
+    if (contactIds.length > 0) {
+      const selectedContacts = await client.query<{ id: string; organization_id: string | null }>(
+        `SELECT id::text, organization_id::text
+         FROM crm_contacts
+         WHERE pipeline_id = $1::uuid
+           AND id = ANY($2::uuid[])`,
+        [input.pipelineId, contactIds],
+      )
+      if (selectedContacts.rowCount !== contactIds.length) {
+        throw new Error('Interaction contact selection is invalid')
+      }
+      if (
+        organization?.organization_id
+        && selectedContacts.rows.some((contact) => contact.organization_id !== organization.organization_id)
+      ) {
+        throw new Error('Interaction contacts must belong to the selected organization')
+      }
     }
     return {
       ...input,
       fields: {
         ...fields,
+        contactId: primaryContactId,
+        contactIds: fields.contactIds === undefined ? undefined : contactIds,
         agentEmail: agent?.rows[0]?.email || null,
         agentName: agent?.rows[0]
           ? clean(agent.rows[0].display_name) || agent.rows[0].email
@@ -2868,11 +2930,27 @@ function hydrateOpportunityRowsWithPool(rows: Record<string, unknown>[], pipelin
   return hydrateOpportunityRows(rows, pipelineId, (text, values) => query<Record<string, unknown>>(text, values))
 }
 
-function interactionFromRow(row: Record<string, unknown>): CrmInteraction {
+function interactionFromRow(
+  row: Record<string, unknown>,
+  contacts: CrmInteraction['contacts'] = [],
+): CrmInteraction {
+  const fallbackContact = row.contact_id ? [{
+    id: String(row.contact_id),
+    referenceCode: clean(row.contact_reference_code),
+    fullName: clean(row.contact_name),
+    email: clean(row.contact_email),
+    phoneWork: clean(row.contact_phone_work),
+    phoneMobile: clean(row.contact_phone_mobile),
+    jobTitle: clean(row.contact_job_title),
+    isPrimary: true,
+  }] : []
+  const relatedContacts = contacts.length > 0 ? contacts : fallbackContact
+  const primaryContact = relatedContacts.find((contact) => contact.isPrimary) || relatedContacts[0] || null
   return {
     id: String(row.id), referenceCode: clean(row.reference_code), shortUrl: crmReferenceShortUrl(row.reference_code),
     pipelineId: String(row.pipeline_id), organizationId: nullable(row.organization_id), organizationName: clean(row.organization_name),
-    contactId: nullable(row.contact_id), contactName: clean(row.contact_name),
+    contactId: primaryContact?.id || nullable(row.contact_id), contactName: primaryContact?.fullName || clean(row.contact_name),
+    contactIds: relatedContacts.map((contact) => contact.id), contacts: relatedContacts,
     opportunityId: nullable(row.opportunity_id), opportunityName: clean(row.opportunity_name),
     leadId: nullable(row.lead_id), leadName: clean(row.lead_name),
     meetingId: nullable(row.meeting_id), meetingName: clean(row.meeting_name),
@@ -2886,6 +2964,49 @@ function interactionFromRow(row: Record<string, unknown>): CrmInteraction {
     providerThreadId: nullable(row.provider_thread_id), syncStatus: row.sync_status as CrmInteraction['syncStatus'], syncError: nullable(row.sync_error),
     updatedAt: String(row.updated_at),
   }
+}
+
+async function hydrateInteractionRows(
+  rows: Record<string, unknown>[],
+  pipelineId: string,
+  runQuery: (text: string, values: unknown[]) => Promise<{ rows: Record<string, unknown>[] }>,
+) {
+  if (rows.length === 0) return []
+  const interactionIds = rows.map((row) => String(row.id))
+  const relationshipResult = await runQuery(
+    `SELECT relationship.interaction_id::text, relationship.is_primary,
+       contact.id::text, contact.reference_code, contact.full_name, contact.email,
+       contact.phone_work, contact.phone_mobile, contact.job_title
+     FROM crm_interaction_contacts relationship
+     JOIN crm_contacts contact
+       ON contact.pipeline_id = relationship.pipeline_id
+      AND contact.id = relationship.contact_id
+     WHERE relationship.pipeline_id = $1::uuid
+       AND relationship.interaction_id = ANY($2::uuid[])
+     ORDER BY relationship.interaction_id, relationship.sort_order, contact.full_name, contact.id`,
+    [pipelineId, interactionIds],
+  )
+  const byInteraction = new Map<string, CrmInteraction['contacts']>()
+  for (const relationship of relationshipResult.rows) {
+    const interactionId = String(relationship.interaction_id)
+    const contacts = byInteraction.get(interactionId) || []
+    contacts.push({
+      id: String(relationship.id),
+      referenceCode: clean(relationship.reference_code),
+      fullName: clean(relationship.full_name),
+      email: clean(relationship.email),
+      phoneWork: clean(relationship.phone_work),
+      phoneMobile: clean(relationship.phone_mobile),
+      jobTitle: clean(relationship.job_title),
+      isPrimary: relationship.is_primary === true,
+    })
+    byInteraction.set(interactionId, contacts)
+  }
+  return rows.map((row) => interactionFromRow(row, byInteraction.get(String(row.id)) || []))
+}
+
+function hydrateInteractionRowsWithPool(rows: Record<string, unknown>[], pipelineId: string) {
+  return hydrateInteractionRows(rows, pipelineId, (text, values) => query<Record<string, unknown>>(text, values))
 }
 
 function leadFromRow(row: Record<string, unknown>): CrmLead {
@@ -3080,6 +3201,9 @@ export async function listCrmRecordsInPostgres(input: {
        COALESCE(interaction.organization_id, contact.organization_id, lead.organization_id,
          opportunity.organization_id, meeting.organization_id) AS organization_id,
        organization.name AS organization_name, contact.full_name AS contact_name,
+       contact.reference_code AS contact_reference_code, contact.email AS contact_email,
+       contact.phone_work AS contact_phone_work, contact.phone_mobile AS contact_phone_mobile,
+       contact.job_title AS contact_job_title,
        lead.full_name AS lead_name, opportunity.name AS opportunity_name,
        meeting.subject AS meeting_name, campaign.name AS campaign_name
      FROM crm_interactions interaction
@@ -3103,7 +3227,12 @@ export async function listCrmRecordsInPostgres(input: {
            interaction.organization_id, contact.organization_id, lead.organization_id,
            opportunity.organization_id, meeting.organization_id
          ) = $6::uuid
-         WHEN 'contacts' THEN interaction.contact_id = $6::uuid
+         WHEN 'contacts' THEN interaction.contact_id = $6::uuid OR EXISTS (
+           SELECT 1 FROM crm_interaction_contacts relationship
+           WHERE relationship.pipeline_id = interaction.pipeline_id
+             AND relationship.interaction_id = interaction.id
+             AND relationship.contact_id = $6::uuid
+         )
          WHEN 'leads' THEN interaction.lead_id = $6::uuid
          WHEN 'opportunities' THEN interaction.opportunity_id = $6::uuid
          WHEN 'meetings' THEN interaction.meeting_id = $6::uuid
@@ -3114,6 +3243,18 @@ export async function listCrmRecordsInPostgres(input: {
          OR interaction.subject ILIKE '%' || $2 || '%'
          OR interaction.description ILIKE '%' || $2 || '%'
          OR organization.name ILIKE '%' || $2 || '%' OR contact.full_name ILIKE '%' || $2 || '%'
+         OR EXISTS (
+           SELECT 1
+           FROM crm_interaction_contacts relationship
+           JOIN crm_contacts related_contact
+             ON related_contact.pipeline_id = relationship.pipeline_id
+            AND related_contact.id = relationship.contact_id
+           WHERE relationship.pipeline_id = interaction.pipeline_id
+             AND relationship.interaction_id = interaction.id
+             AND (related_contact.full_name ILIKE '%' || $2 || '%'
+               OR related_contact.reference_code ILIKE '%' || $2 || '%'
+               OR related_contact.email ILIKE '%' || $2 || '%')
+         )
          OR lead.full_name ILIKE '%' || $2 || '%' OR opportunity.name ILIKE '%' || $2 || '%'
          OR meeting.subject ILIKE '%' || $2 || '%' OR campaign.name ILIKE '%' || $2 || '%'
          OR contact.reference_code ILIKE '%' || $2 || '%' OR lead.reference_code ILIKE '%' || $2 || '%'
@@ -3122,7 +3263,7 @@ export async function listCrmRecordsInPostgres(input: {
      ORDER BY interaction.occurred_at DESC NULLS LAST, interaction.updated_at DESC, interaction.id LIMIT $4`,
     [input.pipelineId, search, input.needsReview === true, limit, input.relatedEntity || '', input.relatedId || null],
   )
-  return result.rows.map(interactionFromRow)
+  return hydrateInteractionRowsWithPool(result.rows, input.pipelineId)
 }
 
 export async function listCrmCampaignRecipientsInPostgres(input: {
@@ -4000,6 +4141,15 @@ export async function readCrmRecordReference(input: {
     && !Array.isArray(row.source_payload)
     ? row.source_payload as Record<string, unknown>
     : {}
+  const contactIds = input.entity === 'interactions'
+    ? (await query<{ contact_id: string }>(
+        `SELECT contact_id::text
+         FROM crm_interaction_contacts
+         WHERE pipeline_id = $1::uuid AND interaction_id = $2::uuid
+         ORDER BY sort_order, contact_id`,
+        [input.pipelineId, input.id],
+      )).rows.map((contact) => contact.contact_id)
+    : []
   return {
     id: String(row.id),
     referenceCode: clean(row.reference_code),
@@ -4010,6 +4160,7 @@ export async function readCrmRecordReference(input: {
     organizationName: clean(row.organization_name),
     organizationId: nullable(row.organization_id),
     contactId: nullable(row.contact_id),
+    contactIds,
     leadId: nullable(row.lead_id),
     opportunityId: nullable(row.opportunity_id),
     meetingId: nullable(row.meeting_id),
