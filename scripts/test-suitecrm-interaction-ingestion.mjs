@@ -23,6 +23,7 @@ async function importTypeScript(relativePath, { injectRuntime = false } = {}) {
     output = `
 const listSuiteCrmNotesUpdatedSince = (...args) => globalThis.__suiteCrmInteractionTest.list(...args)
 const stageCrmRecordInPostgres = (...args) => globalThis.__suiteCrmInteractionTest.stage(...args)
+const archiveCrmRecordInPostgres = (...args) => globalThis.__suiteCrmInteractionTest.archive(...args)
 const query = (...args) => globalThis.__suiteCrmInteractionTest.query(...args)
 const decodeHtmlEntities = (value) => globalThis.__decodeHtmlEntities(value)
 ${output}`
@@ -194,6 +195,7 @@ const ambiguousParentNote = {
 const listCalls = []
 const cursorWrites = []
 const staged = []
+const archived = []
 globalThis.__suiteCrmInteractionTest = {
   list: async (input) => {
     listCalls.push(input)
@@ -209,6 +211,10 @@ globalThis.__suiteCrmInteractionTest = {
     staged.push(input)
     return { id: input.localId, referenceCode: 'gi0000001' }
   },
+  archive: async (input) => {
+    archived.push(input)
+    return { archived: true, changed: true, referenceCode: 'gi0000004' }
+  },
   query: async (sql, parameters = []) => {
     if (sql.startsWith('SELECT value FROM app_settings')) return { rows: [] }
     if (sql.includes('INSERT INTO app_settings')) {
@@ -217,6 +223,9 @@ globalThis.__suiteCrmInteractionTest = {
     }
     if (sql.includes('FROM crm_interactions interaction')) {
       if (parameters[0] === changedNote.id) return { rows: [interactionRow()] }
+      if (parameters[0] === deletedNote.id) {
+        return { rows: [interactionRow({ id: 'interaction-deleted', suitecrm_id: deletedNote.id, reference_code: 'gi0000004' })] }
+      }
       if (parameters[0] === ambiguousIdentityNote.id) {
         return {
           rows: [
@@ -252,8 +261,8 @@ const counts = await ingestion.processSuiteCrmInteractionIngestion()
 assert.deepEqual(counts, {
   pagesPolled: 2,
   notesListed: 6,
-  notesMatched: 3,
-  interactionsMatched: 3,
+  notesMatched: 4,
+  interactionsMatched: 4,
   interactionsStaged: 1,
   unchangedInteractions: 2,
   unmatchedNotes: 1,
@@ -261,7 +270,8 @@ assert.deepEqual(counts, {
   parentsResolved: 1,
   parentsUnresolved: 1,
   parentsAmbiguous: 1,
-  deletedNotesIgnored: 1,
+  interactionsArchived: 1,
+  deletedNotesIgnored: 0,
   pending: false,
   errors: 0,
 })
@@ -275,6 +285,14 @@ assert.equal(staged[0].sourceSheetId, 'sheet-1')
 assert.equal(staged[0].sourceRowNumber, 12)
 assert.equal(staged[0].actorEmail, 'owner@example.com')
 assert.equal(staged[0].emitSuiteCrmOutbox, false)
+assert.deepEqual(archived, [{
+  pipelineId: 'pipeline-1',
+  entity: 'interactions',
+  id: 'interaction-deleted',
+  actorEmail: 'owner@example.com',
+  emitSuiteCrmOutbox: false,
+  archiveSource: 'suitecrm',
+}])
 assert.equal(staged[0].sourcePayload.source, 'crm-integration-action')
 assert.deepEqual(staged[0].sourcePayload.suiteCrmInbound, {
   module: 'Notes',
@@ -315,6 +333,9 @@ globalThis.__suiteCrmInteractionTest = {
   },
   stage: async () => {
     throw new Error('Overlap poll should not stage records')
+  },
+  archive: async () => {
+    throw new Error('Overlap poll should not archive records')
   },
   query: async (sql, parameters = []) => {
     if (sql.startsWith('SELECT value FROM app_settings')) {

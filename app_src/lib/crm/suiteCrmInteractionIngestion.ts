@@ -4,6 +4,7 @@ import {
 } from '@/lib/crm/suiteCrmClient'
 import { decodeHtmlEntities } from '@/lib/htmlEntities.mjs'
 import {
+  archiveCrmRecordInPostgres,
   stageCrmRecordInPostgres,
   type StageInteractionInput,
 } from '@/lib/persistence/crm'
@@ -106,6 +107,7 @@ export type SuiteCrmInteractionIngestionCounts = {
   parentsResolved: number
   parentsUnresolved: number
   parentsAmbiguous: number
+  interactionsArchived: number
   deletedNotesIgnored: number
   pending: boolean
   errors: number
@@ -557,6 +559,7 @@ export async function processSuiteCrmInteractionIngestion(): Promise<SuiteCrmInt
     parentsResolved: 0,
     parentsUnresolved: 0,
     parentsAmbiguous: 0,
+    interactionsArchived: 0,
     deletedNotesIgnored: 0,
     pending: false,
     errors: 0,
@@ -581,12 +584,28 @@ export async function processSuiteCrmInteractionIngestion(): Promise<SuiteCrmInt
       counts.pagesPolled += 1
       counts.notesListed += page.notes.length
       for (const snapshot of page.notes) {
-        if (suiteCrmSnapshotIsDeleted(snapshot)) {
-          counts.deletedNotesIgnored += 1
-          continue
-        }
         const matches = await localInteractions(snapshot)
         counts.ambiguousInteractionMatches += matches.ambiguousPipelines
+        if (suiteCrmSnapshotIsDeleted(snapshot)) {
+          if (matches.rows.length === 0) {
+            counts.deletedNotesIgnored += 1
+            continue
+          }
+          counts.notesMatched += 1
+          for (const row of matches.rows) {
+            counts.interactionsMatched += 1
+            const result = await archiveCrmRecordInPostgres({
+              pipelineId: row.pipeline_id,
+              entity: 'interactions',
+              id: row.id,
+              actorEmail: row.owner_email,
+              emitSuiteCrmOutbox: false,
+              archiveSource: 'suitecrm',
+            })
+            if (result.changed) counts.interactionsArchived += 1
+          }
+          continue
+        }
         if (matches.rows.length === 0) {
           if (matches.ambiguousPipelines === 0) counts.unmatchedNotes += 1
           continue

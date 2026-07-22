@@ -198,6 +198,26 @@ function textValue(record: RecordValue, key: string) {
   return String(record[key] ?? '')
 }
 
+function recordsForOrganization(records: RecordValue[], organizationId: string) {
+  if (!organizationId) return records
+  return records.filter((record) => textValue(record, 'organizationId') === organizationId)
+}
+
+function opportunityOptionLabel(record: RecordValue) {
+  const products = Array.isArray(record.products)
+    ? record.products
+      .map((product) => product && typeof product === 'object' ? textValue(product as RecordValue, 'name') : '')
+      .filter(Boolean)
+    : []
+  const productLabel = products.join(', ') || textValue(record, 'name') || 'Untitled opportunity'
+  const context = [
+    textValue(record, 'organization') || textValue(record, 'organizationName'),
+    textValue(record, 'stage'),
+    textValue(record, 'referenceCode'),
+  ].filter(Boolean)
+  return context.length > 0 ? `${productLabel} - ${context.join(' · ')}` : productLabel
+}
+
 function displayValue(record: RecordValue, key: string, settings: UserDateTimeSettings) {
   if (key === 'startsAt' || key === 'occurredAt') {
     return formatUserDateTime(textValue(record, key), settings, {
@@ -1535,7 +1555,7 @@ export default function CrmSection() {
                   Convert
                 </Button>
               )}
-              {(editorEntity === 'leads' || editorEntity === 'campaigns') && (
+              {(editorEntity === 'leads' || editorEntity === 'interactions' || editorEntity === 'campaigns') && (
                 <Tooltip title={`Archive ${ENTITY_LABELS[editorEntity].slice(0, -1).toLowerCase()}`}>
                   <IconButton
                     aria-label={`Archive ${ENTITY_LABELS[editorEntity].slice(0, -1).toLowerCase()}`}
@@ -1741,10 +1761,14 @@ export default function CrmSection() {
             <TextField disabled={!recordEditable} select label="Organization" value={fields.organizationId || ''} onChange={(event) => {
               const organizationId = event.target.value
               const selectedContact = contacts.find((record) => textValue(record, 'id') === fields.contactId)
+              const selectedOpportunity = opportunities.find((record) => textValue(record, 'id') === fields.opportunityId)
               setFields({
                 ...fields,
                 organizationId,
                 contactId: selectedContact && textValue(selectedContact, 'organizationId') === organizationId ? fields.contactId : '',
+                opportunityId: selectedOpportunity && textValue(selectedOpportunity, 'organizationId') === organizationId
+                  ? fields.opportunityId
+                  : '',
               })
             }}>
               <MenuItem value="">Unlinked</MenuItem>
@@ -1755,15 +1779,24 @@ export default function CrmSection() {
             </TextField>
             <TextField disabled={!recordEditable} select label="Contact" value={fields.contactId || ''} onChange={(event) => setFields({ ...fields, contactId: event.target.value })}>
               <MenuItem value="">None</MenuItem>
-              {contacts.map((record) => <MenuItem key={textValue(record, 'id')} value={textValue(record, 'id')}>{textValue(record, 'fullName')}</MenuItem>)}
+              {recordsForOrganization(contacts, fields.organizationId || '')
+                .map((record) => <MenuItem key={textValue(record, 'id')} value={textValue(record, 'id')}>{textValue(record, 'fullName')}</MenuItem>)}
             </TextField>
             <TextField disabled={!recordEditable} select label="Lead" value={fields.leadId || ''} onChange={(event) => setFields({ ...fields, leadId: event.target.value })}>
               <MenuItem value="">None</MenuItem>
               {leads.map((record) => <MenuItem key={textValue(record, 'id')} value={textValue(record, 'id')}>{textValue(record, 'fullName')}</MenuItem>)}
             </TextField>
-            <TextField disabled={!recordEditable} select label="Opportunity" value={fields.opportunityId || ''} onChange={(event) => setFields({ ...fields, opportunityId: event.target.value })}>
+            <TextField
+              disabled={!recordEditable}
+              select
+              label="Pipeline opportunity"
+              value={fields.opportunityId || ''}
+              onChange={(event) => setFields({ ...fields, opportunityId: event.target.value })}
+              helperText="Choose the pipeline deal; its selected products appear in the list."
+            >
               <MenuItem value="">None</MenuItem>
-              {opportunities.map((record) => <MenuItem key={textValue(record, 'id')} value={textValue(record, 'id')}>{textValue(record, 'name')}</MenuItem>)}
+              {recordsForOrganization(opportunities, fields.organizationId || '')
+                .map((record) => <MenuItem key={textValue(record, 'id')} value={textValue(record, 'id')}>{opportunityOptionLabel(record)}</MenuItem>)}
             </TextField>
             <TextField disabled={!recordEditable} label="Starts" type="datetime-local" value={fields.startsAt || ''} onChange={(event) => setFields({ ...fields, startsAt: event.target.value })} InputLabelProps={{ shrink: true }} required />
             <TextField disabled={!recordEditable} label="Ends" type="datetime-local" value={fields.endsAt || ''} onChange={(event) => setFields({ ...fields, endsAt: event.target.value })} InputLabelProps={{ shrink: true }} required />
@@ -1776,10 +1809,14 @@ export default function CrmSection() {
             <TextField disabled={!recordEditable} select label="Organization" value={fields.organizationId || ''} onChange={(event) => {
               const organizationId = event.target.value
               const selectedContact = contacts.find((record) => textValue(record, 'id') === fields.contactId)
+              const selectedOpportunity = opportunities.find((record) => textValue(record, 'id') === fields.opportunityId)
               setFields({
                 ...fields,
                 organizationId,
                 contactId: selectedContact && textValue(selectedContact, 'organizationId') === organizationId ? fields.contactId : '',
+                opportunityId: selectedOpportunity && textValue(selectedOpportunity, 'organizationId') === organizationId
+                  ? fields.opportunityId
+                  : '',
               })
             }}>
               <MenuItem value="">None</MenuItem>
@@ -1790,17 +1827,24 @@ export default function CrmSection() {
             </TextField>
             <TextField disabled={!recordEditable} select label="Contact" value={fields.contactId || ''} onChange={(event) => setFields({ ...fields, contactId: event.target.value })}>
               <MenuItem value="">None</MenuItem>
-              {contacts
-                .filter((record) => !fields.organizationId || textValue(record, 'organizationId') === fields.organizationId)
+              {recordsForOrganization(contacts, fields.organizationId || '')
                 .map((record) => <MenuItem key={textValue(record, 'id')} value={textValue(record, 'id')}>{textValue(record, 'fullName')}</MenuItem>)}
             </TextField>
             <TextField disabled={!recordEditable} select label="Lead" value={fields.leadId || ''} onChange={(event) => setFields({ ...fields, leadId: event.target.value })}>
               <MenuItem value="">None</MenuItem>
               {leads.map((record) => <MenuItem key={textValue(record, 'id')} value={textValue(record, 'id')}>{textValue(record, 'fullName')}</MenuItem>)}
             </TextField>
-            <TextField disabled={!recordEditable} select label="Opportunity" value={fields.opportunityId || ''} onChange={(event) => setFields({ ...fields, opportunityId: event.target.value })}>
+            <TextField
+              disabled={!recordEditable}
+              select
+              label="Pipeline opportunity"
+              value={fields.opportunityId || ''}
+              onChange={(event) => setFields({ ...fields, opportunityId: event.target.value })}
+              helperText="Choose the pipeline deal; its selected products appear in the list."
+            >
               <MenuItem value="">None</MenuItem>
-              {opportunities.map((record) => <MenuItem key={textValue(record, 'id')} value={textValue(record, 'id')}>{textValue(record, 'name')}</MenuItem>)}
+              {recordsForOrganization(opportunities, fields.organizationId || '')
+                .map((record) => <MenuItem key={textValue(record, 'id')} value={textValue(record, 'id')}>{opportunityOptionLabel(record)}</MenuItem>)}
             </TextField>
             <TextField disabled={!recordEditable} select label="Campaign" value={fields.campaignId || ''} onChange={(event) => setFields({ ...fields, campaignId: event.target.value })}>
               <MenuItem value="">None</MenuItem>
