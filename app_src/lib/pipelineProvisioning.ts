@@ -2265,7 +2265,7 @@ async function createDrivePermission(
 ) {
   const parameters = new URLSearchParams({
     supportsAllDrives: 'true',
-    sendNotificationEmail: 'false',
+    sendNotificationEmail: 'true',
     fields: 'id,type,role,emailAddress,permissionDetails(inherited,inheritedFrom,permissionType,role)',
   })
   return googleDriveJson<DrivePermission>(
