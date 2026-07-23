@@ -13,13 +13,27 @@ app_visible: false
 
 ## Status And Scope
 
-This runbook governs the target distributed order, inventory, warehouse, carrier, printing, shipment, and 3PL billing module. The development environment has a Postgres-backed planned-proof workbench, explicit warehouse-release, bulk all-ready pick-confirmation, and pack-verification commands, a shared product/default-package import workflow, an audited exception queue, organization-scoped activation, command-receipt health, and disposable PostgreSQL acceptance. The separate shipped mock proof is automated test evidence and is not the operator execution workflow. This runbook remains `draft` until the module has complete reconciliation and adapter health, tested production adapters, integration/warehouse activation subscopes, and on-call ownership. Current general environment, backup, promotion, and restore procedures remain authoritative:
+This runbook governs the target distributed order, inventory, warehouse, carrier, printing, shipment, and 3PL billing module. The development environment has a Postgres-backed planned-proof workbench, explicit warehouse-release, bulk all-ready pick-confirmation, and pack-verification commands, a shared product/default-package import workflow, an audited exception queue, organization-scoped activation, direct carrier credential administration, command-receipt health, and disposable PostgreSQL acceptance. The separate shipped mock proof is automated test evidence and is not the operator execution workflow. This runbook remains `draft` until the module has complete reconciliation and adapter health, tested production adapters, integration/warehouse activation subscopes, and on-call ownership. Current general environment, backup, promotion, and restore procedures remain authoritative:
 
 - [ClawPilot Environments and Deployment](clawpilot-environments.md)
 - [Railway Postgres Backups](railway-postgres-backups.md)
 - [Agent Security and Integration Isolation](agent-security-and-isolation.md)
 
-Migrations `0081`, `0082`, `0084`, `0085`, and `0086` and the mock workbench are development evidence only. Do not use this document as evidence that an operations worker, production provider integration, checkout callback, enrolled print agent, or live warehouse workflow is deployed.
+Migrations `0081`, `0082`, `0084`, `0085`, `0086`, and `0087` and the mock workbench are development evidence only. Do not use this document as evidence that an operations worker, production provider integration, checkout callback, enrolled print agent, or live warehouse workflow is deployed.
+
+## Direct Carrier Credential Procedure
+
+1. Confirm the active workspace before opening **Settings > Integrations > Shipping**. Carrier accounts belong to that organization only. The organization owner or a user with explicit **Manage operations** permission may manage them; that permission does not expose unrelated integrations.
+2. Select UPS, FedEx, or USPS and select **Sandbox / developer** or **Production**. The developer selection uses UPS CIE, FedEx Sandbox, or USPS TEM. ClawPilot fixes those hosts server-side; do not enter a provider host or reuse production credentials. Configure and prove the developer workflow before production whenever the provider offers it.
+3. Enter the provider client ID and client secret. Enter the billing account number for UPS or FedEx; it is optional for USPS. Do not paste credentials into tickets, chat, logs, documents, or source files.
+4. Use **Save and verify**. ClawPilot calls only the provider's allowlisted OAuth endpoint before atomically storing encrypted credential material. A rejection leaves the previous stored credential unchanged.
+5. Confirm the permanent `gia` integration identity, masked suffixes, incremented credential version, `Verified` state, and `Disabled` state for a first-time connection. The browser never receives the stored credential or short-lived access token.
+6. Use **Test connection** after any provider-side permission, account, or secret change. Do not enable a failed or unverified account.
+7. Enable the account only after verification and only in the intended environment. Enabling re-runs verification. Developer and production credentials are stored, versioned, verified, and enabled independently; a developer record cannot satisfy a production adapter.
+8. Rotate by entering the full replacement credential and selecting **Save and verify**. The previous ciphertext is replaced only after the candidate verifies, and the audit log records rotation metadata without a secret.
+9. Use **Disconnect** only after confirming the organization, provider, and environment. Disconnect deletes encrypted credential material and disables the integration metadata; it does not delete immutable historical shipment evidence.
+
+Credential verification is not shipping certification. Do not activate rating, label purchase, void, manifest, pickup, or tracking until the corresponding adapter, provider attempts, unknown-outcome reconciliation, and authorized live smoke test pass the release gate in the [small parcel architecture](../architecture/small-parcel-carrier-adapters.md).
 
 ## Product And Package Catalog
 

@@ -1680,7 +1680,17 @@ export async function updateOperationsActivationInPostgres(input: {
          FROM operations_integration_accounts
          WHERE organization_id = $1::uuid AND environment = 'production'
            AND status = 'active'
-           AND integration_type IN ('commerce', 'carrier', 'printing')`,
+           AND integration_type IN ('commerce', 'carrier', 'printing')
+           AND (
+             integration_type <> 'carrier'
+             OR EXISTS (
+               SELECT 1
+               FROM operations_carrier_credentials credential
+               WHERE credential.organization_id = operations_integration_accounts.organization_id
+                 AND credential.integration_account_id = operations_integration_accounts.id
+                 AND credential.verification_status = 'verified'
+             )
+           )`,
         [organizationId],
       )
       const available = new Set(providers.rows.map((row) => row.integration_type))

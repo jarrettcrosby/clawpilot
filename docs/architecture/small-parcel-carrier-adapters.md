@@ -52,6 +52,16 @@ Provider-specific units, field names, service codes, and money representations a
 
 Unsupported capabilities stay visibly disabled. A provider transport compiling or returning fixture data does not establish production support.
 
+### Provider environment boundaries
+
+| Provider | Developer environment | Production environment |
+| --- | --- | --- |
+| UPS REST | CIE (`wwwcie.ups.com`) | UPS production (`onlinetools.ups.com`) |
+| FedEx REST | Sandbox (`apis-sandbox.fedex.com`) | FedEx production (`apis.fedex.com`) |
+| USPS REST | TEM (`apis-tem.usps.com`) | USPS production (`apis.usps.com`) |
+
+Each organization configures a distinct credential record for each provider and environment. Environment hosts are adapter constants, not user configuration. Provider test credentials, account enrollment, permissions, test labels, and certification steps remain separate from production onboarding, and no access token or verified state crosses that boundary.
+
 ## RocketShipIt Transport Rules
 
 The isolated Cloud transport:
@@ -100,6 +110,12 @@ Carrier credentials are organization-scoped and stored through ClawPilot's secre
 ClawPilot never falls back to another organization's credentials or to a platform-wide carrier account. A carrier capability stays unavailable until the active organization has an active, verified account for that carrier and environment. Operator-owned credentials may be selected only when the organization has an explicit, auditable authorization and billing rule for that account.
 
 OAuth access tokens remain server-side, short-lived, and cached by provider/account/environment. Rotation creates auditable credential metadata without exposing the credential value. Test credentials cannot be selected by a production shipment command.
+
+### Implemented Credential Boundary
+
+Migration `0087_operations_carrier_credentials.sql` adds the organization-scoped encrypted companion record for direct UPS REST, FedEx REST, and USPS REST integration accounts. **Settings > Integrations > Shipping** verifies a candidate through the provider's fixed OAuth endpoint before writing AES-256-GCM ciphertext. Authenticated encryption includes organization, provider, and environment; API responses expose only masked suffixes, verification state, credential version, safe error code, and timestamps. Enabling an account re-verifies it, while disconnect removes ciphertext and disables the non-secret integration record. Access tokens are intentionally discarded after verification.
+
+This is credential readiness only. The canonical rating, shipping, label, void, tracking, provider-attempt, token-cache, and reconciliation adapters remain release-gated below. An active credential record is necessary but not sufficient evidence for a live shipping capability.
 
 ## Health And Reconciliation
 

@@ -1739,6 +1739,10 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
               currentUser?.role === 'owner'
               || (currentUser?.role === 'admin' && currentUser.permissions.manageUserAccess)
             )}
+            canManageOperationsIntegrations={Boolean(
+              currentUser?.role === 'owner'
+              || currentUser?.permissions.manageOperations
+            )}
           />
         ) : null}
         {!loading && activeTab === 4 ? <SessionSecurityPanel /> : null}
