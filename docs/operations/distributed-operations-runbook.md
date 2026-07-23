@@ -19,7 +19,9 @@ This runbook governs the target distributed order, inventory, warehouse, carrier
 - [Railway Postgres Backups](railway-postgres-backups.md)
 - [Agent Security and Integration Isolation](agent-security-and-isolation.md)
 
-Migrations `0081`, `0082`, `0084`, `0085`, `0086`, `0087`, and `0088` are bounded development evidence only. Do not use this document as evidence that an operations worker, production provider integration, checkout callback, enrolled print agent, or live warehouse workflow is deployed. Migration `0088` archives legacy mock orders, releases their reservations, hides them from active workbench projections, disables mock integration/facility records, and retains immutable evidence rather than deleting it.
+Migrations `0081` through `0092` are bounded development evidence only. Migrations `0089` and `0090` establish delegated rate paths, multi-account carrier billing, GL Coding, reconciliation, and settlement foundations. Migration `0091` adds capability-aware printer profiles and routing defaults; it does not enroll or deliver work to a local print agent. Migration `0092` hardens carrier-account, charge, match, assignment, GL-run, reconciliation, and settlement provenance. Do not use this document as evidence that an operations worker, production provider integration, checkout callback, enrolled print agent, provider-specific bill importer, accounting export, or live warehouse workflow is deployed. Migration `0088` archives legacy mock orders, releases their reservations, hides them from active workbench projections, disables mock integration/facility records, and retains immutable evidence rather than deleting it.
+
+Operator procedures for printer configuration, multi-account carrier bills, GL Coding, and the Triangle/Square/Circle settlement model are in [Printing, Carrier Billing, And GL Coding](printing-carrier-billing-and-gl-coding.md).
 
 ## Direct Carrier Credential Procedure
 
@@ -129,7 +131,7 @@ The existing endpoints remain required:
 - `/api/persistence/status`: Postgres driver, reachability, and non-empty environment database fingerprint.
 - `/api/health`: migration, worker, provider, queue, and dependency health.
 
-Current `/api/health` reports the `0081`/`0082`/`0084`/`0085`/`0086` migration state, command failures, stale processing, and active/shadow organization counts. Before production activation it must additionally report:
+Current `/api/health` reports the operations migration state through `0092`, command failures, stale processing, and active/shadow organization counts. Before production activation it must additionally report:
 
 - foundation and corrective migration applied/checksum state;
 - activation state by cohort without exposing credentials;

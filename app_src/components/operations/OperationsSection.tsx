@@ -36,6 +36,7 @@ import CloseRounded from '@mui/icons-material/CloseRounded'
 import HelpOutlineRounded from '@mui/icons-material/HelpOutlineRounded'
 import Inventory2Rounded from '@mui/icons-material/Inventory2Rounded'
 import OpenInNewRounded from '@mui/icons-material/OpenInNewRounded'
+import PrintRounded from '@mui/icons-material/PrintRounded'
 import RefreshRounded from '@mui/icons-material/RefreshRounded'
 import ReplayRounded from '@mui/icons-material/ReplayRounded'
 import SearchRounded from '@mui/icons-material/SearchRounded'
@@ -55,6 +56,7 @@ import type {
   OperationsWorkspace,
 } from '@/lib/operations/types'
 import GlCodingPanel from '@/components/operations/GlCodingPanel'
+import PrinterConfigurationPanel from '@/components/operations/PrinterConfigurationPanel'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import { formatUserDateTime } from '@/lib/userDateTime'
 
@@ -500,7 +502,7 @@ export default function OperationsSection() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
-  const [view, setView] = useState<'orders' | 'exceptions' | 'gl-coding'>('orders')
+  const [view, setView] = useState<'orders' | 'exceptions' | 'gl-coding' | 'printing'>('orders')
   const [search, setSearch] = useState('')
   const [status, setStatus] = useState<'' | OperationsOrderStatus>('')
   const [exceptionStatus, setExceptionStatus] = useState<'' | OperationsExceptionStatus>('')
@@ -795,6 +797,17 @@ export default function OperationsSection() {
         ? workspace?.exceptions.length === 0
         : false
   )
+  const mainWorkspaceView = view === 'orders' || view === 'exceptions'
+  const heading = view === 'gl-coding'
+    ? 'Carrier billing & GL'
+    : view === 'printing'
+      ? 'Print orchestration'
+      : 'Order Workbench'
+  const subheading = view === 'gl-coding'
+    ? 'Actual carrier charges, shipment evidence, shipper assignment, and reconciliation'
+    : view === 'printing'
+      ? 'Warehouse printers, document media, defaults, and fallbacks'
+      : `Distributed fulfillment${workspace ? ` · CRM: ${workspace.dataPipeline.name}` : ''}`
 
   return (
     <Box sx={{ height: '100%', display: 'flex', flexDirection: 'column', minWidth: 0, overflow: 'hidden' }}>
@@ -802,8 +815,8 @@ export default function OperationsSection() {
         <Stack direction={{ xs: 'column', sm: 'row' }} justifyContent="space-between" alignItems={{ xs: 'stretch', sm: 'center' }} gap={1.5}>
           <Box>
             <Stack direction="row" spacing={1} alignItems="center">
-              <Typography variant="h5" fontWeight={700}>Order Workbench</Typography>
-              {workspace && (
+              <Typography variant="h5" fontWeight={700}>{heading}</Typography>
+              {mainWorkspaceView && workspace && (
                 <Chip
                   size="small"
                   label={displayStatus(workspace.activation.state)}
@@ -812,9 +825,7 @@ export default function OperationsSection() {
                 />
               )}
             </Stack>
-            <Typography variant="body2" color="text.secondary">
-              Distributed fulfillment{workspace ? ` · CRM: ${workspace.dataPipeline.name}` : ''}
-            </Typography>
+            <Typography variant="body2" color="text.secondary">{subheading}</Typography>
           </Box>
           <Stack direction="row" spacing={1} alignItems="center" sx={{ flexWrap: 'wrap', rowGap: 1 }}>
             {workspace?.capabilities.canActivate && (
@@ -835,13 +846,13 @@ export default function OperationsSection() {
               </Tooltip>
             )}
             <Tooltip title="Operations guide"><IconButton aria-label="Open operations guide" onClick={() => setGuideOpen(true)}><HelpOutlineRounded /></IconButton></Tooltip>
-            {view !== 'gl-coding' && (
+            {mainWorkspaceView && (
               <Tooltip title="Refresh orders"><span><IconButton aria-label="Refresh operations" disabled={loading} onClick={() => void loadWorkspace(selectedGlobalId)}><RefreshRounded /></IconButton></span></Tooltip>
             )}
           </Stack>
         </Stack>
 
-        {summary && (
+        {mainWorkspaceView && summary && (
           <Box sx={{ display: 'flex', flexWrap: 'wrap', columnGap: { xs: 2, sm: 3.5 }, rowGap: 0.25, mt: 2 }}>
             {metric('Open orders', summary.openOrders)}
             {metric('Exceptions', summary.exceptions, summary.exceptions ? '#EF9A9A' : 'text.primary')}
@@ -854,7 +865,7 @@ export default function OperationsSection() {
         )}
         <Tabs
           value={view}
-          onChange={(_, next: 'orders' | 'exceptions' | 'gl-coding') => {
+          onChange={(_, next: 'orders' | 'exceptions' | 'gl-coding' | 'printing') => {
             setView(next)
             setSearch('')
             closeDrawer()
@@ -865,11 +876,12 @@ export default function OperationsSection() {
         >
           <Tab value="orders" label={`Orders${workspace ? ` (${workspace.orders.length})` : ''}`} />
           <Tab value="exceptions" label={`Exceptions${workspace ? ` (${workspace.summary.exceptions})` : ''}`} />
-          <Tab value="gl-coding" label="GL Coding" />
+          <Tab value="gl-coding" label="Billing & GL" />
+          <Tab value="printing" icon={<PrintRounded fontSize="small" />} iconPosition="start" label="Printing" />
         </Tabs>
       </Box>
 
-      {view !== 'gl-coding' && (
+      {mainWorkspaceView && (
         <Box sx={{ px: { xs: 2, md: 3 }, py: 1.5, display: 'flex', flexWrap: 'wrap', gap: 1.25, flexShrink: 0 }}>
           <TextField
             size="small"
@@ -906,15 +918,17 @@ export default function OperationsSection() {
         </Box>
       )}
 
-      {view !== 'gl-coding' && error && <Alert severity="error" onClose={() => setError('')} sx={{ mx: { xs: 2, md: 3 }, mb: 1.5 }}>{error}</Alert>}
-      {view !== 'gl-coding' && notice && <Alert severity="success" onClose={() => setNotice('')} sx={{ mx: { xs: 2, md: 3 }, mb: 1.5 }}>{notice}</Alert>}
-      {view !== 'gl-coding' && !loading && workspace && !workspace.configured && (
+      {mainWorkspaceView && error && <Alert severity="error" onClose={() => setError('')} sx={{ mx: { xs: 2, md: 3 }, mb: 1.5 }}>{error}</Alert>}
+      {mainWorkspaceView && notice && <Alert severity="success" onClose={() => setNotice('')} sx={{ mx: { xs: 2, md: 3 }, mb: 1.5 }}>{notice}</Alert>}
+      {mainWorkspaceView && !loading && workspace && !workspace.configured && (
         <Alert severity="info" sx={{ mx: { xs: 2, md: 3 }, mb: 1.5 }}>Connect an approved commerce provider and configure an active warehouse to begin importing orders.</Alert>
       )}
 
       <Box sx={{ flex: 1, minHeight: 0, overflow: 'auto', WebkitOverflowScrolling: 'touch' }}>
         {view === 'gl-coding' ? (
           <GlCodingPanel />
+        ) : view === 'printing' ? (
+          <PrinterConfigurationPanel />
         ) : loading && !workspace ? (
           <Box sx={{ height: '100%', display: 'grid', placeItems: 'center' }}><CircularProgress size={30} /></Box>
         ) : empty ? (

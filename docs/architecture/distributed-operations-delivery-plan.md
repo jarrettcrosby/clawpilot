@@ -33,7 +33,7 @@ Operations stays fail-closed on file storage. Hosted activation requires Postgre
 
 ## Current Delivery State
 
-As of 2026-07-22, the development environment has completed the bounded Phase 2 shipped mock proof plus an operator-reviewed planned-order path and three explicit warehouse commands. Warehouse release uses an advisory lock, exact row-version check, request-hashed command receipt, complete reservation/allocation validation, blocking-exception validation, and one transaction to release the plan, create the wave and pick tasks, advance the order, and write event/audit evidence. Bulk all-ready pick confirmation locks every affected inventory position, revalidates the released plan, wave, picks, activation, row version, and blocking exceptions, then marks every ready pick `picked`, completes the wave, advances the order to `picking`, and records immutable ledger, event, audit, and exact replay-result evidence in one transaction. Pack verification is a separate replay-safe command that verifies package facts and creates immutable pack-fee evidence without consuming reservations. Durable exception dispositions, one canonical CRM projection per workspace, deterministic provider-customer resolution, team-managed metric/imperial product-package profiles, organization activation state, a provider-neutral small-parcel capability contract, organization-scoped encrypted UPS/FedEx/USPS credential management, and a hardened but unwired RocketShipIt Cloud transport also exist. The full migration chain and transaction behavior run against disposable PostgreSQL in the standard Operations test. Credential verification does not advance production-provider certification or mark Phase 4 complete; scanner claims and per-task confirmation, short-pick recovery, rating/label/print/ship commands, webhook receipts, provider attempts, token caching, print-agent enrollment, task bridging, complete reconciliation health, and live adapters remain open.
+As of 2026-07-23, the development environment has completed the bounded Phase 2 shipped mock proof plus an operator-reviewed planned-order path and three explicit warehouse commands. Warehouse release uses an advisory lock, exact row-version check, request-hashed command receipt, complete reservation/allocation validation, blocking-exception validation, and one transaction to release the plan, create the wave and pick tasks, advance the order, and write event/audit evidence. Bulk all-ready pick confirmation locks every affected inventory position, revalidates the released plan, wave, picks, activation, row version, and blocking exceptions, then marks every ready pick `picked`, completes the wave, advances the order to `picking`, and records immutable ledger, event, audit, and exact replay-result evidence in one transaction. Pack verification is a separate replay-safe command that verifies package facts and creates immutable pack-fee evidence without consuming reservations. Durable exception dispositions, one canonical CRM projection per workspace, deterministic provider-customer resolution, team-managed metric/imperial product-package profiles, organization activation state, a provider-neutral small-parcel capability contract, organization-scoped encrypted UPS/FedEx/USPS credential management, carrier-rate delegation and GL Coding foundations, and capability-aware printer configuration also exist. The full migration chain and transaction behavior run against disposable PostgreSQL in the standard Operations test. Credential verification, printer profiles, and billing schema do not advance production-provider certification or mark Phase 4 or Phase 5 complete; scanner claims, short-pick recovery, production label/void/pickup/tracking, provider-specific carrier-bill ingestion, print-agent enrollment and job acknowledgement, settlement approval/export, complete reconciliation health, and live adapters remain open.
 
 The exception queue deliberately stays separate from Projects tasks. An exception owns operational status and evidence. A later adapter may create or link a Projects task for collaborative work without transferring exception authority to the task module.
 
@@ -124,6 +124,12 @@ The exception queue deliberately stays separate from Projects tasks. An exceptio
 - A retry cannot buy a duplicate label, and a print retry cannot invoke a carrier purchase.
 - Package changes invalidate stale rates and recalculate margin before shipment.
 
+**Implemented foundation**
+
+- Warehouse-scoped thermal and office printer profiles record connection mode, ZPL/PDF/PNG capability, 4 x 6 and 4 x 8 label plus Letter/A4 media, supported documents, defaults, priority, status, and compatible fallback.
+- Route selection fails closed when no compatible online printer exists.
+- Durable local-agent enrollment, leases, acknowledgements, retry evidence, document rendering, and carrier-label purchase remain open.
+
 ### Phase 5 - Contracts, 3PL Billing, And Profitability
 
 **Scope**
@@ -137,6 +143,12 @@ The exception queue deliberately stays separate from Projects tasks. An exceptio
 - S10-S13 pass with exact minor-unit arithmetic and historical version retention.
 - S16 and S25 rerun with final billing and margin projections.
 - Re-export and replay are idempotent; corrections are compensating facts.
+
+**Implemented foundation**
+
+- Triangle, Square, and Circle paths retain explicit directive versions and fees, including a zero Triangle fee.
+- Carrier account identities, multi-account billing statements, shipment-match evidence, independent shipper assignments, selected-batch GL Coding runs, versioned routing rules, manual orphan resolution, reconciliation snapshots, and append-only settlement structures exist.
+- Provider-specific CSV ingestion, GL dimension bindings, settlement approval/rebill commands, payouts, and accounting export remain open.
 
 ### Phase 6 - Production Commerce And Carrier Adapters
 
