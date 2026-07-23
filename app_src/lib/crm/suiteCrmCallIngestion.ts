@@ -1,8 +1,8 @@
-import {
-  listSuiteCrmNotesUpdatedSince,
-  type SuiteCrmNoteSnapshot,
-} from '@/lib/crm/suiteCrmClient'
 import { decodeHtmlEntities } from '@/lib/htmlEntities.mjs'
+import {
+  listSuiteCrmCallsUpdatedSince,
+  type SuiteCrmCallSnapshot,
+} from '@/lib/crm/suiteCrmClient'
 import {
   archiveCrmRecordInPostgres,
   stageCrmRecordInPostgres,
@@ -10,9 +10,9 @@ import {
 } from '@/lib/persistence/crm'
 import { query } from '@/lib/persistence/postgres'
 
-const CURSOR_KEY = 'crm.suitecrm.interaction_ingestion.cursor'
+const CURSOR_KEY = 'crm.suitecrm.call_ingestion.cursor'
 const FULL_HISTORY_START = '1970-01-01T00:00:00.000Z'
-export const SUITE_CRM_INTERACTION_POLL_OVERLAP_MS = 5 * 60 * 1000
+export const SUITE_CRM_CALL_POLL_OVERLAP_MS = 5 * 60 * 1000
 const MAX_PAGES_PER_RUN = 10
 
 type TimestampValue = string | Date
@@ -30,7 +30,7 @@ type CursorDocument = {
   lastError: string | null
 }
 
-type InteractionRow = {
+type CallInteractionRow = {
   id: string
   pipeline_id: string
   owner_email: string
@@ -42,17 +42,21 @@ type InteractionRow = {
   source_payload: Record<string, unknown> | null
   organization_id: string | null
   contact_id: string | null
+  contact_ids: string[] | null
   lead_id: string | null
   opportunity_id: string | null
   meeting_id: string | null
   campaign_id: string | null
   interaction_type: string | null
+  suitecrm_module: 'Notes' | 'Calls' | 'Meetings' | null
   subject: string
   agent_email: string | null
   agent_name: string | null
   occurred_at: TimestampValue | null
   description: string | null
   direction: 'inbound' | 'outbound' | 'internal'
+  activity_status: 'planned' | 'held' | 'not_held' | null
+  duration_minutes: number | null
   delivery_status: string | null
   provider_message_id: string | null
   provider_thread_id: string | null
@@ -64,59 +68,59 @@ type ParentRow = {
   organization_id: string | null
 }
 
-export type SuiteCrmNoteParentType =
+export type SuiteCrmCallParentType =
   | 'Accounts'
   | 'Contacts'
   | 'Leads'
   | 'Opportunities'
   | 'Meetings'
 
-export type SuiteCrmNoteParent = {
-  type: SuiteCrmNoteParentType
+export type SuiteCrmCallParent = {
+  type: SuiteCrmCallParentType
   id: string
 }
 
-export type SuiteCrmNoteParentParseResult =
-  | { status: 'valid'; parent: SuiteCrmNoteParent }
+export type SuiteCrmCallParentParseResult =
+  | { status: 'valid'; parent: SuiteCrmCallParent }
   | { status: 'none' | 'invalid' }
 
 type ParentResolution =
   | {
     status: 'resolved'
-    parent: SuiteCrmNoteParent
+    parent: SuiteCrmCallParent
     relationshipId: string
     organizationId: string | null
   }
-  | { status: 'unresolved'; parent: SuiteCrmNoteParent | null }
-  | { status: 'ambiguous'; parent: SuiteCrmNoteParent }
+  | { status: 'unresolved'; parent: SuiteCrmCallParent | null }
+  | { status: 'ambiguous'; parent: SuiteCrmCallParent }
 
-type InteractionMatchResult = {
-  rows: InteractionRow[]
+type CallInteractionMatchResult = {
+  rows: CallInteractionRow[]
   ambiguousPipelines: number
 }
 
-export type SuiteCrmInteractionIngestionCounts = {
+export type SuiteCrmCallIngestionCounts = {
   pagesPolled: number
-  notesListed: number
-  notesMatched: number
+  callsListed: number
+  callsMatched: number
   interactionsMatched: number
   interactionsStaged: number
   unchangedInteractions: number
-  unmatchedNotes: number
+  unmatchedCalls: number
   ambiguousInteractionMatches: number
   parentsResolved: number
   parentsUnresolved: number
   parentsAmbiguous: number
   interactionsArchived: number
-  deletedNotesIgnored: number
+  deletedCallsIgnored: number
   pending: boolean
   errors: number
 }
 
-class SafeSuiteCrmInteractionIngestionError extends Error {
+class SafeSuiteCrmCallIngestionError extends Error {
   constructor(message: string) {
     super(message)
-    this.name = 'SafeSuiteCrmInteractionIngestionError'
+    this.name = 'SafeSuiteCrmCallIngestionError'
   }
 }
 
@@ -136,7 +140,7 @@ function cleanString(value: unknown, maxLength: number, label: string): string {
     .replace(/\s+/g, ' ')
     .trim()
   if (normalized.length > maxLength) {
-    throw new SafeSuiteCrmInteractionIngestionError(`SuiteCRM ${label} is invalid`)
+    throw new SafeSuiteCrmCallIngestionError(`SuiteCRM ${label} is invalid`)
   }
   return normalized
 }
@@ -144,7 +148,7 @@ function cleanString(value: unknown, maxLength: number, label: string): string {
 function cleanMultiline(value: unknown, maxLength: number, label: string): string {
   const normalized = decodeHtmlEntities(value).replace(/\u0000/g, '').replace(/\r\n?/g, '\n').trim()
   if (normalized.length > maxLength || /[\u0001-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(normalized)) {
-    throw new SafeSuiteCrmInteractionIngestionError(`SuiteCRM ${label} is invalid`)
+    throw new SafeSuiteCrmCallIngestionError(`SuiteCRM ${label} is invalid`)
   }
   return normalized
 }
@@ -157,13 +161,7 @@ function nullableStoredString(value: unknown): string | null {
   return storedString(value) || null
 }
 
-function sourcePayload(value: unknown): Record<string, unknown> {
-  return value && typeof value === 'object' && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : {}
-}
-
-function metadata(value: unknown): Record<string, unknown> {
+function objectValue(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
     : {}
@@ -209,14 +207,14 @@ async function writeCursor(document: CursorDocument): Promise<void> {
   )
 }
 
-export function suiteCrmNoteGlobalId(snapshot: SuiteCrmNoteSnapshot): string | null {
+export function suiteCrmCallGlobalId(snapshot: SuiteCrmCallSnapshot): string | null {
   const value = String(snapshot.attributes.global_id_c ?? '').trim().toLowerCase()
   return /^gi[0-9]{7}$/.test(value) ? value : null
 }
 
-export function parseSuiteCrmNoteParent(
+export function parseSuiteCrmCallParent(
   attributes: Record<string, unknown>,
-): SuiteCrmNoteParentParseResult {
+): SuiteCrmCallParentParseResult {
   const parentType = String(attributes.parent_type ?? '').trim()
   const parentId = String(attributes.parent_id ?? '').trim()
   if (!parentType && !parentId) return { status: 'none' }
@@ -240,7 +238,7 @@ export function parseSuiteCrmNoteParent(
     : { status: 'invalid' }
 }
 
-function suiteCrmSnapshotIsDeleted(snapshot: SuiteCrmNoteSnapshot): boolean {
+function suiteCrmSnapshotIsDeleted(snapshot: SuiteCrmCallSnapshot): boolean {
   const value = snapshot.attributes.deleted
   if (value === true || value === 1) return true
   const normalized = typeof value === 'string' ? value.trim().toLowerCase() : ''
@@ -249,25 +247,35 @@ function suiteCrmSnapshotIsDeleted(snapshot: SuiteCrmNoteSnapshot): boolean {
 
 function suiteTimestamp(value: unknown, label: string): string {
   const parsed = validDate(value)
-  if (!parsed) throw new SafeSuiteCrmInteractionIngestionError(`SuiteCRM note ${label} is invalid`)
+  if (!parsed) throw new SafeSuiteCrmCallIngestionError(`SuiteCRM call ${label} is invalid`)
   return parsed.toISOString()
 }
 
-async function localInteractions(snapshot: SuiteCrmNoteSnapshot): Promise<InteractionMatchResult> {
-  const globalId = suiteCrmNoteGlobalId(snapshot)
-  const result = await query<InteractionRow>(
+async function localCallInteractions(snapshot: SuiteCrmCallSnapshot): Promise<CallInteractionMatchResult> {
+  const globalId = suiteCrmCallGlobalId(snapshot)
+  const result = await query<CallInteractionRow>(
     `SELECT interaction.id::text, interaction.pipeline_id::text, pipeline.owner_email,
        interaction.suitecrm_id, interaction.reference_code, interaction.source_key,
        interaction.source_sheet_id, interaction.source_row_number, interaction.source_payload,
-       interaction.organization_id::text, interaction.contact_id::text, interaction.lead_id::text,
+       interaction.organization_id::text, interaction.contact_id::text,
+       ARRAY(
+         SELECT selected.contact_id::text
+         FROM crm_interaction_contacts selected
+         WHERE selected.pipeline_id = interaction.pipeline_id
+           AND selected.interaction_id = interaction.id
+         ORDER BY selected.sort_order, selected.contact_id
+       ) AS contact_ids,
+       interaction.lead_id::text,
        interaction.opportunity_id::text, interaction.meeting_id::text, interaction.campaign_id::text,
-       interaction.interaction_type, interaction.subject, interaction.agent_email, interaction.agent_name,
+       interaction.interaction_type, interaction.suitecrm_module,
+       interaction.subject, interaction.agent_email, interaction.agent_name,
        interaction.occurred_at, interaction.description, interaction.direction,
+       interaction.activity_status, interaction.duration_minutes,
        interaction.delivery_status, interaction.provider_message_id,
        interaction.provider_thread_id, interaction.metadata
      FROM crm_interactions interaction
      JOIN pipeline_spaces pipeline ON pipeline.id = interaction.pipeline_id
-     WHERE COALESCE(interaction.suitecrm_module, 'Notes') = 'Notes'
+     WHERE lower(COALESCE(interaction.interaction_type, '')) = 'call'
        AND (
          interaction.suitecrm_id = $1
          OR ($2 <> '' AND interaction.reference_code = $2)
@@ -275,13 +283,13 @@ async function localInteractions(snapshot: SuiteCrmNoteSnapshot): Promise<Intera
      ORDER BY interaction.pipeline_id, interaction.id`,
     [snapshot.id, globalId || ''],
   )
-  const rowsByPipeline = new Map<string, InteractionRow[]>()
+  const rowsByPipeline = new Map<string, CallInteractionRow[]>()
   for (const row of result.rows) {
     const pipelineRows = rowsByPipeline.get(row.pipeline_id) || []
     pipelineRows.push(row)
     rowsByPipeline.set(row.pipeline_id, pipelineRows)
   }
-  const rows: InteractionRow[] = []
+  const rows: CallInteractionRow[] = []
   let ambiguousPipelines = 0
   for (const pipelineRows of rowsByPipeline.values()) {
     if (pipelineRows.length === 1) rows.push(pipelineRows[0])
@@ -292,7 +300,7 @@ async function localInteractions(snapshot: SuiteCrmNoteSnapshot): Promise<Intera
 
 async function parentRows(
   pipelineId: string,
-  parent: SuiteCrmNoteParent,
+  parent: SuiteCrmCallParent,
 ): Promise<ParentRow[]> {
   if (parent.type === 'Accounts') {
     const result = await query<ParentRow>(
@@ -367,7 +375,7 @@ async function parentRows(
 
 async function resolveParent(
   pipelineId: string,
-  parsedParent: SuiteCrmNoteParentParseResult,
+  parsedParent: SuiteCrmCallParentParseResult,
 ): Promise<ParentResolution> {
   if (parsedParent.status !== 'valid') return { status: 'unresolved', parent: null }
   const rows = await parentRows(pipelineId, parsedParent.parent)
@@ -381,13 +389,18 @@ async function resolveParent(
   }
 }
 
-function currentRelations(row: InteractionRow): Pick<
+function currentRelations(row: CallInteractionRow): Pick<
   InteractionFields,
-  'organizationId' | 'contactId' | 'leadId' | 'opportunityId' | 'meetingId' | 'campaignId'
+  'organizationId' | 'contactId' | 'contactIds' | 'leadId' | 'opportunityId' | 'meetingId' | 'campaignId'
 > {
+  const contactId = nullableStoredString(row.contact_id)
+  const contactIds = Array.isArray(row.contact_ids)
+    ? row.contact_ids.map(nullableStoredString).filter((value): value is string => Boolean(value))
+    : []
   return {
     organizationId: nullableStoredString(row.organization_id),
-    contactId: nullableStoredString(row.contact_id),
+    contactId,
+    contactIds: contactIds.length > 0 ? [...new Set(contactIds)] : contactId ? [contactId] : [],
     leadId: nullableStoredString(row.lead_id),
     opportunityId: nullableStoredString(row.opportunity_id),
     meetingId: nullableStoredString(row.meeting_id),
@@ -396,12 +409,13 @@ function currentRelations(row: InteractionRow): Pick<
 }
 
 function interactionRelations(
-  row: InteractionRow,
+  row: CallInteractionRow,
   parent: ParentResolution,
 ): Pick<
   InteractionFields,
   | 'organizationId'
   | 'contactId'
+  | 'contactIds'
   | 'leadId'
   | 'opportunityId'
   | 'meetingId'
@@ -411,9 +425,13 @@ function interactionRelations(
 > {
   const current = currentRelations(row)
   if (parent.status !== 'resolved') return current
+  const contactIds = parent.parent.type === 'Contacts'
+    ? [parent.relationshipId, ...(current.contactIds || []).filter((id) => id !== parent.relationshipId)]
+    : current.contactIds
   return {
     organizationId: parent.organizationId || current.organizationId,
     contactId: parent.parent.type === 'Contacts' ? parent.relationshipId : current.contactId,
+    contactIds,
     leadId: parent.parent.type === 'Leads' ? parent.relationshipId : current.leadId,
     opportunityId: parent.parent.type === 'Opportunities' ? parent.relationshipId : current.opportunityId,
     meetingId: parent.parent.type === 'Meetings' ? parent.relationshipId : current.meetingId,
@@ -423,40 +441,94 @@ function interactionRelations(
   }
 }
 
+function suiteCrmCallDirection(
+  value: unknown,
+  current: CallInteractionRow['direction'],
+): CallInteractionRow['direction'] {
+  const direction = cleanString(value, 100, 'call direction').toLowerCase()
+  if (direction === 'inbound' || direction === 'outbound') return direction
+  return current
+}
+
+function suiteCrmCallDeliveryStatus(value: unknown, current: string | null): string {
+  const status = cleanString(value, 100, 'call status').toLowerCase().replace(/[_-]+/g, ' ')
+  if (status === 'planned') return 'planned'
+  if (status === 'held') return 'logged'
+  if (status === 'not held') return 'not-held'
+  return cleanString(current, 100, 'stored call status')
+}
+
+function suiteCrmCallActivityStatus(
+  value: unknown,
+  current: CallInteractionRow['activity_status'],
+): NonNullable<InteractionFields['activityStatus']> {
+  const status = cleanString(value, 100, 'call status').toLowerCase().replace(/[_-]+/g, ' ')
+  if (status === 'planned') return 'planned'
+  if (status === 'held') return 'held'
+  if (status === 'not held') return 'not_held'
+  return current || 'held'
+}
+
+function suiteCrmCallDuration(attributes: Record<string, unknown>): number | null {
+  if (!hasAttribute(attributes, 'duration_hours') && !hasAttribute(attributes, 'duration_minutes')) return null
+  const hours = Number(attributes.duration_hours ?? 0)
+  const minutes = Number(attributes.duration_minutes ?? 0)
+  if (
+    !Number.isFinite(hours)
+    || !Number.isFinite(minutes)
+    || hours < 0
+    || minutes < 0
+    || hours > 24
+    || minutes > 1440
+  ) {
+    throw new SafeSuiteCrmCallIngestionError('SuiteCRM call duration is invalid')
+  }
+  return Math.max(1, Math.min(Math.round(hours * 60 + minutes), 24 * 60))
+}
+
 function interactionFields(
-  snapshot: SuiteCrmNoteSnapshot,
-  row: InteractionRow,
+  snapshot: SuiteCrmCallSnapshot,
+  row: CallInteractionRow,
   parent: ParentResolution,
 ): InteractionFields {
   const attributes = snapshot.attributes
-  const currentSubject = cleanString(row.subject, 300, 'stored note subject')
-  if (!currentSubject) throw new SafeSuiteCrmInteractionIngestionError('Stored CRM interaction subject is invalid')
+  const currentSubject = cleanString(row.subject, 300, 'stored call subject')
+  if (!currentSubject) throw new SafeSuiteCrmCallIngestionError('Stored CRM call interaction subject is invalid')
   const inboundSubject = hasAttribute(attributes, 'name')
-    ? cleanString(attributes.name, 300, 'note subject')
+    ? cleanString(attributes.name, 300, 'call subject')
     : ''
-  const currentDescription = cleanMultiline(row.description, 50_000, 'stored note description')
+  const currentDescription = cleanMultiline(row.description, 50_000, 'stored call description')
   const description = hasAttribute(attributes, 'description')
-    ? cleanMultiline(attributes.description, 50_000, 'note description')
+    ? cleanMultiline(attributes.description, 50_000, 'call description')
     : currentDescription
   const currentOccurredAt = validDate(row.occurred_at)?.toISOString() || null
-  const occurredAt = hasAttribute(attributes, 'occurred_at_c') && storedString(attributes.occurred_at_c)
-    ? suiteTimestamp(attributes.occurred_at_c, 'occurred time')
+  const occurredAt = hasAttribute(attributes, 'date_start') && storedString(attributes.date_start)
+    ? suiteTimestamp(attributes.date_start, 'start time')
     : currentOccurredAt || (hasAttribute(attributes, 'date_entered') && storedString(attributes.date_entered)
       ? suiteTimestamp(attributes.date_entered, 'created time')
       : null)
   return {
     ...interactionRelations(row, parent),
-    interactionType: cleanString(row.interaction_type, 100, 'stored interaction type'),
+    interactionType: 'call',
+    suiteCrmModule: 'Calls',
     subject: inboundSubject || currentSubject,
     agentEmail: nullableStoredString(row.agent_email),
-    agentName: cleanString(row.agent_name, 300, 'stored interaction agent'),
+    agentName: cleanString(row.agent_name, 300, 'stored call agent'),
     occurredAt,
     description,
-    direction: row.direction,
-    deliveryStatus: cleanString(row.delivery_status, 100, 'stored delivery status'),
+    direction: hasAttribute(attributes, 'direction')
+      ? suiteCrmCallDirection(attributes.direction, row.direction)
+      : row.direction,
+    activityStatus: hasAttribute(attributes, 'status')
+      ? suiteCrmCallActivityStatus(attributes.status, row.activity_status)
+      : row.activity_status || 'held',
+    durationMinutes: suiteCrmCallDuration(attributes) ?? row.duration_minutes ?? 15,
+    deliveryStatus: hasAttribute(attributes, 'status')
+      ? suiteCrmCallDeliveryStatus(attributes.status, row.delivery_status)
+      : cleanString(row.delivery_status, 100, 'stored call status'),
     providerMessageId: nullableStoredString(row.provider_message_id),
     providerThreadId: nullableStoredString(row.provider_thread_id),
-    metadata: metadata(row.metadata),
+    metadata: objectValue(row.metadata),
   }
 }
 
@@ -466,11 +538,21 @@ function sameTimestamp(left: unknown, right: unknown): boolean {
   return leftDate?.getTime() === rightDate?.getTime()
 }
 
-function hasMeaningfulChanges(row: InteractionRow, fields: InteractionFields): boolean {
+function sameJson(left: unknown, right: unknown): boolean {
+  return JSON.stringify(objectValue(left)) === JSON.stringify(objectValue(right))
+}
+
+function hasMeaningfulChanges(row: CallInteractionRow, fields: InteractionFields): boolean {
   return (
-    cleanString(row.subject, 300, 'stored note subject') !== fields.subject
-    || cleanMultiline(row.description, 50_000, 'stored note description') !== fields.description
+    cleanString(row.subject, 300, 'stored call subject') !== fields.subject
+    || row.suitecrm_module !== fields.suiteCrmModule
+    || cleanMultiline(row.description, 50_000, 'stored call description') !== fields.description
     || !sameTimestamp(row.occurred_at, fields.occurredAt)
+    || row.direction !== fields.direction
+    || cleanString(row.delivery_status, 100, 'stored call status') !== fields.deliveryStatus
+    || row.activity_status !== fields.activityStatus
+    || Number(row.duration_minutes ?? 0) !== Number(fields.durationMinutes ?? 0)
+    || !sameJson(row.metadata, fields.metadata)
     || nullableStoredString(row.organization_id) !== nullableStoredString(fields.organizationId)
     || nullableStoredString(row.contact_id) !== nullableStoredString(fields.contactId)
     || nullableStoredString(row.lead_id) !== nullableStoredString(fields.leadId)
@@ -480,28 +562,28 @@ function hasMeaningfulChanges(row: InteractionRow, fields: InteractionFields): b
 }
 
 function matchBasis(
-  row: InteractionRow,
-  snapshot: SuiteCrmNoteSnapshot,
+  row: CallInteractionRow,
+  snapshot: SuiteCrmCallSnapshot,
 ): 'suitecrm_id' | 'global_id_c' | 'suitecrm_id_and_global_id_c' {
   const suiteCrmIdMatch = nullableStoredString(row.suitecrm_id) === snapshot.id
-  const globalIdMatch = row.reference_code === suiteCrmNoteGlobalId(snapshot)
+  const globalIdMatch = row.reference_code === suiteCrmCallGlobalId(snapshot)
   if (suiteCrmIdMatch && globalIdMatch) return 'suitecrm_id_and_global_id_c'
   return suiteCrmIdMatch ? 'suitecrm_id' : 'global_id_c'
 }
 
 function suiteCrmInboundSourcePayload(
-  row: InteractionRow,
-  snapshot: SuiteCrmNoteSnapshot,
+  row: CallInteractionRow,
+  snapshot: SuiteCrmCallSnapshot,
   dateModified: string,
   parent: ParentResolution,
 ): Record<string, unknown> {
   const parsedParent = parent.parent
   return {
-    ...sourcePayload(row.source_payload),
+    ...objectValue(row.source_payload),
     suiteCrmInbound: {
-      module: 'Notes',
+      module: 'Calls',
       id: snapshot.id,
-      globalId: suiteCrmNoteGlobalId(snapshot),
+      globalId: suiteCrmCallGlobalId(snapshot),
       dateModified,
       matchedBy: matchBasis(row, snapshot),
       parent: parsedParent ? { type: parsedParent.type, id: parsedParent.id } : null,
@@ -510,10 +592,10 @@ function suiteCrmInboundSourcePayload(
   }
 }
 
-async function reconcileInteraction(
-  snapshot: SuiteCrmNoteSnapshot,
-  row: InteractionRow,
-  parsedParent: SuiteCrmNoteParentParseResult,
+async function reconcileCallInteraction(
+  snapshot: SuiteCrmCallSnapshot,
+  row: CallInteractionRow,
+  parsedParent: SuiteCrmCallParentParseResult,
 ): Promise<{ staged: boolean; parentStatus: ParentResolution['status'] }> {
   const parent = await resolveParent(row.pipeline_id, parsedParent)
   const fields = interactionFields(snapshot, row, parent)
@@ -536,34 +618,34 @@ async function reconcileInteraction(
 
 function recordParentStatus(
   status: ParentResolution['status'],
-  counts: SuiteCrmInteractionIngestionCounts,
+  counts: SuiteCrmCallIngestionCounts,
 ): void {
   if (status === 'resolved') counts.parentsResolved += 1
   else if (status === 'ambiguous') counts.parentsAmbiguous += 1
   else counts.parentsUnresolved += 1
 }
 
-export function sanitizeSuiteCrmInteractionIngestionError(error: unknown): string {
-  return error instanceof SafeSuiteCrmInteractionIngestionError
+export function sanitizeSuiteCrmCallIngestionError(error: unknown): string {
+  return error instanceof SafeSuiteCrmCallIngestionError
     ? error.message.replace(/[\r\n]+/g, ' ').trim().slice(0, 500)
-    : 'SuiteCRM interaction ingestion failed'
+    : 'SuiteCRM call ingestion failed'
 }
 
-export async function processSuiteCrmInteractionIngestion(): Promise<SuiteCrmInteractionIngestionCounts> {
-  const counts: SuiteCrmInteractionIngestionCounts = {
+export async function processSuiteCrmCallIngestion(): Promise<SuiteCrmCallIngestionCounts> {
+  const counts: SuiteCrmCallIngestionCounts = {
     pagesPolled: 0,
-    notesListed: 0,
-    notesMatched: 0,
+    callsListed: 0,
+    callsMatched: 0,
     interactionsMatched: 0,
     interactionsStaged: 0,
     unchangedInteractions: 0,
-    unmatchedNotes: 0,
+    unmatchedCalls: 0,
     ambiguousInteractionMatches: 0,
     parentsResolved: 0,
     parentsUnresolved: 0,
     parentsAmbiguous: 0,
     interactionsArchived: 0,
-    deletedNotesIgnored: 0,
+    deletedCallsIgnored: 0,
     pending: false,
     errors: 0,
   }
@@ -571,7 +653,7 @@ export async function processSuiteCrmInteractionIngestion(): Promise<SuiteCrmInt
   const cursor = await readCursor()
   let state: CursorState = cursor?.state || {
     updatedSince: cursor?.lastPolledAt
-      ? new Date(Date.parse(cursor.lastPolledAt) - SUITE_CRM_INTERACTION_POLL_OVERLAP_MS).toISOString()
+      ? new Date(Date.parse(cursor.lastPolledAt) - SUITE_CRM_CALL_POLL_OVERLAP_MS).toISOString()
       : FULL_HISTORY_START,
     pollStartedAt: now.toISOString(),
     page: 1,
@@ -580,21 +662,21 @@ export async function processSuiteCrmInteractionIngestion(): Promise<SuiteCrmInt
   try {
     await writeCursor({ state, lastPolledAt: now.toISOString(), lastError: null })
     for (let attempt = 0; attempt < MAX_PAGES_PER_RUN; attempt += 1) {
-      const page = await listSuiteCrmNotesUpdatedSince({
+      const page = await listSuiteCrmCallsUpdatedSince({
         updatedSince: state.updatedSince,
         page: state.page,
       })
       counts.pagesPolled += 1
-      counts.notesListed += page.notes.length
-      for (const snapshot of page.notes) {
-        const matches = await localInteractions(snapshot)
+      counts.callsListed += page.calls.length
+      for (const snapshot of page.calls) {
+        const matches = await localCallInteractions(snapshot)
         counts.ambiguousInteractionMatches += matches.ambiguousPipelines
         if (suiteCrmSnapshotIsDeleted(snapshot)) {
           if (matches.rows.length === 0) {
-            counts.deletedNotesIgnored += 1
+            counts.deletedCallsIgnored += 1
             continue
           }
-          counts.notesMatched += 1
+          counts.callsMatched += 1
           for (const row of matches.rows) {
             counts.interactionsMatched += 1
             const result = await archiveCrmRecordInPostgres({
@@ -610,14 +692,14 @@ export async function processSuiteCrmInteractionIngestion(): Promise<SuiteCrmInt
           continue
         }
         if (matches.rows.length === 0) {
-          if (matches.ambiguousPipelines === 0) counts.unmatchedNotes += 1
+          if (matches.ambiguousPipelines === 0) counts.unmatchedCalls += 1
           continue
         }
-        counts.notesMatched += 1
-        const parsedParent = parseSuiteCrmNoteParent(snapshot.attributes)
+        counts.callsMatched += 1
+        const parsedParent = parseSuiteCrmCallParent(snapshot.attributes)
         for (const row of matches.rows) {
           counts.interactionsMatched += 1
-          const result = await reconcileInteraction(snapshot, row, parsedParent)
+          const result = await reconcileCallInteraction(snapshot, row, parsedParent)
           recordParentStatus(result.parentStatus, counts)
           if (result.staged) counts.interactionsStaged += 1
           else counts.unchangedInteractions += 1
@@ -637,7 +719,7 @@ export async function processSuiteCrmInteractionIngestion(): Promise<SuiteCrmInt
     await writeCursor({
       state,
       lastPolledAt: new Date().toISOString(),
-      lastError: sanitizeSuiteCrmInteractionIngestionError(error),
+      lastError: sanitizeSuiteCrmCallIngestionError(error),
     })
     return counts
   }

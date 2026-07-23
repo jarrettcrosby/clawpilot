@@ -20,6 +20,18 @@ export async function processSuiteCrmOutbox(input: { limit?: number; maxAttempts
       if (!item.payload || item.payload.localId !== item.aggregateId) throw new Error('SuiteCRM outbox payload is invalid')
       if (item.operation === 'upsert_user_identity') await upsertSuiteCrmUserIdentity(item.payload)
       else if (item.operation === 'delete_record') await deleteSuiteCrmRecord(item.payload)
+      else if (item.operation === 'reproject_record') {
+        if (item.payload.previousSuiteCrmModule) {
+          await deleteSuiteCrmRecord({
+            ...item.payload,
+            suiteCrmModule: item.payload.previousSuiteCrmModule,
+            previousSuiteCrmModule: undefined,
+            attributes: {},
+            relationships: undefined,
+          })
+        }
+        if (item.payload.suiteCrmModule) await upsertSuiteCrmRecord(item.payload)
+      }
       else await upsertSuiteCrmRecord(item.payload)
       await completeSuiteCrmOutboxInPostgres(item)
       if (item.operation !== 'upsert_user_identity') projectedPipelines.set(item.payload.pipelineId, item.id)

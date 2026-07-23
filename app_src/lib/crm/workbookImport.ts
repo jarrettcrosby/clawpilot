@@ -272,6 +272,7 @@ export async function importCrmWorkbook(input: {
       const staged = await stageCrmRecordInPostgres({
         entity: 'contacts', pipelineId: input.context.pipelineId,
         sourceKey: sourceKey(input.context.sheetId, 'Contacts', record),
+        fieldMode: 'enrich',
         sourceSheetId: input.context.sheetId, sourceRowNumber: record.rowNumber,
         sourcePayload: record.raw, actorEmail: input.actorEmail,
         fields: {
@@ -288,7 +289,10 @@ export async function importCrmWorkbook(input: {
           description: pick(record, 'Notes', 'Description'),
         },
       })
-      contacts.set(normalizedName(fullName), { id: staged.id, suiteCrmId: staged.suiteCrmId })
+      contacts.set(normalizedName(`${organizationName}:${fullName}`), {
+        id: staged.id,
+        suiteCrmId: staged.suiteCrmId,
+      })
       counts.contacts += 1
     }
 
@@ -323,7 +327,7 @@ export async function importCrmWorkbook(input: {
       const contactName = pick(record, 'Contact', 'Contact Name')
       const opportunityName = pick(record, 'Opportunity', 'Opportunity Name')
       const organization = organizations.get(normalizedName(organizationName))
-      const contact = contacts.get(normalizedName(contactName))
+      const contact = contacts.get(normalizedName(`${organizationName}:${contactName}`))
       const opportunity = opportunities.get(normalizedName(`${organizationName}:${opportunityName}`))
       await stageCrmRecordInPostgres({
         entity: 'interactions', pipelineId: input.context.pipelineId,

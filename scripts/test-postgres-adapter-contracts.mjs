@@ -173,6 +173,21 @@ for (const contract of [
   assertIncludes(crmInteractionContactsMigration, contract, 'CRM interaction contacts migration')
 }
 
+const crmNativeActivityProjectionMigration = read('db/migrations/0095_crm_native_activity_projection.sql')
+for (const contract of [
+  'suitecrm_module',
+  'activity_status',
+  'duration_minutes',
+  "'Calls'",
+  "'Meetings'",
+  "'reproject_record'",
+  "'previousSuiteCrmModule', 'Notes'",
+  "source_payload->>'Date'",
+  "'crm:interactions:activity-projection:v1:'",
+]) {
+  assertIncludes(crmNativeActivityProjectionMigration, contract, 'CRM native activity projection migration')
+}
+
 const crmInteractionUserMappingMigration = read('db/migrations/0043_crm_interaction_user_mapping.sql')
 for (const contract of [
   'ADD COLUMN IF NOT EXISTS suitecrm_user_id text',
@@ -640,9 +655,9 @@ assertIncludes(pipelineSync, 'stageCrmRecordInPostgres', 'opportunity Sheet to C
 const crmAdapter = read('app_src/lib/persistence/crm.ts')
 assertIncludes(crmAdapter, 'stageCrmRecordInPostgres', 'CRM projection adapter')
 assertIncludes(crmAdapter, "target_system, payload", 'CRM outbox persistence')
-assertIncludes(crmAdapter, "'upsert_record', 'suitecrm'", 'SuiteCRM outbox target')
+assertIncludes(crmAdapter, "VALUES ($1, $2, $5, 'suitecrm'", 'SuiteCRM dynamic record outbox target')
 assertIncludes(crmAdapter, "SET sync_status = 'synced', sync_error = NULL, suitecrm_synced_at = now()", 'SuiteCRM inbound records marked synced')
-assertIncludes(crmAdapter, "operation IN ('upsert_record', 'delete_record', 'upsert_user_identity')", 'SuiteCRM record and user identity outbox claims')
+assertIncludes(crmAdapter, "operation IN ('upsert_record', 'delete_record', 'reproject_record', 'upsert_user_identity')", 'SuiteCRM record reprojection and user identity outbox claims')
 assertIncludes(crmAdapter, 'ensurePipelineCrmHierarchy', 'workspace organization CRM hierarchy')
 assertIncludes(crmAdapter, 'WITH RECURSIVE descendants AS', 'descendant organization CRM hierarchy')
 assertIncludes(crmAdapter, "relationship_type = 'customer'\n       AND parent_organization_id IS NULL", 'existing nested CRM customer hierarchy preservation')
@@ -690,7 +705,7 @@ assertIncludes(crmAdapter, 'listCrmPipelineUsersInPostgres', 'interaction agent 
 assertIncludes(crmAdapter, 'contact_id: clean(fields.contactSuiteCrmId)', 'SuiteCRM Note contact field')
 assertIncludes(crmAdapter, 'global_id_c: referenceCode', 'SuiteCRM Global ID projection')
 assertIncludes(crmAdapter, 'occurred_at_c: suiteCrmDateTime(fields.occurredAt)', 'SuiteCRM interaction occurrence-time projection')
-assertIncludes(crmAdapter, '`crm:${input.entity}:v3:', 'versioned SuiteCRM Global ID outbox contract')
+assertIncludes(crmAdapter, '`crm:${input.entity}:v4:', 'module-versioned SuiteCRM Global ID outbox contract')
 assertIncludes(crmAdapter, "WHERE sync_outbox.status IN ('succeeded', 'dead')", 'replayed SuiteCRM content revision requeue')
 assertIncludes(crmAdapter, 'RETURNING idempotency_key', 'idempotent SuiteCRM outbox insertion or requeue result')
 assertIncludes(crmAdapter, 'if (suiteCrmOutboxKey)', 'SuiteCRM audit noise suppression')
@@ -879,6 +894,7 @@ assertIncludes(crmIntegrationWorkerRoute, 'processInboundGmailIngestion', 'inbou
 assertIncludes(crmIntegrationWorkerRoute, 'processCalendarIngestion', 'Google Calendar reconciliation worker')
 assertIncludes(crmIntegrationWorkerRoute, 'processSuiteCrmAccountContactIngestion', 'SuiteCRM account/contact reconciliation worker')
 assertIncludes(crmIntegrationWorkerRoute, 'processSuiteCrmMeetingIngestion', 'SuiteCRM meeting reconciliation worker')
+assertIncludes(crmIntegrationWorkerRoute, 'processSuiteCrmCallIngestion', 'SuiteCRM native Call reconciliation worker')
 
 const crmCalendarIngestion = read('app_src/lib/crm/calendarIngestion.ts')
 assertIncludes(crmCalendarIngestion, 'clawpilotMeetingReference', 'Calendar meeting reference correlation')
@@ -892,6 +908,17 @@ assertIncludes(crmSuiteCrmMeetingIngestion, 'listSuiteCrmMeetingsUpdatedSince', 
 assertIncludes(crmSuiteCrmMeetingIngestion, 'hasMeaningfulChanges', 'SuiteCRM meeting echo prevention')
 assertIncludes(crmSuiteCrmMeetingIngestion, 'crm:suitecrm-meeting-calendar:', 'SuiteCRM to Calendar update idempotency')
 assertIncludes(crmSuiteCrmMeetingIngestion, 'meetingCalendarOwnerEmail', 'original Calendar organizer routing')
+
+const crmSuiteCrmCallIngestion = read('app_src/lib/crm/suiteCrmCallIngestion.ts')
+assertIncludes(crmSuiteCrmCallIngestion, 'listSuiteCrmCallsUpdatedSince', 'native SuiteCRM Call polling')
+assertIncludes(crmSuiteCrmCallIngestion, "interaction.suitecrm_module", 'persisted SuiteCRM interaction module matching')
+assertIncludes(crmSuiteCrmCallIngestion, "suiteCrmModule: 'Calls'", 'native Call module preservation')
+assertIncludes(crmSuiteCrmCallIngestion, 'activityStatus:', 'native Call activity status ingestion')
+assertIncludes(crmSuiteCrmCallIngestion, 'durationMinutes:', 'native Call duration ingestion')
+assertIncludes(crmSuiteCrmCallIngestion, 'suiteCrmCallDirection', 'native Call direction ingestion')
+assertIncludes(crmSuiteCrmCallIngestion, 'FROM crm_interaction_contacts selected', 'native Call contact-set preservation')
+assertIncludes(crmSuiteCrmCallIngestion, 'emitSuiteCrmOutbox: false', 'native Call inbound echo suppression')
+assertIncludes(crmSuiteCrmCallIngestion, 'archiveCrmRecordInPostgres', 'native Call deletion reconciliation')
 
 const crmSuiteCrmAccountContactIngestion = read('app_src/lib/crm/suiteCrmAccountContactIngestion.ts')
 assertIncludes(crmSuiteCrmAccountContactIngestion, 'crm.suitecrm.account_contact_ingestion.cursor', 'SuiteCRM account/contact cursor')
@@ -974,6 +1001,10 @@ assertIncludes(suiteCrmClient, '/relationships/${linkFieldName}', 'SuiteCRM subp
 assertIncludes(suiteCrmClient, "'contact', 'contacts'", 'SuiteCRM Note and Meeting contact link fields')
 assertIncludes(suiteCrmClient, 'alreadyLinked', 'idempotent SuiteCRM relationship creation')
 assertIncludes(suiteCrmClient, "'filter[date_modified][gte]'", 'incremental SuiteCRM meeting polling')
+assertIncludes(suiteCrmClient, 'listSuiteCrmCallsUpdatedSince', 'incremental SuiteCRM Call polling')
+assertIncludes(suiteCrmClient, 'suiteCrmRecordModule(record)', 'persisted SuiteCRM outbox module resolution')
+assertIncludes(suiteCrmClient, "explicitModule === 'Notes' || explicitModule === 'Calls' || explicitModule === 'Meetings'", 'bounded interaction module transport')
+assertIncludes(suiteCrmClient, 'return canonicalModule', 'legacy SuiteCRM interaction module fallback')
 assertIncludes(suiteCrmClient, 'listSuiteCrmAccountContactRecordsUpdatedSince', 'incremental SuiteCRM account/contact polling')
 assertIncludes(suiteCrmClient, 'findSuiteCrmUser', 'SuiteCRM app-user mapping lookup')
 assertIncludes(suiteCrmClient, '/Api/V8/module/Users', 'SuiteCRM active user module lookup')
@@ -1013,6 +1044,7 @@ assertIncludes(suiteCrmGlobalIdBootstrap, "const CLAWPILOT_NOTE_OCCURRED_AT_FIEL
 assertIncludes(suiteCrmGlobalIdBootstrap, '$field->unified_search = $unifiedSearch ? 1 : 0', 'module-scoped native SuiteCRM Global ID unified search')
 assertIncludes(suiteCrmGlobalIdBootstrap, "ensure_global_id_field('Users', false)", 'native SuiteCRM User Global ID field')
 assertIncludes(suiteCrmGlobalIdBootstrap, "'Meetings'", 'SuiteCRM meeting Global ID field')
+assertIncludes(suiteCrmGlobalIdBootstrap, "'Calls'", 'SuiteCRM Call Global ID field')
 assertIncludes(suiteCrmGlobalIdBootstrap, "'AOS_Products'", 'SuiteCRM product Global ID field')
 assertIncludes(suiteCrmGlobalIdBootstrap, 'expose_global_id_in_detail_view', 'SuiteCRM Global ID detail layout')
 assertIncludes(suiteCrmGlobalIdBootstrap, 'expose_global_id_in_list_view', 'SuiteCRM Global ID list layout')
@@ -1463,6 +1495,8 @@ for (const migration of [
   '0084_operations_command_results.sql',
   '0085_operations_package_workflow.sql',
   '0086_product_packaging_profiles.sql',
+  '0095_crm_native_activity_projection.sql',
+  '0096_crm_contact_identity_aliases.sql',
 ]) {
   assertIncludes(healthRoute, migration, 'hosted POS and accounting migration health')
 }

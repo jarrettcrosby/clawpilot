@@ -170,12 +170,20 @@ const INTERACTION_TYPES = [
   { value: 'email', label: 'Email' },
   { value: 'call', label: 'Call' },
   { value: 'meeting', label: 'Meeting' },
+  { value: 'linkedin', label: 'LinkedIn' },
   { value: 'note', label: 'Note' },
   { value: 'campaign', label: 'Campaign' },
 ] as const
 
+const ACTIVITY_STATUSES = [
+  { value: 'planned', label: 'Planned' },
+  { value: 'held', label: 'Held' },
+  { value: 'not_held', label: 'Not held' },
+] as const
+
 function interactionTypeValue(value: unknown) {
-  const normalized = String(value || '').trim().toLowerCase()
+  const normalized = String(value || '').trim().toLowerCase().replace(/\s+/g, ' ')
+  if (normalized === 'in person') return 'meeting'
   return INTERACTION_TYPES.some((option) => option.value === normalized) ? normalized : String(value || '').trim()
 }
 
@@ -380,13 +388,21 @@ function initialFields(entity: CrmEntity, record: RecordValue | null, userTimeZo
   const selectedInteractionContactIds = interactionContactIds.length > 0
     ? interactionContactIds
     : idList(source.contactId)
+  const interactionType = interactionTypeValue(source.interactionType)
+  const nativeActivity = (interactionType === 'call' || interactionType === 'meeting') && !source.meetingId
   return {
     subject: textValue(source, 'subject'), organizationId: textValue(source, 'organizationId'),
     contactId: selectedInteractionContactIds[0] || '', contactIds: selectedInteractionContactIds.join(','),
     leadId: textValue(source, 'leadId'),
     opportunityId: textValue(source, 'opportunityId'), meetingId: textValue(source, 'meetingId'),
     campaignId: textValue(source, 'campaignId'),
-    interactionType: interactionTypeValue(source.interactionType), occurredAt: dateTimeLocalValue(source.occurredAt, userTimeZone),
+    interactionType, occurredAt: dateTimeLocalValue(source.occurredAt, userTimeZone),
+    activityStatus: textValue(source, 'activityStatus') || (nativeActivity ? 'held' : ''),
+    durationMinutes: textValue(source, 'durationMinutes')
+      || (nativeActivity ? interactionType === 'call' ? '15' : '30' : ''),
+    direction: interactionType === 'call'
+      ? (textValue(source, 'direction') === 'inbound' ? 'inbound' : 'outbound')
+      : textValue(source, 'direction'),
     agentEmail: textValue(source, 'agentEmail'), agentName: textValue(source, 'agentName'), description: textValue(source, 'description'),
   }
 }
@@ -975,7 +991,13 @@ export default function CrmSection() {
           : textValue(record, 'email'),
       })
     } else if (type === 'log_call') {
-      setActionFields({ subject: `Call ${recordName}`, notes: '' })
+      setActionFields({
+        subject: `Call ${recordName}`,
+        notes: '',
+        activityStatus: 'held',
+        durationMinutes: '15',
+        direction: 'outbound',
+      })
     } else {
       setActionFields({
         recipientReferences: '',
@@ -994,7 +1016,13 @@ export default function CrmSection() {
       const payload = actionComposer.type === 'send_email'
         ? { subject: actionFields.subject, text: actionFields.text }
         : actionComposer.type === 'log_call'
-          ? { subject: actionFields.subject, notes: actionFields.notes }
+          ? {
+              subject: actionFields.subject,
+              notes: actionFields.notes,
+              activityStatus: actionFields.activityStatus,
+              durationMinutes: Number(actionFields.durationMinutes || 15),
+              direction: actionFields.direction,
+            }
           : actionComposer.type === 'create_calendar_event'
             ? {
                 subject: actionFields.subject,
@@ -1409,6 +1437,23 @@ export default function CrmSection() {
             </>}
             {actionComposer?.type === 'log_call' && <>
               <TextField label="Subject" required value={actionFields.subject || ''} onChange={(event) => setActionFields({ ...actionFields, subject: event.target.value })} />
+              <Stack direction={{ xs: 'column', sm: 'row' }} gap={1.5}>
+                <TextField fullWidth select label="Status" value={actionFields.activityStatus || 'held'} onChange={(event) => setActionFields({ ...actionFields, activityStatus: event.target.value })}>
+                  {ACTIVITY_STATUSES.map((status) => <MenuItem key={status.value} value={status.value}>{status.label}</MenuItem>)}
+                </TextField>
+                <TextField fullWidth select label="Direction" value={actionFields.direction || 'outbound'} onChange={(event) => setActionFields({ ...actionFields, direction: event.target.value })}>
+                  <MenuItem value="outbound">Outbound</MenuItem>
+                  <MenuItem value="inbound">Inbound</MenuItem>
+                </TextField>
+                <TextField
+                  fullWidth
+                  label="Duration (minutes)"
+                  type="number"
+                  inputProps={{ min: 1, max: 1440, step: 1 }}
+                  value={actionFields.durationMinutes || '15'}
+                  onChange={(event) => setActionFields({ ...actionFields, durationMinutes: event.target.value })}
+                />
+              </Stack>
               <TextField label="Call notes" multiline minRows={5} value={actionFields.notes || ''} onChange={(event) => setActionFields({ ...actionFields, notes: event.target.value })} />
             </>}
             {actionComposer?.type === 'create_calendar_event' && <>
@@ -1870,6 +1915,14 @@ export default function CrmSection() {
           </>}
           {editorEntity === 'meetings' && <>
             <TextField disabled={!recordEditable} label="Meeting" value={fields.subject || ''} onChange={(event) => setFields({ ...fields, subject: event.target.value })} required />
+            <TextField disabled={!recordEditable} select label="Status" value={fields.status || 'planned'} onChange={(event) => setFields({ ...fields, status: event.target.value })}>
+              <MenuItem value="planned">Planned</MenuItem>
+              <MenuItem value="queued">Queued for calendar</MenuItem>
+              <MenuItem value="scheduled">Scheduled</MenuItem>
+              <MenuItem value="completed">Completed</MenuItem>
+              <MenuItem value="cancelled">Cancelled</MenuItem>
+              <MenuItem value="failed">Failed</MenuItem>
+            </TextField>
             <TextField disabled={!recordEditable} select label="Organization" value={fields.organizationId || ''} onChange={(event) => {
               const organizationId = event.target.value
               const selectedContact = contacts.find((record) => textValue(record, 'id') === fields.contactId)
@@ -1987,12 +2040,65 @@ export default function CrmSection() {
               <MenuItem value="">None</MenuItem>
               {campaigns.map((record) => <MenuItem key={textValue(record, 'id')} value={textValue(record, 'id')}>{textValue(record, 'name')}</MenuItem>)}
             </TextField>
-            <TextField disabled={!recordEditable} select required label="Type" value={fields.interactionType || ''} onChange={(event) => setFields({ ...fields, interactionType: event.target.value })}>
+            <TextField disabled={!recordEditable} select required label="Type" value={fields.interactionType || ''} onChange={(event) => {
+              const interactionType = event.target.value
+              const nativeActivity = interactionType === 'call' || interactionType === 'meeting'
+              setFields({
+                ...fields,
+                interactionType,
+                activityStatus: nativeActivity ? fields.activityStatus || 'held' : '',
+                durationMinutes: nativeActivity
+                  ? fields.interactionType === interactionType
+                    ? fields.durationMinutes || (interactionType === 'call' ? '15' : '30')
+                    : interactionType === 'call' ? '15' : '30'
+                  : '',
+                direction: interactionType === 'call'
+                  ? fields.direction === 'inbound' ? 'inbound' : 'outbound'
+                  : fields.direction,
+              })
+            }}>
               {fields.interactionType && !INTERACTION_TYPES.some((option) => option.value === fields.interactionType) ? (
                 <MenuItem value={fields.interactionType}>{fields.interactionType} (legacy)</MenuItem>
               ) : null}
               {INTERACTION_TYPES.map((option) => <MenuItem key={option.value} value={option.value}>{option.label}</MenuItem>)}
             </TextField>
+            {(fields.interactionType === 'call' || (fields.interactionType === 'meeting' && !fields.meetingId)) && (
+              <Stack direction={{ xs: 'column', sm: 'row' }} gap={1.5}>
+                <TextField
+                  fullWidth
+                  disabled={!recordEditable}
+                  select
+                  label="Activity status"
+                  value={fields.activityStatus || 'held'}
+                  onChange={(event) => setFields({ ...fields, activityStatus: event.target.value })}
+                  helperText={fields.activityStatus === 'planned'
+                    ? 'Planned activities appear in SuiteCRM Activities.'
+                    : 'Held and not-held activities appear in SuiteCRM History.'}
+                >
+                  {ACTIVITY_STATUSES.map((status) => <MenuItem key={status.value} value={status.value}>{status.label}</MenuItem>)}
+                </TextField>
+                <TextField
+                  fullWidth
+                  disabled={!recordEditable}
+                  label="Duration (minutes)"
+                  type="number"
+                  inputProps={{ min: 1, max: 1440, step: 1 }}
+                  value={fields.durationMinutes || (fields.interactionType === 'call' ? '15' : '30')}
+                  onChange={(event) => setFields({ ...fields, durationMinutes: event.target.value })}
+                />
+              </Stack>
+            )}
+            {fields.interactionType === 'call' && (
+              <TextField disabled={!recordEditable} select label="Direction" value={fields.direction || 'outbound'} onChange={(event) => setFields({ ...fields, direction: event.target.value })}>
+                <MenuItem value="outbound">Outbound</MenuItem>
+                <MenuItem value="inbound">Inbound</MenuItem>
+              </TextField>
+            )}
+            {fields.interactionType === 'meeting' && fields.meetingId && (
+              <Alert severity="info">
+                This history entry is linked to a canonical meeting. Its native SuiteCRM activity comes from the meeting record.
+              </Alert>
+            )}
             <TextField disabled={!recordEditable} label="Date" type="datetime-local" value={fields.occurredAt || ''} onChange={(event) => setFields({ ...fields, occurredAt: event.target.value })} InputLabelProps={{ shrink: true }} />
             <TextField
               disabled={!recordEditable}

@@ -312,6 +312,7 @@ $modules = [
     'Leads',
     'Opportunities',
     'Meetings',
+    'Calls',
     'Notes',
     'Campaigns',
 ];

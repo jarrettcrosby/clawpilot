@@ -8,7 +8,7 @@ import {
   stageCrmRecordInPostgres,
 } from '@/lib/persistence/crm'
 import { query, withTransaction } from '@/lib/persistence/postgres'
-import type { CrmMeeting } from '@/lib/crm/types'
+import type { CrmActivityStatus, CrmMeeting } from '@/lib/crm/types'
 import { normalizeUserEmail } from '@/lib/users'
 import { zonedDateTimeToIso } from '@/lib/zonedDateTime'
 
@@ -260,6 +260,29 @@ function normalizeDateTime(value: unknown, field: string): string {
   return dateTime
 }
 
+function normalizeCallActivityStatus(value: unknown): CrmActivityStatus {
+  const status = cleanString(value, 32, 'Call status').toLowerCase().replace(/[\s-]+/g, '_')
+  if (!status) return 'held'
+  if (status === 'planned' || status === 'held' || status === 'not_held') return status
+  throw new CrmIntegrationActionError('Call status is invalid')
+}
+
+function normalizeCallDirection(value: unknown): 'inbound' | 'outbound' {
+  const direction = cleanString(value, 32, 'Call direction').toLowerCase()
+  if (!direction) return 'outbound'
+  if (direction === 'inbound' || direction === 'outbound') return direction
+  throw new CrmIntegrationActionError('Call direction is invalid')
+}
+
+function normalizeCallDuration(value: unknown): number {
+  if (value === undefined || value === null || value === '') return 15
+  const duration = Number(value)
+  if (!Number.isInteger(duration) || duration < 1 || duration > 24 * 60) {
+    throw new CrmIntegrationActionError('Call duration must be a whole number from 1 to 1440 minutes')
+  }
+  return duration
+}
+
 function normalizeEmailList(value: unknown): string[] {
   if (value === undefined || value === null || value === '') return []
   if (!Array.isArray(value) || value.length > 100) {
@@ -405,11 +428,14 @@ async function normalizePayload(
   }
 
   if (actionType === 'log_call') {
-    assertOnlyFields(payload, ['subject', 'notes'])
+    assertOnlyFields(payload, ['subject', 'notes', 'activityStatus', 'durationMinutes', 'direction'])
     if (!target.phone) throw new CrmIntegrationActionError('The referenced CRM record has no phone number')
     return {
       subject: cleanString(payload.subject, 300, 'Call subject') || `Call ${target.name || target.referenceCode}`,
       notes: cleanString(payload.notes, 50_000, 'Call notes'),
+      activityStatus: normalizeCallActivityStatus(payload.activityStatus),
+      durationMinutes: normalizeCallDuration(payload.durationMinutes),
+      direction: normalizeCallDirection(payload.direction),
     }
   }
 
@@ -1089,6 +1115,9 @@ async function stageActionInteraction(input: {
   providerMessageId?: string | null
   providerThreadId?: string | null
   meetingId?: string | null
+  activityStatus?: CrmActivityStatus | null
+  durationMinutes?: number | null
+  direction?: 'inbound' | 'outbound'
 }) {
   const links = interactionLinks(input.target, input.meetingId)
   const parentSuiteCrmType = suiteCrmParentType(input.target.entity)
@@ -1112,12 +1141,17 @@ async function stageActionInteraction(input: {
       parentSuiteCrmId: parentSuiteCrmType ? input.target.suiteCrmId : null,
       parentSuiteCrmType: parentSuiteCrmType || undefined,
       interactionType: input.interactionType,
+      ...(input.interactionType === 'call' ? {
+        suiteCrmModule: 'Calls' as const,
+        activityStatus: input.activityStatus || 'held',
+        durationMinutes: input.durationMinutes || 15,
+      } : {}),
       subject: input.subject,
       agentEmail: input.action.actorEmail,
       agentName: input.action.actorEmail,
       occurredAt: new Date().toISOString(),
       description: input.description,
-      direction: 'outbound',
+      direction: input.direction || 'outbound',
       deliveryStatus: input.deliveryStatus,
       providerMessageId: input.providerMessageId || null,
       providerThreadId: input.providerThreadId || null,
@@ -1428,22 +1462,12 @@ async function createCalendarEventAction(action: LeasedCrmIntegrationAction, tar
       meetingStatus: 'cancelled',
     }
     await recordAttemptSucceeded(action, eventId, summary)
-    const meeting = await stageCalendarMeeting(
+    await stageCalendarMeeting(
       action,
       meetingTarget,
       { eventId, eventUrl, joinUrl },
       'cancelled',
     )
-    await stageActionInteraction({
-      action,
-      target,
-      subject,
-      description,
-      interactionType: 'meeting',
-      deliveryStatus: 'cancelled',
-      providerMessageId: eventId,
-      meetingId: meeting.id,
-    })
     await completeAction(action, eventId, summary)
     return
   }
@@ -1531,22 +1555,12 @@ async function createCalendarEventAction(action: LeasedCrmIntegrationAction, tar
     meetingStatus: finalMeetingStatus,
   }
   await recordAttemptSucceeded(action, eventId, summary)
-  const meeting = await stageCalendarMeeting(
+  await stageCalendarMeeting(
     action,
     meetingTarget,
     { eventId, eventUrl, joinUrl },
     finalMeetingStatus,
   )
-  await stageActionInteraction({
-    action,
-    target,
-    subject,
-    description,
-    interactionType: 'meeting',
-    deliveryStatus: 'scheduled',
-    providerMessageId: eventId,
-    meetingId: meeting.id,
-  })
   await completeAction(action, eventId, summary)
 }
 
@@ -1568,14 +1582,24 @@ async function logCallAction(action: LeasedCrmIntegrationAction, target: CrmRefe
   const url = telUrl(target.phone)
   const subject = requiredString(action.payload.subject, 300, 'Call subject')
   const notes = cleanString(action.payload.notes, 50_000, 'Call notes')
-  const summary = { telUrl: url }
+  const activityStatus = normalizeCallActivityStatus(action.payload.activityStatus)
+  const durationMinutes = normalizeCallDuration(action.payload.durationMinutes)
+  const direction = normalizeCallDirection(action.payload.direction)
+  const summary = { telUrl: url, activityStatus, durationMinutes, direction }
   await stageActionInteraction({
     action,
     target,
     subject,
     description: notes,
     interactionType: 'call',
-    deliveryStatus: 'logged',
+    deliveryStatus: activityStatus === 'planned'
+      ? 'planned'
+      : activityStatus === 'not_held'
+        ? 'not-held'
+        : 'logged',
+    activityStatus,
+    durationMinutes,
+    direction,
   })
   await completeAction(action, null, summary)
 }
