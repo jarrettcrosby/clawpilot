@@ -433,6 +433,9 @@ const upsRate = await sandboxRateModule.requestCarrierSandboxRates({
         RatedShipment: [{
           Service: { Code: '03' },
           TotalCharges: { MonetaryValue: '18.45', CurrencyCode: 'USD' },
+          NegotiatedRateCharges: {
+            TotalCharge: { MonetaryValue: '15.25', CurrencyCode: 'USD' },
+          },
           TimeInTransit: {
             ServiceSummary: {
               EstimatedArrival: {
@@ -449,18 +452,23 @@ const upsRate = await sandboxRateModule.requestCarrierSandboxRates({
     })
   },
 })
-assert.equal(rateRequests[1].url, 'https://wwwcie.ups.com/api/rating/v2409/Shop?additionalinfo=timeintransit')
+assert.equal(rateRequests[1].url, 'https://wwwcie.ups.com/api/rating/v2409/Shop')
 const upsRequest = JSON.parse(rateRequests[1].init.body)
+assert.equal(upsRequest.RateRequest.Request.RequestOption, 'Shop')
 assert.equal(upsRequest.RateRequest.Shipment.Shipper.ShipperNumber, credential.accountNumber)
+assert.equal(
+  upsRequest.RateRequest.Shipment.PaymentDetails.ShipmentCharge[0].BillShipper.AccountNumber,
+  credential.accountNumber,
+)
 assert.equal(upsRequest.RateRequest.Shipment.ShipFrom.Address.AddressLine[0], '101 Jegs Place')
 assert.equal(upsRequest.RateRequest.Shipment.ShipTo.Address.AddressLine[0], '101 Academy Drive')
-assert.equal(upsRequest.RateRequest.Shipment.Package.Description, 'Test Product')
+assert.equal(upsRequest.RateRequest.Shipment.Package[0].Description, 'Test Product')
 assert.deepEqual(JSON.parse(JSON.stringify(upsRate.result.rates)), [{
   serviceCode: '03',
   serviceName: 'UPS Ground',
-  amount: '18.45',
+  amount: '15.25',
   currency: 'USD',
-  rateType: null,
+  rateType: 'NEGOTIATED',
   transitDays: 3,
   deliveryDate: '2026-07-27',
 }])

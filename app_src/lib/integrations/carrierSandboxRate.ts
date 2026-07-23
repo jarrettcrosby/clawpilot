@@ -62,7 +62,7 @@ export type CarrierSandboxRateEvidence = {
 }
 
 const RATE_ENDPOINTS = {
-  ups_rest: 'https://wwwcie.ups.com/api/rating/v2409/Shop?additionalinfo=timeintransit',
+  ups_rest: 'https://wwwcie.ups.com/api/rating/v2409/Shop',
   fedex_rest: 'https://apis-sandbox.fedex.com/rate/v1/rates/quotes',
 } as const
 
@@ -208,12 +208,19 @@ function upsRequest(accountNumber: string) {
   const fixture = CARRIER_SANDBOX_RATE_FIXTURE
   return {
     RateRequest: {
-      Request: { TransactionReference: { CustomerContext: 'ClawPilot sandbox rating' } },
+      Request: {
+        RequestOption: 'Shop',
+        TransactionReference: { CustomerContext: 'ClawPilot sandbox rating' },
+      },
       Shipment: {
         Shipper: { ...upsParty(fixture.origin), ShipperNumber: accountNumber },
         ShipFrom: upsParty(fixture.origin),
         ShipTo: upsParty(fixture.destination),
-        Package: {
+        PaymentDetails: {
+          ShipmentCharge: [{ Type: '01', BillShipper: { AccountNumber: accountNumber } }],
+        },
+        NumOfPieces: '1',
+        Package: [{
           PackagingType: { Code: '02', Description: 'Customer supplied package' },
           Description: fixture.parcel.description,
           Dimensions: {
@@ -224,7 +231,8 @@ function upsRequest(accountNumber: string) {
             UnitOfMeasurement: { Code: 'LBS' },
             Weight: String(fixture.parcel.weight),
           },
-        },
+        }],
+        ShipmentRatingOptions: { NegotiatedRatesIndicator: '' },
       },
     },
   }
@@ -261,7 +269,8 @@ function parseUps(payload: Record<string, unknown>): CarrierSandboxRate[] {
   return list(response.RatedShipment).flatMap((rawShipment) => {
     const shipment = record(rawShipment)
     const service = record(shipment.Service)
-    const charges = record(shipment.TotalCharges)
+    const negotiated = record(record(shipment.NegotiatedRateCharges).TotalCharge)
+    const charges = text(negotiated.MonetaryValue) ? negotiated : record(shipment.TotalCharges)
     const serviceCode = text(service.Code) || 'UNKNOWN'
     const amount = text(charges.MonetaryValue)
     const currency = text(charges.CurrencyCode)
@@ -275,7 +284,7 @@ function parseUps(payload: Record<string, unknown>): CarrierSandboxRate[] {
       serviceName: text(service.Description) || UPS_SERVICE_NAMES[serviceCode] || `UPS service ${serviceCode}`,
       amount,
       currency,
-      rateType: null,
+      rateType: charges === negotiated ? 'NEGOTIATED' : 'PUBLISHED',
       transitDays: transitDays(estimatedArrival.BusinessDaysInTransit || summary.BusinessDaysInTransit),
       deliveryDate: normalizeDate(arrival.Date || estimatedArrival.Date),
     }]

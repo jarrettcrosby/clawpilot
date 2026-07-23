@@ -27,7 +27,7 @@ import {
   writeCarrierCredentialInPostgres,
 } from '@/lib/persistence/carrierIntegrations'
 
-const CARRIER_SANDBOX_RATE_ADAPTER_VERSION = 'direct-rest-v1'
+const CARRIER_SANDBOX_RATE_ADAPTER_VERSION = 'direct-rest-v2'
 
 export class CarrierIntegrationRequestError extends Error {
   readonly status: number
