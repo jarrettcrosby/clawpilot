@@ -91,6 +91,11 @@ export async function ensureDemoWorkspaceMembership(actor: AppUser): Promise<Wor
     viewOperations: true,
     manageOperations: false,
     executeWarehouse: false,
+    manageCarrierRateNetworks: false,
+    grantCarrierRateAccess: false,
+    viewCarrierCost: false,
+    reconcileCarrierBilling: false,
+    approveCarrierSettlement: false,
     viewAccounting: true,
   }
   return withTransaction(async (client) => {

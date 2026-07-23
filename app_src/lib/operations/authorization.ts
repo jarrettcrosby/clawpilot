@@ -7,6 +7,14 @@ export type OperationsCapabilities = {
   canActivate: boolean
 }
 
+export type CarrierRateNetworkCapabilities = {
+  canManageNetworks: boolean
+  canGrantRateAccess: boolean
+  canViewCarrierCost: boolean
+  canReconcileCarrierBilling: boolean
+  canApproveCarrierSettlement: boolean
+}
+
 export function operationsCapabilities(user: AppUser): OperationsCapabilities {
   const role = effectiveAuthorizationRole(user)
   const permissions = effectiveUserPermissions(user)
@@ -18,9 +26,37 @@ export function operationsCapabilities(user: AppUser): OperationsCapabilities {
   }
 }
 
+export function carrierRateNetworkCapabilities(user: AppUser): CarrierRateNetworkCapabilities {
+  const role = effectiveAuthorizationRole(user)
+  const permissions = effectiveUserPermissions(user)
+  const isOwner = role === 'owner'
+  const isAdministrator = role === 'admin'
+  const canViewCarrierCost = isOwner || permissions.viewCarrierCost === true
+  return {
+    canManageNetworks: isOwner || (isAdministrator && permissions.manageCarrierRateNetworks === true),
+    canGrantRateAccess: isOwner || (isAdministrator && permissions.grantCarrierRateAccess === true),
+    canViewCarrierCost,
+    canReconcileCarrierBilling: canViewCarrierCost && (
+      isOwner || permissions.reconcileCarrierBilling === true
+    ),
+    canApproveCarrierSettlement: canViewCarrierCost && (
+      isOwner || (isAdministrator && permissions.approveCarrierSettlement === true)
+    ),
+  }
+}
+
 export function requireOperationsCapability(user: AppUser, capability: keyof OperationsCapabilities) {
   if (!operationsCapabilities(user)[capability]) {
     throw new Error('OPERATIONS_FORBIDDEN')
+  }
+}
+
+export function requireCarrierRateNetworkCapability(
+  user: AppUser,
+  capability: keyof CarrierRateNetworkCapabilities,
+) {
+  if (!carrierRateNetworkCapabilities(user)[capability]) {
+    throw new Error('CARRIER_RATE_NETWORK_FORBIDDEN')
   }
 }
 

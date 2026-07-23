@@ -68,7 +68,7 @@ export type Millimeters = {
 export type Address = {
   name: string
   line1: string
-  line2?: string
+  line2?: string | null
   city: string
   region: string
   postalCode: string
@@ -143,6 +143,199 @@ export type CarrierRate = {
 
 export type PricedCarrierRate = CarrierRate & {
   customerChargeMinor: bigint
+}
+
+export type CarrierRatePartyRole = 'platform_operator' | 'reseller' | 'shipper'
+
+export type CarrierRateParty = {
+  entityType: 'workspace_organization' | 'crm_customer'
+  entityId: string
+  globalId: string
+  displayName: string
+  role: CarrierRatePartyRole
+}
+
+export type CarrierRateMarkupDirective = {
+  globalId: string
+  priority: number
+  type:
+    | 'fixed_amount'
+    | 'percent_markup'
+    | 'cost_plus_percent'
+    | 'minimum_charge'
+    | 'maximum_charge'
+  amountMinor?: bigint
+  basisPoints?: number
+}
+
+export type CarrierRatePathGrant = {
+  grantGlobalId: string
+  grantorGlobalId: string
+  granteeGlobalId: string
+  directives: CarrierRateMarkupDirective[]
+}
+
+export type CarrierRatePathHop = {
+  grantGlobalId: string
+  grantor: CarrierRateParty
+  grantee: CarrierRateParty
+  upstreamBuyMinor: bigint
+  markupMinor: bigint
+  downstreamSellMinor: bigint
+  directiveGlobalIds: string[]
+}
+
+export type CarrierRateSettlement = {
+  type:
+    | 'carrier_payable'
+    | 'carrier_cost_reimbursement'
+    | 'platform_fee'
+    | 'reseller_fee'
+  payerGlobalId: string
+  payeeGlobalId: string
+  amountMinor: bigint
+  currency: string
+  grantGlobalId: string | null
+}
+
+export type CarrierRatePartyMargin = {
+  partyGlobalId: string
+  role: 'platform_operator' | 'reseller'
+  buyMinor: bigint
+  sellMinor: bigint
+  marginMinor: bigint
+}
+
+export type CarrierRatePathPricing = {
+  currency: string
+  carrierAccountGlobalId: string
+  carrierAccountOwnerGlobalId: string
+  carrierPayeeReference: string
+  carrierCostMinor: bigint
+  customerChargeMinor: bigint
+  hops: CarrierRatePathHop[]
+  settlements: CarrierRateSettlement[]
+  margins: CarrierRatePartyMargin[]
+}
+
+export type CarrierAccountAddressVerification =
+  | 'operator_attested'
+  | 'provider_verified'
+
+export type CarrierBillingRelationship =
+  | 'sender'
+  | 'recipient'
+  | 'third_party'
+
+export type CarrierAccountTenderIdentity = {
+  carrierAccountGlobalId: string
+  accountOwnerGlobalId: string
+  accountAddress: Address
+  accountAddressVerification: CarrierAccountAddressVerification
+}
+
+export type CarrierBillingSelection = {
+  relationship: CarrierBillingRelationship
+  carrierAccountGlobalId: string
+  accountOwnerGlobalId: string
+  matchedAddressSide: 'sender' | 'recipient' | null
+  accountAddressVerification: CarrierAccountAddressVerification
+  evidence: {
+    senderMatched: boolean
+    recipientMatched: boolean
+    normalizationVersion: 'postal-address-v1'
+  }
+}
+
+export type CarrierBillingChargeCategory =
+  | 'transportation'
+  | 'fuel_surcharge'
+  | 'residential_surcharge'
+  | 'delivery_area_surcharge'
+  | 'address_correction'
+  | 'dimensional_adjustment'
+  | 'weight_adjustment'
+  | 'signature'
+  | 'saturday'
+  | 'declared_value'
+  | 'tax'
+  | 'duty'
+  | 'late_fee'
+  | 'refund'
+  | 'credit'
+  | 'other'
+
+export type CarrierBillingShipmentMatchStatus =
+  | 'matched'
+  | 'unmatched'
+  | 'ambiguous'
+  | 'rejected'
+
+export type CarrierBillingShipperAssignmentStatus =
+  | 'assigned'
+  | 'unassigned'
+  | 'ambiguous'
+  | 'rejected'
+
+export type CarrierBillingChargeLine = {
+  externalChargeId: string
+  statementGlobalId: string
+  billedAccountFingerprint: string
+  trackingNumber: string | null
+  shipmentGlobalId: string | null
+  shipmentMatchStatus: CarrierBillingShipmentMatchStatus
+  assignedShipperGlobalId: string | null
+  shipperAssignmentStatus: CarrierBillingShipperAssignmentStatus
+  shipperAssignmentSource:
+    | 'shipment_match'
+    | 'manual'
+    | 'routing_rule'
+    | 'none'
+  category: CarrierBillingChargeCategory
+  amountMinor: bigint
+  currency: string
+}
+
+export type CarrierBillingStatementGroupInput = {
+  externalChargeId: string
+  externalStatementId: string
+  billedAccountMaskedReference: string
+  billedAccountFingerprint: string
+}
+
+export type CarrierBillingStatementGroup = {
+  externalStatementId: string
+  billedAccountMaskedReference: string
+  billedAccountFingerprint: string
+  externalChargeIds: string[]
+}
+
+export type CarrierBillingShipperAssignment = {
+  shipmentMatchStatus: CarrierBillingShipmentMatchStatus
+  shipmentGlobalId: string | null
+  shipperAssignmentStatus: CarrierBillingShipperAssignmentStatus
+  assignedShipperGlobalId: string | null
+  source: 'shipment_match' | 'manual' | 'routing_rule' | 'none'
+  ruleGlobalId: string | null
+  actorEmail: string | null
+  reason: string | null
+}
+
+export type CarrierBillingReconciliation = {
+  shipmentGlobalId: string
+  currency: string
+  status: 'pending' | 'provisional' | 'needs_review' | 'reconciled'
+  quotedCarrierCostMinor: bigint
+  actualCarrierCostMinor: bigint
+  varianceMinor: bigint
+  matchedChargeCount: number
+  unresolvedCandidateCount: number
+  assignmentExceptionCount: number
+  chargeTotals: Array<{
+    category: CarrierBillingChargeCategory
+    amountMinor: bigint
+  }>
+  matchedExternalChargeIds: string[]
 }
 
 export type PricingDirective = {

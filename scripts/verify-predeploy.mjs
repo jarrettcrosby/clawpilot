@@ -190,6 +190,8 @@ for (const requiredPath of [
   'db/migrations/0086_product_packaging_profiles.sql',
   'db/migrations/0087_operations_carrier_credentials.sql',
   'db/migrations/0088_operations_sandbox_rating_and_mock_retirement.sql',
+  'db/migrations/0089_operations_rate_delegation_and_carrier_settlement.sql',
+  'db/migrations/0090_operations_carrier_accounts_and_gl_coding.sql',
   '.github/workflows/clawpilot-repository-runner.yml',
   '.github/workflows/deployed-runtime-monitor.yml',
   'scripts/start-railway.sh',

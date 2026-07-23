@@ -31,6 +31,11 @@ export type AppUserPermissions = {
   viewOperations: boolean
   manageOperations: boolean
   executeWarehouse: boolean
+  manageCarrierRateNetworks: boolean
+  grantCarrierRateAccess: boolean
+  viewCarrierCost: boolean
+  reconcileCarrierBilling: boolean
+  approveCarrierSettlement: boolean
   viewFullReleaseHistory: boolean
   manageBackups: boolean
   manageLinks: boolean
@@ -50,6 +55,11 @@ export const MEMBER_PERMISSIONS: AppUserPermissions = {
   viewOperations: false,
   manageOperations: false,
   executeWarehouse: false,
+  manageCarrierRateNetworks: false,
+  grantCarrierRateAccess: false,
+  viewCarrierCost: false,
+  reconcileCarrierBilling: false,
+  approveCarrierSettlement: false,
   viewFullReleaseHistory: false,
   manageBackups: false,
   manageLinks: false,
@@ -69,6 +79,11 @@ export const OWNER_PERMISSIONS: AppUserPermissions = {
   viewOperations: true,
   manageOperations: true,
   executeWarehouse: true,
+  manageCarrierRateNetworks: true,
+  grantCarrierRateAccess: true,
+  viewCarrierCost: true,
+  reconcileCarrierBilling: true,
+  approveCarrierSettlement: true,
   viewFullReleaseHistory: true,
   manageBackups: true,
   manageLinks: true,
@@ -176,6 +191,11 @@ function normalizePermissions(value: unknown): AppUserPermissions {
     viewOperations: input.viewOperations === true,
     manageOperations: input.manageOperations === true,
     executeWarehouse: input.executeWarehouse === true,
+    manageCarrierRateNetworks: input.manageCarrierRateNetworks === true,
+    grantCarrierRateAccess: input.grantCarrierRateAccess === true,
+    viewCarrierCost: input.viewCarrierCost === true,
+    reconcileCarrierBilling: input.reconcileCarrierBilling === true,
+    approveCarrierSettlement: input.approveCarrierSettlement === true,
     viewFullReleaseHistory: input.viewFullReleaseHistory === true,
     manageBackups: input.manageBackups === true,
     manageLinks: input.manageLinks === true,
@@ -197,6 +217,9 @@ export function permissionsForRole(role: AppUserRole, value: unknown): AppUserPe
     permissions.manageBackups = false
     permissions.manageLinks = false
     permissions.manageOperations = false
+    permissions.manageCarrierRateNetworks = false
+    permissions.grantCarrierRateAccess = false
+    permissions.approveCarrierSettlement = false
     permissions.approveAccounting = false
     permissions.viewOrganizationAudit = false
     permissions.viewSystemAudit = false

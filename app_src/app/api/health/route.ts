@@ -235,6 +235,8 @@ export async function GET() {
           product_packaging_profiles_migration_applied: boolean
           operations_carrier_credentials_migration_applied: boolean
           operations_sandbox_rating_migration_applied: boolean
+          operations_rate_delegation_migration_applied: boolean
+          operations_carrier_accounts_gl_coding_migration_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -600,6 +602,16 @@ export async function GET() {
                 FROM schema_migrations
                 WHERE filename = '0088_operations_sandbox_rating_and_mock_retirement.sql'
               ) AS operations_sandbox_rating_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0089_operations_rate_delegation_and_carrier_settlement.sql'
+              ) AS operations_rate_delegation_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0090_operations_carrier_accounts_and_gl_coding.sql'
+              ) AS operations_carrier_accounts_gl_coding_migration_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -684,6 +696,8 @@ export async function GET() {
             && row?.product_packaging_profiles_migration_applied
             && row?.operations_carrier_credentials_migration_applied
             && row?.operations_sandbox_rating_migration_applied
+            && row?.operations_rate_delegation_migration_applied
+            && row?.operations_carrier_accounts_gl_coding_migration_applied
             && row?.migration_checksums_present
           ),
         }
@@ -760,6 +774,8 @@ export async function GET() {
           || !row?.product_packaging_profiles_migration_applied
           || !row?.operations_carrier_credentials_migration_applied
           || !row?.operations_sandbox_rating_migration_applied
+          || !row?.operations_rate_delegation_migration_applied
+          || !row?.operations_carrier_accounts_gl_coding_migration_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')

@@ -54,6 +54,7 @@ import type {
   OperationsOrderStatus,
   OperationsWorkspace,
 } from '@/lib/operations/types'
+import GlCodingPanel from '@/components/operations/GlCodingPanel'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import { formatUserDateTime } from '@/lib/userDateTime'
 
@@ -499,7 +500,7 @@ export default function OperationsSection() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
-  const [view, setView] = useState<'orders' | 'exceptions'>('orders')
+  const [view, setView] = useState<'orders' | 'exceptions' | 'gl-coding'>('orders')
   const [search, setSearch] = useState('')
   const [status, setStatus] = useState<'' | OperationsOrderStatus>('')
   const [exceptionStatus, setExceptionStatus] = useState<'' | OperationsExceptionStatus>('')
@@ -787,7 +788,13 @@ export default function OperationsSection() {
   const detail = workspace?.selectedOrder?.globalId === selectedGlobalId ? workspace.selectedOrder : null
   const selectedException = workspace?.exceptions.find((item) => item.globalId === selectedExceptionGlobalId) || null
   const summary = workspace?.summary
-  const empty = !loading && (view === 'orders' ? workspace?.orders.length === 0 : workspace?.exceptions.length === 0)
+  const empty = !loading && (
+    view === 'orders'
+      ? workspace?.orders.length === 0
+      : view === 'exceptions'
+        ? workspace?.exceptions.length === 0
+        : false
+  )
 
   return (
     <Box sx={{ height: '100%', display: 'flex', flexDirection: 'column', minWidth: 0, overflow: 'hidden' }}>
@@ -828,7 +835,9 @@ export default function OperationsSection() {
               </Tooltip>
             )}
             <Tooltip title="Operations guide"><IconButton aria-label="Open operations guide" onClick={() => setGuideOpen(true)}><HelpOutlineRounded /></IconButton></Tooltip>
-            <Tooltip title="Refresh orders"><span><IconButton aria-label="Refresh operations" disabled={loading} onClick={() => void loadWorkspace(selectedGlobalId)}><RefreshRounded /></IconButton></span></Tooltip>
+            {view !== 'gl-coding' && (
+              <Tooltip title="Refresh orders"><span><IconButton aria-label="Refresh operations" disabled={loading} onClick={() => void loadWorkspace(selectedGlobalId)}><RefreshRounded /></IconButton></span></Tooltip>
+            )}
           </Stack>
         </Stack>
 
@@ -845,7 +854,7 @@ export default function OperationsSection() {
         )}
         <Tabs
           value={view}
-          onChange={(_, next: 'orders' | 'exceptions') => {
+          onChange={(_, next: 'orders' | 'exceptions' | 'gl-coding') => {
             setView(next)
             setSearch('')
             closeDrawer()
@@ -856,52 +865,57 @@ export default function OperationsSection() {
         >
           <Tab value="orders" label={`Orders${workspace ? ` (${workspace.orders.length})` : ''}`} />
           <Tab value="exceptions" label={`Exceptions${workspace ? ` (${workspace.summary.exceptions})` : ''}`} />
+          <Tab value="gl-coding" label="GL Coding" />
         </Tabs>
       </Box>
 
-      <Box sx={{ px: { xs: 2, md: 3 }, py: 1.5, display: 'flex', flexWrap: 'wrap', gap: 1.25, flexShrink: 0 }}>
-        <TextField
-          size="small"
-          value={search}
-          onChange={(event) => setSearch(event.target.value)}
-          placeholder={view === 'orders' ? 'Search order, Global ID, or customer' : 'Search exception, order, or customer'}
-          inputProps={{ 'aria-label': view === 'orders' ? 'Search operations orders' : 'Search operations exceptions' }}
-          InputProps={{ startAdornment: <InputAdornment position="start"><SearchRounded fontSize="small" /></InputAdornment> }}
-          sx={{ ...controlSx, flex: '1 1 280px', maxWidth: 440 }}
-        />
-        {view === 'orders' ? (
+      {view !== 'gl-coding' && (
+        <Box sx={{ px: { xs: 2, md: 3 }, py: 1.5, display: 'flex', flexWrap: 'wrap', gap: 1.25, flexShrink: 0 }}>
           <TextField
-            select
             size="small"
-            value={status}
-            onChange={(event) => setStatus(event.target.value as '' | OperationsOrderStatus)}
-            inputProps={{ 'aria-label': 'Filter orders by status' }}
-            sx={{ ...controlSx, flex: '0 1 180px', minWidth: 150 }}
-          >
-            {ORDER_STATUSES.map((option) => <MenuItem key={option.value || 'all'} value={option.value}>{option.label}</MenuItem>)}
-          </TextField>
-        ) : (
-          <TextField
-            select
-            size="small"
-            value={exceptionStatus}
-            onChange={(event) => setExceptionStatus(event.target.value as '' | OperationsExceptionStatus)}
-            inputProps={{ 'aria-label': 'Filter exceptions by status' }}
-            sx={{ ...controlSx, flex: '0 1 210px', minWidth: 180 }}
-          >
-            {EXCEPTION_STATUSES.map((option) => <MenuItem key={option.value || 'all'} value={option.value}>{option.label}</MenuItem>)}
-          </TextField>
-        )}
-      </Box>
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+            placeholder={view === 'orders' ? 'Search order, Global ID, or customer' : 'Search exception, order, or customer'}
+            inputProps={{ 'aria-label': view === 'orders' ? 'Search operations orders' : 'Search operations exceptions' }}
+            InputProps={{ startAdornment: <InputAdornment position="start"><SearchRounded fontSize="small" /></InputAdornment> }}
+            sx={{ ...controlSx, flex: '1 1 280px', maxWidth: 440 }}
+          />
+          {view === 'orders' ? (
+            <TextField
+              select
+              size="small"
+              value={status}
+              onChange={(event) => setStatus(event.target.value as '' | OperationsOrderStatus)}
+              inputProps={{ 'aria-label': 'Filter orders by status' }}
+              sx={{ ...controlSx, flex: '0 1 180px', minWidth: 150 }}
+            >
+              {ORDER_STATUSES.map((option) => <MenuItem key={option.value || 'all'} value={option.value}>{option.label}</MenuItem>)}
+            </TextField>
+          ) : (
+            <TextField
+              select
+              size="small"
+              value={exceptionStatus}
+              onChange={(event) => setExceptionStatus(event.target.value as '' | OperationsExceptionStatus)}
+              inputProps={{ 'aria-label': 'Filter exceptions by status' }}
+              sx={{ ...controlSx, flex: '0 1 210px', minWidth: 180 }}
+            >
+              {EXCEPTION_STATUSES.map((option) => <MenuItem key={option.value || 'all'} value={option.value}>{option.label}</MenuItem>)}
+            </TextField>
+          )}
+        </Box>
+      )}
 
-      {error && <Alert severity="error" onClose={() => setError('')} sx={{ mx: { xs: 2, md: 3 }, mb: 1.5 }}>{error}</Alert>}
-      {notice && <Alert severity="success" onClose={() => setNotice('')} sx={{ mx: { xs: 2, md: 3 }, mb: 1.5 }}>{notice}</Alert>}
-      {!loading && workspace && !workspace.configured && (
+      {view !== 'gl-coding' && error && <Alert severity="error" onClose={() => setError('')} sx={{ mx: { xs: 2, md: 3 }, mb: 1.5 }}>{error}</Alert>}
+      {view !== 'gl-coding' && notice && <Alert severity="success" onClose={() => setNotice('')} sx={{ mx: { xs: 2, md: 3 }, mb: 1.5 }}>{notice}</Alert>}
+      {view !== 'gl-coding' && !loading && workspace && !workspace.configured && (
         <Alert severity="info" sx={{ mx: { xs: 2, md: 3 }, mb: 1.5 }}>Connect an approved commerce provider and configure an active warehouse to begin importing orders.</Alert>
       )}
 
       <Box sx={{ flex: 1, minHeight: 0, overflow: 'auto', WebkitOverflowScrolling: 'touch' }}>
-        {loading && !workspace ? (
+        {view === 'gl-coding' ? (
+          <GlCodingPanel />
+        ) : loading && !workspace ? (
           <Box sx={{ height: '100%', display: 'grid', placeItems: 'center' }}><CircularProgress size={30} /></Box>
         ) : empty ? (
           <Box sx={{ py: 10, px: 3, textAlign: 'center' }}>
