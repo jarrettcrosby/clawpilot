@@ -2867,8 +2867,8 @@ export async function runMockOperationsProofFromPostgres(input: {
 
     const shipmentResult = await client.query<IdRow>(
       `INSERT INTO operations_shipments (
-         organization_id, order_id, plan_id, package_id, label_id, status,
-         tracking_number, shipped_at, actual_carrier_cost_minor, confirmed_by
+       organization_id, order_id, plan_id, package_id, label_id, status,
+         tracking_number, shipped_at, quoted_carrier_cost_minor, confirmed_by
        ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid,
          'confirmed', $6, now(), $7, $8)
        RETURNING id::text, global_id`,

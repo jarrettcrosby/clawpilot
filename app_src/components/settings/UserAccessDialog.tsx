@@ -66,6 +66,11 @@ type UserPermissions = {
   viewOperations: boolean
   manageOperations: boolean
   executeWarehouse: boolean
+  manageCarrierRateNetworks: boolean
+  grantCarrierRateAccess: boolean
+  viewCarrierCost: boolean
+  reconcileCarrierBilling: boolean
+  approveCarrierSettlement: boolean
   viewFullReleaseHistory: boolean
   manageBackups: boolean
   manageLinks: boolean
@@ -226,7 +231,12 @@ const LOCALES = [
   'zh-CN',
 ]
 
-const PERMISSIONS: Array<{ key: PermissionKey; label: string; adminOnly?: boolean }> = [
+const PERMISSIONS: Array<{
+  key: PermissionKey
+  label: string
+  description?: string
+  adminOnly?: boolean
+}> = [
   { key: 'accessDemo', label: 'Open demo account' },
   { key: 'inviteUsers', label: 'Invite users', adminOnly: true },
   { key: 'manageUserAccess', label: 'Manage access', adminOnly: true },
@@ -235,6 +245,34 @@ const PERMISSIONS: Array<{ key: PermissionKey; label: string; adminOnly?: boolea
   { key: 'viewOperations', label: 'View operations' },
   { key: 'manageOperations', label: 'Manage operations', adminOnly: true },
   { key: 'executeWarehouse', label: 'Execute warehouse work' },
+  {
+    key: 'manageCarrierRateNetworks',
+    label: 'Manage carrier rate networks',
+    description: 'Create, edit, disable, and configure organization carrier rate networks.',
+    adminOnly: true,
+  },
+  {
+    key: 'grantCarrierRateAccess',
+    label: 'Grant carrier rate access',
+    description: 'Grant or revoke downstream access to authorized carrier accounts and rates.',
+    adminOnly: true,
+  },
+  {
+    key: 'viewCarrierCost',
+    label: 'View carrier costs',
+    description: 'View unmarked rates, actual carrier charges, and quoted-to-billed cost variance.',
+  },
+  {
+    key: 'reconcileCarrierBilling',
+    label: 'Reconcile carrier billing',
+    description: 'Import, match, assign, and resolve carrier billing charges and exceptions. Requires View carrier costs.',
+  },
+  {
+    key: 'approveCarrierSettlement',
+    label: 'Approve carrier settlements',
+    description: 'Approve reconciled carrier charges and downstream settlement outcomes. Requires View carrier costs.',
+    adminOnly: true,
+  },
   { key: 'viewFullReleaseHistory', label: 'View full release history', adminOnly: true },
   { key: 'manageBackups', label: 'Manage data checkpoints', adminOnly: true },
   { key: 'manageLinks', label: 'Manage organization short links', adminOnly: true },
@@ -254,6 +292,11 @@ function permissionsForRolePreset(role: EditableRole, current: UserPermissions):
     viewOperations: enabled,
     manageOperations: enabled,
     executeWarehouse: enabled,
+    manageCarrierRateNetworks: enabled,
+    grantCarrierRateAccess: enabled,
+    viewCarrierCost: enabled,
+    reconcileCarrierBilling: enabled,
+    approveCarrierSettlement: enabled,
     viewFullReleaseHistory: enabled,
     manageBackups: enabled,
     manageLinks: enabled,
@@ -1227,7 +1270,7 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
                       ? 'Your permissions are managed by another organization administrator.'
                       : 'Manage access permission is required to change this user.'
                     : user.role === 'member'
-                      ? 'Members can be granted work-creation access. Promote this user to Admin to enable administrative permissions.'
+                      ? 'Members can receive work and specialist permissions. Promote this user to Admin to enable administrative permissions.'
                       : 'Admin permissions can be adjusted individually. An admin cannot grant access they do not hold.'
                 const userPending = pendingAction === `status:${user.email}`
                   || pendingAction === `access:${user.email}`
@@ -1373,32 +1416,39 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
                         {PERMISSIONS.map((permission) => {
                           const permissionEditable = manageable && (!permission.adminOnly || user.role === 'admin')
                           return (
-                            <FormControlLabel
+                            <Tooltip
                               key={permission.key}
-                              label={permission.label}
-                              labelPlacement="start"
-                              control={(
-                                <Switch
-                                  size="small"
-                                  checked={Boolean(user.permissions[permission.key])}
-                                  onChange={(event) => {
-                                    void updateAccess(user, user.role as EditableRole, {
-                                      ...user.permissions,
-                                      [permission.key]: event.target.checked,
-                                    })
-                                  }}
-                                  disabled={busy || !permissionEditable}
-                                  inputProps={{ 'aria-label': `${permission.label} for ${user.email}` }}
-                                />
-                              )}
-                              sx={{
-                                m: 0,
-                                minHeight: 38,
-                                justifyContent: 'space-between',
-                                gap: 1,
-                                '& .MuiFormControlLabel-label': { fontSize: '0.82rem', color: 'text.secondary' },
-                              }}
-                            />
+                              title={permission.description || ''}
+                              placement="top"
+                              arrow
+                              describeChild={Boolean(permission.description)}
+                            >
+                              <FormControlLabel
+                                label={permission.label}
+                                labelPlacement="start"
+                                control={(
+                                  <Switch
+                                    size="small"
+                                    checked={Boolean(user.permissions[permission.key])}
+                                    onChange={(event) => {
+                                      void updateAccess(user, user.role as EditableRole, {
+                                        ...user.permissions,
+                                        [permission.key]: event.target.checked,
+                                      })
+                                    }}
+                                    disabled={busy || !permissionEditable}
+                                    inputProps={{ 'aria-label': `${permission.label} for ${user.email}` }}
+                                  />
+                                )}
+                                sx={{
+                                  m: 0,
+                                  minHeight: 38,
+                                  justifyContent: 'space-between',
+                                  gap: 1,
+                                  '& .MuiFormControlLabel-label': { fontSize: '0.82rem', color: 'text.secondary' },
+                                }}
+                              />
+                            </Tooltip>
                           )
                         })}
                       </Box>

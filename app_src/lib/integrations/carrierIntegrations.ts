@@ -1,16 +1,22 @@
+import { createHash } from 'node:crypto'
 import {
   CarrierCredentialClientError,
   verifyCarrierCredential,
   type CarrierRuntimeCredential,
 } from '@/lib/integrations/carrierCredentialClient'
 import {
+  CARRIER_SANDBOX_RATE_FIXTURE,
   carrierSandboxRateRequestEvidence,
   requestCarrierSandboxRates,
 } from '@/lib/integrations/carrierSandboxRate'
 import {
+  carrierAccountAddressFingerprint,
+  decryptCarrierAccountNumber,
   decryptCarrierCredential,
   encryptCarrierCredential,
-  normalizeCarrierAccountNumber,
+  normalizeCarrierAccountAddress,
+  normalizeCarrierAccountGlobalId,
+  normalizeCarrierBillingAccountNumber,
   normalizeCarrierClientId,
   normalizeCarrierClientSecret,
   normalizeCarrierEnvironment,
@@ -18,13 +24,20 @@ import {
   normalizeDirectCarrierProvider,
 } from '@/lib/integrations/carrierCredentialCrypto'
 import {
+  createCarrierAccountInPostgres,
+  deleteCarrierAccountInPostgres,
   disconnectCarrierCredentialInPostgres,
   markCarrierCredentialVerificationInPostgres,
+  recordCarrierCredentialRevealInPostgres,
+  readActiveCarrierAccountsFromPostgres,
   readCarrierIntegrationsStateFromPostgres,
   readCarrierRuntimeCredentialFromPostgres,
+  setCarrierAccountStatusInPostgres,
   setCarrierIntegrationEnabledInPostgres,
+  updateCarrierAccountInPostgres,
   writeCarrierSandboxRateEvidenceInPostgres,
   writeCarrierCredentialInPostgres,
+  type CarrierRuntimeAccountRecord,
 } from '@/lib/persistence/carrierIntegrations'
 
 const CARRIER_SANDBOX_RATE_ADAPTER_VERSION = 'direct-rest-v2'
@@ -45,9 +58,25 @@ function displayName(value: unknown, provider: string, environment: string) {
   const fallback = `${provider === 'ups_rest' ? 'UPS' : provider === 'fedex_rest' ? 'FedEx' : 'USPS'} ${environment}`
   const normalized = String(value || fallback).trim()
   if (!normalized || normalized.length > 120) {
+    throw new CarrierIntegrationRequestError('Carrier connection name must be 1-120 characters')
+  }
+  return normalized
+}
+
+function carrierAccountDisplayName(value: unknown) {
+  const normalized = String(value || '').trim()
+  if (!normalized || normalized.length > 120) {
     throw new CarrierIntegrationRequestError('Carrier account name must be 1-120 characters')
   }
   return normalized
+}
+
+function billingFlag(value: unknown, defaultValue: boolean) {
+  if (value === undefined) return defaultValue
+  if (typeof value !== 'boolean') {
+    throw new CarrierIntegrationRequestError('Carrier billing permissions must be boolean values')
+  }
+  return value
 }
 
 function sanitize(error: unknown): CarrierIntegrationRequestError {
@@ -61,6 +90,9 @@ function sanitize(error: unknown): CarrierIntegrationRequestError {
   }
   if (message === 'Stored carrier credential could not be decrypted') {
     return new CarrierIntegrationRequestError(message, 500, 'CARRIER_CREDENTIAL_INVALID')
+  }
+  if (message === 'Stored carrier account number could not be decrypted') {
+    return new CarrierIntegrationRequestError(message, 500, 'CARRIER_ACCOUNT_INVALID')
   }
   if (
     message.startsWith('Carrier ')
@@ -99,6 +131,12 @@ async function storedRuntimeCredential(input: {
       'CARRIER_CREDENTIAL_REQUIRED',
     )
   }
+  const providerCredential = decryptCarrierCredential(
+    stored.encrypted,
+    organizationId,
+    provider,
+    environment,
+  )
   return {
     organizationId,
     integrationAccountId: stored.integrationAccountId,
@@ -106,7 +144,7 @@ async function storedRuntimeCredential(input: {
     credentialVersion: stored.credentialVersion,
     provider,
     environment,
-    credential: decryptCarrierCredential(stored.encrypted, organizationId, provider, environment),
+    credential: { ...providerCredential, accountNumber: null },
     status: stored.status,
     verified: stored.verificationStatus === 'verified',
   }
@@ -136,6 +174,36 @@ export async function getCarrierIntegrationsState(organizationIdValue: unknown) 
   return readCarrierIntegrationsStateFromPostgres(normalizeCarrierOrganizationId(organizationIdValue))
 }
 
+export async function revealCarrierCredential(input: {
+  organizationId: unknown
+  provider: unknown
+  environment: unknown
+  actorEmail: string
+}) {
+  try {
+    const runtime = await storedRuntimeCredential(input)
+    await recordCarrierCredentialRevealInPostgres({
+      organizationId: runtime.organizationId,
+      provider: runtime.provider,
+      environment: runtime.environment,
+      actorEmail: input.actorEmail,
+      credentialVersion: runtime.credentialVersion,
+    })
+    const revealedAt = new Date()
+    return {
+      provider: runtime.provider,
+      environment: runtime.environment,
+      clientId: runtime.credential.clientId,
+      clientSecret: runtime.credential.clientSecret,
+      credentialVersion: runtime.credentialVersion,
+      revealedAt: revealedAt.toISOString(),
+      expiresAt: new Date(revealedAt.getTime() + 30_000).toISOString(),
+    }
+  } catch (error) {
+    throw sanitize(error)
+  }
+}
+
 export async function updateCarrierCredential(input: {
   organizationId: unknown
   provider: unknown
@@ -143,7 +211,6 @@ export async function updateCarrierCredential(input: {
   displayName?: unknown
   clientId: unknown
   clientSecret: unknown
-  accountNumber?: unknown
   actorEmail: string
 }) {
   try {
@@ -153,7 +220,7 @@ export async function updateCarrierCredential(input: {
     const credential = {
       clientId: normalizeCarrierClientId(input.clientId),
       clientSecret: normalizeCarrierClientSecret(input.clientSecret),
-      accountNumber: normalizeCarrierAccountNumber(input.accountNumber, provider),
+      accountNumber: null,
     }
     await verifyCarrierCredential({ provider, environment, credential })
     const encrypted = encryptCarrierCredential(credential, organizationId, provider, environment)
@@ -164,7 +231,132 @@ export async function updateCarrierCredential(input: {
       displayName: displayName(input.displayName, provider, environment),
       encrypted,
       clientIdLastFour: credential.clientId.slice(-4),
-      accountNumberLastFour: credential.accountNumber?.slice(-4) || null,
+      accountNumberLastFour: null,
+      actorEmail: input.actorEmail,
+    })
+  } catch (error) {
+    throw sanitize(error)
+  }
+}
+
+function carrierAccountWrite(input: {
+  organizationId: unknown
+  provider: unknown
+  environment: unknown
+  displayName: unknown
+  accountNumber?: unknown
+  registeredAddress: unknown
+  allowSenderBilling?: unknown
+  allowRecipientBilling?: unknown
+  allowThirdPartyBilling?: unknown
+  actorEmail: string
+}) {
+  const allowSenderBilling = billingFlag(input.allowSenderBilling, true)
+  const allowRecipientBilling = billingFlag(input.allowRecipientBilling, true)
+  const allowThirdPartyBilling = billingFlag(input.allowThirdPartyBilling, true)
+  if (!allowSenderBilling && !allowRecipientBilling && !allowThirdPartyBilling) {
+    throw new CarrierIntegrationRequestError('Carrier account must allow at least one billing relationship')
+  }
+  return {
+    organizationId: normalizeCarrierOrganizationId(input.organizationId),
+    provider: normalizeDirectCarrierProvider(input.provider),
+    environment: normalizeCarrierEnvironment(input.environment),
+    displayName: carrierAccountDisplayName(input.displayName),
+    accountNumber: input.accountNumber === undefined
+      ? null
+      : normalizeCarrierBillingAccountNumber(input.accountNumber),
+    registeredAddress: normalizeCarrierAccountAddress(input.registeredAddress),
+    allowSenderBilling,
+    allowRecipientBilling,
+    allowThirdPartyBilling,
+    actorEmail: input.actorEmail,
+  }
+}
+
+export async function createCarrierAccount(input: {
+  organizationId: unknown
+  provider: unknown
+  environment: unknown
+  displayName: unknown
+  accountNumber: unknown
+  registeredAddress: unknown
+  allowSenderBilling?: unknown
+  allowRecipientBilling?: unknown
+  allowThirdPartyBilling?: unknown
+  actorEmail: string
+}) {
+  try {
+    const normalized = carrierAccountWrite(input)
+    if (!normalized.accountNumber) {
+      throw new CarrierIntegrationRequestError('The carrier billing account number is required')
+    }
+    return createCarrierAccountInPostgres(normalized)
+  } catch (error) {
+    throw sanitize(error)
+  }
+}
+
+export async function updateCarrierAccount(input: {
+  organizationId: unknown
+  provider: unknown
+  environment: unknown
+  carrierAccountGlobalId: unknown
+  displayName: unknown
+  accountNumber?: unknown
+  registeredAddress: unknown
+  allowSenderBilling?: unknown
+  allowRecipientBilling?: unknown
+  allowThirdPartyBilling?: unknown
+  actorEmail: string
+}) {
+  try {
+    return updateCarrierAccountInPostgres({
+      ...carrierAccountWrite(input),
+      carrierAccountGlobalId: normalizeCarrierAccountGlobalId(input.carrierAccountGlobalId),
+    })
+  } catch (error) {
+    throw sanitize(error)
+  }
+}
+
+export async function setCarrierAccountStatus(input: {
+  organizationId: unknown
+  provider: unknown
+  environment: unknown
+  carrierAccountGlobalId: unknown
+  status: unknown
+  actorEmail: string
+}) {
+  try {
+    if (input.status !== 'active' && input.status !== 'disabled') {
+      throw new CarrierIntegrationRequestError('Carrier account status must be active or disabled')
+    }
+    return setCarrierAccountStatusInPostgres({
+      organizationId: normalizeCarrierOrganizationId(input.organizationId),
+      provider: normalizeDirectCarrierProvider(input.provider),
+      environment: normalizeCarrierEnvironment(input.environment),
+      carrierAccountGlobalId: normalizeCarrierAccountGlobalId(input.carrierAccountGlobalId),
+      status: input.status,
+      actorEmail: input.actorEmail,
+    })
+  } catch (error) {
+    throw sanitize(error)
+  }
+}
+
+export async function deleteCarrierAccount(input: {
+  organizationId: unknown
+  provider: unknown
+  environment: unknown
+  carrierAccountGlobalId: unknown
+  actorEmail: string
+}) {
+  try {
+    return deleteCarrierAccountInPostgres({
+      organizationId: normalizeCarrierOrganizationId(input.organizationId),
+      provider: normalizeDirectCarrierProvider(input.provider),
+      environment: normalizeCarrierEnvironment(input.environment),
+      carrierAccountGlobalId: normalizeCarrierAccountGlobalId(input.carrierAccountGlobalId),
       actorEmail: input.actorEmail,
     })
   } catch (error) {
@@ -212,14 +404,138 @@ export async function testCarrierCredential(input: {
   }
 }
 
+type SandboxBillingSelection = {
+  account: CarrierRuntimeAccountRecord
+  relationship: 'sender' | 'recipient' | 'third_party'
+  mode: 'explicit' | 'single_active_account'
+  snapshot: Record<string, unknown>
+}
+
+const SANDBOX_SENDER_ADDRESS = normalizeCarrierAccountAddress({
+  line1: CARRIER_SANDBOX_RATE_FIXTURE.origin.street,
+  line2: null,
+  city: CARRIER_SANDBOX_RATE_FIXTURE.origin.city,
+  region: CARRIER_SANDBOX_RATE_FIXTURE.origin.state,
+  postalCode: CARRIER_SANDBOX_RATE_FIXTURE.origin.postalCode,
+  countryCode: CARRIER_SANDBOX_RATE_FIXTURE.origin.countryCode,
+})
+
+const SANDBOX_RECIPIENT_ADDRESS = normalizeCarrierAccountAddress({
+  line1: CARRIER_SANDBOX_RATE_FIXTURE.destination.street,
+  line2: null,
+  city: CARRIER_SANDBOX_RATE_FIXTURE.destination.city,
+  region: CARRIER_SANDBOX_RATE_FIXTURE.destination.state,
+  postalCode: CARRIER_SANDBOX_RATE_FIXTURE.destination.postalCode,
+  countryCode: CARRIER_SANDBOX_RATE_FIXTURE.destination.countryCode,
+})
+
+export function sandboxBillingRelationship(account: CarrierRuntimeAccountRecord) {
+  const registeredFingerprint = carrierAccountAddressFingerprint(account.registeredAddress)
+  if (registeredFingerprint === carrierAccountAddressFingerprint(SANDBOX_SENDER_ADDRESS)) {
+    if (!account.allowSenderBilling) {
+      throw new CarrierIntegrationRequestError(
+        'The selected carrier account does not allow sender billing',
+        409,
+        'CARRIER_ACCOUNT_BILLING_NOT_ALLOWED',
+      )
+    }
+    return 'sender' as const
+  }
+  if (registeredFingerprint === carrierAccountAddressFingerprint(SANDBOX_RECIPIENT_ADDRESS)) {
+    if (!account.allowRecipientBilling) {
+      throw new CarrierIntegrationRequestError(
+        'The selected carrier account does not allow recipient billing',
+        409,
+        'CARRIER_ACCOUNT_BILLING_NOT_ALLOWED',
+      )
+    }
+    return 'recipient' as const
+  }
+  if (!account.allowThirdPartyBilling) {
+    throw new CarrierIntegrationRequestError(
+      'The selected carrier account does not allow third-party billing for this fixture',
+      409,
+      'CARRIER_ACCOUNT_BILLING_NOT_ALLOWED',
+    )
+  }
+  return 'third_party' as const
+}
+
+async function sandboxBillingSelection(input: {
+  runtime: Awaited<ReturnType<typeof storedRuntimeCredential>>
+  carrierAccountGlobalId?: unknown
+}): Promise<SandboxBillingSelection> {
+  const activeAccounts = await readActiveCarrierAccountsFromPostgres({
+    organizationId: input.runtime.organizationId,
+    integrationAccountId: input.runtime.integrationAccountId,
+  })
+  const requestedGlobalId = String(input.carrierAccountGlobalId || '').trim()
+  const normalizedRequestedGlobalId = requestedGlobalId
+    ? normalizeCarrierAccountGlobalId(requestedGlobalId)
+    : null
+  const account = normalizedRequestedGlobalId
+    ? activeAccounts.find((candidate) => candidate.globalId === normalizedRequestedGlobalId)
+    : activeAccounts.length === 1 ? activeAccounts[0] : null
+  if (!account) {
+    if (!requestedGlobalId && activeAccounts.length > 1) {
+      throw new CarrierIntegrationRequestError(
+        'Select a carrier account before testing a sandbox rate',
+        409,
+        'CARRIER_ACCOUNT_SELECTION_REQUIRED',
+      )
+    }
+    throw new CarrierIntegrationRequestError(
+      requestedGlobalId
+        ? 'The selected carrier account is not active'
+        : 'An active carrier account is required for sandbox rating',
+      409,
+      'CARRIER_ACCOUNT_REQUIRED',
+    )
+  }
+  const mode = requestedGlobalId ? 'explicit' : 'single_active_account'
+  const relationship = sandboxBillingRelationship(account)
+  return {
+    account,
+    relationship,
+    mode,
+    snapshot: {
+      selectionMode: mode,
+      carrierAccountGlobalId: account.globalId,
+      carrierAccountDisplayName: account.displayName,
+      accountNumberLastFour: account.accountNumberLastFour,
+      registeredAddress: account.registeredAddress,
+      registeredAddressFingerprint: account.registeredAddressFingerprint,
+      addressVerification: account.addressVerification,
+      billingRelationship: relationship,
+      payerAddressSource: 'registered_carrier_account',
+      precedence: ['sender', 'recipient', 'third_party'],
+      fixtureAddressMatch: relationship === 'third_party' ? 'none' : relationship,
+    },
+  }
+}
+
+function selectionRequestHash(requestHash: string, selection: SandboxBillingSelection) {
+  return createHash('sha256')
+    .update([
+      requestHash,
+      selection.account.globalId,
+      selection.account.accountNumberFingerprint,
+      selection.relationship,
+      selection.mode,
+    ].join(':'))
+    .digest('hex')
+}
+
 export async function testCarrierSandboxRate(input: {
   organizationId: unknown
   provider: unknown
   environment: unknown
+  carrierAccountGlobalId?: unknown
   actorEmail: string
 }) {
   const requestedAt = new Date().toISOString()
   let runtime: Awaited<ReturnType<typeof storedRuntimeCredential>> | null = null
+  let selection: SandboxBillingSelection | null = null
   try {
     const organizationId = normalizeCarrierOrganizationId(input.organizationId)
     const provider = normalizeDirectCarrierProvider(input.provider)
@@ -239,27 +555,45 @@ export async function testCarrierSandboxRate(input: {
       )
     }
     runtime = await storedRuntimeCredential({ organizationId, provider, environment })
-    if (!runtime.verified) {
+    if (runtime.status !== 'active' || !runtime.verified) {
       throw new CarrierIntegrationRequestError(
-        'Verify the carrier credential before testing a rate',
+        'Enable a verified carrier credential before testing a rate',
         409,
         'CARRIER_CREDENTIAL_INACTIVE',
       )
     }
+    selection = await sandboxBillingSelection({
+      runtime,
+      carrierAccountGlobalId: input.carrierAccountGlobalId,
+    })
+    const accountNumber = decryptCarrierAccountNumber(
+      selection.account.encrypted,
+      runtime.organizationId,
+      runtime.provider,
+      runtime.environment,
+      selection.account.globalId,
+    )
     const rate = await requestCarrierSandboxRates({
       provider: runtime.provider,
       environment: runtime.environment,
-      credential: runtime.credential,
+      credential: { ...runtime.credential, accountNumber },
     })
     const evidenceGlobalId = await writeCarrierSandboxRateEvidenceInPostgres({
       organizationId: runtime.organizationId,
       integrationAccountId: runtime.integrationAccountId,
       integrationGlobalId: runtime.integrationGlobalId,
+      carrierAccountId: selection.account.id,
+      carrierAccountGlobalId: selection.account.globalId,
+      billingRelationship: selection.relationship,
+      billingSelectionSnapshot: selection.snapshot,
       provider: runtime.provider,
       credentialVersion: runtime.credentialVersion,
       adapterVersion: CARRIER_SANDBOX_RATE_ADAPTER_VERSION,
-      requestHash: rate.evidence.requestHash,
-      redactedRequest: rate.evidence.redactedRequest,
+      requestHash: selectionRequestHash(rate.evidence.requestHash, selection),
+      redactedRequest: {
+        ...rate.evidence.redactedRequest,
+        billingSelection: selection.snapshot,
+      },
       redactedResponse: rate.evidence.redactedResponse,
       status: 'succeeded',
       providerReference: rate.evidence.providerReference,
@@ -268,21 +602,37 @@ export async function testCarrierSandboxRate(input: {
       requestedAt: rate.evidence.requestedAt,
       completedAt: rate.evidence.completedAt,
     })
-    return { ...rate.result, evidenceGlobalId }
+    return {
+      ...rate.result,
+      carrierAccountGlobalId: selection.account.globalId,
+      billingRelationship: selection.relationship,
+      evidenceGlobalId,
+    }
   } catch (error) {
     const sanitized = sanitize(error)
-    if (runtime && (runtime.provider === 'ups_rest' || runtime.provider === 'fedex_rest')) {
+    if (
+      runtime
+      && selection
+      && (runtime.provider === 'ups_rest' || runtime.provider === 'fedex_rest')
+    ) {
       const safeRequest = carrierSandboxRateRequestEvidence(runtime.provider)
       try {
         await writeCarrierSandboxRateEvidenceInPostgres({
           organizationId: runtime.organizationId,
           integrationAccountId: runtime.integrationAccountId,
           integrationGlobalId: runtime.integrationGlobalId,
+          carrierAccountId: selection.account.id,
+          carrierAccountGlobalId: selection.account.globalId,
+          billingRelationship: selection.relationship,
+          billingSelectionSnapshot: selection.snapshot,
           provider: runtime.provider,
           credentialVersion: runtime.credentialVersion,
           adapterVersion: CARRIER_SANDBOX_RATE_ADAPTER_VERSION,
-          requestHash: safeRequest.requestHash,
-          redactedRequest: safeRequest.redactedRequest,
+          requestHash: selectionRequestHash(safeRequest.requestHash, selection),
+          redactedRequest: {
+            ...safeRequest.redactedRequest,
+            billingSelection: selection.snapshot,
+          },
           redactedResponse: { errorCode: sanitized.code },
           status: 'failed',
           providerReference: null,

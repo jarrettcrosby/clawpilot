@@ -18,6 +18,14 @@ function read(path) {
   return readFileSync(resolve(root, path), 'utf8')
 }
 
+function assertSqlIncludes(sql, fragment, message) {
+  const normalize = (value) => value
+    .replace(/--.*$/gm, '')
+    .replace(/\s+/g, '')
+    .toLowerCase()
+  assert.ok(normalize(sql).includes(normalize(fragment)), message)
+}
+
 function loadTypeScriptModule(path, { mocks = {}, globals = {} } = {}) {
   const output = ts.transpileModule(read(path), {
     compilerOptions: {
@@ -139,6 +147,269 @@ function verifySourceContracts() {
     "WHERE provider IN ('mock-commerce', 'mock-carrier', 'mock-printer')",
     "WHERE code = 'MOCK-01'",
   ]) assert.ok(sandboxRateMigration.includes(fragment), `Mock retirement migration missing ${fragment}`)
+
+  const rateDelegationMigration = read('db/migrations/0089_operations_rate_delegation_and_carrier_settlement.sql')
+  for (const table of [
+    'operations_carrier_rate_networks',
+    'operations_carrier_account_authorizations',
+    'operations_carrier_rate_grants',
+    'operations_carrier_quote_snapshots',
+    'operations_settlement_entries',
+    'operations_settlement_events',
+    'operations_carrier_billing_statements',
+    'operations_carrier_billing_account_resolutions',
+    'operations_carrier_billing_charges',
+    'operations_carrier_billing_matches',
+    'operations_carrier_billing_reconciliations',
+  ]) {
+    assertSqlIncludes(
+      rateDelegationMigration,
+      `CREATE TABLE IF NOT EXISTS ${table}`,
+      `Rate delegation migration missing ${table}`,
+    )
+  }
+  for (const [fragment, message] of [
+    [
+      `FOREIGN KEY (account_owner_organization_id, integration_account_id)
+       REFERENCES operations_integration_accounts(organization_id, id)`,
+      'Carrier account authorizations must bind the exact owning organization and integration account',
+    ],
+    [
+      `FOREIGN KEY (
+         network_id, account_authorization_id,
+         account_owner_organization_id, integration_account_id
+       )
+       REFERENCES operations_carrier_account_authorizations(
+         network_id, id, account_owner_organization_id, integration_account_id
+       )`,
+      'Carrier quote snapshots must bind the exact account authorization path',
+    ],
+    [
+      'party_path_snapshot jsonb NOT NULL',
+      'Carrier quote snapshots must preserve party provenance',
+    ],
+    [
+      'grant_path_snapshot jsonb NOT NULL',
+      'Carrier quote snapshots must preserve grant provenance',
+    ],
+    [
+      'directive_snapshot jsonb NOT NULL',
+      'Carrier quote and settlement records must preserve pricing directive provenance',
+    ],
+    [
+      `customer_charge_minor
+       = quoted_carrier_cost_minor + platform_fee_minor + reseller_fee_minor`,
+      'Carrier quote snapshots must reconcile the customer charge to carrier cost and fees',
+    ],
+    [
+      `CONSTRAINT operations_settlement_entries_idempotency_unique
+       UNIQUE (network_id, idempotency_key)`,
+      'Carrier settlement writes must be idempotent within their rate network',
+    ],
+    [
+      'variance_minor = actual_carrier_cost_minor - quoted_carrier_cost_minor',
+      'Carrier reconciliation must preserve the exact quoted-to-actual variance',
+    ],
+    [
+      'protect_operations_carrier_quote_snapshots_mutation',
+      'Carrier quote snapshots must be append-only',
+    ],
+    [
+      'protect_operations_settlement_entries_mutation',
+      'Carrier settlement entries must be append-only',
+    ],
+    [
+      'protect_operations_carrier_billing_reconciliations_mutation',
+      'Carrier billing reconciliations must be append-only',
+    ],
+  ]) {
+    assertSqlIncludes(rateDelegationMigration, fragment, message)
+  }
+
+  const carrierAccountsGlCodingMigration = read(
+    'db/migrations/0090_operations_carrier_accounts_and_gl_coding.sql',
+  )
+  for (const table of [
+    'operations_carrier_accounts',
+    'operations_gl_coding_runs',
+    'operations_gl_coding_run_batches',
+    'operations_gl_coding_run_items',
+  ]) {
+    assertSqlIncludes(
+      carrierAccountsGlCodingMigration,
+      `CREATE TABLE IF NOT EXISTS ${table}`,
+      `Carrier accounts and GL coding migration missing ${table}`,
+    )
+  }
+  for (const [fragment, message] of [
+    [
+      `CONSTRAINT operations_carrier_accounts_integration_fkey
+       FOREIGN KEY (organization_id, integration_account_id)
+       REFERENCES operations_integration_accounts(organization_id, id)`,
+      'Carrier accounts must remain scoped to their owning integration account',
+    ],
+    [
+      'account_number_ciphertext text NOT NULL',
+      'Carrier account numbers must be encrypted at rest',
+    ],
+    [
+      'account_number_fingerprint text NOT NULL',
+      'Carrier accounts must retain a non-reversible account-number match key',
+    ],
+    [
+      'registered_address_fingerprint text NOT NULL',
+      'Carrier accounts must retain registered-address matching provenance',
+    ],
+    [
+      "IF integration_type IS DISTINCT FROM 'carrier' THEN",
+      'Carrier account rows must point to carrier provider connections',
+    ],
+    [
+      `CONSTRAINT operations_carrier_account_authorizations_carrier_account_fkey
+       FOREIGN KEY (
+         account_owner_organization_id, integration_account_id, carrier_account_id
+       )
+       REFERENCES operations_carrier_accounts(
+         organization_id, integration_account_id, id
+      )`,
+      'Carrier account authorizations must bind the exact carrier account',
+    ],
+    [
+      `CONSTRAINT operations_carrier_account_authorizations_explicit_account
+       CHECK (carrier_account_id IS NOT NULL) NOT VALID`,
+      'New carrier account authorizations must identify an explicit carrier account',
+    ],
+    [
+      `CONSTRAINT operations_carrier_quote_snapshots_carrier_account_fkey
+       FOREIGN KEY (
+         account_owner_organization_id, integration_account_id, carrier_account_id
+       )
+       REFERENCES operations_carrier_accounts(
+         organization_id, integration_account_id, id
+      )`,
+      'Carrier quote snapshots must bind the exact carrier account',
+    ],
+    [
+      `CONSTRAINT operations_carrier_quote_snapshots_explicit_account
+       CHECK (carrier_account_id IS NOT NULL) NOT VALID`,
+      'New carrier quote snapshots must identify an explicit carrier account',
+    ],
+    [
+      `CONSTRAINT operations_carrier_billing_account_resolutions_carrier_account_fkey
+       FOREIGN KEY (
+         account_owner_organization_id, integration_account_id, carrier_account_id
+       )
+       REFERENCES operations_carrier_accounts(
+         organization_id, integration_account_id, id
+      )`,
+      'Carrier billing account resolutions must bind the exact carrier account',
+    ],
+    [
+      `CONSTRAINT operations_carrier_billing_account_resolutions_explicit_account CHECK (
+         decision <> 'matched' OR carrier_account_id IS NOT NULL
+       ) NOT VALID`,
+      'Matched carrier billing resolutions must identify an explicit carrier account',
+    ],
+    [
+      `CONSTRAINT operations_carrier_rate_requests_carrier_account_fkey
+       FOREIGN KEY (organization_id, integration_account_id, carrier_account_id)
+       REFERENCES operations_carrier_accounts(
+         organization_id, integration_account_id, id
+      )`,
+      'Carrier rate requests must bind the exact carrier account',
+    ],
+    [
+      `CONSTRAINT operations_carrier_rate_requests_explicit_account
+       CHECK (carrier_account_id IS NOT NULL) NOT VALID`,
+      'New carrier rate requests must identify an explicit carrier account',
+    ],
+    [
+      "billing_relationship IN ('sender', 'recipient', 'third_party')",
+      'Carrier tenders must preserve the selected billing relationship',
+    ],
+    [
+      "selection_snapshot jsonb NOT NULL DEFAULT '{}'::jsonb",
+      'GL coding runs must preserve their input selection',
+    ],
+    [
+      "rule_snapshot jsonb NOT NULL DEFAULT '[]'::jsonb",
+      'GL coding runs must preserve the rules used for coding',
+    ],
+    [
+      `CONSTRAINT operations_gl_coding_runs_idempotency_unique
+       UNIQUE (network_id, idempotency_key)`,
+      'GL coding runs must be idempotent within their rate network',
+    ],
+    [
+      `CONSTRAINT operations_gl_coding_run_batches_batch_fkey
+       FOREIGN KEY (network_id, batch_id)
+       REFERENCES operations_carrier_billing_batches(network_id, id)`,
+      'GL coding runs must preserve the exact selected billing batches',
+    ],
+    [
+      `CONSTRAINT operations_gl_coding_run_items_charge_fkey
+       FOREIGN KEY (network_id, charge_id)
+       REFERENCES operations_carrier_billing_charges(network_id, id)`,
+      'GL coding items must preserve their exact source charge',
+    ],
+    [
+      `CONSTRAINT operations_gl_coding_run_items_match_fkey
+       FOREIGN KEY (network_id, billing_match_id)
+       REFERENCES operations_carrier_billing_matches(network_id, id)`,
+      'GL coding items must preserve their exact shipment-match decision',
+    ],
+    [
+      `CONSTRAINT operations_gl_coding_run_items_assignment_fkey
+       FOREIGN KEY (network_id, shipper_assignment_id)
+       REFERENCES operations_carrier_billing_shipper_assignments(network_id, id)`,
+      'GL coding items must preserve their exact shipper assignment',
+    ],
+    [
+      `CONSTRAINT operations_gl_coding_run_items_rule_fkey
+       FOREIGN KEY (network_id, routing_rule_id)
+       REFERENCES operations_carrier_billing_routing_rules(network_id, id)`,
+      'GL coding items must preserve their exact routing rule',
+    ],
+    [
+      `CONSTRAINT operations_gl_coding_run_items_rule_version_valid CHECK (
+         (routing_rule_id IS NULL AND routing_rule_version IS NULL)
+         OR (routing_rule_id IS NOT NULL AND routing_rule_version IS NOT NULL)
+       )`,
+      'GL coding items must preserve a routing-rule version with every rule link',
+    ],
+    [
+      'selected.run_id = NEW.run_id',
+      'GL coding items must originate from a batch selected by their run',
+    ],
+    [
+      'matched_charge_id IS DISTINCT FROM NEW.charge_id',
+      'GL coding shipment matches must belong to the coded charge',
+    ],
+    [
+      'assigned_charge_id IS DISTINCT FROM NEW.charge_id',
+      'GL coding shipper assignments must belong to the coded charge',
+    ],
+    [
+      'rule_version IS DISTINCT FROM NEW.routing_rule_version',
+      'GL coding items must preserve the exact routing-rule version used',
+    ],
+    [
+      'protect_operations_gl_coding_run_items_mutation',
+      'GL coding item evidence must be append-only',
+    ],
+    [
+      `CONSTRAINT operations_carrier_billing_reconciliations_gl_run_fkey
+       FOREIGN KEY (network_id, gl_coding_run_id)
+       REFERENCES operations_gl_coding_runs(network_id, id)`,
+      'Carrier reconciliations must preserve the GL coding run that produced them',
+    ],
+  ]) {
+    assertSqlIncludes(carrierAccountsGlCodingMigration, fragment, message)
+  }
+  assert.ok(
+    !/\baccount_number\s+text\b/i.test(carrierAccountsGlCodingMigration),
+    'Carrier account schema must not persist plaintext account numbers',
+  )
 
   const persistence = read('app_src/lib/persistence/operations.ts')
   for (const fragment of [
@@ -306,6 +577,22 @@ function verifySourceContracts() {
     health.includes("WHERE filename = '0088_operations_sandbox_rating_and_mock_retirement.sql'"),
     'Health must require the sandbox rating and mock retirement migration',
   )
+  assert.ok(
+    health.includes("WHERE filename = '0089_operations_rate_delegation_and_carrier_settlement.sql'"),
+    'Health must require the operations rate delegation and carrier settlement migration',
+  )
+  assert.ok(
+    health.includes('row?.operations_rate_delegation_migration_applied'),
+    'Health migration status must include operations rate delegation and carrier settlement',
+  )
+  assert.ok(
+    health.includes("WHERE filename = '0090_operations_carrier_accounts_and_gl_coding.sql'"),
+    'Health must require the operations carrier accounts and GL coding migration',
+  )
+  assert.ok(
+    health.includes('row?.operations_carrier_accounts_gl_coding_migration_applied'),
+    'Health migration status must include operations carrier accounts and GL coding',
+  )
 
   const packaging = read('app_src/lib/persistence/productPackaging.ts')
   for (const fragment of [
@@ -367,6 +654,14 @@ function verifySourceContracts() {
   assert.ok(
     predeploy.includes("'db/migrations/0088_operations_sandbox_rating_and_mock_retirement.sql'"),
     'Predeploy must require the sandbox rating and mock retirement migration',
+  )
+  assert.ok(
+    predeploy.includes("'db/migrations/0089_operations_rate_delegation_and_carrier_settlement.sql'"),
+    'Predeploy must require the operations rate delegation and carrier settlement migration',
+  )
+  assert.ok(
+    predeploy.includes("'db/migrations/0090_operations_carrier_accounts_and_gl_coding.sql'"),
+    'Predeploy must require the operations carrier accounts and GL coding migration',
   )
 }
 

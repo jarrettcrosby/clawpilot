@@ -1,18 +1,23 @@
 import { NextRequest, NextResponse } from 'next/server'
 import {
   CarrierIntegrationRequestError,
+  createCarrierAccount,
+  deleteCarrierAccount,
   disconnectCarrierCredential,
   getCarrierIntegrationsState,
+  revealCarrierCredential,
   sanitizedCarrierIntegrationError,
+  setCarrierAccountStatus,
   setCarrierIntegrationEnabled,
   testCarrierSandboxRate,
   testCarrierCredential,
+  updateCarrierAccount,
   updateCarrierCredential,
 } from '@/lib/integrations/carrierIntegrations'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import { operationsCapabilities } from '@/lib/operations/authorization'
 import { requireRequestUser } from '@/lib/requestUser'
-import type { AppUser } from '@/lib/users'
+import { effectiveAuthorizationRole, type AppUser } from '@/lib/users'
 
 export const dynamic = 'force-dynamic'
 export const revalidate = 0
@@ -21,7 +26,15 @@ export const runtime = 'nodejs'
 const MAX_REQUEST_BYTES = 32 * 1024
 
 function json(payload: Record<string, unknown>, status = 200) {
-  return NextResponse.json(payload, { status, headers: { 'Cache-Control': 'no-store' } })
+  return NextResponse.json(payload, {
+    status,
+    headers: {
+      'Cache-Control': 'no-store, max-age=0',
+      Pragma: 'no-cache',
+      Expires: '0',
+      'X-Content-Type-Options': 'nosniff',
+    },
+  })
 }
 
 function errorResponse(error: unknown) {
@@ -59,6 +72,21 @@ function requireManager(actor: AppUser) {
       'Operations-management permission is required to manage carrier accounts',
       403,
       'CARRIER_MANAGER_REQUIRED',
+    )
+  }
+}
+
+function canRevealCredential(actor: AppUser) {
+  const role = effectiveAuthorizationRole(actor)
+  return role === 'owner' || role === 'admin'
+}
+
+function requireCredentialViewer(actor: AppUser) {
+  if (!canRevealCredential(actor)) {
+    throw new CarrierIntegrationRequestError(
+      'Organization owner or administrator access is required to reveal carrier credentials',
+      403,
+      'CARRIER_CREDENTIAL_REVEAL_FORBIDDEN',
     )
   }
 }
@@ -112,6 +140,7 @@ export async function GET(req: NextRequest) {
     return json({
       ok: true,
       canManage: true,
+      canRevealCredentials: canRevealCredential(actor),
       integrations: await getCarrierIntegrationsState(organizationId(actor)),
     })
   } catch (error) {
@@ -127,8 +156,19 @@ export async function PATCH(req: NextRequest) {
     const organization = organizationId(actor)
     const body = await requestBody(req)
     const action = String(body.action || '').trim()
+    if (action === 'reveal-credential') {
+      only(body, ['action', 'provider', 'environment'])
+      requireCredentialViewer(actor)
+      const credential = await revealCarrierCredential({
+        organizationId: organization,
+        provider: body.provider,
+        environment: body.environment,
+        actorEmail: actor.email,
+      })
+      return json({ ok: true, canManage: true, canRevealCredentials: true, credential })
+    }
     if (action === 'update-credential') {
-      only(body, ['action', 'provider', 'environment', 'displayName', 'clientId', 'clientSecret', 'accountNumber'])
+      only(body, ['action', 'provider', 'environment', 'displayName', 'clientId', 'clientSecret'])
       const integrations = await updateCarrierCredential({
         organizationId: organization,
         provider: body.provider,
@@ -136,7 +176,70 @@ export async function PATCH(req: NextRequest) {
         displayName: body.displayName,
         clientId: body.clientId,
         clientSecret: body.clientSecret,
+        actorEmail: actor.email,
+      })
+      return json({ ok: true, canManage: true, integrations })
+    }
+    if (action === 'create-account') {
+      only(body, [
+        'action', 'provider', 'environment', 'displayName', 'accountNumber',
+        'registeredAddress', 'allowSenderBilling', 'allowRecipientBilling',
+        'allowThirdPartyBilling',
+      ])
+      const integrations = await createCarrierAccount({
+        organizationId: organization,
+        provider: body.provider,
+        environment: body.environment,
+        displayName: body.displayName,
         accountNumber: body.accountNumber,
+        registeredAddress: body.registeredAddress,
+        allowSenderBilling: body.allowSenderBilling,
+        allowRecipientBilling: body.allowRecipientBilling,
+        allowThirdPartyBilling: body.allowThirdPartyBilling,
+        actorEmail: actor.email,
+      })
+      return json({ ok: true, canManage: true, integrations })
+    }
+    if (action === 'update-account') {
+      only(body, [
+        'action', 'provider', 'environment', 'carrierAccountGlobalId',
+        'displayName', 'accountNumber', 'registeredAddress',
+        'allowSenderBilling', 'allowRecipientBilling', 'allowThirdPartyBilling',
+      ])
+      const integrations = await updateCarrierAccount({
+        organizationId: organization,
+        provider: body.provider,
+        environment: body.environment,
+        carrierAccountGlobalId: body.carrierAccountGlobalId,
+        displayName: body.displayName,
+        accountNumber: body.accountNumber,
+        registeredAddress: body.registeredAddress,
+        allowSenderBilling: body.allowSenderBilling,
+        allowRecipientBilling: body.allowRecipientBilling,
+        allowThirdPartyBilling: body.allowThirdPartyBilling,
+        actorEmail: actor.email,
+      })
+      return json({ ok: true, canManage: true, integrations })
+    }
+    if (action === 'set-account-status') {
+      only(body, ['action', 'provider', 'environment', 'carrierAccountGlobalId', 'status'])
+      const integrations = await setCarrierAccountStatus({
+        organizationId: organization,
+        provider: body.provider,
+        environment: body.environment,
+        carrierAccountGlobalId: body.carrierAccountGlobalId,
+        status: body.status,
+        actorEmail: actor.email,
+      })
+      return json({ ok: true, canManage: true, integrations })
+    }
+    if (action === 'delete-account') {
+      only(body, ['action', 'provider', 'environment', 'carrierAccountGlobalId'])
+      const integrations = await deleteCarrierAccount({
+        organizationId: organization,
+        provider: body.provider,
+        environment: body.environment,
+        carrierAccountGlobalId: body.carrierAccountGlobalId,
         actorEmail: actor.email,
       })
       return json({ ok: true, canManage: true, integrations })
@@ -152,11 +255,12 @@ export async function PATCH(req: NextRequest) {
       return json({ ok: true, canManage: true, integrations })
     }
     if (action === 'test-sandbox-rate') {
-      only(body, ['action', 'provider', 'environment'])
+      only(body, ['action', 'provider', 'environment', 'carrierAccountGlobalId'])
       const rateTest = await testCarrierSandboxRate({
         organizationId: organization,
         provider: body.provider,
         environment: body.environment,
+        carrierAccountGlobalId: body.carrierAccountGlobalId,
         actorEmail: actor.email,
       })
       return json({ ok: true, canManage: true, rateTest })

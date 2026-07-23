@@ -8,6 +8,12 @@ import Chip from '@mui/material/Chip'
 import CircularProgress from '@mui/material/CircularProgress'
 import Divider from '@mui/material/Divider'
 import FormControlLabel from '@mui/material/FormControlLabel'
+import FormControl from '@mui/material/FormControl'
+import InputLabel from '@mui/material/InputLabel'
+import InputAdornment from '@mui/material/InputAdornment'
+import IconButton from '@mui/material/IconButton'
+import MenuItem from '@mui/material/MenuItem'
+import Select from '@mui/material/Select'
 import Stack from '@mui/material/Stack'
 import Switch from '@mui/material/Switch'
 import Tab from '@mui/material/Tab'
@@ -18,17 +24,45 @@ import ToggleButtonGroup from '@mui/material/ToggleButtonGroup'
 import Tooltip from '@mui/material/Tooltip'
 import Typography from '@mui/material/Typography'
 import CloudDoneRounded from '@mui/icons-material/CloudDoneRounded'
+import AddRounded from '@mui/icons-material/AddRounded'
+import ContentCopyRounded from '@mui/icons-material/ContentCopyRounded'
+import DeleteOutlineRounded from '@mui/icons-material/DeleteOutlineRounded'
+import EditRounded from '@mui/icons-material/EditRounded'
 import KeyRounded from '@mui/icons-material/KeyRounded'
 import LinkOffRounded from '@mui/icons-material/LinkOffRounded'
 import LocalShippingRounded from '@mui/icons-material/LocalShippingRounded'
 import PowerSettingsNewRounded from '@mui/icons-material/PowerSettingsNewRounded'
 import PriceCheckRounded from '@mui/icons-material/PriceCheckRounded'
 import SaveRounded from '@mui/icons-material/SaveRounded'
+import VisibilityOffRounded from '@mui/icons-material/VisibilityOffRounded'
+import VisibilityRounded from '@mui/icons-material/VisibilityRounded'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import { formatUserDateTime } from '@/lib/userDateTime'
 
 type CarrierProvider = 'ups_rest' | 'fedex_rest' | 'usps_rest'
 type CarrierEnvironment = 'sandbox' | 'production'
+
+type CarrierAddress = {
+  line1: string
+  line2: string | null
+  city: string
+  region: string
+  postalCode: string
+  countryCode: string
+}
+
+type OperationsCarrierAccount = {
+  globalId: string
+  displayName: string
+  accountNumberLastFour: string
+  registeredAddress: CarrierAddress
+  addressVerification: 'unverified' | 'operator_attested' | 'provider_verified'
+  allowSenderBilling: boolean
+  allowRecipientBilling: boolean
+  allowThirdPartyBilling: boolean
+  status: 'needs_configuration' | 'active' | 'disabled'
+  updatedAt: string
+}
 
 type CarrierAccountState = {
   globalId: string
@@ -44,6 +78,7 @@ type CarrierAccountState = {
   verifiedAt: string | null
   lastErrorCode: string | null
   updatedAt: string
+  carrierAccounts: OperationsCarrierAccount[]
 }
 
 type CarrierIntegrationsState = {
@@ -55,8 +90,20 @@ type CarrierPayload = {
   ok?: boolean
   error?: string
   canManage?: boolean
+  canRevealCredentials?: boolean
   integrations?: CarrierIntegrationsState
   rateTest?: CarrierSandboxRateTest
+  credential?: RevealedCarrierCredential
+}
+
+type RevealedCarrierCredential = {
+  provider: CarrierProvider
+  environment: CarrierEnvironment
+  clientId: string
+  clientSecret: string
+  credentialVersion: number
+  revealedAt: string
+  expiresAt: string
 }
 
 type CarrierSandboxRateTest = {
@@ -85,6 +132,8 @@ type CarrierSandboxRateTest = {
     deliveryDate: string | null
   }>
   testedAt: string
+  carrierAccountGlobalId: string
+  billingRelationship: 'sender' | 'recipient' | 'third_party'
   evidenceGlobalId: string
 }
 
@@ -92,7 +141,20 @@ type CredentialForm = {
   displayName: string
   clientId: string
   clientSecret: string
+}
+
+type CarrierAccountForm = {
+  displayName: string
   accountNumber: string
+  line1: string
+  line2: string
+  city: string
+  region: string
+  postalCode: string
+  countryCode: string
+  allowSenderBilling: boolean
+  allowRecipientBilling: boolean
+  allowThirdPartyBilling: boolean
 }
 
 const PROVIDERS: Array<{ value: CarrierProvider; label: string }> = [
@@ -125,12 +187,27 @@ function emptyForm(provider: CarrierProvider, environment: CarrierEnvironment): 
     displayName: `${providerLabel(provider)} ${environment === 'sandbox' ? 'sandbox' : 'production'}`,
     clientId: '',
     clientSecret: '',
+  }
+}
+
+function emptyCarrierAccountForm(): CarrierAccountForm {
+  return {
+    displayName: '',
     accountNumber: '',
+    line1: '',
+    line2: '',
+    city: '',
+    region: '',
+    postalCode: '',
+    countryCode: 'US',
+    allowSenderBilling: true,
+    allowRecipientBilling: true,
+    allowThirdPartyBilling: true,
   }
 }
 
 async function requestCarriers(init?: RequestInit): Promise<CarrierPayload> {
-  const response = await fetch('/api/integrations/carriers', init)
+  const response = await fetch('/api/integrations/carriers', { cache: 'no-store', ...init })
   const result = await response.json().catch(() => ({})) as CarrierPayload
   if (!response.ok || !result.ok) throw new Error(result.error || 'Carrier integration request failed')
   return result
@@ -146,12 +223,17 @@ export default function CarrierIntegrationPanel() {
   const [environment, setEnvironment] = useState<CarrierEnvironment>('sandbox')
   const [integrations, setIntegrations] = useState<CarrierIntegrationsState>({ organizationId: '', accounts: [] })
   const [forms, setForms] = useState<Record<string, CredentialForm>>({})
+  const [carrierAccountForm, setCarrierAccountForm] = useState<CarrierAccountForm>(emptyCarrierAccountForm)
+  const [editingCarrierAccountGlobalId, setEditingCarrierAccountGlobalId] = useState('')
+  const [selectedCarrierAccounts, setSelectedCarrierAccounts] = useState<Record<string, string>>({})
   const [loading, setLoading] = useState(true)
   const [pendingAction, setPendingAction] = useState('')
   const [confirmDisconnect, setConfirmDisconnect] = useState(false)
   const [notice, setNotice] = useState('')
   const [error, setError] = useState('')
   const [rateTest, setRateTest] = useState<CarrierSandboxRateTest | null>(null)
+  const [canRevealCredentials, setCanRevealCredentials] = useState(false)
+  const [revealedCredential, setRevealedCredential] = useState<RevealedCarrierCredential | null>(null)
 
   const key = accountKey(provider, environment)
   const form = forms[key] || emptyForm(provider, environment)
@@ -159,6 +241,16 @@ export default function CarrierIntegrationPanel() {
     () => integrations.accounts.find((entry) => entry.provider === provider && entry.environment === environment) || null,
     [environment, integrations.accounts, provider],
   )
+  const activeCarrierAccounts = useMemo(
+    () => (account?.carrierAccounts || []).filter((entry) => entry.status === 'active'),
+    [account?.carrierAccounts],
+  )
+  const explicitCarrierAccountGlobalId = selectedCarrierAccounts[key] || ''
+  const selectedCarrierAccountGlobalId = activeCarrierAccounts.some(
+    (entry) => entry.globalId === explicitCarrierAccountGlobalId,
+  )
+    ? explicitCarrierAccountGlobalId
+    : activeCarrierAccounts.length === 1 ? activeCarrierAccounts[0].globalId : ''
   const busy = Boolean(pendingAction)
 
   useEffect(() => {
@@ -167,6 +259,7 @@ export default function CarrierIntegrationPanel() {
       .then((result) => {
         if (!active || !result.integrations) return
         setIntegrations(result.integrations)
+        setCanRevealCredentials(result.canRevealCredentials === true)
         setForms((current) => {
           const next = { ...current }
           for (const configured of result.integrations?.accounts || []) {
@@ -184,11 +277,49 @@ export default function CarrierIntegrationPanel() {
     return () => { active = false }
   }, [])
 
+  useEffect(() => {
+    if (!revealedCredential) return
+    const timeout = window.setTimeout(
+      () => setRevealedCredential(null),
+      Math.max(0, Date.parse(revealedCredential.expiresAt) - Date.now()),
+    )
+    return () => window.clearTimeout(timeout)
+  }, [revealedCredential])
+
   function updateForm(field: keyof CredentialForm, value: string) {
     setForms((current) => ({
       ...current,
       [key]: { ...(current[key] || emptyForm(provider, environment)), [field]: value },
     }))
+  }
+
+  function updateCarrierAccountForm<K extends keyof CarrierAccountForm>(
+    field: K,
+    value: CarrierAccountForm[K],
+  ) {
+    setCarrierAccountForm((current) => ({ ...current, [field]: value }))
+  }
+
+  function resetCarrierAccountForm() {
+    setCarrierAccountForm(emptyCarrierAccountForm())
+    setEditingCarrierAccountGlobalId('')
+  }
+
+  function editCarrierAccount(entry: OperationsCarrierAccount) {
+    setEditingCarrierAccountGlobalId(entry.globalId)
+    setCarrierAccountForm({
+      displayName: entry.displayName,
+      accountNumber: '',
+      line1: entry.registeredAddress.line1,
+      line2: entry.registeredAddress.line2 || '',
+      city: entry.registeredAddress.city,
+      region: entry.registeredAddress.region,
+      postalCode: entry.registeredAddress.postalCode,
+      countryCode: entry.registeredAddress.countryCode,
+      allowSenderBilling: entry.allowSenderBilling,
+      allowRecipientBilling: entry.allowRecipientBilling,
+      allowThirdPartyBilling: entry.allowThirdPartyBilling,
+    })
   }
 
   async function patch(actionKey: string, body: Record<string, unknown>, success: string) {
@@ -216,7 +347,6 @@ export default function CarrierIntegrationPanel() {
   async function saveCredential(event: FormEvent) {
     event.preventDefault()
     if (!form.clientId.trim() || !form.clientSecret.trim()) return
-    if (provider !== 'usps_rest' && !form.accountNumber.trim()) return
     const result = await patch(
       'save',
       {
@@ -226,16 +356,79 @@ export default function CarrierIntegrationPanel() {
         displayName: form.displayName,
         clientId: form.clientId,
         clientSecret: form.clientSecret,
-        accountNumber: form.accountNumber,
       },
       `${providerLabel(provider)} credential verified and saved.`,
     )
     if (result) {
+      setRevealedCredential(null)
       setForms((current) => ({
         ...current,
-        [key]: { ...form, clientId: '', clientSecret: '', accountNumber: '' },
+        [key]: { ...form, clientId: '', clientSecret: '' },
       }))
     }
+  }
+
+  async function revealCredential() {
+    if (!account?.configured || busy) return
+    if (!window.confirm(
+      `Reveal the current ${providerLabel(provider)} ${environment} client credentials? This action is audited.`,
+    )) return
+    const result = await patch(
+      'reveal',
+      { action: 'reveal-credential', provider, environment },
+      'Credentials revealed for 30 seconds.',
+    )
+    if (result?.credential) setRevealedCredential(result.credential)
+  }
+
+  async function copyCredential(label: string, value: string) {
+    try {
+      await navigator.clipboard.writeText(value)
+      setNotice(`${label} copied.`)
+    } catch {
+      setError(`${label} could not be copied. Select the value and copy it manually.`)
+    }
+  }
+
+  async function saveCarrierAccount(event: FormEvent) {
+    event.preventDefault()
+    if (
+      !carrierAccountForm.displayName.trim()
+      || (!editingCarrierAccountGlobalId && !carrierAccountForm.accountNumber.trim())
+      || !carrierAccountForm.line1.trim()
+      || !carrierAccountForm.city.trim()
+      || !carrierAccountForm.region.trim()
+      || !carrierAccountForm.postalCode.trim()
+      || !carrierAccountForm.countryCode.trim()
+    ) return
+    const result = await patch(
+      editingCarrierAccountGlobalId ? 'update-account' : 'create-account',
+      {
+        action: editingCarrierAccountGlobalId ? 'update-account' : 'create-account',
+        provider,
+        environment,
+        ...(editingCarrierAccountGlobalId
+          ? { carrierAccountGlobalId: editingCarrierAccountGlobalId }
+          : {}),
+        displayName: carrierAccountForm.displayName,
+        ...(carrierAccountForm.accountNumber.trim()
+          ? { accountNumber: carrierAccountForm.accountNumber }
+          : {}),
+        registeredAddress: {
+          line1: carrierAccountForm.line1,
+          line2: carrierAccountForm.line2 || null,
+          city: carrierAccountForm.city,
+          region: carrierAccountForm.region,
+          postalCode: carrierAccountForm.postalCode,
+          countryCode: carrierAccountForm.countryCode,
+        },
+        allowSenderBilling: carrierAccountForm.allowSenderBilling,
+        allowRecipientBilling: carrierAccountForm.allowRecipientBilling,
+        allowThirdPartyBilling: carrierAccountForm.allowThirdPartyBilling,
+      },
+      editingCarrierAccountGlobalId ? 'Carrier account updated.' : 'Carrier account added.',
+    )
+    if (result) resetCarrierAccountForm()
   }
 
   if (loading) {
@@ -257,7 +450,7 @@ export default function CarrierIntegrationPanel() {
         <Box>
           <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
             <LocalShippingRounded color="primary" />
-            <Typography variant="h6" fontWeight={700}>Carrier accounts</Typography>
+            <Typography variant="h6" fontWeight={700}>Carrier integrations</Typography>
             <Chip
               size="small"
               color={account?.verificationStatus === 'verified' ? 'success' : account?.verificationStatus === 'failed' ? 'error' : 'default'}
@@ -296,8 +489,10 @@ export default function CarrierIntegrationPanel() {
         value={provider}
         onChange={(_, value: CarrierProvider) => {
           setProvider(value)
+          setRevealedCredential(null)
           setConfirmDisconnect(false)
           setRateTest(null)
+          resetCarrierAccountForm()
         }}
         variant="scrollable"
         scrollButtons="auto"
@@ -317,8 +512,10 @@ export default function CarrierIntegrationPanel() {
         onChange={(_, value: CarrierEnvironment | null) => {
           if (value) {
             setEnvironment(value)
+            setRevealedCredential(null)
             setConfirmDisconnect(false)
             setRateTest(null)
+            resetCarrierAccountForm()
           }
         }}
         aria-label="Carrier environment"
@@ -336,16 +533,16 @@ export default function CarrierIntegrationPanel() {
       {account?.configured ? (
         <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap mb={2}>
           <Chip size="small" icon={<KeyRounded />} label={`Client ending ${account.clientIdLastFour || 'unknown'}`} />
-          {account.accountNumberLastFour ? <Chip size="small" label={`Account ending ${account.accountNumberLastFour}`} /> : null}
           <Chip size="small" variant="outlined" label={`Credential v${account.credentialVersion}`} />
           <Chip size="small" variant="outlined" label={account.globalId} />
         </Stack>
       ) : null}
 
+      <Typography variant="subtitle2" fontWeight={700} sx={{ mb: 1 }}>Provider credentials</Typography>
       <Box component="form" onSubmit={saveCredential}>
         <TextField
           fullWidth
-          label="Account name"
+          label="Connection name"
           value={form.displayName}
           onChange={(event) => updateForm('displayName', event.target.value)}
           disabled={busy}
@@ -373,23 +570,33 @@ export default function CarrierIntegrationPanel() {
             sx={fieldSx}
           />
         </Box>
-        <TextField
-          fullWidth
-          required={provider !== 'usps_rest'}
-          label={provider === 'usps_rest' ? 'USPS account number (optional)' : 'Billing account number'}
-          value={form.accountNumber}
-          onChange={(event) => updateForm('accountNumber', event.target.value)}
-          disabled={busy}
-          autoComplete="off"
-          sx={{ ...fieldSx, mt: 1.5 }}
-        />
-
+        {environment === 'sandbox' && provider !== 'usps_rest' && activeCarrierAccounts.length ? (
+          <FormControl fullWidth size="small" sx={{ mt: 1.5 }}>
+            <InputLabel id="sandbox-carrier-account-label">Sandbox billing account</InputLabel>
+            <Select
+              labelId="sandbox-carrier-account-label"
+              label="Sandbox billing account"
+              value={selectedCarrierAccountGlobalId}
+              onChange={(event) => setSelectedCarrierAccounts((current) => ({
+                ...current,
+                [key]: event.target.value,
+              }))}
+              disabled={busy || activeCarrierAccounts.length === 1}
+            >
+              {activeCarrierAccounts.map((entry) => (
+                <MenuItem key={entry.globalId} value={entry.globalId}>
+                  {entry.displayName} ending {entry.accountNumberLastFour}
+                </MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+        ) : null}
         <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} mt={2} flexWrap="wrap" useFlexGap>
           <Button
             type="submit"
             variant="contained"
             startIcon={pendingAction === 'save' ? <CircularProgress size={16} color="inherit" /> : <SaveRounded />}
-            disabled={busy || !form.clientId.trim() || !form.clientSecret.trim() || (provider !== 'usps_rest' && !form.accountNumber.trim())}
+            disabled={busy || !form.clientId.trim() || !form.clientSecret.trim()}
             sx={buttonSx}
           >
             Save and verify
@@ -407,17 +614,41 @@ export default function CarrierIntegrationPanel() {
           >
             Test connection
           </Button>
+          {canRevealCredentials ? (
+            <Button
+              variant="outlined"
+              startIcon={pendingAction === 'reveal' ? <CircularProgress size={16} color="inherit" /> : <VisibilityRounded />}
+              disabled={busy || !account?.configured}
+              onClick={() => void revealCredential()}
+              sx={buttonSx}
+            >
+              Reveal credentials
+            </Button>
+          ) : null}
           {environment === 'sandbox' && provider !== 'usps_rest' ? (
             <Tooltip title="Rates the fixed synthetic test parcel. No shipment, label, pickup, or charge is created.">
               <span>
                 <Button
                   variant="outlined"
                   startIcon={pendingAction === 'rate' ? <CircularProgress size={16} color="inherit" /> : <PriceCheckRounded />}
-                  disabled={busy || !account?.configured || account.verificationStatus !== 'verified'}
+                  disabled={
+                    busy
+                    || !account?.configured
+                    || account.verificationStatus !== 'verified'
+                    || account.status !== 'active'
+                    || !selectedCarrierAccountGlobalId
+                  }
                   onClick={() => {
                     void patch(
                       'rate',
-                      { action: 'test-sandbox-rate', provider, environment },
+                      {
+                        action: 'test-sandbox-rate',
+                        provider,
+                        environment,
+                        ...(activeCarrierAccounts.length > 1
+                          ? { carrierAccountGlobalId: selectedCarrierAccountGlobalId }
+                          : {}),
+                      },
                       `${providerLabel(provider)} sandbox rates returned.`,
                     ).then((result) => {
                       if (result?.rateTest) setRateTest(result.rateTest)
@@ -442,6 +673,301 @@ export default function CarrierIntegrationPanel() {
           </Button>
         </Stack>
       </Box>
+
+      {revealedCredential
+        && revealedCredential.provider === provider
+        && revealedCredential.environment === environment ? (
+          <Alert
+            severity="warning"
+            sx={{ mt: 2, borderRadius: '8px', alignItems: 'flex-start' }}
+            action={(
+              <Tooltip title="Hide credentials">
+                <IconButton
+                  color="inherit"
+                  size="small"
+                  onClick={() => setRevealedCredential(null)}
+                  aria-label="Hide carrier credentials"
+                >
+                  <VisibilityOffRounded fontSize="small" />
+                </IconButton>
+              </Tooltip>
+            )}
+          >
+            <Typography variant="body2" fontWeight={700}>
+              Visible for 30 seconds
+            </Typography>
+            <Typography variant="caption" color="inherit">
+              Copy these values only to a trusted system. This reveal was recorded in organization activity.
+            </Typography>
+            <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', sm: '1fr 1fr' }, gap: 1.5, mt: 1.5 }}>
+              <TextField
+                label="Client ID"
+                value={revealedCredential.clientId}
+                InputProps={{
+                  readOnly: true,
+                  endAdornment: (
+                    <InputAdornment position="end">
+                      <Tooltip title="Copy client ID">
+                        <IconButton
+                          edge="end"
+                          onClick={() => void copyCredential('Client ID', revealedCredential.clientId)}
+                          aria-label="Copy carrier client ID"
+                        >
+                          <ContentCopyRounded fontSize="small" />
+                        </IconButton>
+                      </Tooltip>
+                    </InputAdornment>
+                  ),
+                }}
+                sx={fieldSx}
+              />
+              <TextField
+                label="Client secret"
+                value={revealedCredential.clientSecret}
+                InputProps={{
+                  readOnly: true,
+                  endAdornment: (
+                    <InputAdornment position="end">
+                      <Tooltip title="Copy client secret">
+                        <IconButton
+                          edge="end"
+                          onClick={() => void copyCredential('Client secret', revealedCredential.clientSecret)}
+                          aria-label="Copy carrier client secret"
+                        >
+                          <ContentCopyRounded fontSize="small" />
+                        </IconButton>
+                      </Tooltip>
+                    </InputAdornment>
+                  ),
+                }}
+                sx={fieldSx}
+              />
+            </Box>
+          </Alert>
+        ) : null}
+
+      {account?.configured ? (
+        <Box sx={{ mt: 3, pt: 2, borderTop: '1px solid', borderColor: 'divider' }}>
+          <Stack
+            direction={{ xs: 'column', sm: 'row' }}
+            spacing={1}
+            justifyContent="space-between"
+            alignItems={{ xs: 'stretch', sm: 'center' }}
+          >
+            <Box>
+              <Typography variant="subtitle2" fontWeight={700}>Billing accounts</Typography>
+            </Box>
+            {editingCarrierAccountGlobalId ? (
+              <Button size="small" onClick={resetCarrierAccountForm} disabled={busy}>Cancel edit</Button>
+            ) : null}
+          </Stack>
+
+          <Stack spacing={0} sx={{ mt: 1.5, borderTop: '1px solid', borderColor: 'divider' }}>
+            {(account.carrierAccounts || []).map((entry) => (
+              <Box
+                key={entry.globalId}
+                sx={{
+                  py: 1.25,
+                  display: 'grid',
+                  gridTemplateColumns: { xs: '1fr', sm: 'minmax(0, 1fr) auto auto' },
+                  gap: 1,
+                  alignItems: 'center',
+                  borderBottom: '1px solid',
+                  borderColor: 'divider',
+                }}
+              >
+                <Box sx={{ minWidth: 0 }}>
+                  <Stack direction="row" spacing={0.75} alignItems="center" flexWrap="wrap" useFlexGap>
+                    <Typography variant="body2" fontWeight={650}>{entry.displayName}</Typography>
+                    <Chip size="small" variant="outlined" label={`ending ${entry.accountNumberLastFour}`} />
+                    <Chip size="small" variant="outlined" label={entry.globalId} />
+                  </Stack>
+                  <Typography variant="caption" color="text.secondary">
+                    {entry.registeredAddress.line1}, {entry.registeredAddress.city}, {entry.registeredAddress.region}{' '}
+                    {entry.registeredAddress.postalCode}
+                  </Typography>
+                </Box>
+                <FormControlLabel
+                  control={(
+                    <Switch
+                      size="small"
+                      checked={entry.status === 'active'}
+                      disabled={busy || entry.status === 'needs_configuration'}
+                      onChange={(_, enabled) => void patch(
+                        `status-${entry.globalId}`,
+                        {
+                          action: 'set-account-status',
+                          provider,
+                          environment,
+                          carrierAccountGlobalId: entry.globalId,
+                          status: enabled ? 'active' : 'disabled',
+                        },
+                        enabled ? 'Carrier account enabled.' : 'Carrier account disabled.',
+                      )}
+                    />
+                  )}
+                  label={entry.status === 'active' ? 'Active' : 'Disabled'}
+                  sx={{ m: 0 }}
+                />
+                <Stack direction="row" spacing={0.5}>
+                  <Tooltip title="Edit carrier account">
+                    <span>
+                      <Button
+                        size="small"
+                        startIcon={<EditRounded />}
+                        onClick={() => editCarrierAccount(entry)}
+                        disabled={busy}
+                      >
+                        Edit
+                      </Button>
+                    </span>
+                  </Tooltip>
+                  <Tooltip title="Delete unused carrier account">
+                    <span>
+                      <Button
+                        size="small"
+                        color="error"
+                        startIcon={<DeleteOutlineRounded />}
+                        disabled={busy}
+                        onClick={() => {
+                          if (!window.confirm(`Delete ${entry.displayName}?`)) return
+                          void patch(
+                            `delete-${entry.globalId}`,
+                            {
+                              action: 'delete-account',
+                              provider,
+                              environment,
+                              carrierAccountGlobalId: entry.globalId,
+                            },
+                            'Carrier account deleted.',
+                          )
+                        }}
+                      >
+                        Delete
+                      </Button>
+                    </span>
+                  </Tooltip>
+                </Stack>
+              </Box>
+            ))}
+          </Stack>
+
+          <Box component="form" onSubmit={saveCarrierAccount} sx={{ mt: 2 }}>
+            <Typography variant="subtitle2" fontWeight={700} sx={{ mb: 1 }}>
+              {editingCarrierAccountGlobalId ? 'Edit billing account' : 'Add billing account'}
+            </Typography>
+            <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', sm: '1fr 1fr' }, gap: 1.5 }}>
+              <TextField
+                required
+                label="Account name"
+                value={carrierAccountForm.displayName}
+                onChange={(event) => updateCarrierAccountForm('displayName', event.target.value)}
+                disabled={busy}
+                inputProps={{ maxLength: 120 }}
+                sx={fieldSx}
+              />
+              <TextField
+                required={!editingCarrierAccountGlobalId}
+                label={editingCarrierAccountGlobalId ? 'New account number (optional)' : 'Account number'}
+                value={carrierAccountForm.accountNumber}
+                onChange={(event) => updateCarrierAccountForm('accountNumber', event.target.value)}
+                disabled={busy}
+                autoComplete="off"
+                sx={fieldSx}
+              />
+              <TextField
+                required
+                label="Registered address line 1"
+                value={carrierAccountForm.line1}
+                onChange={(event) => updateCarrierAccountForm('line1', event.target.value)}
+                disabled={busy}
+                sx={fieldSx}
+              />
+              <TextField
+                label="Registered address line 2"
+                value={carrierAccountForm.line2}
+                onChange={(event) => updateCarrierAccountForm('line2', event.target.value)}
+                disabled={busy}
+                sx={fieldSx}
+              />
+              <TextField
+                required
+                label="City"
+                value={carrierAccountForm.city}
+                onChange={(event) => updateCarrierAccountForm('city', event.target.value)}
+                disabled={busy}
+                sx={fieldSx}
+              />
+              <TextField
+                required
+                label="State / region"
+                value={carrierAccountForm.region}
+                onChange={(event) => updateCarrierAccountForm('region', event.target.value)}
+                disabled={busy}
+                sx={fieldSx}
+              />
+              <TextField
+                required
+                label="Postal code"
+                value={carrierAccountForm.postalCode}
+                onChange={(event) => updateCarrierAccountForm('postalCode', event.target.value)}
+                disabled={busy}
+                sx={fieldSx}
+              />
+              <TextField
+                required
+                label="Country code"
+                value={carrierAccountForm.countryCode}
+                onChange={(event) => updateCarrierAccountForm('countryCode', event.target.value.toUpperCase())}
+                disabled={busy}
+                inputProps={{ maxLength: 2 }}
+                sx={fieldSx}
+              />
+            </Box>
+            <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} mt={1}>
+              <FormControlLabel
+                control={(
+                  <Switch
+                    checked={carrierAccountForm.allowSenderBilling}
+                    onChange={(_, value) => updateCarrierAccountForm('allowSenderBilling', value)}
+                    disabled={busy}
+                  />
+                )}
+                label="Sender"
+              />
+              <FormControlLabel
+                control={(
+                  <Switch
+                    checked={carrierAccountForm.allowRecipientBilling}
+                    onChange={(_, value) => updateCarrierAccountForm('allowRecipientBilling', value)}
+                    disabled={busy}
+                  />
+                )}
+                label="Recipient"
+              />
+              <FormControlLabel
+                control={(
+                  <Switch
+                    checked={carrierAccountForm.allowThirdPartyBilling}
+                    onChange={(_, value) => updateCarrierAccountForm('allowThirdPartyBilling', value)}
+                    disabled={busy}
+                  />
+                )}
+                label="Third party"
+              />
+            </Stack>
+            <Button
+              type="submit"
+              variant="outlined"
+              startIcon={<AddRounded />}
+              disabled={busy}
+              sx={buttonSx}
+            >
+              {editingCarrierAccountGlobalId ? 'Save account' : 'Add account'}
+            </Button>
+          </Box>
+        </Box>
+      ) : null}
 
       {environment === 'sandbox' && provider !== 'usps_rest' ? (
         <Box sx={{ mt: 2, pt: 2, borderTop: '1px solid', borderColor: 'divider' }}>
@@ -483,7 +1009,8 @@ export default function CarrierIntegrationPanel() {
                 </Box>
               ))}
               <Typography variant="caption" color="text.disabled" sx={{ mt: 1 }}>
-                Evidence {rateTest.evidenceGlobalId}
+                {rateTest.carrierAccountGlobalId} | {rateTest.billingRelationship.replace('_', ' ')} | Evidence{' '}
+                {rateTest.evidenceGlobalId}
               </Typography>
             </Stack>
           ) : null}
@@ -503,6 +1030,7 @@ export default function CarrierIntegrationPanel() {
                 startIcon={<PowerSettingsNewRounded />}
                 onClick={() => {
                   setConfirmDisconnect(false)
+                  setRevealedCredential(null)
                   void patch(
                     'disconnect',
                     { action: 'disconnect', provider, environment },

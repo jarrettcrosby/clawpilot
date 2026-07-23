@@ -88,6 +88,27 @@ assert.ok(
   'Sandbox-rate evidence must never persist provider credentials or tokens',
 )
 
+const carrierAccountMigration = read('db/migrations/0090_operations_carrier_accounts_and_gl_coding.sql')
+for (const fragment of [
+  'CREATE TABLE IF NOT EXISTS operations_carrier_accounts',
+  'account_number_ciphertext text NOT NULL',
+  'account_number_iv text NOT NULL',
+  'account_number_tag text NOT NULL',
+  'registered_address jsonb NOT NULL',
+  'allow_sender_billing boolean NOT NULL DEFAULT true',
+  'allow_recipient_billing boolean NOT NULL DEFAULT true',
+  'allow_third_party_billing boolean NOT NULL DEFAULT true',
+  'ADD COLUMN IF NOT EXISTS carrier_account_id uuid',
+  'ADD COLUMN IF NOT EXISTS billing_relationship text',
+  "billing_selection_snapshot jsonb NOT NULL DEFAULT '{}'::jsonb",
+]) {
+  assert.ok(carrierAccountMigration.includes(fragment), `Carrier-account migration missing ${fragment}`)
+}
+assert.ok(
+  !/\baccount_number\s+text\b/i.test(carrierAccountMigration),
+  'Carrier account numbers must not be stored in plaintext',
+)
+
 const persistence = read('app_src/lib/persistence/carrierIntegrations.ts')
 for (const fragment of [
   'WHERE account.organization_id = $1::uuid',
@@ -101,6 +122,9 @@ for (const fragment of [
   "'carrier.integration.enabled'",
   "'carrier.integration.disabled'",
   "'carrier.credential.disconnected'",
+  "'carrier.credential.revealed'",
+  'recordCarrierCredentialRevealInPostgres',
+  'payload: { credentialVersion: row.credential_version }',
   'writeCarrierSandboxRateEvidenceInPostgres',
   'operations_carrier_rate_requests',
   "'carrier.sandbox_rate.succeeded'",
@@ -109,6 +133,17 @@ for (const fragment of [
   "$1::uuid, $2, 'carrier', $3, $4, 'disabled'",
   "WHEN account.status = 'error' THEN 'disabled'",
   'NOT $4::boolean',
+  'carrierAccounts: OperationsCarrierAccountState[]',
+  'operations_carrier_accounts',
+  'createCarrierAccountInPostgres',
+  'updateCarrierAccountInPostgres',
+  'setCarrierAccountStatusInPostgres',
+  'deleteCarrierAccountInPostgres',
+  'readActiveCarrierAccountsFromPostgres',
+  'encryptCarrierAccountNumber',
+  'carrier_account_id',
+  'billing_relationship',
+  'billing_selection_snapshot',
 ]) {
   assert.ok(persistence.includes(fragment), `Carrier persistence contract missing ${fragment}`)
 }
@@ -121,6 +156,9 @@ assert.ok(!persistence.includes('console.'), 'Carrier persistence must not log c
 const service = read('app_src/lib/integrations/carrierIntegrations.ts')
 for (const fragment of [
   'resolveActiveCarrierCredential',
+  'revealCarrierCredential',
+  'recordCarrierCredentialRevealInPostgres',
+  'expiresAt: new Date(revealedAt.getTime() + 30_000).toISOString()',
   "runtime.status !== 'active' || !runtime.verified",
   'await verifyCarrierCredential({ provider, environment, credential })',
   'encryptCarrierCredential(credential, organizationId, provider, environment)',
@@ -129,6 +167,18 @@ for (const fragment of [
   'requestCarrierSandboxRates',
   'writeCarrierSandboxRateEvidenceInPostgres',
   'Carrier integration request failed',
+  'createCarrierAccount',
+  'updateCarrierAccount',
+  'setCarrierAccountStatus',
+  'deleteCarrierAccount',
+  'sandboxBillingRelationship',
+  "activeAccounts.length === 1",
+  "'CARRIER_ACCOUNT_SELECTION_REQUIRED'",
+  "precedence: ['sender', 'recipient', 'third_party']",
+  'decryptCarrierAccountNumber',
+  'carrierAccountGlobalId: selection.account.globalId',
+  'billingRelationship: selection.relationship',
+  'billingSelectionSnapshot: selection.snapshot',
 ]) {
   assert.ok(service.includes(fragment), `Carrier service contract missing ${fragment}`)
 }
@@ -137,6 +187,14 @@ assert.ok(
     < service.indexOf('encryptCarrierCredential(credential, organizationId, provider, environment)'),
   'Carrier credentials must be verified before encryption and persistence',
 )
+assert.ok(
+  service.match(/runtime\.status !== 'active' \|\| !runtime\.verified/g)?.length >= 2,
+  'Credential resolution and sandbox rating must both require an active, verified account',
+)
+assert.ok(
+  service.includes('accountNumber: null'),
+  'Provider credentials must not persist a carrier billing account number',
+)
 
 const route = read('app_src/app/api/integrations/carriers/route.ts')
 for (const fragment of [
@@ -144,12 +202,23 @@ for (const fragment of [
   '32 * 1024',
   'requireManager',
   "action === 'update-credential'",
+  "action === 'reveal-credential'",
   "action === 'test-connection'",
   "action === 'test-sandbox-rate'",
   "action === 'set-enabled'",
   "action === 'disconnect'",
+  "action === 'create-account'",
+  "action === 'update-account'",
+  "action === 'set-account-status'",
+  "action === 'delete-account'",
+  "'carrierAccountGlobalId'",
   'sanitizedCarrierIntegrationError',
   'operationsCapabilities(actor).canManage',
+  'canRevealCredentials: canRevealCredential(actor)',
+  'requireCredentialViewer(actor)',
+  "return role === 'owner' || role === 'admin'",
+  "'CARRIER_CREDENTIAL_REVEAL_FORBIDDEN'",
+  "'Cache-Control': 'no-store, max-age=0'",
 ]) {
   assert.ok(route.includes(fragment), `Carrier API contract missing ${fragment}`)
 }
@@ -165,14 +234,53 @@ for (const fragment of [
   'type="password"',
   'Save and verify',
   'Test connection',
+  'Reveal credentials',
+  'canRevealCredentials ?',
+  'Visible for 30 seconds',
+  'Copy client ID',
+  'Copy client secret',
+  'setRevealedCredential(null)',
   'Test sandbox rate',
   '101 Jegs Place',
   '101 Academy Drive',
   'Test Product',
   'Rating only',
   'Disconnect',
+  'Billing accounts',
+  'Registered address line 1',
+  'set-account-status',
+  'delete-account',
+  'Sandbox billing account',
+  'carrierAccountGlobalId: selectedCarrierAccountGlobalId',
 ]) {
   assert.ok(panel.includes(fragment), `Carrier settings UI missing ${fragment}`)
+}
+assert.ok(
+  panel.includes("account.status !== 'active'"),
+  'Sandbox rate UI must remain disabled until the verified credential is explicitly enabled',
+)
+assert.ok(
+  panel.includes("Math.max(0, Date.parse(revealedCredential.expiresAt) - Date.now())"),
+  'Revealed credentials must be removed from the browser after their server-defined expiry',
+)
+const revealPersistence = persistence.slice(
+  persistence.indexOf('export async function recordCarrierCredentialRevealInPostgres'),
+  persistence.indexOf('async function auditCarrier'),
+)
+assert.ok(
+  !/clientSecret|client_secret|credential_ciphertext|credential_iv|credential_tag/.test(revealPersistence),
+  'Carrier reveal audit records must never read or include secret material',
+)
+
+const integrationsDoc = read('docs/modules/user-integrations.md')
+for (const fragment of [
+  'masked by default',
+  'removed from the page after 30 seconds',
+  'written to organization audit history before plaintext is returned',
+  'users consuming delegated carrier rates cannot reveal the credential',
+  'OAuth tokens remain non-exportable',
+]) {
+  assert.ok(integrationsDoc.includes(fragment), `Carrier reveal documentation missing ${fragment}`)
 }
 
 const settingsPanel = read('app_src/components/settings/IntegrationSettingsPanel.tsx')
@@ -233,6 +341,135 @@ assert.throws(
   /billing account number is required/,
 )
 assert.equal(cryptoModule.normalizeCarrierAccountNumber('', 'usps_rest'), null)
+assert.equal(cryptoModule.normalizeCarrierBillingAccountNumber(' ACCT-9012 '), 'ACCT-9012')
+assert.throws(
+  () => cryptoModule.normalizeCarrierBillingAccountNumber('123'),
+  /must be 4-128 printable ASCII characters/,
+)
+
+const carrierAccountAddress = {
+  line1: '101 Jegs Place',
+  line2: null,
+  city: 'Delaware',
+  region: 'OH',
+  postalCode: '43015',
+  countryCode: 'US',
+}
+const carrierAccountGlobalId = 'gac1234567'
+const encryptedAccountNumber = cryptoModule.encryptCarrierAccountNumber(
+  credential.accountNumber,
+  organizationId,
+  'ups_rest',
+  'sandbox',
+  carrierAccountGlobalId,
+)
+assert.ok(!encryptedAccountNumber.ciphertext.includes(Buffer.from(credential.accountNumber)))
+assert.equal(
+  cryptoModule.decryptCarrierAccountNumber(
+    encryptedAccountNumber,
+    organizationId,
+    'ups_rest',
+    'sandbox',
+    carrierAccountGlobalId,
+  ),
+  credential.accountNumber,
+)
+assert.throws(
+  () => cryptoModule.decryptCarrierAccountNumber(
+    encryptedAccountNumber,
+    organizationId,
+    'ups_rest',
+    'sandbox',
+    'gac7654321',
+  ),
+  /could not be decrypted/,
+  'carrier account AAD must reject a different account Global ID',
+)
+assert.equal(
+  cryptoModule.carrierAccountAddressFingerprint(carrierAccountAddress),
+  cryptoModule.carrierAccountAddressFingerprint({
+    ...carrierAccountAddress,
+    line1: '  101   Jegs Place ',
+    postalCode: '43015-',
+  }),
+  'registered address fingerprints must use normalized address values',
+)
+assert.notEqual(
+  cryptoModule.carrierAccountNumberFingerprint(
+    organizationId,
+    'ups_rest',
+    'sandbox',
+    credential.accountNumber,
+  ),
+  cryptoModule.carrierAccountNumberFingerprint(
+    otherOrganizationId,
+    'ups_rest',
+    'sandbox',
+    credential.accountNumber,
+  ),
+  'account number fingerprints must be tenant scoped',
+)
+
+const carrierServiceModule = loadTypeScriptModule('app_src/lib/integrations/carrierIntegrations.ts', {
+  mocks: {
+    '@/lib/integrations/carrierCredentialClient': {
+      CarrierCredentialClientError: Error,
+      verifyCarrierCredential: async () => ({}),
+    },
+    '@/lib/integrations/carrierSandboxRate': {
+      CARRIER_SANDBOX_RATE_FIXTURE: {
+        origin: {
+          street: '101 Jegs Place',
+          city: 'Delaware',
+          state: 'OH',
+          postalCode: '43015',
+          countryCode: 'US',
+        },
+        destination: {
+          street: '101 Academy Drive',
+          city: 'Buzzards Bay',
+          state: 'MA',
+          postalCode: '02532',
+          countryCode: 'US',
+        },
+      },
+      carrierSandboxRateRequestEvidence: () => ({}),
+      requestCarrierSandboxRates: async () => ({}),
+    },
+    '@/lib/integrations/carrierCredentialCrypto': cryptoModule,
+    '@/lib/persistence/carrierIntegrations': {},
+  },
+})
+const payerAccount = {
+  registeredAddress: carrierAccountAddress,
+  allowSenderBilling: true,
+  allowRecipientBilling: true,
+  allowThirdPartyBilling: true,
+}
+assert.equal(carrierServiceModule.sandboxBillingRelationship(payerAccount), 'sender')
+assert.equal(carrierServiceModule.sandboxBillingRelationship({
+  ...payerAccount,
+  registeredAddress: {
+    line1: '101 Academy Drive',
+    line2: null,
+    city: 'Buzzards Bay',
+    region: 'MA',
+    postalCode: '02532',
+    countryCode: 'US',
+  },
+}), 'recipient')
+assert.equal(carrierServiceModule.sandboxBillingRelationship({
+  ...payerAccount,
+  registeredAddress: { ...carrierAccountAddress, line1: '500 Third Party Way' },
+}), 'third_party')
+assert.throws(
+  () => carrierServiceModule.sandboxBillingRelationship({
+    ...payerAccount,
+    allowSenderBilling: false,
+  }),
+  (error) => error.code === 'CARRIER_ACCOUNT_BILLING_NOT_ALLOWED',
+  'a sender address must not silently fall through to recipient or third-party billing',
+)
 
 const requests = []
 const successfulFetch = async (url, init) => {

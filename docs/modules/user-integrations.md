@@ -13,7 +13,7 @@ app_visible: true
 
 ## Purpose
 
-Keep user-owned Maton accounts separate from the platform Google Workspace credential. All secrets are write-only in the UI, encrypted before Postgres persistence, and isolated between the development and production databases.
+Keep user-owned Maton accounts separate from the platform Google Workspace credential. Secrets are encrypted before Postgres persistence and isolated between the development and production databases. They remain write-only unless a module contract below defines a narrower, audited organization-admin reveal workflow.
 
 ## Maton Account Contract
 
@@ -62,7 +62,9 @@ Keep user-owned Maton accounts separate from the platform Google Workspace crede
 - **Settings > Integrations > Shipping** is organization scoped. The organization owner or a user with explicit **Manage operations** permission can manage direct UPS, FedEx, and USPS credentials. That permission exposes Shipping without exposing Google, QuickBooks, Toast, or user-access administration.
 - Provider developer and production environments are separate account records. The developer selection resolves to UPS CIE, FedEx Sandbox, or USPS TEM through fixed server-side endpoints; operators cannot supply or override these hosts. A verified developer credential never enables a production shipment capability, and changing the active workspace never reuses the prior organization's carrier account.
 - Enter the provider client ID, client secret, and carrier billing account number. USPS does not require a billing account number in the current credential contract. ClawPilot verifies the candidate against the provider's fixed OAuth endpoint before saving it.
-- ClawPilot encrypts the complete credential with AES-256-GCM and binds authenticated encryption to the organization, provider, and environment. The browser receives only the permanent integration Global ID, masked client/account suffixes, credential version, verification state, safe error code, and timestamps.
+- ClawPilot encrypts the complete credential with AES-256-GCM and binds authenticated encryption to the organization, provider, and environment. Normal browser reads receive only the permanent integration Global ID, masked client/account suffixes, credential version, verification state, safe error code, and timestamps.
+- An owner or administrator of the owning organization who also has **Manage operations** permission may explicitly reveal the current provider client ID and client secret. The values remain masked by default, the no-store response is removed from the page after 30 seconds, and the reveal is written to organization audit history before plaintext is returned. Ordinary members and users consuming delegated carrier rates cannot reveal the credential.
+- The reveal workflow does not expose carrier billing account numbers, provider OAuth access tokens, refresh tokens, previous credential versions, or another organization's credentials. OAuth tokens remain non-exportable.
 - OAuth access tokens are short lived and are neither returned to the browser nor stored in the credential table. Rotation replaces the encrypted credential, increments its version, and preserves an audit event without exposing the old or new secret.
 - A first-time saved credential remains disabled after verification. Enabling an account is a separate operator action and performs another provider verification. Rotation preserves a deliberate active or disabled state; recovery from a failed verification returns to disabled and requires explicit re-enable. A live carrier adapter must resolve an account that is both `active` and `verified`; there is no cross-organization or platform-account fallback.
 - **Disconnect** requires confirmation, removes encrypted credential material, and disables the non-secret integration account. Existing immutable shipment evidence remains intact.
