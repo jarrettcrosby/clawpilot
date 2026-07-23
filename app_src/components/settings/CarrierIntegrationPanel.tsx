@@ -22,6 +22,7 @@ import KeyRounded from '@mui/icons-material/KeyRounded'
 import LinkOffRounded from '@mui/icons-material/LinkOffRounded'
 import LocalShippingRounded from '@mui/icons-material/LocalShippingRounded'
 import PowerSettingsNewRounded from '@mui/icons-material/PowerSettingsNewRounded'
+import PriceCheckRounded from '@mui/icons-material/PriceCheckRounded'
 import SaveRounded from '@mui/icons-material/SaveRounded'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import { formatUserDateTime } from '@/lib/userDateTime'
@@ -55,6 +56,36 @@ type CarrierPayload = {
   error?: string
   canManage?: boolean
   integrations?: CarrierIntegrationsState
+  rateTest?: CarrierSandboxRateTest
+}
+
+type CarrierSandboxRateTest = {
+  provider: 'ups_rest' | 'fedex_rest'
+  environment: 'sandbox'
+  fixture: {
+    origin: { name: string; street: string; city: string; state: string; postalCode: string; countryCode: string }
+    destination: { name: string; street: string; city: string; state: string; postalCode: string; countryCode: string }
+    parcel: {
+      description: string
+      length: number
+      width: number
+      height: number
+      dimensionUnit: string
+      weight: number
+      weightUnit: string
+    }
+  }
+  rates: Array<{
+    serviceCode: string
+    serviceName: string
+    amount: string
+    currency: string
+    rateType: string | null
+    transitDays: number | null
+    deliveryDate: string | null
+  }>
+  testedAt: string
+  evidenceGlobalId: string
 }
 
 type CredentialForm = {
@@ -120,6 +151,7 @@ export default function CarrierIntegrationPanel() {
   const [confirmDisconnect, setConfirmDisconnect] = useState(false)
   const [notice, setNotice] = useState('')
   const [error, setError] = useState('')
+  const [rateTest, setRateTest] = useState<CarrierSandboxRateTest | null>(null)
 
   const key = accountKey(provider, environment)
   const form = forms[key] || emptyForm(provider, environment)
@@ -262,7 +294,11 @@ export default function CarrierIntegrationPanel() {
 
       <Tabs
         value={provider}
-        onChange={(_, value: CarrierProvider) => { setProvider(value); setConfirmDisconnect(false) }}
+        onChange={(_, value: CarrierProvider) => {
+          setProvider(value)
+          setConfirmDisconnect(false)
+          setRateTest(null)
+        }}
         variant="scrollable"
         scrollButtons="auto"
         aria-label="Carrier provider"
@@ -279,7 +315,11 @@ export default function CarrierIntegrationPanel() {
         size="small"
         value={environment}
         onChange={(_, value: CarrierEnvironment | null) => {
-          if (value) { setEnvironment(value); setConfirmDisconnect(false) }
+          if (value) {
+            setEnvironment(value)
+            setConfirmDisconnect(false)
+            setRateTest(null)
+          }
         }}
         aria-label="Carrier environment"
         sx={{ maxWidth: 420, mb: 2, '& .MuiToggleButton-root': { borderRadius: '8px' } }}
@@ -367,6 +407,29 @@ export default function CarrierIntegrationPanel() {
           >
             Test connection
           </Button>
+          {environment === 'sandbox' && provider !== 'usps_rest' ? (
+            <Tooltip title="Rates the fixed synthetic test parcel. No shipment, label, pickup, or charge is created.">
+              <span>
+                <Button
+                  variant="outlined"
+                  startIcon={pendingAction === 'rate' ? <CircularProgress size={16} color="inherit" /> : <PriceCheckRounded />}
+                  disabled={busy || !account?.configured || account.verificationStatus !== 'verified'}
+                  onClick={() => {
+                    void patch(
+                      'rate',
+                      { action: 'test-sandbox-rate', provider, environment },
+                      `${providerLabel(provider)} sandbox rates returned.`,
+                    ).then((result) => {
+                      if (result?.rateTest) setRateTest(result.rateTest)
+                    })
+                  }}
+                  sx={buttonSx}
+                >
+                  Test sandbox rate
+                </Button>
+              </span>
+            </Tooltip>
+          ) : null}
           <Button
             color="error"
             variant="text"
@@ -379,6 +442,53 @@ export default function CarrierIntegrationPanel() {
           </Button>
         </Stack>
       </Box>
+
+      {environment === 'sandbox' && provider !== 'usps_rest' ? (
+        <Box sx={{ mt: 2, pt: 2, borderTop: '1px solid', borderColor: 'divider' }}>
+          <Typography variant="subtitle2" fontWeight={700}>Sandbox rating fixture</Typography>
+          <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
+            John Doe, 101 Jegs Place, Delaware, OH 43015 to John Doe, 101 Academy Drive,
+            Buzzards Bay, MA 02532. Test Product, 12 x 10 x 6 IN, 5 LB.
+          </Typography>
+          <Typography variant="caption" color="text.disabled">
+            Rating only. ClawPilot does not create a shipment, label, pickup, manifest, or carrier charge.
+          </Typography>
+          {rateTest ? (
+            <Stack spacing={0} sx={{ mt: 1.5, borderTop: '1px solid', borderColor: 'divider' }}>
+              {rateTest.rates.map((rate) => (
+                <Box
+                  key={`${rate.serviceCode}:${rate.rateType || 'default'}`}
+                  sx={{
+                    py: 1.25,
+                    display: 'grid',
+                    gridTemplateColumns: { xs: '1fr auto', sm: 'minmax(180px, 1fr) auto auto' },
+                    gap: 1,
+                    alignItems: 'center',
+                    borderBottom: '1px solid',
+                    borderColor: 'divider',
+                  }}
+                >
+                  <Box sx={{ minWidth: 0 }}>
+                    <Typography variant="body2" fontWeight={650} noWrap>{rate.serviceName}</Typography>
+                    <Typography variant="caption" color="text.disabled">{rate.serviceCode}</Typography>
+                  </Box>
+                  <Typography variant="body2" fontWeight={700}>{rate.currency} {rate.amount}</Typography>
+                  <Typography
+                    variant="caption"
+                    color="text.secondary"
+                    sx={{ gridColumn: { xs: '1 / -1', sm: 'auto' }, textAlign: { sm: 'right' } }}
+                  >
+                    {rate.deliveryDate || (rate.transitDays !== null ? `${rate.transitDays} business days` : 'Transit estimate unavailable')}
+                  </Typography>
+                </Box>
+              ))}
+              <Typography variant="caption" color="text.disabled" sx={{ mt: 1 }}>
+                Evidence {rateTest.evidenceGlobalId}
+              </Typography>
+            </Stack>
+          ) : null}
+        </Box>
+      ) : null}
 
       {confirmDisconnect ? (
         <Alert

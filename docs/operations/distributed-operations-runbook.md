@@ -13,13 +13,13 @@ app_visible: false
 
 ## Status And Scope
 
-This runbook governs the target distributed order, inventory, warehouse, carrier, printing, shipment, and 3PL billing module. The development environment has a Postgres-backed planned-proof workbench, explicit warehouse-release, bulk all-ready pick-confirmation, and pack-verification commands, a shared product/default-package import workflow, an audited exception queue, organization-scoped activation, direct carrier credential administration, command-receipt health, and disposable PostgreSQL acceptance. The separate shipped mock proof is automated test evidence and is not the operator execution workflow. This runbook remains `draft` until the module has complete reconciliation and adapter health, tested production adapters, integration/warehouse activation subscopes, and on-call ownership. Current general environment, backup, promotion, and restore procedures remain authoritative:
+This runbook governs the target distributed order, inventory, warehouse, carrier, printing, shipment, and 3PL billing module. The development environment has a Postgres-backed order workbench, explicit warehouse-release, bulk all-ready pick-confirmation, and pack-verification commands for eligible non-archived orders, a shared product/default-package import workflow, an audited exception queue, organization-scoped activation, direct carrier credential administration, UPS and FedEx sandbox rating against a fixed synthetic fixture, append-only redacted rate evidence, command-receipt health, and disposable PostgreSQL acceptance. Deterministic mock flows are automated-test evidence only and cannot be launched from the hosted workbench. This runbook remains `draft` until the module has complete reconciliation and adapter health, tested production adapters, integration/warehouse activation subscopes, and on-call ownership. Current general environment, backup, promotion, and restore procedures remain authoritative:
 
 - [ClawPilot Environments and Deployment](clawpilot-environments.md)
 - [Railway Postgres Backups](railway-postgres-backups.md)
 - [Agent Security and Integration Isolation](agent-security-and-isolation.md)
 
-Migrations `0081`, `0082`, `0084`, `0085`, `0086`, and `0087` and the mock workbench are development evidence only. Do not use this document as evidence that an operations worker, production provider integration, checkout callback, enrolled print agent, or live warehouse workflow is deployed.
+Migrations `0081`, `0082`, `0084`, `0085`, `0086`, `0087`, and `0088` are bounded development evidence only. Do not use this document as evidence that an operations worker, production provider integration, checkout callback, enrolled print agent, or live warehouse workflow is deployed. Migration `0088` archives legacy mock orders, releases their reservations, hides them from active workbench projections, disables mock integration/facility records, and retains immutable evidence rather than deleting it.
 
 ## Direct Carrier Credential Procedure
 
@@ -33,7 +33,17 @@ Migrations `0081`, `0082`, `0084`, `0085`, `0086`, and `0087` and the mock workb
 8. Rotate by entering the full replacement credential and selecting **Save and verify**. The previous ciphertext is replaced only after the candidate verifies, and the audit log records rotation metadata without a secret.
 9. Use **Disconnect** only after confirming the organization, provider, and environment. Disconnect deletes encrypted credential material and disables the integration metadata; it does not delete immutable historical shipment evidence.
 
-Credential verification is not shipping certification. Do not activate rating, label purchase, void, manifest, pickup, or tracking until the corresponding adapter, provider attempts, unknown-outcome reconciliation, and authorized live smoke test pass the release gate in the [small parcel architecture](../architecture/small-parcel-carrier-adapters.md).
+Credential verification is not shipping certification. The only currently authorized provider call is the fixed UPS or FedEx sandbox rate test below. Do not activate production rating, label purchase, void, manifest, pickup, tracking, or any carrier side effect until the corresponding adapter, provider attempts, unknown-outcome reconciliation, and authorized smoke test pass the release gate in the [small parcel architecture](../architecture/small-parcel-carrier-adapters.md).
+
+## UPS And FedEx Sandbox Rate Test
+
+1. Confirm the active workspace and open **Settings > Integrations > Shipping**.
+2. Select UPS or FedEx and **Sandbox / developer**. Confirm that the sandbox credential is active and verified. Production credentials are rejected by this action.
+3. Review the immutable fixture shown in the panel: John Doe at `101 Jegs Place, Delaware, OH 43015` to John Doe at `101 Academy Drive, Buzzards Bay, MA 02532`, with one `Test Product` parcel measuring `12 x 10 x 6 in` and weighing `5 lb`.
+4. Select **Test sandbox rate** once. The request performs rating only. It cannot create a shipment, label, pickup, manifest, tracking record, carrier charge, or print job.
+5. Record the returned `grq` evidence Global ID and review only normalized service, amount, currency, transit, and delivery values. Do not copy credentials, tokens, account numbers, or raw provider payloads into operating notes.
+6. A failure may be retried only after reviewing its safe error and provider/account status. The append-only evidence preserves each attempt without storing secrets or a full address payload.
+7. Stop after rating. Label and pickup tests are a later gated procedure and must automatically void or cancel every sandbox artifact, reconcile ambiguous outcomes, and retain proof of cancellation.
 
 ## Product And Package Catalog
 
@@ -49,7 +59,7 @@ Only authorized pipeline editors can import or change the catalog. Viewers can i
 
 ## Planned Order, Warehouse Release, Pick Confirmation, And Pack Verification
 
-1. Open **Operations**, select **Orders**, and prepare a proof order. The default proof stops at `planned`; it does not pick, pack, buy a label, print, or ship.
+1. Open **Operations**, select **Orders**, and open an eligible non-archived order received through an approved commerce boundary. The hosted workbench does not create proof orders; deterministic mock generation is reserved for automated tests.
 2. Open the planned order and verify the customer, lines, warehouse plan, reservation and allocation quantities, package and selected-rate evidence, promise, and estimated cost/revenue/margin.
 3. Resolve every open high or critical exception before release. Do not bypass an incomplete reservation or allocation with direct SQL.
 4. Use **Release to warehouse**, record a specific operational reason, and submit once. The client keeps one idempotency key for safe retries of that release attempt.

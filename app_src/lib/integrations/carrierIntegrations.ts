@@ -4,6 +4,10 @@ import {
   type CarrierRuntimeCredential,
 } from '@/lib/integrations/carrierCredentialClient'
 import {
+  carrierSandboxRateRequestEvidence,
+  requestCarrierSandboxRates,
+} from '@/lib/integrations/carrierSandboxRate'
+import {
   decryptCarrierCredential,
   encryptCarrierCredential,
   normalizeCarrierAccountNumber,
@@ -19,8 +23,11 @@ import {
   readCarrierIntegrationsStateFromPostgres,
   readCarrierRuntimeCredentialFromPostgres,
   setCarrierIntegrationEnabledInPostgres,
+  writeCarrierSandboxRateEvidenceInPostgres,
   writeCarrierCredentialInPostgres,
 } from '@/lib/persistence/carrierIntegrations'
+
+const CARRIER_SANDBOX_RATE_ADAPTER_VERSION = 'direct-rest-v1'
 
 export class CarrierIntegrationRequestError extends Error {
   readonly status: number
@@ -73,7 +80,14 @@ async function storedRuntimeCredential(input: {
   organizationId: unknown
   provider: unknown
   environment: unknown
-}): Promise<CarrierRuntimeCredential & { status: 'active' | 'disabled' | 'error'; verified: boolean }> {
+}): Promise<CarrierRuntimeCredential & {
+  organizationId: string
+  integrationAccountId: string
+  integrationGlobalId: string
+  credentialVersion: number
+  status: 'active' | 'disabled' | 'error'
+  verified: boolean
+}> {
   const organizationId = normalizeCarrierOrganizationId(input.organizationId)
   const provider = normalizeDirectCarrierProvider(input.provider)
   const environment = normalizeCarrierEnvironment(input.environment)
@@ -86,6 +100,10 @@ async function storedRuntimeCredential(input: {
     )
   }
   return {
+    organizationId,
+    integrationAccountId: stored.integrationAccountId,
+    integrationGlobalId: stored.globalId,
+    credentialVersion: stored.credentialVersion,
     provider,
     environment,
     credential: decryptCarrierCredential(stored.encrypted, organizationId, provider, environment),
@@ -189,6 +207,93 @@ export async function testCarrierCredential(input: {
       })
     } catch {
       // Invalid request dimensions cannot identify a stored credential to mark failed.
+    }
+    throw sanitized
+  }
+}
+
+export async function testCarrierSandboxRate(input: {
+  organizationId: unknown
+  provider: unknown
+  environment: unknown
+  actorEmail: string
+}) {
+  const requestedAt = new Date().toISOString()
+  let runtime: Awaited<ReturnType<typeof storedRuntimeCredential>> | null = null
+  try {
+    const organizationId = normalizeCarrierOrganizationId(input.organizationId)
+    const provider = normalizeDirectCarrierProvider(input.provider)
+    const environment = normalizeCarrierEnvironment(input.environment)
+    if (environment !== 'sandbox') {
+      throw new CarrierIntegrationRequestError(
+        'Rate testing is limited to carrier sandbox accounts',
+        409,
+        'CARRIER_SANDBOX_REQUIRED',
+      )
+    }
+    if (provider !== 'ups_rest' && provider !== 'fedex_rest') {
+      throw new CarrierIntegrationRequestError(
+        'Sandbox rating is not available for this carrier yet',
+        409,
+        'CARRIER_SANDBOX_RATE_UNSUPPORTED',
+      )
+    }
+    runtime = await storedRuntimeCredential({ organizationId, provider, environment })
+    if (!runtime.verified) {
+      throw new CarrierIntegrationRequestError(
+        'Verify the carrier credential before testing a rate',
+        409,
+        'CARRIER_CREDENTIAL_INACTIVE',
+      )
+    }
+    const rate = await requestCarrierSandboxRates({
+      provider: runtime.provider,
+      environment: runtime.environment,
+      credential: runtime.credential,
+    })
+    const evidenceGlobalId = await writeCarrierSandboxRateEvidenceInPostgres({
+      organizationId: runtime.organizationId,
+      integrationAccountId: runtime.integrationAccountId,
+      integrationGlobalId: runtime.integrationGlobalId,
+      provider: runtime.provider,
+      credentialVersion: runtime.credentialVersion,
+      adapterVersion: CARRIER_SANDBOX_RATE_ADAPTER_VERSION,
+      requestHash: rate.evidence.requestHash,
+      redactedRequest: rate.evidence.redactedRequest,
+      redactedResponse: rate.evidence.redactedResponse,
+      status: 'succeeded',
+      providerReference: rate.evidence.providerReference,
+      errorCode: null,
+      actorEmail: input.actorEmail,
+      requestedAt: rate.evidence.requestedAt,
+      completedAt: rate.evidence.completedAt,
+    })
+    return { ...rate.result, evidenceGlobalId }
+  } catch (error) {
+    const sanitized = sanitize(error)
+    if (runtime && (runtime.provider === 'ups_rest' || runtime.provider === 'fedex_rest')) {
+      const safeRequest = carrierSandboxRateRequestEvidence(runtime.provider)
+      try {
+        await writeCarrierSandboxRateEvidenceInPostgres({
+          organizationId: runtime.organizationId,
+          integrationAccountId: runtime.integrationAccountId,
+          integrationGlobalId: runtime.integrationGlobalId,
+          provider: runtime.provider,
+          credentialVersion: runtime.credentialVersion,
+          adapterVersion: CARRIER_SANDBOX_RATE_ADAPTER_VERSION,
+          requestHash: safeRequest.requestHash,
+          redactedRequest: safeRequest.redactedRequest,
+          redactedResponse: { errorCode: sanitized.code },
+          status: 'failed',
+          providerReference: null,
+          errorCode: sanitized.code,
+          actorEmail: input.actorEmail,
+          requestedAt,
+          completedAt: new Date().toISOString(),
+        })
+      } catch {
+        // The original carrier error remains authoritative if evidence storage fails.
+      }
     }
     throw sanitized
   }

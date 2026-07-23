@@ -1291,6 +1291,7 @@ async function readOrderDetail(
        WHERE candidate.order_id = orders.id ORDER BY candidate.shipped_at DESC LIMIT 1
      ) shipment ON true
      WHERE orders.organization_id = $1::uuid AND orders.global_id = $2
+       AND orders.archived_at IS NULL
      LIMIT 1`,
     [organizationId, orderGlobalId],
   )
@@ -1469,9 +1470,12 @@ export async function readOperationsWorkspaceFromPostgres(input: {
   const organizationId = requireOrganizationId(input.organizationId)
   const activation = await withTransaction((client) => resolveActivation(client, organizationId))
   const values: unknown[] = [organizationId]
-  const where = ['orders.organization_id = $1::uuid']
+  const where = ['orders.organization_id = $1::uuid', 'orders.archived_at IS NULL']
   const exceptionValues: unknown[] = [organizationId]
-  const exceptionWhere = ['exception.organization_id = $1::uuid']
+  const exceptionWhere = [
+    'exception.organization_id = $1::uuid',
+    '(orders.id IS NULL OR orders.archived_at IS NULL)',
+  ]
   if (input.search) {
     values.push(`%${input.search.toLowerCase()}%`)
     where.push(`(lower(orders.order_number) LIKE $${values.length} OR lower(orders.global_id) LIKE $${values.length} OR lower(customer.name) LIKE $${values.length})`)
@@ -1490,10 +1494,10 @@ export async function readOperationsWorkspaceFromPostgres(input: {
   const [configuredResult, summaryResult, orderResult, exceptionResult, warehouseResult, customerResult, productResult] = await Promise.all([
     query<QueryResultRow & { configured: boolean }>(
       `SELECT EXISTS (
-         SELECT 1 FROM operations_integration_accounts integration
-         WHERE integration.organization_id = $1::uuid AND integration.environment = 'mock'
-       ) AND EXISTS (
-         SELECT 1 FROM operations_warehouses warehouse WHERE warehouse.organization_id = $1::uuid
+         SELECT 1 FROM operations_warehouses warehouse
+         WHERE warehouse.organization_id = $1::uuid
+           AND warehouse.status = 'active'
+           AND warehouse.code <> 'MOCK-01'
        ) AS configured`,
       [organizationId],
     ),
@@ -1507,13 +1511,44 @@ export async function readOperationsWorkspaceFromPostgres(input: {
       unbilled_minor: string
     }>(
       `SELECT
-         (SELECT count(*) FROM operations_orders WHERE organization_id = $1::uuid AND status NOT IN ('shipped', 'cancelled'))::text AS open_orders,
-         (SELECT count(*) FROM operations_exceptions WHERE organization_id = $1::uuid AND status IN ('open', 'acknowledged'))::text AS exceptions,
-         (SELECT count(*) FROM operations_orders WHERE organization_id = $1::uuid AND status NOT IN ('shipped', 'cancelled') AND promised_delivery_at <= now() + interval '2 days')::text AS due_soon,
-         (SELECT count(*) FROM operations_orders WHERE organization_id = $1::uuid AND status = 'shipped' AND updated_at >= date_trunc('day', now()))::text AS shipped_today,
-         COALESCE((SELECT sum(reserved_quantity) FROM operations_inventory_positions WHERE organization_id = $1::uuid), 0)::text AS reserved_units,
-         COALESCE((SELECT sum(on_hand_quantity - reserved_quantity - damaged_quantity) FROM operations_inventory_positions WHERE organization_id = $1::uuid), 0)::text AS available_units,
-         COALESCE((SELECT sum(amount_minor) FROM operations_billable_events WHERE organization_id = $1::uuid AND status = 'unbilled'), 0)::text AS unbilled_minor`,
+         (SELECT count(*) FROM operations_orders WHERE organization_id = $1::uuid AND archived_at IS NULL AND status NOT IN ('shipped', 'cancelled'))::text AS open_orders,
+         (SELECT count(*)
+          FROM operations_exceptions exception
+          LEFT JOIN operations_orders exception_order
+            ON exception_order.organization_id = exception.organization_id AND exception_order.id = exception.order_id
+          WHERE exception.organization_id = $1::uuid
+            AND exception.status IN ('open', 'acknowledged')
+            AND (exception_order.id IS NULL OR exception_order.archived_at IS NULL))::text AS exceptions,
+         (SELECT count(*) FROM operations_orders WHERE organization_id = $1::uuid AND archived_at IS NULL AND status NOT IN ('shipped', 'cancelled') AND promised_delivery_at <= now() + interval '2 days')::text AS due_soon,
+         (SELECT count(*) FROM operations_orders WHERE organization_id = $1::uuid AND archived_at IS NULL AND status = 'shipped' AND updated_at >= date_trunc('day', now()))::text AS shipped_today,
+         COALESCE((SELECT sum(position.reserved_quantity)
+                   FROM operations_inventory_positions position
+                   JOIN operations_warehouses warehouse
+                     ON warehouse.organization_id = position.organization_id AND warehouse.id = position.warehouse_id
+                   JOIN operations_locations location
+                     ON location.organization_id = position.organization_id AND location.id = position.location_id
+                   JOIN operations_inventory_pools pool
+                     ON pool.organization_id = position.organization_id AND pool.id = position.pool_id
+                   WHERE position.organization_id = $1::uuid
+                     AND warehouse.status = 'active' AND warehouse.code <> 'MOCK-01'
+                     AND location.active = true AND pool.active = true), 0)::text AS reserved_units,
+         COALESCE((SELECT sum(position.on_hand_quantity - position.reserved_quantity - position.damaged_quantity)
+                   FROM operations_inventory_positions position
+                   JOIN operations_warehouses warehouse
+                     ON warehouse.organization_id = position.organization_id AND warehouse.id = position.warehouse_id
+                   JOIN operations_locations location
+                     ON location.organization_id = position.organization_id AND location.id = position.location_id
+                   JOIN operations_inventory_pools pool
+                     ON pool.organization_id = position.organization_id AND pool.id = position.pool_id
+                   WHERE position.organization_id = $1::uuid
+                     AND warehouse.status = 'active' AND warehouse.code <> 'MOCK-01'
+                     AND location.active = true AND pool.active = true), 0)::text AS available_units,
+         COALESCE((SELECT sum(event.amount_minor)
+                   FROM operations_billable_events event
+                   JOIN operations_orders billable_order
+                     ON billable_order.organization_id = event.organization_id AND billable_order.id = event.order_id
+                   WHERE event.organization_id = $1::uuid AND event.status = 'unbilled'
+                     AND billable_order.archived_at IS NULL), 0)::text AS unbilled_minor`,
       [organizationId],
     ),
     query<QueryResultRow & {
@@ -1580,7 +1615,7 @@ export async function readOperationsWorkspaceFromPostgres(input: {
     ),
     query<QueryResultRow & { id: string; global_id: string; name: string }>(
       `SELECT id::text, global_id, name FROM operations_warehouses
-       WHERE organization_id = $1::uuid AND status = 'active' ORDER BY name, id`,
+       WHERE organization_id = $1::uuid AND status = 'active' AND code <> 'MOCK-01' ORDER BY name, id`,
       [organizationId],
     ),
     query<CustomerRow>(

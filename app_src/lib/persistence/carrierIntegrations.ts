@@ -63,6 +63,24 @@ export type CarrierRuntimeCredentialRecord = {
   encrypted: EncryptedCarrierCredential
 }
 
+export type CarrierSandboxRateEvidenceInput = {
+  organizationId: string
+  integrationAccountId: string
+  integrationGlobalId: string
+  provider: DirectCarrierProvider
+  credentialVersion: number
+  adapterVersion: string
+  requestHash: string
+  redactedRequest: Record<string, unknown>
+  redactedResponse: Record<string, unknown>
+  status: 'succeeded' | 'failed'
+  providerReference: string | null
+  errorCode: string | null
+  actorEmail: string
+  requestedAt: string
+  completedAt: string
+}
+
 function iso(value: TimestampValue | null | undefined) {
   return value ? new Date(value).toISOString() : null
 }
@@ -424,4 +442,63 @@ export async function disconnectCarrierCredentialInPostgres(input: {
     })
   })
   return readCarrierIntegrationsStateFromPostgres(input.organizationId)
+}
+
+export async function writeCarrierSandboxRateEvidenceInPostgres(
+  input: CarrierSandboxRateEvidenceInput,
+) {
+  return withTransaction(async (client) => {
+    const result = await client.query<{ global_id: string }>(
+      `INSERT INTO operations_carrier_rate_requests (
+         organization_id, integration_account_id, provider, environment,
+         purpose, adapter_version, credential_version, request_hash,
+         redacted_request, redacted_response, status, provider_reference,
+         error_code, actor_email, requested_at, completed_at
+       ) VALUES (
+         $1::uuid, $2::uuid, $3, 'sandbox',
+         'sandbox_rate_test', $4, $5, $6,
+         $7::jsonb, $8::jsonb, $9, $10,
+         $11, $12, $13::timestamptz, $14::timestamptz
+       )
+       RETURNING global_id`,
+      [
+        input.organizationId,
+        input.integrationAccountId,
+        input.provider,
+        input.adapterVersion,
+        input.credentialVersion,
+        input.requestHash,
+        JSON.stringify(input.redactedRequest),
+        JSON.stringify(input.redactedResponse),
+        input.status,
+        input.providerReference,
+        input.errorCode,
+        input.actorEmail,
+        input.requestedAt,
+        input.completedAt,
+      ],
+    )
+    const globalId = result.rows[0].global_id
+    await auditCarrier(client, {
+      actorEmail: input.actorEmail,
+      organizationId: input.organizationId,
+      eventType: input.status === 'succeeded'
+        ? 'carrier.sandbox_rate.succeeded'
+        : 'carrier.sandbox_rate.failed',
+      globalId: input.integrationGlobalId,
+      provider: input.provider,
+      environment: 'sandbox',
+      payload: {
+        evidenceGlobalId: globalId,
+        adapterVersion: input.adapterVersion,
+        credentialVersion: input.credentialVersion,
+        requestHash: input.requestHash,
+        rateCount: Array.isArray(input.redactedResponse.rates)
+          ? input.redactedResponse.rates.length
+          : 0,
+        ...(input.errorCode ? { errorCode: input.errorCode } : {}),
+      },
+    })
+    return globalId
+  })
 }

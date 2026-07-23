@@ -33,6 +33,10 @@ const selectedOrder = {
   waveStatus: null,
   pickTaskCount: 0,
   readyPickTaskCount: 0,
+  pickedPickTaskCount: 0,
+  packageCount: 1,
+  plannedPackageCount: 1,
+  packedPackageCount: 0,
   availableActions: [
     {
       action: 'release_to_warehouse',
@@ -169,6 +173,7 @@ function workspace(exceptionStatus: OperationsExceptionStatus = 'open', lifecycl
     rowVersion: 2,
     waveStatus: 'completed',
     readyPickTaskCount: 0,
+    pickedPickTaskCount: 2,
     availableActions: [
       ...releasedOrder.availableActions.slice(0, 1),
       {
@@ -176,6 +181,12 @@ function workspace(exceptionStatus: OperationsExceptionStatus = 'open', lifecycl
         label: 'Confirm all picks',
         enabled: false,
         blockedReason: 'Every pick on this wave is already confirmed.',
+      },
+      {
+        action: 'verify_pack',
+        label: 'Verify packages',
+        enabled: true,
+        blockedReason: null,
       },
     ],
     lines: selectedOrder.lines.map((line) => ({ ...line, pickStatus: 'picked' })),
@@ -284,26 +295,7 @@ async function installOperationsRoutes(page: Page) {
           },
         })
       }
-      expect(request.action).toBe('run-proof-order')
-      expect(request.proof?.customerGlobalId).toBe('ga1234567')
-      expect(request.proof?.executionMode).toBe('planned')
-      expect(request.proof?.lines).toEqual([
-        { productGlobalId: 'gp1234567', quantity: 2, openingQuantity: 12 },
-        { productGlobalId: 'gp7654321', quantity: 1, openingQuantity: 12 },
-      ])
-      return route.fulfill({
-        status: 201,
-        json: {
-          ok: true,
-          result: {
-            orderGlobalId: selectedOrder.globalId,
-            orderStatus: 'planned',
-            duplicate: false,
-            trackingNumber: null,
-            steps: Array.from({ length: 11 }, (_, index) => `Completed proof step ${index + 1}`),
-          },
-        },
-      })
+      throw new Error(`Unexpected hosted operations action: ${request.action || 'missing'}`)
     }
     return route.fulfill({ json: { ok: true, operations: workspace(exceptionStatus, lifecycle) } })
   })
@@ -336,8 +328,9 @@ test('operations workbench renders dense desktop evidence and order drill-in', a
   await expect(page.getByRole('heading', { name: 'Confirm warehouse picks' })).toBeVisible()
   await page.getByRole('button', { name: 'Confirm picks', exact: true }).click()
   await expect(page.getByText(/All picks for order gor1234567 were confirmed/)).toBeVisible()
-  await expect(page.getByText('Every pick on this wave is already confirmed.')).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Verify packages' })).toBeVisible()
   await expect(page.getByText('Picks ready').locator('..').getByText('0 / 2')).toBeVisible()
+  await expect(page.getByText('Picks complete').locator('..').getByText('2 / 2')).toBeVisible()
   await page.getByRole('button', { name: 'Close order details' }).click()
 
   await page.getByRole('tab', { name: 'Exceptions (1)' }).click()
@@ -349,7 +342,7 @@ test('operations workbench renders dense desktop evidence and order drill-in', a
   await expect(page.getByRole('tab', { name: 'Exceptions (1)' })).toBeVisible()
 })
 
-test('operations mobile workflow has no page overflow and executes a proof order', async ({ page }) => {
+test('operations mobile workflow has no page overflow and omits hosted proof generation', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 })
   await installOperationsRoutes(page)
   await gotoApp(page, '/#operations')
@@ -365,20 +358,11 @@ test('operations mobile workflow has no page overflow and executes a proof order
   await page.getByRole('button', { name: 'Close exception details' }).click()
   await page.getByRole('tab', { name: 'Orders (1)' }).click()
 
-  await page.getByRole('button', { name: 'Prepare order' }).click()
-  await expect(page.getByRole('heading', { name: 'Prepare proof order', exact: true })).toBeVisible()
-  await page.getByRole('button', { name: 'Add product' }).click()
-  await expect(page.getByRole('combobox', { name: 'Product 1' })).toContainText('Trail Pack')
-  await expect(page.getByRole('combobox', { name: 'Product 2' })).toContainText('Camp Lantern')
-  await page.getByRole('textbox', { name: 'Address', exact: true }).fill('200 Customer Lane')
-  await page.getByRole('textbox', { name: 'City', exact: true }).fill('New York')
-  await page.getByRole('textbox', { name: 'State or region', exact: true }).fill('NY')
-  await page.getByRole('textbox', { name: 'Postal code', exact: true }).fill('10001')
-  await page.getByRole('button', { name: 'Prepare order' }).click()
-
-  await expect(page.getByText(/Proof order planned/)).toBeVisible()
-  await expect(page.getByText('Completed proof step 11')).toBeVisible()
-  await page.getByRole('button', { name: 'Review planned order' }).click()
+  await expect(page.getByRole('button', { name: 'Prepare order' })).toHaveCount(0)
+  await page.getByRole('button', { name: 'Open operations guide' }).click()
+  await expect(page.getByText(/Deterministic mock adapters remain isolated to automated tests/)).toBeVisible()
+  await page.getByRole('button', { name: 'Done' }).click()
+  await page.getByRole('button', { name: /PROOF-1042/ }).click()
   await expect(page.getByRole('heading', { name: 'Order PROOF-1042' })).toBeVisible()
   await expect.poll(async () => page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(1)
 })

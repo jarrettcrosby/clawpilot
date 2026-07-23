@@ -233,6 +233,8 @@ export async function GET() {
           operations_command_results_migration_applied: boolean
           operations_package_workflow_migration_applied: boolean
           product_packaging_profiles_migration_applied: boolean
+          operations_carrier_credentials_migration_applied: boolean
+          operations_sandbox_rating_migration_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -588,6 +590,16 @@ export async function GET() {
                 FROM schema_migrations
                 WHERE filename = '0086_product_packaging_profiles.sql'
               ) AS product_packaging_profiles_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0087_operations_carrier_credentials.sql'
+              ) AS operations_carrier_credentials_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0088_operations_sandbox_rating_and_mock_retirement.sql'
+              ) AS operations_sandbox_rating_migration_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -670,6 +682,8 @@ export async function GET() {
             && row?.operations_command_results_migration_applied
             && row?.operations_package_workflow_migration_applied
             && row?.product_packaging_profiles_migration_applied
+            && row?.operations_carrier_credentials_migration_applied
+            && row?.operations_sandbox_rating_migration_applied
             && row?.migration_checksums_present
           ),
         }
@@ -744,6 +758,8 @@ export async function GET() {
           || !row?.operations_command_results_migration_applied
           || !row?.operations_package_workflow_migration_applied
           || !row?.product_packaging_profiles_migration_applied
+          || !row?.operations_carrier_credentials_migration_applied
+          || !row?.operations_sandbox_rating_migration_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')

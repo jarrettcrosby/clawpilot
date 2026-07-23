@@ -1,6 +1,6 @@
 'use client'
 
-import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react'
+import { FormEvent, useCallback, useEffect, useState } from 'react'
 import {
   Alert,
   Box,
@@ -31,13 +31,10 @@ import {
   useMediaQuery,
   useTheme,
 } from '@mui/material'
-import AddRounded from '@mui/icons-material/AddRounded'
 import CheckCircleRounded from '@mui/icons-material/CheckCircleRounded'
 import CloseRounded from '@mui/icons-material/CloseRounded'
-import ErrorOutlineRounded from '@mui/icons-material/ErrorOutlineRounded'
 import HelpOutlineRounded from '@mui/icons-material/HelpOutlineRounded'
 import Inventory2Rounded from '@mui/icons-material/Inventory2Rounded'
-import LocalShippingRounded from '@mui/icons-material/LocalShippingRounded'
 import OpenInNewRounded from '@mui/icons-material/OpenInNewRounded'
 import RefreshRounded from '@mui/icons-material/RefreshRounded'
 import ReplayRounded from '@mui/icons-material/ReplayRounded'
@@ -46,8 +43,6 @@ import TaskAltRounded from '@mui/icons-material/TaskAltRounded'
 import WarningAmberRounded from '@mui/icons-material/WarningAmberRounded'
 import WarehouseRounded from '@mui/icons-material/WarehouseRounded'
 import type {
-  MockOperationsProofInput,
-  MockOperationsProofResult,
   OperationsActivationState,
   OperationsActivationUpdateResult,
   OperationsExceptionListItem,
@@ -67,29 +62,7 @@ type OperationsPayload = {
   error?: string
   code?: string
   operations?: OperationsWorkspace
-  result?: MockOperationsProofResult | OperationsExceptionUpdateResult | OperationsActivationUpdateResult | OperationsOrderCommandResult
-}
-
-type ProofForm = {
-  customerGlobalId: string
-  lines: ProofFormLine[]
-  externalOrderId: string
-  orderNumber: string
-  requestedDeliveryAt: string
-  name: string
-  line1: string
-  line2: string
-  city: string
-  region: string
-  postalCode: string
-  country: string
-}
-
-type ProofFormLine = {
-  id: string
-  productGlobalId: string
-  quantity: string
-  openingQuantity: string
+  result?: OperationsExceptionUpdateResult | OperationsActivationUpdateResult | OperationsOrderCommandResult
 }
 
 const ORDER_STATUSES: Array<{ value: '' | OperationsOrderStatus; label: string }> = [
@@ -131,37 +104,6 @@ const controlSx = {
     borderRadius: '8px',
     backgroundColor: '#15151D',
   },
-}
-
-function localDateTime(daysFromToday: number) {
-  const date = new Date()
-  date.setDate(date.getDate() + daysFromToday)
-  date.setHours(17, 0, 0, 0)
-  const offset = date.getTimezoneOffset() * 60_000
-  return new Date(date.getTime() - offset).toISOString().slice(0, 16)
-}
-
-function newProofForm(): ProofForm {
-  const token = Date.now().toString().slice(-9)
-  return {
-    customerGlobalId: '',
-    lines: [{
-      id: `line-${token}-1`,
-      productGlobalId: '',
-      quantity: '2',
-      openingQuantity: '12',
-    }],
-    externalOrderId: `mock-${token}`,
-    orderNumber: `PROOF-${token}`,
-    requestedDeliveryAt: localDateTime(7),
-    name: '',
-    line1: '',
-    line2: '',
-    city: '',
-    region: '',
-    postalCode: '',
-    country: 'US',
-  }
 }
 
 function displayStatus(status: string) {
@@ -541,7 +483,7 @@ function OperationsGuide({ open, onClose }: { open: boolean; onClose: () => void
           <Box><Typography fontWeight={700}>2. Promise and reserve</Typography><Typography color="text.secondary">ClawPilot selects a feasible warehouse, reserves customer-owned inventory, cartonizes the order, compares rates, and records the promise.</Typography></Box>
           <Box><Typography fontWeight={700}>3. Release and execute</Typography><Typography color="text.secondary">Review the plan, reservations, packages, rates, cost, revenue, and margin before release. Release creates a wave and ready pick tasks. Pick confirmation completes the wave; package verification then records who packed each carton and accrues contract pack fees without purchasing a label or creating a shipment.</Typography></Box>
           <Box><Typography fontWeight={700}>4. Reconcile revenue</Typography><Typography color="text.secondary">Contract directives create immutable billable events for order handling, picks, packing, freight, storage, and special services.</Typography></Box>
-          <Alert severity="info">This first slice uses deterministic mock commerce, carrier, and print adapters. It writes real tenant-scoped PostgreSQL records but does not contact a live provider.</Alert>
+          <Alert severity="info">Hosted orders enter through approved commerce integrations. Carrier sandbox rating is available to authorized managers under Settings, Integrations, Shipping. Deterministic mock adapters remain isolated to automated tests and never create hosted workspace records.</Alert>
         </Stack>
       </DialogContent>
       <DialogActions><Button onClick={onClose}>Done</Button></DialogActions>
@@ -566,10 +508,6 @@ export default function OperationsSection() {
   const [selectedExceptionGlobalId, setSelectedExceptionGlobalId] = useState<string | null>(null)
   const [exceptionDrawerOpen, setExceptionDrawerOpen] = useState(false)
   const [updatingException, setUpdatingException] = useState(false)
-  const [proofOpen, setProofOpen] = useState(false)
-  const [proof, setProof] = useState<ProofForm>(newProofForm)
-  const [submitting, setSubmitting] = useState(false)
-  const [proofResult, setProofResult] = useState<MockOperationsProofResult | null>(null)
   const [guideOpen, setGuideOpen] = useState(false)
   const [updatingActivation, setUpdatingActivation] = useState(false)
   const [releaseOpen, setReleaseOpen] = useState(false)
@@ -617,16 +555,6 @@ export default function OperationsSection() {
     }
   }, [loadWorkspace, search, selectedGlobalId])
 
-  const openProof = () => {
-    const next = newProofForm()
-    next.customerGlobalId = workspace?.catalog.customers[0]?.globalId || ''
-    next.lines[0].productGlobalId = workspace?.catalog.products[0]?.globalId || ''
-    next.name = workspace?.catalog.customers[0]?.name || ''
-    setProof(next)
-    setProofResult(null)
-    setProofOpen(true)
-  }
-
   const chooseOrder = (order: OperationsOrderListItem) => {
     setSelectedGlobalId(order.globalId)
     setDrawerOpen(true)
@@ -652,86 +580,6 @@ export default function OperationsSection() {
     setView('orders')
     setSelectedGlobalId(orderGlobalId)
     setDrawerOpen(true)
-  }
-
-  const updateProof = (field: Exclude<keyof ProofForm, 'lines'>, value: string) => {
-    setProof((current) => ({ ...current, [field]: value }))
-  }
-
-  const updateProofLine = (id: string, field: keyof Omit<ProofFormLine, 'id'>, value: string) => {
-    setProof((current) => ({
-      ...current,
-      lines: current.lines.map((line) => line.id === id ? { ...line, [field]: value } : line),
-    }))
-  }
-
-  const addProofLine = () => {
-    setProof((current) => {
-      const selected = new Set(current.lines.map((line) => line.productGlobalId))
-      const productGlobalId = workspace?.catalog.products.find((item) => !selected.has(item.globalId))?.globalId || ''
-      if (!productGlobalId || current.lines.length >= 25) return current
-      return {
-        ...current,
-        lines: [...current.lines, {
-          id: `line-${Date.now()}-${current.lines.length + 1}`,
-          productGlobalId,
-          quantity: '1',
-          openingQuantity: '12',
-        }],
-      }
-    })
-  }
-
-  const removeProofLine = (id: string) => {
-    setProof((current) => current.lines.length === 1
-      ? current
-      : { ...current, lines: current.lines.filter((line) => line.id !== id) })
-  }
-
-  const submitProof = async (event: FormEvent) => {
-    event.preventDefault()
-    setSubmitting(true)
-    setError('')
-    const body: MockOperationsProofInput = {
-      customerGlobalId: proof.customerGlobalId,
-      lines: proof.lines.map((line) => ({
-        productGlobalId: line.productGlobalId,
-        quantity: Number(line.quantity),
-        openingQuantity: Number(line.openingQuantity),
-      })),
-      externalOrderId: proof.externalOrderId,
-      orderNumber: proof.orderNumber,
-      requestedDeliveryAt: new Date(proof.requestedDeliveryAt).toISOString(),
-      executionMode: 'planned',
-      shipTo: {
-        name: proof.name,
-        line1: proof.line1,
-        line2: proof.line2 || undefined,
-        city: proof.city,
-        region: proof.region,
-        postalCode: proof.postalCode,
-        country: proof.country,
-      },
-    }
-    try {
-      const response = await fetch('/api/operations', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'run-proof-order', proof: body }),
-      })
-      const payload = await response.json() as OperationsPayload
-      if (!response.ok || !payload.result || !('orderGlobalId' in payload.result) || !('steps' in payload.result)) {
-        throw new Error(payload.error || 'Proof order failed')
-      }
-      setProofResult(payload.result)
-      setSelectedGlobalId(payload.result.orderGlobalId)
-      setNotice(`Order ${payload.result.orderGlobalId} is planned and ready for operator review.`)
-      await loadWorkspace(payload.result.orderGlobalId)
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : 'Proof order failed')
-    } finally {
-      setSubmitting(false)
-    }
   }
 
   const openRelease = () => {
@@ -936,20 +784,10 @@ export default function OperationsSection() {
   }
 
   const capabilities = workspace?.capabilities
-  const canRunProof = Boolean(
-    capabilities?.canManage
-    && capabilities?.canExecute
-    && workspace?.activation.state === 'shadow',
-  )
-  const catalogReady = Boolean(workspace?.catalog.customers.length && workspace?.catalog.products.length)
   const detail = workspace?.selectedOrder?.globalId === selectedGlobalId ? workspace.selectedOrder : null
   const selectedException = workspace?.exceptions.find((item) => item.globalId === selectedExceptionGlobalId) || null
   const summary = workspace?.summary
   const empty = !loading && (view === 'orders' ? workspace?.orders.length === 0 : workspace?.exceptions.length === 0)
-  const proofCustomer = useMemo(
-    () => workspace?.catalog.customers.find((item) => item.globalId === proof.customerGlobalId),
-    [proof.customerGlobalId, workspace?.catalog.customers],
-  )
 
   return (
     <Box sx={{ height: '100%', display: 'flex', flexDirection: 'column', minWidth: 0, overflow: 'hidden' }}>
@@ -991,9 +829,6 @@ export default function OperationsSection() {
             )}
             <Tooltip title="Operations guide"><IconButton aria-label="Open operations guide" onClick={() => setGuideOpen(true)}><HelpOutlineRounded /></IconButton></Tooltip>
             <Tooltip title="Refresh orders"><span><IconButton aria-label="Refresh operations" disabled={loading} onClick={() => void loadWorkspace(selectedGlobalId)}><RefreshRounded /></IconButton></span></Tooltip>
-            <Tooltip title={!catalogReady ? 'Add an organization and active CRM product first' : workspace?.activation.state !== 'shadow' ? 'Proof orders run only in shadow mode' : !canRunProof ? 'Operations execute permission is required' : 'Prepare a mock order for operator review'}>
-              <span><Button variant="contained" startIcon={<AddRounded />} disabled={!canRunProof || !catalogReady} onClick={openProof}>Prepare order</Button></span>
-            </Tooltip>
           </Stack>
         </Stack>
 
@@ -1062,7 +897,7 @@ export default function OperationsSection() {
       {error && <Alert severity="error" onClose={() => setError('')} sx={{ mx: { xs: 2, md: 3 }, mb: 1.5 }}>{error}</Alert>}
       {notice && <Alert severity="success" onClose={() => setNotice('')} sx={{ mx: { xs: 2, md: 3 }, mb: 1.5 }}>{notice}</Alert>}
       {!loading && workspace && !workspace.configured && (
-        <Alert severity="info" sx={{ mx: { xs: 2, md: 3 }, mb: 1.5 }}>The operations workspace will be initialized by its first proof order.</Alert>
+        <Alert severity="info" sx={{ mx: { xs: 2, md: 3 }, mb: 1.5 }}>Connect an approved commerce provider and configure an active warehouse to begin importing orders.</Alert>
       )}
 
       <Box sx={{ flex: 1, minHeight: 0, overflow: 'auto', WebkitOverflowScrolling: 'touch' }}>
@@ -1313,126 +1148,6 @@ export default function OperationsSection() {
         </Box>
       </Dialog>
 
-      <Dialog open={proofOpen} onClose={() => !submitting && setProofOpen(false)} fullWidth maxWidth="md" fullScreen={mobile}>
-        <Box component="form" onSubmit={submitProof}>
-          <DialogTitle component="div" sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-            <LocalShippingRounded color="primary" />
-            <Box sx={{ flex: 1 }}><Typography variant="h6" fontWeight={700}>Prepare proof order</Typography><Typography variant="caption" color="text.secondary">Mock commerce · carrier · operator-controlled fulfillment</Typography></Box>
-            <IconButton aria-label="Close proof order" disabled={submitting} onClick={() => setProofOpen(false)}><CloseRounded /></IconButton>
-          </DialogTitle>
-          <DialogContent dividers sx={{ py: 2.5 }}>
-            {proofResult ? (
-              <Stack spacing={2.5}>
-                <Alert severity="success" icon={<CheckCircleRounded />}>{proofResult.duplicate ? 'Idempotent retry confirmed' : 'Proof order planned'} · {proofResult.orderGlobalId}</Alert>
-                <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', sm: 'repeat(2, minmax(0, 1fr))' }, gap: 1.25 }}>
-                  {proofResult.steps.map((step, index) => (
-                    <Box key={step} sx={{ display: 'flex', gap: 1, py: 0.75 }}><Chip size="small" label={index + 1} color="success" /><Typography variant="body2">{step}</Typography></Box>
-                  ))}
-                </Box>
-                <Button variant="outlined" onClick={() => { setProofOpen(false); setDrawerOpen(true) }}>Review planned order</Button>
-              </Stack>
-            ) : (
-              <Stack spacing={2.5}>
-                <Alert severity="warning" icon={<ErrorOutlineRounded />}>This prepares a mock order, reservations, package, carrier rates, and financial plan in the active organization. It does not release or ship the order.</Alert>
-                <Stack spacing={1.25}>
-                  <Stack direction="row" alignItems="center" justifyContent="space-between" gap={1}>
-                    <Box>
-                      <Typography variant="subtitle2" fontWeight={700}>Order products</Typography>
-                      <Typography variant="caption" color="text.secondary">Add every product and quantity required by this order.</Typography>
-                    </Box>
-                    <Button
-                      size="small"
-                      startIcon={<AddRounded />}
-                      onClick={addProofLine}
-                      disabled={proof.lines.length >= Math.min(25, workspace?.catalog.products.length || 0)}
-                    >
-                      Add product
-                    </Button>
-                  </Stack>
-                  {proof.lines.map((line, index) => {
-                    const selectedByOtherLine = new Set(proof.lines
-                      .filter((candidate) => candidate.id !== line.id)
-                      .map((candidate) => candidate.productGlobalId))
-                    return (
-                      <Box
-                        key={line.id}
-                        sx={{
-                          display: 'grid',
-                          gridTemplateColumns: { xs: 'minmax(0, 1fr) 40px', sm: 'minmax(220px, 2fr) minmax(110px, 0.75fr) minmax(140px, 1fr) 40px' },
-                          gap: 1,
-                          alignItems: 'center',
-                        }}
-                      >
-                        <TextField
-                          select
-                          required
-                          label={`Product ${index + 1}`}
-                          value={line.productGlobalId}
-                          onChange={(event) => updateProofLine(line.id, 'productGlobalId', event.target.value)}
-                          sx={{ gridColumn: { xs: '1 / 2', sm: 'auto' } }}
-                        >
-                          {workspace?.catalog.products
-                            .filter((item) => item.globalId === line.productGlobalId || !selectedByOtherLine.has(item.globalId))
-                            .map((item) => <MenuItem key={item.globalId} value={item.globalId}>{item.name}{item.sku ? ` · ${item.sku}` : ''}</MenuItem>)}
-                        </TextField>
-                        <TextField
-                          required
-                          type="number"
-                          label="Quantity"
-                          value={line.quantity}
-                          onChange={(event) => updateProofLine(line.id, 'quantity', event.target.value)}
-                          inputProps={{ min: 1, max: 1000, step: 1 }}
-                          sx={{ gridColumn: { xs: '1 / 2', sm: 'auto' } }}
-                        />
-                        <TextField
-                          required
-                          type="number"
-                          label="Opening inventory"
-                          value={line.openingQuantity}
-                          onChange={(event) => updateProofLine(line.id, 'openingQuantity', event.target.value)}
-                          inputProps={{ min: 1, max: 100000, step: 1 }}
-                          sx={{ gridColumn: { xs: '1 / 2', sm: 'auto' } }}
-                        />
-                        <Tooltip title={proof.lines.length === 1 ? 'An order needs at least one product' : 'Remove product'}>
-                          <span>
-                            <IconButton
-                              aria-label={`Remove product ${index + 1}`}
-                              onClick={() => removeProofLine(line.id)}
-                              disabled={proof.lines.length === 1}
-                              sx={{ width: 40, height: 40 }}
-                            >
-                              <CloseRounded />
-                            </IconButton>
-                          </span>
-                        </Tooltip>
-                      </Box>
-                    )
-                  })}
-                </Stack>
-                <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', sm: 'repeat(2, minmax(0, 1fr))' }, gap: 1.5 }}>
-                  <TextField select required label="CRM customer" value={proof.customerGlobalId} onChange={(event) => { updateProof('customerGlobalId', event.target.value); const customer = workspace?.catalog.customers.find((item) => item.globalId === event.target.value); if (customer) updateProof('name', customer.name) }}>
-                    {workspace?.catalog.customers.map((item) => <MenuItem key={item.globalId} value={item.globalId}>{item.name} · {item.globalId}</MenuItem>)}
-                  </TextField>
-                  <TextField required label="External order ID" value={proof.externalOrderId} onChange={(event) => updateProof('externalOrderId', event.target.value)} inputProps={{ maxLength: 120 }} />
-                  <TextField required label="Order number" value={proof.orderNumber} onChange={(event) => updateProof('orderNumber', event.target.value)} inputProps={{ maxLength: 100 }} />
-                  <TextField required type="datetime-local" label="Requested delivery" value={proof.requestedDeliveryAt} onChange={(event) => updateProof('requestedDeliveryAt', event.target.value)} InputLabelProps={{ shrink: true }} />
-                  <TextField required label="Ship-to name" value={proof.name || proofCustomer?.name || ''} onChange={(event) => updateProof('name', event.target.value)} inputProps={{ maxLength: 120 }} />
-                  <TextField required label="Address" value={proof.line1} onChange={(event) => updateProof('line1', event.target.value)} inputProps={{ maxLength: 160 }} />
-                  <TextField label="Address line 2" value={proof.line2} onChange={(event) => updateProof('line2', event.target.value)} inputProps={{ maxLength: 160 }} />
-                  <TextField required label="City" value={proof.city} onChange={(event) => updateProof('city', event.target.value)} inputProps={{ maxLength: 100 }} />
-                  <TextField required label="State or region" value={proof.region} onChange={(event) => updateProof('region', event.target.value)} inputProps={{ maxLength: 100 }} />
-                  <TextField required label="Postal code" value={proof.postalCode} onChange={(event) => updateProof('postalCode', event.target.value)} inputProps={{ maxLength: 30 }} />
-                  <TextField required label="Country" value={proof.country} onChange={(event) => updateProof('country', event.target.value.toUpperCase())} inputProps={{ maxLength: 2 }} />
-                </Box>
-              </Stack>
-            )}
-          </DialogContent>
-          <DialogActions sx={{ px: 3, py: 2 }}>
-            <Button onClick={() => setProofOpen(false)} disabled={submitting}>{proofResult ? 'Done' : 'Cancel'}</Button>
-            {!proofResult && <Button type="submit" variant="contained" disabled={submitting} startIcon={submitting ? <CircularProgress size={16} /> : <WarehouseRounded />}>{submitting ? 'Preparing' : 'Prepare order'}</Button>}
-          </DialogActions>
-        </Box>
-      </Dialog>
     </Box>
   )
 }

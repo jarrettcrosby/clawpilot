@@ -65,6 +65,29 @@ for (const fragment of [
 }
 assert.ok(!migration.includes('client_secret text'), 'Carrier credentials must not store plaintext secrets')
 
+const sandboxRateMigration = read('db/migrations/0088_operations_sandbox_rating_and_mock_retirement.sql')
+for (const fragment of [
+  "('grq', 'operations.carrier_rate_request'",
+  'ADD COLUMN IF NOT EXISTS archived_at timestamptz',
+  'CREATE TABLE IF NOT EXISTS operations_carrier_rate_requests',
+  "environment text NOT NULL CHECK (environment = 'sandbox')",
+  "purpose = 'sandbox_rate_test'",
+  "request_hash text NOT NULL CHECK (request_hash ~ '^[a-f0-9]{64}$')",
+  'redacted_request jsonb NOT NULL',
+  'redacted_response jsonb NOT NULL',
+  'protect_operations_carrier_rate_requests_mutation',
+  "WHERE orders.source_provider = 'mock-commerce'",
+  "SET status = 'cancelled'",
+  "WHERE provider IN ('mock-commerce', 'mock-carrier', 'mock-printer')",
+  "WHERE code = 'MOCK-01'",
+]) {
+  assert.ok(sandboxRateMigration.includes(fragment), `Sandbox-rate migration missing ${fragment}`)
+}
+assert.ok(
+  !/client_secret|access_token|private_key/i.test(sandboxRateMigration),
+  'Sandbox-rate evidence must never persist provider credentials or tokens',
+)
+
 const persistence = read('app_src/lib/persistence/carrierIntegrations.ts')
 for (const fragment of [
   'WHERE account.organization_id = $1::uuid',
@@ -78,6 +101,10 @@ for (const fragment of [
   "'carrier.integration.enabled'",
   "'carrier.integration.disabled'",
   "'carrier.credential.disconnected'",
+  'writeCarrierSandboxRateEvidenceInPostgres',
+  'operations_carrier_rate_requests',
+  "'carrier.sandbox_rate.succeeded'",
+  "'carrier.sandbox_rate.failed'",
   'carrier-credential:',
   "$1::uuid, $2, 'carrier', $3, $4, 'disabled'",
   "WHEN account.status = 'error' THEN 'disabled'",
@@ -97,6 +124,10 @@ for (const fragment of [
   "runtime.status !== 'active' || !runtime.verified",
   'await verifyCarrierCredential({ provider, environment, credential })',
   'encryptCarrierCredential(credential, organizationId, provider, environment)',
+  'testCarrierSandboxRate',
+  "environment !== 'sandbox'",
+  'requestCarrierSandboxRates',
+  'writeCarrierSandboxRateEvidenceInPostgres',
   'Carrier integration request failed',
 ]) {
   assert.ok(service.includes(fragment), `Carrier service contract missing ${fragment}`)
@@ -114,6 +145,7 @@ for (const fragment of [
   'requireManager',
   "action === 'update-credential'",
   "action === 'test-connection'",
+  "action === 'test-sandbox-rate'",
   "action === 'set-enabled'",
   "action === 'disconnect'",
   'sanitizedCarrierIntegrationError',
@@ -133,6 +165,11 @@ for (const fragment of [
   'type="password"',
   'Save and verify',
   'Test connection',
+  'Test sandbox rate',
+  '101 Jegs Place',
+  '101 Academy Drive',
+  'Test Product',
+  'Rating only',
   'Disconnect',
 ]) {
   assert.ok(panel.includes(fragment), `Carrier settings UI missing ${fragment}`)
@@ -283,5 +320,181 @@ await assert.rejects(
   },
   'response size must be enforced even without Content-Length',
 )
+
+class MockCarrierCredentialClientError extends Error {
+  constructor(message, status, code) {
+    super(message)
+    this.status = status
+    this.code = code
+  }
+}
+
+const rateRequests = []
+const sandboxRateModule = loadTypeScriptModule('app_src/lib/integrations/carrierSandboxRate.ts', {
+  mocks: {
+    '@/lib/integrations/carrierCredentialClient': {
+      CarrierCredentialClientError: MockCarrierCredentialClientError,
+      requestCarrierAccessToken: async () => ({
+        accessToken: 'short-lived-rate-token-must-not-leak',
+        expiresInSeconds: 3600,
+        scope: 'rate',
+      }),
+    },
+  },
+})
+
+const fixture = sandboxRateModule.CARRIER_SANDBOX_RATE_FIXTURE
+assert.deepEqual(JSON.parse(JSON.stringify(fixture)), {
+  origin: {
+    name: 'John Doe',
+    street: '101 Jegs Place',
+    city: 'Delaware',
+    state: 'OH',
+    postalCode: '43015',
+    countryCode: 'US',
+  },
+  destination: {
+    name: 'John Doe',
+    street: '101 Academy Drive',
+    city: 'Buzzards Bay',
+    state: 'MA',
+    postalCode: '02532',
+    countryCode: 'US',
+  },
+  parcel: {
+    description: 'Test Product',
+    length: 12,
+    width: 10,
+    height: 6,
+    dimensionUnit: 'IN',
+    weight: 5,
+    weightUnit: 'LB',
+  },
+})
+
+const fedexRate = await sandboxRateModule.requestCarrierSandboxRates({
+  provider: 'fedex_rest',
+  environment: 'sandbox',
+  credential,
+}, {
+  fetchImpl: async (url, init) => {
+    rateRequests.push({ url: String(url), init })
+    return new Response(JSON.stringify({
+      output: {
+        rateReplyDetails: [{
+          serviceType: 'FEDEX_GROUND',
+          serviceName: 'FedEx Ground',
+          ratedShipmentDetails: [{
+            rateType: 'ACCOUNT',
+            totalNetCharge: 14.72,
+            currency: 'USD',
+          }],
+          operationalDetail: {
+            transitTime: 'TWO_DAYS',
+            deliveryDate: '2026-07-24',
+          },
+        }],
+      },
+    }), {
+      status: 200,
+      headers: {
+        'content-type': 'application/json',
+        'x-customer-transaction-id': 'fedex-rate-reference',
+      },
+    })
+  },
+})
+assert.equal(rateRequests[0].url, 'https://apis-sandbox.fedex.com/rate/v1/rates/quotes')
+const fedexRequest = JSON.parse(rateRequests[0].init.body)
+assert.equal(fedexRequest.accountNumber.value, credential.accountNumber)
+assert.equal(fedexRequest.requestedShipment.shipper.address.streetLines[0], '101 Jegs Place')
+assert.equal(fedexRequest.requestedShipment.recipient.address.streetLines[0], '101 Academy Drive')
+assert.equal(fedexRequest.requestedShipment.requestedPackageLineItems[0].itemDescription, 'Test Product')
+assert.deepEqual(JSON.parse(JSON.stringify(fedexRate.result.rates)), [{
+  serviceCode: 'FEDEX_GROUND',
+  serviceName: 'FedEx Ground',
+  amount: '14.72',
+  currency: 'USD',
+  rateType: 'ACCOUNT',
+  transitDays: 2,
+  deliveryDate: '2026-07-24',
+}])
+assert.equal(fedexRate.evidence.providerReference, 'fedex-rate-reference')
+
+const upsRate = await sandboxRateModule.requestCarrierSandboxRates({
+  provider: 'ups_rest',
+  environment: 'sandbox',
+  credential,
+}, {
+  fetchImpl: async (url, init) => {
+    rateRequests.push({ url: String(url), init })
+    return new Response(JSON.stringify({
+      RateResponse: {
+        RatedShipment: [{
+          Service: { Code: '03' },
+          TotalCharges: { MonetaryValue: '18.45', CurrencyCode: 'USD' },
+          TimeInTransit: {
+            ServiceSummary: {
+              EstimatedArrival: {
+                BusinessDaysInTransit: '3',
+                Arrival: { Date: '20260727' },
+              },
+            },
+          },
+        }],
+      },
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json', 'transaction-id': 'ups-rate-reference' },
+    })
+  },
+})
+assert.equal(rateRequests[1].url, 'https://wwwcie.ups.com/api/rating/v2409/Shop?additionalinfo=timeintransit')
+const upsRequest = JSON.parse(rateRequests[1].init.body)
+assert.equal(upsRequest.RateRequest.Shipment.Shipper.ShipperNumber, credential.accountNumber)
+assert.equal(upsRequest.RateRequest.Shipment.ShipFrom.Address.AddressLine[0], '101 Jegs Place')
+assert.equal(upsRequest.RateRequest.Shipment.ShipTo.Address.AddressLine[0], '101 Academy Drive')
+assert.equal(upsRequest.RateRequest.Shipment.Package.Description, 'Test Product')
+assert.deepEqual(JSON.parse(JSON.stringify(upsRate.result.rates)), [{
+  serviceCode: '03',
+  serviceName: 'UPS Ground',
+  amount: '18.45',
+  currency: 'USD',
+  rateType: null,
+  transitDays: 3,
+  deliveryDate: '2026-07-27',
+}])
+assert.equal(upsRate.evidence.providerReference, 'ups-rate-reference')
+
+for (const value of [fedexRate, upsRate]) {
+  const serialized = JSON.stringify(value)
+  assert.ok(!serialized.includes(credential.accountNumber), 'Rate result/evidence must redact account numbers')
+  assert.ok(!serialized.includes(credential.clientId), 'Rate result/evidence must redact client IDs')
+  assert.ok(!serialized.includes(credential.clientSecret), 'Rate result/evidence must redact client secrets')
+  assert.ok(!serialized.includes('short-lived-rate-token-must-not-leak'), 'Rate result/evidence must redact tokens')
+}
+
+await assert.rejects(
+  sandboxRateModule.requestCarrierSandboxRates({
+    provider: 'ups_rest',
+    environment: 'production',
+    credential,
+  }),
+  (error) => error.code === 'CARRIER_SANDBOX_REQUIRED' && error.status === 409,
+  'Rating test must reject production carrier credentials before any provider request',
+)
+
+const sandboxRateSource = read('app_src/lib/integrations/carrierSandboxRate.ts')
+for (const forbiddenEndpoint of [
+  '/ship/v1/',
+  '/pickup/',
+  '/label/',
+  '/manifest/',
+]) {
+  assert.ok(
+    !sandboxRateSource.toLowerCase().includes(forbiddenEndpoint),
+    `Sandbox rating adapter must not contain transactional endpoint ${forbiddenEndpoint}`,
+  )
+}
 
 console.log('carrier integration contract tests passed')

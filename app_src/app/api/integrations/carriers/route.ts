@@ -5,6 +5,7 @@ import {
   getCarrierIntegrationsState,
   sanitizedCarrierIntegrationError,
   setCarrierIntegrationEnabled,
+  testCarrierSandboxRate,
   testCarrierCredential,
   updateCarrierCredential,
 } from '@/lib/integrations/carrierIntegrations'
@@ -149,6 +150,16 @@ export async function PATCH(req: NextRequest) {
         actorEmail: actor.email,
       })
       return json({ ok: true, canManage: true, integrations })
+    }
+    if (action === 'test-sandbox-rate') {
+      only(body, ['action', 'provider', 'environment'])
+      const rateTest = await testCarrierSandboxRate({
+        organizationId: organization,
+        provider: body.provider,
+        environment: body.environment,
+        actorEmail: actor.email,
+      })
+      return json({ ok: true, canManage: true, rateTest })
     }
     if (action === 'set-enabled') {
       only(body, ['action', 'provider', 'environment', 'enabled'])

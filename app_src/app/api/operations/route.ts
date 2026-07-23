@@ -67,6 +67,16 @@ function requirePostgres() {
   }
 }
 
+function requireOperationsProofFixture() {
+  if (process.env.CLAWPILOT_OPERATIONS_PROOF_ENABLED !== 'true') {
+    requestError(
+      'OPERATIONS_PROOF_DISABLED',
+      'The hosted proof-order fixture is disabled',
+      404,
+    )
+  }
+}
+
 function record(value: unknown, code: string, label: string): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) requestError(code, `${label} is invalid`)
   return value as Record<string, unknown>
@@ -275,6 +285,7 @@ export async function POST(req: NextRequest) {
     const body = await requestBody(req)
     const action = textValue(body.action, 'Operations action', 50)
     if (action === 'run-proof-order') {
+      requireOperationsProofFixture()
       if (!capabilities.canManage || !capabilities.canExecute) {
         return json({
           ok: false,

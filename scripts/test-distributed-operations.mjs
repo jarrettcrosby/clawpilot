@@ -129,6 +129,17 @@ function verifySourceContracts() {
     "source IN ('manual', 'csv_import', 'provider_sync')",
   ]) assert.ok(packagingMigration.includes(fragment), `Product packaging migration missing ${fragment}`)
 
+  const sandboxRateMigration = read('db/migrations/0088_operations_sandbox_rating_and_mock_retirement.sql')
+  for (const fragment of [
+    'ADD COLUMN IF NOT EXISTS archived_at timestamptz',
+    'CREATE TABLE IF NOT EXISTS operations_carrier_rate_requests',
+    'protect_operations_carrier_rate_requests_mutation',
+    "WHERE orders.source_provider = 'mock-commerce'",
+    "SET status = 'cancelled'",
+    "WHERE provider IN ('mock-commerce', 'mock-carrier', 'mock-printer')",
+    "WHERE code = 'MOCK-01'",
+  ]) assert.ok(sandboxRateMigration.includes(fragment), `Mock retirement migration missing ${fragment}`)
+
   const persistence = read('app_src/lib/persistence/operations.ts')
   for (const fragment of [
     'readOperationsWorkspaceFromPostgres',
@@ -163,6 +174,8 @@ function verifySourceContracts() {
     "eventType: 'operations.package.packed'",
     "eventType: 'operations.order.pack_verified'",
     'readDefaultProductPackagingWithClient',
+    'orders.archived_at IS NULL',
+    "warehouse.code <> 'MOCK-01'",
   ]) assert.ok(persistence.includes(fragment), `Operations persistence missing ${fragment}`)
   assert.ok(!persistence.includes('console.'), 'Operations persistence must not log tenant data')
 
@@ -241,6 +254,8 @@ function verifySourceContracts() {
     "'Cache-Control': 'private, no-store'",
     'MAX_REQUEST_BYTES',
     "action === 'run-proof-order'",
+    'CLAWPILOT_OPERATIONS_PROOF_ENABLED',
+    'OPERATIONS_PROOF_DISABLED',
     "action === 'release-order'",
     "action === 'confirm-picks'",
     "action === 'verify-pack'",
@@ -282,6 +297,14 @@ function verifySourceContracts() {
   assert.ok(
     health.includes("WHERE filename = '0086_product_packaging_profiles.sql'"),
     'Health must require the product packaging profiles migration',
+  )
+  assert.ok(
+    health.includes("WHERE filename = '0087_operations_carrier_credentials.sql'"),
+    'Health must require the operations carrier credential migration',
+  )
+  assert.ok(
+    health.includes("WHERE filename = '0088_operations_sandbox_rating_and_mock_retirement.sql'"),
+    'Health must require the sandbox rating and mock retirement migration',
   )
 
   const packaging = read('app_src/lib/persistence/productPackaging.ts')
@@ -336,6 +359,14 @@ function verifySourceContracts() {
   assert.ok(
     predeploy.includes("'db/migrations/0086_product_packaging_profiles.sql'"),
     'Predeploy must require the product packaging profiles migration',
+  )
+  assert.ok(
+    predeploy.includes("'db/migrations/0087_operations_carrier_credentials.sql'"),
+    'Predeploy must require the operations carrier credential migration',
+  )
+  assert.ok(
+    predeploy.includes("'db/migrations/0088_operations_sandbox_rating_and_mock_retirement.sql'"),
+    'Predeploy must require the sandbox rating and mock retirement migration',
   )
 }
 
@@ -416,6 +447,7 @@ async function verifyCarrierTransport() {
 }
 
 async function verifyRouteBehavior() {
+  delete process.env.CLAWPILOT_OPERATIONS_PROOF_ENABLED
   class OperationsRequestError extends Error {
     constructor(code, message, status = 400) {
       super(message)
@@ -569,6 +601,15 @@ async function verifyRouteBehavior() {
       country: 'us',
     },
   }
+  const disabledProof = await route.POST(request('http://localhost/api/operations', {
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'run-proof-order', proof }),
+  }))
+  assert.equal(disabledProof.status, 404)
+  assert.equal((await payload(disabledProof)).code, 'OPERATIONS_PROOF_DISABLED')
+  assert.equal(calls.proofs.length, 0)
+
+  process.env.CLAWPILOT_OPERATIONS_PROOF_ENABLED = 'true'
   const deniedWrite = await route.POST(request('http://localhost/api/operations', {
     actor: { ...actor, capabilities: { canView: true, canManage: true, canExecute: false, canActivate: false } },
     headers: { 'Content-Type': 'application/json' },
@@ -830,6 +871,7 @@ async function verifyRouteBehavior() {
   }))
   assert.equal(noWorkspace.status, 409)
   assert.equal((await payload(noWorkspace)).code, 'ACTIVE_ORGANIZATION_REQUIRED')
+  delete process.env.CLAWPILOT_OPERATIONS_PROOF_ENABLED
 }
 
 function postgresMock(pool) {
@@ -1375,7 +1417,9 @@ async function verifyPostgresAcceptance(databaseUrl) {
     assert.equal(workspace.selectedOrder.billableEvents.length, 4)
     assert.equal(workspace.summary.openOrders, 0)
     assert.equal(workspace.summary.shippedToday, 1)
-    assert.equal(workspace.summary.availableUnits, 10)
+    // Test-only MOCK-01 stock remains available to the internal harness but is
+    // deliberately absent from hosted workbench inventory projections.
+    assert.equal(workspace.summary.availableUnits, 0)
     assert.equal(workspace.summary.reservedUnits, 0)
     assert.equal(workspace.summary.unbilledMinor, '1472')
 

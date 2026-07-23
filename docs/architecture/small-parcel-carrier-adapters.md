@@ -111,11 +111,13 @@ ClawPilot never falls back to another organization's credentials or to a platfor
 
 OAuth access tokens remain server-side, short-lived, and cached by provider/account/environment. Rotation creates auditable credential metadata without exposing the credential value. Test credentials cannot be selected by a production shipment command.
 
-### Implemented Credential Boundary
+### Implemented Credential And Sandbox Rating Boundary
 
 Migration `0087_operations_carrier_credentials.sql` adds the organization-scoped encrypted companion record for direct UPS REST, FedEx REST, and USPS REST integration accounts. **Settings > Integrations > Shipping** verifies a candidate through the provider's fixed OAuth endpoint before writing AES-256-GCM ciphertext. Authenticated encryption includes organization, provider, and environment; API responses expose only masked suffixes, verification state, credential version, safe error code, and timestamps. Enabling an account re-verifies it, while disconnect removes ciphertext and disables the non-secret integration record. Access tokens are intentionally discarded after verification.
 
-This is credential readiness only. The canonical rating, shipping, label, void, tracking, provider-attempt, token-cache, and reconciliation adapters remain release-gated below. An active credential record is necessary but not sufficient evidence for a live shipping capability.
+Migration `0088_operations_sandbox_rating_and_mock_retirement.sql` adds an append-only `grq` sandbox-rate evidence record. An organization manager may run one server-defined UPS CIE or FedEx Sandbox rate request from **Settings > Integrations > Shipping** only when that provider's sandbox credential is active and verified. The fixture is fixed to John Doe, `101 Jegs Place, Delaware, OH 43015` to John Doe, `101 Academy Drive, Buzzards Bay, MA 02532`, with one `Test Product` parcel measuring `12 x 10 x 6 in` and weighing `5 lb`. The browser receives only normalized service, price, currency, transit, delivery, provider reference, and the evidence Global ID. The request hash and redacted request/response summaries are retained; credentials, access tokens, account numbers, and raw provider bodies are not.
+
+This release boundary is **rating only**. It exposes no shipping, label, void, pickup, manifest, tracking, or document action and refuses production credentials. Label and pickup testing require a later sandbox-only command boundary with durable intent, automatic void or cancellation, unknown-outcome reconciliation, and operator-visible evidence before those controls may be enabled. A successful sandbox rate is provider connectivity evidence, not certification for production shipping.
 
 ## Health And Reconciliation
 

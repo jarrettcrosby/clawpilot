@@ -17,6 +17,10 @@ export type CarrierCredentialVerification = {
   scope: string | null
 }
 
+export type CarrierAccessToken = CarrierCredentialVerification & {
+  accessToken: string
+}
+
 export class CarrierCredentialClientError extends Error {
   readonly status: number
   readonly code: string
@@ -112,10 +116,10 @@ function responseError(status: number) {
   )
 }
 
-export async function verifyCarrierCredential(
+export async function requestCarrierAccessToken(
   input: CarrierRuntimeCredential,
   options: { fetchImpl?: typeof fetch; timeoutMs?: number } = {},
-): Promise<CarrierCredentialVerification> {
+): Promise<CarrierAccessToken> {
   const fetchImpl = options.fetchImpl || fetch
   const timeoutMs = Math.max(1_000, Math.min(options.timeoutMs || 8_000, 15_000))
   const controller = new AbortController()
@@ -158,6 +162,7 @@ export async function verifyCarrierCredential(
     return {
       provider: input.provider,
       environment: input.environment,
+      accessToken: payload.access_token,
       expiresInSeconds: Number.isFinite(expiresIn) && expiresIn > 0 ? expiresIn : null,
       scope: typeof payload.scope === 'string' ? payload.scope.slice(0, 512) : null,
     }
@@ -177,6 +182,19 @@ export async function verifyCarrierCredential(
     )
   } finally {
     clearTimeout(timeout)
+  }
+}
+
+export async function verifyCarrierCredential(
+  input: CarrierRuntimeCredential,
+  options: { fetchImpl?: typeof fetch; timeoutMs?: number } = {},
+): Promise<CarrierCredentialVerification> {
+  const token = await requestCarrierAccessToken(input, options)
+  return {
+    provider: token.provider,
+    environment: token.environment,
+    expiresInSeconds: token.expiresInSeconds,
+    scope: token.scope,
   }
 }
 
