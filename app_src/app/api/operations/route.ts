@@ -13,11 +13,14 @@ import type {
 } from '@/lib/operations/types'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import {
+  confirmOperationsOrderPicksFromPostgres,
   OperationsRequestError,
   readOperationsWorkspaceFromPostgres,
+  releaseOperationsOrderFromPostgres,
   runMockOperationsProofFromPostgres,
   updateOperationsActivationInPostgres,
   updateOperationsExceptionInPostgres,
+  verifyOperationsOrderPackFromPostgres,
 } from '@/lib/persistence/operations'
 import { requireRequestUser } from '@/lib/requestUser'
 
@@ -42,7 +45,7 @@ const ACTIVATION_STATES = new Set<OperationsActivationState>([
 ])
 const PROOF_FIELDS = new Set([
   'customerGlobalId', 'lines', 'productGlobalId', 'externalOrderId', 'orderNumber',
-  'quantity', 'openingQuantity', 'requestedDeliveryAt', 'shipTo',
+  'quantity', 'openingQuantity', 'requestedDeliveryAt', 'shipTo', 'executionMode',
 ])
 const PROOF_LINE_FIELDS = new Set(['productGlobalId', 'quantity', 'openingQuantity'])
 const ADDRESS_FIELDS = new Set(['name', 'line1', 'line2', 'city', 'region', 'postalCode', 'country'])
@@ -61,6 +64,16 @@ function requestError(code: string, message: string, status = 400): never {
 function requirePostgres() {
   if (!isPostgresStorageEnabled()) {
     requestError('OPERATIONS_POSTGRES_REQUIRED', 'Operations requires Postgres storage', 503)
+  }
+}
+
+function requireOperationsProofFixture() {
+  if (process.env.CLAWPILOT_OPERATIONS_PROOF_ENABLED !== 'true') {
+    requestError(
+      'OPERATIONS_PROOF_DISABLED',
+      'The hosted proof-order fixture is disabled',
+      404,
+    )
   }
 }
 
@@ -162,6 +175,10 @@ function proofLinesValue(input: Record<string, unknown>): MockOperationsProofLin
 function proofValue(value: unknown): MockOperationsProofInput {
   const input = record(value, 'OPERATIONS_REQUEST_INVALID', 'Proof order')
   assertFields(input, PROOF_FIELDS, 'OPERATIONS_REQUEST_INVALID', 'Proof order')
+  const executionMode = textValue(input.executionMode, 'Proof execution mode', 20, false) || 'planned'
+  if (!['planned', 'shipped'].includes(executionMode)) {
+    requestError('OPERATIONS_REQUEST_INVALID', 'Proof execution mode is invalid')
+  }
   return {
     customerGlobalId: globalIdValue(input.customerGlobalId, 'CRM customer', CUSTOMER_GLOBAL_ID),
     lines: proofLinesValue(input),
@@ -169,7 +186,16 @@ function proofValue(value: unknown): MockOperationsProofInput {
     orderNumber: textValue(input.orderNumber, 'Order number', 100),
     requestedDeliveryAt: requestedDeliveryValue(input.requestedDeliveryAt),
     shipTo: addressValue(input.shipTo),
+    executionMode: executionMode as MockOperationsProofInput['executionMode'],
   }
+}
+
+function idempotencyKeyValue(req: NextRequest): string {
+  const key = String(req.headers.get('idempotency-key') || '').trim()
+  if (!/^[A-Za-z0-9._:-]{8,200}$/.test(key)) {
+    requestError('OPERATIONS_IDEMPOTENCY_KEY_INVALID', 'A valid Idempotency-Key header is required')
+  }
+  return key
 }
 
 async function requestBody(req: NextRequest): Promise<Record<string, unknown>> {
@@ -259,10 +285,11 @@ export async function POST(req: NextRequest) {
     const body = await requestBody(req)
     const action = textValue(body.action, 'Operations action', 50)
     if (action === 'run-proof-order') {
+      requireOperationsProofFixture()
       if (!capabilities.canManage || !capabilities.canExecute) {
         return json({
           ok: false,
-          error: 'You do not have permission to prepare and execute warehouse operations',
+          error: 'You do not have permission to prepare warehouse operations',
           code: 'OPERATIONS_EXECUTE_REQUIRED',
         }, 403)
       }
@@ -273,6 +300,78 @@ export async function POST(req: NextRequest) {
         proof: proofValue(body.proof),
       })
       return json({ ok: true, capabilities, result }, result.duplicate ? 200 : 201)
+    }
+    if (action === 'release-order') {
+      if (!capabilities.canManage || !capabilities.canExecute) {
+        return json({
+          ok: false,
+          error: 'You do not have permission to release warehouse work',
+          code: 'OPERATIONS_EXECUTE_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set(['action', 'orderGlobalId', 'expectedRowVersion', 'reason']),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
+      const result = await releaseOperationsOrderFromPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        orderGlobalId: globalIdValue(body.orderGlobalId, 'Operations order', ORDER_GLOBAL_ID),
+        expectedRowVersion: integerValue(body.expectedRowVersion, 'Order version', 0, 2_147_483_647),
+        reason: textValue(body.reason, 'Release reason', 500),
+        idempotencyKey: idempotencyKeyValue(req),
+      })
+      return json({ ok: true, capabilities, result })
+    }
+    if (action === 'confirm-picks') {
+      if (!capabilities.canManage || !capabilities.canExecute) {
+        return json({
+          ok: false,
+          error: 'You do not have permission to confirm warehouse picks',
+          code: 'OPERATIONS_EXECUTE_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set(['action', 'orderGlobalId', 'expectedRowVersion', 'reason']),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
+      const result = await confirmOperationsOrderPicksFromPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        orderGlobalId: globalIdValue(body.orderGlobalId, 'Operations order', ORDER_GLOBAL_ID),
+        expectedRowVersion: integerValue(body.expectedRowVersion, 'Order version', 0, 2_147_483_647),
+        reason: textValue(body.reason, 'Pick confirmation reason', 500),
+        idempotencyKey: idempotencyKeyValue(req),
+      })
+      return json({ ok: true, capabilities, result })
+    }
+    if (action === 'verify-pack') {
+      if (!capabilities.canManage || !capabilities.canExecute) {
+        return json({
+          ok: false,
+          error: 'You do not have permission to verify warehouse packages',
+          code: 'OPERATIONS_EXECUTE_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set(['action', 'orderGlobalId', 'expectedRowVersion', 'reason']),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
+      const result = await verifyOperationsOrderPackFromPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        orderGlobalId: globalIdValue(body.orderGlobalId, 'Operations order', ORDER_GLOBAL_ID),
+        expectedRowVersion: integerValue(body.expectedRowVersion, 'Order version', 0, 2_147_483_647),
+        reason: textValue(body.reason, 'Package verification reason', 500),
+        idempotencyKey: idempotencyKeyValue(req),
+      })
+      return json({ ok: true, capabilities, result })
     }
     if (action === 'update-exception') {
       if (!capabilities.canManage) {

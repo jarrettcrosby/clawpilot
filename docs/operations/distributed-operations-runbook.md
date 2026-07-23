@@ -13,13 +13,64 @@ app_visible: false
 
 ## Status And Scope
 
-This runbook governs the target distributed order, inventory, warehouse, carrier, printing, shipment, and 3PL billing module. The development environment has a Postgres-backed mock proof workbench, an audited exception queue, organization-scoped activation, command-receipt health, and disposable PostgreSQL acceptance. This runbook remains `draft` until the module has complete reconciliation and adapter health, tested production adapters, integration/warehouse activation subscopes, and on-call ownership. Current general environment, backup, promotion, and restore procedures remain authoritative:
+This runbook governs the target distributed order, inventory, warehouse, carrier, printing, shipment, and 3PL billing module. The development environment has a Postgres-backed order workbench, explicit warehouse-release, bulk all-ready pick-confirmation, and pack-verification commands for eligible non-archived orders, a shared product/default-package import workflow, an audited exception queue, organization-scoped activation, direct carrier credential administration, UPS and FedEx sandbox rating against a fixed synthetic fixture, append-only redacted rate evidence, command-receipt health, and disposable PostgreSQL acceptance. Deterministic mock flows are automated-test evidence only and cannot be launched from the hosted workbench. This runbook remains `draft` until the module has complete reconciliation and adapter health, tested production adapters, integration/warehouse activation subscopes, and on-call ownership. Current general environment, backup, promotion, and restore procedures remain authoritative:
 
 - [ClawPilot Environments and Deployment](clawpilot-environments.md)
 - [Railway Postgres Backups](railway-postgres-backups.md)
 - [Agent Security and Integration Isolation](agent-security-and-isolation.md)
 
-Migrations `0081` and `0082` and the mock workbench are development evidence only. Do not use this document as evidence that an operations worker, production provider integration, checkout callback, enrolled print agent, or live warehouse workflow is deployed.
+Migrations `0081`, `0082`, `0084`, `0085`, `0086`, `0087`, and `0088` are bounded development evidence only. Do not use this document as evidence that an operations worker, production provider integration, checkout callback, enrolled print agent, or live warehouse workflow is deployed. Migration `0088` archives legacy mock orders, releases their reservations, hides them from active workbench projections, disables mock integration/facility records, and retains immutable evidence rather than deleting it.
+
+## Direct Carrier Credential Procedure
+
+1. Confirm the active workspace before opening **Settings > Integrations > Shipping**. Carrier accounts belong to that organization only. The organization owner or a user with explicit **Manage operations** permission may manage them; that permission does not expose unrelated integrations.
+2. Select UPS, FedEx, or USPS and select **Sandbox / developer** or **Production**. The developer selection uses UPS CIE, FedEx Sandbox, or USPS TEM. ClawPilot fixes those hosts server-side; do not enter a provider host or reuse production credentials. Configure and prove the developer workflow before production whenever the provider offers it.
+3. Enter the provider client ID and client secret. Enter the billing account number for UPS or FedEx; it is optional for USPS. Do not paste credentials into tickets, chat, logs, documents, or source files.
+4. Use **Save and verify**. ClawPilot calls only the provider's allowlisted OAuth endpoint before atomically storing encrypted credential material. A rejection leaves the previous stored credential unchanged.
+5. Confirm the permanent `gia` integration identity, masked suffixes, incremented credential version, `Verified` state, and `Disabled` state for a first-time connection. The browser never receives the stored credential or short-lived access token.
+6. Use **Test connection** after any provider-side permission, account, or secret change. Do not enable a failed or unverified account.
+7. Enable the account only after verification and only in the intended environment. Enabling re-runs verification. Developer and production credentials are stored, versioned, verified, and enabled independently; a developer record cannot satisfy a production adapter.
+8. Rotate by entering the full replacement credential and selecting **Save and verify**. The previous ciphertext is replaced only after the candidate verifies, and the audit log records rotation metadata without a secret.
+9. Use **Disconnect** only after confirming the organization, provider, and environment. Disconnect deletes encrypted credential material and disables the integration metadata; it does not delete immutable historical shipment evidence.
+
+Credential verification is not shipping certification. The only currently authorized provider call is the fixed UPS or FedEx sandbox rate test below. Do not activate production rating, label purchase, void, manifest, pickup, tracking, or any carrier side effect until the corresponding adapter, provider attempts, unknown-outcome reconciliation, and authorized smoke test pass the release gate in the [small parcel architecture](../architecture/small-parcel-carrier-adapters.md).
+
+## UPS And FedEx Sandbox Rate Test
+
+1. Confirm the active workspace and open **Settings > Integrations > Shipping**.
+2. Select UPS or FedEx and **Sandbox / developer**. Confirm that the sandbox credential is active and verified. Production credentials are rejected by this action.
+3. Review the immutable fixture shown in the panel: John Doe at `101 Jegs Place, Delaware, OH 43015` to John Doe at `101 Academy Drive, Buzzards Bay, MA 02532`, with one `Test Product` parcel measuring `12 x 10 x 6 in` and weighing `5 lb`.
+4. Select **Test sandbox rate** once. The request performs rating only. It cannot create a shipment, label, pickup, manifest, tracking record, carrier charge, or print job.
+5. Record the returned `grq` evidence Global ID and review only normalized service, amount, currency, transit, and delivery values. Do not copy credentials, tokens, account numbers, or raw provider payloads into operating notes.
+6. A failure may be retried only after reviewing its safe error and provider/account status. The append-only evidence preserves each attempt without storing secrets or a full address payload.
+7. Stop after rating. Label and pickup tests are a later gated procedure and must automatically void or cancel every sandbox artifact, reconcile ambiguous outcomes, and retain proof of cancellation.
+
+## Product And Package Catalog
+
+1. Open **Pipeline**, select the intended pipeline, and open **Configure > Products**. Confirm the active workspace first; product and package records are organization scoped.
+2. Add one product manually or download the Products CSV template. Imports accept at most 500 data rows and 1 MB per file.
+3. For package-aware fulfillment, provide package name, type, unit of measure, units per package, length, width, height, and weight. Select **Metric** for centimeters and kilograms or **Imperial** for inches and pounds. Supply all four measurement fields together or leave all four empty. ClawPilot stores canonical millimeters and grams for deterministic cartonization and carrier requests while retaining the selected entry system.
+4. Import the CSV once and review the result. Valid rows are retained when other rows fail, and each failed row reports its source row number and reason.
+5. Confirm an existing product was updated rather than duplicated. Matching uses SKU first when present and then case-insensitive product name. A conflicting name/SKU pair is rejected for review.
+6. Open the product again and verify the permanent `gp` product identity and default `gpp` package profile. A later team edit must retain both identities and increment package evidence rather than create a second default profile.
+7. Disable the package profile when its measurements must not drive fulfillment. The product may remain active for sales while fulfillment uses the clearly identified fallback until corrected package data is approved.
+
+Only authorized pipeline editors can import or change the catalog. Viewers can inspect it but cannot mutate it. The current slice supports one default package profile per product; do not model alternate cartons, facility packs, or supplier-specific packs as duplicate products.
+
+## Planned Order, Warehouse Release, Pick Confirmation, And Pack Verification
+
+1. Open **Operations**, select **Orders**, and open an eligible non-archived order received through an approved commerce boundary. The hosted workbench does not create proof orders; deterministic mock generation is reserved for automated tests.
+2. Open the planned order and verify the customer, lines, warehouse plan, reservation and allocation quantities, package and selected-rate evidence, promise, and estimated cost/revenue/margin.
+3. Resolve every open high or critical exception before release. Do not bypass an incomplete reservation or allocation with direct SQL.
+4. Use **Release to warehouse**, record a specific operational reason, and submit once. The client keeps one idempotency key for safe retries of that release attempt.
+5. On success, confirm the order and selected plan are `released`, exactly one released wave exists, and the expected pick tasks are `ready`.
+6. Verify that every expected task is ready and that the displayed pick count matches the order lines. **Confirm all picks** is intentionally unavailable for partial, short, blocked, or already confirmed work.
+7. Use **Confirm all picks**, record a specific operational reason, and submit once. The client keeps one idempotency key for safe retries. The command rechecks the exact order version, released plan and wave, all ready picks, active organization, inventory positions, and blocking exceptions before changing state.
+8. On success, confirm the order is `picking`, the wave is `completed`, every pick task is `picked`, and the active reservation remains intact for the later pack/ship consumption command.
+9. Verify the package details and use **Verify pack** only after every required pick is complete. Record a specific operational reason and submit once. The command rechecks the exact order version, selected plan, wave, picks, package state, active organization, blocking exceptions, and command receipt before changing state.
+10. On success, confirm the order and package are `packed`, one pack-fee billable event exists for each applicable directive, the active reservation remains retained for shipment consumption, and no shipment, label, or print job was created.
+11. If the screen reports a stale version, reload and re-review the current evidence before issuing a new command. Never change the idempotency key merely to bypass an uncertain result.
+12. Current operator capability stops after deterministic pack verification. Scanner claims, per-task scans, short-pick handling, label purchase, printing, and shipment confirmation remain unavailable until their explicit commands and reconciliation controls pass Phase 4 acceptance.
 
 ## Exception Queue Procedure
 
@@ -41,6 +92,7 @@ Exception updates require operations-management permission. They never alter imm
 6. Preserve Global IDs, correlation ID, idempotency key, adapter version, provider reference, timestamps, and safe error code during diagnosis.
 7. Keep credentials, full addresses, customs data, raw labels, and unrestricted provider payloads out of tickets, chat, logs, audit payloads, and this repository.
 8. Database restore is a last-resort coordinated recovery. Application defects use feature containment and code rollback; isolated data defects use compensating commands or later migrations.
+9. Require each customer organization to configure and verify separate credentials for every enabled carrier and sandbox or production environment. Never substitute another organization's or a platform-wide account when credentials are absent, disabled, unverified, or environment-mismatched.
 
 ## Required Operating Roles
 
@@ -77,7 +129,7 @@ The existing endpoints remain required:
 - `/api/persistence/status`: Postgres driver, reachability, and non-empty environment database fingerprint.
 - `/api/health`: migration, worker, provider, queue, and dependency health.
 
-Current `/api/health` reports the `0081`/`0082` migration state, command failures, stale processing, and active/shadow organization counts. Before production activation it must additionally report:
+Current `/api/health` reports the `0081`/`0082`/`0084`/`0085`/`0086` migration state, command failures, stale processing, and active/shadow organization counts. Before production activation it must additionally report:
 
 - foundation and corrective migration applied/checksum state;
 - activation state by cohort without exposing credentials;
@@ -371,6 +423,8 @@ This query reflects the `0081` draft. The final model must separate immutable ch
 - Never manually relax a promise or ownership constraint. An override creates a new plan version and exception with financial effect.
 
 ### Carrier Timeout Or Unknown Label Outcome
+
+Provider behavior, capability, credential, timeout, response, and certification boundaries are defined in the [small parcel carrier adapter architecture](../architecture/small-parcel-carrier-adapters.md). RocketShipIt is an optional provider transport; it does not change the durable command and reconciliation requirements below.
 
 **Contain**
 

@@ -15,7 +15,7 @@ app_visible: false
 
 Provide native distributed order management, warehouse execution, carrier shipping, and 3PL billing inside ClawPilot. The module serves 3PL operators, retailers, distributors, manufacturers, and fulfillment operators without creating a second application or duplicating CRM, product, identity, audit, task, document, notification, or accounting masters.
 
-This document remains the **target contract** for the full module. The current development slice includes migrations `0081_distributed_operations_foundation.sql` and `0082_operations_activation_and_command_safety.sql`, a tenant-scoped order workbench, a deterministic 20-step mock order-to-ship proof, a durable exception queue, scoped activation controls, canonical CRM catalog projection, provider-customer resolution, and command receipts. These features prove PostgreSQL authority and application boundaries; they do not establish a production commerce, carrier, printer, optimizer, warehouse, or accounting provider.
+This document remains the **target contract** for the full module. The current development slice includes migrations `0081_distributed_operations_foundation.sql`, `0082_operations_activation_and_command_safety.sql`, `0084_operations_command_results.sql`, `0085_operations_package_workflow.sql`, `0086_product_packaging_profiles.sql`, `0087_operations_carrier_credentials.sql`, and `0088_operations_sandbox_rating_and_mock_retirement.sql`; a tenant-scoped order workbench; explicit idempotent warehouse-release, bulk all-ready pick-confirmation, and pack-verification commands for eligible non-archived orders; a durable exception queue; scoped activation controls; canonical CRM catalog projection; provider-customer resolution; team-managed product/package imports; organization-scoped direct carrier credential administration; UPS and FedEx sandbox rating against one server-defined synthetic fixture; append-only redacted rate evidence; and exact command-result receipts. The deterministic 20-step mock flow remains an internal automated-test harness only. Hosted mock generation is disabled and historical mock artifacts are archived. These features prove PostgreSQL authority and application boundaries; they do not establish a production commerce, shipping, label, pickup, printer, optimizer, warehouse, or accounting provider.
 
 ## Current Development Slice
 
@@ -24,15 +24,31 @@ The implemented slice provides:
 - Postgres-only operations access scoped to the active workspace and explicit `viewOperations`, `manageOperations`, and execution permissions;
 - CRM organization and `gp` product resolution without cloning customer or catalog masters;
 - one explicit CRM data pipeline per workspace, deduplicated customer and product catalogs by permanent Global ID, and deterministic provider-customer matching with review-required staging for ambiguous or unmatched identities;
-- idempotent mock order import, reservation, deterministic warehouse planning, cartonization, carrier selection, pick/pack/ship, inventory-ledger evidence, billable facts, domain events, audit, and fulfillment outbox intent;
+- an internal test-only deterministic order, reservation, planning, cartonization, carrier, and print harness that cannot create hosted workspace records without an explicit automated-test feature flag;
+- operator-controlled warehouse release with exact-version concurrency, readiness and exception checks, one released wave, ready pick tasks, domain event, audit evidence, and replay-safe command receipts;
+- operator-controlled bulk pick confirmation with exact-version concurrency, affected-position locks, all-ready validation, one completed wave, picked tasks, retained reservations, immutable pick ledger evidence, domain event, audit evidence, and replay-safe exact result payloads;
+- operator-controlled pack verification with exact-version concurrency, released-plan and completed-pick validation, one packed package, retained reservations for shipment consumption, immutable pack-fee evidence, domain event, audit evidence, and replay-safe exact result payloads;
+- a shared CRM product catalog that authorized pipeline editors can maintain individually or import from CSV, with a permanent `gp` product identity, duplicate prevention by SKU or case-insensitive name, per-row validation, and bounded partial-import results;
+- one organization-scoped default package profile per product in this slice, with permanent `gpp` identity, package type, unit of measure, units per package, preferred metric or imperial entry system, dimensions, weight, active state, source, optimistic row version, and audit history; fulfillment planning consumes canonical millimeters and grams from the active profile and records its provenance, while products without a profile retain the explicit conservative fallback;
+- archived legacy hosted mock proof records with reservations released and immutable ledger, domain-event, audit, billable, and Global ID evidence retained;
 - organization-scoped `disabled`, `shadow`, `read_only`, `active`, and `frozen` activation state with revision, reason, actor, and audit history;
-- durable command receipts that bind idempotency key, request hash, actor, correlation, status, result, attempts, and safe failure evidence;
+- organization-, provider-, and environment-scoped UPS REST, FedEx REST, and USPS REST credential administration with candidate OAuth verification, AES-256-GCM persistence, masked metadata, rotation versions, audited activation and disconnect, and no cross-tenant or production/sandbox fallback;
+- manager-triggered UPS CIE and FedEx Sandbox rating for one fixed John Doe route and `Test Product` parcel, with normalized safe results and append-only redacted `grq` evidence; production rating and every transactional carrier action remain disabled;
+- durable command receipts that bind idempotency key, request hash, actor, correlation, status, exact result payload, attempts, and safe failure evidence;
 - responsive Orders and Exceptions views with permanent `gor` and `gex` identities;
 - audited exception transitions for acknowledge, resolve, dismiss, and reopen, with tenant isolation and retained resolution history;
-- an in-module guide that clearly labels all active providers as mocks;
+- an in-module guide that directs carrier sandbox testing to **Settings > Integrations > Shipping** and identifies deterministic mocks as automated-test-only;
 - disposable PostgreSQL acceptance coverage that applies the full migration chain and validates atomic writes, replay, rollback, append-only evidence, money totals, and cross-workspace isolation.
 
-Production activation remains out of scope until later delivery gates verify provider credentials, webhook receipts, provider attempts, reconciliation, complete operational health, recovery commands, and an explicitly approved integration and warehouse cohort.
+Production activation remains out of scope until later delivery gates verify provider credentials, webhook receipts, provider attempts, reconciliation, complete operational health, recovery commands, and an explicitly approved integration and warehouse cohort. Sandbox rating evidence does not authorize production rating, label creation, pickup scheduling, or shipment confirmation.
+
+### Product And Package Catalog Workflow
+
+The shared catalog is managed from **Pipeline > Configure > Products** because CRM products remain the product authority for both sales and operations. An authorized editor may add or update one product at a time or import a CSV containing at most 500 rows and 1 MB. The product template includes name, SKU, type, category, status, price, cost, currency, URL, description, active state, package name, package type, unit of measure, units per package, measurement system, length, width, height, weight, and package active state. Metric entry uses centimeters and kilograms; imperial entry uses inches and pounds. The service converts both to canonical millimeters and grams for cartonization and carrier adapters while retaining the team's preferred entry system.
+
+An import updates an existing product when its SKU matches case-insensitively or, when no SKU resolves it, its name matches case-insensitively. A product name and SKU cannot identify different existing records. Every invalid row is reported without discarding valid rows, and spreadsheet-formula-prefixed text is rejected. Package length, width, height, and weight must be supplied together. Team edits reuse the same product and default package Global IDs, increment the package row version, and append audit evidence instead of creating duplicate catalog records.
+
+The current vertical slice intentionally maintains one editable default package profile per product. The schema leaves room for multiple named profiles and facility-specific packaging in a later cartonization slice, but the application must not imply that those choices are available yet.
 
 Normative terms in this document use **must** for an invariant, **should** for the default, and **may** for an allowed option.
 
@@ -491,7 +507,7 @@ Each adapter declares versioned capabilities: authentication, webhook verificati
 
 ### Carrier Provider
 
-Each adapter declares accounts, services, negotiated/published rates, transit estimates, address validation, labels, voids, tracking, manifests, pickups, customs, proof of delivery, idempotency, and reconciliation capabilities. USPS, UPS, and FedEx are initial targets. Calls use controlled parallelism, per-provider timeout and circuit-breaker policy, bounded response storage, and exact account/service snapshots.
+Each adapter declares accounts, services, negotiated/published rates, transit estimates, address validation, labels, voids, tracking, manifests, pickups, customs, proof of delivery, idempotency, and reconciliation capabilities. USPS, UPS, and FedEx are initial direct targets. RocketShipIt is an optional aggregator behind the same canonical boundary, not a replacement shipment master. Calls use controlled parallelism, per-provider timeout and circuit-breaker policy, bounded response storage, exact account/service snapshots, canonical millimeters/grams, and exact money conversion. The [small parcel carrier adapter architecture](../architecture/small-parcel-carrier-adapters.md) defines provider boundaries, side-effect safety, secret handling, and certification gates.
 
 ### Printer Gateway
 

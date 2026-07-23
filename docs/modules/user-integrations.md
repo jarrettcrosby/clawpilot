@@ -1,11 +1,11 @@
 ---
 id: cp-module-user-integrations
 title: User Integrations and Credentials
-summary: Per-user Maton connections, organization QuickBooks and Toast access, Google Workspace administration, managed resources, and credential controls.
+summary: Per-user Maton connections, organization QuickBooks, Toast, and carrier access, Google Workspace administration, managed resources, and credential controls.
 status: active
 kind: module-contract
 area: integrations
-tags: [integrations, maton, quickbooks, toast, google-workspace, credentials, tenancy]
+tags: [integrations, maton, quickbooks, toast, carriers, google-workspace, credentials, tenancy]
 app_visible: true
 ---
 
@@ -57,6 +57,17 @@ Keep user-owned Maton accounts separate from the platform Google Workspace crede
 - Selected Toast locations can map accounting categories to active QuickBooks accounts. Mapping changes are organization-scoped and audited.
 - Disconnecting or rebinding clears cached provider catalog rows and invalidates stale accounting mappings. Provider writes remain disabled. See [QuickBooks Accounting Connector](quickbooks-accounting.md).
 
+## Small Parcel Carrier Account Contract
+
+- **Settings > Integrations > Shipping** is organization scoped. The organization owner or a user with explicit **Manage operations** permission can manage direct UPS, FedEx, and USPS credentials. That permission exposes Shipping without exposing Google, QuickBooks, Toast, or user-access administration.
+- Provider developer and production environments are separate account records. The developer selection resolves to UPS CIE, FedEx Sandbox, or USPS TEM through fixed server-side endpoints; operators cannot supply or override these hosts. A verified developer credential never enables a production shipment capability, and changing the active workspace never reuses the prior organization's carrier account.
+- Enter the provider client ID, client secret, and carrier billing account number. USPS does not require a billing account number in the current credential contract. ClawPilot verifies the candidate against the provider's fixed OAuth endpoint before saving it.
+- ClawPilot encrypts the complete credential with AES-256-GCM and binds authenticated encryption to the organization, provider, and environment. The browser receives only the permanent integration Global ID, masked client/account suffixes, credential version, verification state, safe error code, and timestamps.
+- OAuth access tokens are short lived and are neither returned to the browser nor stored in the credential table. Rotation replaces the encrypted credential, increments its version, and preserves an audit event without exposing the old or new secret.
+- A first-time saved credential remains disabled after verification. Enabling an account is a separate operator action and performs another provider verification. Rotation preserves a deliberate active or disabled state; recovery from a failed verification returns to disabled and requires explicit re-enable. A live carrier adapter must resolve an account that is both `active` and `verified`; there is no cross-organization or platform-account fallback.
+- **Disconnect** requires confirmation, removes encrypted credential material, and disables the non-secret integration account. Existing immutable shipment evidence remains intact.
+- This credential workflow does not by itself certify rating, label purchase, void, manifest, or tracking. Those capabilities remain unavailable until the named direct adapter passes its sandbox, failure-injection, reconciliation, and authorized live-smoke release gates.
+
 ## Managed Pipeline Resources
 
 - Provisioning is an explicit pipeline-owner command.
@@ -86,4 +97,5 @@ Use the [Google Workspace integration runbook](../operations/google-workspace-in
 5. Confirm Knowledge remains `Local` unless the owner deliberately enables `External` and the dedicated key is configured.
 6. Confirm each Toast access type reports its own verified state, selected locations are correct, and accounting output remains a draft.
 7. Confirm the QuickBooks company shown in Settings belongs to the active organization, catalog sync is current, and no financial posting controls are exposed.
-8. Rotate credentials through Settings or the owning server environment as appropriate; never add plaintext keys, private keys, OAuth tokens, or full connection IDs to documentation, logs, or release copy.
+8. Confirm each enabled carrier account belongs to the active organization, uses the intended sandbox or production environment, and reports `Verified`. Test the connection after provider-side rotation before enabling it.
+9. Rotate credentials through Settings or the owning server environment as appropriate; never add plaintext keys, private keys, OAuth tokens, carrier account numbers, or full connection IDs to documentation, logs, or release copy.

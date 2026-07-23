@@ -424,6 +424,7 @@ function DealDrawer({
         url: '',
         description: '',
         active: true,
+        packaging: null,
       })),
   ]
   const selectedOwner = owners.find((owner) => owner.id === form.ownerContactId)

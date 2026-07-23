@@ -1460,6 +1460,9 @@ for (const migration of [
   '0081_distributed_operations_foundation.sql',
   '0082_operations_activation_and_command_safety.sql',
   '0083_crm_interaction_contacts.sql',
+  '0084_operations_command_results.sql',
+  '0085_operations_package_workflow.sql',
+  '0086_product_packaging_profiles.sql',
 ]) {
   assertIncludes(healthRoute, migration, 'hosted POS and accounting migration health')
 }

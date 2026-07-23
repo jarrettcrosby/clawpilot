@@ -20,6 +20,15 @@ export type OperationsExceptionStatus = 'open' | 'acknowledged' | 'resolved' | '
 
 export type OperationsActivationState = 'disabled' | 'shadow' | 'read_only' | 'active' | 'frozen'
 
+export type OperationsOrderAction = 'release_to_warehouse' | 'confirm_picks' | 'verify_pack'
+
+export type OperationsOrderActionAvailability = {
+  action: OperationsOrderAction
+  label: string
+  enabled: boolean
+  blockedReason: string | null
+}
+
 export type CommerceCustomerMatchMethod =
   | 'external_id'
   | 'email'
@@ -74,6 +83,7 @@ export type CommerceOrderLineInput = {
   unitPriceMinor: number
   weightGrams: number
   dimensionsMm: Millimeters
+  unitsPerPackage?: number
 }
 
 export type CommerceOrderInput = {
@@ -95,8 +105,33 @@ export type PackagePlan = {
   lineExternalIds: string[]
 }
 
+export type SmallParcelCarrier = 'UPS' | 'FedEx' | 'USPS' | 'MockCarrier'
+
+export type CarrierProvider = 'ups_rest' | 'fedex_rest' | 'usps_rest' | 'rocketshipit' | 'mock'
+
+export type CarrierCapability =
+  | 'address_validation'
+  | 'rating'
+  | 'transit'
+  | 'label'
+  | 'void'
+  | 'tracking'
+  | 'manifest'
+  | 'pickup'
+  | 'customs_documents'
+  | 'proof_of_delivery'
+  | 'reconciliation'
+
+export type CarrierAdapterDescriptor = {
+  provider: CarrierProvider
+  adapterVersion: string
+  environment: 'mock' | 'sandbox' | 'production'
+  carriers: readonly SmallParcelCarrier[]
+  capabilities: readonly CarrierCapability[]
+}
+
 export type CarrierRate = {
-  carrier: 'UPS' | 'FedEx' | 'USPS' | 'MockCarrier'
+  carrier: SmallParcelCarrier
   serviceCode: string
   serviceName: string
   internalCostMinor: bigint
@@ -178,6 +213,65 @@ export type LabelResult = {
   payload: string
 }
 
+export type CarrierAddressValidationResult = {
+  valid: boolean
+  residential: boolean | null
+  normalizedAddress: Address | null
+  suggestions: Address[]
+  providerPayload: Record<string, unknown>
+}
+
+export type CarrierTransitEstimate = {
+  carrier: SmallParcelCarrier
+  serviceCode: string
+  serviceName: string
+  transitDays: number
+  estimatedDeliveryAt: string
+  guaranteed: boolean | null
+  providerPayload: Record<string, unknown>
+}
+
+export type CarrierVoidResult = {
+  voided: boolean
+  providerReference: string
+  providerPayload: Record<string, unknown>
+}
+
+export type CarrierTrackingActivity = {
+  status: string
+  occurredAt: string
+  location: string | null
+  description: string
+}
+
+export type CarrierTrackingResult = {
+  trackingNumber: string
+  status: string
+  estimatedDeliveryAt: string | null
+  deliveredAt: string | null
+  activities: CarrierTrackingActivity[]
+  providerPayload: Record<string, unknown>
+}
+
+export type CarrierManifestResult = {
+  providerManifestId: string
+  format: 'PDF' | 'PNG'
+  payload: string
+  providerPayload: Record<string, unknown>
+}
+
+export type CarrierPickupResult = {
+  providerPickupId: string
+  status: string
+  providerPayload: Record<string, unknown>
+}
+
+export type CarrierLabelReconciliationResult = {
+  outcome: 'found' | 'not_found' | 'unknown'
+  label: LabelResult | null
+  providerPayload: Record<string, unknown>
+}
+
 export type PrintResult = {
   accepted: boolean
   providerJobId: string
@@ -235,6 +329,16 @@ export type OperationsExceptionListItem = {
 export type OperationsOrderDetail = OperationsOrderListItem & {
   externalOrderId: string
   currency: string
+  rowVersion: number
+  planStatus: string | null
+  waveStatus: string | null
+  pickTaskCount: number
+  readyPickTaskCount: number
+  pickedPickTaskCount: number
+  packageCount: number
+  plannedPackageCount: number
+  packedPackageCount: number
+  availableActions: OperationsOrderActionAvailability[]
   shipTo: Address
   lines: Array<{
     globalId: string
@@ -321,6 +425,7 @@ export type MockOperationsProofInput = {
   openingQuantity?: number
   requestedDeliveryAt: string
   shipTo: Address
+  executionMode?: 'planned' | 'shipped'
 }
 
 export type MockOperationsProofResult = {
@@ -329,6 +434,13 @@ export type MockOperationsProofResult = {
   duplicate: boolean
   trackingNumber: string | null
   steps: string[]
+}
+
+export type OperationsOrderCommandResult = {
+  orderGlobalId: string
+  orderStatus: OperationsOrderStatus
+  rowVersion: number
+  replayed: boolean
 }
 
 export type OperationsExceptionUpdateResult = {
