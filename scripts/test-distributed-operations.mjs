@@ -593,6 +593,22 @@ function verifySourceContracts() {
     health.includes('row?.operations_carrier_accounts_gl_coding_migration_applied'),
     'Health migration status must include operations carrier accounts and GL coding',
   )
+  assert.ok(
+    health.includes("WHERE filename = '0091_operations_printer_configuration.sql'"),
+    'Health must require the operations printer configuration migration',
+  )
+  assert.ok(
+    health.includes('row?.operations_printer_configuration_migration_applied'),
+    'Health migration status must include operations printer configuration',
+  )
+  assert.ok(
+    health.includes("WHERE filename = '0092_operations_carrier_billing_integrity.sql'"),
+    'Health must require the carrier billing integrity migration',
+  )
+  assert.ok(
+    health.includes('row?.operations_carrier_billing_integrity_migration_applied'),
+    'Health migration status must include carrier billing integrity',
+  )
 
   const packaging = read('app_src/lib/persistence/productPackaging.ts')
   for (const fragment of [
@@ -662,6 +678,14 @@ function verifySourceContracts() {
   assert.ok(
     predeploy.includes("'db/migrations/0090_operations_carrier_accounts_and_gl_coding.sql'"),
     'Predeploy must require the operations carrier accounts and GL coding migration',
+  )
+  assert.ok(
+    predeploy.includes("'db/migrations/0091_operations_printer_configuration.sql'"),
+    'Predeploy must require the operations printer configuration migration',
+  )
+  assert.ok(
+    predeploy.includes("'db/migrations/0092_operations_carrier_billing_integrity.sql'"),
+    'Predeploy must require the carrier billing integrity migration',
   )
 }
 

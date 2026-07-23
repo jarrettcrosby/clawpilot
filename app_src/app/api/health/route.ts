@@ -237,6 +237,8 @@ export async function GET() {
           operations_sandbox_rating_migration_applied: boolean
           operations_rate_delegation_migration_applied: boolean
           operations_carrier_accounts_gl_coding_migration_applied: boolean
+          operations_printer_configuration_migration_applied: boolean
+          operations_carrier_billing_integrity_migration_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -612,6 +614,16 @@ export async function GET() {
                 FROM schema_migrations
                 WHERE filename = '0090_operations_carrier_accounts_and_gl_coding.sql'
               ) AS operations_carrier_accounts_gl_coding_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0091_operations_printer_configuration.sql'
+              ) AS operations_printer_configuration_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0092_operations_carrier_billing_integrity.sql'
+              ) AS operations_carrier_billing_integrity_migration_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -698,6 +710,8 @@ export async function GET() {
             && row?.operations_sandbox_rating_migration_applied
             && row?.operations_rate_delegation_migration_applied
             && row?.operations_carrier_accounts_gl_coding_migration_applied
+            && row?.operations_printer_configuration_migration_applied
+            && row?.operations_carrier_billing_integrity_migration_applied
             && row?.migration_checksums_present
           ),
         }
@@ -776,6 +790,8 @@ export async function GET() {
           || !row?.operations_sandbox_rating_migration_applied
           || !row?.operations_rate_delegation_migration_applied
           || !row?.operations_carrier_accounts_gl_coding_migration_applied
+          || !row?.operations_printer_configuration_migration_applied
+          || !row?.operations_carrier_billing_integrity_migration_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')

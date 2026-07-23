@@ -15,7 +15,7 @@ app_visible: false
 
 ClawPilot separates carrier-rate authority, carrier-account ownership, shipment matching, shipper assignment, and financial settlement. None can be inferred from CRM hierarchy or from another step succeeding.
 
-This is the contract for the current development slice. Migrations `0089_operations_rate_delegation_and_carrier_settlement.sql` and `0090_operations_carrier_accounts_and_gl_coding.sql` provide the working-tree foundation. The Operations workbench now exposes the selected-batch GL Coding runner, pinned routing-rule versions, and manual orphan assignment. This is not evidence of live carrier billing, final settlement, or accounting export. Provider mechanics remain behind the [small parcel carrier adapter boundary](small-parcel-carrier-adapters.md).
+This is the contract for the current development slice. Migrations `0089_operations_rate_delegation_and_carrier_settlement.sql` and `0090_operations_carrier_accounts_and_gl_coding.sql` provide the rate-network and operator-workbench foundation. Migration `0092_operations_carrier_billing_integrity.sql` binds each billing statement and charge to exact provider, environment, account, tracking, assignment, GL-run, reconciliation, and settlement evidence while preserving legacy rows for explicit backfill. The Operations workbench exposes the selected-batch GL Coding runner, pinned routing-rule versions, and manual orphan assignment. This is not evidence of a provider-specific live carrier-bill importer, final settlement approval, payout, or accounting export. Provider mechanics remain behind the [small parcel carrier adapter boundary](small-parcel-carrier-adapters.md), and the operator workflow is documented in [Printing, Carrier Billing, And GL Coding](../operations/printing-carrier-billing-and-gl-coding.md).
 
 ## Rate Network
 
@@ -108,7 +108,7 @@ A failed void or cancellation freezes further tests for that account until recon
 
 ## Remaining Delivery
 
-The working-tree foundation defines schema, append-only evidence, pure rate-path pricing, payer classification, statement grouping, selected-batch GL Coding, independent shipper assignment, manual orphan resolution, reconciliation calculations, multiple address-bound carrier-account administration, and least-privilege capability enforcement. It does not yet provide the production services that:
+The working-tree foundation defines schema, append-only evidence, pure rate-path pricing, payer classification, statement grouping, selected-batch GL Coding, independent shipper assignment, manual orphan resolution, reconciliation calculations, multiple address-bound carrier-account administration, exact actual-cost provenance, and least-privilege capability enforcement. New integrity constraints are initially `NOT VALID` where historical rows require an explicit evidence backfill; new writes are still checked. It does not yet provide the production services that:
 
 - parse and import provider-specific carrier CSV formats into immutable billing batches;
 - add rule simulation, accounting-catalog bindings, and GL dimensions beyond shipper assignment;

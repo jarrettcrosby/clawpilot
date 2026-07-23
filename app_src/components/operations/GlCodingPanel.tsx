@@ -474,6 +474,11 @@ export default function GlCodingPanel() {
   return (
     <Box sx={{ px: { xs: 2, md: 3 }, py: 2.5, minWidth: 0 }}>
       <Stack spacing={3} divider={<Divider flexItem />}>
+        <Alert severity="info">
+          Carrier files may include several account numbers. ClawPilot keeps quoted rates as pro forma evidence,
+          matches actual charges by provider, account, and tracking evidence, and leaves unsupported charges in
+          review. Assigning an orphan to a shipper never fabricates a shipment match.
+        </Alert>
         <Box component="section">
           <Stack direction="row" justifyContent="space-between" alignItems="center" gap={2} sx={{ mb: 1.5 }}>
             <Box>
