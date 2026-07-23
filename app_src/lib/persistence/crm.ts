@@ -2,13 +2,16 @@ import crypto from 'node:crypto'
 import type { PoolClient } from 'pg'
 import {
   contactIdentityKey,
+  contactNameIdentityKey,
   crmSourceHash,
+  normalizedCrmIdentityText,
   organizationIdentityKey,
   stableGlobalSuiteCrmId,
   stableSuiteCrmId,
 } from '@/lib/crm/stableId'
 import { crmDateOnly } from '@/lib/crm/dateOnly.mjs'
 import type {
+  CrmActivityStatus,
   CrmContact,
   CrmCampaign,
   CrmCampaignRecipient,
@@ -22,6 +25,7 @@ import type {
   CrmRecord,
   CrmSummary,
   SuiteCrmOutboxRecord,
+  SuiteCrmInteractionModule,
   SuiteCrmUserIdentityOutboxRecord,
 } from '@/lib/crm/types'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
@@ -64,6 +68,7 @@ type CommonStageInput = {
   pipelineId: string
   localId?: string | null
   sourceKey: string
+  fieldMode?: 'replace' | 'enrich'
   sourceSheetId?: string | null
   sourceRowNumber?: number | null
   sourcePayload?: Record<string, unknown>
@@ -247,6 +252,9 @@ export type StageInteractionInput = CommonStageInput & {
     parentSuiteCrmId?: string | null
     parentSuiteCrmType?: 'Accounts' | 'Contacts' | 'Leads' | 'Opportunities' | 'Meetings' | 'Campaigns'
     interactionType?: string
+    suiteCrmModule?: SuiteCrmInteractionModule | null
+    activityStatus?: CrmActivityStatus | null
+    durationMinutes?: number | null
     subject: string
     agentEmail?: string | null
     agentSuiteCrmUserId?: string | null
@@ -281,7 +289,7 @@ type CrmOutboxItemBase = {
 
 export type CrmOutboxItem = CrmOutboxItemBase & (
   | {
-    operation: 'upsert_record' | 'delete_record'
+    operation: 'upsert_record' | 'delete_record' | 'reproject_record'
     payload: SuiteCrmOutboxRecord
   }
   | {
@@ -292,6 +300,45 @@ export type CrmOutboxItem = CrmOutboxItemBase & (
 
 function clean(value: unknown) {
   return String(value ?? '').trim()
+}
+
+function normalizedInteractionType(value: unknown) {
+  const normalized = clean(value).toLowerCase().replace(/[_-]+/g, ' ').replace(/\s+/g, ' ')
+  if (normalized === 'call') return 'call'
+  if (normalized === 'meeting' || normalized === 'in person') return 'meeting'
+  if (normalized === 'email') return 'email'
+  if (normalized === 'campaign') return 'campaign'
+  if (normalized === 'note') return 'note'
+  return normalized
+}
+
+function interactionSuiteCrmModule(fields: StageInteractionInput['fields']): SuiteCrmInteractionModule | null {
+  if (fields.suiteCrmModule !== undefined) return fields.suiteCrmModule
+  const interactionType = normalizedInteractionType(fields.interactionType)
+  if (interactionType === 'call') return 'Calls'
+  if (interactionType === 'meeting') return fields.meetingId ? null : 'Meetings'
+  return 'Notes'
+}
+
+function interactionActivityStatus(fields: StageInteractionInput['fields']): CrmActivityStatus | null {
+  const moduleName = interactionSuiteCrmModule(fields)
+  if (moduleName !== 'Calls' && moduleName !== 'Meetings') return null
+  if (fields.activityStatus === 'planned' || fields.activityStatus === 'held' || fields.activityStatus === 'not_held') {
+    return fields.activityStatus
+  }
+  const deliveryStatus = clean(fields.deliveryStatus).toLowerCase().replace(/[_-]+/g, ' ')
+  if (['planned', 'queued', 'scheduled'].includes(deliveryStatus)) return 'planned'
+  if (['cancelled', 'canceled', 'failed', 'not held', 'missed'].includes(deliveryStatus)) return 'not_held'
+  const occurredAt = fields.occurredAt ? new Date(fields.occurredAt) : null
+  return occurredAt && Number.isFinite(occurredAt.getTime()) && occurredAt.getTime() > Date.now()
+    ? 'planned'
+    : 'held'
+}
+
+function interactionDurationMinutes(fields: StageInteractionInput['fields']) {
+  const requested = Number(fields.durationMinutes)
+  if (Number.isFinite(requested)) return Math.max(1, Math.min(Math.trunc(requested), 24 * 60))
+  return interactionSuiteCrmModule(fields) === 'Calls' ? 15 : 30
 }
 
 function uniqueUuidList(value: unknown) {
@@ -451,6 +498,26 @@ function suiteCrmAttributes(input: StageCrmRecordInput, referenceCode: string) {
     }
   }
   const fields = input.fields
+  const moduleName = interactionSuiteCrmModule(fields)
+  if (moduleName === 'Calls' || moduleName === 'Meetings') {
+    const duration = interactionDurationMinutes(fields)
+    const activityStatus = interactionActivityStatus(fields)
+    return {
+      ...globalId,
+      name: clean(fields.subject),
+      date_start: suiteCrmDateTime(fields.occurredAt),
+      duration_hours: Math.floor(duration / 60),
+      duration_minutes: duration % 60,
+      status: activityStatus === 'planned' ? 'Planned' : activityStatus === 'not_held' ? 'Not Held' : 'Held',
+      ...(moduleName === 'Calls' ? {
+        direction: clean(fields.direction).toLowerCase() === 'inbound' ? 'Inbound' : 'Outbound',
+      } : {}),
+      parent_type: fields.parentSuiteCrmId ? clean(fields.parentSuiteCrmType) : '',
+      parent_id: clean(fields.parentSuiteCrmId),
+      ...(fields.agentSuiteCrmUserId ? { assigned_user_id: clean(fields.agentSuiteCrmUserId) } : {}),
+      description: clean(fields.description),
+    }
+  }
   return {
     ...globalId,
     name: clean(fields.subject),
@@ -468,25 +535,71 @@ async function suiteCrmRelationships(
   input: StageCrmRecordInput,
 ): Promise<NonNullable<SuiteCrmOutboxRecord['relationships']>> {
   if (input.entity === 'interactions') {
-    const result = await client.query<{
-      link_field_name: 'contact'
-      related_module_name: 'Contacts'
-      related_bean_id: string
-    }>(
-      `SELECT 'contact'::text AS link_field_name, 'Contacts'::text AS related_module_name,
-         contact.suitecrm_id AS related_bean_id
-       FROM crm_interactions interaction
-       JOIN crm_contacts contact
-         ON contact.pipeline_id = interaction.pipeline_id
-        AND contact.id = interaction.contact_id
-       WHERE interaction.pipeline_id = $1::uuid
-         AND interaction.id = $2::uuid
-         AND contact.suitecrm_id IS NOT NULL`,
-      [input.pipelineId, input.localId || null],
-    )
-    // SuiteCRM Notes expose one canonical Contact relationship. ClawPilot keeps
-    // the complete contact set locally while the first selected contact remains
-    // the SuiteCRM-compatible primary relationship.
+    const moduleName = interactionSuiteCrmModule(input.fields)
+    const result = moduleName === 'Notes'
+      ? await client.query<{
+          link_field_name: 'contact'
+          related_module_name: 'Contacts'
+          related_bean_id: string
+        }>(
+          `SELECT 'contact'::text AS link_field_name, 'Contacts'::text AS related_module_name,
+             contact.suitecrm_id AS related_bean_id
+           FROM crm_interactions interaction
+           JOIN crm_contacts contact
+             ON contact.pipeline_id = interaction.pipeline_id
+            AND contact.id = interaction.contact_id
+           WHERE interaction.pipeline_id = $1::uuid
+             AND interaction.id = $2::uuid
+             AND contact.suitecrm_id IS NOT NULL`,
+          [input.pipelineId, input.localId || null],
+        )
+      : moduleName
+        ? await client.query<{
+            link_field_name: 'accounts' | 'contacts' | 'leads' | 'opportunity'
+            related_module_name: 'Accounts' | 'Contacts' | 'Leads' | 'Opportunities'
+            related_bean_id: string
+          }>(
+            `SELECT 'accounts'::text AS link_field_name, 'Accounts'::text AS related_module_name,
+               organization.suitecrm_id AS related_bean_id, 0 AS sort_order
+             FROM crm_organizations organization
+             WHERE organization.pipeline_id = $1::uuid
+               AND organization.id = $3::uuid
+               AND organization.suitecrm_id IS NOT NULL
+             UNION ALL
+             SELECT 'contacts', 'Contacts', contact.suitecrm_id, 10 + selected.sort_order
+             FROM crm_interaction_contacts selected
+             JOIN crm_contacts contact
+               ON contact.pipeline_id = selected.pipeline_id
+              AND contact.id = selected.contact_id
+             WHERE selected.pipeline_id = $1::uuid
+               AND selected.interaction_id = $2::uuid
+               AND contact.suitecrm_id IS NOT NULL
+             UNION ALL
+             SELECT 'leads', 'Leads', lead.suitecrm_id, 1000
+             FROM crm_leads lead
+             WHERE lead.pipeline_id = $1::uuid
+               AND lead.id = $4::uuid
+               AND lead.suitecrm_id IS NOT NULL
+             UNION ALL
+             SELECT 'opportunity', 'Opportunities', opportunity.suitecrm_id, 1001
+             FROM crm_opportunities opportunity
+             WHERE $6::boolean
+               AND opportunity.pipeline_id = $1::uuid
+               AND opportunity.id = $5::uuid
+               AND opportunity.suitecrm_id IS NOT NULL
+             ORDER BY sort_order, related_bean_id`,
+            [
+              input.pipelineId,
+              input.localId || null,
+              input.fields.organizationId || null,
+              input.fields.leadId || null,
+              input.fields.opportunityId || null,
+              moduleName === 'Meetings',
+            ],
+          )
+        : { rows: [] }
+    // Notes expose one canonical Contact link. Calls and Meetings use their
+    // native activity relationships so every selected Contact remains visible.
     return result.rows.map((row) => ({
       linkFieldName: row.link_field_name,
       relatedModuleName: row.related_module_name,
@@ -577,24 +690,84 @@ async function enqueueSuiteCrmRecord(
   suiteCrmId: string,
   referenceCode: string,
   sourceHash: string,
+  previousSuiteCrmModule?: SuiteCrmInteractionModule | null,
 ): Promise<string | null> {
+  const suiteCrmModule = input.entity === 'interactions'
+    ? interactionSuiteCrmModule(input.fields)
+    : undefined
+  const moduleTransition = input.entity === 'interactions'
+    && previousSuiteCrmModule !== undefined
+    && previousSuiteCrmModule !== suiteCrmModule
+  if (moduleTransition) {
+    await client.query(
+      `DELETE FROM sync_outbox
+       WHERE target_system = 'suitecrm'
+         AND aggregate_type = $1
+         AND aggregate_id = $2
+         AND operation IN ('upsert_record', 'reproject_record')
+         AND status IN ('queued', 'failed', 'dead')`,
+      [`crm_${input.entity}`, localId],
+    )
+  }
+  if (input.entity === 'interactions' && !suiteCrmModule) {
+    if (!previousSuiteCrmModule) return null
+    const deletePayload: SuiteCrmOutboxRecord = {
+      entity: input.entity,
+      pipelineId: input.pipelineId,
+      localId,
+      suiteCrmId,
+      suiteCrmModule: previousSuiteCrmModule,
+      attributes: {},
+    }
+    const deleteKey = `crm:${input.entity}:module-delete:v1:${localId}:${previousSuiteCrmModule}`
+    const deleted = await client.query<{ idempotency_key: string }>(
+      `INSERT INTO sync_outbox (
+         aggregate_type, aggregate_id, operation, target_system, payload,
+         status, idempotency_key, created_at, available_at, updated_at
+       )
+       VALUES ($1, $2, 'delete_record', 'suitecrm', $3::jsonb, 'queued', $4, now(), now(), now())
+       ON CONFLICT (target_system, idempotency_key)
+       WHERE idempotency_key IS NOT NULL
+       DO UPDATE SET
+         payload = EXCLUDED.payload,
+         status = 'queued',
+         attempts = 0,
+         last_error = NULL,
+         available_at = now(),
+         processed_at = NULL,
+         locked_at = NULL,
+         lock_token = NULL,
+         updated_at = now()
+       WHERE sync_outbox.status IN ('succeeded', 'dead')
+       RETURNING idempotency_key`,
+      [`crm_${input.entity}`, localId, JSON.stringify(deletePayload), deleteKey],
+    )
+    return deleted.rows[0]?.idempotency_key || null
+  }
   const relationships = await suiteCrmRelationships(client, { ...input, localId })
   const payload: SuiteCrmOutboxRecord = {
     entity: input.entity,
     pipelineId: input.pipelineId,
     localId,
     suiteCrmId,
+    ...(suiteCrmModule ? { suiteCrmModule } : {}),
+    ...(moduleTransition && previousSuiteCrmModule
+      ? { previousSuiteCrmModule }
+      : {}),
     attributes: suiteCrmAttributes(input, referenceCode),
     ...(relationships.length > 0 ? { relationships } : {}),
   }
-  const idempotencyKey = `crm:${input.entity}:v3:${localId}:${sourceHash}`
+  const operation = moduleTransition && previousSuiteCrmModule
+    ? 'reproject_record'
+    : 'upsert_record'
+  const idempotencyKey = `crm:${input.entity}:v4:${localId}:${suiteCrmModule || 'default'}:${sourceHash}`
   const inserted = await client.query<{ idempotency_key: string }>(
     `
       INSERT INTO sync_outbox (
         aggregate_type, aggregate_id, operation, target_system, payload,
         status, idempotency_key, created_at, available_at, updated_at
       )
-      VALUES ($1, $2, 'upsert_record', 'suitecrm', $3::jsonb, 'queued', $4, now(), now(), now())
+      VALUES ($1, $2, $5, 'suitecrm', $3::jsonb, 'queued', $4, now(), now(), now())
       ON CONFLICT (target_system, idempotency_key)
       WHERE idempotency_key IS NOT NULL
       DO UPDATE SET
@@ -615,6 +788,7 @@ async function enqueueSuiteCrmRecord(
       localId,
       JSON.stringify(payload),
       idempotencyKey,
+      operation,
     ],
   )
   return inserted.rows[0]?.idempotency_key || null
@@ -1223,12 +1397,19 @@ async function stageCampaign(client: PoolClient, input: StageCampaignInput, suit
 
 async function stageInteraction(client: PoolClient, input: StageInteractionInput, suiteCrmId: string, sourceHash: string) {
   const fields = input.fields
+  const interactionType = normalizedInteractionType(fields.interactionType) || 'note'
+  const suiteCrmModule = interactionSuiteCrmModule(fields)
+  const activityStatus = interactionActivityStatus(fields)
+  const durationMinutes = suiteCrmModule === 'Calls' || suiteCrmModule === 'Meetings'
+    ? interactionDurationMinutes(fields)
+    : null
   const result = await client.query<{ id: string; suitecrm_id: string; reference_code: string }>(
     `
       INSERT INTO crm_interactions (
         pipeline_id, organization_id, contact_id, lead_id, opportunity_id, meeting_id,
         campaign_id, suitecrm_id, source_key, reference_code, source_sheet_id, source_row_number,
-        interaction_type, subject, agent_email, agent_name, occurred_at, description, direction,
+        interaction_type, suitecrm_module, activity_status, duration_minutes,
+        subject, agent_email, agent_name, occurred_at, description, direction,
         delivery_status, provider_message_id, provider_thread_id, metadata,
         source_payload, source_hash, sync_status, sync_error, created_by, updated_by
       )
@@ -1236,8 +1417,8 @@ async function stageInteraction(client: PoolClient, input: StageInteractionInput
         $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6::uuid, $7::uuid,
         $8, $9,
         COALESCE((SELECT reference_code FROM crm_interactions WHERE pipeline_id = $1::uuid AND source_key = $9), allocate_crm_reference('gi')),
-        $10, $11, $12, $13, $14, $15, $16::timestamptz, $17, $18, $19,
-        $20, $21, $22::jsonb, $23::jsonb, $24, 'pending', NULL, $25, $25
+        $10, $11, $12, $13, $14, $15, $16, $17, $18, $19::timestamptz, $20, $21, $22,
+        $23, $24, $25::jsonb, $26::jsonb, $27, 'pending', NULL, $28, $28
       )
       ON CONFLICT (pipeline_id, source_key) DO UPDATE SET
         organization_id = EXCLUDED.organization_id,
@@ -1250,6 +1431,9 @@ async function stageInteraction(client: PoolClient, input: StageInteractionInput
         source_sheet_id = EXCLUDED.source_sheet_id,
         source_row_number = EXCLUDED.source_row_number,
         interaction_type = EXCLUDED.interaction_type,
+        suitecrm_module = EXCLUDED.suitecrm_module,
+        activity_status = EXCLUDED.activity_status,
+        duration_minutes = EXCLUDED.duration_minutes,
         subject = EXCLUDED.subject,
         agent_email = EXCLUDED.agent_email,
         agent_name = EXCLUDED.agent_name,
@@ -1272,9 +1456,10 @@ async function stageInteraction(client: PoolClient, input: StageInteractionInput
       input.pipelineId, fields.organizationId || null, fields.contactId || null, fields.leadId || null,
       fields.opportunityId || null, fields.meetingId || null, fields.campaignId || null,
       suiteCrmId, input.sourceKey, input.sourceSheetId || null, input.sourceRowNumber || null,
-      nullable(fields.interactionType), clean(fields.subject), fields.agentEmail || null,
-      nullable(fields.agentName), isoTimestamp(fields.occurredAt), nullable(fields.description),
-      fields.direction || 'internal', nullable(fields.deliveryStatus), fields.providerMessageId || null,
+      interactionType, suiteCrmModule, activityStatus, durationMinutes, clean(fields.subject),
+      fields.agentEmail || null, nullable(fields.agentName), isoTimestamp(fields.occurredAt),
+      nullable(fields.description), fields.direction || 'internal', nullable(fields.deliveryStatus),
+      fields.providerMessageId || null,
       fields.providerThreadId || null, JSON.stringify(fields.metadata || {}),
       JSON.stringify(input.sourcePayload || {}), sourceHash, input.actorEmail,
     ],
@@ -1541,6 +1726,204 @@ async function normalizeStageContactOwner(
   }
 }
 
+type ContactAliasKind = 'source' | 'former_identity' | 'merged_contact'
+
+type ContactStageResolution = {
+  input: StageContactInput
+  aliases: Array<{ key: string; kind: ContactAliasKind }>
+}
+
+async function resolveContactStageIdentity(
+  client: PoolClient,
+  input: StageContactInput,
+): Promise<ContactStageResolution> {
+  const rawSourceKey = clean(input.sourceKey)
+  const emailIdentity = clean(input.fields.email)
+    ? contactIdentityKey(input.fields)
+    : ''
+  const nameIdentity = contactNameIdentityKey(input.fields)
+  const lookupKeys = [...new Set([rawSourceKey, emailIdentity, nameIdentity].filter(Boolean))]
+  await client.query(
+    `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
+    [`crm-contact-identity:${input.pipelineId}:${lookupKeys.sort().join('|')}`],
+  )
+
+  const aliases = await client.query<{ contact_id: string; source_key: string }>(
+    `SELECT contact_id::text, source_key
+     FROM crm_contact_source_aliases
+     WHERE pipeline_id = $1::uuid
+       AND source_key = ANY($2::text[])
+     ORDER BY source_key
+     FOR UPDATE`,
+    [input.pipelineId, lookupKeys],
+  )
+  const aliasContactIds = [...new Set(aliases.rows.map((row) => row.contact_id))]
+  if (aliasContactIds.length > 1) {
+    throw new Error('Contact source and identity aliases resolve to different contacts')
+  }
+
+  const normalizedName = normalizedCrmIdentityText(input.fields.fullName)
+  const matches = await client.query<Record<string, unknown>>(
+    `SELECT *
+     FROM crm_contacts
+     WHERE pipeline_id = $1::uuid
+       AND ${activeCrmRecordSql('crm_contacts')}
+       AND (
+         ($3::uuid IS NOT NULL AND id = $3::uuid)
+         OR (
+           $3::uuid IS NULL
+           AND organization_id = $2::uuid
+           AND (
+             (NULLIF($4, '') IS NOT NULL AND lower(btrim(COALESCE(email, ''))) = lower($4))
+             OR lower(regexp_replace(btrim(full_name), '\\s+', ' ', 'g')) = $5
+           )
+         )
+       )
+     ORDER BY created_at, id
+     FOR UPDATE`,
+    [
+      input.pipelineId,
+      input.fields.organizationId || null,
+      input.localId || null,
+      clean(input.fields.email),
+      normalizedName,
+    ],
+  )
+  if (input.localId && !matches.rows.some((row) => String(row.id) === input.localId)) {
+    throw new Error('CRM contact was not found')
+  }
+
+  const exactEmailMatches = clean(input.fields.email)
+    ? matches.rows.filter((row) => normalizedCrmIdentityText(row.email) === normalizedCrmIdentityText(input.fields.email))
+    : []
+  if (exactEmailMatches.length > 1) throw new Error('Contact email identifies multiple existing contacts')
+  const exactNameMatches = matches.rows.filter((row) => (
+    normalizedCrmIdentityText(row.full_name) === normalizedName
+  ))
+
+  let matchedId = input.localId || aliasContactIds[0] || ''
+  const emailMatchId = exactEmailMatches[0] ? String(exactEmailMatches[0].id) : ''
+  if (matchedId && emailMatchId && matchedId !== emailMatchId) {
+    throw new Error('Contact source alias conflicts with the supplied email')
+  }
+  if (!matchedId && emailMatchId) matchedId = emailMatchId
+  if (!matchedId && clean(input.fields.email)) {
+    if (exactNameMatches.length === 1 && !clean(exactNameMatches[0].email)) {
+      matchedId = String(exactNameMatches[0].id)
+    } else if (exactNameMatches.length > 1) {
+      throw new Error('Contact name is ambiguous; select the existing contact before adding an email')
+    }
+  }
+  if (!matchedId && !clean(input.fields.email)) {
+    if (exactNameMatches.length === 1) matchedId = String(exactNameMatches[0].id)
+    else if (exactNameMatches.length > 1) {
+      throw new Error('Contact name is ambiguous; add an email or select the existing contact')
+    }
+  }
+
+  const existing = matchedId
+    ? matches.rows.find((row) => String(row.id) === matchedId)
+      || (await client.query<Record<string, unknown>>(
+        `SELECT *
+         FROM crm_contacts
+         WHERE pipeline_id = $1::uuid AND id = $2::uuid
+         LIMIT 1
+         FOR UPDATE`,
+        [input.pipelineId, matchedId],
+      )).rows[0]
+    : null
+  if (matchedId && !existing) throw new Error('Contact identity alias points to a missing contact')
+  if (
+    existing
+    && !input.localId
+    && clean(existing.organization_id) !== clean(input.fields.organizationId)
+  ) {
+    throw new Error('Contact identity alias belongs to a different organization')
+  }
+
+  let fields = input.fields
+  if (existing && input.fieldMode === 'enrich') {
+    const preserve = (column: string, incoming: unknown) => clean(existing[column]) || clean(incoming)
+    fields = {
+      ...fields,
+      priority: preserve('priority', fields.priority),
+      firstName: preserve('first_name', fields.firstName),
+      lastName: preserve('last_name', fields.lastName),
+      fullName: preserve('full_name', fields.fullName),
+      contactType: preserve('contact_type', fields.contactType),
+      accountManager: preserve('account_manager', fields.accountManager),
+      ownerUserReferenceCode: preserve('owner_user_reference_code', fields.ownerUserReferenceCode) || null,
+      ownerEmail: preserve('owner_email', fields.ownerEmail) || null,
+      ownerDisplayName: preserve('owner_display_name', fields.ownerDisplayName) || null,
+      jobTitle: preserve('job_title', fields.jobTitle),
+      email: preserve('email', fields.email),
+      linkedinUrl: preserve('linkedin_url', fields.linkedinUrl),
+      phoneWork: preserve('phone_work', fields.phoneWork),
+      phoneMobile: preserve('phone_mobile', fields.phoneMobile),
+      address: preserve('primary_address_street', fields.address),
+      city: preserve('primary_address_city', fields.city),
+      state: preserve('primary_address_state', fields.state),
+      postalCode: preserve('primary_address_postal_code', fields.postalCode),
+      country: preserve('primary_address_country', fields.country),
+      description: preserve('description', fields.description),
+      emailOptOut: existing.email_opt_out === true || fields.emailOptOut === true,
+      pipelineUser: existing.pipeline_user === true || fields.pipelineUser === true,
+    }
+  }
+
+  const resolvedAliases = new Map<string, ContactAliasKind>()
+  if (rawSourceKey) resolvedAliases.set(rawSourceKey, 'source')
+  if (emailIdentity) resolvedAliases.set(emailIdentity, 'former_identity')
+  const existingUsedNameIdentity = existing && (
+    clean(existing.identity_key) === nameIdentity
+    || clean(existing.source_key) === nameIdentity
+  )
+  if (!clean(input.fields.email) || existingUsedNameIdentity || aliases.rows.some((row) => row.source_key === nameIdentity)) {
+    resolvedAliases.set(nameIdentity, 'former_identity')
+  }
+  return {
+    input: { ...input, localId: matchedId || null, fields },
+    aliases: [...resolvedAliases].map(([key, kind]) => ({ key, kind })),
+  }
+}
+
+async function persistContactStageAliases(
+  client: PoolClient,
+  input: StageContactInput,
+  contactId: string,
+  aliases: ContactStageResolution['aliases'],
+) {
+  for (const alias of aliases) {
+    if (!alias.key || alias.key.length > 500) throw new Error('Contact source alias is invalid')
+    const saved = await client.query<{ contact_id: string }>(
+      `INSERT INTO crm_contact_source_aliases (
+         pipeline_id, source_key, contact_id, alias_kind,
+         source_sheet_id, source_row_number, source_payload, created_by
+       )
+       VALUES ($1::uuid, $2, $3::uuid, $4, $5, $6, $7::jsonb, $8)
+       ON CONFLICT (pipeline_id, source_key) DO UPDATE SET
+         source_sheet_id = COALESCE(EXCLUDED.source_sheet_id, crm_contact_source_aliases.source_sheet_id),
+         source_row_number = COALESCE(EXCLUDED.source_row_number, crm_contact_source_aliases.source_row_number),
+         source_payload = EXCLUDED.source_payload
+       WHERE crm_contact_source_aliases.contact_id = EXCLUDED.contact_id
+       RETURNING contact_id::text`,
+      [
+        input.pipelineId,
+        alias.key,
+        contactId,
+        alias.kind,
+        input.sourceSheetId || null,
+        input.sourceRowNumber || null,
+        JSON.stringify(input.sourcePayload || {}),
+        input.actorEmail,
+      ],
+    )
+    if (!saved.rows[0] || saved.rows[0].contact_id !== contactId) {
+      throw new Error('Contact source alias is already assigned to another contact')
+    }
+  }
+}
+
 async function normalizeStageCrmRecordInput(
   client: PoolClient,
   input: StageCrmRecordInput,
@@ -1618,6 +2001,8 @@ async function normalizeStageCrmRecordInput(
       organization_suitecrm_id: string | null
       contact_suitecrm_id: string | null
       contact_organization_id: string | null
+      lead_suitecrm_id: string | null
+      opportunity_suitecrm_id: string | null
     }>(
       `WITH resolved AS (
          SELECT COALESCE(
@@ -1631,14 +2016,22 @@ async function normalizeStageCrmRecordInput(
        SELECT organization.id::text AS organization_id,
          organization.suitecrm_id AS organization_suitecrm_id,
          contact.suitecrm_id AS contact_suitecrm_id,
-         contact.organization_id::text AS contact_organization_id
+         contact.organization_id::text AS contact_organization_id,
+         lead.suitecrm_id AS lead_suitecrm_id,
+         opportunity.suitecrm_id AS opportunity_suitecrm_id
        FROM resolved
        LEFT JOIN crm_organizations organization
          ON organization.pipeline_id = $1::uuid
         AND organization.id = resolved.organization_id
        LEFT JOIN crm_contacts contact
          ON contact.pipeline_id = $1::uuid
-        AND contact.id = $3::uuid`,
+        AND contact.id = $3::uuid
+       LEFT JOIN crm_leads lead
+         ON lead.pipeline_id = $1::uuid
+        AND lead.id = $4::uuid
+       LEFT JOIN crm_opportunities opportunity
+         ON opportunity.pipeline_id = $1::uuid
+        AND opportunity.id = $5::uuid`,
       [
         input.pipelineId,
         fields.organizationId || null,
@@ -1667,10 +2060,37 @@ async function normalizeStageCrmRecordInput(
         throw new Error('Interaction contacts must belong to the selected organization')
       }
     }
+    const interactionType = normalizedInteractionType(fields.interactionType) || 'note'
+    const suiteCrmModule = interactionSuiteCrmModule({ ...fields, interactionType })
+    const occurredAt = suiteCrmModule === 'Calls' || suiteCrmModule === 'Meetings'
+      ? isoTimestamp(fields.occurredAt) || new Date().toISOString()
+      : isoTimestamp(fields.occurredAt)
+    const parentSuiteCrmId = organization?.opportunity_suitecrm_id
+      || organization?.lead_suitecrm_id
+      || organization?.organization_suitecrm_id
+      || fields.parentSuiteCrmId
+      || null
+    const parentSuiteCrmType = organization?.opportunity_suitecrm_id
+      ? 'Opportunities' as const
+      : organization?.lead_suitecrm_id
+        ? 'Leads' as const
+        : organization?.organization_suitecrm_id
+          ? 'Accounts' as const
+          : fields.parentSuiteCrmType
     return {
       ...input,
       fields: {
         ...fields,
+        interactionType,
+        suiteCrmModule,
+        activityStatus: interactionActivityStatus({ ...fields, interactionType, suiteCrmModule }),
+        durationMinutes: suiteCrmModule === 'Calls' || suiteCrmModule === 'Meetings'
+          ? interactionDurationMinutes(fields)
+          : null,
+        occurredAt,
+        direction: suiteCrmModule === 'Calls' && fields.direction !== 'inbound'
+          ? 'outbound'
+          : fields.direction,
         contactId: primaryContactId,
         contactIds: fields.contactIds === undefined ? undefined : contactIds,
         agentEmail: agent?.rows[0]?.email || null,
@@ -1680,8 +2100,8 @@ async function normalizeStageCrmRecordInput(
         agentSuiteCrmUserId: agent?.rows[0]?.suitecrm_user_id || null,
         organizationId: organization?.organization_id || null,
         contactSuiteCrmId: organization?.contact_suitecrm_id || null,
-        parentSuiteCrmId: organization?.organization_suitecrm_id || fields.parentSuiteCrmId || null,
-        parentSuiteCrmType: organization?.organization_suitecrm_id ? 'Accounts' : fields.parentSuiteCrmType,
+        parentSuiteCrmId,
+        parentSuiteCrmType,
       },
     }
   }
@@ -1689,7 +2109,13 @@ async function normalizeStageCrmRecordInput(
 }
 
 export async function stageCrmRecordWithClient(client: PoolClient, rawInput: StageCrmRecordInput) {
-  const input = await normalizeStageCrmRecordInput(client, rawInput)
+  let input = await normalizeStageCrmRecordInput(client, rawInput)
+  let contactAliases: ContactStageResolution['aliases'] = []
+  if (input.entity === 'contacts') {
+    const contactResolution = await resolveContactStageIdentity(client, input)
+    input = contactResolution.input
+    contactAliases = contactResolution.aliases
+  }
   const identityKey = input.entity === 'organizations'
     ? organizationIdentityKey(input.fields)
     : input.entity === 'contacts'
@@ -1705,6 +2131,22 @@ export async function stageCrmRecordWithClient(client: PoolClient, rawInput: Sta
     ? stableGlobalSuiteCrmId(input.entity, sourceKey)
     : stableSuiteCrmId(input.pipelineId, input.entity, sourceKey)
   const sourceHash = crmSourceHash({ fields: input.fields, sourcePayload: input.sourcePayload || {} })
+  let previousSuiteCrmModule: SuiteCrmInteractionModule | null | undefined
+  if (input.entity === 'interactions') {
+    const previous = await client.query<{ suitecrm_module: SuiteCrmInteractionModule | null }>(
+      `SELECT suitecrm_module
+       FROM crm_interactions
+       WHERE pipeline_id = $1::uuid
+         AND (
+           ($2::uuid IS NOT NULL AND id = $2::uuid)
+           OR ($2::uuid IS NULL AND source_key = $3)
+         )
+       LIMIT 1
+       FOR UPDATE`,
+      [input.pipelineId, input.localId || null, sourceKey],
+    )
+    if (previous.rows[0]) previousSuiteCrmModule = previous.rows[0].suitecrm_module
+  }
   let row: { id: string; suitecrm_id: string; reference_code: string }
   switch (input.entity) {
     case 'organizations':
@@ -1712,6 +2154,7 @@ export async function stageCrmRecordWithClient(client: PoolClient, rawInput: Sta
       break
     case 'contacts':
       row = await stageContact(client, input, suiteCrmId, sourceHash, sourceKey)
+      await persistContactStageAliases(client, input, row.id, contactAliases)
       break
     case 'products':
       row = await stageProduct(client, input, suiteCrmId, sourceHash)
@@ -1751,7 +2194,16 @@ export async function stageCrmRecordWithClient(client: PoolClient, rawInput: Sta
       row.suitecrm_id,
       row.reference_code,
       sourceHash,
+      previousSuiteCrmModule,
     )
+    if (input.entity === 'interactions' && !interactionSuiteCrmModule(input.fields) && !suiteCrmOutboxKey) {
+      await client.query(
+        `UPDATE crm_interactions
+         SET sync_status = 'synced', sync_error = NULL, suitecrm_synced_at = now(), updated_at = now()
+         WHERE id = $1::uuid`,
+        [row.id],
+      )
+    }
   } else {
     const table = ENTITY_TABLE[input.entity]
     await client.query(
@@ -1824,9 +2276,12 @@ export async function archiveCrmRecordInPostgres(input: {
       id: string
       reference_code: string
       suitecrm_id: string | null
+      suitecrm_module: SuiteCrmInteractionModule | null
       source_payload: Record<string, unknown> | null
     }>(
-      `SELECT id::text, reference_code, suitecrm_id, source_payload
+      `SELECT id::text, reference_code, suitecrm_id,
+         ${input.entity === 'interactions' ? 'suitecrm_module' : 'NULL::text AS suitecrm_module'},
+         source_payload
        FROM ${table}
        WHERE pipeline_id = $1::uuid AND id = $2::uuid
        FOR UPDATE`,
@@ -1894,6 +2349,7 @@ export async function archiveCrmRecordInPostgres(input: {
             pipelineId: input.pipelineId,
             localId: input.id,
             suiteCrmId: record.suitecrm_id,
+            ...(record.suitecrm_module ? { suiteCrmModule: record.suitecrm_module } : {}),
             attributes: {},
           }),
           `crm-archive:${input.entity}:${input.id}`,
@@ -2964,6 +3420,11 @@ function interactionFromRow(
     campaignId: nullable(row.campaign_id), campaignName: clean(row.campaign_name),
     suiteCrmId: nullable(row.suitecrm_id), sourceKey: String(row.source_key),
     sourceRowNumber: row.source_row_number === null ? null : Number(row.source_row_number), interactionType: clean(row.interaction_type),
+    suiteCrmModule: nullable(row.suitecrm_module) as CrmInteraction['suiteCrmModule'],
+    activityStatus: nullable(row.activity_status) as CrmInteraction['activityStatus'],
+    durationMinutes: row.duration_minutes === null || row.duration_minutes === undefined
+      ? null
+      : Number(row.duration_minutes),
     subject: clean(row.subject), agentEmail: nullable(row.agent_email), agentName: clean(row.agent_name),
     occurredAt: row.occurred_at ? String(row.occurred_at) : null,
     description: clean(row.description), direction: (row.direction || 'internal') as CrmInteraction['direction'],
@@ -4235,7 +4696,12 @@ export async function resolveCrmReferenceCode(referenceValue: unknown): Promise<
   if (!isPostgresStorageEnabled()) return referenceCode
   try {
     const result = await query<{ canonical_code: string }>(
-      `SELECT canonical_code FROM crm_reference_registry WHERE reference_code = $1 LIMIT 1`,
+      `SELECT COALESCE(alias.canonical_code, registry.canonical_code) AS canonical_code
+       FROM crm_reference_registry registry
+       LEFT JOIN crm_reference_aliases alias
+         ON alias.alias_code = registry.reference_code
+       WHERE registry.reference_code = $1
+       LIMIT 1`,
       [referenceCode],
     )
     return clean(result.rows[0]?.canonical_code) || referenceCode
@@ -4384,7 +4850,7 @@ export async function claimSuiteCrmOutboxInPostgres(input: { limit?: number; max
     const result = await client.query<Record<string, unknown>>(
       `WITH candidates AS (
          SELECT id FROM sync_outbox
-         WHERE target_system = 'suitecrm' AND operation IN ('upsert_record', 'delete_record', 'upsert_user_identity')
+         WHERE target_system = 'suitecrm' AND operation IN ('upsert_record', 'delete_record', 'reproject_record', 'upsert_user_identity')
            AND status IN ('queued', 'failed') AND attempts < $1 AND available_at <= now()
          ORDER BY available_at, created_at FOR UPDATE SKIP LOCKED LIMIT $2
        )
@@ -4398,7 +4864,7 @@ export async function claimSuiteCrmOutboxInPostgres(input: { limit?: number; max
     for (const row of result.rows) {
       const entity = String(row.aggregate_type).replace(/^crm_/, '') as CrmEntity
       const table = ENTITY_TABLE[entity]
-      if (table && row.operation === 'upsert_record') {
+      if (table && (row.operation === 'upsert_record' || row.operation === 'reproject_record')) {
         await client.query(
           `UPDATE ${table} SET sync_status = 'syncing', sync_error = NULL, updated_at = now() WHERE id = $1::uuid`,
           [row.aggregate_id],
@@ -4428,7 +4894,7 @@ export async function completeSuiteCrmOutboxInPostgres(item: CrmOutboxItem) {
     )
     if (!completed.rows[0]) throw new Error('SuiteCRM outbox lease was lost')
     const table = tableForAggregate(item.aggregateType)
-    if (table && item.operation === 'upsert_record') {
+    if (table && (item.operation === 'upsert_record' || item.operation === 'reproject_record')) {
       await client.query(
         `UPDATE ${table} SET sync_status = 'synced', sync_error = NULL, suitecrm_synced_at = now(), updated_at = now() WHERE id = $1::uuid`,
         [item.aggregateId],
@@ -4462,7 +4928,7 @@ export async function failSuiteCrmOutboxInPostgres(input: { item: CrmOutboxItem;
     )
     if (!result.rows[0]) throw new Error('SuiteCRM outbox lease was lost')
     const table = tableForAggregate(input.item.aggregateType)
-    if (table && input.item.operation === 'upsert_record') {
+    if (table && (input.item.operation === 'upsert_record' || input.item.operation === 'reproject_record')) {
       await client.query(
         `UPDATE ${table}
          SET sync_status = $3, sync_error = $2, updated_at = now()

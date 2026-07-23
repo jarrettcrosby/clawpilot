@@ -1,6 +1,11 @@
 import crypto from 'node:crypto'
 import { NextRequest, NextResponse } from 'next/server'
-import { CRM_ENTITIES, type CrmEntity } from '@/lib/crm/types'
+import {
+  CRM_ENTITIES,
+  type CrmActivityStatus,
+  type CrmEntity,
+  type SuiteCrmInteractionModule,
+} from '@/lib/crm/types'
 import { enqueueCrmIntegrationAction } from '@/lib/crm/integrationActions'
 import { reconcileCrmBoardProjectionsForPipeline } from '@/lib/crm/boardProjection'
 import {
@@ -49,6 +54,38 @@ function numberValue(value: unknown, min = 0, max = Number.MAX_SAFE_INTEGER) {
   const out = Number(value)
   if (!Number.isFinite(out)) return 0
   return Math.max(min, Math.min(max, out))
+}
+
+const INTERACTION_TYPES = ['email', 'call', 'meeting', 'linkedin', 'note', 'campaign'] as const
+
+function interactionTypeValue(value: unknown) {
+  const normalized = stringValue(value, 100).toLowerCase().replace(/\s+/g, ' ')
+  const canonical = normalized === 'in person' ? 'meeting' : normalized
+  if (INTERACTION_TYPES.includes(canonical as (typeof INTERACTION_TYPES)[number])) return canonical
+  throw new Error('Interaction type is invalid')
+}
+
+function activityStatusValue(value: unknown, fallback: CrmActivityStatus): CrmActivityStatus {
+  const normalized = stringValue(value, 32).toLowerCase().replace(/[\s-]+/g, '_')
+  if (!normalized) return fallback
+  if (normalized === 'planned' || normalized === 'held' || normalized === 'not_held') return normalized
+  throw new Error('Activity status is invalid')
+}
+
+function activityDurationMinutes(value: unknown, fallback = 15) {
+  if (value === undefined || value === null || value === '') return fallback
+  const minutes = Number(value)
+  if (!Number.isInteger(minutes) || minutes < 1 || minutes > 24 * 60) {
+    throw new Error('Activity duration must be a whole number from 1 to 1440 minutes')
+  }
+  return minutes
+}
+
+function callDirectionValue(value: unknown) {
+  const direction = stringValue(value, 32).toLowerCase()
+  if (!direction) return 'outbound' as const
+  if (direction === 'inbound' || direction === 'outbound') return direction
+  throw new Error('Call direction is invalid')
 }
 
 function validEmail(value: unknown) {
@@ -491,6 +528,27 @@ export async function POST(req: NextRequest) {
             : campaign?.suiteCrmId
               ? 'Campaigns' as const
               : undefined
+    const interactionType = interactionTypeValue(fields.interactionType)
+    const meetingId = fields.meetingId === undefined
+      ? current?.meetingId || null
+      : stringValue(fields.meetingId, 50) || null
+    const suiteCrmModule: SuiteCrmInteractionModule | null = interactionType === 'call'
+      ? 'Calls'
+      : interactionType === 'meeting'
+        ? meetingId ? null : 'Meetings'
+        : 'Notes'
+    const nativeActivity = suiteCrmModule === 'Calls' || suiteCrmModule === 'Meetings'
+    const activityStatus = nativeActivity
+      ? activityStatusValue(fields.activityStatus, 'held')
+      : null
+    const durationMinutes = nativeActivity
+      ? activityDurationMinutes(fields.durationMinutes, suiteCrmModule === 'Calls' ? 15 : 30)
+      : null
+    const direction = suiteCrmModule === 'Calls'
+      ? callDirectionValue(fields.direction)
+      : ['inbound', 'outbound', 'internal'].includes(String(fields.direction))
+        ? fields.direction as 'inbound' | 'outbound' | 'internal'
+        : 'internal'
     const staged = await stageCrmRecordInPostgres({
       entity, pipelineId: pipeline.id, localId: current?.id, sourceKey, actorEmail: actor.email,
       sourcePayload: { ...(current?.sourcePayload || {}), source: 'clawpilot' },
@@ -498,18 +556,15 @@ export async function POST(req: NextRequest) {
         organizationId: organization?.id || contact?.organizationId || lead?.organizationId || current?.organizationId || null,
         contactId: contact?.id || null, contactIds: interactionContactIds,
         leadId: lead?.id || null, opportunityId: opportunity?.id || null,
-        meetingId: fields.meetingId === undefined
-          ? current?.meetingId || null
-          : stringValue(fields.meetingId, 50) || null,
+        meetingId,
         campaignId: campaign?.id || null,
-        parentSuiteCrmId, parentSuiteCrmType, interactionType: stringValue(fields.interactionType, 100),
+        parentSuiteCrmId, parentSuiteCrmType, interactionType, suiteCrmModule,
+        activityStatus, durationMinutes,
         subject, agentEmail: validEmail(fields.agentEmail || current?.agentEmail),
         agentName: stringValue(fields.agentName || current?.agentName, 200),
         occurredAt: stringValue(fields.occurredAt, 50) || null,
         description: stringValue(fields.description, 10_000),
-        direction: ['inbound', 'outbound', 'internal'].includes(String(fields.direction))
-          ? fields.direction as 'inbound' | 'outbound' | 'internal'
-          : 'internal',
+        direction,
         deliveryStatus: stringValue(fields.deliveryStatus, 100),
       },
     })

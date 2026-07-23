@@ -11,6 +11,8 @@ export const CRM_ENTITIES = [
 
 export type CrmEntity = (typeof CRM_ENTITIES)[number]
 export type CrmSyncStatus = 'pending' | 'syncing' | 'synced' | 'failed'
+export type SuiteCrmInteractionModule = 'Notes' | 'Calls' | 'Meetings'
+export type CrmActivityStatus = 'planned' | 'held' | 'not_held'
 
 export type CrmOrganization = {
   id: string
@@ -193,6 +195,9 @@ export type CrmInteraction = {
   sourceKey: string
   sourceRowNumber: number | null
   interactionType: string
+  suiteCrmModule: SuiteCrmInteractionModule | null
+  activityStatus: CrmActivityStatus | null
+  durationMinutes: number | null
   subject: string
   agentEmail: string | null
   agentName: string
@@ -342,6 +347,8 @@ export type SuiteCrmOutboxRecord = {
   pipelineId: string
   localId: string
   suiteCrmId: string
+  suiteCrmModule?: SuiteCrmInteractionModule
+  previousSuiteCrmModule?: SuiteCrmInteractionModule
   attributes: Record<string, unknown>
   relationships?: Array<{
     linkFieldName: 'accounts' | 'contact' | 'contacts' | 'leads' | 'opportunity'

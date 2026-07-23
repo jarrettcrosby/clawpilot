@@ -41,6 +41,13 @@ export function contactIdentityKey(input: {
 }) {
   const email = normalizedCrmIdentityText(input.email)
   if (email) return `contact:email:${email}`
+  return contactNameIdentityKey(input)
+}
+
+export function contactNameIdentityKey(input: {
+  fullName: unknown
+  organizationId?: string | null
+}) {
   return `contact:name:${normalizedCrmIdentityText(input.fullName)}:organization:${input.organizationId || 'none'}`
 }
 

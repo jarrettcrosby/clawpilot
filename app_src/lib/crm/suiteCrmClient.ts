@@ -1,6 +1,17 @@
 import type { CrmEntity, SuiteCrmOutboxRecord, SuiteCrmUserIdentityOutboxRecord } from '@/lib/crm/types'
 
-const ENTITY_MODULE: Record<CrmEntity, string> = {
+type SuiteCrmRecordModule =
+  | 'Accounts'
+  | 'Contacts'
+  | 'AOS_Products'
+  | 'Leads'
+  | 'Opportunities'
+  | 'Meetings'
+  | 'Notes'
+  | 'Calls'
+  | 'Campaigns'
+
+const ENTITY_MODULE: Record<CrmEntity, SuiteCrmRecordModule> = {
   organizations: 'Accounts',
   contacts: 'Contacts',
   products: 'AOS_Products',
@@ -34,6 +45,7 @@ export type SuiteCrmRecordSnapshot = {
 
 export type SuiteCrmMeetingSnapshot = SuiteCrmRecordSnapshot
 export type SuiteCrmNoteSnapshot = SuiteCrmRecordSnapshot
+export type SuiteCrmCallSnapshot = SuiteCrmRecordSnapshot
 export type SuiteCrmAccountContactModule = 'Accounts' | 'Contacts'
 export type SuiteCrmUserMatch = {
   id: string
@@ -212,7 +224,7 @@ export async function findSuiteCrmUser(input: {
 }
 
 async function listSuiteCrmModuleRecordsUpdatedSince(
-  moduleName: 'Accounts' | 'Contacts' | 'Meetings' | 'Notes',
+  moduleName: 'Accounts' | 'Contacts' | 'Meetings' | 'Notes' | 'Calls',
   recordLabel: string,
   input: SuiteCrmIncrementalListInput,
   fetchImpl: typeof fetch,
@@ -293,11 +305,35 @@ export async function listSuiteCrmNotesUpdatedSince(
   return { notes: response.records, totalPages: response.totalPages }
 }
 
+export async function listSuiteCrmCallsUpdatedSince(
+  input: SuiteCrmIncrementalListInput,
+  fetchImpl: typeof fetch = fetch,
+) {
+  const response = await listSuiteCrmModuleRecordsUpdatedSince('Calls', 'call', input, fetchImpl)
+  return { calls: response.records, totalPages: response.totalPages }
+}
+
+function suiteCrmRecordModule(record: SuiteCrmOutboxRecord): SuiteCrmRecordModule {
+  const canonicalModule = ENTITY_MODULE[record.entity]
+  const explicitModule = record.suiteCrmModule
+  if (explicitModule === undefined) return canonicalModule
+  if (record.entity === 'interactions') {
+    if (explicitModule === 'Notes' || explicitModule === 'Calls' || explicitModule === 'Meetings') {
+      return explicitModule
+    }
+    throw new Error('SuiteCRM interaction module is invalid')
+  }
+  if (explicitModule !== canonicalModule) {
+    throw new Error('SuiteCRM record module does not match its entity')
+  }
+  return canonicalModule
+}
+
 export async function upsertSuiteCrmRecord(
   record: SuiteCrmOutboxRecord,
   fetchImpl: typeof fetch = fetch,
 ) {
-  const moduleName = ENTITY_MODULE[record.entity]
+  const moduleName = suiteCrmRecordModule(record)
   const existing = await request(
     `/Api/V8/module/${moduleName}/${encodeURIComponent(record.suiteCrmId)}`,
     { method: 'GET' },
@@ -424,7 +460,7 @@ export async function deleteSuiteCrmRecord(
   record: SuiteCrmOutboxRecord,
   fetchImpl: typeof fetch = fetch,
 ) {
-  const moduleName = ENTITY_MODULE[record.entity]
+  const moduleName = suiteCrmRecordModule(record)
   await request(
     `/Api/V8/module/${moduleName}/${encodeURIComponent(record.suiteCrmId)}`,
     { method: 'DELETE' },

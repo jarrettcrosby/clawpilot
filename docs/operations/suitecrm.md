@@ -19,7 +19,7 @@ Each Railway environment has a `suitecrm` service, a dedicated MariaDB service, 
 
 The image is built from `services/suitecrm/`. It verifies the official SuiteCRM 8.10.1 release digest, serves `public/` with Apache, runs the legacy scheduler every minute, and continuously restarts the Symfony Messenger worker.
 
-Container boot also idempotently installs the ClawPilot `Global ID` custom field on Accounts, Contacts, AOS Products, Leads, Opportunities, Meetings, Notes, Campaigns, and Users. The field is named `global_id_c` in SuiteCRM metadata, labeled `Global ID`, and added to native detail and list layouts. Business-record modules are enabled for reporting and unified search; Users retain their administrator-module search boundary. Notes also receive a reportable, audited `Occurred At` DateTime field named `occurred_at_c` on native edit, detail, and list layouts; it stores the interaction's business timestamp separately from SuiteCRM's system creation time.
+Container boot also idempotently installs the ClawPilot `Global ID` custom field on Accounts, Contacts, AOS Products, Leads, Opportunities, Meetings, Calls, Notes, Campaigns, and Users. The field is named `global_id_c` in SuiteCRM metadata, labeled `Global ID`, and added to native detail and list layouts. Business-record modules are enabled for reporting and unified search; Users retain their administrator-module search boundary. Notes also receive a reportable, audited `Occurred At` DateTime field named `occurred_at_c` on native edit, detail, and list layouts; it stores the interaction's business timestamp separately from SuiteCRM's system creation time.
 
 Every ClawPilot application user owns a permanent `gu#######` identity in Postgres. When an administrator maps that person to a native SuiteCRM User, ClawPilot queues an idempotent `global_id_c` projection through the SuiteCRM outbox. The worker refuses to overwrite a different permanent ID or duplicate one onto a second SuiteCRM User. The person's CRM Contact remains a separate `gc#######` record.
 
@@ -89,6 +89,48 @@ CLAWPILOT_BACKFILL_CONFIRM=global-id-v1 npm run crm:backfill-suitecrm
 ```
 
 Drain `/api/crm/outbox/process`, then verify an exact V8 filter on `global_id_c` and inspect a meeting's Contacts and Accounts subpanels. The backfill is transactionally queued and may be rerun; unchanged payloads are not duplicated.
+
+### Native activity projection
+
+Migration `0095_crm_native_activity_projection.sql` runs through the normal `npm run db:migrate` predeploy path. It adds the native activity module, status, and duration fields to `crm_interactions`; repairs imported workbook interaction timestamps from the original `source_payload.Date`; normalizes Calls and unlinked Meeting/In Person interactions; and queues one `reproject_record` operation per affected interaction.
+
+The matching worker processes each reproject in this order:
+
+1. Delete the interaction's legacy SuiteCRM Note by its stable SuiteCRM ID.
+2. Create the native Call or Meeting with the same permanent `gi` Global ID, business timestamp, status, duration, assignment, and verified relationships.
+3. For a companion `gi` history row already linked to a canonical `gm` Meeting, stop after deleting the duplicate Note. The `gm` Meeting remains the only native activity projection.
+
+Do not run a separate ad hoc production update for this conversion. Deploy the SuiteCRM metadata and application worker that understand Calls and `reproject_record`, run the normal migration once in development, and drain `/api/crm/outbox/process`. Verify:
+
+- a planned Call appears under the related Account's or Contact's **Activities**;
+- held and not-held Calls appear under **History**;
+- native direction and duration match the ClawPilot interaction;
+- an unlinked Meeting/In Person interaction appears as one native Meeting;
+- a canonical `gm` Meeting has no duplicate `gi` Note or second native Meeting;
+- workbook-imported activity dates still match their original source `Date`.
+
+Repeat the same migration, drain, and checks in production only after development passes.
+
+### Duplicate Contact consolidation
+
+Migration `0096_crm_contact_identity_aliases.sql` preserves workbook source keys, former identity keys, and retired public `gc` references when two Contact rows represent the same person. Contact staging resolves those aliases before creating a row, safely enriches a single name-only Contact when an email is later supplied, and treats workbook fields as enrichment so an older sheet row cannot erase a stronger CRM email or title.
+
+Use the guarded merge command only after migration `0096` and the matching application worker are deployed. It is a full transactional dry run unless `--apply`, an active audit actor, and the exact confirmation token are all supplied:
+
+```bash
+npm run crm:merge-contacts -- \
+  --survivor gc1234567 \
+  --duplicate gc7654321
+
+npm run crm:merge-contacts -- \
+  --survivor gc1234567 \
+  --duplicate gc7654321 \
+  --apply \
+  --actor operator@example.com \
+  --confirm merge:gc7654321:into:gc1234567
+```
+
+The merge keeps the survivor's local ID, public reference, and SuiteCRM ID; fills only missing survivor data; rewires local relationships; keeps the duplicate public reference as a permanent alias; and records an append-only tombstone. SuiteCRM work is dependency-ordered: update the survivor, update affected activity relationships, then delete the duplicate Contact. If the validation finds conflicting emails, organizations, names, in-flight work, an app-user identity, an unknown Contact foreign key, or an activity whose relationship payload cannot be reconstructed safely, the transaction stops without mutation.
 
 After deploying the native Note-to-Contact relationship contract, queue the historical Note repair from each environment using an explicit audit actor:
 

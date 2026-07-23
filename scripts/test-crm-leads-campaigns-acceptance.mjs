@@ -111,6 +111,28 @@ const FIXTURES = Object.freeze({
     direction: 'outbound',
     deliveryStatus: 'sent',
   },
+  callInteraction: {
+    subject: 'Acceptance native call',
+    interactionType: 'call',
+    occurredAt: '2026-08-01T17:00:00.000Z',
+    agentEmail: actorEmail,
+    agentName: 'CRM Acceptance Operator',
+    description: 'Representative native Call interaction.',
+    activityStatus: 'held',
+    durationMinutes: 15,
+    direction: 'outbound',
+  },
+  inPersonInteraction: {
+    subject: 'Acceptance in-person meeting',
+    interactionType: 'In Person',
+    occurredAt: '2026-08-01T18:00:00.000Z',
+    agentEmail: actorEmail,
+    agentName: 'CRM Acceptance Operator',
+    description: 'Representative legacy meeting alias.',
+    activityStatus: 'held',
+    durationMinutes: 45,
+    direction: 'internal',
+  },
 })
 
 function read(relativePath) {
@@ -120,7 +142,10 @@ function read(relativePath) {
 function verifySourceContracts() {
   assert.deepEqual(
     Object.keys(FIXTURES).filter((key) => !key.startsWith('archived')),
-    ['account', 'contact', 'lead', 'opportunity', 'meeting', 'campaign', 'interaction'],
+    [
+      'account', 'contact', 'lead', 'opportunity', 'meeting', 'campaign',
+      'interaction', 'callInteraction', 'inPersonInteraction',
+    ],
   )
   const route = read('app_src/app/api/crm/route.ts')
   const persistence = read('app_src/lib/persistence/crm.ts')
@@ -142,9 +167,26 @@ function verifySourceContracts() {
   assert.match(component, /openLifecycleDialog\('convert-lead'/)
   assert.match(component, /openLifecycleDialog\('archive'/)
   assert.match(component, /width: \{ xs: '100%', sm: 460 \}/)
+  assert.match(component, /const ACTIVITY_STATUSES =/)
+  assert.match(component, /label="Activity status"/)
+  assert.match(component, /label="Duration \(minutes\)"/)
+  assert.match(component, /label="Direction"/)
+  assert.match(component, /value="completed">Completed/)
+  assert.match(route, /normalized === 'in person' \? 'meeting'/)
+  assert.match(route, /suiteCrmModule: SuiteCrmInteractionModule \| null/)
+  assert.match(route, /suiteCrmModule === 'Calls' \? 15 : 30/)
+  assert.match(route, /Activity duration must be a whole number from 1 to 1440 minutes/)
   assert.match(integrations, /campaignId: target\.id/)
   assert.match(integrations, /campaignRecipientId: recipient\.id/)
   assert.match(integrations, /stageActionInteraction/)
+  assert.match(integrations, /suiteCrmModule: 'Calls'/)
+  assert.match(integrations, /activityStatus: input\.activityStatus \|\| 'held'/)
+  assert.match(integrations, /durationMinutes: input\.durationMinutes \|\| 15/)
+  const calendarAction = integrations.slice(
+    integrations.indexOf('async function createCalendarEventAction'),
+    integrations.indexOf('function telUrl'),
+  )
+  assert.doesNotMatch(calendarAction, /stageActionInteraction/)
   assert.match(globalRoute, /if \(isPostgresStorageEnabled\(\) && !resolved\.found\)/)
 }
 
@@ -346,15 +388,65 @@ async function runApiAcceptance(baseUrl, token, pool) {
       campaignId: campaign.id,
     })),
   })).record
+  const callInteraction = (await apiJson(baseUrl, token, '/api/crm', {
+    method: 'POST',
+    body: JSON.stringify(fields('interactions', FIXTURES.callInteraction, {
+      organizationId: account.id,
+      contactIds: [contact.id],
+      opportunityId: opportunity.id,
+    })),
+  })).record
+  const inPersonInteraction = (await apiJson(baseUrl, token, '/api/crm', {
+    method: 'POST',
+    body: JSON.stringify(fields('interactions', FIXTURES.inPersonInteraction, {
+      organizationId: account.id,
+      contactIds: [contact.id],
+      opportunityId: opportunity.id,
+    })),
+  })).record
+  const linkedMeetingInteraction = (await apiJson(baseUrl, token, '/api/crm', {
+    method: 'POST',
+    body: JSON.stringify(fields('interactions', {
+      ...FIXTURES.inPersonInteraction,
+      subject: 'Acceptance canonical meeting history link',
+      interactionType: 'meeting',
+      occurredAt: FIXTURES.meeting.startsAt,
+    }, {
+      organizationId: account.id,
+      contactIds: [contact.id],
+      meetingId: meeting.id,
+    })),
+  })).record
 
   for (const [entity, record, prefix] of [
     ['organizations', account, 'ga'], ['contacts', contact, 'gc'], ['leads', lead, 'gl'],
     ['opportunities', opportunity, 'go'], ['meetings', meeting, 'gm'],
     ['campaigns', campaign, 'gk'], ['interactions', interaction, 'gi'],
+    ['interactions', callInteraction, 'gi'], ['interactions', inPersonInteraction, 'gi'],
+    ['interactions', linkedMeetingInteraction, 'gi'],
   ]) {
     assert.match(record.referenceCode, new RegExp(`^${prefix}[0-9]{7}$`), `${entity} Global ID`)
     assert.equal(record.shortUrl, `${shortLinkOrigin}/s/${record.referenceCode}`)
   }
+
+  const activityRecords = (await apiJson(baseUrl, token, '/api/crm?entity=interactions&limit=100')).records
+  const savedCall = activityRecords.find((record) => record.id === callInteraction.id)
+  assert.equal(savedCall.interactionType, 'call')
+  assert.equal(savedCall.suiteCrmModule, 'Calls')
+  assert.equal(savedCall.activityStatus, 'held')
+  assert.equal(savedCall.durationMinutes, 15)
+  assert.equal(savedCall.direction, 'outbound')
+  const savedInPerson = activityRecords.find((record) => record.id === inPersonInteraction.id)
+  assert.equal(savedInPerson.interactionType, 'meeting')
+  assert.equal(savedInPerson.suiteCrmModule, 'Meetings')
+  assert.equal(savedInPerson.activityStatus, 'held')
+  assert.equal(savedInPerson.durationMinutes, 45)
+  const savedLinkedMeeting = activityRecords.find((record) => record.id === linkedMeetingInteraction.id)
+  assert.equal(savedLinkedMeeting.interactionType, 'meeting')
+  assert.equal(savedLinkedMeeting.suiteCrmModule, null)
+  assert.equal(savedLinkedMeeting.activityStatus, null)
+  assert.equal(savedLinkedMeeting.durationMinutes, null)
+  assert.equal(savedLinkedMeeting.syncStatus, 'synced')
 
   const editedLeadFields = { ...FIXTURES.archivedLead, status: 'Nurture', description: 'Edited before archival.' }
   await apiJson(baseUrl, token, '/api/crm', {
@@ -425,6 +517,41 @@ async function runApiAcceptance(baseUrl, token, pool) {
     'succeeded',
     `Campaign expansion failed: ${JSON.stringify(campaignAction.action)}`,
   )
+  const callAction = await apiJson(baseUrl, token, '/api/crm/actions', {
+    method: 'POST',
+    body: JSON.stringify({
+      actionType: 'log_call',
+      referenceCode: contact.referenceCode,
+      payload: {
+        subject: 'Acceptance quick call',
+        notes: 'Native Call action proof.',
+        activityStatus: 'not_held',
+        durationMinutes: 7,
+        direction: 'inbound',
+      },
+      idempotencyKey: 'crm-acceptance-native-call-v1',
+      processNow: true,
+    }),
+  })
+  assert.equal(callAction.action.status, 'succeeded')
+  assert.deepEqual(
+    {
+      activityStatus: callAction.action.responseSummary.activityStatus,
+      durationMinutes: callAction.action.responseSummary.durationMinutes,
+      direction: callAction.action.responseSummary.direction,
+    },
+    { activityStatus: 'not_held', durationMinutes: 7, direction: 'inbound' },
+  )
+  const callActionActivity = await apiJson(
+    baseUrl,
+    token,
+    '/api/crm?entity=interactions&query=Acceptance%20quick%20call&limit=20',
+  )
+  const loggedCall = callActionActivity.records.find((record) => record.subject === 'Acceptance quick call')
+  assert.equal(loggedCall.suiteCrmModule, 'Calls')
+  assert.equal(loggedCall.activityStatus, 'not_held')
+  assert.equal(loggedCall.durationMinutes, 7)
+  assert.equal(loggedCall.direction, 'inbound')
   const campaignActivity = await apiJson(
     baseUrl,
     token,
@@ -511,15 +638,21 @@ async function runApiAcceptance(baseUrl, token, pool) {
      WHERE target_system = 'suitecrm' AND operation = 'upsert_record'
        AND payload->>'localId' = ANY($1::text[])
      ORDER BY updated_at DESC`,
-    [[account.id, contact.id, lead.id, convertedLead.convertedContactId, convertedLead.convertedOpportunityId, meeting.id, campaign.id, interaction.id]],
+    [[
+      account.id, contact.id, lead.id, convertedLead.convertedContactId,
+      convertedLead.convertedOpportunityId, meeting.id, campaign.id, interaction.id,
+      callInteraction.id, inPersonInteraction.id, linkedMeetingInteraction.id,
+    ]],
   )
   const projectedGlobalIds = new Set(projectionProof.rows.map((row) => row.payload?.attributes?.global_id_c).filter(Boolean))
   for (const referenceCode of [
     account.referenceCode, contact.referenceCode, lead.referenceCode, conversion.result.contactReferenceCode,
     conversion.result.opportunityReferenceCode, meeting.referenceCode, campaign.referenceCode, interaction.referenceCode,
+    callInteraction.referenceCode, inPersonInteraction.referenceCode,
   ]) {
     assert.equal(projectedGlobalIds.has(referenceCode), true, `SuiteCRM projection for ${referenceCode}`)
   }
+  assert.equal(projectedGlobalIds.has(linkedMeetingInteraction.referenceCode), false)
   const childActions = await pool.query(
     `SELECT payload FROM crm_integration_actions
      WHERE aggregate_type = 'crm_campaign_recipient' AND payload->>'campaignId' = $1`,
@@ -528,7 +661,7 @@ async function runApiAcceptance(baseUrl, token, pool) {
   assert.equal(childActions.rowCount, 2)
   assert.equal(childActions.rows.every((row) => row.payload.campaignRecipientId), true)
 
-  return { account, contact, lead, campaign, convertedLead, conversion }
+  return { account, contact, lead, meeting, campaign, callInteraction, convertedLead, conversion }
 }
 
 async function runMobileAcceptance(baseUrl, token, records, serverLogs) {
@@ -585,6 +718,45 @@ async function runMobileAcceptance(baseUrl, token, records, serverLogs) {
       `CRM portrait drawer ended offscreen: ${JSON.stringify(portraitGeometry)}`,
     )
     assert.ok(portraitGeometry.drawerWidth > 300)
+    await page.getByLabel('Close editor').click()
+
+    await page.getByRole('tab', { name: 'Interactions' }).click()
+    const interactionSearch = page.getByPlaceholder('Search interactions')
+    await interactionSearch.waitFor()
+    await interactionSearch.fill(records.callInteraction.referenceCode)
+    await interactionSearch.press('Enter')
+    const callRow = page.getByRole('row').filter({ hasText: records.callInteraction.referenceCode })
+    await callRow.waitFor({ timeout: 60_000 })
+    await callRow.getByRole('cell').nth(1).click()
+    await page.getByText('Edit Interaction', { exact: true }).waitFor()
+    const callDrawer = page.getByLabel('Close editor')
+      .locator('xpath=ancestor::*[contains(@class,"MuiDrawer-paper")][1]')
+    assert.equal(
+      (await callDrawer.getByRole('combobox', { name: 'Activity status' }).textContent())?.trim(),
+      'Held',
+    )
+    assert.equal(
+      (await callDrawer.getByRole('combobox', { name: 'Direction' }).textContent())?.trim(),
+      'Outbound',
+    )
+    assert.equal(await callDrawer.getByLabel('Duration (minutes)').inputValue(), '15')
+    await page.getByLabel('Close editor').click()
+
+    await page.getByRole('tab', { name: 'Meetings' }).click()
+    const meetingSearch = page.getByPlaceholder('Search meetings')
+    await meetingSearch.waitFor()
+    await meetingSearch.fill(records.meeting.referenceCode)
+    await meetingSearch.press('Enter')
+    const meetingRow = page.getByRole('row').filter({ hasText: records.meeting.referenceCode })
+    await meetingRow.waitFor({ timeout: 60_000 })
+    await meetingRow.getByRole('cell').nth(1).click()
+    await page.getByText('Edit Meeting', { exact: true }).waitFor()
+    const meetingDrawer = page.getByLabel('Close editor')
+      .locator('xpath=ancestor::*[contains(@class,"MuiDrawer-paper")][1]')
+    assert.equal(
+      (await meetingDrawer.getByRole('combobox', { name: 'Status' }).textContent())?.trim(),
+      'Planned',
+    )
     await page.getByLabel('Close editor').click()
 
     await page.getByRole('tab', { name: 'Campaigns' }).click()
