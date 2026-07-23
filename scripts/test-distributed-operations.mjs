@@ -112,6 +112,23 @@ function verifySourceContracts() {
     'Operations command results migration must persist exact idempotent responses',
   )
 
+  const packageWorkflowMigration = read('db/migrations/0085_operations_package_workflow.sql')
+  assert.ok(
+    packageWorkflowMigration.includes("ALTER COLUMN status SET DEFAULT 'planned'"),
+    'Operations package workflow must require explicit pack verification',
+  )
+
+  const packagingMigration = read('db/migrations/0086_product_packaging_profiles.sql')
+  for (const fragment of [
+    "('gpp', 'operations.product_package_profile'",
+    'CREATE TABLE IF NOT EXISTS operations_product_package_profiles',
+    'operations_product_package_profiles_pipeline_scope_fkey',
+    'operations_product_package_profiles_product_fkey',
+    'operations_product_package_profiles_product_key_unique',
+    "measurement_system text NOT NULL DEFAULT 'metric'",
+    "source IN ('manual', 'csv_import', 'provider_sync')",
+  ]) assert.ok(packagingMigration.includes(fragment), `Product packaging migration missing ${fragment}`)
+
   const persistence = read('app_src/lib/persistence/operations.ts')
   for (const fragment of [
     'readOperationsWorkspaceFromPostgres',
@@ -141,16 +158,71 @@ function verifySourceContracts() {
     "commandType: 'confirm_operations_order_picks'",
     "eventType: 'operations.pick.completed'",
     "eventType: 'operations.order.picks_confirmed'",
+    'verifyOperationsOrderPackFromPostgres',
+    "commandType: 'verify_operations_order_pack'",
+    "eventType: 'operations.package.packed'",
+    "eventType: 'operations.order.pack_verified'",
+    'readDefaultProductPackagingWithClient',
   ]) assert.ok(persistence.includes(fragment), `Operations persistence missing ${fragment}`)
   assert.ok(!persistence.includes('console.'), 'Operations persistence must not log tenant data')
 
   const adapters = read('app_src/lib/operations/adapters.ts')
-  for (const fragment of ['CommerceAdapter', 'CarrierAdapter', 'PrintAdapter', 'MockCommerceAdapter', 'MockCarrierAdapter', 'MockPrintAdapter']) {
+  for (const fragment of [
+    'CommerceAdapter',
+    'CarrierAdapter',
+    'CarrierAdapterDescriptor',
+    'supports(capability: CarrierCapability)',
+    'validateAddress?',
+    'estimateTransit?',
+    'voidLabel?',
+    'track?',
+    'createManifest?',
+    'createPickup?',
+    'reconcileLabel?',
+    'PrintAdapter',
+    'MockCommerceAdapter',
+    'MockCarrierAdapter',
+    'MockPrintAdapter',
+  ]) {
     assert.ok(adapters.includes(fragment), `Operations adapter boundary missing ${fragment}`)
   }
 
+  const carrierTypes = read('app_src/lib/operations/types.ts')
+  for (const fragment of [
+    'CarrierProvider',
+    'CarrierCapability',
+    'CarrierAdapterDescriptor',
+    'CarrierAddressValidationResult',
+    'CarrierTransitEstimate',
+    'CarrierTrackingResult',
+    'CarrierLabelReconciliationResult',
+  ]) assert.ok(carrierTypes.includes(fragment), `Carrier domain contract missing ${fragment}`)
+
+  const rocketShipIt = read('app_src/lib/operations/carriers/rocketShipIt.ts')
+  for (const fragment of [
+    "'https://api.rocketship.it/v1'",
+    "'UPS-REST'",
+    "'FedEx-REST'",
+    "'GetAllRates'",
+    "'SubmitShipment'",
+    "'VoidShipment'",
+    "'GetTrackingDocuments'",
+    'ROCKETSHIPIT_DEBUG_FORBIDDEN',
+    'ROCKETSHIPIT_RESPONSE_TOO_LARGE',
+    'RocketShipItCloudClient',
+  ]) assert.ok(rocketShipIt.includes(fragment), `RocketShipIt transport missing ${fragment}`)
+  assert.ok(!rocketShipIt.includes('console.'), 'RocketShipIt transport must not log credentials or shipment data')
+
   const domain = read('app_src/lib/operations/domain.ts')
-  for (const fragment of ['availableOperationsOrderActions', 'DeterministicFulfillmentOptimizer', 'cartonizeSinglePackage', 'selectPromiseRate', 'priceContract']) {
+  for (const fragment of [
+    'availableOperationsOrderActions',
+    'DeterministicFulfillmentOptimizer',
+    'cartonizeSinglePackage',
+    'selectPromiseRate',
+    'priceContract',
+    'unitsPerPackage',
+    'packageQuantity',
+  ]) {
     assert.ok(domain.includes(fragment), `Operations domain missing ${fragment}`)
   }
 
@@ -164,12 +236,14 @@ function verifySourceContracts() {
     'runMockOperationsProofFromPostgres',
     'releaseOperationsOrderFromPostgres',
     'confirmOperationsOrderPicksFromPostgres',
+    'verifyOperationsOrderPackFromPostgres',
     'updateOperationsExceptionInPostgres',
     "'Cache-Control': 'private, no-store'",
     'MAX_REQUEST_BYTES',
     "action === 'run-proof-order'",
     "action === 'release-order'",
     "action === 'confirm-picks'",
+    "action === 'verify-pack'",
     'Idempotency-Key',
     "action === 'update-exception'",
     "action === 'update-activation'",
@@ -201,6 +275,46 @@ function verifySourceContracts() {
     health.includes('row?.operations_command_results_migration_applied'),
     'Health migration status must include operations command result persistence',
   )
+  assert.ok(
+    health.includes("WHERE filename = '0085_operations_package_workflow.sql'"),
+    'Health must require the operations package workflow migration',
+  )
+  assert.ok(
+    health.includes("WHERE filename = '0086_product_packaging_profiles.sql'"),
+    'Health must require the product packaging profiles migration',
+  )
+
+  const packaging = read('app_src/lib/persistence/productPackaging.ts')
+  for (const fragment of [
+    'upsertProductPackagingProfileWithClient',
+    'readProductPackagingProfilesInPostgres',
+    'readDefaultProductPackagingWithClient',
+    "eventType: 'operations.product_packaging.updated'",
+    'row_version = operations_product_package_profiles.row_version + 1',
+    'measurementSystem',
+  ]) assert.ok(packaging.includes(fragment), `Product packaging persistence missing ${fragment}`)
+
+  const catalogRoute = read('app_src/app/api/pipeline/catalog/route.ts')
+  for (const fragment of [
+    'packageName',
+    'packageType',
+    'unitOfMeasure',
+    'unitsPerPackage',
+    'measurementSystem',
+    'dimensionFactor',
+    'weightFactor',
+    '25.4',
+    '453.59237',
+    "}, 'csv_import')",
+  ]) assert.ok(catalogRoute.includes(fragment), `Pipeline catalog package import missing ${fragment}`)
+
+  const catalogDialog = read('app_src/components/pipeline/PipelineCatalogDialog.tsx')
+  for (const fragment of [
+    'Metric (cm / kg)',
+    'Imperial (in / lb)',
+    'measurementSystem,length,width,height,weight',
+    'packageDisplayValues',
+  ]) assert.ok(catalogDialog.includes(fragment), `Pipeline catalog unit UI missing ${fragment}`)
 
   const predeploy = read('scripts/verify-predeploy.mjs')
   assert.ok(
@@ -215,6 +329,90 @@ function verifySourceContracts() {
     predeploy.includes("'db/migrations/0084_operations_command_results.sql'"),
     'Predeploy must require the operations command results migration',
   )
+  assert.ok(
+    predeploy.includes("'db/migrations/0085_operations_package_workflow.sql'"),
+    'Predeploy must require the operations package workflow migration',
+  )
+  assert.ok(
+    predeploy.includes("'db/migrations/0086_product_packaging_profiles.sql'"),
+    'Predeploy must require the product packaging profiles migration',
+  )
+}
+
+async function verifyCarrierTransport() {
+  const requests = []
+  const transport = loadTypeScriptModule('app_src/lib/operations/carriers/rocketShipIt.ts')
+  const client = new transport.RocketShipItCloudClient({
+    apiKey: 'rocketshipit-test-key',
+    fetch: async (url, init) => {
+      requests.push({ url: String(url), init })
+      if (String(url).endsWith('/health')) return new Response('', { status: 200 })
+      return new Response(JSON.stringify({
+        meta: { code: 200 },
+        data: { rates: [{ service_code: 'GROUND', rate: 12.34 }], errors: [] },
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    },
+  })
+
+  const health = await client.health()
+  assert.equal(health.healthy, true)
+  assert.equal(health.status, 200)
+  const result = await client.execute({
+    carrier: 'UPS-REST',
+    action: 'GetAllRates',
+    params: { account_number: 'configured-in-secret-layer' },
+  })
+  assert.equal(result.meta.code, 200)
+  assert.equal(result.data.rates[0].service_code, 'GROUND')
+  assert.equal(requests[1].url, 'https://api.rocketship.it/v1')
+  assert.equal(requests[1].init.method, 'POST')
+  assert.equal(requests[1].init.headers['Content-Type'], 'application/json')
+  assert.equal(requests[1].init.headers['x-api-key'], 'rocketshipit-test-key')
+  const requestBody = JSON.parse(requests[1].init.body)
+  assert.equal(requestBody.carrier, 'UPS-REST')
+  assert.equal(requestBody.action, 'GetAllRates')
+  assert.equal(requestBody.debug, undefined)
+
+  await expectRejected(
+    () => client.execute({
+      carrier: 'UPS-REST',
+      action: 'GetAllRates',
+      params: { nested: { debug: true } },
+    }),
+    (error) => error.code === 'ROCKETSHIPIT_DEBUG_FORBIDDEN',
+    'RocketShipIt production transport must reject debug payloads',
+  )
+  await expectRejected(
+    () => client.execute({
+      carrier: 'Unsupported',
+      action: 'GetAllRates',
+      params: {},
+    }),
+    (error) => error.code === 'ROCKETSHIPIT_CARRIER_UNSUPPORTED',
+    'RocketShipIt transport must reject unapproved carriers',
+  )
+
+  const carrierErrorClient = new transport.RocketShipItCloudClient({
+    apiKey: 'rocketshipit-test-key',
+    fetch: async () => new Response(JSON.stringify({
+      meta: { code: 200 },
+      data: { errors: [{ message: 'provider response containing sensitive shipment detail' }] },
+    }), { status: 200 }),
+  })
+  await expectRejected(
+    () => carrierErrorClient.execute({
+      carrier: 'FedEx-REST',
+      action: 'SubmitShipment',
+      params: { private_key: 'must-not-appear-in-errors' },
+    }),
+    (error) => (
+      error.code === 'ROCKETSHIPIT_CARRIER_ERROR'
+      && error.providerErrorCount === 1
+      && !error.message.includes('sensitive shipment detail')
+      && !error.message.includes('must-not-appear-in-errors')
+    ),
+    'RocketShipIt errors must remain bounded and redact request/provider payloads',
+  )
 }
 
 async function verifyRouteBehavior() {
@@ -225,7 +423,7 @@ async function verifyRouteBehavior() {
       this.status = status
     }
   }
-  const calls = { reads: [], proofs: [], releases: [], picks: [], exceptions: [], activations: [] }
+  const calls = { reads: [], proofs: [], releases: [], picks: [], packs: [], exceptions: [], activations: [] }
   const route = loadTypeScriptModule('app_src/app/api/operations/route.ts', {
     mocks: {
       'next/server': {
@@ -276,6 +474,15 @@ async function verifyRouteBehavior() {
           return {
             orderGlobalId: input.orderGlobalId,
             orderStatus: 'picking',
+            rowVersion: input.expectedRowVersion + 1,
+            replayed: false,
+          }
+        },
+        verifyOperationsOrderPackFromPostgres: async (input) => {
+          calls.packs.push(input)
+          return {
+            orderGlobalId: input.orderGlobalId,
+            orderStatus: 'packed',
             rowVersion: input.expectedRowVersion + 1,
             replayed: false,
           }
@@ -498,6 +705,51 @@ async function verifyRouteBehavior() {
     expectedRowVersion: 5,
     reason: 'Picker verified every ready task',
     idempotencyKey: 'picks-route-proof-1',
+  })
+
+  const deniedPackVerification = await route.POST(request('http://localhost/api/operations', {
+    actor: { ...actor, capabilities: { canView: true, canManage: true, canExecute: false, canActivate: false } },
+    headers: { 'Content-Type': 'application/json', 'Idempotency-Key': 'pack-route-denied-1' },
+    body: JSON.stringify({
+      action: 'verify-pack',
+      orderGlobalId: 'gor1234567',
+      expectedRowVersion: 6,
+      reason: 'Packer verified the carton',
+    }),
+  }))
+  assert.equal(deniedPackVerification.status, 403)
+  assert.equal((await payload(deniedPackVerification)).code, 'OPERATIONS_EXECUTE_REQUIRED')
+
+  const packVerificationWithoutKey = await route.POST(request('http://localhost/api/operations', {
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      action: 'verify-pack',
+      orderGlobalId: 'gor1234567',
+      expectedRowVersion: 6,
+      reason: 'Packer verified the carton',
+    }),
+  }))
+  assert.equal(packVerificationWithoutKey.status, 400)
+  assert.equal((await payload(packVerificationWithoutKey)).code, 'OPERATIONS_IDEMPOTENCY_KEY_INVALID')
+
+  const validPackVerification = await route.POST(request('http://localhost/api/operations', {
+    headers: { 'Content-Type': 'application/json', 'Idempotency-Key': 'pack-route-proof-1' },
+    body: JSON.stringify({
+      action: 'verify-pack',
+      orderGlobalId: 'gor1234567',
+      expectedRowVersion: 6,
+      reason: 'Packer verified the carton',
+    }),
+  }))
+  assert.equal(validPackVerification.status, 200)
+  assert.equal(calls.packs.length, 1)
+  assert.deepEqual(JSON.parse(JSON.stringify(calls.packs[0])), {
+    organizationId: actor.organizationId,
+    actorEmail: actor.email,
+    orderGlobalId: 'gor1234567',
+    expectedRowVersion: 6,
+    reason: 'Packer verified the carton',
+    idempotencyKey: 'pack-route-proof-1',
   })
 
   const validExceptionUpdate = await route.POST(request('http://localhost/api/operations', {
@@ -815,25 +1067,121 @@ async function verifyPostgresAcceptance(databaseUrl) {
   })
   try {
     await pool.query('SELECT 1')
+    const postgres = postgresMock(pool)
+    const auditWriter = auditWriterMock()
     const domain = loadTypeScriptModule('app_src/lib/operations/domain.ts')
     const adapters = loadTypeScriptModule('app_src/lib/operations/adapters.ts', {
       mocks: { '@/lib/operations/domain': domain },
     })
     const stableId = loadTypeScriptModule('app_src/lib/crm/stableId.ts')
+    const productPackaging = loadTypeScriptModule('app_src/lib/persistence/productPackaging.ts', {
+      mocks: {
+        '@/lib/auditWriter': auditWriter,
+        '@/lib/persistence/postgres': postgres,
+      },
+    })
     const persistence = loadTypeScriptModule('app_src/lib/persistence/operations.ts', {
       mocks: {
-        '@/lib/auditWriter': auditWriterMock(),
+        '@/lib/auditWriter': auditWriter,
         '@/lib/crm/stableId': stableId,
         '@/lib/operations/adapters': adapters,
         '@/lib/operations/domain': domain,
         '@/lib/persistence/crm': {
           stageCrmRecordWithClient: stageCommerceCustomerForAcceptance,
         },
-        '@/lib/persistence/postgres': postgresMock(pool),
+        '@/lib/persistence/postgres': postgres,
+        '@/lib/persistence/productPackaging': productPackaging,
       },
     })
     const primary = await seedWorkspace(pool, 'primary')
     const other = await seedWorkspace(pool, 'other')
+    const firstPackageProfile = await postgres.withTransaction((client) => (
+      productPackaging.upsertProductPackagingProfileWithClient(client, {
+        organizationId: primary.organizationId,
+        pipelineId: primary.pipelineId,
+        productId: primary.product.id,
+        actorEmail: primary.email,
+        profile: {
+          profileName: 'Default case',
+          packageType: 'case',
+          unitOfMeasure: 'case',
+          unitsPerPackage: 2,
+          measurementSystem: 'metric',
+          lengthMm: 410,
+          widthMm: 310,
+          heightMm: 205,
+          weightGrams: 1100,
+          active: true,
+          source: 'csv_import',
+        },
+      })
+    ))
+    assert.match(firstPackageProfile.globalId, /^gpp\d{7}$/)
+    assert.equal(firstPackageProfile.rowVersion, 0)
+    assert.equal(firstPackageProfile.source, 'csv_import')
+    assert.equal(firstPackageProfile.measurementSystem, 'metric')
+
+    const updatedPackageProfile = await postgres.withTransaction((client) => (
+      productPackaging.upsertProductPackagingProfileWithClient(client, {
+        organizationId: primary.organizationId,
+        pipelineId: primary.pipelineId,
+        productId: primary.product.id,
+        actorEmail: primary.email,
+        profile: {
+          profileName: 'Team-managed case',
+          packageType: 'case',
+          unitOfMeasure: 'case',
+          unitsPerPackage: 2,
+          measurementSystem: 'imperial',
+          lengthMm: 420,
+          widthMm: 320,
+          heightMm: 210,
+          weightGrams: 1200,
+          active: true,
+          source: 'manual',
+        },
+      })
+    ))
+    assert.equal(updatedPackageProfile.globalId, firstPackageProfile.globalId)
+    assert.equal(updatedPackageProfile.rowVersion, 1)
+    assert.equal(updatedPackageProfile.source, 'manual')
+    assert.equal(updatedPackageProfile.measurementSystem, 'imperial')
+    const packageProfileEvidence = await pool.query(
+      `SELECT
+         (SELECT count(*) FROM operations_product_package_profiles
+          WHERE organization_id = $1::uuid AND product_id = $2::uuid)::int AS profiles,
+         (SELECT count(*) FROM audit_events
+          WHERE organization_id = $1::uuid
+            AND aggregate_id = $3
+            AND event_type = 'operations.product_packaging.updated')::int AS audits`,
+      [primary.organizationId, primary.product.id, firstPackageProfile.globalId],
+    )
+    assert.deepEqual(packageProfileEvidence.rows[0], { profiles: 1, audits: 2 })
+    await expectRejected(
+      () => postgres.withTransaction((client) => (
+        productPackaging.upsertProductPackagingProfileWithClient(client, {
+          organizationId: other.organizationId,
+          pipelineId: primary.pipelineId,
+          productId: primary.product.id,
+          actorEmail: other.email,
+          profile: {
+            profileName: 'Cross-workspace case',
+            packageType: 'case',
+            unitOfMeasure: 'case',
+            unitsPerPackage: 1,
+            measurementSystem: 'metric',
+            lengthMm: 100,
+            widthMm: 100,
+            heightMm: 100,
+            weightGrams: 100,
+            active: true,
+            source: 'manual',
+          },
+        })
+      )),
+      (error) => error.code === '23503',
+      'Cross-workspace package profile writes must fail',
+    )
     const externalOrderId = `mock-${randomUUID()}`
     const primaryProof = proofInput(primary, externalOrderId, { executionMode: 'shipped' })
     const first = await persistence.runMockOperationsProofFromPostgres({
@@ -1011,7 +1359,7 @@ async function verifyPostgresAcceptance(databaseUrl) {
       [primary.organizationId, first.orderGlobalId],
     )
     assert.equal(money.rows[0].estimated_revenue_minor, money.rows[0].billable_total)
-    assert.equal(money.rows[0].billable_total, '1335')
+    assert.equal(money.rows[0].billable_total, '1472')
     assert.equal(money.rows[0].billable_count, 4)
 
     const workspace = await persistence.readOperationsWorkspaceFromPostgres({
@@ -1029,7 +1377,7 @@ async function verifyPostgresAcceptance(databaseUrl) {
     assert.equal(workspace.summary.shippedToday, 1)
     assert.equal(workspace.summary.availableUnits, 10)
     assert.equal(workspace.summary.reservedUnits, 0)
-    assert.equal(workspace.summary.unbilledMinor, '1335')
+    assert.equal(workspace.summary.unbilledMinor, '1472')
 
     const multiExternalOrderId = `multi-${randomUUID()}`
     const multiProof = proofInput(primary, multiExternalOrderId, { executionMode: 'shipped' })
@@ -1138,6 +1486,11 @@ async function verifyPostgresAcceptance(databaseUrl) {
     assert.equal(plannedWorkspace.selectedOrder.lines[0].reservedQuantity, 1)
     assert.equal(plannedWorkspace.selectedOrder.lines[0].pickStatus, null)
     assert.equal(plannedWorkspace.selectedOrder.packages[0].status, 'planned')
+    assert.equal(plannedWorkspace.selectedOrder.packages[0].weightGrams, 1200)
+    assert.deepEqual(
+      JSON.parse(JSON.stringify(plannedWorkspace.selectedOrder.packages[0].dimensionsMm)),
+      { length: 420, width: 320, height: 210 },
+    )
     assert.equal(plannedWorkspace.selectedOrder.pickTaskCount, 0)
     assert.equal(plannedWorkspace.selectedOrder.readyPickTaskCount, 0)
     const plannedReleaseAction = plannedWorkspace.selectedOrder.availableActions.find(
@@ -1146,8 +1499,12 @@ async function verifyPostgresAcceptance(databaseUrl) {
     const plannedPickAction = plannedWorkspace.selectedOrder.availableActions.find(
       (action) => action.action === 'confirm_picks',
     )
+    const plannedPackAction = plannedWorkspace.selectedOrder.availableActions.find(
+      (action) => action.action === 'verify_pack',
+    )
     assert.equal(plannedReleaseAction.enabled, true)
     assert.equal(plannedPickAction.enabled, false)
+    assert.equal(plannedPackAction.enabled, false)
 
     const expectedRowVersion = plannedWorkspace.selectedOrder.rowVersion
     const releaseInput = {
@@ -1336,8 +1693,130 @@ async function verifyPostgresAcceptance(databaseUrl) {
     const pickingPickAction = pickingWorkspace.selectedOrder.availableActions.find(
       (action) => action.action === 'confirm_picks',
     )
+    const pickingPackAction = pickingWorkspace.selectedOrder.availableActions.find(
+      (action) => action.action === 'verify_pack',
+    )
     assert.equal(pickingPickAction.enabled, false)
     assert.match(pickingPickAction.blockedReason, /already confirmed/i)
+    assert.equal(pickingPackAction.enabled, true)
+
+    const packInput = {
+      organizationId: primary.organizationId,
+      actorEmail: primary.email,
+      orderGlobalId: planned.orderGlobalId,
+      expectedRowVersion: picked.rowVersion,
+      reason: 'Acceptance packer verified the planned carton',
+      idempotencyKey: `pack-acceptance-${randomUUID()}`,
+    }
+    const packed = await persistence.verifyOperationsOrderPackFromPostgres(packInput)
+    assert.equal(packed.orderGlobalId, planned.orderGlobalId)
+    assert.equal(packed.orderStatus, 'packed')
+    assert.equal(packed.rowVersion, picked.rowVersion + 1)
+    assert.equal(packed.replayed, false)
+
+    const replayedPack = await persistence.verifyOperationsOrderPackFromPostgres(packInput)
+    assert.deepEqual(JSON.parse(JSON.stringify(replayedPack)), {
+      ...JSON.parse(JSON.stringify(packed)),
+      replayed: true,
+    })
+    const pickReplayAfterPack = await persistence.confirmOperationsOrderPicksFromPostgres(pickInput)
+    assert.deepEqual(JSON.parse(JSON.stringify(pickReplayAfterPack)), {
+      ...JSON.parse(JSON.stringify(picked)),
+      replayed: true,
+    })
+    const releaseReplayAfterPack = await persistence.releaseOperationsOrderFromPostgres(releaseInput)
+    assert.deepEqual(JSON.parse(JSON.stringify(releaseReplayAfterPack)), {
+      ...JSON.parse(JSON.stringify(released)),
+      replayed: true,
+    })
+
+    const packEvidence = await pool.query(
+      `SELECT orders.status, orders.row_version::int,
+              min(package.status) AS package_status,
+              (SELECT count(*) FROM operations_domain_events event
+               WHERE event.organization_id = orders.organization_id
+                 AND event.aggregate_global_id = orders.global_id
+                 AND event.event_type = 'operations.package.packed')::int AS pack_events,
+              (SELECT count(*) FROM audit_events audit
+               WHERE audit.organization_id = orders.organization_id
+                 AND audit.aggregate_id = orders.global_id
+                 AND audit.event_type = 'operations.order.pack_verified')::int AS pack_audits,
+              (SELECT count(*) FROM operations_billable_events billable
+               WHERE billable.organization_id = orders.organization_id
+                 AND billable.order_id = orders.id
+                 AND billable.event_type = 'pack')::int AS pack_billables,
+              (SELECT count(*) FROM operations_reservations reservation
+               JOIN operations_order_lines line
+                 ON line.organization_id = reservation.organization_id
+                AND line.id = reservation.order_line_id
+               WHERE line.organization_id = orders.organization_id
+                 AND line.order_id = orders.id
+                 AND reservation.status = 'active')::int AS active_reservations,
+              (SELECT count(*) FROM operations_shipments shipment
+               WHERE shipment.organization_id = orders.organization_id
+                 AND shipment.order_id = orders.id)::int AS shipments,
+              (SELECT count(*) FROM operations_labels label
+               WHERE label.organization_id = orders.organization_id
+                 AND label.package_id IN (
+                   SELECT package_filter.id
+                   FROM operations_packages package_filter
+                   WHERE package_filter.organization_id = orders.organization_id
+                     AND package_filter.plan_id = plan.id
+                 ))::int AS labels,
+              (SELECT count(*) FROM operations_print_jobs print_job
+               WHERE print_job.organization_id = orders.organization_id
+                 AND print_job.label_id IN (
+                   SELECT label_filter.id
+                   FROM operations_labels label_filter
+                   JOIN operations_packages package_filter
+                     ON package_filter.organization_id = label_filter.organization_id
+                    AND package_filter.id = label_filter.package_id
+                   WHERE package_filter.organization_id = orders.organization_id
+                     AND package_filter.plan_id = plan.id
+                 ))::int AS print_jobs
+       FROM operations_orders orders
+       JOIN operations_fulfillment_plans plan
+         ON plan.organization_id = orders.organization_id AND plan.order_id = orders.id
+       JOIN operations_packages package
+         ON package.organization_id = plan.organization_id AND package.plan_id = plan.id
+       WHERE orders.organization_id = $1::uuid AND orders.global_id = $2
+       GROUP BY orders.id, plan.id`,
+      [primary.organizationId, planned.orderGlobalId],
+    )
+    assert.deepEqual(packEvidence.rows[0], {
+      status: 'packed',
+      row_version: picked.rowVersion + 1,
+      package_status: 'packed',
+      pack_events: 1,
+      pack_audits: 1,
+      pack_billables: 1,
+      active_reservations: 1,
+      shipments: 0,
+      labels: 0,
+      print_jobs: 0,
+    })
+
+    const packedWorkspace = await persistence.readOperationsWorkspaceFromPostgres({
+      organizationId: primary.organizationId,
+      capabilities: { canView: true, canManage: true, canExecute: true },
+      selectedOrderGlobalId: planned.orderGlobalId,
+    })
+    assert.equal(packedWorkspace.selectedOrder.status, 'packed')
+    assert.equal(packedWorkspace.selectedOrder.packages[0].status, 'packed')
+    const packedPackAction = packedWorkspace.selectedOrder.availableActions.find(
+      (action) => action.action === 'verify_pack',
+    )
+    assert.equal(packedPackAction.enabled, false)
+    assert.match(packedPackAction.blockedReason, /already complete/i)
+
+    await expectRejected(
+      () => persistence.verifyOperationsOrderPackFromPostgres({
+        ...packInput,
+        idempotencyKey: `pack-stale-${randomUUID()}`,
+      }),
+      (error) => error.code === 'OPERATIONS_ORDER_VERSION_CONFLICT',
+      'A stale order version must not verify warehouse packages twice',
+    )
 
     await expectRejected(
       () => persistence.confirmOperationsOrderPicksFromPostgres({
@@ -1563,6 +2042,7 @@ async function verifyDisposablePostgres() {
 
 async function main() {
   verifySourceContracts()
+  await verifyCarrierTransport()
   await verifyRouteBehavior()
   if (!contractsOnly) await verifyDisposablePostgres()
   console.log(`Distributed operations contracts passed${contractsOnly ? '' : ' with disposable PostgreSQL acceptance'}`)

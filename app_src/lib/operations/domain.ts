@@ -25,6 +25,10 @@ export function availableOperationsOrderActions(input: {
   allocatedLineCount: number
   pickTaskCount: number
   readyPickTaskCount: number
+  pickedPickTaskCount: number
+  packageCount: number
+  plannedPackageCount: number
+  packedPackageCount: number
   blockingExceptionCount: number
 }): OperationsOrderActionAvailability[] {
   let releaseBlockedReason: string | null = null
@@ -63,6 +67,27 @@ export function availableOperationsOrderActions(input: {
     pickBlockedReason = 'Resolve high or critical order exceptions before confirming picks.'
   }
 
+  let packBlockedReason: string | null = null
+  if (!input.canExecute) {
+    packBlockedReason = 'Operations execute permission is required.'
+  } else if (!['shadow', 'active'].includes(input.activationState)) {
+    packBlockedReason = 'Set Operations to Shadow or Active before verifying packages.'
+  } else if (input.status !== 'picking') {
+    packBlockedReason = input.status === 'packed' || input.status === 'shipped'
+      ? 'Package verification is already complete.'
+      : 'Confirm every pick before verifying packages.'
+  } else if (input.planStatus !== 'released' || input.waveStatus !== 'completed') {
+    packBlockedReason = 'The fulfillment plan must be released and its wave completed before packing.'
+  } else if (input.pickTaskCount < 1 || input.pickedPickTaskCount !== input.pickTaskCount) {
+    packBlockedReason = 'Every pick task must be complete before verifying packages.'
+  } else if (input.packageCount < 1 || input.plannedPackageCount !== input.packageCount) {
+    packBlockedReason = input.packedPackageCount === input.packageCount
+      ? 'Package verification is already complete.'
+      : 'Every package must be in the planned state before verification.'
+  } else if (input.blockingExceptionCount > 0) {
+    packBlockedReason = 'Resolve high or critical order exceptions before verifying packages.'
+  }
+
   return [
     {
       action: 'release_to_warehouse',
@@ -75,6 +100,12 @@ export function availableOperationsOrderActions(input: {
       label: 'Confirm all picks',
       enabled: pickBlockedReason === null,
       blockedReason: pickBlockedReason,
+    },
+    {
+      action: 'verify_pack',
+      label: 'Verify packages',
+      enabled: packBlockedReason === null,
+      blockedReason: packBlockedReason,
     },
   ]
 }
@@ -107,10 +138,12 @@ export function cartonizeSinglePackage(lines: CommerceOrderLineInput[]): Package
   if (!lines.length) throw new Error('OPERATIONS_ORDER_LINES_REQUIRED')
   const aggregate = lines.reduce((result, line) => {
     const quantity = assertPositiveQuantity(line.quantity)
-    result.weight += Math.max(0, integer(line.weightGrams)) * quantity
+    const unitsPerPackage = Math.max(1, integer(line.unitsPerPackage, 1))
+    const packageQuantity = Math.ceil(quantity / unitsPerPackage)
+    result.weight += Math.max(0, integer(line.weightGrams)) * packageQuantity
     result.length = Math.max(result.length, Math.max(1, integer(line.dimensionsMm.length, 100)))
     result.width = Math.max(result.width, Math.max(1, integer(line.dimensionsMm.width, 100)))
-    result.height += Math.max(1, integer(line.dimensionsMm.height, 100)) * quantity
+    result.height += Math.max(1, integer(line.dimensionsMm.height, 100)) * packageQuantity
     result.ids.push(line.externalLineId)
     return result
   }, { weight: 0, length: 1, width: 1, height: 0, ids: [] as string[] })

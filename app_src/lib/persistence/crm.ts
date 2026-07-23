@@ -26,6 +26,12 @@ import type {
 } from '@/lib/crm/types'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import { syncPipelineProductDropdownCatalogInPostgres } from '@/lib/persistence/pipeline'
+import {
+  readDefaultProductPackagingWithClient,
+  readProductPackagingProfilesInPostgres,
+  upsertProductPackagingProfileWithClient,
+  type ProductPackagingProfileInput,
+} from '@/lib/persistence/productPackaging'
 import { splitPipelineProductNames } from '@/lib/pipeline/productNames.mjs'
 import { query, withTransaction } from '@/lib/persistence/postgres'
 import { appPublicUrl } from '@/lib/publicUrl'
@@ -2810,7 +2816,8 @@ function productFromRow(row: Record<string, unknown>): CrmProduct {
     sku: clean(row.sku), productType: clean(row.product_type), category: clean(row.category), status: clean(row.status),
     price: finite(row.price), cost: finite(row.cost), currency: clean(row.currency) || 'USD', url: clean(row.url),
     description: clean(row.description),
-    active: row.active !== false, syncStatus: row.sync_status as CrmProduct['syncStatus'], syncError: nullable(row.sync_error),
+    active: row.active !== false, packaging: null,
+    syncStatus: row.sync_status as CrmProduct['syncStatus'], syncError: nullable(row.sync_error),
     updatedAt: String(row.updated_at),
   }
 }
@@ -3833,6 +3840,20 @@ export async function readPipelineCatalogInPostgres(input: {
     readPipelineCatalogPeople(context),
     listCrmRecordsInPostgres({ pipelineId: input.pipelineId, entity: 'products', limit: 1000 }) as Promise<CrmProduct[]>,
   ])
+  const packagingProfiles = await readProductPackagingProfilesInPostgres({
+    organizationId: context.workspaceOrganizationId,
+    pipelineId: context.pipelineId,
+    productIds: products.map((product) => product.id),
+  })
+  const packagingByProductId = new Map(
+    packagingProfiles
+      .filter((profile) => profile.isDefault)
+      .map((profile) => [profile.productId, profile]),
+  )
+  const productsWithPackaging = products.map((product) => ({
+    ...product,
+    packaging: packagingByProductId.get(product.id) || null,
+  }))
   if (input.reconcile !== false) {
     await syncPipelineProductDropdownCatalogInPostgres({
       pipelineId: input.pipelineId,
@@ -3840,7 +3861,7 @@ export async function readPipelineCatalogInPostgres(input: {
       ownerNames: people.filter((person) => person.active).map((person) => person.displayName),
     })
   }
-  return { people, products }
+  return { people, products: productsWithPackaging }
 }
 
 export async function upsertPipelineCatalogPersonInPostgres(input: {
@@ -3941,6 +3962,7 @@ export async function upsertPipelineCatalogProductInPostgres(input: {
   actorEmail: string
   id?: string | null
   fields: StageProductInput['fields']
+  packaging?: ProductPackagingProfileInput | null
   deferDropdownSync?: boolean
 }) {
   const context = await requirePipelineCatalogOrganization(input)
@@ -3999,7 +4021,21 @@ export async function upsertPipelineCatalogProductInPostgres(input: {
       `SELECT * FROM crm_products WHERE pipeline_id = $1::uuid AND id = $2::uuid LIMIT 1`,
       [context.pipelineId, staged.id],
     )
-    return productFromRow(saved.rows[0])
+    const product = productFromRow(saved.rows[0])
+    const packaging = input.packaging
+      ? await upsertProductPackagingProfileWithClient(client, {
+        organizationId: context.workspaceOrganizationId,
+        pipelineId: context.pipelineId,
+        productId: product.id,
+        actorEmail: input.actorEmail,
+        profile: input.packaging,
+      })
+      : (await readDefaultProductPackagingWithClient(client, {
+        organizationId: context.workspaceOrganizationId,
+        pipelineId: context.pipelineId,
+        productIds: [product.id],
+      })).get(product.id) || null
+    return { ...product, packaging }
   })
   if (!input.deferDropdownSync) {
     await syncPipelineProductDropdownCatalogInPostgres({

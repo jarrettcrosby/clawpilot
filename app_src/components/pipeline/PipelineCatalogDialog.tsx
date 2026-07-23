@@ -15,12 +15,15 @@ import IconButton from '@mui/material/IconButton'
 import List from '@mui/material/List'
 import ListItem from '@mui/material/ListItem'
 import ListItemText from '@mui/material/ListItemText'
+import MenuItem from '@mui/material/MenuItem'
 import Stack from '@mui/material/Stack'
 import Switch from '@mui/material/Switch'
 import Tab from '@mui/material/Tab'
 import Tabs from '@mui/material/Tabs'
 import TextField from '@mui/material/TextField'
 import Tooltip from '@mui/material/Tooltip'
+import ToggleButton from '@mui/material/ToggleButton'
+import ToggleButtonGroup from '@mui/material/ToggleButtonGroup'
 import Typography from '@mui/material/Typography'
 import useMediaQuery from '@mui/material/useMediaQuery'
 import CloseRounded from '@mui/icons-material/CloseRounded'
@@ -57,6 +60,19 @@ export type PipelineCatalogProduct = {
   url: string
   description: string
   active: boolean
+  packaging: {
+    globalId: string
+    profileName: string
+    packageType: 'each' | 'inner_pack' | 'case' | 'carton' | 'pallet'
+    unitOfMeasure: string
+    unitsPerPackage: number
+    measurementSystem: 'metric' | 'imperial'
+    lengthMm: number
+    widthMm: number
+    heightMm: number
+    weightGrams: number
+    active: boolean
+  } | null
 }
 
 export type PipelineCatalogSnapshot = {
@@ -73,6 +89,7 @@ type ImportResult = {
 }
 
 type WorkflowField = 'stage' | 'priority' | 'status' | 'source' | 'loss_reason'
+type MeasurementSystem = 'metric' | 'imperial'
 
 const WORKFLOW_FIELDS: Array<{ key: WorkflowField; label: string; helper: string }> = [
   { key: 'stage', label: 'Stages', helper: 'One pipeline lane per line, in display order.' },
@@ -105,12 +122,64 @@ const EMPTY_PRODUCT = {
   url: '',
   description: '',
   active: true,
+  packageName: '',
+  packageType: 'each',
+  unitOfMeasure: 'each',
+  unitsPerPackage: '1',
+  measurementSystem: 'metric' as MeasurementSystem,
+  length: '',
+  width: '',
+  height: '',
+  weight: '',
+  packagingActive: true,
+}
+
+function decimalInput(value: string) {
+  const normalized = value.replace(/[^0-9.]/g, '')
+  const [whole, ...fraction] = normalized.split('.')
+  return fraction.length ? `${whole}.${fraction.join('')}` : whole
+}
+
+function displayNumber(value: number) {
+  return String(Number(value.toFixed(3)))
+}
+
+function packageDisplayValues(packaging: PipelineCatalogProduct['packaging'], system: MeasurementSystem) {
+  if (!packaging) return { length: '', width: '', height: '', weight: '' }
+  const dimensionDivisor = system === 'imperial' ? 25.4 : 10
+  const weightDivisor = system === 'imperial' ? 453.59237 : 1_000
+  return {
+    length: displayNumber(packaging.lengthMm / dimensionDivisor),
+    width: displayNumber(packaging.widthMm / dimensionDivisor),
+    height: displayNumber(packaging.heightMm / dimensionDivisor),
+    weight: displayNumber(packaging.weightGrams / weightDivisor),
+  }
+}
+
+function convertDisplayValue(value: string, from: MeasurementSystem, to: MeasurementSystem, kind: 'dimension' | 'weight') {
+  if (!value.trim() || from === to) return value
+  const number = Number(value)
+  if (!Number.isFinite(number)) return value
+  const canonical = kind === 'dimension'
+    ? number * (from === 'imperial' ? 25.4 : 10)
+    : number * (from === 'imperial' ? 453.59237 : 1_000)
+  const divisor = kind === 'dimension'
+    ? (to === 'imperial' ? 25.4 : 10)
+    : (to === 'imperial' ? 453.59237 : 1_000)
+  return displayNumber(canonical / divisor)
+}
+
+function packageSummary(packaging: NonNullable<PipelineCatalogProduct['packaging']>) {
+  const values = packageDisplayValues(packaging, packaging.measurementSystem)
+  const dimensionUnit = packaging.measurementSystem === 'imperial' ? 'in' : 'cm'
+  const weightUnit = packaging.measurementSystem === 'imperial' ? 'lb' : 'kg'
+  return `${values.length} x ${values.width} x ${values.height} ${dimensionUnit} · ${values.weight} ${weightUnit}`
 }
 
 function downloadCsvTemplate(kind: 'people' | 'products') {
   const value = kind === 'people'
     ? 'fullName,email,jobTitle,active\nTaylor Morgan,taylor@example.com,Sales Manager,true\n'
-    : 'name,sku,productType,category,status,price,cost,currency,url,description,active\nConsulting,CONSULT-01,Service,Advisory,Active,250,0,USD,https://example.com/consulting,Professional services,true\n'
+    : 'name,sku,productType,category,status,price,cost,currency,url,description,active,packageName,packageType,unitOfMeasure,unitsPerPackage,measurementSystem,length,width,height,weight,packagingActive\nShipping carton,CARTON-01,Good,Packaging,Active,4.5,1.25,USD,https://example.com/carton,Standard fulfillment carton,true,Default carton,carton,carton,1,imperial,16,12,10,1.5,true\n'
   const url = URL.createObjectURL(new Blob([value], { type: 'text/csv;charset=utf-8' }))
   const anchor = document.createElement('a')
   anchor.href = url
@@ -236,6 +305,11 @@ export default function PipelineCatalogDialog({
           ...product,
           price: Number(product.price || 0),
           cost: Number(product.cost || 0),
+          unitsPerPackage: Number(product.unitsPerPackage || 1),
+          length: product.length ? Number(product.length) : '',
+          width: product.width ? Number(product.width) : '',
+          height: product.height ? Number(product.height) : '',
+          weight: product.weight ? Number(product.weight) : '',
         }),
       })
       const payload = await response.json().catch(() => ({}))
@@ -368,7 +442,7 @@ export default function PipelineCatalogDialog({
             {tab === 'people'
               ? 'ClawPilot users are included automatically. CRM-only people can own pipeline work without receiving application access.'
               : tab === 'products'
-                ? 'Active CRM products are the only products offered when creating or editing opportunities.'
+                ? 'Import or maintain the shared product catalog and its default package data. Active products are offered in opportunities and fulfillment orders.'
                 : 'These choices and their order apply only to the selected pipeline.'}
           </Typography>
           {catalog.canEdit && tab !== 'workflow' ? (
@@ -449,6 +523,13 @@ export default function PipelineCatalogDialog({
                           url: item.url,
                           description: item.description,
                           active: item.active,
+                          packageName: item.packaging?.profileName || '',
+                          packageType: item.packaging?.packageType || 'each',
+                          unitOfMeasure: item.packaging?.unitOfMeasure || 'each',
+                          unitsPerPackage: String(item.packaging?.unitsPerPackage || 1),
+                          measurementSystem: item.packaging?.measurementSystem || 'metric',
+                          ...packageDisplayValues(item.packaging, item.packaging?.measurementSystem || 'metric'),
+                          packagingActive: item.packaging?.active !== false,
                         })
                         setProductEditorOpen(true)
                       }}><EditRounded /></IconButton>
@@ -461,6 +542,9 @@ export default function PipelineCatalogDialog({
                       item.sku || item.referenceCode,
                       item.category,
                       item.price ? `${item.currency || 'USD'} ${Number(item.price).toLocaleString()}` : '',
+                      item.packaging
+                        ? packageSummary(item.packaging)
+                        : 'Package data not set',
                     ].filter(Boolean).join(' · ')}
                     primaryTypographyProps={{ component: 'div', fontWeight: 600, sx: { pr: 5, overflowWrap: 'anywhere' } }}
                     secondaryTypographyProps={{ sx: { mt: 0.5, pr: 5, overflowWrap: 'anywhere' } }}
@@ -535,6 +619,55 @@ export default function PipelineCatalogDialog({
               </Stack>
               <TextField label="Product URL" type="url" value={product.url} onChange={(event) => setProduct({ ...product, url: event.target.value })} />
               <TextField multiline minRows={3} label="Description" value={product.description} onChange={(event) => setProduct({ ...product, description: event.target.value })} />
+              <Divider />
+              <Box>
+                <Typography variant="subtitle2" fontWeight={700}>Default package</Typography>
+                <Typography variant="body2" color="text.secondary">Optional team-managed dimensions and weight used by cartonization, carrier rating, and fulfillment planning.</Typography>
+              </Box>
+              <Stack direction={{ xs: 'column', sm: 'row' }} gap={1.5}>
+                <TextField fullWidth label="Package name" value={product.packageName} onChange={(event) => setProduct({ ...product, packageName: event.target.value })} />
+                <TextField select fullWidth label="Package type" value={product.packageType} onChange={(event) => setProduct({ ...product, packageType: event.target.value })}>
+                  <MenuItem value="each">Each</MenuItem>
+                  <MenuItem value="inner_pack">Inner pack</MenuItem>
+                  <MenuItem value="case">Case</MenuItem>
+                  <MenuItem value="carton">Carton</MenuItem>
+                  <MenuItem value="pallet">Pallet</MenuItem>
+                </TextField>
+                <TextField fullWidth label="Unit of measure" value={product.unitOfMeasure} onChange={(event) => setProduct({ ...product, unitOfMeasure: event.target.value })} />
+                <TextField fullWidth label="Units per package" inputMode="numeric" value={product.unitsPerPackage} onChange={(event) => setProduct({ ...product, unitsPerPackage: event.target.value.replace(/[^0-9]/g, '') })} />
+              </Stack>
+              <ToggleButtonGroup
+                exclusive
+                fullWidth
+                size="small"
+                value={product.measurementSystem}
+                onChange={(_, next: MeasurementSystem | null) => {
+                  if (!next || next === product.measurementSystem) return
+                  setProduct({
+                    ...product,
+                    measurementSystem: next,
+                    length: convertDisplayValue(product.length, product.measurementSystem, next, 'dimension'),
+                    width: convertDisplayValue(product.width, product.measurementSystem, next, 'dimension'),
+                    height: convertDisplayValue(product.height, product.measurementSystem, next, 'dimension'),
+                    weight: convertDisplayValue(product.weight, product.measurementSystem, next, 'weight'),
+                  })
+                }}
+                aria-label="Package measurement system"
+              >
+                <ToggleButton value="metric">Metric (cm / kg)</ToggleButton>
+                <ToggleButton value="imperial">Imperial (in / lb)</ToggleButton>
+              </ToggleButtonGroup>
+              <Stack direction={{ xs: 'column', sm: 'row' }} gap={1.5}>
+                <TextField fullWidth label={`Length (${product.measurementSystem === 'imperial' ? 'in' : 'cm'})`} inputMode="decimal" value={product.length} onChange={(event) => setProduct({ ...product, length: decimalInput(event.target.value) })} />
+                <TextField fullWidth label={`Width (${product.measurementSystem === 'imperial' ? 'in' : 'cm'})`} inputMode="decimal" value={product.width} onChange={(event) => setProduct({ ...product, width: decimalInput(event.target.value) })} />
+                <TextField fullWidth label={`Height (${product.measurementSystem === 'imperial' ? 'in' : 'cm'})`} inputMode="decimal" value={product.height} onChange={(event) => setProduct({ ...product, height: decimalInput(event.target.value) })} />
+                <TextField fullWidth label={`Weight (${product.measurementSystem === 'imperial' ? 'lb' : 'kg'})`} inputMode="decimal" value={product.weight} onChange={(event) => setProduct({ ...product, weight: decimalInput(event.target.value) })} />
+              </Stack>
+              <Typography variant="caption" color="text.secondary">Enter all four measurement fields together. Leave all four blank when package data is not yet known.</Typography>
+              <Stack direction="row" alignItems="center" justifyContent="space-between">
+                <Typography variant="body2">Use this package profile for fulfillment planning</Typography>
+                <Switch checked={product.packagingActive} onChange={(event) => setProduct({ ...product, packagingActive: event.target.checked })} />
+              </Stack>
               <Stack direction="row" alignItems="center" justifyContent="space-between">
                 <Typography variant="body2">Available when selecting products</Typography>
                 <Switch checked={product.active} onChange={(event) => setProduct({ ...product, active: event.target.checked })} />

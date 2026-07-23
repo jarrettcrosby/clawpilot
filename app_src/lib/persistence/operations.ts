@@ -39,6 +39,7 @@ import type {
   PricingDirective,
 } from '@/lib/operations/types'
 import { stageCrmRecordWithClient } from '@/lib/persistence/crm'
+import { readDefaultProductPackagingWithClient } from '@/lib/persistence/productPackaging'
 import {
   acquireTransactionAdvisoryLock,
   query,
@@ -1203,6 +1204,7 @@ async function readOrderDetail(
     status: OperationsOrderStatus
     currency: string
     row_version: string
+    plan_id: string | null
     plan_status: string | null
     wave_status: string | null
     warehouse_name: string | null
@@ -1212,6 +1214,10 @@ async function readOrderDetail(
     allocated_line_count: string
     pick_task_count: string
     ready_pick_task_count: string
+    picked_pick_task_count: string
+    package_count: string
+    planned_package_count: string
+    packed_package_count: string
     exception_count: string
     blocking_exception_count: string
     expected_cost_minor: string | null
@@ -1225,7 +1231,8 @@ async function readOrderDetail(
        orders.id::text, orders.global_id, orders.order_number, orders.external_order_id,
        customer.name AS customer_name, customer.reference_code AS customer_global_id,
        orders.source_provider, orders.status, orders.currency, orders.ship_to,
-       orders.row_version::text, plan.status AS plan_status, wave.status AS wave_status,
+       orders.row_version::text, plan.id::text AS plan_id,
+       plan.status AS plan_status, wave.status AS wave_status,
        plan_warehouse.name AS warehouse_name, orders.promised_delivery_at,
        (SELECT count(*) FROM operations_order_lines line WHERE line.order_id = orders.id)::text AS line_count,
        (SELECT count(*) FROM operations_order_lines line
@@ -1247,6 +1254,17 @@ async function readOrderDetail(
        (SELECT count(*) FROM operations_pick_tasks pick
         WHERE pick.organization_id = orders.organization_id AND pick.plan_id = plan.id
           AND pick.status = 'ready')::text AS ready_pick_task_count,
+       (SELECT count(*) FROM operations_pick_tasks pick
+        WHERE pick.organization_id = orders.organization_id AND pick.plan_id = plan.id
+          AND pick.status = 'picked' AND pick.picked_quantity = pick.quantity)::text AS picked_pick_task_count,
+       (SELECT count(*) FROM operations_packages package
+        WHERE package.organization_id = orders.organization_id AND package.plan_id = plan.id)::text AS package_count,
+       (SELECT count(*) FROM operations_packages package
+        WHERE package.organization_id = orders.organization_id AND package.plan_id = plan.id
+          AND package.status = 'planned')::text AS planned_package_count,
+       (SELECT count(*) FROM operations_packages package
+        WHERE package.organization_id = orders.organization_id AND package.plan_id = plan.id
+          AND package.status IN ('packed', 'labeled', 'shipped'))::text AS packed_package_count,
        (SELECT count(*) FROM operations_exceptions exception
         WHERE exception.order_id = orders.id AND exception.status IN ('open', 'acknowledged'))::text AS exception_count,
        (SELECT count(*) FROM operations_exceptions exception
@@ -1296,11 +1314,12 @@ async function readOrderDetail(
        FROM operations_order_lines line
        JOIN crm_products product ON product.id = line.product_id AND product.pipeline_id = line.pipeline_id
        LEFT JOIN operations_reservations reservation ON reservation.order_line_id = line.id
-       LEFT JOIN operations_fulfillment_allocations allocation ON allocation.order_line_id = line.id
+       LEFT JOIN operations_fulfillment_allocations allocation
+         ON allocation.order_line_id = line.id AND allocation.plan_id = $3::uuid
        LEFT JOIN operations_pick_tasks pick ON pick.allocation_id = allocation.id
        WHERE line.organization_id = $1::uuid AND line.order_id = $2::uuid
        ORDER BY line.created_at, line.id`,
-      [organizationId, row.id],
+      [organizationId, row.id, row.plan_id],
     ),
     query<QueryResultRow & {
       global_id: string
@@ -1314,10 +1333,9 @@ async function readOrderDetail(
       `SELECT package.global_id, package.package_number, package.weight_grams,
               package.length_mm, package.width_mm, package.height_mm, package.status
        FROM operations_packages package
-       JOIN operations_fulfillment_plans plan ON plan.id = package.plan_id
-       WHERE package.organization_id = $1::uuid AND plan.order_id = $2::uuid
+       WHERE package.organization_id = $1::uuid AND package.plan_id = $2::uuid
        ORDER BY package.package_number`,
-      [organizationId, row.id],
+      [organizationId, row.plan_id],
     ),
     query<QueryResultRow & {
       global_id: string
@@ -1333,10 +1351,9 @@ async function readOrderDetail(
               rate.customer_charge_minor::text, rate.estimated_delivery_at,
               rate.meets_promise, rate.selected
        FROM operations_carrier_rates rate
-       JOIN operations_fulfillment_plans plan ON plan.id = rate.plan_id
-       WHERE rate.organization_id = $1::uuid AND plan.order_id = $2::uuid
+       WHERE rate.organization_id = $1::uuid AND rate.plan_id = $2::uuid
        ORDER BY rate.internal_cost_minor, rate.carrier, rate.service_code`,
-      [organizationId, row.id],
+      [organizationId, row.plan_id],
     ),
     query<QueryResultRow & { global_id: string; event_type: string; amount_minor: string; status: string }>(
       `SELECT global_id, event_type, amount_minor::text, status
@@ -1369,6 +1386,10 @@ async function readOrderDetail(
     waveStatus: row.wave_status,
     pickTaskCount: Number(row.pick_task_count),
     readyPickTaskCount: Number(row.ready_pick_task_count),
+    pickedPickTaskCount: Number(row.picked_pick_task_count),
+    packageCount: Number(row.package_count),
+    plannedPackageCount: Number(row.planned_package_count),
+    packedPackageCount: Number(row.packed_package_count),
     availableActions: availableOperationsOrderActions({
       status: row.status,
       activationState: context.activationState,
@@ -1380,6 +1401,10 @@ async function readOrderDetail(
       allocatedLineCount: Number(row.allocated_line_count),
       pickTaskCount: Number(row.pick_task_count),
       readyPickTaskCount: Number(row.ready_pick_task_count),
+      pickedPickTaskCount: Number(row.picked_pick_task_count),
+      packageCount: Number(row.package_count),
+      plannedPackageCount: Number(row.planned_package_count),
+      packedPackageCount: Number(row.packed_package_count),
       blockingExceptionCount: Number(row.blocking_exception_count),
     }),
     warehouseName: row.warehouse_name,
@@ -2109,6 +2134,11 @@ export async function runMockOperationsProofFromPostgres(input: {
         await resolveProduct(client, pipeline.id, proofLine.productGlobalId),
       )
     }
+    const packagingByProductId = await readDefaultProductPackagingWithClient(client, {
+      organizationId,
+      pipelineId: pipeline.id,
+      productIds: [...products.values()].map((product) => product.id),
+    })
     const totalQuantity = proofLines.reduce((sum, line) => sum + line.quantity, 0)
     const currency = assertCurrency('USD')
     const requestedDeliveryAt = new Date(input.proof.requestedDeliveryAt)
@@ -2133,17 +2163,32 @@ export async function runMockOperationsProofFromPostgres(input: {
       lines: proofLines.map((proofLine, index) => {
         const product = products.get(proofLine.productGlobalId)
         if (!product) throw new Error('OPERATIONS_PRODUCT_RESOLUTION_MISSING')
+        const packaging = packagingByProductId.get(product.id)
         return {
           externalLineId: `${input.proof.externalOrderId}:${index + 1}`,
           channelSku: product.sku || product.reference_code,
           description: product.name,
           quantity: proofLine.quantity,
           unitPriceMinor: moneyMinorFromDecimal(product.price),
-          weightGrams: 350,
-          dimensionsMm: { length: 220, width: 160, height: 90 },
+          weightGrams: packaging?.weightGrams || 350,
+          unitsPerPackage: packaging?.unitsPerPackage || 1,
+          dimensionsMm: packaging
+            ? { length: packaging.lengthMm, width: packaging.widthMm, height: packaging.heightMm }
+            : { length: 220, width: 160, height: 90 },
         }
       }),
-      sourcePayload: { proof: true, lineCount: proofLines.length },
+      sourcePayload: {
+        proof: true,
+        lineCount: proofLines.length,
+        packaging: [...products.values()].map((product) => {
+          const packaging = packagingByProductId.get(product.id)
+          return {
+            productGlobalId: product.reference_code,
+            profileGlobalId: packaging?.globalId || null,
+            source: packaging ? 'team_managed_profile' : 'conservative_fallback',
+          }
+        }),
+      },
     })
     const configuration = await ensureProofConfiguration(client, {
       organizationId,
@@ -2293,6 +2338,10 @@ export async function runMockOperationsProofFromPostgres(input: {
         productGlobalIds: fulfillmentLines.map((item) => item.product.reference_code),
         lineCount: fulfillmentLines.length,
         mapping: 'resolved',
+        packageProfileGlobalIds: [...packagingByProductId.values()].map((profile) => profile.globalId),
+        packageFallbackProductGlobalIds: fulfillmentLines
+          .filter((item) => !packagingByProductId.has(item.product.id))
+          .map((item) => item.product.reference_code),
       },
     })
 
@@ -3572,6 +3621,344 @@ export async function confirmOperationsOrderPicksFromPostgres(input: {
         orderGlobalId: picked.global_id,
         orderStatus: picked.status,
         rowVersion: Number(picked.row_version),
+        replayed: false,
+      }
+      await completeCommandReceipt(client, command.receipt.id, order.global_id, result)
+
+      return result
+    })
+  } catch (error) {
+    await failCommandReceipt(command.receipt.id, error)
+    throw error
+  }
+}
+
+export async function verifyOperationsOrderPackFromPostgres(input: {
+  organizationId: string
+  actorEmail: string
+  orderGlobalId: string
+  expectedRowVersion: number
+  reason: string
+  idempotencyKey: string
+}): Promise<OperationsOrderCommandResult> {
+  const organizationId = requireOrganizationId(input.organizationId)
+  const actorEmail = String(input.actorEmail || '').trim().toLowerCase()
+  const orderGlobalId = String(input.orderGlobalId || '').trim()
+  const reason = String(input.reason || '').trim()
+  const idempotencyKey = String(input.idempotencyKey || '').trim()
+  if (!actorEmail) throw new OperationsRequestError('OPERATIONS_ACTOR_REQUIRED', 'A signed-in user is required', 401)
+  if (!/^gor\d{7}$/.test(orderGlobalId)) {
+    throw new OperationsRequestError('OPERATIONS_ORDER_INVALID', 'Order is invalid')
+  }
+  if (!Number.isSafeInteger(input.expectedRowVersion) || input.expectedRowVersion < 0) {
+    throw new OperationsRequestError('OPERATIONS_ORDER_VERSION_INVALID', 'Order version is invalid')
+  }
+  if (!reason || reason.length > 500) {
+    throw new OperationsRequestError('OPERATIONS_PACK_REASON_INVALID', 'A package verification reason is required')
+  }
+  if (!/^[A-Za-z0-9._:-]{8,200}$/.test(idempotencyKey)) {
+    throw new OperationsRequestError('OPERATIONS_IDEMPOTENCY_KEY_INVALID', 'A valid idempotency key is required')
+  }
+
+  const command = await prepareCommandReceipt({
+    organizationId,
+    commandType: 'verify_operations_order_pack',
+    idempotencyKey,
+    requestHash: commandRequestHash({ orderGlobalId, expectedRowVersion: input.expectedRowVersion, reason }),
+    actorEmail,
+  })
+  if (command.completed) {
+    return completedOrderCommandResult(organizationId, command.receipt)
+  }
+
+  try {
+    return await withTransaction(async (client) => {
+      await acquireTransactionAdvisoryLock(client, `operations:order:${organizationId}:${orderGlobalId}`)
+      const activation = await resolveActivation(client, organizationId)
+      if (!['shadow', 'active'].includes(activation.state)) {
+        throw new OperationsRequestError(
+          'OPERATIONS_EXECUTION_STATE_INVALID',
+          'Set Operations to Shadow or Active before verifying packages',
+          409,
+        )
+      }
+
+      const orderResult = await client.query<OrderIdentityRow & {
+        pipeline_id: string
+        customer_id: string
+        contract_version_id: string | null
+        currency: string
+      }>(
+        `SELECT id::text, global_id, status, row_version::text,
+                pipeline_id::text, customer_id::text, contract_version_id::text, currency
+         FROM operations_orders
+         WHERE organization_id = $1::uuid AND global_id = $2
+         FOR UPDATE`,
+        [organizationId, orderGlobalId],
+      )
+      const order = orderResult.rows[0]
+      if (!order || order.row_version === undefined) {
+        throw new OperationsRequestError('OPERATIONS_ORDER_NOT_FOUND', 'Operations order was not found', 404)
+      }
+      if (Number(order.row_version) !== input.expectedRowVersion) {
+        throw new OperationsRequestError(
+          'OPERATIONS_ORDER_VERSION_CONFLICT',
+          'This order changed after it was opened. Refresh the order before verifying packages.',
+          409,
+        )
+      }
+      if (order.status !== 'picking') {
+        throw new OperationsRequestError(
+          'OPERATIONS_ORDER_TRANSITION_INVALID',
+          `Order packages cannot be verified from ${order.status}`,
+          409,
+        )
+      }
+
+      const planResult = await client.query<QueryResultRow & {
+        id: string
+        global_id: string
+        status: string
+      }>(
+        `SELECT id::text, global_id, status
+         FROM operations_fulfillment_plans
+         WHERE organization_id = $1::uuid AND order_id = $2::uuid
+         ORDER BY version_number DESC
+         LIMIT 1
+         FOR UPDATE`,
+        [organizationId, order.id],
+      )
+      const plan = planResult.rows[0]
+      if (!plan || plan.status !== 'released') {
+        throw new OperationsRequestError(
+          'OPERATIONS_FULFILLMENT_PLAN_INVALID',
+          'The released fulfillment plan is unavailable for package verification',
+          409,
+        )
+      }
+
+      const waveResult = await client.query<IdRow & { status: string }>(
+        `SELECT wave.id::text, wave.global_id, wave.status
+         FROM operations_waves wave
+         WHERE wave.organization_id = $1::uuid
+           AND wave.id = (
+             SELECT pick.wave_id
+             FROM operations_pick_tasks pick
+             WHERE pick.organization_id = $1::uuid AND pick.plan_id = $2::uuid
+             ORDER BY pick.created_at, pick.id
+             LIMIT 1
+           )
+         FOR UPDATE`,
+        [organizationId, plan.id],
+      )
+      const wave = waveResult.rows[0]
+      if (!wave || wave.status !== 'completed') {
+        throw new OperationsRequestError(
+          'OPERATIONS_WAVE_INVALID',
+          'The warehouse wave must be complete before verifying packages',
+          409,
+        )
+      }
+
+      const pickResult = await client.query<QueryResultRow & {
+        global_id: string
+        status: string
+        quantity: string
+        picked_quantity: string
+      }>(
+        `SELECT global_id, status, quantity::text, picked_quantity::text
+         FROM operations_pick_tasks
+         WHERE organization_id = $1::uuid AND plan_id = $2::uuid
+         ORDER BY sequence_number, id
+         FOR UPDATE`,
+        [organizationId, plan.id],
+      )
+      if (pickResult.rows.length < 1 || pickResult.rows.some((pick) => (
+        pick.status !== 'picked' || Number(pick.picked_quantity) !== Number(pick.quantity)
+      ))) {
+        throw new OperationsRequestError(
+          'OPERATIONS_PICK_TASKS_INCOMPLETE',
+          'Every pick task must be complete before verifying packages',
+          409,
+        )
+      }
+
+      const packageResult = await client.query<QueryResultRow & {
+        id: string
+        global_id: string
+        package_number: number
+        status: string
+      }>(
+        `SELECT id::text, global_id, package_number, status
+         FROM operations_packages
+         WHERE organization_id = $1::uuid AND plan_id = $2::uuid
+         ORDER BY package_number, id
+         FOR UPDATE`,
+        [organizationId, plan.id],
+      )
+      if (packageResult.rows.length < 1 || packageResult.rows.some((item) => item.status !== 'planned')) {
+        throw new OperationsRequestError(
+          'OPERATIONS_PACKAGES_NOT_PLANNED',
+          'Every package must be in the planned state before verification',
+          409,
+        )
+      }
+
+      const blockingResult = await client.query<QueryResultRow & { count: string }>(
+        `SELECT count(*)::text AS count
+         FROM operations_exceptions
+         WHERE organization_id = $1::uuid AND order_id = $2::uuid
+           AND status IN ('open', 'acknowledged')
+           AND severity IN ('high', 'critical')`,
+        [organizationId, order.id],
+      )
+      if (Number(blockingResult.rows[0]?.count || 0) > 0) {
+        throw new OperationsRequestError(
+          'OPERATIONS_ORDER_BLOCKED_BY_EXCEPTION',
+          'Resolve high or critical order exceptions before verifying packages',
+          409,
+        )
+      }
+
+      const packedPackages = await client.query<QueryResultRow & { global_id: string }>(
+        `UPDATE operations_packages
+         SET status = 'packed', packed_by = $3, packed_at = now()
+         WHERE organization_id = $1::uuid AND plan_id = $2::uuid AND status = 'planned'
+         RETURNING global_id`,
+        [organizationId, plan.id, actorEmail],
+      )
+      if (Number(packedPackages.rowCount || 0) !== packageResult.rows.length) {
+        throw new OperationsRequestError(
+          'OPERATIONS_PACKAGES_CHANGED',
+          'Packages changed before they could be verified. Refresh and try again.',
+          409,
+        )
+      }
+
+      let billableEventCount = 0
+      if (order.contract_version_id) {
+        const directiveResult = await client.query<QueryResultRow & {
+          id: string
+          global_id: string
+          directive_type: PricingDirective['type']
+          priority: number
+          configuration: Record<string, unknown>
+        }>(
+          `SELECT id::text, global_id, directive_type, priority, configuration
+           FROM operations_pricing_directives
+           WHERE organization_id = $1::uuid AND contract_version_id = $2::uuid
+             AND directive_type = 'pack_fee'
+           ORDER BY priority, global_id`,
+          [organizationId, order.contract_version_id],
+        )
+        const directives: PricingDirective[] = directiveResult.rows.map((directive) => ({
+          id: directive.id,
+          globalId: directive.global_id,
+          type: directive.directive_type,
+          priority: directive.priority,
+          configuration: json(directive.configuration),
+        }))
+        for (const packageRow of packageResult.rows) {
+          for (const directive of directives) {
+            const charge = priceContract({
+              directives: [directive],
+              totalUnits: 1,
+              freightCostMinor: BigInt(0),
+              packageCount: 1,
+            }).charges[0]
+            if (!charge) continue
+            const billable = await client.query(
+              `INSERT INTO operations_billable_events (
+                 organization_id, pipeline_id, customer_id, order_id, contract_version_id,
+                 directive_id, event_type, quantity, amount_minor, currency, status,
+                 source_global_id, idempotency_key
+               ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid,
+                 $6::uuid, 'pack', 1, $7, $8, 'unbilled', $9, $10)
+               ON CONFLICT (organization_id, idempotency_key) DO NOTHING
+               RETURNING id`,
+              [
+                organizationId,
+                order.pipeline_id,
+                order.customer_id,
+                order.id,
+                order.contract_version_id,
+                charge.directiveId,
+                charge.amountMinor.toString(),
+                order.currency,
+                packageRow.global_id,
+                `${order.global_id}:pack:${packageRow.global_id}:${charge.directiveGlobalId}`,
+              ],
+            )
+            billableEventCount += Number(billable.rowCount || 0)
+          }
+        }
+      }
+
+      const updatedOrder = await client.query<OrderIdentityRow>(
+        `UPDATE operations_orders
+         SET status = 'packed', updated_by = $4, updated_at = now(), row_version = row_version + 1
+         WHERE organization_id = $1::uuid AND id = $2::uuid
+           AND status = 'picking' AND row_version = $3
+         RETURNING id::text, global_id, status, row_version::text`,
+        [organizationId, order.id, input.expectedRowVersion, actorEmail],
+      )
+      const packed = updatedOrder.rows[0]
+      if (!packed || packed.row_version === undefined) {
+        throw new OperationsRequestError(
+          'OPERATIONS_ORDER_VERSION_CONFLICT',
+          'This order changed before packages could be verified. Refresh and try again.',
+          409,
+        )
+      }
+
+      await appendDomainEvent(client, {
+        organizationId,
+        aggregateType: 'operations.order',
+        aggregateId: order.id,
+        aggregateGlobalId: order.global_id,
+        eventType: 'operations.package.packed',
+        actorEmail,
+        correlationId: command.receipt.correlation_id,
+        idempotencyKey: `${order.global_id}:pack-verified:${command.receipt.id}`,
+        payload: {
+          status: 'packed',
+          planGlobalId: plan.global_id,
+          waveGlobalId: wave.global_id,
+          packageGlobalIds: packedPackages.rows.map((item) => item.global_id),
+          billableEventCount,
+          reason,
+          reservationsRetained: true,
+          labelPurchased: false,
+          shipmentCreated: false,
+        },
+      })
+      await recordAuditEvent({
+        actor: actorEmail,
+        eventType: 'operations.order.pack_verified',
+        aggregateType: 'operations.order',
+        aggregateId: order.global_id,
+        subject: `Verified packages for ${order.global_id}`,
+        organizationId,
+        eventKey: `operations:order-pack-verified:${command.receipt.id}`,
+        payload: {
+          previousStatus: 'picking',
+          status: 'packed',
+          previousRowVersion: input.expectedRowVersion,
+          rowVersion: Number(packed.row_version),
+          planGlobalId: plan.global_id,
+          waveGlobalId: wave.global_id,
+          packageCount: packedPackages.rows.length,
+          billableEventCount,
+          reason,
+          reservationsRetained: true,
+          labelPurchased: false,
+          shipmentCreated: false,
+        },
+      }, client)
+      const result: OperationsOrderCommandResult = {
+        orderGlobalId: packed.global_id,
+        orderStatus: packed.status,
+        rowVersion: Number(packed.row_version),
         replayed: false,
       }
       await completeCommandReceipt(client, command.receipt.id, order.global_id, result)

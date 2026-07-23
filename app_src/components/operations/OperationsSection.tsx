@@ -224,6 +224,7 @@ function OrderDetailDrawer({
   onClose,
   onRelease,
   onConfirmPicks,
+  onVerifyPack,
 }: {
   order: OperationsOrderDetail | null
   open: boolean
@@ -231,16 +232,21 @@ function OrderDetailDrawer({
   onClose: () => void
   onRelease: () => void
   onConfirmPicks: () => void
+  onVerifyPack: () => void
 }) {
   const theme = useTheme()
   const mobile = useMediaQuery(theme.breakpoints.down('md'))
   const dateTime = useUserDateTime()
   const releaseAction = order?.availableActions?.find((item) => item.action === 'release_to_warehouse')
   const confirmPicksAction = order?.availableActions?.find((item) => item.action === 'confirm_picks')
-  const primaryAction = order?.status === 'released' || order?.status === 'picking'
+  const verifyPackAction = order?.availableActions?.find((item) => item.action === 'verify_pack')
+  const primaryAction = order?.status === 'released'
     ? confirmPicksAction
-    : releaseAction
+    : order?.status === 'picking' || order?.status === 'packed' || order?.status === 'shipped'
+      ? verifyPackAction
+      : releaseAction
   const confirmingPicks = primaryAction?.action === 'confirm_picks'
+  const verifyingPack = primaryAction?.action === 'verify_pack'
 
   return (
     <Drawer
@@ -298,26 +304,30 @@ function OrderDetailDrawer({
             </DetailSection>
 
             <DetailSection title="Order control">
-              <Box sx={{ display: 'grid', gridTemplateColumns: { xs: 'repeat(2, minmax(0, 1fr))', sm: 'repeat(4, minmax(0, 1fr))' }, gap: 1, mb: 1.5 }}>
+              <Box sx={{ display: 'grid', gridTemplateColumns: { xs: 'repeat(2, minmax(0, 1fr))', sm: 'repeat(3, minmax(0, 1fr))' }, gap: 1, mb: 1.5 }}>
                 <Box><Typography variant="caption" color="text.secondary">Plan</Typography><Typography>{displayStatus(order.planStatus || 'not planned')}</Typography></Box>
                 <Box><Typography variant="caption" color="text.secondary">Wave</Typography><Typography>{displayStatus(order.waveStatus || 'not released')}</Typography></Box>
                 <Box><Typography variant="caption" color="text.secondary">Picks ready</Typography><Typography>{order.readyPickTaskCount} / {order.pickTaskCount}</Typography></Box>
+                <Box><Typography variant="caption" color="text.secondary">Picks complete</Typography><Typography>{order.pickedPickTaskCount} / {order.pickTaskCount}</Typography></Box>
+                <Box><Typography variant="caption" color="text.secondary">Packages packed</Typography><Typography>{order.packedPackageCount} / {order.packageCount}</Typography></Box>
                 <Box><Typography variant="caption" color="text.secondary">Version</Typography><Typography>{order.rowVersion}</Typography></Box>
               </Box>
               {primaryAction?.blockedReason && <Alert severity="info" sx={{ mb: 1.5 }}>{primaryAction.blockedReason}</Alert>}
               {primaryAction && (
                 <Tooltip title={primaryAction.blockedReason || (confirmingPicks
                   ? 'Confirm every ready pick task and complete the released wave'
-                  : 'Create a released warehouse wave and ready pick tasks')}>
+                  : verifyingPack
+                    ? 'Verify the carton plan and record package-level billing evidence'
+                    : 'Create a released warehouse wave and ready pick tasks')}>
                   <span>
                     <Button
                       fullWidth
                       variant="contained"
-                      startIcon={busy ? <CircularProgress size={16} /> : confirmingPicks ? <TaskAltRounded /> : <WarehouseRounded />}
+                      startIcon={busy ? <CircularProgress size={16} /> : confirmingPicks ? <TaskAltRounded /> : verifyingPack ? <Inventory2Rounded /> : <WarehouseRounded />}
                       disabled={!primaryAction.enabled || busy}
-                      onClick={confirmingPicks ? onConfirmPicks : onRelease}
+                      onClick={confirmingPicks ? onConfirmPicks : verifyingPack ? onVerifyPack : onRelease}
                     >
-                      {busy ? (confirmingPicks ? 'Confirming picks' : 'Releasing') : primaryAction.label}
+                      {busy ? (confirmingPicks ? 'Confirming picks' : verifyingPack ? 'Verifying packages' : 'Releasing') : primaryAction.label}
                     </Button>
                   </span>
                 </Tooltip>
@@ -345,7 +355,13 @@ function OrderDetailDrawer({
               {order.packages.length ? <Stack divider={<Divider flexItem />}>
                 {order.packages.map((item) => (
                   <Box key={item.globalId} sx={{ py: 1.25, display: 'flex', justifyContent: 'space-between', gap: 2 }}>
-                    <Box><Typography fontWeight={600}>Package {item.packageNumber}</Typography><Typography variant="caption" color="text.secondary">{item.globalId}</Typography></Box>
+                    <Box>
+                      <Stack direction="row" spacing={1} alignItems="center">
+                        <Typography fontWeight={600}>Package {item.packageNumber}</Typography>
+                        <Chip size="small" label={displayStatus(item.status)} color={item.status === 'planned' ? 'default' : 'success'} />
+                      </Stack>
+                      <Typography variant="caption" color="text.secondary">{item.globalId}</Typography>
+                    </Box>
                     <Box sx={{ textAlign: 'right' }}><Typography>{item.weightGrams} g</Typography><Typography variant="caption" color="text.secondary">{item.dimensionsMm.length} × {item.dimensionsMm.width} × {item.dimensionsMm.height} mm</Typography></Box>
                   </Box>
                 ))}
@@ -523,7 +539,7 @@ function OperationsGuide({ open, onClose }: { open: boolean; onClose: () => void
         <Stack spacing={2.5}>
           <Box><Typography fontWeight={700}>1. Import and validate</Typography><Typography color="text.secondary">Orders enter through a commerce adapter. ClawPilot reuses provider mappings or a unique CRM identity match, creates a customer only when no match exists, and sends ambiguous matches to review.</Typography></Box>
           <Box><Typography fontWeight={700}>2. Promise and reserve</Typography><Typography color="text.secondary">ClawPilot selects a feasible warehouse, reserves customer-owned inventory, cartonizes the order, compares rates, and records the promise.</Typography></Box>
-          <Box><Typography fontWeight={700}>3. Release and execute</Typography><Typography color="text.secondary">Review the plan, reservations, package, rate, cost, revenue, and margin before releasing it. Release creates the warehouse wave and ready pick tasks; later commands move work through pick, pack, label, print, shipment, and channel fulfillment.</Typography></Box>
+          <Box><Typography fontWeight={700}>3. Release and execute</Typography><Typography color="text.secondary">Review the plan, reservations, packages, rates, cost, revenue, and margin before release. Release creates a wave and ready pick tasks. Pick confirmation completes the wave; package verification then records who packed each carton and accrues contract pack fees without purchasing a label or creating a shipment.</Typography></Box>
           <Box><Typography fontWeight={700}>4. Reconcile revenue</Typography><Typography color="text.secondary">Contract directives create immutable billable events for order handling, picks, packing, freight, storage, and special services.</Typography></Box>
           <Alert severity="info">This first slice uses deterministic mock commerce, carrier, and print adapters. It writes real tenant-scoped PostgreSQL records but does not contact a live provider.</Alert>
         </Stack>
@@ -564,6 +580,10 @@ export default function OperationsSection() {
   const [confirmPicksReason, setConfirmPicksReason] = useState('Confirm all ready pick tasks for the released wave')
   const [confirmPicksIdempotencyKey, setConfirmPicksIdempotencyKey] = useState('')
   const [confirmingPicks, setConfirmingPicks] = useState(false)
+  const [verifyPackOpen, setVerifyPackOpen] = useState(false)
+  const [verifyPackReason, setVerifyPackReason] = useState('Verify the carton plan after all warehouse picks are complete')
+  const [verifyPackIdempotencyKey, setVerifyPackIdempotencyKey] = useState('')
+  const [verifyingPack, setVerifyingPack] = useState(false)
 
   const loadWorkspace = useCallback(async (orderGlobalId?: string | null, signal?: AbortSignal) => {
     setLoading(true)
@@ -805,6 +825,53 @@ export default function OperationsSection() {
       setError(caught instanceof Error ? caught.message : 'Warehouse picks could not be confirmed')
     } finally {
       setConfirmingPicks(false)
+    }
+  }
+
+  const openVerifyPack = () => {
+    setVerifyPackReason('Verify the carton plan after all warehouse picks are complete')
+    setVerifyPackIdempotencyKey(`operations-pack:${detail?.globalId || 'order'}:${crypto.randomUUID()}`)
+    setVerifyPackOpen(true)
+  }
+
+  const closeVerifyPack = () => {
+    if (verifyingPack) return
+    setVerifyPackOpen(false)
+    setVerifyPackIdempotencyKey('')
+  }
+
+  const verifyPack = async (event: FormEvent) => {
+    event.preventDefault()
+    if (!detail || !verifyPackReason.trim() || !verifyPackIdempotencyKey) return
+    setVerifyingPack(true)
+    setError('')
+    setNotice('')
+    try {
+      const response = await fetch('/api/operations', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': verifyPackIdempotencyKey,
+        },
+        body: JSON.stringify({
+          action: 'verify-pack',
+          orderGlobalId: detail.globalId,
+          expectedRowVersion: detail.rowVersion,
+          reason: verifyPackReason.trim(),
+        }),
+      })
+      const payload = await response.json() as OperationsPayload
+      if (!response.ok || !payload.result || !('orderGlobalId' in payload.result) || !('rowVersion' in payload.result)) {
+        throw new Error(payload.error || 'Packages could not be verified')
+      }
+      setVerifyPackOpen(false)
+      setVerifyPackIdempotencyKey('')
+      setNotice(`Packages for order ${payload.result.orderGlobalId} were verified. No label or shipment was created.`)
+      await loadWorkspace(payload.result.orderGlobalId)
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'Packages could not be verified')
+    } finally {
+      setVerifyingPack(false)
     }
   }
 
@@ -1124,10 +1191,11 @@ export default function OperationsSection() {
       <OrderDetailDrawer
         order={detail}
         open={drawerOpen}
-        busy={releasingOrder || confirmingPicks}
+        busy={releasingOrder || confirmingPicks || verifyingPack}
         onClose={closeDrawer}
         onRelease={openRelease}
         onConfirmPicks={openConfirmPicks}
+        onVerifyPack={openVerifyPack}
       />
       <ExceptionDetailDrawer
         exception={selectedException}
@@ -1205,6 +1273,41 @@ export default function OperationsSection() {
               startIcon={confirmingPicks ? <CircularProgress size={16} /> : <TaskAltRounded />}
             >
               {confirmingPicks ? 'Confirming picks' : 'Confirm picks'}
+            </Button>
+          </DialogActions>
+        </Box>
+      </Dialog>
+
+      <Dialog open={verifyPackOpen} onClose={closeVerifyPack} fullWidth maxWidth="sm">
+        <Box component="form" onSubmit={verifyPack}>
+          <DialogTitle>Verify warehouse packages</DialogTitle>
+          <DialogContent dividers>
+            <Stack spacing={2}>
+              <Alert severity="warning">
+                This marks all {detail?.plannedPackageCount || 0} planned packages as packed for {detail?.orderNumber || 'this order'} and accrues versioned contract pack fees. Inventory reservations remain active. No label is purchased and no shipment is created.
+              </Alert>
+              <TextField
+                required
+                autoFocus
+                multiline
+                minRows={3}
+                label="Package verification reason"
+                value={verifyPackReason}
+                onChange={(event) => setVerifyPackReason(event.target.value)}
+                inputProps={{ maxLength: 500 }}
+                helperText={`${verifyPackReason.trim().length}/500 · Recorded in the audit history`}
+              />
+            </Stack>
+          </DialogContent>
+          <DialogActions>
+            <Button onClick={closeVerifyPack} disabled={verifyingPack}>Cancel</Button>
+            <Button
+              type="submit"
+              variant="contained"
+              disabled={verifyingPack || !verifyPackReason.trim()}
+              startIcon={verifyingPack ? <CircularProgress size={16} /> : <Inventory2Rounded />}
+            >
+              {verifyingPack ? 'Verifying packages' : 'Confirm package verification'}
             </Button>
           </DialogActions>
         </Box>

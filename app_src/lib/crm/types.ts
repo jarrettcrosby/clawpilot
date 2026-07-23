@@ -100,8 +100,30 @@ export type CrmProduct = {
   url: string
   description: string
   active: boolean
+  packaging: ProductPackagingProfile | null
   syncStatus: CrmSyncStatus
   syncError: string | null
+  updatedAt: string
+}
+
+export type ProductPackagingProfile = {
+  id: string
+  globalId: string
+  productId: string
+  profileKey: string
+  profileName: string
+  packageType: 'each' | 'inner_pack' | 'case' | 'carton' | 'pallet'
+  unitOfMeasure: string
+  unitsPerPackage: number
+  measurementSystem: 'metric' | 'imperial'
+  lengthMm: number
+  widthMm: number
+  heightMm: number
+  weightGrams: number
+  isDefault: boolean
+  active: boolean
+  source: 'manual' | 'csv_import' | 'provider_sync'
+  rowVersion: number
   updatedAt: string
 }
 
