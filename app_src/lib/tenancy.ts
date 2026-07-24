@@ -21,6 +21,11 @@ import {
   type AppUserStatus,
 } from '@/lib/users'
 import { requireWorkspaceAppUser } from '@/lib/workspaceMemberships'
+import {
+  DEMO_BOARD_ID,
+  DEMO_SYSTEM_EMAIL,
+  isDemoWorkspaceId,
+} from '@/lib/demoMode'
 
 export const BOARD_SELECTION_COOKIE = 'clawpilot_board_id'
 export const PIPELINE_SELECTION_COOKIE = 'clawpilot_pipeline_id'
@@ -254,7 +259,7 @@ async function ensureBasePipelineTemplate(client: PoolClient, pipelineId: string
 export async function ensureDefaultResourcesForUser(emailValue: TenantActorInput): Promise<{
   boardId: string
   pipelineId: string
-  crmBoardId: string
+  crmBoardId: string | null
   pipelineProvisioningRequired: boolean
 }> {
   const user = await resolveTenantActor(emailValue)
@@ -269,6 +274,48 @@ export async function ensureDefaultResourcesForUser(emailValue: TenantActorInput
   return withTransaction(async (client) => {
     await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [organization.id])
     await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 1))', [ownerEmail])
+
+    if (isDemoWorkspaceId(organization.id)) {
+      const demoWorkspace = await client.query<{ id: string }>(
+        `SELECT id::text
+         FROM workspace_organizations
+         WHERE id = $1::uuid
+           AND is_demo = true
+         FOR SHARE`,
+        [organization.id],
+      )
+      const demoPipeline = await client.query<{ id: string }>(
+        `SELECT id::text
+         FROM pipeline_spaces
+         WHERE workspace_organization_id = $1::uuid
+           AND owner_email = $2
+           AND is_default = true
+           AND sync_enabled = false
+           AND reference_access_disabled = false
+         ORDER BY updated_at DESC, created_at DESC, id
+         LIMIT 1
+         FOR SHARE`,
+        [organization.id, DEMO_SYSTEM_EMAIL],
+      )
+      const demoBoard = await client.query<{ id: string }>(
+        `SELECT id::text
+         FROM project_boards
+         WHERE id = $1::uuid
+           AND workspace_organization_id = $2::uuid
+           AND owner_email = $3
+         FOR SHARE`,
+        [DEMO_BOARD_ID, organization.id, DEMO_SYSTEM_EMAIL],
+      )
+      if (!demoWorkspace.rows[0] || !demoPipeline.rows[0] || !demoBoard.rows[0]) {
+        throw new Error('Demo account resources are not available')
+      }
+      return {
+        boardId: demoBoard.rows[0].id,
+        pipelineId: demoPipeline.rows[0].id,
+        crmBoardId: null,
+        pipelineProvisioningRequired: false,
+      }
+    }
 
     await client.query(
       `
@@ -297,7 +344,10 @@ export async function ensureDefaultResourcesForUser(emailValue: TenantActorInput
     let personalPipeline = await client.query<PipelineResourceRow>(
       `SELECT id::text, owner_email, provisioning_status, sheet_id, short_link_id::text, sync_enabled
        FROM pipeline_spaces
-       WHERE owner_email = $1 AND workspace_organization_id = $2::uuid AND is_default
+       WHERE owner_email = $1
+         AND workspace_organization_id = $2::uuid
+         AND is_default
+         AND reference_access_disabled = false
        LIMIT 1
        FOR UPDATE`,
       [ownerEmail, organization.id],
@@ -324,6 +374,7 @@ export async function ensureDefaultResourcesForUser(emailValue: TenantActorInput
       `SELECT pipeline.id::text, pipeline.owner_email
        FROM pipeline_spaces pipeline
        WHERE pipeline.workspace_organization_id = $1::uuid
+         AND pipeline.reference_access_disabled = false
        ORDER BY
          EXISTS (
            SELECT 1 FROM crm_board_projections projection
@@ -478,12 +529,13 @@ export async function listProjectBoards(
         ON membership.board_id = board.id
        AND membership.user_email = $1
       WHERE board.workspace_organization_id = $2::uuid
+        AND (NOT $3::boolean OR board.id = $4::uuid)
         AND (board.owner_email = $1 OR membership.user_email = $1)
       ORDER BY
         CASE WHEN board.owner_email = $1 AND board.is_default THEN 0 WHEN board.owner_email = $1 THEN 1 ELSE 2 END,
         board.created_at ASC
     `,
-    [actor.email, actor.organizationId],
+    [actor.email, actor.organizationId, isDemoWorkspaceId(actor.organizationId), DEMO_BOARD_ID],
   )
   return result.rows.map(toProjectBoard)
 }
@@ -543,6 +595,8 @@ export async function listPipelineSpaces(
       LEFT JOIN short_links short_link
         ON short_link.id = pipeline.short_link_id
       WHERE pipeline.workspace_organization_id = $2::uuid
+        AND pipeline.reference_access_disabled = false
+        AND (NOT $3::boolean OR pipeline.owner_email = $4)
         AND (pipeline.owner_email = $1 OR membership.user_email = $1)
       ORDER BY
         CASE
@@ -560,7 +614,7 @@ export async function listPipelineSpaces(
         END,
         pipeline.created_at ASC
     `,
-    [actor.email, actor.organizationId],
+    [actor.email, actor.organizationId, isDemoWorkspaceId(actor.organizationId), DEMO_SYSTEM_EMAIL],
   )
   return result.rows.map(toPipelineSpace)
 }

@@ -109,13 +109,14 @@ export async function ensureDemoWorkspaceMembership(actor: AppUser): Promise<Wor
       `SELECT id::text
        FROM pipeline_spaces
        WHERE workspace_organization_id = $1::uuid
+         AND owner_email = $2
          AND is_default = true
          AND sync_enabled = false
          AND reference_access_disabled = false
        ORDER BY updated_at DESC, created_at DESC, id
        LIMIT 1
        FOR SHARE`,
-      [DEMO_WORKSPACE_ID],
+      [DEMO_WORKSPACE_ID, DEMO_SYSTEM_EMAIL],
     )
     const activePipelineId = activePipeline.rows[0]?.id
     if (!activePipelineId) throw new Error('Demo pipeline is not available')

@@ -248,6 +248,7 @@ export async function GET() {
           operations_receiving_topology_migration_applied: boolean
           pos_payment_exceptions_migration_applied: boolean
           crm_reference_quarantine_migration_applied: boolean
+          demo_managed_resource_guard_migration_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -678,6 +679,11 @@ export async function GET() {
                 FROM schema_migrations
                 WHERE filename = '0103_pipeline_crm_reference_quarantine.sql'
               ) AS crm_reference_quarantine_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0104_demo_managed_resource_guard.sql'
+              ) AS demo_managed_resource_guard_migration_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -775,6 +781,7 @@ export async function GET() {
             && row?.operations_receiving_topology_migration_applied
             && row?.pos_payment_exceptions_migration_applied
             && row?.crm_reference_quarantine_migration_applied
+            && row?.demo_managed_resource_guard_migration_applied
             && row?.migration_checksums_present
           ),
         }
@@ -864,6 +871,7 @@ export async function GET() {
           || !row?.operations_receiving_topology_migration_applied
           || !row?.pos_payment_exceptions_migration_applied
           || !row?.crm_reference_quarantine_migration_applied
+          || !row?.demo_managed_resource_guard_migration_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')

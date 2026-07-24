@@ -539,6 +539,10 @@ assertIncludes(tenancyAdapter, 'ON CONFLICT (pipeline_id) DO UPDATE', 'empty pip
 assertIncludes(tenancyAdapter, "((EXCLUDED.catalog->'dropdowns') - 'product')", 'pipeline product preservation')
 assertIncludes(tenancyAdapter, '!personalPipeline.rows[0].short_link_id', 'personal pipeline short-link reconciliation signal')
 assertIncludes(tenancyAdapter, 'workspace_organization_id = $1::uuid', 'organization-primary CRM pipeline selection')
+assertIncludes(tenancyAdapter, 'isDemoWorkspaceId(organization.id)', 'managed demo resource reuse')
+assertIncludes(tenancyAdapter, 'pipeline.reference_access_disabled = false', 'quarantined pipeline access exclusion')
+assertIncludes(tenancyAdapter, 'NOT $3::boolean OR board.id = $4::uuid', 'demo board isolation')
+assertIncludes(tenancyAdapter, 'NOT $3::boolean OR pipeline.owner_email = $4', 'demo pipeline isolation')
 assertIncludes(tenancyAdapter, 'Only the board owner can share it', 'tenancy adapter')
 assertIncludes(tenancyAdapter, 'Only the pipeline owner can share it', 'tenancy adapter')
 
@@ -1543,6 +1547,7 @@ for (const migration of [
   '0097_operations_settlement_lifecycle.sql',
   '0102_pos_payment_exceptions.sql',
   '0103_pipeline_crm_reference_quarantine.sql',
+  '0104_demo_managed_resource_guard.sql',
 ]) {
   assertIncludes(healthRoute, migration, 'hosted POS and accounting migration health')
 }

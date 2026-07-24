@@ -246,6 +246,22 @@ async function verifyQuarantine(evidence) {
     if (!preferenceBlocked) {
       throw new Error('database allowed a workspace default on a quarantined demo pipeline')
     }
+    let personalPipelineBlocked = false
+    try {
+      await client.query(
+        `INSERT INTO pipeline_spaces (
+           name, owner_email, workspace_organization_id, is_default, sync_enabled
+         ) VALUES (
+           'My pipeline', 'demo-visitor@example.com',
+           '10000000-0000-4000-8000-000000000001'::uuid, true, false
+         )`,
+      )
+    } catch (error) {
+      personalPipelineBlocked = error?.code === '23514'
+    }
+    if (!personalPipelineBlocked) {
+      throw new Error('database allowed a personal pipeline in the managed demo workspace')
+    }
     await client.query(
       `UPDATE short_links
        SET disabled_at = NULL, updated_at = now()
