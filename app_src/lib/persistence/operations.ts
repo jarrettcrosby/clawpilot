@@ -72,10 +72,12 @@ type WarehouseRow = QueryResultRow & {
   global_id: string
   code: string
   name: string
+  facility_type: OperationsWorkspace['warehouses'][number]['facilityType']
   timezone: string
   address: Record<string, unknown>
   status: 'active' | 'inactive'
   cutoff_time: string | null
+  row_version: string
 }
 type WarehouseLocationRow = QueryResultRow & {
   id: string
@@ -84,8 +86,71 @@ type WarehouseLocationRow = QueryResultRow & {
   code: string
   zone: string
   location_type: OperationsWorkspace['warehouses'][number]['locations'][number]['locationType']
+  topology_level: OperationsWorkspace['warehouses'][number]['locations'][number]['topologyLevel']
+  parent_location_global_id: string | null
   pick_sequence: number
   active: boolean
+  max_volume_cubic_meters: string | null
+  max_weight_kg: string | null
+  used_volume_cubic_meters: string
+  used_weight_kg: string
+  allow_mixed_products: boolean
+  notes: string | null
+  row_version: string
+}
+type LocationProductRuleRow = QueryResultRow & {
+  global_id: string
+  location_id: string
+  product_global_id: string
+  product_name: string
+  rule_type: OperationsWorkspace['warehouses'][number]['locations'][number]['productRules'][number]['ruleType']
+  max_quantity: string | null
+  active: boolean
+}
+type InventoryPoolRow = QueryResultRow & {
+  id: string
+  global_id: string
+  name: string
+  pool_type: OperationsWorkspace['inventoryPools'][number]['poolType']
+  allocation_policy: OperationsWorkspace['inventoryPools'][number]['allocationPolicy']
+  owner_customer_global_id: string | null
+  owner_customer_name: string | null
+  active: boolean
+}
+type InventoryPoolCustomerRow = QueryResultRow & {
+  pool_id: string
+  global_id: string
+  name: string
+  priority: number
+}
+type InboundReceiptRow = QueryResultRow & {
+  id: string
+  global_id: string
+  reference_number: string
+  status: OperationsWorkspace['inboundReceipts'][number]['status']
+  warehouse_global_id: string
+  warehouse_name: string
+  pool_global_id: string
+  pool_name: string
+  expected_at: Date | null
+  completed_at: Date | null
+  row_version: string
+}
+type InboundReceiptLineRow = QueryResultRow & {
+  id: string
+  global_id: string
+  receipt_id: string
+  line_number: number
+  product_global_id: string
+  product_name: string
+  product_sku: string | null
+  location_global_id: string
+  location_code: string
+  expected_quantity: string
+  accepted_quantity: string
+  damaged_quantity: string
+  lot_code: string
+  unit_of_measure: string
 }
 type PositionRow = QueryResultRow & {
   id: string
@@ -1799,6 +1864,11 @@ export async function readOperationsWorkspaceFromPostgres(input: {
     exceptionResult,
     warehouseResult,
     warehouseLocationResult,
+    locationProductRuleResult,
+    inventoryPoolResult,
+    inventoryPoolCustomerResult,
+    inboundReceiptResult,
+    inboundReceiptLineResult,
     customerResult,
     productResult,
     sandboxCarrierAccountResult,
@@ -1925,8 +1995,8 @@ export async function readOperationsWorkspaceFromPostgres(input: {
       exceptionValues,
     ),
     query<WarehouseRow>(
-      `SELECT id::text, global_id, code, name, timezone, address, status,
-              cutoff_time::text
+      `SELECT id::text, global_id, code, name, facility_type, timezone, address, status,
+              cutoff_time::text, row_version::text
        FROM operations_warehouses
        WHERE organization_id = $1::uuid AND code <> 'MOCK-01'
        ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, lower(name), id`,
@@ -1935,13 +2005,109 @@ export async function readOperationsWorkspaceFromPostgres(input: {
     query<WarehouseLocationRow>(
       `SELECT location.id::text, location.global_id,
               location.warehouse_id::text, location.code, location.zone,
-              location.location_type, location.pick_sequence, location.active
+              location.location_type, location.topology_level,
+              parent.global_id AS parent_location_global_id,
+              location.pick_sequence, location.active,
+              location.max_volume_cubic_meters::text,
+              location.max_weight_kg::text,
+              COALESCE(usage.used_volume_cubic_meters, 0)::text AS used_volume_cubic_meters,
+              COALESCE(usage.used_weight_kg, 0)::text AS used_weight_kg,
+              location.allow_mixed_products, location.notes, location.row_version::text
        FROM operations_locations location
        JOIN operations_warehouses warehouse
          ON warehouse.organization_id = location.organization_id
         AND warehouse.id = location.warehouse_id
+       LEFT JOIN operations_locations parent
+         ON parent.organization_id = location.organization_id
+        AND parent.id = location.parent_location_id
+       LEFT JOIN LATERAL (
+         SELECT
+           COALESCE(sum(
+             position.on_hand_quantity
+             * profile.length_mm * profile.width_mm * profile.height_mm
+             / 1000000000.0
+           ), 0) AS used_volume_cubic_meters,
+           COALESCE(sum(position.on_hand_quantity * profile.weight_grams / 1000.0), 0) AS used_weight_kg
+         FROM operations_inventory_positions position
+         LEFT JOIN operations_product_package_profiles profile
+           ON profile.organization_id = position.organization_id
+          AND profile.product_id = position.product_id
+          AND profile.active = true
+          AND profile.is_default = true
+         WHERE position.organization_id = location.organization_id
+           AND position.location_id = location.id
+       ) usage ON true
        WHERE location.organization_id = $1::uuid AND warehouse.code <> 'MOCK-01'
        ORDER BY lower(warehouse.name), location.pick_sequence, lower(location.code), location.id`,
+      [organizationId],
+    ),
+    query<LocationProductRuleRow>(
+      `SELECT rule.global_id, rule.location_id::text,
+              product.reference_code AS product_global_id, product.name AS product_name,
+              rule.rule_type, rule.max_quantity::text, rule.active
+       FROM operations_location_product_rules rule
+       JOIN crm_products product
+         ON product.pipeline_id = rule.pipeline_id AND product.id = rule.product_id
+       WHERE rule.organization_id = $1::uuid
+       ORDER BY rule.location_id, lower(product.name), rule.id`,
+      [organizationId],
+    ),
+    query<InventoryPoolRow>(
+      `SELECT pool.id::text, pool.global_id, pool.name, pool.pool_type,
+              pool.allocation_policy, pool.active,
+              owner.reference_code AS owner_customer_global_id,
+              owner.name AS owner_customer_name
+       FROM operations_inventory_pools pool
+       LEFT JOIN crm_organizations owner
+         ON owner.pipeline_id = pool.pipeline_id AND owner.id = pool.owner_customer_id
+       WHERE pool.organization_id = $1::uuid
+       ORDER BY pool.active DESC, lower(pool.name), pool.id`,
+      [organizationId],
+    ),
+    query<InventoryPoolCustomerRow>(
+      `SELECT eligible.pool_id::text, customer.reference_code AS global_id,
+              customer.name, eligible.priority
+       FROM operations_inventory_pool_customers eligible
+       JOIN crm_organizations customer
+         ON customer.pipeline_id = eligible.pipeline_id AND customer.id = eligible.customer_id
+       WHERE eligible.organization_id = $1::uuid
+         AND eligible.effective_from <= now()
+         AND (eligible.effective_to IS NULL OR eligible.effective_to > now())
+       ORDER BY eligible.pool_id, eligible.priority, lower(customer.name), customer.id`,
+      [organizationId],
+    ),
+    query<InboundReceiptRow>(
+      `SELECT receipt.id::text, receipt.global_id, receipt.reference_number,
+              receipt.status, warehouse.global_id AS warehouse_global_id,
+              warehouse.name AS warehouse_name, pool.global_id AS pool_global_id,
+              pool.name AS pool_name, receipt.expected_at, receipt.completed_at,
+              receipt.row_version::text
+       FROM operations_receipts receipt
+       JOIN operations_warehouses warehouse
+         ON warehouse.organization_id = receipt.organization_id AND warehouse.id = receipt.warehouse_id
+       JOIN operations_inventory_pools pool
+         ON pool.organization_id = receipt.organization_id AND pool.id = receipt.inventory_pool_id
+       WHERE receipt.organization_id = $1::uuid
+       ORDER BY
+         CASE receipt.status WHEN 'receiving' THEN 0 WHEN 'expected' THEN 1 ELSE 2 END,
+         receipt.expected_at NULLS LAST, receipt.updated_at DESC, receipt.id DESC
+       LIMIT 200`,
+      [organizationId],
+    ),
+    query<InboundReceiptLineRow>(
+      `SELECT line.id::text, line.global_id, line.receipt_id::text, line.line_number,
+              product.reference_code AS product_global_id, product.name AS product_name,
+              NULLIF(btrim(product.sku), '') AS product_sku,
+              location.global_id AS location_global_id, location.code AS location_code,
+              line.expected_quantity::text, line.accepted_quantity::text,
+              line.damaged_quantity::text, line.lot_code, line.unit_of_measure
+       FROM operations_receipt_lines line
+       JOIN crm_products product
+         ON product.pipeline_id = line.pipeline_id AND product.id = line.product_id
+       JOIN operations_locations location
+         ON location.organization_id = line.organization_id AND location.id = line.target_location_id
+       WHERE line.organization_id = $1::uuid
+       ORDER BY line.receipt_id, line.line_number`,
       [organizationId],
     ),
     query<CustomerRow>(
@@ -2047,10 +2213,12 @@ export async function readOperationsWorkspaceFromPostgres(input: {
       globalId: row.global_id,
       code: row.code,
       name: row.name,
+      facilityType: row.facility_type,
       timezone: row.timezone,
       address: json(row.address) as Address,
       status: row.status,
       cutoffTime: row.cutoff_time,
+      rowVersion: Number(row.row_version),
       locations: warehouseLocationResult.rows
         .filter((location) => location.warehouse_id === row.id)
         .map((location) => ({
@@ -2059,10 +2227,82 @@ export async function readOperationsWorkspaceFromPostgres(input: {
           code: location.code,
           zone: location.zone,
           locationType: location.location_type,
+          topologyLevel: location.topology_level,
+          parentLocationGlobalId: location.parent_location_global_id,
           pickSequence: location.pick_sequence,
           active: location.active,
+          maxVolumeCubicMeters: location.max_volume_cubic_meters === null ? null : Number(location.max_volume_cubic_meters),
+          maxWeightKg: location.max_weight_kg === null ? null : Number(location.max_weight_kg),
+          usedVolumeCubicMeters: Number(location.used_volume_cubic_meters),
+          usedWeightKg: Number(location.used_weight_kg),
+          allowMixedProducts: location.allow_mixed_products,
+          notes: location.notes,
+          rowVersion: Number(location.row_version),
+          productRules: locationProductRuleResult.rows
+            .filter((rule) => rule.location_id === location.id)
+            .map((rule) => ({
+              globalId: rule.global_id,
+              productGlobalId: rule.product_global_id,
+              productName: rule.product_name,
+              ruleType: rule.rule_type,
+              maxQuantity: rule.max_quantity === null ? null : Number(rule.max_quantity),
+              active: rule.active,
+            })),
         })),
     })),
+    inventoryPools: inventoryPoolResult.rows.map((row) => ({
+      id: row.id,
+      globalId: row.global_id,
+      name: row.name,
+      poolType: row.pool_type,
+      allocationPolicy: row.allocation_policy,
+      ownerCustomerGlobalId: row.owner_customer_global_id,
+      ownerCustomerName: row.owner_customer_name,
+      eligibleCustomers: inventoryPoolCustomerResult.rows
+        .filter((customer) => customer.pool_id === row.id)
+        .map((customer) => ({
+          globalId: customer.global_id,
+          name: customer.name,
+          priority: customer.priority,
+        })),
+      active: row.active,
+    })),
+    inboundReceipts: inboundReceiptResult.rows.map((row) => {
+      const lines = inboundReceiptLineResult.rows
+        .filter((line) => line.receipt_id === row.id)
+        .map((line) => ({
+          id: line.id,
+          globalId: line.global_id,
+          lineNumber: line.line_number,
+          productGlobalId: line.product_global_id,
+          productName: line.product_name,
+          productSku: line.product_sku,
+          targetLocationGlobalId: line.location_global_id,
+          targetLocationCode: line.location_code,
+          expectedQuantity: Number(line.expected_quantity),
+          acceptedQuantity: Number(line.accepted_quantity),
+          damagedQuantity: Number(line.damaged_quantity),
+          lotCode: line.lot_code,
+          unitOfMeasure: line.unit_of_measure,
+        }))
+      return {
+        id: row.id,
+        globalId: row.global_id,
+        referenceNumber: row.reference_number,
+        status: row.status,
+        warehouseGlobalId: row.warehouse_global_id,
+        warehouseName: row.warehouse_name,
+        inventoryPoolGlobalId: row.pool_global_id,
+        inventoryPoolName: row.pool_name,
+        expectedAt: row.expected_at?.toISOString() || null,
+        completedAt: row.completed_at?.toISOString() || null,
+        rowVersion: Number(row.row_version),
+        expectedQuantity: lines.reduce((sum, line) => sum + line.expectedQuantity, 0),
+        receivedQuantity: lines.reduce((sum, line) => sum + line.acceptedQuantity, 0),
+        damagedQuantity: lines.reduce((sum, line) => sum + line.damagedQuantity, 0),
+        lines,
+      }
+    }),
     catalog: {
       customers: uniqueReferenceRows(customerResult.rows).map((row) => ({ id: row.id, globalId: row.reference_code, name: row.name })),
       products: uniqueReferenceRows(productResult.rows).map((row) => ({ id: row.id, globalId: row.reference_code, name: row.name, sku: row.sku })),
@@ -2087,6 +2327,185 @@ export async function readOperationsWorkspaceFromPostgres(input: {
 const WAREHOUSE_LOCATION_TYPES = new Set([
   'receiving', 'storage', 'pick', 'pack', 'staging', 'shipping', 'returns',
 ])
+const WAREHOUSE_FACILITY_TYPES = new Set([
+  'distribution_center', 'store', 'dark_store', 'micro_fulfillment',
+  'cross_dock', 'supplier', 'drop_ship', 'third_party',
+])
+const WAREHOUSE_TOPOLOGY_LEVELS = new Set([
+  'building', 'zone', 'aisle', 'row', 'bay', 'level', 'shelf', 'bin',
+  'staging', 'dock', 'station',
+])
+const LOCATION_PRODUCT_RULE_TYPES = new Set(['allowed', 'preferred', 'restricted'])
+
+type LocationProductRuleInput = {
+  productGlobalId: string
+  ruleType: 'allowed' | 'preferred' | 'restricted'
+  maxQuantity?: number | null
+}
+
+type OperationsLocationMutationInput = {
+  organizationId: string
+  actorEmail: string
+  warehouseGlobalId: string
+  code: string
+  zone: string
+  locationType: OperationsWorkspace['warehouses'][number]['locations'][number]['locationType']
+  topologyLevel: OperationsWorkspace['warehouses'][number]['locations'][number]['topologyLevel']
+  parentLocationGlobalId?: string | null
+  pickSequence: number
+  active?: boolean
+  maxVolumeCubicMeters?: number | null
+  maxWeightKg?: number | null
+  allowMixedProducts?: boolean
+  notes?: string | null
+  productRules?: LocationProductRuleInput[]
+}
+
+function optionalPositiveCapacity(value: unknown, label: string): number | null {
+  if (value === null || value === undefined || value === '') return null
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric) || numeric <= 0 || numeric > 1_000_000_000) {
+    throw new OperationsRequestError('OPERATIONS_LOCATION_CAPACITY_INVALID', `${label} must be greater than zero`)
+  }
+  return numeric
+}
+
+function validateLocationMutation(input: OperationsLocationMutationInput) {
+  const actorEmail = trimmed(input.actorEmail, 320).toLowerCase()
+  const code = trimmed(input.code, 40).toUpperCase()
+  const zone = trimmed(input.zone, 80).toUpperCase()
+  if (!actorEmail) throw new OperationsRequestError('OPERATIONS_ACTOR_REQUIRED', 'A signed-in user is required', 401)
+  if (!/^gwh\d{7}$/.test(input.warehouseGlobalId)) {
+    throw new OperationsRequestError('OPERATIONS_WAREHOUSE_INVALID', 'Warehouse is invalid')
+  }
+  if (!code || !/^[A-Z0-9][A-Z0-9_-]*$/.test(code)) {
+    throw new OperationsRequestError('OPERATIONS_LOCATION_CODE_INVALID', 'Location code may use letters, numbers, hyphens, and underscores')
+  }
+  if (!zone) throw new OperationsRequestError('OPERATIONS_LOCATION_ZONE_REQUIRED', 'Location zone is required')
+  if (!WAREHOUSE_LOCATION_TYPES.has(input.locationType)) {
+    throw new OperationsRequestError('OPERATIONS_LOCATION_TYPE_INVALID', 'Location type is invalid')
+  }
+  if (!WAREHOUSE_TOPOLOGY_LEVELS.has(input.topologyLevel)) {
+    throw new OperationsRequestError('OPERATIONS_TOPOLOGY_LEVEL_INVALID', 'Topology level is invalid')
+  }
+  if (!Number.isSafeInteger(input.pickSequence) || input.pickSequence < 0 || input.pickSequence > 1_000_000) {
+    throw new OperationsRequestError('OPERATIONS_PICK_SEQUENCE_INVALID', 'Pick sequence is invalid')
+  }
+  const rules = input.productRules || []
+  if (rules.length > 250) {
+    throw new OperationsRequestError('OPERATIONS_LOCATION_RULE_LIMIT', 'A location may have up to 250 product rules')
+  }
+  const uniqueProducts = new Set<string>()
+  for (const rule of rules) {
+    if (!/^gp\d{7}$/.test(rule.productGlobalId) || !LOCATION_PRODUCT_RULE_TYPES.has(rule.ruleType)) {
+      throw new OperationsRequestError('OPERATIONS_LOCATION_RULE_INVALID', 'A location product rule is invalid')
+    }
+    if (uniqueProducts.has(rule.productGlobalId)) {
+      throw new OperationsRequestError('OPERATIONS_LOCATION_RULE_DUPLICATE', 'A product may only have one rule per location')
+    }
+    uniqueProducts.add(rule.productGlobalId)
+    optionalPositiveCapacity(rule.maxQuantity, 'Product quantity limit')
+  }
+  return {
+    actorEmail,
+    code,
+    zone,
+    notes: trimmed(input.notes, 2_000) || null,
+    maxVolumeCubicMeters: optionalPositiveCapacity(input.maxVolumeCubicMeters, 'Maximum cubic storage'),
+    maxWeightKg: optionalPositiveCapacity(input.maxWeightKg, 'Maximum weight'),
+    rules,
+  }
+}
+
+async function resolveLocationParent(
+  client: PoolClient,
+  organizationId: string,
+  warehouseId: string,
+  parentGlobalId: string | null | undefined,
+  currentLocationId?: string,
+): Promise<string | null> {
+  if (!parentGlobalId) return null
+  if (!/^gwl\d{7}$/.test(parentGlobalId)) {
+    throw new OperationsRequestError('OPERATIONS_LOCATION_PARENT_INVALID', 'Parent location is invalid')
+  }
+  const parentResult = await client.query<IdRow>(
+    `SELECT id::text, global_id
+     FROM operations_locations
+     WHERE organization_id = $1::uuid AND warehouse_id = $2::uuid
+       AND global_id = $3 AND active = true
+     LIMIT 1 FOR UPDATE`,
+    [organizationId, warehouseId, parentGlobalId],
+  )
+  const parent = parentResult.rows[0]
+  if (!parent) {
+    throw new OperationsRequestError('OPERATIONS_LOCATION_PARENT_NOT_FOUND', 'Parent location was not found in this warehouse', 404)
+  }
+  if (currentLocationId) {
+    if (parent.id === currentLocationId) {
+      throw new OperationsRequestError('OPERATIONS_LOCATION_PARENT_CYCLE', 'A location cannot be its own parent')
+    }
+    const descendantResult = await client.query<QueryResultRow & { found: boolean }>(
+      `WITH RECURSIVE descendants AS (
+         SELECT id FROM operations_locations
+         WHERE organization_id = $1::uuid AND parent_location_id = $2::uuid
+         UNION ALL
+         SELECT child.id
+         FROM operations_locations child
+         JOIN descendants parent ON child.parent_location_id = parent.id
+         WHERE child.organization_id = $1::uuid
+       )
+       SELECT EXISTS (SELECT 1 FROM descendants WHERE id = $3::uuid) AS found`,
+      [organizationId, currentLocationId, parent.id],
+    )
+    if (descendantResult.rows[0]?.found) {
+      throw new OperationsRequestError('OPERATIONS_LOCATION_PARENT_CYCLE', 'A location cannot be moved beneath one of its descendants')
+    }
+  }
+  return parent.id
+}
+
+async function replaceLocationProductRules(
+  client: PoolClient,
+  organizationId: string,
+  pipelineId: string,
+  locationId: string,
+  actorEmail: string,
+  rules: LocationProductRuleInput[],
+) {
+  const productIds: string[] = []
+  for (const rule of rules) {
+    const product = await resolveProduct(client, pipelineId, rule.productGlobalId)
+    productIds.push(product.id)
+    await client.query(
+      `INSERT INTO operations_location_product_rules (
+         organization_id, pipeline_id, location_id, product_id, rule_type,
+         max_quantity, active, created_by, updated_by
+       ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6::numeric, true, $7, $7)
+       ON CONFLICT (organization_id, location_id, product_id) DO UPDATE SET
+         rule_type = EXCLUDED.rule_type,
+         max_quantity = EXCLUDED.max_quantity,
+         active = true,
+         updated_by = EXCLUDED.updated_by,
+         updated_at = now()`,
+      [
+        organizationId,
+        pipelineId,
+        locationId,
+        product.id,
+        rule.ruleType,
+        optionalPositiveCapacity(rule.maxQuantity, 'Product quantity limit'),
+        actorEmail,
+      ],
+    )
+  }
+  await client.query(
+    `UPDATE operations_location_product_rules
+     SET active = false, updated_by = $4, updated_at = now()
+     WHERE organization_id = $1::uuid AND location_id = $2::uuid
+       AND (cardinality($3::uuid[]) = 0 OR product_id <> ALL($3::uuid[]))`,
+    [organizationId, locationId, productIds, actorEmail],
+  )
+}
 
 export async function createOperationsWarehouseInPostgres(input: {
   organizationId: string
@@ -2095,6 +2514,7 @@ export async function createOperationsWarehouseInPostgres(input: {
   name: string
   timezone: string
   address: Address
+  facilityType?: OperationsWorkspace['warehouses'][number]['facilityType']
   cutoffTime?: string | null
   createStarterLocations?: boolean
 }): Promise<{ warehouseGlobalId: string; locationGlobalIds: string[] }> {
@@ -2105,10 +2525,14 @@ export async function createOperationsWarehouseInPostgres(input: {
   const name = trimmed(input.name, 160)
   const timezone = trimmed(input.timezone, 80)
   const cutoffTime = trimmed(input.cutoffTime, 8) || null
+  const facilityType = input.facilityType || 'distribution_center'
   if (!code || !/^[A-Z0-9][A-Z0-9_-]*$/.test(code)) {
     throw new OperationsRequestError('OPERATIONS_WAREHOUSE_CODE_INVALID', 'Warehouse code may use letters, numbers, hyphens, and underscores')
   }
   if (!name) throw new OperationsRequestError('OPERATIONS_WAREHOUSE_NAME_REQUIRED', 'Warehouse name is required')
+  if (!WAREHOUSE_FACILITY_TYPES.has(facilityType)) {
+    throw new OperationsRequestError('OPERATIONS_WAREHOUSE_FACILITY_INVALID', 'Warehouse facility type is invalid')
+  }
   try {
     new Intl.DateTimeFormat('en-US', { timeZone: timezone }).format()
   } catch {
@@ -2124,11 +2548,11 @@ export async function createOperationsWarehouseInPostgres(input: {
     try {
       const result = await client.query<IdRow>(
         `INSERT INTO operations_warehouses (
-           organization_id, code, name, timezone, address, status,
+           organization_id, code, name, facility_type, timezone, address, status,
            cutoff_time, created_by, updated_by
-         ) VALUES ($1::uuid, $2, $3, $4, $5::jsonb, 'active', $6::time, $7, $7)
+         ) VALUES ($1::uuid, $2, $3, $4, $5, $6::jsonb, 'active', $7::time, $8, $8)
          RETURNING id::text, global_id`,
-        [organizationId, code, name, timezone, JSON.stringify(input.address), cutoffTime, actorEmail],
+        [organizationId, code, name, facilityType, timezone, JSON.stringify(input.address), cutoffTime, actorEmail],
       )
       warehouse = result.rows[0]
     } catch (error) {
@@ -2138,28 +2562,43 @@ export async function createOperationsWarehouseInPostgres(input: {
       throw error
     }
 
-    const starterLocations = input.createStarterLocations === false
-      ? []
-      : [
-          ['RECEIVE-01', 'INBOUND', 'receiving', 10],
-          ['STAGE-IN-01', 'INBOUND', 'staging', 20],
-          ['BIN-01', 'STORAGE', 'storage', 100],
-          ['PICK-01', 'PICK', 'pick', 200],
-          ['PACK-01', 'PACK', 'pack', 300],
-          ['STAGE-OUT-01', 'OUTBOUND', 'staging', 400],
-          ['SHIP-01', 'OUTBOUND', 'shipping', 500],
-          ['RETURNS-01', 'RETURNS', 'returns', 600],
-        ] as const
+    const starterLocations = input.createStarterLocations === false ? [] : [
+      { code: 'INBOUND', zone: 'INBOUND', type: 'receiving', level: 'zone', sequence: 1, parent: null },
+      { code: 'RECEIVE-01', zone: 'INBOUND', type: 'receiving', level: 'dock', sequence: 10, parent: 'INBOUND' },
+      { code: 'STAGE-IN-01', zone: 'INBOUND', type: 'staging', level: 'staging', sequence: 20, parent: 'INBOUND' },
+      { code: 'STORAGE', zone: 'STORAGE', type: 'storage', level: 'zone', sequence: 90, parent: null },
+      { code: 'BIN-01', zone: 'STORAGE', type: 'storage', level: 'bin', sequence: 100, parent: 'STORAGE' },
+      { code: 'FULFILLMENT', zone: 'FULFILLMENT', type: 'pick', level: 'zone', sequence: 190, parent: null },
+      { code: 'PICK-01', zone: 'FULFILLMENT', type: 'pick', level: 'station', sequence: 200, parent: 'FULFILLMENT' },
+      { code: 'PACK-01', zone: 'FULFILLMENT', type: 'pack', level: 'station', sequence: 300, parent: 'FULFILLMENT' },
+      { code: 'OUTBOUND', zone: 'OUTBOUND', type: 'shipping', level: 'zone', sequence: 390, parent: null },
+      { code: 'STAGE-OUT-01', zone: 'OUTBOUND', type: 'staging', level: 'staging', sequence: 400, parent: 'OUTBOUND' },
+      { code: 'SHIP-01', zone: 'OUTBOUND', type: 'shipping', level: 'dock', sequence: 500, parent: 'OUTBOUND' },
+      { code: 'RETURNS', zone: 'RETURNS', type: 'returns', level: 'zone', sequence: 590, parent: null },
+      { code: 'RETURNS-01', zone: 'RETURNS', type: 'returns', level: 'station', sequence: 600, parent: 'RETURNS' },
+    ] as const
     const locationGlobalIds: string[] = []
-    for (const [locationCode, zone, locationType, pickSequence] of starterLocations) {
+    const locationIdsByCode = new Map<string, string>()
+    for (const starter of starterLocations) {
       const result = await client.query<IdRow>(
         `INSERT INTO operations_locations (
            organization_id, warehouse_id, code, zone, location_type,
-           pick_sequence, active, created_by
-         ) VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, true, $7)
+           topology_level, parent_location_id, pick_sequence, active, created_by, updated_by
+         ) VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, $7::uuid, $8, true, $9, $9)
          RETURNING id::text, global_id`,
-        [organizationId, warehouse.id, locationCode, zone, locationType, pickSequence, actorEmail],
+        [
+          organizationId,
+          warehouse.id,
+          starter.code,
+          starter.zone,
+          starter.type,
+          starter.level,
+          starter.parent ? locationIdsByCode.get(starter.parent) : null,
+          starter.sequence,
+          actorEmail,
+        ],
       )
+      locationIdsByCode.set(starter.code, result.rows[0].id)
       locationGlobalIds.push(result.rows[0].global_id)
     }
     await recordAuditEvent({
@@ -2170,41 +2609,17 @@ export async function createOperationsWarehouseInPostgres(input: {
       subject: name,
       organizationId,
       eventKey: `operations:warehouse:${warehouse.global_id}:created`,
-      payload: { code, timezone, cutoffTime, starterLocationCount: locationGlobalIds.length },
+      payload: { code, facilityType, timezone, cutoffTime, starterLocationCount: locationGlobalIds.length },
     }, client)
     return { warehouseGlobalId: warehouse.global_id, locationGlobalIds }
   })
 }
 
-export async function createOperationsLocationInPostgres(input: {
-  organizationId: string
-  actorEmail: string
-  warehouseGlobalId: string
-  code: string
-  zone: string
-  locationType: OperationsWorkspace['warehouses'][number]['locations'][number]['locationType']
-  pickSequence: number
-}): Promise<{ locationGlobalId: string }> {
+export async function createOperationsLocationInPostgres(input: OperationsLocationMutationInput): Promise<{ locationGlobalId: string }> {
   const organizationId = requireOrganizationId(input.organizationId)
-  const actorEmail = trimmed(input.actorEmail, 320).toLowerCase()
-  const code = trimmed(input.code, 40).toUpperCase()
-  const zone = trimmed(input.zone, 80).toUpperCase()
-  if (!actorEmail) throw new OperationsRequestError('OPERATIONS_ACTOR_REQUIRED', 'A signed-in user is required', 401)
-  if (!/^gwh\d{7}$/.test(input.warehouseGlobalId)) {
-    throw new OperationsRequestError('OPERATIONS_WAREHOUSE_INVALID', 'Warehouse is invalid')
-  }
-  if (!code || !/^[A-Z0-9][A-Z0-9_-]*$/.test(code)) {
-    throw new OperationsRequestError('OPERATIONS_LOCATION_CODE_INVALID', 'Location code may use letters, numbers, hyphens, and underscores')
-  }
-  if (!zone) throw new OperationsRequestError('OPERATIONS_LOCATION_ZONE_REQUIRED', 'Location zone is required')
-  if (!WAREHOUSE_LOCATION_TYPES.has(input.locationType)) {
-    throw new OperationsRequestError('OPERATIONS_LOCATION_TYPE_INVALID', 'Location type is invalid')
-  }
-  if (!Number.isSafeInteger(input.pickSequence) || input.pickSequence < 0 || input.pickSequence > 1_000_000) {
-    throw new OperationsRequestError('OPERATIONS_PICK_SEQUENCE_INVALID', 'Pick sequence is invalid')
-  }
+  const normalized = validateLocationMutation(input)
   return withTransaction(async (client) => {
-    await acquireTransactionAdvisoryLock(client, `operations:location:${organizationId}:${input.warehouseGlobalId}:${code}`)
+    await acquireTransactionAdvisoryLock(client, `operations:location:${organizationId}:${input.warehouseGlobalId}:${normalized.code}`)
     const warehouseResult = await client.query<IdRow>(
       `SELECT id::text, global_id FROM operations_warehouses
        WHERE organization_id = $1::uuid AND global_id = $2 LIMIT 1 FOR UPDATE`,
@@ -2212,25 +2627,70 @@ export async function createOperationsLocationInPostgres(input: {
     )
     const warehouse = warehouseResult.rows[0]
     if (!warehouse) throw new OperationsRequestError('OPERATIONS_WAREHOUSE_NOT_FOUND', 'Warehouse was not found', 404)
+    const parentLocationId = await resolveLocationParent(
+      client,
+      organizationId,
+      warehouse.id,
+      input.parentLocationGlobalId,
+    )
+    const pipeline = await resolvePipeline(client, organizationId)
     try {
       const result = await client.query<IdRow>(
         `INSERT INTO operations_locations (
            organization_id, warehouse_id, code, zone, location_type,
-           pick_sequence, active, created_by
-         ) VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, true, $7)
+           topology_level, parent_location_id, pick_sequence, active,
+           max_volume_cubic_meters, max_weight_kg, allow_mixed_products,
+           notes, created_by, updated_by
+         ) VALUES (
+           $1::uuid, $2::uuid, $3, $4, $5, $6, $7::uuid, $8, $9,
+           $10::numeric, $11::numeric, $12, $13, $14, $14
+         )
          RETURNING id::text, global_id`,
-        [organizationId, warehouse.id, code, zone, input.locationType, input.pickSequence, actorEmail],
+        [
+          organizationId,
+          warehouse.id,
+          normalized.code,
+          normalized.zone,
+          input.locationType,
+          input.topologyLevel,
+          parentLocationId,
+          input.pickSequence,
+          input.active !== false,
+          normalized.maxVolumeCubicMeters,
+          normalized.maxWeightKg,
+          input.allowMixedProducts !== false,
+          normalized.notes,
+          normalized.actorEmail,
+        ],
       )
       const location = result.rows[0]
+      await replaceLocationProductRules(
+        client,
+        organizationId,
+        pipeline.id,
+        location.id,
+        normalized.actorEmail,
+        normalized.rules,
+      )
       await recordAuditEvent({
-        actor: actorEmail,
+        actor: normalized.actorEmail,
         eventType: 'operations.location.created',
         aggregateType: 'operations.location',
         aggregateId: location.global_id,
-        subject: code,
+        subject: normalized.code,
         organizationId,
         eventKey: `operations:location:${location.global_id}:created`,
-        payload: { warehouseGlobalId: warehouse.global_id, zone, locationType: input.locationType, pickSequence: input.pickSequence },
+        payload: {
+          warehouseGlobalId: warehouse.global_id,
+          zone: normalized.zone,
+          locationType: input.locationType,
+          topologyLevel: input.topologyLevel,
+          parentLocationGlobalId: input.parentLocationGlobalId || null,
+          pickSequence: input.pickSequence,
+          maxVolumeCubicMeters: normalized.maxVolumeCubicMeters,
+          maxWeightKg: normalized.maxWeightKg,
+          productRuleCount: normalized.rules.length,
+        },
       }, client)
       return { locationGlobalId: location.global_id }
     } catch (error) {
@@ -2239,6 +2699,253 @@ export async function createOperationsLocationInPostgres(input: {
       }
       throw error
     }
+  })
+}
+
+export async function updateOperationsWarehouseInPostgres(input: {
+  organizationId: string
+  actorEmail: string
+  warehouseGlobalId: string
+  expectedRowVersion: number
+  name: string
+  facilityType: OperationsWorkspace['warehouses'][number]['facilityType']
+  timezone: string
+  address: Address
+  cutoffTime?: string | null
+  status: 'active' | 'inactive'
+}): Promise<{ warehouseGlobalId: string; rowVersion: number }> {
+  const organizationId = requireOrganizationId(input.organizationId)
+  const actorEmail = trimmed(input.actorEmail, 320).toLowerCase()
+  const name = trimmed(input.name, 160)
+  const cutoffTime = trimmed(input.cutoffTime, 8) || null
+  if (!actorEmail) throw new OperationsRequestError('OPERATIONS_ACTOR_REQUIRED', 'A signed-in user is required', 401)
+  if (!/^gwh\d{7}$/.test(input.warehouseGlobalId) || !name) {
+    throw new OperationsRequestError('OPERATIONS_WAREHOUSE_INVALID', 'Warehouse is invalid')
+  }
+  if (!WAREHOUSE_FACILITY_TYPES.has(input.facilityType) || !['active', 'inactive'].includes(input.status)) {
+    throw new OperationsRequestError('OPERATIONS_WAREHOUSE_FACILITY_INVALID', 'Warehouse configuration is invalid')
+  }
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: input.timezone }).format()
+  } catch {
+    throw new OperationsRequestError('OPERATIONS_WAREHOUSE_TIMEZONE_INVALID', 'Warehouse timezone is invalid')
+  }
+  if (cutoffTime && !/^([01]\d|2[0-3]):[0-5]\d$/.test(cutoffTime)) {
+    throw new OperationsRequestError('OPERATIONS_WAREHOUSE_CUTOFF_INVALID', 'Warehouse cutoff must use 24-hour HH:MM time')
+  }
+  return withTransaction(async (client) => {
+    const result = await client.query<QueryResultRow & { global_id: string; row_version: string }>(
+      `UPDATE operations_warehouses
+       SET name = $4, facility_type = $5, timezone = $6, address = $7::jsonb,
+           cutoff_time = $8::time, status = $9, row_version = row_version + 1,
+           updated_by = $10, updated_at = now()
+       WHERE organization_id = $1::uuid AND global_id = $2 AND row_version = $3
+       RETURNING global_id, row_version::text`,
+      [
+        organizationId,
+        input.warehouseGlobalId,
+        input.expectedRowVersion,
+        name,
+        input.facilityType,
+        input.timezone,
+        JSON.stringify(input.address),
+        cutoffTime,
+        input.status,
+        actorEmail,
+      ],
+    )
+    const row = result.rows[0]
+    if (!row) {
+      throw new OperationsRequestError('OPERATIONS_WAREHOUSE_VERSION_CONFLICT', 'Warehouse changed since it was opened. Refresh and try again.', 409)
+    }
+    await recordAuditEvent({
+      actor: actorEmail,
+      eventType: 'operations.warehouse.updated',
+      aggregateType: 'operations.warehouse',
+      aggregateId: row.global_id,
+      subject: name,
+      organizationId,
+      eventKey: `operations:warehouse:${row.global_id}:version:${row.row_version}`,
+      payload: { facilityType: input.facilityType, timezone: input.timezone, status: input.status, cutoffTime },
+    }, client)
+    return { warehouseGlobalId: row.global_id, rowVersion: Number(row.row_version) }
+  })
+}
+
+export async function updateOperationsLocationInPostgres(
+  input: OperationsLocationMutationInput & { locationGlobalId: string; expectedRowVersion: number },
+): Promise<{ locationGlobalId: string; rowVersion: number }> {
+  const organizationId = requireOrganizationId(input.organizationId)
+  const normalized = validateLocationMutation(input)
+  if (!/^gwl\d{7}$/.test(input.locationGlobalId)) {
+    throw new OperationsRequestError('OPERATIONS_LOCATION_INVALID', 'Location is invalid')
+  }
+  return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(client, `operations:location:${organizationId}:${input.locationGlobalId}`)
+    const currentResult = await client.query<IdRow & { warehouse_id: string }>(
+      `SELECT location.id::text, location.global_id, location.warehouse_id::text
+       FROM operations_locations location
+       JOIN operations_warehouses warehouse
+         ON warehouse.organization_id = location.organization_id
+        AND warehouse.id = location.warehouse_id
+       WHERE location.organization_id = $1::uuid
+         AND location.global_id = $2
+         AND warehouse.global_id = $3
+       LIMIT 1 FOR UPDATE OF location`,
+      [organizationId, input.locationGlobalId, input.warehouseGlobalId],
+    )
+    const current = currentResult.rows[0]
+    if (!current) throw new OperationsRequestError('OPERATIONS_LOCATION_NOT_FOUND', 'Location was not found', 404)
+    const parentLocationId = await resolveLocationParent(
+      client,
+      organizationId,
+      current.warehouse_id,
+      input.parentLocationGlobalId,
+      current.id,
+    )
+    const result = await client.query<QueryResultRow & { global_id: string; row_version: string }>(
+      `UPDATE operations_locations
+       SET code = $4, zone = $5, location_type = $6, topology_level = $7,
+           parent_location_id = $8::uuid, pick_sequence = $9, active = $10,
+           max_volume_cubic_meters = $11::numeric, max_weight_kg = $12::numeric,
+           allow_mixed_products = $13, notes = $14, row_version = row_version + 1,
+           updated_by = $15, updated_at = now()
+       WHERE organization_id = $1::uuid AND id = $2::uuid AND row_version = $3
+       RETURNING global_id, row_version::text`,
+      [
+        organizationId,
+        current.id,
+        input.expectedRowVersion,
+        normalized.code,
+        normalized.zone,
+        input.locationType,
+        input.topologyLevel,
+        parentLocationId,
+        input.pickSequence,
+        input.active !== false,
+        normalized.maxVolumeCubicMeters,
+        normalized.maxWeightKg,
+        input.allowMixedProducts !== false,
+        normalized.notes,
+        normalized.actorEmail,
+      ],
+    )
+    const row = result.rows[0]
+    if (!row) {
+      throw new OperationsRequestError('OPERATIONS_LOCATION_VERSION_CONFLICT', 'Location changed since it was opened. Refresh and try again.', 409)
+    }
+    const pipeline = await resolvePipeline(client, organizationId)
+    await replaceLocationProductRules(
+      client,
+      organizationId,
+      pipeline.id,
+      current.id,
+      normalized.actorEmail,
+      normalized.rules,
+    )
+    await recordAuditEvent({
+      actor: normalized.actorEmail,
+      eventType: 'operations.location.updated',
+      aggregateType: 'operations.location',
+      aggregateId: row.global_id,
+      subject: normalized.code,
+      organizationId,
+      eventKey: `operations:location:${row.global_id}:version:${row.row_version}`,
+      payload: {
+        zone: normalized.zone,
+        locationType: input.locationType,
+        topologyLevel: input.topologyLevel,
+        parentLocationGlobalId: input.parentLocationGlobalId || null,
+        active: input.active !== false,
+        productRuleCount: normalized.rules.length,
+      },
+    }, client)
+    return { locationGlobalId: row.global_id, rowVersion: Number(row.row_version) }
+  })
+}
+
+export async function deleteOperationsLocationInPostgres(input: {
+  organizationId: string
+  actorEmail: string
+  locationGlobalId: string
+  expectedRowVersion: number
+}): Promise<{ locationGlobalId: string; outcome: 'deleted' | 'retired' }> {
+  const organizationId = requireOrganizationId(input.organizationId)
+  const actorEmail = trimmed(input.actorEmail, 320).toLowerCase()
+  if (!actorEmail) throw new OperationsRequestError('OPERATIONS_ACTOR_REQUIRED', 'A signed-in user is required', 401)
+  if (!/^gwl\d{7}$/.test(input.locationGlobalId)) {
+    throw new OperationsRequestError('OPERATIONS_LOCATION_INVALID', 'Location is invalid')
+  }
+  return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(client, `operations:location:${organizationId}:${input.locationGlobalId}`)
+    const currentResult = await client.query<IdRow & { code: string; row_version: string }>(
+      `SELECT id::text, global_id, code, row_version::text
+       FROM operations_locations
+       WHERE organization_id = $1::uuid AND global_id = $2
+       LIMIT 1 FOR UPDATE`,
+      [organizationId, input.locationGlobalId],
+    )
+    const current = currentResult.rows[0]
+    if (!current) throw new OperationsRequestError('OPERATIONS_LOCATION_NOT_FOUND', 'Location was not found', 404)
+    if (Number(current.row_version) !== input.expectedRowVersion) {
+      throw new OperationsRequestError('OPERATIONS_LOCATION_VERSION_CONFLICT', 'Location changed since it was opened. Refresh and try again.', 409)
+    }
+    const childResult = await client.query<QueryResultRow & { count: string }>(
+      `SELECT count(*)::text AS count
+       FROM operations_locations
+       WHERE organization_id = $1::uuid AND parent_location_id = $2::uuid AND active = true`,
+      [organizationId, current.id],
+    )
+    if (Number(childResult.rows[0]?.count || 0) > 0) {
+      throw new OperationsRequestError('OPERATIONS_LOCATION_HAS_CHILDREN', 'Move or retire child locations before removing this topology node', 409)
+    }
+    let outcome: 'deleted' | 'retired' = 'deleted'
+    await client.query('SAVEPOINT delete_operations_location')
+    try {
+      await client.query(
+        `DELETE FROM operations_location_product_rules
+         WHERE organization_id = $1::uuid AND location_id = $2::uuid`,
+        [organizationId, current.id],
+      )
+      await client.query(
+        `DELETE FROM operations_locations
+         WHERE organization_id = $1::uuid AND id = $2::uuid`,
+        [organizationId, current.id],
+      )
+      await client.query('RELEASE SAVEPOINT delete_operations_location')
+    } catch (error) {
+      await client.query('ROLLBACK TO SAVEPOINT delete_operations_location')
+      if ((error as { code?: string }).code !== '23503') {
+        await client.query('RELEASE SAVEPOINT delete_operations_location')
+        throw error
+      }
+      await client.query('RELEASE SAVEPOINT delete_operations_location')
+      outcome = 'retired'
+      await client.query(
+        `UPDATE operations_locations
+         SET active = false, row_version = row_version + 1,
+             updated_by = $3, updated_at = now()
+         WHERE organization_id = $1::uuid AND id = $2::uuid`,
+        [organizationId, current.id, actorEmail],
+      )
+      await client.query(
+        `UPDATE operations_location_product_rules
+         SET active = false, updated_by = $3, updated_at = now()
+         WHERE organization_id = $1::uuid AND location_id = $2::uuid`,
+        [organizationId, current.id, actorEmail],
+      )
+    }
+    await recordAuditEvent({
+      actor: actorEmail,
+      eventType: outcome === 'deleted' ? 'operations.location.deleted' : 'operations.location.retired',
+      aggregateType: 'operations.location',
+      aggregateId: current.global_id,
+      subject: current.code,
+      organizationId,
+      eventKey: `operations:location:${current.global_id}:${outcome}:${Date.now()}`,
+      payload: { outcome },
+    }, client)
+    return { locationGlobalId: current.global_id, outcome }
   })
 }
 

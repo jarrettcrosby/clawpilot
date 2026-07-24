@@ -694,18 +694,79 @@ export type OperationsWorkspace = {
     globalId: string
     code: string
     name: string
+    facilityType: 'distribution_center' | 'store' | 'dark_store' | 'micro_fulfillment' | 'cross_dock' | 'supplier' | 'drop_ship' | 'third_party'
     timezone: string
     address: Address
     status: 'active' | 'inactive'
     cutoffTime: string | null
+    rowVersion: number
     locations: Array<{
       id: string
       globalId: string
       code: string
       zone: string
       locationType: 'receiving' | 'storage' | 'pick' | 'pack' | 'staging' | 'shipping' | 'returns'
+      topologyLevel: 'building' | 'zone' | 'aisle' | 'row' | 'bay' | 'level' | 'shelf' | 'bin' | 'staging' | 'dock' | 'station'
+      parentLocationGlobalId: string | null
       pickSequence: number
       active: boolean
+      maxVolumeCubicMeters: number | null
+      maxWeightKg: number | null
+      usedVolumeCubicMeters: number
+      usedWeightKg: number
+      allowMixedProducts: boolean
+      notes: string | null
+      rowVersion: number
+      productRules: Array<{
+        globalId: string
+        productGlobalId: string
+        productName: string
+        ruleType: 'allowed' | 'preferred' | 'restricted'
+        maxQuantity: number | null
+        active: boolean
+      }>
+    }>
+  }>
+  inventoryPools: Array<{
+    id: string
+    globalId: string
+    name: string
+    poolType: 'customer_dedicated' | 'shared'
+    allocationPolicy: 'fifo' | 'fefo' | 'priority'
+    ownerCustomerGlobalId: string | null
+    ownerCustomerName: string | null
+    eligibleCustomers: Array<{ globalId: string; name: string; priority: number }>
+    active: boolean
+  }>
+  inboundReceipts: Array<{
+    id: string
+    globalId: string
+    referenceNumber: string
+    status: 'expected' | 'receiving' | 'completed' | 'cancelled'
+    warehouseGlobalId: string
+    warehouseName: string
+    inventoryPoolGlobalId: string
+    inventoryPoolName: string
+    expectedAt: string | null
+    completedAt: string | null
+    rowVersion: number
+    expectedQuantity: number
+    receivedQuantity: number
+    damagedQuantity: number
+    lines: Array<{
+      id: string
+      globalId: string
+      lineNumber: number
+      productGlobalId: string
+      productName: string
+      productSku: string | null
+      targetLocationGlobalId: string
+      targetLocationCode: string
+      expectedQuantity: number
+      acceptedQuantity: number
+      damagedQuantity: number
+      lotCode: string
+      unitOfMeasure: string
     }>
   }>
   catalog: {
@@ -722,6 +783,49 @@ export type OperationsWorkspace = {
     }>
   }
   generatedAt: string
+}
+
+export type OperationsInventoryPoolInput = {
+  name: string
+  poolType: 'customer_dedicated' | 'shared'
+  allocationPolicy: 'fifo' | 'fefo' | 'priority'
+  ownerCustomerGlobalId: string | null
+  eligibleCustomerGlobalIds: string[]
+}
+
+export type OperationsInboundReceiptInput = {
+  warehouseGlobalId: string
+  inventoryPoolGlobalId: string
+  referenceNumber: string
+  expectedAt: string | null
+  lines: Array<{
+    productGlobalId: string
+    targetLocationGlobalId: string
+    expectedQuantity: number
+    lotCode: string
+    unitOfMeasure: string
+  }>
+}
+
+export type OperationsInboundReceiptCompletionInput = {
+  receiptGlobalId: string
+  expectedRowVersion: number
+  reason: string
+  lines: Array<{
+    lineGlobalId: string
+    acceptedQuantity: number
+    damagedQuantity: number
+  }>
+}
+
+export type OperationsInboundReceiptCommandResult = {
+  receiptGlobalId: string
+  status: 'completed'
+  rowVersion: number
+  receivedQuantity: number
+  damagedQuantity: number
+  positionGlobalIds: string[]
+  replayed: boolean
 }
 
 export type MockOperationsProofLineInput = {
