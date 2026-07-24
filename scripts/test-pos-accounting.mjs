@@ -224,6 +224,11 @@ for (const fragment of [
   'Date accounting controls',
   'Reload sales',
   'Regenerate accounting',
+  'mappingRegenerationDate === businessDate',
+  'Regenerate {businessDate}',
+  'Mapping saved. Regenerate this date to apply it to the accounting draft.',
+  'This only changes ClawPilot mapping configuration; it does not post anything to QuickBooks.',
+  'Use the dedicated Payment Exceptions clearing account approved by accounting, not the POS clearing account.',
   "method: 'POST'",
   "action === 'reload-sales'",
 ]) {
@@ -246,6 +251,12 @@ for (const fragment of [
 const posSection = read('app_src/components/pos/PosSection.tsx')
 for (const fragment of [
   'businessDate={to}',
+  'function postingDraftAmount(draft: DataRecord)',
+  'Payment Exceptions Journal',
+  'Choose Payment Exceptions account',
+  'Choose settlement account',
+  'Choose QuickBooks item',
+  'Choose QuickBooks account',
 ]) {
   assert.ok(posSection.includes(fragment), `POS section missing ${fragment}`)
 }
@@ -856,6 +867,10 @@ assert.equal(captureHoldPreview.salesReceipt.total, 0)
 assert.equal(captureHoldPreview.paymentExceptions.captureChecks, 1)
 assert.equal(captureHoldPreview.paymentExceptions.captureAmount, 44.54)
 assert.equal(captureHoldPreview.paymentExceptions.releaseAmount, 0)
+assert.match(captureHoldPreview.paymentExceptions.links[0].orderKey, /^link:[0-9a-f]{32}$/)
+assert.match(captureHoldPreview.paymentExceptions.links[0].checkKey, /^link:[0-9a-f]{32}$/)
+assert.match(captureHoldPreview.paymentExceptions.links[0].paymentKey, /^link:[0-9a-f]{32}$/)
+assert.equal(JSON.stringify(captureHoldPreview.paymentExceptions.links).includes('preorder-check-1'), false)
 assert.equal(captureHoldPreview.journal.kind, 'payment_exception')
 assert.equal(captureHoldPreview.journal.debits, 44.54)
 assert.equal(captureHoldPreview.journal.credits, 44.54)
@@ -895,6 +910,27 @@ const captureReadyPreview = accounting.buildPosAccountingPreview({
 })
 assert.equal(captureReadyPreview.readiness.readyForReview, true)
 assert.equal(captureReadyPreview.readiness.blockers.length, 0)
+
+const conflictingPaymentExceptionMappings = captureMappings.map((mapping) => (
+  mapping.sourceKind === 'payment_exception'
+    ? { ...mapping, targetId: profile.quickBooksClearingAccountId, targetName: profile.quickBooksClearingAccountName }
+    : mapping
+))
+const paymentExceptionConflictPreview = accounting.buildPosAccountingPreview({
+  businessDate: '2026-07-23',
+  restaurantName: 'Suburbia Sandwich Co',
+  locationTimezone: 'America/New_York',
+  standardOnly: true,
+  profile: { ...profile, batchHoldPolicy: 'do_not_hold' },
+  mappings: conflictingPaymentExceptionMappings,
+  orders: [preorderOrder],
+})
+assert.equal(paymentExceptionConflictPreview.readiness.readyForReview, false)
+assert.ok(paymentExceptionConflictPreview.readiness.blockers.some((blocker) => (
+  blocker.code === 'payment_exception_clearing_conflict'
+  && blocker.sourceKind === 'payment_exception'
+  && blocker.affectedChecks === 1
+)))
 
 const fulfillmentMappingPreview = accounting.buildPosAccountingPreview({
   businessDate: '2026-07-25',
@@ -1252,6 +1288,45 @@ const multiBrandPreview = accounting.buildPosAccountingPreview({
 const settlementLine = multiBrandPreview.journal.lines.find((line) => line.code === 'calculated_net_card_settlement')
 assert.equal(settlementLine?.sourceId, 'summary:card_settlement')
 assert.equal(settlementLine?.target?.id, '1000')
+
+const singleBrandSummaryMappingPreview = accounting.buildPosAccountingPreview({
+  businessDate: '2026-07-18',
+  restaurantName: 'Suburbia Sandwich Co',
+  standardOnly: true,
+  profile,
+  mappings: [{
+    id: 'mapping-card-settlement-summary',
+    scope: 'organization_default',
+    sourceKind: 'card_brand',
+    sourceId: 'summary:card_settlement',
+    sourceName: 'Calculated card settlement',
+    targetType: 'account',
+    targetId: '1000',
+    targetName: 'Operating Checking',
+    active: true,
+    mappingRevision: 1,
+    effectiveFrom: '2026-07-18T00:00:00.000Z',
+    effectiveTo: null,
+    validationStatus: 'valid',
+    validationReason: null,
+    sourceCatalogRevision: 1,
+    targetCatalogRevision: 1,
+    lastValidatedAt: '2026-07-18T00:00:00.000Z',
+    createdBy: 'accounting@example.test',
+    createdAt: '2026-07-18T00:00:00.000Z',
+  }],
+  orders: [july18Order],
+})
+const singleBrandSettlementLine = singleBrandSummaryMappingPreview.journal.lines
+  .find((line) => line.code === 'calculated_net_card_settlement')
+assert.notEqual(singleBrandSettlementLine?.sourceId, 'summary:card_settlement')
+assert.equal(singleBrandSettlementLine?.target?.id, '1000')
+assert.equal(
+  singleBrandSummaryMappingPreview.readiness.missingMappings.some(
+    (entry) => entry.sourceKind === 'card_brand',
+  ),
+  false,
+)
 
 const stableMenuCatalog = accounting.mergeStableToastMenuCatalog(
   accounting.discoverSafePosSourceCatalog([july18Order]),

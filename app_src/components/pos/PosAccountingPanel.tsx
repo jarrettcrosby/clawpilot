@@ -246,6 +246,7 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
   const [preparedProductDraftDialogOpen, setPreparedProductDraftDialogOpen] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
+  const [mappingRegenerationDate, setMappingRegenerationDate] = useState<string | null>(null)
   const [reload, setReload] = useState(0)
   const dateControlsRef = useRef<HTMLDivElement | null>(null)
   const configurationRef = useRef<HTMLDivElement | null>(null)
@@ -363,6 +364,14 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
     const term = search.trim().toLowerCase()
     return mappingDrafts.filter((entry) => !term || `${entry.sourceName} ${entry.sourceKind} ${entry.targetName}`.toLowerCase().includes(term))
   }, [mappingDrafts, search])
+  const focusedMapping = focusAction?.kind === 'mapping'
+    ? mappingDrafts.find((entry) => (
+      entry.sourceKind === focusAction.sourceKind && entry.sourceId === focusAction.sourceId
+    ))
+    : null
+  const focusedMappingName = focusedMapping?.sourceName || focusAction?.sourceName || 'this POS source'
+  const focusedTargetType = (focusedMapping?.targetType || targetTypeFor(focusAction?.sourceKind || ''))
+    .replaceAll('_', ' ')
 
   useEffect(() => {
     if (!focusAction || loading || !workspace) return
@@ -599,6 +608,7 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
       setNotice(changedCount > 0
         ? `${changedCount} accounting ${changedCount === 1 ? 'mapping' : 'mappings'} saved as a new revision.`
         : 'The selected accounting mappings were already current.')
+      if (changedCount > 0) setMappingRegenerationDate(businessDate)
       setReload((value) => value + 1)
     } catch (saveError) {
       setMappingError((saveError as Error).message)
@@ -668,6 +678,7 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
       setNotice(action === 'reload-sales'
         ? `Toast sales reload queued for ${businessDate}. Accounting regenerates after every required sales source finishes.`
         : `POS accounting regenerated from stored sales for ${businessDate}.`)
+      if (action === 'regenerate-accounting') setMappingRegenerationDate(null)
       setReload((value) => value + 1)
     } catch (commandError) {
       setError((commandError as Error).message)
@@ -691,6 +702,26 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
           sx={{ borderRadius: '8px' }}
         >
           {notice}
+        </Alert>
+      ) : null}
+      {mappingRegenerationDate === businessDate ? (
+        <Alert
+          severity="info"
+          variant="outlined"
+          action={(
+            <Button
+              color="inherit"
+              size="small"
+              onClick={() => runAccountingCommand('regenerate-accounting')}
+              disabled={capabilities.canPrepare !== true || !locationGuid || commandActive || runningAccountingCommand !== null}
+              startIcon={runningAccountingCommand === 'regenerate-accounting' ? <CircularProgress size={16} /> : <AccountBalanceRounded />}
+            >
+              Regenerate {businessDate}
+            </Button>
+          )}
+          sx={{ borderRadius: '8px' }}
+        >
+          Mapping saved. Regenerate this date to apply it to the accounting draft. Nothing has been posted to QuickBooks.
         </Alert>
       ) : null}
 
@@ -986,6 +1017,21 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
             </Button>
           </Box>
         </Box>
+        {focusAction?.kind === 'mapping' ? (
+          <Alert severity="info" variant="outlined" sx={{ mx: { xs: 1.5, sm: 2 }, mb: 1.5, borderRadius: '8px' }}>
+            <Typography variant="body2" fontWeight={700}>
+              Choose the QuickBooks {focusedTargetType} for {focusedMappingName}
+            </Typography>
+            <Typography variant="caption" color="text.secondary" display="block" mt={0.35}>
+              Select a target below, choose Save, then regenerate {businessDate}. This only changes ClawPilot mapping configuration; it does not post anything to QuickBooks.
+            </Typography>
+            {focusAction.sourceKind === 'payment_exception' ? (
+              <Typography variant="caption" color="text.secondary" display="block" mt={0.35}>
+                Use the dedicated Payment Exceptions clearing account approved by accounting, not the POS clearing account.
+              </Typography>
+            ) : null}
+          </Alert>
+        ) : null}
         {mappingError ? <Alert severity="error" onClose={() => setMappingError(null)} sx={{ mx: { xs: 1.5, sm: 2 }, mb: 1.5 }}>{mappingError}</Alert> : null}
         {visibleMappings.map((mapping) => {
           const options = targetOptions[mapping.targetType] || []

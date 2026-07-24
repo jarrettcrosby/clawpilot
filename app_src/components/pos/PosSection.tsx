@@ -384,9 +384,12 @@ function isSourceReady(status: string) {
 
 function blockerActionLabel(blocker: PostingQueueBlocker) {
   const content = `${blocker.title} ${blocker.detail}`.toLowerCase()
-  if (blocker.actionKind === 'mapping') return blocker.sourceKind === 'payment_exception'
-    ? 'Map payment exceptions'
-    : 'Map account'
+  if (blocker.actionKind === 'mapping') {
+    if (blocker.sourceKind === 'payment_exception') return 'Choose Payment Exceptions account'
+    if (/settlement/.test(content)) return 'Choose settlement account'
+    if (['sales_item', 'sales_category', 'discount'].includes(blocker.sourceKind)) return 'Choose QuickBooks item'
+    return 'Choose QuickBooks account'
+  }
   if (blocker.actionKind === 'checks') {
     if (blocker.affectedChecks.length) return 'View affected checks'
     return blocker.affectedCheckCount > 0
@@ -401,6 +404,36 @@ function blockerActionLabel(blocker: PostingQueueBlocker) {
   if (/batch|fee detail|payout/.test(content)) return 'Review batch details'
   if (/failed|error/.test(content)) return 'Review failure'
   return 'Reload and recheck'
+}
+
+function postingDraftAmount(draft: DataRecord) {
+  const sourceSummary = record(firstValue(draft, ['sourceSummary']))
+  const standardSummary = record(firstValue(sourceSummary, ['standard']))
+  const standardAmount = numberValue(
+    standardSummary,
+    ['total', 'netSales'],
+    numberValue(sourceSummary, ['grossSales', 'netSales']),
+  )
+  const canonical = record(firstValue(sourceSummary, ['canonical']))
+  const accounting = record(firstValue(canonical, ['accounting']))
+  const salesReceipt = record(firstValue(accounting, ['salesReceipt']))
+  const journal = record(firstValue(accounting, ['journal']))
+  const paymentExceptions = record(firstValue(canonical, ['paymentExceptions']))
+  const paymentExceptionJournalAmount = numberValue(
+    journal,
+    ['debits'],
+    Math.max(
+      Math.abs(numberValue(paymentExceptions, ['captureAmount'])),
+      Math.abs(numberValue(paymentExceptions, ['releaseAmount'])),
+    ),
+  )
+  const journalOnlyPaymentException = textValue(journal, ['kind']) === 'payment_exception'
+    && numberValue(salesReceipt, ['total']) === 0
+    && paymentExceptionJournalAmount !== 0
+  return {
+    amount: journalOnlyPaymentException ? paymentExceptionJournalAmount : standardAmount,
+    journalOnlyPaymentException,
+  }
 }
 
 function postingScopeKey(source: DataRecord) {
@@ -1500,13 +1533,7 @@ export default function PosSection() {
                   </Box>
                   {visiblePostingQueue.length ? visiblePostingQueue.map((entry) => {
                     const { draft } = entry
-                    const sourceSummary = record(firstValue(draft, ['sourceSummary']))
-                    const standardSummary = record(firstValue(sourceSummary, ['standard']))
-                    const draftAmount = numberValue(
-                      standardSummary,
-                      ['total', 'netSales'],
-                      numberValue(sourceSummary, ['grossSales', 'netSales']),
-                    )
+                    const draftAmount = postingDraftAmount(draft)
                     const topBlocker = entry.blockers[0]
                     const selected = selectedDraftKey === entry.key
                     const canOpenPostingReview = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
@@ -1547,7 +1574,12 @@ export default function PosSection() {
                             <Typography variant="caption" color="text.disabled" sx={{ display: { sm: 'none' } }}>{textValue(draft, ['locationName', 'restaurantName'], 'All locations')}</Typography>
                           </Box>
                           <Typography variant="body2" color="text.secondary" noWrap sx={{ display: { xs: 'none', sm: 'block' } }}>{textValue(draft, ['locationName', 'restaurantName'], 'All locations')}</Typography>
-                          <Typography variant="body2" fontWeight={650} textAlign="right" whiteSpace="nowrap">{money(draftAmount)}</Typography>
+                          <Box textAlign="right" minWidth={0}>
+                            <Typography variant="body2" fontWeight={650} whiteSpace="nowrap">{money(draftAmount.amount)}</Typography>
+                            {draftAmount.journalOnlyPaymentException ? (
+                              <Typography variant="caption" color="text.disabled" display="block">Payment Exceptions Journal</Typography>
+                            ) : null}
+                          </Box>
                           <Box display="flex" gap={0.65} justifyContent="flex-end" flexWrap="wrap" sx={{ gridColumn: { xs: '1 / -1', sm: 'auto' } }}>
                             <Chip size="small" variant="outlined" color={statusTone(entry.status)} label={entry.statusLabel} />
                             {entry.blockers.length ? <Chip size="small" color="warning" label={`${entry.blockers.length} ${entry.blockers.length === 1 ? 'blocker' : 'blockers'}`} /> : null}

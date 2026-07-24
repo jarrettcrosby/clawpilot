@@ -540,7 +540,7 @@ test('POS posting queue routes a preorder payment exception to its exact mapping
   await expect(page.getByText("Can't post: Map Payment Exceptions", { exact: true })).toBeVisible()
   await expect(page.getByText('1 blocker', { exact: true })).toBeVisible()
   await expect(page.getByRole('button', { name: 'Open posting review', exact: true })).toBeVisible()
-  await page.getByRole('button', { name: 'Map payment exceptions', exact: true }).click()
+  await page.getByRole('button', { name: 'Choose Payment Exceptions account', exact: true }).click()
   await expect(page.getByPlaceholder('Search mappings')).toHaveValue('payment_exception')
   await expect.poll(() => accountingRequests.some((request) => {
     const url = new URL(request)
