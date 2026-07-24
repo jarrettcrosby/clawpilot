@@ -77,6 +77,11 @@ type WarehouseRow = QueryResultRow & {
   address: Record<string, unknown>
   status: 'active' | 'inactive'
   cutoff_time: string | null
+  operating_days: number[]
+  opens_at: string
+  closes_at: string
+  standard_processing_minutes: number
+  daily_order_capacity: number | null
   row_version: string
 }
 type WarehouseLocationRow = QueryResultRow & {
@@ -1996,7 +2001,8 @@ export async function readOperationsWorkspaceFromPostgres(input: {
     ),
     query<WarehouseRow>(
       `SELECT id::text, global_id, code, name, facility_type, timezone, address, status,
-              cutoff_time::text, row_version::text
+              cutoff_time::text, operating_days, opens_at::text, closes_at::text,
+              standard_processing_minutes, daily_order_capacity, row_version::text
        FROM operations_warehouses
        WHERE organization_id = $1::uuid AND code <> 'MOCK-01'
        ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, lower(name), id`,
@@ -2218,6 +2224,11 @@ export async function readOperationsWorkspaceFromPostgres(input: {
       address: json(row.address) as Address,
       status: row.status,
       cutoffTime: row.cutoff_time,
+      operatingDays: row.operating_days.map(Number),
+      opensAt: row.opens_at,
+      closesAt: row.closes_at,
+      standardProcessingMinutes: Number(row.standard_processing_minutes),
+      dailyOrderCapacity: row.daily_order_capacity === null ? null : Number(row.daily_order_capacity),
       rowVersion: Number(row.row_version),
       locations: warehouseLocationResult.rows
         .filter((location) => location.warehouse_id === row.id)
@@ -2337,6 +2348,14 @@ const WAREHOUSE_TOPOLOGY_LEVELS = new Set([
 ])
 const LOCATION_PRODUCT_RULE_TYPES = new Set(['allowed', 'preferred', 'restricted'])
 
+type OperationsWarehouseOperatingProfileInput = {
+  operatingDays?: number[]
+  opensAt?: string
+  closesAt?: string
+  standardProcessingMinutes?: number
+  dailyOrderCapacity?: number | null
+}
+
 type LocationProductRuleInput = {
   productGlobalId: string
   ruleType: 'allowed' | 'preferred' | 'restricted'
@@ -2359,6 +2378,62 @@ type OperationsLocationMutationInput = {
   allowMixedProducts?: boolean
   notes?: string | null
   productRules?: LocationProductRuleInput[]
+}
+
+function validateWarehouseOperatingProfile(input: OperationsWarehouseOperatingProfileInput) {
+  const operatingDays = Array.from(new Set(input.operatingDays || [1, 2, 3, 4, 5])).sort((a, b) => a - b)
+  if (
+    operatingDays.length < 1
+    || operatingDays.length > 7
+    || operatingDays.some((day) => !Number.isSafeInteger(day) || day < 0 || day > 6)
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_WAREHOUSE_OPERATING_DAYS_INVALID',
+      'Select at least one valid operating day',
+    )
+  }
+  const opensAt = trimmed(input.opensAt ?? '08:00', 8)
+  const closesAt = trimmed(input.closesAt ?? '17:00', 8)
+  if (
+    !/^([01]\d|2[0-3]):[0-5]\d$/.test(opensAt)
+    || !/^([01]\d|2[0-3]):[0-5]\d$/.test(closesAt)
+    || opensAt === closesAt
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_WAREHOUSE_OPERATING_HOURS_INVALID',
+      'Local opening and closing times must be different valid 24-hour times',
+    )
+  }
+  const standardProcessingMinutes = input.standardProcessingMinutes ?? 120
+  if (
+    !Number.isSafeInteger(standardProcessingMinutes)
+    || standardProcessingMinutes < 0
+    || standardProcessingMinutes > 10_080
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_WAREHOUSE_PROCESSING_TIME_INVALID',
+      'Standard processing time must be from 0 to 10,080 minutes',
+    )
+  }
+  const dailyOrderCapacity = input.dailyOrderCapacity === null || input.dailyOrderCapacity === undefined
+    ? null
+    : Number(input.dailyOrderCapacity)
+  if (
+    dailyOrderCapacity !== null
+    && (!Number.isSafeInteger(dailyOrderCapacity) || dailyOrderCapacity < 1 || dailyOrderCapacity > 1_000_000_000)
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_WAREHOUSE_DAILY_CAPACITY_INVALID',
+      'Daily order capacity must be a positive whole number',
+    )
+  }
+  return {
+    operatingDays,
+    opensAt,
+    closesAt,
+    standardProcessingMinutes,
+    dailyOrderCapacity,
+  }
 }
 
 function optionalPositiveCapacity(value: unknown, label: string): number | null {
@@ -2516,6 +2591,11 @@ export async function createOperationsWarehouseInPostgres(input: {
   address: Address
   facilityType?: OperationsWorkspace['warehouses'][number]['facilityType']
   cutoffTime?: string | null
+  operatingDays?: number[]
+  opensAt?: string
+  closesAt?: string
+  standardProcessingMinutes?: number
+  dailyOrderCapacity?: number | null
   createStarterLocations?: boolean
 }): Promise<{ warehouseGlobalId: string; locationGlobalIds: string[] }> {
   const organizationId = requireOrganizationId(input.organizationId)
@@ -2526,6 +2606,7 @@ export async function createOperationsWarehouseInPostgres(input: {
   const timezone = trimmed(input.timezone, 80)
   const cutoffTime = trimmed(input.cutoffTime, 8) || null
   const facilityType = input.facilityType || 'distribution_center'
+  const operatingProfile = validateWarehouseOperatingProfile(input)
   if (!code || !/^[A-Z0-9][A-Z0-9_-]*$/.test(code)) {
     throw new OperationsRequestError('OPERATIONS_WAREHOUSE_CODE_INVALID', 'Warehouse code may use letters, numbers, hyphens, and underscores')
   }
@@ -2549,10 +2630,28 @@ export async function createOperationsWarehouseInPostgres(input: {
       const result = await client.query<IdRow>(
         `INSERT INTO operations_warehouses (
            organization_id, code, name, facility_type, timezone, address, status,
-           cutoff_time, created_by, updated_by
-         ) VALUES ($1::uuid, $2, $3, $4, $5, $6::jsonb, 'active', $7::time, $8, $8)
+           cutoff_time, operating_days, opens_at, closes_at,
+           standard_processing_minutes, daily_order_capacity, created_by, updated_by
+         ) VALUES (
+           $1::uuid, $2, $3, $4, $5, $6::jsonb, 'active', $7::time,
+           $8::smallint[], $9::time, $10::time, $11, $12, $13, $13
+         )
          RETURNING id::text, global_id`,
-        [organizationId, code, name, facilityType, timezone, JSON.stringify(input.address), cutoffTime, actorEmail],
+        [
+          organizationId,
+          code,
+          name,
+          facilityType,
+          timezone,
+          JSON.stringify(input.address),
+          cutoffTime,
+          operatingProfile.operatingDays,
+          operatingProfile.opensAt,
+          operatingProfile.closesAt,
+          operatingProfile.standardProcessingMinutes,
+          operatingProfile.dailyOrderCapacity,
+          actorEmail,
+        ],
       )
       warehouse = result.rows[0]
     } catch (error) {
@@ -2609,7 +2708,14 @@ export async function createOperationsWarehouseInPostgres(input: {
       subject: name,
       organizationId,
       eventKey: `operations:warehouse:${warehouse.global_id}:created`,
-      payload: { code, facilityType, timezone, cutoffTime, starterLocationCount: locationGlobalIds.length },
+      payload: {
+        code,
+        facilityType,
+        timezone,
+        cutoffTime,
+        ...operatingProfile,
+        starterLocationCount: locationGlobalIds.length,
+      },
     }, client)
     return { warehouseGlobalId: warehouse.global_id, locationGlobalIds }
   })
@@ -2712,12 +2818,18 @@ export async function updateOperationsWarehouseInPostgres(input: {
   timezone: string
   address: Address
   cutoffTime?: string | null
+  operatingDays?: number[]
+  opensAt?: string
+  closesAt?: string
+  standardProcessingMinutes?: number
+  dailyOrderCapacity?: number | null
   status: 'active' | 'inactive'
 }): Promise<{ warehouseGlobalId: string; rowVersion: number }> {
   const organizationId = requireOrganizationId(input.organizationId)
   const actorEmail = trimmed(input.actorEmail, 320).toLowerCase()
   const name = trimmed(input.name, 160)
   const cutoffTime = trimmed(input.cutoffTime, 8) || null
+  const operatingProfile = validateWarehouseOperatingProfile(input)
   if (!actorEmail) throw new OperationsRequestError('OPERATIONS_ACTOR_REQUIRED', 'A signed-in user is required', 401)
   if (!/^gwh\d{7}$/.test(input.warehouseGlobalId) || !name) {
     throw new OperationsRequestError('OPERATIONS_WAREHOUSE_INVALID', 'Warehouse is invalid')
@@ -2737,8 +2849,11 @@ export async function updateOperationsWarehouseInPostgres(input: {
     const result = await client.query<QueryResultRow & { global_id: string; row_version: string }>(
       `UPDATE operations_warehouses
        SET name = $4, facility_type = $5, timezone = $6, address = $7::jsonb,
-           cutoff_time = $8::time, status = $9, row_version = row_version + 1,
-           updated_by = $10, updated_at = now()
+           cutoff_time = $8::time, operating_days = $9::smallint[],
+           opens_at = $10::time, closes_at = $11::time,
+           standard_processing_minutes = $12, daily_order_capacity = $13,
+           status = $14, row_version = row_version + 1,
+           updated_by = $15, updated_at = now()
        WHERE organization_id = $1::uuid AND global_id = $2 AND row_version = $3
        RETURNING global_id, row_version::text`,
       [
@@ -2750,6 +2865,11 @@ export async function updateOperationsWarehouseInPostgres(input: {
         input.timezone,
         JSON.stringify(input.address),
         cutoffTime,
+        operatingProfile.operatingDays,
+        operatingProfile.opensAt,
+        operatingProfile.closesAt,
+        operatingProfile.standardProcessingMinutes,
+        operatingProfile.dailyOrderCapacity,
         input.status,
         actorEmail,
       ],
@@ -2766,7 +2886,13 @@ export async function updateOperationsWarehouseInPostgres(input: {
       subject: name,
       organizationId,
       eventKey: `operations:warehouse:${row.global_id}:version:${row.row_version}`,
-      payload: { facilityType: input.facilityType, timezone: input.timezone, status: input.status, cutoffTime },
+      payload: {
+        facilityType: input.facilityType,
+        timezone: input.timezone,
+        status: input.status,
+        cutoffTime,
+        ...operatingProfile,
+      },
     }, client)
     return { warehouseGlobalId: row.global_id, rowVersion: Number(row.row_version) }
   })

@@ -169,6 +169,26 @@ function verifySourceContracts() {
     )
   }
 
+  const warehouseOperatingProfileMigration = read(
+    'db/migrations/0107_operations_warehouse_operating_profile.sql',
+  )
+  for (const fragment of [
+    'ADD COLUMN IF NOT EXISTS operating_days smallint[]',
+    'ADD COLUMN IF NOT EXISTS opens_at time',
+    'ADD COLUMN IF NOT EXISTS closes_at time',
+    'ADD COLUMN IF NOT EXISTS standard_processing_minutes integer',
+    'ADD COLUMN IF NOT EXISTS daily_order_capacity integer',
+    'operations_warehouses_operating_days_valid',
+    'operations_warehouses_operating_hours_valid',
+    'operations_warehouses_processing_minutes_valid',
+    'operations_warehouses_daily_order_capacity_valid',
+  ]) {
+    assert.ok(
+      warehouseOperatingProfileMigration.includes(fragment),
+      `Warehouse operating profile migration missing ${fragment}`,
+    )
+  }
+
   const rateDelegationMigration = read('db/migrations/0089_operations_rate_delegation_and_carrier_settlement.sql')
   for (const table of [
     'operations_carrier_rate_networks',
@@ -474,6 +494,7 @@ function verifySourceContracts() {
     "'operations.location.deleted'",
     "'operations.location.retired'",
     'operations_location_product_rules',
+    'row_number() OVER (ORDER BY location.pick_sequence, allocation.id)::integer',
     'SAVEPOINT delete_operations_location',
     "commandType: 'verify_operations_order_pack'",
     "eventType: 'operations.package.packed'",
@@ -587,9 +608,20 @@ function verifySourceContracts() {
   const warehouseSetup = read('app_src/components/operations/WarehouseSetupPanel.tsx')
   for (const fragment of [
     'Warehouse network',
+    'Warehouse setup guide',
+    'Operational readiness',
     'Create starter topology',
     'Maximum cubic storage',
     'Product placement',
+    'Pick route order',
+    'Lower numbers are picked first when a wave creates tasks',
+    'This does not change customer or order priority',
+    'Automated receiving and directed-putaway enforcement remain a later WMS execution step',
+    'Operating profile',
+    'Operating days',
+    'Standard processing time (minutes)',
+    'Daily order capacity',
+    'automated throughput scheduling is not yet enabled',
     'Parent location',
     'Edit topology, capacity, and product rules',
     'Configure printers',

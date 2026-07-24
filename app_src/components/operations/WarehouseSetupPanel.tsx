@@ -25,8 +25,10 @@ import {
   Typography,
 } from '@mui/material'
 import AddRounded from '@mui/icons-material/AddRounded'
+import CheckCircleOutlineRounded from '@mui/icons-material/CheckCircleOutlineRounded'
 import DeleteOutlineRounded from '@mui/icons-material/DeleteOutlineRounded'
 import EditRounded from '@mui/icons-material/EditRounded'
+import HelpOutlineRounded from '@mui/icons-material/HelpOutlineRounded'
 import Inventory2Rounded from '@mui/icons-material/Inventory2Rounded'
 import WarehouseRounded from '@mui/icons-material/WarehouseRounded'
 import type { OperationsWorkspace } from '@/lib/operations/types'
@@ -51,6 +53,11 @@ type WarehouseForm = {
   facilityType: FacilityType
   timezone: string
   cutoffTime: string
+  operatingDays: number[]
+  opensAt: string
+  closesAt: string
+  standardProcessingMinutes: number
+  dailyOrderCapacity: string
   line1: string
   line2: string
   city: string
@@ -82,15 +89,15 @@ type LocationForm = {
   }>
 }
 
-const facilityTypes: Array<{ value: FacilityType; label: string }> = [
-  { value: 'distribution_center', label: 'Distribution center' },
-  { value: 'store', label: 'Store' },
-  { value: 'dark_store', label: 'Dark store' },
-  { value: 'micro_fulfillment', label: 'Micro-fulfillment center' },
-  { value: 'cross_dock', label: 'Cross-dock facility' },
-  { value: 'supplier', label: 'Supplier facility' },
-  { value: 'drop_ship', label: 'Drop-ship node' },
-  { value: 'third_party', label: 'Third-party warehouse' },
+const facilityTypes: Array<{ value: FacilityType; label: string; description: string }> = [
+  { value: 'distribution_center', label: 'Distribution center', description: 'Full receiving, storage, picking, packing, and shipping operation.' },
+  { value: 'store', label: 'Store', description: 'Retail inventory that may also fulfill or receive customer orders.' },
+  { value: 'dark_store', label: 'Dark store', description: 'Customer-free store configured specifically for fulfillment.' },
+  { value: 'micro_fulfillment', label: 'Micro-fulfillment center', description: 'Compact, high-throughput fulfillment facility near demand.' },
+  { value: 'cross_dock', label: 'Cross-dock facility', description: 'Inbound product moves directly to outbound staging with minimal storage.' },
+  { value: 'supplier', label: 'Supplier facility', description: 'Supplier-controlled node used for inventory visibility or fulfillment.' },
+  { value: 'drop_ship', label: 'Drop-ship node', description: 'External node that ships orders without operator-owned inventory.' },
+  { value: 'third_party', label: 'Third-party warehouse', description: 'Partner or 3PL facility managed through delegated operations.' },
 ]
 
 const countries = [
@@ -122,14 +129,24 @@ const timezones = [
   'UTC',
 ]
 
-const locationTypes: Array<{ value: LocationType; label: string }> = [
-  { value: 'receiving', label: 'Receiving' },
-  { value: 'storage', label: 'Storage' },
-  { value: 'pick', label: 'Picking' },
-  { value: 'pack', label: 'Packing' },
-  { value: 'staging', label: 'Staging' },
-  { value: 'shipping', label: 'Shipping' },
-  { value: 'returns', label: 'Returns' },
+const operatingDayOptions = [
+  { value: 0, short: 'Sun', label: 'Sunday' },
+  { value: 1, short: 'Mon', label: 'Monday' },
+  { value: 2, short: 'Tue', label: 'Tuesday' },
+  { value: 3, short: 'Wed', label: 'Wednesday' },
+  { value: 4, short: 'Thu', label: 'Thursday' },
+  { value: 5, short: 'Fri', label: 'Friday' },
+  { value: 6, short: 'Sat', label: 'Saturday' },
+]
+
+const locationTypes: Array<{ value: LocationType; label: string; description: string }> = [
+  { value: 'receiving', label: 'Receiving', description: 'Unload, count, and inspect inbound product.' },
+  { value: 'storage', label: 'Storage', description: 'Hold available, reserved, quarantine, or damaged inventory.' },
+  { value: 'pick', label: 'Picking', description: 'Source inventory for released wave pick tasks.' },
+  { value: 'pack', label: 'Packing', description: 'Verify picked product and prepare packages for shipment.' },
+  { value: 'staging', label: 'Staging', description: 'Temporarily hold inbound, outbound, or transfer work.' },
+  { value: 'shipping', label: 'Shipping', description: 'Manifest, load, and tender completed packages.' },
+  { value: 'returns', label: 'Returns', description: 'Receive and inspect returned product before disposition.' },
 ]
 
 const topologyLevels: Array<{ value: TopologyLevel; label: string }> = [
@@ -156,6 +173,11 @@ const initialWarehouse: WarehouseForm = {
   facilityType: 'distribution_center',
   timezone: 'America/New_York',
   cutoffTime: '16:00',
+  operatingDays: [1, 2, 3, 4, 5],
+  opensAt: '08:00',
+  closesAt: '17:00',
+  standardProcessingMinutes: 120,
+  dailyOrderCapacity: '',
   line1: '',
   line2: '',
   city: '',
@@ -189,6 +211,11 @@ function warehouseForm(item: Warehouse): WarehouseForm {
     facilityType: item.facilityType,
     timezone: item.timezone,
     cutoffTime: item.cutoffTime?.slice(0, 5) || '',
+    operatingDays: item.operatingDays,
+    opensAt: item.opensAt.slice(0, 5),
+    closesAt: item.closesAt.slice(0, 5),
+    standardProcessingMinutes: item.standardProcessingMinutes,
+    dailyOrderCapacity: item.dailyOrderCapacity === null ? '' : String(item.dailyOrderCapacity),
     line1: item.address.line1,
     line2: item.address.line2 || '',
     city: item.address.city,
@@ -245,6 +272,48 @@ function displayCapacity(value: number, system: MeasurementSystem, kind: 'volume
     : `${value.toLocaleString(undefined, { maximumFractionDigits: 1 })} kg`
 }
 
+function nextPickRouteOrder(item: Warehouse) {
+  const highest = item.locations.reduce((value, location) => Math.max(value, location.pickSequence), 0)
+  return Math.max(100, Math.ceil((highest + 1) / 100) * 100)
+}
+
+function operatingDaysLabel(days: number[]) {
+  const sorted = [...days].sort((a, b) => a - b)
+  const weekdays = [1, 2, 3, 4, 5]
+  if (sorted.length === 7) return 'Daily'
+  if (sorted.length === weekdays.length && sorted.every((day, index) => day === weekdays[index])) {
+    return 'Mon-Fri'
+  }
+  return sorted
+    .map((day) => operatingDayOptions.find((option) => option.value === day)?.short)
+    .filter(Boolean)
+    .join(', ')
+}
+
+function warehouseReadiness(item: Warehouse) {
+  const activeLocations = item.locations.filter((location) => location.active)
+  const checks = [
+    { label: 'Active facility', ready: item.status === 'active' },
+    {
+      label: 'Operating profile',
+      ready: item.operatingDays.length > 0
+        && Boolean(item.opensAt)
+        && Boolean(item.closesAt)
+        && item.standardProcessingMinutes >= 0,
+    },
+    { label: 'Receiving', ready: activeLocations.some((location) => location.locationType === 'receiving') },
+    { label: 'Storage or picking', ready: activeLocations.some((location) => ['storage', 'pick'].includes(location.locationType)) },
+    { label: 'Packing', ready: activeLocations.some((location) => location.locationType === 'pack') },
+    { label: 'Outbound staging or shipping', ready: activeLocations.some((location) => ['staging', 'shipping'].includes(location.locationType)) },
+  ]
+  const completed = checks.filter((check) => check.ready).length
+  return {
+    checks,
+    completed,
+    percent: completed / checks.length * 100,
+  }
+}
+
 async function command(body: Record<string, unknown>) {
   const response = await fetch('/api/operations', {
     method: 'POST',
@@ -296,6 +365,7 @@ function LocationCapacity({ item }: { item: Location }) {
 export default function WarehouseSetupPanel({ workspace, onRefresh, onNavigate }: Props) {
   const [warehouseEditor, setWarehouseEditor] = useState<Warehouse | 'new' | null>(null)
   const [locationEditor, setLocationEditor] = useState<{ warehouse: Warehouse; item: Location | null } | null>(null)
+  const [setupGuideOpen, setSetupGuideOpen] = useState(false)
   const [deleteTarget, setDeleteTarget] = useState<Location | null>(null)
   const [warehouse, setWarehouse] = useState(initialWarehouse)
   const [location, setLocation] = useState(initialLocation)
@@ -326,7 +396,10 @@ export default function WarehouseSetupPanel({ workspace, onRefresh, onNavigate }
 
   function openLocation(targetWarehouse: Warehouse, item: Location | null = null) {
     setLocationEditor({ warehouse: targetWarehouse, item })
-    setLocation(item ? locationForm(item) : initialLocation)
+    setLocation(item ? locationForm(item) : {
+      ...initialLocation,
+      pickSequence: nextPickRouteOrder(targetWarehouse),
+    })
     setRuleProductGlobalId('')
     setRuleType('allowed')
     setError('')
@@ -351,6 +424,11 @@ export default function WarehouseSetupPanel({ workspace, onRefresh, onNavigate }
         facilityType: warehouse.facilityType,
         timezone: warehouse.timezone,
         cutoffTime: warehouse.cutoffTime || null,
+        operatingDays: warehouse.operatingDays,
+        opensAt: warehouse.opensAt,
+        closesAt: warehouse.closesAt,
+        standardProcessingMinutes: warehouse.standardProcessingMinutes,
+        dailyOrderCapacity: warehouse.dailyOrderCapacity ? Number(warehouse.dailyOrderCapacity) : null,
         address: {
           name: warehouse.name,
           line1: warehouse.line1,
@@ -487,15 +565,23 @@ export default function WarehouseSetupPanel({ workspace, onRefresh, onNavigate }
           <Typography variant="h5" fontWeight={700}>Warehouse network</Typography>
           <Typography color="text.secondary">Facilities, topology, capacity, product placement, and work areas.</Typography>
         </Box>
-        <Button
-          variant="contained"
-          startIcon={<AddRounded />}
-          disabled={!canManage}
-          onClick={() => openWarehouse('new')}
-          sx={{ alignSelf: { xs: 'stretch', sm: 'center' } }}
-        >
-          New warehouse
-        </Button>
+        <Stack direction={{ xs: 'column', sm: 'row' }} gap={1} sx={{ alignSelf: { xs: 'stretch', sm: 'center' } }}>
+          <Button
+            variant="outlined"
+            startIcon={<HelpOutlineRounded />}
+            onClick={() => setSetupGuideOpen(true)}
+          >
+            Setup guide
+          </Button>
+          <Button
+            variant="contained"
+            startIcon={<AddRounded />}
+            disabled={!canManage}
+            onClick={() => openWarehouse('new')}
+          >
+            New warehouse
+          </Button>
+        </Stack>
       </Stack>
 
       {error && <Alert severity="error" onClose={() => setError('')} sx={{ mt: 2 }}>{error}</Alert>}
@@ -512,7 +598,9 @@ export default function WarehouseSetupPanel({ workspace, onRefresh, onNavigate }
       </Stack>
 
       <Stack divider={<Divider flexItem />} sx={{ mt: 2 }}>
-        {workspace?.warehouses.map((item) => (
+        {workspace?.warehouses.map((item) => {
+          const readiness = warehouseReadiness(item)
+          return (
           <Box key={item.globalId} sx={{ py: 2 }}>
             <Stack direction={{ xs: 'column', sm: 'row' }} justifyContent="space-between" gap={1}>
               <Stack direction="row" gap={1.25} alignItems="center">
@@ -526,6 +614,12 @@ export default function WarehouseSetupPanel({ workspace, onRefresh, onNavigate }
                   <Typography variant="body2" color="text.secondary">
                     {item.code} · {item.globalId} · {item.timezone}
                     {item.cutoffTime ? ` · cutoff ${item.cutoffTime.slice(0, 5)}` : ''}
+                  </Typography>
+                  <Typography variant="caption" color="text.secondary">
+                    {operatingDaysLabel(item.operatingDays)}
+                    {' · '}{item.opensAt.slice(0, 5)}-{item.closesAt.slice(0, 5)}
+                    {' · '}{item.standardProcessingMinutes} min standard processing
+                    {item.dailyOrderCapacity ? ` · ${item.dailyOrderCapacity.toLocaleString()} orders/day planning capacity` : ''}
                   </Typography>
                 </Box>
               </Stack>
@@ -542,6 +636,38 @@ export default function WarehouseSetupPanel({ workspace, onRefresh, onNavigate }
                 </Button>
               </Stack>
             </Stack>
+
+            <Box sx={{ mt: 1.5, py: 1.25, borderTop: 1, borderColor: 'divider' }}>
+              <Stack direction={{ xs: 'column', sm: 'row' }} justifyContent="space-between" gap={0.75}>
+                <Stack direction="row" gap={0.75} alignItems="center">
+                  <CheckCircleOutlineRounded
+                    fontSize="small"
+                    color={readiness.completed === readiness.checks.length ? 'success' : 'disabled'}
+                  />
+                  <Typography variant="body2" fontWeight={650}>Operational readiness</Typography>
+                </Stack>
+                <Typography variant="body2" color="text.secondary">
+                  {readiness.completed} of {readiness.checks.length} core controls configured
+                </Typography>
+              </Stack>
+              <LinearProgress
+                variant="determinate"
+                value={readiness.percent}
+                color={readiness.percent === 100 ? 'success' : 'primary'}
+                sx={{ mt: 0.75, height: 5, borderRadius: 1 }}
+              />
+              <Stack direction="row" gap={0.75} flexWrap="wrap" sx={{ mt: 1 }}>
+                {readiness.checks.map((check) => (
+                  <Chip
+                    key={check.label}
+                    size="small"
+                    label={check.label}
+                    color={check.ready ? 'success' : 'default'}
+                    variant="outlined"
+                  />
+                ))}
+              </Stack>
+            </Box>
 
             <Stack divider={<Divider flexItem />} sx={{ mt: 1.5, borderTop: 1, borderColor: 'divider' }}>
               {item.locations.length ? locationRows(item).map(({ entry, depth }) => (
@@ -562,7 +688,7 @@ export default function WarehouseSetupPanel({ workspace, onRefresh, onNavigate }
                         {!entry.active && <Chip size="small" label="retired" color="warning" />}
                       </Stack>
                       <Typography variant="caption" color="text.secondary">
-                        {entry.zone} · sequence {entry.pickSequence} · {entry.globalId}
+                        {entry.zone} · pick route {entry.pickSequence} · {entry.globalId}
                         {entry.productRules.filter((rule) => rule.active).length
                           ? ` · ${entry.productRules.filter((rule) => rule.active).length} product rule${entry.productRules.filter((rule) => rule.active).length === 1 ? '' : 's'}`
                           : ''}
@@ -593,7 +719,8 @@ export default function WarehouseSetupPanel({ workspace, onRefresh, onNavigate }
               )}
             </Stack>
           </Box>
-        ))}
+          )
+        })}
       </Stack>
 
       {!workspace?.warehouses.length && (
@@ -622,7 +749,15 @@ export default function WarehouseSetupPanel({ workspace, onRefresh, onNavigate }
                 <TextField required label="Warehouse name" value={warehouse.name} onChange={(e) => setWarehouse({ ...warehouse, name: e.target.value })} fullWidth />
               </Stack>
               <Stack direction={{ xs: 'column', sm: 'row' }} gap={1.5}>
-                <TextField select required label="Facility type" value={warehouse.facilityType} onChange={(e) => setWarehouse({ ...warehouse, facilityType: e.target.value as FacilityType })} fullWidth>
+                <TextField
+                  select
+                  required
+                  label="Facility type"
+                  value={warehouse.facilityType}
+                  onChange={(e) => setWarehouse({ ...warehouse, facilityType: e.target.value as FacilityType })}
+                  helperText={facilityTypes.find((type) => type.value === warehouse.facilityType)?.description}
+                  fullWidth
+                >
                   {facilityTypes.map((type) => <MenuItem key={type.value} value={type.value}>{type.label}</MenuItem>)}
                 </TextField>
                 {editingWarehouse && (
@@ -652,8 +787,88 @@ export default function WarehouseSetupPanel({ workspace, onRefresh, onNavigate }
                 <TextField select required label="Timezone" value={warehouse.timezone} onChange={(e) => setWarehouse({ ...warehouse, timezone: e.target.value })} fullWidth>
                   {timezones.map((timezone) => <MenuItem key={timezone} value={timezone}>{timezone}</MenuItem>)}
                 </TextField>
-                <TextField label="Daily cutoff" type="time" value={warehouse.cutoffTime} onChange={(e) => setWarehouse({ ...warehouse, cutoffTime: e.target.value })} InputLabelProps={{ shrink: true }} fullWidth />
+                <TextField
+                  label="Carrier tender cutoff"
+                  type="time"
+                  value={warehouse.cutoffTime}
+                  onChange={(e) => setWarehouse({ ...warehouse, cutoffTime: e.target.value })}
+                  helperText="Latest normal local-time tender for same-day planning."
+                  InputLabelProps={{ shrink: true }}
+                  fullWidth
+                />
               </Stack>
+              <Divider />
+              <Box>
+                <Typography fontWeight={700}>Operating profile</Typography>
+                <Typography variant="body2" color="text.secondary">
+                  Record the facility-local schedule, normal release-to-carrier processing time, and optional throughput target.
+                </Typography>
+              </Box>
+              <Box>
+                <Typography variant="body2" fontWeight={600} sx={{ mb: 0.75 }}>Operating days</Typography>
+                <ToggleButtonGroup
+                  size="small"
+                  value={warehouse.operatingDays}
+                  onChange={(_, days: number[]) => {
+                    if (days.length) setWarehouse({ ...warehouse, operatingDays: [...days].sort((a, b) => a - b) })
+                  }}
+                  aria-label="Warehouse operating days"
+                  sx={{ display: 'grid', gridTemplateColumns: 'repeat(7, minmax(0, 1fr))' }}
+                >
+                  {operatingDayOptions.map((day) => (
+                    <ToggleButton key={day.value} value={day.value} aria-label={day.label}>
+                      {day.short}
+                    </ToggleButton>
+                  ))}
+                </ToggleButtonGroup>
+              </Box>
+              <Stack direction={{ xs: 'column', sm: 'row' }} gap={1.5}>
+                <TextField
+                  required
+                  label="Local opening time"
+                  type="time"
+                  value={warehouse.opensAt}
+                  onChange={(e) => setWarehouse({ ...warehouse, opensAt: e.target.value })}
+                  InputLabelProps={{ shrink: true }}
+                  fullWidth
+                />
+                <TextField
+                  required
+                  label="Local closing time"
+                  type="time"
+                  value={warehouse.closesAt}
+                  onChange={(e) => setWarehouse({ ...warehouse, closesAt: e.target.value })}
+                  InputLabelProps={{ shrink: true }}
+                  fullWidth
+                />
+              </Stack>
+              <Stack direction={{ xs: 'column', sm: 'row' }} gap={1.5}>
+                <TextField
+                  required
+                  type="number"
+                  label="Standard processing time (minutes)"
+                  value={warehouse.standardProcessingMinutes}
+                  onChange={(e) => setWarehouse({
+                    ...warehouse,
+                    standardProcessingMinutes: Math.max(0, Number(e.target.value)),
+                  })}
+                  inputProps={{ min: 0, max: 10080, step: 1 }}
+                  helperText="Typical time from released order to carrier-ready package."
+                  fullWidth
+                />
+                <TextField
+                  type="number"
+                  label="Daily order capacity"
+                  value={warehouse.dailyOrderCapacity}
+                  onChange={(e) => setWarehouse({ ...warehouse, dailyOrderCapacity: e.target.value })}
+                  inputProps={{ min: 1, max: 1000000000, step: 1 }}
+                  helperText="Optional planning threshold; it does not schedule labor or reserve inventory."
+                  fullWidth
+                />
+              </Stack>
+              <Alert severity="info">
+                These versioned facility inputs support readiness and upcoming promise and capacity planning. Pick route order already controls released wave task traversal; automated throughput scheduling is not yet enabled.
+              </Alert>
               {!editingWarehouse && (
                 <Stack direction="row" justifyContent="space-between" alignItems="center">
                   <Box>
@@ -684,10 +899,24 @@ export default function WarehouseSetupPanel({ workspace, onRefresh, onNavigate }
                 </TextField>
               </Stack>
               <Stack direction={{ xs: 'column', sm: 'row' }} gap={1.5}>
-                <TextField select label="Topology level" value={location.topologyLevel} onChange={(e) => setLocation({ ...location, topologyLevel: e.target.value as TopologyLevel })} fullWidth>
+                <TextField
+                  select
+                  label="Physical level"
+                  value={location.topologyLevel}
+                  onChange={(e) => setLocation({ ...location, topologyLevel: e.target.value as TopologyLevel })}
+                  helperText="Where this node sits in the physical warehouse hierarchy."
+                  fullWidth
+                >
                   {topologyLevels.map((level) => <MenuItem key={level.value} value={level.value}>{level.label}</MenuItem>)}
                 </TextField>
-                <TextField select label="Operational use" value={location.locationType} onChange={(e) => setLocation({ ...location, locationType: e.target.value as LocationType })} fullWidth>
+                <TextField
+                  select
+                  label="Operational use"
+                  value={location.locationType}
+                  onChange={(e) => setLocation({ ...location, locationType: e.target.value as LocationType })}
+                  helperText={locationTypes.find((type) => type.value === location.locationType)?.description}
+                  fullWidth
+                >
                   {locationTypes.map((type) => <MenuItem key={type.value} value={type.value}>{type.label}</MenuItem>)}
                 </TextField>
                 <TextField
@@ -705,7 +934,16 @@ export default function WarehouseSetupPanel({ workspace, onRefresh, onNavigate }
                 </TextField>
               </Stack>
               <Stack direction={{ xs: 'column', sm: 'row' }} gap={1.5} alignItems={{ sm: 'center' }}>
-                <TextField required type="number" label="Pick sequence" value={location.pickSequence} onChange={(e) => setLocation({ ...location, pickSequence: Number(e.target.value) })} inputProps={{ min: 0, max: 1000000 }} fullWidth />
+                <TextField
+                  required
+                  type="number"
+                  label="Pick route order"
+                  value={location.pickSequence}
+                  onChange={(e) => setLocation({ ...location, pickSequence: Number(e.target.value) })}
+                  inputProps={{ min: 0, max: 1000000 }}
+                  helperText="Lower numbers are picked first when a wave creates tasks. Leave gaps such as 100, 200, and 300. This does not change customer or order priority."
+                  fullWidth
+                />
                 <FormControlLabel control={<Switch checked={location.active} onChange={(e) => setLocation({ ...location, active: e.target.checked })} />} label="Active" />
                 <FormControlLabel control={<Switch checked={location.allowMixedProducts} onChange={(e) => setLocation({ ...location, allowMixedProducts: e.target.checked })} />} label="Allow mixed products" />
               </Stack>
@@ -714,7 +952,9 @@ export default function WarehouseSetupPanel({ workspace, onRefresh, onNavigate }
               <Stack direction={{ xs: 'column', sm: 'row' }} justifyContent="space-between" alignItems={{ sm: 'center' }} gap={1}>
                 <Box>
                   <Typography fontWeight={700}>Capacity limits</Typography>
-                  <Typography variant="body2" color="text.secondary">Optional physical limits used for putaway and replenishment eligibility.</Typography>
+                  <Typography variant="body2" color="text.secondary">
+                    Optional physical limits identify full or over-capacity locations from recorded inventory and package measurements.
+                  </Typography>
                 </Box>
                 <ToggleButtonGroup
                   exclusive
@@ -763,9 +1003,12 @@ export default function WarehouseSetupPanel({ workspace, onRefresh, onNavigate }
               <Box>
                 <Typography fontWeight={700}>Product placement</Typography>
                 <Typography variant="body2" color="text.secondary">
-                  Restrict, allow, or prefer specific products at this location. A quantity limit is optional.
+                  Record allowed, preferred, or restricted products for directed placement. A quantity limit is optional.
                 </Typography>
               </Box>
+              <Alert severity="info">
+                Placement rules and capacity are visible planning controls. Automated receiving and directed-putaway enforcement remain a later WMS execution step.
+              </Alert>
               <Stack direction={{ xs: 'column', sm: 'row' }} gap={1}>
                 <Autocomplete
                   options={(workspace?.catalog.products || []).filter((product) => !location.productRules.some((rule) => rule.productGlobalId === product.globalId))}
@@ -844,6 +1087,52 @@ export default function WarehouseSetupPanel({ workspace, onRefresh, onNavigate }
         <DialogActions>
           <Button onClick={() => setDeleteTarget(null)} disabled={saving}>Cancel</Button>
           <Button color="error" variant="contained" onClick={removeLocation} disabled={saving}>Remove location</Button>
+        </DialogActions>
+      </Dialog>
+
+      <Dialog open={setupGuideOpen} onClose={() => setSetupGuideOpen(false)} fullWidth maxWidth="sm">
+        <DialogTitle>Warehouse setup guide</DialogTitle>
+        <DialogContent>
+          <Stack divider={<Divider flexItem />} sx={{ pt: 0.5 }}>
+            {[
+              {
+                title: '1. Define the facility',
+                body: 'Choose the facility type, physical origin address, IANA timezone, and local carrier tender cutoff. These values establish facility master data and local-time planning context.',
+              },
+              {
+                title: '2. Set the operating profile',
+                body: 'Record operating days, local opening and closing times, typical processing minutes, and optional daily order capacity. These versioned inputs support readiness now and the upcoming promise and capacity execution slice.',
+              },
+              {
+                title: '3. Build the physical hierarchy',
+                body: 'Use physical levels to model buildings, zones, aisles, bays, shelves, bins, docks, staging areas, and stations. Parent locations describe containment; operational use describes what work occurs there.',
+              },
+              {
+                title: '4. Order the pick route',
+                body: 'Pick route order controls task traversal inside released waves. Lower values are picked first. Use gaps such as 100, 200, and 300. It is not customer, order, allocation, or replenishment priority.',
+              },
+              {
+                title: '5. Record capacity and placement',
+                body: 'Set cubic and weight limits in imperial or metric units. Add product policies for storage intent. ClawPilot shows current usage now; automated directed putaway is not yet enabled.',
+              },
+              {
+                title: '6. Complete the operating path',
+                body: 'A fulfillment warehouse should have active receiving, storage or picking, packing, and outbound staging or shipping locations. The readiness indicator identifies missing core controls.',
+              },
+              {
+                title: '7. Connect facility services',
+                body: 'Configure printers for labels and packing documents. Bind approved carrier accounts and import carrier billing through the related Operations controls.',
+              },
+            ].map((step) => (
+              <Box key={step.title} sx={{ py: 1.5 }}>
+                <Typography fontWeight={700}>{step.title}</Typography>
+                <Typography variant="body2" color="text.secondary" sx={{ mt: 0.4 }}>{step.body}</Typography>
+              </Box>
+            ))}
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setSetupGuideOpen(false)}>Done</Button>
         </DialogActions>
       </Dialog>
     </Box>

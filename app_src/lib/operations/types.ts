@@ -699,6 +699,11 @@ export type OperationsWorkspace = {
     address: Address
     status: 'active' | 'inactive'
     cutoffTime: string | null
+    operatingDays: number[]
+    opensAt: string
+    closesAt: string
+    standardProcessingMinutes: number
+    dailyOrderCapacity: number | null
     rowVersion: number
     locations: Array<{
       id: string

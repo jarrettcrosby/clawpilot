@@ -128,6 +128,18 @@ function optionalNumberValue(value: unknown, label: string, minimum: number, max
   return parsed
 }
 
+function operatingDaysValue(value: unknown): number[] {
+  if (value === undefined) return [1, 2, 3, 4, 5]
+  if (!Array.isArray(value) || value.length < 1 || value.length > 7) {
+    requestError('OPERATIONS_REQUEST_INVALID', 'Select at least one operating day')
+  }
+  const days = value.map((day) => integerValue(day, 'Operating day', 0, 6))
+  if (new Set(days).size !== days.length) {
+    requestError('OPERATIONS_REQUEST_INVALID', 'Operating days must be unique')
+  }
+  return [...days].sort((a, b) => a - b)
+}
+
 function booleanValue(value: unknown, fallback: boolean): boolean {
   return typeof value === 'boolean' ? value : fallback
 }
@@ -360,7 +372,9 @@ export async function POST(req: NextRequest) {
         return json({ ok: false, error: 'You do not have permission to configure warehouses', code: 'OPERATIONS_MANAGE_REQUIRED' }, 403)
       }
       assertFields(body, new Set([
-        'action', 'code', 'name', 'facilityType', 'timezone', 'address', 'cutoffTime', 'createStarterLocations',
+        'action', 'code', 'name', 'facilityType', 'timezone', 'address', 'cutoffTime',
+        'operatingDays', 'opensAt', 'closesAt', 'standardProcessingMinutes',
+        'dailyOrderCapacity', 'createStarterLocations',
       ]), 'OPERATIONS_REQUEST_INVALID', 'Operations command')
       const result = await createOperationsWarehouseInPostgres({
         organizationId: activeOperationsOrganizationId(actor),
@@ -371,6 +385,20 @@ export async function POST(req: NextRequest) {
         timezone: textValue(body.timezone, 'Warehouse timezone', 80),
         address: addressValue(body.address),
         cutoffTime: textValue(body.cutoffTime, 'Warehouse cutoff', 8, false) || null,
+        operatingDays: operatingDaysValue(body.operatingDays),
+        opensAt: textValue(body.opensAt ?? '08:00', 'Warehouse opening time', 8),
+        closesAt: textValue(body.closesAt ?? '17:00', 'Warehouse closing time', 8),
+        standardProcessingMinutes: integerValue(
+          body.standardProcessingMinutes ?? 120,
+          'Standard processing time',
+          0,
+          10_080,
+        ),
+        dailyOrderCapacity: body.dailyOrderCapacity === null
+          || body.dailyOrderCapacity === undefined
+          || body.dailyOrderCapacity === ''
+          ? null
+          : integerValue(body.dailyOrderCapacity, 'Daily order capacity', 1, 1_000_000_000),
         createStarterLocations: body.createStarterLocations !== false,
       })
       return json({ ok: true, capabilities, result }, 201)
@@ -381,7 +409,8 @@ export async function POST(req: NextRequest) {
       }
       assertFields(body, new Set([
         'action', 'warehouseGlobalId', 'expectedRowVersion', 'name', 'facilityType',
-        'timezone', 'address', 'cutoffTime', 'status',
+        'timezone', 'address', 'cutoffTime', 'operatingDays', 'opensAt', 'closesAt',
+        'standardProcessingMinutes', 'dailyOrderCapacity', 'status',
       ]), 'OPERATIONS_REQUEST_INVALID', 'Operations command')
       const result = await updateOperationsWarehouseInPostgres({
         organizationId: activeOperationsOrganizationId(actor),
@@ -393,6 +422,20 @@ export async function POST(req: NextRequest) {
         timezone: textValue(body.timezone, 'Warehouse timezone', 80),
         address: addressValue(body.address),
         cutoffTime: textValue(body.cutoffTime, 'Warehouse cutoff', 8, false) || null,
+        operatingDays: operatingDaysValue(body.operatingDays),
+        opensAt: textValue(body.opensAt ?? '08:00', 'Warehouse opening time', 8),
+        closesAt: textValue(body.closesAt ?? '17:00', 'Warehouse closing time', 8),
+        standardProcessingMinutes: integerValue(
+          body.standardProcessingMinutes ?? 120,
+          'Standard processing time',
+          0,
+          10_080,
+        ),
+        dailyOrderCapacity: body.dailyOrderCapacity === null
+          || body.dailyOrderCapacity === undefined
+          || body.dailyOrderCapacity === ''
+          ? null
+          : integerValue(body.dailyOrderCapacity, 'Daily order capacity', 1, 1_000_000_000),
         status: textValue(body.status, 'Warehouse status', 20) as 'active' | 'inactive',
       })
       return json({ ok: true, capabilities, result })
