@@ -963,6 +963,41 @@ assertIncludes(crmReferenceRoute, "destination.searchParams.set('pipeline', pipe
 assertIncludes(crmReferenceRoute, "crmAction', 'compose-email'", 'CRM email action deep link')
 assertIncludes(crmReferenceRoute, "|p)[0-9]{7}$", 'product Global ID deep link')
 
+const crmReferenceQuarantineMigration = read('db/migrations/0103_pipeline_crm_reference_quarantine.sql')
+assertIncludes(
+  crmReferenceQuarantineMigration,
+  'ADD COLUMN IF NOT EXISTS reference_access_disabled boolean NOT NULL DEFAULT false',
+  'expand-safe pipeline CRM reference quarantine',
+)
+for (const fragment of [
+  'reject_reference_disabled_pipeline_membership',
+  'reject_reference_disabled_pipeline_preference',
+  'require_pipeline_access_removed_before_quarantine',
+  'preserve_quarantined_pipeline_short_link_disable',
+  'FOR SHARE',
+  "USING ERRCODE = '23514'",
+]) {
+  assertIncludes(
+    crmReferenceQuarantineMigration,
+    fragment,
+    'database-enforced quarantined pipeline access isolation',
+  )
+}
+assert.equal(
+  (crmAdapter.match(/AND NOT pipeline\.reference_access_disabled/g) || []).length,
+  2,
+  'quarantined pipeline CRM reference resolution and bulk-link creation guards',
+)
+assert.ok(
+  (crmAdapter.match(/FOR SHARE OF pipeline/g) || []).length >= 2,
+  'CRM short-link creation must serialize with pipeline quarantine',
+)
+assertIncludes(
+  crmAdapter,
+  'if (owner.rows[0].reference_access_disabled) return null',
+  'quarantined pipeline per-record CRM link creation guard',
+)
+
 const crmBoardProjection = read('app_src/lib/crm/boardProjection.ts')
 assertIncludes(crmBoardProjection, 'updateCrmDescriptionWithClient', 'transactional CRM card description write-through')
 assertIncludes(crmBoardProjection, 'expectedDescriptionHash', 'CRM card optimistic concurrency')
@@ -1507,6 +1542,7 @@ for (const migration of [
   '0096_crm_contact_identity_aliases.sql',
   '0097_operations_settlement_lifecycle.sql',
   '0102_pos_payment_exceptions.sql',
+  '0103_pipeline_crm_reference_quarantine.sql',
 ]) {
   assertIncludes(healthRoute, migration, 'hosted POS and accounting migration health')
 }

@@ -1519,15 +1519,22 @@ async function ensureCrmReferenceShortLink(
 ) {
   const destinationUrl = crmReferenceDestination(input.referenceCode)
   if (!destinationUrl) return null
-  const owner = await client.query<{ owner_email: string; organization_id: string }>(
-    `SELECT pipeline.owner_email, pipeline.workspace_organization_id::text AS organization_id
+  const owner = await client.query<{
+    owner_email: string
+    organization_id: string
+    reference_access_disabled: boolean
+  }>(
+    `SELECT pipeline.owner_email, pipeline.workspace_organization_id::text AS organization_id,
+       pipeline.reference_access_disabled
      FROM pipeline_spaces pipeline
      WHERE pipeline.id = $1::uuid
        AND pipeline.workspace_organization_id IS NOT NULL
-     LIMIT 1`,
+     LIMIT 1
+     FOR SHARE OF pipeline`,
     [input.pipelineId],
   )
   if (!owner.rows[0]) throw new Error('CRM pipeline owner was not found')
+  if (owner.rows[0].reference_access_disabled) return null
   const inserted = await client.query<{ slug: string }>(
     `INSERT INTO short_links (
        owner_email, organization_root_id, source_app, slug, destination_url, title, tags, created_at, updated_at
@@ -4731,6 +4738,7 @@ export async function resolveCrmReferenceRoute(referenceValue: unknown, options:
          ON membership.pipeline_id = pipeline.id AND membership.user_email = $2
        WHERE record.reference_code = $1
          AND ${activeCrmRecordSql('record')}
+         AND NOT pipeline.reference_access_disabled
          AND ($2 = '' OR pipeline.owner_email = $2 OR membership.user_email = $2)
        ORDER BY
          CASE
@@ -4796,6 +4804,8 @@ export async function ensurePipelineCrmReferenceLinks(pipelineId: string) {
        FROM pipeline_spaces pipeline
        WHERE pipeline.id = $1::uuid
          AND pipeline.workspace_organization_id IS NOT NULL
+         AND NOT pipeline.reference_access_disabled
+       FOR SHARE OF pipeline
      ), links AS (
        SELECT records.reference_code AS slug,
          $2 || '/crm/' || records.reference_code AS destination_url,

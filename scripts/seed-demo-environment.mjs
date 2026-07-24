@@ -8,12 +8,14 @@ const { Pool } = requireFromApp('pg')
 
 const DEMO_EMAIL = 'demo-system@clawpilot.example'
 const ROOT_ORGANIZATION_ID = '10000000-0000-4000-8000-000000000001'
-const PIPELINE_ID = '20000000-0000-4000-8000-000000000002'
+const PIPELINE_ID = crypto.randomUUID()
 const BOARD_ID = '30000000-0000-4000-8000-000000000001'
 const TOAST_RESTAURANT_GUID = '90000000-0000-4000-8000-000000000001'
 const TOAST_MENU_GUID = '91000000-0000-4000-8000-000000000001'
 const TOAST_TAX_GUID = '93000000-0000-4000-8000-000000000001'
 const TOAST_DISCOUNT_GUID = '93000000-0000-4000-8000-000000000002'
+const QUARANTINE_ROTATION_ENABLED =
+  String(process.env.DEMO_QUARANTINE_ROTATION_ENABLED || '').toLowerCase() === 'true'
 
 const DEMO_MENU = [
   { id: '94000000-0000-4000-8000-000000000001', name: 'Harbor melt', groupId: '92000000-0000-4000-8000-000000000001', group: 'Sandwiches', categoryId: '93000000-0000-4000-8000-000000000011', price: 15 },
@@ -40,10 +42,6 @@ const pool = new Pool({
   query_timeout: 60000,
 })
 
-function uuid(prefix, index) {
-  return `${prefix}0000000-0000-4000-8000-${String(index).padStart(12, '0')}`
-}
-
 function digest(value) {
   return crypto.createHash('sha256').update(typeof value === 'string' ? value : JSON.stringify(value)).digest('hex')
 }
@@ -60,6 +58,21 @@ async function main() {
   try {
     await client.query(`SELECT pg_advisory_lock(hashtext('clawpilot-demo-account-seed'))`)
     await client.query('BEGIN')
+    await client.query(
+      `SELECT id
+       FROM workspace_organizations
+       WHERE id = $1::uuid
+       FOR UPDATE`,
+      [ROOT_ORGANIZATION_ID],
+    )
+    const currentDemoPipelines = await client.query(
+      `SELECT pipeline.id::text
+       FROM pipeline_spaces pipeline
+       WHERE pipeline.workspace_organization_id = $1::uuid
+       FOR UPDATE`,
+      [ROOT_ORGANIZATION_ID],
+    )
+    const currentDemoPipelineIds = currentDemoPipelines.rows.map((row) => row.id)
     const immutableDemoPipelines = await client.query(
       `SELECT pipeline.id::text
        FROM pipeline_spaces pipeline
@@ -80,7 +93,51 @@ async function main() {
       [ROOT_ORGANIZATION_ID],
     )
     const immutablePipelineIds = immutableDemoPipelines.rows.map((row) => row.id)
+    if (immutablePipelineIds.length > 0 && !QUARANTINE_ROTATION_ENABLED) {
+      await client.query('COMMIT')
+      console.log(JSON.stringify({
+        ok: true,
+        environment: environment || 'local',
+        mode: 'quarantine_guard_rollout',
+        rotationEnabled: false,
+        pendingImmutablePipelines: immutablePipelineIds.length,
+      }))
+      return
+    }
+    if (currentDemoPipelineIds.length > 0) {
+      const activeOutbox = await client.query(
+        `SELECT outbox.id::text, outbox.status
+         FROM sync_outbox outbox
+         WHERE outbox.target_system = 'suitecrm'
+           AND outbox.payload->>'pipelineId' = ANY($1::text[])
+           AND outbox.status IN ('queued', 'failed', 'processing')
+         FOR UPDATE`,
+        [currentDemoPipelineIds],
+      )
+      const processingOutbox = activeOutbox.rows.filter((row) => row.status === 'processing')
+      if (processingOutbox.length > 0) {
+        throw new Error(
+          `demo pipeline rotation blocked by ${processingOutbox.length} active SuiteCRM work item(s)`,
+        )
+      }
+    }
+    const immutablePipelineIdSet = new Set(immutablePipelineIds)
+    const deletablePipelineIds = currentDemoPipelineIds.filter((id) => !immutablePipelineIdSet.has(id))
     if (immutablePipelineIds.length > 0) {
+      await client.query(
+        `UPDATE sync_outbox
+         SET status = 'dead',
+             last_error = 'Demo pipeline quarantined; immutable CRM identity evidence preserved',
+             available_at = 'infinity'::timestamptz,
+             processed_at = COALESCE(processed_at, now()),
+             locked_at = NULL,
+             lock_token = NULL,
+             updated_at = now()
+         WHERE target_system = 'suitecrm'
+           AND payload->>'pipelineId' = ANY($1::text[])
+           AND status IN ('queued', 'failed')`,
+        [immutablePipelineIds],
+      )
       await client.query(
         `UPDATE app_user_workspace_preferences
          SET default_pipeline_id = NULL, updated_at = now()
@@ -94,10 +151,55 @@ async function main() {
         [immutablePipelineIds],
       )
       await client.query(
+        `WITH legacy_references AS (
+           SELECT reference_code FROM crm_organizations WHERE pipeline_id = ANY($1::uuid[])
+           UNION
+           SELECT reference_code FROM crm_contacts WHERE pipeline_id = ANY($1::uuid[])
+           UNION
+           SELECT reference_code FROM crm_leads WHERE pipeline_id = ANY($1::uuid[])
+           UNION
+           SELECT reference_code FROM crm_products WHERE pipeline_id = ANY($1::uuid[])
+           UNION
+           SELECT reference_code FROM crm_opportunities WHERE pipeline_id = ANY($1::uuid[])
+           UNION
+           SELECT reference_code FROM crm_interactions WHERE pipeline_id = ANY($1::uuid[])
+           UNION
+           SELECT reference_code FROM crm_meetings WHERE pipeline_id = ANY($1::uuid[])
+           UNION
+           SELECT reference_code FROM crm_campaigns WHERE pipeline_id = ANY($1::uuid[])
+           UNION
+           SELECT survivor_reference_code FROM crm_contact_merges
+           WHERE pipeline_id = ANY($1::uuid[])
+           UNION
+           SELECT duplicate_reference_code FROM crm_contact_merges
+           WHERE pipeline_id = ANY($1::uuid[])
+         ), expanded_legacy_references AS (
+           SELECT reference_code FROM legacy_references
+           UNION
+           SELECT alias.alias_code
+           FROM crm_reference_aliases alias
+           JOIN legacy_references legacy
+             ON legacy.reference_code = alias.canonical_code
+         )
+         UPDATE short_links link
+         SET disabled_at = COALESCE(link.disabled_at, now()),
+             updated_at = now()
+         FROM expanded_legacy_references legacy
+         WHERE link.deleted_at IS NULL
+           AND (
+             link.slug = legacy.reference_code
+             OR link.slug = 'mail-' || legacy.reference_code
+             OR legacy.reference_code = ANY(link.tags)
+             OR link.destination_url LIKE '%/crm/' || legacy.reference_code || '%'
+           )`,
+        [immutablePipelineIds],
+      )
+      await client.query(
         `UPDATE pipeline_spaces
          SET name = 'Archived demo identity evidence ' || right(id::text, 4),
              is_default = false,
              sync_enabled = false,
+             reference_access_disabled = true,
              updated_at = now()
          WHERE id = ANY($1::uuid[])`,
         [immutablePipelineIds],
@@ -130,16 +232,14 @@ async function main() {
       `DELETE FROM toast_locations WHERE organization_id = $1::uuid`,
       [ROOT_ORGANIZATION_ID],
     )
-    await client.query(
-      `DELETE FROM sync_outbox
-       WHERE target_system = 'suitecrm'
-         AND payload->>'pipelineId' IN (
-           SELECT id::text
-           FROM pipeline_spaces
-           WHERE workspace_organization_id = $1::uuid
-         )`,
-      [ROOT_ORGANIZATION_ID],
-    )
+    if (deletablePipelineIds.length > 0) {
+      await client.query(
+        `DELETE FROM sync_outbox
+         WHERE target_system = 'suitecrm'
+           AND payload->>'pipelineId' = ANY($1::text[])`,
+        [deletablePipelineIds],
+      )
+    }
     await client.query(
       `DELETE FROM operations_activation_scopes WHERE organization_id = $1::uuid`,
       [ROOT_ORGANIZATION_ID],
@@ -470,9 +570,10 @@ async function main() {
     await client.query(
       `INSERT INTO pipeline_spaces (
          id, name, owner_email, is_default, sync_enabled, projection,
-         workspace_organization_id, provisioning_status, created_at, updated_at
+         workspace_organization_id, provisioning_status, reference_access_disabled,
+         created_at, updated_at
        ) VALUES ($1::uuid, 'Demo Revenue Pipeline', $2, true, false, $3::jsonb,
-         $4::uuid, 'not_requested', $5::timestamptz, $5::timestamptz)`,
+         $4::uuid, 'not_requested', false, $5::timestamptz, $5::timestamptz)`,
       [PIPELINE_ID, DEMO_EMAIL, JSON.stringify({
         syncedAt: dataset.generatedAt,
         source: 'demo',
@@ -523,7 +624,7 @@ async function main() {
       [DEMO_EMAIL, ROOT_ORGANIZATION_ID, BOARD_ID, PIPELINE_ID, dataset.generatedAt],
     )
 
-    const crmRootId = uuid('4', 1)
+    const crmRootId = crypto.randomUUID()
     await client.query(
       `INSERT INTO crm_organizations (
          id, pipeline_id, suitecrm_id, source_key, identity_key, reference_code,
@@ -542,7 +643,7 @@ async function main() {
 
     const organizationIds = new Map()
     for (const [index, organization] of dataset.organizations.entries()) {
-      const id = uuid('4', index + 2)
+      const id = crypto.randomUUID()
       organizationIds.set(organization.providerId, id)
       const payload = { provider: 'quickbooks', synthetic: true, customerId: organization.providerId }
       await client.query(
@@ -567,7 +668,7 @@ async function main() {
 
     const contactIds = new Map()
     for (const [index, person] of dataset.people.entries()) {
-      const id = uuid('5', index + 1)
+      const id = crypto.randomUUID()
       contactIds.set(person.email, id)
       const organizationId = organizationIds.get(person.organizationProviderId)
       const [firstName, ...lastParts] = person.fullName.split(' ')
@@ -593,7 +694,7 @@ async function main() {
 
     const productIds = new Map()
     for (const [index, product] of dataset.products.entries()) {
-      const id = uuid('7', index + 1)
+      const id = crypto.randomUUID()
       productIds.set(product.providerId, id)
       const payload = { provider: 'quickbooks', synthetic: true, itemId: product.providerId }
       await client.query(
@@ -614,7 +715,7 @@ async function main() {
 
     const opportunityIds = new Map()
     for (const [index, opportunity] of dataset.opportunities.entries()) {
-      const id = uuid('6', index + 1)
+      const id = crypto.randomUUID()
       opportunityIds.set(opportunity.organizationProviderId, id)
       const organization = dataset.organizations.find((item) => item.providerId === opportunity.organizationProviderId)
       const organizationId = organizationIds.get(opportunity.organizationProviderId)
@@ -662,7 +763,7 @@ async function main() {
            'ClawPilot Demo Team', $10::timestamptz, $11, $12, 'logged', $13::jsonb,
            $13::jsonb, $14, 'synced', $10::timestamptz, $15, $15, $10::timestamptz, $10::timestamptz
          )`,
-        [uuid('8', index + 1), PIPELINE_ID, organizationId, contactId, opportunityId,
+        [crypto.randomUUID(), PIPELINE_ID, organizationId, contactId, opportunityId,
           `demo-suitecrm-interaction-${index + 1}`, interaction.sourceKey, interaction.kind,
           interaction.subject, interaction.occurredAt, interaction.description, interaction.direction,
           JSON.stringify(payload), digest(payload), DEMO_EMAIL],
@@ -1104,6 +1205,7 @@ async function main() {
       interactions: dataset.interactions.length,
       invoices: dataset.invoices.length,
       products: dataset.products.length,
+      pipelineId: PIPELINE_ID,
       quarantinedPipelines: immutablePipelineIds.length,
     }))
   } catch (error) {

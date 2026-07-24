@@ -212,6 +212,7 @@ for (const requiredPath of [
   'db/migrations/0100_operations_sandbox_rate_diagnostic_scope.sql',
   'db/migrations/0101_operations_receiving_and_topology.sql',
   'db/migrations/0102_pos_payment_exceptions.sql',
+  'db/migrations/0103_pipeline_crm_reference_quarantine.sql',
   '.github/workflows/clawpilot-repository-runner.yml',
   '.github/workflows/deployed-runtime-monitor.yml',
   'scripts/start-railway.sh',
