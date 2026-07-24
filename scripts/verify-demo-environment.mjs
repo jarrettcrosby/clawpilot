@@ -29,6 +29,7 @@ try {
         WHERE email = $2 AND status = 'active')::integer AS system_users,
        (SELECT count(*) FROM pipeline_spaces
         WHERE workspace_organization_id = $1::uuid
+          AND owner_email = $2
           AND is_default = true
           AND sync_enabled = false
           AND reference_access_disabled = false)::integer AS active_pipelines,
@@ -46,7 +47,10 @@ try {
           ))::integer AS immutable_pipelines,
        (SELECT count(*) FROM schema_migrations
         WHERE filename = '0103_pipeline_crm_reference_quarantine.sql')::integer
-          AS quarantine_migrations`,
+          AS quarantine_migrations,
+       (SELECT count(*) FROM schema_migrations
+        WHERE filename = '0104_demo_managed_resource_guard.sql')::integer
+          AS managed_resource_migrations`,
     [DEMO_WORKSPACE_ID, DEMO_EMAIL],
   )
   const guard = rolloutGuard.rows[0]
@@ -54,7 +58,8 @@ try {
     if (guard.workspaces !== 1
       || guard.system_users !== 1
       || guard.active_pipelines < 1
-      || guard.quarantine_migrations !== 1) {
+      || guard.quarantine_migrations !== 1
+      || guard.managed_resource_migrations !== 1) {
       throw new Error(`demo quarantine guard verification failed: ${JSON.stringify(guard || {})}`)
     }
     console.log(JSON.stringify({
@@ -74,6 +79,7 @@ try {
       SELECT id, updated_at, created_at
       FROM pipeline_spaces
       WHERE workspace_organization_id = $1::uuid
+        AND owner_email = $2
         AND is_default = true
         AND sync_enabled = false
         AND reference_access_disabled = false

@@ -151,6 +151,8 @@ const verifier = read('scripts/verify-demo-environment.mjs')
 assert.ok(verifier.includes('DEMO_QUARANTINE_ROTATION_ENABLED'))
 assert.ok(verifier.includes("mode: 'quarantine_guard_rollout'"))
 assert.ok(verifier.includes('quarantine_migrations'))
+assert.ok(verifier.includes('managed_resource_migrations'))
+assert.ok((verifier.match(/AND owner_email = \$2/g) || []).length >= 2)
 assert.ok(verifier.includes('guard.active_pipelines < 1'))
 assert.ok(verifier.includes('active_pipeline_candidates'))
 assert.ok(verifier.includes('reference_access_disabled = false'))
@@ -169,6 +171,34 @@ assert.ok(verifier.includes('pos_business_days'))
 assert.ok(verifier.includes('pos_menu_items'))
 assert.ok(verifier.includes('accounting_profiles'))
 assert.ok(verifier.includes('accounting_mappings'))
+
+const demoManagedResourceGuard = read('db/migrations/0104_demo_managed_resource_guard.sql')
+assert.ok(demoManagedResourceGuard.includes('enforce_demo_managed_pipeline_access'))
+assert.ok(demoManagedResourceGuard.includes('The demo workspace only permits its managed pipeline'))
+assert.ok(demoManagedResourceGuard.includes('reference_access_disabled'))
+
+const tenancy = read('app_src/lib/tenancy.ts')
+assert.ok(tenancy.includes('isDemoWorkspaceId(organization.id)'))
+assert.ok(tenancy.includes('Demo account resources are not available'))
+assert.ok(tenancy.includes('AND pipeline.reference_access_disabled = false'))
+assert.ok(tenancy.includes('AND (NOT $3::boolean OR board.id = $4::uuid)'))
+assert.ok(tenancy.includes('AND (NOT $3::boolean OR pipeline.owner_email = $4)'))
+const demoResourceBranch = tenancy.slice(
+  tenancy.indexOf('if (isDemoWorkspaceId(organization.id))'),
+  tenancy.indexOf('INSERT INTO project_boards (name, owner_email', tenancy.indexOf('if (isDemoWorkspaceId(organization.id))')),
+)
+assert.ok(
+  demoResourceBranch.indexOf('FROM workspace_organizations')
+    < demoResourceBranch.indexOf('FROM pipeline_spaces'),
+  'demo resource lookup must lock the workspace before its managed pipeline',
+)
+assert.ok(
+  demoResourceBranch.indexOf('FROM pipeline_spaces')
+    < demoResourceBranch.indexOf('FROM project_boards'),
+  'demo resource lookup must lock the pipeline before the board',
+)
+
+assert.ok(workspaceMemberships.includes('AND owner_email = $2'))
 assert.ok(verifier.includes("dataset_key = 'workspace-demo'"))
 
 const postgresAcceptance = read('scripts/verify-demo-seed-postgres.mjs')
