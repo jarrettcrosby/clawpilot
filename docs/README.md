@@ -62,12 +62,14 @@ Current product behavior is defined by active module and operating contracts. Op
 - [Railway Postgres backups](operations/railway-postgres-backups.md)
 - [SuiteCRM Railway runbook](operations/suitecrm.md)
 - [Sales pipeline EPISCS migration](operations/sales-pipeline-episcs-migration.md)
+- [Printing, carrier billing, and GL Coding](operations/printing-carrier-billing-and-gl-coding.md)
+- [Local print agent](operations/local-print-agent.md)
 - [Release documentation contract](releases/README.md)
 - [ClawPilot identity](brand/clawpilot-identity.md)
 
 ### Distributed Operations Design
 
-These documents define the accepted authority boundary and the pre-activation design for DOM, WMS, shipping, and 3PL billing. They do not claim that migration `0081`, provider adapters, operations workers, or warehouse workflows are deployed.
+These documents define the accepted authority boundary and the pre-activation design for DOM, WMS, shipping, and 3PL billing. Bounded development workflows exist for order execution, sandbox rating, carrier-bill import, GL Coding, settlement evidence, and local print delivery; they do not claim production commerce or carrier mutations, accounting export, invoice/AR, payments, optimization, or live warehouse workers.
 
 - [Distributed operations integration and gap map](maps/distributed-operations-integration-gap-map.md)
 - [Distributed operations domain and architecture contract](modules/distributed-operations.md)

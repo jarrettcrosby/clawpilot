@@ -10,6 +10,8 @@ import {
   createGlCodingRuleInPostgres,
   GlCodingRequestError,
   readGlCodingWorkspaceFromPostgres,
+  recordGlCodingSettlementEventInPostgres,
+  reviewGlCodingRunInPostgres,
   runSelectedGlCodingFilesInPostgres,
 } from '@/lib/persistence/glCoding'
 import { requireRequestUser } from '@/lib/requestUser'
@@ -21,7 +23,9 @@ export const runtime = 'nodejs'
 const MAX_REQUEST_BYTES = 32 * 1024
 const BILLING_BATCH_GLOBAL_ID = /^gcb\d{7}$/
 const BILLING_CHARGE_GLOBAL_ID = /^gcl\d{7}$/
+const GL_CODING_RUN_GLOBAL_ID = /^ggl\d{7}$/
 const RATE_PARTY_GLOBAL_ID = /^grp\d{7}$/
+const SETTLEMENT_GLOBAL_ID = /^gse\d{7}$/
 
 function json(payload: Record<string, unknown>, status = 200) {
   return NextResponse.json(payload, {
@@ -235,16 +239,16 @@ export async function POST(req: NextRequest) {
     requirePostgres()
     const actor = await requireRequestUser(req)
     const capabilities = carrierRateNetworkCapabilities(actor)
-    if (!capabilities.canReconcileCarrierBilling) {
-      return json({
-        ok: false,
-        error: 'You do not have permission to reconcile carrier billing',
-        code: 'CARRIER_BILLING_RECONCILE_REQUIRED',
-      }, 403)
-    }
     const body = await requestBody(req)
     const action = textValue(body.action, 'GL Coding action', 50)
     if (action === 'run-selected-files') {
+      if (!capabilities.canReconcileCarrierBilling) {
+        return json({
+          ok: false,
+          error: 'You do not have permission to reconcile carrier billing',
+          code: 'CARRIER_BILLING_RECONCILE_REQUIRED',
+        }, 403)
+      }
       assertFields(body, new Set(['action', 'batchGlobalIds']), 'GL Coding command')
       if (!Array.isArray(body.batchGlobalIds)) {
         requestError('GL_CODING_REQUEST_INVALID', 'Select at least one carrier billing file')
@@ -264,6 +268,13 @@ export async function POST(req: NextRequest) {
       return json({ ok: true, capabilities, result }, result.duplicate ? 200 : 201)
     }
     if (action === 'assign-orphan') {
+      if (!capabilities.canReconcileCarrierBilling) {
+        return json({
+          ok: false,
+          error: 'You do not have permission to assign carrier billing charges',
+          code: 'CARRIER_BILLING_RECONCILE_REQUIRED',
+        }, 403)
+      }
       assertFields(
         body,
         new Set(['action', 'chargeGlobalId', 'shipperPartyGlobalId', 'reason']),
@@ -287,7 +298,104 @@ export async function POST(req: NextRequest) {
       })
       return json({ ok: true, capabilities, result }, result.duplicate ? 200 : 201)
     }
+    if (action === 'review-run') {
+      if (!capabilities.canApproveCarrierSettlement) {
+        return json({
+          ok: false,
+          error: 'Carrier settlement approval permission is required',
+          code: 'CARRIER_SETTLEMENT_APPROVAL_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set(['action', 'runGlobalId', 'decision', 'reason']),
+        'GL Coding command',
+      )
+      const decision = textValue(body.decision, 'Review decision', 20)
+      if (decision !== 'approved' && decision !== 'rejected') {
+        requestError('GL_CODING_REQUEST_INVALID', 'Review decision is invalid')
+      }
+      const result = await reviewGlCodingRunInPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        runGlobalId: globalIdValue(
+          body.runGlobalId,
+          'GL Coding run',
+          GL_CODING_RUN_GLOBAL_ID,
+        ),
+        decision,
+        reason: textValue(body.reason, 'Review reason', 1_000),
+        idempotencyKey: idempotencyKeyValue(req),
+      })
+      return json({ ok: true, capabilities, result }, result.duplicate ? 200 : 201)
+    }
+    if (action === 'record-settlement-event') {
+      if (!capabilities.canApproveCarrierSettlement) {
+        return json({
+          ok: false,
+          error: 'Carrier settlement approval permission is required',
+          code: 'CARRIER_SETTLEMENT_APPROVAL_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set([
+          'action',
+          'settlementGlobalId',
+          'eventType',
+          'reason',
+          'reference',
+        ]),
+        'GL Coding command',
+      )
+      const eventType = textValue(body.eventType, 'Settlement event', 20)
+      if (![
+        'approved',
+        'billed',
+        'paid',
+        'disputed',
+        'resolved',
+        'reversed',
+        'voided',
+      ].includes(eventType)) {
+        requestError('GL_CODING_REQUEST_INVALID', 'Settlement event is invalid')
+      }
+      const reference = textValue(
+        body.reference,
+        'External reference',
+        200,
+        eventType === 'billed' || eventType === 'paid',
+      )
+      const result = await recordGlCodingSettlementEventInPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        settlementGlobalId: globalIdValue(
+          body.settlementGlobalId,
+          'Settlement',
+          SETTLEMENT_GLOBAL_ID,
+        ),
+        eventType: eventType as
+          | 'approved'
+          | 'billed'
+          | 'paid'
+          | 'disputed'
+          | 'resolved'
+          | 'reversed'
+          | 'voided',
+        reason: textValue(body.reason, 'Settlement reason', 1_000),
+        reference,
+        idempotencyKey: idempotencyKeyValue(req),
+      })
+      return json({ ok: true, capabilities, result }, result.duplicate ? 200 : 201)
+    }
     if (action === 'create-rule') {
+      if (!capabilities.canReconcileCarrierBilling) {
+        return json({
+          ok: false,
+          error: 'You do not have permission to reconcile carrier billing',
+          code: 'CARRIER_BILLING_RECONCILE_REQUIRED',
+        }, 403)
+      }
       if (!capabilities.canManageNetworks) {
         return json({
           ok: false,

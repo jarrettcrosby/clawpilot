@@ -231,6 +231,12 @@ for (const fragment of [
   'operations_gl_coding_run_items',
   'operations.gl_coding.run_completed',
   'operations.gl_coding.orphan_assigned',
+  'reviewGlCodingRunInPostgres',
+  'recordGlCodingSettlementEventInPostgres',
+  "'carrier_payable'",
+  "'carrier_cost_reimbursement'",
+  "'credit'",
+  'quoteTimePlatformAndResellerFeesExcluded',
 ]) {
   assert.ok(persistence.includes(fragment), `Missing GL Coding persistence contract: ${fragment}`)
 }
@@ -244,7 +250,10 @@ for (const fragment of [
   "action === 'run-selected-files'",
   "action === 'assign-orphan'",
   "action === 'create-rule'",
+  "action === 'review-run'",
+  "action === 'record-settlement-event'",
   'canReconcileCarrierBilling',
+  'canApproveCarrierSettlement',
   'canManageNetworks',
   'Idempotency-Key',
   'Cache-Control',
@@ -262,8 +271,50 @@ for (const fragment of [
   'shipperAssignmentStatus',
   'canManageNetworks',
   'environmentConflict',
+  'Import carrier billing CSV',
+  'Approve actuals',
+  'Reject run',
+  'Settlement ledger',
+  'canApproveCarrierSettlement',
 ]) {
   assert.ok(panel.includes(fragment), `Missing GL Coding UI contract: ${fragment}`)
+}
+
+const reviewMigration = read('db/migrations/0093_operations_carrier_billing_import_and_review.sql')
+for (const fragment of [
+  'CREATE TABLE IF NOT EXISTS operations_carrier_billing_import_rows',
+  'CREATE TABLE IF NOT EXISTS operations_gl_coding_reviews',
+  'CREATE TABLE IF NOT EXISTS operations_gl_coding_review_items',
+  'CREATE TABLE IF NOT EXISTS operations_gl_coding_review_settlements',
+  'validate_operations_gl_coding_review',
+  'validate_operations_gl_coding_review_item',
+  'validate_operations_gl_coding_review_settlement',
+  "'carrier_payable', 'carrier_cost_reimbursement', 'credit'",
+  'Only a completed GL Coding run without orphan or error items may be approved',
+  'GL Coding review settlement must preserve the exact reviewed billed-actual decision',
+]) {
+  assert.ok(reviewMigration.includes(fragment), `Missing GL Coding review contract: ${fragment}`)
+}
+
+const settlementLifecycleMigration = read('db/migrations/0097_operations_settlement_lifecycle.sql')
+for (const fragment of [
+  'validate_operations_settlement_event_lifecycle',
+  'Settlement events are append-only',
+  'Settlement lifecycle event requires an operator reason',
+  'Billed and paid settlement events require an external reference',
+  "NEW.event_type = 'approved'",
+  "NEW.event_type = 'billed'",
+  "NEW.event_type = 'paid'",
+  "NEW.event_type = 'disputed'",
+  "NEW.event_type = 'resolved'",
+  "NEW.event_type = 'reversed'",
+  "NEW.event_type = 'voided'",
+  'CREATE OR REPLACE VIEW operations_settlement_current_status',
+]) {
+  assert.ok(
+    settlementLifecycleMigration.includes(fragment),
+    `Missing settlement lifecycle contract: ${fragment}`,
+  )
 }
 
 console.log('gl coding tests passed')

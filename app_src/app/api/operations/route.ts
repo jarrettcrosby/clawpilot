@@ -13,6 +13,7 @@ import type {
 } from '@/lib/operations/types'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import {
+  confirmOperationsOrderShipmentFromPostgres,
   confirmOperationsOrderPicksFromPostgres,
   OperationsRequestError,
   readOperationsWorkspaceFromPostgres,
@@ -22,6 +23,10 @@ import {
   updateOperationsExceptionInPostgres,
   verifyOperationsOrderPackFromPostgres,
 } from '@/lib/persistence/operations'
+import {
+  createOperationsSandboxLabelInPostgres,
+  voidOperationsSandboxLabelInPostgres,
+} from '@/lib/persistence/operationShipping'
 import { requireRequestUser } from '@/lib/requestUser'
 
 export const dynamic = 'force-dynamic'
@@ -33,6 +38,9 @@ const CUSTOMER_GLOBAL_ID = /^ga\d{7}$/
 const PRODUCT_GLOBAL_ID = /^gp\d{7}$/
 const ORDER_GLOBAL_ID = /^gor\d{7}$/
 const EXCEPTION_GLOBAL_ID = /^gex\d{7}$/
+const RATE_GLOBAL_ID = /^grt\d{7}$/
+const CARRIER_ACCOUNT_GLOBAL_ID = /^gac\d{7}$/
+const PRINTER_GLOBAL_ID = /^gpr\d{7}$/
 const ORDER_STATUSES = new Set<OperationsOrderStatus>([
   'imported', 'validated', 'held', 'promised', 'reserved', 'planned',
   'released', 'picking', 'packed', 'shipped', 'cancelled', 'exception',
@@ -105,6 +113,13 @@ function integerValue(value: unknown, label: string, minimum: number, maximum: n
 
 function globalIdValue(value: unknown, label: string, pattern: RegExp): string {
   const globalId = textValue(value, label, 16)
+  if (!pattern.test(globalId)) requestError('OPERATIONS_REQUEST_INVALID', `${label} is invalid`)
+  return globalId
+}
+
+function optionalGlobalIdValue(value: unknown, label: string, pattern: RegExp): string | null {
+  const globalId = textValue(value, label, 16, false)
+  if (!globalId) return null
   if (!pattern.test(globalId)) requestError('OPERATIONS_REQUEST_INVALID', `${label} is invalid`)
   return globalId
 }
@@ -369,6 +384,108 @@ export async function POST(req: NextRequest) {
         orderGlobalId: globalIdValue(body.orderGlobalId, 'Operations order', ORDER_GLOBAL_ID),
         expectedRowVersion: integerValue(body.expectedRowVersion, 'Order version', 0, 2_147_483_647),
         reason: textValue(body.reason, 'Package verification reason', 500),
+        idempotencyKey: idempotencyKeyValue(req),
+      })
+      return json({ ok: true, capabilities, result })
+    }
+    if (action === 'confirm-shipment') {
+      if (!capabilities.canManage || !capabilities.canExecute) {
+        return json({
+          ok: false,
+          error: 'You do not have permission to confirm warehouse shipments',
+          code: 'OPERATIONS_EXECUTE_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set([
+          'action',
+          'orderGlobalId',
+          'expectedRowVersion',
+          'reason',
+          'preferredPrinterGlobalId',
+        ]),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
+      const result = await confirmOperationsOrderShipmentFromPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        orderGlobalId: globalIdValue(body.orderGlobalId, 'Operations order', ORDER_GLOBAL_ID),
+        expectedRowVersion: integerValue(body.expectedRowVersion, 'Order version', 0, 2_147_483_647),
+        reason: textValue(body.reason, 'Shipment confirmation reason', 500),
+        preferredPrinterGlobalId: optionalGlobalIdValue(
+          body.preferredPrinterGlobalId,
+          'Preferred printer',
+          PRINTER_GLOBAL_ID,
+        ),
+        idempotencyKey: idempotencyKeyValue(req),
+      })
+      return json({ ok: true, capabilities, result })
+    }
+    if (action === 'create-sandbox-label') {
+      if (!capabilities.canManage || !capabilities.canExecute) {
+        return json({
+          ok: false,
+          error: 'You do not have permission to purchase carrier labels',
+          code: 'OPERATIONS_EXECUTE_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set([
+          'action',
+          'orderGlobalId',
+          'expectedRowVersion',
+          'reason',
+          'carrierRateGlobalId',
+          'carrierAccountGlobalId',
+          'preferredPrinterGlobalId',
+        ]),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
+      const result = await createOperationsSandboxLabelInPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        orderGlobalId: globalIdValue(body.orderGlobalId, 'Operations order', ORDER_GLOBAL_ID),
+        expectedRowVersion: integerValue(body.expectedRowVersion, 'Order version', 0, 2_147_483_647),
+        reason: textValue(body.reason, 'Label creation reason', 500),
+        carrierRateGlobalId: optionalGlobalIdValue(body.carrierRateGlobalId, 'Carrier rate', RATE_GLOBAL_ID),
+        carrierAccountGlobalId: optionalGlobalIdValue(
+          body.carrierAccountGlobalId,
+          'Carrier account',
+          CARRIER_ACCOUNT_GLOBAL_ID,
+        ),
+        preferredPrinterGlobalId: optionalGlobalIdValue(
+          body.preferredPrinterGlobalId,
+          'Preferred printer',
+          PRINTER_GLOBAL_ID,
+        ),
+        idempotencyKey: idempotencyKeyValue(req),
+      })
+      return json({ ok: true, capabilities, result })
+    }
+    if (action === 'void-sandbox-label') {
+      if (!capabilities.canManage || !capabilities.canExecute) {
+        return json({
+          ok: false,
+          error: 'You do not have permission to void carrier labels',
+          code: 'OPERATIONS_EXECUTE_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set(['action', 'orderGlobalId', 'expectedRowVersion', 'reason']),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
+      const result = await voidOperationsSandboxLabelInPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        orderGlobalId: globalIdValue(body.orderGlobalId, 'Operations order', ORDER_GLOBAL_ID),
+        expectedRowVersion: integerValue(body.expectedRowVersion, 'Order version', 0, 2_147_483_647),
+        reason: textValue(body.reason, 'Label void reason', 500),
         idempotencyKey: idempotencyKeyValue(req),
       })
       return json({ ok: true, capabilities, result })

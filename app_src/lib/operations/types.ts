@@ -20,13 +20,47 @@ export type OperationsExceptionStatus = 'open' | 'acknowledged' | 'resolved' | '
 
 export type OperationsActivationState = 'disabled' | 'shadow' | 'read_only' | 'active' | 'frozen'
 
-export type OperationsOrderAction = 'release_to_warehouse' | 'confirm_picks' | 'verify_pack'
+export type OperationsOrderAction =
+  | 'release_to_warehouse'
+  | 'confirm_picks'
+  | 'verify_pack'
+  | 'confirm_shipment'
 
 export type OperationsOrderActionAvailability = {
   action: OperationsOrderAction
   label: string
   enabled: boolean
   blockedReason: string | null
+}
+
+export type OperationsLabelAttemptState = 'prepared' | 'succeeded' | 'failed' | 'unknown'
+
+export type OperationsSandboxLabelCommandResult = {
+  orderGlobalId: string
+  orderStatus: 'packed'
+  rowVersion: number
+  packageGlobalId: string
+  labelGlobalId: string
+  attemptGlobalId: string
+  trackingNumber: string
+  labelStatus: 'created' | 'voided'
+  replayed: boolean
+  printJobGlobalId: string | null
+  printWarning: string | null
+}
+
+export type OperationsShipmentCommandResult = {
+  orderGlobalId: string
+  orderStatus: 'shipped'
+  rowVersion: number
+  shipmentGlobalId: string
+  trackingNumber: string
+  packingSlipArtifactGlobalId: string
+  commerceExportGlobalId: string
+  commerceExportState: 'succeeded' | 'unsupported' | 'failed'
+  replayed: boolean
+  printJobGlobalId: string | null
+  printWarning: string | null
 }
 
 export type CommerceCustomerMatchMethod =
@@ -548,10 +582,23 @@ export type OperationsOrderDetail = OperationsOrderListItem & {
     weightGrams: number
     dimensionsMm: Millimeters
     status: string
+    latestLabel: {
+      globalId: string
+      status: 'created' | 'voided' | 'failed'
+      carrier: string
+      serviceCode: string
+      trackingNumber: string
+      environment: 'mock' | 'sandbox' | 'production'
+      createAttemptGlobalId: string | null
+      voidAttemptGlobalId: string | null
+      createdAt: string
+      voidedAt: string | null
+    } | null
   }>
   rates: Array<{
     globalId: string
     carrier: string
+    serviceCode: string
     serviceName: string
     internalCostMinor: string
     customerChargeMinor: string
@@ -564,6 +611,55 @@ export type OperationsOrderDetail = OperationsOrderListItem & {
     type: string
     amountMinor: string
     status: string
+  }>
+  labelAttempts: Array<{
+    globalId: string
+    action: 'create' | 'void' | 'reconcile'
+    state: OperationsLabelAttemptState
+    provider: 'ups_rest' | 'fedex_rest'
+    environment: 'sandbox' | 'production'
+    errorCode: string | null
+    labelGlobalId: string | null
+    requestedAt: string
+    completedAt: string | null
+  }>
+  shipments: Array<{
+    globalId: string
+    status: 'confirmed' | 'in_transit' | 'delivered' | 'exception' | 'voided'
+    carrier: string
+    serviceCode: string
+    trackingNumber: string
+    shippedAt: string
+  }>
+  trackingObservations: Array<{
+    globalId: string
+    shipmentGlobalId: string
+    status: 'confirmed' | 'in_transit' | 'out_for_delivery' | 'delivered' | 'exception' | 'voided'
+    provider: string
+    source: 'shipment_confirmation' | 'carrier_webhook' | 'carrier_poll' | 'manual'
+    location: string | null
+    observedAt: string
+  }>
+  printArtifacts: Array<{
+    globalId: string
+    shipmentGlobalId: string | null
+    documentType: 'shipping_label' | 'packing_slip'
+    format: 'ZPL' | 'PDF' | 'PNG'
+    media: 'label_4x6' | 'label_4x8' | 'letter' | 'a4'
+    filename: string | null
+    contentUrl: string | null
+    createdAt: string
+  }>
+  commerceExports: Array<{
+    globalId: string
+    shipmentGlobalId: string
+    provider: string
+    state: 'queued' | 'processing' | 'succeeded' | 'failed' | 'unsupported'
+    providerReference: string | null
+    errorCode: string | null
+    errorMessage: string | null
+    requestedAt: string
+    completedAt: string | null
   }>
   events: Array<{
     globalId: string
@@ -597,6 +693,15 @@ export type OperationsWorkspace = {
   catalog: {
     customers: Array<{ id: string; globalId: string; name: string }>
     products: Array<{ id: string; globalId: string; name: string; sku: string | null }>
+  }
+  shipping: {
+    sandboxCarrierAccounts: Array<{
+      globalId: string
+      provider: 'ups_rest' | 'fedex_rest'
+      displayName: string
+      accountNumberLastFour: string
+      billingRelationships: CarrierBillingRelationship[]
+    }>
   }
   generatedAt: string
 }

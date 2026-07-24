@@ -11,6 +11,7 @@ import {
   PRINTER_STATUSES,
   PRINTER_STATION_TYPES,
   PRINTER_TYPES,
+  isPrinterCapabilitySetValid,
   type OperationsPrinterInput,
 } from '@/lib/operations/printing'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
@@ -28,6 +29,7 @@ export const runtime = 'nodejs'
 const MAX_REQUEST_BYTES = 16 * 1024
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const PRINTER_GLOBAL_ID = /^gpr\d{7}$/
+const PRINT_AGENT_GLOBAL_ID = /^gpt\d{7}$/
 const SAVE_FIELDS = new Set([
   'action',
   'globalId',
@@ -43,6 +45,7 @@ const SAVE_FIELDS = new Set([
   'supportedDocumentTypes',
   'defaultDocumentTypes',
   'fallbackPrinterGlobalId',
+  'localPrintAgentGlobalId',
   'priority',
   'status',
 ])
@@ -123,6 +126,15 @@ function optionalPrinterGlobalId(value: unknown) {
   return globalId
 }
 
+function optionalPrintAgentGlobalId(value: unknown) {
+  if (value === null || value === undefined || value === '') return null
+  const globalId = textValue(value, 'Local print agent', 16)
+  if (!PRINT_AGENT_GLOBAL_ID.test(globalId)) {
+    requestError('OPERATIONS_PRINTER_REQUEST_INVALID', 'Local print agent is invalid')
+  }
+  return globalId
+}
+
 function printerInput(value: unknown): OperationsPrinterInput {
   const input = record(value)
   const unsupported = Object.keys(input).find((field) => !SAVE_FIELDS.has(field))
@@ -186,6 +198,36 @@ function printerInput(value: unknown): OperationsPrinterInput {
       'Printer priority must be an integer from 1 to 999',
     )
   }
+  const printerType = enumValue(input.printerType, 'Printer type', PRINTER_TYPES)
+  const connectionMode = enumValue(
+    input.connectionMode,
+    'Connection mode',
+    PRINTER_CONNECTION_MODES,
+  )
+  const supportedFormats = listValue(input.supportedFormats, 'Print formats', PRINT_FORMATS)
+  const supportedMedia = listValue(input.supportedMedia, 'Print media', PRINT_MEDIA)
+  const localPrintAgentGlobalId = optionalPrintAgentGlobalId(input.localPrintAgentGlobalId)
+  const status = enumValue(input.status, 'Printer status', PRINTER_STATUSES)
+  if (!isPrinterCapabilitySetValid({ printerType, supportedFormats, supportedMedia })) {
+    requestError(
+      'OPERATIONS_PRINTER_CAPABILITIES_INVALID',
+      printerType === 'thermal'
+        ? 'Thermal printers must use 4 x 6 or 4 x 8 label media'
+        : 'Nonthermal printers must use PDF or PNG on Letter or A4 media',
+    )
+  }
+  if (localPrintAgentGlobalId && connectionMode !== 'local_agent') {
+    requestError(
+      'OPERATIONS_PRINTER_AGENT_INVALID',
+      'Only local-agent printer profiles can be assigned to a print agent',
+    )
+  }
+  if (connectionMode === 'local_agent' && status === 'online' && !localPrintAgentGlobalId) {
+    requestError(
+      'OPERATIONS_PRINTER_AGENT_REQUIRED',
+      'Assign an active local print agent before marking this printer online',
+    )
+  }
   return {
     globalId,
     expectedRowVersion,
@@ -193,19 +235,16 @@ function printerInput(value: unknown): OperationsPrinterInput {
     code,
     name: textValue(input.name, 'Printer name', 120),
     stationType: enumValue(input.stationType, 'Station type', PRINTER_STATION_TYPES),
-    printerType: enumValue(input.printerType, 'Printer type', PRINTER_TYPES),
-    connectionMode: enumValue(
-      input.connectionMode,
-      'Connection mode',
-      PRINTER_CONNECTION_MODES,
-    ),
-    supportedFormats: listValue(input.supportedFormats, 'Print formats', PRINT_FORMATS),
-    supportedMedia: listValue(input.supportedMedia, 'Print media', PRINT_MEDIA),
+    printerType,
+    connectionMode,
+    supportedFormats,
+    supportedMedia,
     supportedDocumentTypes,
     defaultDocumentTypes,
     fallbackPrinterGlobalId: optionalPrinterGlobalId(input.fallbackPrinterGlobalId),
+    localPrintAgentGlobalId,
     priority,
-    status: enumValue(input.status, 'Printer status', PRINTER_STATUSES),
+    status,
   }
 }
 
@@ -274,6 +313,7 @@ export async function GET(req: NextRequest) {
       organizationId: activeOperationsOrganizationId(actor),
       canView: capabilities.canView,
       canManage: capabilities.canManage,
+      canExecute: capabilities.canExecute,
     })
     return json({ ok: true, printers })
   } catch (error) {

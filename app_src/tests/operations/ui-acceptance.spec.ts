@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test'
-import type { Page } from '@playwright/test'
+import type { Locator, Page } from '@playwright/test'
 import type { OperationsExceptionStatus } from '@/lib/operations/types'
 
 test.use({ hasTouch: true })
@@ -18,6 +18,17 @@ async function gotoApp(page: Page, path: string) {
   }
   await page.goto(path)
   await expect(page.getByTestId('app-shell')).toBeVisible()
+}
+
+async function isFullyVisibleWithin(inner: Locator, outer: Locator) {
+  const [innerBox, outerBox] = await Promise.all([inner.boundingBox(), outer.boundingBox()])
+  if (!innerBox || !outerBox) return false
+  return (
+    innerBox.x >= outerBox.x - 1
+    && innerBox.x + innerBox.width <= outerBox.x + outerBox.width + 1
+    && innerBox.y >= outerBox.y - 1
+    && innerBox.y + innerBox.height <= outerBox.y + outerBox.height + 1
+  )
 }
 
 const selectedOrder = {
@@ -301,6 +312,27 @@ async function installOperationsRoutes(page: Page) {
   })
 }
 
+async function installOperationsNavigationRoute(page: Page) {
+  await page.route((url) => url.pathname.startsWith('/api/operations/'), async (route) => {
+    await route.fulfill({
+      status: 503,
+      json: { ok: false, error: 'Not required for Operations tab navigation acceptance' },
+    })
+  })
+  await page.route((url) => url.pathname === '/api/operations', async (route) => {
+    await route.fulfill({
+      json: {
+        ok: true,
+        operations: {
+          ...workspace(),
+          selectedOrder: null,
+          shipping: { sandboxCarrierAccounts: [] },
+        },
+      },
+    })
+  })
+}
+
 test('operations workbench renders dense desktop evidence and order drill-in', async ({ page }) => {
   await page.setViewportSize({ width: 1366, height: 768 })
   await installOperationsRoutes(page)
@@ -340,6 +372,68 @@ test('operations workbench renders dense desktop evidence and order drill-in', a
   await expect(page.getByText('Replenish or move the line to another warehouse.')).toBeVisible()
   await page.getByRole('button', { name: 'Acknowledge' }).click()
   await expect(page.getByRole('tab', { name: 'Exceptions (1)' })).toBeVisible()
+})
+
+test('operations tabs support touch navigation without portrait or landscape overflow', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 })
+  await installOperationsNavigationRoute(page)
+  await gotoApp(page, '/#operations')
+
+  const navigation = page.getByTestId('operations-tab-navigation')
+  const scroller = navigation.locator('.MuiTabs-scroller')
+  const left = page.getByRole('button', { name: 'Scroll operations tabs left' })
+  const right = page.getByRole('button', { name: 'Scroll operations tabs right' })
+  const printing = page.getByRole('tab', { name: 'Printing' })
+
+  await expect(navigation).toBeVisible()
+  await expect(left).toBeVisible()
+  await expect(left).toBeDisabled()
+  await expect(right).toBeVisible()
+  await expect(right).toBeEnabled()
+  await expect.poll(async () => scroller.evaluate((element) => getComputedStyle(element).overflowX)).toBe('auto')
+  await expect.poll(async () => scroller.evaluate((element) => getComputedStyle(element).touchAction)).toBe('pan-x')
+
+  const initialScrollLeft = await scroller.evaluate((element) => element.scrollLeft)
+  const rightBox = await right.boundingBox()
+  if (!rightBox) throw new Error('Operations tabs right scroll control has no layout box')
+  await page.touchscreen.tap(rightBox.x + rightBox.width / 2, rightBox.y + rightBox.height / 2)
+  await expect.poll(async () => scroller.evaluate((element) => element.scrollLeft)).toBeGreaterThan(initialScrollLeft)
+  await expect(left).toBeEnabled()
+  await expect.poll(async () => isFullyVisibleWithin(printing, scroller)).toBe(true)
+
+  const rightwardScrollLeft = await scroller.evaluate((element) => element.scrollLeft)
+  const leftBox = await left.boundingBox()
+  if (!leftBox) throw new Error('Operations tabs left scroll control has no layout box')
+  await page.touchscreen.tap(leftBox.x + leftBox.width / 2, leftBox.y + leftBox.height / 2)
+  await expect.poll(async () => scroller.evaluate((element) => element.scrollLeft)).toBeLessThan(rightwardScrollLeft)
+
+  const nextRightBox = await right.boundingBox()
+  if (!nextRightBox) throw new Error('Operations tabs right scroll control has no layout box')
+  await page.touchscreen.tap(
+    nextRightBox.x + nextRightBox.width / 2,
+    nextRightBox.y + nextRightBox.height / 2,
+  )
+  await expect.poll(async () => isFullyVisibleWithin(printing, scroller)).toBe(true)
+
+  const printingBox = await printing.boundingBox()
+  if (!printingBox) throw new Error('Printing tab has no layout box')
+  await page.touchscreen.tap(
+    printingBox.x + printingBox.width / 2,
+    printingBox.y + printingBox.height / 2,
+  )
+  await expect(printing).toHaveAttribute('aria-selected', 'true')
+  await expect.poll(async () => isFullyVisibleWithin(printing, scroller)).toBe(true)
+  await expect.poll(async () => page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(1)
+
+  await page.setViewportSize({ width: 844, height: 390 })
+  await expect(page.getByRole('button', { name: /Scroll operations tabs (left|right)/ })).toHaveCount(0)
+  await expect.poll(async () => isFullyVisibleWithin(printing, scroller)).toBe(true)
+  await expect.poll(async () => page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(1)
+
+  await page.setViewportSize({ width: 390, height: 844 })
+  await expect(right).toBeVisible()
+  await expect.poll(async () => isFullyVisibleWithin(printing, scroller)).toBe(true)
+  await expect.poll(async () => page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(1)
 })
 
 test('operations mobile workflow has no page overflow and omits hosted proof generation', async ({ page }) => {

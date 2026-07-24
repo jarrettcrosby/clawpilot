@@ -1,6 +1,6 @@
 'use client'
 
-import { FormEvent, useCallback, useEffect, useState } from 'react'
+import { FormEvent, forwardRef, useCallback, useEffect, useState } from 'react'
 import {
   Alert,
   Box,
@@ -31,10 +31,13 @@ import {
   useMediaQuery,
   useTheme,
 } from '@mui/material'
+import TabScrollButton, { type TabScrollButtonProps } from '@mui/material/TabScrollButton'
 import CheckCircleRounded from '@mui/icons-material/CheckCircleRounded'
+import CancelRounded from '@mui/icons-material/CancelRounded'
 import CloseRounded from '@mui/icons-material/CloseRounded'
 import HelpOutlineRounded from '@mui/icons-material/HelpOutlineRounded'
 import Inventory2Rounded from '@mui/icons-material/Inventory2Rounded'
+import LocalShippingRounded from '@mui/icons-material/LocalShippingRounded'
 import OpenInNewRounded from '@mui/icons-material/OpenInNewRounded'
 import PrintRounded from '@mui/icons-material/PrintRounded'
 import RefreshRounded from '@mui/icons-material/RefreshRounded'
@@ -53,6 +56,8 @@ import type {
   OperationsOrderDetail,
   OperationsOrderListItem,
   OperationsOrderStatus,
+  OperationsSandboxLabelCommandResult,
+  OperationsShipmentCommandResult,
   OperationsWorkspace,
 } from '@/lib/operations/types'
 import GlCodingPanel from '@/components/operations/GlCodingPanel'
@@ -65,7 +70,12 @@ type OperationsPayload = {
   error?: string
   code?: string
   operations?: OperationsWorkspace
-  result?: OperationsExceptionUpdateResult | OperationsActivationUpdateResult | OperationsOrderCommandResult
+  result?:
+    | OperationsExceptionUpdateResult
+    | OperationsActivationUpdateResult
+    | OperationsOrderCommandResult
+    | OperationsSandboxLabelCommandResult
+    | OperationsShipmentCommandResult
 }
 
 const ORDER_STATUSES: Array<{ value: '' | OperationsOrderStatus; label: string }> = [
@@ -100,6 +110,30 @@ const ACTIVATION_OPTIONS: Array<{ value: OperationsActivationState; label: strin
   { value: 'frozen', label: 'Frozen' },
 ]
 
+const OperationsTabScrollButton = forwardRef<HTMLButtonElement, TabScrollButtonProps>(
+  function OperationsTabScrollButton({ direction, disabled, onClick, ...props }, ref) {
+    const label = direction === 'left'
+      ? 'Scroll operations tabs left'
+      : 'Scroll operations tabs right'
+
+    return (
+      <TabScrollButton
+        {...props}
+        ref={ref}
+        component="button"
+        type="button"
+        direction={direction}
+        disabled={disabled}
+        onClick={disabled ? undefined : onClick}
+        aria-label={label}
+        aria-disabled={disabled}
+        tabIndex={disabled ? -1 : 0}
+        title={label}
+      />
+    )
+  },
+)
+
 const controlSx = {
   minWidth: 0,
   '& .MuiInputBase-root': {
@@ -111,6 +145,13 @@ const controlSx = {
 
 function displayStatus(status: string) {
   return status.replace(/[_.-]+/g, ' ').replace(/\b\w/g, (character) => character.toUpperCase())
+}
+
+function providerForCarrier(carrier: string): 'ups_rest' | 'fedex_rest' | null {
+  const normalized = carrier.trim().toLowerCase()
+  if (normalized === 'ups') return 'ups_rest'
+  if (normalized === 'fedex' || normalized === 'fedex express') return 'fedex_rest'
+  return null
 }
 
 function statusColor(status: string): 'default' | 'success' | 'warning' | 'error' | 'info' {
@@ -164,20 +205,30 @@ function DetailSection({ title, children }: { title: string; children: React.Rea
 
 function OrderDetailDrawer({
   order,
+  sandboxCarrierAccounts,
+  canExecute,
   open,
   busy,
   onClose,
   onRelease,
   onConfirmPicks,
   onVerifyPack,
+  onConfirmShipment,
+  onCreateSandboxLabel,
+  onVoidSandboxLabel,
 }: {
   order: OperationsOrderDetail | null
+  sandboxCarrierAccounts: OperationsWorkspace['shipping']['sandboxCarrierAccounts']
+  canExecute: boolean
   open: boolean
   busy: boolean
   onClose: () => void
   onRelease: () => void
   onConfirmPicks: () => void
   onVerifyPack: () => void
+  onConfirmShipment: () => void
+  onCreateSandboxLabel: () => void
+  onVoidSandboxLabel: () => void
 }) {
   const theme = useTheme()
   const mobile = useMediaQuery(theme.breakpoints.down('md'))
@@ -185,13 +236,50 @@ function OrderDetailDrawer({
   const releaseAction = order?.availableActions?.find((item) => item.action === 'release_to_warehouse')
   const confirmPicksAction = order?.availableActions?.find((item) => item.action === 'confirm_picks')
   const verifyPackAction = order?.availableActions?.find((item) => item.action === 'verify_pack')
+  const confirmShipmentAction = order?.availableActions?.find((item) => item.action === 'confirm_shipment')
   const primaryAction = order?.status === 'released'
     ? confirmPicksAction
-    : order?.status === 'picking' || order?.status === 'packed' || order?.status === 'shipped'
+    : order?.status === 'picking'
       ? verifyPackAction
-      : releaseAction
+      : order?.status === 'packed'
+        ? confirmShipmentAction
+        : order && !['shipped', 'cancelled'].includes(order.status)
+          ? releaseAction
+          : undefined
   const confirmingPicks = primaryAction?.action === 'confirm_picks'
   const verifyingPack = primaryAction?.action === 'verify_pack'
+  const confirmingShipment = primaryAction?.action === 'confirm_shipment'
+  const shipments = order?.shipments || []
+  const trackingObservations = order?.trackingObservations || []
+  const printArtifacts = order?.printArtifacts || []
+  const commerceExports = order?.commerceExports || []
+  const labelAttempts = order?.labelAttempts || []
+  const selectedRate = order?.rates.find((rate) => rate.selected) || null
+  const selectedProvider = selectedRate ? providerForCarrier(selectedRate.carrier) : null
+  const eligibleCarrierAccounts = selectedProvider
+    ? sandboxCarrierAccounts.filter((account) => account.provider === selectedProvider)
+    : []
+  const activeLabel = order?.packages
+    .map((item) => item.latestLabel)
+    .find((label) => label?.status === 'created') || null
+  const unresolvedAttempt = labelAttempts.find(
+    (attempt) => attempt.state === 'prepared' || attempt.state === 'unknown',
+  ) || null
+  const createBlockedReason = !canExecute
+    ? 'You do not have permission to purchase carrier labels.'
+    : order?.status !== 'packed'
+      ? 'Verify package packing before creating a label.'
+      : activeLabel
+        ? 'Void the active label before creating another.'
+        : unresolvedAttempt
+          ? `Attempt ${unresolvedAttempt.globalId} requires reconciliation before another carrier command.`
+          : !selectedRate
+            ? 'Select a carrier rate before creating a label.'
+            : !selectedProvider
+              ? `${selectedRate.carrier} does not have a direct sandbox label adapter.`
+              : eligibleCarrierAccounts.length === 0
+                ? `Connect and verify a sandbox ${selectedRate.carrier} account first.`
+                : null
 
   return (
     <Drawer
@@ -263,16 +351,40 @@ function OrderDetailDrawer({
                   ? 'Confirm every ready pick task and complete the released wave'
                   : verifyingPack
                     ? 'Verify the carton plan and record package-level billing evidence'
+                    : confirmingShipment
+                      ? 'Consume reserved inventory, create the shipment and packing slip, seed tracking, and export fulfillment'
                     : 'Create a released warehouse wave and ready pick tasks')}>
                   <span>
                     <Button
                       fullWidth
                       variant="contained"
-                      startIcon={busy ? <CircularProgress size={16} /> : confirmingPicks ? <TaskAltRounded /> : verifyingPack ? <Inventory2Rounded /> : <WarehouseRounded />}
+                      startIcon={busy
+                        ? <CircularProgress size={16} />
+                        : confirmingPicks
+                          ? <TaskAltRounded />
+                          : verifyingPack
+                            ? <Inventory2Rounded />
+                            : confirmingShipment
+                              ? <LocalShippingRounded />
+                              : <WarehouseRounded />}
                       disabled={!primaryAction.enabled || busy}
-                      onClick={confirmingPicks ? onConfirmPicks : verifyingPack ? onVerifyPack : onRelease}
+                      onClick={confirmingPicks
+                        ? onConfirmPicks
+                        : verifyingPack
+                          ? onVerifyPack
+                          : confirmingShipment
+                            ? onConfirmShipment
+                            : onRelease}
                     >
-                      {busy ? (confirmingPicks ? 'Confirming picks' : verifyingPack ? 'Verifying packages' : 'Releasing') : primaryAction.label}
+                      {busy
+                        ? confirmingPicks
+                          ? 'Confirming picks'
+                          : verifyingPack
+                            ? 'Verifying packages'
+                            : confirmingShipment
+                              ? 'Confirming shipment'
+                              : 'Releasing'
+                        : primaryAction.label}
                     </Button>
                   </span>
                 </Tooltip>
@@ -323,6 +435,281 @@ function OrderDetailDrawer({
                   </Box>
                 ))}
               </Stack> : <Typography variant="body2" color="text.secondary">No carrier rates have been recorded.</Typography>}
+            </DetailSection>
+
+            <DetailSection title="Shipping execution">
+              <Stack spacing={1.5}>
+                {unresolvedAttempt && (
+                  <Alert severity="error">
+                    Carrier attempt {unresolvedAttempt.globalId} is {unresolvedAttempt.state}. Do not retry this
+                    purchase or void. Reconcile the carrier result first so ClawPilot cannot create a duplicate label.
+                  </Alert>
+                )}
+                {activeLabel ? (
+                  <Box sx={{ p: 1.5, border: '1px solid rgba(129,199,132,0.35)', borderRadius: '8px' }}>
+                    <Stack direction="row" justifyContent="space-between" alignItems="flex-start" gap={1.5}>
+                      <Box sx={{ minWidth: 0 }}>
+                        <Stack direction="row" spacing={1} alignItems="center" sx={{ flexWrap: 'wrap', rowGap: 0.75 }}>
+                          <Typography fontWeight={700}>{activeLabel.carrier} {activeLabel.serviceCode}</Typography>
+                          <Chip size="small" color="success" label="Active label" />
+                          <Chip size="small" variant="outlined" label={displayStatus(activeLabel.environment)} />
+                        </Stack>
+                        <Typography sx={{ mt: 0.75, overflowWrap: 'anywhere' }}>{activeLabel.trackingNumber}</Typography>
+                        <Typography variant="caption" color="text.secondary">
+                          {activeLabel.globalId}
+                          {activeLabel.createAttemptGlobalId ? ` · Purchase ${activeLabel.createAttemptGlobalId}` : ''}
+                        </Typography>
+                      </Box>
+                      <Tooltip title="Void through the same sandbox account used to purchase this label">
+                        <span>
+                          <Button
+                            color="error"
+                            variant="outlined"
+                            size="small"
+                            startIcon={<CancelRounded />}
+                            disabled={busy || !canExecute || Boolean(unresolvedAttempt)}
+                            onClick={onVoidSandboxLabel}
+                          >
+                            Void
+                          </Button>
+                        </span>
+                      </Tooltip>
+                    </Stack>
+                  </Box>
+                ) : (
+                  <Alert severity={createBlockedReason ? 'info' : 'warning'}>
+                    {createBlockedReason
+                      || 'Sandbox execution uses the fixed John Doe test shipment. Create the label, inspect the print evidence, then void it immediately.'}
+                  </Alert>
+                )}
+                {!activeLabel && (
+                  <Tooltip title={createBlockedReason || 'Purchase a sandbox label and route its print job'}>
+                    <span>
+                      <Button
+                        fullWidth
+                        variant="contained"
+                        startIcon={<LocalShippingRounded />}
+                        disabled={busy || Boolean(createBlockedReason)}
+                        onClick={onCreateSandboxLabel}
+                      >
+                        Create sandbox label
+                      </Button>
+                    </span>
+                  </Tooltip>
+                )}
+                {labelAttempts.length > 0 && (
+                  <Box>
+                    <Typography variant="caption" color="text.secondary">Carrier command evidence</Typography>
+                    <Stack divider={<Divider flexItem />}>
+                      {labelAttempts.map((attempt) => (
+                        <Box key={attempt.globalId} sx={{ py: 1, display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto', gap: 1 }}>
+                          <Box sx={{ minWidth: 0 }}>
+                            <Typography variant="body2" fontWeight={600}>
+                              {displayStatus(attempt.action)} · {attempt.globalId}
+                            </Typography>
+                            <Typography variant="caption" color="text.secondary">
+                              {displayStatus(attempt.provider)} · {displayStatus(attempt.environment)}
+                              {attempt.errorCode ? ` · ${attempt.errorCode}` : ''}
+                            </Typography>
+                          </Box>
+                          <Chip
+                            size="small"
+                            label={displayStatus(attempt.state)}
+                            color={attempt.state === 'succeeded' ? 'success' : attempt.state === 'failed' ? 'error' : 'warning'}
+                          />
+                        </Box>
+                      ))}
+                    </Stack>
+                  </Box>
+                )}
+              </Stack>
+            </DetailSection>
+
+            <DetailSection title="Shipment evidence">
+              {shipments.length === 0
+                && trackingObservations.length === 0
+                && printArtifacts.length === 0
+                && commerceExports.length === 0 ? (
+                  <Typography variant="body2" color="text.secondary">
+                    Confirmed shipment, tracking, packing-slip, and commerce-export evidence will appear here.
+                  </Typography>
+                ) : (
+                  <Stack spacing={2}>
+                    {shipments.length > 0 && (
+                      <Box>
+                        <Typography variant="caption" color="text.secondary">Shipments</Typography>
+                        <Stack divider={<Divider flexItem />}>
+                          {shipments.map((shipment) => (
+                            <Box
+                              key={shipment.globalId}
+                              sx={{
+                                py: 1.25,
+                                display: 'grid',
+                                gridTemplateColumns: 'minmax(0, 1fr) auto',
+                                gap: 1.5,
+                              }}
+                            >
+                              <Box sx={{ minWidth: 0 }}>
+                                <Typography fontWeight={700}>
+                                  {shipment.carrier} · {shipment.serviceCode}
+                                </Typography>
+                                <Typography sx={{ overflowWrap: 'anywhere' }}>
+                                  {shipment.trackingNumber}
+                                </Typography>
+                                <Typography variant="caption" color="text.secondary">
+                                  {shipment.globalId} · Shipped {formatUserDateTime(
+                                    shipment.shippedAt,
+                                    dateTime,
+                                    {
+                                      year: 'numeric',
+                                      month: 'short',
+                                      day: 'numeric',
+                                      hour: 'numeric',
+                                      minute: '2-digit',
+                                      fallback: 'Unknown',
+                                    },
+                                  )}
+                                </Typography>
+                              </Box>
+                              <Chip
+                                size="small"
+                                label={displayStatus(shipment.status)}
+                                color={shipment.status === 'exception'
+                                  ? 'error'
+                                  : shipment.status === 'delivered'
+                                    ? 'success'
+                                    : 'info'}
+                              />
+                            </Box>
+                          ))}
+                        </Stack>
+                      </Box>
+                    )}
+
+                    {printArtifacts.length > 0 && (
+                      <Box>
+                        <Typography variant="caption" color="text.secondary">Documents</Typography>
+                        <Stack divider={<Divider flexItem />}>
+                          {printArtifacts.map((artifact) => (
+                            <Box
+                              key={artifact.globalId}
+                              sx={{
+                                py: 1.25,
+                                display: 'grid',
+                                gridTemplateColumns: 'minmax(0, 1fr) auto',
+                                gap: 1.5,
+                                alignItems: 'center',
+                              }}
+                            >
+                              <Box sx={{ minWidth: 0 }}>
+                                <Typography fontWeight={600}>
+                                  {displayStatus(artifact.documentType)}
+                                </Typography>
+                                <Typography variant="caption" color="text.secondary">
+                                  {artifact.globalId} · {artifact.format} · {displayStatus(artifact.media)}
+                                </Typography>
+                              </Box>
+                              {artifact.contentUrl ? (
+                                <Button
+                                  component="a"
+                                  href={artifact.contentUrl}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  size="small"
+                                  variant="outlined"
+                                  startIcon={<OpenInNewRounded />}
+                                >
+                                  Open
+                                </Button>
+                              ) : (
+                                <Chip size="small" variant="outlined" label="Unavailable" />
+                              )}
+                            </Box>
+                          ))}
+                        </Stack>
+                      </Box>
+                    )}
+
+                    {trackingObservations.length > 0 && (
+                      <Box>
+                        <Typography variant="caption" color="text.secondary">Tracking history</Typography>
+                        <Stack divider={<Divider flexItem />}>
+                          {trackingObservations.map((observation) => (
+                            <Box key={observation.globalId} sx={{ py: 1.25 }}>
+                              <Stack direction="row" justifyContent="space-between" alignItems="flex-start" gap={1.5}>
+                                <Box sx={{ minWidth: 0 }}>
+                                  <Typography fontWeight={600}>{displayStatus(observation.status)}</Typography>
+                                  <Typography variant="caption" color="text.secondary">
+                                    {displayStatus(observation.provider)} · {displayStatus(observation.source)}
+                                    {observation.location ? ` · ${observation.location}` : ''}
+                                  </Typography>
+                                </Box>
+                                <Typography variant="caption" color="text.secondary" sx={{ whiteSpace: 'nowrap' }}>
+                                  {formatUserDateTime(observation.observedAt, dateTime, {
+                                    month: 'short',
+                                    day: 'numeric',
+                                    hour: 'numeric',
+                                    minute: '2-digit',
+                                    fallback: 'Unknown',
+                                  })}
+                                </Typography>
+                              </Stack>
+                            </Box>
+                          ))}
+                        </Stack>
+                      </Box>
+                    )}
+
+                    {commerceExports.length > 0 && (
+                      <Box>
+                        <Typography variant="caption" color="text.secondary">Commerce fulfillment export</Typography>
+                        <Stack divider={<Divider flexItem />}>
+                          {commerceExports.map((fulfillmentExport) => (
+                            <Box
+                              key={fulfillmentExport.globalId}
+                              sx={{
+                                py: 1.25,
+                                display: 'grid',
+                                gridTemplateColumns: 'minmax(0, 1fr) auto',
+                                gap: 1.5,
+                              }}
+                            >
+                              <Box sx={{ minWidth: 0 }}>
+                                <Typography fontWeight={600}>
+                                  {displayStatus(fulfillmentExport.provider)}
+                                </Typography>
+                                <Typography variant="caption" color="text.secondary" display="block">
+                                  {fulfillmentExport.globalId}
+                                  {fulfillmentExport.providerReference
+                                    ? ` · ${fulfillmentExport.providerReference}`
+                                    : ''}
+                                </Typography>
+                                {(fulfillmentExport.errorCode || fulfillmentExport.errorMessage) && (
+                                  <Typography variant="caption" color="error.main" display="block">
+                                    {[fulfillmentExport.errorCode, fulfillmentExport.errorMessage]
+                                      .filter(Boolean)
+                                      .join(' · ')}
+                                  </Typography>
+                                )}
+                              </Box>
+                              <Chip
+                                size="small"
+                                label={displayStatus(fulfillmentExport.state)}
+                                color={fulfillmentExport.state === 'succeeded'
+                                  ? 'success'
+                                  : fulfillmentExport.state === 'failed'
+                                    ? 'error'
+                                    : fulfillmentExport.state === 'unsupported'
+                                      ? 'default'
+                                      : 'warning'}
+                              />
+                            </Box>
+                          ))}
+                        </Stack>
+                      </Box>
+                    )}
+                  </Stack>
+                )}
             </DetailSection>
 
             <DetailSection title="Billable events">
@@ -484,9 +871,10 @@ function OperationsGuide({ open, onClose }: { open: boolean; onClose: () => void
         <Stack spacing={2.5}>
           <Box><Typography fontWeight={700}>1. Import and validate</Typography><Typography color="text.secondary">Orders enter through a commerce adapter. ClawPilot reuses provider mappings or a unique CRM identity match, creates a customer only when no match exists, and sends ambiguous matches to review.</Typography></Box>
           <Box><Typography fontWeight={700}>2. Promise and reserve</Typography><Typography color="text.secondary">ClawPilot selects a feasible warehouse, reserves customer-owned inventory, cartonizes the order, compares rates, and records the promise.</Typography></Box>
-          <Box><Typography fontWeight={700}>3. Release and execute</Typography><Typography color="text.secondary">Review the plan, reservations, packages, rates, cost, revenue, and margin before release. Release creates a wave and ready pick tasks. Pick confirmation completes the wave; package verification then records who packed each carton and accrues contract pack fees without purchasing a label or creating a shipment.</Typography></Box>
-          <Box><Typography fontWeight={700}>4. Reconcile revenue</Typography><Typography color="text.secondary">Contract directives create immutable billable events for order handling, picks, packing, freight, storage, and special services.</Typography></Box>
-          <Alert severity="info">Hosted orders enter through approved commerce integrations. Carrier sandbox rating is available to authorized managers under Settings, Integrations, Shipping. Deterministic mock adapters remain isolated to automated tests and never create hosted workspace records.</Alert>
+          <Box><Typography fontWeight={700}>3. Release and execute</Typography><Typography color="text.secondary">Review the plan, reservations, packages, rates, cost, revenue, and margin before release. Release creates a wave and ready pick tasks. Pick confirmation completes the wave, and package verification records packing evidence and contract fees.</Typography></Box>
+          <Box><Typography fontWeight={700}>4. Label, print, and void</Typography><Typography color="text.secondary">Authorized managers may purchase a label only through a verified sandbox UPS or FedEx account. ClawPilot records the provider attempt before the call, stores the result, routes the label to the configured printer, and requires the original account when voiding. Prepared or unknown attempts must be reconciled before retrying.</Typography></Box>
+          <Box><Typography fontWeight={700}>5. Reconcile revenue</Typography><Typography color="text.secondary">Contract directives create immutable billable events for order handling, picks, packing, freight, storage, and special services.</Typography></Box>
+          <Alert severity="info">Hosted orders enter through approved commerce integrations. Sandbox label execution always uses the fixed John Doe test fixture between 101 Jegs Place and Massachusetts Maritime Academy. Deterministic mock adapters remain isolated to automated tests.</Alert>
         </Stack>
       </DialogContent>
       <DialogActions><Button onClick={onClose}>Done</Button></DialogActions>
@@ -525,6 +913,21 @@ export default function OperationsSection() {
   const [verifyPackReason, setVerifyPackReason] = useState('Verify the carton plan after all warehouse picks are complete')
   const [verifyPackIdempotencyKey, setVerifyPackIdempotencyKey] = useState('')
   const [verifyingPack, setVerifyingPack] = useState(false)
+  const [confirmShipmentOpen, setConfirmShipmentOpen] = useState(false)
+  const [confirmShipmentReason, setConfirmShipmentReason] = useState(
+    'Confirm the packed order and create shipment evidence',
+  )
+  const [confirmShipmentIdempotencyKey, setConfirmShipmentIdempotencyKey] = useState('')
+  const [confirmingShipment, setConfirmingShipment] = useState(false)
+  const [createLabelOpen, setCreateLabelOpen] = useState(false)
+  const [createLabelReason, setCreateLabelReason] = useState('Purchase a sandbox label for pack-to-ship validation')
+  const [createLabelIdempotencyKey, setCreateLabelIdempotencyKey] = useState('')
+  const [carrierAccountGlobalId, setCarrierAccountGlobalId] = useState('')
+  const [creatingLabel, setCreatingLabel] = useState(false)
+  const [voidLabelOpen, setVoidLabelOpen] = useState(false)
+  const [voidLabelReason, setVoidLabelReason] = useState('Void the sandbox label after validation')
+  const [voidLabelIdempotencyKey, setVoidLabelIdempotencyKey] = useState('')
+  const [voidingLabel, setVoidingLabel] = useState(false)
 
   const loadWorkspace = useCallback(async (orderGlobalId?: string | null, signal?: AbortSignal) => {
     setLoading(true)
@@ -726,6 +1129,186 @@ export default function OperationsSection() {
     }
   }
 
+  const openConfirmShipment = () => {
+    setConfirmShipmentReason('Confirm the packed order and create shipment evidence')
+    setConfirmShipmentIdempotencyKey(
+      `operations-shipment:${detail?.globalId || 'order'}:${crypto.randomUUID()}`,
+    )
+    setConfirmShipmentOpen(true)
+  }
+
+  const closeConfirmShipment = () => {
+    if (confirmingShipment) return
+    setConfirmShipmentOpen(false)
+    setConfirmShipmentIdempotencyKey('')
+  }
+
+  const confirmShipment = async (event: FormEvent) => {
+    event.preventDefault()
+    if (!detail || !confirmShipmentReason.trim() || !confirmShipmentIdempotencyKey) return
+    setConfirmingShipment(true)
+    setError('')
+    setNotice('')
+    try {
+      const response = await fetch('/api/operations', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': confirmShipmentIdempotencyKey,
+        },
+        body: JSON.stringify({
+          action: 'confirm-shipment',
+          orderGlobalId: detail.globalId,
+          expectedRowVersion: detail.rowVersion,
+          reason: confirmShipmentReason.trim(),
+        }),
+      })
+      const payload = await response.json() as OperationsPayload
+      if (!response.ok || !payload.result || !('shipmentGlobalId' in payload.result)) {
+        throw new Error(payload.error || 'Shipment could not be confirmed')
+      }
+      const result = payload.result
+      const exportSummary = result.commerceExportState === 'succeeded'
+        ? `Commerce fulfillment export ${result.commerceExportGlobalId} succeeded.`
+        : result.commerceExportState === 'unsupported'
+          ? `Commerce fulfillment export ${result.commerceExportGlobalId} is unsupported for this provider.`
+          : `Commerce fulfillment export ${result.commerceExportGlobalId} failed and requires review.`
+      const printSummary = result.printWarning
+        ? result.printWarning
+        : result.printJobGlobalId
+          ? `Print job ${result.printJobGlobalId} was routed.`
+          : 'No print job was required.'
+      setConfirmShipmentOpen(false)
+      setConfirmShipmentIdempotencyKey('')
+      setNotice(
+        `Shipment ${result.shipmentGlobalId} was confirmed with tracking ${result.trackingNumber}. `
+        + `Packing slip ${result.packingSlipArtifactGlobalId} was created. ${exportSummary} ${printSummary}`,
+      )
+      await loadWorkspace(result.orderGlobalId)
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'Shipment could not be confirmed')
+    } finally {
+      setConfirmingShipment(false)
+    }
+  }
+
+  const openCreateLabel = () => {
+    const selectedRate = detail?.rates.find((rate) => rate.selected)
+    const provider = selectedRate ? providerForCarrier(selectedRate.carrier) : null
+    const account = workspace?.shipping?.sandboxCarrierAccounts.find(
+      (item) => item.provider === provider,
+    )
+    setCarrierAccountGlobalId(account?.globalId || '')
+    setCreateLabelReason('Purchase a sandbox label for pack-to-ship validation')
+    setCreateLabelIdempotencyKey(`operations-label-create:${detail?.globalId || 'order'}:${crypto.randomUUID()}`)
+    setCreateLabelOpen(true)
+  }
+
+  const closeCreateLabel = () => {
+    if (creatingLabel) return
+    setCreateLabelOpen(false)
+    setCreateLabelIdempotencyKey('')
+    setCarrierAccountGlobalId('')
+  }
+
+  const createSandboxLabel = async (event: FormEvent) => {
+    event.preventDefault()
+    const selectedRate = detail?.rates.find((rate) => rate.selected)
+    if (
+      !detail
+      || !selectedRate
+      || !createLabelReason.trim()
+      || !createLabelIdempotencyKey
+      || !carrierAccountGlobalId
+    ) return
+    setCreatingLabel(true)
+    setError('')
+    setNotice('')
+    try {
+      const response = await fetch('/api/operations', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': createLabelIdempotencyKey,
+        },
+        body: JSON.stringify({
+          action: 'create-sandbox-label',
+          orderGlobalId: detail.globalId,
+          expectedRowVersion: detail.rowVersion,
+          reason: createLabelReason.trim(),
+          carrierRateGlobalId: selectedRate.globalId,
+          carrierAccountGlobalId,
+        }),
+      })
+      const payload = await response.json() as OperationsPayload
+      if (!response.ok || !payload.result || !('labelGlobalId' in payload.result)) {
+        throw new Error(payload.error || 'Sandbox label could not be created')
+      }
+      const result = payload.result
+      setCreateLabelOpen(false)
+      setCreateLabelIdempotencyKey('')
+      setCarrierAccountGlobalId('')
+      setNotice(
+        result.printWarning
+          ? `Sandbox label ${result.labelGlobalId} was created with tracking ${result.trackingNumber}. ${result.printWarning}`
+          : `Sandbox label ${result.labelGlobalId} was created with tracking ${result.trackingNumber} and print job ${result.printJobGlobalId}.`,
+      )
+      await loadWorkspace(result.orderGlobalId)
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'Sandbox label could not be created')
+    } finally {
+      setCreatingLabel(false)
+    }
+  }
+
+  const openVoidLabel = () => {
+    setVoidLabelReason('Void the sandbox label after validation')
+    setVoidLabelIdempotencyKey(`operations-label-void:${detail?.globalId || 'order'}:${crypto.randomUUID()}`)
+    setVoidLabelOpen(true)
+  }
+
+  const closeVoidLabel = () => {
+    if (voidingLabel) return
+    setVoidLabelOpen(false)
+    setVoidLabelIdempotencyKey('')
+  }
+
+  const voidSandboxLabel = async (event: FormEvent) => {
+    event.preventDefault()
+    if (!detail || !voidLabelReason.trim() || !voidLabelIdempotencyKey) return
+    setVoidingLabel(true)
+    setError('')
+    setNotice('')
+    try {
+      const response = await fetch('/api/operations', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': voidLabelIdempotencyKey,
+        },
+        body: JSON.stringify({
+          action: 'void-sandbox-label',
+          orderGlobalId: detail.globalId,
+          expectedRowVersion: detail.rowVersion,
+          reason: voidLabelReason.trim(),
+        }),
+      })
+      const payload = await response.json() as OperationsPayload
+      if (!response.ok || !payload.result || !('labelGlobalId' in payload.result)) {
+        throw new Error(payload.error || 'Sandbox label could not be voided')
+      }
+      const result = payload.result
+      setVoidLabelOpen(false)
+      setVoidLabelIdempotencyKey('')
+      setNotice(`Sandbox label ${result.labelGlobalId} and tracking ${result.trackingNumber} were voided.`)
+      await loadWorkspace(result.orderGlobalId)
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'Sandbox label could not be voided')
+    } finally {
+      setVoidingLabel(false)
+    }
+  }
+
   const transitionException = async (nextStatus: OperationsExceptionStatus) => {
     if (!selectedExceptionGlobalId) return
     setUpdatingException(true)
@@ -788,6 +1371,15 @@ export default function OperationsSection() {
 
   const capabilities = workspace?.capabilities
   const detail = workspace?.selectedOrder?.globalId === selectedGlobalId ? workspace.selectedOrder : null
+  const detailSelectedRate = detail?.rates.find((rate) => rate.selected) || null
+  const detailSelectedProvider = detailSelectedRate
+    ? providerForCarrier(detailSelectedRate.carrier)
+    : null
+  const eligibleSandboxCarrierAccounts = detailSelectedProvider
+    ? workspace?.shipping?.sandboxCarrierAccounts.filter(
+        (account) => account.provider === detailSelectedProvider,
+      ) || []
+    : []
   const selectedException = workspace?.exceptions.find((item) => item.globalId === selectedExceptionGlobalId) || null
   const summary = workspace?.summary
   const empty = !loading && (
@@ -863,22 +1455,64 @@ export default function OperationsSection() {
             {metric('Unbilled', money(summary.unbilledMinor))}
           </Box>
         )}
-        <Tabs
-          value={view}
-          onChange={(_, next: 'orders' | 'exceptions' | 'gl-coding' | 'printing') => {
-            setView(next)
-            setSearch('')
-            closeDrawer()
-            closeExceptionDrawer()
-          }}
-          aria-label="Operations workbench view"
-          sx={{ mt: 1.25, minHeight: 42, '& .MuiTab-root': { minHeight: 42, px: 2 } }}
+        <Box
+          data-testid="operations-tab-navigation"
+          sx={{ mt: 1.25, minWidth: 0, maxWidth: '100%', overflow: 'hidden' }}
         >
-          <Tab value="orders" label={`Orders${workspace ? ` (${workspace.orders.length})` : ''}`} />
-          <Tab value="exceptions" label={`Exceptions${workspace ? ` (${workspace.summary.exceptions})` : ''}`} />
-          <Tab value="gl-coding" label="Billing & GL" />
-          <Tab value="printing" icon={<PrintRounded fontSize="small" />} iconPosition="start" label="Printing" />
-        </Tabs>
+          <Tabs
+            value={view}
+            onChange={(_, next: 'orders' | 'exceptions' | 'gl-coding' | 'printing') => {
+              setView(next)
+              setSearch('')
+              closeDrawer()
+              closeExceptionDrawer()
+            }}
+            variant="scrollable"
+            scrollButtons="auto"
+            allowScrollButtonsMobile
+            slots={{ scrollButtons: OperationsTabScrollButton }}
+            aria-label="Operations workbench view"
+            sx={{
+              width: '100%',
+              minWidth: 0,
+              minHeight: 42,
+              '& .MuiTabs-scroller': {
+                overscrollBehaviorX: 'contain',
+                touchAction: 'pan-x',
+              },
+              '& .MuiTab-root': {
+                flexShrink: 0,
+                minWidth: 'max-content',
+                minHeight: 42,
+                maxWidth: 'none',
+                px: { xs: 1.5, sm: 2 },
+                whiteSpace: 'nowrap',
+              },
+              '& .MuiTabs-scrollButtons': {
+                alignSelf: 'stretch',
+                width: { xs: 36, sm: 40 },
+                minWidth: { xs: 36, sm: 40 },
+                borderRadius: 0,
+                color: '#A8C7FA',
+                backgroundColor: '#111118',
+                '&:hover': { backgroundColor: '#1B1B24' },
+                '&.Mui-disabled': {
+                  opacity: 0.32,
+                  color: 'text.disabled',
+                },
+                '&.Mui-focusVisible': {
+                  outline: '2px solid #A8C7FA',
+                  outlineOffset: -2,
+                },
+              },
+            }}
+          >
+            <Tab value="orders" label={`Orders${workspace ? ` (${workspace.orders.length})` : ''}`} />
+            <Tab value="exceptions" label={`Exceptions${workspace ? ` (${workspace.summary.exceptions})` : ''}`} />
+            <Tab value="gl-coding" label="Billing & GL" />
+            <Tab value="printing" icon={<PrintRounded fontSize="small" />} iconPosition="start" label="Printing" />
+          </Tabs>
+        </Box>
       </Box>
 
       {mainWorkspaceView && (
@@ -1053,12 +1687,24 @@ export default function OperationsSection() {
 
       <OrderDetailDrawer
         order={detail}
+        sandboxCarrierAccounts={workspace?.shipping?.sandboxCarrierAccounts || []}
+        canExecute={Boolean(capabilities?.canManage && capabilities.canExecute)}
         open={drawerOpen}
-        busy={releasingOrder || confirmingPicks || verifyingPack}
+        busy={
+          releasingOrder
+          || confirmingPicks
+          || verifyingPack
+          || confirmingShipment
+          || creatingLabel
+          || voidingLabel
+        }
         onClose={closeDrawer}
         onRelease={openRelease}
         onConfirmPicks={openConfirmPicks}
         onVerifyPack={openVerifyPack}
+        onConfirmShipment={openConfirmShipment}
+        onCreateSandboxLabel={openCreateLabel}
+        onVoidSandboxLabel={openVoidLabel}
       />
       <ExceptionDetailDrawer
         exception={selectedException}
@@ -1171,6 +1817,150 @@ export default function OperationsSection() {
               startIcon={verifyingPack ? <CircularProgress size={16} /> : <Inventory2Rounded />}
             >
               {verifyingPack ? 'Verifying packages' : 'Confirm package verification'}
+            </Button>
+          </DialogActions>
+        </Box>
+      </Dialog>
+
+      <Dialog open={confirmShipmentOpen} onClose={closeConfirmShipment} fullWidth maxWidth="sm">
+        <Box component="form" onSubmit={confirmShipment}>
+          <DialogTitle>Confirm shipment</DialogTitle>
+          <DialogContent dividers>
+            <Stack spacing={2}>
+              <Alert severity="warning">
+                This consumes the reserved inventory, marks the order, package, and fulfillment
+                plan as shipped, creates immutable shipment and packing-slip evidence, seeds
+                tracking, and attempts the commerce fulfillment export for
+                {' '}{detail?.orderNumber || 'this order'}. The order version and shipment
+                readiness checks are repeated when you confirm.
+              </Alert>
+              <Alert severity="info">
+                Packing-slip printing uses the active configured printer route and its approved
+                fallback automatically. A print warning will be recorded without rolling back a
+                valid shipment.
+              </Alert>
+              <TextField
+                required
+                autoFocus
+                multiline
+                minRows={3}
+                label="Shipment confirmation reason"
+                value={confirmShipmentReason}
+                onChange={(event) => setConfirmShipmentReason(event.target.value)}
+                inputProps={{ maxLength: 500 }}
+                helperText={`${confirmShipmentReason.trim().length}/500 · Recorded in the audit history`}
+              />
+            </Stack>
+          </DialogContent>
+          <DialogActions>
+            <Button onClick={closeConfirmShipment} disabled={confirmingShipment}>Cancel</Button>
+            <Button
+              type="submit"
+              variant="contained"
+              disabled={confirmingShipment || !confirmShipmentReason.trim()}
+              startIcon={confirmingShipment ? <CircularProgress size={16} /> : <LocalShippingRounded />}
+            >
+              {confirmingShipment ? 'Confirming shipment' : 'Confirm shipment'}
+            </Button>
+          </DialogActions>
+        </Box>
+      </Dialog>
+
+      <Dialog open={createLabelOpen} onClose={closeCreateLabel} fullWidth maxWidth="sm">
+        <Box component="form" onSubmit={createSandboxLabel}>
+          <DialogTitle>Create sandbox carrier label</DialogTitle>
+          <DialogContent dividers>
+            <Stack spacing={2}>
+              <Alert severity="warning">
+                Sandbox only. ClawPilot will use John Doe, Test Product, 101 Jegs Place in Delaware,
+                Ohio, and Massachusetts Maritime Academy in Buzzards Bay. Inspect the label and
+                print evidence, then void it immediately.
+              </Alert>
+              <Box>
+                <Typography variant="caption" color="text.secondary">Selected service</Typography>
+                <Typography>
+                  {detailSelectedRate
+                    ? `${detailSelectedRate.carrier} · ${detailSelectedRate.serviceName}`
+                    : 'No carrier service selected'}
+                </Typography>
+              </Box>
+              <TextField
+                required
+                select
+                label="Sandbox carrier account"
+                value={carrierAccountGlobalId}
+                onChange={(event) => setCarrierAccountGlobalId(event.target.value)}
+                helperText="Only active, verified sandbox credentials for the selected carrier are available."
+              >
+                {eligibleSandboxCarrierAccounts.map((account) => (
+                  <MenuItem key={account.globalId} value={account.globalId}>
+                    {account.displayName} · •••• {account.accountNumberLastFour}
+                  </MenuItem>
+                ))}
+              </TextField>
+              <TextField
+                required
+                multiline
+                minRows={3}
+                label="Label creation reason"
+                value={createLabelReason}
+                onChange={(event) => setCreateLabelReason(event.target.value)}
+                inputProps={{ maxLength: 500 }}
+                helperText={`${createLabelReason.trim().length}/500 · Recorded with the carrier attempt and audit event`}
+              />
+            </Stack>
+          </DialogContent>
+          <DialogActions>
+            <Button onClick={closeCreateLabel} disabled={creatingLabel}>Cancel</Button>
+            <Button
+              type="submit"
+              variant="contained"
+              disabled={
+                creatingLabel
+                || !createLabelReason.trim()
+                || !carrierAccountGlobalId
+                || !detailSelectedRate
+              }
+              startIcon={creatingLabel ? <CircularProgress size={16} /> : <LocalShippingRounded />}
+            >
+              {creatingLabel ? 'Creating label' : 'Create sandbox label'}
+            </Button>
+          </DialogActions>
+        </Box>
+      </Dialog>
+
+      <Dialog open={voidLabelOpen} onClose={closeVoidLabel} fullWidth maxWidth="sm">
+        <Box component="form" onSubmit={voidSandboxLabel}>
+          <DialogTitle>Void sandbox carrier label</DialogTitle>
+          <DialogContent dividers>
+            <Stack spacing={2}>
+              <Alert severity="warning">
+                ClawPilot will void the active label through the exact provider account recorded
+                at purchase. This does not accept a replacement account or create another label.
+              </Alert>
+              <TextField
+                required
+                autoFocus
+                multiline
+                minRows={3}
+                label="Void reason"
+                value={voidLabelReason}
+                onChange={(event) => setVoidLabelReason(event.target.value)}
+                inputProps={{ maxLength: 500 }}
+                helperText={`${voidLabelReason.trim().length}/500 · Recorded with the carrier attempt and audit event`}
+              />
+            </Stack>
+          </DialogContent>
+          <DialogActions>
+            <Button onClick={closeVoidLabel} disabled={voidingLabel}>Cancel</Button>
+            <Button
+              type="submit"
+              color="error"
+              variant="contained"
+              disabled={voidingLabel || !voidLabelReason.trim()}
+              startIcon={voidingLabel ? <CircularProgress size={16} /> : <CancelRounded />}
+            >
+              {voidingLabel ? 'Voiding label' : 'Confirm void'}
             </Button>
           </DialogActions>
         </Box>

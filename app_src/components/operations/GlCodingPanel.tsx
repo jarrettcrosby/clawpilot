@@ -19,6 +19,7 @@ import {
 import AddRounded from '@mui/icons-material/AddRounded'
 import PlayArrowRounded from '@mui/icons-material/PlayArrowRounded'
 import RefreshRounded from '@mui/icons-material/RefreshRounded'
+import UploadFileRounded from '@mui/icons-material/UploadFileRounded'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import { formatUserDateTime } from '@/lib/userDateTime'
 
@@ -31,6 +32,7 @@ type GlCodingCapabilities = {
   canAssignOrphans?: boolean
   canCreateRules?: boolean
   canManageRules?: boolean
+  canApproveCarrierSettlement?: boolean
 }
 
 type GlCodingBatch = {
@@ -61,6 +63,13 @@ type GlCodingRun = {
   requestedAt?: string | null
   completedAt?: string | null
   errorSummary?: string | null
+  review?: {
+    globalId: string
+    decision?: 'approved' | 'rejected' | null
+    reason?: string | null
+    reviewedBy?: string | null
+    reviewedAt?: string | null
+  } | null
 }
 
 type GlCodingOrphan = {
@@ -99,6 +108,31 @@ type GlCodingShipper = {
   name?: string | null
 }
 
+type GlCodingSettlement = {
+  globalId: string
+  settlementType?: string | null
+  role?: string | null
+  amountMinor?: string | number | null
+  sourceChargeAmountMinor?: string | number | null
+  currency?: string | null
+  currentStatus?: string | null
+  payerName?: string | null
+  payerGlobalId?: string | null
+  payeeName?: string | null
+  payeeGlobalId?: string | null
+  chargeGlobalId?: string | null
+  sourceGlobalId?: string | null
+  actorEmail?: string | null
+  occurredAt?: string | null
+  codingOutputs?: Record<string, unknown>
+  latestEvent?: {
+    globalId: string
+    details?: Record<string, unknown>
+    actorEmail?: string | null
+    occurredAt?: string | null
+  } | null
+}
+
 type GlCodingWorkspace = {
   capabilities: GlCodingCapabilities
   batches: GlCodingBatch[]
@@ -106,6 +140,7 @@ type GlCodingWorkspace = {
   orphans: GlCodingOrphan[]
   rules: GlCodingRule[]
   shippers: GlCodingShipper[]
+  settlements: GlCodingSettlement[]
 }
 
 type GlCodingPayload = {
@@ -117,6 +152,21 @@ type GlCodingPayload = {
 type OrphanDraft = {
   shipperPartyGlobalId: string
   reason: string
+}
+
+type SettlementEventType =
+  | 'approved'
+  | 'billed'
+  | 'paid'
+  | 'disputed'
+  | 'resolved'
+  | 'reversed'
+  | 'voided'
+
+type SettlementDraft = {
+  eventType: SettlementEventType | ''
+  reason: string
+  reference: string
 }
 
 type RuleForm = {
@@ -159,6 +209,7 @@ function normalizeWorkspace(input: Partial<GlCodingWorkspace>): GlCodingWorkspac
     orphans: Array.isArray(input.orphans) ? input.orphans : [],
     rules: Array.isArray(input.rules) ? input.rules : [],
     shippers: Array.isArray(input.shippers) ? input.shippers : [],
+    settlements: Array.isArray(input.settlements) ? input.settlements : [],
   }
 }
 
@@ -169,11 +220,31 @@ function displayStatus(value: string | null | undefined) {
 }
 
 function statusColor(status: string | null | undefined): 'default' | 'success' | 'warning' | 'error' | 'info' {
-  if (status === 'completed' || status === 'assigned' || status === 'ready') return 'success'
-  if (status === 'failed' || status === 'rejected') return 'error'
-  if (status === 'needs_review' || status === 'ambiguous') return 'warning'
-  if (status === 'queued' || status === 'running') return 'info'
+  if (
+    status === 'completed'
+    || status === 'assigned'
+    || status === 'ready'
+    || status === 'approved'
+    || status === 'paid'
+    || status === 'resolved'
+  ) return 'success'
+  if (status === 'failed' || status === 'rejected' || status === 'voided') return 'error'
+  if (
+    status === 'needs_review'
+    || status === 'ambiguous'
+    || status === 'disputed'
+  ) return 'warning'
+  if (status === 'queued' || status === 'running' || status === 'billed') return 'info'
   return 'default'
+}
+
+function settlementActions(status: string | null | undefined): SettlementEventType[] {
+  if (status === 'approved') return ['billed', 'paid', 'disputed', 'reversed', 'voided']
+  if (status === 'billed') return ['paid', 'disputed', 'reversed', 'voided']
+  if (status === 'disputed') return ['resolved', 'voided']
+  if (status === 'resolved') return ['billed', 'paid', 'reversed', 'voided']
+  if (status === 'accrued') return ['approved', 'voided']
+  return []
 }
 
 function money(minor: string | number | null | undefined, currency = 'USD') {
@@ -275,6 +346,14 @@ export default function GlCodingPanel() {
   const [orphanDrafts, setOrphanDrafts] = useState<Record<string, OrphanDraft>>({})
   const [ruleForm, setRuleForm] = useState<RuleForm>(emptyRuleForm)
   const [creatingRule, setCreatingRule] = useState(false)
+  const [importFile, setImportFile] = useState<File | null>(null)
+  const [importProvider, setImportProvider] = useState<'ups' | 'fedex' | 'usps'>('ups')
+  const [importEnvironment, setImportEnvironment] = useState<'production' | 'sandbox'>('production')
+  const [importing, setImporting] = useState(false)
+  const [reviewReasons, setReviewReasons] = useState<Record<string, string>>({})
+  const [reviewingRunId, setReviewingRunId] = useState<string | null>(null)
+  const [settlementDrafts, setSettlementDrafts] = useState<Record<string, SettlementDraft>>({})
+  const [updatingSettlementId, setUpdatingSettlementId] = useState<string | null>(null)
 
   const load = useCallback(async (signal?: AbortSignal) => {
     setLoading(true)
@@ -321,6 +400,8 @@ export default function GlCodingPanel() {
   const canAssign = capabilityAllows(workspace?.capabilities || {}, ['canAssignOrphans', 'canAssign'])
   const canCreateRules = workspace?.capabilities.canManageNetworks === true
     && capabilityAllows(workspace.capabilities, ['canCreateRules', 'canManageRules'])
+  const canApproveCarrierSettlement =
+    workspace?.capabilities.canApproveCarrierSettlement === true
 
   const toggleBatch = (batch: GlCodingBatch) => {
     setSelectedBatchIds((current) => (
@@ -448,6 +529,213 @@ export default function GlCodingPanel() {
     }
   }
 
+  const importBillingFile = async () => {
+    if (!importFile) return
+    setImporting(true)
+    setError('')
+    setNotice('')
+    try {
+      const form = new FormData()
+      form.append('file', importFile)
+      form.append('provider', importProvider)
+      form.append('environment', importEnvironment)
+      const response = await fetch('/api/operations/carrier-billing/import', {
+        method: 'POST',
+        body: form,
+      })
+      const payload = await readPayload(response)
+      if (!response.ok || !payload.ok) {
+        throw new Error(payload.error || 'The carrier billing file could not be imported')
+      }
+      const importedFilename = importFile.name
+      setImportFile(null)
+      setNotice(`${importedFilename} was imported and is ready for GL Coding.`)
+      await load()
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'The carrier billing file could not be imported')
+    } finally {
+      setImporting(false)
+    }
+  }
+
+  const reviewRun = async (
+    run: GlCodingRun,
+    decision: 'approved' | 'rejected',
+  ) => {
+    const reason = String(reviewReasons[run.globalId] || '').trim()
+    if (!reason) return
+    setReviewingRunId(run.globalId)
+    setError('')
+    setNotice('')
+    try {
+      await postAction(
+        {
+          action: 'review-run',
+          runGlobalId: run.globalId,
+          decision,
+          reason,
+        },
+        `operations-gl-review:${run.globalId}:${crypto.randomUUID()}`,
+      )
+      setReviewReasons((current) => {
+        const next = { ...current }
+        delete next[run.globalId]
+        return next
+      })
+      setNotice(
+        decision === 'approved'
+          ? `${run.globalId} was approved and its billed-actual settlements were accrued.`
+          : `${run.globalId} was rejected with a recorded reason.`,
+      )
+      await load()
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'The GL Coding run could not be reviewed')
+    } finally {
+      setReviewingRunId(null)
+    }
+  }
+
+  const updateSettlementDraft = (
+    settlementGlobalId: string,
+    update: Partial<SettlementDraft>,
+  ) => {
+    setSettlementDrafts((current) => {
+      const previous = current[settlementGlobalId] || {
+        eventType: '',
+        reason: '',
+        reference: '',
+      }
+      return {
+        ...current,
+        [settlementGlobalId]: {
+          ...previous,
+          ...update,
+        },
+      }
+    })
+  }
+
+  const recordSettlementEvent = async (settlement: GlCodingSettlement) => {
+    const draft = settlementDrafts[settlement.globalId]
+    if (!draft?.eventType || !draft.reason.trim()) return
+    if (
+      (draft.eventType === 'billed' || draft.eventType === 'paid')
+      && !draft.reference.trim()
+    ) return
+    setUpdatingSettlementId(settlement.globalId)
+    setError('')
+    setNotice('')
+    try {
+      await postAction(
+        {
+          action: 'record-settlement-event',
+          settlementGlobalId: settlement.globalId,
+          eventType: draft.eventType,
+          reason: draft.reason.trim(),
+          reference: draft.reference.trim(),
+        },
+        `operations-settlement-event:${settlement.globalId}:${crypto.randomUUID()}`,
+      )
+      setSettlementDrafts((current) => {
+        const next = { ...current }
+        delete next[settlement.globalId]
+        return next
+      })
+      setNotice(
+        `${settlement.globalId} is now ${displayStatus(draft.eventType).toLowerCase()}.`,
+      )
+      await load()
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'The settlement could not be updated')
+    } finally {
+      setUpdatingSettlementId(null)
+    }
+  }
+
+  const runReviewPanel = (run: GlCodingRun) => {
+    if (run.review) {
+      return (
+        <Alert
+          severity={run.review.decision === 'approved' ? 'success' : 'warning'}
+          sx={{ mt: 1.25 }}
+        >
+          <Typography variant="body2" fontWeight={700}>
+            {displayStatus(run.review.decision)} by {run.review.reviewedBy || 'an authorized reviewer'}
+          </Typography>
+          <Typography variant="body2">{run.review.reason || 'No review reason was recorded.'}</Typography>
+          {run.review.reviewedAt && (
+            <Typography variant="caption" color="text.secondary">
+              {formatUserDateTime(run.review.reviewedAt, dateTime, {
+                year: 'numeric',
+                month: 'short',
+                day: 'numeric',
+                hour: 'numeric',
+                minute: '2-digit',
+                fallback: '',
+              })}
+            </Typography>
+          )}
+        </Alert>
+      )
+    }
+    if (!['completed', 'needs_review'].includes(String(run.status || ''))) return null
+    if (!canApproveCarrierSettlement) {
+      return (
+        <Alert severity="info" sx={{ mt: 1.25 }}>
+          Settlement approval permission is required to review this run.
+        </Alert>
+      )
+    }
+    const reason = reviewReasons[run.globalId] || ''
+    const busy = reviewingRunId === run.globalId
+    const approvable =
+      run.status === 'completed'
+      && count(run.orphanCount) === 0
+      && count(run.errorCount) === 0
+    return (
+      <Box sx={{ mt: 1.25 }}>
+        <TextField
+          fullWidth
+          size="small"
+          label="Review reason"
+          value={reason}
+          onChange={(event) => setReviewReasons((current) => ({
+            ...current,
+            [run.globalId]: event.target.value,
+          }))}
+          disabled={busy}
+          inputProps={{ maxLength: 1_000 }}
+          sx={fieldSx}
+        />
+        {!approvable && (
+          <Typography variant="caption" color="warning.main" display="block" sx={{ mt: 0.75 }}>
+            Approval is available only after the run completes with no orphan or error items. Rejection remains
+            available so the file can be corrected and rerun.
+          </Typography>
+        )}
+        <Stack direction="row" spacing={1} sx={{ mt: 1 }}>
+          <Button
+            variant="contained"
+            color="success"
+            disabled={busy || !approvable || !reason.trim()}
+            startIcon={busy ? <CircularProgress size={16} color="inherit" /> : undefined}
+            onClick={() => void reviewRun(run, 'approved')}
+          >
+            Approve actuals
+          </Button>
+          <Button
+            variant="outlined"
+            color="warning"
+            disabled={busy || !reason.trim()}
+            onClick={() => void reviewRun(run, 'rejected')}
+          >
+            Reject run
+          </Button>
+        </Stack>
+      </Box>
+    )
+  }
+
   if (loading && !workspace) {
     return <Box sx={{ minHeight: 280, display: 'grid', placeItems: 'center' }}><CircularProgress size={30} /></Box>
   }
@@ -507,6 +795,85 @@ export default function GlCodingPanel() {
           {error && <Alert severity="error" onClose={() => setError('')} sx={{ mb: 1.5 }}>{error}</Alert>}
           {notice && <Alert severity="success" onClose={() => setNotice('')} sx={{ mb: 1.5 }}>{notice}</Alert>}
           {!canRun && <Alert severity="info" sx={{ mb: 1.5 }}>You do not have permission to run billing reconciliation.</Alert>}
+
+          <Box
+            sx={{
+              mb: 2,
+              p: 1.5,
+              border: '1px solid',
+              borderColor: 'divider',
+              borderRadius: '8px',
+            }}
+          >
+            <Typography fontWeight={700}>Import carrier billing CSV</Typography>
+            <Typography variant="caption" color="text.secondary">
+              One file may include one or many account numbers. Account values are fingerprinted and masked before
+              evidence is stored.
+            </Typography>
+            <Box
+              sx={{
+                mt: 1.25,
+                display: 'grid',
+                gridTemplateColumns: {
+                  xs: 'minmax(0, 1fr)',
+                  sm: 'minmax(130px, 0.6fr) minmax(150px, 0.7fr) minmax(0, 1.5fr) auto',
+                },
+                gap: 1,
+                alignItems: 'center',
+              }}
+            >
+              <TextField
+                select
+                size="small"
+                label="Carrier"
+                value={importProvider}
+                onChange={(event) => setImportProvider(event.target.value as 'ups' | 'fedex' | 'usps')}
+                disabled={!canRun || importing}
+                sx={fieldSx}
+              >
+                <MenuItem value="ups">UPS</MenuItem>
+                <MenuItem value="fedex">FedEx</MenuItem>
+                <MenuItem value="usps">USPS</MenuItem>
+              </TextField>
+              <TextField
+                select
+                size="small"
+                label="Environment"
+                value={importEnvironment}
+                onChange={(event) => setImportEnvironment(event.target.value as 'production' | 'sandbox')}
+                disabled={!canRun || importing}
+                sx={fieldSx}
+              >
+                <MenuItem value="production">Production</MenuItem>
+                <MenuItem value="sandbox">Sandbox</MenuItem>
+              </TextField>
+              <Button
+                component="label"
+                variant="outlined"
+                startIcon={<UploadFileRounded />}
+                disabled={!canRun || importing}
+                sx={{ minWidth: 0, justifyContent: 'flex-start', overflow: 'hidden' }}
+              >
+                <Box component="span" sx={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {importFile?.name || 'Choose CSV'}
+                </Box>
+                <input
+                  hidden
+                  type="file"
+                  accept=".csv,text/csv"
+                  onChange={(event) => setImportFile(event.target.files?.[0] || null)}
+                />
+              </Button>
+              <Button
+                variant="contained"
+                disabled={!canRun || importing || !importFile}
+                startIcon={importing ? <CircularProgress size={16} color="inherit" /> : <UploadFileRounded />}
+                onClick={() => void importBillingFile()}
+              >
+                {importing ? 'Importing' : 'Import'}
+              </Button>
+            </Box>
+          </Box>
 
           {workspace?.batches.length ? (
             <Stack divider={<Divider flexItem />}>
@@ -604,24 +971,204 @@ export default function GlCodingPanel() {
                 <Box><Typography variant="caption" color="text.secondary">Errors</Typography><Typography fontWeight={700} color={count(latestRun.errorCount) ? 'error.main' : 'text.primary'}>{count(latestRun.errorCount)}</Typography></Box>
               </Box>
               {latestRun.errorSummary && <Alert severity="error" sx={{ mt: 1.5 }}>{latestRun.errorSummary}</Alert>}
+              {runReviewPanel(latestRun)}
               {workspace.runs.length > 1 && (
                 <Stack divider={<Divider flexItem />} sx={{ mt: 1.5 }}>
                   {workspace.runs.slice(1, 6).map((run) => (
-                    <Stack key={run.globalId} direction="row" justifyContent="space-between" alignItems="center" gap={2} sx={{ py: 1 }}>
-                      <Box sx={{ minWidth: 0 }}>
-                        <Typography variant="body2" fontWeight={650}>{run.globalId}</Typography>
-                        <Typography variant="caption" color="text.secondary">
-                          {count(run.selectedChargeCount)} charges · {count(run.orphanCount)} orphans
-                        </Typography>
-                      </Box>
-                      <Chip size="small" label={displayStatus(run.status)} color={statusColor(run.status)} />
-                    </Stack>
+                    <Box key={run.globalId} sx={{ py: 1 }}>
+                      <Stack direction="row" justifyContent="space-between" alignItems="center" gap={2}>
+                        <Box sx={{ minWidth: 0 }}>
+                          <Typography variant="body2" fontWeight={650}>{run.globalId}</Typography>
+                          <Typography variant="caption" color="text.secondary">
+                            {count(run.selectedChargeCount)} charges · {count(run.orphanCount)} orphans
+                          </Typography>
+                        </Box>
+                        <Chip size="small" label={displayStatus(run.status)} color={statusColor(run.status)} />
+                      </Stack>
+                      {runReviewPanel(run)}
+                    </Box>
                   ))}
                 </Stack>
               )}
             </>
           ) : (
             <Typography color="text.secondary">No GL Coding runs have been recorded.</Typography>
+          )}
+        </Box>
+
+        <Box component="section">
+          <Stack direction="row" justifyContent="space-between" alignItems="baseline" gap={2} sx={{ mb: 1.5 }}>
+            <Box>
+              <Typography variant="h6" fontWeight={700}>Settlement ledger</Typography>
+              <Typography variant="caption" color="text.secondary">
+                Approved billed actuals and contract charges, with append-only lifecycle evidence.
+              </Typography>
+            </Box>
+            <Typography variant="caption" color="text.secondary">
+              {workspace.settlements.length} entries
+            </Typography>
+          </Stack>
+          {workspace.settlements.length ? (
+            <Stack divider={<Divider flexItem />}>
+              {workspace.settlements.map((settlement) => {
+                const actions = settlementActions(settlement.currentStatus)
+                const draft = settlementDrafts[settlement.globalId] || {
+                  eventType: '',
+                  reason: '',
+                  reference: '',
+                }
+                const busy = updatingSettlementId === settlement.globalId
+                const referenceRequired =
+                  draft.eventType === 'billed'
+                  || draft.eventType === 'paid'
+                const canSubmit =
+                  canApproveCarrierSettlement
+                  && !busy
+                  && Boolean(draft.eventType)
+                  && Boolean(draft.reason.trim())
+                  && (!referenceRequired || Boolean(draft.reference.trim()))
+                const latestReason = String(settlement.latestEvent?.details?.reason || '').trim()
+                const latestReference = String(settlement.latestEvent?.details?.reference || '').trim()
+                const codingOutputs = Object.entries(settlement.codingOutputs || {})
+                  .filter(([, value]) => value !== null && value !== undefined && String(value).trim())
+                return (
+                  <Box key={settlement.globalId} sx={{ py: 1.5 }}>
+                    <Box
+                      sx={{
+                        display: 'grid',
+                        gridTemplateColumns: { xs: 'minmax(0, 1fr)', md: 'minmax(0, 1.5fr) auto' },
+                        gap: 1,
+                      }}
+                    >
+                      <Box sx={{ minWidth: 0 }}>
+                        <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
+                          <Typography fontWeight={700}>{settlement.globalId}</Typography>
+                          <Chip
+                            size="small"
+                            label={displayStatus(settlement.currentStatus)}
+                            color={statusColor(settlement.currentStatus)}
+                          />
+                          <Chip
+                            size="small"
+                            variant="outlined"
+                            label={displayStatus(settlement.role || settlement.settlementType)}
+                          />
+                        </Stack>
+                        <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
+                          {settlement.payerName || settlement.payerGlobalId || 'Unknown payer'}
+                          {' → '}
+                          {settlement.payeeName || settlement.payeeGlobalId || 'Unknown payee'}
+                        </Typography>
+                        <Typography variant="caption" color="text.secondary" sx={{ overflowWrap: 'anywhere' }}>
+                          {[settlement.chargeGlobalId, settlement.sourceGlobalId].filter(Boolean).join(' · ')}
+                        </Typography>
+                        {(latestReason || latestReference) && (
+                          <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 0.5 }}>
+                            {[latestReason, latestReference ? `Reference ${latestReference}` : ''].filter(Boolean).join(' · ')}
+                          </Typography>
+                        )}
+                        {codingOutputs.length > 0 && (
+                          <Stack
+                            direction="row"
+                            spacing={0.75}
+                            flexWrap="wrap"
+                            useFlexGap
+                            sx={{ mt: 0.75 }}
+                          >
+                            {codingOutputs.map(([key, value]) => (
+                              <Chip
+                                key={key}
+                                size="small"
+                                variant="outlined"
+                                label={`${displayStatus(key)}: ${String(value)}`}
+                              />
+                            ))}
+                          </Stack>
+                        )}
+                      </Box>
+                      <Box sx={{ textAlign: { xs: 'left', md: 'right' } }}>
+                        <Typography fontWeight={750}>
+                          {money(settlement.amountMinor, settlement.currency || 'USD')}
+                        </Typography>
+                        {settlement.sourceChargeAmountMinor !== null
+                          && settlement.sourceChargeAmountMinor !== undefined && (
+                          <Typography variant="caption" color="text.secondary">
+                            Source charge {money(
+                              settlement.sourceChargeAmountMinor,
+                              settlement.currency || 'USD',
+                            )}
+                          </Typography>
+                        )}
+                      </Box>
+                    </Box>
+                    {actions.length > 0 && (
+                      <Box
+                        sx={{
+                          mt: 1.25,
+                          display: 'grid',
+                          gridTemplateColumns: {
+                            xs: 'minmax(0, 1fr)',
+                            md: 'minmax(150px, 0.6fr) minmax(220px, 1.2fr) minmax(180px, 0.8fr) auto',
+                          },
+                          gap: 1,
+                        }}
+                      >
+                        <TextField
+                          select
+                          size="small"
+                          label="Next status"
+                          value={draft.eventType}
+                          onChange={(event) => updateSettlementDraft(settlement.globalId, {
+                            eventType: event.target.value as SettlementEventType,
+                          })}
+                          disabled={!canApproveCarrierSettlement || busy}
+                          sx={fieldSx}
+                        >
+                          {actions.map((action) => (
+                            <MenuItem key={action} value={action}>{displayStatus(action)}</MenuItem>
+                          ))}
+                        </TextField>
+                        <TextField
+                          size="small"
+                          label="Reason"
+                          value={draft.reason}
+                          onChange={(event) => updateSettlementDraft(settlement.globalId, {
+                            reason: event.target.value,
+                          })}
+                          disabled={!canApproveCarrierSettlement || busy}
+                          inputProps={{ maxLength: 1_000 }}
+                          sx={fieldSx}
+                        />
+                        <TextField
+                          size="small"
+                          required={referenceRequired}
+                          label={referenceRequired ? 'Invoice or payment reference' : 'External reference'}
+                          value={draft.reference}
+                          onChange={(event) => updateSettlementDraft(settlement.globalId, {
+                            reference: event.target.value,
+                          })}
+                          disabled={!canApproveCarrierSettlement || busy}
+                          inputProps={{ maxLength: 200 }}
+                          sx={fieldSx}
+                        />
+                        <Button
+                          variant="outlined"
+                          disabled={!canSubmit}
+                          startIcon={busy ? <CircularProgress size={16} /> : undefined}
+                          onClick={() => void recordSettlementEvent(settlement)}
+                        >
+                          {busy ? 'Recording' : 'Record'}
+                        </Button>
+                      </Box>
+                    )}
+                  </Box>
+                )
+              })}
+            </Stack>
+          ) : (
+            <Typography color="text.secondary">
+              No settlement entries have been generated. Approve a completed GL Coding run to accrue billed actuals.
+            </Typography>
           )}
         </Box>
 

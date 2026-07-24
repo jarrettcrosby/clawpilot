@@ -33,13 +33,16 @@ app_visible: true
 - [Application Shell and Access](../modules/application-shell-and-access.md): roles, permissions, login history, and security boundaries.
 - [2026-03-20 Stable Build Integrity Outage](../incidents/2026-03-20-stable-build-integrity-outage.md): retained release-safety evidence.
 
-## Distributed Operations Pre-Activation
+## Distributed Operations
 
-- [Distributed Operations Runbook](../operations/distributed-operations-runbook.md): target activation, monitoring, reconciliation, incidents, recovery, and rollback.
+- [Distributed Operations](../modules/distributed-operations.md): domain authority, state machines, shipment-safety invariants, packing-slip and tracking evidence, and adapter contracts.
+- [Distributed Operations Runbook](../operations/distributed-operations-runbook.md): target activation, sandbox/production shipment boundaries, artifact and commerce-export diagnostics, monitoring, incidents, recovery, and rollback.
 - [Distributed Operations Delivery, Migration, and Test Plan](../architecture/distributed-operations-delivery-plan.md): phased gates, migration/cutover strategy, and S01-S25 acceptance.
-- [Distributed Operations Integration and Gap Map](distributed-operations-integration-gap-map.md): current platform reuse, `0081` foundation coverage, and blockers.
+- [Distributed Operations Integration and Gap Map](distributed-operations-integration-gap-map.md): current platform reuse, implemented development boundaries, and remaining blockers.
+- [Printing, Carrier Billing, And GL Coding](../operations/printing-carrier-billing-and-gl-coding.md): printer setup, direct carrier-bill import, GL review, Triangle/Square/Circle settlement, and financial controls.
+- [Local Print Agent](../operations/local-print-agent.md): enrollment, credential rotation, fenced claims, acknowledgements, retry, fallback, and reprint operations.
 
-These documents remain pre-activation. Existing environment and backup procedures stay authoritative until operations health, scoped activation, and on-call ownership are implemented.
+The bounded development workflows are implemented and tested, but the overall module remains pre-activation for production provider mutations, hosted shipment confirmation, tracking ingestion, commerce-fulfillment dispatch, and accounting export. Sandbox labels cannot confirm shipments or consume inventory. Working-tree migration `0099` and the packing-slip/artifact delivery code establish durable evidence contracts without activating those production commands. On mobile, the Operations subpanel row scrolls horizontally between Orders, Exceptions, Billing & GL, and Printing by touch or labeled edge controls. Existing environment and backup procedures stay authoritative until provider certification, scoped activation, complete health/reconciliation, and on-call ownership are in place.
 
 ## Standard Verification Path
 

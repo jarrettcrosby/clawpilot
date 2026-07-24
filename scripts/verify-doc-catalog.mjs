@@ -36,6 +36,8 @@ const requiredCurrentDocuments = [
   'docs/operations/public-demo-environment.md',
   'docs/operations/agent-security-and-isolation.md',
   'docs/operations/knowledge-vault-organization.md',
+  'docs/operations/printing-carrier-billing-and-gl-coding.md',
+  'docs/operations/local-print-agent.md',
   'docs/releases/README.md',
   'docs/brand/clawpilot-identity.md',
 ]

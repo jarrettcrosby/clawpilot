@@ -1411,6 +1411,129 @@ async function verifySettlementAndIdentityEvidence(
     fixture.actorEmail,
   ]
 
+  const settlementReviewRun = await insertReturningId(
+    pool,
+    `INSERT INTO operations_gl_coding_runs (
+       network_id, selection_snapshot, rule_snapshot,
+       input_checksum, idempotency_key,
+       selected_batch_count, selected_charge_count,
+       requested_by
+     ) VALUES (
+       $1, $2::jsonb, '[]'::jsonb,
+       $3, $4,
+       1, 1,
+       $5
+     )
+     RETURNING id`,
+    [
+      fixture.network.id,
+      JSON.stringify({
+        batches: [{ globalId: billing.batch.global_id }],
+        purpose: 'settlement-integrity-review',
+      }),
+      fixture.checksumA,
+      `settlement-review-run-${fixture.suffix}`,
+      fixture.actorEmail,
+    ],
+  )
+  await pool.query(
+    `INSERT INTO operations_gl_coding_run_batches (
+       network_id, run_id, batch_id
+     ) VALUES ($1, $2, $3)`,
+    [fixture.network.id, settlementReviewRun.id, billing.batch.id],
+  )
+  await pool.query(
+    `UPDATE operations_gl_coding_runs
+     SET status = 'running', started_at = now()
+     WHERE id = $1`,
+    [settlementReviewRun.id],
+  )
+  const settlementReviewRunItem = await insertReturningId(
+    pool,
+    `INSERT INTO operations_gl_coding_run_items (
+       network_id, run_id, charge_id,
+       billing_match_id, shipper_assignment_id,
+       result, shipment_match_status, shipper_assignment_status,
+       coding_outputs, evidence, explanation
+     ) VALUES (
+       $1, $2, $3,
+       $4, $5,
+       'assigned', 'unmatched', 'assigned',
+       $6::jsonb, $7::jsonb, $8
+     )
+     RETURNING id`,
+    [
+      fixture.network.id,
+      settlementReviewRun.id,
+      billing.manualCharge.id,
+      decisions.manualUnmatched.id,
+      decisions.manualAssignment.id,
+      JSON.stringify({ glAccount: '6000', department: 'FREIGHT' }),
+      JSON.stringify({ assignmentSource: 'manual' }),
+      'Manual assignment retained for billed-actual settlement review',
+    ],
+  )
+  await pool.query(
+    `UPDATE operations_gl_coding_runs
+     SET status = 'completed',
+         shipper_assigned_count = 1,
+         completed_at = now(),
+         summary = '{"assigned":1,"reviewReady":true}'::jsonb
+     WHERE id = $1`,
+    [settlementReviewRun.id],
+  )
+  const settlementReview = await insertReturningId(
+    pool,
+    `INSERT INTO operations_gl_coding_reviews (
+       network_id, run_id, decision, reason,
+       idempotency_key, evidence, reviewed_by
+     ) VALUES (
+       $1, $2, 'approved', $3,
+       $4, $5::jsonb, $6
+     )
+     RETURNING id`,
+    [
+      fixture.network.id,
+      settlementReviewRun.id,
+      'Approved exact billed-actual evidence for settlement integrity tests',
+      `settlement-review-${fixture.suffix}`,
+      JSON.stringify({ purpose: 'settlement-integrity-review' }),
+      fixture.actorEmail,
+    ],
+  )
+  await pool.query(
+    `INSERT INTO operations_gl_coding_review_items (
+       network_id, run_id, review_id, run_item_id,
+       billing_statement_id, billing_charge_id,
+       billing_account_resolution_id, account_authorization_id,
+       carrier_account_id, shipper_assignment_id,
+       source_charge_amount_minor, currency, evidence
+     ) VALUES (
+       $1, $2, $3, $4,
+       $5, $6,
+       $7, $8,
+       $9, $10,
+       $11, $12, $13::jsonb
+     )`,
+    [
+      fixture.network.id,
+      settlementReviewRun.id,
+      settlementReview.id,
+      settlementReviewRunItem.id,
+      billing.statementA.id,
+      billing.manualCharge.id,
+      billing.resolutionA.id,
+      fixture.authorizationA.id,
+      fixture.accountA.id,
+      decisions.manualAssignment.id,
+      2500,
+      'USD',
+      JSON.stringify({
+        codingOutputs: { glAccount: '6000', department: 'FREIGHT' },
+      }),
+    ],
+  )
+
   await expectRejected(
     () => pool.query(
       `INSERT INTO operations_settlement_entries (
@@ -1514,6 +1637,132 @@ async function verifySettlementAndIdentityEvidence(
   assert.equal(settlement.quote_snapshot_id, null)
   assert.equal(settlement.cost_basis, 'billed_actual')
   assert.equal(Number(settlement.source_charge_amount_minor), 2500)
+
+  const insertSettlementEvent = async ({
+    eventType,
+    reason,
+    reference,
+    idempotencyKey,
+  }) => insertReturningId(
+    pool,
+    `INSERT INTO operations_settlement_events (
+       network_id, settlement_entry_id, event_type,
+       details, idempotency_key, actor_email
+     ) VALUES (
+       $1, $2, $3,
+       $4::jsonb, $5, $6
+     )
+     RETURNING id, global_id, event_type`,
+    [
+      fixture.network.id,
+      settlement.id,
+      eventType,
+      JSON.stringify({
+        reason,
+        ...(reference ? { reference } : {}),
+      }),
+      idempotencyKey,
+      fixture.actorEmail,
+    ],
+  )
+
+  const approvedEvent = await insertSettlementEvent({
+    eventType: 'approved',
+    reason: 'Approved against exact carrier statement evidence',
+    idempotencyKey: `settlement-approved-${fixture.suffix}`,
+  })
+  assert.equal(approvedEvent.event_type, 'approved')
+
+  await expectRejected(
+    () => insertSettlementEvent({
+      eventType: 'billed',
+      reason: 'Attempt billing without an external reference',
+      idempotencyKey: `settlement-billed-no-ref-${fixture.suffix}`,
+    }),
+    /require an external reference/,
+    'Billed settlement evidence must include an external reference',
+  )
+
+  const billedEvent = await insertSettlementEvent({
+    eventType: 'billed',
+    reason: 'Billed on the customer settlement statement',
+    reference: `INV-${fixture.suffix}`,
+    idempotencyKey: `settlement-billed-${fixture.suffix}`,
+  })
+  assert.equal(billedEvent.event_type, 'billed')
+
+  const disputedEvent = await insertSettlementEvent({
+    eventType: 'disputed',
+    reason: 'Customer disputed the carrier accessorial',
+    reference: `DSP-${fixture.suffix}`,
+    idempotencyKey: `settlement-disputed-${fixture.suffix}`,
+  })
+  assert.equal(disputedEvent.event_type, 'disputed')
+
+  const resolvedEvent = await insertSettlementEvent({
+    eventType: 'resolved',
+    reason: 'Carrier statement evidence resolved the dispute',
+    reference: `DSP-${fixture.suffix}`,
+    idempotencyKey: `settlement-resolved-${fixture.suffix}`,
+  })
+  assert.equal(resolvedEvent.event_type, 'resolved')
+
+  const paidEvent = await insertSettlementEvent({
+    eventType: 'paid',
+    reason: 'Payment confirmed against remittance evidence',
+    reference: `PAY-${fixture.suffix}`,
+    idempotencyKey: `settlement-paid-${fixture.suffix}`,
+  })
+  assert.equal(paidEvent.event_type, 'paid')
+
+  await expectRejected(
+    () => insertSettlementEvent({
+      eventType: 'reversed',
+      reason: 'Attempt to reverse a completed payment',
+      reference: `REV-${fixture.suffix}`,
+      idempotencyKey: `settlement-reversed-after-paid-${fixture.suffix}`,
+    }),
+    /transition from paid to reversed is not allowed/,
+    'Paid settlements require a new compensating entry instead of history mutation',
+  )
+
+  const currentSettlementStatus = await pool.query(
+    `SELECT current_status, latest_event_global_id, latest_event_details
+     FROM operations_settlement_current_status
+     WHERE network_id = $1
+       AND settlement_entry_id = $2`,
+    [fixture.network.id, settlement.id],
+  )
+  assert.equal(currentSettlementStatus.rowCount, 1)
+  assert.equal(currentSettlementStatus.rows[0].current_status, 'paid')
+  assert.equal(
+    currentSettlementStatus.rows[0].latest_event_global_id,
+    paidEvent.global_id,
+  )
+  assert.equal(
+    currentSettlementStatus.rows[0].latest_event_details.reference,
+    `PAY-${fixture.suffix}`,
+  )
+
+  await expectRejected(
+    () => pool.query(
+      `UPDATE operations_settlement_events
+       SET details = '{"reason":"mutated"}'::jsonb
+       WHERE id = $1`,
+      [approvedEvent.id],
+    ),
+    /append-only/,
+    'Settlement lifecycle evidence must be immutable',
+  )
+  await expectRejected(
+    () => pool.query(
+      `DELETE FROM operations_settlement_events
+       WHERE id = $1`,
+      [approvedEvent.id],
+    ),
+    /append-only/,
+    'Settlement lifecycle evidence cannot be deleted',
+  )
 
   const financialBasis = await pool.query(
     `SELECT

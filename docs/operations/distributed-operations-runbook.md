@@ -13,15 +13,16 @@ app_visible: false
 
 ## Status And Scope
 
-This runbook governs the target distributed order, inventory, warehouse, carrier, printing, shipment, and 3PL billing module. The development environment has a Postgres-backed order workbench, explicit warehouse-release, bulk all-ready pick-confirmation, and pack-verification commands for eligible non-archived orders, a shared product/default-package import workflow, an audited exception queue, organization-scoped activation, direct carrier credential administration, UPS and FedEx sandbox rating against a fixed synthetic fixture, append-only redacted rate evidence, command-receipt health, and disposable PostgreSQL acceptance. Deterministic mock flows are automated-test evidence only and cannot be launched from the hosted workbench. This runbook remains `draft` until the module has complete reconciliation and adapter health, tested production adapters, integration/warehouse activation subscopes, and on-call ownership. Current general environment, backup, promotion, and restore procedures remain authoritative:
+This runbook governs the target distributed order, inventory, warehouse, carrier, printing, shipment, and 3PL billing module. The development environment has a Postgres-backed order workbench, explicit warehouse-release, bulk all-ready pick-confirmation, pack-verification, sandbox-label-create, and sandbox-label-void commands for eligible non-archived orders, a shared product/default-package import workflow, an audited exception queue, organization-scoped activation, direct carrier credential administration, UPS and FedEx sandbox rating and label execution against a fixed synthetic fixture, append-only redacted provider evidence, durable print delivery, a working-tree packing-slip/artifact and shipment-completion evidence contract, horizontally scrollable mobile Operations subpanel navigation, command-receipt health, and disposable PostgreSQL acceptance. Deterministic mock flows are automated-test evidence only and cannot be launched from the hosted workbench. This runbook remains `draft` until the module has a hosted production shipment-confirmation command, complete reconciliation and adapter health, tested production adapters, integration/warehouse activation subscopes, and on-call ownership. Current general environment, backup, promotion, and restore procedures remain authoritative:
 
 - [ClawPilot Environments and Deployment](clawpilot-environments.md)
 - [Railway Postgres Backups](railway-postgres-backups.md)
 - [Agent Security and Integration Isolation](agent-security-and-isolation.md)
 
-Migrations `0081` through `0092` are bounded development evidence only. Migrations `0089` and `0090` establish delegated rate paths, multi-account carrier billing, GL Coding, reconciliation, and settlement foundations. Migration `0091` adds capability-aware printer profiles and routing defaults; it does not enroll or deliver work to a local print agent. Migration `0092` hardens carrier-account, charge, match, assignment, GL-run, reconciliation, and settlement provenance. Do not use this document as evidence that an operations worker, production provider integration, checkout callback, enrolled print agent, provider-specific bill importer, accounting export, or live warehouse workflow is deployed. Migration `0088` archives legacy mock orders, releases their reservations, hides them from active workbench projections, disables mock integration/facility records, and retains immutable evidence rather than deleting it.
+Operations migrations `0081` through `0094`, `0097`, `0098`, and working-tree `0099` are bounded development evidence only. Migrations `0089` and `0090` establish delegated rate paths, multi-account carrier billing, GL Coding, reconciliation, and settlement foundations. Migration `0091` adds capability-aware printer profiles and routing defaults. Migration `0092` hardens carrier-account, charge, match, assignment, GL-run, reconciliation, and settlement provenance. Migration `0093` adds direct checksum-bound carrier CSV import and immutable financial review evidence. Migration `0094` adds enrolled local print agents, leased delivery attempts, fallback routing, and controlled reprints. Migration `0097` enforces append-only settlement transitions and current-status projections. Migration `0098` adds immutable carrier-label attempts, one-active-label enforcement, exact carrier-account evidence, and sandbox create/void finalization. Migration `0099` adds immutable packing-slip payloads, append-only tracking observations, and durable commerce-fulfillment export state. It does not by itself expose or authorize production shipment confirmation. Do not use this document as evidence that a production commerce or carrier adapter, checkout callback, accounting export, invoice/AR workflow, payment adapter, or live warehouse worker is deployed. Migration `0088` archives legacy mock orders, releases their reservations, hides them from active workbench projections, disables mock integration/facility records, and retains immutable evidence rather than deleting it.
 
 Operator procedures for printer configuration, multi-account carrier bills, GL Coding, and the Triangle/Square/Circle settlement model are in [Printing, Carrier Billing, And GL Coding](printing-carrier-billing-and-gl-coding.md).
+Enrollment, claim fencing, retry, fallback, and reprint procedures are in [Local Print Agent](local-print-agent.md).
 
 ## Direct Carrier Credential Procedure
 
@@ -35,7 +36,7 @@ Operator procedures for printer configuration, multi-account carrier bills, GL C
 8. Rotate by entering the full replacement credential and selecting **Save and verify**. The previous ciphertext is replaced only after the candidate verifies, and the audit log records rotation metadata without a secret.
 9. Use **Disconnect** only after confirming the organization, provider, and environment. Disconnect deletes encrypted credential material and disables the integration metadata; it does not delete immutable historical shipment evidence.
 
-Credential verification is not shipping certification. The only currently authorized provider call is the fixed UPS or FedEx sandbox rate test below. Do not activate production rating, label purchase, void, manifest, pickup, tracking, or any carrier side effect until the corresponding adapter, provider attempts, unknown-outcome reconciliation, and authorized smoke test pass the release gate in the [small parcel architecture](../architecture/small-parcel-carrier-adapters.md).
+Credential verification is not shipping certification. The only currently authorized provider calls are the fixed UPS or FedEx sandbox rate test and the bounded sandbox label create/void procedure below. Do not activate production rating, label purchase, void, manifest, pickup, tracking, or any carrier side effect until the corresponding adapter, provider attempts, unknown-outcome reconciliation, and authorized smoke test pass the release gate in the [small parcel architecture](../architecture/small-parcel-carrier-adapters.md).
 
 ## UPS And FedEx Sandbox Rate Test
 
@@ -45,7 +46,28 @@ Credential verification is not shipping certification. The only currently author
 4. Select **Test sandbox rate** once. The request performs rating only. It cannot create a shipment, label, pickup, manifest, tracking record, carrier charge, or print job.
 5. Record the returned `grq` evidence Global ID and review only normalized service, amount, currency, transit, and delivery values. Do not copy credentials, tokens, account numbers, or raw provider payloads into operating notes.
 6. A failure may be retried only after reviewing its safe error and provider/account status. The append-only evidence preserves each attempt without storing secrets or a full address payload.
-7. Stop after rating. Label and pickup tests are a later gated procedure and must automatically void or cancel every sandbox artifact, reconcile ambiguous outcomes, and retain proof of cancellation.
+7. Stop after rating unless the order is eligible for the separate bounded sandbox label procedure below. Pickup, manifest, tracking mutation, and production actions remain prohibited.
+
+## UPS And FedEx Sandbox Label Create And Void
+
+1. Use only an eligible packed order whose sender, receiver, line, parcel, and selected rate match the fixed John Doe sandbox fixture. The sender is `101 Jegs Place, Delaware, OH 43015`; the receiver is `101 Academy Drive, Buzzards Bay, MA 02532`; the line is `Test Product`; and the parcel is `12 x 10 x 6 in` at `5 lb`.
+2. Open the order in **Operations > Orders** and confirm its selected UPS or FedEx rate, the intended active sandbox carrier account, the current order version, and the target warehouse printer. Production credentials and an account from another organization are rejected.
+3. Select **Create sandbox label**, enter a specific reason, and submit once. The command first commits an immutable `prepared` attempt, performs provider I/O outside the database transaction, then finalizes the attempt and label exactly once. One package may have only one active label.
+4. On success, confirm the active label, tracking reference, successful `gla` attempt, `label.created` domain event, audit event, and durable shipping-label print job. The label is committed before print routing. A print-routing warning therefore does not mean the carrier purchase failed. This result does not create a shipment, consume inventory, append tracking evidence, queue commerce fulfillment, or render a packing slip.
+5. If the label exists but the print job is missing, replay the original command with the original idempotency key. ClawPilot reuses the committed label and attempts the same idempotent print enqueue without calling the carrier again. Never create a new label merely to recover printing.
+6. Select **Void** immediately after inspection, enter a specific reason, and submit once. The void must use the exact persisted integration and carrier account used for purchase. Confirm the label is `voided`, the package returns to `packed`, and immutable `label.voided` and audit evidence exist.
+7. If a create or void attempt is `prepared` or `unknown`, stop. Do not retry with a new key. Reconcile the provider result and finalize that attempt before any later provider command.
+8. Keep the resulting tracking number, provider reference, and label payload out of tickets and chat. Retain them only in the bounded operational evidence and document/print path.
+
+## Shipment Confirmation Safety And Durable Evidence
+
+1. Treat sandbox rating and sandbox label execution as pre-dispatch proof only. No sandbox action is authorized to create an `operations_shipments` row, mark a package or order shipped, consume or release a reservation, append `operations_tracking_observations`, create `operations_commerce_fulfillment_exports`, or render a packing slip.
+2. The deterministic mock proof is separate. Its automated-test-only transaction creates a mock shipment, consumes its mock reservation, and records a mock commerce result. Hosted users cannot launch that path, and its result is not evidence that the production completion bundle or a provider adapter is certified.
+3. There is no general hosted production shipment-confirmation command in the current slice. Do not simulate one with direct SQL, by changing a sandbox label environment, or by manually consuming inventory.
+4. Migration `0099` defines the required production evidence bundle. When the command is wired, one tenant-scoped transaction must create the shipment and inventory-consumption facts, immutable packing-slip metadata and PDF bytes, the first append-only `confirmed` tracking observation, and a `queued` commerce-fulfillment export intent. Carrier and commerce network calls occur only after that transaction commits.
+5. Packing slips use the versioned `packing-slip-letter-v1` renderer and retain SHA-256, byte length, safe filename, MIME type, template version, and immutable render snapshot. Authorized users retrieve raw PDF bytes through the active-organization artifact route. Local print-agent JSON claims preserve shipping labels as `utf8` and carry binary packing slips as `base64`.
+6. `operations_shipments` remains the current shipment projection. `operations_tracking_observations` is append-only evidence with `confirmed`, `in_transit`, `out_for_delivery`, `delivered`, `exception`, and `voided` statuses; the current slice does not yet include carrier webhook or polling ingestion.
+7. Commerce exports start as `queued`, may move through `processing`, and record `succeeded`, `failed`, or `unsupported`. A failed export may re-enter the retry lifecycle through an approved command; `succeeded` and `unsupported` are immutable terminal outcomes. Shipment identity and payload are immutable, and provider I/O belongs to a post-commit worker. The dispatcher, provider adapter, replay/reconciliation command, and queue health are not yet implemented.
 
 ## Product And Package Catalog
 
@@ -70,9 +92,16 @@ Only authorized pipeline editors can import or change the catalog. Viewers can i
 7. Use **Confirm all picks**, record a specific operational reason, and submit once. The client keeps one idempotency key for safe retries. The command rechecks the exact order version, released plan and wave, all ready picks, active organization, inventory positions, and blocking exceptions before changing state.
 8. On success, confirm the order is `picking`, the wave is `completed`, every pick task is `picked`, and the active reservation remains intact for the later pack/ship consumption command.
 9. Verify the package details and use **Verify pack** only after every required pick is complete. Record a specific operational reason and submit once. The command rechecks the exact order version, selected plan, wave, picks, package state, active organization, blocking exceptions, and command receipt before changing state.
-10. On success, confirm the order and package are `packed`, one pack-fee billable event exists for each applicable directive, the active reservation remains retained for shipment consumption, and no shipment, label, or print job was created.
-11. If the screen reports a stale version, reload and re-review the current evidence before issuing a new command. Never change the idempotency key merely to bypass an uncertain result.
-12. Current operator capability stops after deterministic pack verification. Scanner claims, per-task scans, short-pick handling, label purchase, printing, and shipment confirmation remain unavailable until their explicit commands and reconciliation controls pass Phase 4 acceptance.
+10. On success, confirm the order and package are `packed`, one pack-fee billable event exists for each applicable directive, the active reservation remains retained for shipment consumption, and no shipment, label, or print job was created by pack verification itself.
+11. If the order matches the fixed sandbox fixture, follow the separate sandbox label create-and-void procedure. Label execution is not available for an arbitrary address, product, package, production credential, or production order.
+12. If the screen reports a stale version, reload and re-review the current evidence before issuing a new command. Never change the idempotency key merely to bypass an uncertain result.
+13. Current operator capability stops after bounded sandbox label create/void and label print routing. Scanner claims, per-task scans, short-pick handling, automatic packing-slip creation during shipment confirmation, shipment confirmation itself, pickup scheduling, manifests, tracking mutation, and production carrier actions remain unavailable until their explicit commands and reconciliation controls pass Phase 4 acceptance.
+
+## Mobile Operations Subpanel Navigation
+
+1. On a narrow screen, use the horizontally scrollable tab row beneath the Operations header to reach **Orders**, **Exceptions**, **Billing & GL**, and **Printing**. Swipe the tab strip or use its labeled left/right controls; the controls disable at the corresponding edge.
+2. Keep the active subpanel visible before acting. Changing tabs clears the Orders/Exceptions search and closes open detail drawers so a command cannot be issued against a hidden prior context.
+3. The tab strip owns horizontal movement and each selected subpanel owns its normal content scrolling. Do not interpret a clipped off-screen tab as a missing capability, and do not rely on page-level horizontal scrolling.
 
 ## Exception Queue Procedure
 
@@ -95,6 +124,7 @@ Exception updates require operations-management permission. They never alter imm
 7. Keep credentials, full addresses, customs data, raw labels, and unrestricted provider payloads out of tickets, chat, logs, audit payloads, and this repository.
 8. Database restore is a last-resort coordinated recovery. Application defects use feature containment and code rollback; isolated data defects use compensating commands or later migrations.
 9. Require each customer organization to configure and verify separate credentials for every enabled carrier and sandbox or production environment. Never substitute another organization's or a platform-wide account when credentials are absent, disabled, unverified, or environment-mismatched.
+10. Never use a sandbox label, sandbox tracking number, successful print acknowledgement, or browser-visible package state as shipment confirmation or authority to consume inventory.
 
 ## Required Operating Roles
 
@@ -131,7 +161,7 @@ The existing endpoints remain required:
 - `/api/persistence/status`: Postgres driver, reachability, and non-empty environment database fingerprint.
 - `/api/health`: migration, worker, provider, queue, and dependency health.
 
-Current `/api/health` reports the operations migration state through `0092`, command failures, stale processing, and active/shadow organization counts. Before production activation it must additionally report:
+Current `/api/health` verifies the required bounded operations migrations through `0098`, command failures, stale processing, and active/shadow organization counts. Working-tree migration `0099` is not yet part of the required health or predeploy migration contract. Before production activation health must additionally report:
 
 - foundation and corrective migration applied/checksum state;
 - activation state by cohort without exposing credentials;
@@ -317,7 +347,47 @@ WHERE label.organization_id = :organization_id
 ORDER BY label.created_at DESC;
 ```
 
-Use provider-attempt and reconciliation tables, once implemented, to identify `unknown` purchases. Label rows alone cannot prove that a timed-out provider request did not succeed remotely.
+Use `operations_label_attempts` to identify `prepared` or `unknown` purchases and voids. Label rows alone cannot prove that a timed-out provider request did not succeed remotely.
+
+### Shipment Completion Evidence
+
+Do not select `payload.payload` during routine diagnosis. The following checks identities, states, and byte counts without returning customer-facing document bytes:
+
+```sql
+SELECT shipment.global_id AS shipment_global_id,
+       shipment.status AS shipment_status,
+       artifact.global_id AS packing_slip_global_id,
+       artifact.content_sha256,
+       octet_length(payload.payload) AS packing_slip_bytes,
+       tracking.global_id AS first_tracking_global_id,
+       tracking.status AS first_tracking_status,
+       export.global_id AS commerce_export_global_id,
+       export.state AS commerce_export_state,
+       export.attempts AS commerce_export_attempts
+FROM operations_shipments shipment
+LEFT JOIN operations_print_artifacts artifact
+  ON artifact.organization_id = shipment.organization_id
+ AND artifact.source_shipment_id = shipment.id
+ AND artifact.document_type = 'packing_slip'
+LEFT JOIN operations_print_artifact_payloads payload
+  ON payload.organization_id = artifact.organization_id
+ AND payload.artifact_id = artifact.id
+LEFT JOIN LATERAL (
+  SELECT observation.global_id, observation.status
+  FROM operations_tracking_observations observation
+  WHERE observation.organization_id = shipment.organization_id
+    AND observation.shipment_id = shipment.id
+  ORDER BY observation.observed_at, observation.id
+  LIMIT 1
+) tracking ON true
+LEFT JOIN operations_commerce_fulfillment_exports export
+  ON export.organization_id = shipment.organization_id
+ AND export.shipment_id = shipment.id
+WHERE shipment.organization_id = :organization_id
+ORDER BY shipment.shipped_at DESC NULLS LAST, shipment.global_id;
+```
+
+The `0099` completion columns are expected to be empty for sandbox labels and the legacy deterministic mock path. Until the production confirmation writer is implemented, do not repair those absences by inserting rows manually.
 
 ### Unbilled Activity
 
@@ -480,7 +550,7 @@ Provider behavior, capability, credential, timeout, response, and certification 
 
 **Diagnose**
 
-- Compare shipment, package, active label, manifest/pickup, carrier tracking observations, commerce fulfillment ID, and outbox acknowledgements.
+- Compare shipment, package, active label, manifest/pickup, append-only `gto` tracking observations, `gfe` commerce-export state, packing-slip artifact integrity, and outbox acknowledgements.
 
 **Recover**
 
