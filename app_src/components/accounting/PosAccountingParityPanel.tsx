@@ -171,6 +171,8 @@ type ExpectedBase = {
   providerTransactionId: string | null
   documentNumber: string | null
   memo: string | null
+  sourceTipsCents?: number | null
+  scheduledForFuture?: boolean
   draft: {
     id: string
     restaurantName: string | null
@@ -190,6 +192,8 @@ type ExpectedBase = {
     quickBooksSalesReceiptId: string | null
     quickBooksJournalEntryId: string | null
     postingBatch: PostingBatch | null
+    sourceTipsCents?: number | null
+    scheduledForFuture?: boolean
   }
 }
 
@@ -222,6 +226,24 @@ type HistoricalPair = {
   journalBalance: { status: CheckStatus; deltaCents: number }
 }
 
+type HistoricalPostingBundle = {
+  basis: 'business_date_and_marker'
+  businessDate: string
+  marker: string
+  salesReceipts: EvidenceReference[]
+  journalEntries: EvidenceReference[]
+  receiptArithmetic: Array<{ status: CheckStatus; deltaCents: number | null }>
+  journalBalance: Array<{ status: CheckStatus; deltaCents: number }>
+  receiptTotalCents: number | null
+}
+
+type HistoricalJournalOnlyCapture = {
+  basis: 'payment_exceptions_account'
+  businessDate: string
+  journalEntry: EvidenceReference
+  journalBalance: { status: CheckStatus; deltaCents: number }
+}
+
 type EvidenceGroup = {
   businessDate: string
   documentNumber: string | null
@@ -241,18 +263,48 @@ type DraftParityRow = {
   expected: ExpectedEvidence
   actual: QuickBooksEvidence | null
   match: {
-    status: 'matched' | 'ambiguous' | 'missing_quickbooks'
+    status: 'matched' | 'ambiguous' | 'missing_quickbooks' | 'scheduled'
     basis: string | null
     candidateTransactionIds: string[]
   }
   comparison: ReceiptComparison | JournalComparison | null
 }
 
+type PreorderLifecycle = {
+  lifecycleId?: string
+  paymentDate?: string
+  paymentBusinessDate?: string
+  fulfillmentDate?: string
+  fulfillmentBusinessDate?: string
+  amountCents?: number
+  totalCents?: number
+  tipCents?: number
+  tipsCents?: number
+  checkCount?: number
+  orderCount?: number
+  basis?: string
+  status?: string
+  orderKey?: string
+  checkKey?: string
+  paymentKey?: string
+  locationName?: string | null
+  restaurantName?: string | null
+  captureDraftId?: string
+  releaseDraftId?: string
+}
+
 type ParityReport = {
+  evidenceLastSyncedAt?: string | null
+  evidenceFreshness?: {
+    draftsNewerThanEvidence: number
+    evidenceMayBeStale: boolean
+  }
   historicalBaseline: {
     summary: {
       cachedTransactions: number
       pairCount: number
+      postingBundleCount?: number
+      journalOnlyCaptureCount?: number
       exactMarkerPairs: number
       dateFallbackPairs: number
       unmatchedGroups: number
@@ -263,6 +315,8 @@ type ParityReport = {
       journalBalance: Record<'match' | 'variance' | 'insufficientEvidence', number>
     }
     pairs: HistoricalPair[]
+    postingBundles?: HistoricalPostingBundle[]
+    journalOnlyCaptures?: HistoricalJournalOnlyCapture[]
     unmatchedGroups: EvidenceGroup[]
     ambiguousGroups: AmbiguousGroup[]
   }
@@ -273,11 +327,13 @@ type ParityReport = {
     cachedTransactions: number
     matched: number
     ambiguous: number
+    scheduled?: number
     missingQuickBooks: number
     unmatchedQuickBooks: number
     comparisonsMatched: number
     comparisonsWithVariance: number
     comparisonsWithInsufficientEvidence: number
+    draftsNewerThanEvidence?: number
   }
   pagination: {
     page: number
@@ -291,6 +347,8 @@ type ParityReport = {
     pageSize: number
     totalPages: number
     pairPages: number
+    postingBundlePages?: number
+    journalOnlyCapturePages?: number
     unmatchedPages: number
     ambiguousPages: number
   }
@@ -298,11 +356,15 @@ type ParityReport = {
     configured: boolean
     connectionStatus: string | null
     lastCatalogSyncedAt: string | null
+    lastPosEvidenceSyncedAt?: string | null
+    lastEvidenceSyncedAt?: string | null
     syncStatus: string | null
     syncCompletedAt: string | null
     salesReceiptCount: number
     journalEntryCount: number
+    draftsNewerThanEvidence?: number
   }
+  preorderLifecycles?: PreorderLifecycle[]
   warnings: string[]
 }
 
@@ -334,6 +396,17 @@ type PostingActionResponse = {
     businessDate?: string
     salesReceiptId?: string
     journalEntryId?: string
+  }
+}
+
+type EvidenceRefreshResponse = {
+  ok?: boolean
+  error?: string
+  refreshed?: {
+    fromBusinessDate: string
+    toBusinessDate: string
+    transactionCount: number
+    refreshedAt: string
   }
 }
 
@@ -382,6 +455,7 @@ const sectionSx = {
 
 function statusColor(status: string): ChipColor {
   if (status === 'match' || status === 'matched') return 'success'
+  if (status === 'scheduled') return 'info'
   if (status === 'variance' || status === 'missing_quickbooks' || status === 'unmatched') return 'error'
   if (status === 'ambiguous' || status === 'insufficient_evidence') return 'warning'
   return 'default'
@@ -442,6 +516,79 @@ function isJournalOnlyDraft(rows: DraftParityRow[], draftId: string) {
   const draftRows = rows.filter((row) => row.expected.draft.id === draftId)
   return draftRows.some((row) => row.expected.entityType === 'JournalEntry')
     && !draftRows.some((row) => row.expected.entityType === 'SalesReceipt')
+}
+
+function isScheduledRow(row: DraftParityRow) {
+  return row.match.status === 'scheduled'
+    || Boolean(row.expected.scheduledForFuture)
+    || Boolean(row.expected.draft.scheduledForFuture)
+}
+
+function rowMatchLabel(row: DraftParityRow) {
+  return isScheduledRow(row) ? 'scheduled for fulfillment' : statusLabel(row.match.status)
+}
+
+function rowComparisonLabel(row: DraftParityRow) {
+  return isScheduledRow(row)
+    ? 'not due yet'
+    : statusLabel(row.comparison?.status || 'insufficient_evidence')
+}
+
+function sourceTipsCents(expected: ExpectedEvidence) {
+  return expected.sourceTipsCents ?? expected.draft.sourceTipsCents ?? null
+}
+
+function inclusiveDateRangeDays(from: string, to: string) {
+  const parse = (value: string) => {
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value)
+    if (!match) return null
+    return Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]))
+  }
+  const fromMillis = parse(from)
+  const toMillis = parse(to)
+  if (fromMillis === null || toMillis === null || toMillis < fromMillis) return null
+  return Math.floor((toMillis - fromMillis) / 86_400_000) + 1
+}
+
+function groupPreorderLifecycles(lifecycles: PreorderLifecycle[]) {
+  const groups = new Map<string, {
+    paymentDate: string
+    fulfillmentDate: string
+    locationName: string
+    totalCents: number
+    tipsCents: number
+    checkKeys: Set<string>
+    fallbackCheckCount: number
+    statuses: Set<string>
+  }>()
+  for (const lifecycle of lifecycles) {
+    const paymentDate = lifecycle.paymentBusinessDate || lifecycle.paymentDate || 'Unknown payment date'
+    const fulfillmentDate = lifecycle.fulfillmentBusinessDate || lifecycle.fulfillmentDate || 'Unknown fulfillment date'
+    const locationName = lifecycle.locationName || lifecycle.restaurantName || 'POS location'
+    const key = `${paymentDate}\u0000${fulfillmentDate}\u0000${locationName}`
+    const group = groups.get(key) || {
+      paymentDate,
+      fulfillmentDate,
+      locationName,
+      totalCents: 0,
+      tipsCents: 0,
+      checkKeys: new Set<string>(),
+      fallbackCheckCount: 0,
+      statuses: new Set<string>(),
+    }
+    group.totalCents += lifecycle.totalCents ?? lifecycle.amountCents ?? 0
+    group.tipsCents += lifecycle.tipCents ?? lifecycle.tipsCents ?? 0
+    if (lifecycle.checkKey) group.checkKeys.add(lifecycle.checkKey)
+    else group.fallbackCheckCount += lifecycle.checkCount ?? lifecycle.orderCount ?? 1
+    if (lifecycle.status || lifecycle.basis) group.statuses.add(lifecycle.status || lifecycle.basis || '')
+    groups.set(key, group)
+  }
+  return [...groups.values()].map((group) => ({
+    ...group,
+    checkCount: group.checkKeys.size + group.fallbackCheckCount,
+  })).sort((left, right) =>
+    right.paymentDate.localeCompare(left.paymentDate)
+      || right.fulfillmentDate.localeCompare(left.fulfillmentDate))
 }
 
 function quantityLabel(quantityMillis: number | null | undefined) {
@@ -615,6 +762,7 @@ function ExpectedDocumentDetails({ expected, formatCents }: {
   expected: ExpectedEvidence
   formatCents: (value: number | null | undefined) => string
 }) {
+  const toastTipsCents = sourceTipsCents(expected)
   return (
     <Box component="section">
       <Box display="flex" alignItems="center" justifyContent="space-between" gap={1.5} mb={1.5}>
@@ -633,6 +781,12 @@ function ExpectedDocumentDetails({ expected, formatCents }: {
         <DetailField label="Draft status" value={statusLabel(expected.draft.status)} />
         <Box gridColumn={{ sm: '1 / -1' }}><DetailField label="Memo" value={expected.memo} wrap /></Box>
       </Box>
+      {typeof toastTipsCents === 'number' ? (
+        <Alert severity="info" variant="outlined" sx={{ mt: 2 }}>
+          Toast reports {formatCents(toastTipsCents)} in tips for this source activity. Tips belong in the
+          payment Journal Entry and are intentionally excluded from the Sales Receipt total.
+        </Alert>
+      ) : null}
       {expected.entityType === 'SalesReceipt' ? (
         <>
           <Box display="grid" gridTemplateColumns={{ xs: 'repeat(2, minmax(0, 1fr))', sm: 'repeat(3, minmax(0, 1fr))' }} gap={2} py={2}>
@@ -668,6 +822,7 @@ function PostingControls({
   pending,
   externalEvidence,
   journalOnly,
+  scheduled,
   onPrepare,
   onApprove,
   onRecordExternal,
@@ -677,6 +832,7 @@ function PostingControls({
   pending: boolean
   externalEvidence: ReturnType<typeof externalPostingEvidence>
   journalOnly: boolean
+  scheduled: boolean
   onPrepare: (draftId: string, journalOnly: boolean) => void
   onApprove: (batch: PostingBatch, journalOnly: boolean) => void
   onRecordExternal: (input: ReturnType<typeof externalPostingEvidence>) => void
@@ -691,6 +847,7 @@ function PostingControls({
     && !batch
     && (draft.status === 'needs_review' || draft.status === 'failed')
     && !externallyPosted
+    && !scheduled
   const canApprove = capabilities.canApprove
     && Boolean(batch)
     && ['pending_approval', 'failed', 'partial_failed'].includes(batch?.status || '')
@@ -698,6 +855,7 @@ function PostingControls({
   const canRecordExternal = capabilities.canApprove
     && (draft.status === 'needs_review' || draft.status === 'failed')
     && !externallyPosted
+    && !scheduled
   const externalOption = canRecordExternal ? (
     <Stack spacing={1}>
       <Alert severity={externalEvidence ? 'info' : 'warning'} variant="outlined">
@@ -735,7 +893,12 @@ function PostingControls({
         />
       </Box>
 
-      {externallyPosted ? (
+      {scheduled ? (
+        <Alert severity="info" variant="outlined">
+          This posting is scheduled for its future fulfillment date. No QuickBooks document is expected yet,
+          and external acknowledgment stays unavailable until the posting becomes due.
+        </Alert>
+      ) : externallyPosted ? (
         <Stack spacing={1.5}>
           <Alert severity="success">
             This date was posted by {externalProvider}. ClawPilot retained the exact QuickBooks evidence and will not post it again.
@@ -946,6 +1109,7 @@ export default function PosAccountingParityPanel() {
   })
   const [loading, setLoading] = useState(true)
   const [actionPending, setActionPending] = useState(false)
+  const [syncingEvidence, setSyncingEvidence] = useState(false)
   const [actionNotice, setActionNotice] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [page, setPage] = useState(1)
@@ -1087,6 +1251,7 @@ export default function PosAccountingParityPanel() {
     setExternalReviewNote('')
     setExternalSalesReceiptId(evidence?.salesReceiptId || '')
     setExternalJournalEntryId(evidence?.journalEntryId || '')
+    setError(null)
     setExternalDialogTarget({
       mode: 'draft',
       draftId: selection.row.expected.draft.id,
@@ -1102,14 +1267,18 @@ export default function PosAccountingParityPanel() {
     setExternalReviewNote('')
     setExternalSalesReceiptId('')
     setExternalJournalEntryId('')
+    setError(null)
     setExternalDialogTarget({ mode: 'range' })
   }
   const closeExternalDialog = () => {
     if (actionPending) return
+    setError(null)
     setExternalDialogTarget(null)
   }
   const baseline = report?.historicalBaseline
   const visiblePairs = baseline?.pairs || []
+  const visiblePostingBundles = baseline?.postingBundles || []
+  const visibleJournalOnlyCaptures = baseline?.journalOnlyCaptures || []
   const visibleUnmatched = baseline?.unmatchedGroups || []
   const visibleAmbiguous = baseline?.ambiguousGroups || []
   const dateRangeInvalid = Boolean(fromInput && toInput && fromInput > toInput)
@@ -1133,6 +1302,31 @@ export default function PosAccountingParityPanel() {
   const selectedJournalOnly = selection?.kind === 'current' && report
     ? isJournalOnlyDraft(report.rows, selection.row.expected.draft.id)
     : false
+  const currentDraftDates = [...new Set(
+    (report?.rows || []).map((row) => row.expected.businessDate),
+  )].sort()
+  const visibleDates = currentDraftDates.length
+    ? currentDraftDates
+    : [...(report?.pagination.dates || [])].sort()
+  const evidenceFrom = from || visibleDates[0] || ''
+  const evidenceTo = to || visibleDates.at(-1) || ''
+  const evidenceRangeDays = evidenceFrom && evidenceTo
+    ? inclusiveDateRangeDays(evidenceFrom, evidenceTo)
+    : null
+  const evidenceRange = evidenceRangeDays !== null && evidenceRangeDays <= 32
+    ? { from: evidenceFrom, to: evidenceTo }
+    : null
+  const evidenceLastSyncedAt = report && Object.hasOwn(report, 'evidenceLastSyncedAt')
+    ? report.evidenceLastSyncedAt || null
+    : report?.cache.lastEvidenceSyncedAt
+      || report?.cache.lastPosEvidenceSyncedAt
+      || report?.cache.syncCompletedAt
+      || null
+  const draftsNewerThanEvidence = report?.evidenceFreshness?.draftsNewerThanEvidence
+    ?? report?.cache.draftsNewerThanEvidence
+    ?? report?.summary.draftsNewerThanEvidence
+    ?? 0
+  const visiblePreorderLifecycles = groupPreorderLifecycles(report?.preorderLifecycles || [])
 
   const applyRange = () => {
     if (dateRangeInvalid) return
@@ -1176,6 +1370,39 @@ export default function PosAccountingParityPanel() {
       return null
     } finally {
       setActionPending(false)
+    }
+  }
+
+  const syncQuickBooksEvidence = async () => {
+    if (!evidenceRange) return
+    setSyncingEvidence(true)
+    setActionNotice(null)
+    setError(null)
+    try {
+      const response = await fetch('/api/accounting/quickbooks', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        cache: 'no-store',
+        body: JSON.stringify({
+          action: 'refresh-pos-evidence',
+          fromBusinessDate: evidenceRange.from,
+          toBusinessDate: evidenceRange.to,
+        }),
+      })
+      const payload = await response.json() as EvidenceRefreshResponse
+      if (!response.ok || !payload.ok || !payload.refreshed) {
+        throw new Error(payload.error || 'QuickBooks posting evidence could not be refreshed')
+      }
+      setActionNotice(
+        `QuickBooks evidence rechecked for ${payload.refreshed.fromBusinessDate} through ${payload.refreshed.toBusinessDate}; `
+        + `${payload.refreshed.transactionCount} posting record${payload.refreshed.transactionCount === 1 ? '' : 's'} loaded.`,
+      )
+      setLoading(true)
+      setRefreshToken((value) => value + 1)
+    } catch (syncError) {
+      setError((syncError as Error).message)
+    } finally {
+      setSyncingEvidence(false)
     }
   }
 
@@ -1274,11 +1501,11 @@ export default function PosAccountingParityPanel() {
             Toast posting history and current ClawPilot accounting drafts
           </Typography>
         </Box>
-        <Tooltip title="Refresh parity evidence">
+        <Tooltip title="Reload the saved comparison without contacting QuickBooks">
           <span>
             <IconButton
-              aria-label="Refresh parity evidence"
-              disabled={loading}
+              aria-label="Reload saved parity comparison"
+              disabled={loading || syncingEvidence}
               onClick={() => {
                 setLoading(true)
                 setError(null)
@@ -1316,6 +1543,24 @@ export default function PosAccountingParityPanel() {
         <Button variant="contained" disabled={dateRangeInvalid || loading} onClick={applyRange}>Apply</Button>
         {(from || to) ? <Button variant="text" onClick={clearRange}>Clear</Button> : null}
         {capabilities.canApprove ? (
+          <Tooltip title={evidenceRange
+            ? `Read QuickBooks posting evidence for ${evidenceRange.from} through ${evidenceRange.to}, then rebuild this comparison`
+            : evidenceRangeDays !== null && evidenceRangeDays > 32
+              ? 'Apply a date range of 32 days or less before syncing QuickBooks evidence'
+              : 'Load a visible date range before syncing QuickBooks evidence'}>
+            <span>
+              <Button
+                variant="outlined"
+                disabled={!evidenceRange || dateRangeInvalid || loading || syncingEvidence || actionPending}
+                onClick={syncQuickBooksEvidence}
+                startIcon={syncingEvidence ? <CircularProgress size={16} /> : <RefreshRounded />}
+              >
+                Sync QuickBooks and recheck
+              </Button>
+            </span>
+          </Tooltip>
+        ) : null}
+        {capabilities.canApprove ? (
           <Tooltip title={from && to ? 'Acknowledge exact external posting matches without writing to QuickBooks' : 'Apply both dates before acknowledging external postings'}>
             <span>
               <Button
@@ -1330,8 +1575,43 @@ export default function PosAccountingParityPanel() {
         ) : null}
       </Box>
 
-      {error ? <Alert severity="error">{error}</Alert> : null}
+      {error && !externalDialogTarget ? <Alert severity="error">{error}</Alert> : null}
       {actionNotice ? <Alert severity="success" onClose={() => setActionNotice(null)}>{actionNotice}</Alert> : null}
+      {report ? (
+        <Box
+          sx={sectionSx}
+          px={{ xs: 1.5, sm: 2 }}
+          py={1.25}
+          display="flex"
+          alignItems={{ xs: 'flex-start', sm: 'center' }}
+          justifyContent="space-between"
+          flexDirection={{ xs: 'column', sm: 'row' }}
+          gap={1}
+        >
+          <Box>
+            <Typography variant="body2" fontWeight={650}>QuickBooks posting evidence</Typography>
+            <Typography variant="caption" color="text.secondary">
+              {evidenceLastSyncedAt
+                ? `Last checked ${formatUserDateTime(evidenceLastSyncedAt, dateTimeSettings, { dateStyle: 'medium', timeStyle: 'short' })}`
+                : 'Not checked yet for this connection'}
+            </Typography>
+          </Box>
+          <Chip
+            size="small"
+            variant="outlined"
+            color={draftsNewerThanEvidence > 0 ? 'warning' : evidenceLastSyncedAt ? 'success' : 'default'}
+            label={draftsNewerThanEvidence > 0
+              ? `${draftsNewerThanEvidence} draft${draftsNewerThanEvidence === 1 ? '' : 's'} newer than evidence`
+              : evidenceLastSyncedAt ? 'Evidence current for loaded drafts' : 'Sync required'}
+          />
+        </Box>
+      ) : null}
+      {draftsNewerThanEvidence > 0 ? (
+        <Alert severity="warning" variant="outlined">
+          ClawPilot drafts changed after the last QuickBooks evidence check. Use Sync QuickBooks and recheck
+          before acknowledging an external posting so recently created records are not mistaken for missing evidence.
+        </Alert>
+      ) : null}
       {report?.warnings.map((warning) => <Alert key={warning} severity="warning" variant="outlined">{warning}</Alert>)}
 
       {!report && loading ? (
@@ -1350,6 +1630,8 @@ export default function PosAccountingParityPanel() {
             <Box display="grid" gridTemplateColumns={{ xs: 'repeat(2, minmax(0, 1fr))', sm: 'repeat(4, minmax(0, 1fr))', lg: 'repeat(7, minmax(0, 1fr))' }} gap={2} px={{ xs: 1.5, sm: 2 }} py={2}>
               <Metric label="Records" value={baseline.summary.cachedTransactions} />
               <Metric label="Paired dates" value={baseline.summary.pairCount} tone="#A8C7FA" />
+              <Metric label="Posting bundles" value={baseline.summary.postingBundleCount || 0} tone="#70D6A7" />
+              <Metric label="Payment captures" value={baseline.summary.journalOnlyCaptureCount || 0} tone="#70D6A7" />
               <Metric label="Exact marker pairs" value={baseline.summary.exactMarkerPairs} tone="#70D6A7" />
               <Metric label="Date fallback" value={baseline.summary.dateFallbackPairs} />
               <Metric label="Unmatched" value={baseline.summary.unmatchedEvidence} tone={baseline.summary.unmatchedEvidence ? '#F2B76D' : '#70D6A7'} />
@@ -1403,6 +1685,110 @@ export default function PosAccountingParityPanel() {
               </Box>
             )) : <Typography color="text.secondary" p={2}>No Toast posting pairs in this period.</Typography>}
           </Box>
+
+          {visiblePostingBundles.length ? (
+            <Box sx={sectionSx}>
+              <SectionHeader
+                title="Recognized multi-document posting bundles"
+                detail={`${baseline.summary.postingBundleCount || visiblePostingBundles.length} valid bundle${(baseline.summary.postingBundleCount || visiblePostingBundles.length) === 1 ? '' : 's'}`}
+              />
+              <Divider />
+              <Typography variant="body2" color="text.secondary" px={{ xs: 1.5, sm: 2 }} py={1.5}>
+                These are valid Toast postings where multiple Sales Receipts share one settlement Journal Entry.
+                They are recognized as one posting bundle and are not exceptions.
+              </Typography>
+              {visiblePostingBundles.map((bundle) => {
+                const receiptStatus = bundle.receiptArithmetic.some((check) => check.status === 'variance')
+                  ? 'variance'
+                  : bundle.receiptArithmetic.some((check) => check.status === 'insufficient_evidence')
+                    ? 'insufficient_evidence'
+                    : 'match'
+                const journalStatus = bundle.journalBalance.some((check) => check.status === 'variance')
+                  ? 'variance'
+                  : bundle.journalBalance.some((check) => check.status === 'insufficient_evidence')
+                    ? 'insufficient_evidence'
+                    : 'match'
+                return (
+                  <Box
+                    key={`${bundle.businessDate}-${bundle.marker}`}
+                    px={{ xs: 0.5, sm: 1 }}
+                    py={1}
+                    borderTop="1px solid rgba(255,255,255,0.06)"
+                  >
+                    <Box px={1} pb={0.75} display="flex" alignItems="center" justifyContent="space-between" gap={2}>
+                      <Box minWidth={0}>
+                        <Typography variant="body2" fontWeight={700}>
+                          {bundle.businessDate} · {bundle.marker}
+                        </Typography>
+                        <Typography variant="caption" color="text.secondary">
+                          {bundle.salesReceipts.length} Sales Receipt{bundle.salesReceipts.length === 1 ? '' : 's'}
+                          {' · '}{bundle.journalEntries.length} Journal Entr{bundle.journalEntries.length === 1 ? 'y' : 'ies'}
+                          {' · '}aggregate receipt total {formatDelta(bundle.receiptTotalCents)}
+                        </Typography>
+                      </Box>
+                      <Chip size="small" color="success" variant="outlined" label="Recognized bundle" />
+                    </Box>
+                    <Box display="grid" gridTemplateColumns={{ xs: '1fr', sm: 'repeat(2, minmax(0, 1fr))' }} gap={0.5}>
+                      {[...bundle.salesReceipts, ...bundle.journalEntries].map((evidence) => (
+                        <EvidenceButton
+                          key={evidence.evidenceId}
+                          evidence={evidence}
+                          status={evidence.entityType === 'SalesReceipt' ? receiptStatus : journalStatus}
+                          onOpen={openHistoricalEvidence}
+                        />
+                      ))}
+                    </Box>
+                    <Box display="flex" gap={0.75} flexWrap="wrap" px={1} pt={0.75}>
+                      <Chip size="small" color={statusColor(receiptStatus)} variant="outlined" label={`Receipt checks: ${statusLabel(receiptStatus)}`} />
+                      <Chip size="small" color={statusColor(journalStatus)} variant="outlined" label={`Journal balance: ${statusLabel(journalStatus)}`} />
+                    </Box>
+                  </Box>
+                )
+              })}
+            </Box>
+          ) : null}
+
+          {visibleJournalOnlyCaptures.length ? (
+            <Box sx={sectionSx}>
+              <SectionHeader
+                title="Recognized payment-exception journals"
+                detail={`${baseline.summary.journalOnlyCaptureCount || visibleJournalOnlyCaptures.length} journal-only payment capture${(baseline.summary.journalOnlyCaptureCount || visibleJournalOnlyCaptures.length) === 1 ? '' : 's'}`}
+              />
+              <Divider />
+              <Typography variant="body2" color="text.secondary" px={{ xs: 1.5, sm: 2 }} py={1.5}>
+                A payment-date exception correctly has only a Journal Entry. Its Sales Receipt remains tied to
+                the later fulfillment date, so this journal is recognized and is not an unmatched posting.
+              </Typography>
+              {visibleJournalOnlyCaptures.map((capture) => (
+                <Box
+                  key={`${capture.businessDate}-${capture.journalEntry.evidenceId}`}
+                  display="grid"
+                  gridTemplateColumns={{ xs: '1fr', sm: '130px minmax(0, 1fr) 170px' }}
+                  gap={1.25}
+                  px={{ xs: 1.5, sm: 2 }}
+                  py={1.5}
+                  alignItems="center"
+                  borderTop="1px solid rgba(255,255,255,0.06)"
+                >
+                  <Box>
+                    <Typography variant="body2" fontWeight={700}>{capture.businessDate}</Typography>
+                    <Typography variant="caption" color="success.main">Recognized payment capture</Typography>
+                  </Box>
+                  <EvidenceButton
+                    evidence={capture.journalEntry}
+                    status={capture.journalBalance.status}
+                    onOpen={openHistoricalEvidence}
+                  />
+                  <Chip
+                    size="small"
+                    color={statusColor(capture.journalBalance.status)}
+                    variant="outlined"
+                    label={`Balance ${statusLabel(capture.journalBalance.status)} · ${formatDelta(capture.journalBalance.deltaCents)}`}
+                  />
+                </Box>
+              ))}
+            </Box>
+          ) : null}
 
           {(baseline.unmatchedGroups.length || baseline.ambiguousGroups.length) ? (
             <Box sx={sectionSx}>
@@ -1475,12 +1861,53 @@ export default function PosAccountingParityPanel() {
             </Box>
           ) : null}
 
+          {visiblePreorderLifecycles.length ? (
+            <Box sx={sectionSx}>
+              <SectionHeader
+                title="Preorder lifecycles"
+                detail={`${visiblePreorderLifecycles.length} linked payment and fulfillment date${visiblePreorderLifecycles.length === 1 ? '' : 's'}`}
+              />
+              <Divider />
+              <Alert severity="info" variant="outlined" sx={{ m: { xs: 1.5, sm: 2 }, mb: 1 }}>
+                A preorder is one customer-payment lifecycle, not two sales. The payment-date Journal Entry
+                holds the tender in Payment Exceptions; the Sales Receipt and clearing Journal Entry become due
+                on the fulfillment date.
+              </Alert>
+              {visiblePreorderLifecycles.map((lifecycle) => (
+                <Box
+                  key={`${lifecycle.paymentDate}-${lifecycle.fulfillmentDate}-${lifecycle.locationName}`}
+                  display="grid"
+                  gridTemplateColumns={{ xs: '1fr', sm: 'minmax(0, 1.5fr) repeat(3, minmax(100px, 0.75fr))' }}
+                  gap={1.5}
+                  px={{ xs: 1.5, sm: 2 }}
+                  py={1.5}
+                  borderTop="1px solid rgba(255,255,255,0.06)"
+                  alignItems="center"
+                >
+                  <Box minWidth={0}>
+                    <Typography variant="body2" fontWeight={700}>
+                      Paid {lifecycle.paymentDate} → fulfilled {lifecycle.fulfillmentDate}
+                    </Typography>
+                    <Typography variant="caption" color="text.secondary" display="block">
+                      {lifecycle.locationName}
+                      {lifecycle.statuses.size ? ` · ${[...lifecycle.statuses].map(statusLabel).join(', ')}` : ''}
+                    </Typography>
+                  </Box>
+                  <DetailField label="Prepaid total" value={formatDelta(lifecycle.totalCents)} />
+                  <DetailField label="Toast tips" value={formatDelta(lifecycle.tipsCents)} />
+                  <DetailField label="Checks" value={lifecycle.checkCount} />
+                </Box>
+              ))}
+            </Box>
+          ) : null}
+
           <Box sx={sectionSx}>
             <SectionHeader title="Current ClawPilot drafts" detail={`${report.pagination.totalDates} business dates`} />
             <Divider />
-            <Box display="grid" gridTemplateColumns={{ xs: 'repeat(2, minmax(0, 1fr))', sm: 'repeat(4, minmax(0, 1fr))' }} gap={2} px={{ xs: 1.5, sm: 2 }} py={2}>
+            <Box display="grid" gridTemplateColumns={{ xs: 'repeat(2, minmax(0, 1fr))', sm: 'repeat(5, minmax(0, 1fr))' }} gap={2} px={{ xs: 1.5, sm: 2 }} py={2}>
               <Metric label="Drafts" value={report.summary.drafts} />
               <Metric label="Matched" value={report.summary.matched} tone="#70D6A7" />
+              <Metric label="Scheduled" value={report.summary.scheduled || 0} tone="#A8C7FA" />
               <Metric label="Missing" value={report.summary.missingQuickBooks} tone={report.summary.missingQuickBooks ? '#F2B76D' : '#70D6A7'} />
               <Metric label="Variances" value={report.summary.comparisonsWithVariance} tone={report.summary.comparisonsWithVariance ? '#FF8A80' : '#70D6A7'} />
             </Box>
@@ -1526,16 +1953,16 @@ export default function PosAccountingParityPanel() {
                 </Box>
                 <Box sx={{ display: { xs: 'none', sm: 'block' } }}>
                   <Typography variant="caption" color="text.secondary">Evidence match</Typography>
-                  <Box mt={0.5}><Chip size="small" color={statusColor(row.match.status)} variant="outlined" label={statusLabel(row.match.status)} /></Box>
+                  <Box mt={0.5}><Chip size="small" color={statusColor(isScheduledRow(row) ? 'scheduled' : row.match.status)} variant="outlined" label={rowMatchLabel(row)} /></Box>
                 </Box>
                 <Box sx={{ display: { xs: 'none', sm: 'block' } }}>
                   <Typography variant="caption" color="text.secondary">Amount comparison</Typography>
-                  <Box mt={0.5}><Chip size="small" color={statusColor(row.comparison?.status || 'insufficient_evidence')} variant="outlined" label={statusLabel(row.comparison?.status || 'insufficient_evidence')} /></Box>
+                  <Box mt={0.5}><Chip size="small" color={statusColor(isScheduledRow(row) ? 'scheduled' : row.comparison?.status || 'insufficient_evidence')} variant="outlined" label={rowComparisonLabel(row)} /></Box>
                 </Box>
                 <ChevronRightRounded fontSize="small" color="action" sx={{ display: { xs: 'none', sm: 'block' } }} />
                 <Box display={{ xs: 'flex', sm: 'none' }} alignItems="center" gap={0.75} gridColumn="1 / -1" flexWrap="wrap">
-                  <Chip size="small" color={statusColor(row.match.status)} variant="outlined" label={statusLabel(row.match.status)} />
-                  <Chip size="small" color={statusColor(row.comparison?.status || 'insufficient_evidence')} variant="outlined" label={statusLabel(row.comparison?.status || 'insufficient_evidence')} />
+                  <Chip size="small" color={statusColor(isScheduledRow(row) ? 'scheduled' : row.match.status)} variant="outlined" label={rowMatchLabel(row)} />
+                  <Chip size="small" color={statusColor(isScheduledRow(row) ? 'scheduled' : row.comparison?.status || 'insufficient_evidence')} variant="outlined" label={rowComparisonLabel(row)} />
                 </Box>
               </Box>
             )) : <Typography color="text.secondary" p={2}>No current drafts in this period.</Typography>}
@@ -1550,11 +1977,6 @@ export default function PosAccountingParityPanel() {
             ) : null}
           </Box>
 
-          {report.cache.syncCompletedAt ? (
-            <Typography variant="caption" color="text.disabled">
-              QuickBooks cache completed {formatUserDateTime(report.cache.syncCompletedAt, dateTimeSettings, { dateStyle: 'medium', timeStyle: 'short' })}
-            </Typography>
-          ) : null}
         </>
       ) : null}
 
@@ -1609,12 +2031,17 @@ export default function PosAccountingParityPanel() {
                   <Box component="section">
                     <Box display="flex" alignItems="center" justifyContent="space-between" gap={1.5} mb={1.5}>
                       <Typography fontWeight={700}>Parity status</Typography>
-                      <Chip size="small" variant="outlined" color={statusColor(selection.row.match.status)} label={statusLabel(selection.row.match.status)} />
+                      <Chip
+                        size="small"
+                        variant="outlined"
+                        color={statusColor(isScheduledRow(selection.row) ? 'scheduled' : selection.row.match.status)}
+                        label={rowMatchLabel(selection.row)}
+                      />
                     </Box>
                     <Box display="grid" gridTemplateColumns={{ xs: '1fr', sm: 'repeat(2, minmax(0, 1fr))' }} gap={1.5}>
-                      <DetailField label="Evidence match" value={statusLabel(selection.row.match.status)} />
+                      <DetailField label="Evidence match" value={rowMatchLabel(selection.row)} />
                       <DetailField label="Match basis" value={selection.row.match.basis ? statusLabel(selection.row.match.basis) : null} />
-                      <DetailField label="Amount comparison" value={selection.row.comparison ? statusLabel(selection.row.comparison.status) : 'insufficient evidence'} />
+                      <DetailField label="Amount comparison" value={rowComparisonLabel(selection.row)} />
                       <DetailField label="Reconciliation" value={statusLabel(selection.row.expected.draft.reconciliationStatus)} />
                       {selection.row.match.candidateTransactionIds.length ? (
                         <Box gridColumn={{ sm: '1 / -1' }}>
@@ -1629,6 +2056,7 @@ export default function PosAccountingParityPanel() {
                     pending={actionPending}
                     externalEvidence={selectedExternalEvidence}
                     journalOnly={selectedJournalOnly}
+                    scheduled={isScheduledRow(selection.row)}
                     onPrepare={preparePosting}
                     onApprove={approvePosting}
                     onRecordExternal={openExternalDraftDialog}
@@ -1640,6 +2068,10 @@ export default function PosAccountingParityPanel() {
                       contextStatus={selection.row.match.status}
                       formatCents={formatDelta}
                     />
+                  ) : isScheduledRow(selection.row) ? (
+                    <Alert severity="info">
+                      QuickBooks evidence is not expected until this preorder reaches its fulfillment date.
+                    </Alert>
                   ) : (
                     <Alert severity={selection.row.match.status === 'missing_quickbooks' ? 'warning' : 'info'}>
                       No single normalized QuickBooks record is attached to this draft comparison.
@@ -1651,7 +2083,7 @@ export default function PosAccountingParityPanel() {
                       comparison={selection.row.comparison}
                       formatCents={formatDelta}
                     />
-                  ) : (
+                  ) : isScheduledRow(selection.row) ? null : (
                     <Alert severity="warning">A line-level amount comparison is not available for this draft.</Alert>
                   )}
                 </Stack>
@@ -1675,6 +2107,11 @@ export default function PosAccountingParityPanel() {
             <Alert severity="info" variant="outlined">
               This records existing QuickBooks evidence only. ClawPilot will not create, approve, or resend a QuickBooks transaction.
             </Alert>
+            {error ? (
+              <Alert severity="error" variant="outlined">
+                Acknowledgment was not recorded: {error}
+              </Alert>
+            ) : null}
             {externalDialogTarget?.mode === 'draft' ? (
               <Stack spacing={1.5}>
                 <DetailField label="Business date" value={externalDialogTarget.businessDate} />
@@ -1706,7 +2143,10 @@ export default function PosAccountingParityPanel() {
               </Stack>
             ) : (
               <Alert severity="warning" variant="outlined">
-                ClawPilot will acknowledge only dates in the applied range whose required QuickBooks document or documents match with no amount variance. Every unresolved date stays in Needs Review.
+                ClawPilot will acknowledge only dates in the applied range whose required QuickBooks evidence
+                matches with no amount variance. A payment-date exception requires its exact Journal Entry;
+                a fulfillment posting requires its exact Sales Receipt and Journal Entry. Every unresolved date
+                stays in Needs Review.
               </Alert>
             )}
             <TextField

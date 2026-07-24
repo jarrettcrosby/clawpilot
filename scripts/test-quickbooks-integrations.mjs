@@ -44,7 +44,13 @@ function loadTypeScriptModule(path, mocks = {}) {
   const module = { exports: {} }
   const sandbox = {
     Buffer,
+    clearTimeout,
     console,
+    Error,
+    Headers,
+    Response,
+    setTimeout,
+    URLSearchParams,
     exports: module.exports,
     module,
     process,
@@ -327,6 +333,13 @@ for (const fragment of [
   "crm_entity_type IN ('organization', 'contact', 'product')",
 ]) includes(crmReconciliationMigration, fragment, 'QuickBooks CRM reconciliation migration')
 
+const posEvidenceRefreshMigration = read('db/migrations/0105_quickbooks_pos_evidence_refresh.sql')
+includes(
+  posEvidenceRefreshMigration,
+  'ADD COLUMN IF NOT EXISTS last_pos_evidence_synced_at timestamptz',
+  'QuickBooks POS evidence refresh migration',
+)
+
 const crmReconciliation = read('app_src/lib/persistence/quickBooksCrmSync.ts')
 for (const fragment of [
   'configureQuickBooksCrmSyncInPostgres',
@@ -378,8 +391,122 @@ for (const fragment of [
   "method: 'POST'",
   'buildQuickBooksProviderPayload',
   'QuickBooksProviderWriteError',
+  'readQuickBooksPosTransactions',
+  "for (const entity of ['SalesReceipt', 'JournalEntry'] as const)",
+  'assertTransactionRangePage',
+  'POS evidence contained an unusable record',
+  'POS evidence was outside the requested date range',
+  'POS evidence contained a duplicate record',
+  'supports at most 32 business dates',
 ]) includes(client + read('app_src/lib/maton.ts'), fragment, 'QuickBooks client')
 assert.ok(!client.includes('TRANSACTION_ENTITIES.map'), 'QuickBooks entity reads must remain paced')
+
+const quickBooksCatalogClientMocks = {
+  parseQuickBooksAccounts,
+  parseQuickBooksAttachments,
+  parseQuickBooksCompanyInfo,
+  parseQuickBooksClasses,
+  parseQuickBooksCustomers,
+  parseQuickBooksDepartments,
+  parseQuickBooksFinancialReport,
+  parseQuickBooksItems,
+  parseQuickBooksTaxCodes,
+  parseQuickBooksTransactions,
+  parseQuickBooksVendors,
+}
+function quickBooksJsonResponse(payload, status = 200) {
+  const raw = JSON.stringify(payload)
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    headers: new Headers({ 'content-length': String(Buffer.byteLength(raw)) }),
+    body: null,
+    text: async () => raw,
+  }
+}
+const posEvidenceProviderPaths = []
+const posEvidenceClientModule = loadTypeScriptModule('app_src/lib/integrations/quickBooksClient.ts', {
+  '@/lib/maton': {
+    matonFetch: async (pathname) => {
+      posEvidenceProviderPaths.push(decodeURIComponent(pathname))
+      if (pathname.includes('STARTPOSITION%20201')) {
+        return quickBooksJsonResponse({
+          QueryResponse: {
+            SalesReceipt: [{ Id: 'sales-201', TxnDate: '2026-07-25', TotalAmt: 9.99 }],
+          },
+        })
+      }
+      if (pathname.includes('SalesReceipt')) {
+        return quickBooksJsonResponse({
+          QueryResponse: {
+            SalesReceipt: Array.from({ length: 200 }, (_, index) => ({
+              Id: `sales-${index + 1}`,
+              TxnDate: '2026-07-23',
+              TotalAmt: index + 1,
+            })),
+          },
+        })
+      }
+      return quickBooksJsonResponse({ QueryResponse: {} })
+    },
+  },
+  '@/lib/integrations/quickBooksCatalog.mjs': quickBooksCatalogClientMocks,
+  '@/lib/integrations/quickBooksWritePayloads': {
+    buildQuickBooksProviderPayload: () => ({}),
+    quickBooksProviderEntity: () => ({ path: 'unused', responseKey: 'unused' }),
+  },
+})
+const boundedPosEvidence = await posEvidenceClientModule.readQuickBooksPosTransactions({
+  ownerEmail: 'owner@example.test',
+  connectionId: 'connection-1',
+  fromBusinessDate: '2026-07-23',
+  toBusinessDate: '2026-07-25',
+})
+assert.equal(boundedPosEvidence.length, 201)
+assert.equal(posEvidenceProviderPaths.length, 3)
+assert.ok(
+  posEvidenceProviderPaths.every((pathname) => (
+    pathname.includes("TxnDate >= '2026-07-23'")
+    && pathname.includes("TxnDate <= '2026-07-25'")
+  )),
+  'bounded QuickBooks evidence reads must constrain every provider page',
+)
+assert.ok(
+  posEvidenceProviderPaths.some((pathname) => pathname.includes('STARTPOSITION 201 MAXRESULTS 200')),
+  'bounded QuickBooks evidence reads must page beyond the first 200 records',
+)
+await assert.rejects(
+  posEvidenceClientModule.readQuickBooksPosTransactions({
+    ownerEmail: 'owner@example.test',
+    connectionId: 'connection-1',
+    fromBusinessDate: '2026-07-23',
+    toBusinessDate: '2026-08-24',
+  }),
+  /at most 32 business dates/,
+)
+
+const providerFaultClientModule = loadTypeScriptModule('app_src/lib/integrations/quickBooksClient.ts', {
+  '@/lib/maton': {
+    matonFetch: async () => quickBooksJsonResponse({
+      Fault: { Error: [{ Message: 'Provider query unavailable' }] },
+    }),
+  },
+  '@/lib/integrations/quickBooksCatalog.mjs': quickBooksCatalogClientMocks,
+  '@/lib/integrations/quickBooksWritePayloads': {
+    buildQuickBooksProviderPayload: () => ({}),
+    quickBooksProviderEntity: () => ({ path: 'unused', responseKey: 'unused' }),
+  },
+})
+await assert.rejects(
+  providerFaultClientModule.readQuickBooksPosTransactions({
+    ownerEmail: 'owner@example.test',
+    connectionId: 'connection-1',
+    fromBusinessDate: '2026-07-23',
+    toBusinessDate: '2026-07-25',
+  }),
+  /Provider query unavailable/,
+  'HTTP-success provider faults must not be treated as an empty evidence range',
+)
 
 const writePayloads = read('app_src/lib/integrations/quickBooksWritePayloads.ts')
 for (const fragment of [
@@ -724,8 +851,173 @@ for (const fragment of [
   'UPDATE pos_accounting_catalog_mappings SET effective_to = clock_timestamp()',
   "status IN ('draft', 'pending_approval', 'approved', 'failed', 'dead')",
   "status = 'processing'",
+  'refreshQuickBooksPosEvidenceInPostgres',
+  '`quickbooks-pos-evidence:${input.organizationId}`',
+  'QuickBooks connection changed before POS evidence refresh completion',
+  "entity_type IN ('SalesReceipt', 'JournalEntry')",
+  'ON CONFLICT (organization_id, entity_type, quickbooks_transaction_id) DO UPDATE SET',
+  "eventType: 'quickbooks.pos_evidence.refreshed'",
+  'last_pos_evidence_synced_at = now()',
 ]) includes(persistence, fragment, 'QuickBooks persistence')
 assert.ok(!persistence.includes('console.'), 'QuickBooks persistence must not log credentials or source payloads')
+
+let posEvidenceProviderResult = [{
+  id: 'sales-23',
+  entityType: 'SalesReceipt',
+  documentNumber: 'CP-23',
+  transactionDate: '2026-07-23',
+  dueDate: null,
+  partyId: null,
+  partyName: null,
+  accountId: 'bank-1',
+  accountName: 'Checking',
+  currencyCode: 'USD',
+  totalAmount: 44.54,
+  openBalance: 0,
+  status: 'Posted',
+  emailStatus: null,
+  paymentMethod: null,
+  memo: 'Toast 2026-07-23',
+  sourcePayload: { Id: 'sales-23' },
+}]
+let posEvidenceProviderError = null
+let posEvidenceActiveBinding = true
+let posEvidenceTransactionCount = 0
+const posEvidenceSqlCalls = []
+const posEvidenceLocks = []
+const posEvidenceAuditEvents = []
+const posEvidencePersistenceModule = loadTypeScriptModule('app_src/lib/persistence/quickBooksIntegrations.ts', {
+  '@/lib/auditWriter': {
+    recordAuditEvent: async (event) => { posEvidenceAuditEvents.push(event) },
+  },
+  '@/lib/integrations/quickBooksClient': {
+    readQuickBooksPosTransactions: async () => {
+      if (posEvidenceProviderError) throw posEvidenceProviderError
+      return posEvidenceProviderResult
+    },
+  },
+  '@/lib/persistence/postgres': {
+    acquireTransactionAdvisoryLock: async (_client, key) => { posEvidenceLocks.push(key) },
+    query: async (source) => {
+      assert.ok(source.includes('FROM organization_quickbooks_connections'))
+      return {
+        rowCount: 1,
+        rows: [{
+          credential_owner_email: 'owner@example.test',
+          maton_connection_id: 'connection-1',
+          status: 'active',
+        }],
+      }
+    },
+    withTransaction: async (handler) => {
+      posEvidenceTransactionCount += 1
+      return handler({
+        query: async (source, params = []) => {
+          posEvidenceSqlCalls.push({ source, params })
+          if (source.includes('FROM organization_quickbooks_connections') && source.includes('FOR SHARE')) {
+            return {
+              rowCount: posEvidenceActiveBinding ? 1 : 0,
+              rows: posEvidenceActiveBinding ? [{ organization_id: writeOrganizationId }] : [],
+            }
+          }
+          if (source.includes('RETURNING last_pos_evidence_synced_at')) {
+            return {
+              rowCount: 1,
+              rows: [{ refreshed_at: '2026-07-24T18:00:00.000Z' }],
+            }
+          }
+          return { rowCount: 1, rows: [] }
+        },
+      })
+    },
+  },
+})
+const refreshedPosEvidence = await posEvidencePersistenceModule.refreshQuickBooksPosEvidenceInPostgres({
+  organizationId: writeOrganizationId,
+  fromBusinessDate: '2026-07-23',
+  toBusinessDate: '2026-07-25',
+  actorEmail: 'approver@example.test',
+})
+assert.equal(refreshedPosEvidence.transactionCount, 1)
+assert.equal(refreshedPosEvidence.salesReceiptCount, 1)
+assert.deepEqual(
+  posEvidenceLocks.slice(0, 2),
+  [
+    `quickbooks-binding:${writeOrganizationId}`,
+    `quickbooks-pos-evidence:${writeOrganizationId}`,
+  ],
+  'POS evidence refresh must serialize against connection rebind and full catalog replacement',
+)
+assert.ok(
+  posEvidenceSqlCalls.some((call) => (
+    call.source.includes("entity_type IN ('SalesReceipt', 'JournalEntry')")
+    && call.params[1] === '2026-07-23'
+    && call.params[2] === '2026-07-25'
+  )),
+  'POS evidence refresh must delete only the requested entity/date scope',
+)
+assert.ok(
+  posEvidenceSqlCalls.some((call) => call.source.includes(
+    'ON CONFLICT (organization_id, entity_type, quickbooks_transaction_id) DO UPDATE SET',
+  )),
+  'POS evidence refresh must update a transaction whose date moved into the requested range',
+)
+assert.equal(posEvidenceAuditEvents[0].eventType, 'quickbooks.pos_evidence.refreshed')
+
+const transactionCountBeforeProviderFailure = posEvidenceTransactionCount
+posEvidenceProviderError = new Error('provider unavailable')
+await assert.rejects(
+  posEvidencePersistenceModule.refreshQuickBooksPosEvidenceInPostgres({
+    organizationId: writeOrganizationId,
+    fromBusinessDate: '2026-07-23',
+    toBusinessDate: '2026-07-25',
+    actorEmail: 'approver@example.test',
+  }),
+  /provider unavailable/,
+)
+assert.equal(
+  posEvidenceTransactionCount,
+  transactionCountBeforeProviderFailure,
+  'provider failures must leave the existing QuickBooks evidence cache untouched',
+)
+posEvidenceProviderError = null
+
+const deleteCountBeforeBindingChange = posEvidenceSqlCalls.filter((call) => (
+  call.source.includes('DELETE FROM quickbooks_transactions')
+)).length
+posEvidenceActiveBinding = false
+await assert.rejects(
+  posEvidencePersistenceModule.refreshQuickBooksPosEvidenceInPostgres({
+    organizationId: writeOrganizationId,
+    fromBusinessDate: '2026-07-23',
+    toBusinessDate: '2026-07-25',
+    actorEmail: 'approver@example.test',
+  }),
+  /connection changed/,
+)
+assert.equal(
+  posEvidenceSqlCalls.filter((call) => call.source.includes('DELETE FROM quickbooks_transactions')).length,
+  deleteCountBeforeBindingChange,
+  'a connection change must be detected before deleting cached evidence',
+)
+posEvidenceActiveBinding = true
+
+const transactionCountBeforeOutOfScope = posEvidenceTransactionCount
+posEvidenceProviderResult = [{ ...posEvidenceProviderResult[0], transactionDate: '2026-07-26' }]
+await assert.rejects(
+  posEvidencePersistenceModule.refreshQuickBooksPosEvidenceInPostgres({
+    organizationId: writeOrganizationId,
+    fromBusinessDate: '2026-07-23',
+    toBusinessDate: '2026-07-25',
+    actorEmail: 'approver@example.test',
+  }),
+  /outside the requested scope/,
+)
+assert.equal(
+  posEvidenceTransactionCount,
+  transactionCountBeforeOutOfScope,
+  'out-of-scope provider records must not start cache replacement',
+)
 
 const writePersistence = read('app_src/lib/persistence/quickBooksWrites.ts')
 for (const fragment of [
@@ -766,6 +1058,9 @@ let integrationScenario = 'rebind'
 const integrationPersistenceModule = loadTypeScriptModule('app_src/lib/persistence/quickBooksIntegrations.ts', {
   '@/lib/auditWriter': {
     recordAuditEvent: async (event) => { integrationAuditEvents.push(event) },
+  },
+  '@/lib/integrations/quickBooksClient': {
+    readQuickBooksPosTransactions: async () => [],
   },
   '@/lib/persistence/postgres': {
     acquireTransactionAdvisoryLock: async (client, key) => client.query(
@@ -1506,7 +1801,132 @@ for (const fragment of [
   "viewValue === 'invoice'",
   "viewValue === 'transaction-attachments'",
   "'Cache-Control': 'no-store'",
+  'export async function POST(req: NextRequest)',
+  "body.action !== 'refresh-pos-evidence'",
+  'capabilities.canApprove',
+  'ACCOUNTING_CONTENT_TYPE_INVALID',
+  'ACCOUNTING_PARITY_DATE_RANGE_TOO_LARGE',
+  'refreshQuickBooksPosEvidenceInPostgres',
+  'QUICKBOOKS_CONNECTION_CHANGED',
 ]) includes(explorerRoute, fragment, 'QuickBooks explorer API')
+
+let posEvidenceRouteCapabilities = {
+  canView: true,
+  canManage: false,
+  canPrepare: true,
+  canApprove: false,
+}
+let posEvidenceRefreshError = null
+const posEvidenceRefreshInputs = []
+const posEvidenceRouteModule = loadTypeScriptModule('app_src/app/api/accounting/quickbooks/route.ts', {
+  'next/server': {
+    NextResponse: {
+      json: (body, init = {}) => ({
+        body,
+        status: init.status || 200,
+        headers: init.headers || {},
+      }),
+    },
+  },
+  '@/lib/accountingAuthorization': {
+    accountingCapabilities: () => posEvidenceRouteCapabilities,
+    activeAccountingOrganizationId: () => writeOrganizationId,
+  },
+  '@/lib/persistence/config': { isPostgresStorageEnabled: () => true },
+  '@/lib/persistence/quickBooksExplorer': {},
+  '@/lib/persistence/posAccountingParity': {},
+  '@/lib/persistence/quickBooksIntegrations': {
+    refreshQuickBooksPosEvidenceInPostgres: async (input) => {
+      posEvidenceRefreshInputs.push(input)
+      if (posEvidenceRefreshError) throw posEvidenceRefreshError
+      return {
+        fromBusinessDate: input.fromBusinessDate,
+        toBusinessDate: input.toBusinessDate,
+        transactionCount: 2,
+        refreshedAt: '2026-07-24T18:00:00.000Z',
+      }
+    },
+  },
+  '@/lib/requestUser': {
+    requireRequestUser: async () => ({
+      email: 'approver@example.test',
+      organizationId: writeOrganizationId,
+    }),
+  },
+})
+function posEvidenceRouteRequest(body, headers = {}) {
+  const raw = typeof body === 'string' ? body : JSON.stringify(body)
+  return {
+    headers: new Headers({
+      'content-type': 'application/json',
+      'content-length': String(Buffer.byteLength(raw)),
+      ...headers,
+    }),
+    text: async () => raw,
+  }
+}
+
+const deniedPosEvidenceRefresh = await posEvidenceRouteModule.POST(posEvidenceRouteRequest({
+  action: 'refresh-pos-evidence',
+  fromBusinessDate: '2026-07-23',
+  toBusinessDate: '2026-07-25',
+}))
+assert.equal(deniedPosEvidenceRefresh.status, 403)
+assert.equal(deniedPosEvidenceRefresh.body.code, 'ACCOUNTING_APPROVAL_REQUIRED')
+assert.equal(posEvidenceRefreshInputs.length, 0)
+
+posEvidenceRouteCapabilities = { ...posEvidenceRouteCapabilities, canApprove: true }
+const invalidContentTypeRefresh = await posEvidenceRouteModule.POST(posEvidenceRouteRequest(
+  {
+    action: 'refresh-pos-evidence',
+    fromBusinessDate: '2026-07-23',
+    toBusinessDate: '2026-07-25',
+  },
+  { 'content-type': 'text/plain' },
+))
+assert.equal(invalidContentTypeRefresh.status, 415)
+assert.equal(invalidContentTypeRefresh.body.code, 'ACCOUNTING_CONTENT_TYPE_INVALID')
+
+const oversizedPosEvidenceRefresh = await posEvidenceRouteModule.POST(posEvidenceRouteRequest(
+  {
+    action: 'refresh-pos-evidence',
+    fromBusinessDate: '2026-07-23',
+    toBusinessDate: '2026-07-25',
+  },
+  { 'content-length': String((16 * 1024) + 1) },
+))
+assert.equal(oversizedPosEvidenceRefresh.status, 413)
+assert.equal(oversizedPosEvidenceRefresh.body.code, 'ACCOUNTING_REQUEST_TOO_LARGE')
+
+const unboundedPosEvidenceRefresh = await posEvidenceRouteModule.POST(posEvidenceRouteRequest({
+  action: 'refresh-pos-evidence',
+  fromBusinessDate: '2026-07-01',
+  toBusinessDate: '2026-08-02',
+}))
+assert.equal(unboundedPosEvidenceRefresh.status, 400)
+assert.equal(unboundedPosEvidenceRefresh.body.code, 'ACCOUNTING_PARITY_DATE_RANGE_TOO_LARGE')
+assert.equal(posEvidenceRefreshInputs.length, 0)
+
+const validPosEvidenceRefresh = await posEvidenceRouteModule.POST(posEvidenceRouteRequest({
+  action: 'refresh-pos-evidence',
+  fromBusinessDate: '2026-07-23',
+  toBusinessDate: '2026-07-25',
+}))
+assert.equal(validPosEvidenceRefresh.status, 200)
+assert.equal(validPosEvidenceRefresh.body.ok, true)
+assert.equal(posEvidenceRefreshInputs[0].organizationId, writeOrganizationId)
+assert.equal(posEvidenceRefreshInputs[0].fromBusinessDate, '2026-07-23')
+assert.equal(posEvidenceRefreshInputs[0].toBusinessDate, '2026-07-25')
+assert.equal(posEvidenceRefreshInputs[0].actorEmail, 'approver@example.test')
+
+posEvidenceRefreshError = new Error('QuickBooks connection changed before POS evidence refresh completion')
+const changedConnectionRefresh = await posEvidenceRouteModule.POST(posEvidenceRouteRequest({
+  action: 'refresh-pos-evidence',
+  fromBusinessDate: '2026-07-23',
+  toBusinessDate: '2026-07-25',
+}))
+assert.equal(changedConnectionRefresh.status, 409)
+assert.equal(changedConnectionRefresh.body.code, 'QUICKBOOKS_CONNECTION_CHANGED')
 
 const actionsRoute = read('app_src/app/api/accounting/quickbooks/actions/route.ts')
 for (const fragment of [

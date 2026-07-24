@@ -123,7 +123,9 @@ Toast can receive a payment on one date and fulfill the related order on another
 1. On the payment date, the Payments Journal debits the actual tender or settlement destination and credits the mapped **Payment Exceptions** clearing account. A payment-date-only draft does not create a zero-dollar Sales Receipt.
 2. On the fulfillment date, the Sales Receipt recognizes the mapped sale and the Payments Journal debits **Payment Exceptions** while crediting POS clearing and tips payable.
 3. Split payments retain every payment business date. Missing payment timing is a blocking issue rather than an assumed date.
-4. **Payment Exceptions** maps to one QuickBooks account-backed catalog source (`summary:payment_exceptions`). It should normally be an Other Current Asset clearing account, not a bank account.
+4. **Payment Exceptions** maps to one QuickBooks account-backed catalog source (`summary:payment_exceptions`). It must use the dedicated clearing account approved by accounting and cannot reuse the POS clearing account; ClawPilot does not guess the account type or silently repair that financial choice.
+5. Capture and release rows retain non-customer Toast order, check, and payment keys plus both business dates, so the parity view can present one `Paid → fulfilled` lifecycle instead of two unrelated missing documents.
+6. Toast tips remain a separate payment fact. They are compared against the Payments Journal or tips-payable line, never inferred from the Sales Receipt. A later Toast tip update creates a new correction revision without overwriting protected posting evidence.
 
 Payment timing uses Toast's authoritative `paidBusinessDate` first, so overnight payments follow the restaurant's configured closeout boundary. Older payloads without that field fall back to the restaurant-local calendar date of `paidDate`. Fulfillment follows `promisedDate`, matching Toast's scheduled-order model and Shogo's documented Payment Exceptions clearing workflow.
 
@@ -133,6 +135,8 @@ ClawPilot uses Shogo's operator workflow as a comparison model, not as a runtime
 
 - The queue normalizes the public Shogo concepts `NONE`, `POST`, `HOLD`, `POSTED`, `UPDATED`, `BATCHHOLD`, `FAILED`, `UPDATEFAILED`, `OPEN CHECKS`, and `OOB` into the five operator states while preserving the specific reason as the row label and blocker detail.
 - Confirmed mapping, QuickBooks binding, out-of-balance, source-variance, allocation, open-check, batch-detail, settlement, payment-timing, protected-update, provider-posting, missing-source-date, overdue-worker, and failed Toast-sync problems remain visible. The selected date range has no silent draft or issue cap. An unrecognized provider or worker error becomes a safe generic failure with its recorded message instead of disappearing.
+- A mapping action names the exact target (for example **Choose settlement account**), explains that saving changes configuration rather than posting, and leaves a visible regeneration action until the selected date has been rebuilt.
+- The parity view distinguishes a future fulfillment document as scheduled instead of missing. An authorized **Sync QuickBooks and recheck** action reads only the selected bounded date range, replaces that range's cached Sales Receipt and Journal Entry evidence, records the refresh timestamp, and then re-evaluates exact matches. Human acknowledgement remains separate from provider evidence and cannot manufacture a match.
 - Preview readiness, the stored draft, issue state and notification, and prepare/approve authorization use the same canonical blocker evaluation. The posting endpoint rechecks that stored gate at both preparation and approval.
 - The posting review remains permission- and approval-controlled. Queue actions may navigate to the exact review date, but they do not bypass preparation, fingerprint confirmation, or approval.
 
@@ -153,6 +157,8 @@ The Accounting view provides two bounded Shogo-parity controls for the resolved 
 The Accounting workspace includes a read-only comparison against the active organization's complete cached Toast-marked QuickBooks corpus. Recent postings are useful debugging fixtures, but acceptance is based on all available history rather than one or two selected dates.
 
 - Exact business-date and document evidence is preferred. A one-to-one date fallback is allowed only when it cannot hide ambiguity.
+- One SHOGO posting marker may legitimately contain several Sales Receipts and one or more settlement journals. Those records are evaluated as one aggregate posting bundle instead of being labeled ambiguous solely because the relationship is not one-to-one.
+- A balanced journal-only Payment Exceptions capture is a recognized prepaid-order posting, not an unmatched exception. The future Sales Receipt and release journal remain scheduled until fulfillment.
 - Receipt and settlement-journal variances are reported separately. A balanced journal is validated from its account lines because historical postings may include cash, card, fees, tips, payouts, or other settlement entries.
 - Unmatched and ambiguous records remain visible. ClawPilot does not manufacture a pair to make coverage appear complete.
 - The comparison returns normalized summaries and line evidence, never raw QuickBooks source payloads, and cannot post, approve, regenerate, or change a mapping.
@@ -223,7 +229,7 @@ All rows are organization-scoped. A multi-business user connects, selects, and r
 
 ## Current Release Boundary
 
-This release implements both Toast credential connections, location verification, scheduled and manual read-only ingestion, current-day modified-order polling, future-order payment/fulfillment projection, immutable source snapshots, sanitized order/check/item projections, menu catalogs, a dedicated responsive POS workspace, operational reports, daily projections, Payment Exceptions accounting, a consolidated posting queue, versioned accounting profiles and date drafts, separate sales reload and stored-data regeneration commands, QuickBooks reference catalogs, immutable accounting previews, deduplicated accounting-issue notifications, worker health, and audit events. Organization-bound QuickBooks authorization, mapping management, prepared posting batches, and independent approval are available. A canonical readiness gate prevents Toast-to-QuickBooks posting until mapping, reconciliation, hold, and authorization checks pass.
+This release implements both Toast credential connections, location verification, scheduled and manual read-only ingestion, current-day modified-order polling, future-order payment/fulfillment projection, immutable source snapshots, sanitized order/check/item projections, menu catalogs, a dedicated responsive POS workspace, operational reports, daily projections, Payment Exceptions accounting, a consolidated posting queue, versioned accounting profiles and date drafts, separate sales reload and stored-data regeneration commands, QuickBooks reference catalogs, bounded on-demand posting-evidence refresh, linked preorder parity, aggregate historical posting bundles, immutable accounting previews, deduplicated accounting-issue notifications, worker health, and audit events. Organization-bound QuickBooks authorization, mapping management, prepared posting batches, and independent approval are available. A canonical readiness gate prevents Toast-to-QuickBooks posting until mapping, reconciliation, hold, and authorization checks pass.
 
 ## Verification
 
@@ -238,6 +244,10 @@ This release implements both Toast credential connections, location verification
 9. Bind the intended organization to QuickBooks, save one location's account mappings, and confirm financial posting remains unavailable.
 10. Confirm an active Toast menu item with no observed sales remains available for mapping. Prepare a missing QuickBooks product draft, submit and approve it in Accounting, refresh the catalog after posting, and then save the Toast mapping.
 11. Sync a business date with no sales or refund activity and confirm it produces no dated accounting draft.
+12. For a paid future order, confirm the payment date shows one Payment Exceptions journal, the fulfillment date shows a scheduled Sales Receipt plus release journal, and the parity view links both dates with the source tip total.
+13. Post the payment journal externally, choose **Sync QuickBooks and recheck**, and confirm the evidence timestamp advances and exact provider evidence becomes acknowledgeable without creating a ClawPilot posting.
+14. Confirm a general card-settlement mapping satisfies a single card brand, while reusing the POS clearing account for Payment Exceptions remains a visible blocker.
+15. Confirm historical multiple-receipt settlement bundles and standalone Payment Exceptions capture journals are classified as valid history rather than ambiguous one-to-one failures.
 12. Enable **Email issue alerts**, leave one confirmed current-date mapping issue, run the worker twice, and confirm one Activity item and one email delivery are created for that occurrence. Open the action and confirm the correct organization, location, date, and Accounting view load.
 13. Resolve the issue and confirm Activity records the resolution. Reintroduce the issue and confirm exactly one new occurrence is queued.
 14. Disable email alerts and confirm issue Activity continues without an outbox row. Confirm a demo or reserved recipient is rejected even if it has owner permissions.

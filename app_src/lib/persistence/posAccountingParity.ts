@@ -52,6 +52,16 @@ interface PosAccountingExpectedBase extends PosAccountingIdentity {
     externalPostingReference: string | null
     quickBooksSalesReceiptId: string | null
     quickBooksJournalEntryId: string | null
+    scheduledForFuture: boolean
+    sourceTipsCents: number | null
+    paymentExceptions: {
+      affectedChecks: number
+      captureChecks: number
+      releaseChecks: number
+      captureAmountCents: number
+      releaseAmountCents: number
+      links: PosAccountingPaymentExceptionLink[]
+    }
     postingBatch: {
       id: string
       status: string
@@ -78,6 +88,18 @@ interface PosAccountingExpectedBase extends PosAccountingIdentity {
       }
     } | null
   }
+}
+
+export interface PosAccountingPaymentExceptionLink {
+  kind: 'capture' | 'release'
+  orderKey: string
+  checkKey: string
+  paymentKey: string
+  paymentBusinessDate: string
+  fulfillmentBusinessDate: string
+  amountCents: number
+  tipCents: number
+  totalCents: number
 }
 
 export interface NormalizedExpectedSalesReceipt extends PosAccountingExpectedBase {
@@ -221,6 +243,8 @@ export interface PosAccountingHistoricalBaseline {
   summary: {
     cachedTransactions: number
     pairCount: number
+    postingBundleCount: number
+    journalOnlyCaptureCount: number
     exactMarkerPairs: number
     dateFallbackPairs: number
     unmatchedGroups: number
@@ -236,6 +260,22 @@ export interface PosAccountingHistoricalBaseline {
     salesReceipt: PosAccountingHistoricalEvidenceReference
     journalEntry: PosAccountingHistoricalEvidenceReference
     receiptArithmetic: PosAccountingReceiptArithmeticCheck
+    journalBalance: PosAccountingJournalBalanceCheck
+  }>
+  postingBundles: Array<{
+    basis: 'business_date_and_marker'
+    businessDate: string
+    marker: string
+    salesReceipts: PosAccountingHistoricalEvidenceReference[]
+    journalEntries: PosAccountingHistoricalEvidenceReference[]
+    receiptArithmetic: PosAccountingReceiptArithmeticCheck[]
+    journalBalance: PosAccountingJournalBalanceCheck[]
+    receiptTotalCents: number | null
+  }>
+  journalOnlyCaptures: Array<{
+    basis: 'payment_exceptions_account'
+    businessDate: string
+    journalEntry: PosAccountingHistoricalEvidenceReference
     journalBalance: PosAccountingJournalBalanceCheck
   }>
   unmatchedGroups: Array<{
@@ -256,13 +296,35 @@ export interface PosAccountingHistoricalBaseline {
 export interface PosAccountingParityMatch {
   expected: NormalizedExpectedPosAccountingDocument
   actual: NormalizedQuickBooksPosAccountingEvidence | null
-  status: 'matched' | 'ambiguous' | 'missing_quickbooks'
+  status: 'matched' | 'ambiguous' | 'missing_quickbooks' | 'scheduled'
   basis: PosAccountingParityMatchBasis | null
   candidateTransactionIds: string[]
 }
 
 export interface PosAccountingParityReport {
   dates: string[]
+  evidenceLastSyncedAt: string | null
+  evidenceFreshness: {
+    draftsNewerThanEvidence: number
+    evidenceMayBeStale: boolean
+  }
+  preorderLifecycles: Array<{
+    lifecycleId: string
+    restaurantGuid: string
+    restaurantName: string | null
+    locationName: string | null
+    orderKey: string
+    checkKey: string
+    paymentKey: string
+    paymentBusinessDate: string
+    fulfillmentBusinessDate: string
+    amountCents: number
+    tipCents: number
+    totalCents: number
+    captureDraftId: string | null
+    releaseDraftId: string | null
+    status: 'linked' | 'capture_only' | 'release_only'
+  }>
   historicalBaseline: PosAccountingHistoricalBaseline
   rows: Array<{
     expected: NormalizedExpectedPosAccountingDocument
@@ -290,11 +352,13 @@ export interface PosAccountingParityReport {
     cachedTransactions: number
     matched: number
     ambiguous: number
+    scheduled: number
     missingQuickBooks: number
     unmatchedQuickBooks: number
     comparisonsMatched: number
     comparisonsWithVariance: number
     comparisonsWithInsufficientEvidence: number
+    draftsNewerThanEvidence: number
   }
 }
 
@@ -332,6 +396,8 @@ export interface PosAccountingParityPostgresReport extends PosAccountingParityRe
     pageSize: number
     totalPages: number
     pairPages: number
+    postingBundlePages: number
+    journalOnlyCapturePages: number
     unmatchedPages: number
     ambiguousPages: number
   }
@@ -339,6 +405,7 @@ export interface PosAccountingParityPostgresReport extends PosAccountingParityRe
     configured: boolean
     connectionStatus: string | null
     lastCatalogSyncedAt: string | null
+    lastPosEvidenceSyncedAt: string | null
     syncStatus: string | null
     syncCompletedAt: string | null
     salesReceiptCount: number
@@ -378,6 +445,10 @@ function firstText(values: unknown[], maximumLength = 500): string | null {
 function integer(value: unknown, fallback = 0): number {
   const parsed = typeof value === 'number' ? value : Number(value)
   return Number.isSafeInteger(parsed) ? parsed : fallback
+}
+
+function boolean(value: unknown): boolean {
+  return value === true || value === 'true'
 }
 
 function timestamp(value: unknown): string | null {
@@ -843,6 +914,36 @@ function normalizeExpectedJournalLines(lines: UnknownRecord[]) {
   }
 }
 
+function normalizePaymentExceptionLink(value: unknown): PosAccountingPaymentExceptionLink | null {
+  const link = asRecord(value)
+  const kindValue = text(link.kind, 20)
+  const kind = kindValue === 'capture' || kindValue === 'release' ? kindValue : null
+  const orderKey = text(link.orderKey, 300)
+  const checkKey = text(link.checkKey, 300)
+  const paymentKey = text(link.paymentKey, 300)
+  const paymentBusinessDate = businessDate(link.paymentBusinessDate)
+  const fulfillmentBusinessDate = businessDate(link.fulfillmentBusinessDate)
+  const amountCents = firstMoney(link, ['amountCents'], ['amount'])
+  const tipCents = firstMoney(link, ['tipCents'], ['tip']) ?? 0
+  const totalCents = firstMoney(link, ['totalCents'], ['total'])
+    ?? (amountCents === null ? null : amountCents + tipCents)
+  if (!kind || !orderKey || !checkKey || !paymentKey || !paymentBusinessDate
+    || !fulfillmentBusinessDate || amountCents === null || totalCents === null) {
+    return null
+  }
+  return {
+    kind,
+    orderKey,
+    checkKey,
+    paymentKey,
+    paymentBusinessDate,
+    fulfillmentBusinessDate,
+    amountCents,
+    tipCents,
+    totalCents,
+  }
+}
+
 export function normalizePosAccountingDraftEvidence(
   input: unknown,
 ): NormalizedPosAccountingDraftEvidence | null {
@@ -855,6 +956,19 @@ export function normalizePosAccountingDraftEvidence(
   const sourceSummary = asRecord(row.source_summary ?? row.sourceSummary)
   const standard = asRecord(sourceSummary.standard)
   const canonicalReceipt = recordAt(sourceSummary, ['canonical', 'accounting', 'salesReceipt'])
+  const canonicalPaymentExceptions = recordAt(sourceSummary, ['canonical', 'paymentExceptions'])
+  const readinessPaymentExceptions = recordAt(
+    sourceSummary,
+    ['canonical', 'readiness', 'paymentExceptions'],
+  )
+  const paymentExceptions = Object.keys(canonicalPaymentExceptions).length > 0
+    ? canonicalPaymentExceptions
+    : readinessPaymentExceptions
+  const paymentExceptionLinks = asList(paymentExceptions.links)
+    .map(normalizePaymentExceptionLink)
+    .filter((link): link is PosAccountingPaymentExceptionLink => Boolean(link))
+  const sourceTipsCents = firstMoney(canonicalReceipt, ['tipsCents'], ['tips'])
+    ?? firstMoney(standard, ['tipsCents'], ['tips'])
   const quickBooksPayload = asRecord(row.quickbooks_payload ?? row.quickBooksPayload)
   const receiptDocument = documentRecord(
     sourceSummary,
@@ -940,6 +1054,16 @@ export function normalizePosAccountingDraftEvidence(
       row.quickbooks_journal_entry_id,
       row.quickBooksJournalEntryId,
     ], 200),
+    scheduledForFuture: boolean(row.scheduled_for_future ?? row.scheduledForFuture),
+    sourceTipsCents,
+    paymentExceptions: {
+      affectedChecks: Math.max(0, integer(paymentExceptions.affectedChecks, 0)),
+      captureChecks: Math.max(0, integer(paymentExceptions.captureChecks, 0)),
+      releaseChecks: Math.max(0, integer(paymentExceptions.releaseChecks, 0)),
+      captureAmountCents: firstMoney(paymentExceptions, ['captureAmountCents'], ['captureAmount']) ?? 0,
+      releaseAmountCents: firstMoney(paymentExceptions, ['releaseAmountCents'], ['releaseAmount']) ?? 0,
+      links: paymentExceptionLinks,
+    },
     postingBatch,
   }
 
@@ -1297,7 +1421,9 @@ export function matchPosAccountingParityDocuments(input: {
     matches.set(expectedId, {
       expected: expectedItem,
       actual: null,
-      status: candidateTransactionIds.length > 0 ? 'ambiguous' : 'missing_quickbooks',
+      status: candidateTransactionIds.length > 0
+        ? 'ambiguous'
+        : expectedItem.draft.scheduledForFuture ? 'scheduled' : 'missing_quickbooks',
       basis: null,
       candidateTransactionIds,
     })
@@ -1386,6 +1512,13 @@ function statusCounts(statuses: Array<'match' | 'variance' | 'insufficient_evide
   }
 }
 
+function isPaymentExceptionsJournal(journal: NormalizedQuickBooksJournalEntry): boolean {
+  return journal.postingOrigin !== null && journal.lineGroups.some((line) => {
+    const accountName = normalizedIdentity(line.accountName)
+    return Boolean(accountName && /\bpayment exceptions?\b/.test(accountName))
+  })
+}
+
 export function buildHistoricalPosAccountingBaseline(
   evidence: readonly NormalizedQuickBooksPosAccountingEvidence[],
 ): PosAccountingHistoricalBaseline {
@@ -1403,6 +1536,8 @@ export function buildHistoricalPosAccountingBaseline(
   const remainingJournals = new Set(journalById.keys())
   const ambiguousEvidenceIds = new Set<string>()
   const pairs: PosAccountingHistoricalBaseline['pairs'] = []
+  const postingBundles: PosAccountingHistoricalBaseline['postingBundles'] = []
+  const journalOnlyCaptures: PosAccountingHistoricalBaseline['journalOnlyCaptures'] = []
   const ambiguousGroups: PosAccountingHistoricalBaseline['ambiguousGroups'] = []
 
   const appendPair = (
@@ -1448,19 +1583,36 @@ export function buildHistoricalPosAccountingBaseline(
       appendPair(groupReceipts[0], groupJournals[0], 'business_date_and_marker')
       continue
     }
-    const groupEvidence = [...groupReceipts, ...groupJournals]
-    groupEvidence.forEach((item) => {
-      ambiguousEvidenceIds.add(item.evidenceId)
+    const receiptTotals = groupReceipts.map((receipt) => receipt.totalCents)
+    postingBundles.push({
+      basis: 'business_date_and_marker',
+      businessDate: groupReceipts[0].businessDate,
+      marker: normalizedIdentity(groupReceipts[0].memo) || '',
+      salesReceipts: groupReceipts.map(historicalEvidenceReference),
+      journalEntries: groupJournals.map(historicalEvidenceReference),
+      receiptArithmetic: groupReceipts.map(compareSalesReceiptInternalArithmetic),
+      journalBalance: groupJournals.map(compareJournalEntryBalance),
+      receiptTotalCents: receiptTotals.every((amount): amount is number => amount !== null)
+        ? receiptTotals.reduce((total, amount) => total + amount, 0)
+        : null,
+    })
+    const bundledEvidence = [...groupReceipts, ...groupJournals]
+    bundledEvidence.forEach((item) => {
       remainingReceipts.delete(item.evidenceId)
       remainingJournals.delete(item.evidenceId)
     })
-    ambiguousGroups.push({
-      basis: 'business_date_and_marker',
-      businessDate: groupEvidence[0].businessDate,
-      documentNumber: null,
-      salesReceipts: groupReceipts.map(historicalEvidenceReference),
-      journalEntries: groupJournals.map(historicalEvidenceReference),
+  }
+
+  for (const journalId of [...remainingJournals]) {
+    const journal = journalById.get(journalId)
+    if (!journal || !isPaymentExceptionsJournal(journal)) continue
+    journalOnlyCaptures.push({
+      basis: 'payment_exceptions_account',
+      businessDate: journal.businessDate,
+      journalEntry: historicalEvidenceReference(journal),
+      journalBalance: compareJournalEntryBalance(journal),
     })
+    remainingJournals.delete(journalId)
   }
 
   const remainingDates = [...new Set([
@@ -1531,6 +1683,10 @@ export function buildHistoricalPosAccountingBaseline(
 
   pairs.sort((left, right) => right.businessDate.localeCompare(left.businessDate)
     || left.salesReceipt.evidenceId.localeCompare(right.salesReceipt.evidenceId))
+  postingBundles.sort((left, right) => right.businessDate.localeCompare(left.businessDate)
+    || left.marker.localeCompare(right.marker))
+  journalOnlyCaptures.sort((left, right) => right.businessDate.localeCompare(left.businessDate)
+    || left.journalEntry.evidenceId.localeCompare(right.journalEntry.evidenceId))
   ambiguousGroups.sort((left, right) => right.businessDate.localeCompare(left.businessDate)
     || left.basis.localeCompare(right.basis)
     || (left.documentNumber || '').localeCompare(right.documentNumber || ''))
@@ -1540,6 +1696,8 @@ export function buildHistoricalPosAccountingBaseline(
     summary: {
       cachedTransactions: evidence.length,
       pairCount: pairs.length,
+      postingBundleCount: postingBundles.length,
+      journalOnlyCaptureCount: journalOnlyCaptures.length,
       exactMarkerPairs: pairs
         .filter((pair) => pair.basis === 'business_date_and_marker').length,
       dateFallbackPairs: pairs.filter((pair) => pair.basis === 'business_date_only').length,
@@ -1551,15 +1709,82 @@ export function buildHistoricalPosAccountingBaseline(
       journalBalance: statusCounts(journalChecks.map((check) => check.status)),
     },
     pairs,
+    postingBundles,
+    journalOnlyCaptures,
     unmatchedGroups,
     ambiguousGroups,
   }
+}
+
+function buildPreorderLifecycles(
+  drafts: readonly NormalizedPosAccountingDraftEvidence[],
+): PosAccountingParityReport['preorderLifecycles'] {
+  const lifecycles = new Map<string, {
+    reference: PosAccountingPaymentExceptionLink
+    draft: PosAccountingExpectedBase['draft']
+    captureDraftIds: Set<string>
+    releaseDraftIds: Set<string>
+  }>()
+  for (const normalizedDraft of drafts) {
+    const draft = normalizedDraft.documents[0]?.draft
+    if (!draft) continue
+    for (const link of draft.paymentExceptions.links) {
+      const lifecycleId = [
+        draft.restaurantGuid,
+        link.orderKey,
+        link.checkKey,
+        link.paymentKey,
+        link.paymentBusinessDate,
+        link.fulfillmentBusinessDate,
+        link.amountCents,
+        link.tipCents,
+        link.totalCents,
+      ].join(':')
+      const lifecycle = lifecycles.get(lifecycleId) || {
+        reference: link,
+        draft,
+        captureDraftIds: new Set<string>(),
+        releaseDraftIds: new Set<string>(),
+      }
+      if (link.kind === 'capture') lifecycle.captureDraftIds.add(draft.id)
+      else lifecycle.releaseDraftIds.add(draft.id)
+      lifecycles.set(lifecycleId, lifecycle)
+    }
+  }
+  return [...lifecycles].map(([lifecycleId, lifecycle]) => {
+    const captureDraftIds = [...lifecycle.captureDraftIds].sort()
+    const releaseDraftIds = [...lifecycle.releaseDraftIds].sort()
+    return {
+      lifecycleId,
+      restaurantGuid: lifecycle.draft.restaurantGuid,
+      restaurantName: lifecycle.draft.restaurantName,
+      locationName: lifecycle.draft.locationName,
+      orderKey: lifecycle.reference.orderKey,
+      checkKey: lifecycle.reference.checkKey,
+      paymentKey: lifecycle.reference.paymentKey,
+      paymentBusinessDate: lifecycle.reference.paymentBusinessDate,
+      fulfillmentBusinessDate: lifecycle.reference.fulfillmentBusinessDate,
+      amountCents: lifecycle.reference.amountCents,
+      tipCents: lifecycle.reference.tipCents,
+      totalCents: lifecycle.reference.totalCents,
+      captureDraftId: captureDraftIds.length === 1 ? captureDraftIds[0] : null,
+      releaseDraftId: releaseDraftIds.length === 1 ? releaseDraftIds[0] : null,
+      status: captureDraftIds.length > 0 && releaseDraftIds.length > 0
+        ? 'linked' as const
+        : captureDraftIds.length > 0 ? 'capture_only' as const : 'release_only' as const,
+    }
+  }).sort((left, right) =>
+    right.paymentBusinessDate.localeCompare(left.paymentBusinessDate)
+      || right.fulfillmentBusinessDate.localeCompare(left.fulfillmentBusinessDate)
+      || left.lifecycleId.localeCompare(right.lifecycleId))
 }
 
 export function buildPosAccountingParityReport(input: {
   drafts: readonly unknown[]
   transactions: readonly unknown[]
   fullHistoryTransactions?: readonly unknown[]
+  evidenceLastSyncedAt?: string | null
+  draftsNewerThanEvidence?: number
 }): PosAccountingParityReport {
   const drafts = input.drafts
     .map(normalizePosAccountingDraftEvidence)
@@ -1611,8 +1836,25 @@ export function buildPosAccountingParityReport(input: {
     ...transactions.map((transaction) => transaction.businessDate),
   ])].sort().reverse()
   const comparisonStatuses = rows.map((row) => row.comparison?.status).filter(Boolean)
+  const evidenceLastSyncedAt = timestamp(input.evidenceLastSyncedAt)
+  const locallyCountedDraftsNewerThanEvidence = evidenceLastSyncedAt
+    ? drafts.filter((draft) => {
+      const updatedAt = draft.documents[0]?.draft.updatedAt
+      return updatedAt !== null && updatedAt > evidenceLastSyncedAt
+    }).length
+    : drafts.length
+  const draftsNewerThanEvidence = Math.max(
+    0,
+    input.draftsNewerThanEvidence ?? locallyCountedDraftsNewerThanEvidence,
+  )
   return {
     dates,
+    evidenceLastSyncedAt,
+    evidenceFreshness: {
+      draftsNewerThanEvidence,
+      evidenceMayBeStale: draftsNewerThanEvidence > 0,
+    },
+    preorderLifecycles: buildPreorderLifecycles(drafts),
     historicalBaseline: buildHistoricalPosAccountingBaseline(fullHistoryTransactions),
     rows,
     unmatchedQuickBooks: matched.unmatchedQuickBooks,
@@ -1627,12 +1869,14 @@ export function buildPosAccountingParityReport(input: {
       cachedTransactions: transactions.length,
       matched: rows.filter((row) => row.match.status === 'matched').length,
       ambiguous: rows.filter((row) => row.match.status === 'ambiguous').length,
+      scheduled: rows.filter((row) => row.match.status === 'scheduled').length,
       missingQuickBooks: rows.filter((row) => row.match.status === 'missing_quickbooks').length,
       unmatchedQuickBooks: matched.unmatchedQuickBooks.length,
       comparisonsMatched: comparisonStatuses.filter((status) => status === 'match').length,
       comparisonsWithVariance: comparisonStatuses.filter((status) => status === 'variance').length,
       comparisonsWithInsufficientEvidence: comparisonStatuses
         .filter((status) => status === 'insufficient_evidence').length,
+      draftsNewerThanEvidence,
     },
   }
 }
@@ -1776,10 +2020,12 @@ export async function readPosAccountingParityReportInPostgres(
       configured: boolean
       connection_status: string | null
       last_catalog_synced_at: string | null
+      last_pos_evidence_synced_at: string | null
       sync_status: string | null
       sync_completed_at: string | null
       sales_receipt_count: string
       journal_entry_count: string
+      drafts_newer_than_evidence: string
     }>(
       `SELECT
          EXISTS (
@@ -1795,6 +2041,11 @@ export async function readPosAccountingParityReportInPostgres(
            FROM organization_quickbooks_connections connection
            WHERE connection.organization_id = $1::uuid
          ) AS last_catalog_synced_at,
+         (
+           SELECT connection.last_pos_evidence_synced_at::text
+           FROM organization_quickbooks_connections connection
+           WHERE connection.organization_id = $1::uuid
+         ) AS last_pos_evidence_synced_at,
          (
            SELECT outbox.status FROM quickbooks_sync_outbox outbox
            WHERE outbox.organization_id = $1::uuid AND outbox.sync_kind = 'catalog'
@@ -1814,8 +2065,22 @@ export async function readPosAccountingParityReportInPostgres(
            WHERE transaction.organization_id = $1::uuid
              AND transaction.entity_type = 'JournalEntry'
              AND ${POS_ACCOUNTING_TRANSACTION_SQL}
-         ) AS journal_entry_count`,
-      [organizationId],
+         ) AS journal_entry_count,
+         (
+           SELECT count(*)::text
+           FROM toast_accounting_export_drafts draft
+           LEFT JOIN organization_quickbooks_connections connection
+             ON connection.organization_id = draft.organization_id
+           WHERE draft.organization_id = $1::uuid
+             AND draft.is_current = true
+             AND ($2::date IS NULL OR draft.business_date >= $2::date)
+             AND ($3::date IS NULL OR draft.business_date <= $3::date)
+             AND (
+               connection.last_pos_evidence_synced_at IS NULL
+               OR draft.updated_at > connection.last_pos_evidence_synced_at
+             )
+         ) AS drafts_newer_than_evidence`,
+      baseValues,
     ),
     query<{
       entity_type: string
@@ -1903,6 +2168,7 @@ export async function readPosAccountingParityReportInPostgres(
       draft_revision: number
       source_revision: number
       updated_at: string
+      scheduled_for_future: boolean
     }>(
       `SELECT draft.id::text, draft.restaurant_guid::text,
          location.restaurant_name, location.location_name,
@@ -1932,11 +2198,17 @@ export async function readPosAccountingParityReportInPostgres(
          journal_request.provider_entity_id AS journal_entry_provider_entity_id,
          journal_request.last_error_message AS journal_entry_request_error,
          draft.draft_revision, draft.source_revision,
-         draft.updated_at::text
+         draft.updated_at::text,
+         (
+           draft.business_date
+             > (now() AT TIME ZONE COALESCE(location_zone.name, 'UTC'))::date
+         ) AS scheduled_for_future
        FROM toast_accounting_export_drafts draft
        LEFT JOIN toast_locations location
         ON location.organization_id = draft.organization_id
         AND location.restaurant_guid = draft.restaurant_guid
+       LEFT JOIN pg_timezone_names location_zone
+         ON location_zone.name = NULLIF(location.timezone, '')
        LEFT JOIN pos_accounting_posting_batches posting_batch
          ON posting_batch.organization_id = draft.organization_id
         AND posting_batch.id = draft.posting_batch_id
@@ -1959,6 +2231,10 @@ export async function readPosAccountingParityReportInPostgres(
     drafts,
     transactions,
     fullHistoryTransactions: fullHistoryResult.rows,
+    evidenceLastSyncedAt: cacheResult.rows[0]?.last_pos_evidence_synced_at,
+    draftsNewerThanEvidence: numberFromDatabase(
+      cacheResult.rows[0]?.drafts_newer_than_evidence,
+    ),
   })
   const historicalOffset = (historyPage - 1) * historyPageSize
   const historicalBaseline = fullReport.historicalBaseline
@@ -1968,6 +2244,12 @@ export async function readPosAccountingParityReportInPostgres(
     pairPages: historicalBaseline.pairs.length === 0
       ? 0
       : Math.ceil(historicalBaseline.pairs.length / historyPageSize),
+    postingBundlePages: historicalBaseline.postingBundles.length === 0
+      ? 0
+      : Math.ceil(historicalBaseline.postingBundles.length / historyPageSize),
+    journalOnlyCapturePages: historicalBaseline.journalOnlyCaptures.length === 0
+      ? 0
+      : Math.ceil(historicalBaseline.journalOnlyCaptures.length / historyPageSize),
     unmatchedPages: historicalBaseline.unmatchedGroups.length === 0
       ? 0
       : Math.ceil(historicalBaseline.unmatchedGroups.length / historyPageSize),
@@ -1978,6 +2260,8 @@ export async function readPosAccountingParityReportInPostgres(
   }
   historicalPagination.totalPages = Math.max(
     historicalPagination.pairPages,
+    historicalPagination.postingBundlePages,
+    historicalPagination.journalOnlyCapturePages,
     historicalPagination.unmatchedPages,
     historicalPagination.ambiguousPages,
   )
@@ -1986,6 +2270,10 @@ export async function readPosAccountingParityReportInPostgres(
     historicalBaseline: {
       ...historicalBaseline,
       pairs: historicalBaseline.pairs.slice(historicalOffset, historicalOffset + historyPageSize),
+      postingBundles: historicalBaseline.postingBundles
+        .slice(historicalOffset, historicalOffset + historyPageSize),
+      journalOnlyCaptures: historicalBaseline.journalOnlyCaptures
+        .slice(historicalOffset, historicalOffset + historyPageSize),
       unmatchedGroups: historicalBaseline.unmatchedGroups
         .slice(historicalOffset, historicalOffset + historyPageSize),
       ambiguousGroups: historicalBaseline.ambiguousGroups
@@ -1998,6 +2286,7 @@ export async function readPosAccountingParityReportInPostgres(
     configured: cacheRow?.configured === true,
     connectionStatus: text(cacheRow?.connection_status, 80),
     lastCatalogSyncedAt: timestamp(cacheRow?.last_catalog_synced_at),
+    lastPosEvidenceSyncedAt: timestamp(cacheRow?.last_pos_evidence_synced_at),
     syncStatus: text(cacheRow?.sync_status, 80),
     syncCompletedAt: timestamp(cacheRow?.sync_completed_at),
     salesReceiptCount: numberFromDatabase(cacheRow?.sales_receipt_count),
@@ -2008,6 +2297,11 @@ export async function readPosAccountingParityReportInPostgres(
   else if (cache.connectionStatus !== 'active') warnings.push('The QuickBooks connection is not active.')
   if (cache.syncStatus !== 'succeeded') {
     warnings.push('The latest QuickBooks catalog sync is not marked succeeded; unmatched evidence may be incomplete.')
+  }
+  if (report.evidenceFreshness.evidenceMayBeStale) {
+    warnings.push(
+      `${report.evidenceFreshness.draftsNewerThanEvidence} current POS draft(s) changed after the latest QuickBooks evidence sync.`,
+    )
   }
   if (report.discardedEvidence.drafts > 0 || report.discardedEvidence.quickBooksTransactions > 0) {
     warnings.push('Evidence with an invalid identifier, entity type, or business date was excluded.')

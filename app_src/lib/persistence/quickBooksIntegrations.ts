@@ -1,5 +1,6 @@
 import crypto from 'crypto'
 import { recordAuditEvent } from '@/lib/auditWriter'
+import { readQuickBooksPosTransactions } from '@/lib/integrations/quickBooksClient'
 import type {
   QuickBooksAccount,
   QuickBooksAttachment,
@@ -597,6 +598,155 @@ export async function queueQuickBooksCatalogSyncInPostgres(input: {
   )
   if (!result.rowCount) throw new Error('Connect QuickBooks before refreshing the catalog')
   return result.rows[0]
+}
+
+export async function refreshQuickBooksPosEvidenceInPostgres(input: {
+  organizationId: string
+  fromBusinessDate: string
+  toBusinessDate: string
+  actorEmail: string
+}) {
+  const connection = await query<{
+    credential_owner_email: string
+    maton_connection_id: string
+    status: string
+  }>(
+    `SELECT credential_owner_email, maton_connection_id, status
+     FROM organization_quickbooks_connections
+     WHERE organization_id = $1::uuid
+     LIMIT 1`,
+    [input.organizationId],
+  )
+  const binding = connection.rows[0]
+  if (!binding || binding.status !== 'active') {
+    throw new Error('The active organization QuickBooks connection is unavailable')
+  }
+  const transactions = await readQuickBooksPosTransactions({
+    ownerEmail: binding.credential_owner_email,
+    connectionId: binding.maton_connection_id,
+    fromBusinessDate: input.fromBusinessDate,
+    toBusinessDate: input.toBusinessDate,
+  })
+  const outOfScopeTransaction = transactions.find((entry) => (
+    !entry.id
+    || !['SalesReceipt', 'JournalEntry'].includes(entry.entityType)
+    || !entry.transactionDate
+    || entry.transactionDate < input.fromBusinessDate
+    || entry.transactionDate > input.toBusinessDate
+  ))
+  if (outOfScopeTransaction) {
+    throw new Error('QuickBooks POS evidence response was outside the requested scope')
+  }
+  const refreshedAt = await withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `quickbooks-binding:${input.organizationId}`,
+    )
+    await acquireTransactionAdvisoryLock(
+      client,
+      `quickbooks-pos-evidence:${input.organizationId}`,
+    )
+    const activeBinding = await client.query(
+      `SELECT organization_id
+       FROM organization_quickbooks_connections
+       WHERE organization_id = $1::uuid
+         AND credential_owner_email = $2
+         AND maton_connection_id = $3
+         AND status = 'active'
+       FOR SHARE`,
+      [input.organizationId, binding.credential_owner_email, binding.maton_connection_id],
+    )
+    if (activeBinding.rowCount !== 1) {
+      throw new Error('QuickBooks connection changed before POS evidence refresh completion')
+    }
+    await client.query(
+      `DELETE FROM quickbooks_transactions
+       WHERE organization_id = $1::uuid
+         AND entity_type IN ('SalesReceipt', 'JournalEntry')
+         AND transaction_date BETWEEN $2::date AND $3::date`,
+      [input.organizationId, input.fromBusinessDate, input.toBusinessDate],
+    )
+    for (let offset = 0; offset < transactions.length; offset += 500) {
+      await client.query(
+        `INSERT INTO quickbooks_transactions (
+           organization_id, entity_type, quickbooks_transaction_id, document_number,
+           transaction_date, due_date, party_id, party_name, account_id, account_name,
+           currency_code, total_amount, open_balance, transaction_status, email_status,
+           payment_method, memo, source_payload, synced_at
+         )
+         SELECT $1::uuid, row."entityType", row.id, row."documentNumber",
+           row."transactionDate"::date, row."dueDate"::date, row."partyId", row."partyName",
+           row."accountId", row."accountName", row."currencyCode", row."totalAmount",
+           row."openBalance", row.status, row."emailStatus", row."paymentMethod", row.memo,
+           row."sourcePayload", now()
+         FROM jsonb_to_recordset($2::jsonb) AS row(
+           id text, "entityType" text, "documentNumber" text, "transactionDate" text,
+           "dueDate" text, "partyId" text, "partyName" text, "accountId" text,
+           "accountName" text, "currencyCode" text, "totalAmount" numeric,
+           "openBalance" numeric, status text, "emailStatus" text, "paymentMethod" text,
+           memo text, "sourcePayload" jsonb
+         )
+         ON CONFLICT (organization_id, entity_type, quickbooks_transaction_id) DO UPDATE SET
+           document_number = EXCLUDED.document_number,
+           transaction_date = EXCLUDED.transaction_date,
+           due_date = EXCLUDED.due_date,
+           party_id = EXCLUDED.party_id,
+           party_name = EXCLUDED.party_name,
+           account_id = EXCLUDED.account_id,
+           account_name = EXCLUDED.account_name,
+           currency_code = EXCLUDED.currency_code,
+           total_amount = EXCLUDED.total_amount,
+           open_balance = EXCLUDED.open_balance,
+           transaction_status = EXCLUDED.transaction_status,
+           email_status = EXCLUDED.email_status,
+           payment_method = EXCLUDED.payment_method,
+           memo = EXCLUDED.memo,
+           source_payload = EXCLUDED.source_payload,
+           synced_at = EXCLUDED.synced_at`,
+        [input.organizationId, JSON.stringify(transactions.slice(offset, offset + 500))],
+      )
+    }
+    const updated = await client.query<{ refreshed_at: string }>(
+      `UPDATE organization_quickbooks_connections
+       SET last_pos_evidence_synced_at = now(), updated_by = lower($2), updated_at = now()
+       WHERE organization_id = $1::uuid
+         AND credential_owner_email = $3
+         AND maton_connection_id = $4
+         AND status = 'active'
+       RETURNING last_pos_evidence_synced_at::text AS refreshed_at`,
+      [
+        input.organizationId,
+        input.actorEmail,
+        binding.credential_owner_email,
+        binding.maton_connection_id,
+      ],
+    )
+    if (updated.rowCount !== 1) {
+      throw new Error('QuickBooks connection changed before POS evidence refresh completion')
+    }
+    await recordAuditEvent({
+      actor: input.actorEmail,
+      eventType: 'quickbooks.pos_evidence.refreshed',
+      aggregateType: 'organization_quickbooks_connection',
+      aggregateId: input.organizationId,
+      organizationId: input.organizationId,
+      payload: {
+        fromBusinessDate: input.fromBusinessDate,
+        toBusinessDate: input.toBusinessDate,
+        transactionCount: transactions.length,
+        entityTypes: ['SalesReceipt', 'JournalEntry'],
+      },
+    }, client)
+    return updated.rows[0].refreshed_at
+  })
+  return {
+    fromBusinessDate: input.fromBusinessDate,
+    toBusinessDate: input.toBusinessDate,
+    transactionCount: transactions.length,
+    salesReceiptCount: transactions.filter((entry) => entry.entityType === 'SalesReceipt').length,
+    journalEntryCount: transactions.filter((entry) => entry.entityType === 'JournalEntry').length,
+    refreshedAt,
+  }
 }
 
 export async function queueAutomaticQuickBooksCatalogSyncsInPostgres() {

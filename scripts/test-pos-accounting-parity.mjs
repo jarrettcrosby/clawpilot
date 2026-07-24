@@ -421,6 +421,7 @@ const tipsExcludedDraft = pure.normalizePosAccountingDraftEvidence(accountingDra
   }],
 }))
 assert.equal(tipsExcludedDraft.documents[0].totalCents, 1875)
+assert.equal(tipsExcludedDraft.documents[0].draft.sourceTipsCents, 250)
 assert.equal(tipsExcludedDraft.documents[1].lineGroups.length, 5)
 assert.equal(
   pure.compareSalesReceiptEvidence(tipsExcludedDraft.documents[0], normalizedReceipt).status,
@@ -554,6 +555,96 @@ assert.equal(ambiguity.matches[0].candidateTransactionIds.length, 2)
 assert.equal(ambiguity.matches[1].status, 'missing_quickbooks')
 assert.equal(ambiguity.unmatchedQuickBooks.length, 3)
 assert.equal(ambiguity.unmatchedQuickBooks.filter((row) => row.ambiguous).length, 2)
+
+const scheduledDraftInput = accountingDraft({
+  id: 'draft-scheduled',
+  date: '2026-09-20',
+  receiptDocumentNumber: '260920POS',
+  journalDocumentNumber: '260920POS',
+})
+scheduledDraftInput.scheduled_for_future = true
+const scheduledReport = pure.buildPosAccountingParityReport({
+  drafts: [scheduledDraftInput],
+  transactions: [],
+  evidenceLastSyncedAt: '2026-09-17T12:00:00.000Z',
+})
+assert.equal(scheduledReport.summary.scheduled, 2)
+assert.equal(scheduledReport.summary.missingQuickBooks, 0)
+assert.equal(scheduledReport.rows.every((row) => row.match.status === 'scheduled'), true)
+
+const captureLifecycleDraft = accountingDraft({
+  id: 'draft-preorder-capture',
+  date: '2026-07-23',
+  receiptDocumentNumber: '260723POS',
+  journalDocumentNumber: '260723POS',
+  standard: { total: '44.54', tendered: '44.54', tax: '3.04', tips: '0.00' },
+})
+captureLifecycleDraft.source_summary.canonical.paymentExceptions = {
+  affectedChecks: 2,
+  captureChecks: 2,
+  releaseChecks: 0,
+  captureAmount: 44.54,
+  releaseAmount: 0,
+  links: [{
+    kind: 'capture',
+    orderKey: 'order-1',
+    checkKey: 'check-1',
+    paymentKey: 'payment-1',
+    paymentBusinessDate: '2026-07-23',
+    fulfillmentBusinessDate: '2026-07-25',
+    amount: 44.54,
+    tip: 0,
+    total: 44.54,
+  }],
+}
+const releaseLifecycleDraft = accountingDraft({
+  id: 'draft-preorder-release',
+  date: '2026-07-25',
+  receiptDocumentNumber: '260725POS',
+  journalDocumentNumber: '260725POS',
+  standard: { total: '44.54', tendered: '44.54', tax: '3.04', tips: '0.00' },
+})
+releaseLifecycleDraft.source_summary.canonical.paymentExceptions = {
+  affectedChecks: 2,
+  captureChecks: 0,
+  releaseChecks: 2,
+  captureAmount: 0,
+  releaseAmount: 44.54,
+  links: [{
+    kind: 'release',
+    orderKey: 'order-1',
+    checkKey: 'check-1',
+    paymentKey: 'payment-1',
+    paymentBusinessDate: '2026-07-23',
+    fulfillmentBusinessDate: '2026-07-25',
+    amount: 44.54,
+    tip: 0,
+    total: 44.54,
+  }],
+}
+const lifecycleReport = pure.buildPosAccountingParityReport({
+  drafts: [captureLifecycleDraft, releaseLifecycleDraft],
+  transactions: [],
+  evidenceLastSyncedAt: '2026-07-24T12:00:00.000Z',
+})
+assert.equal(lifecycleReport.preorderLifecycles.length, 1)
+assert.equal(lifecycleReport.preorderLifecycles[0].status, 'linked')
+assert.equal(lifecycleReport.preorderLifecycles[0].paymentBusinessDate, '2026-07-23')
+assert.equal(lifecycleReport.preorderLifecycles[0].fulfillmentBusinessDate, '2026-07-25')
+assert.equal(lifecycleReport.preorderLifecycles[0].totalCents, 4454)
+assert.equal(lifecycleReport.preorderLifecycles[0].tipCents, 0)
+assert.equal(lifecycleReport.preorderLifecycles[0].captureDraftId, 'draft-preorder-capture')
+assert.equal(lifecycleReport.preorderLifecycles[0].releaseDraftId, 'draft-preorder-release')
+assert.equal(lifecycleReport.evidenceLastSyncedAt, '2026-07-24T12:00:00.000Z')
+assert.equal(lifecycleReport.evidenceFreshness.draftsNewerThanEvidence, 2)
+assert.equal(lifecycleReport.evidenceFreshness.evidenceMayBeStale, true)
+const freshLifecycleReport = pure.buildPosAccountingParityReport({
+  drafts: [captureLifecycleDraft, releaseLifecycleDraft],
+  transactions: [],
+  evidenceLastSyncedAt: '2026-09-17T12:00:00.000Z',
+})
+assert.equal(freshLifecycleReport.evidenceFreshness.draftsNewerThanEvidence, 0)
+assert.equal(freshLifecycleReport.evidenceFreshness.evidenceMayBeStale, false)
 
 function dateRange(first, last, count) {
   const firstMillis = new Date(`${first}T00:00:00.000Z`).getTime()
@@ -701,9 +792,43 @@ const fallbackAndAmbiguousBaseline = pure.buildHistoricalPosAccountingBaseline([
 assert.equal(fallbackAndAmbiguousBaseline.summary.pairCount, 1)
 assert.equal(fallbackAndAmbiguousBaseline.summary.exactMarkerPairs, 1)
 assert.equal(fallbackAndAmbiguousBaseline.summary.dateFallbackPairs, 0)
-assert.equal(fallbackAndAmbiguousBaseline.summary.ambiguousGroups, 1)
-assert.equal(fallbackAndAmbiguousBaseline.summary.ambiguousEvidence, 3)
+assert.equal(fallbackAndAmbiguousBaseline.summary.postingBundleCount, 1)
+assert.equal(fallbackAndAmbiguousBaseline.postingBundles[0].salesReceipts.length, 2)
+assert.equal(fallbackAndAmbiguousBaseline.postingBundles[0].journalEntries.length, 1)
+assert.equal(fallbackAndAmbiguousBaseline.postingBundles[0].receiptTotalCents, 3750)
+assert.equal(fallbackAndAmbiguousBaseline.summary.ambiguousGroups, 0)
+assert.equal(fallbackAndAmbiguousBaseline.summary.ambiguousEvidence, 0)
 assert.equal(fallbackAndAmbiguousBaseline.summary.unmatchedEvidence, 0)
+
+const journalOnlyCaptureBaseline = pure.buildHistoricalPosAccountingBaseline([
+  pure.normalizeJournalEntryEvidence(journalTransaction({
+    id: 'payment-exception-only',
+    date: '2026-07-23',
+    documentNumber: '260723POS',
+    lines: [{
+      Id: '1', Amount: '42.59', DetailType: 'JournalEntryLineDetail',
+      JournalEntryLineDetail: {
+        PostingType: 'Debit',
+        AccountRef: { value: 'account-bank', name: 'Bank deposit' },
+      },
+    }, {
+      Id: '2', Amount: '1.95', DetailType: 'JournalEntryLineDetail',
+      JournalEntryLineDetail: {
+        PostingType: 'Debit',
+        AccountRef: { value: 'account-fees', name: 'Processing fees' },
+      },
+    }, {
+      Id: '3', Amount: '44.54', DetailType: 'JournalEntryLineDetail',
+      JournalEntryLineDetail: {
+        PostingType: 'Credit',
+        AccountRef: { value: 'account-payment-exceptions', name: 'Payment Exceptions' },
+      },
+    }],
+  })),
+])
+assert.equal(journalOnlyCaptureBaseline.summary.journalOnlyCaptureCount, 1)
+assert.equal(journalOnlyCaptureBaseline.summary.unmatchedEvidence, 0)
+assert.equal(journalOnlyCaptureBaseline.journalOnlyCaptures[0].journalBalance.status, 'match')
 
 const sqlCalls = []
 async function queryMock(source, parameters = []) {
@@ -725,10 +850,12 @@ async function queryMock(source, parameters = []) {
       configured: true,
       connection_status: 'active',
       last_catalog_synced_at: '2026-09-16T12:00:00.000Z',
+      last_pos_evidence_synced_at: '2026-09-16T12:00:00.000Z',
       sync_status: 'succeeded',
       sync_completed_at: '2026-09-16T12:00:00.000Z',
       sales_receipt_count: '49',
       journal_entry_count: '48',
+      drafts_newer_than_evidence: '0',
     }] }
   }
   if (source.includes('LEFT JOIN toast_locations location')) return { rows: [] }
@@ -756,6 +883,9 @@ assert.equal(postgresReport.pagination.dates[0], secondPageDates[0])
 assert.equal(postgresReport.pagination.dates.at(-1), secondPageDates.at(-1))
 assert.equal(postgresReport.cache.salesReceiptCount, 49)
 assert.equal(postgresReport.cache.journalEntryCount, 48)
+assert.equal(postgresReport.cache.lastPosEvidenceSyncedAt, '2026-09-16T12:00:00.000Z')
+assert.equal(postgresReport.evidenceLastSyncedAt, '2026-09-16T12:00:00.000Z')
+assert.equal(postgresReport.evidenceFreshness.draftsNewerThanEvidence, 0)
 assert.equal(postgresReport.unmatchedQuickBooks.length, secondPageTransactions.length)
 assert.equal(postgresReport.historicalBaseline.summary.cachedTransactions, 97)
 assert.equal(postgresReport.historicalBaseline.summary.exactMarkerPairs, 44)
@@ -766,6 +896,8 @@ assert.equal(postgresReport.historicalPagination.page, 2)
 assert.equal(postgresReport.historicalPagination.pageSize, 10)
 assert.equal(postgresReport.historicalPagination.totalPages, 5)
 assert.equal(postgresReport.historicalPagination.pairPages, 5)
+assert.equal(postgresReport.historicalPagination.postingBundlePages, 0)
+assert.equal(postgresReport.historicalPagination.journalOnlyCapturePages, 0)
 assert.equal(postgresReport.historicalPagination.unmatchedPages, 1)
 assert.equal(JSON.stringify(postgresReport).includes('source_payload'), false)
 assert.equal(JSON.stringify(postgresReport).includes('rawSourcePayloadSecret'), false)
@@ -782,6 +914,8 @@ assert.equal(sqlCalls.some((call) => call.source.includes('toast_accounting_expo
 assert.equal(sqlCalls.some((call) => call.source.includes("linked_draft.posting_origin IN ('shogo', 'external', 'clawpilot')")), true)
 assert.equal(sqlCalls.some((call) => /document_number[\s\S]*pos\$/i.test(call.source)), false)
 assert.equal(sqlCalls.some((call) => call.source.includes('draft.is_current = true')), true)
+assert.equal(sqlCalls.some((call) => call.source.includes('last_pos_evidence_synced_at')), true)
+assert.equal(sqlCalls.some((call) => call.source.includes('AS scheduled_for_future')), true)
 assert.equal(sqlCalls.some((call) => call.source.includes("IN ('SalesReceipt', 'JournalEntry')")), true)
 const fullHistoryQuery = sqlCalls.find((call) =>
   call.source.includes('SELECT transaction.entity_type')
@@ -868,5 +1002,18 @@ assert.match(parityPanel, /Acknowledge external posting/)
 assert.match(parityPanel, /record-external-draft/)
 assert.match(parityPanel, /record-external-range/)
 assert.match(parityPanel, /ClawPilot will not create, approve, or resend a QuickBooks transaction/)
+assert.match(parityPanel, /Sync QuickBooks and recheck/)
+assert.match(parityPanel, /action: 'refresh-pos-evidence'/)
+assert.match(parityPanel, /lastEvidenceSyncedAt/)
+assert.match(parityPanel, /draftsNewerThanEvidence/)
+assert.match(parityPanel, /Acknowledgment was not recorded/)
+assert.match(parityPanel, /payment-date exception requires its exact Journal Entry/)
+assert.match(parityPanel, /scheduled for fulfillment/)
+assert.match(parityPanel, /Tips belong in the[\s\S]*payment Journal Entry[\s\S]*excluded from the Sales Receipt total/)
+assert.match(parityPanel, /Preorder lifecycles/)
+assert.match(parityPanel, /Recognized multi-document posting bundles/)
+assert.match(parityPanel, /Recognized payment-exception journals/)
+assert.match(parityPanel, /They are recognized as one posting bundle and are not exceptions/)
+assert.match(parityPanel, /this journal is recognized and is not an unmatched posting/)
 
 console.log('PASS POS accounting parity normalization, matching, comparison, historical corpus, and read-only Postgres contracts')

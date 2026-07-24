@@ -675,6 +675,13 @@ function sourceIdentity(kind: PosSourceKind, providerId: unknown, name: string) 
     : derivedSourceId(kind, name)
 }
 
+function paymentLifecycleEvidenceKey(kind: 'order' | 'check' | 'payment', value: unknown) {
+  return `link:${crypto.createHash('sha256')
+    .update(['pos-payment-lifecycle-v1', kind, String(value || '')].join('\u0000'))
+    .digest('hex')
+    .slice(0, 32)}`
+}
+
 export type PosAccountingCatalogEntry = {
   sourceKind: PosSourceKind
   sourceId: string
@@ -1195,7 +1202,9 @@ export function buildPosAccountingPreview(input: {
       }
     : null
   type PaymentFact = {
+    orderKey: string
     checkKey: string
+    paymentKey: string
     type: string
     cardBrand: string | null
     amount: number
@@ -1209,25 +1218,33 @@ export function buildPosAccountingPreview(input: {
   const timezone = input.locationTimezone || 'UTC'
   for (const order of orders) {
     const fulfillmentDate = dateOnly(order.fulfillment_business_date || order.business_date)
+    const orderIdentity = String(order.order_guid || order.display_number || 'order')
+    const orderKey = paymentLifecycleEvidenceKey('order', orderIdentity)
     const projectedPaymentDates = dateList(order.payment_business_dates)
     const legacyTiming = order.payment_business_dates === undefined
       || (projectedPaymentDates.length === 0 && !order.created_at_source)
     for (const [checkIndex, checkValue] of list(record(order.details).checks).entries()) {
       const check = record(checkValue)
-      for (const paymentValue of list(check.payments)) {
+      for (const [paymentIndex, paymentValue] of list(check.payments).entries()) {
         const payment = record(paymentValue)
         const explicitPaymentDate = normalizedBusinessDate(payment.paidBusinessDate)
           || instantBusinessDate(payment.paidAt ?? check.paidAt, timezone)
         const paymentDate = explicitPaymentDate
           || (projectedPaymentDates.length === 1 ? projectedPaymentDates[0] : null)
           || (legacyTiming ? fulfillmentDate : null)
-        const checkKey = String(check.providerGuid || check.displayNumber || `${order.order_guid || order.display_number || 'order'}:${checkIndex}`)
+        const checkIdentity = String(check.providerGuid || check.displayNumber || `${orderIdentity}:${checkIndex}`)
+        const checkKey = paymentLifecycleEvidenceKey('check', checkIdentity)
         if (!paymentDate) {
           paymentDateUnknownCheckKeys.add(checkKey)
           continue
         }
         paymentFacts.push({
+          orderKey,
           checkKey,
+          paymentKey: paymentLifecycleEvidenceKey(
+            'payment',
+            safeSourceName(payment.providerGuid, '') || `${checkIdentity}:${paymentIndex}`,
+          ),
           type: safeSourceName(payment.type, 'OTHER'),
           cardBrand: safeSourceName(payment.cardBrand, '') || null,
           amount: money(payment.amount),
@@ -1278,6 +1295,7 @@ export function buildPosAccountingPreview(input: {
     ? sourceIdentity('card_brand', null, cardBrands[0])
     : 'summary:card_settlement'
   const cardBrandMapping = mappingBySource.get(mappingKey('card_brand', cardSettlementSourceId, 'account'))
+    || mappingBySource.get(mappingKey('card_brand', 'summary:card_settlement', 'account'))
   const feeMapping = mappingBySource.get(mappingKey('fee', 'summary:processing_fees', 'account'))
   const cashMapping = mappingBySource.get(mappingKey('cash_drawer', 'summary:cash', 'account'))
   const tipsMapping = mappingBySource.get(mappingKey('service_charge', 'summary:tips', 'account'))
@@ -1415,6 +1433,33 @@ export function buildPosAccountingPreview(input: {
   ).size
   const captureChecks = new Set(capturePayments.map((payment) => payment.checkKey)).size
   const releaseChecks = new Set(releasePayments.map((payment) => payment.checkKey)).size
+  const paymentExceptionClearingConflict = Boolean(
+    paymentExceptionTarget
+    && clearingTarget
+    && paymentExceptionTarget.id === clearingTarget.id
+    && (capturedExceptionAmount !== 0 || releasedExceptionAmount !== 0),
+  )
+  const paymentExceptionLinks = [...capturePayments.map((payment) => ({
+    kind: 'capture' as const,
+    orderKey: payment.orderKey,
+    checkKey: payment.checkKey,
+    paymentKey: payment.paymentKey,
+    paymentBusinessDate: payment.paymentDate,
+    fulfillmentBusinessDate: payment.fulfillmentDate,
+    amount: payment.amount,
+    tip: payment.tip,
+    total: money(payment.amount + payment.tip),
+  })), ...releasePayments.map((payment) => ({
+    kind: 'release' as const,
+    orderKey: payment.orderKey,
+    checkKey: payment.checkKey,
+    paymentKey: payment.paymentKey,
+    paymentBusinessDate: payment.paymentDate,
+    fulfillmentBusinessDate: payment.fulfillmentDate,
+    amount: payment.amount,
+    tip: payment.tip,
+    total: money(payment.amount + payment.tip),
+  }))]
   const missingMappings = [...missing.values()]
   const blockers: PosAccountingBlocker[] = [
     ...missingMappings.map((entry): PosAccountingBlocker => entry.sourceKind === 'payment_exception'
@@ -1435,6 +1480,15 @@ export function buildPosAccountingPreview(input: {
           sourceKind: entry.sourceKind,
           sourceId: entry.sourceId,
         }),
+    ...(paymentExceptionClearingConflict ? [{
+      code: 'payment_exception_clearing_conflict',
+      title: 'Separate Payment Exceptions from POS clearing',
+      detail: 'Payment Exceptions and POS clearing use the same QuickBooks account. Choose a dedicated Payment Exceptions clearing account before posting.',
+      action: 'Map account',
+      sourceKind: 'payment_exception' as const,
+      sourceId: paymentExceptionSourceId,
+      affectedChecks: affectedExceptionChecks,
+    }] : []),
     ...(input.profile.quickBooksBindingStatus !== 'verified' ? [{
       code: 'quickbooks_company_unbound',
       title: 'Verify the QuickBooks company',
@@ -1565,6 +1619,7 @@ export function buildPosAccountingPreview(input: {
       releaseChecks,
       captureAmount: capturedExceptionAmount,
       releaseAmount: releasedExceptionAmount,
+      links: paymentExceptionLinks,
     },
     readiness: {
       readyForReview: readiness.readyForReview,
@@ -1584,6 +1639,7 @@ export function buildPosAccountingPreview(input: {
         releaseChecks,
         captureAmount: capturedExceptionAmount,
         releaseAmount: releasedExceptionAmount,
+        links: paymentExceptionLinks,
       },
       openChecks: batch.openChecks,
       excludedOpenChecks: batch.excludedOpenChecks,

@@ -93,9 +93,13 @@ async function responseJson(response: Response) {
   } catch {
     throw new Error('QuickBooks returned an invalid response')
   }
-  if (!response.ok) {
-    const fault = payload.Fault as { Error?: Array<{ Message?: string }> } | undefined
-    throw new Error(fault?.Error?.[0]?.Message || `QuickBooks request failed with HTTP ${response.status}`)
+  const fault = payload.Fault as { Error?: Array<{ Message?: string; Detail?: string }> } | undefined
+  if (!response.ok || fault) {
+    throw new Error(
+      fault?.Error?.[0]?.Message
+      || fault?.Error?.[0]?.Detail
+      || `QuickBooks request failed with HTTP ${response.status}`,
+    )
   }
   return payload
 }
@@ -227,10 +231,45 @@ async function queryEntityPage(
   )
 }
 
+async function queryTransactionRangePage(
+  entity: 'SalesReceipt' | 'JournalEntry',
+  ownerEmail: string,
+  connectionId: string,
+  fromBusinessDate: string,
+  toBusinessDate: string,
+  startPosition: number,
+  pageSize: number,
+) {
+  const query = encodeURIComponent(
+    `SELECT * FROM ${entity} WHERE TxnDate >= '${fromBusinessDate}' AND TxnDate <= '${toBusinessDate}' `
+      + `STARTPOSITION ${startPosition} MAXRESULTS ${pageSize}`,
+  )
+  return request(
+    `/quickbooks/v3/company/:realmId/query?query=${query}&minorversion=${MINOR_VERSION}`,
+    ownerEmail,
+    connectionId,
+  )
+}
+
 function sourceRowCount(payload: Record<string, unknown>, entity: QuickBooksQueryEntity) {
   const queryResponse = payload.QueryResponse
   if (!queryResponse || typeof queryResponse !== 'object' || Array.isArray(queryResponse)) return 0
   const rows = (queryResponse as Record<string, unknown>)[entity]
+  return Array.isArray(rows) ? rows.length : 0
+}
+
+function assertTransactionRangePage(
+  payload: Record<string, unknown>,
+  entity: 'SalesReceipt' | 'JournalEntry',
+) {
+  const queryResponse = payload.QueryResponse
+  if (!queryResponse || typeof queryResponse !== 'object' || Array.isArray(queryResponse)) {
+    throw new Error(`QuickBooks ${entity} POS evidence response was invalid`)
+  }
+  const rows = (queryResponse as Record<string, unknown>)[entity]
+  if (rows !== undefined && !Array.isArray(rows)) {
+    throw new Error(`QuickBooks ${entity} POS evidence rows were invalid`)
+  }
   return Array.isArray(rows) ? rows.length : 0
 }
 
@@ -262,6 +301,66 @@ export async function readQuickBooksCompanyInfo(ownerEmail: string, connectionId
     connectionId,
   )
   return parseQuickBooksCompanyInfo(payload)
+}
+
+export async function readQuickBooksPosTransactions(input: {
+  ownerEmail: string
+  connectionId: string
+  fromBusinessDate: string
+  toBusinessDate: string
+}) {
+  const validDate = (value: string) => {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false
+    const parsed = new Date(`${value}T00:00:00.000Z`)
+    return Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value
+  }
+  if (!validDate(input.fromBusinessDate) || !validDate(input.toBusinessDate)
+    || input.fromBusinessDate > input.toBusinessDate) {
+    throw new Error('QuickBooks POS evidence dates are invalid')
+  }
+  const fromTime = new Date(`${input.fromBusinessDate}T00:00:00.000Z`).getTime()
+  const toTime = new Date(`${input.toBusinessDate}T00:00:00.000Z`).getTime()
+  if ((toTime - fromTime) / 86_400_000 > 31) {
+    throw new Error('QuickBooks POS evidence refresh supports at most 32 business dates')
+  }
+
+  const transactions = new Map<string, QuickBooksTransaction>()
+  for (const entity of ['SalesReceipt', 'JournalEntry'] as const) {
+    const entityIds = new Set<string>()
+    for (let startPosition = 1; startPosition <= MAX_CATALOG_RECORDS; startPosition += TRANSACTION_PAGE_SIZE) {
+      const payload = await queryTransactionRangePage(
+        entity,
+        input.ownerEmail,
+        input.connectionId,
+        input.fromBusinessDate,
+        input.toBusinessDate,
+        startPosition,
+        TRANSACTION_PAGE_SIZE,
+      )
+      const sourceCount = assertTransactionRangePage(payload, entity)
+      const parsed = parseQuickBooksTransactions(payload, entity)
+      if (parsed.length !== sourceCount) {
+        throw new Error(`QuickBooks ${entity} POS evidence contained an unusable record`)
+      }
+      for (const transaction of parsed) {
+        if (!transaction.transactionDate
+          || transaction.transactionDate < input.fromBusinessDate
+          || transaction.transactionDate > input.toBusinessDate) {
+          throw new Error(`QuickBooks ${entity} POS evidence was outside the requested date range`)
+        }
+        if (entityIds.has(transaction.id)) {
+          throw new Error(`QuickBooks ${entity} POS evidence contained a duplicate record`)
+        }
+        entityIds.add(transaction.id)
+        transactions.set(`${transaction.entityType}:${transaction.id}`, transaction)
+      }
+      if (sourceCount < TRANSACTION_PAGE_SIZE) break
+      if (startPosition + TRANSACTION_PAGE_SIZE > MAX_CATALOG_RECORDS) {
+        throw new Error(`QuickBooks ${entity} POS evidence exceeded ${MAX_CATALOG_RECORDS} records`)
+      }
+    }
+  }
+  return [...transactions.values()]
 }
 
 function isoDate(value: Date) {
