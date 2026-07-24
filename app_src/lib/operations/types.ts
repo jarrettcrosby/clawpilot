@@ -689,7 +689,25 @@ export type OperationsWorkspace = {
   orders: OperationsOrderListItem[]
   exceptions: OperationsExceptionListItem[]
   selectedOrder: OperationsOrderDetail | null
-  warehouses: Array<{ id: string; globalId: string; name: string }>
+  warehouses: Array<{
+    id: string
+    globalId: string
+    code: string
+    name: string
+    timezone: string
+    address: Address
+    status: 'active' | 'inactive'
+    cutoffTime: string | null
+    locations: Array<{
+      id: string
+      globalId: string
+      code: string
+      zone: string
+      locationType: 'receiving' | 'storage' | 'pick' | 'pack' | 'staging' | 'shipping' | 'returns'
+      pickSequence: number
+      active: boolean
+    }>
+  }>
   catalog: {
     customers: Array<{ id: string; globalId: string; name: string }>
     products: Array<{ id: string; globalId: string; name: string; sku: string | null }>

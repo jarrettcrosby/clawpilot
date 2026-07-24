@@ -41,12 +41,13 @@ Credential verification is not shipping certification. The only currently author
 ## UPS And FedEx Sandbox Rate Test
 
 1. Confirm the active workspace and open **Settings > Integrations > Shipping**.
-2. Select UPS or FedEx and **Sandbox / developer**. Confirm that the sandbox credential is active and verified. Production credentials are rejected by this action.
-3. Review the immutable fixture shown in the panel: John Doe at `101 Jegs Place, Delaware, OH 43015` to John Doe at `101 Academy Drive, Buzzards Bay, MA 02532`, with one `Test Product` parcel measuring `12 x 10 x 6 in` and weighing `5 lb`.
-4. Select **Test sandbox rate** once. The request performs rating only. It cannot create a shipment, label, pickup, manifest, tracking record, carrier charge, or print job.
-5. Record the returned `grq` evidence Global ID and review only normalized service, amount, currency, transit, and delivery values. Do not copy credentials, tokens, account numbers, or raw provider payloads into operating notes.
-6. A failure may be retried only after reviewing its safe error and provider/account status. The append-only evidence preserves each attempt without storing secrets or a full address payload.
-7. Stop after rating unless the order is eligible for the separate bounded sandbox label procedure below. Pickup, manifest, tracking mutation, and production actions remain prohibited.
+2. Select UPS or FedEx and **Sandbox / developer**. Confirm that the sandbox credential is verified and enable the sandbox integration. Production credentials are rejected by this action.
+3. Under **Billing accounts**, add the carrier account number and the address registered to that account. Enable the billing account and select it for the sandbox test. Credentials prove API access; the carrier account separately determines sender, recipient, or third-party billing. Never invent either value.
+4. Review the immutable fixture shown in the panel: John Doe at `101 Jegs Place, Delaware, OH 43015` to John Doe at `101 Academy Drive, Buzzards Bay, MA 02532`, with one `Test Product` parcel measuring `12 x 10 x 6 in` and weighing `5 lb`.
+5. Select **Test sandbox rate** once. The request performs rating only. It cannot create a shipment, label, pickup, manifest, tracking record, carrier charge, or print job.
+6. Record the returned `grq` evidence Global ID and review only normalized service, amount, currency, transit, and delivery values. Do not copy credentials, tokens, account numbers, or raw provider payloads into operating notes.
+7. A failure may be retried only after reviewing its safe error and provider/account status. The append-only evidence preserves each attempt without storing secrets or a full address payload.
+8. Stop after rating unless the order is eligible for the separate bounded sandbox label procedure below. Pickup, manifest, tracking mutation, and production actions remain prohibited.
 
 ## UPS And FedEx Sandbox Label Create And Void
 
@@ -81,6 +82,17 @@ Credential verification is not shipping certification. The only currently author
 
 Only authorized pipeline editors can import or change the catalog. Viewers can inspect it but cannot mutate it. The current slice supports one default package profile per product; do not model alternate cartons, facility packs, or supplier-specific packs as duplicate products.
 
+## Warehouse And Bin Setup
+
+1. Open **Operations**, then select **Warehouses** in the horizontally scrollable subpanel row.
+2. Select **New warehouse**. Enter a unique facility code, facility name, IANA timezone, local carrier cutoff, and the complete physical address. The address becomes operational master data; confirm it before later binding carrier accounts, pickup locations, or origin rules.
+3. Leave **Create starter locations** enabled for a new facility unless a reviewed location import will follow. ClawPilot creates receiving, inbound staging, storage, picking, packing, outbound staging, shipping, and returns locations so the warehouse can be configured without direct database work.
+4. Confirm the permanent `gwh` warehouse identity and its active status. Each starter location receives a permanent `gwl` identity.
+5. Use **Add bin / location** to add further storage bins, pick faces, zones, pack stations, staging positions, docks, or returns positions. Location codes must be unique inside the warehouse; pick sequence controls deterministic routing order in this foundation slice.
+6. Configure physical printers under **Printing** and carrier billing files or GL Coding under **Billing & GL**. Those are separate facility services and do not become configured merely because a warehouse exists.
+
+The current warehouse screen establishes facility and location masters only. Inbound appointments, ASNs, receiving, discrepancy capture, quality/quarantine, directed putaway, replenishment, cycle counts, transfers, lot/serial controls, and scanner-directed work remain subsequent WMS slices. Do not represent the starter topology as evidence those workflows are complete.
+
 ## Planned Order, Warehouse Release, Pick Confirmation, And Pack Verification
 
 1. Open **Operations**, select **Orders**, and open an eligible non-archived order received through an approved commerce boundary. The hosted workbench does not create proof orders; deterministic mock generation is reserved for automated tests.
@@ -99,7 +111,7 @@ Only authorized pipeline editors can import or change the catalog. Viewers can i
 
 ## Mobile Operations Subpanel Navigation
 
-1. On a narrow screen, use the horizontally scrollable tab row beneath the Operations header to reach **Orders**, **Exceptions**, **Billing & GL**, and **Printing**. Swipe the tab strip or use its labeled left/right controls; the controls disable at the corresponding edge.
+1. On a narrow screen, use the horizontally scrollable tab row beneath the Operations header to reach **Orders**, **Exceptions**, **Warehouses**, **Billing & GL**, and **Printing**. Swipe the tab strip or use its labeled left/right controls; the controls disable at the corresponding edge.
 2. Keep the active subpanel visible before acting. Changing tabs clears the Orders/Exceptions search and closes open detail drawers so a command cannot be issued against a hidden prior context.
 3. The tab strip owns horizontal movement and each selected subpanel owns its normal content scrolling. Do not interpret a clipped off-screen tab as a missing capability, and do not rely on page-level horizontal scrolling.
 

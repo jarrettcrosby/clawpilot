@@ -441,6 +441,10 @@ function verifySourceContracts() {
     "eventType: 'operations.pick.completed'",
     "eventType: 'operations.order.picks_confirmed'",
     'verifyOperationsOrderPackFromPostgres',
+    'createOperationsWarehouseInPostgres',
+    'createOperationsLocationInPostgres',
+    "eventType: 'operations.warehouse.created'",
+    "eventType: 'operations.location.created'",
     "commandType: 'verify_operations_order_pack'",
     "eventType: 'operations.package.packed'",
     "eventType: 'operations.order.pack_verified'",
@@ -523,10 +527,14 @@ function verifySourceContracts() {
     'verifyOperationsOrderPackFromPostgres',
     'createOperationsSandboxLabelInPostgres',
     'voidOperationsSandboxLabelInPostgres',
+    'createOperationsWarehouseInPostgres',
+    'createOperationsLocationInPostgres',
     'updateOperationsExceptionInPostgres',
     "'Cache-Control': 'private, no-store'",
     'MAX_REQUEST_BYTES',
     "action === 'run-proof-order'",
+    "action === 'create-warehouse'",
+    "action === 'create-location'",
     'CLAWPILOT_OPERATIONS_PROOF_ENABLED',
     'OPERATIONS_PROOF_DISABLED',
     "action === 'release-order'",
@@ -539,6 +547,22 @@ function verifySourceContracts() {
     "action === 'update-activation'",
   ]) assert.ok(route.includes(fragment), `Operations route missing ${fragment}`)
   assert.ok(!/clientSecret|accessToken|privateKey/i.test(route), 'Operations route must not handle credentials')
+
+  const warehouseSetup = read('app_src/components/operations/WarehouseSetupPanel.tsx')
+  for (const fragment of [
+    'Warehouse setup',
+    'Create starter locations',
+    'Configure printers',
+    'Import carrier billing',
+    "action: 'create-warehouse'",
+    "action: 'create-location'",
+  ]) assert.ok(warehouseSetup.includes(fragment), `Warehouse setup UI missing ${fragment}`)
+
+  const operationsSection = read('app_src/components/operations/OperationsSection.tsx')
+  assert.ok(
+    operationsSection.includes('<Tab value="warehouses"'),
+    'Operations navigation must expose warehouse setup',
+  )
 
   const health = read('app_src/app/api/health/route.ts')
   assert.ok(

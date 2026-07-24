@@ -10,11 +10,14 @@ import type {
   OperationsActivationState,
   OperationsExceptionStatus,
   OperationsOrderStatus,
+  OperationsWorkspace,
 } from '@/lib/operations/types'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import {
   confirmOperationsOrderShipmentFromPostgres,
   confirmOperationsOrderPicksFromPostgres,
+  createOperationsLocationInPostgres,
+  createOperationsWarehouseInPostgres,
   OperationsRequestError,
   readOperationsWorkspaceFromPostgres,
   releaseOperationsOrderFromPostgres,
@@ -41,6 +44,7 @@ const EXCEPTION_GLOBAL_ID = /^gex\d{7}$/
 const RATE_GLOBAL_ID = /^grt\d{7}$/
 const CARRIER_ACCOUNT_GLOBAL_ID = /^gac\d{7}$/
 const PRINTER_GLOBAL_ID = /^gpr\d{7}$/
+const WAREHOUSE_GLOBAL_ID = /^gwh\d{7}$/
 const ORDER_STATUSES = new Set<OperationsOrderStatus>([
   'imported', 'validated', 'held', 'promised', 'reserved', 'planned',
   'released', 'picking', 'packed', 'shipped', 'cancelled', 'exception',
@@ -299,6 +303,43 @@ export async function POST(req: NextRequest) {
     const capabilities = operationsCapabilities(actor)
     const body = await requestBody(req)
     const action = textValue(body.action, 'Operations action', 50)
+    if (action === 'create-warehouse') {
+      if (!capabilities.canManage) {
+        return json({ ok: false, error: 'You do not have permission to configure warehouses', code: 'OPERATIONS_MANAGE_REQUIRED' }, 403)
+      }
+      assertFields(body, new Set([
+        'action', 'code', 'name', 'timezone', 'address', 'cutoffTime', 'createStarterLocations',
+      ]), 'OPERATIONS_REQUEST_INVALID', 'Operations command')
+      const result = await createOperationsWarehouseInPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        code: textValue(body.code, 'Warehouse code', 32),
+        name: textValue(body.name, 'Warehouse name', 160),
+        timezone: textValue(body.timezone, 'Warehouse timezone', 80),
+        address: addressValue(body.address),
+        cutoffTime: textValue(body.cutoffTime, 'Warehouse cutoff', 8, false) || null,
+        createStarterLocations: body.createStarterLocations !== false,
+      })
+      return json({ ok: true, capabilities, result }, 201)
+    }
+    if (action === 'create-location') {
+      if (!capabilities.canManage) {
+        return json({ ok: false, error: 'You do not have permission to configure warehouse locations', code: 'OPERATIONS_MANAGE_REQUIRED' }, 403)
+      }
+      assertFields(body, new Set([
+        'action', 'warehouseGlobalId', 'code', 'zone', 'locationType', 'pickSequence',
+      ]), 'OPERATIONS_REQUEST_INVALID', 'Operations command')
+      const result = await createOperationsLocationInPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        warehouseGlobalId: globalIdValue(body.warehouseGlobalId, 'Warehouse', WAREHOUSE_GLOBAL_ID),
+        code: textValue(body.code, 'Location code', 40),
+        zone: textValue(body.zone, 'Location zone', 80),
+        locationType: textValue(body.locationType, 'Location type', 20) as OperationsWorkspace['warehouses'][number]['locations'][number]['locationType'],
+        pickSequence: integerValue(body.pickSequence, 'Pick sequence', 0, 1_000_000),
+      })
+      return json({ ok: true, capabilities, result }, 201)
+    }
     if (action === 'run-proof-order') {
       requireOperationsProofFixture()
       if (!capabilities.canManage || !capabilities.canExecute) {

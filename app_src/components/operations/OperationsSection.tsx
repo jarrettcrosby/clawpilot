@@ -62,6 +62,7 @@ import type {
 } from '@/lib/operations/types'
 import GlCodingPanel from '@/components/operations/GlCodingPanel'
 import PrinterConfigurationPanel from '@/components/operations/PrinterConfigurationPanel'
+import WarehouseSetupPanel from '@/components/operations/WarehouseSetupPanel'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import { formatUserDateTime } from '@/lib/userDateTime'
 
@@ -890,7 +891,7 @@ export default function OperationsSection() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
-  const [view, setView] = useState<'orders' | 'exceptions' | 'gl-coding' | 'printing'>('orders')
+  const [view, setView] = useState<'orders' | 'exceptions' | 'warehouses' | 'gl-coding' | 'printing'>('orders')
   const [search, setSearch] = useState('')
   const [status, setStatus] = useState<'' | OperationsOrderStatus>('')
   const [exceptionStatus, setExceptionStatus] = useState<'' | OperationsExceptionStatus>('')
@@ -1394,11 +1395,15 @@ export default function OperationsSection() {
     ? 'Carrier billing & GL'
     : view === 'printing'
       ? 'Print orchestration'
+      : view === 'warehouses'
+        ? 'Warehouse network'
       : 'Order Workbench'
   const subheading = view === 'gl-coding'
     ? 'Actual carrier charges, shipment evidence, shipper assignment, and reconciliation'
     : view === 'printing'
       ? 'Warehouse printers, document media, defaults, and fallbacks'
+      : view === 'warehouses'
+        ? 'Facilities, inbound staging, storage bins, fulfillment locations, and returns'
       : `Distributed fulfillment${workspace ? ` · CRM: ${workspace.dataPipeline.name}` : ''}`
 
   return (
@@ -1461,7 +1466,7 @@ export default function OperationsSection() {
         >
           <Tabs
             value={view}
-            onChange={(_, next: 'orders' | 'exceptions' | 'gl-coding' | 'printing') => {
+            onChange={(_, next: 'orders' | 'exceptions' | 'warehouses' | 'gl-coding' | 'printing') => {
               setView(next)
               setSearch('')
               closeDrawer()
@@ -1509,6 +1514,7 @@ export default function OperationsSection() {
           >
             <Tab value="orders" label={`Orders${workspace ? ` (${workspace.orders.length})` : ''}`} />
             <Tab value="exceptions" label={`Exceptions${workspace ? ` (${workspace.summary.exceptions})` : ''}`} />
+            <Tab value="warehouses" icon={<WarehouseRounded fontSize="small" />} iconPosition="start" label="Warehouses" />
             <Tab value="gl-coding" label="Billing & GL" />
             <Tab value="printing" icon={<PrintRounded fontSize="small" />} iconPosition="start" label="Printing" />
           </Tabs>
@@ -1559,7 +1565,13 @@ export default function OperationsSection() {
       )}
 
       <Box sx={{ flex: 1, minHeight: 0, overflow: 'auto', WebkitOverflowScrolling: 'touch' }}>
-        {view === 'gl-coding' ? (
+        {view === 'warehouses' ? (
+          <WarehouseSetupPanel
+            workspace={workspace}
+            onRefresh={() => loadWorkspace()}
+            onNavigate={(next) => setView(next)}
+          />
+        ) : view === 'gl-coding' ? (
           <GlCodingPanel />
         ) : view === 'printing' ? (
           <PrinterConfigurationPanel />
