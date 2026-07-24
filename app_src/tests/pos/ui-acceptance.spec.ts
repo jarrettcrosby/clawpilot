@@ -548,6 +548,167 @@ test('POS posting queue routes a preorder payment exception to its exact mapping
   })).toBeTruthy()
 })
 
+test('POS separates paid from closed and routes closeout holds to reload actions', async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 900 })
+  await authenticateIfConfigured(page)
+  const preorder = {
+    orderGuid: 'preorder-order-closeout',
+    restaurantGuid: locationId,
+    restaurantName: 'Acceptance Restaurant',
+    businessDate: '2026-07-25',
+    displayNumber: '25',
+    paymentStatus: 'PAID',
+    paidAt: '2026-07-23T22:10:00.000Z',
+    paymentBusinessDates: ['2026-07-23'],
+    promisedAt: '2026-07-25T15:00:00.000Z',
+    fulfillmentBusinessDate: '2026-07-25',
+    checkCount: 1,
+    total: 44.54,
+  }
+  const readinessBlockers = [
+    {
+      businessDate: '2026-07-27',
+      code: 'payment_not_captured',
+      title: 'Wait for captured payments',
+      detail: 'Toast has not reported every payment as captured.',
+      action: 'Reload sales',
+      sourceKind: 'payment_exception',
+    },
+    {
+      businessDate: '2026-07-26',
+      code: 'payment_business_day_open',
+      title: 'Wait for the payment business day to close',
+      detail: 'The payment business day is still open in the restaurant timezone.',
+      action: 'Reload sales',
+    },
+    {
+      businessDate: '2026-07-25',
+      code: 'fulfillment_checks_not_closed',
+      title: 'Wait for finalized Toast checks',
+      detail: 'Toast has not finalized every fulfillment check.',
+      action: 'Reload sales',
+    },
+    {
+      businessDate: '2026-07-24',
+      code: 'batch_hold_fee_detail',
+      title: 'Await processing-fee detail',
+      detail: 'One or more card payments do not include processing-fee evidence.',
+      action: 'Reload settlement',
+    },
+    {
+      businessDate: '2026-07-23',
+      code: 'batch_hold_payout',
+      title: 'Await verified settlement',
+      detail: 'Verified payout evidence is unavailable.',
+      action: 'Reload settlement',
+    },
+  ]
+  const queueSnapshot = {
+    ...posSnapshot,
+    range: { from: '2026-07-23', to: '2026-07-27' },
+    summary: { ...posSnapshot.summary, preorderCount: 1 },
+    orders: { items: [preorder], total: 1, page: 1, pageSize: 25 },
+    selectedOrder: {
+      ...preorder,
+      openedAt: '2026-07-20T16:00:00.000Z',
+      checks: [{ guid: 'preorder-check-closeout', displayNumber: '25', paymentStatus: 'PAID', total: 44.54 }],
+    },
+    drafts: readinessBlockers.map((blocker, index) => ({
+      id: `00000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`,
+      restaurantGuid: locationId,
+      restaurantName: 'Acceptance Restaurant',
+      businessDate: blocker.businessDate,
+      status: 'needs_review',
+      reconciliationStatus: 'ready',
+      sourceSummary: {
+        standard: { total: 44.54 },
+        canonical: {
+          readiness: {
+            readyForReview: false,
+            hold: true,
+            missingMappings: [],
+            blockers: [blocker],
+            holdReasons: [blocker.detail],
+          },
+        },
+      },
+    })),
+    accountingIssues: [],
+    syncIssues: [],
+  }
+  await mockPos(page, queueSnapshot)
+  await page.route((url) => url.pathname === '/api/pos/accounting', (route) => route.fulfill({
+    json: {
+      ok: true,
+      capabilities: { canView: true, canManage: true, canPrepare: true, canApprove: true },
+      accounting: {
+        location: { restaurantGuid: locationId, restaurantName: 'Acceptance Restaurant', locationName: 'Downtown' },
+        profile: {
+          scope: 'organization_default', profileRevision: 1, postingMethod: 'itemized_sales_receipt',
+          breakoutDimensions: [], trackSalesTax: true, memoMode: 'pos_date', customMemo: null,
+          customTransactionNumber: false, transactionNumberSuffix: null, suppressZeroOverShort: true,
+          autoPayoutTips: false, depositChecksWithCash: false, openCheckPolicy: 'hold',
+          batchHoldPolicy: 'hold_until_closed', emailNotificationsEnabled: false,
+        },
+        quickBooks: {
+          configured: true, bound: true, companyName: 'Acceptance Books', status: 'active',
+          catalog: { accounts: 1, items: 0, taxCodes: 0, classes: 0, departments: 0 },
+        },
+        sourceCatalog: [{
+          sourceKind: 'payment_exception',
+          sourceId: 'summary:payment_exceptions',
+          sourceName: 'Payment Exceptions',
+        }],
+        mappings: [],
+        targets: {
+          accounts: [{ id: 'payment-exceptions-account', name: 'Payment Exceptions' }],
+          items: [], customers: [], vendors: [], taxCodes: [], classes: [], departments: [],
+        },
+        preview: {
+          available: true,
+          readiness: { readyForReview: false, hold: true, missingMappings: [], holdReasons: [] },
+          salesReceipt: { subtotal: 0, tax: 0, tips: 0, total: 0, lineItems: [] },
+          journal: { lines: [], balanced: true, balance: 0 },
+          evidence: {},
+        },
+        draft: { id: '00000000-0000-4000-8000-000000000001', status: 'needs_review', draftRevision: 1 },
+        draftHistory: [],
+        latestCommand: null,
+      },
+    },
+  }))
+  await page.addInitScript((organizationId) => {
+    window.localStorage.setItem(`clawpilot.pos.guide.seen:${organizationId}`, '1')
+  }, posSnapshot.organizationId)
+
+  await page.goto('/#pos')
+  if (new URL(page.url()).pathname === '/login') {
+    throw new Error('Target requires authentication; set UI_AUTH_PASSWORD and UI_OPERATOR_SECRET together')
+  }
+  await expect(page.getByTestId('app-shell')).toBeVisible()
+  await activatePos(page)
+
+  await page.getByRole('tab', { name: 'Orders', exact: true }).click()
+  await page.getByRole('button', { name: /Order 25 Preorder/ }).click()
+  await expect(page.getByTestId('pos-order-paid-at')).toContainText('2026')
+  await expect(page.getByTestId('pos-order-closed-at')).toContainText('—')
+  await page.getByRole('button', { name: 'Close order detail' }).click()
+
+  await page.getByRole('tab', { name: 'Accounting', exact: true }).click()
+  await expect(page.getByText('Awaiting captured payment', { exact: true })).toBeVisible()
+  await expect(page.getByText('Awaiting day closeout', { exact: true })).toBeVisible()
+  await expect(page.getByText('Awaiting Toast closeout', { exact: true })).toBeVisible()
+  await expect(page.getByText('Awaiting batch details', { exact: true })).toHaveCount(2)
+  await expect(page.getByRole('button', { name: 'Reload payment status', exact: true })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Reload after day closeout', exact: true })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Reload check status', exact: true })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Reload fee details', exact: true })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Reload settlement', exact: true })).toBeVisible()
+
+  await page.getByRole('button', { name: 'Reload payment status', exact: true }).click()
+  await expect(page.getByPlaceholder('Search mappings')).toHaveValue('')
+})
+
 test('POS accounting saves only one exact changed mapping from a catalog larger than 250 rows', async ({ page }) => {
   await page.setViewportSize({ width: 1280, height: 900 })
   await authenticateIfConfigured(page)

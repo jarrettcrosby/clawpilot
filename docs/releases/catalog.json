@@ -3,19 +3,24 @@
   "releases": {
     "default": {
       "oncePerEnvironment": true,
-      "title": "QuickBooks posting evidence and preorder reconciliation",
-      "summary": "ClawPilot now links prepaid Toast orders across payment and fulfillment dates, refreshes QuickBooks evidence on demand, and explains the exact mapping or review action required before posting.",
+      "title": "Toast closeout-safe preorder posting",
+      "summary": "ClawPilot now keeps prepaid-order accounting visible while preventing QuickBooks posting until Toast payment and fulfillment evidence is final.",
       "features": [
-        "A bounded Sync QuickBooks and recheck action with visible evidence freshness",
-        "Linked preorder lifecycles showing payment date, fulfillment date, document roles, check count, and Toast tips",
-        "Historical posting bundles that recognize multiple Sales Receipts per settlement journal and journal-only prepaid captures",
-        "Specific mapping guidance and an explicit regenerate handoff after configuration changes"
+        "A visible provisional Payment Exceptions journal while the payment business day is active",
+        "Separate Paid and Closed evidence in the Toast order drawer",
+        "Actionable reload states for day closeout, payment capture, Toast check closeout, and batch details",
+        "Linked payment-date capture and fulfillment-date release without duplicate sales"
       ],
       "fixes": [
-        "A valid general settlement mapping now satisfies single-brand card payments",
-        "Future fulfillment documents are shown as scheduled instead of missing from QuickBooks",
-        "Payment Exceptions cannot silently reuse the POS clearing account",
-        "Toast tip evidence is shown separately from Sales Receipt totals"
+        "Payment journals cannot post before the restaurant's Toast business-day cutoff",
+        "Card payment journals remain held until Toast reports CAPTURED",
+        "Sales Receipts and release journals remain held until every active Toast check is CLOSED",
+        "Voided Toast activity no longer contributes accounting dates, totals, or closeout holds",
+        "Predeployment drafts now fail closed until regenerated through the current closeout rules",
+        "Payments without paidBusinessDate use the exact Toast cutoff or remain blocked",
+        "Missing or invalid restaurant timezones now block posting instead of falling back to UTC",
+        "Stored orders must be refreshed from Toast after closeout before a posting becomes ready",
+        "A prepared posting cannot be reused or approved after its accounting content changes"
       ]
     }
   }

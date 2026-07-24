@@ -1,7 +1,11 @@
 import crypto from 'crypto'
 import type { PoolClient } from 'pg'
 import { recordAuditEvent } from '@/lib/auditWriter'
-import { projectToastOrders } from '@/lib/integrations/toastOrderProjection'
+import {
+  isToastProjectedOrderAccountingActive,
+  isToastProjectedPaymentActive,
+  projectToastOrders,
+} from '@/lib/integrations/toastOrderProjection'
 import { PosAccountingRequestError } from '@/lib/persistence/posAccounting'
 import { query, withTransaction } from '@/lib/persistence/postgres'
 import type { EncryptedToastClientSecret, ToastAccessType } from '@/lib/integrations/toastCredentialCrypto'
@@ -31,6 +35,7 @@ type LocationRow = {
   location_name: string | null
   location_code: string | null
   timezone: string | null
+  closeout_hour: number | null
   active: boolean
   test_mode: boolean
   archived: boolean
@@ -60,6 +65,7 @@ export type ToastLocationState = {
   locationName: string | null
   locationCode: string | null
   timezone: string | null
+  closeoutHour: number | null
   active: boolean
   testMode: boolean
   archived: boolean
@@ -128,6 +134,7 @@ export type ToastLocationWrite = {
   locationName?: string | null
   locationCode?: string | null
   timezone?: string | null
+  closeoutHour?: number | null
   active?: boolean
   testMode?: boolean
   archived?: boolean
@@ -138,6 +145,7 @@ export type ToastSyncJob = {
   organizationId: string
   restaurantGuid: string
   timezone: string | null
+  closeoutHour: number | null
   syncKind: 'analytics_sales' | 'analytics_payouts' | 'standard_orders' | 'standard_order_updates'
   businessDate: string
   attemptCount: number
@@ -210,6 +218,7 @@ function locationState(row: LocationRow): ToastLocationState {
     locationName: row.location_name,
     locationCode: row.location_code,
     timezone: row.timezone,
+    closeoutHour: row.closeout_hour ?? null,
     active: row.active,
     testMode: row.test_mode,
     archived: row.archived,
@@ -565,20 +574,24 @@ async function upsertLocation(
 ) {
   await client.query(
     `INSERT INTO toast_locations (
-       organization_id, restaurant_guid, restaurant_name, location_name, location_code, timezone,
+       organization_id, restaurant_guid, restaurant_name, location_name, location_code, timezone, closeout_hour,
        active, test_mode, archived, analytics_access, standard_access, selected,
        last_verified_at, created_at, updated_at
      ) VALUES (
-       $1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8, $9,
-       $10 = 'analytics', $10 = 'standard', false, now(), now(), now()
+       $1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8, $9, $10,
+       $11 = 'analytics', $11 = 'standard', false, now(), now(), now()
      )
      ON CONFLICT (organization_id, restaurant_guid) DO UPDATE SET
        restaurant_name = EXCLUDED.restaurant_name,
        location_name = COALESCE(EXCLUDED.location_name, toast_locations.location_name),
        location_code = COALESCE(EXCLUDED.location_code, toast_locations.location_code),
        timezone = COALESCE(EXCLUDED.timezone, toast_locations.timezone),
+       closeout_hour = CASE
+         WHEN $11 = 'standard' THEN EXCLUDED.closeout_hour
+         ELSE toast_locations.closeout_hour
+       END,
        active = EXCLUDED.active,
-       test_mode = CASE WHEN $10 = 'analytics' THEN EXCLUDED.test_mode ELSE toast_locations.test_mode END,
+       test_mode = CASE WHEN $11 = 'analytics' THEN EXCLUDED.test_mode ELSE toast_locations.test_mode END,
        archived = EXCLUDED.archived,
        analytics_access = toast_locations.analytics_access OR EXCLUDED.analytics_access,
        standard_access = toast_locations.standard_access OR EXCLUDED.standard_access,
@@ -587,6 +600,7 @@ async function upsertLocation(
     [
       organizationId, location.restaurantGuid, location.restaurantName,
       location.locationName || null, location.locationCode || null, location.timezone || null,
+      location.closeoutHour ?? null,
       location.active !== false, location.testMode === true, location.archived === true, accessType,
     ],
   )
@@ -971,6 +985,7 @@ export async function claimToastSyncJobsInPostgres(input: { limit: number; worke
       requested_by: string | null
       lock_token: string
       timezone: string | null
+      closeout_hour: number | null
     }>(
        `WITH due AS (
          SELECT id FROM toast_sync_outbox
@@ -993,7 +1008,8 @@ export async function claimToastSyncJobsInPostgres(input: { limit: number; worke
        )
        SELECT claimed.id, claimed.organization_id::text, claimed.restaurant_guid::text,
          claimed.sync_kind, claimed.business_date, claimed.attempt_count, claimed.max_attempts,
-         claimed.request_state, claimed.requested_by, claimed.lock_token, location.timezone
+         claimed.request_state, claimed.requested_by, claimed.lock_token,
+         location.timezone, location.closeout_hour
        FROM claimed
        LEFT JOIN toast_locations location
          ON location.organization_id = claimed.organization_id
@@ -1005,6 +1021,7 @@ export async function claimToastSyncJobsInPostgres(input: { limit: number; worke
       organizationId: row.organization_id,
       restaurantGuid: row.restaurant_guid,
       timezone: row.timezone,
+      closeoutHour: row.closeout_hour,
       syncKind: row.sync_kind,
       businessDate: row.business_date,
       attemptCount: row.attempt_count,
@@ -1204,36 +1221,82 @@ function businessDateForInstant(value: string | null, timezoneValue: string | nu
   }
 }
 
+function toastPaymentBusinessDateForInstant(
+  value: string | null,
+  timezoneValue: string | null,
+  closeoutHourValue: number | null,
+) {
+  if (!value || !Number.isInteger(closeoutHourValue) || Number(closeoutHourValue) < 0 || Number(closeoutHourValue) > 12) {
+    return null
+  }
+  const instant = new Date(value)
+  if (Number.isNaN(instant.getTime())) return null
+  try {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: timezoneValue || 'UTC',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      hourCycle: 'h23',
+    }).formatToParts(instant)
+    const dateParts = Object.fromEntries(parts.map((part) => [part.type, part.value]))
+    const localDate = `${dateParts.year}-${dateParts.month}-${dateParts.day}`
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(localDate) || dateParts.hour === undefined) return null
+    if (Number(dateParts.hour) >= Number(closeoutHourValue)) return localDate
+    const previous = new Date(`${localDate}T00:00:00.000Z`)
+    previous.setUTCDate(previous.getUTCDate() - 1)
+    return previous.toISOString().slice(0, 10)
+  } catch {
+    return null
+  }
+}
+
 function projectedOrderBusinessDates(
   order: ReturnType<typeof projectToastOrders>['orders'][number],
   sourceBusinessDate: string,
   timezone: string | null,
+  closeoutHour: number | null,
 ) {
   // Toast's payment-level paidBusinessDate already reflects the restaurant's
-  // closeout rules. Only fall back to the restaurant-local paidAt calendar for
-  // older payloads that do not expose that field.
+  // closeout rules. Older payloads may fall back to paidAt only when the exact
+  // restaurant cutoff is available; otherwise accounting fails closed later
+  // instead of assigning the payment to a calendar date.
   const paymentBusinessDates = new Set<string>()
   const activeChecks = order.details.checks.filter((check) => !check.voided && !check.deleted)
   for (const check of activeChecks) {
-    if (check.payments.length === 0) {
-      const checkDate = businessDateForInstant(check.paidAt || order.paidAt, timezone)
+    const activePayments = check.payments.filter(isToastProjectedPaymentActive)
+    if (activePayments.length === 0) {
+      if (check.payments.length > 0) continue
+      const checkDate = toastPaymentBusinessDateForInstant(
+        check.paidAt || order.paidAt,
+        timezone,
+        closeoutHour,
+      )
       if (checkDate) paymentBusinessDates.add(checkDate)
       continue
     }
-    for (const payment of check.payments) {
+    for (const payment of activePayments) {
       const paymentDate = payment.paidBusinessDate
-        || businessDateForInstant(payment.paidAt || check.paidAt || order.paidAt, timezone)
+        || toastPaymentBusinessDateForInstant(
+          payment.paidAt || check.paidAt || order.paidAt,
+          timezone,
+          closeoutHour,
+        )
       if (paymentDate) paymentBusinessDates.add(paymentDate)
     }
   }
   if (activeChecks.length === 0) {
-    const orderDate = businessDateForInstant(order.paidAt, timezone)
+    const orderDate = toastPaymentBusinessDateForInstant(order.paidAt, timezone, closeoutHour)
     if (orderDate) paymentBusinessDates.add(orderDate)
   }
   const fulfillmentBusinessDate = businessDateForInstant(
     order.promisedAt || order.estimatedFulfillmentAt,
     timezone,
   ) || sourceBusinessDate
+  if (!isToastProjectedOrderAccountingActive(order)) {
+    return { paymentBusinessDates: [], fulfillmentBusinessDate }
+  }
   return {
     paymentBusinessDates: [...paymentBusinessDates].sort(),
     fulfillmentBusinessDate,
@@ -1289,9 +1352,12 @@ export async function projectToastStandardOrdersInPostgres(input: {
         order,
         input.job.businessDate,
         input.job.timezone,
+        input.job.closeoutHour,
       )
-      normalizedDates.paymentBusinessDates.forEach((date) => accountingBusinessDates.add(date))
-      accountingBusinessDates.add(normalizedDates.fulfillmentBusinessDate)
+      if (isToastProjectedOrderAccountingActive(order)) {
+        normalizedDates.paymentBusinessDates.forEach((date) => accountingBusinessDates.add(date))
+        accountingBusinessDates.add(normalizedDates.fulfillmentBusinessDate)
+      }
       await client.query(
         `INSERT INTO toast_pos_orders (
            organization_id, restaurant_guid, order_guid, business_date, display_number,

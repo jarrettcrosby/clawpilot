@@ -46,6 +46,7 @@ type LocationState = {
   locationName: string | null
   locationCode: string | null
   timezone: string | null
+  closeoutHour: number | null
   active: boolean
   testMode: boolean
   archived: boolean
@@ -576,7 +577,9 @@ export default function ToastIntegrationPanel() {
               <Box minWidth={0}>
                 <Typography fontWeight={650} noWrap>{location.restaurantName}</Typography>
                 <Typography variant="caption" color="text.secondary" sx={{ display: 'block', overflowWrap: 'anywhere' }}>
-                  {location.restaurantGuid}{location.timezone ? ` · ${location.timezone}` : ''}
+                  {location.restaurantGuid}
+                  {location.timezone ? ` · ${location.timezone}` : ''}
+                  {location.closeoutHour !== null ? ` · cutoff ${location.closeoutHour}:00` : ' · cutoff awaiting refresh'}
                 </Typography>
                 <Stack direction="row" spacing={0.75} mt={0.75} flexWrap="wrap" useFlexGap>
                   {location.analyticsAccess ? <Chip size="small" label="Analytics" variant="outlined" /> : null}

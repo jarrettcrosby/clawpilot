@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict'
+import crypto from 'node:crypto'
 import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
@@ -1557,8 +1558,19 @@ for (const fragment of [
   'receipt?.id || null',
   "status: row.sales_receipt_status || 'not_required'",
   'assertCanonicalDraftReadiness',
+  'assertPreparedBatchMatchesCurrentPayloads',
+  'fingerprintPosAccountingPostingPayloads',
   'FOR UPDATE OF batch, journal',
 ]) includes(posPostingPersistence, fragment, 'POS accounting posting persistence')
+const preparePostingSource = posPostingPersistence.slice(
+  posPostingPersistence.indexOf('export async function preparePosAccountingPostingBatchInPostgres'),
+  posPostingPersistence.indexOf('export async function approvePosAccountingPostingBatchInPostgres'),
+)
+assert.ok(
+  preparePostingSource.indexOf('assertCanonicalDraftReadiness(draft)')
+    < preparePostingSource.indexOf('if (draft.posting_batch_id)'),
+  'POS posting prepare must enforce canonical blockers before replaying an existing prepared batch',
+)
 
 const posPostingRoute = read('app_src/app/api/accounting/quickbooks/pos-posting/route.ts')
 for (const fragment of [
@@ -1572,6 +1584,414 @@ for (const fragment of [
   'confirmFingerprint',
   'MAX_REQUEST_BYTES',
 ]) includes(posPostingRoute, fragment, 'POS accounting posting API')
+
+const canonicalGateQueries = []
+const canonicalGateDraftId = '21212121-2121-4212-8212-212121212121'
+const canonicalGateModule = loadTypeScriptModule('app_src/lib/persistence/posAccountingPosting.ts', {
+  '@/lib/auditWriter': { recordAuditEvent: async () => {} },
+  '@/lib/integrations/quickBooksWritePayloads': {
+    fingerprintQuickBooksWritePayload: () => 'a'.repeat(64),
+  },
+  '@/lib/persistence/posAccountingParity': {
+    buildPosAccountingParityReport: () => ({ rows: [] }),
+    readPosAccountingParityReportInPostgres: async () => ({ rows: [], pagination: { totalPages: 1 } }),
+  },
+  '@/lib/persistence/posAccounting': {
+    POS_ACCOUNTING_POSTING_GATE_VERSION: 2,
+    evaluateStoredPosAccountingReadiness: () => ({
+      readyForReview: false,
+      blockers: [{
+        code: 'payment_business_day_open',
+        title: 'Wait for the payment business day to close',
+        detail: 'Regenerate after the business day closes.',
+        action: 'Reload sales',
+      }],
+    }),
+  },
+  '@/lib/persistence/postgres': {
+    acquireTransactionAdvisoryLock: async () => {},
+    withTransaction: async (callback) => callback({
+      async query(source) {
+        canonicalGateQueries.push(String(source))
+        if (String(source).includes('FROM toast_accounting_export_drafts')) {
+          return { rows: [{
+            id: canonicalGateDraftId,
+            restaurant_guid: '11111111-1111-4111-8111-111111111111',
+            business_date: '2026-07-23',
+            status: 'needs_review',
+            reconciliation_status: 'orders_only',
+            source_summary: { canonical: { readiness: { postingGateVersion: 2, readyForReview: true } } },
+            proposed_lines: [],
+            posting_batch_id: '31313131-3131-4313-8313-313131313131',
+            is_current: true,
+          }] }
+        }
+        throw new Error(`Canonical blocker gate performed an unexpected query: ${source}`)
+      },
+    }),
+  },
+  '@/lib/quickBooksWritePolicy': {
+    configuredQuickBooksWritePolicy: () => ({ enabled: false, mode: null, allowedOperations: [] }),
+  },
+})
+await assert.rejects(
+  canonicalGateModule.preparePosAccountingPostingBatchInPostgres({
+    organizationId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    draftId: canonicalGateDraftId,
+    actorEmail: 'operator@example.test',
+  }),
+  (error) => (
+    error.code === 'POS_ACCOUNTING_POSTING_NOT_READY'
+    && error.status === 409
+    && error.message.includes('Wait for the payment business day to close')
+  ),
+)
+assert.equal(canonicalGateQueries.length, 1, 'canonical blockers must stop prepare before batch replay or QuickBooks reads')
+
+const contentBoundDraftId = '41414141-4141-4414-8414-414141414141'
+const contentBoundBatchId = '42424242-4242-4424-8424-424242424242'
+const contentBoundReceiptRequestId = '43434343-4343-4434-8434-434343434343'
+const contentBoundJournalRequestId = '44444444-4444-4444-8444-444444444444'
+const contentBoundProfileId = '45454545-4545-4454-8454-454545454545'
+const contentBoundRestaurantGuid = '46464646-4646-4464-8464-464646464646'
+const contentBoundOrganizationId = '47474747-4747-4474-8474-474747474747'
+const contentBoundPayloadFingerprint = (payload) => crypto
+  .createHash('sha256')
+  .update(JSON.stringify(payload))
+  .digest('hex')
+const contentBoundDraft = ({
+  salesAmount = 100,
+  tipAmount = 10,
+  feeAmount = 3,
+  postingGateVersion = 2,
+} = {}) => {
+  const paymentAmount = salesAmount + tipAmount
+  const bankAmount = paymentAmount - feeAmount
+  return {
+    id: contentBoundDraftId,
+    restaurant_guid: contentBoundRestaurantGuid,
+    business_date: '2026-07-23',
+    status: 'needs_review',
+    reconciliation_status: 'orders_only',
+    source_summary: {
+      canonical: {
+        profileId: contentBoundProfileId,
+        readiness: { postingGateVersion, readyForReview: true, blockers: [] },
+        accounting: { salesReceipt: { tax: 0 } },
+        mappingRevisions: [],
+      },
+    },
+    proposed_lines: [
+      {
+        document: 'sales_receipt',
+        sourceName: 'Net sales',
+        quantity: 1,
+        amount: salesAmount,
+        target: { id: 'item-sales' },
+      },
+      {
+        document: 'payments_journal',
+        code: 'bank_deposit',
+        label: 'Bank deposit',
+        side: 'debit',
+        amount: bankAmount,
+        target: { id: 'account-bank' },
+      },
+      {
+        document: 'payments_journal',
+        code: 'processing_fee',
+        sourceKind: 'fee',
+        label: 'Processing fee',
+        side: 'debit',
+        amount: feeAmount,
+        target: { id: 'account-fee' },
+      },
+      {
+        document: 'payments_journal',
+        code: 'sales_clearing',
+        label: 'Sales clearing',
+        side: 'credit',
+        amount: salesAmount,
+        target: { id: 'account-clearing' },
+      },
+      {
+        document: 'payments_journal',
+        code: 'tips',
+        label: 'Tips payable',
+        side: 'credit',
+        amount: tipAmount,
+        target: { id: 'account-tips' },
+      },
+    ],
+    posting_batch_id: contentBoundBatchId,
+    is_current: true,
+  }
+}
+const contentBoundMaterializedPayloads = ({ salesAmount = 100, tipAmount = 10, feeAmount = 3 } = {}) => {
+  const paymentAmount = salesAmount + tipAmount
+  const bankAmount = paymentAmount - feeAmount
+  return {
+    salesReceipt: {
+      transactionDate: '2026-07-23',
+      customerId: null,
+      customerName: null,
+      depositToAccountId: 'account-clearing',
+      depositToAccountName: 'POS Clearing',
+      taxCodeId: null,
+      taxCodeName: null,
+      taxAmount: 0,
+      memo: 'Toast 2026-07-23 - ClawPilot POS accounting',
+      lines: [{
+        itemId: 'item-sales',
+        itemName: 'Sales item',
+        description: 'Net sales',
+        quantity: 1,
+        unitPrice: salesAmount,
+        amount: salesAmount,
+        taxable: false,
+      }],
+      totalAmount: salesAmount,
+    },
+    journalEntry: {
+      transactionDate: '2026-07-23',
+      memo: 'Toast 2026-07-23 - ClawPilot POS accounting',
+      lines: [
+        {
+          accountId: 'account-bank',
+          accountName: 'Bank',
+          description: 'Bank deposit',
+          postingType: 'Debit',
+          amount: bankAmount,
+        },
+        {
+          accountId: 'account-fee',
+          accountName: 'Processing fees',
+          description: 'Processing fee',
+          postingType: 'Debit',
+          amount: feeAmount,
+        },
+        {
+          accountId: 'account-clearing',
+          accountName: 'POS Clearing',
+          description: 'Sales clearing',
+          postingType: 'Credit',
+          amount: salesAmount,
+        },
+        {
+          accountId: 'account-tips',
+          accountName: 'Tips payable',
+          description: 'Tips payable',
+          postingType: 'Credit',
+          amount: tipAmount,
+        },
+      ],
+      debitAmount: paymentAmount,
+      creditAmount: paymentAmount,
+    },
+  }
+}
+let currentContentBoundDraft = contentBoundDraft()
+let currentContentBoundBatchStatus = 'pending_approval'
+let contentBoundBatchFingerprint = ''
+let contentBoundQueries = []
+const contentBoundClient = {
+  async query(source) {
+    contentBoundQueries.push(String(source))
+    if (String(source).includes('FROM toast_accounting_export_drafts')) {
+      return { rows: [currentContentBoundDraft] }
+    }
+    if (String(source).includes('FROM pos_accounting_posting_batches batch')) {
+      return { rows: [{
+        id: contentBoundBatchId,
+        draft_id: contentBoundDraftId,
+        restaurant_guid: contentBoundRestaurantGuid,
+        business_date: '2026-07-23',
+        status: currentContentBoundBatchStatus,
+        request_fingerprint: contentBoundBatchFingerprint,
+        sales_receipt_request_id: contentBoundReceiptRequestId,
+        sales_receipt_status: 'pending_approval',
+        sales_receipt_provider_entity_id: null,
+        sales_receipt_error: null,
+        journal_entry_request_id: contentBoundJournalRequestId,
+        journal_entry_status: 'pending_approval',
+        journal_entry_provider_entity_id: null,
+        journal_entry_error: null,
+        requested_by: 'preparer@example.test',
+        approved_by: null,
+        approval_note: null,
+        last_error: null,
+        submitted_at: '2026-07-24T12:00:00.000Z',
+        approved_at: null,
+        posted_at: currentContentBoundBatchStatus === 'posted' ? '2026-07-24T12:05:00.000Z' : null,
+        updated_at: '2026-07-24T12:00:00.000Z',
+      }] }
+    }
+    if (String(source).includes('FROM pos_accounting_profiles')) {
+      return { rows: [{
+        quickbooks_binding_status: 'verified',
+        quickbooks_customer_id: null,
+        quickbooks_customer_name: null,
+        quickbooks_clearing_account_id: 'account-clearing',
+        quickbooks_clearing_account_name: 'POS Clearing',
+        track_sales_tax: false,
+      }] }
+    }
+    if (String(source).includes('FROM quickbooks_items')) {
+      return { rows: [{
+        quickbooks_item_id: 'item-sales',
+        name: 'Sales item',
+        fully_qualified_name: 'Sales item',
+        item_type: 'Service',
+        taxable: false,
+      }] }
+    }
+    if (String(source).includes('FROM quickbooks_accounts')) {
+      return { rows: [
+        { quickbooks_account_id: 'account-bank', fully_qualified_name: 'Bank' },
+        { quickbooks_account_id: 'account-fee', fully_qualified_name: 'Processing fees' },
+        { quickbooks_account_id: 'account-clearing', fully_qualified_name: 'POS Clearing' },
+        { quickbooks_account_id: 'account-tips', fully_qualified_name: 'Tips payable' },
+      ] }
+    }
+    throw new Error(`Content-bound posting test performed an unexpected query: ${source}`)
+  },
+}
+const contentBoundModule = loadTypeScriptModule('app_src/lib/persistence/posAccountingPosting.ts', {
+  '@/lib/auditWriter': { recordAuditEvent: async () => {} },
+  '@/lib/integrations/quickBooksWritePayloads': {
+    fingerprintQuickBooksWritePayload: contentBoundPayloadFingerprint,
+  },
+  '@/lib/persistence/posAccountingParity': {
+    buildPosAccountingParityReport: () => ({ rows: [] }),
+    readPosAccountingParityReportInPostgres: async () => ({ rows: [], pagination: { totalPages: 1 } }),
+  },
+  '@/lib/persistence/posAccounting': {
+    POS_ACCOUNTING_POSTING_GATE_VERSION: 2,
+    evaluateStoredPosAccountingReadiness: () => ({ readyForReview: true, blockers: [] }),
+  },
+  '@/lib/persistence/postgres': {
+    acquireTransactionAdvisoryLock: async () => {},
+    withTransaction: async (callback) => callback(contentBoundClient),
+  },
+  '@/lib/quickBooksWritePolicy': {
+    configuredQuickBooksWritePolicy: () => ({
+      enabled: true,
+      mode: 'production',
+      allowedOperations: ['sales_receipt.create', 'journal_entry.create'],
+    }),
+  },
+})
+contentBoundBatchFingerprint = contentBoundModule.fingerprintPosAccountingPostingPayloads(
+  contentBoundDraftId,
+  contentBoundMaterializedPayloads(),
+)
+currentContentBoundDraft = contentBoundDraft({ postingGateVersion: 1 })
+contentBoundQueries = []
+await assert.rejects(
+  contentBoundModule.preparePosAccountingPostingBatchInPostgres({
+    organizationId: contentBoundOrganizationId,
+    draftId: contentBoundDraftId,
+    actorEmail: 'preparer@example.test',
+  }),
+  (error) => (
+    error.code === 'POS_ACCOUNTING_POSTING_REGENERATION_REQUIRED'
+    && error.status === 409
+    && error.message.includes('Regenerate accounting')
+  ),
+  'a legacy prepared draft must fail closed until it is regenerated through the current closeout gate',
+)
+assert.equal(
+  contentBoundQueries.some((source) => source.includes('FROM pos_accounting_posting_batches batch')),
+  false,
+  'a legacy draft must stop preparation before replaying a prepared batch',
+)
+contentBoundQueries = []
+await assert.rejects(
+  contentBoundModule.approvePosAccountingPostingBatchInPostgres({
+    organizationId: contentBoundOrganizationId,
+    batchId: contentBoundBatchId,
+    confirmFingerprint: contentBoundBatchFingerprint,
+    actorEmail: 'approver@example.test',
+  }),
+  (error) => error.code === 'POS_ACCOUNTING_POSTING_REGENERATION_REQUIRED' && error.status === 409,
+  'a legacy prepared batch must fail closed at approval until its draft is regenerated',
+)
+assert.equal(
+  contentBoundQueries.some((source) => source.includes('UPDATE quickbooks_write_requests request SET')),
+  false,
+  'a legacy draft must stop approval before child writes are released',
+)
+currentContentBoundDraft = contentBoundDraft()
+contentBoundQueries = []
+const unchangedPreparedBatch = await contentBoundModule.preparePosAccountingPostingBatchInPostgres({
+  organizationId: contentBoundOrganizationId,
+  draftId: contentBoundDraftId,
+  actorEmail: 'preparer@example.test',
+})
+assert.equal(unchangedPreparedBatch.requestFingerprint, contentBoundBatchFingerprint)
+assert.equal(
+  contentBoundQueries.some((source) => source.includes('INSERT INTO quickbooks_write_requests')),
+  false,
+  'an unchanged prepared draft must replay idempotently without creating new child writes',
+)
+
+for (const drift of [
+  { label: 'amount', values: { salesAmount: 101, tipAmount: 10, feeAmount: 3 } },
+  { label: 'tip', values: { salesAmount: 100, tipAmount: 11, feeAmount: 3 } },
+  { label: 'fee', values: { salesAmount: 100, tipAmount: 10, feeAmount: 4 } },
+]) {
+  currentContentBoundDraft = contentBoundDraft(drift.values)
+  contentBoundQueries = []
+  await assert.rejects(
+    contentBoundModule.preparePosAccountingPostingBatchInPostgres({
+      organizationId: contentBoundOrganizationId,
+      draftId: contentBoundDraftId,
+      actorEmail: 'preparer@example.test',
+    }),
+    (error) => (
+      error.code === 'POS_ACCOUNTING_POSTING_CONTENT_STALE'
+      && error.status === 409
+      && error.message.includes('Regenerate accounting')
+    ),
+    `${drift.label} drift must make prepared-batch replay fail closed`,
+  )
+  assert.equal(
+    contentBoundQueries.some((source) => (
+      source.includes('INSERT INTO quickbooks_write_requests')
+      || source.includes('UPDATE quickbooks_write_requests')
+    )),
+    false,
+    `${drift.label} drift must not mutate QuickBooks child writes during prepare`,
+  )
+
+  contentBoundQueries = []
+  await assert.rejects(
+    contentBoundModule.approvePosAccountingPostingBatchInPostgres({
+      organizationId: contentBoundOrganizationId,
+      batchId: contentBoundBatchId,
+      confirmFingerprint: contentBoundBatchFingerprint,
+      actorEmail: 'approver@example.test',
+    }),
+    (error) => error.code === 'POS_ACCOUNTING_POSTING_CONTENT_STALE' && error.status === 409,
+    `${drift.label} drift must make approval fail closed`,
+  )
+  assert.equal(
+    contentBoundQueries.some((source) => source.includes('UPDATE quickbooks_write_requests request SET')),
+    false,
+    `${drift.label} drift must stop approval before child writes are released`,
+  )
+}
+
+currentContentBoundBatchStatus = 'posted'
+contentBoundQueries = []
+const idempotentPostedBatch = await contentBoundModule.approvePosAccountingPostingBatchInPostgres({
+  organizationId: contentBoundOrganizationId,
+  batchId: contentBoundBatchId,
+  confirmFingerprint: contentBoundBatchFingerprint,
+  actorEmail: 'approver@example.test',
+})
+assert.equal(idempotentPostedBatch.status, 'posted')
+assert.equal(contentBoundQueries.length, 1, 'posted evidence must replay without rematerializing mutable draft content')
 
 const externalPostingQueries = []
 const externalPostingAuditEvents = []
@@ -1666,6 +2086,7 @@ const externalPostingModule = loadTypeScriptModule('app_src/lib/persistence/posA
     recordAuditEvent: async (event) => { externalPostingAuditEvents.push(event) },
   },
   '@/lib/persistence/posAccounting': {
+    POS_ACCOUNTING_POSTING_GATE_VERSION: 2,
     evaluateStoredPosAccountingReadiness: () => ({ readyForReview: true, blockers: [] }),
   },
   '@/lib/integrations/quickBooksWritePayloads': {

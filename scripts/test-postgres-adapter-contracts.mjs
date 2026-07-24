@@ -1548,6 +1548,8 @@ for (const migration of [
   '0102_pos_payment_exceptions.sql',
   '0103_pipeline_crm_reference_quarantine.sql',
   '0104_demo_managed_resource_guard.sql',
+  '0105_quickbooks_pos_evidence_refresh.sql',
+  '0106_toast_location_closeout_hour.sql',
 ]) {
   assertIncludes(healthRoute, migration, 'hosted POS and accounting migration health')
 }
