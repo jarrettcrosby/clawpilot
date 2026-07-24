@@ -1249,7 +1249,7 @@ for (const fragment of [
   "operationKind: 'sales_receipt.create'",
   "operationKind: 'journal_entry.create'",
   "'partial_failed'",
-  "receipt.actual?.postingOrigin !== 'clawpilot'",
+  "receipt?.actual?.postingOrigin !== 'clawpilot'",
   "journal.actual?.postingOrigin !== 'clawpilot'",
   "review_outcome = 'externally_posted'",
   "posting_origin = 'external'",
@@ -1258,6 +1258,11 @@ for (const fragment of [
   'failures.push({',
   'quickbooks_sales_receipt_id',
   'quickbooks_journal_entry_id',
+  'journalOnlyPaymentException',
+  'receipt?.id || null',
+  "status: row.sales_receipt_status || 'not_required'",
+  'assertCanonicalDraftReadiness',
+  'FOR UPDATE OF batch, journal',
 ]) includes(posPostingPersistence, fragment, 'POS accounting posting persistence')
 
 const posPostingRoute = read('app_src/app/api/accounting/quickbooks/pos-posting/route.ts')
@@ -1278,6 +1283,7 @@ const externalPostingAuditEvents = []
 const externalPostingDraftId = '22222222-2222-4222-8222-222222222222'
 const externalPostingBatchId = '33333333-3333-4333-8333-333333333333'
 let externalPostingReconciliationStatus = 'orders_only'
+let externalPostingJournalOnly = false
 const externalPostingClient = {
   async query(source, parameters = []) {
     externalPostingQueries.push({ source, parameters })
@@ -1291,7 +1297,13 @@ const externalPostingClient = {
         status: 'needs_review',
         reconciliation_status: externalPostingReconciliationStatus,
         source_summary: {},
-        proposed_lines: [],
+        proposed_lines: externalPostingJournalOnly ? [{
+          document: 'payments_journal',
+          code: 'payment_exception_capture',
+          sourceKind: 'payment_exception',
+          side: 'credit',
+          amount: 44.54,
+        }] : [],
         posting_batch_id: externalPostingBatchId,
         is_current: true,
         review_outcome: null,
@@ -1310,10 +1322,10 @@ const externalPostingClient = {
     }
     if (source.includes("'external'::text AS pos_accounting_origin")) {
       return { rows: [
-        {
+        ...(!externalPostingJournalOnly ? [{
           entity_type: 'SalesReceipt', quickbooks_transaction_id: 'receipt-19',
           transaction_date: new Date('2026-07-19T00:00:00.000Z'), pos_accounting_business_date: '2026-07-19',
-        },
+        }] : []),
         {
           entity_type: 'JournalEntry', quickbooks_transaction_id: 'journal-19',
           transaction_date: new Date('2026-07-19T00:00:00.000Z'), pos_accounting_business_date: '2026-07-19',
@@ -1358,18 +1370,21 @@ const externalPostingModule = loadTypeScriptModule('app_src/lib/persistence/posA
   '@/lib/auditWriter': {
     recordAuditEvent: async (event) => { externalPostingAuditEvents.push(event) },
   },
+  '@/lib/persistence/posAccounting': {
+    evaluateStoredPosAccountingReadiness: () => ({ readyForReview: true, blockers: [] }),
+  },
   '@/lib/integrations/quickBooksWritePayloads': {
     fingerprintQuickBooksWritePayload: () => 'a'.repeat(64),
   },
   '@/lib/persistence/posAccountingParity': {
     buildPosAccountingParityReport: () => ({
       rows: [
-        {
+        ...(!externalPostingJournalOnly ? [{
           expected: { entityType: 'SalesReceipt', draft: { id: externalPostingDraftId } },
           match: { status: 'matched' },
           comparison: { status: 'match' },
           actual: { providerTransactionId: 'receipt-19' },
-        },
+        }] : []),
         {
           expected: { entityType: 'JournalEntry', draft: { id: externalPostingDraftId } },
           match: { status: 'matched' },
@@ -1388,6 +1403,10 @@ const externalPostingModule = loadTypeScriptModule('app_src/lib/persistence/posA
     configuredQuickBooksWritePolicy: () => ({ enabled: false, mode: null, allowedOperations: [] }),
   },
 })
+assert.equal(externalPostingModule.posAccountingDraftTaxAmount({
+  standard: { tax: 0 },
+  canonical: { accounting: { salesReceipt: { tax: 2.72 } } },
+}), 2.72, 'fulfillment posting tax must come from the authoritative dated preview')
 const externalPostingOutcome = await externalPostingModule.recordExternalPostingInPostgres({
   organizationId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
   draftId: externalPostingDraftId,
@@ -1408,6 +1427,20 @@ assert.ok(externalPostingQueries.some(({ source }) => source.includes("status = 
 assert.ok(externalPostingQueries.some(({ source }) => source.includes("review_outcome = 'externally_posted'")))
 assert.equal(externalPostingQueries.some(({ source }) => source.includes("status = 'approved'")), false)
 
+externalPostingJournalOnly = true
+const externalJournalOnlyOutcome = await externalPostingModule.recordExternalPostingInPostgres({
+  organizationId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+  draftId: externalPostingDraftId,
+  salesReceiptId: null,
+  journalEntryId: 'journal-19',
+  providerName: 'Shogo',
+  actorEmail: 'operator@example.com',
+})
+assert.equal(externalJournalOnlyOutcome.recorded, true)
+assert.equal(externalJournalOnlyOutcome.salesReceiptId, null)
+assert.equal(externalJournalOnlyOutcome.journalEntryId, 'journal-19')
+
+externalPostingJournalOnly = false
 externalPostingReconciliationStatus = 'variance'
 await assert.rejects(
   () => externalPostingModule.recordExternalPostingInPostgres({

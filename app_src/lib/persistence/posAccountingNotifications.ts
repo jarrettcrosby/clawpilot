@@ -20,6 +20,7 @@ export type PosAccountingIssue = {
   code: string
   title: string
   detail: string
+  action?: string
 }
 
 type IssueStateRow = {
@@ -78,6 +79,32 @@ function money(value: unknown) {
 
 export function derivePosAccountingIssues(workspace: PosAccountingWorkspace): PosAccountingIssue[] {
   const preview = workspace.preview
+  const canonicalBlockers = Array.isArray(preview.readiness?.blockers)
+    ? preview.readiness.blockers.map((value) => {
+        const blocker = value && typeof value === 'object' && !Array.isArray(value)
+          ? value as Record<string, unknown>
+          : {}
+        return {
+          code: cleanText(blocker.code, 'accounting_hold', 600),
+          title: cleanText(blocker.title, 'Accounting date is on hold'),
+          detail: cleanText(blocker.detail, 'Resolve the accounting hold before posting.', 1_000),
+          action: cleanText(blocker.action, 'Review accounting'),
+        }
+      })
+    : []
+  const draftFailure = workspace.draft?.status === 'failed' || workspace.draft?.lastError
+    ? [{
+        code: 'provider_failure',
+        title: 'Retry the failed accounting post',
+        detail: cleanText(workspace.draft?.lastError, 'QuickBooks rejected or failed the accounting post.', 1_000),
+        action: 'Review failure',
+      }]
+    : []
+  if (canonicalBlockers.length > 0 || draftFailure.length > 0) {
+    return [...new Map(
+      [...canonicalBlockers, ...draftFailure].map((issue) => [issue.code, issue]),
+    ).values()].sort((left, right) => left.code.localeCompare(right.code))
+  }
   if (!preview.available) return []
 
   const issues: PosAccountingIssue[] = []

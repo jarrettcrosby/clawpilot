@@ -3,17 +3,19 @@
   "releases": {
     "default": {
       "oncePerEnvironment": true,
-      "title": "Personalized ClawPilot user guide",
-      "summary": "Every active workspace membership now receives a private, continuously refreshed ClawPilot User Guide in Docs. It provides direct module navigation and role-aware instructions for projects and agents, pipeline and CRM, accounting and POS, sharing, mobile use, browser sessions, and troubleshooting.",
+      "title": "Warehouse operations and reliable POS posting",
+      "summary": "ClawPilot now carries warehouse work through receiving, shipment, printing, carrier billing, settlement, and editable topology while giving Toast accounting an actionable posting queue with correct future-order and Payment Exceptions handling.",
       "features": [
-        "A private ClawPilot User Guide automatically available as the first document for every active user membership",
-        "Direct links and concise workflow guidance for Dashboard, Docs, Projects, Pipeline, CRM, Accounting, POS, Links, Agents, and Versions",
-        "Workspace- and role-aware guidance for permissions, integrations, agent dispatch, controlled provider writes, browser sessions, and support evidence",
-        "Responsive guide reading in phone portrait, phone landscape, and desktop layouts"
+        "Editable warehouse, location, receiving, shipment, label, packing-slip, print-agent, carrier-billing, GL-coding, and settlement workflows",
+        "A POS posting queue with Ready, Hold, Posting, Posted, and Failed states, issue-only filtering, exact blocker details, and corrective actions",
+        "Toast future-order accounting that records payment-day Payment Exceptions and releases them when the order is fulfilled",
+        "Restaurant-business-date-aware payment classification and a bounded replay that discovers existing future preorders"
       ],
       "fixes": [
-        "Provisioning no longer depends on a user first opening Docs or waiting for a background document refresh",
-        "Guide content remains current when a user's active workspace role or relevant permissions change"
+        "Late-night Toast payments now follow paidBusinessDate instead of being shifted by calendar midnight",
+        "Open checks, out-of-balance journals, missing mappings, incomplete batch details, protected updates, stale workers, and provider failures can no longer disappear from the posting queue",
+        "Payment-only preorder dates no longer create empty QuickBooks Sales Receipts",
+        "Sandbox carrier-rate diagnostics remain scoped to their exact account and evidence boundary"
       ]
     }
   }

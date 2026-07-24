@@ -67,6 +67,7 @@
     "verify:tenancy-data": "node scripts/verify-tenancy-provisioning.mjs",
     "db:migrate": "node scripts/db-migrate.mjs",
     "db:inspect": "node scripts/db-inspect-persistence.mjs",
+    "toast:activate-payment-date-backfill": "node scripts/activate-toast-payment-date-backfill.mjs",
     "demo:seed": "node scripts/seed-demo-environment.mjs",
     "demo:verify": "node scripts/verify-demo-environment.mjs",
     "demo:verify-postgres": "node scripts/verify-demo-seed-postgres.mjs",

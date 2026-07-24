@@ -1,6 +1,6 @@
 'use client'
 
-import { FormEvent, forwardRef, useCallback, useEffect, useState } from 'react'
+import { FormEvent, forwardRef, type MouseEvent as ReactMouseEvent, useCallback, useEffect, useState } from 'react'
 import {
   Alert,
   Box,
@@ -134,6 +134,26 @@ const OperationsTabScrollButton = forwardRef<HTMLButtonElement, TabScrollButtonP
     )
   },
 )
+
+function pageOperationsTabs(event: ReactMouseEvent<HTMLDivElement>) {
+  const target = event.target as HTMLElement
+  const button = target.closest<HTMLButtonElement>(
+    'button[aria-label="Scroll operations tabs left"], button[aria-label="Scroll operations tabs right"]',
+  )
+  if (!button || button.disabled || !event.currentTarget.contains(button)) return
+
+  const scroller = event.currentTarget.querySelector<HTMLElement>('.MuiTabs-scroller')
+  if (!scroller) return
+
+  event.preventDefault()
+  event.stopPropagation()
+  scroller.scrollTo({
+    left: button.getAttribute('aria-label')?.endsWith('left')
+      ? 0
+      : scroller.scrollWidth - scroller.clientWidth,
+    behavior: 'auto',
+  })
+}
 
 const controlSx = {
   minWidth: 0,
@@ -1462,6 +1482,7 @@ export default function OperationsSection() {
         )}
         <Box
           data-testid="operations-tab-navigation"
+          onClickCapture={pageOperationsTabs}
           sx={{ mt: 1.25, minWidth: 0, maxWidth: '100%', overflow: 'hidden' }}
         >
           <Tabs

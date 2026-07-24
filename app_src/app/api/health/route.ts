@@ -246,6 +246,7 @@ export async function GET() {
           operations_settlement_lifecycle_migration_applied: boolean
           operations_label_execution_migration_applied: boolean
           operations_receiving_topology_migration_applied: boolean
+          pos_payment_exceptions_migration_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -666,6 +667,11 @@ export async function GET() {
                 FROM schema_migrations
                 WHERE filename = '0101_operations_receiving_and_topology.sql'
               ) AS operations_receiving_topology_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0102_pos_payment_exceptions.sql'
+              ) AS pos_payment_exceptions_migration_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -761,6 +767,7 @@ export async function GET() {
             && row?.operations_settlement_lifecycle_migration_applied
             && row?.operations_label_execution_migration_applied
             && row?.operations_receiving_topology_migration_applied
+            && row?.pos_payment_exceptions_migration_applied
             && row?.migration_checksums_present
           ),
         }
@@ -848,6 +855,7 @@ export async function GET() {
           || !row?.operations_settlement_lifecycle_migration_applied
           || !row?.operations_label_execution_migration_applied
           || !row?.operations_receiving_topology_migration_applied
+          || !row?.pos_payment_exceptions_migration_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')

@@ -143,9 +143,9 @@ async function authenticateIfConfigured(page: Page) {
   expect(response.ok(), `UI authentication failed with HTTP ${response.status()}`).toBeTruthy()
 }
 
-async function mockPos(page: Page) {
+async function mockPos(page: Page, snapshot: Record<string, unknown> = posSnapshot) {
   await page.route((url) => url.pathname === '/api/pos', (route) => route.fulfill({
-    json: { ok: true, capabilities: { canView: true, canManage: true }, pos: posSnapshot },
+    json: { ok: true, capabilities: { canView: true, canManage: true }, pos: snapshot },
   }))
   await page.route((url) => url.pathname === '/api/pos/reports', (route) => route.fulfill({
     json: { ok: true, report: operationalReport },
@@ -389,6 +389,164 @@ for (const viewport of [
     await expectNoDocumentOverflow(page)
   })
 }
+
+test('POS posting queue routes a preorder payment exception to its exact mapping', async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 900 })
+  await authenticateIfConfigured(page)
+  const queueSnapshot = {
+    ...posSnapshot,
+    summary: { ...posSnapshot.summary, preorderCount: 1 },
+    orders: {
+      items: [{
+        orderGuid: 'preorder-order-1',
+        restaurantGuid: locationId,
+        restaurantName: 'Acceptance Restaurant',
+        businessDate: '2026-07-25',
+        displayNumber: '1',
+        paymentStatus: 'PAID',
+        paidAt: '2026-07-23T22:10:00.000Z',
+        paymentBusinessDates: ['2026-07-23'],
+        promisedAt: '2026-07-25T15:00:00.000Z',
+        fulfillmentBusinessDate: '2026-07-25',
+        checkCount: 1,
+        total: 44.54,
+      }],
+      total: 1,
+      page: 1,
+      pageSize: 25,
+    },
+    drafts: [
+      {
+        id: '22222222-2222-4222-8222-222222222222',
+        restaurantGuid: locationId,
+        restaurantName: 'Acceptance Restaurant',
+        businessDate: '2026-07-23',
+        status: 'needs_mapping',
+        reconciliationStatus: 'ready',
+        sourceSummary: {
+          standard: { total: 44.54 },
+          canonical: {
+            readiness: {
+              readyForReview: false,
+              hold: true,
+              missingMappings: [{
+                sourceKind: 'payment_exception',
+                sourceId: 'summary:payment_exceptions',
+                sourceName: 'Payment Exceptions',
+                targetType: 'account',
+              }],
+              blockers: [{
+                code: 'payment_exception_mapping_required',
+                title: 'Map Payment Exceptions',
+                detail: '1 prepaid check requires a QuickBooks Payment Exceptions account.',
+                action: 'Map account',
+                sourceKind: 'payment_exception',
+                sourceId: 'summary:payment_exceptions',
+                affectedChecks: 1,
+              }],
+              holdReasons: ['1 prepaid check requires a QuickBooks Payment Exceptions account.'],
+            },
+          },
+        },
+      },
+      {
+        id: '33333333-3333-4333-8333-333333333333',
+        restaurantGuid: locationId,
+        restaurantName: 'Acceptance Restaurant',
+        businessDate: '2026-07-22',
+        status: 'needs_review',
+        reconciliationStatus: 'orders_only',
+        sourceSummary: {
+          standard: { total: 21.22 },
+          canonical: { readiness: { readyForReview: true, hold: false, missingMappings: [], blockers: [], holdReasons: [] } },
+        },
+      },
+    ],
+    accountingIssues: [],
+    syncIssues: [],
+  }
+  await mockPos(page, queueSnapshot)
+  const accountingRequests: string[] = []
+  await page.route((url) => url.pathname === '/api/pos/accounting', (route) => {
+    accountingRequests.push(route.request().url())
+    return route.fulfill({
+      json: {
+        ok: true,
+        capabilities: { canView: true, canManage: true, canPrepare: true, canApprove: true },
+        accounting: {
+          location: { restaurantGuid: locationId, restaurantName: 'Acceptance Restaurant', locationName: 'Downtown' },
+          profile: {
+            scope: 'organization_default', profileRevision: 1, postingMethod: 'itemized_sales_receipt',
+            breakoutDimensions: [], trackSalesTax: true, memoMode: 'pos_date', customMemo: null,
+            customTransactionNumber: false, transactionNumberSuffix: null, suppressZeroOverShort: true,
+            autoPayoutTips: false, depositChecksWithCash: false, openCheckPolicy: 'hold',
+            batchHoldPolicy: 'hold_until_closed', emailNotificationsEnabled: false,
+          },
+          quickBooks: {
+            configured: true, bound: true, companyName: 'Acceptance Books', status: 'active',
+            catalog: { accounts: 1, items: 0, taxCodes: 0, classes: 0, departments: 0 },
+          },
+          sourceCatalog: [{
+            sourceKind: 'payment_exception',
+            sourceId: 'summary:payment_exceptions',
+            sourceName: 'Payment Exceptions',
+          }],
+          mappings: [],
+          targets: {
+            accounts: [{ id: 'payment-exceptions-account', name: 'Payment Exceptions' }],
+            items: [], customers: [], vendors: [], taxCodes: [], classes: [], departments: [],
+          },
+          preview: {
+            available: true,
+            paymentExceptions: { affectedChecks: 1, captureChecks: 1, releaseChecks: 0, captureAmount: 44.54, releaseAmount: 0 },
+            readiness: {
+              readyForReview: false,
+              hold: true,
+              missingMappings: [{
+                sourceKind: 'payment_exception',
+                sourceId: 'summary:payment_exceptions',
+                sourceName: 'Payment Exceptions',
+                targetType: 'account',
+              }],
+              holdReasons: ['1 prepaid check requires a QuickBooks Payment Exceptions account.'],
+            },
+            salesReceipt: { subtotal: 0, tax: 0, tips: 0, total: 0, lineItems: [] },
+            journal: { lines: [], balanced: true, balance: 0 },
+            evidence: {},
+          },
+          draft: { id: '22222222-2222-4222-8222-222222222222', status: 'needs_mapping', draftRevision: 1 },
+          draftHistory: [],
+          latestCommand: null,
+        },
+      },
+    })
+  })
+
+  await page.addInitScript((organizationId) => {
+    window.localStorage.setItem(`clawpilot.pos.guide.seen:${organizationId}`, '1')
+  }, posSnapshot.organizationId)
+  await page.goto('/#pos')
+  if (new URL(page.url()).pathname === '/login') {
+    throw new Error('Target requires authentication; set UI_AUTH_PASSWORD and UI_OPERATOR_SECRET together')
+  }
+  await expect(page.getByTestId('app-shell')).toBeVisible()
+  await activatePos(page)
+
+  await page.getByRole('tab', { name: 'Orders', exact: true }).click()
+  await expect(page.getByText('1 preorder', { exact: true })).toBeVisible()
+  await expect(page.getByText('Fulfills Jul 25, 2026', { exact: true })).toBeVisible()
+
+  await page.getByRole('tab', { name: 'Accounting', exact: true }).click()
+  await expect(page.getByText("Can't post: Map Payment Exceptions", { exact: true })).toBeVisible()
+  await expect(page.getByText('1 blocker', { exact: true })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Open posting review', exact: true })).toBeVisible()
+  await page.getByRole('button', { name: 'Map payment exceptions', exact: true }).click()
+  await expect(page.getByPlaceholder('Search mappings')).toHaveValue('payment_exception')
+  await expect.poll(() => accountingRequests.some((request) => {
+    const url = new URL(request)
+    return url.searchParams.get('date') === '2026-07-23' && url.searchParams.get('location') === locationId
+  })).toBeTruthy()
+})
 
 test('POS accounting saves only one exact changed mapping from a catalog larger than 250 rows', async ({ page }) => {
   await page.setViewportSize({ width: 1280, height: 900 })

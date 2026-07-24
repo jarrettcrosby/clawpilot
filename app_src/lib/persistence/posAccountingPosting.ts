@@ -12,6 +12,7 @@ import {
   buildPosAccountingParityReport,
   readPosAccountingParityReportInPostgres,
 } from '@/lib/persistence/posAccountingParity'
+import { evaluateStoredPosAccountingReadiness } from '@/lib/persistence/posAccounting'
 import { acquireTransactionAdvisoryLock, withTransaction } from '@/lib/persistence/postgres'
 import { configuredQuickBooksWritePolicy } from '@/lib/quickBooksWritePolicy'
 
@@ -63,8 +64,8 @@ type PostingBatchRow = {
   business_date: string
   status: PostingBatchStatus
   request_fingerprint: string
-  sales_receipt_request_id: string
-  sales_receipt_status: string
+  sales_receipt_request_id: string | null
+  sales_receipt_status: string | null
   sales_receipt_provider_entity_id: string | null
   sales_receipt_error: string | null
   journal_entry_request_id: string
@@ -149,6 +150,11 @@ function requiredProviderId(value: unknown, label: string) {
   return id
 }
 
+function optionalProviderId(value: unknown, label: string) {
+  if (value === null || value === undefined || String(value).trim() === '') return null
+  return requiredProviderId(value, label)
+}
+
 function requiredExternalProvider(value: unknown) {
   const provider = text(value, 120)
   if (!provider) {
@@ -190,7 +196,7 @@ function batchFromRow(row: PostingBatchRow) {
     requestFingerprint: row.request_fingerprint,
     salesReceipt: {
       requestId: row.sales_receipt_request_id,
-      status: row.sales_receipt_status,
+      status: row.sales_receipt_status || 'not_required',
       providerEntityId: row.sales_receipt_provider_entity_id,
       error: row.sales_receipt_error,
     },
@@ -215,13 +221,48 @@ async function readBatch(client: PoolClient, organizationId: string, batchId: st
   const result = await client.query<PostingBatchRow>(
     `SELECT ${BATCH_SELECT}
      FROM pos_accounting_posting_batches batch
-     JOIN quickbooks_write_requests receipt ON receipt.id = batch.sales_receipt_request_id
+     LEFT JOIN quickbooks_write_requests receipt ON receipt.id = batch.sales_receipt_request_id
      JOIN quickbooks_write_requests journal ON journal.id = batch.journal_entry_request_id
      WHERE batch.organization_id = $1::uuid AND batch.id = $2::uuid
-     FOR UPDATE OF batch, receipt, journal`,
+     FOR UPDATE OF batch, journal`,
     [organizationId, batchId],
   )
   return result.rows[0] || null
+}
+
+function assertCanonicalDraftReadiness(draft: Pick<DraftRow, 'source_summary'>) {
+  const sourceSummary = record(draft.source_summary)
+  const canonical = record(sourceSummary.canonical)
+  const storedReadiness = record(canonical.readiness)
+  const readiness = evaluateStoredPosAccountingReadiness(storedReadiness)
+  if (storedReadiness.readyForReview !== true || !readiness.readyForReview) {
+    const blocker = readiness.blockers[0]
+    throw new PosAccountingPostingError(
+      'POS_ACCOUNTING_POSTING_NOT_READY',
+      blocker
+        ? `${blocker.title}: ${blocker.detail}`
+        : 'Resolve every accounting hold before preparing or approving this date',
+      409,
+    )
+  }
+  return { sourceSummary, canonical, readiness }
+}
+
+function isJournalOnlyPaymentExceptionDraft(draft: Pick<DraftRow, 'proposed_lines'>) {
+  const lines = records(draft.proposed_lines)
+  const hasReceipt = lines.some((line) => line.document === 'sales_receipt')
+  return !hasReceipt && lines.some((line) =>
+    line.document === 'payments_journal'
+      && line.sourceKind === 'payment_exception'
+      && line.code === 'payment_exception_capture')
+}
+
+export function posAccountingDraftTaxAmount(sourceSummaryValue: unknown) {
+  const sourceSummary = record(sourceSummaryValue)
+  const canonicalReceipt = record(record(record(sourceSummary.canonical).accounting).salesReceipt)
+  return canonicalReceipt.tax !== null && canonicalReceipt.tax !== undefined
+    ? amount(canonicalReceipt.tax)
+    : amount(record(sourceSummary.standard).tax)
 }
 
 async function materializePostingPayloads(
@@ -229,24 +270,7 @@ async function materializePostingPayloads(
   organizationId: string,
   draft: DraftRow,
 ) {
-  const sourceSummary = record(draft.source_summary)
-  const canonical = record(sourceSummary.canonical)
-  const readiness = record(canonical.readiness)
-  if (readiness.mappingsComplete !== true || readiness.allocationComplete !== true
-    || records(readiness.missingMappings).length > 0) {
-    throw new PosAccountingPostingError(
-      'POS_ACCOUNTING_POSTING_NOT_READY',
-      'Complete every POS accounting mapping and allocation before preparing this date',
-      409,
-    )
-  }
-  if (draft.reconciliation_status !== 'ready') {
-    throw new PosAccountingPostingError(
-      'POS_ACCOUNTING_POSTING_SOURCE_VARIANCE',
-      'Resolve the Toast source reconciliation variance before preparing this date',
-      409,
-    )
-  }
+  const { sourceSummary, canonical } = assertCanonicalDraftReadiness(draft)
   const profileId = requiredUuid(canonical.profileId, 'Accounting profile')
   const profileResult = await client.query<{
     quickbooks_binding_status: string
@@ -275,10 +299,13 @@ async function materializePostingPayloads(
   const proposedLines = records(draft.proposed_lines)
   const rawReceiptLines = proposedLines.filter((line) => line.document === 'sales_receipt')
   const rawJournalLines = proposedLines.filter((line) => line.document === 'payments_journal')
-  if (!rawReceiptLines.length || !rawJournalLines.length) {
+  const journalOnlyPaymentException = rawReceiptLines.length === 0
+    && rawJournalLines.some((line) =>
+      line.sourceKind === 'payment_exception' && line.code === 'payment_exception_capture')
+  if (!rawJournalLines.length || (rawReceiptLines.length === 0 && !journalOnlyPaymentException)) {
     throw new PosAccountingPostingError(
       'POS_ACCOUNTING_POSTING_DOCUMENTS_INCOMPLETE',
-      'The accounting draft must contain both a Sales Receipt and a Journal Entry',
+      'The accounting draft must contain a Journal Entry and, unless it is payment-exception-only, a Sales Receipt',
       409,
     )
   }
@@ -374,7 +401,7 @@ async function materializePostingPayloads(
   }
 
   let taxCode: { id: string; name: string } | null = null
-  const taxAmount = amount(record(sourceSummary.standard).tax)
+  const taxAmount = posAccountingDraftTaxAmount(sourceSummary)
   if (profile.track_sales_tax && taxAmount !== 0) {
     const mappingIds = records(canonical.mappingRevisions)
       .filter((mapping) => mapping.sourceKind === 'tax' && mapping.targetType === 'tax_code')
@@ -402,7 +429,7 @@ async function materializePostingPayloads(
     taxCode = { id: row.target_id, name: row.target_name }
   }
 
-  if (profile.quickbooks_customer_id) {
+  if (rawReceiptLines.length > 0 && profile.quickbooks_customer_id) {
     const customer = await client.query<{ quickbooks_customer_id: string }>(
       `SELECT quickbooks_customer_id FROM quickbooks_customers
        WHERE organization_id = $1::uuid AND quickbooks_customer_id = $2 AND active = true LIMIT 1`,
@@ -419,14 +446,14 @@ async function materializePostingPayloads(
 
   const marker = `Toast ${draft.business_date} - ClawPilot POS accounting`
   const receiptTotal = amount(receiptLines.reduce((sum, line) => sum + line.amount, 0) + taxAmount)
-  if (receiptTotal <= 0) {
+  if (rawReceiptLines.length > 0 && receiptTotal <= 0) {
     throw new PosAccountingPostingError(
       'POS_ACCOUNTING_POSTING_RECEIPT_TOTAL_INVALID',
       'The Sales Receipt total must be greater than zero',
       409,
     )
   }
-  const salesReceipt: QuickBooksSalesReceiptDraft = {
+  const salesReceipt: QuickBooksSalesReceiptDraft | null = rawReceiptLines.length > 0 ? {
     transactionDate: draft.business_date,
     customerId: profile.quickbooks_customer_id,
     customerName: profile.quickbooks_customer_name,
@@ -438,7 +465,7 @@ async function materializePostingPayloads(
     memo: marker,
     lines: receiptLines,
     totalAmount: receiptTotal,
-  }
+  } : null
   const journalEntry: QuickBooksJournalEntryDraft = {
     transactionDate: draft.business_date,
     memo: marker,
@@ -538,15 +565,15 @@ export async function preparePosAccountingPostingBatchInPostgres(input: {
       throw new PosAccountingPostingError('QUICKBOOKS_NOT_CONNECTED', 'Connect QuickBooks before preparing this posting', 409)
     }
     const payloads = await materializePostingPayloads(client, input.organizationId, draft)
-    const receipt = await insertChildRequest(client, {
-      organizationId: input.organizationId,
-      connectionId,
-      draftId,
-      kind: 'sales-receipt',
-      operationKind: 'sales_receipt.create',
-      payload: payloads.salesReceipt,
-      actorEmail: input.actorEmail,
-    })
+    const receipt = payloads.salesReceipt ? await insertChildRequest(client, {
+        organizationId: input.organizationId,
+        connectionId,
+        draftId,
+        kind: 'sales-receipt',
+        operationKind: 'sales_receipt.create',
+        payload: payloads.salesReceipt,
+        actorEmail: input.actorEmail,
+      }) : null
     const journal = await insertChildRequest(client, {
       organizationId: input.organizationId,
       connectionId,
@@ -558,7 +585,7 @@ export async function preparePosAccountingPostingBatchInPostgres(input: {
     })
     const requestFingerprint = crypto.createHash('sha256').update(JSON.stringify({
       draftId,
-      salesReceipt: receipt.fingerprint,
+      salesReceipt: receipt?.fingerprint || null,
       journalEntry: journal.fingerprint,
     })).digest('hex')
     const batchResult = await client.query<{ id: string }>(
@@ -575,7 +602,7 @@ export async function preparePosAccountingPostingBatchInPostgres(input: {
         draft.restaurant_guid,
         draft.business_date,
         requestFingerprint,
-        receipt.id,
+        receipt?.id || null,
         journal.id,
         input.actorEmail,
       ],
@@ -596,11 +623,13 @@ export async function preparePosAccountingPostingBatchInPostgres(input: {
       aggregateId: batchId,
       organizationId: input.organizationId,
       payload: {
-        message: `Prepared Sales Receipt and Journal Entry for Toast ${draft.business_date}`,
+        message: payloads.salesReceipt
+          ? `Prepared Sales Receipt and Journal Entry for Toast ${draft.business_date}`
+          : `Prepared Payment Exceptions Journal Entry for Toast ${draft.business_date}`,
         draftId,
         businessDate: draft.business_date,
         requestFingerprint,
-        documentCount: 2,
+        documentCount: payloads.salesReceipt ? 2 : 1,
       },
     }, client)
     const stored = await readBatch(client, input.organizationId, batchId)
@@ -625,6 +654,22 @@ export async function approvePosAccountingPostingBatchInPostgres(input: {
     if (!['pending_approval', 'failed', 'partial_failed'].includes(batch.status)) {
       throw new PosAccountingPostingError('POS_ACCOUNTING_POSTING_STATE_CONFLICT', 'This posting batch cannot be approved in its current state', 409)
     }
+    const draftResult = await client.query<Pick<DraftRow, 'source_summary'> & { is_current: boolean }>(
+      `SELECT source_summary, is_current
+       FROM toast_accounting_export_drafts
+       WHERE organization_id = $1::uuid AND id = $2::uuid
+       FOR UPDATE`,
+      [input.organizationId, batch.draft_id],
+    )
+    const currentDraft = draftResult.rows[0]
+    if (!currentDraft?.is_current) {
+      throw new PosAccountingPostingError(
+        'POS_ACCOUNTING_POSTING_APPROVAL_STALE',
+        'Regenerate and review the current accounting date before approving this posting',
+        409,
+      )
+    }
+    assertCanonicalDraftReadiness(currentDraft)
     if (input.confirmFingerprint !== batch.request_fingerprint) {
       throw new PosAccountingPostingError('POS_ACCOUNTING_POSTING_APPROVAL_STALE', 'Review the current two-document posting before approving it', 409)
     }
@@ -642,7 +687,7 @@ export async function approvePosAccountingPostingBatchInPostgres(input: {
     const allowed = connection?.write_verified_at
       && policy.enabled
       && policy.mode === connection.write_mode
-      && policy.allowedOperations.includes('sales_receipt.create')
+      && (!batch.sales_receipt_request_id || policy.allowedOperations.includes('sales_receipt.create'))
       && policy.allowedOperations.includes('journal_entry.create')
     if (!allowed) {
       throw new PosAccountingPostingError(
@@ -651,12 +696,13 @@ export async function approvePosAccountingPostingBatchInPostgres(input: {
         409,
       )
     }
+    const requestIds = [batch.sales_receipt_request_id, batch.journal_entry_request_id].filter(Boolean) as string[]
     const children = await client.query<{ id: string; status: string }>(
       `UPDATE quickbooks_write_requests request SET
          status = CASE WHEN request.status IN ('pending_approval', 'failed', 'dead') THEN 'approved' ELSE request.status END,
-         approved_by = CASE WHEN request.status IN ('pending_approval', 'failed', 'dead') THEN lower($4) ELSE request.approved_by END,
+         approved_by = CASE WHEN request.status IN ('pending_approval', 'failed', 'dead') THEN lower($3) ELSE request.approved_by END,
          approved_at = CASE WHEN request.status IN ('pending_approval', 'failed', 'dead') THEN now() ELSE request.approved_at END,
-         approval_note = CASE WHEN request.status IN ('pending_approval', 'failed', 'dead') THEN $5 ELSE request.approval_note END,
+         approval_note = CASE WHEN request.status IN ('pending_approval', 'failed', 'dead') THEN $4 ELSE request.approval_note END,
          attempt_count = CASE WHEN request.status IN ('failed', 'dead') THEN 0 ELSE request.attempt_count END,
          available_at = CASE WHEN request.status IN ('pending_approval', 'failed', 'dead') THEN now() ELSE request.available_at END,
          locked_at = CASE WHEN request.status IN ('pending_approval', 'failed', 'dead') THEN NULL ELSE request.locked_at END,
@@ -666,18 +712,17 @@ export async function approvePosAccountingPostingBatchInPostgres(input: {
          last_error_message = CASE WHEN request.status IN ('failed', 'dead') THEN NULL ELSE request.last_error_message END,
          updated_at = now()
        WHERE request.organization_id = $1::uuid
-         AND request.id IN ($2::uuid, $3::uuid)
+         AND request.id = ANY($2::uuid[])
          AND request.status <> 'cancelled'
        RETURNING request.id::text, request.status`,
       [
         input.organizationId,
-        batch.sales_receipt_request_id,
-        batch.journal_entry_request_id,
+        requestIds,
         input.actorEmail,
         input.approvalNote || null,
       ],
     )
-    if (children.rows.length !== 2) {
+    if (children.rows.length !== requestIds.length) {
       throw new PosAccountingPostingError('POS_ACCOUNTING_POSTING_CHILD_CONFLICT', 'One of the two accounting documents was cancelled or removed', 409)
     }
     const childStatuses = new Set(children.rows.map((row) => row.status))
@@ -712,7 +757,7 @@ export async function approvePosAccountingPostingBatchInPostgres(input: {
         requestFingerprint: batch.request_fingerprint,
         previousStatus: batch.status,
         requestStatus: nextStatus,
-        documentCount: 2,
+        documentCount: requestIds.length,
       },
     }, client)
     const stored = await readBatch(client, input.organizationId, batchId)
@@ -746,22 +791,22 @@ async function cancelPreparedPostingBatchForExternalEvidence(
       409,
     )
   }
+  const requestIds = [batch.sales_receipt_request_id, batch.journal_entry_request_id].filter(Boolean) as string[]
   const children = await client.query<{ id: string }>(
     `UPDATE quickbooks_write_requests request SET
-       status = 'cancelled', cancelled_by = lower($4),
+       status = 'cancelled', cancelled_by = lower($3),
        cancelled_at = COALESCE(request.cancelled_at, now()), updated_at = now()
      WHERE request.organization_id = $1::uuid
-       AND request.id IN ($2::uuid, $3::uuid)
+       AND request.id = ANY($2::uuid[])
        AND request.status IN ('draft', 'pending_approval', 'cancelled')
      RETURNING request.id::text`,
     [
       input.organizationId,
-      batch.sales_receipt_request_id,
-      batch.journal_entry_request_id,
+      requestIds,
       input.actorEmail,
     ],
   )
-  if (children.rows.length !== 2) {
+  if (children.rows.length !== requestIds.length) {
     throw new PosAccountingPostingError(
       'POS_ACCOUNTING_EXTERNAL_POSTING_CONFLICT',
       'One of the prepared ClawPilot documents is no longer safe to cancel',
@@ -781,7 +826,7 @@ async function cancelPreparedPostingBatchForExternalEvidence(
 export async function recordExternalPostingInPostgres(input: {
   organizationId: string
   draftId: string
-  salesReceiptId: string
+  salesReceiptId?: string | null
   journalEntryId: string
   providerName: string
   providerReference?: string | null
@@ -789,7 +834,7 @@ export async function recordExternalPostingInPostgres(input: {
   actorEmail: string
 }) {
   const draftId = requiredUuid(input.draftId, 'Accounting draft')
-  const salesReceiptId = requiredProviderId(input.salesReceiptId, 'QuickBooks Sales Receipt ID')
+  const salesReceiptId = optionalProviderId(input.salesReceiptId, 'QuickBooks Sales Receipt ID')
   const journalEntryId = requiredProviderId(input.journalEntryId, 'QuickBooks Journal Entry ID')
   const providerName = requiredExternalProvider(input.providerName)
   const providerReference = optionalExternalReference(input.providerReference)
@@ -819,6 +864,13 @@ export async function recordExternalPostingInPostgres(input: {
         'POS_ACCOUNTING_POSTING_DRAFT_NOT_FOUND',
         'The current accounting draft was not found',
         404,
+      )
+    }
+    const journalOnlyPaymentException = isJournalOnlyPaymentExceptionDraft(draft)
+    if (!journalOnlyPaymentException && !salesReceiptId) {
+      throw new PosAccountingPostingError(
+        'POS_ACCOUNTING_EXTERNAL_EVIDENCE_ID_INVALID',
+        'QuickBooks Sales Receipt ID is required for a sales-bearing accounting date',
       )
     }
     const alreadyExternal = draft.review_outcome === 'externally_posted'
@@ -869,46 +921,49 @@ export async function recordExternalPostingInPostgres(input: {
          AND transaction.quickbooks_transaction_id = ANY($2::text[])
          AND transaction.entity_type IN ('SalesReceipt', 'JournalEntry')
        FOR SHARE OF transaction`,
-      [input.organizationId, [salesReceiptId, journalEntryId]],
+      [input.organizationId, [salesReceiptId, journalEntryId].filter(Boolean)],
     )
-    const receipt = transactionResult.rows.find((row) =>
+    const receipt = salesReceiptId ? transactionResult.rows.find((row) =>
       row.entity_type === 'SalesReceipt' && row.quickbooks_transaction_id === salesReceiptId)
+      : null
     const journal = transactionResult.rows.find((row) =>
       row.entity_type === 'JournalEntry' && row.quickbooks_transaction_id === journalEntryId)
-    if (!receipt || !journal) {
+    if ((!journalOnlyPaymentException && !receipt) || !journal) {
       throw new PosAccountingPostingError(
         'POS_ACCOUNTING_EXTERNAL_EVIDENCE_NOT_FOUND',
-        'Both exact QuickBooks records must be present in the current QuickBooks cache',
+        journalOnlyPaymentException
+          ? 'The exact QuickBooks Journal Entry must be present in the current QuickBooks cache'
+          : 'Both exact QuickBooks records must be present in the current QuickBooks cache',
         409,
       )
     }
-    if (String(receipt.pos_accounting_business_date) !== draft.business_date
+    if ((receipt && String(receipt.pos_accounting_business_date) !== draft.business_date)
       || String(journal.pos_accounting_business_date) !== draft.business_date) {
       throw new PosAccountingPostingError(
         'POS_ACCOUNTING_EXTERNAL_EVIDENCE_DATE_MISMATCH',
-        'Both QuickBooks records must use the draft business date',
+        'Every QuickBooks record must use the draft business date',
         409,
       )
     }
     const parity = buildPosAccountingParityReport({
       drafts: [draft],
-      transactions: [receipt, journal],
-      fullHistoryTransactions: [receipt, journal],
+      transactions: [receipt, journal].filter(Boolean),
+      fullHistoryTransactions: [receipt, journal].filter(Boolean),
     })
     const rows = parity.rows.filter((row) => row.expected.draft.id === draftId)
     const receiptRow = rows.find((row) => row.expected.entityType === 'SalesReceipt')
     const journalRow = rows.find((row) => row.expected.entityType === 'JournalEntry')
-    const exactMatch = rows.length === 2
-      && receiptRow?.match.status === 'matched'
+    const exactMatch = rows.length === (journalOnlyPaymentException ? 1 : 2)
+      && (journalOnlyPaymentException || receiptRow?.match.status === 'matched')
       && journalRow?.match.status === 'matched'
-      && receiptRow.comparison?.status === 'match'
+      && (journalOnlyPaymentException || receiptRow?.comparison?.status === 'match')
       && journalRow.comparison?.status === 'match'
-      && receiptRow.actual?.providerTransactionId === salesReceiptId
+      && (journalOnlyPaymentException || receiptRow?.actual?.providerTransactionId === salesReceiptId)
       && journalRow.actual?.providerTransactionId === journalEntryId
     if (!exactMatch) {
       throw new PosAccountingPostingError(
         'POS_ACCOUNTING_EXTERNAL_EVIDENCE_MISMATCH',
-        'The selected QuickBooks records do not exactly match both ClawPilot posting documents',
+        'The selected QuickBooks records do not exactly match the ClawPilot posting documents',
         409,
       )
     }
@@ -926,7 +981,7 @@ export async function recordExternalPostingInPostgres(input: {
          reviewed_by = lower($3), reviewed_at = now(), review_note = $6,
          quickbooks_sales_receipt_id = $7,
          quickbooks_journal_entry_id = $8,
-         quickbooks_transaction_id = $7,
+         quickbooks_transaction_id = COALESCE($7, $8),
          approved_by = lower($3), approved_at = now(), posted_at = now(),
          last_error = NULL, updated_at = now()
        WHERE organization_id = $1::uuid AND id = $2::uuid`,
@@ -1013,22 +1068,25 @@ export async function recordMatchedExternalResultsInPostgres(input: {
   const candidates = [...grouped.entries()].flatMap(([draftId, rows]) => {
     const receipt = rows.find((row) => row.expected.entityType === 'SalesReceipt')
     const journal = rows.find((row) => row.expected.entityType === 'JournalEntry')
-    const accepted = rows.length === 2
-      && EXTERNAL_POSTING_RECONCILIATION_STATUSES.has(receipt?.expected.draft.reconciliationStatus || '')
-      && receipt?.match.status === 'matched'
+    const journalOnlyPaymentException = rows.length === 1 && !receipt && Boolean(journal)
+    const accepted = rows.length === (journalOnlyPaymentException ? 1 : 2)
+      && EXTERNAL_POSTING_RECONCILIATION_STATUSES.has(
+        (journal || receipt)?.expected.draft.reconciliationStatus || '',
+      )
+      && (journalOnlyPaymentException || receipt?.match.status === 'matched')
       && journal?.match.status === 'matched'
-      && receipt.comparison?.status === 'match'
+      && (journalOnlyPaymentException || receipt?.comparison?.status === 'match')
       && journal.comparison?.status === 'match'
-      && Boolean(receipt.actual)
+      && (journalOnlyPaymentException || Boolean(receipt?.actual))
       && Boolean(journal.actual)
-      && receipt.actual?.postingOrigin !== 'clawpilot'
+      && (journalOnlyPaymentException || receipt?.actual?.postingOrigin !== 'clawpilot')
       && journal.actual?.postingOrigin !== 'clawpilot'
-      && Boolean(receipt.actual?.providerTransactionId)
+      && (journalOnlyPaymentException || Boolean(receipt?.actual?.providerTransactionId))
       && Boolean(journal.actual?.providerTransactionId)
     return accepted ? [{
       draftId,
-      businessDate: receipt!.expected.businessDate,
-      receiptId: receipt!.actual!.providerTransactionId!,
+      businessDate: (journal || receipt)!.expected.businessDate,
+      receiptId: receipt?.actual?.providerTransactionId || null,
       journalId: journal!.actual!.providerTransactionId!,
     }] : []
   })
@@ -1107,21 +1165,25 @@ export async function synchronizePosAccountingPostingBatchForRequest(
   const batchResult = await client.query<PostingBatchRow>(
     `SELECT ${BATCH_SELECT}
      FROM pos_accounting_posting_batches batch
-     JOIN quickbooks_write_requests receipt ON receipt.id = batch.sales_receipt_request_id
+     LEFT JOIN quickbooks_write_requests receipt ON receipt.id = batch.sales_receipt_request_id
      JOIN quickbooks_write_requests journal ON journal.id = batch.journal_entry_request_id
      WHERE batch.organization_id = $1::uuid
-       AND $2::uuid IN (batch.sales_receipt_request_id, batch.journal_entry_request_id)
-     FOR UPDATE OF batch, receipt, journal`,
+       AND (
+         batch.sales_receipt_request_id = $2::uuid
+         OR batch.journal_entry_request_id = $2::uuid
+       )
+     FOR UPDATE OF batch, journal`,
     [input.organizationId, input.requestId],
   )
   const batch = batchResult.rows[0]
   if (!batch) return null
-  const receiptSucceeded = batch.sales_receipt_status === 'succeeded'
+  const receiptSucceeded = !batch.sales_receipt_request_id || batch.sales_receipt_status === 'succeeded'
   const journalSucceeded = batch.journal_entry_status === 'succeeded'
-  const receiptFailed = ['failed', 'dead'].includes(batch.sales_receipt_status)
+  const receiptFailed = Boolean(batch.sales_receipt_request_id)
+    && ['failed', 'dead'].includes(batch.sales_receipt_status || '')
   const journalFailed = ['failed', 'dead'].includes(batch.journal_entry_status)
   const bothSucceeded = receiptSucceeded && journalSucceeded
-  const anySucceeded = receiptSucceeded || journalSucceeded
+  const anySucceeded = (Boolean(batch.sales_receipt_request_id) && receiptSucceeded) || journalSucceeded
   const anyFailed = receiptFailed || journalFailed
   const nextStatus: PostingBatchStatus = bothSucceeded
     ? 'posted'
@@ -1144,7 +1206,7 @@ export async function synchronizePosAccountingPostingBatchForRequest(
        status = CASE WHEN $3 = 'posted' THEN 'posted' WHEN $3 IN ('failed', 'partial_failed') THEN 'failed' ELSE 'posting' END,
        quickbooks_sales_receipt_id = $4,
        quickbooks_journal_entry_id = $5,
-       quickbooks_transaction_id = CASE WHEN $3 = 'posted' THEN $4 ELSE quickbooks_transaction_id END,
+       quickbooks_transaction_id = CASE WHEN $3 = 'posted' THEN COALESCE($4, $5) ELSE quickbooks_transaction_id END,
        posted_at = CASE WHEN $3 = 'posted' THEN now() ELSE posted_at END,
        last_error = $6, updated_at = now()
      WHERE organization_id = $1::uuid AND id = $2::uuid`,

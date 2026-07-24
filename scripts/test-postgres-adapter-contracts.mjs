@@ -1506,6 +1506,7 @@ for (const migration of [
   '0095_crm_native_activity_projection.sql',
   '0096_crm_contact_identity_aliases.sql',
   '0097_operations_settlement_lifecycle.sql',
+  '0102_pos_payment_exceptions.sql',
 ]) {
   assertIncludes(healthRoute, migration, 'hosted POS and accounting migration health')
 }

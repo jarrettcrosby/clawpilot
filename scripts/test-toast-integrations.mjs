@@ -100,6 +100,11 @@ for (const fragment of [
   "GROUP BY CASE WHEN sync_kind = 'standard_order_updates' THEN 'standard_orders' ELSE sync_kind END",
   "syncKind: 'analytics_sales' | 'analytics_payouts' | 'standard_orders' | 'standard_order_updates'",
   "COALESCE(locked_at, updated_at) < now() - interval '15 minutes'",
+  'postprocess_token IS NULL',
+  'postprocess_token = $4::uuid',
+  'postprocess_token = $3::uuid',
+  'postprocess_token = $2::uuid',
+  'finishToastSyncPostProcessingInPostgres',
   'AND lock_token = $4::uuid',
   'AND lock_token = $3::uuid',
   'rerun_requested_at',
@@ -134,6 +139,51 @@ assert.ok(
   rerunMigration.includes('ADD COLUMN IF NOT EXISTS rerun_requested_at timestamptz'),
   'Toast rerun migration must add the durable follow-up marker',
 )
+
+const paymentExceptionMigration = read('db/migrations/0102_pos_payment_exceptions.sql')
+for (const fragment of [
+  'created_at_source timestamptz',
+  'modified_at_source timestamptz',
+  'promised_at timestamptz',
+  'estimated_fulfillment_at timestamptz',
+  "payment_business_dates date[] NOT NULL DEFAULT '{}'::date[]",
+  'fulfillment_business_date date',
+  'postprocess_token uuid',
+  'postprocess_started_at timestamptz',
+  "'infinity'::timestamptz",
+  `'{"backfill":"pos_payment_exceptions_v1","staged":true}'::jsonb`,
+  "CROSS JOIN generate_series(0, 30) AS recent(day_offset)",
+  "'standard_order_updates'",
+  'LEFT JOIN pg_timezone_names zone',
+  "AT TIME ZONE COALESCE(zone.name, 'UTC')",
+  "credential.access_type = 'standard'",
+  "WHEN job.status = 'processing' THEN now()",
+  "ELSE 'pending'",
+]) {
+  assert.ok(paymentExceptionMigration.includes(fragment), `Payment exception migration missing ${fragment}`)
+}
+assert.ok(
+  !paymentExceptionMigration.includes('ALTER COLUMN fulfillment_business_date SET NOT NULL'),
+  'Payment exception migration must remain compatible with the previously deployed Toast worker',
+)
+assert.ok(
+  !paymentExceptionMigration.includes('USING gin (payment_business_dates)'),
+  'Payment date indexing must wait for a predicate that can use the GIN index',
+)
+
+const paymentDateBackfillActivation = read('scripts/activate-toast-payment-date-backfill.mjs')
+for (const fragment of [
+  "pg_advisory_xact_lock(hashtext('clawpilot-toast-payment-date-backfill-v1'))",
+  `'{"backfill":"pos_payment_exceptions_v1","staged":true}'::jsonb`,
+  "job.request_state, '{}'::jsonb) - 'staged'",
+  'staged.position / 4',
+  "make_interval(secs => ((staged.position / 4)::integer * 60))",
+]) {
+  assert.ok(
+    paymentDateBackfillActivation.includes(fragment),
+    `Toast payment-date backfill activation missing ${fragment}`,
+  )
+}
 
 const notificationMigration = read('db/migrations/0074_pos_accounting_issue_notifications.sql')
 for (const fragment of [
@@ -517,9 +567,19 @@ assert.ok(updateRequest.url.includes('endDate=2026-07-17T00%3A00%3A00.000Z'))
 const worker = read('app_src/lib/toastSyncWorker.ts')
 assert.ok(worker.includes('regeneratePosAccountingDraftInPostgres'), 'Toast worker must regenerate canonical accounting drafts')
 assert.ok(worker.includes('finalizePosAccountingReloadForDateInPostgres'), 'Toast worker must finalize date-scoped accounting reloads')
+const completeJobBody = worker.slice(
+  worker.indexOf('async function completeJob'),
+  worker.indexOf('async function processJob'),
+)
 assert.ok(
-  worker.indexOf('completeToastSyncJobInPostgres') < worker.indexOf('await refreshAccountingState(job, [job.businessDate])'),
+  completeJobBody.indexOf('completeToastSyncJobInPostgres')
+    < completeJobBody.indexOf('await refreshAccountingState(job, accountingBusinessDates)'),
   'Toast jobs must complete before accounting evaluates multi-source reload readiness',
+)
+assert.ok(
+  completeJobBody.indexOf('await refreshAccountingState(job, accountingBusinessDates)')
+    < completeJobBody.indexOf('await finishToastSyncPostProcessingInPostgres({ job })'),
+  'Toast jobs must retain their durable completion lease until accounting refresh succeeds',
 )
 assert.ok(worker.includes('deferToastSyncJobInPostgres'), 'Toast worker must support asynchronous Analytics reports')
 assert.ok(worker.includes("job.syncKind === 'standard_order_updates'"), 'Toast worker must poll modified orders')
@@ -527,7 +587,73 @@ assert.ok(worker.includes('getToastStandardOrders({ credential, restaurantGuid: 
   'modified-order sync must refresh complete affected business days')
 assert.ok(worker.includes('catchUpDates(target.latestStandardUpdateDate, businessDate)'),
   'Toast worker must catch up missed modified-order windows')
+assert.ok(worker.includes('queueAutomaticToastOrderUpdateInPostgres({ ...target, businessDate: currentDate })'),
+  'Toast worker must poll current local-day order modifications')
 assert.ok(!worker.includes('quickbooks'), 'Toast ingestion worker must not post directly to QuickBooks')
+
+const automaticUpdateDates = []
+const workerModule = loadTypeScriptModule('app_src/lib/toastSyncWorker.ts', {
+  mocks: {
+    '@/lib/integrations/toastClient': {},
+    '@/lib/integrations/toastCredentialCrypto': { decryptToastClientSecret: () => 'secret' },
+    '@/lib/persistence/posAccountingNotifications': {
+      processPosAccountingNotificationOutbox: async () => ({ claimed: 0, succeeded: 0, failed: 0, dead: 0 }),
+      reconcilePosAccountingIssueForDateInPostgres: async () => {},
+      reconcileStaleOpenPosAccountingIssuesInPostgres: async () => ({ checked: 0, reconciled: 0, failed: 0 }),
+    },
+    '@/lib/persistence/posAccounting': {
+      finalizePosAccountingReloadForDateInPostgres: async () => ({ pending: false, finalized: false, failed: false }),
+      regeneratePosAccountingDraftInPostgres: async () => {},
+    },
+    '@/lib/persistence/toastIntegrations': {
+      claimToastSyncJobsInPostgres: async () => [],
+      listToastAutomaticSyncTargetsInPostgres: async () => [{
+        organizationId,
+        restaurantGuid,
+        timezone: 'America/New_York',
+        analyticsEnabled: false,
+        standardEnabled: true,
+        latestStandardUpdateDate: null,
+      }],
+      queueAutomaticToastSyncInPostgres: async () => {},
+      queueAutomaticToastOrderUpdateInPostgres: async (input) => automaticUpdateDates.push(input.businessDate),
+    },
+  },
+})
+assert.equal(
+  workerModule.currentBusinessDate('America/New_York', new Date('2026-07-24T02:00:00.000Z')),
+  '2026-07-23',
+  'Toast worker must derive the current business date in the restaurant timezone',
+)
+const historicalWindow = workerModule.modifiedWindow(
+  '2026-07-23',
+  'America/New_York',
+  new Date('2026-07-25T12:00:00.000Z'),
+)
+assert.equal(historicalWindow.startDate, '2026-07-23T04:00:00.000Z')
+assert.equal(historicalWindow.endDate, '2026-07-24T04:00:00.000Z',
+  'Toast modification polling must use local-day UTC boundaries')
+const currentWindow = workerModule.modifiedWindow(
+  '2026-07-23',
+  'America/New_York',
+  new Date('2026-07-24T02:00:00.000Z'),
+)
+assert.equal(currentWindow.startDate, '2026-07-23T04:00:00.000Z')
+assert.equal(currentWindow.endDate, '2026-07-24T02:00:00.000Z',
+  'Toast current-day polling must not send a future endDate')
+const daylightSavingWindow = workerModule.modifiedWindow(
+  '2026-11-01',
+  'America/New_York',
+  new Date('2026-11-03T12:00:00.000Z'),
+)
+assert.equal(daylightSavingWindow.startDate, '2026-11-01T04:00:00.000Z')
+assert.equal(daylightSavingWindow.endDate, '2026-11-02T05:00:00.000Z',
+  'Toast modification polling must preserve the full local day across DST')
+await workerModule.processToastSyncOutbox({ workerId: 'scheduler-contract' })
+assert.ok(
+  automaticUpdateDates.includes(workerModule.currentBusinessDate('America/New_York')),
+  'automatic polling must queue the live local business date',
+)
 
 const health = read('app_src/app/api/health/route.ts')
 assert.ok(health.includes('Toast sync queue has terminal failed jobs.'))
@@ -612,9 +738,58 @@ async function runToastOutboxPostgresAcceptance() {
     )
     await pool.query(
       `INSERT INTO toast_locations (
-         organization_id, restaurant_guid, restaurant_name, active,
+         organization_id, restaurant_guid, restaurant_name, timezone, active,
          analytics_access, standard_access, selected, last_verified_at
-       ) VALUES ($1::uuid, $2::uuid, 'Toast Acceptance Restaurant', true, true, true, true, now())`,
+       ) VALUES (
+         $1::uuid, $2::uuid, 'Toast Acceptance Restaurant', 'America/New_York',
+         true, true, true, true, now()
+       )`,
+      [organizationId, restaurantGuid],
+    )
+
+    await pool.query(
+      `INSERT INTO toast_sync_outbox (
+         organization_id, restaurant_guid, sync_kind, business_date,
+         status, available_at, request_state
+       ) VALUES
+         ($1::uuid, $2::uuid, 'standard_order_updates', '2026-06-01'::date,
+          'pending', 'infinity'::timestamptz,
+          '{"backfill":"pos_payment_exceptions_v1","staged":true}'::jsonb),
+         ($1::uuid, $2::uuid, 'standard_order_updates', '2026-06-02'::date,
+          'pending', 'infinity'::timestamptz,
+          '{"backfill":"pos_payment_exceptions_v1","staged":true}'::jsonb)`,
+      [organizationId, restaurantGuid],
+    )
+    const activationResult = JSON.parse(command(
+      'node',
+      ['scripts/activate-toast-payment-date-backfill.mjs'],
+      { env: { DATABASE_URL: databaseUrl, PGSSLMODE: 'disable' } },
+    ))
+    assert.equal(activationResult.activated, 2)
+    const activatedBackfill = await pool.query(
+      `SELECT business_date::text, available_at < 'infinity'::timestamptz AS available,
+         request_state ? 'staged' AS staged,
+         request_state ? 'activatedAt' AS activated
+       FROM toast_sync_outbox
+       WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid
+         AND business_date = ANY(ARRAY['2026-06-01', '2026-06-02']::date[])
+       ORDER BY business_date`,
+      [organizationId, restaurantGuid],
+    )
+    assert.deepEqual(activatedBackfill.rows, [
+      { business_date: '2026-06-01', available: true, staged: false, activated: true },
+      { business_date: '2026-06-02', available: true, staged: false, activated: true },
+    ])
+    const repeatedActivation = JSON.parse(command(
+      'node',
+      ['scripts/activate-toast-payment-date-backfill.mjs'],
+      { env: { DATABASE_URL: databaseUrl, PGSSLMODE: 'disable' } },
+    ))
+    assert.equal(repeatedActivation.activated, 0, 'backfill activation must be idempotent')
+    await pool.query(
+      `DELETE FROM toast_sync_outbox
+       WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid
+         AND business_date = ANY(ARRAY['2026-06-01', '2026-06-02']::date[])`,
       [organizationId, restaurantGuid],
     )
 
@@ -800,6 +975,87 @@ async function runToastOutboxPostgresAcceptance() {
     assert.equal(firstClaims.length, 3)
     const standardJob = firstClaims.find((job) => job.syncKind === 'standard_orders')
     assert.ok(standardJob)
+    assert.equal(standardJob.timezone, 'America/New_York')
+    const timingProjection = await databasePersistence.projectToastStandardOrdersInPostgres({
+      job: standardJob,
+      orders: [{
+        guid: '55555555-5555-4555-8555-555555555555',
+        createdDate: '2026-07-18T01:30:00.000Z',
+        modifiedDate: '2026-07-18T05:15:00.000Z',
+        promisedDate: '2026-07-20T15:00:00.000Z',
+        checks: [{
+          paymentStatus: 'PAID',
+          amount: 44.54,
+          totalAmount: 44.54,
+          selections: [{ displayName: 'Weekend preorder', quantity: 1, price: 44.54 }],
+          payments: [
+            {
+              type: 'CREDIT',
+              amount: 20,
+              paidDate: '2026-07-18T05:00:00.000Z',
+              paidBusinessDate: 20260717,
+            },
+            {
+              type: 'CREDIT',
+              amount: 24.54,
+              paidDate: '2026-07-18T06:00:00.000Z',
+              paidBusinessDate: '20260717',
+            },
+          ],
+        }],
+      }],
+    })
+    assert.deepEqual(
+      [...timingProjection.accountingBusinessDates],
+      ['2026-07-17', '2026-07-18', '2026-07-20'],
+    )
+    const timingRow = await pool.query(
+      `SELECT created_at_source::text, modified_at_source::text, promised_at::text,
+         payment_business_dates::text, fulfillment_business_date::text, details
+       FROM toast_pos_orders
+       WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid
+         AND order_guid = '55555555-5555-4555-8555-555555555555'`,
+      [organizationId, restaurantGuid],
+    )
+    assert.equal(timingRow.rows[0].payment_business_dates, '{2026-07-17}')
+    assert.equal(timingRow.rows[0].fulfillment_business_date, '2026-07-20')
+    assert.deepEqual(
+      timingRow.rows[0].details.checks[0].payments.map((payment) => payment.paidBusinessDate),
+      ['2026-07-17', '2026-07-17'],
+      'Toast paidBusinessDate must survive the sanitized projection and override local-calendar inference',
+    )
+    assert.match(timingRow.rows[0].created_at_source, /^2026-07-18 01:30:00/)
+    assert.match(timingRow.rows[0].modified_at_source, /^2026-07-18 05:15:00/)
+    assert.match(timingRow.rows[0].promised_at, /^2026-07-20 15:00:00/)
+    const removedTimingProjection = await databasePersistence.projectToastStandardOrdersInPostgres({
+      job: standardJob,
+      orders: [],
+    })
+    assert.deepEqual(
+      [...removedTimingProjection.accountingBusinessDates],
+      ['2026-07-17', '2026-07-18', '2026-07-20'],
+      'removing or moving an order must refresh its prior payment and fulfillment dates',
+    )
+    assert.equal(
+      Number((await pool.query(
+        `SELECT count(*) FROM toast_pos_orders
+         WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid
+           AND order_guid = '55555555-5555-4555-8555-555555555555'`,
+        [organizationId, restaurantGuid],
+      )).rows[0].count),
+      0,
+      'full-date replacement must remove an order no longer returned by Toast',
+    )
+    assert.equal(
+      Number((await pool.query(
+        `SELECT standard_orders_count FROM toast_daily_sales
+         WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid
+           AND business_date = '2026-07-18'`,
+        [organizationId, restaurantGuid],
+      )).rows[0].standard_orders_count),
+      0,
+      'removing the last order must clear its stored Standard daily total',
+    )
     await databasePersistence.queueToastSyncForDateInPostgres({
       organizationId, businessDate: '2026-07-18', actorEmail,
     })
@@ -818,9 +1074,45 @@ async function runToastOutboxPostgresAcceptance() {
     assert.equal(followUp.rows[0].status, 'pending')
     assert.equal(followUp.rows[0].attempt_count, 0)
     assert.equal(followUp.rows[0].rerun_requested_at, null)
+    assert.equal(
+      (await pool.query(
+        'SELECT postprocess_token::text FROM toast_sync_outbox WHERE id = $1::uuid',
+        [standardJob.id],
+      )).rows[0].postprocess_token,
+      standardJob.lockToken,
+      'completion must retain the finishing worker token across accounting post-processing',
+    )
+    assert.equal(
+      await databasePersistence.finishToastSyncPostProcessingInPostgres({ job: standardJob }),
+      true,
+    )
     const followUpClaims = await databasePersistence.claimToastSyncJobsInPostgres({ limit: 1, workerId: 'acceptance-worker-2' })
     assert.equal(followUpClaims[0].id, standardJob.id)
     assert.equal(await databasePersistence.completeToastSyncJobInPostgres({ job: followUpClaims[0], resultSummary: { records: 2 } }), true)
+    const staleFailure = await databasePersistence.failToastSyncJobInPostgres({
+      job: standardJob,
+      error: 'stale worker failure',
+    })
+    assert.equal(staleFailure.accepted, false, 'an older lease must not overwrite a newer completed lease')
+    assert.equal(staleFailure.dead, false)
+    const accountingRefreshFailure = await databasePersistence.failToastSyncJobInPostgres({
+      job: followUpClaims[0],
+      error: 'accounting refresh failed',
+    })
+    assert.equal(
+      accountingRefreshFailure.accepted,
+      true,
+      'the completing lease must be able to make a post-processing failure retryable',
+    )
+    assert.equal(accountingRefreshFailure.dead, false)
+    const postprocessFailure = await pool.query(
+      `SELECT status, last_error, postprocess_token
+       FROM toast_sync_outbox WHERE id = $1::uuid`,
+      [standardJob.id],
+    )
+    assert.equal(postprocessFailure.rows[0].status, 'failed')
+    assert.equal(postprocessFailure.rows[0].last_error, 'accounting refresh failed')
+    assert.equal(postprocessFailure.rows[0].postprocess_token, null)
     await databasePersistence.queueToastSyncForDateInPostgres({
       organizationId, businessDate: '2026-07-18', actorEmail,
     })
@@ -845,6 +1137,7 @@ async function runToastOutboxPostgresAcceptance() {
       null,
     )
     assert.equal(await databasePersistence.completeToastSyncJobInPostgres({ job: updateJob, resultSummary: { records: 0 } }), true)
+    assert.equal(await databasePersistence.finishToastSyncPostProcessingInPostgres({ job: updateJob }), true)
     await databasePersistence.queueAutomaticToastOrderUpdateInPostgres({
       organizationId, restaurantGuid, businessDate: '2026-07-18',
     })
@@ -854,6 +1147,45 @@ async function runToastOutboxPostgresAcceptance() {
       organizationId, restaurantGuid, businessDate: '2026-07-18',
     })
     assert.equal((await pool.query('SELECT status FROM toast_sync_outbox WHERE id = $1::uuid', [updateJob.id])).rows[0].status, 'pending')
+    const orphanSourceClaims = await databasePersistence.claimToastSyncJobsInPostgres({
+      limit: 20,
+      workerId: 'acceptance-worker-orphan-source',
+    })
+    const orphanSourceJob = orphanSourceClaims.find((job) => job.id === updateJob.id)
+    assert.ok(orphanSourceJob)
+    assert.equal(await databasePersistence.completeToastSyncJobInPostgres({
+      job: orphanSourceJob,
+      resultSummary: { records: 0 },
+    }), true)
+    await pool.query(
+      `UPDATE toast_sync_outbox
+       SET postprocess_started_at = now() - interval '20 minutes'
+       WHERE id = $1::uuid`,
+      [updateJob.id],
+    )
+    const recoveredClaims = await databasePersistence.claimToastSyncJobsInPostgres({
+      limit: 20,
+      workerId: 'acceptance-worker-orphan-recovery',
+    })
+    const recoveredJob = recoveredClaims.find((job) => job.id === updateJob.id)
+    assert.ok(recoveredJob, 'an orphaned post-processing lease must return to the retry queue')
+    assert.notEqual(recoveredJob.lockToken, orphanSourceJob.lockToken)
+    const lateStaleFailure = await databasePersistence.failToastSyncJobInPostgres({
+      job: orphanSourceJob,
+      error: 'late stale failure',
+    })
+    assert.equal(
+      lateStaleFailure.accepted,
+      false,
+      'the recovered lease must reject a late failure from the orphaned lease',
+    )
+    assert.equal(lateStaleFailure.dead, false)
+    const cleanupFailure = await databasePersistence.failToastSyncJobInPostgres({
+      job: recoveredJob,
+      error: 'acceptance cleanup',
+    })
+    assert.equal(cleanupFailure.accepted, true)
+    assert.equal(cleanupFailure.dead, false)
     console.log('Toast outbox disposable PostgreSQL rerun acceptance passed')
   } finally {
     if (pool) await pool.end().catch(() => undefined)

@@ -122,6 +122,19 @@ for (const fragment of [
   assert.ok(externalPostingOutcomesMigration.includes(fragment), `External POS accounting outcome migration missing ${fragment}`)
 }
 
+const paymentExceptionMigration = read('db/migrations/0102_pos_payment_exceptions.sql')
+for (const fragment of [
+  'payment_business_dates date[]',
+  'fulfillment_business_date date',
+  "'payment_exception'",
+  'pos_accounting_mapping_target_compatible',
+  'ALTER COLUMN sales_receipt_request_id DROP NOT NULL',
+  'quickbooks_journal_entry_id IS NOT NULL',
+  'jsonb_path_exists',
+]) {
+  assert.ok(paymentExceptionMigration.includes(fragment), `Payment exception migration missing ${fragment}`)
+}
+
 const persistenceSource = read('app_src/lib/persistence/posAccounting.ts')
 for (const fragment of [
   'WHERE organization_id = $1::uuid',
@@ -476,6 +489,10 @@ assert.equal(insertedRevision.params[12], protectedDraft.id)
 const regeneratedSummary = JSON.parse(insertedRevision.params[6])
 assert.equal(regeneratedSummary.canonical.generatedFrom, 'stored_pos_sales')
 assert.equal(regeneratedSummary.canonical.sourceRevision, 9)
+assert.equal(regeneratedSummary.canonical.updateRequired, true)
+assert.equal(regeneratedSummary.canonical.readiness.readyForReview, false)
+assert.ok(regeneratedSummary.canonical.readiness.blockers.some((blocker) => blocker.code === 'update_hold'))
+assert.equal(insertedRevision.params[4], 'needs_mapping')
 assert.equal(regeneratedSummary.standard.total, 24.2)
 
 const companyFingerprint = accounting.posQuickBooksConnectionFingerprint({
@@ -780,6 +797,163 @@ assert.equal(exclusionPreview.salesReceipt.lineItems.length, 1)
 assert.equal(exclusionPreview.salesReceipt.lineItems[0].sourceName, 'Closed item')
 assert.equal(exclusionPreview.readiness.openChecks, 1)
 assert.equal(exclusionPreview.readiness.excludedOpenChecks, 1)
+
+const preorderOrder = structuredClone(july18Order)
+Object.assign(preorderOrder, {
+  order_guid: 'preorder-1',
+  display_number: '1',
+  business_date: '2026-07-25',
+  fulfillment_business_date: '2026-07-25',
+  payment_business_dates: ['2026-07-23'],
+  created_at_source: '2026-07-24T02:10:00.000Z',
+  gross_sales: 41.82,
+  net_sales: 41.82,
+  discounts: 0,
+  tax: 2.72,
+  service_charges: 0,
+  tips: 0,
+  refunds: 0,
+  tendered: 44.54,
+  total: 44.54,
+  cash_tender: 0,
+  card_tender: 44.54,
+  other_tender: 0,
+})
+Object.assign(preorderOrder.details.checks[0], {
+  providerGuid: 'preorder-check-1',
+  displayNumber: '1',
+  amount: 41.82,
+  tax: 2.72,
+  total: 44.54,
+  paidAt: '2026-07-24T02:10:00.000Z',
+  closedAt: '2026-07-24T02:10:00.000Z',
+})
+Object.assign(preorderOrder.details.checks[0].selections[0], {
+  quantity: 1,
+  gross: 41.82,
+  net: 41.82,
+  tax: 2.72,
+})
+Object.assign(preorderOrder.details.checks[0].payments[0], {
+  amount: 44.54,
+  tip: 0,
+  processingFee: 1.95,
+  paidAt: '2026-07-24T05:10:00.000Z',
+  paidBusinessDate: 20260723,
+})
+
+const captureHoldPreview = accounting.buildPosAccountingPreview({
+  businessDate: '2026-07-23',
+  restaurantName: 'Suburbia Sandwich Co',
+  locationTimezone: 'America/New_York',
+  standardOnly: true,
+  profile: { ...profile, batchHoldPolicy: 'do_not_hold' },
+  mappings: [],
+  orders: [preorderOrder],
+})
+assert.equal(captureHoldPreview.salesReceipt.lineItems.length, 0)
+assert.equal(captureHoldPreview.salesReceipt.total, 0)
+assert.equal(captureHoldPreview.paymentExceptions.captureChecks, 1)
+assert.equal(captureHoldPreview.paymentExceptions.captureAmount, 44.54)
+assert.equal(captureHoldPreview.paymentExceptions.releaseAmount, 0)
+assert.equal(captureHoldPreview.journal.kind, 'payment_exception')
+assert.equal(captureHoldPreview.journal.debits, 44.54)
+assert.equal(captureHoldPreview.journal.credits, 44.54)
+assert.equal(
+  captureHoldPreview.journal.lines.find((line) => line.code === 'calculated_net_card_settlement')?.amount,
+  42.59,
+)
+assert.equal(
+  captureHoldPreview.journal.lines.find((line) => line.code === 'processing_fees')?.amount,
+  1.95,
+)
+assert.equal(
+  captureHoldPreview.journal.lines.find((line) => line.code === 'payment_exception_capture')?.amount,
+  44.54,
+)
+assert.ok(captureHoldPreview.readiness.blockers.some((blocker) =>
+  blocker.code === 'payment_exception_mapping_required'
+  && blocker.action === 'Map account'
+  && blocker.affectedChecks === 1))
+
+const mappingFor = (entry, index) => ({
+  ...entry,
+  targetId: `payment-exception-target-${index}`,
+  targetName: `Payment exception target ${index}`,
+  active: true,
+  validationStatus: 'valid',
+})
+const captureMappings = captureHoldPreview.readiness.missingMappings.map(mappingFor)
+const captureReadyPreview = accounting.buildPosAccountingPreview({
+  businessDate: '2026-07-23',
+  restaurantName: 'Suburbia Sandwich Co',
+  locationTimezone: 'America/New_York',
+  standardOnly: true,
+  profile: { ...profile, batchHoldPolicy: 'do_not_hold' },
+  mappings: captureMappings,
+  orders: [preorderOrder],
+})
+assert.equal(captureReadyPreview.readiness.readyForReview, true)
+assert.equal(captureReadyPreview.readiness.blockers.length, 0)
+
+const fulfillmentMappingPreview = accounting.buildPosAccountingPreview({
+  businessDate: '2026-07-25',
+  restaurantName: 'Suburbia Sandwich Co',
+  locationTimezone: 'America/New_York',
+  standardOnly: true,
+  profile: { ...profile, batchHoldPolicy: 'do_not_hold' },
+  mappings: captureMappings,
+  orders: [preorderOrder],
+})
+const mappingByKey = new Map(
+  [...captureMappings, ...fulfillmentMappingPreview.readiness.missingMappings.map(mappingFor)]
+    .map((entry) => [`${entry.sourceKind}:${entry.sourceId}:${entry.targetType}`, entry]),
+)
+const fulfillmentReadyPreview = accounting.buildPosAccountingPreview({
+  businessDate: '2026-07-25',
+  restaurantName: 'Suburbia Sandwich Co',
+  locationTimezone: 'America/New_York',
+  standardOnly: true,
+  profile: { ...profile, batchHoldPolicy: 'do_not_hold' },
+  mappings: [...mappingByKey.values()],
+  orders: [preorderOrder],
+})
+assert.equal(fulfillmentReadyPreview.salesReceipt.total, 44.54)
+assert.equal(fulfillmentReadyPreview.paymentExceptions.captureAmount, 0)
+assert.equal(fulfillmentReadyPreview.paymentExceptions.releaseAmount, 44.54)
+assert.equal(
+  fulfillmentReadyPreview.journal.lines.find((line) => line.code === 'payment_exception_release')?.amount,
+  44.54,
+)
+assert.equal(
+  fulfillmentReadyPreview.journal.lines.find((line) => line.code === 'pos_clearing')?.amount,
+  44.54,
+)
+assert.equal(fulfillmentReadyPreview.journal.balanced, true)
+assert.equal(fulfillmentReadyPreview.readiness.readyForReview, true)
+assert.equal(
+  accounting.reconciliationStatusForDraft(
+    { standard_orders_count: 0 },
+    new Set(),
+    fulfillmentReadyPreview,
+  ),
+  'orders_only',
+  'persisted Standard rows must make a future fulfillment draft source-ready without a duplicate dated outbox job',
+)
+
+const incompleteFeeOrder = structuredClone(preorderOrder)
+incompleteFeeOrder.details.checks[0].payments[0].processingFee = null
+const feeBatchHoldPreview = accounting.buildPosAccountingPreview({
+  businessDate: '2026-07-23',
+  restaurantName: 'Suburbia Sandwich Co',
+  locationTimezone: 'America/New_York',
+  standardOnly: true,
+  profile: { ...profile, batchHoldPolicy: 'hold_until_closed' },
+  mappings: captureMappings,
+  orders: [incompleteFeeOrder],
+})
+assert.ok(feeBatchHoldPreview.readiness.blockers.some((blocker) => blocker.code === 'batch_hold_fee_detail'))
+assert.equal(feeBatchHoldPreview.readiness.readyForReview, false)
 
 const mappingSqlCalls = []
 const mappingAuditEvents = []
@@ -1197,6 +1371,29 @@ const consumedQueryOnlyTarget = accountingDraftNavigation.consumeAccountingDraft
   `https://aiapp.eigenracing.com/?accountingView=actions&accountingRequest=${draftRequestId}`,
 )
 assert.equal(consumedQueryOnlyTarget.cleanUrl, '/#accounting')
+const posPostingReviewUrl = accountingDraftNavigation.buildPosPostingReviewUrl(
+  'https://clawpilot.example/?posView=accounting&location=truck&date=2026-07-23#pos',
+  { draftId: draftRequestId, businessDate: '2026-07-23' },
+)
+assert.equal(posPostingReviewUrl.hash, '#accounting')
+assert.equal(posPostingReviewUrl.searchParams.get('accountingView'), 'pos-parity')
+assert.equal(posPostingReviewUrl.searchParams.get('posPostingDraft'), draftRequestId.toLowerCase())
+assert.equal(posPostingReviewUrl.searchParams.get('posPostingDate'), '2026-07-23')
+assert.equal(posPostingReviewUrl.searchParams.has('posView'), false)
+const consumedPosPostingTarget = accountingDraftNavigation.consumePosPostingReviewTarget(
+  posPostingReviewUrl.toString(),
+)
+assert.equal(consumedPosPostingTarget.draftId, draftRequestId.toLowerCase())
+assert.equal(consumedPosPostingTarget.businessDate, '2026-07-23')
+assert.equal(consumedPosPostingTarget.hasTarget, true)
+assert.equal(consumedPosPostingTarget.cleanUrl, '/?accountingView=pos-parity#accounting')
+assert.throws(
+  () => accountingDraftNavigation.buildPosPostingReviewUrl(
+    'https://clawpilot.example/#pos',
+    { draftId: 'invalid', businessDate: '2026-07-23' },
+  ),
+  /draft id is invalid/,
+)
 
 const homeClient = read('app_src/app/HomeClient.tsx')
 assert.ok(homeClient.includes('accountingSectionFromNavigationUrl(window.location.href)'))

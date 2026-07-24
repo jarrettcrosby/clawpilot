@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import Alert from '@mui/material/Alert'
 import Autocomplete from '@mui/material/Autocomplete'
 import Box from '@mui/material/Box'
@@ -35,12 +35,21 @@ type MoneyFormatter = (amount: number, compact?: boolean) => string
 type NumberFormatter = (value: number, maximumFractionDigits?: number) => string
 type MappingScope = 'organization_default' | 'location_override'
 
+export type PosAccountingFocusAction = {
+  key: string
+  kind: 'mapping' | 'checks' | 'configuration' | 'preview' | 'reload' | 'posting_review'
+  sourceKind?: string
+  sourceId?: string
+  sourceName?: string
+}
+
 type PosAccountingPanelProps = {
   location: string
   businessDate: string
   revision: number
   money: MoneyFormatter
   number: NumberFormatter
+  focusAction?: PosAccountingFocusAction | null
 }
 
 type TargetOption = {
@@ -216,7 +225,7 @@ function ReadinessChip({ ready, readyLabel, waitingLabel }: {
   return <Chip size="small" variant="outlined" color={ready ? 'success' : 'warning'} label={ready ? readyLabel : waitingLabel} />
 }
 
-export default function PosAccountingPanel({ location, businessDate, revision, money, number }: PosAccountingPanelProps) {
+export default function PosAccountingPanel({ location, businessDate, revision, money, number, focusAction }: PosAccountingPanelProps) {
   const [workspace, setWorkspace] = useState<DataRecord | null>(null)
   const [profile, setProfile] = useState<DataRecord>({})
   const [scope, setScope] = useState<MappingScope>('organization_default')
@@ -238,6 +247,11 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
   const [error, setError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
   const [reload, setReload] = useState(0)
+  const dateControlsRef = useRef<HTMLDivElement | null>(null)
+  const configurationRef = useRef<HTMLDivElement | null>(null)
+  const mappingsRef = useRef<HTMLDivElement | null>(null)
+  const previewRef = useRef<HTMLDivElement | null>(null)
+  const mappingRowRefs = useRef<Map<string, HTMLDivElement>>(new Map())
 
   useEffect(() => {
     const controller = new AbortController()
@@ -302,6 +316,9 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
   const commandStatus = text(latestCommand.status)
   const commandActive = ['queued', 'running'].includes(commandStatus)
   const hasAccountingDraft = Boolean(currentDraft.id)
+  const journalOnly = text(journal.kind) === 'payment_exception'
+    && rows(receipt.lineItems).length === 0
+    && amount(receipt.total) === 0
   const protectedRevisionCount = draftHistory.filter((draft) => (
     ['approved', 'posting', 'posted'].includes(text(draft.status))
   )).length
@@ -346,6 +363,30 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
     const term = search.trim().toLowerCase()
     return mappingDrafts.filter((entry) => !term || `${entry.sourceName} ${entry.sourceKind} ${entry.targetName}`.toLowerCase().includes(term))
   }, [mappingDrafts, search])
+
+  useEffect(() => {
+    if (!focusAction || loading || !workspace) return
+    if (focusAction.kind === 'mapping') {
+      setSearch(focusAction.sourceName || focusAction.sourceKind || '')
+    }
+    const timer = window.setTimeout(() => {
+      let target: HTMLDivElement | null = null
+      if (focusAction.kind === 'mapping') {
+        const sourceKey = mappingDraftKey(focusAction.sourceKind || '', focusAction.sourceId || '')
+        target = mappingRowRefs.current.get(sourceKey) || mappingsRef.current
+      } else if (focusAction.kind === 'configuration') {
+        target = configurationRef.current
+      } else if (focusAction.kind === 'checks') {
+        target = previewRef.current
+      } else if (focusAction.kind === 'preview') {
+        target = previewRef.current
+      } else {
+        target = dateControlsRef.current
+      }
+      target?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    }, 60)
+    return () => window.clearTimeout(timer)
+  }, [focusAction, loading, mappingDrafts, workspace])
 
   const mappedCount = mappingDrafts.filter((entry) => entry.active && entry.targetId).length
   const locationGuid = text(locationRecord.restaurantGuid)
@@ -653,7 +694,7 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
         </Alert>
       ) : null}
 
-      <Box sx={{ ...panelSx, p: { xs: 1.5, sm: 2 } }}>
+      <Box ref={dateControlsRef} sx={{ ...panelSx, p: { xs: 1.5, sm: 2 }, scrollMarginTop: 16 }}>
         <Box display="flex" flexDirection={{ xs: 'column', md: 'row' }} justifyContent="space-between" alignItems={{ xs: 'stretch', md: 'center' }} gap={1.5}>
           <Box minWidth={0}>
             <Box display="flex" alignItems="center" gap={0.75} flexWrap="wrap">
@@ -747,7 +788,7 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
         </DialogActions>
       </Dialog>
 
-      <Box sx={{ ...panelSx, p: { xs: 1.5, sm: 2 } }}>
+      <Box ref={configurationRef} sx={{ ...panelSx, p: { xs: 1.5, sm: 2 }, scrollMarginTop: 16 }}>
         <Box display="flex" flexDirection={{ xs: 'column', sm: 'row' }} justifyContent="space-between" alignItems={{ xs: 'stretch', sm: 'flex-start' }} gap={1.5}>
           <Box minWidth={0}>
             <Box display="flex" alignItems="center" gap={0.75} flexWrap="wrap">
@@ -921,7 +962,7 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
         </Box>
       </Box>
 
-      <Box sx={{ ...panelSx, overflow: 'hidden' }}>
+      <Box ref={mappingsRef} sx={{ ...panelSx, overflow: 'hidden', scrollMarginTop: 16 }}>
         <Box px={{ xs: 1.5, sm: 2 }} py={1.5} display="flex" flexDirection={{ xs: 'column', sm: 'row' }} alignItems={{ xs: 'stretch', sm: 'center' }} justifyContent="space-between" gap={1.25}>
           <Box minWidth={0}>
             <Box display="flex" alignItems="center" gap={0.75}>
@@ -966,7 +1007,29 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
               } : null)
             : null
           return (
-            <Box key={`${mapping.sourceKind}:${mapping.sourceId}`} px={{ xs: 1.5, sm: 2 }} py={1.25} borderTop="1px solid rgba(255,255,255,0.065)" display="grid" gridTemplateColumns={{ xs: '1fr', md: 'minmax(180px, 0.8fr) 150px minmax(240px, 1.2fr)' }} gap={1.25} alignItems="center">
+            <Box
+              key={`${mapping.sourceKind}:${mapping.sourceId}`}
+              ref={(node: HTMLDivElement | null) => {
+                if (node) mappingRowRefs.current.set(sourceKey, node)
+                else mappingRowRefs.current.delete(sourceKey)
+              }}
+              px={{ xs: 1.5, sm: 2 }}
+              py={1.25}
+              borderTop="1px solid rgba(255,255,255,0.065)"
+              display="grid"
+              gridTemplateColumns={{ xs: '1fr', md: 'minmax(180px, 0.8fr) 150px minmax(240px, 1.2fr)' }}
+              gap={1.25}
+              alignItems="center"
+              sx={{
+                scrollMarginTop: 16,
+                outline: focusAction?.kind === 'mapping'
+                  && focusAction.sourceKind === mapping.sourceKind
+                  && focusAction.sourceId === mapping.sourceId
+                  ? '2px solid rgba(242,183,109,0.7)'
+                  : 'none',
+                outlineOffset: -2,
+              }}
+            >
               <Box minWidth={0}>
                 <Box display="flex" gap={0.6} alignItems="center" minWidth={0}>
                   <Typography variant="body2" fontWeight={650} noWrap>{mapping.sourceName}</Typography>
@@ -1047,7 +1110,7 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
       </Box>
 
       {hasAccountingDraft ? (
-        <Box display="grid" gridTemplateColumns={{ xs: '1fr', lg: 'minmax(0, 1.35fr) minmax(300px, 0.65fr)' }} gap={2}>
+        <Box ref={previewRef} display="grid" gridTemplateColumns={{ xs: '1fr', lg: 'minmax(0, 1.35fr) minmax(300px, 0.65fr)' }} gap={2} sx={{ scrollMarginTop: 16 }}>
           <Box sx={{ ...panelSx, overflow: 'hidden' }}>
             <Box px={{ xs: 1.5, sm: 2 }} py={1.5} display="flex" justifyContent="space-between" alignItems="center" gap={1.5}>
               <Box>
@@ -1090,7 +1153,7 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
               ))}
               {evidence.protected === true ? <Alert severity="info" sx={{ borderRadius: '8px' }}>Approved or posted evidence is immutable.</Alert> : null}
               <Alert severity="info" sx={{ borderRadius: '8px' }}>
-                This screen prepares and validates accounting evidence. Review the completed draft in Accounting &gt; POS posting parity to record a Shogo result or post the Sales Receipt and Journal Entry with ClawPilot.
+                This screen prepares and validates accounting evidence. Review the completed draft in Accounting &gt; POS posting parity to record a Shogo result or post {journalOnly ? 'the Payment Exceptions Journal Entry' : 'the Sales Receipt and Journal Entry'} with ClawPilot.
               </Alert>
             </Stack>
           </Box>

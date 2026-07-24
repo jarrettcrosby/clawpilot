@@ -359,13 +359,13 @@ async function main() {
         }
         await client.query(
           `INSERT INTO toast_pos_orders (
-             organization_id, restaurant_guid, order_guid, business_date, display_number,
+             organization_id, restaurant_guid, order_guid, business_date, fulfillment_business_date, display_number,
              source, dining_option, approval_status, payment_status, opened_at, closed_at, paid_at,
              guest_count, check_count, item_count, gross_sales, net_sales, discounts, tax,
              service_charges, tips, refunds, tendered, total, cash_tender, card_tender,
              other_tender, voided, deleted, details, payload_hash, created_at, updated_at
            ) VALUES (
-             $1::uuid, $2::uuid, $3, $4::date, $5, 'Demo counter', 'TAKE_OUT', 'APPROVED',
+             $1::uuid, $2::uuid, $3, $4::date, $4::date, $5, 'Demo counter', 'TAKE_OUT', 'APPROVED',
              'PAID', $6::timestamptz, $6::timestamptz, $6::timestamptz,
              1, 1, 1, $7, $8, $9, $10, 0, $11, 0, $12, $13, $14, $15,
              0, false, false, $16::jsonb, $17, $6::timestamptz, $6::timestamptz
