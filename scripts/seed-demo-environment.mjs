@@ -60,6 +60,30 @@ async function main() {
   try {
     await client.query(`SELECT pg_advisory_lock(hashtext('clawpilot-demo-account-seed'))`)
     await client.query('BEGIN')
+    const immutableDemoCrmEvidence = await client.query(
+      `SELECT (
+         EXISTS (
+           SELECT 1
+           FROM crm_contact_source_aliases
+           WHERE pipeline_id = $1::uuid
+         )
+         OR EXISTS (
+           SELECT 1
+           FROM crm_contact_merges
+           WHERE pipeline_id = $1::uuid
+         )
+       ) AS present`,
+      [PIPELINE_ID],
+    )
+    if (immutableDemoCrmEvidence.rows[0]?.present === true) {
+      await client.query('COMMIT')
+      console.log(JSON.stringify({
+        ok: true,
+        environment: environment || 'local',
+        mode: 'preserved_immutable_crm_evidence',
+      }))
+      return
+    }
     await client.query(
       `DELETE FROM app_documents WHERE workspace_organization_id = $1::uuid`,
       [ROOT_ORGANIZATION_ID],
