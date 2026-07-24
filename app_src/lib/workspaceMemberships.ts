@@ -16,7 +16,6 @@ import {
 } from '@/lib/users'
 import {
   DEMO_BOARD_ID,
-  DEMO_PIPELINE_ID,
   DEMO_SYSTEM_EMAIL,
   DEMO_WORKSPACE_ID,
 } from '@/lib/demoMode'
@@ -106,6 +105,20 @@ export async function ensureDemoWorkspaceMembership(actor: AppUser): Promise<Wor
       [DEMO_WORKSPACE_ID],
     )
     if (!demo.rows[0]) throw new Error('Demo account is not available')
+    const activePipeline = await client.query<{ id: string }>(
+      `SELECT id::text
+       FROM pipeline_spaces
+       WHERE workspace_organization_id = $1::uuid
+         AND is_default = true
+         AND sync_enabled = false
+         AND reference_access_disabled = false
+       ORDER BY updated_at DESC, created_at DESC, id
+       LIMIT 1
+       FOR SHARE`,
+      [DEMO_WORKSPACE_ID],
+    )
+    const activePipelineId = activePipeline.rows[0]?.id
+    if (!activePipelineId) throw new Error('Demo pipeline is not available')
     await client.query(
       `INSERT INTO app_user_organization_memberships (
          user_email, organization_id, role, permissions, status, is_default,
@@ -126,12 +139,21 @@ export async function ensureDemoWorkspaceMembership(actor: AppUser): Promise<Wor
       [DEMO_BOARD_ID, actor.email, DEMO_SYSTEM_EMAIL],
     )
     await client.query(
+      `DELETE FROM pipeline_space_members membership
+       USING pipeline_spaces pipeline
+       WHERE membership.pipeline_id = pipeline.id
+         AND membership.user_email = $1
+         AND pipeline.workspace_organization_id = $2::uuid
+         AND pipeline.id <> $3::uuid`,
+      [actor.email, DEMO_WORKSPACE_ID, activePipelineId],
+    )
+    await client.query(
       `INSERT INTO pipeline_space_members (
          pipeline_id, user_email, access_role, shared_by, created_at, updated_at
        ) VALUES ($1::uuid, $2, 'viewer', $3, now(), now())
        ON CONFLICT (pipeline_id, user_email) DO UPDATE SET
          access_role = 'viewer', shared_by = EXCLUDED.shared_by, updated_at = now()`,
-      [DEMO_PIPELINE_ID, actor.email, DEMO_SYSTEM_EMAIL],
+      [activePipelineId, actor.email, DEMO_SYSTEM_EMAIL],
     )
     await client.query(
       `INSERT INTO app_user_workspace_preferences (
@@ -142,7 +164,7 @@ export async function ensureDemoWorkspaceMembership(actor: AppUser): Promise<Wor
          default_board_id = EXCLUDED.default_board_id,
          default_pipeline_id = EXCLUDED.default_pipeline_id,
          updated_at = now()`,
-      [actor.email, DEMO_WORKSPACE_ID, DEMO_BOARD_ID, DEMO_PIPELINE_ID],
+      [actor.email, DEMO_WORKSPACE_ID, DEMO_BOARD_ID, activePipelineId],
     )
     const result = await client.query<WorkspaceMembershipRow>(
       `${MEMBERSHIP_SELECT}

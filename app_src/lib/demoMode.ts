@@ -1,6 +1,5 @@
 export const DEMO_SYSTEM_EMAIL = 'demo-system@clawpilot.example'
 export const DEMO_WORKSPACE_ID = '10000000-0000-4000-8000-000000000001'
-export const DEMO_PIPELINE_ID = '20000000-0000-4000-8000-000000000001'
 export const DEMO_BOARD_ID = '30000000-0000-4000-8000-000000000001'
 
 export function isDemoWorkspaceId(value: unknown): boolean {
