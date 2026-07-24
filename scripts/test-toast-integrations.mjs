@@ -87,6 +87,15 @@ for (const fragment of [
 }
 assert.ok(!migration.includes('client_secret text'), 'Toast migration must not store a plaintext client secret')
 
+const closeoutHourMigration = read('db/migrations/0106_toast_location_closeout_hour.sql')
+for (const fragment of [
+  'ADD COLUMN IF NOT EXISTS closeout_hour smallint',
+  'toast_locations_closeout_hour_valid',
+  'closeout_hour BETWEEN 0 AND 12',
+]) {
+  assert.ok(closeoutHourMigration.includes(fragment), `Toast closeout-hour migration missing ${fragment}`)
+}
+
 const persistence = read('app_src/lib/persistence/toastIntegrations.ts')
 for (const fragment of [
   'WHERE organization_id = $1',
@@ -99,6 +108,7 @@ for (const fragment of [
   "result_summary ->> 'records'",
   "GROUP BY CASE WHEN sync_kind = 'standard_order_updates' THEN 'standard_orders' ELSE sync_kind END",
   "syncKind: 'analytics_sales' | 'analytics_payouts' | 'standard_orders' | 'standard_order_updates'",
+  'location.timezone, location.closeout_hour',
   "COALESCE(locked_at, updated_at) < now() - interval '15 minutes'",
   'postprocess_token IS NULL',
   'postprocess_token = $4::uuid',
@@ -112,6 +122,8 @@ for (const fragment of [
   "CASE WHEN rerun_requested_at IS NULL THEN 'succeeded' ELSE 'pending' END",
   "syncKind: 'analytics_sales'",
   "syncKind: 'standard_orders'",
+  'closeout_hour = CASE',
+  "WHEN $11 = 'standard' THEN EXCLUDED.closeout_hour",
 ]) {
   assert.ok(persistence.includes(fragment), `Toast persistence contract missing ${fragment}`)
 }
@@ -271,6 +283,7 @@ const tenantPersistence = loadTypeScriptModule('app_src/lib/persistence/toastInt
               location_name: null,
               location_code: null,
               timezone: 'America/New_York',
+              closeout_hour: 6,
               active: true,
               test_mode: false,
               archived: false,
@@ -334,6 +347,37 @@ await tenantPersistence.readToastIntegrationStateFromPostgres(otherOrganizationI
 assert.ok(tenantQueries.slice(0, firstTenantQueryCount).every((entry) => entry.params[0] === organizationId))
 assert.ok(tenantQueries.slice(firstTenantQueryCount).every((entry) => entry.params[0] === otherOrganizationId))
 assert.equal(tenantState.organizationId, organizationId)
+assert.equal(tenantState.locations[0].closeoutHour, 6)
+
+const closeoutUpsertQueries = []
+const closeoutUpsertPersistence = loadTypeScriptModule('app_src/lib/persistence/toastIntegrations.ts', {
+  mocks: {
+    ...toastPersistenceMocks,
+    '@/lib/integrations/toastOrderProjection': toastOrderProjection,
+    '@/lib/persistence/postgres': {
+      query: async () => ({ rows: [], rowCount: 0 }),
+      withTransaction: async (work) => work({
+        query: async (sql, params = []) => {
+          closeoutUpsertQueries.push({ source: String(sql), params: [...params] })
+          return { rows: [], rowCount: 1 }
+        },
+      }),
+    },
+  },
+})
+await closeoutUpsertPersistence.upsertToastStandardLocationInPostgres({
+  organizationId,
+  location: {
+    restaurantGuid,
+    restaurantName: 'Test Restaurant',
+    timezone: 'America/New_York',
+    closeoutHour: 6,
+  },
+  actorEmail: 'manager@example.test',
+})
+const closeoutUpsert = closeoutUpsertQueries.find((entry) => entry.source.includes('INSERT INTO toast_locations'))
+assert.equal(closeoutUpsert.params[6], 6)
+assert.equal(closeoutUpsert.params[10], 'standard')
 
 const queueQueries = []
 const queuePersistence = loadTypeScriptModule('app_src/lib/persistence/toastIntegrations.ts', {
@@ -482,7 +526,9 @@ const toastFetch = async (url, init = {}) => {
     return new Response(JSON.stringify([{ restaurantGuid, restaurantName: 'Test Restaurant', active: true }]), { status: 200 })
   }
   if (String(url).includes(`/restaurants/v1/restaurants/${restaurantGuid}`)) {
-    return new Response(JSON.stringify({ general: { name: 'Test Restaurant', timeZone: 'America/New_York' } }), { status: 200 })
+    return new Response(JSON.stringify({
+      general: { name: 'Test Restaurant', timeZone: 'America/New_York', closeoutHour: 6 },
+    }), { status: 200 })
   }
   if (String(url).endsWith('/era/v1/metrics') && init.method === 'POST') {
     return new Response(JSON.stringify(reportGuid), { status: 200 })
@@ -531,6 +577,7 @@ assert.equal(requests[1].init.headers.get('Authorization'), 'Bearer access-token
 
 const standardRestaurant = await clientModule.getToastStandardRestaurant(standardCredential, restaurantGuid)
 assert.equal(standardRestaurant.timezone, 'America/New_York')
+assert.equal(standardRestaurant.closeoutHour, 6)
 const standardRequest = requests.find((entry) => entry.url.includes('/restaurants/v1/restaurants/'))
 assert.equal(standardRequest.init.headers.get('Toast-Restaurant-External-ID'), restaurantGuid)
 
@@ -738,10 +785,10 @@ async function runToastOutboxPostgresAcceptance() {
     )
     await pool.query(
       `INSERT INTO toast_locations (
-         organization_id, restaurant_guid, restaurant_name, timezone, active,
+         organization_id, restaurant_guid, restaurant_name, timezone, closeout_hour, active,
          analytics_access, standard_access, selected, last_verified_at
        ) VALUES (
-         $1::uuid, $2::uuid, 'Toast Acceptance Restaurant', 'America/New_York',
+         $1::uuid, $2::uuid, 'Toast Acceptance Restaurant', 'America/New_York', 4,
          true, true, true, true, now()
        )`,
       [organizationId, restaurantGuid],
@@ -976,6 +1023,7 @@ async function runToastOutboxPostgresAcceptance() {
     const standardJob = firstClaims.find((job) => job.syncKind === 'standard_orders')
     assert.ok(standardJob)
     assert.equal(standardJob.timezone, 'America/New_York')
+    assert.equal(standardJob.closeoutHour, 4)
     const timingProjection = await databasePersistence.projectToastStandardOrdersInPostgres({
       job: standardJob,
       orders: [{
@@ -1001,7 +1049,45 @@ async function runToastOutboxPostgresAcceptance() {
               paidDate: '2026-07-18T06:00:00.000Z',
               paidBusinessDate: '20260717',
             },
+            {
+              type: 'CASH',
+              amount: 44.54,
+              paidDate: '2026-07-17T05:00:00.000Z',
+              paidBusinessDate: '20260716',
+              voided: true,
+            },
+            {
+              type: 'CREDIT',
+              amount: 44.54,
+              paidDate: '2026-07-17T06:00:00.000Z',
+              paidBusinessDate: '20260716',
+              paymentStatus: 'VOIDED',
+            },
+            {
+              type: 'CREDIT',
+              amount: 44.54,
+              paidDate: '2026-07-16T06:00:00.000Z',
+              paidBusinessDate: '20260715',
+              paymentStatus: 'CANCELLED',
+            },
           ],
+        }],
+      }, {
+        guid: '55555555-5555-4555-8555-555555555556',
+        createdDate: '2026-07-18T05:50:00.000Z',
+        modifiedDate: '2026-07-18T06:05:00.000Z',
+        promisedDate: '2026-07-20T15:00:00.000Z',
+        checks: [{
+          paymentStatus: 'PAID',
+          amount: 10,
+          totalAmount: 10,
+          selections: [{ displayName: 'Pre-closeout preorder', quantity: 1, price: 10 }],
+          payments: [{
+            type: 'CREDIT',
+            paymentStatus: 'CAPTURED',
+            amount: 10,
+            paidDate: '2026-07-18T06:00:00.000Z',
+          }],
         }],
       }],
     })
@@ -1019,10 +1105,27 @@ async function runToastOutboxPostgresAcceptance() {
     )
     assert.equal(timingRow.rows[0].payment_business_dates, '{2026-07-17}')
     assert.equal(timingRow.rows[0].fulfillment_business_date, '2026-07-20')
+    const inferredTimingRow = await pool.query(
+      `SELECT payment_business_dates::text
+       FROM toast_pos_orders
+       WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid
+         AND order_guid = '55555555-5555-4555-8555-555555555556'`,
+      [organizationId, restaurantGuid],
+    )
+    assert.equal(
+      inferredTimingRow.rows[0].payment_business_dates,
+      '{2026-07-17}',
+      'a paidAt before the configured Toast cutoff must remain on the preceding business date',
+    )
     assert.deepEqual(
       timingRow.rows[0].details.checks[0].payments.map((payment) => payment.paidBusinessDate),
-      ['2026-07-17', '2026-07-17'],
+      ['2026-07-17', '2026-07-17', '2026-07-16', '2026-07-16', '2026-07-15'],
       'Toast paidBusinessDate must survive the sanitized projection and override local-calendar inference',
+    )
+    assert.deepEqual(
+      timingRow.rows[0].details.checks[0].payments.map((payment) => payment.voided),
+      [false, false, true, true, true],
+      'voided and cancelled payment evidence must remain identifiable without adding obsolete accounting dates',
     )
     assert.match(timingRow.rows[0].created_at_source, /^2026-07-18 01:30:00/)
     assert.match(timingRow.rows[0].modified_at_source, /^2026-07-18 05:15:00/)

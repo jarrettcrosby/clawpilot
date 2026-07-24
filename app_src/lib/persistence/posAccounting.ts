@@ -1,7 +1,12 @@
 import crypto from 'crypto'
 import type { PoolClient } from 'pg'
 import { recordAuditEvent } from '@/lib/auditWriter'
-import { summarizeToastProjectedChecks, type ToastProjectedCheck } from '@/lib/integrations/toastOrderProjection'
+import {
+  isToastProjectedOrderAccountingActive,
+  isToastProjectedPaymentActive,
+  summarizeToastProjectedChecks,
+  type ToastProjectedCheck,
+} from '@/lib/integrations/toastOrderProjection'
 import { acquireTransactionAdvisoryLock, query, withTransaction } from '@/lib/persistence/postgres'
 
 export const POS_POSTING_METHODS = [
@@ -51,6 +56,7 @@ export const POS_TARGET_TYPES = [
 export const POS_OPEN_CHECK_POLICIES = ['hold', 'exclude', 'include'] as const
 export const POS_BATCH_HOLD_POLICIES = ['hold_until_closed', 'hold_until_settled', 'do_not_hold'] as const
 export const POS_ACCOUNTING_SCOPES = ['organization_default', 'location_override'] as const
+export const POS_ACCOUNTING_POSTING_GATE_VERSION = 2
 
 export type PosPostingMethod = typeof POS_POSTING_METHODS[number]
 export type PosBreakoutDimension = typeof POS_BREAKOUT_DIMENSIONS[number]
@@ -201,6 +207,8 @@ type MappingRow = {
 type SourceOrderRow = {
   order_guid?: string | null
   display_number?: string | null
+  voided?: boolean
+  deleted?: boolean
   business_date: TimestampValue
   fulfillment_business_date?: TimestampValue | null
   payment_business_dates?: TimestampValue[] | null
@@ -228,6 +236,7 @@ type LocationRow = {
   restaurant_name: string
   location_name: string | null
   timezone: string | null
+  closeout_hour: number | null
   analytics_access: boolean
   standard_access: boolean
 }
@@ -364,7 +373,20 @@ function dateList(value: TimestampValue[] | null | undefined) {
   return Array.isArray(value) ? value.map(dateOnly).filter(Boolean) : []
 }
 
-function instantBusinessDate(value: unknown, timezone: string) {
+const LEGACY_SAFE_TOAST_CLOSEOUT_HOUR = 12
+
+function validIanaTimezone(value: unknown): value is string {
+  const candidate = String(value || '').trim()
+  if (!candidate) return false
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: candidate }).format(new Date(0))
+    return true
+  } catch {
+    return false
+  }
+}
+
+function activeToastBusinessDate(value: unknown, timezone: string, closeoutHour: number) {
   const parsed = new Date(String(value || ''))
   if (Number.isNaN(parsed.getTime())) return null
   try {
@@ -373,14 +395,32 @@ function instantBusinessDate(value: unknown, timezone: string) {
       year: 'numeric',
       month: '2-digit',
       day: '2-digit',
+      hour: '2-digit',
+      hourCycle: 'h23',
     }).formatToParts(parsed)
     const values = Object.fromEntries(parts.map((part) => [part.type, part.value]))
-    return values.year && values.month && values.day
-      ? `${values.year}-${values.month}-${values.day}`
-      : null
+    if (!values.year || !values.month || !values.day || values.hour === undefined) return null
+    const localDate = `${values.year}-${values.month}-${values.day}`
+    if (Number(values.hour) >= closeoutHour) return localDate
+    const previous = new Date(`${localDate}T00:00:00.000Z`)
+    previous.setUTCDate(previous.getUTCDate() - 1)
+    return previous.toISOString().slice(0, 10)
   } catch {
-    return parsed.toISOString().slice(0, 10)
+    return null
   }
+}
+
+function inferredToastPaymentBusinessDate(value: unknown, timezone: string, closeoutHour: number | null | undefined) {
+  if (Number.isInteger(closeoutHour) && Number(closeoutHour) >= 0 && Number(closeoutHour) <= 12) {
+    return activeToastBusinessDate(value, timezone, Number(closeoutHour))
+  }
+  // Without an exact profile, accept an instant only when every valid Toast
+  // cutoff (00:00 through 12:00) assigns it to the same business date.
+  const earliestCutoffDate = activeToastBusinessDate(value, timezone, 0)
+  const latestCutoffDate = activeToastBusinessDate(value, timezone, 12)
+  return earliestCutoffDate && earliestCutoffDate === latestCutoffDate
+    ? earliestCutoffDate
+    : null
 }
 
 function enumValue<T extends string>(value: unknown, allowed: readonly T[], code: string, label: string): T {
@@ -724,6 +764,13 @@ function isOpenCheck(value: unknown) {
   return !check.paidAt && !check.closedAt && !/(paid|closed|complete)/.test(status)
 }
 
+function isFinalizedCheck(value: unknown) {
+  const check = record(value)
+  const closedAt = new Date(String(check.closedAt || ''))
+  return String(check.paymentStatus || '').trim().toLowerCase() === 'closed'
+    && !Number.isNaN(closedAt.getTime())
+}
+
 function orderWithChecks(order: SourceOrderRow, checks: JsonRecord[]): SourceOrderRow {
   const summary = summarizeToastProjectedChecks(checks as unknown as ToastProjectedCheck[])
   return {
@@ -751,6 +798,7 @@ function applyOpenCheckPolicy(orders: SourceOrderRow[], policy: PosOpenCheckPoli
   for (const order of orders) {
     const checks = list(record(order.details).checks).map(record)
     const activeChecks = checks.filter((check) => check.voided !== true && check.deleted !== true)
+    if (checks.length > 0 && activeChecks.length === 0) continue
     const orderOpenChecks = activeChecks.filter(isOpenCheck)
     openChecks += orderOpenChecks.length
     if (policy !== 'exclude' || orderOpenChecks.length === 0) {
@@ -896,6 +944,7 @@ export function discoverSafePosSourceCatalog(orders: SourceOrderRow[]): PosAccou
   }
 
   for (const order of orders) {
+    if (order.voided === true || order.deleted === true) continue
     const businessDate = dateOnly(order.business_date)
     const fulfillmentDate = dateOnly(order.fulfillment_business_date || order.business_date)
     const offDatePayments = dateList(order.payment_business_dates)
@@ -917,8 +966,10 @@ export function discoverSafePosSourceCatalog(orders: SourceOrderRow[]): PosAccou
     const details = record(order.details)
     for (const checkValue of list(details.checks)) {
       const check = record(checkValue)
+      if (check.voided === true || check.deleted === true) continue
       for (const selectionValue of list(check.selections)) {
         const selection = record(selectionValue)
+        if (selection.voided === true || selection.deleted === true) continue
         const itemName = safeSourceName(selection.itemName ?? selection.name, 'POS item')
         add('sales_item', selection.itemGuid ?? selection.providerGuid, itemName, selection.net, selection.quantity, businessDate)
         const groupName = safeSourceName(selection.groupName, '')
@@ -951,6 +1002,7 @@ export function discoverSafePosSourceCatalog(orders: SourceOrderRow[]): PosAccou
       }
       for (const paymentValue of list(check.payments)) {
         const payment = record(paymentValue)
+        if (!isToastProjectedPaymentActive(payment)) continue
         const paymentType = safeSourceName(payment.type, 'Other tender')
         add('tender', null, paymentType, payment.amount, 1, businessDate)
         add('payment_type', null, paymentType, payment.amount, 1, businessDate)
@@ -1074,6 +1126,8 @@ export function buildPosAccountingPreview(input: {
   businessDate: string
   restaurantName: string
   locationTimezone?: string | null
+  locationCloseoutHour?: number | null
+  asOf?: TimestampValue
   standardOnly: boolean
   profile: PosAccountingProfile
   mappings: PosAccountingMapping[]
@@ -1089,7 +1143,8 @@ export function buildPosAccountingPreview(input: {
     updatedAt: string | null
   } | null
 }) {
-  const batch = applyOpenCheckPolicy(input.orders, input.profile.openCheckPolicy)
+  const activeInputOrders = input.orders.filter(isToastProjectedOrderAccountingActive)
+  const batch = applyOpenCheckPolicy(activeInputOrders, input.profile.openCheckPolicy)
   const orders = batch.orders
   const fulfillmentOrders = orders.filter((order) =>
     dateOnly(order.fulfillment_business_date || order.business_date) === input.businessDate)
@@ -1132,8 +1187,11 @@ export function buildPosAccountingPreview(input: {
   }>()
   for (const order of fulfillmentOrders) {
     for (const checkValue of list(record(order.details).checks)) {
-      for (const selectionValue of list(record(checkValue).selections)) {
+      const check = record(checkValue)
+      if (check.voided === true || check.deleted === true) continue
+      for (const selectionValue of list(check.selections)) {
         const selection = record(selectionValue)
+        if (selection.voided === true || selection.deleted === true) continue
         const sourceName = safeSourceName(selection.itemName ?? selection.name, 'POS item')
         const sourceId = sourceIdentity('sales_item', selection.itemGuid ?? selection.providerGuid, sourceName)
         const categoryName = safeSourceName(selection.groupName, '') || null
@@ -1206,6 +1264,8 @@ export function buildPosAccountingPreview(input: {
     checkKey: string
     paymentKey: string
     type: string
+    status: string | null
+    paidEvidence: boolean
     cardBrand: string | null
     amount: number
     tip: number
@@ -1215,23 +1275,61 @@ export function buildPosAccountingPreview(input: {
   }
   const paymentFacts: PaymentFact[] = []
   const paymentDateUnknownCheckKeys = new Set<string>()
-  const timezone = input.locationTimezone || 'UTC'
+  const locationTimezoneValid = validIanaTimezone(input.locationTimezone)
+  const timezone = locationTimezoneValid ? String(input.locationTimezone) : 'UTC'
+  const configuredCloseoutHour = input.locationCloseoutHour
+  // A legacy row may represent any valid Toast cutoff. Noon is the conservative
+  // upper bound, so a missing profile can never permit posting before its real
+  // configured closeout hour. Standard location verification stores the exact value.
+  const closeoutHour = Number.isInteger(configuredCloseoutHour)
+    && Number(configuredCloseoutHour) >= 0
+    && Number(configuredCloseoutHour) <= 12
+    ? Number(configuredCloseoutHour)
+    : LEGACY_SAFE_TOAST_CLOSEOUT_HOUR
+  const closeoutHourSource = closeoutHour === configuredCloseoutHour ? 'restaurant' : 'legacy_safe_fallback'
+  const asOfInstant = new Date(input.asOf ?? new Date())
+  const asOfBusinessDate = locationTimezoneValid
+    ? activeToastBusinessDate(asOfInstant, timezone, closeoutHour)
+    : null
+  const unfinalizedFulfillmentCheckKeys = new Set<string>()
+  for (const [orderIndex, order] of activeInputOrders.entries()) {
+    if (dateOnly(order.fulfillment_business_date || order.business_date) !== input.businessDate) continue
+    const orderIdentity = String(order.order_guid || order.display_number || `order:${orderIndex}`)
+    const checkEvidence = record(order.details).checks
+    const checks = list(checkEvidence).map(record)
+    const activeChecks = checks
+      .filter((check) => check.voided !== true && check.deleted !== true)
+    if (checks.length > 0 && activeChecks.length === 0) continue
+    if (activeChecks.length === 0) {
+      unfinalizedFulfillmentCheckKeys.add(paymentLifecycleEvidenceKey('check', `${orderIdentity}:unavailable`))
+      continue
+    }
+    for (const [checkIndex, check] of activeChecks.entries()) {
+      if (isFinalizedCheck(check)) continue
+      const checkIdentity = String(check.providerGuid || check.displayNumber || `${orderIdentity}:${checkIndex}`)
+      unfinalizedFulfillmentCheckKeys.add(paymentLifecycleEvidenceKey('check', checkIdentity))
+    }
+  }
   for (const order of orders) {
     const fulfillmentDate = dateOnly(order.fulfillment_business_date || order.business_date)
     const orderIdentity = String(order.order_guid || order.display_number || 'order')
     const orderKey = paymentLifecycleEvidenceKey('order', orderIdentity)
-    const projectedPaymentDates = dateList(order.payment_business_dates)
-    const legacyTiming = order.payment_business_dates === undefined
-      || (projectedPaymentDates.length === 0 && !order.created_at_source)
     for (const [checkIndex, checkValue] of list(record(order.details).checks).entries()) {
       const check = record(checkValue)
+      if (check.voided === true || check.deleted === true) continue
       for (const [paymentIndex, paymentValue] of list(check.payments).entries()) {
         const payment = record(paymentValue)
-        const explicitPaymentDate = normalizedBusinessDate(payment.paidBusinessDate)
-          || instantBusinessDate(payment.paidAt ?? check.paidAt, timezone)
+        if (!isToastProjectedPaymentActive(payment)) continue
+        const authoritativePaymentDate = normalizedBusinessDate(payment.paidBusinessDate)
+        const inferredPaymentDate = authoritativePaymentDate
+          ? null
+          : inferredToastPaymentBusinessDate(
+            payment.paidAt ?? check.paidAt,
+            timezone,
+            configuredCloseoutHour,
+          )
+        const explicitPaymentDate = authoritativePaymentDate || inferredPaymentDate
         const paymentDate = explicitPaymentDate
-          || (projectedPaymentDates.length === 1 ? projectedPaymentDates[0] : null)
-          || (legacyTiming ? fulfillmentDate : null)
         const checkIdentity = String(check.providerGuid || check.displayNumber || `${orderIdentity}:${checkIndex}`)
         const checkKey = paymentLifecycleEvidenceKey('check', checkIdentity)
         if (!paymentDate) {
@@ -1246,6 +1344,12 @@ export function buildPosAccountingPreview(input: {
             safeSourceName(payment.providerGuid, '') || `${checkIdentity}:${paymentIndex}`,
           ),
           type: safeSourceName(payment.type, 'OTHER'),
+          status: safeSourceName(payment.status, '') || null,
+          paidEvidence: Boolean(
+            payment.paidAt
+            || check.paidAt
+            || /^(paid|closed)$/i.test(String(check.paymentStatus || '').trim()),
+          ),
           cardBrand: safeSourceName(payment.cardBrand, '') || null,
           amount: money(payment.amount),
           tip: money(payment.tip),
@@ -1265,6 +1369,16 @@ export function buildPosAccountingPreview(input: {
   const releasePayments = paymentFacts.filter((payment) =>
     payment.fulfillmentDate === input.businessDate && payment.paymentDate !== input.businessDate)
   const settlementPayments = [...sameDayPayments, ...capturePayments]
+  const unfinalizedPayments = settlementPayments.filter((payment) => {
+    const cardPayment = /credit|debit|card/i.test(payment.type) || Boolean(payment.cardBrand)
+    return cardPayment
+      ? payment.status?.trim().toUpperCase() !== 'CAPTURED'
+      : !payment.paidEvidence
+  })
+  const uncapturedPaymentCheckKeys = new Set(
+    unfinalizedPayments
+      .map((payment) => payment.checkKey),
+  )
   const legacyPaymentFallback = settlementPayments.length === 0
     && paymentFacts.length === 0
     && fulfillmentOrders.some((order) => order.payment_business_dates === undefined)
@@ -1413,6 +1527,29 @@ export function buildPosAccountingPreview(input: {
   const sourceVariance = money(totals.total - salesReceiptTotal - totals.tips)
   const itemizedTotal = money(lineItems.reduce((sum, line) => sum + line.amount, 0))
   const hasSettlementActivity = settlementPayments.length > 0 || legacyPaymentFallback
+  const hasAccountingActivity = hasSettlementActivity
+    || fulfillmentOrders.length > 0
+    || releasePayments.length > 0
+  const sourceRefreshInstants = activeInputOrders.map((order) => {
+    const candidate = new Date(String(order.updated_at || ''))
+    return Number.isNaN(candidate.getTime()) || candidate.getTime() > asOfInstant.getTime()
+      ? null
+      : candidate
+  })
+  const sourceRefreshedAt = sourceRefreshInstants.length > 0
+    && sourceRefreshInstants.every((value): value is Date => value !== null)
+    ? sourceRefreshInstants.reduce((earliest, value) => (
+        value.getTime() < earliest.getTime() ? value : earliest
+      ))
+    : null
+  const sourceRefreshBusinessDate = locationTimezoneValid && sourceRefreshedAt
+    ? activeToastBusinessDate(sourceRefreshedAt, timezone, closeoutHour)
+    : null
+  const businessDayWallClockComplete = !hasAccountingActivity
+    || Boolean(asOfBusinessDate && input.businessDate < asOfBusinessDate)
+  const sourceFreshAfterCloseout = !hasAccountingActivity
+    || Boolean(sourceRefreshBusinessDate && input.businessDate < sourceRefreshBusinessDate)
+  const paymentBusinessDayComplete = businessDayWallClockComplete && sourceFreshAfterCloseout
   const payoutEvidenceUnavailable = hasSettlementActivity && (cardAmount !== 0 || cardTips !== 0)
   const unavailableInputs = [...(payoutEvidenceUnavailable ? [{
       key: 'payout_deposit',
@@ -1520,6 +1657,44 @@ export function buildPosAccountingPreview(input: {
       action: 'View checks',
       affectedChecks: batch.openChecks,
     }] : []),
+    ...(hasAccountingActivity && !locationTimezoneValid ? [{
+      code: 'toast_location_timezone_unavailable',
+      title: 'Verify the Toast location timezone',
+      detail: 'The restaurant timezone is missing or invalid, so ClawPilot cannot determine when the Toast business day closes. Refresh the Standard API location in Settings before regenerating.',
+      action: 'Fix configuration',
+    }] : []),
+    ...(hasAccountingActivity && locationTimezoneValid && !businessDayWallClockComplete ? [{
+      code: 'payment_business_day_open',
+      title: 'Wait for the payment business day to close',
+      detail: `${input.businessDate} is still the active payment business day in ${timezone} `
+        + `(closeout ${closeoutHour}:00${closeoutHourSource === 'legacy_safe_fallback' ? ' conservative fallback; refresh the Toast location profile' : ''}). `
+        + 'Regenerate after the business day closes before posting its payment journal.',
+      action: 'Reload sales',
+      affectedChecks: new Set(settlementPayments.map((payment) => payment.checkKey)).size,
+    }] : []),
+    ...(hasAccountingActivity
+      && locationTimezoneValid
+      && businessDayWallClockComplete
+      && !sourceFreshAfterCloseout ? [{
+        code: 'toast_source_refresh_required',
+        title: 'Reload Toast after closeout',
+        detail: `The stored Toast orders were not refreshed after the ${closeoutHour}:00 closeout for ${input.businessDate}. Reload sales before posting so late payments, tips, voids, and closed checks are included.`,
+        action: 'Reload sales',
+      }] : []),
+    ...(uncapturedPaymentCheckKeys.size > 0 ? [{
+      code: 'payment_not_captured',
+      title: 'Wait for captured payments',
+      detail: `${uncapturedPaymentCheckKeys.size} checks include card payments that are not CAPTURED or non-card payments without final paid evidence in Toast. Regenerate after every included payment is final.`,
+      action: 'Reload sales',
+      affectedChecks: uncapturedPaymentCheckKeys.size,
+    }] : []),
+    ...(unfinalizedFulfillmentCheckKeys.size > 0 ? [{
+      code: 'fulfillment_checks_not_closed',
+      title: 'Wait for finalized Toast checks',
+      detail: `${unfinalizedFulfillmentCheckKeys.size} fulfillment checks are not CLOSED with a Toast closeout timestamp. Regenerate after Toast finalizes them before posting the Sales Receipt and release journal.`,
+      action: 'Reload sales',
+      affectedChecks: unfinalizedFulfillmentCheckKeys.size,
+    }] : []),
     ...(input.profile.batchHoldPolicy === 'hold_until_settled' && payoutEvidenceUnavailable ? [{
       code: 'batch_hold_payout',
       title: 'Await verified settlement',
@@ -1622,6 +1797,7 @@ export function buildPosAccountingPreview(input: {
       links: paymentExceptionLinks,
     },
     readiness: {
+      postingGateVersion: POS_ACCOUNTING_POSTING_GATE_VERSION,
       readyForReview: readiness.readyForReview,
       available,
       balanced: Math.abs(balance) < 0.01,
@@ -1641,6 +1817,18 @@ export function buildPosAccountingPreview(input: {
         releaseAmount: releasedExceptionAmount,
         links: paymentExceptionLinks,
       },
+      closeout: {
+        asOfBusinessDate,
+        timezone,
+        timezoneValid: locationTimezoneValid,
+        closeoutHour,
+        closeoutHourSource,
+        sourceRefreshedAt: sourceRefreshedAt?.toISOString() || null,
+        sourceFreshAfterCloseout,
+        paymentBusinessDayComplete,
+        uncapturedPayments: unfinalizedPayments.length,
+        unfinalizedFulfillmentChecks: unfinalizedFulfillmentCheckKeys.size,
+      },
       openChecks: batch.openChecks,
       excludedOpenChecks: batch.excludedOpenChecks,
       postingEnabled: false,
@@ -1650,7 +1838,8 @@ export function buildPosAccountingPreview(input: {
 
 async function resolveLocation(organizationId: string, restaurantGuid: string | null) {
   const result = await query<LocationRow>(
-    `SELECT restaurant_guid::text, restaurant_name, location_name, timezone, analytics_access, standard_access
+    `SELECT restaurant_guid::text, restaurant_name, location_name, timezone, closeout_hour,
+       analytics_access, standard_access
      FROM toast_locations
      WHERE organization_id = $1::uuid
        AND active = true AND archived = false
@@ -1697,7 +1886,7 @@ const MAPPING_SELECT = `id::text, restaurant_guid::text, source_kind, source_id,
   validation_status, validation_reason, source_catalog_revision, target_catalog_revision,
   last_validated_at, created_by, created_at`
 
-const SOURCE_ORDER_SELECT = `order_guid, display_number, business_date, fulfillment_business_date,
+const SOURCE_ORDER_SELECT = `order_guid, display_number, voided, deleted, business_date, fulfillment_business_date,
   payment_business_dates, created_at_source, gross_sales::text, net_sales::text, discounts::text,
   tax::text, service_charges::text, tips::text, refunds::text, tendered::text, total::text,
   cash_tender::text, card_tender::text, other_tender::text, source, dining_option, details, updated_at`
@@ -2083,6 +2272,7 @@ export async function readPosAccountingWorkspaceFromPostgres(input: {
       businessDate: input.businessDate,
       restaurantName: location.location_name || location.restaurant_name,
       locationTimezone: location.timezone,
+      locationCloseoutHour: location.closeout_hour,
       standardOnly: location.standard_access && !location.analytics_access,
       profile,
       mappings,

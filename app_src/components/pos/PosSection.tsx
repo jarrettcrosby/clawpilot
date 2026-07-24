@@ -341,8 +341,23 @@ function affectedCheckCount(value: unknown, checks: AffectedCheck[]) {
   return Number.isFinite(parsed) ? Math.max(0, Math.round(parsed)) : checks.length
 }
 
+const RELOAD_READINESS_BLOCKERS = new Set([
+  'payment_business_day_open',
+  'toast_source_refresh_required',
+  'payment_not_captured',
+  'fulfillment_checks_not_closed',
+  'batch_hold_fee_detail',
+  'batch_hold_payout',
+])
+
+function blockerCode(source: DataRecord) {
+  return textValue(source, ['code', 'id']).trim().toLowerCase()
+}
+
 function blockerActionKind(source: DataRecord, sourceKind: string, title: string, detail: string): PosAccountingFocusAction['kind'] {
+  const code = blockerCode(source)
   const explicit = textValue(source, ['actionKind', 'actionType', 'target', 'action']).toLowerCase()
+  if (RELOAD_READINESS_BLOCKERS.has(code)) return 'reload'
   if (/mapping|map/.test(explicit) || sourceKind) return 'mapping'
   if (/check|order/.test(explicit)) return 'checks'
   if (/review posting|review failure|retry/.test(explicit)) return 'posting_review'
@@ -383,6 +398,14 @@ function isSourceReady(status: string) {
 }
 
 function blockerActionLabel(blocker: PostingQueueBlocker) {
+  const code = blocker.key.toLowerCase()
+  if (code === 'payment_business_day_open') return 'Reload after day closeout'
+  if (code === 'toast_source_refresh_required') return 'Reload Toast after closeout'
+  if (code === 'toast_location_timezone_unavailable') return 'Verify Toast location'
+  if (code === 'payment_not_captured') return 'Reload payment status'
+  if (code === 'fulfillment_checks_not_closed') return 'Reload check status'
+  if (code === 'batch_hold_fee_detail') return 'Reload fee details'
+  if (code === 'batch_hold_payout') return 'Reload settlement'
   const content = `${blocker.title} ${blocker.detail}`.toLowerCase()
   if (blocker.actionKind === 'mapping') {
     if (blocker.sourceKind === 'payment_exception') return 'Choose Payment Exceptions account'
@@ -404,6 +427,17 @@ function blockerActionLabel(blocker: PostingQueueBlocker) {
   if (/batch|fee detail|payout/.test(content)) return 'Review batch details'
   if (/failed|error/.test(content)) return 'Review failure'
   return 'Reload and recheck'
+}
+
+function blockerHoldStatusLabel(blockers: PostingQueueBlocker[]) {
+  const codes = new Set(blockers.map((blocker) => blocker.key.toLowerCase()))
+  if (codes.has('payment_not_captured')) return 'Awaiting captured payment'
+  if (codes.has('payment_business_day_open')) return 'Awaiting day closeout'
+  if (codes.has('toast_source_refresh_required')) return 'Needs post-closeout reload'
+  if (codes.has('toast_location_timezone_unavailable')) return 'Needs location setup'
+  if (codes.has('fulfillment_checks_not_closed')) return 'Awaiting Toast closeout'
+  if (codes.has('batch_hold_fee_detail') || codes.has('batch_hold_payout')) return 'Awaiting batch details'
+  return ''
 }
 
 function postingDraftAmount(draft: DataRecord) {
@@ -726,7 +760,9 @@ function queueDraft(draft: DataRecord, index: number): PostingQueueDraft {
     draft,
     key: textValue(draft, ['id', 'guid'], String(index)),
     status,
-    statusLabel: postingStatusLabel(effectiveReportedStatus, status),
+    statusLabel: status === 'Hold'
+      ? blockerHoldStatusLabel(blockers) || postingStatusLabel(effectiveReportedStatus, status)
+      : postingStatusLabel(effectiveReportedStatus, status),
     blockers,
   }
 }
@@ -1738,7 +1774,8 @@ export default function PosSection() {
             <Box display="grid" gridTemplateColumns="repeat(2, minmax(0, 1fr))" columnGap={2} rowGap={1.25} mb={2}>
               {[
                 ['Opened', dateTimeLabel(firstValue(detail, ['openedAt', 'openedDate', 'createdAt']))],
-                ['Closed', dateTimeLabel(firstValue(detail, ['closedAt', 'closedDate', 'paidDate']))],
+                ['Paid', dateTimeLabel(firstValue(detail, ['paidAt', 'paidDate']))],
+                ['Closed', dateTimeLabel(firstValue(detail, ['closedAt', 'closedDate']))],
                 ...(detailFulfillmentDate ? [['Fulfillment', dateLabel(detailFulfillmentDate)]] : []),
                 ...(detailPaymentDates.length ? [['Payment date', detailPaymentDates.map((date) => dateLabel(date, true)).join(', ')]] : []),
                 ['Checks', number(checks.length)],
@@ -1746,7 +1783,12 @@ export default function PosSection() {
                 ['Dining option', textValue(detail, ['diningOptionName', 'diningOption', 'serviceType'], '—')],
                 ['Source', textValue(detail, ['source', 'sourceName', 'channel'], 'Toast')],
               ].map(([label, value]) => (
-                <Box key={label} minWidth={0}>
+                <Box
+                  key={label}
+                  minWidth={0}
+                  {...(label === 'Paid' ? { 'data-testid': 'pos-order-paid-at' } : {})}
+                  {...(label === 'Closed' ? { 'data-testid': 'pos-order-closed-at' } : {})}
+                >
                   <Typography variant="caption" color="text.disabled" display="block">{label}</Typography>
                   <Typography variant="body2" noWrap>{value}</Typography>
                 </Box>

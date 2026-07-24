@@ -17,6 +17,7 @@ export type ToastRestaurant = {
   locationName: string | null
   locationCode: string | null
   timezone: string | null
+  closeoutHour: number | null
   active: boolean
   testMode: boolean
   archived: boolean
@@ -170,6 +171,12 @@ function cleanText(value: unknown, max = 200) {
   return text ? text.slice(0, max) : null
 }
 
+function optionalCloseoutHour(value: unknown) {
+  if (value === null || value === undefined || String(value).trim() === '') return null
+  const parsed = Number(value)
+  return Number.isInteger(parsed) && parsed >= 0 && parsed <= 12 ? parsed : null
+}
+
 function absoluteTimestamp(value: unknown, label: string) {
   const raw = String(value || '').trim()
   const parsed = Date.parse(raw)
@@ -303,6 +310,7 @@ function restaurantFromAnalytics(value: unknown): ToastRestaurant | null {
       locationName: null,
       locationCode: null,
       timezone: null,
+      closeoutHour: null,
       active: record.active !== false,
       testMode: record.testMode === true,
       archived: record.archived === true,
@@ -342,6 +350,7 @@ export async function getToastStandardRestaurant(
     locationName: cleanText(general.locationName),
     locationCode: cleanText(general.locationCode, 64),
     timezone: cleanText(general.timeZone, 100),
+    closeoutHour: optionalCloseoutHour(general.closeoutHour),
     active: general.archived !== true,
     testMode: false,
     archived: general.archived === true,

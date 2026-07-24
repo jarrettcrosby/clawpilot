@@ -614,7 +614,7 @@ const july18Order = {
   cash_tender: 0,
   card_tender: 592.32,
   other_tender: 0,
-  updated_at: '2026-07-18T23:59:00.000Z',
+  updated_at: '2026-07-19T16:00:00.000Z',
   details: {
     checks: [{
       paymentStatus: 'PAID',
@@ -641,6 +641,7 @@ const july18Order = {
 const preview = accounting.buildPosAccountingPreview({
   businessDate: '2026-07-18',
   restaurantName: 'Suburbia Sandwich Co',
+  locationTimezone: 'America/New_York',
   standardOnly: true,
   profile,
   mappings: [],
@@ -674,6 +675,7 @@ assert.equal(preview.readiness.mappingsComplete, false)
 const discountRefundPreview = accounting.buildPosAccountingPreview({
   businessDate: '2026-07-18',
   restaurantName: 'Suburbia Sandwich Co',
+  locationTimezone: 'America/New_York',
   standardOnly: true,
   profile,
   mappings: [],
@@ -718,6 +720,7 @@ netDiscountOrder.details.checks[0].selections[0].discounts = [{
 const unmappedNetDiscountPreview = accounting.buildPosAccountingPreview({
   businessDate: '2026-07-18',
   restaurantName: 'Suburbia Sandwich Co',
+  locationTimezone: 'America/New_York',
   standardOnly: true,
   profile,
   mappings: [],
@@ -734,6 +737,7 @@ assert.equal(
 const netDiscountPreview = accounting.buildPosAccountingPreview({
   businessDate: '2026-07-18',
   restaurantName: 'Suburbia Sandwich Co',
+  locationTimezone: 'America/New_York',
   standardOnly: true,
   profile,
   mappings: unmappedNetDiscountPreview.readiness.missingMappings.map((entry, index) => ({
@@ -756,6 +760,7 @@ assert.equal(netDiscountPreview.postingSideEffect, false)
 const legacyReadyPreview = accounting.buildPosAccountingPreview({
   businessDate: '2026-07-18',
   restaurantName: 'Suburbia Sandwich Co',
+  locationTimezone: 'America/New_York',
   standardOnly: true,
   profile,
   mappings: [],
@@ -796,6 +801,7 @@ const mixedCheckOrder = {
 const exclusionPreview = accounting.buildPosAccountingPreview({
   businessDate: '2026-07-18',
   restaurantName: 'Suburbia Sandwich Co',
+  locationTimezone: 'America/New_York',
   standardOnly: true,
   profile: { ...profile, openCheckPolicy: 'exclude' },
   mappings: [],
@@ -829,6 +835,7 @@ Object.assign(preorderOrder, {
   cash_tender: 0,
   card_tender: 44.54,
   other_tender: 0,
+  updated_at: '2026-07-24T16:00:00.000Z',
 })
 Object.assign(preorderOrder.details.checks[0], {
   providerGuid: 'preorder-check-1',
@@ -837,7 +844,7 @@ Object.assign(preorderOrder.details.checks[0], {
   tax: 2.72,
   total: 44.54,
   paidAt: '2026-07-24T02:10:00.000Z',
-  closedAt: '2026-07-24T02:10:00.000Z',
+  closedAt: null,
 })
 Object.assign(preorderOrder.details.checks[0].selections[0], {
   quantity: 1,
@@ -857,6 +864,7 @@ const captureHoldPreview = accounting.buildPosAccountingPreview({
   businessDate: '2026-07-23',
   restaurantName: 'Suburbia Sandwich Co',
   locationTimezone: 'America/New_York',
+  asOf: '2026-07-24T16:00:00.000Z',
   standardOnly: true,
   profile: { ...profile, batchHoldPolicy: 'do_not_hold' },
   mappings: [],
@@ -899,17 +907,284 @@ const mappingFor = (entry, index) => ({
   validationStatus: 'valid',
 })
 const captureMappings = captureHoldPreview.readiness.missingMappings.map(mappingFor)
-const captureReadyPreview = accounting.buildPosAccountingPreview({
+const captureBusinessDayOpenPreview = accounting.buildPosAccountingPreview({
   businessDate: '2026-07-23',
   restaurantName: 'Suburbia Sandwich Co',
   locationTimezone: 'America/New_York',
+  asOf: '2026-07-23T20:00:00.000Z',
   standardOnly: true,
   profile: { ...profile, batchHoldPolicy: 'do_not_hold' },
   mappings: captureMappings,
   orders: [preorderOrder],
 })
+assert.equal(captureBusinessDayOpenPreview.paymentExceptions.captureAmount, 44.54)
+assert.equal(
+  captureBusinessDayOpenPreview.journal.lines.find((line) => line.code === 'payment_exception_capture')?.amount,
+  44.54,
+  'the provisional capture journal must remain visible while posting is held',
+)
+assert.ok(captureBusinessDayOpenPreview.readiness.blockers.some((blocker) => (
+  blocker.code === 'payment_business_day_open'
+  && blocker.action === 'Reload sales'
+  && blocker.affectedChecks === 1
+)))
+assert.equal(captureBusinessDayOpenPreview.readiness.closeout.paymentBusinessDayComplete, false)
+assert.equal(captureBusinessDayOpenPreview.readiness.readyForReview, false)
+
+const configuredPreCloseoutPreview = accounting.buildPosAccountingPreview({
+  businessDate: '2026-07-23',
+  restaurantName: 'Suburbia Sandwich Co',
+  locationTimezone: 'America/New_York',
+  locationCloseoutHour: 4,
+  asOf: '2026-07-24T07:59:00.000Z',
+  standardOnly: true,
+  profile: { ...profile, batchHoldPolicy: 'do_not_hold' },
+  mappings: captureMappings,
+  orders: [preorderOrder],
+})
+assert.equal(configuredPreCloseoutPreview.readiness.closeout.asOfBusinessDate, '2026-07-23')
+assert.equal(configuredPreCloseoutPreview.readiness.closeout.closeoutHour, 4)
+assert.equal(configuredPreCloseoutPreview.readiness.closeout.closeoutHourSource, 'restaurant')
+assert.ok(configuredPreCloseoutPreview.readiness.blockers.some((blocker) => (
+  blocker.code === 'payment_business_day_open'
+)))
+
+const configuredAtCloseoutPreview = accounting.buildPosAccountingPreview({
+  businessDate: '2026-07-23',
+  restaurantName: 'Suburbia Sandwich Co',
+  locationTimezone: 'America/New_York',
+  locationCloseoutHour: 4,
+  asOf: '2026-07-24T08:00:00.000Z',
+  standardOnly: true,
+  profile: { ...profile, batchHoldPolicy: 'do_not_hold' },
+  mappings: captureMappings,
+  orders: [preorderOrder],
+})
+assert.equal(configuredAtCloseoutPreview.readiness.closeout.asOfBusinessDate, '2026-07-24')
+assert.equal(
+  configuredAtCloseoutPreview.readiness.blockers.some((blocker) => blocker.code === 'payment_business_day_open'),
+  false,
+)
+assert.ok(
+  configuredAtCloseoutPreview.readiness.blockers.some((blocker) => blocker.code === 'toast_source_refresh_required'),
+  'wall-clock closeout must not make a stale pre-closeout source postable',
+)
+assert.equal(configuredAtCloseoutPreview.readiness.closeout.sourceFreshAfterCloseout, false)
+assert.equal(configuredAtCloseoutPreview.readiness.closeout.paymentBusinessDayComplete, false)
+
+const postCloseoutRefreshedOrder = structuredClone(preorderOrder)
+postCloseoutRefreshedOrder.updated_at = '2026-07-24T08:00:00.000Z'
+const configuredAfterReloadPreview = accounting.buildPosAccountingPreview({
+  businessDate: '2026-07-23',
+  restaurantName: 'Suburbia Sandwich Co',
+  locationTimezone: 'America/New_York',
+  locationCloseoutHour: 4,
+  asOf: '2026-07-24T08:01:00.000Z',
+  standardOnly: true,
+  profile: { ...profile, batchHoldPolicy: 'do_not_hold' },
+  mappings: captureMappings,
+  orders: [postCloseoutRefreshedOrder],
+})
+assert.equal(
+  configuredAfterReloadPreview.readiness.blockers.some((blocker) => blocker.code === 'toast_source_refresh_required'),
+  false,
+)
+assert.equal(configuredAfterReloadPreview.readiness.closeout.sourceFreshAfterCloseout, true)
+
+const preCloseoutPaymentWithoutBusinessDate = structuredClone(preorderOrder)
+preCloseoutPaymentWithoutBusinessDate.payment_business_dates = ['2026-07-24']
+delete preCloseoutPaymentWithoutBusinessDate.details.checks[0].payments[0].paidBusinessDate
+preCloseoutPaymentWithoutBusinessDate.details.checks[0].payments[0].paidAt = '2026-07-24T06:00:00.000Z'
+const inferredPreCloseoutPaymentPreview = accounting.buildPosAccountingPreview({
+  businessDate: '2026-07-23',
+  restaurantName: 'Suburbia Sandwich Co',
+  locationTimezone: 'America/New_York',
+  locationCloseoutHour: 4,
+  asOf: '2026-07-24T16:00:00.000Z',
+  standardOnly: true,
+  profile: { ...profile, batchHoldPolicy: 'do_not_hold' },
+  mappings: captureMappings,
+  orders: [preCloseoutPaymentWithoutBusinessDate],
+})
+assert.equal(inferredPreCloseoutPaymentPreview.paymentExceptions.captureAmount, 44.54)
+assert.equal(
+  inferredPreCloseoutPaymentPreview.readiness.blockers.some((blocker) => blocker.code === 'payment_date_unavailable'),
+  false,
+  'paidAt before the exact Toast cutoff must infer the preceding payment business date',
+)
+const unknownCutoffPaymentPreview = accounting.buildPosAccountingPreview({
+  businessDate: '2026-07-23',
+  restaurantName: 'Suburbia Sandwich Co',
+  locationTimezone: 'America/New_York',
+  locationCloseoutHour: null,
+  asOf: '2026-07-24T16:00:00.000Z',
+  standardOnly: true,
+  profile: { ...profile, batchHoldPolicy: 'do_not_hold' },
+  mappings: captureMappings,
+  orders: [preCloseoutPaymentWithoutBusinessDate],
+})
+assert.ok(
+  unknownCutoffPaymentPreview.readiness.blockers.some((blocker) => blocker.code === 'payment_date_unavailable'),
+  'a missing paidBusinessDate must fail closed when the restaurant cutoff is unavailable',
+)
+
+const missingTimezonePreview = accounting.buildPosAccountingPreview({
+  businessDate: '2026-07-23',
+  restaurantName: 'Suburbia Sandwich Co',
+  locationTimezone: null,
+  locationCloseoutHour: 4,
+  asOf: '2026-07-24T16:00:00.000Z',
+  standardOnly: true,
+  profile: { ...profile, batchHoldPolicy: 'do_not_hold' },
+  mappings: captureMappings,
+  orders: [preorderOrder],
+})
+assert.ok(
+  missingTimezonePreview.readiness.blockers.some((blocker) => blocker.code === 'toast_location_timezone_unavailable'),
+)
+assert.equal(missingTimezonePreview.readiness.closeout.timezoneValid, false)
+assert.equal(missingTimezonePreview.readiness.readyForReview, false)
+const invalidTimezonePreview = accounting.buildPosAccountingPreview({
+  businessDate: '2026-07-23',
+  restaurantName: 'Suburbia Sandwich Co',
+  locationTimezone: 'Not/A_Timezone',
+  locationCloseoutHour: 4,
+  asOf: '2026-07-24T16:00:00.000Z',
+  standardOnly: true,
+  profile: { ...profile, batchHoldPolicy: 'do_not_hold' },
+  mappings: captureMappings,
+  orders: [preorderOrder],
+})
+assert.ok(
+  invalidTimezonePreview.readiness.blockers.some((blocker) => blocker.code === 'toast_location_timezone_unavailable'),
+)
+assert.equal(invalidTimezonePreview.readiness.closeout.asOfBusinessDate, null)
+
+const legacyPreCloseoutPreview = accounting.buildPosAccountingPreview({
+  businessDate: '2026-07-23',
+  restaurantName: 'Suburbia Sandwich Co',
+  locationTimezone: 'America/New_York',
+  locationCloseoutHour: null,
+  asOf: '2026-07-24T15:59:00.000Z',
+  standardOnly: true,
+  profile: { ...profile, batchHoldPolicy: 'do_not_hold' },
+  mappings: captureMappings,
+  orders: [preorderOrder],
+})
+assert.equal(legacyPreCloseoutPreview.readiness.closeout.asOfBusinessDate, '2026-07-23')
+assert.equal(legacyPreCloseoutPreview.readiness.closeout.closeoutHour, 12)
+assert.equal(legacyPreCloseoutPreview.readiness.closeout.closeoutHourSource, 'legacy_safe_fallback')
+assert.match(
+  legacyPreCloseoutPreview.readiness.blockers.find((blocker) => blocker.code === 'payment_business_day_open')?.detail || '',
+  /conservative fallback/,
+)
+
+const authorizedPreorderOrder = structuredClone(preorderOrder)
+authorizedPreorderOrder.details.checks[0].payments[0].status = 'AUTHORIZED'
+const uncapturedPaymentPreview = accounting.buildPosAccountingPreview({
+  businessDate: '2026-07-23',
+  restaurantName: 'Suburbia Sandwich Co',
+  locationTimezone: 'America/New_York',
+  asOf: '2026-07-24T16:00:00.000Z',
+  standardOnly: true,
+  profile: { ...profile, batchHoldPolicy: 'do_not_hold' },
+  mappings: captureMappings,
+  orders: [authorizedPreorderOrder],
+})
+assert.ok(uncapturedPaymentPreview.readiness.blockers.some((blocker) => (
+  blocker.code === 'payment_not_captured'
+  && blocker.action === 'Reload sales'
+  && blocker.affectedChecks === 1
+)))
+assert.equal(uncapturedPaymentPreview.readiness.closeout.uncapturedPayments, 1)
+assert.equal(uncapturedPaymentPreview.readiness.readyForReview, false)
+
+const paidCashPreorderOrder = structuredClone(preorderOrder)
+Object.assign(paidCashPreorderOrder.details.checks[0].payments[0], {
+  type: 'CASH',
+  cardBrand: null,
+  status: null,
+  processingFee: null,
+})
+const paidCashCapturePreview = accounting.buildPosAccountingPreview({
+  businessDate: '2026-07-23',
+  restaurantName: 'Suburbia Sandwich Co',
+  locationTimezone: 'America/New_York',
+  asOf: '2026-07-24T16:00:00.000Z',
+  standardOnly: true,
+  profile: { ...profile, batchHoldPolicy: 'do_not_hold' },
+  mappings: [],
+  orders: [paidCashPreorderOrder],
+})
+assert.equal(
+  paidCashCapturePreview.readiness.blockers.some((blocker) => blocker.code === 'payment_not_captured'),
+  false,
+  'cash and other non-card payments use final paid evidence because Toast CAPTURED applies to card payments',
+)
+
+const replacedCashPreorderOrder = structuredClone(preorderOrder)
+replacedCashPreorderOrder.details.checks[0].payments = [{
+  ...replacedCashPreorderOrder.details.checks[0].payments[0],
+  status: 'VOIDED',
+  voided: true,
+}, {
+  providerGuid: 'replacement-cash-payment',
+  type: 'CASH',
+  cardBrand: null,
+  status: null,
+  amount: 44.54,
+  tip: 0,
+  processingFee: null,
+  paidAt: '2026-07-24T05:12:00.000Z',
+  paidBusinessDate: '2026-07-23',
+  voided: false,
+  deleted: false,
+}]
+const replacedCashCapturePreview = accounting.buildPosAccountingPreview({
+  businessDate: '2026-07-23',
+  restaurantName: 'Suburbia Sandwich Co',
+  locationTimezone: 'America/New_York',
+  asOf: '2026-07-24T16:00:00.000Z',
+  standardOnly: true,
+  profile: { ...profile, batchHoldPolicy: 'do_not_hold' },
+  mappings: [],
+  orders: [replacedCashPreorderOrder],
+})
+assert.equal(replacedCashCapturePreview.paymentExceptions.captureChecks, 1)
+assert.equal(replacedCashCapturePreview.paymentExceptions.captureAmount, 44.54)
+assert.equal(replacedCashCapturePreview.readiness.closeout.uncapturedPayments, 0)
+assert.equal(
+  replacedCashCapturePreview.readiness.blockers.some((blocker) => blocker.code === 'payment_not_captured'),
+  false,
+  'a voided card attempt must not leave a permanent capture hold after a final non-card replacement',
+)
+assert.equal(
+  replacedCashCapturePreview.journal.lines.some((line) => line.code === 'calculated_net_card_settlement'),
+  false,
+)
+assert.equal(
+  replacedCashCapturePreview.journal.lines.find((line) => line.code === 'cash_in_drawer')?.amount,
+  44.54,
+)
+
+const captureReadyPreview = accounting.buildPosAccountingPreview({
+  businessDate: '2026-07-23',
+  restaurantName: 'Suburbia Sandwich Co',
+  locationTimezone: 'America/New_York',
+  asOf: '2026-07-24T16:00:00.000Z',
+  standardOnly: true,
+  profile: { ...profile, batchHoldPolicy: 'do_not_hold' },
+  mappings: captureMappings,
+  orders: [preorderOrder],
+})
+assert.equal(preorderOrder.details.checks[0].paymentStatus, 'PAID')
+assert.equal(preorderOrder.details.checks[0].closedAt, null)
+assert.equal(preorderOrder.details.checks[0].payments[0].status, 'CAPTURED')
 assert.equal(captureReadyPreview.readiness.readyForReview, true)
 assert.equal(captureReadyPreview.readiness.blockers.length, 0)
+assert.equal(captureReadyPreview.readiness.closeout.asOfBusinessDate, '2026-07-24')
+assert.equal(captureReadyPreview.readiness.closeout.closeoutHour, 12)
+assert.equal(captureReadyPreview.readiness.closeout.closeoutHourSource, 'legacy_safe_fallback')
 
 const conflictingPaymentExceptionMappings = captureMappings.map((mapping) => (
   mapping.sourceKind === 'payment_exception'
@@ -920,6 +1195,7 @@ const paymentExceptionConflictPreview = accounting.buildPosAccountingPreview({
   businessDate: '2026-07-23',
   restaurantName: 'Suburbia Sandwich Co',
   locationTimezone: 'America/New_York',
+  asOf: '2026-07-24T16:00:00.000Z',
   standardOnly: true,
   profile: { ...profile, batchHoldPolicy: 'do_not_hold' },
   mappings: conflictingPaymentExceptionMappings,
@@ -936,6 +1212,7 @@ const fulfillmentMappingPreview = accounting.buildPosAccountingPreview({
   businessDate: '2026-07-25',
   restaurantName: 'Suburbia Sandwich Co',
   locationTimezone: 'America/New_York',
+  asOf: '2026-07-26T16:00:00.000Z',
   standardOnly: true,
   profile: { ...profile, batchHoldPolicy: 'do_not_hold' },
   mappings: captureMappings,
@@ -945,14 +1222,39 @@ const mappingByKey = new Map(
   [...captureMappings, ...fulfillmentMappingPreview.readiness.missingMappings.map(mappingFor)]
     .map((entry) => [`${entry.sourceKind}:${entry.sourceId}:${entry.targetType}`, entry]),
 )
-const fulfillmentReadyPreview = accounting.buildPosAccountingPreview({
+const fulfillmentCloseoutHoldPreview = accounting.buildPosAccountingPreview({
   businessDate: '2026-07-25',
   restaurantName: 'Suburbia Sandwich Co',
   locationTimezone: 'America/New_York',
+  asOf: '2026-07-26T16:00:00.000Z',
   standardOnly: true,
   profile: { ...profile, batchHoldPolicy: 'do_not_hold' },
   mappings: [...mappingByKey.values()],
   orders: [preorderOrder],
+})
+assert.equal(fulfillmentCloseoutHoldPreview.salesReceipt.total, 44.54)
+assert.equal(fulfillmentCloseoutHoldPreview.paymentExceptions.releaseAmount, 44.54)
+assert.ok(fulfillmentCloseoutHoldPreview.readiness.blockers.some((blocker) => (
+  blocker.code === 'fulfillment_checks_not_closed'
+  && blocker.action === 'Reload sales'
+  && blocker.affectedChecks === 1
+)))
+assert.equal(fulfillmentCloseoutHoldPreview.readiness.closeout.unfinalizedFulfillmentChecks, 1)
+assert.equal(fulfillmentCloseoutHoldPreview.readiness.readyForReview, false)
+
+const closedPreorderOrder = structuredClone(preorderOrder)
+closedPreorderOrder.details.checks[0].paymentStatus = 'CLOSED'
+closedPreorderOrder.details.checks[0].closedAt = '2026-07-25T18:00:00.000Z'
+closedPreorderOrder.updated_at = '2026-07-26T16:00:00.000Z'
+const fulfillmentReadyPreview = accounting.buildPosAccountingPreview({
+  businessDate: '2026-07-25',
+  restaurantName: 'Suburbia Sandwich Co',
+  locationTimezone: 'America/New_York',
+  asOf: '2026-07-26T16:00:00.000Z',
+  standardOnly: true,
+  profile: { ...profile, batchHoldPolicy: 'do_not_hold' },
+  mappings: [...mappingByKey.values()],
+  orders: [closedPreorderOrder],
 })
 assert.equal(fulfillmentReadyPreview.salesReceipt.total, 44.54)
 assert.equal(fulfillmentReadyPreview.paymentExceptions.captureAmount, 0)
@@ -977,12 +1279,116 @@ assert.equal(
   'persisted Standard rows must make a future fulfillment draft source-ready without a duplicate dated outbox job',
 )
 
+const voidedFulfillmentOrder = structuredClone(preorderOrder)
+voidedFulfillmentOrder.order_guid = 'voided-fulfillment-order'
+voidedFulfillmentOrder.voided = true
+const deletedFulfillmentOrder = structuredClone(preorderOrder)
+deletedFulfillmentOrder.order_guid = 'deleted-fulfillment-order'
+deletedFulfillmentOrder.deleted = true
+const voidedCheckSetOrder = structuredClone(preorderOrder)
+voidedCheckSetOrder.order_guid = 'voided-check-set-order'
+voidedCheckSetOrder.details.checks[0].voided = true
+const deletedCheckSetOrder = structuredClone(preorderOrder)
+deletedCheckSetOrder.order_guid = 'deleted-check-set-order'
+deletedCheckSetOrder.details.checks[0].deleted = true
+const validSalesWithVoidsPreview = accounting.buildPosAccountingPreview({
+  businessDate: '2026-07-25',
+  restaurantName: 'Suburbia Sandwich Co',
+  locationTimezone: 'America/New_York',
+  asOf: '2026-07-26T16:00:00.000Z',
+  standardOnly: true,
+  profile: { ...profile, batchHoldPolicy: 'do_not_hold' },
+  mappings: [...mappingByKey.values()],
+  orders: [
+    closedPreorderOrder,
+    voidedFulfillmentOrder,
+    deletedFulfillmentOrder,
+    voidedCheckSetOrder,
+    deletedCheckSetOrder,
+  ],
+})
+assert.equal(validSalesWithVoidsPreview.salesReceipt.total, 44.54)
+assert.equal(validSalesWithVoidsPreview.readiness.closeout.unfinalizedFulfillmentChecks, 0)
+assert.equal(
+  validSalesWithVoidsPreview.readiness.blockers.some((blocker) => blocker.code === 'fulfillment_checks_not_closed'),
+  false,
+  'fully voided or deleted orders and check sets must not block valid fulfillment sales',
+)
+
+const mixedVoidedLinesOrder = structuredClone(closedPreorderOrder)
+mixedVoidedLinesOrder.details.checks[0].selections.push({
+  ...structuredClone(mixedVoidedLinesOrder.details.checks[0].selections[0]),
+  itemGuid: 'voided-selection',
+  itemName: 'Voided selection',
+  gross: 900,
+  net: 900,
+  voided: true,
+})
+mixedVoidedLinesOrder.details.checks.push({
+  ...structuredClone(mixedVoidedLinesOrder.details.checks[0]),
+  providerGuid: 'voided-check',
+  displayNumber: 'voided-check',
+  amount: 700,
+  tax: 0,
+  total: 700,
+  voided: true,
+  selections: [{
+    ...structuredClone(mixedVoidedLinesOrder.details.checks[0].selections[0]),
+    itemGuid: 'voided-check-selection',
+    itemName: 'Voided check selection',
+    gross: 700,
+    net: 700,
+  }],
+})
+const mixedVoidedLinesPreview = accounting.buildPosAccountingPreview({
+  businessDate: '2026-07-25',
+  restaurantName: 'Suburbia Sandwich Co',
+  locationTimezone: 'America/New_York',
+  asOf: '2026-07-26T16:00:00.000Z',
+  standardOnly: true,
+  profile: { ...profile, batchHoldPolicy: 'do_not_hold' },
+  mappings: [...mappingByKey.values()],
+  orders: [mixedVoidedLinesOrder],
+})
+assert.equal(mixedVoidedLinesPreview.salesReceipt.total, 44.54)
+assert.equal(mixedVoidedLinesPreview.salesReceipt.lineItems.length, 1)
+assert.equal(
+  mixedVoidedLinesPreview.salesReceipt.lineItems.some((line) => /voided/i.test(line.sourceName)),
+  false,
+  'mixed voided checks and selections must not enter the Sales Receipt preview',
+)
+assert.equal(
+  mixedVoidedLinesPreview.readiness.missingMappings.some((mapping) => /voided/i.test(mapping.sourceName)),
+  false,
+  'mixed voided checks and selections must not create mapping blockers',
+)
+
+const missingCheckEvidenceOrder = structuredClone(preorderOrder)
+missingCheckEvidenceOrder.order_guid = 'missing-check-evidence-order'
+missingCheckEvidenceOrder.details = {}
+const missingCheckEvidencePreview = accounting.buildPosAccountingPreview({
+  businessDate: '2026-07-25',
+  restaurantName: 'Suburbia Sandwich Co',
+  locationTimezone: 'America/New_York',
+  asOf: '2026-07-26T16:00:00.000Z',
+  standardOnly: true,
+  profile: { ...profile, batchHoldPolicy: 'do_not_hold' },
+  mappings: [...mappingByKey.values()],
+  orders: [closedPreorderOrder, missingCheckEvidenceOrder],
+})
+assert.equal(missingCheckEvidencePreview.readiness.closeout.unfinalizedFulfillmentChecks, 1)
+assert.ok(missingCheckEvidencePreview.readiness.blockers.some((blocker) => (
+  blocker.code === 'fulfillment_checks_not_closed'
+  && blocker.affectedChecks === 1
+)), 'an active order without any check evidence must continue to fail safe')
+
 const incompleteFeeOrder = structuredClone(preorderOrder)
 incompleteFeeOrder.details.checks[0].payments[0].processingFee = null
 const feeBatchHoldPreview = accounting.buildPosAccountingPreview({
   businessDate: '2026-07-23',
   restaurantName: 'Suburbia Sandwich Co',
   locationTimezone: 'America/New_York',
+  asOf: '2026-07-24T16:00:00.000Z',
   standardOnly: true,
   profile: { ...profile, batchHoldPolicy: 'hold_until_closed' },
   mappings: captureMappings,
@@ -1260,6 +1666,7 @@ assert.ok(multiBrandCatalog.some((entry) => (
 const multiBrandPreview = accounting.buildPosAccountingPreview({
   businessDate: '2026-07-18',
   restaurantName: 'Suburbia Sandwich Co',
+  locationTimezone: 'America/New_York',
   standardOnly: true,
   profile,
   mappings: [{
@@ -1292,6 +1699,7 @@ assert.equal(settlementLine?.target?.id, '1000')
 const singleBrandSummaryMappingPreview = accounting.buildPosAccountingPreview({
   businessDate: '2026-07-18',
   restaurantName: 'Suburbia Sandwich Co',
+  locationTimezone: 'America/New_York',
   standardOnly: true,
   profile,
   mappings: [{
