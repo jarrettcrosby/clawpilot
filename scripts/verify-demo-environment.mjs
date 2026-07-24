@@ -6,7 +6,7 @@ const { Pool } = requireFromApp('pg')
 
 const DEMO_EMAIL = 'demo-system@clawpilot.example'
 const DEMO_WORKSPACE_ID = '10000000-0000-4000-8000-000000000001'
-const DEMO_PIPELINE_ID = '20000000-0000-4000-8000-000000000001'
+const DEMO_PIPELINE_ID = '20000000-0000-4000-8000-000000000002'
 const DEMO_BOARD_ID = '30000000-0000-4000-8000-000000000001'
 
 if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required')
@@ -36,6 +36,17 @@ try {
       (SELECT count(*) FROM pipeline_spaces
         WHERE id = $3::uuid AND workspace_organization_id = $1::uuid
           AND sheet_id IS NULL AND sync_enabled = false)::integer AS pipelines,
+      (SELECT count(*) FROM pipeline_spaces
+        WHERE workspace_organization_id = $1::uuid
+          AND id <> $3::uuid
+          AND (is_default = true OR sync_enabled = true))::integer AS unsafe_legacy_pipelines,
+      (SELECT count(*) FROM pipeline_space_members membership
+        JOIN pipeline_spaces pipeline ON pipeline.id = membership.pipeline_id
+        WHERE pipeline.workspace_organization_id = $1::uuid
+          AND pipeline.id <> $3::uuid)::integer AS legacy_pipeline_memberships,
+      (SELECT count(*) FROM app_user_workspace_preferences preference
+        WHERE preference.workspace_organization_id = $1::uuid
+          AND preference.default_pipeline_id <> $3::uuid)::integer AS legacy_default_preferences,
       (SELECT count(*) FROM operations_activation_scopes
         WHERE organization_id = $1::uuid
           AND data_pipeline_id = $3::uuid
@@ -120,7 +131,9 @@ try {
   `, [DEMO_WORKSPACE_ID, DEMO_EMAIL, DEMO_PIPELINE_ID, DEMO_BOARD_ID])
   const row = result.rows[0]
   if (!row || row.workspaces !== 1 || row.system_users !== 1 || row.memberships < 1
-    || row.pipelines !== 1 || row.operations_activation_scopes !== 1 || row.boards !== 1
+    || row.pipelines !== 1 || row.unsafe_legacy_pipelines !== 0
+    || row.legacy_pipeline_memberships !== 0 || row.legacy_default_preferences !== 0
+    || row.operations_activation_scopes !== 1 || row.boards !== 1
     || row.organizations < 5 || row.contacts < 5
     || row.opportunities < 5 || row.interactions < 12 || row.invoices < 6
     || row.interactions_recent < 1 || row.interactions_follow_up < 1 || row.interactions_context < 1

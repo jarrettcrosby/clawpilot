@@ -8,7 +8,7 @@ const { Pool } = requireFromApp('pg')
 
 const DEMO_EMAIL = 'demo-system@clawpilot.example'
 const ROOT_ORGANIZATION_ID = '10000000-0000-4000-8000-000000000001'
-const PIPELINE_ID = '20000000-0000-4000-8000-000000000001'
+const PIPELINE_ID = '20000000-0000-4000-8000-000000000002'
 const BOARD_ID = '30000000-0000-4000-8000-000000000001'
 const TOAST_RESTAURANT_GUID = '90000000-0000-4000-8000-000000000001'
 const TOAST_MENU_GUID = '91000000-0000-4000-8000-000000000001'
@@ -60,29 +60,48 @@ async function main() {
   try {
     await client.query(`SELECT pg_advisory_lock(hashtext('clawpilot-demo-account-seed'))`)
     await client.query('BEGIN')
-    const immutableDemoCrmEvidence = await client.query(
-      `SELECT (
-         EXISTS (
-           SELECT 1
-           FROM crm_contact_source_aliases
-           WHERE pipeline_id = $1::uuid
+    const immutableDemoPipelines = await client.query(
+      `SELECT pipeline.id::text
+       FROM pipeline_spaces pipeline
+       WHERE pipeline.workspace_organization_id = $1::uuid
+         AND (
+           EXISTS (
+             SELECT 1
+             FROM crm_contact_source_aliases alias
+             WHERE alias.pipeline_id = pipeline.id
+           )
+           OR EXISTS (
+             SELECT 1
+             FROM crm_contact_merges merge_evidence
+             WHERE merge_evidence.pipeline_id = pipeline.id
+           )
          )
-         OR EXISTS (
-           SELECT 1
-           FROM crm_contact_merges
-           WHERE pipeline_id = $1::uuid
-         )
-       ) AS present`,
-      [PIPELINE_ID],
+       FOR UPDATE`,
+      [ROOT_ORGANIZATION_ID],
     )
-    if (immutableDemoCrmEvidence.rows[0]?.present === true) {
-      await client.query('COMMIT')
-      console.log(JSON.stringify({
-        ok: true,
-        environment: environment || 'local',
-        mode: 'preserved_immutable_crm_evidence',
-      }))
-      return
+    const immutablePipelineIds = immutableDemoPipelines.rows.map((row) => row.id)
+    if (immutablePipelineIds.length > 0) {
+      await client.query(
+        `UPDATE app_user_workspace_preferences
+         SET default_pipeline_id = NULL, updated_at = now()
+         WHERE workspace_organization_id = $1::uuid
+           AND default_pipeline_id = ANY($2::uuid[])`,
+        [ROOT_ORGANIZATION_ID, immutablePipelineIds],
+      )
+      await client.query(
+        `DELETE FROM pipeline_space_members
+         WHERE pipeline_id = ANY($1::uuid[])`,
+        [immutablePipelineIds],
+      )
+      await client.query(
+        `UPDATE pipeline_spaces
+         SET name = 'Archived demo identity evidence ' || right(id::text, 4),
+             is_default = false,
+             sync_enabled = false,
+             updated_at = now()
+         WHERE id = ANY($1::uuid[])`,
+        [immutablePipelineIds],
+      )
     }
     await client.query(
       `DELETE FROM app_documents WHERE workspace_organization_id = $1::uuid`,
@@ -126,7 +145,18 @@ async function main() {
       [ROOT_ORGANIZATION_ID],
     )
     await client.query(
-      `DELETE FROM pipeline_spaces WHERE workspace_organization_id = $1::uuid`,
+      `DELETE FROM pipeline_spaces pipeline
+       WHERE pipeline.workspace_organization_id = $1::uuid
+         AND NOT EXISTS (
+           SELECT 1
+           FROM crm_contact_source_aliases alias
+           WHERE alias.pipeline_id = pipeline.id
+         )
+         AND NOT EXISTS (
+           SELECT 1
+           FROM crm_contact_merges merge_evidence
+           WHERE merge_evidence.pipeline_id = pipeline.id
+         )`,
       [ROOT_ORGANIZATION_ID],
     )
     await client.query(
@@ -1074,6 +1104,7 @@ async function main() {
       interactions: dataset.interactions.length,
       invoices: dataset.invoices.length,
       products: dataset.products.length,
+      quarantinedPipelines: immutablePipelineIds.length,
     }))
   } catch (error) {
     await client.query('ROLLBACK').catch(() => undefined)
