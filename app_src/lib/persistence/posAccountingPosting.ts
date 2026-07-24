@@ -12,7 +12,10 @@ import {
   buildPosAccountingParityReport,
   readPosAccountingParityReportInPostgres,
 } from '@/lib/persistence/posAccountingParity'
-import { evaluateStoredPosAccountingReadiness } from '@/lib/persistence/posAccounting'
+import {
+  evaluateStoredPosAccountingReadiness,
+  POS_ACCOUNTING_POSTING_GATE_VERSION,
+} from '@/lib/persistence/posAccounting'
 import { acquireTransactionAdvisoryLock, withTransaction } from '@/lib/persistence/postgres'
 import { configuredQuickBooksWritePolicy } from '@/lib/quickBooksWritePolicy'
 
@@ -234,6 +237,13 @@ function assertCanonicalDraftReadiness(draft: Pick<DraftRow, 'source_summary'>) 
   const sourceSummary = record(draft.source_summary)
   const canonical = record(sourceSummary.canonical)
   const storedReadiness = record(canonical.readiness)
+  if (storedReadiness.postingGateVersion !== POS_ACCOUNTING_POSTING_GATE_VERSION) {
+    throw new PosAccountingPostingError(
+      'POS_ACCOUNTING_POSTING_REGENERATION_REQUIRED',
+      'Regenerate accounting before posting so this draft is checked against the current Toast closeout rules.',
+      409,
+    )
+  }
   const readiness = evaluateStoredPosAccountingReadiness(storedReadiness)
   if (storedReadiness.readyForReview !== true || !readiness.readyForReview) {
     const blocker = readiness.blockers[0]
@@ -523,6 +533,41 @@ async function insertChildRequest(
   return { id: row.id, fingerprint }
 }
 
+export function fingerprintPosAccountingPostingPayloads(
+  draftId: string,
+  payloads: {
+    salesReceipt: QuickBooksSalesReceiptDraft | null
+    journalEntry: QuickBooksJournalEntryDraft
+  },
+) {
+  return crypto.createHash('sha256').update(JSON.stringify({
+    draftId,
+    salesReceipt: payloads.salesReceipt
+      ? fingerprintQuickBooksWritePayload(payloads.salesReceipt)
+      : null,
+    journalEntry: fingerprintQuickBooksWritePayload(payloads.journalEntry),
+  })).digest('hex')
+}
+
+function assertPreparedBatchMatchesCurrentPayloads(
+  draft: Pick<DraftRow, 'id'>,
+  payloads: {
+    salesReceipt: QuickBooksSalesReceiptDraft | null
+    journalEntry: QuickBooksJournalEntryDraft
+  },
+  batch: Pick<PostingBatchRow, 'request_fingerprint'>,
+) {
+  const currentFingerprint = fingerprintPosAccountingPostingPayloads(draft.id, payloads)
+  if (currentFingerprint !== batch.request_fingerprint) {
+    throw new PosAccountingPostingError(
+      'POS_ACCOUNTING_POSTING_CONTENT_STALE',
+      'The prepared posting no longer matches the current accounting content. Regenerate accounting and review the new revision before posting.',
+      409,
+    )
+  }
+  return currentFingerprint
+}
+
 export async function preparePosAccountingPostingBatchInPostgres(input: {
   organizationId: string
   draftId: string
@@ -544,9 +589,18 @@ export async function preparePosAccountingPostingBatchInPostgres(input: {
     if (!draft || !draft.is_current) {
       throw new PosAccountingPostingError('POS_ACCOUNTING_POSTING_DRAFT_NOT_FOUND', 'The current accounting draft was not found', 404)
     }
+    // The canonical blocker set is authoritative even when a child batch was
+    // prepared earlier. Regeneration can discover a later Toast closeout hold;
+    // never replay the prior prepared payload around that new gate.
+    assertCanonicalDraftReadiness(draft)
     if (draft.posting_batch_id) {
       const existing = await readBatch(client, input.organizationId, draft.posting_batch_id)
-      if (existing) return batchFromRow(existing)
+      if (existing) {
+        if (existing.status === 'posted') return batchFromRow(existing)
+        const currentPayloads = await materializePostingPayloads(client, input.organizationId, draft)
+        assertPreparedBatchMatchesCurrentPayloads(draft, currentPayloads, existing)
+        return batchFromRow(existing)
+      }
     }
     if (draft.status !== 'needs_review' && draft.status !== 'failed') {
       throw new PosAccountingPostingError(
@@ -583,11 +637,7 @@ export async function preparePosAccountingPostingBatchInPostgres(input: {
       payload: payloads.journalEntry,
       actorEmail: input.actorEmail,
     })
-    const requestFingerprint = crypto.createHash('sha256').update(JSON.stringify({
-      draftId,
-      salesReceipt: receipt?.fingerprint || null,
-      journalEntry: journal.fingerprint,
-    })).digest('hex')
+    const requestFingerprint = fingerprintPosAccountingPostingPayloads(draftId, payloads)
     const batchResult = await client.query<{ id: string }>(
       `INSERT INTO pos_accounting_posting_batches (
          organization_id, draft_id, restaurant_guid, business_date,
@@ -654,8 +704,10 @@ export async function approvePosAccountingPostingBatchInPostgres(input: {
     if (!['pending_approval', 'failed', 'partial_failed'].includes(batch.status)) {
       throw new PosAccountingPostingError('POS_ACCOUNTING_POSTING_STATE_CONFLICT', 'This posting batch cannot be approved in its current state', 409)
     }
-    const draftResult = await client.query<Pick<DraftRow, 'source_summary'> & { is_current: boolean }>(
-      `SELECT source_summary, is_current
+    const draftResult = await client.query<DraftRow>(
+      `SELECT id::text, restaurant_guid::text, business_date::text, status,
+         reconciliation_status, source_summary, proposed_lines,
+         posting_batch_id::text, is_current
        FROM toast_accounting_export_drafts
        WHERE organization_id = $1::uuid AND id = $2::uuid
        FOR UPDATE`,
@@ -670,6 +722,8 @@ export async function approvePosAccountingPostingBatchInPostgres(input: {
       )
     }
     assertCanonicalDraftReadiness(currentDraft)
+    const currentPayloads = await materializePostingPayloads(client, input.organizationId, currentDraft)
+    assertPreparedBatchMatchesCurrentPayloads(currentDraft, currentPayloads, batch)
     if (input.confirmFingerprint !== batch.request_fingerprint) {
       throw new PosAccountingPostingError('POS_ACCOUNTING_POSTING_APPROVAL_STALE', 'Review the current two-document posting before approving it', 409)
     }

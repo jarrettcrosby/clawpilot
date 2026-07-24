@@ -46,6 +46,8 @@ export type ToastProjectedPayment = {
   tipRefundAmount: number
   processingFee: number | null
   refunded: boolean
+  voided: boolean
+  deleted: boolean
 }
 
 export type ToastProjectedNamedAmount = {
@@ -271,6 +273,12 @@ function payment(value: unknown): ToastProjectedPayment {
   const status = nestedText(item.paymentStatus ?? item.status, 'name', 'value')
   const refundAmount = Math.abs(money(refund.refundAmount ?? item.refundAmount))
   const tipRefundAmount = Math.abs(money(refund.tipRefundAmount ?? item.tipRefundAmount))
+  const deleted = item.deleted === true
+  const voided = item.voided === true
+    || deleted
+    || item.cancelled === true
+    || item.canceled === true
+    || /^(voided|cancelled|canceled)$/i.test(status || '')
   return {
     type: nestedText(paymentMethod.name ?? item.type, 'name', 'value') || 'OTHER',
     cardBrand: nestedText(item.cardType, 'name', 'value'),
@@ -286,7 +294,30 @@ function payment(value: unknown): ToastProjectedPayment {
       : Math.abs(money(item.originalProcessingFee)),
     refunded: item.refunded === true || refundAmount > 0 || tipRefundAmount > 0
       || /refund/i.test(status || '') || /refund/i.test(String(item.refundStatus || '')),
+    voided,
+    deleted,
   }
+}
+
+export function isToastProjectedPaymentActive(value: unknown) {
+  const entry = record(value)
+  const status = nestedText(entry.status ?? entry.paymentStatus, 'name', 'value')
+  return entry.voided !== true
+    && entry.deleted !== true
+    && entry.cancelled !== true
+    && entry.canceled !== true
+    && !/^(voided|cancelled|canceled)$/i.test(status || '')
+}
+
+export function isToastProjectedOrderAccountingActive(value: unknown) {
+  const order = record(value)
+  if (order.voided === true || order.deleted === true) return false
+  const checks = list(record(order.details).checks)
+  return checks.length === 0
+    || checks.some((value) => {
+      const entry = record(value)
+      return entry.voided !== true && entry.deleted !== true
+    })
 }
 
 function check(value: unknown): ToastProjectedCheck {
@@ -333,7 +364,9 @@ function netPaymentTip(entry: ToastProjectedPayment) {
 export function summarizeToastProjectedChecks(checks: ToastProjectedCheck[]) {
   const activeChecks = checks.filter((entry) => !entry.voided && !entry.deleted)
   const selections = activeChecks.flatMap((entry) => entry.selections).filter((entry) => !entry.voided)
-  const payments = activeChecks.flatMap((entry) => entry.payments)
+  const payments = activeChecks
+    .flatMap((entry) => entry.payments)
+    .filter(isToastProjectedPaymentActive)
   const salesRefunds = sum(payments.map((entry) => money(entry.refundAmount)))
   const tipRefunds = sum(payments.map((entry) => money(entry.tipRefundAmount)))
   const netSales = money(sum(activeChecks.map((entry) => money(entry.amount))) - salesRefunds)
@@ -420,7 +453,7 @@ export function projectToastOrders(values: unknown[]) {
     byId.set(order.orderGuid, order)
   })
   const orders = [...byId.values()]
-  const active = orders.filter((order) => !order.deleted && !order.voided)
+  const active = orders.filter(isToastProjectedOrderAccountingActive)
   const voided = orders.filter((order) => !order.deleted && order.voided)
   const totals: ToastProjectedTotals = {
     orderCount: active.length,
