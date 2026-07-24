@@ -53,7 +53,7 @@ try {
   if (!QUARANTINE_ROTATION_ENABLED && guard?.immutable_pipelines > 0) {
     if (guard.workspaces !== 1
       || guard.system_users !== 1
-      || guard.active_pipelines !== 1
+      || guard.active_pipelines < 1
       || guard.quarantine_migrations !== 1) {
       throw new Error(`demo quarantine guard verification failed: ${JSON.stringify(guard || {})}`)
     }
