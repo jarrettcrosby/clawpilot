@@ -15,7 +15,7 @@ app_visible: false
 
 Provide native distributed order management, warehouse execution, carrier shipping, and 3PL billing inside ClawPilot. The module serves 3PL operators, retailers, distributors, manufacturers, and fulfillment operators without creating a second application or duplicating CRM, product, identity, audit, task, document, notification, or accounting masters.
 
-This document remains the **target contract** for the full module. The current development slice includes migrations `0081` through `0092`; a tenant-scoped order workbench; explicit idempotent warehouse-release, bulk all-ready pick-confirmation, and pack-verification commands for eligible non-archived orders; a durable exception queue; scoped activation controls; canonical CRM catalog projection; provider-customer resolution; team-managed product/package imports; organization-scoped direct carrier credential administration; UPS and FedEx sandbox rating against one server-defined synthetic fixture; append-only redacted rate evidence; carrier-rate delegation and billing foundations; selected-batch GL Coding; and organization- and warehouse-scoped printer configuration. The deterministic 20-step mock flow remains an internal automated-test harness only. Hosted mock generation is disabled and historical mock artifacts are archived. These features prove PostgreSQL authority and application boundaries; they do not establish a production commerce, label, pickup, print-agent, settlement-export, optimizer, or accounting provider.
+This document remains the **target contract** for the full module. The current development slice includes operations migrations `0081` through `0094`, `0097`, and `0098`, plus working-tree migration `0099`; a tenant-scoped order workbench; explicit idempotent warehouse-release, bulk all-ready pick-confirmation, pack-verification, sandbox-label-create, and sandbox-label-void commands for eligible non-archived orders; a durable exception queue; scoped activation controls; canonical CRM catalog projection; provider-customer resolution; team-managed product/package imports; organization-scoped direct carrier credential administration; UPS and FedEx sandbox rating and label execution against one server-defined synthetic fixture; append-only redacted provider evidence; carrier-rate delegation; direct multi-account carrier CSV import; selected-batch GL Coding; separate financial review; billed-actual Triangle/Square/Circle settlement evidence; append-only settlement status transitions; capability-aware printer configuration; enrolled local print-agent delivery with controlled reprints and same-warehouse fallback; and a working-tree PDF packing-slip renderer, immutable artifact-payload store, authenticated artifact stream, tracking-observation schema, and commerce-fulfillment export state model. The deterministic 20-step mock flow remains an internal automated-test harness only. Hosted mock generation is disabled and historical mock artifacts are archived. These features prove PostgreSQL authority and application boundaries; they do not establish a production commerce adapter, production carrier mutation, production shipment-confirmation command, tracking worker, commerce-export dispatcher, pickup scheduling, accounting export, invoice/AR workflow, payment adapter, or optimizer.
 
 ## Current Development Slice
 
@@ -33,16 +33,21 @@ The implemented slice provides:
 - archived legacy hosted mock proof records with reservations released and immutable ledger, domain-event, audit, billable, and Global ID evidence retained;
 - organization-scoped `disabled`, `shadow`, `read_only`, `active`, and `frozen` activation state with revision, reason, actor, and audit history;
 - organization-, provider-, and environment-scoped UPS REST, FedEx REST, and USPS REST credential administration with candidate OAuth verification, AES-256-GCM persistence, masked metadata, rotation versions, audited activation and disconnect, and no cross-tenant or production/sandbox fallback;
-- manager-triggered UPS CIE and FedEx Sandbox rating for one fixed John Doe route and `Test Product` parcel, with normalized safe results and append-only redacted `grq` evidence; production rating and every transactional carrier action remain disabled;
-- explicit Triangle, optional Square, and Circle rate-path evidence; address-bound multi-account carrier identities; pro forma quote economics; selected-batch GL Coding; versioned routing rules; independent shipment matches and shipper assignments; manual orphan assignment; reconciliation and append-only settlement foundations;
-- organization- and warehouse-scoped thermal and office printer profiles with connection mode, supported formats, supported media, supported document types, document defaults, priority, status, and same-warehouse fallback selection; browser delivery remains best effort and reliable transport still requires an enrolled local agent;
+- manager-triggered UPS CIE and FedEx Sandbox rating for one fixed John Doe route and `Test Product` parcel, with normalized safe results and append-only redacted `grq` evidence; production rating remains disabled;
+- manager-triggered UPS CIE and FedEx Sandbox label creation and immediate void for the same fixed synthetic shipment, with immutable `gla` prepare/call/finalize attempts, one active label per package, exact carrier-account reuse on void, redacted provider evidence, domain and audit events, and retry blocking whenever the provider result is unknown;
+- post-commit routing of a successfully persisted sandbox shipping label into one idempotent durable print job; replay of the original label command can recover a missing print job without calling the carrier again, while print retry and reprint remain separate from label purchase;
+- a strict sandbox boundary: rating and label create/void can never create an `operations_shipments` row, mark a package or order shipped, consume or release inventory, append a tracking observation, create a commerce-fulfillment export, or render a packing slip;
+- working-tree shipment-completion evidence contracts in `0099`: immutable packing-slip payloads, append-only `gto` tracking observations, and durable `gfe` commerce-fulfillment export intents with explicit `queued`, `processing`, `succeeded`, `failed`, and `unsupported` states;
+- a deterministic letter-size PDF packing-slip renderer with content hash, byte length, safe filename, template version, and immutable render snapshot; organization-scoped authenticated PDF delivery; and local print-agent claims that preserve label text as `utf8` while encoding binary artifacts as `base64`;
+- explicit Triangle, optional Square, and Circle rate-path evidence; address-bound multi-account carrier identities; pro forma quote economics; direct checksum-bound carrier CSV import; selected-batch GL Coding; versioned routing rules; independent shipment matches and shipper assignments; manual orphan assignment; separate run approval; billed-actual reimbursement and payable entries; disputes; references; and append-only settlement transitions;
+- organization- and warehouse-scoped thermal and nonthermal printer profiles with connection mode, supported formats, supported media, supported document types, document defaults, priority, status, same-warehouse fallback selection, enrolled local print agents, fenced claims, bounded retries, and reasoned reprints; browser delivery remains best effort;
 - durable command receipts that bind idempotency key, request hash, actor, correlation, status, exact result payload, attempts, and safe failure evidence;
-- responsive Orders and Exceptions views with permanent `gor` and `gex` identities;
+- responsive Orders and Exceptions views with permanent `gor` and `gex` identities, plus horizontally scrollable Orders, Exceptions, Billing & GL, and Printing subpanel navigation with touch panning and accessible edge scroll controls on narrow screens;
 - audited exception transitions for acknowledge, resolve, dismiss, and reopen, with tenant isolation and retained resolution history;
 - an in-module guide that directs carrier sandbox testing to **Settings > Integrations > Shipping** and identifies deterministic mocks as automated-test-only;
 - disposable PostgreSQL acceptance coverage that applies the full migration chain and validates atomic writes, replay, rollback, append-only evidence, money totals, and cross-workspace isolation.
 
-Production activation remains out of scope until later delivery gates verify provider credentials, webhook receipts, provider attempts, reconciliation, complete operational health, recovery commands, and an explicitly approved integration and warehouse cohort. Sandbox rating evidence does not authorize production rating, label creation, pickup scheduling, or shipment confirmation.
+Production activation remains out of scope until later delivery gates verify provider credentials, webhook receipts, provider attempts, reconciliation, complete operational health, recovery commands, and an explicitly approved integration and warehouse cohort. Sandbox rating and label evidence do not authorize production rating, label creation, pickup scheduling, shipment confirmation, or inventory consumption. The renderer and durable payload boundary now exist in the working tree, but automatic packing-slip creation is not yet wired to a hosted production shipment-confirmation command. `app_documents` is not used as a substitute for logistics artifacts.
 
 ### Product And Package Catalog Workflow
 
@@ -108,6 +113,7 @@ The route handler authenticates and validates transport. The application service
 ## Identity, Units, And Time
 
 - Every aggregate and externally referenced child receives one immutable Global ID from the shared registry. `0081` proposes `gor`, `gol`, `gwh`, `gwl`, `gip`, `giv`, `gld`, `grs`, `gct`, `gcv`, `gpd`, `gfp`, `gfa`, `gcp`, `grt`, `gwv`, `gpk`, `gpa`, `glb`, `gsh`, `gpr`, `gpj`, `gbe`, `gia`, `gpm`, `gex`, `gev`, and `grl`.
+- Later print and shipment-completion migrations add permanent identities for print agents/artifacts and `gto` tracking observations plus `gfe` commerce-fulfillment exports. A tracking number or provider fulfillment ID remains an alias, never the aggregate identity.
 - Quote, return, inventory unit/LPN, lot, serial, receipt, manifest, and any separate fulfillment-order identities must be allocated before those aggregates ship.
 - Cross-module payloads carry Global IDs. Database relationships also carry tenant-scoped UUID foreign keys for integrity.
 - Money uses integer minor units plus ISO 4217 currency. Percentage and quantity calculations use PostgreSQL `numeric`; binary floating point is forbidden for authoritative results.
@@ -283,6 +289,10 @@ Wave state is `planned -> released -> in_progress -> completed`, with `cancelled
 ## Shipment State Machine
 
 Package, label, print, and shipment states remain distinct. A print confirms document delivery to an enrolled agent; it does not confirm the parcel shipped.
+
+The current sandbox label commands stop at label and print evidence. A sandbox `label.created` result is never a dock-handoff fact and cannot call shipment confirmation or inventory consumption. The automated deterministic mock proof retains its older test-only behavior: inside its isolated mock transaction it creates a mock shipment, consumes its mock reservation, and records a mock commerce result. That path is unavailable from the hosted workbench and is not production acceptance.
+
+Migration `0099` defines the durable evidence bundle for a future hosted production confirmation. The confirmation transaction must create the shipment and inventory-consumption facts together with immutable packing-slip metadata and bytes, the first append-only `confirmed` tracking observation, and a `queued` commerce-fulfillment export intent. Carrier or commerce network I/O occurs only after commit. The current working tree does not yet expose that general production confirmation command or its tracking/export workers.
 
 ```mermaid
 stateDiagram-v2
@@ -505,7 +515,7 @@ Fallback must not use current time, random values, unordered map iteration, prov
 
 ### Commerce Provider
 
-Each adapter declares versioned capabilities: authentication, webhook verification/registration, product and inventory sync, order/cancellation/refund import, checkout rates, fulfillment/tracking export, returns, cursors, and reconciliation. The adapter translates a verified provider message into a canonical command and translates an authorized outbox intent into a provider request. Initial production targets are Shopify, BigCommerce, and Etsy; mocks and sandboxes do not count as production verification.
+Each adapter declares versioned capabilities: authentication, webhook verification/registration, product and inventory sync, order/cancellation/refund import, checkout rates, fulfillment/tracking export, returns, cursors, and reconciliation. The adapter translates a verified provider message into a canonical command and translates an authorized outbox intent into a provider request. A shipment commit creates an immutable export identity and payload in `queued`; a worker may advance it through `processing` to `succeeded`, `failed`, or `unsupported` without rewriting its shipment, provider, external order, payload, idempotency key, or request time. `failed` may return to the retry lifecycle through an approved command, while `succeeded` and `unsupported` are immutable terminal outcomes. Initial production targets are Shopify, BigCommerce, and Etsy; mocks and sandboxes do not count as production verification.
 
 ### Carrier Provider
 
@@ -513,7 +523,7 @@ Each adapter declares accounts, services, negotiated/published rates, transit es
 
 ### Printer Gateway
 
-The gateway accepts a durable document reference and route, not a carrier purchase request. It exposes printer capability/health, leased job claim, print acknowledgement, bounded retry, and approved fallback. Reprints are separate auditable commands with permission and reason.
+The gateway accepts a durable document reference and route, not a carrier purchase request. It exposes printer capability/health, leased job claim, print acknowledgement, bounded retry, and approved fallback. Shipping-label claims retain their original UTF-8 payload and declare `encoding=utf8`; immutable binary packing-slip payloads are base64 encoded and declare `encoding=base64`. Reprints are separate auditable commands with permission and reason.
 
 ### Accounting Export
 
@@ -524,6 +534,7 @@ The adapter reads approved immutable billable facts and credits, produces a vers
 - Browser and partner APIs are versioned under `/api/operations/v1` and use Global IDs in resource paths and payloads.
 - Commands require `Idempotency-Key`, reject unsupported fields, cap request size, return stable machine error codes, and use `Cache-Control: no-store`.
 - Queries return only the active workspace and authorized customer/facility scope. Cost and margin fields require separate permissions.
+- The current internal `GET /api/operations/artifacts/{gpf}` route requires an authenticated user with Operations view access, resolves only the active organization, verifies PDF length and SHA-256, and returns immutable raw PDF bytes with a safe attachment filename. It does not expose a cross-tenant object-store URL.
 - Public commerce webhooks use provider-specific signature authentication and never share browser-session routes.
 - Checkout quote requests use a separate bounded contract with expiration, caller identity, rate limits, and an immutable quote snapshot.
 - Bulk exports are asynchronous jobs; they do not hold request transactions open.
@@ -537,11 +548,12 @@ The adapter reads approved immutable billable facts and credits, produces a vers
 - Metrics cover import latency/deduplication, reservation conflicts, ledger drift, promise attainment, optimizer duration/fallback, split rate, pick/pack performance, carrier/label outcomes, printer failures, shipment exceptions, unbilled facts, and quoted-to-actual margin variance.
 - A scheduled ledger reconciliation compares every materialized bucket to immutable ledger deltas. Any nonzero drift is critical, freezes affected inventory commands, and follows the [runbook](../operations/distributed-operations-runbook.md).
 - Commerce, carrier, tracking, print, and accounting reconciliation detect missed or ambiguous external outcomes without blindly repeating side effects.
+- Shipment-completion reconciliation compares each confirmed shipment with its inventory-consumption evidence, packing-slip artifact and payload, first `confirmed` tracking observation, and commerce export state. Missing `0099` evidence is expected for the legacy mock path and for sandbox labels because neither uses the production completion bundle.
 - Logs use correlation IDs, Global IDs, safe error codes, adapter version, and duration. They exclude credentials, label payloads, full addresses, and unrestricted provider bodies.
 
 ## Foundation Limitations
 
-Before this contract can become active, implementation must close the blockers in the [integration and gap map](../maps/distributed-operations-integration-gap-map.md), especially typed permissions, atomic reservation commands, webhook/provider attempt evidence, quote and optimizer snapshots, split-plan representation, advanced inventory dimensions, billable lifecycle separation, and shared-service adapters.
+Before this contract can become active, implementation must close the blockers in the [integration and gap map](../maps/distributed-operations-integration-gap-map.md), especially typed permissions, atomic reservation and shipment-confirmation commands, webhook/provider attempt evidence, tracking ingestion and reconciliation, commerce-export dispatch, migration/queue health, quote and optimizer snapshots, split-plan representation, advanced inventory dimensions, billable lifecycle separation, and shared-service adapters.
 
 ## Connected Notes
 

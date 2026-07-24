@@ -29,6 +29,10 @@ type PrinterRow = {
   default_document_types: OperationsPrinterProfile['defaultDocumentTypes']
   fallback_printer_global_id: string | null
   fallback_printer_name: string | null
+  local_print_agent_global_id: string | null
+  local_print_agent_name: string | null
+  local_print_agent_status: OperationsPrinterProfile['localPrintAgentStatus']
+  local_print_agent_last_seen_at: string | null
   priority: number
   status: OperationsPrinterProfile['status']
   row_version: number
@@ -73,6 +77,10 @@ function profile(row: PrinterRow): OperationsPrinterProfile {
     defaultDocumentTypes: row.default_document_types,
     fallbackPrinterGlobalId: row.fallback_printer_global_id,
     fallbackPrinterName: row.fallback_printer_name,
+    localPrintAgentGlobalId: row.local_print_agent_global_id,
+    localPrintAgentName: row.local_print_agent_name,
+    localPrintAgentStatus: row.local_print_agent_status,
+    localPrintAgentLastSeenAt: row.local_print_agent_last_seen_at,
     priority: row.priority,
     status: row.status,
     rowVersion: row.row_version,
@@ -99,6 +107,10 @@ const PRINTER_SELECT = `
     printer.default_document_types,
     fallback.global_id AS fallback_printer_global_id,
     fallback.name AS fallback_printer_name,
+    print_agent.global_id AS local_print_agent_global_id,
+    print_agent.name AS local_print_agent_name,
+    print_agent.status AS local_print_agent_status,
+    print_agent.last_seen_at::text AS local_print_agent_last_seen_at,
     printer.priority,
     printer.status,
     printer.row_version,
@@ -111,9 +123,16 @@ const PRINTER_SELECT = `
   LEFT JOIN operations_printers fallback
     ON fallback.organization_id = printer.organization_id
    AND fallback.id = printer.fallback_printer_id
+  LEFT JOIN operations_print_agents print_agent
+    ON print_agent.organization_id = printer.organization_id
+   AND print_agent.warehouse_id = printer.warehouse_id
+   AND print_agent.id = printer.local_print_agent_id
 `
 
-async function listProfiles(organizationId: string, client?: PoolClient) {
+export async function listOperationsPrinterProfilesInPostgres(
+  organizationId: string,
+  client?: PoolClient,
+) {
   const sql = `${PRINTER_SELECT}
     WHERE printer.organization_id = $1::uuid
       AND warehouse.status = 'active'
@@ -151,6 +170,7 @@ export async function readOperationsPrinterWorkspaceFromPostgres(input: {
   organizationId: string
   canView: boolean
   canManage: boolean
+  canExecute: boolean
 }): Promise<OperationsPrinterWorkspace> {
   if (!input.canView) {
     throw new OperationsRequestError(
@@ -174,13 +194,14 @@ export async function readOperationsPrinterWorkspaceFromPostgres(input: {
     capabilities: {
       canView: input.canView,
       canManage: input.canManage,
+      canExecute: input.canExecute,
     },
     warehouses: warehousesResult.rows.map((row) => ({
       id: row.id,
       globalId: row.global_id,
       name: row.name,
     })),
-    printers: await listProfiles(organizationId),
+    printers: await listOperationsPrinterProfilesInPostgres(organizationId),
     generatedAt: new Date().toISOString(),
   }
 }
@@ -191,14 +212,19 @@ async function fallbackPrinterId(input: {
   warehouseId: string
   fallbackPrinterGlobalId: string | null
   currentPrinterId: string | null
+  printer: OperationsPrinterInput
 }) {
   if (!input.fallbackPrinterGlobalId) return null
   const result = await input.client.query<{
     id: string
     warehouse_id: string
     status: string
+    supported_formats: string[]
+    supported_media: string[]
+    supported_document_types: string[]
   }>(
-    `SELECT id::text, warehouse_id::text, status
+    `SELECT id::text, warehouse_id::text, status,
+       supported_formats, supported_media, supported_document_types
      FROM operations_printers
      WHERE organization_id = $1::uuid
        AND global_id = $2
@@ -224,7 +250,65 @@ async function fallbackPrinterId(input: {
       'A disabled printer cannot be used as a fallback',
     )
   }
+  if (
+    input.printer.supportedFormats.some((value) => !fallback.supported_formats.includes(value))
+    || input.printer.supportedMedia.some((value) => !fallback.supported_media.includes(value))
+    || input.printer.supportedDocumentTypes.some((value) => (
+      !fallback.supported_document_types.includes(value)
+    ))
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PRINTER_FALLBACK_INCOMPATIBLE',
+      'Fallback printer must support every configured document, media, and format',
+    )
+  }
   return fallback.id
+}
+
+async function localPrintAgentId(input: {
+  client: PoolClient
+  organizationId: string
+  warehouseId: string
+  localPrintAgentGlobalId: string | null
+  connectionMode: OperationsPrinterInput['connectionMode']
+  status: OperationsPrinterInput['status']
+}) {
+  if (!input.localPrintAgentGlobalId) {
+    if (input.connectionMode === 'local_agent' && input.status === 'online') {
+      throw new OperationsRequestError(
+        'OPERATIONS_PRINTER_AGENT_REQUIRED',
+        'An online local-agent printer must be assigned to an active print agent',
+      )
+    }
+    return null
+  }
+  if (input.connectionMode !== 'local_agent') {
+    throw new OperationsRequestError(
+      'OPERATIONS_PRINTER_AGENT_INVALID',
+      'Only local-agent printer profiles can be assigned to a print agent',
+    )
+  }
+  const result = await input.client.query<{ id: string }>(
+    `SELECT id::text
+     FROM operations_print_agents
+     WHERE organization_id = $1::uuid
+       AND warehouse_id = $2::uuid
+       AND global_id = $3
+       AND status = 'active'
+     FOR SHARE`,
+    [
+      input.organizationId,
+      input.warehouseId,
+      input.localPrintAgentGlobalId,
+    ],
+  )
+  if (!result.rows[0]) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PRINTER_AGENT_INVALID',
+      'Print agent must be active and enrolled for the same warehouse',
+    )
+  }
+  return result.rows[0].id
 }
 
 async function removeConflictingDefaults(input: {
@@ -337,6 +421,15 @@ export async function saveOperationsPrinterInPostgres(input: {
         warehouseId: input.printer.warehouseId,
         fallbackPrinterGlobalId: input.printer.fallbackPrinterGlobalId,
         currentPrinterId: printerId,
+        printer: input.printer,
+      })
+      const printAgentId = await localPrintAgentId({
+        client,
+        organizationId,
+        warehouseId: input.printer.warehouseId,
+        localPrintAgentGlobalId: input.printer.localPrintAgentGlobalId,
+        connectionMode: input.printer.connectionMode,
+        status: input.printer.status,
       })
       await removeConflictingDefaults({
         client,
@@ -361,8 +454,9 @@ export async function saveOperationsPrinterInPostgres(input: {
                supported_document_types = $10::text[],
                default_document_types = $11::text[],
                fallback_printer_id = $12::uuid,
-               priority = $13,
-               status = $14,
+               local_print_agent_id = $13::uuid,
+               priority = $14,
+               status = $15,
                row_version = row_version + 1,
                updated_at = now()
            WHERE organization_id = $1::uuid
@@ -380,6 +474,7 @@ export async function saveOperationsPrinterInPostgres(input: {
             input.printer.supportedDocumentTypes,
             input.printer.defaultDocumentTypes,
             fallbackId,
+            printAgentId,
             input.printer.priority,
             input.printer.status,
           ],
@@ -400,13 +495,14 @@ export async function saveOperationsPrinterInPostgres(input: {
              supported_document_types,
              default_document_types,
              fallback_printer_id,
+             local_print_agent_id,
              priority,
              status,
              created_by
            ) VALUES (
              $1::uuid, $2::uuid, $3, $4, $5, $6, $7,
              'ZPL' = ANY($8::text[]), $8::text[], $9::text[], $10::text[],
-             $11::text[], $12::uuid, $13, $14, $15
+             $11::text[], $12::uuid, $13::uuid, $14, $15, $16
            )
            RETURNING id::text, global_id`,
           [
@@ -422,6 +518,7 @@ export async function saveOperationsPrinterInPostgres(input: {
             input.printer.supportedDocumentTypes,
             input.printer.defaultDocumentTypes,
             fallbackId,
+            printAgentId,
             input.printer.priority,
             input.printer.status,
             actorEmail,
@@ -453,6 +550,7 @@ export async function saveOperationsPrinterInPostgres(input: {
           supportedDocumentTypes: saved.supportedDocumentTypes,
           defaultDocumentTypes: saved.defaultDocumentTypes,
           fallbackPrinterGlobalId: saved.fallbackPrinterGlobalId,
+          localPrintAgentGlobalId: saved.localPrintAgentGlobalId,
           status: saved.status,
         },
       }, client)

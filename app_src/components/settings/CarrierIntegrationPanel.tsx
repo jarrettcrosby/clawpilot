@@ -252,6 +252,17 @@ export default function CarrierIntegrationPanel() {
     ? explicitCarrierAccountGlobalId
     : activeCarrierAccounts.length === 1 ? activeCarrierAccounts[0].globalId : ''
   const busy = Boolean(pendingAction)
+  const sandboxRateBlocker = !account?.configured
+    ? 'Save and verify provider credentials first.'
+    : account.verificationStatus !== 'verified'
+      ? 'Verify the provider credentials first.'
+      : account.status !== 'active'
+        ? 'Enable this sandbox integration.'
+        : !activeCarrierAccounts.length
+          ? 'Add and enable a sandbox billing account with its registered address.'
+          : !selectedCarrierAccountGlobalId
+            ? 'Select the sandbox billing account to use for the test.'
+            : ''
 
   useEffect(() => {
     let active = true
@@ -538,6 +549,17 @@ export default function CarrierIntegrationPanel() {
         </Stack>
       ) : null}
 
+      {environment === 'sandbox' && provider !== 'usps_rest' && sandboxRateBlocker ? (
+        <Alert severity="info" sx={{ mb: 2, borderRadius: '8px' }}>
+          <Typography variant="body2" fontWeight={700}>Sandbox rate test setup</Typography>
+          <Typography variant="body2">{sandboxRateBlocker}</Typography>
+          <Typography variant="caption" color="text.secondary">
+            Provider credentials and carrier billing accounts are separate. The account number and its
+            registered address determine sender, recipient, or third-party billing for the test request.
+          </Typography>
+        </Alert>
+      ) : null}
+
       <Typography variant="subtitle2" fontWeight={700} sx={{ mb: 1 }}>Provider credentials</Typography>
       <Box component="form" onSubmit={saveCredential}>
         <TextField
@@ -626,17 +648,14 @@ export default function CarrierIntegrationPanel() {
             </Button>
           ) : null}
           {environment === 'sandbox' && provider !== 'usps_rest' ? (
-            <Tooltip title="Rates the fixed synthetic test parcel. No shipment, label, pickup, or charge is created.">
+            <Tooltip title={sandboxRateBlocker || 'Rates the fixed synthetic test parcel. No shipment, label, pickup, or charge is created.'}>
               <span>
                 <Button
                   variant="outlined"
                   startIcon={pendingAction === 'rate' ? <CircularProgress size={16} color="inherit" /> : <PriceCheckRounded />}
                   disabled={
                     busy
-                    || !account?.configured
-                    || account.verificationStatus !== 'verified'
-                    || account.status !== 'active'
-                    || !selectedCarrierAccountGlobalId
+                    || Boolean(sandboxRateBlocker)
                   }
                   onClick={() => {
                     void patch(

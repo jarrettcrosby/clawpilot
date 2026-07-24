@@ -526,7 +526,7 @@ for (const viewport of MOBILE_VIEWPORTS) {
       await drawer.getByPlaceholder('Add a description...').fill('Updated from the CRM card')
       await drawer.getByRole('button', { name: 'Save', exact: true }).click()
       await expect.poll(() => patchBody?.crmDescription).toBe('Updated from the CRM card')
-      expect(patchBody?.crmDescriptionHash).toBe(initialHash)
+      await expect.poll(() => patchBody?.crmDescriptionHash).toBe(initialHash)
       await closeDrawer.click()
       await expectNoDocumentOverflow(page)
     })

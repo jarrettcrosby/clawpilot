@@ -46,12 +46,14 @@ This repository is the canonical source for ClawPilot product, engineering, and 
 
 ## Distributed Operations Design
 
-The following set defines the accepted authority boundary and draft implementation/operating contract for DOM, WMS, shipping, and 3PL billing. It is pre-activation design, not shipped product behavior.
+The following set defines the accepted authority boundary and implementation/operating contract for DOM, WMS, shipping, and 3PL billing. Bounded development workflows are implemented, but production provider mutations and accounting delivery remain pre-activation.
 
 - [Distributed operations integration and gap map](maps/distributed-operations-integration-gap-map.md)
 - [Distributed operations domain and architecture contract](modules/distributed-operations.md)
 - [Distributed operations delivery, migration, and test plan](architecture/distributed-operations-delivery-plan.md)
 - [Distributed operations runbook](operations/distributed-operations-runbook.md)
+- [Printing, carrier billing, and GL Coding](operations/printing-carrier-billing-and-gl-coding.md)
+- [Local print agent](operations/local-print-agent.md)
 - [Native distributed operations authority and adapter boundaries](decisions/0006-native-distributed-operations-authority.md)
 
 ## Active Operating Contracts
@@ -60,6 +62,8 @@ The following set defines the accepted authority boundary and draft implementati
 - [Demo account](operations/public-demo-environment.md)
 - [Agent security and integration isolation](operations/agent-security-and-isolation.md)
 - [Knowledge vault organization](operations/knowledge-vault-organization.md)
+- [Printing, carrier billing, and GL Coding](operations/printing-carrier-billing-and-gl-coding.md)
+- [Local print agent](operations/local-print-agent.md)
 - [Repository patch runner](operations/repository-patch-runner.md)
 - [Release documentation contract](releases/README.md)
 - [ClawPilot identity](brand/clawpilot-identity.md)

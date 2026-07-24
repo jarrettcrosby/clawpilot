@@ -587,12 +587,12 @@ function payloadHash(value) {
 async function insertOrder(pool, input) {
   await pool.query(
     `INSERT INTO toast_pos_orders (
-       organization_id, restaurant_guid, order_guid, business_date,
+       organization_id, restaurant_guid, order_guid, business_date, fulfillment_business_date,
        guest_count, check_count, item_count, gross_sales, net_sales, discounts,
        tax, service_charges, tips, refunds, tendered, total,
        cash_tender, card_tender, other_tender, voided, deleted, details, payload_hash
      ) VALUES (
-       $1::uuid, $2::uuid, $3, $4::date,
+       $1::uuid, $2::uuid, $3, $4::date, $4::date,
        $5, $6, $7, $8, $9, $10,
        $11, $12, $13, $14, $15, $16,
        $17, $18, $19, $20, $21, $22::jsonb, $23
@@ -655,6 +655,28 @@ async function seedDisposableDatabase(pool) {
        ($1::uuid, $2::uuid, 'Acceptance Restaurant', 'Acceptance Location', 'America/New_York', true, false, true, true, true),
        ($3::uuid, $4::uuid, 'Private Other Restaurant', 'Private Other Location', 'America/Chicago', true, false, true, true, true)`,
     [ORGANIZATION_ID, RESTAURANT_GUID, OTHER_ORGANIZATION_ID, OTHER_RESTAURANT_GUID],
+  )
+  await pool.query(
+    `INSERT INTO organization_toast_credentials (
+       organization_id, access_type, api_base_url, client_id,
+       client_secret_ciphertext, client_secret_iv, client_secret_tag,
+       client_secret_last_four, sync_enabled, verified_at
+     ) VALUES (
+       $1::uuid, 'standard', 'https://ws-api.toasttab.com', 'acceptance-standard-client',
+       decode('01', 'hex'), decode(repeat('00', 12), 'hex'), decode(repeat('00', 16), 'hex'),
+       'test', true, now()
+     )`,
+    [ORGANIZATION_ID],
+  )
+  await pool.query(
+    `INSERT INTO toast_sync_outbox (
+       organization_id, restaurant_guid, sync_kind, business_date, status,
+       attempt_count, completed_at, postprocess_token, postprocess_started_at
+     ) VALUES
+       ($1::uuid, $2::uuid, 'standard_orders', '2026-07-16', 'succeeded', 1, now(), NULL, NULL),
+       ($1::uuid, $2::uuid, 'standard_orders', '2026-07-18', 'succeeded', 1, now(),
+        gen_random_uuid(), now() - interval '20 minutes')`,
+    [ORGANIZATION_ID, RESTAURANT_GUID],
   )
 
   const rows = acceptanceRows()
@@ -765,6 +787,40 @@ async function runDisposablePostgresAssertions() {
       timeout: 180_000,
     })
     await seedDisposableDatabase(pool)
+
+    const posPersistenceModule = loadTypeScriptModule('app_src/lib/persistence/pos.ts', {
+      '@/lib/persistence/postgres': { query: (sql, params) => pool.query(sql, params) },
+      '@/lib/persistence/toastIntegrations': {
+        readToastIntegrationStateFromPostgres: async () => ({
+          credentials: {
+            standard: { configured: true },
+            analytics: { configured: false },
+          },
+          locations: [],
+          latestSyncAt: null,
+          jobs: [],
+          reporting: { datasets: {}, noDataReason: null },
+        }),
+      },
+    })
+    const posWorkspace = await posPersistenceModule.readPosWorkspaceFromPostgres({
+      organizationId: ORGANIZATION_ID,
+      from: '2026-07-16',
+      to: '2026-07-18',
+      restaurantGuid: RESTAURANT_GUID,
+      page: 1,
+      pageSize: 25,
+      selectedOrderGuid: null,
+      search: '',
+    })
+    assert.deepEqual(
+      Array.from(posWorkspace.syncIssues, (issue) => [issue.syncKind, issue.status]),
+      [
+        ['standard_orders', 'stale'],
+        ['standard_orders', 'missing'],
+      ],
+      'POS posting queue must expose overdue postprocessing and configured missing source dates',
+    )
 
     const persistenceModule = loadTypeScriptModule('app_src/lib/persistence/posReporting.ts', {
       '@/lib/persistence/postgres': { query: (sql, params) => pool.query(sql, params) },

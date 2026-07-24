@@ -59,6 +59,10 @@ const sample = {
   displayNumber: '42',
   source: { name: 'In Store' },
   diningOption: { behavior: 'DINE_IN' },
+  createdDate: '2026-07-18T15:50:00.000Z',
+  modifiedDate: '2026-07-18T16:05:00.000Z',
+  promisedDate: '2026-07-20T15:30:00.000Z',
+  estimatedFulfillmentDate: '2026-07-20T15:25:00.000Z',
   numberOfGuests: 2,
   openedDate: '2026-07-18T16:00:00.000Z',
   checks: [{
@@ -75,7 +79,15 @@ const sample = {
       tax: 1.6,
       modifiers: [{ displayName: 'Extra sauce', quantity: 1, price: 0.5 }],
     }],
-    payments: [{ type: 'CREDIT', cardType: 'VISA', paymentStatus: 'CAPTURED', amount: 21.6, tipAmount: 3 }],
+    payments: [{
+      guid: '33333333-3333-4333-8333-333333333333',
+      type: 'CREDIT',
+      cardType: 'VISA',
+      paymentStatus: 'CAPTURED',
+      paidDate: '2026-07-18T16:02:00.000Z',
+      amount: 21.6,
+      tipAmount: 3,
+    }],
   }],
 }
 const projected = projectionModule.projectToastOrders([sample])
@@ -89,6 +101,11 @@ assert.equal(projected.totals.tips, 3)
 assert.equal(projected.totals.tendered, 21.6)
 assert.equal(projected.totals.total, 24.6)
 assert.equal(projected.totals.cardTender, 21.6)
+assert.equal(projected.orders[0].createdAt, '2026-07-18T15:50:00.000Z')
+assert.equal(projected.orders[0].modifiedAt, '2026-07-18T16:05:00.000Z')
+assert.equal(projected.orders[0].promisedAt, '2026-07-20T15:30:00.000Z')
+assert.equal(projected.orders[0].estimatedFulfillmentAt, '2026-07-20T15:25:00.000Z')
+assert.equal(projected.orders[0].details.checks[0].payments[0].paidAt, '2026-07-18T16:02:00.000Z')
 assert.equal(projected.orders[0].details.checks[0].payments[0].cardBrand, 'VISA')
 assert.equal(projected.orders[0].details.checks[0].selections[0].name, 'Lunch special')
 assert.ok(!JSON.stringify(projected.orders[0].details).includes('last4Digits'))
@@ -200,10 +217,26 @@ for (const fragment of [
   'sum(card_tender) FILTER (WHERE voided = false)',
   'selectedOrder',
   'readiness',
+  'missing_source_dates',
+  "job.status = 'processing'",
+  "job.status = 'pending'",
+  "'No Toast synchronization was queued for this configured source and business date.'",
 ]) {
   assert.ok(readModel.includes(fragment), `POS read model missing ${fragment}`)
 }
 assert.match(readModel, /o\.order_guid = \$2[\s\S]*?o\.deleted = false/)
+assert.ok(
+  !readModel.includes('ORDER BY d.business_date DESC, d.updated_at DESC LIMIT 50'),
+  'POS posting queue must not silently truncate current drafts',
+)
+assert.ok(
+  !readModel.includes('ORDER BY issue.business_date DESC, issue.last_seen_at DESC\\n       LIMIT 100'),
+  'POS posting queue must not silently truncate durable accounting issues',
+)
+assert.ok(
+  !readModel.includes('ORDER BY job.business_date DESC, job.updated_at DESC\\n       LIMIT 100'),
+  'POS posting queue must not silently truncate failed sync issues',
+)
 
 const selectedQueries = []
 const deletedSelectedRow = {

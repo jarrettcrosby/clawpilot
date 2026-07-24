@@ -109,6 +109,23 @@ assert.ok(
   'Carrier account numbers must not be stored in plaintext',
 )
 
+const sandboxDiagnosticScopeMigration = read(
+  'db/migrations/0100_operations_sandbox_rate_diagnostic_scope.sql',
+)
+for (const fragment of [
+  'DROP CONSTRAINT IF EXISTS operations_carrier_rate_requests_authorization_scope_valid',
+  'ADD CONSTRAINT operations_carrier_rate_requests_authorization_scope_consistent',
+  'network_id IS NULL',
+  'account_authorization_id IS NULL',
+  'network_id IS NOT NULL',
+  'account_authorization_id IS NOT NULL',
+]) {
+  assert.ok(
+    sandboxDiagnosticScopeMigration.includes(fragment),
+    `Sandbox diagnostic scope migration missing ${fragment}`,
+  )
+}
+
 const persistence = read('app_src/lib/persistence/carrierIntegrations.ts')
 for (const fragment of [
   'WHERE account.organization_id = $1::uuid',

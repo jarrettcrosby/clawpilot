@@ -148,6 +148,27 @@ function verifySourceContracts() {
     "WHERE code = 'MOCK-01'",
   ]) assert.ok(sandboxRateMigration.includes(fragment), `Mock retirement migration missing ${fragment}`)
 
+  const receivingTopologyMigration = read('db/migrations/0101_operations_receiving_and_topology.sql')
+  for (const fragment of [
+    "('grc', 'operations.receipt'",
+    "('grcl', 'operations.receipt_line'",
+    'ADD COLUMN IF NOT EXISTS facility_type text',
+    'ADD COLUMN IF NOT EXISTS parent_location_id uuid',
+    'ADD COLUMN IF NOT EXISTS topology_level text',
+    'ADD COLUMN IF NOT EXISTS max_volume_cubic_meters numeric',
+    'ADD COLUMN IF NOT EXISTS max_weight_kg numeric',
+    'ADD COLUMN IF NOT EXISTS allow_mixed_products boolean',
+    'CREATE TABLE IF NOT EXISTS operations_location_product_rules',
+    'CREATE TABLE IF NOT EXISTS operations_receipts',
+    'CREATE TABLE IF NOT EXISTS operations_receipt_lines',
+    'ADD COLUMN IF NOT EXISTS damaged_delta numeric',
+  ]) {
+    assert.ok(
+      receivingTopologyMigration.includes(fragment),
+      `Operations receiving and topology migration missing ${fragment}`,
+    )
+  }
+
   const rateDelegationMigration = read('db/migrations/0089_operations_rate_delegation_and_carrier_settlement.sql')
   for (const table of [
     'operations_carrier_rate_networks',
@@ -441,6 +462,19 @@ function verifySourceContracts() {
     "eventType: 'operations.pick.completed'",
     "eventType: 'operations.order.picks_confirmed'",
     'verifyOperationsOrderPackFromPostgres',
+    'createOperationsWarehouseInPostgres',
+    'createOperationsLocationInPostgres',
+    'updateOperationsWarehouseInPostgres',
+    'updateOperationsLocationInPostgres',
+    'deleteOperationsLocationInPostgres',
+    "eventType: 'operations.warehouse.created'",
+    "eventType: 'operations.location.created'",
+    "eventType: 'operations.warehouse.updated'",
+    "eventType: 'operations.location.updated'",
+    "'operations.location.deleted'",
+    "'operations.location.retired'",
+    'operations_location_product_rules',
+    'SAVEPOINT delete_operations_location',
     "commandType: 'verify_operations_order_pack'",
     "eventType: 'operations.package.packed'",
     "eventType: 'operations.order.pack_verified'",
@@ -521,20 +555,56 @@ function verifySourceContracts() {
     'releaseOperationsOrderFromPostgres',
     'confirmOperationsOrderPicksFromPostgres',
     'verifyOperationsOrderPackFromPostgres',
+    'createOperationsSandboxLabelInPostgres',
+    'voidOperationsSandboxLabelInPostgres',
+    'createOperationsWarehouseInPostgres',
+    'createOperationsLocationInPostgres',
+    'updateOperationsWarehouseInPostgres',
+    'updateOperationsLocationInPostgres',
+    'deleteOperationsLocationInPostgres',
     'updateOperationsExceptionInPostgres',
     "'Cache-Control': 'private, no-store'",
     'MAX_REQUEST_BYTES',
     "action === 'run-proof-order'",
+    "action === 'create-warehouse'",
+    "action === 'update-warehouse'",
+    "action === 'create-location'",
+    "action === 'update-location'",
+    "action === 'delete-location'",
     'CLAWPILOT_OPERATIONS_PROOF_ENABLED',
     'OPERATIONS_PROOF_DISABLED',
     "action === 'release-order'",
     "action === 'confirm-picks'",
     "action === 'verify-pack'",
+    "action === 'create-sandbox-label'",
+    "action === 'void-sandbox-label'",
     'Idempotency-Key',
     "action === 'update-exception'",
     "action === 'update-activation'",
   ]) assert.ok(route.includes(fragment), `Operations route missing ${fragment}`)
   assert.ok(!/clientSecret|accessToken|privateKey/i.test(route), 'Operations route must not handle credentials')
+
+  const warehouseSetup = read('app_src/components/operations/WarehouseSetupPanel.tsx')
+  for (const fragment of [
+    'Warehouse network',
+    'Create starter topology',
+    'Maximum cubic storage',
+    'Product placement',
+    'Parent location',
+    'Edit topology, capacity, and product rules',
+    'Configure printers',
+    'Import carrier billing',
+    "'create-warehouse'",
+    "'create-location'",
+    "'update-location'",
+    "action: 'delete-location'",
+  ]) assert.ok(warehouseSetup.includes(fragment), `Warehouse setup UI missing ${fragment}`)
+
+  const operationsSection = read('app_src/components/operations/OperationsSection.tsx')
+  assert.ok(
+    operationsSection.includes('<Tab value="warehouses"'),
+    'Operations navigation must expose warehouse setup',
+  )
 
   const health = read('app_src/app/api/health/route.ts')
   assert.ok(
@@ -609,6 +679,46 @@ function verifySourceContracts() {
     health.includes('row?.operations_carrier_billing_integrity_migration_applied'),
     'Health migration status must include carrier billing integrity',
   )
+  assert.ok(
+    health.includes("WHERE filename = '0093_operations_carrier_billing_import_and_review.sql'"),
+    'Health must require carrier billing import and review',
+  )
+  assert.ok(
+    health.includes('row?.operations_carrier_billing_review_migration_applied'),
+    'Health migration status must include carrier billing import and review',
+  )
+  assert.ok(
+    health.includes("WHERE filename = '0094_operations_print_delivery.sql'"),
+    'Health must require print delivery',
+  )
+  assert.ok(
+    health.includes('row?.operations_print_delivery_migration_applied'),
+    'Health migration status must include print delivery',
+  )
+  assert.ok(
+    health.includes("WHERE filename = '0097_operations_settlement_lifecycle.sql'"),
+    'Health must require settlement lifecycle controls',
+  )
+  assert.ok(
+    health.includes('row?.operations_settlement_lifecycle_migration_applied'),
+    'Health migration status must include settlement lifecycle controls',
+  )
+  assert.ok(
+    health.includes("WHERE filename = '0098_operations_label_execution.sql'"),
+    'Health must require label execution persistence',
+  )
+  assert.ok(
+    health.includes('row?.operations_label_execution_migration_applied'),
+    'Health migration status must include label execution persistence',
+  )
+  assert.ok(
+    health.includes("WHERE filename = '0101_operations_receiving_and_topology.sql'"),
+    'Health must require receiving and topology persistence',
+  )
+  assert.ok(
+    health.includes('row?.operations_receiving_topology_migration_applied'),
+    'Health migration status must include receiving and topology persistence',
+  )
 
   const packaging = read('app_src/lib/persistence/productPackaging.ts')
   for (const fragment of [
@@ -652,6 +762,10 @@ function verifySourceContracts() {
     'Predeploy must require the operations hardening migration',
   )
   assert.ok(
+    predeploy.includes("'db/migrations/0101_operations_receiving_and_topology.sql'"),
+    'Predeploy verification must require the receiving and topology migration',
+  )
+  assert.ok(
     predeploy.includes("'db/migrations/0084_operations_command_results.sql'"),
     'Predeploy must require the operations command results migration',
   )
@@ -686,6 +800,22 @@ function verifySourceContracts() {
   assert.ok(
     predeploy.includes("'db/migrations/0092_operations_carrier_billing_integrity.sql'"),
     'Predeploy must require the carrier billing integrity migration',
+  )
+  assert.ok(
+    predeploy.includes("'db/migrations/0093_operations_carrier_billing_import_and_review.sql'"),
+    'Predeploy must require carrier billing import and review',
+  )
+  assert.ok(
+    predeploy.includes("'db/migrations/0094_operations_print_delivery.sql'"),
+    'Predeploy must require print delivery',
+  )
+  assert.ok(
+    predeploy.includes("'db/migrations/0097_operations_settlement_lifecycle.sql'"),
+    'Predeploy must require settlement lifecycle controls',
+  )
+  assert.ok(
+    predeploy.includes("'db/migrations/0098_operations_label_execution.sql'"),
+    'Predeploy must require label execution persistence',
   )
 }
 
@@ -774,7 +904,17 @@ async function verifyRouteBehavior() {
       this.status = status
     }
   }
-  const calls = { reads: [], proofs: [], releases: [], picks: [], packs: [], exceptions: [], activations: [] }
+  const calls = {
+    reads: [],
+    proofs: [],
+    releases: [],
+    picks: [],
+    packs: [],
+    labelCreates: [],
+    labelVoids: [],
+    exceptions: [],
+    activations: [],
+  }
   const route = loadTypeScriptModule('app_src/app/api/operations/route.ts', {
     mocks: {
       'next/server': {
@@ -857,6 +997,40 @@ async function verifyRouteBehavior() {
               status: input.status,
               title: 'Inventory review',
             },
+          }
+        },
+      },
+      '@/lib/persistence/operationShipping': {
+        createOperationsSandboxLabelInPostgres: async (input) => {
+          calls.labelCreates.push(input)
+          return {
+            orderGlobalId: input.orderGlobalId,
+            orderStatus: 'packed',
+            rowVersion: input.expectedRowVersion + 1,
+            packageGlobalId: 'gpk1234567',
+            labelGlobalId: 'glb1234567',
+            attemptGlobalId: 'gla1234567',
+            trackingNumber: '1ZTEST1234567890',
+            labelStatus: 'created',
+            replayed: false,
+            printJobGlobalId: 'gpj1234567',
+            printWarning: null,
+          }
+        },
+        voidOperationsSandboxLabelInPostgres: async (input) => {
+          calls.labelVoids.push(input)
+          return {
+            orderGlobalId: input.orderGlobalId,
+            orderStatus: 'packed',
+            rowVersion: input.expectedRowVersion + 1,
+            packageGlobalId: 'gpk1234567',
+            labelGlobalId: 'glb1234567',
+            attemptGlobalId: 'gla7654321',
+            trackingNumber: '1ZTEST1234567890',
+            labelStatus: 'voided',
+            replayed: false,
+            printJobGlobalId: null,
+            printWarning: null,
           }
         },
       },
@@ -1110,6 +1284,82 @@ async function verifyRouteBehavior() {
     expectedRowVersion: 6,
     reason: 'Packer verified the carton',
     idempotencyKey: 'pack-route-proof-1',
+  })
+
+  const deniedLabelCreate = await route.POST(request('http://localhost/api/operations', {
+    actor: { ...actor, capabilities: { canView: true, canManage: true, canExecute: false, canActivate: false } },
+    headers: { 'Content-Type': 'application/json', 'Idempotency-Key': 'label-create-denied-1' },
+    body: JSON.stringify({
+      action: 'create-sandbox-label',
+      orderGlobalId: 'gor1234567',
+      expectedRowVersion: 7,
+      reason: 'Sandbox proof label',
+      carrierRateGlobalId: 'grt1234567',
+      carrierAccountGlobalId: 'gac1234567',
+    }),
+  }))
+  assert.equal(deniedLabelCreate.status, 403)
+  assert.equal((await payload(deniedLabelCreate)).code, 'OPERATIONS_EXECUTE_REQUIRED')
+  assert.equal(calls.labelCreates.length, 0)
+
+  const labelCreateWithoutKey = await route.POST(request('http://localhost/api/operations', {
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      action: 'create-sandbox-label',
+      orderGlobalId: 'gor1234567',
+      expectedRowVersion: 7,
+      reason: 'Sandbox proof label',
+      carrierRateGlobalId: 'grt1234567',
+      carrierAccountGlobalId: 'gac1234567',
+    }),
+  }))
+  assert.equal(labelCreateWithoutKey.status, 400)
+  assert.equal((await payload(labelCreateWithoutKey)).code, 'OPERATIONS_IDEMPOTENCY_KEY_INVALID')
+
+  const validLabelCreate = await route.POST(request('http://localhost/api/operations', {
+    headers: { 'Content-Type': 'application/json', 'Idempotency-Key': 'label-create-route-proof-1' },
+    body: JSON.stringify({
+      action: 'create-sandbox-label',
+      orderGlobalId: 'gor1234567',
+      expectedRowVersion: 7,
+      reason: 'Sandbox proof label',
+      carrierRateGlobalId: 'grt1234567',
+      carrierAccountGlobalId: 'gac1234567',
+      preferredPrinterGlobalId: 'gpr1234567',
+    }),
+  }))
+  assert.equal(validLabelCreate.status, 200)
+  assert.equal(calls.labelCreates.length, 1)
+  assert.deepEqual(JSON.parse(JSON.stringify(calls.labelCreates[0])), {
+    organizationId: actor.organizationId,
+    actorEmail: actor.email,
+    orderGlobalId: 'gor1234567',
+    expectedRowVersion: 7,
+    reason: 'Sandbox proof label',
+    carrierRateGlobalId: 'grt1234567',
+    carrierAccountGlobalId: 'gac1234567',
+    preferredPrinterGlobalId: 'gpr1234567',
+    idempotencyKey: 'label-create-route-proof-1',
+  })
+
+  const validLabelVoid = await route.POST(request('http://localhost/api/operations', {
+    headers: { 'Content-Type': 'application/json', 'Idempotency-Key': 'label-void-route-proof-1' },
+    body: JSON.stringify({
+      action: 'void-sandbox-label',
+      orderGlobalId: 'gor1234567',
+      expectedRowVersion: 8,
+      reason: 'Sandbox proof complete',
+    }),
+  }))
+  assert.equal(validLabelVoid.status, 200)
+  assert.equal(calls.labelVoids.length, 1)
+  assert.deepEqual(JSON.parse(JSON.stringify(calls.labelVoids[0])), {
+    organizationId: actor.organizationId,
+    actorEmail: actor.email,
+    orderGlobalId: 'gor1234567',
+    expectedRowVersion: 8,
+    reason: 'Sandbox proof complete',
+    idempotencyKey: 'label-void-route-proof-1',
   })
 
   const validExceptionUpdate = await route.POST(request('http://localhost/api/operations', {
@@ -1435,6 +1685,7 @@ async function verifyPostgresAcceptance(databaseUrl) {
       mocks: { '@/lib/operations/domain': domain },
     })
     const stableId = loadTypeScriptModule('app_src/lib/crm/stableId.ts')
+    const packingSlip = loadTypeScriptModule('app_src/lib/operations/packingSlip.ts')
     const productPackaging = loadTypeScriptModule('app_src/lib/persistence/productPackaging.ts', {
       mocks: {
         '@/lib/auditWriter': auditWriter,
@@ -1447,8 +1698,16 @@ async function verifyPostgresAcceptance(databaseUrl) {
         '@/lib/crm/stableId': stableId,
         '@/lib/operations/adapters': adapters,
         '@/lib/operations/domain': domain,
+        '@/lib/operations/packingSlip': packingSlip,
         '@/lib/persistence/crm': {
           stageCrmRecordWithClient: stageCommerceCustomerForAcceptance,
+        },
+        '@/lib/persistence/operationPrintDelivery': {
+          enqueueOperationsPrintJobInPostgres: async () => ({
+            printJobGlobalId: null,
+            printJobStatus: null,
+            printWarning: 'No printer configured in distributed operations acceptance.',
+          }),
         },
         '@/lib/persistence/postgres': postgres,
         '@/lib/persistence/productPackaging': productPackaging,

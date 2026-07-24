@@ -17,6 +17,10 @@ import {
   priceContract,
   selectPromiseRate,
 } from '@/lib/operations/domain'
+import {
+  PACKING_SLIP_TEMPLATE_VERSION,
+  renderPackingSlip,
+} from '@/lib/operations/packingSlip'
 import type { OperationsCapabilities } from '@/lib/operations/authorization'
 import type {
   Address,
@@ -35,10 +39,12 @@ import type {
   OperationsOrderCommandResult,
   OperationsOrderListItem,
   OperationsOrderStatus,
+  OperationsShipmentCommandResult,
   OperationsWorkspace,
   PricingDirective,
 } from '@/lib/operations/types'
 import { stageCrmRecordWithClient } from '@/lib/persistence/crm'
+import { enqueueOperationsPrintJobInPostgres } from '@/lib/persistence/operationPrintDelivery'
 import { readDefaultProductPackagingWithClient } from '@/lib/persistence/productPackaging'
 import {
   acquireTransactionAdvisoryLock,
@@ -61,6 +67,91 @@ type ProductRow = QueryResultRow & {
   price: string
 }
 type IdRow = QueryResultRow & { id: string; global_id: string }
+type WarehouseRow = QueryResultRow & {
+  id: string
+  global_id: string
+  code: string
+  name: string
+  facility_type: OperationsWorkspace['warehouses'][number]['facilityType']
+  timezone: string
+  address: Record<string, unknown>
+  status: 'active' | 'inactive'
+  cutoff_time: string | null
+  row_version: string
+}
+type WarehouseLocationRow = QueryResultRow & {
+  id: string
+  global_id: string
+  warehouse_id: string
+  code: string
+  zone: string
+  location_type: OperationsWorkspace['warehouses'][number]['locations'][number]['locationType']
+  topology_level: OperationsWorkspace['warehouses'][number]['locations'][number]['topologyLevel']
+  parent_location_global_id: string | null
+  pick_sequence: number
+  active: boolean
+  max_volume_cubic_meters: string | null
+  max_weight_kg: string | null
+  used_volume_cubic_meters: string
+  used_weight_kg: string
+  allow_mixed_products: boolean
+  notes: string | null
+  row_version: string
+}
+type LocationProductRuleRow = QueryResultRow & {
+  global_id: string
+  location_id: string
+  product_global_id: string
+  product_name: string
+  rule_type: OperationsWorkspace['warehouses'][number]['locations'][number]['productRules'][number]['ruleType']
+  max_quantity: string | null
+  active: boolean
+}
+type InventoryPoolRow = QueryResultRow & {
+  id: string
+  global_id: string
+  name: string
+  pool_type: OperationsWorkspace['inventoryPools'][number]['poolType']
+  allocation_policy: OperationsWorkspace['inventoryPools'][number]['allocationPolicy']
+  owner_customer_global_id: string | null
+  owner_customer_name: string | null
+  active: boolean
+}
+type InventoryPoolCustomerRow = QueryResultRow & {
+  pool_id: string
+  global_id: string
+  name: string
+  priority: number
+}
+type InboundReceiptRow = QueryResultRow & {
+  id: string
+  global_id: string
+  reference_number: string
+  status: OperationsWorkspace['inboundReceipts'][number]['status']
+  warehouse_global_id: string
+  warehouse_name: string
+  pool_global_id: string
+  pool_name: string
+  expected_at: Date | null
+  completed_at: Date | null
+  row_version: string
+}
+type InboundReceiptLineRow = QueryResultRow & {
+  id: string
+  global_id: string
+  receipt_id: string
+  line_number: number
+  product_global_id: string
+  product_name: string
+  product_sku: string | null
+  location_global_id: string
+  location_code: string
+  expected_quantity: string
+  accepted_quantity: string
+  damaged_quantity: string
+  lot_code: string
+  unit_of_measure: string
+}
 type PositionRow = QueryResultRow & {
   id: string
   global_id: string
@@ -1173,7 +1264,7 @@ async function consumeReservedInventory(
        organization_id, position_id, event_type, on_hand_delta, reserved_delta,
        on_hand_after, reserved_after, source_global_id, reason, idempotency_key, actor_email
      ) VALUES ($1::uuid, $2::uuid, 'ship', $3, $4, $5, $6,
-       $7, 'Shipped mock proof order', $8, $9)`,
+       $7, 'Shipment confirmed', $8, $9)`,
     [
       input.organizationId,
       input.position.id,
@@ -1218,6 +1309,11 @@ async function readOrderDetail(
     package_count: string
     planned_package_count: string
     packed_package_count: string
+    active_label_count: string
+    shippable_label_count: string
+    sandbox_label_count: string
+    unresolved_label_attempt_count: string
+    existing_shipment_count: string
     exception_count: string
     blocking_exception_count: string
     expected_cost_minor: string | null
@@ -1265,6 +1361,36 @@ async function readOrderDetail(
        (SELECT count(*) FROM operations_packages package
         WHERE package.organization_id = orders.organization_id AND package.plan_id = plan.id
           AND package.status IN ('packed', 'labeled', 'shipped'))::text AS packed_package_count,
+       (SELECT count(*) FROM operations_labels label
+        JOIN operations_packages package
+          ON package.organization_id = label.organization_id
+         AND package.id = label.package_id
+        WHERE label.organization_id = orders.organization_id
+          AND package.plan_id = plan.id
+          AND label.status = 'created')::text AS active_label_count,
+       (SELECT count(*) FROM operations_labels label
+        JOIN operations_packages package
+          ON package.organization_id = label.organization_id
+         AND package.id = label.package_id
+        WHERE label.organization_id = orders.organization_id
+          AND package.plan_id = plan.id
+          AND label.status = 'created'
+          AND label.environment IN ('mock', 'production'))::text AS shippable_label_count,
+       (SELECT count(*) FROM operations_labels label
+        JOIN operations_packages package
+          ON package.organization_id = label.organization_id
+         AND package.id = label.package_id
+        WHERE label.organization_id = orders.organization_id
+          AND package.plan_id = plan.id
+          AND label.status = 'created'
+          AND label.environment = 'sandbox')::text AS sandbox_label_count,
+       (SELECT count(*) FROM operations_label_attempts attempt
+        WHERE attempt.organization_id = orders.organization_id
+          AND attempt.order_id = orders.id
+          AND attempt.state IN ('prepared', 'unknown'))::text AS unresolved_label_attempt_count,
+       (SELECT count(*) FROM operations_shipments existing_shipment
+        WHERE existing_shipment.organization_id = orders.organization_id
+          AND existing_shipment.order_id = orders.id)::text AS existing_shipment_count,
        (SELECT count(*) FROM operations_exceptions exception
         WHERE exception.order_id = orders.id AND exception.status IN ('open', 'acknowledged'))::text AS exception_count,
        (SELECT count(*) FROM operations_exceptions exception
@@ -1298,7 +1424,18 @@ async function readOrderDetail(
   const row = orderResult.rows[0]
   if (!row) return null
 
-  const [lineResult, packageResult, rateResult, billableResult, eventResult] = await Promise.all([
+  const [
+    lineResult,
+    packageResult,
+    rateResult,
+    billableResult,
+    labelAttemptResult,
+    shipmentResult,
+    trackingResult,
+    artifactResult,
+    commerceExportResult,
+    eventResult,
+  ] = await Promise.all([
     query<QueryResultRow & {
       global_id: string
       product_global_id: string
@@ -1330,10 +1467,47 @@ async function readOrderDetail(
       width_mm: number
       height_mm: number
       status: string
+      label_global_id: string | null
+      label_status: 'created' | 'voided' | 'failed' | null
+      label_carrier: string | null
+      label_service_code: string | null
+      label_tracking_number: string | null
+      label_environment: 'mock' | 'sandbox' | 'production' | null
+      create_attempt_global_id: string | null
+      void_attempt_global_id: string | null
+      label_created_at: Date | null
+      label_voided_at: Date | null
     }>(
       `SELECT package.global_id, package.package_number, package.weight_grams,
-              package.length_mm, package.width_mm, package.height_mm, package.status
+              package.length_mm, package.width_mm, package.height_mm, package.status,
+              latest_label.global_id AS label_global_id,
+              latest_label.status AS label_status,
+              latest_label.carrier AS label_carrier,
+              latest_label.service_code AS label_service_code,
+              latest_label.tracking_number AS label_tracking_number,
+              latest_label.environment AS label_environment,
+              latest_label.create_attempt_global_id,
+              latest_label.void_attempt_global_id,
+              latest_label.created_at AS label_created_at,
+              latest_label.voided_at AS label_voided_at
        FROM operations_packages package
+       LEFT JOIN LATERAL (
+         SELECT label.global_id, label.status, label.carrier, label.service_code,
+                label.tracking_number, label.environment, label.created_at, label.voided_at,
+                create_attempt.global_id AS create_attempt_global_id,
+                void_attempt.global_id AS void_attempt_global_id
+         FROM operations_labels label
+         LEFT JOIN operations_label_attempts create_attempt
+           ON create_attempt.organization_id = label.organization_id
+          AND create_attempt.id = label.create_attempt_id
+         LEFT JOIN operations_label_attempts void_attempt
+           ON void_attempt.organization_id = label.organization_id
+          AND void_attempt.id = label.void_attempt_id
+         WHERE label.organization_id = package.organization_id
+           AND label.package_id = package.id
+         ORDER BY label.created_at DESC, label.id DESC
+         LIMIT 1
+       ) latest_label ON true
        WHERE package.organization_id = $1::uuid AND package.plan_id = $2::uuid
        ORDER BY package.package_number`,
       [organizationId, row.plan_id],
@@ -1341,6 +1515,7 @@ async function readOrderDetail(
     query<QueryResultRow & {
       global_id: string
       carrier: string
+      service_code: string
       service_name: string
       internal_cost_minor: string
       customer_charge_minor: string
@@ -1348,7 +1523,7 @@ async function readOrderDetail(
       meets_promise: boolean
       selected: boolean
     }>(
-      `SELECT rate.global_id, rate.carrier, rate.service_name, rate.internal_cost_minor::text,
+      `SELECT rate.global_id, rate.carrier, rate.service_code, rate.service_name, rate.internal_cost_minor::text,
               rate.customer_charge_minor::text, rate.estimated_delivery_at,
               rate.meets_promise, rate.selected
        FROM operations_carrier_rates rate
@@ -1361,6 +1536,124 @@ async function readOrderDetail(
        FROM operations_billable_events
        WHERE organization_id = $1::uuid AND order_id = $2::uuid
        ORDER BY occurred_at, id`,
+      [organizationId, row.id],
+    ),
+    query<QueryResultRow & {
+      global_id: string
+      action: 'create' | 'void' | 'reconcile'
+      state: 'prepared' | 'succeeded' | 'failed' | 'unknown'
+      provider: 'ups_rest' | 'fedex_rest'
+      environment: 'sandbox' | 'production'
+      error_code: string | null
+      label_global_id: string | null
+      requested_at: Date
+      completed_at: Date | null
+    }>(
+      `SELECT attempt.global_id, attempt.action, attempt.state, attempt.provider,
+              attempt.environment, attempt.error_code,
+              label.global_id AS label_global_id,
+              attempt.requested_at, attempt.completed_at
+       FROM operations_label_attempts attempt
+       LEFT JOIN operations_labels label
+         ON label.organization_id = attempt.organization_id
+        AND label.id = attempt.label_id
+       WHERE attempt.organization_id = $1::uuid
+         AND attempt.order_id = $2::uuid
+       ORDER BY attempt.requested_at DESC, attempt.id DESC`,
+      [organizationId, row.id],
+    ),
+    query<QueryResultRow & {
+      global_id: string
+      status: 'confirmed' | 'in_transit' | 'delivered' | 'exception' | 'voided'
+      carrier: string
+      service_code: string
+      tracking_number: string
+      shipped_at: Date
+    }>(
+      `SELECT shipment.global_id, shipment.status, label.carrier,
+              label.service_code, shipment.tracking_number, shipment.shipped_at
+       FROM operations_shipments shipment
+       JOIN operations_labels label
+         ON label.organization_id = shipment.organization_id
+        AND label.id = shipment.label_id
+       WHERE shipment.organization_id = $1::uuid
+         AND shipment.order_id = $2::uuid
+       ORDER BY shipment.shipped_at DESC, shipment.id DESC`,
+      [organizationId, row.id],
+    ),
+    query<QueryResultRow & {
+      global_id: string
+      shipment_global_id: string
+      status: 'confirmed' | 'in_transit' | 'out_for_delivery' | 'delivered' | 'exception' | 'voided'
+      provider: string
+      source: 'shipment_confirmation' | 'carrier_webhook' | 'carrier_poll' | 'manual'
+      location: string | null
+      observed_at: Date
+    }>(
+      `SELECT observation.global_id,
+              shipment.global_id AS shipment_global_id,
+              observation.status, observation.provider, observation.source,
+              observation.location, observation.observed_at
+       FROM operations_tracking_observations observation
+       JOIN operations_shipments shipment
+         ON shipment.organization_id = observation.organization_id
+        AND shipment.id = observation.shipment_id
+       WHERE shipment.organization_id = $1::uuid
+         AND shipment.order_id = $2::uuid
+       ORDER BY observation.observed_at DESC, observation.id DESC`,
+      [organizationId, row.id],
+    ),
+    query<QueryResultRow & {
+      global_id: string
+      shipment_global_id: string | null
+      document_type: 'shipping_label' | 'packing_slip'
+      format: 'ZPL' | 'PDF' | 'PNG'
+      media_size: 'label_4x6' | 'label_4x8' | 'letter' | 'a4'
+      filename: string | null
+      has_payload: boolean
+      created_at: Date
+    }>(
+      `SELECT artifact.global_id,
+              shipment.global_id AS shipment_global_id,
+              artifact.document_type, artifact.format, artifact.media_size,
+              payload.filename,
+              (payload.artifact_id IS NOT NULL) AS has_payload,
+              artifact.created_at
+       FROM operations_print_artifacts artifact
+       LEFT JOIN operations_shipments shipment
+         ON shipment.organization_id = artifact.organization_id
+        AND shipment.id = artifact.source_shipment_id
+       LEFT JOIN operations_print_artifact_payloads payload
+         ON payload.organization_id = artifact.organization_id
+        AND payload.artifact_id = artifact.id
+       WHERE artifact.organization_id = $1::uuid
+         AND artifact.source_order_id = $2::uuid
+       ORDER BY artifact.created_at DESC, artifact.id DESC`,
+      [organizationId, row.id],
+    ),
+    query<QueryResultRow & {
+      global_id: string
+      shipment_global_id: string
+      provider: string
+      state: 'queued' | 'processing' | 'succeeded' | 'failed' | 'unsupported'
+      provider_reference: string | null
+      error_code: string | null
+      error_message: string | null
+      requested_at: Date
+      completed_at: Date | null
+    }>(
+      `SELECT export.global_id,
+              shipment.global_id AS shipment_global_id,
+              export.provider, export.state, export.provider_reference,
+              export.error_code, export.error_message,
+              export.requested_at, export.completed_at
+       FROM operations_commerce_fulfillment_exports export
+       JOIN operations_shipments shipment
+         ON shipment.organization_id = export.organization_id
+        AND shipment.id = export.shipment_id
+       WHERE export.organization_id = $1::uuid
+         AND export.order_id = $2::uuid
+       ORDER BY export.requested_at DESC, export.id DESC`,
       [organizationId, row.id],
     ),
     query<QueryResultRow & { global_id: string; event_type: string; occurred_at: Date; payload: Record<string, unknown> }>(
@@ -1407,6 +1700,11 @@ async function readOrderDetail(
       plannedPackageCount: Number(row.planned_package_count),
       packedPackageCount: Number(row.packed_package_count),
       blockingExceptionCount: Number(row.blocking_exception_count),
+      activeLabelCount: Number(row.active_label_count),
+      shippableLabelCount: Number(row.shippable_label_count),
+      sandboxLabelCount: Number(row.sandbox_label_count),
+      unresolvedLabelAttemptCount: Number(row.unresolved_label_attempt_count),
+      existingShipmentCount: Number(row.existing_shipment_count),
     }),
     warehouseName: row.warehouse_name,
     promisedDeliveryAt: row.promised_delivery_at?.toISOString() || null,
@@ -1433,10 +1731,27 @@ async function readOrderDetail(
       weightGrams: item.weight_grams,
       dimensionsMm: { length: item.length_mm, width: item.width_mm, height: item.height_mm },
       status: item.status,
+      latestLabel: item.label_global_id && item.label_status && item.label_carrier
+        && item.label_service_code && item.label_tracking_number && item.label_environment
+        && item.label_created_at
+        ? {
+            globalId: item.label_global_id,
+            status: item.label_status,
+            carrier: item.label_carrier,
+            serviceCode: item.label_service_code,
+            trackingNumber: item.label_tracking_number,
+            environment: item.label_environment,
+            createAttemptGlobalId: item.create_attempt_global_id,
+            voidAttemptGlobalId: item.void_attempt_global_id,
+            createdAt: item.label_created_at.toISOString(),
+            voidedAt: item.label_voided_at?.toISOString() || null,
+          }
+        : null,
     })),
     rates: rateResult.rows.map((item) => ({
       globalId: item.global_id,
       carrier: item.carrier,
+      serviceCode: item.service_code,
       serviceName: item.service_name,
       internalCostMinor: item.internal_cost_minor,
       customerChargeMinor: item.customer_charge_minor,
@@ -1449,6 +1764,57 @@ async function readOrderDetail(
       type: item.event_type,
       amountMinor: item.amount_minor,
       status: item.status,
+    })),
+    labelAttempts: labelAttemptResult.rows.map((item) => ({
+      globalId: item.global_id,
+      action: item.action,
+      state: item.state,
+      provider: item.provider,
+      environment: item.environment,
+      errorCode: item.error_code,
+      labelGlobalId: item.label_global_id,
+      requestedAt: item.requested_at.toISOString(),
+      completedAt: item.completed_at?.toISOString() || null,
+    })),
+    shipments: shipmentResult.rows.map((item) => ({
+      globalId: item.global_id,
+      status: item.status,
+      carrier: item.carrier,
+      serviceCode: item.service_code,
+      trackingNumber: item.tracking_number,
+      shippedAt: item.shipped_at.toISOString(),
+    })),
+    trackingObservations: trackingResult.rows.map((item) => ({
+      globalId: item.global_id,
+      shipmentGlobalId: item.shipment_global_id,
+      status: item.status,
+      provider: item.provider,
+      source: item.source,
+      location: item.location,
+      observedAt: item.observed_at.toISOString(),
+    })),
+    printArtifacts: artifactResult.rows.map((item) => ({
+      globalId: item.global_id,
+      shipmentGlobalId: item.shipment_global_id,
+      documentType: item.document_type,
+      format: item.format,
+      media: item.media_size,
+      filename: item.filename,
+      contentUrl: item.has_payload
+        ? `/api/operations/artifacts/${encodeURIComponent(item.global_id)}`
+        : null,
+      createdAt: item.created_at.toISOString(),
+    })),
+    commerceExports: commerceExportResult.rows.map((item) => ({
+      globalId: item.global_id,
+      shipmentGlobalId: item.shipment_global_id,
+      provider: item.provider,
+      state: item.state,
+      providerReference: item.provider_reference,
+      errorCode: item.error_code,
+      errorMessage: item.error_message,
+      requestedAt: item.requested_at.toISOString(),
+      completedAt: item.completed_at?.toISOString() || null,
     })),
     events: eventResult.rows.map((item) => ({
       globalId: item.global_id,
@@ -1491,7 +1857,22 @@ export async function readOperationsWorkspaceFromPostgres(input: {
     exceptionWhere.push(`exception.status = $${exceptionValues.length}`)
   }
 
-  const [configuredResult, summaryResult, orderResult, exceptionResult, warehouseResult, customerResult, productResult] = await Promise.all([
+  const [
+    configuredResult,
+    summaryResult,
+    orderResult,
+    exceptionResult,
+    warehouseResult,
+    warehouseLocationResult,
+    locationProductRuleResult,
+    inventoryPoolResult,
+    inventoryPoolCustomerResult,
+    inboundReceiptResult,
+    inboundReceiptLineResult,
+    customerResult,
+    productResult,
+    sandboxCarrierAccountResult,
+  ] = await Promise.all([
     query<QueryResultRow & { configured: boolean }>(
       `SELECT EXISTS (
          SELECT 1 FROM operations_warehouses warehouse
@@ -1613,9 +1994,120 @@ export async function readOperationsWorkspaceFromPostgres(input: {
        LIMIT 100`,
       exceptionValues,
     ),
-    query<QueryResultRow & { id: string; global_id: string; name: string }>(
-      `SELECT id::text, global_id, name FROM operations_warehouses
-       WHERE organization_id = $1::uuid AND status = 'active' AND code <> 'MOCK-01' ORDER BY name, id`,
+    query<WarehouseRow>(
+      `SELECT id::text, global_id, code, name, facility_type, timezone, address, status,
+              cutoff_time::text, row_version::text
+       FROM operations_warehouses
+       WHERE organization_id = $1::uuid AND code <> 'MOCK-01'
+       ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, lower(name), id`,
+      [organizationId],
+    ),
+    query<WarehouseLocationRow>(
+      `SELECT location.id::text, location.global_id,
+              location.warehouse_id::text, location.code, location.zone,
+              location.location_type, location.topology_level,
+              parent.global_id AS parent_location_global_id,
+              location.pick_sequence, location.active,
+              location.max_volume_cubic_meters::text,
+              location.max_weight_kg::text,
+              COALESCE(usage.used_volume_cubic_meters, 0)::text AS used_volume_cubic_meters,
+              COALESCE(usage.used_weight_kg, 0)::text AS used_weight_kg,
+              location.allow_mixed_products, location.notes, location.row_version::text
+       FROM operations_locations location
+       JOIN operations_warehouses warehouse
+         ON warehouse.organization_id = location.organization_id
+        AND warehouse.id = location.warehouse_id
+       LEFT JOIN operations_locations parent
+         ON parent.organization_id = location.organization_id
+        AND parent.id = location.parent_location_id
+       LEFT JOIN LATERAL (
+         SELECT
+           COALESCE(sum(
+             position.on_hand_quantity
+             * profile.length_mm * profile.width_mm * profile.height_mm
+             / 1000000000.0
+           ), 0) AS used_volume_cubic_meters,
+           COALESCE(sum(position.on_hand_quantity * profile.weight_grams / 1000.0), 0) AS used_weight_kg
+         FROM operations_inventory_positions position
+         LEFT JOIN operations_product_package_profiles profile
+           ON profile.organization_id = position.organization_id
+          AND profile.product_id = position.product_id
+          AND profile.active = true
+          AND profile.is_default = true
+         WHERE position.organization_id = location.organization_id
+           AND position.location_id = location.id
+       ) usage ON true
+       WHERE location.organization_id = $1::uuid AND warehouse.code <> 'MOCK-01'
+       ORDER BY lower(warehouse.name), location.pick_sequence, lower(location.code), location.id`,
+      [organizationId],
+    ),
+    query<LocationProductRuleRow>(
+      `SELECT rule.global_id, rule.location_id::text,
+              product.reference_code AS product_global_id, product.name AS product_name,
+              rule.rule_type, rule.max_quantity::text, rule.active
+       FROM operations_location_product_rules rule
+       JOIN crm_products product
+         ON product.pipeline_id = rule.pipeline_id AND product.id = rule.product_id
+       WHERE rule.organization_id = $1::uuid
+       ORDER BY rule.location_id, lower(product.name), rule.id`,
+      [organizationId],
+    ),
+    query<InventoryPoolRow>(
+      `SELECT pool.id::text, pool.global_id, pool.name, pool.pool_type,
+              pool.allocation_policy, pool.active,
+              owner.reference_code AS owner_customer_global_id,
+              owner.name AS owner_customer_name
+       FROM operations_inventory_pools pool
+       LEFT JOIN crm_organizations owner
+         ON owner.pipeline_id = pool.pipeline_id AND owner.id = pool.owner_customer_id
+       WHERE pool.organization_id = $1::uuid
+       ORDER BY pool.active DESC, lower(pool.name), pool.id`,
+      [organizationId],
+    ),
+    query<InventoryPoolCustomerRow>(
+      `SELECT eligible.pool_id::text, customer.reference_code AS global_id,
+              customer.name, eligible.priority
+       FROM operations_inventory_pool_customers eligible
+       JOIN crm_organizations customer
+         ON customer.pipeline_id = eligible.pipeline_id AND customer.id = eligible.customer_id
+       WHERE eligible.organization_id = $1::uuid
+         AND eligible.effective_from <= now()
+         AND (eligible.effective_to IS NULL OR eligible.effective_to > now())
+       ORDER BY eligible.pool_id, eligible.priority, lower(customer.name), customer.id`,
+      [organizationId],
+    ),
+    query<InboundReceiptRow>(
+      `SELECT receipt.id::text, receipt.global_id, receipt.reference_number,
+              receipt.status, warehouse.global_id AS warehouse_global_id,
+              warehouse.name AS warehouse_name, pool.global_id AS pool_global_id,
+              pool.name AS pool_name, receipt.expected_at, receipt.completed_at,
+              receipt.row_version::text
+       FROM operations_receipts receipt
+       JOIN operations_warehouses warehouse
+         ON warehouse.organization_id = receipt.organization_id AND warehouse.id = receipt.warehouse_id
+       JOIN operations_inventory_pools pool
+         ON pool.organization_id = receipt.organization_id AND pool.id = receipt.inventory_pool_id
+       WHERE receipt.organization_id = $1::uuid
+       ORDER BY
+         CASE receipt.status WHEN 'receiving' THEN 0 WHEN 'expected' THEN 1 ELSE 2 END,
+         receipt.expected_at NULLS LAST, receipt.updated_at DESC, receipt.id DESC
+       LIMIT 200`,
+      [organizationId],
+    ),
+    query<InboundReceiptLineRow>(
+      `SELECT line.id::text, line.global_id, line.receipt_id::text, line.line_number,
+              product.reference_code AS product_global_id, product.name AS product_name,
+              NULLIF(btrim(product.sku), '') AS product_sku,
+              location.global_id AS location_global_id, location.code AS location_code,
+              line.expected_quantity::text, line.accepted_quantity::text,
+              line.damaged_quantity::text, line.lot_code, line.unit_of_measure
+       FROM operations_receipt_lines line
+       JOIN crm_products product
+         ON product.pipeline_id = line.pipeline_id AND product.id = line.product_id
+       JOIN operations_locations location
+         ON location.organization_id = line.organization_id AND location.id = line.target_location_id
+       WHERE line.organization_id = $1::uuid
+       ORDER BY line.receipt_id, line.line_number`,
       [organizationId],
     ),
     query<CustomerRow>(
@@ -1631,6 +2123,39 @@ export async function readOperationsWorkspaceFromPostgres(input: {
        WHERE product.pipeline_id = $1::uuid AND product.active = true
        ORDER BY lower(product.name), product.id LIMIT 500`,
       [activation.data_pipeline_id],
+    ),
+    query<QueryResultRow & {
+      global_id: string
+      provider: 'ups_rest' | 'fedex_rest'
+      display_name: string
+      account_number_last_four: string
+      allow_sender_billing: boolean
+      allow_recipient_billing: boolean
+      allow_third_party_billing: boolean
+    }>(
+      `SELECT account.global_id, integration.provider, account.display_name,
+              account.account_number_last_four,
+              account.allow_sender_billing, account.allow_recipient_billing,
+              account.allow_third_party_billing
+       FROM operations_carrier_accounts account
+       JOIN operations_integration_accounts integration
+         ON integration.organization_id = account.organization_id
+        AND integration.id = account.integration_account_id
+       WHERE account.organization_id = $1::uuid
+         AND account.status = 'active'
+         AND integration.status = 'active'
+         AND integration.environment = 'sandbox'
+         AND integration.integration_type = 'carrier'
+         AND integration.provider IN ('ups_rest', 'fedex_rest')
+         AND EXISTS (
+           SELECT 1
+           FROM operations_carrier_credentials credential
+           WHERE credential.organization_id = integration.organization_id
+             AND credential.integration_account_id = integration.id
+             AND credential.verification_status = 'verified'
+         )
+       ORDER BY integration.provider, lower(account.display_name), account.id`,
+      [organizationId],
     ),
   ])
 
@@ -1683,13 +2208,745 @@ export async function readOperationsWorkspaceFromPostgres(input: {
       activationState: activation.state,
       canExecute: input.capabilities.canExecute,
     }) : null,
-    warehouses: warehouseResult.rows.map((row) => ({ id: row.id, globalId: row.global_id, name: row.name })),
+    warehouses: warehouseResult.rows.map((row) => ({
+      id: row.id,
+      globalId: row.global_id,
+      code: row.code,
+      name: row.name,
+      facilityType: row.facility_type,
+      timezone: row.timezone,
+      address: json(row.address) as Address,
+      status: row.status,
+      cutoffTime: row.cutoff_time,
+      rowVersion: Number(row.row_version),
+      locations: warehouseLocationResult.rows
+        .filter((location) => location.warehouse_id === row.id)
+        .map((location) => ({
+          id: location.id,
+          globalId: location.global_id,
+          code: location.code,
+          zone: location.zone,
+          locationType: location.location_type,
+          topologyLevel: location.topology_level,
+          parentLocationGlobalId: location.parent_location_global_id,
+          pickSequence: location.pick_sequence,
+          active: location.active,
+          maxVolumeCubicMeters: location.max_volume_cubic_meters === null ? null : Number(location.max_volume_cubic_meters),
+          maxWeightKg: location.max_weight_kg === null ? null : Number(location.max_weight_kg),
+          usedVolumeCubicMeters: Number(location.used_volume_cubic_meters),
+          usedWeightKg: Number(location.used_weight_kg),
+          allowMixedProducts: location.allow_mixed_products,
+          notes: location.notes,
+          rowVersion: Number(location.row_version),
+          productRules: locationProductRuleResult.rows
+            .filter((rule) => rule.location_id === location.id)
+            .map((rule) => ({
+              globalId: rule.global_id,
+              productGlobalId: rule.product_global_id,
+              productName: rule.product_name,
+              ruleType: rule.rule_type,
+              maxQuantity: rule.max_quantity === null ? null : Number(rule.max_quantity),
+              active: rule.active,
+            })),
+        })),
+    })),
+    inventoryPools: inventoryPoolResult.rows.map((row) => ({
+      id: row.id,
+      globalId: row.global_id,
+      name: row.name,
+      poolType: row.pool_type,
+      allocationPolicy: row.allocation_policy,
+      ownerCustomerGlobalId: row.owner_customer_global_id,
+      ownerCustomerName: row.owner_customer_name,
+      eligibleCustomers: inventoryPoolCustomerResult.rows
+        .filter((customer) => customer.pool_id === row.id)
+        .map((customer) => ({
+          globalId: customer.global_id,
+          name: customer.name,
+          priority: customer.priority,
+        })),
+      active: row.active,
+    })),
+    inboundReceipts: inboundReceiptResult.rows.map((row) => {
+      const lines = inboundReceiptLineResult.rows
+        .filter((line) => line.receipt_id === row.id)
+        .map((line) => ({
+          id: line.id,
+          globalId: line.global_id,
+          lineNumber: line.line_number,
+          productGlobalId: line.product_global_id,
+          productName: line.product_name,
+          productSku: line.product_sku,
+          targetLocationGlobalId: line.location_global_id,
+          targetLocationCode: line.location_code,
+          expectedQuantity: Number(line.expected_quantity),
+          acceptedQuantity: Number(line.accepted_quantity),
+          damagedQuantity: Number(line.damaged_quantity),
+          lotCode: line.lot_code,
+          unitOfMeasure: line.unit_of_measure,
+        }))
+      return {
+        id: row.id,
+        globalId: row.global_id,
+        referenceNumber: row.reference_number,
+        status: row.status,
+        warehouseGlobalId: row.warehouse_global_id,
+        warehouseName: row.warehouse_name,
+        inventoryPoolGlobalId: row.pool_global_id,
+        inventoryPoolName: row.pool_name,
+        expectedAt: row.expected_at?.toISOString() || null,
+        completedAt: row.completed_at?.toISOString() || null,
+        rowVersion: Number(row.row_version),
+        expectedQuantity: lines.reduce((sum, line) => sum + line.expectedQuantity, 0),
+        receivedQuantity: lines.reduce((sum, line) => sum + line.acceptedQuantity, 0),
+        damagedQuantity: lines.reduce((sum, line) => sum + line.damagedQuantity, 0),
+        lines,
+      }
+    }),
     catalog: {
       customers: uniqueReferenceRows(customerResult.rows).map((row) => ({ id: row.id, globalId: row.reference_code, name: row.name })),
       products: uniqueReferenceRows(productResult.rows).map((row) => ({ id: row.id, globalId: row.reference_code, name: row.name, sku: row.sku })),
     },
+    shipping: {
+      sandboxCarrierAccounts: sandboxCarrierAccountResult.rows.map((row) => ({
+        globalId: row.global_id,
+        provider: row.provider,
+        displayName: row.display_name,
+        accountNumberLastFour: row.account_number_last_four,
+        billingRelationships: [
+          ...(row.allow_sender_billing ? ['sender' as const] : []),
+          ...(row.allow_recipient_billing ? ['recipient' as const] : []),
+          ...(row.allow_third_party_billing ? ['third_party' as const] : []),
+        ],
+      })),
+    },
     generatedAt: new Date().toISOString(),
   }
+}
+
+const WAREHOUSE_LOCATION_TYPES = new Set([
+  'receiving', 'storage', 'pick', 'pack', 'staging', 'shipping', 'returns',
+])
+const WAREHOUSE_FACILITY_TYPES = new Set([
+  'distribution_center', 'store', 'dark_store', 'micro_fulfillment',
+  'cross_dock', 'supplier', 'drop_ship', 'third_party',
+])
+const WAREHOUSE_TOPOLOGY_LEVELS = new Set([
+  'building', 'zone', 'aisle', 'row', 'bay', 'level', 'shelf', 'bin',
+  'staging', 'dock', 'station',
+])
+const LOCATION_PRODUCT_RULE_TYPES = new Set(['allowed', 'preferred', 'restricted'])
+
+type LocationProductRuleInput = {
+  productGlobalId: string
+  ruleType: 'allowed' | 'preferred' | 'restricted'
+  maxQuantity?: number | null
+}
+
+type OperationsLocationMutationInput = {
+  organizationId: string
+  actorEmail: string
+  warehouseGlobalId: string
+  code: string
+  zone: string
+  locationType: OperationsWorkspace['warehouses'][number]['locations'][number]['locationType']
+  topologyLevel: OperationsWorkspace['warehouses'][number]['locations'][number]['topologyLevel']
+  parentLocationGlobalId?: string | null
+  pickSequence: number
+  active?: boolean
+  maxVolumeCubicMeters?: number | null
+  maxWeightKg?: number | null
+  allowMixedProducts?: boolean
+  notes?: string | null
+  productRules?: LocationProductRuleInput[]
+}
+
+function optionalPositiveCapacity(value: unknown, label: string): number | null {
+  if (value === null || value === undefined || value === '') return null
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric) || numeric <= 0 || numeric > 1_000_000_000) {
+    throw new OperationsRequestError('OPERATIONS_LOCATION_CAPACITY_INVALID', `${label} must be greater than zero`)
+  }
+  return numeric
+}
+
+function validateLocationMutation(input: OperationsLocationMutationInput) {
+  const actorEmail = trimmed(input.actorEmail, 320).toLowerCase()
+  const code = trimmed(input.code, 40).toUpperCase()
+  const zone = trimmed(input.zone, 80).toUpperCase()
+  if (!actorEmail) throw new OperationsRequestError('OPERATIONS_ACTOR_REQUIRED', 'A signed-in user is required', 401)
+  if (!/^gwh\d{7}$/.test(input.warehouseGlobalId)) {
+    throw new OperationsRequestError('OPERATIONS_WAREHOUSE_INVALID', 'Warehouse is invalid')
+  }
+  if (!code || !/^[A-Z0-9][A-Z0-9_-]*$/.test(code)) {
+    throw new OperationsRequestError('OPERATIONS_LOCATION_CODE_INVALID', 'Location code may use letters, numbers, hyphens, and underscores')
+  }
+  if (!zone) throw new OperationsRequestError('OPERATIONS_LOCATION_ZONE_REQUIRED', 'Location zone is required')
+  if (!WAREHOUSE_LOCATION_TYPES.has(input.locationType)) {
+    throw new OperationsRequestError('OPERATIONS_LOCATION_TYPE_INVALID', 'Location type is invalid')
+  }
+  if (!WAREHOUSE_TOPOLOGY_LEVELS.has(input.topologyLevel)) {
+    throw new OperationsRequestError('OPERATIONS_TOPOLOGY_LEVEL_INVALID', 'Topology level is invalid')
+  }
+  if (!Number.isSafeInteger(input.pickSequence) || input.pickSequence < 0 || input.pickSequence > 1_000_000) {
+    throw new OperationsRequestError('OPERATIONS_PICK_SEQUENCE_INVALID', 'Pick sequence is invalid')
+  }
+  const rules = input.productRules || []
+  if (rules.length > 250) {
+    throw new OperationsRequestError('OPERATIONS_LOCATION_RULE_LIMIT', 'A location may have up to 250 product rules')
+  }
+  const uniqueProducts = new Set<string>()
+  for (const rule of rules) {
+    if (!/^gp\d{7}$/.test(rule.productGlobalId) || !LOCATION_PRODUCT_RULE_TYPES.has(rule.ruleType)) {
+      throw new OperationsRequestError('OPERATIONS_LOCATION_RULE_INVALID', 'A location product rule is invalid')
+    }
+    if (uniqueProducts.has(rule.productGlobalId)) {
+      throw new OperationsRequestError('OPERATIONS_LOCATION_RULE_DUPLICATE', 'A product may only have one rule per location')
+    }
+    uniqueProducts.add(rule.productGlobalId)
+    optionalPositiveCapacity(rule.maxQuantity, 'Product quantity limit')
+  }
+  return {
+    actorEmail,
+    code,
+    zone,
+    notes: trimmed(input.notes, 2_000) || null,
+    maxVolumeCubicMeters: optionalPositiveCapacity(input.maxVolumeCubicMeters, 'Maximum cubic storage'),
+    maxWeightKg: optionalPositiveCapacity(input.maxWeightKg, 'Maximum weight'),
+    rules,
+  }
+}
+
+async function resolveLocationParent(
+  client: PoolClient,
+  organizationId: string,
+  warehouseId: string,
+  parentGlobalId: string | null | undefined,
+  currentLocationId?: string,
+): Promise<string | null> {
+  if (!parentGlobalId) return null
+  if (!/^gwl\d{7}$/.test(parentGlobalId)) {
+    throw new OperationsRequestError('OPERATIONS_LOCATION_PARENT_INVALID', 'Parent location is invalid')
+  }
+  const parentResult = await client.query<IdRow>(
+    `SELECT id::text, global_id
+     FROM operations_locations
+     WHERE organization_id = $1::uuid AND warehouse_id = $2::uuid
+       AND global_id = $3 AND active = true
+     LIMIT 1 FOR UPDATE`,
+    [organizationId, warehouseId, parentGlobalId],
+  )
+  const parent = parentResult.rows[0]
+  if (!parent) {
+    throw new OperationsRequestError('OPERATIONS_LOCATION_PARENT_NOT_FOUND', 'Parent location was not found in this warehouse', 404)
+  }
+  if (currentLocationId) {
+    if (parent.id === currentLocationId) {
+      throw new OperationsRequestError('OPERATIONS_LOCATION_PARENT_CYCLE', 'A location cannot be its own parent')
+    }
+    const descendantResult = await client.query<QueryResultRow & { found: boolean }>(
+      `WITH RECURSIVE descendants AS (
+         SELECT id FROM operations_locations
+         WHERE organization_id = $1::uuid AND parent_location_id = $2::uuid
+         UNION ALL
+         SELECT child.id
+         FROM operations_locations child
+         JOIN descendants parent ON child.parent_location_id = parent.id
+         WHERE child.organization_id = $1::uuid
+       )
+       SELECT EXISTS (SELECT 1 FROM descendants WHERE id = $3::uuid) AS found`,
+      [organizationId, currentLocationId, parent.id],
+    )
+    if (descendantResult.rows[0]?.found) {
+      throw new OperationsRequestError('OPERATIONS_LOCATION_PARENT_CYCLE', 'A location cannot be moved beneath one of its descendants')
+    }
+  }
+  return parent.id
+}
+
+async function replaceLocationProductRules(
+  client: PoolClient,
+  organizationId: string,
+  pipelineId: string,
+  locationId: string,
+  actorEmail: string,
+  rules: LocationProductRuleInput[],
+) {
+  const productIds: string[] = []
+  for (const rule of rules) {
+    const product = await resolveProduct(client, pipelineId, rule.productGlobalId)
+    productIds.push(product.id)
+    await client.query(
+      `INSERT INTO operations_location_product_rules (
+         organization_id, pipeline_id, location_id, product_id, rule_type,
+         max_quantity, active, created_by, updated_by
+       ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6::numeric, true, $7, $7)
+       ON CONFLICT (organization_id, location_id, product_id) DO UPDATE SET
+         rule_type = EXCLUDED.rule_type,
+         max_quantity = EXCLUDED.max_quantity,
+         active = true,
+         updated_by = EXCLUDED.updated_by,
+         updated_at = now()`,
+      [
+        organizationId,
+        pipelineId,
+        locationId,
+        product.id,
+        rule.ruleType,
+        optionalPositiveCapacity(rule.maxQuantity, 'Product quantity limit'),
+        actorEmail,
+      ],
+    )
+  }
+  await client.query(
+    `UPDATE operations_location_product_rules
+     SET active = false, updated_by = $4, updated_at = now()
+     WHERE organization_id = $1::uuid AND location_id = $2::uuid
+       AND (cardinality($3::uuid[]) = 0 OR product_id <> ALL($3::uuid[]))`,
+    [organizationId, locationId, productIds, actorEmail],
+  )
+}
+
+export async function createOperationsWarehouseInPostgres(input: {
+  organizationId: string
+  actorEmail: string
+  code: string
+  name: string
+  timezone: string
+  address: Address
+  facilityType?: OperationsWorkspace['warehouses'][number]['facilityType']
+  cutoffTime?: string | null
+  createStarterLocations?: boolean
+}): Promise<{ warehouseGlobalId: string; locationGlobalIds: string[] }> {
+  const organizationId = requireOrganizationId(input.organizationId)
+  const actorEmail = trimmed(input.actorEmail, 320).toLowerCase()
+  if (!actorEmail) throw new OperationsRequestError('OPERATIONS_ACTOR_REQUIRED', 'A signed-in user is required', 401)
+  const code = trimmed(input.code, 32).toUpperCase()
+  const name = trimmed(input.name, 160)
+  const timezone = trimmed(input.timezone, 80)
+  const cutoffTime = trimmed(input.cutoffTime, 8) || null
+  const facilityType = input.facilityType || 'distribution_center'
+  if (!code || !/^[A-Z0-9][A-Z0-9_-]*$/.test(code)) {
+    throw new OperationsRequestError('OPERATIONS_WAREHOUSE_CODE_INVALID', 'Warehouse code may use letters, numbers, hyphens, and underscores')
+  }
+  if (!name) throw new OperationsRequestError('OPERATIONS_WAREHOUSE_NAME_REQUIRED', 'Warehouse name is required')
+  if (!WAREHOUSE_FACILITY_TYPES.has(facilityType)) {
+    throw new OperationsRequestError('OPERATIONS_WAREHOUSE_FACILITY_INVALID', 'Warehouse facility type is invalid')
+  }
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: timezone }).format()
+  } catch {
+    throw new OperationsRequestError('OPERATIONS_WAREHOUSE_TIMEZONE_INVALID', 'Warehouse timezone is invalid')
+  }
+  if (cutoffTime && !/^([01]\d|2[0-3]):[0-5]\d$/.test(cutoffTime)) {
+    throw new OperationsRequestError('OPERATIONS_WAREHOUSE_CUTOFF_INVALID', 'Warehouse cutoff must use 24-hour HH:MM time')
+  }
+
+  return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(client, `operations:warehouse:${organizationId}:${code}`)
+    let warehouse: IdRow
+    try {
+      const result = await client.query<IdRow>(
+        `INSERT INTO operations_warehouses (
+           organization_id, code, name, facility_type, timezone, address, status,
+           cutoff_time, created_by, updated_by
+         ) VALUES ($1::uuid, $2, $3, $4, $5, $6::jsonb, 'active', $7::time, $8, $8)
+         RETURNING id::text, global_id`,
+        [organizationId, code, name, facilityType, timezone, JSON.stringify(input.address), cutoffTime, actorEmail],
+      )
+      warehouse = result.rows[0]
+    } catch (error) {
+      if ((error as { code?: string }).code === '23505') {
+        throw new OperationsRequestError('OPERATIONS_WAREHOUSE_CODE_EXISTS', 'A warehouse already uses this code', 409)
+      }
+      throw error
+    }
+
+    const starterLocations = input.createStarterLocations === false ? [] : [
+      { code: 'INBOUND', zone: 'INBOUND', type: 'receiving', level: 'zone', sequence: 1, parent: null },
+      { code: 'RECEIVE-01', zone: 'INBOUND', type: 'receiving', level: 'dock', sequence: 10, parent: 'INBOUND' },
+      { code: 'STAGE-IN-01', zone: 'INBOUND', type: 'staging', level: 'staging', sequence: 20, parent: 'INBOUND' },
+      { code: 'STORAGE', zone: 'STORAGE', type: 'storage', level: 'zone', sequence: 90, parent: null },
+      { code: 'BIN-01', zone: 'STORAGE', type: 'storage', level: 'bin', sequence: 100, parent: 'STORAGE' },
+      { code: 'FULFILLMENT', zone: 'FULFILLMENT', type: 'pick', level: 'zone', sequence: 190, parent: null },
+      { code: 'PICK-01', zone: 'FULFILLMENT', type: 'pick', level: 'station', sequence: 200, parent: 'FULFILLMENT' },
+      { code: 'PACK-01', zone: 'FULFILLMENT', type: 'pack', level: 'station', sequence: 300, parent: 'FULFILLMENT' },
+      { code: 'OUTBOUND', zone: 'OUTBOUND', type: 'shipping', level: 'zone', sequence: 390, parent: null },
+      { code: 'STAGE-OUT-01', zone: 'OUTBOUND', type: 'staging', level: 'staging', sequence: 400, parent: 'OUTBOUND' },
+      { code: 'SHIP-01', zone: 'OUTBOUND', type: 'shipping', level: 'dock', sequence: 500, parent: 'OUTBOUND' },
+      { code: 'RETURNS', zone: 'RETURNS', type: 'returns', level: 'zone', sequence: 590, parent: null },
+      { code: 'RETURNS-01', zone: 'RETURNS', type: 'returns', level: 'station', sequence: 600, parent: 'RETURNS' },
+    ] as const
+    const locationGlobalIds: string[] = []
+    const locationIdsByCode = new Map<string, string>()
+    for (const starter of starterLocations) {
+      const result = await client.query<IdRow>(
+        `INSERT INTO operations_locations (
+           organization_id, warehouse_id, code, zone, location_type,
+           topology_level, parent_location_id, pick_sequence, active, created_by, updated_by
+         ) VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, $7::uuid, $8, true, $9, $9)
+         RETURNING id::text, global_id`,
+        [
+          organizationId,
+          warehouse.id,
+          starter.code,
+          starter.zone,
+          starter.type,
+          starter.level,
+          starter.parent ? locationIdsByCode.get(starter.parent) : null,
+          starter.sequence,
+          actorEmail,
+        ],
+      )
+      locationIdsByCode.set(starter.code, result.rows[0].id)
+      locationGlobalIds.push(result.rows[0].global_id)
+    }
+    await recordAuditEvent({
+      actor: actorEmail,
+      eventType: 'operations.warehouse.created',
+      aggregateType: 'operations.warehouse',
+      aggregateId: warehouse.global_id,
+      subject: name,
+      organizationId,
+      eventKey: `operations:warehouse:${warehouse.global_id}:created`,
+      payload: { code, facilityType, timezone, cutoffTime, starterLocationCount: locationGlobalIds.length },
+    }, client)
+    return { warehouseGlobalId: warehouse.global_id, locationGlobalIds }
+  })
+}
+
+export async function createOperationsLocationInPostgres(input: OperationsLocationMutationInput): Promise<{ locationGlobalId: string }> {
+  const organizationId = requireOrganizationId(input.organizationId)
+  const normalized = validateLocationMutation(input)
+  return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(client, `operations:location:${organizationId}:${input.warehouseGlobalId}:${normalized.code}`)
+    const warehouseResult = await client.query<IdRow>(
+      `SELECT id::text, global_id FROM operations_warehouses
+       WHERE organization_id = $1::uuid AND global_id = $2 LIMIT 1 FOR UPDATE`,
+      [organizationId, input.warehouseGlobalId],
+    )
+    const warehouse = warehouseResult.rows[0]
+    if (!warehouse) throw new OperationsRequestError('OPERATIONS_WAREHOUSE_NOT_FOUND', 'Warehouse was not found', 404)
+    const parentLocationId = await resolveLocationParent(
+      client,
+      organizationId,
+      warehouse.id,
+      input.parentLocationGlobalId,
+    )
+    const pipeline = await resolvePipeline(client, organizationId)
+    try {
+      const result = await client.query<IdRow>(
+        `INSERT INTO operations_locations (
+           organization_id, warehouse_id, code, zone, location_type,
+           topology_level, parent_location_id, pick_sequence, active,
+           max_volume_cubic_meters, max_weight_kg, allow_mixed_products,
+           notes, created_by, updated_by
+         ) VALUES (
+           $1::uuid, $2::uuid, $3, $4, $5, $6, $7::uuid, $8, $9,
+           $10::numeric, $11::numeric, $12, $13, $14, $14
+         )
+         RETURNING id::text, global_id`,
+        [
+          organizationId,
+          warehouse.id,
+          normalized.code,
+          normalized.zone,
+          input.locationType,
+          input.topologyLevel,
+          parentLocationId,
+          input.pickSequence,
+          input.active !== false,
+          normalized.maxVolumeCubicMeters,
+          normalized.maxWeightKg,
+          input.allowMixedProducts !== false,
+          normalized.notes,
+          normalized.actorEmail,
+        ],
+      )
+      const location = result.rows[0]
+      await replaceLocationProductRules(
+        client,
+        organizationId,
+        pipeline.id,
+        location.id,
+        normalized.actorEmail,
+        normalized.rules,
+      )
+      await recordAuditEvent({
+        actor: normalized.actorEmail,
+        eventType: 'operations.location.created',
+        aggregateType: 'operations.location',
+        aggregateId: location.global_id,
+        subject: normalized.code,
+        organizationId,
+        eventKey: `operations:location:${location.global_id}:created`,
+        payload: {
+          warehouseGlobalId: warehouse.global_id,
+          zone: normalized.zone,
+          locationType: input.locationType,
+          topologyLevel: input.topologyLevel,
+          parentLocationGlobalId: input.parentLocationGlobalId || null,
+          pickSequence: input.pickSequence,
+          maxVolumeCubicMeters: normalized.maxVolumeCubicMeters,
+          maxWeightKg: normalized.maxWeightKg,
+          productRuleCount: normalized.rules.length,
+        },
+      }, client)
+      return { locationGlobalId: location.global_id }
+    } catch (error) {
+      if ((error as { code?: string }).code === '23505') {
+        throw new OperationsRequestError('OPERATIONS_LOCATION_CODE_EXISTS', 'This warehouse already uses that location code', 409)
+      }
+      throw error
+    }
+  })
+}
+
+export async function updateOperationsWarehouseInPostgres(input: {
+  organizationId: string
+  actorEmail: string
+  warehouseGlobalId: string
+  expectedRowVersion: number
+  name: string
+  facilityType: OperationsWorkspace['warehouses'][number]['facilityType']
+  timezone: string
+  address: Address
+  cutoffTime?: string | null
+  status: 'active' | 'inactive'
+}): Promise<{ warehouseGlobalId: string; rowVersion: number }> {
+  const organizationId = requireOrganizationId(input.organizationId)
+  const actorEmail = trimmed(input.actorEmail, 320).toLowerCase()
+  const name = trimmed(input.name, 160)
+  const cutoffTime = trimmed(input.cutoffTime, 8) || null
+  if (!actorEmail) throw new OperationsRequestError('OPERATIONS_ACTOR_REQUIRED', 'A signed-in user is required', 401)
+  if (!/^gwh\d{7}$/.test(input.warehouseGlobalId) || !name) {
+    throw new OperationsRequestError('OPERATIONS_WAREHOUSE_INVALID', 'Warehouse is invalid')
+  }
+  if (!WAREHOUSE_FACILITY_TYPES.has(input.facilityType) || !['active', 'inactive'].includes(input.status)) {
+    throw new OperationsRequestError('OPERATIONS_WAREHOUSE_FACILITY_INVALID', 'Warehouse configuration is invalid')
+  }
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: input.timezone }).format()
+  } catch {
+    throw new OperationsRequestError('OPERATIONS_WAREHOUSE_TIMEZONE_INVALID', 'Warehouse timezone is invalid')
+  }
+  if (cutoffTime && !/^([01]\d|2[0-3]):[0-5]\d$/.test(cutoffTime)) {
+    throw new OperationsRequestError('OPERATIONS_WAREHOUSE_CUTOFF_INVALID', 'Warehouse cutoff must use 24-hour HH:MM time')
+  }
+  return withTransaction(async (client) => {
+    const result = await client.query<QueryResultRow & { global_id: string; row_version: string }>(
+      `UPDATE operations_warehouses
+       SET name = $4, facility_type = $5, timezone = $6, address = $7::jsonb,
+           cutoff_time = $8::time, status = $9, row_version = row_version + 1,
+           updated_by = $10, updated_at = now()
+       WHERE organization_id = $1::uuid AND global_id = $2 AND row_version = $3
+       RETURNING global_id, row_version::text`,
+      [
+        organizationId,
+        input.warehouseGlobalId,
+        input.expectedRowVersion,
+        name,
+        input.facilityType,
+        input.timezone,
+        JSON.stringify(input.address),
+        cutoffTime,
+        input.status,
+        actorEmail,
+      ],
+    )
+    const row = result.rows[0]
+    if (!row) {
+      throw new OperationsRequestError('OPERATIONS_WAREHOUSE_VERSION_CONFLICT', 'Warehouse changed since it was opened. Refresh and try again.', 409)
+    }
+    await recordAuditEvent({
+      actor: actorEmail,
+      eventType: 'operations.warehouse.updated',
+      aggregateType: 'operations.warehouse',
+      aggregateId: row.global_id,
+      subject: name,
+      organizationId,
+      eventKey: `operations:warehouse:${row.global_id}:version:${row.row_version}`,
+      payload: { facilityType: input.facilityType, timezone: input.timezone, status: input.status, cutoffTime },
+    }, client)
+    return { warehouseGlobalId: row.global_id, rowVersion: Number(row.row_version) }
+  })
+}
+
+export async function updateOperationsLocationInPostgres(
+  input: OperationsLocationMutationInput & { locationGlobalId: string; expectedRowVersion: number },
+): Promise<{ locationGlobalId: string; rowVersion: number }> {
+  const organizationId = requireOrganizationId(input.organizationId)
+  const normalized = validateLocationMutation(input)
+  if (!/^gwl\d{7}$/.test(input.locationGlobalId)) {
+    throw new OperationsRequestError('OPERATIONS_LOCATION_INVALID', 'Location is invalid')
+  }
+  return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(client, `operations:location:${organizationId}:${input.locationGlobalId}`)
+    const currentResult = await client.query<IdRow & { warehouse_id: string }>(
+      `SELECT location.id::text, location.global_id, location.warehouse_id::text
+       FROM operations_locations location
+       JOIN operations_warehouses warehouse
+         ON warehouse.organization_id = location.organization_id
+        AND warehouse.id = location.warehouse_id
+       WHERE location.organization_id = $1::uuid
+         AND location.global_id = $2
+         AND warehouse.global_id = $3
+       LIMIT 1 FOR UPDATE OF location`,
+      [organizationId, input.locationGlobalId, input.warehouseGlobalId],
+    )
+    const current = currentResult.rows[0]
+    if (!current) throw new OperationsRequestError('OPERATIONS_LOCATION_NOT_FOUND', 'Location was not found', 404)
+    const parentLocationId = await resolveLocationParent(
+      client,
+      organizationId,
+      current.warehouse_id,
+      input.parentLocationGlobalId,
+      current.id,
+    )
+    const result = await client.query<QueryResultRow & { global_id: string; row_version: string }>(
+      `UPDATE operations_locations
+       SET code = $4, zone = $5, location_type = $6, topology_level = $7,
+           parent_location_id = $8::uuid, pick_sequence = $9, active = $10,
+           max_volume_cubic_meters = $11::numeric, max_weight_kg = $12::numeric,
+           allow_mixed_products = $13, notes = $14, row_version = row_version + 1,
+           updated_by = $15, updated_at = now()
+       WHERE organization_id = $1::uuid AND id = $2::uuid AND row_version = $3
+       RETURNING global_id, row_version::text`,
+      [
+        organizationId,
+        current.id,
+        input.expectedRowVersion,
+        normalized.code,
+        normalized.zone,
+        input.locationType,
+        input.topologyLevel,
+        parentLocationId,
+        input.pickSequence,
+        input.active !== false,
+        normalized.maxVolumeCubicMeters,
+        normalized.maxWeightKg,
+        input.allowMixedProducts !== false,
+        normalized.notes,
+        normalized.actorEmail,
+      ],
+    )
+    const row = result.rows[0]
+    if (!row) {
+      throw new OperationsRequestError('OPERATIONS_LOCATION_VERSION_CONFLICT', 'Location changed since it was opened. Refresh and try again.', 409)
+    }
+    const pipeline = await resolvePipeline(client, organizationId)
+    await replaceLocationProductRules(
+      client,
+      organizationId,
+      pipeline.id,
+      current.id,
+      normalized.actorEmail,
+      normalized.rules,
+    )
+    await recordAuditEvent({
+      actor: normalized.actorEmail,
+      eventType: 'operations.location.updated',
+      aggregateType: 'operations.location',
+      aggregateId: row.global_id,
+      subject: normalized.code,
+      organizationId,
+      eventKey: `operations:location:${row.global_id}:version:${row.row_version}`,
+      payload: {
+        zone: normalized.zone,
+        locationType: input.locationType,
+        topologyLevel: input.topologyLevel,
+        parentLocationGlobalId: input.parentLocationGlobalId || null,
+        active: input.active !== false,
+        productRuleCount: normalized.rules.length,
+      },
+    }, client)
+    return { locationGlobalId: row.global_id, rowVersion: Number(row.row_version) }
+  })
+}
+
+export async function deleteOperationsLocationInPostgres(input: {
+  organizationId: string
+  actorEmail: string
+  locationGlobalId: string
+  expectedRowVersion: number
+}): Promise<{ locationGlobalId: string; outcome: 'deleted' | 'retired' }> {
+  const organizationId = requireOrganizationId(input.organizationId)
+  const actorEmail = trimmed(input.actorEmail, 320).toLowerCase()
+  if (!actorEmail) throw new OperationsRequestError('OPERATIONS_ACTOR_REQUIRED', 'A signed-in user is required', 401)
+  if (!/^gwl\d{7}$/.test(input.locationGlobalId)) {
+    throw new OperationsRequestError('OPERATIONS_LOCATION_INVALID', 'Location is invalid')
+  }
+  return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(client, `operations:location:${organizationId}:${input.locationGlobalId}`)
+    const currentResult = await client.query<IdRow & { code: string; row_version: string }>(
+      `SELECT id::text, global_id, code, row_version::text
+       FROM operations_locations
+       WHERE organization_id = $1::uuid AND global_id = $2
+       LIMIT 1 FOR UPDATE`,
+      [organizationId, input.locationGlobalId],
+    )
+    const current = currentResult.rows[0]
+    if (!current) throw new OperationsRequestError('OPERATIONS_LOCATION_NOT_FOUND', 'Location was not found', 404)
+    if (Number(current.row_version) !== input.expectedRowVersion) {
+      throw new OperationsRequestError('OPERATIONS_LOCATION_VERSION_CONFLICT', 'Location changed since it was opened. Refresh and try again.', 409)
+    }
+    const childResult = await client.query<QueryResultRow & { count: string }>(
+      `SELECT count(*)::text AS count
+       FROM operations_locations
+       WHERE organization_id = $1::uuid AND parent_location_id = $2::uuid AND active = true`,
+      [organizationId, current.id],
+    )
+    if (Number(childResult.rows[0]?.count || 0) > 0) {
+      throw new OperationsRequestError('OPERATIONS_LOCATION_HAS_CHILDREN', 'Move or retire child locations before removing this topology node', 409)
+    }
+    let outcome: 'deleted' | 'retired' = 'deleted'
+    await client.query('SAVEPOINT delete_operations_location')
+    try {
+      await client.query(
+        `DELETE FROM operations_location_product_rules
+         WHERE organization_id = $1::uuid AND location_id = $2::uuid`,
+        [organizationId, current.id],
+      )
+      await client.query(
+        `DELETE FROM operations_locations
+         WHERE organization_id = $1::uuid AND id = $2::uuid`,
+        [organizationId, current.id],
+      )
+      await client.query('RELEASE SAVEPOINT delete_operations_location')
+    } catch (error) {
+      await client.query('ROLLBACK TO SAVEPOINT delete_operations_location')
+      if ((error as { code?: string }).code !== '23503') {
+        await client.query('RELEASE SAVEPOINT delete_operations_location')
+        throw error
+      }
+      await client.query('RELEASE SAVEPOINT delete_operations_location')
+      outcome = 'retired'
+      await client.query(
+        `UPDATE operations_locations
+         SET active = false, row_version = row_version + 1,
+             updated_by = $3, updated_at = now()
+         WHERE organization_id = $1::uuid AND id = $2::uuid`,
+        [organizationId, current.id, actorEmail],
+      )
+      await client.query(
+        `UPDATE operations_location_product_rules
+         SET active = false, updated_by = $3, updated_at = now()
+         WHERE organization_id = $1::uuid AND location_id = $2::uuid`,
+        [organizationId, current.id, actorEmail],
+      )
+    }
+    await recordAuditEvent({
+      actor: actorEmail,
+      eventType: outcome === 'deleted' ? 'operations.location.deleted' : 'operations.location.retired',
+      aggregateType: 'operations.location',
+      aggregateId: current.global_id,
+      subject: current.code,
+      organizationId,
+      eventKey: `operations:location:${current.global_id}:${outcome}:${Date.now()}`,
+      payload: { outcome },
+    }, client)
+    return { locationGlobalId: current.global_id, outcome }
+  })
 }
 
 export async function updateOperationsActivationInPostgres(input: {
@@ -2084,6 +3341,123 @@ async function completedOrderCommandResult(
     orderStatus: order.status,
     rowVersion: Number(order.row_version),
     replayed: true,
+  }
+}
+
+async function completedShipmentCommandResult(
+  organizationId: string,
+  receipt: Pick<CommandReceiptRow, 'result_global_id' | 'result_payload'>,
+): Promise<OperationsShipmentCommandResult> {
+  const payload = receipt.result_payload
+  if (payload
+    && typeof payload.orderGlobalId === 'string'
+    && payload.orderStatus === 'shipped'
+    && Number.isSafeInteger(Number(payload.rowVersion))
+    && typeof payload.shipmentGlobalId === 'string'
+    && typeof payload.trackingNumber === 'string'
+    && typeof payload.packingSlipArtifactGlobalId === 'string'
+    && typeof payload.commerceExportGlobalId === 'string'
+    && ['succeeded', 'unsupported', 'failed'].includes(String(payload.commerceExportState))) {
+    return {
+      orderGlobalId: payload.orderGlobalId,
+      orderStatus: 'shipped',
+      rowVersion: Number(payload.rowVersion),
+      shipmentGlobalId: payload.shipmentGlobalId,
+      trackingNumber: payload.trackingNumber,
+      packingSlipArtifactGlobalId: payload.packingSlipArtifactGlobalId,
+      commerceExportGlobalId: payload.commerceExportGlobalId,
+      commerceExportState: payload.commerceExportState as OperationsShipmentCommandResult['commerceExportState'],
+      replayed: true,
+      printJobGlobalId: typeof payload.printJobGlobalId === 'string'
+        ? payload.printJobGlobalId
+        : null,
+      printWarning: typeof payload.printWarning === 'string'
+        ? payload.printWarning
+        : null,
+    }
+  }
+  const orderGlobalId = receipt.result_global_id
+  if (!orderGlobalId) {
+    throw new OperationsRequestError(
+      'OPERATIONS_COMMAND_RECEIPT_INVALID',
+      'Completed command receipt has no shipment result',
+      409,
+    )
+  }
+  const result = await query<QueryResultRow & {
+    order_global_id: string
+    order_status: OperationsOrderStatus
+    row_version: string
+    shipment_global_id: string
+    tracking_number: string
+    artifact_global_id: string
+    export_global_id: string
+    export_state: string
+    print_job_global_id: string | null
+  }>(
+    `SELECT source_order.global_id AS order_global_id,
+            source_order.status AS order_status,
+            source_order.row_version::text,
+            shipment.global_id AS shipment_global_id,
+            shipment.tracking_number,
+            artifact.global_id AS artifact_global_id,
+            fulfillment_export.global_id AS export_global_id,
+            fulfillment_export.state AS export_state,
+            print_job.global_id AS print_job_global_id
+     FROM operations_orders source_order
+     JOIN LATERAL (
+       SELECT candidate.id, candidate.global_id, candidate.tracking_number
+       FROM operations_shipments candidate
+       WHERE candidate.organization_id = source_order.organization_id
+         AND candidate.order_id = source_order.id
+       ORDER BY candidate.shipped_at DESC, candidate.id DESC
+       LIMIT 1
+     ) shipment ON true
+     JOIN operations_print_artifacts artifact
+       ON artifact.organization_id = source_order.organization_id
+      AND artifact.source_shipment_id = shipment.id
+      AND artifact.document_type = 'packing_slip'
+     JOIN operations_commerce_fulfillment_exports fulfillment_export
+       ON fulfillment_export.organization_id = source_order.organization_id
+      AND fulfillment_export.shipment_id = shipment.id
+     LEFT JOIN LATERAL (
+       SELECT candidate.global_id
+       FROM operations_print_jobs candidate
+       WHERE candidate.organization_id = artifact.organization_id
+         AND candidate.artifact_id = artifact.id
+       ORDER BY candidate.created_at DESC, candidate.id DESC
+       LIMIT 1
+     ) print_job ON true
+     WHERE source_order.organization_id = $1::uuid
+       AND source_order.global_id = $2
+     LIMIT 1`,
+    [organizationId, orderGlobalId],
+  )
+  const row = result.rows[0]
+  if (!row || row.order_status !== 'shipped') {
+    throw new OperationsRequestError(
+      'OPERATIONS_COMMAND_RECEIPT_INVALID',
+      'Completed shipment result is unavailable',
+      409,
+    )
+  }
+  const exportState = ['succeeded', 'unsupported', 'failed'].includes(row.export_state)
+    ? row.export_state as OperationsShipmentCommandResult['commerceExportState']
+    : 'failed'
+  return {
+    orderGlobalId: row.order_global_id,
+    orderStatus: 'shipped',
+    rowVersion: Number(row.row_version),
+    shipmentGlobalId: row.shipment_global_id,
+    trackingNumber: row.tracking_number,
+    packingSlipArtifactGlobalId: row.artifact_global_id,
+    commerceExportGlobalId: row.export_global_id,
+    commerceExportState: exportState,
+    replayed: true,
+    printJobGlobalId: row.print_job_global_id,
+    printWarning: exportState === 'failed' && row.export_state !== 'failed'
+      ? 'Commerce fulfillment export has not reached a terminal state.'
+      : null,
   }
 }
 
@@ -4012,6 +5386,844 @@ export async function verifyOperationsOrderPackFromPostgres(input: {
     })
   } catch (error) {
     await failCommandReceipt(command.receipt.id, error)
+    throw error
+  }
+}
+
+export async function confirmOperationsOrderShipmentFromPostgres(input: {
+  organizationId: string
+  actorEmail: string
+  orderGlobalId: string
+  preferredPrinterGlobalId?: string | null
+  expectedRowVersion: number
+  reason: string
+  idempotencyKey: string
+}): Promise<OperationsShipmentCommandResult> {
+  const organizationId = requireOrganizationId(input.organizationId)
+  const actorEmail = String(input.actorEmail || '').trim().toLowerCase()
+  const orderGlobalId = String(input.orderGlobalId || '').trim()
+  const preferredPrinterGlobalId = String(input.preferredPrinterGlobalId || '').trim() || null
+  const reason = String(input.reason || '').trim()
+  const idempotencyKey = String(input.idempotencyKey || '').trim()
+  if (!actorEmail) {
+    throw new OperationsRequestError('OPERATIONS_ACTOR_REQUIRED', 'A signed-in user is required', 401)
+  }
+  if (!/^gor\d{7}$/.test(orderGlobalId)) {
+    throw new OperationsRequestError('OPERATIONS_ORDER_INVALID', 'Order is invalid')
+  }
+  if (preferredPrinterGlobalId && !/^gpr\d{7}$/.test(preferredPrinterGlobalId)) {
+    throw new OperationsRequestError('OPERATIONS_PRINTER_INVALID', 'Preferred printer is invalid')
+  }
+  if (!Number.isSafeInteger(input.expectedRowVersion) || input.expectedRowVersion < 0) {
+    throw new OperationsRequestError('OPERATIONS_ORDER_VERSION_INVALID', 'Order version is invalid')
+  }
+  if (!reason || reason.length > 500) {
+    throw new OperationsRequestError(
+      'OPERATIONS_SHIPMENT_REASON_INVALID',
+      'A shipment-confirmation reason is required',
+    )
+  }
+  if (!/^[A-Za-z0-9._:-]{8,200}$/.test(idempotencyKey)) {
+    throw new OperationsRequestError(
+      'OPERATIONS_IDEMPOTENCY_KEY_INVALID',
+      'A valid idempotency key is required',
+    )
+  }
+
+  const command = await prepareCommandReceipt({
+    organizationId,
+    commandType: 'confirm_operations_order_shipment',
+    idempotencyKey,
+    requestHash: commandRequestHash({
+      orderGlobalId,
+      preferredPrinterGlobalId,
+      expectedRowVersion: input.expectedRowVersion,
+      reason,
+    }),
+    actorEmail,
+  })
+  if (command.completed) {
+    return completedShipmentCommandResult(organizationId, command.receipt)
+  }
+
+  type ShipmentCommitContext = {
+    result: OperationsShipmentCommandResult
+    sourceProvider: string
+    externalOrderId: string
+    carrier: string
+    shippedAt: string
+    warehouseId: string
+    storageReference: string
+    renderedPackingSlip: ReturnType<typeof renderPackingSlip>
+  }
+
+  let committed = false
+  try {
+    const context = await withTransaction<ShipmentCommitContext>(async (client) => {
+      await acquireTransactionAdvisoryLock(
+        client,
+        `operations:order:${organizationId}:${orderGlobalId}`,
+      )
+      const activation = await resolveActivation(client, organizationId)
+      if (!['shadow', 'active'].includes(activation.state)) {
+        throw new OperationsRequestError(
+          'OPERATIONS_EXECUTION_STATE_INVALID',
+          'Set Operations to Shadow or Active before confirming shipments',
+          409,
+        )
+      }
+
+      const orderResult = await client.query<OrderIdentityRow & {
+        pipeline_id: string
+        customer_id: string
+        customer_global_id: string
+        customer_name: string
+        source_provider: string
+        external_order_id: string
+        order_number: string
+        currency: string
+        ship_to: Record<string, unknown>
+        line_count: string
+      }>(
+        `SELECT source_order.id::text, source_order.global_id, source_order.status,
+                source_order.row_version::text, source_order.pipeline_id::text,
+                source_order.customer_id::text,
+                customer.reference_code AS customer_global_id,
+                customer.name AS customer_name,
+                source_order.source_provider, source_order.external_order_id,
+                source_order.order_number, source_order.currency,
+                source_order.ship_to,
+                (SELECT count(*)::text
+                 FROM operations_order_lines source_line
+                 WHERE source_line.organization_id = source_order.organization_id
+                   AND source_line.order_id = source_order.id) AS line_count
+         FROM operations_orders source_order
+         JOIN crm_organizations customer
+           ON customer.pipeline_id = source_order.pipeline_id
+          AND customer.id = source_order.customer_id
+         WHERE source_order.organization_id = $1::uuid
+           AND source_order.global_id = $2
+         FOR UPDATE OF source_order`,
+        [organizationId, orderGlobalId],
+      )
+      const order = orderResult.rows[0]
+      if (!order || order.row_version === undefined) {
+        throw new OperationsRequestError(
+          'OPERATIONS_ORDER_NOT_FOUND',
+          'Operations order was not found',
+          404,
+        )
+      }
+      if (Number(order.row_version) !== input.expectedRowVersion) {
+        throw new OperationsRequestError(
+          'OPERATIONS_ORDER_VERSION_CONFLICT',
+          'This order changed after it was opened. Refresh the order before confirming shipment.',
+          409,
+        )
+      }
+      if (order.status !== 'packed') {
+        throw new OperationsRequestError(
+          'OPERATIONS_ORDER_TRANSITION_INVALID',
+          `Shipment cannot be confirmed from ${order.status}`,
+          409,
+        )
+      }
+
+      const planResult = await client.query<QueryResultRow & {
+        id: string
+        global_id: string
+        status: string
+        warehouse_id: string
+      }>(
+        `SELECT id::text, global_id, status, warehouse_id::text
+         FROM operations_fulfillment_plans
+         WHERE organization_id = $1::uuid AND order_id = $2::uuid
+         ORDER BY version_number DESC
+         LIMIT 1
+         FOR UPDATE`,
+        [organizationId, order.id],
+      )
+      const plan = planResult.rows[0]
+      if (!plan || plan.status !== 'released') {
+        throw new OperationsRequestError(
+          'OPERATIONS_FULFILLMENT_PLAN_INVALID',
+          'The released fulfillment plan is unavailable for shipment confirmation',
+          409,
+        )
+      }
+
+      const waveResult = await client.query<IdRow & { status: string }>(
+        `SELECT wave.id::text, wave.global_id, wave.status
+         FROM operations_waves wave
+         WHERE wave.organization_id = $1::uuid
+           AND wave.id = (
+             SELECT pick.wave_id
+             FROM operations_pick_tasks pick
+             WHERE pick.organization_id = $1::uuid
+               AND pick.plan_id = $2::uuid
+             ORDER BY pick.created_at, pick.id
+             LIMIT 1
+           )
+         FOR UPDATE`,
+        [organizationId, plan.id],
+      )
+      const wave = waveResult.rows[0]
+      if (!wave || wave.status !== 'completed') {
+        throw new OperationsRequestError(
+          'OPERATIONS_WAVE_INVALID',
+          'The warehouse wave must be complete before confirming shipment',
+          409,
+        )
+      }
+
+      const packageResult = await client.query<QueryResultRow & {
+        id: string
+        global_id: string
+        status: string
+      }>(
+        `SELECT id::text, global_id, status
+         FROM operations_packages
+         WHERE organization_id = $1::uuid AND plan_id = $2::uuid
+         ORDER BY package_number, id
+         FOR UPDATE`,
+        [organizationId, plan.id],
+      )
+      if (packageResult.rows.length !== 1 || packageResult.rows[0].status !== 'labeled') {
+        throw new OperationsRequestError(
+          'OPERATIONS_SHIPMENT_PACKAGE_INVALID',
+          'Shipment confirmation currently requires exactly one verified, labeled package',
+          409,
+        )
+      }
+      const sourcePackage = packageResult.rows[0]
+
+      const unresolvedAttempts = await client.query<QueryResultRow & {
+        id: string
+        state: string
+      }>(
+        `SELECT id::text, state
+         FROM operations_label_attempts
+         WHERE organization_id = $1::uuid
+           AND order_id = $2::uuid
+           AND state IN ('prepared', 'unknown')
+         FOR UPDATE`,
+        [organizationId, order.id],
+      )
+      if (unresolvedAttempts.rows.length > 0) {
+        throw new OperationsRequestError(
+          'OPERATIONS_LABEL_ATTEMPT_UNRESOLVED',
+          'Resolve pending or unknown carrier label attempts before confirming shipment',
+          409,
+        )
+      }
+
+      const labelResult = await client.query<QueryResultRow & {
+        id: string
+        global_id: string
+        environment: 'mock' | 'sandbox' | 'production'
+        tracking_number: string
+        carrier: string
+        service_code: string
+        internal_cost_minor: string
+      }>(
+        `SELECT label.id::text, label.global_id, label.environment,
+                label.tracking_number, label.carrier, label.service_code,
+                rate.internal_cost_minor::text
+         FROM operations_labels label
+         JOIN operations_carrier_rates rate
+           ON rate.organization_id = label.organization_id
+          AND rate.id = label.carrier_rate_id
+         WHERE label.organization_id = $1::uuid
+           AND label.package_id = $2::uuid
+           AND label.status = 'created'
+         ORDER BY label.created_at DESC, label.id DESC
+         FOR UPDATE OF label`,
+        [organizationId, sourcePackage.id],
+      )
+      if (labelResult.rows.length !== 1) {
+        throw new OperationsRequestError(
+          'OPERATIONS_ACTIVE_LABEL_INVALID',
+          'Exactly one active carrier label is required before confirming shipment',
+          409,
+        )
+      }
+      const label = labelResult.rows[0]
+      if (label.environment === 'sandbox') {
+        throw new OperationsRequestError(
+          'OPERATIONS_SANDBOX_LABEL_CANNOT_SHIP',
+          'Sandbox labels are test evidence only. Void the sandbox label; it cannot confirm shipment or consume inventory.',
+          409,
+        )
+      }
+      if (!['mock', 'production'].includes(label.environment)) {
+        throw new OperationsRequestError(
+          'OPERATIONS_LABEL_ENVIRONMENT_INVALID',
+          'Only mock or production label evidence may confirm a shipment',
+          409,
+        )
+      }
+
+      const blockingResult = await client.query<QueryResultRow & { count: string }>(
+        `SELECT count(*)::text AS count
+         FROM operations_exceptions
+         WHERE organization_id = $1::uuid
+           AND order_id = $2::uuid
+           AND status IN ('open', 'acknowledged')
+           AND severity IN ('high', 'critical')`,
+        [organizationId, order.id],
+      )
+      if (Number(blockingResult.rows[0]?.count || 0) > 0) {
+        throw new OperationsRequestError(
+          'OPERATIONS_ORDER_BLOCKED_BY_EXCEPTION',
+          'Resolve high or critical order exceptions before confirming shipment',
+          409,
+        )
+      }
+
+      const existingShipment = await client.query<IdRow>(
+        `SELECT id::text, global_id
+         FROM operations_shipments
+         WHERE organization_id = $1::uuid AND order_id = $2::uuid
+         FOR UPDATE`,
+        [organizationId, order.id],
+      )
+      if (existingShipment.rows.length > 0) {
+        throw new OperationsRequestError(
+          'OPERATIONS_SHIPMENT_ALREADY_CONFIRMED',
+          'This order already has shipment evidence',
+          409,
+        )
+      }
+
+      const allocationResult = await client.query<QueryResultRow & {
+        line_id: string
+        line_global_id: string
+        line_quantity: string
+        product_global_id: string
+        product_name: string
+        channel_sku: string
+        allocation_quantity: string
+        reservation_id: string
+        reservation_global_id: string
+        reservation_quantity: string
+        reservation_status: string
+        position_id: string
+        position_global_id: string
+        position_warehouse_id: string
+        position_warehouse_global_id: string
+        position_warehouse_name: string
+        position_location_id: string
+        on_hand_quantity: string
+        reserved_quantity: string
+      }>(
+        `SELECT source_line.id::text AS line_id,
+                source_line.global_id AS line_global_id,
+                source_line.quantity::text AS line_quantity,
+                product.reference_code AS product_global_id,
+                product.name AS product_name,
+                source_line.channel_sku,
+                allocation.quantity::text AS allocation_quantity,
+                reservation.id::text AS reservation_id,
+                reservation.global_id AS reservation_global_id,
+                reservation.quantity::text AS reservation_quantity,
+                reservation.status AS reservation_status,
+                position.id::text AS position_id,
+                position.global_id AS position_global_id,
+                position.warehouse_id::text AS position_warehouse_id,
+                warehouse.global_id AS position_warehouse_global_id,
+                warehouse.name AS position_warehouse_name,
+                position.location_id::text AS position_location_id,
+                position.on_hand_quantity::text,
+                position.reserved_quantity::text
+         FROM operations_fulfillment_allocations allocation
+         JOIN operations_order_lines source_line
+           ON source_line.organization_id = allocation.organization_id
+          AND source_line.id = allocation.order_line_id
+         JOIN crm_products product
+           ON product.pipeline_id = source_line.pipeline_id
+          AND product.id = source_line.product_id
+         JOIN operations_reservations reservation
+           ON reservation.organization_id = allocation.organization_id
+          AND reservation.id = allocation.reservation_id
+         JOIN operations_inventory_positions position
+           ON position.organization_id = allocation.organization_id
+          AND position.id = allocation.position_id
+         JOIN operations_warehouses warehouse
+           ON warehouse.organization_id = position.organization_id
+          AND warehouse.id = position.warehouse_id
+         WHERE allocation.organization_id = $1::uuid
+           AND allocation.plan_id = $2::uuid
+         ORDER BY source_line.created_at, source_line.id, allocation.created_at, allocation.id
+         FOR UPDATE OF allocation, reservation, position, source_line`,
+        [organizationId, plan.id],
+      )
+      const allocations = allocationResult.rows
+      const allocatedByLine = new Map<string, number>()
+      for (const allocation of allocations) {
+        const quantity = numberValue(allocation.allocation_quantity)
+        allocatedByLine.set(
+          allocation.line_id,
+          (allocatedByLine.get(allocation.line_id) || 0) + quantity,
+        )
+        if (
+          allocation.reservation_status !== 'active'
+          || numberValue(allocation.reservation_quantity) !== quantity
+          || allocation.position_warehouse_id !== plan.warehouse_id
+        ) {
+          throw new OperationsRequestError(
+            'OPERATIONS_RESERVATION_INVALID',
+            'Shipment allocations no longer match active reservations in the selected warehouse',
+            409,
+          )
+        }
+      }
+      const completeLineIds = new Set(
+        allocations
+          .filter((allocation) => (
+            allocatedByLine.get(allocation.line_id) === numberValue(allocation.line_quantity)
+          ))
+          .map((allocation) => allocation.line_id),
+      )
+      if (
+        allocations.length < 1
+        || completeLineIds.size !== Number(order.line_count)
+      ) {
+        throw new OperationsRequestError(
+          'OPERATIONS_ALLOCATION_INCOMPLETE',
+          'Every order line must remain fully allocated before shipment confirmation',
+          409,
+        )
+      }
+
+      const shipmentResult = await client.query<IdRow & { shipped_at: Date }>(
+        `INSERT INTO operations_shipments (
+           organization_id, order_id, plan_id, package_id, label_id, status,
+           tracking_number, shipped_at, quoted_carrier_cost_minor, confirmed_by
+         ) VALUES (
+           $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, 'confirmed',
+           $6, now(), $7, $8
+         )
+         RETURNING id::text, global_id, shipped_at`,
+        [
+          organizationId,
+          order.id,
+          plan.id,
+          sourcePackage.id,
+          label.id,
+          label.tracking_number,
+          label.internal_cost_minor,
+          actorEmail,
+        ],
+      )
+      const shipment = shipmentResult.rows[0]
+      const shippedAt = shipment.shipped_at.toISOString()
+
+      for (const allocation of allocations) {
+        await consumeReservedInventory(client, {
+          organizationId,
+          order,
+          position: {
+            id: allocation.position_id,
+            global_id: allocation.position_global_id,
+            warehouse_id: allocation.position_warehouse_id,
+            warehouse_global_id: allocation.position_warehouse_global_id,
+            warehouse_name: allocation.position_warehouse_name,
+            location_id: allocation.position_location_id,
+            on_hand_quantity: allocation.on_hand_quantity,
+            reserved_quantity: allocation.reserved_quantity,
+          },
+          reservation: {
+            id: allocation.reservation_id,
+            global_id: allocation.reservation_global_id,
+          },
+          quantity: numberValue(allocation.allocation_quantity),
+          actorEmail,
+        })
+      }
+
+      const packingLines = [...new Map(allocations.map((allocation) => [
+        allocation.line_id,
+        {
+          productGlobalId: allocation.product_global_id,
+          productName: allocation.product_name,
+          channelSku: allocation.channel_sku,
+          quantity: numberValue(allocation.line_quantity),
+        },
+      ])).values()]
+      const packingSnapshot = {
+        orderGlobalId: order.global_id,
+        orderNumber: order.order_number,
+        customerName: order.customer_name,
+        customerGlobalId: order.customer_global_id,
+        shipmentGlobalId: shipment.global_id,
+        trackingNumber: label.tracking_number,
+        carrier: label.carrier,
+        serviceCode: label.service_code,
+        shippedAt,
+        shipTo: address(order.ship_to),
+        lines: packingLines,
+      }
+      const renderedPackingSlip = renderPackingSlip(packingSnapshot)
+      const storageReference = (
+        `clawpilot-document:${shipment.global_id}:packing-slip:${renderedPackingSlip.contentSha256}`
+      )
+      const artifactResult = await client.query<IdRow>(
+        `INSERT INTO operations_print_artifacts (
+           organization_id, source_order_id, source_shipment_id,
+           document_type, format, media_size, content_sha256,
+           byte_length, storage_reference, created_by
+         ) VALUES (
+           $1::uuid, $2::uuid, $3::uuid, 'packing_slip', 'PDF', 'letter',
+           $4, $5, $6, $7
+         )
+         RETURNING id::text, global_id`,
+        [
+          organizationId,
+          order.id,
+          shipment.id,
+          renderedPackingSlip.contentSha256,
+          renderedPackingSlip.byteLength,
+          storageReference,
+          actorEmail,
+        ],
+      )
+      const artifact = artifactResult.rows[0]
+      await client.query(
+        `INSERT INTO operations_print_artifact_payloads (
+           artifact_id, organization_id, mime_type, filename, payload,
+           template_version, render_snapshot
+         ) VALUES (
+           $1::uuid, $2::uuid, $3, $4, $5, $6, $7::jsonb
+         )`,
+        [
+          artifact.id,
+          organizationId,
+          renderedPackingSlip.mimeType,
+          renderedPackingSlip.filename,
+          renderedPackingSlip.payload,
+          PACKING_SLIP_TEMPLATE_VERSION,
+          JSON.stringify(packingSnapshot),
+        ],
+      )
+
+      await client.query(
+        `INSERT INTO operations_tracking_observations (
+           organization_id, shipment_id, status, provider, location,
+           observed_at, source, raw_snapshot, idempotency_key, actor_email
+         ) VALUES (
+           $1::uuid, $2::uuid, 'confirmed', $3, NULL,
+           $4::timestamptz, 'shipment_confirmation', $5::jsonb, $6, $7
+         )`,
+        [
+          organizationId,
+          shipment.id,
+          label.carrier,
+          shippedAt,
+          JSON.stringify({
+            shipmentGlobalId: shipment.global_id,
+            labelGlobalId: label.global_id,
+            trackingNumber: label.tracking_number,
+            environment: label.environment,
+          }),
+          `${shipment.global_id}:tracking:confirmed`,
+          actorEmail,
+        ],
+      )
+
+      const exportSnapshot = {
+        orderGlobalId: order.global_id,
+        shipmentGlobalId: shipment.global_id,
+        externalOrderId: order.external_order_id,
+        trackingNumber: label.tracking_number,
+        carrier: label.carrier,
+        serviceCode: label.service_code,
+        shippedAt,
+      }
+      const exportResult = await client.query<IdRow>(
+        `INSERT INTO operations_commerce_fulfillment_exports (
+           organization_id, order_id, shipment_id, provider,
+           external_order_id, state, payload_snapshot, idempotency_key
+         ) VALUES (
+           $1::uuid, $2::uuid, $3::uuid, $4, $5,
+           'queued', $6::jsonb, $7
+         )
+         RETURNING id::text, global_id`,
+        [
+          organizationId,
+          order.id,
+          shipment.id,
+          order.source_provider,
+          order.external_order_id,
+          JSON.stringify(exportSnapshot),
+          `${shipment.global_id}:commerce-fulfillment`,
+        ],
+      )
+      const fulfillmentExport = exportResult.rows[0]
+
+      const updatedPackage = await client.query(
+        `UPDATE operations_packages
+         SET status = 'shipped'
+         WHERE organization_id = $1::uuid
+           AND id = $2::uuid
+           AND status = 'labeled'
+         RETURNING id`,
+        [organizationId, sourcePackage.id],
+      )
+      if (updatedPackage.rowCount !== 1) {
+        throw new OperationsRequestError(
+          'OPERATIONS_PACKAGE_CHANGED',
+          'The package changed before shipment confirmation. Refresh and try again.',
+          409,
+        )
+      }
+      const fulfilledPlan = await client.query(
+        `UPDATE operations_fulfillment_plans
+         SET status = 'fulfilled', updated_at = now()
+         WHERE organization_id = $1::uuid
+           AND id = $2::uuid
+           AND status = 'released'
+         RETURNING id`,
+        [organizationId, plan.id],
+      )
+      if (fulfilledPlan.rowCount !== 1) {
+        throw new OperationsRequestError(
+          'OPERATIONS_FULFILLMENT_PLAN_CHANGED',
+          'The fulfillment plan changed before shipment confirmation',
+          409,
+        )
+      }
+      const updatedOrder = await client.query<OrderIdentityRow>(
+        `UPDATE operations_orders
+         SET status = 'shipped', updated_by = $4, updated_at = now(),
+             row_version = row_version + 1
+         WHERE organization_id = $1::uuid
+           AND id = $2::uuid
+           AND status = 'packed'
+           AND row_version = $3
+         RETURNING id::text, global_id, status, row_version::text`,
+        [organizationId, order.id, input.expectedRowVersion, actorEmail],
+      )
+      const shippedOrder = updatedOrder.rows[0]
+      if (!shippedOrder || shippedOrder.row_version === undefined) {
+        throw new OperationsRequestError(
+          'OPERATIONS_ORDER_VERSION_CONFLICT',
+          'This order changed before shipment could be confirmed. Refresh and try again.',
+          409,
+        )
+      }
+
+      await appendDomainEvent(client, {
+        organizationId,
+        aggregateType: 'operations.order',
+        aggregateId: order.id,
+        aggregateGlobalId: order.global_id,
+        eventType: 'operations.shipment.confirmed',
+        actorEmail,
+        correlationId: command.receipt.correlation_id,
+        idempotencyKey: `${shipment.global_id}:confirmed`,
+        payload: {
+          shipmentGlobalId: shipment.global_id,
+          labelGlobalId: label.global_id,
+          trackingNumber: label.tracking_number,
+          carrier: label.carrier,
+          serviceCode: label.service_code,
+          labelEnvironment: label.environment,
+          packingSlipArtifactGlobalId: artifact.global_id,
+          commerceExportGlobalId: fulfillmentExport.global_id,
+          reason,
+        },
+      })
+      await appendDomainEvent(client, {
+        organizationId,
+        aggregateType: 'operations.order',
+        aggregateId: order.id,
+        aggregateGlobalId: order.global_id,
+        eventType: 'operations.inventory.consumed',
+        actorEmail,
+        correlationId: command.receipt.correlation_id,
+        idempotencyKey: `${shipment.global_id}:inventory-consumed`,
+        payload: {
+          shipmentGlobalId: shipment.global_id,
+          allocations: allocations.map((allocation) => ({
+            inventoryPositionGlobalId: allocation.position_global_id,
+            productGlobalId: allocation.product_global_id,
+            quantity: numberValue(allocation.allocation_quantity),
+          })),
+        },
+      })
+      await appendDomainEvent(client, {
+        organizationId,
+        aggregateType: 'operations.order',
+        aggregateId: order.id,
+        aggregateGlobalId: order.global_id,
+        eventType: 'operations.commerce_fulfillment.queued',
+        actorEmail,
+        correlationId: command.receipt.correlation_id,
+        idempotencyKey: `${fulfillmentExport.global_id}:queued`,
+        payload: exportSnapshot,
+      })
+      await recordAuditEvent({
+        actor: actorEmail,
+        eventType: 'operations.order.shipment_confirmed',
+        aggregateType: 'operations.order',
+        aggregateId: order.global_id,
+        subject: `Confirmed shipment for ${order.global_id}`,
+        organizationId,
+        eventKey: `operations:order-shipment-confirmed:${command.receipt.id}`,
+        payload: {
+          previousStatus: 'packed',
+          status: 'shipped',
+          previousRowVersion: input.expectedRowVersion,
+          rowVersion: Number(shippedOrder.row_version),
+          shipmentGlobalId: shipment.global_id,
+          labelGlobalId: label.global_id,
+          labelEnvironment: label.environment,
+          trackingNumber: label.tracking_number,
+          packingSlipArtifactGlobalId: artifact.global_id,
+          commerceExportGlobalId: fulfillmentExport.global_id,
+          reason,
+        },
+      }, client)
+
+      const result: OperationsShipmentCommandResult = {
+        orderGlobalId: shippedOrder.global_id,
+        orderStatus: 'shipped',
+        rowVersion: Number(shippedOrder.row_version),
+        shipmentGlobalId: shipment.global_id,
+        trackingNumber: label.tracking_number,
+        packingSlipArtifactGlobalId: artifact.global_id,
+        commerceExportGlobalId: fulfillmentExport.global_id,
+        commerceExportState: 'failed',
+        replayed: false,
+        printJobGlobalId: null,
+        printWarning: 'Shipment committed; print and commerce post-processing are pending.',
+      }
+      await completeCommandReceipt(client, command.receipt.id, order.global_id, result)
+
+      return {
+        result,
+        sourceProvider: order.source_provider,
+        externalOrderId: order.external_order_id,
+        carrier: label.carrier,
+        shippedAt,
+        warehouseId: plan.warehouse_id,
+        storageReference,
+        renderedPackingSlip,
+      }
+    })
+    committed = true
+
+    let printJobGlobalId: string | null = null
+    let printWarning: string | null = null
+    try {
+      const printJob = await enqueueOperationsPrintJobInPostgres({
+        organizationId,
+        actorEmail,
+        idempotencyKey: `${context.result.shipmentGlobalId}:packing-slip-print`,
+        warehouseId: context.warehouseId,
+        preferredPrinterGlobalId,
+        document: {
+          type: 'packing_slip',
+          format: 'PDF',
+          media: 'letter',
+          contentSha256: context.renderedPackingSlip.contentSha256,
+          byteLength: context.renderedPackingSlip.byteLength,
+          storageReference: context.storageReference,
+          sourceOrderGlobalId: context.result.orderGlobalId,
+          sourceShipmentGlobalId: context.result.shipmentGlobalId,
+        },
+      })
+      const printResult = printJob as unknown as {
+        globalId?: string
+        printJobGlobalId?: string | null
+        printWarning?: string | null
+      }
+      printJobGlobalId = (
+        typeof printResult.globalId === 'string'
+          ? printResult.globalId
+          : typeof printResult.printJobGlobalId === 'string'
+            ? printResult.printJobGlobalId
+            : null
+      )
+      printWarning = typeof printResult.printWarning === 'string'
+        ? printResult.printWarning
+        : null
+    } catch (error) {
+      printWarning = error instanceof Error
+        ? `Packing slip is available, but automatic printing was not queued: ${error.message}`
+        : 'Packing slip is available, but automatic printing was not queued.'
+    }
+
+    let commerceExportState: OperationsShipmentCommandResult['commerceExportState']
+    let providerReference: string | null = null
+    let exportErrorCode: string | null = null
+    let exportErrorMessage: string | null = null
+    if (context.sourceProvider === 'mock-commerce') {
+      try {
+        const commerceAdapter = new MockCommerceAdapter()
+        const exportResult = await commerceAdapter.updateFulfillment({
+          externalOrderId: context.externalOrderId,
+          trackingNumber: context.result.trackingNumber,
+          carrier: context.carrier,
+          shippedAt: context.shippedAt,
+          idempotencyKey: `${context.result.shipmentGlobalId}:commerce-fulfillment`,
+        })
+        commerceExportState = exportResult.accepted ? 'succeeded' : 'failed'
+        providerReference = exportResult.providerReference || null
+        if (!exportResult.accepted) {
+          exportErrorCode = 'OPERATIONS_COMMERCE_EXPORT_REJECTED'
+          exportErrorMessage = 'The commerce provider rejected the fulfillment export.'
+        }
+      } catch (error) {
+        commerceExportState = 'failed'
+        exportErrorCode = 'OPERATIONS_COMMERCE_EXPORT_FAILED'
+        exportErrorMessage = error instanceof Error
+          ? error.message.slice(0, 500)
+          : 'Commerce fulfillment export failed'
+      }
+    } else {
+      commerceExportState = 'unsupported'
+      exportErrorCode = 'OPERATIONS_COMMERCE_PROVIDER_UNSUPPORTED'
+      exportErrorMessage = (
+        `Fulfillment export adapter for ${context.sourceProvider} is not configured.`
+      )
+    }
+
+    await query(
+      `UPDATE operations_commerce_fulfillment_exports
+       SET state = $3, attempts = attempts + 1,
+           provider_reference = $4, error_code = $5, error_message = $6,
+           completed_at = now(), updated_at = now()
+       WHERE organization_id = $1::uuid
+         AND global_id = $2
+         AND state IN ('queued', 'processing')`,
+      [
+        organizationId,
+        context.result.commerceExportGlobalId,
+        commerceExportState,
+        providerReference,
+        exportErrorCode,
+        exportErrorMessage,
+      ],
+    )
+
+    const result: OperationsShipmentCommandResult = {
+      ...context.result,
+      commerceExportState,
+      printJobGlobalId,
+      printWarning,
+    }
+    await query(
+      `UPDATE operations_command_receipts
+       SET result_payload = $2::jsonb, updated_at = now()
+       WHERE id = $1::uuid AND status = 'succeeded'`,
+      [command.receipt.id, JSON.stringify(result)],
+    )
+    return result
+  } catch (error) {
+    if (!committed) {
+      await failCommandReceipt(command.receipt.id, error)
+    }
     throw error
   }
 }

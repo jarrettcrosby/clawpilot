@@ -20,13 +20,47 @@ export type OperationsExceptionStatus = 'open' | 'acknowledged' | 'resolved' | '
 
 export type OperationsActivationState = 'disabled' | 'shadow' | 'read_only' | 'active' | 'frozen'
 
-export type OperationsOrderAction = 'release_to_warehouse' | 'confirm_picks' | 'verify_pack'
+export type OperationsOrderAction =
+  | 'release_to_warehouse'
+  | 'confirm_picks'
+  | 'verify_pack'
+  | 'confirm_shipment'
 
 export type OperationsOrderActionAvailability = {
   action: OperationsOrderAction
   label: string
   enabled: boolean
   blockedReason: string | null
+}
+
+export type OperationsLabelAttemptState = 'prepared' | 'succeeded' | 'failed' | 'unknown'
+
+export type OperationsSandboxLabelCommandResult = {
+  orderGlobalId: string
+  orderStatus: 'packed'
+  rowVersion: number
+  packageGlobalId: string
+  labelGlobalId: string
+  attemptGlobalId: string
+  trackingNumber: string
+  labelStatus: 'created' | 'voided'
+  replayed: boolean
+  printJobGlobalId: string | null
+  printWarning: string | null
+}
+
+export type OperationsShipmentCommandResult = {
+  orderGlobalId: string
+  orderStatus: 'shipped'
+  rowVersion: number
+  shipmentGlobalId: string
+  trackingNumber: string
+  packingSlipArtifactGlobalId: string
+  commerceExportGlobalId: string
+  commerceExportState: 'succeeded' | 'unsupported' | 'failed'
+  replayed: boolean
+  printJobGlobalId: string | null
+  printWarning: string | null
 }
 
 export type CommerceCustomerMatchMethod =
@@ -548,10 +582,23 @@ export type OperationsOrderDetail = OperationsOrderListItem & {
     weightGrams: number
     dimensionsMm: Millimeters
     status: string
+    latestLabel: {
+      globalId: string
+      status: 'created' | 'voided' | 'failed'
+      carrier: string
+      serviceCode: string
+      trackingNumber: string
+      environment: 'mock' | 'sandbox' | 'production'
+      createAttemptGlobalId: string | null
+      voidAttemptGlobalId: string | null
+      createdAt: string
+      voidedAt: string | null
+    } | null
   }>
   rates: Array<{
     globalId: string
     carrier: string
+    serviceCode: string
     serviceName: string
     internalCostMinor: string
     customerChargeMinor: string
@@ -564,6 +611,55 @@ export type OperationsOrderDetail = OperationsOrderListItem & {
     type: string
     amountMinor: string
     status: string
+  }>
+  labelAttempts: Array<{
+    globalId: string
+    action: 'create' | 'void' | 'reconcile'
+    state: OperationsLabelAttemptState
+    provider: 'ups_rest' | 'fedex_rest'
+    environment: 'sandbox' | 'production'
+    errorCode: string | null
+    labelGlobalId: string | null
+    requestedAt: string
+    completedAt: string | null
+  }>
+  shipments: Array<{
+    globalId: string
+    status: 'confirmed' | 'in_transit' | 'delivered' | 'exception' | 'voided'
+    carrier: string
+    serviceCode: string
+    trackingNumber: string
+    shippedAt: string
+  }>
+  trackingObservations: Array<{
+    globalId: string
+    shipmentGlobalId: string
+    status: 'confirmed' | 'in_transit' | 'out_for_delivery' | 'delivered' | 'exception' | 'voided'
+    provider: string
+    source: 'shipment_confirmation' | 'carrier_webhook' | 'carrier_poll' | 'manual'
+    location: string | null
+    observedAt: string
+  }>
+  printArtifacts: Array<{
+    globalId: string
+    shipmentGlobalId: string | null
+    documentType: 'shipping_label' | 'packing_slip'
+    format: 'ZPL' | 'PDF' | 'PNG'
+    media: 'label_4x6' | 'label_4x8' | 'letter' | 'a4'
+    filename: string | null
+    contentUrl: string | null
+    createdAt: string
+  }>
+  commerceExports: Array<{
+    globalId: string
+    shipmentGlobalId: string
+    provider: string
+    state: 'queued' | 'processing' | 'succeeded' | 'failed' | 'unsupported'
+    providerReference: string | null
+    errorCode: string | null
+    errorMessage: string | null
+    requestedAt: string
+    completedAt: string | null
   }>
   events: Array<{
     globalId: string
@@ -593,12 +689,143 @@ export type OperationsWorkspace = {
   orders: OperationsOrderListItem[]
   exceptions: OperationsExceptionListItem[]
   selectedOrder: OperationsOrderDetail | null
-  warehouses: Array<{ id: string; globalId: string; name: string }>
+  warehouses: Array<{
+    id: string
+    globalId: string
+    code: string
+    name: string
+    facilityType: 'distribution_center' | 'store' | 'dark_store' | 'micro_fulfillment' | 'cross_dock' | 'supplier' | 'drop_ship' | 'third_party'
+    timezone: string
+    address: Address
+    status: 'active' | 'inactive'
+    cutoffTime: string | null
+    rowVersion: number
+    locations: Array<{
+      id: string
+      globalId: string
+      code: string
+      zone: string
+      locationType: 'receiving' | 'storage' | 'pick' | 'pack' | 'staging' | 'shipping' | 'returns'
+      topologyLevel: 'building' | 'zone' | 'aisle' | 'row' | 'bay' | 'level' | 'shelf' | 'bin' | 'staging' | 'dock' | 'station'
+      parentLocationGlobalId: string | null
+      pickSequence: number
+      active: boolean
+      maxVolumeCubicMeters: number | null
+      maxWeightKg: number | null
+      usedVolumeCubicMeters: number
+      usedWeightKg: number
+      allowMixedProducts: boolean
+      notes: string | null
+      rowVersion: number
+      productRules: Array<{
+        globalId: string
+        productGlobalId: string
+        productName: string
+        ruleType: 'allowed' | 'preferred' | 'restricted'
+        maxQuantity: number | null
+        active: boolean
+      }>
+    }>
+  }>
+  inventoryPools: Array<{
+    id: string
+    globalId: string
+    name: string
+    poolType: 'customer_dedicated' | 'shared'
+    allocationPolicy: 'fifo' | 'fefo' | 'priority'
+    ownerCustomerGlobalId: string | null
+    ownerCustomerName: string | null
+    eligibleCustomers: Array<{ globalId: string; name: string; priority: number }>
+    active: boolean
+  }>
+  inboundReceipts: Array<{
+    id: string
+    globalId: string
+    referenceNumber: string
+    status: 'expected' | 'receiving' | 'completed' | 'cancelled'
+    warehouseGlobalId: string
+    warehouseName: string
+    inventoryPoolGlobalId: string
+    inventoryPoolName: string
+    expectedAt: string | null
+    completedAt: string | null
+    rowVersion: number
+    expectedQuantity: number
+    receivedQuantity: number
+    damagedQuantity: number
+    lines: Array<{
+      id: string
+      globalId: string
+      lineNumber: number
+      productGlobalId: string
+      productName: string
+      productSku: string | null
+      targetLocationGlobalId: string
+      targetLocationCode: string
+      expectedQuantity: number
+      acceptedQuantity: number
+      damagedQuantity: number
+      lotCode: string
+      unitOfMeasure: string
+    }>
+  }>
   catalog: {
     customers: Array<{ id: string; globalId: string; name: string }>
     products: Array<{ id: string; globalId: string; name: string; sku: string | null }>
   }
+  shipping: {
+    sandboxCarrierAccounts: Array<{
+      globalId: string
+      provider: 'ups_rest' | 'fedex_rest'
+      displayName: string
+      accountNumberLastFour: string
+      billingRelationships: CarrierBillingRelationship[]
+    }>
+  }
   generatedAt: string
+}
+
+export type OperationsInventoryPoolInput = {
+  name: string
+  poolType: 'customer_dedicated' | 'shared'
+  allocationPolicy: 'fifo' | 'fefo' | 'priority'
+  ownerCustomerGlobalId: string | null
+  eligibleCustomerGlobalIds: string[]
+}
+
+export type OperationsInboundReceiptInput = {
+  warehouseGlobalId: string
+  inventoryPoolGlobalId: string
+  referenceNumber: string
+  expectedAt: string | null
+  lines: Array<{
+    productGlobalId: string
+    targetLocationGlobalId: string
+    expectedQuantity: number
+    lotCode: string
+    unitOfMeasure: string
+  }>
+}
+
+export type OperationsInboundReceiptCompletionInput = {
+  receiptGlobalId: string
+  expectedRowVersion: number
+  reason: string
+  lines: Array<{
+    lineGlobalId: string
+    acceptedQuantity: number
+    damagedQuantity: number
+  }>
+}
+
+export type OperationsInboundReceiptCommandResult = {
+  receiptGlobalId: string
+  status: 'completed'
+  rowVersion: number
+  receivedQuantity: number
+  damagedQuantity: number
+  positionGlobalIds: string[]
+  replayed: boolean
 }
 
 export type MockOperationsProofLineInput = {

@@ -362,6 +362,46 @@ const parityDraft = pure.normalizePosAccountingDraftEvidence(accountingDraft({
   receiptDocumentNumber: '250314POS',
   journalDocumentNumber: '250314POS',
 }))
+const canonicalTaxDraftInput = accountingDraft({
+  id: 'draft-canonical-tax',
+  date: '2025-03-14',
+  receiptDocumentNumber: '250314POS',
+  journalDocumentNumber: '250314POS',
+  standard: { total: '17.50', tax: '0.00' },
+})
+canonicalTaxDraftInput.source_summary.canonical.accounting = {
+  salesReceipt: { tax: '1.25', total: '18.75' },
+}
+const canonicalTaxDraft = pure.normalizePosAccountingDraftEvidence(canonicalTaxDraftInput)
+assert.equal(canonicalTaxDraft.documents[0].taxCents, 125)
+assert.equal(canonicalTaxDraft.documents[0].totalCents, 1875)
+const journalOnlyPaymentExceptionDraft = pure.normalizePosAccountingDraftEvidence({
+  id: 'draft-payment-exception-capture',
+  restaurant_guid: RESTAURANT_GUID,
+  business_date: '2025-03-13',
+  status: 'needs_review',
+  reconciliation_status: 'orders_only',
+  source_summary: { standard: { netSales: '44.54', tax: '0.00' } },
+  proposed_lines: [{
+    document: 'payments_journal',
+    code: 'calculated_net_card_settlement',
+    sourceKind: 'card_brand',
+    side: 'debit',
+    amount: '44.54',
+    target: { id: 'account-card', name: 'Card clearing' },
+  }, {
+    document: 'payments_journal',
+    code: 'payment_exception_capture',
+    sourceKind: 'payment_exception',
+    side: 'credit',
+    amount: '44.54',
+    target: { id: 'account-payment-exceptions', name: 'Payment Exceptions' },
+  }],
+})
+assert.equal(journalOnlyPaymentExceptionDraft.documents.length, 1)
+assert.equal(journalOnlyPaymentExceptionDraft.documents[0].entityType, 'JournalEntry')
+assert.equal(journalOnlyPaymentExceptionDraft.documents[0].debitCents, 4454)
+assert.equal(journalOnlyPaymentExceptionDraft.documents[0].creditCents, 4454)
 const receiptComparison = pure.compareSalesReceiptEvidence(
   parityDraft.documents[0],
   normalizedReceipt,

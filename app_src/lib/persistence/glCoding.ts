@@ -145,6 +145,71 @@ type ExistingRunRow = QueryResultRow & {
   summary: unknown
 }
 
+type ReviewableRunItemRow = QueryResultRow & {
+  run_item_id: string
+  run_item_global_id: string
+  charge_id: string
+  charge_global_id: string
+  statement_id: string
+  statement_global_id: string
+  batch_provider: string
+  source_filename: string
+  amount_minor: string
+  currency: string
+  account_resolution_id: string
+  account_resolution_global_id: string
+  account_authorization_id: string
+  account_authorization_global_id: string
+  carrier_account_id: string
+  carrier_account_global_id: string
+  shipper_assignment_id: string
+  shipper_assignment_global_id: string
+  shipper_party_id: string
+  shipper_party_global_id: string
+  shipper_party_name: string
+  account_owner_party_id: string
+  account_owner_party_global_id: string
+  account_owner_party_name: string
+  executing_organization_id: string
+  coding_outputs: unknown
+}
+
+type ExistingReviewRow = QueryResultRow & {
+  id: string
+  global_id: string
+  run_id: string
+  run_global_id: string
+  decision: 'approved' | 'rejected'
+  reason: string
+  idempotency_key: string
+  reviewed_by: string
+  reviewed_at: Date
+}
+
+type SettlementRow = QueryResultRow & {
+  id: string
+  global_id: string
+  settlement_type: string
+  amount_minor: string
+  source_charge_amount_minor: string | null
+  currency: string
+  current_status: string
+  payer_name: string
+  payer_global_id: string | null
+  payee_name: string
+  payee_global_id: string | null
+  review_role: string | null
+  charge_global_id: string | null
+  source_global_id: string
+  actor_email: string | null
+  occurred_at: Date
+  calculation_snapshot: unknown
+  latest_event_global_id: string | null
+  latest_event_details: unknown
+  latest_event_actor: string | null
+  latest_event_at: Date | null
+}
+
 export class GlCodingRequestError extends Error {
   constructor(
     readonly code: string,
@@ -195,6 +260,57 @@ function runResult(row: ExistingRunRow, duplicate = false) {
   }
 }
 
+function reviewResult(
+  row: ExistingReviewRow,
+  itemCount: number,
+  settlementCount: number,
+  duplicate = false,
+) {
+  return {
+    globalId: row.global_id,
+    runGlobalId: row.run_global_id,
+    decision: row.decision,
+    reason: row.reason,
+    reviewedBy: row.reviewed_by,
+    reviewedAt: iso(row.reviewed_at),
+    itemCount,
+    settlementCount,
+    duplicate,
+  }
+}
+
+function settlementEventTransitionAllowed(
+  currentStatus: string,
+  eventType:
+    | 'approved'
+    | 'billed'
+    | 'paid'
+    | 'disputed'
+    | 'resolved'
+    | 'reversed'
+    | 'voided',
+) {
+  const allowed: Record<
+    | 'approved'
+    | 'billed'
+    | 'paid'
+    | 'disputed'
+    | 'resolved'
+    | 'reversed'
+    | 'voided',
+    string[]
+  > = {
+    approved: ['accrued'],
+    billed: ['approved', 'resolved'],
+    paid: ['approved', 'billed', 'resolved'],
+    disputed: ['approved', 'billed'],
+    resolved: ['disputed'],
+    reversed: ['approved', 'billed', 'resolved'],
+    voided: ['accrued', 'approved', 'billed', 'disputed', 'resolved'],
+  }
+  return allowed[eventType].includes(currentStatus)
+}
+
 async function findNetwork(
   executor: SqlExecutor,
   organizationId: string,
@@ -211,7 +327,7 @@ async function findNetwork(
               FROM operations_carrier_rate_parties party
              WHERE party.network_id = network.id
                AND party.workspace_organization_id = $1::uuid
-               AND party.role = 'platform_operator'
+               AND party.role IN ('platform_operator', 'reseller')
           )
         )
       ORDER BY (network.platform_organization_id = $1::uuid) DESC,
@@ -726,6 +842,7 @@ export async function readGlCodingWorkspaceFromPostgres(input: {
       orphans: [],
       rules: [],
       shippers: [],
+      settlements: [],
     }
   }
 
@@ -761,13 +878,27 @@ export async function readGlCodingWorkspaceFromPostgres(input: {
     requested_by: string | null
     requested_at: Date
     completed_at: Date | null
+    review_global_id: string | null
+    review_decision: 'approved' | 'rejected' | null
+    review_reason: string | null
+    reviewed_by: string | null
+    reviewed_at: Date | null
   }>(
-    `SELECT global_id, status, selected_batch_count, selected_charge_count,
-            shipment_matched_count, shipper_assigned_count, orphan_count,
-            excluded_count, error_count, requested_by, requested_at, completed_at
-       FROM operations_gl_coding_runs
-      WHERE network_id = $1::uuid
-      ORDER BY requested_at DESC, id DESC
+    `SELECT run.global_id, run.status, run.selected_batch_count,
+            run.selected_charge_count, run.shipment_matched_count,
+            run.shipper_assigned_count, run.orphan_count,
+            run.excluded_count, run.error_count, run.requested_by,
+            run.requested_at, run.completed_at,
+            review.global_id AS review_global_id,
+            review.decision AS review_decision,
+            review.reason AS review_reason,
+            review.reviewed_by, review.reviewed_at
+       FROM operations_gl_coding_runs run
+       LEFT JOIN operations_gl_coding_reviews review
+         ON review.network_id = run.network_id
+        AND review.run_id = run.id
+      WHERE run.network_id = $1::uuid
+      ORDER BY run.requested_at DESC, run.id DESC
       LIMIT 50`,
     [network.id],
   )
@@ -857,6 +988,60 @@ export async function readGlCodingWorkspaceFromPostgres(input: {
       ORDER BY lower(party.display_name), party.global_id`,
     [network.id],
   )
+  const settlements = await query<SettlementRow>(
+    `SELECT settlement.id::text, settlement.global_id,
+            settlement.settlement_type, settlement.amount_minor::text,
+            settlement.source_charge_amount_minor::text,
+            settlement.currency,
+            COALESCE(latest.event_type, settlement.initial_status) AS current_status,
+            CASE
+              WHEN settlement.payer_type = 'carrier'
+                THEN settlement.payer_external_ref
+              ELSE payer.display_name
+            END AS payer_name,
+            payer.global_id AS payer_global_id,
+            CASE
+              WHEN settlement.payee_type = 'carrier'
+                THEN settlement.payee_external_ref
+              ELSE payee.display_name
+            END AS payee_name,
+            payee.global_id AS payee_global_id,
+            review_link.role AS review_role,
+            charge.global_id AS charge_global_id,
+            settlement.source_global_id,
+            settlement.actor_email, settlement.occurred_at,
+            settlement.calculation_snapshot,
+            latest.global_id AS latest_event_global_id,
+            latest.details AS latest_event_details,
+            latest.actor_email AS latest_event_actor,
+            latest.occurred_at AS latest_event_at
+       FROM operations_settlement_entries settlement
+       LEFT JOIN operations_carrier_rate_parties payer
+         ON payer.network_id = settlement.network_id
+        AND payer.id = settlement.payer_party_id
+       LEFT JOIN operations_carrier_rate_parties payee
+         ON payee.network_id = settlement.network_id
+        AND payee.id = settlement.payee_party_id
+       LEFT JOIN operations_carrier_billing_charges charge
+         ON charge.network_id = settlement.network_id
+        AND charge.id = settlement.billing_charge_id
+       LEFT JOIN operations_gl_coding_review_settlements review_link
+         ON review_link.network_id = settlement.network_id
+        AND review_link.settlement_entry_id = settlement.id
+       LEFT JOIN LATERAL (
+         SELECT event.global_id, event.event_type, event.details,
+                event.actor_email, event.occurred_at
+           FROM operations_settlement_events event
+          WHERE event.network_id = settlement.network_id
+            AND event.settlement_entry_id = settlement.id
+          ORDER BY event.occurred_at DESC, event.created_at DESC, event.id DESC
+          LIMIT 1
+       ) latest ON true
+      WHERE settlement.network_id = $1::uuid
+      ORDER BY settlement.occurred_at DESC, settlement.id DESC
+      LIMIT 200`,
+    [network.id],
+  )
 
   return {
     capabilities: input.capabilities,
@@ -892,6 +1077,13 @@ export async function readGlCodingWorkspaceFromPostgres(input: {
       requestedBy: row.requested_by,
       requestedAt: iso(row.requested_at),
       completedAt: iso(row.completed_at),
+      review: row.review_global_id ? {
+        globalId: row.review_global_id,
+        decision: row.review_decision,
+        reason: row.review_reason,
+        reviewedBy: row.reviewed_by,
+        reviewedAt: iso(row.reviewed_at),
+      } : null,
     })),
     orphans: orphans.rows.map((row) => ({
       chargeGlobalId: row.global_id,
@@ -929,6 +1121,34 @@ export async function readGlCodingWorkspaceFromPostgres(input: {
       entityType: row.entity_type,
       organizationId: row.workspace_organization_id,
       crmCustomerGlobalId: row.crm_customer_global_id,
+    })),
+    settlements: settlements.rows.map((row) => ({
+      globalId: row.global_id,
+      settlementType: row.settlement_type,
+      role: row.review_role || row.settlement_type,
+      amountMinor: safeMinorUnits(row.amount_minor),
+      sourceChargeAmountMinor: row.source_charge_amount_minor === null
+        ? null
+        : safeMinorUnits(row.source_charge_amount_minor),
+      currency: row.currency,
+      currentStatus: row.current_status,
+      payerName: row.payer_name,
+      payerGlobalId: row.payer_global_id,
+      payeeName: row.payee_name,
+      payeeGlobalId: row.payee_global_id,
+      chargeGlobalId: row.charge_global_id,
+      sourceGlobalId: row.source_global_id,
+      actorEmail: row.actor_email,
+      occurredAt: iso(row.occurred_at),
+      codingOutputs: objectValue(
+        objectValue(row.calculation_snapshot).codingOutputs,
+      ),
+      latestEvent: row.latest_event_global_id ? {
+        globalId: row.latest_event_global_id,
+        details: objectValue(row.latest_event_details),
+        actorEmail: row.latest_event_actor,
+        occurredAt: iso(row.latest_event_at),
+      } : null,
     })),
   }
 }
@@ -1442,6 +1662,623 @@ export async function assignGlCodingOrphanInPostgres(input: {
       },
     }, client)
     return runResult(updated.rows[0])
+  })
+}
+
+export async function reviewGlCodingRunInPostgres(input: {
+  organizationId: string
+  actorEmail: string
+  runGlobalId: string
+  decision: 'approved' | 'rejected'
+  reason: string
+  idempotencyKey: string
+}) {
+  return withTransaction(async (client) => {
+    const network = await requireNetwork(client, input.organizationId)
+    await acquireTransactionAdvisoryLock(client, `gl-coding-review:${network.id}`)
+
+    const existingByKey = await client.query<ExistingReviewRow>(
+      `SELECT review.id::text, review.global_id, review.run_id::text,
+              run.global_id AS run_global_id, review.decision, review.reason,
+              review.idempotency_key, review.reviewed_by, review.reviewed_at
+         FROM operations_gl_coding_reviews review
+         JOIN operations_gl_coding_runs run
+           ON run.network_id = review.network_id
+          AND run.id = review.run_id
+        WHERE review.network_id = $1::uuid
+          AND review.idempotency_key = $2
+        LIMIT 1`,
+      [network.id, input.idempotencyKey],
+    )
+    if (existingByKey.rows[0]) {
+      const prior = existingByKey.rows[0]
+      if (
+        prior.run_global_id !== input.runGlobalId
+        || prior.decision !== input.decision
+        || prior.reason !== input.reason
+      ) {
+        requestError(
+          'GL_CODING_IDEMPOTENCY_CONFLICT',
+          'This idempotency key was already used for a different GL Coding review',
+          409,
+        )
+      }
+      const counts = await client.query<QueryResultRow & {
+        item_count: string
+        settlement_count: string
+      }>(
+        `SELECT count(DISTINCT item.id)::text AS item_count,
+                count(link.settlement_entry_id)::text AS settlement_count
+           FROM operations_gl_coding_review_items item
+           LEFT JOIN operations_gl_coding_review_settlements link
+             ON link.network_id = item.network_id
+            AND link.review_item_id = item.id
+          WHERE item.network_id = $1::uuid
+            AND item.review_id = $2::uuid`,
+        [network.id, prior.id],
+      )
+      return reviewResult(
+        prior,
+        Number(counts.rows[0]?.item_count || 0),
+        Number(counts.rows[0]?.settlement_count || 0),
+        true,
+      )
+    }
+
+    const runResultRow = await client.query<ExistingRunRow>(
+      `SELECT id::text, global_id, input_checksum, selection_snapshot, status,
+              selected_batch_count, selected_charge_count,
+              shipment_matched_count, shipper_assigned_count,
+              orphan_count, excluded_count, error_count, summary
+         FROM operations_gl_coding_runs
+        WHERE network_id = $1::uuid
+          AND global_id = $2
+        LIMIT 1
+        FOR UPDATE`,
+      [network.id, input.runGlobalId],
+    )
+    const run = runResultRow.rows[0]
+    if (!run) {
+      requestError('GL_CODING_RUN_NOT_FOUND', 'GL Coding run was not found', 404)
+    }
+
+    const existingByRun = await client.query<ExistingReviewRow>(
+      `SELECT review.id::text, review.global_id, review.run_id::text,
+              run.global_id AS run_global_id, review.decision, review.reason,
+              review.idempotency_key, review.reviewed_by, review.reviewed_at
+         FROM operations_gl_coding_reviews review
+         JOIN operations_gl_coding_runs run
+           ON run.network_id = review.network_id
+          AND run.id = review.run_id
+        WHERE review.network_id = $1::uuid
+          AND review.run_id = $2::uuid
+        LIMIT 1`,
+      [network.id, run.id],
+    )
+    if (existingByRun.rows[0]) {
+      const prior = existingByRun.rows[0]
+      if (prior.decision !== input.decision || prior.reason !== input.reason) {
+        requestError(
+          'GL_CODING_REVIEW_ALREADY_RECORDED',
+          'This GL Coding run already has a different review decision',
+          409,
+        )
+      }
+      const counts = await client.query<QueryResultRow & {
+        item_count: string
+        settlement_count: string
+      }>(
+        `SELECT count(DISTINCT item.id)::text AS item_count,
+                count(link.settlement_entry_id)::text AS settlement_count
+           FROM operations_gl_coding_review_items item
+           LEFT JOIN operations_gl_coding_review_settlements link
+             ON link.network_id = item.network_id
+            AND link.review_item_id = item.id
+          WHERE item.network_id = $1::uuid
+            AND item.review_id = $2::uuid`,
+        [network.id, prior.id],
+      )
+      return reviewResult(
+        prior,
+        Number(counts.rows[0]?.item_count || 0),
+        Number(counts.rows[0]?.settlement_count || 0),
+        true,
+      )
+    }
+
+    const createdReview = await client.query<ExistingReviewRow>(
+      `INSERT INTO operations_gl_coding_reviews (
+         network_id, run_id, decision, reason, idempotency_key,
+         evidence, reviewed_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3, $4, $5, $6::jsonb, $7
+       )
+       RETURNING id::text, global_id, run_id::text,
+                 $8::text AS run_global_id, decision, reason,
+                 idempotency_key, reviewed_by, reviewed_at`,
+      [
+        network.id,
+        run.id,
+        input.decision,
+        input.reason,
+        input.idempotencyKey,
+        JSON.stringify({
+          runGlobalId: run.global_id,
+          selectedChargeCount: Number(run.selected_charge_count),
+          shipperAssignedCount: Number(run.shipper_assigned_count),
+          excludedCount: Number(run.excluded_count),
+          orphanCount: Number(run.orphan_count),
+          errorCount: Number(run.error_count),
+        }),
+        input.actorEmail,
+        run.global_id,
+      ],
+    )
+    const review = createdReview.rows[0]
+
+    if (input.decision === 'rejected') {
+      await recordAuditEvent({
+        actor: input.actorEmail,
+        eventType: 'operations.gl_coding.run_rejected',
+        aggregateType: 'operations.gl_coding_review',
+        aggregateId: review.global_id,
+        eventKey: `gl-coding-review:${network.global_id}:${input.idempotencyKey}`,
+        organizationId: input.organizationId,
+        payload: {
+          networkGlobalId: network.global_id,
+          runGlobalId: run.global_id,
+          reason: input.reason,
+        },
+      }, client)
+      return reviewResult(review, 0, 0)
+    }
+
+    const reviewableItems = await client.query<ReviewableRunItemRow>(
+      `SELECT item.id::text AS run_item_id,
+              item.global_id AS run_item_global_id,
+              charge.id::text AS charge_id,
+              charge.global_id AS charge_global_id,
+              statement.id::text AS statement_id,
+              statement.global_id AS statement_global_id,
+              batch.provider AS batch_provider,
+              batch.source_filename,
+              charge.amount_minor::text, charge.currency,
+              resolution.id::text AS account_resolution_id,
+              resolution.global_id AS account_resolution_global_id,
+              resolution.account_authorization_id::text,
+              authorization.global_id AS account_authorization_global_id,
+              resolution.carrier_account_id::text,
+              carrier_account.global_id AS carrier_account_global_id,
+              assignment.id::text AS shipper_assignment_id,
+              assignment.global_id AS shipper_assignment_global_id,
+              shipper.id::text AS shipper_party_id,
+              shipper.global_id AS shipper_party_global_id,
+              shipper.display_name AS shipper_party_name,
+              account_owner.id::text AS account_owner_party_id,
+              account_owner.global_id AS account_owner_party_global_id,
+              account_owner.display_name AS account_owner_party_name,
+              assignment.coding_outputs,
+              COALESCE(
+                shipper.workspace_organization_id,
+                shipper_pipeline.workspace_organization_id
+              )::text AS executing_organization_id
+         FROM operations_gl_coding_run_items item
+         JOIN operations_carrier_billing_charges charge
+           ON charge.network_id = item.network_id
+          AND charge.id = item.charge_id
+         JOIN operations_carrier_billing_statements statement
+           ON statement.network_id = charge.network_id
+          AND statement.id = charge.statement_id
+         JOIN operations_carrier_billing_batches batch
+           ON batch.network_id = statement.network_id
+          AND batch.id = statement.batch_id
+         JOIN operations_carrier_billing_current_account_resolutions resolution
+           ON resolution.network_id = statement.network_id
+          AND resolution.statement_id = statement.id
+          AND resolution.decision = 'matched'
+         JOIN operations_carrier_account_authorizations authorization
+           ON authorization.network_id = resolution.network_id
+          AND authorization.id = resolution.account_authorization_id
+         JOIN operations_integration_accounts carrier_account
+           ON carrier_account.organization_id = authorization.account_owner_organization_id
+          AND carrier_account.id = resolution.carrier_account_id
+         JOIN operations_carrier_billing_current_shipper_assignments assignment
+           ON assignment.network_id = charge.network_id
+          AND assignment.charge_id = charge.id
+          AND assignment.id = item.shipper_assignment_id
+          AND assignment.decision = 'assigned'
+         JOIN operations_carrier_rate_parties shipper
+           ON shipper.network_id = assignment.network_id
+          AND shipper.id = assignment.shipper_party_id
+          AND shipper.role = 'shipper'
+         LEFT JOIN pipeline_spaces shipper_pipeline
+           ON shipper.entity_type = 'crm_customer'
+          AND shipper_pipeline.id = shipper.crm_pipeline_id
+         JOIN operations_carrier_rate_parties account_owner
+           ON account_owner.network_id = resolution.network_id
+          AND account_owner.workspace_organization_id
+            = resolution.account_owner_organization_id
+          AND account_owner.role IN ('platform_operator', 'reseller')
+        WHERE item.network_id = $1::uuid
+          AND item.run_id = $2::uuid
+          AND item.result = 'assigned'
+        ORDER BY item.created_at, item.id
+        FOR UPDATE OF item, charge`,
+      [network.id, run.id],
+    )
+    if (reviewableItems.rows.length !== Number(run.shipper_assigned_count)) {
+      requestError(
+        'GL_CODING_REVIEW_EVIDENCE_STALE',
+        'One or more GL Coding assignments changed; run GL Coding again before approval',
+        409,
+      )
+    }
+
+    let settlementCount = 0
+    for (const item of reviewableItems.rows) {
+      const reviewItem = await client.query<DecisionRow>(
+        `INSERT INTO operations_gl_coding_review_items (
+           network_id, run_id, review_id, run_item_id,
+           billing_statement_id, billing_charge_id,
+           billing_account_resolution_id, account_authorization_id,
+           carrier_account_id, shipper_assignment_id,
+           source_charge_amount_minor, currency, evidence
+         ) VALUES (
+           $1::uuid, $2::uuid, $3::uuid, $4::uuid,
+           $5::uuid, $6::uuid, $7::uuid, $8::uuid,
+           $9::uuid, $10::uuid, $11::bigint, $12, $13::jsonb
+         )
+         RETURNING id::text, global_id`,
+        [
+          network.id,
+          run.id,
+          review.id,
+          item.run_item_id,
+          item.statement_id,
+          item.charge_id,
+          item.account_resolution_id,
+          item.account_authorization_id,
+          item.carrier_account_id,
+          item.shipper_assignment_id,
+          item.amount_minor,
+          item.currency,
+          JSON.stringify({
+            runItemGlobalId: item.run_item_global_id,
+            statementGlobalId: item.statement_global_id,
+            chargeGlobalId: item.charge_global_id,
+            accountResolutionGlobalId: item.account_resolution_global_id,
+            accountAuthorizationGlobalId: item.account_authorization_global_id,
+            carrierAccountGlobalId: item.carrier_account_global_id,
+            shipperAssignmentGlobalId: item.shipper_assignment_global_id,
+            sourceFilename: item.source_filename,
+            codingOutputs: objectValue(item.coding_outputs),
+          }),
+        ],
+      )
+      const sourceAmount = BigInt(item.amount_minor)
+      const absoluteAmount = sourceAmount < BigInt(0) ? -sourceAmount : sourceAmount
+      const providerIdentity = item.batch_provider
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '')
+        .replace(/^upsrest$/, 'ups')
+        .replace(/^fedexrest$/, 'fedex')
+        .replace(/^uspsrest$/, 'usps')
+      const settlementsToCreate: Array<{
+        role: 'carrier_payable' | 'carrier_cost_reimbursement' | 'credit'
+        payerType: 'rate_party' | 'carrier'
+        payerPartyId: string | null
+        payerExternalRef: string | null
+        payeeType: 'rate_party' | 'carrier'
+        payeePartyId: string | null
+        payeeExternalRef: string | null
+      }> = []
+      if (sourceAmount > BigInt(0)) {
+        settlementsToCreate.push({
+          role: 'carrier_payable',
+          payerType: 'rate_party',
+          payerPartyId: item.account_owner_party_id,
+          payerExternalRef: null,
+          payeeType: 'carrier',
+          payeePartyId: null,
+          payeeExternalRef: providerIdentity,
+        })
+        if (item.shipper_party_id !== item.account_owner_party_id) {
+          settlementsToCreate.push({
+            role: 'carrier_cost_reimbursement',
+            payerType: 'rate_party',
+            payerPartyId: item.shipper_party_id,
+            payerExternalRef: null,
+            payeeType: 'rate_party',
+            payeePartyId: item.account_owner_party_id,
+            payeeExternalRef: null,
+          })
+        }
+      } else if (sourceAmount < BigInt(0)) {
+        settlementsToCreate.push({
+          role: 'credit',
+          payerType: 'carrier',
+          payerPartyId: null,
+          payerExternalRef: providerIdentity,
+          payeeType: 'rate_party',
+          payeePartyId: item.account_owner_party_id,
+          payeeExternalRef: null,
+        })
+      }
+
+      for (const settlementPlan of settlementsToCreate) {
+        const settlementKey = [
+          'gl-review',
+          review.global_id,
+          reviewItem.rows[0].global_id,
+          settlementPlan.role,
+        ].join(':')
+        const settlement = await client.query<DecisionRow>(
+          `INSERT INTO operations_settlement_entries (
+             network_id, quote_snapshot_id, executing_organization_id,
+             shipment_id, settlement_type,
+             payer_type, payer_party_id, payer_external_ref,
+             payee_type, payee_party_id, payee_external_ref,
+             amount_minor, currency, initial_status,
+             source_type, source_global_id, directive_snapshot,
+             calculation_snapshot, idempotency_key, actor_email,
+             account_authorization_id, carrier_account_id,
+             billing_statement_id, billing_charge_id,
+             billing_account_resolution_id, shipper_assignment_id,
+             cost_basis, source_charge_amount_minor
+           ) VALUES (
+             $1::uuid, NULL, $2::uuid, NULL, $3,
+             $4, $5::uuid, $6, $7, $8::uuid, $9,
+             $10::bigint, $11, 'accrued',
+             'shipper_assignment', $12, '[]'::jsonb,
+             $13::jsonb, $14, $15,
+             $16::uuid, $17::uuid, $18::uuid, $19::uuid,
+             $20::uuid, $21::uuid, 'billed_actual', $22::bigint
+           )
+           RETURNING id::text, global_id`,
+          [
+            network.id,
+            item.executing_organization_id,
+            settlementPlan.role,
+            settlementPlan.payerType,
+            settlementPlan.payerPartyId,
+            settlementPlan.payerExternalRef,
+            settlementPlan.payeeType,
+            settlementPlan.payeePartyId,
+            settlementPlan.payeeExternalRef,
+            absoluteAmount.toString(),
+            item.currency,
+            item.shipper_assignment_global_id,
+            JSON.stringify({
+              model: 'triangle_square_circle_billed_actual',
+              role: settlementPlan.role,
+              reviewGlobalId: review.global_id,
+              chargeGlobalId: item.charge_global_id,
+              sourceChargeAmountMinor: item.amount_minor,
+              accountOwnerParty: {
+                globalId: item.account_owner_party_global_id,
+                name: item.account_owner_party_name,
+              },
+              shipperParty: {
+                globalId: item.shipper_party_global_id,
+                name: item.shipper_party_name,
+              },
+              codingOutputs: objectValue(item.coding_outputs),
+              quoteTimePlatformAndResellerFeesExcluded: true,
+            }),
+            settlementKey,
+            input.actorEmail,
+            item.account_authorization_id,
+            item.carrier_account_id,
+            item.statement_id,
+            item.charge_id,
+            item.account_resolution_id,
+            item.shipper_assignment_id,
+            item.amount_minor,
+          ],
+        )
+        await client.query(
+          `INSERT INTO operations_gl_coding_review_settlements (
+             network_id, review_item_id, settlement_entry_id, role
+           ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4)`,
+          [
+            network.id,
+            reviewItem.rows[0].id,
+            settlement.rows[0].id,
+            settlementPlan.role,
+          ],
+        )
+        await client.query(
+          `INSERT INTO operations_settlement_events (
+             network_id, settlement_entry_id, event_type, details,
+             idempotency_key, actor_email
+           ) VALUES (
+             $1::uuid, $2::uuid, 'approved', $3::jsonb, $4, $5
+           )`,
+          [
+            network.id,
+            settlement.rows[0].id,
+            JSON.stringify({
+              reason: input.reason,
+              reviewGlobalId: review.global_id,
+              chargeGlobalId: item.charge_global_id,
+            }),
+            `${settlementKey}:approved`,
+            input.actorEmail,
+          ],
+        )
+        settlementCount += 1
+      }
+    }
+
+    await recordAuditEvent({
+      actor: input.actorEmail,
+      eventType: 'operations.gl_coding.run_approved',
+      aggregateType: 'operations.gl_coding_review',
+      aggregateId: review.global_id,
+      eventKey: `gl-coding-review:${network.global_id}:${input.idempotencyKey}`,
+      organizationId: input.organizationId,
+      payload: {
+        networkGlobalId: network.global_id,
+        runGlobalId: run.global_id,
+        itemCount: reviewableItems.rows.length,
+        settlementCount,
+        reason: input.reason,
+        quoteTimePlatformAndResellerFeesExcluded: true,
+      },
+    }, client)
+    return reviewResult(
+      review,
+      reviewableItems.rows.length,
+      settlementCount,
+    )
+  })
+}
+
+export async function recordGlCodingSettlementEventInPostgres(input: {
+  organizationId: string
+  actorEmail: string
+  settlementGlobalId: string
+  eventType:
+    | 'approved'
+    | 'billed'
+    | 'paid'
+    | 'disputed'
+    | 'resolved'
+    | 'reversed'
+    | 'voided'
+  reason: string
+  reference?: string | null
+  idempotencyKey: string
+}) {
+  return withTransaction(async (client) => {
+    const network = await requireNetwork(client, input.organizationId)
+    await acquireTransactionAdvisoryLock(client, `settlement:${network.id}`)
+
+    const details = {
+      reason: input.reason,
+      ...(input.reference ? { reference: input.reference } : {}),
+    }
+    const existing = await client.query<QueryResultRow & {
+      global_id: string
+      settlement_global_id: string
+      event_type: string
+      details: unknown
+      occurred_at: Date
+    }>(
+      `SELECT event.global_id, settlement.global_id AS settlement_global_id,
+              event.event_type, event.details, event.occurred_at
+         FROM operations_settlement_events event
+         JOIN operations_settlement_entries settlement
+           ON settlement.network_id = event.network_id
+          AND settlement.id = event.settlement_entry_id
+        WHERE event.network_id = $1::uuid
+          AND event.idempotency_key = $2
+        LIMIT 1`,
+      [network.id, input.idempotencyKey],
+    )
+    if (existing.rows[0]) {
+      const prior = existing.rows[0]
+      const priorDetails = objectValue(prior.details)
+      if (
+        prior.settlement_global_id !== input.settlementGlobalId
+        || prior.event_type !== input.eventType
+        || priorDetails.reason !== input.reason
+        || (priorDetails.reference || null) !== (input.reference || null)
+      ) {
+        requestError(
+          'GL_CODING_IDEMPOTENCY_CONFLICT',
+          'This idempotency key was already used for a different settlement event',
+          409,
+        )
+      }
+      return {
+        globalId: prior.global_id,
+        settlementGlobalId: prior.settlement_global_id,
+        currentStatus: prior.event_type,
+        occurredAt: iso(prior.occurred_at),
+        duplicate: true,
+      }
+    }
+
+    const settlementResult = await client.query<QueryResultRow & {
+      id: string
+      global_id: string
+      initial_status: string
+      current_status: string
+    }>(
+      `SELECT settlement.id::text, settlement.global_id,
+              settlement.initial_status,
+              COALESCE(latest.event_type, settlement.initial_status) AS current_status
+         FROM operations_settlement_entries settlement
+         LEFT JOIN LATERAL (
+           SELECT event.event_type
+             FROM operations_settlement_events event
+            WHERE event.network_id = settlement.network_id
+              AND event.settlement_entry_id = settlement.id
+            ORDER BY event.occurred_at DESC, event.created_at DESC, event.id DESC
+            LIMIT 1
+         ) latest ON true
+        WHERE settlement.network_id = $1::uuid
+          AND settlement.global_id = $2
+        LIMIT 1
+        FOR UPDATE OF settlement`,
+      [network.id, input.settlementGlobalId],
+    )
+    const settlement = settlementResult.rows[0]
+    if (!settlement) {
+      requestError('SETTLEMENT_NOT_FOUND', 'Settlement entry was not found', 404)
+    }
+    if (!settlementEventTransitionAllowed(settlement.current_status, input.eventType)) {
+      requestError(
+        'SETTLEMENT_TRANSITION_INVALID',
+        `Settlement cannot move from ${settlement.current_status} to ${input.eventType}`,
+        409,
+      )
+    }
+    const created = await client.query<QueryResultRow & {
+      global_id: string
+      occurred_at: Date
+    }>(
+      `INSERT INTO operations_settlement_events (
+         network_id, settlement_entry_id, event_type, details,
+         idempotency_key, actor_email
+       ) VALUES (
+         $1::uuid, $2::uuid, $3, $4::jsonb, $5, $6
+       )
+       RETURNING global_id, occurred_at`,
+      [
+        network.id,
+        settlement.id,
+        input.eventType,
+        JSON.stringify({
+          ...details,
+          previousStatus: settlement.current_status,
+        }),
+        input.idempotencyKey,
+        input.actorEmail,
+      ],
+    )
+    await recordAuditEvent({
+      actor: input.actorEmail,
+      eventType: `operations.settlement.${input.eventType}`,
+      aggregateType: 'operations.settlement_entry',
+      aggregateId: settlement.global_id,
+      eventKey: `settlement:${network.global_id}:${input.idempotencyKey}`,
+      organizationId: input.organizationId,
+      payload: {
+        previousStatus: settlement.current_status,
+        currentStatus: input.eventType,
+        reason: input.reason,
+        reference: input.reference || null,
+      },
+    }, client)
+    return {
+      globalId: created.rows[0].global_id,
+      settlementGlobalId: settlement.global_id,
+      currentStatus: input.eventType,
+      occurredAt: iso(created.rows[0].occurred_at),
+      duplicate: false,
+    }
   })
 }
 

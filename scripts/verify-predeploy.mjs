@@ -96,8 +96,16 @@ if (!railwayStart.includes('npm run release:record')) {
 }
 
 const healthGatePosition = railwayStart.indexOf('[[ "$HEALTHY" == "1" ]]')
+const toastBackfillPosition = railwayStart.indexOf('npm run toast:activate-payment-date-backfill')
 const releaseRecordPosition = railwayStart.indexOf('npm run release:record')
-if (healthGatePosition < 0 || releaseRecordPosition < healthGatePosition) {
+if (
+  healthGatePosition < 0
+  || toastBackfillPosition < healthGatePosition
+  || releaseRecordPosition < toastBackfillPosition
+) {
+  fail('scripts/start-railway.sh must activate staged Toast backfills after health and before release recording')
+}
+if (releaseRecordPosition < healthGatePosition) {
   fail('scripts/start-railway.sh must record releases only after runtime health validation')
 }
 
@@ -194,11 +202,20 @@ for (const requiredPath of [
   'db/migrations/0090_operations_carrier_accounts_and_gl_coding.sql',
   'db/migrations/0091_operations_printer_configuration.sql',
   'db/migrations/0092_operations_carrier_billing_integrity.sql',
+  'db/migrations/0093_operations_carrier_billing_import_and_review.sql',
+  'db/migrations/0094_operations_print_delivery.sql',
   'db/migrations/0095_crm_native_activity_projection.sql',
   'db/migrations/0096_crm_contact_identity_aliases.sql',
+  'db/migrations/0097_operations_settlement_lifecycle.sql',
+  'db/migrations/0098_operations_label_execution.sql',
+  'db/migrations/0099_operations_shipment_completion.sql',
+  'db/migrations/0100_operations_sandbox_rate_diagnostic_scope.sql',
+  'db/migrations/0101_operations_receiving_and_topology.sql',
+  'db/migrations/0102_pos_payment_exceptions.sql',
   '.github/workflows/clawpilot-repository-runner.yml',
   '.github/workflows/deployed-runtime-monitor.yml',
   'scripts/start-railway.sh',
+  'scripts/activate-toast-payment-date-backfill.mjs',
   'scripts/test-suitecrm-interaction-ingestion.mjs',
   'scripts/test-suitecrm-call-ingestion.mjs',
   'scripts/test-crm-contact-identity.mjs',
@@ -214,10 +231,16 @@ for (const requiredPath of [
   'scripts/vercel-build.mjs',
   'scripts/verify-mail-sender.mjs',
   'scripts/test-operation-printing.mjs',
+  'scripts/test-operation-print-agent-runtime.mjs',
+  'scripts/test-operation-shipment-completion.mjs',
+  'scripts/test-operations-print-delivery.mjs',
+  'scripts/test-carrier-billing-import.mjs',
+  'scripts/test-carrier-billing-persistence.mjs',
   'scripts/test-carrier-billing-integrity.mjs',
   'docs/index.md',
   'docs/modules/toast-and-accounting.md',
   'docs/operations/printing-carrier-billing-and-gl-coding.md',
+  'docs/operations/local-print-agent.md',
   'docs/releases/catalog.json',
   'app_src/proxy.ts',
   'app_src/app/api/auth/magic/request/route.ts',

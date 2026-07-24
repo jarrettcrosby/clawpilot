@@ -17,6 +17,8 @@ import {
   ListItemText,
   MenuItem,
   Stack,
+  Tab,
+  Tabs,
   TextField,
   Tooltip,
   Typography,
@@ -24,17 +26,26 @@ import {
   useTheme,
 } from '@mui/material'
 import AddRounded from '@mui/icons-material/AddRounded'
+import CancelRounded from '@mui/icons-material/CancelRounded'
+import ContentCopyRounded from '@mui/icons-material/ContentCopyRounded'
 import EditRounded from '@mui/icons-material/EditRounded'
+import KeyRounded from '@mui/icons-material/KeyRounded'
 import PrintRounded from '@mui/icons-material/PrintRounded'
 import RefreshRounded from '@mui/icons-material/RefreshRounded'
+import ReplayRounded from '@mui/icons-material/ReplayRounded'
+import RestartAltRounded from '@mui/icons-material/RestartAltRounded'
+import TokenRounded from '@mui/icons-material/TokenRounded'
 import {
   PRINT_DOCUMENT_TYPES,
   PRINT_FORMATS,
-  PRINT_MEDIA,
   PRINTER_CONNECTION_MODES,
   PRINTER_STATUSES,
   PRINTER_STATION_TYPES,
   PRINTER_TYPES,
+  type OperationsPrintAgentProfile,
+  type OperationsPrintAgentWorkspace,
+  type OperationsPrintJobListItem,
+  type OperationsPrintJobWorkspace,
   type OperationsPrinterInput,
   type OperationsPrinterProfile,
   type OperationsPrinterWorkspace,
@@ -54,7 +65,23 @@ type PrinterPayload = {
   printer?: OperationsPrinterProfile
 }
 
+type PrintAgentPayload = {
+  ok?: boolean
+  error?: string
+  agents?: OperationsPrintAgentWorkspace
+  agent?: OperationsPrintAgentProfile
+  credential?: string | null
+}
+
+type PrintJobPayload = {
+  ok?: boolean
+  error?: string
+  jobs?: OperationsPrintJobWorkspace
+  job?: OperationsPrintJobListItem
+}
+
 type PrinterForm = OperationsPrinterInput
+type View = 'jobs' | 'printers' | 'agents'
 
 const fieldSx = {
   minWidth: 0,
@@ -66,21 +93,31 @@ const fieldSx = {
 
 const LABELS: Record<string, string> = {
   thermal: 'Thermal',
-  office: 'Office',
+  nonthermal: 'Nonthermal',
   local_agent: 'Local print agent',
   browser: 'Browser download',
   system_service: 'System service',
   pack: 'Pack station',
   shipping: 'Shipping station',
   receiving: 'Receiving station',
+  office: 'Office',
   online: 'Online',
   offline: 'Offline',
   disabled: 'Disabled',
+  active: 'Active',
+  revoked: 'Revoked',
+  queued: 'Queued',
+  claimed: 'Claimed',
+  delivered: 'Acknowledged',
+  failed: 'Failed',
+  cancelled: 'Cancelled',
+  printed: 'Legacy printed',
+  rerouted: 'Legacy rerouted',
   label_4x6: '4 x 6 label',
   label_4x8: '4 x 8 label',
   letter: 'US Letter',
   a4: 'A4',
-  shipping_label: 'Shipping label',
+  shipping_label: 'Carrier label',
   packing_slip: 'Packing slip',
   pick_ticket: 'Pick ticket',
   carton_label: 'Carton label',
@@ -92,11 +129,18 @@ const LABELS: Record<string, string> = {
 }
 
 function label(value: string) {
-  return LABELS[value] || value.replace(/[_.-]+/g, ' ').replace(/\b\w/g, (letter) => letter.toUpperCase())
+  return LABELS[value]
+    || value.replace(/[_.-]+/g, ' ').replace(/\b\w/g, (letter) => letter.toUpperCase())
 }
 
 function values(value: unknown) {
   return typeof value === 'string' ? value.split(',').filter(Boolean) : value as string[]
+}
+
+function timestamp(value: string | null) {
+  if (!value) return 'Never'
+  const parsed = new Date(value)
+  return Number.isNaN(parsed.getTime()) ? 'Unknown' : parsed.toLocaleString()
 }
 
 function defaultForm(warehouseId: string): PrinterForm {
@@ -112,6 +156,7 @@ function defaultForm(warehouseId: string): PrinterForm {
     supportedDocumentTypes: ['shipping_label', 'return_label'],
     defaultDocumentTypes: [],
     fallbackPrinterGlobalId: null,
+    localPrintAgentGlobalId: null,
     priority: 100,
     status: 'offline',
   }
@@ -132,16 +177,20 @@ function editForm(printer: OperationsPrinterProfile): PrinterForm {
     supportedDocumentTypes: printer.supportedDocumentTypes,
     defaultDocumentTypes: printer.defaultDocumentTypes,
     fallbackPrinterGlobalId: printer.fallbackPrinterGlobalId,
+    localPrintAgentGlobalId: printer.localPrintAgentGlobalId,
     priority: printer.priority,
     status: printer.status,
   }
 }
 
-async function payload(response: Response): Promise<PrinterPayload> {
+async function responsePayload<T>(response: Response): Promise<T & { ok?: boolean; error?: string }> {
   try {
-    return await response.json() as PrinterPayload
+    return await response.json() as T & { ok?: boolean; error?: string }
   } catch {
-    return { ok: false, error: `Printer configuration returned an invalid response (${response.status})` }
+    return {
+      ok: false,
+      error: `Printing API returned an invalid response (${response.status})`,
+    } as T & { ok?: boolean; error?: string }
   }
 }
 
@@ -180,32 +229,69 @@ function MultiSelect({
   )
 }
 
+function statusColor(status: string): 'default' | 'success' | 'warning' | 'error' | 'info' {
+  if (status === 'online' || status === 'active' || status === 'delivered' || status === 'printed') {
+    return 'success'
+  }
+  if (status === 'failed' || status === 'revoked' || status === 'cancelled') return 'error'
+  if (status === 'offline' || status === 'claimed') return 'warning'
+  if (status === 'queued') return 'info'
+  return 'default'
+}
+
 export default function PrinterConfigurationPanel() {
   const theme = useTheme()
   const mobile = useMediaQuery(theme.breakpoints.down('sm'))
-  const [workspace, setWorkspace] = useState<OperationsPrinterWorkspace | null>(null)
+  const [view, setView] = useState<View>('jobs')
+  const [printers, setPrinters] = useState<OperationsPrinterWorkspace | null>(null)
+  const [agents, setAgents] = useState<OperationsPrintAgentWorkspace | null>(null)
+  const [jobs, setJobs] = useState<OperationsPrintJobWorkspace | null>(null)
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
-  const [form, setForm] = useState<PrinterForm | null>(null)
+  const [printerForm, setPrinterForm] = useState<PrinterForm | null>(null)
+  const [enrollForm, setEnrollForm] = useState<{ warehouseId: string; name: string } | null>(null)
+  const [agentAction, setAgentAction] = useState<{
+    agent: OperationsPrintAgentProfile
+    action: 'rotate-credential' | 'revoke-agent'
+  } | null>(null)
+  const [jobAction, setJobAction] = useState<{
+    job: OperationsPrintJobListItem
+    action: 'retry-job' | 'reprint-job' | 'cancel-job'
+    reason: string
+  } | null>(null)
+  const [credential, setCredential] = useState('')
 
   const load = useCallback(async (signal?: AbortSignal) => {
     setLoading(true)
     setError('')
     try {
-      const response = await fetch('/api/operations/printers', {
-        cache: 'no-store',
-        signal,
-      })
-      const result = await payload(response)
-      if (!response.ok || !result.ok || !result.printers) {
-        throw new Error(result.error || 'Printer configuration is unavailable')
+      const [printerResponse, agentResponse, jobResponse] = await Promise.all([
+        fetch('/api/operations/printers', { cache: 'no-store', signal }),
+        fetch('/api/operations/print-agents', { cache: 'no-store', signal }),
+        fetch('/api/operations/print-jobs', { cache: 'no-store', signal }),
+      ])
+      const [printerResult, agentResult, jobResult] = await Promise.all([
+        responsePayload<PrinterPayload>(printerResponse),
+        responsePayload<PrintAgentPayload>(agentResponse),
+        responsePayload<PrintJobPayload>(jobResponse),
+      ])
+      if (!printerResponse.ok || !printerResult.ok || !printerResult.printers) {
+        throw new Error(printerResult.error || 'Printer configuration is unavailable')
       }
-      setWorkspace(result.printers)
+      if (!agentResponse.ok || !agentResult.ok || !agentResult.agents) {
+        throw new Error(agentResult.error || 'Local print agents are unavailable')
+      }
+      if (!jobResponse.ok || !jobResult.ok || !jobResult.jobs) {
+        throw new Error(jobResult.error || 'Print jobs are unavailable')
+      }
+      setPrinters(printerResult.printers)
+      setAgents(agentResult.agents)
+      setJobs(jobResult.jobs)
     } catch (caught) {
       if (caught instanceof DOMException && caught.name === 'AbortError') return
-      setError(caught instanceof Error ? caught.message : 'Printer configuration is unavailable')
+      setError(caught instanceof Error ? caught.message : 'Printing operations are unavailable')
     } finally {
       if (!signal?.aborted) setLoading(false)
     }
@@ -218,54 +304,92 @@ export default function PrinterConfigurationPanel() {
   }, [load])
 
   const fallbackOptions = useMemo(
-    () => workspace?.printers.filter((printer) => (
-      printer.warehouseId === form?.warehouseId
-      && printer.globalId !== form?.globalId
+    () => printers?.printers.filter((printer) => (
+      printer.warehouseId === printerForm?.warehouseId
+      && printer.globalId !== printerForm?.globalId
       && printer.status !== 'disabled'
+      && printerForm?.supportedFormats.every((item) => printer.supportedFormats.includes(item))
+      && printerForm.supportedMedia.every((item) => printer.supportedMedia.includes(item))
+      && printerForm.supportedDocumentTypes.every((item) => (
+        printer.supportedDocumentTypes.includes(item)
+      ))
     )) || [],
-    [form?.globalId, form?.warehouseId, workspace?.printers],
+    [printerForm, printers?.printers],
   )
 
-  function update<K extends keyof PrinterForm>(key: K, value: PrinterForm[K]) {
-    setForm((current) => current ? { ...current, [key]: value } : current)
+  const agentOptions = useMemo(
+    () => agents?.agents.filter((agent) => (
+      agent.warehouseId === printerForm?.warehouseId && agent.status === 'active'
+    )) || [],
+    [agents?.agents, printerForm?.warehouseId],
+  )
+
+  function updatePrinter<K extends keyof PrinterForm>(key: K, value: PrinterForm[K]) {
+    setPrinterForm((current) => current ? { ...current, [key]: value } : current)
   }
 
   function choosePrinterType(printerType: PrinterType) {
-    setForm((current) => {
+    setPrinterForm((current) => {
       if (!current) return current
-      if (printerType === 'office') {
+      if (printerType === 'nonthermal') {
         return {
           ...current,
           printerType,
-          supportedFormats: ['PDF'],
+          stationType: 'office',
+          supportedFormats: ['PDF', 'PNG'],
           supportedMedia: ['letter', 'a4'],
-          supportedDocumentTypes: ['packing_slip', 'pick_ticket', 'bill_of_lading', 'customs_document', 'customer_insert'],
+          supportedDocumentTypes: [
+            'packing_slip',
+            'pick_ticket',
+            'bill_of_lading',
+            'customs_document',
+            'customer_insert',
+          ],
           defaultDocumentTypes: [],
+          fallbackPrinterGlobalId: null,
         }
       }
       return {
         ...current,
         printerType,
+        stationType: current.stationType === 'office' ? 'shipping' : current.stationType,
         supportedFormats: ['ZPL', 'PDF'],
-        supportedMedia: ['label_4x6'],
+        supportedMedia: ['label_4x6', 'label_4x8'],
         supportedDocumentTypes: ['shipping_label', 'return_label', 'carton_label'],
         defaultDocumentTypes: [],
+        fallbackPrinterGlobalId: null,
       }
     })
   }
 
-  function chooseSupportedDocuments(next: string[]) {
-    const supported = next as PrintDocumentType[]
-    setForm((current) => current ? {
+  function chooseConnection(connectionMode: PrinterConnectionMode) {
+    setPrinterForm((current) => current ? {
       ...current,
-      supportedDocumentTypes: supported,
-      defaultDocumentTypes: current.defaultDocumentTypes.filter((item) => supported.includes(item)),
+      connectionMode,
+      localPrintAgentGlobalId: connectionMode === 'local_agent'
+        ? current.localPrintAgentGlobalId
+        : null,
+      status: connectionMode === 'local_agent' && !current.localPrintAgentGlobalId
+        ? 'offline'
+        : current.status,
     } : current)
   }
 
-  async function save() {
-    if (!form) return
-    if (!form.code.trim() || !form.name.trim()) {
+  function chooseSupportedDocuments(next: string[]) {
+    const supported = next as PrintDocumentType[]
+    setPrinterForm((current) => current ? {
+      ...current,
+      supportedDocumentTypes: supported,
+      defaultDocumentTypes: current.defaultDocumentTypes.filter((item) => (
+        supported.includes(item)
+      )),
+      fallbackPrinterGlobalId: null,
+    } : current)
+  }
+
+  async function savePrinter() {
+    if (!printerForm) return
+    if (!printerForm.code.trim() || !printerForm.name.trim()) {
       setError('Printer code and name are required')
       return
     }
@@ -278,16 +402,16 @@ export default function PrinterConfigurationPanel() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           action: 'save-printer',
-          ...form,
-          code: form.code.trim(),
-          name: form.name.trim(),
+          ...printerForm,
+          code: printerForm.code.trim(),
+          name: printerForm.name.trim(),
         }),
       })
-      const result = await payload(response)
+      const result = await responsePayload<PrinterPayload>(response)
       if (!response.ok || !result.ok || !result.printer) {
         throw new Error(result.error || 'Printer configuration could not be saved')
       }
-      setForm(null)
+      setPrinterForm(null)
       setNotice(`${result.printer.name} was saved`)
       await load()
     } catch (caught) {
@@ -297,114 +421,414 @@ export default function PrinterConfigurationPanel() {
     }
   }
 
+  async function enrollAgent() {
+    if (!enrollForm) return
+    setSaving(true)
+    setError('')
+    setNotice('')
+    try {
+      const response = await fetch('/api/operations/print-agents', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': crypto.randomUUID(),
+        },
+        body: JSON.stringify({ action: 'enroll-agent', ...enrollForm }),
+      })
+      const result = await responsePayload<PrintAgentPayload>(response)
+      if (!response.ok || !result.ok || !result.agent) {
+        throw new Error(result.error || 'Local print agent could not be enrolled')
+      }
+      setEnrollForm(null)
+      if (result.credential) setCredential(result.credential)
+      setNotice(result.credential
+        ? `${result.agent.name} was enrolled`
+        : 'Agent already enrolled; rotate its credential to issue a new one')
+      await load()
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'Local print agent could not be enrolled')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  async function runAgentAction() {
+    if (!agentAction) return
+    setSaving(true)
+    setError('')
+    setNotice('')
+    try {
+      const response = await fetch('/api/operations/print-agents', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(agentAction.action === 'rotate-credential'
+            ? { 'Idempotency-Key': crypto.randomUUID() }
+            : {}),
+        },
+        body: JSON.stringify({
+          action: agentAction.action,
+          printAgentGlobalId: agentAction.agent.globalId,
+        }),
+      })
+      const result = await responsePayload<PrintAgentPayload>(response)
+      if (!response.ok || !result.ok || !result.agent) {
+        throw new Error(result.error || 'Local print-agent action failed')
+      }
+      setAgentAction(null)
+      if (result.credential) setCredential(result.credential)
+      setNotice(agentAction.action === 'rotate-credential'
+        ? result.credential
+          ? `${result.agent.name} credential was rotated`
+          : 'Credential was already issued; rotate again with a new request to replace it'
+        : `${result.agent.name} was revoked and its printers were set offline`)
+      await load()
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'Local print-agent action failed')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  async function runJobAction() {
+    if (!jobAction) return
+    if (!jobAction.reason.trim()) {
+      const actionName = jobAction.action === 'reprint-job'
+        ? 'Reprint'
+        : jobAction.action === 'cancel-job'
+          ? 'Cancellation'
+          : 'Retry'
+      setError(`${actionName} reason is required`)
+      return
+    }
+    setSaving(true)
+    setError('')
+    setNotice('')
+    try {
+      const response = await fetch('/api/operations/print-jobs', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': crypto.randomUUID(),
+        },
+        body: JSON.stringify({
+          action: jobAction.action,
+          jobGlobalId: jobAction.job.globalId,
+          reason: jobAction.reason.trim(),
+        }),
+      })
+      const result = await responsePayload<PrintJobPayload>(response)
+      if (!response.ok || !result.ok || !result.job) {
+        throw new Error(result.error || 'Print-job action failed')
+      }
+      setJobAction(null)
+      setNotice(
+        jobAction.action === 'reprint-job'
+          ? `Reprint ${result.job.globalId} was queued`
+          : jobAction.action === 'cancel-job'
+            ? `${result.job.globalId} was cancelled`
+            : `${result.job.globalId} was queued for retry`,
+      )
+      await load()
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'Print-job action failed')
+    } finally {
+      setSaving(false)
+    }
+  }
+
   return (
     <Box sx={{ px: { xs: 2, md: 3 }, py: 2.5 }}>
       <Stack direction={{ xs: 'column', sm: 'row' }} justifyContent="space-between" gap={1.5}>
         <Box>
-          <Typography variant="h6" fontWeight={700}>Printer routing</Typography>
+          <Typography variant="h6" fontWeight={700}>Printing operations</Typography>
           <Typography variant="body2" color="text.secondary">
-            Match documents and media to warehouse printers without repurchasing carrier labels.
+            Route durable documents, supervise local agents, and audit every delivery attempt.
           </Typography>
         </Box>
-        <Stack direction="row" spacing={1} alignItems="center">
-          <Tooltip title="Refresh printers">
-            <span>
-              <IconButton aria-label="Refresh printer configuration" disabled={loading} onClick={() => void load()}>
-                <RefreshRounded />
-              </IconButton>
-            </span>
-          </Tooltip>
-          {workspace?.capabilities.canManage && (
-            <Button
-              variant="contained"
-              startIcon={<AddRounded />}
-              disabled={!workspace.warehouses[0]}
-              onClick={() => setForm(defaultForm(workspace.warehouses[0]?.id || ''))}
+        <Tooltip title="Refresh printing operations">
+          <span>
+            <IconButton
+              aria-label="Refresh printing operations"
+              disabled={loading}
+              onClick={() => void load()}
             >
-              Add printer
-            </Button>
-          )}
-        </Stack>
+              <RefreshRounded />
+            </IconButton>
+          </span>
+        </Tooltip>
       </Stack>
 
       <Alert severity="info" sx={{ mt: 2 }}>
-        Configuration and routing are durable. Browser delivery is best effort; reliable printing requires an enrolled local agent and a printer acknowledgment before a job is marked printed.
+        Acknowledged means the local agent handed the document to its configured device. It does not prove physical output, and retries or reprints never purchase another carrier label.
       </Alert>
       {error && <Alert severity="error" onClose={() => setError('')} sx={{ mt: 1.5 }}>{error}</Alert>}
       {notice && <Alert severity="success" onClose={() => setNotice('')} sx={{ mt: 1.5 }}>{notice}</Alert>}
 
-      {loading && !workspace ? (
+      <Tabs
+        value={view}
+        onChange={(_event, next: View) => setView(next)}
+        variant={mobile ? 'fullWidth' : 'standard'}
+        sx={{ mt: 1.5, borderBottom: '1px solid rgba(255,255,255,0.1)' }}
+      >
+        <Tab value="jobs" label={`Jobs${jobs ? ` (${jobs.jobs.length})` : ''}`} />
+        <Tab value="printers" label={`Printers${printers ? ` (${printers.printers.length})` : ''}`} />
+        <Tab value="agents" label={`Agents${agents ? ` (${agents.agents.length})` : ''}`} />
+      </Tabs>
+
+      {loading && !printers ? (
         <Box sx={{ py: 8, display: 'grid', placeItems: 'center' }}><CircularProgress size={30} /></Box>
-      ) : workspace?.warehouses.length === 0 ? (
-        <Alert severity="warning" sx={{ mt: 2 }}>Create an active warehouse before configuring printers.</Alert>
-      ) : workspace?.printers.length === 0 ? (
-        <Box sx={{ py: 8, textAlign: 'center' }}>
-          <PrintRounded sx={{ fontSize: 40, color: 'text.disabled' }} />
-          <Typography fontWeight={700} sx={{ mt: 1 }}>No printer profiles</Typography>
-          <Typography variant="body2" color="text.secondary">Add the thermal and office printers used by this organization.</Typography>
+      ) : view === 'jobs' ? (
+        <Box sx={{ pt: 2 }}>
+          {!jobs?.jobs.length ? (
+            <Box sx={{ py: 7, textAlign: 'center' }}>
+              <PrintRounded sx={{ fontSize: 40, color: 'text.disabled' }} />
+              <Typography fontWeight={700} sx={{ mt: 1 }}>No print jobs</Typography>
+              <Typography variant="body2" color="text.secondary">
+                Carrier-label and packing-slip jobs will appear here when their source workflow queues them.
+              </Typography>
+            </Box>
+          ) : (
+            <Stack divider={<Divider flexItem />}>
+              {jobs.jobs.map((job) => (
+                <Stack
+                  key={job.globalId}
+                  direction={{ xs: 'column', md: 'row' }}
+                  justifyContent="space-between"
+                  gap={1.5}
+                  sx={{ py: 2 }}
+                >
+                  <Box sx={{ minWidth: 0 }}>
+                    <Stack direction="row" gap={0.75} alignItems="center" flexWrap="wrap" useFlexGap>
+                      <Typography fontWeight={700}>{job.globalId}</Typography>
+                      <Chip size="small" label={label(job.status)} color={statusColor(job.status)} />
+                      {job.documentType && <Chip size="small" label={label(job.documentType)} variant="outlined" />}
+                      {job.media && <Chip size="small" label={label(job.media)} variant="outlined" />}
+                      {job.format && <Chip size="small" label={job.format} variant="outlined" />}
+                    </Stack>
+                    <Typography variant="body2" color="text.secondary" sx={{ mt: 0.6 }}>
+                      {job.printerName} · Attempt {job.attempts} of {job.maxAttempts} · {timestamp(job.createdAt)}
+                    </Typography>
+                    <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 0.35 }}>
+                      {job.routingReason}
+                    </Typography>
+                    {job.lastError && (
+                      <Typography variant="caption" color="error.light" display="block" sx={{ mt: 0.35 }}>
+                        {job.lastError}
+                      </Typography>
+                    )}
+                    {job.reprintOfJobGlobalId && (
+                      <Typography variant="caption" color="#A8C7FA" display="block" sx={{ mt: 0.35 }}>
+                        Reprint of {job.reprintOfJobGlobalId}: {job.reprintReason}
+                      </Typography>
+                    )}
+                    {job.status === 'claimed' && (
+                      <Typography variant="caption" color="warning.light" display="block" sx={{ mt: 0.35 }}>
+                        Lease expires {timestamp(job.claimExpiresAt)}
+                      </Typography>
+                    )}
+                  </Box>
+                  <Stack direction="row" spacing={1} alignItems="center" justifyContent="flex-end">
+                    {job.status === 'failed' && jobs.capabilities.canExecute && job.attempts < job.maxAttempts && (
+                      <Button
+                        size="small"
+                        variant="outlined"
+                        startIcon={<RestartAltRounded />}
+                        onClick={() => setJobAction({ job, action: 'retry-job', reason: '' })}
+                      >
+                        Retry
+                      </Button>
+                    )}
+                    {job.status === 'delivered' && jobs.capabilities.canReprint && (
+                      <Button
+                        size="small"
+                        variant="outlined"
+                        startIcon={<ReplayRounded />}
+                        onClick={() => setJobAction({ job, action: 'reprint-job', reason: '' })}
+                      >
+                        Reprint
+                      </Button>
+                    )}
+                    {(job.status === 'queued' || job.status === 'claimed')
+                      && (jobs.capabilities.canExecute || jobs.capabilities.canManage) && (
+                      <Button
+                        size="small"
+                        variant="outlined"
+                        color="error"
+                        startIcon={<CancelRounded />}
+                        onClick={() => setJobAction({ job, action: 'cancel-job', reason: '' })}
+                      >
+                        Cancel
+                      </Button>
+                    )}
+                  </Stack>
+                </Stack>
+              ))}
+            </Stack>
+          )}
+        </Box>
+      ) : view === 'printers' ? (
+        <Box sx={{ pt: 2 }}>
+          <Stack direction="row" justifyContent="flex-end">
+            {printers?.capabilities.canManage && (
+              <Button
+                variant="contained"
+                startIcon={<AddRounded />}
+                disabled={!printers.warehouses[0]}
+                onClick={() => setPrinterForm(defaultForm(printers.warehouses[0]?.id || ''))}
+              >
+                Add printer
+              </Button>
+            )}
+          </Stack>
+          {!printers?.warehouses.length ? (
+            <Alert severity="warning" sx={{ mt: 2 }}>Create an active warehouse before configuring printers.</Alert>
+          ) : !printers.printers.length ? (
+            <Box sx={{ py: 7, textAlign: 'center' }}>
+              <PrintRounded sx={{ fontSize: 40, color: 'text.disabled' }} />
+              <Typography fontWeight={700} sx={{ mt: 1 }}>No printer profiles</Typography>
+            </Box>
+          ) : (
+            <Stack divider={<Divider flexItem />} sx={{ mt: 1 }}>
+              {printers.printers.map((printer) => (
+                <Stack
+                  key={printer.globalId}
+                  direction={{ xs: 'column', md: 'row' }}
+                  justifyContent="space-between"
+                  gap={1.5}
+                  sx={{ py: 2 }}
+                >
+                  <Box sx={{ minWidth: 0 }}>
+                    <Stack direction="row" spacing={0.75} alignItems="center" flexWrap="wrap" useFlexGap>
+                      <Typography fontWeight={700}>{printer.name}</Typography>
+                      <Chip size="small" label={label(printer.printerType)} variant="outlined" />
+                      <Chip size="small" label={label(printer.status)} color={statusColor(printer.status)} />
+                    </Stack>
+                    <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
+                      {printer.warehouseName} · {label(printer.stationType)} · {label(printer.connectionMode)}
+                    </Typography>
+                    <Typography variant="caption" color="#A8C7FA">
+                      {printer.globalId} · {printer.code}
+                    </Typography>
+                    <Stack direction="row" gap={0.75} flexWrap="wrap" useFlexGap sx={{ mt: 1 }}>
+                      {printer.defaultDocumentTypes.map((item) => (
+                        <Chip key={item} size="small" label={`Default: ${label(item)}`} color="info" variant="outlined" />
+                      ))}
+                      {printer.supportedMedia.map((item) => (
+                        <Chip key={item} size="small" label={label(item)} variant="outlined" />
+                      ))}
+                      {printer.supportedFormats.map((item) => (
+                        <Chip key={item} size="small" label={item} variant="outlined" />
+                      ))}
+                    </Stack>
+                    <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 0.75 }}>
+                      Agent: {printer.localPrintAgentName || 'Not assigned'} · Last seen: {timestamp(printer.lastSeenAt)}
+                    </Typography>
+                    {printer.fallbackPrinterName && (
+                      <Typography variant="caption" color="text.secondary" display="block">
+                        Approved fallback: {printer.fallbackPrinterName}
+                      </Typography>
+                    )}
+                  </Box>
+                  {printers.capabilities.canManage && (
+                    <Tooltip title={`Edit ${printer.name}`}>
+                      <IconButton
+                        aria-label={`Edit ${printer.name}`}
+                        onClick={() => setPrinterForm(editForm(printer))}
+                        sx={{ alignSelf: { xs: 'flex-end', md: 'center' } }}
+                      >
+                        <EditRounded />
+                      </IconButton>
+                    </Tooltip>
+                  )}
+                </Stack>
+              ))}
+            </Stack>
+          )}
         </Box>
       ) : (
-        <Stack divider={<Divider flexItem />} sx={{ mt: 2 }}>
-          {workspace?.printers.map((printer) => (
-            <Stack
-              key={printer.globalId}
-              direction={{ xs: 'column', md: 'row' }}
-              justifyContent="space-between"
-              gap={1.5}
-              sx={{ py: 2 }}
-            >
-              <Box sx={{ minWidth: 0 }}>
-                <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
-                  <Typography fontWeight={700}>{printer.name}</Typography>
-                  <Chip size="small" label={label(printer.printerType)} variant="outlined" />
-                  <Chip
-                    size="small"
-                    label={label(printer.status)}
-                    color={printer.status === 'online' ? 'success' : printer.status === 'offline' ? 'warning' : 'default'}
-                  />
+        <Box sx={{ pt: 2 }}>
+          <Stack direction="row" justifyContent="flex-end">
+            {agents?.capabilities.canManage && (
+              <Button
+                variant="contained"
+                startIcon={<TokenRounded />}
+                disabled={!printers?.warehouses[0]}
+                onClick={() => setEnrollForm({
+                  warehouseId: printers?.warehouses[0]?.id || '',
+                  name: '',
+                })}
+              >
+                Enroll agent
+              </Button>
+            )}
+          </Stack>
+          {!agents?.agents.length ? (
+            <Box sx={{ py: 7, textAlign: 'center' }}>
+              <TokenRounded sx={{ fontSize: 40, color: 'text.disabled' }} />
+              <Typography fontWeight={700} sx={{ mt: 1 }}>No local print agents</Typography>
+            </Box>
+          ) : (
+            <Stack divider={<Divider flexItem />} sx={{ mt: 1 }}>
+              {agents.agents.map((agent) => (
+                <Stack
+                  key={agent.globalId}
+                  direction={{ xs: 'column', md: 'row' }}
+                  justifyContent="space-between"
+                  gap={1.5}
+                  sx={{ py: 2 }}
+                >
+                  <Box sx={{ minWidth: 0 }}>
+                    <Stack direction="row" spacing={0.75} alignItems="center" flexWrap="wrap" useFlexGap>
+                      <Typography fontWeight={700}>{agent.name}</Typography>
+                      <Chip size="small" label={label(agent.status)} color={statusColor(agent.status)} />
+                      <Chip size="small" label={`Credential v${agent.credentialVersion}`} variant="outlined" />
+                    </Stack>
+                    <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
+                      {agent.warehouseName} · Last seen {timestamp(agent.lastSeenAt)}
+                    </Typography>
+                    <Typography variant="caption" color="#A8C7FA">{agent.globalId}</Typography>
+                    <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 0.5 }}>
+                      Printers: {agent.assignedPrinters.map((printer) => printer.name).join(', ') || 'None'}
+                    </Typography>
+                  </Box>
+                  {agents.capabilities.canManage && agent.status === 'active' && (
+                    <Stack direction="row" spacing={0.5} justifyContent="flex-end">
+                      <Tooltip title={`Rotate ${agent.name} credential`}>
+                        <IconButton
+                          aria-label={`Rotate ${agent.name} credential`}
+                          onClick={() => setAgentAction({ agent, action: 'rotate-credential' })}
+                        >
+                          <KeyRounded />
+                        </IconButton>
+                      </Tooltip>
+                      <Tooltip title={`Revoke ${agent.name}`}>
+                        <IconButton
+                          aria-label={`Revoke ${agent.name}`}
+                          color="error"
+                          onClick={() => setAgentAction({ agent, action: 'revoke-agent' })}
+                        >
+                          <RestartAltRounded />
+                        </IconButton>
+                      </Tooltip>
+                    </Stack>
+                  )}
                 </Stack>
-                <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-                  {printer.warehouseName} · {label(printer.stationType)} · {label(printer.connectionMode)}
-                </Typography>
-                <Typography variant="caption" color="#A8C7FA">{printer.globalId} · {printer.code}</Typography>
-                <Stack direction="row" gap={0.75} flexWrap="wrap" useFlexGap sx={{ mt: 1 }}>
-                  {printer.defaultDocumentTypes.map((item) => (
-                    <Chip key={item} size="small" label={`Default: ${label(item)}`} color="info" variant="outlined" />
-                  ))}
-                  {printer.supportedMedia.map((item) => <Chip key={item} size="small" label={label(item)} variant="outlined" />)}
-                  {printer.supportedFormats.map((item) => <Chip key={item} size="small" label={item} variant="outlined" />)}
-                </Stack>
-                {printer.fallbackPrinterName && (
-                  <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 0.75 }}>
-                    Fallback: {printer.fallbackPrinterName}
-                  </Typography>
-                )}
-              </Box>
-              {workspace?.capabilities.canManage && (
-                <Tooltip title={`Edit ${printer.name}`}>
-                  <IconButton
-                    aria-label={`Edit ${printer.name}`}
-                    onClick={() => setForm(editForm(printer))}
-                    sx={{ alignSelf: { xs: 'flex-end', md: 'center' } }}
-                  >
-                    <EditRounded />
-                  </IconButton>
-                </Tooltip>
-              )}
+              ))}
             </Stack>
-          ))}
-        </Stack>
+          )}
+        </Box>
       )}
 
       <Dialog
-        open={Boolean(form)}
-        onClose={() => !saving && setForm(null)}
+        open={Boolean(printerForm)}
+        onClose={() => !saving && setPrinterForm(null)}
         fullScreen={mobile}
         fullWidth
         maxWidth="md"
       >
-        <DialogTitle>{form?.globalId ? 'Edit printer' : 'Add printer'}</DialogTitle>
-        {form && (
+        <DialogTitle>{printerForm?.globalId ? 'Edit printer' : 'Add printer'}</DialogTitle>
+        {printerForm && (
           <DialogContent dividers>
             <Stack spacing={2}>
               <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.5}>
@@ -413,16 +837,21 @@ export default function PrinterConfigurationPanel() {
                   fullWidth
                   size="small"
                   label="Warehouse"
-                  value={form.warehouseId}
-                  disabled={Boolean(form.globalId)}
-                  onChange={(event) => {
-                    update('warehouseId', event.target.value)
-                    update('fallbackPrinterGlobalId', null)
-                  }}
-                  helperText={form.globalId ? 'Create a new profile to move a physical printer to another warehouse.' : ''}
+                  value={printerForm.warehouseId}
+                  disabled={Boolean(printerForm.globalId)}
+                  onChange={(event) => setPrinterForm((current) => current ? {
+                    ...current,
+                    warehouseId: event.target.value,
+                    fallbackPrinterGlobalId: null,
+                    localPrintAgentGlobalId: null,
+                    status: 'offline',
+                  } : current)}
+                  helperText={printerForm.globalId
+                    ? 'Create a new profile to move a physical printer to another warehouse.'
+                    : ''}
                   sx={fieldSx}
                 >
-                  {workspace?.warehouses.map((warehouse) => (
+                  {printers?.warehouses.map((warehouse) => (
                     <MenuItem key={warehouse.id} value={warehouse.id}>{warehouse.name}</MenuItem>
                   ))}
                 </TextField>
@@ -430,8 +859,8 @@ export default function PrinterConfigurationPanel() {
                   fullWidth
                   size="small"
                   label="Printer code"
-                  value={form.code}
-                  onChange={(event) => update('code', event.target.value.toUpperCase())}
+                  value={printerForm.code}
+                  onChange={(event) => updatePrinter('code', event.target.value.toUpperCase())}
                   inputProps={{ maxLength: 40 }}
                   sx={fieldSx}
                 />
@@ -440,8 +869,8 @@ export default function PrinterConfigurationPanel() {
                 fullWidth
                 size="small"
                 label="Printer name"
-                value={form.name}
-                onChange={(event) => update('name', event.target.value)}
+                value={printerForm.name}
+                onChange={(event) => updatePrinter('name', event.target.value)}
                 inputProps={{ maxLength: 120 }}
                 sx={fieldSx}
               />
@@ -451,7 +880,7 @@ export default function PrinterConfigurationPanel() {
                   fullWidth
                   size="small"
                   label="Printer type"
-                  value={form.printerType}
+                  value={printerForm.printerType}
                   onChange={(event) => choosePrinterType(event.target.value as PrinterType)}
                   sx={fieldSx}
                 >
@@ -462,8 +891,8 @@ export default function PrinterConfigurationPanel() {
                   fullWidth
                   size="small"
                   label="Station"
-                  value={form.stationType}
-                  onChange={(event) => update('stationType', event.target.value as PrinterStationType)}
+                  value={printerForm.stationType}
+                  onChange={(event) => updatePrinter('stationType', event.target.value as PrinterStationType)}
                   sx={fieldSx}
                 >
                   {PRINTER_STATION_TYPES.map((item) => <MenuItem key={item} value={item}>{label(item)}</MenuItem>)}
@@ -473,8 +902,8 @@ export default function PrinterConfigurationPanel() {
                   fullWidth
                   size="small"
                   label="Connection"
-                  value={form.connectionMode}
-                  onChange={(event) => update('connectionMode', event.target.value as PrinterConnectionMode)}
+                  value={printerForm.connectionMode}
+                  onChange={(event) => chooseConnection(event.target.value as PrinterConnectionMode)}
                   sx={fieldSx}
                 >
                   {PRINTER_CONNECTION_MODES.map((item) => <MenuItem key={item} value={item}>{label(item)}</MenuItem>)}
@@ -483,37 +912,68 @@ export default function PrinterConfigurationPanel() {
               <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.5}>
                 <MultiSelect
                   label="Formats"
-                  options={PRINT_FORMATS}
-                  selected={form.supportedFormats}
-                  onChange={(next) => update('supportedFormats', next as PrintFormat[])}
+                  options={printerForm.printerType === 'thermal' ? PRINT_FORMATS : ['PDF', 'PNG']}
+                  selected={printerForm.supportedFormats}
+                  onChange={(next) => {
+                    updatePrinter('supportedFormats', next as PrintFormat[])
+                    updatePrinter('fallbackPrinterGlobalId', null)
+                  }}
                 />
                 <MultiSelect
                   label="Media"
-                  options={PRINT_MEDIA}
-                  selected={form.supportedMedia}
-                  onChange={(next) => update('supportedMedia', next as PrintMedia[])}
+                  options={printerForm.printerType === 'thermal'
+                    ? ['label_4x6', 'label_4x8']
+                    : ['letter', 'a4']}
+                  selected={printerForm.supportedMedia}
+                  onChange={(next) => {
+                    updatePrinter('supportedMedia', next as PrintMedia[])
+                    updatePrinter('fallbackPrinterGlobalId', null)
+                  }}
                 />
               </Stack>
               <MultiSelect
                 label="Supported documents"
                 options={PRINT_DOCUMENT_TYPES}
-                selected={form.supportedDocumentTypes}
+                selected={printerForm.supportedDocumentTypes}
                 onChange={chooseSupportedDocuments}
               />
               <MultiSelect
                 label="Default routes"
-                options={form.supportedDocumentTypes}
-                selected={form.defaultDocumentTypes}
-                onChange={(next) => update('defaultDocumentTypes', next as PrintDocumentType[])}
+                options={printerForm.supportedDocumentTypes}
+                selected={printerForm.defaultDocumentTypes}
+                onChange={(next) => {
+                  updatePrinter('defaultDocumentTypes', next as PrintDocumentType[])
+                  updatePrinter('fallbackPrinterGlobalId', null)
+                }}
               />
+              {printerForm.connectionMode === 'local_agent' && (
+                <TextField
+                  select
+                  fullWidth
+                  size="small"
+                  label="Local print agent"
+                  value={printerForm.localPrintAgentGlobalId || ''}
+                  onChange={(event) => setPrinterForm((current) => current ? {
+                    ...current,
+                    localPrintAgentGlobalId: event.target.value || null,
+                    status: event.target.value ? current.status : 'offline',
+                  } : current)}
+                  sx={fieldSx}
+                >
+                  <MenuItem value="">Not assigned</MenuItem>
+                  {agentOptions.map((agent) => (
+                    <MenuItem key={agent.globalId} value={agent.globalId}>{agent.name}</MenuItem>
+                  ))}
+                </TextField>
+              )}
               <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.5}>
                 <TextField
                   select
                   fullWidth
                   size="small"
-                  label="Fallback printer"
-                  value={form.fallbackPrinterGlobalId || ''}
-                  onChange={(event) => update('fallbackPrinterGlobalId', event.target.value || null)}
+                  label="Approved fallback"
+                  value={printerForm.fallbackPrinterGlobalId || ''}
+                  onChange={(event) => updatePrinter('fallbackPrinterGlobalId', event.target.value || null)}
                   sx={fieldSx}
                 >
                   <MenuItem value="">No fallback</MenuItem>
@@ -526,8 +986,8 @@ export default function PrinterConfigurationPanel() {
                   size="small"
                   type="number"
                   label="Priority"
-                  value={form.priority}
-                  onChange={(event) => update('priority', Number(event.target.value))}
+                  value={printerForm.priority}
+                  onChange={(event) => updatePrinter('priority', Number(event.target.value))}
                   inputProps={{ min: 1, max: 999, step: 1 }}
                   sx={fieldSx}
                 />
@@ -536,21 +996,205 @@ export default function PrinterConfigurationPanel() {
                   fullWidth
                   size="small"
                   label="Status"
-                  value={form.status}
-                  onChange={(event) => update('status', event.target.value as PrinterStatus)}
+                  value={printerForm.status}
+                  onChange={(event) => updatePrinter('status', event.target.value as PrinterStatus)}
                   sx={fieldSx}
                 >
-                  {PRINTER_STATUSES.map((item) => <MenuItem key={item} value={item}>{label(item)}</MenuItem>)}
+                  {PRINTER_STATUSES.map((item) => (
+                    <MenuItem
+                      key={item}
+                      value={item}
+                      disabled={
+                        item === 'online'
+                        && printerForm.connectionMode === 'local_agent'
+                        && !printerForm.localPrintAgentGlobalId
+                      }
+                    >
+                      {label(item)}
+                    </MenuItem>
+                  ))}
                 </TextField>
               </Stack>
             </Stack>
           </DialogContent>
         )}
         <DialogActions>
-          <Button onClick={() => setForm(null)} disabled={saving}>Cancel</Button>
-          <Button variant="contained" onClick={() => void save()} disabled={saving}>
+          <Button onClick={() => setPrinterForm(null)} disabled={saving}>Cancel</Button>
+          <Button variant="contained" onClick={() => void savePrinter()} disabled={saving}>
             {saving ? 'Saving...' : 'Save printer'}
           </Button>
+        </DialogActions>
+      </Dialog>
+
+      <Dialog
+        open={Boolean(enrollForm)}
+        onClose={() => !saving && setEnrollForm(null)}
+        fullWidth
+        maxWidth="sm"
+      >
+        <DialogTitle>Enroll local print agent</DialogTitle>
+        {enrollForm && (
+          <DialogContent dividers>
+            <Stack spacing={2}>
+              <TextField
+                select
+                fullWidth
+                size="small"
+                label="Warehouse"
+                value={enrollForm.warehouseId}
+                onChange={(event) => setEnrollForm({ ...enrollForm, warehouseId: event.target.value })}
+                sx={fieldSx}
+              >
+                {printers?.warehouses.map((warehouse) => (
+                  <MenuItem key={warehouse.id} value={warehouse.id}>{warehouse.name}</MenuItem>
+                ))}
+              </TextField>
+              <TextField
+                fullWidth
+                size="small"
+                label="Agent name"
+                value={enrollForm.name}
+                onChange={(event) => setEnrollForm({ ...enrollForm, name: event.target.value })}
+                inputProps={{ maxLength: 120 }}
+                sx={fieldSx}
+              />
+            </Stack>
+          </DialogContent>
+        )}
+        <DialogActions>
+          <Button onClick={() => setEnrollForm(null)} disabled={saving}>Cancel</Button>
+          <Button
+            variant="contained"
+            onClick={() => void enrollAgent()}
+            disabled={saving || !enrollForm?.name.trim()}
+          >
+            {saving ? 'Enrolling...' : 'Enroll'}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      <Dialog
+        open={Boolean(agentAction)}
+        onClose={() => !saving && setAgentAction(null)}
+        fullWidth
+        maxWidth="sm"
+      >
+        <DialogTitle>
+          {agentAction?.action === 'rotate-credential' ? 'Rotate agent credential' : 'Revoke local print agent'}
+        </DialogTitle>
+        <DialogContent dividers>
+          <Typography variant="body2" color="text.secondary">
+            {agentAction?.action === 'rotate-credential'
+              ? `The current credential for ${agentAction.agent.name} will stop working immediately.`
+              : `${agentAction?.agent.name || 'This agent'} will be revoked and every assigned local-agent printer will be set offline.`}
+          </Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setAgentAction(null)} disabled={saving}>Cancel</Button>
+          <Button
+            variant="contained"
+            color={agentAction?.action === 'revoke-agent' ? 'error' : 'primary'}
+            onClick={() => void runAgentAction()}
+            disabled={saving}
+          >
+            {saving
+              ? 'Working...'
+              : agentAction?.action === 'rotate-credential' ? 'Rotate' : 'Revoke'}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      <Dialog
+        open={Boolean(jobAction)}
+        onClose={() => !saving && setJobAction(null)}
+        fullWidth
+        maxWidth="sm"
+      >
+        <DialogTitle>
+          {jobAction?.action === 'reprint-job'
+            ? 'Authorize reprint'
+            : jobAction?.action === 'cancel-job'
+              ? 'Cancel print job'
+              : 'Retry print job'}
+        </DialogTitle>
+        {jobAction && (
+          <DialogContent dividers>
+            <Stack spacing={2}>
+              <Typography variant="body2" color="text.secondary">
+                {jobAction.action === 'reprint-job'
+                  ? `This creates a new audited job from ${jobAction.job.globalId} without purchasing another carrier label.`
+                  : jobAction.action === 'cancel-job'
+                    ? `This fences ${jobAction.job.globalId} from further delivery. A claimed device may already have accepted the document.`
+                    : `This requeues ${jobAction.job.globalId} within its existing bounded attempt limit.`}
+              </Typography>
+              <TextField
+                fullWidth
+                multiline
+                minRows={3}
+                label={jobAction.action === 'reprint-job'
+                  ? 'Reprint reason'
+                  : jobAction.action === 'cancel-job'
+                    ? 'Cancellation reason'
+                    : 'Retry reason'}
+                value={jobAction.reason}
+                onChange={(event) => setJobAction({ ...jobAction, reason: event.target.value })}
+                inputProps={{ maxLength: 500 }}
+                sx={fieldSx}
+              />
+            </Stack>
+          </DialogContent>
+        )}
+        <DialogActions>
+          <Button onClick={() => setJobAction(null)} disabled={saving}>
+            {jobAction?.action === 'cancel-job' ? 'Back' : 'Cancel'}
+          </Button>
+          <Button
+            variant="contained"
+            color={jobAction?.action === 'cancel-job' ? 'error' : 'primary'}
+            onClick={() => void runJobAction()}
+            disabled={saving || !jobAction?.reason.trim()}
+          >
+            {saving
+              ? 'Working...'
+              : jobAction?.action === 'reprint-job'
+                ? 'Queue reprint'
+                : jobAction?.action === 'cancel-job'
+                  ? 'Cancel job'
+                  : 'Queue retry'}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      <Dialog open={Boolean(credential)} onClose={() => setCredential('')} fullWidth maxWidth="sm">
+        <DialogTitle>One-time agent credential</DialogTitle>
+        <DialogContent dividers>
+          <Alert severity="warning">
+            This credential is shown once. Rotate it if this dialog closes before the local agent is configured.
+          </Alert>
+          <Box
+            component="pre"
+            sx={{
+              mt: 2,
+              mb: 0,
+              p: 1.5,
+              border: '1px solid rgba(255,255,255,0.15)',
+              borderRadius: '6px',
+              overflowWrap: 'anywhere',
+              whiteSpace: 'pre-wrap',
+              fontSize: '0.8rem',
+            }}
+          >
+            {credential}
+          </Box>
+        </DialogContent>
+        <DialogActions>
+          <Button
+            startIcon={<ContentCopyRounded />}
+            onClick={() => void navigator.clipboard.writeText(credential)}
+          >
+            Copy
+          </Button>
+          <Button variant="contained" onClick={() => setCredential('')}>Done</Button>
         </DialogActions>
       </Dialog>
     </Box>

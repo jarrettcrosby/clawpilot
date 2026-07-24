@@ -10,29 +10,45 @@ import type {
   OperationsActivationState,
   OperationsExceptionStatus,
   OperationsOrderStatus,
+  OperationsWorkspace,
 } from '@/lib/operations/types'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import {
+  confirmOperationsOrderShipmentFromPostgres,
   confirmOperationsOrderPicksFromPostgres,
+  createOperationsLocationInPostgres,
+  createOperationsWarehouseInPostgres,
+  deleteOperationsLocationInPostgres,
   OperationsRequestError,
   readOperationsWorkspaceFromPostgres,
   releaseOperationsOrderFromPostgres,
   runMockOperationsProofFromPostgres,
   updateOperationsActivationInPostgres,
   updateOperationsExceptionInPostgres,
+  updateOperationsLocationInPostgres,
+  updateOperationsWarehouseInPostgres,
   verifyOperationsOrderPackFromPostgres,
 } from '@/lib/persistence/operations'
+import {
+  createOperationsSandboxLabelInPostgres,
+  voidOperationsSandboxLabelInPostgres,
+} from '@/lib/persistence/operationShipping'
 import { requireRequestUser } from '@/lib/requestUser'
 
 export const dynamic = 'force-dynamic'
 export const revalidate = 0
 export const runtime = 'nodejs'
 
-const MAX_REQUEST_BYTES = 8 * 1024
+const MAX_REQUEST_BYTES = 64 * 1024
 const CUSTOMER_GLOBAL_ID = /^ga\d{7}$/
 const PRODUCT_GLOBAL_ID = /^gp\d{7}$/
 const ORDER_GLOBAL_ID = /^gor\d{7}$/
 const EXCEPTION_GLOBAL_ID = /^gex\d{7}$/
+const RATE_GLOBAL_ID = /^grt\d{7}$/
+const CARRIER_ACCOUNT_GLOBAL_ID = /^gac\d{7}$/
+const PRINTER_GLOBAL_ID = /^gpr\d{7}$/
+const WAREHOUSE_GLOBAL_ID = /^gwh\d{7}$/
+const LOCATION_GLOBAL_ID = /^gwl\d{7}$/
 const ORDER_STATUSES = new Set<OperationsOrderStatus>([
   'imported', 'validated', 'held', 'promised', 'reserved', 'planned',
   'released', 'picking', 'packed', 'shipped', 'cancelled', 'exception',
@@ -103,8 +119,63 @@ function integerValue(value: unknown, label: string, minimum: number, maximum: n
   return parsed
 }
 
+function optionalNumberValue(value: unknown, label: string, minimum: number, maximum: number): number | null {
+  if (value === null || value === undefined || value === '') return null
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed) || parsed < minimum || parsed > maximum) {
+    requestError('OPERATIONS_REQUEST_INVALID', `${label} must be from ${minimum} to ${maximum}`)
+  }
+  return parsed
+}
+
+function booleanValue(value: unknown, fallback: boolean): boolean {
+  return typeof value === 'boolean' ? value : fallback
+}
+
+function locationProductRulesValue(value: unknown): Array<{
+  productGlobalId: string
+  ruleType: 'allowed' | 'preferred' | 'restricted'
+  maxQuantity: number | null
+}> {
+  if (value === undefined) return []
+  if (!Array.isArray(value) || value.length > 250) {
+    requestError('OPERATIONS_REQUEST_INVALID', 'Location product rules are invalid')
+  }
+  const seen = new Set<string>()
+  return value.map((entry, index) => {
+    const rule = record(entry, 'OPERATIONS_REQUEST_INVALID', `Location product rule ${index + 1}`)
+    assertFields(
+      rule,
+      new Set(['productGlobalId', 'ruleType', 'maxQuantity']),
+      'OPERATIONS_REQUEST_INVALID',
+      `Location product rule ${index + 1}`,
+    )
+    const productGlobalId = globalIdValue(rule.productGlobalId, 'Location product', PRODUCT_GLOBAL_ID)
+    if (seen.has(productGlobalId)) {
+      requestError('OPERATIONS_REQUEST_INVALID', 'A product may only have one rule per location')
+    }
+    seen.add(productGlobalId)
+    const ruleType = textValue(rule.ruleType, 'Product rule type', 20)
+    if (!['allowed', 'preferred', 'restricted'].includes(ruleType)) {
+      requestError('OPERATIONS_REQUEST_INVALID', 'Product rule type is invalid')
+    }
+    return {
+      productGlobalId,
+      ruleType: ruleType as 'allowed' | 'preferred' | 'restricted',
+      maxQuantity: optionalNumberValue(rule.maxQuantity, 'Product quantity limit', 0.000001, 1_000_000_000),
+    }
+  })
+}
+
 function globalIdValue(value: unknown, label: string, pattern: RegExp): string {
   const globalId = textValue(value, label, 16)
+  if (!pattern.test(globalId)) requestError('OPERATIONS_REQUEST_INVALID', `${label} is invalid`)
+  return globalId
+}
+
+function optionalGlobalIdValue(value: unknown, label: string, pattern: RegExp): string | null {
+  const globalId = textValue(value, label, 16, false)
+  if (!globalId) return null
   if (!pattern.test(globalId)) requestError('OPERATIONS_REQUEST_INVALID', `${label} is invalid`)
   return globalId
 }
@@ -284,6 +355,125 @@ export async function POST(req: NextRequest) {
     const capabilities = operationsCapabilities(actor)
     const body = await requestBody(req)
     const action = textValue(body.action, 'Operations action', 50)
+    if (action === 'create-warehouse') {
+      if (!capabilities.canManage) {
+        return json({ ok: false, error: 'You do not have permission to configure warehouses', code: 'OPERATIONS_MANAGE_REQUIRED' }, 403)
+      }
+      assertFields(body, new Set([
+        'action', 'code', 'name', 'facilityType', 'timezone', 'address', 'cutoffTime', 'createStarterLocations',
+      ]), 'OPERATIONS_REQUEST_INVALID', 'Operations command')
+      const result = await createOperationsWarehouseInPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        code: textValue(body.code, 'Warehouse code', 32),
+        name: textValue(body.name, 'Warehouse name', 160),
+        facilityType: (textValue(body.facilityType, 'Facility type', 40, false) || 'distribution_center') as OperationsWorkspace['warehouses'][number]['facilityType'],
+        timezone: textValue(body.timezone, 'Warehouse timezone', 80),
+        address: addressValue(body.address),
+        cutoffTime: textValue(body.cutoffTime, 'Warehouse cutoff', 8, false) || null,
+        createStarterLocations: body.createStarterLocations !== false,
+      })
+      return json({ ok: true, capabilities, result }, 201)
+    }
+    if (action === 'update-warehouse') {
+      if (!capabilities.canManage) {
+        return json({ ok: false, error: 'You do not have permission to configure warehouses', code: 'OPERATIONS_MANAGE_REQUIRED' }, 403)
+      }
+      assertFields(body, new Set([
+        'action', 'warehouseGlobalId', 'expectedRowVersion', 'name', 'facilityType',
+        'timezone', 'address', 'cutoffTime', 'status',
+      ]), 'OPERATIONS_REQUEST_INVALID', 'Operations command')
+      const result = await updateOperationsWarehouseInPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        warehouseGlobalId: globalIdValue(body.warehouseGlobalId, 'Warehouse', WAREHOUSE_GLOBAL_ID),
+        expectedRowVersion: integerValue(body.expectedRowVersion, 'Warehouse version', 0, 2_147_483_647),
+        name: textValue(body.name, 'Warehouse name', 160),
+        facilityType: textValue(body.facilityType, 'Facility type', 40) as OperationsWorkspace['warehouses'][number]['facilityType'],
+        timezone: textValue(body.timezone, 'Warehouse timezone', 80),
+        address: addressValue(body.address),
+        cutoffTime: textValue(body.cutoffTime, 'Warehouse cutoff', 8, false) || null,
+        status: textValue(body.status, 'Warehouse status', 20) as 'active' | 'inactive',
+      })
+      return json({ ok: true, capabilities, result })
+    }
+    if (action === 'create-location') {
+      if (!capabilities.canManage) {
+        return json({ ok: false, error: 'You do not have permission to configure warehouse locations', code: 'OPERATIONS_MANAGE_REQUIRED' }, 403)
+      }
+      assertFields(body, new Set([
+        'action', 'warehouseGlobalId', 'code', 'zone', 'locationType', 'topologyLevel',
+        'parentLocationGlobalId', 'pickSequence', 'active', 'maxVolumeCubicMeters',
+        'maxWeightKg', 'allowMixedProducts', 'notes', 'productRules',
+      ]), 'OPERATIONS_REQUEST_INVALID', 'Operations command')
+      const result = await createOperationsLocationInPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        warehouseGlobalId: globalIdValue(body.warehouseGlobalId, 'Warehouse', WAREHOUSE_GLOBAL_ID),
+        code: textValue(body.code, 'Location code', 40),
+        zone: textValue(body.zone, 'Location zone', 80),
+        locationType: textValue(body.locationType, 'Location type', 20) as OperationsWorkspace['warehouses'][number]['locations'][number]['locationType'],
+        topologyLevel: textValue(body.topologyLevel, 'Topology level', 20) as OperationsWorkspace['warehouses'][number]['locations'][number]['topologyLevel'],
+        parentLocationGlobalId: optionalGlobalIdValue(body.parentLocationGlobalId, 'Parent location', LOCATION_GLOBAL_ID),
+        pickSequence: integerValue(body.pickSequence, 'Pick sequence', 0, 1_000_000),
+        active: booleanValue(body.active, true),
+        maxVolumeCubicMeters: optionalNumberValue(body.maxVolumeCubicMeters, 'Maximum cubic storage', 0.000001, 1_000_000_000),
+        maxWeightKg: optionalNumberValue(body.maxWeightKg, 'Maximum weight', 0.000001, 1_000_000_000),
+        allowMixedProducts: booleanValue(body.allowMixedProducts, true),
+        notes: textValue(body.notes, 'Location notes', 2_000, false) || null,
+        productRules: locationProductRulesValue(body.productRules),
+      })
+      return json({ ok: true, capabilities, result }, 201)
+    }
+    if (action === 'update-location') {
+      if (!capabilities.canManage) {
+        return json({ ok: false, error: 'You do not have permission to configure warehouse locations', code: 'OPERATIONS_MANAGE_REQUIRED' }, 403)
+      }
+      assertFields(body, new Set([
+        'action', 'warehouseGlobalId', 'locationGlobalId', 'expectedRowVersion',
+        'code', 'zone', 'locationType', 'topologyLevel', 'parentLocationGlobalId',
+        'pickSequence', 'active', 'maxVolumeCubicMeters', 'maxWeightKg',
+        'allowMixedProducts', 'notes', 'productRules',
+      ]), 'OPERATIONS_REQUEST_INVALID', 'Operations command')
+      const result = await updateOperationsLocationInPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        warehouseGlobalId: globalIdValue(body.warehouseGlobalId, 'Warehouse', WAREHOUSE_GLOBAL_ID),
+        locationGlobalId: globalIdValue(body.locationGlobalId, 'Location', LOCATION_GLOBAL_ID),
+        expectedRowVersion: integerValue(body.expectedRowVersion, 'Location version', 0, 2_147_483_647),
+        code: textValue(body.code, 'Location code', 40),
+        zone: textValue(body.zone, 'Location zone', 80),
+        locationType: textValue(body.locationType, 'Location type', 20) as OperationsWorkspace['warehouses'][number]['locations'][number]['locationType'],
+        topologyLevel: textValue(body.topologyLevel, 'Topology level', 20) as OperationsWorkspace['warehouses'][number]['locations'][number]['topologyLevel'],
+        parentLocationGlobalId: optionalGlobalIdValue(body.parentLocationGlobalId, 'Parent location', LOCATION_GLOBAL_ID),
+        pickSequence: integerValue(body.pickSequence, 'Pick sequence', 0, 1_000_000),
+        active: booleanValue(body.active, true),
+        maxVolumeCubicMeters: optionalNumberValue(body.maxVolumeCubicMeters, 'Maximum cubic storage', 0.000001, 1_000_000_000),
+        maxWeightKg: optionalNumberValue(body.maxWeightKg, 'Maximum weight', 0.000001, 1_000_000_000),
+        allowMixedProducts: booleanValue(body.allowMixedProducts, true),
+        notes: textValue(body.notes, 'Location notes', 2_000, false) || null,
+        productRules: locationProductRulesValue(body.productRules),
+      })
+      return json({ ok: true, capabilities, result })
+    }
+    if (action === 'delete-location') {
+      if (!capabilities.canManage) {
+        return json({ ok: false, error: 'You do not have permission to remove warehouse locations', code: 'OPERATIONS_MANAGE_REQUIRED' }, 403)
+      }
+      assertFields(
+        body,
+        new Set(['action', 'locationGlobalId', 'expectedRowVersion']),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
+      const result = await deleteOperationsLocationInPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        locationGlobalId: globalIdValue(body.locationGlobalId, 'Location', LOCATION_GLOBAL_ID),
+        expectedRowVersion: integerValue(body.expectedRowVersion, 'Location version', 0, 2_147_483_647),
+      })
+      return json({ ok: true, capabilities, result })
+    }
     if (action === 'run-proof-order') {
       requireOperationsProofFixture()
       if (!capabilities.canManage || !capabilities.canExecute) {
@@ -369,6 +559,108 @@ export async function POST(req: NextRequest) {
         orderGlobalId: globalIdValue(body.orderGlobalId, 'Operations order', ORDER_GLOBAL_ID),
         expectedRowVersion: integerValue(body.expectedRowVersion, 'Order version', 0, 2_147_483_647),
         reason: textValue(body.reason, 'Package verification reason', 500),
+        idempotencyKey: idempotencyKeyValue(req),
+      })
+      return json({ ok: true, capabilities, result })
+    }
+    if (action === 'confirm-shipment') {
+      if (!capabilities.canManage || !capabilities.canExecute) {
+        return json({
+          ok: false,
+          error: 'You do not have permission to confirm warehouse shipments',
+          code: 'OPERATIONS_EXECUTE_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set([
+          'action',
+          'orderGlobalId',
+          'expectedRowVersion',
+          'reason',
+          'preferredPrinterGlobalId',
+        ]),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
+      const result = await confirmOperationsOrderShipmentFromPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        orderGlobalId: globalIdValue(body.orderGlobalId, 'Operations order', ORDER_GLOBAL_ID),
+        expectedRowVersion: integerValue(body.expectedRowVersion, 'Order version', 0, 2_147_483_647),
+        reason: textValue(body.reason, 'Shipment confirmation reason', 500),
+        preferredPrinterGlobalId: optionalGlobalIdValue(
+          body.preferredPrinterGlobalId,
+          'Preferred printer',
+          PRINTER_GLOBAL_ID,
+        ),
+        idempotencyKey: idempotencyKeyValue(req),
+      })
+      return json({ ok: true, capabilities, result })
+    }
+    if (action === 'create-sandbox-label') {
+      if (!capabilities.canManage || !capabilities.canExecute) {
+        return json({
+          ok: false,
+          error: 'You do not have permission to purchase carrier labels',
+          code: 'OPERATIONS_EXECUTE_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set([
+          'action',
+          'orderGlobalId',
+          'expectedRowVersion',
+          'reason',
+          'carrierRateGlobalId',
+          'carrierAccountGlobalId',
+          'preferredPrinterGlobalId',
+        ]),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
+      const result = await createOperationsSandboxLabelInPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        orderGlobalId: globalIdValue(body.orderGlobalId, 'Operations order', ORDER_GLOBAL_ID),
+        expectedRowVersion: integerValue(body.expectedRowVersion, 'Order version', 0, 2_147_483_647),
+        reason: textValue(body.reason, 'Label creation reason', 500),
+        carrierRateGlobalId: optionalGlobalIdValue(body.carrierRateGlobalId, 'Carrier rate', RATE_GLOBAL_ID),
+        carrierAccountGlobalId: optionalGlobalIdValue(
+          body.carrierAccountGlobalId,
+          'Carrier account',
+          CARRIER_ACCOUNT_GLOBAL_ID,
+        ),
+        preferredPrinterGlobalId: optionalGlobalIdValue(
+          body.preferredPrinterGlobalId,
+          'Preferred printer',
+          PRINTER_GLOBAL_ID,
+        ),
+        idempotencyKey: idempotencyKeyValue(req),
+      })
+      return json({ ok: true, capabilities, result })
+    }
+    if (action === 'void-sandbox-label') {
+      if (!capabilities.canManage || !capabilities.canExecute) {
+        return json({
+          ok: false,
+          error: 'You do not have permission to void carrier labels',
+          code: 'OPERATIONS_EXECUTE_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set(['action', 'orderGlobalId', 'expectedRowVersion', 'reason']),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
+      const result = await voidOperationsSandboxLabelInPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        orderGlobalId: globalIdValue(body.orderGlobalId, 'Operations order', ORDER_GLOBAL_ID),
+        expectedRowVersion: integerValue(body.expectedRowVersion, 'Order version', 0, 2_147_483_647),
+        reason: textValue(body.reason, 'Label void reason', 500),
         idempotencyKey: idempotencyKeyValue(req),
       })
       return json({ ok: true, capabilities, result })

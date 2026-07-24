@@ -30,6 +30,7 @@ export const POS_SOURCE_KINDS = [
   'payout',
   'fee',
   'over_short',
+  'payment_exception',
   'revenue_center',
   'day_part',
   'dining_option',
@@ -198,7 +199,12 @@ type MappingRow = {
 }
 
 type SourceOrderRow = {
+  order_guid?: string | null
+  display_number?: string | null
   business_date: TimestampValue
+  fulfillment_business_date?: TimestampValue | null
+  payment_business_dates?: TimestampValue[] | null
+  created_at_source?: TimestampValue | null
   source?: string | null
   dining_option?: string | null
   gross_sales: string | number
@@ -221,6 +227,7 @@ type LocationRow = {
   restaurant_guid: string
   restaurant_name: string
   location_name: string | null
+  timezone: string | null
   analytics_access: boolean
   standard_access: boolean
 }
@@ -239,6 +246,7 @@ type DraftRow = {
   source_revision: number
   supersedes_draft_id: string | null
   is_current: boolean
+  last_error: string | null
   created_at: TimestampValue
   updated_at: TimestampValue
 }
@@ -272,6 +280,7 @@ const TARGETS_BY_SOURCE: Record<PosSourceKind, readonly PosTargetType[]> = {
   payout: ['account'],
   fee: ['account'],
   over_short: ['account'],
+  payment_exception: ['account'],
   revenue_center: ['class', 'department', 'location', 'customer', 'vendor'],
   day_part: ['class', 'department', 'location', 'customer', 'vendor'],
   dining_option: ['class', 'department', 'location', 'customer', 'vendor'],
@@ -303,6 +312,7 @@ function draftFromRow(row: DraftRow | undefined) {
     sourceRevision: row.source_revision,
     supersedesDraftId: row.supersedes_draft_id,
     current: row.is_current,
+    lastError: row.last_error,
     createdAt: iso(row.created_at),
     updatedAt: iso(row.updated_at),
   } : null
@@ -336,6 +346,41 @@ function iso(value: TimestampValue | null | undefined) {
 
 function dateOnly(value: TimestampValue | null | undefined) {
   return value instanceof Date ? value.toISOString().slice(0, 10) : String(value || '').slice(0, 10)
+}
+
+function normalizedBusinessDate(value: unknown) {
+  const candidate = String(value || '').trim()
+  const normalized = /^\d{8}$/.test(candidate)
+    ? `${candidate.slice(0, 4)}-${candidate.slice(4, 6)}-${candidate.slice(6, 8)}`
+    : candidate
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(normalized)) return null
+  const parsed = new Date(`${normalized}T00:00:00.000Z`)
+  return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === normalized
+    ? normalized
+    : null
+}
+
+function dateList(value: TimestampValue[] | null | undefined) {
+  return Array.isArray(value) ? value.map(dateOnly).filter(Boolean) : []
+}
+
+function instantBusinessDate(value: unknown, timezone: string) {
+  const parsed = new Date(String(value || ''))
+  if (Number.isNaN(parsed.getTime())) return null
+  try {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: timezone || 'UTC',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).formatToParts(parsed)
+    const values = Object.fromEntries(parts.map((part) => [part.type, part.value]))
+    return values.year && values.month && values.day
+      ? `${values.year}-${values.month}-${values.day}`
+      : null
+  } catch {
+    return parsed.toISOString().slice(0, 10)
+  }
 }
 
 function enumValue<T extends string>(value: unknown, allowed: readonly T[], code: string, label: string): T {
@@ -712,6 +757,21 @@ function applyOpenCheckPolicy(orders: SourceOrderRow[], policy: PosOpenCheckPoli
   return { orders: filtered, openChecks, excludedOpenChecks }
 }
 
+export type PosAccountingBlocker = {
+  code: string
+  title: string
+  detail: string
+  action: string
+  sourceKind?: PosSourceKind
+  sourceId?: string
+  affectedChecks?: number
+}
+
+function uniqueBlockers(blockers: PosAccountingBlocker[]) {
+  return [...new Map(blockers.map((blocker) => [blocker.code, blocker])).values()]
+    .sort((left, right) => left.code.localeCompare(right.code))
+}
+
 export function evaluatePosAccountingReadiness(input: {
   available: boolean
   balanced: boolean
@@ -719,9 +779,38 @@ export function evaluatePosAccountingReadiness(input: {
   mappingsComplete: boolean
   unallocatedSubtotal: number
   holdReasons: string[]
+  blockers?: PosAccountingBlocker[]
 }) {
   const allocationComplete = Math.abs(input.unallocatedSubtotal) < 0.01
-  const hold = input.holdReasons.length > 0
+  const blockers = uniqueBlockers([
+    ...(input.blockers || []),
+    ...(!input.balanced && !(input.blockers || []).some((entry) => entry.code === 'out_of_balance') ? [{
+      code: 'out_of_balance',
+      title: 'Balance the accounting journal',
+      detail: 'The accounting journal debits and credits do not match.',
+      action: 'Review journal',
+    }] : []),
+    ...(!input.sourceReconciled && !(input.blockers || []).some((entry) => entry.code === 'source_variance') ? [{
+      code: 'source_variance',
+      title: 'Resolve the Toast source variance',
+      detail: 'The Toast order total does not reconcile to the proposed accounting documents.',
+      action: 'Reload sales',
+    }] : []),
+    ...(!input.mappingsComplete && !(input.blockers || []).some((entry) =>
+      entry.code === 'payment_exception_mapping_required' || entry.code.startsWith('missing_mapping:')) ? [{
+      code: 'mapping_hold',
+      title: 'Complete accounting mappings',
+      detail: 'One or more Toast sources do not have a valid QuickBooks destination.',
+      action: 'Map accounts',
+    }] : []),
+    ...(!allocationComplete && !(input.blockers || []).some((entry) => entry.code === 'sales_unallocated') ? [{
+      code: 'sales_unallocated',
+      title: 'Allocate all sales',
+      detail: `${Math.abs(money(input.unallocatedSubtotal)).toFixed(2)} of sales is not allocated to mapped items.`,
+      action: 'Map products',
+    }] : []),
+  ])
+  const hold = blockers.length > 0 || input.holdReasons.length > 0
   return {
     readyForReview: input.available
       && input.balanced
@@ -731,7 +820,33 @@ export function evaluatePosAccountingReadiness(input: {
       && !hold,
     allocationComplete,
     hold,
+    blockers,
   }
+}
+
+export function evaluateStoredPosAccountingReadiness(value: unknown) {
+  const readiness = record(value)
+  const blockers = list(readiness.blockers).map((entry): PosAccountingBlocker => {
+    const blocker = record(entry)
+    return {
+      code: String(blocker.code || 'mapping_hold'),
+      title: String(blocker.title || 'Accounting date is on hold'),
+      detail: String(blocker.detail || 'Resolve the accounting hold before posting.'),
+      action: String(blocker.action || 'Review accounting'),
+      ...(blocker.sourceKind ? { sourceKind: blocker.sourceKind as PosSourceKind } : {}),
+      ...(blocker.sourceId ? { sourceId: String(blocker.sourceId) } : {}),
+      ...(Number(blocker.affectedChecks) > 0 ? { affectedChecks: Number(blocker.affectedChecks) } : {}),
+    }
+  })
+  return evaluatePosAccountingReadiness({
+    available: readiness.available !== false,
+    balanced: readiness.balanced === true,
+    sourceReconciled: readiness.sourceReconciled === true,
+    mappingsComplete: readiness.mappingsComplete === true,
+    unallocatedSubtotal: Number(readiness.unallocatedSubtotal || 0),
+    holdReasons: list(readiness.holdReasons).map(String),
+    blockers,
+  })
 }
 
 export function discoverSafePosSourceCatalog(orders: SourceOrderRow[]): PosAccountingCatalogEntry[] {
@@ -775,6 +890,19 @@ export function discoverSafePosSourceCatalog(orders: SourceOrderRow[]): PosAccou
 
   for (const order of orders) {
     const businessDate = dateOnly(order.business_date)
+    const fulfillmentDate = dateOnly(order.fulfillment_business_date || order.business_date)
+    const offDatePayments = dateList(order.payment_business_dates)
+      .filter((paymentDate) => paymentDate !== fulfillmentDate)
+    if (offDatePayments.length > 0) {
+      add(
+        'payment_exception',
+        'summary:payment_exceptions',
+        'Payment Exceptions',
+        money(order.tendered) + money(order.tips),
+        offDatePayments.length,
+        businessDate,
+      )
+    }
     let sawDiscount = false
     let sawTax = false
     let sawServiceCharge = false
@@ -938,6 +1066,7 @@ function target(mapping: PosAccountingMapping | undefined) {
 export function buildPosAccountingPreview(input: {
   businessDate: string
   restaurantName: string
+  locationTimezone?: string | null
   standardOnly: boolean
   profile: PosAccountingProfile
   mappings: PosAccountingMapping[]
@@ -949,17 +1078,20 @@ export function buildPosAccountingPreview(input: {
     approvedAt: string | null
     postedAt: string | null
     quickBooksTransactionId: string | null
+    lastError?: string | null
     updatedAt: string | null
   } | null
 }) {
   const batch = applyOpenCheckPolicy(input.orders, input.profile.openCheckPolicy)
   const orders = batch.orders
+  const fulfillmentOrders = orders.filter((order) =>
+    dateOnly(order.fulfillment_business_date || order.business_date) === input.businessDate)
   const mappingBySource = new Map(
     input.mappings
       .filter((entry) => entry.active && entry.validationStatus === 'valid')
       .map((entry) => [mappingKey(entry.sourceKind, entry.sourceId, entry.targetType), entry]),
   )
-  const totals = orders.reduce((sum, order) => ({
+  const totals = fulfillmentOrders.reduce((sum, order) => ({
     grossSales: money(sum.grossSales + money(order.gross_sales)),
     subtotal: money(sum.subtotal + money(order.net_sales)),
     discounts: money(sum.discounts + money(order.discounts)),
@@ -991,7 +1123,7 @@ export function buildPosAccountingPreview(input: {
     quantity: number
     amount: number
   }>()
-  for (const order of orders) {
+  for (const order of fulfillmentOrders) {
     for (const checkValue of list(record(order.details).checks)) {
       for (const selectionValue of list(record(checkValue).selections)) {
         const selection = record(selectionValue)
@@ -1062,19 +1194,40 @@ export function buildPosAccountingPreview(input: {
         name: input.profile.quickBooksClearingAccountName || 'Clearing account',
       }
     : null
-  const paymentFacts: Array<{
+  type PaymentFact = {
+    checkKey: string
     type: string
     cardBrand: string | null
     amount: number
     tip: number
     processingFee: number | null
-  }> = []
+    paymentDate: string
+    fulfillmentDate: string
+  }
+  const paymentFacts: PaymentFact[] = []
+  const paymentDateUnknownCheckKeys = new Set<string>()
+  const timezone = input.locationTimezone || 'UTC'
   for (const order of orders) {
-    for (const checkValue of list(record(order.details).checks)) {
+    const fulfillmentDate = dateOnly(order.fulfillment_business_date || order.business_date)
+    const projectedPaymentDates = dateList(order.payment_business_dates)
+    const legacyTiming = order.payment_business_dates === undefined
+      || (projectedPaymentDates.length === 0 && !order.created_at_source)
+    for (const [checkIndex, checkValue] of list(record(order.details).checks).entries()) {
       const check = record(checkValue)
       for (const paymentValue of list(check.payments)) {
         const payment = record(paymentValue)
+        const explicitPaymentDate = normalizedBusinessDate(payment.paidBusinessDate)
+          || instantBusinessDate(payment.paidAt ?? check.paidAt, timezone)
+        const paymentDate = explicitPaymentDate
+          || (projectedPaymentDates.length === 1 ? projectedPaymentDates[0] : null)
+          || (legacyTiming ? fulfillmentDate : null)
+        const checkKey = String(check.providerGuid || check.displayNumber || `${order.order_guid || order.display_number || 'order'}:${checkIndex}`)
+        if (!paymentDate) {
+          paymentDateUnknownCheckKeys.add(checkKey)
+          continue
+        }
         paymentFacts.push({
+          checkKey,
           type: safeSourceName(payment.type, 'OTHER'),
           cardBrand: safeSourceName(payment.cardBrand, '') || null,
           amount: money(payment.amount),
@@ -1082,29 +1235,43 @@ export function buildPosAccountingPreview(input: {
           processingFee: payment.processingFee === null || payment.processingFee === undefined
             ? null
             : Math.abs(money(payment.processingFee)),
+          paymentDate,
+          fulfillmentDate,
         })
       }
     }
   }
-  const cardPayments = paymentFacts.filter((payment) => /credit|debit|card/i.test(payment.type) || Boolean(payment.cardBrand))
+  const sameDayPayments = paymentFacts.filter((payment) =>
+    payment.paymentDate === input.businessDate && payment.fulfillmentDate === input.businessDate)
+  const capturePayments = paymentFacts.filter((payment) =>
+    payment.paymentDate === input.businessDate && payment.fulfillmentDate !== input.businessDate)
+  const releasePayments = paymentFacts.filter((payment) =>
+    payment.fulfillmentDate === input.businessDate && payment.paymentDate !== input.businessDate)
+  const settlementPayments = [...sameDayPayments, ...capturePayments]
+  const legacyPaymentFallback = settlementPayments.length === 0
+    && paymentFacts.length === 0
+    && fulfillmentOrders.some((order) => order.payment_business_dates === undefined)
+  const cardPayments = settlementPayments.filter((payment) =>
+    /credit|debit|card/i.test(payment.type) || Boolean(payment.cardBrand))
   const cashPayments = paymentFacts.filter((payment) => /cash/i.test(payment.type))
-  const otherPayments = paymentFacts.filter((payment) => !cardPayments.includes(payment) && !cashPayments.includes(payment))
-  const feeEvidenceComplete = cardPayments.length > 0 && cardPayments.every((payment) => payment.processingFee !== null)
+    .filter((payment) => settlementPayments.includes(payment))
+  const otherPayments = settlementPayments.filter((payment) => !cardPayments.includes(payment) && !cashPayments.includes(payment))
+  const feeEvidenceComplete = cardPayments.length === 0 || cardPayments.every((payment) => payment.processingFee !== null)
   const processingFees = money(cardPayments.reduce((sum, payment) => sum + money(payment.processingFee), 0))
-  const cardAmount = paymentFacts.length > 0
+  const cardAmount = settlementPayments.length > 0
     ? money(cardPayments.reduce((sum, payment) => sum + payment.amount, 0))
-    : money(orders.reduce((sum, order) => sum + money(order.card_tender), 0))
-  const cashAmount = paymentFacts.length > 0
+    : legacyPaymentFallback ? money(fulfillmentOrders.reduce((sum, order) => sum + money(order.card_tender), 0)) : 0
+  const cashAmount = settlementPayments.length > 0
     ? money(cashPayments.reduce((sum, payment) => sum + payment.amount, 0))
-    : money(orders.reduce((sum, order) => sum + money(order.cash_tender), 0))
-  const otherAmount = paymentFacts.length > 0
+    : legacyPaymentFallback ? money(fulfillmentOrders.reduce((sum, order) => sum + money(order.cash_tender), 0)) : 0
+  const otherAmount = settlementPayments.length > 0
     ? money(otherPayments.reduce((sum, payment) => sum + payment.amount, 0))
-    : money(orders.reduce((sum, order) => sum + money(order.other_tender), 0))
+    : legacyPaymentFallback ? money(fulfillmentOrders.reduce((sum, order) => sum + money(order.other_tender), 0)) : 0
   const cardTips = money(cardPayments.reduce((sum, payment) => sum + payment.tip, 0))
   const cashTips = money(cashPayments.reduce((sum, payment) => sum + payment.tip, 0))
-  const otherTips = paymentFacts.length > 0
+  const otherTips = settlementPayments.length > 0
     ? money(otherPayments.reduce((sum, payment) => sum + payment.tip, 0))
-    : money(totals.tips - cardTips - cashTips)
+    : legacyPaymentFallback ? money(totals.tips - cardTips - cashTips) : 0
   const calculatedNetCardSettlement = money(cardAmount + cardTips - processingFees)
   const cardBrands = [...new Set(cardPayments.map((payment) => payment.cardBrand).filter(Boolean))] as string[]
   const cardSettlementSourceId = cardBrands.length === 1
@@ -1114,6 +1281,19 @@ export function buildPosAccountingPreview(input: {
   const feeMapping = mappingBySource.get(mappingKey('fee', 'summary:processing_fees', 'account'))
   const cashMapping = mappingBySource.get(mappingKey('cash_drawer', 'summary:cash', 'account'))
   const tipsMapping = mappingBySource.get(mappingKey('service_charge', 'summary:tips', 'account'))
+  const paymentExceptionSourceId = 'summary:payment_exceptions'
+  const paymentExceptionMapping = mappingBySource.get(mappingKey('payment_exception', paymentExceptionSourceId, 'account'))
+  const paymentExceptionTarget = target(paymentExceptionMapping)
+  const capturedExceptionAmount = money(capturePayments.reduce((sum, payment) => sum + payment.amount + payment.tip, 0))
+  const releasedExceptionAmount = money(releasePayments.reduce((sum, payment) => sum + payment.amount + payment.tip, 0))
+  const sameDayTender = legacyPaymentFallback
+    ? totals.tender
+    : money(sameDayPayments.reduce((sum, payment) => sum + payment.amount, 0))
+  const sameDayTips = legacyPaymentFallback
+    ? totals.tips
+    : money(sameDayPayments.reduce((sum, payment) => sum + payment.tip, 0))
+  const releasedTender = money(releasePayments.reduce((sum, payment) => sum + payment.amount, 0))
+  const releasedTips = money(releasePayments.reduce((sum, payment) => sum + payment.tip, 0))
   const debitLines = [
     ...(cardAmount !== 0 || cardTips !== 0 ? [{
       side: 'debit' as const,
@@ -1155,26 +1335,46 @@ export function buildPosAccountingPreview(input: {
       target: target(mappingBySource.get(mappingKey('tender', 'summary:other', 'account'))) || clearingTarget,
       verifiedBankDeposit: false,
     }] : []),
+    ...(releasedExceptionAmount !== 0 ? [{
+      side: 'debit' as const,
+      code: 'payment_exception_release',
+      label: 'Payment Exceptions',
+      amount: releasedExceptionAmount,
+      sourceKind: 'payment_exception' as const,
+      sourceId: paymentExceptionSourceId,
+      target: paymentExceptionTarget,
+      verifiedBankDeposit: false,
+    }] : []),
   ]
   const creditLines = [
-    ...(totals.tender !== 0 ? [{
+    ...(money(sameDayTender + releasedTender) !== 0 ? [{
       side: 'credit' as const,
       code: 'pos_clearing',
       label: 'POS clearing',
-      amount: totals.tender,
+      amount: money(sameDayTender + releasedTender),
       sourceKind: 'tender' as const,
       sourceId: 'summary:clearing',
       target: clearingTarget,
       verifiedBankDeposit: false,
     }] : []),
-    ...(totals.tips !== 0 ? [{
+    ...(money(sameDayTips + releasedTips) !== 0 ? [{
       side: 'credit' as const,
       code: 'tips_payable',
       label: 'Credit tips',
-      amount: totals.tips,
+      amount: money(sameDayTips + releasedTips),
       sourceKind: 'service_charge' as const,
       sourceId: 'summary:tips',
       target: target(tipsMapping),
+      verifiedBankDeposit: false,
+    }] : []),
+    ...(capturedExceptionAmount !== 0 ? [{
+      side: 'credit' as const,
+      code: 'payment_exception_capture',
+      label: 'Payment Exceptions',
+      amount: capturedExceptionAmount,
+      sourceKind: 'payment_exception' as const,
+      sourceId: paymentExceptionSourceId,
+      target: paymentExceptionTarget,
       verifiedBankDeposit: false,
     }] : []),
   ]
@@ -1194,41 +1394,128 @@ export function buildPosAccountingPreview(input: {
   const salesReceiptTotal = money(totals.subtotal + totals.tax)
   const sourceVariance = money(totals.total - salesReceiptTotal - totals.tips)
   const itemizedTotal = money(lineItems.reduce((sum, line) => sum + line.amount, 0))
-  const unavailableInputs = [{
+  const hasSettlementActivity = settlementPayments.length > 0 || legacyPaymentFallback
+  const payoutEvidenceUnavailable = hasSettlementActivity && (cardAmount !== 0 || cardTips !== 0)
+  const unavailableInputs = [...(payoutEvidenceUnavailable ? [{
       key: 'payout_deposit',
       status: 'unavailable' as const,
       reason: input.standardOnly
         ? 'Toast Standard Orders does not verify the bank payout deposit.'
         : 'No Analytics payout evidence is available for this preview.',
-    }, ...(!feeEvidenceComplete ? [{
+    }] : []), ...(!feeEvidenceComplete ? [{
       key: 'processing_fees',
       status: 'unavailable' as const,
       reason: 'One or more Standard payments did not include originalProcessingFee.',
     }] : [])]
-  const holdReasons = [
-    'Verified payout evidence is unavailable; calculated settlement cannot be treated as a bank deposit.',
-    ...(!feeEvidenceComplete ? ['Processing fee evidence is incomplete.'] : []),
-    ...(input.profile.quickBooksBindingStatus !== 'verified' ? ['No verified QuickBooks company is bound to this profile revision.'] : []),
-    ...(input.profile.openCheckPolicy === 'hold' && batch.openChecks > 0 ? [`${batch.openChecks} open checks require this batch to remain on hold.`] : []),
-  ]
   const protectedEvidence = Boolean(input.draftEvidence && ['approved', 'posting', 'posted', 'failed'].includes(input.draftEvidence.status))
-  const finalHoldReasons = [
-    ...holdReasons,
-    ...(protectedEvidence ? ['Approved or posted evidence is immutable and cannot be replaced by a preview.'] : []),
-  ]
   const unallocatedSubtotal = money(totals.subtotal - itemizedTotal)
+  const paymentDateUnknownChecks = paymentDateUnknownCheckKeys.size
+  const affectedExceptionChecks = new Set(
+    [...capturePayments, ...releasePayments].map((payment) => payment.checkKey),
+  ).size
+  const captureChecks = new Set(capturePayments.map((payment) => payment.checkKey)).size
+  const releaseChecks = new Set(releasePayments.map((payment) => payment.checkKey)).size
+  const missingMappings = [...missing.values()]
+  const blockers: PosAccountingBlocker[] = [
+    ...missingMappings.map((entry): PosAccountingBlocker => entry.sourceKind === 'payment_exception'
+      ? {
+          code: 'payment_exception_mapping_required',
+          title: 'Map Payment Exceptions',
+          detail: `${affectedExceptionChecks} prepaid or late-paid checks require a QuickBooks Payment Exceptions account.`,
+          action: 'Map account',
+          sourceKind: 'payment_exception',
+          sourceId: paymentExceptionSourceId,
+          affectedChecks: affectedExceptionChecks,
+        }
+      : {
+          code: `missing_mapping:${entry.sourceKind}:${entry.sourceId}:${entry.targetType}`,
+          title: `Map ${entry.sourceName}`,
+          detail: `${entry.sourceKind.replaceAll('_', ' ')} needs a QuickBooks ${entry.targetType.replaceAll('_', ' ')} mapping.`,
+          action: entry.targetType === 'item' ? 'Map product' : 'Map account',
+          sourceKind: entry.sourceKind,
+          sourceId: entry.sourceId,
+        }),
+    ...(input.profile.quickBooksBindingStatus !== 'verified' ? [{
+      code: 'quickbooks_company_unbound',
+      title: 'Verify the QuickBooks company',
+      detail: 'The accounting profile is not bound to the active organization QuickBooks company.',
+      action: 'Verify company',
+    }] : []),
+    ...(Math.abs(balance) >= 0.01 ? [{
+      code: 'out_of_balance',
+      title: 'Review the out-of-balance journal',
+      detail: `The Payments Journal differs by ${Math.abs(balance).toFixed(2)}.`,
+      action: 'Review journal',
+    }] : []),
+    ...(Math.abs(sourceVariance) >= 0.01 ? [{
+      code: 'source_variance',
+      title: 'Resolve the Toast source variance',
+      detail: `Toast sales and proposed accounting documents differ by ${Math.abs(sourceVariance).toFixed(2)}.`,
+      action: 'Reload sales',
+    }] : []),
+    ...(Math.abs(unallocatedSubtotal) >= 0.01 ? [{
+      code: 'sales_unallocated',
+      title: 'Allocate all sales',
+      detail: `${Math.abs(unallocatedSubtotal).toFixed(2)} of sales is not allocated to mapped items.`,
+      action: 'Map products',
+    }] : []),
+    ...(input.profile.openCheckPolicy === 'hold' && batch.openChecks > 0 ? [{
+      code: 'open_check',
+      title: 'Close or exclude open checks',
+      detail: `${batch.openChecks} open checks keep this business date on hold.`,
+      action: 'View checks',
+      affectedChecks: batch.openChecks,
+    }] : []),
+    ...(input.profile.batchHoldPolicy === 'hold_until_settled' && payoutEvidenceUnavailable ? [{
+      code: 'batch_hold_payout',
+      title: 'Await verified settlement',
+      detail: 'Verified payout evidence is unavailable; calculated settlement cannot be treated as a bank deposit.',
+      action: 'Reload settlement',
+    }] : []),
+    ...(input.profile.batchHoldPolicy !== 'do_not_hold' && !feeEvidenceComplete ? [{
+      code: 'batch_hold_fee_detail',
+      title: 'Await processing-fee detail',
+      detail: 'One or more card payments do not include original processing-fee evidence.',
+      action: 'Reload settlement',
+    }] : []),
+    ...(paymentDateUnknownChecks > 0 ? [{
+      code: 'payment_date_unavailable',
+      title: 'Resolve payment timing',
+      detail: `${paymentDateUnknownChecks} paid checks do not include enough timing evidence to choose the payment journal date.`,
+      action: 'Reload sales',
+      affectedChecks: paymentDateUnknownChecks,
+    }] : []),
+    ...(protectedEvidence && input.draftEvidence?.status !== 'failed' ? [{
+      code: 'update_hold',
+      title: 'Review protected posting evidence',
+      detail: 'Approved or posted evidence is immutable and cannot be replaced by a regenerated preview.',
+      action: 'Review posting',
+    }] : []),
+    ...(input.draftEvidence?.status === 'failed' || input.draftEvidence?.lastError ? [{
+      code: 'provider_failure',
+      title: 'Retry the failed accounting post',
+      detail: safeSourceName(input.draftEvidence?.lastError, 'QuickBooks rejected or failed the accounting post.'),
+      action: 'Review failure',
+    }] : []),
+  ]
+  const finalHoldReasons = uniqueBlockers(blockers).map((blocker) => blocker.detail)
+  const available = fulfillmentOrders.length > 0
+    || settlementPayments.length > 0
+    || releasePayments.length > 0
+    || legacyPaymentFallback
   const readiness = evaluatePosAccountingReadiness({
-    available: orders.length > 0,
+    available,
     balanced: Math.abs(balance) < 0.01,
     sourceReconciled: Math.abs(sourceVariance) < 0.01,
     mappingsComplete: missing.size === 0,
     unallocatedSubtotal,
     holdReasons: finalHoldReasons,
+    blockers,
   })
   return {
     businessDate: input.businessDate,
     restaurantName: input.restaurantName,
-    available: orders.length > 0,
+    available,
     standardOnly: input.standardOnly,
     containsPii: false,
     postingSideEffect: false,
@@ -1257,7 +1544,9 @@ export function buildPosAccountingPreview(input: {
       unallocatedSubtotal,
     },
     journal: {
-      kind: 'payment_settlement',
+      kind: capturePayments.length > 0 || releasePayments.length > 0
+        ? 'payment_exception'
+        : 'payment_settlement',
       lines: [...debitLines, ...creditLines],
       debits,
       credits,
@@ -1270,13 +1559,32 @@ export function buildPosAccountingPreview(input: {
       feeEvidenceComplete,
       unavailableInputs,
     },
+    paymentExceptions: {
+      affectedChecks: affectedExceptionChecks,
+      captureChecks,
+      releaseChecks,
+      captureAmount: capturedExceptionAmount,
+      releaseAmount: releasedExceptionAmount,
+    },
     readiness: {
       readyForReview: readiness.readyForReview,
+      available,
+      balanced: Math.abs(balance) < 0.01,
+      sourceReconciled: Math.abs(sourceVariance) < 0.01,
       mappingsComplete: missing.size === 0,
       allocationComplete: readiness.allocationComplete,
-      missingMappings: [...missing.values()],
+      unallocatedSubtotal,
+      missingMappings,
       hold: readiness.hold,
       holdReasons: finalHoldReasons,
+      blockers: readiness.blockers,
+      paymentExceptions: {
+        affectedChecks: affectedExceptionChecks,
+        captureChecks,
+        releaseChecks,
+        captureAmount: capturedExceptionAmount,
+        releaseAmount: releasedExceptionAmount,
+      },
       openChecks: batch.openChecks,
       excludedOpenChecks: batch.excludedOpenChecks,
       postingEnabled: false,
@@ -1286,7 +1594,7 @@ export function buildPosAccountingPreview(input: {
 
 async function resolveLocation(organizationId: string, restaurantGuid: string | null) {
   const result = await query<LocationRow>(
-    `SELECT restaurant_guid::text, restaurant_name, location_name, analytics_access, standard_access
+    `SELECT restaurant_guid::text, restaurant_name, location_name, timezone, analytics_access, standard_access
      FROM toast_locations
      WHERE organization_id = $1::uuid
        AND active = true AND archived = false
@@ -1333,7 +1641,8 @@ const MAPPING_SELECT = `id::text, restaurant_guid::text, source_kind, source_id,
   validation_status, validation_reason, source_catalog_revision, target_catalog_revision,
   last_validated_at, created_by, created_at`
 
-const SOURCE_ORDER_SELECT = `business_date, gross_sales::text, net_sales::text, discounts::text,
+const SOURCE_ORDER_SELECT = `order_guid, display_number, business_date, fulfillment_business_date,
+  payment_business_dates, created_at_source, gross_sales::text, net_sales::text, discounts::text,
   tax::text, service_charges::text, tips::text, refunds::text, tendered::text, total::text,
   cash_tender::text, card_tender::text, other_tender::text, source, dining_option, details, updated_at`
 
@@ -1427,7 +1736,11 @@ export async function readPosAccountingWorkspaceFromPostgres(input: {
       `SELECT ${SOURCE_ORDER_SELECT}
        FROM toast_pos_orders
        WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid
-         AND business_date = $3::date AND deleted = false
+         AND (
+           fulfillment_business_date = $3::date
+           OR $3::date = ANY(payment_business_dates)
+         )
+         AND deleted = false
        ORDER BY order_guid
        LIMIT 5000`,
       [...params, input.businessDate],
@@ -1526,7 +1839,7 @@ export async function readPosAccountingWorkspaceFromPostgres(input: {
     query<DraftRow>(
       `SELECT id::text, status, reconciliation_status, approved_by, approved_at, posted_at,
          quickbooks_transaction_id, draft_revision, generation_reason, generated_by,
-         source_revision, supersedes_draft_id::text, is_current, created_at, updated_at
+         source_revision, supersedes_draft_id::text, is_current, last_error, created_at, updated_at
        FROM toast_accounting_export_drafts
        WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid
          AND business_date = $3::date
@@ -1713,6 +2026,7 @@ export async function readPosAccountingWorkspaceFromPostgres(input: {
     preview: buildPosAccountingPreview({
       businessDate: input.businessDate,
       restaurantName: location.location_name || location.restaurant_name,
+      locationTimezone: location.timezone,
       standardOnly: location.standard_access && !location.analytics_access,
       profile,
       mappings,
@@ -1748,6 +2062,7 @@ type DailySalesRow = {
 }
 
 const PROTECTED_DRAFT_STATUSES = new Set(['approved', 'posting', 'posted', 'failed'])
+const POSTED_OR_IN_FLIGHT_DRAFT_STATUSES = new Set(['approved', 'posting', 'posted'])
 
 function hasDailySalesActivity(sales: DailySalesRow | undefined) {
   if (!sales) return false
@@ -1780,8 +2095,31 @@ function sourceSummaryForDraft(input: {
   sales: DailySalesRow | undefined
   workspace: Awaited<ReturnType<typeof readPosAccountingWorkspaceFromPostgres>>
   generationReason: PosAccountingGenerationReason
+  reconciliationStatus: string
+  protectedPostingHistory: boolean
 }) {
   const sales = input.sales
+  const previewReadiness = input.workspace.preview.readiness
+  const sourceReady = ['ready', 'orders_only'].includes(input.reconciliationStatus)
+  const accountingBlockers: PosAccountingBlocker[] = [
+    ...previewReadiness.blockers.filter((blocker) =>
+      blocker.code !== 'update_hold' && blocker.code !== 'provider_failure'),
+    ...(input.protectedPostingHistory ? [{
+      code: 'update_hold',
+      title: 'Review the previously posted date',
+      detail: 'This date already has protected approval or posting evidence. Review the change before creating a QuickBooks update.',
+      action: 'Review posting',
+    }] : []),
+  ]
+  const canonicalReadiness = evaluatePosAccountingReadiness({
+    available: previewReadiness.available,
+    balanced: previewReadiness.balanced,
+    sourceReconciled: previewReadiness.sourceReconciled && sourceReady,
+    mappingsComplete: previewReadiness.mappingsComplete,
+    unallocatedSubtotal: previewReadiness.unallocatedSubtotal,
+    holdReasons: accountingBlockers.map((blocker) => blocker.detail),
+    blockers: accountingBlockers,
+  })
   return {
     grossSales: Number(sales?.gross_sales || 0),
     netSales: Number(sales?.net_sales || 0),
@@ -1819,7 +2157,31 @@ function sourceSummaryForDraft(input: {
         targetType: mapping.targetType,
         mappingRevision: mapping.mappingRevision,
       })),
-      readiness: input.workspace.preview.readiness,
+      readiness: {
+        ...previewReadiness,
+        ...canonicalReadiness,
+        holdReasons: accountingBlockers.map((blocker) => blocker.detail),
+        sourceReconciled: previewReadiness.sourceReconciled && sourceReady,
+        reconciliationStatus: input.reconciliationStatus,
+      },
+      accounting: {
+        salesReceipt: {
+          subtotal: input.workspace.preview.salesReceipt.subtotal,
+          discounts: input.workspace.preview.salesReceipt.discounts,
+          tax: input.workspace.preview.salesReceipt.tax,
+          tender: input.workspace.preview.salesReceipt.tender,
+          tips: input.workspace.preview.salesReceipt.tips,
+          total: input.workspace.preview.salesReceipt.total,
+        },
+        journal: {
+          kind: input.workspace.preview.journal.kind,
+          debits: input.workspace.preview.journal.debits,
+          credits: input.workspace.preview.journal.credits,
+          balance: input.workspace.preview.journal.balance,
+        },
+      },
+      paymentExceptions: input.workspace.preview.paymentExceptions,
+      updateRequired: input.protectedPostingHistory,
     },
   }
 }
@@ -1831,12 +2193,18 @@ function proposedLinesForPreview(preview: Awaited<ReturnType<typeof readPosAccou
   ]
 }
 
-function reconciliationStatusForDraft(
+export function reconciliationStatusForDraft(
   sales: DailySalesRow | undefined,
   completedKinds: Set<string>,
+  preview: Awaited<ReturnType<typeof readPosAccountingWorkspaceFromPostgres>>['preview'],
 ) {
   const analyticsReady = completedKinds.has('analytics_sales')
+  // Modified-order polling can discover a future fulfillment date while the
+  // claimed outbox job is keyed to the payment date. Persisted Standard rows
+  // are evidence for that affected date even when it has no separate outbox row.
   const standardReady = completedKinds.has('standard_orders')
+    || Number(sales?.standard_orders_count || 0) > 0
+  if (!analyticsReady && !standardReady && preview.available) return 'orders_only'
   if (!analyticsReady && !standardReady) return 'pending'
   if (!analyticsReady) return 'orders_only'
   if (!standardReady) return 'analytics_only'
@@ -1892,7 +2260,7 @@ export async function regeneratePosAccountingDraftInPostgres(input: {
       client.query<DraftRow>(
         `SELECT id::text, status, reconciliation_status, approved_by, approved_at, posted_at,
            quickbooks_transaction_id, draft_revision, generation_reason, generated_by,
-           source_revision, supersedes_draft_id::text, is_current, created_at, updated_at
+           source_revision, supersedes_draft_id::text, is_current, last_error, created_at, updated_at
          FROM toast_accounting_export_drafts
          WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid
            AND business_date = $3::date
@@ -1904,12 +2272,14 @@ export async function regeneratePosAccountingDraftInPostgres(input: {
     const sales = salesResult.rows[0]
     const current = draftResult.rows.find((row) => row.is_current)
     const protectedHistory = draftResult.rows.some((row) => PROTECTED_DRAFT_STATUSES.has(row.status))
+    const postedOrInFlightHistory = draftResult.rows.some((row) =>
+      POSTED_OR_IN_FLIGHT_DRAFT_STATUSES.has(row.status))
     const hasActivity = hasDailySalesActivity(sales) || workspace.preview.available
     const shouldRetainCorrection = protectedHistory && !hasActivity
     const completedKinds = new Set(
       jobResult.rows.filter((row) => row.status === 'succeeded').map((row) => row.sync_kind),
     )
-    const reconciliationStatus = reconciliationStatusForDraft(sales, completedKinds)
+    const reconciliationStatus = reconciliationStatusForDraft(sales, completedKinds, workspace.preview)
     const commandType = input.generationReason === 'automatic_sync' ? null : input.generationReason
 
     if (!hasActivity && !shouldRetainCorrection) {
@@ -1959,9 +2329,17 @@ export async function regeneratePosAccountingDraftInPostgres(input: {
       return { draft: null, command, createdRevision: false, noSales: true }
     }
 
-    const sourceSummary = sourceSummaryForDraft({ sales, workspace, generationReason: input.generationReason })
+    const sourceSummary = sourceSummaryForDraft({
+      sales,
+      workspace,
+      generationReason: input.generationReason,
+      reconciliationStatus,
+      protectedPostingHistory: postedOrInFlightHistory,
+    })
     const proposedLines = proposedLinesForPreview(workspace.preview)
-    const status = workspace.preview.readiness.missingMappings.length > 0 ? 'needs_mapping' : 'needs_review'
+    const status = record(record(sourceSummary.canonical).readiness).readyForReview === true
+      ? 'needs_review'
+      : 'needs_mapping'
     const forceNewRevision = input.forceNewRevision === true || Boolean(current && PROTECTED_DRAFT_STATUSES.has(current.status))
     let storedDraft: DraftRow
     let createdRevision = false
@@ -1976,7 +2354,7 @@ export async function regeneratePosAccountingDraftInPostgres(input: {
            AND status NOT IN ('approved', 'posting', 'posted', 'failed')
          RETURNING id::text, status, reconciliation_status, approved_by, approved_at, posted_at,
            quickbooks_transaction_id, draft_revision, generation_reason, generated_by,
-           source_revision, supersedes_draft_id::text, is_current, created_at, updated_at`,
+           source_revision, supersedes_draft_id::text, is_current, last_error, created_at, updated_at`,
         [
           current.id,
           status,
@@ -2015,7 +2393,7 @@ export async function regeneratePosAccountingDraftInPostgres(input: {
          )
          RETURNING id::text, status, reconciliation_status, approved_by, approved_at, posted_at,
            quickbooks_transaction_id, draft_revision, generation_reason, generated_by,
-           source_revision, supersedes_draft_id::text, is_current, created_at, updated_at`,
+           source_revision, supersedes_draft_id::text, is_current, last_error, created_at, updated_at`,
         [
           input.organizationId,
           location.restaurant_guid,

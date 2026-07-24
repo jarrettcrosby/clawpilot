@@ -38,6 +38,8 @@ export type ToastProjectedPayment = {
   type: string
   cardBrand: string | null
   status: string | null
+  paidAt: string | null
+  paidBusinessDate: string | null
   amount: number
   tip: number
   refundAmount: number
@@ -83,6 +85,10 @@ export type ToastProjectedOrder = {
   diningOption: string | null
   approvalStatus: string | null
   paymentStatus: string | null
+  createdAt: string | null
+  modifiedAt: string | null
+  promisedAt: string | null
+  estimatedFulfillmentAt: string | null
   openedAt: string | null
   closedAt: string | null
   paidAt: string | null
@@ -109,6 +115,7 @@ export type ToastProjectedOrder = {
 
 export type ToastProjectedTotals = Omit<ToastProjectedOrder,
   'orderGuid' | 'displayNumber' | 'source' | 'diningOption' | 'approvalStatus' | 'paymentStatus'
+  | 'createdAt' | 'modifiedAt' | 'promisedAt' | 'estimatedFulfillmentAt'
   | 'openedAt' | 'closedAt' | 'paidAt' | 'voided' | 'deleted' | 'details' | 'payloadHash'
 > & { orderCount: number; voids: number }
 
@@ -161,6 +168,19 @@ function instant(value: unknown) {
   if (!candidate) return null
   const parsed = new Date(candidate)
   return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString()
+}
+
+function businessDate(value: unknown) {
+  const candidate = text(value, 20)
+  if (!candidate) return null
+  const normalized = /^\d{8}$/.test(candidate)
+    ? `${candidate.slice(0, 4)}-${candidate.slice(4, 6)}-${candidate.slice(6, 8)}`
+    : candidate
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(normalized)) return null
+  const parsed = new Date(`${normalized}T00:00:00.000Z`)
+  return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === normalized
+    ? normalized
+    : null
 }
 
 function serviceChargeAmount(value: unknown) {
@@ -255,6 +275,8 @@ function payment(value: unknown): ToastProjectedPayment {
     type: nestedText(paymentMethod.name ?? item.type, 'name', 'value') || 'OTHER',
     cardBrand: nestedText(item.cardType, 'name', 'value'),
     status,
+    paidAt: instant(item.paidDate ?? item.paymentDate ?? item.paidAt),
+    paidBusinessDate: businessDate(item.paidBusinessDate),
     amount: money(item.amount),
     tip: money(item.tipAmount),
     refundAmount,
@@ -362,6 +384,10 @@ export function projectToastOrder(value: unknown, fallbackId: string): ToastProj
     diningOption: nestedText(item.diningOption, 'behavior', 'name', 'value'),
     approvalStatus: nestedText(item.approvalStatus, 'name', 'value'),
     paymentStatus: paymentStatuses.join(', ') || null,
+    createdAt: instant(item.createdDate ?? item.createdAt),
+    modifiedAt: instant(item.modifiedDate ?? item.modifiedAt),
+    promisedAt: instant(item.promisedDate ?? item.promisedAt),
+    estimatedFulfillmentAt: instant(item.estimatedFulfillmentDate ?? item.estimatedFulfillmentAt),
     openedAt: instant(item.openedDate ?? item.openedAt),
     closedAt: instant(item.closedDate ?? item.closedAt),
     paidAt: instant(item.paidDate ?? item.paidAt),

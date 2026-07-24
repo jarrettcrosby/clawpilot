@@ -41,11 +41,13 @@ flowchart LR
 ```
 
 1. A manager selects verified restaurant locations and queues a business date or enables daily synchronization.
-2. A token-bound Postgres outbox lease retrieves Analytics sales, Analytics payouts, and Standard orders only when the relevant credential and location access exist. A stale lease is recoverable after 15 minutes, but a superseded worker cannot write or complete the replacement claim. A manual refresh of an active job records one durable follow-up run; a completed job can be explicitly rerun, while the automatic modified-order poll is throttled to one run per 15 minutes.
+2. A token-bound Postgres outbox lease retrieves Analytics sales, Analytics payouts, and Standard orders only when the relevant credential and location access exist. A stale lease is recoverable after 15 minutes, but a superseded worker cannot write or complete the replacement claim. A manual refresh of an active job records one durable follow-up run; a completed job can be explicitly rerun, while the automatic modified-order poll is throttled to one run per 15 minutes. The automatic poll covers both the previous and current restaurant-local business dates so a paid future order is visible shortly after it is entered instead of waiting for the next closeout.
 3. Analytics reports are asynchronous. The job retains its Toast request GUID and defers without consuming retry attempts until the report is ready.
 4. Provider records are stored as immutable, content-hashed snapshots. Retries cannot create duplicate source evidence.
-5. Standard orders are normalized into tenant-scoped order, check, item, tender, tax, tip, discount, service-charge, refund, and total fields. Guest identity, customer contact data, card numbers, and provider payment identifiers are not exposed through the POS projection.
-6. Normalized order rows and daily sales are atomically replaced per organization, restaurant, and business date. The daily update job reads Toast's modified-order feed, then retrieves and replaces every affected business day so refunds or edits to older orders do not leave stale projections. Immutable source snapshots remain backend evidence for recalculation.
+5. Standard orders are normalized into tenant-scoped order, check, item, tender, tax, tip, discount, service-charge, refund, and total fields. The projection also preserves source-created, source-modified, promised, estimated-fulfillment, and payment timestamps so accounting can distinguish when money was received from when the sale is fulfilled. Guest identity, customer contact data, card numbers, and provider payment identifiers are not exposed through the POS projection.
+6. Normalized order rows and daily sales are atomically replaced per organization, restaurant, and business date. The daily update job reads Toast's modified-order feed using a restaurant-timezone and daylight-saving-aware window, then retrieves and replaces every affected business day so future orders, refunds, or edits to older orders do not leave stale projections. Every payment and fulfillment business date affected by the order is re-evaluated for accounting. Immutable source snapshots remain backend evidence for recalculation.
+
+The Payment Exceptions rollout stages one restaurant-local 31-day modified-order replay for each active Standard location. Migration-created jobs remain unavailable until the updated Railway app and worker pass health; startup then activates them in batches of four per minute. This expand-first sequence prevents the previous worker from consuming lifecycle backfill work during a Vercel/Railway rolling deployment.
 7. Automatic scheduling never revives failed or dead work. An operator must review the specific error before retrying a terminal job.
 8. Each completed sales projection refreshes the current canonical accounting draft from stored normalized orders, effective mappings, the active posting profile, allocation, reconciliation, holds, open checks, and the current QuickBooks company binding. A correlated accounting reload waits for every required sales source before generating one final revision. Neither path has a posting action.
 
@@ -54,9 +56,9 @@ flowchart LR
 POS is a first-class authenticated module in the desktop navigation and mobile More menu. It uses the active browser-session workspace and the existing accounting-view permission; switching businesses cannot reuse the prior organization's locations, orders, totals, or drafts.
 
 - **Overview** shows business-date sales, order and guest counts, average check, discounts, refunds, and a daily trend for the selected location and date range.
-- **Orders** provides server-paginated order search and an order drawer with checks, line items, modifiers, tax, tenders, and tips. All timestamps use the signed-in user's timezone.
+- **Orders** provides server-paginated order search and an order drawer with checks, line items, modifiers, tax, tenders, and tips. Paid orders with a later fulfillment date appear on their payment date with a **Preorder** marker and retain their future fulfillment date. All timestamps use the signed-in user's timezone.
 - **Reports** provides business-day sales, check status, product and category performance, tender and card summaries, cash evidence, prior-period comparisons, and a transparent sales run rate. Wide tables collapse into stacked operational rows on phones.
-- **Accounting** shows location/date reconciliation drafts, versioned posting profiles, QuickBooks reference catalogs, item/account mappings, immutable previews, any missing mapping or source variance, and separate date-scoped sales reload and accounting regeneration controls. It does not expose a posting shortcut.
+- **Accounting** provides one location/date posting queue with `Hold`, `Ready`, `Posting`, `Posted`, and `Failed` states, an issues-only filter, structured blocker reasons, and a direct action for the affected mapping, checks, configuration, or posting review. Selecting a row loads that exact date and location. The same workspace retains versioned posting profiles, QuickBooks reference catalogs, item/account mappings, immutable previews, and separate date-scoped sales reload and accounting regeneration controls.
 - Owners receive access by role. Administrators can grant `viewAccounting` to selected members. Managing Toast credentials and selected locations remains limited to organization owners and access administrators.
 - The protected demo workspace contains rolling synthetic POS data and no provider credential, provider identifier, customer identity, or live restaurant data.
 
@@ -105,12 +107,36 @@ Accounting is configured by organization with an optional restaurant override. A
 
 The attached legacy mapping workbook is an import source, not the runtime database. Its accepted baseline is Itemized Sales Receipt, per-line tax, a clearing account, a separate payments journal, 29 mapped sales-item targets, and six unresolved item mappings. Import must preserve aliases and mark unresolved rows for review rather than guessing QuickBooks destinations.
 
-The preview produces two immutable documents for a business date:
+The preview normally produces two immutable documents for a business date:
 
 1. An itemized Sales Receipt with mapped net product sales and tax. Item-level discounts and refunds are already reflected in normalized net item amounts and are not subtracted a second time. Tips remain outside the receipt.
 2. A balanced Payments Journal that clears tenders, tips, deposits, fees, cash, and over/short only when their required sources are available.
 
+A payment-date-only Payment Exceptions event produces only the balanced Payments Journal described below; it never manufactures an empty Sales Receipt.
+
 An unresolved item, missing destination, unavailable payout, source variance, or unbalanced journal places the preview on hold. Profile and mapping saves create configuration revisions; the operator explicitly regenerates accounting when the revised rules should be applied to a business date. Approved, posting, and posted evidence is never overwritten.
+
+### Future Orders And Payment Exceptions
+
+Toast can receive a payment on one date and fulfill the related order on another. ClawPilot treats those as two linked accounting events instead of dropping the early payment or recognizing the sale twice.
+
+1. On the payment date, the Payments Journal debits the actual tender or settlement destination and credits the mapped **Payment Exceptions** clearing account. A payment-date-only draft does not create a zero-dollar Sales Receipt.
+2. On the fulfillment date, the Sales Receipt recognizes the mapped sale and the Payments Journal debits **Payment Exceptions** while crediting POS clearing and tips payable.
+3. Split payments retain every payment business date. Missing payment timing is a blocking issue rather than an assumed date.
+4. **Payment Exceptions** maps to one QuickBooks account-backed catalog source (`summary:payment_exceptions`). It should normally be an Other Current Asset clearing account, not a bank account.
+
+Payment timing uses Toast's authoritative `paidBusinessDate` first, so overnight payments follow the restaurant's configured closeout boundary. Older payloads without that field fall back to the restaurant-local calendar date of `paidDate`. Fulfillment follows `promisedDate`, matching Toast's scheduled-order model and Shogo's documented Payment Exceptions clearing workflow.
+
+### Posting Status And Issue Coverage
+
+ClawPilot uses Shogo's operator workflow as a comparison model, not as a runtime API dependency. Shogo does not publish a customer accounting-status API contract in its public documentation, so ClawPilot derives its status from its own durable Toast, mapping, draft, QuickBooks, and worker evidence.
+
+- The queue normalizes the public Shogo concepts `NONE`, `POST`, `HOLD`, `POSTED`, `UPDATED`, `BATCHHOLD`, `FAILED`, `UPDATEFAILED`, `OPEN CHECKS`, and `OOB` into the five operator states while preserving the specific reason as the row label and blocker detail.
+- Confirmed mapping, QuickBooks binding, out-of-balance, source-variance, allocation, open-check, batch-detail, settlement, payment-timing, protected-update, provider-posting, missing-source-date, overdue-worker, and failed Toast-sync problems remain visible. The selected date range has no silent draft or issue cap. An unrecognized provider or worker error becomes a safe generic failure with its recorded message instead of disappearing.
+- Preview readiness, the stored draft, issue state and notification, and prepare/approve authorization use the same canonical blocker evaluation. The posting endpoint rechecks that stored gate at both preparation and approval.
+- The posting review remains permission- and approval-controlled. Queue actions may navigate to the exact review date, but they do not bypass preparation, fingerprint confirmation, or approval.
+
+Public comparison references: [Shogo Posting Status](https://support.shogo.io/hc/en-us/articles/49742464242580-Shogo-Posting-Status), [Shogo Accounting Status Report](https://support.shogo.io/hc/en-us/articles/17204444337044-Accounting-Status-Report), [Shogo Payment Exceptions](https://support.shogo.io/hc/en-us/articles/360042666771-Payment-Exceptions), [Toast payment fields](https://doc.toasttab.com/openapi/orders/operation/ordersChecksPaymentsPost/), and [Toast scheduled orders](https://doc.toasttab.com/doc/devguide/orders_api_future_orders.html).
 
 ### Date-Scoped Accounting Commands
 
@@ -148,7 +174,7 @@ A completed sync with no Toast sales, tenders, tax, tips, discounts, fees, or re
 ClawPilot turns confirmed accounting blockers into actionable, organization-scoped notifications instead of requiring an operator to repeatedly inspect every business date.
 
 - A completed projection and every profile or mapping save re-evaluates the canonical POS accounting preview for the selected organization, restaurant, and business date.
-- Confirmed blockers include missing mappings, an unverified QuickBooks company binding, an unbalanced payments journal, unallocated sales, and open checks when the profile policy requires a hold. Unavailable preview or payout data does not create a false alert.
+- Confirmed blockers include missing mappings, an unverified QuickBooks company binding, an unbalanced payments journal, source variance, unallocated sales, open checks when the profile policy requires a hold, missing delayed-batch evidence when its policy requires a hold, unavailable payment timing, and provider posting failures. Toast synchronization failures are surfaced in the same posting queue. Unavailable preview data does not create a false accounting issue.
 - One durable issue state is maintained per organization, restaurant, and business date. The normalized issue fingerprint prevents repeated worker checks and threaded retries from creating duplicate alerts.
 - A changed issue set or an issue that recurs after resolution creates a new occurrence. Resolving the underlying blockers closes the issue, cancels unsent mail, and records a resolution in Activity.
 - The in-app Activity event and email action open the exact organization, POS Accounting view, restaurant, and business date that needs review.
@@ -197,11 +223,11 @@ All rows are organization-scoped. A multi-business user connects, selects, and r
 
 ## Current Release Boundary
 
-This release implements both Toast credential connections, location verification, scheduled and manual read-only ingestion, immutable source snapshots, sanitized order/check/item projections, menu catalogs, a dedicated responsive POS workspace, operational reports, daily projections, versioned accounting profiles and date drafts, separate sales reload and stored-data regeneration commands, QuickBooks reference catalogs, immutable accounting previews, deduplicated accounting-issue notifications, worker health, and audit events. Organization-bound QuickBooks authorization and mapping management are available. Toast-to-QuickBooks financial posting remains intentionally locked pending complete mapping, reconciliation, independent approval, and sandbox acceptance.
+This release implements both Toast credential connections, location verification, scheduled and manual read-only ingestion, current-day modified-order polling, future-order payment/fulfillment projection, immutable source snapshots, sanitized order/check/item projections, menu catalogs, a dedicated responsive POS workspace, operational reports, daily projections, Payment Exceptions accounting, a consolidated posting queue, versioned accounting profiles and date drafts, separate sales reload and stored-data regeneration commands, QuickBooks reference catalogs, immutable accounting previews, deduplicated accounting-issue notifications, worker health, and audit events. Organization-bound QuickBooks authorization, mapping management, prepared posting batches, and independent approval are available. A canonical readiness gate prevents Toast-to-QuickBooks posting until mapping, reconciliation, hold, and authorization checks pass.
 
 ## Verification
 
-1. Run `npm run test:toast`, `npm run test:pos`, and `npm run test:pos-accounting`.
+1. Run `npm run test:toast`, `npm run test:pos`, `npm run test:pos-accounting`, `npm run test:pos-accounting-parity`, and `npm run test:pos-accounting-notifications`.
 2. Connect Analytics and Standard credentials independently and confirm no full secret returns from the API.
 3. Refresh Analytics locations, verify a Standard location GUID, and select only the intended restaurants.
 4. Queue one completed business date and confirm all jobs reach `succeeded` or a specific retryable error.
@@ -216,3 +242,5 @@ This release implements both Toast credential connections, location verification
 13. Resolve the issue and confirm Activity records the resolution. Reintroduce the issue and confirm exactly one new occurrence is queued.
 14. Disable email alerts and confirm issue Activity continues without an outbox row. Confirm a demo or reserved recipient is rejected even if it has owner permissions.
 15. Open the full-range historical parity view and verify matched, unmatched, and ambiguous receipt/journal evidence is organization scoped, read-only, and free of raw provider payloads.
+16. Create a paid future order, confirm it appears on the payment date with its fulfillment date, and verify the payment-date journal credits Payment Exceptions while the fulfillment-date documents release Payment Exceptions without duplicating sales.
+17. Force a missing mapping, open check, out-of-balance preview, incomplete fee batch, missing source date, overdue Toast job, Toast sync failure, and QuickBooks posting failure. Confirm each appears in the posting queue, the issues-only filter retains it, and its action opens the exact corrective surface.

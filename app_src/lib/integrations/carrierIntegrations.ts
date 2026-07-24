@@ -411,6 +411,22 @@ type SandboxBillingSelection = {
   snapshot: Record<string, unknown>
 }
 
+export type CarrierSandboxShippingRuntime = {
+  organizationId: string
+  integrationAccountId: string
+  integrationGlobalId: string
+  credentialVersion: number
+  provider: 'ups_rest' | 'fedex_rest'
+  environment: 'sandbox'
+  credential: CarrierRuntimeCredential['credential']
+  carrierAccountId: string
+  carrierAccountGlobalId: string
+  carrierAccountDisplayName: string
+  accountNumberLastFour: string
+  billingRelationship: SandboxBillingSelection['relationship']
+  billingSelectionSnapshot: Record<string, unknown>
+}
+
 const SANDBOX_SENDER_ADDRESS = normalizeCarrierAccountAddress({
   line1: CARRIER_SANDBOX_RATE_FIXTURE.origin.street,
   line2: null,
@@ -511,6 +527,64 @@ async function sandboxBillingSelection(input: {
       precedence: ['sender', 'recipient', 'third_party'],
       fixtureAddressMatch: relationship === 'third_party' ? 'none' : relationship,
     },
+  }
+}
+
+export async function resolveCarrierSandboxShippingRuntime(input: {
+  organizationId: unknown
+  provider: unknown
+  carrierAccountGlobalId?: unknown
+}): Promise<CarrierSandboxShippingRuntime> {
+  try {
+    const organizationId = normalizeCarrierOrganizationId(input.organizationId)
+    const provider = normalizeDirectCarrierProvider(input.provider)
+    if (provider !== 'ups_rest' && provider !== 'fedex_rest') {
+      throw new CarrierIntegrationRequestError(
+        'Sandbox label execution is not available for this carrier yet',
+        409,
+        'CARRIER_SANDBOX_LABEL_UNSUPPORTED',
+      )
+    }
+    const runtime = await storedRuntimeCredential({
+      organizationId,
+      provider,
+      environment: 'sandbox',
+    })
+    if (runtime.status !== 'active' || !runtime.verified) {
+      throw new CarrierIntegrationRequestError(
+        'Enable a verified sandbox carrier credential before creating labels',
+        409,
+        'CARRIER_CREDENTIAL_INACTIVE',
+      )
+    }
+    const selection = await sandboxBillingSelection({
+      runtime,
+      carrierAccountGlobalId: input.carrierAccountGlobalId,
+    })
+    const accountNumber = decryptCarrierAccountNumber(
+      selection.account.encrypted,
+      runtime.organizationId,
+      runtime.provider,
+      runtime.environment,
+      selection.account.globalId,
+    )
+    return {
+      organizationId: runtime.organizationId,
+      integrationAccountId: runtime.integrationAccountId,
+      integrationGlobalId: runtime.integrationGlobalId,
+      credentialVersion: runtime.credentialVersion,
+      provider,
+      environment: 'sandbox',
+      credential: { ...runtime.credential, accountNumber },
+      carrierAccountId: selection.account.id,
+      carrierAccountGlobalId: selection.account.globalId,
+      carrierAccountDisplayName: selection.account.displayName,
+      accountNumberLastFour: selection.account.accountNumberLastFour,
+      billingRelationship: selection.relationship,
+      billingSelectionSnapshot: selection.snapshot,
+    }
+  } catch (error) {
+    throw sanitize(error)
   }
 }
 

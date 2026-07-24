@@ -171,6 +171,35 @@ export function carrierAccountNumberFingerprint(
     .digest('hex')
 }
 
+export function unresolvedCarrierBillingAccountFingerprint(
+  networkIdentityValue: unknown,
+  providerValue: unknown,
+  environmentValue: unknown,
+  accountNumberValue: unknown,
+) {
+  const networkIdentity = printable(
+    networkIdentityValue,
+    'Carrier rate network identity',
+    3,
+    128,
+  ).toLowerCase()
+  const provider = printable(providerValue, 'Carrier provider', 2, 64)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+  const environment = normalizeCarrierEnvironment(environmentValue)
+  const accountNumber = normalizeOptionalCarrierAccountNumber(accountNumberValue)
+  if (!provider) throw new Error('Carrier provider is required')
+  if (!accountNumber) throw new Error('The carrier billing account number is required')
+  return crypto
+    .createHmac('sha256', fingerprintKey())
+    .update(
+      `clawpilot:carrier-billing:unresolved:v1:${networkIdentity}:${provider}:${environment}:${accountNumber}`,
+      'utf8',
+    )
+    .digest('hex')
+}
+
 export function carrierAccountAddressFingerprint(value: unknown) {
   const address = normalizeCarrierAccountAddress(value)
   return crypto

@@ -113,6 +113,29 @@ assert.match(firstFingerprint, /^[0-9a-f]{64}$/)
 assert.equal(firstFingerprint, secondFingerprint, 'Issue ordering must not cause duplicate notification occurrences')
 assert.notEqual(firstFingerprint, notifications.posAccountingIssueFingerprint(issues.slice(1)))
 assert.equal(notifications.derivePosAccountingIssues({ ...workspace, preview: { available: false } }).length, 0)
+const canonicalIssues = notifications.derivePosAccountingIssues({
+  profile: { quickBooksBindingStatus: 'verified', openCheckPolicy: 'hold' },
+  draft: null,
+  preview: {
+    available: true,
+    readiness: {
+      blockers: [{
+        code: 'payment_exception_mapping_required',
+        title: 'Map Payment Exceptions',
+        detail: '2 prepaid checks require a QuickBooks Payment Exceptions account.',
+        action: 'Map account',
+      }],
+    },
+  },
+})
+assert.deepEqual(Array.from(canonicalIssues, (issue) => issue.code), ['payment_exception_mapping_required'])
+assert.equal(canonicalIssues[0].action, 'Map account')
+const failedDraftIssues = notifications.derivePosAccountingIssues({
+  draft: { status: 'failed', lastError: 'QuickBooks account is inactive' },
+  preview: { available: false, readiness: { blockers: [] } },
+})
+assert.equal(failedDraftIssues[0].code, 'provider_failure')
+assert.match(failedDraftIssues[0].detail, /inactive/)
 assert.equal(notifications.isDeliverablePosAccountingRecipient('owner@notifications.clawpilot.dev'), true)
 for (const reserved of [
   'demo-system@clawpilot.example',

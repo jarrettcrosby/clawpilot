@@ -239,8 +239,14 @@ export async function GET() {
           operations_carrier_accounts_gl_coding_migration_applied: boolean
           operations_printer_configuration_migration_applied: boolean
           operations_carrier_billing_integrity_migration_applied: boolean
+          operations_carrier_billing_review_migration_applied: boolean
+          operations_print_delivery_migration_applied: boolean
           crm_native_activity_projection_migration_applied: boolean
           crm_contact_identity_aliases_migration_applied: boolean
+          operations_settlement_lifecycle_migration_applied: boolean
+          operations_label_execution_migration_applied: boolean
+          operations_receiving_topology_migration_applied: boolean
+          pos_payment_exceptions_migration_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -629,6 +635,16 @@ export async function GET() {
               EXISTS (
                 SELECT 1
                 FROM schema_migrations
+                WHERE filename = '0093_operations_carrier_billing_import_and_review.sql'
+              ) AS operations_carrier_billing_review_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0094_operations_print_delivery.sql'
+              ) AS operations_print_delivery_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
                 WHERE filename = '0095_crm_native_activity_projection.sql'
               ) AS crm_native_activity_projection_migration_applied,
               EXISTS (
@@ -636,6 +652,26 @@ export async function GET() {
                 FROM schema_migrations
                 WHERE filename = '0096_crm_contact_identity_aliases.sql'
               ) AS crm_contact_identity_aliases_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0097_operations_settlement_lifecycle.sql'
+              ) AS operations_settlement_lifecycle_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0098_operations_label_execution.sql'
+              ) AS operations_label_execution_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0101_operations_receiving_and_topology.sql'
+              ) AS operations_receiving_topology_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0102_pos_payment_exceptions.sql'
+              ) AS pos_payment_exceptions_migration_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -724,8 +760,14 @@ export async function GET() {
             && row?.operations_carrier_accounts_gl_coding_migration_applied
             && row?.operations_printer_configuration_migration_applied
             && row?.operations_carrier_billing_integrity_migration_applied
+            && row?.operations_carrier_billing_review_migration_applied
+            && row?.operations_print_delivery_migration_applied
             && row?.crm_native_activity_projection_migration_applied
             && row?.crm_contact_identity_aliases_migration_applied
+            && row?.operations_settlement_lifecycle_migration_applied
+            && row?.operations_label_execution_migration_applied
+            && row?.operations_receiving_topology_migration_applied
+            && row?.pos_payment_exceptions_migration_applied
             && row?.migration_checksums_present
           ),
         }
@@ -806,8 +848,14 @@ export async function GET() {
           || !row?.operations_carrier_accounts_gl_coding_migration_applied
           || !row?.operations_printer_configuration_migration_applied
           || !row?.operations_carrier_billing_integrity_migration_applied
+          || !row?.operations_carrier_billing_review_migration_applied
+          || !row?.operations_print_delivery_migration_applied
           || !row?.crm_native_activity_projection_migration_applied
           || !row?.crm_contact_identity_aliases_migration_applied
+          || !row?.operations_settlement_lifecycle_migration_applied
+          || !row?.operations_label_execution_migration_applied
+          || !row?.operations_receiving_topology_migration_applied
+          || !row?.pos_payment_exceptions_migration_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')

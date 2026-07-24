@@ -1495,8 +1495,18 @@ for (const migration of [
   '0084_operations_command_results.sql',
   '0085_operations_package_workflow.sql',
   '0086_product_packaging_profiles.sql',
+  '0087_operations_carrier_credentials.sql',
+  '0088_operations_sandbox_rating_and_mock_retirement.sql',
+  '0089_operations_rate_delegation_and_carrier_settlement.sql',
+  '0090_operations_carrier_accounts_and_gl_coding.sql',
+  '0091_operations_printer_configuration.sql',
+  '0092_operations_carrier_billing_integrity.sql',
+  '0093_operations_carrier_billing_import_and_review.sql',
+  '0094_operations_print_delivery.sql',
   '0095_crm_native_activity_projection.sql',
   '0096_crm_contact_identity_aliases.sql',
+  '0097_operations_settlement_lifecycle.sql',
+  '0102_pos_payment_exceptions.sql',
 ]) {
   assertIncludes(healthRoute, migration, 'hosted POS and accounting migration health')
 }

@@ -21,6 +21,7 @@ import {
   completeToastSyncJobInPostgres,
   deferToastSyncJobInPostgres,
   failToastSyncJobInPostgres,
+  finishToastSyncPostProcessingInPostgres,
   listToastAutomaticSyncTargetsInPostgres,
   queueAutomaticToastSyncInPostgres,
   queueAutomaticToastOrderUpdateInPostgres,
@@ -31,7 +32,7 @@ import {
   type ToastSyncJob,
 } from '@/lib/persistence/toastIntegrations'
 
-function previousBusinessDate(timezoneValue: string | null) {
+export function currentBusinessDate(timezoneValue: string | null, now = new Date()) {
   const timezone = timezoneValue || 'UTC'
   try {
     const parts = new Intl.DateTimeFormat('en-US', {
@@ -39,15 +40,16 @@ function previousBusinessDate(timezoneValue: string | null) {
       year: 'numeric',
       month: '2-digit',
       day: '2-digit',
-    }).formatToParts(new Date())
+    }).formatToParts(now)
     const value = Object.fromEntries(parts.map((part) => [part.type, part.value]))
-    const today = new Date(Date.UTC(Number(value.year), Number(value.month) - 1, Number(value.day)))
-    today.setUTCDate(today.getUTCDate() - 1)
-    return today.toISOString().slice(0, 10)
+    return `${value.year}-${value.month}-${value.day}`
   } catch {
-    const yesterday = new Date(Date.now() - 86_400_000)
-    return yesterday.toISOString().slice(0, 10)
+    return now.toISOString().slice(0, 10)
   }
+}
+
+function previousBusinessDate(timezoneValue: string | null) {
+  return offsetDate(currentBusinessDate(timezoneValue), -1)
 }
 
 function offsetDate(dateValue: string, days: number) {
@@ -56,10 +58,55 @@ function offsetDate(dateValue: string, days: number) {
   return date.toISOString().slice(0, 10)
 }
 
-function modifiedWindow(dateValue: string) {
+function timeZoneOffsetMilliseconds(instant: Date, timezone: string) {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(instant)
+  const value = Object.fromEntries(parts.map((part) => [part.type, part.value]))
+  const hour = Number(value.hour) === 24 ? 0 : Number(value.hour)
+  const representedAsUtc = Date.UTC(
+    Number(value.year),
+    Number(value.month) - 1,
+    Number(value.day),
+    hour,
+    Number(value.minute),
+    Number(value.second),
+  )
+  return representedAsUtc - Math.floor(instant.getTime() / 1000) * 1000
+}
+
+function localMidnightUtc(dateValue: string, timezoneValue: string | null) {
+  const timezone = timezoneValue || 'UTC'
+  const [year, month, day] = dateValue.split('-').map(Number)
+  const localMidnightAsUtc = Date.UTC(year, month - 1, day)
+  try {
+    let candidate = localMidnightAsUtc
+    for (let iteration = 0; iteration < 3; iteration += 1) {
+      const corrected = localMidnightAsUtc - timeZoneOffsetMilliseconds(new Date(candidate), timezone)
+      if (corrected === candidate) break
+      candidate = corrected
+    }
+    return new Date(candidate).toISOString()
+  } catch {
+    return new Date(localMidnightAsUtc).toISOString()
+  }
+}
+
+export function modifiedWindow(dateValue: string, timezoneValue: string | null, now = new Date()) {
+  const naturalEnd = localMidnightUtc(offsetDate(dateValue, 1), timezoneValue)
+  const endDate = dateValue === currentBusinessDate(timezoneValue, now) && now.getTime() < new Date(naturalEnd).getTime()
+    ? now.toISOString()
+    : naturalEnd
   return {
-    startDate: `${dateValue}T00:00:00.000Z`,
-    endDate: `${offsetDate(dateValue, 1)}T00:00:00.000Z`,
+    startDate: localMidnightUtc(dateValue, timezoneValue),
+    endDate,
   }
 }
 
@@ -134,6 +181,20 @@ async function refreshAccountingState(job: ToastSyncJob, businessDates: string[]
   }
 }
 
+async function completeJob(
+  job: ToastSyncJob,
+  resultSummary: Record<string, unknown>,
+  accountingBusinessDates: string[] = [],
+) {
+  if (!await completeToastSyncJobInPostgres({ job, resultSummary })) {
+    throw new Error('Toast sync worker lease expired')
+  }
+  await refreshAccountingState(job, accountingBusinessDates)
+  if (!await finishToastSyncPostProcessingInPostgres({ job })) {
+    throw new Error('Toast sync worker post-processing lease expired')
+  }
+}
+
 async function processJob(job: ToastSyncJob) {
   const credential = await runtimeCredential(job)
   if (job.syncKind === 'analytics_sales') {
@@ -160,10 +221,7 @@ async function processJob(job: ToastSyncJob) {
       })),
     })
     const totals = await upsertToastAnalyticsSalesInPostgres({ job, records: report.records })
-    if (!await completeToastSyncJobInPostgres({ job, resultSummary: { records: report.records.length, totals } })) {
-      throw new Error('Toast sync worker lease expired')
-    }
-    await refreshAccountingState(job, [job.businessDate])
+    await completeJob(job, { records: report.records.length, totals }, [job.businessDate])
     return { deferred: false }
   }
   if (job.syncKind === 'analytics_payouts') {
@@ -189,18 +247,17 @@ async function processJob(job: ToastSyncJob) {
         sourceId: sourceId(payload, `${report.requestGuid}:${index}`), payload,
       })),
     })
-    if (!await completeToastSyncJobInPostgres({ job, resultSummary: { records: report.records.length } })) {
-      throw new Error('Toast sync worker lease expired')
-    }
+    await completeJob(job, { records: report.records.length })
     return { deferred: false }
   }
   if (job.syncKind === 'standard_order_updates') {
     const updates = await getToastStandardOrderUpdates({
       credential,
       restaurantGuid: job.restaurantGuid,
-      ...modifiedWindow(job.businessDate),
+      ...modifiedWindow(job.businessDate, job.timezone),
     })
     const affectedDates = [...new Set(updates.map(orderBusinessDate).filter((value): value is string => Boolean(value)))].sort()
+    const accountingBusinessDates = new Set(affectedDates)
     for (const [index, businessDate] of affectedDates.entries()) {
       if (index > 0) await delay(250)
       const orders = await getToastStandardOrders({ credential, restaurantGuid: job.restaurantGuid, businessDate })
@@ -212,13 +269,18 @@ async function processJob(job: ToastSyncJob) {
           sourceId: sourceId(payload, `${job.restaurantGuid}:${businessDate}:${recordIndex}`), payload,
         })),
       })
-      await projectToastStandardOrdersInPostgres({ job: datedJob, orders })
+      const totals = await projectToastStandardOrdersInPostgres({ job: datedJob, orders })
+      totals.accountingBusinessDates.forEach((date) => accountingBusinessDates.add(date))
     }
-    if (!await completeToastSyncJobInPostgres({
+    await completeJob(
       job,
-      resultSummary: { records: updates.length, affectedBusinessDates: affectedDates },
-    })) throw new Error('Toast sync worker lease expired')
-    await refreshAccountingState(job, affectedDates)
+      {
+        records: updates.length,
+        affectedBusinessDates: affectedDates,
+        accountingBusinessDates: [...accountingBusinessDates].sort(),
+      },
+      [...accountingBusinessDates],
+    )
     return { deferred: false }
   }
   const orders = await getToastStandardOrders({
@@ -234,16 +296,14 @@ async function processJob(job: ToastSyncJob) {
     })),
   })
   const totals = await projectToastStandardOrdersInPostgres({ job, orders })
-  if (!await completeToastSyncJobInPostgres({ job, resultSummary: { records: orders.length, totals } })) {
-    throw new Error('Toast sync worker lease expired')
-  }
-  await refreshAccountingState(job, [job.businessDate])
+  await completeJob(job, { records: orders.length, totals }, totals.accountingBusinessDates)
   return { deferred: false }
 }
 
 async function queueAutomaticSyncs() {
   const targets = await listToastAutomaticSyncTargetsInPostgres()
   for (const target of targets) {
+    const currentDate = currentBusinessDate(target.timezone)
     const businessDate = previousBusinessDate(target.timezone)
     await queueAutomaticToastSyncInPostgres({
       ...target,
@@ -253,6 +313,7 @@ async function queueAutomaticSyncs() {
       for (const catchUpDate of catchUpDates(target.latestStandardUpdateDate, businessDate)) {
         await queueAutomaticToastOrderUpdateInPostgres({ ...target, businessDate: catchUpDate })
       }
+      await queueAutomaticToastOrderUpdateInPostgres({ ...target, businessDate: currentDate })
     }
   }
   return targets.length

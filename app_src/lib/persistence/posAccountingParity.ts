@@ -105,7 +105,7 @@ export type NormalizedExpectedPosAccountingDocument =
 export interface NormalizedPosAccountingDraftEvidence {
   draftId: string
   businessDate: string
-  documents: [NormalizedExpectedSalesReceipt, NormalizedExpectedJournalEntry]
+  documents: NormalizedExpectedPosAccountingDocument[]
 }
 
 interface NormalizedQuickBooksBase extends PosAccountingIdentity {
@@ -854,6 +854,7 @@ export function normalizePosAccountingDraftEvidence(
 
   const sourceSummary = asRecord(row.source_summary ?? row.sourceSummary)
   const standard = asRecord(sourceSummary.standard)
+  const canonicalReceipt = recordAt(sourceSummary, ['canonical', 'accounting', 'salesReceipt'])
   const quickBooksPayload = asRecord(row.quickbooks_payload ?? row.quickBooksPayload)
   const receiptDocument = documentRecord(
     sourceSummary,
@@ -868,6 +869,13 @@ export function normalizePosAccountingDraftEvidence(
   const lines = asList(row.proposed_lines ?? row.proposedLines).map(asRecord)
   const receiptLines = normalizeExpectedReceiptLines(lines)
   const journalLines = normalizeExpectedJournalLines(lines)
+  const journalOnlyPaymentException = !receiptLines.lineEvidenceAvailable
+    && lines.some((line) => {
+      const document = text(line.document, 80)?.replace(/[^a-z]/gi, '').toLowerCase()
+      return (document === 'paymentsjournal' || document === 'journalentry')
+        && line.sourceKind === 'payment_exception'
+        && line.code === 'payment_exception_capture'
+    })
   const providerTransactionId = firstText([
     row.quickbooks_transaction_id,
     row.providerTransactionId,
@@ -942,7 +950,8 @@ export function normalizePosAccountingDraftEvidence(
     receiptDocument,
     ['taxCents', 'totalTaxCents'],
     ['tax', 'totalTax', 'TotalTax'],
-  ) ?? firstMoney(standard, ['taxCents'], ['tax'])
+  ) ?? firstMoney(canonicalReceipt, ['taxCents'], ['tax'])
+    ?? firstMoney(standard, ['taxCents'], ['tax'])
   const receiptTotal = firstMoney(
     receiptDocument,
     ['totalCents', 'totalAmountCents'],
@@ -951,7 +960,8 @@ export function normalizePosAccountingDraftEvidence(
     receiptLineTotal !== null && receiptTax !== null
       ? receiptLineTotal + receiptTax
       : null
-  ) ?? firstMoney(standard, ['tenderedCents'], ['tendered'])
+  ) ?? firstMoney(canonicalReceipt, ['totalCents'], ['total'])
+    ?? firstMoney(standard, ['tenderedCents'], ['tendered'])
     ?? firstMoney(standard, ['totalCents'], ['total'])
     ?? receiptLineTotal
 
@@ -1021,7 +1031,11 @@ export function normalizePosAccountingDraftEvidence(
     unmappedLineCount: journalLines.unmappedLineCount,
   }
 
-  return { draftId, businessDate: date, documents: [receipt, journal] }
+  return {
+    draftId,
+    businessDate: date,
+    documents: journalOnlyPaymentException ? [journal] : [receipt, journal],
+  }
 }
 
 function amountComparison(

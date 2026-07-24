@@ -99,6 +99,7 @@ for _attempt in $(seq 1 120); do
 done
 [[ "$HEALTHY" == "1" ]] || fail "application did not pass health validation within 120 seconds"
 
+npm run toast:activate-payment-date-backfill
 npm run release:record
 
 while kill -0 "$APP_PID" 2>/dev/null; do

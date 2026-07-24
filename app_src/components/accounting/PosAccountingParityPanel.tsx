@@ -27,6 +27,7 @@ import DescriptionRounded from '@mui/icons-material/DescriptionRounded'
 import ReceiptLongRounded from '@mui/icons-material/ReceiptLongRounded'
 import RefreshRounded from '@mui/icons-material/RefreshRounded'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
+import { consumePosPostingReviewTarget } from '@/lib/accountingDraftNavigation'
 import { formatUserDateTime } from '@/lib/userDateTime'
 
 type CheckStatus = 'match' | 'variance' | 'insufficient_evidence'
@@ -56,7 +57,7 @@ type PostingBatch = {
     status: string
     providerEntityId: string | null
     error: string | null
-  }
+  } | null
   journalEntry: {
     requestId: string
     status: string
@@ -342,6 +343,7 @@ type ExternalPostingDialogTarget =
     draftId: string
     businessDate: string
     evidenceDetected: boolean
+    journalOnly: boolean
   }
   | { mode: 'range' }
 
@@ -414,25 +416,32 @@ function externalPostingEvidence(rows: DraftParityRow[], draftId: string) {
   const draftRows = rows.filter((row) => row.expected.draft.id === draftId)
   const receipt = draftRows.find((row) => row.expected.entityType === 'SalesReceipt')
   const journal = draftRows.find((row) => row.expected.entityType === 'JournalEntry')
-  const eligible = draftRows.length === 2
-    && ['ready', 'orders_only'].includes(receipt?.expected.draft.reconciliationStatus || '')
-    && receipt?.match.status === 'matched'
+  const journalOnly = Boolean(journal) && !receipt
+  const eligible = (journalOnly || draftRows.length === 2)
+    && ['ready', 'orders_only'].includes(journal?.expected.draft.reconciliationStatus || '')
+    && (journalOnly || receipt?.match.status === 'matched')
     && journal?.match.status === 'matched'
-    && receipt.comparison?.status === 'match'
+    && (journalOnly || receipt?.comparison?.status === 'match')
     && journal.comparison?.status === 'match'
-    && receipt.actual?.postingOrigin !== 'clawpilot'
+    && (journalOnly || receipt?.actual?.postingOrigin !== 'clawpilot')
     && journal.actual?.postingOrigin !== 'clawpilot'
-    && Boolean(receipt.actual?.providerTransactionId)
+    && (journalOnly || Boolean(receipt?.actual?.providerTransactionId))
     && Boolean(journal.actual?.providerTransactionId)
   if (!eligible) return null
   return {
-    salesReceiptId: receipt!.actual!.providerTransactionId!,
+    salesReceiptId: receipt?.actual?.providerTransactionId || null,
     journalEntryId: journal!.actual!.providerTransactionId!,
-    suggestedProvider: receipt!.actual!.postingOrigin === 'shogo'
+    suggestedProvider: (journalOnly || receipt!.actual!.postingOrigin === 'shogo')
       && journal!.actual!.postingOrigin === 'shogo'
       ? 'Shogo'
       : '',
   }
+}
+
+function isJournalOnlyDraft(rows: DraftParityRow[], draftId: string) {
+  const draftRows = rows.filter((row) => row.expected.draft.id === draftId)
+  return draftRows.some((row) => row.expected.entityType === 'JournalEntry')
+    && !draftRows.some((row) => row.expected.entityType === 'SalesReceipt')
 }
 
 function quantityLabel(quantityMillis: number | null | undefined) {
@@ -658,6 +667,7 @@ function PostingControls({
   capabilities,
   pending,
   externalEvidence,
+  journalOnly,
   onPrepare,
   onApprove,
   onRecordExternal,
@@ -666,8 +676,9 @@ function PostingControls({
   capabilities: AccountingCapabilities
   pending: boolean
   externalEvidence: ReturnType<typeof externalPostingEvidence>
-  onPrepare: (draftId: string) => void
-  onApprove: (batch: PostingBatch) => void
+  journalOnly: boolean
+  onPrepare: (draftId: string, journalOnly: boolean) => void
+  onApprove: (batch: PostingBatch, journalOnly: boolean) => void
   onRecordExternal: (input: ReturnType<typeof externalPostingEvidence>) => void
 }) {
   const draft = expected.draft
@@ -691,8 +702,12 @@ function PostingControls({
     <Stack spacing={1}>
       <Alert severity={externalEvidence ? 'info' : 'warning'} variant="outlined">
         {externalEvidence
-          ? 'Both QuickBooks documents match this draft with no variance. If another system posted them, acknowledge that evidence to retain the audit trail and prevent a duplicate ClawPilot posting.'
-          : 'If another system posted this date, enter its exact QuickBooks Sales Receipt and Journal Entry IDs. ClawPilot will acknowledge them only after both records, the business date, and all compared amounts match.'}
+          ? journalOnly
+            ? 'The QuickBooks Journal Entry matches this payment exception with no variance. If another system posted it, acknowledge that evidence to retain the audit trail and prevent a duplicate ClawPilot posting.'
+            : 'Both QuickBooks documents match this draft with no variance. If another system posted them, acknowledge that evidence to retain the audit trail and prevent a duplicate ClawPilot posting.'
+          : journalOnly
+            ? 'If another system posted this payment exception, enter its exact QuickBooks Journal Entry ID. ClawPilot will acknowledge it only after the record, payment date, and all compared amounts match.'
+            : 'If another system posted this date, enter its exact QuickBooks Sales Receipt and Journal Entry IDs. ClawPilot will acknowledge them only after both records, the business date, and all compared amounts match.'}
       </Alert>
       <Button
         variant="outlined"
@@ -726,7 +741,7 @@ function PostingControls({
             This date was posted by {externalProvider}. ClawPilot retained the exact QuickBooks evidence and will not post it again.
           </Alert>
           <Box display="grid" gridTemplateColumns={{ xs: '1fr', sm: 'repeat(2, minmax(0, 1fr))' }} gap={1.5}>
-            <DetailField label="Sales Receipt ID" value={draft.quickBooksSalesReceiptId} />
+            {!journalOnly ? <DetailField label="Sales Receipt ID" value={draft.quickBooksSalesReceiptId} /> : null}
             <DetailField label="Journal Entry ID" value={draft.quickBooksJournalEntryId} />
             <DetailField label="Acknowledged by" value={draft.reviewedBy} />
             <DetailField label="Provider reference" value={draft.externalPostingReference} />
@@ -738,24 +753,32 @@ function PostingControls({
           <Box display="grid" gridTemplateColumns={{ xs: '1fr', sm: 'repeat(2, minmax(0, 1fr))' }} gap={1.5}>
             <DetailField label="Batch status" value={statusLabel(batch.status)} />
             <DetailField label="Requested by" value={batch.requestedBy} />
-            <DetailField label="Sales Receipt" value={`${statusLabel(batch.salesReceipt.status)}${batch.salesReceipt.providerEntityId ? ` · ${batch.salesReceipt.providerEntityId}` : ''}`} wrap />
+            {!journalOnly && batch.salesReceipt ? (
+              <DetailField label="Sales Receipt" value={`${statusLabel(batch.salesReceipt.status)}${batch.salesReceipt.providerEntityId ? ` · ${batch.salesReceipt.providerEntityId}` : ''}`} wrap />
+            ) : null}
             <DetailField label="Journal Entry" value={`${statusLabel(batch.journalEntry.status)}${batch.journalEntry.providerEntityId ? ` · ${batch.journalEntry.providerEntityId}` : ''}`} wrap />
           </Box>
           {batch.lastError ? <Alert severity="error">{batch.lastError}</Alert> : null}
           {batch.status === 'approved' || batch.status === 'posting' ? (
-            <Alert severity="info">The worker is posting the two documents. Each document has its own idempotency key.</Alert>
+            <Alert severity="info">
+              {journalOnly
+                ? 'The worker is posting the Journal Entry with its protected idempotency key.'
+                : 'The worker is posting the two documents. Each document has its own idempotency key.'}
+            </Alert>
           ) : null}
           {batch.status === 'posted' ? (
-            <Alert severity="success">Both QuickBooks documents posted successfully.</Alert>
+            <Alert severity="success">
+              {journalOnly ? 'The QuickBooks Journal Entry posted successfully.' : 'Both QuickBooks documents posted successfully.'}
+            </Alert>
           ) : null}
           {canApprove ? (
             <Button
               variant="contained"
               disabled={pending}
-              onClick={() => onApprove(batch)}
+              onClick={() => onApprove(batch, journalOnly)}
               startIcon={pending ? <CircularProgress size={16} /> : <AccountBalanceRounded />}
             >
-              {retry ? 'Retry failed document' : 'Approve & queue 2 documents'}
+              {retry ? 'Retry failed document' : journalOnly ? 'Approve & queue Journal Entry' : 'Approve & queue 2 documents'}
             </Button>
           ) : null}
         </Stack>
@@ -763,16 +786,18 @@ function PostingControls({
         <Stack spacing={1.5}>
           {externalOption}
           <Alert severity="info">
-            ClawPilot posts one recoverable batch per business date: a Sales Receipt for sales and tax, plus a Journal Entry for tender, tips, and fees. Their totals serve different purposes and are validated independently.
+            {journalOnly
+              ? 'This is a payment-date exception. ClawPilot prepares one recoverable Journal Entry for the payment adjustment; the original sales remain on their fulfillment-date posting.'
+              : 'ClawPilot posts one recoverable batch per business date: a Sales Receipt for sales and tax, plus a Journal Entry for tender, tips, and fees. Their totals serve different purposes and are validated independently.'}
           </Alert>
           {canPrepare ? (
             <Button
               variant="outlined"
               disabled={pending}
-              onClick={() => onPrepare(draft.id)}
+              onClick={() => onPrepare(draft.id, journalOnly)}
               startIcon={pending ? <CircularProgress size={16} /> : <DescriptionRounded />}
             >
-              Prepare 2-document posting
+              {journalOnly ? 'Prepare Journal Entry posting' : 'Prepare 2-document posting'}
             </Button>
           ) : null}
         </Stack>
@@ -940,8 +965,24 @@ export default function PosAccountingParityPanel() {
   const [externalReviewNote, setExternalReviewNote] = useState('')
   const [externalSalesReceiptId, setExternalSalesReceiptId] = useState('')
   const [externalJournalEntryId, setExternalJournalEntryId] = useState('')
+  const [navigationReady, setNavigationReady] = useState(false)
+  const [targetDraftId, setTargetDraftId] = useState<string | null>(null)
 
   useEffect(() => {
+    const target = consumePosPostingReviewTarget(window.location.href)
+    if (target.businessDate) {
+      setFromInput(target.businessDate)
+      setToInput(target.businessDate)
+      setFrom(target.businessDate)
+      setTo(target.businessDate)
+    }
+    if (target.draftId) setTargetDraftId(target.draftId)
+    if (target.hasTarget) window.history.replaceState({}, '', target.cleanUrl)
+    setNavigationReady(true)
+  }, [])
+
+  useEffect(() => {
+    if (!navigationReady) return
     const controller = new AbortController()
     const params = new URLSearchParams({
       view: 'pos-parity',
@@ -968,7 +1009,7 @@ export default function PosAccountingParityPanel() {
         if (!controller.signal.aborted) setLoading(false)
       })
     return () => controller.abort()
-  }, [from, historyPage, page, refreshToken, to])
+  }, [from, historyPage, navigationReady, page, refreshToken, to])
 
   useEffect(() => {
     if (!selection || selection.kind !== 'historical') return
@@ -1022,8 +1063,25 @@ export default function PosAccountingParityPanel() {
     setDetailError(null)
     setDetailLoading(false)
   }
+
+  useEffect(() => {
+    if (!targetDraftId || !report || loading) return
+    const targetRow = report.rows.find((row) => row.expected.draft.id === targetDraftId)
+    if (targetRow) {
+      setHistoricalDetail(null)
+      setDetailError(null)
+      setDetailLoading(false)
+      setSelection({ kind: 'current', row: targetRow })
+    } else if (from && to) {
+      setError(`POS posting review for ${from} was not found in the active organization.`)
+    }
+    setTargetDraftId(null)
+  }, [from, loading, report, targetDraftId, to])
   const openExternalDraftDialog = (evidence: ReturnType<typeof externalPostingEvidence>) => {
     if (!selection || selection.kind !== 'current') return
+    const journalOnly = report
+      ? isJournalOnlyDraft(report.rows, selection.row.expected.draft.id)
+      : selection.row.expected.entityType === 'JournalEntry'
     setExternalProviderName(evidence?.suggestedProvider || '')
     setExternalProviderReference('')
     setExternalReviewNote('')
@@ -1034,6 +1092,7 @@ export default function PosAccountingParityPanel() {
       draftId: selection.row.expected.draft.id,
       businessDate: selection.row.expected.businessDate,
       evidenceDetected: Boolean(evidence),
+      journalOnly,
     })
   }
   const openExternalRangeDialog = () => {
@@ -1071,6 +1130,9 @@ export default function PosAccountingParityPanel() {
   const selectedExternalEvidence = selection?.kind === 'current' && report
     ? externalPostingEvidence(report.rows, selection.row.expected.draft.id)
     : null
+  const selectedJournalOnly = selection?.kind === 'current' && report
+    ? isJournalOnlyDraft(report.rows, selection.row.expected.draft.id)
+    : false
 
   const applyRange = () => {
     if (dateRangeInvalid) return
@@ -1128,7 +1190,9 @@ export default function PosAccountingParityPanel() {
       ? await postPostingAction({
         action: 'record-external-draft',
         draftId: externalDialogTarget.draftId,
-        salesReceiptId: externalSalesReceiptId.trim(),
+        ...(!externalDialogTarget.journalOnly
+          ? { salesReceiptId: externalSalesReceiptId.trim() }
+          : {}),
         journalEntryId: externalJournalEntryId.trim(),
         ...common,
       })
@@ -1143,7 +1207,9 @@ export default function PosAccountingParityPanel() {
       setActionNotice(
         payload.result.alreadyRecorded
           ? `This ${externalProviderName.trim()} posting was already acknowledged.`
-          : `${externalProviderName.trim()} posting acknowledged. ClawPilot retained both QuickBooks IDs and will not post this date again.`,
+          : externalDialogTarget.journalOnly
+            ? `${externalProviderName.trim()} posting acknowledged. ClawPilot retained the QuickBooks Journal Entry ID and will not post this payment exception again.`
+            : `${externalProviderName.trim()} posting acknowledged. ClawPilot retained both QuickBooks IDs and will not post this date again.`,
       )
     } else {
       const failureSummary = payload.result.failedValidation
@@ -1159,20 +1225,24 @@ export default function PosAccountingParityPanel() {
     setRefreshToken((value) => value + 1)
   }
 
-  const preparePosting = async (draftId: string) => {
+  const preparePosting = async (draftId: string, journalOnly: boolean) => {
     const payload = await postPostingAction({ action: 'prepare-clawpilot', draftId })
     if (!payload?.batch) return
-    setActionNotice('Prepared one Sales Receipt and one Journal Entry for review. Nothing has been posted yet.')
+    setActionNotice(journalOnly
+      ? 'Prepared one Journal Entry for review. Nothing has been posted yet.'
+      : 'Prepared one Sales Receipt and one Journal Entry for review. Nothing has been posted yet.')
     closeDrawer()
     setLoading(true)
     setRefreshToken((value) => value + 1)
   }
 
-  const approvePosting = async (batch: PostingBatch) => {
+  const approvePosting = async (batch: PostingBatch, journalOnly: boolean) => {
     const retry = batch.status === 'failed' || batch.status === 'partial_failed'
     const confirmed = window.confirm(retry
       ? 'Retry only the failed QuickBooks document? Any successful document will not be posted again.'
-      : 'Approve and queue this Sales Receipt and Journal Entry for QuickBooks posting?')
+      : journalOnly
+        ? 'Approve and queue this Journal Entry for QuickBooks posting?'
+        : 'Approve and queue this Sales Receipt and Journal Entry for QuickBooks posting?')
     if (!confirmed) return
     const payload = await postPostingAction({
       action: 'approve-clawpilot',
@@ -1183,7 +1253,9 @@ export default function PosAccountingParityPanel() {
     if (!payload?.batch) return
     setActionNotice(retry
       ? 'The failed document was requeued; any successful document was left unchanged.'
-      : 'The two-document posting was approved and queued for QuickBooks.')
+      : journalOnly
+        ? 'The Journal Entry was approved and queued for QuickBooks.'
+        : 'The two-document posting was approved and queued for QuickBooks.')
     closeDrawer()
     setLoading(true)
     setRefreshToken((value) => value + 1)
@@ -1556,6 +1628,7 @@ export default function PosAccountingParityPanel() {
                     capabilities={capabilities}
                     pending={actionPending}
                     externalEvidence={selectedExternalEvidence}
+                    journalOnly={selectedJournalOnly}
                     onPrepare={preparePosting}
                     onApprove={approvePosting}
                     onRecordExternal={openExternalDraftDialog}
@@ -1607,17 +1680,21 @@ export default function PosAccountingParityPanel() {
                 <DetailField label="Business date" value={externalDialogTarget.businessDate} />
                 {!externalDialogTarget.evidenceDetected ? (
                   <Alert severity="warning" variant="outlined">
-                    No exact pair was auto-detected. Enter the QuickBooks record IDs from the external posting; acknowledgment will fail safely if either record does not match.
+                    {externalDialogTarget.journalOnly
+                      ? 'No exact Journal Entry was auto-detected. Enter the QuickBooks Journal Entry ID from the external posting; acknowledgment will fail safely if the record does not match.'
+                      : 'No exact pair was auto-detected. Enter the QuickBooks record IDs from the external posting; acknowledgment will fail safely if either record does not match.'}
                   </Alert>
                 ) : null}
                 <Box display="grid" gridTemplateColumns={{ xs: '1fr', sm: 'repeat(2, minmax(0, 1fr))' }} gap={1.5}>
-                  <TextField
-                    required
-                    label="Sales Receipt ID"
-                    value={externalSalesReceiptId}
-                    onChange={(event) => setExternalSalesReceiptId(event.target.value)}
-                    inputProps={{ maxLength: 200 }}
-                  />
+                  {!externalDialogTarget.journalOnly ? (
+                    <TextField
+                      required
+                      label="Sales Receipt ID"
+                      value={externalSalesReceiptId}
+                      onChange={(event) => setExternalSalesReceiptId(event.target.value)}
+                      inputProps={{ maxLength: 200 }}
+                    />
+                  ) : null}
                   <TextField
                     required
                     label="Journal Entry ID"
@@ -1629,7 +1706,7 @@ export default function PosAccountingParityPanel() {
               </Stack>
             ) : (
               <Alert severity="warning" variant="outlined">
-                ClawPilot will acknowledge only dates in the applied range that have one exact Sales Receipt match and one exact Journal Entry match with no amount variance. Every unresolved date stays in Needs Review.
+                ClawPilot will acknowledge only dates in the applied range whose required QuickBooks document or documents match with no amount variance. Every unresolved date stays in Needs Review.
               </Alert>
             )}
             <TextField
@@ -1668,7 +1745,8 @@ export default function PosAccountingParityPanel() {
             disabled={actionPending
               || !externalProviderName.trim()
               || (externalDialogTarget?.mode === 'draft'
-                && (!externalSalesReceiptId.trim() || !externalJournalEntryId.trim()))}
+                && ((!externalDialogTarget.journalOnly && !externalSalesReceiptId.trim())
+                  || !externalJournalEntryId.trim()))}
             startIcon={actionPending ? <CircularProgress size={16} /> : <CompareArrowsRounded />}
           >
             Acknowledge posting
