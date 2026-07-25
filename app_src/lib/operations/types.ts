@@ -881,6 +881,30 @@ export type OperationsInboundReceiptCommandResult = {
   replayed: boolean
 }
 
+export type OperationsReplenishmentExecutionInput = {
+  sourceLocationGlobalId: string
+  destinationLocationGlobalId: string
+  inventoryPoolGlobalId: string
+  productGlobalId: string
+  quantity: number
+}
+
+export type OperationsReplenishmentExecutionResult = {
+  replenishmentTaskGlobalId: string
+  status: 'completed'
+  warehouseGlobalId: string
+  productGlobalId: string
+  inventoryPoolGlobalId: string
+  sourceLocationGlobalId: string
+  sourceLocationCode: string
+  destinationLocationGlobalId: string
+  destinationLocationCode: string
+  movedQuantity: number
+  sourceAvailableAfter: number
+  destinationAvailableAfter: number
+  replayed: boolean
+}
+
 export type MockOperationsProofLineInput = {
   productGlobalId: string
   quantity: number

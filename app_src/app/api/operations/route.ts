@@ -23,6 +23,7 @@ import {
   createOperationsLocationInPostgres,
   createOperationsWarehouseInPostgres,
   deleteOperationsLocationInPostgres,
+  executeOperationsReplenishmentInPostgres,
   OperationsRequestError,
   readOperationsWorkspaceFromPostgres,
   releaseOperationsOrderFromPostgres,
@@ -787,6 +788,57 @@ export async function POST(req: NextRequest) {
         idempotencyKey: idempotencyKeyValue(req),
       })
       return json({ ok: true, capabilities, result })
+    }
+    if (action === 'execute-replenishment') {
+      if (!capabilities.canManage || !capabilities.canExecute) {
+        return json({
+          ok: false,
+          error: 'You do not have permission to execute warehouse replenishment',
+          code: 'OPERATIONS_EXECUTE_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set([
+          'action',
+          'sourceLocationGlobalId',
+          'destinationLocationGlobalId',
+          'inventoryPoolGlobalId',
+          'productGlobalId',
+          'quantity',
+        ]),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
+      const result = await executeOperationsReplenishmentInPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        replenishment: {
+          sourceLocationGlobalId: globalIdValue(
+            body.sourceLocationGlobalId,
+            'Source location',
+            LOCATION_GLOBAL_ID,
+          ),
+          destinationLocationGlobalId: globalIdValue(
+            body.destinationLocationGlobalId,
+            'Destination location',
+            LOCATION_GLOBAL_ID,
+          ),
+          inventoryPoolGlobalId: globalIdValue(
+            body.inventoryPoolGlobalId,
+            'Inventory pool',
+            INVENTORY_POOL_GLOBAL_ID,
+          ),
+          productGlobalId: globalIdValue(
+            body.productGlobalId,
+            'Product',
+            PRODUCT_GLOBAL_ID,
+          ),
+          quantity: positiveNumberValue(body.quantity, 'Replenishment quantity'),
+        },
+        idempotencyKey: idempotencyKeyValue(req),
+      })
+      return json({ ok: true, capabilities, result }, result.replayed ? 200 : 201)
     }
     if (action === 'run-proof-order') {
       requireOperationsProofFixture()

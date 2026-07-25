@@ -1912,6 +1912,258 @@ async function verifyInboundReceivingAcceptance(pool, persistence, fixture) {
   )
 }
 
+async function verifyReplenishmentExecutionAcceptance(pool, persistence, fixture) {
+  const warehouse = await persistence.createOperationsWarehouseInPostgres({
+    organizationId: fixture.organizationId,
+    actorEmail: fixture.email,
+    code: `REPLEN-${randomUUID().slice(0, 6)}`,
+    name: 'Replenishment acceptance warehouse',
+    timezone: 'America/New_York',
+    address: {
+      name: 'Replenishment acceptance warehouse',
+      line1: '101 Jegs Place',
+      city: 'Delaware',
+      region: 'OH',
+      postalCode: '43015',
+      country: 'US',
+    },
+    facilityType: 'distribution_center',
+    cutoffTime: '21:00',
+    createStarterLocations: false,
+  })
+  const reserve = await persistence.createOperationsLocationInPostgres({
+    organizationId: fixture.organizationId,
+    actorEmail: fixture.email,
+    warehouseGlobalId: warehouse.warehouseGlobalId,
+    code: 'RESERVE-01',
+    zone: 'RESERVE',
+    locationType: 'storage',
+    topologyLevel: 'bin',
+    pickSequence: 100,
+    storageFunction: 'reserve',
+    maxVolumeCubicMeters: 10,
+    maxWeightKg: 1000,
+    allowMixedProducts: false,
+    notes: 'Disposable replenishment reserve.',
+    productRules: [{
+      productGlobalId: fixture.product.reference_code,
+      ruleType: 'preferred',
+      maxQuantity: 100,
+    }],
+  })
+  const forwardPick = await persistence.createOperationsLocationInPostgres({
+    organizationId: fixture.organizationId,
+    actorEmail: fixture.email,
+    warehouseGlobalId: warehouse.warehouseGlobalId,
+    code: 'PICK-01',
+    zone: 'PICK',
+    locationType: 'pick',
+    topologyLevel: 'bin',
+    pickSequence: 200,
+    storageFunction: 'forward_pick',
+    maxVolumeCubicMeters: 10,
+    maxWeightKg: 1000,
+    allowMixedProducts: false,
+    notes: 'Disposable replenishment pick face.',
+    productRules: [{
+      productGlobalId: fixture.product.reference_code,
+      ruleType: 'preferred',
+      maxQuantity: 20,
+      replenishmentMode: 'min_max',
+      replenishmentSourceLocationGlobalId: reserve.locationGlobalId,
+      minQuantity: 2,
+      targetQuantity: 8,
+    }],
+  })
+  const identities = await pool.query(
+    `SELECT
+       warehouse.id::text AS warehouse_id,
+       reserve.id::text AS reserve_id,
+       forward_pick.id::text AS forward_pick_id
+     FROM operations_warehouses warehouse
+     JOIN operations_locations reserve
+       ON reserve.organization_id = warehouse.organization_id
+      AND reserve.warehouse_id = warehouse.id
+      AND reserve.global_id = $3
+     JOIN operations_locations forward_pick
+       ON forward_pick.organization_id = warehouse.organization_id
+      AND forward_pick.warehouse_id = warehouse.id
+      AND forward_pick.global_id = $4
+     WHERE warehouse.organization_id = $1::uuid AND warehouse.global_id = $2`,
+    [
+      fixture.organizationId,
+      warehouse.warehouseGlobalId,
+      reserve.locationGlobalId,
+      forwardPick.locationGlobalId,
+    ],
+  )
+  assert.equal(identities.rowCount, 1)
+
+  const inventoryPool = await pool.query(
+    `INSERT INTO operations_inventory_pools (
+       organization_id, pipeline_id, owner_customer_id, name, pool_type,
+       allocation_policy, active, created_by
+     ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4, 'customer_dedicated', 'fifo', true, $5)
+     RETURNING id::text, global_id`,
+    [
+      fixture.organizationId,
+      fixture.pipelineId,
+      fixture.customer.id,
+      `Replenishment acceptance pool ${randomUUID().slice(0, 8)}`,
+      fixture.email,
+    ],
+  )
+  const sourcePosition = await pool.query(
+    `INSERT INTO operations_inventory_positions (
+       organization_id, pipeline_id, warehouse_id, location_id, pool_id,
+       product_id, lot_code, on_hand_quantity
+     ) VALUES (
+       $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid,
+       $6::uuid, 'LOT-REPLENISHMENT-01', 20
+     )
+     RETURNING id::text, global_id`,
+    [
+      fixture.organizationId,
+      fixture.pipelineId,
+      identities.rows[0].warehouse_id,
+      identities.rows[0].reserve_id,
+      inventoryPool.rows[0].id,
+      fixture.product.id,
+    ],
+  )
+  await pool.query(
+    `INSERT INTO operations_inventory_ledger (
+       organization_id, position_id, event_type,
+       on_hand_delta, reserved_delta, damaged_delta,
+       on_hand_after, reserved_after, damaged_after,
+       source_global_id, reason, idempotency_key, actor_email
+     ) VALUES (
+       $1::uuid, $2::uuid, 'opening_balance',
+       20, 0, 0, 20, 0, 0,
+       $3, 'Disposable replenishment opening balance', $4, $5
+     )`,
+    [
+      fixture.organizationId,
+      sourcePosition.rows[0].id,
+      fixture.product.reference_code,
+      `replenishment-opening-${randomUUID()}`,
+      fixture.email,
+    ],
+  )
+
+  const idempotencyKey = `replenishment-execute-${randomUUID()}`
+  const moved = await persistence.executeOperationsReplenishmentInPostgres({
+    organizationId: fixture.organizationId,
+    actorEmail: fixture.email,
+    idempotencyKey,
+    replenishment: {
+      sourceLocationGlobalId: reserve.locationGlobalId,
+      destinationLocationGlobalId: forwardPick.locationGlobalId,
+      inventoryPoolGlobalId: inventoryPool.rows[0].global_id,
+      productGlobalId: fixture.product.reference_code,
+      quantity: 8,
+    },
+  })
+  assert.match(moved.replenishmentTaskGlobalId, /^grpl\d{7}$/)
+  assert.equal(moved.status, 'completed')
+  assert.equal(moved.movedQuantity, 8)
+  assert.equal(moved.sourceAvailableAfter, 12)
+  assert.equal(moved.destinationAvailableAfter, 8)
+  assert.equal(moved.replayed, false)
+
+  const replay = await persistence.executeOperationsReplenishmentInPostgres({
+    organizationId: fixture.organizationId,
+    actorEmail: fixture.email,
+    idempotencyKey,
+    replenishment: {
+      sourceLocationGlobalId: reserve.locationGlobalId,
+      destinationLocationGlobalId: forwardPick.locationGlobalId,
+      inventoryPoolGlobalId: inventoryPool.rows[0].global_id,
+      productGlobalId: fixture.product.reference_code,
+      quantity: 8,
+    },
+  })
+  assert.equal(replay.replenishmentTaskGlobalId, moved.replenishmentTaskGlobalId)
+  assert.equal(replay.replayed, true)
+
+  const evidence = await pool.query(
+    `SELECT
+       task.status,
+       task.quantity::text,
+       source.on_hand_quantity::text AS source_on_hand,
+       destination.on_hand_quantity::text AS destination_on_hand,
+       (SELECT count(*) FROM operations_inventory_ledger ledger
+        WHERE ledger.organization_id = task.organization_id
+          AND ledger.source_global_id = task.global_id
+          AND ledger.event_type = 'replenishment_out')::int AS outbound_entries,
+       (SELECT count(*) FROM operations_inventory_ledger ledger
+        WHERE ledger.organization_id = task.organization_id
+          AND ledger.source_global_id = task.global_id
+          AND ledger.event_type = 'replenishment_in')::int AS inbound_entries,
+       (SELECT COALESCE(sum(ledger.on_hand_delta), 0)::text
+        FROM operations_inventory_ledger ledger
+        WHERE ledger.organization_id = task.organization_id
+          AND ledger.source_global_id = task.global_id)::text AS net_movement,
+       (SELECT count(*) FROM operations_domain_events event
+        WHERE event.organization_id = task.organization_id
+          AND event.aggregate_global_id = task.global_id
+          AND event.event_type = 'operations.replenishment.completed')::int AS events,
+       (SELECT count(*) FROM audit_events audit
+        WHERE audit.organization_id = task.organization_id
+          AND audit.aggregate_id = task.global_id
+          AND audit.event_type = 'operations.replenishment.completed')::int AS audits,
+       (SELECT count(*) FROM operations_command_receipts command
+        WHERE command.organization_id = task.organization_id
+          AND command.result_global_id = task.global_id
+          AND command.status = 'succeeded')::int AS commands
+     FROM operations_replenishment_tasks task
+     JOIN operations_inventory_positions source
+       ON source.organization_id = task.organization_id
+      AND source.location_id = task.source_location_id
+      AND source.pool_id = task.inventory_pool_id
+      AND source.product_id = task.product_id
+      AND source.lot_code = 'LOT-REPLENISHMENT-01'
+     JOIN operations_inventory_positions destination
+       ON destination.organization_id = task.organization_id
+      AND destination.id <> source.id
+      AND destination.location_id = task.destination_location_id
+      AND destination.pool_id = task.inventory_pool_id
+      AND destination.product_id = task.product_id
+      AND destination.lot_code = source.lot_code
+     WHERE task.organization_id = $1::uuid AND task.global_id = $2`,
+    [fixture.organizationId, moved.replenishmentTaskGlobalId],
+  )
+  assert.deepEqual(evidence.rows[0], {
+    status: 'completed',
+    quantity: '8.000000',
+    source_on_hand: '12.000000',
+    destination_on_hand: '8.000000',
+    outbound_entries: 1,
+    inbound_entries: 1,
+    net_movement: '0.000000',
+    events: 1,
+    audits: 1,
+    commands: 1,
+  })
+
+  await expectRejected(
+    () => persistence.executeOperationsReplenishmentInPostgres({
+      organizationId: fixture.organizationId,
+      actorEmail: fixture.email,
+      idempotencyKey: `replenishment-stale-${randomUUID()}`,
+      replenishment: {
+        sourceLocationGlobalId: reserve.locationGlobalId,
+        destinationLocationGlobalId: forwardPick.locationGlobalId,
+        inventoryPoolGlobalId: inventoryPool.rows[0].global_id,
+        productGlobalId: fixture.product.reference_code,
+        quantity: 1,
+      },
+    }),
+    (error) => error.code === 'OPERATIONS_REPLENISHMENT_STALE',
+    'A replenishment request must fail closed after its recommendation is no longer active',
+  )
+}
+
 async function expectRejected(work, predicate, message) {
   let error = null
   try {
@@ -2913,6 +3165,7 @@ async function verifyPostgresAcceptance(databaseUrl) {
     }
 
     await verifyInboundReceivingAcceptance(pool, persistence, primary)
+    await verifyReplenishmentExecutionAcceptance(pool, persistence, primary)
   } finally {
     await pool.end()
   }

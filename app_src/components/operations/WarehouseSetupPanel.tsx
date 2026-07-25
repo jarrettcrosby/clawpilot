@@ -30,6 +30,7 @@ import DeleteOutlineRounded from '@mui/icons-material/DeleteOutlineRounded'
 import EditRounded from '@mui/icons-material/EditRounded'
 import HelpOutlineRounded from '@mui/icons-material/HelpOutlineRounded'
 import Inventory2Rounded from '@mui/icons-material/Inventory2Rounded'
+import MoveDownRounded from '@mui/icons-material/MoveDownRounded'
 import WarehouseRounded from '@mui/icons-material/WarehouseRounded'
 import type { OperationsWorkspace } from '@/lib/operations/types'
 
@@ -47,6 +48,7 @@ type TopologyLevel = Location['topologyLevel']
 type StorageFunction = Location['storageFunction']
 type ProductRule = Location['productRules'][number]
 type ReplenishmentMode = ProductRule['replenishmentMode']
+type ReplenishmentRecommendation = OperationsWorkspace['replenishmentRecommendations'][number]
 type MeasurementSystem = 'imperial' | 'metric'
 
 type WarehouseForm = {
@@ -353,12 +355,18 @@ function warehouseReadiness(item: Warehouse) {
 async function command(body: Record<string, unknown>) {
   const response = await fetch('/api/operations', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      'Idempotency-Key': `operations-warehouse:${String(body.action || 'command')}:${crypto.randomUUID()}`,
+    },
     body: JSON.stringify(body),
   })
   const payload = await response.json().catch(() => ({})) as {
     error?: string
-    result?: { outcome?: 'deleted' | 'retired' }
+    result?: {
+      outcome?: 'deleted' | 'retired'
+      replenishmentTaskGlobalId?: string
+    }
   }
   if (!response.ok) throw new Error(payload.error || 'Warehouse setup could not be saved')
   return payload
@@ -403,6 +411,7 @@ export default function WarehouseSetupPanel({ workspace, onRefresh, onNavigate }
   const [locationEditor, setLocationEditor] = useState<{ warehouse: Warehouse; item: Location | null } | null>(null)
   const [setupGuideOpen, setSetupGuideOpen] = useState(false)
   const [deleteTarget, setDeleteTarget] = useState<Location | null>(null)
+  const [replenishmentTarget, setReplenishmentTarget] = useState<ReplenishmentRecommendation | null>(null)
   const [warehouse, setWarehouse] = useState(initialWarehouse)
   const [location, setLocation] = useState(initialLocation)
   const [ruleProductGlobalId, setRuleProductGlobalId] = useState('')
@@ -411,6 +420,7 @@ export default function WarehouseSetupPanel({ workspace, onRefresh, onNavigate }
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const canManage = workspace?.capabilities.canManage === true
+  const canExecuteReplenishment = canManage && workspace?.capabilities.canExecute === true
 
   const locationWarehouse = locationEditor?.warehouse || null
   const editingLocation = locationEditor?.item || null
@@ -578,6 +588,32 @@ export default function WarehouseSetupPanel({ workspace, onRefresh, onNavigate }
     }
   }
 
+  async function executeReplenishment() {
+    if (!replenishmentTarget || !canExecuteReplenishment) return
+    setSaving(true)
+    setError('')
+    try {
+      const payload = await command({
+        action: 'execute-replenishment',
+        sourceLocationGlobalId: replenishmentTarget.sourceLocationGlobalId,
+        destinationLocationGlobalId: replenishmentTarget.destinationLocationGlobalId,
+        inventoryPoolGlobalId: replenishmentTarget.inventoryPoolGlobalId,
+        productGlobalId: replenishmentTarget.productGlobalId,
+        quantity: replenishmentTarget.recommendedQuantity,
+      })
+      const taskGlobalId = payload.result?.replenishmentTaskGlobalId
+      setReplenishmentTarget(null)
+      setNotice(taskGlobalId
+        ? `Replenishment completed. Task ${taskGlobalId}.`
+        : 'Replenishment completed.')
+      await onRefresh()
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Replenishment could not be completed')
+    } finally {
+      setSaving(false)
+    }
+  }
+
   function addProductRule() {
     const product = workspace?.catalog.products.find((item) => item.globalId === ruleProductGlobalId)
     if (!product || location.productRules.some((item) => item.productGlobalId === product.globalId)) return
@@ -697,6 +733,22 @@ export default function WarehouseSetupPanel({ workspace, onRefresh, onNavigate }
                     <Chip size="small" variant="outlined" label={`${recommendation.releasedDemand.toLocaleString()} units demand`} />
                   )}
                   <Chip size="small" color="warning" variant="outlined" label={`Move ${recommendation.recommendedQuantity.toLocaleString()}`} />
+                  <Tooltip title={canExecuteReplenishment ? 'Review and confirm this inventory move' : 'Warehouse execution permission is required'}>
+                    <span>
+                      <Button
+                        size="small"
+                        variant="outlined"
+                        startIcon={<MoveDownRounded />}
+                        disabled={!canExecuteReplenishment || saving}
+                        onClick={() => {
+                          setReplenishmentTarget(recommendation)
+                          setError('')
+                        }}
+                      >
+                        Move
+                      </Button>
+                    </span>
+                  </Tooltip>
                 </Stack>
               </Stack>
             ))}
@@ -1324,6 +1376,58 @@ export default function WarehouseSetupPanel({ workspace, onRefresh, onNavigate }
         <DialogActions>
           <Button onClick={() => setDeleteTarget(null)} disabled={saving}>Cancel</Button>
           <Button color="error" variant="contained" onClick={removeLocation} disabled={saving}>Remove location</Button>
+        </DialogActions>
+      </Dialog>
+
+      <Dialog
+        open={Boolean(replenishmentTarget)}
+        onClose={() => !saving && setReplenishmentTarget(null)}
+        maxWidth="sm"
+        fullWidth
+      >
+        <DialogTitle>Confirm replenishment move</DialogTitle>
+        <DialogContent>
+          {replenishmentTarget && (
+            <Stack gap={1.5} sx={{ pt: 0.5 }}>
+              <Alert severity="warning">
+                Confirming creates and completes replenishment work, moves inventory atomically, and records the warehouse audit evidence.
+              </Alert>
+              <Box>
+                <Typography fontWeight={700}>{replenishmentTarget.productName}</Typography>
+                <Typography variant="body2" color="text.secondary">
+                  {replenishmentTarget.warehouseName} · {replenishmentTarget.inventoryPoolName}
+                </Typography>
+              </Box>
+              <Stack direction={{ xs: 'column', sm: 'row' }} gap={1}>
+                <Box sx={{ flex: 1 }}>
+                  <Typography variant="caption" color="text.secondary">From</Typography>
+                  <Typography>{replenishmentTarget.sourceLocationCode}</Typography>
+                </Box>
+                <Box sx={{ flex: 1 }}>
+                  <Typography variant="caption" color="text.secondary">To</Typography>
+                  <Typography>{replenishmentTarget.destinationLocationCode}</Typography>
+                </Box>
+                <Box sx={{ flex: 1 }}>
+                  <Typography variant="caption" color="text.secondary">Quantity</Typography>
+                  <Typography>{replenishmentTarget.recommendedQuantity.toLocaleString()} units</Typography>
+                </Box>
+              </Stack>
+              <Typography variant="body2" color="text.secondary">
+                {replenishmentTarget.explanation}
+              </Typography>
+            </Stack>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setReplenishmentTarget(null)} disabled={saving}>Cancel</Button>
+          <Button
+            variant="contained"
+            startIcon={<MoveDownRounded />}
+            onClick={executeReplenishment}
+            disabled={saving || !canExecuteReplenishment}
+          >
+            Confirm move
+          </Button>
         </DialogActions>
       </Dialog>
 
