@@ -1440,6 +1440,7 @@ assertIncludes(authProxy, '/api/agents/research/process', 'auth proxy public age
 assertIncludes(authProxy, '/api/agents/repository-runs/process', 'auth proxy public repository worker route')
 assertIncludes(authProxy, '/api/integrations/toast/process', 'auth proxy public Toast worker route')
 assertIncludes(authProxy, '/api/integrations/quickbooks/process', 'auth proxy public QuickBooks worker route')
+assertIncludes(authProxy, '/api/operations/print-agent/jobs', 'auth proxy public print-agent transport route')
 assertIncludes(authProxy, 'HOSTED_RUNTIME', 'auth proxy fail-closed hosted mode')
 
 const loginRoute = read('app_src/app/api/auth/login/route.ts')

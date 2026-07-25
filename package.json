@@ -23,6 +23,7 @@
     "test:carrier-billing": "node scripts/test-carrier-billing-integrity.mjs",
     "test:printing": "node scripts/test-operation-printing.mjs && node scripts/test-operations-print-delivery.mjs && node scripts/test-operation-print-agent-runtime.mjs && node scripts/test-operation-print-artifact-delivery.mjs && node scripts/test-local-print-agent.mjs",
     "print-agent:run": "node scripts/run-local-print-agent.mjs",
+    "print-agent:install:macos": "node scripts/install-macos-print-agent.mjs",
     "print-agent:test-label": "node scripts/print-zebra-test-label.mjs --confirm-test-print",
     "test:carriers": "node scripts/test-carrier-integrations.mjs && npm run test:carrier-sandbox-label && npm run test:operation-shipping-persistence",
     "test:carrier-sandbox-label": "node scripts/test-carrier-sandbox-label.mjs",

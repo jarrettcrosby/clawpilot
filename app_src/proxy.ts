@@ -60,6 +60,7 @@ function isPublicApi(pathname: string) {
     || normalizedPath === '/api/integrations/quickbooks/process'
     || normalizedPath === '/api/docs/embeddings/process'
     || normalizedPath === '/api/ai-radar/process'
+    || normalizedPath === '/api/operations/print-agent/jobs'
     || normalizedPath === '/api/shortlinks'
     || normalizedPath.startsWith('/api/auth/')
   )
