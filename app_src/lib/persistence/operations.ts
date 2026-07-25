@@ -35,10 +35,15 @@ import type {
   OperationsExceptionListItem,
   OperationsExceptionStatus,
   OperationsExceptionUpdateResult,
+  OperationsInboundReceiptCommandResult,
+  OperationsInboundReceiptCompletionInput,
+  OperationsInboundReceiptCreationResult,
+  OperationsInboundReceiptInput,
   OperationsOrderDetail,
   OperationsOrderCommandResult,
   OperationsOrderListItem,
   OperationsOrderStatus,
+  OperationsPutawayPlacement,
   OperationsShipmentCommandResult,
   OperationsWorkspace,
   PricingDirective,
@@ -194,6 +199,52 @@ type CommandReceiptRow = QueryResultRow & {
   result_payload: Record<string, unknown> | null
   attempts: number
   updated_at: Date
+}
+
+type PutawayCandidateRow = QueryResultRow & {
+  id: string
+  global_id: string
+  code: string
+  location_type: 'storage' | 'pick'
+  pick_sequence: number
+  max_volume_cubic_meters: string | null
+  max_weight_kg: string | null
+  allow_mixed_products: boolean
+  rule_type: 'allowed' | 'preferred' | 'restricted' | null
+  rule_max_quantity: string | null
+  used_volume_cubic_meters: string
+  used_weight_kg: string
+  product_quantity: string
+  other_product_count: string
+  unknown_profile_count: string
+}
+
+type ReceiptCommandRow = QueryResultRow & {
+  id: string
+  global_id: string
+  pipeline_id: string
+  warehouse_id: string
+  inventory_pool_id: string
+  status: OperationsWorkspace['inboundReceipts'][number]['status']
+  row_version: string
+}
+
+type ReceiptCommandLineRow = QueryResultRow & {
+  id: string
+  global_id: string
+  product_id: string
+  product_global_id: string
+  target_location_id: string
+  expected_quantity: string
+  lot_code: string
+}
+
+type InventoryBalanceRow = QueryResultRow & {
+  id: string
+  global_id: string
+  on_hand_quantity: string
+  reserved_quantity: string
+  damaged_quantity: string
 }
 
 type ExceptionRow = QueryResultRow & {
@@ -2030,10 +2081,16 @@ export async function readOperationsWorkspaceFromPostgres(input: {
          SELECT
            COALESCE(sum(
              position.on_hand_quantity
+             / NULLIF(profile.units_per_package, 0)
              * profile.length_mm * profile.width_mm * profile.height_mm
              / 1000000000.0
            ), 0) AS used_volume_cubic_meters,
-           COALESCE(sum(position.on_hand_quantity * profile.weight_grams / 1000.0), 0) AS used_weight_kg
+           COALESCE(sum(
+             position.on_hand_quantity
+             / NULLIF(profile.units_per_package, 0)
+             * profile.weight_grams
+             / 1000.0
+           ), 0) AS used_weight_kg
          FROM operations_inventory_positions position
          LEFT JOIN operations_product_package_profiles profile
            ON profile.organization_id = position.organization_id
@@ -3379,6 +3436,859 @@ async function failCommandReceipt(receiptId: string, error: unknown) {
     )
   } catch {
     // Preserve the command failure even if receipt persistence is unavailable.
+  }
+}
+
+type PutawayPendingUsage = {
+  volumeCubicMeters: number
+  weightKg: number
+  quantityByProductId: Map<string, number>
+}
+
+function positiveReceiptQuantity(value: unknown, label: string): number {
+  const quantity = Number(value)
+  if (!Number.isFinite(quantity) || quantity <= 0 || quantity > 1_000_000_000) {
+    throw new OperationsRequestError('OPERATIONS_RECEIPT_INVALID', `${label} must be greater than zero`)
+  }
+  return quantity
+}
+
+function nonNegativeReceiptQuantity(value: unknown, label: string): number {
+  const quantity = Number(value)
+  if (!Number.isFinite(quantity) || quantity < 0 || quantity > 1_000_000_000) {
+    throw new OperationsRequestError('OPERATIONS_RECEIPT_INVALID', `${label} must be zero or greater`)
+  }
+  return quantity
+}
+
+function receiptText(value: unknown, label: string, maximum: number, required = true): string {
+  const result = String(value ?? '').trim()
+  if ((required && !result) || result.length > maximum || /[\u0000-\u001f\u007f]/.test(result)) {
+    throw new OperationsRequestError('OPERATIONS_RECEIPT_INVALID', `${label} is invalid`)
+  }
+  return result
+}
+
+function completedReceiptCreationResult(
+  receipt: Pick<CommandReceiptRow, 'result_payload'>,
+): OperationsInboundReceiptCreationResult {
+  const payload = receipt.result_payload
+  if (!payload
+    || typeof payload.receiptGlobalId !== 'string'
+    || payload.status !== 'expected'
+    || typeof payload.rowVersion !== 'number'
+    || typeof payload.expectedQuantity !== 'number'
+    || !Array.isArray(payload.placements)) {
+    throw new OperationsRequestError(
+      'OPERATIONS_COMMAND_RECEIPT_INVALID',
+      'Completed command receipt has no inbound receipt result',
+      409,
+    )
+  }
+  return {
+    receiptGlobalId: payload.receiptGlobalId,
+    status: 'expected',
+    rowVersion: payload.rowVersion,
+    expectedQuantity: payload.expectedQuantity,
+    placements: payload.placements as OperationsPutawayPlacement[],
+    replayed: true,
+  }
+}
+
+function completedInboundReceiptResult(
+  receipt: Pick<CommandReceiptRow, 'result_payload'>,
+): OperationsInboundReceiptCommandResult {
+  const payload = receipt.result_payload
+  if (!payload
+    || typeof payload.receiptGlobalId !== 'string'
+    || payload.status !== 'completed'
+    || typeof payload.rowVersion !== 'number'
+    || typeof payload.receivedQuantity !== 'number'
+    || typeof payload.damagedQuantity !== 'number'
+    || !Array.isArray(payload.positionGlobalIds)
+    || !payload.positionGlobalIds.every((value) => typeof value === 'string')) {
+    throw new OperationsRequestError(
+      'OPERATIONS_COMMAND_RECEIPT_INVALID',
+      'Completed command receipt has no receiving result',
+      409,
+    )
+  }
+  return {
+    receiptGlobalId: payload.receiptGlobalId,
+    status: 'completed',
+    rowVersion: payload.rowVersion,
+    receivedQuantity: payload.receivedQuantity,
+    damagedQuantity: payload.damagedQuantity,
+    positionGlobalIds: payload.positionGlobalIds,
+    replayed: true,
+  }
+}
+
+async function readPutawayCandidates(
+  client: PoolClient,
+  input: {
+    organizationId: string
+    pipelineId: string
+    warehouseId: string
+    productId: string
+    requestedLocationGlobalId?: string | null
+  },
+): Promise<PutawayCandidateRow[]> {
+  const result = await client.query<PutawayCandidateRow>(
+    `SELECT location.id::text, location.global_id, location.code,
+            location.location_type, location.pick_sequence,
+            location.max_volume_cubic_meters::text,
+            location.max_weight_kg::text, location.allow_mixed_products,
+            rule.rule_type, rule.max_quantity::text AS rule_max_quantity,
+            COALESCE(usage.used_volume_cubic_meters, 0)::text AS used_volume_cubic_meters,
+            COALESCE(usage.used_weight_kg, 0)::text AS used_weight_kg,
+            COALESCE(usage.product_quantity, 0)::text AS product_quantity,
+            COALESCE(usage.other_product_count, 0)::text AS other_product_count,
+            COALESCE(usage.unknown_profile_count, 0)::text AS unknown_profile_count
+     FROM operations_locations location
+     LEFT JOIN operations_location_product_rules rule
+       ON rule.organization_id = location.organization_id
+      AND rule.location_id = location.id
+      AND rule.pipeline_id = $2::uuid
+      AND rule.product_id = $4::uuid
+      AND rule.active = true
+     LEFT JOIN LATERAL (
+       SELECT
+         COALESCE(sum(
+           CASE WHEN profile.units_per_package IS NULL THEN 0 ELSE
+             position.on_hand_quantity
+             / NULLIF(profile.units_per_package, 0)
+             * profile.length_mm * profile.width_mm * profile.height_mm
+             / 1000000000.0
+           END
+         ), 0) AS used_volume_cubic_meters,
+         COALESCE(sum(
+           CASE WHEN profile.units_per_package IS NULL THEN 0 ELSE
+             position.on_hand_quantity
+             / NULLIF(profile.units_per_package, 0)
+             * profile.weight_grams
+             / 1000.0
+           END
+         ), 0) AS used_weight_kg,
+         COALESCE(sum(position.on_hand_quantity)
+           FILTER (WHERE position.product_id = $4::uuid), 0) AS product_quantity,
+         count(DISTINCT position.product_id)
+           FILTER (WHERE position.product_id <> $4::uuid AND position.on_hand_quantity > 0)
+           AS other_product_count,
+         count(*)
+           FILTER (WHERE position.on_hand_quantity > 0 AND profile.units_per_package IS NULL)
+           AS unknown_profile_count
+       FROM operations_inventory_positions position
+       LEFT JOIN LATERAL (
+         SELECT package.units_per_package, package.length_mm, package.width_mm,
+                package.height_mm, package.weight_grams
+         FROM operations_product_package_profiles package
+         WHERE package.organization_id = position.organization_id
+           AND package.pipeline_id = position.pipeline_id
+           AND package.product_id = position.product_id
+           AND package.active = true
+         ORDER BY package.is_default DESC, lower(package.profile_name), package.id
+         LIMIT 1
+       ) profile ON true
+       WHERE position.organization_id = location.organization_id
+         AND position.location_id = location.id
+     ) usage ON true
+     WHERE location.organization_id = $1::uuid
+       AND location.warehouse_id = $3::uuid
+       AND location.active = true
+       AND location.location_type IN ('storage', 'pick')
+       AND ($5::text IS NULL OR location.global_id = $5)
+       AND NOT EXISTS (
+         SELECT 1
+         FROM operations_locations child
+         WHERE child.organization_id = location.organization_id
+           AND child.parent_location_id = location.id
+           AND child.active = true
+       )
+     ORDER BY location.pick_sequence, lower(location.code), location.id`,
+    [
+      input.organizationId,
+      input.pipelineId,
+      input.warehouseId,
+      input.productId,
+      input.requestedLocationGlobalId || null,
+    ],
+  )
+  return result.rows
+}
+
+async function selectPutawayPlacement(
+  client: PoolClient,
+  input: {
+    organizationId: string
+    pipelineId: string
+    warehouseId: string
+    product: ProductRow
+    quantity: number
+    requestedLocationGlobalId?: string | null
+    pendingByLocationId?: Map<string, PutawayPendingUsage>
+  },
+): Promise<{
+  locationId: string
+  placement: Omit<OperationsPutawayPlacement, 'lineGlobalId'>
+  volumeCubicMeters: number
+  weightKg: number
+}> {
+  const candidates = await readPutawayCandidates(client, {
+    organizationId: input.organizationId,
+    pipelineId: input.pipelineId,
+    warehouseId: input.warehouseId,
+    productId: input.product.id,
+    requestedLocationGlobalId: input.requestedLocationGlobalId,
+  })
+  if (input.requestedLocationGlobalId && !candidates.length) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PUTAWAY_LOCATION_INVALID',
+      'The selected putaway location is not an active leaf storage or pick location in this warehouse',
+      409,
+    )
+  }
+
+  const packaging = await readDefaultProductPackagingWithClient(client, {
+    organizationId: input.organizationId,
+    pipelineId: input.pipelineId,
+    productIds: [input.product.id],
+  })
+  const profile = packaging.get(input.product.id)
+  const packageCount = profile ? input.quantity / profile.unitsPerPackage : 0
+  const incomingVolume = profile
+    ? packageCount * profile.lengthMm * profile.widthMm * profile.heightMm / 1_000_000_000
+    : 0
+  const incomingWeight = profile ? packageCount * profile.weightGrams / 1_000 : 0
+  const rejected = new Set<string>()
+  const eligible = candidates.filter((candidate) => {
+    const pending = input.pendingByLocationId?.get(candidate.id)
+    const pendingOtherProducts = pending
+      ? [...pending.quantityByProductId.entries()]
+          .some(([productId, quantity]) => productId !== input.product.id && quantity > 0)
+      : false
+    const pendingProductQuantity = pending?.quantityByProductId.get(input.product.id) || 0
+    if (candidate.rule_type === 'restricted') {
+      rejected.add('product restriction')
+      return false
+    }
+    if (!candidate.allow_mixed_products
+      && (numberValue(candidate.other_product_count) > 0 || pendingOtherProducts)) {
+      rejected.add('mixed-product restriction')
+      return false
+    }
+    if (candidate.rule_max_quantity !== null
+      && numberValue(candidate.product_quantity) + pendingProductQuantity + input.quantity
+        > numberValue(candidate.rule_max_quantity) + 0.000001) {
+      rejected.add('product quantity limit')
+      return false
+    }
+    const hasCapacity = candidate.max_volume_cubic_meters !== null
+      || candidate.max_weight_kg !== null
+    if (hasCapacity && !profile) {
+      rejected.add('missing package dimensions or weight')
+      return false
+    }
+    if (hasCapacity && numberValue(candidate.unknown_profile_count) > 0) {
+      rejected.add('existing inventory without package measurements')
+      return false
+    }
+    const projectedVolume = numberValue(candidate.used_volume_cubic_meters)
+      + (pending?.volumeCubicMeters || 0)
+      + incomingVolume
+    const projectedWeight = numberValue(candidate.used_weight_kg)
+      + (pending?.weightKg || 0)
+      + incomingWeight
+    if (candidate.max_volume_cubic_meters !== null
+      && projectedVolume > numberValue(candidate.max_volume_cubic_meters) + 0.000001) {
+      rejected.add('cubic capacity')
+      return false
+    }
+    if (candidate.max_weight_kg !== null
+      && projectedWeight > numberValue(candidate.max_weight_kg) + 0.000001) {
+      rejected.add('weight capacity')
+      return false
+    }
+    return true
+  })
+  eligible.sort((left, right) => {
+    const leftPending = input.pendingByLocationId?.get(left.id)
+    const rightPending = input.pendingByLocationId?.get(right.id)
+    const leftRank = left.rule_type === 'preferred'
+      ? 0
+      : numberValue(left.product_quantity) + (leftPending?.quantityByProductId.get(input.product.id) || 0) > 0
+        ? 1
+        : left.location_type === 'storage' ? 2 : 3
+    const rightRank = right.rule_type === 'preferred'
+      ? 0
+      : numberValue(right.product_quantity) + (rightPending?.quantityByProductId.get(input.product.id) || 0) > 0
+        ? 1
+        : right.location_type === 'storage' ? 2 : 3
+    return leftRank - rightRank
+      || left.pick_sequence - right.pick_sequence
+      || left.code.localeCompare(right.code)
+  })
+  const selected = eligible[0]
+  if (!selected) {
+    const suffix = rejected.size ? ` Blocked by: ${[...rejected].join(', ')}.` : ''
+    throw new OperationsRequestError(
+      'OPERATIONS_PUTAWAY_UNAVAILABLE',
+      `No eligible putaway location has sufficient configured capacity for ${input.product.name}.${suffix}`,
+      409,
+    )
+  }
+  const pending = input.pendingByLocationId?.get(selected.id)
+  const sameProduct = numberValue(selected.product_quantity)
+    + (pending?.quantityByProductId.get(input.product.id) || 0) > 0
+  const strategy: OperationsPutawayPlacement['strategy'] = input.requestedLocationGlobalId
+    ? 'manual'
+    : selected.rule_type === 'preferred'
+      ? 'preferred_rule'
+      : sameProduct
+        ? 'same_product'
+        : 'route_order'
+  const explanation = strategy === 'manual'
+    ? `Selected manually; product rules and capacity were revalidated for ${selected.code}.`
+    : strategy === 'preferred_rule'
+      ? `${selected.code} has the preferred-product rule and sufficient capacity.`
+      : strategy === 'same_product'
+        ? `${selected.code} already stores this product and has sufficient capacity.`
+        : `${selected.code} is the first eligible location by pick route order (${selected.pick_sequence}).`
+  return {
+    locationId: selected.id,
+    placement: {
+      productGlobalId: input.product.reference_code,
+      targetLocationGlobalId: selected.global_id,
+      targetLocationCode: selected.code,
+      strategy,
+      explanation,
+      projectedVolumeCubicMeters: profile
+        ? numberValue(selected.used_volume_cubic_meters) + (pending?.volumeCubicMeters || 0) + incomingVolume
+        : null,
+      projectedWeightKg: profile
+        ? numberValue(selected.used_weight_kg) + (pending?.weightKg || 0) + incomingWeight
+        : null,
+    },
+    volumeCubicMeters: incomingVolume,
+    weightKg: incomingWeight,
+  }
+}
+
+export async function createOperationsInboundReceiptInPostgres(input: {
+  organizationId: string
+  actorEmail: string
+  receipt: OperationsInboundReceiptInput
+  idempotencyKey: string
+}): Promise<OperationsInboundReceiptCreationResult> {
+  const organizationId = requireOrganizationId(input.organizationId)
+  const referenceNumber = receiptText(input.receipt.referenceNumber, 'Receipt reference', 120)
+  if (!Array.isArray(input.receipt.lines) || input.receipt.lines.length < 1 || input.receipt.lines.length > 100) {
+    throw new OperationsRequestError('OPERATIONS_RECEIPT_INVALID', 'Receipt must include from 1 to 100 lines')
+  }
+  const expectedAt = input.receipt.expectedAt ? new Date(input.receipt.expectedAt) : null
+  if (expectedAt && Number.isNaN(expectedAt.getTime())) {
+    throw new OperationsRequestError('OPERATIONS_RECEIPT_INVALID', 'Expected receipt date is invalid')
+  }
+  const normalized: OperationsInboundReceiptInput = {
+    warehouseGlobalId: receiptText(input.receipt.warehouseGlobalId, 'Warehouse', 16),
+    inventoryPoolGlobalId: receiptText(input.receipt.inventoryPoolGlobalId, 'Inventory pool', 16),
+    referenceNumber,
+    expectedAt: expectedAt?.toISOString() || null,
+    lines: input.receipt.lines.map((line, index) => ({
+      productGlobalId: receiptText(line.productGlobalId, `Product on line ${index + 1}`, 16),
+      targetLocationGlobalId: line.targetLocationGlobalId
+        ? receiptText(line.targetLocationGlobalId, `Putaway location on line ${index + 1}`, 16)
+        : null,
+      expectedQuantity: positiveReceiptQuantity(line.expectedQuantity, `Expected quantity on line ${index + 1}`),
+      lotCode: receiptText(line.lotCode, `Lot on line ${index + 1}`, 120, false),
+      unitOfMeasure: receiptText(line.unitOfMeasure || 'each', `Unit of measure on line ${index + 1}`, 50),
+    })),
+  }
+  const prepared = await prepareCommandReceipt({
+    organizationId,
+    commandType: 'create_inbound_receipt',
+    idempotencyKey: input.idempotencyKey,
+    requestHash: commandRequestHash(normalized),
+    actorEmail: input.actorEmail,
+  })
+  if (prepared.completed) return completedReceiptCreationResult(prepared.receipt)
+
+  try {
+    return await withTransaction(async (client) => {
+      const pipeline = await resolvePipeline(client, organizationId)
+      await acquireTransactionAdvisoryLock(
+        client,
+        `operations:receipt-reference:${organizationId}:${referenceNumber}`,
+      )
+      const warehouseResult = await client.query<WarehouseRow>(
+        `SELECT id::text, global_id, code, name, facility_type, timezone, address, status,
+                cutoff_time::text, operating_days, opens_at::text, closes_at::text,
+                standard_processing_minutes, daily_order_capacity, row_version::text
+         FROM operations_warehouses
+         WHERE organization_id = $1::uuid AND global_id = $2
+         LIMIT 1
+         FOR UPDATE`,
+        [organizationId, normalized.warehouseGlobalId],
+      )
+      const warehouse = warehouseResult.rows[0]
+      if (!warehouse || warehouse.status !== 'active') {
+        throw new OperationsRequestError(
+          'OPERATIONS_WAREHOUSE_INACTIVE',
+          'Select an active warehouse for this receipt',
+          409,
+        )
+      }
+      await acquireTransactionAdvisoryLock(client, `operations:receiving:${organizationId}:${warehouse.id}`)
+      const poolResult = await client.query<InventoryPoolRow>(
+        `SELECT pool.id::text, pool.global_id, pool.name, pool.pool_type,
+                pool.allocation_policy, pool.active,
+                owner.reference_code AS owner_customer_global_id,
+                owner.name AS owner_customer_name
+         FROM operations_inventory_pools pool
+         LEFT JOIN crm_organizations owner
+           ON owner.pipeline_id = pool.pipeline_id AND owner.id = pool.owner_customer_id
+         WHERE pool.organization_id = $1::uuid AND pool.global_id = $2
+         LIMIT 1`,
+        [organizationId, normalized.inventoryPoolGlobalId],
+      )
+      const pool = poolResult.rows[0]
+      if (!pool || !pool.active) {
+        throw new OperationsRequestError(
+          'OPERATIONS_INVENTORY_POOL_INACTIVE',
+          'Select an active inventory pool for this receipt',
+          409,
+        )
+      }
+      const existing = await client.query<{ global_id: string }>(
+        `SELECT global_id
+         FROM operations_receipts
+         WHERE organization_id = $1::uuid AND reference_number = $2
+         LIMIT 1`,
+        [organizationId, referenceNumber],
+      )
+      if (existing.rows[0]) {
+        throw new OperationsRequestError(
+          'OPERATIONS_RECEIPT_REFERENCE_EXISTS',
+          'This receipt reference already exists',
+          409,
+        )
+      }
+      const receiptResult = await client.query<ReceiptCommandRow>(
+        `INSERT INTO operations_receipts (
+           organization_id, pipeline_id, warehouse_id, inventory_pool_id,
+           reference_number, expected_at, created_by, updated_by
+         ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6::timestamptz, $7, $7)
+         RETURNING id::text, global_id, pipeline_id::text, warehouse_id::text,
+                   inventory_pool_id::text, status, row_version::text`,
+        [
+          organizationId,
+          pipeline.id,
+          warehouse.id,
+          pool.id,
+          referenceNumber,
+          normalized.expectedAt,
+          input.actorEmail,
+        ],
+      )
+      const receipt = receiptResult.rows[0]
+      const placements: OperationsPutawayPlacement[] = []
+      const pendingByLocationId = new Map<string, PutawayPendingUsage>()
+      for (const [index, line] of normalized.lines.entries()) {
+        const product = await resolveProduct(client, pipeline.id, line.productGlobalId)
+        const selected = await selectPutawayPlacement(client, {
+          organizationId,
+          pipelineId: pipeline.id,
+          warehouseId: warehouse.id,
+          product,
+          quantity: line.expectedQuantity,
+          requestedLocationGlobalId: line.targetLocationGlobalId,
+          pendingByLocationId,
+        })
+        const inserted = await client.query<{ global_id: string }>(
+          `INSERT INTO operations_receipt_lines (
+             organization_id, receipt_id, pipeline_id, product_id, target_location_id,
+             line_number, expected_quantity, lot_code, unit_of_measure
+           ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6, $7, $8, $9)
+           RETURNING global_id`,
+          [
+            organizationId,
+            receipt.id,
+            pipeline.id,
+            product.id,
+            selected.locationId,
+            index + 1,
+            line.expectedQuantity,
+            line.lotCode,
+            line.unitOfMeasure,
+          ],
+        )
+        placements.push({ lineGlobalId: inserted.rows[0].global_id, ...selected.placement })
+        const pending = pendingByLocationId.get(selected.locationId) || {
+          volumeCubicMeters: 0,
+          weightKg: 0,
+          quantityByProductId: new Map<string, number>(),
+        }
+        pending.volumeCubicMeters += selected.volumeCubicMeters
+        pending.weightKg += selected.weightKg
+        pending.quantityByProductId.set(
+          product.id,
+          (pending.quantityByProductId.get(product.id) || 0) + line.expectedQuantity,
+        )
+        pendingByLocationId.set(selected.locationId, pending)
+      }
+      const expectedQuantity = normalized.lines.reduce((sum, line) => sum + line.expectedQuantity, 0)
+      const result: OperationsInboundReceiptCreationResult = {
+        receiptGlobalId: receipt.global_id,
+        status: 'expected',
+        rowVersion: Number(receipt.row_version),
+        expectedQuantity,
+        placements,
+        replayed: false,
+      }
+      await appendDomainEvent(client, {
+        organizationId,
+        aggregateType: 'operations.receipt',
+        aggregateId: receipt.id,
+        aggregateGlobalId: receipt.global_id,
+        eventType: 'operations.receipt.created',
+        actorEmail: input.actorEmail,
+        correlationId: prepared.receipt.correlation_id,
+        idempotencyKey: `${receipt.global_id}:created`,
+        payload: {
+          referenceNumber,
+          warehouseGlobalId: warehouse.global_id,
+          inventoryPoolGlobalId: pool.global_id,
+          expectedQuantity,
+          placements,
+        },
+      })
+      await recordAuditEvent({
+        actor: input.actorEmail,
+        eventType: 'operations.receipt.created',
+        aggregateType: 'operations.receipt',
+        aggregateId: receipt.global_id,
+        subject: referenceNumber,
+        organizationId,
+        eventKey: `operations:receipt:${receipt.global_id}:created`,
+        payload: {
+          warehouseGlobalId: warehouse.global_id,
+          inventoryPoolGlobalId: pool.global_id,
+          expectedQuantity,
+          placements,
+        },
+      }, client)
+      await completeCommandReceipt(
+        client,
+        prepared.receipt.id,
+        receipt.global_id,
+        result as unknown as Record<string, unknown>,
+      )
+      return result
+    })
+  } catch (error) {
+    await failCommandReceipt(prepared.receipt.id, error)
+    throw error
+  }
+}
+
+export async function completeOperationsInboundReceiptInPostgres(input: {
+  organizationId: string
+  actorEmail: string
+  completion: OperationsInboundReceiptCompletionInput
+  idempotencyKey: string
+}): Promise<OperationsInboundReceiptCommandResult> {
+  const organizationId = requireOrganizationId(input.organizationId)
+  const reason = receiptText(input.completion.reason, 'Receiving reason', 500)
+  if (!Number.isSafeInteger(input.completion.expectedRowVersion) || input.completion.expectedRowVersion < 0) {
+    throw new OperationsRequestError('OPERATIONS_RECEIPT_INVALID', 'Receipt version is invalid')
+  }
+  if (!Array.isArray(input.completion.lines) || input.completion.lines.length < 1 || input.completion.lines.length > 100) {
+    throw new OperationsRequestError('OPERATIONS_RECEIPT_INVALID', 'Receiving confirmation must include every receipt line')
+  }
+  const seen = new Set<string>()
+  const normalized: OperationsInboundReceiptCompletionInput = {
+    receiptGlobalId: receiptText(input.completion.receiptGlobalId, 'Receipt', 16),
+    expectedRowVersion: input.completion.expectedRowVersion,
+    reason,
+    lines: input.completion.lines.map((line, index) => {
+      const lineGlobalId = receiptText(line.lineGlobalId, `Receipt line ${index + 1}`, 20)
+      if (seen.has(lineGlobalId)) {
+        throw new OperationsRequestError('OPERATIONS_RECEIPT_INVALID', 'Receipt line confirmations must be unique')
+      }
+      seen.add(lineGlobalId)
+      return {
+        lineGlobalId,
+        acceptedQuantity: nonNegativeReceiptQuantity(
+          line.acceptedQuantity,
+          `Accepted quantity on line ${index + 1}`,
+        ),
+        damagedQuantity: nonNegativeReceiptQuantity(
+          line.damagedQuantity,
+          `Damaged quantity on line ${index + 1}`,
+        ),
+      }
+    }),
+  }
+  const prepared = await prepareCommandReceipt({
+    organizationId,
+    commandType: 'complete_inbound_receipt',
+    idempotencyKey: input.idempotencyKey,
+    requestHash: commandRequestHash(normalized),
+    actorEmail: input.actorEmail,
+  })
+  if (prepared.completed) return completedInboundReceiptResult(prepared.receipt)
+
+  try {
+    return await withTransaction(async (client) => {
+      const receiptResult = await client.query<ReceiptCommandRow>(
+        `SELECT id::text, global_id, pipeline_id::text, warehouse_id::text,
+                inventory_pool_id::text, status, row_version::text
+         FROM operations_receipts
+         WHERE organization_id = $1::uuid AND global_id = $2
+         LIMIT 1
+         FOR UPDATE`,
+        [organizationId, normalized.receiptGlobalId],
+      )
+      const receipt = receiptResult.rows[0]
+      if (!receipt) {
+        throw new OperationsRequestError('OPERATIONS_RECEIPT_NOT_FOUND', 'Inbound receipt was not found', 404)
+      }
+      await acquireTransactionAdvisoryLock(client, `operations:receiving:${organizationId}:${receipt.warehouse_id}`)
+      if (!['expected', 'receiving'].includes(receipt.status)) {
+        throw new OperationsRequestError(
+          'OPERATIONS_RECEIPT_STATUS_INVALID',
+          `Receipt cannot be completed from ${receipt.status}`,
+          409,
+        )
+      }
+      if (Number(receipt.row_version) !== normalized.expectedRowVersion) {
+        throw new OperationsRequestError(
+          'OPERATIONS_RECEIPT_VERSION_CONFLICT',
+          'Receipt changed after it was opened; refresh before confirming receiving',
+          409,
+        )
+      }
+      const lineResult = await client.query<ReceiptCommandLineRow>(
+        `SELECT line.id::text, line.global_id, line.product_id::text,
+                product.reference_code AS product_global_id,
+                line.target_location_id::text, line.expected_quantity::text,
+                line.lot_code
+         FROM operations_receipt_lines line
+         JOIN crm_products product
+           ON product.pipeline_id = line.pipeline_id AND product.id = line.product_id
+         WHERE line.organization_id = $1::uuid AND line.receipt_id = $2::uuid
+         ORDER BY line.line_number, line.id
+         FOR UPDATE OF line`,
+        [organizationId, receipt.id],
+      )
+      if (lineResult.rows.length !== normalized.lines.length) {
+        throw new OperationsRequestError(
+          'OPERATIONS_RECEIPT_LINES_INCOMPLETE',
+          'Confirm accepted and damaged quantities for every receipt line',
+          409,
+        )
+      }
+      const completionByLine = new Map(normalized.lines.map((line) => [line.lineGlobalId, line]))
+      if (lineResult.rows.some((line) => !completionByLine.has(line.global_id))) {
+        throw new OperationsRequestError(
+          'OPERATIONS_RECEIPT_LINES_INCOMPLETE',
+          'Receiving confirmation does not match this receipt',
+          409,
+        )
+      }
+      const positionGlobalIds = new Set<string>()
+      let receivedQuantity = 0
+      let damagedQuantity = 0
+      for (const line of lineResult.rows) {
+        const completion = completionByLine.get(line.global_id)!
+        const total = completion.acceptedQuantity + completion.damagedQuantity
+        if (total > numberValue(line.expected_quantity) + 0.000001) {
+          throw new OperationsRequestError(
+            'OPERATIONS_RECEIPT_QUANTITY_EXCEEDED',
+            `Accepted and damaged quantity exceeds expected quantity on ${line.global_id}`,
+            409,
+          )
+        }
+        if (Math.abs(total - numberValue(line.expected_quantity)) > 0.000001) {
+          throw new OperationsRequestError(
+            'OPERATIONS_RECEIPT_QUANTITY_INCOMPLETE',
+            `Classify every expected unit as accepted or damaged on ${line.global_id}`,
+            409,
+          )
+        }
+        if (total > 0) {
+          const product = await resolveProduct(client, receipt.pipeline_id, line.product_global_id)
+          const location = await client.query<{ global_id: string }>(
+            `SELECT global_id
+             FROM operations_locations
+             WHERE organization_id = $1::uuid AND id = $2::uuid
+             LIMIT 1`,
+            [organizationId, line.target_location_id],
+          )
+          if (!location.rows[0]) {
+            throw new OperationsRequestError(
+              'OPERATIONS_PUTAWAY_LOCATION_INVALID',
+              `The planned putaway location for ${line.global_id} is no longer available`,
+              409,
+            )
+          }
+          await selectPutawayPlacement(client, {
+            organizationId,
+            pipelineId: receipt.pipeline_id,
+            warehouseId: receipt.warehouse_id,
+            product,
+            quantity: total,
+            requestedLocationGlobalId: location.rows[0].global_id,
+          })
+          const positionInsert = await client.query<{ id: string; global_id: string }>(
+            `INSERT INTO operations_inventory_positions (
+               organization_id, pipeline_id, warehouse_id, location_id, pool_id,
+               product_id, lot_code
+             ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6::uuid, $7)
+             ON CONFLICT (
+               organization_id, warehouse_id, location_id, pool_id, product_id, lot_code
+             ) DO UPDATE SET updated_at = operations_inventory_positions.updated_at
+             RETURNING id::text, global_id`,
+            [
+              organizationId,
+              receipt.pipeline_id,
+              receipt.warehouse_id,
+              line.target_location_id,
+              receipt.inventory_pool_id,
+              line.product_id,
+              line.lot_code,
+            ],
+          )
+          const positionResult = await client.query<InventoryBalanceRow>(
+            `SELECT id::text, global_id, on_hand_quantity::text,
+                    reserved_quantity::text, damaged_quantity::text
+             FROM operations_inventory_positions
+             WHERE organization_id = $1::uuid AND id = $2::uuid
+             FOR UPDATE`,
+            [organizationId, positionInsert.rows[0].id],
+          )
+          const position = positionResult.rows[0]
+          const onHandAfter = numberValue(position.on_hand_quantity) + total
+          const damagedAfter = numberValue(position.damaged_quantity) + completion.damagedQuantity
+          const reservedAfter = numberValue(position.reserved_quantity)
+          await client.query(
+            `UPDATE operations_inventory_positions
+             SET on_hand_quantity = $3, damaged_quantity = $4,
+                 version = version + 1, updated_at = now()
+             WHERE organization_id = $1::uuid AND id = $2::uuid`,
+            [organizationId, position.id, onHandAfter, damagedAfter],
+          )
+          await client.query(
+            `INSERT INTO operations_inventory_ledger (
+               organization_id, position_id, event_type,
+               on_hand_delta, reserved_delta, damaged_delta,
+               on_hand_after, reserved_after, damaged_after,
+               source_global_id, reason, idempotency_key, actor_email
+             ) VALUES (
+               $1::uuid, $2::uuid, 'receipt', $3, 0, $4, $5, $6, $7, $8, $9, $10, $11
+             )`,
+            [
+              organizationId,
+              position.id,
+              total,
+              completion.damagedQuantity,
+              onHandAfter,
+              reservedAfter,
+              damagedAfter,
+              line.global_id,
+              reason,
+              `${receipt.global_id}:${line.global_id}:receipt:${prepared.receipt.id}`,
+              input.actorEmail,
+            ],
+          )
+          positionGlobalIds.add(position.global_id)
+        }
+        await client.query(
+          `UPDATE operations_receipt_lines
+           SET accepted_quantity = $3, damaged_quantity = $4, updated_at = now()
+           WHERE organization_id = $1::uuid AND id = $2::uuid`,
+          [
+            organizationId,
+            line.id,
+            completion.acceptedQuantity,
+            completion.damagedQuantity,
+          ],
+        )
+        receivedQuantity += completion.acceptedQuantity
+        damagedQuantity += completion.damagedQuantity
+      }
+      const updatedReceipt = await client.query<{ row_version: string }>(
+        `UPDATE operations_receipts
+         SET status = 'completed', started_at = COALESCE(started_at, now()),
+             completed_at = now(), updated_by = $4,
+             row_version = row_version + 1, updated_at = now()
+         WHERE organization_id = $1::uuid AND id = $2::uuid AND row_version = $3
+         RETURNING row_version::text`,
+        [
+          organizationId,
+          receipt.id,
+          normalized.expectedRowVersion,
+          input.actorEmail,
+        ],
+      )
+      if (!updatedReceipt.rows[0]) {
+        throw new OperationsRequestError(
+          'OPERATIONS_RECEIPT_VERSION_CONFLICT',
+          'Receipt changed before receiving could be completed',
+          409,
+        )
+      }
+      const result: OperationsInboundReceiptCommandResult = {
+        receiptGlobalId: receipt.global_id,
+        status: 'completed',
+        rowVersion: Number(updatedReceipt.rows[0].row_version),
+        receivedQuantity,
+        damagedQuantity,
+        positionGlobalIds: [...positionGlobalIds],
+        replayed: false,
+      }
+      await appendDomainEvent(client, {
+        organizationId,
+        aggregateType: 'operations.receipt',
+        aggregateId: receipt.id,
+        aggregateGlobalId: receipt.global_id,
+        eventType: 'operations.receipt.completed',
+        actorEmail: input.actorEmail,
+        correlationId: prepared.receipt.correlation_id,
+        idempotencyKey: `${receipt.global_id}:completed:${prepared.receipt.id}`,
+        payload: {
+          receivedQuantity,
+          damagedQuantity,
+          positionGlobalIds: result.positionGlobalIds,
+          reason,
+        },
+      })
+      await recordAuditEvent({
+        actor: input.actorEmail,
+        eventType: 'operations.receipt.completed',
+        aggregateType: 'operations.receipt',
+        aggregateId: receipt.global_id,
+        subject: receipt.global_id,
+        organizationId,
+        eventKey: `operations:receipt:${receipt.global_id}:completed:${prepared.receipt.id}`,
+        payload: {
+          receivedQuantity,
+          damagedQuantity,
+          positionGlobalIds: result.positionGlobalIds,
+          reason,
+        },
+      }, client)
+      await completeCommandReceipt(
+        client,
+        prepared.receipt.id,
+        receipt.global_id,
+        result as unknown as Record<string, unknown>,
+      )
+      return result
+    })
+  } catch (error) {
+    await failCommandReceipt(prepared.receipt.id, error)
+    throw error
   }
 }
 

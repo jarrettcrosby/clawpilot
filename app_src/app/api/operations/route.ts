@@ -9,6 +9,8 @@ import type {
   MockOperationsProofLineInput,
   OperationsActivationState,
   OperationsExceptionStatus,
+  OperationsInboundReceiptCompletionInput,
+  OperationsInboundReceiptInput,
   OperationsOrderStatus,
   OperationsWorkspace,
 } from '@/lib/operations/types'
@@ -16,6 +18,8 @@ import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import {
   confirmOperationsOrderShipmentFromPostgres,
   confirmOperationsOrderPicksFromPostgres,
+  completeOperationsInboundReceiptInPostgres,
+  createOperationsInboundReceiptInPostgres,
   createOperationsLocationInPostgres,
   createOperationsWarehouseInPostgres,
   deleteOperationsLocationInPostgres,
@@ -49,6 +53,9 @@ const CARRIER_ACCOUNT_GLOBAL_ID = /^gac\d{7}$/
 const PRINTER_GLOBAL_ID = /^gpr\d{7}$/
 const WAREHOUSE_GLOBAL_ID = /^gwh\d{7}$/
 const LOCATION_GLOBAL_ID = /^gwl\d{7}$/
+const INVENTORY_POOL_GLOBAL_ID = /^gip\d{7}$/
+const RECEIPT_GLOBAL_ID = /^grc\d{7}$/
+const RECEIPT_LINE_GLOBAL_ID = /^grcl\d{7}$/
 const ORDER_STATUSES = new Set<OperationsOrderStatus>([
   'imported', 'validated', 'held', 'promised', 'reserved', 'planned',
   'released', 'picking', 'packed', 'shipped', 'cancelled', 'exception',
@@ -126,6 +133,116 @@ function optionalNumberValue(value: unknown, label: string, minimum: number, max
     requestError('OPERATIONS_REQUEST_INVALID', `${label} must be from ${minimum} to ${maximum}`)
   }
   return parsed
+}
+
+function positiveNumberValue(value: unknown, label: string, maximum = 1_000_000_000): number {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed) || parsed <= 0 || parsed > maximum) {
+    requestError('OPERATIONS_REQUEST_INVALID', `${label} must be greater than zero`)
+  }
+  return parsed
+}
+
+function nonNegativeNumberValue(value: unknown, label: string, maximum = 1_000_000_000): number {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed) || parsed < 0 || parsed > maximum) {
+    requestError('OPERATIONS_REQUEST_INVALID', `${label} must be zero or greater`)
+  }
+  return parsed
+}
+
+function optionalDateTimeValue(value: unknown, label: string): string | null {
+  const raw = textValue(value, label, 50, false)
+  if (!raw) return null
+  const parsed = new Date(raw)
+  if (Number.isNaN(parsed.getTime())) {
+    requestError('OPERATIONS_REQUEST_INVALID', `${label} is invalid`)
+  }
+  return parsed.toISOString()
+}
+
+function inboundReceiptLinesValue(value: unknown): OperationsInboundReceiptInput['lines'] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 100) {
+    requestError('OPERATIONS_REQUEST_INVALID', 'Receipt must include from 1 to 100 lines')
+  }
+  return value.map((entry, index) => {
+    const line = record(entry, 'OPERATIONS_REQUEST_INVALID', `Receipt line ${index + 1}`)
+    assertFields(
+      line,
+      new Set([
+        'productGlobalId',
+        'targetLocationGlobalId',
+        'expectedQuantity',
+        'lotCode',
+        'unitOfMeasure',
+      ]),
+      'OPERATIONS_REQUEST_INVALID',
+      `Receipt line ${index + 1}`,
+    )
+    return {
+      productGlobalId: globalIdValue(
+        line.productGlobalId,
+        `Product on line ${index + 1}`,
+        PRODUCT_GLOBAL_ID,
+      ),
+      targetLocationGlobalId: optionalGlobalIdValue(
+        line.targetLocationGlobalId,
+        `Putaway location on line ${index + 1}`,
+        LOCATION_GLOBAL_ID,
+      ),
+      expectedQuantity: positiveNumberValue(
+        line.expectedQuantity,
+        `Expected quantity on line ${index + 1}`,
+      ),
+      lotCode: textValue(line.lotCode, `Lot on line ${index + 1}`, 120, false),
+      unitOfMeasure: textValue(
+        line.unitOfMeasure || 'each',
+        `Unit of measure on line ${index + 1}`,
+        50,
+      ),
+    }
+  })
+}
+
+function inboundReceiptCompletionLinesValue(
+  value: unknown,
+): OperationsInboundReceiptCompletionInput['lines'] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 100) {
+    requestError(
+      'OPERATIONS_REQUEST_INVALID',
+      'Receiving confirmation must include every receipt line',
+    )
+  }
+  const seen = new Set<string>()
+  return value.map((entry, index) => {
+    const line = record(entry, 'OPERATIONS_REQUEST_INVALID', `Receiving line ${index + 1}`)
+    assertFields(
+      line,
+      new Set(['lineGlobalId', 'acceptedQuantity', 'damagedQuantity']),
+      'OPERATIONS_REQUEST_INVALID',
+      `Receiving line ${index + 1}`,
+    )
+    const lineGlobalId = globalIdValue(
+      line.lineGlobalId,
+      `Receipt line ${index + 1}`,
+      RECEIPT_LINE_GLOBAL_ID,
+    )
+    if (seen.has(lineGlobalId)) {
+      requestError('OPERATIONS_REQUEST_INVALID', 'Receipt line confirmations must be unique')
+    }
+    seen.add(lineGlobalId)
+    return {
+      lineGlobalId,
+      acceptedQuantity: nonNegativeNumberValue(
+        line.acceptedQuantity,
+        `Accepted quantity on line ${index + 1}`,
+      ),
+      damagedQuantity: nonNegativeNumberValue(
+        line.damagedQuantity,
+        `Damaged quantity on line ${index + 1}`,
+      ),
+    }
+  })
 }
 
 function operatingDaysValue(value: unknown): number[] {
@@ -514,6 +631,91 @@ export async function POST(req: NextRequest) {
         actorEmail: actor.email,
         locationGlobalId: globalIdValue(body.locationGlobalId, 'Location', LOCATION_GLOBAL_ID),
         expectedRowVersion: integerValue(body.expectedRowVersion, 'Location version', 0, 2_147_483_647),
+      })
+      return json({ ok: true, capabilities, result })
+    }
+    if (action === 'create-inbound-receipt') {
+      if (!capabilities.canManage || !capabilities.canExecute) {
+        return json({
+          ok: false,
+          error: 'You do not have permission to create inbound receipts',
+          code: 'OPERATIONS_EXECUTE_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set([
+          'action',
+          'warehouseGlobalId',
+          'inventoryPoolGlobalId',
+          'referenceNumber',
+          'expectedAt',
+          'lines',
+        ]),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
+      const result = await createOperationsInboundReceiptInPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        receipt: {
+          warehouseGlobalId: globalIdValue(
+            body.warehouseGlobalId,
+            'Warehouse',
+            WAREHOUSE_GLOBAL_ID,
+          ),
+          inventoryPoolGlobalId: globalIdValue(
+            body.inventoryPoolGlobalId,
+            'Inventory pool',
+            INVENTORY_POOL_GLOBAL_ID,
+          ),
+          referenceNumber: textValue(body.referenceNumber, 'Receipt reference', 120),
+          expectedAt: optionalDateTimeValue(body.expectedAt, 'Expected date'),
+          lines: inboundReceiptLinesValue(body.lines),
+        },
+        idempotencyKey: idempotencyKeyValue(req),
+      })
+      return json({ ok: true, capabilities, result }, result.replayed ? 200 : 201)
+    }
+    if (action === 'complete-inbound-receipt') {
+      if (!capabilities.canManage || !capabilities.canExecute) {
+        return json({
+          ok: false,
+          error: 'You do not have permission to complete inbound receipts',
+          code: 'OPERATIONS_EXECUTE_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set([
+          'action',
+          'receiptGlobalId',
+          'expectedRowVersion',
+          'reason',
+          'lines',
+        ]),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
+      const result = await completeOperationsInboundReceiptInPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        completion: {
+          receiptGlobalId: globalIdValue(
+            body.receiptGlobalId,
+            'Inbound receipt',
+            RECEIPT_GLOBAL_ID,
+          ),
+          expectedRowVersion: integerValue(
+            body.expectedRowVersion,
+            'Receipt version',
+            0,
+            2_147_483_647,
+          ),
+          reason: textValue(body.reason, 'Receiving reason', 500),
+          lines: inboundReceiptCompletionLinesValue(body.lines),
+        },
+        idempotencyKey: idempotencyKeyValue(req),
       })
       return json({ ok: true, capabilities, result })
     }

@@ -37,6 +37,14 @@ As of 2026-07-23, the development environment has completed the bounded Phase 2 
 
 The exception queue deliberately stays separate from Projects tasks. An exception owns operational status and evidence. A later adapter may create or link a Projects task for collaborative work without transferring exception authority to the task module.
 
+### Implemented inbound receiving checkpoint
+
+The first advanced-WMS execution slice now supports expected inbound receipts with multiple product and lot lines, an active warehouse and inventory-ownership pool, optional manual destinations, and automatic capacity-aware putaway. Automatic placement considers only active leaf storage or pick locations. It rejects restricted products, disallowed mixed-product storage, product quantity limits, maximum cubic volume, and maximum weight. It prefers an explicit product-location rule, then an existing location for the same product, then storage over pick locations. **Pick route order is only the final tie-breaker**; it is not customer, order, allocation, or replenishment priority.
+
+Receipt creation and completion are separate idempotent Postgres commands. Completion locks and version-checks the receipt, revalidates the planned location instead of silently rerouting inventory, updates the materialized position, and writes accepted and damaged quantities to the immutable inventory ledger with event and audit evidence. Capacity calculations use product package dimensions and weight normalized by `units_per_package`; a configured capacity fails closed when the package profile is missing or existing contents cannot be measured.
+
+This checkpoint posts canonical inventory units only. Case and pallet conversion remains disabled until a versioned UOM conversion profile exists. Provider ASN import, receiving appointments, partial/short-receipt exception handling, quarantine workflows, lot expiration, serial capture, LPNs, replenishment, and directed picking remain Phase 7 work. Product placement rules are enforced for this receipt-putaway path; they do not yet claim directed replenishment or picking.
+
 ## Delivery Phases
 
 ### Phase 0 - Discovery And Architecture

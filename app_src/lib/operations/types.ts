@@ -805,11 +805,31 @@ export type OperationsInboundReceiptInput = {
   expectedAt: string | null
   lines: Array<{
     productGlobalId: string
-    targetLocationGlobalId: string
+    targetLocationGlobalId?: string | null
     expectedQuantity: number
     lotCode: string
     unitOfMeasure: string
   }>
+}
+
+export type OperationsPutawayPlacement = {
+  lineGlobalId: string
+  productGlobalId: string
+  targetLocationGlobalId: string
+  targetLocationCode: string
+  strategy: 'manual' | 'preferred_rule' | 'same_product' | 'route_order'
+  explanation: string
+  projectedVolumeCubicMeters: number | null
+  projectedWeightKg: number | null
+}
+
+export type OperationsInboundReceiptCreationResult = {
+  receiptGlobalId: string
+  status: 'expected'
+  rowVersion: number
+  expectedQuantity: number
+  placements: OperationsPutawayPlacement[]
+  replayed: boolean
 }
 
 export type OperationsInboundReceiptCompletionInput = {
