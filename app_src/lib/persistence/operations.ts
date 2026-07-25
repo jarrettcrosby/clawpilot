@@ -44,6 +44,8 @@ import type {
   OperationsOrderListItem,
   OperationsOrderStatus,
   OperationsPutawayPlacement,
+  OperationsReplenishmentExecutionInput,
+  OperationsReplenishmentExecutionResult,
   OperationsShipmentCommandResult,
   OperationsWorkspace,
   PricingDirective,
@@ -273,6 +275,25 @@ type InventoryBalanceRow = QueryResultRow & {
   on_hand_quantity: string
   reserved_quantity: string
   damaged_quantity: string
+}
+
+type ReplenishmentExecutionRuleRow = QueryResultRow & {
+  rule_id: string
+  rule_global_id: string
+  replenishment_mode: 'min_max' | 'order_demand'
+  min_quantity: string | null
+  target_quantity: string
+  warehouse_id: string
+  warehouse_global_id: string
+  product_id: string
+  product_name: string
+  product_sku: string | null
+  source_location_id: string
+  source_location_global_id: string
+  source_location_code: string
+  destination_location_id: string
+  destination_location_global_id: string
+  destination_location_code: string
 }
 
 type ExceptionRow = QueryResultRow & {
@@ -2164,39 +2185,21 @@ export async function readOperationsWorkspaceFromPostgres(input: {
               destination.global_id AS destination_location_global_id,
               destination.code AS destination_location_code,
               rule.replenishment_mode,
-              GREATEST(
-                source_position.on_hand_quantity
-                  - source_position.reserved_quantity
-                  - source_position.damaged_quantity,
-                0
-              )::text AS available_at_source,
-              GREATEST(
-                COALESCE(destination_position.on_hand_quantity, 0)
-                  - COALESCE(destination_position.reserved_quantity, 0)
-                  - COALESCE(destination_position.damaged_quantity, 0),
-                0
-              )::text AS available_at_destination,
+              source_balance.available_quantity::text AS available_at_source,
+              COALESCE(destination_balance.available_quantity, 0)::text
+                AS available_at_destination,
               COALESCE(demand.released_demand, 0)::text AS released_demand,
               rule.min_quantity::text,
               rule.target_quantity::text,
               LEAST(
-                GREATEST(
-                  source_position.on_hand_quantity
-                    - source_position.reserved_quantity
-                    - source_position.damaged_quantity,
-                  0
-                ),
+                source_balance.available_quantity,
                 GREATEST(
                   CASE
                     WHEN rule.replenishment_mode = 'order_demand'
                       THEN GREATEST(rule.target_quantity, COALESCE(demand.released_demand, 0))
                     ELSE rule.target_quantity
                   END
-                    - (
-                      COALESCE(destination_position.on_hand_quantity, 0)
-                      - COALESCE(destination_position.reserved_quantity, 0)
-                      - COALESCE(destination_position.damaged_quantity, 0)
-                    ),
+                    - COALESCE(destination_balance.available_quantity, 0),
                   0
                 )
               )::text AS recommended_quantity
@@ -2218,19 +2221,43 @@ export async function readOperationsWorkspaceFromPostgres(input: {
        JOIN crm_products product
          ON product.pipeline_id = rule.pipeline_id
         AND product.id = rule.product_id
-       JOIN operations_inventory_positions source_position
-         ON source_position.organization_id = rule.organization_id
-        AND source_position.location_id = source.id
-        AND source_position.product_id = rule.product_id
+       JOIN LATERAL (
+         SELECT position.pool_id,
+                SUM(GREATEST(
+                  position.on_hand_quantity
+                    - position.reserved_quantity
+                    - position.damaged_quantity,
+                  0
+                )) AS available_quantity
+         FROM operations_inventory_positions position
+         WHERE position.organization_id = rule.organization_id
+           AND position.location_id = source.id
+           AND position.product_id = rule.product_id
+         GROUP BY position.pool_id
+         HAVING SUM(GREATEST(
+           position.on_hand_quantity
+             - position.reserved_quantity
+             - position.damaged_quantity,
+           0
+         )) > 0
+       ) source_balance ON true
        JOIN operations_inventory_pools pool
-         ON pool.organization_id = source_position.organization_id
-        AND pool.id = source_position.pool_id
+         ON pool.organization_id = rule.organization_id
+        AND pool.id = source_balance.pool_id
         AND pool.active = true
-       LEFT JOIN operations_inventory_positions destination_position
-         ON destination_position.organization_id = rule.organization_id
-        AND destination_position.location_id = destination.id
-        AND destination_position.product_id = rule.product_id
-        AND destination_position.pool_id = source_position.pool_id
+       LEFT JOIN LATERAL (
+         SELECT SUM(GREATEST(
+                  position.on_hand_quantity
+                    - position.reserved_quantity
+                    - position.damaged_quantity,
+                  0
+                )) AS available_quantity
+         FROM operations_inventory_positions position
+         WHERE position.organization_id = rule.organization_id
+           AND position.location_id = destination.id
+           AND position.product_id = rule.product_id
+           AND position.pool_id = source_balance.pool_id
+       ) destination_balance ON true
        LEFT JOIN LATERAL (
          SELECT COALESCE(SUM(allocation.quantity), 0) AS released_demand
          FROM operations_fulfillment_allocations allocation
@@ -2249,7 +2276,7 @@ export async function readOperationsWorkspaceFromPostgres(input: {
          JOIN operations_inventory_positions allocation_position
            ON allocation_position.organization_id = allocation.organization_id
           AND allocation_position.id = allocation.position_id
-          AND allocation_position.pool_id = source_position.pool_id
+          AND allocation_position.pool_id = source_balance.pool_id
        ) demand ON true
        WHERE rule.organization_id = $1::uuid
          AND rule.active = true
@@ -2258,26 +2285,14 @@ export async function readOperationsWorkspaceFromPostgres(input: {
          AND (
            (
              rule.replenishment_mode = 'min_max'
-             AND (
-               COALESCE(destination_position.on_hand_quantity, 0)
-               - COALESCE(destination_position.reserved_quantity, 0)
-               - COALESCE(destination_position.damaged_quantity, 0)
-             ) <= rule.min_quantity
+             AND COALESCE(destination_balance.available_quantity, 0) <= rule.min_quantity
            )
            OR (
              rule.replenishment_mode = 'order_demand'
-             AND (
-               COALESCE(destination_position.on_hand_quantity, 0)
-               - COALESCE(destination_position.reserved_quantity, 0)
-               - COALESCE(destination_position.damaged_quantity, 0)
-             ) < GREATEST(rule.target_quantity, COALESCE(demand.released_demand, 0))
+             AND COALESCE(destination_balance.available_quantity, 0)
+               < GREATEST(rule.target_quantity, COALESCE(demand.released_demand, 0))
            )
          )
-         AND (
-           source_position.on_hand_quantity
-           - source_position.reserved_quantity
-           - source_position.damaged_quantity
-         ) > 0
        ORDER BY warehouse.name, destination.pick_sequence, product.name, pool.name`,
       [organizationId],
     ),
@@ -3871,6 +3886,46 @@ function completedInboundReceiptResult(
   }
 }
 
+function completedReplenishmentExecutionResult(
+  receipt: Pick<CommandReceiptRow, 'result_payload'>,
+): OperationsReplenishmentExecutionResult {
+  const payload = receipt.result_payload
+  if (!payload
+    || typeof payload.replenishmentTaskGlobalId !== 'string'
+    || payload.status !== 'completed'
+    || typeof payload.warehouseGlobalId !== 'string'
+    || typeof payload.productGlobalId !== 'string'
+    || typeof payload.inventoryPoolGlobalId !== 'string'
+    || typeof payload.sourceLocationGlobalId !== 'string'
+    || typeof payload.sourceLocationCode !== 'string'
+    || typeof payload.destinationLocationGlobalId !== 'string'
+    || typeof payload.destinationLocationCode !== 'string'
+    || typeof payload.movedQuantity !== 'number'
+    || typeof payload.sourceAvailableAfter !== 'number'
+    || typeof payload.destinationAvailableAfter !== 'number') {
+    throw new OperationsRequestError(
+      'OPERATIONS_COMMAND_RECEIPT_INVALID',
+      'Completed command receipt has no replenishment result',
+      409,
+    )
+  }
+  return {
+    replenishmentTaskGlobalId: payload.replenishmentTaskGlobalId,
+    status: 'completed',
+    warehouseGlobalId: payload.warehouseGlobalId,
+    productGlobalId: payload.productGlobalId,
+    inventoryPoolGlobalId: payload.inventoryPoolGlobalId,
+    sourceLocationGlobalId: payload.sourceLocationGlobalId,
+    sourceLocationCode: payload.sourceLocationCode,
+    destinationLocationGlobalId: payload.destinationLocationGlobalId,
+    destinationLocationCode: payload.destinationLocationCode,
+    movedQuantity: payload.movedQuantity,
+    sourceAvailableAfter: payload.sourceAvailableAfter,
+    destinationAvailableAfter: payload.destinationAvailableAfter,
+    replayed: true,
+  }
+}
+
 async function readPutawayCandidates(
   client: PoolClient,
   input: {
@@ -4629,6 +4684,459 @@ export async function completeOperationsInboundReceiptInPostgres(input: {
         client,
         prepared.receipt.id,
         receipt.global_id,
+        result as unknown as Record<string, unknown>,
+      )
+      return result
+    })
+  } catch (error) {
+    await failCommandReceipt(prepared.receipt.id, error)
+    throw error
+  }
+}
+
+export async function executeOperationsReplenishmentInPostgres(input: {
+  organizationId: string
+  actorEmail: string
+  replenishment: OperationsReplenishmentExecutionInput
+  idempotencyKey: string
+}): Promise<OperationsReplenishmentExecutionResult> {
+  const organizationId = requireOrganizationId(input.organizationId)
+  const normalized: OperationsReplenishmentExecutionInput = {
+    sourceLocationGlobalId: receiptText(
+      input.replenishment.sourceLocationGlobalId,
+      'Replenishment source location',
+      20,
+    ),
+    destinationLocationGlobalId: receiptText(
+      input.replenishment.destinationLocationGlobalId,
+      'Replenishment destination location',
+      20,
+    ),
+    inventoryPoolGlobalId: receiptText(
+      input.replenishment.inventoryPoolGlobalId,
+      'Replenishment inventory pool',
+      20,
+    ),
+    productGlobalId: receiptText(
+      input.replenishment.productGlobalId,
+      'Replenishment product',
+      20,
+    ),
+    quantity: positiveReceiptQuantity(
+      input.replenishment.quantity,
+      'Replenishment quantity',
+    ),
+  }
+  if (normalized.sourceLocationGlobalId === normalized.destinationLocationGlobalId) {
+    throw new OperationsRequestError(
+      'OPERATIONS_REPLENISHMENT_INVALID',
+      'Replenishment source and destination must be different locations',
+    )
+  }
+  const prepared = await prepareCommandReceipt({
+    organizationId,
+    commandType: 'execute_replenishment',
+    idempotencyKey: input.idempotencyKey,
+    requestHash: commandRequestHash(normalized),
+    actorEmail: input.actorEmail,
+  })
+  if (prepared.completed) {
+    return completedReplenishmentExecutionResult(prepared.receipt)
+  }
+
+  try {
+    return await withTransaction(async (client) => {
+      const pipeline = await resolvePipeline(client, organizationId)
+      const product = await resolveProduct(client, pipeline.id, normalized.productGlobalId)
+      const ruleResult = await client.query<ReplenishmentExecutionRuleRow>(
+        `SELECT rule.id::text AS rule_id, rule.global_id AS rule_global_id,
+                rule.replenishment_mode, rule.min_quantity::text,
+                rule.target_quantity::text,
+                warehouse.id::text AS warehouse_id,
+                warehouse.global_id AS warehouse_global_id,
+                product.id::text AS product_id, product.name AS product_name,
+                product.sku AS product_sku,
+                source.id::text AS source_location_id,
+                source.global_id AS source_location_global_id,
+                source.code AS source_location_code,
+                destination.id::text AS destination_location_id,
+                destination.global_id AS destination_location_global_id,
+                destination.code AS destination_location_code
+         FROM operations_location_product_rules rule
+         JOIN operations_locations destination
+           ON destination.organization_id = rule.organization_id
+          AND destination.id = rule.location_id
+          AND destination.active = true
+         JOIN operations_locations source
+           ON source.organization_id = rule.organization_id
+          AND source.id = rule.replenishment_source_location_id
+          AND source.active = true
+         JOIN operations_warehouses warehouse
+           ON warehouse.organization_id = rule.organization_id
+          AND warehouse.id = destination.warehouse_id
+          AND warehouse.id = source.warehouse_id
+          AND warehouse.status = 'active'
+          AND warehouse.code <> 'MOCK-01'
+         JOIN crm_products product
+           ON product.pipeline_id = rule.pipeline_id
+          AND product.id = rule.product_id
+          AND product.active = true
+         WHERE rule.organization_id = $1::uuid
+           AND rule.pipeline_id = $2::uuid
+           AND rule.active = true
+           AND rule.replenishment_mode IN ('min_max', 'order_demand')
+           AND rule.target_quantity IS NOT NULL
+           AND source.global_id = $3
+           AND destination.global_id = $4
+           AND product.reference_code = $5
+         LIMIT 1
+         FOR UPDATE OF rule, source, destination, warehouse`,
+        [
+          organizationId,
+          pipeline.id,
+          normalized.sourceLocationGlobalId,
+          normalized.destinationLocationGlobalId,
+          normalized.productGlobalId,
+        ],
+      )
+      const rule = ruleResult.rows[0]
+      if (!rule) {
+        throw new OperationsRequestError(
+          'OPERATIONS_REPLENISHMENT_RULE_NOT_FOUND',
+          'The active replenishment rule is no longer available; refresh warehouse setup',
+          409,
+        )
+      }
+      const poolResult = await client.query<InventoryPoolRow>(
+        `SELECT pool.id::text, pool.global_id, pool.name, pool.pool_type,
+                pool.allocation_policy, pool.active,
+                owner.reference_code AS owner_customer_global_id,
+                owner.name AS owner_customer_name
+         FROM operations_inventory_pools pool
+         LEFT JOIN crm_organizations owner
+           ON owner.pipeline_id = pool.pipeline_id AND owner.id = pool.owner_customer_id
+         WHERE pool.organization_id = $1::uuid
+           AND pool.global_id = $2
+           AND pool.active = true
+         LIMIT 1`,
+        [organizationId, normalized.inventoryPoolGlobalId],
+      )
+      const pool = poolResult.rows[0]
+      if (!pool) {
+        throw new OperationsRequestError(
+          'OPERATIONS_INVENTORY_POOL_INACTIVE',
+          'The replenishment inventory pool is no longer active',
+          409,
+        )
+      }
+      await acquireTransactionAdvisoryLock(
+        client,
+        `operations:replenishment:${organizationId}:${rule.warehouse_id}:${product.id}:${pool.id}`,
+      )
+      const sourceResult = await client.query<InventoryBalanceRow & { lot_code: string }>(
+        `SELECT id::text, global_id, lot_code, on_hand_quantity::text,
+                reserved_quantity::text, damaged_quantity::text
+         FROM operations_inventory_positions
+         WHERE organization_id = $1::uuid
+           AND warehouse_id = $2::uuid
+           AND location_id = $3::uuid
+           AND pool_id = $4::uuid
+           AND product_id = $5::uuid
+         ORDER BY lot_code, id
+         FOR UPDATE`,
+        [
+          organizationId,
+          rule.warehouse_id,
+          rule.source_location_id,
+          pool.id,
+          product.id,
+        ],
+      )
+      const destinationResult = await client.query<InventoryBalanceRow & { lot_code: string }>(
+        `SELECT id::text, global_id, lot_code, on_hand_quantity::text,
+                reserved_quantity::text, damaged_quantity::text
+         FROM operations_inventory_positions
+         WHERE organization_id = $1::uuid
+           AND warehouse_id = $2::uuid
+           AND location_id = $3::uuid
+           AND pool_id = $4::uuid
+           AND product_id = $5::uuid
+         ORDER BY lot_code, id
+         FOR UPDATE`,
+        [
+          organizationId,
+          rule.warehouse_id,
+          rule.destination_location_id,
+          pool.id,
+          product.id,
+        ],
+      )
+      const availableAtSource = sourceResult.rows.reduce(
+        (sum, position) => sum + Math.max(
+          numberValue(position.on_hand_quantity)
+            - numberValue(position.reserved_quantity)
+            - numberValue(position.damaged_quantity),
+          0,
+        ),
+        0,
+      )
+      const availableAtDestination = destinationResult.rows.reduce(
+        (sum, position) => sum + Math.max(
+          numberValue(position.on_hand_quantity)
+            - numberValue(position.reserved_quantity)
+            - numberValue(position.damaged_quantity),
+          0,
+        ),
+        0,
+      )
+      const demandResult = await client.query<{ released_demand: string }>(
+        `SELECT COALESCE(SUM(allocation.quantity), 0)::text AS released_demand
+         FROM operations_fulfillment_allocations allocation
+         JOIN operations_fulfillment_plans plan
+           ON plan.organization_id = allocation.organization_id
+          AND plan.id = allocation.plan_id
+          AND plan.warehouse_id = $2::uuid
+         JOIN operations_orders demand_order
+           ON demand_order.organization_id = plan.organization_id
+          AND demand_order.id = plan.order_id
+          AND demand_order.status IN ('planned', 'released', 'picking')
+         JOIN operations_order_lines demand_line
+           ON demand_line.organization_id = allocation.organization_id
+          AND demand_line.id = allocation.order_line_id
+          AND demand_line.product_id = $3::uuid
+         JOIN operations_inventory_positions allocation_position
+           ON allocation_position.organization_id = allocation.organization_id
+          AND allocation_position.id = allocation.position_id
+          AND allocation_position.pool_id = $4::uuid
+         WHERE allocation.organization_id = $1::uuid`,
+        [organizationId, rule.warehouse_id, product.id, pool.id],
+      )
+      const releasedDemand = numberValue(demandResult.rows[0]?.released_demand)
+      const targetQuantity = rule.replenishment_mode === 'order_demand'
+        ? Math.max(numberValue(rule.target_quantity), releasedDemand)
+        : numberValue(rule.target_quantity)
+      const triggerActive = rule.replenishment_mode === 'min_max'
+        ? availableAtDestination <= numberValue(rule.min_quantity)
+        : availableAtDestination < targetQuantity
+      const recommendedQuantity = triggerActive
+        ? Math.min(availableAtSource, Math.max(targetQuantity - availableAtDestination, 0))
+        : 0
+      if (normalized.quantity > recommendedQuantity + 0.000001) {
+        throw new OperationsRequestError(
+          'OPERATIONS_REPLENISHMENT_STALE',
+          'Inventory or demand changed; refresh the recommendation before moving stock',
+          409,
+        )
+      }
+      await selectPutawayPlacement(client, {
+        organizationId,
+        pipelineId: pipeline.id,
+        warehouseId: rule.warehouse_id,
+        product,
+        quantity: normalized.quantity,
+        requestedLocationGlobalId: rule.destination_location_global_id,
+      })
+      const recommendationSnapshot = {
+        ruleGlobalId: rule.rule_global_id,
+        replenishmentMode: rule.replenishment_mode,
+        availableAtSource,
+        availableAtDestination,
+        releasedDemand,
+        minQuantity: rule.min_quantity === null ? null : numberValue(rule.min_quantity),
+        targetQuantity: numberValue(rule.target_quantity),
+        calculatedTargetQuantity: targetQuantity,
+        recommendedQuantity,
+      }
+      const taskResult = await client.query<{ id: string; global_id: string }>(
+        `INSERT INTO operations_replenishment_tasks (
+           organization_id, pipeline_id, warehouse_id, inventory_pool_id,
+           product_id, source_location_id, destination_location_id,
+           quantity, replenishment_mode, recommendation_snapshot, status,
+           idempotency_key, created_by, completed_by, completed_at
+         ) VALUES (
+           $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6::uuid, $7::uuid,
+           $8, $9, $10::jsonb, 'completed', $11, $12, $12, now()
+         )
+         RETURNING id::text, global_id`,
+        [
+          organizationId,
+          pipeline.id,
+          rule.warehouse_id,
+          pool.id,
+          product.id,
+          rule.source_location_id,
+          rule.destination_location_id,
+          normalized.quantity,
+          rule.replenishment_mode,
+          JSON.stringify(recommendationSnapshot),
+          input.idempotencyKey,
+          input.actorEmail,
+        ],
+      )
+      const task = taskResult.rows[0]
+      let remaining = normalized.quantity
+      let movementIndex = 0
+      for (const sourcePosition of sourceResult.rows) {
+        if (remaining <= 0.000001) break
+        const sourceAvailable = Math.max(
+          numberValue(sourcePosition.on_hand_quantity)
+            - numberValue(sourcePosition.reserved_quantity)
+            - numberValue(sourcePosition.damaged_quantity),
+          0,
+        )
+        const movedQuantity = Math.min(sourceAvailable, remaining)
+        if (movedQuantity <= 0.000001) continue
+        movementIndex += 1
+        const sourceOnHandAfter = numberValue(sourcePosition.on_hand_quantity) - movedQuantity
+        const sourceReservedAfter = numberValue(sourcePosition.reserved_quantity)
+        const sourceDamagedAfter = numberValue(sourcePosition.damaged_quantity)
+        await client.query(
+          `UPDATE operations_inventory_positions
+           SET on_hand_quantity = $3, version = version + 1, updated_at = now()
+           WHERE organization_id = $1::uuid AND id = $2::uuid`,
+          [organizationId, sourcePosition.id, sourceOnHandAfter],
+        )
+        await client.query(
+          `INSERT INTO operations_inventory_ledger (
+             organization_id, position_id, event_type,
+             on_hand_delta, reserved_delta, damaged_delta,
+             on_hand_after, reserved_after, damaged_after,
+             source_global_id, reason, idempotency_key, actor_email
+           ) VALUES (
+             $1::uuid, $2::uuid, 'replenishment_out',
+             $3, 0, 0, $4, $5, $6, $7, $8, $9, $10
+           )`,
+          [
+            organizationId,
+            sourcePosition.id,
+            -movedQuantity,
+            sourceOnHandAfter,
+            sourceReservedAfter,
+            sourceDamagedAfter,
+            task.global_id,
+            `Move to ${rule.destination_location_code}`,
+            `${task.global_id}:${movementIndex}:out`,
+            input.actorEmail,
+          ],
+        )
+        const destinationInsert = await client.query<{ id: string; global_id: string }>(
+          `INSERT INTO operations_inventory_positions (
+             organization_id, pipeline_id, warehouse_id, location_id, pool_id,
+             product_id, lot_code
+           ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6::uuid, $7)
+           ON CONFLICT (
+             organization_id, warehouse_id, location_id, pool_id, product_id, lot_code
+           ) DO UPDATE SET updated_at = operations_inventory_positions.updated_at
+           RETURNING id::text, global_id`,
+          [
+            organizationId,
+            pipeline.id,
+            rule.warehouse_id,
+            rule.destination_location_id,
+            pool.id,
+            product.id,
+            sourcePosition.lot_code,
+          ],
+        )
+        const destinationPositionResult = await client.query<InventoryBalanceRow>(
+          `SELECT id::text, global_id, on_hand_quantity::text,
+                  reserved_quantity::text, damaged_quantity::text
+           FROM operations_inventory_positions
+           WHERE organization_id = $1::uuid AND id = $2::uuid
+           FOR UPDATE`,
+          [organizationId, destinationInsert.rows[0].id],
+        )
+        const destinationPosition = destinationPositionResult.rows[0]
+        const destinationOnHandAfter = numberValue(destinationPosition.on_hand_quantity)
+          + movedQuantity
+        const destinationReservedAfter = numberValue(destinationPosition.reserved_quantity)
+        const destinationDamagedAfter = numberValue(destinationPosition.damaged_quantity)
+        await client.query(
+          `UPDATE operations_inventory_positions
+           SET on_hand_quantity = $3, version = version + 1, updated_at = now()
+           WHERE organization_id = $1::uuid AND id = $2::uuid`,
+          [organizationId, destinationPosition.id, destinationOnHandAfter],
+        )
+        await client.query(
+          `INSERT INTO operations_inventory_ledger (
+             organization_id, position_id, event_type,
+             on_hand_delta, reserved_delta, damaged_delta,
+             on_hand_after, reserved_after, damaged_after,
+             source_global_id, reason, idempotency_key, actor_email
+           ) VALUES (
+             $1::uuid, $2::uuid, 'replenishment_in',
+             $3, 0, 0, $4, $5, $6, $7, $8, $9, $10
+           )`,
+          [
+            organizationId,
+            destinationPosition.id,
+            movedQuantity,
+            destinationOnHandAfter,
+            destinationReservedAfter,
+            destinationDamagedAfter,
+            task.global_id,
+            `Move from ${rule.source_location_code}`,
+            `${task.global_id}:${movementIndex}:in`,
+            input.actorEmail,
+          ],
+        )
+        remaining -= movedQuantity
+      }
+      if (remaining > 0.000001) {
+        throw new OperationsRequestError(
+          'OPERATIONS_REPLENISHMENT_INVENTORY_CONFLICT',
+          'Available source inventory changed before the move completed',
+          409,
+        )
+      }
+      const result: OperationsReplenishmentExecutionResult = {
+        replenishmentTaskGlobalId: task.global_id,
+        status: 'completed',
+        warehouseGlobalId: rule.warehouse_global_id,
+        productGlobalId: product.reference_code,
+        inventoryPoolGlobalId: pool.global_id,
+        sourceLocationGlobalId: rule.source_location_global_id,
+        sourceLocationCode: rule.source_location_code,
+        destinationLocationGlobalId: rule.destination_location_global_id,
+        destinationLocationCode: rule.destination_location_code,
+        movedQuantity: normalized.quantity,
+        sourceAvailableAfter: availableAtSource - normalized.quantity,
+        destinationAvailableAfter: availableAtDestination + normalized.quantity,
+        replayed: false,
+      }
+      await appendDomainEvent(client, {
+        organizationId,
+        aggregateType: 'operations.replenishment_task',
+        aggregateId: task.id,
+        aggregateGlobalId: task.global_id,
+        eventType: 'operations.replenishment.completed',
+        actorEmail: input.actorEmail,
+        correlationId: prepared.receipt.correlation_id,
+        idempotencyKey: `${task.global_id}:completed`,
+        payload: {
+          ...result,
+          ruleGlobalId: rule.rule_global_id,
+          recommendationSnapshot,
+        },
+      })
+      await recordAuditEvent({
+        actor: input.actorEmail,
+        eventType: 'operations.replenishment.completed',
+        aggregateType: 'operations.replenishment_task',
+        aggregateId: task.global_id,
+        subject: `${product.name}: ${rule.source_location_code} to ${rule.destination_location_code}`,
+        organizationId,
+        eventKey: `operations:replenishment:${task.global_id}:completed`,
+        payload: {
+          ...result,
+          ruleGlobalId: rule.rule_global_id,
+          recommendationSnapshot,
+        },
+      }, client)
+      await completeCommandReceipt(
+        client,
+        prepared.receipt.id,
+        task.global_id,
         result as unknown as Record<string, unknown>,
       )
       return result
