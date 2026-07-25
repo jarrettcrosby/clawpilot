@@ -44,7 +44,9 @@ type Location = Warehouse['locations'][number]
 type FacilityType = Warehouse['facilityType']
 type LocationType = Location['locationType']
 type TopologyLevel = Location['topologyLevel']
+type StorageFunction = Location['storageFunction']
 type ProductRule = Location['productRules'][number]
+type ReplenishmentMode = ProductRule['replenishmentMode']
 type MeasurementSystem = 'imperial' | 'metric'
 
 type WarehouseForm = {
@@ -58,6 +60,8 @@ type WarehouseForm = {
   closesAt: string
   standardProcessingMinutes: number
   dailyOrderCapacity: string
+  upsCutoff: string
+  fedexCutoff: string
   line1: string
   line2: string
   city: string
@@ -73,6 +77,7 @@ type LocationForm = {
   zone: string
   locationType: LocationType
   topologyLevel: TopologyLevel
+  storageFunction: StorageFunction
   parentLocationGlobalId: string
   pickSequence: number
   active: boolean
@@ -86,6 +91,10 @@ type LocationForm = {
     productName: string
     ruleType: ProductRule['ruleType']
     maxQuantity: string
+    replenishmentMode: ReplenishmentMode
+    replenishmentSourceLocationGlobalId: string
+    minQuantity: string
+    targetQuantity: string
   }>
 }
 
@@ -163,6 +172,22 @@ const topologyLevels: Array<{ value: TopologyLevel; label: string }> = [
   { value: 'station', label: 'Work station' },
 ]
 
+const storageFunctions: Array<{ value: StorageFunction; label: string; description: string }> = [
+  { value: 'work_area', label: 'Work area', description: 'Non-storage work point such as receiving, packing, or shipping.' },
+  { value: 'reserve', label: 'Reserve storage', description: 'Case, pallet, or overflow inventory that supplies forward pick locations.' },
+  { value: 'bulk', label: 'Bulk storage', description: 'High-volume reserve inventory held outside active pick faces.' },
+  { value: 'forward_pick', label: 'Forward pick face', description: 'Primary each- or case-pick location replenished from reserve.' },
+  { value: 'mezzanine_pick', label: 'Mezzanine pick face', description: 'Forward pick location on a mezzanine or elevated pick module.' },
+  { value: 'flow_rack', label: 'Flow rack', description: 'High-velocity forward pick location designed for frequent replenishment.' },
+  { value: 'staging', label: 'Staging', description: 'Temporary inbound, outbound, transfer, or exception holding area.' },
+]
+
+const replenishmentModes: Array<{ value: ReplenishmentMode; label: string; description: string }> = [
+  { value: 'disabled', label: 'No replenishment', description: 'Do not produce replenishment recommendations for this product and location.' },
+  { value: 'min_max', label: 'Min / target', description: 'Recommend stock when the pick face falls below minimum, up to the target.' },
+  { value: 'order_demand', label: 'Released order demand', description: 'Recommend stock when released demand exceeds available pick-face inventory.' },
+]
+
 const defaultZones = ['INBOUND', 'STORAGE', 'FULFILLMENT', 'OUTBOUND', 'RETURNS', 'QUARANTINE']
 const CUBIC_FEET_PER_CUBIC_METER = 35.3146667
 const POUNDS_PER_KILOGRAM = 2.20462262
@@ -178,6 +203,8 @@ const initialWarehouse: WarehouseForm = {
   closesAt: '17:00',
   standardProcessingMinutes: 120,
   dailyOrderCapacity: '',
+  upsCutoff: '21:00',
+  fedexCutoff: '21:00',
   line1: '',
   line2: '',
   city: '',
@@ -193,6 +220,7 @@ const initialLocation: LocationForm = {
   zone: 'STORAGE',
   locationType: 'storage',
   topologyLevel: 'bin',
+  storageFunction: 'reserve',
   parentLocationGlobalId: '',
   pickSequence: 100,
   active: true,
@@ -216,6 +244,8 @@ function warehouseForm(item: Warehouse): WarehouseForm {
     closesAt: item.closesAt.slice(0, 5),
     standardProcessingMinutes: item.standardProcessingMinutes,
     dailyOrderCapacity: item.dailyOrderCapacity === null ? '' : String(item.dailyOrderCapacity),
+    upsCutoff: item.carrierCutoffs.UPS || '',
+    fedexCutoff: item.carrierCutoffs.FEDEX || '',
     line1: item.address.line1,
     line2: item.address.line2 || '',
     city: item.address.city,
@@ -233,6 +263,7 @@ function locationForm(item: Location): LocationForm {
     zone: item.zone,
     locationType: item.locationType,
     topologyLevel: item.topologyLevel,
+    storageFunction: item.storageFunction,
     parentLocationGlobalId: item.parentLocationGlobalId || '',
     pickSequence: item.pickSequence,
     active: item.active,
@@ -252,6 +283,10 @@ function locationForm(item: Location): LocationForm {
         productName: rule.productName,
         ruleType: rule.ruleType,
         maxQuantity: rule.maxQuantity === null ? '' : String(rule.maxQuantity),
+        replenishmentMode: rule.replenishmentMode,
+        replenishmentSourceLocationGlobalId: rule.replenishmentSourceLocationGlobalId || '',
+        minQuantity: rule.minQuantity === null ? '' : String(rule.minQuantity),
+        targetQuantity: rule.targetQuantity === null ? '' : String(rule.targetQuantity),
       })),
   }
 }
@@ -302,7 +337,8 @@ function warehouseReadiness(item: Warehouse) {
         && item.standardProcessingMinutes >= 0,
     },
     { label: 'Receiving', ready: activeLocations.some((location) => location.locationType === 'receiving') },
-    { label: 'Storage or picking', ready: activeLocations.some((location) => ['storage', 'pick'].includes(location.locationType)) },
+    { label: 'Reserve or bulk storage', ready: activeLocations.some((location) => ['reserve', 'bulk'].includes(location.storageFunction)) },
+    { label: 'Forward picking', ready: activeLocations.some((location) => ['forward_pick', 'mezzanine_pick', 'flow_rack'].includes(location.storageFunction)) },
     { label: 'Packing', ready: activeLocations.some((location) => location.locationType === 'pack') },
     { label: 'Outbound staging or shipping', ready: activeLocations.some((location) => ['staging', 'shipping'].includes(location.locationType)) },
   ]
@@ -387,6 +423,14 @@ export default function WarehouseSetupPanel({ workspace, onRefresh, onNavigate }
     ])).sort(),
     [locationWarehouse],
   )
+  const replenishmentSourceOptions = useMemo(
+    () => (locationWarehouse?.locations || []).filter((item) => (
+      item.active
+      && item.globalId !== editingLocation?.globalId
+      && ['reserve', 'bulk'].includes(item.storageFunction)
+    )),
+    [editingLocation?.globalId, locationWarehouse],
+  )
 
   function openWarehouse(item: Warehouse | 'new') {
     setWarehouseEditor(item)
@@ -429,6 +473,10 @@ export default function WarehouseSetupPanel({ workspace, onRefresh, onNavigate }
         closesAt: warehouse.closesAt,
         standardProcessingMinutes: warehouse.standardProcessingMinutes,
         dailyOrderCapacity: warehouse.dailyOrderCapacity ? Number(warehouse.dailyOrderCapacity) : null,
+        carrierCutoffs: {
+          ...(warehouse.upsCutoff ? { UPS: warehouse.upsCutoff } : {}),
+          ...(warehouse.fedexCutoff ? { FEDEX: warehouse.fedexCutoff } : {}),
+        },
         address: {
           name: warehouse.name,
           line1: warehouse.line1,
@@ -469,6 +517,7 @@ export default function WarehouseSetupPanel({ workspace, onRefresh, onNavigate }
         zone: location.zone,
         locationType: location.locationType,
         topologyLevel: location.topologyLevel,
+        storageFunction: location.storageFunction,
         parentLocationGlobalId: location.parentLocationGlobalId || null,
         pickSequence: location.pickSequence,
         active: location.active,
@@ -484,6 +533,16 @@ export default function WarehouseSetupPanel({ workspace, onRefresh, onNavigate }
           productGlobalId: rule.productGlobalId,
           ruleType: rule.ruleType,
           maxQuantity: rule.maxQuantity ? Number(rule.maxQuantity) : null,
+          replenishmentMode: rule.replenishmentMode,
+          replenishmentSourceLocationGlobalId: rule.replenishmentMode === 'disabled'
+            ? null
+            : rule.replenishmentSourceLocationGlobalId || null,
+          minQuantity: rule.replenishmentMode === 'disabled' || !rule.minQuantity
+            ? null
+            : Number(rule.minQuantity),
+          targetQuantity: rule.replenishmentMode === 'disabled' || !rule.targetQuantity
+            ? null
+            : Number(rule.targetQuantity),
         })),
       })
       setLocationEditor(null)
@@ -529,6 +588,10 @@ export default function WarehouseSetupPanel({ workspace, onRefresh, onNavigate }
         productName: product.name,
         ruleType,
         maxQuantity: '',
+        replenishmentMode: 'disabled',
+        replenishmentSourceLocationGlobalId: '',
+        minQuantity: '',
+        targetQuantity: '',
       }],
     })
     setRuleProductGlobalId('')
@@ -597,6 +660,50 @@ export default function WarehouseSetupPanel({ workspace, onRefresh, onNavigate }
         <Button variant="outlined" onClick={() => onNavigate('gl-coding')}>Import carrier billing</Button>
       </Stack>
 
+      {Boolean(workspace?.replenishmentRecommendations.length) && (
+        <Box sx={{ mt: 2, borderTop: 1, borderBottom: 1, borderColor: 'divider', py: 1.5 }}>
+          <Stack direction={{ xs: 'column', sm: 'row' }} justifyContent="space-between" gap={0.75}>
+            <Box>
+              <Typography fontWeight={700}>Replenishment recommendations</Typography>
+              <Typography variant="body2" color="text.secondary">
+                Forward-pick shortages calculated within the same inventory owner and pool. Recommendations do not move stock until an operator creates and confirms replenishment work.
+              </Typography>
+            </Box>
+            <Chip
+              label={`${workspace?.replenishmentRecommendations.length || 0} ready`}
+              color="warning"
+              variant="outlined"
+              sx={{ alignSelf: { xs: 'flex-start', sm: 'center' } }}
+            />
+          </Stack>
+          <Stack divider={<Divider flexItem />} sx={{ mt: 1 }}>
+            {workspace?.replenishmentRecommendations.map((recommendation) => (
+              <Stack
+                key={`${recommendation.inventoryPoolGlobalId}:${recommendation.productGlobalId}:${recommendation.destinationLocationGlobalId}`}
+                direction={{ xs: 'column', sm: 'row' }}
+                justifyContent="space-between"
+                gap={0.75}
+                sx={{ py: 1 }}
+              >
+                <Box>
+                  <Typography fontWeight={650}>{recommendation.productName}</Typography>
+                  <Typography variant="caption" color="text.secondary">
+                    {recommendation.warehouseName} · {recommendation.sourceLocationCode} → {recommendation.destinationLocationCode} · {recommendation.inventoryPoolName}
+                  </Typography>
+                </Box>
+                <Stack direction="row" gap={0.75} alignItems="center" flexWrap="wrap">
+                  <Chip size="small" label={replenishmentModes.find((mode) => mode.value === recommendation.replenishmentMode)?.label || recommendation.replenishmentMode} />
+                  {recommendation.replenishmentMode === 'order_demand' && (
+                    <Chip size="small" variant="outlined" label={`${recommendation.releasedDemand.toLocaleString()} units demand`} />
+                  )}
+                  <Chip size="small" color="warning" variant="outlined" label={`Move ${recommendation.recommendedQuantity.toLocaleString()}`} />
+                </Stack>
+              </Stack>
+            ))}
+          </Stack>
+        </Box>
+      )}
+
       <Stack divider={<Divider flexItem />} sx={{ mt: 2 }}>
         {workspace?.warehouses.map((item) => {
           const readiness = warehouseReadiness(item)
@@ -621,6 +728,13 @@ export default function WarehouseSetupPanel({ workspace, onRefresh, onNavigate }
                     {' · '}{item.standardProcessingMinutes} min standard processing
                     {item.dailyOrderCapacity ? ` · ${item.dailyOrderCapacity.toLocaleString()} orders/day planning capacity` : ''}
                   </Typography>
+                  {Object.keys(item.carrierCutoffs).length > 0 && (
+                    <Typography variant="caption" color="text.secondary" display="block">
+                      Carrier cutoffs: {Object.entries(item.carrierCutoffs)
+                        .map(([provider, cutoff]) => `${provider} ${cutoff}`)
+                        .join(' · ')}
+                    </Typography>
+                  )}
                 </Box>
               </Stack>
               <Stack direction="row" gap={0.5}>
@@ -685,12 +799,21 @@ export default function WarehouseSetupPanel({ workspace, onRefresh, onNavigate }
                         <Typography fontWeight={650}>{entry.code}</Typography>
                         <Chip size="small" label={entry.topologyLevel} variant="outlined" />
                         <Chip size="small" label={entry.locationType} />
+                        <Chip
+                          size="small"
+                          label={storageFunctions.find((item) => item.value === entry.storageFunction)?.label || entry.storageFunction}
+                          color={['forward_pick', 'mezzanine_pick', 'flow_rack'].includes(entry.storageFunction) ? 'primary' : 'default'}
+                          variant="outlined"
+                        />
                         {!entry.active && <Chip size="small" label="retired" color="warning" />}
                       </Stack>
                       <Typography variant="caption" color="text.secondary">
                         {entry.zone} · pick route {entry.pickSequence} · {entry.globalId}
                         {entry.productRules.filter((rule) => rule.active).length
                           ? ` · ${entry.productRules.filter((rule) => rule.active).length} product rule${entry.productRules.filter((rule) => rule.active).length === 1 ? '' : 's'}`
+                          : ''}
+                        {entry.productRules.filter((rule) => rule.active && rule.replenishmentMode !== 'disabled').length
+                          ? ` · ${entry.productRules.filter((rule) => rule.active && rule.replenishmentMode !== 'disabled').length} replenished`
                           : ''}
                         {!entry.allowMixedProducts ? ' · single product only' : ''}
                       </Typography>
@@ -797,6 +920,26 @@ export default function WarehouseSetupPanel({ workspace, onRefresh, onNavigate }
                   fullWidth
                 />
               </Stack>
+              <Stack direction={{ xs: 'column', sm: 'row' }} gap={1.5}>
+                <TextField
+                  label="UPS trailer cutoff"
+                  type="time"
+                  value={warehouse.upsCutoff}
+                  onChange={(e) => setWarehouse({ ...warehouse, upsCutoff: e.target.value })}
+                  helperText="Local dock cutoff used for UPS planning."
+                  InputLabelProps={{ shrink: true }}
+                  fullWidth
+                />
+                <TextField
+                  label="FedEx trailer cutoff"
+                  type="time"
+                  value={warehouse.fedexCutoff}
+                  onChange={(e) => setWarehouse({ ...warehouse, fedexCutoff: e.target.value })}
+                  helperText="Local dock cutoff used for FedEx planning."
+                  InputLabelProps={{ shrink: true }}
+                  fullWidth
+                />
+              </Stack>
               <Divider />
               <Box>
                 <Typography fontWeight={700}>Operating profile</Typography>
@@ -867,7 +1010,7 @@ export default function WarehouseSetupPanel({ workspace, onRefresh, onNavigate }
                 />
               </Stack>
               <Alert severity="info">
-                These versioned facility inputs support readiness and upcoming promise and capacity planning. Pick route order already controls released wave task traversal; automated throughput scheduling is not yet enabled.
+                Facility and carrier cutoffs are stored in local warehouse time for promise and wave planning. Pick route order controls released task traversal; throughput scheduling remains a later optimization step.
               </Alert>
               {!editingWarehouse && (
                 <Stack direction="row" justifyContent="space-between" alignItems="center">
@@ -918,6 +1061,18 @@ export default function WarehouseSetupPanel({ workspace, onRefresh, onNavigate }
                   fullWidth
                 >
                   {locationTypes.map((type) => <MenuItem key={type.value} value={type.value}>{type.label}</MenuItem>)}
+                </TextField>
+              </Stack>
+              <Stack direction={{ xs: 'column', sm: 'row' }} gap={1.5}>
+                <TextField
+                  select
+                  label="Storage function"
+                  value={location.storageFunction}
+                  onChange={(e) => setLocation({ ...location, storageFunction: e.target.value as StorageFunction })}
+                  helperText={storageFunctions.find((item) => item.value === location.storageFunction)?.description}
+                  fullWidth
+                >
+                  {storageFunctions.map((item) => <MenuItem key={item.value} value={item.value}>{item.label}</MenuItem>)}
                 </TextField>
                 <TextField
                   select
@@ -1007,7 +1162,7 @@ export default function WarehouseSetupPanel({ workspace, onRefresh, onNavigate }
                 </Typography>
               </Box>
               <Alert severity="info">
-                Placement rules and capacity are visible planning controls. Automated receiving and directed-putaway enforcement remain a later WMS execution step.
+                Placement rules and capacity influence directed putaway. Replenishment is recommendation-only in this slice: operators review the proposed source, destination, pool, and quantity before stock is moved.
               </Alert>
               <Stack direction={{ xs: 'column', sm: 'row' }} gap={1}>
                 <Autocomplete
@@ -1027,43 +1182,125 @@ export default function WarehouseSetupPanel({ workspace, onRefresh, onNavigate }
               </Stack>
               <Stack divider={<Divider flexItem />}>
                 {location.productRules.map((rule, index) => (
-                  <Stack key={rule.productGlobalId} direction={{ xs: 'column', sm: 'row' }} gap={1} alignItems={{ sm: 'center' }} sx={{ py: 1 }}>
-                    <Typography sx={{ flex: 1 }} fontWeight={600}>{rule.productName}</Typography>
-                    <TextField
-                      select
-                      size="small"
-                      label="Rule"
-                      value={rule.ruleType}
-                      onChange={(e) => {
-                        const next = [...location.productRules]
-                        next[index] = { ...rule, ruleType: e.target.value as ProductRule['ruleType'] }
-                        setLocation({ ...location, productRules: next })
-                      }}
-                      sx={{ minWidth: 145 }}
-                    >
-                      <MenuItem value="allowed">Allowed</MenuItem>
-                      <MenuItem value="preferred">Preferred</MenuItem>
-                      <MenuItem value="restricted">Restricted</MenuItem>
-                    </TextField>
-                    <TextField
-                      size="small"
-                      type="number"
-                      label="Max quantity"
-                      value={rule.maxQuantity}
-                      onChange={(e) => {
-                        const next = [...location.productRules]
-                        next[index] = { ...rule, maxQuantity: e.target.value }
-                        setLocation({ ...location, productRules: next })
-                      }}
-                      inputProps={{ min: 0.000001, step: 'any' }}
-                      sx={{ width: { sm: 150 } }}
-                    />
-                    <Tooltip title="Remove product rule">
-                      <IconButton type="button" onClick={() => setLocation({ ...location, productRules: location.productRules.filter((_, ruleIndex) => ruleIndex !== index) })}>
-                        <DeleteOutlineRounded />
-                      </IconButton>
-                    </Tooltip>
-                  </Stack>
+                  <Box key={rule.productGlobalId} sx={{ py: 1.25 }}>
+                    <Stack direction={{ xs: 'column', sm: 'row' }} gap={1} alignItems={{ sm: 'center' }}>
+                      <Typography sx={{ flex: 1 }} fontWeight={600}>{rule.productName}</Typography>
+                      <TextField
+                        select
+                        size="small"
+                        label="Placement"
+                        value={rule.ruleType}
+                        onChange={(e) => {
+                          const next = [...location.productRules]
+                          next[index] = { ...rule, ruleType: e.target.value as ProductRule['ruleType'] }
+                          setLocation({ ...location, productRules: next })
+                        }}
+                        sx={{ minWidth: 145 }}
+                      >
+                        <MenuItem value="allowed">Allowed</MenuItem>
+                        <MenuItem value="preferred">Preferred</MenuItem>
+                        <MenuItem value="restricted">Restricted</MenuItem>
+                      </TextField>
+                      <TextField
+                        size="small"
+                        type="number"
+                        label="Maximum"
+                        value={rule.maxQuantity}
+                        onChange={(e) => {
+                          const next = [...location.productRules]
+                          next[index] = { ...rule, maxQuantity: e.target.value }
+                          setLocation({ ...location, productRules: next })
+                        }}
+                        inputProps={{ min: 0.000001, step: 'any' }}
+                        sx={{ width: { sm: 140 } }}
+                      />
+                      <Tooltip title="Remove product rule">
+                        <IconButton type="button" onClick={() => setLocation({ ...location, productRules: location.productRules.filter((_, ruleIndex) => ruleIndex !== index) })}>
+                          <DeleteOutlineRounded />
+                        </IconButton>
+                      </Tooltip>
+                    </Stack>
+                    <Stack direction={{ xs: 'column', sm: 'row' }} gap={1} sx={{ mt: 1 }}>
+                      <TextField
+                        select
+                        size="small"
+                        label="Replenishment"
+                        value={rule.replenishmentMode}
+                        onChange={(e) => {
+                          const mode = e.target.value as ReplenishmentMode
+                          const next = [...location.productRules]
+                          next[index] = {
+                            ...rule,
+                            replenishmentMode: mode,
+                            replenishmentSourceLocationGlobalId: mode === 'disabled' ? '' : rule.replenishmentSourceLocationGlobalId,
+                            minQuantity: mode === 'disabled' ? '' : rule.minQuantity,
+                            targetQuantity: mode === 'disabled' ? '' : rule.targetQuantity,
+                          }
+                          setLocation({ ...location, productRules: next })
+                        }}
+                        helperText={replenishmentModes.find((mode) => mode.value === rule.replenishmentMode)?.description}
+                        sx={{ minWidth: { sm: 190 }, flex: 1 }}
+                      >
+                        {replenishmentModes.map((mode) => <MenuItem key={mode.value} value={mode.value}>{mode.label}</MenuItem>)}
+                      </TextField>
+                      {rule.replenishmentMode !== 'disabled' && (
+                        <>
+                          <TextField
+                            select
+                            required
+                            size="small"
+                            label="Reserve source"
+                            value={rule.replenishmentSourceLocationGlobalId}
+                            onChange={(e) => {
+                              const next = [...location.productRules]
+                              next[index] = { ...rule, replenishmentSourceLocationGlobalId: e.target.value }
+                              setLocation({ ...location, productRules: next })
+                            }}
+                            helperText={replenishmentSourceOptions.length
+                              ? 'Active reserve or bulk location in this warehouse.'
+                              : 'Create an active reserve or bulk location first.'}
+                            sx={{ minWidth: { sm: 190 }, flex: 1 }}
+                          >
+                            {replenishmentSourceOptions.map((source) => (
+                              <MenuItem key={source.globalId} value={source.globalId}>
+                                {source.code} · {storageFunctions.find((item) => item.value === source.storageFunction)?.label}
+                              </MenuItem>
+                            ))}
+                          </TextField>
+                          {rule.replenishmentMode === 'min_max' && (
+                            <TextField
+                              required
+                              size="small"
+                              type="number"
+                              label="Minimum"
+                              value={rule.minQuantity}
+                              onChange={(e) => {
+                                const next = [...location.productRules]
+                                next[index] = { ...rule, minQuantity: e.target.value }
+                                setLocation({ ...location, productRules: next })
+                              }}
+                              inputProps={{ min: 0, step: 'any' }}
+                              sx={{ width: { sm: 125 } }}
+                            />
+                          )}
+                          <TextField
+                            required
+                            size="small"
+                            type="number"
+                            label="Target"
+                            value={rule.targetQuantity}
+                            onChange={(e) => {
+                              const next = [...location.productRules]
+                              next[index] = { ...rule, targetQuantity: e.target.value }
+                              setLocation({ ...location, productRules: next })
+                            }}
+                            inputProps={{ min: 0.000001, step: 'any' }}
+                            sx={{ width: { sm: 125 } }}
+                          />
+                        </>
+                      )}
+                    </Stack>
+                  </Box>
                 ))}
                 {!location.productRules.length && <Typography variant="body2" color="text.secondary">No product-specific placement rules.</Typography>}
               </Stack>
@@ -1097,7 +1334,7 @@ export default function WarehouseSetupPanel({ workspace, onRefresh, onNavigate }
             {[
               {
                 title: '1. Define the facility',
-                body: 'Choose the facility type, physical origin address, IANA timezone, and local carrier tender cutoff. These values establish facility master data and local-time planning context.',
+                body: 'Choose the facility type, physical origin address, IANA timezone, facility tender cutoff, and carrier-specific trailer cutoffs. Cutoffs are local warehouse times used by promise and wave planning.',
               },
               {
                 title: '2. Set the operating profile',
@@ -1105,7 +1342,7 @@ export default function WarehouseSetupPanel({ workspace, onRefresh, onNavigate }
               },
               {
                 title: '3. Build the physical hierarchy',
-                body: 'Use physical levels to model buildings, zones, aisles, bays, shelves, bins, docks, staging areas, and stations. Parent locations describe containment; operational use describes what work occurs there.',
+                body: 'Use physical levels to model buildings, zones, aisles, bays, shelves, bins, docks, staging areas, and stations. Parent locations describe containment; operational use describes the work; storage function identifies reserve, bulk, forward pick, mezzanine, flow rack, staging, or non-storage work areas.',
               },
               {
                 title: '4. Order the pick route',
@@ -1113,14 +1350,18 @@ export default function WarehouseSetupPanel({ workspace, onRefresh, onNavigate }
               },
               {
                 title: '5. Record capacity and placement',
-                body: 'Set cubic and weight limits in imperial or metric units. Add product policies for storage intent. ClawPilot shows current usage now; automated directed putaway is not yet enabled.',
+                body: 'Set cubic and weight limits in imperial or metric units. Product policies drive directed putaway and keep restricted products out of a location. Maximum quantity caps the product within the location.',
               },
               {
-                title: '6. Complete the operating path',
-                body: 'A fulfillment warehouse should have active receiving, storage or picking, packing, and outbound staging or shipping locations. The readiness indicator identifies missing core controls.',
+                title: '6. Configure pick-face replenishment',
+                body: 'For a product in a forward, mezzanine, or flow-rack pick face, choose a reserve or bulk source. Min / target recommends movement when pick-face stock drops below minimum. Released order demand recommends movement when demand exceeds pick-face availability. Recommendations stay within the same inventory owner and pool.',
               },
               {
-                title: '7. Connect facility services',
+                title: '7. Complete the operating path',
+                body: 'A fulfillment warehouse should have active receiving, reserve or bulk storage, forward picking, packing, and outbound staging or shipping locations. The readiness indicator identifies missing core controls.',
+              },
+              {
+                title: '8. Connect facility services',
                 body: 'Configure printers for labels and packing documents. Bind approved carrier accounts and import carrier billing through the related Operations controls.',
               },
             ].map((step) => (

@@ -261,10 +261,48 @@ function booleanValue(value: unknown, fallback: boolean): boolean {
   return typeof value === 'boolean' ? value : fallback
 }
 
+function carrierCutoffsValue(value: unknown): Record<string, string> {
+  if (value === undefined || value === null) return {}
+  const input = record(value, 'OPERATIONS_REQUEST_INVALID', 'Carrier cutoffs')
+  if (Object.keys(input).length > 25) {
+    requestError('OPERATIONS_REQUEST_INVALID', 'Carrier cutoffs are invalid')
+  }
+  const result: Record<string, string> = {}
+  for (const [providerValue, cutoffValue] of Object.entries(input)) {
+    const provider = textValue(providerValue, 'Carrier code', 40).toUpperCase()
+    const cutoff = textValue(cutoffValue, `${provider} cutoff`, 8)
+    if (!/^[A-Z0-9_-]+$/.test(provider) || !/^([01]\d|2[0-3]):[0-5]\d$/.test(cutoff)) {
+      requestError(
+        'OPERATIONS_REQUEST_INVALID',
+        'Carrier cutoffs require a carrier code and local 24-hour HH:MM time',
+      )
+    }
+    result[provider] = cutoff
+  }
+  return result
+}
+
+function locationStorageFunctionValue(
+  value: unknown,
+  locationType: OperationsWorkspace['warehouses'][number]['locations'][number]['locationType'],
+): OperationsWorkspace['warehouses'][number]['locations'][number]['storageFunction'] {
+  if (value === null || value === undefined || value === '') {
+    if (locationType === 'pick') return 'forward_pick'
+    if (locationType === 'storage') return 'reserve'
+    if (locationType === 'staging') return 'staging'
+    return 'work_area'
+  }
+  return textValue(value, 'Storage function', 30) as OperationsWorkspace['warehouses'][number]['locations'][number]['storageFunction']
+}
+
 function locationProductRulesValue(value: unknown): Array<{
   productGlobalId: string
   ruleType: 'allowed' | 'preferred' | 'restricted'
   maxQuantity: number | null
+  replenishmentMode: 'disabled' | 'min_max' | 'order_demand'
+  replenishmentSourceLocationGlobalId: string | null
+  minQuantity: number | null
+  targetQuantity: number | null
 }> {
   if (value === undefined) return []
   if (!Array.isArray(value) || value.length > 250) {
@@ -275,7 +313,15 @@ function locationProductRulesValue(value: unknown): Array<{
     const rule = record(entry, 'OPERATIONS_REQUEST_INVALID', `Location product rule ${index + 1}`)
     assertFields(
       rule,
-      new Set(['productGlobalId', 'ruleType', 'maxQuantity']),
+      new Set([
+        'productGlobalId',
+        'ruleType',
+        'maxQuantity',
+        'replenishmentMode',
+        'replenishmentSourceLocationGlobalId',
+        'minQuantity',
+        'targetQuantity',
+      ]),
       'OPERATIONS_REQUEST_INVALID',
       `Location product rule ${index + 1}`,
     )
@@ -288,10 +334,27 @@ function locationProductRulesValue(value: unknown): Array<{
     if (!['allowed', 'preferred', 'restricted'].includes(ruleType)) {
       requestError('OPERATIONS_REQUEST_INVALID', 'Product rule type is invalid')
     }
+    const replenishmentMode = textValue(
+      rule.replenishmentMode,
+      'Replenishment mode',
+      20,
+      false,
+    ) || 'disabled'
+    if (!['disabled', 'min_max', 'order_demand'].includes(replenishmentMode)) {
+      requestError('OPERATIONS_REQUEST_INVALID', 'Replenishment mode is invalid')
+    }
     return {
       productGlobalId,
       ruleType: ruleType as 'allowed' | 'preferred' | 'restricted',
       maxQuantity: optionalNumberValue(rule.maxQuantity, 'Product quantity limit', 0.000001, 1_000_000_000),
+      replenishmentMode: replenishmentMode as 'disabled' | 'min_max' | 'order_demand',
+      replenishmentSourceLocationGlobalId: optionalGlobalIdValue(
+        rule.replenishmentSourceLocationGlobalId,
+        'Replenishment source',
+        LOCATION_GLOBAL_ID,
+      ),
+      minQuantity: optionalNumberValue(rule.minQuantity, 'Replenishment minimum', 0, 1_000_000_000),
+      targetQuantity: optionalNumberValue(rule.targetQuantity, 'Replenishment target', 0.000001, 1_000_000_000),
     }
   })
 }
@@ -491,7 +554,7 @@ export async function POST(req: NextRequest) {
       assertFields(body, new Set([
         'action', 'code', 'name', 'facilityType', 'timezone', 'address', 'cutoffTime',
         'operatingDays', 'opensAt', 'closesAt', 'standardProcessingMinutes',
-        'dailyOrderCapacity', 'createStarterLocations',
+        'dailyOrderCapacity', 'carrierCutoffs', 'createStarterLocations',
       ]), 'OPERATIONS_REQUEST_INVALID', 'Operations command')
       const result = await createOperationsWarehouseInPostgres({
         organizationId: activeOperationsOrganizationId(actor),
@@ -516,6 +579,7 @@ export async function POST(req: NextRequest) {
           || body.dailyOrderCapacity === ''
           ? null
           : integerValue(body.dailyOrderCapacity, 'Daily order capacity', 1, 1_000_000_000),
+        carrierCutoffs: carrierCutoffsValue(body.carrierCutoffs),
         createStarterLocations: body.createStarterLocations !== false,
       })
       return json({ ok: true, capabilities, result }, 201)
@@ -527,7 +591,7 @@ export async function POST(req: NextRequest) {
       assertFields(body, new Set([
         'action', 'warehouseGlobalId', 'expectedRowVersion', 'name', 'facilityType',
         'timezone', 'address', 'cutoffTime', 'operatingDays', 'opensAt', 'closesAt',
-        'standardProcessingMinutes', 'dailyOrderCapacity', 'status',
+        'standardProcessingMinutes', 'dailyOrderCapacity', 'carrierCutoffs', 'status',
       ]), 'OPERATIONS_REQUEST_INVALID', 'Operations command')
       const result = await updateOperationsWarehouseInPostgres({
         organizationId: activeOperationsOrganizationId(actor),
@@ -553,6 +617,7 @@ export async function POST(req: NextRequest) {
           || body.dailyOrderCapacity === ''
           ? null
           : integerValue(body.dailyOrderCapacity, 'Daily order capacity', 1, 1_000_000_000),
+        carrierCutoffs: carrierCutoffsValue(body.carrierCutoffs),
         status: textValue(body.status, 'Warehouse status', 20) as 'active' | 'inactive',
       })
       return json({ ok: true, capabilities, result })
@@ -564,19 +629,21 @@ export async function POST(req: NextRequest) {
       assertFields(body, new Set([
         'action', 'warehouseGlobalId', 'code', 'zone', 'locationType', 'topologyLevel',
         'parentLocationGlobalId', 'pickSequence', 'active', 'maxVolumeCubicMeters',
-        'maxWeightKg', 'allowMixedProducts', 'notes', 'productRules',
+        'maxWeightKg', 'allowMixedProducts', 'storageFunction', 'notes', 'productRules',
       ]), 'OPERATIONS_REQUEST_INVALID', 'Operations command')
+      const locationType = textValue(body.locationType, 'Location type', 20) as OperationsWorkspace['warehouses'][number]['locations'][number]['locationType']
       const result = await createOperationsLocationInPostgres({
         organizationId: activeOperationsOrganizationId(actor),
         actorEmail: actor.email,
         warehouseGlobalId: globalIdValue(body.warehouseGlobalId, 'Warehouse', WAREHOUSE_GLOBAL_ID),
         code: textValue(body.code, 'Location code', 40),
         zone: textValue(body.zone, 'Location zone', 80),
-        locationType: textValue(body.locationType, 'Location type', 20) as OperationsWorkspace['warehouses'][number]['locations'][number]['locationType'],
+        locationType,
         topologyLevel: textValue(body.topologyLevel, 'Topology level', 20) as OperationsWorkspace['warehouses'][number]['locations'][number]['topologyLevel'],
         parentLocationGlobalId: optionalGlobalIdValue(body.parentLocationGlobalId, 'Parent location', LOCATION_GLOBAL_ID),
         pickSequence: integerValue(body.pickSequence, 'Pick sequence', 0, 1_000_000),
         active: booleanValue(body.active, true),
+        storageFunction: locationStorageFunctionValue(body.storageFunction, locationType),
         maxVolumeCubicMeters: optionalNumberValue(body.maxVolumeCubicMeters, 'Maximum cubic storage', 0.000001, 1_000_000_000),
         maxWeightKg: optionalNumberValue(body.maxWeightKg, 'Maximum weight', 0.000001, 1_000_000_000),
         allowMixedProducts: booleanValue(body.allowMixedProducts, true),
@@ -593,8 +660,9 @@ export async function POST(req: NextRequest) {
         'action', 'warehouseGlobalId', 'locationGlobalId', 'expectedRowVersion',
         'code', 'zone', 'locationType', 'topologyLevel', 'parentLocationGlobalId',
         'pickSequence', 'active', 'maxVolumeCubicMeters', 'maxWeightKg',
-        'allowMixedProducts', 'notes', 'productRules',
+        'allowMixedProducts', 'storageFunction', 'notes', 'productRules',
       ]), 'OPERATIONS_REQUEST_INVALID', 'Operations command')
+      const locationType = textValue(body.locationType, 'Location type', 20) as OperationsWorkspace['warehouses'][number]['locations'][number]['locationType']
       const result = await updateOperationsLocationInPostgres({
         organizationId: activeOperationsOrganizationId(actor),
         actorEmail: actor.email,
@@ -603,11 +671,12 @@ export async function POST(req: NextRequest) {
         expectedRowVersion: integerValue(body.expectedRowVersion, 'Location version', 0, 2_147_483_647),
         code: textValue(body.code, 'Location code', 40),
         zone: textValue(body.zone, 'Location zone', 80),
-        locationType: textValue(body.locationType, 'Location type', 20) as OperationsWorkspace['warehouses'][number]['locations'][number]['locationType'],
+        locationType,
         topologyLevel: textValue(body.topologyLevel, 'Topology level', 20) as OperationsWorkspace['warehouses'][number]['locations'][number]['topologyLevel'],
         parentLocationGlobalId: optionalGlobalIdValue(body.parentLocationGlobalId, 'Parent location', LOCATION_GLOBAL_ID),
         pickSequence: integerValue(body.pickSequence, 'Pick sequence', 0, 1_000_000),
         active: booleanValue(body.active, true),
+        storageFunction: locationStorageFunctionValue(body.storageFunction, locationType),
         maxVolumeCubicMeters: optionalNumberValue(body.maxVolumeCubicMeters, 'Maximum cubic storage', 0.000001, 1_000_000_000),
         maxWeightKg: optionalNumberValue(body.maxWeightKg, 'Maximum weight', 0.000001, 1_000_000_000),
         allowMixedProducts: booleanValue(body.allowMixedProducts, true),

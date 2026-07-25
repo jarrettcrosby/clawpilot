@@ -216,6 +216,8 @@ for (const requiredPath of [
   'db/migrations/0104_demo_managed_resource_guard.sql',
   'db/migrations/0105_quickbooks_pos_evidence_refresh.sql',
   'db/migrations/0106_toast_location_closeout_hour.sql',
+  'db/migrations/0107_operations_warehouse_operating_profile.sql',
+  'db/migrations/0108_operations_slotting_and_replenishment.sql',
   '.github/workflows/clawpilot-repository-runner.yml',
   '.github/workflows/deployed-runtime-monitor.yml',
   'scripts/start-railway.sh',

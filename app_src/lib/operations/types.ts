@@ -699,6 +699,7 @@ export type OperationsWorkspace = {
     address: Address
     status: 'active' | 'inactive'
     cutoffTime: string | null
+    carrierCutoffs: Record<string, string>
     operatingDays: number[]
     opensAt: string
     closesAt: string
@@ -715,6 +716,7 @@ export type OperationsWorkspace = {
       parentLocationGlobalId: string | null
       pickSequence: number
       active: boolean
+      storageFunction: 'work_area' | 'reserve' | 'bulk' | 'forward_pick' | 'mezzanine_pick' | 'flow_rack' | 'staging'
       maxVolumeCubicMeters: number | null
       maxWeightKg: number | null
       usedVolumeCubicMeters: number
@@ -728,9 +730,35 @@ export type OperationsWorkspace = {
         productName: string
         ruleType: 'allowed' | 'preferred' | 'restricted'
         maxQuantity: number | null
+        replenishmentMode: 'disabled' | 'min_max' | 'order_demand'
+        replenishmentSourceLocationGlobalId: string | null
+        replenishmentSourceLocationCode: string | null
+        minQuantity: number | null
+        targetQuantity: number | null
         active: boolean
       }>
     }>
+  }>
+  replenishmentRecommendations: Array<{
+    warehouseGlobalId: string
+    warehouseName: string
+    productGlobalId: string
+    productName: string
+    productSku: string | null
+    inventoryPoolGlobalId: string
+    inventoryPoolName: string
+    sourceLocationGlobalId: string
+    sourceLocationCode: string
+    destinationLocationGlobalId: string
+    destinationLocationCode: string
+    replenishmentMode: 'min_max' | 'order_demand'
+    availableAtSource: number
+    availableAtDestination: number
+    releasedDemand: number
+    minQuantity: number | null
+    targetQuantity: number
+    recommendedQuantity: number
+    explanation: string
   }>
   inventoryPools: Array<{
     id: string
