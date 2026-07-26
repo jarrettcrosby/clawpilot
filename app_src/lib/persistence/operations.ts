@@ -2107,11 +2107,11 @@ export async function readOperationsWorkspaceFromPostgres(input: {
        FROM operations_warehouses
        WHERE organization_id = $1::uuid
          AND code <> 'MOCK-01'
-         AND NOT (
+         AND NOT COALESCE((
            status = 'inactive'
            AND address->>'scenarioKey' = 'clawpilot-wms-development-v1'
            AND address->>'state' = 'retired'
-         )
+         ), false)
        ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, lower(name), id`,
       [organizationId],
     ),
@@ -2158,11 +2158,11 @@ export async function readOperationsWorkspaceFromPostgres(input: {
        ) usage ON true
        WHERE location.organization_id = $1::uuid
          AND warehouse.code <> 'MOCK-01'
-         AND NOT (
+         AND NOT COALESCE((
            warehouse.status = 'inactive'
            AND warehouse.address->>'scenarioKey' = 'clawpilot-wms-development-v1'
            AND warehouse.address->>'state' = 'retired'
-         )
+         ), false)
        ORDER BY lower(warehouse.name), location.pick_sequence, lower(location.code), location.id`,
       [organizationId],
     ),
@@ -2374,11 +2374,11 @@ export async function readOperationsWorkspaceFromPostgres(input: {
       `SELECT customer.id::text, customer.reference_code, customer.name
        FROM crm_organizations customer
        WHERE customer.pipeline_id = $1::uuid
-         AND NOT (
+         AND NOT COALESCE((
            customer.source_payload->>'scenarioKey'
              = 'clawpilot-wms-development-v1'
            AND customer.source_payload->>'state' = 'retired'
-         )
+         ), false)
        ORDER BY lower(customer.name), customer.id LIMIT 500`,
       [activation.data_pipeline_id],
     ),
