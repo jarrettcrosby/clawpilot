@@ -3099,9 +3099,9 @@ export async function ensurePipelineCrmHierarchy(input: {
     `SELECT *
      FROM crm_organizations customer
      WHERE customer.pipeline_id = $1::uuid
-       AND customer.relationship_type = 'customer'
-       AND customer.parent_organization_id IS NULL
-       AND ${activeCrmRecordSql('customer')}`,
+       AND ${activeCrmRecordSql('customer')}
+       AND relationship_type = 'customer'
+       AND parent_organization_id IS NULL`,
     [input.pipelineId],
   )
   for (const customer of customers.rows) {
