@@ -6,6 +6,7 @@ import { createRequire } from 'node:module'
 const requireFromApp = createRequire(new URL('../app_src/package.json', import.meta.url))
 
 const SCENARIO_KEY = 'clawpilot-wms-development-v1'
+const SIMULATOR_LINEAGE_LOCK_PREFIX = 'clawpilot:wms-development-simulator-lineage'
 const DEFAULT_ANCHOR_DATE = '2026-07-25'
 const ALLOWED_ENVIRONMENTS = new Set(['dev', 'development', 'local'])
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
@@ -36,6 +37,20 @@ function digest(value) {
 function actorEmailForOrganization(organizationId) {
   const organizationKey = organizationId.replaceAll('-', '').slice(0, 12).toLowerCase()
   return `wms-simulator+${organizationKey}@clawpilot.invalid`
+}
+
+function simulatorLineageLockKey(organizationId) {
+  return `${SIMULATOR_LINEAGE_LOCK_PREFIX}:${organizationId.toLowerCase()}`
+}
+
+function parsedObject(value) {
+  if (value && typeof value === 'object' && !Array.isArray(value)) return value
+  try {
+    const parsed = JSON.parse(String(value || ''))
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}
+  } catch {
+    return {}
+  }
 }
 
 function parseArguments(argv) {
@@ -496,6 +511,7 @@ async function requireSchema(client) {
     'operations_inventory_pool_customers',
     'operations_inventory_positions',
     'operations_inventory_ledger',
+    'operations_product_mappings',
     'operations_orders',
     'operations_order_lines',
     'operations_reservations',
@@ -505,6 +521,12 @@ async function requireSchema(client) {
     'operations_packages',
     'operations_waves',
     'operations_pick_tasks',
+    'operations_exceptions',
+    'operations_receipts',
+    'operations_receipt_lines',
+    'operations_replenishment_tasks',
+    'operations_printers',
+    'operations_print_agents',
   ]
   const result = await client.query(
     `SELECT name, to_regclass(name) IS NOT NULL AS present
@@ -551,6 +573,558 @@ async function resolveScope(client, configuration) {
     organizationName: organizationResult.rows[0].name,
     pipelineId: pipelineResult.rows[0].id,
     pipelineName: pipelineResult.rows[0].name,
+  }
+}
+
+async function assertSimulatorLineageSeedable(client, scope) {
+  const result = await client.query(
+    `SELECT (
+       EXISTS (
+         SELECT 1
+         FROM operations_integration_accounts integration
+         WHERE integration.organization_id = $1::uuid
+           AND integration.provider = 'wms_development_simulator'
+           AND integration.integration_type = 'commerce'
+           AND integration.environment = 'mock'
+           AND integration.configuration->>'state' = 'retired'
+       )
+       OR EXISTS (
+         SELECT 1
+         FROM operations_orders orders
+         WHERE orders.organization_id = $1::uuid
+           AND orders.source_provider = 'wms_development_simulator'
+           AND (
+             orders.archived_at IS NOT NULL
+             OR orders.source_payload->>'simulationState' = 'retired'
+           )
+       )
+       OR EXISTS (
+         SELECT 1
+         FROM operations_warehouses warehouse
+         WHERE warehouse.organization_id = $1::uuid
+           AND warehouse.code = 'DEV-WMS-SIM-01'
+           AND warehouse.address->>'state' = 'retired'
+       )
+     ) AS retired`,
+    [scope.organizationId],
+  )
+  if (result.rows[0]?.retired === true) {
+    fail(
+      'The WMS development simulator lineage is retired for this organization '
+      + 'and cannot be reseeded',
+    )
+  }
+}
+
+async function resolveScenarioRetirementTarget(client, configuration, scope, scenario) {
+  const integrationResult = await client.query(
+    `SELECT integration.id::text, integration.global_id
+     FROM operations_integration_accounts integration
+     WHERE integration.organization_id = $1::uuid
+       AND integration.provider = 'wms_development_simulator'
+       AND integration.integration_type = 'commerce'
+       AND integration.environment = 'mock'
+       AND integration.configuration->>'scenarioKey' = $2
+     ORDER BY integration.id
+     FOR UPDATE`,
+    [scope.organizationId, scenario.scenarioKey],
+  )
+  if (integrationResult.rowCount !== 1) {
+    fail(
+      `Scenario cleanup requires exactly one marked integration; found `
+      + `${integrationResult.rowCount}`,
+    )
+  }
+  const integration = integrationResult.rows[0]
+
+  const warehouseResult = await client.query(
+    `SELECT warehouse.id::text, warehouse.global_id
+     FROM operations_warehouses warehouse
+     WHERE warehouse.organization_id = $1::uuid
+       AND warehouse.code = 'DEV-WMS-SIM-01'
+       AND warehouse.address->>'scenarioKey' = $2
+     ORDER BY warehouse.id
+     FOR UPDATE`,
+    [scope.organizationId, scenario.scenarioKey],
+  )
+  if (warehouseResult.rowCount !== 1) {
+    fail(
+      `Scenario cleanup requires exactly one marked warehouse; found `
+      + `${warehouseResult.rowCount}`,
+    )
+  }
+  const warehouse = warehouseResult.rows[0]
+
+  const orderResult = await client.query(
+    `SELECT orders.id::text, orders.external_order_id,
+            orders.pipeline_id::text, orders.integration_account_id::text,
+            orders.source_payload->>'scenarioKey' AS scenario_key
+     FROM operations_orders orders
+     WHERE orders.organization_id = $1::uuid
+       AND orders.source_provider = 'wms_development_simulator'
+       AND (
+         orders.integration_account_id = $3::uuid
+         OR orders.source_payload->>'scenarioKey' = $2
+       )
+     ORDER BY orders.external_order_id, orders.id
+     FOR UPDATE`,
+    [scope.organizationId, scenario.scenarioKey, integration.id],
+  )
+  const expectedExternalOrderIds = scenario.orders
+    .map((order) => order.externalOrderId)
+    .sort()
+  const actualExternalOrderIds = orderResult.rows
+    .map((order) => order.external_order_id)
+    .sort()
+  const exactOrderSet = actualExternalOrderIds.length === expectedExternalOrderIds.length
+    && actualExternalOrderIds.every(
+      (externalOrderId, index) => externalOrderId === expectedExternalOrderIds[index],
+    )
+  if (!exactOrderSet) {
+    const actual = new Set(actualExternalOrderIds)
+    const expected = new Set(expectedExternalOrderIds)
+    const missing = expectedExternalOrderIds.filter((id) => !actual.has(id))
+    const unexpected = actualExternalOrderIds.filter((id) => !expected.has(id))
+    fail(
+      `Scenario cleanup expected ${expectedExternalOrderIds.length} exact orders; found `
+      + `${actualExternalOrderIds.length}; missing=${missing.join(',') || 'none'}; `
+      + `unexpected=${unexpected.join(',') || 'none'}`,
+    )
+  }
+  if (orderResult.rows.some((order) => order.scenario_key !== scenario.scenarioKey)) {
+    fail('Scenario cleanup found an expected order without the exact scenario marker')
+  }
+  if (orderResult.rows.some((order) => order.integration_account_id !== integration.id)) {
+    fail('Scenario cleanup found an expected order bound to another integration')
+  }
+
+  const pipelineIds = [...new Set(orderResult.rows.map((order) => order.pipeline_id))]
+  if (pipelineIds.length !== 1) {
+    fail(`Scenario cleanup orders span ${pipelineIds.length} pipelines`)
+  }
+  const pipelineId = pipelineIds[0]
+  if (configuration.pipelineId && configuration.pipelineId !== pipelineId) {
+    fail(
+      `Scenario cleanup pipeline ${pipelineId} does not match `
+      + `WMS_SIM_PIPELINE_ID=${configuration.pipelineId}`,
+    )
+  }
+  const pipelineResult = await client.query(
+    `SELECT id::text, name
+     FROM pipeline_spaces
+     WHERE workspace_organization_id = $1::uuid
+       AND id = $2::uuid
+     FOR UPDATE`,
+    [scope.organizationId, pipelineId],
+  )
+  if (pipelineResult.rowCount !== 1) {
+    fail(`Scenario cleanup pipeline ${pipelineId} is not owned by the supplied organization`)
+  }
+
+  const customerResult = await client.query(
+    `SELECT customer.id::text, customer.reference_code
+     FROM crm_organizations customer
+     WHERE customer.pipeline_id = $1::uuid
+       AND customer.source_key = $2
+       AND customer.source_payload->>'scenarioKey' = $3
+     ORDER BY customer.id
+     FOR UPDATE`,
+    [pipelineId, scenario.customer.sourceKey, scenario.scenarioKey],
+  )
+  if (customerResult.rowCount !== 1) {
+    fail(
+      `Scenario cleanup requires exactly one marked customer in pipeline ${pipelineId}; `
+      + `found ${customerResult.rowCount}`,
+    )
+  }
+  const customer = customerResult.rows[0]
+
+  const productResult = await client.query(
+    `SELECT product.id::text, product.source_key
+     FROM crm_products product
+     WHERE product.pipeline_id = $1::uuid
+       AND product.source_key LIKE $2
+       AND product.source_payload->>'scenarioKey' = $3
+     ORDER BY product.source_key, product.id
+     FOR UPDATE`,
+    [
+      pipelineId,
+      `${scenario.scenarioKey}:product:%`,
+      scenario.scenarioKey,
+    ],
+  )
+  const expectedProductSourceKeys = scenario.products
+    .map((product) => product.sourceKey)
+    .sort()
+  const actualProductSourceKeys = productResult.rows
+    .map((product) => product.source_key)
+    .sort()
+  if (
+    actualProductSourceKeys.length !== expectedProductSourceKeys.length
+    || actualProductSourceKeys.some(
+      (sourceKey, index) => sourceKey !== expectedProductSourceKeys[index],
+    )
+  ) {
+    fail(
+      `Scenario cleanup requires ${expectedProductSourceKeys.length} exact marked products; `
+      + `found ${actualProductSourceKeys.length}`,
+    )
+  }
+  const productIdBySourceKey = new Map(
+    productResult.rows.map((product) => [product.source_key, product.id]),
+  )
+
+  const locationResult = await client.query(
+    `SELECT location.id::text, location.code, location.notes
+     FROM operations_locations location
+     WHERE location.organization_id = $1::uuid
+       AND location.warehouse_id = $2::uuid
+     ORDER BY location.code, location.id
+     FOR UPDATE`,
+    [scope.organizationId, warehouse.id],
+  )
+  const expectedLocationCodes = scenario.locations
+    .map((location) => location.code)
+    .sort()
+  const actualLocationCodes = locationResult.rows
+    .map((location) => location.code)
+    .sort()
+  const exactLocationSet = actualLocationCodes.length === expectedLocationCodes.length
+    && actualLocationCodes.every(
+      (code, index) => code === expectedLocationCodes[index],
+    )
+  if (!exactLocationSet || locationResult.rows.some(
+    (location) => parsedObject(location.notes).scenarioKey !== scenario.scenarioKey
+  )) {
+    fail(
+      `Scenario cleanup requires ${expectedLocationCodes.length} exact marked locations; `
+      + `found ${actualLocationCodes.length}`,
+    )
+  }
+  const locationIdByCode = new Map(
+    locationResult.rows.map((location) => [location.code, location.id]),
+  )
+
+  const poolResult = await client.query(
+    `SELECT pool.id::text, pool.global_id, pool.pipeline_id::text,
+            pool.owner_customer_id::text
+     FROM operations_inventory_pools pool
+     WHERE pool.organization_id = $1::uuid
+       AND pool.name = '[DEV WMS] Shared Simulation Pool'
+     ORDER BY pool.id
+     FOR UPDATE`,
+    [scope.organizationId],
+  )
+  if (poolResult.rowCount !== 1) {
+    fail(
+      `Scenario cleanup requires exactly one named simulator pool; found `
+      + `${poolResult.rowCount}`,
+    )
+  }
+  const pool = poolResult.rows[0]
+  if (pool.pipeline_id !== pipelineId) {
+    fail(`Scenario simulator pool belongs to unexpected pipeline ${pool.pipeline_id}`)
+  }
+  if (pool.owner_customer_id && pool.owner_customer_id !== customer.id) {
+    fail('Scenario simulator pool has an unrelated owner customer')
+  }
+
+  const poolPositionResult = await client.query(
+    `SELECT position.id::text, position.warehouse_id::text
+     FROM operations_inventory_positions position
+     WHERE position.organization_id = $1::uuid
+       AND position.pool_id = $2::uuid
+     ORDER BY position.id
+     FOR UPDATE`,
+    [scope.organizationId, pool.id],
+  )
+  if (poolPositionResult.rows.some(
+    (position) => position.warehouse_id !== warehouse.id
+  )) {
+    fail('Scenario simulator pool has inventory positions outside the marked warehouse')
+  }
+
+  const poolCustomerResult = await client.query(
+    `SELECT eligible.customer_id::text, eligible.pipeline_id::text
+     FROM operations_inventory_pool_customers eligible
+     WHERE eligible.organization_id = $1::uuid
+       AND eligible.pool_id = $2::uuid
+     ORDER BY eligible.customer_id, eligible.effective_from
+     FOR UPDATE`,
+    [scope.organizationId, pool.id],
+  )
+  if (poolCustomerResult.rows.some(
+    (eligible) => eligible.customer_id !== customer.id
+      || eligible.pipeline_id !== pipelineId
+  )) {
+    fail('Scenario simulator pool has a customer link outside the marked scenario customer')
+  }
+
+  const warehousePositionResult = await client.query(
+    `SELECT position.id::text, position.pool_id::text,
+            position.product_id::text, position.location_id::text
+     FROM operations_inventory_positions position
+     WHERE position.organization_id = $1::uuid
+       AND position.warehouse_id = $2::uuid
+     ORDER BY position.id
+     FOR UPDATE`,
+    [scope.organizationId, warehouse.id],
+  )
+  const exactProductIds = new Set(productIdBySourceKey.values())
+  const exactLocationIds = new Set(locationIdByCode.values())
+  if (warehousePositionResult.rows.some((position) => position.pool_id !== pool.id)) {
+    fail('Marked scenario warehouse has an inventory position from another pool')
+  }
+  if (warehousePositionResult.rows.some(
+    (position) => !exactProductIds.has(position.product_id)
+      || !exactLocationIds.has(position.location_id)
+  )) {
+    fail('Marked scenario warehouse has an inventory position outside exact fixture products or locations')
+  }
+
+  const activeRuleResult = await client.query(
+    `SELECT rule.id::text, location.code AS location_code, rule.product_id::text
+     FROM operations_location_product_rules rule
+     JOIN operations_locations location
+       ON location.organization_id = rule.organization_id
+      AND location.id = rule.location_id
+     WHERE rule.organization_id = $1::uuid
+       AND location.warehouse_id = $2::uuid
+       AND rule.active
+     ORDER BY rule.id
+     FOR UPDATE OF rule`,
+    [scope.organizationId, warehouse.id],
+  )
+  const expectedRulePairs = new Set(scenario.placementRules.map((rule) => {
+    const product = scenario.products.find((candidate) => candidate.key === rule.productKey)
+    return `${locationIdByCode.get(rule.locationCode)}:${productIdBySourceKey.get(product.sourceKey)}`
+  }))
+  if (activeRuleResult.rows.some(
+    (rule) => !expectedRulePairs.has(
+      `${locationIdByCode.get(rule.location_code)}:${rule.product_id}`,
+    )
+  )) {
+    fail('Marked scenario warehouse has an active location rule outside the exact fixture')
+  }
+
+  const orderIds = orderResult.rows.map((order) => order.id)
+  const waveName = `[DEV WMS] Replenishment Pressure ${scenario.anchorDate}`
+  const waveResult = await client.query(
+    `SELECT wave.id::text, wave.global_id, wave.name,
+            EXISTS (
+              SELECT 1
+              FROM operations_pick_tasks other_task
+              JOIN operations_fulfillment_plans other_plan
+                ON other_plan.organization_id = other_task.organization_id
+               AND other_plan.id = other_task.plan_id
+              WHERE other_task.organization_id = wave.organization_id
+                AND other_task.wave_id = wave.id
+                AND NOT (other_plan.order_id = ANY($4::uuid[]))
+            ) AS contaminated
+     FROM operations_waves wave
+     WHERE wave.organization_id = $1::uuid
+       AND (
+         (
+           wave.warehouse_id = $2::uuid
+           AND wave.name = $3
+         )
+         OR EXISTS (
+           SELECT 1
+           FROM operations_pick_tasks scenario_task
+           JOIN operations_fulfillment_plans scenario_plan
+             ON scenario_plan.organization_id = scenario_task.organization_id
+            AND scenario_plan.id = scenario_task.plan_id
+           WHERE scenario_task.organization_id = wave.organization_id
+             AND scenario_task.wave_id = wave.id
+             AND scenario_plan.order_id = ANY($4::uuid[])
+         )
+       )
+     ORDER BY wave.id
+     FOR UPDATE`,
+    [scope.organizationId, warehouse.id, waveName, orderIds],
+  )
+  const contaminatedWaves = waveResult.rows
+    .filter((wave) => wave.contaminated === true)
+    .map((wave) => wave.global_id)
+  if (contaminatedWaves.length > 0) {
+    fail(
+      `Scenario cleanup refused contaminated wave(s): ${contaminatedWaves.join(', ')}`,
+    )
+  }
+  const waveIds = waveResult.rows.map((wave) => wave.id)
+
+  const unrelatedReservationResult = await client.query(
+    `SELECT reservation.global_id
+     FROM operations_reservations reservation
+     JOIN operations_inventory_positions position
+       ON position.organization_id = reservation.organization_id
+      AND position.id = reservation.position_id
+     JOIN operations_orders orders
+       ON orders.organization_id = reservation.organization_id
+      AND orders.id = reservation.order_id
+     WHERE reservation.organization_id = $1::uuid
+       AND reservation.status = 'active'
+       AND (
+         position.pool_id = $2::uuid
+         OR position.warehouse_id = $3::uuid
+       )
+       AND (
+         orders.source_provider IS DISTINCT FROM 'wms_development_simulator'
+         OR orders.source_payload->>'scenarioKey' IS DISTINCT FROM $4
+       )
+     ORDER BY reservation.id
+     FOR UPDATE OF reservation, position, orders`,
+    [scope.organizationId, pool.id, warehouse.id, scenario.scenarioKey],
+  )
+  const unrelatedAllocationResult = await client.query(
+    `SELECT allocation.global_id
+     FROM operations_fulfillment_allocations allocation
+     JOIN operations_inventory_positions position
+       ON position.organization_id = allocation.organization_id
+      AND position.id = allocation.position_id
+     JOIN operations_fulfillment_plans plan
+       ON plan.organization_id = allocation.organization_id
+      AND plan.id = allocation.plan_id
+     JOIN operations_orders orders
+       ON orders.organization_id = plan.organization_id
+      AND orders.id = plan.order_id
+     WHERE allocation.organization_id = $1::uuid
+       AND plan.status <> 'cancelled'
+       AND (
+         position.pool_id = $2::uuid
+         OR position.warehouse_id = $3::uuid
+       )
+       AND (
+         orders.source_provider IS DISTINCT FROM 'wms_development_simulator'
+         OR orders.source_payload->>'scenarioKey' IS DISTINCT FROM $4
+       )
+     ORDER BY allocation.id
+     FOR UPDATE OF allocation, position, plan, orders`,
+    [scope.organizationId, pool.id, warehouse.id, scenario.scenarioKey],
+  )
+  const unrelatedPlanResult = await client.query(
+    `SELECT plan.global_id
+     FROM operations_fulfillment_plans plan
+     JOIN operations_orders orders
+       ON orders.organization_id = plan.organization_id
+      AND orders.id = plan.order_id
+     WHERE plan.organization_id = $1::uuid
+       AND plan.warehouse_id = $2::uuid
+       AND plan.status <> 'cancelled'
+       AND (
+         orders.source_provider IS DISTINCT FROM 'wms_development_simulator'
+         OR orders.source_payload->>'scenarioKey' IS DISTINCT FROM $3
+       )
+     ORDER BY plan.id
+     FOR UPDATE OF plan, orders`,
+    [scope.organizationId, warehouse.id, scenario.scenarioKey],
+  )
+  const nonterminalReceiptResult = await client.query(
+    `SELECT receipt.global_id
+     FROM operations_receipts receipt
+     WHERE receipt.organization_id = $1::uuid
+       AND receipt.status NOT IN ('completed', 'cancelled')
+       AND (
+         receipt.warehouse_id = $2::uuid
+         OR receipt.inventory_pool_id = $3::uuid
+         OR EXISTS (
+           SELECT 1
+           FROM operations_receipt_lines receipt_line
+           JOIN operations_locations target_location
+             ON target_location.organization_id = receipt_line.organization_id
+            AND target_location.id = receipt_line.target_location_id
+           WHERE receipt_line.organization_id = receipt.organization_id
+             AND receipt_line.receipt_id = receipt.id
+             AND target_location.warehouse_id = $2::uuid
+         )
+       )
+     ORDER BY receipt.id
+     FOR UPDATE OF receipt`,
+    [scope.organizationId, warehouse.id, pool.id],
+  )
+  const nonterminalReplenishmentResult = await client.query(
+    `SELECT task.global_id
+     FROM operations_replenishment_tasks task
+     WHERE task.organization_id = $1::uuid
+       AND task.status NOT IN ('completed', 'cancelled')
+       AND (
+         task.warehouse_id = $2::uuid
+         OR task.inventory_pool_id = $3::uuid
+         OR EXISTS (
+           SELECT 1
+           FROM operations_locations task_location
+           WHERE task_location.organization_id = task.organization_id
+             AND task_location.id IN (
+               task.source_location_id,
+               task.destination_location_id
+             )
+             AND task_location.warehouse_id = $2::uuid
+         )
+       )
+     ORDER BY task.id
+     FOR UPDATE OF task`,
+    [scope.organizationId, warehouse.id, pool.id],
+  )
+  const otherActiveWaveResult = await client.query(
+    `SELECT wave.global_id
+     FROM operations_waves wave
+     WHERE wave.organization_id = $1::uuid
+       AND wave.warehouse_id = $2::uuid
+       AND wave.status IN ('planned', 'released', 'in_progress')
+       AND NOT (wave.id = ANY($3::uuid[]))
+     ORDER BY wave.id
+     FOR UPDATE OF wave`,
+    [scope.organizationId, warehouse.id, waveIds],
+  )
+  const activePrinterResult = await client.query(
+    `SELECT printer.global_id
+     FROM operations_printers printer
+     WHERE printer.organization_id = $1::uuid
+       AND printer.warehouse_id = $2::uuid
+       AND printer.status <> 'disabled'
+     ORDER BY printer.id
+     FOR UPDATE OF printer`,
+    [scope.organizationId, warehouse.id],
+  )
+  const activePrintAgentResult = await client.query(
+    `SELECT agent.global_id
+     FROM operations_print_agents agent
+     WHERE agent.organization_id = $1::uuid
+       AND agent.warehouse_id = $2::uuid
+       AND agent.status = 'active'
+     ORDER BY agent.id
+     FOR UPDATE OF agent`,
+    [scope.organizationId, warehouse.id],
+  )
+  const unrelatedDependents = [
+    ['active_reservations', unrelatedReservationResult.rowCount],
+    ['active_allocations', unrelatedAllocationResult.rowCount],
+    ['non_cancelled_plans', unrelatedPlanResult.rowCount],
+    ['nonterminal_receipts', nonterminalReceiptResult.rowCount],
+    ['nonterminal_replenishment_tasks', nonterminalReplenishmentResult.rowCount],
+    ['other_active_waves', otherActiveWaveResult.rowCount],
+    ['active_printers', activePrinterResult.rowCount],
+    ['active_print_agents', activePrintAgentResult.rowCount],
+  ].filter(([, count]) => Number(count) > 0)
+  if (unrelatedDependents.length > 0) {
+    fail(
+      'Scenario cleanup refused active unrelated warehouse or pool dependents: '
+      + unrelatedDependents.map(([name, count]) => `${name}=${count}`).join(', '),
+    )
+  }
+
+  return {
+    scope: {
+      ...scope,
+      pipelineId,
+      pipelineName: pipelineResult.rows[0].name,
+    },
+    integration,
+    warehouse,
+    customer,
+    pool,
+    orderIds,
+    waveIds,
   }
 }
 
@@ -1540,10 +2114,11 @@ async function seedScenario(client, configuration, scenario) {
   try {
     await client.query(
       `SELECT pg_advisory_xact_lock(hashtext($1))`,
-      [`${scenario.scenarioKey}:${configuration.organizationId}`],
+      [simulatorLineageLockKey(configuration.organizationId)],
     )
     await requireSchema(client)
     const scope = await resolveScope(client, configuration)
+    await assertSimulatorLineageSeedable(client, scope)
     await upsertActor(client, scope, scenario)
     const customer = await upsertSyntheticCustomer(client, scope, scenario)
     const products = await upsertProducts(client, scope, scenario)
@@ -1611,17 +2186,19 @@ async function seedScenario(client, configuration, scenario) {
   }
 }
 
-async function releaseScenarioReservations(client, scope, scenario) {
+async function releaseScenarioReservations(client, scope, scenario, orderIds) {
+  if (orderIds.length === 0) return 0
+
   const reservations = await client.query(
     `SELECT reservation.id::text, reservation.global_id, reservation.position_id::text,
             reservation.quantity
      FROM operations_reservations reservation
      WHERE reservation.organization_id = $1::uuid
-       AND reservation.idempotency_key LIKE $2
+       AND reservation.order_id = ANY($2::uuid[])
        AND reservation.status = 'active'
      ORDER BY reservation.created_at, reservation.id
      FOR UPDATE`,
-    [scope.organizationId, `${scenario.scenarioKey}:reservation:%`],
+    [scope.organizationId, orderIds],
   )
   for (const reservation of reservations.rows) {
     const positionResult = await client.query(
@@ -1681,7 +2258,7 @@ async function releaseScenarioReservations(client, scope, scenario) {
     )
     await client.query(
       `UPDATE operations_reservations
-       SET status = 'released', released_at = now()
+       SET status = 'released', released_at = COALESCE(released_at, now())
        WHERE organization_id = $1::uuid AND id = $2::uuid`,
       [scope.organizationId, reservation.id],
     )
@@ -1689,18 +2266,484 @@ async function releaseScenarioReservations(client, scope, scenario) {
   return reservations.rowCount
 }
 
+async function assertScenarioRetired(client, scope, scenario) {
+  const result = await client.query(
+    `WITH target_warehouse AS (
+       SELECT warehouse.id
+       FROM operations_warehouses warehouse
+       WHERE warehouse.organization_id = $1::uuid
+         AND warehouse.code = 'DEV-WMS-SIM-01'
+         AND warehouse.address->>'scenarioKey' = $2
+     ),
+     target_pool AS (
+       SELECT pool.id
+       FROM operations_inventory_pools pool
+       WHERE pool.organization_id = $1::uuid
+         AND pool.name = '[DEV WMS] Shared Simulation Pool'
+     ),
+     target_locations AS (
+       SELECT location.id
+       FROM operations_locations location
+       WHERE location.organization_id = $1::uuid
+         AND location.warehouse_id IN (SELECT id FROM target_warehouse)
+     ),
+     scenario_products AS (
+       SELECT product.id
+       FROM crm_products product
+       JOIN pipeline_spaces pipeline
+         ON pipeline.id = product.pipeline_id
+        AND pipeline.workspace_organization_id = $1::uuid
+       WHERE product.source_key LIKE $6
+         AND product.source_payload->>'scenarioKey' = $2
+     ),
+     scenario_orders AS (
+       SELECT orders.id
+       FROM operations_orders orders
+       WHERE orders.organization_id = $1::uuid
+         AND orders.source_provider = 'wms_development_simulator'
+         AND orders.source_payload->>'scenarioKey' = $2
+     )
+     SELECT
+       (
+         SELECT CASE WHEN count(*) = 1 THEN 0 ELSE 1 END
+         FROM operations_integration_accounts integration
+         WHERE integration.organization_id = $1::uuid
+           AND integration.provider = 'wms_development_simulator'
+           AND integration.integration_type = 'commerce'
+           AND integration.environment = 'mock'
+           AND integration.configuration->>'scenarioKey' = $2
+       )::integer AS integration_count_invalid,
+       (
+         SELECT CASE WHEN count(*) = $5::integer THEN 0 ELSE 1 END
+         FROM operations_orders orders
+         WHERE orders.organization_id = $1::uuid
+           AND orders.source_provider = 'wms_development_simulator'
+           AND orders.source_payload->>'scenarioKey' = $2
+       )::integer AS order_count_invalid,
+       (
+         SELECT CASE WHEN count(*) = 1 THEN 0 ELSE 1 END
+         FROM operations_warehouses warehouse
+         WHERE warehouse.organization_id = $1::uuid
+           AND warehouse.code = 'DEV-WMS-SIM-01'
+           AND warehouse.address->>'scenarioKey' = $2
+       )::integer AS warehouse_count_invalid,
+       (
+         SELECT CASE WHEN count(*) = 1 THEN 0 ELSE 1 END
+         FROM operations_inventory_pools pool
+         WHERE pool.organization_id = $1::uuid
+           AND pool.name = '[DEV WMS] Shared Simulation Pool'
+       )::integer AS inventory_pool_count_invalid,
+       (
+         SELECT count(*)
+         FROM operations_integration_accounts integration
+         WHERE integration.organization_id = $1::uuid
+           AND integration.provider = 'wms_development_simulator'
+           AND integration.integration_type = 'commerce'
+           AND integration.environment = 'mock'
+           AND integration.configuration->>'scenarioKey' = $2
+           AND (
+             integration.status <> 'disabled'
+             OR integration.credential_reference IS NOT NULL
+             OR integration.configuration->>'state' IS DISTINCT FROM 'retired'
+           )
+       )::integer AS integrations_not_retired,
+       (
+         SELECT count(*)
+         FROM operations_orders orders
+         WHERE orders.organization_id = $1::uuid
+           AND orders.source_provider = 'wms_development_simulator'
+           AND orders.source_payload->>'scenarioKey' = $2
+           AND (
+             orders.status <> 'cancelled'
+             OR orders.archived_at IS NULL
+             OR orders.archive_reason IS NULL
+             OR orders.archived_by IS NULL
+             OR orders.source_payload->>'simulationState' IS DISTINCT FROM 'retired'
+             OR orders.source_payload->>'retirementReason'
+               IS DISTINCT FROM 'wms_development_simulation_retired'
+           )
+       )::integer AS orders_not_retired,
+       (
+         SELECT count(*)
+         FROM operations_reservations reservation
+         JOIN operations_orders orders
+           ON orders.organization_id = reservation.organization_id
+          AND orders.id = reservation.order_id
+         WHERE reservation.organization_id = $1::uuid
+           AND orders.source_provider = 'wms_development_simulator'
+           AND orders.source_payload->>'scenarioKey' = $2
+           AND reservation.status = 'active'
+       )::integer AS active_reservations,
+       (
+         SELECT count(*)
+         FROM operations_reservations reservation
+         JOIN operations_inventory_positions position
+           ON position.organization_id = reservation.organization_id
+          AND position.id = reservation.position_id
+         JOIN operations_orders orders
+           ON orders.organization_id = reservation.organization_id
+          AND orders.id = reservation.order_id
+         WHERE reservation.organization_id = $1::uuid
+           AND reservation.status = 'active'
+           AND (
+             position.pool_id IN (SELECT id FROM target_pool)
+             OR position.warehouse_id IN (SELECT id FROM target_warehouse)
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM scenario_orders
+             WHERE scenario_orders.id = orders.id
+           )
+       )::integer AS unrelated_active_reservations,
+       (
+         SELECT count(*)
+         FROM operations_fulfillment_allocations allocation
+         JOIN operations_inventory_positions position
+           ON position.organization_id = allocation.organization_id
+          AND position.id = allocation.position_id
+         JOIN operations_fulfillment_plans plan
+           ON plan.organization_id = allocation.organization_id
+          AND plan.id = allocation.plan_id
+         JOIN operations_orders orders
+           ON orders.organization_id = plan.organization_id
+          AND orders.id = plan.order_id
+         WHERE allocation.organization_id = $1::uuid
+           AND plan.status <> 'cancelled'
+           AND (
+             position.pool_id IN (SELECT id FROM target_pool)
+             OR position.warehouse_id IN (SELECT id FROM target_warehouse)
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM scenario_orders
+             WHERE scenario_orders.id = orders.id
+           )
+       )::integer AS unrelated_active_allocations,
+       (
+         SELECT count(*)
+         FROM operations_fulfillment_plans plan
+         JOIN operations_orders orders
+           ON orders.organization_id = plan.organization_id
+          AND orders.id = plan.order_id
+         WHERE plan.organization_id = $1::uuid
+           AND plan.warehouse_id IN (SELECT id FROM target_warehouse)
+           AND plan.status <> 'cancelled'
+           AND NOT EXISTS (
+             SELECT 1 FROM scenario_orders
+             WHERE scenario_orders.id = orders.id
+           )
+       )::integer AS unrelated_non_cancelled_plans,
+       (
+         SELECT count(*)
+         FROM operations_receipts receipt
+         WHERE receipt.organization_id = $1::uuid
+           AND receipt.status NOT IN ('completed', 'cancelled')
+           AND (
+             receipt.warehouse_id IN (SELECT id FROM target_warehouse)
+             OR receipt.inventory_pool_id IN (SELECT id FROM target_pool)
+             OR EXISTS (
+               SELECT 1
+               FROM operations_receipt_lines receipt_line
+               JOIN operations_locations target_location
+                 ON target_location.organization_id = receipt_line.organization_id
+                AND target_location.id = receipt_line.target_location_id
+               WHERE receipt_line.organization_id = receipt.organization_id
+                 AND receipt_line.receipt_id = receipt.id
+                 AND target_location.warehouse_id IN (
+                   SELECT id FROM target_warehouse
+                 )
+             )
+           )
+       )::integer AS unrelated_nonterminal_receipts,
+       (
+         SELECT count(*)
+         FROM operations_replenishment_tasks task
+         WHERE task.organization_id = $1::uuid
+           AND task.status NOT IN ('completed', 'cancelled')
+           AND (
+             task.warehouse_id IN (SELECT id FROM target_warehouse)
+             OR task.inventory_pool_id IN (SELECT id FROM target_pool)
+             OR EXISTS (
+               SELECT 1
+               FROM operations_locations task_location
+               WHERE task_location.organization_id = task.organization_id
+                 AND task_location.id IN (
+                   task.source_location_id,
+                   task.destination_location_id
+                 )
+                 AND task_location.warehouse_id IN (
+                   SELECT id FROM target_warehouse
+                 )
+             )
+           )
+       )::integer AS unrelated_nonterminal_replenishment_tasks,
+       (
+         SELECT count(*)
+         FROM operations_inventory_positions position
+         WHERE position.organization_id = $1::uuid
+           AND position.warehouse_id IN (SELECT id FROM target_warehouse)
+           AND NOT EXISTS (
+             SELECT 1 FROM target_pool WHERE target_pool.id = position.pool_id
+           )
+       )::integer AS foreign_pool_positions_in_warehouse,
+       (
+         SELECT count(*)
+         FROM operations_inventory_positions position
+         WHERE position.organization_id = $1::uuid
+           AND position.warehouse_id IN (SELECT id FROM target_warehouse)
+           AND (
+             NOT EXISTS (
+               SELECT 1
+               FROM scenario_products
+               WHERE scenario_products.id = position.product_id
+             )
+             OR NOT EXISTS (
+               SELECT 1
+               FROM target_locations
+               WHERE target_locations.id = position.location_id
+             )
+           )
+       )::integer AS foreign_product_or_location_positions,
+       (
+         SELECT count(*)
+         FROM operations_inventory_positions position
+         WHERE position.organization_id = $1::uuid
+           AND position.pool_id IN (SELECT id FROM target_pool)
+           AND NOT EXISTS (
+             SELECT 1
+             FROM target_warehouse
+             WHERE target_warehouse.id = position.warehouse_id
+           )
+       )::integer AS simulator_pool_positions_outside_warehouse,
+       (
+         SELECT count(*)
+         FROM operations_fulfillment_plans plan
+         JOIN operations_orders orders
+           ON orders.organization_id = plan.organization_id
+          AND orders.id = plan.order_id
+         WHERE plan.organization_id = $1::uuid
+           AND orders.source_provider = 'wms_development_simulator'
+           AND orders.source_payload->>'scenarioKey' = $2
+           AND plan.status <> 'cancelled'
+       )::integer AS plans_not_cancelled,
+       (
+         SELECT count(*)
+         FROM operations_pick_tasks pick_task
+         JOIN operations_fulfillment_plans plan
+           ON plan.organization_id = pick_task.organization_id
+          AND plan.id = pick_task.plan_id
+         JOIN operations_orders orders
+           ON orders.organization_id = plan.organization_id
+          AND orders.id = plan.order_id
+         WHERE pick_task.organization_id = $1::uuid
+           AND orders.source_provider = 'wms_development_simulator'
+           AND orders.source_payload->>'scenarioKey' = $2
+           AND pick_task.status <> 'cancelled'
+       )::integer AS tasks_not_cancelled,
+       (
+         SELECT count(*)
+         FROM operations_waves wave
+         WHERE wave.organization_id = $1::uuid
+           AND (
+             (
+               wave.name = $3
+               AND EXISTS (
+                 SELECT 1
+                 FROM operations_warehouses warehouse
+                 WHERE warehouse.organization_id = wave.organization_id
+                   AND warehouse.id = wave.warehouse_id
+                   AND warehouse.code = 'DEV-WMS-SIM-01'
+                   AND warehouse.address->>'scenarioKey' = $2
+               )
+             )
+             OR EXISTS (
+               SELECT 1
+               FROM operations_pick_tasks wave_task
+               JOIN operations_fulfillment_plans wave_plan
+                 ON wave_plan.organization_id = wave_task.organization_id
+                AND wave_plan.id = wave_task.plan_id
+               JOIN operations_orders wave_order
+                 ON wave_order.organization_id = wave_plan.organization_id
+                AND wave_order.id = wave_plan.order_id
+               WHERE wave_task.organization_id = wave.organization_id
+                 AND wave_task.wave_id = wave.id
+                 AND wave_order.source_provider = 'wms_development_simulator'
+                 AND wave_order.source_payload->>'scenarioKey' = $2
+             )
+           )
+           AND wave.status <> 'cancelled'
+       )::integer AS waves_not_cancelled,
+       (
+         SELECT count(*)
+         FROM operations_waves wave
+         WHERE wave.organization_id = $1::uuid
+           AND wave.warehouse_id IN (SELECT id FROM target_warehouse)
+           AND wave.status IN ('planned', 'released', 'in_progress')
+           AND wave.name IS DISTINCT FROM $3
+           AND NOT EXISTS (
+             SELECT 1
+             FROM operations_pick_tasks wave_task
+             JOIN operations_fulfillment_plans wave_plan
+               ON wave_plan.organization_id = wave_task.organization_id
+              AND wave_plan.id = wave_task.plan_id
+             JOIN scenario_orders
+               ON scenario_orders.id = wave_plan.order_id
+             WHERE wave_task.organization_id = wave.organization_id
+               AND wave_task.wave_id = wave.id
+           )
+       )::integer AS unrelated_active_waves,
+       (
+         SELECT count(*)
+         FROM operations_printers printer
+         WHERE printer.organization_id = $1::uuid
+           AND printer.warehouse_id IN (SELECT id FROM target_warehouse)
+           AND printer.status <> 'disabled'
+       )::integer AS unrelated_active_printers,
+       (
+         SELECT count(*)
+         FROM operations_print_agents agent
+         WHERE agent.organization_id = $1::uuid
+           AND agent.warehouse_id IN (SELECT id FROM target_warehouse)
+           AND agent.status = 'active'
+       )::integer AS unrelated_active_print_agents,
+       (
+         SELECT count(*)
+         FROM operations_exceptions exception
+         JOIN operations_orders orders
+           ON orders.organization_id = exception.organization_id
+          AND orders.id = exception.order_id
+         WHERE exception.organization_id = $1::uuid
+           AND orders.source_provider = 'wms_development_simulator'
+           AND orders.source_payload->>'scenarioKey' = $2
+           AND exception.status IN ('open', 'acknowledged')
+       )::integer AS active_exceptions,
+       (
+         SELECT count(*)
+         FROM operations_warehouses warehouse
+         WHERE warehouse.organization_id = $1::uuid
+           AND warehouse.code = 'DEV-WMS-SIM-01'
+           AND warehouse.address->>'scenarioKey' = $2
+           AND (
+             warehouse.status <> 'inactive'
+             OR warehouse.address->>'state' IS DISTINCT FROM 'retired'
+           )
+       )::integer AS active_warehouses,
+       (
+         SELECT count(*)
+         FROM operations_locations location
+         JOIN operations_warehouses warehouse
+           ON warehouse.organization_id = location.organization_id
+          AND warehouse.id = location.warehouse_id
+         WHERE location.organization_id = $1::uuid
+           AND warehouse.code = 'DEV-WMS-SIM-01'
+           AND warehouse.address->>'scenarioKey' = $2
+           AND location.active
+       )::integer AS active_locations,
+       (
+         SELECT count(*)
+         FROM operations_location_product_rules rule
+         JOIN operations_locations location
+           ON location.organization_id = rule.organization_id
+          AND location.id = rule.location_id
+         JOIN operations_warehouses warehouse
+           ON warehouse.organization_id = location.organization_id
+          AND warehouse.id = location.warehouse_id
+         WHERE rule.organization_id = $1::uuid
+           AND warehouse.code = 'DEV-WMS-SIM-01'
+           AND warehouse.address->>'scenarioKey' = $2
+           AND rule.active
+       )::integer AS active_location_rules,
+       (
+         SELECT count(*)
+         FROM operations_product_mappings mapping
+         JOIN operations_integration_accounts integration
+           ON integration.organization_id = mapping.organization_id
+          AND integration.id = mapping.integration_account_id
+         WHERE mapping.organization_id = $1::uuid
+           AND integration.provider = 'wms_development_simulator'
+           AND integration.integration_type = 'commerce'
+           AND integration.environment = 'mock'
+           AND integration.configuration->>'scenarioKey' = $2
+           AND mapping.active
+       )::integer AS active_product_mappings,
+       (
+         SELECT count(*)
+         FROM operations_inventory_pools pool
+         WHERE pool.organization_id = $1::uuid
+           AND pool.name = '[DEV WMS] Shared Simulation Pool'
+           AND pool.active
+       )::integer AS active_inventory_pools,
+       (
+         SELECT count(*)
+         FROM crm_products product
+         JOIN pipeline_spaces pipeline
+           ON pipeline.id = product.pipeline_id
+          AND pipeline.workspace_organization_id = $1::uuid
+         WHERE product.source_key LIKE $6
+           AND product.source_payload->>'scenarioKey' = $2
+           AND (product.active OR product.status IS DISTINCT FROM 'Inactive')
+       )::integer AS active_products,
+       (
+         SELECT count(*)
+         FROM crm_organizations customer
+         JOIN pipeline_spaces pipeline
+           ON pipeline.id = customer.pipeline_id
+          AND pipeline.workspace_organization_id = $1::uuid
+         WHERE customer.source_key = $7
+           AND customer.source_payload->>'scenarioKey' = $2
+           AND customer.source_payload->>'state' IS DISTINCT FROM 'retired'
+       )::integer AS active_customers,
+       (
+         SELECT count(*)
+         FROM app_user_organization_memberships membership
+         WHERE membership.organization_id = $1::uuid
+           AND membership.user_email = $4
+           AND (membership.status <> 'disabled' OR membership.is_default)
+       )::integer AS active_actor_memberships,
+       (
+         SELECT count(*)
+         FROM app_users actor
+         WHERE actor.email = $4
+           AND actor.status <> 'disabled'
+       )::integer AS active_actors`,
+    [
+      scope.organizationId,
+      scenario.scenarioKey,
+      `[DEV WMS] Replenishment Pressure ${scenario.anchorDate}`,
+      scenario.actor.email,
+      scenario.orders.length,
+      `${scenario.scenarioKey}:product:%`,
+      scenario.customer.sourceKey,
+    ],
+  )
+  const violations = Object.entries(result.rows[0])
+    .filter(([, count]) => Number(count) > 0)
+    .map(([name, count]) => `${name}=${count}`)
+  if (violations.length > 0) {
+    fail(`Scenario cleanup postflight failed: ${violations.join(', ')}`)
+  }
+}
+
 async function cleanupScenario(client, configuration, scenario) {
   await client.query('BEGIN')
   try {
     await client.query(
       `SELECT pg_advisory_xact_lock(hashtext($1))`,
-      [`${scenario.scenarioKey}:${configuration.organizationId}`],
+      [simulatorLineageLockKey(configuration.organizationId)],
     )
     await requireSchema(client)
-    const scope = await resolveScope(client, configuration)
-    const releasedReservations = await releaseScenarioReservations(client, scope, scenario)
+    const resolvedScope = await resolveScope(client, configuration)
+    const target = await resolveScenarioRetirementTarget(
+      client,
+      configuration,
+      resolvedScope,
+      scenario,
+    )
+    const scope = target.scope
+    const integrationIds = [target.integration.id]
+    const warehouseIds = [target.warehouse.id]
+    const orderIds = target.orderIds
+    const waveIds = target.waveIds
 
-    const integrationResult = await client.query(
+    await client.query(
       `UPDATE operations_integration_accounts
        SET status = 'disabled',
            configuration = configuration || '{"state":"retired"}'::jsonb,
@@ -1708,67 +2751,114 @@ async function cleanupScenario(client, configuration, scenario) {
            updated_by = $2,
            updated_at = now()
        WHERE organization_id = $1::uuid
-         AND provider = 'wms_development_simulator'
-         AND integration_type = 'commerce'
-         AND environment = 'mock'
-       RETURNING id::text`,
-      [scope.organizationId, scenario.actor.email],
+         AND id = $3::uuid
+         AND (
+           status <> 'disabled'
+           OR credential_reference IS NOT NULL
+           OR configuration->>'state' IS DISTINCT FROM 'retired'
+         )`,
+      [scope.organizationId, scenario.actor.email, target.integration.id],
     )
-    const integrationIds = integrationResult.rows.map((row) => row.id)
+
+    const releasedReservations = await releaseScenarioReservations(
+      client,
+      scope,
+      scenario,
+      orderIds,
+    )
 
     let cancelledOrders = 0
-    if (integrationIds.length > 0) {
-      const orderIds = await client.query(
-        `SELECT id::text
-         FROM operations_orders
-         WHERE organization_id = $1::uuid
-           AND integration_account_id = ANY($2::uuid[])`,
-        [scope.organizationId, integrationIds],
+    let cancelledPickTasks = 0
+    let cancelledPlans = 0
+    let cancelledWaves = 0
+    let dismissedExceptions = 0
+    if (orderIds.length > 0) {
+      const taskResult = await client.query(
+        `UPDATE operations_pick_tasks pick_task
+         SET status = 'cancelled', updated_at = now()
+         FROM operations_fulfillment_plans plan
+         WHERE pick_task.organization_id = $1::uuid
+           AND pick_task.plan_id = plan.id
+           AND plan.order_id = ANY($2::uuid[])
+           AND pick_task.status <> 'cancelled'
+         RETURNING pick_task.id`,
+        [scope.organizationId, orderIds],
       )
-      const ids = orderIds.rows.map((row) => row.id)
-      if (ids.length > 0) {
-        await client.query(
-          `UPDATE operations_pick_tasks pick_task
-           SET status = 'cancelled', updated_at = now()
-           FROM operations_fulfillment_plans plan
-           WHERE pick_task.organization_id = $1::uuid
-             AND pick_task.plan_id = plan.id
-             AND plan.order_id = ANY($2::uuid[])`,
-          [scope.organizationId, ids],
-        )
-        await client.query(
-          `UPDATE operations_fulfillment_plans
-           SET status = 'cancelled', updated_at = now()
-           WHERE organization_id = $1::uuid
-             AND order_id = ANY($2::uuid[])`,
-          [scope.organizationId, ids],
-        )
-        const cancelled = await client.query(
-          `UPDATE operations_orders
-           SET status = 'cancelled',
-               source_payload = source_payload || '{"simulationState":"retired"}'::jsonb,
-               updated_by = $3,
-               row_version = row_version + 1,
-               updated_at = now()
-           WHERE organization_id = $1::uuid
-             AND id = ANY($2::uuid[])
-           RETURNING id`,
-          [scope.organizationId, ids, scenario.actor.email],
-        )
-        cancelledOrders = cancelled.rowCount
-      }
+      cancelledPickTasks = taskResult.rowCount
+
+      const planResult = await client.query(
+        `UPDATE operations_fulfillment_plans
+         SET status = 'cancelled', updated_at = now()
+         WHERE organization_id = $1::uuid
+           AND order_id = ANY($2::uuid[])
+           AND status <> 'cancelled'
+         RETURNING id`,
+        [scope.organizationId, orderIds],
+      )
+      cancelledPlans = planResult.rowCount
+
+      const exceptionResult = await client.query(
+        `UPDATE operations_exceptions exception
+         SET status = 'dismissed',
+             resolved_by = COALESCE(exception.resolved_by, $3),
+             resolved_at = COALESCE(exception.resolved_at, now()),
+             details = exception.details || jsonb_build_object(
+               'retirementReason', 'wms_development_simulation_retired'
+             ),
+             updated_at = now()
+         WHERE exception.organization_id = $1::uuid
+           AND exception.order_id = ANY($2::uuid[])
+           AND exception.status IN ('open', 'acknowledged')
+         RETURNING exception.id`,
+        [scope.organizationId, orderIds, scenario.actor.email],
+      )
+      dismissedExceptions = exceptionResult.rowCount
+
+      const cancelled = await client.query(
+        `UPDATE operations_orders
+         SET status = 'cancelled',
+             source_payload = source_payload || jsonb_build_object(
+               'simulationState', 'retired',
+               'retirementReason', 'wms_development_simulation_retired'
+             ),
+             archived_at = COALESCE(archived_at, now()),
+             archive_reason = COALESCE(
+               archive_reason,
+               'wms_development_simulation_retired'
+             ),
+             archived_by = COALESCE(archived_by, $3),
+             updated_by = $3,
+             row_version = row_version + 1,
+             updated_at = now()
+         WHERE organization_id = $1::uuid
+           AND id = ANY($2::uuid[])
+           AND (
+             status <> 'cancelled'
+             OR archived_at IS NULL
+             OR archive_reason IS NULL
+             OR archived_by IS NULL
+             OR source_payload->>'simulationState' IS DISTINCT FROM 'retired'
+             OR source_payload->>'retirementReason'
+               IS DISTINCT FROM 'wms_development_simulation_retired'
+           )
+         RETURNING id`,
+        [scope.organizationId, orderIds, scenario.actor.email],
+      )
+      cancelledOrders = cancelled.rowCount
     }
 
-    await client.query(
-      `UPDATE operations_waves
-       SET status = 'cancelled', completed_at = now()
-       WHERE organization_id = $1::uuid
-         AND name = $2`,
-      [
-        scope.organizationId,
-        `[DEV WMS] Replenishment Pressure ${scenario.anchorDate}`,
-      ],
+    const waveResult = await client.query(
+      `UPDATE operations_waves wave
+       SET status = 'cancelled',
+           completed_at = COALESCE(completed_at, now())
+       WHERE wave.organization_id = $1::uuid
+         AND wave.id = ANY($2::uuid[])
+         AND wave.status <> 'cancelled'
+       RETURNING wave.id::text`,
+      [scope.organizationId, waveIds],
     )
+    cancelledWaves = waveResult.rowCount
+
     await client.query(
       `UPDATE operations_location_product_rules rule
        SET active = false, updated_by = $2, updated_at = now()
@@ -1776,14 +2866,16 @@ async function cleanupScenario(client, configuration, scenario) {
        WHERE rule.organization_id = $1::uuid
          AND rule.location_id = location.id
          AND location.warehouse_id = warehouse.id
-         AND warehouse.code = 'DEV-WMS-SIM-01'`,
-      [scope.organizationId, scenario.actor.email],
+         AND warehouse.id = ANY($3::uuid[])
+         AND rule.active`,
+      [scope.organizationId, scenario.actor.email, warehouseIds],
     )
     await client.query(
       `UPDATE operations_product_mappings
        SET active = false, updated_at = now()
        WHERE organization_id = $1::uuid
-         AND integration_account_id = ANY($2::uuid[])`,
+         AND integration_account_id = ANY($2::uuid[])
+         AND active`,
       [scope.organizationId, integrationIds],
     )
     await client.query(
@@ -1795,24 +2887,35 @@ async function cleanupScenario(client, configuration, scenario) {
        FROM operations_warehouses warehouse
        WHERE location.organization_id = $1::uuid
          AND location.warehouse_id = warehouse.id
-         AND warehouse.code = 'DEV-WMS-SIM-01'`,
-      [scope.organizationId, scenario.actor.email],
+         AND warehouse.id = ANY($3::uuid[])
+         AND location.active`,
+      [scope.organizationId, scenario.actor.email, warehouseIds],
     )
     await client.query(
       `UPDATE operations_warehouses
        SET status = 'inactive',
+           address = address || jsonb_build_object(
+             'state', 'retired',
+             'retirementReason', 'wms_development_simulation_retired'
+           ),
            updated_by = $2,
            row_version = row_version + 1,
            updated_at = now()
-       WHERE organization_id = $1::uuid AND code = 'DEV-WMS-SIM-01'`,
-      [scope.organizationId, scenario.actor.email],
+       WHERE organization_id = $1::uuid
+         AND id = ANY($3::uuid[])
+         AND (
+           status <> 'inactive'
+           OR address->>'state' IS DISTINCT FROM 'retired'
+         )`,
+      [scope.organizationId, scenario.actor.email, warehouseIds],
     )
     await client.query(
       `UPDATE operations_inventory_pools
        SET active = false, updated_at = now()
        WHERE organization_id = $1::uuid
-         AND name = '[DEV WMS] Shared Simulation Pool'`,
-      [scope.organizationId],
+         AND id = $2::uuid
+         AND active`,
+      [scope.organizationId, target.pool.id],
     )
     await client.query(
       `UPDATE crm_products
@@ -1822,16 +2925,35 @@ async function cleanupScenario(client, configuration, scenario) {
            updated_by = $3,
            updated_at = now()
        WHERE pipeline_id = $1::uuid
-         AND source_key LIKE $2`,
-      [scope.pipelineId, `${scenario.scenarioKey}:product:%`, scenario.actor.email],
+         AND source_key LIKE $2
+         AND source_payload->>'scenarioKey' = $4
+         AND (
+           active
+           OR status IS DISTINCT FROM 'Inactive'
+           OR source_payload->>'simulationState' IS DISTINCT FROM 'retired'
+         )`,
+      [
+        scope.pipelineId,
+        `${scenario.scenarioKey}:product:%`,
+        scenario.actor.email,
+        scenario.scenarioKey,
+      ],
     )
     await client.query(
       `UPDATE crm_organizations
        SET source_payload = source_payload || '{"state":"retired"}'::jsonb,
            updated_by = $3,
            updated_at = now()
-       WHERE pipeline_id = $1::uuid AND source_key = $2`,
-      [scope.pipelineId, scenario.customer.sourceKey, scenario.actor.email],
+       WHERE pipeline_id = $1::uuid
+         AND id = $2::uuid
+         AND source_payload->>'scenarioKey' = $4
+         AND source_payload->>'state' IS DISTINCT FROM 'retired'`,
+      [
+        scope.pipelineId,
+        target.customer.id,
+        scenario.actor.email,
+        scenario.scenarioKey,
+      ],
     )
     await client.query(
       `UPDATE app_user_organization_memberships
@@ -1839,7 +2961,9 @@ async function cleanupScenario(client, configuration, scenario) {
            is_default = false,
            updated_by = $1,
            updated_at = now()
-       WHERE user_email = $1 AND organization_id = $2::uuid`,
+       WHERE user_email = $1
+         AND organization_id = $2::uuid
+         AND (status <> 'disabled' OR is_default)`,
       [scenario.actor.email, scope.organizationId],
     )
     await client.query(
@@ -1848,9 +2972,16 @@ async function cleanupScenario(client, configuration, scenario) {
            activated_at = NULL,
            permissions = $2::jsonb,
            updated_at = now()
-       WHERE email = $1`,
+       WHERE email = $1
+         AND (
+           status <> 'disabled'
+           OR activated_at IS NOT NULL
+           OR permissions IS DISTINCT FROM $2::jsonb
+         )`,
       [scenario.actor.email, JSON.stringify(FALSE_PERMISSIONS)],
     )
+
+    await assertScenarioRetired(client, scope, scenario)
 
     await client.query('COMMIT')
     return {
@@ -1863,6 +2994,12 @@ async function cleanupScenario(client, configuration, scenario) {
       pipelineId: scope.pipelineId,
       reservationsReleased: releasedReservations,
       ordersCancelled: cancelledOrders,
+      ordersArchived: cancelledOrders,
+      pickTasksCancelled: cancelledPickTasks,
+      plansCancelled: cancelledPlans,
+      wavesCancelled: cancelledWaves,
+      exceptionsDismissed: dismissedExceptions,
+      postflightPassed: true,
       immutableInventoryLedgerPreserved: true,
       carrierTransactionsVoided: 0,
       emailsSent: 0,
@@ -1974,6 +3111,9 @@ function printHelp() {
 Optional:
   WMS_SIM_PIPELINE_ID=<uuid>       Select a pipeline in the supplied organization.
   WMS_SIM_ANCHOR_DATE=YYYY-MM-DD  Override the deterministic ${DEFAULT_ANCHOR_DATE} anchor.
+
+Cleanup permanently retires the WMS development simulator lineage for the
+organization. No scenario version can reseed that lineage afterward.
 
 This script has no production override.`)
 }

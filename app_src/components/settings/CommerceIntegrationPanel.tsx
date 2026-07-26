@@ -173,6 +173,84 @@ type CommercePayload = {
   requestedScopes?: string[]
 }
 
+type ShopifyOrderPreviewLine = {
+  externalLineId: string
+  sku: string | null
+  quantity: number
+  currentQuantity: number
+  unfulfilledQuantity: number
+  requiresShipping: boolean
+  mappingStatus: 'inactive' | 'mapped' | 'missing' | 'sku_missing'
+  mappedProductGlobalId: string | null
+  packageProfileReady: boolean
+}
+
+type ShopifyOrderPreviewOrder = {
+  externalOrderId: string
+  orderName: string
+  providerCreatedAt: string
+  providerProcessedAt: string
+  providerUpdatedAt: string
+  providerCancelledAt: string | null
+  providerClosedAt: string | null
+  testOrder: boolean
+  sourceName: string | null
+  financialStatus: string | null
+  fulfillmentStatus: string
+  fulfillable: boolean
+  requiresShipping: boolean
+  currencyCode: string
+  subtotalAmount: string
+  shippingAmount: string
+  taxAmount: string
+  totalAmount: string
+  lineItemQuantity: number
+  lineItemsTruncated: boolean
+  normalizedLines: ShopifyOrderPreviewLine[]
+  gapCodes: string[]
+  diagnosticState: 'complete' | 'gaps'
+  sourceHash: string
+}
+
+type ShopifyOrderPreviewState = {
+  accountGlobalId: string
+  status: 'empty' | 'held'
+  policy: {
+    version: string
+    retentionHours: number
+    maxOrders: number
+    maxLinesPerOrder: number
+    rawPayloadStored: boolean
+    customerFieldsRequested: boolean
+    shopifyWritesAllowed: boolean
+    canonicalPromotionAllowed: boolean
+  }
+  run: {
+    credentialVersion: number
+    windowEnd: string
+    ordersSeen: number
+    ordersStaged: number
+    moreAvailable: boolean
+    grantedScopes: string[]
+    canonicalOrdersCreated: number
+    shopifyWrites: number
+    syncCursorAdvanced: boolean
+    completedAt: string
+    expiresAt: string
+  } | null
+  orders: ShopifyOrderPreviewOrder[]
+  gapCounts: Record<string, number>
+}
+
+type ShopifyOrderPreviewPayload = {
+  ok?: boolean
+  error?: string
+  code?: string
+  preview?: ShopifyOrderPreviewState
+  state?: ShopifyOrderPreviewState
+  deleted?: number
+}
+
 type ShopifyForm = {
   displayName: string
   environment: CommerceEnvironment
@@ -248,6 +326,10 @@ function actionableCommerceError(error: unknown) {
       'Update the app version scopes, release it, approve the change in Shopify, then test the connection again.',
     SHOPIFY_SCOPE_PROFILE_INCOMPLETE:
       'Add the listed least-privilege receipt scopes to the Shopify app version, release it, approve the change, and test again.',
+    SHOPIFY_ORDER_READ_SCOPE_REQUIRED:
+      'Add read_orders to the released Shopify app version, approve the scope change, and test the connection again.',
+    SHOPIFY_ORDER_PREVIEW_DISABLED:
+      'This held order-preview diagnostic is available only in an approved ClawPilot development lane with its server feature flag enabled.',
     FAIRE_ACCESS_DENIED:
       'Confirm the Faire app remains authorized for this brand, then reconnect it if access was revoked.',
     FAIRE_RESOURCE_NOT_FOUND:
@@ -284,6 +366,45 @@ async function requestCommerce(init?: RequestInit): Promise<CommercePayload> {
   return result
 }
 
+async function requestShopifyOrderPreview(
+  accountGlobalId: string,
+  init?: RequestInit,
+): Promise<ShopifyOrderPreviewPayload> {
+  const path = new URL(
+    '/api/integrations/commerce/shopify/order-preview',
+    window.location.origin,
+  )
+  if (!init || init.method === 'GET') {
+    path.searchParams.set('accountGlobalId', accountGlobalId)
+  }
+  const response = await fetch(`${path.pathname}${path.search}`, {
+    cache: 'no-store',
+    ...init,
+  })
+  const result = await response.json().catch(() => ({})) as
+    ShopifyOrderPreviewPayload
+  if (!response.ok || !result.ok) {
+    throw new CommerceRequestError(
+      result.error || 'Shopify order-preview request failed',
+      result.code,
+    )
+  }
+  return result
+}
+
+function money(amount: string, currency: string) {
+  const value = Number(amount)
+  if (!Number.isFinite(value)) return `${amount} ${currency}`
+  try {
+    return new Intl.NumberFormat(undefined, {
+      style: 'currency',
+      currency,
+    }).format(value)
+  } catch {
+    return `${amount} ${currency}`
+  }
+}
+
 function statusColor(
   status: CommerceAccount['status'] | CommerceAccount['verificationStatus'],
 ) {
@@ -303,6 +424,9 @@ export default function CommerceIntegrationPanel() {
   const [pendingAction, setPendingAction] = useState('')
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
+  const [shopifyPreviews, setShopifyPreviews] = useState<
+    Record<string, ShopifyOrderPreviewState>
+  >({})
   const [shopify, setShopify] = useState<ShopifyForm>({
     displayName: '',
     environment: 'sandbox',
@@ -398,6 +522,92 @@ export default function CommerceIntegrationPanel() {
         .catch(() => undefined)
       setError(actionError)
       return false
+    } finally {
+      setPendingAction('')
+    }
+  }
+
+  async function loadShopifyPreview(account: CommerceAccount) {
+    const key = `preview-load:${account.globalId}`
+    setPendingAction(key)
+    setError('')
+    try {
+      const payload = await requestShopifyOrderPreview(
+        account.globalId,
+        { method: 'GET' },
+      )
+      if (payload.preview) {
+        setShopifyPreviews((current) => ({
+          ...current,
+          [account.globalId]: payload.preview as ShopifyOrderPreviewState,
+        }))
+      }
+    } catch (requestError) {
+      setError(actionableCommerceError(requestError))
+    } finally {
+      setPendingAction('')
+    }
+  }
+
+  async function importShopifyPreview(account: CommerceAccount) {
+    const key = `preview-import:${account.globalId}`
+    setPendingAction(key)
+    setError('')
+    setNotice('')
+    try {
+      const payload = await requestShopifyOrderPreview(account.globalId, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          accountGlobalId: account.globalId,
+          idempotencyKey: crypto.randomUUID(),
+          confirmReadOnly: true,
+        }),
+      })
+      if (payload.preview) {
+        setShopifyPreviews((current) => ({
+          ...current,
+          [account.globalId]: payload.preview as ShopifyOrderPreviewState,
+        }))
+        setNotice(
+          `${account.displayName} read-only Shopify order preview is held for review. No Shopify records or canonical ClawPilot orders were changed.`,
+        )
+      }
+    } catch (requestError) {
+      setError(actionableCommerceError(requestError))
+    } finally {
+      setPendingAction('')
+    }
+  }
+
+  async function clearShopifyPreview(account: CommerceAccount) {
+    if (
+      !window.confirm(
+        `Clear the ephemeral Shopify order preview for ${account.displayName}? This does not change Shopify or canonical ClawPilot orders.`,
+      )
+    ) return
+    const key = `preview-clear:${account.globalId}`
+    setPendingAction(key)
+    setError('')
+    setNotice('')
+    try {
+      const payload = await requestShopifyOrderPreview(account.globalId, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          accountGlobalId: account.globalId,
+          confirmClear: true,
+        }),
+      })
+      if (payload.state) {
+        setShopifyPreviews((current) => ({
+          ...current,
+          [account.globalId]: payload.state as ShopifyOrderPreviewState,
+        }))
+      }
+      setNotice(`${account.displayName} held Shopify order preview cleared.`)
+    } catch (requestError) {
+      setError(actionableCommerceError(requestError))
     } finally {
       setPendingAction('')
     }
@@ -948,6 +1158,12 @@ export default function CommerceIntegrationPanel() {
               const missingScopes = valueStrings(
                 account.configuration.missingScopes,
               )
+              const preview = shopifyPreviews[account.globalId]
+              const canPreviewShopifyOrders = account.provider === 'shopify'
+                && account.environment === 'sandbox'
+                && account.configured
+                && account.verificationStatus === 'verified'
+                && grantedScopes.includes('read_orders')
               const activationBlockers = account.provider === 'shopify'
                 && account.status !== 'active'
                 ? [
@@ -1166,6 +1382,317 @@ export default function CommerceIntegrationPanel() {
                             ))}
                           </Stack>
                         </Box>
+                      ) : null}
+
+                      {account.provider === 'shopify' ? (
+                        <Accordion
+                          disableGutters
+                          variant="outlined"
+                          sx={{ borderRadius: '8px !important' }}
+                        >
+                          <AccordionSummary
+                            expandIcon={<ExpandMoreRounded />}
+                          >
+                            <Box>
+                              <Typography fontWeight={700}>
+                                Development order preview · read only
+                              </Typography>
+                              <Typography
+                                variant="body2"
+                                color="text.secondary"
+                              >
+                                Inspect a held, minimized sample before
+                                designing canonical order import.
+                              </Typography>
+                            </Box>
+                          </AccordionSummary>
+                          <AccordionDetails>
+                            <Stack spacing={2}>
+                              <Alert severity="warning">
+                                ClawPilot fetches at most the newest 25 non-test
+                                orders and the first 20 lines per order, marks
+                                additional lines as a visible gap, keeps the
+                                minimized diagnostic for 24 hours, and stores
+                                no raw Shopify response, customer contact
+                                fields, shipping address, or customized product
+                                titles. This does not create canonical orders,
+                                advance a synchronization cursor, enable
+                                receipt intake, or write to Shopify.
+                              </Alert>
+
+                              {!canPreviewShopifyOrders ? (
+                                <Alert severity="info">
+                                  Preview requires a verified sandbox
+                                  connection with <code>read_orders</code>{' '}
+                                  granted. Test the connection after Shopify
+                                  approves the released app scopes.
+                                </Alert>
+                              ) : null}
+
+                              <Stack
+                                direction={{ xs: 'column', sm: 'row' }}
+                                gap={1}
+                                flexWrap="wrap"
+                              >
+                                <Button
+                                  variant="outlined"
+                                  disabled={
+                                    pendingAction !== ''
+                                    || !account.configured
+                                  }
+                                  onClick={() => loadShopifyPreview(account)}
+                                  sx={actionButtonSx}
+                                >
+                                  {pendingAction
+                                    === `preview-load:${account.globalId}`
+                                    ? 'Loading…'
+                                    : 'Load current preview'}
+                                </Button>
+                                <Button
+                                  variant="contained"
+                                  startIcon={<SyncRounded />}
+                                  disabled={
+                                    pendingAction !== ''
+                                    || !canPreviewShopifyOrders
+                                  }
+                                  onClick={() => importShopifyPreview(account)}
+                                  sx={actionButtonSx}
+                                >
+                                  {pendingAction
+                                    === `preview-import:${account.globalId}`
+                                    ? 'Fetching…'
+                                    : 'Fetch newest 25 · read only'}
+                                </Button>
+                                <Button
+                                  variant="outlined"
+                                  color="warning"
+                                  disabled={
+                                    pendingAction !== ''
+                                    || !preview?.run
+                                  }
+                                  onClick={() => clearShopifyPreview(account)}
+                                  sx={actionButtonSx}
+                                >
+                                  {pendingAction
+                                    === `preview-clear:${account.globalId}`
+                                    ? 'Clearing…'
+                                    : 'Clear preview'}
+                                </Button>
+                              </Stack>
+
+                              {preview?.run ? (
+                                <>
+                                  <Stack
+                                    direction="row"
+                                    gap={0.75}
+                                    flexWrap="wrap"
+                                  >
+                                    <Chip
+                                      size="small"
+                                      color="success"
+                                      label={`${preview.run.ordersStaged} held orders`}
+                                    />
+                                    <Chip
+                                      size="small"
+                                      label={`${preview.run.ordersSeen} seen`}
+                                    />
+                                    <Chip
+                                      size="small"
+                                      label={`${preview.run.canonicalOrdersCreated} canonical orders`}
+                                    />
+                                    <Chip
+                                      size="small"
+                                      label={`${preview.run.shopifyWrites} Shopify writes`}
+                                    />
+                                    <Chip
+                                      size="small"
+                                      label={`Cursor advanced: ${
+                                        preview.run.syncCursorAdvanced
+                                          ? 'yes'
+                                          : 'no'
+                                      }`}
+                                    />
+                                  </Stack>
+
+                                  <Typography
+                                    variant="caption"
+                                    color="text.secondary"
+                                  >
+                                    Completed{' '}
+                                    {new Date(
+                                      preview.run.completedAt,
+                                    ).toLocaleString()} · expires{' '}
+                                    {new Date(
+                                      preview.run.expiresAt,
+                                    ).toLocaleString()}
+                                  </Typography>
+
+                                  {preview.run.moreAvailable ? (
+                                    <Alert severity="info">
+                                      More matching Shopify orders exist. Only
+                                      the newest 25 were staged for this
+                                      diagnostic; no next-page cursor was
+                                      retained.
+                                    </Alert>
+                                  ) : null}
+
+                                  {Object.keys(preview.gapCounts).length ? (
+                                    <Box>
+                                      <Typography
+                                        variant="caption"
+                                        color="text.secondary"
+                                      >
+                                        Diagnostic gaps
+                                      </Typography>
+                                      <Stack
+                                        direction="row"
+                                        gap={0.75}
+                                        flexWrap="wrap"
+                                        sx={{ mt: 0.5 }}
+                                      >
+                                        {Object.entries(preview.gapCounts)
+                                          .map(([gap, count]) => (
+                                            <Chip
+                                              key={gap}
+                                              size="small"
+                                              color="warning"
+                                              label={`${humanize(gap)} · ${count}`}
+                                            />
+                                          ))}
+                                      </Stack>
+                                    </Box>
+                                  ) : null}
+
+                                  {preview.orders.length ? (
+                                    <TableContainer
+                                      sx={{
+                                        maxHeight: 480,
+                                        border: 1,
+                                        borderColor: 'divider',
+                                        borderRadius: 1,
+                                      }}
+                                    >
+                                      <Table size="small" stickyHeader>
+                                        <TableHead>
+                                          <TableRow>
+                                            <TableCell>Order</TableCell>
+                                            <TableCell>Created</TableCell>
+                                            <TableCell>Status</TableCell>
+                                            <TableCell>Units / SKUs</TableCell>
+                                            <TableCell align="right">
+                                              Total
+                                            </TableCell>
+                                            <TableCell>Gaps</TableCell>
+                                          </TableRow>
+                                        </TableHead>
+                                        <TableBody>
+                                          {preview.orders.map((order) => {
+                                            const skus = order.normalizedLines
+                                              .map((line) => (
+                                                line.sku || 'No SKU'
+                                              ))
+                                            const uniqueSkus = [...new Set(
+                                              skus,
+                                            )]
+                                            return (
+                                              <TableRow
+                                                key={order.externalOrderId}
+                                                hover
+                                              >
+                                                <TableCell>
+                                                  <Typography
+                                                    variant="body2"
+                                                    fontWeight={700}
+                                                  >
+                                                    {order.orderName}
+                                                  </Typography>
+                                                  <Typography
+                                                    variant="caption"
+                                                    color="text.secondary"
+                                                  >
+                                                    {order.sourceName
+                                                      || 'Unknown source'}
+                                                  </Typography>
+                                                </TableCell>
+                                                <TableCell>
+                                                  {new Date(
+                                                    order.providerCreatedAt,
+                                                  ).toLocaleString()}
+                                                </TableCell>
+                                                <TableCell>
+                                                  <Typography variant="body2">
+                                                    {humanize(
+                                                      order.financialStatus
+                                                        || 'unknown',
+                                                    )}
+                                                  </Typography>
+                                                  <Typography
+                                                    variant="caption"
+                                                    color="text.secondary"
+                                                  >
+                                                    {humanize(
+                                                      order.fulfillmentStatus,
+                                                    )}
+                                                  </Typography>
+                                                </TableCell>
+                                                <TableCell>
+                                                  <Typography variant="body2">
+                                                    {order.lineItemQuantity}{' '}
+                                                    units
+                                                  </Typography>
+                                                  <Typography
+                                                    variant="caption"
+                                                    color="text.secondary"
+                                                  >
+                                                    {uniqueSkus
+                                                      .slice(0, 4)
+                                                      .join(', ')}
+                                                    {uniqueSkus.length > 4
+                                                      ? ` +${
+                                                        uniqueSkus.length - 4
+                                                      }`
+                                                      : ''}
+                                                  </Typography>
+                                                </TableCell>
+                                                <TableCell align="right">
+                                                  {money(
+                                                    order.totalAmount,
+                                                    order.currencyCode,
+                                                  )}
+                                                </TableCell>
+                                                <TableCell>
+                                                  {order.gapCodes.length
+                                                    ? order.gapCodes
+                                                      .map(humanize)
+                                                      .join(', ')
+                                                    : 'None detected'}
+                                                </TableCell>
+                                              </TableRow>
+                                            )
+                                          })}
+                                        </TableBody>
+                                      </Table>
+                                    </TableContainer>
+                                  ) : (
+                                    <Alert severity="info">
+                                      The completed preview contained no
+                                      matching non-test orders.
+                                    </Alert>
+                                  )}
+                                </>
+                              ) : (
+                                <Typography
+                                  variant="body2"
+                                  color="text.secondary"
+                                >
+                                  No current held preview is loaded. Loading
+                                  checks ClawPilot only; fetching makes
+                                  read-only Shopify Admin API calls.
+                                </Typography>
+                              )}
+                            </Stack>
+                          </AccordionDetails>
+                        </Accordion>
                       ) : null}
 
                       {activationBlockers.length ? (

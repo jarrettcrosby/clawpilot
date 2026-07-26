@@ -257,6 +257,7 @@ export async function GET() {
           operations_carrier_account_sender_name_migration_applied: boolean
           operations_commerce_integrations_migration_applied: boolean
           operations_faire_oauth_migration_applied: boolean
+          operations_shopify_order_preview_migration_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -732,6 +733,11 @@ export async function GET() {
                 FROM schema_migrations
                 WHERE filename = '0112_operations_faire_oauth.sql'
               ) AS operations_faire_oauth_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0113_operations_shopify_order_preview.sql'
+              ) AS operations_shopify_order_preview_migration_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -838,6 +844,7 @@ export async function GET() {
             && row?.operations_carrier_account_sender_name_migration_applied
             && row?.operations_commerce_integrations_migration_applied
             && row?.operations_faire_oauth_migration_applied
+            && row?.operations_shopify_order_preview_migration_applied
             && row?.migration_checksums_present
           ),
         }
@@ -936,6 +943,7 @@ export async function GET() {
           || !row?.operations_carrier_account_sender_name_migration_applied
           || !row?.operations_commerce_integrations_migration_applied
           || !row?.operations_faire_oauth_migration_applied
+          || !row?.operations_shopify_order_preview_migration_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')
