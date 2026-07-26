@@ -32,8 +32,10 @@ import TableRow from '@mui/material/TableRow'
 import TextField from '@mui/material/TextField'
 import Typography from '@mui/material/Typography'
 import ExpandMoreRounded from '@mui/icons-material/ExpandMoreRounded'
+import ContentCopyRounded from '@mui/icons-material/ContentCopyRounded'
 import LinkRounded from '@mui/icons-material/LinkRounded'
 import LinkOffRounded from '@mui/icons-material/LinkOffRounded'
+import OpenInNewRounded from '@mui/icons-material/OpenInNewRounded'
 import PowerSettingsNewRounded from '@mui/icons-material/PowerSettingsNewRounded'
 import StorefrontRounded from '@mui/icons-material/StorefrontRounded'
 import SyncRounded from '@mui/icons-material/SyncRounded'
@@ -116,6 +118,28 @@ type ProviderCatalog = {
 
 type CommerceCatalog = {
   classification: string
+  onboarding: {
+    shopify: {
+      developerPortalUrl: string
+      setupGuideUrl: string
+      tokenGuideUrl: string
+      defaultAppUrl: string
+      apiVersion: string
+      requiredBeforeConnect: readonly string[]
+      receiptProofScopes: readonly string[]
+      acceptedReceiptTopics: readonly string[]
+      unsupportedCredentialMode: string
+    }
+    faire: {
+      developerPortalUrl: string
+      setupGuideUrl: string
+      requiredBeforeConnect: readonly string[]
+      supportContact: string
+      minimumProbeScope: string
+      sandboxAvailable: boolean
+      webhooksAvailable: boolean
+    }
+  }
   definitions: CapabilityDefinition[]
   providers: Record<CommerceProvider, ProviderCatalog>
   activationBoundary: {
@@ -131,6 +155,7 @@ type CommerceCatalog = {
 type CommercePayload = {
   ok?: boolean
   error?: string
+  code?: string
   canManage?: boolean
   canActivate?: boolean
   integrations?: CommerceState
@@ -181,6 +206,46 @@ function valueStrings(value: unknown): string[] {
     : []
 }
 
+class CommerceRequestError extends Error {
+  constructor(
+    message: string,
+    readonly code = 'COMMERCE_REQUEST_FAILED',
+  ) {
+    super(message)
+    this.name = 'CommerceRequestError'
+  }
+}
+
+function actionableCommerceError(error: unknown) {
+  if (!(error instanceof CommerceRequestError)) {
+    return error instanceof Error
+      ? error.message
+      : 'Sales-channel integration request failed'
+  }
+  const guidance: Record<string, string> = {
+    SHOPIFY_SHOP_NOT_PERMITTED:
+      'Create the app and store under the same organization in Shopify Dev Dashboard.',
+    SHOPIFY_APP_NOT_INSTALLED:
+      'Release an app version, install it on the exact store, then try again.',
+    SHOPIFY_STORE_NOT_FOUND:
+      'Confirm the permanent myshopify.com domain in Shopify store settings; do not use a storefront or admin URL.',
+    SHOPIFY_CLIENT_CREDENTIALS_REJECTED:
+      'Confirm the canonical myshopify.com domain and copy the current client ID and secret from the installed Dev Dashboard app.',
+    SHOPIFY_ACCESS_DENIED:
+      'Update the app version scopes, release it, approve the change in Shopify, then test the connection again.',
+    SHOPIFY_SCOPE_PROFILE_INCOMPLETE:
+      'Add the listed least-privilege receipt scopes to the Shopify app version, release it, approve the change, and test again.',
+    FAIRE_ACCESS_DENIED:
+      'First confirm this is the final brand API key, not the developer app APA token. If it is, ask developers@faire.com to confirm direct production API access for this brand and app before retrying.',
+    FAIRE_RESOURCE_NOT_FOUND:
+      'Confirm this is an active Faire brand account; retailer accounts cannot use the custom integration API.',
+    COMMERCE_ENCRYPTION_UNAVAILABLE:
+      'Ask a ClawPilot administrator to configure commerce credential encryption for this environment.',
+  }
+  const nextStep = guidance[error.code]
+  return `${error.message}${nextStep ? ` ${nextStep}` : ''} [${error.code}]`
+}
+
 async function requestCommerce(init?: RequestInit): Promise<CommercePayload> {
   const response = await fetch('/api/integrations/commerce', {
     cache: 'no-store',
@@ -188,7 +253,10 @@ async function requestCommerce(init?: RequestInit): Promise<CommercePayload> {
   })
   const result = await response.json().catch(() => ({})) as CommercePayload
   if (!response.ok || !result.ok) {
-    throw new Error(result.error || 'Sales-channel integration request failed')
+    throw new CommerceRequestError(
+      result.error || 'Sales-channel integration request failed',
+      result.code,
+    )
   }
   return result
 }
@@ -240,11 +308,7 @@ export default function CommerceIntegrationPanel() {
       })
       .catch((requestError) => {
         if (active) {
-          setError(
-            requestError instanceof Error
-              ? requestError.message
-              : 'Sales-channel integration request failed',
-          )
+          setError(actionableCommerceError(requestError))
         }
       })
       .finally(() => {
@@ -273,11 +337,11 @@ export default function CommerceIntegrationPanel() {
       setNotice(successMessage)
       return true
     } catch (requestError) {
-      setError(
-        requestError instanceof Error
-          ? requestError.message
-          : 'Sales-channel integration request failed',
-      )
+      const actionError = actionableCommerceError(requestError)
+      await requestCommerce()
+        .then((payload) => applyPayload(payload))
+        .catch(() => undefined)
+      setError(actionError)
       return false
     } finally {
       setPendingAction('')
@@ -289,7 +353,7 @@ export default function CommerceIntegrationPanel() {
     const saved = await action(
       'connect-shopify',
       { action: 'connect-shopify', ...shopify },
-      'Shopify store and app credentials verified. Send one signed app-scope, product, or inventory delivery to verify the webhook secret before enabling receipt intake.',
+      'Shopify merchant-owned app connected and its API identity verified. Complete the receipt setup checklist below only when you are ready to enable signed receipt intake.',
     )
     if (saved) {
       setShopify((current) => ({
@@ -306,7 +370,7 @@ export default function CommerceIntegrationPanel() {
     const saved = await action(
       'connect-faire',
       { action: 'connect-faire', ...faire },
-      'Faire brand identity and credential verified. Domain synchronization remains disabled.',
+      'Faire custom integration connected and its brand identity verified. Automated synchronization remains unavailable until the polling worker is released.',
     )
     if (saved) {
       setFaire((current) => ({
@@ -320,7 +384,7 @@ export default function CommerceIntegrationPanel() {
   async function disconnect(account: CommerceAccount) {
     if (
       !window.confirm(
-        `Disconnect ${account.displayName}? Encrypted credentials will be removed; durable operational evidence remains.`,
+        `Disconnect ${account.displayName}? ClawPilot will remove its encrypted credential and retain durable operational evidence. Revoke or remove provider-side access separately.`,
       )
     ) return
     await action(
@@ -328,6 +392,20 @@ export default function CommerceIntegrationPanel() {
       { action: 'disconnect', accountGlobalId: account.globalId },
       `${account.displayName} disconnected.`,
     )
+  }
+
+  async function copyWebhookUrl(account: CommerceAccount) {
+    if (!account.webhookUrl) return
+    setError('')
+    setNotice('')
+    try {
+      await navigator.clipboard.writeText(account.webhookUrl)
+      setNotice(`${account.displayName} webhook URL copied.`)
+    } catch {
+      setError(
+        'The webhook URL could not be copied automatically. Select it from the read-only field and copy it manually.',
+      )
+    }
   }
 
   if (loading) {
@@ -353,9 +431,15 @@ export default function CommerceIntegrationPanel() {
       </Box>
 
       <Alert severity="info">
-        This slice verifies and encrypts credentials, audits provider
-        capabilities, persists sync/retry evidence, and accepts signed Shopify
-        receipt evidence. Canonical order import, inventory writes,
+        These are user-owned custom integrations. Create the application in
+        the provider portal first, install or authorize it for the intended
+        store or brand, and then connect the issued credentials here.
+        ClawPilot does not create a marketplace app or start a multi-merchant
+        OAuth flow on your behalf.
+      </Alert>
+      <Alert severity="warning">
+        A verified connection proves provider identity and encrypted credential
+        storage only. Canonical order import, inventory writes,
         reconciliation workers, fulfillment export, multi-merchant OAuth, and
         production domain activation are not enabled. Order and customer
         webhook topics are rejected until a retention/privacy lifecycle and
@@ -380,14 +464,86 @@ export default function CommerceIntegrationPanel() {
             >
               <Box>
                 <Typography variant="subtitle1" fontWeight={700}>
-                  Shopify store
+                  Shopify merchant-owned app
                 </Typography>
                 <Typography variant="body2" color="text.secondary">
-                  Dev Dashboard client-credentials connection for one
+                  Merchant-owned Dev Dashboard application for one
                   same-organization <code>.myshopify.com</code> store.
-                  Multi-merchant OAuth is a later activation boundary.
                 </Typography>
               </Box>
+              {catalog ? (
+                <Alert severity="info" icon={false}>
+                  <Typography variant="subtitle2" fontWeight={700}>
+                    Before you connect
+                  </Typography>
+                  <Box
+                    component="ol"
+                    sx={{
+                      pl: 2.5,
+                      my: 1,
+                      '& li': { mb: 0.5 },
+                    }}
+                  >
+                    {catalog.onboarding.shopify.requiredBeforeConnect.map(
+                      (step) => (
+                        <Typography component="li" variant="body2" key={step}>
+                          {step}
+                        </Typography>
+                      ),
+                    )}
+                  </Box>
+                  <Typography variant="body2" color="text.secondary">
+                    Use <code>{catalog.onboarding.shopify.defaultAppUrl}</code>{' '}
+                    for an API-only app home, select webhook API version{' '}
+                    <code>{catalog.onboarding.shopify.apiVersion}</code>, and
+                    start with least privilege. The current receipt-proof
+                    profile requires only{' '}
+                    <code>
+                      {catalog.onboarding.shopify.receiptProofScopes.join(', ')}
+                    </code>
+                    . Shopify Admin-created legacy apps and Admin API access
+                    tokens are not supported. Public and custom-distribution
+                    apps require a different OAuth flow and are not supported
+                    by this connection form.
+                  </Typography>
+                  <Stack
+                    direction={{ xs: 'column', sm: 'row' }}
+                    spacing={1}
+                    sx={{ mt: 1.5 }}
+                  >
+                    <Button
+                      href={catalog.onboarding.shopify.developerPortalUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      variant="outlined"
+                      size="small"
+                      endIcon={<OpenInNewRounded />}
+                    >
+                      Open Shopify Dev Dashboard
+                    </Button>
+                    <Button
+                      href={catalog.onboarding.shopify.setupGuideUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      variant="text"
+                      size="small"
+                      endIcon={<OpenInNewRounded />}
+                    >
+                      Shopify setup guide
+                    </Button>
+                    <Button
+                      href={catalog.onboarding.shopify.tokenGuideUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      variant="text"
+                      size="small"
+                      endIcon={<OpenInNewRounded />}
+                    >
+                      Client-credentials guide
+                    </Button>
+                  </Stack>
+                </Alert>
+              ) : null}
               <TextField
                 label="Connection name"
                 value={shopify.displayName}
@@ -482,7 +638,7 @@ export default function CommerceIntegrationPanel() {
               >
                 {pendingAction === 'connect-shopify'
                   ? 'Verifying…'
-                  : 'Verify and save Shopify'}
+                  : 'Connect Shopify Dev Dashboard app'}
               </Button>
             </Stack>
           </CardContent>
@@ -493,13 +649,75 @@ export default function CommerceIntegrationPanel() {
             <Stack component="form" spacing={2} onSubmit={connectFaire}>
               <Box>
                 <Typography variant="subtitle1" fontWeight={700}>
-                  Faire brand
+                  Faire custom integration
                 </Typography>
                 <Typography variant="body2" color="text.secondary">
-                  Production-only brand API connection for the B2B wholesale
-                  marketplace. Faire does not publish webhooks or a sandbox.
+                  Brand-owned unpublished application for the production B2B
+                  wholesale marketplace.
                 </Typography>
               </Box>
+              {catalog ? (
+                <Alert severity="info" icon={false}>
+                  <Typography variant="subtitle2" fontWeight={700}>
+                    Before you connect
+                  </Typography>
+                  <Box
+                    component="ol"
+                    sx={{
+                      pl: 2.5,
+                      my: 1,
+                      '& li': { mb: 0.5 },
+                    }}
+                  >
+                    {catalog.onboarding.faire.requiredBeforeConnect.map(
+                      (step) => (
+                        <Typography component="li" variant="body2" key={step}>
+                          {step}
+                        </Typography>
+                      ),
+                    )}
+                  </Box>
+                  <Typography variant="body2" color="text.secondary">
+                    Paste the final brand API key generated by Faire, not the
+                    developer app&apos;s APA token. The profile probe needs
+                    practical access to{' '}
+                    <code>{catalog.onboarding.faire.minimumProbeScope}</code>.
+                    Retailer accounts are ineligible, and Faire publishes no
+                    sandbox or webhook flow for this custom integration. If
+                    the Brand Portal self-service option is unavailable,
+                    use <strong>Start a request</strong> in the linked guide to
+                    contact Faire Support. For unresolved direct API access,
+                    contact{' '}
+                    <code>{catalog.onboarding.faire.supportContact}</code>.
+                  </Typography>
+                  <Stack
+                    direction={{ xs: 'column', sm: 'row' }}
+                    spacing={1}
+                    sx={{ mt: 1.5 }}
+                  >
+                    <Button
+                      href={catalog.onboarding.faire.developerPortalUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      variant="outlined"
+                      size="small"
+                      endIcon={<OpenInNewRounded />}
+                    >
+                      Open Faire developer portal
+                    </Button>
+                    <Button
+                      href={catalog.onboarding.faire.setupGuideUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      variant="text"
+                      size="small"
+                      endIcon={<OpenInNewRounded />}
+                    >
+                      Faire API key guide
+                    </Button>
+                  </Stack>
+                </Alert>
+              ) : null}
               <TextField
                 label="Connection name"
                 value={faire.displayName}
@@ -514,13 +732,13 @@ export default function CommerceIntegrationPanel() {
               <TextField
                 required
                 type="password"
-                label="Faire brand API token"
+                label="Faire final brand API key"
                 value={faire.accessToken}
                 onChange={(event) => setFaire((current) => ({
                   ...current,
                   accessToken: event.target.value,
                 }))}
-                helperText="Retailer accounts cannot create custom API connections; this is for a Faire brand account."
+                helperText="Paste the final brand API key generated in the Faire Brand Portal. Do not paste the APA token itself."
                 autoComplete="new-password"
                 sx={fieldSx}
               />
@@ -549,7 +767,7 @@ export default function CommerceIntegrationPanel() {
               >
                 {pendingAction === 'connect-faire'
                   ? 'Verifying…'
-                  : 'Verify and save Faire'}
+                  : 'Connect Faire custom integration'}
               </Button>
             </Stack>
           </CardContent>
@@ -573,6 +791,26 @@ export default function CommerceIntegrationPanel() {
               const grantedScopes = valueStrings(
                 account.configuration.grantedScopes,
               )
+              const requestedScopes = valueStrings(
+                account.configuration.requestedScopes,
+              )
+              const missingScopes = valueStrings(
+                account.configuration.missingScopes,
+              )
+              const activationBlockers = account.provider === 'shopify'
+                && account.status !== 'active'
+                ? [
+                    ...(!canActivate
+                      ? ['Owner or operations-administrator access is required.']
+                      : []),
+                    ...(missingScopes.length
+                      ? [`Add and approve these app scopes: ${missingScopes.join(', ')}.`]
+                      : []),
+                    ...(account.webhookVerificationStatus !== 'verified'
+                      ? ['Send one valid signed allowed-topic delivery to the callback URL.']
+                      : []),
+                  ]
+                : []
               return (
                 <Card key={account.globalId} variant="outlined">
                   <CardContent>
@@ -610,8 +848,16 @@ export default function CommerceIntegrationPanel() {
                           ) : null}
                           <Chip
                             size="small"
-                            color={statusColor(account.status)}
-                            label={humanize(account.status)}
+                            color={account.status === 'active'
+                              ? 'success'
+                              : 'default'}
+                            label={account.provider === 'shopify'
+                              ? `Receipt intake ${
+                                account.status === 'active'
+                                  ? 'enabled'
+                                  : 'disabled'
+                              }`
+                              : 'Synchronization unavailable'}
                           />
                           {account.configured
                             && account.credentialIdentifierLastFour ? (
@@ -625,14 +871,129 @@ export default function CommerceIntegrationPanel() {
                         </Stack>
                       </Stack>
 
+                      <Alert
+                        severity={account.verificationStatus === 'verified'
+                          ? 'success'
+                          : 'warning'}
+                      >
+                        {account.verificationStatus === 'verified'
+                          ? `${providerLabel(account.provider)} API connection established.`
+                          : `${providerLabel(account.provider)} API connection needs attention.`}{' '}
+                        {account.provider === 'shopify'
+                          ? 'Receipt intake is a separate optional activation step.'
+                          : 'Faire polling, order import, and inventory synchronization are not active yet.'}
+                      </Alert>
+
                       {account.provider === 'shopify' && account.webhookUrl ? (
-                        <TextField
-                          label="Signed webhook receipt URL"
-                          value={account.webhookUrl}
-                          InputProps={{ readOnly: true }}
-                          helperText="Send an app/scopes_update, product, or inventory signed delivery while disabled to verify the client secret; it is held and never imported. Order and customer topics are rejected."
-                          sx={fieldSx}
-                        />
+                        <Box>
+                          <Typography variant="subtitle2" fontWeight={700}>
+                            Optional signed receipt setup
+                          </Typography>
+                          <Typography
+                            variant="body2"
+                            color="text.secondary"
+                            sx={{ mb: 1 }}
+                          >
+                            Use the account-specific URL below for shop-specific
+                            webhook subscriptions. ClawPilot does not register
+                            provider subscriptions in this slice. One valid
+                            signed allowed-topic delivery verifies the stored
+                            app secret; synthetic CLI delivery proves signing
+                            only, not that a real subscription exists.
+                          </Typography>
+                          <Stack
+                            direction={{ xs: 'column', sm: 'row' }}
+                            spacing={1}
+                            alignItems={{ sm: 'flex-start' }}
+                          >
+                            <TextField
+                              fullWidth
+                              label="Signed webhook receipt URL"
+                              value={account.webhookUrl}
+                              InputProps={{ readOnly: true }}
+                              helperText="Order and customer topics are rejected."
+                              sx={fieldSx}
+                            />
+                            <Button
+                              variant="outlined"
+                              startIcon={<ContentCopyRounded />}
+                              onClick={() => copyWebhookUrl(account)}
+                              sx={actionButtonSx}
+                            >
+                              Copy URL
+                            </Button>
+                          </Stack>
+                          {catalog ? (
+                            <>
+                              <Typography
+                                variant="caption"
+                                color="text.secondary"
+                                display="block"
+                                sx={{ mt: 1 }}
+                              >
+                                Accepted receipt topics
+                              </Typography>
+                              <Stack
+                                direction="row"
+                                gap={0.75}
+                                flexWrap="wrap"
+                                sx={{ mt: 0.5 }}
+                              >
+                                {catalog.onboarding.shopify.acceptedReceiptTopics
+                                  .map((topic) => (
+                                    <Chip
+                                      key={topic}
+                                      size="small"
+                                      label={topic}
+                                    />
+                                  ))}
+                              </Stack>
+                              <Button
+                                href="https://shopify.dev/docs/apps/build/webhooks/subscribe"
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                variant="text"
+                                size="small"
+                                endIcon={<OpenInNewRounded />}
+                                sx={{ mt: 0.75 }}
+                              >
+                                Shopify webhook subscription guide
+                              </Button>
+                            </>
+                          ) : null}
+                        </Box>
+                      ) : null}
+
+                      {requestedScopes.length ? (
+                        <Box>
+                          <Typography
+                            variant="caption"
+                            color="text.secondary"
+                          >
+                            Least-privilege receipt profile
+                          </Typography>
+                          <Stack
+                            direction="row"
+                            gap={0.75}
+                            flexWrap="wrap"
+                            sx={{ mt: 0.5 }}
+                          >
+                            {requestedScopes.map((scope) => (
+                              <Chip
+                                key={scope}
+                                size="small"
+                                color={missingScopes.includes(scope)
+                                  ? 'warning'
+                                  : 'success'}
+                                label={`${scope}${
+                                  missingScopes.includes(scope)
+                                    ? ' · missing'
+                                    : ' · granted'
+                                }`}
+                              />
+                            ))}
+                          </Stack>
+                        </Box>
                       ) : null}
 
                       {grantedScopes.length ? (
@@ -654,6 +1015,25 @@ export default function CommerceIntegrationPanel() {
                             ))}
                           </Stack>
                         </Box>
+                      ) : null}
+
+                      {activationBlockers.length ? (
+                        <Alert severity="info">
+                          <Typography variant="body2" fontWeight={700}>
+                            Receipt intake is not ready to enable
+                          </Typography>
+                          <Box component="ul" sx={{ pl: 2.5, my: 0.5 }}>
+                            {activationBlockers.map((blocker) => (
+                              <Typography
+                                component="li"
+                                variant="body2"
+                                key={blocker}
+                              >
+                                {blocker}
+                              </Typography>
+                            ))}
+                          </Box>
+                        </Alert>
                       ) : null}
 
                       <Stack
@@ -688,6 +1068,7 @@ export default function CommerceIntegrationPanel() {
                               disabled={
                                 pendingAction !== ''
                                 || !canActivate
+                                || missingScopes.length > 0
                                 || account.webhookVerificationStatus !== 'verified'
                               }
                               onClick={() => action(
@@ -854,10 +1235,11 @@ export default function CommerceIntegrationPanel() {
       ) : null}
 
       <Typography variant="caption" color="text.secondary">
-        Shopify connections in this slice exchange Dev Dashboard app
-        credentials for short-lived tokens when needed; Faire connections use
-        a brand API token and production profile verification. Encrypted
-        credentials are write-only and are never returned by this page.
+        Shopify custom integrations exchange merchant-owned Dev Dashboard app
+        credentials for short-lived tokens when needed. Faire custom
+        integrations use the final brand API key generated after the brand
+        authorizes its unpublished developer app. Encrypted credentials are
+        write-only and are never returned by this page.
       </Typography>
     </Stack>
   )

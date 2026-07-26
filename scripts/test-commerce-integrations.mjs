@@ -134,8 +134,12 @@ includes(persistence, [
   "'commerce.credential.verification_failed'",
   "'commerce.integration.enabled'",
   "'commerce.integration.disabled'",
+  "'commerce.shopify.scopes_updated'",
   "'commerce.credential.disconnected'",
   "'commerce.webhook.received'",
+  'disableIntegration?: boolean',
+  "reason: 'shopify_scope_profile_incomplete'",
+  'scopeProfileIncomplete',
   'payload_hash',
   'Shopify reused a webhook event ID with a different payload',
   'account.commerce_credential_generation = $6',
@@ -143,8 +147,11 @@ includes(persistence, [
   'row.credential_version !== row.commerce_credential_generation',
   'commerce_credential_generation = $3',
   'credential.credential_version = $3',
+  'credential.credential_version =\n                 account.commerce_credential_generation',
+  "account.configuration->>'scopeProfile' =",
+  "account.configuration->'missingScopes' = '[]'::jsonb",
   'FOR UPDATE OF account, credential',
-  "current.status === 'active' ? 'queued' : 'held'",
+  "effectiveStatus === 'active' ? 'queued' : 'held'",
   'Shopify webhook credential generation changed before receipt commit',
 ], 'Commerce persistence')
 assert.ok(
@@ -161,11 +168,17 @@ includes(service, [
   "'faire_brand_token'",
   "'shopify_client_credentials'",
   'await requestShopifyAccessToken',
+  'SHOPIFY_RECEIPT_PROOF_SCOPES',
+  'auditShopifyScopeRequirements',
+  'auditShopifyScopeUpdatePayload',
+  "scopeProfile: 'receipt_evidence_v1'",
+  'SHOPIFY_SCOPE_PROFILE_INCOMPLETE',
   "runtime.status === 'error'",
   'verifyShopifyWebhookHmac',
   'encryptCommerceWebhookPayload',
   'recordShopifyWebhookReceiptInPostgres',
   'SHOPIFY_CONTROL_PLANE_WEBHOOK_TOPIC_SET.has(topic)',
+  "topic === 'app/scopes_update'",
   'SHOPIFY_WEBHOOK_TOPIC_UNSUPPORTED',
   'Faire runtime polling is not implemented',
 ], 'Commerce service')
@@ -200,6 +213,7 @@ includes(adminRoute, [
   'inventoryMutation: false',
   'fulfillmentExport: false',
   'acceptedReceiptTopics: SHOPIFY_CONTROL_PLANE_WEBHOOK_TOPICS',
+  'onboarding: COMMERCE_CUSTOM_INTEGRATION_ONBOARDING',
 ], 'Commerce admin route')
 assert.ok(
   !adminRoute.includes("'accessToken',\n        'clientSecret'"),
@@ -240,6 +254,21 @@ const panel = read(
 includes(panel, [
   'Sales channels',
   'separate from restaurant POS',
+  'These are user-owned custom integrations',
+  'Before you connect',
+  'Connect Shopify Dev Dashboard app',
+  'Connect Faire custom integration',
+  'Do not paste the APA token itself',
+  'SHOPIFY_SHOP_NOT_PERMITTED',
+  'SHOPIFY_STORE_NOT_FOUND',
+  'developers@faire.com',
+  'const actionError = actionableCommerceError(requestError)',
+  'await requestCommerce()',
+  'Revoke or remove provider-side access separately',
+  'Optional signed receipt setup',
+  'Copy URL',
+  'Least-privilege receipt profile',
+  'Synchronization unavailable',
   'type="password"',
   'confirmLiveAccess',
   'Canonical order import',
@@ -265,6 +294,26 @@ const capabilities = loadTypeScriptModule(
 )
 assert.equal(capabilities.SHOPIFY_ADMIN_API_VERSION, '2026-07')
 assert.deepEqual(
+  JSON.parse(JSON.stringify(capabilities.SHOPIFY_RECEIPT_PROOF_SCOPES)),
+  ['read_products', 'read_inventory'],
+)
+assert.equal(
+  capabilities.COMMERCE_CUSTOM_INTEGRATION_ONBOARDING.shopify.developerPortalUrl,
+  'https://dev.shopify.com/dashboard',
+)
+assert.equal(
+  capabilities.COMMERCE_CUSTOM_INTEGRATION_ONBOARDING.faire.setupGuideUrl,
+  'https://www.faire.com/support/articles/37632363832091',
+)
+assert.ok(
+  capabilities.SHOPIFY_ACCESS_SCOPES.includes(
+    'read_inventory_shipments_received_items',
+  )
+  && capabilities.SHOPIFY_ACCESS_SCOPES.includes(
+    'write_inventory_shipments_received_items',
+  ),
+)
+assert.deepEqual(
   JSON.parse(JSON.stringify(
     capabilities.SHOPIFY_CONTROL_PLANE_WEBHOOK_TOPICS,
   )),
@@ -276,6 +325,38 @@ assert.deepEqual(
     'products/delete',
     'products/update',
   ],
+)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(capabilities.auditShopifyScopeRequirements(
+    ['read_products', 'read_inventory'],
+    ['write_products', 'write_inventory'],
+  ))),
+  {
+    requestedScopes: ['read_inventory', 'read_products'],
+    grantedScopes: ['write_inventory', 'write_products'],
+    missingScopes: [],
+    restrictedScopes: [],
+  },
+  'Shopify write scopes must satisfy their paired read requirements',
+)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(capabilities.auditShopifyScopeUpdatePayload({
+    current: ['write_products'],
+    previous: ['write_products', 'write_inventory'],
+  }))),
+  {
+    requestedScopes: ['read_inventory', 'read_products'],
+    grantedScopes: ['write_products'],
+    missingScopes: ['read_inventory'],
+    restrictedScopes: [],
+  },
+  'Shopify scope-update events must expose a fail-closed receipt-profile audit',
+)
+assert.throws(
+  () => capabilities.auditShopifyScopeUpdatePayload({
+    current: 'read_products',
+  }),
+  /scope-update payload was invalid/,
 )
 assert.equal(
   capabilities.CLAWPILOT_SHOPIFY_CAPABILITY_IMPLEMENTATION.order_import,
@@ -480,6 +561,40 @@ assert.equal(tokenRequests[0].init.body.get('client_id'), credential.clientId)
 assert.equal(
   tokenRequests[0].init.body.get('client_secret'),
   credential.clientSecret,
+)
+await assert.rejects(
+  shopifyClient.requestShopifyAccessToken(
+    {
+      shopDomain: 'example-store.myshopify.com',
+      clientId: credential.clientId,
+      clientSecret: credential.clientSecret,
+    },
+    {
+      fetchImpl: async () => new Response(JSON.stringify({
+        error: 'shop_not_permitted',
+        error_description:
+          'Client credentials cannot be performed on this shop.',
+      }), {
+        status: 400,
+        headers: { 'content-type': 'application/json' },
+      }),
+    },
+  ),
+  (error) => error?.code === 'SHOPIFY_SHOP_NOT_PERMITTED'
+    && /same Dev Dashboard organization/.test(error.message),
+)
+await assert.rejects(
+  shopifyClient.requestShopifyAccessToken(
+    {
+      shopDomain: 'missing-store.myshopify.com',
+      clientId: credential.clientId,
+      clientSecret: credential.clientSecret,
+    },
+    {
+      fetchImpl: async () => new Response('', { status: 404 }),
+    },
+  ),
+  (error) => error?.code === 'SHOPIFY_STORE_NOT_FOUND',
 )
 
 const shopifyRequests = []

@@ -17,8 +17,11 @@ import {
   probeFaireBrandProfile,
 } from '@/lib/integrations/faireCommerceClient'
 import {
+  auditShopifyScopeUpdatePayload,
+  auditShopifyScopeRequirements,
   SHOPIFY_ADMIN_API_VERSION,
   SHOPIFY_CONTROL_PLANE_WEBHOOK_TOPICS,
+  SHOPIFY_RECEIPT_PROOF_SCOPES,
 } from '@/lib/integrations/commerceCapabilities'
 import {
   normalizeShopifyShopDomain,
@@ -303,6 +306,10 @@ export async function connectShopifyCommerce(input: {
       shopDomain,
       accessToken: grant.accessToken,
     })
+    const scopeAudit = auditShopifyScopeRequirements(
+      SHOPIFY_RECEIPT_PROOF_SCOPES,
+      probe.grantedScopes,
+    )
     const credential: ShopifyCommerceCredential = {
       provider: 'shopify',
       authMode: 'shopify_client_credentials',
@@ -322,9 +329,10 @@ export async function connectShopifyCommerce(input: {
       tokenAcquisition: 'client_credentials',
       accessTokenLifetimeSeconds: grant.expiresIn,
       accessTokenPersisted: false,
-      requestedScopes: [],
-      missingScopes: [],
-      restrictedScopes: ['read_all_orders', 'read_customers', 'write_customers'],
+      scopeProfile: 'receipt_evidence_v1',
+      requestedScopes: scopeAudit.requestedScopes,
+      missingScopes: scopeAudit.missingScopes,
+      restrictedScopes: scopeAudit.restrictedScopes,
       acceptedReceiptTopics: [...SHOPIFY_CONTROL_PLANE_WEBHOOK_TOPICS],
       webhookSecretVerified: false,
       domainWorkersActivated: false,
@@ -444,7 +452,9 @@ function revokesCredentialVerification(
   }
   return new Set([
     'SHOPIFY_ACCESS_DENIED',
+    'SHOPIFY_APP_NOT_INSTALLED',
     'SHOPIFY_CLIENT_CREDENTIALS_REJECTED',
+    'SHOPIFY_SHOP_NOT_PERMITTED',
     'SHOPIFY_STORE_NOT_FOUND',
     'SHOPIFY_PROBE_INVALID',
     'SHOPIFY_STORE_IDENTITY_CHANGED',
@@ -506,6 +516,10 @@ async function verifyStoredConnection(
         'SHOPIFY_STORE_IDENTITY_CHANGED',
       )
     }
+    const scopeAudit = auditShopifyScopeRequirements(
+      SHOPIFY_RECEIPT_PROOF_SCOPES,
+      probe.grantedScopes,
+    )
     return {
       configuration: {
         ...runtime.configuration,
@@ -518,6 +532,10 @@ async function verifyStoredConnection(
         tokenAcquisition: 'client_credentials',
         accessTokenLifetimeSeconds: grant.expiresIn,
         accessTokenPersisted: false,
+        scopeProfile: 'receipt_evidence_v1',
+        requestedScopes: scopeAudit.requestedScopes,
+        missingScopes: scopeAudit.missingScopes,
+        restrictedScopes: scopeAudit.restrictedScopes,
         lastVerifiedAt: new Date().toISOString(),
         domainWorkersActivated: false,
       },
@@ -602,6 +620,9 @@ export async function testCommerceConnection(input: {
       actorEmail: input.actorEmail,
       errorCode: null,
       configuration: verified.configuration,
+      disableIntegration: runtime.provider === 'shopify'
+        && Array.isArray(verified.configuration.missingScopes)
+        && verified.configuration.missingScopes.length > 0,
     })
   } catch (error) {
     const sanitized = sanitize(error)
@@ -668,6 +689,24 @@ export async function setCommerceIntegrationEnabled(input: {
         accountGlobalId: runtime.globalId,
         actorEmail: input.actorEmail,
       })
+      const refreshed = await storedRuntime({
+        organizationId: runtime.organizationId,
+        accountGlobalId: runtime.globalId,
+      })
+      const missingScopes = Array.isArray(
+        refreshed.configuration.missingScopes,
+      )
+        ? refreshed.configuration.missingScopes.filter(
+          (scope): scope is string => typeof scope === 'string',
+        )
+        : []
+      if (missingScopes.length) {
+        throw new CommerceIntegrationRequestError(
+          `Shopify app is missing the receipt-proof scopes: ${missingScopes.join(', ')}`,
+          409,
+          'SHOPIFY_SCOPE_PROFILE_INCOMPLETE',
+        )
+      }
     }
     const result = await setCommerceIntegrationEnabledInPostgres({
       organizationId: runtime.organizationId,
@@ -829,6 +868,20 @@ export async function receiveShopifyWebhook(input: {
         'SHOPIFY_WEBHOOK_JSON_INVALID',
       )
     }
+    let scopeAudit: ReturnType<
+      typeof auditShopifyScopeUpdatePayload
+    > | null = null
+    if (topic === 'app/scopes_update') {
+      try {
+        scopeAudit = auditShopifyScopeUpdatePayload(payload)
+      } catch {
+        throw new CommerceIntegrationRequestError(
+          'Shopify scope-update payload is invalid',
+          400,
+          'SHOPIFY_WEBHOOK_JSON_INVALID',
+        )
+      }
+    }
     const payloadHash = createHash('sha256')
       .update(input.rawBody)
       .digest('hex')
@@ -848,6 +901,7 @@ export async function receiveShopifyWebhook(input: {
       encryptedPayload,
       payloadBytes: input.rawBody.byteLength,
       providerTriggeredAt,
+      scopeAudit,
     })
     await markShopifyWebhookSecretVerifiedInPostgres({ runtime })
     return receipt
