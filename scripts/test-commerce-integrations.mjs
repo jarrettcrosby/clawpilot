@@ -1093,4 +1093,692 @@ assert.equal(
   false,
 )
 
+const previewMigration = read(
+  'db/migrations/0113_operations_shopify_order_preview.sql',
+)
+includes(previewMigration, [
+  'CREATE TABLE IF NOT EXISTS operations_commerce_order_preview_runs',
+  'CREATE TABLE IF NOT EXISTS operations_commerce_order_previews',
+  'WHEN jsonb_array_length(value) > 20 THEN false',
+  'max_orders integer NOT NULL CHECK (max_orders BETWEEN 1 AND 25)',
+  'orders_seen integer NOT NULL CHECK (orders_seen BETWEEN 0 AND 25)',
+  'canonical_orders_created integer NOT NULL DEFAULT 0',
+  'CHECK (canonical_orders_created = 0)',
+  'shopify_writes integer NOT NULL DEFAULT 0 CHECK (shopify_writes = 0)',
+  'sync_cursor_advanced boolean NOT NULL DEFAULT false',
+  'CHECK (sync_cursor_advanced = false)',
+  "expires_at <= created_at + interval '24 hours'",
+  'ON DELETE CASCADE',
+  'protect_operations_commerce_order_preview_update',
+  'BEFORE UPDATE ON operations_commerce_order_preview_runs',
+  'BEFORE UPDATE ON operations_commerce_order_previews',
+], 'Shopify order-preview migration')
+for (const forbiddenColumn of [
+  /\braw_payload\s+/i,
+  /\bprovider_payload\s+/i,
+  /\bcustomer_(?:id|name|email|phone)\s+/i,
+  /\b(?:billing|shipping)_address\s+/i,
+  /\border_(?:note|tags)\s+/i,
+  /\bline_(?:title|vendor|custom_attributes)\s+/i,
+]) {
+  assert.doesNotMatch(
+    previewMigration,
+    forbiddenColumn,
+    'Shopify order-preview tables must not store raw or direct customer data',
+  )
+}
+
+class MockShopifyCommerceClientError extends Error {
+  constructor(
+    message,
+    status = 502,
+    code = 'SHOPIFY_UPSTREAM_FAILED',
+    retryable = false,
+  ) {
+    super(message)
+    this.name = 'ShopifyCommerceClientError'
+    this.status = status
+    this.code = code
+    this.retryable = retryable
+  }
+}
+
+let previewGraphqlHandler = async () => {
+  throw new Error('Unexpected Shopify call in source-contract test')
+}
+let previewRetryDelays = []
+const previewClient = loadTypeScriptModule(
+  'app_src/lib/integrations/shopifyOrderPreview.ts',
+  {
+    mocks: {
+      '@/lib/integrations/shopifyCommerceClient': {
+        ShopifyCommerceClientError: MockShopifyCommerceClientError,
+        shopifyAdminGraphql: (...args) => previewGraphqlHandler(...args),
+      },
+    },
+    globals: {
+      setTimeout(callback, delayMs) {
+        previewRetryDelays.push(delayMs)
+        callback()
+        return 1
+      },
+    },
+  },
+)
+assert.equal(previewClient.SHOPIFY_ORDER_PREVIEW_MAX_ORDERS, 25)
+assert.equal(previewClient.SHOPIFY_ORDER_PREVIEW_MAX_LINES, 20)
+assert.equal(previewClient.SHOPIFY_ORDER_PREVIEW_TTL_HOURS, 24)
+const previewQueries = JSON.parse(JSON.stringify(
+  previewClient.SHOPIFY_ORDER_PREVIEW_QUERY_CONTRACT,
+))
+includes(previewQueries.ids, [
+  'query ClawPilotShopifyOrderPreviewIds',
+  'first: $first',
+  'query: $filter',
+  'sortKey: CREATED_AT',
+  'reverse: true',
+  'test',
+  'hasNextPage',
+], 'Shopify order-preview ID query')
+includes(previewQueries.detail, [
+  'query ClawPilotShopifyOrderPreviewDetail',
+  '$ids: [ID!]!',
+  'nodes(ids: $ids)',
+  '... on Order',
+  'lineItems(first: 20)',
+  'currentSubtotalLineItemsQuantity',
+], 'Shopify order-preview detail query')
+for (const queryText of Object.values(previewQueries)) {
+  assert.doesNotMatch(
+    queryText,
+    /\bmutation\b/i,
+    'Shopify order-preview GraphQL must be read-only',
+  )
+  assert.doesNotMatch(
+    queryText,
+    /\b(?:customer|email|phone|billingAddress|shippingAddress|note|tags|customAttributes|title|vendor)\b/i,
+    'Shopify order-preview GraphQL must not request direct customer data',
+  )
+  assert.doesNotMatch(
+    queryText,
+    /\bafter\s*:/i,
+    'Shopify order-preview GraphQL must not retain or advance a page cursor',
+  )
+}
+assert.doesNotMatch(
+  previewQueries.detail,
+  /\b(?:product|variant|inventoryItem)\b/i,
+  'Shopify order-preview GraphQL must not traverse product or inventory objects',
+)
+const previewClientSource = read(
+  'app_src/lib/integrations/shopifyOrderPreview.ts',
+)
+includes(previewClientSource, [
+  'CLAWPILOT_SHOPIFY_ORDER_PREVIEW_ENABLED',
+  "['dev', 'development', 'local', 'preview'].includes(lane)",
+  'first: SHOPIFY_ORDER_PREVIEW_MAX_ORDERS',
+  "filter: `test:false created_at:<='${windowEnd}'`",
+  'SHOPIFY_ORDER_PREVIEW_DEADLINE_MS = 45_000',
+  'SHOPIFY_ORDER_PREVIEW_RETRY_DELAYS_MS = [250, 750]',
+  'query: SHOPIFY_ORDER_PREVIEW_DETAIL_QUERY',
+  'variables: { ids: orderIds }',
+], 'Shopify held-preview client')
+
+function previewMoney(amount, currencyCode = 'USD') {
+  return {
+    shopMoney: {
+      amount,
+      currencyCode,
+    },
+  }
+}
+
+function previewLine({
+  id,
+  sku,
+  quantity = 1,
+  currentQuantity = quantity,
+  unfulfilledQuantity = currentQuantity,
+  requiresShipping = true,
+}) {
+  return {
+    id,
+    sku,
+    quantity,
+    currentQuantity,
+    unfulfilledQuantity,
+    requiresShipping,
+    product: {
+      id: 'gid://shopify/Product/999',
+      title: 'must-not-be-retained-product',
+    },
+    variant: {
+      id: 'gid://shopify/ProductVariant/999',
+      inventoryItem: {
+        id: 'gid://shopify/InventoryItem/999',
+      },
+    },
+    title: 'must-not-be-retained-line-title',
+    vendor: 'must-not-be-retained-vendor',
+    customAttributes: [{
+      key: 'customer-instruction',
+      value: 'must-not-be-retained-custom-value',
+    }],
+  }
+}
+
+function previewOrder({
+  id,
+  name,
+  createdAt,
+  cancelledAt = null,
+  closedAt = null,
+  sourceName = 'web',
+  financialStatus = 'PAID',
+  fulfillmentStatus = 'UNFULFILLED',
+  fulfillable = true,
+  requiresShipping = true,
+  lineItemQuantity = 1,
+  lineItems = [],
+  lineItemsTruncated = false,
+  subtotalAmount = '10.00',
+  shippingAmount = '2.00',
+  taxAmount = '1.00',
+  totalAmount = '13.00',
+}) {
+  return {
+    id,
+    name,
+    createdAt,
+    processedAt: createdAt,
+    updatedAt: createdAt,
+    cancelledAt,
+    closedAt,
+    test: false,
+    sourceName,
+    displayFinancialStatus: financialStatus,
+    displayFulfillmentStatus: fulfillmentStatus,
+    fulfillable,
+    requiresShipping,
+    currencyCode: 'USD',
+    currentSubtotalLineItemsQuantity: lineItemQuantity,
+    currentSubtotalPriceSet: previewMoney(subtotalAmount),
+    currentShippingPriceSet: previewMoney(shippingAmount),
+    currentTotalTaxSet: previewMoney(taxAmount),
+    currentTotalPriceSet: previewMoney(totalAmount),
+    lineItems: {
+      nodes: lineItems,
+      pageInfo: { hasNextPage: lineItemsTruncated },
+    },
+    customer: {
+      id: 'gid://shopify/Customer/999',
+      email: 'must-not-be-retained@example.com',
+      phone: '+15555550199',
+    },
+    shippingAddress: {
+      address1: 'must-not-be-retained-address',
+    },
+    billingAddress: {
+      address1: 'must-not-be-retained-billing-address',
+    },
+    note: 'must-not-be-retained-note',
+    tags: ['must-not-be-retained-tag'],
+  }
+}
+
+const previewOrderIds = [
+  'gid://shopify/Order/101',
+  'gid://shopify/Order/102',
+]
+const previewOrders = [
+  previewOrder({
+    id: previewOrderIds[0],
+    name: '#101',
+    createdAt: '2026-07-25T12:00:00Z',
+    cancelledAt: '2026-07-25T13:00:00Z',
+    closedAt: '2026-07-25T14:00:00Z',
+    fulfillmentStatus: 'FULFILLED',
+    fulfillable: false,
+    lineItemQuantity: 3,
+    lineItemsTruncated: true,
+    lineItems: [
+      previewLine({
+        id: 'gid://shopify/LineItem/1001',
+        sku: 'SKU-101',
+        quantity: 2,
+        currentQuantity: 2,
+        unfulfilledQuantity: 0,
+      }),
+      previewLine({
+        id: 'gid://shopify/LineItem/1002',
+        sku: null,
+        quantity: 1,
+        currentQuantity: 1,
+        unfulfilledQuantity: 0,
+      }),
+    ],
+  }),
+  previewOrder({
+    id: previewOrderIds[1],
+    name: '#102',
+    createdAt: '2026-07-24T12:00:00Z',
+    sourceName: null,
+    financialStatus: null,
+    requiresShipping: false,
+    lineItemQuantity: 0,
+    lineItems: [],
+    subtotalAmount: '0.00',
+    shippingAmount: '0.00',
+    taxAmount: '0.00',
+    totalAmount: '0.00',
+  }),
+]
+const previewGraphqlCalls = []
+previewGraphqlHandler = async (runtimeCredential, request, options) => {
+  previewGraphqlCalls.push({ runtimeCredential, request, options })
+  if (request.operationName === 'ClawPilotShopifyOrderPreviewIds') {
+    return {
+      orders: {
+        nodes: previewOrderIds.map((id) => ({ id, test: false })),
+        pageInfo: { hasNextPage: true },
+      },
+    }
+  }
+  if (request.operationName === 'ClawPilotShopifyOrderPreviewDetail') {
+    return { nodes: previewOrders }
+  }
+  throw new Error(`Unexpected Shopify operation ${request.operationName}`)
+}
+previewRetryDelays = []
+const parsedPreview = await previewClient.fetchShopifyOrderPreview({
+  shopDomain: 'example-store.myshopify.com',
+  accessToken: issuedAccessToken,
+})
+assert.equal(previewGraphqlCalls.length, 2)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(
+    previewGraphqlCalls.map((call) => call.request.operationName),
+  )),
+  [
+    'ClawPilotShopifyOrderPreviewIds',
+    'ClawPilotShopifyOrderPreviewDetail',
+  ],
+  'Shopify preview must use one IDs query and one bulk detail query',
+)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(
+    previewGraphqlCalls[1].request.variables,
+  )),
+  { ids: previewOrderIds },
+  'Shopify preview must submit all bounded order IDs in one nodes query',
+)
+assert.ok(
+  previewGraphqlCalls.every(
+    (call) => call.options.timeoutMs > 0 && call.options.timeoutMs <= 12_000,
+  ),
+  'Shopify preview calls must have a bounded request timeout',
+)
+assert.equal(parsedPreview.ordersSeen, 2)
+assert.equal(parsedPreview.moreAvailable, true)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(
+    parsedPreview.candidates.map((candidate) => candidate.externalOrderId),
+  )),
+  previewOrderIds,
+  'Shopify bulk detail parsing must preserve requested order-ID order',
+)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(parsedPreview.candidates[0].gapCodes)),
+  [
+    'canonical_import_not_implemented',
+    'customer_resolution_not_evaluated',
+    'line_items_truncated',
+    'order_already_fulfilled',
+    'order_cancelled',
+    'requested_delivery_not_mapped',
+    'ship_to_not_ingested',
+    'sku_missing',
+  ],
+  'Shopify preview must normalize and sort diagnostic gaps',
+)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(parsedPreview.candidates[1].gapCodes)),
+  [
+    'canonical_import_not_implemented',
+    'customer_resolution_not_evaluated',
+    'line_items_empty',
+    'non_shippable_order',
+    'requested_delivery_not_mapped',
+  ],
+)
+assert.equal(parsedPreview.candidates[0].lineItemsTruncated, true)
+assert.deepEqual(
+  Object.keys(parsedPreview.candidates[0]).sort(),
+  [
+    'currencyCode',
+    'externalOrderId',
+    'financialStatus',
+    'fulfillable',
+    'fulfillmentStatus',
+    'gapCodes',
+    'lineItemQuantity',
+    'lineItemsTruncated',
+    'normalizedLines',
+    'orderName',
+    'providerCancelledAt',
+    'providerClosedAt',
+    'providerCreatedAt',
+    'providerProcessedAt',
+    'providerUpdatedAt',
+    'requiresShipping',
+    'shippingAmount',
+    'sourceHash',
+    'sourceName',
+    'subtotalAmount',
+    'taxAmount',
+    'testOrder',
+    'totalAmount',
+  ],
+  'Shopify preview orders must retain only the approved minimized projection',
+)
+assert.deepEqual(
+  Object.keys(parsedPreview.candidates[0].normalizedLines[0]).sort(),
+  [
+    'currentQuantity',
+    'externalLineId',
+    'quantity',
+    'requiresShipping',
+    'sku',
+    'unfulfilledQuantity',
+  ],
+  'Shopify preview lines must retain only the approved minimized projection',
+)
+const serializedParsedPreview = JSON.stringify(parsedPreview)
+for (const forbiddenValue of [
+  'must-not-be-retained-product',
+  'must-not-be-retained-line-title',
+  'must-not-be-retained-vendor',
+  'must-not-be-retained-custom-value',
+  'must-not-be-retained@example.com',
+  '+15555550199',
+  'must-not-be-retained-address',
+  'must-not-be-retained-billing-address',
+  'must-not-be-retained-note',
+  'must-not-be-retained-tag',
+  'gid://shopify/Product/999',
+  'gid://shopify/ProductVariant/999',
+  'gid://shopify/InventoryItem/999',
+  'gid://shopify/Customer/999',
+]) {
+  assert.ok(
+    !serializedParsedPreview.includes(forbiddenValue),
+    `Shopify preview retained forbidden provider field value ${forbiddenValue}`,
+  )
+}
+
+let previewRetryAttempts = 0
+previewRetryDelays = []
+previewGraphqlHandler = async (_runtimeCredential, request) => {
+  previewRetryAttempts += 1
+  if (previewRetryAttempts === 1) {
+    throw new MockShopifyCommerceClientError(
+      'Shopify throttled the diagnostic read',
+      503,
+      'SHOPIFY_RATE_LIMITED',
+      true,
+    )
+  }
+  assert.equal(
+    request.operationName,
+    'ClawPilotShopifyOrderPreviewIds',
+  )
+  return {
+    orders: {
+      nodes: [],
+      pageInfo: { hasNextPage: false },
+    },
+  }
+}
+const retriedPreview = await previewClient.fetchShopifyOrderPreview({
+  shopDomain: 'example-store.myshopify.com',
+  accessToken: issuedAccessToken,
+})
+assert.equal(retriedPreview.ordersSeen, 0)
+assert.equal(previewRetryAttempts, 2)
+assert.deepEqual(
+  previewRetryDelays,
+  [250],
+  'Shopify preview must retry retryable failures using its bounded first delay',
+)
+
+previewRetryAttempts = 0
+previewRetryDelays = []
+previewGraphqlHandler = async () => {
+  previewRetryAttempts += 1
+  throw new MockShopifyCommerceClientError(
+    'Shopify remains unavailable',
+    503,
+    'SHOPIFY_UNAVAILABLE',
+    true,
+  )
+}
+await assert.rejects(
+  previewClient.fetchShopifyOrderPreview({
+    shopDomain: 'example-store.myshopify.com',
+    accessToken: issuedAccessToken,
+  }),
+  (error) => error?.code === 'SHOPIFY_UNAVAILABLE',
+  'Shopify preview must return the upstream error after exhausting retries',
+)
+assert.equal(previewRetryAttempts, 3)
+assert.deepEqual(
+  previewRetryDelays,
+  [250, 750],
+  'Shopify preview retry budget must be bounded to two waits',
+)
+
+previewRetryAttempts = 0
+previewGraphqlHandler = async () => {
+  previewRetryAttempts += 1
+  throw new Error('Deadline-exhausted preview must not call Shopify')
+}
+await assert.rejects(
+  previewClient.fetchShopifyOrderPreview(
+    {
+      shopDomain: 'example-store.myshopify.com',
+      accessToken: issuedAccessToken,
+    },
+    { deadlineAt: Date.now() + 500 },
+  ),
+  (error) => error?.code === 'SHOPIFY_ORDER_PREVIEW_DEADLINE_EXCEEDED',
+  'Shopify preview must fail before provider I/O when its absolute deadline is exhausted',
+)
+assert.equal(previewRetryAttempts, 0)
+
+const previewPersistence = read(
+  'app_src/lib/persistence/commerceOrderPreviews.ts',
+)
+includes(previewPersistence, [
+  'purgeExpiredShopifyOrderPreviewsInPostgres',
+  'DELETE FROM operations_commerce_order_preview_runs',
+  'WHERE expires_at <= now()',
+  'await purgeExpiredShopifyOrderPreviewsInPostgres()',
+  "account.integration_type = 'commerce'",
+  "account.provider = 'shopify'",
+  "AND environment = 'sandbox'",
+  'WHERE organization_id = $1::uuid',
+  'AND integration_account_id = $2::uuid',
+  'AND account.global_id = $3',
+  'operations_commerce_order_preview_runs',
+  'operations_commerce_order_previews',
+  "'commerce.shopify_order_preview.imported'",
+  'maxLinesPerOrder: 20',
+  'canonicalOrdersCreated: 0',
+  'shopifyWrites: 0',
+  'syncCursorAdvanced: false',
+  'clearShopifyOrderPreviewInPostgres',
+  "'commerce.shopify_order_preview.cleared'",
+], 'Shopify order-preview persistence')
+const mappingReadSource = previewPersistence.slice(
+  previewPersistence.indexOf('async function mappingCatalog'),
+  previewPersistence.indexOf('function enrichCandidate'),
+)
+assert.match(
+  mappingReadSource,
+  /\bSELECT\b/,
+  'Shopify order-preview mapping enrichment must read the local catalog',
+)
+assert.doesNotMatch(
+  mappingReadSource,
+  /\b(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM)\b/i,
+  'Shopify order-preview mapping enrichment must not mutate products or mappings',
+)
+assert.doesNotMatch(
+  previewPersistence,
+  /\b(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+(?:operations_orders|operations_commerce_sync_cursors|crm_contacts|crm_customers|crm_products|operations_product_mappings)\b/i,
+  'Shopify order preview must not write canonical orders, cursors, customers, products, or mappings',
+)
+
+const previewServiceSource = service.slice(
+  service.indexOf('async function shopifyPreviewAccount'),
+  service.indexOf('async function verifyStoredConnection'),
+)
+includes(previewServiceSource, [
+  'assertShopifyOrderPreviewRuntime()',
+  "runtime.provider !== 'shopify'",
+  "runtime.environment !== 'sandbox'",
+  "runtime.verificationStatus !== 'verified'",
+  "probeScopes.has('read_orders')",
+  "tokenScopes.has('read_orders')",
+  'await fetchShopifyOrderPreview',
+  'testOrdersIncluded: false',
+  'includeTestOrders: false',
+  'readOnly: true',
+  "action: 'orders.held_preview.read'",
+  'canonicalOrdersCreated: 0',
+  'shopifyWrites: 0',
+  'syncCursorAdvanced: false',
+], 'Shopify order-preview service')
+includes(service, [
+  'SHOPIFY_ORDER_PREVIEW_PROVIDER_BUDGET_MS = 50_000',
+  'SHOPIFY_ORDER_PREVIEW_PROVIDER_CALL_TIMEOUT_MS = 10_000',
+], 'Shopify order-preview provider deadline')
+assert.doesNotMatch(
+  previewServiceSource,
+  /\b(?:writeCommerceCredentialInPostgres|setCommerceIntegrationEnabledInPostgres|recordShopifyWebhookReceiptInPostgres)\s*\(/,
+  'Shopify order preview must not enable intake or write provider-domain state',
+)
+const commerceStateSource = service.slice(
+  service.indexOf('export async function getCommerceIntegrationsState'),
+  service.indexOf('export async function connectShopifyCommerce'),
+)
+assert.ok(
+  commerceStateSource.includes(
+    'await purgeExpiredShopifyOrderPreviewsInPostgres()',
+  ),
+  'Sales-channel reads must opportunistically purge expired Shopify previews',
+)
+
+const previewRoute = read(
+  'app_src/app/api/integrations/commerce/shopify/order-preview/route.ts',
+)
+includes(previewRoute, [
+  "export const dynamic = 'force-dynamic'",
+  "export const runtime = 'nodejs'",
+  'export const maxDuration = 60',
+  '8 * 1024',
+  'requireRequestUser(req)',
+  'operationsCapabilities(actor).canManage',
+  'isPostgresStorageEnabled()',
+  "'Cache-Control': 'no-store, max-age=0'",
+  'export async function GET',
+  'export async function POST',
+  'export async function DELETE',
+  "'confirmReadOnly'",
+  'body.confirmReadOnly !== true',
+  "'confirmClear'",
+  'body.confirmClear !== true',
+  'organizationId: organizationId(user)',
+  'accountGlobalId: body.accountGlobalId',
+], 'Shopify order-preview route')
+const previewProviderBudget = Number(
+  service.match(
+    /SHOPIFY_ORDER_PREVIEW_PROVIDER_BUDGET_MS\s*=\s*([0-9_]+)/,
+  )?.[1].replaceAll('_', ''),
+)
+const previewRouteSeconds = Number(
+  previewRoute.match(/export const maxDuration\s*=\s*([0-9]+)/)?.[1],
+)
+assert.ok(
+  Number.isFinite(previewProviderBudget)
+  && Number.isFinite(previewRouteSeconds)
+  && previewProviderBudget < previewRouteSeconds * 1_000,
+  'Shopify provider reads must leave time for persistence within the route deadline',
+)
+assert.doesNotMatch(
+  previewRoute,
+  /\b(?:clientSecret|accessToken|rawPayload|customerEmail|customerPhone)\b/,
+  'Shopify order-preview route must not accept credentials, raw payloads, or customer fields',
+)
+
+const disconnectSource = persistence.slice(
+  persistence.indexOf(
+    'export async function disconnectCommerceCredentialInPostgres',
+  ),
+  persistence.indexOf(
+    'export async function recordCommerceProviderAttemptInPostgres',
+  ),
+)
+includes(disconnectSource, [
+  "row.provider === 'shopify'",
+  'DELETE FROM operations_commerce_order_preview_runs',
+  'WHERE organization_id = $1::uuid',
+  'AND integration_account_id = $2::uuid',
+  'DELETE FROM operations_commerce_credentials',
+], 'Shopify disconnect preview purge')
+assert.ok(
+  disconnectSource.indexOf(
+    'DELETE FROM operations_commerce_order_preview_runs',
+  ) < disconnectSource.indexOf(
+    'DELETE FROM operations_commerce_credentials',
+  ),
+  'Disconnect must clear held Shopify previews before deleting the credential',
+)
+
+const previewPanelText = panel.toLowerCase().replace(/\s+/g, ' ')
+for (const textFragment of [
+  'development order preview',
+  'read only',
+  'newest 25 non-test',
+  'first 20 lines per order',
+  '24 hours',
+  'fetch newest 25',
+  'clear preview',
+]) {
+  assert.ok(
+    previewPanelText.includes(textFragment),
+    `Shopify order-preview UI missing ${textFragment}`,
+  )
+}
+includes(panel, [
+  'confirmReadOnly: true',
+  'confirmClear: true',
+  'crypto.randomUUID()',
+  'preview.run.canonicalOrdersCreated',
+  'preview.run.shopifyWrites',
+  'preview.run.syncCursorAdvanced',
+  'preview.run.moreAvailable',
+  'preview.gapCounts',
+  'preview.orders',
+], 'Shopify order-preview UI')
+
+const healthRoute = read('app_src/app/api/health/route.ts')
+includes(healthRoute, [
+  'operations_shopify_order_preview_migration_applied: boolean',
+  "filename = '0113_operations_shopify_order_preview.sql'",
+  'AS operations_shopify_order_preview_migration_applied',
+  '&& row?.operations_shopify_order_preview_migration_applied',
+  '|| !row?.operations_shopify_order_preview_migration_applied',
+], 'Shopify order-preview health migration gate')
+
 console.log('PASS commerce integration control-plane contracts')

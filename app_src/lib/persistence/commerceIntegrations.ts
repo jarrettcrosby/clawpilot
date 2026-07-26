@@ -987,6 +987,14 @@ export async function disconnectCommerceCredentialInPostgres(input: {
     )
     const row = account.rows[0]
     if (!row) return
+    if (row.provider === 'shopify') {
+      await client.query(
+        `DELETE FROM operations_commerce_order_preview_runs
+         WHERE organization_id = $1::uuid
+           AND integration_account_id = $2::uuid`,
+        [input.organizationId, row.id],
+      )
+    }
     await client.query(
       `DELETE FROM operations_commerce_credentials
        WHERE organization_id = $1::uuid

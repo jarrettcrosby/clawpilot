@@ -38,6 +38,14 @@ import {
   verifyShopifyWebhookHmac,
 } from '@/lib/integrations/shopifyCommerceClient'
 import {
+  assertShopifyOrderPreviewRuntime,
+  fetchShopifyOrderPreview,
+  normalizeShopifyOrderPreviewIdempotencyKey,
+  SHOPIFY_ORDER_PREVIEW_MAX_ORDERS,
+  SHOPIFY_ORDER_PREVIEW_POLICY_VERSION,
+  ShopifyOrderPreviewError,
+} from '@/lib/integrations/shopifyOrderPreview'
+import {
   claimFaireOAuthInstallationInPostgres,
   createFaireOAuthInstallationInPostgres,
   discardFaireOAuthInstallationInPostgres,
@@ -55,11 +63,21 @@ import {
   type CommerceRuntimeCredentialRecord,
   type CommerceSyncResource,
 } from '@/lib/persistence/commerceIntegrations'
+import {
+  clearShopifyOrderPreviewInPostgres,
+  purgeExpiredShopifyOrderPreviewsInPostgres,
+  readShopifyOrderPreviewStateFromPostgres,
+  storeShopifyOrderPreviewInPostgres,
+} from '@/lib/persistence/commerceOrderPreviews'
 import { appPublicUrl } from '@/lib/publicUrl'
 
 const SHOPIFY_ADAPTER_VERSION = `shopify-graphql-${SHOPIFY_ADMIN_API_VERSION}-control-v1`
+const SHOPIFY_ORDER_PREVIEW_ADAPTER_VERSION =
+  `shopify-graphql-${SHOPIFY_ADMIN_API_VERSION}-held-preview-v1`
 const FAIRE_ADAPTER_VERSION = 'faire-external-api-v2-control-v1'
 const FAIRE_OAUTH_INSTALLATION_TTL_MS = 15 * 60 * 1000
+const SHOPIFY_ORDER_PREVIEW_PROVIDER_BUDGET_MS = 50_000
+const SHOPIFY_ORDER_PREVIEW_PROVIDER_CALL_TIMEOUT_MS = 10_000
 const MAX_WEBHOOK_BYTES = 512 * 1024
 const SHOPIFY_CONTROL_PLANE_WEBHOOK_TOPIC_SET = new Set<string>(
   SHOPIFY_CONTROL_PLANE_WEBHOOK_TOPICS,
@@ -91,6 +109,13 @@ function sanitize(error: unknown): CommerceIntegrationRequestError {
     )
   }
   if (error instanceof FaireCommerceClientError) {
+    return new CommerceIntegrationRequestError(
+      error.message,
+      error.status,
+      error.code,
+    )
+  }
+  if (error instanceof ShopifyOrderPreviewError) {
     return new CommerceIntegrationRequestError(
       error.message,
       error.status,
@@ -138,6 +163,20 @@ function sanitize(error: unknown): CommerceIntegrationRequestError {
       'Shopify webhook credential changed before the delivery could be recorded',
       409,
       'SHOPIFY_WEBHOOK_CREDENTIAL_STALE',
+    )
+  }
+  if (message === 'Shopify order preview credential changed before preview commit') {
+    return new CommerceIntegrationRequestError(
+      'The Shopify credential changed before the held preview could be saved',
+      409,
+      'SHOPIFY_ORDER_PREVIEW_CREDENTIAL_STALE',
+    )
+  }
+  if (message === 'Shopify order preview idempotency key was reused for a different request') {
+    return new CommerceIntegrationRequestError(
+      'The Shopify order-preview request identity was already used',
+      409,
+      'SHOPIFY_ORDER_PREVIEW_IDEMPOTENCY_CONFLICT',
     )
   }
   if (
@@ -526,6 +565,7 @@ export async function getCommerceIntegrationsState(
   organizationIdValue: unknown,
 ) {
   const organizationId = normalizeCommerceOrganizationId(organizationIdValue)
+  await purgeExpiredShopifyOrderPreviewsInPostgres()
   const state = await readCommerceIntegrationsStateFromPostgres(organizationId)
   return {
     ...state,
@@ -742,6 +782,235 @@ async function storedRuntime(input: {
     )
   }
   return runtime
+}
+
+async function shopifyPreviewAccount(input: {
+  organizationId: unknown
+  accountGlobalId: unknown
+}) {
+  const runtime = await storedRuntime(input)
+  if (runtime.provider !== 'shopify') {
+    throw new CommerceIntegrationRequestError(
+      'Shopify order preview requires a Shopify sales channel',
+      400,
+      'SHOPIFY_ORDER_PREVIEW_PROVIDER_REQUIRED',
+    )
+  }
+  return runtime
+}
+
+async function shopifyPreviewFetchRuntime(input: {
+  organizationId: unknown
+  accountGlobalId: unknown
+}) {
+  assertShopifyOrderPreviewRuntime()
+  const runtime = await shopifyPreviewAccount(input)
+  if (runtime.environment !== 'sandbox') {
+    throw new CommerceIntegrationRequestError(
+      'Shopify order preview is limited to development or test stores',
+      409,
+      'SHOPIFY_ORDER_PREVIEW_SANDBOX_REQUIRED',
+    )
+  }
+  if (runtime.verificationStatus !== 'verified' || runtime.status === 'error') {
+    throw new CommerceIntegrationRequestError(
+      'Verify the Shopify connection before reading an order preview',
+      409,
+      'SHOPIFY_ORDER_PREVIEW_VERIFICATION_REQUIRED',
+    )
+  }
+  return runtime
+}
+
+function shopifyPreviewProviderTimeout(deadlineAt: number) {
+  const remainingMs = deadlineAt - Date.now()
+  if (remainingMs < 1_000) {
+    throw new ShopifyOrderPreviewError(
+      'Shopify order preview exceeded its safe read deadline',
+      504,
+      'SHOPIFY_ORDER_PREVIEW_DEADLINE_EXCEEDED',
+    )
+  }
+  return Math.min(
+    SHOPIFY_ORDER_PREVIEW_PROVIDER_CALL_TIMEOUT_MS,
+    remainingMs,
+  )
+}
+
+export async function getShopifyOrderPreview(input: {
+  organizationId: unknown
+  accountGlobalId: unknown
+}) {
+  try {
+    const runtime = await shopifyPreviewAccount(input)
+    return readShopifyOrderPreviewStateFromPostgres({
+      organizationId: runtime.organizationId,
+      accountGlobalId: runtime.globalId,
+    })
+  } catch (error) {
+    throw sanitize(error)
+  }
+}
+
+export async function clearShopifyOrderPreview(input: {
+  organizationId: unknown
+  accountGlobalId: unknown
+  actorEmail: string
+}) {
+  try {
+    const runtime = await shopifyPreviewAccount(input)
+    return clearShopifyOrderPreviewInPostgres({
+      runtime,
+      actorEmail: input.actorEmail,
+    })
+  } catch (error) {
+    throw sanitize(error)
+  }
+}
+
+export async function importShopifyOrderPreview(input: {
+  organizationId: unknown
+  accountGlobalId: unknown
+  idempotencyKey: unknown
+  actorEmail: string
+}) {
+  let runtime: CommerceRuntimeCredentialRecord | null = null
+  const requestedAt = new Date()
+  const idempotencyKey = normalizeShopifyOrderPreviewIdempotencyKey(
+    input.idempotencyKey,
+  )
+  try {
+    runtime = await shopifyPreviewFetchRuntime(input)
+    const providerDeadlineAt =
+      Date.now() + SHOPIFY_ORDER_PREVIEW_PROVIDER_BUDGET_MS
+    const credential = decryptStoredCredential(runtime)
+    if (credential.provider !== 'shopify') {
+      throw new Error('Stored commerce credential could not be decrypted')
+    }
+    const shopDomain = normalizeShopifyShopDomain(
+      runtime.configuration.shopDomain,
+    )
+    const grant = await requestShopifyAccessToken(
+      {
+        shopDomain,
+        clientId: credential.clientId,
+        clientSecret: credential.clientSecret,
+      },
+      { timeoutMs: shopifyPreviewProviderTimeout(providerDeadlineAt) },
+    )
+    const probe = await probeShopifyConnection(
+      {
+        shopDomain,
+        accessToken: grant.accessToken,
+      },
+      { timeoutMs: shopifyPreviewProviderTimeout(providerDeadlineAt) },
+    )
+    if (probe.shopId !== runtime.externalAccountId) {
+      throw new CommerceIntegrationRequestError(
+        'Shopify returned a different store identity',
+        409,
+        'SHOPIFY_STORE_IDENTITY_CHANGED',
+      )
+    }
+    const probeScopes = new Set(probe.grantedScopes)
+    const tokenScopes = new Set(grant.grantedScopes)
+    if (!probeScopes.has('read_orders') || !tokenScopes.has('read_orders')) {
+      throw new CommerceIntegrationRequestError(
+        'The installed Shopify app has not granted read_orders',
+        409,
+        'SHOPIFY_ORDER_READ_SCOPE_REQUIRED',
+      )
+    }
+    const fetched = await fetchShopifyOrderPreview(
+      {
+        shopDomain,
+        accessToken: grant.accessToken,
+      },
+      { deadlineAt: providerDeadlineAt },
+    )
+    const requestHash = createHash('sha256').update(JSON.stringify({
+      accountGlobalId: runtime.globalId,
+      credentialVersion: runtime.credentialVersion,
+      policyVersion: SHOPIFY_ORDER_PREVIEW_POLICY_VERSION,
+      maxOrders: SHOPIFY_ORDER_PREVIEW_MAX_ORDERS,
+      testOrdersIncluded: false,
+      shopifyWrites: 0,
+    })).digest('hex')
+    const state = await storeShopifyOrderPreviewInPostgres({
+      runtime,
+      idempotencyKey,
+      requestHash,
+      grantedScopes: probe.grantedScopes,
+      fetched,
+      actorEmail: input.actorEmail,
+    })
+    const completedAt = new Date()
+    await recordCommerceProviderAttemptInPostgres({
+      organizationId: runtime.organizationId,
+      accountGlobalId: runtime.globalId,
+      action: 'orders.held_preview.read',
+      adapterVersion: SHOPIFY_ORDER_PREVIEW_ADAPTER_VERSION,
+      idempotencyKey,
+      requestHash,
+      redactedRequest: {
+        credentialVersion: runtime.credentialVersion,
+        policyVersion: SHOPIFY_ORDER_PREVIEW_POLICY_VERSION,
+        maxOrders: SHOPIFY_ORDER_PREVIEW_MAX_ORDERS,
+        includeTestOrders: false,
+        readOnly: true,
+      },
+      redactedResponse: {
+        ordersSeen: fetched.ordersSeen,
+        ordersStaged: fetched.candidates.length,
+        moreAvailable: fetched.moreAvailable,
+        canonicalOrdersCreated: 0,
+        shopifyWrites: 0,
+        syncCursorAdvanced: false,
+      },
+      state: 'succeeded',
+      providerReference: runtime.externalAccountId,
+      errorCode: null,
+      actorEmail: input.actorEmail,
+      requestedAt: requestedAt.toISOString(),
+      completedAt: completedAt.toISOString(),
+    })
+    return state
+  } catch (error) {
+    const sanitized = sanitize(error)
+    if (runtime) {
+      const completedAt = new Date()
+      await recordCommerceProviderAttemptInPostgres({
+        organizationId: runtime.organizationId,
+        accountGlobalId: runtime.globalId,
+        action: 'orders.held_preview.read',
+        adapterVersion: SHOPIFY_ORDER_PREVIEW_ADAPTER_VERSION,
+        idempotencyKey,
+        requestHash: createHash('sha256').update(JSON.stringify({
+          accountGlobalId: runtime.globalId,
+          credentialVersion: runtime.credentialVersion,
+          policyVersion: SHOPIFY_ORDER_PREVIEW_POLICY_VERSION,
+          maxOrders: SHOPIFY_ORDER_PREVIEW_MAX_ORDERS,
+          testOrdersIncluded: false,
+          shopifyWrites: 0,
+        })).digest('hex'),
+        redactedRequest: {
+          credentialVersion: runtime.credentialVersion,
+          policyVersion: SHOPIFY_ORDER_PREVIEW_POLICY_VERSION,
+          maxOrders: SHOPIFY_ORDER_PREVIEW_MAX_ORDERS,
+          includeTestOrders: false,
+          readOnly: true,
+        },
+        redactedResponse: {},
+        state: 'failed',
+        providerReference: runtime.externalAccountId,
+        errorCode: sanitized.code,
+        actorEmail: input.actorEmail,
+        requestedAt: requestedAt.toISOString(),
+        completedAt: completedAt.toISOString(),
+      }).catch(() => undefined)
+    }
+    throw sanitized
+  }
 }
 
 async function verifyStoredConnection(

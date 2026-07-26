@@ -75,9 +75,11 @@ node scripts/seed-wms-development-simulation.mjs
 The default pipeline is selected first. Set `WMS_SIM_PIPELINE_ID` to choose a
 specific pipeline belonging to the supplied organization.
 
-The command is idempotent. Re-running it reactivates and refreshes the same
-tagged scenario. It does not overwrite inventory balances that operators have
-changed while testing.
+Generation is idempotent only before retirement. Before cleanup, re-running the
+command refreshes the same tagged scenario without overwriting inventory
+balances that operators changed while testing. After cleanup succeeds, the
+organization-scoped simulator singleton and its order lineage are permanently
+retired; generation is blocked for every scenario version.
 
 ## Inspect
 
@@ -100,12 +102,20 @@ DATABASE_URL=postgresql://localhost/clawpilot_dev \
 node scripts/seed-wms-development-simulation.mjs --cleanup
 ```
 
-Cleanup releases active synthetic reservations through compensating inventory
-ledger entries, cancels synthetic orders, plans, waves, and pick tasks, and
-deactivates the synthetic warehouse, locations, pool, mappings, products,
-integration, actor, and membership.
+Cleanup first locks and verifies the exact integration, warehouse, inventory
+pool, customer, pipeline, and 21-order fixture. It refuses a pool or wave that
+also contains unrelated operational records. It also refuses unrelated active
+reservations, allocations, plans, receipts, replenishment tasks, inventory
+positions, location rules, waves, printers, or print agents that would be
+stranded by deactivating the simulator warehouse or pool. It never mutates those
+unrelated records. After that fail-closed preflight, it releases active synthetic
+reservations through compensating inventory ledger entries, cancels synthetic
+orders, plans, waves, and pick tasks, dismisses linked open exceptions, archives
+the orders, and deactivates the synthetic warehouse, locations, pool, mappings,
+products, integration, actor, and membership.
 
-Cleanup intentionally preserves Global IDs, inventory positions, and immutable
-inventory ledger history. This maintains ClawPilot's audit and no-ID-reuse
-invariants. A later generation run reactivates the same scenario and creates a
-new audited reservation cycle.
+Cleanup is one-way and terminal for this organization's WMS simulator lineage.
+Rerunning cleanup is idempotent, but generation remains blocked afterward.
+Global IDs, archived orders, inventory positions, immutable inventory ledger
+history, and other evidence tombstones are intentionally preserved to maintain
+ClawPilot's audit and no-ID-reuse invariants.
