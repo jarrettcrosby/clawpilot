@@ -1,6 +1,6 @@
 'use client'
 
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
 import {
   Alert,
   Box,
@@ -29,6 +29,7 @@ import AddRounded from '@mui/icons-material/AddRounded'
 import CancelRounded from '@mui/icons-material/CancelRounded'
 import ContentCopyRounded from '@mui/icons-material/ContentCopyRounded'
 import EditRounded from '@mui/icons-material/EditRounded'
+import InfoOutlined from '@mui/icons-material/InfoOutlined'
 import KeyRounded from '@mui/icons-material/KeyRounded'
 import PrintRounded from '@mui/icons-material/PrintRounded'
 import RefreshRounded from '@mui/icons-material/RefreshRounded'
@@ -143,6 +144,66 @@ function timestamp(value: string | null) {
   return Number.isNaN(parsed.getTime()) ? 'Unknown' : parsed.toLocaleString()
 }
 
+function formatBytes(value: number | null) {
+  if (value === null || !Number.isFinite(value)) return 'Not available'
+  if (value < 1024) return `${value} B`
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`
+  return `${(value / (1024 * 1024)).toFixed(1)} MB`
+}
+
+function packageSize(job: OperationsPrintJobListItem) {
+  if (
+    job.packageLengthMm === null
+    || job.packageWidthMm === null
+    || job.packageHeightMm === null
+  ) return 'Not available'
+  const inches = [job.packageLengthMm, job.packageWidthMm, job.packageHeightMm]
+    .map((value) => (value / 25.4).toFixed(1))
+    .join(' x ')
+  return `${inches} in (${job.packageLengthMm} x ${job.packageWidthMm} x ${job.packageHeightMm} mm)`
+}
+
+function packageWeight(job: OperationsPrintJobListItem) {
+  if (job.packageWeightGrams === null) return 'Not available'
+  return `${(job.packageWeightGrams / 453.59237).toFixed(2)} lb (${job.packageWeightGrams} g)`
+}
+
+function destination(job: OperationsPrintJobListItem) {
+  const locality = [
+    job.shipToCity,
+    job.shipToRegion,
+    job.shipToPostalCode,
+    job.shipToCountry,
+  ].filter(Boolean).join(', ')
+  return [job.shipToName, locality].filter(Boolean).join(' · ') || 'Not available'
+}
+
+function namedGlobalId(name: string | null, globalId: string | null) {
+  return [name, globalId].filter(Boolean).join(' · ') || 'Not available'
+}
+
+function DetailField({ term, value }: { term: string; value: ReactNode }) {
+  return (
+    <Box sx={{ minWidth: 0 }}>
+      <Typography
+        component="dt"
+        variant="caption"
+        color="text.secondary"
+        sx={{ textTransform: 'uppercase' }}
+      >
+        {term}
+      </Typography>
+      <Typography
+        component="dd"
+        variant="body2"
+        sx={{ m: 0, mt: 0.25, overflowWrap: 'anywhere' }}
+      >
+        {value || 'Not available'}
+      </Typography>
+    </Box>
+  )
+}
+
 function defaultForm(warehouseId: string): PrinterForm {
   return {
     warehouseId,
@@ -250,6 +311,7 @@ export default function PrinterConfigurationPanel() {
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
+  const [selectedJob, setSelectedJob] = useState<OperationsPrintJobListItem | null>(null)
   const [printerForm, setPrinterForm] = useState<PrinterForm | null>(null)
   const [enrollForm, setEnrollForm] = useState<{ warehouseId: string; name: string } | null>(null)
   const [agentAction, setAgentAction] = useState<{
@@ -289,6 +351,11 @@ export default function PrinterConfigurationPanel() {
       setPrinters(printerResult.printers)
       setAgents(agentResult.agents)
       setJobs(jobResult.jobs)
+      setSelectedJob((current) => (
+        current
+          ? jobResult.jobs?.jobs.find((job) => job.globalId === current.globalId) || null
+          : null
+      ))
     } catch (caught) {
       if (caught instanceof DOMException && caught.name === 'AbortError') return
       setError(caught instanceof Error ? caught.message : 'Printing operations are unavailable')
@@ -629,6 +696,14 @@ export default function PrinterConfigurationPanel() {
                     )}
                   </Box>
                   <Stack direction="row" spacing={1} alignItems="center" justifyContent="flex-end">
+                    <Button
+                      size="small"
+                      variant="text"
+                      startIcon={<InfoOutlined />}
+                      onClick={() => setSelectedJob(job)}
+                    >
+                      Details
+                    </Button>
                     {job.status === 'failed' && jobs.capabilities.canExecute && job.attempts < job.maxAttempts && (
                       <Button
                         size="small"
@@ -722,7 +797,10 @@ export default function PrinterConfigurationPanel() {
                       ))}
                     </Stack>
                     <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 0.75 }}>
-                      Agent: {printer.localPrintAgentName || 'Not assigned'} · Last seen: {timestamp(printer.lastSeenAt)}
+                      Agent: {printer.localPrintAgentName || 'Not assigned'} · Agent heartbeat: {timestamp(printer.localPrintAgentLastSeenAt)}
+                    </Typography>
+                    <Typography variant="caption" color="text.secondary" display="block">
+                      Last device delivery: {timestamp(printer.lastSeenAt)}
                     </Typography>
                     {printer.fallbackPrinterName && (
                       <Typography variant="caption" color="text.secondary" display="block">
@@ -819,6 +897,338 @@ export default function PrinterConfigurationPanel() {
           )}
         </Box>
       )}
+
+      <Dialog
+        open={Boolean(selectedJob)}
+        onClose={() => setSelectedJob(null)}
+        fullScreen={mobile}
+        fullWidth
+        maxWidth="md"
+      >
+        <DialogTitle>
+          <Stack
+            direction={{ xs: 'column', sm: 'row' }}
+            alignItems={{ xs: 'flex-start', sm: 'center' }}
+            gap={1}
+          >
+            <Box sx={{ minWidth: 0, flex: 1 }}>
+              <Typography variant="h6" fontWeight={700}>Print job details</Typography>
+              <Typography variant="body2" color="text.secondary" sx={{ overflowWrap: 'anywhere' }}>
+                {selectedJob?.globalId}
+              </Typography>
+            </Box>
+            {selectedJob && (
+              <Chip
+                size="small"
+                label={label(selectedJob.status)}
+                color={statusColor(selectedJob.status)}
+              />
+            )}
+          </Stack>
+        </DialogTitle>
+        {selectedJob && (
+          <DialogContent dividers>
+            <Stack spacing={3}>
+              <Box component="section">
+                <Typography fontWeight={700}>Document and source</Typography>
+                <Box
+                  component="dl"
+                  sx={{
+                    m: 0,
+                    mt: 1.25,
+                    display: 'grid',
+                    gridTemplateColumns: { xs: '1fr', sm: 'repeat(2, minmax(0, 1fr))' },
+                    gap: 2,
+                  }}
+                >
+                  <DetailField term="Document" value={selectedJob.documentType ? label(selectedJob.documentType) : null} />
+                  <DetailField
+                    term="Output"
+                    value={[
+                      selectedJob.media ? label(selectedJob.media) : null,
+                      selectedJob.format,
+                    ].filter(Boolean).join(' · ')}
+                  />
+                  <DetailField
+                    term="Order"
+                    value={selectedJob.sourceOrderNumber
+                      ? `${selectedJob.sourceOrderNumber} · ${selectedJob.sourceOrderGlobalId || 'No Global ID'}`
+                      : selectedJob.sourceOrderGlobalId}
+                  />
+                  <DetailField term="Shipment Global ID" value={selectedJob.sourceShipmentGlobalId} />
+                  <DetailField
+                    term="Carrier label"
+                    value={selectedJob.sourceLabelGlobalId
+                      ? `${selectedJob.sourceLabelGlobalId} · ${label(selectedJob.sourceLabelStatus || 'unknown')}`
+                      : null}
+                  />
+                  <DetailField
+                    term="Carrier service"
+                    value={[
+                      selectedJob.carrier?.toUpperCase(),
+                      selectedJob.carrierServiceCode,
+                      selectedJob.carrierEnvironment
+                        ? label(selectedJob.carrierEnvironment)
+                        : null,
+                    ].filter(Boolean).join(' · ')}
+                  />
+                  <DetailField term="Tracking number" value={selectedJob.trackingNumber} />
+                  <DetailField term="Label created" value={timestamp(selectedJob.labelCreatedAt)} />
+                  {selectedJob.labelVoidedAt && (
+                    <>
+                      <DetailField term="Label voided" value={timestamp(selectedJob.labelVoidedAt)} />
+                      <DetailField term="Voided by" value={selectedJob.labelVoidedBy} />
+                    </>
+                  )}
+                </Box>
+              </Box>
+
+              <Divider />
+
+              <Box component="section">
+                <Typography fontWeight={700}>Destination and package</Typography>
+                <Box
+                  component="dl"
+                  sx={{
+                    m: 0,
+                    mt: 1.25,
+                    display: 'grid',
+                    gridTemplateColumns: { xs: '1fr', sm: 'repeat(2, minmax(0, 1fr))' },
+                    gap: 2,
+                  }}
+                >
+                  <DetailField term="Ship to" value={destination(selectedJob)} />
+                  <DetailField
+                    term="Package"
+                    value={selectedJob.packageGlobalId
+                      ? `Package ${selectedJob.packageNumber || '—'} · ${selectedJob.packageGlobalId}`
+                      : null}
+                  />
+                  <DetailField term="Package dimensions" value={packageSize(selectedJob)} />
+                  <DetailField term="Package weight" value={packageWeight(selectedJob)} />
+                </Box>
+              </Box>
+
+              <Divider />
+
+              <Box component="section">
+                <Typography fontWeight={700}>Routing and device</Typography>
+                <Box
+                  component="dl"
+                  sx={{
+                    m: 0,
+                    mt: 1.25,
+                    display: 'grid',
+                    gridTemplateColumns: { xs: '1fr', sm: 'repeat(2, minmax(0, 1fr))' },
+                    gap: 2,
+                  }}
+                >
+                  <DetailField
+                    term="Warehouse"
+                    value={namedGlobalId(
+                      selectedJob.warehouseName,
+                      selectedJob.warehouseGlobalId,
+                    )}
+                  />
+                  <DetailField term="Station" value={label(selectedJob.stationType)} />
+                  <DetailField
+                    term="Delivered printer"
+                    value={namedGlobalId(
+                      selectedJob.printerName,
+                      selectedJob.printerGlobalId,
+                    )}
+                  />
+                  <DetailField
+                    term="Requested printer"
+                    value={namedGlobalId(
+                      selectedJob.requestedPrinterName,
+                      selectedJob.requestedPrinterGlobalId,
+                    )}
+                  />
+                  <DetailField
+                    term="Fallback printer"
+                    value={namedGlobalId(
+                      selectedJob.fallbackPrinterName,
+                      selectedJob.fallbackPrinterGlobalId,
+                    )}
+                  />
+                  <DetailField
+                    term="Local print agent"
+                    value={namedGlobalId(
+                      selectedJob.printAgentName,
+                      selectedJob.printAgentGlobalId,
+                    )}
+                  />
+                  <DetailField term="Routing explanation" value={selectedJob.routingReason} />
+                  <DetailField term="Enqueued by" value={selectedJob.enqueuedBy} />
+                </Box>
+              </Box>
+
+              <Divider />
+
+              <Box component="section">
+                <Typography fontWeight={700}>Document integrity</Typography>
+                <Box
+                  component="dl"
+                  sx={{
+                    m: 0,
+                    mt: 1.25,
+                    display: 'grid',
+                    gridTemplateColumns: { xs: '1fr', sm: 'repeat(2, minmax(0, 1fr))' },
+                    gap: 2,
+                  }}
+                >
+                  <DetailField term="Artifact Global ID" value={selectedJob.artifactGlobalId} />
+                  <DetailField term="Payload size" value={formatBytes(selectedJob.artifactByteLength)} />
+                  <DetailField term="SHA-256" value={selectedJob.artifactContentSha256} />
+                  <DetailField term="Artifact created by" value={selectedJob.artifactCreatedBy} />
+                  <DetailField term="Artifact created" value={timestamp(selectedJob.artifactCreatedAt)} />
+                </Box>
+              </Box>
+
+              <Divider />
+
+              <Box component="section">
+                <Typography fontWeight={700}>Lifecycle and lineage</Typography>
+                <Box
+                  component="dl"
+                  sx={{
+                    m: 0,
+                    mt: 1.25,
+                    display: 'grid',
+                    gridTemplateColumns: { xs: '1fr', sm: 'repeat(2, minmax(0, 1fr))' },
+                    gap: 2,
+                  }}
+                >
+                  <DetailField term="Attempts" value={`${selectedJob.attempts} of ${selectedJob.maxAttempts}`} />
+                  <DetailField term="Available at" value={timestamp(selectedJob.availableAt)} />
+                  <DetailField term="Claim lease expires" value={timestamp(selectedJob.claimExpiresAt)} />
+                  <DetailField term="Delivered at" value={timestamp(selectedJob.deliveredAt)} />
+                  <DetailField term="Created" value={timestamp(selectedJob.createdAt)} />
+                  <DetailField term="Last updated" value={timestamp(selectedJob.updatedAt)} />
+                  <DetailField term="Last error" value={selectedJob.lastError} />
+                  <DetailField
+                    term="Reprint lineage"
+                    value={selectedJob.reprintOfJobGlobalId
+                      ? `${selectedJob.reprintOfJobGlobalId} · ${selectedJob.reprintReason || 'No reason recorded'}`
+                      : 'Original print job'}
+                  />
+                </Box>
+              </Box>
+
+              <Divider />
+
+              <Box component="section">
+                <Typography fontWeight={700}>Delivery history</Typography>
+                {!selectedJob.attemptHistory.length ? (
+                  <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
+                    No delivery events have been recorded.
+                  </Typography>
+                ) : (
+                  <Stack divider={<Divider flexItem />} sx={{ mt: 0.75 }}>
+                    {selectedJob.attemptHistory.map((attempt) => (
+                      <Box key={`${attempt.sequenceNumber}-${attempt.occurredAt}`} sx={{ py: 1.5 }}>
+                        <Stack
+                          direction={{ xs: 'column', sm: 'row' }}
+                          alignItems={{ xs: 'flex-start', sm: 'center' }}
+                          gap={0.75}
+                        >
+                          <Chip
+                            size="small"
+                            label={label(attempt.state)}
+                            color={statusColor(attempt.state)}
+                          />
+                          <Typography variant="body2" fontWeight={700}>
+                            Attempt {attempt.attemptNumber} · Event {attempt.sequenceNumber}
+                          </Typography>
+                          <Typography variant="caption" color="text.secondary">
+                            {timestamp(attempt.occurredAt)}
+                          </Typography>
+                        </Stack>
+                        <Typography variant="body2" color="text.secondary" sx={{ mt: 0.75 }}>
+                          {attempt.printerName || 'No printer recorded'}
+                          {attempt.printAgentGlobalId ? ` · Agent ${attempt.printAgentGlobalId}` : ''}
+                          {attempt.actorEmail
+                            ? ` · ${attempt.actorEmail}`
+                            : attempt.actorType ? ` · ${label(attempt.actorType)}` : ''}
+                        </Typography>
+                        {attempt.deviceJobReference && (
+                          <Typography variant="caption" color="text.secondary" display="block">
+                            Device job: {attempt.deviceJobReference}
+                          </Typography>
+                        )}
+                        {attempt.deliveryEvidence && (
+                          <Typography variant="caption" color="text.secondary" display="block">
+                            Delivery evidence: {attempt.deliveryEvidence}
+                          </Typography>
+                        )}
+                        <Typography
+                          variant="caption"
+                          color={attempt.physicalOutputVerified ? 'success.light' : 'text.secondary'}
+                          display="block"
+                        >
+                          Physical output: {attempt.physicalOutputVerified ? 'Verified' : 'Not verified'}
+                        </Typography>
+                        {(attempt.errorCode || attempt.errorMessage) && (
+                          <Typography variant="caption" color="error.light" display="block" sx={{ mt: 0.5 }}>
+                            {[attempt.errorCode, attempt.errorMessage].filter(Boolean).join(' · ')}
+                          </Typography>
+                        )}
+                        {attempt.detail && (
+                          <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 0.5 }}>
+                            {attempt.detail}
+                          </Typography>
+                        )}
+                      </Box>
+                    ))}
+                  </Stack>
+                )}
+              </Box>
+            </Stack>
+          </DialogContent>
+        )}
+        <DialogActions sx={{ flexWrap: 'wrap' }}>
+          {selectedJob?.status === 'failed'
+            && jobs?.capabilities.canExecute
+            && selectedJob.attempts < selectedJob.maxAttempts && (
+            <Button
+              startIcon={<RestartAltRounded />}
+              onClick={() => {
+                setSelectedJob(null)
+                setJobAction({ job: selectedJob, action: 'retry-job', reason: '' })
+              }}
+            >
+              Retry
+            </Button>
+          )}
+          {selectedJob?.status === 'delivered' && jobs?.capabilities.canReprint && (
+            <Button
+              startIcon={<ReplayRounded />}
+              onClick={() => {
+                setSelectedJob(null)
+                setJobAction({ job: selectedJob, action: 'reprint-job', reason: '' })
+              }}
+            >
+              Reprint
+            </Button>
+          )}
+          {selectedJob
+            && (selectedJob.status === 'queued' || selectedJob.status === 'claimed')
+            && (jobs?.capabilities.canExecute || jobs?.capabilities.canManage) && (
+            <Button
+              color="error"
+              startIcon={<CancelRounded />}
+              onClick={() => {
+                setSelectedJob(null)
+                setJobAction({ job: selectedJob, action: 'cancel-job', reason: '' })
+              }}
+            >
+              Cancel job
+            </Button>
+          )}
+          <Button variant="contained" onClick={() => setSelectedJob(null)}>Close</Button>
+        </DialogActions>
+      </Dialog>
 
       <Dialog
         open={Boolean(printerForm)}

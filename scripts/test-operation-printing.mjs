@@ -328,6 +328,12 @@ for (const fragment of [
   'Cancel print job',
   'Retry print job',
   'does not prove physical output',
+  'Print job details',
+  'Agent heartbeat',
+  'Last device delivery',
+  'Package dimensions',
+  'Document integrity',
+  'Delivery history',
 ]) assert.ok(panel.includes(fragment), `Printer UI missing ${fragment}`)
 
 const operations = read('app_src/components/operations/OperationsSection.tsx')
