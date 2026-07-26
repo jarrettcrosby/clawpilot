@@ -15,6 +15,8 @@ const health = read('app_src/app/api/health/route.ts')
 const predeploy = read('scripts/verify-predeploy.mjs')
 const simulation = read('scripts/seed-wms-development-simulation.mjs')
 const simulationRunbook = read('docs/modules/wms-development-simulation.md')
+const rootPackage = read('package.json')
+const crmPersistence = read('app_src/lib/persistence/crm.ts')
 
 for (const fragment of [
   'ADD COLUMN IF NOT EXISTS carrier_cutoffs jsonb',
@@ -113,10 +115,21 @@ for (const fragment of [
   'requires exactly one marked warehouse',
   'requires exactly one named simulator pool',
   'pool has inventory positions outside the marked warehouse',
-  'pool has a customer link outside the marked scenario customer',
+  'Scenario simulator pool must have exactly one link to the marked',
   'inventory position from another pool',
   'inventory position outside exact fixture products or locations',
   'active location rule outside the exact fixture',
+  'function scenarioCustomerIdentities(',
+  'function isAllowedScenarioCustomerIdentity(',
+  'orders.customer_id::text',
+  'Scenario cleanup orders span ${customerIds.length} customers',
+  'Scenario cleanup orders are bound to another marked customer',
+  'Scenario cleanup marked customer belongs to another pipeline',
+  'Scenario cleanup marked customer metadata is not exact',
+  'Scenario cleanup marked customer identity is not an allowed exact pair',
+  'Scenario generation found ${existing.rowCount} conflicting customer identities',
+  'Scenario generation found a conflicting or repurposed customer identity',
+  'poolCustomerResult.rowCount !== 1',
   'unrelatedReservationResult',
   'unrelatedAllocationResult',
   'unrelatedPlanResult',
@@ -138,9 +151,20 @@ for (const fragment of [
   "exception.status IN ('open', 'acknowledged')",
   'async function assertScenarioRetired(',
   'integration_count_invalid',
+  'product_count_invalid',
   'order_count_invalid',
   'warehouse_count_invalid',
   'inventory_pool_count_invalid',
+  'scenario_customer_candidates AS',
+  'customer_count_invalid',
+  'customer_identity_invalid',
+  'orders_customer_invalid',
+  'pool_customer_links_invalid',
+  'pool_owner_invalid',
+  'claimable_suitecrm_outbox',
+  'active_crm_short_links',
+  'processing SuiteCRM projection(s)',
+  'WMS development simulator retired before SuiteCRM delivery',
   'unrelated_active_reservations',
   'unrelated_active_allocations',
   'unrelated_non_cancelled_plans',
@@ -222,6 +246,46 @@ assert.equal(
   false,
   'Development simulation cleanup must preserve fixture evidence and tombstones',
 )
+assert.equal(
+  /\bDELETE\s+FROM\s+(?:sync_outbox|short_links)\b/i.test(cleanupScenario),
+  false,
+  'Cleanup must preserve SuiteCRM outbox and short-link evidence',
+)
+assert.equal(
+  cleanupScenario.includes("'delete_record'"),
+  false,
+  'Cleanup must not enqueue or issue a SuiteCRM record deletion',
+)
+assert.equal(
+  (cleanupScenario.match(/'archived', true/g) || []).length,
+  2,
+  'Cleanup must archive both synthetic CRM customers and products locally',
+)
+assert.ok(
+  cleanupScenario.includes('AND id = ANY($2::uuid[])'),
+  'Cleanup must archive only the exact locked synthetic product IDs',
+)
+assert.ok(
+  cleanupScenario.includes(
+    "source_payload->>'retirementReason'\n             IS DISTINCT FROM 'wms_development_simulation_retired'",
+  ),
+  'Cleanup must upgrade partially retired CRM fixtures idempotently',
+)
+assert.equal(
+  (crmPersistence.match(/activeCrmRecordSql\('organization'\)/g) || []).length,
+  5,
+  'CRM organization list, summary, sync summary, and links must exclude archives',
+)
+assert.equal(
+  (crmPersistence.match(/activeCrmRecordSql\('product'\)/g) || []).length,
+  5,
+  'CRM product list, summary, sync summary, and links must exclude archives',
+)
+assert.equal(
+  (crmPersistence.match(/activeCrmRecordSql\('customer'\)/g) || []).length,
+  1,
+  'CRM hierarchy repair must exclude archived customers',
+)
 for (const fragment of [
   'Generation is idempotent only before retirement.',
   'generation is blocked for every scenario version',
@@ -230,6 +294,9 @@ for (const fragment of [
   'evidence tombstones are intentionally preserved',
   'It never mutates those',
   'unrelated records',
+  'marked archived and retired in the',
+  'terminally neutralizes only',
+  'separately authorized SuiteCRM cleanup',
 ]) {
   assert.ok(
     simulationRunbook.includes(fragment),
@@ -244,6 +311,12 @@ assert.equal(
 assert.ok(
   predeploy.includes("'docs/modules/wms-development-simulation.md'"),
   'Predeploy manifest must require the WMS development simulation runbook',
+)
+assert.ok(
+  rootPackage.includes(
+    'node scripts/seed-wms-development-simulation.mjs --self-test',
+  ),
+  'Aggregate Operations tests must execute the simulator identity self-test',
 )
 
 console.log('Operations slotting, replenishment, and development-simulation contracts passed.')

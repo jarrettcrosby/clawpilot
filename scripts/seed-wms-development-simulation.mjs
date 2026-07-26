@@ -53,6 +53,29 @@ function parsedObject(value) {
   }
 }
 
+function scenarioCustomerIdentities(scenario) {
+  const normalizedName = String(scenario.customer.name || '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+  return {
+    seededSourceKey: scenario.customer.sourceKey,
+    seededIdentityKey: scenario.customer.identityKey,
+    canonicalIdentityKey: `customer:name:${normalizedName}`,
+  }
+}
+
+function isAllowedScenarioCustomerIdentity(customer, scenario) {
+  const identities = scenarioCustomerIdentities(scenario)
+  return (
+    customer.source_key === identities.seededSourceKey
+    && customer.identity_key === identities.seededIdentityKey
+  ) || (
+    customer.source_key === identities.canonicalIdentityKey
+    && customer.identity_key === identities.canonicalIdentityKey
+  )
+}
+
 function parseArguments(argv) {
   const flags = new Set(argv)
   const unknown = argv.filter((value) => !['--cleanup', '--self-test', '--help'].includes(value))
@@ -527,6 +550,8 @@ async function requireSchema(client) {
     'operations_replenishment_tasks',
     'operations_printers',
     'operations_print_agents',
+    'sync_outbox',
+    'short_links',
   ]
   const result = await client.query(
     `SELECT name, to_regclass(name) IS NOT NULL AS present
@@ -658,6 +683,7 @@ async function resolveScenarioRetirementTarget(client, configuration, scope, sce
   const orderResult = await client.query(
     `SELECT orders.id::text, orders.external_order_id,
             orders.pipeline_id::text, orders.integration_account_id::text,
+            orders.customer_id::text,
             orders.source_payload->>'scenarioKey' AS scenario_key
      FROM operations_orders orders
      WHERE orders.organization_id = $1::uuid
@@ -697,6 +723,11 @@ async function resolveScenarioRetirementTarget(client, configuration, scope, sce
   if (orderResult.rows.some((order) => order.integration_account_id !== integration.id)) {
     fail('Scenario cleanup found an expected order bound to another integration')
   }
+  const customerIds = [...new Set(orderResult.rows.map((order) => order.customer_id))]
+  if (customerIds.length !== 1 || !customerIds[0]) {
+    fail(`Scenario cleanup orders span ${customerIds.length} customers`)
+  }
+  const customerId = customerIds[0]
 
   const pipelineIds = [...new Set(orderResult.rows.map((order) => order.pipeline_id))]
   if (pipelineIds.length !== 1) {
@@ -722,14 +753,20 @@ async function resolveScenarioRetirementTarget(client, configuration, scope, sce
   }
 
   const customerResult = await client.query(
-    `SELECT customer.id::text, customer.reference_code
+    `SELECT customer.id::text, customer.reference_code,
+            customer.pipeline_id::text, customer.source_key,
+            customer.identity_key, customer.name,
+            customer.account_type, customer.relationship_type
      FROM crm_organizations customer
-     WHERE customer.pipeline_id = $1::uuid
-       AND customer.source_key = $2
-       AND customer.source_payload->>'scenarioKey' = $3
+     JOIN pipeline_spaces pipeline
+       ON pipeline.id = customer.pipeline_id
+      AND pipeline.workspace_organization_id = $1::uuid
+     WHERE customer.source_payload->>'scenarioKey' = $2
+       AND customer.source_payload->>'synthetic' = 'true'
+       AND customer.source_payload->>'nonDeliverable' = 'true'
      ORDER BY customer.id
      FOR UPDATE`,
-    [pipelineId, scenario.customer.sourceKey, scenario.scenarioKey],
+    [scope.organizationId, scenario.scenarioKey],
   )
   if (customerResult.rowCount !== 1) {
     fail(
@@ -738,9 +775,24 @@ async function resolveScenarioRetirementTarget(client, configuration, scope, sce
     )
   }
   const customer = customerResult.rows[0]
-
+  if (customer.id !== customerId) {
+    fail('Scenario cleanup orders are bound to another marked customer')
+  }
+  if (customer.pipeline_id !== pipelineId) {
+    fail('Scenario cleanup marked customer belongs to another pipeline')
+  }
+  if (
+    customer.name !== scenario.customer.name
+    || customer.account_type !== 'Synthetic test customer'
+    || customer.relationship_type !== 'customer'
+  ) {
+    fail('Scenario cleanup marked customer metadata is not exact')
+  }
+  if (!isAllowedScenarioCustomerIdentity(customer, scenario)) {
+    fail('Scenario cleanup marked customer identity is not an allowed exact pair')
+  }
   const productResult = await client.query(
-    `SELECT product.id::text, product.source_key
+    `SELECT product.id::text, product.reference_code, product.source_key
      FROM crm_products product
      WHERE product.pipeline_id = $1::uuid
        AND product.source_key LIKE $2
@@ -773,6 +825,35 @@ async function resolveScenarioRetirementTarget(client, configuration, scope, sce
   const productIdBySourceKey = new Map(
     productResult.rows.map((product) => [product.source_key, product.id]),
   )
+  const productIds = productResult.rows.map((product) => product.id)
+  const suiteCrmOutboxResult = await client.query(
+    `SELECT outbox.id::text, outbox.status
+     FROM sync_outbox outbox
+     WHERE outbox.target_system = 'suitecrm'
+       AND outbox.operation IN ('upsert_record', 'reproject_record')
+       AND outbox.status IN ('queued', 'failed', 'processing')
+       AND (
+         (
+           outbox.aggregate_type = 'crm_organizations'
+           AND outbox.aggregate_id = $1
+         )
+         OR (
+           outbox.aggregate_type = 'crm_products'
+           AND outbox.aggregate_id = ANY($2::text[])
+         )
+       )
+     ORDER BY outbox.id
+     FOR UPDATE`,
+    [customer.id, productIds],
+  )
+  const processingSuiteCrmOutbox = suiteCrmOutboxResult.rows
+    .filter((outbox) => outbox.status === 'processing')
+  if (processingSuiteCrmOutbox.length > 0) {
+    fail(
+      `Scenario cleanup blocked by ${processingSuiteCrmOutbox.length} `
+      + 'processing SuiteCRM projection(s)',
+    )
+  }
 
   const locationResult = await client.query(
     `SELECT location.id::text, location.code, location.notes
@@ -853,11 +934,17 @@ async function resolveScenarioRetirementTarget(client, configuration, scope, sce
      FOR UPDATE`,
     [scope.organizationId, pool.id],
   )
-  if (poolCustomerResult.rows.some(
-    (eligible) => eligible.customer_id !== customer.id
-      || eligible.pipeline_id !== pipelineId
-  )) {
-    fail('Scenario simulator pool has a customer link outside the marked scenario customer')
+  if (
+    poolCustomerResult.rowCount !== 1
+    || poolCustomerResult.rows.some(
+      (eligible) => eligible.customer_id !== customer.id
+        || eligible.pipeline_id !== pipelineId
+    )
+  ) {
+    fail(
+      'Scenario simulator pool must have exactly one link to the marked '
+      + 'scenario customer',
+    )
   }
 
   const warehousePositionResult = await client.query(
@@ -1123,6 +1210,11 @@ async function resolveScenarioRetirementTarget(client, configuration, scope, sce
     warehouse,
     customer,
     pool,
+    productIds,
+    crmReferenceCodes: [
+      customer.reference_code,
+      ...productResult.rows.map((product) => product.reference_code),
+    ],
     orderIds,
     waveIds,
   }
@@ -1188,7 +1280,87 @@ async function upsertSyntheticCustomer(client, scope, scenario) {
     nonDeliverable: true,
     state: 'active',
   }
-  const result = await client.query(
+  const identities = scenarioCustomerIdentities(scenario)
+  const existing = await client.query(
+    `SELECT customer.id::text, customer.reference_code,
+            customer.pipeline_id::text, customer.source_key,
+            customer.identity_key, customer.name,
+            customer.account_type, customer.relationship_type,
+            customer.source_payload
+     FROM crm_organizations customer
+     JOIN pipeline_spaces pipeline
+       ON pipeline.id = customer.pipeline_id
+      AND pipeline.workspace_organization_id = $1::uuid
+     WHERE (
+         customer.source_payload->>'scenarioKey' = $2
+         OR (
+           customer.pipeline_id = $3::uuid
+           AND (
+             customer.source_key = ANY($4::text[])
+             OR customer.identity_key = ANY($5::text[])
+           )
+         )
+       )
+     ORDER BY customer.id
+     FOR UPDATE`,
+    [
+      scope.organizationId,
+      scenario.scenarioKey,
+      scope.pipelineId,
+      [identities.seededSourceKey, identities.canonicalIdentityKey],
+      [identities.seededIdentityKey, identities.canonicalIdentityKey],
+    ],
+  )
+  if (existing.rowCount > 1) {
+    fail(`Scenario generation found ${existing.rowCount} conflicting customer identities`)
+  }
+  if (existing.rowCount === 1) {
+    const customer = existing.rows[0]
+    const markedPayload = parsedObject(customer.source_payload)
+    if (
+      markedPayload.scenarioKey !== scenario.scenarioKey
+      || markedPayload.synthetic !== true
+      || markedPayload.nonDeliverable !== true
+      || customer.pipeline_id !== scope.pipelineId
+      || customer.name !== scenario.customer.name
+      || customer.account_type !== 'Synthetic test customer'
+      || customer.relationship_type !== 'customer'
+      || !isAllowedScenarioCustomerIdentity(customer, scenario)
+    ) {
+      fail('Scenario generation found a conflicting or repurposed customer identity')
+    }
+    const updated = await client.query(
+      `UPDATE crm_organizations
+       SET priority = 'D',
+           name = $3,
+           account_type = 'Synthetic test customer',
+           account_manager = $4,
+           description = $5,
+           source_payload = $6::jsonb,
+           source_hash = $7,
+           sync_status = 'synced',
+           sync_error = NULL,
+           updated_by = $4,
+           email = NULL,
+           email_opt_out = true,
+           updated_at = now()
+       WHERE pipeline_id = $1::uuid
+         AND id = $2::uuid
+       RETURNING id::text, reference_code`,
+      [
+        scope.pipelineId,
+        customer.id,
+        scenario.customer.name,
+        scenario.actor.email,
+        'Development-only synthetic WMS demand owner. Never synchronize or contact.',
+        JSON.stringify(payload),
+        digest(payload),
+      ],
+    )
+    return updated.rows[0]
+  }
+
+  const inserted = await client.query(
     `INSERT INTO crm_organizations (
        pipeline_id, source_key, identity_key, priority, name, account_type,
        account_manager, description, source_payload, source_hash, sync_status,
@@ -1199,21 +1371,6 @@ async function upsertSyntheticCustomer(client, scope, scenario) {
        $1::uuid, $2, $3, 'D', $4, 'Synthetic test customer', $5, $6,
        $7::jsonb, $8, 'synced', NULL, $5, $5, NULL, 'customer', NULL, true, now()
      )
-     ON CONFLICT (pipeline_id, source_key) DO UPDATE SET
-       identity_key = EXCLUDED.identity_key,
-       priority = EXCLUDED.priority,
-       name = EXCLUDED.name,
-       account_type = EXCLUDED.account_type,
-       account_manager = EXCLUDED.account_manager,
-       description = EXCLUDED.description,
-       source_payload = EXCLUDED.source_payload,
-       source_hash = EXCLUDED.source_hash,
-       sync_status = 'synced',
-       sync_error = NULL,
-       updated_by = EXCLUDED.updated_by,
-       email = NULL,
-       email_opt_out = true,
-       updated_at = now()
      RETURNING id::text, reference_code`,
     [
       scope.pipelineId,
@@ -1226,7 +1383,7 @@ async function upsertSyntheticCustomer(client, scope, scenario) {
       digest(payload),
     ],
   )
-  return result.rows[0]
+  return inserted.rows[0]
 }
 
 async function upsertProducts(client, scope, scenario) {
@@ -2267,6 +2424,7 @@ async function releaseScenarioReservations(client, scope, scenario, orderIds) {
 }
 
 async function assertScenarioRetired(client, scope, scenario) {
+  const customerIdentities = scenarioCustomerIdentities(scenario)
   const result = await client.query(
     `WITH target_warehouse AS (
        SELECT warehouse.id
@@ -2288,7 +2446,7 @@ async function assertScenarioRetired(client, scope, scenario) {
          AND location.warehouse_id IN (SELECT id FROM target_warehouse)
      ),
      scenario_products AS (
-       SELECT product.id
+       SELECT product.id, product.reference_code
        FROM crm_products product
        JOIN pipeline_spaces pipeline
          ON pipeline.id = product.pipeline_id
@@ -2296,8 +2454,42 @@ async function assertScenarioRetired(client, scope, scenario) {
        WHERE product.source_key LIKE $6
          AND product.source_payload->>'scenarioKey' = $2
      ),
+     scenario_customer_candidates AS (
+       SELECT customer.id, customer.pipeline_id, customer.source_key,
+              customer.identity_key, customer.name, customer.account_type,
+              customer.relationship_type, customer.reference_code
+       FROM crm_organizations customer
+       JOIN pipeline_spaces pipeline
+         ON pipeline.id = customer.pipeline_id
+        AND pipeline.workspace_organization_id = $1::uuid
+       WHERE customer.source_payload->>'scenarioKey' = $2
+         AND customer.source_payload->>'synthetic' = 'true'
+         AND customer.source_payload->>'nonDeliverable' = 'true'
+     ),
+     scenario_customer AS (
+       SELECT customer.id, customer.pipeline_id, customer.reference_code
+       FROM scenario_customer_candidates customer
+       WHERE customer.name = $7
+         AND customer.account_type = 'Synthetic test customer'
+         AND customer.relationship_type = 'customer'
+         AND (
+           (
+             customer.source_key = $8
+             AND customer.identity_key = $9
+           )
+           OR (
+             customer.source_key = $10
+             AND customer.identity_key = $10
+           )
+         )
+     ),
+     scenario_reference_codes AS (
+       SELECT customer.reference_code FROM scenario_customer customer
+       UNION
+       SELECT product.reference_code FROM scenario_products product
+     ),
      scenario_orders AS (
-       SELECT orders.id
+       SELECT orders.id, orders.pipeline_id, orders.customer_id
        FROM operations_orders orders
        WHERE orders.organization_id = $1::uuid
          AND orders.source_provider = 'wms_development_simulator'
@@ -2313,6 +2505,10 @@ async function assertScenarioRetired(client, scope, scenario) {
            AND integration.environment = 'mock'
            AND integration.configuration->>'scenarioKey' = $2
        )::integer AS integration_count_invalid,
+       (
+         SELECT CASE WHEN count(*) = $11::integer THEN 0 ELSE 1 END
+         FROM scenario_products
+       )::integer AS product_count_invalid,
        (
          SELECT CASE WHEN count(*) = $5::integer THEN 0 ELSE 1 END
          FROM operations_orders orders
@@ -2333,6 +2529,95 @@ async function assertScenarioRetired(client, scope, scenario) {
          WHERE pool.organization_id = $1::uuid
            AND pool.name = '[DEV WMS] Shared Simulation Pool'
        )::integer AS inventory_pool_count_invalid,
+       (
+         SELECT CASE WHEN count(*) = 1 THEN 0 ELSE 1 END
+         FROM scenario_customer_candidates
+       )::integer AS customer_count_invalid,
+       (
+         SELECT CASE WHEN count(*) = 1 THEN 0 ELSE 1 END
+         FROM scenario_customer
+       )::integer AS customer_identity_invalid,
+       (
+         SELECT count(*)
+         FROM scenario_orders orders
+         WHERE NOT EXISTS (
+           SELECT 1
+           FROM scenario_customer customer
+           WHERE customer.id = orders.customer_id
+             AND customer.pipeline_id = orders.pipeline_id
+         )
+       )::integer AS orders_customer_invalid,
+       (
+         SELECT CASE
+           WHEN count(*) = 1
+            AND count(*) FILTER (
+              WHERE EXISTS (
+                SELECT 1
+                FROM scenario_customer customer
+                WHERE customer.id = eligible.customer_id
+                  AND customer.pipeline_id = eligible.pipeline_id
+              )
+            ) = 1
+           THEN 0
+           ELSE 1
+         END
+         FROM operations_inventory_pool_customers eligible
+         WHERE eligible.organization_id = $1::uuid
+           AND eligible.pool_id IN (SELECT id FROM target_pool)
+       )::integer AS pool_customer_links_invalid,
+       (
+         SELECT count(*)
+         FROM operations_inventory_pools pool
+         WHERE pool.organization_id = $1::uuid
+           AND pool.id IN (SELECT id FROM target_pool)
+           AND pool.owner_customer_id IS NOT NULL
+           AND NOT EXISTS (
+             SELECT 1
+             FROM scenario_customer customer
+             WHERE customer.id = pool.owner_customer_id
+           )
+       )::integer AS pool_owner_invalid,
+       (
+         SELECT count(*)
+         FROM sync_outbox outbox
+         WHERE outbox.target_system = 'suitecrm'
+           AND outbox.operation IN ('upsert_record', 'reproject_record')
+           AND outbox.status IN ('queued', 'failed', 'processing')
+           AND (
+             (
+               outbox.aggregate_type = 'crm_organizations'
+               AND EXISTS (
+                 SELECT 1
+                 FROM scenario_customer customer
+                 WHERE outbox.aggregate_id = customer.id::text
+               )
+             )
+             OR (
+               outbox.aggregate_type = 'crm_products'
+               AND EXISTS (
+                 SELECT 1
+                 FROM scenario_products product
+                 WHERE outbox.aggregate_id = product.id::text
+               )
+             )
+           )
+       )::integer AS claimable_suitecrm_outbox,
+       (
+         SELECT count(*)
+         FROM short_links link
+         WHERE link.source_app = 'clawpilot-crm'
+           AND link.deleted_at IS NULL
+           AND link.disabled_at IS NULL
+           AND EXISTS (
+             SELECT 1
+             FROM scenario_reference_codes reference
+             WHERE link.slug = reference.reference_code
+                OR link.slug = 'mail-' || reference.reference_code
+                OR reference.reference_code = ANY(link.tags)
+                OR link.destination_url LIKE
+                  '%/crm/' || reference.reference_code || '%'
+           )
+       )::integer AS active_crm_short_links,
        (
          SELECT count(*)
          FROM operations_integration_accounts integration
@@ -2679,17 +2964,27 @@ async function assertScenarioRetired(client, scope, scenario) {
           AND pipeline.workspace_organization_id = $1::uuid
          WHERE product.source_key LIKE $6
            AND product.source_payload->>'scenarioKey' = $2
-           AND (product.active OR product.status IS DISTINCT FROM 'Inactive')
+           AND (
+             product.active
+             OR product.status IS DISTINCT FROM 'Inactive'
+             OR product.source_payload->>'simulationState' IS DISTINCT FROM 'retired'
+             OR COALESCE(
+               lower(product.source_payload->>'archived'),
+               'false'
+             ) NOT IN ('true', '1', 'yes')
+           )
        )::integer AS active_products,
        (
          SELECT count(*)
          FROM crm_organizations customer
-         JOIN pipeline_spaces pipeline
-           ON pipeline.id = customer.pipeline_id
-          AND pipeline.workspace_organization_id = $1::uuid
-         WHERE customer.source_key = $7
-           AND customer.source_payload->>'scenarioKey' = $2
-           AND customer.source_payload->>'state' IS DISTINCT FROM 'retired'
+         JOIN scenario_customer marked
+           ON marked.id = customer.id
+          AND marked.pipeline_id = customer.pipeline_id
+         WHERE customer.source_payload->>'state' IS DISTINCT FROM 'retired'
+            OR COALESCE(
+              lower(customer.source_payload->>'archived'),
+              'false'
+            ) NOT IN ('true', '1', 'yes')
        )::integer AS active_customers,
        (
          SELECT count(*)
@@ -2711,7 +3006,11 @@ async function assertScenarioRetired(client, scope, scenario) {
       scenario.actor.email,
       scenario.orders.length,
       `${scenario.scenarioKey}:product:%`,
-      scenario.customer.sourceKey,
+      scenario.customer.name,
+      customerIdentities.seededSourceKey,
+      customerIdentities.seededIdentityKey,
+      customerIdentities.canonicalIdentityKey,
+      scenario.products.length,
     ],
   )
   const violations = Object.entries(result.rows[0])
@@ -2742,6 +3041,32 @@ async function cleanupScenario(client, configuration, scenario) {
     const warehouseIds = [target.warehouse.id]
     const orderIds = target.orderIds
     const waveIds = target.waveIds
+
+    const neutralizedSuiteCrmOutbox = await client.query(
+      `UPDATE sync_outbox
+       SET status = 'dead',
+           last_error = 'WMS development simulator retired before SuiteCRM delivery',
+           available_at = 'infinity'::timestamptz,
+           processed_at = COALESCE(processed_at, now()),
+           locked_at = NULL,
+           lock_token = NULL,
+           updated_at = now()
+       WHERE target_system = 'suitecrm'
+         AND operation IN ('upsert_record', 'reproject_record')
+         AND status IN ('queued', 'failed')
+         AND (
+           (
+             aggregate_type = 'crm_organizations'
+             AND aggregate_id = $1
+           )
+           OR (
+             aggregate_type = 'crm_products'
+             AND aggregate_id = ANY($2::text[])
+           )
+         )
+       RETURNING id`,
+      [target.customer.id, target.productIds],
+    )
 
     await client.query(
       `UPDATE operations_integration_accounts
@@ -2921,39 +3246,80 @@ async function cleanupScenario(client, configuration, scenario) {
       `UPDATE crm_products
        SET active = false,
            status = 'Inactive',
-           source_payload = source_payload || '{"simulationState":"retired"}'::jsonb,
+           source_payload = source_payload || jsonb_build_object(
+             'simulationState', 'retired',
+             'retirementReason', 'wms_development_simulation_retired',
+             'archived', true
+           ),
            updated_by = $3,
            updated_at = now()
        WHERE pipeline_id = $1::uuid
-         AND source_key LIKE $2
+         AND id = ANY($2::uuid[])
          AND source_payload->>'scenarioKey' = $4
          AND (
            active
            OR status IS DISTINCT FROM 'Inactive'
            OR source_payload->>'simulationState' IS DISTINCT FROM 'retired'
+           OR source_payload->>'retirementReason'
+             IS DISTINCT FROM 'wms_development_simulation_retired'
+           OR COALESCE(
+             lower(source_payload->>'archived'),
+             'false'
+           ) NOT IN ('true', '1', 'yes')
          )`,
       [
         scope.pipelineId,
-        `${scenario.scenarioKey}:product:%`,
+        target.productIds,
         scenario.actor.email,
         scenario.scenarioKey,
       ],
     )
     await client.query(
       `UPDATE crm_organizations
-       SET source_payload = source_payload || '{"state":"retired"}'::jsonb,
+       SET source_payload = source_payload || jsonb_build_object(
+             'state', 'retired',
+             'retirementReason', 'wms_development_simulation_retired',
+             'archived', true
+           ),
            updated_by = $3,
            updated_at = now()
        WHERE pipeline_id = $1::uuid
          AND id = $2::uuid
          AND source_payload->>'scenarioKey' = $4
-         AND source_payload->>'state' IS DISTINCT FROM 'retired'`,
+         AND (
+           source_payload->>'state' IS DISTINCT FROM 'retired'
+           OR source_payload->>'retirementReason'
+             IS DISTINCT FROM 'wms_development_simulation_retired'
+           OR COALESCE(
+             lower(source_payload->>'archived'),
+             'false'
+           ) NOT IN ('true', '1', 'yes')
+         )`,
       [
         scope.pipelineId,
         target.customer.id,
         scenario.actor.email,
         scenario.scenarioKey,
       ],
+    )
+    const disabledCrmShortLinks = await client.query(
+      `UPDATE short_links link
+       SET disabled_at = COALESCE(link.disabled_at, now()),
+           updated_at = now()
+       WHERE link.source_app = 'clawpilot-crm'
+         AND link.deleted_at IS NULL
+         AND link.disabled_at IS NULL
+         AND EXISTS (
+           SELECT 1
+           FROM unnest($1::text[]) reference(reference_code)
+           WHERE link.slug = reference.reference_code
+              OR link.slug = 'mail-' || reference.reference_code
+              OR reference.reference_code = ANY(link.tags)
+              OR link.destination_url LIKE
+                '%/crm/' || reference.reference_code || '%'
+         )
+       RETURNING link.id`,
+      [target.crmReferenceCodes],
     )
     await client.query(
       `UPDATE app_user_organization_memberships
@@ -2999,6 +3365,8 @@ async function cleanupScenario(client, configuration, scenario) {
       plansCancelled: cancelledPlans,
       wavesCancelled: cancelledWaves,
       exceptionsDismissed: dismissedExceptions,
+      suiteCrmProjectionsNeutralized: neutralizedSuiteCrmOutbox.rowCount,
+      crmShortLinksDisabled: disabledCrmShortLinks.rowCount,
       postflightPassed: true,
       immutableInventoryLedgerPreserved: true,
       carrierTransactionsVoided: 0,
@@ -3052,6 +3420,28 @@ function runSelfTest() {
     localConfiguration.WMS_SIM_ORGANIZATION_ID,
   )
   assert.deepEqual(first, second, 'Scenario generation must be deterministic')
+  const customerIdentities = scenarioCustomerIdentities(first)
+  assert.deepEqual(customerIdentities, {
+    seededSourceKey: 'clawpilot-wms-development-v1:customer',
+    seededIdentityKey: 'customer:synthetic:clawpilot-wms-development-v1',
+    canonicalIdentityKey: 'customer:name:[dev wms] northstar test commerce llc',
+  })
+  assert.equal(isAllowedScenarioCustomerIdentity({
+    source_key: customerIdentities.seededSourceKey,
+    identity_key: customerIdentities.seededIdentityKey,
+  }, first), true)
+  assert.equal(isAllowedScenarioCustomerIdentity({
+    source_key: customerIdentities.canonicalIdentityKey,
+    identity_key: customerIdentities.canonicalIdentityKey,
+  }, first), true)
+  assert.equal(isAllowedScenarioCustomerIdentity({
+    source_key: customerIdentities.seededSourceKey,
+    identity_key: customerIdentities.canonicalIdentityKey,
+  }, first), false)
+  assert.equal(isAllowedScenarioCustomerIdentity({
+    source_key: 'customer:name:unrelated',
+    identity_key: 'customer:name:unrelated',
+  }, first), false)
   assert.equal(first.actor.email, 'wms-simulator+100000000000@clawpilot.invalid')
   assert.ok(first.actor.email.endsWith('.invalid'))
   assert.deepEqual(first.warehouse.address, {
@@ -3088,7 +3478,7 @@ function runSelfTest() {
   return {
     ok: true,
     mode: 'self-test',
-    assertions: 24,
+    assertions: 29,
     scenarioKey: first.scenarioKey,
     products: first.products.length,
     locations: first.locations.length,
