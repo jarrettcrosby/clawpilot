@@ -1,11 +1,11 @@
 ---
 id: cp-module-user-integrations
 title: User Integrations and Credentials
-summary: Per-user Maton connections, organization QuickBooks, Toast, and carrier access, Google Workspace administration, managed resources, and credential controls.
+summary: Per-user Maton connections, organization QuickBooks, Toast, carrier and commerce-channel access, Google Workspace administration, managed resources, and credential controls.
 status: active
 kind: module-contract
 area: integrations
-tags: [integrations, maton, quickbooks, toast, carriers, google-workspace, credentials, tenancy]
+tags: [integrations, maton, quickbooks, toast, carriers, commerce, shopify, faire, google-workspace, credentials, tenancy]
 app_visible: true
 ---
 
@@ -70,6 +70,17 @@ Keep user-owned Maton accounts separate from the platform Google Workspace crede
 - **Disconnect** requires confirmation, removes encrypted credential material, and disables the non-secret integration account. Existing immutable shipment evidence remains intact.
 - This credential workflow does not by itself certify rating, label purchase, void, manifest, or tracking. Those capabilities remain unavailable until the named direct adapter passes its sandbox, failure-injection, reconciliation, and authorized live-smoke release gates.
 
+## Sales-Channel Integration Contract
+
+- **Settings > Integrations > Sales channels** is organization scoped and available to the owner or a user with explicit **Manage operations** permission. Shopify and Faire are commerce/sales-channel connections for Distributed Operations, not restaurant POS accounts and not cart modules.
+- The current singleton connection boundary permits one Shopify account and one Faire account per organization and environment. A candidate shop or brand identity is verified against a fixed provider origin before it is saved. That immutable provider identity remains on the nonsecret integration-account tombstone after disconnect; the same Global ID cannot be rebound to another shop or brand. Account replacement and multi-store generations require a later coordinated workflow.
+- Shopify accepts the canonical `store-name.myshopify.com` domain plus the client ID and client secret of an installed Dev Dashboard app in the same Shopify organization as the store. ClawPilot exchanges those credentials for a 24-hour access token whenever it verifies the connection and never persists or returns that short-lived token. Admin GraphQL is pinned to version `2026-07`; a Shopify development/test store may use the `sandbox` classification, but there is no alternate arbitrary API host.
+- Faire accepts a brand API token and verifies the production brand profile at the fixed External API v2 origin. Faire has no public sandbox or webhook contract. Retailer accounts cannot use this custom brand API path. Multi-brand Faire OAuth, Shopify multi-merchant OAuth, and Shopify zero-downtime dual-secret rotation remain future work.
+- Credentials are AES-256-GCM encrypted with organization, provider, environment, and immutable provider identity in authenticated data. Browser reads receive only a masked client-ID or token suffix, monotonic credential generation, verification state, safe configuration, capability/scope evidence, and timestamps. There is no credential-reveal action.
+- A first-time connection remains disabled after API verification. One valid signed `app/scopes_update`, product, or inventory Shopify delivery verifies the exact stored credential generation and is retained as encrypted `held` evidence while disabled. An owner or operations administrator may then separately enable **Shopify signed receipt intake** for that same bounded topic set. Order/customer topics are rejected until retention, erasure, privacy-response, and canonical processing exist. This does not enable order import, inventory mutation/export, webhook registration, fulfillment export, or provider writes. Faire cannot be enabled until its polling worker exists.
+- Shopify receipts authenticate against the exact raw request bytes, require the connected shop domain and event ID, deduplicate exact re-deliveries, reject event-ID/payload conflicts, persist the immutable credential generation, and stream-enforce the body limit before retaining the raw body as encrypted evidence. Receipt insertion locks and rechecks the current credential and account status, so rotation, disconnect, and disable cannot be crossed by a stale in-flight delivery. The public receipt route does not accept a browser session or carry user authorization.
+- Capability UI separates what the provider offers, the provider scopes involved, and what ClawPilot has implemented. Unsupported or unimplemented capabilities remain visible as such; no scope list or successful connection probe is production-activation evidence.
+
 ## Managed Pipeline Resources
 
 - Provisioning is an explicit pipeline-owner command.
@@ -100,4 +111,5 @@ Use the [Google Workspace integration runbook](../operations/google-workspace-in
 6. Confirm each Toast access type reports its own verified state, selected locations are correct, and accounting output remains a draft.
 7. Confirm the QuickBooks company shown in Settings belongs to the active organization, catalog sync is current, and no financial posting controls are exposed.
 8. Confirm each enabled carrier account belongs to the active organization, uses the intended sandbox or production environment, and reports `Verified`. Test the connection after provider-side rotation before enabling it.
-9. Rotate credentials through Settings or the owning server environment as appropriate; never add plaintext keys, private keys, OAuth tokens, carrier account numbers, or full connection IDs to documentation, logs, or release copy.
+9. Confirm each Shopify/Faire connection belongs to the active organization, its immutable shop/brand identity is correct, tokens remain masked, and the capability audit distinguishes provider availability from implemented behavior. Shopify receipt intake may be active; commerce domain workers must still report inactive.
+10. Rotate credentials through Settings or the owning server environment as appropriate; never add plaintext keys, private keys, OAuth tokens, carrier account numbers, or full connection IDs to documentation, logs, or release copy.
