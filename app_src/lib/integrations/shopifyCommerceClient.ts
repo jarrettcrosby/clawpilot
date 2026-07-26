@@ -328,7 +328,17 @@ function tokenGrantedScopes(value: unknown): string[] {
   return [...scopes].sort()
 }
 
-function tokenUpstreamError(status: number) {
+function tokenErrorIdentifier(payload: Record<string, unknown> | null) {
+  return [payload?.error, payload?.error_description]
+    .filter((value): value is string => typeof value === 'string')
+    .join(' ')
+    .toLowerCase()
+}
+
+function tokenUpstreamError(
+  status: number,
+  payload: Record<string, unknown> | null,
+) {
   if (status === 429) {
     return new ShopifyCommerceClientError(
       'Shopify temporarily rate limited token acquisition',
@@ -343,6 +353,31 @@ function tokenUpstreamError(status: number) {
       503,
       'SHOPIFY_UNAVAILABLE',
       true,
+    )
+  }
+  if (status === 404) {
+    return new ShopifyCommerceClientError(
+      'The configured Shopify store was not found',
+      409,
+      'SHOPIFY_STORE_NOT_FOUND',
+    )
+  }
+  const identifier = tokenErrorIdentifier(payload)
+  if (identifier.includes('shop_not_permitted')) {
+    return new ShopifyCommerceClientError(
+      'Shopify requires the app and store to belong to the same Dev Dashboard organization',
+      409,
+      'SHOPIFY_SHOP_NOT_PERMITTED',
+    )
+  }
+  if (
+    identifier.includes('app_not_installed')
+    || identifier.includes('app is not installed')
+  ) {
+    return new ShopifyCommerceClientError(
+      'Install the released Shopify app on this store before connecting it',
+      409,
+      'SHOPIFY_APP_NOT_INSTALLED',
     )
   }
   return new ShopifyCommerceClientError(
@@ -390,7 +425,7 @@ export async function requestShopifyAccessToken(
       MAX_TOKEN_RESPONSE_BYTES,
     )
     const payload = responsePayload(bytes)
-    if (!response.ok) throw tokenUpstreamError(response.status)
+    if (!response.ok) throw tokenUpstreamError(response.status, payload)
     const expiresIn = Number(payload?.expires_in)
     if (
       !payload

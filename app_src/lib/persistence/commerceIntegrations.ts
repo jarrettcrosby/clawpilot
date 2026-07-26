@@ -621,6 +621,7 @@ export async function markCommerceCredentialVerificationInPostgres(input: {
   actorEmail: string
   errorCode: string | null
   configuration?: Record<string, unknown>
+  disableIntegration?: boolean
 }) {
   await withTransaction(async (client) => {
     const result = await client.query<{
@@ -631,6 +632,7 @@ export async function markCommerceCredentialVerificationInPostgres(input: {
       `UPDATE operations_integration_accounts account
        SET status = CASE
              WHEN $3::text IS NOT NULL THEN 'error'
+             WHEN $7::boolean THEN 'disabled'
              WHEN account.status = 'error' THEN 'disabled'
              ELSE account.status
            END,
@@ -656,6 +658,7 @@ export async function markCommerceCredentialVerificationInPostgres(input: {
         input.configuration ? JSON.stringify(input.configuration) : null,
         input.actorEmail,
         input.credentialVersion,
+        input.disableIntegration === true,
       ],
     )
     const row = result.rows[0]
@@ -700,6 +703,20 @@ export async function markCommerceCredentialVerificationInPostgres(input: {
       environment: row.environment,
       payload: input.errorCode ? { errorCode: input.errorCode } : {},
     })
+    if (input.disableIntegration) {
+      await auditCommerce(client, {
+        actorEmail: input.actorEmail,
+        organizationId: input.organizationId,
+        eventType: 'commerce.integration.disabled',
+        globalId: row.global_id,
+        provider: row.provider,
+        environment: row.environment,
+        payload: {
+          automatic: true,
+          reason: 'shopify_scope_profile_incomplete',
+        },
+      })
+    }
   })
   return readCommerceIntegrationsStateFromPostgres(input.organizationId)
 }
@@ -730,10 +747,17 @@ export async function setCommerceIntegrationEnabledInPostgres(input: {
              FROM operations_commerce_credentials credential
              WHERE credential.organization_id = account.organization_id
                AND credential.integration_account_id = account.id
+               AND credential.credential_version =
+                 account.commerce_credential_generation
                AND credential.verification_status = 'verified'
                AND (
                  account.provider <> 'shopify'
-                 OR credential.webhook_verification_status = 'verified'
+                 OR (
+                   credential.webhook_verification_status = 'verified'
+                   AND account.configuration->>'scopeProfile' =
+                     'receipt_evidence_v1'
+                   AND account.configuration->'missingScopes' = '[]'::jsonb
+                 )
                )
            )
          )
@@ -952,6 +976,12 @@ export async function recordShopifyWebhookReceiptInPostgres(input: {
   encryptedPayload: EncryptedCommerceValue
   payloadBytes: number
   providerTriggeredAt: string | null
+  scopeAudit?: {
+    requestedScopes: string[]
+    grantedScopes: string[]
+    missingScopes: string[]
+    restrictedScopes: string[]
+  } | null
 }) {
   return withTransaction(async (client) => {
     await acquireTransactionAdvisoryLock(
@@ -963,12 +993,14 @@ export async function recordShopifyWebhookReceiptInPostgres(input: {
       commerce_credential_generation: number
       credential_version: number
       verification_status: 'unverified' | 'verified' | 'failed'
+      configuration: Record<string, unknown>
     }>(
       `SELECT
          account.status,
          account.commerce_credential_generation,
          credential.credential_version,
-         credential.verification_status
+         credential.verification_status,
+         account.configuration
        FROM operations_integration_accounts account
        JOIN operations_commerce_credentials credential
          ON credential.organization_id = account.organization_id
@@ -996,7 +1028,6 @@ export async function recordShopifyWebhookReceiptInPostgres(input: {
         'Shopify webhook credential generation changed before receipt commit',
       )
     }
-    const receiptState = current.status === 'active' ? 'queued' : 'held'
     const existing = await client.query<{
       global_id: string
       payload_hash: string
@@ -1020,6 +1051,56 @@ export async function recordShopifyWebhookReceiptInPostgres(input: {
       }
       return { globalId: existing.rows[0].global_id, duplicate: true }
     }
+    const scopeProfileIncomplete = Boolean(
+      input.scopeAudit?.missingScopes.length,
+    )
+    if (input.scopeAudit) {
+      await client.query(
+        `UPDATE operations_integration_accounts
+         SET status = CASE
+               WHEN $4::boolean THEN 'disabled'
+               ELSE status
+             END,
+             configuration = $5::jsonb,
+             updated_at = now()
+         WHERE organization_id = $1::uuid
+           AND id = $2::uuid
+           AND commerce_credential_generation = $3`,
+        [
+          input.runtime.organizationId,
+          input.runtime.integrationAccountId,
+          input.runtime.credentialVersion,
+          scopeProfileIncomplete,
+          JSON.stringify({
+            ...(current.configuration || {}),
+            scopeProfile: 'receipt_evidence_v1',
+            requestedScopes: input.scopeAudit.requestedScopes,
+            grantedScopes: input.scopeAudit.grantedScopes,
+            missingScopes: input.scopeAudit.missingScopes,
+            restrictedScopes: input.scopeAudit.restrictedScopes,
+            lastScopeWebhookAt: new Date().toISOString(),
+          }),
+        ],
+      )
+      await auditCommerce(client, {
+        actorEmail: null,
+        organizationId: input.runtime.organizationId,
+        eventType: 'commerce.shopify.scopes_updated',
+        globalId: input.runtime.globalId,
+        provider: 'shopify',
+        environment: input.runtime.environment,
+        isSystem: true,
+        payload: {
+          grantedScopes: input.scopeAudit.grantedScopes,
+          missingScopes: input.scopeAudit.missingScopes,
+          intakeDisabled: scopeProfileIncomplete,
+        },
+      })
+    }
+    const effectiveStatus = scopeProfileIncomplete
+      ? 'disabled'
+      : current.status
+    const receiptState = effectiveStatus === 'active' ? 'queued' : 'held'
     const inserted = await client.query<{ global_id: string }>(
       `INSERT INTO operations_commerce_webhook_receipts (
          organization_id, integration_account_id, provider,

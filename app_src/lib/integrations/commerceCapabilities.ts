@@ -130,6 +130,8 @@ export const SHOPIFY_ACCESS_SCOPES = [
   'write_inventory_transfers',
   'read_inventory_shipments',
   'write_inventory_shipments',
+  'read_inventory_shipments_received_items',
+  'write_inventory_shipments_received_items',
   'read_locations',
   'write_locations',
   'read_customers',
@@ -210,7 +212,11 @@ export const SHOPIFY_CAPABILITY_SCOPES = {
   inventory_import: ['read_inventory', 'read_locations'],
   inventory_export: ['write_inventory', 'read_locations'],
   inventory_transfer_synchronization: ['write_inventory_transfers'],
-  inventory_shipment_synchronization: ['write_inventory_shipments'],
+  inventory_shipment_synchronization: [
+    'write_inventory_shipments',
+    'read_inventory_shipments_received_items',
+    'write_inventory_shipments_received_items',
+  ],
   location_synchronization: ['read_locations'],
   location_administration: ['write_locations'],
   customer_synchronization: ['read_customers'],
@@ -239,6 +245,56 @@ export type ShopifyScopedCapability = keyof typeof SHOPIFY_CAPABILITY_SCOPES
 export const SHOPIFY_RESTRICTED_ACCESS_SCOPES = [
   'read_all_orders',
 ] as const satisfies readonly ShopifyAccessScope[]
+
+// This is the least-privilege scope profile for the bounded product and
+// inventory receipt evidence accepted by the current control plane. It is not
+// an order-import, inventory-write, or fulfillment-activation profile.
+export const SHOPIFY_RECEIPT_PROOF_SCOPES = [
+  'read_products',
+  'read_inventory',
+] as const satisfies readonly ShopifyAccessScope[]
+
+export const COMMERCE_CUSTOM_INTEGRATION_ONBOARDING = {
+  shopify: {
+    ownership: 'merchant_owned_same_shopify_organization',
+    authMode: 'shopify_client_credentials',
+    developerPortalUrl: 'https://dev.shopify.com/dashboard',
+    setupGuideUrl:
+      'https://shopify.dev/docs/apps/build/dev-dashboard/create-apps-using-dev-dashboard',
+    tokenGuideUrl:
+      'https://shopify.dev/docs/apps/build/dev-dashboard/get-api-access-tokens',
+    defaultAppUrl: 'https://shopify.dev/apps/default-app-home',
+    apiVersion: SHOPIFY_ADMIN_API_VERSION,
+    requiredBeforeConnect: [
+      'Create a merchant-owned app in Shopify Dev Dashboard.',
+      'Create and release an app version with least-privilege scopes.',
+      'Install the app on a store in the same Shopify organization.',
+      'Copy the canonical myshopify.com domain, client ID, and client secret.',
+    ],
+    receiptProofScopes: SHOPIFY_RECEIPT_PROOF_SCOPES,
+    acceptedReceiptTopics: SHOPIFY_CONTROL_PLANE_WEBHOOK_TOPICS,
+    unsupportedCredentialMode: 'legacy_admin_access_token',
+  },
+  faire: {
+    ownership: 'brand_owned_unpublished_custom_integration',
+    authMode: 'faire_brand_token',
+    developerPortalUrl: 'https://developers.faire.com/signup',
+    setupGuideUrl:
+      'https://www.faire.com/support/articles/37632363832091',
+    requiredBeforeConnect: [
+      'Create a Faire Developer account and an unpublished app.',
+      'Copy the app APA token.',
+      'In Brand Portal, open Settings, Integrations, then Have an unpublished integration.',
+      'Enter the APA token, continue, and copy the generated final brand API key.',
+      'If that self-service option is unavailable, use Start a request in the linked guide to contact Faire Support.',
+      'Paste the final API key generated for the brand into ClawPilot, not the APA token.',
+    ],
+    supportContact: 'developers@faire.com',
+    minimumProbeScope: 'READ_BRAND',
+    sandboxAvailable: false,
+    webhooksAvailable: false,
+  },
+} as const
 
 export type ClawPilotCapabilityImplementationState = 'control_plane_implemented' | 'not_implemented'
 
@@ -379,6 +435,7 @@ const SHOPIFY_SCOPED_CAPABILITY_SET = new Set<CommerceCapability>(
   Object.keys(SHOPIFY_CAPABILITY_SCOPES) as ShopifyScopedCapability[],
 )
 const SHOPIFY_RESTRICTED_SCOPE_SET = new Set<ShopifyAccessScope>(SHOPIFY_RESTRICTED_ACCESS_SCOPES)
+const SHOPIFY_ACCESS_SCOPE_SET = new Set<string>(SHOPIFY_ACCESS_SCOPES)
 
 export function isCommerceCapability(value: unknown): value is CommerceCapability {
   return typeof value === 'string'
@@ -415,19 +472,60 @@ function normalizedGrantedScopes(grantedScopes: readonly string[]): string[] {
   return [...normalized].sort()
 }
 
+function effectiveGrantedScopeSet(grantedScopes: readonly string[]) {
+  const effective = new Set(normalizedGrantedScopes(grantedScopes))
+  for (const scope of [...effective]) {
+    if (!scope.startsWith('write_')) continue
+    const impliedReadScope = `read_${scope.slice('write_'.length)}`
+    if (SHOPIFY_ACCESS_SCOPE_SET.has(impliedReadScope)) {
+      effective.add(impliedReadScope)
+    }
+  }
+  return effective
+}
+
+export function auditShopifyScopeRequirements(
+  requestedScopes: readonly ShopifyAccessScope[],
+  grantedScopes: readonly string[],
+): ShopifyScopeAudit {
+  const requested = [...new Set(requestedScopes)].sort()
+  const granted = normalizedGrantedScopes(grantedScopes)
+  const effectiveGranted = effectiveGrantedScopeSet(granted)
+  return {
+    requestedScopes: requested,
+    grantedScopes: granted,
+    missingScopes: requested.filter((scope) => !effectiveGranted.has(scope)),
+    restrictedScopes: requested.filter((scope) => SHOPIFY_RESTRICTED_SCOPE_SET.has(scope)),
+  }
+}
+
+export function auditShopifyScopeUpdatePayload(
+  payload: unknown,
+): ShopifyScopeAudit {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    throw new TypeError('Shopify scope-update payload was invalid')
+  }
+  const current = (payload as Record<string, unknown>).current
+  if (
+    !Array.isArray(current)
+    || !current.every((scope): scope is string => typeof scope === 'string')
+  ) {
+    throw new TypeError('Shopify scope-update payload was invalid')
+  }
+  return auditShopifyScopeRequirements(
+    SHOPIFY_RECEIPT_PROOF_SCOPES,
+    current,
+  )
+}
+
 export function auditShopifyScopes(
   capabilities: readonly CommerceCapability[],
   grantedScopes: readonly string[],
 ): ShopifyScopeAudit {
-  const requestedScopes = shopifyScopesForCapabilities(capabilities)
-  const granted = normalizedGrantedScopes(grantedScopes)
-  const grantedSet = new Set(granted)
-  return {
-    requestedScopes,
-    grantedScopes: granted,
-    missingScopes: requestedScopes.filter((scope) => !grantedSet.has(scope)),
-    restrictedScopes: requestedScopes.filter((scope) => SHOPIFY_RESTRICTED_SCOPE_SET.has(scope)),
-  }
+  return auditShopifyScopeRequirements(
+    shopifyScopesForCapabilities(capabilities),
+    grantedScopes,
+  )
 }
 
 export function missingShopifyScopes(

@@ -12,6 +12,7 @@ import {
 import {
   CLAWPILOT_FAIRE_CAPABILITY_IMPLEMENTATION,
   CLAWPILOT_SHOPIFY_CAPABILITY_IMPLEMENTATION,
+  COMMERCE_CUSTOM_INTEGRATION_ONBOARDING,
   COMMERCE_CAPABILITY_DEFINITIONS,
   FAIRE_CAPABILITY_SCOPES,
   FAIRE_PROVIDER_AVAILABLE_CAPABILITIES,
@@ -166,6 +167,7 @@ function only(body: Record<string, unknown>, fields: string[]) {
 function capabilityCatalog() {
   return {
     classification: 'commerce_sales_channels',
+    onboarding: COMMERCE_CUSTOM_INTEGRATION_ONBOARDING,
     definitions: COMMERCE_CAPABILITY_DEFINITIONS,
     providers: {
       shopify: {
