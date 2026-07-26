@@ -1,12 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server'
 import {
-  connectFaireCommerce,
   connectShopifyCommerce,
   CommerceIntegrationRequestError,
   disconnectCommerceIntegration,
+  faireOAuthCallbackUrl,
   getCommerceIntegrationsState,
   sanitizedCommerceIntegrationError,
   setCommerceIntegrationEnabled,
+  startFaireOAuthCommerce,
   testCommerceConnection,
 } from '@/lib/integrations/commerceIntegrations'
 import {
@@ -28,7 +29,7 @@ import {
 } from '@/lib/integrations/faireCommerceClient'
 import { operationsCapabilities } from '@/lib/operations/authorization'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
-import { requireRequestUser } from '@/lib/requestUser'
+import { requireRequestSession, requireRequestUser } from '@/lib/requestUser'
 import type { AppUser } from '@/lib/users'
 
 export const dynamic = 'force-dynamic'
@@ -167,7 +168,13 @@ function only(body: Record<string, unknown>, fields: string[]) {
 function capabilityCatalog() {
   return {
     classification: 'commerce_sales_channels',
-    onboarding: COMMERCE_CUSTOM_INTEGRATION_ONBOARDING,
+    onboarding: {
+      ...COMMERCE_CUSTOM_INTEGRATION_ONBOARDING,
+      faire: {
+        ...COMMERCE_CUSTOM_INTEGRATION_ONBOARDING.faire,
+        callbackUrl: faireOAuthCallbackUrl(),
+      },
+    },
     definitions: COMMERCE_CAPABILITY_DEFINITIONS,
     providers: {
       shopify: {
@@ -213,6 +220,7 @@ function capabilityCatalog() {
       inventoryMutation: false,
       fulfillmentExport: false,
       multiMerchantOauth: false,
+      faireCustomAppOauth: true,
     },
   }
 }
@@ -281,32 +289,35 @@ export async function PATCH(req: NextRequest) {
       })
     }
 
-    if (action === 'connect-faire') {
+    if (action === 'start-faire-oauth') {
       only(body, [
         'action',
         'displayName',
-        'accessToken',
+        'applicationId',
+        'applicationSecret',
+        'scopeProfile',
         'confirmLiveAccess',
       ])
       if (body.confirmLiveAccess !== true) {
         throw new CommerceIntegrationRequestError(
-          'Confirm that ClawPilot may verify this production Faire credential',
+          'Confirm that ClawPilot may redirect to Faire, exchange the authorization code, and verify the production brand profile',
           400,
           'COMMERCE_LIVE_ACCESS_CONFIRMATION_REQUIRED',
         )
       }
-      const integrations = await connectFaireCommerce({
+      const session = await requireRequestSession(req)
+      const oauth = await startFaireOAuthCommerce({
         organizationId: organization,
-        displayName: body.displayName,
-        accessToken: body.accessToken,
+        browserSessionId: session.id,
         actorEmail: actor.email,
+        displayName: body.displayName,
+        applicationId: body.applicationId,
+        applicationSecret: body.applicationSecret,
+        scopeProfile: body.scopeProfile,
       })
       return json({
         ok: true,
-        canManage: true,
-        canActivate: operationsCapabilities(actor).canActivate,
-        integrations,
-        catalog: capabilityCatalog(),
+        ...oauth,
       })
     }
 

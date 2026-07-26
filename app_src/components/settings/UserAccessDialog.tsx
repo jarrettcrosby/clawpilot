@@ -392,7 +392,15 @@ function safeProvisioningError(value: string | null | undefined) {
   return sanitized || 'Google Workspace provisioning failed.'
 }
 
-export default function UserAccessDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
+export default function UserAccessDialog({
+  open,
+  initialTab = 0,
+  onClose,
+}: {
+  open: boolean
+  initialTab?: number
+  onClose: () => void
+}) {
   const dateTimeSettings = useUserDateTime()
   const theme = useTheme()
   const narrowScreen = useMediaQuery(theme.breakpoints.down('sm'))
@@ -456,7 +464,7 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
     if (!open) return
 
     let active = true
-    setActiveTab(0)
+    setActiveTab(initialTab)
     setUsersPayload(null)
     setWorkspacesPayload(null)
     setProfile(EMPTY_PROFILE)
@@ -503,7 +511,7 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
     })
 
     return () => { active = false }
-  }, [open])
+  }, [initialTab, open])
 
   useEffect(() => {
     if (!open || busy || !hasActivePipelineProvisioning) return
@@ -1784,6 +1792,7 @@ export default function UserAccessDialog({ open, onClose }: { open: boolean; onC
 
         {!loading && activeTab === 3 ? (
           <IntegrationSettingsPanel
+            initialIntegration={initialTab === 3 ? 'commerce' : undefined}
             isOwner={currentUser?.role === 'owner'}
             canManageOrganizationIntegrations={Boolean(
               currentUser?.role === 'owner'

@@ -29,16 +29,22 @@ type IntegrationKey =
   | 'knowledge'
 
 export default function IntegrationSettingsPanel({
+  initialIntegration,
   isOwner,
   canManageOrganizationIntegrations,
   canManageOperationsIntegrations,
 }: {
+  initialIntegration?: 'commerce'
   isOwner: boolean
   canManageOrganizationIntegrations: boolean
   canManageOperationsIntegrations: boolean
 }) {
   const [activeIntegration, setActiveIntegration] = useState<IntegrationKey>(
-    isOwner || canManageOrganizationIntegrations ? (isOwner ? 'google' : 'maton') : 'shipping',
+    initialIntegration === 'commerce' && canManageOperationsIntegrations
+      ? 'commerce'
+      : isOwner || canManageOrganizationIntegrations
+        ? (isOwner ? 'google' : 'maton')
+        : 'shipping',
   )
 
   if (!canManageOrganizationIntegrations && !canManageOperationsIntegrations) {

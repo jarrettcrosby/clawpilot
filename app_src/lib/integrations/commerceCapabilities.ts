@@ -276,21 +276,38 @@ export const COMMERCE_CUSTOM_INTEGRATION_ONBOARDING = {
     unsupportedCredentialMode: 'legacy_admin_access_token',
   },
   faire: {
-    ownership: 'brand_owned_unpublished_custom_integration',
-    authMode: 'faire_brand_token',
+    ownership: 'brand_owned_custom_application',
+    authMode: 'faire_oauth',
     developerPortalUrl: 'https://developers.faire.com/signup',
     setupGuideUrl:
+      'https://developers.faire.com/docs#/#authentication',
+    directTokenGuideUrl:
       'https://www.faire.com/support/articles/37632363832091',
     requiredBeforeConnect: [
-      'Create a Faire Developer account and an unpublished app.',
-      'Copy the app APA token.',
-      'In Brand Portal, open Settings, Integrations, then Have an unpublished integration.',
-      'Enter the APA token, continue, and copy the generated final brand API key.',
-      'If that self-service option is unavailable, use Start a request in the linked guide to contact Faire Support.',
-      'Paste the final API key generated for the brand into ClawPilot, not the APA token.',
+      'Create a Faire Developer account and a Custom App.',
+      'Copy the Application ID and Secret ID from App Details and Settings.',
+      'OAuth eligibility is confirmed only when Faire accepts this app at authorization; Faire documents a separate single-brand API-key flow that this ClawPilot form does not accept.',
+      'Enter both credentials in ClawPilot and continue to Faire.',
+      'Sign in to the intended Faire brand and approve the requested permissions.',
+      'Return to ClawPilot so it can exchange the one-use code and verify the brand profile.',
     ],
     supportContact: 'developers@faire.com',
     minimumProbeScope: 'READ_BRAND',
+    scopeProfiles: {
+      connection_test: ['READ_BRAND'],
+      distributed_operations: [
+        'READ_PRODUCTS',
+        'WRITE_PRODUCTS',
+        'READ_ORDERS',
+        'WRITE_ORDERS',
+        'READ_BRAND',
+        'READ_RETAILER',
+        'READ_INVENTORIES',
+        'WRITE_INVENTORIES',
+        'READ_SHIPMENTS',
+        'READ_REVIEWS',
+      ],
+    },
     sandboxAvailable: false,
     webhooksAvailable: false,
   },
@@ -387,7 +404,7 @@ export const FAIRE_CAPABILITY_SCOPES = {
 // those methods may mutate canonical operations state until a reviewed worker
 // and mapping workflow is delivered. This mirrors the Shopify evidence rule.
 export const CLAWPILOT_FAIRE_CAPABILITY_IMPLEMENTATION = {
-  oauth_authentication: 'not_implemented',
+  oauth_authentication: 'control_plane_implemented',
   api_authentication: 'control_plane_implemented',
   webhook_registration: 'not_implemented',
   webhook_verification: 'not_implemented',

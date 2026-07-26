@@ -145,6 +145,19 @@ export type CommerceRuntimeCredentialRecord = {
   encrypted: EncryptedCommerceValue
 }
 
+export type FaireOAuthInstallationRecord = {
+  organizationId: string
+  browserSessionId: string
+  actorEmail: string
+  stateHash: string
+  redirectUrl: string
+  displayName: string | null
+  requestedScopes: string[]
+  applicationIdLastFour: string
+  encrypted: EncryptedCommerceValue
+  expiresAt: string
+}
+
 function iso(value: TimestampValue | null | undefined) {
   return value ? new Date(value).toISOString() : null
 }
@@ -248,6 +261,7 @@ function accountState(
 export async function readCommerceIntegrationsStateFromPostgres(
   organizationId: string,
 ): Promise<CommerceIntegrationsState> {
+  await purgeExpiredFaireOAuthInstallationsInPostgres()
   const [connections, cursorRows, evidenceRows] = await Promise.all([
     query<CommerceConnectionRow>(
       `${CONNECTION_SELECT}
@@ -333,6 +347,14 @@ export async function readCommerceIntegrationsStateFromPostgres(
       evidence.get(row.id),
     )),
   }
+}
+
+export async function purgeExpiredFaireOAuthInstallationsInPostgres() {
+  const result = await query(
+    `DELETE FROM operations_commerce_oauth_installations
+     WHERE expires_at <= now()`,
+  )
+  return result.rowCount || 0
 }
 
 export async function readCommerceRuntimeCredentialFromPostgres(input: {
@@ -424,6 +446,158 @@ async function auditCommerce(
       ...(input.payload || {}),
     },
   }, client)
+}
+
+export async function createFaireOAuthInstallationInPostgres(input: {
+  organizationId: string
+  browserSessionId: string
+  actorEmail: string
+  stateHash: string
+  redirectUrl: string
+  displayName: string | null
+  requestedScopes: string[]
+  applicationIdLastFour: string
+  encrypted: EncryptedCommerceValue
+  expiresAt: string
+}) {
+  await withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `commerce-oauth:${input.organizationId}:faire:${input.browserSessionId}`,
+    )
+    await client.query(
+      `INSERT INTO operations_commerce_oauth_installations (
+         organization_id, provider, browser_session_id, actor_email,
+         state_hash, redirect_url, display_name, requested_scopes,
+         application_id_last_four, application_credential_ciphertext,
+         application_credential_iv, application_credential_tag, expires_at
+       ) VALUES (
+         $1::uuid, 'faire', $2::uuid, $3, $4, $5, $6, $7::text[],
+         $8, $9, $10, $11, $12::timestamptz
+       )
+       ON CONFLICT (organization_id, provider, browser_session_id)
+       DO UPDATE SET
+         actor_email = EXCLUDED.actor_email,
+         state_hash = EXCLUDED.state_hash,
+         redirect_url = EXCLUDED.redirect_url,
+         display_name = EXCLUDED.display_name,
+         requested_scopes = EXCLUDED.requested_scopes,
+         application_id_last_four = EXCLUDED.application_id_last_four,
+         application_credential_ciphertext =
+           EXCLUDED.application_credential_ciphertext,
+         application_credential_iv = EXCLUDED.application_credential_iv,
+         application_credential_tag = EXCLUDED.application_credential_tag,
+         created_at = now(),
+         expires_at = EXCLUDED.expires_at`,
+      [
+        input.organizationId,
+        input.browserSessionId,
+        input.actorEmail,
+        input.stateHash,
+        input.redirectUrl,
+        input.displayName,
+        input.requestedScopes,
+        input.applicationIdLastFour,
+        input.encrypted.ciphertext,
+        input.encrypted.iv,
+        input.encrypted.tag,
+        input.expiresAt,
+      ],
+    )
+  })
+}
+
+export async function discardFaireOAuthInstallationInPostgres(input: {
+  organizationId: string
+  browserSessionId: string
+  actorEmail: string
+  stateHash: string
+}) {
+  const result = await query<{ id: string }>(
+    `DELETE FROM operations_commerce_oauth_installations
+     WHERE organization_id = $1::uuid
+       AND provider = 'faire'
+       AND browser_session_id = $2::uuid
+       AND actor_email = $3
+       AND state_hash = $4
+     RETURNING id::text`,
+    [
+      input.organizationId,
+      input.browserSessionId,
+      input.actorEmail,
+      input.stateHash,
+    ],
+  )
+  return Boolean(result.rows[0])
+}
+
+export async function claimFaireOAuthInstallationInPostgres(input: {
+  organizationId: string
+  browserSessionId: string
+  actorEmail: string
+  stateHash: string
+}): Promise<FaireOAuthInstallationRecord | null> {
+  return withTransaction(async (client) => {
+    const result = await client.query<{
+      organization_id: string
+      browser_session_id: string
+      actor_email: string
+      state_hash: string
+      redirect_url: string
+      display_name: string | null
+      requested_scopes: string[]
+      application_id_last_four: string
+      application_credential_ciphertext: Buffer
+      application_credential_iv: Buffer
+      application_credential_tag: Buffer
+      expires_at: TimestampValue
+    }>(
+      `DELETE FROM operations_commerce_oauth_installations
+       WHERE organization_id = $1::uuid
+         AND provider = 'faire'
+         AND browser_session_id = $2::uuid
+         AND actor_email = $3
+         AND state_hash = $4
+         AND expires_at > now()
+       RETURNING
+         organization_id::text,
+         browser_session_id::text,
+         actor_email,
+         state_hash,
+         redirect_url,
+         display_name,
+         requested_scopes,
+         application_id_last_four,
+         application_credential_ciphertext,
+         application_credential_iv,
+         application_credential_tag,
+         expires_at`,
+      [
+        input.organizationId,
+        input.browserSessionId,
+        input.actorEmail,
+        input.stateHash,
+      ],
+    )
+    const row = result.rows[0]
+    if (!row) return null
+    return {
+      organizationId: row.organization_id,
+      browserSessionId: row.browser_session_id,
+      actorEmail: row.actor_email,
+      stateHash: row.state_hash,
+      redirectUrl: row.redirect_url,
+      displayName: row.display_name,
+      requestedScopes: row.requested_scopes,
+      applicationIdLastFour: row.application_id_last_four,
+      encrypted: {
+        ciphertext: row.application_credential_ciphertext,
+        iv: row.application_credential_iv,
+        tag: row.application_credential_tag,
+      },
+      expiresAt: iso(row.expires_at) as string,
+    }
+  })
 }
 
 export async function writeCommerceCredentialInPostgres(input: {
