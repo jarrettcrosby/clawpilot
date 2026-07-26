@@ -217,8 +217,14 @@ includes(webhookRoute, [
   "req.headers.get('x-shopify-webhook-id')",
   "req.headers.get('x-shopify-topic')",
   "req.headers.get('x-shopify-shop-domain')",
+  'SHOPIFY_WEBHOOK_DESTINATION_INVALID',
   'duplicate: result.duplicate',
 ], 'Shopify webhook route')
+assert.ok(
+  webhookRoute.indexOf('normalizeCommerceAccountGlobalId')
+    < webhookRoute.indexOf('boundedRequestBody(req)'),
+  'Shopify webhook account path must be validated before reading the body',
+)
 
 const proxy = read('app_src/proxy.ts')
 assert.ok(

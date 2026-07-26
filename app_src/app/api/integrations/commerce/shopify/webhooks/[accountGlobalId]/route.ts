@@ -70,9 +70,16 @@ export async function POST(
       )
     }
     const { accountGlobalId: rawAccountGlobalId } = await context.params
-    const accountGlobalId = normalizeCommerceAccountGlobalId(
-      rawAccountGlobalId,
-    )
+    let accountGlobalId: string
+    try {
+      accountGlobalId = normalizeCommerceAccountGlobalId(rawAccountGlobalId)
+    } catch {
+      throw new CommerceIntegrationRequestError(
+        'Shopify webhook destination is invalid',
+        400,
+        'SHOPIFY_WEBHOOK_DESTINATION_INVALID',
+      )
+    }
     const declaredLength = Number(req.headers.get('content-length') || 0)
     if (
       Number.isFinite(declaredLength)
