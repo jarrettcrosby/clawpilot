@@ -58,6 +58,7 @@ function isPublicApi(pathname: string) {
     || normalizedPath === '/api/agents/repository-runs/process'
     || normalizedPath === '/api/integrations/toast/process'
     || normalizedPath === '/api/integrations/quickbooks/process'
+    || normalizedPath.startsWith('/api/integrations/commerce/shopify/webhooks/')
     || normalizedPath === '/api/docs/embeddings/process'
     || normalizedPath === '/api/ai-radar/process'
     || normalizedPath === '/api/operations/print-agent/jobs'

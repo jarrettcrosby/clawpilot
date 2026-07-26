@@ -162,7 +162,7 @@ This checkpoint posts canonical inventory units only. Case and pallet conversion
 
 **Scope**
 
-- Certify Shopify, BigCommerce, and Etsy adapter capability contracts for their actual supported features.
+- Certify Shopify, Faire, BigCommerce, and Etsy adapter capability contracts for their actual supported features; Faire remains a polling-only B2B marketplace rather than a webhook or POS integration.
 - Certify USPS, UPS, and FedEx account, rate, label, void, tracking, and reconciliation capabilities used by the release.
 - Add webhook registration/signature verification, cursor sync, scheduled reconciliation, dead-letter replay, inventory export, fulfillment export, and integration-health UI.
 
@@ -171,6 +171,12 @@ This checkpoint posts canonical inventory units only. Case and pallet conversion
 - Provider sandboxes pass contract and fault-injection suites.
 - Each production adapter receives a separately recorded credential/account verification and one authorized live smoke test that creates no customer-impacting shipment unless explicitly approved.
 - S01-S06 and S19 rerun through the real adapter boundary; unsupported capabilities remain visibly disabled.
+
+**Implemented control-plane foundation**
+
+- Migration `0111` adds write-only encrypted Shopify/Faire credentials, immutable provider identity, monotonic credential generations, version/capability evidence, immutable Shopify encrypted receipt deduplication, resource cursors, and finalize-once provider-attempt/retry/dead-letter structures.
+- Settings exposes **Sales channels** separately from Toast POS. Shopify Dev Dashboard client credentials are exchanged for non-persisted 24-hour tokens against the fixed store origin, while Faire brand-token probes use the fixed production origin; both connections default disabled.
+- Shopify signed receipt intake may be explicitly enabled only after API verification and a valid signed app-scope, product, or inventory delivery proves the exact credential generation. Order/customer topics remain rejected until retention, erasure, privacy-response, and canonical processing exist. Provider writes, Shopify multi-merchant OAuth, zero-downtime dual-secret rotation, webhook registration, polling, reconciliation, replay, and fulfillment export remain Phase 6 exit work.
 
 ### Phase 7 - Advanced WMS And Reverse Logistics
 
@@ -317,7 +323,7 @@ The scenario ID is stable and must appear in the eventual test name, CI output, 
 
 | ID | Required scenario | Earliest owning phase | Automated level and decisive assertion |
 | --- | --- | --- | --- |
-| S01 | Duplicate Shopify webhook imports one order. | 2 fixture; 6 provider | Adapter + Postgres concurrency: one receipt, one canonical order, one import event, replay returns the first result. |
+| S01 | Duplicate Shopify webhook imports one order. | 2 fixture; 6 provider | Current control-plane tests prove raw-body HMAC and exact receipt-deduplication boundaries only. Phase 6 still requires Postgres concurrency proving one receipt, one canonical order, one import event, and replay of the first result. |
 | S02 | Imported order links to the correct CRM customer through Global ID. | 2 | Integration: order references the authorized pipeline customer UUID and expected permanent `ga`; another tenant's `ga` is rejected. |
 | S03 | Channel SKUs map to correct global products. | 2 | Adapter contract: each line resolves the expected `gp`; missing/ambiguous mapping holds the order and creates no reservation. |
 | S04 | Checkout quote uses a warehouse that can fulfill the complete order. | 3 | Domain + Postgres: selected warehouse covers every line from eligible inventory; partial warehouses are recorded as rejected. |
