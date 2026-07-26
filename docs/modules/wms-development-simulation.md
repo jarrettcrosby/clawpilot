@@ -81,6 +81,12 @@ balances that operators changed while testing. After cleanup succeeds, the
 organization-scoped simulator singleton and its order lineage are permanently
 retired; generation is blocked for every scenario version.
 
+CRM hierarchy staging can normalize the synthetic customer's original simulator
+identity to ClawPilot's canonical `customer:name:<normalized name>` identity.
+Generation recognizes only the exact original identity pair or that exact
+canonical pair and updates the same marked customer. Multiple marked customers,
+mixed identity pairs, or a repurposed identity abort generation.
+
 ## Inspect
 
 Open Operations and select the supplied organization. The seeded warehouse is
@@ -113,6 +119,21 @@ reservations through compensating inventory ledger entries, cancels synthetic
 orders, plans, waves, and pick tasks, dismisses linked open exceptions, archives
 the orders, and deactivates the synthetic warehouse, locations, pool, mappings,
 products, integration, actor, and membership.
+
+Customer verification is linkage-first: all 21 exact orders must reference one
+marked synthetic customer, and the simulator pool must have exactly one
+eligibility link to that same customer. The customer must retain the exact
+fixture metadata and either the original simulator identity pair or the exact
+canonical CRM name identity pair. Any duplicate, foreign linkage, mixed pair, or
+third identity form aborts the transaction before retirement.
+
+The synthetic customer and products are marked archived and retired in the
+local CRM read model, and their ClawPilot CRM short links are disabled. Cleanup
+refuses to race a processing SuiteCRM projection and terminally neutralizes only
+the exact synthetic customer's or products' queued/failed SuiteCRM upserts while
+preserving outbox evidence. It does not hard-delete local tombstones or delete a
+historical SuiteCRM projection that was already delivered; that external
+evidence requires a separately authorized SuiteCRM cleanup.
 
 Cleanup is one-way and terminal for this organization's WMS simulator lineage.
 Rerunning cleanup is idempotent, but generation remains blocked afterward.
