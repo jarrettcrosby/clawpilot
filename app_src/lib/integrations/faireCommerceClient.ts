@@ -1,4 +1,8 @@
 export const FAIRE_API_BASE_URL = 'https://www.faire.com/external-api/v2' as const
+export const FAIRE_OAUTH_AUTHORIZE_URL =
+  'https://faire.com/oauth2/authorize' as const
+export const FAIRE_OAUTH_TOKEN_URL =
+  'https://www.faire.com/api/external-api-oauth2/token' as const
 
 const FAIRE_API_ORIGIN = 'https://www.faire.com'
 const FAIRE_API_PATH_PREFIX = '/external-api/v2/'
@@ -14,8 +18,7 @@ const MAX_AVAILABILITY_ITEMS = 250
 const MAX_SHIPMENTS = 100
 
 /**
- * Faire's documented OAuth scope vocabulary. The client accepts an already
- * issued access token; it does not implement or imply an OAuth grant flow.
+ * Faire's documented OAuth scope vocabulary.
  */
 export const FAIRE_API_SCOPES = Object.freeze([
   'READ_PRODUCTS',
@@ -39,7 +42,7 @@ export const FAIRE_COMMERCE_CAPABILITIES = Object.freeze({
   provider: 'faire',
   classification: 'b2b_wholesale_marketplace_sales_channel',
   environment: 'production',
-  authentication: 'access_token_header',
+  authentication: 'direct_token_or_oauth',
   inventoryReadMode: 'selector_only',
   webhooks: false,
   sandbox: false,
@@ -144,8 +147,27 @@ export type FaireShipmentInput = {
 
 export type FaireCommerceClientOptions = {
   accessToken: unknown
+  applicationId?: unknown
+  applicationSecret?: unknown
   fetchImpl?: typeof fetch
   timeoutMs?: number
+}
+
+export type FaireOAuthAuthorizationInput = {
+  applicationId: unknown
+  redirectUrl: unknown
+  scopes: unknown
+  state: unknown
+}
+
+export type FaireOAuthTokenExchangeInput = FaireOAuthAuthorizationInput & {
+  applicationSecret: unknown
+  authorizationCode: unknown
+}
+
+export type FaireOAuthTokenGrant = {
+  accessToken: string
+  tokenType: 'BEARER'
 }
 
 export type FaireCommerceClient = {
@@ -226,6 +248,113 @@ function normalizeAccessToken(value: unknown) {
     invalidInput('A valid Faire access token is required', 'FAIRE_ACCESS_TOKEN_INVALID')
   }
   return accessToken
+}
+
+function normalizeApplicationId(value: unknown) {
+  const applicationId = typeof value === 'string' ? value.trim() : ''
+  if (
+    applicationId.length < 1
+    || applicationId.length > 255
+    || !/^[\x20-\x7e]+$/.test(applicationId)
+  ) {
+    invalidInput(
+      'A valid Faire application ID is required',
+      'FAIRE_APPLICATION_ID_INVALID',
+    )
+  }
+  return applicationId
+}
+
+function normalizeApplicationSecret(value: unknown) {
+  const applicationSecret = typeof value === 'string' ? value.trim() : ''
+  if (
+    applicationSecret.length < 16
+    || applicationSecret.length > 4096
+    || !/^[\x21-\x7e]+$/.test(applicationSecret)
+  ) {
+    invalidInput(
+      'A valid Faire Secret ID is required',
+      'FAIRE_APPLICATION_SECRET_INVALID',
+    )
+  }
+  return applicationSecret
+}
+
+function normalizeOAuthScopes(value: unknown) {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 10) {
+    invalidInput(
+      'Faire OAuth requires 1-10 permissions',
+      'FAIRE_OAUTH_SCOPES_INVALID',
+    )
+  }
+  const known = new Set<string>(FAIRE_API_SCOPES)
+  const scopes = value.map((scope) => String(scope || '').trim())
+  if (
+    scopes.some((scope) => !known.has(scope))
+    || new Set(scopes).size !== scopes.length
+  ) {
+    invalidInput(
+      'Faire OAuth permissions are invalid',
+      'FAIRE_OAUTH_SCOPES_INVALID',
+    )
+  }
+  return scopes
+}
+
+function normalizeOAuthState(value: unknown) {
+  const state = typeof value === 'string' ? value.trim() : ''
+  if (
+    state.length < 32
+    || state.length > 256
+    || !/^[A-Za-z0-9_-]+$/.test(state)
+  ) {
+    invalidInput('Faire OAuth state is invalid', 'FAIRE_OAUTH_STATE_INVALID')
+  }
+  return state
+}
+
+function normalizeOAuthRedirectUrl(value: unknown) {
+  const candidate = typeof value === 'string' ? value.trim() : ''
+  let url: URL
+  try {
+    url = new URL(candidate)
+  } catch {
+    invalidInput(
+      'Faire OAuth callback URL is invalid',
+      'FAIRE_OAUTH_REDIRECT_INVALID',
+    )
+  }
+  if (
+    url.username
+    || url.password
+    || url.hash
+    || (
+      url.protocol !== 'https:'
+      && url.hostname !== 'localhost'
+      && url.hostname !== '127.0.0.1'
+    )
+  ) {
+    invalidInput(
+      'Faire OAuth callback URL is invalid',
+      'FAIRE_OAUTH_REDIRECT_INVALID',
+    )
+  }
+  return url.toString()
+}
+
+function normalizeAuthorizationCode(value: unknown) {
+  const code = typeof value === 'string' ? value.trim() : ''
+  if (
+    code.length < 8
+    || code.length > 4096
+    || !/^[\x21-\x7e]+$/.test(code)
+  ) {
+    invalidInput(
+      'Faire OAuth authorization code is invalid',
+      'FAIRE_OAUTH_CODE_INVALID',
+    )
+  }
+  return code
 }
 
 function normalizeTimeout(value: unknown) {
@@ -797,10 +926,122 @@ function expectInventoryResponse(value: unknown) {
   return record
 }
 
+export function buildFaireOAuthAuthorizationUrl(
+  input: FaireOAuthAuthorizationInput,
+) {
+  const applicationId = normalizeApplicationId(input.applicationId)
+  const redirectUrl = normalizeOAuthRedirectUrl(input.redirectUrl)
+  const scopes = normalizeOAuthScopes(input.scopes)
+  const state = normalizeOAuthState(input.state)
+  const url = new URL(FAIRE_OAUTH_AUTHORIZE_URL)
+  url.searchParams.set('applicationId', applicationId)
+  for (const scope of scopes) url.searchParams.append('scope', scope)
+  url.searchParams.set('state', state)
+  url.searchParams.set('redirectUrl', redirectUrl)
+  return url.toString()
+}
+
+export async function exchangeFaireOAuthAuthorizationCode(
+  input: FaireOAuthTokenExchangeInput,
+  options: {
+    fetchImpl?: typeof fetch
+    timeoutMs?: number
+  } = {},
+): Promise<FaireOAuthTokenGrant> {
+  const applicationId = normalizeApplicationId(input.applicationId)
+  const applicationSecret = normalizeApplicationSecret(
+    input.applicationSecret,
+  )
+  const redirectUrl = normalizeOAuthRedirectUrl(input.redirectUrl)
+  const scopes = normalizeOAuthScopes(input.scopes)
+  normalizeOAuthState(input.state)
+  const authorizationCode = normalizeAuthorizationCode(input.authorizationCode)
+  const fetchImpl = typeof options.fetchImpl === 'function'
+    ? options.fetchImpl
+    : fetch
+  const controller = new AbortController()
+  const timeout = setTimeout(
+    () => controller.abort(),
+    normalizeTimeout(options.timeoutMs),
+  )
+  let response: Response
+  let bytes: Uint8Array
+  try {
+    response = await fetchImpl(FAIRE_OAUTH_TOKEN_URL, {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: serializeRequestBody({
+        application_token: applicationId,
+        application_secret: applicationSecret,
+        redirect_url: redirectUrl,
+        scope: scopes,
+        grant_type: 'AUTHORIZATION_CODE',
+        authorization_code: authorizationCode,
+      }),
+      signal: controller.signal,
+      redirect: 'error',
+      cache: 'no-store',
+      credentials: 'omit',
+    })
+    bytes = await readBoundedResponse(response)
+  } catch (error) {
+    if (error instanceof FaireCommerceClientError) throw error
+    if (controller.signal.aborted || isAbortError(error)) {
+      throw new FaireCommerceClientError(
+        'Faire OAuth token exchange timed out',
+        504,
+        'FAIRE_OAUTH_EXCHANGE_TIMEOUT',
+        true,
+      )
+    }
+    throw new FaireCommerceClientError(
+      'Faire OAuth token exchange is temporarily unavailable',
+      503,
+      'FAIRE_OAUTH_EXCHANGE_UNAVAILABLE',
+      true,
+    )
+  } finally {
+    clearTimeout(timeout)
+  }
+
+  if (!response.ok) {
+    if (response.status === 400 || response.status === 401) {
+      throw new FaireCommerceClientError(
+        'Faire rejected the OAuth authorization exchange',
+        422,
+        'FAIRE_OAUTH_EXCHANGE_REJECTED',
+      )
+    }
+    throw upstreamError(response.status)
+  }
+  const payload = expectObject(parseJsonResponse(bytes))
+  const accessToken = normalizeAccessToken(payload.access_token)
+  const tokenType = String(payload.token_type || '').trim().toUpperCase()
+  if (tokenType !== 'BEARER') {
+    throw new FaireCommerceClientError(
+      'Faire returned an invalid OAuth token response',
+      502,
+      'FAIRE_OAUTH_RESPONSE_INVALID',
+    )
+  }
+  return { accessToken, tokenType }
+}
+
 export function createFaireCommerceClient(
   options: FaireCommerceClientOptions,
 ): FaireCommerceClient {
   const accessToken = normalizeAccessToken(options?.accessToken)
+  const oauthRequested = options?.applicationId !== undefined
+    || options?.applicationSecret !== undefined
+  const applicationId = oauthRequested
+    ? normalizeApplicationId(options?.applicationId)
+    : null
+  const applicationSecret = oauthRequested
+    ? normalizeApplicationSecret(options?.applicationSecret)
+    : null
   const fetchImpl = typeof options?.fetchImpl === 'function'
     ? options.fetchImpl
     : fetch
@@ -813,10 +1054,19 @@ export function createFaireCommerceClient(
     const url = requestUrl(pathname, input.query)
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), timeoutMs)
-    const headers = new Headers({
-      Accept: 'application/json',
-      'X-FAIRE-ACCESS-TOKEN': accessToken,
-    })
+    const headers = new Headers({ Accept: 'application/json' })
+    if (applicationId && applicationSecret) {
+      headers.set(
+        'X-FAIRE-APP-CREDENTIALS',
+        Buffer.from(
+          `${applicationId}:${applicationSecret}`,
+          'utf8',
+        ).toString('base64'),
+      )
+      headers.set('X-FAIRE-OAUTH-ACCESS-TOKEN', accessToken)
+    } else {
+      headers.set('X-FAIRE-ACCESS-TOKEN', accessToken)
+    }
     const body = input.body === undefined
       ? undefined
       : serializeRequestBody(input.body)

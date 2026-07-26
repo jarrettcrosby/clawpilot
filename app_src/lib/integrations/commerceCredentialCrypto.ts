@@ -6,6 +6,7 @@ export type CommerceEnvironment = 'sandbox' | 'production'
 export type CommerceAuthMode =
   | 'shopify_client_credentials'
   | 'faire_brand_token'
+  | 'faire_oauth'
 
 export type ShopifyCommerceCredential = {
   provider: 'shopify'
@@ -14,10 +15,28 @@ export type ShopifyCommerceCredential = {
   clientSecret: string
 }
 
-export type FaireCommerceCredential = {
+export type FaireBrandTokenCommerceCredential = {
   provider: 'faire'
   authMode: 'faire_brand_token'
   accessToken: string
+}
+
+export type FaireOAuthCommerceCredential = {
+  provider: 'faire'
+  authMode: 'faire_oauth'
+  applicationId: string
+  applicationSecret: string
+  accessToken: string
+  scopes: string[]
+}
+
+export type FaireCommerceCredential =
+  | FaireBrandTokenCommerceCredential
+  | FaireOAuthCommerceCredential
+
+export type FaireOAuthPendingCredential = {
+  applicationId: string
+  applicationSecret: string
 }
 
 export type CommerceCredentialPayload =
@@ -78,7 +97,7 @@ export function normalizeCommerceAuthMode(
   const provider = normalizeCommerceProvider(providerValue)
   const allowed: CommerceAuthMode[] = provider === 'shopify'
     ? ['shopify_client_credentials']
-    : ['faire_brand_token']
+    : ['faire_brand_token', 'faire_oauth']
   if (allowed.includes(value as CommerceAuthMode)) {
     return value as CommerceAuthMode
   }
@@ -101,6 +120,47 @@ function printable(value: unknown, label: string, minimum: number, maximum: numb
 
 export function normalizeCommerceExternalAccountId(value: unknown) {
   return printable(value, 'Provider account identity', 1, 255)
+}
+
+export function normalizeFaireApplicationId(value: unknown) {
+  return printable(
+    value,
+    'Faire application ID',
+    1,
+    255,
+  )
+}
+
+export function normalizeFaireApplicationSecret(value: unknown) {
+  return printable(value, 'Faire Secret ID', 16, 4096)
+}
+
+export function normalizeFaireOAuthScopes(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 10) {
+    throw new Error('Faire OAuth scopes must contain 1-10 permissions')
+  }
+  const scopes = value.map((scope) => {
+    const normalized = printable(scope, 'Faire OAuth scope', 3, 64)
+    if (!/^[A-Z][A-Z_]+$/.test(normalized)) {
+      throw new Error('Faire OAuth scope is invalid')
+    }
+    return normalized
+  })
+  if (new Set(scopes).size !== scopes.length) {
+    throw new Error('Faire OAuth scopes must not contain duplicates')
+  }
+  return scopes
+}
+
+export function normalizeFaireOAuthPendingCredential(
+  value: FaireOAuthPendingCredential,
+): FaireOAuthPendingCredential {
+  return {
+    applicationId: normalizeFaireApplicationId(value.applicationId),
+    applicationSecret: normalizeFaireApplicationSecret(
+      value.applicationSecret,
+    ),
+  }
 }
 
 export function normalizeCommerceCredential(
@@ -129,10 +189,29 @@ export function normalizeCommerceCredential(
     }
   }
 
-  const input = value as FaireCommerceCredential
+  if (authMode === 'faire_oauth') {
+    const input = value as FaireOAuthCommerceCredential
+    return {
+      provider,
+      authMode,
+      applicationId: normalizeFaireApplicationId(input.applicationId),
+      applicationSecret: normalizeFaireApplicationSecret(
+        input.applicationSecret,
+      ),
+      accessToken: printable(
+        input.accessToken,
+        'Provider access token',
+        8,
+        8192,
+      ),
+      scopes: normalizeFaireOAuthScopes(input.scopes),
+    }
+  }
+
+  const input = value as FaireBrandTokenCommerceCredential
   return {
     provider,
-    authMode: authMode as FaireCommerceCredential['authMode'],
+    authMode: 'faire_brand_token',
     accessToken: printable(
       input.accessToken,
       'Provider access token',
@@ -172,6 +251,28 @@ function credentialAuthenticatedData(
   )
   return Buffer.from(
     `clawpilot:commerce:${organizationId}:${provider}:${environment}:${externalAccountId}:credential:v1`,
+    'utf8',
+  )
+}
+
+function oauthInstallationAuthenticatedData(
+  organizationIdValue: unknown,
+  browserSessionIdValue: unknown,
+  stateHashValue: unknown,
+) {
+  const organizationId = normalizeCommerceOrganizationId(organizationIdValue)
+  const browserSessionId = String(browserSessionIdValue || '')
+    .trim()
+    .toLowerCase()
+  if (!UUID_PATTERN.test(browserSessionId)) {
+    throw new Error('A valid browser session is required')
+  }
+  const stateHash = String(stateHashValue || '').trim().toLowerCase()
+  if (!/^[a-f0-9]{64}$/.test(stateHash)) {
+    throw new Error('Faire OAuth state digest is invalid')
+  }
+  return Buffer.from(
+    `clawpilot:commerce:${organizationId}:faire:${browserSessionId}:${stateHash}:oauth-installation:v1`,
     'utf8',
   )
 }
@@ -249,6 +350,57 @@ export function decryptCommerceCredential(
     return credential
   } catch {
     throw new Error('Stored commerce credential could not be decrypted')
+  }
+}
+
+export function encryptFaireOAuthPendingCredential(
+  credentialValue: FaireOAuthPendingCredential,
+  organizationId: unknown,
+  browserSessionId: unknown,
+  stateHash: unknown,
+): EncryptedCommerceValue {
+  const credential = normalizeFaireOAuthPendingCredential(credentialValue)
+  const iv = crypto.randomBytes(12)
+  const cipher = crypto.createCipheriv('aes-256-gcm', encryptionKey(), iv)
+  cipher.setAAD(oauthInstallationAuthenticatedData(
+    organizationId,
+    browserSessionId,
+    stateHash,
+  ))
+  const ciphertext = Buffer.concat([
+    cipher.update(JSON.stringify(credential), 'utf8'),
+    cipher.final(),
+  ])
+  return { ciphertext, iv, tag: cipher.getAuthTag() }
+}
+
+export function decryptFaireOAuthPendingCredential(
+  fields: EncryptedCommerceValue,
+  organizationId: unknown,
+  browserSessionId: unknown,
+  stateHash: unknown,
+): FaireOAuthPendingCredential {
+  try {
+    const decipher = crypto.createDecipheriv(
+      'aes-256-gcm',
+      encryptionKey(),
+      fields.iv,
+    )
+    decipher.setAAD(oauthInstallationAuthenticatedData(
+      organizationId,
+      browserSessionId,
+      stateHash,
+    ))
+    decipher.setAuthTag(fields.tag)
+    const raw = Buffer.concat([
+      decipher.update(fields.ciphertext),
+      decipher.final(),
+    ]).toString('utf8')
+    return normalizeFaireOAuthPendingCredential(
+      JSON.parse(raw) as FaireOAuthPendingCredential,
+    )
+  } catch {
+    throw new Error('Stored Faire OAuth installation could not be decrypted')
   }
 }
 

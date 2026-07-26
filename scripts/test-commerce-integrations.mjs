@@ -76,6 +76,7 @@ function includes(source, fragments, label) {
 }
 
 const migration = read('db/migrations/0111_operations_commerce_integrations.sql')
+const oauthMigration = read('db/migrations/0112_operations_faire_oauth.sql')
 includes(migration, [
   "('gcw', 'operations.commerce_webhook_receipt'",
   "('gxa', 'operations.commerce_provider_attempt'",
@@ -118,6 +119,28 @@ assert.ok(
     && !migration.includes('payload jsonb'),
   'Commerce migration must not persist plaintext credentials or webhook bodies',
 )
+includes(oauthMigration, [
+  "'faire_oauth'",
+  'CREATE TABLE IF NOT EXISTS operations_commerce_oauth_installations',
+  'browser_session_id uuid NOT NULL',
+  'state_hash text NOT NULL UNIQUE',
+  "state_hash ~ '^[a-f0-9]{64}$'",
+  'application_credential_ciphertext bytea NOT NULL',
+  'application_credential_iv bytea NOT NULL',
+  'application_credential_tag bytea NOT NULL',
+  "expires_at <= created_at + interval '20 minutes'",
+  'UNIQUE (organization_id, provider, browser_session_id)',
+  'NEW.auth_mode',
+  'Commerce authentication mode changes require replacement ciphertext',
+  'Commerce credential generations must advance exactly once',
+], 'Faire OAuth migration')
+assert.ok(
+  !oauthMigration.includes('authorization_code text')
+    && !oauthMigration.includes('access_token text')
+    && !oauthMigration.includes('application_secret text')
+    && !oauthMigration.includes('state text NOT NULL'),
+  'Faire OAuth migration must not persist raw state, codes, or plaintext secrets',
+)
 
 const persistence = read('app_src/lib/persistence/commerceIntegrations.ts')
 includes(persistence, [
@@ -153,16 +176,70 @@ includes(persistence, [
   'FOR UPDATE OF account, credential',
   "effectiveStatus === 'active' ? 'queued' : 'held'",
   'Shopify webhook credential generation changed before receipt commit',
+  'createFaireOAuthInstallationInPostgres',
+  'purgeExpiredFaireOAuthInstallationsInPostgres',
+  'discardFaireOAuthInstallationInPostgres',
+  'claimFaireOAuthInstallationInPostgres',
+  'DELETE FROM operations_commerce_oauth_installations',
+  'WHERE expires_at <= now()',
+  'AND browser_session_id = $2::uuid',
+  'AND actor_email = $3',
+  'AND state_hash = $4',
+  'AND expires_at > now()',
 ], 'Commerce persistence')
 assert.ok(
   !/console\.(?:log|error|warn)/.test(persistence),
   'Commerce persistence must not log credentials or payloads',
+)
+const faireOauthDiscardSource = persistence.slice(
+  persistence.indexOf(
+    'export async function discardFaireOAuthInstallationInPostgres',
+  ),
+  persistence.indexOf(
+    'export async function claimFaireOAuthInstallationInPostgres',
+  ),
+)
+includes(faireOauthDiscardSource, [
+  'organization_id = $1::uuid',
+  "provider = 'faire'",
+  'browser_session_id = $2::uuid',
+  'actor_email = $3',
+  'state_hash = $4',
+  'RETURNING id::text',
+], 'Faire OAuth denial cleanup')
+const commerceStateReadSource = persistence.slice(
+  persistence.indexOf(
+    'export async function readCommerceIntegrationsStateFromPostgres',
+  ),
+  persistence.indexOf(
+    'export async function readCommerceRuntimeCredentialFromPostgres',
+  ),
+)
+assert.ok(
+  commerceStateReadSource.includes(
+    'await purgeExpiredFaireOAuthInstallationsInPostgres()',
+  ),
+  'Sales-channel reads must purge expired Faire OAuth staging rows',
 )
 
 const service = read('app_src/lib/integrations/commerceIntegrations.ts')
 includes(service, [
   'await probeShopifyConnection',
   'await probeFaireBrandProfile',
+  'startFaireOAuthCommerce',
+  'completeFaireOAuthCommerce',
+  'purgeExpiredFaireOAuthCommerce',
+  'discardFaireOAuthCommerce',
+  'requireFaireOAuthHttpsCallback',
+  "'FAIRE_OAUTH_PUBLIC_HTTPS_REQUIRED'",
+  'randomBytes(32)',
+  "toString('base64url')",
+  "createHash('sha256').update(state).digest('hex')",
+  'encryptFaireOAuthPendingCredential',
+  'claimFaireOAuthInstallationInPostgres',
+  'exchangeFaireOAuthAuthorizationCode',
+  "authMode: 'faire_oauth'",
+  "tokenAcquisition: 'authorization_code'",
   'encryptCommerceCredential',
   'domainWorkersActivated: false',
   "'faire_brand_token'",
@@ -182,10 +259,38 @@ includes(service, [
   'SHOPIFY_WEBHOOK_TOPIC_UNSUPPORTED',
   'Faire runtime polling is not implemented',
 ], 'Commerce service')
+const faireOauthStartSource = service.slice(
+  service.indexOf('export async function startFaireOAuthCommerce'),
+  service.indexOf('export async function purgeExpiredFaireOAuthCommerce'),
+)
 assert.ok(
-  service.indexOf('await probeShopifyConnection')
-    < service.indexOf('const encrypted = encryptCommerceCredential'),
+  faireOauthStartSource.indexOf('requireFaireOAuthHttpsCallback')
+    < faireOauthStartSource.indexOf('encryptFaireOAuthPendingCredential'),
+  'Faire OAuth must reject local HTTP before encrypting or persisting credentials',
+)
+assert.ok(
+  faireOauthStartSource.includes(
+    'await purgeExpiredFaireOAuthInstallationsInPostgres()',
+  ),
+  'Faire OAuth start must purge expired staging rows',
+)
+const shopifyConnectSource = service.slice(
+  service.indexOf('export async function connectShopifyCommerce'),
+  service.indexOf('export async function connectFaireCommerce'),
+)
+assert.ok(
+  shopifyConnectSource.indexOf('await probeShopifyConnection')
+    < shopifyConnectSource.indexOf('const encrypted = encryptCommerceCredential'),
   'Shopify must be verified before encrypted credential persistence',
+)
+const faireOauthCompleteSource = service.slice(
+  service.indexOf('export async function completeFaireOAuthCommerce'),
+  service.indexOf('export async function getCommerceIntegrationsState'),
+)
+assert.ok(
+  faireOauthCompleteSource.indexOf('await probeFaireBrandProfile')
+    < faireOauthCompleteSource.indexOf('encryptCommerceCredential'),
+  'Faire OAuth brand identity must be verified before credential persistence',
 )
 assert.ok(
   !service.includes('console.'),
@@ -201,19 +306,24 @@ includes(adminRoute, [
   'operationsCapabilities(actor).canManage',
   'operationsCapabilities(actor).canActivate',
   "action === 'connect-shopify'",
-  "action === 'connect-faire'",
+  "action === 'start-faire-oauth'",
   "action === 'test-connection'",
   "action === 'set-enabled'",
   "action === 'disconnect'",
   'confirmLiveAccess',
   "'clientId'",
+  "'applicationId'",
+  "'applicationSecret'",
+  "'scopeProfile'",
+  'requireRequestSession(req)',
   "'Cache-Control': 'no-store, max-age=0'",
   'domainWorkersActivated: false',
   'canonicalOrderImport: false',
   'inventoryMutation: false',
   'fulfillmentExport: false',
   'acceptedReceiptTopics: SHOPIFY_CONTROL_PLANE_WEBHOOK_TOPICS',
-  'onboarding: COMMERCE_CUSTOM_INTEGRATION_ONBOARDING',
+  '...COMMERCE_CUSTOM_INTEGRATION_ONBOARDING',
+  'callbackUrl: faireOAuthCallbackUrl()',
 ], 'Commerce admin route')
 assert.ok(
   !adminRoute.includes("'accessToken',\n        'clientSecret'"),
@@ -247,6 +357,43 @@ assert.ok(
   ),
   'Only the signed Shopify webhook prefix should bypass browser auth',
 )
+assert.ok(
+  proxy.includes(
+    "normalizedPath === '/api/integrations/commerce/faire/oauth/callback'",
+  ),
+  'Only the exact Faire OAuth callback should bypass proxy session attribution',
+)
+
+const faireOauthCallback = read(
+  'app_src/app/api/integrations/commerce/faire/oauth/callback/route.ts',
+)
+includes(faireOauthCallback, [
+  "export const runtime = 'nodejs'",
+  'requireRequestSession(req)',
+  'requireRequestUser(req)',
+  'operationsCapabilities(actor).canManage',
+  "req.nextUrl.searchParams.get('state')",
+  "'authorizationCode'",
+  "req.nextUrl.searchParams.has('error')",
+  'completeFaireOAuthCommerce',
+  'purgeExpiredFaireOAuthCommerce',
+  'discardFaireOAuthCommerce',
+  "'Cache-Control': 'no-store, max-age=0'",
+  "'Referrer-Policy': 'no-referrer'",
+  "url.searchParams.set('settings', 'integrations')",
+  "url.searchParams.set('integration', 'commerce')",
+], 'Faire OAuth callback')
+assert.ok(
+  !faireOauthCallback.includes('error_description')
+    && !faireOauthCallback.includes("searchParams.set('authorizationCode'"),
+  'Faire OAuth callback must not echo provider errors or codes into redirects',
+)
+assert.ok(
+  faireOauthCallback.includes(
+    'if (state) {\n        await discardFaireOAuthCommerce',
+  ),
+  'Faire denial cleanup must require the returned state before deleting',
+)
 
 const panel = read(
   'app_src/components/settings/CommerceIntegrationPanel.tsx',
@@ -257,11 +404,23 @@ includes(panel, [
   'These are user-owned custom integrations',
   'Before you connect',
   'Connect Shopify Dev Dashboard app',
-  'Connect Faire custom integration',
-  'Do not paste the APA token itself',
+  'Faire Custom App OAuth',
+  'Faire Application ID',
+  'Faire Secret ID',
+  "OAuth eligibility only when it accepts the authorization",
+  'single-brand API-key flow',
+  'Single-brand guide — not connectable here',
+  'ClawPilot OAuth callback URL',
+  'Continue to Faire',
+  'Connection test — READ_BRAND only',
+  'Distributed operations — all 10 documented permissions',
+  "authorizationUrl.origin !== 'https://faire.com'",
+  "window.location.assign(authorizationUrl.toString())",
+  'FAIRE_OAUTH_STATE_INVALID',
+  'FAIRE_OAUTH_PUBLIC_HTTPS_REQUIRED',
   'SHOPIFY_SHOP_NOT_PERMITTED',
   'SHOPIFY_STORE_NOT_FOUND',
-  'developers@faire.com',
+  'catalog.onboarding.faire.supportContact',
   'const actionError = actionableCommerceError(requestError)',
   'await requestCommerce()',
   'Revoke or remove provider-side access separately',
@@ -276,18 +435,37 @@ includes(panel, [
   'Domain workers activated: no.',
   'Order and customer topics are rejected',
   "clientId: ''",
-  "accessToken: ''",
+  "applicationId: ''",
+  "applicationSecret: ''",
   "clientSecret: ''",
 ], 'Commerce settings UI')
 const integrationSettings = read(
   'app_src/components/settings/IntegrationSettingsPanel.tsx',
 )
 includes(integrationSettings, [
+  "initialIntegration?: 'commerce'",
+  "initialIntegration === 'commerce' && canManageOperationsIntegrations",
   "key: 'commerce'",
   "label: 'Sales channels'",
   '<CommerceIntegrationPanel />',
   'canManageOperationsIntegrations',
 ], 'Integration settings navigation')
+const appHeader = read('app_src/components/AppHeader.tsx')
+includes(appHeader, [
+  "params.get('settings') === 'integrations'",
+  "params.get('integration') === 'commerce'",
+  'setSettingsInitialTab(3)',
+  'setUserAccessOpen(true)',
+  'initialTab={settingsInitialTab}',
+], 'Commerce OAuth settings deep link')
+const userAccessDialog = read(
+  'app_src/components/settings/UserAccessDialog.tsx',
+)
+includes(userAccessDialog, [
+  'initialTab = 0',
+  'setActiveTab(initialTab)',
+  "initialIntegration={initialTab === 3 ? 'commerce' : undefined}",
+], 'Commerce OAuth integration deep link')
 
 const capabilities = loadTypeScriptModule(
   'app_src/lib/integrations/commerceCapabilities.ts',
@@ -303,7 +481,19 @@ assert.equal(
 )
 assert.equal(
   capabilities.COMMERCE_CUSTOM_INTEGRATION_ONBOARDING.faire.setupGuideUrl,
-  'https://www.faire.com/support/articles/37632363832091',
+  'https://developers.faire.com/docs#/#authentication',
+)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(
+    capabilities.COMMERCE_CUSTOM_INTEGRATION_ONBOARDING
+      .faire.scopeProfiles.connection_test,
+  )),
+  ['READ_BRAND'],
+)
+assert.equal(
+  capabilities.COMMERCE_CUSTOM_INTEGRATION_ONBOARDING
+    .faire.scopeProfiles.distributed_operations.length,
+  10,
 )
 assert.ok(
   capabilities.SHOPIFY_ACCESS_SCOPES.includes(
@@ -369,6 +559,10 @@ assert.equal(
 assert.equal(
   capabilities.CLAWPILOT_FAIRE_CAPABILITY_IMPLEMENTATION.order_import,
   'not_implemented',
+)
+assert.equal(
+  capabilities.CLAWPILOT_FAIRE_CAPABILITY_IMPLEMENTATION.oauth_authentication,
+  'control_plane_implemented',
 )
 assert.ok(
   capabilities.SHOPIFY_PROVIDER_AVAILABLE_CAPABILITIES.includes('order_import'),
@@ -455,6 +649,93 @@ assert.throws(
   () => cryptoModule.normalizeCommerceEnvironment('sandbox', 'faire'),
   /does not provide a public sandbox/,
 )
+const faireOAuthCredential = {
+  provider: 'faire',
+  authMode: 'faire_oauth',
+  applicationId: 'faire-test-application-id',
+  applicationSecret: 'faire-secret-id-1234567890',
+  accessToken: 'faire-oauth-access-token-1234567890',
+  scopes: ['READ_BRAND'],
+}
+assert.equal(
+  cryptoModule.normalizeFaireApplicationId(faireOAuthCredential.applicationId),
+  faireOAuthCredential.applicationId,
+  'Faire application IDs must not be constrained to an undocumented prefix',
+)
+const encryptedFaireOAuth = cryptoModule.encryptCommerceCredential(
+  faireOAuthCredential,
+  organizationId,
+  'production',
+  'brand_123',
+)
+assert.ok(
+  !encryptedFaireOAuth.ciphertext.includes(
+    Buffer.from(faireOAuthCredential.applicationSecret),
+  )
+    && !encryptedFaireOAuth.ciphertext.includes(
+      Buffer.from(faireOAuthCredential.accessToken),
+    ),
+  'Faire OAuth ciphertext must not expose the app secret or access token',
+)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(cryptoModule.decryptCommerceCredential(
+    encryptedFaireOAuth,
+    organizationId,
+    'faire',
+    'production',
+    'brand_123',
+  ))),
+  faireOAuthCredential,
+)
+const browserSessionId = '33333333-3333-4333-8333-333333333333'
+const stateHash = crypto.createHash('sha256')
+  .update('oauth-state-12345678901234567890123456789012')
+  .digest('hex')
+const encryptedPendingFaire = cryptoModule.encryptFaireOAuthPendingCredential(
+  {
+    applicationId: faireOAuthCredential.applicationId,
+    applicationSecret: faireOAuthCredential.applicationSecret,
+  },
+  organizationId,
+  browserSessionId,
+  stateHash,
+)
+assert.ok(
+  !encryptedPendingFaire.ciphertext.includes(
+    Buffer.from(faireOAuthCredential.applicationSecret),
+  ),
+  'Pending Faire OAuth state must encrypt the Secret ID',
+)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(
+    cryptoModule.decryptFaireOAuthPendingCredential(
+      encryptedPendingFaire,
+      organizationId,
+      browserSessionId,
+      stateHash,
+    ),
+  )),
+  {
+    applicationId: faireOAuthCredential.applicationId,
+    applicationSecret: faireOAuthCredential.applicationSecret,
+  },
+)
+for (const [org, session, digest] of [
+  [otherOrganizationId, browserSessionId, stateHash],
+  [organizationId, '44444444-4444-4444-8444-444444444444', stateHash],
+  [organizationId, browserSessionId, 'a'.repeat(64)],
+]) {
+  assert.throws(
+    () => cryptoModule.decryptFaireOAuthPendingCredential(
+      encryptedPendingFaire,
+      org,
+      session,
+      digest,
+    ),
+    /could not be decrypted/,
+    'Pending Faire OAuth credential AAD must bind tenant, session, and state',
+  )
+}
 
 const rawWebhook = Buffer.from('{"id":123,"name":"#1001"}')
 const encryptedWebhook = cryptoModule.encryptCommerceWebhookPayload(
@@ -648,9 +929,92 @@ assert.equal(
   faireClient.FAIRE_API_BASE_URL,
   'https://www.faire.com/external-api/v2',
 )
+assert.equal(
+  faireClient.FAIRE_OAUTH_AUTHORIZE_URL,
+  'https://faire.com/oauth2/authorize',
+)
+assert.equal(
+  faireClient.FAIRE_OAUTH_TOKEN_URL,
+  'https://www.faire.com/api/external-api-oauth2/token',
+)
 assert.equal(faireClient.FAIRE_COMMERCE_CAPABILITIES.webhooks, false)
 assert.equal(faireClient.FAIRE_COMMERCE_CAPABILITIES.sandbox, false)
 assert.equal(faireClient.FAIRE_COMMERCE_CAPABILITIES.returnWrites, false)
+const faireOauthState = 'faire-oauth-state-123456789012345678901234567890'
+const faireOauthRedirect =
+  'https://dev.clawpilot.example/api/integrations/commerce/faire/oauth/callback'
+const faireAuthorizationUrl = new URL(
+  faireClient.buildFaireOAuthAuthorizationUrl({
+    applicationId: faireOAuthCredential.applicationId,
+    redirectUrl: faireOauthRedirect,
+    scopes: ['READ_BRAND', 'READ_ORDERS'],
+    state: faireOauthState,
+  }),
+)
+assert.equal(faireAuthorizationUrl.origin, 'https://faire.com')
+assert.equal(faireAuthorizationUrl.pathname, '/oauth2/authorize')
+assert.equal(
+  faireAuthorizationUrl.searchParams.get('applicationId'),
+  faireOAuthCredential.applicationId,
+)
+assert.deepEqual(
+  faireAuthorizationUrl.searchParams.getAll('scope'),
+  ['READ_BRAND', 'READ_ORDERS'],
+)
+assert.equal(
+  faireAuthorizationUrl.searchParams.get('redirectUrl'),
+  faireOauthRedirect,
+)
+assert.equal(faireAuthorizationUrl.searchParams.get('state'), faireOauthState)
+
+const faireTokenRequests = []
+const faireTokenGrant = await faireClient.exchangeFaireOAuthAuthorizationCode(
+  {
+    applicationId: faireOAuthCredential.applicationId,
+    applicationSecret: faireOAuthCredential.applicationSecret,
+    authorizationCode: 'faire-authorization-code-1234567890',
+    redirectUrl: faireOauthRedirect,
+    scopes: ['READ_BRAND'],
+    state: faireOauthState,
+  },
+  {
+    fetchImpl: async (url, init) => {
+      faireTokenRequests.push({ url: String(url), init })
+      return new Response(JSON.stringify({
+        access_token: faireOAuthCredential.accessToken,
+        token_type: 'BEARER',
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    },
+  },
+)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(faireTokenGrant)),
+  {
+    accessToken: faireOAuthCredential.accessToken,
+    tokenType: 'BEARER',
+  },
+)
+assert.equal(
+  faireTokenRequests[0].url,
+  'https://www.faire.com/api/external-api-oauth2/token',
+)
+assert.equal(faireTokenRequests[0].init.redirect, 'error')
+assert.equal(faireTokenRequests[0].init.credentials, 'omit')
+assert.deepEqual(
+  JSON.parse(faireTokenRequests[0].init.body),
+  {
+    application_token: faireOAuthCredential.applicationId,
+    application_secret: faireOAuthCredential.applicationSecret,
+    redirect_url: faireOauthRedirect,
+    scope: ['READ_BRAND'],
+    grant_type: 'AUTHORIZATION_CODE',
+    authorization_code: 'faire-authorization-code-1234567890',
+  },
+  'Faire token exchange must use the provider-accepted snake_case body',
+)
 const faireRequests = []
 const faireApi = faireClient.createFaireCommerceClient({
   accessToken: 'faire-brand-token-1234567890',
@@ -699,5 +1063,34 @@ assert.equal(
 )
 assert.equal('registerWebhook' in faireApi, false)
 assert.equal('writeReturn' in faireApi, false)
+
+const faireOauthRequests = []
+const faireOauthApi = faireClient.createFaireCommerceClient({
+  accessToken: faireOAuthCredential.accessToken,
+  applicationId: faireOAuthCredential.applicationId,
+  applicationSecret: faireOAuthCredential.applicationSecret,
+  fetchImpl: async (url, init) => {
+    faireOauthRequests.push({ url: String(url), init })
+    return new Response(JSON.stringify({
+      brand_id: 'brand_123',
+      name: 'Example Faire Brand',
+    }), { status: 200 })
+  },
+})
+await faireOauthApi.probeBrandProfile()
+assert.equal(
+  faireOauthRequests[0].init.headers.get('X-FAIRE-APP-CREDENTIALS'),
+  Buffer.from(
+    `${faireOAuthCredential.applicationId}:${faireOAuthCredential.applicationSecret}`,
+  ).toString('base64'),
+)
+assert.equal(
+  faireOauthRequests[0].init.headers.get('X-FAIRE-OAUTH-ACCESS-TOKEN'),
+  faireOAuthCredential.accessToken,
+)
+assert.equal(
+  faireOauthRequests[0].init.headers.has('X-FAIRE-ACCESS-TOKEN'),
+  false,
+)
 
 console.log('PASS commerce integration control-plane contracts')

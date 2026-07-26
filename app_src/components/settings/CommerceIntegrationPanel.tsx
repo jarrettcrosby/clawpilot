@@ -133,9 +133,15 @@ type CommerceCatalog = {
     faire: {
       developerPortalUrl: string
       setupGuideUrl: string
+      directTokenGuideUrl: string
+      callbackUrl: string
       requiredBeforeConnect: readonly string[]
       supportContact: string
       minimumProbeScope: string
+      scopeProfiles: {
+        connection_test: readonly string[]
+        distributed_operations: readonly string[]
+      }
       sandboxAvailable: boolean
       webhooksAvailable: boolean
     }
@@ -149,6 +155,7 @@ type CommerceCatalog = {
     inventoryMutation: boolean
     fulfillmentExport: boolean
     multiMerchantOauth: boolean
+    faireCustomAppOauth: boolean
   }
 }
 
@@ -160,6 +167,10 @@ type CommercePayload = {
   canActivate?: boolean
   integrations?: CommerceState
   catalog?: CommerceCatalog
+  authorizationUrl?: string
+  callbackUrl?: string
+  expiresAt?: string
+  requestedScopes?: string[]
 }
 
 type ShopifyForm = {
@@ -173,7 +184,9 @@ type ShopifyForm = {
 
 type FaireForm = {
   displayName: string
-  accessToken: string
+  applicationId: string
+  applicationSecret: string
+  scopeProfile: 'connection_test' | 'distributed_operations'
   confirmLiveAccess: boolean
 }
 
@@ -236,9 +249,19 @@ function actionableCommerceError(error: unknown) {
     SHOPIFY_SCOPE_PROFILE_INCOMPLETE:
       'Add the listed least-privilege receipt scopes to the Shopify app version, release it, approve the change, and test again.',
     FAIRE_ACCESS_DENIED:
-      'First confirm this is the final brand API key, not the developer app APA token. If it is, ask developers@faire.com to confirm direct production API access for this brand and app before retrying.',
+      'Confirm the Faire app remains authorized for this brand, then reconnect it if access was revoked.',
     FAIRE_RESOURCE_NOT_FOUND:
       'Confirm this is an active Faire brand account; retailer accounts cannot use the custom integration API.',
+    FAIRE_OAUTH_EXCHANGE_REJECTED:
+      'Confirm the Application ID and Secret ID are the current credentials for this Faire Custom App, then start the authorization again.',
+    FAIRE_OAUTH_STATE_INVALID:
+      'The one-use setup window expired, was already used, or returned in another ClawPilot browser session. Start the Faire connection again.',
+    FAIRE_OAUTH_AUTHORIZATION_DENIED:
+      'The Faire authorization was not approved. Start again when you are ready to approve the requested permissions.',
+    FAIRE_OAUTH_CALLBACK_INVALID:
+      'Faire returned an incomplete authorization response. Start the connection again or contact Faire Developer Support.',
+    FAIRE_OAUTH_PUBLIC_HTTPS_REQUIRED:
+      'Use the hosted ClawPilot development environment or an approved public HTTPS tunnel for the live Faire authorization.',
     COMMERCE_ENCRYPTION_UNAVAILABLE:
       'Ask a ClawPilot administrator to configure commerce credential encryption for this environment.',
   }
@@ -290,7 +313,9 @@ export default function CommerceIntegrationPanel() {
   })
   const [faire, setFaire] = useState<FaireForm>({
     displayName: '',
-    accessToken: '',
+    applicationId: '',
+    applicationSecret: '',
+    scopeProfile: 'connection_test',
     confirmLiveAccess: false,
   })
 
@@ -304,7 +329,37 @@ export default function CommerceIntegrationPanel() {
     let active = true
     requestCommerce()
       .then((payload) => {
-        if (active) applyPayload(payload)
+        if (active) {
+          applyPayload(payload)
+          const url = new URL(window.location.href)
+          const oauthStatus = url.searchParams.get('faireOauth')
+          const oauthCode = url.searchParams.get('faireOauthCode')
+          if (oauthStatus === 'connected') {
+            setNotice(
+              'Faire Custom App authorized and its brand identity verified. Automated synchronization remains unavailable until the polling worker is released.',
+            )
+          } else if (oauthStatus === 'error') {
+            setError(actionableCommerceError(new CommerceRequestError(
+              'Faire Custom App authorization did not complete.',
+              oauthCode || 'FAIRE_OAUTH_CALLBACK_INVALID',
+            )))
+          }
+          if (oauthStatus) {
+            for (const key of [
+              'settings',
+              'integration',
+              'faireOauth',
+              'faireOauthCode',
+            ]) {
+              url.searchParams.delete(key)
+            }
+            window.history.replaceState(
+              window.history.state,
+              '',
+              `${url.pathname}${url.search}${url.hash}`,
+            )
+          }
+        }
       })
       .catch((requestError) => {
         if (active) {
@@ -367,17 +422,43 @@ export default function CommerceIntegrationPanel() {
 
   async function connectFaire(event: FormEvent) {
     event.preventDefault()
-    const saved = await action(
-      'connect-faire',
-      { action: 'connect-faire', ...faire },
-      'Faire custom integration connected and its brand identity verified. Automated synchronization remains unavailable until the polling worker is released.',
-    )
-    if (saved) {
+    setPendingAction('start-faire-oauth')
+    setError('')
+    setNotice('')
+    try {
+      const payload = await requestCommerce({
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'start-faire-oauth',
+          ...faire,
+        }),
+      })
+      if (!payload.authorizationUrl) {
+        throw new CommerceRequestError(
+          'ClawPilot did not receive the Faire authorization URL.',
+          'FAIRE_OAUTH_START_INVALID',
+        )
+      }
+      const authorizationUrl = new URL(payload.authorizationUrl)
+      if (
+        authorizationUrl.origin !== 'https://faire.com'
+        || authorizationUrl.pathname !== '/oauth2/authorize'
+      ) {
+        throw new CommerceRequestError(
+          'ClawPilot rejected an unexpected Faire authorization URL.',
+          'FAIRE_OAUTH_START_INVALID',
+        )
+      }
       setFaire((current) => ({
         ...current,
-        accessToken: '',
+        applicationSecret: '',
         confirmLiveAccess: false,
       }))
+      window.location.assign(authorizationUrl.toString())
+    } catch (requestError) {
+      setError(actionableCommerceError(requestError))
+      setPendingAction('')
     }
   }
 
@@ -432,10 +513,10 @@ export default function CommerceIntegrationPanel() {
 
       <Alert severity="info">
         These are user-owned custom integrations. Create the application in
-        the provider portal first, install or authorize it for the intended
-        store or brand, and then connect the issued credentials here.
-        ClawPilot does not create a marketplace app or start a multi-merchant
-        OAuth flow on your behalf.
+        the provider portal first. Shopify verifies the installed
+        merchant-owned app credentials directly. Faire securely stages the
+        Custom App credentials, redirects you to authorize the intended brand,
+        and exchanges the one-use callback code on the server.
       </Alert>
       <Alert severity="warning">
         A verified connection proves provider identity and encrypted credential
@@ -649,11 +730,13 @@ export default function CommerceIntegrationPanel() {
             <Stack component="form" spacing={2} onSubmit={connectFaire}>
               <Box>
                 <Typography variant="subtitle1" fontWeight={700}>
-                  Faire custom integration
+                  Faire Custom App OAuth
                 </Typography>
                 <Typography variant="body2" color="text.secondary">
-                  Brand-owned unpublished application for the production B2B
-                  wholesale marketplace.
+                  Application ID + Secret ID authorization for the production
+                  B2B wholesale marketplace. Faire confirms this Custom App&apos;s
+                  OAuth eligibility only when it accepts the authorization
+                  request.
                 </Typography>
               </Box>
               {catalog ? (
@@ -678,18 +761,40 @@ export default function CommerceIntegrationPanel() {
                     )}
                   </Box>
                   <Typography variant="body2" color="text.secondary">
-                    Paste the final brand API key generated by Faire, not the
-                    developer app&apos;s APA token. The profile probe needs
-                    practical access to{' '}
+                    ClawPilot never places the Secret ID in the Faire
+                    authorization URL. It encrypts the pending credential,
+                    sends the Application ID and requested permissions to
+                    Faire, then uses the Secret ID only on the server for the
+                    one-use code exchange. Faire documents no preliminary
+                    credential ping: the authorization redirect is the first
+                    provider interaction, and the Secret ID is validated only
+                    after Faire returns an authorization code. Faire separately
+                    documents a single-brand API-key flow but does not publicly
+                    explain whether its &quot;APA token&quot; is the same value
+                    as the OAuth Application ID. Use the values Faire labels
+                    for this OAuth flow. This ClawPilot form cannot accept the
+                    final brand API key produced by the separate flow. If Faire
+                    does not offer authorization for this Custom App, contact{' '}
+                    <code>{catalog.onboarding.faire.supportContact}</code>.
+                    The profile probe needs{' '}
                     <code>{catalog.onboarding.faire.minimumProbeScope}</code>.
                     Retailer accounts are ineligible, and Faire publishes no
-                    sandbox or webhook flow for this custom integration. If
-                    the Brand Portal self-service option is unavailable,
-                    use <strong>Start a request</strong> in the linked guide to
-                    contact Faire Support. For unresolved direct API access,
-                    contact{' '}
-                    <code>{catalog.onboarding.faire.supportContact}</code>.
+                    sandbox or webhook flow for this custom integration.
+                    The default connection-test profile requests only{' '}
+                    <code>READ_BRAND</code>. The explicit distributed-operations
+                    profile requests all ten documented OAuth permissions so
+                    the encrypted connection is ready for the scoped WMS/DOM
+                    capabilities shown below; selecting it does not activate
+                    any domain worker.
                   </Typography>
+                  <TextField
+                    fullWidth
+                    label="ClawPilot OAuth callback URL"
+                    value={catalog.onboarding.faire.callbackUrl}
+                    helperText="This exact HTTPS URL is sent to Faire for authorization and token exchange. Use it if Faire asks for the app callback or redirect URL."
+                    InputProps={{ readOnly: true }}
+                    sx={{ ...fieldSx, mt: 1.5 }}
+                  />
                   <Stack
                     direction={{ xs: 'column', sm: 'row' }}
                     spacing={1}
@@ -713,7 +818,17 @@ export default function CommerceIntegrationPanel() {
                       size="small"
                       endIcon={<OpenInNewRounded />}
                     >
-                      Faire API key guide
+                      Faire OAuth guide
+                    </Button>
+                    <Button
+                      href={catalog.onboarding.faire.directTokenGuideUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      variant="text"
+                      size="small"
+                      endIcon={<OpenInNewRounded />}
+                    >
+                      Single-brand guide — not connectable here
                     </Button>
                   </Stack>
                 </Alert>
@@ -731,17 +846,52 @@ export default function CommerceIntegrationPanel() {
               />
               <TextField
                 required
-                type="password"
-                label="Faire final brand API key"
-                value={faire.accessToken}
+                label="Faire Application ID"
+                value={faire.applicationId}
                 onChange={(event) => setFaire((current) => ({
                   ...current,
-                  accessToken: event.target.value,
+                  applicationId: event.target.value,
                 }))}
-                helperText="Paste the final brand API key generated in the Faire Brand Portal. Do not paste the APA token itself."
+                placeholder="Application ID from Faire"
+                helperText="Copy the Application ID shown in Faire Developer Portal under App Details and Settings."
+                autoComplete="off"
+                inputProps={{ maxLength: 255 }}
+                sx={fieldSx}
+              />
+              <TextField
+                required
+                type="password"
+                label="Faire Secret ID"
+                value={faire.applicationSecret}
+                onChange={(event) => setFaire((current) => ({
+                  ...current,
+                  applicationSecret: event.target.value,
+                }))}
+                helperText="Copy the Secret ID from Faire. It is encrypted for the pending setup and is never placed in the redirect URL or returned by the API."
                 autoComplete="new-password"
                 sx={fieldSx}
               />
+              <FormControl sx={fieldSx}>
+                <InputLabel id="faire-scope-profile-label">
+                  Permission profile
+                </InputLabel>
+                <Select
+                  labelId="faire-scope-profile-label"
+                  label="Permission profile"
+                  value={faire.scopeProfile}
+                  onChange={(event) => setFaire((current) => ({
+                    ...current,
+                    scopeProfile: event.target.value as FaireForm['scopeProfile'],
+                  }))}
+                >
+                  <MenuItem value="connection_test">
+                    Connection test — READ_BRAND only
+                  </MenuItem>
+                  <MenuItem value="distributed_operations">
+                    Distributed operations — all 10 documented permissions
+                  </MenuItem>
+                </Select>
+              </FormControl>
               <FormControlLabel
                 control={(
                   <Checkbox
@@ -752,7 +902,7 @@ export default function CommerceIntegrationPanel() {
                     }))}
                   />
                 )}
-                label="I authorize a live production brand-profile verification call."
+                label="I authorize the Faire redirect, server-side code exchange, and live production brand-profile verification."
               />
               <Button
                 type="submit"
@@ -761,13 +911,14 @@ export default function CommerceIntegrationPanel() {
                 disabled={
                   pendingAction !== ''
                   || !faire.confirmLiveAccess
-                  || !faire.accessToken
+                  || !faire.applicationId
+                  || !faire.applicationSecret
                 }
                 sx={actionButtonSx}
               >
-                {pendingAction === 'connect-faire'
-                  ? 'Verifying…'
-                  : 'Connect Faire custom integration'}
+                {pendingAction === 'start-faire-oauth'
+                  ? 'Preparing Faire…'
+                  : 'Continue to Faire'}
               </Button>
             </Stack>
           </CardContent>
@@ -1236,10 +1387,10 @@ export default function CommerceIntegrationPanel() {
 
       <Typography variant="caption" color="text.secondary">
         Shopify custom integrations exchange merchant-owned Dev Dashboard app
-        credentials for short-lived tokens when needed. Faire custom
-        integrations use the final brand API key generated after the brand
-        authorizes its unpublished developer app. Encrypted credentials are
-        write-only and are never returned by this page.
+        credentials for short-lived tokens when needed. Faire Custom Apps use
+        an authorization-code exchange and both provider-required OAuth headers
+        after the brand approves access. Encrypted credentials are write-only
+        and are never returned by this page.
       </Typography>
     </Stack>
   )

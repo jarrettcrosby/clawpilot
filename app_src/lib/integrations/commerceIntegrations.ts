@@ -1,17 +1,24 @@
-import { createHash, randomUUID } from 'node:crypto'
+import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import {
+  decryptFaireOAuthPendingCredential,
   decryptCommerceCredential,
+  encryptFaireOAuthPendingCredential,
   encryptCommerceCredential,
   encryptCommerceWebhookPayload,
+  normalizeFaireApplicationId,
+  normalizeFaireApplicationSecret,
   normalizeCommerceAccountGlobalId,
   normalizeCommerceEnvironment,
   normalizeCommerceOrganizationId,
   type CommerceEnvironment,
   type CommerceProvider,
   type FaireCommerceCredential,
+  type FaireOAuthCommerceCredential,
   type ShopifyCommerceCredential,
 } from '@/lib/integrations/commerceCredentialCrypto'
 import {
+  buildFaireOAuthAuthorizationUrl,
+  exchangeFaireOAuthAuthorizationCode,
   FAIRE_API_SCOPES,
   FaireCommerceClientError,
   probeFaireBrandProfile,
@@ -31,9 +38,13 @@ import {
   verifyShopifyWebhookHmac,
 } from '@/lib/integrations/shopifyCommerceClient'
 import {
+  claimFaireOAuthInstallationInPostgres,
+  createFaireOAuthInstallationInPostgres,
+  discardFaireOAuthInstallationInPostgres,
   disconnectCommerceCredentialInPostgres,
   markShopifyWebhookSecretVerifiedInPostgres,
   markCommerceCredentialVerificationInPostgres,
+  purgeExpiredFaireOAuthInstallationsInPostgres,
   readCommerceIntegrationsStateFromPostgres,
   readCommerceRuntimeCredentialFromPostgres,
   readCommerceWebhookCredentialFromPostgres,
@@ -48,6 +59,7 @@ import { appPublicUrl } from '@/lib/publicUrl'
 
 const SHOPIFY_ADAPTER_VERSION = `shopify-graphql-${SHOPIFY_ADMIN_API_VERSION}-control-v1`
 const FAIRE_ADAPTER_VERSION = 'faire-external-api-v2-control-v1'
+const FAIRE_OAUTH_INSTALLATION_TTL_MS = 15 * 60 * 1000
 const MAX_WEBHOOK_BYTES = 512 * 1024
 const SHOPIFY_CONTROL_PLANE_WEBHOOK_TOPIC_SET = new Set<string>(
   SHOPIFY_CONTROL_PLANE_WEBHOOK_TOPICS,
@@ -98,6 +110,13 @@ function sanitize(error: unknown): CommerceIntegrationRequestError {
       message,
       500,
       'COMMERCE_CREDENTIAL_INVALID',
+    )
+  }
+  if (message === 'Stored Faire OAuth installation could not be decrypted') {
+    return new CommerceIntegrationRequestError(
+      'Faire OAuth setup could not be validated; start the connection again',
+      409,
+      'FAIRE_OAUTH_STATE_INVALID',
     )
   }
   if (message === 'The commerce connection is permanently bound to its original provider account') {
@@ -158,6 +177,11 @@ function displayName(value: unknown, fallback: string) {
     )
   }
   return normalized
+}
+
+function optionalDisplayName(value: unknown) {
+  const normalized = String(value || '').trim()
+  return normalized ? displayName(normalized, normalized) : null
 }
 
 function accessToken(value: unknown, provider: 'Faire') {
@@ -261,6 +285,241 @@ function webhookUrl(globalId: string) {
     `/api/integrations/commerce/shopify/webhooks/${globalId}`,
     appPublicUrl(),
   ).toString()
+}
+
+export function faireOAuthCallbackUrl() {
+  return new URL(
+    '/api/integrations/commerce/faire/oauth/callback',
+    appPublicUrl(),
+  ).toString()
+}
+
+function requireFaireOAuthHttpsCallback(redirectUrl: string) {
+  if (new URL(redirectUrl).protocol !== 'https:') {
+    throw new CommerceIntegrationRequestError(
+      'Faire OAuth requires ClawPilot to run at a configured public HTTPS origin',
+      503,
+      'FAIRE_OAUTH_PUBLIC_HTTPS_REQUIRED',
+    )
+  }
+  return redirectUrl
+}
+
+function faireOAuthState(value: unknown) {
+  const state = String(value || '').trim()
+  if (
+    state.length < 32
+    || state.length > 256
+    || !/^[A-Za-z0-9_-]+$/.test(state)
+  ) {
+    throw new CommerceIntegrationRequestError(
+      'Faire OAuth state is invalid or expired',
+      409,
+      'FAIRE_OAUTH_STATE_INVALID',
+    )
+  }
+  return state
+}
+
+function faireOAuthRequestedScopes(value: unknown) {
+  if (value === undefined || value === 'connection_test') {
+    return ['READ_BRAND']
+  }
+  if (value === 'distributed_operations') {
+    return [...FAIRE_API_SCOPES]
+  }
+  throw new CommerceIntegrationRequestError(
+    'Faire OAuth scope profile is invalid',
+    400,
+    'FAIRE_OAUTH_SCOPE_PROFILE_INVALID',
+  )
+}
+
+export async function startFaireOAuthCommerce(input: {
+  organizationId: unknown
+  browserSessionId: string
+  actorEmail: string
+  displayName?: unknown
+  applicationId: unknown
+  applicationSecret: unknown
+  scopeProfile?: unknown
+}) {
+  try {
+    const organizationId = normalizeCommerceOrganizationId(input.organizationId)
+    const applicationId = normalizeFaireApplicationId(input.applicationId)
+    const applicationSecret = normalizeFaireApplicationSecret(
+      input.applicationSecret,
+    )
+    const state = randomBytes(32).toString('base64url')
+    const stateHash = createHash('sha256').update(state).digest('hex')
+    const redirectUrl = requireFaireOAuthHttpsCallback(
+      faireOAuthCallbackUrl(),
+    )
+    const requestedScopes = faireOAuthRequestedScopes(input.scopeProfile)
+    const expiresAt = new Date(
+      Date.now() + FAIRE_OAUTH_INSTALLATION_TTL_MS,
+    ).toISOString()
+    const encrypted = encryptFaireOAuthPendingCredential(
+      { applicationId, applicationSecret },
+      organizationId,
+      input.browserSessionId,
+      stateHash,
+    )
+    await purgeExpiredFaireOAuthInstallationsInPostgres()
+    await createFaireOAuthInstallationInPostgres({
+      organizationId,
+      browserSessionId: input.browserSessionId,
+      actorEmail: input.actorEmail,
+      stateHash,
+      redirectUrl,
+      displayName: optionalDisplayName(input.displayName),
+      requestedScopes,
+      applicationIdLastFour: applicationId.slice(-4),
+      encrypted,
+      expiresAt,
+    })
+    return {
+      authorizationUrl: buildFaireOAuthAuthorizationUrl({
+        applicationId,
+        redirectUrl,
+        scopes: requestedScopes,
+        state,
+      }),
+      callbackUrl: redirectUrl,
+      expiresAt,
+      requestedScopes,
+    }
+  } catch (error) {
+    throw sanitize(error)
+  }
+}
+
+export async function purgeExpiredFaireOAuthCommerce() {
+  try {
+    return await purgeExpiredFaireOAuthInstallationsInPostgres()
+  } catch (error) {
+    throw sanitize(error)
+  }
+}
+
+export async function discardFaireOAuthCommerce(input: {
+  organizationId: unknown
+  browserSessionId: string
+  actorEmail: string
+  state: unknown
+}) {
+  try {
+    const organizationId = normalizeCommerceOrganizationId(input.organizationId)
+    const state = faireOAuthState(input.state)
+    const stateHash = createHash('sha256').update(state).digest('hex')
+    return await discardFaireOAuthInstallationInPostgres({
+      organizationId,
+      browserSessionId: input.browserSessionId,
+      actorEmail: input.actorEmail,
+      stateHash,
+    })
+  } catch (error) {
+    throw sanitize(error)
+  }
+}
+
+export async function completeFaireOAuthCommerce(input: {
+  organizationId: unknown
+  browserSessionId: string
+  actorEmail: string
+  state: unknown
+  authorizationCode: unknown
+}) {
+  try {
+    const organizationId = normalizeCommerceOrganizationId(input.organizationId)
+    const state = faireOAuthState(input.state)
+    const stateHash = createHash('sha256').update(state).digest('hex')
+    const pending = await claimFaireOAuthInstallationInPostgres({
+      organizationId,
+      browserSessionId: input.browserSessionId,
+      actorEmail: input.actorEmail,
+      stateHash,
+    })
+    if (!pending) {
+      throw new CommerceIntegrationRequestError(
+        'Faire OAuth setup is invalid, expired, already used, or belongs to another session',
+        409,
+        'FAIRE_OAUTH_STATE_INVALID',
+      )
+    }
+    const application = decryptFaireOAuthPendingCredential(
+      pending.encrypted,
+      pending.organizationId,
+      pending.browserSessionId,
+      pending.stateHash,
+    )
+    const grant = await exchangeFaireOAuthAuthorizationCode({
+      applicationId: application.applicationId,
+      applicationSecret: application.applicationSecret,
+      authorizationCode: input.authorizationCode,
+      redirectUrl: pending.redirectUrl,
+      scopes: pending.requestedScopes,
+      state,
+    })
+    const profile = await probeFaireBrandProfile({
+      accessToken: grant.accessToken,
+      applicationId: application.applicationId,
+      applicationSecret: application.applicationSecret,
+    })
+    const identity = faireProfileIdentity(profile)
+    const credential: FaireOAuthCommerceCredential = {
+      provider: 'faire',
+      authMode: 'faire_oauth',
+      applicationId: application.applicationId,
+      applicationSecret: application.applicationSecret,
+      accessToken: grant.accessToken,
+      scopes: pending.requestedScopes,
+    }
+    const configuration = {
+      classification: 'b2b_wholesale_marketplace_sales_channel',
+      accountName: identity.name,
+      providerAccountId: identity.id,
+      adapterVersion: FAIRE_ADAPTER_VERSION,
+      apiVersion: 'external-api-v2',
+      authMode: credential.authMode,
+      tokenAcquisition: 'authorization_code',
+      tokenRefreshAvailable: false,
+      providerAvailableScopes: [...FAIRE_API_SCOPES],
+      requestedScopes: pending.requestedScopes,
+      scopeProfile: pending.requestedScopes.length === 1
+        && pending.requestedScopes[0] === 'READ_BRAND'
+        ? 'connection_test'
+        : 'distributed_operations',
+      grantedScopes: null,
+      scopeVerification: 'not_exposed_by_provider',
+      webhooksAvailable: false,
+      sandboxAvailable: false,
+      returnWritesAvailable: false,
+      domainWorkersActivated: false,
+    }
+    const encrypted = encryptCommerceCredential(
+      credential,
+      organizationId,
+      'production',
+      identity.id,
+    )
+    return writeCommerceCredentialInPostgres({
+      organizationId,
+      provider: 'faire',
+      environment: 'production',
+      externalAccountId: identity.id,
+      displayName: displayName(pending.displayName, identity.name),
+      configuration,
+      authMode: credential.authMode,
+      encrypted,
+      credentialIdentifierLastFour: application.applicationId.slice(-4),
+      webhookVerificationStatus: 'not_applicable',
+      resources: FAIRE_SYNC_RESOURCES,
+      actorEmail: input.actorEmail,
+    })
+  } catch (error) {
+    throw sanitize(error)
+  }
 }
 
 export async function getCommerceIntegrationsState(
@@ -551,9 +810,15 @@ async function verifyStoredConnection(
   if (credential.provider !== 'faire') {
     throw new Error('Stored commerce credential could not be decrypted')
   }
-  const profile = await probeFaireBrandProfile({
-    accessToken: credential.accessToken,
-  })
+  const profile = await probeFaireBrandProfile(
+    credential.authMode === 'faire_oauth'
+      ? {
+          accessToken: credential.accessToken,
+          applicationId: credential.applicationId,
+          applicationSecret: credential.applicationSecret,
+        }
+      : { accessToken: credential.accessToken },
+  )
   const identity = faireProfileIdentity(profile)
   if (identity.id !== runtime.externalAccountId) {
     throw new CommerceIntegrationRequestError(
