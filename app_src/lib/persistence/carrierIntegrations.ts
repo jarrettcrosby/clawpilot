@@ -44,6 +44,7 @@ type OperationsCarrierAccountRow = {
   provider: DirectCarrierProvider
   environment: CarrierEnvironment
   display_name: string
+  sender_name: string
   account_number_ciphertext: string
   account_number_iv: string
   account_number_tag: string
@@ -63,6 +64,7 @@ type OperationsCarrierAccountRow = {
 export type OperationsCarrierAccountState = {
   globalId: string
   displayName: string
+  senderName: string
   accountNumberLastFour: string
   registeredAddress: CarrierAccountAddress
   addressVerification: 'unverified' | 'operator_attested' | 'provider_verified'
@@ -112,6 +114,7 @@ export type CarrierRuntimeAccountRecord = {
   globalId: string
   integrationAccountId: string
   displayName: string
+  senderName: string
   accountNumberLastFour: string
   accountNumberFingerprint: string
   registeredAddress: CarrierAccountAddress
@@ -153,6 +156,7 @@ function accountState(row: OperationsCarrierAccountRow): OperationsCarrierAccoun
   return {
     globalId: row.global_id,
     displayName: row.display_name,
+    senderName: row.sender_name,
     accountNumberLastFour: row.account_number_last_four,
     registeredAddress: row.registered_address,
     addressVerification: row.address_verification,
@@ -232,6 +236,7 @@ export async function readCarrierIntegrationsStateFromPostgres(
          connection.provider,
          connection.environment,
          carrier_account.display_name,
+         carrier_account.sender_name,
          carrier_account.account_number_ciphertext,
          carrier_account.account_number_iv,
          carrier_account.account_number_tag,
@@ -378,6 +383,7 @@ type CarrierAccountWriteInput = {
   provider: DirectCarrierProvider
   environment: CarrierEnvironment
   displayName: string
+  senderName: string
   accountNumber: string | null
   registeredAddress: CarrierAccountAddress
   allowSenderBilling: boolean
@@ -449,23 +455,24 @@ export async function createCarrierAccountInPostgres(input: CarrierAccountWriteI
       )
       await client.query(
         `INSERT INTO operations_carrier_accounts (
-           global_id, organization_id, integration_account_id, display_name,
+           global_id, organization_id, integration_account_id, display_name, sender_name,
            account_number_ciphertext, account_number_iv, account_number_tag,
            encryption_version, account_number_last_four, account_number_fingerprint,
            registered_address, registered_address_fingerprint,
            address_verification, allow_sender_billing, allow_recipient_billing,
            allow_third_party_billing, status, created_by, updated_by
          ) VALUES (
-           $1, $2::uuid, $3::uuid, $4,
-           $5, $6, $7, 1, $8, $9,
-           $10::jsonb, $11, 'operator_attested', $12, $13, $14,
-           'active', $15, $15
+           $1, $2::uuid, $3::uuid, $4, $5,
+           $6, $7, $8, 1, $9, $10,
+           $11::jsonb, $12, 'operator_attested', $13, $14, $15,
+           'active', $16, $16
          )`,
         [
           globalId,
           input.organizationId,
           connection.id,
           input.displayName,
+          input.senderName,
           encryptedText(encrypted.ciphertext),
           encryptedText(encrypted.iv),
           encryptedText(encrypted.tag),
@@ -538,29 +545,31 @@ export async function updateCarrierAccountInPostgres(
       await client.query(
         `UPDATE operations_carrier_accounts
          SET display_name = $3,
-             account_number_ciphertext = COALESCE($4, account_number_ciphertext),
-             account_number_iv = COALESCE($5, account_number_iv),
-             account_number_tag = COALESCE($6, account_number_tag),
-             encryption_version = CASE WHEN $4::text IS NULL
+             sender_name = $4,
+             account_number_ciphertext = COALESCE($5, account_number_ciphertext),
+             account_number_iv = COALESCE($6, account_number_iv),
+             account_number_tag = COALESCE($7, account_number_tag),
+             encryption_version = CASE WHEN $5::text IS NULL
                THEN encryption_version ELSE encryption_version + 1 END,
-             account_number_last_four = COALESCE($7, account_number_last_four),
-             account_number_fingerprint = COALESCE($8, account_number_fingerprint),
-             registered_address = $9::jsonb,
-             registered_address_fingerprint = $10,
+             account_number_last_four = COALESCE($8, account_number_last_four),
+             account_number_fingerprint = COALESCE($9, account_number_fingerprint),
+             registered_address = $10::jsonb,
+             registered_address_fingerprint = $11,
              address_verification = CASE
-               WHEN registered_address_fingerprint = $10 THEN address_verification
+               WHEN registered_address_fingerprint = $11 THEN address_verification
                ELSE 'operator_attested'
              END,
-             allow_sender_billing = $11,
-             allow_recipient_billing = $12,
-             allow_third_party_billing = $13,
-             updated_by = $14,
+             allow_sender_billing = $12,
+             allow_recipient_billing = $13,
+             allow_third_party_billing = $14,
+             updated_by = $15,
              updated_at = now()
          WHERE organization_id = $1::uuid AND id = $2::uuid`,
         [
           input.organizationId,
           account.id,
           input.displayName,
+          input.senderName,
           encrypted ? encryptedText(encrypted.ciphertext) : null,
           encrypted ? encryptedText(encrypted.iv) : null,
           encrypted ? encryptedText(encrypted.tag) : null,
@@ -699,6 +708,7 @@ export async function readActiveCarrierAccountsFromPostgres(input: {
        connection.provider,
        connection.environment,
        carrier_account.display_name,
+       carrier_account.sender_name,
        carrier_account.account_number_ciphertext,
        carrier_account.account_number_iv,
        carrier_account.account_number_tag,
@@ -728,6 +738,7 @@ export async function readActiveCarrierAccountsFromPostgres(input: {
     globalId: row.global_id,
     integrationAccountId: row.integration_account_id,
     displayName: row.display_name,
+    senderName: row.sender_name,
     accountNumberLastFour: row.account_number_last_four,
     accountNumberFingerprint: row.account_number_fingerprint,
     registeredAddress: row.registered_address,

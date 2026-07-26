@@ -513,6 +513,8 @@ Fallback must not use current time, random values, unordered map iteration, prov
 
 ## External Adapter Contracts
 
+Carrier billing accounts are organization-scoped operational identities. Each active account stores a required sender name with its registered address and supported payer roles. Rating and label adapters must obtain the shipper name and origin address from the selected account snapshot; they must not infer sender identity from a credential display name, account number, signed-in user, warehouse label, or hard-coded fixture. The immutable provider-attempt evidence records the selected account identity and safe sender metadata without exposing credential material.
+
 ### Commerce Provider
 
 Each adapter declares versioned capabilities: authentication, webhook verification/registration, product and inventory sync, order/cancellation/refund import, checkout rates, fulfillment/tracking export, returns, cursors, and reconciliation. The adapter translates a verified provider message into a canonical command and translates an authorized outbox intent into a provider request. A shipment commit creates an immutable export identity and payload in `queued`; a worker may advance it through `processing` to `succeeded`, `failed`, or `unsupported` without rewriting its shipment, provider, external order, payload, idempotency key, or request time. `failed` may return to the retry lifecycle through an approved command, while `succeeded` and `unsupported` are immutable terminal outcomes. Initial production targets are Shopify, BigCommerce, and Etsy; mocks and sandboxes do not count as production verification.

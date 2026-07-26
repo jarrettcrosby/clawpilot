@@ -71,6 +71,14 @@ function carrierAccountDisplayName(value: unknown) {
   return normalized
 }
 
+function carrierAccountSenderName(value: unknown) {
+  const normalized = String(value || '').trim().replace(/\s+/g, ' ')
+  if (!normalized || normalized.length > 120 || /[\u0000-\u001f\u007f]/.test(normalized)) {
+    throw new CarrierIntegrationRequestError('Carrier account sender name must be 1-120 characters')
+  }
+  return normalized
+}
+
 function billingFlag(value: unknown, defaultValue: boolean) {
   if (value === undefined) return defaultValue
   if (typeof value !== 'boolean') {
@@ -244,6 +252,7 @@ function carrierAccountWrite(input: {
   provider: unknown
   environment: unknown
   displayName: unknown
+  senderName: unknown
   accountNumber?: unknown
   registeredAddress: unknown
   allowSenderBilling?: unknown
@@ -262,6 +271,7 @@ function carrierAccountWrite(input: {
     provider: normalizeDirectCarrierProvider(input.provider),
     environment: normalizeCarrierEnvironment(input.environment),
     displayName: carrierAccountDisplayName(input.displayName),
+    senderName: carrierAccountSenderName(input.senderName),
     accountNumber: input.accountNumber === undefined
       ? null
       : normalizeCarrierBillingAccountNumber(input.accountNumber),
@@ -278,6 +288,7 @@ export async function createCarrierAccount(input: {
   provider: unknown
   environment: unknown
   displayName: unknown
+  senderName: unknown
   accountNumber: unknown
   registeredAddress: unknown
   allowSenderBilling?: unknown
@@ -302,6 +313,7 @@ export async function updateCarrierAccount(input: {
   environment: unknown
   carrierAccountGlobalId: unknown
   displayName: unknown
+  senderName: unknown
   accountNumber?: unknown
   registeredAddress: unknown
   allowSenderBilling?: unknown
@@ -518,6 +530,7 @@ async function sandboxBillingSelection(input: {
       selectionMode: mode,
       carrierAccountGlobalId: account.globalId,
       carrierAccountDisplayName: account.displayName,
+      senderName: account.senderName,
       accountNumberLastFour: account.accountNumberLastFour,
       registeredAddress: account.registeredAddress,
       registeredAddressFingerprint: account.registeredAddressFingerprint,
@@ -651,7 +664,7 @@ export async function testCarrierSandboxRate(input: {
       provider: runtime.provider,
       environment: runtime.environment,
       credential: { ...runtime.credential, accountNumber },
-    })
+    }, { senderName: selection.account.senderName })
     const evidenceGlobalId = await writeCarrierSandboxRateEvidenceInPostgres({
       organizationId: runtime.organizationId,
       integrationAccountId: runtime.integrationAccountId,

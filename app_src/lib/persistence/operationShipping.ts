@@ -246,10 +246,11 @@ function fixtureAddress(
     postalCode: string
     countryCode: string
   },
+  options: { requireName?: boolean } = {},
 ) {
   const candidate = normalizedAddress(value)
   return (
-    candidate.name === fixture.name.toLowerCase()
+    (options.requireName === false || candidate.name === fixture.name.toLowerCase())
     && candidate.street === fixture.street.toLowerCase()
     && candidate.city === fixture.city.toLowerCase()
     && candidate.state === fixture.state
@@ -498,7 +499,11 @@ function assertCreateContext(context: ShippingContext, expectedRowVersion: numbe
   }
   if (
     !fixtureAddress(context.order.ship_to, CARRIER_SANDBOX_RATE_FIXTURE.destination)
-    || !fixtureAddress(context.order.warehouse_address, CARRIER_SANDBOX_RATE_FIXTURE.origin)
+    || !fixtureAddress(
+      context.order.warehouse_address,
+      CARRIER_SANDBOX_RATE_FIXTURE.origin,
+      { requireName: false },
+    )
   ) {
     throw new OperationsRequestError(
       'OPERATIONS_LABEL_FIXTURE_REQUIRED',
@@ -570,6 +575,7 @@ function safeProviderResponse(error: CarrierSandboxLabelError) {
     outcome: error.uncertain ? 'unknown' : 'failed',
     code: error.code,
     retryAllowed: false,
+    ...(error.redactedResponse || {}),
   }
 }
 

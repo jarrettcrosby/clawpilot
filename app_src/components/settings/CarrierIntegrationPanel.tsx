@@ -54,6 +54,7 @@ type CarrierAddress = {
 type OperationsCarrierAccount = {
   globalId: string
   displayName: string
+  senderName: string
   accountNumberLastFour: string
   registeredAddress: CarrierAddress
   addressVerification: 'unverified' | 'operator_attested' | 'provider_verified'
@@ -145,6 +146,7 @@ type CredentialForm = {
 
 type CarrierAccountForm = {
   displayName: string
+  senderName: string
   accountNumber: string
   line1: string
   line2: string
@@ -193,6 +195,7 @@ function emptyForm(provider: CarrierProvider, environment: CarrierEnvironment): 
 function emptyCarrierAccountForm(): CarrierAccountForm {
   return {
     displayName: '',
+    senderName: '',
     accountNumber: '',
     line1: '',
     line2: '',
@@ -320,6 +323,7 @@ export default function CarrierIntegrationPanel() {
     setEditingCarrierAccountGlobalId(entry.globalId)
     setCarrierAccountForm({
       displayName: entry.displayName,
+      senderName: entry.senderName,
       accountNumber: '',
       line1: entry.registeredAddress.line1,
       line2: entry.registeredAddress.line2 || '',
@@ -405,6 +409,7 @@ export default function CarrierIntegrationPanel() {
     event.preventDefault()
     if (
       !carrierAccountForm.displayName.trim()
+      || !carrierAccountForm.senderName.trim()
       || (!editingCarrierAccountGlobalId && !carrierAccountForm.accountNumber.trim())
       || !carrierAccountForm.line1.trim()
       || !carrierAccountForm.city.trim()
@@ -422,6 +427,7 @@ export default function CarrierIntegrationPanel() {
           ? { carrierAccountGlobalId: editingCarrierAccountGlobalId }
           : {}),
         displayName: carrierAccountForm.displayName,
+        senderName: carrierAccountForm.senderName,
         ...(carrierAccountForm.accountNumber.trim()
           ? { accountNumber: carrierAccountForm.accountNumber }
           : {}),
@@ -802,6 +808,9 @@ export default function CarrierIntegrationPanel() {
                     <Chip size="small" variant="outlined" label={entry.globalId} />
                   </Stack>
                   <Typography variant="caption" color="text.secondary">
+                    Sender: {entry.senderName}
+                  </Typography>
+                  <Typography variant="caption" color="text.secondary" display="block">
                     {entry.registeredAddress.line1}, {entry.registeredAddress.city}, {entry.registeredAddress.region}{' '}
                     {entry.registeredAddress.postalCode}
                   </Typography>
@@ -893,6 +902,16 @@ export default function CarrierIntegrationPanel() {
                 disabled={busy}
                 autoComplete="off"
                 sx={fieldSx}
+              />
+              <TextField
+                required
+                label="Sender name"
+                value={carrierAccountForm.senderName}
+                onChange={(event) => updateCarrierAccountForm('senderName', event.target.value)}
+                disabled={busy}
+                inputProps={{ maxLength: 120 }}
+                helperText="Used as the shipper name for carrier rating and labels."
+                sx={{ ...fieldSx, gridColumn: { sm: '1 / -1' } }}
               />
               <TextField
                 required

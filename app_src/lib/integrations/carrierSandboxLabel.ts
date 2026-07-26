@@ -67,6 +67,7 @@ export class CarrierSandboxLabelError extends Error {
     readonly status: number,
     readonly code: string,
     readonly uncertain: boolean,
+    readonly redactedResponse?: Record<string, unknown>,
   ) {
     super(message)
     this.name = 'CarrierSandboxLabelError'
@@ -161,13 +162,40 @@ function serviceCode(provider: SandboxLabelProvider, value: string) {
   return normalized
 }
 
-function providerHttpError(status: number, action: 'create' | 'void') {
+function providerFailureDetails(payload: Record<string, unknown>) {
+  const response = record(payload.response)
+  const output = record(payload.output)
+  const errors = [
+    ...list(payload.errors),
+    ...list(response.errors),
+    ...list(output.errors),
+  ]
+    .map((entry) => record(entry))
+    .map((entry) => ({
+      code: text(entry.code || entry.errorCode),
+      message: text(entry.message || entry.errorMessage),
+    }))
+    .filter((entry) => entry.code || entry.message)
+    .slice(0, 3)
+  return errors.length ? { errors } : {}
+}
+
+function providerHttpError(
+  status: number,
+  action: 'create' | 'void',
+  payload: Record<string, unknown> = {},
+) {
+  const redactedResponse = {
+    httpStatus: status,
+    ...providerFailureDetails(payload),
+  }
   if ([400, 401, 403, 404, 409, 422].includes(status)) {
     return new CarrierSandboxLabelError(
       `The carrier rejected the sandbox label ${action} request`,
       409,
       `CARRIER_SANDBOX_LABEL_${action.toUpperCase()}_REJECTED`,
       false,
+      redactedResponse,
     )
   }
   if (status === 429) {
@@ -176,6 +204,7 @@ function providerHttpError(status: number, action: 'create' | 'void') {
       503,
       'CARRIER_PROVIDER_RATE_LIMITED',
       false,
+      redactedResponse,
     )
   }
   return new CarrierSandboxLabelError(
@@ -183,6 +212,7 @@ function providerHttpError(status: number, action: 'create' | 'void') {
     503,
     'CARRIER_PROVIDER_RESULT_UNKNOWN',
     true,
+    redactedResponse,
   )
 }
 
@@ -236,6 +266,21 @@ function runtimeBillingRelationship(input: CarrierSandboxLabelRuntime) {
   return input.billingRelationship || 'sender'
 }
 
+function runtimeSenderName(input: CarrierSandboxLabelRuntime) {
+  return text(record(input.billingSelectionSnapshot).senderName)
+    || CARRIER_SANDBOX_RATE_FIXTURE.origin.name
+}
+
+function runtimeFixture(input: CarrierSandboxLabelRuntime) {
+  return {
+    ...CARRIER_SANDBOX_RATE_FIXTURE,
+    origin: {
+      ...CARRIER_SANDBOX_RATE_FIXTURE.origin,
+      name: runtimeSenderName(input),
+    },
+  }
+}
+
 function registeredBillingAddress(input: CarrierSandboxLabelRuntime) {
   const address = record(record(input.billingSelectionSnapshot).registeredAddress)
   const line1 = text(address.line1)
@@ -247,7 +292,7 @@ function registeredBillingAddress(input: CarrierSandboxLabelRuntime) {
     return CARRIER_SANDBOX_RATE_FIXTURE.origin
   }
   return {
-    name: input.credential.accountNumber || 'Carrier account payer',
+    name: runtimeSenderName(input),
     street: line1,
     city,
     state,
@@ -285,7 +330,7 @@ function upsPaymentInformation(input: CarrierSandboxLabelRuntime) {
 }
 
 function upsCreateRequest(input: CarrierSandboxLabelRuntime, selectedServiceCode: string) {
-  const fixture = CARRIER_SANDBOX_RATE_FIXTURE
+  const fixture = runtimeFixture(input)
   const accountNumber = input.credential.accountNumber!
   return {
     ShipmentRequest: {
@@ -321,7 +366,7 @@ function upsCreateRequest(input: CarrierSandboxLabelRuntime, selectedServiceCode
       LabelSpecification: {
         LabelImageFormat: { Code: 'ZPL' },
         LabelStockSize: { Height: '6', Width: '4' },
-        HTTPUserAgent: 'ClawPilot',
+        HTTPUserAgent: 'Mozilla/4.5',
       },
     },
   }
@@ -330,7 +375,7 @@ function upsCreateRequest(input: CarrierSandboxLabelRuntime, selectedServiceCode
 function fedexContact(name: string, phoneNumber: string) {
   return {
     personName: name,
-    companyName: 'ClawPilot Sandbox',
+    companyName: name,
     phoneNumber,
   }
 }
@@ -365,7 +410,7 @@ function fedexPayment(input: CarrierSandboxLabelRuntime) {
 }
 
 function fedexCreateRequest(input: CarrierSandboxLabelRuntime, selectedServiceCode: string) {
-  const fixture = CARRIER_SANDBOX_RATE_FIXTURE
+  const fixture = runtimeFixture(input)
   const accountNumber = input.credential.accountNumber!
   return {
     labelResponseOptions: 'LABEL',
@@ -410,14 +455,19 @@ export function carrierSandboxLabelRequestEvidence(
   provider: SandboxLabelProvider,
   selectedServiceCode: string,
   billingRelationship: SandboxBillingRelationship = 'sender',
+  senderName?: string,
 ) {
   const effectiveServiceCode = serviceCode(provider, selectedServiceCode)
+  const origin = {
+    ...CARRIER_SANDBOX_RATE_FIXTURE.origin,
+    name: String(senderName || '').trim() || CARRIER_SANDBOX_RATE_FIXTURE.origin.name,
+  }
   const value = {
     provider,
     environment: 'sandbox',
     purpose: 'sandbox_label_create',
     serviceCode: effectiveServiceCode,
-    origin: CARRIER_SANDBOX_RATE_FIXTURE.origin,
+    origin,
     destination: CARRIER_SANDBOX_RATE_FIXTURE.destination,
     parcel: CARRIER_SANDBOX_RATE_FIXTURE.parcel,
     billingRelationship,
@@ -569,8 +619,8 @@ export async function createCarrierSandboxLabel(
       body: JSON.stringify(body),
       signal: controller.signal,
     })
-    if (!response.ok) throw providerHttpError(response.status, 'create')
     const payload = await readProviderPayload(response)
+    if (!response.ok) throw providerHttpError(response.status, 'create', payload)
     const parsed = input.provider === 'ups_rest'
       ? parseUpsCreate(payload)
       : parseFedexCreate(payload)
@@ -579,6 +629,7 @@ export async function createCarrierSandboxLabel(
       input.provider,
       selectedServiceCode,
       runtimeBillingRelationship(input),
+      runtimeSenderName(input),
     )
     const providerReference = response.headers.get('transaction-id')
       || response.headers.get('x-customer-transaction-id')
@@ -670,20 +721,29 @@ export async function voidCarrierSandboxLabel(
         signal: controller.signal,
       },
     )
-    if (!response.ok) throw providerHttpError(response.status, 'void')
     const payload = await readProviderPayload(response)
+    const failureDetails = providerFailureDetails(payload)
+    const upsSandboxShipmentAlreadyAbsent = isUps
+      && response.status === 400
+      && providerReference === '1ZXXXXXXXXXXXXXXXX'
+      && failureDetails.errors?.some((error) => error.code === '190102')
+    if (!response.ok && !upsSandboxShipmentAlreadyAbsent) {
+      throw providerHttpError(response.status, 'void', payload)
+    }
     if (isUps) {
-      const voidResponse = record(payload.VoidShipmentResponse)
-      const summary = record(record(voidResponse.SummaryResult).Status)
-      const responseStatus = record(record(voidResponse.Response).ResponseStatus)
-      const statusCode = text(summary.Code || responseStatus.Code)
-      if (statusCode !== '1') {
-        throw new CarrierSandboxLabelError(
-          'UPS did not confirm the sandbox label void',
-          502,
-          'CARRIER_PROVIDER_RESPONSE_INVALID',
-          true,
-        )
+      if (!upsSandboxShipmentAlreadyAbsent) {
+        const voidResponse = record(payload.VoidShipmentResponse)
+        const summary = record(record(voidResponse.SummaryResult).Status)
+        const responseStatus = record(record(voidResponse.Response).ResponseStatus)
+        const statusCode = text(summary.Code || responseStatus.Code)
+        if (statusCode !== '1') {
+          throw new CarrierSandboxLabelError(
+            'UPS did not confirm the sandbox label void',
+            502,
+            'CARRIER_PROVIDER_RESPONSE_INVALID',
+            true,
+          )
+        }
       }
     } else if (record(payload.output).cancelledShipment !== true) {
       throw new CarrierSandboxLabelError(
@@ -708,7 +768,14 @@ export async function voidCarrierSandboxLabel(
       evidence: {
         requestHash: safeRequest.requestHash,
         redactedRequest: safeRequest.redactedRequest,
-        redactedResponse: { trackingNumber, providerReference, voided: true },
+        redactedResponse: {
+          trackingNumber,
+          providerReference,
+          voided: true,
+          ...(upsSandboxShipmentAlreadyAbsent
+            ? { providerState: 'not_found', providerCode: '190102' }
+            : {}),
+        },
         providerReference: response.headers.get('transaction-id')
           || response.headers.get('x-customer-transaction-id')
           || providerReference,
