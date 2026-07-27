@@ -66,11 +66,12 @@ function runScript(args, ports) {
 
 let configuredLength = 1396
 let received = ''
+let calibrationChangesLength = true
 const printer = net.createServer((socket) => {
   socket.setEncoding('ascii')
   socket.on('data', (chunk) => {
     received += chunk
-    if (received === '~JC\r\n') configuredLength = 1218
+    if (received === '~JC\r\n' && calibrationChangesLength) configuredLength = 1218
   })
 })
 const http = createHttpServer((_request, response) => {
@@ -119,6 +120,29 @@ try {
   assert.equal(result.before.diagnosis.configuredLabelLengthDots, 1396)
   assert.equal(result.after.diagnosis.configuredLabelLengthDots, 1218)
   assert.equal(result.after.diagnosis.expectedStockMatchesCalibration, true)
+
+  configuredLength = 1396
+  received = ''
+  calibrationChangesLength = false
+  const stillMiscalibrated = await runScript([
+    '--expected-media',
+    'label_4x6',
+    '--confirm-agent-paused',
+    '--confirm-auto-calibration',
+  ], ports)
+  assert.equal(stillMiscalibrated.code, 2)
+  assert.match(
+    stillMiscalibrated.stderr,
+    /sensed media still does not match 4 x 6 stock/,
+  )
+  const failedResult = JSON.parse(stillMiscalibrated.stdout)
+  assert.equal(failedResult.ok, false)
+  assert.equal(failedResult.calibrationVerified, false)
+  assert.equal(
+    failedResult.after.diagnosis.expectedStockMatchesCalibration,
+    false,
+  )
+  assert.match(failedResult.requiredAction, /reload actual 4 x 6 gap stock/)
 
   process.stdout.write('Zebra printer calibration contracts passed\n')
 } finally {

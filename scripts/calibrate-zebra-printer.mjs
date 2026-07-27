@@ -293,7 +293,7 @@ export async function runZebraCalibrationCli(argv, env = process.env) {
   const options = parseArguments(argv, env)
   if (options.help) {
     process.stdout.write(usage())
-    return
+    return { ok: true }
   }
 
   const before = await inspectZebraPrinter(options)
@@ -304,7 +304,7 @@ export async function runZebraCalibrationCli(argv, env = process.env) {
       mutationSent: false,
       printer: before,
     }, null, 2)}\n`)
-    return
+    return { ok: true }
   }
 
   assertCalibrationPreconditions(options, before)
@@ -314,18 +314,30 @@ export async function runZebraCalibrationCli(argv, env = process.env) {
   const delivery = await sendZebraAutoCalibration(options)
   await new Promise((resolvePromise) => setTimeout(resolvePromise, options.settleMs))
   const after = await inspectZebraPrinter(options)
+  const calibrationVerified = after.diagnosis.expectedStockMatchesCalibration === true
   process.stdout.write(`${JSON.stringify({
-    ok: true,
+    ok: calibrationVerified,
     action: 'auto_media_calibration',
     command: '~JC',
     expectedCalibrationFeedCount: '1-4 labels',
     acceptedBytes: delivery.acceptedBytes,
+    calibrationVerified,
+    requiredAction: calibrationVerified
+      ? null
+      : 'Measure the label pitch, then reload actual 4 x 6 gap stock and inspect or clean the WEB sensor before calibrating again.',
     before,
     after,
   }, null, 2)}\n`)
+  if (!calibrationVerified) {
+    process.stderr.write(
+      'Zebra auto calibration completed, but the sensed media still does not match 4 x 6 stock. Do not send another label until the physical media or WEB sensor is corrected.\n',
+    )
+  }
+  return { ok: calibrationVerified }
 }
 
 const invokedPath = process.argv[1] ? path.resolve(process.argv[1]) : ''
 if (invokedPath === fileURLToPath(import.meta.url)) {
-  await runZebraCalibrationCli(process.argv.slice(2))
+  const result = await runZebraCalibrationCli(process.argv.slice(2))
+  if (result?.ok === false) process.exitCode = 2
 }

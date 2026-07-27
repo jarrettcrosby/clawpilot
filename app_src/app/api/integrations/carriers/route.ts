@@ -15,6 +15,7 @@ import {
   updateCarrierCredential,
 } from '@/lib/integrations/carrierIntegrations'
 import {
+  closeCarrierRateTestSampleLabel,
   createCarrierRateTestLabel,
   listCarrierRateTestLabelAttempts,
   listCarrierRateTestLabels,
@@ -23,6 +24,7 @@ import {
   voidCarrierRateTestLabel,
 } from '@/lib/integrations/carrierRateTestLabelActions'
 import {
+  carrierSandboxLabelLifecycleMode,
   carrierSandboxLabelOutputOptions,
   type CarrierLabelOutputFormat,
 } from '@/lib/integrations/carrierSandboxLabel'
@@ -331,6 +333,10 @@ function safeRateTestLabel(
     ratedAmount: label.ratedAmount,
     ratedCurrency: label.ratedCurrency,
     trackingNumber: label.trackingNumber,
+    lifecycleMode: carrierSandboxLabelLifecycleMode(
+      label.provider,
+      label.trackingNumber,
+    ),
     format: label.format,
     mediaSize: label.mediaSize,
     sourceKind: label.sourceKind,
@@ -384,6 +390,8 @@ function safeRateTestLabelAttempt(
     selectedRate: attempt.selectedRate,
     reason: attempt.reason,
     errorCode: attempt.errorCode,
+    providerErrorCodes: attempt.providerErrorCodes,
+    providerHttpStatus: attempt.providerHttpStatus,
     providerReference: attempt.providerReference,
     reconciliationOutcome: attempt.reconciliationOutcome,
     reconciliationReason: attempt.reconciliationReason,
@@ -651,6 +659,35 @@ export async function PATCH(req: NextRequest) {
         rateTestLabels: (
           await listCarrierRateTestLabels({ organizationId: organization })
         ).map(safeRateTestLabel),
+      })
+    }
+    if (action === 'close-rate-test-sample-label') {
+      only(body, ['action', 'labelGlobalId', 'reason', 'idempotencyKey'])
+      requireExecutor(actor)
+      requireCredentialViewer(actor)
+      const rateTestLabel = await closeCarrierRateTestSampleLabel({
+        organizationId: organization,
+        actorEmail: actor.email,
+        labelGlobalId: globalReference(
+          body.labelGlobalId,
+          'gsl',
+          'Rate-test label reference',
+        ),
+        reason: plainText(body.reason, 'Sample-label close reason', 500),
+        idempotencyKey: idempotencyKey(body.idempotencyKey),
+      })
+      const [rateTestLabels, rateTestAttempts] = await Promise.all([
+        listCarrierRateTestLabels({ organizationId: organization }),
+        listCarrierRateTestLabelAttempts({ organizationId: organization }),
+      ])
+      return json({
+        ok: true,
+        canManage: true,
+        canExecute: true,
+        canReconcile: true,
+        rateTestLabel: safeRateTestLabel(rateTestLabel),
+        rateTestLabels: rateTestLabels.map(safeRateTestLabel),
+        rateTestAttempts: rateTestAttempts.map(safeRateTestLabelAttempt),
       })
     }
     if (action === 'reconcile-rate-test-attempt') {

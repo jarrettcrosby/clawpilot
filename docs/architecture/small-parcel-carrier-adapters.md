@@ -139,6 +139,8 @@ rejected before insert.
 
 Rating and shipping remain separate provider commands. A successful rate contains no label document or tracking number. An authorized operator may explicitly select one evidenced service and choose a provider-native 4 x 6 output before calling the provider sandbox Ship API through a durable prepare/call/finalize command. The standard UPS Shipping diagnostic exposes native `ZPL`; the current UPS OpenAPI describes `GIF`, `ZPL`, `EPL`, and `SPL` for standard shipment labels and does not establish native PDF or PNG for this path. ClawPilot therefore does not advertise UPS PDF/PNG or silently translate GIF. FedEx exposes native `ZPLII` with `STOCK_4X6`, or native `PDF`/`PNG` with `PAPER_4X6`. ClawPilot validates the decoded format and dimensions where applicable, records the exact provider bytes and source metadata, and only then permits a compatible print route. The associated void resolves the exact persisted account, and an ambiguous create or void result blocks a fresh attempt until reconciliation.
 
+Provider-native ZPL is accepted only when it contains one complete format, an effective copy count of one, and no explicit blank-feed or media-slew command. UPS CIE's exact `1ZXXXXXXXXXXXXXXXX` sample output is printable conformance media but is not modeled as an active provider shipment. Its terminal action is an audited local **close sample** with no UPS call and an explicit `confirmed_no_active_label` outcome; ordinary UPS shipment references continue to use the documented carrier void endpoint.
+
 | Diagnostic provider | Exposed customer choice | Provider-native request | Current media |
 | --- | --- | --- | --- |
 | UPS Shipping REST | ZPL | `LabelImageFormat.Code=ZPL` | 4 x 6 |

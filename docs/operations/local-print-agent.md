@@ -171,6 +171,13 @@ duplicate ClawPilot jobs. After calibration, press the physical Feed button
 once: exactly one blank label should advance and stop at the tear position.
 Then restart the exact paused local print-agent service.
 
+The calibration command exits nonzero and reports `calibrationVerified: false`
+when the post-`~JC` label pitch still differs materially from the selected
+stock. That result means the printer accepted the maintenance command but did
+not become safe for 4 x 6 delivery. Measure the physical gap-to-gap pitch,
+reload actual 4 x 6 stock, and inspect or clean the WEB sensor before trying
+again; do not treat command delivery alone as successful calibration.
+
 The printer's tear-off setting controls only where the gap rests over the tear
 bar. It cannot correct a whole-label skip. Do not change `^TA`, label-top, or
 left-position values to compensate for an incorrect media length. If standard

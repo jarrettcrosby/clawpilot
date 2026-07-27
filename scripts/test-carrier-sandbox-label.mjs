@@ -185,11 +185,25 @@ function assertEvidenceRedacted(result) {
 }
 
 const {
+  carrierSandboxLabelLifecycleMode,
   carrierSandboxLabelOutputOptions,
   carrierSandboxLabelRequestEvidence,
   createCarrierSandboxLabel,
   voidCarrierSandboxLabel,
 } = loadLabelModule()
+
+assert.equal(
+  carrierSandboxLabelLifecycleMode('ups_rest', '1ZXXXXXXXXXXXXXXXX'),
+  'close_sample',
+)
+assert.equal(
+  carrierSandboxLabelLifecycleMode('ups_rest', '1ZSHIPMENT0001'),
+  'carrier_void',
+)
+assert.equal(
+  carrierSandboxLabelLifecycleMode('fedex_rest', '1ZXXXXXXXXXXXXXXXX'),
+  'carrier_void',
+)
 
 assert.deepEqual(
   plain(carrierSandboxLabelOutputOptions('ups_rest')),
@@ -530,6 +544,50 @@ await assert.rejects(
   }),
   'UPS label bytes must contain a complete ZPL ^XA/^XZ envelope',
 )
+
+for (const [unsafeZpl, expectation] of [
+  [
+    '^XA^FO20,20^FDLABEL ONE^FS^XZ^XA^FO20,20^FDLABEL TWO^FS^XZ',
+    'multiple ZPL envelopes',
+  ],
+  [
+    '^XA^PQ2^FO20,20^FDTWO COPIES^FS^XZ',
+    'a copy count greater than one',
+  ],
+  [
+    '^XA^FO20,20^FDEXPLICIT FEED^FS^PH^XZ',
+    'an explicit blank-label feed',
+  ],
+  [
+    '^XA^FO20,20^FDEXPLICIT SLEW^FS^PF1218^XZ',
+    'an explicit media slew',
+  ],
+]) {
+  await assert.rejects(
+    createCarrierSandboxLabel(runtime('ups_rest', '03'), {
+      fetchImpl: async () => jsonResponse({
+        ShipmentResponse: {
+          ShipmentResults: {
+            ShipmentIdentificationNumber: '1ZUNSAFECOPIES',
+            PackageResults: [{
+              TrackingNumber: '1ZUNSAFECOPIES',
+              ShippingLabel: {
+                ImageFormat: { Code: 'ZPL' },
+                GraphicImage: Buffer.from(unsafeZpl, 'utf8').toString('base64'),
+              },
+            }],
+          },
+        },
+      }),
+    }),
+    (error) => assertError(error, {
+      code: 'CARRIER_PROVIDER_RESPONSE_INVALID',
+      status: 502,
+      uncertain: true,
+    }),
+    `UPS label bytes must reject ${expectation}`,
+  )
+}
 
 await assert.rejects(
   createCarrierSandboxLabel(runtime('fedex_rest', 'FEDEX_GROUND'), {

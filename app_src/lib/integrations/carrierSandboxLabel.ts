@@ -75,6 +75,18 @@ export type CarrierSandboxVoidResult = {
   evidence: CarrierSandboxLabelEvidence
 }
 
+export type CarrierSandboxLabelLifecycleMode = 'carrier_void' | 'close_sample'
+
+export function carrierSandboxLabelLifecycleMode(
+  provider: SandboxLabelProvider,
+  trackingNumber: string,
+): CarrierSandboxLabelLifecycleMode {
+  return (
+    provider === 'ups_rest'
+    && /^1Z[X]{16}$/i.test(String(trackingNumber || '').trim())
+  ) ? 'close_sample' : 'carrier_void'
+}
+
 export class CarrierSandboxLabelError extends Error {
   constructor(
     message: string,
@@ -742,10 +754,18 @@ function labelMetadata(labelBytes: Uint8Array) {
 function printableZpl(bytes: Buffer, provider: 'UPS' | 'FedEx') {
   const payload = bytes.toString('utf8')
   const normalized = payload.trim()
+  const startCount = normalized.match(/\^XA/g)?.length || 0
+  const endCount = normalized.match(/\^XZ/g)?.length || 0
+  const copyCounts = [...normalized.matchAll(/\^PQ(\d{1,5})(?=[,^\s]|$)/g)]
+    .map((match) => Number(match[1]))
   if (
     !Buffer.from(payload, 'utf8').equals(bytes)
     || !normalized.startsWith('^XA')
     || !normalized.endsWith('^XZ')
+    || startCount !== 1
+    || endCount !== 1
+    || copyCounts.some((count) => count !== 1)
+    || /(?:\^PH|~PH|\^PF\d)/.test(normalized)
     || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(payload)
   ) {
     return invalidLabelResponse(provider)
