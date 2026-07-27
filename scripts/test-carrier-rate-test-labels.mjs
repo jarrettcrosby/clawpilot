@@ -166,6 +166,13 @@ for (const fragment of [
   'queueCarrierRateTestLabelPrintInPostgres',
   'listCarrierRateTestLabelAttemptsInPostgres',
   'reconcileCarrierRateTestLabelAttemptInPostgres',
+  'closeCarrierRateTestSampleLabelInPostgres',
+  "'CARRIER_RATE_TEST_SAMPLE_NO_ACTIVE_LABEL'",
+  "'confirmed_no_active_label'",
+  "closeMode: 'ups_cie_sample'",
+  'carrierCallMade: false',
+  'providerErrorCodes',
+  'providerHttpStatus',
   'replayCarrierRateTestLabelVoidInPostgres',
   "state IN ('prepared', 'unknown')",
   "type: 'rate_test_label'",
@@ -204,6 +211,9 @@ for (const fragment of [
   'CARRIER_RATE_TEST_SELECTION_MISMATCH',
   'CARRIER_RATE_TEST_RECONCILIATION_REQUIRED',
   'reconcileCarrierRateTestLabelAttempt',
+  'closeCarrierRateTestSampleLabel',
+  'carrierSandboxLabelLifecycleMode',
+  "'CARRIER_RATE_TEST_SAMPLE_CLOSE_REQUIRED'",
   'senderBillingOnly: true',
   'shipmentFixture',
   'payloadEncoding',
@@ -264,10 +274,29 @@ for (const fragment of [
   'providerStockType: label.providerStockType',
   'printArtifactGlobalId: label.printArtifactGlobalId',
   'artifactGlobalId: job.artifactGlobalId',
+  'lifecycleMode: carrierSandboxLabelLifecycleMode',
+  'providerErrorCodes: attempt.providerErrorCodes',
+  'providerHttpStatus: attempt.providerHttpStatus',
+  "action === 'close-rate-test-sample-label'",
 ]) {
   assert.ok(
     carrierApi.includes(fragment),
     `Missing carrier label output API contract: ${fragment}`,
+  )
+}
+const sampleCloseApi = carrierApi.slice(
+  carrierApi.indexOf("if (action === 'close-rate-test-sample-label')"),
+  carrierApi.indexOf("if (action === 'reconcile-rate-test-attempt')"),
+)
+for (const fragment of [
+  'requireExecutor(actor)',
+  'requireCredentialViewer(actor)',
+  'closeCarrierRateTestSampleLabel',
+  'rateTestAttempts.map(safeRateTestLabelAttempt)',
+]) {
+  assert.ok(
+    sampleCloseApi.includes(fragment),
+    `UPS sample-close API authorization/result contract missing: ${fragment}`,
   )
 }
 
@@ -280,6 +309,9 @@ for (const fragment of [
   'outputFormat: selectedLabelOutput.format',
   'Provider-native',
   'source bytes immutable',
+  'Close UPS sample without carrier call',
+  "'close-rate-test-sample-label'",
+  'provider code',
 ]) {
   assert.ok(
     carrierUi.includes(fragment),

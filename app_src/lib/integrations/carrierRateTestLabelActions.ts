@@ -7,6 +7,7 @@ import {
 import {
   CARRIER_SANDBOX_LABEL_ADAPTER_VERSION,
   CarrierSandboxLabelError,
+  carrierSandboxLabelLifecycleMode,
   createCarrierSandboxLabel,
   voidCarrierSandboxLabel,
   type CarrierLabelOutputFormat,
@@ -20,6 +21,7 @@ import {
 } from '@/lib/integrations/carrierSandboxRate'
 import {
   carrierRateTestLabelFingerprint,
+  closeCarrierRateTestSampleLabelInPostgres,
   finalizeCarrierRateTestLabelAttemptFailureInPostgres,
   finalizeCarrierRateTestLabelCreateInPostgres,
   finalizeCarrierRateTestLabelVoidInPostgres,
@@ -470,6 +472,18 @@ export async function voidCarrierRateTestLabel(input: {
     organizationId: input.organizationId,
     labelGlobalId: input.labelGlobalId,
   })
+  if (
+    carrierSandboxLabelLifecycleMode(
+      label.provider,
+      label.trackingNumber,
+    ) === 'close_sample'
+  ) {
+    throw new OperationsRequestError(
+      'CARRIER_RATE_TEST_SAMPLE_CLOSE_REQUIRED',
+      'UPS CIE returned printable sample media without an active carrier shipment. Use Close UPS sample; no carrier void call is required.',
+      409,
+    )
+  }
   const attemptRequestHash = carrierRateTestLabelFingerprint({
     action: 'void',
     labelGlobalId: label.labelGlobalId,
@@ -563,6 +577,50 @@ export async function voidCarrierRateTestLabel(input: {
       503,
     )
   }
+}
+
+export async function closeCarrierRateTestSampleLabel(input: {
+  organizationId: string
+  actorEmail: string
+  labelGlobalId: string
+  reason: string
+  idempotencyKey: string
+}) {
+  const label = await readCarrierRateTestLabelProviderContextInPostgres({
+    organizationId: input.organizationId,
+    labelGlobalId: input.labelGlobalId,
+  })
+  if (
+    carrierSandboxLabelLifecycleMode(
+      label.provider,
+      label.trackingNumber,
+    ) !== 'close_sample'
+  ) {
+    throw new OperationsRequestError(
+      'CARRIER_RATE_TEST_SAMPLE_CLOSE_UNAVAILABLE',
+      'This label has a carrier-side lifecycle and must use the provider void action',
+      409,
+    )
+  }
+  const attemptRequestHash = carrierRateTestLabelFingerprint({
+    action: 'close_sample',
+    labelGlobalId: label.labelGlobalId,
+    rateEvidenceGlobalId: label.rateEvidenceGlobalId,
+    carrierAccountGlobalId: label.carrierAccountGlobalId,
+    providerLabelId: label.providerLabelId,
+    trackingNumber: label.trackingNumber,
+    adapterVersion: CARRIER_SANDBOX_LABEL_ADAPTER_VERSION,
+    reason: input.reason,
+  })
+  return closeCarrierRateTestSampleLabelInPostgres({
+    organizationId: input.organizationId,
+    actorEmail: input.actorEmail,
+    label,
+    reason: input.reason,
+    idempotencyKey: input.idempotencyKey,
+    attemptRequestHash,
+    adapterVersion: CARRIER_SANDBOX_LABEL_ADAPTER_VERSION,
+  })
 }
 
 export async function printCarrierRateTestLabel(input: {

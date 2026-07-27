@@ -31,7 +31,7 @@
     "test:commerce-normalization": "node scripts/test-commerce-normalization-schema.mjs && node scripts/test-commerce-normalizers.mjs && node scripts/test-commerce-intake.mjs",
     "test:ui-controls": "node scripts/test-ui-control-layout.mjs",
     "test:carrier-sandbox-label": "node scripts/test-carrier-sandbox-label.mjs",
-    "test:carrier-rate-test-labels": "node scripts/test-carrier-rate-test-labels.mjs",
+    "test:carrier-rate-test-labels": "node scripts/test-carrier-rate-test-labels.mjs && node scripts/test-carrier-rate-test-sample-close.mjs",
     "test:operation-shipping-persistence": "node scripts/test-operation-shipping-persistence.mjs",
     "test:multi-workspace-memberships": "node scripts/test-multi-workspace-memberships.mjs",
     "test:sales-pipeline-episcs-migration": "node scripts/test-sales-pipeline-episcs-migration.mjs",

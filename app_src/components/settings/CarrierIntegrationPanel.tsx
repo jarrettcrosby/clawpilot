@@ -182,6 +182,7 @@ type CarrierRateTestLabel = {
   ratedAmount: string
   ratedCurrency: string
   trackingNumber: string
+  lifecycleMode: 'carrier_void' | 'close_sample'
   format: 'ZPL' | 'PDF' | 'PNG'
   mediaSize: 'label_4x6' | 'label_4x8'
   sourceKind: 'provider_native'
@@ -291,6 +292,8 @@ type CarrierRateTestLabelAttempt = {
   }
   reason: string
   errorCode: string | null
+  providerErrorCodes: string[]
+  providerHttpStatus: number | null
   providerReference: string | null
   reconciliationOutcome:
     | 'confirmed_no_active_label'
@@ -521,6 +524,14 @@ export default function CarrierIntegrationPanel() {
   const selectedRateTestLabel = visibleRateTestLabels.find(
     (entry) => entry.globalId === selectedRateTestLabelGlobalId,
   ) || null
+  const selectedRateTestLabelVoidAttempt = rateTestAttempts.find((entry) => (
+    entry.labelGlobalId === selectedRateTestLabel?.globalId
+    && entry.action === 'void'
+  )) || null
+  const selectedRateTestLabelClosedWithoutCarrierVoid = Boolean(
+    selectedRateTestLabel?.status === 'voided'
+    && selectedRateTestLabelVoidAttempt?.reconciliationOutcome === 'confirmed_no_active_label',
+  )
   const visibleReconciliationAttempts = useMemo(
     () => rateTestAttempts.filter((entry) => (
       entry.provider === provider && entry.reconciliationEligible
@@ -890,15 +901,20 @@ export default function CarrierIntegrationPanel() {
     ) return
     const idempotencyKey = voidLabelIdempotencyKey || newIdempotencyKey('void')
     if (!voidLabelIdempotencyKey) setVoidLabelIdempotencyKey(idempotencyKey)
+    const closeSample = selectedRateTestLabel.lifecycleMode === 'close_sample'
     const result = await patch(
-      'void-rate-test-label',
+      closeSample ? 'close-rate-test-sample-label' : 'void-rate-test-label',
       {
-        action: 'void-rate-test-label',
+        action: closeSample
+          ? 'close-rate-test-sample-label'
+          : 'void-rate-test-label',
         labelGlobalId: selectedRateTestLabel.globalId,
         reason: voidLabelReason.trim(),
         idempotencyKey,
       },
-      `Sandbox label ${selectedRateTestLabel.globalId} was voided.`,
+      closeSample
+        ? `UPS CIE sample ${selectedRateTestLabel.globalId} was closed locally; no carrier void call was made.`
+        : `Sandbox label ${selectedRateTestLabel.globalId} was voided.`,
     )
     if (!result) return
     setVoidLabelReason('')
@@ -1583,7 +1599,7 @@ export default function CarrierIntegrationPanel() {
             alternativeLabel
             sx={{ mt: 2, mb: 2, '& .MuiStepLabel-label': { fontSize: '0.75rem' } }}
           >
-            {['Rate', 'Create label', 'Print stored label', 'Void'].map((label) => (
+            {['Rate', 'Create label', 'Print stored label', 'Void / close'].map((label) => (
               <Step key={label}><StepLabel>{label}</StepLabel></Step>
             ))}
           </Stepper>
@@ -1966,7 +1982,17 @@ export default function CarrierIntegrationPanel() {
                             size="small"
                             color={label.status === 'created' ? 'success' : 'default'}
                             variant="outlined"
-                            label={label.status === 'created' ? 'Created' : 'Voided'}
+                            label={label.status === 'created'
+                              ? 'Created'
+                              : (
+                                rateTestAttempts.find((attempt) => (
+                                  attempt.labelGlobalId === label.globalId
+                                  && attempt.action === 'void'
+                                  && attempt.reconciliationOutcome === 'confirmed_no_active_label'
+                                ))
+                                  ? 'Closed sample'
+                                  : 'Voided'
+                              )}
                           />
                           <Chip size="small" variant="outlined" label={label.globalId} />
                         </Stack>
@@ -2250,27 +2276,64 @@ export default function CarrierIntegrationPanel() {
               </Box>
 
               <Box sx={{ mt: 3, pt: 2, borderTop: '1px solid', borderColor: 'divider' }}>
-                <Typography variant="overline" color="text.disabled">Step 4 · Void</Typography>
-                <Typography variant="subtitle2" fontWeight={700}>Close the carrier-side test</Typography>
+                <Typography variant="overline" color="text.disabled">
+                  Step 4 · {selectedRateTestLabel.lifecycleMode === 'close_sample'
+                    ? 'Close sample'
+                    : 'Void'}
+                </Typography>
+                <Typography variant="subtitle2" fontWeight={700}>
+                  {selectedRateTestLabel.lifecycleMode === 'close_sample'
+                    ? 'Close the UPS CIE sample evidence'
+                    : 'Close the carrier-side test'}
+                </Typography>
                 {selectedRateTestLabel.status === 'voided' ? (
                   <Alert severity="success" sx={{ mt: 1.5, borderRadius: '8px' }}>
-                    Voided {selectedRateTestLabel.voidedAt
-                      ? formatUserDateTime(selectedRateTestLabel.voidedAt, dateTimeSettings, {
-                          year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
-                        })
-                      : 'successfully'}.
+                    {selectedRateTestLabelClosedWithoutCarrierVoid
+                      ? 'Closed locally after confirming that this UPS CIE sample never represented an active carrier shipment. No carrier void was recorded.'
+                      : `Voided ${selectedRateTestLabel.voidedAt
+                        ? formatUserDateTime(selectedRateTestLabel.voidedAt, dateTimeSettings, {
+                            year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
+                          })
+                        : 'successfully'}.`}
                   </Alert>
                 ) : (
                   <Stack spacing={1.5} sx={{ mt: 1.5 }}>
-                    <Alert severity="warning" sx={{ borderRadius: '8px' }}>
-                      Voiding calls the carrier for tracking {selectedRateTestLabel.trackingNumber}. It does
-                      not delete the stored audit record.
-                    </Alert>
+                    {selectedRateTestLabel.lifecycleMode === 'close_sample' ? (
+                      <Alert severity="info" sx={{ borderRadius: '8px' }}>
+                        UPS CIE returned the printable sample reference{' '}
+                        {selectedRateTestLabel.trackingNumber}, not an active carrier shipment. Closing this
+                        sample retires it in ClawPilot with audited no-active-label evidence and makes no UPS
+                        API call.
+                      </Alert>
+                    ) : (
+                      <Alert severity="warning" sx={{ borderRadius: '8px' }}>
+                        Voiding calls the carrier for tracking {selectedRateTestLabel.trackingNumber}. It does
+                        not delete the stored audit record.
+                      </Alert>
+                    )}
+                    {selectedRateTestLabelVoidAttempt?.state === 'failed' ? (
+                      <Alert severity="warning" sx={{ borderRadius: '8px' }}>
+                        Previous void attempt {selectedRateTestLabelVoidAttempt.globalId} failed with{' '}
+                        {selectedRateTestLabelVoidAttempt.errorCode || 'a carrier rejection'}
+                        {selectedRateTestLabelVoidAttempt.providerErrorCodes.length
+                          ? ` · provider code ${selectedRateTestLabelVoidAttempt.providerErrorCodes.join(', ')}`
+                          : ''}
+                        . The local label remains active until this step completes.
+                      </Alert>
+                    ) : null}
+                    {selectedRateTestLabel.lifecycleMode === 'close_sample' && !canReconcile ? (
+                      <Alert severity="warning" sx={{ borderRadius: '8px' }}>
+                        Organization owner or administrator access plus warehouse execution is required to
+                        close UPS sample evidence.
+                      </Alert>
+                    ) : null}
                     <TextField
                       required
                       multiline
                       minRows={2}
-                      label="Void reason"
+                      label={selectedRateTestLabel.lifecycleMode === 'close_sample'
+                        ? 'Sample close reason'
+                        : 'Void reason'}
                       value={voidLabelReason}
                       onChange={(event) => {
                         setVoidLabelReason(event.target.value)
@@ -2278,7 +2341,11 @@ export default function CarrierIntegrationPanel() {
                       }}
                       disabled={busy}
                       inputProps={{ maxLength: 500 }}
-                      helperText={`${voidLabelReason.length}/500 · recorded with the carrier void`}
+                      helperText={`${voidLabelReason.length}/500 · ${
+                        selectedRateTestLabel.lifecycleMode === 'close_sample'
+                          ? 'recorded with the audited local close'
+                          : 'recorded with the carrier void'
+                      }`}
                       sx={fieldSx}
                     />
                     <FormControlLabel
@@ -2292,26 +2359,37 @@ export default function CarrierIntegrationPanel() {
                           disabled={busy}
                         />
                       )}
-                      label={`I confirm I want to void exactly ${selectedRateTestLabel.globalId}, tracking ${selectedRateTestLabel.trackingNumber}.`}
+                      label={selectedRateTestLabel.lifecycleMode === 'close_sample'
+                        ? `I confirm ${selectedRateTestLabel.globalId} is the UPS CIE sample ${selectedRateTestLabel.trackingNumber} and should be closed without a carrier call.`
+                        : `I confirm I want to void exactly ${selectedRateTestLabel.globalId}, tracking ${selectedRateTestLabel.trackingNumber}.`}
                       sx={{ alignItems: 'flex-start', m: 0 }}
                     />
                     <Box>
                       <Button
                         color="error"
                         variant="outlined"
-                        startIcon={pendingAction === 'void-rate-test-label'
+                        startIcon={(
+                          pendingAction === 'void-rate-test-label'
+                          || pendingAction === 'close-rate-test-sample-label'
+                        )
                           ? <CircularProgress size={16} color="inherit" />
                           : <DeleteOutlineRounded />}
                         disabled={
                           busy
                           || !canExecute
+                          || (
+                            selectedRateTestLabel.lifecycleMode === 'close_sample'
+                            && !canReconcile
+                          )
                           || !voidLabelConfirmed
                           || !voidLabelReason.trim()
                         }
                         onClick={() => void voidRateTestLabel()}
                         sx={buttonSx}
                       >
-                        Void exact sandbox label
+                        {selectedRateTestLabel.lifecycleMode === 'close_sample'
+                          ? 'Close UPS sample without carrier call'
+                          : 'Void exact sandbox label'}
                       </Button>
                     </Box>
                   </Stack>

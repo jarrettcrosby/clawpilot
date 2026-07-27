@@ -103,6 +103,8 @@ export type CarrierRateTestLabelAttemptListItem = {
   selectedRate: CarrierRateTestSelectedRate
   reason: string
   errorCode: string | null
+  providerErrorCodes: string[]
+  providerHttpStatus: number | null
   providerReference: string | null
   reconciliationOutcome:
     | 'confirmed_no_active_label'
@@ -158,6 +160,8 @@ type AttemptRow = {
   selected_rate: Record<string, unknown>
   reason: string
   error_code: string | null
+  provider_error_codes: unknown
+  provider_http_status: string | null
   provider_reference: string | null
   reconciliation_outcome:
     | CarrierRateTestLabelAttemptListItem['reconciliationOutcome']
@@ -210,7 +214,10 @@ const ATTEMPT_SELECT = `
          label.global_id AS label_global_id,
          attempt.action, attempt.state, attempt.provider,
          attempt.service_code, attempt.selected_rate, attempt.reason,
-         attempt.error_code, attempt.provider_reference,
+         attempt.error_code,
+         attempt.redacted_response->'providerErrorCodes' AS provider_error_codes,
+         attempt.redacted_response->>'httpStatus' AS provider_http_status,
+         attempt.provider_reference,
          attempt.reconciliation_outcome, attempt.reconciliation_reason,
          attempt.reconciled_by, attempt.reconciled_at,
          attempt.requested_at, attempt.completed_at,
@@ -317,6 +324,20 @@ function storedSelectedRate(value: unknown): CarrierRateTestSelectedRate {
 function attemptItem(
   row: AttemptRow,
 ): CarrierRateTestLabelAttemptListItem {
+  const providerErrorCodes = Array.isArray(row.provider_error_codes)
+    ? row.provider_error_codes
+      .filter((value): value is string => (
+        typeof value === 'string'
+        && /^[A-Za-z0-9._:-]{1,80}$/.test(value)
+      ))
+      .slice(0, 3)
+    : []
+  const parsedHttpStatus = Number(row.provider_http_status)
+  const providerHttpStatus = Number.isInteger(parsedHttpStatus)
+    && parsedHttpStatus >= 100
+    && parsedHttpStatus <= 599
+    ? parsedHttpStatus
+    : null
   return {
     globalId: row.global_id,
     rateEvidenceGlobalId: row.rate_evidence_global_id,
@@ -328,6 +349,8 @@ function attemptItem(
     selectedRate: storedSelectedRate(row.selected_rate),
     reason: row.reason,
     errorCode: row.error_code,
+    providerErrorCodes,
+    providerHttpStatus,
     providerReference: row.provider_reference,
     reconciliationOutcome: row.reconciliation_outcome,
     reconciliationReason: row.reconciliation_reason,
@@ -1335,6 +1358,234 @@ export async function finalizeCarrierRateTestLabelVoidInPostgres(input: {
       payload: { voidAttemptGlobalId: input.attemptGlobalId, status: 'voided' },
     }, client)
     return oneLabel(input.organizationId, attempt.label_global_id, client)
+  })
+}
+
+export async function closeCarrierRateTestSampleLabelInPostgres(input: {
+  organizationId: string
+  actorEmail: string
+  label: CarrierRateTestLabelProviderContext
+  reason: string
+  idempotencyKey: string
+  attemptRequestHash: string
+  adapterVersion: string
+}) {
+  const reason = String(input.reason || '').trim()
+  if (
+    !reason
+    || reason.length > 500
+    || /[\u0000-\u001f\u007f]/.test(reason)
+  ) {
+    throw new OperationsRequestError(
+      'CARRIER_RATE_TEST_SAMPLE_CLOSE_REASON_INVALID',
+      'Sample-label close reason must be 1-500 plain-text characters',
+    )
+  }
+  if (!/^[A-Za-z0-9._:-]{8,200}$/.test(input.idempotencyKey)) {
+    throw new OperationsRequestError(
+      'CARRIER_RATE_TEST_SAMPLE_CLOSE_KEY_INVALID',
+      'Sample-label close idempotency key is invalid',
+    )
+  }
+  if (!/^[a-f0-9]{64}$/.test(input.attemptRequestHash)) {
+    throw new OperationsRequestError(
+      'CARRIER_RATE_TEST_SAMPLE_CLOSE_HASH_INVALID',
+      'Sample-label close request hash is invalid',
+    )
+  }
+
+  return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `carrier-rate-test-label:sample-close:${input.organizationId}:${input.label.labelGlobalId}`,
+    )
+    await acquireTransactionAdvisoryLock(
+      client,
+      `carrier-rate-test-label:sample-close-key:${input.organizationId}:${input.idempotencyKey}`,
+    )
+
+    const replay = await client.query<{
+      label_id: string | null
+      request_hash: string
+      reconciliation_outcome: CarrierRateTestLabelAttemptListItem['reconciliationOutcome']
+    }>(
+      `SELECT label_id::text, request_hash, reconciliation_outcome
+         FROM operations_carrier_rate_test_label_attempts
+        WHERE organization_id = $1::uuid
+          AND action = 'void'
+          AND idempotency_key = $2
+        LIMIT 1
+        FOR SHARE`,
+      [input.organizationId, input.idempotencyKey],
+    )
+    if (replay.rows[0]) {
+      if (
+        replay.rows[0].request_hash !== input.attemptRequestHash
+        || replay.rows[0].label_id !== input.label.labelId
+      ) {
+        throw new OperationsRequestError(
+          'CARRIER_RATE_TEST_LABEL_IDEMPOTENCY_REUSED',
+          'Idempotency-Key was already used for a different sample-label close',
+          409,
+        )
+      }
+      if (replay.rows[0].reconciliation_outcome === 'confirmed_no_active_label') {
+        return oneLabel(
+          input.organizationId,
+          input.label.labelGlobalId,
+          client,
+        )
+      }
+      throw new OperationsRequestError(
+        'CARRIER_RATE_TEST_SAMPLE_CLOSE_CONFLICT',
+        'The existing sample-label close attempt has a different outcome',
+        409,
+      )
+    }
+
+    const locked = await client.query<{
+      status: 'created' | 'voided'
+      provider: Provider
+      environment: 'sandbox'
+      tracking_number: string
+      provider_label_id: string
+    }>(
+      `SELECT status, provider, environment, tracking_number, provider_label_id
+         FROM operations_carrier_rate_test_labels
+        WHERE organization_id = $1::uuid
+          AND id = $2::uuid
+          AND global_id = $3
+        FOR UPDATE`,
+      [
+        input.organizationId,
+        input.label.labelId,
+        input.label.labelGlobalId,
+      ],
+    )
+    const label = locked.rows[0]
+    if (!label) {
+      throw new OperationsRequestError(
+        'CARRIER_RATE_TEST_LABEL_NOT_FOUND',
+        'Carrier rate-test label was not found in the active organization',
+        404,
+      )
+    }
+    if (label.status !== 'created') {
+      throw new OperationsRequestError(
+        'CARRIER_RATE_TEST_LABEL_ALREADY_VOIDED',
+        'Carrier rate-test label is already closed',
+        409,
+      )
+    }
+    const cieSample = (
+      label.provider === 'ups_rest'
+      && label.environment === 'sandbox'
+      && /^1Z[X]{16}$/i.test(label.tracking_number)
+      && /^1Z[X]{16}$/i.test(label.provider_label_id)
+    )
+    if (!cieSample) {
+      throw new OperationsRequestError(
+        'CARRIER_RATE_TEST_SAMPLE_CLOSE_UNAVAILABLE',
+        'Only a UPS CIE sample label without an active carrier shipment can use this close action',
+        409,
+      )
+    }
+
+    const selectedRate: CarrierRateTestSelectedRate = {
+      serviceCode: input.label.serviceCode,
+      serviceName: input.label.serviceName,
+      rateType: input.label.rateType,
+      amount: input.label.ratedAmount,
+      currency: input.label.ratedCurrency,
+    }
+    const attempt = await client.query<{ id: string; global_id: string }>(
+      `INSERT INTO operations_carrier_rate_test_label_attempts (
+         organization_id, rate_request_id, integration_account_id,
+         carrier_account_id, label_id, action, state, provider, environment,
+         credential_version, service_code, rate_type, selected_rate,
+         destination_fingerprint, adapter_version, reason, idempotency_key,
+         request_hash, redacted_request, redacted_response,
+         provider_reference, error_code,
+         reconciliation_outcome, reconciliation_reason,
+         reconciliation_idempotency_key, reconciled_by, reconciled_at,
+         actor_email, completed_at
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid,
+         'void', 'failed', 'ups_rest', 'sandbox',
+         $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14,
+         $15::jsonb, $16::jsonb, $17,
+         'CARRIER_RATE_TEST_SAMPLE_NO_ACTIVE_LABEL',
+         'confirmed_no_active_label', $12, $13, $18, now(),
+         $18, now()
+       )
+       RETURNING id::text, global_id`,
+      [
+        input.organizationId,
+        input.label.rateRequestId,
+        input.label.integrationAccountId,
+        input.label.carrierAccountId,
+        input.label.labelId,
+        input.label.credentialVersion,
+        input.label.serviceCode,
+        input.label.rateType,
+        JSON.stringify(selectedRate),
+        input.label.destinationFingerprint,
+        input.adapterVersion,
+        reason,
+        input.idempotencyKey,
+        input.attemptRequestHash,
+        JSON.stringify({
+          labelGlobalId: input.label.labelGlobalId,
+          rateEvidenceGlobalId: input.label.rateEvidenceGlobalId,
+          closeMode: 'ups_cie_sample',
+          carrierCallMade: false,
+        }),
+        JSON.stringify({
+          providerShipmentState: 'no_active_shipment',
+          trackingClassification: 'ups_cie_sample',
+          carrierCallMade: false,
+        }),
+        label.provider_label_id,
+        input.actorEmail,
+      ],
+    )
+    const closed = await client.query<{ global_id: string }>(
+      `UPDATE operations_carrier_rate_test_labels
+          SET status = 'voided', void_attempt_id = $3::uuid,
+              voided_by = $4, voided_at = now()
+        WHERE organization_id = $1::uuid
+          AND id = $2::uuid
+          AND status = 'created'
+       RETURNING global_id`,
+      [
+        input.organizationId,
+        input.label.labelId,
+        attempt.rows[0].id,
+        input.actorEmail,
+      ],
+    )
+    if (!closed.rows[0]) {
+      throw new OperationsRequestError(
+        'CARRIER_RATE_TEST_SAMPLE_CLOSE_CONFLICT',
+        'Carrier rate-test sample label changed before it could be closed',
+        409,
+      )
+    }
+    await recordAuditEvent({
+      actor: input.actorEmail,
+      eventType: 'carrier.rate_test_label.sample_closed',
+      aggregateType: 'operations.carrier_rate_test_label',
+      aggregateId: input.label.labelGlobalId,
+      eventKey: `carrier:rate-test-label:sample-closed:${input.label.labelGlobalId}`,
+      organizationId: input.organizationId,
+      payload: {
+        voidAttemptGlobalId: attempt.rows[0].global_id,
+        outcome: 'confirmed_no_active_label',
+        carrierCallMade: false,
+        reason,
+      },
+    }, client)
+    return oneLabel(input.organizationId, input.label.labelGlobalId, client)
   })
 }
 
