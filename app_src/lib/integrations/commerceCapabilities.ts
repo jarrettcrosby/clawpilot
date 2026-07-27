@@ -315,9 +315,9 @@ export const COMMERCE_CUSTOM_INTEGRATION_ONBOARDING = {
 
 export type ClawPilotCapabilityImplementationState = 'control_plane_implemented' | 'not_implemented'
 
-// Current-state evidence only. "control_plane_implemented" means the safe
-// connection/receipt/control boundary exists; it does not imply a domain sync
-// or export worker.
+// Current-state evidence only. "control_plane_implemented" means a safe
+// operator command or connection/receipt boundary exists; it does not imply an
+// unattended domain sync or export worker.
 export const CLAWPILOT_SHOPIFY_CAPABILITY_IMPLEMENTATION = {
   oauth_authentication: 'not_implemented',
   api_authentication: 'control_plane_implemented',
@@ -335,7 +335,7 @@ export const CLAWPILOT_SHOPIFY_CAPABILITY_IMPLEMENTATION = {
   location_administration: 'not_implemented',
   customer_synchronization: 'not_implemented',
   customer_export: 'not_implemented',
-  order_import: 'not_implemented',
+  order_import: 'control_plane_implemented',
   historical_order_import: 'not_implemented',
   order_creation: 'not_implemented',
   order_update: 'not_implemented',
@@ -420,7 +420,7 @@ export const CLAWPILOT_FAIRE_CAPABILITY_IMPLEMENTATION = {
   location_administration: 'not_implemented',
   customer_synchronization: 'not_implemented',
   customer_export: 'not_implemented',
-  order_import: 'not_implemented',
+  order_import: 'control_plane_implemented',
   historical_order_import: 'not_implemented',
   order_creation: 'not_implemented',
   order_update: 'not_implemented',

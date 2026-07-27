@@ -174,6 +174,7 @@ export type FaireCommerceClient = {
   probeBrandProfile: () => Promise<FaireBrandProfile>
   listProducts: (options?: FaireListOptions) => Promise<FaireProductsPage>
   listOrders: (options?: FaireListOptions) => Promise<FaireOrdersPage>
+  getOrder: (orderId: string) => Promise<FaireOrder>
   listInventory: (query: FaireInventoryQuery) => Promise<FaireInventoryResponse>
   moveOrderToProcessing: (
     orderId: string,
@@ -892,26 +893,35 @@ function expectObjectCollection(
 function expectInventoryResponse(value: unknown) {
   const record = expectObject(value)
   const inventories = safeRecord(record.inventories)
-  const validQuantity = (quantity: unknown) => {
+  const validQuantity = (quantity: unknown, signed: boolean) => {
     const candidate = safeRecord(quantity)
     if (!candidate) return false
-    if (candidate.type !== 'QUANTITY' && candidate.type !== 'UNTRACKED') {
-      return false
+    if (candidate.type === 'UNTRACKED') {
+      return candidate.quantity === undefined
     }
-    return candidate.quantity === undefined
-      ? candidate.type === 'UNTRACKED'
-      : Number.isInteger(candidate.quantity)
+    return (
+      candidate.type === 'QUANTITY'
+      && Number.isSafeInteger(candidate.quantity)
+      && (signed || Number(candidate.quantity) >= 0)
+    )
   }
   const validLevel = (value: unknown) => {
     const level = safeRecord(value)
     if (!level) return false
-    return [
-      level.on_hand_quantity,
-      level.committed_quantity,
-      level.available_quantity,
-    ].every((quantity) => (
-      quantity === undefined || validQuantity(quantity)
-    ))
+    return (
+      (
+        level.on_hand_quantity === undefined
+        || validQuantity(level.on_hand_quantity, true)
+      )
+      && (
+        level.committed_quantity === undefined
+        || validQuantity(level.committed_quantity, false)
+      )
+      && (
+        level.available_quantity === undefined
+        || validQuantity(level.available_quantity, true)
+      )
+    )
   }
   if (
     !inventories
@@ -1127,6 +1137,19 @@ export function createFaireCommerceClient(
     ) as FaireOrdersPage
   }
 
+  async function getOrder(orderIdValue: string) {
+    const orderId = normalizeResourceId(
+      orderIdValue,
+      'Faire order ID',
+      'FAIRE_ORDER_ID_INVALID',
+    )
+    const response = expectObject(await request(`/orders/${orderId}`))
+    return (
+      safeRecord(response.order)
+      || response
+    ) as FaireOrder
+  }
+
   async function listInventory(query: FaireInventoryQuery) {
     const inventory = inventoryRequest(query)
     return expectInventoryResponse(await request(inventory.pathname, {
@@ -1216,6 +1239,7 @@ export function createFaireCommerceClient(
     probeBrandProfile,
     listProducts,
     listOrders,
+    getOrder,
     listInventory,
     moveOrderToProcessing,
     cancelOrder,
@@ -1242,6 +1266,13 @@ export function listFaireOrders(
   listOptions?: FaireListOptions,
 ) {
   return createFaireCommerceClient(options).listOrders(listOptions)
+}
+
+export function getFaireOrder(
+  options: FaireCommerceClientOptions,
+  orderId: string,
+) {
+  return createFaireCommerceClient(options).getOrder(orderId)
 }
 
 export function listFaireInventory(

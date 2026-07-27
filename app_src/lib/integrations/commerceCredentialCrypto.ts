@@ -49,6 +49,15 @@ export type EncryptedCommerceValue = {
   tag: Buffer
 }
 
+export type CommerceIntakeContinuationPayload = {
+  orderCursor: string
+}
+
+export type CommerceIntakeReadResultPayload = {
+  envelope: Record<string, unknown>
+  page: Record<string, unknown>
+}
+
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const PRINTABLE_ASCII = /^[\x20-\x7e]+$/
@@ -296,6 +305,165 @@ function webhookAuthenticatedData(
   )
 }
 
+function candidateSnapshotAuthenticatedData(
+  organizationIdValue: unknown,
+  accountGlobalIdValue: unknown,
+  externalOrderIdValue: unknown,
+  sourceHashValue: unknown,
+  kindValue: unknown,
+) {
+  const organizationId = normalizeCommerceOrganizationId(organizationIdValue)
+  const accountGlobalId = normalizeCommerceAccountGlobalId(accountGlobalIdValue)
+  const externalOrderId = printable(
+    externalOrderIdValue,
+    'External order identity',
+    1,
+    512,
+  )
+  const sourceHash = String(sourceHashValue || '').trim().toLowerCase()
+  if (!/^[a-f0-9]{64}$/.test(sourceHash)) {
+    throw new Error('Commerce candidate source digest is invalid')
+  }
+  const kind = String(kindValue || '').trim()
+  if (kind !== 'party' && kind !== 'ship_to') {
+    throw new Error('Commerce candidate snapshot kind is invalid')
+  }
+  return Buffer.from(
+    `clawpilot:commerce:${organizationId}:${accountGlobalId}:${externalOrderId}:${sourceHash}:${kind}:candidate-snapshot:v1`,
+    'utf8',
+  )
+}
+
+function intakeContinuationAuthenticatedData(
+  organizationIdValue: unknown,
+  accountGlobalIdValue: unknown,
+  providerValue: unknown,
+  sessionIdValue: unknown,
+  batchNumberValue: unknown,
+  queryHashValue: unknown,
+) {
+  const organizationId = normalizeCommerceOrganizationId(organizationIdValue)
+  const accountGlobalId = normalizeCommerceAccountGlobalId(accountGlobalIdValue)
+  const provider = normalizeCommerceProvider(providerValue)
+  const sessionId = String(sessionIdValue || '').trim().toLowerCase()
+  if (!UUID_PATTERN.test(sessionId)) {
+    throw new Error('Commerce intake continuation session is invalid')
+  }
+  const batchNumber = Number(batchNumberValue)
+  if (
+    !Number.isSafeInteger(batchNumber)
+    || batchNumber < 1
+    || batchNumber > 1_000_000
+  ) {
+    throw new Error('Commerce intake continuation batch is invalid')
+  }
+  const queryHash = String(queryHashValue || '').trim().toLowerCase()
+  if (!/^[a-f0-9]{64}$/.test(queryHash)) {
+    throw new Error('Commerce intake continuation query digest is invalid')
+  }
+  return Buffer.from(
+    `clawpilot:commerce:${organizationId}:${accountGlobalId}:${provider}:${sessionId}:${batchNumber}:${queryHash}:intake-continuation:v1`,
+    'utf8',
+  )
+}
+
+function intakeReadResultAuthenticatedData(
+  organizationIdValue: unknown,
+  accountGlobalIdValue: unknown,
+  providerValue: unknown,
+  intentIdValue: unknown,
+  providerAttemptIdValue: unknown,
+  requestHashValue: unknown,
+) {
+  const organizationId = normalizeCommerceOrganizationId(organizationIdValue)
+  const accountGlobalId = normalizeCommerceAccountGlobalId(accountGlobalIdValue)
+  const provider = normalizeCommerceProvider(providerValue)
+  const intentId = String(intentIdValue || '').trim().toLowerCase()
+  const providerAttemptId = String(providerAttemptIdValue || '')
+    .trim()
+    .toLowerCase()
+  if (!UUID_PATTERN.test(intentId) || !UUID_PATTERN.test(providerAttemptId)) {
+    throw new Error('Commerce intake read evidence identity is invalid')
+  }
+  const requestHash = String(requestHashValue || '').trim().toLowerCase()
+  if (!/^[a-f0-9]{64}$/.test(requestHash)) {
+    throw new Error('Commerce intake read request digest is invalid')
+  }
+  return Buffer.from(
+    `clawpilot:commerce:${organizationId}:${accountGlobalId}:${provider}:${intentId}:${providerAttemptId}:${requestHash}:intake-read-result:v1`,
+    'utf8',
+  )
+}
+
+function encodeCommerceIntakeReadResult(
+  value: CommerceIntakeReadResultPayload,
+) {
+  if (
+    !value
+    || typeof value !== 'object'
+    || !value.envelope
+    || typeof value.envelope !== 'object'
+    || Array.isArray(value.envelope)
+    || !value.page
+    || typeof value.page !== 'object'
+    || Array.isArray(value.page)
+  ) {
+    throw new Error('Commerce intake read result is invalid')
+  }
+  return Buffer.from(JSON.stringify(value, (_key, item) => (
+    typeof item === 'bigint'
+      ? { __clawpilotCommerceBigIntV1: item.toString() }
+      : item
+  )), 'utf8')
+}
+
+function decodeCommerceIntakeReadResult(
+  payload: Buffer,
+): CommerceIntakeReadResultPayload {
+  const value = JSON.parse(payload.toString('utf8'), (_key, item) => {
+    const marker = item && typeof item === 'object' && !Array.isArray(item)
+      ? (item as Record<string, unknown>).__clawpilotCommerceBigIntV1
+      : null
+    if (
+      item
+      && typeof item === 'object'
+      && !Array.isArray(item)
+      && Object.keys(item).length === 1
+      && typeof marker === 'string'
+      && /^-?[0-9]+$/.test(marker)
+    ) {
+      return BigInt(marker)
+    }
+    return item
+  }) as CommerceIntakeReadResultPayload
+  if (
+    !value
+    || typeof value !== 'object'
+    || !value.envelope
+    || typeof value.envelope !== 'object'
+    || Array.isArray(value.envelope)
+    || !value.page
+    || typeof value.page !== 'object'
+    || Array.isArray(value.page)
+  ) {
+    throw new Error('invalid read result')
+  }
+  return value
+}
+
+function normalizeCommerceIntakeContinuation(
+  value: CommerceIntakeContinuationPayload,
+): CommerceIntakeContinuationPayload {
+  return {
+    orderCursor: printable(
+      value?.orderCursor,
+      'Commerce intake provider cursor',
+      1,
+      4096,
+    ),
+  }
+}
+
 export function encryptCommerceCredential(
   credentialValue: CommerceCredentialPayload,
   organizationId: unknown,
@@ -448,5 +616,249 @@ export function decryptCommerceWebhookPayload(
     ])
   } catch {
     throw new Error('Stored commerce webhook payload could not be decrypted')
+  }
+}
+
+export function encryptCommerceCandidateSnapshot(
+  value: Record<string, unknown>,
+  organizationId: unknown,
+  accountGlobalId: unknown,
+  externalOrderId: unknown,
+  sourceHash: unknown,
+  kind: 'party' | 'ship_to',
+): EncryptedCommerceValue & { hash: string; encryptionVersion: 1 } {
+  const payload = Buffer.from(JSON.stringify(value), 'utf8')
+  if (payload.byteLength < 2 || payload.byteLength > 65_536) {
+    throw new Error('Commerce candidate snapshot must be 2-65536 bytes')
+  }
+  const iv = crypto.randomBytes(12)
+  const key = encryptionKey()
+  const authenticatedData = candidateSnapshotAuthenticatedData(
+    organizationId,
+    accountGlobalId,
+    externalOrderId,
+    sourceHash,
+    kind,
+  )
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv)
+  cipher.setAAD(authenticatedData)
+  const ciphertext = Buffer.concat([cipher.update(payload), cipher.final()])
+  return {
+    ciphertext,
+    iv,
+    tag: cipher.getAuthTag(),
+    hash: crypto.createHmac('sha256', key)
+      .update('clawpilot:commerce:candidate-snapshot-digest:v1\0', 'utf8')
+      .update(authenticatedData)
+      .update(payload)
+      .digest('hex'),
+    encryptionVersion: 1,
+  }
+}
+
+export function decryptCommerceCandidateSnapshot(
+  fields: EncryptedCommerceValue,
+  organizationId: unknown,
+  accountGlobalId: unknown,
+  externalOrderId: unknown,
+  sourceHash: unknown,
+  kind: 'party' | 'ship_to',
+): Record<string, unknown> {
+  try {
+    const decipher = crypto.createDecipheriv(
+      'aes-256-gcm',
+      encryptionKey(),
+      fields.iv,
+    )
+    decipher.setAAD(candidateSnapshotAuthenticatedData(
+      organizationId,
+      accountGlobalId,
+      externalOrderId,
+      sourceHash,
+      kind,
+    ))
+    decipher.setAuthTag(fields.tag)
+    const value = JSON.parse(Buffer.concat([
+      decipher.update(fields.ciphertext),
+      decipher.final(),
+    ]).toString('utf8'))
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new Error('invalid snapshot')
+    }
+    return value as Record<string, unknown>
+  } catch {
+    throw new Error('Stored commerce candidate snapshot could not be decrypted')
+  }
+}
+
+export function encryptCommerceIntakeReadResult(
+  value: CommerceIntakeReadResultPayload,
+  organizationId: unknown,
+  accountGlobalId: unknown,
+  provider: unknown,
+  intentId: unknown,
+  providerAttemptId: unknown,
+  requestHash: unknown,
+): EncryptedCommerceValue & {
+  hash: string
+  bytes: number
+  encryptionVersion: 1
+} {
+  const payload = encodeCommerceIntakeReadResult(value)
+  if (payload.byteLength < 2 || payload.byteLength > 8_388_608) {
+    throw new Error(
+      'Commerce intake read result must be 2-8388608 bytes',
+    )
+  }
+  const iv = crypto.randomBytes(12)
+  const key = encryptionKey()
+  const authenticatedData = intakeReadResultAuthenticatedData(
+    organizationId,
+    accountGlobalId,
+    provider,
+    intentId,
+    providerAttemptId,
+    requestHash,
+  )
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv)
+  cipher.setAAD(authenticatedData)
+  const ciphertext = Buffer.concat([cipher.update(payload), cipher.final()])
+  return {
+    ciphertext,
+    iv,
+    tag: cipher.getAuthTag(),
+    hash: crypto.createHmac('sha256', key)
+      .update('clawpilot:commerce:intake-read-result-digest:v1\0', 'utf8')
+      .update(authenticatedData)
+      .update(payload)
+      .digest('hex'),
+    bytes: payload.byteLength,
+    encryptionVersion: 1,
+  }
+}
+
+export function decryptCommerceIntakeReadResult(
+  fields: EncryptedCommerceValue,
+  organizationId: unknown,
+  accountGlobalId: unknown,
+  provider: unknown,
+  intentId: unknown,
+  providerAttemptId: unknown,
+  requestHash: unknown,
+  expectedHash?: unknown,
+): CommerceIntakeReadResultPayload {
+  try {
+    const key = encryptionKey()
+    const authenticatedData = intakeReadResultAuthenticatedData(
+      organizationId,
+      accountGlobalId,
+      provider,
+      intentId,
+      providerAttemptId,
+      requestHash,
+    )
+    const decipher = crypto.createDecipheriv(
+      'aes-256-gcm',
+      key,
+      fields.iv,
+    )
+    decipher.setAAD(authenticatedData)
+    decipher.setAuthTag(fields.tag)
+    const payload = Buffer.concat([
+      decipher.update(fields.ciphertext),
+      decipher.final(),
+    ])
+    if (expectedHash !== undefined) {
+      const normalizedExpectedHash = String(expectedHash || '')
+        .trim()
+        .toLowerCase()
+      const computedHash = crypto.createHmac('sha256', key)
+        .update('clawpilot:commerce:intake-read-result-digest:v1\0', 'utf8')
+        .update(authenticatedData)
+        .update(payload)
+        .digest('hex')
+      if (
+        !/^[a-f0-9]{64}$/.test(normalizedExpectedHash)
+        || !crypto.timingSafeEqual(
+          Buffer.from(computedHash, 'hex'),
+          Buffer.from(normalizedExpectedHash, 'hex'),
+        )
+      ) {
+        throw new Error('read result digest mismatch')
+      }
+    }
+    return decodeCommerceIntakeReadResult(payload)
+  } catch {
+    throw new Error(
+      'Stored commerce intake read result could not be decrypted',
+    )
+  }
+}
+
+export function encryptCommerceIntakeContinuation(
+  value: CommerceIntakeContinuationPayload,
+  organizationId: unknown,
+  accountGlobalId: unknown,
+  provider: unknown,
+  sessionId: unknown,
+  batchNumber: unknown,
+  queryHash: unknown,
+): EncryptedCommerceValue & { hash: string; encryptionVersion: 1 } {
+  const normalized = normalizeCommerceIntakeContinuation(value)
+  const payload = Buffer.from(JSON.stringify(normalized), 'utf8')
+  if (payload.byteLength < 2 || payload.byteLength > 8192) {
+    throw new Error('Commerce intake continuation must be 2-8192 bytes')
+  }
+  const iv = crypto.randomBytes(12)
+  const cipher = crypto.createCipheriv('aes-256-gcm', encryptionKey(), iv)
+  cipher.setAAD(intakeContinuationAuthenticatedData(
+    organizationId,
+    accountGlobalId,
+    provider,
+    sessionId,
+    batchNumber,
+    queryHash,
+  ))
+  const ciphertext = Buffer.concat([cipher.update(payload), cipher.final()])
+  return {
+    ciphertext,
+    iv,
+    tag: cipher.getAuthTag(),
+    hash: crypto.createHash('sha256').update(payload).digest('hex'),
+    encryptionVersion: 1,
+  }
+}
+
+export function decryptCommerceIntakeContinuation(
+  fields: EncryptedCommerceValue,
+  organizationId: unknown,
+  accountGlobalId: unknown,
+  provider: unknown,
+  sessionId: unknown,
+  batchNumber: unknown,
+  queryHash: unknown,
+): CommerceIntakeContinuationPayload {
+  try {
+    const decipher = crypto.createDecipheriv(
+      'aes-256-gcm',
+      encryptionKey(),
+      fields.iv,
+    )
+    decipher.setAAD(intakeContinuationAuthenticatedData(
+      organizationId,
+      accountGlobalId,
+      provider,
+      sessionId,
+      batchNumber,
+      queryHash,
+    ))
+    decipher.setAuthTag(fields.tag)
+    const value = JSON.parse(Buffer.concat([
+      decipher.update(fields.ciphertext),
+      decipher.final(),
+    ]).toString('utf8')) as CommerceIntakeContinuationPayload
+    return normalizeCommerceIntakeContinuation(value)
+  } catch {
+    throw new Error('Stored commerce intake continuation could not be decrypted')
   }
 }
