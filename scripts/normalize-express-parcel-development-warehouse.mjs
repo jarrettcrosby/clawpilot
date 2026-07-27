@@ -1083,20 +1083,6 @@ async function prepare(client, config) {
       [TARGET.organizationId],
     )
     await client.query(
-      `UPDATE operations_contract_versions version
-       SET status = 'retired',
-           effective_to = CASE
-             WHEN effective_to IS NULL AND effective_from < now() THEN now()
-             ELSE effective_to
-           END
-       FROM operations_contracts contract
-       WHERE version.organization_id = $1::uuid
-         AND version.contract_id = contract.id
-         AND contract.name LIKE 'Mock proof fulfillment %'
-         AND version.status <> 'retired'`,
-      [TARGET.organizationId],
-    )
-    await client.query(
       `UPDATE operations_contracts
        SET status = 'terminated', updated_at = now()
        WHERE organization_id = $1::uuid

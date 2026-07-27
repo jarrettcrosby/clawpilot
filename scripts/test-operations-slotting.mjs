@@ -219,6 +219,12 @@ for (const fragment of [
     `Express Parcel normalization missing ${fragment}`,
   )
 }
+assert.equal(
+  /\b(?:UPDATE|DELETE\s+FROM)\s+operations_contract_versions\b/i
+    .test(normalization),
+  false,
+  'Normalization must preserve immutable operations contract-version evidence',
+)
 const simulationMain = simulation.slice(
   simulation.indexOf('async function main()'),
 )
