@@ -130,6 +130,7 @@ includes(shopifyQuerySource, [
   'orders(',
   'first: ${SHOPIFY_ORDER_PAGE_SIZE}',
   'after: $after',
+  'sortKey: ID',
   'endCursor',
   'currentQuantity',
   'unfulfilledQuantity',
@@ -160,6 +161,11 @@ assert.doesNotMatch(
   shopifyQuerySource,
   /\bmutation\b/i,
   'Shopify intake GraphQL must remain read-only',
+)
+assert.doesNotMatch(
+  shopifyQuerySource,
+  /productVariants\([\s\S]*?sortKey:\s*UPDATED_AT/,
+  'Shopify product-variant intake must use a supported 2026-07 sort key',
 )
 
 includes(serviceSource, [
@@ -901,6 +907,18 @@ const service = loadTypeScriptModule(
           if (
             request.operationName === 'ClawPilotCommerceProductVariants'
           ) {
+            assert.match(
+              request.query,
+              /productVariants\([\s\S]*?sortKey:\s*ID/,
+            )
+            assert.doesNotMatch(
+              request.query,
+              /productVariants\([\s\S]*?sortKey:\s*UPDATED_AT/,
+            )
+            assert.match(
+              request.variables.query,
+              /^updated_at:<='[^']+'$/,
+            )
             const secondPage = Boolean(request.variables.after)
             if (secondPage) {
               assert.equal(
