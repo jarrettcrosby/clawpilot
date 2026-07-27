@@ -195,6 +195,11 @@ function verifySourceContracts() {
     'FOR UPDATE OF job SKIP LOCKED',
     'LEASE_EXPIRED',
     'physicalOutputVerified: false',
+    'artifact.content_sha256 AS artifact_content_sha256',
+    'source_label.environment AS carrier_environment',
+    'source_package.length_mm AS package_length_mm',
+    "NULLIF(source_order.ship_to->>'name', '') AS ship_to_name",
+    'warehouse.name AS warehouse_name',
   ]) {
     assert.ok(
       persistence.includes(fragment),
@@ -227,6 +232,19 @@ function verifySourceContracts() {
     'private, no-store',
   ]) {
     assert.ok(operatorRoute.includes(fragment), `Missing print-job route contract: ${fragment}`)
+  }
+  const panel = read('app_src/components/operations/PrinterConfigurationPanel.tsx')
+  for (const fragment of [
+    'Print job details',
+    'Agent heartbeat',
+    'Last device delivery',
+    'Destination and package',
+    'Routing and device',
+    'Document integrity',
+    'Lifecycle and lineage',
+    'Delivery history',
+  ]) {
+    assert.ok(panel.includes(fragment), `Missing print-job detail contract: ${fragment}`)
   }
   const managementRoute = read('app_src/app/api/operations/print-agents/route.ts')
   for (const fragment of [
@@ -1032,6 +1050,10 @@ async function verifyPostgresAcceptance(connectionString) {
 async function main() {
   verifySourceContracts()
   verifyOwnedTypeContracts()
+  if (process.argv.includes('--contracts-only')) {
+    console.log('Operations print-delivery source and type contracts passed.')
+    return
+  }
   command('docker', ['info'], { timeout: 30_000 })
 
   const container = `clawpilot-print-delivery-${process.pid}-${randomUUID().slice(0, 8)}`

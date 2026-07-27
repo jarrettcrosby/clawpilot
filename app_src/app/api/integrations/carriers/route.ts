@@ -182,7 +182,7 @@ export async function PATCH(req: NextRequest) {
     }
     if (action === 'create-account') {
       only(body, [
-        'action', 'provider', 'environment', 'displayName', 'accountNumber',
+        'action', 'provider', 'environment', 'displayName', 'senderName', 'accountNumber',
         'registeredAddress', 'allowSenderBilling', 'allowRecipientBilling',
         'allowThirdPartyBilling',
       ])
@@ -191,6 +191,7 @@ export async function PATCH(req: NextRequest) {
         provider: body.provider,
         environment: body.environment,
         displayName: body.displayName,
+        senderName: body.senderName,
         accountNumber: body.accountNumber,
         registeredAddress: body.registeredAddress,
         allowSenderBilling: body.allowSenderBilling,
@@ -203,7 +204,7 @@ export async function PATCH(req: NextRequest) {
     if (action === 'update-account') {
       only(body, [
         'action', 'provider', 'environment', 'carrierAccountGlobalId',
-        'displayName', 'accountNumber', 'registeredAddress',
+        'displayName', 'senderName', 'accountNumber', 'registeredAddress',
         'allowSenderBilling', 'allowRecipientBilling', 'allowThirdPartyBilling',
       ])
       const integrations = await updateCarrierAccount({
@@ -212,6 +213,7 @@ export async function PATCH(req: NextRequest) {
         environment: body.environment,
         carrierAccountGlobalId: body.carrierAccountGlobalId,
         displayName: body.displayName,
+        senderName: body.senderName,
         accountNumber: body.accountNumber,
         registeredAddress: body.registeredAddress,
         allowSenderBilling: body.allowSenderBilling,

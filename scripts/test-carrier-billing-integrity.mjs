@@ -244,13 +244,13 @@ async function seedCarrierBillingFixture(pool) {
     return insertReturningId(
       pool,
       `INSERT INTO operations_carrier_accounts (
-         organization_id, integration_account_id, display_name,
+         organization_id, integration_account_id, display_name, sender_name,
          account_number_ciphertext, account_number_iv, account_number_tag,
          account_number_last_four, account_number_fingerprint,
          registered_address, registered_address_fingerprint,
          created_by, updated_by
        ) VALUES (
-         $1, $2, $3,
+         $1, $2, $3, $3,
          $4, $5, $6,
          $7, $8,
          $9::jsonb, $10,

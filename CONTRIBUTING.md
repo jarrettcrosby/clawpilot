@@ -12,6 +12,7 @@
 
 - Keep slices small and reviewable.
 - Read relevant docs before broad refactors.
+- Use the [Codex task continuity procedure](docs/operations/codex-task-continuity.md) when work moves between desktop, phone, compaction, or fresh tasks.
 - Preserve user/runtime data unless the task explicitly says to migrate or clean it.
 - Do not commit secrets, live customer data, runtime logs, backups, or generated agent state.
 - Behavior changes require proactive documentation updates in the same slice when the behavior is user-facing, operational, data-related, integration-related, or architectural. Do not wait for the operator to request documentation.

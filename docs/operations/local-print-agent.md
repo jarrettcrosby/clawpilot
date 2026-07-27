@@ -61,6 +61,64 @@ New enrollment and rotation credentials use the versioned shape:
 
 `cpprint.v1.<agent-uuid>.<secret>`
 
+## Mac Runtime
+
+The repository includes a raw-ZPL Mac runtime for a networked Zebra printer:
+
+```bash
+CLAWPILOT_PRINT_AGENT_URL=https://dev.aiapp.eigenracing.com \
+CLAWPILOT_PRINT_AGENT_CREDENTIAL='cpprint.v1.<agent-uuid>.<secret>' \
+CLAWPILOT_PRINTER_HOST='printer-hostname-or-static-ip' \
+npm run print-agent:run
+```
+
+The runtime accepts only immutable inline UTF-8 ZPL artifacts. It verifies the
+artifact SHA-256 and byte length, writes a claim ledger under
+`~/.clawpilot/`, and connects to the printer's raw port `9100`. The credential
+may instead be read from macOS Keychain with
+`CLAWPILOT_PRINT_AGENT_KEYCHAIN_SERVICE` and
+`CLAWPILOT_PRINT_AGENT_KEYCHAIN_ACCOUNT`; do not put the credential in a
+LaunchAgent property list.
+
+Use `--probe` to test raw network reachability without claiming work. A
+separate guarded command can print a static label marked
+`VOID - NO POSTAGE`; it never invokes a carrier or creates a shipment:
+
+```bash
+CLAWPILOT_PRINTER_HOST='printer-hostname-or-static-ip' \
+npm run print-agent:test-label
+```
+
+For an always-on macOS workstation, store the enrolled credential in Keychain
+and install a user-scoped LaunchAgent:
+
+```bash
+security add-generic-password -U \
+  -s 'com.clawpilot.print-agent.dev' \
+  -a 'FHMXLAB35' \
+  -w 'cpprint.v1.<agent-uuid>.<secret>'
+
+npm run print-agent:install:macos -- \
+  --name 'FHMXLAB35 Zebra' \
+  --base-url 'https://dev.aiapp.eigenracing.com' \
+  --printer-host 'FHMXLAB35.local' \
+  --keychain-service 'com.clawpilot.print-agent.dev' \
+  --keychain-account 'FHMXLAB35'
+```
+
+The installer copies the minimal runtime into the user's Application Support
+directory, writes a credential-free property list under
+`~/Library/LaunchAgents`, and creates separate standard-output, error, and
+duplicate-fence paths. It refuses to install if the referenced Keychain item
+does not exist. Use the same arguments with `--uninstall` to stop and remove
+the LaunchAgent; the Keychain item and delivery ledger remain for an explicit
+operator cleanup.
+
+If the runtime restarts after bytes may have reached the printer but before an
+acknowledgement is recorded, it reports `PRINT_OUTCOME_UNCERTAIN` and fences
+automatic resend. An operator must inspect the device and use the controlled
+retry or reprint workflow.
+
 The route does not use a browser session. Every claim, acknowledgement, and failure requires a caller-stable `Idempotency-Key` header containing 8 to 200 letters, numbers, periods, underscores, colons, or hyphens.
 
 ### Claim
@@ -169,6 +227,7 @@ putting document contents into audit payloads.
 ```bash
 node scripts/test-operation-printing.mjs
 node scripts/test-operation-print-agent-runtime.mjs
+node scripts/test-macos-print-agent-installer.mjs
 node scripts/test-operations-print-delivery.mjs
 npm run lint
 ```

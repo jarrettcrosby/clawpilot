@@ -53,6 +53,7 @@ Current product behavior is defined by active module and operating contracts. Op
 ### Operations
 
 - [ClawPilot environments and deployment](operations/clawpilot-environments.md)
+- [Codex task continuity](operations/codex-task-continuity.md)
 - [Demo account](operations/public-demo-environment.md)
 - [Agent security and integration isolation](operations/agent-security-and-isolation.md)
 - [Knowledge vault organization](operations/knowledge-vault-organization.md)

@@ -91,6 +91,7 @@ export default function AppHeader({
   const [buildInfo, setBuildInfo] = useState<{ short: string; hash: string; subject: string; date: string; dirty: boolean; dirtyCount: number } | null>(null)
   const [buildOpen, setBuildOpen] = useState(false)
   const [userAccessOpen, setUserAccessOpen] = useState(false)
+  const [settingsInitialTab, setSettingsInitialTab] = useState(0)
   const [runtimeInfo, setRuntimeInfo] = useState<{
     lane: string
     port: string
@@ -107,6 +108,20 @@ export default function AppHeader({
     if (drawerOpen || activityState.workspaceRevision !== workspaceRevision) return 0
     return getReadCount(activityState.events)
   }, [activityState, drawerOpen, workspaceRevision])
+
+  useEffect(() => {
+    const params = new URL(window.location.href).searchParams
+    if (
+      params.get('settings') === 'integrations'
+      && params.get('integration') === 'commerce'
+    ) {
+      const frame = window.requestAnimationFrame(() => {
+        setSettingsInitialTab(3)
+        setUserAccessOpen(true)
+      })
+      return () => window.cancelAnimationFrame(frame)
+    }
+  }, [])
 
   useEffect(() => {
     let active = true
@@ -418,7 +433,14 @@ export default function AppHeader({
         </DialogActions>
       </Dialog>
 
-      <UserAccessDialog open={userAccessOpen} onClose={() => setUserAccessOpen(false)} />
+      <UserAccessDialog
+        open={userAccessOpen}
+        initialTab={settingsInitialTab}
+        onClose={() => {
+          setUserAccessOpen(false)
+          setSettingsInitialTab(0)
+        }}
+      />
 
       <Popover
         open={Boolean(runtimeAnchor)}

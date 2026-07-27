@@ -156,12 +156,36 @@ export type OperationsPrintJobListItem = {
   format: PrintFormat | null
   media: PrintMedia | null
   artifactGlobalId: string | null
+  artifactContentSha256: string | null
+  artifactByteLength: number | null
+  artifactCreatedBy: string | null
+  artifactCreatedAt: string | null
   sourceLabelGlobalId: string | null
   sourceLabelStatus: string | null
+  carrier: string | null
+  carrierServiceCode: string | null
+  carrierEnvironment: string | null
+  labelCreatedAt: string | null
+  labelVoidedAt: string | null
+  labelVoidedBy: string | null
   sourceOrderGlobalId: string | null
   sourceOrderNumber: string | null
   sourceShipmentGlobalId: string | null
   trackingNumber: string | null
+  packageGlobalId: string | null
+  packageNumber: number | null
+  packageLengthMm: number | null
+  packageWidthMm: number | null
+  packageHeightMm: number | null
+  packageWeightGrams: number | null
+  shipToName: string | null
+  shipToCity: string | null
+  shipToRegion: string | null
+  shipToPostalCode: string | null
+  shipToCountry: string | null
+  warehouseGlobalId: string
+  warehouseName: string
+  stationType: PrinterStationType
   printerGlobalId: string
   printerName: string
   requestedPrinterGlobalId: string

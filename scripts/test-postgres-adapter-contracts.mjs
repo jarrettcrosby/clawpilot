@@ -1440,6 +1440,7 @@ assertIncludes(authProxy, '/api/agents/research/process', 'auth proxy public age
 assertIncludes(authProxy, '/api/agents/repository-runs/process', 'auth proxy public repository worker route')
 assertIncludes(authProxy, '/api/integrations/toast/process', 'auth proxy public Toast worker route')
 assertIncludes(authProxy, '/api/integrations/quickbooks/process', 'auth proxy public QuickBooks worker route')
+assertIncludes(authProxy, '/api/operations/print-agent/jobs', 'auth proxy public print-agent transport route')
 assertIncludes(authProxy, 'HOSTED_RUNTIME', 'auth proxy fail-closed hosted mode')
 
 const loginRoute = read('app_src/app/api/auth/login/route.ts')
@@ -1550,6 +1551,10 @@ for (const migration of [
   '0104_demo_managed_resource_guard.sql',
   '0105_quickbooks_pos_evidence_refresh.sql',
   '0106_toast_location_closeout_hour.sql',
+  '0107_operations_warehouse_operating_profile.sql',
+  '0108_operations_slotting_and_replenishment.sql',
+  '0109_operations_replenishment_execution.sql',
+  '0110_operations_carrier_account_sender_name.sql',
 ]) {
   assertIncludes(healthRoute, migration, 'hosted POS and accounting migration health')
 }

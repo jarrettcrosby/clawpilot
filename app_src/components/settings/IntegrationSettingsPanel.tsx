@@ -10,26 +10,41 @@ import HubRounded from '@mui/icons-material/HubRounded'
 import LocalShippingRounded from '@mui/icons-material/LocalShippingRounded'
 import ManageSearchRounded from '@mui/icons-material/ManageSearchRounded'
 import RestaurantRounded from '@mui/icons-material/RestaurantRounded'
+import StorefrontRounded from '@mui/icons-material/StorefrontRounded'
 import CarrierIntegrationPanel from './CarrierIntegrationPanel'
+import CommerceIntegrationPanel from './CommerceIntegrationPanel'
 import EmbeddingSettingsPanel from './EmbeddingSettingsPanel'
 import GoogleWorkspaceIntegrationPanel from './GoogleWorkspaceIntegrationPanel'
 import MatonIntegrationPanel from './MatonIntegrationPanel'
 import QuickBooksIntegrationPanel from './QuickBooksIntegrationPanel'
 import ToastIntegrationPanel from './ToastIntegrationPanel'
 
-type IntegrationKey = 'google' | 'maton' | 'quickbooks' | 'toast' | 'shipping' | 'knowledge'
+type IntegrationKey =
+  | 'google'
+  | 'maton'
+  | 'quickbooks'
+  | 'toast'
+  | 'commerce'
+  | 'shipping'
+  | 'knowledge'
 
 export default function IntegrationSettingsPanel({
+  initialIntegration,
   isOwner,
   canManageOrganizationIntegrations,
   canManageOperationsIntegrations,
 }: {
+  initialIntegration?: 'commerce'
   isOwner: boolean
   canManageOrganizationIntegrations: boolean
   canManageOperationsIntegrations: boolean
 }) {
   const [activeIntegration, setActiveIntegration] = useState<IntegrationKey>(
-    isOwner || canManageOrganizationIntegrations ? (isOwner ? 'google' : 'maton') : 'shipping',
+    initialIntegration === 'commerce' && canManageOperationsIntegrations
+      ? 'commerce'
+      : isOwner || canManageOrganizationIntegrations
+        ? (isOwner ? 'google' : 'maton')
+        : 'shipping',
   )
 
   if (!canManageOrganizationIntegrations && !canManageOperationsIntegrations) {
@@ -46,6 +61,7 @@ export default function IntegrationSettingsPanel({
         { key: 'maton' as const, label: 'Maton', icon: <HubRounded sx={{ fontSize: 18 }} /> },
         { key: 'quickbooks' as const, label: 'QuickBooks', icon: <AccountBalanceRounded sx={{ fontSize: 18 }} /> },
         { key: 'toast' as const, label: 'Toast', icon: <RestaurantRounded sx={{ fontSize: 18 }} /> },
+        { key: 'commerce' as const, label: 'Sales channels', icon: <StorefrontRounded sx={{ fontSize: 18 }} /> },
         { key: 'shipping' as const, label: 'Shipping', icon: <LocalShippingRounded sx={{ fontSize: 18 }} /> },
         { key: 'knowledge' as const, label: 'Knowledge', icon: <ManageSearchRounded sx={{ fontSize: 18 }} /> },
       ]
@@ -56,6 +72,7 @@ export default function IntegrationSettingsPanel({
           { key: 'toast' as const, label: 'Toast', icon: <RestaurantRounded sx={{ fontSize: 18 }} /> },
         ] : []),
         ...(canManageOperationsIntegrations ? [
+          { key: 'commerce' as const, label: 'Sales channels', icon: <StorefrontRounded sx={{ fontSize: 18 }} /> },
           { key: 'shipping' as const, label: 'Shipping', icon: <LocalShippingRounded sx={{ fontSize: 18 }} /> },
         ] : []),
       ]
@@ -115,6 +132,11 @@ export default function IntegrationSettingsPanel({
       {activeIntegration === 'shipping' ? (
         <Box role="tabpanel" id="integration-panel-shipping" aria-labelledby="integration-tab-shipping">
           <CarrierIntegrationPanel />
+        </Box>
+      ) : null}
+      {activeIntegration === 'commerce' ? (
+        <Box role="tabpanel" id="integration-panel-commerce" aria-labelledby="integration-tab-commerce">
+          <CommerceIntegrationPanel />
         </Box>
       ) : null}
       {activeIntegration === 'knowledge' && isOwner ? (

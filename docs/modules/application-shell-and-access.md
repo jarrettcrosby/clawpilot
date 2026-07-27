@@ -38,6 +38,7 @@ Provide a responsive, authenticated ClawPilot workspace with clear user identity
 - An invitation must assign the person to an existing organization or deliberately create a child organization. It must never synthesize a personal organization from the person's name or email.
 - Organization membership and hierarchy placement define the user's data graph. The global `owner`, `admin`, or `member` role plus explicit permissions controls application administration.
 - Each user manages name, job title, organization, timezone, locale, integrations, and sharing in Settings. Profile changes update that user's CRM Contact and organization membership projection.
+- Settings > Integrations exposes **Sales channels** to the owner and users with **Manage operations** permission. That panel manages organization-scoped Shopify/Faire commerce credentials and capability evidence without exposing Google, QuickBooks, Toast, user-access administration, or plaintext provider secrets. Commerce remains separate from the restaurant POS surface.
 - Timestamps are stored in UTC and rendered in the signed-in user's timezone and locale.
 - ChatGPT/Codex authorization is stored per ClawPilot user. One user's credential cannot authorize another user's agent execution.
 - Activity is independent from the selected board or pipeline. Every user can review events they performed and security events targeting their account.

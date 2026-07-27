@@ -37,6 +37,14 @@ As of 2026-07-23, the development environment has completed the bounded Phase 2 
 
 The exception queue deliberately stays separate from Projects tasks. An exception owns operational status and evidence. A later adapter may create or link a Projects task for collaborative work without transferring exception authority to the task module.
 
+### Implemented inbound receiving checkpoint
+
+The first advanced-WMS execution slice now supports expected inbound receipts with multiple product and lot lines, an active warehouse and inventory-ownership pool, optional manual destinations, and automatic capacity-aware putaway. Automatic placement considers only active leaf storage or pick locations. It rejects restricted products, disallowed mixed-product storage, product quantity limits, maximum cubic volume, and maximum weight. It prefers an explicit product-location rule, then an existing location for the same product, then storage over pick locations. **Pick route order is only the final tie-breaker**; it is not customer, order, allocation, or replenishment priority.
+
+Receipt creation and completion are separate idempotent Postgres commands. Completion locks and version-checks the receipt, revalidates the planned location instead of silently rerouting inventory, updates the materialized position, and writes accepted and damaged quantities to the immutable inventory ledger with event and audit evidence. Capacity calculations use product package dimensions and weight normalized by `units_per_package`; a configured capacity fails closed when the package profile is missing or existing contents cannot be measured.
+
+This checkpoint posts canonical inventory units only. Case and pallet conversion remains disabled until a versioned UOM conversion profile exists. Provider ASN import, receiving appointments, partial/short-receipt exception handling, quarantine workflows, lot expiration, serial capture, LPNs, replenishment, and directed picking remain Phase 7 work. Product placement rules are enforced for this receipt-putaway path; they do not yet claim directed replenishment or picking.
+
 ## Delivery Phases
 
 ### Phase 0 - Discovery And Architecture
@@ -154,7 +162,7 @@ The exception queue deliberately stays separate from Projects tasks. An exceptio
 
 **Scope**
 
-- Certify Shopify, BigCommerce, and Etsy adapter capability contracts for their actual supported features.
+- Certify Shopify, Faire, BigCommerce, and Etsy adapter capability contracts for their actual supported features; Faire remains a polling-only B2B marketplace rather than a webhook or POS integration.
 - Certify USPS, UPS, and FedEx account, rate, label, void, tracking, and reconciliation capabilities used by the release.
 - Add webhook registration/signature verification, cursor sync, scheduled reconciliation, dead-letter replay, inventory export, fulfillment export, and integration-health UI.
 
@@ -163,6 +171,12 @@ The exception queue deliberately stays separate from Projects tasks. An exceptio
 - Provider sandboxes pass contract and fault-injection suites.
 - Each production adapter receives a separately recorded credential/account verification and one authorized live smoke test that creates no customer-impacting shipment unless explicitly approved.
 - S01-S06 and S19 rerun through the real adapter boundary; unsupported capabilities remain visibly disabled.
+
+**Implemented control-plane foundation**
+
+- Migration `0111` adds write-only encrypted Shopify/Faire credentials, immutable provider identity, monotonic credential generations, version/capability evidence, immutable Shopify encrypted receipt deduplication, resource cursors, and finalize-once provider-attempt/retry/dead-letter structures.
+- Settings exposes **Sales channels** separately from Toast POS. Shopify Dev Dashboard client credentials are exchanged for non-persisted 24-hour tokens against the fixed store origin, while Faire brand-token probes use the fixed production origin; both connections default disabled.
+- Shopify signed receipt intake may be explicitly enabled only after API verification and a valid signed app-scope, product, or inventory delivery proves the exact credential generation. Order/customer topics remain rejected until retention, erasure, privacy-response, and canonical processing exist. Provider writes, Shopify multi-merchant OAuth, zero-downtime dual-secret rotation, webhook registration, polling, reconciliation, replay, and fulfillment export remain Phase 6 exit work.
 
 ### Phase 7 - Advanced WMS And Reverse Logistics
 
@@ -309,7 +323,7 @@ The scenario ID is stable and must appear in the eventual test name, CI output, 
 
 | ID | Required scenario | Earliest owning phase | Automated level and decisive assertion |
 | --- | --- | --- | --- |
-| S01 | Duplicate Shopify webhook imports one order. | 2 fixture; 6 provider | Adapter + Postgres concurrency: one receipt, one canonical order, one import event, replay returns the first result. |
+| S01 | Duplicate Shopify webhook imports one order. | 2 fixture; 6 provider | Current control-plane tests prove raw-body HMAC and exact receipt-deduplication boundaries only. Phase 6 still requires Postgres concurrency proving one receipt, one canonical order, one import event, and replay of the first result. |
 | S02 | Imported order links to the correct CRM customer through Global ID. | 2 | Integration: order references the authorized pipeline customer UUID and expected permanent `ga`; another tenant's `ga` is rejected. |
 | S03 | Channel SKUs map to correct global products. | 2 | Adapter contract: each line resolves the expected `gp`; missing/ambiguous mapping holds the order and creates no reservation. |
 | S04 | Checkout quote uses a warehouse that can fulfill the complete order. | 3 | Domain + Postgres: selected warehouse covers every line from eligible inventory; partial warehouses are recorded as rejected. |

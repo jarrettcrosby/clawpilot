@@ -46,7 +46,7 @@ This repository is the canonical source for ClawPilot product, engineering, and 
 
 ## Distributed Operations Design
 
-The following set defines the accepted authority boundary and implementation/operating contract for DOM, WMS, shipping, and 3PL billing. Bounded development workflows are implemented, but production provider mutations and accounting delivery remain pre-activation.
+The following set defines the accepted authority boundary and implementation/operating contract for DOM, WMS, shipping, commerce sales channels, and 3PL billing. Bounded development workflows and the Shopify/Faire credential/capability evidence control plane are implemented for development; hosted deployment evidence is recorded separately. Canonical commerce workers, production provider mutations, and accounting delivery remain pre-activation.
 
 - [Distributed operations integration and gap map](maps/distributed-operations-integration-gap-map.md)
 - [Distributed operations domain and architecture contract](modules/distributed-operations.md)

@@ -699,6 +699,12 @@ export type OperationsWorkspace = {
     address: Address
     status: 'active' | 'inactive'
     cutoffTime: string | null
+    carrierCutoffs: Record<string, string>
+    operatingDays: number[]
+    opensAt: string
+    closesAt: string
+    standardProcessingMinutes: number
+    dailyOrderCapacity: number | null
     rowVersion: number
     locations: Array<{
       id: string
@@ -710,6 +716,7 @@ export type OperationsWorkspace = {
       parentLocationGlobalId: string | null
       pickSequence: number
       active: boolean
+      storageFunction: 'work_area' | 'reserve' | 'bulk' | 'forward_pick' | 'mezzanine_pick' | 'flow_rack' | 'staging'
       maxVolumeCubicMeters: number | null
       maxWeightKg: number | null
       usedVolumeCubicMeters: number
@@ -723,9 +730,35 @@ export type OperationsWorkspace = {
         productName: string
         ruleType: 'allowed' | 'preferred' | 'restricted'
         maxQuantity: number | null
+        replenishmentMode: 'disabled' | 'min_max' | 'order_demand'
+        replenishmentSourceLocationGlobalId: string | null
+        replenishmentSourceLocationCode: string | null
+        minQuantity: number | null
+        targetQuantity: number | null
         active: boolean
       }>
     }>
+  }>
+  replenishmentRecommendations: Array<{
+    warehouseGlobalId: string
+    warehouseName: string
+    productGlobalId: string
+    productName: string
+    productSku: string | null
+    inventoryPoolGlobalId: string
+    inventoryPoolName: string
+    sourceLocationGlobalId: string
+    sourceLocationCode: string
+    destinationLocationGlobalId: string
+    destinationLocationCode: string
+    replenishmentMode: 'min_max' | 'order_demand'
+    availableAtSource: number
+    availableAtDestination: number
+    releasedDemand: number
+    minQuantity: number | null
+    targetQuantity: number
+    recommendedQuantity: number
+    explanation: string
   }>
   inventoryPools: Array<{
     id: string
@@ -800,11 +833,31 @@ export type OperationsInboundReceiptInput = {
   expectedAt: string | null
   lines: Array<{
     productGlobalId: string
-    targetLocationGlobalId: string
+    targetLocationGlobalId?: string | null
     expectedQuantity: number
     lotCode: string
     unitOfMeasure: string
   }>
+}
+
+export type OperationsPutawayPlacement = {
+  lineGlobalId: string
+  productGlobalId: string
+  targetLocationGlobalId: string
+  targetLocationCode: string
+  strategy: 'manual' | 'preferred_rule' | 'same_product' | 'route_order'
+  explanation: string
+  projectedVolumeCubicMeters: number | null
+  projectedWeightKg: number | null
+}
+
+export type OperationsInboundReceiptCreationResult = {
+  receiptGlobalId: string
+  status: 'expected'
+  rowVersion: number
+  expectedQuantity: number
+  placements: OperationsPutawayPlacement[]
+  replayed: boolean
 }
 
 export type OperationsInboundReceiptCompletionInput = {
@@ -825,6 +878,30 @@ export type OperationsInboundReceiptCommandResult = {
   receivedQuantity: number
   damagedQuantity: number
   positionGlobalIds: string[]
+  replayed: boolean
+}
+
+export type OperationsReplenishmentExecutionInput = {
+  sourceLocationGlobalId: string
+  destinationLocationGlobalId: string
+  inventoryPoolGlobalId: string
+  productGlobalId: string
+  quantity: number
+}
+
+export type OperationsReplenishmentExecutionResult = {
+  replenishmentTaskGlobalId: string
+  status: 'completed'
+  warehouseGlobalId: string
+  productGlobalId: string
+  inventoryPoolGlobalId: string
+  sourceLocationGlobalId: string
+  sourceLocationCode: string
+  destinationLocationGlobalId: string
+  destinationLocationCode: string
+  movedQuantity: number
+  sourceAvailableAfter: number
+  destinationAvailableAfter: number
   replayed: boolean
 }
 

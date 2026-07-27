@@ -204,6 +204,10 @@ assert.equal(
 )
 assert.equal(upsCreateBody.ShipmentRequest.Shipment.Service.Code, '03')
 assert.equal(upsCreateBody.ShipmentRequest.LabelSpecification.LabelImageFormat.Code, 'ZPL')
+assert.equal(
+  upsCreateBody.ShipmentRequest.LabelSpecification.HTTPUserAgent,
+  'Mozilla/4.5',
+)
 assert.deepEqual(plain({
   provider: upsCreateResult.provider,
   trackingNumber: upsCreateResult.trackingNumber,
@@ -294,6 +298,30 @@ assert.equal(upsVoidResult.voided, true)
 assert.equal(upsVoidResult.trackingNumber, upsCreateResult.trackingNumber)
 assert.equal(upsVoidResult.providerReference, upsCreateResult.providerLabelId)
 assertEvidenceRedacted(upsVoidResult)
+
+const upsMaskedVoidResult = await voidCarrierSandboxLabel({
+  ...runtime('ups_rest', '03'),
+  trackingNumber: '1ZXXXXXXXXXXXXXXXX',
+  providerReference: '1ZXXXXXXXXXXXXXXXX',
+}, {
+  fetchImpl: async () => jsonResponse({
+    response: {
+      errors: [{
+        code: '190102',
+        message: 'No shipment found within the allowed void period',
+      }],
+    },
+  }, { status: 400 }),
+})
+assert.equal(upsMaskedVoidResult.voided, true)
+assert.deepEqual(plain(upsMaskedVoidResult.evidence.redactedResponse), {
+  trackingNumber: '1ZXXXXXXXXXXXXXXXX',
+  providerReference: '1ZXXXXXXXXXXXXXXXX',
+  voided: true,
+  providerState: 'not_found',
+  providerCode: '190102',
+})
+assertEvidenceRedacted(upsMaskedVoidResult)
 
 const fedexVoidCalls = []
 const fedexVoidResult = await voidCarrierSandboxLabel({

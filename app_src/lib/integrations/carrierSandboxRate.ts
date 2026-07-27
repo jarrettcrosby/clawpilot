@@ -5,7 +5,35 @@ import {
   type CarrierRuntimeCredential,
 } from '@/lib/integrations/carrierCredentialClient'
 
-export const CARRIER_SANDBOX_RATE_FIXTURE = {
+export type CarrierSandboxRateFixture = {
+  origin: {
+    name: string
+    street: string
+    city: string
+    state: string
+    postalCode: string
+    countryCode: string
+  }
+  destination: {
+    name: string
+    street: string
+    city: string
+    state: string
+    postalCode: string
+    countryCode: string
+  }
+  parcel: {
+    description: string
+    length: number
+    width: number
+    height: number
+    dimensionUnit: 'IN'
+    weight: number
+    weightUnit: 'LB'
+  }
+}
+
+export const CARRIER_SANDBOX_RATE_FIXTURE: CarrierSandboxRateFixture = {
   origin: {
     name: 'John Doe',
     street: '101 Jegs Place',
@@ -31,7 +59,7 @@ export const CARRIER_SANDBOX_RATE_FIXTURE = {
     weight: 5,
     weightUnit: 'LB',
   },
-} as const
+}
 
 export type CarrierSandboxRate = {
   serviceCode: string
@@ -46,7 +74,7 @@ export type CarrierSandboxRate = {
 export type CarrierSandboxRateResult = {
   provider: 'ups_rest' | 'fedex_rest'
   environment: 'sandbox'
-  fixture: typeof CARRIER_SANDBOX_RATE_FIXTURE
+  fixture: CarrierSandboxRateFixture
   rates: CarrierSandboxRate[]
   testedAt: string
   evidenceGlobalId?: string
@@ -134,6 +162,17 @@ function hash(value: unknown) {
   return createHash('sha256').update(stable(value)).digest('hex')
 }
 
+function fixtureForSender(senderName?: string): CarrierSandboxRateFixture {
+  const normalized = String(senderName || '').trim().replace(/\s+/g, ' ')
+  return {
+    ...CARRIER_SANDBOX_RATE_FIXTURE,
+    origin: {
+      ...CARRIER_SANDBOX_RATE_FIXTURE.origin,
+      name: normalized || CARRIER_SANDBOX_RATE_FIXTURE.origin.name,
+    },
+  }
+}
+
 function providerError(status: number) {
   if ([400, 401, 403, 404, 422].includes(status)) {
     return new CarrierCredentialClientError(
@@ -156,17 +195,23 @@ function providerError(status: number) {
   )
 }
 
-function fedexRequest(accountNumber: string) {
-  const fixture = CARRIER_SANDBOX_RATE_FIXTURE
+function fedexRequest(accountNumber: string, fixture: CarrierSandboxRateFixture) {
   return {
     accountNumber: { value: accountNumber },
     rateRequestControlParameters: { returnTransitTimes: true },
     requestedShipment: {
-      shipper: { address: {
-        streetLines: [fixture.origin.street], city: fixture.origin.city,
-        stateOrProvinceCode: fixture.origin.state, postalCode: fixture.origin.postalCode,
-        countryCode: fixture.origin.countryCode,
-      } },
+      shipper: {
+        contact: {
+          personName: fixture.origin.name,
+          companyName: fixture.origin.name,
+          phoneNumber: '7405550100',
+        },
+        address: {
+          streetLines: [fixture.origin.street], city: fixture.origin.city,
+          stateOrProvinceCode: fixture.origin.state, postalCode: fixture.origin.postalCode,
+          countryCode: fixture.origin.countryCode,
+        },
+      },
       recipient: { address: {
         streetLines: [fixture.destination.street], city: fixture.destination.city,
         stateOrProvinceCode: fixture.destination.state, postalCode: fixture.destination.postalCode,
@@ -204,8 +249,7 @@ function upsParty(address: CarrierSandboxAddress) {
   }
 }
 
-function upsRequest(accountNumber: string) {
-  const fixture = CARRIER_SANDBOX_RATE_FIXTURE
+function upsRequest(accountNumber: string, fixture: CarrierSandboxRateFixture) {
   return {
     RateRequest: {
       Request: {
@@ -291,14 +335,18 @@ function parseUps(payload: Record<string, unknown>): CarrierSandboxRate[] {
   })
 }
 
-export function carrierSandboxRateRequestEvidence(provider: 'ups_rest' | 'fedex_rest') {
+export function carrierSandboxRateRequestEvidence(
+  provider: 'ups_rest' | 'fedex_rest',
+  senderName?: string,
+) {
+  const fixture = fixtureForSender(senderName)
   const request = {
     provider,
     environment: 'sandbox',
     purpose: 'sandbox_rate_test',
-    origin: CARRIER_SANDBOX_RATE_FIXTURE.origin,
-    destination: CARRIER_SANDBOX_RATE_FIXTURE.destination,
-    parcel: CARRIER_SANDBOX_RATE_FIXTURE.parcel,
+    origin: fixture.origin,
+    destination: fixture.destination,
+    parcel: fixture.parcel,
   }
   return {
     requestHash: hash(request),
@@ -308,7 +356,7 @@ export function carrierSandboxRateRequestEvidence(provider: 'ups_rest' | 'fedex_
 
 export async function requestCarrierSandboxRates(
   input: CarrierRuntimeCredential,
-  options: { fetchImpl?: typeof fetch; timeoutMs?: number } = {},
+  options: { fetchImpl?: typeof fetch; timeoutMs?: number; senderName?: string } = {},
 ): Promise<{ result: CarrierSandboxRateResult; evidence: CarrierSandboxRateEvidence }> {
   if (input.environment !== 'sandbox') {
     throw new CarrierCredentialClientError(
@@ -333,11 +381,12 @@ export async function requestCarrierSandboxRates(
   }
 
   const fetchImpl = options.fetchImpl || fetch
+  const fixture = fixtureForSender(options.senderName)
   const requestedAt = new Date().toISOString()
   const token = await requestCarrierAccessToken(input, { fetchImpl, timeoutMs: options.timeoutMs })
   const body = input.provider === 'fedex_rest'
-    ? fedexRequest(input.credential.accountNumber)
-    : upsRequest(input.credential.accountNumber)
+    ? fedexRequest(input.credential.accountNumber, fixture)
+    : upsRequest(input.credential.accountNumber, fixture)
   const transactionId = randomUUID()
   const controller = new AbortController()
   const timeoutMs = Math.max(1_000, Math.min(options.timeoutMs || 12_000, 15_000))
@@ -376,13 +425,13 @@ export async function requestCarrierSandboxRates(
       throw new CarrierCredentialClientError('The carrier returned no usable sandbox rates', 502, 'CARRIER_SANDBOX_RATE_EMPTY')
     }
     const completedAt = new Date().toISOString()
-    const safeRequest = carrierSandboxRateRequestEvidence(input.provider)
+    const safeRequest = carrierSandboxRateRequestEvidence(input.provider, fixture.origin.name)
     const safeResponse = { rateCount: rates.length, rates }
     return {
       result: {
         provider: input.provider,
         environment: 'sandbox',
-        fixture: CARRIER_SANDBOX_RATE_FIXTURE,
+        fixture,
         rates,
         testedAt: completedAt,
       },

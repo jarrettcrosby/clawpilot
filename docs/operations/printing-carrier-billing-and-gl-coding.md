@@ -57,6 +57,22 @@ Carrier label purchase and print delivery are intentionally separate idempotent 
 
 Packing slips and other operational documents will follow the same print route but do not share carrier-purchase state. Packing-slip generation is not yet active because ClawPilot still needs a logistics document renderer and durable binary-object adapter; the knowledge-document repository is not used as a substitute.
 
+## Inspect A Print Job
+
+Open **Operations > Printing > Jobs** and choose **Details** on a job. The operator record provides the information needed to investigate DOM/WMS document delivery without exposing credentials or the printable payload:
+
+- document Global ID, type, format, medium, template version, original or reprint lineage, and current status;
+- source order, shipment, carrier label, tracking number, carrier, service, and provider environment;
+- ship-to name and locality plus the source package Global ID, package number, canonical dimensions, and weight;
+- warehouse, station type, requested printer, selected printer, local print agent, fallback printer, and the human-readable routing reason;
+- artifact checksum, byte length, creation actor, and creation time;
+- created, available, leased, acknowledged, failed, cancelled, and reprinted lifecycle timestamps;
+- retry counts, last safe error, reprint actor and reason, and every fenced agent/device delivery attempt.
+
+**Agent heartbeat** and **last device delivery** are separate signals. The heartbeat proves the enrolled local agent has recently polled ClawPilot, including when no work was available. Last device delivery records the most recent acknowledged handoff to that printer. An acknowledged job proves that the agent handed the document to the configured device; it does not prove that paper or label stock physically exited the printer.
+
+Credentials, complete carrier-account numbers, artifact storage references, and raw label bytes remain outside the operator view. A retry or reprint always references the existing durable artifact and never purchases another carrier label.
+
 ## Import Carrier Billing Evidence
 
 A carrier billing file may contain one or many carrier account numbers. Each imported source must retain provider, environment, checksum, filename, source-document reference, import actor, and row totals.

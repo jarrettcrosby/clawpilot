@@ -109,6 +109,20 @@ assert.ok(
   'Carrier account numbers must not be stored in plaintext',
 )
 
+const carrierAccountSenderNameMigration = read(
+  'db/migrations/0110_operations_carrier_account_sender_name.sql',
+)
+for (const fragment of [
+  'ADD COLUMN IF NOT EXISTS sender_name text',
+  'ALTER COLUMN sender_name SET NOT NULL',
+  'operations_carrier_accounts_sender_name_valid',
+]) {
+  assert.ok(
+    carrierAccountSenderNameMigration.includes(fragment),
+    `Carrier-account sender-name migration missing ${fragment}`,
+  )
+}
+
 const sandboxDiagnosticScopeMigration = read(
   'db/migrations/0100_operations_sandbox_rate_diagnostic_scope.sql',
 )
@@ -161,6 +175,8 @@ for (const fragment of [
   'carrier_account_id',
   'billing_relationship',
   'billing_selection_snapshot',
+  'sender_name',
+  'senderName',
 ]) {
   assert.ok(persistence.includes(fragment), `Carrier persistence contract missing ${fragment}`)
 }
@@ -196,6 +212,7 @@ for (const fragment of [
   'carrierAccountGlobalId: selection.account.globalId',
   'billingRelationship: selection.relationship',
   'billingSelectionSnapshot: selection.snapshot',
+  'senderName: selection.account.senderName',
 ]) {
   assert.ok(service.includes(fragment), `Carrier service contract missing ${fragment}`)
 }
@@ -229,6 +246,7 @@ for (const fragment of [
   "action === 'set-account-status'",
   "action === 'delete-account'",
   "'carrierAccountGlobalId'",
+  "'senderName'",
   'sanitizedCarrierIntegrationError',
   'operationsCapabilities(actor).canManage',
   'canRevealCredentials: canRevealCredential(actor)',
@@ -264,6 +282,9 @@ for (const fragment of [
   'Rating only',
   'Disconnect',
   'Billing accounts',
+  'Sender: {entry.senderName}',
+  'label="Sender name"',
+  'Used as the shipper name for carrier rating and labels.',
   'Registered address line 1',
   'set-account-status',
   'delete-account',
@@ -631,6 +652,7 @@ const fedexRate = await sandboxRateModule.requestCarrierSandboxRates({
   environment: 'sandbox',
   credential,
 }, {
+  senderName: 'Jegs Test Sender',
   fetchImpl: async (url, init) => {
     rateRequests.push({ url: String(url), init })
     return new Response(JSON.stringify({
@@ -661,6 +683,8 @@ const fedexRate = await sandboxRateModule.requestCarrierSandboxRates({
 assert.equal(rateRequests[0].url, 'https://apis-sandbox.fedex.com/rate/v1/rates/quotes')
 const fedexRequest = JSON.parse(rateRequests[0].init.body)
 assert.equal(fedexRequest.accountNumber.value, credential.accountNumber)
+assert.equal(fedexRequest.requestedShipment.shipper.contact.personName, 'Jegs Test Sender')
+assert.equal(fedexRequest.requestedShipment.shipper.contact.companyName, 'Jegs Test Sender')
 assert.equal(fedexRequest.requestedShipment.shipper.address.streetLines[0], '101 Jegs Place')
 assert.equal(fedexRequest.requestedShipment.recipient.address.streetLines[0], '101 Academy Drive')
 assert.equal(fedexRequest.requestedShipment.requestedPackageLineItems[0].itemDescription, 'Test Product')
@@ -674,12 +698,14 @@ assert.deepEqual(JSON.parse(JSON.stringify(fedexRate.result.rates)), [{
   deliveryDate: '2026-07-24',
 }])
 assert.equal(fedexRate.evidence.providerReference, 'fedex-rate-reference')
+assert.equal(fedexRate.result.fixture.origin.name, 'Jegs Test Sender')
 
 const upsRate = await sandboxRateModule.requestCarrierSandboxRates({
   provider: 'ups_rest',
   environment: 'sandbox',
   credential,
 }, {
+  senderName: 'Jegs Test Sender',
   fetchImpl: async (url, init) => {
     rateRequests.push({ url: String(url), init })
     return new Response(JSON.stringify({
@@ -709,6 +735,8 @@ const upsRate = await sandboxRateModule.requestCarrierSandboxRates({
 assert.equal(rateRequests[1].url, 'https://wwwcie.ups.com/api/rating/v2409/Shop')
 const upsRequest = JSON.parse(rateRequests[1].init.body)
 assert.equal(upsRequest.RateRequest.Request.RequestOption, 'Shop')
+assert.equal(upsRequest.RateRequest.Shipment.Shipper.Name, 'Jegs Test Sender')
+assert.equal(upsRequest.RateRequest.Shipment.ShipFrom.Name, 'Jegs Test Sender')
 assert.equal(upsRequest.RateRequest.Shipment.Shipper.ShipperNumber, credential.accountNumber)
 assert.equal(
   upsRequest.RateRequest.Shipment.PaymentDetails.ShipmentCharge[0].BillShipper.AccountNumber,
@@ -727,6 +755,7 @@ assert.deepEqual(JSON.parse(JSON.stringify(upsRate.result.rates)), [{
   deliveryDate: '2026-07-27',
 }])
 assert.equal(upsRate.evidence.providerReference, 'ups-rate-reference')
+assert.equal(upsRate.result.fixture.origin.name, 'Jegs Test Sender')
 
 for (const value of [fedexRate, upsRate]) {
   const serialized = JSON.stringify(value)

@@ -251,6 +251,13 @@ export async function GET() {
           demo_managed_resource_guard_migration_applied: boolean
           quickbooks_pos_evidence_refresh_migration_applied: boolean
           toast_location_closeout_hour_migration_applied: boolean
+          operations_warehouse_operating_profile_migration_applied: boolean
+          operations_slotting_replenishment_migration_applied: boolean
+          operations_replenishment_execution_migration_applied: boolean
+          operations_carrier_account_sender_name_migration_applied: boolean
+          operations_commerce_integrations_migration_applied: boolean
+          operations_faire_oauth_migration_applied: boolean
+          operations_shopify_order_preview_migration_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -696,6 +703,41 @@ export async function GET() {
                 FROM schema_migrations
                 WHERE filename = '0106_toast_location_closeout_hour.sql'
               ) AS toast_location_closeout_hour_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0107_operations_warehouse_operating_profile.sql'
+              ) AS operations_warehouse_operating_profile_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0108_operations_slotting_and_replenishment.sql'
+              ) AS operations_slotting_replenishment_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0109_operations_replenishment_execution.sql'
+              ) AS operations_replenishment_execution_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0110_operations_carrier_account_sender_name.sql'
+              ) AS operations_carrier_account_sender_name_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0111_operations_commerce_integrations.sql'
+              ) AS operations_commerce_integrations_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0112_operations_faire_oauth.sql'
+              ) AS operations_faire_oauth_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0113_operations_shopify_order_preview.sql'
+              ) AS operations_shopify_order_preview_migration_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -796,6 +838,13 @@ export async function GET() {
             && row?.demo_managed_resource_guard_migration_applied
             && row?.quickbooks_pos_evidence_refresh_migration_applied
             && row?.toast_location_closeout_hour_migration_applied
+            && row?.operations_warehouse_operating_profile_migration_applied
+            && row?.operations_slotting_replenishment_migration_applied
+            && row?.operations_replenishment_execution_migration_applied
+            && row?.operations_carrier_account_sender_name_migration_applied
+            && row?.operations_commerce_integrations_migration_applied
+            && row?.operations_faire_oauth_migration_applied
+            && row?.operations_shopify_order_preview_migration_applied
             && row?.migration_checksums_present
           ),
         }
@@ -888,6 +937,13 @@ export async function GET() {
           || !row?.demo_managed_resource_guard_migration_applied
           || !row?.quickbooks_pos_evidence_refresh_migration_applied
           || !row?.toast_location_closeout_hour_migration_applied
+          || !row?.operations_warehouse_operating_profile_migration_applied
+          || !row?.operations_slotting_replenishment_migration_applied
+          || !row?.operations_replenishment_execution_migration_applied
+          || !row?.operations_carrier_account_sender_name_migration_applied
+          || !row?.operations_commerce_integrations_migration_applied
+          || !row?.operations_faire_oauth_migration_applied
+          || !row?.operations_shopify_order_preview_migration_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')

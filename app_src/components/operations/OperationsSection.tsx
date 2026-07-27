@@ -38,6 +38,7 @@ import CloseRounded from '@mui/icons-material/CloseRounded'
 import HelpOutlineRounded from '@mui/icons-material/HelpOutlineRounded'
 import Inventory2Rounded from '@mui/icons-material/Inventory2Rounded'
 import LocalShippingRounded from '@mui/icons-material/LocalShippingRounded'
+import MoveToInboxRounded from '@mui/icons-material/MoveToInboxRounded'
 import OpenInNewRounded from '@mui/icons-material/OpenInNewRounded'
 import PrintRounded from '@mui/icons-material/PrintRounded'
 import RefreshRounded from '@mui/icons-material/RefreshRounded'
@@ -62,6 +63,7 @@ import type {
 } from '@/lib/operations/types'
 import GlCodingPanel from '@/components/operations/GlCodingPanel'
 import PrinterConfigurationPanel from '@/components/operations/PrinterConfigurationPanel'
+import ReceivingPanel from '@/components/operations/ReceivingPanel'
 import WarehouseSetupPanel from '@/components/operations/WarehouseSetupPanel'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import { formatUserDateTime } from '@/lib/userDateTime'
@@ -911,7 +913,9 @@ export default function OperationsSection() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
-  const [view, setView] = useState<'orders' | 'exceptions' | 'warehouses' | 'gl-coding' | 'printing'>('orders')
+  const [view, setView] = useState<
+    'orders' | 'exceptions' | 'receiving' | 'warehouses' | 'gl-coding' | 'printing'
+  >('orders')
   const [search, setSearch] = useState('')
   const [status, setStatus] = useState<'' | OperationsOrderStatus>('')
   const [exceptionStatus, setExceptionStatus] = useState<'' | OperationsExceptionStatus>('')
@@ -1415,6 +1419,8 @@ export default function OperationsSection() {
     ? 'Carrier billing & GL'
     : view === 'printing'
       ? 'Print orchestration'
+      : view === 'receiving'
+        ? 'Inbound receiving'
       : view === 'warehouses'
         ? 'Warehouse network'
       : 'Order Workbench'
@@ -1422,6 +1428,8 @@ export default function OperationsSection() {
     ? 'Actual carrier charges, shipment evidence, shipper assignment, and reconciliation'
     : view === 'printing'
       ? 'Warehouse printers, document media, defaults, and fallbacks'
+      : view === 'receiving'
+        ? 'Expected receipts, inspection, directed putaway, and inventory ledger posting'
       : view === 'warehouses'
         ? 'Facilities, inbound staging, storage bins, fulfillment locations, and returns'
       : `Distributed fulfillment${workspace ? ` · CRM: ${workspace.dataPipeline.name}` : ''}`
@@ -1487,7 +1495,13 @@ export default function OperationsSection() {
         >
           <Tabs
             value={view}
-            onChange={(_, next: 'orders' | 'exceptions' | 'warehouses' | 'gl-coding' | 'printing') => {
+            onChange={(_, next:
+              | 'orders'
+              | 'exceptions'
+              | 'receiving'
+              | 'warehouses'
+              | 'gl-coding'
+              | 'printing') => {
               setView(next)
               setSearch('')
               closeDrawer()
@@ -1514,6 +1528,15 @@ export default function OperationsSection() {
                 px: { xs: 1.5, sm: 2 },
                 whiteSpace: 'nowrap',
               },
+              '@media (min-width:600px) and (max-width:899.95px)': {
+                '& .MuiTab-root': {
+                  px: 0.75,
+                  fontSize: '0.72rem',
+                },
+                '& .MuiTab-iconWrapper': {
+                  display: 'none',
+                },
+              },
               '& .MuiTabs-scrollButtons': {
                 alignSelf: 'stretch',
                 width: { xs: 36, sm: 40 },
@@ -1535,6 +1558,12 @@ export default function OperationsSection() {
           >
             <Tab value="orders" label={`Orders${workspace ? ` (${workspace.orders.length})` : ''}`} />
             <Tab value="exceptions" label={`Exceptions${workspace ? ` (${workspace.summary.exceptions})` : ''}`} />
+            <Tab
+              value="receiving"
+              icon={<MoveToInboxRounded fontSize="small" />}
+              iconPosition="start"
+              label={`Receiving${workspace ? ` (${workspace.inboundReceipts?.length || 0})` : ''}`}
+            />
             <Tab value="warehouses" icon={<WarehouseRounded fontSize="small" />} iconPosition="start" label="Warehouses" />
             <Tab value="gl-coding" label="Billing & GL" />
             <Tab value="printing" icon={<PrintRounded fontSize="small" />} iconPosition="start" label="Printing" />
@@ -1584,9 +1613,16 @@ export default function OperationsSection() {
       {mainWorkspaceView && !loading && workspace && !workspace.configured && (
         <Alert severity="info" sx={{ mx: { xs: 2, md: 3 }, mb: 1.5 }}>Connect an approved commerce provider and configure an active warehouse to begin importing orders.</Alert>
       )}
+      {!mainWorkspaceView && error && (
+        <Alert severity="error" onClose={() => setError('')} sx={{ mx: { xs: 2, md: 3 }, mt: 1.5 }}>
+          {error}
+        </Alert>
+      )}
 
       <Box sx={{ flex: 1, minHeight: 0, overflow: 'auto', WebkitOverflowScrolling: 'touch' }}>
-        {view === 'warehouses' ? (
+        {view === 'receiving' ? (
+          <ReceivingPanel workspace={workspace} onRefresh={() => loadWorkspace()} />
+        ) : view === 'warehouses' ? (
           <WarehouseSetupPanel
             workspace={workspace}
             onRefresh={() => loadWorkspace()}

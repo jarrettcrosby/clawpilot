@@ -9,6 +9,8 @@ import type {
   MockOperationsProofLineInput,
   OperationsActivationState,
   OperationsExceptionStatus,
+  OperationsInboundReceiptCompletionInput,
+  OperationsInboundReceiptInput,
   OperationsOrderStatus,
   OperationsWorkspace,
 } from '@/lib/operations/types'
@@ -16,9 +18,12 @@ import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import {
   confirmOperationsOrderShipmentFromPostgres,
   confirmOperationsOrderPicksFromPostgres,
+  completeOperationsInboundReceiptInPostgres,
+  createOperationsInboundReceiptInPostgres,
   createOperationsLocationInPostgres,
   createOperationsWarehouseInPostgres,
   deleteOperationsLocationInPostgres,
+  executeOperationsReplenishmentInPostgres,
   OperationsRequestError,
   readOperationsWorkspaceFromPostgres,
   releaseOperationsOrderFromPostgres,
@@ -49,6 +54,9 @@ const CARRIER_ACCOUNT_GLOBAL_ID = /^gac\d{7}$/
 const PRINTER_GLOBAL_ID = /^gpr\d{7}$/
 const WAREHOUSE_GLOBAL_ID = /^gwh\d{7}$/
 const LOCATION_GLOBAL_ID = /^gwl\d{7}$/
+const INVENTORY_POOL_GLOBAL_ID = /^gip\d{7}$/
+const RECEIPT_GLOBAL_ID = /^grc\d{7}$/
+const RECEIPT_LINE_GLOBAL_ID = /^grcl\d{7}$/
 const ORDER_STATUSES = new Set<OperationsOrderStatus>([
   'imported', 'validated', 'held', 'promised', 'reserved', 'planned',
   'released', 'picking', 'packed', 'shipped', 'cancelled', 'exception',
@@ -128,14 +136,174 @@ function optionalNumberValue(value: unknown, label: string, minimum: number, max
   return parsed
 }
 
+function positiveNumberValue(value: unknown, label: string, maximum = 1_000_000_000): number {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed) || parsed <= 0 || parsed > maximum) {
+    requestError('OPERATIONS_REQUEST_INVALID', `${label} must be greater than zero`)
+  }
+  return parsed
+}
+
+function nonNegativeNumberValue(value: unknown, label: string, maximum = 1_000_000_000): number {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed) || parsed < 0 || parsed > maximum) {
+    requestError('OPERATIONS_REQUEST_INVALID', `${label} must be zero or greater`)
+  }
+  return parsed
+}
+
+function optionalDateTimeValue(value: unknown, label: string): string | null {
+  const raw = textValue(value, label, 50, false)
+  if (!raw) return null
+  const parsed = new Date(raw)
+  if (Number.isNaN(parsed.getTime())) {
+    requestError('OPERATIONS_REQUEST_INVALID', `${label} is invalid`)
+  }
+  return parsed.toISOString()
+}
+
+function inboundReceiptLinesValue(value: unknown): OperationsInboundReceiptInput['lines'] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 100) {
+    requestError('OPERATIONS_REQUEST_INVALID', 'Receipt must include from 1 to 100 lines')
+  }
+  return value.map((entry, index) => {
+    const line = record(entry, 'OPERATIONS_REQUEST_INVALID', `Receipt line ${index + 1}`)
+    assertFields(
+      line,
+      new Set([
+        'productGlobalId',
+        'targetLocationGlobalId',
+        'expectedQuantity',
+        'lotCode',
+        'unitOfMeasure',
+      ]),
+      'OPERATIONS_REQUEST_INVALID',
+      `Receipt line ${index + 1}`,
+    )
+    return {
+      productGlobalId: globalIdValue(
+        line.productGlobalId,
+        `Product on line ${index + 1}`,
+        PRODUCT_GLOBAL_ID,
+      ),
+      targetLocationGlobalId: optionalGlobalIdValue(
+        line.targetLocationGlobalId,
+        `Putaway location on line ${index + 1}`,
+        LOCATION_GLOBAL_ID,
+      ),
+      expectedQuantity: positiveNumberValue(
+        line.expectedQuantity,
+        `Expected quantity on line ${index + 1}`,
+      ),
+      lotCode: textValue(line.lotCode, `Lot on line ${index + 1}`, 120, false),
+      unitOfMeasure: textValue(
+        line.unitOfMeasure || 'each',
+        `Unit of measure on line ${index + 1}`,
+        50,
+      ),
+    }
+  })
+}
+
+function inboundReceiptCompletionLinesValue(
+  value: unknown,
+): OperationsInboundReceiptCompletionInput['lines'] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 100) {
+    requestError(
+      'OPERATIONS_REQUEST_INVALID',
+      'Receiving confirmation must include every receipt line',
+    )
+  }
+  const seen = new Set<string>()
+  return value.map((entry, index) => {
+    const line = record(entry, 'OPERATIONS_REQUEST_INVALID', `Receiving line ${index + 1}`)
+    assertFields(
+      line,
+      new Set(['lineGlobalId', 'acceptedQuantity', 'damagedQuantity']),
+      'OPERATIONS_REQUEST_INVALID',
+      `Receiving line ${index + 1}`,
+    )
+    const lineGlobalId = globalIdValue(
+      line.lineGlobalId,
+      `Receipt line ${index + 1}`,
+      RECEIPT_LINE_GLOBAL_ID,
+    )
+    if (seen.has(lineGlobalId)) {
+      requestError('OPERATIONS_REQUEST_INVALID', 'Receipt line confirmations must be unique')
+    }
+    seen.add(lineGlobalId)
+    return {
+      lineGlobalId,
+      acceptedQuantity: nonNegativeNumberValue(
+        line.acceptedQuantity,
+        `Accepted quantity on line ${index + 1}`,
+      ),
+      damagedQuantity: nonNegativeNumberValue(
+        line.damagedQuantity,
+        `Damaged quantity on line ${index + 1}`,
+      ),
+    }
+  })
+}
+
+function operatingDaysValue(value: unknown): number[] {
+  if (value === undefined) return [1, 2, 3, 4, 5]
+  if (!Array.isArray(value) || value.length < 1 || value.length > 7) {
+    requestError('OPERATIONS_REQUEST_INVALID', 'Select at least one operating day')
+  }
+  const days = value.map((day) => integerValue(day, 'Operating day', 0, 6))
+  if (new Set(days).size !== days.length) {
+    requestError('OPERATIONS_REQUEST_INVALID', 'Operating days must be unique')
+  }
+  return [...days].sort((a, b) => a - b)
+}
+
 function booleanValue(value: unknown, fallback: boolean): boolean {
   return typeof value === 'boolean' ? value : fallback
+}
+
+function carrierCutoffsValue(value: unknown): Record<string, string> {
+  if (value === undefined || value === null) return {}
+  const input = record(value, 'OPERATIONS_REQUEST_INVALID', 'Carrier cutoffs')
+  if (Object.keys(input).length > 25) {
+    requestError('OPERATIONS_REQUEST_INVALID', 'Carrier cutoffs are invalid')
+  }
+  const result: Record<string, string> = {}
+  for (const [providerValue, cutoffValue] of Object.entries(input)) {
+    const provider = textValue(providerValue, 'Carrier code', 40).toUpperCase()
+    const cutoff = textValue(cutoffValue, `${provider} cutoff`, 8)
+    if (!/^[A-Z0-9_-]+$/.test(provider) || !/^([01]\d|2[0-3]):[0-5]\d$/.test(cutoff)) {
+      requestError(
+        'OPERATIONS_REQUEST_INVALID',
+        'Carrier cutoffs require a carrier code and local 24-hour HH:MM time',
+      )
+    }
+    result[provider] = cutoff
+  }
+  return result
+}
+
+function locationStorageFunctionValue(
+  value: unknown,
+  locationType: OperationsWorkspace['warehouses'][number]['locations'][number]['locationType'],
+): OperationsWorkspace['warehouses'][number]['locations'][number]['storageFunction'] {
+  if (value === null || value === undefined || value === '') {
+    if (locationType === 'pick') return 'forward_pick'
+    if (locationType === 'storage') return 'reserve'
+    if (locationType === 'staging') return 'staging'
+    return 'work_area'
+  }
+  return textValue(value, 'Storage function', 30) as OperationsWorkspace['warehouses'][number]['locations'][number]['storageFunction']
 }
 
 function locationProductRulesValue(value: unknown): Array<{
   productGlobalId: string
   ruleType: 'allowed' | 'preferred' | 'restricted'
   maxQuantity: number | null
+  replenishmentMode: 'disabled' | 'min_max' | 'order_demand'
+  replenishmentSourceLocationGlobalId: string | null
+  minQuantity: number | null
+  targetQuantity: number | null
 }> {
   if (value === undefined) return []
   if (!Array.isArray(value) || value.length > 250) {
@@ -146,7 +314,15 @@ function locationProductRulesValue(value: unknown): Array<{
     const rule = record(entry, 'OPERATIONS_REQUEST_INVALID', `Location product rule ${index + 1}`)
     assertFields(
       rule,
-      new Set(['productGlobalId', 'ruleType', 'maxQuantity']),
+      new Set([
+        'productGlobalId',
+        'ruleType',
+        'maxQuantity',
+        'replenishmentMode',
+        'replenishmentSourceLocationGlobalId',
+        'minQuantity',
+        'targetQuantity',
+      ]),
       'OPERATIONS_REQUEST_INVALID',
       `Location product rule ${index + 1}`,
     )
@@ -159,10 +335,27 @@ function locationProductRulesValue(value: unknown): Array<{
     if (!['allowed', 'preferred', 'restricted'].includes(ruleType)) {
       requestError('OPERATIONS_REQUEST_INVALID', 'Product rule type is invalid')
     }
+    const replenishmentMode = textValue(
+      rule.replenishmentMode,
+      'Replenishment mode',
+      20,
+      false,
+    ) || 'disabled'
+    if (!['disabled', 'min_max', 'order_demand'].includes(replenishmentMode)) {
+      requestError('OPERATIONS_REQUEST_INVALID', 'Replenishment mode is invalid')
+    }
     return {
       productGlobalId,
       ruleType: ruleType as 'allowed' | 'preferred' | 'restricted',
       maxQuantity: optionalNumberValue(rule.maxQuantity, 'Product quantity limit', 0.000001, 1_000_000_000),
+      replenishmentMode: replenishmentMode as 'disabled' | 'min_max' | 'order_demand',
+      replenishmentSourceLocationGlobalId: optionalGlobalIdValue(
+        rule.replenishmentSourceLocationGlobalId,
+        'Replenishment source',
+        LOCATION_GLOBAL_ID,
+      ),
+      minQuantity: optionalNumberValue(rule.minQuantity, 'Replenishment minimum', 0, 1_000_000_000),
+      targetQuantity: optionalNumberValue(rule.targetQuantity, 'Replenishment target', 0.000001, 1_000_000_000),
     }
   })
 }
@@ -360,7 +553,9 @@ export async function POST(req: NextRequest) {
         return json({ ok: false, error: 'You do not have permission to configure warehouses', code: 'OPERATIONS_MANAGE_REQUIRED' }, 403)
       }
       assertFields(body, new Set([
-        'action', 'code', 'name', 'facilityType', 'timezone', 'address', 'cutoffTime', 'createStarterLocations',
+        'action', 'code', 'name', 'facilityType', 'timezone', 'address', 'cutoffTime',
+        'operatingDays', 'opensAt', 'closesAt', 'standardProcessingMinutes',
+        'dailyOrderCapacity', 'carrierCutoffs', 'createStarterLocations',
       ]), 'OPERATIONS_REQUEST_INVALID', 'Operations command')
       const result = await createOperationsWarehouseInPostgres({
         organizationId: activeOperationsOrganizationId(actor),
@@ -371,6 +566,21 @@ export async function POST(req: NextRequest) {
         timezone: textValue(body.timezone, 'Warehouse timezone', 80),
         address: addressValue(body.address),
         cutoffTime: textValue(body.cutoffTime, 'Warehouse cutoff', 8, false) || null,
+        operatingDays: operatingDaysValue(body.operatingDays),
+        opensAt: textValue(body.opensAt ?? '08:00', 'Warehouse opening time', 8),
+        closesAt: textValue(body.closesAt ?? '17:00', 'Warehouse closing time', 8),
+        standardProcessingMinutes: integerValue(
+          body.standardProcessingMinutes ?? 120,
+          'Standard processing time',
+          0,
+          10_080,
+        ),
+        dailyOrderCapacity: body.dailyOrderCapacity === null
+          || body.dailyOrderCapacity === undefined
+          || body.dailyOrderCapacity === ''
+          ? null
+          : integerValue(body.dailyOrderCapacity, 'Daily order capacity', 1, 1_000_000_000),
+        carrierCutoffs: carrierCutoffsValue(body.carrierCutoffs),
         createStarterLocations: body.createStarterLocations !== false,
       })
       return json({ ok: true, capabilities, result }, 201)
@@ -381,7 +591,8 @@ export async function POST(req: NextRequest) {
       }
       assertFields(body, new Set([
         'action', 'warehouseGlobalId', 'expectedRowVersion', 'name', 'facilityType',
-        'timezone', 'address', 'cutoffTime', 'status',
+        'timezone', 'address', 'cutoffTime', 'operatingDays', 'opensAt', 'closesAt',
+        'standardProcessingMinutes', 'dailyOrderCapacity', 'carrierCutoffs', 'status',
       ]), 'OPERATIONS_REQUEST_INVALID', 'Operations command')
       const result = await updateOperationsWarehouseInPostgres({
         organizationId: activeOperationsOrganizationId(actor),
@@ -393,6 +604,21 @@ export async function POST(req: NextRequest) {
         timezone: textValue(body.timezone, 'Warehouse timezone', 80),
         address: addressValue(body.address),
         cutoffTime: textValue(body.cutoffTime, 'Warehouse cutoff', 8, false) || null,
+        operatingDays: operatingDaysValue(body.operatingDays),
+        opensAt: textValue(body.opensAt ?? '08:00', 'Warehouse opening time', 8),
+        closesAt: textValue(body.closesAt ?? '17:00', 'Warehouse closing time', 8),
+        standardProcessingMinutes: integerValue(
+          body.standardProcessingMinutes ?? 120,
+          'Standard processing time',
+          0,
+          10_080,
+        ),
+        dailyOrderCapacity: body.dailyOrderCapacity === null
+          || body.dailyOrderCapacity === undefined
+          || body.dailyOrderCapacity === ''
+          ? null
+          : integerValue(body.dailyOrderCapacity, 'Daily order capacity', 1, 1_000_000_000),
+        carrierCutoffs: carrierCutoffsValue(body.carrierCutoffs),
         status: textValue(body.status, 'Warehouse status', 20) as 'active' | 'inactive',
       })
       return json({ ok: true, capabilities, result })
@@ -404,19 +630,21 @@ export async function POST(req: NextRequest) {
       assertFields(body, new Set([
         'action', 'warehouseGlobalId', 'code', 'zone', 'locationType', 'topologyLevel',
         'parentLocationGlobalId', 'pickSequence', 'active', 'maxVolumeCubicMeters',
-        'maxWeightKg', 'allowMixedProducts', 'notes', 'productRules',
+        'maxWeightKg', 'allowMixedProducts', 'storageFunction', 'notes', 'productRules',
       ]), 'OPERATIONS_REQUEST_INVALID', 'Operations command')
+      const locationType = textValue(body.locationType, 'Location type', 20) as OperationsWorkspace['warehouses'][number]['locations'][number]['locationType']
       const result = await createOperationsLocationInPostgres({
         organizationId: activeOperationsOrganizationId(actor),
         actorEmail: actor.email,
         warehouseGlobalId: globalIdValue(body.warehouseGlobalId, 'Warehouse', WAREHOUSE_GLOBAL_ID),
         code: textValue(body.code, 'Location code', 40),
         zone: textValue(body.zone, 'Location zone', 80),
-        locationType: textValue(body.locationType, 'Location type', 20) as OperationsWorkspace['warehouses'][number]['locations'][number]['locationType'],
+        locationType,
         topologyLevel: textValue(body.topologyLevel, 'Topology level', 20) as OperationsWorkspace['warehouses'][number]['locations'][number]['topologyLevel'],
         parentLocationGlobalId: optionalGlobalIdValue(body.parentLocationGlobalId, 'Parent location', LOCATION_GLOBAL_ID),
         pickSequence: integerValue(body.pickSequence, 'Pick sequence', 0, 1_000_000),
         active: booleanValue(body.active, true),
+        storageFunction: locationStorageFunctionValue(body.storageFunction, locationType),
         maxVolumeCubicMeters: optionalNumberValue(body.maxVolumeCubicMeters, 'Maximum cubic storage', 0.000001, 1_000_000_000),
         maxWeightKg: optionalNumberValue(body.maxWeightKg, 'Maximum weight', 0.000001, 1_000_000_000),
         allowMixedProducts: booleanValue(body.allowMixedProducts, true),
@@ -433,8 +661,9 @@ export async function POST(req: NextRequest) {
         'action', 'warehouseGlobalId', 'locationGlobalId', 'expectedRowVersion',
         'code', 'zone', 'locationType', 'topologyLevel', 'parentLocationGlobalId',
         'pickSequence', 'active', 'maxVolumeCubicMeters', 'maxWeightKg',
-        'allowMixedProducts', 'notes', 'productRules',
+        'allowMixedProducts', 'storageFunction', 'notes', 'productRules',
       ]), 'OPERATIONS_REQUEST_INVALID', 'Operations command')
+      const locationType = textValue(body.locationType, 'Location type', 20) as OperationsWorkspace['warehouses'][number]['locations'][number]['locationType']
       const result = await updateOperationsLocationInPostgres({
         organizationId: activeOperationsOrganizationId(actor),
         actorEmail: actor.email,
@@ -443,11 +672,12 @@ export async function POST(req: NextRequest) {
         expectedRowVersion: integerValue(body.expectedRowVersion, 'Location version', 0, 2_147_483_647),
         code: textValue(body.code, 'Location code', 40),
         zone: textValue(body.zone, 'Location zone', 80),
-        locationType: textValue(body.locationType, 'Location type', 20) as OperationsWorkspace['warehouses'][number]['locations'][number]['locationType'],
+        locationType,
         topologyLevel: textValue(body.topologyLevel, 'Topology level', 20) as OperationsWorkspace['warehouses'][number]['locations'][number]['topologyLevel'],
         parentLocationGlobalId: optionalGlobalIdValue(body.parentLocationGlobalId, 'Parent location', LOCATION_GLOBAL_ID),
         pickSequence: integerValue(body.pickSequence, 'Pick sequence', 0, 1_000_000),
         active: booleanValue(body.active, true),
+        storageFunction: locationStorageFunctionValue(body.storageFunction, locationType),
         maxVolumeCubicMeters: optionalNumberValue(body.maxVolumeCubicMeters, 'Maximum cubic storage', 0.000001, 1_000_000_000),
         maxWeightKg: optionalNumberValue(body.maxWeightKg, 'Maximum weight', 0.000001, 1_000_000_000),
         allowMixedProducts: booleanValue(body.allowMixedProducts, true),
@@ -473,6 +703,142 @@ export async function POST(req: NextRequest) {
         expectedRowVersion: integerValue(body.expectedRowVersion, 'Location version', 0, 2_147_483_647),
       })
       return json({ ok: true, capabilities, result })
+    }
+    if (action === 'create-inbound-receipt') {
+      if (!capabilities.canManage || !capabilities.canExecute) {
+        return json({
+          ok: false,
+          error: 'You do not have permission to create inbound receipts',
+          code: 'OPERATIONS_EXECUTE_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set([
+          'action',
+          'warehouseGlobalId',
+          'inventoryPoolGlobalId',
+          'referenceNumber',
+          'expectedAt',
+          'lines',
+        ]),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
+      const result = await createOperationsInboundReceiptInPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        receipt: {
+          warehouseGlobalId: globalIdValue(
+            body.warehouseGlobalId,
+            'Warehouse',
+            WAREHOUSE_GLOBAL_ID,
+          ),
+          inventoryPoolGlobalId: globalIdValue(
+            body.inventoryPoolGlobalId,
+            'Inventory pool',
+            INVENTORY_POOL_GLOBAL_ID,
+          ),
+          referenceNumber: textValue(body.referenceNumber, 'Receipt reference', 120),
+          expectedAt: optionalDateTimeValue(body.expectedAt, 'Expected date'),
+          lines: inboundReceiptLinesValue(body.lines),
+        },
+        idempotencyKey: idempotencyKeyValue(req),
+      })
+      return json({ ok: true, capabilities, result }, result.replayed ? 200 : 201)
+    }
+    if (action === 'complete-inbound-receipt') {
+      if (!capabilities.canManage || !capabilities.canExecute) {
+        return json({
+          ok: false,
+          error: 'You do not have permission to complete inbound receipts',
+          code: 'OPERATIONS_EXECUTE_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set([
+          'action',
+          'receiptGlobalId',
+          'expectedRowVersion',
+          'reason',
+          'lines',
+        ]),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
+      const result = await completeOperationsInboundReceiptInPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        completion: {
+          receiptGlobalId: globalIdValue(
+            body.receiptGlobalId,
+            'Inbound receipt',
+            RECEIPT_GLOBAL_ID,
+          ),
+          expectedRowVersion: integerValue(
+            body.expectedRowVersion,
+            'Receipt version',
+            0,
+            2_147_483_647,
+          ),
+          reason: textValue(body.reason, 'Receiving reason', 500),
+          lines: inboundReceiptCompletionLinesValue(body.lines),
+        },
+        idempotencyKey: idempotencyKeyValue(req),
+      })
+      return json({ ok: true, capabilities, result })
+    }
+    if (action === 'execute-replenishment') {
+      if (!capabilities.canManage || !capabilities.canExecute) {
+        return json({
+          ok: false,
+          error: 'You do not have permission to execute warehouse replenishment',
+          code: 'OPERATIONS_EXECUTE_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set([
+          'action',
+          'sourceLocationGlobalId',
+          'destinationLocationGlobalId',
+          'inventoryPoolGlobalId',
+          'productGlobalId',
+          'quantity',
+        ]),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
+      const result = await executeOperationsReplenishmentInPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        replenishment: {
+          sourceLocationGlobalId: globalIdValue(
+            body.sourceLocationGlobalId,
+            'Source location',
+            LOCATION_GLOBAL_ID,
+          ),
+          destinationLocationGlobalId: globalIdValue(
+            body.destinationLocationGlobalId,
+            'Destination location',
+            LOCATION_GLOBAL_ID,
+          ),
+          inventoryPoolGlobalId: globalIdValue(
+            body.inventoryPoolGlobalId,
+            'Inventory pool',
+            INVENTORY_POOL_GLOBAL_ID,
+          ),
+          productGlobalId: globalIdValue(
+            body.productGlobalId,
+            'Product',
+            PRODUCT_GLOBAL_ID,
+          ),
+          quantity: positiveNumberValue(body.quantity, 'Replenishment quantity'),
+        },
+        idempotencyKey: idempotencyKeyValue(req),
+      })
+      return json({ ok: true, capabilities, result }, result.replayed ? 200 : 201)
     }
     if (action === 'run-proof-order') {
       requireOperationsProofFixture()

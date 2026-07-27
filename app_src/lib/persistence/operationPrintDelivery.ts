@@ -55,12 +55,36 @@ type PrintJobRow = {
   format: OperationsPrintJobListItem['format']
   media_size: OperationsPrintJobListItem['media']
   artifact_global_id: string | null
+  artifact_content_sha256: string | null
+  artifact_byte_length: string | number | null
+  artifact_created_by: string | null
+  artifact_created_at: TimestampValue | null
   source_label_global_id: string | null
   source_label_status: string | null
+  carrier: string | null
+  carrier_service_code: string | null
+  carrier_environment: string | null
+  label_created_at: TimestampValue | null
+  label_voided_at: TimestampValue | null
+  label_voided_by: string | null
   source_order_global_id: string | null
   source_order_number: string | null
   source_shipment_global_id: string | null
   tracking_number: string | null
+  package_global_id: string | null
+  package_number: number | null
+  package_length_mm: number | null
+  package_width_mm: number | null
+  package_height_mm: number | null
+  package_weight_grams: number | null
+  ship_to_name: string | null
+  ship_to_city: string | null
+  ship_to_region: string | null
+  ship_to_postal_code: string | null
+  ship_to_country: string | null
+  warehouse_global_id: string
+  warehouse_name: string
+  station_type: OperationsPrintJobListItem['stationType']
   printer_global_id: string
   printer_name: string
   requested_printer_global_id: string
@@ -402,12 +426,38 @@ function jobItem(row: PrintJobRow): OperationsPrintJobListItem {
     format: row.format,
     media: row.media_size,
     artifactGlobalId: row.artifact_global_id,
+    artifactContentSha256: row.artifact_content_sha256,
+    artifactByteLength: row.artifact_byte_length === null
+      ? null
+      : Number(row.artifact_byte_length),
+    artifactCreatedBy: row.artifact_created_by,
+    artifactCreatedAt: iso(row.artifact_created_at),
     sourceLabelGlobalId: row.source_label_global_id,
     sourceLabelStatus: row.source_label_status,
+    carrier: row.carrier,
+    carrierServiceCode: row.carrier_service_code,
+    carrierEnvironment: row.carrier_environment,
+    labelCreatedAt: iso(row.label_created_at),
+    labelVoidedAt: iso(row.label_voided_at),
+    labelVoidedBy: row.label_voided_by,
     sourceOrderGlobalId: row.source_order_global_id,
     sourceOrderNumber: row.source_order_number,
     sourceShipmentGlobalId: row.source_shipment_global_id,
     trackingNumber: row.tracking_number,
+    packageGlobalId: row.package_global_id,
+    packageNumber: row.package_number,
+    packageLengthMm: row.package_length_mm,
+    packageWidthMm: row.package_width_mm,
+    packageHeightMm: row.package_height_mm,
+    packageWeightGrams: row.package_weight_grams,
+    shipToName: row.ship_to_name,
+    shipToCity: row.ship_to_city,
+    shipToRegion: row.ship_to_region,
+    shipToPostalCode: row.ship_to_postal_code,
+    shipToCountry: row.ship_to_country,
+    warehouseGlobalId: row.warehouse_global_id,
+    warehouseName: row.warehouse_name,
+    stationType: row.station_type,
     printerGlobalId: row.printer_global_id,
     printerName: row.printer_name,
     requestedPrinterGlobalId: row.requested_printer_global_id,
@@ -477,13 +527,37 @@ const PRINT_JOB_SELECT = `
     artifact.format,
     artifact.media_size,
     artifact.global_id AS artifact_global_id,
+    artifact.content_sha256 AS artifact_content_sha256,
+    artifact.byte_length AS artifact_byte_length,
+    artifact.created_by AS artifact_created_by,
+    artifact.created_at AS artifact_created_at,
     source_label.global_id AS source_label_global_id,
     source_label.status AS source_label_status,
+    source_label.carrier,
+    source_label.service_code AS carrier_service_code,
+    source_label.environment AS carrier_environment,
+    source_label.created_at AS label_created_at,
+    source_label.voided_at AS label_voided_at,
+    source_label.voided_by AS label_voided_by,
     source_order.global_id AS source_order_global_id,
     source_order.order_number AS source_order_number,
     source_shipment.global_id AS source_shipment_global_id,
     COALESCE(source_shipment.tracking_number, source_label.tracking_number)
       AS tracking_number,
+    source_package.global_id AS package_global_id,
+    source_package.package_number,
+    source_package.length_mm AS package_length_mm,
+    source_package.width_mm AS package_width_mm,
+    source_package.height_mm AS package_height_mm,
+    source_package.weight_grams AS package_weight_grams,
+    NULLIF(source_order.ship_to->>'name', '') AS ship_to_name,
+    NULLIF(source_order.ship_to->>'city', '') AS ship_to_city,
+    NULLIF(source_order.ship_to->>'region', '') AS ship_to_region,
+    NULLIF(source_order.ship_to->>'postalCode', '') AS ship_to_postal_code,
+    NULLIF(source_order.ship_to->>'country', '') AS ship_to_country,
+    warehouse.global_id AS warehouse_global_id,
+    warehouse.name AS warehouse_name,
+    printer.station_type,
     printer.global_id AS printer_global_id,
     printer.name AS printer_name,
     requested.global_id AS requested_printer_global_id,
@@ -510,6 +584,9 @@ const PRINT_JOB_SELECT = `
   JOIN operations_printers printer
     ON printer.organization_id = job.organization_id
    AND printer.id = job.printer_id
+  JOIN operations_warehouses warehouse
+    ON warehouse.organization_id = printer.organization_id
+   AND warehouse.id = printer.warehouse_id
   JOIN operations_printers requested
     ON requested.organization_id = job.organization_id
    AND requested.id = COALESCE(job.requested_printer_id, job.printer_id)
@@ -526,6 +603,9 @@ const PRINT_JOB_SELECT = `
   LEFT JOIN operations_labels source_label
     ON source_label.organization_id = artifact.organization_id
    AND source_label.id = artifact.source_label_id
+  LEFT JOIN operations_packages source_package
+    ON source_package.organization_id = source_label.organization_id
+   AND source_package.id = source_label.package_id
   LEFT JOIN operations_orders source_order
     ON source_order.organization_id = artifact.organization_id
    AND source_order.id = artifact.source_order_id

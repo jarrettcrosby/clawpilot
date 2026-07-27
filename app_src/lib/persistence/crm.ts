@@ -3097,8 +3097,9 @@ export async function ensurePipelineCrmHierarchy(input: {
 
   const customers = await query<Record<string, unknown>>(
     `SELECT *
-     FROM crm_organizations
-     WHERE pipeline_id = $1::uuid
+     FROM crm_organizations customer
+     WHERE customer.pipeline_id = $1::uuid
+       AND ${activeCrmRecordSql('customer')}
        AND relationship_type = 'customer'
        AND parent_organization_id IS NULL`,
     [input.pipelineId],
@@ -3560,6 +3561,7 @@ export async function listCrmRecordsInPostgres(input: {
        FROM crm_organizations organization
        LEFT JOIN crm_organizations parent ON parent.id = organization.parent_organization_id
        WHERE organization.pipeline_id = $1::uuid
+         AND ${activeCrmRecordSql('organization')}
          AND ($2 = '' OR organization.reference_code ILIKE '%' || $2 || '%'
            OR organization.name ILIKE '%' || $2 || '%'
            OR organization.account_type ILIKE '%' || $2 || '%'
@@ -3584,13 +3586,15 @@ export async function listCrmRecordsInPostgres(input: {
   }
   if (input.entity === 'products') {
     const result = await query<Record<string, unknown>>(
-      `SELECT * FROM crm_products
-       WHERE pipeline_id = $1::uuid
-         AND ($2 = '' OR reference_code ILIKE '%' || $2 || '%'
-           OR name ILIKE '%' || $2 || '%' OR sku ILIKE '%' || $2 || '%'
-           OR product_type ILIKE '%' || $2 || '%' OR category ILIKE '%' || $2 || '%'
-           OR url ILIKE '%' || $2 || '%')
-       ORDER BY active DESC, lower(name), lower(COALESCE(sku, '')), id
+      `SELECT product.* FROM crm_products product
+       WHERE product.pipeline_id = $1::uuid
+         AND ${activeCrmRecordSql('product')}
+         AND ($2 = '' OR product.reference_code ILIKE '%' || $2 || '%'
+           OR product.name ILIKE '%' || $2 || '%' OR product.sku ILIKE '%' || $2 || '%'
+           OR product.product_type ILIKE '%' || $2 || '%' OR product.category ILIKE '%' || $2 || '%'
+           OR product.url ILIKE '%' || $2 || '%')
+       ORDER BY product.active DESC, lower(product.name),
+         lower(COALESCE(product.sku, '')), product.id
        LIMIT $3`,
       [input.pipelineId, search, limit],
     )
@@ -4551,9 +4555,13 @@ export async function readCrmSummaryFromPostgres(pipelineId: string): Promise<Cr
   const result = await query<Record<string, string>>(
     `
       SELECT
-        (SELECT count(*) FROM crm_organizations WHERE pipeline_id = $1::uuid)::text AS organizations,
+        (SELECT count(*) FROM crm_organizations organization
+         WHERE pipeline_id = $1::uuid
+           AND ${activeCrmRecordSql('organization')})::text AS organizations,
         (SELECT count(*) FROM crm_contacts WHERE pipeline_id = $1::uuid)::text AS contacts,
-        (SELECT count(*) FROM crm_products WHERE pipeline_id = $1::uuid)::text AS products,
+        (SELECT count(*) FROM crm_products product
+         WHERE pipeline_id = $1::uuid
+           AND ${activeCrmRecordSql('product')})::text AS products,
         (SELECT count(*) FROM crm_leads lead WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('lead')})::text AS leads,
         (SELECT count(*) FROM crm_opportunities WHERE pipeline_id = $1::uuid)::text AS opportunities,
         (SELECT count(*) FROM crm_meetings WHERE pipeline_id = $1::uuid)::text AS meetings,
@@ -4574,9 +4582,11 @@ export async function readCrmSummaryFromPostgres(pipelineId: string): Promise<Cr
         (SELECT COALESCE(sum(amount), 0) FROM crm_opportunities WHERE pipeline_id = $1::uuid AND lower(COALESCE(status, '')) NOT IN ('won', 'lost', 'closed', 'abandoned'))::text AS open_pipeline_value,
         (SELECT COALESCE(sum(amount * probability / 100), 0) FROM crm_opportunities WHERE pipeline_id = $1::uuid AND lower(COALESCE(status, '')) NOT IN ('won', 'lost', 'closed', 'abandoned'))::text AS weighted_pipeline_value,
         (SELECT count(*) FROM (
-          SELECT sync_status FROM crm_organizations WHERE pipeline_id = $1::uuid
+          SELECT sync_status FROM crm_organizations organization
+            WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('organization')}
           UNION ALL SELECT sync_status FROM crm_contacts WHERE pipeline_id = $1::uuid
-          UNION ALL SELECT sync_status FROM crm_products WHERE pipeline_id = $1::uuid
+          UNION ALL SELECT sync_status FROM crm_products product
+            WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('product')}
           UNION ALL SELECT sync_status FROM crm_leads lead WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('lead')}
           UNION ALL SELECT sync_status FROM crm_opportunities WHERE pipeline_id = $1::uuid
           UNION ALL SELECT sync_status FROM crm_meetings WHERE pipeline_id = $1::uuid
@@ -4584,9 +4594,11 @@ export async function readCrmSummaryFromPostgres(pipelineId: string): Promise<Cr
           UNION ALL SELECT sync_status FROM crm_campaigns campaign WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('campaign')}
         ) records WHERE sync_status IN ('pending', 'syncing'))::text AS pending_sync,
         (SELECT count(*) FROM (
-          SELECT sync_status FROM crm_organizations WHERE pipeline_id = $1::uuid
+          SELECT sync_status FROM crm_organizations organization
+            WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('organization')}
           UNION ALL SELECT sync_status FROM crm_contacts WHERE pipeline_id = $1::uuid
-          UNION ALL SELECT sync_status FROM crm_products WHERE pipeline_id = $1::uuid
+          UNION ALL SELECT sync_status FROM crm_products product
+            WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('product')}
           UNION ALL SELECT sync_status FROM crm_leads lead WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('lead')}
           UNION ALL SELECT sync_status FROM crm_opportunities WHERE pipeline_id = $1::uuid
           UNION ALL SELECT sync_status FROM crm_meetings WHERE pipeline_id = $1::uuid
@@ -4788,9 +4800,13 @@ export async function ensurePipelineCrmReferenceLinks(pipelineId: string) {
   if (!origin.startsWith('https://')) return 0
   const result = await query(
     `WITH RECURSIVE records AS (
-       SELECT reference_code, name AS title, 'organizations'::text AS entity, email FROM crm_organizations WHERE pipeline_id = $1::uuid
+       SELECT reference_code, name AS title, 'organizations'::text AS entity, email
+         FROM crm_organizations organization
+         WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('organization')}
        UNION ALL SELECT reference_code, full_name, 'contacts', email FROM crm_contacts WHERE pipeline_id = $1::uuid
-       UNION ALL SELECT reference_code, name, 'products', NULL::text FROM crm_products WHERE pipeline_id = $1::uuid
+       UNION ALL SELECT reference_code, name, 'products', NULL::text
+         FROM crm_products product
+         WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('product')}
        UNION ALL SELECT reference_code, full_name, 'leads', email FROM crm_leads lead
          WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('lead')}
        UNION ALL SELECT reference_code, name, 'opportunities', NULL::text FROM crm_opportunities WHERE pipeline_id = $1::uuid
