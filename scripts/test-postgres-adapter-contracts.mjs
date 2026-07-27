@@ -1555,6 +1555,11 @@ for (const migration of [
   '0108_operations_slotting_and_replenishment.sql',
   '0109_operations_replenishment_execution.sql',
   '0110_operations_carrier_account_sender_name.sql',
+  '0111_operations_commerce_integrations.sql',
+  '0112_operations_faire_oauth.sql',
+  '0113_operations_shopify_order_preview.sql',
+  '0114_operations_commerce_normalization.sql',
+  '0115_operations_commerce_intake_continuations.sql',
 ]) {
   assertIncludes(healthRoute, migration, 'hosted POS and accounting migration health')
 }

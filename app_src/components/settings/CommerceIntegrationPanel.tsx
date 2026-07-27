@@ -48,6 +48,7 @@ import VisibilityRounded from '@mui/icons-material/VisibilityRounded'
 import IntegrationSetupJourney, {
   type IntegrationSetupStepState,
 } from '@/components/settings/IntegrationSetupJourney'
+import CommerceIntakeWorkflow from '@/components/settings/CommerceIntakeWorkflow'
 
 type CommerceProvider = 'shopify' | 'faire'
 type CommerceEnvironment = 'sandbox' | 'production'
@@ -175,6 +176,7 @@ type CommercePayload = {
   canManage?: boolean
   canActivate?: boolean
   canRevealCredentials?: boolean
+  intakeAvailable?: boolean
   integrations?: CommerceState
   catalog?: CommerceCatalog
   authorizationUrl?: string
@@ -478,6 +480,7 @@ export default function CommerceIntegrationPanel() {
   const [catalog, setCatalog] = useState<CommerceCatalog | null>(null)
   const [canActivate, setCanActivate] = useState(false)
   const [canRevealCredentials, setCanRevealCredentials] = useState(false)
+  const [intakeAvailable, setIntakeAvailable] = useState(false)
   const [loading, setLoading] = useState(true)
   const [pendingAction, setPendingAction] = useState('')
   const [error, setError] = useState('')
@@ -517,6 +520,7 @@ export default function CommerceIntegrationPanel() {
     }
     if (payload.catalog) setCatalog(payload.catalog)
     setCanActivate(payload.canActivate === true)
+    setIntakeAvailable(payload.intakeAvailable === true)
     if (typeof payload.canRevealCredentials === 'boolean') {
       setCanRevealCredentials(payload.canRevealCredentials)
     }
@@ -1585,8 +1589,18 @@ export default function CommerceIntegrationPanel() {
                           : `${providerLabel(account.provider)} API connection needs attention.`}{' '}
                         {account.provider === 'shopify'
                           ? 'Receipt intake is a separate optional activation step.'
-                          : 'Faire polling, order import, and inventory synchronization are not active yet.'}
+                          : 'Scheduled Faire polling and inventory synchronization are not active; the development-only operator intake below is separate.'}
                       </Alert>
+
+                      {intakeAvailable
+                        && account.configured
+                        && account.verificationStatus === 'verified' ? (
+                        <CommerceIntakeWorkflow
+                          accountGlobalId={account.globalId}
+                          provider={account.provider}
+                          displayName={account.displayName}
+                        />
+                      ) : null}
 
                       {account.provider === 'shopify' && account.webhookUrl ? (
                         <Box>
@@ -1721,7 +1735,7 @@ export default function CommerceIntegrationPanel() {
                         </Box>
                       ) : null}
 
-                      {account.provider === 'shopify' ? (
+                      {account.provider === 'shopify' && !intakeAvailable ? (
                         <Accordion
                           disableGutters
                           variant="outlined"

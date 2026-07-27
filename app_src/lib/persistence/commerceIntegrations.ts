@@ -1083,34 +1083,72 @@ export async function recordCommerceProviderAttemptInPostgres(input: {
   completedAt: string
 }) {
   return withTransaction(async (client) => {
-    const result = await client.query<{
-      global_id: string
-      provider: CommerceProvider
-      environment: CommerceEnvironment
+    const account = await client.query<{
+      id: string
     }>(
+      `SELECT id::text
+       FROM operations_integration_accounts
+       WHERE organization_id = $1::uuid
+         AND global_id = $2
+         AND integration_type = 'commerce'
+       LIMIT 1
+       FOR SHARE`,
+      [input.organizationId, input.accountGlobalId],
+    )
+    if (!account.rows[0]) return null
+    await acquireTransactionAdvisoryLock(
+      client,
+      [
+        'commerce-provider-attempt',
+        input.organizationId,
+        account.rows[0].id,
+        input.action,
+        input.idempotencyKey,
+      ].join(':'),
+    )
+    const previous = await client.query<{
+      global_id: string
+      attempt_number: number
+      request_hash: string
+      state: string
+    }>(
+      `SELECT global_id, attempt_number, request_hash, state
+       FROM operations_commerce_provider_attempts
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND action = $3
+         AND idempotency_key = $4
+       ORDER BY attempt_number DESC
+       LIMIT 1`,
+      [
+        input.organizationId,
+        account.rows[0].id,
+        input.action,
+        input.idempotencyKey,
+      ],
+    )
+    const latest = previous.rows[0]
+    if (latest && latest.request_hash !== input.requestHash) {
+      throw new Error(
+        'Commerce provider attempt idempotency key was reused for a different request',
+      )
+    }
+    if (latest?.state === 'succeeded') return latest.global_id
+
+    const result = await client.query<{ global_id: string }>(
       `INSERT INTO operations_commerce_provider_attempts (
          organization_id, integration_account_id, action, adapter_version,
          idempotency_key, request_hash, redacted_request, redacted_response,
          state, provider_reference, error_code, requested_at, completed_at,
-         created_by
+         created_by, attempt_number
+       ) VALUES (
+         $1::uuid, $2::uuid, $3, $4, $5, $6, $7::jsonb, $8::jsonb,
+         $9, $10, $11, $12::timestamptz, $13::timestamptz, $14, $15
        )
-       SELECT
-         account.organization_id, account.id, $3, $4, $5, $6,
-         $7::jsonb, $8::jsonb, $9, $10, $11,
-         $12::timestamptz, $13::timestamptz, $14
-       FROM operations_integration_accounts account
-       WHERE account.organization_id = $1::uuid
-         AND account.global_id = $2
-         AND account.integration_type = 'commerce'
-       ON CONFLICT (
-         organization_id, integration_account_id, action, idempotency_key,
-         attempt_number
-       )
-       DO NOTHING
        RETURNING global_id`,
       [
         input.organizationId,
-        input.accountGlobalId,
+        account.rows[0].id,
         input.action,
         input.adapterVersion,
         input.idempotencyKey,
@@ -1123,9 +1161,10 @@ export async function recordCommerceProviderAttemptInPostgres(input: {
         input.requestedAt,
         input.completedAt,
         input.actorEmail,
+        (latest?.attempt_number || 0) + 1,
       ],
     )
-    return result.rows[0]?.global_id || null
+    return result.rows[0].global_id
   })
 }
 
