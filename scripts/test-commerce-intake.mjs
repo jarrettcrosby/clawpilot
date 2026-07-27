@@ -385,11 +385,42 @@ const workflowSource = read(
 includes(workflowSource, [
   'operatorCommandsAllowed',
   'provider_cursor_live',
-  'Open Operations',
+  'initializeShadowActivation',
+  "'initialize-shadow'",
+  'confirmShadowActivation: true',
+  'Enable Shadow',
+  'Review Operations',
   'Every staged',
-  'Set Activation to Shadow or Active',
   'href="#operations"',
 ], 'Commerce intake activation recovery')
+const intakeRouteSource = read(
+  'app_src/app/api/integrations/commerce/intake/route.ts',
+)
+includes(intakeRouteSource, [
+  "body.action === 'initialize-shadow'",
+  'assertCommerceIntakeRuntime()',
+  'requireActivator(user)',
+  'confirmShadowActivation',
+  "state: 'shadow'",
+  'expectedActivationState',
+  'expectedActivationRevision',
+  'expectedCurrentState',
+  'expectedCurrentRevision',
+  'getCommerceIntake',
+], 'Authenticated in-place Shadow activation recovery')
+includes(persistenceSource, [
+  "'COMMERCE_INTAKE_ACTIVATION_REQUIRED'",
+  'Initialize Operations in Shadow mode',
+], 'Missing activation recovery')
+const operationsPersistenceSource = read(
+  'app_src/lib/persistence/operations.ts',
+)
+includes(operationsPersistenceSource, [
+  'input.expectedCurrentState',
+  "input.expectedCurrentState === 'missing'",
+  'row.revision === input.expectedCurrentRevision',
+  "'OPERATIONS_ACTIVATION_STATE_CONFLICT'",
+], 'Activation recovery state fencing')
 includes(workflowSource, [
   "'fetch-products'",
   "'fetch-next-products'",
@@ -469,6 +500,15 @@ class MockCommerceIntegrationRequestError extends Error {
   constructor(message, status, code) {
     super(message)
     this.name = 'CommerceIntegrationRequestError'
+    this.status = status
+    this.code = code
+  }
+}
+
+class MockOperationsRequestError extends Error {
+  constructor(code, message, status = 400) {
+    super(message)
+    this.name = 'OperationsRequestError'
     this.status = status
     this.code = code
   }
@@ -1507,6 +1547,8 @@ try {
 let authenticated = true
 let postgresEnabled = true
 let managerEnabled = true
+let activatorEnabled = true
+let intakeRuntimeEnabled = true
 const routeTrace = []
 const routeServiceCalls = []
 const routeActor = {
@@ -1529,6 +1571,16 @@ const route = loadTypeScriptModule(
         },
       },
       '@/lib/integrations/commerceIntake': {
+        assertCommerceIntakeRuntime() {
+          routeTrace.push('runtime')
+          if (!intakeRuntimeEnabled) {
+            throw new MockCommerceIntegrationRequestError(
+              'Commerce intake is not enabled in this environment',
+              404,
+              'COMMERCE_INTAKE_DISABLED',
+            )
+          }
+        },
         async executeCommerceIntakeCommand(input) {
           routeTrace.push('service-post')
           routeServiceCalls.push({ method: 'POST', input })
@@ -1542,18 +1594,41 @@ const route = loadTypeScriptModule(
       },
       '@/lib/integrations/commerceIntegrations': {
         CommerceIntegrationRequestError: MockCommerceIntegrationRequestError,
+        async getCommerceIntegrationsState() {
+          routeTrace.push('integration-state')
+          return {
+            accounts: [{
+              globalId: shopifyRuntime.globalId,
+              configured: true,
+              verificationStatus: 'verified',
+            }],
+          }
+        },
         sanitizedCommerceIntegrationError: sanitizeCommerceError,
       },
       '@/lib/operations/authorization': {
         operationsCapabilities() {
           routeTrace.push('manager')
-          return { canManage: managerEnabled }
+          return {
+            canManage: managerEnabled,
+            canActivate: activatorEnabled,
+          }
         },
       },
       '@/lib/persistence/config': {
         isPostgresStorageEnabled() {
           routeTrace.push('postgres')
           return postgresEnabled
+        },
+      },
+      '@/lib/persistence/operations': {
+        OperationsRequestError: MockOperationsRequestError,
+        async updateOperationsActivationInPostgres(input) {
+          routeTrace.push('activation-update')
+          return {
+            state: input.state,
+            revision: 1,
+          }
         },
       },
       '@/lib/requestUser': {
@@ -1627,5 +1702,59 @@ response = await route.POST(mockRequest('POST', {
 assert.equal(response.status, 200)
 assert.deepEqual(routeTrace, ['auth', 'postgres', 'manager', 'service-post'])
 assert.equal(routeServiceCalls.at(-1).input.actorEmail, actorEmail)
+
+intakeRuntimeEnabled = false
+routeTrace.length = 0
+response = await route.POST(mockRequest('POST', {
+  action: 'initialize-shadow',
+  accountGlobalId: shopifyRuntime.globalId,
+  confirmShadowActivation: true,
+  expectedActivationState: 'missing',
+  expectedActivationRevision: null,
+}))
+assert.equal(response.status, 404)
+assert.deepEqual(routeTrace, ['auth', 'postgres', 'manager', 'runtime'])
+assert.ok(!routeTrace.includes('activation-update'))
+
+intakeRuntimeEnabled = true
+activatorEnabled = false
+routeTrace.length = 0
+response = await route.POST(mockRequest('POST', {
+  action: 'initialize-shadow',
+  accountGlobalId: shopifyRuntime.globalId,
+  confirmShadowActivation: true,
+  expectedActivationState: 'missing',
+  expectedActivationRevision: null,
+}))
+assert.equal(response.status, 403)
+assert.deepEqual(routeTrace, [
+  'auth',
+  'postgres',
+  'manager',
+  'runtime',
+  'manager',
+])
+
+activatorEnabled = true
+routeTrace.length = 0
+response = await route.POST(mockRequest('POST', {
+  action: 'initialize-shadow',
+  accountGlobalId: shopifyRuntime.globalId,
+  confirmShadowActivation: true,
+  expectedActivationState: 'missing',
+  expectedActivationRevision: null,
+}))
+assert.equal(response.status, 200)
+assert.deepEqual(routeTrace, [
+  'auth',
+  'postgres',
+  'manager',
+  'runtime',
+  'manager',
+  'integration-state',
+  'activation-update',
+  'service-get',
+])
+assert.equal(response.payload.intake.accountGlobalId, shopifyRuntime.globalId)
 
 console.log('PASS test-commerce-intake')

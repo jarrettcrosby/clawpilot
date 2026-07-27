@@ -136,6 +136,7 @@ type IntakeAccountRow = {
     | 'read_only'
     | 'active'
     | 'frozen'
+  activation_revision: number
 }
 
 type CandidateRow = {
@@ -593,7 +594,8 @@ async function resolveAccount(
        account.provider,
        account.commerce_credential_generation AS credential_version,
        pipeline.id::text AS pipeline_id,
-       activation.state AS activation_state
+       activation.state AS activation_state,
+       activation.revision AS activation_revision
      FROM operations_integration_accounts account
      JOIN operations_activation_scopes activation
        ON activation.organization_id = account.organization_id
@@ -609,7 +611,28 @@ async function resolveAccount(
     [input.organizationId, input.accountGlobalId],
   )
   const row = result.rows[0]
-  if (!row) throw new Error('Commerce intake account is unavailable')
+  if (!row) {
+    const account = await client.query(
+      `SELECT 1
+       FROM operations_integration_accounts
+       WHERE organization_id = $1::uuid
+         AND global_id = $2
+         AND integration_type = 'commerce'
+         AND provider IN ('shopify', 'faire')
+       LIMIT 1`,
+      [input.organizationId, input.accountGlobalId],
+    )
+    if (account.rows[0]) {
+      intakeError(
+        'COMMERCE_INTAKE_ACTIVATION_REQUIRED',
+        'Initialize Operations in Shadow mode before reading products or orders',
+      )
+    }
+    intakeError(
+      'COMMERCE_INTAKE_ACCOUNT_REQUIRED',
+      'The selected commerce connection is unavailable',
+    )
+  }
   return row
 }
 
@@ -5132,6 +5155,7 @@ export async function readCommerceIntakeStateFromPostgres(input: {
         defaultSlaPolicyVersion: DEFAULT_SLA_POLICY_VERSION,
         retentionDays: 30,
         activationState: account.activation_state,
+        activationRevision: account.activation_revision,
         operatorCommandsAllowed: ['shadow', 'active'].includes(
           account.activation_state,
         ),

@@ -211,6 +211,7 @@ type CommerceIntake = {
       | 'read_only'
       | 'active'
       | 'frozen'
+    activationRevision?: number | null
     operatorCommandsAllowed?: boolean
     providerWritesAllowed?: boolean
     syncCursorAdvanceAllowed?: boolean
@@ -317,6 +318,7 @@ type CommerceIntakeWorkflowProps = {
   accountGlobalId: string
   provider: CommerceProvider
   displayName: string
+  canActivate: boolean
 }
 
 class IntakeRequestError extends Error {
@@ -519,11 +521,13 @@ export default function CommerceIntakeWorkflow({
   accountGlobalId,
   provider,
   displayName,
+  canActivate,
 }: CommerceIntakeWorkflowProps) {
   const [intake, setIntake] = useState<CommerceIntake | null>(null)
   const [loading, setLoading] = useState(true)
   const [pendingAction, setPendingAction] = useState('')
   const [error, setError] = useState('')
+  const [errorCode, setErrorCode] = useState('')
   const [notice, setNotice] = useState('')
   const [productDrafts, setProductDrafts] = useState<
     Record<string, ProductDraft>
@@ -568,6 +572,7 @@ export default function CommerceIntakeWorkflow({
     const controller = new AbortController()
     setLoading(true)
     setError('')
+    setErrorCode('')
     setNotice('')
     setIntake(null)
     retryKeys.current.clear()
@@ -581,7 +586,14 @@ export default function CommerceIntakeWorkflow({
     setUnsupportedReasons({})
     loadIntake(controller.signal)
       .catch((requestError) => {
-        if (!controller.signal.aborted) setError(safeError(requestError))
+        if (!controller.signal.aborted) {
+          setError(safeError(requestError))
+          setErrorCode(
+            requestError instanceof IntakeRequestError
+              ? requestError.code
+              : '',
+          )
+        }
       })
       .finally(() => {
         if (!controller.signal.aborted) setLoading(false)
@@ -602,6 +614,7 @@ export default function CommerceIntakeWorkflow({
     retryKeys.current.set(retryKey, stableIdempotencyKey)
     setPendingAction(requestKey)
     setError('')
+    setErrorCode('')
     setNotice('')
     try {
       const response = await fetch('/api/integrations/commerce/intake', {
@@ -636,6 +649,11 @@ export default function CommerceIntakeWorkflow({
         await loadIntake().catch(() => undefined)
       }
       setError(safeError(requestError))
+      setErrorCode(
+        requestError instanceof IntakeRequestError
+          ? requestError.code
+          : '',
+      )
     } finally {
       setPendingAction('')
     }
@@ -645,6 +663,7 @@ export default function CommerceIntakeWorkflow({
     if (pendingAction) return
     setPendingAction('reload')
     setError('')
+    setErrorCode('')
     setNotice('')
     try {
       await loadIntake()
@@ -660,6 +679,54 @@ export default function CommerceIntakeWorkflow({
       setNotice('Workflow reloaded from current ClawPilot intake state.')
     } catch (requestError) {
       setError(safeError(requestError))
+      setErrorCode(
+        requestError instanceof IntakeRequestError
+          ? requestError.code
+          : '',
+      )
+    } finally {
+      setPendingAction('')
+    }
+  }
+
+  async function initializeShadowActivation() {
+    if (pendingAction) return
+    if (
+      !window.confirm(
+        `Set ${displayName}'s organization Operations mode to Shadow? This enables reviewed ClawPilot intake decisions but does not write to ${providerLabel(provider)} or start background synchronization.`,
+      )
+    ) return
+    setPendingAction('initialize-shadow')
+    setError('')
+    setErrorCode('')
+    setNotice('')
+    try {
+      const response = await fetch('/api/integrations/commerce/intake', {
+        method: 'POST',
+        cache: 'no-store',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          accountGlobalId,
+          action: 'initialize-shadow',
+          confirmShadowActivation: true,
+          expectedActivationState:
+            intake?.policy?.activationState || 'missing',
+          expectedActivationRevision:
+            intake?.policy?.activationRevision ?? null,
+        }),
+      })
+      const payload = await readPayload(response)
+      setIntake(payload.intake || null)
+      setNotice(
+        'Operations is now in Shadow mode. Product and order intake actions are unlocked.',
+      )
+    } catch (requestError) {
+      setError(safeError(requestError))
+      setErrorCode(
+        requestError instanceof IntakeRequestError
+          ? requestError.code
+          : '',
+      )
     } finally {
       setPendingAction('')
     }
@@ -682,7 +749,12 @@ export default function CommerceIntakeWorkflow({
   const productPagination = intake?.paginations?.products
     || (latestPagination?.resource === 'products' ? latestPagination : null)
   const operatorCommandsAllowed =
-    intake?.policy?.operatorCommandsAllowed !== false
+    intake?.policy?.operatorCommandsAllowed === true
+  const activationRecoveryAvailable = canActivate && (
+    errorCode === 'COMMERCE_INTAKE_ACTIVATION_REQUIRED'
+    || intake?.policy?.activationState === 'disabled'
+    || intake?.policy?.activationState === 'read_only'
+  )
   const canFetchNextOrders = Boolean(
     orderPagination?.hasNextBatch
     && orderPagination.continuationRunGlobalId,
@@ -1211,14 +1283,30 @@ export default function CommerceIntakeWorkflow({
             <Alert
               severity="warning"
               action={(
-                <Button color="inherit" size="small" href="#operations">
-                  Open Operations
-                </Button>
+                <Stack direction={{ xs: 'column', sm: 'row' }} spacing={0.5}>
+                  {activationRecoveryAvailable ? (
+                    <Button
+                      color="inherit"
+                      size="small"
+                      disabled={pendingAction !== ''}
+                      onClick={() => void initializeShadowActivation()}
+                    >
+                      {pendingAction === 'initialize-shadow'
+                        ? 'Enabling…'
+                        : 'Enable Shadow'}
+                    </Button>
+                  ) : null}
+                  <Button color="inherit" size="small" href="#operations">
+                    Review Operations
+                  </Button>
+                </Stack>
               )}
             >
               Resolution and promotion are locked while Operations activation
-              is {humanize(intake?.policy?.activationState || 'disabled')}.
-              Set Activation to Shadow or Active, then reload this workflow.
+              is {humanize(intake?.policy?.activationState || 'not initialized')}.
+              {activationRecoveryAvailable
+                ? ' Enable Shadow here to unlock the reviewed workflow.'
+                : ' Review Operations activation before continuing.'}
             </Alert>
           ) : null}
           {(
