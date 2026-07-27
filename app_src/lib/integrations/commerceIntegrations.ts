@@ -228,7 +228,7 @@ function accessToken(value: unknown, provider: 'Faire') {
   const normalized = String(value || '').trim()
   if (
     normalized.length < 8
-    || normalized.length > 8192
+    || normalized.length > 4096
     || !/^[\x21-\x7e]+$/.test(normalized)
   ) {
     throw new CommerceIntegrationRequestError(

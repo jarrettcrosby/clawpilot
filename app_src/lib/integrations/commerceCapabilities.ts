@@ -277,7 +277,8 @@ export const COMMERCE_CUSTOM_INTEGRATION_ONBOARDING = {
   },
   faire: {
     ownership: 'brand_owned_custom_application',
-    authMode: 'faire_oauth',
+    authMode: 'faire_brand_token',
+    supportedAuthModes: ['faire_brand_token', 'faire_oauth'],
     developerPortalUrl: 'https://developers.faire.com/signup',
     setupGuideUrl:
       'https://developers.faire.com/docs#/#authentication',
@@ -285,11 +286,10 @@ export const COMMERCE_CUSTOM_INTEGRATION_ONBOARDING = {
       'https://www.faire.com/support/articles/37632363832091',
     requiredBeforeConnect: [
       'Create a Faire Developer account and a Custom App.',
-      'Copy the Application ID and Secret ID from App Details and Settings.',
-      'OAuth eligibility is confirmed only when Faire accepts this app at authorization; Faire documents a separate single-brand API-key flow that this ClawPilot form does not accept.',
-      'Enter both credentials in ClawPilot and continue to Faire.',
-      'Sign in to the intended Faire brand and approve the requested permissions.',
-      'Return to ClawPilot so it can exchange the one-use code and verify the brand profile.',
+      'For one brand, use the unpublished integration in Faire Brand Portal to generate a final API key.',
+      'Paste only that generated API key into ClawPilot; the APA application token and Secret ID are not the final brand API key.',
+      'Alternatively, use Application ID and Secret ID only when Faire accepts the Custom App OAuth authorization flow.',
+      'ClawPilot makes one read-only brand-profile request before encrypted persistence.',
     ],
     supportContact: 'developers@faire.com',
     minimumProbeScope: 'READ_BRAND',

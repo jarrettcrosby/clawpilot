@@ -165,6 +165,7 @@ type CommerceCatalog = {
     inventoryMutation: boolean
     fulfillmentExport: boolean
     multiMerchantOauth: boolean
+    faireBrandApiKey: boolean
     faireCustomAppOauth: boolean
   }
 }
@@ -288,7 +289,9 @@ type ShopifyForm = {
 }
 
 type FaireForm = {
+  authPath: 'brand_api_key' | 'oauth'
   displayName: string
+  apiKey: string
   applicationId: string
   applicationSecret: string
   scopeProfile: 'connection_test' | 'distributed_operations'
@@ -500,7 +503,9 @@ export default function CommerceIntegrationPanel() {
     confirmLiveAccess: false,
   })
   const [faire, setFaire] = useState<FaireForm>({
+    authPath: 'brand_api_key',
     displayName: '',
+    apiKey: '',
     applicationId: '',
     applicationSecret: '',
     scopeProfile: 'connection_test',
@@ -734,6 +739,27 @@ export default function CommerceIntegrationPanel() {
 
   async function connectFaire(event: FormEvent) {
     event.preventDefault()
+    if (faire.authPath === 'brand_api_key') {
+      const saved = await action(
+        'connect-faire-api-key',
+        {
+          action: 'connect-faire-api-key',
+          displayName: faire.displayName,
+          accessToken: faire.apiKey,
+          confirmLiveAccess: faire.confirmLiveAccess,
+        },
+        'Faire generated API key connected and the brand identity was verified with a read-only request. Synchronization remains unavailable until the polling worker is released.',
+      )
+      if (saved) {
+        setRevealedCredential(null)
+        setFaire((current) => ({
+          ...current,
+          apiKey: '',
+          confirmLiveAccess: false,
+        }))
+      }
+      return
+    }
     setPendingAction('start-faire-oauth')
     setError('')
     setNotice('')
@@ -743,7 +769,11 @@ export default function CommerceIntegrationPanel() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           action: 'start-faire-oauth',
-          ...faire,
+          displayName: faire.displayName,
+          applicationId: faire.applicationId,
+          applicationSecret: faire.applicationSecret,
+          scopeProfile: faire.scopeProfile,
+          confirmLiveAccess: faire.confirmLiveAccess,
         }),
       })
       if (!payload.authorizationUrl) {
@@ -902,9 +932,10 @@ export default function CommerceIntegrationPanel() {
       <Alert severity="info">
         These are user-owned custom integrations. Create the application in
         the provider portal first. Shopify verifies the installed
-        merchant-owned app credentials directly. Faire securely stages the
-        Custom App credentials, redirects you to authorize the intended brand,
-        and exchanges the one-use callback code on the server.
+        merchant-owned app credentials directly. For a single Faire brand,
+        generate the final API key in Faire Brand Portal and paste it below.
+        Custom App OAuth remains available when Faire accepts that app&apos;s
+        authorization flow.
       </Alert>
       <Alert severity="warning">
         A verified connection proves provider identity and encrypted credential
@@ -1213,30 +1244,64 @@ export default function CommerceIntegrationPanel() {
             <Stack component="form" spacing={2} onSubmit={connectFaire}>
               <Box>
                 <Typography variant="subtitle1" fontWeight={700}>
-                  Faire Custom App OAuth
+                  Faire custom integration
                 </Typography>
                 <Typography variant="body2" color="text.secondary">
-                  Application ID + Secret ID authorization for the production
-                  B2B wholesale marketplace. Faire confirms this Custom App&apos;s
-                  OAuth eligibility only when it accepts the authorization
-                  request.
+                  Connect one production Faire brand with the generated API
+                  key from Brand Portal, or use Custom App OAuth when Faire
+                  accepts that application&apos;s authorization flow.
                 </Typography>
               </Box>
+              <FormControl sx={fieldSx}>
+                <InputLabel id="faire-auth-path-label">
+                  Connection method
+                </InputLabel>
+                <Select
+                  labelId="faire-auth-path-label"
+                  label="Connection method"
+                  value={faire.authPath}
+                  onChange={(event) => {
+                    const authPath = event.target.value as FaireForm['authPath']
+                    setFaire((current) => ({
+                      ...current,
+                      authPath,
+                      apiKey: authPath === 'oauth' ? '' : current.apiKey,
+                      applicationSecret:
+                        authPath === 'brand_api_key'
+                          ? ''
+                          : current.applicationSecret,
+                      confirmLiveAccess: false,
+                    }))
+                  }}
+                >
+                  <MenuItem value="brand_api_key">
+                    Generated API key — single brand (recommended)
+                  </MenuItem>
+                  <MenuItem value="oauth">
+                    Custom App OAuth — if enabled by Faire
+                  </MenuItem>
+                </Select>
+              </FormControl>
               <IntegrationSetupJourney
                 title="Before you connect · Faire setup"
-                description="Faire exposes more than one provider-side path. This journey identifies the path ClawPilot can complete and the facts an administrator should verify."
+                description="Follow the provider-side path that matches the credential Faire issued. The generated brand API key and OAuth application credentials are different values."
                 steps={[
                   {
                     key: 'faire-path',
                     label: 'Choose the Faire connection path',
                     state: faireAccount?.configured ? 'complete' : 'current',
-                    description:
-                      'This form supports Faire Custom App OAuth using the Application ID and Secret ID. Faire separately documents a single-brand API-key flow. If the brand portal shows Email partner or Generate API key, that is the separate APA-token/final-key path and the generated key is not connectable here.',
+                    description: faire.authPath === 'brand_api_key'
+                      ? 'Use this path when Faire Brand Portal shows Email partner and Generate API key. The generated final API key is connectable below; the Application ID or APA application token is not the API key.'
+                      : 'Use this path only when Faire accepts the Custom App OAuth authorization request made with the Application ID and Secret ID.',
                     facts: [
                       {
                         label: 'ClawPilot auth mode',
                         value: faireAccount?.authMode
-                          || 'Faire Custom App OAuth',
+                          || (
+                            faire.authPath === 'brand_api_key'
+                              ? 'Generated brand API key'
+                              : 'Faire Custom App OAuth'
+                          ),
                       },
                       {
                         label: 'Provider environment',
@@ -1268,7 +1333,7 @@ export default function CommerceIntegrationPanel() {
                           size="small"
                           endIcon={<OpenInNewRounded />}
                         >
-                          Faire OAuth guide
+                          Custom App OAuth guide
                         </Button>
                         <Button
                           href={catalog.onboarding.faire.directTokenGuideUrl}
@@ -1278,18 +1343,40 @@ export default function CommerceIntegrationPanel() {
                           size="small"
                           endIcon={<OpenInNewRounded />}
                         >
-                          Single-brand guide — not connectable here
+                          Generate a single-brand API key
                         </Button>
                       </Stack>
                     ) : undefined,
                   },
                   {
                     key: 'faire-app',
-                    label: 'Configure the Custom App',
+                    label: faire.authPath === 'brand_api_key'
+                      ? 'Generate the brand API key'
+                      : 'Configure the Custom App',
                     state: faireAccount?.configured ? 'complete' : 'current',
-                    description:
-                      'Copy the Application ID and Secret ID from App Details and Settings. OAuth eligibility only when it accepts the authorization is the provider proof; there is no documented preliminary server ping.',
-                    facts: [
+                    description: faire.authPath === 'brand_api_key'
+                      ? 'In Faire Brand Portal, open the unpublished integration for your Custom App and choose Generate API key. Copy the generated key once and keep it separate from the Application ID and Secret ID.'
+                      : 'Copy the Application ID and Secret ID from App Details and Settings. Faire proves OAuth eligibility only by accepting the authorization request; there is no documented preliminary server ping.',
+                    facts: faire.authPath === 'brand_api_key' ? [
+                      {
+                        label: 'Provider flow',
+                        value: 'Unpublished integration · single brand',
+                      },
+                      {
+                        label: 'Credential accepted below',
+                        value: 'Generated API key only',
+                      },
+                      {
+                        label: 'Identity verification',
+                        value: 'One read-only brand-profile request',
+                      },
+                      {
+                        label: 'Provider support',
+                        value: catalog
+                          ? catalog.onboarding.faire.supportContact
+                          : 'Faire Developer Support',
+                      },
+                    ] : [
                       {
                         label: 'ClawPilot OAuth callback URL',
                         value: catalog?.onboarding.faire.callbackUrl
@@ -1319,10 +1406,11 @@ export default function CommerceIntegrationPanel() {
                   },
                   {
                     key: 'faire-authorize',
-                    label: 'Authorize the intended brand',
+                    label: 'Verify the intended brand',
                     state: faireConnectionState,
-                    description:
-                      'Enter the application credentials below, continue to Faire, approve the intended brand, and return through the one-use callback. ClawPilot exchanges the code server-side and verifies the brand profile before encrypted persistence.',
+                    description: faire.authPath === 'brand_api_key'
+                      ? 'Paste the generated API key below. ClawPilot sends one read-only request to Faire’s brand-profile endpoint, verifies the immutable brand identity, encrypts the key, and leaves synchronization disabled.'
+                      : 'Enter the application credentials below, continue to Faire, approve the intended brand, and return through the one-use callback. ClawPilot exchanges the code server-side and verifies the brand profile before encrypted persistence.',
                     facts: [
                       {
                         label: 'Faire brand ID',
@@ -1383,54 +1471,75 @@ export default function CommerceIntegrationPanel() {
                 inputProps={{ maxLength: 120 }}
                 sx={fieldSx}
               />
-              <TextField
-                required
-                label="Faire Application ID"
-                value={faire.applicationId}
-                onChange={(event) => setFaire((current) => ({
-                  ...current,
-                  applicationId: event.target.value,
-                }))}
-                placeholder="Application ID from Faire"
-                helperText="Copy the Application ID shown in Faire Developer Portal under App Details and Settings."
-                autoComplete="off"
-                inputProps={{ maxLength: 255 }}
-                sx={fieldSx}
-              />
-              <TextField
-                required
-                type="password"
-                label="Faire Secret ID"
-                value={faire.applicationSecret}
-                onChange={(event) => setFaire((current) => ({
-                  ...current,
-                  applicationSecret: event.target.value,
-                }))}
-                helperText="Copy the Secret ID from Faire. It is encrypted for the pending setup and is never placed in the redirect URL or returned by the API."
-                autoComplete="new-password"
-                sx={fieldSx}
-              />
-              <FormControl sx={fieldSx}>
-                <InputLabel id="faire-scope-profile-label">
-                  Permission profile
-                </InputLabel>
-                <Select
-                  labelId="faire-scope-profile-label"
-                  label="Permission profile"
-                  value={faire.scopeProfile}
+              {faire.authPath === 'brand_api_key' ? (
+                <TextField
+                  required
+                  type="password"
+                  label="Faire generated API key"
+                  value={faire.apiKey}
                   onChange={(event) => setFaire((current) => ({
                     ...current,
-                    scopeProfile: event.target.value as FaireForm['scopeProfile'],
+                    apiKey: event.target.value,
                   }))}
-                >
-                  <MenuItem value="connection_test">
-                    Connection test — READ_BRAND only
-                  </MenuItem>
-                  <MenuItem value="distributed_operations">
-                    Distributed operations — all 10 documented permissions
-                  </MenuItem>
-                </Select>
-              </FormControl>
+                  placeholder="Paste the final key generated in Brand Portal"
+                  helperText="Use the final API key from Generate API key. Do not paste the Application ID, APA application token, or Secret ID. ClawPilot encrypts this key and never reveals it after save."
+                  autoComplete="new-password"
+                  inputProps={{ maxLength: 4096 }}
+                  sx={fieldSx}
+                />
+              ) : (
+                <>
+                  <TextField
+                    required
+                    label="Faire Application ID"
+                    value={faire.applicationId}
+                    onChange={(event) => setFaire((current) => ({
+                      ...current,
+                      applicationId: event.target.value,
+                    }))}
+                    placeholder="Application ID from Faire"
+                    helperText="Copy the Application ID shown in Faire Developer Portal under App Details and Settings."
+                    autoComplete="off"
+                    inputProps={{ maxLength: 255 }}
+                    sx={fieldSx}
+                  />
+                  <TextField
+                    required
+                    type="password"
+                    label="Faire Secret ID"
+                    value={faire.applicationSecret}
+                    onChange={(event) => setFaire((current) => ({
+                      ...current,
+                      applicationSecret: event.target.value,
+                    }))}
+                    helperText="Copy the Secret ID from Faire. It is encrypted for the pending setup and is never placed in the redirect URL or returned by the API."
+                    autoComplete="new-password"
+                    sx={fieldSx}
+                  />
+                  <FormControl sx={fieldSx}>
+                    <InputLabel id="faire-scope-profile-label">
+                      Permission profile
+                    </InputLabel>
+                    <Select
+                      labelId="faire-scope-profile-label"
+                      label="Permission profile"
+                      value={faire.scopeProfile}
+                      onChange={(event) => setFaire((current) => ({
+                        ...current,
+                        scopeProfile:
+                          event.target.value as FaireForm['scopeProfile'],
+                      }))}
+                    >
+                      <MenuItem value="connection_test">
+                        Connection test — READ_BRAND only
+                      </MenuItem>
+                      <MenuItem value="distributed_operations">
+                        Distributed operations — all 10 documented permissions
+                      </MenuItem>
+                    </Select>
+                  </FormControl>
+                </>
+              )}
               <FormControlLabel
                 control={(
                   <Checkbox
@@ -1441,7 +1550,9 @@ export default function CommerceIntegrationPanel() {
                     }))}
                   />
                 )}
-                label="I authorize the Faire redirect, server-side code exchange, and live production brand-profile verification."
+                label={faire.authPath === 'brand_api_key'
+                  ? 'I authorize one read-only Faire brand-profile request to verify this generated API key. No Faire data will be written or synchronized.'
+                  : 'I authorize the Faire redirect, server-side code exchange, and live production brand-profile verification.'}
               />
               <Button
                 type="submit"
@@ -1450,14 +1561,21 @@ export default function CommerceIntegrationPanel() {
                 disabled={
                   pendingAction !== ''
                   || !faire.confirmLiveAccess
-                  || !faire.applicationId
-                  || !faire.applicationSecret
+                  || (
+                    faire.authPath === 'brand_api_key'
+                      ? !faire.apiKey
+                      : !faire.applicationId || !faire.applicationSecret
+                  )
                 }
                 sx={actionButtonSx}
               >
-                {pendingAction === 'start-faire-oauth'
-                  ? 'Preparing Faire…'
-                  : 'Continue to Faire'}
+                {pendingAction === 'connect-faire-api-key'
+                  ? 'Verifying API key…'
+                  : pendingAction === 'start-faire-oauth'
+                    ? 'Preparing Faire…'
+                    : faire.authPath === 'brand_api_key'
+                      ? 'Connect generated API key'
+                      : 'Continue to Faire'}
               </Button>
             </Stack>
           </CardContent>
@@ -2093,7 +2211,8 @@ export default function CommerceIntegrationPanel() {
                             ? 'Testing…'
                             : 'Test connection'}
                         </Button>
-                        {canRevealCredentials ? (
+                        {canRevealCredentials
+                          && account.authMode !== 'faire_brand_token' ? (
                           <Button
                             variant="outlined"
                             startIcon={pendingAction
@@ -2111,6 +2230,17 @@ export default function CommerceIntegrationPanel() {
                           >
                             Reveal credentials
                           </Button>
+                        ) : null}
+                        {account.authMode === 'faire_brand_token' ? (
+                          <Typography
+                            variant="caption"
+                            color="text.secondary"
+                            sx={{ alignSelf: 'center', maxWidth: 360 }}
+                          >
+                            Faire generated API keys are encrypted and
+                            non-revealable. Generate a replacement in Faire and
+                            reconnect to rotate this credential.
+                          </Typography>
                         ) : null}
                         {account.provider === 'shopify'
                           && account.configured
@@ -2396,12 +2526,15 @@ export default function CommerceIntegrationPanel() {
 
       <Typography variant="caption" color="text.secondary">
         Shopify custom integrations exchange merchant-owned Dev Dashboard app
-        credentials for short-lived tokens when needed. Faire Custom Apps use
-        an authorization-code exchange and both provider-required OAuth headers
-        after the brand approves access. Application credentials are encrypted
-        and masked by default; an authorized owning-organization administrator
-        can request an audited 30-second reveal of the current generation.
-        Provider access and refresh tokens are never returned.
+        credentials for short-lived tokens when needed. A Faire single-brand
+        connection sends its encrypted generated API key only in the
+        provider-required access-token header. Faire OAuth uses an
+        authorization-code exchange when the provider accepts that path.
+        Application credentials are encrypted and masked by default; an
+        authorized owning-organization administrator can request an audited
+        30-second reveal of current Shopify or Faire OAuth application
+        credentials. Provider API keys, access tokens, and refresh tokens are
+        never returned.
       </Typography>
     </Stack>
   )
