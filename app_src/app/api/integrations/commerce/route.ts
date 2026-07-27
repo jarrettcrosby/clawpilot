@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import {
+  connectFaireCommerce,
   connectShopifyCommerce,
   CommerceIntegrationRequestError,
   disconnectCommerceIntegration,
@@ -252,6 +253,7 @@ function capabilityCatalog() {
       inventoryMutation: false,
       fulfillmentExport: false,
       multiMerchantOauth: false,
+      faireBrandApiKey: true,
       faireCustomAppOauth: true,
     },
   }
@@ -369,6 +371,35 @@ export async function PATCH(req: NextRequest) {
       return json({
         ok: true,
         ...oauth,
+      })
+    }
+
+    if (action === 'connect-faire-api-key') {
+      only(body, [
+        'action',
+        'displayName',
+        'accessToken',
+        'confirmLiveAccess',
+      ])
+      if (body.confirmLiveAccess !== true) {
+        throw new CommerceIntegrationRequestError(
+          'Confirm that ClawPilot may make one read-only Faire brand-profile request to verify this API key',
+          400,
+          'COMMERCE_LIVE_ACCESS_CONFIRMATION_REQUIRED',
+        )
+      }
+      const integrations = await connectFaireCommerce({
+        organizationId: organization,
+        displayName: body.displayName,
+        accessToken: body.accessToken,
+        actorEmail: actor.email,
+      })
+      return json({
+        ok: true,
+        canManage: true,
+        canActivate: operationsCapabilities(actor).canActivate,
+        integrations,
+        catalog: capabilityCatalog(),
       })
     }
 

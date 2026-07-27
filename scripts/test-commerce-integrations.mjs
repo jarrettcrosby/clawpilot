@@ -319,6 +319,22 @@ assert.ok(
     < faireOauthCompleteSource.indexOf('encryptCommerceCredential'),
   'Faire OAuth brand identity must be verified before credential persistence',
 )
+const faireApiKeyConnectSource = service.slice(
+  service.indexOf('export async function connectFaireCommerce'),
+  service.indexOf('function decryptStoredCredential'),
+)
+assert.ok(
+  faireApiKeyConnectSource.indexOf('await probeFaireBrandProfile')
+    < faireApiKeyConnectSource.indexOf('encryptCommerceCredential'),
+  'Faire generated API key must be verified read-only before encrypted credential persistence',
+)
+includes(faireApiKeyConnectSource, [
+  "authMode: 'faire_brand_token'",
+  'accessToken: token',
+  'credentialIdentifierLastFour: token.slice(-4)',
+  "webhookVerificationStatus: 'not_applicable'",
+  'domainWorkersActivated: false',
+], 'Faire generated API key connection')
 assert.ok(
   !service.includes('console.'),
   'Commerce integration service must not log credentials',
@@ -359,6 +375,7 @@ includes(adminRoute, [
   'operationsCapabilities(actor).canManage',
   'operationsCapabilities(actor).canActivate',
   "action === 'connect-shopify'",
+  "action === 'connect-faire-api-key'",
   "action === 'start-faire-oauth'",
   "action === 'test-connection'",
   "action === 'set-enabled'",
@@ -369,6 +386,7 @@ includes(adminRoute, [
   "return role === 'owner' || role === 'admin'",
   "'COMMERCE_CREDENTIAL_REVEAL_FORBIDDEN'",
   'revealCommerceCredential',
+  'connectFaireCommerce',
   'confirmLiveAccess',
   "'clientId'",
   "'applicationId'",
@@ -380,10 +398,28 @@ includes(adminRoute, [
   'canonicalOrderImport: commerceIntakeRuntimeAvailable()',
   'inventoryMutation: false',
   'fulfillmentExport: false',
+  'faireBrandApiKey: true',
   'acceptedReceiptTopics: SHOPIFY_CONTROL_PLANE_WEBHOOK_TOPICS',
   '...COMMERCE_CUSTOM_INTEGRATION_ONBOARDING',
   'callbackUrl: faireOAuthCallbackUrl()',
 ], 'Commerce admin route')
+const faireApiKeyRouteSource = adminRoute.slice(
+  adminRoute.indexOf("if (action === 'connect-faire-api-key')"),
+  adminRoute.indexOf("if (action === 'test-connection')"),
+)
+includes(faireApiKeyRouteSource, [
+  "'accessToken'",
+  "'confirmLiveAccess'",
+  'body.confirmLiveAccess !== true',
+  'one read-only Faire brand-profile request',
+  'connectFaireCommerce',
+  'accessToken: body.accessToken',
+], 'Faire generated API key route')
+assert.ok(
+  !faireApiKeyRouteSource.includes('applicationSecret')
+    && !faireApiKeyRouteSource.includes('authorizationUrl'),
+  'Faire generated API key route must remain separate from OAuth credentials',
+)
 assert.ok(
   !adminRoute.includes("'accessToken',\n        'clientSecret'"),
   'Shopify Admin API must not accept a pasted short-lived access token',
@@ -400,9 +436,13 @@ includes(integrationsDoc, [
   'additional granted `read_` scopes remain',
   'leaves the target verified but disabled with pristine cursors',
   'existing default workspace plus non-Shopify shipping, warehouse, printer, and print-agent identities',
+  'uses **Generate API key** to obtain the final brand API key',
+  '`X-FAIRE-ACCESS-TOKEN`',
+  'The command sends no Faire write request',
+  'Settings defaults to the single-brand generated-API-key path',
   'explicitly reveal only the current Shopify client ID/client secret or current Faire OAuth Application ID/Secret ID',
   'removed from the page after 30 seconds',
-  'Legacy Faire brand-token credentials are not revealable',
+  'Faire generated API keys are non-revealable',
   'never returns Shopify short-lived access tokens, Faire OAuth or brand access tokens',
 ], 'Commerce credential and development-establishment documentation')
 
@@ -490,12 +530,18 @@ includes(panel, [
   'These are user-owned custom integrations',
   'Before you connect',
   'Connect Shopify Dev Dashboard app',
-  'Faire Custom App OAuth',
+  'Faire custom integration',
+  'Generated API key — single brand (recommended)',
+  'Faire generated API key',
+  'Connect generated API key',
+  "action: 'connect-faire-api-key'",
+  'One read-only brand-profile request',
+  'No Faire data will be written or synchronized',
   'Faire Application ID',
   'Faire Secret ID',
-  "OAuth eligibility only when it accepts the authorization",
-  'single-brand API-key flow',
-  'Single-brand guide — not connectable here',
+  'Custom App OAuth — if enabled by Faire',
+  'Generate a single-brand API key',
+  'the Application ID or APA application token is not the API key',
   'ClawPilot OAuth callback URL',
   'Continue to Faire',
   'Connection test — READ_BRAND only',
@@ -523,7 +569,11 @@ includes(panel, [
   "clientId: ''",
   "applicationId: ''",
   "applicationSecret: ''",
+  "apiKey: ''",
   "clientSecret: ''",
+  "account.authMode !== 'faire_brand_token'",
+  'Faire generated API keys are encrypted and',
+  'inputProps={{ maxLength: 4096 }}',
   'useRef(integrations.organizationId)',
   'payload.integrations.organizationId',
   '!== organizationIdRef.current',
@@ -591,6 +641,17 @@ assert.equal(
 assert.equal(
   capabilities.COMMERCE_CUSTOM_INTEGRATION_ONBOARDING.faire.setupGuideUrl,
   'https://developers.faire.com/docs#/#authentication',
+)
+assert.equal(
+  capabilities.COMMERCE_CUSTOM_INTEGRATION_ONBOARDING.faire.authMode,
+  'faire_brand_token',
+)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(
+    capabilities.COMMERCE_CUSTOM_INTEGRATION_ONBOARDING
+      .faire.supportedAuthModes,
+  )),
+  ['faire_brand_token', 'faire_oauth'],
 )
 assert.deepEqual(
   JSON.parse(JSON.stringify(
