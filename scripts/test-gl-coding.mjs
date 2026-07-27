@@ -264,7 +264,10 @@ for (const fragment of [
 
 const panel = read('app_src/components/operations/GlCodingPanel.tsx')
 for (const fragment of [
-  'Run GL Coding',
+  'Run Shipment GL Coding',
+  "mode: 'carrier-invoices' | 'shipment-pricing'",
+  'MUD means Markup Directive',
+  'independently versioned contract directive',
   'Orphan queue',
   'Assignment reason',
   'shipmentMatchStatus',
@@ -278,6 +281,40 @@ for (const fragment of [
   'canApproveCarrierSettlement',
 ]) {
   assert.ok(panel.includes(fragment), `Missing GL Coding UI contract: ${fragment}`)
+}
+
+const navigation = read('app_src/components/Navigation.tsx')
+for (const fragment of [
+  "id: 'operations/exceptions'",
+  "id: 'operations/receiving'",
+  "id: 'operations/warehouses'",
+  "id: 'operations/carrier-invoices'",
+  "label: 'Carrier invoicing'",
+  "id: 'operations/gl-coding'",
+  "label: 'Shipment pricing & GL'",
+  "id: 'operations/printing'",
+]) {
+  assert.ok(navigation.includes(fragment), `Missing carrier-finance navigation contract: ${fragment}`)
+}
+
+const homeClient = read('app_src/app/HomeClient.tsx')
+for (const fragment of [
+  "'operations/carrier-invoices': 'carrier-invoices'",
+  "'operations/gl-coding': 'gl-coding'",
+]) {
+  assert.ok(homeClient.includes(fragment), `Missing carrier-finance route contract: ${fragment}`)
+}
+
+const operationsSection = read('app_src/components/operations/OperationsSection.tsx')
+for (const fragment of [
+  '<GlCodingPanel mode="carrier-invoices" />',
+  '<GlCodingPanel mode="shipment-pricing" />',
+  'Assign charges to the responsible shipper, review MUD pricing',
+]) {
+  assert.ok(
+    operationsSection.includes(fragment),
+    `Missing split carrier-finance workbench contract: ${fragment}`,
+  )
 }
 
 const reviewMigration = read('db/migrations/0093_operations_carrier_billing_import_and_review.sql')

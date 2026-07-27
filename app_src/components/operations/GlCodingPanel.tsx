@@ -334,8 +334,13 @@ async function readPayload(response: Response): Promise<GlCodingPayload> {
   }
 }
 
-export default function GlCodingPanel() {
+export default function GlCodingPanel({
+  mode,
+}: {
+  mode: 'carrier-invoices' | 'shipment-pricing'
+}) {
   const dateTime = useUserDateTime()
+  const isShipmentPricing = mode === 'shipment-pricing'
   const [workspace, setWorkspace] = useState<GlCodingWorkspace | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -354,6 +359,9 @@ export default function GlCodingPanel() {
   const [reviewingRunId, setReviewingRunId] = useState<string | null>(null)
   const [settlementDrafts, setSettlementDrafts] = useState<Record<string, SettlementDraft>>({})
   const [updatingSettlementId, setUpdatingSettlementId] = useState<string | null>(null)
+  const surfaceError = mode === 'carrier-invoices'
+    ? error.replace(/^GL Coding/, 'Carrier invoicing')
+    : error
 
   const load = useCallback(async (signal?: AbortSignal) => {
     setLoading(true)
@@ -751,7 +759,11 @@ export default function GlCodingPanel() {
             </Button>
           )}
         >
-          {error || 'GL Coding data is unavailable'}
+          {surfaceError || (
+            mode === 'carrier-invoices'
+              ? 'Carrier invoicing data is unavailable'
+              : 'Shipment pricing and GL data is unavailable'
+          )}
         </Alert>
       </Box>
     )
@@ -763,117 +775,138 @@ export default function GlCodingPanel() {
     <Box sx={{ px: { xs: 2, md: 3 }, py: 2.5, minWidth: 0 }}>
       <Stack spacing={3} divider={<Divider flexItem />}>
         <Alert severity="info">
-          Carrier files may include several account numbers. ClawPilot keeps quoted rates as pro forma evidence,
-          matches actual charges by provider, account, and tracking evidence, and leaves unsupported charges in
-          review. Assigning an orphan to a shipper never fabricates a shipment match.
+          {isShipmentPricing
+            ? 'MUD means Markup Directive: the approved, versioned contract rule that produced the customer price. Shipment Pricing & GL links billed carrier charges to shipment and shipper evidence, reviews the retained MUD result, and never silently recalculates or changes the quoted price.'
+            : 'Carrier files may include several account numbers. ClawPilot preserves each source file, matches actual charges by provider, account, and tracking evidence, and leaves unsupported rows in review instead of inventing a shipment match.'}
         </Alert>
         <Box component="section">
           <Stack direction="row" justifyContent="space-between" alignItems="center" gap={2} sx={{ mb: 1.5 }}>
             <Box>
-              <Typography variant="h6" fontWeight={700}>Billing files</Typography>
-              <Typography variant="caption" color="text.secondary">{workspace?.batches.length || 0} available</Typography>
+              <Typography variant="h6" fontWeight={700}>
+                {isShipmentPricing ? 'Billing files ready for pricing review' : 'Carrier billing files'}
+              </Typography>
+              <Typography variant="caption" color="text.secondary">
+                {workspace?.batches.length || 0} available
+                {isShipmentPricing ? ' · select compatible files to begin GL Coding' : ' · immutable imported evidence'}
+              </Typography>
             </Box>
             <Stack direction="row" spacing={1}>
-              <Tooltip title="Refresh GL Coding">
+              <Tooltip title={isShipmentPricing ? 'Refresh shipment pricing and GL' : 'Refresh carrier invoices'}>
                 <span>
-                  <IconButton aria-label="Refresh GL Coding" onClick={() => void load()} disabled={loading}>
+                  <IconButton
+                    aria-label={isShipmentPricing ? 'Refresh shipment pricing and GL' : 'Refresh carrier invoices'}
+                    onClick={() => void load()}
+                    disabled={loading}
+                  >
                     {loading ? <CircularProgress size={20} /> : <RefreshRounded />}
                   </IconButton>
                 </span>
               </Tooltip>
-              <Button
-                variant="contained"
-                startIcon={running ? <CircularProgress size={16} color="inherit" /> : <PlayArrowRounded />}
-                disabled={!canRun || running || selectedBatchIds.length === 0}
-                onClick={() => void runSelected()}
-              >
-                {running ? 'Running' : 'Run GL Coding'}
-              </Button>
+              {isShipmentPricing && (
+                <Button
+                  variant="contained"
+                  startIcon={running ? <CircularProgress size={16} color="inherit" /> : <PlayArrowRounded />}
+                  disabled={!canRun || running || selectedBatchIds.length === 0}
+                  onClick={() => void runSelected()}
+                >
+                  {running ? 'Running' : 'Run Shipment GL Coding'}
+                </Button>
+              )}
             </Stack>
           </Stack>
 
-          {error && <Alert severity="error" onClose={() => setError('')} sx={{ mb: 1.5 }}>{error}</Alert>}
+          {surfaceError && (
+            <Alert severity="error" onClose={() => setError('')} sx={{ mb: 1.5 }}>
+              {surfaceError}
+            </Alert>
+          )}
           {notice && <Alert severity="success" onClose={() => setNotice('')} sx={{ mb: 1.5 }}>{notice}</Alert>}
-          {!canRun && <Alert severity="info" sx={{ mb: 1.5 }}>You do not have permission to run billing reconciliation.</Alert>}
+          {!canRun && (
+            <Alert severity="info" sx={{ mb: 1.5 }}>
+              You do not have permission to import carrier invoices or run shipment pricing reconciliation.
+            </Alert>
+          )}
 
-          <Box
-            sx={{
-              mb: 2,
-              p: 1.5,
-              border: '1px solid',
-              borderColor: 'divider',
-              borderRadius: '8px',
-            }}
-          >
-            <Typography fontWeight={700}>Import carrier billing CSV</Typography>
-            <Typography variant="caption" color="text.secondary">
-              One file may include one or many account numbers. Account values are fingerprinted and masked before
-              evidence is stored.
-            </Typography>
+          {!isShipmentPricing && (
             <Box
               sx={{
-                mt: 1.25,
-                display: 'grid',
-                gridTemplateColumns: {
-                  xs: 'minmax(0, 1fr)',
-                  sm: 'minmax(130px, 0.6fr) minmax(150px, 0.7fr) minmax(0, 1.5fr) auto',
-                },
-                gap: 1,
-                alignItems: 'center',
+                mb: 2,
+                p: 1.5,
+                border: '1px solid',
+                borderColor: 'divider',
+                borderRadius: '8px',
               }}
             >
-              <TextField
-                select
-                size="small"
-                label="Carrier"
-                value={importProvider}
-                onChange={(event) => setImportProvider(event.target.value as 'ups' | 'fedex' | 'usps')}
-                disabled={!canRun || importing}
-                sx={fieldSx}
+              <Typography fontWeight={700}>Import carrier billing CSV</Typography>
+              <Typography variant="caption" color="text.secondary">
+                One file may include one or many account numbers. Account values are fingerprinted and masked before
+                evidence is stored.
+              </Typography>
+              <Box
+                sx={{
+                  mt: 1.25,
+                  display: 'grid',
+                  gridTemplateColumns: {
+                    xs: 'minmax(0, 1fr)',
+                    sm: 'minmax(130px, 0.6fr) minmax(150px, 0.7fr) minmax(0, 1.5fr) auto',
+                  },
+                  gap: 1,
+                  alignItems: 'center',
+                }}
               >
-                <MenuItem value="ups">UPS</MenuItem>
-                <MenuItem value="fedex">FedEx</MenuItem>
-                <MenuItem value="usps">USPS</MenuItem>
-              </TextField>
-              <TextField
-                select
-                size="small"
-                label="Environment"
-                value={importEnvironment}
-                onChange={(event) => setImportEnvironment(event.target.value as 'production' | 'sandbox')}
-                disabled={!canRun || importing}
-                sx={fieldSx}
-              >
-                <MenuItem value="production">Production</MenuItem>
-                <MenuItem value="sandbox">Sandbox</MenuItem>
-              </TextField>
-              <Button
-                component="label"
-                variant="outlined"
-                startIcon={<UploadFileRounded />}
-                disabled={!canRun || importing}
-                sx={{ minWidth: 0, justifyContent: 'flex-start', overflow: 'hidden' }}
-              >
-                <Box component="span" sx={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {importFile?.name || 'Choose CSV'}
-                </Box>
-                <input
-                  hidden
-                  type="file"
-                  accept=".csv,text/csv"
-                  onChange={(event) => setImportFile(event.target.files?.[0] || null)}
-                />
-              </Button>
-              <Button
-                variant="contained"
-                disabled={!canRun || importing || !importFile}
-                startIcon={importing ? <CircularProgress size={16} color="inherit" /> : <UploadFileRounded />}
-                onClick={() => void importBillingFile()}
-              >
-                {importing ? 'Importing' : 'Import'}
-              </Button>
+                <TextField
+                  select
+                  size="small"
+                  label="Carrier"
+                  value={importProvider}
+                  onChange={(event) => setImportProvider(event.target.value as 'ups' | 'fedex' | 'usps')}
+                  disabled={!canRun || importing}
+                  sx={fieldSx}
+                >
+                  <MenuItem value="ups">UPS</MenuItem>
+                  <MenuItem value="fedex">FedEx</MenuItem>
+                  <MenuItem value="usps">USPS</MenuItem>
+                </TextField>
+                <TextField
+                  select
+                  size="small"
+                  label="Environment"
+                  value={importEnvironment}
+                  onChange={(event) => setImportEnvironment(event.target.value as 'production' | 'sandbox')}
+                  disabled={!canRun || importing}
+                  sx={fieldSx}
+                >
+                  <MenuItem value="production">Production</MenuItem>
+                  <MenuItem value="sandbox">Sandbox</MenuItem>
+                </TextField>
+                <Button
+                  component="label"
+                  variant="outlined"
+                  startIcon={<UploadFileRounded />}
+                  disabled={!canRun || importing}
+                  sx={{ minWidth: 0, justifyContent: 'flex-start', overflow: 'hidden' }}
+                >
+                  <Box component="span" sx={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {importFile?.name || 'Choose CSV'}
+                  </Box>
+                  <input
+                    hidden
+                    type="file"
+                    accept=".csv,text/csv"
+                    onChange={(event) => setImportFile(event.target.files?.[0] || null)}
+                  />
+                </Button>
+                <Button
+                  variant="contained"
+                  disabled={!canRun || importing || !importFile}
+                  startIcon={importing ? <CircularProgress size={16} color="inherit" /> : <UploadFileRounded />}
+                  onClick={() => void importBillingFile()}
+                >
+                  {importing ? 'Importing' : 'Import'}
+                </Button>
+              </Box>
             </Box>
-          </Box>
+          )}
 
           {workspace?.batches.length ? (
             <Stack divider={<Divider flexItem />}>
@@ -898,22 +931,25 @@ export default function GlCodingPanel() {
                 return (
                   <Box
                     key={batch.globalId}
-                    component="label"
                     sx={{
                       py: 1.25,
                       display: 'grid',
-                      gridTemplateColumns: 'auto minmax(0, 1fr) auto',
+                      gridTemplateColumns: isShipmentPricing
+                        ? 'auto minmax(0, 1fr) auto'
+                        : 'minmax(0, 1fr) auto',
                       gap: 1.25,
                       alignItems: 'center',
-                      cursor: disabled ? 'default' : 'pointer',
+                      cursor: isShipmentPricing && !disabled ? 'pointer' : 'default',
                     }}
                   >
-                    <Checkbox
-                      checked={selectedBatchIds.includes(batch.globalId)}
-                      onChange={() => toggleBatch(batch)}
-                      disabled={disabled}
-                      inputProps={{ 'aria-label': `Select billing file ${batchFilename(batch)}` }}
-                    />
+                    {isShipmentPricing && (
+                      <Checkbox
+                        checked={selectedBatchIds.includes(batch.globalId)}
+                        onChange={() => toggleBatch(batch)}
+                        disabled={disabled}
+                        inputProps={{ 'aria-label': `Select billing file ${batchFilename(batch)}` }}
+                      />
+                    )}
                     <Box sx={{ minWidth: 0 }}>
                       <Typography fontWeight={650} sx={{ overflowWrap: 'anywhere' }}>{batchFilename(batch)}</Typography>
                       <Typography variant="caption" color="text.secondary" sx={{ overflowWrap: 'anywhere' }}>
@@ -943,6 +979,8 @@ export default function GlCodingPanel() {
           )}
         </Box>
 
+        {isShipmentPricing && (
+          <>
         <Box component="section">
           <Typography variant="h6" fontWeight={700} sx={{ mb: 1.5 }}>Run summary</Typography>
           {latestRun ? (
@@ -1245,7 +1283,11 @@ export default function GlCodingPanel() {
         </Box>
 
         <Box component="section">
-          <Typography variant="h6" fontWeight={700}>Rules</Typography>
+          <Typography variant="h6" fontWeight={700}>Shipper assignment rules</Typography>
+          <Typography variant="caption" color="text.secondary">
+            These rules route imported charges to a responsible shipper and produce GL dimensions. MUD pricing
+            remains an independently versioned contract directive.
+          </Typography>
           {workspace?.rules.length ? (
             <Stack divider={<Divider flexItem />} sx={{ mt: 1 }}>
               {workspace.rules.map((rule) => (
@@ -1377,6 +1419,8 @@ export default function GlCodingPanel() {
             </Box>
           </Box>
         </Box>
+          </>
+        )}
       </Stack>
     </Box>
   )

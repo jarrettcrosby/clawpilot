@@ -1,5 +1,6 @@
 'use client'
 
+import { useState, type ElementType, type MouseEvent } from 'react'
 import {
   BottomNavigation,
   BottomNavigationAction,
@@ -12,6 +13,8 @@ import {
   ListItemButton,
   ListItemIcon,
   ListItemText,
+  Menu,
+  MenuItem,
   Tooltip,
   Typography,
 } from '@mui/material'
@@ -22,10 +25,73 @@ import ContactsRounded from '@mui/icons-material/ContactsRounded'
 import AccountBalanceRounded from '@mui/icons-material/AccountBalanceRounded'
 import PointOfSaleRounded from '@mui/icons-material/PointOfSaleRounded'
 import LocalShippingRounded from '@mui/icons-material/LocalShippingRounded'
+import ImportExportRounded from '@mui/icons-material/ImportExportRounded'
+import MoveToInboxRounded from '@mui/icons-material/MoveToInboxRounded'
+import PrintRounded from '@mui/icons-material/PrintRounded'
+import ReceiptLongRounded from '@mui/icons-material/ReceiptLongRounded'
+import SpaceDashboardRounded from '@mui/icons-material/SpaceDashboardRounded'
+import WarningAmberRounded from '@mui/icons-material/WarningAmberRounded'
+import WarehouseRounded from '@mui/icons-material/WarehouseRounded'
 import BrandMark from '@/components/BrandMark'
 import { DashboardIcon, DocsIcon, ProjectsIcon, PipelineIcon, AgentsIcon, VersionsIcon } from '@/lib/icons'
 
-const NAV_ITEMS = [
+type NavigationChild = {
+  id: string
+  label: string
+  Icon: ElementType
+}
+
+type NavigationItem = {
+  id: string
+  label: string
+  Icon: ElementType
+  children?: NavigationChild[]
+}
+
+const OPERATIONS_CHILDREN: NavigationChild[] = [
+  {
+    id: 'operations',
+    label: 'Orders',
+    Icon: SpaceDashboardRounded,
+  },
+  {
+    id: 'operations/exceptions',
+    label: 'Exceptions',
+    Icon: WarningAmberRounded,
+  },
+  {
+    id: 'operations/imports',
+    label: 'Commerce imports',
+    Icon: ImportExportRounded,
+  },
+  {
+    id: 'operations/receiving',
+    label: 'Receiving',
+    Icon: MoveToInboxRounded,
+  },
+  {
+    id: 'operations/warehouses',
+    label: 'Warehouses',
+    Icon: WarehouseRounded,
+  },
+  {
+    id: 'operations/carrier-invoices',
+    label: 'Carrier invoicing',
+    Icon: ReceiptLongRounded,
+  },
+  {
+    id: 'operations/gl-coding',
+    label: 'Shipment pricing & GL',
+    Icon: AccountBalanceRounded,
+  },
+  {
+    id: 'operations/printing',
+    label: 'Printing',
+    Icon: PrintRounded,
+  },
+]
+
+const NAV_ITEMS: NavigationItem[] = [
   { id: 'dashboard', label: 'Dashboard', Icon: DashboardIcon },
   { id: 'docs', label: 'Docs', Icon: DocsIcon },
   { id: 'projects', label: 'Projects', Icon: ProjectsIcon },
@@ -33,7 +99,12 @@ const NAV_ITEMS = [
   { id: 'crm', label: 'CRM', Icon: ContactsRounded },
   { id: 'accounting', label: 'Accounting', Icon: AccountBalanceRounded },
   { id: 'pos', label: 'POS', Icon: PointOfSaleRounded },
-  { id: 'operations', label: 'Operations', Icon: LocalShippingRounded },
+  {
+    id: 'operations',
+    label: 'Operations',
+    Icon: LocalShippingRounded,
+    children: OPERATIONS_CHILDREN,
+  },
   { id: 'links', label: 'Links', Icon: LinkRounded },
   { id: 'agents', label: 'Agents', Icon: AgentsIcon },
   { id: 'versions', label: 'Versions', Icon: VersionsIcon },
@@ -62,60 +133,153 @@ type NavigationListProps = {
 
 function NavigationList({ activeSection, collapsed = false, onSelect, surface, showLinks }: NavigationListProps) {
   const items = showLinks ? NAV_ITEMS : NAV_ITEMS.filter((item) => item.id !== 'links')
+  const activeRoot = activeSection.split('/')[0]
+  const [flyoutAnchor, setFlyoutAnchor] = useState<HTMLElement | null>(null)
+
+  const selectFlyoutItem = (section: string) => {
+    setFlyoutAnchor(null)
+    onSelect(section)
+  }
+
   return (
-    <List sx={{ px: collapsed ? 1.25 : 1.5, py: 1, flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden' }}>
-      {items.map((item) => (
-        <Tooltip
-          key={item.id}
-          title={collapsed ? item.label : ''}
-          placement="right"
-          disableHoverListener={!collapsed}
-        >
-          <ListItem disablePadding>
-            <ListItemButton
-              data-testid={`nav-${surface}-${item.id}`}
-              aria-label={item.label}
-              aria-current={activeSection === item.id ? 'page' : undefined}
-              selected={activeSection === item.id}
-              onClick={() => onSelect(item.id)}
-              sx={{
-                borderRadius: 1,
-                mb: 0.5,
-                px: collapsed ? 1 : 2,
-                py: 1.25,
-                justifyContent: collapsed ? 'center' : 'flex-start',
-                minHeight: 48,
-                '&.Mui-selected': {
-                  backgroundColor: 'rgba(168,199,250,0.12)',
-                  '&:hover': { backgroundColor: 'rgba(168,199,250,0.16)' },
-                },
-                '&:hover': { backgroundColor: 'rgba(255,255,255,0.05)' },
-              }}
+    <>
+      <List sx={{ px: collapsed ? 1.25 : 1.5, py: 1, flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden' }}>
+        {items.map((item) => (
+          <Box key={item.id}>
+            <Tooltip
+              title={collapsed ? item.label : ''}
+              placement="right"
+              disableHoverListener={!collapsed}
             >
-              <ListItemIcon
-                sx={{
-                  minWidth: collapsed ? 0 : 36,
-                  color: activeSection === item.id ? '#A8C7FA' : 'rgba(255,255,255,0.5)',
-                  justifyContent: 'center',
-                }}
-              >
-                <item.Icon sx={{ fontSize: 22 }} />
-              </ListItemIcon>
-              {!collapsed && (
-                <ListItemText
-                  primary={item.label}
-                  primaryTypographyProps={{
-                    fontSize: '0.875rem',
-                    fontWeight: activeSection === item.id ? 600 : 400,
-                    color: activeSection === item.id ? '#A8C7FA' : 'text.secondary',
+              <ListItem disablePadding>
+                <ListItemButton
+                  data-testid={`nav-${surface}-${item.id}`}
+                  aria-label={item.label}
+                  aria-current={activeSection === item.id ? 'page' : undefined}
+                  aria-haspopup={collapsed && item.children ? 'menu' : undefined}
+                  aria-expanded={
+                    collapsed && item.children
+                      ? Boolean(flyoutAnchor)
+                      : undefined
+                  }
+                  selected={activeRoot === item.id}
+                  onClick={(event: MouseEvent<HTMLElement>) => {
+                    if (collapsed && item.children) {
+                      setFlyoutAnchor(event.currentTarget)
+                      return
+                    }
+                    onSelect(item.id)
                   }}
-                />
-              )}
-            </ListItemButton>
-          </ListItem>
-        </Tooltip>
-      ))}
-    </List>
+                  sx={{
+                    borderRadius: 1,
+                    mb: 0.5,
+                    px: collapsed ? 1 : 2,
+                    py: 1.25,
+                    justifyContent: collapsed ? 'center' : 'flex-start',
+                    minHeight: 48,
+                    '&.Mui-selected': {
+                      backgroundColor: 'rgba(168,199,250,0.12)',
+                      '&:hover': { backgroundColor: 'rgba(168,199,250,0.16)' },
+                    },
+                    '&:hover': { backgroundColor: 'rgba(255,255,255,0.05)' },
+                  }}
+                >
+                  <ListItemIcon
+                    sx={{
+                      minWidth: collapsed ? 0 : 36,
+                      color: activeRoot === item.id ? '#A8C7FA' : 'rgba(255,255,255,0.5)',
+                      justifyContent: 'center',
+                    }}
+                  >
+                    <item.Icon sx={{ fontSize: 22 }} />
+                  </ListItemIcon>
+                  {!collapsed && (
+                    <ListItemText
+                      primary={item.label}
+                      primaryTypographyProps={{
+                        fontSize: '0.875rem',
+                        fontWeight: activeRoot === item.id ? 600 : 400,
+                        color: activeRoot === item.id ? '#A8C7FA' : 'text.secondary',
+                      }}
+                    />
+                  )}
+                </ListItemButton>
+              </ListItem>
+            </Tooltip>
+            {!collapsed
+            && item.children
+            && (surface === 'mobile' || activeRoot === item.id) ? (
+              <List
+                disablePadding
+                aria-label={`${item.label} submodules`}
+                sx={{ pl: 1.5, pb: 0.5 }}
+              >
+                {item.children.map((child) => (
+                  <ListItem key={child.id} disablePadding>
+                    <ListItemButton
+                      data-testid={`nav-${surface}-${child.id.replace('/', '-')}`}
+                      aria-label={child.label}
+                      aria-current={activeSection === child.id ? 'page' : undefined}
+                      selected={activeSection === child.id}
+                      onClick={() => onSelect(child.id)}
+                      sx={{
+                        borderRadius: 1,
+                        minHeight: 40,
+                        pl: 2,
+                        '&.Mui-selected': {
+                          backgroundColor: 'rgba(168,199,250,0.1)',
+                        },
+                      }}
+                    >
+                      <ListItemIcon
+                        sx={{
+                          minWidth: 32,
+                          color: activeSection === child.id
+                            ? '#A8C7FA'
+                            : 'rgba(255,255,255,0.45)',
+                        }}
+                      >
+                        <child.Icon sx={{ fontSize: 18 }} />
+                      </ListItemIcon>
+                      <ListItemText
+                        primary={child.label}
+                        primaryTypographyProps={{
+                          fontSize: '0.8rem',
+                          color: activeSection === child.id
+                            ? '#A8C7FA'
+                            : 'text.secondary',
+                        }}
+                      />
+                    </ListItemButton>
+                  </ListItem>
+                ))}
+              </List>
+            ) : null}
+          </Box>
+        ))}
+      </List>
+      <Menu
+        anchorEl={flyoutAnchor}
+        open={Boolean(flyoutAnchor)}
+        onClose={() => setFlyoutAnchor(null)}
+        anchorOrigin={{ vertical: 'top', horizontal: 'right' }}
+        transformOrigin={{ vertical: 'top', horizontal: 'left' }}
+        MenuListProps={{ 'aria-label': 'Operations submodules' }}
+      >
+        {OPERATIONS_CHILDREN.map((child) => (
+          <MenuItem
+            key={child.id}
+            selected={activeSection === child.id}
+            onClick={() => selectFlyoutItem(child.id)}
+          >
+            <ListItemIcon>
+              <child.Icon fontSize="small" />
+            </ListItemIcon>
+            <ListItemText>{child.label}</ListItemText>
+          </MenuItem>
+        ))}
+      </Menu>
+    </>
   )
 }
 

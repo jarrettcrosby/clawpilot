@@ -18,20 +18,41 @@ import CardContent from '@mui/material/CardContent'
 import Chip from '@mui/material/Chip'
 import CircularProgress from '@mui/material/CircularProgress'
 import Divider from '@mui/material/Divider'
+import Dialog from '@mui/material/Dialog'
+import DialogContent from '@mui/material/DialogContent'
+import DialogTitle from '@mui/material/DialogTitle'
 import FormControl from '@mui/material/FormControl'
 import FormHelperText from '@mui/material/FormHelperText'
+import IconButton from '@mui/material/IconButton'
 import InputLabel from '@mui/material/InputLabel'
 import MenuItem from '@mui/material/MenuItem'
 import Select from '@mui/material/Select'
 import Stack from '@mui/material/Stack'
+import Tab from '@mui/material/Tab'
+import TablePagination from '@mui/material/TablePagination'
+import Tabs from '@mui/material/Tabs'
 import TextField from '@mui/material/TextField'
 import Typography from '@mui/material/Typography'
 import BlockRounded from '@mui/icons-material/BlockRounded'
 import CheckCircleOutlineRounded from '@mui/icons-material/CheckCircleOutlineRounded'
 import CloudDownloadRounded from '@mui/icons-material/CloudDownloadRounded'
+import CloseRounded from '@mui/icons-material/CloseRounded'
 import ExpandMoreRounded from '@mui/icons-material/ExpandMoreRounded'
+import FileDownloadRounded from '@mui/icons-material/FileDownloadRounded'
+import FileUploadRounded from '@mui/icons-material/FileUploadRounded'
 import PublishRounded from '@mui/icons-material/PublishRounded'
 import RefreshRounded from '@mui/icons-material/RefreshRounded'
+import {
+  CommerceIntakeCsvError,
+  exportCommerceIssueSummaryCsv,
+  exportCommerceOrderSummaryCsv,
+  exportCommerceProductReviewCsv,
+  formatCommerceMoneyMajor,
+  parseCommerceMoneyMajor,
+  parseCommerceProductReviewCsv,
+  type CommerceProductReviewDecision,
+  type CommerceProductReviewImportResult,
+} from '@/lib/integrations/commerceIntakeCsv'
 
 type CommerceProvider = 'shopify' | 'faire'
 type CandidateState =
@@ -321,6 +342,10 @@ type CommerceIntakeWorkflowProps = {
   canActivate: boolean
 }
 
+type WorkbenchTab = 'overview' | 'products' | 'orders' | 'issues'
+type ProductReviewFilter = 'all' | 'needs_decision' | 'matched' | 'skipped'
+type OrderReviewFilter = 'all' | 'needs_review' | 'ready' | 'added' | 'skipped'
+
 class IntakeRequestError extends Error {
   constructor(
     message: string,
@@ -343,6 +368,8 @@ const actionButtonSx = {
   width: { xs: '100%', sm: 'auto' },
 }
 
+const workbenchPageSize = 10
+
 const terminalStates = new Set<CandidateState>([
   'promoted',
   'failed',
@@ -357,6 +384,27 @@ function humanize(value: string) {
   return value
     .replace(/_/g, ' ')
     .replace(/\b\w/g, (letter) => letter.toUpperCase())
+}
+
+function rejectionTitle(code: string) {
+  const titles: Record<string, string> = {
+    COMMERCE_ORDER_MONEY_INCOMPLETE: 'Order totals could not be read',
+    COMMERCE_ORDER_LINES_INCOMPLETE: 'Order line details are incomplete',
+    COMMERCE_PRODUCT_RECORD_INVALID: 'Product details could not be read',
+  }
+  return titles[code] || 'Provider record needs review'
+}
+
+function candidateStateLabel(state: CandidateState) {
+  const labels: Record<CandidateState, string> = {
+    held: 'Needs review',
+    resolving: 'In review',
+    ready: 'Ready to add',
+    promoted: 'Added to ClawPilot',
+    failed: 'Skipped',
+    expired: 'Expired',
+  }
+  return labels[state]
 }
 
 function formatDate(value?: string | null) {
@@ -375,7 +423,7 @@ function formatMoney(minor?: number | null, currency?: string | null) {
     const exponent = formatter.resolvedOptions().maximumFractionDigits ?? 2
     return formatter.format((minor as number) / (10 ** exponent))
   } catch {
-    return `${minor} ${currency} minor units`
+    return 'Amount unavailable'
   }
 }
 
@@ -393,9 +441,28 @@ function normalizeCurrency(value: string) {
   return value.trim().toUpperCase().slice(0, 3)
 }
 
+function majorPriceFromMinor(
+  minor?: number | null,
+  currency?: string | null,
+) {
+  if (!Number.isInteger(minor) || !currency) return ''
+  try {
+    return formatCommerceMoneyMajor(minor as number, currency)
+  } catch {
+    return ''
+  }
+}
+
 function validPrice(draft: ProductDraft) {
-  return /^\d+$/.test(draft.unitPriceMinor)
-    && /^[A-Z]{3}$/.test(normalizeCurrency(draft.currency))
+  try {
+    parseCommerceMoneyMajor(
+      draft.unitPriceMinor,
+      normalizeCurrency(draft.currency),
+    )
+    return true
+  } catch {
+    return false
+  }
 }
 
 function dimensionsLabel(dimensions?: DimensionsMm | null) {
@@ -413,9 +480,10 @@ function initialProductDraft(line: IntakeLine): ProductDraft {
     productGlobalId: line.productGlobalId || '',
     name: line.title || '',
     sku: line.sku || '',
-    unitPriceMinor: Number.isInteger(line.unitPriceMinor)
-      ? String(line.unitPriceMinor)
-      : '',
+    unitPriceMinor: majorPriceFromMinor(
+      line.unitPriceMinor,
+      line.currency,
+    ),
     currency: normalizeCurrency(line.currency || ''),
   }
 }
@@ -431,12 +499,35 @@ function initialCatalogProductDraft(
     productGlobalId: candidate.productGlobalId || '',
     name,
     sku: candidate.sku || '',
-    unitPriceMinor: Number.isInteger(candidate.priceMinor)
-      ? String(candidate.priceMinor)
-      : '',
+    unitPriceMinor: majorPriceFromMinor(
+      candidate.priceMinor,
+      candidate.currency,
+    ),
     currency: normalizeCurrency(candidate.currency || ''),
     exclusionReason: '',
   }
+}
+
+function downloadCsv(csv: string, filename: string) {
+  const url = URL.createObjectURL(new Blob([csv], {
+    type: 'text/csv;charset=utf-8',
+  }))
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = filename
+  document.body.appendChild(anchor)
+  anchor.click()
+  anchor.remove()
+  URL.revokeObjectURL(url)
+}
+
+function csvFilename(
+  provider: CommerceProvider,
+  resource: 'products' | 'orders' | 'issues',
+) {
+  return `clawpilot-${provider}-${resource}-${
+    new Date().toISOString().slice(0, 10)
+  }.csv`
 }
 
 function initialCustomerDraft(candidate: IntakeCandidate): CustomerDraft {
@@ -526,6 +617,22 @@ export default function CommerceIntakeWorkflow({
   const [intake, setIntake] = useState<CommerceIntake | null>(null)
   const [loading, setLoading] = useState(true)
   const [pendingAction, setPendingAction] = useState('')
+  const [workbenchOpen, setWorkbenchOpen] = useState(false)
+  const [workbenchTab, setWorkbenchTab] =
+    useState<WorkbenchTab>('overview')
+  const [productSearch, setProductSearch] = useState('')
+  const [orderSearch, setOrderSearch] = useState('')
+  const [issueSearch, setIssueSearch] = useState('')
+  const [productFilter, setProductFilter] =
+    useState<ProductReviewFilter>('all')
+  const [orderFilter, setOrderFilter] =
+    useState<OrderReviewFilter>('all')
+  const [productPage, setProductPage] = useState(0)
+  const [orderPage, setOrderPage] = useState(0)
+  const [issuePage, setIssuePage] = useState(0)
+  const [csvImportPreview, setCsvImportPreview] =
+    useState<CommerceProductReviewImportResult | null>(null)
+  const [csvImportFilename, setCsvImportFilename] = useState('')
   const [error, setError] = useState('')
   const [errorCode, setErrorCode] = useState('')
   const [notice, setNotice] = useState('')
@@ -554,6 +661,7 @@ export default function CommerceIntakeWorkflow({
     Record<string, string>
   >({})
   const retryKeys = useRef(new Map<string, string>())
+  const csvInputRef = useRef<HTMLInputElement | null>(null)
 
   const loadIntake = useCallback(async (signal?: AbortSignal) => {
     const params = new URLSearchParams({ accountGlobalId })
@@ -575,6 +683,18 @@ export default function CommerceIntakeWorkflow({
     setErrorCode('')
     setNotice('')
     setIntake(null)
+    setWorkbenchOpen(false)
+    setWorkbenchTab('overview')
+    setProductSearch('')
+    setOrderSearch('')
+    setIssueSearch('')
+    setProductFilter('all')
+    setOrderFilter('all')
+    setProductPage(0)
+    setOrderPage(0)
+    setIssuePage(0)
+    setCsvImportPreview(null)
+    setCsvImportFilename('')
     retryKeys.current.clear()
     setProductDrafts({})
     setCatalogProductDrafts({})
@@ -630,6 +750,10 @@ export default function CommerceIntakeWorkflow({
       })
       const payload = await readPayload(response)
       setIntake(payload.intake || null)
+      if (action === 'resolve-catalog-product') {
+        setCsvImportPreview(null)
+        setCsvImportFilename('')
+      }
       retryKeys.current.delete(retryKey)
       setNotice(
         payload.command?.replayed
@@ -676,6 +800,8 @@ export default function CommerceIntakeWorkflow({
       setDeliveryDrafts({})
       setPackageDrafts({})
       setUnsupportedReasons({})
+      setCsvImportPreview(null)
+      setCsvImportFilename('')
       setNotice('Workflow reloaded from current ClawPilot intake state.')
     } catch (requestError) {
       setError(safeError(requestError))
@@ -742,7 +868,10 @@ export default function CommerceIntakeWorkflow({
   )
   const productCatalog = intake?.productCatalog || []
   const customerCatalog = intake?.customerCatalog || []
-  const rejections = intake?.rejections || []
+  const rejections = useMemo(
+    () => intake?.rejections || [],
+    [intake?.rejections],
+  )
   const latestPagination = intake?.pagination || null
   const orderPagination = intake?.paginations?.orders
     || (latestPagination?.resource === 'orders' ? latestPagination : null)
@@ -780,8 +909,8 @@ export default function CommerceIntakeWorkflow({
           ? 'Start new operational fetch'
           : 'Fetch operational orders'
   const orderFetchSuccessMessage = canFetchNextOrders
-    ? `${providerLabel(provider)} next order batch fetched and staged.`
-    : `${providerLabel(provider)} operational orders fetched into held intake candidates.`
+    ? `${providerLabel(provider)} next order batch checked. Review ready orders and issues below.`
+    : `${providerLabel(provider)} orders checked. Review ready orders and issues below.`
   const canFetchNextProducts = Boolean(
     productPagination?.hasNextBatch
     && productPagination.continuationRunGlobalId,
@@ -809,8 +938,8 @@ export default function CommerceIntakeWorkflow({
           ? 'Start new catalog fetch'
           : 'Fetch product catalog'
   const productFetchSuccessMessage = canFetchNextProducts
-    ? `${providerLabel(provider)} next product batch fetched and staged.`
-    : `${providerLabel(provider)} product catalog fetched into held mapping candidates.`
+    ? `${providerLabel(provider)} next product batch checked. Review the product decisions below.`
+    : `${providerLabel(provider)} products checked. Review the product decisions below.`
   const candidateCounts = useMemo(() => {
     const counts: Record<CandidateState, number> = {
       held: 0,
@@ -827,10 +956,457 @@ export default function CommerceIntakeWorkflow({
     (count, candidate) => count + (candidate.blockers?.length || 0),
     0,
   )
+  const candidatesWithBlockers = candidates.filter(
+    (candidate) => (candidate.blockers?.length || 0) > 0,
+  )
+  const issueRecordCount = rejections.length + candidatesWithBlockers.length
   const unresolvedProductCount = productCandidates.filter((candidate) => (
     !terminalStates.has(candidate.state)
     && candidate.mappingStatus !== 'resolved'
   )).length
+  const filteredProductCandidates = useMemo(() => {
+    const query = productSearch.trim().toLocaleLowerCase()
+    return productCandidates.filter((candidate) => {
+      const matchesFilter = productFilter === 'all'
+        || (
+          productFilter === 'needs_decision'
+          && !terminalStates.has(candidate.state)
+          && candidate.mappingStatus !== 'resolved'
+        )
+        || (
+          productFilter === 'matched'
+          && candidate.mappingStatus === 'resolved'
+        )
+        || (
+          productFilter === 'skipped'
+          && candidate.state === 'failed'
+        )
+      if (!matchesFilter) return false
+      if (!query) return true
+      return [
+        candidate.productTitle,
+        candidate.variantTitle,
+        candidate.sku,
+        candidate.barcode,
+        candidate.vendor,
+        candidate.productType,
+        candidate.externalVariantId,
+      ].some((value) => (
+        String(value || '').toLocaleLowerCase().includes(query)
+      ))
+    })
+  }, [productCandidates, productFilter, productSearch])
+  const filteredOrderCandidates = useMemo(() => {
+    const query = orderSearch.trim().toLocaleLowerCase()
+    return candidates.filter((candidate) => {
+      const matchesFilter = orderFilter === 'all'
+        || (
+          orderFilter === 'needs_review'
+          && (
+            candidate.state === 'held'
+            || candidate.state === 'resolving'
+          )
+        )
+        || (
+          orderFilter === 'ready'
+          && candidate.state === 'ready'
+        )
+        || (
+          orderFilter === 'added'
+          && candidate.state === 'promoted'
+        )
+        || (
+          orderFilter === 'skipped'
+          && (
+            candidate.state === 'failed'
+            || candidate.state === 'expired'
+          )
+        )
+      if (!matchesFilter) return false
+      if (!query) return true
+      return [
+        candidate.orderNumber,
+        candidate.externalOrderId,
+        candidate.state,
+        candidate.providerStatus,
+        candidate.normalizedOrderStatus,
+        candidate.customer?.snapshotName,
+      ].some((value) => (
+        String(value || '').toLocaleLowerCase().includes(query)
+      ))
+    })
+  }, [candidates, orderFilter, orderSearch])
+  const filteredRejections = useMemo(() => {
+    const query = issueSearch.trim().toLocaleLowerCase()
+    if (!query) return rejections
+    return rejections.filter((rejection) => [
+      rejectionTitle(rejection.errorCode),
+      rejection.errorCode,
+      rejection.externalId,
+      rejection.resourceType,
+      rejection.safeMessage,
+    ].some((value) => String(value || '').toLocaleLowerCase().includes(query)))
+  }, [issueSearch, rejections])
+  const rejectionGroups = useMemo(() => {
+    const grouped = new Map<string, {
+      code: string
+      resourceType: 'order' | 'product'
+      message: string
+      count: number
+    }>()
+    for (const rejection of filteredRejections) {
+      const key = [
+        rejection.resourceType,
+        rejection.errorCode,
+        rejection.safeMessage,
+      ].join(':')
+      const current = grouped.get(key)
+      grouped.set(key, {
+        code: rejection.errorCode,
+        resourceType: rejection.resourceType,
+        message: rejection.safeMessage,
+        count: (current?.count || 0) + 1,
+      })
+    }
+    return Array.from(grouped.values())
+      .sort((left, right) => right.count - left.count)
+  }, [filteredRejections])
+  const candidateBlockerGroups = useMemo(() => {
+    const query = issueSearch.trim().toLocaleLowerCase()
+    const grouped = new Map<string, {
+      code: string
+      label: string
+      action: string
+      count: number
+    }>()
+    for (const candidate of candidates) {
+      const seen = new Set<string>()
+      for (const blocker of candidate.blockers || []) {
+        if (seen.has(blocker.code)) continue
+        seen.add(blocker.code)
+        const searchable = [
+          blocker.code,
+          blocker.label,
+          blocker.action,
+          candidate.externalOrderId,
+          candidate.orderNumber,
+        ].join(' ').toLocaleLowerCase()
+        if (query && !searchable.includes(query)) continue
+        const current = grouped.get(blocker.code)
+        grouped.set(blocker.code, {
+          code: blocker.code,
+          label: blocker.label,
+          action: blocker.action,
+          count: (current?.count || 0) + 1,
+        })
+      }
+    }
+    return Array.from(grouped.values())
+      .sort((left, right) => right.count - left.count)
+  }, [candidates, issueSearch])
+  const safeProductPage = Math.min(
+    productPage,
+    Math.max(0, Math.ceil(filteredProductCandidates.length / workbenchPageSize) - 1),
+  )
+  const safeOrderPage = Math.min(
+    orderPage,
+    Math.max(0, Math.ceil(filteredOrderCandidates.length / workbenchPageSize) - 1),
+  )
+  const safeIssuePage = Math.min(
+    issuePage,
+    Math.max(0, Math.ceil(filteredRejections.length / workbenchPageSize) - 1),
+  )
+  const visibleProductCandidates = filteredProductCandidates.slice(
+    safeProductPage * workbenchPageSize,
+    (safeProductPage + 1) * workbenchPageSize,
+  )
+  const visibleOrderCandidates = filteredOrderCandidates.slice(
+    safeOrderPage * workbenchPageSize,
+    (safeOrderPage + 1) * workbenchPageSize,
+  )
+  const visibleRejections = filteredRejections.slice(
+    safeIssuePage * workbenchPageSize,
+    (safeIssuePage + 1) * workbenchPageSize,
+  )
+  const recommendedAction = !operatorCommandsAllowed
+    ? {
+        label: 'Enable reviewed imports',
+        detail: 'Operations must be in Shadow or Active mode before records can be reviewed.',
+        tab: 'overview' as WorkbenchTab,
+      }
+    : unresolvedProductCount > 0
+      ? {
+          label: `Review ${unresolvedProductCount} ${
+            unresolvedProductCount === 1 ? 'product' : 'products'
+          }`,
+          detail: 'Match, create, or skip each provider product before adding orders.',
+          tab: 'products' as WorkbenchTab,
+        }
+      : issueRecordCount > 0
+        ? {
+            label: `Review ${issueRecordCount} ${
+              issueRecordCount === 1 ? 'issue' : 'issues'
+            }`,
+            detail: 'Grouped provider failures and order blockers show what can be fixed next.',
+            tab: 'issues' as WorkbenchTab,
+          }
+        : candidates.length > 0
+          ? {
+              label: `Review ${candidates.length} ${
+                candidates.length === 1 ? 'order' : 'orders'
+              }`,
+              detail: 'Complete required details, validate, and add each approved order.',
+              tab: 'orders' as WorkbenchTab,
+            }
+          : {
+              label: 'Check for products and orders',
+              detail: 'Start or refresh the bounded provider reads below.',
+              tab: 'overview' as WorkbenchTab,
+            }
+
+  function reportCsvError(requestError: unknown) {
+    setError(
+      requestError instanceof CommerceIntakeCsvError
+        ? `${requestError.message} [${requestError.code}]`
+        : requestError instanceof Error
+          ? requestError.message
+          : 'The CSV operation could not be completed.',
+    )
+  }
+
+  function downloadProductReviewCsv() {
+    setError('')
+    setNotice('')
+    try {
+      const reviewCandidates = productCandidates.filter((candidate) => (
+        !terminalStates.has(candidate.state)
+        && candidate.mappingStatus !== 'resolved'
+      ))
+      const csv = exportCommerceProductReviewCsv({
+        accountGlobalId,
+        provider,
+        candidates: reviewCandidates,
+      })
+      downloadCsv(csv, csvFilename(provider, 'products'))
+      setNotice(
+        `Downloaded ${reviewCandidates.length} product review ${
+          reviewCandidates.length === 1 ? 'row' : 'rows'
+        }. Enter an action for only the rows you want to apply, then import the file for validation.`,
+      )
+    } catch (requestError) {
+      reportCsvError(requestError)
+    }
+  }
+
+  function downloadOrderSummaryCsv() {
+    setError('')
+    setNotice('')
+    try {
+      const csv = exportCommerceOrderSummaryCsv({
+        accountGlobalId,
+        provider,
+        candidates: candidates.map((candidate) => ({
+          globalId: candidate.globalId,
+          rowVersion: candidate.rowVersion,
+          externalOrderId: candidate.externalOrderId,
+          orderNumber: candidate.orderNumber,
+          state: candidateStateLabel(candidate.state),
+          normalizedOrderStatus: candidate.normalizedOrderStatus,
+          normalizedPaymentStatus: candidate.normalizedPaymentStatus,
+          normalizedFulfillmentStatus:
+            candidate.normalizedFulfillmentStatus,
+          normalizedReturnStatus: candidate.normalizedReturnStatus,
+          currency: candidate.currency,
+          totalMinor: candidate.totalMinor,
+          lineCount: candidate.lines?.length || 0,
+          requiresShipping: candidate.requiresShipping,
+          blockerCodes: candidate.blockers?.map((blocker) => blocker.code),
+          sourceUpdatedAt: candidate.sourceUpdatedAt,
+          canonicalOrderGlobalId: candidate.canonicalOrderGlobalId,
+        })),
+      })
+      downloadCsv(csv, csvFilename(provider, 'orders'))
+      setNotice(
+        `Downloaded ${candidates.length} sanitized order ${
+          candidates.length === 1 ? 'row' : 'rows'
+        }. Customer contact and address details are not included.`,
+      )
+    } catch (requestError) {
+      reportCsvError(requestError)
+    }
+  }
+
+  function downloadIssueSummaryCsv() {
+    setError('')
+    setNotice('')
+    try {
+      const csv = exportCommerceIssueSummaryCsv({
+        accountGlobalId,
+        provider,
+        issues: rejections.map((rejection) => ({
+          globalId: rejection.globalId,
+          rowVersion: rejection.rowVersion,
+          resourceType: rejection.resourceType,
+          externalId: rejection.externalId,
+          errorCode: rejection.errorCode,
+          safeMessage: rejection.safeMessage,
+        })),
+      })
+      downloadCsv(csv, csvFilename(provider, 'issues'))
+      setNotice(
+        `Downloaded ${rejections.length} sanitized provider ${
+          rejections.length === 1 ? 'issue' : 'issues'
+        }. Credentials and customer contact details are not included.`,
+      )
+    } catch (requestError) {
+      reportCsvError(requestError)
+    }
+  }
+
+  async function previewProductDecisionCsv(file: File) {
+    if (pendingAction) return
+    setPendingAction('preview-product-csv')
+    setError('')
+    setNotice('')
+    setCsvImportPreview(null)
+    setCsvImportFilename(file.name)
+    try {
+      const preview = parseCommerceProductReviewCsv({
+        csv: await file.text(),
+        accountGlobalId,
+        expectedCandidates: productCandidates.map((candidate) => ({
+          globalId: candidate.globalId,
+          rowVersion: candidate.rowVersion,
+        })),
+      })
+      setCsvImportPreview(preview)
+      if (preview.ok) {
+        setNotice(
+          `CSV checked: ${preview.decisions.length} ${
+            preview.decisions.length === 1 ? 'decision is' : 'decisions are'
+          } ready to apply and ${preview.skippedRows} blank ${
+            preview.skippedRows === 1 ? 'row was' : 'rows were'
+          } left unchanged.`,
+        )
+      } else {
+        setError(
+          `CSV needs correction before anything can be applied. ${
+            preview.errors.length
+          } ${preview.errors.length === 1 ? 'error was' : 'errors were'} found.`,
+        )
+      }
+    } catch (requestError) {
+      reportCsvError(requestError)
+    } finally {
+      setPendingAction('')
+      if (csvInputRef.current) csvInputRef.current.value = ''
+    }
+  }
+
+  function csvDecisionResolution(decision: CommerceProductReviewDecision) {
+    if (decision.action === 'map_existing') {
+      return {
+        mode: 'existing',
+        productGlobalId: decision.productGlobalId,
+      }
+    }
+    if (decision.action === 'create') {
+      return {
+        mode: 'create',
+        name: decision.name,
+        sku: decision.sku || '',
+        unitPriceMinor: decision.unitPriceMinor,
+        currency: decision.currency,
+      }
+    }
+    return {
+      mode: 'exclude',
+      reasonCode: 'operator_confirmed_catalog_exclusion',
+      reason: decision.reason,
+    }
+  }
+
+  async function applyProductDecisionCsv() {
+    if (
+      pendingAction
+      || !operatorCommandsAllowed
+      || !csvImportPreview?.ok
+      || csvImportPreview.decisions.length === 0
+    ) return
+    if (
+      !window.confirm(
+        `Apply ${csvImportPreview.decisions.length} reviewed product ${
+          csvImportPreview.decisions.length === 1 ? 'decision' : 'decisions'
+        } from ${csvImportFilename}? Each row is fenced to this connection and its current version.`,
+      )
+    ) return
+
+    const decisions = csvImportPreview.decisions
+    let applied = 0
+    let lastIntake: CommerceIntake | null = intake
+    setPendingAction('apply-product-csv')
+    setError('')
+    setNotice('')
+
+    try {
+      for (const decision of decisions) {
+        const requestKey = [
+          'csv-product',
+          decision.candidateGlobalId,
+          decision.rowVersion,
+          decision.action,
+        ].join(':')
+        const retryKey = `${accountGlobalId}:${requestKey}`
+        const stableIdempotencyKey = retryKeys.current.get(retryKey)
+          || idempotencyKey()
+        retryKeys.current.set(retryKey, stableIdempotencyKey)
+
+        const response = await fetch('/api/integrations/commerce/intake', {
+          method: 'POST',
+          cache: 'no-store',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            accountGlobalId,
+            action: 'resolve-catalog-product',
+            idempotencyKey: stableIdempotencyKey,
+            candidateGlobalId: decision.candidateGlobalId,
+            rowVersion: decision.rowVersion,
+            resolution: csvDecisionResolution(decision),
+          }),
+        })
+        const payload = await readPayload(response)
+        lastIntake = payload.intake || lastIntake
+        retryKeys.current.delete(retryKey)
+        applied += 1
+      }
+
+      setIntake(lastIntake)
+      setCsvImportPreview(null)
+      setCsvImportFilename('')
+      setNotice(
+        `${applied} product ${
+          applied === 1 ? 'decision was' : 'decisions were'
+        } applied. Provider data was not changed.`,
+      )
+    } catch (requestError) {
+      setCsvImportPreview({
+        ...csvImportPreview,
+        totalRows: decisions.length - applied,
+        skippedRows: 0,
+        decisions: decisions.slice(applied),
+      })
+      await loadIntake().catch(() => undefined)
+      setError(
+        `${applied} ${
+          applied === 1 ? 'decision was' : 'decisions were'
+        } applied before processing stopped. ${
+          safeError(requestError)
+        } The failed row keeps its retry identity; retry the remaining preview after reviewing the current state.`,
+      )
+    } finally {
+      setPendingAction('')
+    }
+  }
 
   function catalogProductDraft(candidate: ProductCandidate) {
     return catalogProductDrafts[candidate.globalId]
@@ -865,7 +1441,7 @@ export default function CommerceIntakeWorkflow({
           productGlobalId: draft.productGlobalId,
         },
       },
-      `${candidate.productTitle} mapped to the selected ClawPilot product.`,
+      `${candidate.productTitle} matched to the selected ClawPilot product.`,
     )
   }
 
@@ -882,11 +1458,14 @@ export default function CommerceIntakeWorkflow({
           mode: 'create',
           name: draft.name.trim(),
           sku: draft.sku.trim(),
-          unitPriceMinor: Number(draft.unitPriceMinor),
+          unitPriceMinor: parseCommerceMoneyMajor(
+            draft.unitPriceMinor,
+            normalizeCurrency(draft.currency),
+          ),
           currency: normalizeCurrency(draft.currency),
         },
       },
-      `${draft.name.trim()} created and mapped to this provider variant.`,
+      `${draft.name.trim()} created and matched to this provider variant.`,
     )
   }
 
@@ -906,7 +1485,7 @@ export default function CommerceIntakeWorkflow({
           reason,
         },
       },
-      `${candidate.productTitle} excluded from catalog mapping with an audit reason.`,
+      `${candidate.productTitle} skipped with an audited reason.`,
     )
   }
 
@@ -1037,7 +1616,10 @@ export default function CommerceIntakeWorkflow({
         product: {
           mode: 'existing',
           productGlobalId: draft.productGlobalId,
-          unitPriceMinor: Number(draft.unitPriceMinor),
+          unitPriceMinor: parseCommerceMoneyMajor(
+            draft.unitPriceMinor,
+            normalizeCurrency(draft.currency),
+          ),
           currency: normalizeCurrency(draft.currency),
         },
       },
@@ -1062,7 +1644,10 @@ export default function CommerceIntakeWorkflow({
           mode: 'create',
           name: draft.name.trim(),
           sku: draft.sku.trim(),
-          unitPriceMinor: Number(draft.unitPriceMinor),
+          unitPriceMinor: parseCommerceMoneyMajor(
+            draft.unitPriceMinor,
+            normalizeCurrency(draft.currency),
+          ),
           currency: normalizeCurrency(draft.currency),
         },
       },
@@ -1243,24 +1828,152 @@ export default function CommerceIntakeWorkflow({
   }
 
   return (
-    <Accordion
-      disableGutters
-      variant="outlined"
-      sx={{ borderRadius: '8px !important' }}
-    >
-      <AccordionSummary expandIcon={<ExpandMoreRounded />}>
-        <Box>
-          <Typography fontWeight={700}>
-            Commerce intake · map, resolve, and promote
-          </Typography>
-          <Typography variant="body2" color="text.secondary">
-            Fetch read-only {providerLabel(provider)} products and orders,
-            map the catalog, resolve each hold, and explicitly promote
-            canonical orders.
-          </Typography>
+    <>
+      <Card variant="outlined">
+        <CardContent sx={{ '&:last-child': { pb: 2 } }}>
+          <Stack spacing={1.5}>
+            <Stack
+              direction={{ xs: 'column', md: 'row' }}
+              justifyContent="space-between"
+              alignItems={{ md: 'center' }}
+              spacing={1.5}
+            >
+              <Box>
+                <Typography fontWeight={700}>
+                  Import products and orders
+                </Typography>
+                <Typography variant="body2" color="text.secondary">
+                  Review {providerLabel(provider)} data in a dedicated
+                  workspace before anything becomes a ClawPilot record.
+                </Typography>
+              </Box>
+              <Button
+                variant="contained"
+                onClick={() => {
+                  setWorkbenchTab('overview')
+                  setWorkbenchOpen(true)
+                }}
+                sx={actionButtonSx}
+              >
+                Open import workspace
+              </Button>
+            </Stack>
+            <Stack direction="row" gap={0.75} flexWrap="wrap">
+              <Chip
+                size="small"
+                color={operatorCommandsAllowed ? 'success' : 'warning'}
+                label={`Operations ${
+                  humanize(intake?.policy?.activationState || 'not initialized')
+                }`}
+              />
+              <Chip
+                size="small"
+                label={`${productCandidates.length} products found`}
+              />
+              <Chip
+                size="small"
+                color={unresolvedProductCount ? 'warning' : 'default'}
+                label={`${unresolvedProductCount} products need a decision`}
+              />
+              <Chip
+                size="small"
+                label={`${candidates.length} orders ready for review`}
+              />
+              <Chip
+                size="small"
+                color={issueRecordCount ? 'warning' : 'default'}
+                label={`${issueRecordCount} ${
+                  issueRecordCount === 1 ? 'issue' : 'issues'
+                }`}
+              />
+            </Stack>
+          </Stack>
+        </CardContent>
+      </Card>
+
+      <Dialog
+        fullScreen
+        open={workbenchOpen}
+        onClose={() => {
+          if (!pendingAction) setWorkbenchOpen(false)
+        }}
+        aria-labelledby={`commerce-intake-title-${accountGlobalId}`}
+      >
+        <DialogTitle
+          id={`commerce-intake-title-${accountGlobalId}`}
+          sx={{
+            borderBottom: 1,
+            borderColor: 'divider',
+            py: 1.5,
+          }}
+        >
+          <Stack
+            direction="row"
+            alignItems="center"
+            justifyContent="space-between"
+            spacing={1}
+          >
+            <Box>
+              <Typography component="div" variant="h6" fontWeight={700}>
+                {displayName}
+              </Typography>
+              <Typography variant="body2" color="text.secondary">
+                {providerLabel(provider)} import workspace · read-only provider
+                access
+              </Typography>
+            </Box>
+            <IconButton
+              aria-label="Close import workspace"
+              disabled={Boolean(pendingAction)}
+              onClick={() => setWorkbenchOpen(false)}
+            >
+              <CloseRounded />
+            </IconButton>
+          </Stack>
+        </DialogTitle>
+        <Box sx={{ borderBottom: 1, borderColor: 'divider', px: 2 }}>
+          <Tabs
+            value={workbenchTab}
+            onChange={(_event, value: WorkbenchTab) => {
+              setWorkbenchTab(value)
+            }}
+            variant="scrollable"
+            scrollButtons="auto"
+            aria-label="Commerce import workspace sections"
+          >
+            <Tab
+              id={`commerce-intake-tab-overview-${accountGlobalId}`}
+              aria-controls={`commerce-intake-panel-overview-${accountGlobalId}`}
+              value="overview"
+              label="Overview"
+            />
+            <Tab
+              id={`commerce-intake-tab-products-${accountGlobalId}`}
+              aria-controls={`commerce-intake-panel-products-${accountGlobalId}`}
+              value="products"
+              label={`Products (${unresolvedProductCount})`}
+            />
+            <Tab
+              id={`commerce-intake-tab-orders-${accountGlobalId}`}
+              aria-controls={`commerce-intake-panel-orders-${accountGlobalId}`}
+              value="orders"
+              label={`Orders (${candidates.length})`}
+            />
+            <Tab
+              id={`commerce-intake-tab-issues-${accountGlobalId}`}
+              aria-controls={`commerce-intake-panel-issues-${accountGlobalId}`}
+              value="issues"
+              label={`Issues (${issueRecordCount})`}
+            />
+          </Tabs>
         </Box>
-      </AccordionSummary>
-      <AccordionDetails>
+        <DialogContent
+          sx={{
+            bgcolor: 'background.default',
+            px: { xs: 2, md: 4 },
+            py: 3,
+          }}
+        >
         <Stack spacing={2.5}>
           {error ? (
             <Alert severity="error" onClose={() => setError('')}>
@@ -1273,11 +1986,67 @@ export default function CommerceIntakeWorkflow({
             </Alert>
           ) : null}
 
+          {workbenchTab === 'overview' ? (
+            <Stack
+              role="tabpanel"
+              id={`commerce-intake-panel-overview-${accountGlobalId}`}
+              aria-labelledby={`commerce-intake-tab-overview-${accountGlobalId}`}
+              spacing={2.5}
+            >
+          <Card
+            variant="outlined"
+            sx={{ borderColor: 'primary.main', bgcolor: 'action.hover' }}
+          >
+            <CardContent sx={{ '&:last-child': { pb: 2 } }}>
+              <Stack
+                direction={{ xs: 'column', md: 'row' }}
+                justifyContent="space-between"
+                alignItems={{ md: 'center' }}
+                spacing={1.5}
+              >
+                <Box>
+                  <Typography
+                    variant="overline"
+                    color="primary.main"
+                    fontWeight={700}
+                  >
+                    What to do next
+                  </Typography>
+                  <Typography fontWeight={700}>
+                    {recommendedAction.label}
+                  </Typography>
+                  <Typography variant="body2" color="text.secondary">
+                    {recommendedAction.detail}
+                  </Typography>
+                </Box>
+                <Button
+                  variant="contained"
+                  disabled={Boolean(pendingAction)}
+                  onClick={() => {
+                    if (!operatorCommandsAllowed) {
+                      if (activationRecoveryAvailable) {
+                        void initializeShadowActivation()
+                      } else {
+                        window.location.hash = 'operations'
+                      }
+                      return
+                    }
+                    setWorkbenchTab(recommendedAction.tab)
+                  }}
+                  sx={actionButtonSx}
+                >
+                  {!operatorCommandsAllowed && !activationRecoveryAvailable
+                    ? 'Review Operations access'
+                    : recommendedAction.label}
+                </Button>
+              </Stack>
+            </CardContent>
+          </Card>
           <Alert severity="info">
-            This workflow is provider-read-only. It cannot update{' '}
-            {providerLabel(provider)}, register webhooks, advance a sync
-            cursor, reserve inventory, or export fulfillment. Credentials and
-            provider tokens are never returned here.
+            ClawPilot can read {providerLabel(provider)} and create records
+            only after your approval. It cannot change {providerLabel(provider)},
+            advance a sync cursor, reserve inventory, or export fulfillment.
+            Credentials and provider tokens are never returned here.
           </Alert>
           {!operatorCommandsAllowed ? (
             <Alert
@@ -1336,7 +2105,7 @@ export default function CommerceIntakeWorkflow({
           >
             {[
               {
-                label: '1 · Fetch',
+                label: '1 · Find',
                 value: latestPagination
                   ? `${humanize(latestPagination.resource)} batch ${
                     latestPagination.batchNumber
@@ -1353,22 +2122,28 @@ export default function CommerceIntakeWorkflow({
                       ? 'live cursor'
                       : 'time-fenced'
                   }`
-                  : 'Bounded provider read',
+                  : 'Read provider data safely',
               },
               {
-                label: '2 · Resolve',
-                value: `${blockerCount} order blockers`,
-                detail: `${unresolvedProductCount} product mapping(s) open`,
+                label: '2 · Review',
+                value: `${blockerCount} order ${
+                  blockerCount === 1 ? 'issue' : 'issues'
+                }`,
+                detail: `${unresolvedProductCount} ${
+                  unresolvedProductCount === 1
+                    ? 'product needs a decision'
+                    : 'products need decisions'
+                }`,
               },
               {
-                label: '3 · Validate',
+                label: '3 · Check',
                 value: `${candidateCounts.ready} ready`,
-                detail: 'All required evidence checked',
+                detail: 'Required details confirmed',
               },
               {
-                label: '4 · Promote',
-                value: `${candidateCounts.promoted} promoted`,
-                detail: 'Canonical transaction only',
+                label: '4 · Add',
+                value: `${candidateCounts.promoted} added`,
+                detail: 'Create the ClawPilot order',
               },
             ].map((step) => (
               <Card key={step.label} variant="outlined">
@@ -1431,8 +2206,8 @@ export default function CommerceIntakeWorkflow({
             {([
               {
                 key: 'products',
-                title: 'Product catalog intake',
-                detail: 'Stage provider variants, then map, create, or exclude each one.',
+                title: 'Products to review',
+                detail: 'Find provider variants, then match, create, or skip each one.',
                 pagination: productPagination,
                 canFetchNext: canFetchNextProducts,
                 fetchAction: productFetchAction,
@@ -1448,8 +2223,8 @@ export default function CommerceIntakeWorkflow({
               },
               {
                 key: 'orders',
-                title: 'Operational order intake',
-                detail: 'Stage open orders only; canonical creation still requires promotion.',
+                title: 'Orders to review',
+                detail: 'Find open orders, then check and add each approved order to ClawPilot.',
                 pagination: orderPagination,
                 canFetchNext: canFetchNextOrders,
                 fetchAction: orderFetchAction,
@@ -1597,8 +2372,179 @@ export default function CommerceIntakeWorkflow({
               }
             </Typography>
           </Box>
+            </Stack>
+          ) : null}
 
-          {rejections.length ? (
+          {workbenchTab === 'issues' ? (
+            <Stack
+              role="tabpanel"
+              id={`commerce-intake-panel-issues-${accountGlobalId}`}
+              aria-labelledby={`commerce-intake-tab-issues-${accountGlobalId}`}
+              spacing={2.5}
+            >
+              <Stack
+                direction={{ xs: 'column', md: 'row' }}
+                justifyContent="space-between"
+                alignItems={{ md: 'flex-end' }}
+                spacing={1.5}
+              >
+                <Box>
+                  <Typography variant="h6" fontWeight={700}>
+                    Provider issues
+                  </Typography>
+                  <Typography variant="body2" color="text.secondary">
+                    Review provider records that could not be staged safely.
+                    Identical failures are summarized before individual
+                    recovery actions.
+                  </Typography>
+                </Box>
+                <Stack
+                  direction={{ xs: 'column', sm: 'row' }}
+                  spacing={1}
+                  alignItems={{ sm: 'flex-end' }}
+                >
+                  <Button
+                    variant="outlined"
+                    startIcon={<FileDownloadRounded />}
+                    disabled={rejections.length === 0}
+                    onClick={downloadIssueSummaryCsv}
+                    sx={actionButtonSx}
+                  >
+                    Export provider issues CSV
+                  </Button>
+                  <TextField
+                    label="Search issues"
+                    value={issueSearch}
+                    onChange={(event) => {
+                      setIssueSearch(event.target.value)
+                      setIssuePage(0)
+                    }}
+                    sx={{ ...fieldSx, minWidth: { md: 320 } }}
+                  />
+                </Stack>
+              </Stack>
+              {candidateBlockerGroups.length ? (
+                <Box
+                  sx={{
+                    display: 'grid',
+                    gridTemplateColumns: {
+                      xs: '1fr',
+                      md: 'repeat(2, minmax(0, 1fr))',
+                    },
+                    gap: 1,
+                  }}
+                >
+                  {candidateBlockerGroups.map((group) => (
+                    <Card key={group.code} variant="outlined">
+                      <CardContent sx={{ '&:last-child': { pb: 2 } }}>
+                        <Stack spacing={0.75}>
+                          <Stack
+                            direction="row"
+                            justifyContent="space-between"
+                            spacing={1}
+                          >
+                            <Typography fontWeight={700}>
+                              {group.label}
+                            </Typography>
+                            <Chip
+                              size="small"
+                              color="warning"
+                              label={`${group.count} ${
+                                group.count === 1 ? 'order' : 'orders'
+                              }`}
+                            />
+                          </Stack>
+                          <Typography variant="body2" color="text.secondary">
+                            {group.action}
+                          </Typography>
+                          <Button
+                            size="small"
+                            variant="text"
+                            onClick={() => setWorkbenchTab('orders')}
+                            sx={{ alignSelf: 'flex-start' }}
+                          >
+                            Review affected orders
+                          </Button>
+                          <Typography
+                            variant="caption"
+                            color="text.secondary"
+                          >
+                            Technical code: {group.code}
+                          </Typography>
+                        </Stack>
+                      </CardContent>
+                    </Card>
+                  ))}
+                </Box>
+              ) : null}
+              {rejectionGroups.length ? (
+                <Box
+                  sx={{
+                    display: 'grid',
+                    gridTemplateColumns: {
+                      xs: '1fr',
+                      md: 'repeat(2, minmax(0, 1fr))',
+                    },
+                    gap: 1,
+                  }}
+                >
+                  {rejectionGroups.map((group) => (
+                    <Card
+                      key={`${group.resourceType}:${group.code}`}
+                      variant="outlined"
+                    >
+                      <CardContent sx={{ '&:last-child': { pb: 2 } }}>
+                        <Stack spacing={0.75}>
+                          <Stack
+                            direction="row"
+                            justifyContent="space-between"
+                            spacing={1}
+                          >
+                            <Typography fontWeight={700}>
+                              {rejectionTitle(group.code)}
+                            </Typography>
+                            <Chip
+                              size="small"
+                              color="warning"
+                              label={`${group.count} ${
+                                group.count === 1 ? 'record' : 'records'
+                              }`}
+                            />
+                          </Stack>
+                          <Typography variant="body2" color="text.secondary">
+                            {group.message}
+                          </Typography>
+                          {provider === 'faire'
+                          && group.code
+                            === 'COMMERCE_ORDER_MONEY_INCOMPLETE' ? (
+                            <Alert severity="info">
+                              These orders use Faire&apos;s current order-money
+                              response, which ClawPilot cannot translate safely
+                              yet. This is a ClawPilot adapter gap, not a
+                              customer-data correction. Retrying will not
+                              change the result until that adapter is updated.
+                            </Alert>
+                            ) : null}
+                          <Typography
+                            variant="caption"
+                            color="text.secondary"
+                          >
+                            Technical code: {group.code}
+                          </Typography>
+                        </Stack>
+                      </CardContent>
+                    </Card>
+                  ))}
+                </Box>
+              ) : null}
+              {issueRecordCount > 0
+              && candidateBlockerGroups.length === 0
+              && rejectionGroups.length === 0 ? (
+                <Alert severity="info">
+                  No issues match the current search.
+                </Alert>
+                ) : null}
+          {filteredRejections.length ? (
             <Stack spacing={1}>
               <Alert severity="warning">
                 <Typography variant="body2" fontWeight={700}>
@@ -1611,7 +2557,7 @@ export default function CommerceIntakeWorkflow({
                   corrected catalog revision can be fetched.
                 </Typography>
               </Alert>
-              {rejections.map((rejection) => {
+              {visibleRejections.map((rejection) => {
                 const exclusionReason =
                   rejectionReasons[rejection.globalId] || ''
                 const retryKey =
@@ -1737,20 +2683,233 @@ export default function CommerceIntakeWorkflow({
                 )
               })}
             </Stack>
+          ) : rejections.length === 0
+          && candidateBlockerGroups.length === 0 ? (
+            <Alert severity="success">
+              No provider or order issues are waiting for review.
+            </Alert>
+          ) : null}
+              {filteredRejections.length > workbenchPageSize ? (
+                <TablePagination
+                  component="div"
+                  count={filteredRejections.length}
+                  page={safeIssuePage}
+                  onPageChange={(_event, page) => setIssuePage(page)}
+                  rowsPerPage={workbenchPageSize}
+                  rowsPerPageOptions={[workbenchPageSize]}
+                  labelRowsPerPage="Issues per page"
+                />
+              ) : null}
+            </Stack>
           ) : null}
 
-          <Divider />
-
+          {workbenchTab === 'products' ? (
+            <Stack
+              role="tabpanel"
+              id={`commerce-intake-panel-products-${accountGlobalId}`}
+              aria-labelledby={`commerce-intake-tab-products-${accountGlobalId}`}
+              spacing={2.5}
+            >
+          <Stack
+            direction={{ xs: 'column', md: 'row' }}
+            justifyContent="space-between"
+            alignItems={{ md: 'flex-end' }}
+            spacing={1.5}
+          >
           <Box>
             <Typography variant="h6" fontWeight={700}>
-              Product catalog mapping
+              Products
             </Typography>
             <Typography variant="body2" color="text.secondary">
-              Each provider variant must be mapped to an existing ClawPilot
-              product, used to create a new product, or explicitly excluded
-              with a reason.
+              Match each provider variant to an existing product, create a new
+              ClawPilot product, or skip it with an audited reason.
             </Typography>
           </Box>
+            <Stack
+              direction={{ xs: 'column', sm: 'row' }}
+              spacing={1}
+              alignItems={{ sm: 'flex-end' }}
+              flexWrap="wrap"
+            >
+              <input
+                ref={csvInputRef}
+                hidden
+                type="file"
+                accept=".csv,text/csv"
+                onChange={(event) => {
+                  const file = event.target.files?.[0]
+                  if (file) void previewProductDecisionCsv(file)
+                }}
+              />
+              <Button
+                variant="outlined"
+                startIcon={<FileDownloadRounded />}
+                disabled={unresolvedProductCount === 0}
+                onClick={downloadProductReviewCsv}
+                sx={actionButtonSx}
+              >
+                Download review CSV
+              </Button>
+              <Button
+                variant="outlined"
+                startIcon={<FileUploadRounded />}
+                disabled={
+                  Boolean(pendingAction)
+                  || !operatorCommandsAllowed
+                  || unresolvedProductCount === 0
+                }
+                onClick={() => csvInputRef.current?.click()}
+                sx={actionButtonSx}
+              >
+                {pendingAction === 'preview-product-csv'
+                  ? 'Checking CSV…'
+                  : 'Import decisions'}
+              </Button>
+              <TextField
+                select
+                label="Show"
+                value={productFilter}
+                onChange={(event) => {
+                  setProductFilter(
+                    event.target.value as ProductReviewFilter,
+                  )
+                  setProductPage(0)
+                }}
+                sx={{ ...fieldSx, minWidth: { sm: 170 } }}
+              >
+                <MenuItem value="all">All products</MenuItem>
+                <MenuItem value="needs_decision">Needs a decision</MenuItem>
+                <MenuItem value="matched">Matched</MenuItem>
+                <MenuItem value="skipped">Skipped</MenuItem>
+              </TextField>
+              <TextField
+                label="Search products"
+                value={productSearch}
+                onChange={(event) => {
+                  setProductSearch(event.target.value)
+                  setProductPage(0)
+                }}
+                sx={{ ...fieldSx, minWidth: { md: 320 } }}
+              />
+            </Stack>
+          </Stack>
+
+          {csvImportPreview ? (
+            <Card
+              variant="outlined"
+              sx={{
+                borderColor: csvImportPreview.ok
+                  ? 'success.main'
+                  : 'warning.main',
+              }}
+            >
+              <CardContent sx={{ '&:last-child': { pb: 2 } }}>
+                <Stack spacing={1.25}>
+                  <Stack
+                    direction={{ xs: 'column', sm: 'row' }}
+                    justifyContent="space-between"
+                    spacing={1}
+                  >
+                    <Box>
+                      <Typography fontWeight={700}>
+                        CSV validation preview
+                      </Typography>
+                      <Typography
+                        variant="body2"
+                        color="text.secondary"
+                        sx={{ overflowWrap: 'anywhere' }}
+                      >
+                        {csvImportFilename} · {csvImportPreview.totalRows}{' '}
+                        {csvImportPreview.totalRows === 1 ? 'row' : 'rows'} ·{' '}
+                        {csvImportPreview.decisions.length}{' '}
+                        {csvImportPreview.decisions.length === 1
+                          ? 'decision'
+                          : 'decisions'} · {csvImportPreview.skippedRows} left
+                        unchanged
+                      </Typography>
+                    </Box>
+                    <Chip
+                      size="small"
+                      color={csvImportPreview.ok ? 'success' : 'warning'}
+                      label={csvImportPreview.ok
+                        ? 'Ready to apply'
+                        : `${csvImportPreview.errors.length} ${
+                          csvImportPreview.errors.length === 1
+                            ? 'error'
+                            : 'errors'
+                        }`}
+                    />
+                  </Stack>
+                  <Alert severity="info">
+                    Only the <strong>action</strong> and corresponding decision
+                    fields are applied. Every row must still match this
+                    connection, its exact candidate ID, and its current row
+                    version. Blank actions leave products unchanged.
+                  </Alert>
+                  {csvImportPreview.errors.length ? (
+                    <Stack spacing={0.5}>
+                      {csvImportPreview.errors.slice(0, 20).map((
+                        rowError,
+                        index,
+                      ) => (
+                        <Typography
+                          key={`${rowError.rowNumber}:${rowError.column || ''}:${rowError.code}:${index}`}
+                          variant="body2"
+                          color="error"
+                        >
+                          {rowError.rowNumber
+                            ? `Row ${rowError.rowNumber}`
+                            : 'File'}
+                          {rowError.column ? ` · ${rowError.column}` : ''}
+                          : {rowError.message}
+                        </Typography>
+                      ))}
+                      {csvImportPreview.errors.length > 20 ? (
+                        <Typography variant="body2" color="error">
+                          And {csvImportPreview.errors.length - 20} more
+                          errors. Correct the file and import it again.
+                        </Typography>
+                      ) : null}
+                    </Stack>
+                  ) : null}
+                  <Stack
+                    direction={{ xs: 'column', sm: 'row' }}
+                    spacing={1}
+                  >
+                    <Button
+                      variant="contained"
+                      disabled={
+                        Boolean(pendingAction)
+                        || !csvImportPreview.ok
+                        || csvImportPreview.decisions.length === 0
+                      }
+                      onClick={() => void applyProductDecisionCsv()}
+                      sx={actionButtonSx}
+                    >
+                      {pendingAction === 'apply-product-csv'
+                        ? 'Applying decisions…'
+                        : `Apply ${csvImportPreview.decisions.length} ${
+                          csvImportPreview.decisions.length === 1
+                            ? 'decision'
+                            : 'decisions'
+                        }`}
+                    </Button>
+                    <Button
+                      variant="text"
+                      disabled={Boolean(pendingAction)}
+                      onClick={() => {
+                        setCsvImportPreview(null)
+                        setCsvImportFilename('')
+                      }}
+                      sx={actionButtonSx}
+                    >
+                      Clear preview
+                    </Button>
+                  </Stack>
+                </Stack>
+              </CardContent>
+            </Card>
+          ) : null}
 
           {!productPagination && productCandidates.length === 0 ? (
             <Alert severity="info">
@@ -1768,7 +2927,12 @@ export default function CommerceIntakeWorkflow({
             </Alert>
           ) : (
             <Stack spacing={1.5}>
-              {productCandidates.map((candidate) => {
+              {filteredProductCandidates.length === 0 ? (
+                <Alert severity="info">
+                  No products match the current search and filter.
+                </Alert>
+              ) : null}
+              {visibleProductCandidates.map((candidate) => {
                 const draft = catalogProductDraft(candidate)
                 const mapped = candidate.mappingStatus === 'resolved'
                   && Boolean(candidate.productGlobalId)
@@ -1837,7 +3001,7 @@ export default function CommerceIntakeWorkflow({
                             <Chip
                               size="small"
                               color={stateColor(candidate.state)}
-                              label={humanize(candidate.state)}
+                              label={candidateStateLabel(candidate.state)}
                             />
                             <Chip
                               size="small"
@@ -1904,12 +3068,12 @@ export default function CommerceIntakeWorkflow({
 
                         {mapped ? (
                           <Alert severity="success">
-                            Mapped to ClawPilot product{' '}
+                            Matched to ClawPilot product{' '}
                             {candidate.productGlobalId}.
                           </Alert>
                         ) : candidate.state === 'failed' ? (
                           <Alert severity="info">
-                            This provider revision was excluded:{' '}
+                            This provider revision was skipped:{' '}
                             {candidate.unsupportedReason
                               || 'operator-confirmed exclusion'}.
                             A later catalog fetch can stage a corrected
@@ -1923,14 +3087,36 @@ export default function CommerceIntakeWorkflow({
                           </Alert>
                         ) : (
                           <Alert severity="warning">
-                            Choose one executable disposition below. SKU and
-                            barcode are evidence only; the provider variant ID
-                            remains the integration identity.
+                            Open <strong>Choose product decision</strong> and
+                            select one action. SKU and barcode are reference
+                            details only; the provider variant remains the
+                            connection identity.
                           </Alert>
                         )}
 
                         {!actionsLocked ? (
-                          <>
+                          <Accordion
+                            disableGutters
+                            elevation={0}
+                            sx={{
+                              border: 1,
+                              borderColor: 'divider',
+                              borderRadius: '8px',
+                              '&::before': { display: 'none' },
+                            }}
+                          >
+                            <AccordionSummary
+                              expandIcon={<ExpandMoreRounded />}
+                              aria-controls={`product-decision-${candidate.globalId}`}
+                            >
+                              <Typography fontWeight={700}>
+                                Choose product decision
+                              </Typography>
+                            </AccordionSummary>
+                            <AccordionDetails
+                              id={`product-decision-${candidate.globalId}`}
+                            >
+                              <Stack spacing={1.5}>
                             <Stack
                               direction={{ xs: 'column', sm: 'row' }}
                               spacing={1}
@@ -1979,7 +3165,7 @@ export default function CommerceIntakeWorkflow({
                               >
                                 {pendingAction === mapKey
                                   ? 'Mapping…'
-                                  : 'Map existing product'}
+                                  : 'Match existing product'}
                               </Button>
                             </Stack>
 
@@ -1988,7 +3174,7 @@ export default function CommerceIntakeWorkflow({
                                 variant="caption"
                                 color="text.secondary"
                               >
-                                or create and map
+                                or create a new product
                               </Typography>
                             </Divider>
 
@@ -2025,7 +3211,7 @@ export default function CommerceIntakeWorkflow({
                                 sx={fieldSx}
                               />
                               <TextField
-                                label="Price (minor units)"
+                                label={`Price (${draft.currency || 'currency'})`}
                                 type="number"
                                 value={draft.unitPriceMinor}
                                 onChange={(event) => {
@@ -2033,7 +3219,8 @@ export default function CommerceIntakeWorkflow({
                                     unitPriceMinor: event.target.value,
                                   })
                                 }}
-                                inputProps={{ min: 0, step: 1 }}
+                                inputProps={{ min: 0, step: 'any' }}
+                                helperText="Enter the normal customer-facing amount, such as 12.34."
                                 sx={fieldSx}
                               />
                               <TextField
@@ -2067,7 +3254,7 @@ export default function CommerceIntakeWorkflow({
                             >
                               {pendingAction === createKey
                                 ? 'Creating…'
-                                : 'Create and map product'}
+                                : 'Create and match product'}
                             </Button>
 
                             <Divider>
@@ -2075,7 +3262,7 @@ export default function CommerceIntakeWorkflow({
                                 variant="caption"
                                 color="text.secondary"
                               >
-                                or exclude this revision
+                                or skip this provider revision
                               </Typography>
                             </Divider>
 
@@ -2091,7 +3278,7 @@ export default function CommerceIntakeWorkflow({
                               }}
                             >
                               <TextField
-                                label="Catalog exclusion reason"
+                                label="Reason for skipping"
                                 value={draft.exclusionReason}
                                 onChange={(event) => {
                                   updateCatalogProductDraft(candidate, {
@@ -2116,10 +3303,12 @@ export default function CommerceIntakeWorkflow({
                               >
                                 {pendingAction === excludeKey
                                   ? 'Excluding…'
-                                  : 'Exclude product revision'}
+                                  : 'Skip this product'}
                               </Button>
                             </Box>
-                          </>
+                              </Stack>
+                            </AccordionDetails>
+                          </Accordion>
                         ) : null}
                       </Stack>
                     </CardContent>
@@ -2128,24 +3317,89 @@ export default function CommerceIntakeWorkflow({
               })}
             </Stack>
           )}
+              {filteredProductCandidates.length > workbenchPageSize ? (
+                <TablePagination
+                  component="div"
+                  count={filteredProductCandidates.length}
+                  page={safeProductPage}
+                  onPageChange={(_event, page) => setProductPage(page)}
+                  rowsPerPage={workbenchPageSize}
+                  rowsPerPageOptions={[workbenchPageSize]}
+                  labelRowsPerPage="Products per page"
+                />
+              ) : null}
+            </Stack>
+          ) : null}
 
-          <Divider />
-
+          {workbenchTab === 'orders' ? (
+            <Stack
+              role="tabpanel"
+              id={`commerce-intake-panel-orders-${accountGlobalId}`}
+              aria-labelledby={`commerce-intake-tab-orders-${accountGlobalId}`}
+              spacing={2.5}
+            >
+          <Stack
+            direction={{ xs: 'column', md: 'row' }}
+            justifyContent="space-between"
+            alignItems={{ md: 'flex-end' }}
+            spacing={1.5}
+          >
           <Box>
             <Typography variant="h6" fontWeight={700}>
-              Operational order candidates
+              Orders
             </Typography>
             <Typography variant="body2" color="text.secondary">
-              Resolve and validate held orders before explicitly promoting
-              each canonical transaction.
+              Fix required details, check each order, then explicitly add the
+              approved order to ClawPilot.
             </Typography>
           </Box>
+            <Stack
+              direction={{ xs: 'column', sm: 'row' }}
+              spacing={1}
+              alignItems={{ sm: 'flex-end' }}
+            >
+              <Button
+                variant="outlined"
+                startIcon={<FileDownloadRounded />}
+                disabled={candidates.length === 0}
+                onClick={downloadOrderSummaryCsv}
+                sx={actionButtonSx}
+              >
+                Export orders CSV
+              </Button>
+              <TextField
+                select
+                label="Show"
+                value={orderFilter}
+                onChange={(event) => {
+                  setOrderFilter(event.target.value as OrderReviewFilter)
+                  setOrderPage(0)
+                }}
+                sx={{ ...fieldSx, minWidth: { sm: 160 } }}
+              >
+                <MenuItem value="all">All orders</MenuItem>
+                <MenuItem value="needs_review">Needs review</MenuItem>
+                <MenuItem value="ready">Ready to add</MenuItem>
+                <MenuItem value="added">Added</MenuItem>
+                <MenuItem value="skipped">Skipped or expired</MenuItem>
+              </TextField>
+              <TextField
+                label="Search orders"
+                value={orderSearch}
+                onChange={(event) => {
+                  setOrderSearch(event.target.value)
+                  setOrderPage(0)
+                }}
+                sx={{ ...fieldSx, minWidth: { md: 320 } }}
+              />
+            </Stack>
+          </Stack>
 
           {!orderPagination && candidates.length === 0 ? (
             <Alert severity="info">
-              Select <strong>Fetch operational orders</strong> to create
-              bounded held candidates. Nothing is imported until a ready
-              candidate is explicitly promoted.
+              Select <strong>Fetch operational orders</strong> to find orders
+              for review. Nothing is added to ClawPilot until a ready order is
+              explicitly approved.
             </Alert>
           ) : candidates.length === 0 ? (
             <Alert severity="info">
@@ -2156,7 +3410,12 @@ export default function CommerceIntakeWorkflow({
             </Alert>
           ) : (
             <Stack spacing={2}>
-              {candidates.map((candidate) => {
+              {filteredOrderCandidates.length === 0 ? (
+                <Alert severity="info">
+                  No orders match the current search and filter.
+                </Alert>
+              ) : null}
+              {visibleOrderCandidates.map((candidate) => {
                 const unavailableReason = candidateUnavailableReason(candidate)
                 const candidateLocked = Boolean(unavailableReason)
                   || !operatorCommandsAllowed
@@ -2192,8 +3451,10 @@ export default function CommerceIntakeWorkflow({
                   ? ''
                   : candidate.unsupportedReason
                     || (candidate.blockers?.length
-                      ? `${candidate.blockers.length} blocker(s) still require resolution and validation.`
-                      : 'Run validation successfully before promotion.')
+                      ? `${candidate.blockers.length} ${
+                        candidate.blockers.length === 1 ? 'issue still needs' : 'issues still need'
+                      } review.`
+                      : 'Check the order successfully before adding it.')
                 return (
                   <Card key={candidate.globalId} variant="outlined">
                     <CardContent>
@@ -2220,7 +3481,7 @@ export default function CommerceIntakeWorkflow({
                             <Chip
                               size="small"
                               color={stateColor(candidate.state)}
-                              label={humanize(candidate.state)}
+                              label={candidateStateLabel(candidate.state)}
                             />
                             <Chip
                               size="small"
@@ -2298,8 +3559,8 @@ export default function CommerceIntakeWorkflow({
 
                         {candidate.canonicalOrderGlobalId ? (
                           <Alert severity="success">
-                            Canonical order {candidate.canonicalOrderGlobalId}
-                            {' '}was created by promotion.
+                            ClawPilot order {candidate.canonicalOrderGlobalId}
+                            {' '}was created.
                           </Alert>
                         ) : null}
                         {candidate.unsupportedReason ? (
@@ -2433,7 +3694,7 @@ export default function CommerceIntakeWorkflow({
                                           }}
                                         >
                                           <TextField
-                                            label="Order-time price (minor units)"
+                                            label={`Order price (${draft.currency || 'currency'})`}
                                             type="number"
                                             value={draft.unitPriceMinor}
                                             onChange={(event) => {
@@ -2446,8 +3707,8 @@ export default function CommerceIntakeWorkflow({
                                                 },
                                               )
                                             }}
-                                            inputProps={{ min: 0, step: 1 }}
-                                            helperText="Required. For USD, $12.34 is 1234. The current product price is never substituted."
+                                            inputProps={{ min: 0, step: 'any' }}
+                                            helperText="Required. Enter the amount shown on this order, such as 12.34. The current catalog price is never substituted."
                                             sx={fieldSx}
                                           />
                                           <TextField
@@ -3211,12 +4472,12 @@ export default function CommerceIntakeWorkflow({
                                   candidateGlobalId: candidate.globalId,
                                   rowVersion: candidate.rowVersion,
                                 },
-                                'Candidate validation completed.',
+                                'Order check completed. Review its current readiness before adding it.',
                               )
                             }}
                             sx={actionButtonSx}
                           >
-                            Validate
+                            Check order
                           </Button>
                           <Button
                             variant="contained"
@@ -3235,12 +4496,12 @@ export default function CommerceIntakeWorkflow({
                                   rowVersion: candidate.rowVersion,
                                   confirmProviderWriteOff: true,
                                 },
-                                'Candidate promoted to one canonical ClawPilot order.',
+                                'Order added to ClawPilot. The provider was not changed.',
                               )
                             }}
                             sx={actionButtonSx}
                           >
-                            Promote canonical order
+                            Add order to ClawPilot
                           </Button>
                         </Stack>
 
@@ -3250,7 +4511,7 @@ export default function CommerceIntakeWorkflow({
                             variant="caption"
                             color="text.secondary"
                           >
-                            Promotion unavailable: {promotionReason}
+                            Cannot add this order yet: {promotionReason}
                           </Typography>
                         ) : null}
 
@@ -3321,8 +4582,22 @@ export default function CommerceIntakeWorkflow({
               })}
             </Stack>
           )}
+              {filteredOrderCandidates.length > workbenchPageSize ? (
+                <TablePagination
+                  component="div"
+                  count={filteredOrderCandidates.length}
+                  page={safeOrderPage}
+                  onPageChange={(_event, page) => setOrderPage(page)}
+                  rowsPerPage={workbenchPageSize}
+                  rowsPerPageOptions={[workbenchPageSize]}
+                  labelRowsPerPage="Orders per page"
+                />
+              ) : null}
+            </Stack>
+          ) : null}
         </Stack>
-      </AccordionDetails>
-    </Accordion>
+        </DialogContent>
+      </Dialog>
+    </>
   )
 }

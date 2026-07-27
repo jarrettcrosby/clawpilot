@@ -36,6 +36,7 @@ import CheckCircleRounded from '@mui/icons-material/CheckCircleRounded'
 import CancelRounded from '@mui/icons-material/CancelRounded'
 import CloseRounded from '@mui/icons-material/CloseRounded'
 import HelpOutlineRounded from '@mui/icons-material/HelpOutlineRounded'
+import ImportExportRounded from '@mui/icons-material/ImportExportRounded'
 import Inventory2Rounded from '@mui/icons-material/Inventory2Rounded'
 import LocalShippingRounded from '@mui/icons-material/LocalShippingRounded'
 import MoveToInboxRounded from '@mui/icons-material/MoveToInboxRounded'
@@ -62,6 +63,7 @@ import type {
   OperationsWorkspace,
 } from '@/lib/operations/types'
 import GlCodingPanel from '@/components/operations/GlCodingPanel'
+import CommerceImportsPanel from '@/components/operations/CommerceImportsPanel'
 import PrinterConfigurationPanel from '@/components/operations/PrinterConfigurationPanel'
 import ReceivingPanel from '@/components/operations/ReceivingPanel'
 import WarehouseSetupPanel from '@/components/operations/WarehouseSetupPanel'
@@ -80,6 +82,16 @@ type OperationsPayload = {
     | OperationsSandboxLabelCommandResult
     | OperationsShipmentCommandResult
 }
+
+export type OperationsView =
+  | 'orders'
+  | 'exceptions'
+  | 'imports'
+  | 'receiving'
+  | 'warehouses'
+  | 'carrier-invoices'
+  | 'gl-coding'
+  | 'printing'
 
 const ORDER_STATUSES: Array<{ value: '' | OperationsOrderStatus; label: string }> = [
   { value: '', label: 'All statuses' },
@@ -905,7 +917,11 @@ function OperationsGuide({ open, onClose }: { open: boolean; onClose: () => void
   )
 }
 
-export default function OperationsSection() {
+export default function OperationsSection({
+  initialView = 'orders',
+}: {
+  initialView?: OperationsView
+}) {
   const theme = useTheme()
   const mobile = useMediaQuery(theme.breakpoints.down('md'))
   const dateTime = useUserDateTime()
@@ -913,9 +929,7 @@ export default function OperationsSection() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
-  const [view, setView] = useState<
-    'orders' | 'exceptions' | 'receiving' | 'warehouses' | 'gl-coding' | 'printing'
-  >('orders')
+  const [view, setView] = useState<OperationsView>(initialView)
   const [search, setSearch] = useState('')
   const [status, setStatus] = useState<'' | OperationsOrderStatus>('')
   const [exceptionStatus, setExceptionStatus] = useState<'' | OperationsExceptionStatus>('')
@@ -953,6 +967,15 @@ export default function OperationsSection() {
   const [voidLabelReason, setVoidLabelReason] = useState('Void the sandbox label after validation')
   const [voidLabelIdempotencyKey, setVoidLabelIdempotencyKey] = useState('')
   const [voidingLabel, setVoidingLabel] = useState(false)
+
+  useEffect(() => {
+    setView(initialView)
+    setSearch('')
+    setSelectedGlobalId(null)
+    setDrawerOpen(false)
+    setSelectedExceptionGlobalId(null)
+    setExceptionDrawerOpen(false)
+  }, [initialView])
 
   const loadWorkspace = useCallback(async (orderGlobalId?: string | null, signal?: AbortSignal) => {
     setLoading(true)
@@ -1415,19 +1438,27 @@ export default function OperationsSection() {
         : false
   )
   const mainWorkspaceView = view === 'orders' || view === 'exceptions'
-  const heading = view === 'gl-coding'
-    ? 'Carrier billing & GL'
+  const heading = view === 'carrier-invoices'
+    ? 'Carrier invoicing'
+    : view === 'gl-coding'
+      ? 'Shipment pricing & GL'
     : view === 'printing'
       ? 'Print orchestration'
+      : view === 'imports'
+        ? 'Commerce imports'
       : view === 'receiving'
         ? 'Inbound receiving'
       : view === 'warehouses'
         ? 'Warehouse network'
       : 'Order Workbench'
-  const subheading = view === 'gl-coding'
-    ? 'Actual carrier charges, shipment evidence, shipper assignment, and reconciliation'
+  const subheading = view === 'carrier-invoices'
+    ? 'Import carrier bills and preserve account, shipment-match, and actual-cost evidence'
+    : view === 'gl-coding'
+      ? 'Assign charges to the responsible shipper, review MUD pricing, and approve reconciliation and GL outputs'
     : view === 'printing'
       ? 'Warehouse printers, document media, defaults, and fallbacks'
+      : view === 'imports'
+        ? 'Review Shopify and Faire products, orders, and import issues before they enter Operations'
       : view === 'receiving'
         ? 'Expected receipts, inspection, directed putaway, and inventory ledger posting'
       : view === 'warehouses'
@@ -1496,16 +1527,14 @@ export default function OperationsSection() {
           <Tabs
             value={view}
             onChange={(_, next:
-              | 'orders'
-              | 'exceptions'
-              | 'receiving'
-              | 'warehouses'
-              | 'gl-coding'
-              | 'printing') => {
+              OperationsView) => {
               setView(next)
               setSearch('')
               closeDrawer()
               closeExceptionDrawer()
+              window.location.hash = next === 'orders'
+                ? 'operations'
+                : `operations/${next}`
             }}
             variant="scrollable"
             scrollButtons="auto"
@@ -1559,13 +1588,20 @@ export default function OperationsSection() {
             <Tab value="orders" label={`Orders${workspace ? ` (${workspace.orders.length})` : ''}`} />
             <Tab value="exceptions" label={`Exceptions${workspace ? ` (${workspace.summary.exceptions})` : ''}`} />
             <Tab
+              value="imports"
+              icon={<ImportExportRounded fontSize="small" />}
+              iconPosition="start"
+              label="Commerce imports"
+            />
+            <Tab
               value="receiving"
               icon={<MoveToInboxRounded fontSize="small" />}
               iconPosition="start"
               label={`Receiving${workspace ? ` (${workspace.inboundReceipts?.length || 0})` : ''}`}
             />
             <Tab value="warehouses" icon={<WarehouseRounded fontSize="small" />} iconPosition="start" label="Warehouses" />
-            <Tab value="gl-coding" label="Billing & GL" />
+            <Tab value="carrier-invoices" label="Carrier invoicing" />
+            <Tab value="gl-coding" label="Shipment pricing & GL" />
             <Tab value="printing" icon={<PrintRounded fontSize="small" />} iconPosition="start" label="Printing" />
           </Tabs>
         </Box>
@@ -1613,14 +1649,16 @@ export default function OperationsSection() {
       {mainWorkspaceView && !loading && workspace && !workspace.configured && (
         <Alert severity="info" sx={{ mx: { xs: 2, md: 3 }, mb: 1.5 }}>Connect an approved commerce provider and configure an active warehouse to begin importing orders.</Alert>
       )}
-      {!mainWorkspaceView && error && (
+      {(view === 'receiving' || view === 'warehouses') && error && (
         <Alert severity="error" onClose={() => setError('')} sx={{ mx: { xs: 2, md: 3 }, mt: 1.5 }}>
           {error}
         </Alert>
       )}
 
       <Box sx={{ flex: 1, minHeight: 0, overflow: 'auto', WebkitOverflowScrolling: 'touch' }}>
-        {view === 'receiving' ? (
+        {view === 'imports' ? (
+          <CommerceImportsPanel />
+        ) : view === 'receiving' ? (
           <ReceivingPanel workspace={workspace} onRefresh={() => loadWorkspace()} />
         ) : view === 'warehouses' ? (
           <WarehouseSetupPanel
@@ -1628,8 +1666,10 @@ export default function OperationsSection() {
             onRefresh={() => loadWorkspace()}
             onNavigate={(next) => setView(next)}
           />
+        ) : view === 'carrier-invoices' ? (
+          <GlCodingPanel mode="carrier-invoices" />
         ) : view === 'gl-coding' ? (
-          <GlCodingPanel />
+          <GlCodingPanel mode="shipment-pricing" />
         ) : view === 'printing' ? (
           <PrinterConfigurationPanel />
         ) : loading && !workspace ? (

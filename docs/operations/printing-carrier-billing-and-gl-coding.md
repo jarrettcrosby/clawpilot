@@ -80,7 +80,7 @@ Credentials, complete carrier-account numbers, artifact storage references, and 
 
 A carrier billing file may contain one or many carrier account numbers. Each imported source must retain provider, environment, checksum, filename, source-document reference, import actor, and row totals.
 
-Import the source directly from **Operations > Billing & GL > Import carrier billing CSV**. ClawPilot accepts multipart CSV uploads, calculates the checksum server-side, rejects an idempotency-key replay with different bytes, and never persists the complete carrier account number. Provider-specific column aliases normalize into the common charge schema; unsupported or incomplete rows remain visible as rejected evidence instead of being silently discarded.
+Import the source directly from **Operations > Carrier invoicing > Import carrier billing CSV**. ClawPilot accepts multipart CSV uploads, calculates the checksum server-side, rejects an idempotency-key replay with different bytes, and never persists the complete carrier account number. Provider-specific column aliases normalize into the common charge schema; unsupported or incomplete rows remain visible as rejected evidence instead of being silently discarded.
 
 For each statement and charge:
 
@@ -94,22 +94,25 @@ The carrier account registered address determines sender, recipient, or third-pa
 
 ## Run GL Coding
 
-Open **Operations > Billing & GL** and explicitly select the carrier billing batches to process.
+Open **Operations > Shipment pricing & GL** and explicitly select the carrier billing batches to process.
+
+A **Markup Directive (MUD)** is the approved, effective-dated contract rule that produced the customer-facing shipment price. The quote retains the exact MUD version and calculated result. GL Coding links billed carrier charges to shipment and shipper evidence and reviews that retained result; it does not silently recalculate, replace, or mutate the quoted MUD price.
 
 1. Select a versioned routing-rule set.
 2. Run GL Coding against the selected immutable input snapshot.
-3. Review automatic shipper assignments and their exact rule version.
+3. Review automatic shipment-to-shipper assignments and their exact shipper-routing rule version.
 4. Review orphans separately.
 5. Manually assign an orphan only when the responsible Circle is known. Record a reason.
 6. Leave unresolved evidence unresolved when neither a rule nor an operator can support an assignment.
 7. Reprocess under a later rule version by creating superseding assignment evidence. Never rewrite the prior run.
 8. Approve or reject a completed run as a separate financial-control action. Approval snapshots every selected charge, statement, account resolution, account authorization, carrier account, shipper assignment, currency, amount, and GL output.
 
-Shipment matching and shipper assignment are independent:
+Shipment matching, shipper assignment, and MUD pricing are independent:
 
 - A matched shipment may determine the Circle.
 - An unmatched charge may still be assigned to a Circle by a versioned GL rule or a manual decision.
 - Manual or rule assignment must not falsely change the shipment match to `matched`.
+- A shipper-assignment rule identifies the responsible Circle and GL dimensions; it is not a MUD and cannot rewrite the customer-facing price.
 
 ## Triangle, Square, And Circle Billing
 
