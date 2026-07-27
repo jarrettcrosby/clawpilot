@@ -28,6 +28,7 @@ import {
 import AddRounded from '@mui/icons-material/AddRounded'
 import CancelRounded from '@mui/icons-material/CancelRounded'
 import ContentCopyRounded from '@mui/icons-material/ContentCopyRounded'
+import DownloadRounded from '@mui/icons-material/DownloadRounded'
 import EditRounded from '@mui/icons-material/EditRounded'
 import InfoOutlined from '@mui/icons-material/InfoOutlined'
 import KeyRounded from '@mui/icons-material/KeyRounded'
@@ -1377,6 +1378,16 @@ export default function PrinterConfigurationPanel() {
           </DialogContent>
         )}
         <DialogActions sx={{ flexWrap: 'wrap' }}>
+          {selectedJob?.artifactGlobalId && (
+            <Button
+              component="a"
+              href={`/api/operations/artifacts/${encodeURIComponent(selectedJob.artifactGlobalId)}`}
+              download
+              startIcon={<DownloadRounded />}
+            >
+              Download {selectedJob.format || 'artifact'}
+            </Button>
+          )}
           {selectedJob?.status === 'failed'
             && jobs?.capabilities.canExecute
             && selectedJob.attempts < selectedJob.maxAttempts && (

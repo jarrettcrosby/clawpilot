@@ -126,7 +126,25 @@ ZPL, 4 x 6 media, and shipping labels. PDF/PNG remain valid carrier artifacts
 only for a separately enrolled native print service; carrier bytes are never
 rasterized, scaled, or converted merely to satisfy a mismatched printer.
 
-Rating and shipping remain separate provider commands. A successful rate contains no label document or tracking number. An authorized operator may explicitly select one evidenced service and call the provider sandbox Ship API through a durable prepare/call/finalize command. The bounded thermal diagnostic requests UPS ZPL or FedEx `ZPLII` with `STOCK_4X6`; ClawPilot records either provider stream as `ZPL`, validates the decoded UTF-8 command envelope, and stores the exact bytes before any printer route is attempted. It does not convert PDF/PNG to ZPL, inject margins, scale carrier content, or mutate an older stored artifact. The associated void resolves the exact persisted account, and an ambiguous create or void result blocks a fresh attempt until reconciliation.
+Migration `0118_operations_carrier_label_output_artifacts.sql` makes the
+carrier-returned file an explicit immutable source. The label records its
+canonical format, provider image type, provider stock type, content hash, and
+`provider_native` source kind. A future conversion may write only a separate
+immutable derivative that binds the original source hash, its own hash, the
+converter name/version, media, and conversion options. No converter is enabled
+by this migration, and neither a printer mismatch nor a download request may
+overwrite the provider source. Finalization must match the output format stored
+on the prepared carrier command; a provider response in a different format is
+rejected before insert.
+
+Rating and shipping remain separate provider commands. A successful rate contains no label document or tracking number. An authorized operator may explicitly select one evidenced service and choose a provider-native 4 x 6 output before calling the provider sandbox Ship API through a durable prepare/call/finalize command. The standard UPS Shipping diagnostic exposes native `ZPL`; the current UPS OpenAPI describes `GIF`, `ZPL`, `EPL`, and `SPL` for standard shipment labels and does not establish native PDF or PNG for this path. ClawPilot therefore does not advertise UPS PDF/PNG or silently translate GIF. FedEx exposes native `ZPLII` with `STOCK_4X6`, or native `PDF`/`PNG` with `PAPER_4X6`. ClawPilot validates the decoded format and dimensions where applicable, records the exact provider bytes and source metadata, and only then permits a compatible print route. The associated void resolves the exact persisted account, and an ambiguous create or void result blocks a fresh attempt until reconciliation.
+
+| Diagnostic provider | Exposed customer choice | Provider-native request | Current media |
+| --- | --- | --- | --- |
+| UPS Shipping REST | ZPL | `LabelImageFormat.Code=ZPL` | 4 x 6 |
+| FedEx Ship REST | ZPL | `ImageType=ZPLII`, `LabelStockType=STOCK_4X6` | 4 x 6 |
+| FedEx Ship REST | PDF | `ImageType=PDF`, `LabelStockType=PAPER_4X6` | 4 x 6 |
+| FedEx Ship REST | PNG | `ImageType=PNG`, `LabelStockType=PAPER_4X6` | 4 x 6 at the provider-documented 800 x 1200 pixels |
 
 Printing is a third command over the stored label artifact. Test-print, retry, and controlled reprint do not call the carrier. Capability routing requires the printer or print service to advertise the exact document type, media, and format. Existing PDF/PNG labels therefore remain usable only with an explicitly compatible route; a raw-ZPL Zebra route never accepts them. The boundary refuses production credentials and cannot create an operational shipment, pickup, manifest, tracking observation, commerce export, packing slip, or inventory mutation. A successful sandbox rate or label remains diagnostic evidence, not certification for production shipping.
 
@@ -151,9 +169,10 @@ Scheduled reconciliation covers:
 - [RocketShipIt rating guide](https://docs.rocketshipit.com/rs/docs/rating.html)
 - [UPS Developer Portal](https://developer.ups.com/)
 - [UPS API catalog](https://developer.ups.com/catalog?loc=en_US)
+- [UPS Shipping OpenAPI](https://github.com/UPS-API/api-documentation/blob/main/Shipping.yaml)
 - [FedEx rates and transit times API](https://developer.fedex.com/api/en-us/catalog/rate/docs.html)
 - [FedEx OAuth API](https://developer.fedex.com/api/en-as/catalog/authorization/docs.html)
-- [FedEx ship API](https://developer.fedex.com/api/en-pr/catalog/ship/docs.html)
+- [FedEx Ship API](https://developer.fedex.com/api/en-us/catalog/ship/v1/docs.html)
 - [USPS APIs getting started](https://developers.usps.com/getting-started)
 - [USPS Domestic Labels 3.0](https://developers.usps.com/domesticlabelsv3)
 

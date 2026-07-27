@@ -28,6 +28,45 @@ The durable model supports:
 
 `delivered` or **Acknowledged** means the local agent handed the artifact to its configured device. It does not prove that paper exited the printer. Browser downloads and print dialogs never create durable delivery evidence.
 
+Authorized operators may download the exact immutable bytes from a print-job
+detail or a stored diagnostic label after its print artifact exists. The
+active-organization artifact route supports ZPL, PDF, and PNG; it derives a
+safe MIME type and extension from the recorded format, validates the stored
+length and SHA-256 before streaming, and emits a strong SHA-256 ETag. The
+browser must revalidate every cached response through the signed-in,
+active-organization authorization boundary; label bytes are never fresh for
+offline or year-long cache reuse. The binary response is never placed in
+print-job JSON, audit payloads, or logs.
+Downloading is inspection or manual-delivery assistance only and does not
+acknowledge a print job, prove physical output, call a carrier, or create a
+reprint.
+
+### Does the workstation need an installed application?
+
+Not for download-only use. An authorized operator may download the stored ZPL,
+PDF, or PNG and print it manually without installing the ClawPilot agent.
+
+Automatic cloud-to-local printing does require a trusted process on a computer
+or print server that can reach the printer. A browser cannot be treated as a
+durable, silent bridge to a USB device, an operating-system queue, or arbitrary
+raw port 9100 endpoints. The supported first-party path is the ClawPilot local
+print agent:
+
+- a network Zebra that accepts native ZPL can receive the exact stored command
+  stream over raw TCP without an operating-system printer driver;
+- a USB printer, or a PDF/PNG route, requires an explicitly configured
+  operating-system/vendor queue and a local-agent backend that declares those
+  capabilities; the bundled raw-ZPL worker does not claim them;
+- a dedicated always-on workstation or print server is preferable to relying on
+  an operator's browser tab.
+
+Do not vendor an indiscriminate collection of GitHub printer drivers into the
+agent. Prefer carrier-native output, driverless IPP/CUPS where the device
+supports it, signed vendor software, or a maintained printing bridge with a
+bounded capability adapter. Any added backend must be version-pinned, licensed,
+security-reviewed, and tested against the exact format, DPI, media, copy count,
+and printer model before it may advertise compatibility.
+
 ## Configure Printing
 
 Open **Operations > Printing**.
@@ -91,6 +130,55 @@ separate guarded command can print a static label marked
 CLAWPILOT_PRINTER_HOST='printer-hostname-or-static-ip' \
 npm run print-agent:test-label
 ```
+
+### Zebra media calibration
+
+Media calibration is device maintenance, not a print job. It does not create,
+claim, retry, reprint, or acknowledge a ClawPilot artifact. The inspection
+command is read-only and reports the printer's media mode, sensor, configured
+label length, tear-off position, label offsets, and the difference between the
+calibrated stock and an expected 4 x 6 label:
+
+```bash
+CLAWPILOT_PRINTER_HOST='192.0.2.10' \
+npm run print-agent:calibrate-zebra -- --expected-media label_4x6
+```
+
+For 203 dpi stock, a configured label length materially above approximately
+1,218 dots means the sensor is consistently finding a gap beyond six inches.
+Calibration cannot turn physically longer stock into 4 x 6 stock. Load actual
+4 x 6 die-cut gap labels before calibrating or select a carrier stock size that
+matches the loaded media.
+
+The first-line corrective action for skipped labels is Zebra's standard auto
+media calibration (`~JC`). Pause the exact local print-agent service first so
+no print job can overlap calibration, load 4 x 6 gap media, close the cover,
+and run:
+
+```bash
+CLAWPILOT_PRINTER_HOST='192.0.2.10' \
+npm run print-agent:calibrate-zebra -- \
+  --expected-media label_4x6 \
+  --confirm-agent-paused \
+  --confirm-auto-calibration
+```
+
+The command refuses to mutate a printer that is not `READY` or does not report
+`GAP/NOTCH` media with the `WEB` sensor. Zebra documents that `~JC`
+intentionally feeds one to four labels while measuring label length and
+calibrating the media sensor. Those blank feeds are calibration activity, not
+duplicate ClawPilot jobs. After calibration, press the physical Feed button
+once: exactly one blank label should advance and stop at the tear position.
+Then restart the exact paused local print-agent service.
+
+The printer's tear-off setting controls only where the gap rests over the tear
+bar. It cannot correct a whole-label skip. Do not change `^TA`, label-top, or
+left-position values to compensate for an incorrect media length. If standard
+auto calibration still does not make one Feed press advance one label, inspect
+media loading and the transmissive sensor, then use the GK420d seven-flash
+manual calibration procedure. Manual calibration prints a sensor profile and
+disables automatic calibration until printer defaults are restored, so it is
+an escalation rather than the default application command.
 
 For an always-on macOS workstation, store the enrolled credential in Keychain
 and install a user-scoped LaunchAgent:
@@ -189,6 +277,9 @@ silently left queued.
 
 The **Jobs** view shows current target, document type, media, format, attempts, lease expiry, failure, and reprint lineage.
 
+- **Download ZPL/PDF/PNG** streams the exact stored artifact through the
+  signed-in active-organization boundary. It does not convert, resize, rerender,
+  queue, acknowledge, or alter the document.
 - **Retry** is available only for a failed job below its maximum attempt count and requires a reason.
 - **Cancel** is available for queued or claimed jobs and requires a reason. Cancelling fences later acknowledgement, but a device may already have accepted a claimed document.
 - **Reprint** is available only after an acknowledged durable delivery, requires both printer-management and warehouse-execution access, and requires a reason.
@@ -207,6 +298,8 @@ The signed-in operator APIs are:
 - `GET/POST /api/operations/print-agents`
 - `GET/POST /api/operations/print-jobs`
 - `GET/POST /api/operations/printers`
+- `GET /api/operations/artifacts/{artifactGlobalId}` for an authenticated,
+  tenant-scoped exact-byte download
 
 Queue commands accept an existing active carrier label or immutable packing-slip artifact metadata. They route only to a capability-compatible online local-agent profile.
 
@@ -225,6 +318,9 @@ putting document contents into audit payloads.
 - A claim is limited to printers explicitly bound to that agent.
 - Claim tokens fence every acknowledgement and failure.
 - Artifact payloads and storage references are never written to audit events.
+- Artifact downloads require an authenticated operator with Operations view
+  access in the artifact's organization. Cross-organization and malformed
+  Global IDs return no artifact bytes.
 - Caller-provided artifact references must use `https`, `s3`, or a ClawPilot document reference and cannot contain credentials, query strings, or fragments.
 - Carrier label status is checked before claim; voided or inactive labels are not delivered.
 - A carrier-label reprint is rejected when the source label is no longer active.

@@ -32,6 +32,7 @@ import CloudDoneRounded from '@mui/icons-material/CloudDoneRounded'
 import AddRounded from '@mui/icons-material/AddRounded'
 import ContentCopyRounded from '@mui/icons-material/ContentCopyRounded'
 import DeleteOutlineRounded from '@mui/icons-material/DeleteOutlineRounded'
+import DownloadRounded from '@mui/icons-material/DownloadRounded'
 import EditRounded from '@mui/icons-material/EditRounded'
 import KeyRounded from '@mui/icons-material/KeyRounded'
 import LinkOffRounded from '@mui/icons-material/LinkOffRounded'
@@ -105,6 +106,10 @@ type CarrierPayload = {
   rateTest?: CarrierSandboxRateTest
   rateTestLabel?: CarrierRateTestLabel
   rateTestLabels?: CarrierRateTestLabel[]
+  rateTestLabelOutputs?: Record<
+    'ups_rest' | 'fedex_rest',
+    CarrierRateTestLabelOutputOption[]
+  >
   rateTestPrinters?: CarrierRateTestPrinter[]
   printJob?: CarrierRateTestPrintJob
   rateTestAttempt?: CarrierRateTestLabelAttempt
@@ -179,13 +184,61 @@ type CarrierRateTestLabel = {
   trackingNumber: string
   format: 'ZPL' | 'PDF' | 'PNG'
   mediaSize: 'label_4x6' | 'label_4x8'
+  sourceKind: 'provider_native'
+  providerImageType: 'ZPL' | 'ZPLII' | 'PDF' | 'PNG'
+  providerStockType: 'HEIGHT_6_WIDTH_4' | 'STOCK_4X6' | 'PAPER_4X6'
   byteLength: number
   contentSha256: string
+  printArtifactGlobalId: string | null
   status: 'created' | 'voided'
   createdAt: string
   createdBy: string | null
   voidedAt: string | null
   voidedBy: string | null
+}
+
+type CarrierRateTestLabelOutputOption = {
+  format: 'ZPL' | 'PDF' | 'PNG'
+  mediaSize: 'label_4x6'
+  sourceKind: 'provider_native'
+  providerImageType: 'ZPL' | 'ZPLII' | 'PDF' | 'PNG'
+  providerStockType: 'HEIGHT_6_WIDTH_4' | 'STOCK_4X6' | 'PAPER_4X6'
+}
+
+const FALLBACK_RATE_TEST_LABEL_OUTPUTS: Record<
+  'ups_rest' | 'fedex_rest',
+  CarrierRateTestLabelOutputOption[]
+> = {
+  ups_rest: [{
+    format: 'ZPL',
+    mediaSize: 'label_4x6',
+    sourceKind: 'provider_native',
+    providerImageType: 'ZPL',
+    providerStockType: 'HEIGHT_6_WIDTH_4',
+  }],
+  fedex_rest: [
+    {
+      format: 'ZPL',
+      mediaSize: 'label_4x6',
+      sourceKind: 'provider_native',
+      providerImageType: 'ZPLII',
+      providerStockType: 'STOCK_4X6',
+    },
+    {
+      format: 'PDF',
+      mediaSize: 'label_4x6',
+      sourceKind: 'provider_native',
+      providerImageType: 'PDF',
+      providerStockType: 'PAPER_4X6',
+    },
+    {
+      format: 'PNG',
+      mediaSize: 'label_4x6',
+      sourceKind: 'provider_native',
+      providerImageType: 'PNG',
+      providerStockType: 'PAPER_4X6',
+    },
+  ],
 }
 
 type CarrierRateTestPrinter = {
@@ -204,6 +257,7 @@ type CarrierRateTestPrinter = {
 
 type CarrierRateTestPrintJob = {
   globalId: string
+  artifactGlobalId: string | null
   sourceLabelGlobalId: string | null
   status: 'queued' | 'claimed' | 'delivered' | 'failed' | 'cancelled' | 'printed' | 'rerouted'
   format: 'ZPL' | 'PDF' | 'PNG' | null
@@ -379,6 +433,12 @@ export default function CarrierIntegrationPanel() {
   const [rateTest, setRateTest] = useState<CarrierSandboxRateTest | null>(null)
   const [rateDestinations, setRateDestinations] = useState<Record<string, SandboxRateDestinationForm>>({})
   const [rateTestLabels, setRateTestLabels] = useState<CarrierRateTestLabel[]>([])
+  const [rateTestLabelOutputs, setRateTestLabelOutputs] = useState(
+    FALLBACK_RATE_TEST_LABEL_OUTPUTS,
+  )
+  const [selectedLabelOutputFormats, setSelectedLabelOutputFormats] = useState<
+    Record<'ups_rest' | 'fedex_rest', 'ZPL' | 'PDF' | 'PNG'>
+  >({ ups_rest: 'ZPL', fedex_rest: 'ZPL' })
   const [rateTestAttempts, setRateTestAttempts] = useState<CarrierRateTestLabelAttempt[]>([])
   const [rateTestPrinters, setRateTestPrinters] = useState<CarrierRateTestPrinter[]>([])
   const [selectedRateKey, setSelectedRateKey] = useState('')
@@ -431,6 +491,27 @@ export default function CarrierIntegrationPanel() {
     && rateDestination.countryCode === 'US',
   )
   const selectedRate = rateTest?.rates.find((entry) => sandboxRateKey(entry) === selectedRateKey) || null
+  const labelOutputProvider = provider === 'fedex_rest' ? 'fedex_rest' : 'ups_rest'
+  const availableLabelOutputs = provider === 'usps_rest'
+    ? []
+    : rateTestLabelOutputs[labelOutputProvider]
+  const selectedLabelOutputFormat = selectedLabelOutputFormats[labelOutputProvider]
+  const selectedLabelOutput = availableLabelOutputs.find(
+    (entry) => entry.format === selectedLabelOutputFormat,
+  ) || availableLabelOutputs[0] || null
+  const selectedOutputCompatiblePrinters = useMemo(
+    () => !selectedLabelOutput
+      ? []
+      : rateTestPrinters.filter((entry) => (
+          entry.status === 'online'
+          && entry.connectionMode === 'local_agent'
+          && entry.localPrintAgentStatus === 'active'
+          && entry.supportedDocumentTypes.includes('shipping_label')
+          && entry.supportedFormats.includes(selectedLabelOutput.format)
+          && entry.supportedMedia.includes(selectedLabelOutput.mediaSize)
+        )),
+    [rateTestPrinters, selectedLabelOutput],
+  )
   const visibleRateTestLabels = useMemo(
     () => rateTestLabels.filter(
       (entry) => entry.provider === provider && entry.environment === environment,
@@ -500,6 +581,9 @@ export default function CarrierIntegrationPanel() {
         setCanExecute(result.canExecute === true)
         setCanReconcile(result.canReconcile === true)
         if (result.rateTestLabels) setRateTestLabels(result.rateTestLabels)
+        if (result.rateTestLabelOutputs) {
+          setRateTestLabelOutputs(result.rateTestLabelOutputs)
+        }
         if (result.rateTestAttempts) setRateTestAttempts(result.rateTestAttempts)
         if (result.rateTestPrinters) setRateTestPrinters(result.rateTestPrinters)
         setForms((current) => {
@@ -730,7 +814,13 @@ export default function CarrierIntegrationPanel() {
   }
 
   async function createRateTestLabel() {
-    if (!rateTest || !selectedRate || !createLabelConfirmed || !createLabelReason.trim()) return
+    if (
+      !rateTest
+      || !selectedRate
+      || !selectedLabelOutput
+      || !createLabelConfirmed
+      || !createLabelReason.trim()
+    ) return
     const idempotencyKey = createLabelIdempotencyKey || newIdempotencyKey('create')
     if (!createLabelIdempotencyKey) setCreateLabelIdempotencyKey(idempotencyKey)
     const result = await patch(
@@ -746,6 +836,7 @@ export default function CarrierIntegrationPanel() {
           currency: selectedRate.currency,
         },
         destination: rateTest.fixture.destination,
+        outputFormat: selectedLabelOutput.format,
         reason: createLabelReason.trim(),
         idempotencyKey,
       },
@@ -1743,6 +1834,45 @@ export default function CarrierIntegrationPanel() {
                     Exact source evidence: {rateTest.evidenceGlobalId}
                   </Typography>
                 </Box>
+                <FormControl fullWidth size="small" sx={fieldSx}>
+                  <InputLabel id="rate-test-label-output-format">
+                    Carrier label output
+                  </InputLabel>
+                  <Select
+                    labelId="rate-test-label-output-format"
+                    label="Carrier label output"
+                    value={selectedLabelOutput?.format || ''}
+                    onChange={(event) => {
+                      setSelectedLabelOutputFormats((current) => ({
+                        ...current,
+                        [labelOutputProvider]: event.target.value as 'ZPL' | 'PDF' | 'PNG',
+                      }))
+                      setCreateLabelConfirmed(false)
+                      setCreateLabelIdempotencyKey('')
+                    }}
+                    disabled={busy || availableLabelOutputs.length < 2}
+                  >
+                    {availableLabelOutputs.map((output) => (
+                      <MenuItem key={output.format} value={output.format}>
+                        {output.format} · 4 × 6 · carrier native
+                      </MenuItem>
+                    ))}
+                  </Select>
+                </FormControl>
+                {selectedLabelOutput ? (
+                  <Alert
+                    severity={selectedOutputCompatiblePrinters.length ? 'success' : 'info'}
+                    sx={{ borderRadius: '8px' }}
+                  >
+                    {selectedLabelOutput.format === 'ZPL'
+                      ? `${providerLabel(provider)} will return its native Zebra command stream.`
+                      : `${providerLabel(provider)} will return its native ${selectedLabelOutput.format} file; ClawPilot does not rasterize or replace the provider source.`}
+                    {' '}
+                    {selectedOutputCompatiblePrinters.length
+                      ? `${selectedOutputCompatiblePrinters.length} online print route${selectedOutputCompatiblePrinters.length === 1 ? '' : 's'} currently match this output.`
+                      : 'No online print route currently matches this output; the provider file will still remain stored for an explicitly compatible route.'}
+                  </Alert>
+                ) : null}
                 <TextField
                   required
                   multiline
@@ -1781,6 +1911,7 @@ export default function CarrierIntegrationPanel() {
                     disabled={
                       busy
                       || !canExecute
+                      || !selectedLabelOutput
                       || !createLabelConfirmed
                       || !createLabelReason.trim()
                     }
@@ -1842,6 +1973,9 @@ export default function CarrierIntegrationPanel() {
                         <Typography variant="caption" color="text.secondary" display="block">
                           Tracking {label.trackingNumber} · {label.ratedCurrency} {label.ratedAmount} ·{' '}
                           {label.format} {label.mediaSize.replace('label_', '').replace('x', ' × ')}
+                        </Typography>
+                        <Typography variant="caption" color="text.disabled" display="block">
+                          Provider-native {label.providerImageType} · source bytes immutable
                         </Typography>
                         <Typography variant="caption" color="text.disabled" display="block">
                           Created {formatUserDateTime(label.createdAt, dateTimeSettings, {
@@ -2025,10 +2159,34 @@ export default function CarrierIntegrationPanel() {
                     <strong>Media:</strong> {selectedRateTestLabel.format} · {selectedRateTestLabel.mediaSize}
                   </Typography>
                   <Typography variant="caption" color="text.disabled" sx={{ gridColumn: { sm: '1 / -1' } }}>
-                    Stored bytes: {selectedRateTestLabel.byteLength.toLocaleString()} · SHA-256{' '}
+                    Provider-native {selectedRateTestLabel.providerImageType} · Stored bytes:{' '}
+                    {selectedRateTestLabel.byteLength.toLocaleString()} · SHA-256{' '}
                     {selectedRateTestLabel.contentSha256.slice(0, 16)}…
                   </Typography>
                 </Box>
+                {(selectedRateTestLabel.printArtifactGlobalId
+                  || (
+                    rateTestPrintJob?.sourceLabelGlobalId === selectedRateTestLabel.globalId
+                      ? rateTestPrintJob.artifactGlobalId
+                      : null
+                  )) ? (
+                  <Box sx={{ mt: 1.5 }}>
+                    <Button
+                      component="a"
+                      href={`/api/operations/artifacts/${encodeURIComponent(
+                        selectedRateTestLabel.printArtifactGlobalId
+                        || rateTestPrintJob?.artifactGlobalId
+                        || '',
+                      )}`}
+                      download
+                      variant="outlined"
+                      startIcon={<DownloadRounded />}
+                      sx={buttonSx}
+                    >
+                      Download stored {selectedRateTestLabel.format}
+                    </Button>
+                  </Box>
+                ) : null}
                 {selectedRateTestLabel.status === 'voided' ? (
                   <Alert severity="warning" sx={{ mt: 1.5, borderRadius: '8px' }}>
                     This label is voided and cannot be queued for a new test print.
@@ -2068,14 +2226,16 @@ export default function CarrierIntegrationPanel() {
                       </Button>
                     </Box>
                     {rateTestPrintJob?.sourceLabelGlobalId === selectedRateTestLabel.globalId ? (
-                      <Alert
-                        severity={rateTestPrintJob.status === 'failed' ? 'warning' : 'success'}
-                        sx={{ borderRadius: '8px' }}
-                      >
-                        Print job {rateTestPrintJob.globalId} is {rateTestPrintJob.status} for{' '}
-                        {rateTestPrintJob.printerName}. Retry and controlled reprint remain available in
-                        Operations print jobs and reuse the same stored label bytes.
-                      </Alert>
+                      <>
+                        <Alert
+                          severity={rateTestPrintJob.status === 'failed' ? 'warning' : 'success'}
+                          sx={{ borderRadius: '8px' }}
+                        >
+                          Print job {rateTestPrintJob.globalId} is {rateTestPrintJob.status} for{' '}
+                          {rateTestPrintJob.printerName}. Retry and controlled reprint remain available in
+                          Operations print jobs and reuse the same stored label bytes.
+                        </Alert>
+                      </>
                     ) : null}
                   </Stack>
                 ) : (

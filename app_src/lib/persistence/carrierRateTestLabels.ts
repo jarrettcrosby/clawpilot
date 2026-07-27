@@ -38,8 +38,12 @@ export type CarrierRateTestLabelListItem = {
   trackingNumber: string
   format: 'ZPL' | 'PDF' | 'PNG'
   mediaSize: 'label_4x6' | 'label_4x8'
+  sourceKind: 'provider_native'
+  providerImageType: 'ZPL' | 'ZPLII' | 'PDF' | 'PNG'
+  providerStockType: 'HEIGHT_6_WIDTH_4' | 'STOCK_4X6' | 'PAPER_4X6'
   byteLength: number
   contentSha256: string
+  printArtifactGlobalId: string | null
   status: 'created' | 'voided'
   createdBy: string | null
   createdAt: string
@@ -130,8 +134,12 @@ type LabelRow = {
   tracking_number: string
   format: CarrierRateTestLabelListItem['format']
   media_size: CarrierRateTestLabelListItem['mediaSize']
+  source_kind: CarrierRateTestLabelListItem['sourceKind']
+  provider_image_type: CarrierRateTestLabelListItem['providerImageType']
+  provider_stock_type: CarrierRateTestLabelListItem['providerStockType']
   byte_length: string | number
   content_sha256: string
+  print_artifact_global_id: string | null
   status: CarrierRateTestLabelListItem['status']
   created_by: string | null
   created_at: TimestampValue
@@ -170,9 +178,12 @@ const LABEL_SELECT = `
          label.provider, label.environment, label.credential_version,
          label.service_code, label.service_name, label.rate_type,
          label.rated_amount, label.rated_currency, label.tracking_number,
-         label.format, label.media_size,
+         label.format, label.media_size, label.source_kind,
+         label.provider_image_type, label.provider_stock_type,
          octet_length(label.label_payload)::text AS byte_length,
-         label.content_sha256, label.status, label.created_by,
+         label.content_sha256,
+         print_artifact.global_id AS print_artifact_global_id,
+         label.status, label.created_by,
          label.created_at, label.voided_by, label.voided_at
     FROM operations_carrier_rate_test_labels label
     JOIN operations_carrier_rate_requests rate
@@ -186,7 +197,12 @@ const LABEL_SELECT = `
      AND created.id = label.create_attempt_id
     LEFT JOIN operations_carrier_rate_test_label_attempts voided
       ON voided.organization_id = label.organization_id
-     AND voided.id = label.void_attempt_id`
+     AND voided.id = label.void_attempt_id
+    LEFT JOIN operations_print_artifacts print_artifact
+      ON print_artifact.organization_id = label.organization_id
+     AND print_artifact.source_rate_test_label_id = label.id
+     AND print_artifact.format = label.format
+     AND print_artifact.media_size = label.media_size`
 
 const ATTEMPT_SELECT = `
   SELECT attempt.global_id,
@@ -238,8 +254,12 @@ function labelItem(row: LabelRow): CarrierRateTestLabelListItem {
     trackingNumber: row.tracking_number,
     format: row.format,
     mediaSize: row.media_size,
+    sourceKind: row.source_kind,
+    providerImageType: row.provider_image_type,
+    providerStockType: row.provider_stock_type,
     byteLength: Number(row.byte_length),
     contentSha256: row.content_sha256,
+    printArtifactGlobalId: row.print_artifact_global_id,
     status: row.status,
     createdBy: row.created_by,
     createdAt: iso(row.created_at)!,
@@ -484,6 +504,7 @@ type PrepareCreateInput = CarrierRateTestCreateContext & {
   attemptRequestHash: string
   destinationFingerprint: string
   selectedRate: CarrierRateTestSelectedRate
+  outputFormat: 'ZPL' | 'PDF' | 'PNG'
   adapterVersion: string
 }
 
@@ -633,6 +654,7 @@ export async function prepareCarrierRateTestLabelCreateInPostgres(
           carrierAccountGlobalId: input.carrierAccountGlobalId,
           destinationFingerprint: input.destinationFingerprint,
           selectedRate: input.selectedRate,
+          outputFormat: input.outputFormat,
         }),
         input.actorEmail,
       ],
@@ -652,7 +674,11 @@ export async function finalizeCarrierRateTestLabelCreateInPostgres(input: {
   accountNumberFingerprint: string
   providerLabelId: string
   trackingNumber: string
-  format: 'ZPL' | 'PDF'
+  format: 'ZPL' | 'PDF' | 'PNG'
+  mediaSize: 'label_4x6'
+  sourceKind: 'provider_native'
+  providerImageType: 'ZPL' | 'ZPLII' | 'PDF' | 'PNG'
+  providerStockType: 'HEIGHT_6_WIDTH_4' | 'STOCK_4X6' | 'PAPER_4X6'
   labelPayload: Buffer
   contentSha256: string
   providerReference: string | null
@@ -663,6 +689,10 @@ export async function finalizeCarrierRateTestLabelCreateInPostgres(input: {
   const pdfTail = bytes
     .subarray(Math.max(0, bytes.byteLength - 2048))
     .toString('latin1')
+  const pngSignature = Buffer.from([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+  ])
+  const pngTail = bytes.subarray(Math.max(0, bytes.byteLength - 32))
   const expectedHash = crypto.createHash('sha256').update(bytes).digest('hex')
   const validPayload = (
     bytes.byteLength >= 1
@@ -682,7 +712,18 @@ export async function finalizeCarrierRateTestLabelCreateInPostgres(input: {
         && bytes.subarray(0, 5).toString('ascii') === '%PDF-'
         && /%%EOF[\u0000\t\n\f\r ]*$/.test(pdfTail)
       )
+      || (
+        input.format === 'PNG'
+        && bytes.byteLength >= 45
+        && bytes.subarray(0, 8).equals(pngSignature)
+        && bytes.subarray(12, 16).toString('ascii') === 'IHDR'
+        && bytes.readUInt32BE(16) === 800
+        && bytes.readUInt32BE(20) === 1200
+        && pngTail.includes(Buffer.from('IEND', 'ascii'))
+      )
     )
+    && input.mediaSize === 'label_4x6'
+    && input.sourceKind === 'provider_native'
   )
   if (!validPayload) {
     throw new OperationsRequestError(
@@ -706,6 +747,7 @@ export async function finalizeCarrierRateTestLabelCreateInPostgres(input: {
       credential_version: number
       selected_rate: Record<string, unknown>
       destination_fingerprint: string
+      requested_output_format: string
     }>(
       `SELECT attempt.id::text, attempt.state,
               label.global_id AS label_global_id,
@@ -716,7 +758,11 @@ export async function finalizeCarrierRateTestLabelCreateInPostgres(input: {
               attempt.carrier_account_id::text,
               carrier_account.global_id AS carrier_account_global_id,
               attempt.provider, attempt.credential_version,
-              attempt.selected_rate, attempt.destination_fingerprint
+              attempt.selected_rate, attempt.destination_fingerprint,
+              COALESCE(
+                attempt.redacted_request->>'outputFormat',
+                'ZPL'
+              ) AS requested_output_format
          FROM operations_carrier_rate_test_label_attempts attempt
          JOIN operations_carrier_rate_requests rate
            ON rate.organization_id = attempt.organization_id
@@ -752,20 +798,51 @@ export async function finalizeCarrierRateTestLabelCreateInPostgres(input: {
         409,
       )
     }
+    if (attempt.requested_output_format !== input.format) {
+      throw new OperationsRequestError(
+        'CARRIER_RATE_TEST_LABEL_OUTPUT_MISMATCH',
+        'Carrier label output does not match the prepared request',
+        409,
+      )
+    }
     const selectedRate = storedSelectedRate(attempt.selected_rate)
+    const expectedProviderOutput: Partial<
+      Record<'ZPL' | 'PDF' | 'PNG', readonly [string, string]>
+    > = attempt.provider === 'ups_rest'
+      ? {
+          ZPL: ['ZPL', 'HEIGHT_6_WIDTH_4'],
+        }
+      : {
+          ZPL: ['ZPLII', 'STOCK_4X6'],
+          PDF: ['PDF', 'PAPER_4X6'],
+          PNG: ['PNG', 'PAPER_4X6'],
+        }
+    const expectedOutput = expectedProviderOutput[input.format]
+    if (
+      !expectedOutput
+      || input.providerImageType !== expectedOutput[0]
+      || input.providerStockType !== expectedOutput[1]
+    ) {
+      throw new OperationsRequestError(
+        'CARRIER_PROVIDER_RESPONSE_INVALID',
+        'Carrier label source metadata does not match the provider output',
+        502,
+      )
+    }
     const inserted = await client.query<{ id: string; global_id: string }>(
       `INSERT INTO operations_carrier_rate_test_labels (
          organization_id, rate_request_id, integration_account_id,
          carrier_account_id, provider, environment, credential_version,
          account_number_fingerprint, rate_request_hash, destination_fingerprint,
          service_code, service_name, rate_type, rated_amount, rated_currency,
-         provider_label_id, tracking_number, format, media_size, label_payload,
+         provider_label_id, tracking_number, format, media_size,
+         source_kind, provider_image_type, provider_stock_type, label_payload,
          content_sha256, provider_reference, redacted_provider_evidence,
          create_attempt_id, created_by
        ) VALUES (
          $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, 'sandbox', $6,
-         $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'label_4x6',
-         $18::bytea, $19, $20, $21::jsonb, $22::uuid, $23
+         $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
+         $19, $20, $21, $22::bytea, $23, $24, $25::jsonb, $26::uuid, $27
        )
        RETURNING id::text, global_id`,
       [
@@ -786,6 +863,10 @@ export async function finalizeCarrierRateTestLabelCreateInPostgres(input: {
         input.providerLabelId,
         input.trackingNumber,
         input.format,
+        input.mediaSize,
+        input.sourceKind,
+        input.providerImageType,
+        input.providerStockType,
         input.labelPayload,
         input.contentSha256,
         input.providerReference,
@@ -806,7 +887,10 @@ export async function finalizeCarrierRateTestLabelCreateInPostgres(input: {
         inserted.rows[0].id,
         JSON.stringify({
           format: input.format,
-          mediaSize: 'label_4x6',
+          mediaSize: input.mediaSize,
+          sourceKind: input.sourceKind,
+          providerImageType: input.providerImageType,
+          providerStockType: input.providerStockType,
           byteLength: input.labelPayload.byteLength,
           contentSha256: input.contentSha256,
         }),
@@ -829,7 +913,10 @@ export async function finalizeCarrierRateTestLabelCreateInPostgres(input: {
         serviceCode: selectedRate.serviceCode,
         rateType: selectedRate.rateType,
         format: input.format,
-        mediaSize: 'label_4x6',
+        mediaSize: input.mediaSize,
+        sourceKind: input.sourceKind,
+        providerImageType: input.providerImageType,
+        providerStockType: input.providerStockType,
         byteLength: input.labelPayload.byteLength,
         contentSha256: input.contentSha256,
       },

@@ -11,7 +11,7 @@ import {
   type CarrierSandboxRateFixture,
 } from '@/lib/integrations/carrierSandboxRate'
 
-export const CARRIER_SANDBOX_LABEL_ADAPTER_VERSION = 'direct-rest-sandbox-v2'
+export const CARRIER_SANDBOX_LABEL_ADAPTER_VERSION = 'direct-rest-sandbox-v3'
 
 const LABEL_ENDPOINTS = {
   ups_rest: 'https://wwwcie.ups.com/api/shipments/v2409/ship',
@@ -25,6 +25,14 @@ const VOID_ENDPOINTS = {
 
 type SandboxLabelProvider = keyof typeof LABEL_ENDPOINTS
 type SandboxBillingRelationship = 'sender' | 'recipient' | 'third_party'
+export type CarrierLabelOutputFormat = 'ZPL' | 'PDF' | 'PNG'
+export type CarrierSandboxLabelOutputOption = {
+  format: CarrierLabelOutputFormat
+  mediaSize: 'label_4x6'
+  sourceKind: 'provider_native'
+  providerImageType: 'ZPL' | 'ZPLII' | 'PDF' | 'PNG'
+  providerStockType: 'HEIGHT_6_WIDTH_4' | 'STOCK_4X6' | 'PAPER_4X6'
+}
 export type CarrierSandboxLabelShipmentFixture = CarrierSandboxRateFixture
 type CarrierSandboxLabelRuntime = CarrierRuntimeCredential & {
   billingRelationship?: SandboxBillingRelationship
@@ -46,7 +54,11 @@ export type CarrierSandboxLabelResult = {
   environment: 'sandbox'
   trackingNumber: string
   providerLabelId: string
-  format: 'ZPL' | 'PDF'
+  format: CarrierLabelOutputFormat
+  mediaSize: 'label_4x6'
+  sourceKind: 'provider_native'
+  providerImageType: CarrierSandboxLabelOutputOption['providerImageType']
+  providerStockType: CarrierSandboxLabelOutputOption['providerStockType']
   labelPayload: string
   payloadEncoding: 'utf8' | 'base64'
   labelByteLength: number
@@ -74,6 +86,65 @@ export class CarrierSandboxLabelError extends Error {
     super(message)
     this.name = 'CarrierSandboxLabelError'
   }
+}
+
+const PROVIDER_LABEL_OUTPUTS: Record<
+  SandboxLabelProvider,
+  readonly CarrierSandboxLabelOutputOption[]
+> = {
+  ups_rest: [{
+    format: 'ZPL',
+    mediaSize: 'label_4x6',
+    sourceKind: 'provider_native',
+    providerImageType: 'ZPL',
+    providerStockType: 'HEIGHT_6_WIDTH_4',
+  }],
+  fedex_rest: [
+    {
+      format: 'ZPL',
+      mediaSize: 'label_4x6',
+      sourceKind: 'provider_native',
+      providerImageType: 'ZPLII',
+      providerStockType: 'STOCK_4X6',
+    },
+    {
+      format: 'PDF',
+      mediaSize: 'label_4x6',
+      sourceKind: 'provider_native',
+      providerImageType: 'PDF',
+      providerStockType: 'PAPER_4X6',
+    },
+    {
+      format: 'PNG',
+      mediaSize: 'label_4x6',
+      sourceKind: 'provider_native',
+      providerImageType: 'PNG',
+      providerStockType: 'PAPER_4X6',
+    },
+  ],
+}
+
+export function carrierSandboxLabelOutputOptions(
+  provider: SandboxLabelProvider,
+): CarrierSandboxLabelOutputOption[] {
+  return PROVIDER_LABEL_OUTPUTS[provider].map((entry) => ({ ...entry }))
+}
+
+function labelOutputOption(
+  provider: SandboxLabelProvider,
+  format: CarrierLabelOutputFormat = 'ZPL',
+) {
+  const option = PROVIDER_LABEL_OUTPUTS[provider]
+    .find((entry) => entry.format === format)
+  if (!option) {
+    throw new CarrierSandboxLabelError(
+      `${provider === 'ups_rest' ? 'UPS' : 'FedEx'} does not provide ${format} as a native 4 x 6 label in this diagnostic`,
+      409,
+      'CARRIER_LABEL_OUTPUT_UNSUPPORTED',
+      false,
+    )
+  }
+  return option
 }
 
 function record(value: unknown): Record<string, unknown> {
@@ -427,6 +498,7 @@ function upsCreateRequest(
   input: CarrierSandboxLabelRuntime,
   selectedServiceCode: string,
   fixture: CarrierSandboxLabelShipmentFixture,
+  output: CarrierSandboxLabelOutputOption,
 ) {
   const accountNumber = input.credential.accountNumber!
   return {
@@ -461,7 +533,7 @@ function upsCreateRequest(
         }],
       },
       LabelSpecification: {
-        LabelImageFormat: { Code: 'ZPL' },
+        LabelImageFormat: { Code: output.providerImageType },
         LabelStockSize: { Height: '6', Width: '4' },
         HTTPUserAgent: 'Mozilla/4.5',
       },
@@ -510,6 +582,7 @@ function fedexCreateRequest(
   input: CarrierSandboxLabelRuntime,
   selectedServiceCode: string,
   fixture: CarrierSandboxLabelShipmentFixture,
+  output: CarrierSandboxLabelOutputOption,
 ) {
   const accountNumber = input.credential.accountNumber!
   return {
@@ -532,8 +605,8 @@ function fedexCreateRequest(
       shippingChargesPayment: fedexPayment(input),
       labelSpecification: {
         labelFormatType: 'COMMON2D',
-        imageType: 'ZPLII',
-        labelStockType: 'STOCK_4X6',
+        imageType: output.providerImageType,
+        labelStockType: output.providerStockType,
       },
       requestedPackageLineItems: [{
         sequenceNumber: 1,
@@ -557,7 +630,9 @@ export function carrierSandboxLabelRequestEvidence(
   billingRelationship: SandboxBillingRelationship = 'sender',
   senderName?: string,
   shipmentFixture?: CarrierSandboxLabelShipmentFixture,
+  outputFormat: CarrierLabelOutputFormat = 'ZPL',
 ) {
+  const output = labelOutputOption(provider, outputFormat)
   const effectiveServiceCode = serviceCode(provider, selectedServiceCode)
   const fixture = shipmentFixture
     ? normalizeShipmentFixture(shipmentFixture)
@@ -578,9 +653,11 @@ export function carrierSandboxLabelRequestEvidence(
     parcel: fixture.parcel,
     billingRelationship,
     label: {
-      format: 'ZPL',
-      providerImageType: provider === 'fedex_rest' ? 'ZPLII' : 'ZPL',
-      mediaSize: 'label_4x6',
+      format: output.format,
+      providerImageType: output.providerImageType,
+      providerStockType: output.providerStockType,
+      mediaSize: output.mediaSize,
+      sourceKind: output.sourceKind,
     },
   }
   return {
@@ -676,7 +753,44 @@ function printableZpl(bytes: Buffer, provider: 'UPS' | 'FedEx') {
   return payload
 }
 
-function parseUpsCreate(payload: Record<string, unknown>) {
+function printablePdf(bytes: Buffer, provider: 'UPS' | 'FedEx') {
+  const tail = bytes
+    .subarray(Math.max(0, bytes.byteLength - 2048))
+    .toString('latin1')
+  if (
+    bytes.subarray(0, 5).toString('ascii') !== '%PDF-'
+    || !/%%EOF[\u0000\t\n\f\r ]*$/.test(tail)
+  ) {
+    return invalidLabelResponse(provider)
+  }
+  return bytes.toString('base64')
+}
+
+function printablePng(bytes: Buffer, provider: 'UPS' | 'FedEx') {
+  const signature = Buffer.from([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+  ])
+  const ihdr = bytes.subarray(12, 16).toString('ascii')
+  const width = bytes.byteLength >= 24 ? bytes.readUInt32BE(16) : 0
+  const height = bytes.byteLength >= 24 ? bytes.readUInt32BE(20) : 0
+  const tail = bytes.subarray(Math.max(0, bytes.byteLength - 32))
+  if (
+    bytes.byteLength < 45
+    || !bytes.subarray(0, 8).equals(signature)
+    || ihdr !== 'IHDR'
+    || width !== 800
+    || height !== 1200
+    || !tail.includes(Buffer.from('IEND', 'ascii'))
+  ) {
+    return invalidLabelResponse(provider)
+  }
+  return bytes.toString('base64')
+}
+
+function parseUpsCreate(
+  payload: Record<string, unknown>,
+  output: CarrierSandboxLabelOutputOption,
+) {
   const response = record(payload.ShipmentResponse)
   const shipment = record(response.ShipmentResults)
   const packageResult = record(list(shipment.PackageResults)[0])
@@ -684,7 +798,12 @@ function parseUpsCreate(payload: Record<string, unknown>) {
   const imageFormat = text(record(shippingLabel.ImageFormat).Code).toUpperCase()
   const trackingNumber = text(packageResult.TrackingNumber)
   const providerLabelId = text(shipment.ShipmentIdentificationNumber) || trackingNumber
-  if (!trackingNumber || !providerLabelId || imageFormat !== 'ZPL') {
+  if (
+    !trackingNumber
+    || !providerLabelId
+    || output.format !== 'ZPL'
+    || imageFormat !== output.providerImageType
+  ) {
     return invalidLabelResponse('UPS')
   }
   const labelBytes = decodeProviderLabel(shippingLabel.GraphicImage, 'UPS')
@@ -694,22 +813,26 @@ function parseUpsCreate(payload: Record<string, unknown>) {
     providerLabelId,
     labelPayload,
     payloadEncoding: 'utf8' as const,
-    format: 'ZPL' as const,
+    ...output,
     ...labelMetadata(labelBytes),
   }
 }
 
-function firstFedexPiece(payload: Record<string, unknown>) {
-  const output = record(payload.output)
-  const shipment = record(list(output.transactionShipments)[0])
+function firstFedexPiece(
+  payload: Record<string, unknown>,
+  output: CarrierSandboxLabelOutputOption,
+) {
+  const responseOutput = record(payload.output)
+  const shipment = record(list(responseOutput.transactionShipments)[0])
   const piece = record(list(shipment.pieceResponses)[0])
   const packageDocument = list(piece.packageDocuments)
     .map((value) => record(value))
     .find((document) => (
       text(document.contentType).toUpperCase() === 'LABEL'
-      && ['ZPLII', 'ZPL'].includes(
-        text(document.docType || document.documentType || document.imageType)
-          .toUpperCase(),
+      && (
+        !text(document.docType || document.documentType || document.imageType)
+        || text(document.docType || document.documentType || document.imageType)
+          .toUpperCase() === output.providerImageType
       )
     )) || {}
   const documentPart = record(list(packageDocument.parts)[0])
@@ -723,21 +846,34 @@ function firstFedexPiece(payload: Record<string, unknown>) {
   }
 }
 
-function parseFedexCreate(payload: Record<string, unknown>) {
-  const { shipment, piece, labelPayload: encodedLabel } = firstFedexPiece(payload)
+function parseFedexCreate(
+  payload: Record<string, unknown>,
+  output: CarrierSandboxLabelOutputOption,
+) {
+  const {
+    shipment,
+    piece,
+    labelPayload: encodedLabel,
+  } = firstFedexPiece(payload, output)
   const trackingNumber = text(piece.trackingNumber || shipment.masterTrackingNumber)
   const providerLabelId = text(shipment.masterTrackingNumber) || trackingNumber
   if (!trackingNumber || !providerLabelId) {
     return invalidLabelResponse('FedEx')
   }
   const labelBytes = decodeProviderLabel(encodedLabel, 'FedEx')
-  const labelPayload = printableZpl(labelBytes, 'FedEx')
+  const labelPayload = output.format === 'ZPL'
+    ? printableZpl(labelBytes, 'FedEx')
+    : output.format === 'PDF'
+      ? printablePdf(labelBytes, 'FedEx')
+      : printablePng(labelBytes, 'FedEx')
   return {
     trackingNumber,
     providerLabelId,
     labelPayload,
-    payloadEncoding: 'utf8' as const,
-    format: 'ZPL' as const,
+    payloadEncoding: output.format === 'ZPL'
+      ? 'utf8' as const
+      : 'base64' as const,
+    ...output,
     ...labelMetadata(labelBytes),
   }
 }
@@ -775,10 +911,14 @@ async function readProviderPayload(response: Response) {
 }
 
 export async function createCarrierSandboxLabel(
-  input: CarrierSandboxLabelRuntime & { serviceCode: string },
+  input: CarrierSandboxLabelRuntime & {
+    serviceCode: string
+    outputFormat?: CarrierLabelOutputFormat
+  },
   options: { fetchImpl?: typeof fetch; timeoutMs?: number } = {},
 ): Promise<CarrierSandboxLabelResult> {
   requireSandboxRuntime(input)
+  const output = labelOutputOption(input.provider, input.outputFormat)
   const selectedServiceCode = serviceCode(input.provider, input.serviceCode)
   const fetchImpl = options.fetchImpl || fetch
   const requestedAt = new Date().toISOString()
@@ -798,8 +938,8 @@ export async function createCarrierSandboxLabel(
   try {
     const fixture = runtimeFixture(input)
     const body = input.provider === 'ups_rest'
-      ? upsCreateRequest(input, selectedServiceCode, fixture)
-      : fedexCreateRequest(input, selectedServiceCode, fixture)
+      ? upsCreateRequest(input, selectedServiceCode, fixture, output)
+      : fedexCreateRequest(input, selectedServiceCode, fixture, output)
     const response = await fetchImpl(LABEL_ENDPOINTS[input.provider], {
       method: 'POST',
       headers: {
@@ -825,8 +965,8 @@ export async function createCarrierSandboxLabel(
       })
     }
     const parsed = input.provider === 'ups_rest'
-      ? parseUpsCreate(payload)
-      : parseFedexCreate(payload)
+      ? parseUpsCreate(payload, output)
+      : parseFedexCreate(payload, output)
     const completedAt = new Date().toISOString()
     const safeRequest = carrierSandboxLabelRequestEvidence(
       input.provider,
@@ -834,6 +974,7 @@ export async function createCarrierSandboxLabel(
       runtimeBillingRelationship(input),
       runtimeSenderName(input),
       fixture,
+      output.format,
     )
     const providerReference = response.headers.get('transaction-id')
       || response.headers.get('x-customer-transaction-id')
@@ -849,6 +990,10 @@ export async function createCarrierSandboxLabel(
           trackingNumber: parsed.trackingNumber,
           providerLabelId: parsed.providerLabelId,
           format: parsed.format,
+          mediaSize: parsed.mediaSize,
+          sourceKind: parsed.sourceKind,
+          providerImageType: parsed.providerImageType,
+          providerStockType: parsed.providerStockType,
           payloadEncoding: parsed.payloadEncoding,
           labelByteLength: parsed.labelByteLength,
           labelContentSha256: parsed.labelContentSha256,

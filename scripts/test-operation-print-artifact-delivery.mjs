@@ -84,10 +84,15 @@ function verifyStaticContracts() {
   const persistence = read('app_src/lib/persistence/operationPrintDelivery.ts')
   for (const fragment of [
     'readOperationsPrintArtifactPayloadInPostgres',
-    'FROM operations_print_artifact_payloads payload',
-    'payload.organization_id = $1::uuid',
+    'FROM operations_print_artifacts artifact',
+    'artifact.organization_id = $1::uuid',
     'artifact.global_id = $2',
+    'source_label.label_payload AS source_label_payload',
+    'rate_test_label.label_payload AS rate_test_label_payload',
     'payload.payload AS artifact_payload',
+    "artifact.document_type !== 'packing_slip'",
+    "artifact.document_type !== 'shipping_label'",
+    "'application/vnd.zebra-zpl'",
     "encoding: format === 'ZPL' ? 'utf8' : 'base64'",
     "encoding: input.format === 'ZPL' ? 'utf8' : 'base64'",
     'encoding: \'base64\'',
@@ -104,11 +109,51 @@ function verifyStaticContracts() {
     'activeOperationsOrganizationId',
     'operationsCapabilities(actor).canView',
     'Content-Disposition',
-    'private, max-age=31536000, immutable',
+    'private, no-cache, max-age=0, must-revalidate',
+    'Cross-Origin-Resource-Policy',
     'X-Content-Type-Options',
+    'X-ClawPilot-Content-SHA256',
+    "ZPL: 'zpl'",
+    "PDF: 'pdf'",
+    "PNG: 'png'",
     'new Uint8Array(artifact.payload)',
   ]) {
     assert.ok(route.includes(fragment), `Missing artifact route contract: ${fragment}`)
+  }
+  assert.ok(
+    !route.includes('max-age=31536000') && !route.includes('immutable'),
+    'Sensitive artifact bytes must never remain fresh in a long-lived browser cache',
+  )
+
+  const printJobs = read('app_src/components/operations/PrinterConfigurationPanel.tsx')
+  for (const fragment of [
+    'Download {selectedJob.format || \'artifact\'}',
+    '/api/operations/artifacts/${encodeURIComponent(selectedJob.artifactGlobalId)}',
+  ]) {
+    assert.ok(printJobs.includes(fragment), `Missing print-job download control: ${fragment}`)
+  }
+
+  const rateTestLabels = read('app_src/lib/persistence/carrierRateTestLabels.ts')
+  for (const fragment of [
+    'printArtifactGlobalId: string | null',
+    'print_artifact.global_id AS print_artifact_global_id',
+    'printArtifactGlobalId: row.print_artifact_global_id',
+  ]) {
+    assert.ok(
+      rateTestLabels.includes(fragment),
+      `Missing diagnostic-label artifact projection: ${fragment}`,
+    )
+  }
+
+  const carrierPanel = read('app_src/components/settings/CarrierIntegrationPanel.tsx')
+  for (const fragment of [
+    'selectedRateTestLabel.printArtifactGlobalId',
+    'Download stored {selectedRateTestLabel.format}',
+  ]) {
+    assert.ok(
+      carrierPanel.includes(fragment),
+      `Missing diagnostic-label download control: ${fragment}`,
+    )
   }
 }
 
@@ -153,12 +198,21 @@ async function verifyPersistenceContracts() {
   const queries = []
   let rows = [{
     global_id: 'gpf1000001',
+    document_type: 'packing_slip',
+    format: 'PDF',
+    media_size: 'letter',
     content_sha256: contentSha256,
     byte_length: String(pdf.byteLength),
-    mime_type: 'application/pdf',
-    filename: 'ORDER-100-packing-slip.pdf',
-    payload: pdf,
+    payload_mime_type: 'application/pdf',
+    payload_filename: 'ORDER-100-packing-slip.pdf',
+    artifact_payload: pdf,
     template_version: 'packing-slip-letter-v1',
+    source_label_global_id: null,
+    source_label_format: null,
+    source_label_payload: null,
+    rate_test_label_global_id: null,
+    rate_test_label_format: null,
+    rate_test_label_payload: null,
     created_at: new Date('2026-07-23T12:00:00.000Z'),
   }]
   const persistence = loadTypeScript(
@@ -220,6 +274,11 @@ async function verifyPersistenceContracts() {
   })
   assert.equal(artifact.globalId, 'gpf1000001')
   assert.deepEqual(Buffer.from(artifact.payload), pdf)
+  assert.equal(artifact.documentType, 'packing_slip')
+  assert.equal(artifact.format, 'PDF')
+  assert.equal(artifact.media, 'letter')
+  assert.equal(artifact.mimeType, 'application/pdf')
+  assert.equal(artifact.filename, 'ORDER-100-packing-slip.pdf')
   assert.equal(queries.length, 1)
   assert.deepEqual(
     Array.from(queries[0].params),
@@ -227,8 +286,67 @@ async function verifyPersistenceContracts() {
   )
   assert.match(
     queries[0].sql,
-    /payload\.organization_id = \$1::uuid[\s\S]+artifact\.global_id = \$2/,
+    /artifact\.organization_id = \$1::uuid[\s\S]+artifact\.global_id = \$2/,
     'Artifact lookup must scope by organization before Global ID',
+  )
+
+  const zpl = Buffer.from('^XA\n^FO20,20^FDExact ZPL^FS\n^XZ', 'utf8')
+  rows = [{
+    ...rows[0],
+    document_type: 'shipping_label',
+    format: 'ZPL',
+    media_size: 'label_4x6',
+    content_sha256: createHash('sha256').update(zpl).digest('hex'),
+    byte_length: String(zpl.byteLength),
+    payload_mime_type: null,
+    payload_filename: null,
+    artifact_payload: null,
+    template_version: null,
+    rate_test_label_global_id: 'gsl1000001',
+    rate_test_label_format: 'ZPL',
+    rate_test_label_payload: zpl,
+  }]
+  const zplArtifact = await persistence.readOperationsPrintArtifactPayloadInPostgres({
+    organizationId: '11111111-1111-4111-8111-111111111111',
+    artifactGlobalId: 'gpf1000001',
+  })
+  assert.deepEqual(Buffer.from(zplArtifact.payload), zpl)
+  assert.equal(zplArtifact.mimeType, 'application/vnd.zebra-zpl')
+  assert.equal(zplArtifact.filename, 'shipping-label-gsl1000001')
+
+  const png = Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    Buffer.from('exact-png-bytes', 'ascii'),
+  ])
+  rows = [{
+    ...rows[0],
+    format: 'PNG',
+    content_sha256: createHash('sha256').update(png).digest('hex'),
+    byte_length: String(png.byteLength),
+    source_label_global_id: 'glb1000001',
+    source_label_format: 'PNG',
+    source_label_payload: png.toString('base64'),
+    rate_test_label_global_id: null,
+    rate_test_label_format: null,
+    rate_test_label_payload: null,
+  }]
+  const pngArtifact = await persistence.readOperationsPrintArtifactPayloadInPostgres({
+    organizationId: '11111111-1111-4111-8111-111111111111',
+    artifactGlobalId: 'gpf1000001',
+  })
+  assert.deepEqual(Buffer.from(pngArtifact.payload), png)
+  assert.equal(pngArtifact.mimeType, 'image/png')
+  assert.equal(pngArtifact.filename, 'shipping-label-glb1000001')
+
+  const pngRow = rows[0]
+  rows = [{ ...pngRow, document_type: 'customs_document' }]
+  await assert.rejects(
+    persistence.readOperationsPrintArtifactPayloadInPostgres({
+      organizationId: '11111111-1111-4111-8111-111111111111',
+      artifactGlobalId: 'gpf1000001',
+    }),
+    (error) => error.code === 'OPERATIONS_PRINT_ARTIFACT_CORRUPT' && error.status === 500,
+    'Only packing slips and shipping labels may use the artifact download route',
   )
 
   await assert.rejects(
@@ -238,11 +356,11 @@ async function verifyPersistenceContracts() {
     }),
     (error) => error.code === 'OPERATIONS_PRINT_ARTIFACT_NOT_FOUND' && error.status === 404,
   )
-  assert.equal(queries.length, 1, 'Invalid artifact IDs must not query PostgreSQL')
+  assert.equal(queries.length, 4, 'Invalid artifact IDs must not query PostgreSQL')
 
   rows = [{
-    ...rows[0],
-    payload: Buffer.from('corrupt'),
+    ...pngRow,
+    content_sha256: '0'.repeat(64),
   }]
   await assert.rejects(
     persistence.readOperationsPrintArtifactPayloadInPostgres({
@@ -266,7 +384,21 @@ async function verifyRouteContracts() {
   const contentSha256 = createHash('sha256').update(pdf).digest('hex')
   let authenticated = true
   let canView = true
+  let actorOrganizationId = '22222222-2222-4222-8222-222222222222'
   const reads = []
+  let routeArtifact = {
+    globalId: 'gpf1000002',
+    documentType: 'packing_slip',
+    format: 'PDF',
+    media: 'letter',
+    contentSha256,
+    byteLength: pdf.byteLength,
+    mimeType: 'application/pdf',
+    filename: '../../Order 100 "packing slip".pdf',
+    payload: pdf,
+    templateVersion: 'packing-slip-letter-v1',
+    createdAt: '2026-07-23T12:00:00.000Z',
+  }
   const route = loadTypeScript(
     'app_src/app/api/operations/artifacts/[globalId]/route.ts',
     {
@@ -282,16 +414,7 @@ async function verifyRouteContracts() {
       '@/lib/persistence/operationPrintDelivery': {
         async readOperationsPrintArtifactPayloadInPostgres(input) {
           reads.push(input)
-          return {
-            globalId: 'gpf1000002',
-            contentSha256,
-            byteLength: pdf.byteLength,
-            mimeType: 'application/pdf',
-            filename: '../../Order 100 "packing slip".pdf',
-            payload: pdf,
-            templateVersion: 'packing-slip-letter-v1',
-            createdAt: '2026-07-23T12:00:00.000Z',
-          }
+          return routeArtifact
         },
       },
       '@/lib/persistence/operations': { OperationsRequestError: RequestError },
@@ -300,7 +423,7 @@ async function verifyRouteContracts() {
           if (!authenticated) throw new Error('Unauthorized')
           return {
             email: 'operator@example.com',
-            organizationId: '22222222-2222-4222-8222-222222222222',
+            organizationId: actorOrganizationId,
           }
         },
       },
@@ -316,10 +439,14 @@ async function verifyRouteContracts() {
   assert.equal(response.headers.get('content-type'), 'application/pdf')
   assert.equal(response.headers.get('content-length'), String(pdf.byteLength))
   assert.equal(response.headers.get('etag'), `"${contentSha256}"`)
+  assert.equal(response.headers.get('x-clawpilot-content-sha256'), contentSha256)
   assert.equal(response.headers.get('x-content-type-options'), 'nosniff')
+  assert.equal(response.headers.get('cross-origin-resource-policy'), 'same-origin')
   assert.equal(response.headers.get('content-security-policy'), 'sandbox')
-  assert.match(response.headers.get('cache-control'), /\bprivate\b/)
-  assert.match(response.headers.get('cache-control'), /\bimmutable\b/)
+  assert.equal(
+    response.headers.get('cache-control'),
+    'private, no-cache, max-age=0, must-revalidate',
+  )
   const disposition = response.headers.get('content-disposition')
   assert.match(disposition, /^attachment; filename="[A-Za-z0-9._-]+\.pdf"$/)
   assert.doesNotMatch(disposition, /[\/\\\r\n]/)
@@ -328,12 +455,82 @@ async function verifyRouteContracts() {
     artifactGlobalId: 'gpf1000002',
   })
 
+  const zpl = Buffer.from('^XA\n^FO10,10^FDDownload^FS\n^XZ', 'utf8')
+  const zplSha256 = createHash('sha256').update(zpl).digest('hex')
+  routeArtifact = {
+    ...routeArtifact,
+    documentType: 'shipping_label',
+    format: 'ZPL',
+    media: 'label_4x6',
+    contentSha256: zplSha256,
+    byteLength: zpl.byteLength,
+    mimeType: 'application/vnd.zebra-zpl',
+    filename: '../FedEx label.pdf',
+    payload: zpl,
+    templateVersion: null,
+  }
+  const zplResponse = await route.GET(
+    { headers: new Headers() },
+    { params: Promise.resolve({ globalId: 'gpf1000002' }) },
+  )
+  assert.equal(zplResponse.status, 200)
+  assert.deepEqual(Buffer.from(await zplResponse.arrayBuffer()), zpl)
+  assert.equal(zplResponse.headers.get('content-type'), 'application/vnd.zebra-zpl')
+  assert.equal(
+    zplResponse.headers.get('content-disposition'),
+    'attachment; filename="FedEx-label.zpl"',
+  )
+
+  const png = Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    Buffer.from('route-png', 'ascii'),
+  ])
+  const pngSha256 = createHash('sha256').update(png).digest('hex')
+  routeArtifact = {
+    ...routeArtifact,
+    format: 'PNG',
+    contentSha256: pngSha256,
+    byteLength: png.byteLength,
+    mimeType: 'image/png',
+    filename: 'UPS label.zpl',
+    payload: png,
+  }
+  const pngResponse = await route.GET(
+    { headers: new Headers() },
+    { params: Promise.resolve({ globalId: 'gpf1000002' }) },
+  )
+  assert.equal(pngResponse.status, 200)
+  assert.deepEqual(Buffer.from(await pngResponse.arrayBuffer()), png)
+  assert.equal(pngResponse.headers.get('content-type'), 'image/png')
+  assert.equal(
+    pngResponse.headers.get('content-disposition'),
+    'attachment; filename="UPS-label.png"',
+  )
+
+  routeArtifact = {
+    ...routeArtifact,
+    documentType: 'packing_slip',
+    format: 'PDF',
+    media: 'letter',
+    contentSha256,
+    byteLength: pdf.byteLength,
+    mimeType: 'application/pdf',
+    filename: 'packing-slip.pdf',
+    payload: pdf,
+    templateVersion: 'packing-slip-letter-v1',
+  }
+  const readsBeforeRevalidation = reads.length
   const notModified = await route.GET(
     { headers: new Headers({ 'If-None-Match': `"${contentSha256}"` }) },
     { params: Promise.resolve({ globalId: 'gpf1000002' }) },
   )
   assert.equal(notModified.status, 304)
   assert.equal(await notModified.text(), '')
+  assert.equal(
+    reads.length,
+    readsBeforeRevalidation + 1,
+    'ETag revalidation must repeat tenant authorization and artifact resolution',
+  )
 
   authenticated = false
   const readCount = reads.length
@@ -352,6 +549,19 @@ async function verifyRouteContracts() {
   )
   assert.equal(forbidden.status, 403)
   assert.equal(reads.length, readCount, 'Unauthorized operators must not resolve artifacts')
+
+  canView = true
+  actorOrganizationId = ''
+  const organizationRequired = await route.GET(
+    { headers: new Headers() },
+    { params: Promise.resolve({ globalId: 'gpf1000002' }) },
+  )
+  assert.equal(organizationRequired.status, 409)
+  assert.equal(
+    reads.length,
+    readCount,
+    'Requests without an active organization must not resolve artifacts',
+  )
 }
 
 verifyStaticContracts()

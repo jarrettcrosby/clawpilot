@@ -185,12 +185,21 @@ type PrintClaimRow = {
 
 type PrintArtifactPayloadRow = {
   global_id: string
+  document_type: DurablePrintDocumentType
+  format: PrintFormat
+  media_size: PrintMedia
   content_sha256: string
   byte_length: string
-  mime_type: 'application/pdf'
-  filename: string
-  payload: Buffer
-  template_version: string
+  payload_mime_type: 'application/pdf' | 'image/png' | null
+  payload_filename: string | null
+  artifact_payload: Buffer | null
+  template_version: string | null
+  source_label_global_id: string | null
+  source_label_format: PrintFormat | null
+  source_label_payload: string | null
+  rate_test_label_global_id: string | null
+  rate_test_label_format: PrintFormat | null
+  rate_test_label_payload: Buffer | null
   created_at: TimestampValue
 }
 
@@ -427,6 +436,25 @@ function validateLabelBytes(format: PrintFormat, bytes: Buffer) {
       'OPERATIONS_PRINT_LABEL_PAYLOAD_INVALID',
       'Stored shipping-label bytes do not match the declared format',
       409,
+    )
+  }
+  return bytes
+}
+
+function validateDocumentBytes(format: PrintFormat, bytes: Buffer) {
+  const bounded = bytes.byteLength >= 1 && bytes.byteLength <= 50 * 1024 * 1024
+  const valid = bounded && (format === 'PDF'
+    ? validPdfBytes(bytes)
+    : format === 'PNG'
+      ? bytes.subarray(0, 8).equals(
+        Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      )
+      : false)
+  if (!valid) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PRINT_ARTIFACT_CORRUPT',
+      'Print artifact content failed integrity validation',
+      500,
     )
   }
   return bytes
@@ -929,22 +957,39 @@ export async function readOperationsPrintArtifactPayloadInPostgres(input: {
   const result = await query<PrintArtifactPayloadRow>(
     `SELECT
        artifact.global_id,
+       artifact.document_type,
+       artifact.format,
+       artifact.media_size,
        artifact.content_sha256,
        artifact.byte_length::text,
-       payload.mime_type,
-       payload.filename,
-       payload.payload,
+       payload.mime_type AS payload_mime_type,
+       payload.filename AS payload_filename,
+       payload.payload AS artifact_payload,
        payload.template_version,
-       payload.created_at
-     FROM operations_print_artifact_payloads payload
-     JOIN operations_print_artifacts artifact
-       ON artifact.organization_id = payload.organization_id
-      AND artifact.id = payload.artifact_id
-     WHERE payload.organization_id = $1::uuid
+       source_label.global_id AS source_label_global_id,
+       source_label.format AS source_label_format,
+       source_label.label_payload AS source_label_payload,
+       rate_test_label.global_id AS rate_test_label_global_id,
+       rate_test_label.format AS rate_test_label_format,
+       rate_test_label.label_payload AS rate_test_label_payload,
+       COALESCE(
+         payload.created_at,
+         source_label.created_at,
+         rate_test_label.created_at,
+         artifact.created_at
+       ) AS created_at
+     FROM operations_print_artifacts artifact
+     LEFT JOIN operations_print_artifact_payloads payload
+       ON payload.organization_id = artifact.organization_id
+      AND payload.artifact_id = artifact.id
+     LEFT JOIN operations_labels source_label
+       ON source_label.organization_id = artifact.organization_id
+      AND source_label.id = artifact.source_label_id
+     LEFT JOIN operations_carrier_rate_test_labels rate_test_label
+       ON rate_test_label.organization_id = artifact.organization_id
+      AND rate_test_label.id = artifact.source_rate_test_label_id
+     WHERE artifact.organization_id = $1::uuid
        AND artifact.global_id = $2
-       AND artifact.document_type = 'packing_slip'
-       AND artifact.format = 'PDF'
-       AND payload.mime_type = 'application/pdf'
      LIMIT 1`,
     [organizationId, artifactGlobalId],
   )
@@ -956,11 +1001,89 @@ export async function readOperationsPrintArtifactPayloadInPostgres(input: {
       404,
     )
   }
+  let payload: Buffer
+  let filename: string
+  let mimeType: 'application/vnd.zebra-zpl' | 'application/pdf' | 'image/png'
+  let templateVersion: string | null = null
+  if (
+    artifact.document_type !== 'packing_slip'
+    && artifact.document_type !== 'shipping_label'
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PRINT_ARTIFACT_CORRUPT',
+      'Print artifact content failed integrity validation',
+      500,
+    )
+  }
+  if (artifact.document_type === 'packing_slip') {
+    const expectedMimeType = artifact.format === 'PDF'
+      ? 'application/pdf'
+      : artifact.format === 'PNG'
+        ? 'image/png'
+        : null
+    if (
+      !expectedMimeType
+      || artifact.payload_mime_type !== expectedMimeType
+      || !artifact.payload_filename
+      || !artifact.artifact_payload
+    ) {
+      throw new OperationsRequestError(
+        'OPERATIONS_PRINT_ARTIFACT_CORRUPT',
+        'Print artifact content failed integrity validation',
+        500,
+      )
+    }
+    payload = Buffer.from(artifact.artifact_payload)
+    validateDocumentBytes(artifact.format, payload)
+    filename = artifact.payload_filename
+    mimeType = expectedMimeType
+    templateVersion = artifact.template_version
+  } else if (
+    artifact.document_type === 'shipping_label'
+    &&
+    artifact.source_label_global_id
+    && artifact.source_label_format === artifact.format
+    && artifact.source_label_payload !== null
+  ) {
+    payload = decodeStoredOperationsLabelPayload({
+      format: artifact.format,
+      payload: artifact.source_label_payload,
+    })
+    filename = `shipping-label-${artifact.source_label_global_id}`
+    mimeType = artifact.format === 'ZPL'
+      ? 'application/vnd.zebra-zpl'
+      : artifact.format === 'PDF'
+        ? 'application/pdf'
+        : 'image/png'
+  } else if (
+    artifact.document_type === 'shipping_label'
+    &&
+    artifact.rate_test_label_global_id
+    && artifact.rate_test_label_format === artifact.format
+    && artifact.rate_test_label_payload
+  ) {
+    payload = validateLabelBytes(
+      artifact.format,
+      Buffer.from(artifact.rate_test_label_payload),
+    )
+    filename = `shipping-label-${artifact.rate_test_label_global_id}`
+    mimeType = artifact.format === 'ZPL'
+      ? 'application/vnd.zebra-zpl'
+      : artifact.format === 'PDF'
+        ? 'application/pdf'
+        : 'image/png'
+  } else {
+    throw new OperationsRequestError(
+      'OPERATIONS_PRINT_ARTIFACT_CORRUPT',
+      'Print artifact content failed integrity validation',
+      500,
+    )
+  }
   const byteLength = Number(artifact.byte_length)
   if (
     !Number.isSafeInteger(byteLength)
-    || byteLength !== artifact.payload.byteLength
-    || contentHash(artifact.payload) !== artifact.content_sha256
+    || byteLength !== payload.byteLength
+    || contentHash(payload) !== artifact.content_sha256
   ) {
     throw new OperationsRequestError(
       'OPERATIONS_PRINT_ARTIFACT_CORRUPT',
@@ -970,12 +1093,15 @@ export async function readOperationsPrintArtifactPayloadInPostgres(input: {
   }
   return {
     globalId: artifact.global_id,
+    documentType: artifact.document_type,
+    format: artifact.format,
+    media: artifact.media_size,
     contentSha256: artifact.content_sha256,
     byteLength,
-    mimeType: artifact.mime_type,
-    filename: artifact.filename,
-    payload: artifact.payload,
-    templateVersion: artifact.template_version,
+    mimeType,
+    filename,
+    payload,
+    templateVersion,
     createdAt: iso(artifact.created_at) as string,
   }
 }

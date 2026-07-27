@@ -23,6 +23,10 @@ const migrationSource = read(
   'db/migrations/0116_operations_carrier_rate_test_labels.sql',
 )
 const migration = compactSql(migrationSource)
+const outputMigrationSource = read(
+  'db/migrations/0118_operations_carrier_label_output_artifacts.sql',
+)
+const outputMigration = compactSql(outputMigrationSource)
 
 for (const fragment of [
   "('gsl', 'operations.carrier_rate_test_label'",
@@ -74,6 +78,50 @@ assert.ok(
   'Rate-test label bytes must use bytea rather than encoded text',
 )
 
+for (const fragment of [
+  'ADD COLUMN IF NOT EXISTS source_kind text',
+  'ADD COLUMN IF NOT EXISTS provider_image_type text',
+  'ADD COLUMN IF NOT EXISTS provider_stock_type text',
+  "source_kind = 'provider_native'",
+  "provider_image_type = 'ZPLII'",
+  "provider_stock_type = 'PAPER_4X6'",
+  'NEW.label_payload',
+  'OLD.label_payload',
+  'operations_carrier_rate_test_label_derivatives',
+  'source_content_sha256 text NOT NULL',
+  'artifact_payload bytea NOT NULL',
+  'converter_name text NOT NULL',
+  'converter_version text NOT NULL',
+  'conversion_options jsonb NOT NULL',
+  'Carrier label derived artifacts are immutable',
+  'Carrier label derivative source hash does not match',
+  'Carrier label derivative content hash does not match',
+]) {
+  assert.ok(
+    outputMigration.includes(fragment),
+    `Missing carrier label source/derivative contract: ${fragment}`,
+  )
+}
+const outputTriggerDrop = outputMigration.indexOf(
+  'DROP TRIGGER IF EXISTS protect_operations_carrier_rate_test_label_write',
+)
+const outputBackfill = outputMigration.indexOf(
+  'UPDATE operations_carrier_rate_test_labels SET source_kind',
+)
+const outputFunction = outputMigration.indexOf(
+  'CREATE OR REPLACE FUNCTION protect_operations_carrier_rate_test_label()',
+)
+const outputTriggerCreate = outputMigration.indexOf(
+  'CREATE TRIGGER protect_operations_carrier_rate_test_label_write',
+)
+assert.ok(
+  outputTriggerDrop >= 0
+    && outputBackfill > outputTriggerDrop
+    && outputFunction > outputBackfill
+    && outputTriggerCreate > outputFunction,
+  '0118 must drop the 0116 immutability trigger before backfill and recreate it after the replacement function',
+)
+
 const persistence = read('app_src/lib/persistence/operationPrintDelivery.ts')
 for (const fragment of [
   "type: 'rate_test_label'",
@@ -121,6 +169,10 @@ for (const fragment of [
   'replayCarrierRateTestLabelVoidInPostgres',
   "state IN ('prepared', 'unknown')",
   "type: 'rate_test_label'",
+  "attempt.redacted_request->>'outputFormat'",
+  ') AS requested_output_format',
+  'attempt.requested_output_format !== input.format',
+  'CARRIER_RATE_TEST_LABEL_OUTPUT_MISMATCH',
 ]) {
   assert.ok(
     labelPersistence.includes(fragment),
@@ -176,12 +228,19 @@ assert.ok(
 
 const adapter = read('app_src/lib/integrations/carrierSandboxLabel.ts')
 for (const fragment of [
-  "CARRIER_SANDBOX_LABEL_ADAPTER_VERSION = 'direct-rest-sandbox-v2'",
-  "imageType: 'ZPLII'",
-  "labelStockType: 'STOCK_4X6'",
-  "format: 'ZPL' as const",
-  "payloadEncoding: 'utf8' as const",
-  "providerImageType: provider === 'fedex_rest' ? 'ZPLII' : 'ZPL'",
+  "CARRIER_SANDBOX_LABEL_ADAPTER_VERSION = 'direct-rest-sandbox-v3'",
+  'carrierSandboxLabelOutputOptions',
+  "providerImageType: 'ZPL'",
+  "providerImageType: 'ZPLII'",
+  "providerImageType: 'PDF'",
+  "providerImageType: 'PNG'",
+  "providerStockType: 'HEIGHT_6_WIDTH_4'",
+  "providerStockType: 'STOCK_4X6'",
+  "providerStockType: 'PAPER_4X6'",
+  "sourceKind: 'provider_native'",
+  'printablePdf',
+  'printablePng',
+  "'CARRIER_LABEL_OUTPUT_UNSUPPORTED'",
 ]) {
   assert.ok(
     adapter.includes(fragment),
@@ -189,8 +248,43 @@ for (const fragment of [
   )
 }
 assert.ok(
-  !/labelSpecification:\s*\{[\s\S]{0,200}imageType:\s*'PDF'/.test(adapter),
-  'The bounded FedEx diagnostic must not request a laser PDF for a thermal route',
+  !/\b(?:sharp|imagemagick|ghostscript|rasterize|convertLabel)\b/i.test(adapter),
+  'Carrier adapter selection must request native provider output rather than convert source bytes',
 )
+
+const carrierApi = read('app_src/app/api/integrations/carriers/route.ts')
+for (const fragment of [
+  'rateTestLabelOutputs',
+  "carrierSandboxLabelOutputOptions('ups_rest')",
+  "carrierSandboxLabelOutputOptions('fedex_rest')",
+  "'outputFormat'",
+  'outputFormat: labelOutputFormat(body.outputFormat)',
+  'sourceKind: label.sourceKind',
+  'providerImageType: label.providerImageType',
+  'providerStockType: label.providerStockType',
+  'printArtifactGlobalId: label.printArtifactGlobalId',
+  'artifactGlobalId: job.artifactGlobalId',
+]) {
+  assert.ok(
+    carrierApi.includes(fragment),
+    `Missing carrier label output API contract: ${fragment}`,
+  )
+}
+
+const carrierUi = read(
+  'app_src/components/settings/CarrierIntegrationPanel.tsx',
+)
+for (const fragment of [
+  'Carrier label output',
+  'carrier native',
+  'outputFormat: selectedLabelOutput.format',
+  'Provider-native',
+  'source bytes immutable',
+]) {
+  assert.ok(
+    carrierUi.includes(fragment),
+    `Missing carrier label output UI contract: ${fragment}`,
+  )
+}
 
 console.log('Carrier rate-test label schema and print contracts passed.')

@@ -24,16 +24,27 @@ function json(payload: Record<string, unknown>, status: number) {
   })
 }
 
-function safePdfFilename(value: string) {
+const ARTIFACT_EXTENSIONS = {
+  ZPL: 'zpl',
+  PDF: 'pdf',
+  PNG: 'png',
+} as const
+
+function safeArtifactFilename(
+  value: string,
+  format: keyof typeof ARTIFACT_EXTENSIONS,
+  artifactGlobalId: string,
+) {
+  const extension = ARTIFACT_EXTENSIONS[format]
   const stem = String(value || '')
     .normalize('NFKD')
     .replace(/[^\x20-\x7e]/g, '')
-    .replace(/\.pdf$/i, '')
+    .replace(/\.(zpl|pdf|png)$/i, '')
     .replace(/[^A-Za-z0-9._-]+/g, '-')
-    .replace(/^\.+/, '')
+    .replace(/^[.-]+/, '')
     .replace(/[.-]+$/, '')
     .slice(0, 180)
-  return `${stem || 'packing-slip'}.pdf`
+  return `${stem || `print-artifact-${artifactGlobalId}`}.${extension}`
 }
 
 function errorResponse(error: unknown) {
@@ -83,12 +94,19 @@ export async function GET(
       artifactGlobalId: globalId,
     })
     const etag = `"${artifact.contentSha256}"`
+    const filename = safeArtifactFilename(
+      artifact.filename,
+      artifact.format,
+      artifact.globalId,
+    )
     const headers = {
       'Content-Type': artifact.mimeType,
-      'Content-Disposition': `attachment; filename="${safePdfFilename(artifact.filename)}"`,
-      'Cache-Control': 'private, max-age=31536000, immutable',
+      'Content-Disposition': `attachment; filename="${filename}"`,
+      'Cache-Control': 'private, no-cache, max-age=0, must-revalidate',
       'Content-Security-Policy': 'sandbox',
+      'Cross-Origin-Resource-Policy': 'same-origin',
       'X-Content-Type-Options': 'nosniff',
+      'X-ClawPilot-Content-SHA256': artifact.contentSha256,
       Vary: 'Cookie',
       ETag: etag,
     }

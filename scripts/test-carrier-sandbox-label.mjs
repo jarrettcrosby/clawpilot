@@ -185,10 +185,26 @@ function assertEvidenceRedacted(result) {
 }
 
 const {
+  carrierSandboxLabelOutputOptions,
   carrierSandboxLabelRequestEvidence,
   createCarrierSandboxLabel,
   voidCarrierSandboxLabel,
 } = loadLabelModule()
+
+assert.deepEqual(
+  plain(carrierSandboxLabelOutputOptions('ups_rest')),
+  [{
+    format: 'ZPL',
+    mediaSize: 'label_4x6',
+    sourceKind: 'provider_native',
+    providerImageType: 'ZPL',
+    providerStockType: 'HEIGHT_6_WIDTH_4',
+  }],
+)
+assert.deepEqual(
+  plain(carrierSandboxLabelOutputOptions('fedex_rest').map((entry) => entry.format)),
+  ['ZPL', 'PDF', 'PNG'],
+)
 
 const normalizedShipmentFixture = {
   origin: {
@@ -312,6 +328,18 @@ assert.equal(
 assert.equal(upsCreateResult.evidence.providerReference, 'ups-create-transaction')
 assertEvidenceRedacted(upsCreateResult)
 
+await assert.rejects(
+  createCarrierSandboxLabel(runtime('ups_rest', '03', {
+    outputFormat: 'PDF',
+  })),
+  (error) => assertError(error, {
+    code: 'CARRIER_LABEL_OUTPUT_UNSUPPORTED',
+    status: 409,
+    uncertain: false,
+  }),
+  'UPS PDF must remain unavailable until a provider-native standard Ship output is proven',
+)
+
 const fedexZpl = '^XA^PW812^LL1218^FO48,48^FDFEDEX SANDBOX^FS^XZ'
 const fedexCreateCalls = []
 const fedexCreateResult = await createCarrierSandboxLabel(runtime('fedex_rest', 'FEDEX_GROUND', {
@@ -397,6 +425,86 @@ assert.equal(
 )
 assert.equal(fedexCreateResult.evidence.providerReference, 'fedex-create-transaction')
 assertEvidenceRedacted(fedexCreateResult)
+
+const fedexPdf = Buffer.from(
+  '%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n',
+  'ascii',
+)
+const fedexPdfCalls = []
+const fedexPdfResult = await createCarrierSandboxLabel(
+  runtime('fedex_rest', 'FEDEX_GROUND', { outputFormat: 'PDF' }),
+  {
+    fetchImpl: async (url, init) => {
+      fedexPdfCalls.push({ url: String(url), init })
+      return jsonResponse({
+        output: {
+          transactionShipments: [{
+            masterTrackingNumber: 'MASTERPDF0003',
+            pieceResponses: [{
+              trackingNumber: 'TRACKINGPDF0003',
+              packageDocuments: [{
+                contentType: 'LABEL',
+                docType: 'PDF',
+                encodedLabel: fedexPdf.toString('base64'),
+              }],
+            }],
+          }],
+        },
+      })
+    },
+  },
+)
+const fedexPdfBody = JSON.parse(fedexPdfCalls[0].init.body)
+assert.equal(fedexPdfBody.requestedShipment.labelSpecification.imageType, 'PDF')
+assert.equal(fedexPdfBody.requestedShipment.labelSpecification.labelStockType, 'PAPER_4X6')
+assert.equal(fedexPdfResult.format, 'PDF')
+assert.equal(fedexPdfResult.payloadEncoding, 'base64')
+assert.equal(fedexPdfResult.providerImageType, 'PDF')
+assert.equal(fedexPdfResult.providerStockType, 'PAPER_4X6')
+assert.ok(Buffer.from(fedexPdfResult.labelPayload, 'base64').equals(fedexPdf))
+assertEvidenceRedacted(fedexPdfResult)
+
+const fedexPng = Buffer.alloc(48)
+Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+  .copy(fedexPng, 0)
+fedexPng.writeUInt32BE(13, 8)
+fedexPng.write('IHDR', 12, 'ascii')
+fedexPng.writeUInt32BE(800, 16)
+fedexPng.writeUInt32BE(1200, 20)
+fedexPng.write('IEND', 40, 'ascii')
+const fedexPngCalls = []
+const fedexPngResult = await createCarrierSandboxLabel(
+  runtime('fedex_rest', 'FEDEX_GROUND', { outputFormat: 'PNG' }),
+  {
+    fetchImpl: async (url, init) => {
+      fedexPngCalls.push({ url: String(url), init })
+      return jsonResponse({
+        output: {
+          transactionShipments: [{
+            masterTrackingNumber: 'MASTERPNG0004',
+            pieceResponses: [{
+              trackingNumber: 'TRACKINGPNG0004',
+              packageDocuments: [{
+                contentType: 'LABEL',
+                imageType: 'PNG',
+                encodedLabel: fedexPng.toString('base64'),
+              }],
+            }],
+          }],
+        },
+      })
+    },
+  },
+)
+const fedexPngBody = JSON.parse(fedexPngCalls[0].init.body)
+assert.equal(fedexPngBody.requestedShipment.labelSpecification.imageType, 'PNG')
+assert.equal(fedexPngBody.requestedShipment.labelSpecification.labelStockType, 'PAPER_4X6')
+assert.equal(fedexPngResult.format, 'PNG')
+assert.equal(fedexPngResult.payloadEncoding, 'base64')
+assert.equal(fedexPngResult.providerImageType, 'PNG')
+assert.equal(fedexPngResult.providerStockType, 'PAPER_4X6')
+assert.ok(Buffer.from(fedexPngResult.labelPayload, 'base64').equals(fedexPng))
+assertEvidenceRedacted(fedexPngResult)
 
 await assert.rejects(
   createCarrierSandboxLabel(runtime('ups_rest', '03'), {

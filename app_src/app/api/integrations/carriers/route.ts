@@ -22,6 +22,10 @@ import {
   reconcileCarrierRateTestLabelAttempt,
   voidCarrierRateTestLabel,
 } from '@/lib/integrations/carrierRateTestLabelActions'
+import {
+  carrierSandboxLabelOutputOptions,
+  type CarrierLabelOutputFormat,
+} from '@/lib/integrations/carrierSandboxLabel'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import { listOperationsPrinterProfilesInPostgres } from '@/lib/persistence/operationPrinting'
 import { OperationsRequestError } from '@/lib/persistence/operations'
@@ -214,6 +218,15 @@ function idempotencyKey(value: unknown) {
   return normalized
 }
 
+function labelOutputFormat(value: unknown): CarrierLabelOutputFormat {
+  if (value === 'ZPL' || value === 'PDF' || value === 'PNG') return value
+  throw new CarrierIntegrationRequestError(
+    'Label output format must be ZPL, PDF, or PNG',
+    400,
+    'CARRIER_REQUEST_INVALID',
+  )
+}
+
 function selectedRateInput(value: unknown) {
   const rate = objectField(value, 'Selected rate')
   only(rate, ['serviceCode', 'serviceName', 'rateType', 'amount', 'currency'])
@@ -320,8 +333,12 @@ function safeRateTestLabel(
     trackingNumber: label.trackingNumber,
     format: label.format,
     mediaSize: label.mediaSize,
+    sourceKind: label.sourceKind,
+    providerImageType: label.providerImageType,
+    providerStockType: label.providerStockType,
     byteLength: label.byteLength,
     contentSha256: label.contentSha256,
+    printArtifactGlobalId: label.printArtifactGlobalId,
     status: label.status,
     createdAt: label.createdAt,
     createdBy: label.createdBy,
@@ -335,6 +352,7 @@ function safeRateTestPrintJob(
 ) {
   return {
     globalId: job.globalId,
+    artifactGlobalId: job.artifactGlobalId,
     sourceLabelGlobalId: job.sourceLabelGlobalId,
     status: job.status,
     format: job.format,
@@ -409,6 +427,10 @@ export async function GET(req: NextRequest) {
           && printer.supportedMedia.some((media) => media === 'label_4x6' || media === 'label_4x8')
         ))
         .map(safeRateTestPrinter),
+      rateTestLabelOutputs: {
+        ups_rest: carrierSandboxLabelOutputOptions('ups_rest'),
+        fedex_rest: carrierSandboxLabelOutputOptions('fedex_rest'),
+      },
     })
   } catch (error) {
     return errorResponse(error)
@@ -541,6 +563,7 @@ export async function PATCH(req: NextRequest) {
         'rateEvidenceGlobalId',
         'selectedRate',
         'destination',
+        'outputFormat',
         'reason',
         'idempotencyKey',
       ])
@@ -558,6 +581,7 @@ export async function PATCH(req: NextRequest) {
         rateEvidenceGlobalId,
         selectedRate,
         destination,
+        outputFormat: labelOutputFormat(body.outputFormat),
         reason: plainText(body.reason, 'Test-label reason', 500),
         idempotencyKey: idempotencyKey(body.idempotencyKey),
       })

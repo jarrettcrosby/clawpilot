@@ -9,6 +9,7 @@ import {
   CarrierSandboxLabelError,
   createCarrierSandboxLabel,
   voidCarrierSandboxLabel,
+  type CarrierLabelOutputFormat,
 } from '@/lib/integrations/carrierSandboxLabel'
 import {
   buildCarrierSandboxRateFixture,
@@ -313,6 +314,7 @@ export async function createCarrierRateTestLabel(input: {
   rateEvidenceGlobalId: string
   selectedRate: CarrierRateTestSelectedRate
   destination: CarrierSandboxParty
+  outputFormat: CarrierLabelOutputFormat
   reason: string
   idempotencyKey: string
 }) {
@@ -332,6 +334,7 @@ export async function createCarrierRateTestLabel(input: {
     credentialVersion: context.credentialVersion,
     selectedRate,
     destinationFingerprint,
+    outputFormat: input.outputFormat,
     adapterVersion: CARRIER_SANDBOX_LABEL_ADAPTER_VERSION,
     reason: input.reason,
   })
@@ -344,6 +347,7 @@ export async function createCarrierRateTestLabel(input: {
     attemptRequestHash,
     destinationFingerprint,
     selectedRate,
+    outputFormat: input.outputFormat,
     adapterVersion: CARRIER_SANDBOX_LABEL_ADAPTER_VERSION,
   })
   if (prepared.disposition === 'replayed') return prepared.label
@@ -379,6 +383,7 @@ export async function createCarrierRateTestLabel(input: {
       ...runtime,
       serviceCode: selectedRate.serviceCode,
       shipmentFixture,
+      outputFormat: input.outputFormat,
     })
   } catch (error) {
     await finalizePreparedFailure({
@@ -422,6 +427,10 @@ export async function createCarrierRateTestLabel(input: {
       providerLabelId: result.providerLabelId,
       trackingNumber: result.trackingNumber,
       format: result.format,
+      mediaSize: result.mediaSize,
+      sourceKind: result.sourceKind,
+      providerImageType: result.providerImageType,
+      providerStockType: result.providerStockType,
       labelPayload: bytes,
       contentSha256: result.labelContentSha256,
       providerReference: result.evidence.providerReference,
