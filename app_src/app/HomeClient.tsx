@@ -13,7 +13,9 @@ import ShortLinksSection from '@/components/links/ShortLinksSection'
 import CrmSection from '@/components/crm/CrmSection'
 import AccountingSection from '@/components/accounting/AccountingSection'
 import PosSection from '@/components/pos/PosSection'
-import OperationsSection from '@/components/operations/OperationsSection'
+import OperationsSection, {
+  type OperationsView,
+} from '@/components/operations/OperationsSection'
 import ShortcutsModal from '@/components/help/ShortcutsModal'
 import SessionGuard from '@/components/auth/SessionGuard'
 import ImpersonationBanner from '@/components/auth/ImpersonationBanner'
@@ -24,14 +26,25 @@ import { WORKSPACE_CHANGED_EVENT, type WorkspaceChangedDetail } from '@/lib/work
 import { accountingSectionFromNavigationUrl } from '@/lib/accountingDraftNavigation'
 
 const SECTIONS = ['dashboard', 'docs', 'projects', 'pipeline', 'crm', 'accounting', 'pos', 'operations', 'links', 'agents', 'versions']
+const OPERATIONS_TARGETS: Record<string, OperationsView> = {
+  operations: 'orders',
+  'operations/exceptions': 'exceptions',
+  'operations/imports': 'imports',
+  'operations/receiving': 'receiving',
+  'operations/warehouses': 'warehouses',
+  'operations/carrier-invoices': 'carrier-invoices',
+  'operations/gl-coding': 'gl-coding',
+  'operations/printing': 'printing',
+}
 const DESKTOP_NAV_COLLAPSED_KEY = 'clawpilot_desktop_nav_collapsed'
 const DESKTOP_NAV_PREFERENCE_EVENT = 'clawpilot:desktop-nav-preference'
 
-function getSectionFromHash(): string {
+function getNavigationTargetFromHash(): string {
   if (typeof window === 'undefined') return 'dashboard'
   const accountingSection = accountingSectionFromNavigationUrl(window.location.href)
   if (accountingSection) return accountingSection
   const hash = window.location.hash.replace('#', '')
+  if (hash in OPERATIONS_TARGETS) return hash
   return SECTIONS.includes(hash) ? hash : 'dashboard'
 }
 
@@ -65,7 +78,12 @@ export default function HomeClient({
   sessionGuardEnabled: boolean
 }) {
   // Always init 'dashboard' to match SSR. useEffect corrects to real hash post-hydration.
-  const activeSection = useSyncExternalStore(subscribeToHashChange, getSectionFromHash, () => 'dashboard')
+  const navigationTarget = useSyncExternalStore(
+    subscribeToHashChange,
+    getNavigationTargetFromHash,
+    () => 'dashboard',
+  )
+  const activeSection = navigationTarget.split('/')[0]
   const desktopNavCollapsed = useSyncExternalStore(
     subscribeToDesktopNavPreference,
     getDesktopNavCollapsed,
@@ -196,7 +214,7 @@ export default function HomeClient({
       }}
     >
       <Navigation
-        activeSection={section}
+        activeSection={navigationTarget}
         onNavigate={navigate}
         collapsed={desktopNavCollapsed}
         mobileOpen={mobileNavOpen}
@@ -273,7 +291,9 @@ export default function HomeClient({
           )}
           {section === 'operations' && (
             <Box sx={{ height: '100%', overflow: 'hidden' }}>
-              <OperationsSection />
+              <OperationsSection
+                initialView={OPERATIONS_TARGETS[navigationTarget] || 'orders'}
+              />
             </Box>
           )}
           {shortLinksEnabled && section === 'links' && (

@@ -452,9 +452,13 @@ includes(workflowSource, [
   "'resolve-catalog-product'",
   'Retry exact order',
   'Exclusion audit reason',
-  'Map existing product',
-  'Create and map product',
-  'Catalog exclusion reason',
+  'Match existing product',
+  'Create and match product',
+  'Reason for skipping',
+  'Download review CSV',
+  'Import decisions',
+  'parseCommerceProductReviewCsv',
+  'confirmProviderWriteOff: true',
 ], 'Commerce intake executable recovery and catalog workflow')
 includes(workflowSource, [
   "requestError.code === 'COMMERCE_INTAKE_READ_RESTART_REQUIRED'",
