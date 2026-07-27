@@ -3624,7 +3624,7 @@ async function cleanupScenario(
       `UPDATE operations_locations location
        SET active = false,
            updated_by = $2,
-           row_version = row_version + 1,
+           row_version = location.row_version + 1,
            updated_at = now()
        FROM operations_warehouses warehouse
        WHERE location.organization_id = $1::uuid
