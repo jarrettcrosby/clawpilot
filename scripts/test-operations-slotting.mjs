@@ -213,6 +213,8 @@ for (const fragment of [
   'TRUSTED_RAILWAY_PROJECT_ID',
   'WMS_SIM_EXPECTED_DATABASE_FINGERPRINT',
   'WMS_SIM_PRESERVE_PRINTER_GLOBAL_ID',
+  "'supersededBy', $5::text",
+  "'formerScenarioKey', $6::text",
 ]) {
   assert.ok(
     normalization.includes(fragment),
@@ -224,6 +226,40 @@ assert.equal(
     .test(normalization),
   false,
   'Normalization must preserve immutable operations contract-version evidence',
+)
+const joinedLocationUpdates = [
+  ...normalization.matchAll(
+    /`UPDATE operations_locations location[\s\S]*?FROM operations_warehouses warehouse[\s\S]*?`/g,
+  ),
+]
+assert.equal(
+  joinedLocationUpdates.length,
+  2,
+  'Expected both joined location updates to remain covered',
+)
+for (const [joinedLocationUpdate] of joinedLocationUpdates) {
+  assert.ok(
+    joinedLocationUpdate.includes(
+      'row_version = location.row_version + 1',
+    ),
+    'Joined location updates must qualify the target row_version column',
+  )
+}
+const joinedSimulationLocationUpdates = [
+  ...simulation.matchAll(
+    /`UPDATE operations_locations location[\s\S]*?FROM operations_warehouses warehouse[\s\S]*?`/g,
+  ),
+]
+assert.equal(
+  joinedSimulationLocationUpdates.length,
+  1,
+  'Expected the joined simulation location update to remain covered',
+)
+assert.ok(
+  joinedSimulationLocationUpdates[0][0].includes(
+    'row_version = location.row_version + 1',
+  ),
+  'Joined simulation location updates must qualify the target row_version column',
 )
 const simulationMain = simulation.slice(
   simulation.indexOf('async function main()'),

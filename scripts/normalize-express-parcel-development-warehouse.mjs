@@ -1117,7 +1117,7 @@ async function prepare(client, config) {
              'previousNotes', location.notes
            )::text,
            updated_by = $2,
-           row_version = row_version + 1,
+           row_version = location.row_version + 1,
            updated_at = now()
        FROM operations_warehouses warehouse
        WHERE location.organization_id = $1::uuid
@@ -1405,7 +1405,7 @@ async function finalize(client, config) {
              'previousNotes', location.notes
            )::text,
            updated_by = $3,
-           row_version = row_version + 1,
+           row_version = location.row_version + 1,
            updated_at = now()
        FROM operations_warehouses warehouse
        WHERE location.organization_id = $1::uuid
@@ -1427,7 +1427,7 @@ async function finalize(client, config) {
            address = address || jsonb_build_object(
              'state', 'retired',
              'retirementReason', 'superseded_by_preserved_print_warehouse',
-             'supersededBy', $5
+             'supersededBy', $5::text
            ),
            updated_by = $2,
            row_version = row_version + 1,
@@ -1485,7 +1485,7 @@ async function finalize(client, config) {
            ) || jsonb_build_object(
              'state', 'operational',
              'simulationState', 'retired',
-             'formerScenarioKey', $6,
+             'formerScenarioKey', $6::text,
              'preservedForPrinting', true,
              'normalizedFromWarehouse', source.global_id
            ),
