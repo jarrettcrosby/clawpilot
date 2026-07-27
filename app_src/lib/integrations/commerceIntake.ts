@@ -1659,6 +1659,13 @@ export async function executeCommerceIntakeCommand(input: {
         }).catch(() => undefined)
       }
       if (!(error instanceof CommerceIntegrationRequestError)) {
+        if (!continuationRunGlobalId) {
+          throw new CommerceIntegrationRequestError(
+            `The read-only ${resource} request could not be prepared. Retry the same action; no provider request was sent.`,
+            500,
+            'COMMERCE_INTAKE_READ_PREPARATION_FAILED',
+          )
+        }
         throw new CommerceIntegrationRequestError(
           `The saved ${resource} batch cannot be resumed. Restart that read-only fetch.`,
           409,
