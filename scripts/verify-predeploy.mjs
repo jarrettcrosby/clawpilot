@@ -225,6 +225,8 @@ for (const requiredPath of [
   'db/migrations/0113_operations_shopify_order_preview.sql',
   'db/migrations/0114_operations_commerce_normalization.sql',
   'db/migrations/0115_operations_commerce_intake_continuations.sql',
+  'db/migrations/0116_operations_carrier_rate_test_labels.sql',
+  'scripts/test-carrier-rate-test-labels.mjs',
   'scripts/test-commerce-integrations.mjs',
   'scripts/test-commerce-normalization-schema.mjs',
   'scripts/test-commerce-normalizers.mjs',

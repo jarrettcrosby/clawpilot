@@ -14,7 +14,17 @@ import {
   updateCarrierAccount,
   updateCarrierCredential,
 } from '@/lib/integrations/carrierIntegrations'
+import {
+  createCarrierRateTestLabel,
+  listCarrierRateTestLabelAttempts,
+  listCarrierRateTestLabels,
+  printCarrierRateTestLabel,
+  reconcileCarrierRateTestLabelAttempt,
+  voidCarrierRateTestLabel,
+} from '@/lib/integrations/carrierRateTestLabelActions'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
+import { listOperationsPrinterProfilesInPostgres } from '@/lib/persistence/operationPrinting'
+import { OperationsRequestError } from '@/lib/persistence/operations'
 import { operationsCapabilities } from '@/lib/operations/authorization'
 import { requireRequestUser } from '@/lib/requestUser'
 import { effectiveAuthorizationRole, type AppUser } from '@/lib/users'
@@ -40,6 +50,9 @@ function json(payload: Record<string, unknown>, status = 200) {
 function errorResponse(error: unknown) {
   if (error instanceof Error && error.message === 'Unauthorized') {
     return json({ ok: false, error: 'Unauthorized', code: 'UNAUTHORIZED' }, 401)
+  }
+  if (error instanceof OperationsRequestError) {
+    return json({ ok: false, error: error.message, code: error.code }, error.status)
   }
   const sanitized = sanitizedCarrierIntegrationError(error)
   return json({ ok: false, error: sanitized.message, code: sanitized.code }, sanitized.status)
@@ -72,6 +85,17 @@ function requireManager(actor: AppUser) {
       'Operations-management permission is required to manage carrier accounts',
       403,
       'CARRIER_MANAGER_REQUIRED',
+    )
+  }
+}
+
+function requireExecutor(actor: AppUser) {
+  const capabilities = operationsCapabilities(actor)
+  if (!capabilities.canManage || !capabilities.canExecute) {
+    throw new CarrierIntegrationRequestError(
+      'Operations-management and warehouse-execution permissions are required for sandbox label actions',
+      403,
+      'CARRIER_EXECUTE_REQUIRED',
     )
   }
 }
@@ -132,16 +156,259 @@ function only(body: Record<string, unknown>, fields: string[]) {
   }
 }
 
+function objectField(value: unknown, label: string) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new CarrierIntegrationRequestError(
+      `${label} must be an object`,
+      400,
+      'CARRIER_REQUEST_INVALID',
+    )
+  }
+  return value as Record<string, unknown>
+}
+
+function plainText(value: unknown, label: string, maximum: number) {
+  if (typeof value !== 'string') {
+    throw new CarrierIntegrationRequestError(
+      `${label} must be text`,
+      400,
+      'CARRIER_REQUEST_INVALID',
+    )
+  }
+  const normalized = value.trim()
+  if (!normalized || normalized.length > maximum || /[\u0000-\u001f\u007f]/.test(normalized)) {
+    throw new CarrierIntegrationRequestError(
+      `${label} must be 1-${maximum} plain-text characters`,
+      400,
+      'CARRIER_REQUEST_INVALID',
+    )
+  }
+  return normalized
+}
+
+function globalReference(
+  value: unknown,
+  prefix: 'grq' | 'gsl' | 'gpr' | 'gsa',
+  label: string,
+) {
+  const normalized = String(value || '').trim()
+  if (!new RegExp(`^${prefix}[0-9]{7}$`).test(normalized)) {
+    throw new CarrierIntegrationRequestError(
+      `${label} is invalid`,
+      400,
+      'CARRIER_REQUEST_INVALID',
+    )
+  }
+  return normalized
+}
+
+function idempotencyKey(value: unknown) {
+  const normalized = String(value || '').trim()
+  if (!/^[A-Za-z0-9._:-]{8,200}$/.test(normalized)) {
+    throw new CarrierIntegrationRequestError(
+      'Idempotency key must be 8-200 safe characters',
+      400,
+      'CARRIER_REQUEST_INVALID',
+    )
+  }
+  return normalized
+}
+
+function selectedRateInput(value: unknown) {
+  const rate = objectField(value, 'Selected rate')
+  only(rate, ['serviceCode', 'serviceName', 'rateType', 'amount', 'currency'])
+  const rateType = rate.rateType === null
+    ? null
+    : plainText(rate.rateType, 'Selected rate type', 80)
+  const amount = String(rate.amount || '').trim()
+  const currency = String(rate.currency || '').trim().toUpperCase()
+  if (!/^[0-9]+(?:[.][0-9]{1,6})?$/.test(amount)) {
+    throw new CarrierIntegrationRequestError(
+      'Selected rate amount is invalid',
+      400,
+      'CARRIER_REQUEST_INVALID',
+    )
+  }
+  if (!/^[A-Z]{3}$/.test(currency)) {
+    throw new CarrierIntegrationRequestError(
+      'Selected rate currency is invalid',
+      400,
+      'CARRIER_REQUEST_INVALID',
+    )
+  }
+  return {
+    serviceCode: plainText(rate.serviceCode, 'Selected service code', 80),
+    serviceName: plainText(rate.serviceName, 'Selected service name', 160),
+    rateType,
+    amount,
+    currency,
+  }
+}
+
+function destinationInput(value: unknown) {
+  const destination = objectField(value, 'Destination')
+  only(destination, ['name', 'line1', 'line2', 'city', 'region', 'postalCode', 'countryCode'])
+  const line2 = destination.line2 === null || destination.line2 === ''
+    ? null
+    : plainText(destination.line2, 'Destination address line 2', 120)
+  const region = String(destination.region || '').trim().toUpperCase()
+  const postalCode = String(destination.postalCode || '').trim()
+  const countryCode = String(destination.countryCode || '').trim().toUpperCase()
+  if (!/^[A-Z]{2}$/.test(region)) {
+    throw new CarrierIntegrationRequestError(
+      'Destination state must be a two-letter code',
+      400,
+      'CARRIER_REQUEST_INVALID',
+    )
+  }
+  if (!/^[0-9]{5}(?:-[0-9]{4})?$/.test(postalCode)) {
+    throw new CarrierIntegrationRequestError(
+      'Destination ZIP code is invalid',
+      400,
+      'CARRIER_REQUEST_INVALID',
+    )
+  }
+  if (countryCode !== 'US') {
+    throw new CarrierIntegrationRequestError(
+      'Sandbox label testing currently requires a US destination',
+      400,
+      'CARRIER_REQUEST_INVALID',
+    )
+  }
+  return {
+    name: plainText(destination.name, 'Destination name', 120),
+    line1: plainText(destination.line1, 'Destination address line 1', 160),
+    line2,
+    city: plainText(destination.city, 'Destination city', 100),
+    region,
+    postalCode,
+    countryCode: 'US' as const,
+  }
+}
+
+function safeRateTestPrinter(
+  printer: Awaited<ReturnType<typeof listOperationsPrinterProfilesInPostgres>>[number],
+) {
+  return {
+    globalId: printer.globalId,
+    warehouseGlobalId: printer.warehouseGlobalId,
+    warehouseName: printer.warehouseName,
+    code: printer.code,
+    name: printer.name,
+    connectionMode: printer.connectionMode,
+    supportedFormats: printer.supportedFormats,
+    supportedMedia: printer.supportedMedia,
+    supportedDocumentTypes: printer.supportedDocumentTypes,
+    localPrintAgentStatus: printer.localPrintAgentStatus,
+    status: printer.status,
+  }
+}
+
+function safeRateTestLabel(
+  label: Awaited<ReturnType<typeof listCarrierRateTestLabels>>[number],
+) {
+  return {
+    globalId: label.globalId,
+    rateEvidenceGlobalId: label.rateEvidenceGlobalId,
+    provider: label.provider,
+    environment: label.environment,
+    serviceCode: label.serviceCode,
+    serviceName: label.serviceName,
+    rateType: label.rateType,
+    ratedAmount: label.ratedAmount,
+    ratedCurrency: label.ratedCurrency,
+    trackingNumber: label.trackingNumber,
+    format: label.format,
+    mediaSize: label.mediaSize,
+    byteLength: label.byteLength,
+    contentSha256: label.contentSha256,
+    status: label.status,
+    createdAt: label.createdAt,
+    createdBy: label.createdBy,
+    voidedAt: label.voidedAt,
+    voidedBy: label.voidedBy,
+  }
+}
+
+function safeRateTestPrintJob(
+  job: Awaited<ReturnType<typeof printCarrierRateTestLabel>>,
+) {
+  return {
+    globalId: job.globalId,
+    sourceLabelGlobalId: job.sourceLabelGlobalId,
+    status: job.status,
+    format: job.format,
+    media: job.media,
+    printerGlobalId: job.printerGlobalId,
+    printerName: job.printerName,
+    warehouseGlobalId: job.warehouseGlobalId,
+    warehouseName: job.warehouseName,
+    routingReason: job.routingReason,
+    attempts: job.attempts,
+    maxAttempts: job.maxAttempts,
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
+    deliveredAt: job.deliveredAt,
+  }
+}
+
+function safeRateTestLabelAttempt(
+  attempt: Awaited<ReturnType<typeof listCarrierRateTestLabelAttempts>>[number],
+) {
+  return {
+    globalId: attempt.globalId,
+    rateEvidenceGlobalId: attempt.rateEvidenceGlobalId,
+    labelGlobalId: attempt.labelGlobalId,
+    action: attempt.action,
+    state: attempt.state,
+    provider: attempt.provider,
+    serviceCode: attempt.serviceCode,
+    selectedRate: attempt.selectedRate,
+    reason: attempt.reason,
+    errorCode: attempt.errorCode,
+    providerReference: attempt.providerReference,
+    reconciliationOutcome: attempt.reconciliationOutcome,
+    reconciliationReason: attempt.reconciliationReason,
+    reconciledBy: attempt.reconciledBy,
+    reconciledAt: attempt.reconciledAt,
+    requestedAt: attempt.requestedAt,
+    completedAt: attempt.completedAt,
+    reconciliationEligible: attempt.reconciliationEligible,
+  }
+}
+
 export async function GET(req: NextRequest) {
   try {
     const actor = await requireRequestUser(req)
     requirePostgres()
     requireManager(actor)
+    const organization = organizationId(actor)
+    const capabilities = operationsCapabilities(actor)
+    const [integrations, rateTestLabels, rateTestAttempts, printers] = await Promise.all([
+      getCarrierIntegrationsState(organization),
+      listCarrierRateTestLabels({ organizationId: organization }),
+      listCarrierRateTestLabelAttempts({ organizationId: organization }),
+      listOperationsPrinterProfilesInPostgres(organization),
+    ])
     return json({
       ok: true,
       canManage: true,
+      canExecute: capabilities.canExecute,
       canRevealCredentials: canRevealCredential(actor),
-      integrations: await getCarrierIntegrationsState(organizationId(actor)),
+      canReconcile: capabilities.canExecute && canRevealCredential(actor),
+      integrations,
+      rateTestLabels: rateTestLabels.map(safeRateTestLabel),
+      rateTestAttempts: rateTestAttempts.map(safeRateTestLabelAttempt),
+      rateTestPrinters: printers
+        .filter((printer) => (
+          printer.status === 'online'
+          && printer.connectionMode === 'local_agent'
+          && printer.localPrintAgentStatus === 'active'
+          && printer.supportedDocumentTypes.includes('shipping_label')
+          && printer.supportedFormats.length > 0
+          && printer.supportedMedia.some((media) => media === 'label_4x6' || media === 'label_4x8')
+        ))
+        .map(safeRateTestPrinter),
     })
   } catch (error) {
     return errorResponse(error)
@@ -257,15 +524,158 @@ export async function PATCH(req: NextRequest) {
       return json({ ok: true, canManage: true, integrations })
     }
     if (action === 'test-sandbox-rate') {
-      only(body, ['action', 'provider', 'environment', 'carrierAccountGlobalId'])
+      only(body, ['action', 'provider', 'environment', 'carrierAccountGlobalId', 'destination'])
       const rateTest = await testCarrierSandboxRate({
         organizationId: organization,
         provider: body.provider,
         environment: body.environment,
         carrierAccountGlobalId: body.carrierAccountGlobalId,
+        destination: body.destination,
         actorEmail: actor.email,
       })
       return json({ ok: true, canManage: true, rateTest })
+    }
+    if (action === 'create-rate-test-label') {
+      only(body, [
+        'action',
+        'rateEvidenceGlobalId',
+        'selectedRate',
+        'destination',
+        'reason',
+        'idempotencyKey',
+      ])
+      requireExecutor(actor)
+      const rateEvidenceGlobalId = globalReference(
+        body.rateEvidenceGlobalId,
+        'grq',
+        'Rate evidence reference',
+      )
+      const selectedRate = selectedRateInput(body.selectedRate)
+      const destination = destinationInput(body.destination)
+      const rateTestLabel = await createCarrierRateTestLabel({
+        organizationId: organization,
+        actorEmail: actor.email,
+        rateEvidenceGlobalId,
+        selectedRate,
+        destination,
+        reason: plainText(body.reason, 'Test-label reason', 500),
+        idempotencyKey: idempotencyKey(body.idempotencyKey),
+      })
+      return json({
+        ok: true,
+        canManage: true,
+        canExecute: true,
+        rateTestLabel: safeRateTestLabel(rateTestLabel),
+        rateTestLabels: (
+          await listCarrierRateTestLabels({ organizationId: organization })
+        ).map(safeRateTestLabel),
+      })
+    }
+    if (action === 'print-rate-test-label') {
+      only(body, ['action', 'labelGlobalId', 'preferredPrinterGlobalId', 'idempotencyKey'])
+      requireExecutor(actor)
+      const labelGlobalId = globalReference(body.labelGlobalId, 'gsl', 'Rate-test label reference')
+      const preferredPrinterGlobalId = globalReference(
+        body.preferredPrinterGlobalId,
+        'gpr',
+        'Printer reference',
+      )
+      const printers = await listOperationsPrinterProfilesInPostgres(organization)
+      const printer = printers.find((entry) => entry.globalId === preferredPrinterGlobalId)
+      if (
+        !printer
+        || printer.status !== 'online'
+        || printer.connectionMode !== 'local_agent'
+        || printer.localPrintAgentStatus !== 'active'
+      ) {
+        throw new CarrierIntegrationRequestError(
+          'The selected printer is not an online local-agent printer for this organization',
+          409,
+          'CARRIER_RATE_TEST_PRINTER_UNAVAILABLE',
+        )
+      }
+      const printJob = await printCarrierRateTestLabel({
+        organizationId: organization,
+        actorEmail: actor.email,
+        labelGlobalId,
+        warehouseId: printer.warehouseId,
+        preferredPrinterGlobalId: printer.globalId,
+        idempotencyKey: idempotencyKey(body.idempotencyKey),
+      })
+      return json({
+        ok: true,
+        canManage: true,
+        canExecute: true,
+        printJob: safeRateTestPrintJob(printJob),
+      })
+    }
+    if (action === 'void-rate-test-label') {
+      only(body, ['action', 'labelGlobalId', 'reason', 'idempotencyKey'])
+      requireExecutor(actor)
+      const rateTestLabel = await voidCarrierRateTestLabel({
+        organizationId: organization,
+        actorEmail: actor.email,
+        labelGlobalId: globalReference(body.labelGlobalId, 'gsl', 'Rate-test label reference'),
+        reason: plainText(body.reason, 'Void reason', 500),
+        idempotencyKey: idempotencyKey(body.idempotencyKey),
+      })
+      return json({
+        ok: true,
+        canManage: true,
+        canExecute: true,
+        rateTestLabel: safeRateTestLabel(rateTestLabel),
+        rateTestLabels: (
+          await listCarrierRateTestLabels({ organizationId: organization })
+        ).map(safeRateTestLabel),
+      })
+    }
+    if (action === 'reconcile-rate-test-attempt') {
+      only(body, [
+        'action',
+        'attemptGlobalId',
+        'outcome',
+        'reason',
+        'idempotencyKey',
+      ])
+      requireExecutor(actor)
+      requireCredentialViewer(actor)
+      const outcome = String(body.outcome || '').trim()
+      if (
+        outcome !== 'confirmed_no_active_label'
+        && outcome !== 'confirmed_voided'
+        && outcome !== 'confirmed_active'
+      ) {
+        throw new CarrierIntegrationRequestError(
+          'Carrier reconciliation outcome is invalid',
+          400,
+          'CARRIER_REQUEST_INVALID',
+        )
+      }
+      const attempt = await reconcileCarrierRateTestLabelAttempt({
+        organizationId: organization,
+        actorEmail: actor.email,
+        attemptGlobalId: globalReference(
+          body.attemptGlobalId,
+          'gsa',
+          'Carrier attempt reference',
+        ),
+        outcome,
+        reason: plainText(body.reason, 'Reconciliation reason', 500),
+        idempotencyKey: idempotencyKey(body.idempotencyKey),
+      })
+      const [rateTestLabels, rateTestAttempts] = await Promise.all([
+        listCarrierRateTestLabels({ organizationId: organization }),
+        listCarrierRateTestLabelAttempts({ organizationId: organization }),
+      ])
+      return json({
+        ok: true,
+        canManage: true,
+        canExecute: true,
+        canReconcile: true,
+        rateTestAttempt: safeRateTestLabelAttempt(attempt),
+        rateTestLabels: rateTestLabels.map(safeRateTestLabel),
+        rateTestAttempts: rateTestAttempts.map(safeRateTestLabelAttempt),
+      })
     }
     if (action === 'set-enabled') {
       only(body, ['action', 'provider', 'environment', 'enabled'])

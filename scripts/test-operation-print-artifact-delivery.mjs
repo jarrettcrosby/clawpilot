@@ -88,7 +88,8 @@ function verifyStaticContracts() {
     'payload.organization_id = $1::uuid',
     'artifact.global_id = $2',
     'payload.payload AS artifact_payload',
-    'encoding: \'utf8\'',
+    "encoding: format === 'ZPL' ? 'utf8' : 'base64'",
+    "encoding: input.format === 'ZPL' ? 'utf8' : 'base64'",
     'encoding: \'base64\'',
   ]) {
     assert.ok(

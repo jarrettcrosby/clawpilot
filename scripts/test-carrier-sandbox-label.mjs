@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
@@ -102,7 +103,21 @@ function loadLabelModule() {
         }
       }
       if (specifier === '@/lib/integrations/carrierSandboxRate') {
-        return { CARRIER_SANDBOX_RATE_FIXTURE: fixture }
+        return {
+          CARRIER_SANDBOX_RATE_FIXTURE: fixture,
+          carrierSandboxPartyFingerprint: (value) => (
+            createHash('sha256').update(JSON.stringify(value)).digest('hex')
+          ),
+          normalizeCarrierSandboxParty: (value) => ({
+            name: String(value.name).trim(),
+            line1: String(value.line1).trim(),
+            line2: value.line2 ? String(value.line2).trim() : null,
+            city: String(value.city).trim(),
+            region: String(value.region).trim().toUpperCase(),
+            postalCode: String(value.postalCode).trim(),
+            countryCode: 'US',
+          }),
+        }
       }
       return nodeRequire(specifier)
     },
@@ -111,7 +126,7 @@ function loadLabelModule() {
   return module.exports
 }
 
-function runtime(provider, serviceCode) {
+function runtime(provider, serviceCode, overrides = {}) {
   return {
     provider,
     environment: 'sandbox',
@@ -121,6 +136,7 @@ function runtime(provider, serviceCode) {
       clientSecret: secrets.clientSecret,
     },
     serviceCode,
+    ...overrides,
   }
 }
 
@@ -143,6 +159,13 @@ function assertError(error, expected) {
   for (const secret of Object.values(secrets)) {
     assert.ok(!serialized.includes(secret), `Error leaked protected value ${secret}`)
   }
+  if (expected.uncertain) {
+    assert.match(
+      error.redactedResponse?.clientTransactionId || '',
+      /^[a-f0-9]{32}$/,
+      'Unknown carrier mutations must retain a safe client transaction ID',
+    )
+  }
   return true
 }
 
@@ -162,12 +185,57 @@ function assertEvidenceRedacted(result) {
 }
 
 const {
+  carrierSandboxLabelRequestEvidence,
   createCarrierSandboxLabel,
   voidCarrierSandboxLabel,
 } = loadLabelModule()
 
+const normalizedShipmentFixture = {
+  origin: {
+    name: 'Account Sender',
+    line1: '500 Account Way',
+    line2: 'Suite 200',
+    city: 'Columbus',
+    region: 'OH',
+    postalCode: '43215',
+    countryCode: 'US',
+  },
+  destination: {
+    name: 'Receiving Team',
+    line1: '101 Academy Drive',
+    line2: 'Warehouse B',
+    city: 'Buzzards Bay',
+    region: 'MA',
+    postalCode: '02532',
+    countryCode: 'US',
+  },
+  parcel: fixture.parcel,
+}
+const legacyEvidence = carrierSandboxLabelRequestEvidence('ups_rest', '03')
+assert.match(
+  legacyEvidence.redactedRequest.shipment.originFingerprint,
+  /^[a-f0-9]{64}$/,
+)
+assert.match(
+  legacyEvidence.redactedRequest.shipment.destinationFingerprint,
+  /^[a-f0-9]{64}$/,
+)
+assert.equal(legacyEvidence.redactedRequest.shipment.origin.region, 'OH')
+assert.equal(legacyEvidence.redactedRequest.shipment.destination.region, 'MA')
+assert.ok(
+  !JSON.stringify(legacyEvidence.redactedRequest).includes('101 Jegs Place'),
+  'Redacted label evidence must omit the sender street',
+)
+assert.ok(
+  !JSON.stringify(legacyEvidence.redactedRequest).includes('101 Academy Drive'),
+  'Redacted label evidence must omit the destination street',
+)
+
+const upsZpl = '^XA^FO50,50^FDSANDBOX^FS^XZ'
 const upsCreateCalls = []
-const upsCreateResult = await createCarrierSandboxLabel(runtime('ups_rest', '03'), {
+const upsCreateResult = await createCarrierSandboxLabel(runtime('ups_rest', '03', {
+  shipmentFixture: normalizedShipmentFixture,
+}), {
   fetchImpl: async (url, init) => {
     upsCreateCalls.push({ url: String(url), init })
     return jsonResponse({
@@ -179,7 +247,7 @@ const upsCreateResult = await createCarrierSandboxLabel(runtime('ups_rest', '03'
             TrackingNumber: '1ZTRACKING0001',
             ShippingLabel: {
               ImageFormat: { Code: 'ZPL' },
-              GraphicImage: 'XlhBXkZPNTAsNTBeRkRTQU5EQk9YXkZT',
+              GraphicImage: Buffer.from(upsZpl, 'utf8').toString('base64'),
             },
           }],
         },
@@ -203,6 +271,14 @@ assert.equal(
   secrets.accountNumber,
 )
 assert.equal(upsCreateBody.ShipmentRequest.Shipment.Service.Code, '03')
+assert.deepEqual(
+  upsCreateBody.ShipmentRequest.Shipment.ShipFrom.Address.AddressLine,
+  ['500 Account Way', 'Suite 200'],
+)
+assert.deepEqual(
+  upsCreateBody.ShipmentRequest.Shipment.ShipTo.Address.AddressLine,
+  ['101 Academy Drive', 'Warehouse B'],
+)
 assert.equal(upsCreateBody.ShipmentRequest.LabelSpecification.LabelImageFormat.Code, 'ZPL')
 assert.equal(
   upsCreateBody.ShipmentRequest.LabelSpecification.HTTPUserAgent,
@@ -213,17 +289,34 @@ assert.deepEqual(plain({
   trackingNumber: upsCreateResult.trackingNumber,
   providerLabelId: upsCreateResult.providerLabelId,
   format: upsCreateResult.format,
+  payloadEncoding: upsCreateResult.payloadEncoding,
 }), {
   provider: 'ups_rest',
   trackingNumber: '1ZTRACKING0001',
   providerLabelId: '1ZSHIPMENT0001',
   format: 'ZPL',
+  payloadEncoding: 'utf8',
 })
+assert.equal(upsCreateResult.labelPayload, upsZpl)
+assert.equal(upsCreateResult.labelByteLength, Buffer.byteLength(upsZpl, 'utf8'))
+assert.equal(
+  upsCreateResult.labelContentSha256,
+  createHash('sha256').update(upsZpl, 'utf8').digest('hex'),
+)
+assert.equal(upsCreateResult.evidence.redactedResponse.payloadEncoding, 'utf8')
+assert.equal(upsCreateResult.evidence.redactedResponse.labelByteLength, Buffer.byteLength(upsZpl))
+assert.equal(
+  upsCreateResult.evidence.redactedResponse.labelContentSha256,
+  upsCreateResult.labelContentSha256,
+)
 assert.equal(upsCreateResult.evidence.providerReference, 'ups-create-transaction')
 assertEvidenceRedacted(upsCreateResult)
 
+const fedexPdf = Buffer.from('%PDF-1.4\n1 0 obj\n<<>>\nendobj\n%%EOF\n', 'ascii')
 const fedexCreateCalls = []
-const fedexCreateResult = await createCarrierSandboxLabel(runtime('fedex_rest', 'FEDEX_GROUND'), {
+const fedexCreateResult = await createCarrierSandboxLabel(runtime('fedex_rest', 'FEDEX_GROUND', {
+  shipmentFixture: normalizedShipmentFixture,
+}), {
   fetchImpl: async (url, init) => {
     fedexCreateCalls.push({ url: String(url), init })
     return jsonResponse({
@@ -233,11 +326,18 @@ const fedexCreateResult = await createCarrierSandboxLabel(runtime('fedex_rest', 
           masterTrackingNumber: 'MASTERTRACKING0002',
           pieceResponses: [{
             trackingNumber: 'TRACKING0002',
-            packageDocuments: [{
-              contentType: 'LABEL',
-              docType: 'PDF',
-              encodedLabel: 'JVBERi0xLjQKJVRlc3QK',
-            }],
+            packageDocuments: [
+              {
+                contentType: 'COMMERCIAL_INVOICE',
+                docType: 'PDF',
+                encodedLabel: Buffer.from('not the label').toString('base64'),
+              },
+              {
+                contentType: 'LABEL',
+                docType: 'PDF',
+                encodedLabel: fedexPdf.toString('base64'),
+              },
+            ],
           }],
         }],
       },
@@ -253,6 +353,14 @@ const fedexCreateBody = JSON.parse(fedexCreateCalls[0].init.body)
 assert.equal(fedexCreateBody.accountNumber.value, secrets.accountNumber)
 assert.equal(fedexCreateBody.requestedShipment.packagingType, 'YOUR_PACKAGING')
 assert.equal(fedexCreateBody.requestedShipment.shippingChargesPayment.paymentType, 'SENDER')
+assert.deepEqual(
+  fedexCreateBody.requestedShipment.shipper.address.streetLines,
+  ['500 Account Way', 'Suite 200'],
+)
+assert.deepEqual(
+  fedexCreateBody.requestedShipment.recipients[0].address.streetLines,
+  ['101 Academy Drive', 'Warehouse B'],
+)
 assert.equal(fedexCreateBody.requestedShipment.labelSpecification.imageType, 'PDF')
 assert.equal(fedexCreateBody.requestedShipment.labelSpecification.labelStockType, 'PAPER_4X6')
 assert.equal(fedexCreateBody.requestedShipment.requestedPackageLineItems.length, 1)
@@ -261,14 +369,99 @@ assert.deepEqual(plain({
   trackingNumber: fedexCreateResult.trackingNumber,
   providerLabelId: fedexCreateResult.providerLabelId,
   format: fedexCreateResult.format,
+  payloadEncoding: fedexCreateResult.payloadEncoding,
 }), {
   provider: 'fedex_rest',
   trackingNumber: 'TRACKING0002',
   providerLabelId: 'MASTERTRACKING0002',
   format: 'PDF',
+  payloadEncoding: 'base64',
 })
+assert.equal(fedexCreateResult.labelPayload, fedexPdf.toString('base64'))
+assert.equal(fedexCreateResult.labelByteLength, fedexPdf.byteLength)
+assert.equal(
+  fedexCreateResult.labelContentSha256,
+  createHash('sha256').update(fedexPdf).digest('hex'),
+)
+assert.equal(fedexCreateResult.evidence.redactedResponse.payloadEncoding, 'base64')
+assert.equal(fedexCreateResult.evidence.redactedResponse.labelByteLength, fedexPdf.byteLength)
+assert.equal(
+  fedexCreateResult.evidence.redactedResponse.labelContentSha256,
+  fedexCreateResult.labelContentSha256,
+)
 assert.equal(fedexCreateResult.evidence.providerReference, 'fedex-create-transaction')
 assertEvidenceRedacted(fedexCreateResult)
+
+await assert.rejects(
+  createCarrierSandboxLabel(runtime('ups_rest', '03'), {
+    fetchImpl: async () => jsonResponse({
+      ShipmentResponse: {
+        ShipmentResults: {
+          ShipmentIdentificationNumber: '1ZINVALIDZPL',
+          PackageResults: [{
+            TrackingNumber: '1ZINVALIDZPL',
+            ShippingLabel: {
+              ImageFormat: { Code: 'ZPL' },
+              GraphicImage: Buffer.from('^XA^FO20,20^FDMISSING END', 'utf8').toString('base64'),
+            },
+          }],
+        },
+      },
+    }),
+  }),
+  (error) => assertError(error, {
+    code: 'CARRIER_PROVIDER_RESPONSE_INVALID',
+    status: 502,
+    uncertain: true,
+  }),
+  'UPS label bytes must contain a complete ZPL ^XA/^XZ envelope',
+)
+
+await assert.rejects(
+  createCarrierSandboxLabel(runtime('fedex_rest', 'FEDEX_GROUND'), {
+    fetchImpl: async () => jsonResponse({
+      output: {
+        transactionShipments: [{
+          masterTrackingNumber: 'INVALIDPDF',
+          pieceResponses: [{
+            trackingNumber: 'INVALIDPDF',
+            packageDocuments: [{
+              encodedLabel: Buffer.from('not a PDF', 'utf8').toString('base64'),
+            }],
+          }],
+        }],
+      },
+    }),
+  }),
+  (error) => assertError(error, {
+    code: 'CARRIER_PROVIDER_RESPONSE_INVALID',
+    status: 502,
+    uncertain: true,
+  }),
+  'FedEx label bytes must begin with the PDF signature',
+)
+
+await assert.rejects(
+  createCarrierSandboxLabel(runtime('fedex_rest', 'FEDEX_GROUND'), {
+    fetchImpl: async () => jsonResponse({
+      output: {
+        transactionShipments: [{
+          masterTrackingNumber: 'INVALIDBASE64',
+          pieceResponses: [{
+            trackingNumber: 'INVALIDBASE64',
+            packageDocuments: [{ encodedLabel: 'not*base64' }],
+          }],
+        }],
+      },
+    }),
+  }),
+  (error) => assertError(error, {
+    code: 'CARRIER_PROVIDER_RESPONSE_INVALID',
+    status: 502,
+    uncertain: true,
+  }),
+  'Malformed provider base64 must be rejected before persistence',
+)
 
 const upsVoidCalls = []
 const upsVoidResult = await voidCarrierSandboxLabel({
@@ -299,29 +492,28 @@ assert.equal(upsVoidResult.trackingNumber, upsCreateResult.trackingNumber)
 assert.equal(upsVoidResult.providerReference, upsCreateResult.providerLabelId)
 assertEvidenceRedacted(upsVoidResult)
 
-const upsMaskedVoidResult = await voidCarrierSandboxLabel({
-  ...runtime('ups_rest', '03'),
-  trackingNumber: '1ZXXXXXXXXXXXXXXXX',
-  providerReference: '1ZXXXXXXXXXXXXXXXX',
-}, {
-  fetchImpl: async () => jsonResponse({
-    response: {
-      errors: [{
-        code: '190102',
-        message: 'No shipment found within the allowed void period',
-      }],
-    },
-  }, { status: 400 }),
-})
-assert.equal(upsMaskedVoidResult.voided, true)
-assert.deepEqual(plain(upsMaskedVoidResult.evidence.redactedResponse), {
-  trackingNumber: '1ZXXXXXXXXXXXXXXXX',
-  providerReference: '1ZXXXXXXXXXXXXXXXX',
-  voided: true,
-  providerState: 'not_found',
-  providerCode: '190102',
-})
-assertEvidenceRedacted(upsMaskedVoidResult)
+await assert.rejects(
+  voidCarrierSandboxLabel({
+    ...runtime('ups_rest', '03'),
+    trackingNumber: '1ZXXXXXXXXXXXXXXXX',
+    providerReference: '1ZXXXXXXXXXXXXXXXX',
+  }, {
+    fetchImpl: async () => jsonResponse({
+      response: {
+        errors: [{
+          code: '190102',
+          message: 'No shipment found within the allowed void period',
+        }],
+      },
+    }, { status: 400 }),
+  }),
+  (error) => assertError(error, {
+    code: 'CARRIER_SANDBOX_LABEL_VOID_REJECTED',
+    status: 409,
+    uncertain: false,
+  }),
+  'A provider not-found response must not be recorded as a confirmed void',
+)
 
 const fedexVoidCalls = []
 const fedexVoidResult = await voidCarrierSandboxLabel({
@@ -459,6 +651,10 @@ await assert.rejects(
       accountNumber: secrets.accountNumber,
       clientSecret: secrets.clientSecret,
       message: 'Provider rejected request',
+      errors: [{
+        code: 'INVALID_ACCOUNT',
+        message: `Rejected ${secrets.accountNumber} at a protected address`,
+      }],
     }, { status: 422 }),
   }),
   (error) => assertError(error, {

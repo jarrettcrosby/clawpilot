@@ -196,10 +196,19 @@ function verifySourceContracts() {
     'LEASE_EXPIRED',
     'physicalOutputVerified: false',
     'artifact.content_sha256 AS artifact_content_sha256',
-    'source_label.environment AS carrier_environment',
+    'COALESCE(source_label.environment, rate_test_label.environment)',
     'source_package.length_mm AS package_length_mm',
     "NULLIF(source_order.ship_to->>'name', '') AS ship_to_name",
     'warehouse.name AS warehouse_name',
+    "type: 'rate_test_label'",
+    'sourceRateTestLabelGlobalId',
+    'decodeStoredOperationsLabelPayload',
+    'strictBase64Bytes',
+    'rate_test_label.label_payload AS rate_test_label_payload',
+    'cancelVoidedRateTestLabelJobs',
+    'artifact.source_rate_test_label_id IS NULL',
+    'original.rate_test_label_id',
+    'OPERATIONS_PRINT_ARTIFACT_CORRUPT',
   ]) {
     assert.ok(
       persistence.includes(fragment),
@@ -274,6 +283,81 @@ function verifySourceContracts() {
     helpers.operationsPrintDeliveryFingerprint({ b: 2, a: 1 }),
     helpers.operationsPrintDeliveryFingerprint({ a: 1, b: 2 }),
     'Request fingerprints must be independent of object key order',
+  )
+
+  const rawZpl = '^XA\n^FO20,20^FDClawPilot^FS\n^XZ'
+  const legacyBase64Zpl = Buffer.from(rawZpl, 'utf8').toString('base64')
+  assert.equal(
+    Buffer.from(helpers.decodeStoredOperationsLabelPayload({
+      format: 'ZPL',
+      payload: rawZpl,
+    })).toString('utf8'),
+    rawZpl,
+    'Canonical UTF-8 ZPL must remain unchanged',
+  )
+  assert.equal(
+    Buffer.from(helpers.decodeStoredOperationsLabelPayload({
+      format: 'ZPL',
+      payload: legacyBase64Zpl,
+    })).toString('utf8'),
+    rawZpl,
+    'Legacy base64-encoded ZPL must decode before artifact hashing and delivery',
+  )
+
+  const pdf = Buffer.from('%PDF-1.7\nClawPilot\n%%EOF\n', 'ascii')
+  const png = Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    Buffer.from('ClawPilot', 'ascii'),
+  ])
+  for (const [format, bytes] of [['PDF', pdf], ['PNG', png]]) {
+    const decoded = helpers.decodeStoredOperationsLabelPayload({
+      format,
+      payload: bytes.toString('base64'),
+    })
+    assert.equal(Buffer.from(decoded).toString('hex'), bytes.toString('hex'))
+    const claim = helpers.encodeOperationsPrintClaimPayload({
+      format,
+      rateTestLabelPayload: bytes,
+      labelPayload: null,
+      artifactPayload: null,
+    })
+    assert.equal(claim.encoding, 'base64')
+    assert.equal(claim.inlinePayload, bytes.toString('base64'))
+  }
+  const zplClaim = helpers.encodeOperationsPrintClaimPayload({
+    format: 'ZPL',
+    rateTestLabelPayload: Buffer.from(rawZpl, 'utf8'),
+    labelPayload: null,
+    artifactPayload: null,
+  })
+  assert.equal(zplClaim.encoding, 'utf8')
+  assert.equal(zplClaim.inlinePayload, rawZpl)
+
+  assert.throws(
+    () => helpers.decodeStoredOperationsLabelPayload({
+      format: 'ZPL',
+      payload: Buffer.from('not-zpl', 'utf8').toString('base64'),
+    }),
+    /declared format/,
+    'Base64 text that does not decode to a ZPL envelope must fail closed',
+  )
+  assert.throws(
+    () => helpers.decodeStoredOperationsLabelPayload({
+      format: 'PDF',
+      payload: legacyBase64Zpl,
+    }),
+    /declared format/,
+    'A payload signature mismatch must fail closed',
+  )
+  assert.throws(
+    () => helpers.encodeOperationsPrintClaimPayload({
+      format: 'PNG',
+      rateTestLabelPayload: pdf,
+      labelPayload: null,
+      artifactPayload: null,
+    }),
+    /declared format/,
+    'Stored rate-test bytes must match the declared format before delivery',
   )
 }
 
