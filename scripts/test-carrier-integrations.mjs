@@ -213,6 +213,10 @@ for (const fragment of [
   'billingRelationship: selection.relationship',
   'billingSelectionSnapshot: selection.snapshot',
   'senderName: selection.account.senderName',
+  'senderBillingOnly: true',
+  'buildCarrierSandboxRateFixture',
+  'destination: input.destination',
+  'redactedSandboxRateBillingSelection',
 ]) {
   assert.ok(service.includes(fragment), `Carrier service contract missing ${fragment}`)
 }
@@ -245,7 +249,20 @@ for (const fragment of [
   "action === 'update-account'",
   "action === 'set-account-status'",
   "action === 'delete-account'",
+  "action === 'create-rate-test-label'",
+  "action === 'print-rate-test-label'",
+  "action === 'void-rate-test-label'",
+  'requireExecutor(actor)',
+  "'CARRIER_EXECUTE_REQUIRED'",
+  'listOperationsPrinterProfilesInPostgres',
+  'safeRateTestPrinter',
+  'safeRateTestLabel',
+  'error instanceof OperationsRequestError',
+  "printer.connectionMode === 'local_agent'",
+  "printer.localPrintAgentStatus === 'active'",
+  "printer.supportedDocumentTypes.includes('shipping_label')",
   "'carrierAccountGlobalId'",
+  "'destination'",
   "'senderName'",
   'sanitizedCarrierIntegrationError',
   'operationsCapabilities(actor).canManage',
@@ -258,6 +275,42 @@ for (const fragment of [
   assert.ok(route.includes(fragment), `Carrier API contract missing ${fragment}`)
 }
 assert.ok(!route.includes('permissions.manageUserAccess'), 'Carrier management must use operations permission')
+const safeRateTestPrinterMapper = route.slice(
+  route.indexOf('function safeRateTestPrinter'),
+  route.indexOf('export async function GET'),
+)
+for (const forbidden of ['id: printer.id', 'warehouseId: printer.warehouseId']) {
+  assert.ok(
+    !safeRateTestPrinterMapper.includes(forbidden),
+    `Carrier GET printer payload must not expose ${forbidden}`,
+  )
+}
+assert.ok(
+  safeRateTestPrinterMapper.includes('globalId: printer.globalId')
+    && safeRateTestPrinterMapper.includes('warehouseGlobalId: printer.warehouseGlobalId'),
+  'Carrier GET must identify compatible printers with safe global references',
+)
+const safeRateTestLabelMapper = route.slice(
+  route.indexOf('function safeRateTestLabel'),
+  route.indexOf('export async function GET'),
+)
+for (const forbidden of [
+  'createAttemptGlobalId',
+  'voidAttemptGlobalId',
+  'carrierAccountGlobalId',
+  'credentialVersion',
+  'labelPayload',
+]) {
+  assert.ok(
+    !safeRateTestLabelMapper.includes(forbidden),
+    `Carrier GET label payload must not expose ${forbidden}`,
+  )
+}
+assert.ok(
+  safeRateTestLabelMapper.includes('contentSha256: label.contentSha256')
+    && safeRateTestLabelMapper.includes('byteLength: label.byteLength'),
+  'Carrier GET label history must expose safe integrity metadata without stored bytes',
+)
 
 const panel = read('app_src/components/settings/CarrierIntegrationPanel.tsx')
 for (const fragment of [
@@ -276,10 +329,14 @@ for (const fragment of [
   'Copy client secret',
   'setRevealedCredential(null)',
   'Test sandbox rate',
-  '101 Jegs Place',
-  '101 Academy Drive',
-  'Test Product',
-  'Rating only',
+  'Read-only sender',
+  'Test destination',
+  'Destination address line 1',
+  'Destination address line 2',
+  'Destination ZIP code',
+  'Fixed parcel: Test Product',
+  'Rating returns prices only',
+  'No label media',
   'Disconnect',
   'Billing accounts',
   'Sender: {entry.senderName}',
@@ -290,6 +347,25 @@ for (const fragment of [
   'delete-account',
   'Sandbox billing account',
   'carrierAccountGlobalId: selectedCarrierAccountGlobalId',
+  'destination: rateDestination',
+  'destinationFingerprint',
+  'Sandbox label test workflow',
+  "['Rate', 'Create label', 'Print stored label', 'Void']",
+  "action: 'create-rate-test-label'",
+  "action: 'print-rate-test-label'",
+  "action: 'void-rate-test-label'",
+  'rateEvidenceGlobalId: rateTest.evidenceGlobalId',
+  'selectedRate.serviceCode',
+  'Create and store sandbox label',
+  'Test print stored label',
+  'Void exact sandbox label',
+  'Label metadata is durable and safe to review.',
+  'Label bytes and internal database identifiers',
+  'Printing queues the label bytes already stored in ClawPilot.',
+  'It does not call the carrier,',
+  "entry.connectionMode === 'local_agent'",
+  "entry.localPrintAgentStatus === 'active'",
+  "entry.supportedDocumentTypes.includes('shipping_label')",
 ]) {
   assert.ok(panel.includes(fragment), `Carrier settings UI missing ${fragment}`)
 }
@@ -300,6 +376,21 @@ assert.ok(
 assert.ok(
   panel.includes("Math.max(0, Date.parse(revealedCredential.expiresAt) - Date.now())"),
   'Revealed credentials must be removed from the browser after their server-defined expiry',
+)
+const browserSafeRateTestLabel = panel.slice(
+  panel.indexOf('type CarrierRateTestLabel ='),
+  panel.indexOf('type CarrierRateTestPrinter ='),
+)
+for (const forbidden of ['labelPayload', 'providerLabelId', 'integrationAccountId', 'carrierAccountId']) {
+  assert.ok(
+    !browserSafeRateTestLabel.includes(forbidden),
+    `Carrier browser label payload must not expose ${forbidden}`,
+  )
+}
+assert.ok(
+  browserSafeRateTestLabel.includes('contentSha256: string')
+    && browserSafeRateTestLabel.includes('byteLength: number'),
+  'Carrier browser label history may expose integrity metadata, not label bytes',
 )
 const revealPersistence = persistence.slice(
   persistence.indexOf('export async function recordCarrierCredentialRevealInPostgres'),
@@ -647,12 +738,93 @@ assert.deepEqual(JSON.parse(JSON.stringify(fixture)), {
   },
 })
 
+const editableDestination = {
+  name: '  Test   Receiver  ',
+  line1: ' 500 Test Avenue ',
+  line2: ' Suite 200 ',
+  city: ' Columbus ',
+  region: 'oh',
+  postalCode: '43215-1234',
+  countryCode: 'us',
+}
+const editableFixture = sandboxRateModule.buildCarrierSandboxRateFixture({
+  senderName: 'Jegs Test Sender',
+  registeredAddress: carrierAccountAddress,
+  destination: editableDestination,
+})
+assert.deepEqual(JSON.parse(JSON.stringify(editableFixture)), {
+  origin: {
+    name: 'Jegs Test Sender',
+    line1: '101 Jegs Place',
+    line2: null,
+    city: 'Delaware',
+    region: 'OH',
+    postalCode: '43015',
+    countryCode: 'US',
+  },
+  destination: {
+    name: 'Test Receiver',
+    line1: '500 Test Avenue',
+    line2: 'Suite 200',
+    city: 'Columbus',
+    region: 'OH',
+    postalCode: '43215-1234',
+    countryCode: 'US',
+  },
+  parcel: JSON.parse(JSON.stringify(fixture.parcel)),
+})
+const destinationFingerprint = sandboxRateModule.carrierSandboxPartyFingerprint(
+  editableFixture.destination,
+)
+assert.match(destinationFingerprint, /^[a-f0-9]{64}$/)
+assert.equal(
+  destinationFingerprint,
+  sandboxRateModule.carrierSandboxPartyFingerprint({
+    ...editableFixture.destination,
+    name: ' Test   Receiver ',
+    line1: ' 500   Test Avenue ',
+  }),
+  'party fingerprints must use the exact normalized canonical shape',
+)
+assert.notEqual(
+  destinationFingerprint,
+  sandboxRateModule.carrierSandboxPartyFingerprint({
+    ...editableFixture.destination,
+    postalCode: '43215',
+  }),
+  'party fingerprints must change when a normalized address field changes',
+)
+assert.throws(
+  () => sandboxRateModule.normalizeCarrierSandboxParty({
+    ...editableFixture.destination,
+    unexpected: 'not allowed',
+  }),
+  /field is not supported/,
+  'destination objects must reject unexpected nested fields',
+)
+assert.throws(
+  () => sandboxRateModule.normalizeCarrierSandboxParty({
+    ...editableFixture.destination,
+    countryCode: 'CA',
+  }),
+  /supports US addresses only/,
+  'sandbox rating destinations must remain US-only',
+)
+assert.throws(
+  () => sandboxRateModule.normalizeCarrierSandboxParty({
+    ...editableFixture.destination,
+    postalCode: 'invalid',
+  }),
+  /five or nine digit US ZIP code/,
+  'sandbox rating destinations must validate US ZIP codes',
+)
+
 const fedexRate = await sandboxRateModule.requestCarrierSandboxRates({
   provider: 'fedex_rest',
   environment: 'sandbox',
   credential,
 }, {
-  senderName: 'Jegs Test Sender',
+  fixture: editableFixture,
   fetchImpl: async (url, init) => {
     rateRequests.push({ url: String(url), init })
     return new Response(JSON.stringify({
@@ -686,7 +858,10 @@ assert.equal(fedexRequest.accountNumber.value, credential.accountNumber)
 assert.equal(fedexRequest.requestedShipment.shipper.contact.personName, 'Jegs Test Sender')
 assert.equal(fedexRequest.requestedShipment.shipper.contact.companyName, 'Jegs Test Sender')
 assert.equal(fedexRequest.requestedShipment.shipper.address.streetLines[0], '101 Jegs Place')
-assert.equal(fedexRequest.requestedShipment.recipient.address.streetLines[0], '101 Academy Drive')
+assert.deepEqual(fedexRequest.requestedShipment.recipient.address.streetLines, [
+  '500 Test Avenue',
+  'Suite 200',
+])
 assert.equal(fedexRequest.requestedShipment.requestedPackageLineItems[0].itemDescription, 'Test Product')
 assert.deepEqual(JSON.parse(JSON.stringify(fedexRate.result.rates)), [{
   serviceCode: 'FEDEX_GROUND',
@@ -699,13 +874,14 @@ assert.deepEqual(JSON.parse(JSON.stringify(fedexRate.result.rates)), [{
 }])
 assert.equal(fedexRate.evidence.providerReference, 'fedex-rate-reference')
 assert.equal(fedexRate.result.fixture.origin.name, 'Jegs Test Sender')
+assert.equal(fedexRate.result.destinationFingerprint, destinationFingerprint)
 
 const upsRate = await sandboxRateModule.requestCarrierSandboxRates({
   provider: 'ups_rest',
   environment: 'sandbox',
   credential,
 }, {
-  senderName: 'Jegs Test Sender',
+  fixture: editableFixture,
   fetchImpl: async (url, init) => {
     rateRequests.push({ url: String(url), init })
     return new Response(JSON.stringify({
@@ -743,7 +919,10 @@ assert.equal(
   credential.accountNumber,
 )
 assert.equal(upsRequest.RateRequest.Shipment.ShipFrom.Address.AddressLine[0], '101 Jegs Place')
-assert.equal(upsRequest.RateRequest.Shipment.ShipTo.Address.AddressLine[0], '101 Academy Drive')
+assert.deepEqual(upsRequest.RateRequest.Shipment.ShipTo.Address.AddressLine, [
+  '500 Test Avenue',
+  'Suite 200',
+])
 assert.equal(upsRequest.RateRequest.Shipment.Package[0].Description, 'Test Product')
 assert.deepEqual(JSON.parse(JSON.stringify(upsRate.result.rates)), [{
   serviceCode: '03',
@@ -756,6 +935,7 @@ assert.deepEqual(JSON.parse(JSON.stringify(upsRate.result.rates)), [{
 }])
 assert.equal(upsRate.evidence.providerReference, 'ups-rate-reference')
 assert.equal(upsRate.result.fixture.origin.name, 'Jegs Test Sender')
+assert.equal(upsRate.result.destinationFingerprint, destinationFingerprint)
 
 for (const value of [fedexRate, upsRate]) {
   const serialized = JSON.stringify(value)
@@ -764,6 +944,40 @@ for (const value of [fedexRate, upsRate]) {
   assert.ok(!serialized.includes(credential.clientSecret), 'Rate result/evidence must redact client secrets')
   assert.ok(!serialized.includes('short-lived-rate-token-must-not-leak'), 'Rate result/evidence must redact tokens')
 }
+
+for (const value of [fedexRate.evidence.redactedRequest, upsRate.evidence.redactedRequest]) {
+  const serialized = JSON.stringify(value)
+  assert.equal(value.shipment.destinationFingerprint, destinationFingerprint)
+  assert.equal(
+    value.shipment.originFingerprint,
+    sandboxRateModule.carrierSandboxPartyFingerprint(editableFixture.origin),
+  )
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(value.shipment.parcel)),
+    JSON.parse(JSON.stringify(fixture.parcel)),
+  )
+  for (const pii of [
+    editableFixture.origin.name,
+    editableFixture.origin.line1,
+    editableFixture.origin.city,
+    editableFixture.origin.postalCode,
+    editableFixture.destination.name,
+    editableFixture.destination.line1,
+    editableFixture.destination.line2,
+    editableFixture.destination.city,
+    editableFixture.destination.postalCode,
+  ]) {
+    assert.ok(!serialized.includes(pii), `Durable rate evidence must redact address value ${pii}`)
+  }
+}
+assert.notEqual(
+  fedexRate.evidence.requestHash,
+  sandboxRateModule.carrierSandboxRateRequestEvidence('fedex_rest', {
+    ...editableFixture,
+    destination: { ...editableFixture.destination, postalCode: '43215' },
+  }).requestHash,
+  'the provider request hash must bind the exact normalized destination',
+)
 
 await assert.rejects(
   sandboxRateModule.requestCarrierSandboxRates({

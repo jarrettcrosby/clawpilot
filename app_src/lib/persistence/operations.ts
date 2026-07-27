@@ -1056,9 +1056,11 @@ async function ensureProofConfiguration(
     await client.query(
       `INSERT INTO operations_product_mappings (
          organization_id, integration_account_id, pipeline_id, product_id,
-         channel_sku, external_product_id, active, created_by
+       channel_sku, external_product_id, active, created_by
        ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, true, $7)
        ON CONFLICT (organization_id, integration_account_id, channel_sku)
+       WHERE channel_sku IS NOT NULL
+         AND mapping_method = 'legacy_sku'
        DO UPDATE SET pipeline_id = EXCLUDED.pipeline_id, product_id = EXCLUDED.product_id,
          external_product_id = EXCLUDED.external_product_id, active = true, updated_at = now()`,
       [
@@ -3520,6 +3522,8 @@ export async function updateOperationsActivationInPostgres(input: {
   actorEmail: string
   state: OperationsActivationState
   reason?: string | null
+  expectedCurrentState?: OperationsActivationState | 'missing'
+  expectedCurrentRevision?: number | null
 }): Promise<OperationsActivationUpdateResult> {
   const organizationId = requireOrganizationId(input.organizationId)
   const actorEmail = trimmed(input.actorEmail, 320).toLowerCase()
@@ -3531,6 +3535,30 @@ export async function updateOperationsActivationInPostgres(input: {
 
   return withTransaction(async (client) => {
     await acquireTransactionAdvisoryLock(client, `operations:activation:${organizationId}`)
+    if (input.expectedCurrentState !== undefined) {
+      const observed = await client.query<{
+        state: OperationsActivationState
+        revision: number
+      }>(
+        `SELECT state, revision
+         FROM operations_activation_scopes
+         WHERE organization_id = $1::uuid
+         FOR UPDATE`,
+        [organizationId],
+      )
+      const row = observed.rows[0] || null
+      const exactMatch = input.expectedCurrentState === 'missing'
+        ? row === null && input.expectedCurrentRevision === null
+        : row?.state === input.expectedCurrentState
+          && row.revision === input.expectedCurrentRevision
+      if (!exactMatch) {
+        throw new OperationsRequestError(
+          'OPERATIONS_ACTIVATION_STATE_CONFLICT',
+          'Operations activation changed after this workflow loaded; review its current mode before continuing',
+          409,
+        )
+      }
+    }
     const current = await resolveActivation(client, organizationId, true)
     if (input.state === 'active') {
       const providers = await client.query<QueryResultRow & { integration_type: string }>(

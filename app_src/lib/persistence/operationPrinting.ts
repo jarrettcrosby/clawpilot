@@ -272,6 +272,10 @@ async function localPrintAgentId(input: {
   localPrintAgentGlobalId: string | null
   connectionMode: OperationsPrinterInput['connectionMode']
   status: OperationsPrinterInput['status']
+  printer: Pick<
+    OperationsPrinterInput,
+    'supportedFormats' | 'supportedMedia' | 'supportedDocumentTypes'
+  >
 }) {
   if (!input.localPrintAgentGlobalId) {
     if (input.connectionMode === 'local_agent' && input.status === 'online') {
@@ -288,8 +292,14 @@ async function localPrintAgentId(input: {
       'Only local-agent printer profiles can be assigned to a print agent',
     )
   }
-  const result = await input.client.query<{ id: string }>(
-    `SELECT id::text
+  const result = await input.client.query<{
+    id: string
+    supported_formats: string[]
+    supported_media: string[]
+    supported_document_types: string[]
+  }>(
+    `SELECT id::text, supported_formats, supported_media,
+       supported_document_types
      FROM operations_print_agents
      WHERE organization_id = $1::uuid
        AND warehouse_id = $2::uuid
@@ -308,7 +318,24 @@ async function localPrintAgentId(input: {
       'Print agent must be active and enrolled for the same warehouse',
     )
   }
-  return result.rows[0].id
+  const agent = result.rows[0]
+  if (
+    input.printer.supportedFormats.some((value) => (
+      !agent.supported_formats.includes(value)
+    ))
+    || input.printer.supportedMedia.some((value) => (
+      !agent.supported_media.includes(value)
+    ))
+    || input.printer.supportedDocumentTypes.some((value) => (
+      !agent.supported_document_types.includes(value)
+    ))
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PRINTER_AGENT_CAPABILITIES_INCOMPATIBLE',
+      'Printer document, media, and format capabilities must be a subset of the assigned print agent',
+    )
+  }
+  return agent.id
 }
 
 async function removeConflictingDefaults(input: {
@@ -430,6 +457,7 @@ export async function saveOperationsPrinterInPostgres(input: {
         localPrintAgentGlobalId: input.printer.localPrintAgentGlobalId,
         connectionMode: input.printer.connectionMode,
         status: input.printer.status,
+        printer: input.printer,
       })
       await removeConflictingDefaults({
         client,

@@ -1989,7 +1989,10 @@ async function upsertProductMappings(client, scope, scenario, integration, produ
          channel_sku, external_product_id, active, created_by, updated_at
        )
        VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, true, $7, now())
-       ON CONFLICT (organization_id, integration_account_id, channel_sku) DO UPDATE SET
+       ON CONFLICT (organization_id, integration_account_id, channel_sku)
+       WHERE channel_sku IS NOT NULL
+         AND mapping_method = 'legacy_sku'
+       DO UPDATE SET
          pipeline_id = EXCLUDED.pipeline_id,
          product_id = EXCLUDED.product_id,
          external_product_id = EXCLUDED.external_product_id,

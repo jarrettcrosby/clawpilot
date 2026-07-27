@@ -1,6 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import {
+  PRINT_DOCUMENT_TYPES,
+  PRINT_FORMATS,
+  PRINT_MEDIA,
+  type PrintAgentCapabilities,
+} from '@/lib/operations/printing'
+import {
   acknowledgeOperationsPrintJobInPostgres,
   authenticateOperationsPrintAgentInPostgres,
   claimOperationsPrintJobsInPostgres,
@@ -16,7 +22,7 @@ const MAX_REQUEST_BYTES = 8 * 1024
 const JOB_GLOBAL_ID = /^gpj\d{7}$/
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const ACTION_FIELDS: Record<string, Set<string>> = {
-  claim: new Set(['action', 'limit', 'leaseSeconds']),
+  claim: new Set(['action', 'limit', 'leaseSeconds', 'capabilities']),
   acknowledge: new Set(['action', 'jobGlobalId', 'claimToken', 'deviceJobReference']),
   fail: new Set([
     'action', 'jobGlobalId', 'claimToken', 'errorCode', 'errorMessage',
@@ -43,6 +49,68 @@ function text(value: unknown, label: string, max: number) {
     requestError('OPERATIONS_PRINT_AGENT_REQUEST_INVALID', `${label} is invalid`)
   }
   return parsed
+}
+
+function capabilityList<T extends string>(
+  value: unknown,
+  label: string,
+  supported: readonly T[],
+) {
+  if (
+    !Array.isArray(value)
+    || value.length === 0
+    || value.length > supported.length
+  ) {
+    requestError('OPERATIONS_PRINT_AGENT_CAPABILITIES_INVALID', `${label} are invalid`)
+  }
+  const parsed = value.map((entry) => String(entry || '').trim() as T)
+  if (
+    parsed.some((entry) => !supported.includes(entry))
+    || new Set(parsed).size !== parsed.length
+  ) {
+    requestError('OPERATIONS_PRINT_AGENT_CAPABILITIES_INVALID', `${label} are invalid`)
+  }
+  return parsed
+}
+
+function runtimeCapabilities(value: unknown): PrintAgentCapabilities {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    requestError(
+      'OPERATIONS_PRINT_AGENT_CAPABILITIES_REQUIRED',
+      'Claim requests require an explicit runtime capability declaration',
+    )
+  }
+  const capabilities = value as Record<string, unknown>
+  if (
+    Object.keys(capabilities).some((field) => (
+      !['formats', 'media', 'documentTypes'].includes(field)
+    ))
+    || !Object.prototype.hasOwnProperty.call(capabilities, 'formats')
+    || !Object.prototype.hasOwnProperty.call(capabilities, 'media')
+    || !Object.prototype.hasOwnProperty.call(capabilities, 'documentTypes')
+  ) {
+    requestError(
+      'OPERATIONS_PRINT_AGENT_CAPABILITIES_INVALID',
+      'Runtime capabilities must include only formats, media, and documentTypes',
+    )
+  }
+  return {
+    supportedFormats: capabilityList(
+      capabilities.formats,
+      'Runtime formats',
+      PRINT_FORMATS,
+    ),
+    supportedMedia: capabilityList(
+      capabilities.media,
+      'Runtime media',
+      PRINT_MEDIA,
+    ),
+    supportedDocumentTypes: capabilityList(
+      capabilities.documentTypes,
+      'Runtime document types',
+      PRINT_DOCUMENT_TYPES,
+    ),
+  }
 }
 
 function bearer(req: NextRequest) {
@@ -160,11 +228,13 @@ export async function POST(req: NextRequest) {
           'Claim lease is invalid',
         )
       }
+      const capabilities = runtimeCapabilities(command.value.capabilities)
       const jobs = await claimOperationsPrintJobsInPostgres({
         agent,
         idempotencyKey: idempotencyKey(req),
         limit,
         leaseSeconds,
+        runtimeCapabilities: capabilities,
       })
       return json({ ok: true, jobs })
     }

@@ -78,6 +78,8 @@ type CommonStageInput = {
 
 export type StageOrganizationInput = CommonStageInput & {
   entity: 'organizations'
+  identityKeyOverride?: string
+  createOnly?: boolean
   fields: {
     parentOrganizationId?: string | null
     parentOrganizationSuiteCrmId?: string | null
@@ -875,24 +877,9 @@ async function stageOrganization(
       fields.workspaceOrganizationReferenceCode,
     )
   }
-  const result = await client.query<{ id: string; suitecrm_id: string; reference_code: string }>(
-    `
-      INSERT INTO crm_organizations (
-        pipeline_id, suitecrm_id, source_key, identity_key, reference_code, parent_organization_id,
-        workspace_organization_id, relationship_type, source_sheet_id, source_row_number,
-        priority, name, account_type, account_manager, website, linkedin_url, phone, email, email_opt_out,
-        billing_address_street, billing_address_city, billing_address_state,
-        billing_address_postal_code, billing_address_country, description,
-        source_payload, source_hash, sync_status, sync_error, created_by, updated_by
-      )
-      VALUES (
-        $1::uuid, $2, $3, $3,
-        COALESCE((SELECT reference_code FROM crm_organizations WHERE pipeline_id = $1::uuid AND identity_key = $3), allocate_crm_reference('ga')),
-        $4::uuid, $5::uuid, $6, $7, $8, $9, $10, $11,
-        $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24::jsonb, $25,
-        'pending', NULL, $26, $26
-      )
-      ON CONFLICT (pipeline_id, identity_key) DO UPDATE SET
+  const conflictAction = input.createOnly
+    ? 'DO NOTHING'
+    : `DO UPDATE SET
         suitecrm_id = COALESCE(crm_organizations.suitecrm_id, EXCLUDED.suitecrm_id),
         source_key = EXCLUDED.source_key,
         parent_organization_id = EXCLUDED.parent_organization_id,
@@ -920,7 +907,25 @@ async function stageOrganization(
         sync_status = CASE WHEN crm_organizations.source_hash IS DISTINCT FROM EXCLUDED.source_hash THEN 'pending' ELSE crm_organizations.sync_status END,
         sync_error = CASE WHEN crm_organizations.source_hash IS DISTINCT FROM EXCLUDED.source_hash THEN NULL ELSE crm_organizations.sync_error END,
         updated_by = EXCLUDED.updated_by,
-        updated_at = now()
+        updated_at = now()`
+  const result = await client.query<{ id: string; suitecrm_id: string; reference_code: string }>(
+    `
+      INSERT INTO crm_organizations (
+        pipeline_id, suitecrm_id, source_key, identity_key, reference_code, parent_organization_id,
+        workspace_organization_id, relationship_type, source_sheet_id, source_row_number,
+        priority, name, account_type, account_manager, website, linkedin_url, phone, email, email_opt_out,
+        billing_address_street, billing_address_city, billing_address_state,
+        billing_address_postal_code, billing_address_country, description,
+        source_payload, source_hash, sync_status, sync_error, created_by, updated_by
+      )
+      VALUES (
+        $1::uuid, $2, $3, $3,
+        COALESCE((SELECT reference_code FROM crm_organizations WHERE pipeline_id = $1::uuid AND identity_key = $3), allocate_crm_reference('ga')),
+        $4::uuid, $5::uuid, $6, $7, $8, $9, $10, $11,
+        $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24::jsonb, $25,
+        'pending', NULL, $26, $26
+      )
+      ON CONFLICT (pipeline_id, identity_key) ${conflictAction}
       RETURNING id::text, suitecrm_id, reference_code
     `,
     [
@@ -933,6 +938,11 @@ async function stageOrganization(
       JSON.stringify(input.sourcePayload || {}), sourceHash, input.actorEmail,
     ],
   )
+  if (!result.rows[0]) {
+    throw new Error(
+      'CRM organization identity already exists; select the existing organization',
+    )
+  }
   return applyWorkspaceOrganizationIdentity(
     client,
     result.rows[0],
@@ -2124,10 +2134,29 @@ export async function stageCrmRecordWithClient(client: PoolClient, rawInput: Sta
     contactAliases = contactResolution.aliases
   }
   const identityKey = input.entity === 'organizations'
-    ? organizationIdentityKey(input.fields)
+    ? clean(input.identityKeyOverride)
+      || organizationIdentityKey(input.fields)
     : input.entity === 'contacts'
       ? contactIdentityKey(input.fields)
       : null
+  if (
+    input.entity === 'organizations'
+    && input.identityKeyOverride
+    && !input.createOnly
+  ) {
+    throw new Error(
+      'A custom CRM organization identity requires create-only persistence',
+    )
+  }
+  if (
+    input.entity === 'organizations'
+    && input.createOnly
+    && input.localId
+  ) {
+    throw new Error(
+      'Create-only CRM organization persistence cannot target an existing record',
+    )
+  }
   const sourceKey = identityKey || clean(input.sourceKey)
   if (!sourceKey || sourceKey.length > 500) throw new Error('CRM source key is invalid')
   const suiteCrmId = (

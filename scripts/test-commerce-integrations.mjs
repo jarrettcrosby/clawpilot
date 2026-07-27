@@ -377,7 +377,7 @@ includes(adminRoute, [
   'requireRequestSession(req)',
   "'Cache-Control': 'no-store, max-age=0'",
   'domainWorkersActivated: false',
-  'canonicalOrderImport: false',
+  'canonicalOrderImport: commerceIntakeRuntimeAvailable()',
   'inventoryMutation: false',
   'fulfillmentExport: false',
   'acceptedReceiptTopics: SHOPIFY_CONTROL_PLANE_WEBHOOK_TOPICS',
@@ -659,7 +659,7 @@ assert.throws(
 )
 assert.equal(
   capabilities.CLAWPILOT_SHOPIFY_CAPABILITY_IMPLEMENTATION.order_import,
-  'not_implemented',
+  'control_plane_implemented',
 )
 assert.equal(
   capabilities.CLAWPILOT_SHOPIFY_CAPABILITY_IMPLEMENTATION.webhook_verification,
@@ -667,7 +667,7 @@ assert.equal(
 )
 assert.equal(
   capabilities.CLAWPILOT_FAIRE_CAPABILITY_IMPLEMENTATION.order_import,
-  'not_implemented',
+  'control_plane_implemented',
 )
 assert.equal(
   capabilities.CLAWPILOT_FAIRE_CAPABILITY_IMPLEMENTATION.oauth_authentication,
@@ -1134,10 +1134,18 @@ const faireApi = faireClient.createFaireCommerceClient({
       return new Response(JSON.stringify({
         inventories: {
           product_variant_123: {
-            on_hand_quantity: { type: 'QUANTITY', quantity: 18 },
+            on_hand_quantity: { type: 'QUANTITY', quantity: -1 },
             committed_quantity: { type: 'QUANTITY', quantity: 3 },
-            available_quantity: { type: 'QUANTITY', quantity: 15 },
+            available_quantity: { type: 'QUANTITY', quantity: -4 },
           },
+        },
+      }), { status: 200 })
+    }
+    if (requestUrl.endsWith('/orders/order_123')) {
+      return new Response(JSON.stringify({
+        order: {
+          id: 'order_123',
+          state: 'NEW',
         },
       }), { status: 200 })
     }
@@ -1164,14 +1172,38 @@ assert.deepEqual(
   JSON.parse(JSON.stringify(
     faireInventory.inventories.product_variant_123.available_quantity,
   )),
-  { type: 'QUANTITY', quantity: 15 },
+  { type: 'QUANTITY', quantity: -4 },
 )
 assert.equal(
   faireRequests[1].url,
   'https://www.faire.com/external-api/v2/product-inventory/by-product-variant-ids?ids=product_variant_123',
 )
+const faireOrder = await faireApi.getOrder('order_123')
+assert.equal(faireOrder.id, 'order_123')
+assert.equal(
+  faireRequests[2].url,
+  'https://www.faire.com/external-api/v2/orders/order_123',
+)
 assert.equal('registerWebhook' in faireApi, false)
 assert.equal('writeReturn' in faireApi, false)
+
+const invalidCommittedFaireApi = faireClient.createFaireCommerceClient({
+  accessToken: 'faire-brand-token-1234567890',
+  fetchImpl: async () => new Response(JSON.stringify({
+    inventories: {
+      product_variant_123: {
+        committed_quantity: { type: 'QUANTITY', quantity: -1 },
+      },
+    },
+  }), { status: 200 }),
+})
+await assert.rejects(
+  invalidCommittedFaireApi.listInventory({
+    productVariantIds: ['product_variant_123'],
+  }),
+  (error) => error.code === 'FAIRE_RESPONSE_INVALID',
+  'Faire committed inventory must remain nonnegative',
+)
 
 const faireOauthRequests = []
 const faireOauthApi = faireClient.createFaireCommerceClient({
@@ -1888,6 +1920,16 @@ includes(healthRoute, [
   'AS operations_shopify_order_preview_migration_applied',
   '&& row?.operations_shopify_order_preview_migration_applied',
   '|| !row?.operations_shopify_order_preview_migration_applied',
+  'operations_commerce_normalization_migration_applied: boolean',
+  "filename = '0114_operations_commerce_normalization.sql'",
+  'AS operations_commerce_normalization_migration_applied',
+  '&& row?.operations_commerce_normalization_migration_applied',
+  '|| !row?.operations_commerce_normalization_migration_applied',
+  'operations_commerce_continuations_migration_applied: boolean',
+  "filename = '0115_operations_commerce_intake_continuations.sql'",
+  'AS operations_commerce_continuations_migration_applied',
+  '&& row?.operations_commerce_continuations_migration_applied',
+  '|| !row?.operations_commerce_continuations_migration_applied',
 ], 'Shopify order-preview health migration gate')
 
 console.log('PASS commerce integration control-plane contracts')

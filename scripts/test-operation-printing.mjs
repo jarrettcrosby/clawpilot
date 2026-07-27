@@ -195,7 +195,6 @@ assert.equal(isPrinterCapabilitySetValid({
   supportedFormats: ['ZPL'],
   supportedMedia: ['letter'],
 }), false)
-
 const migration = read('db/migrations/0091_operations_printer_configuration.sql')
 for (const fragment of [
   'printer_type text NOT NULL',
@@ -334,7 +333,35 @@ for (const fragment of [
   'Package dimensions',
   'Document integrity',
   'Delivery history',
+  'const BUNDLED_AGENT_FORMATS = DEFAULT_PRINT_AGENT_CAPABILITIES.supportedFormats',
+  'const BUNDLED_AGENT_MEDIA = DEFAULT_PRINT_AGENT_CAPABILITIES.supportedMedia',
+  'const BUNDLED_AGENT_DOCUMENT_TYPES = DEFAULT_PRINT_AGENT_CAPABILITIES.supportedDocumentTypes',
+  'function agentSupportsPrinter(',
+  'containsAll(agent.supportedFormats, printer.supportedFormats)',
+  'containsAll(agent.supportedMedia, printer.supportedMedia)',
+  'containsAll(agent.supportedDocumentTypes, printer.supportedDocumentTypes)',
+  'options={printerFormatOptions}',
+  'options={printerMediaOptions}',
+  'options={printerDocumentOptions}',
+  'Bundled Zebra runtime: raw UTF-8 ZPL only',
+  'Use bundled Zebra defaults',
+  'Bundled-compatible raw ZPL',
+  'Custom capability agent',
+  'This assignment is incompatible.',
+  'Only agents whose declared capabilities cover this printer are available.',
 ]) assert.ok(panel.includes(fragment), `Printer UI missing ${fragment}`)
+assert.ok(
+  !panel.includes("supportedFormats: ['ZPL', 'PDF']"),
+  'Bundled local-agent printer defaults must not claim PDF support',
+)
+assert.ok(
+  !panel.includes("supportedMedia: ['label_4x6', 'label_4x8']"),
+  'Bundled local-agent printer defaults must not claim unverified 4 x 8 support',
+)
+assert.ok(
+  panel.includes("onClick={() => setPrinterForm(editForm(printer))}"),
+  'Existing printer profiles must remain editable',
+)
 
 const operations = read('app_src/components/operations/OperationsSection.tsx')
 assert.ok(operations.includes('value="printing"'), 'Operations navigation must expose Printing')

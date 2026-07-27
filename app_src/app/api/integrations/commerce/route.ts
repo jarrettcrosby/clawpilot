@@ -12,6 +12,9 @@ import {
   testCommerceConnection,
 } from '@/lib/integrations/commerceIntegrations'
 import {
+  commerceIntakeRuntimeAvailable,
+} from '@/lib/integrations/commerceIntake'
+import {
   CLAWPILOT_FAIRE_CAPABILITY_IMPLEMENTATION,
   CLAWPILOT_SHOPIFY_CAPABILITY_IMPLEMENTATION,
   COMMERCE_CUSTOM_INTEGRATION_ONBOARDING,
@@ -245,7 +248,7 @@ function capabilityCatalog() {
     activationBoundary: {
       receiptIntakeOnly: true,
       domainWorkersActivated: false,
-      canonicalOrderImport: false,
+      canonicalOrderImport: commerceIntakeRuntimeAvailable(),
       inventoryMutation: false,
       fulfillmentExport: false,
       multiMerchantOauth: false,
@@ -265,6 +268,7 @@ export async function GET(req: NextRequest) {
       canManage: true,
       canActivate: capabilities.canActivate,
       canRevealCredentials: canRevealCredential(actor),
+      intakeAvailable: commerceIntakeRuntimeAvailable(),
       integrations: await getCommerceIntegrationsState(
         organizationId(actor),
       ),

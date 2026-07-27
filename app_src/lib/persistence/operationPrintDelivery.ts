@@ -2,9 +2,14 @@ import crypto from 'crypto'
 import type { PoolClient } from 'pg'
 import { recordAuditEvent } from '@/lib/auditWriter'
 import {
+  DEFAULT_PRINT_AGENT_CAPABILITIES,
+  PRINT_DOCUMENT_TYPES,
+  PRINT_FORMATS,
+  PRINT_MEDIA,
   selectPrinterRoute,
   supportsPrinterRoute,
   type DurablePrintDocumentType,
+  type PrintAgentCapabilities,
   type OperationsPrintAgentContext,
   type OperationsPrintAgentCredential,
   type OperationsPrintAgentProfile,
@@ -40,6 +45,9 @@ type PrintAgentRow = {
   name: string
   status: OperationsPrintAgentProfile['status']
   credential_version: number
+  supported_formats: OperationsPrintAgentProfile['supportedFormats']
+  supported_media: OperationsPrintAgentProfile['supportedMedia']
+  supported_document_types: OperationsPrintAgentProfile['supportedDocumentTypes']
   assigned_printers: Array<{ globalId: string; name: string }> | null
   enrolled_by: string | null
   enrolled_at: TimestampValue
@@ -130,6 +138,7 @@ type LockedPrintJobRow = {
   global_id: string
   organization_id: string
   label_id: string | null
+  rate_test_label_id: string | null
   source_order_id: string | null
   source_order_global_id: string | null
   source_shipment_id: string | null
@@ -167,6 +176,7 @@ type PrintClaimRow = {
   byte_length: string
   storage_reference: string
   label_payload: string | null
+  rate_test_label_payload: Buffer | null
   artifact_payload: Buffer | null
   printer_global_id: string
   printer_code: string
@@ -175,12 +185,21 @@ type PrintClaimRow = {
 
 type PrintArtifactPayloadRow = {
   global_id: string
+  document_type: DurablePrintDocumentType
+  format: PrintFormat
+  media_size: PrintMedia
   content_sha256: string
   byte_length: string
-  mime_type: 'application/pdf'
-  filename: string
-  payload: Buffer
-  template_version: string
+  payload_mime_type: 'application/pdf' | 'image/png' | null
+  payload_filename: string | null
+  artifact_payload: Buffer | null
+  template_version: string | null
+  source_label_global_id: string | null
+  source_label_format: PrintFormat | null
+  source_label_payload: string | null
+  rate_test_label_global_id: string | null
+  rate_test_label_format: PrintFormat | null
+  rate_test_label_payload: Buffer | null
   created_at: TimestampValue
 }
 
@@ -195,6 +214,11 @@ export type EnqueueOperationsPrintJobInput = {
     | {
       type: 'shipping_label'
       sourceLabelGlobalId: string
+      media: Extract<PrintMedia, 'label_4x6' | 'label_4x8'>
+    }
+    | {
+      type: 'rate_test_label'
+      sourceRateTestLabelGlobalId: string
       media: Extract<PrintMedia, 'label_4x6' | 'label_4x8'>
     }
     | {
@@ -214,6 +238,7 @@ const AGENT_GLOBAL_ID = /^gpt\d{7}$/
 const JOB_GLOBAL_ID = /^gpj\d{7}$/
 const ARTIFACT_GLOBAL_ID = /^gpf\d{7}$/
 const LABEL_GLOBAL_ID = /^glb\d{7}$/
+const RATE_TEST_LABEL_GLOBAL_ID = /^gsl\d{7}$/
 const ORDER_GLOBAL_ID = /^gor\d{7}$/
 const SHIPMENT_GLOBAL_ID = /^gsh\d{7}$/
 const SHA256 = /^[a-f0-9]{64}$/
@@ -224,6 +249,7 @@ const STORAGE_PROTOCOLS = new Set([
   's3:',
   'clawpilot-document:',
   'clawpilot-label:',
+  'clawpilot-rate-test-label:',
 ])
 const MAX_REASON_LENGTH = 500
 const MAX_ERROR_LENGTH = 1000
@@ -277,6 +303,64 @@ function requiredReason(value: string, label: string) {
   return reason
 }
 
+function requiredCapabilityValues<T extends string>(
+  values: unknown,
+  label: string,
+  supported: readonly T[],
+) {
+  if (
+    !Array.isArray(values)
+    || values.length === 0
+    || values.length > supported.length
+    || values.some((value) => typeof value !== 'string' || !supported.includes(value as T))
+    || new Set(values).size !== values.length
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PRINT_AGENT_CAPABILITIES_INVALID',
+      `${label} are invalid`,
+    )
+  }
+  return values as T[]
+}
+
+function requiredPrintAgentCapabilities(
+  input?: Partial<PrintAgentCapabilities>,
+): PrintAgentCapabilities {
+  const capabilities = input || DEFAULT_PRINT_AGENT_CAPABILITIES
+  return {
+    supportedFormats: requiredCapabilityValues(
+      capabilities.supportedFormats,
+      'Print-agent formats',
+      PRINT_FORMATS,
+    ),
+    supportedMedia: requiredCapabilityValues(
+      capabilities.supportedMedia,
+      'Print-agent media',
+      PRINT_MEDIA,
+    ),
+    supportedDocumentTypes: requiredCapabilityValues(
+      capabilities.supportedDocumentTypes,
+      'Print-agent document types',
+      PRINT_DOCUMENT_TYPES,
+    ),
+  }
+}
+
+function printAgentCapabilitiesAreSubset(
+  candidate: PrintAgentCapabilities,
+  enrolled: PrintAgentCapabilities,
+) {
+  return candidate.supportedFormats.every((value) => (
+    enrolled.supportedFormats.includes(value)
+  ))
+    && candidate.supportedMedia.every((value) => (
+      enrolled.supportedMedia.includes(value)
+    ))
+    && candidate.supportedDocumentTypes.every((value) => (
+      enrolled.supportedDocumentTypes.includes(value)
+    ))
+}
+
 function stableJson(value: unknown): string {
   if (value === null || typeof value !== 'object') {
     return JSON.stringify(value) ?? 'null'
@@ -300,20 +384,149 @@ function contentHash(value: string | Buffer) {
   return crypto.createHash('sha256').update(value).digest('hex')
 }
 
+function strictBase64Bytes(value: string) {
+  const encoded = value.replace(/\s+/g, '')
+  const unpadded = encoded.replace(/=+$/, '')
+  if (
+    !encoded
+    || !/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)
+    || encoded.length % 4 === 1
+    || (encoded.includes('=') && encoded.length % 4 !== 0)
+  ) return null
+  const padded = unpadded.padEnd(Math.ceil(unpadded.length / 4) * 4, '=')
+  const bytes = Buffer.from(padded, 'base64')
+  return (
+    bytes.length
+    && bytes.toString('base64').replace(/=+$/, '') === unpadded
+  ) ? bytes : null
+}
+
+function validZplBytes(bytes: Buffer) {
+  const payload = bytes.toString('utf8')
+  const normalized = payload.trim()
+  return (
+    Buffer.from(payload, 'utf8').equals(bytes)
+    && normalized.startsWith('^XA')
+    && normalized.endsWith('^XZ')
+    && !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(payload)
+  )
+}
+
+function validPdfBytes(bytes: Buffer) {
+  if (bytes.subarray(0, 5).toString('ascii') !== '%PDF-') return false
+  const tail = bytes
+    .subarray(Math.max(0, bytes.byteLength - 2048))
+    .toString('latin1')
+  return /%%EOF[\u0000\t\n\f\r ]*$/.test(tail)
+}
+
+function validateLabelBytes(format: PrintFormat, bytes: Buffer) {
+  const bounded = bytes.byteLength >= 1 && bytes.byteLength <= 10 * 1024 * 1024
+  const valid = bounded && (format === 'ZPL'
+    ? validZplBytes(bytes)
+    : format === 'PDF'
+      ? validPdfBytes(bytes)
+      : format === 'PNG'
+        ? bytes.subarray(0, 8).equals(
+          Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+        )
+        : false)
+  if (!valid) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PRINT_LABEL_PAYLOAD_INVALID',
+      'Stored shipping-label bytes do not match the declared format',
+      409,
+    )
+  }
+  return bytes
+}
+
+function validateDocumentBytes(format: PrintFormat, bytes: Buffer) {
+  const bounded = bytes.byteLength >= 1 && bytes.byteLength <= 50 * 1024 * 1024
+  const valid = bounded && (format === 'PDF'
+    ? validPdfBytes(bytes)
+    : format === 'PNG'
+      ? bytes.subarray(0, 8).equals(
+        Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      )
+      : false)
+  if (!valid) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PRINT_ARTIFACT_CORRUPT',
+      'Print artifact content failed integrity validation',
+      500,
+    )
+  }
+  return bytes
+}
+
+export function decodeStoredOperationsLabelPayload(input: {
+  format: PrintFormat
+  payload: string
+}) {
+  if (input.format === 'ZPL') {
+    const raw = Buffer.from(input.payload, 'utf8')
+    if (validZplBytes(raw)) return raw
+    const decoded = strictBase64Bytes(input.payload)
+    if (decoded && validZplBytes(decoded)) return decoded
+    return validateLabelBytes(input.format, raw)
+  }
+  const decoded = strictBase64Bytes(input.payload)
+  if (!decoded) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PRINT_LABEL_PAYLOAD_INVALID',
+      'Stored shipping-label payload is not valid base64',
+      409,
+    )
+  }
+  return validateLabelBytes(input.format, decoded)
+}
+
 export function encodeOperationsPrintClaimPayload(input: {
-  labelPayload: string | null
-  artifactPayload: Uint8Array | null
+  format?: PrintFormat | null
+  labelPayload?: string | null
+  rateTestLabelPayload?: Uint8Array | null
+  artifactPayload?: Uint8Array | null
 }): {
   inlinePayload: string | null
   encoding: PrintPayloadEncoding | null
 } {
-  if (input.labelPayload !== null) {
+  if (input.labelPayload !== undefined && input.labelPayload !== null) {
+    const format = input.format || 'ZPL'
+    const bytes = decodeStoredOperationsLabelPayload({
+      format,
+      payload: input.labelPayload,
+    })
     return {
-      inlinePayload: input.labelPayload,
-      encoding: 'utf8',
+      inlinePayload: format === 'ZPL'
+        ? bytes.toString('utf8')
+        : bytes.toString('base64'),
+      encoding: format === 'ZPL' ? 'utf8' : 'base64',
     }
   }
-  if (input.artifactPayload !== null) {
+  if (
+    input.rateTestLabelPayload !== undefined
+    && input.rateTestLabelPayload !== null
+  ) {
+    if (!input.format) {
+      throw new OperationsRequestError(
+        'OPERATIONS_PRINT_LABEL_PAYLOAD_INVALID',
+        'Stored rate-test label format is unavailable',
+        409,
+      )
+    }
+    const bytes = validateLabelBytes(
+      input.format,
+      Buffer.from(input.rateTestLabelPayload),
+    )
+    return {
+      inlinePayload: input.format === 'ZPL'
+        ? bytes.toString('utf8')
+        : bytes.toString('base64'),
+      encoding: input.format === 'ZPL' ? 'utf8' : 'base64',
+    }
+  }
+  if (input.artifactPayload !== undefined && input.artifactPayload !== null) {
     return {
       inlinePayload: Buffer.from(input.artifactPayload).toString('base64'),
       encoding: 'base64',
@@ -409,6 +622,9 @@ function agentProfile(row: PrintAgentRow): OperationsPrintAgentProfile {
     name: row.name,
     status: row.status,
     credentialVersion: row.credential_version,
+    supportedFormats: row.supported_formats,
+    supportedMedia: row.supported_media,
+    supportedDocumentTypes: row.supported_document_types,
     assignedPrinters: Array.isArray(row.assigned_printers) ? row.assigned_printers : [],
     enrolledBy: row.enrolled_by,
     enrolledAt: iso(row.enrolled_at) as string,
@@ -497,6 +713,9 @@ const PRINT_AGENT_SELECT = `
     agent.name,
     agent.status,
     agent.credential_version,
+    agent.supported_formats,
+    agent.supported_media,
+    agent.supported_document_types,
     COALESCE(
       jsonb_agg(
         jsonb_build_object('globalId', printer.global_id, 'name', printer.name)
@@ -531,18 +750,29 @@ const PRINT_JOB_SELECT = `
     artifact.byte_length AS artifact_byte_length,
     artifact.created_by AS artifact_created_by,
     artifact.created_at AS artifact_created_at,
-    source_label.global_id AS source_label_global_id,
-    source_label.status AS source_label_status,
-    source_label.carrier,
-    source_label.service_code AS carrier_service_code,
-    source_label.environment AS carrier_environment,
-    source_label.created_at AS label_created_at,
-    source_label.voided_at AS label_voided_at,
-    source_label.voided_by AS label_voided_by,
+    COALESCE(source_label.global_id, rate_test_label.global_id)
+      AS source_label_global_id,
+    COALESCE(source_label.status, rate_test_label.status)
+      AS source_label_status,
+    COALESCE(source_label.carrier, rate_test_label.provider) AS carrier,
+    COALESCE(source_label.service_code, rate_test_label.service_code)
+      AS carrier_service_code,
+    COALESCE(source_label.environment, rate_test_label.environment)
+      AS carrier_environment,
+    COALESCE(source_label.created_at, rate_test_label.created_at)
+      AS label_created_at,
+    COALESCE(source_label.voided_at, rate_test_label.voided_at)
+      AS label_voided_at,
+    COALESCE(source_label.voided_by, rate_test_label.voided_by)
+      AS label_voided_by,
     source_order.global_id AS source_order_global_id,
     source_order.order_number AS source_order_number,
     source_shipment.global_id AS source_shipment_global_id,
-    COALESCE(source_shipment.tracking_number, source_label.tracking_number)
+    COALESCE(
+      source_shipment.tracking_number,
+      source_label.tracking_number,
+      rate_test_label.tracking_number
+    )
       AS tracking_number,
     source_package.global_id AS package_global_id,
     source_package.package_number,
@@ -603,6 +833,9 @@ const PRINT_JOB_SELECT = `
   LEFT JOIN operations_labels source_label
     ON source_label.organization_id = artifact.organization_id
    AND source_label.id = artifact.source_label_id
+  LEFT JOIN operations_carrier_rate_test_labels rate_test_label
+    ON rate_test_label.organization_id = artifact.organization_id
+   AND rate_test_label.id = artifact.source_rate_test_label_id
   LEFT JOIN operations_packages source_package
     ON source_package.organization_id = source_label.organization_id
    AND source_package.id = source_label.package_id
@@ -724,22 +957,39 @@ export async function readOperationsPrintArtifactPayloadInPostgres(input: {
   const result = await query<PrintArtifactPayloadRow>(
     `SELECT
        artifact.global_id,
+       artifact.document_type,
+       artifact.format,
+       artifact.media_size,
        artifact.content_sha256,
        artifact.byte_length::text,
-       payload.mime_type,
-       payload.filename,
-       payload.payload,
+       payload.mime_type AS payload_mime_type,
+       payload.filename AS payload_filename,
+       payload.payload AS artifact_payload,
        payload.template_version,
-       payload.created_at
-     FROM operations_print_artifact_payloads payload
-     JOIN operations_print_artifacts artifact
-       ON artifact.organization_id = payload.organization_id
-      AND artifact.id = payload.artifact_id
-     WHERE payload.organization_id = $1::uuid
+       source_label.global_id AS source_label_global_id,
+       source_label.format AS source_label_format,
+       source_label.label_payload AS source_label_payload,
+       rate_test_label.global_id AS rate_test_label_global_id,
+       rate_test_label.format AS rate_test_label_format,
+       rate_test_label.label_payload AS rate_test_label_payload,
+       COALESCE(
+         payload.created_at,
+         source_label.created_at,
+         rate_test_label.created_at,
+         artifact.created_at
+       ) AS created_at
+     FROM operations_print_artifacts artifact
+     LEFT JOIN operations_print_artifact_payloads payload
+       ON payload.organization_id = artifact.organization_id
+      AND payload.artifact_id = artifact.id
+     LEFT JOIN operations_labels source_label
+       ON source_label.organization_id = artifact.organization_id
+      AND source_label.id = artifact.source_label_id
+     LEFT JOIN operations_carrier_rate_test_labels rate_test_label
+       ON rate_test_label.organization_id = artifact.organization_id
+      AND rate_test_label.id = artifact.source_rate_test_label_id
+     WHERE artifact.organization_id = $1::uuid
        AND artifact.global_id = $2
-       AND artifact.document_type = 'packing_slip'
-       AND artifact.format = 'PDF'
-       AND payload.mime_type = 'application/pdf'
      LIMIT 1`,
     [organizationId, artifactGlobalId],
   )
@@ -751,11 +1001,89 @@ export async function readOperationsPrintArtifactPayloadInPostgres(input: {
       404,
     )
   }
+  let payload: Buffer
+  let filename: string
+  let mimeType: 'application/vnd.zebra-zpl' | 'application/pdf' | 'image/png'
+  let templateVersion: string | null = null
+  if (
+    artifact.document_type !== 'packing_slip'
+    && artifact.document_type !== 'shipping_label'
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PRINT_ARTIFACT_CORRUPT',
+      'Print artifact content failed integrity validation',
+      500,
+    )
+  }
+  if (artifact.document_type === 'packing_slip') {
+    const expectedMimeType = artifact.format === 'PDF'
+      ? 'application/pdf'
+      : artifact.format === 'PNG'
+        ? 'image/png'
+        : null
+    if (
+      !expectedMimeType
+      || artifact.payload_mime_type !== expectedMimeType
+      || !artifact.payload_filename
+      || !artifact.artifact_payload
+    ) {
+      throw new OperationsRequestError(
+        'OPERATIONS_PRINT_ARTIFACT_CORRUPT',
+        'Print artifact content failed integrity validation',
+        500,
+      )
+    }
+    payload = Buffer.from(artifact.artifact_payload)
+    validateDocumentBytes(artifact.format, payload)
+    filename = artifact.payload_filename
+    mimeType = expectedMimeType
+    templateVersion = artifact.template_version
+  } else if (
+    artifact.document_type === 'shipping_label'
+    &&
+    artifact.source_label_global_id
+    && artifact.source_label_format === artifact.format
+    && artifact.source_label_payload !== null
+  ) {
+    payload = decodeStoredOperationsLabelPayload({
+      format: artifact.format,
+      payload: artifact.source_label_payload,
+    })
+    filename = `shipping-label-${artifact.source_label_global_id}`
+    mimeType = artifact.format === 'ZPL'
+      ? 'application/vnd.zebra-zpl'
+      : artifact.format === 'PDF'
+        ? 'application/pdf'
+        : 'image/png'
+  } else if (
+    artifact.document_type === 'shipping_label'
+    &&
+    artifact.rate_test_label_global_id
+    && artifact.rate_test_label_format === artifact.format
+    && artifact.rate_test_label_payload
+  ) {
+    payload = validateLabelBytes(
+      artifact.format,
+      Buffer.from(artifact.rate_test_label_payload),
+    )
+    filename = `shipping-label-${artifact.rate_test_label_global_id}`
+    mimeType = artifact.format === 'ZPL'
+      ? 'application/vnd.zebra-zpl'
+      : artifact.format === 'PDF'
+        ? 'application/pdf'
+        : 'image/png'
+  } else {
+    throw new OperationsRequestError(
+      'OPERATIONS_PRINT_ARTIFACT_CORRUPT',
+      'Print artifact content failed integrity validation',
+      500,
+    )
+  }
   const byteLength = Number(artifact.byte_length)
   if (
     !Number.isSafeInteger(byteLength)
-    || byteLength !== artifact.payload.byteLength
-    || contentHash(artifact.payload) !== artifact.content_sha256
+    || byteLength !== payload.byteLength
+    || contentHash(payload) !== artifact.content_sha256
   ) {
     throw new OperationsRequestError(
       'OPERATIONS_PRINT_ARTIFACT_CORRUPT',
@@ -765,12 +1093,15 @@ export async function readOperationsPrintArtifactPayloadInPostgres(input: {
   }
   return {
     globalId: artifact.global_id,
+    documentType: artifact.document_type,
+    format: artifact.format,
+    media: artifact.media_size,
     contentSha256: artifact.content_sha256,
     byteLength,
-    mimeType: artifact.mime_type,
-    filename: artifact.filename,
-    payload: artifact.payload,
-    templateVersion: artifact.template_version,
+    mimeType,
+    filename,
+    payload,
+    templateVersion,
     createdAt: iso(artifact.created_at) as string,
   }
 }
@@ -837,6 +1168,9 @@ export async function enrollOperationsPrintAgentInPostgres(input: {
   name: string
   actorEmail: string
   idempotencyKey: string
+  supportedFormats?: OperationsPrintAgentProfile['supportedFormats']
+  supportedMedia?: OperationsPrintAgentProfile['supportedMedia']
+  supportedDocumentTypes?: OperationsPrintAgentProfile['supportedDocumentTypes']
 }): Promise<OperationsPrintAgentCredential> {
   const organizationId = requiredOrganizationId(input.organizationId)
   const actorEmail = requiredActor(input.actorEmail)
@@ -854,7 +1188,21 @@ export async function enrollOperationsPrintAgentInPostgres(input: {
       'Print agent warehouse is invalid',
     )
   }
+  const capabilities = requiredPrintAgentCapabilities({
+    supportedFormats: input.supportedFormats
+      || DEFAULT_PRINT_AGENT_CAPABILITIES.supportedFormats,
+    supportedMedia: input.supportedMedia
+      || DEFAULT_PRINT_AGENT_CAPABILITIES.supportedMedia,
+    supportedDocumentTypes: input.supportedDocumentTypes
+      || DEFAULT_PRINT_AGENT_CAPABILITIES.supportedDocumentTypes,
+  })
   const requestFingerprint = fingerprint({
+    action: 'enroll-print-agent',
+    warehouseId: input.warehouseId,
+    name,
+    ...capabilities,
+  })
+  const legacyRequestFingerprint = fingerprint({
     action: 'enroll-print-agent',
     warehouseId: input.warehouseId,
     name,
@@ -877,7 +1225,21 @@ export async function enrollOperationsPrintAgentInPostgres(input: {
       [organizationId, idempotencyKey],
     )
     if (replay.rows[0]) {
-      if (replay.rows[0].request_fingerprint !== requestFingerprint) {
+      const isLegacyDefaultReplay = (
+        printAgentCapabilitiesAreSubset(
+          capabilities,
+          DEFAULT_PRINT_AGENT_CAPABILITIES,
+        )
+        && printAgentCapabilitiesAreSubset(
+          DEFAULT_PRINT_AGENT_CAPABILITIES,
+          capabilities,
+        )
+        && replay.rows[0].request_fingerprint === legacyRequestFingerprint
+      )
+      if (
+        replay.rows[0].request_fingerprint !== requestFingerprint
+        && !isLegacyDefaultReplay
+      ) {
         throw new OperationsRequestError(
           'OPERATIONS_PRINT_IDEMPOTENCY_REUSED',
           'Idempotency-Key was already used for a different print-agent request',
@@ -909,8 +1271,12 @@ export async function enrollOperationsPrintAgentInPostgres(input: {
     const inserted = await client.query<{ global_id: string }>(
       `INSERT INTO operations_print_agents (
          id, organization_id, warehouse_id, name, secret_hash,
-         request_fingerprint, idempotency_key, enrolled_by
-       ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7, $8)
+         request_fingerprint, idempotency_key, enrolled_by,
+         supported_formats, supported_media, supported_document_types
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7, $8,
+         $9::text[], $10::text[], $11::text[]
+       )
        RETURNING global_id`,
       [
         generated.agentId,
@@ -921,6 +1287,9 @@ export async function enrollOperationsPrintAgentInPostgres(input: {
         requestFingerprint,
         idempotencyKey,
         actorEmail,
+        capabilities.supportedFormats,
+        capabilities.supportedMedia,
+        capabilities.supportedDocumentTypes,
       ],
     )
     const globalId = inserted.rows[0].global_id
@@ -937,6 +1306,9 @@ export async function enrollOperationsPrintAgentInPostgres(input: {
         printAgentGlobalId: globalId,
         warehouseGlobalId: agent.warehouseGlobalId,
         credentialVersion: agent.credentialVersion,
+        supportedFormats: agent.supportedFormats,
+        supportedMedia: agent.supportedMedia,
+        supportedDocumentTypes: agent.supportedDocumentTypes,
       },
     }, client)
     return { agent, credential: generated.credential }
@@ -1150,9 +1522,13 @@ export async function authenticateOperationsPrintAgentInPostgres(
     secret_hash: string
     status: string
     credential_version: number
+    supported_formats: OperationsPrintAgentContext['supportedFormats']
+    supported_media: OperationsPrintAgentContext['supportedMedia']
+    supported_document_types: OperationsPrintAgentContext['supportedDocumentTypes']
   }>(
     `SELECT id::text, global_id, organization_id::text, warehouse_id::text,
-       name, secret_hash, status, credential_version
+       name, secret_hash, status, credential_version,
+       supported_formats, supported_media, supported_document_types
      FROM operations_print_agents
      WHERE id = $1::uuid
      LIMIT 1`,
@@ -1177,6 +1553,9 @@ export async function authenticateOperationsPrintAgentInPostgres(
     warehouseId: agent.warehouse_id,
     name: agent.name,
     credentialVersion: agent.credential_version,
+    supportedFormats: agent.supported_formats,
+    supportedMedia: agent.supported_media,
+    supportedDocumentTypes: agent.supported_document_types,
   }
 }
 
@@ -1372,8 +1751,12 @@ async function insertArtifact(
       )
     }
     const row = label.rows[0]
-    const contentSha256 = contentHash(row.label_payload)
-    const byteLength = Buffer.byteLength(row.label_payload, 'utf8')
+    const labelBytes = decodeStoredOperationsLabelPayload({
+      format: row.format,
+      payload: row.label_payload,
+    })
+    const contentSha256 = contentHash(labelBytes)
+    const byteLength = labelBytes.byteLength
     await client.query(
       `INSERT INTO operations_print_artifacts (
          organization_id, source_label_id, source_order_id, source_shipment_id,
@@ -1417,6 +1800,7 @@ async function insertArtifact(
       id: artifact.rows[0].id,
       globalId: artifact.rows[0].global_id,
       labelId: row.id,
+      rateTestLabelId: null,
       type: 'shipping_label' as const,
       format: artifact.rows[0].format,
       media: input.document.media,
@@ -1426,6 +1810,124 @@ async function insertArtifact(
         orderNumber: row.order_number,
         shipmentId: row.shipment_id,
         shipmentGlobalId: row.shipment_global_id,
+        trackingNumber: row.tracking_number,
+      },
+    }
+  }
+
+  if (input.document.type === 'rate_test_label') {
+    if (!RATE_TEST_LABEL_GLOBAL_ID.test(
+      input.document.sourceRateTestLabelGlobalId,
+    )) {
+      throw new OperationsRequestError(
+        'OPERATIONS_PRINT_LABEL_INVALID',
+        'Rate-test label reference is invalid',
+      )
+    }
+    const label = await client.query<{
+      id: string
+      global_id: string
+      format: PrintFormat
+      media_size: Extract<PrintMedia, 'label_4x6' | 'label_4x8'>
+      label_payload: Buffer
+      content_sha256: string
+      byte_length: string
+      tracking_number: string
+    }>(
+      `SELECT
+         label.id::text,
+         label.global_id,
+         label.format,
+         label.media_size,
+         label.label_payload,
+         label.content_sha256,
+         octet_length(label.label_payload)::text AS byte_length,
+         label.tracking_number
+       FROM operations_carrier_rate_test_labels label
+       WHERE label.organization_id = $1::uuid
+         AND label.global_id = $2
+         AND label.status = 'created'
+       FOR SHARE`,
+      [organizationId, input.document.sourceRateTestLabelGlobalId],
+    )
+    const row = label.rows[0]
+    if (!row || row.media_size !== input.document.media) {
+      throw new OperationsRequestError(
+        'OPERATIONS_PRINT_LABEL_INVALID',
+        'Active rate-test label was not found with the selected media',
+        404,
+      )
+    }
+    const labelBytes = validateLabelBytes(row.format, Buffer.from(row.label_payload))
+    if (
+      contentHash(labelBytes) !== row.content_sha256
+      || labelBytes.byteLength !== Number(row.byte_length)
+    ) {
+      throw new OperationsRequestError(
+        'OPERATIONS_PRINT_ARTIFACT_CORRUPT',
+        'Rate-test label content failed integrity validation',
+        500,
+      )
+    }
+    await client.query(
+      `INSERT INTO operations_print_artifacts (
+         organization_id, source_rate_test_label_id,
+         document_type, format, media_size, content_sha256, byte_length,
+         storage_reference, created_by
+       ) VALUES (
+         $1::uuid, $2::uuid,
+         'shipping_label', $3, $4, $5, $6, $7, $8
+       )
+       ON CONFLICT (
+         organization_id, source_rate_test_label_id, format, media_size
+       ) WHERE source_rate_test_label_id IS NOT NULL
+       DO NOTHING`,
+      [
+        organizationId,
+        row.id,
+        row.format,
+        row.media_size,
+        row.content_sha256,
+        labelBytes.byteLength,
+        `clawpilot-rate-test-label:${row.global_id}`,
+        actorEmail,
+      ],
+    )
+    const artifact = await client.query<{
+      id: string
+      global_id: string
+      format: PrintFormat
+    }>(
+      `SELECT id::text, global_id, format
+       FROM operations_print_artifacts
+       WHERE organization_id = $1::uuid
+         AND source_rate_test_label_id = $2::uuid
+         AND format = $3
+         AND media_size = $4
+       FOR SHARE`,
+      [organizationId, row.id, row.format, row.media_size],
+    )
+    if (!artifact.rows[0]) {
+      throw new OperationsRequestError(
+        'OPERATIONS_PRINT_ARTIFACT_CONFLICT',
+        'Rate-test label artifact could not be resolved',
+        409,
+      )
+    }
+    return {
+      id: artifact.rows[0].id,
+      globalId: artifact.rows[0].global_id,
+      labelId: null,
+      rateTestLabelId: row.id,
+      type: 'shipping_label' as const,
+      format: artifact.rows[0].format,
+      media: row.media_size,
+      source: {
+        orderId: null,
+        orderGlobalId: null,
+        orderNumber: null,
+        shipmentId: null,
+        shipmentGlobalId: null,
         trackingNumber: row.tracking_number,
       },
     }
@@ -1481,6 +1983,7 @@ async function insertArtifact(
       id: inserted.rows[0].id,
       globalId: inserted.rows[0].global_id,
       labelId: null,
+      rateTestLabelId: null,
       type: 'packing_slip' as const,
       format: input.document.format,
       media: input.document.media,
@@ -1531,6 +2034,7 @@ async function insertArtifact(
     id: artifact.rows[0].id,
     globalId: artifact.rows[0].global_id,
     labelId: null,
+    rateTestLabelId: null,
     type: 'packing_slip' as const,
     format: input.document.format,
     media: input.document.media,
@@ -1612,6 +2116,47 @@ async function assertShippingLabelCanBeEnqueued(input: {
   )
 }
 
+async function assertRateTestLabelCanBeEnqueued(input: {
+  client: PoolClient
+  organizationId: string
+  sourceRateTestLabelGlobalId: string
+}) {
+  await acquireTransactionAdvisoryLock(
+    input.client,
+    `operations:print-rate-test-label:${input.organizationId}:${input.sourceRateTestLabelGlobalId}`,
+  )
+  const existing = await input.client.query<{
+    global_id: string
+    status: OperationsPrintJobListItem['status']
+  }>(
+    `SELECT job.global_id, job.status
+     FROM operations_print_jobs job
+     JOIN operations_carrier_rate_test_labels label
+       ON label.organization_id = job.organization_id
+      AND label.id = job.rate_test_label_id
+     WHERE job.organization_id = $1::uuid
+       AND label.global_id = $2
+       AND job.reprint_of_job_id IS NULL
+     LIMIT 1
+     FOR SHARE OF job, label`,
+    [input.organizationId, input.sourceRateTestLabelGlobalId],
+  )
+  if (!existing.rows[0]) return
+  const job = existing.rows[0]
+  const nextStep = job.status === 'delivered'
+    ? 'Use the controlled reprint action and provide a reprint reason.'
+    : job.status === 'failed'
+      ? 'Use the retry action after resolving the printer route.'
+      : job.status === 'cancelled'
+        ? 'Create a new rate-test label before creating another print job.'
+        : 'Wait for or manage the existing print job.'
+  throw new OperationsRequestError(
+    'OPERATIONS_PRINT_LABEL_ALREADY_ENQUEUED',
+    `Rate-test label already has original print job ${job.global_id} (${job.status}). ${nextStep}`,
+    409,
+  )
+}
+
 export async function enqueueOperationsPrintJobInPostgres(
   input: EnqueueOperationsPrintJobInput,
 ) {
@@ -1671,6 +2216,12 @@ export async function enqueueOperationsPrintJobInPostgres(
         organizationId,
         sourceLabelGlobalId: input.document.sourceLabelGlobalId,
       })
+    } else if (input.document.type === 'rate_test_label') {
+      await assertRateTestLabelCanBeEnqueued({
+        client,
+        organizationId,
+        sourceRateTestLabelGlobalId: input.document.sourceRateTestLabelGlobalId,
+      })
     }
     const artifact = await insertArtifact(client, input, organizationId, actorEmail)
     const profiles = await listOperationsPrinterProfilesInPostgres(organizationId, client)
@@ -1691,19 +2242,22 @@ export async function enqueueOperationsPrintJobInPostgres(
     }
     const inserted = await client.query<{ id: string; global_id: string }>(
       `INSERT INTO operations_print_jobs (
-         organization_id, label_id, artifact_id, printer_id,
+         organization_id, label_id, rate_test_label_id,
+         artifact_id, printer_id,
          requested_printer_id, fallback_printer_id,
          status, routing_reason, attempts, max_attempts,
          request_fingerprint, enqueued_by, idempotency_key
        ) VALUES (
-         $1::uuid, $2::uuid, $3::uuid, $4::uuid,
-         $5::uuid, $6::uuid,
-         'queued', $7, 0, $8, $9, $10, $11
+         $1::uuid, $2::uuid, $3::uuid,
+         $4::uuid, $5::uuid,
+         $6::uuid, $7::uuid,
+         'queued', $8, 0, $9, $10, $11, $12
        )
        RETURNING id::text, global_id`,
       [
         organizationId,
         artifact.labelId,
+        artifact.rateTestLabelId,
         artifact.id,
         route.printer.id,
         route.requestedPrinter.id,
@@ -1751,6 +2305,9 @@ export async function enqueueOperationsPrintJobInPostgres(
         sourceOrderNumber: artifact.source.orderNumber,
         sourceShipmentGlobalId: artifact.source.shipmentGlobalId,
         trackingNumber: artifact.source.trackingNumber,
+        sourceRateTestLabelGlobalId: input.document.type === 'rate_test_label'
+          ? input.document.sourceRateTestLabelGlobalId
+          : null,
       },
     }, client)
     return oneJob(organizationId, job.global_id, client)
@@ -1763,11 +2320,16 @@ const LOCKED_PRINT_JOB_SELECT = `
     job.global_id,
     job.organization_id::text,
     job.label_id::text,
+    job.rate_test_label_id::text,
     artifact.source_order_id::text,
     source_order.global_id AS source_order_global_id,
     artifact.source_shipment_id::text,
     source_shipment.global_id AS source_shipment_global_id,
-    COALESCE(source_shipment.tracking_number, source_label.tracking_number)
+    COALESCE(
+      source_shipment.tracking_number,
+      source_label.tracking_number,
+      rate_test_label.tracking_number
+    )
       AS tracking_number,
     job.artifact_id::text,
     artifact.document_type,
@@ -1799,6 +2361,9 @@ const LOCKED_PRINT_JOB_SELECT = `
   LEFT JOIN operations_labels source_label
     ON source_label.organization_id = artifact.organization_id
    AND source_label.id = artifact.source_label_id
+  LEFT JOIN operations_carrier_rate_test_labels rate_test_label
+    ON rate_test_label.organization_id = artifact.organization_id
+   AND rate_test_label.id = artifact.source_rate_test_label_id
   JOIN operations_printers printer
     ON printer.organization_id = job.organization_id
    AND printer.id = job.printer_id
@@ -2237,6 +2802,60 @@ async function cancelVoidedLabelJobs(
   }
 }
 
+async function cancelVoidedRateTestLabelJobs(
+  client: PoolClient,
+  agent: OperationsPrintAgentContext,
+) {
+  const cancelled = await client.query<{
+    id: string
+    global_id: string
+    printer_id: string
+  }>(
+    `SELECT job.id::text, job.global_id, job.printer_id::text
+     FROM operations_print_jobs job
+     JOIN operations_print_artifacts artifact
+       ON artifact.organization_id = job.organization_id
+      AND artifact.id = job.artifact_id
+     JOIN operations_carrier_rate_test_labels label
+       ON label.organization_id = artifact.organization_id
+      AND label.id = artifact.source_rate_test_label_id
+     JOIN operations_printers printer
+       ON printer.organization_id = job.organization_id
+      AND printer.id = job.printer_id
+     WHERE job.organization_id = $1::uuid
+       AND printer.warehouse_id = $2::uuid
+       AND job.status = 'queued'
+       AND label.status <> 'created'
+     ORDER BY job.created_at, job.id
+     FOR UPDATE OF job SKIP LOCKED
+     LIMIT 25`,
+    [agent.organizationId, agent.warehouseId],
+  )
+  for (const job of cancelled.rows) {
+    await client.query(
+      `INSERT INTO operations_print_delivery_attempts (
+         organization_id, print_job_id, printer_id,
+         state, actor_type, idempotency_key, request_fingerprint, detail
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid,
+         'cancelled', 'system', $4, $5,
+         'Source carrier rate-test label is no longer active'
+       )`,
+      [
+        agent.organizationId,
+        job.id,
+        job.printer_id,
+        `print-job:${job.global_id}:source-rate-test-label-cancelled`,
+        fingerprint({
+          state: 'cancelled',
+          jobGlobalId: job.global_id,
+          reason: 'source_rate_test_label_inactive',
+        }),
+      ],
+    )
+  }
+}
+
 async function claimedJobs(
   client: PoolClient,
   agent: OperationsPrintAgentContext,
@@ -2257,6 +2876,7 @@ async function claimedJobs(
        artifact.byte_length::text,
        artifact.storage_reference,
        label.label_payload,
+       rate_test_label.label_payload AS rate_test_label_payload,
        payload.payload AS artifact_payload,
        printer.global_id AS printer_global_id,
        printer.code AS printer_code,
@@ -2275,6 +2895,10 @@ async function claimedJobs(
        ON label.organization_id = artifact.organization_id
       AND label.id = artifact.source_label_id
       AND label.status = 'created'
+     LEFT JOIN operations_carrier_rate_test_labels rate_test_label
+       ON rate_test_label.organization_id = artifact.organization_id
+      AND rate_test_label.id = artifact.source_rate_test_label_id
+      AND rate_test_label.status = 'created'
      LEFT JOIN operations_print_artifact_payloads payload
        ON payload.organization_id = artifact.organization_id
       AND payload.artifact_id = artifact.id
@@ -2294,9 +2918,36 @@ async function claimedJobs(
   }
   return result.rows.map((row) => {
     const encodedPayload = encodeOperationsPrintClaimPayload({
+      format: row.format,
       labelPayload: row.label_payload,
+      rateTestLabelPayload: row.rate_test_label_payload,
       artifactPayload: row.artifact_payload,
     })
+    if (
+      row.document_type === 'shipping_label'
+      && encodedPayload.inlinePayload === null
+    ) {
+      throw new OperationsRequestError(
+        'OPERATIONS_PRINT_ARTIFACT_CORRUPT',
+        'Shipping-label bytes are unavailable for this print claim',
+        500,
+      )
+    }
+    if (encodedPayload.inlinePayload !== null && encodedPayload.encoding) {
+      const payloadBytes = encodedPayload.encoding === 'utf8'
+        ? Buffer.from(encodedPayload.inlinePayload, 'utf8')
+        : Buffer.from(encodedPayload.inlinePayload, 'base64')
+      if (
+        payloadBytes.byteLength !== Number(row.byte_length)
+        || contentHash(payloadBytes) !== row.content_sha256
+      ) {
+        throw new OperationsRequestError(
+          'OPERATIONS_PRINT_ARTIFACT_CORRUPT',
+          'Print artifact content failed integrity validation',
+          500,
+        )
+      }
+    }
     return {
       globalId: row.global_id,
       claimToken: row.claim_token,
@@ -2326,6 +2977,7 @@ export async function claimOperationsPrintJobsInPostgres(input: {
   idempotencyKey: string
   limit?: number
   leaseSeconds?: number
+  runtimeCapabilities: PrintAgentCapabilities
 }): Promise<OperationsPrintClaimJob[]> {
   const limit = Math.max(1, Math.min(Number(input.limit) || 1, 10))
   const leaseSeconds = Math.max(
@@ -2333,11 +2985,13 @@ export async function claimOperationsPrintJobsInPostgres(input: {
     Math.min(Number(input.leaseSeconds) || DEFAULT_LEASE_SECONDS, 300),
   )
   const callerKey = requiredIdempotencyKey(input.idempotencyKey)
+  const runtimeCapabilities = requiredPrintAgentCapabilities(input.runtimeCapabilities)
   const requestFingerprint = fingerprint({
     action: 'claim-print-jobs',
     printAgentGlobalId: input.agent.globalId,
     limit,
     leaseSeconds,
+    ...runtimeCapabilities,
   })
   const claimKeys = Array.from(
     { length: limit },
@@ -2350,6 +3004,37 @@ export async function claimOperationsPrintJobsInPostgres(input: {
       client,
       `operations:print-claim:${input.agent.organizationId}:${input.agent.id}:${callerKey}`,
     )
+    const enrolledCapabilitiesResult = await client.query<{
+      supported_formats: OperationsPrintAgentContext['supportedFormats']
+      supported_media: OperationsPrintAgentContext['supportedMedia']
+      supported_document_types: OperationsPrintAgentContext['supportedDocumentTypes']
+    }>(
+      `SELECT supported_formats, supported_media, supported_document_types
+       FROM operations_print_agents
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid
+         AND status = 'active'
+       FOR SHARE`,
+      [input.agent.organizationId, input.agent.id],
+    )
+    const enrolledCapabilitiesRow = enrolledCapabilitiesResult.rows[0]
+    const enrolledCapabilities = enrolledCapabilitiesRow
+      ? {
+        supportedFormats: enrolledCapabilitiesRow.supported_formats,
+        supportedMedia: enrolledCapabilitiesRow.supported_media,
+        supportedDocumentTypes: enrolledCapabilitiesRow.supported_document_types,
+      }
+      : null
+    if (
+      !enrolledCapabilities
+      || !printAgentCapabilitiesAreSubset(runtimeCapabilities, enrolledCapabilities)
+    ) {
+      throw new OperationsRequestError(
+        'OPERATIONS_PRINT_AGENT_CAPABILITIES_MISMATCH',
+        'Runtime capabilities must be a non-empty subset of the enrolled print-agent capabilities',
+        409,
+      )
+    }
     const replay = await client.query<{
       id: string
       idempotency_key: string
@@ -2386,6 +3071,7 @@ export async function claimOperationsPrintJobsInPostgres(input: {
     }
     await recoverExpiredClaims(client, input.agent)
     await cancelVoidedLabelJobs(client, input.agent)
+    await cancelVoidedRateTestLabelJobs(client, input.agent)
     await rerouteUnavailableQueuedJobs({
       client,
       organizationId: input.agent.organizationId,
@@ -2417,7 +3103,11 @@ export async function claimOperationsPrintJobsInPostgres(input: {
          job.global_id,
          source_order.global_id AS source_order_global_id,
          source_shipment.global_id AS source_shipment_global_id,
-         COALESCE(source_shipment.tracking_number, label.tracking_number)
+         COALESCE(
+           source_shipment.tracking_number,
+           label.tracking_number,
+           rate_test_label.tracking_number
+         )
            AS tracking_number,
          artifact.global_id AS artifact_global_id,
          artifact.document_type,
@@ -2449,6 +3139,10 @@ export async function claimOperationsPrintJobsInPostgres(input: {
          ON label.organization_id = artifact.organization_id
         AND label.id = artifact.source_label_id
         AND label.status = 'created'
+       LEFT JOIN operations_carrier_rate_test_labels rate_test_label
+         ON rate_test_label.organization_id = artifact.organization_id
+        AND rate_test_label.id = artifact.source_rate_test_label_id
+        AND rate_test_label.status = 'created'
        WHERE job.organization_id = $1::uuid
          AND printer.warehouse_id = $2::uuid
          AND printer.local_print_agent_id = $3::uuid
@@ -2457,9 +3151,16 @@ export async function claimOperationsPrintJobsInPostgres(input: {
          AND job.status = 'queued'
          AND job.available_at <= clock_timestamp()
          AND job.attempts <= job.max_attempts
+         AND artifact.format = ANY($5::text[])
+         AND artifact.media_size = ANY($6::text[])
+         AND artifact.document_type = ANY($7::text[])
          AND (
            artifact.source_label_id IS NULL
            OR label.id IS NOT NULL
+         )
+         AND (
+           artifact.source_rate_test_label_id IS NULL
+           OR rate_test_label.id IS NOT NULL
          )
        ORDER BY job.available_at, job.created_at, job.id
        FOR UPDATE OF job SKIP LOCKED
@@ -2469,6 +3170,9 @@ export async function claimOperationsPrintJobsInPostgres(input: {
         input.agent.warehouseId,
         input.agent.id,
         limit,
+        runtimeCapabilities.supportedFormats,
+        runtimeCapabilities.supportedMedia,
+        runtimeCapabilities.supportedDocumentTypes,
       ],
     )
     const claimAttemptIds: string[] = []
@@ -2516,6 +3220,9 @@ export async function claimOperationsPrintJobsInPostgres(input: {
           sourceOrderGlobalId: job.source_order_global_id,
           sourceShipmentGlobalId: job.source_shipment_global_id,
           trackingNumber: job.tracking_number,
+          runtimeSupportedFormats: runtimeCapabilities.supportedFormats,
+          runtimeSupportedMedia: runtimeCapabilities.supportedMedia,
+          runtimeSupportedDocumentTypes: runtimeCapabilities.supportedDocumentTypes,
         },
       }, client)
     }
@@ -3077,6 +3784,23 @@ export async function reprintOperationsPrintJobInPostgres(input: {
         )
       }
     }
+    if (original.rate_test_label_id) {
+      const sourceLabel = await client.query<{ status: string }>(
+        `SELECT status
+         FROM operations_carrier_rate_test_labels
+         WHERE organization_id = $1::uuid
+           AND id = $2::uuid
+         FOR SHARE`,
+        [organizationId, original.rate_test_label_id],
+      )
+      if (sourceLabel.rows[0]?.status !== 'created') {
+        throw new OperationsRequestError(
+          'OPERATIONS_PRINT_REPRINT_LABEL_INACTIVE',
+          'Inactive or voided carrier rate-test labels cannot be reprinted',
+          409,
+        )
+      }
+    }
     const profiles = await listOperationsPrinterProfilesInPostgres(organizationId, client)
     const route = selectPrinterRoute(profiles, {
       warehouseId: original.warehouse_id,
@@ -3095,22 +3819,25 @@ export async function reprintOperationsPrintJobInPostgres(input: {
     }
     const inserted = await client.query<{ id: string; global_id: string }>(
       `INSERT INTO operations_print_jobs (
-         organization_id, label_id, artifact_id, printer_id,
+         organization_id, label_id, rate_test_label_id,
+         artifact_id, printer_id,
          requested_printer_id, fallback_printer_id,
          status, routing_reason, attempts, max_attempts,
          request_fingerprint, enqueued_by, idempotency_key,
          reprint_of_job_id, reprint_reason, reprint_authorized_by
        ) VALUES (
-         $1::uuid, $2::uuid, $3::uuid, $4::uuid,
-         $5::uuid, $6::uuid,
-         'queued', $7, 0, $8,
-         $9, $10, $11,
-         $12::uuid, $13, $10
+         $1::uuid, $2::uuid, $3::uuid,
+         $4::uuid, $5::uuid,
+         $6::uuid, $7::uuid,
+         'queued', $8, 0, $9,
+         $10, $11, $12,
+         $13::uuid, $14, $11
        )
        RETURNING id::text, global_id`,
       [
         organizationId,
         original.label_id,
+        original.rate_test_label_id,
         original.artifact_id,
         route.printer.id,
         route.requestedPrinter.id,

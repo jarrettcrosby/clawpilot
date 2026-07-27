@@ -62,6 +62,17 @@ const theme = createTheme({
         },
       },
     },
+    MuiDialogActions: {
+      styleOverrides: {
+        root: {
+          flexWrap: 'wrap',
+          gap: 8,
+          '& > :not(style) ~ :not(style)': {
+            marginLeft: 0,
+          },
+        },
+      },
+    },
     MuiChip: {
       styleOverrides: {
         root: {

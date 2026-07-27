@@ -5,7 +5,33 @@ import {
   type CarrierRuntimeCredential,
 } from '@/lib/integrations/carrierCredentialClient'
 
+export type CarrierSandboxParty = {
+  name: string
+  line1: string
+  line2: string | null
+  city: string
+  region: string
+  postalCode: string
+  countryCode: 'US'
+}
+
+type CarrierSandboxParcel = {
+  description: string
+  length: number
+  width: number
+  height: number
+  dimensionUnit: 'IN'
+  weight: number
+  weightUnit: 'LB'
+}
+
 export type CarrierSandboxRateFixture = {
+  origin: CarrierSandboxParty
+  destination: CarrierSandboxParty
+  parcel: CarrierSandboxParcel
+}
+
+type LegacyCarrierSandboxRateFixture = {
   origin: {
     name: string
     street: string
@@ -22,18 +48,12 @@ export type CarrierSandboxRateFixture = {
     postalCode: string
     countryCode: string
   }
-  parcel: {
-    description: string
-    length: number
-    width: number
-    height: number
-    dimensionUnit: 'IN'
-    weight: number
-    weightUnit: 'LB'
-  }
+  parcel: CarrierSandboxParcel
 }
 
-export const CARRIER_SANDBOX_RATE_FIXTURE: CarrierSandboxRateFixture = {
+// The fixed legacy fixture remains the separate bounded sandbox-label fixture.
+// Sandbox rating converts it to the canonical party shape before use.
+export const CARRIER_SANDBOX_RATE_FIXTURE: LegacyCarrierSandboxRateFixture = {
   origin: {
     name: 'John Doe',
     street: '101 Jegs Place',
@@ -75,6 +95,7 @@ export type CarrierSandboxRateResult = {
   provider: 'ups_rest' | 'fedex_rest'
   environment: 'sandbox'
   fixture: CarrierSandboxRateFixture
+  destinationFingerprint: string
   rates: CarrierSandboxRate[]
   testedAt: string
   evidenceGlobalId?: string
@@ -162,14 +183,129 @@ function hash(value: unknown) {
   return createHash('sha256').update(stable(value)).digest('hex')
 }
 
-function fixtureForSender(senderName?: string): CarrierSandboxRateFixture {
-  const normalized = String(senderName || '').trim().replace(/\s+/g, ' ')
+const PARTY_FIELDS = new Set([
+  'name',
+  'line1',
+  'line2',
+  'city',
+  'region',
+  'postalCode',
+  'countryCode',
+])
+
+function partyText(value: unknown, label: string, maximum: number) {
+  if (typeof value !== 'string' || /[\u0000-\u001f\u007f]/.test(value)) {
+    throw new Error(`Carrier sandbox ${label} must be plain text`)
+  }
+  const normalized = value.trim().replace(/\s+/g, ' ')
+  if (!normalized || normalized.length > maximum) {
+    throw new Error(`Carrier sandbox ${label} must be 1-${maximum} characters`)
+  }
+  return normalized
+}
+
+export function normalizeCarrierSandboxParty(value: unknown): CarrierSandboxParty {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('Carrier sandbox destination must be an object')
+  }
+  const input = value as Record<string, unknown>
+  const unsupported = Object.keys(input).find((field) => !PARTY_FIELDS.has(field))
+  if (unsupported) {
+    throw new Error(`Carrier sandbox destination field is not supported: ${unsupported}`)
+  }
+  const line2Value = input.line2
+  if (
+    line2Value !== undefined
+    && line2Value !== null
+    && (typeof line2Value !== 'string' || /[\u0000-\u001f\u007f]/.test(line2Value))
+  ) {
+    throw new Error('Carrier sandbox destination line 2 must be plain text')
+  }
+  const line2 = typeof line2Value === 'string'
+    ? line2Value.trim().replace(/\s+/g, ' ')
+    : ''
+  if (line2.length > 120) {
+    throw new Error('Carrier sandbox destination line 2 must be 120 characters or fewer')
+  }
+  const region = partyText(input.region, 'destination region', 2).toUpperCase()
+  if (!/^[A-Z]{2}$/.test(region)) {
+    throw new Error('Carrier sandbox destination region must use a two-letter US state code')
+  }
+  const postalCode = partyText(input.postalCode, 'destination postal code', 10)
+  if (!/^\d{5}(?:-\d{4})?$/.test(postalCode)) {
+    throw new Error('Carrier sandbox destination postal code must be a five or nine digit US ZIP code')
+  }
+  const countryCode = partyText(input.countryCode, 'destination country code', 2).toUpperCase()
+  if (countryCode !== 'US') {
+    throw new Error('Carrier sandbox rating currently supports US addresses only')
+  }
   return {
-    ...CARRIER_SANDBOX_RATE_FIXTURE,
-    origin: {
-      ...CARRIER_SANDBOX_RATE_FIXTURE.origin,
-      name: normalized || CARRIER_SANDBOX_RATE_FIXTURE.origin.name,
-    },
+    name: partyText(input.name, 'destination name', 120),
+    line1: partyText(input.line1, 'destination address line 1', 160),
+    line2: line2 || null,
+    city: partyText(input.city, 'destination city', 100),
+    region,
+    postalCode,
+    countryCode,
+  }
+}
+
+export function carrierSandboxPartyFingerprint(normalizedParty: CarrierSandboxParty) {
+  const party = normalizeCarrierSandboxParty(normalizedParty)
+  return hash({
+    version: 'carrier-sandbox-party-v1',
+    party,
+  })
+}
+
+function legacyParty(
+  party: LegacyCarrierSandboxRateFixture['origin'],
+): CarrierSandboxParty {
+  return normalizeCarrierSandboxParty({
+    name: party.name,
+    line1: party.street,
+    line2: null,
+    city: party.city,
+    region: party.state,
+    postalCode: party.postalCode,
+    countryCode: party.countryCode,
+  })
+}
+
+export function buildCarrierSandboxRateFixture(input: {
+  senderName: string
+  registeredAddress: {
+    line1: string
+    line2: string | null
+    city: string
+    region: string
+    postalCode: string
+    countryCode: string
+  }
+  destination?: unknown
+}): CarrierSandboxRateFixture {
+  return {
+    origin: normalizeCarrierSandboxParty({
+      name: input.senderName,
+      line1: input.registeredAddress.line1,
+      line2: input.registeredAddress.line2,
+      city: input.registeredAddress.city,
+      region: input.registeredAddress.region,
+      postalCode: input.registeredAddress.postalCode,
+      countryCode: input.registeredAddress.countryCode,
+    }),
+    destination: input.destination === undefined
+      ? legacyParty(CARRIER_SANDBOX_RATE_FIXTURE.destination)
+      : normalizeCarrierSandboxParty(input.destination),
+    parcel: { ...CARRIER_SANDBOX_RATE_FIXTURE.parcel },
+  }
+}
+
+function defaultCarrierSandboxRateFixture(): CarrierSandboxRateFixture {
+  return {
+    origin: legacyParty(CARRIER_SANDBOX_RATE_FIXTURE.origin),
+    destination: legacyParty(CARRIER_SANDBOX_RATE_FIXTURE.destination),
+    parcel: { ...CARRIER_SANDBOX_RATE_FIXTURE.parcel },
   }
 }
 
@@ -207,14 +343,19 @@ function fedexRequest(accountNumber: string, fixture: CarrierSandboxRateFixture)
           phoneNumber: '7405550100',
         },
         address: {
-          streetLines: [fixture.origin.street], city: fixture.origin.city,
-          stateOrProvinceCode: fixture.origin.state, postalCode: fixture.origin.postalCode,
+          streetLines: [fixture.origin.line1, ...(fixture.origin.line2 ? [fixture.origin.line2] : [])],
+          city: fixture.origin.city,
+          stateOrProvinceCode: fixture.origin.region, postalCode: fixture.origin.postalCode,
           countryCode: fixture.origin.countryCode,
         },
       },
       recipient: { address: {
-        streetLines: [fixture.destination.street], city: fixture.destination.city,
-        stateOrProvinceCode: fixture.destination.state, postalCode: fixture.destination.postalCode,
+        streetLines: [
+          fixture.destination.line1,
+          ...(fixture.destination.line2 ? [fixture.destination.line2] : []),
+        ],
+        city: fixture.destination.city,
+        stateOrProvinceCode: fixture.destination.region, postalCode: fixture.destination.postalCode,
         countryCode: fixture.destination.countryCode,
       } },
       pickupType: 'DROPOFF_AT_FEDEX_LOCATION',
@@ -232,17 +373,13 @@ function fedexRequest(accountNumber: string, fixture: CarrierSandboxRateFixture)
   }
 }
 
-type CarrierSandboxAddress =
-  | typeof CARRIER_SANDBOX_RATE_FIXTURE.origin
-  | typeof CARRIER_SANDBOX_RATE_FIXTURE.destination
-
-function upsParty(address: CarrierSandboxAddress) {
+function upsParty(address: CarrierSandboxParty) {
   return {
     Name: address.name,
     Address: {
-      AddressLine: [address.street],
+      AddressLine: [address.line1, ...(address.line2 ? [address.line2] : [])],
       City: address.city,
-      StateProvinceCode: address.state,
+      StateProvinceCode: address.region,
       PostalCode: address.postalCode,
       CountryCode: address.countryCode,
     },
@@ -337,9 +474,8 @@ function parseUps(payload: Record<string, unknown>): CarrierSandboxRate[] {
 
 export function carrierSandboxRateRequestEvidence(
   provider: 'ups_rest' | 'fedex_rest',
-  senderName?: string,
+  fixture: CarrierSandboxRateFixture = defaultCarrierSandboxRateFixture(),
 ) {
-  const fixture = fixtureForSender(senderName)
   const request = {
     provider,
     environment: 'sandbox',
@@ -350,13 +486,34 @@ export function carrierSandboxRateRequestEvidence(
   }
   return {
     requestHash: hash(request),
-    redactedRequest: request,
+    redactedRequest: {
+      provider,
+      environment: 'sandbox',
+      purpose: 'sandbox_rate_test',
+      shipment: {
+        originFingerprint: carrierSandboxPartyFingerprint(fixture.origin),
+        destinationFingerprint: carrierSandboxPartyFingerprint(fixture.destination),
+        origin: {
+          region: fixture.origin.region,
+          countryCode: fixture.origin.countryCode,
+        },
+        destination: {
+          region: fixture.destination.region,
+          countryCode: fixture.destination.countryCode,
+        },
+        parcel: fixture.parcel,
+      },
+    },
   }
 }
 
 export async function requestCarrierSandboxRates(
   input: CarrierRuntimeCredential,
-  options: { fetchImpl?: typeof fetch; timeoutMs?: number; senderName?: string } = {},
+  options: {
+    fetchImpl?: typeof fetch
+    timeoutMs?: number
+    fixture?: CarrierSandboxRateFixture
+  } = {},
 ): Promise<{ result: CarrierSandboxRateResult; evidence: CarrierSandboxRateEvidence }> {
   if (input.environment !== 'sandbox') {
     throw new CarrierCredentialClientError(
@@ -381,7 +538,7 @@ export async function requestCarrierSandboxRates(
   }
 
   const fetchImpl = options.fetchImpl || fetch
-  const fixture = fixtureForSender(options.senderName)
+  const fixture = options.fixture || defaultCarrierSandboxRateFixture()
   const requestedAt = new Date().toISOString()
   const token = await requestCarrierAccessToken(input, { fetchImpl, timeoutMs: options.timeoutMs })
   const body = input.provider === 'fedex_rest'
@@ -425,13 +582,14 @@ export async function requestCarrierSandboxRates(
       throw new CarrierCredentialClientError('The carrier returned no usable sandbox rates', 502, 'CARRIER_SANDBOX_RATE_EMPTY')
     }
     const completedAt = new Date().toISOString()
-    const safeRequest = carrierSandboxRateRequestEvidence(input.provider, fixture.origin.name)
+    const safeRequest = carrierSandboxRateRequestEvidence(input.provider, fixture)
     const safeResponse = { rateCount: rates.length, rates }
     return {
       result: {
         provider: input.provider,
         environment: 'sandbox',
         fixture,
+        destinationFingerprint: carrierSandboxPartyFingerprint(fixture.destination),
         rates,
         testedAt: completedAt,
       },

@@ -52,8 +52,11 @@ Carrier label purchase and print delivery are intentionally separate idempotent 
 - A print retry must not call the carrier or purchase another label.
 - A reprint is a new audited print command with actor, permission, reason, and an explicit reprint marker.
 - A carrier outcome that is unknown must be reconciled before label purchase is retried.
-- A successful label commit precedes print routing. Replaying the original label command can recover the same idempotent print job without another carrier call.
+- A successful label commit precedes print routing. The order-bound flow may recover its same idempotent print job during command replay; the Settings diagnostic exposes a separate explicit print command. Both retry and controlled reprint reuse stored bytes without another carrier call.
 - A void command resolves the exact persisted integration and carrier account from the label; an operator cannot substitute a different account.
+- Carrier rating is earlier, separate quote evidence. It never supplies a printable label. The Settings diagnostic creates a label only after the operator chooses an evidenced service and confirms the separate sandbox Ship API command.
+- Provider base64 is decoded before durable storage. ZPL must contain a valid command envelope and is delivered as UTF-8; PDF/PNG must pass binary signature validation and is base64 encoded only at a JSON delivery boundary. Artifact SHA-256 and byte length always cover the decoded bytes delivered to the printer.
+- Unknown or stale prepared Settings diagnostic mutations are recovered through the organization-admin reconciliation control after external provider verification. The allowed result is action-specific, durable, idempotent, and clears the retry fence without invoking the carrier.
 
 Packing slips and other operational documents will follow the same print route but do not share carrier-purchase state. Packing-slip generation is not yet active because ClawPilot still needs a logistics document renderer and durable binary-object adapter; the knowledge-document repository is not used as a substitute.
 

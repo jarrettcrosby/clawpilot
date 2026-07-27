@@ -111,13 +111,42 @@ ClawPilot never falls back to another organization's credentials or to a platfor
 
 OAuth access tokens remain server-side, short-lived, and cached by provider/account/environment. Rotation creates auditable credential metadata without exposing the credential value. Test credentials cannot be selected by a production shipment command.
 
-### Implemented Credential And Sandbox Rating Boundary
+### Implemented Credential, Sandbox Rating, And Diagnostic Label Boundary
 
 Migration `0087_operations_carrier_credentials.sql` adds the organization-scoped encrypted companion record for direct UPS REST, FedEx REST, and USPS REST integration accounts. **Settings > Integrations > Shipping** verifies a candidate through the provider's fixed OAuth endpoint before writing AES-256-GCM ciphertext. Authenticated encryption includes organization, provider, and environment; API responses expose only masked suffixes, verification state, credential version, safe error code, and timestamps. Enabling an account re-verifies it, while disconnect removes ciphertext and disables the non-secret integration record. Access tokens are intentionally discarded after verification.
 
-Migration `0088_operations_sandbox_rating_and_mock_retirement.sql` adds an append-only `grq` sandbox-rate evidence record. An organization manager may run one server-defined UPS CIE or FedEx Sandbox rate request from **Settings > Integrations > Shipping** only when that provider's sandbox credential is active and verified. The fixture is fixed to John Doe, `101 Jegs Place, Delaware, OH 43015` to John Doe, `101 Academy Drive, Buzzards Bay, MA 02532`, with one `Test Product` parcel measuring `12 x 10 x 6 in` and weighing `5 lb`. The browser receives only normalized service, price, currency, transit, delivery, provider reference, and the evidence Global ID. The request hash and redacted request/response summaries are retained; credentials, access tokens, account numbers, and raw provider bodies are not.
+Migration `0088_operations_sandbox_rating_and_mock_retirement.sql` adds an append-only `grq` sandbox-rate evidence record. An organization manager may run one UPS CIE or FedEx Sandbox rate request from **Settings > Integrations > Shipping** only when that provider's sandbox credential and selected billing account are active and verified. The selected account's sender identity and registered address are the origin, the operator may edit a validated U.S. destination, and one fixed `Test Product` parcel measures `12 x 10 x 6 in` and weighs `5 lb`. Rating is sender-billed in this bounded flow. The browser receives normalized quotes and the evidence Global ID; durable evidence binds the exact request while omitting credentials, access tokens, account numbers, raw provider bodies, and full address PII.
 
-This release boundary is **rating only**. It exposes no shipping, label, void, pickup, manifest, tracking, or document action and refuses production credentials. Label and pickup testing require a later sandbox-only command boundary with durable intent, automatic void or cancellation, unknown-outcome reconciliation, and operator-visible evidence before those controls may be enabled. A successful sandbox rate is provider connectivity evidence, not certification for production shipping.
+Migration `0117_operations_print_agent_capabilities.sql` closes the delivery
+capability boundary after carrier label creation. A bound printer profile must
+be a subset of the enrolled agent's declared format, media, and document
+capabilities, and the claiming runtime repeats that profile before ClawPilot
+returns immutable bytes. The bundled Zebra runtime declares only provider-native
+ZPL, 4 x 6 media, and shipping labels. PDF/PNG remain valid carrier artifacts
+only for a separately enrolled native print service; carrier bytes are never
+rasterized, scaled, or converted merely to satisfy a mismatched printer.
+
+Migration `0118_operations_carrier_label_output_artifacts.sql` makes the
+carrier-returned file an explicit immutable source. The label records its
+canonical format, provider image type, provider stock type, content hash, and
+`provider_native` source kind. A future conversion may write only a separate
+immutable derivative that binds the original source hash, its own hash, the
+converter name/version, media, and conversion options. No converter is enabled
+by this migration, and neither a printer mismatch nor a download request may
+overwrite the provider source. Finalization must match the output format stored
+on the prepared carrier command; a provider response in a different format is
+rejected before insert.
+
+Rating and shipping remain separate provider commands. A successful rate contains no label document or tracking number. An authorized operator may explicitly select one evidenced service and choose a provider-native 4 x 6 output before calling the provider sandbox Ship API through a durable prepare/call/finalize command. The standard UPS Shipping diagnostic exposes native `ZPL`; the current UPS OpenAPI describes `GIF`, `ZPL`, `EPL`, and `SPL` for standard shipment labels and does not establish native PDF or PNG for this path. ClawPilot therefore does not advertise UPS PDF/PNG or silently translate GIF. FedEx exposes native `ZPLII` with `STOCK_4X6`, or native `PDF`/`PNG` with `PAPER_4X6`. ClawPilot validates the decoded format and dimensions where applicable, records the exact provider bytes and source metadata, and only then permits a compatible print route. The associated void resolves the exact persisted account, and an ambiguous create or void result blocks a fresh attempt until reconciliation.
+
+| Diagnostic provider | Exposed customer choice | Provider-native request | Current media |
+| --- | --- | --- | --- |
+| UPS Shipping REST | ZPL | `LabelImageFormat.Code=ZPL` | 4 x 6 |
+| FedEx Ship REST | ZPL | `ImageType=ZPLII`, `LabelStockType=STOCK_4X6` | 4 x 6 |
+| FedEx Ship REST | PDF | `ImageType=PDF`, `LabelStockType=PAPER_4X6` | 4 x 6 |
+| FedEx Ship REST | PNG | `ImageType=PNG`, `LabelStockType=PAPER_4X6` | 4 x 6 at the provider-documented 800 x 1200 pixels |
+
+Printing is a third command over the stored label artifact. Test-print, retry, and controlled reprint do not call the carrier. Capability routing requires the printer or print service to advertise the exact document type, media, and format. Existing PDF/PNG labels therefore remain usable only with an explicitly compatible route; a raw-ZPL Zebra route never accepts them. The boundary refuses production credentials and cannot create an operational shipment, pickup, manifest, tracking observation, commerce export, packing slip, or inventory mutation. A successful sandbox rate or label remains diagnostic evidence, not certification for production shipping.
 
 ## Health And Reconciliation
 
@@ -140,9 +169,10 @@ Scheduled reconciliation covers:
 - [RocketShipIt rating guide](https://docs.rocketshipit.com/rs/docs/rating.html)
 - [UPS Developer Portal](https://developer.ups.com/)
 - [UPS API catalog](https://developer.ups.com/catalog?loc=en_US)
+- [UPS Shipping OpenAPI](https://github.com/UPS-API/api-documentation/blob/main/Shipping.yaml)
 - [FedEx rates and transit times API](https://developer.fedex.com/api/en-us/catalog/rate/docs.html)
 - [FedEx OAuth API](https://developer.fedex.com/api/en-as/catalog/authorization/docs.html)
-- [FedEx ship API](https://developer.fedex.com/api/en-pr/catalog/ship/docs.html)
+- [FedEx Ship API](https://developer.fedex.com/api/en-us/catalog/ship/v1/docs.html)
 - [USPS APIs getting started](https://developers.usps.com/getting-started)
 - [USPS Domestic Labels 3.0](https://developers.usps.com/domesticlabelsv3)
 

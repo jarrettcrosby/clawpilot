@@ -28,6 +28,7 @@ import {
 import AddRounded from '@mui/icons-material/AddRounded'
 import CancelRounded from '@mui/icons-material/CancelRounded'
 import ContentCopyRounded from '@mui/icons-material/ContentCopyRounded'
+import DownloadRounded from '@mui/icons-material/DownloadRounded'
 import EditRounded from '@mui/icons-material/EditRounded'
 import InfoOutlined from '@mui/icons-material/InfoOutlined'
 import KeyRounded from '@mui/icons-material/KeyRounded'
@@ -37,8 +38,10 @@ import ReplayRounded from '@mui/icons-material/ReplayRounded'
 import RestartAltRounded from '@mui/icons-material/RestartAltRounded'
 import TokenRounded from '@mui/icons-material/TokenRounded'
 import {
+  DEFAULT_PRINT_AGENT_CAPABILITIES,
   PRINT_DOCUMENT_TYPES,
   PRINT_FORMATS,
+  PRINT_MEDIA,
   PRINTER_CONNECTION_MODES,
   PRINTER_STATUSES,
   PRINTER_STATION_TYPES,
@@ -82,7 +85,18 @@ type PrintJobPayload = {
 }
 
 type PrinterForm = OperationsPrinterInput
+type AgentEnrollmentForm = {
+  warehouseId: string
+  name: string
+  supportedFormats: PrintFormat[]
+  supportedMedia: PrintMedia[]
+  supportedDocumentTypes: PrintDocumentType[]
+}
 type View = 'jobs' | 'printers' | 'agents'
+
+const BUNDLED_AGENT_FORMATS = DEFAULT_PRINT_AGENT_CAPABILITIES.supportedFormats
+const BUNDLED_AGENT_MEDIA = DEFAULT_PRINT_AGENT_CAPABILITIES.supportedMedia
+const BUNDLED_AGENT_DOCUMENT_TYPES = DEFAULT_PRINT_AGENT_CAPABILITIES.supportedDocumentTypes
 
 const fieldSx = {
   minWidth: 0,
@@ -182,6 +196,31 @@ function namedGlobalId(name: string | null, globalId: string | null) {
   return [name, globalId].filter(Boolean).join(' · ') || 'Not available'
 }
 
+function containsAll<T extends string>(available: readonly T[], required: readonly T[]) {
+  return required.every((item) => available.includes(item))
+}
+
+function agentSupportsPrinter(
+  agent: OperationsPrintAgentProfile,
+  printer: Pick<
+    PrinterForm,
+    'supportedFormats' | 'supportedMedia' | 'supportedDocumentTypes'
+  >,
+) {
+  return containsAll(agent.supportedFormats, printer.supportedFormats)
+    && containsAll(agent.supportedMedia, printer.supportedMedia)
+    && containsAll(agent.supportedDocumentTypes, printer.supportedDocumentTypes)
+}
+
+function isBundledRawZplCapability(agent: OperationsPrintAgentProfile) {
+  return agent.supportedFormats.length === BUNDLED_AGENT_FORMATS.length
+    && containsAll(agent.supportedFormats, BUNDLED_AGENT_FORMATS)
+    && agent.supportedMedia.length === BUNDLED_AGENT_MEDIA.length
+    && containsAll(agent.supportedMedia, BUNDLED_AGENT_MEDIA)
+    && agent.supportedDocumentTypes.length === BUNDLED_AGENT_DOCUMENT_TYPES.length
+    && containsAll(agent.supportedDocumentTypes, BUNDLED_AGENT_DOCUMENT_TYPES)
+}
+
 function DetailField({ term, value }: { term: string; value: ReactNode }) {
   return (
     <Box sx={{ minWidth: 0 }}>
@@ -212,14 +251,24 @@ function defaultForm(warehouseId: string): PrinterForm {
     stationType: 'shipping',
     printerType: 'thermal',
     connectionMode: 'local_agent',
-    supportedFormats: ['ZPL', 'PDF'],
-    supportedMedia: ['label_4x6'],
-    supportedDocumentTypes: ['shipping_label', 'return_label'],
+    supportedFormats: [...BUNDLED_AGENT_FORMATS],
+    supportedMedia: [...BUNDLED_AGENT_MEDIA],
+    supportedDocumentTypes: [...BUNDLED_AGENT_DOCUMENT_TYPES],
     defaultDocumentTypes: [],
     fallbackPrinterGlobalId: null,
     localPrintAgentGlobalId: null,
     priority: 100,
     status: 'offline',
+  }
+}
+
+function defaultEnrollmentForm(warehouseId: string): AgentEnrollmentForm {
+  return {
+    warehouseId,
+    name: '',
+    supportedFormats: [...BUNDLED_AGENT_FORMATS],
+    supportedMedia: [...BUNDLED_AGENT_MEDIA],
+    supportedDocumentTypes: [...BUNDLED_AGENT_DOCUMENT_TYPES],
   }
 }
 
@@ -260,11 +309,13 @@ function MultiSelect({
   options,
   selected,
   onChange,
+  helperText,
 }: {
   label: string
   options: readonly string[]
   selected: string[]
   onChange: (value: string[]) => void
+  helperText?: string
 }) {
   return (
     <TextField
@@ -273,6 +324,7 @@ function MultiSelect({
       size="small"
       label={fieldLabel}
       value={selected}
+      helperText={helperText}
       onChange={(event) => onChange(values(event.target.value))}
       SelectProps={{
         multiple: true,
@@ -313,7 +365,7 @@ export default function PrinterConfigurationPanel() {
   const [notice, setNotice] = useState('')
   const [selectedJob, setSelectedJob] = useState<OperationsPrintJobListItem | null>(null)
   const [printerForm, setPrinterForm] = useState<PrinterForm | null>(null)
-  const [enrollForm, setEnrollForm] = useState<{ warehouseId: string; name: string } | null>(null)
+  const [enrollForm, setEnrollForm] = useState<AgentEnrollmentForm | null>(null)
   const [agentAction, setAgentAction] = useState<{
     agent: OperationsPrintAgentProfile
     action: 'rotate-credential' | 'revoke-agent'
@@ -384,11 +436,55 @@ export default function PrinterConfigurationPanel() {
     [printerForm, printers?.printers],
   )
 
+  const selectedAgent = useMemo(
+    () => agents?.agents.find((agent) => (
+      agent.globalId === printerForm?.localPrintAgentGlobalId
+    )) || null,
+    [agents?.agents, printerForm?.localPrintAgentGlobalId],
+  )
+
+  const selectedAgentCompatible = Boolean(
+    printerForm
+    && selectedAgent
+    && selectedAgent.status === 'active'
+    && selectedAgent.warehouseId === printerForm.warehouseId
+    && agentSupportsPrinter(selectedAgent, printerForm),
+  )
+
   const agentOptions = useMemo(
     () => agents?.agents.filter((agent) => (
-      agent.warehouseId === printerForm?.warehouseId && agent.status === 'active'
+      agent.warehouseId === printerForm?.warehouseId
+      && agent.status === 'active'
+      && Boolean(printerForm && agentSupportsPrinter(agent, printerForm))
     )) || [],
-    [agents?.agents, printerForm?.warehouseId],
+    [agents?.agents, printerForm],
+  )
+
+  const printerFormatOptions = useMemo(() => {
+    const typeOptions: PrintFormat[] = printerForm?.printerType === 'thermal'
+      ? [...PRINT_FORMATS]
+      : ['PDF', 'PNG']
+    return selectedAgent && selectedAgentCompatible
+      ? typeOptions.filter((item) => selectedAgent.supportedFormats.includes(item))
+      : typeOptions
+  }, [printerForm?.printerType, selectedAgent, selectedAgentCompatible])
+
+  const printerMediaOptions = useMemo(() => {
+    const typeOptions: PrintMedia[] = printerForm?.printerType === 'thermal'
+      ? ['label_4x6', 'label_4x8']
+      : ['letter', 'a4']
+    return selectedAgent && selectedAgentCompatible
+      ? typeOptions.filter((item) => selectedAgent.supportedMedia.includes(item))
+      : typeOptions
+  }, [printerForm?.printerType, selectedAgent, selectedAgentCompatible])
+
+  const printerDocumentOptions = useMemo(
+    () => selectedAgent && selectedAgentCompatible
+      ? PRINT_DOCUMENT_TYPES.filter((item) => (
+        selectedAgent.supportedDocumentTypes.includes(item)
+      ))
+      : PRINT_DOCUMENT_TYPES,
+    [selectedAgent, selectedAgentCompatible],
   )
 
   function updatePrinter<K extends keyof PrinterForm>(key: K, value: PrinterForm[K]) {
@@ -414,17 +510,21 @@ export default function PrinterConfigurationPanel() {
           ],
           defaultDocumentTypes: [],
           fallbackPrinterGlobalId: null,
+          localPrintAgentGlobalId: null,
+          status: current.connectionMode === 'local_agent' ? 'offline' : current.status,
         }
       }
       return {
         ...current,
         printerType,
         stationType: current.stationType === 'office' ? 'shipping' : current.stationType,
-        supportedFormats: ['ZPL', 'PDF'],
-        supportedMedia: ['label_4x6', 'label_4x8'],
-        supportedDocumentTypes: ['shipping_label', 'return_label', 'carton_label'],
+        supportedFormats: [...BUNDLED_AGENT_FORMATS],
+        supportedMedia: [...BUNDLED_AGENT_MEDIA],
+        supportedDocumentTypes: [...BUNDLED_AGENT_DOCUMENT_TYPES],
         defaultDocumentTypes: [],
         fallbackPrinterGlobalId: null,
+        localPrintAgentGlobalId: null,
+        status: current.connectionMode === 'local_agent' ? 'offline' : current.status,
       }
     })
   }
@@ -442,22 +542,74 @@ export default function PrinterConfigurationPanel() {
     } : current)
   }
 
+  function chooseSupportedCapability<
+    K extends 'supportedFormats' | 'supportedMedia' | 'supportedDocumentTypes',
+  >(key: K, next: PrinterForm[K]) {
+    setPrinterForm((current) => {
+      if (!current) return current
+      const nextForm: PrinterForm = {
+        ...current,
+        [key]: next,
+        defaultDocumentTypes: key === 'supportedDocumentTypes'
+          ? current.defaultDocumentTypes.filter((item) => (
+            (next as PrintDocumentType[]).includes(item)
+          ))
+          : current.defaultDocumentTypes,
+        fallbackPrinterGlobalId: null,
+      }
+      const agent = agents?.agents.find((item) => (
+        item.globalId === current.localPrintAgentGlobalId
+      ))
+      const keepAgent = Boolean(
+        agent
+        && agent.status === 'active'
+        && agent.warehouseId === current.warehouseId
+        && agentSupportsPrinter(agent, nextForm),
+      )
+      return {
+        ...nextForm,
+        localPrintAgentGlobalId: keepAgent ? current.localPrintAgentGlobalId : null,
+        status: current.connectionMode === 'local_agent' && !keepAgent
+          ? 'offline'
+          : current.status,
+      }
+    })
+  }
+
   function chooseSupportedDocuments(next: string[]) {
-    const supported = next as PrintDocumentType[]
-    setPrinterForm((current) => current ? {
-      ...current,
-      supportedDocumentTypes: supported,
-      defaultDocumentTypes: current.defaultDocumentTypes.filter((item) => (
-        supported.includes(item)
-      )),
-      fallbackPrinterGlobalId: null,
-    } : current)
+    chooseSupportedCapability('supportedDocumentTypes', next as PrintDocumentType[])
+  }
+
+  function chooseSupportedFormats(next: string[]) {
+    chooseSupportedCapability('supportedFormats', next as PrintFormat[])
+  }
+
+  function chooseSupportedMedia(next: string[]) {
+    chooseSupportedCapability('supportedMedia', next as PrintMedia[])
   }
 
   async function savePrinter() {
     if (!printerForm) return
     if (!printerForm.code.trim() || !printerForm.name.trim()) {
       setError('Printer code and name are required')
+      return
+    }
+    if (
+      !printerForm.supportedFormats.length
+      || !printerForm.supportedMedia.length
+      || !printerForm.supportedDocumentTypes.length
+    ) {
+      setError('Select at least one supported format, media size, and document type')
+      return
+    }
+    if (
+      printerForm.connectionMode === 'local_agent'
+      && printerForm.localPrintAgentGlobalId
+      && !selectedAgentCompatible
+    ) {
+      setError(
+        'Choose an active local print agent that supports every selected format, media size, and document type',
+      )
       return
     }
     setSaving(true)
@@ -490,6 +642,14 @@ export default function PrinterConfigurationPanel() {
 
   async function enrollAgent() {
     if (!enrollForm) return
+    if (
+      !enrollForm.supportedFormats.length
+      || !enrollForm.supportedMedia.length
+      || !enrollForm.supportedDocumentTypes.length
+    ) {
+      setError('Select at least one agent format, media size, and document type')
+      return
+    }
     setSaving(true)
     setError('')
     setNotice('')
@@ -500,7 +660,14 @@ export default function PrinterConfigurationPanel() {
           'Content-Type': 'application/json',
           'Idempotency-Key': crypto.randomUUID(),
         },
-        body: JSON.stringify({ action: 'enroll-agent', ...enrollForm }),
+        body: JSON.stringify({
+          action: 'enroll-agent',
+          warehouseId: enrollForm.warehouseId,
+          name: enrollForm.name.trim(),
+          supportedFormats: enrollForm.supportedFormats,
+          supportedMedia: enrollForm.supportedMedia,
+          supportedDocumentTypes: enrollForm.supportedDocumentTypes,
+        }),
       })
       const result = await responsePayload<PrintAgentPayload>(response)
       if (!response.ok || !result.ok || !result.agent) {
@@ -832,10 +999,9 @@ export default function PrinterConfigurationPanel() {
                 variant="contained"
                 startIcon={<TokenRounded />}
                 disabled={!printers?.warehouses[0]}
-                onClick={() => setEnrollForm({
-                  warehouseId: printers?.warehouses[0]?.id || '',
-                  name: '',
-                })}
+                onClick={() => setEnrollForm(defaultEnrollmentForm(
+                  printers?.warehouses[0]?.id || '',
+                ))}
               >
                 Enroll agent
               </Button>
@@ -861,11 +1027,35 @@ export default function PrinterConfigurationPanel() {
                       <Typography fontWeight={700}>{agent.name}</Typography>
                       <Chip size="small" label={label(agent.status)} color={statusColor(agent.status)} />
                       <Chip size="small" label={`Credential v${agent.credentialVersion}`} variant="outlined" />
+                      <Chip
+                        size="small"
+                        color={isBundledRawZplCapability(agent) ? 'info' : 'secondary'}
+                        label={isBundledRawZplCapability(agent)
+                          ? 'Bundled-compatible raw ZPL'
+                          : 'Custom capability agent'}
+                        variant="outlined"
+                      />
                     </Stack>
                     <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
                       {agent.warehouseName} · Last seen {timestamp(agent.lastSeenAt)}
                     </Typography>
                     <Typography variant="caption" color="#A8C7FA">{agent.globalId}</Typography>
+                    <Stack direction="row" gap={0.75} flexWrap="wrap" useFlexGap sx={{ mt: 1 }}>
+                      {agent.supportedFormats.map((item) => (
+                        <Chip
+                          key={`format-${item}`}
+                          size="small"
+                          label={item === 'ZPL' ? 'Raw ZPL' : item}
+                          variant="outlined"
+                        />
+                      ))}
+                      {agent.supportedMedia.map((item) => (
+                        <Chip key={`media-${item}`} size="small" label={label(item)} variant="outlined" />
+                      ))}
+                      {agent.supportedDocumentTypes.map((item) => (
+                        <Chip key={`document-${item}`} size="small" label={label(item)} variant="outlined" />
+                      ))}
+                    </Stack>
                     <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 0.5 }}>
                       Printers: {agent.assignedPrinters.map((printer) => printer.name).join(', ') || 'None'}
                     </Typography>
@@ -1188,6 +1378,16 @@ export default function PrinterConfigurationPanel() {
           </DialogContent>
         )}
         <DialogActions sx={{ flexWrap: 'wrap' }}>
+          {selectedJob?.artifactGlobalId && (
+            <Button
+              component="a"
+              href={`/api/operations/artifacts/${encodeURIComponent(selectedJob.artifactGlobalId)}`}
+              download
+              startIcon={<DownloadRounded />}
+            >
+              Download {selectedJob.format || 'artifact'}
+            </Button>
+          )}
           {selectedJob?.status === 'failed'
             && jobs?.capabilities.canExecute
             && selectedJob.attempts < selectedJob.maxAttempts && (
@@ -1321,31 +1521,32 @@ export default function PrinterConfigurationPanel() {
               </Stack>
               <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.5}>
                 <MultiSelect
-                  label="Formats"
-                  options={printerForm.printerType === 'thermal' ? PRINT_FORMATS : ['PDF', 'PNG']}
+                  label="Printer formats"
+                  options={printerFormatOptions}
                   selected={printerForm.supportedFormats}
-                  onChange={(next) => {
-                    updatePrinter('supportedFormats', next as PrintFormat[])
-                    updatePrinter('fallbackPrinterGlobalId', null)
-                  }}
+                  onChange={chooseSupportedFormats}
+                  helperText={selectedAgentCompatible
+                    ? `Limited to ${selectedAgent?.name}'s declared runtime capabilities.`
+                    : 'Raw ZPL is the safe choice for the bundled Zebra local agent.'}
                 />
                 <MultiSelect
-                  label="Media"
-                  options={printerForm.printerType === 'thermal'
-                    ? ['label_4x6', 'label_4x8']
-                    : ['letter', 'a4']}
+                  label="Printer media"
+                  options={printerMediaOptions}
                   selected={printerForm.supportedMedia}
-                  onChange={(next) => {
-                    updatePrinter('supportedMedia', next as PrintMedia[])
-                    updatePrinter('fallbackPrinterGlobalId', null)
-                  }}
+                  onChange={chooseSupportedMedia}
+                  helperText={selectedAgentCompatible
+                    ? `Limited to ${selectedAgent?.name}'s declared runtime capabilities.`
+                    : undefined}
                 />
               </Stack>
               <MultiSelect
                 label="Supported documents"
-                options={PRINT_DOCUMENT_TYPES}
+                options={printerDocumentOptions}
                 selected={printerForm.supportedDocumentTypes}
                 onChange={chooseSupportedDocuments}
+                helperText={selectedAgentCompatible
+                  ? `Limited to ${selectedAgent?.name}'s declared runtime capabilities.`
+                  : undefined}
               />
               <MultiSelect
                 label="Default routes"
@@ -1368,13 +1569,33 @@ export default function PrinterConfigurationPanel() {
                     localPrintAgentGlobalId: event.target.value || null,
                     status: event.target.value ? current.status : 'offline',
                   } : current)}
+                  helperText={!agentOptions.length
+                    ? 'No active agent in this warehouse declares every selected format, media size, and document type.'
+                    : 'Only agents whose declared capabilities cover this printer are available.'}
                   sx={fieldSx}
                 >
                   <MenuItem value="">Not assigned</MenuItem>
+                  {selectedAgent && !selectedAgentCompatible && (
+                    <MenuItem value={selectedAgent.globalId} disabled>
+                      {selectedAgent.name} — incompatible existing assignment
+                    </MenuItem>
+                  )}
                   {agentOptions.map((agent) => (
-                    <MenuItem key={agent.globalId} value={agent.globalId}>{agent.name}</MenuItem>
+                    <MenuItem key={agent.globalId} value={agent.globalId}>
+                      {agent.name} — {isBundledRawZplCapability(agent)
+                        ? 'bundled-compatible raw ZPL'
+                        : 'custom capabilities'}
+                    </MenuItem>
                   ))}
                 </TextField>
+              )}
+              {printerForm.connectionMode === 'local_agent'
+                && printerForm.localPrintAgentGlobalId
+                && !selectedAgentCompatible && (
+                <Alert severity="error">
+                  This assignment is incompatible. Choose an active agent that supports every
+                  selected printer capability before saving.
+                </Alert>
               )}
               <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.5}>
                 <TextField
@@ -1430,7 +1651,22 @@ export default function PrinterConfigurationPanel() {
         )}
         <DialogActions>
           <Button onClick={() => setPrinterForm(null)} disabled={saving}>Cancel</Button>
-          <Button variant="contained" onClick={() => void savePrinter()} disabled={saving}>
+          <Button
+            variant="contained"
+            onClick={() => void savePrinter()}
+            disabled={
+              saving
+              || !printerForm
+              || !printerForm.supportedFormats.length
+              || !printerForm.supportedMedia.length
+              || !printerForm.supportedDocumentTypes.length
+              || (
+                printerForm.connectionMode === 'local_agent'
+                && Boolean(printerForm.localPrintAgentGlobalId)
+                && !selectedAgentCompatible
+              )
+            }
+          >
             {saving ? 'Saving...' : 'Save printer'}
           </Button>
         </DialogActions>
@@ -1446,6 +1682,16 @@ export default function PrinterConfigurationPanel() {
         {enrollForm && (
           <DialogContent dividers>
             <Stack spacing={2}>
+              <Alert severity="info">
+                <Typography variant="body2" fontWeight={700}>
+                  Bundled Zebra runtime: raw UTF-8 ZPL only
+                </Typography>
+                <Typography variant="body2">
+                  The safe preset accepts 4 x 6 carrier shipping labels. Declare PDF, PNG,
+                  4 x 8, return labels, or office documents only for a separately maintained
+                  custom agent that you have tested.
+                </Typography>
+              </Alert>
               <TextField
                 select
                 fullWidth
@@ -1468,6 +1714,52 @@ export default function PrinterConfigurationPanel() {
                 inputProps={{ maxLength: 120 }}
                 sx={fieldSx}
               />
+              <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.5}>
+                <MultiSelect
+                  label="Agent formats"
+                  options={PRINT_FORMATS}
+                  selected={enrollForm.supportedFormats}
+                  onChange={(next) => setEnrollForm({
+                    ...enrollForm,
+                    supportedFormats: next as PrintFormat[],
+                  })}
+                  helperText="Raw ZPL is the bundled runtime default."
+                />
+                <MultiSelect
+                  label="Agent media"
+                  options={PRINT_MEDIA}
+                  selected={enrollForm.supportedMedia}
+                  onChange={(next) => setEnrollForm({
+                    ...enrollForm,
+                    supportedMedia: next as PrintMedia[],
+                  })}
+                  helperText="4 x 6 labels are the bundled runtime default."
+                />
+              </Stack>
+              <MultiSelect
+                label="Agent document types"
+                options={PRINT_DOCUMENT_TYPES}
+                selected={enrollForm.supportedDocumentTypes}
+                onChange={(next) => setEnrollForm({
+                  ...enrollForm,
+                  supportedDocumentTypes: next as PrintDocumentType[],
+                })}
+                helperText="Carrier shipping labels are the bundled runtime default."
+              />
+              <Box>
+                <Button
+                  size="small"
+                  variant="outlined"
+                  onClick={() => setEnrollForm({
+                    ...enrollForm,
+                    supportedFormats: [...BUNDLED_AGENT_FORMATS],
+                    supportedMedia: [...BUNDLED_AGENT_MEDIA],
+                    supportedDocumentTypes: [...BUNDLED_AGENT_DOCUMENT_TYPES],
+                  })}
+                >
+                  Use bundled Zebra defaults
+                </Button>
+              </Box>
             </Stack>
           </DialogContent>
         )}
@@ -1476,7 +1768,14 @@ export default function PrinterConfigurationPanel() {
           <Button
             variant="contained"
             onClick={() => void enrollAgent()}
-            disabled={saving || !enrollForm?.name.trim()}
+            disabled={
+              saving
+              || !enrollForm
+              || !enrollForm.name.trim()
+              || !enrollForm.supportedFormats.length
+              || !enrollForm.supportedMedia.length
+              || !enrollForm.supportedDocumentTypes.length
+            }
           >
             {saving ? 'Enrolling...' : 'Enroll'}
           </Button>
