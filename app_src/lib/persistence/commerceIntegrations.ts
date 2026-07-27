@@ -420,6 +420,50 @@ function runtimeCredential(
   }
 }
 
+export async function recordCommerceCredentialRevealInPostgres(input: {
+  organizationId: string
+  accountGlobalId: string
+  actorEmail: string
+  credentialVersion: number
+}) {
+  await withTransaction(async (client) => {
+    const result = await client.query<{
+      global_id: string
+      provider: CommerceProvider
+      environment: CommerceEnvironment
+      credential_version: number
+    }>(
+      `SELECT account.global_id, account.provider, account.environment,
+         credential.credential_version
+       FROM operations_integration_accounts account
+       JOIN operations_commerce_credentials credential
+         ON credential.organization_id = account.organization_id
+        AND credential.integration_account_id = account.id
+       WHERE account.organization_id = $1::uuid
+         AND account.global_id = $2
+         AND account.integration_type = 'commerce'
+         AND account.provider IN ('shopify', 'faire')
+         AND credential.credential_version =
+           account.commerce_credential_generation
+       FOR SHARE OF account, credential`,
+      [input.organizationId, input.accountGlobalId],
+    )
+    const row = result.rows[0]
+    if (!row || row.credential_version !== input.credentialVersion) {
+      throw new Error('Commerce credentials are not configured')
+    }
+    await auditCommerce(client, {
+      actorEmail: input.actorEmail,
+      organizationId: input.organizationId,
+      eventType: 'commerce.credential.revealed',
+      globalId: row.global_id,
+      provider: row.provider,
+      environment: row.environment,
+      payload: { credentialVersion: row.credential_version },
+    })
+  })
+}
+
 async function auditCommerce(
   client: PoolClient,
   input: {

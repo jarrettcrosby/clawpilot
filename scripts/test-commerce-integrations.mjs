@@ -159,7 +159,10 @@ includes(persistence, [
   "'commerce.integration.disabled'",
   "'commerce.shopify.scopes_updated'",
   "'commerce.credential.disconnected'",
+  "'commerce.credential.revealed'",
   "'commerce.webhook.received'",
+  'recordCommerceCredentialRevealInPostgres',
+  'payload: { credentialVersion: row.credential_version }',
   'disableIntegration?: boolean',
   "reason: 'shopify_scope_profile_incomplete'",
   'scopeProfileIncomplete',
@@ -221,6 +224,27 @@ assert.ok(
   ),
   'Sales-channel reads must purge expired Faire OAuth staging rows',
 )
+const revealPersistenceSource = persistence.slice(
+  persistence.indexOf(
+    'export async function recordCommerceCredentialRevealInPostgres',
+  ),
+  persistence.indexOf('async function auditCommerce'),
+)
+includes(revealPersistenceSource, [
+  'account.organization_id = $1::uuid',
+  'account.global_id = $2',
+  "account.integration_type = 'commerce'",
+  "account.provider IN ('shopify', 'faire')",
+  'credential.credential_version =',
+  'account.commerce_credential_generation',
+  'FOR SHARE OF account, credential',
+  "'commerce.credential.revealed'",
+], 'Commerce credential reveal persistence')
+assert.doesNotMatch(
+  revealPersistenceSource,
+  /\b(?:credential_ciphertext|credential_iv|credential_tag|clientSecret|applicationSecret|accessToken)\b/,
+  'Commerce reveal audit persistence must never select or record secret material',
+)
 
 const service = read('app_src/lib/integrations/commerceIntegrations.ts')
 includes(service, [
@@ -258,6 +282,9 @@ includes(service, [
   "topic === 'app/scopes_update'",
   'SHOPIFY_WEBHOOK_TOPIC_UNSUPPORTED',
   'Faire runtime polling is not implemented',
+  'revealCommerceCredential',
+  'recordCommerceCredentialRevealInPostgres',
+  'expiresAt: new Date(revealedAt.getTime() + 30_000).toISOString()',
 ], 'Commerce service')
 const faireOauthStartSource = service.slice(
   service.indexOf('export async function startFaireOAuthCommerce'),
@@ -296,6 +323,32 @@ assert.ok(
   !service.includes('console.'),
   'Commerce integration service must not log credentials',
 )
+const revealServiceSource = service.slice(
+  service.indexOf('export async function revealCommerceCredential'),
+  service.indexOf('export async function connectShopifyCommerce'),
+)
+includes(revealServiceSource, [
+  "credential.authMode === 'shopify_client_credentials'",
+  'clientId: credential.clientId',
+  'clientSecret: credential.clientSecret',
+  "credential.authMode === 'faire_oauth'",
+  'applicationId: credential.applicationId',
+  'applicationSecret: credential.applicationSecret',
+  "'COMMERCE_CREDENTIAL_REVEAL_UNAVAILABLE'",
+  'accountGlobalId: runtime.globalId',
+  'credentialVersion: runtime.credentialVersion',
+  'recordCommerceCredentialRevealInPostgres',
+  'revealedAt: revealedAt.toISOString()',
+], 'Commerce credential reveal service')
+assert.doesNotMatch(
+  revealServiceSource,
+  /\baccessToken\s*:/,
+  'Commerce reveal response must never include a Faire OAuth or brand access token',
+)
+assert.ok(
+  !revealServiceSource.includes('...credential'),
+  'Commerce reveal response must allow-list application credentials',
+)
 
 const adminRoute = read(
   'app_src/app/api/integrations/commerce/route.ts',
@@ -310,6 +363,12 @@ includes(adminRoute, [
   "action === 'test-connection'",
   "action === 'set-enabled'",
   "action === 'disconnect'",
+  "action === 'reveal-credential'",
+  'canRevealCredentials: canRevealCredential(actor)',
+  'requireCredentialViewer(actor)',
+  "return role === 'owner' || role === 'admin'",
+  "'COMMERCE_CREDENTIAL_REVEAL_FORBIDDEN'",
+  'revealCommerceCredential',
   'confirmLiveAccess',
   "'clientId'",
   "'applicationId'",
@@ -329,6 +388,23 @@ assert.ok(
   !adminRoute.includes("'accessToken',\n        'clientSecret'"),
   'Shopify Admin API must not accept a pasted short-lived access token',
 )
+
+const integrationsDoc = read('docs/modules/user-integrations.md')
+includes(integrationsDoc, [
+  'scripts/establish-ag-alchemy-development.mjs',
+  'limited to the Railway development database',
+  'read-only identity/scope GraphQL query',
+  'operator-approved read-only set `read_all_orders`',
+  '`read_merchant_managed_fulfillment_orders`',
+  'Any granted scope beginning `write_` fails closed',
+  'additional granted `read_` scopes remain',
+  'leaves the target verified but disabled with pristine cursors',
+  'existing default workspace plus non-Shopify shipping, warehouse, printer, and print-agent identities',
+  'explicitly reveal only the current Shopify client ID/client secret or current Faire OAuth Application ID/Secret ID',
+  'removed from the page after 30 seconds',
+  'Legacy Faire brand-token credentials are not revealable',
+  'never returns Shopify short-lived access tokens, Faire OAuth or brand access tokens',
+], 'Commerce credential and development-establishment documentation')
 
 const webhookRoute = read(
   'app_src/app/api/integrations/commerce/shopify/webhooks/[accountGlobalId]/route.ts',
@@ -399,6 +475,16 @@ const panel = read(
   'app_src/components/settings/CommerceIntegrationPanel.tsx',
 )
 includes(panel, [
+  'Math.min(',
+  '30_000,',
+  'Date.parse(revealedCredential.expiresAt) - Date.now()',
+  "window.addEventListener('blur', clearRevealedCredential)",
+  "window.addEventListener('pagehide', clearRevealedCredential)",
+  "document.addEventListener('visibilitychange', clearWhenHidden)",
+  'operating-system clipboard',
+  'automatically clear',
+], 'Commerce credential reveal browser lifetime cap')
+includes(panel, [
   'Sales channels',
   'separate from restaurant POS',
   'These are user-owned custom integrations',
@@ -438,7 +524,30 @@ includes(panel, [
   "applicationId: ''",
   "applicationSecret: ''",
   "clientSecret: ''",
+  'useRef(integrations.organizationId)',
+  'payload.integrations.organizationId',
+  '!== organizationIdRef.current',
+  'const revealOrganizationId = organizationIdRef.current',
+  'organizationIdRef.current === revealOrganizationId',
 ], 'Commerce settings UI')
+const revealPanelSource = panel.slice(
+  panel.indexOf('async function revealCredential'),
+  panel.indexOf('async function copyRevealedCredential'),
+)
+assert.ok(
+  revealPanelSource.indexOf('setRevealedCredential(null)')
+    < revealPanelSource.indexOf('window.confirm'),
+  'Starting another credential reveal must clear the prior plaintext first',
+)
+const applyPayloadSource = panel.slice(
+  panel.indexOf('function applyPayload'),
+  panel.indexOf('useEffect(() =>'),
+)
+assert.ok(
+  applyPayloadSource.indexOf('setRevealedCredential(null)')
+    < applyPayloadSource.indexOf('setIntegrations(payload.integrations)'),
+  'A workspace change must clear plaintext before applying the next organization',
+)
 const integrationSettings = read(
   'app_src/components/settings/IntegrationSettingsPanel.tsx',
 )

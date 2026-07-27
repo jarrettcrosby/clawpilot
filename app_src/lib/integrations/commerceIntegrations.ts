@@ -56,6 +56,7 @@ import {
   readCommerceIntegrationsStateFromPostgres,
   readCommerceRuntimeCredentialFromPostgres,
   readCommerceWebhookCredentialFromPostgres,
+  recordCommerceCredentialRevealInPostgres,
   recordCommerceProviderAttemptInPostgres,
   recordShopifyWebhookReceiptInPostgres,
   setCommerceIntegrationEnabledInPostgres,
@@ -575,6 +576,70 @@ export async function getCommerceIntegrationsState(
         ? webhookUrl(account.globalId)
         : null,
     })),
+  }
+}
+
+export async function revealCommerceCredential(input: {
+  organizationId: unknown
+  accountGlobalId: unknown
+  actorEmail: string
+}) {
+  try {
+    const runtime = await storedRuntime(input)
+    const credential = decryptStoredCredential(runtime)
+    let revealable:
+      | {
+          clientId: string
+          clientSecret: string
+        }
+      | {
+          applicationId: string
+          applicationSecret: string
+        }
+    if (
+      runtime.provider === 'shopify'
+      && credential.provider === 'shopify'
+      && credential.authMode === 'shopify_client_credentials'
+    ) {
+      revealable = {
+        clientId: credential.clientId,
+        clientSecret: credential.clientSecret,
+      }
+    } else if (
+      runtime.provider === 'faire'
+      && credential.provider === 'faire'
+      && credential.authMode === 'faire_oauth'
+    ) {
+      revealable = {
+        applicationId: credential.applicationId,
+        applicationSecret: credential.applicationSecret,
+      }
+    } else {
+      throw new CommerceIntegrationRequestError(
+        'This Faire connection does not store an application ID and Secret ID',
+        409,
+        'COMMERCE_CREDENTIAL_REVEAL_UNAVAILABLE',
+      )
+    }
+    await recordCommerceCredentialRevealInPostgres({
+      organizationId: runtime.organizationId,
+      accountGlobalId: runtime.globalId,
+      actorEmail: input.actorEmail,
+      credentialVersion: runtime.credentialVersion,
+    })
+    const revealedAt = new Date()
+    return {
+      provider: runtime.provider,
+      environment: runtime.environment,
+      accountGlobalId: runtime.globalId,
+      authMode: runtime.authMode,
+      credentialVersion: runtime.credentialVersion,
+      ...revealable,
+      revealedAt: revealedAt.toISOString(),
+      expiresAt: new Date(revealedAt.getTime() + 30_000).toISOString(),
+    }
+  } catch (error) {
+    throw sanitize(error)
   }
 }
 

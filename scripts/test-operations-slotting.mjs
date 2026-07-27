@@ -15,6 +15,12 @@ const health = read('app_src/app/api/health/route.ts')
 const predeploy = read('scripts/verify-predeploy.mjs')
 const simulation = read('scripts/seed-wms-development-simulation.mjs')
 const simulationRunbook = read('docs/modules/wms-development-simulation.md')
+const normalization = read(
+  'scripts/normalize-express-parcel-development-warehouse.mjs',
+)
+const normalizationRunbook = read(
+  'docs/operations/express-parcel-development-warehouse-normalization.md',
+)
 const rootPackage = read('package.json')
 const crmPersistence = read('app_src/lib/persistence/crm.ts')
 
@@ -180,6 +186,89 @@ for (const fragment of [
 ]) {
   assert.ok(simulation.includes(fragment), `Development simulation missing ${fragment}`)
 }
+for (const fragment of [
+  'retire-wms-simulation-preserve-printing-v1',
+  '--cleanup-preserve-warehouse',
+  'assertPreservedPrintingRetained',
+  'assertExpectedDatabaseFingerprint',
+  'PRESERVE_DISPOSABLE_REHEARSAL_CONFIRMATION',
+  'TRUSTED_RAILWAY_DEVELOPMENT_ENVIRONMENT_ID',
+  'WMS_SIM_EXPECTED_DATABASE_FINGERPRINT',
+  'WMS_SIM_PRESERVE_FOREIGN_POSITION_GLOBAL_ID',
+]) {
+  assert.ok(
+    simulation.includes(fragment),
+    `Development preserve cleanup missing ${fragment}`,
+  )
+}
+for (const fragment of [
+  'prepare-express-parcel-dev-warehouse-v1',
+  'finalize-express-parcel-dev-warehouse-v1',
+  'EXPRESS_PARCEL_DEV_PLAN_DIGEST',
+  'operations_inventory_ledger',
+  'MAX_PRINT_AGENT_AGE_MINUTES = 15',
+  'assertSourceLocationsMovable',
+  'DISPOSABLE_REHEARSAL_CONFIRMATION',
+  'TRUSTED_RAILWAY_DEVELOPMENT_ENVIRONMENT_ID',
+  'TRUSTED_RAILWAY_PROJECT_ID',
+  'WMS_SIM_EXPECTED_DATABASE_FINGERPRINT',
+  'WMS_SIM_PRESERVE_PRINTER_GLOBAL_ID',
+  "'supersededBy', $5::text",
+  "'formerScenarioKey', $6::text",
+]) {
+  assert.ok(
+    normalization.includes(fragment),
+    `Express Parcel normalization missing ${fragment}`,
+  )
+}
+assert.equal(
+  /\b(?:UPDATE|DELETE\s+FROM)\s+operations_contract_versions\b/i
+    .test(normalization),
+  false,
+  'Normalization must preserve immutable operations contract-version evidence',
+)
+const joinedLocationUpdates = [
+  ...normalization.matchAll(
+    /`UPDATE operations_locations location[\s\S]*?FROM operations_warehouses warehouse[\s\S]*?`/g,
+  ),
+]
+assert.equal(
+  joinedLocationUpdates.length,
+  2,
+  'Expected both joined location updates to remain covered',
+)
+for (const [joinedLocationUpdate] of joinedLocationUpdates) {
+  assert.ok(
+    joinedLocationUpdate.includes(
+      'row_version = location.row_version + 1',
+    ),
+    'Joined location updates must qualify the target row_version column',
+  )
+}
+const joinedSimulationLocationUpdates = [
+  ...simulation.matchAll(
+    /`UPDATE operations_locations location[\s\S]*?FROM operations_warehouses warehouse[\s\S]*?`/g,
+  ),
+]
+assert.equal(
+  joinedSimulationLocationUpdates.length,
+  1,
+  'Expected the joined simulation location update to remain covered',
+)
+assert.ok(
+  joinedSimulationLocationUpdates[0][0].includes(
+    'row_version = location.row_version + 1',
+  ),
+  'Joined simulation location updates must qualify the target row_version column',
+)
+const simulationMain = simulation.slice(
+  simulation.indexOf('async function main()'),
+)
+assert.ok(
+  simulationMain.indexOf('assertExpectedDatabaseFingerprint(')
+    < simulationMain.indexOf('await cleanupScenario('),
+  'Preserve cleanup must verify the expected database identity before its transaction',
+)
 assert.equal(
   (
     simulation.match(
@@ -303,6 +392,20 @@ for (const fragment of [
     `WMS development simulation runbook missing ${fragment}`,
   )
 }
+for (const fragment of [
+  'There is no production override.',
+  'compensating inventory-ledger entries',
+  'after.phase` as `wms_cleanup',
+  'immutable Zebra proof lineage',
+  'normalize-express-parcel-disposable-rehearsal-v1',
+  'retire-wms-simulation-disposable-rehearsal-v1',
+  'restores Operations to `read_only`',
+]) {
+  assert.ok(
+    normalizationRunbook.includes(fragment),
+    `Express Parcel normalization runbook missing ${fragment}`,
+  )
+}
 assert.equal(
   simulationRunbook.includes('A later generation run reactivates the same scenario'),
   false,
@@ -317,6 +420,12 @@ assert.ok(
     'node scripts/seed-wms-development-simulation.mjs --self-test',
   ),
   'Aggregate Operations tests must execute the simulator identity self-test',
+)
+assert.ok(
+  rootPackage.includes(
+    'node scripts/normalize-express-parcel-development-warehouse.mjs --self-test',
+  ),
+  'Aggregate Operations tests must execute the warehouse normalization self-test',
 )
 
 console.log('Operations slotting, replenishment, and development-simulation contracts passed.')

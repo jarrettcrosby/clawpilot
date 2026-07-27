@@ -7,10 +7,23 @@ const requireFromApp = createRequire(new URL('../app_src/package.json', import.m
 
 const SCENARIO_KEY = 'clawpilot-wms-development-v1'
 const SIMULATOR_LINEAGE_LOCK_PREFIX = 'clawpilot:wms-development-simulator-lineage'
+const PRESERVE_PRINTING_CONFIRMATION = 'retire-wms-simulation-preserve-printing-v1'
+const PRESERVE_DISPOSABLE_REHEARSAL_CONFIRMATION =
+  'retire-wms-simulation-disposable-rehearsal-v1'
+const TRUSTED_RAILWAY_PROJECT_ID =
+  'b5169ebd-8166-4b96-9a81-7cc8adaa9270'
+const TRUSTED_RAILWAY_DEVELOPMENT_ENVIRONMENT_ID =
+  'e4abd95f-825c-4242-b37b-825a92597e98'
 const DEFAULT_ANCHOR_DATE = '2026-07-25'
 const ALLOWED_ENVIRONMENTS = new Set(['dev', 'development', 'local'])
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/
+const WAREHOUSE_GLOBAL_ID_PATTERN = /^gwh[0-9]{7}$/
+const LOCATION_GLOBAL_ID_PATTERN = /^gwl[0-9]{7}$/
+const INVENTORY_POOL_GLOBAL_ID_PATTERN = /^gip[0-9]{7}$/
+const INVENTORY_POSITION_GLOBAL_ID_PATTERN = /^giv[0-9]{7}$/
+const PRINTER_GLOBAL_ID_PATTERN = /^gpr[0-9]{7}$/
+const PRINT_AGENT_GLOBAL_ID_PATTERN = /^gpt[0-9]{7}$/
 const FALSE_PERMISSIONS = Object.freeze({
   inviteUsers: false,
   manageUserAccess: false,
@@ -78,15 +91,27 @@ function isAllowedScenarioCustomerIdentity(customer, scenario) {
 
 function parseArguments(argv) {
   const flags = new Set(argv)
-  const unknown = argv.filter((value) => !['--cleanup', '--self-test', '--help'].includes(value))
+  const supported = [
+    '--cleanup',
+    '--cleanup-preserve-warehouse',
+    '--self-test',
+    '--help',
+  ]
+  const unknown = argv.filter((value) => !supported.includes(value))
   if (unknown.length > 0) {
     fail(`Unsupported argument(s): ${unknown.join(', ')}`)
   }
-  if (flags.has('--cleanup') && flags.has('--self-test')) {
-    fail('--cleanup and --self-test cannot be combined')
+  const selectedModes = [
+    flags.has('--cleanup'),
+    flags.has('--cleanup-preserve-warehouse'),
+    flags.has('--self-test'),
+  ].filter(Boolean).length
+  if (selectedModes > 1) {
+    fail('--cleanup, --cleanup-preserve-warehouse, and --self-test cannot be combined')
   }
   return {
     cleanup: flags.has('--cleanup'),
+    cleanupPreserveWarehouse: flags.has('--cleanup-preserve-warehouse'),
     selfTest: flags.has('--self-test'),
     help: flags.has('--help'),
   }
@@ -101,6 +126,7 @@ function isLocalDatabaseHost(hostname) {
   return normalized === 'localhost'
     || normalized === '127.0.0.1'
     || normalized === '::1'
+    || normalized === '[::1]'
     || normalized.endsWith('.localhost')
 }
 
@@ -166,6 +192,160 @@ function validateExecutionEnvironment(environment) {
     databaseUrl,
     anchorDate,
   }
+}
+
+function populatedRailwayMarkers(environment) {
+  return Object.entries(environment)
+    .filter(([key, value]) => (
+      key.startsWith('RAILWAY_') && String(value || '').trim()
+    ))
+    .map(([key]) => key)
+}
+
+function validatePreserveExecutionLane(environment) {
+  const rehearsalConfirmation = String(
+    environment.WMS_SIM_DISPOSABLE_REHEARSAL_CONFIRM || '',
+  ).trim()
+  if (rehearsalConfirmation) {
+    if (
+      rehearsalConfirmation
+        !== PRESERVE_DISPOSABLE_REHEARSAL_CONFIRMATION
+    ) {
+      fail(
+        'WMS_SIM_DISPOSABLE_REHEARSAL_CONFIRM='
+        + `${PRESERVE_DISPOSABLE_REHEARSAL_CONFIRMATION} is required`,
+      )
+    }
+    if (populatedRailwayMarkers(environment).length > 0) {
+      fail(
+        'Disposable rehearsal cannot run with Railway environment markers',
+      )
+    }
+    let database
+    try {
+      database = new URL(String(environment.DATABASE_URL || '').trim())
+    } catch {
+      fail('Disposable rehearsal requires a local PostgreSQL database URL')
+    }
+    if (!isLocalDatabaseHost(database.hostname)) {
+      fail('Disposable rehearsal requires a local PostgreSQL database URL')
+    }
+    return
+  }
+  if (
+    normalizedEnvironment(environment.RAILWAY_ENVIRONMENT_NAME)
+      !== 'development'
+  ) {
+    fail('RAILWAY_ENVIRONMENT_NAME=development is required for preserve cleanup')
+  }
+  if (
+    normalizedEnvironment(environment.RAILWAY_PROJECT_ID)
+      !== TRUSTED_RAILWAY_PROJECT_ID
+  ) {
+    fail('RAILWAY_PROJECT_ID does not match the trusted ClawPilot project')
+  }
+  if (
+    normalizedEnvironment(environment.RAILWAY_ENVIRONMENT_ID)
+      !== TRUSTED_RAILWAY_DEVELOPMENT_ENVIRONMENT_ID
+  ) {
+    fail(
+      'RAILWAY_ENVIRONMENT_ID does not match the trusted development environment',
+    )
+  }
+}
+
+function validatePreservePrintingConfiguration(environment) {
+  if (String(environment.WMS_SIM_PRESERVE_CONFIRM || '').trim()
+      !== PRESERVE_PRINTING_CONFIRMATION) {
+    fail(
+      `WMS_SIM_PRESERVE_CONFIRM=${PRESERVE_PRINTING_CONFIRMATION} is required`,
+    )
+  }
+  const warehouseGlobalId = String(
+    environment.WMS_SIM_PRESERVE_WAREHOUSE_GLOBAL_ID || '',
+  ).trim()
+  const printerGlobalId = String(
+    environment.WMS_SIM_PRESERVE_PRINTER_GLOBAL_ID || '',
+  ).trim()
+  const printAgentGlobalId = String(
+    environment.WMS_SIM_PRESERVE_PRINT_AGENT_GLOBAL_ID || '',
+  ).trim()
+  const foreignLocationGlobalId = String(
+    environment.WMS_SIM_PRESERVE_FOREIGN_LOCATION_GLOBAL_ID || '',
+  ).trim()
+  const foreignPoolGlobalId = String(
+    environment.WMS_SIM_PRESERVE_FOREIGN_POOL_GLOBAL_ID || '',
+  ).trim()
+  const foreignPositionGlobalId = String(
+    environment.WMS_SIM_PRESERVE_FOREIGN_POSITION_GLOBAL_ID || '',
+  ).trim()
+  const expectedDatabaseFingerprint = String(
+    environment.WMS_SIM_EXPECTED_DATABASE_FINGERPRINT || '',
+  ).trim().toLowerCase()
+  if (!UUID_PATTERN.test(expectedDatabaseFingerprint)) {
+    fail(
+      'WMS_SIM_EXPECTED_DATABASE_FINGERPRINT must be the exact '
+      + 'development database identity',
+    )
+  }
+  if (!WAREHOUSE_GLOBAL_ID_PATTERN.test(warehouseGlobalId)) {
+    fail('WMS_SIM_PRESERVE_WAREHOUSE_GLOBAL_ID must be an exact gwh Global ID')
+  }
+  if (!PRINTER_GLOBAL_ID_PATTERN.test(printerGlobalId)) {
+    fail('WMS_SIM_PRESERVE_PRINTER_GLOBAL_ID must be an exact gpr Global ID')
+  }
+  if (!PRINT_AGENT_GLOBAL_ID_PATTERN.test(printAgentGlobalId)) {
+    fail('WMS_SIM_PRESERVE_PRINT_AGENT_GLOBAL_ID must be an exact gpt Global ID')
+  }
+  if (!LOCATION_GLOBAL_ID_PATTERN.test(foreignLocationGlobalId)) {
+    fail(
+      'WMS_SIM_PRESERVE_FOREIGN_LOCATION_GLOBAL_ID must be an exact gwl Global ID',
+    )
+  }
+  if (!INVENTORY_POOL_GLOBAL_ID_PATTERN.test(foreignPoolGlobalId)) {
+    fail(
+      'WMS_SIM_PRESERVE_FOREIGN_POOL_GLOBAL_ID must be an exact gip Global ID',
+    )
+  }
+  if (!INVENTORY_POSITION_GLOBAL_ID_PATTERN.test(foreignPositionGlobalId)) {
+    fail(
+      'WMS_SIM_PRESERVE_FOREIGN_POSITION_GLOBAL_ID must be an exact giv Global ID',
+    )
+  }
+  return {
+    warehouseGlobalId,
+    printerGlobalId,
+    printAgentGlobalId,
+    foreignLocationGlobalId,
+    foreignPoolGlobalId,
+    foreignPositionGlobalId,
+    expectedDatabaseFingerprint,
+  }
+}
+
+function assertDatabaseFingerprint(actualFingerprint, expectedFingerprint) {
+  const actual = String(actualFingerprint || '').trim().toLowerCase()
+  if (!UUID_PATTERN.test(actual)) {
+    fail('Connected development database identity is missing or invalid')
+  }
+  if (actual !== expectedFingerprint) {
+    fail('Connected database identity does not match the approved development plan')
+  }
+  return actual
+}
+
+async function assertExpectedDatabaseFingerprint(client, expectedFingerprint) {
+  const database = (
+    await client.query(
+      `SELECT value->>'id' AS database_fingerprint
+       FROM app_settings
+       WHERE key = 'deployment.database.identity'`,
+    )
+  ).rows[0]
+  return assertDatabaseFingerprint(
+    database?.database_fingerprint,
+    expectedFingerprint,
+  )
 }
 
 function isoAt(anchorDate, dayOffset, hour, minute = 0) {
@@ -641,7 +821,13 @@ async function assertSimulatorLineageSeedable(client, scope) {
   }
 }
 
-async function resolveScenarioRetirementTarget(client, configuration, scope, scenario) {
+async function resolveScenarioRetirementTarget(
+  client,
+  configuration,
+  scope,
+  scenario,
+  preservePrinting = null,
+) {
   const integrationResult = await client.query(
     `SELECT integration.id::text, integration.global_id
      FROM operations_integration_accounts integration
@@ -679,6 +865,15 @@ async function resolveScenarioRetirementTarget(client, configuration, scope, sce
     )
   }
   const warehouse = warehouseResult.rows[0]
+  if (
+    preservePrinting
+    && warehouse.global_id !== preservePrinting.warehouseGlobalId
+  ) {
+    fail(
+      `Scenario cleanup preserve target is ${warehouse.global_id}, not `
+      + `${preservePrinting.warehouseGlobalId}`,
+    )
+  }
 
   const orderResult = await client.query(
     `SELECT orders.id::text, orders.external_order_id,
@@ -856,7 +1051,8 @@ async function resolveScenarioRetirementTarget(client, configuration, scope, sce
   }
 
   const locationResult = await client.query(
-    `SELECT location.id::text, location.code, location.notes
+    `SELECT location.id::text, location.global_id, location.code,
+            location.notes, location.active
      FROM operations_locations location
      WHERE location.organization_id = $1::uuid
        AND location.warehouse_id = $2::uuid
@@ -864,26 +1060,50 @@ async function resolveScenarioRetirementTarget(client, configuration, scope, sce
      FOR UPDATE`,
     [scope.organizationId, warehouse.id],
   )
+  const markedLocationRows = locationResult.rows.filter(
+    (location) => parsedObject(location.notes).scenarioKey === scenario.scenarioKey,
+  )
+  const foreignLocationRows = locationResult.rows.filter(
+    (location) => parsedObject(location.notes).scenarioKey !== scenario.scenarioKey,
+  )
   const expectedLocationCodes = scenario.locations
     .map((location) => location.code)
     .sort()
-  const actualLocationCodes = locationResult.rows
+  const actualLocationCodes = markedLocationRows
     .map((location) => location.code)
     .sort()
   const exactLocationSet = actualLocationCodes.length === expectedLocationCodes.length
     && actualLocationCodes.every(
       (code, index) => code === expectedLocationCodes[index],
     )
-  if (!exactLocationSet || locationResult.rows.some(
-    (location) => parsedObject(location.notes).scenarioKey !== scenario.scenarioKey
-  )) {
+  if (!exactLocationSet) {
     fail(
       `Scenario cleanup requires ${expectedLocationCodes.length} exact marked locations; `
-      + `found ${actualLocationCodes.length}`,
+      + `found ${actualLocationCodes.length} marked locations`,
     )
   }
+  if (!preservePrinting && foreignLocationRows.length > 0) {
+    fail(
+      `Scenario cleanup found ${foreignLocationRows.length} unrelated warehouse `
+      + 'location(s)',
+    )
+  }
+  if (preservePrinting) {
+    if (
+      foreignLocationRows.length !== 1
+      || foreignLocationRows[0].global_id !== preservePrinting.foreignLocationGlobalId
+    ) {
+      fail(
+        'Scenario cleanup preserve mode requires exactly the explicitly named '
+        + 'foreign proof location',
+      )
+    }
+    if (foreignLocationRows[0].active !== false) {
+      fail('The preserved foreign proof location must already be inactive')
+    }
+  }
   const locationIdByCode = new Map(
-    locationResult.rows.map((location) => [location.code, location.id]),
+    markedLocationRows.map((location) => [location.code, location.id]),
   )
 
   const poolResult = await client.query(
@@ -948,25 +1168,82 @@ async function resolveScenarioRetirementTarget(client, configuration, scope, sce
   }
 
   const warehousePositionResult = await client.query(
-    `SELECT position.id::text, position.pool_id::text,
-            position.product_id::text, position.location_id::text
+    `SELECT position.id::text, position.global_id,
+            position.pool_id::text, position.product_id::text,
+            position.location_id::text, position.reserved_quantity,
+            pool.global_id AS pool_global_id, pool.name AS pool_name,
+            pool.active AS pool_active,
+            location.global_id AS location_global_id,
+            location.active AS location_active,
+            (
+              SELECT count(*)
+              FROM operations_reservations reservation
+              WHERE reservation.organization_id = position.organization_id
+                AND reservation.position_id = position.id
+                AND reservation.status = 'active'
+            )::integer AS active_reservations,
+            (
+              SELECT count(*)
+              FROM operations_fulfillment_allocations allocation
+              JOIN operations_fulfillment_plans plan
+                ON plan.organization_id = allocation.organization_id
+               AND plan.id = allocation.plan_id
+              WHERE allocation.organization_id = position.organization_id
+                AND allocation.position_id = position.id
+                AND plan.status <> 'cancelled'
+            )::integer AS active_allocations
      FROM operations_inventory_positions position
+     JOIN operations_inventory_pools pool
+       ON pool.organization_id = position.organization_id
+      AND pool.id = position.pool_id
+     JOIN operations_locations location
+       ON location.organization_id = position.organization_id
+      AND location.id = position.location_id
      WHERE position.organization_id = $1::uuid
        AND position.warehouse_id = $2::uuid
      ORDER BY position.id
-     FOR UPDATE`,
+     FOR UPDATE OF position, pool, location`,
     [scope.organizationId, warehouse.id],
   )
   const exactProductIds = new Set(productIdBySourceKey.values())
   const exactLocationIds = new Set(locationIdByCode.values())
-  if (warehousePositionResult.rows.some((position) => position.pool_id !== pool.id)) {
-    fail('Marked scenario warehouse has an inventory position from another pool')
-  }
-  if (warehousePositionResult.rows.some(
+  const scenarioPositions = warehousePositionResult.rows.filter(
+    (position) => position.pool_id === pool.id,
+  )
+  const foreignPositions = warehousePositionResult.rows.filter(
+    (position) => position.pool_id !== pool.id,
+  )
+  if (scenarioPositions.some(
     (position) => !exactProductIds.has(position.product_id)
       || !exactLocationIds.has(position.location_id)
   )) {
     fail('Marked scenario warehouse has an inventory position outside exact fixture products or locations')
+  }
+  if (!preservePrinting && foreignPositions.length > 0) {
+    fail('Marked scenario warehouse has an inventory position from another pool')
+  }
+  if (preservePrinting) {
+    const foreignPosition = foreignPositions[0]
+    if (
+      foreignPositions.length !== 1
+      || !foreignPosition
+      || foreignPosition.global_id !== preservePrinting.foreignPositionGlobalId
+      || foreignPosition.pool_global_id !== preservePrinting.foreignPoolGlobalId
+      || foreignPosition.location_global_id
+        !== preservePrinting.foreignLocationGlobalId
+      || exactProductIds.has(foreignPosition.product_id)
+      || !String(foreignPosition.pool_name || '').startsWith('Proof pool ')
+      || foreignPosition.pool_active !== false
+      || foreignPosition.location_active !== false
+      || Number(foreignPosition.reserved_quantity) !== 0
+      || Number(foreignPosition.active_reservations) !== 0
+      || Number(foreignPosition.active_allocations) !== 0
+    ) {
+      fail(
+        'Scenario cleanup preserve mode found an unretired or unexpected '
+        + 'foreign proof position',
+      )
+    }
   }
 
   const activeRuleResult = await client.query(
@@ -1183,6 +1460,65 @@ async function resolveScenarioRetirementTarget(client, configuration, scope, sce
      FOR UPDATE OF agent`,
     [scope.organizationId, warehouse.id],
   )
+  let unexpectedActivePrinterCount = activePrinterResult.rowCount
+  let unexpectedActivePrintAgentCount = activePrintAgentResult.rowCount
+  if (preservePrinting) {
+    const activePrinterGlobalIds = activePrinterResult.rows.map(
+      (printer) => printer.global_id,
+    )
+    const activePrintAgentGlobalIds = activePrintAgentResult.rows.map(
+      (agent) => agent.global_id,
+    )
+    if (
+      activePrinterGlobalIds.length !== 1
+      || activePrinterGlobalIds[0] !== preservePrinting.printerGlobalId
+      || activePrintAgentGlobalIds.length !== 1
+      || activePrintAgentGlobalIds[0] !== preservePrinting.printAgentGlobalId
+    ) {
+      fail(
+        'Scenario cleanup preserve mode requires exactly the named active '
+        + 'printer and print agent',
+      )
+    }
+    const printingBinding = await client.query(
+      `SELECT printer.global_id AS printer_global_id,
+              agent.global_id AS print_agent_global_id,
+              warehouse.global_id AS warehouse_global_id,
+              printer.status AS printer_status,
+              printer.connection_mode,
+              agent.status AS print_agent_status
+       FROM operations_printers printer
+       JOIN operations_print_agents agent
+         ON agent.organization_id = printer.organization_id
+        AND agent.warehouse_id = printer.warehouse_id
+        AND agent.id = printer.local_print_agent_id
+       JOIN operations_warehouses warehouse
+         ON warehouse.organization_id = printer.organization_id
+        AND warehouse.id = printer.warehouse_id
+       WHERE printer.organization_id = $1::uuid
+         AND printer.global_id = $2
+         AND agent.global_id = $3
+         AND warehouse.global_id = $4
+       FOR UPDATE OF printer, agent, warehouse`,
+      [
+        scope.organizationId,
+        preservePrinting.printerGlobalId,
+        preservePrinting.printAgentGlobalId,
+        preservePrinting.warehouseGlobalId,
+      ],
+    )
+    const binding = printingBinding.rows[0]
+    if (
+      printingBinding.rowCount !== 1
+      || binding.printer_status === 'disabled'
+      || binding.connection_mode !== 'local_agent'
+      || binding.print_agent_status !== 'active'
+    ) {
+      fail('The explicitly preserved printer-to-agent binding is not active')
+    }
+    unexpectedActivePrinterCount = 0
+    unexpectedActivePrintAgentCount = 0
+  }
   const unrelatedDependents = [
     ['active_reservations', unrelatedReservationResult.rowCount],
     ['active_allocations', unrelatedAllocationResult.rowCount],
@@ -1190,8 +1526,8 @@ async function resolveScenarioRetirementTarget(client, configuration, scope, sce
     ['nonterminal_receipts', nonterminalReceiptResult.rowCount],
     ['nonterminal_replenishment_tasks', nonterminalReplenishmentResult.rowCount],
     ['other_active_waves', otherActiveWaveResult.rowCount],
-    ['active_printers', activePrinterResult.rowCount],
-    ['active_print_agents', activePrintAgentResult.rowCount],
+    ['active_printers', unexpectedActivePrinterCount],
+    ['active_print_agents', unexpectedActivePrintAgentCount],
   ].filter(([, count]) => Number(count) > 0)
   if (unrelatedDependents.length > 0) {
     fail(
@@ -2423,7 +2759,61 @@ async function releaseScenarioReservations(client, scope, scenario, orderIds) {
   return reservations.rowCount
 }
 
-async function assertScenarioRetired(client, scope, scenario) {
+async function assertPreservedPrintingRetained(
+  client,
+  scope,
+  scenario,
+  preservePrinting,
+) {
+  const result = await client.query(
+    `SELECT warehouse.global_id AS warehouse_global_id,
+            warehouse.status AS warehouse_status,
+            warehouse.address->>'simulationState' AS simulation_state,
+            warehouse.address->>'formerScenarioKey' AS former_scenario_key,
+            printer.global_id AS printer_global_id,
+            printer.status AS printer_status,
+            printer.connection_mode,
+            agent.global_id AS print_agent_global_id,
+            agent.status AS print_agent_status
+     FROM operations_warehouses warehouse
+     JOIN operations_printers printer
+       ON printer.organization_id = warehouse.organization_id
+      AND printer.warehouse_id = warehouse.id
+     JOIN operations_print_agents agent
+       ON agent.organization_id = printer.organization_id
+      AND agent.warehouse_id = printer.warehouse_id
+      AND agent.id = printer.local_print_agent_id
+     WHERE warehouse.organization_id = $1::uuid
+       AND warehouse.global_id = $2
+       AND printer.global_id = $3
+       AND agent.global_id = $4`,
+    [
+      scope.organizationId,
+      preservePrinting.warehouseGlobalId,
+      preservePrinting.printerGlobalId,
+      preservePrinting.printAgentGlobalId,
+    ],
+  )
+  const row = result.rows[0]
+  if (
+    result.rowCount !== 1
+    || row.warehouse_status !== 'active'
+    || row.simulation_state !== 'retired'
+    || row.former_scenario_key !== scenario.scenarioKey
+    || row.printer_status === 'disabled'
+    || row.connection_mode !== 'local_agent'
+    || row.print_agent_status !== 'active'
+  ) {
+    fail('Scenario cleanup did not preserve the exact active printing binding')
+  }
+}
+
+async function assertScenarioRetired(
+  client,
+  scope,
+  scenario,
+  preservePrinting = null,
+) {
   const customerIdentities = scenarioCustomerIdentities(scenario)
   const result = await client.query(
     `WITH target_warehouse AS (
@@ -3013,15 +3403,41 @@ async function assertScenarioRetired(client, scope, scenario) {
       scenario.products.length,
     ],
   )
+  const expectedPreservedCounts = preservePrinting
+    ? new Map([
+      ['foreign_pool_positions_in_warehouse', 1],
+      ['foreign_product_or_location_positions', 1],
+      ['unrelated_active_printers', 1],
+      ['unrelated_active_print_agents', 1],
+      ['active_warehouses', 1],
+    ])
+    : new Map()
   const violations = Object.entries(result.rows[0])
-    .filter(([, count]) => Number(count) > 0)
+    .filter(([name, count]) => (
+      expectedPreservedCounts.has(name)
+        ? Number(count) !== expectedPreservedCounts.get(name)
+        : Number(count) > 0
+    ))
     .map(([name, count]) => `${name}=${count}`)
   if (violations.length > 0) {
     fail(`Scenario cleanup postflight failed: ${violations.join(', ')}`)
   }
+  if (preservePrinting) {
+    await assertPreservedPrintingRetained(
+      client,
+      scope,
+      scenario,
+      preservePrinting,
+    )
+  }
 }
 
-async function cleanupScenario(client, configuration, scenario) {
+async function cleanupScenario(
+  client,
+  configuration,
+  scenario,
+  preservePrinting = null,
+) {
   await client.query('BEGIN')
   try {
     await client.query(
@@ -3035,6 +3451,7 @@ async function cleanupScenario(client, configuration, scenario) {
       configuration,
       resolvedScope,
       scenario,
+      preservePrinting,
     )
     const scope = target.scope
     const integrationIds = [target.integration.id]
@@ -3207,7 +3624,7 @@ async function cleanupScenario(client, configuration, scenario) {
       `UPDATE operations_locations location
        SET active = false,
            updated_by = $2,
-           row_version = row_version + 1,
+           row_version = location.row_version + 1,
            updated_at = now()
        FROM operations_warehouses warehouse
        WHERE location.organization_id = $1::uuid
@@ -3216,24 +3633,57 @@ async function cleanupScenario(client, configuration, scenario) {
          AND location.active`,
       [scope.organizationId, scenario.actor.email, warehouseIds],
     )
-    await client.query(
-      `UPDATE operations_warehouses
-       SET status = 'inactive',
-           address = address || jsonb_build_object(
-             'state', 'retired',
-             'retirementReason', 'wms_development_simulation_retired'
-           ),
-           updated_by = $2,
-           row_version = row_version + 1,
-           updated_at = now()
-       WHERE organization_id = $1::uuid
-         AND id = ANY($3::uuid[])
-         AND (
-           status <> 'inactive'
-           OR address->>'state' IS DISTINCT FROM 'retired'
-         )`,
-      [scope.organizationId, scenario.actor.email, warehouseIds],
-    )
+    if (preservePrinting) {
+      await client.query(
+        `UPDATE operations_warehouses
+         SET status = 'active',
+             address = (address - 'synthetic') || jsonb_build_object(
+               'simulationState', 'retired',
+               'retirementReason', 'wms_development_simulation_retired',
+               'formerScenarioKey', $4,
+               'preservedForPrinting', true
+             ),
+             updated_by = $2,
+             row_version = row_version + 1,
+             updated_at = now()
+         WHERE organization_id = $1::uuid
+           AND id = ANY($3::uuid[])
+           AND (
+             status <> 'active'
+             OR address->>'simulationState' IS DISTINCT FROM 'retired'
+             OR address->>'formerScenarioKey' IS DISTINCT FROM $4
+             OR COALESCE(
+               lower(address->>'preservedForPrinting'),
+               'false'
+             ) NOT IN ('true', '1', 'yes')
+           )`,
+        [
+          scope.organizationId,
+          scenario.actor.email,
+          warehouseIds,
+          scenario.scenarioKey,
+        ],
+      )
+    } else {
+      await client.query(
+        `UPDATE operations_warehouses
+         SET status = 'inactive',
+             address = address || jsonb_build_object(
+               'state', 'retired',
+               'retirementReason', 'wms_development_simulation_retired'
+             ),
+             updated_by = $2,
+             row_version = row_version + 1,
+             updated_at = now()
+         WHERE organization_id = $1::uuid
+           AND id = ANY($3::uuid[])
+           AND (
+             status <> 'inactive'
+             OR address->>'state' IS DISTINCT FROM 'retired'
+           )`,
+        [scope.organizationId, scenario.actor.email, warehouseIds],
+      )
+    }
     await client.query(
       `UPDATE operations_inventory_pools
        SET active = false, updated_at = now()
@@ -3347,12 +3797,12 @@ async function cleanupScenario(client, configuration, scenario) {
       [scenario.actor.email, JSON.stringify(FALSE_PERMISSIONS)],
     )
 
-    await assertScenarioRetired(client, scope, scenario)
+    await assertScenarioRetired(client, scope, scenario, preservePrinting)
 
     await client.query('COMMIT')
     return {
       ok: true,
-      mode: 'cleanup',
+      mode: preservePrinting ? 'cleanup-preserve-warehouse' : 'cleanup',
       environment: configuration.explicitEnvironment,
       scenarioKey: scenario.scenarioKey,
       organizationId: scope.organizationId,
@@ -3369,6 +3819,9 @@ async function cleanupScenario(client, configuration, scenario) {
       crmShortLinksDisabled: disabledCrmShortLinks.rowCount,
       postflightPassed: true,
       immutableInventoryLedgerPreserved: true,
+      preservedWarehouseGlobalId: preservePrinting?.warehouseGlobalId || null,
+      preservedPrinterGlobalId: preservePrinting?.printerGlobalId || null,
+      preservedPrintAgentGlobalId: preservePrinting?.printAgentGlobalId || null,
       carrierTransactionsVoided: 0,
       emailsSent: 0,
     }
@@ -3409,6 +3862,104 @@ function runSelfTest() {
       WMS_SIM_ORGANIZATION_ID: '',
     }),
     /explicitly supplied UUID/,
+  )
+  assert.deepEqual(
+    parseArguments(['--cleanup-preserve-warehouse']),
+    {
+      cleanup: false,
+      cleanupPreserveWarehouse: true,
+      selfTest: false,
+      help: false,
+    },
+  )
+  assert.throws(
+    () => parseArguments(['--cleanup', '--cleanup-preserve-warehouse']),
+    /cannot be combined/,
+  )
+  const preserveEnvironment = {
+    WMS_SIM_PRESERVE_CONFIRM: PRESERVE_PRINTING_CONFIRMATION,
+    WMS_SIM_EXPECTED_DATABASE_FINGERPRINT:
+      '12345678-1234-4123-8123-123456789abc',
+    WMS_SIM_PRESERVE_WAREHOUSE_GLOBAL_ID: 'gwh7494117',
+    WMS_SIM_PRESERVE_PRINTER_GLOBAL_ID: 'gpr5630232',
+    WMS_SIM_PRESERVE_PRINT_AGENT_GLOBAL_ID: 'gpt7418225',
+    WMS_SIM_PRESERVE_FOREIGN_LOCATION_GLOBAL_ID: 'gwl1050773',
+    WMS_SIM_PRESERVE_FOREIGN_POOL_GLOBAL_ID: 'gip7957421',
+    WMS_SIM_PRESERVE_FOREIGN_POSITION_GLOBAL_ID: 'giv9161814',
+  }
+  assert.deepEqual(
+    validatePreservePrintingConfiguration(preserveEnvironment),
+    {
+      warehouseGlobalId: 'gwh7494117',
+      printerGlobalId: 'gpr5630232',
+      printAgentGlobalId: 'gpt7418225',
+      foreignLocationGlobalId: 'gwl1050773',
+      foreignPoolGlobalId: 'gip7957421',
+      foreignPositionGlobalId: 'giv9161814',
+      expectedDatabaseFingerprint:
+        '12345678-1234-4123-8123-123456789abc',
+    },
+  )
+  assert.throws(
+    () => validatePreservePrintingConfiguration({
+      ...preserveEnvironment,
+      WMS_SIM_PRESERVE_CONFIRM: '',
+    }),
+    /is required/,
+  )
+  assert.throws(
+    () => validatePreservePrintingConfiguration({
+      ...preserveEnvironment,
+      WMS_SIM_EXPECTED_DATABASE_FINGERPRINT: '',
+    }),
+    /exact development database identity/,
+  )
+  assert.equal(
+    assertDatabaseFingerprint(
+      '12345678-1234-4123-8123-123456789ABC',
+      '12345678-1234-4123-8123-123456789abc',
+    ),
+    '12345678-1234-4123-8123-123456789abc',
+  )
+  assert.throws(
+    () => assertDatabaseFingerprint(
+      '22345678-1234-4123-8123-123456789abc',
+      '12345678-1234-4123-8123-123456789abc',
+    ),
+    /does not match/,
+  )
+  const livePreserveEnvironment = {
+    DATABASE_URL: 'postgres://example.invalid/clawpilot',
+    RAILWAY_ENVIRONMENT_NAME: 'development',
+    RAILWAY_PROJECT_ID: TRUSTED_RAILWAY_PROJECT_ID,
+    RAILWAY_ENVIRONMENT_ID:
+      TRUSTED_RAILWAY_DEVELOPMENT_ENVIRONMENT_ID,
+  }
+  assert.doesNotThrow(
+    () => validatePreserveExecutionLane(livePreserveEnvironment),
+  )
+  assert.throws(
+    () => validatePreserveExecutionLane({
+      ...livePreserveEnvironment,
+      RAILWAY_ENVIRONMENT_ID:
+        '22345678-1234-4123-8123-123456789abc',
+    }),
+    /trusted development environment/,
+  )
+  const rehearsalPreserveEnvironment = {
+    DATABASE_URL: 'postgres://localhost/clawpilot-rehearsal',
+    WMS_SIM_DISPOSABLE_REHEARSAL_CONFIRM:
+      PRESERVE_DISPOSABLE_REHEARSAL_CONFIRMATION,
+  }
+  assert.doesNotThrow(
+    () => validatePreserveExecutionLane(rehearsalPreserveEnvironment),
+  )
+  assert.throws(
+    () => validatePreserveExecutionLane({
+      ...rehearsalPreserveEnvironment,
+      RAILWAY_ENVIRONMENT_NAME: 'development',
+    }),
+    /cannot run with Railway environment markers/,
   )
 
   const first = buildScenario(
@@ -3478,7 +4029,7 @@ function runSelfTest() {
   return {
     ok: true,
     mode: 'self-test',
-    assertions: 29,
+    assertions: 41,
     scenarioKey: first.scenarioKey,
     products: first.products.length,
     locations: first.locations.length,
@@ -3496,6 +4047,17 @@ function printHelp() {
   WMS_SIM_ENV=local WMS_SIM_ORGANIZATION_ID=<uuid> DATABASE_URL=<url> \\
     node scripts/seed-wms-development-simulation.mjs --cleanup
 
+  WMS_SIM_ENV=development WMS_SIM_ORGANIZATION_ID=<uuid> DATABASE_URL=<url> \\
+    WMS_SIM_PRESERVE_CONFIRM=${PRESERVE_PRINTING_CONFIRMATION} \\
+    WMS_SIM_EXPECTED_DATABASE_FINGERPRINT=<uuid-from-normalization-plan> \\
+    WMS_SIM_PRESERVE_WAREHOUSE_GLOBAL_ID=<gwh> \\
+    WMS_SIM_PRESERVE_PRINTER_GLOBAL_ID=<gpr> \\
+    WMS_SIM_PRESERVE_PRINT_AGENT_GLOBAL_ID=<gpt> \\
+    WMS_SIM_PRESERVE_FOREIGN_LOCATION_GLOBAL_ID=<gwl> \\
+    WMS_SIM_PRESERVE_FOREIGN_POOL_GLOBAL_ID=<gip> \\
+    WMS_SIM_PRESERVE_FOREIGN_POSITION_GLOBAL_ID=<giv> \\
+    node scripts/seed-wms-development-simulation.mjs --cleanup-preserve-warehouse
+
   node scripts/seed-wms-development-simulation.mjs --self-test
 
 Optional:
@@ -3504,6 +4066,15 @@ Optional:
 
 Cleanup permanently retires the WMS development simulator lineage for the
 organization. No scenario version can reseed that lineage afterward.
+
+The preserve-warehouse cleanup is a narrow development recovery mode. It still
+retires the exact 21-order scenario and writes compensating reservation ledger
+entries, but retains one exact warehouse/printer/agent binding. Its one named
+foreign proof position must already be inactive, unreserved, and cancelled.
+Live preserve cleanup requires the trusted Railway project and development
+environment IDs compiled into this tool. Disposable offline rehearsal requires
+a local PostgreSQL URL, no populated RAILWAY_* marker, and:
+  WMS_SIM_DISPOSABLE_REHEARSAL_CONFIRM=${PRESERVE_DISPOSABLE_REHEARSAL_CONFIRMATION}
 
 This script has no production override.`)
 }
@@ -3520,6 +4091,12 @@ async function main() {
   }
 
   const configuration = validateExecutionEnvironment(process.env)
+  const preservePrinting = args.cleanupPreserveWarehouse
+    ? validatePreservePrintingConfiguration(process.env)
+    : null
+  if (preservePrinting) {
+    validatePreserveExecutionLane(process.env)
+  }
   const scenario = buildScenario(configuration.anchorDate, configuration.organizationId)
   const { Pool } = requireFromApp('pg')
   const sslMode = normalizedEnvironment(process.env.PGSSLMODE || process.env.DATABASE_SSL)
@@ -3535,8 +4112,19 @@ async function main() {
   try {
     const client = await pool.connect()
     try {
-      const result = args.cleanup
-        ? await cleanupScenario(client, configuration, scenario)
+      if (preservePrinting) {
+        await assertExpectedDatabaseFingerprint(
+          client,
+          preservePrinting.expectedDatabaseFingerprint,
+        )
+      }
+      const result = args.cleanup || args.cleanupPreserveWarehouse
+        ? await cleanupScenario(
+          client,
+          configuration,
+          scenario,
+          preservePrinting,
+        )
         : await seedScenario(client, configuration, scenario)
       console.log(JSON.stringify(result, null, 2))
     } finally {

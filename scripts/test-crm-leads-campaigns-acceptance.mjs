@@ -343,10 +343,67 @@ function fields(entity, fixture, relationships = {}) {
 
 async function runApiAcceptance(baseUrl, token, pool) {
   await apiJson(baseUrl, token, '/api/crm?entity=leads&limit=10')
+  const initialProfile = await pool.query(
+    `SELECT contact.id::text, contact.pipeline_id::text, contact.organization_id::text,
+       contact.reference_code
+     FROM crm_contacts contact
+     WHERE contact.app_user_email = $1`,
+    [actorEmail],
+  )
+  assert.equal(initialProfile.rowCount, 1)
 
   const account = (await apiJson(baseUrl, token, '/api/crm', {
     method: 'POST', body: JSON.stringify(fields('organizations', FIXTURES.account)),
   })).record
+  await pool.query(
+    `UPDATE crm_contacts
+     SET organization_id = $2::uuid,
+       full_name = 'CRM Acceptance Customer Contact',
+       contact_type = 'QuickBooks customer',
+       job_title = 'Purchasing manager',
+       description = 'Customer relationship evidence must survive profile refresh.',
+       source_payload = '{"source":"quickbooks_customer","customerId":"2"}'::jsonb
+     WHERE id = $1::uuid`,
+    [initialProfile.rows[0].id, account.id],
+  )
+  await pool.query(
+    `INSERT INTO crm_contact_source_aliases (
+       pipeline_id, source_key, contact_id, alias_kind, source_payload, created_by
+     ) VALUES (
+       $1::uuid, 'quickbooks:customer-contact:2', $2::uuid, 'source',
+       '{"source":"quickbooks_customer","customerId":"2"}'::jsonb, $3
+     )`,
+    [initialProfile.rows[0].pipeline_id, initialProfile.rows[0].id, actorEmail],
+  )
+  await apiJson(baseUrl, token, '/api/crm?entity=organizations&limit=10')
+  const preservedProfile = await pool.query(
+    `SELECT contact.id::text, contact.pipeline_id::text, contact.organization_id::text,
+       contact.reference_code, contact.full_name, contact.contact_type, contact.job_title,
+       contact.description, contact.source_payload,
+       count(alias.source_key)::integer AS preserved_aliases
+     FROM crm_contacts contact
+     LEFT JOIN crm_contact_source_aliases alias
+       ON alias.pipeline_id = contact.pipeline_id
+      AND alias.contact_id = contact.id
+     WHERE contact.app_user_email = $1
+     GROUP BY contact.id`,
+    [actorEmail],
+  )
+  assert.equal(preservedProfile.rowCount, 1)
+  assert.equal(preservedProfile.rows[0].id, initialProfile.rows[0].id)
+  assert.equal(preservedProfile.rows[0].reference_code, initialProfile.rows[0].reference_code)
+  assert.equal(preservedProfile.rows[0].organization_id, account.id)
+  assert.equal(preservedProfile.rows[0].full_name, 'CRM Acceptance Customer Contact')
+  assert.equal(preservedProfile.rows[0].contact_type, 'QuickBooks customer')
+  assert.equal(preservedProfile.rows[0].job_title, 'Purchasing manager')
+  assert.equal(
+    preservedProfile.rows[0].description,
+    'Customer relationship evidence must survive profile refresh.',
+  )
+  assert.equal(preservedProfile.rows[0].source_payload.source, 'quickbooks_customer')
+  assert.equal(preservedProfile.rows[0].source_payload.customerId, '2')
+  assert.equal(preservedProfile.rows[0].source_payload.clawpilotProfile.userEmail, actorEmail)
+  assert.ok(preservedProfile.rows[0].preserved_aliases >= 3)
   const contact = (await apiJson(baseUrl, token, '/api/crm', {
     method: 'POST', body: JSON.stringify(fields('contacts', FIXTURES.contact, { organizationId: account.id })),
   })).record
@@ -660,6 +717,34 @@ async function runApiAcceptance(baseUrl, token, pool) {
   )
   assert.equal(childActions.rowCount, 2)
   assert.equal(childActions.rows.every((row) => row.payload.campaignRecipientId), true)
+
+  const conflictingNameAlias = [
+    'contact:name:crm acceptance operator:organization:',
+    preservedProfile.rows[0].organization_id,
+  ].join('')
+  await pool.query(
+    `INSERT INTO crm_contact_source_aliases (
+       pipeline_id, source_key, contact_id, alias_kind, source_payload, created_by
+     ) VALUES ($1::uuid, $2, $3::uuid, 'former_identity', '{}'::jsonb, $4)`,
+    [preservedProfile.rows[0].pipeline_id, conflictingNameAlias, contact.id, actorEmail],
+  )
+  const listWithDeferredProfileRepair = await apiJson(
+    baseUrl,
+    token,
+    '/api/crm?entity=organizations&limit=10',
+  )
+  assert.equal(listWithDeferredProfileRepair.records.some((record) => record.id === account.id), true)
+  const profileAfterDeferredRepair = await pool.query(
+    `SELECT id::text, organization_id::text, reference_code
+     FROM crm_contacts
+     WHERE app_user_email = $1`,
+    [actorEmail],
+  )
+  assert.deepEqual(profileAfterDeferredRepair.rows[0], {
+    id: initialProfile.rows[0].id,
+    organization_id: preservedProfile.rows[0].organization_id,
+    reference_code: initialProfile.rows[0].reference_code,
+  })
 
   return { account, contact, lead, meeting, campaign, callInteraction, convertedLead, conversion }
 }
