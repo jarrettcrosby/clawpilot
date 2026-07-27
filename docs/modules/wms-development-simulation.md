@@ -140,3 +140,23 @@ Rerunning cleanup is idempotent, but generation remains blocked afterward.
 Global IDs, archived orders, inventory positions, immutable inventory ledger
 history, and other evidence tombstones are intentionally preserved to maintain
 ClawPilot's audit and no-ID-reuse invariants.
+
+### Preserve-printing retirement
+
+`--cleanup-preserve-warehouse` is a narrow development recovery mode for a
+simulator warehouse that became the owner of a real local-agent printer
+binding. It is not a general cleanup shortcut. In addition to the normal
+development guards, it requires an exact confirmation string and the Global IDs
+of one warehouse, one printer, one print agent, and one already-retired foreign
+proof location/pool/position.
+
+The command applies the same exact 21-order verification and compensating
+reservation releases as normal cleanup. It leaves the named warehouse active,
+marks its simulator lineage retired, and preserves only the exact active
+printer-to-agent binding. Any second active printer or agent, any additional
+foreign position, or a foreign proof position that remains active, reserved, or
+allocated aborts the transaction.
+
+The approved one-time Express Parcel workflow, including its prepare and
+finalize phases, is documented in
+`docs/operations/express-parcel-development-warehouse-normalization.md`.

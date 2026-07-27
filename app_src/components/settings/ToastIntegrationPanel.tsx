@@ -24,6 +24,7 @@ import SaveRounded from '@mui/icons-material/SaveRounded'
 import SyncRounded from '@mui/icons-material/SyncRounded'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import { formatUserDateTime } from '@/lib/userDateTime'
+import IntegrationSetupJourney from '@/components/settings/IntegrationSetupJourney'
 
 type AccessType = 'analytics' | 'standard'
 
@@ -353,6 +354,129 @@ export default function ToastIntegrationPanel() {
           sx={{ m: 0 }}
         />
       </Stack>
+
+      <Box sx={{ mt: 2 }}>
+        <IntegrationSetupJourney
+          description="Verify at least one Toast API lane, select the exact locations, then enable and observe the bounded sync."
+          steps={[
+            {
+              key: 'toast-credentials',
+              label: 'Save and verify Toast credentials',
+              state: integration.credentials.analytics.configured
+                || integration.credentials.standard.configured
+                ? 'complete'
+                : 'current',
+              description:
+                'Analytics and standard-order access are separate credential lanes. Configure only the datasets this organization is authorized to read.',
+              facts: [
+                {
+                  label: 'Analytics credential',
+                  value: integration.credentials.analytics.configured
+                    ? `Version ${
+                      integration.credentials.analytics.credentialVersion
+                    } · client ••••${
+                      integration.credentials.analytics.clientIdLastFour
+                      || 'unknown'
+                    }`
+                    : 'Not configured',
+                },
+                {
+                  label: 'Standard credential',
+                  value: integration.credentials.standard.configured
+                    ? `Version ${
+                      integration.credentials.standard.credentialVersion
+                    } · client ••••${
+                      integration.credentials.standard.clientIdLastFour
+                      || 'unknown'
+                    }`
+                    : 'Not configured',
+                },
+              ],
+            },
+            {
+              key: 'toast-locations',
+              label: 'Verify and select locations',
+              state: selectedCount
+                ? 'complete'
+                : integration.credentials.analytics.configured
+                  || integration.credentials.standard.configured
+                  ? 'current'
+                  : 'pending',
+              description:
+                'Location selection is the business-data scope. Test mode, archive state, timezone, and closeout hour remain visible per location.',
+              facts: [
+                {
+                  label: 'Verified locations',
+                  value: String(integration.locations.length),
+                },
+                {
+                  label: 'Selected locations',
+                  value: String(selectedCount),
+                },
+              ],
+            },
+            {
+              key: 'toast-sync',
+              label: 'Enable the sync schedule',
+              state: syncEnabled
+                ? 'complete'
+                : selectedCount
+                  ? 'current'
+                  : 'pending',
+              description:
+                'Daily sync is an explicit organization setting. Manual business-date sync remains available for bounded validation.',
+              facts: [
+                {
+                  label: 'Daily sync',
+                  value: syncEnabled ? 'Enabled' : 'Disabled',
+                },
+                {
+                  label: 'Latest completed sync',
+                  value: latestSync || 'Not yet',
+                },
+              ],
+            },
+            {
+              key: 'toast-observe',
+              label: 'Confirm data and queue health',
+              state: integration.jobs.failed || integration.jobs.dead
+                ? 'attention'
+                : integration.reporting.businessDays > 0
+                  ? 'complete'
+                  : syncEnabled
+                    ? 'current'
+                    : 'pending',
+              description:
+                'Review reporting coverage and queue outcomes before using Toast data for accounting closeout.',
+              facts: [
+                {
+                  label: 'Business dates',
+                  value: String(integration.reporting.businessDays),
+                },
+                {
+                  label: 'Records available',
+                  value: String(
+                    integration.reporting.totals.standardOrders
+                    + integration.reporting.totals.analyticsRows,
+                  ),
+                },
+                {
+                  label: 'Pending / processing',
+                  value: `${integration.jobs.pending} / ${
+                    integration.jobs.processing
+                  }`,
+                },
+                {
+                  label: 'Failed / dead',
+                  value: `${integration.jobs.failed} / ${
+                    integration.jobs.dead
+                  }`,
+                },
+              ],
+            },
+          ]}
+        />
+      </Box>
 
       <Divider sx={{ my: 3 }} />
 

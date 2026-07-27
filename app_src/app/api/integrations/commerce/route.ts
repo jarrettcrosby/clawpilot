@@ -5,6 +5,7 @@ import {
   disconnectCommerceIntegration,
   faireOAuthCallbackUrl,
   getCommerceIntegrationsState,
+  revealCommerceCredential,
   sanitizedCommerceIntegrationError,
   setCommerceIntegrationEnabled,
   startFaireOAuthCommerce,
@@ -30,7 +31,7 @@ import {
 import { operationsCapabilities } from '@/lib/operations/authorization'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import { requireRequestSession, requireRequestUser } from '@/lib/requestUser'
-import type { AppUser } from '@/lib/users'
+import { effectiveAuthorizationRole, type AppUser } from '@/lib/users'
 
 export const dynamic = 'force-dynamic'
 export const revalidate = 0
@@ -101,6 +102,21 @@ function requireActivator(actor: AppUser) {
       'Owner or operations-administrator access is required to enable receipt intake',
       403,
       'COMMERCE_ACTIVATOR_REQUIRED',
+    )
+  }
+}
+
+function canRevealCredential(actor: AppUser) {
+  const role = effectiveAuthorizationRole(actor)
+  return role === 'owner' || role === 'admin'
+}
+
+function requireCredentialViewer(actor: AppUser) {
+  if (!canRevealCredential(actor)) {
+    throw new CommerceIntegrationRequestError(
+      'Organization owner or administrator access is required to reveal sales-channel credentials',
+      403,
+      'COMMERCE_CREDENTIAL_REVEAL_FORBIDDEN',
     )
   }
 }
@@ -248,6 +264,7 @@ export async function GET(req: NextRequest) {
       ok: true,
       canManage: true,
       canActivate: capabilities.canActivate,
+      canRevealCredentials: canRevealCredential(actor),
       integrations: await getCommerceIntegrationsState(
         organizationId(actor),
       ),
@@ -266,6 +283,23 @@ export async function PATCH(req: NextRequest) {
     const organization = organizationId(actor)
     const body = await requestBody(req)
     const action = String(body.action || '').trim()
+
+    if (action === 'reveal-credential') {
+      only(body, ['action', 'accountGlobalId'])
+      requireCredentialViewer(actor)
+      const credential = await revealCommerceCredential({
+        organizationId: organization,
+        accountGlobalId: body.accountGlobalId,
+        actorEmail: actor.email,
+      })
+      return json({
+        ok: true,
+        canManage: true,
+        canActivate: operationsCapabilities(actor).canActivate,
+        canRevealCredentials: true,
+        credential,
+      })
+    }
 
     if (action === 'connect-shopify') {
       only(body, [

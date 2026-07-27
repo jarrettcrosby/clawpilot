@@ -3166,29 +3166,82 @@ export async function syncAppUserProfileToCrm(input: {
   const organization = hierarchy.lineage.find((candidate) => (
     candidate.workspaceOrganizationId === workspaceOrganization.id
   )) || hierarchy.customerParent
-  const contact = await stageCrmRecordInPostgres({
-    entity: 'contacts',
-    pipelineId: input.pipelineId,
-    sourceKey: `profile:${user.email}`,
-    actorEmail: user.email,
-    sourcePayload: {
+  const profileSourceKey = `profile:${user.email}`
+  const contact = await withTransaction(async (client) => {
+    await client.query(
+      `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
+      [`crm-app-user-profile:${input.pipelineId}:${user.email}`],
+    )
+    const existingProfiles = await client.query<{
+      id: string
+      organization_id: string
+      organization_suitecrm_id: string | null
+      source_payload: Record<string, unknown> | null
+    }>(
+      `SELECT contact.id::text, contact.organization_id::text,
+         organization.suitecrm_id AS organization_suitecrm_id,
+         contact.source_payload
+       FROM crm_contacts contact
+       JOIN crm_organizations organization
+         ON organization.pipeline_id = contact.pipeline_id
+        AND organization.id = contact.organization_id
+       WHERE contact.pipeline_id = $1::uuid
+         AND (
+           contact.app_user_email = $2
+           OR contact.reference_code = $3
+           OR contact.source_key = $4
+           OR EXISTS (
+             SELECT 1
+             FROM crm_contact_source_aliases alias
+             WHERE alias.pipeline_id = contact.pipeline_id
+               AND alias.contact_id = contact.id
+               AND alias.source_key = $4
+           )
+         )
+       ORDER BY contact.created_at, contact.id
+       FOR UPDATE`,
+      [input.pipelineId, user.email, user.contactReferenceCode, profileSourceKey],
+    )
+    if (existingProfiles.rows.length > 1) {
+      throw new Error('CRM profile identity resolves to multiple contacts')
+    }
+    const existingProfile = existingProfiles.rows[0]
+    const profilePayload = {
       source: 'clawpilot_profile',
       userEmail: user.email,
       workspaceOrganizationId: workspaceOrganization.id,
       timezone: user.timezone,
       locale: user.locale,
-    },
-    fields: {
-      organizationId: organization.id,
-      organizationSuiteCrmId: organization.suiteCrmId,
-      appUserEmail: user.email,
-      appUserContactReferenceCode: user.contactReferenceCode,
-      fullName: displayName,
-      email: user.email,
-      jobTitle: clean(user.jobTitle),
-      contactType: 'ClawPilot user',
-      description: 'Managed from the ClawPilot user profile.',
-    },
+    }
+    const existingSourcePayload = (
+      existingProfile?.source_payload
+      && typeof existingProfile.source_payload === 'object'
+      && !Array.isArray(existingProfile.source_payload)
+    ) ? existingProfile.source_payload : {}
+    return stageCrmRecordWithClient(client, {
+      entity: 'contacts',
+      pipelineId: input.pipelineId,
+      localId: existingProfile?.id || null,
+      sourceKey: profileSourceKey,
+      fieldMode: existingProfile ? 'enrich' : 'replace',
+      actorEmail: user.email,
+      sourcePayload: existingProfile
+        ? { ...existingSourcePayload, clawpilotProfile: profilePayload }
+        : profilePayload,
+      fields: {
+        organizationId: existingProfile?.organization_id || organization.id,
+        organizationSuiteCrmId: existingProfile
+          ? existingProfile.organization_suitecrm_id
+          : organization.suiteCrmId,
+        appUserEmail: user.email,
+        appUserContactReferenceCode: user.contactReferenceCode,
+        fullName: displayName,
+        email: user.email,
+        jobTitle: clean(user.jobTitle),
+        contactType: 'ClawPilot user',
+        description: 'Managed from the ClawPilot user profile.',
+      },
+    })
   })
   return {
     workspaceOrganizationId: workspaceOrganization.id,
@@ -3200,6 +3253,19 @@ export async function syncAppUserProfileToCrm(input: {
     appUserEmail: user.email,
     displayName,
   }
+}
+
+const RECOVERABLE_CRM_PROFILE_RECONCILIATION_ERRORS = new Set([
+  'CRM profile identity resolves to multiple contacts',
+  'Contact source and identity aliases resolve to different contacts',
+  'Contact source alias conflicts with the supplied email',
+  'Contact identity alias belongs to a different organization',
+  'Contact source alias is already assigned to another contact',
+])
+
+export function isRecoverableCrmProfileReconciliationError(error: unknown) {
+  return error instanceof Error
+    && RECOVERABLE_CRM_PROFILE_RECONCILIATION_ERRORS.has(error.message)
 }
 
 export async function syncPipelineOwnerProfileToCrm(pipelineId: string) {
