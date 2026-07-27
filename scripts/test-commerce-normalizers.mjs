@@ -397,6 +397,360 @@ function moneyValue(field) {
     : field.state
 }
 
+const faireExternalOrderV2Source = clone(faireSource)
+delete faireExternalOrderV2Source.brand.currency
+const faireExternalOrderV2 = faireExternalOrderV2Source.orders[0]
+delete faireExternalOrderV2.currency
+delete faireExternalOrderV2.subtotal_cents
+delete faireExternalOrderV2.shipping_cents
+delete faireExternalOrderV2.tax_cents
+delete faireExternalOrderV2.total_discount_cents
+delete faireExternalOrderV2.total_cents
+faireExternalOrderV2.is_free_shipping = true
+faireExternalOrderV2.brand_discounts = [{
+  id: 'bpc-brand-50',
+  discount_type: 'FLAT_AMOUNT',
+  discount_amount: {
+    amount_minor: 50,
+    currency: 'USD',
+  },
+}]
+faireExternalOrderV2.payout_costs = {
+  subtotal_after_brand_discounts: {
+    amount_minor: 900,
+    currency: 'USD',
+  },
+  total_brand_discounts: {
+    amount_minor: 94,
+    currency: 'USD',
+  },
+  net_tax: {
+    amount_minor: 50,
+    currency: 'USD',
+  },
+  total_payout: {
+    amount_minor: 700,
+    currency: 'USD',
+  },
+}
+const faireExternalOrderV2Line = faireExternalOrderV2.items[0]
+delete faireExternalOrderV2Line.price_cents
+delete faireExternalOrderV2Line.subtotal_cents
+delete faireExternalOrderV2Line.discount_cents
+delete faireExternalOrderV2Line.tax_cents
+faireExternalOrderV2Line.price = {
+  amount_minor: 497,
+  currency: 'USD',
+}
+faireExternalOrderV2Line.discounts = [{
+  discount_amount: {
+    amount_minor: 44,
+    currency: 'USD',
+  },
+}]
+
+const faireExternalOrderV2Normalized = faire.normalizeFaireCommerce(
+  faireExternalOrderV2Source,
+  {
+    ...baseContext,
+    externalAccountId: 'brand-1',
+    apiVersion: 'external-api-v2',
+  },
+)
+assert.equal(
+  faireExternalOrderV2Normalized.rejections.length,
+  0,
+  'Current ExternalOrderV2 nested Money fields must normalize',
+)
+assert.equal(faireExternalOrderV2Normalized.orders.length, 1)
+const faireExternalOrderV2NormalizedOrder =
+  faireExternalOrderV2Normalized.orders[0]
+assert.equal(faireExternalOrderV2NormalizedOrder.currency, 'USD')
+assert.deepEqual(
+  {
+    subtotal: moneyValue(faireExternalOrderV2NormalizedOrder.subtotal),
+    shipping: moneyValue(faireExternalOrderV2NormalizedOrder.shipping),
+    tax: moneyValue(faireExternalOrderV2NormalizedOrder.tax),
+    discount: moneyValue(faireExternalOrderV2NormalizedOrder.discount),
+    total: moneyValue(faireExternalOrderV2NormalizedOrder.total),
+  },
+  {
+    subtotal: '994:USD',
+    shipping: '0:USD',
+    tax: '50:USD',
+    discount: '94:USD',
+    total: '950:USD',
+  },
+)
+assert.deepEqual(
+  {
+    unitPrice: moneyValue(
+      faireExternalOrderV2NormalizedOrder.lines[0].unitPrice,
+    ),
+    lineSubtotal: moneyValue(
+      faireExternalOrderV2NormalizedOrder.lines[0].lineSubtotal,
+    ),
+    lineDiscount: moneyValue(
+      faireExternalOrderV2NormalizedOrder.lines[0].lineDiscount,
+    ),
+    brandDiscount: moneyValue(
+      faireExternalOrderV2NormalizedOrder.providerFacts.brandDiscount,
+    ),
+    lineDiscountTotal: moneyValue(
+      faireExternalOrderV2NormalizedOrder.providerFacts.lineDiscountTotal,
+    ),
+    payout: moneyValue(
+      faireExternalOrderV2NormalizedOrder.providerFacts.payoutAmount,
+    ),
+  },
+  {
+    unitPrice: '497:USD',
+    lineSubtotal: '994:USD',
+    lineDiscount: '44:USD',
+    brandDiscount: '50:USD',
+    lineDiscountTotal: '44:USD',
+    payout: '700:USD',
+  },
+)
+assert.equal(
+  faireExternalOrderV2Normalized.normalizerVersion,
+  'faire-commerce-normalizer-v2',
+)
+
+const faireExternalOrderV2TesterSource = clone(faireExternalOrderV2Source)
+const faireExternalOrderV2TesterOrder =
+  faireExternalOrderV2TesterSource.orders[0]
+faireExternalOrderV2TesterOrder.id = 'order-v2-tester'
+faireExternalOrderV2TesterOrder.display_id = 'V2-TESTER'
+faireExternalOrderV2TesterOrder.payout_costs
+  .subtotal_after_brand_discounts.amount_minor = 1_023
+faireExternalOrderV2TesterOrder.items[0].includes_tester = true
+faireExternalOrderV2TesterOrder.items[0].tester_price = {
+  amount_minor: 123,
+  currency: 'USD',
+}
+const faireExternalOrderV2Tester = faire.normalizeFaireCommerce(
+  faireExternalOrderV2TesterSource,
+  {
+    ...baseContext,
+    externalAccountId: 'brand-1',
+    apiVersion: 'external-api-v2',
+  },
+)
+assert.equal(faireExternalOrderV2Tester.rejections.length, 0)
+assert.equal(
+  moneyValue(faireExternalOrderV2Tester.orders[0].lines[0].lineSubtotal),
+  '1117:USD',
+  'A Faire tester is one separately priced addition to the merchandise subtotal',
+)
+
+const faireExternalOrderV2MissingTesterSource =
+  clone(faireExternalOrderV2TesterSource)
+faireExternalOrderV2MissingTesterSource.orders[0].id =
+  'order-v2-missing-tester-price'
+faireExternalOrderV2MissingTesterSource.orders[0].display_id =
+  'V2-MISSING-TESTER-PRICE'
+delete faireExternalOrderV2MissingTesterSource.orders[0].items[0].tester_price
+const faireExternalOrderV2MissingTester = faire.normalizeFaireCommerce(
+  faireExternalOrderV2MissingTesterSource,
+  {
+    ...baseContext,
+    externalAccountId: 'brand-1',
+    apiVersion: 'external-api-v2',
+  },
+)
+assert.equal(faireExternalOrderV2MissingTester.orders.length, 0)
+assertSafeRejection(faireExternalOrderV2MissingTester.rejections[0], {
+  resourceType: 'order',
+  errorCode: 'COMMERCE_ORDER_RECORD_INVALID',
+  externalId: 'order-v2-missing-tester-price',
+})
+
+const faireExternalOrderV2NoneDiscountSource =
+  clone(faireExternalOrderV2Source)
+faireExternalOrderV2NoneDiscountSource.orders[0].brand_discounts = [
+  {
+    id: 'bpc-free-shipping',
+    discount_type: 'NONE',
+    includes_free_shipping: true,
+  },
+  ...faireExternalOrderV2Source.orders[0].brand_discounts,
+]
+faireExternalOrderV2NoneDiscountSource.orders[0].items[0].discounts = [
+  {
+    id: 'bpc-line-none',
+    discount_type: 'NONE',
+    includes_free_shipping: true,
+  },
+  ...faireExternalOrderV2Source.orders[0].items[0].discounts,
+]
+const faireExternalOrderV2NoneDiscount = faire.normalizeFaireCommerce(
+  faireExternalOrderV2NoneDiscountSource,
+  {
+    ...baseContext,
+    externalAccountId: 'brand-1',
+    apiVersion: 'external-api-v2',
+  },
+)
+assert.equal(
+  moneyValue(
+    faireExternalOrderV2NoneDiscount.orders[0].providerFacts.brandDiscount,
+  ),
+  '50:USD',
+  'A NONE promotion contributes exact zero to monetary discounts',
+)
+assert.equal(
+  moneyValue(
+    faireExternalOrderV2NoneDiscount.orders[0]
+      .providerFacts.lineDiscountTotal,
+  ),
+  '44:USD',
+)
+
+const faireExternalOrderV2PercentageDiscountSource =
+  clone(faireExternalOrderV2Source)
+faireExternalOrderV2PercentageDiscountSource.orders[0].brand_discounts = [{
+  id: 'bpc-brand-percent',
+  discount_type: 'PERCENTAGE',
+  discount_percentage: 10,
+}]
+faireExternalOrderV2PercentageDiscountSource.orders[0].items[0].discounts = [{
+  id: 'bpc-line-percent',
+  discount_type: 'PERCENTAGE',
+  discount_percentage: 10,
+}]
+const faireExternalOrderV2PercentageDiscount = faire.normalizeFaireCommerce(
+  faireExternalOrderV2PercentageDiscountSource,
+  {
+    ...baseContext,
+    externalAccountId: 'brand-1',
+    apiVersion: 'external-api-v2',
+  },
+)
+assert.equal(
+  moneyValue(
+    faireExternalOrderV2PercentageDiscount.orders[0]
+      .providerFacts.brandDiscount,
+  ),
+  'unavailable',
+  'A percentage without an exact amount must not become inferred money',
+)
+assert.equal(
+  moneyValue(
+    faireExternalOrderV2PercentageDiscount.orders[0].lines[0].lineDiscount,
+  ),
+  'unavailable',
+)
+assert.equal(
+  moneyValue(
+    faireExternalOrderV2PercentageDiscount.orders[0]
+      .providerFacts.lineDiscountTotal,
+  ),
+  'unavailable',
+)
+
+const faireExternalOrderV2MixedDiscountSource =
+  clone(faireExternalOrderV2Source)
+faireExternalOrderV2MixedDiscountSource.orders[0].brand_discounts.push({
+  id: 'bpc-brand-percent',
+  discount_type: 'PERCENTAGE',
+  discount_percentage: 10,
+})
+faireExternalOrderV2MixedDiscountSource.orders[0].items[0].discounts.push({
+  id: 'bpc-line-percent',
+  discount_type: 'PERCENTAGE',
+  discount_percentage: 10,
+})
+const faireExternalOrderV2MixedDiscount = faire.normalizeFaireCommerce(
+  faireExternalOrderV2MixedDiscountSource,
+  {
+    ...baseContext,
+    externalAccountId: 'brand-1',
+    apiVersion: 'external-api-v2',
+  },
+)
+assert.equal(
+  moneyValue(
+    faireExternalOrderV2MixedDiscount.orders[0]
+      .providerFacts.brandDiscount,
+  ),
+  'unavailable',
+  'Mixed exact and inexact discounts must not expose a partial exact sum',
+)
+assert.equal(
+  moneyValue(
+    faireExternalOrderV2MixedDiscount.orders[0].lines[0].lineDiscount,
+  ),
+  'unavailable',
+)
+assert.equal(
+  moneyValue(
+    faireExternalOrderV2MixedDiscount.orders[0]
+      .providerFacts.lineDiscountTotal,
+  ),
+  'unavailable',
+)
+
+const faireExternalOrderV2HeaderSource = clone(faireExternalOrderV2Source)
+Object.assign(faireExternalOrderV2HeaderSource.orders[0], {
+  subtotal_cents: 1_100,
+  shipping_cents: 75,
+  tax_cents: 60,
+  total_discount_cents: 100,
+  total_cents: 1_135,
+})
+const faireExternalOrderV2HeaderNormalized = faire.normalizeFaireCommerce(
+  faireExternalOrderV2HeaderSource,
+  {
+    ...baseContext,
+    externalAccountId: 'brand-1',
+    apiVersion: 'external-api-v2',
+  },
+)
+assert.deepEqual(
+  {
+    subtotal: moneyValue(
+      faireExternalOrderV2HeaderNormalized.orders[0].subtotal,
+    ),
+    shipping: moneyValue(
+      faireExternalOrderV2HeaderNormalized.orders[0].shipping,
+    ),
+    tax: moneyValue(faireExternalOrderV2HeaderNormalized.orders[0].tax),
+    discount: moneyValue(
+      faireExternalOrderV2HeaderNormalized.orders[0].discount,
+    ),
+    total: moneyValue(faireExternalOrderV2HeaderNormalized.orders[0].total),
+  },
+  {
+    subtotal: '1100:USD',
+    shipping: '75:USD',
+    tax: '60:USD',
+    discount: '100:USD',
+    total: '1135:USD',
+  },
+  'Explicit header totals must take precedence over derived V2 payout facts',
+)
+
+const faireExternalOrderV2PaidShippingSource =
+  clone(faireExternalOrderV2Source)
+faireExternalOrderV2PaidShippingSource.orders[0].id = 'order-v2-paid-shipping'
+faireExternalOrderV2PaidShippingSource.orders[0].display_id = 'V2-PAID-SHIPPING'
+faireExternalOrderV2PaidShippingSource.orders[0].is_free_shipping = false
+const faireExternalOrderV2PaidShipping = faire.normalizeFaireCommerce(
+  faireExternalOrderV2PaidShippingSource,
+  {
+    ...baseContext,
+    externalAccountId: 'brand-1',
+    apiVersion: 'external-api-v2',
+  },
+)
+assert.equal(faireExternalOrderV2PaidShipping.orders.length, 0)
+assertSafeRejection(faireExternalOrderV2PaidShipping.rejections[0], {
+  resourceType: 'order',
+  errorCode: 'COMMERCE_ORDER_MONEY_INCOMPLETE',
+  externalId: 'order-v2-paid-shipping',
+})
+
 function addressProjection(field) {
   const address = availableValue(field)
   return {

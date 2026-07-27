@@ -1710,18 +1710,20 @@ export default function CommerceIntegrationPanel() {
                           ? `${providerLabel(account.provider)} API connection established.`
                           : `${providerLabel(account.provider)} API connection needs attention.`}{' '}
                         {account.provider === 'shopify'
-                          ? 'Receipt intake is a separate optional activation step.'
-                          : 'Scheduled Faire polling and inventory synchronization are not active; the development-only operator intake below is separate.'}
+                          ? 'Automatic product catalog sync is managed below. Signed order receipts remain a separate optional activation.'
+                          : 'Automatic product catalog sync is managed below. Scheduled order and inventory synchronization remain separate and inactive.'}
                       </Alert>
 
-                      {intakeAvailable
-                        && account.configured
-                        && account.verificationStatus === 'verified' ? (
+                      {intakeAvailable ? (
                         <CommerceIntakeWorkflow
                           accountGlobalId={account.globalId}
                           provider={account.provider}
                           displayName={account.displayName}
                           canActivate={canActivate}
+                          connectionReady={
+                            account.configured
+                            && account.verificationStatus === 'verified'
+                          }
                         />
                       ) : null}
 

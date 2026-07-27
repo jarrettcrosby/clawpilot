@@ -10,6 +10,7 @@ import {
   encryptCommerceIntakeContinuation,
 } from '@/lib/integrations/commerceCredentialCrypto'
 import { CommerceIntegrationRequestError } from '@/lib/integrations/commerceIntegrations'
+import { exactProductMappingMutation } from '@/lib/integrations/commerceProductMappingPolicy'
 import type { CommerceRuntimeCredentialRecord } from '@/lib/persistence/commerceIntegrations'
 import {
   commerceCurrencyMinorUnit,
@@ -26,11 +27,17 @@ import {
   acquireTransactionAdvisoryLock,
   withTransaction,
 } from '@/lib/persistence/postgres'
+import {
+  applyCommerceCatalogSyncPolicyWithClient,
+  readCommerceCatalogSyncStateWithClient,
+} from '@/lib/persistence/commerceCatalogSync'
 
 const POLICY_VERSION = 'commerce-intake-resolution-v1'
+const PRODUCT_INTAKE_POLICY_VERSION = 'commerce-product-intake-policy-v1'
 const DEFAULT_SLA_POLICY_VERSION = 'commerce-default-sla-v1'
 const DEFAULT_SLA_DAYS = 7
 const COMMERCE_INTAKE_READ_LEASE_MS = 2 * 60 * 1_000
+const COMMERCE_INTAKE_PRODUCT_CANDIDATE_RESPONSE_LIMIT = 500
 
 type CandidateAddress = {
   name: string
@@ -137,6 +144,13 @@ type IntakeAccountRow = {
     | 'active'
     | 'frozen'
   activation_revision: number
+}
+
+type ProductIntakePolicyRow = {
+  policy_version: string
+  unmatched_action: 'review' | 'auto_create'
+  revision: number
+  updated_at: string | Date
 }
 
 type CandidateRow = {
@@ -785,6 +799,47 @@ function commandHash(value: unknown) {
   return createHash('sha256').update(canonicalJson(value)).digest('hex')
 }
 
+function deterministicCommandUuid(value: unknown) {
+  const bytes = createHash('sha256')
+    .update('clawpilot:commerce:automatic-product-command:v1\0')
+    .update(canonicalJson(value))
+    .digest()
+    .subarray(0, 16)
+  bytes[6] = (bytes[6] & 0x0f) | 0x50
+  bytes[8] = (bytes[8] & 0x3f) | 0x80
+  const hex = bytes.toString('hex')
+  return [
+    hex.slice(0, 8),
+    hex.slice(8, 12),
+    hex.slice(12, 16),
+    hex.slice(16, 20),
+    hex.slice(20),
+  ].join('-')
+}
+
+function defaultProductIntakePolicy() {
+  return {
+    version: PRODUCT_INTAKE_POLICY_VERSION,
+    unmatchedAction: 'review' as const,
+    autoCreateNewProducts: false,
+    revision: 0,
+    updatedAt: null as string | null,
+  }
+}
+
+function productIntakePolicyState(
+  row: ProductIntakePolicyRow | null | undefined,
+) {
+  if (!row) return defaultProductIntakePolicy()
+  return {
+    version: row.policy_version,
+    unmatchedAction: row.unmatched_action,
+    autoCreateNewProducts: row.unmatched_action === 'auto_create',
+    revision: Number(row.revision),
+    updatedAt: iso(row.updated_at),
+  }
+}
+
 async function prepareReceipt(
   client: PoolClient,
   input: {
@@ -1212,6 +1267,132 @@ async function lockProductCandidate(
     )
   }
   return candidate
+}
+
+async function activateExactProductMapping(
+  client: PoolClient,
+  input: {
+    organizationId: string
+    integrationAccountId: string
+    pipelineId: string
+    productId: string
+    channelSku: string | null
+    externalProductId: string | null
+    externalVariantId: string
+    externalInventoryItemId: string | null
+    mappingMethod: 'exact_variant' | 'product_created'
+    mappingSourceRevision: string
+    actorEmail: string
+    allowReplacement?: boolean
+  },
+) {
+  const active = (
+    await client.query<{
+      id: string
+      global_id: string
+      product_id: string
+    }>(
+      `SELECT id::text, global_id, product_id::text
+       FROM operations_product_mappings
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND external_variant_id = $3
+         AND active = true
+       LIMIT 1
+       FOR UPDATE`,
+      [
+        input.organizationId,
+        input.integrationAccountId,
+        input.externalVariantId,
+      ],
+    )
+  ).rows[0]
+  const mutation = exactProductMappingMutation({
+    activeProductId: active?.product_id || null,
+    requestedProductId: input.productId,
+    allowReplacement: input.allowReplacement !== false,
+  })
+  if (mutation === 'reuse') {
+    const refreshed = (
+      await client.query<{
+        id: string
+        global_id: string
+      }>(
+        `UPDATE operations_product_mappings
+         SET pipeline_id = $2::uuid,
+             channel_sku = $3,
+             external_product_id = $4,
+             external_inventory_item_id = $5,
+             mapping_source_revision = $6,
+             updated_at = now()
+         WHERE id = $1::uuid
+         RETURNING id::text, global_id`,
+        [
+          active.id,
+          input.pipelineId,
+          input.channelSku,
+          input.externalProductId,
+          input.externalInventoryItemId,
+          input.mappingSourceRevision,
+        ],
+      )
+    ).rows[0]
+    return {
+      ...refreshed,
+      replacedMappingGlobalId: null as string | null,
+    }
+  }
+  if (mutation === 'preserve') {
+    intakeError(
+      'COMMERCE_PRODUCT_AUTO_CREATE_MAPPING_CONFLICT',
+      'Automatic product creation cannot replace an existing provider variant mapping',
+      409,
+    )
+  }
+  if (mutation === 'replace' && active) {
+    await client.query(
+      `UPDATE operations_product_mappings
+       SET active = false,
+           updated_at = now()
+       WHERE id = $1::uuid
+         AND active = true`,
+      [active.id],
+    )
+  }
+  const created = (
+    await client.query<{
+      id: string
+      global_id: string
+    }>(
+      `INSERT INTO operations_product_mappings (
+         organization_id, integration_account_id, pipeline_id, product_id,
+         channel_sku, external_product_id, external_variant_id,
+         external_inventory_item_id, mapping_method,
+         mapping_source_revision, active, created_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7, $8,
+         $9, $10, true, $11
+       )
+       RETURNING id::text, global_id`,
+      [
+        input.organizationId,
+        input.integrationAccountId,
+        input.pipelineId,
+        input.productId,
+        input.channelSku,
+        input.externalProductId,
+        input.externalVariantId,
+        input.externalInventoryItemId,
+        input.mappingMethod,
+        input.mappingSourceRevision,
+        input.actorEmail,
+      ],
+    )
+  ).rows[0]
+  return {
+    ...created,
+    replacedMappingGlobalId: active?.global_id || null,
+  }
 }
 
 async function candidateLines(
@@ -3587,6 +3768,64 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
       (sum, product) => sum + product.variants.length,
       0,
     )
+    const productVariantIds = [
+      ...new Set(input.envelope.products.flatMap(
+        (product) => product.variants.map(
+          (variant) => variant.identity.value,
+        ),
+      )),
+    ]
+    const latestProductEvidence = productVariantIds.length
+      ? (
+          await client.query<{
+            id: string
+            external_variant_id: string
+            source_revision: string
+            source_hash: string
+            credential_version: number
+          }>(
+            `SELECT DISTINCT ON (candidate.external_variant_id)
+               candidate.id::text,
+               candidate.external_variant_id,
+               candidate.source_revision,
+               candidate.source_hash,
+               run.credential_version
+             FROM operations_commerce_product_candidates candidate
+             JOIN operations_commerce_intake_runs run
+               ON run.organization_id = candidate.organization_id
+              AND run.integration_account_id
+                  = candidate.integration_account_id
+              AND run.pipeline_id = candidate.pipeline_id
+              AND run.id = candidate.run_id
+             WHERE candidate.organization_id = $1::uuid
+               AND candidate.integration_account_id = $2::uuid
+               AND candidate.provider = $3
+               AND candidate.external_variant_id = ANY($4::text[])
+               AND candidate.expires_at > now()
+               AND candidate.workflow_state <> 'expired'
+               AND run.credential_version = $5::integer
+               AND run.expires_at > now()
+               AND run.workflow_state <> 'expired'
+             ORDER BY candidate.external_variant_id,
+                      candidate.observed_at DESC,
+                      candidate.created_at DESC,
+                      candidate.id DESC`,
+            [
+              account.organization_id,
+              account.id,
+              account.provider,
+              productVariantIds,
+              account.credential_version,
+            ],
+          )
+        ).rows
+      : []
+    const latestProductEvidenceByVariant = new Map(
+      latestProductEvidence.map((row) => [
+        row.external_variant_id,
+        row,
+      ]),
+    )
     const normalizationRejections = input.envelope.rejections.map(
       (rejection) => ({
         resourceType: rejection.resourceType,
@@ -3734,6 +3973,18 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
     )
     const run = runResult.rows[0]
 
+    const mappingVariantIds = [...new Set([
+      ...input.envelope.products.flatMap(
+        (product) => product.variants.map(
+          (variant) => variant.identity.value,
+        ),
+      ),
+      ...input.envelope.orders.flatMap(
+        (order) => order.lines
+          .map((line) => exactMappingIdentity(line))
+          .filter((identity): identity is string => Boolean(identity)),
+      ),
+    ])]
     const mappings = await client.query<{
       id: string
       external_variant_id: string
@@ -3744,16 +3995,38 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
        WHERE organization_id = $1::uuid
          AND integration_account_id = $2::uuid
          AND active = true
-         AND external_variant_id IS NOT NULL`,
-      [account.organization_id, account.id],
+         AND external_variant_id = ANY($3::text[])`,
+      [account.organization_id, account.id, mappingVariantIds],
     )
     const mappingByVariant = new Map(
       mappings.rows.map((mapping) => [mapping.external_variant_id, mapping]),
     )
     const productCandidateByVariant = new Map<string, string>()
+    let productVariantsStaged = 0
+    let productVariantsPreserved = 0
     for (const product of input.envelope.products) {
       const status = providerProductStatus(product)
       for (const variant of product.variants) {
+        const incomingSourceRevision = sourceRevision(
+          variant.providerUpdatedAt,
+          variant.sourceHash,
+        )
+        const prior = latestProductEvidenceByVariant.get(
+          variant.identity.value,
+        )
+        if (
+          prior
+          && prior.credential_version === account.credential_version
+          && prior.source_revision === incomingSourceRevision
+          && prior.source_hash === variant.sourceHash
+        ) {
+          productCandidateByVariant.set(
+            variant.identity.value,
+            prior.id,
+          )
+          productVariantsPreserved += 1
+          continue
+        }
         const wholesalePrice = optionalMoney(variant.wholesalePrice)
         const retailPrice = optionalMoney(variant.retailPrice)
         const price = wholesalePrice ?? retailPrice
@@ -3822,7 +4095,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
             variant.providerCreatedAt,
             variant.providerUpdatedAt,
             input.envelope.observedAt,
-            sourceRevision(variant.providerUpdatedAt, variant.sourceHash),
+            incomingSourceRevision,
             variant.sourceHash,
             input.envelope.apiVersion,
             input.envelope.normalizerVersion,
@@ -3838,6 +4111,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
           variant.identity.value,
           productCandidate.rows[0].id,
         )
+        productVariantsStaged += 1
       }
     }
 
@@ -4252,7 +4526,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
       }
     }
 
-    const recordsStaged = variantCount + ordersStaged
+    const recordsStaged = productVariantsStaged + ordersStaged
     let pagination: {
       mode: 'operational'
       resource: 'orders' | 'products'
@@ -4508,7 +4782,8 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
       ordersStaged,
       ordersPreserved,
       ordersSkippedCanonical,
-      productVariantsStaged: variantCount,
+      productVariantsStaged,
+      productVariantsPreserved,
       recordsRejected,
       recordsStaged,
       pagination,
@@ -4529,7 +4804,9 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
         ordersStaged,
         ordersPreserved,
         ordersSkippedCanonical,
-        productVariants: variantCount,
+        productVariantsSeen: variantCount,
+        productVariantsStaged,
+        productVariantsPreserved,
         recordsRejected,
         normalizationRejections,
         action: stageResult.action,
@@ -4555,6 +4832,221 @@ function safeNumber(value: string | number | null | undefined) {
   return Number.isFinite(parsed) ? parsed : null
 }
 
+export async function updateCommerceProductIntakePolicyInPostgres(input: {
+  organizationId: string
+  accountGlobalId: string
+  actorEmail: string
+  idempotencyKey: string
+  expectedPolicyRevision: number
+  unmatchedAction: 'review' | 'auto_create'
+  confirmAutoCreateProducts: boolean
+}) {
+  return withTransaction(async (client) => {
+    const accountResult = await client.query<{
+      id: string
+      global_id: string
+      provider: 'shopify' | 'faire'
+      status: 'active' | 'disabled' | 'error'
+      commerce_credential_generation: number
+    }>(
+      `SELECT account.id::text, account.global_id, account.provider,
+              account.status, account.commerce_credential_generation
+       FROM operations_integration_accounts account
+       WHERE account.organization_id = $1::uuid
+         AND account.global_id = $2
+         AND account.integration_type = 'commerce'
+         AND account.provider IN ('shopify', 'faire')
+       LIMIT 1
+       FOR UPDATE OF account`,
+      [input.organizationId, input.accountGlobalId],
+    )
+    const account = accountResult.rows[0]
+    if (!account) {
+      intakeError(
+        'COMMERCE_INTAKE_ACCOUNT_REQUIRED',
+        'The selected commerce connection is unavailable',
+        404,
+      )
+    }
+    const requestHash = commandHash({
+      policyVersion: PRODUCT_INTAKE_POLICY_VERSION,
+      accountGlobalId: account.global_id,
+      expectedPolicyRevision: input.expectedPolicyRevision,
+      unmatchedAction: input.unmatchedAction,
+      confirmAutoCreateProducts: input.confirmAutoCreateProducts,
+    })
+    const prepared = await prepareReceipt(client, {
+      organizationId: input.organizationId,
+      commandType: 'commerce.intake.update_product_policy',
+      idempotencyKey: input.idempotencyKey,
+      requestHash,
+      actorEmail: input.actorEmail,
+    })
+    if (prepared.replayed) return replayPayload(prepared.receipt)
+
+    const currentPolicy = (
+      await client.query<ProductIntakePolicyRow>(
+        `SELECT policy_version, unmatched_action, revision, updated_at
+         FROM operations_commerce_product_intake_policies
+         WHERE organization_id = $1::uuid
+           AND integration_account_id = $2::uuid
+         FOR UPDATE`,
+        [input.organizationId, account.id],
+      )
+    ).rows[0] || null
+    const currentRevision = currentPolicy
+      ? Number(currentPolicy.revision)
+      : 0
+    if (
+      !Number.isSafeInteger(input.expectedPolicyRevision)
+      || input.expectedPolicyRevision < 0
+      || input.expectedPolicyRevision !== currentRevision
+    ) {
+      intakeError(
+        'COMMERCE_PRODUCT_INTAKE_POLICY_REVISION_CONFLICT',
+        'The automatic product policy changed. Reload before saving it again.',
+        409,
+      )
+    }
+    if (
+      input.unmatchedAction === 'auto_create'
+      && input.confirmAutoCreateProducts !== true
+    ) {
+      intakeError(
+        'COMMERCE_PRODUCT_AUTO_CREATE_CONFIRMATION_REQUIRED',
+        'Confirm automatic creation of new ClawPilot products',
+        400,
+      )
+    }
+    if (input.unmatchedAction === 'auto_create') {
+      const activation = (
+        await client.query<{
+          state: 'disabled' | 'shadow' | 'read_only' | 'active' | 'frozen'
+        }>(
+          `SELECT state
+           FROM operations_activation_scopes
+           WHERE organization_id = $1::uuid
+           LIMIT 1
+           FOR UPDATE`,
+          [input.organizationId],
+        )
+      ).rows[0]
+      const credential = (
+        await client.query<{
+          credential_version: number
+          verification_status: 'unverified' | 'verified' | 'failed'
+        }>(
+          `SELECT credential_version, verification_status
+           FROM operations_commerce_credentials
+           WHERE organization_id = $1::uuid
+             AND integration_account_id = $2::uuid
+           LIMIT 1
+           FOR UPDATE`,
+          [input.organizationId, account.id],
+        )
+      ).rows[0]
+      if (
+        account.status === 'error'
+        || !credential
+        || credential.verification_status !== 'verified'
+        || credential.credential_version
+          !== account.commerce_credential_generation
+      ) {
+        intakeError(
+          'COMMERCE_PRODUCT_AUTO_CREATE_CONNECTION_REQUIRED',
+          'Verify and repair this commerce connection before turning on automatic product creation',
+          409,
+        )
+      }
+      if (!activation || !['shadow', 'active'].includes(activation.state)) {
+        intakeError(
+          'COMMERCE_INTAKE_ACTIVATION_REQUIRED',
+          'Set Operations to Shadow or Active before turning on automatic product creation',
+          409,
+        )
+      }
+    }
+
+    const nextRevision = currentRevision + 1
+    const updated = (
+      await client.query<ProductIntakePolicyRow>(
+        `INSERT INTO operations_commerce_product_intake_policies (
+           organization_id, integration_account_id, policy_version,
+           unmatched_action, revision, created_by, updated_by
+         ) VALUES (
+           $1::uuid, $2::uuid, $3, $4, $5, $6, $6
+         )
+         ON CONFLICT (organization_id, integration_account_id)
+         DO UPDATE SET
+           policy_version = EXCLUDED.policy_version,
+           unmatched_action = EXCLUDED.unmatched_action,
+           revision = EXCLUDED.revision,
+           updated_by = EXCLUDED.updated_by,
+           updated_at = now()
+         RETURNING policy_version, unmatched_action, revision, updated_at`,
+        [
+          input.organizationId,
+          account.id,
+          PRODUCT_INTAKE_POLICY_VERSION,
+          input.unmatchedAction,
+          nextRevision,
+          input.actorEmail,
+        ],
+      )
+    ).rows[0]
+    const policy = productIntakePolicyState(updated)
+    const catalogSync = await applyCommerceCatalogSyncPolicyWithClient(
+      client,
+      {
+        organizationId: input.organizationId,
+        integrationAccountId: account.id,
+        provider: account.provider,
+        credentialVersion: account.commerce_credential_generation,
+        policyRevision: nextRevision,
+        unmatchedAction: input.unmatchedAction,
+        actorEmail: input.actorEmail,
+      },
+    )
+    const result = {
+      action: 'set-product-intake-policy',
+      accountGlobalId: account.global_id,
+      productIntake: policy,
+      catalogSync,
+      providerWrites: 0,
+      syncCursorAdvanced: false,
+      replayed: false,
+    }
+    await completeReceipt(
+      client,
+      prepared.receipt.id,
+      account.global_id,
+      result,
+    )
+    await recordAuditEvent({
+      actor: input.actorEmail,
+      eventType: 'commerce.intake.product_policy.updated',
+      aggregateType: 'operations.integration_account',
+      aggregateId: account.global_id,
+      organizationId: input.organizationId,
+      eventKey:
+        `commerce-product-policy:${account.global_id}:${input.idempotencyKey}`,
+      payload: {
+        provider: account.provider,
+        policyVersion: PRODUCT_INTAKE_POLICY_VERSION,
+        previousAction: currentPolicy?.unmatched_action || 'review',
+        unmatchedAction: input.unmatchedAction,
+        previousRevision: currentRevision,
+        revision: nextRevision,
+        catalogSyncQueued: catalogSync.queued,
+        catalogSyncCancelled: catalogSync.cancelled,
+        providerWrites: 0,
+        syncCursorAdvanced: false,
+      },
+    }, client)
+    return result
+  })
+}
+
 export async function readCommerceIntakeStateFromPostgres(input: {
   organizationId: string
   accountGlobalId: string
@@ -4564,6 +5056,22 @@ export async function readCommerceIntakeStateFromPostgres(input: {
       organizationId: input.organizationId,
       accountGlobalId: input.accountGlobalId,
     })
+    const productIntakePolicy = productIntakePolicyState((
+      await client.query<ProductIntakePolicyRow>(
+        `SELECT policy_version, unmatched_action, revision, updated_at
+         FROM operations_commerce_product_intake_policies
+         WHERE organization_id = $1::uuid
+           AND integration_account_id = $2::uuid`,
+        [account.organization_id, account.id],
+      )
+    ).rows[0])
+    const productCatalogSync = await readCommerceCatalogSyncStateWithClient(
+      client,
+      {
+        organizationId: account.organization_id,
+        integrationAccountId: account.id,
+      },
+    )
     const runResult = await client.query<{
       id: string
       global_id: string
@@ -4810,13 +5318,75 @@ export async function readCommerceIntakeStateFromPostgres(input: {
                       selected.created_at DESC,
                       selected.id DESC
            )
-         ORDER BY candidate.provider_updated_at DESC NULLS LAST,
+         ORDER BY CASE
+                    WHEN candidate.mapping_state <> 'resolved'
+                         AND candidate.workflow_state
+                               IN ('held', 'resolving', 'ready')
+                      THEN 0
+                    ELSE 1
+                  END,
+                  candidate.provider_updated_at DESC NULLS LAST,
                   candidate.observed_at DESC,
                   candidate.created_at DESC,
-                  candidate.id DESC`,
+                  candidate.id DESC
+         LIMIT ${COMMERCE_INTAKE_PRODUCT_CANDIDATE_RESPONSE_LIMIT}`,
         [account.organization_id, account.id],
       )
     ).rows
+    const productCandidateSummary = (
+      await client.query<{
+        total: string
+        unresolved: string
+        held: string
+        ready: string
+        excluded: string
+      }>(
+        `SELECT
+           count(*)::text AS total,
+           count(*) FILTER (
+             WHERE latest.mapping_state <> 'resolved'
+               AND latest.workflow_state IN ('held', 'resolving', 'ready')
+           )::text AS unresolved,
+           count(*) FILTER (
+             WHERE latest.workflow_state IN ('held', 'resolving')
+           )::text AS held,
+           count(*) FILTER (
+             WHERE latest.workflow_state = 'ready'
+           )::text AS ready,
+           count(*) FILTER (
+             WHERE latest.workflow_state = 'failed'
+           )::text AS excluded
+         FROM (
+           SELECT DISTINCT ON (selected.external_variant_id)
+                  selected.workflow_state,
+                  selected.mapping_state
+           FROM operations_commerce_product_candidates selected
+           JOIN operations_commerce_intake_runs selected_run
+             ON selected_run.organization_id = selected.organization_id
+            AND selected_run.integration_account_id
+                = selected.integration_account_id
+            AND selected_run.pipeline_id = selected.pipeline_id
+            AND selected_run.id = selected.run_id
+           WHERE selected.organization_id = $1::uuid
+             AND selected.integration_account_id = $2::uuid
+             AND selected.expires_at > now()
+             AND selected.workflow_state <> 'expired'
+             AND selected_run.expires_at > now()
+             AND selected_run.workflow_state <> 'expired'
+           ORDER BY selected.external_variant_id,
+                    selected.observed_at DESC,
+                    selected.created_at DESC,
+                    selected.id DESC
+         ) latest`,
+        [account.organization_id, account.id],
+      )
+    ).rows[0] || {
+      total: '0',
+      unresolved: '0',
+      held: '0',
+      ready: '0',
+      excluded: '0',
+    }
 
     const productRows = await client.query<{
       id: string
@@ -5116,6 +5686,12 @@ export async function readCommerceIntakeStateFromPostgres(input: {
       unsupportedReason: candidate.unsupported_reason_detail
         || candidate.unsupported_reason_code,
     }))
+    const returnedUnresolvedProductCandidates = mappedProductCandidates.filter(
+      (candidate) => (
+        candidate.mappingStatus !== 'resolved'
+        && ['held', 'resolving', 'ready'].includes(candidate.state)
+      ),
+    ).length
     const evidenceRow = evidence.rows[0]
     type ContinuationStateRow = (typeof continuationResult.rows)[number]
     const paginationState = (
@@ -5157,6 +5733,8 @@ export async function readCommerceIntakeStateFromPostgres(input: {
         ),
         providerWritesAllowed: false,
         syncCursorAdvanceAllowed: false,
+        productIntake: productIntakePolicy,
+        productCatalogSync,
       },
       run: run
         ? {
@@ -5188,18 +5766,9 @@ export async function readCommerceIntakeStateFromPostgres(input: {
             latestRunRecordsPromoted: run.records_promoted,
             latestRunCanonicalProductsCreated:
               run.canonical_products_created,
-            productRecordsHeld: mappedProductCandidates.filter(
-              (candidate) => (
-                candidate.state === 'held'
-                || candidate.state === 'resolving'
-              ),
-            ).length,
-            productRecordsReady: mappedProductCandidates.filter(
-              (candidate) => candidate.state === 'ready',
-            ).length,
-            productRecordsExcluded: mappedProductCandidates.filter(
-              (candidate) => candidate.state === 'failed',
-            ).length,
+            productRecordsHeld: Number(productCandidateSummary.held),
+            productRecordsReady: Number(productCandidateSummary.ready),
+            productRecordsExcluded: Number(productCandidateSummary.excluded),
             providerReads: 1,
             providerWrites: run.provider_write_count,
             syncCursorAdvanced: run.sync_cursor_advanced,
@@ -5212,6 +5781,20 @@ export async function readCommerceIntakeStateFromPostgres(input: {
       },
       candidates: mappedCandidates,
       productCandidates: mappedProductCandidates,
+      productCandidateSummary: {
+        scope: 'latest_unexpired_per_account_provider_variant',
+        limit: COMMERCE_INTAKE_PRODUCT_CANDIDATE_RESPONSE_LIMIT,
+        total: Number(productCandidateSummary.total),
+        unresolved: Number(productCandidateSummary.unresolved),
+        returned: mappedProductCandidates.length,
+        unresolvedReturned: returnedUnresolvedProductCandidates,
+        truncated:
+          Number(productCandidateSummary.total)
+          > mappedProductCandidates.length,
+        unresolvedTruncated:
+          Number(productCandidateSummary.unresolved)
+          > returnedUnresolvedProductCandidates,
+      },
       rejections: openRejections.rows.map((rejection) => ({
         globalId: rejection.global_id,
         rowVersion: Number(rejection.row_version),
@@ -5257,6 +5840,11 @@ export async function resolveCommerceProductCandidateInPostgres(input: {
   idempotencyKey: string
   candidateGlobalId: string
   candidateRowVersion: number
+  automatic?: {
+    policyVersion: typeof PRODUCT_INTAKE_POLICY_VERSION
+    policyRevision: number
+    runGlobalId: string
+  }
   resolution:
     | {
         mode: 'existing'
@@ -5363,15 +5951,86 @@ export async function resolveCommerceProductCandidateInPostgres(input: {
               reason: safeReason,
             }
           : input.resolution,
+        automatic: input.automatic || null,
       },
     )
     if (started.replayed) return replayPayload(started.receipt)
+    if (input.automatic) {
+      const automaticPolicy = (
+        await client.query<ProductIntakePolicyRow>(
+          `SELECT policy_version, unmatched_action, revision, updated_at
+           FROM operations_commerce_product_intake_policies
+           WHERE organization_id = $1::uuid
+             AND integration_account_id = $2::uuid
+           FOR UPDATE`,
+          [started.account.organization_id, started.account.id],
+        )
+      ).rows[0]
+      if (
+        !automaticPolicy
+        || automaticPolicy.policy_version !== input.automatic.policyVersion
+        || automaticPolicy.unmatched_action !== 'auto_create'
+        || Number(automaticPolicy.revision)
+          !== input.automatic.policyRevision
+      ) {
+        intakeError(
+          'COMMERCE_PRODUCT_AUTO_CREATE_DISABLED',
+          'Automatic product creation is no longer enabled',
+          409,
+        )
+      }
+    }
     const candidate = await lockProductCandidate(client, {
       organizationId: started.account.organization_id,
       integrationAccountId: started.account.id,
       candidateGlobalId: input.candidateGlobalId,
       candidateRowVersion: input.candidateRowVersion,
     })
+    const preservedAutomaticMapping = input.automatic
+      ? (
+          await client.query<{
+            id: string
+            global_id: string
+            product_id: string
+            product_global_id: string
+            product_sku: string | null
+            product_archived: boolean
+          }>(
+            `SELECT mapping.id::text, mapping.global_id,
+                    mapping.product_id::text,
+                    product.reference_code AS product_global_id,
+                    product.sku AS product_sku,
+                    COALESCE(
+                      lower(product.source_payload->>'archived'),
+                      'false'
+                    ) IN ('true', '1', 'yes') AS product_archived
+             FROM operations_product_mappings mapping
+             JOIN crm_products product
+               ON product.pipeline_id = mapping.pipeline_id
+              AND product.id = mapping.product_id
+             WHERE mapping.organization_id = $1::uuid
+               AND mapping.integration_account_id = $2::uuid
+               AND mapping.pipeline_id = $3::uuid
+               AND mapping.external_variant_id = $4
+               AND mapping.active = true
+             LIMIT 1
+             FOR UPDATE OF mapping, product`,
+            [
+              candidate.organization_id,
+              candidate.integration_account_id,
+              candidate.pipeline_id,
+              candidate.external_variant_id,
+            ],
+          )
+        ).rows[0] || null
+      : null
+    if (preservedAutomaticMapping?.product_archived) {
+      intakeError(
+        'COMMERCE_PRODUCT_AUTO_CREATE_MAPPING_CONFLICT',
+        'The existing provider variant mapping points to an archived product and requires review',
+        409,
+      )
+    }
 
     if (input.resolution.mode === 'exclude') {
       await client.query(
@@ -5470,7 +6129,13 @@ export async function resolveCommerceProductCandidateInPostgres(input: {
       sku: string | null
     }
     let productWasCreated = false
-    if (input.resolution.mode === 'existing') {
+    if (preservedAutomaticMapping) {
+      product = {
+        id: preservedAutomaticMapping.product_id,
+        globalId: preservedAutomaticMapping.product_global_id,
+        sku: preservedAutomaticMapping.product_sku,
+      }
+    } else if (input.resolution.mode === 'existing') {
       const productResult = await client.query<{
         id: string
         reference_code: string
@@ -5545,7 +6210,9 @@ export async function resolveCommerceProductCandidateInPostgres(input: {
           pipelineId: candidate.pipeline_id,
           sourceKey,
           sourcePayload: {
-            source: 'commerce_catalog_explicit_creation',
+            source: input.automatic
+              ? 'commerce_catalog_automatic_creation'
+              : 'commerce_catalog_explicit_creation',
             integrationAccountGlobalId: input.runtime.globalId,
             provider: candidate.provider,
             externalProductId: candidate.external_product_id,
@@ -5555,6 +6222,12 @@ export async function resolveCommerceProductCandidateInPostgres(input: {
             candidateGlobalId: candidate.global_id,
             sourceRevision: candidate.source_revision,
             sourceHash: candidate.source_hash,
+            providerSnapshot: {
+              productTitle: candidate.product_title_snapshot,
+              variantTitle: candidate.variant_title_snapshot,
+              sku: candidate.sku_snapshot,
+              barcode: candidate.barcode_snapshot,
+            },
           },
           actorEmail: input.actorEmail,
           fields: {
@@ -5566,7 +6239,9 @@ export async function resolveCommerceProductCandidateInPostgres(input: {
             status: 'Active',
             active: true,
             description:
-              `Explicitly created from ${candidate.provider} catalog variant ${candidate.global_id}.`,
+              `${
+                input.automatic ? 'Automatically' : 'Explicitly'
+              } created from ${candidate.provider} catalog variant ${candidate.global_id}.`,
           },
         })
         product = {
@@ -5578,51 +6253,28 @@ export async function resolveCommerceProductCandidateInPostgres(input: {
       }
     }
 
-    const mappingMethod = productWasCreated
-      ? 'product_created'
-      : 'exact_variant'
-    const mappingResult = await client.query<{
-      id: string
-      global_id: string
-    }>(
-      `INSERT INTO operations_product_mappings (
-         organization_id, integration_account_id, pipeline_id, product_id,
-         channel_sku, external_product_id, external_variant_id,
-         external_inventory_item_id, mapping_method,
-         mapping_source_revision, active, created_by
-       ) VALUES (
-         $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7, $8,
-         $9, $10, true, $11
-       )
-       ON CONFLICT (
-         organization_id, integration_account_id, external_variant_id
-       ) WHERE external_variant_id IS NOT NULL
-       DO UPDATE SET
-         pipeline_id = EXCLUDED.pipeline_id,
-         product_id = EXCLUDED.product_id,
-         channel_sku = EXCLUDED.channel_sku,
-         external_product_id = EXCLUDED.external_product_id,
-         external_inventory_item_id = EXCLUDED.external_inventory_item_id,
-         mapping_method = EXCLUDED.mapping_method,
-         mapping_source_revision = EXCLUDED.mapping_source_revision,
-         active = true,
-         updated_at = now()
-       RETURNING id::text, global_id`,
-      [
-        candidate.organization_id,
-        candidate.integration_account_id,
-        candidate.pipeline_id,
-        product.id,
-        candidate.sku_snapshot || product.sku,
-        candidate.external_product_id,
-        candidate.external_variant_id,
-        candidate.external_inventory_item_id,
-        mappingMethod,
-        candidate.source_revision,
-        input.actorEmail,
-      ],
-    )
-    const mapping = mappingResult.rows[0]
+    const mapping = preservedAutomaticMapping
+      ? {
+          id: preservedAutomaticMapping.id,
+          global_id: preservedAutomaticMapping.global_id,
+          replacedMappingGlobalId: null as string | null,
+        }
+      : await activateExactProductMapping(client, {
+          organizationId: candidate.organization_id,
+          integrationAccountId: candidate.integration_account_id,
+          pipelineId: candidate.pipeline_id,
+          productId: product.id,
+          channelSku: candidate.sku_snapshot || product.sku,
+          externalProductId: candidate.external_product_id,
+          externalVariantId: candidate.external_variant_id,
+          externalInventoryItemId: candidate.external_inventory_item_id,
+          mappingMethod: productWasCreated
+            ? 'product_created'
+            : 'exact_variant',
+          mappingSourceRevision: candidate.source_revision,
+          actorEmail: input.actorEmail,
+          allowReplacement: !input.automatic,
+        })
     const updated = await client.query<{
       workflow_state: string
       blocking_codes: string[]
@@ -5679,7 +6331,9 @@ export async function resolveCommerceProductCandidateInPostgres(input: {
       resultingWorkflowState: candidate.workflow_state,
       reasonCode: productWasCreated
         ? 'catalog_product_created_and_mapped'
-        : 'catalog_product_mapped',
+        : preservedAutomaticMapping
+          ? 'catalog_product_existing_mapping_preserved'
+          : 'catalog_product_mapped',
       productId: product.id,
       productMappingId: mapping.id,
       receipt: started.receipt,
@@ -5698,6 +6352,9 @@ export async function resolveCommerceProductCandidateInPostgres(input: {
       rowVersion: Number(candidate.row_version),
       productGlobalId: product.globalId,
       productMappingGlobalId: mapping.global_id,
+      replacedProductMappingGlobalId: mapping.replacedMappingGlobalId,
+      automatic: Boolean(input.automatic),
+      automaticPolicyRevision: input.automatic?.policyRevision || null,
       providerWrites: 0,
       syncCursorAdvanced: false,
       replayed: false,
@@ -5722,15 +6379,226 @@ export async function resolveCommerceProductCandidateInPostgres(input: {
         externalVariantIdHash: commandHash(candidate.external_variant_id),
         sourceHash: candidate.source_hash,
         resolutionMode: input.resolution.mode,
+        automatic: Boolean(input.automatic),
+        automaticPolicyVersion: input.automatic?.policyVersion || null,
+        automaticPolicyRevision: input.automatic?.policyRevision || null,
         productCreated: productWasCreated,
+        existingMappingPreserved: Boolean(preservedAutomaticMapping),
         productGlobalId: product.globalId,
         productMappingGlobalId: mapping.global_id,
+        replacedProductMappingGlobalId: mapping.replacedMappingGlobalId,
         providerWrites: 0,
         syncCursorAdvanced: false,
       },
     }, client)
     return result
   })
+}
+
+function boundedAutomaticProductDisplayName(value: string) {
+  if (value.length <= 255) return value
+  const suffix = ` · ${commandHash(value).slice(0, 12)}`
+  return `${value.slice(0, 255 - suffix.length).trimEnd()}${suffix}`
+}
+
+export function automaticProductResolution(
+  candidate: ProductCandidateRow,
+) {
+  const title = candidate.product_title_snapshot.trim()
+  const variant = candidate.variant_title_snapshot?.trim() || null
+  const rawName = variant && variant !== title
+    ? `${title} · ${variant}`
+    : title
+  const rawSku = candidate.sku_snapshot?.trim() || null
+  const currency = candidate.currency_code?.trim().toUpperCase() || ''
+  const unitPriceMinor = safeMinor(candidate.price_minor)
+  if (
+    rawName.length < 1
+    || /[\p{C}]/u.test(rawName)
+  ) {
+    return { resolution: null, reason: 'product_name_invalid' } as const
+  }
+  if (rawSku && /[\p{C}]/u.test(rawSku)) {
+    return { resolution: null, reason: 'product_sku_invalid' } as const
+  }
+  if (!/^[A-Z]{3}$/.test(currency)) {
+    return { resolution: null, reason: 'product_currency_invalid' } as const
+  }
+  if (unitPriceMinor === null || unitPriceMinor < 0) {
+    return { resolution: null, reason: 'product_price_invalid' } as const
+  }
+  return {
+    resolution: {
+      mode: 'create' as const,
+      name: boundedAutomaticProductDisplayName(rawName),
+      sku: rawSku && rawSku.length <= 25 ? rawSku : null,
+      unitPriceMinor,
+      currency,
+    },
+    reason: null,
+  }
+}
+
+export async function autoCreateCommerceProductsForRunInPostgres(input: {
+  runtime: CommerceRuntimeCredentialRecord
+  actorEmail: string
+  runGlobalId: string
+}) {
+  const selection = await withTransaction(async (client) => {
+    const account = await resolveAccount(client, {
+      organizationId: input.runtime.organizationId,
+      accountGlobalId: input.runtime.globalId,
+    })
+    const policy = (
+      await client.query<ProductIntakePolicyRow>(
+        `SELECT policy_version, unmatched_action, revision, updated_at
+         FROM operations_commerce_product_intake_policies
+         WHERE organization_id = $1::uuid
+           AND integration_account_id = $2::uuid`,
+        [account.organization_id, account.id],
+      )
+    ).rows[0] || null
+    if (
+      !policy
+      || policy.policy_version !== PRODUCT_INTAKE_POLICY_VERSION
+      || policy.unmatched_action !== 'auto_create'
+    ) {
+      return {
+        policy: productIntakePolicyState(policy),
+        candidates: [] as ProductCandidateRow[],
+      }
+    }
+    const candidates = (
+      await client.query<ProductCandidateRow>(
+        `${PRODUCT_CANDIDATE_SELECT}
+         WHERE candidate.organization_id = $1::uuid
+           AND candidate.integration_account_id = $2::uuid
+           AND run.global_id = $3
+           AND run.credential_version = $4::integer
+           AND run.resource = 'products'
+           AND run.expires_at > now()
+           AND run.workflow_state <> 'expired'
+           AND candidate.expires_at > now()
+           AND candidate.workflow_state IN ('held', 'resolving')
+           AND candidate.mapping_state = 'unresolved'
+         ORDER BY candidate.created_at, candidate.id`,
+        [
+          account.organization_id,
+          account.id,
+          input.runGlobalId,
+          input.runtime.credentialVersion,
+        ],
+      )
+    ).rows
+    return {
+      policy: productIntakePolicyState(policy),
+      candidates,
+    }
+  })
+  const skippedByReason: Record<string, number> = {}
+  let attempted = 0
+  let created = 0
+  let mappedExisting = 0
+  let failed = 0
+  let stoppedBecauseDisabled = false
+  for (const candidate of selection.candidates) {
+    const automatic = automaticProductResolution(candidate)
+    if (!automatic.resolution) {
+      skippedByReason[automatic.reason] =
+        (skippedByReason[automatic.reason] || 0) + 1
+      continue
+    }
+    attempted += 1
+    try {
+      const result = await resolveCommerceProductCandidateInPostgres({
+        runtime: input.runtime,
+        actorEmail: input.actorEmail,
+        idempotencyKey: deterministicCommandUuid({
+          policyVersion: PRODUCT_INTAKE_POLICY_VERSION,
+          policyRevision: selection.policy.revision,
+          accountGlobalId: input.runtime.globalId,
+          runGlobalId: input.runGlobalId,
+          candidateGlobalId: candidate.global_id,
+          candidateRowVersion: Number(candidate.row_version),
+        }),
+        candidateGlobalId: candidate.global_id,
+        candidateRowVersion: Number(candidate.row_version),
+        automatic: {
+          policyVersion: PRODUCT_INTAKE_POLICY_VERSION,
+          policyRevision: selection.policy.revision,
+          runGlobalId: input.runGlobalId,
+        },
+        resolution: automatic.resolution,
+      }) as { action?: string }
+      if (result.action === 'create-and-map-product-candidate') {
+        created += 1
+      } else {
+        mappedExisting += 1
+      }
+    } catch (error) {
+      failed += 1
+      if (
+        error instanceof CommerceIntegrationRequestError
+        && error.code === 'COMMERCE_PRODUCT_AUTO_CREATE_DISABLED'
+      ) {
+        stoppedBecauseDisabled = true
+        break
+      }
+    }
+  }
+  const remainingUnresolved = await withTransaction(async (client) => {
+    const account = await resolveAccount(client, {
+      organizationId: input.runtime.organizationId,
+      accountGlobalId: input.runtime.globalId,
+    })
+    const result = await client.query<{ count: string }>(
+      `SELECT count(*)::text AS count
+       FROM operations_commerce_product_candidates candidate
+       JOIN operations_commerce_intake_runs run
+         ON run.organization_id = candidate.organization_id
+        AND run.integration_account_id = candidate.integration_account_id
+        AND run.pipeline_id = candidate.pipeline_id
+        AND run.id = candidate.run_id
+       WHERE candidate.organization_id = $1::uuid
+         AND candidate.integration_account_id = $2::uuid
+         AND run.global_id = $3
+         AND run.credential_version = $4::integer
+         AND run.resource = 'products'
+         AND run.expires_at > now()
+         AND run.workflow_state <> 'expired'
+         AND candidate.expires_at > now()
+         AND candidate.workflow_state IN ('held', 'resolving')
+         AND candidate.mapping_state = 'unresolved'`,
+      [
+        account.organization_id,
+        account.id,
+        input.runGlobalId,
+        input.runtime.credentialVersion,
+      ],
+    )
+    return Number(result.rows[0]?.count || 0)
+  })
+  return {
+    policy: selection.policy,
+    enabled: selection.policy.autoCreateNewProducts,
+    runGlobalId: input.runGlobalId,
+    candidatesFound: selection.candidates.length,
+    eligible: selection.candidates.length
+      - Object.values(skippedByReason).reduce((sum, count) => sum + count, 0),
+    attempted,
+    created,
+    mappedExisting,
+    skipped: Object.values(skippedByReason).reduce(
+      (sum, count) => sum + count,
+      0,
+    ),
+    skippedByReason,
+    failed,
+    stoppedBecauseDisabled,
+    remainingUnresolved,
+    providerWrites: 0,
+    syncCursorAdvanced: false,
+  }
 }
 
 export async function excludeCommerceIntakeRejectionInPostgres(input: {
@@ -6008,48 +6876,19 @@ export async function resolveCommerceCandidateProductInPostgres(input: {
       const mappingMethod = input.product.mode === 'create'
         ? 'product_created'
         : 'exact_variant'
-      const mappingResult = await client.query<{
-        id: string
-        global_id: string
-      }>(
-        `INSERT INTO operations_product_mappings (
-           organization_id, integration_account_id, pipeline_id, product_id,
-           channel_sku, external_product_id, external_variant_id,
-           external_inventory_item_id, mapping_method,
-           mapping_source_revision, active, created_by
-         ) VALUES (
-           $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7, $8,
-           $9, $10, true, $11
-         )
-         ON CONFLICT (
-           organization_id, integration_account_id, external_variant_id
-         ) WHERE external_variant_id IS NOT NULL
-         DO UPDATE SET
-           pipeline_id = EXCLUDED.pipeline_id,
-           product_id = EXCLUDED.product_id,
-           channel_sku = EXCLUDED.channel_sku,
-           external_product_id = EXCLUDED.external_product_id,
-           external_inventory_item_id = EXCLUDED.external_inventory_item_id,
-           mapping_method = EXCLUDED.mapping_method,
-           mapping_source_revision = EXCLUDED.mapping_source_revision,
-           active = true,
-           updated_at = now()
-         RETURNING id::text, global_id`,
-        [
-          candidate.organization_id,
-          candidate.integration_account_id,
-          candidate.pipeline_id,
-          product.id,
-          line.sku_snapshot || product.sku,
-          line.external_product_id,
-          mappingIdentity,
-          line.external_inventory_item_id,
-          mappingMethod,
-          line.source_revision,
-          input.actorEmail,
-        ],
-      )
-      mapping = mappingResult.rows[0]
+      mapping = await activateExactProductMapping(client, {
+        organizationId: candidate.organization_id,
+        integrationAccountId: candidate.integration_account_id,
+        pipelineId: candidate.pipeline_id,
+        productId: product.id,
+        channelSku: line.sku_snapshot || product.sku,
+        externalProductId: line.external_product_id,
+        externalVariantId: mappingIdentity,
+        externalInventoryItemId: line.external_inventory_item_id,
+        mappingMethod,
+        mappingSourceRevision: line.source_revision,
+        actorEmail: input.actorEmail,
+      })
     }
     const providerPriceSelected = (
       line.unit_price_minor !== null

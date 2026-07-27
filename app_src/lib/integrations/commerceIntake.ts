@@ -15,9 +15,11 @@ import {
   listFaireProducts,
 } from '@/lib/integrations/faireCommerceClient'
 import {
+  FAIRE_COMMERCE_NORMALIZER_VERSION,
   normalizeFaireCommerce,
 } from '@/lib/integrations/faireCommerceNormalizer'
 import {
+  SHOPIFY_COMMERCE_NORMALIZER_VERSION,
   normalizeShopifyCommerce,
 } from '@/lib/integrations/shopifyCommerceNormalizer'
 import {
@@ -37,6 +39,7 @@ import {
   type CommerceRuntimeCredentialRecord,
 } from '@/lib/persistence/commerceIntegrations'
 import {
+  autoCreateCommerceProductsForRunInPostgres,
   captureCommerceIntakeProviderReadInPostgres,
   confirmCommerceCandidateAddressInPostgres,
   excludeCommerceIntakeRejectionInPostgres,
@@ -56,6 +59,7 @@ import {
   resolveCommerceProductCandidateInPostgres,
   reserveCommerceIntakeProviderReadInPostgres,
   stageCommerceNormalizationEnvelopeInPostgres,
+  updateCommerceProductIntakePolicyInPostgres,
   validateCommerceCandidateInPostgres,
   type CommerceIntakeReadIntentAction,
   type CommerceIntakeReadIntentTarget,
@@ -371,6 +375,7 @@ type IntakeCommandAction =
   | 'resolve-delivery'
   | 'resolve-package'
   | 'resolve-product'
+  | 'set-product-intake-policy'
   | 'validate'
 
 export function commerceIntakeRuntimeAvailable() {
@@ -561,6 +566,7 @@ function action(value: unknown): IntakeCommandAction {
     'resolve-delivery',
     'resolve-package',
     'resolve-product',
+    'set-product-intake-policy',
     'validate',
   ]
   if (!allowed.includes(result)) {
@@ -1139,6 +1145,7 @@ async function shopifyEnvelope(
 async function shopifyProductEnvelope(
   runtime: CommerceRuntimeCredentialRecord,
   page: OperationalPageRequest,
+  hydrateInventory = true,
 ): Promise<OperationalPageResult> {
   const credential = decryptCommerceCredential(
     runtime.encrypted,
@@ -1181,7 +1188,8 @@ async function shopifyProductEnvelope(
     },
     {
       query: shopifyProductVariantsQuery(
-        grant.grantedScopes.includes('read_inventory'),
+        hydrateInventory
+        && grant.grantedScopes.includes('read_inventory'),
       ),
       operationName: 'ClawPilotCommerceProductVariants',
       variables: {
@@ -1345,6 +1353,7 @@ async function faireEnvelope(
 async function faireProductEnvelope(
   runtime: CommerceRuntimeCredentialRecord,
   page: OperationalPageRequest,
+  hydrateInventory = true,
 ): Promise<OperationalPageResult> {
   const credential = decryptCommerceCredential(
     runtime.encrypted,
@@ -1396,6 +1405,8 @@ async function faireProductEnvelope(
   }
   const baseNormalized = normalizeFaireCommerce(normalizedSource, context)
   const canReadInventory = (
+    hydrateInventory
+    &&
     credential.authMode === 'faire_oauth'
     && credential.scopes.includes('READ_INVENTORIES')
   )
@@ -1458,11 +1469,20 @@ async function fetchEnvelope(
   runtime: CommerceRuntimeCredentialRecord,
   page: OperationalPageRequest,
   targetExternalOrderId: string | null = null,
+  options: { hydrateProductInventory?: boolean } = {},
 ): Promise<OperationalPageResult> {
   return page.resource === 'products'
     ? runtime.provider === 'shopify'
-      ? shopifyProductEnvelope(runtime, page)
-      : faireProductEnvelope(runtime, page)
+      ? shopifyProductEnvelope(
+          runtime,
+          page,
+          options.hydrateProductInventory !== false,
+        )
+      : faireProductEnvelope(
+          runtime,
+          page,
+          options.hydrateProductInventory !== false,
+        )
     : runtime.provider === 'shopify'
       ? shopifyEnvelope(runtime, page, targetExternalOrderId)
       : faireEnvelope(runtime, page, targetExternalOrderId)
@@ -1473,21 +1493,134 @@ export async function getCommerceIntake(input: {
   accountGlobalId: unknown
 }) {
   assertCommerceIntakeRuntime()
-  const runtime = await runtimeFor(input)
+  const organizationId = normalizeCommerceOrganizationId(input.organizationId)
+  const accountGlobalId = normalizeCommerceAccountGlobalId(
+    input.accountGlobalId,
+  )
   return readCommerceIntakeStateFromPostgres({
-    organizationId: runtime.organizationId,
-    accountGlobalId: runtime.globalId,
+    organizationId,
+    accountGlobalId,
   })
 }
 
-export async function executeCommerceIntakeCommand(input: {
+async function withAutomaticProductCreation(
+  command: Record<string, unknown>,
+  input: {
+    runtime: CommerceRuntimeCredentialRecord
+    actorEmail: string
+    action: IntakeCommandAction
+  },
+) {
+  if (
+    input.action !== 'fetch-products'
+    && input.action !== 'fetch-next-products'
+  ) return command
+  const runGlobalId = typeof command.runGlobalId === 'string'
+    ? command.runGlobalId
+    : ''
+  if (!RUN_PATTERN.test(runGlobalId)) {
+    return {
+      ...command,
+      automaticProductCreation: {
+        attempted: 0,
+        failed: true,
+        errorCode: 'COMMERCE_PRODUCT_AUTO_CREATE_RUN_REQUIRED',
+        providerWrites: 0,
+        syncCursorAdvanced: false,
+      },
+    }
+  }
+  try {
+    return {
+      ...command,
+      automaticProductCreation:
+        await autoCreateCommerceProductsForRunInPostgres({
+          runtime: input.runtime,
+          actorEmail: input.actorEmail,
+          runGlobalId,
+        }),
+    }
+  } catch {
+    // Staging and its read evidence are already durable. A retry of the same
+    // fetch command re-enters this sweep through the stage-replay path.
+    return {
+      ...command,
+      automaticProductCreation: {
+        attempted: 0,
+        failed: true,
+        errorCode: 'COMMERCE_PRODUCT_AUTO_CREATE_SWEEP_FAILED',
+        providerWrites: 0,
+        syncCursorAdvanced: false,
+      },
+    }
+  }
+}
+
+type ExecuteCommerceIntakeInput = {
   organizationId: unknown
   actorEmail: string
   body: Record<string, unknown>
-}) {
+}
+
+type CommerceIntakeExecutionOptions = {
+  includeIntakeState: boolean
+  hydrateProductInventory: boolean
+}
+
+async function executeCommerceIntakeCommandInternal(
+  input: ExecuteCommerceIntakeInput,
+  options: CommerceIntakeExecutionOptions,
+) {
   assertCommerceIntakeRuntime()
   const commandAction = action(input.body.action)
   const key = idempotencyKey(input.body.idempotencyKey)
+  if (commandAction === 'set-product-intake-policy') {
+    const organizationId = normalizeCommerceOrganizationId(
+      input.organizationId,
+    )
+    const accountGlobalId = normalizeCommerceAccountGlobalId(
+      input.body.accountGlobalId,
+    )
+    const unmatchedAction = text(
+      input.body.unmatchedAction,
+      'Unmatched product action',
+      20,
+    )
+    if (!['review', 'auto_create'].includes(unmatchedAction)) {
+      throw new CommerceIntegrationRequestError(
+        'Unmatched product action must be review or auto-create',
+        400,
+        'COMMERCE_INTAKE_COMMAND_INVALID',
+      )
+    }
+    if (
+      unmatchedAction === 'auto_create'
+      && input.body.confirmAutoCreateProducts !== true
+    ) {
+      throw new CommerceIntegrationRequestError(
+        'Confirm automatic creation of new ClawPilot products',
+        400,
+        'COMMERCE_PRODUCT_AUTO_CREATE_CONFIRMATION_REQUIRED',
+      )
+    }
+    const command = await updateCommerceProductIntakePolicyInPostgres({
+      organizationId,
+      accountGlobalId,
+      actorEmail: input.actorEmail,
+      idempotencyKey: key,
+      expectedPolicyRevision: rowVersion(
+        input.body.expectedPolicyRevision,
+      ),
+      unmatchedAction: unmatchedAction as 'review' | 'auto_create',
+      confirmAutoCreateProducts:
+        input.body.confirmAutoCreateProducts === true,
+    })
+    const intake = await readCommerceIntakeStateFromPostgres({
+      organizationId,
+      accountGlobalId,
+    }).catch(() => null)
+    return { command, intake }
+  }
   const runtime = await runtimeFor({
     organizationId: input.organizationId,
     accountGlobalId: input.body.accountGlobalId,
@@ -1570,12 +1703,22 @@ export async function executeCommerceIntakeCommand(input: {
       target: replayTarget,
     })
     if (replay) {
+      const command = await withAutomaticProductCreation(
+        replay as Record<string, unknown>,
+        {
+          runtime,
+          actorEmail: input.actorEmail,
+          action: commandAction,
+        },
+      )
       return {
-        command: replay,
-        intake: await readCommerceIntakeStateFromPostgres({
-          organizationId: runtime.organizationId,
-          accountGlobalId: runtime.globalId,
-        }),
+        command,
+        intake: options.includeIntakeState
+          ? await readCommerceIntakeStateFromPostgres({
+              organizationId: runtime.organizationId,
+              accountGlobalId: runtime.globalId,
+            })
+          : null,
       }
     }
     const refreshTarget = refreshCandidateGlobalId
@@ -1705,8 +1848,9 @@ export async function executeCommerceIntakeCommand(input: {
       providerWrites: 0,
       syncCursorAdvanced: false,
     }
-    const adapterVersion =
-      `commerce-normalization-${runtime.provider}-v1`
+    const adapterVersion = runtime.provider === 'shopify'
+      ? SHOPIFY_COMMERCE_NORMALIZER_VERSION
+      : FAIRE_COMMERCE_NORMALIZER_VERSION
     const reservation = await reserveCommerceIntakeProviderReadInPostgres({
       ...shared,
       readIntentId,
@@ -1728,6 +1872,9 @@ export async function executeCommerceIntakeCommand(input: {
           runtime,
           page,
           targetExternalOrderId,
+          {
+            hydrateProductInventory: options.hydrateProductInventory,
+          },
         )
         const normalizedVariants = result.envelope.products.reduce(
           (count, product) => count + product.variants.length,
@@ -1789,12 +1936,22 @@ export async function executeCommerceIntakeCommand(input: {
       readIntentId,
       capturedResponseHash: captured.responseHash,
     })
+    const commandWithAutomaticCreation = await withAutomaticProductCreation(
+      command as Record<string, unknown>,
+      {
+        runtime,
+        actorEmail: input.actorEmail,
+        action: commandAction,
+      },
+    )
     return {
-      command,
-      intake: await readCommerceIntakeStateFromPostgres({
-        organizationId: runtime.organizationId,
-        accountGlobalId: runtime.globalId,
-      }),
+      command: commandWithAutomaticCreation,
+      intake: options.includeIntakeState
+        ? await readCommerceIntakeStateFromPostgres({
+            organizationId: runtime.organizationId,
+            accountGlobalId: runtime.globalId,
+          })
+        : null,
     }
   }
 
@@ -2076,4 +2233,43 @@ export async function executeCommerceIntakeCommand(input: {
       accountGlobalId: runtime.globalId,
     }),
   }
+}
+
+export async function executeCommerceIntakeCommand(
+  input: ExecuteCommerceIntakeInput,
+) {
+  return executeCommerceIntakeCommandInternal(input, {
+    includeIntakeState: true,
+    hydrateProductInventory: true,
+  })
+}
+
+export async function executeCommerceCatalogProductPage(input: {
+  organizationId: string
+  accountGlobalId: string
+  actorEmail: string
+  idempotencyKey: string
+  continuationRunGlobalId: string | null
+}) {
+  return executeCommerceIntakeCommandInternal({
+    organizationId: input.organizationId,
+    actorEmail: input.actorEmail,
+    body: {
+      action: input.continuationRunGlobalId
+        ? 'fetch-next-products'
+        : 'fetch-products',
+      accountGlobalId: input.accountGlobalId,
+      idempotencyKey: input.idempotencyKey,
+      confirmReadOnly: true,
+      ...(input.continuationRunGlobalId
+        ? { continuationRunGlobalId: input.continuationRunGlobalId }
+        : {}),
+    },
+  }, {
+    // Background catalog work must remain O(page), not O(retained catalog).
+    // The browser command path still returns the complete intake state.
+    includeIntakeState: false,
+    // Product reconciliation deliberately does not query or stage inventory.
+    hydrateProductInventory: false,
+  })
 }
