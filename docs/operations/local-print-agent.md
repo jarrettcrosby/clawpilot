@@ -15,10 +15,10 @@ app_visible: true
 
 The local print agent transports an existing immutable print artifact to an approved warehouse printer. It cannot rate a shipment, purchase or void a carrier label, change a package, or create a reprint.
 
-The durable path supports:
+The durable model supports:
 
-- thermal carrier labels in ZPL, PDF, or PNG on 4 x 6 or 4 x 8 label media;
-- nonthermal packing slips in PDF or PNG on US Letter or A4 media;
+- thermal carrier labels in ZPL, PDF, or PNG on 4 x 6 or 4 x 8 label media only when the enrolled agent explicitly declares that exact format/media/document combination;
+- nonthermal packing slips in PDF or PNG on US Letter or A4 media only when the enrolled agent explicitly declares that exact format/media/document combination;
 - warehouse-scoped agent credentials stored only as SHA-256 verifiers;
 - leased claims with a fenced claim token;
 - append-only acknowledgement and failure attempts;
@@ -32,14 +32,14 @@ The durable path supports:
 
 Open **Operations > Printing**.
 
-1. In **Agents**, enroll one agent for the warehouse.
+1. In **Agents**, enroll one agent for the warehouse and declare only the formats, media, and document types its installed runtime can actually deliver.
 2. Retain the one-time credential in the local agent configuration. ClawPilot stores only its verifier.
-3. In **Printers**, configure the device capabilities and bind it to the enrolled agent.
+3. In **Printers**, configure the device capabilities and bind it to an enrolled agent whose declared capabilities contain the entire printer profile.
 4. Keep an unbound local-agent printer offline.
 5. For thermal devices, select only 4 x 6 or 4 x 8 label media.
 6. For nonthermal devices, select PDF or PNG and Letter or A4 media.
 7. Optionally select one same-warehouse fallback that supports every configured document, format, and medium on the primary.
-8. Mark the profile online only after the real device path is ready.
+8. Mark the profile online only after the real device path is ready. ClawPilot rejects an assignment whose printer capabilities exceed the agent, and the worker repeats its runtime capabilities on every claim so a credential/runtime mismatch fails closed before payload delivery.
 
 Rotating an agent credential invalidates the prior credential immediately. Revoking an agent is terminal, unbinds its printer profiles, and sets those local-agent printers offline.
 
@@ -63,7 +63,9 @@ New enrollment and rotation credentials use the versioned shape:
 
 ## Mac Runtime
 
-The repository includes a raw-ZPL Mac runtime for a networked Zebra printer:
+The repository includes a raw-ZPL Mac runtime for a networked Zebra printer.
+Its fixed capability profile is **ZPL + 4 x 6 + shipping label**; it does not
+advertise or accept PDF, PNG, 4 x 8, Letter, A4, or packing slips:
 
 ```bash
 CLAWPILOT_PRINT_AGENT_URL=https://dev.aiapp.eigenracing.com \
@@ -72,7 +74,8 @@ CLAWPILOT_PRINTER_HOST='printer-hostname-or-static-ip' \
 npm run print-agent:run
 ```
 
-The runtime accepts only immutable inline UTF-8 ZPL artifacts. It verifies the
+The runtime declares that fixed capability profile on every claim and accepts
+only immutable inline UTF-8 ZPL artifacts. It verifies the
 artifact SHA-256 and byte length, writes a claim ledger under
 `~/.clawpilot/`, and connects to the printer's raw port `9100`. The credential
 may instead be read from macOS Keychain with
@@ -118,6 +121,12 @@ If the runtime restarts after bytes may have reached the printer but before an
 acknowledgement is recorded, it reports `PRINT_OUTCOME_UNCERTAIN` and fences
 automatic resend. An operator must inspect the device and use the controlled
 retry or reprint workflow.
+
+PDF and PNG are not converted to ZPL. To deliver either format, enroll a
+separate agent/runtime that natively supports that exact format and media, then
+bind the printer profile to it. Until such an agent exists, the format remains
+visible as unsupported instead of entering a queue that the Zebra runtime
+cannot complete.
 
 The route does not use a browser session. Every claim, acknowledgement, and failure requires a caller-stable `Idempotency-Key` header containing 8 to 200 letters, numbers, periods, underscores, colons, or hyphens.
 

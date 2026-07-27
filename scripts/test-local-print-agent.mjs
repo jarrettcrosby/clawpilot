@@ -76,6 +76,7 @@ const api = createHttpServer(async (request, response) => {
     action: body.action,
     authorization: request.headers.authorization,
     key: request.headers['idempotency-key'],
+    capabilities: body.capabilities,
   })
   response.writeHead(200, { 'content-type': 'application/json' })
   if (body.action === 'claim') {
@@ -98,6 +99,12 @@ try {
   assert.match(result.stdout, /"event":"job_acknowledged"/)
   assert.equal(printed, zpl)
   assert.deepEqual(actions.map((item) => item.action), ['claim', 'acknowledge'])
+  assert.deepEqual(actions[0].capabilities, {
+    formats: ['ZPL'],
+    media: ['label_4x6'],
+    documentTypes: ['shipping_label'],
+  })
+  assert.equal(actions[1].capabilities, undefined)
   assert.ok(actions.every((item) => item.authorization?.startsWith('Bearer cpprint.v1.')))
   assert.ok(actions.every((item) => String(item.key || '').length >= 8))
   const saved = JSON.parse(await readFile(ledger, 'utf8'))

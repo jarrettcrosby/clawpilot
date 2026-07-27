@@ -2,9 +2,14 @@ import crypto from 'crypto'
 import type { PoolClient } from 'pg'
 import { recordAuditEvent } from '@/lib/auditWriter'
 import {
+  DEFAULT_PRINT_AGENT_CAPABILITIES,
+  PRINT_DOCUMENT_TYPES,
+  PRINT_FORMATS,
+  PRINT_MEDIA,
   selectPrinterRoute,
   supportsPrinterRoute,
   type DurablePrintDocumentType,
+  type PrintAgentCapabilities,
   type OperationsPrintAgentContext,
   type OperationsPrintAgentCredential,
   type OperationsPrintAgentProfile,
@@ -40,6 +45,9 @@ type PrintAgentRow = {
   name: string
   status: OperationsPrintAgentProfile['status']
   credential_version: number
+  supported_formats: OperationsPrintAgentProfile['supportedFormats']
+  supported_media: OperationsPrintAgentProfile['supportedMedia']
+  supported_document_types: OperationsPrintAgentProfile['supportedDocumentTypes']
   assigned_printers: Array<{ globalId: string; name: string }> | null
   enrolled_by: string | null
   enrolled_at: TimestampValue
@@ -286,6 +294,64 @@ function requiredReason(value: string, label: string) {
   return reason
 }
 
+function requiredCapabilityValues<T extends string>(
+  values: unknown,
+  label: string,
+  supported: readonly T[],
+) {
+  if (
+    !Array.isArray(values)
+    || values.length === 0
+    || values.length > supported.length
+    || values.some((value) => typeof value !== 'string' || !supported.includes(value as T))
+    || new Set(values).size !== values.length
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PRINT_AGENT_CAPABILITIES_INVALID',
+      `${label} are invalid`,
+    )
+  }
+  return values as T[]
+}
+
+function requiredPrintAgentCapabilities(
+  input?: Partial<PrintAgentCapabilities>,
+): PrintAgentCapabilities {
+  const capabilities = input || DEFAULT_PRINT_AGENT_CAPABILITIES
+  return {
+    supportedFormats: requiredCapabilityValues(
+      capabilities.supportedFormats,
+      'Print-agent formats',
+      PRINT_FORMATS,
+    ),
+    supportedMedia: requiredCapabilityValues(
+      capabilities.supportedMedia,
+      'Print-agent media',
+      PRINT_MEDIA,
+    ),
+    supportedDocumentTypes: requiredCapabilityValues(
+      capabilities.supportedDocumentTypes,
+      'Print-agent document types',
+      PRINT_DOCUMENT_TYPES,
+    ),
+  }
+}
+
+function printAgentCapabilitiesAreSubset(
+  candidate: PrintAgentCapabilities,
+  enrolled: PrintAgentCapabilities,
+) {
+  return candidate.supportedFormats.every((value) => (
+    enrolled.supportedFormats.includes(value)
+  ))
+    && candidate.supportedMedia.every((value) => (
+      enrolled.supportedMedia.includes(value)
+    ))
+    && candidate.supportedDocumentTypes.every((value) => (
+      enrolled.supportedDocumentTypes.includes(value)
+    ))
+}
+
 function stableJson(value: unknown): string {
   if (value === null || typeof value !== 'object') {
     return JSON.stringify(value) ?? 'null'
@@ -528,6 +594,9 @@ function agentProfile(row: PrintAgentRow): OperationsPrintAgentProfile {
     name: row.name,
     status: row.status,
     credentialVersion: row.credential_version,
+    supportedFormats: row.supported_formats,
+    supportedMedia: row.supported_media,
+    supportedDocumentTypes: row.supported_document_types,
     assignedPrinters: Array.isArray(row.assigned_printers) ? row.assigned_printers : [],
     enrolledBy: row.enrolled_by,
     enrolledAt: iso(row.enrolled_at) as string,
@@ -616,6 +685,9 @@ const PRINT_AGENT_SELECT = `
     agent.name,
     agent.status,
     agent.credential_version,
+    agent.supported_formats,
+    agent.supported_media,
+    agent.supported_document_types,
     COALESCE(
       jsonb_agg(
         jsonb_build_object('globalId', printer.global_id, 'name', printer.name)
@@ -970,6 +1042,9 @@ export async function enrollOperationsPrintAgentInPostgres(input: {
   name: string
   actorEmail: string
   idempotencyKey: string
+  supportedFormats?: OperationsPrintAgentProfile['supportedFormats']
+  supportedMedia?: OperationsPrintAgentProfile['supportedMedia']
+  supportedDocumentTypes?: OperationsPrintAgentProfile['supportedDocumentTypes']
 }): Promise<OperationsPrintAgentCredential> {
   const organizationId = requiredOrganizationId(input.organizationId)
   const actorEmail = requiredActor(input.actorEmail)
@@ -987,7 +1062,21 @@ export async function enrollOperationsPrintAgentInPostgres(input: {
       'Print agent warehouse is invalid',
     )
   }
+  const capabilities = requiredPrintAgentCapabilities({
+    supportedFormats: input.supportedFormats
+      || DEFAULT_PRINT_AGENT_CAPABILITIES.supportedFormats,
+    supportedMedia: input.supportedMedia
+      || DEFAULT_PRINT_AGENT_CAPABILITIES.supportedMedia,
+    supportedDocumentTypes: input.supportedDocumentTypes
+      || DEFAULT_PRINT_AGENT_CAPABILITIES.supportedDocumentTypes,
+  })
   const requestFingerprint = fingerprint({
+    action: 'enroll-print-agent',
+    warehouseId: input.warehouseId,
+    name,
+    ...capabilities,
+  })
+  const legacyRequestFingerprint = fingerprint({
     action: 'enroll-print-agent',
     warehouseId: input.warehouseId,
     name,
@@ -1010,7 +1099,21 @@ export async function enrollOperationsPrintAgentInPostgres(input: {
       [organizationId, idempotencyKey],
     )
     if (replay.rows[0]) {
-      if (replay.rows[0].request_fingerprint !== requestFingerprint) {
+      const isLegacyDefaultReplay = (
+        printAgentCapabilitiesAreSubset(
+          capabilities,
+          DEFAULT_PRINT_AGENT_CAPABILITIES,
+        )
+        && printAgentCapabilitiesAreSubset(
+          DEFAULT_PRINT_AGENT_CAPABILITIES,
+          capabilities,
+        )
+        && replay.rows[0].request_fingerprint === legacyRequestFingerprint
+      )
+      if (
+        replay.rows[0].request_fingerprint !== requestFingerprint
+        && !isLegacyDefaultReplay
+      ) {
         throw new OperationsRequestError(
           'OPERATIONS_PRINT_IDEMPOTENCY_REUSED',
           'Idempotency-Key was already used for a different print-agent request',
@@ -1042,8 +1145,12 @@ export async function enrollOperationsPrintAgentInPostgres(input: {
     const inserted = await client.query<{ global_id: string }>(
       `INSERT INTO operations_print_agents (
          id, organization_id, warehouse_id, name, secret_hash,
-         request_fingerprint, idempotency_key, enrolled_by
-       ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7, $8)
+         request_fingerprint, idempotency_key, enrolled_by,
+         supported_formats, supported_media, supported_document_types
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7, $8,
+         $9::text[], $10::text[], $11::text[]
+       )
        RETURNING global_id`,
       [
         generated.agentId,
@@ -1054,6 +1161,9 @@ export async function enrollOperationsPrintAgentInPostgres(input: {
         requestFingerprint,
         idempotencyKey,
         actorEmail,
+        capabilities.supportedFormats,
+        capabilities.supportedMedia,
+        capabilities.supportedDocumentTypes,
       ],
     )
     const globalId = inserted.rows[0].global_id
@@ -1070,6 +1180,9 @@ export async function enrollOperationsPrintAgentInPostgres(input: {
         printAgentGlobalId: globalId,
         warehouseGlobalId: agent.warehouseGlobalId,
         credentialVersion: agent.credentialVersion,
+        supportedFormats: agent.supportedFormats,
+        supportedMedia: agent.supportedMedia,
+        supportedDocumentTypes: agent.supportedDocumentTypes,
       },
     }, client)
     return { agent, credential: generated.credential }
@@ -1283,9 +1396,13 @@ export async function authenticateOperationsPrintAgentInPostgres(
     secret_hash: string
     status: string
     credential_version: number
+    supported_formats: OperationsPrintAgentContext['supportedFormats']
+    supported_media: OperationsPrintAgentContext['supportedMedia']
+    supported_document_types: OperationsPrintAgentContext['supportedDocumentTypes']
   }>(
     `SELECT id::text, global_id, organization_id::text, warehouse_id::text,
-       name, secret_hash, status, credential_version
+       name, secret_hash, status, credential_version,
+       supported_formats, supported_media, supported_document_types
      FROM operations_print_agents
      WHERE id = $1::uuid
      LIMIT 1`,
@@ -1310,6 +1427,9 @@ export async function authenticateOperationsPrintAgentInPostgres(
     warehouseId: agent.warehouse_id,
     name: agent.name,
     credentialVersion: agent.credential_version,
+    supportedFormats: agent.supported_formats,
+    supportedMedia: agent.supported_media,
+    supportedDocumentTypes: agent.supported_document_types,
   }
 }
 
@@ -2731,6 +2851,7 @@ export async function claimOperationsPrintJobsInPostgres(input: {
   idempotencyKey: string
   limit?: number
   leaseSeconds?: number
+  runtimeCapabilities: PrintAgentCapabilities
 }): Promise<OperationsPrintClaimJob[]> {
   const limit = Math.max(1, Math.min(Number(input.limit) || 1, 10))
   const leaseSeconds = Math.max(
@@ -2738,11 +2859,13 @@ export async function claimOperationsPrintJobsInPostgres(input: {
     Math.min(Number(input.leaseSeconds) || DEFAULT_LEASE_SECONDS, 300),
   )
   const callerKey = requiredIdempotencyKey(input.idempotencyKey)
+  const runtimeCapabilities = requiredPrintAgentCapabilities(input.runtimeCapabilities)
   const requestFingerprint = fingerprint({
     action: 'claim-print-jobs',
     printAgentGlobalId: input.agent.globalId,
     limit,
     leaseSeconds,
+    ...runtimeCapabilities,
   })
   const claimKeys = Array.from(
     { length: limit },
@@ -2755,6 +2878,37 @@ export async function claimOperationsPrintJobsInPostgres(input: {
       client,
       `operations:print-claim:${input.agent.organizationId}:${input.agent.id}:${callerKey}`,
     )
+    const enrolledCapabilitiesResult = await client.query<{
+      supported_formats: OperationsPrintAgentContext['supportedFormats']
+      supported_media: OperationsPrintAgentContext['supportedMedia']
+      supported_document_types: OperationsPrintAgentContext['supportedDocumentTypes']
+    }>(
+      `SELECT supported_formats, supported_media, supported_document_types
+       FROM operations_print_agents
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid
+         AND status = 'active'
+       FOR SHARE`,
+      [input.agent.organizationId, input.agent.id],
+    )
+    const enrolledCapabilitiesRow = enrolledCapabilitiesResult.rows[0]
+    const enrolledCapabilities = enrolledCapabilitiesRow
+      ? {
+        supportedFormats: enrolledCapabilitiesRow.supported_formats,
+        supportedMedia: enrolledCapabilitiesRow.supported_media,
+        supportedDocumentTypes: enrolledCapabilitiesRow.supported_document_types,
+      }
+      : null
+    if (
+      !enrolledCapabilities
+      || !printAgentCapabilitiesAreSubset(runtimeCapabilities, enrolledCapabilities)
+    ) {
+      throw new OperationsRequestError(
+        'OPERATIONS_PRINT_AGENT_CAPABILITIES_MISMATCH',
+        'Runtime capabilities must be a non-empty subset of the enrolled print-agent capabilities',
+        409,
+      )
+    }
     const replay = await client.query<{
       id: string
       idempotency_key: string
@@ -2871,6 +3025,9 @@ export async function claimOperationsPrintJobsInPostgres(input: {
          AND job.status = 'queued'
          AND job.available_at <= clock_timestamp()
          AND job.attempts <= job.max_attempts
+         AND artifact.format = ANY($5::text[])
+         AND artifact.media_size = ANY($6::text[])
+         AND artifact.document_type = ANY($7::text[])
          AND (
            artifact.source_label_id IS NULL
            OR label.id IS NOT NULL
@@ -2887,6 +3044,9 @@ export async function claimOperationsPrintJobsInPostgres(input: {
         input.agent.warehouseId,
         input.agent.id,
         limit,
+        runtimeCapabilities.supportedFormats,
+        runtimeCapabilities.supportedMedia,
+        runtimeCapabilities.supportedDocumentTypes,
       ],
     )
     const claimAttemptIds: string[] = []
@@ -2934,6 +3094,9 @@ export async function claimOperationsPrintJobsInPostgres(input: {
           sourceOrderGlobalId: job.source_order_global_id,
           sourceShipmentGlobalId: job.source_shipment_global_id,
           trackingNumber: job.tracking_number,
+          runtimeSupportedFormats: runtimeCapabilities.supportedFormats,
+          runtimeSupportedMedia: runtimeCapabilities.supportedMedia,
+          runtimeSupportedDocumentTypes: runtimeCapabilities.supportedDocumentTypes,
         },
       }, client)
     }

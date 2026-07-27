@@ -169,6 +169,25 @@ function verifySourceContracts() {
     !/\b(?:plaintext_secret|secret_plaintext|enrollment_secret)\b/i.test(migrationSource),
     'Migration must not persist a plaintext enrollment secret',
   )
+  const capabilityMigration = compactSql(
+    read('db/migrations/0117_operations_print_agent_capabilities.sql'),
+  )
+  for (const fragment of [
+    "supported_formats text[] NOT NULL DEFAULT ARRAY['ZPL']::text[]",
+    "supported_media text[] NOT NULL DEFAULT ARRAY['label_4x6']::text[]",
+    "supported_document_types text[] NOT NULL DEFAULT ARRAY['shipping_label']::text[]",
+    'enforce_operations_print_agent_capabilities',
+    'Printer capabilities must be a subset of its local print agent capabilities',
+    "supported_formats = ARRAY['ZPL']::text[]",
+    "supported_media = ARRAY['label_4x6']::text[]",
+    "supported_document_types = ARRAY['shipping_label']::text[]",
+    "printer_type = 'thermal'",
+  ]) {
+    assert.ok(
+      capabilityMigration.includes(fragment),
+      `Missing print-agent capability SQL contract: ${fragment}`,
+    )
+  }
 
   const persistence = read('app_src/lib/persistence/operationPrintDelivery.ts')
   for (const fragment of [
@@ -209,6 +228,9 @@ function verifySourceContracts() {
     'artifact.source_rate_test_label_id IS NULL',
     'original.rate_test_label_id',
     'OPERATIONS_PRINT_ARTIFACT_CORRUPT',
+    'OPERATIONS_PRINT_AGENT_CAPABILITIES_MISMATCH',
+    'artifact.format = ANY($5::text[])',
+    'runtimeSupportedFormats',
   ]) {
     assert.ok(
       persistence.includes(fragment),
@@ -228,6 +250,7 @@ function verifySourceContracts() {
     'authenticateOperationsPrintAgentInPostgres',
     'Idempotency-Key',
     'Cache-Control',
+    'runtimeCapabilities',
   ]) {
     assert.ok(agentRoute.includes(fragment), `Missing print-agent route contract: ${fragment}`)
   }
@@ -261,6 +284,10 @@ function verifySourceContracts() {
     "command.action === 'rotate-credential'",
     "command.action === 'revoke-agent'",
     'requireRequestUser',
+    'supportedFormats',
+    'supportedMedia',
+    'supportedDocumentTypes',
+    'DEFAULT_PRINT_AGENT_CAPABILITIES',
   ]) {
     assert.ok(managementRoute.includes(fragment), `Missing print-agent management contract: ${fragment}`)
   }
@@ -643,8 +670,14 @@ async function seedFixture(pool) {
     pool,
     `INSERT INTO operations_print_agents (
        organization_id, warehouse_id, name, secret_hash,
-       request_fingerprint, idempotency_key, enrolled_by
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+       request_fingerprint, idempotency_key, enrolled_by,
+       supported_formats, supported_media, supported_document_types
+     ) VALUES (
+       $1, $2, $3, $4, $5, $6, $7,
+       ARRAY['ZPL', 'PDF', 'PNG']::text[],
+       ARRAY['label_4x6', 'label_4x8', 'letter', 'a4']::text[],
+       ARRAY['shipping_label', 'packing_slip']::text[]
+     )
      RETURNING id, global_id`,
     [
       organization.id,
@@ -784,6 +817,27 @@ async function verifyPostgresAcceptance(connectionString) {
     assert.equal(credentialRecord.rows[0].secret_hash, fixture.secretHash)
     assert.notEqual(credentialRecord.rows[0].secret_hash, fixture.plainSecret)
     assert.equal(credentialRecord.rows[0].credential_version, 1)
+    const defaultCapabilityAgent = await pool.query(
+      `INSERT INTO operations_print_agents (
+         organization_id, warehouse_id, name, secret_hash,
+         request_fingerprint, idempotency_key, enrolled_by
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING supported_formats, supported_media, supported_document_types`,
+      [
+        fixture.organizationId,
+        fixture.warehouseId,
+        'Bundled Zebra default agent',
+        '3'.repeat(64),
+        '4'.repeat(64),
+        `default-capabilities-${fixture.suffix}`,
+        fixture.actorEmail,
+      ],
+    )
+    assert.deepEqual(defaultCapabilityAgent.rows[0], {
+      supported_formats: ['ZPL'],
+      supported_media: ['label_4x6'],
+      supported_document_types: ['shipping_label'],
+    })
     await expectRejected(
       () => pool.query(
         `UPDATE operations_print_agents

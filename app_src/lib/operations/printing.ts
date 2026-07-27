@@ -40,6 +40,18 @@ export type PrintPayloadEncoding = typeof PRINT_PAYLOAD_ENCODINGS[number]
 export type PrintAgentStatus = typeof PRINT_AGENT_STATUSES[number]
 export type PrintJobStatus = typeof PRINT_JOB_STATUSES[number]
 
+export type PrintAgentCapabilities = {
+  supportedFormats: PrintFormat[]
+  supportedMedia: PrintMedia[]
+  supportedDocumentTypes: PrintDocumentType[]
+}
+
+export const DEFAULT_PRINT_AGENT_CAPABILITIES: PrintAgentCapabilities = {
+  supportedFormats: ['ZPL'],
+  supportedMedia: ['label_4x6'],
+  supportedDocumentTypes: ['shipping_label'],
+}
+
 export type OperationsPrinterProfile = {
   id: string
   globalId: string
@@ -108,6 +120,9 @@ export type OperationsPrintAgentProfile = {
   name: string
   status: PrintAgentStatus
   credentialVersion: number
+  supportedFormats: PrintFormat[]
+  supportedMedia: PrintMedia[]
+  supportedDocumentTypes: PrintDocumentType[]
   assignedPrinters: Array<{ globalId: string; name: string }>
   enrolledBy: string | null
   enrolledAt: string
@@ -229,6 +244,9 @@ export type OperationsPrintAgentContext = {
   warehouseId: string
   name: string
   credentialVersion: number
+  supportedFormats: PrintFormat[]
+  supportedMedia: PrintMedia[]
+  supportedDocumentTypes: PrintDocumentType[]
 }
 
 export type OperationsPrintClaimJob = {
@@ -286,6 +304,15 @@ export function isDocumentMediaCompatible(input: {
     return DOCUMENT_MEDIA.has(input.media) && input.format !== 'ZPL'
   }
   return true
+}
+
+export function supportsPrintAgentRoute(
+  capabilities: PrintAgentCapabilities,
+  request: Pick<PrinterRouteRequest, 'documentType' | 'format' | 'media'>,
+) {
+  return capabilities.supportedFormats.includes(request.format)
+    && capabilities.supportedMedia.includes(request.media)
+    && capabilities.supportedDocumentTypes.includes(request.documentType)
 }
 
 export function isPrinterCapabilitySetValid(input: {

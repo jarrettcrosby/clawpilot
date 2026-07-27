@@ -13,6 +13,11 @@ const help = args.has('--help') || args.has('-h')
 const pollIntervalMs = positiveInteger(process.env.CLAWPILOT_PRINT_AGENT_POLL_MS, 2_000)
 const printerPort = positiveInteger(process.env.CLAWPILOT_PRINTER_PORT, 9_100)
 const printerHost = String(process.env.CLAWPILOT_PRINTER_HOST || '').trim()
+const workerCapabilities = Object.freeze({
+  formats: ['ZPL'],
+  media: ['label_4x6'],
+  documentTypes: ['shipping_label'],
+})
 const ledgerPath = expandHome(
   process.env.CLAWPILOT_PRINT_AGENT_LEDGER
     || '~/.clawpilot/print-agent-ledger.json',
@@ -36,6 +41,9 @@ Optional environment:
 Options:
   --once    Claim at most one job and exit
   --probe   Test the raw printer connection without claiming work
+
+Runtime capability:
+  Raw UTF-8 ZPL shipping labels on 4 x 6 label media only
 `)
   process.exit(0)
 }
@@ -326,6 +334,7 @@ async function cycle(config, ledger) {
   const response = await agentRequest(config, 'claim', {
     limit: 1,
     leaseSeconds: 120,
+    capabilities: workerCapabilities,
   }, `claim:${os.hostname()}:${randomUUID()}`)
   const jobs = Array.isArray(response.jobs) ? response.jobs : []
   if (jobs[0]) await handleJob(config, ledger, jobs[0])

@@ -5,6 +5,13 @@ import {
 } from '@/lib/operations/authorization'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import {
+  DEFAULT_PRINT_AGENT_CAPABILITIES,
+  PRINT_DOCUMENT_TYPES,
+  PRINT_FORMATS,
+  PRINT_MEDIA,
+  type PrintAgentCapabilities,
+} from '@/lib/operations/printing'
+import {
   enrollOperationsPrintAgentInPostgres,
   readOperationsPrintAgentWorkspaceFromPostgres,
   revokeOperationsPrintAgentInPostgres,
@@ -21,7 +28,14 @@ const MAX_REQUEST_BYTES = 8 * 1024
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const AGENT_GLOBAL_ID = /^gpt\d{7}$/
 const ACTION_FIELDS: Record<string, Set<string>> = {
-  'enroll-agent': new Set(['action', 'warehouseId', 'name']),
+  'enroll-agent': new Set([
+    'action',
+    'warehouseId',
+    'name',
+    'supportedFormats',
+    'supportedMedia',
+    'supportedDocumentTypes',
+  ]),
   'rotate-credential': new Set(['action', 'printAgentGlobalId']),
   'revoke-agent': new Set(['action', 'printAgentGlobalId']),
 }
@@ -56,6 +70,69 @@ function text(value: unknown, label: string, max: number) {
     fail('OPERATIONS_PRINT_AGENT_REQUEST_INVALID', `${label} is invalid`)
   }
   return parsed
+}
+
+function capabilityList<T extends string>(
+  value: unknown,
+  label: string,
+  supported: readonly T[],
+) {
+  if (
+    !Array.isArray(value)
+    || value.length === 0
+    || value.length > supported.length
+  ) {
+    fail('OPERATIONS_PRINT_AGENT_CAPABILITIES_INVALID', `${label} are invalid`)
+  }
+  const parsed = value.map((entry) => String(entry || '').trim() as T)
+  if (
+    parsed.some((entry) => !supported.includes(entry))
+    || new Set(parsed).size !== parsed.length
+  ) {
+    fail('OPERATIONS_PRINT_AGENT_CAPABILITIES_INVALID', `${label} are invalid`)
+  }
+  return parsed
+}
+
+function enrollmentCapabilities(value: Record<string, unknown>): PrintAgentCapabilities {
+  const fields = [
+    value.supportedFormats,
+    value.supportedMedia,
+    value.supportedDocumentTypes,
+  ]
+  const provided = fields.filter((entry) => entry !== undefined).length
+  if (provided === 0) {
+    return {
+      supportedFormats: [...DEFAULT_PRINT_AGENT_CAPABILITIES.supportedFormats],
+      supportedMedia: [...DEFAULT_PRINT_AGENT_CAPABILITIES.supportedMedia],
+      supportedDocumentTypes: [
+        ...DEFAULT_PRINT_AGENT_CAPABILITIES.supportedDocumentTypes,
+      ],
+    }
+  }
+  if (provided !== fields.length) {
+    fail(
+      'OPERATIONS_PRINT_AGENT_CAPABILITIES_INVALID',
+      'Print-agent formats, media, and document types must be provided together',
+    )
+  }
+  return {
+    supportedFormats: capabilityList(
+      value.supportedFormats,
+      'Print-agent formats',
+      PRINT_FORMATS,
+    ),
+    supportedMedia: capabilityList(
+      value.supportedMedia,
+      'Print-agent media',
+      PRINT_MEDIA,
+    ),
+    supportedDocumentTypes: capabilityList(
+      value.supportedDocumentTypes,
+      'Print-agent document types',
+      PRINT_DOCUMENT_TYPES,
+    ),
+  }
 }
 
 function idempotencyKey(req: NextRequest) {
@@ -169,12 +246,14 @@ export async function POST(req: NextRequest) {
       if (!UUID.test(warehouseId)) {
         fail('OPERATIONS_PRINT_AGENT_REQUEST_INVALID', 'Warehouse is invalid')
       }
+      const capabilities = enrollmentCapabilities(command.value)
       const result = await enrollOperationsPrintAgentInPostgres({
         organizationId,
         warehouseId,
         name: text(command.value.name, 'Print agent name', 120),
         actorEmail: actor.email,
         idempotencyKey: idempotencyKey(req),
+        ...capabilities,
       })
       return json({ ok: true, ...result })
     }

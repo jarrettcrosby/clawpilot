@@ -526,6 +526,83 @@ async function verifyLegacyPrinterNormalization(connectionString) {
   }
 }
 
+async function verifyAgentCapabilityBackfill(connectionString) {
+  const pool = new Pool({ connectionString, connectionTimeoutMillis: 5_000 })
+  try {
+    const fixture = await seedBase(pool)
+    const agent = await insertReturning(
+      pool,
+      `INSERT INTO operations_print_agents (
+         organization_id, warehouse_id, name, secret_hash,
+         request_fingerprint, idempotency_key, enrolled_by
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING id`,
+      [
+        fixture.organizationId,
+        fixture.warehouseId,
+        'Pre-capability bundled Zebra agent',
+        '5'.repeat(64),
+        '6'.repeat(64),
+        `legacy-agent-${fixture.suffix}`,
+        fixture.actorEmail,
+      ],
+    )
+    await pool.query(
+      `DROP TRIGGER IF EXISTS enforce_operations_printer_agent_capabilities_write
+         ON operations_printers`,
+    )
+    const printer = await createPrinter(pool, fixture, {
+      code: `LEGACY-ZEBRA-${fixture.suffix}`,
+      name: 'Legacy broad Zebra profile',
+      priority: 10,
+      printerType: 'thermal',
+      formats: ['ZPL', 'PDF'],
+      media: ['label_4x6', 'label_4x8'],
+      documents: ['shipping_label', 'return_label'],
+      agentId: agent.id,
+      isDefault: true,
+    })
+    await pool.query(
+      read('db/migrations/0117_operations_print_agent_capabilities.sql'),
+    )
+    const backfilled = await pool.query(
+      `SELECT
+         supports_zpl,
+         supported_formats,
+         supported_media,
+         supported_document_types,
+         default_document_types,
+         status,
+         local_print_agent_id::text
+       FROM operations_printers
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid`,
+      [fixture.organizationId, printer.id],
+    )
+    assert.deepEqual(backfilled.rows[0], {
+      supports_zpl: true,
+      supported_formats: ['ZPL'],
+      supported_media: ['label_4x6'],
+      supported_document_types: ['shipping_label'],
+      default_document_types: ['shipping_label'],
+      status: 'online',
+      local_print_agent_id: agent.id,
+    })
+    await expectRejected(
+      () => pool.query(
+        `UPDATE operations_printers
+         SET supported_formats = ARRAY['ZPL', 'PDF']::text[]
+         WHERE organization_id = $1::uuid
+           AND id = $2::uuid`,
+        [fixture.organizationId, printer.id],
+      ),
+      /subset of its local print agent capabilities/,
+    )
+  } finally {
+    await pool.end()
+  }
+}
+
 async function verifyRuntime(connectionString) {
   const pool = new Pool({ connectionString, connectionTimeoutMillis: 5_000 })
   const auditCalls = []
@@ -542,12 +619,28 @@ async function verifyRuntime(connectionString) {
       },
     )
     const fixture = await seedBase(pool)
+    const packingCapabilities = {
+      supportedFormats: ['PDF'],
+      supportedMedia: ['letter'],
+      supportedDocumentTypes: ['packing_slip'],
+    }
+    const labelCapabilities = {
+      supportedFormats: ['ZPL'],
+      supportedMedia: ['label_4x6'],
+      supportedDocumentTypes: ['shipping_label'],
+    }
+    const primaryAgentCapabilities = {
+      supportedFormats: ['ZPL', 'PDF'],
+      supportedMedia: ['label_4x6', 'letter'],
+      supportedDocumentTypes: ['shipping_label', 'packing_slip'],
+    }
     const primaryEnrollment = await persistence.enrollOperationsPrintAgentInPostgres({
       organizationId: fixture.organizationId,
       warehouseId: fixture.warehouseId,
       name: 'Primary print agent',
       actorEmail: fixture.actorEmail,
       idempotencyKey: `primary-agent-${fixture.suffix}`,
+      ...primaryAgentCapabilities,
     })
     const fallbackEnrollment = await persistence.enrollOperationsPrintAgentInPostgres({
       organizationId: fixture.organizationId,
@@ -555,12 +648,21 @@ async function verifyRuntime(connectionString) {
       name: 'Fallback print agent',
       actorEmail: fixture.actorEmail,
       idempotencyKey: `fallback-agent-${fixture.suffix}`,
+      ...packingCapabilities,
     })
     assert.ok(primaryEnrollment.credential)
     assert.ok(fallbackEnrollment.credential)
     assert.match(
       primaryEnrollment.credential,
       /^cpprint\.v1\.[0-9a-f-]{36}\.[A-Za-z0-9_-]{43}$/i,
+    )
+    assert.deepEqual(
+      structuredClone(primaryEnrollment.agent.supportedFormats),
+      primaryAgentCapabilities.supportedFormats,
+    )
+    assert.deepEqual(
+      structuredClone(fallbackEnrollment.agent.supportedMedia),
+      packingCapabilities.supportedMedia,
     )
 
     const fallback = await createPrinter(pool, fixture, {
@@ -610,11 +712,34 @@ async function verifyRuntime(connectionString) {
       primaryEnrollment.credential,
     )
     assert.equal(primaryAgent.globalId, primaryEnrollment.agent.globalId)
+    await expectRejected(
+      () => persistence.claimOperationsPrintJobsInPostgres({
+        agent: primaryAgent,
+        idempotencyKey: `primary-invalid-capability-${fixture.suffix}`,
+        limit: 1,
+        leaseSeconds: 120,
+        runtimeCapabilities: {
+          supportedFormats: ['PNG'],
+          supportedMedia: ['letter'],
+          supportedDocumentTypes: ['packing_slip'],
+        },
+      }),
+      /subset of the enrolled print-agent capabilities/,
+    )
+    const narrowNoMatch = await persistence.claimOperationsPrintJobsInPostgres({
+      agent: primaryAgent,
+      idempotencyKey: `primary-narrow-no-match-${fixture.suffix}`,
+      limit: 1,
+      leaseSeconds: 120,
+      runtimeCapabilities: labelCapabilities,
+    })
+    assert.equal(narrowNoMatch.length, 0)
     const primaryClaim = await persistence.claimOperationsPrintJobsInPostgres({
       agent: primaryAgent,
       idempotencyKey: `primary-claim-${fixture.suffix}`,
       limit: 1,
       leaseSeconds: 120,
+      runtimeCapabilities: packingCapabilities,
     })
     assert.equal(primaryClaim.length, 1)
     assert.equal(primaryClaim[0].globalId, queued.globalId)
@@ -624,6 +749,7 @@ async function verifyRuntime(connectionString) {
       idempotencyKey: `primary-claim-${fixture.suffix}`,
       limit: 1,
       leaseSeconds: 120,
+      runtimeCapabilities: packingCapabilities,
     })
     assert.equal(duplicatePrimaryClaim.length, 1)
     assert.equal(
@@ -664,6 +790,7 @@ async function verifyRuntime(connectionString) {
       idempotencyKey: `fallback-claim-${fixture.suffix}`,
       limit: 1,
       leaseSeconds: 120,
+      runtimeCapabilities: packingCapabilities,
     })
     assert.equal(fallbackClaim.length, 1)
     assert.equal(fallbackClaim[0].printer.globalId, fallback.global_id)
@@ -761,6 +888,7 @@ async function verifyRuntime(connectionString) {
       idempotencyKey: `label-claim-${fixture.suffix}`,
       limit: 1,
       leaseSeconds: 120,
+      runtimeCapabilities: labelCapabilities,
     })
     assert.equal(labelClaim.length, 1)
     assert.equal(labelClaim[0].globalId, labelJob.globalId)
@@ -798,6 +926,7 @@ async function verifyRuntime(connectionString) {
         name: 'Offline-route primary agent',
         actorEmail: fixture.actorEmail,
         idempotencyKey: `offline-primary-agent-${fixture.suffix}`,
+        ...packingCapabilities,
       })
     const offlineFallbackEnrollment =
       await persistence.enrollOperationsPrintAgentInPostgres({
@@ -806,6 +935,7 @@ async function verifyRuntime(connectionString) {
         name: 'Offline-route fallback agent',
         actorEmail: fixture.actorEmail,
         idempotencyKey: `offline-fallback-agent-${fixture.suffix}`,
+        ...packingCapabilities,
       })
     const offlineFallback = await createPrinter(pool, fixture, {
       code: `OFFLINE-FALLBACK-${fixture.suffix}`,
@@ -858,6 +988,7 @@ async function verifyRuntime(connectionString) {
       idempotencyKey: `offline-fallback-claim-${fixture.suffix}`,
       limit: 1,
       leaseSeconds: 120,
+      runtimeCapabilities: packingCapabilities,
     })
     assert.equal(reroutedClaim.length, 1)
     assert.equal(reroutedClaim[0].globalId, offlineJob.globalId)
@@ -875,6 +1006,7 @@ async function verifyRuntime(connectionString) {
       name: 'Revoked-route print agent',
       actorEmail: fixture.actorEmail,
       idempotencyKey: `revoked-agent-${fixture.suffix}`,
+      ...packingCapabilities,
     })
     const revokedPrinter = await createPrinter(pool, fixture, {
       code: `REVOKED-${fixture.suffix}`,
@@ -1062,6 +1194,7 @@ async function main() {
       timeout: 240_000,
     })
     await verifyLegacyPrinterNormalization(connectionString)
+    await verifyAgentCapabilityBackfill(connectionString)
     await verifyRuntime(connectionString)
   } finally {
     spawnSync('docker', ['stop', '-t', '1', container], {
