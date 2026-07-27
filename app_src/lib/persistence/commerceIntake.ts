@@ -3980,7 +3980,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
            $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7, $8,
            $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19,
            $20, $21, $22, $23, $24, $25, $26, $27, $28, $29,
-           CASE WHEN $27 IS NULL THEN NULL ELSE 0 END,
+           CASE WHEN $27::text IS NULL THEN NULL ELSE 0 END,
            $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40,
            $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51,
            $52::timestamptz, $53::timestamptz, $54::timestamptz,

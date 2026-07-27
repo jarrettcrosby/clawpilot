@@ -252,6 +252,9 @@ for (const exportName of [
 const commandResultSource = persistenceSource.slice(
   persistenceSource.indexOf('function commandResult'),
 )
+includes(persistenceSource, [
+  'CASE WHEN $27::text IS NULL THEN NULL ELSE 0 END',
+], 'Nullable presentment-currency staging parameter typing')
 const readIntentPreparationSource = persistenceSource.slice(
   persistenceSource.indexOf(
     'export async function prepareCommerceIntakeReadIntentInPostgres',
