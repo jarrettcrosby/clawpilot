@@ -12,6 +12,14 @@ const continuationMigration = readFileSync(resolve(
   process.cwd(),
   'db/migrations/0115_operations_commerce_intake_continuations.sql',
 ), 'utf8')
+const operationsPersistence = readFileSync(resolve(
+  process.cwd(),
+  'app_src/lib/persistence/operations.ts',
+), 'utf8')
+const developmentSeed = readFileSync(resolve(
+  process.cwd(),
+  'scripts/seed-wms-development-simulation.mjs',
+), 'utf8')
 
 function includesAll(fragments, label) {
   for (const fragment of fragments) {
@@ -70,6 +78,16 @@ includesAll([
   "AND mapping_method = 'legacy_sku'",
   'Commerce product mapping provider variant identity is immutable',
 ], 'Exact provider variant identity')
+for (const [source, label] of [
+  [operationsPersistence, 'Operations proof legacy SKU upsert'],
+  [developmentSeed, 'Development seed legacy SKU upsert'],
+]) {
+  includesAllIn(source, [
+    'ON CONFLICT (organization_id, integration_account_id, channel_sku)',
+    'WHERE channel_sku IS NOT NULL',
+    "AND mapping_method = 'legacy_sku'",
+  ], label)
+}
 
 includesAll([
   'provider_order_status_raw text NOT NULL',
