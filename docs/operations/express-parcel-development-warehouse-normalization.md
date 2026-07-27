@@ -88,9 +88,11 @@ node scripts/normalize-express-parcel-development-warehouse.mjs --prepare
 Prepare freezes Operations writes, verifies all eight mock orders carry the
 nested proof marker, releases the seven active mock reservations through seven
 compensating inventory-ledger entries, cancels mock tasks/plans/waves, archives
-the mock orders, retires mock pools/contracts/routes, and removes only the two
-explicitly named unreferenced mock printer profiles. It leaves the workspace
-frozen for the WMS phase.
+the mock orders, retires mock pools and routes, terminates only the mutable mock
+contract projection, and removes only the two explicitly named unreferenced
+mock printer profiles. Existing `operations_contract_versions` rows remain
+immutable with their original status, dates, terms, and references. It leaves
+the workspace frozen for the WMS phase.
 
 Do not continue unless prepare reports `after.phase` as `wms_cleanup`.
 
