@@ -275,7 +275,24 @@ export default function IntegrationSetupJourney({
                       })}
                     </Box>
                   ) : null}
-                  {step.action ? <Box sx={{ mt: 1 }}>{step.action}</Box> : null}
+                  {step.action ? (
+                    <Box
+                      sx={{
+                        mt: 1,
+                        minWidth: 0,
+                        '& .MuiButton-root': {
+                          flexShrink: 0,
+                          maxWidth: '100%',
+                          whiteSpace: 'nowrap',
+                        },
+                        '& > .MuiStack-root': {
+                          flexWrap: 'wrap',
+                        },
+                      }}
+                    >
+                      {step.action}
+                    </Box>
+                  ) : null}
                 </Box>
               </Box>
             )

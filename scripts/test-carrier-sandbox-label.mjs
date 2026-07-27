@@ -312,7 +312,7 @@ assert.equal(
 assert.equal(upsCreateResult.evidence.providerReference, 'ups-create-transaction')
 assertEvidenceRedacted(upsCreateResult)
 
-const fedexPdf = Buffer.from('%PDF-1.4\n1 0 obj\n<<>>\nendobj\n%%EOF\n', 'ascii')
+const fedexZpl = '^XA^PW812^LL1218^FO48,48^FDFEDEX SANDBOX^FS^XZ'
 const fedexCreateCalls = []
 const fedexCreateResult = await createCarrierSandboxLabel(runtime('fedex_rest', 'FEDEX_GROUND', {
   shipmentFixture: normalizedShipmentFixture,
@@ -334,8 +334,8 @@ const fedexCreateResult = await createCarrierSandboxLabel(runtime('fedex_rest', 
               },
               {
                 contentType: 'LABEL',
-                docType: 'PDF',
-                encodedLabel: fedexPdf.toString('base64'),
+                docType: 'ZPLII',
+                encodedLabel: Buffer.from(fedexZpl, 'utf8').toString('base64'),
               },
             ],
           }],
@@ -361,8 +361,8 @@ assert.deepEqual(
   fedexCreateBody.requestedShipment.recipients[0].address.streetLines,
   ['101 Academy Drive', 'Warehouse B'],
 )
-assert.equal(fedexCreateBody.requestedShipment.labelSpecification.imageType, 'PDF')
-assert.equal(fedexCreateBody.requestedShipment.labelSpecification.labelStockType, 'PAPER_4X6')
+assert.equal(fedexCreateBody.requestedShipment.labelSpecification.imageType, 'ZPLII')
+assert.equal(fedexCreateBody.requestedShipment.labelSpecification.labelStockType, 'STOCK_4X6')
 assert.equal(fedexCreateBody.requestedShipment.requestedPackageLineItems.length, 1)
 assert.deepEqual(plain({
   provider: fedexCreateResult.provider,
@@ -374,17 +374,23 @@ assert.deepEqual(plain({
   provider: 'fedex_rest',
   trackingNumber: 'TRACKING0002',
   providerLabelId: 'MASTERTRACKING0002',
-  format: 'PDF',
-  payloadEncoding: 'base64',
+  format: 'ZPL',
+  payloadEncoding: 'utf8',
 })
-assert.equal(fedexCreateResult.labelPayload, fedexPdf.toString('base64'))
-assert.equal(fedexCreateResult.labelByteLength, fedexPdf.byteLength)
+assert.equal(fedexCreateResult.labelPayload, fedexZpl)
+assert.equal(fedexCreateResult.labelByteLength, Buffer.byteLength(fedexZpl, 'utf8'))
 assert.equal(
   fedexCreateResult.labelContentSha256,
-  createHash('sha256').update(fedexPdf).digest('hex'),
+  createHash('sha256').update(fedexZpl, 'utf8').digest('hex'),
 )
-assert.equal(fedexCreateResult.evidence.redactedResponse.payloadEncoding, 'base64')
-assert.equal(fedexCreateResult.evidence.redactedResponse.labelByteLength, fedexPdf.byteLength)
+assert.equal(fedexCreateResult.evidence.redactedRequest.label.format, 'ZPL')
+assert.equal(fedexCreateResult.evidence.redactedRequest.label.providerImageType, 'ZPLII')
+assert.equal(fedexCreateResult.evidence.redactedRequest.label.mediaSize, 'label_4x6')
+assert.equal(fedexCreateResult.evidence.redactedResponse.payloadEncoding, 'utf8')
+assert.equal(
+  fedexCreateResult.evidence.redactedResponse.labelByteLength,
+  Buffer.byteLength(fedexZpl, 'utf8'),
+)
 assert.equal(
   fedexCreateResult.evidence.redactedResponse.labelContentSha256,
   fedexCreateResult.labelContentSha256,
@@ -422,11 +428,16 @@ await assert.rejects(
     fetchImpl: async () => jsonResponse({
       output: {
         transactionShipments: [{
-          masterTrackingNumber: 'INVALIDPDF',
+          masterTrackingNumber: 'INVALIDZPL',
           pieceResponses: [{
-            trackingNumber: 'INVALIDPDF',
+            trackingNumber: 'INVALIDZPL',
             packageDocuments: [{
-              encodedLabel: Buffer.from('not a PDF', 'utf8').toString('base64'),
+              contentType: 'LABEL',
+              docType: 'ZPLII',
+              encodedLabel: Buffer.from(
+                '^XA^FO20,20^FDMISSING END',
+                'utf8',
+              ).toString('base64'),
             }],
           }],
         }],
@@ -438,7 +449,7 @@ await assert.rejects(
     status: 502,
     uncertain: true,
   }),
-  'FedEx label bytes must begin with the PDF signature',
+  'FedEx label bytes must contain a complete ZPL ^XA/^XZ envelope',
 )
 
 await assert.rejects(
@@ -449,7 +460,11 @@ await assert.rejects(
           masterTrackingNumber: 'INVALIDBASE64',
           pieceResponses: [{
             trackingNumber: 'INVALIDBASE64',
-            packageDocuments: [{ encodedLabel: 'not*base64' }],
+            packageDocuments: [{
+              contentType: 'LABEL',
+              docType: 'ZPLII',
+              encodedLabel: 'not*base64',
+            }],
           }],
         }],
       },
@@ -461,6 +476,61 @@ await assert.rejects(
     uncertain: true,
   }),
   'Malformed provider base64 must be rejected before persistence',
+)
+
+await assert.rejects(
+  createCarrierSandboxLabel(runtime('fedex_rest', 'FEDEX_GROUND'), {
+    fetchImpl: async () => jsonResponse({
+      output: {
+        transactionShipments: [{
+          masterTrackingNumber: 'WRONGFORMAT',
+          pieceResponses: [{
+            trackingNumber: 'WRONGFORMAT',
+            packageDocuments: [{
+              contentType: 'LABEL',
+              docType: 'PDF',
+              encodedLabel: Buffer.from(fedexZpl, 'utf8').toString('base64'),
+            }],
+          }],
+        }],
+      },
+    }),
+  }),
+  (error) => assertError(error, {
+    code: 'CARRIER_PROVIDER_RESPONSE_INVALID',
+    status: 502,
+    uncertain: true,
+  }),
+  'FedEx must return the requested native thermal document format',
+)
+
+await assert.rejects(
+  createCarrierSandboxLabel(runtime('fedex_rest', 'FEDEX_GROUND'), {
+    fetchImpl: async () => jsonResponse({
+      output: {
+        transactionShipments: [{
+          masterTrackingNumber: 'CONTROLBYTE',
+          pieceResponses: [{
+            trackingNumber: 'CONTROLBYTE',
+            packageDocuments: [{
+              contentType: 'LABEL',
+              imageType: 'ZPL',
+              encodedLabel: Buffer.from(
+                '^XA^FO20,20^FDINVALID\u0000BYTE^FS^XZ',
+                'utf8',
+              ).toString('base64'),
+            }],
+          }],
+        }],
+      },
+    }),
+  }),
+  (error) => assertError(error, {
+    code: 'CARRIER_PROVIDER_RESPONSE_INVALID',
+    status: 502,
+    uncertain: true,
+  }),
+  'FedEx ZPL must reject unsafe control bytes',
 )
 
 const upsVoidCalls = []

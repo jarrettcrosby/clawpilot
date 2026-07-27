@@ -920,7 +920,7 @@ export default function CommerceIntegrationPanel() {
       <Box
         sx={{
           display: 'grid',
-          gridTemplateColumns: { xs: '1fr', lg: '1fr 1fr' },
+          gridTemplateColumns: 'minmax(0, 1fr)',
           gap: 2,
         }}
       >
@@ -973,7 +973,9 @@ export default function CommerceIntegrationPanel() {
                     action: catalog ? (
                       <Stack
                         direction={{ xs: 'column', sm: 'row' }}
-                        spacing={1}
+                        gap={1}
+                        flexWrap="wrap"
+                        useFlexGap
                       >
                         <Button
                           href={catalog.onboarding.shopify.developerPortalUrl}
@@ -1244,7 +1246,9 @@ export default function CommerceIntegrationPanel() {
                     action: catalog ? (
                       <Stack
                         direction={{ xs: 'column', sm: 'row' }}
-                        spacing={1}
+                        gap={1}
+                        flexWrap="wrap"
+                        useFlexGap
                       >
                         <Button
                           href={catalog.onboarding.faire.developerPortalUrl}

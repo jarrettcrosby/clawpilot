@@ -174,4 +174,23 @@ assert.ok(
   'Stored-label print action must not invoke a carrier API',
 )
 
+const adapter = read('app_src/lib/integrations/carrierSandboxLabel.ts')
+for (const fragment of [
+  "CARRIER_SANDBOX_LABEL_ADAPTER_VERSION = 'direct-rest-sandbox-v2'",
+  "imageType: 'ZPLII'",
+  "labelStockType: 'STOCK_4X6'",
+  "format: 'ZPL' as const",
+  "payloadEncoding: 'utf8' as const",
+  "providerImageType: provider === 'fedex_rest' ? 'ZPLII' : 'ZPL'",
+]) {
+  assert.ok(
+    adapter.includes(fragment),
+    `Missing provider-native thermal label contract: ${fragment}`,
+  )
+}
+assert.ok(
+  !/labelSpecification:\s*\{[\s\S]{0,200}imageType:\s*'PDF'/.test(adapter),
+  'The bounded FedEx diagnostic must not request a laser PDF for a thermal route',
+)
+
 console.log('Carrier rate-test label schema and print contracts passed.')

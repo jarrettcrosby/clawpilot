@@ -2081,7 +2081,10 @@ export default function CarrierIntegrationPanel() {
                 ) : (
                   <Alert severity="warning" sx={{ mt: 1.5, borderRadius: '8px' }}>
                     No online local-agent printer supports shipping labels in {selectedRateTestLabel.format}{' '}
-                    on {selectedRateTestLabel.mediaSize}. Configure a compatible printer before printing.
+                    on {selectedRateTestLabel.mediaSize}.{' '}
+                    {selectedRateTestLabel.format === 'PDF'
+                      ? 'This existing provider PDF remains immutable. Void it below, run a new sandbox rate, and create a new provider-native thermal ZPL label for a ZPL printer; or configure a PDF-capable local print service.'
+                      : 'Configure a printer that explicitly supports this exact format and media before printing.'}
                   </Alert>
                 )}
               </Box>

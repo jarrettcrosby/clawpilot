@@ -11,7 +11,7 @@ import {
   type CarrierSandboxRateFixture,
 } from '@/lib/integrations/carrierSandboxRate'
 
-export const CARRIER_SANDBOX_LABEL_ADAPTER_VERSION = 'direct-rest-sandbox-v1'
+export const CARRIER_SANDBOX_LABEL_ADAPTER_VERSION = 'direct-rest-sandbox-v2'
 
 const LABEL_ENDPOINTS = {
   ups_rest: 'https://wwwcie.ups.com/api/shipments/v2409/ship',
@@ -532,8 +532,8 @@ function fedexCreateRequest(
       shippingChargesPayment: fedexPayment(input),
       labelSpecification: {
         labelFormatType: 'COMMON2D',
-        imageType: 'PDF',
-        labelStockType: 'PAPER_4X6',
+        imageType: 'ZPLII',
+        labelStockType: 'STOCK_4X6',
       },
       requestedPackageLineItems: [{
         sequenceNumber: 1,
@@ -577,6 +577,11 @@ export function carrierSandboxLabelRequestEvidence(
     destination: fixture.destination,
     parcel: fixture.parcel,
     billingRelationship,
+    label: {
+      format: 'ZPL',
+      providerImageType: provider === 'fedex_rest' ? 'ZPLII' : 'ZPL',
+      mediaSize: 'label_4x6',
+    },
   }
   return {
     requestHash: hash(value),
@@ -586,6 +591,7 @@ export function carrierSandboxLabelRequestEvidence(
       purpose: 'sandbox_label_create',
       serviceCode: effectiveServiceCode,
       billingRelationship,
+      label: value.label,
       shipment: {
         originFingerprint: carrierSandboxPartyFingerprint(origin),
         destinationFingerprint: carrierSandboxPartyFingerprint(fixture.destination),
@@ -656,12 +662,18 @@ function labelMetadata(labelBytes: Uint8Array) {
   }
 }
 
-function validPdfBytes(bytes: Buffer) {
-  if (bytes.subarray(0, 5).toString('ascii') !== '%PDF-') return false
-  const tail = bytes
-    .subarray(Math.max(0, bytes.byteLength - 2048))
-    .toString('latin1')
-  return /%%EOF[\u0000\t\n\f\r ]*$/.test(tail)
+function printableZpl(bytes: Buffer, provider: 'UPS' | 'FedEx') {
+  const payload = bytes.toString('utf8')
+  const normalized = payload.trim()
+  if (
+    !Buffer.from(payload, 'utf8').equals(bytes)
+    || !normalized.startsWith('^XA')
+    || !normalized.endsWith('^XZ')
+    || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(payload)
+  ) {
+    return invalidLabelResponse(provider)
+  }
+  return payload
 }
 
 function parseUpsCreate(payload: Record<string, unknown>) {
@@ -676,16 +688,7 @@ function parseUpsCreate(payload: Record<string, unknown>) {
     return invalidLabelResponse('UPS')
   }
   const labelBytes = decodeProviderLabel(shippingLabel.GraphicImage, 'UPS')
-  const labelPayload = labelBytes.toString('utf8')
-  const normalized = labelPayload.trim()
-  if (
-    !Buffer.from(labelPayload, 'utf8').equals(labelBytes)
-    || !normalized.startsWith('^XA')
-    || !normalized.endsWith('^XZ')
-    || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(labelPayload)
-  ) {
-    return invalidLabelResponse('UPS')
-  }
+  const labelPayload = printableZpl(labelBytes, 'UPS')
   return {
     trackingNumber,
     providerLabelId,
@@ -704,8 +707,10 @@ function firstFedexPiece(payload: Record<string, unknown>) {
     .map((value) => record(value))
     .find((document) => (
       text(document.contentType).toUpperCase() === 'LABEL'
-      && text(document.docType || document.documentType || document.imageType)
-        .toUpperCase() === 'PDF'
+      && ['ZPLII', 'ZPL'].includes(
+        text(document.docType || document.documentType || document.imageType)
+          .toUpperCase(),
+      )
     )) || {}
   const documentPart = record(list(packageDocument.parts)[0])
   return {
@@ -726,15 +731,13 @@ function parseFedexCreate(payload: Record<string, unknown>) {
     return invalidLabelResponse('FedEx')
   }
   const labelBytes = decodeProviderLabel(encodedLabel, 'FedEx')
-  if (!validPdfBytes(labelBytes)) {
-    return invalidLabelResponse('FedEx')
-  }
+  const labelPayload = printableZpl(labelBytes, 'FedEx')
   return {
     trackingNumber,
     providerLabelId,
-    labelPayload: labelBytes.toString('base64'),
-    payloadEncoding: 'base64' as const,
-    format: 'PDF' as const,
+    labelPayload,
+    payloadEncoding: 'utf8' as const,
+    format: 'ZPL' as const,
     ...labelMetadata(labelBytes),
   }
 }
