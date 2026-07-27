@@ -307,7 +307,7 @@ function shopifyProductVariantsQuery(includeInventory: boolean) {
     first: ${SHOPIFY_PRODUCT_VARIANT_PAGE_SIZE}
     after: $after
     query: $query
-    sortKey: UPDATED_AT
+    sortKey: ID
     reverse: true
   ) {
     nodes {
