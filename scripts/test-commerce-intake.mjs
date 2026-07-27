@@ -246,6 +246,20 @@ for (const exportName of [
 const commandResultSource = persistenceSource.slice(
   persistenceSource.indexOf('function commandResult'),
 )
+const readIntentPreparationSource = persistenceSource.slice(
+  persistenceSource.indexOf(
+    'export async function prepareCommerceIntakeReadIntentInPostgres',
+  ),
+  persistenceSource.indexOf('type CommerceReadIntentPersistenceRow'),
+)
+includes(readIntentPreparationSource, [
+  "now() + interval '30 days'",
+], 'Database-clock commerce read-intent retention')
+assert.doesNotMatch(
+  readIntentPreparationSource,
+  /now\.getTime\(\)\s*\+\s*30\s*\*\s*24\s*\*\s*60\s*\*\s*60/,
+  'Commerce read-intent retention must not mix the app clock with the database created_at clock',
+)
 includes(commandResultSource, [
   'providerWrites: 0',
   'syncCursorAdvanced: false',
@@ -638,6 +652,7 @@ const readIntents = new Map()
 const invalidContinuations = []
 const stageAttempts = []
 let failStageOnceForKey = null
+let failReadIntentPreparationForKey = null
 const refreshTargets = new Map([
   ['gcoc0000001', {
     provider: 'shopify',
@@ -963,6 +978,11 @@ const service = loadTypeScriptModule(
           return replay?.result || null
         },
         async prepareCommerceIntakeReadIntentInPostgres(input) {
+          if (
+            input.idempotencyKey === failReadIntentPreparationForKey
+          ) {
+            throw new Error('simulated initial read-intent preparation failure')
+          }
           const existing = readIntents.get(input.idempotencyKey)
           if (existing) return existing
           let continuedPage = null
@@ -1165,6 +1185,37 @@ function commandBody(action, extra = {}) {
 }
 
 try {
+  const readPreparationFailureKey = nextKey()
+  failReadIntentPreparationForKey = readPreparationFailureKey
+  const readsBeforePreparationFailure = { ...providerReads }
+  await assert.rejects(
+    service.executeCommerceIntakeCommand({
+      organizationId,
+      actorEmail,
+      body: {
+        action: 'fetch-products',
+        accountGlobalId: shopifyRuntime.globalId,
+        confirmReadOnly: true,
+        idempotencyKey: readPreparationFailureKey,
+      },
+    }),
+    (error) => (
+      error.code === 'COMMERCE_INTAKE_READ_PREPARATION_FAILED'
+      && error.status === 500
+      && /no provider request was sent/i.test(error.message)
+    ),
+  )
+  assert.deepEqual(
+    providerReads,
+    readsBeforePreparationFailure,
+    'Initial read-intent preparation failure must happen before provider I/O',
+  )
+  assert.equal(
+    invalidContinuations.length,
+    0,
+    'Initial read-intent preparation failure must not invalidate a continuation',
+  )
+
   const shopifyFetchKey = nextKey()
   failStageOnceForKey = shopifyFetchKey
   await assert.rejects(

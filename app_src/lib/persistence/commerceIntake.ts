@@ -2495,9 +2495,6 @@ export async function prepareCommerceIntakeReadIntentInPostgres(input: {
         productsFetched: input.resource === 'products',
         oneRootPage: true,
       })
-    const expiresAt = new Date(
-      now.getTime() + 30 * 24 * 60 * 60 * 1_000,
-    ).toISOString()
     const created = await client.query<{ id: string }>(
       `INSERT INTO operations_commerce_intake_read_intents (
          organization_id, integration_account_id, pipeline_id, provider,
@@ -2511,7 +2508,7 @@ export async function prepareCommerceIntakeReadIntentInPostgres(input: {
          $1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7, $8, $9, $10,
          $11, $12, $13, $14::uuid, $15, $16, $17::uuid, $18,
          $19::timestamptz, $20::timestamptz, $21, $22, $22,
-         $23::timestamptz
+         now() + interval '30 days'
        )
        RETURNING id::text`,
       [
@@ -2537,7 +2534,6 @@ export async function prepareCommerceIntakeReadIntentInPostgres(input: {
         windowEnd,
         queryHash,
         input.actorEmail,
-        expiresAt,
       ],
     )
     return {
