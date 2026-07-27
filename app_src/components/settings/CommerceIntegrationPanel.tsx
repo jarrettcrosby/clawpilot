@@ -1599,6 +1599,7 @@ export default function CommerceIntegrationPanel() {
                           accountGlobalId={account.globalId}
                           provider={account.provider}
                           displayName={account.displayName}
+                          canActivate={canActivate}
                         />
                       ) : null}
 

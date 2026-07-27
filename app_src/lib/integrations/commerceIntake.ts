@@ -385,7 +385,7 @@ export function commerceIntakeRuntimeAvailable() {
   return ['dev', 'development', 'local', 'preview'].includes(lane)
 }
 
-function assertIntakeRuntime() {
+export function assertCommerceIntakeRuntime() {
   if (process.env.CLAWPILOT_COMMERCE_INTAKE_ENABLED !== '1') {
     throw new CommerceIntegrationRequestError(
       'Commerce intake is not enabled in this environment',
@@ -1472,7 +1472,7 @@ export async function getCommerceIntake(input: {
   organizationId: unknown
   accountGlobalId: unknown
 }) {
-  assertIntakeRuntime()
+  assertCommerceIntakeRuntime()
   const runtime = await runtimeFor(input)
   return readCommerceIntakeStateFromPostgres({
     organizationId: runtime.organizationId,
@@ -1485,7 +1485,7 @@ export async function executeCommerceIntakeCommand(input: {
   actorEmail: string
   body: Record<string, unknown>
 }) {
-  assertIntakeRuntime()
+  assertCommerceIntakeRuntime()
   const commandAction = action(input.body.action)
   const key = idempotencyKey(input.body.idempotencyKey)
   const runtime = await runtimeFor({

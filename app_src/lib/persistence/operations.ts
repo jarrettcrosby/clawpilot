@@ -3522,6 +3522,8 @@ export async function updateOperationsActivationInPostgres(input: {
   actorEmail: string
   state: OperationsActivationState
   reason?: string | null
+  expectedCurrentState?: OperationsActivationState | 'missing'
+  expectedCurrentRevision?: number | null
 }): Promise<OperationsActivationUpdateResult> {
   const organizationId = requireOrganizationId(input.organizationId)
   const actorEmail = trimmed(input.actorEmail, 320).toLowerCase()
@@ -3533,6 +3535,30 @@ export async function updateOperationsActivationInPostgres(input: {
 
   return withTransaction(async (client) => {
     await acquireTransactionAdvisoryLock(client, `operations:activation:${organizationId}`)
+    if (input.expectedCurrentState !== undefined) {
+      const observed = await client.query<{
+        state: OperationsActivationState
+        revision: number
+      }>(
+        `SELECT state, revision
+         FROM operations_activation_scopes
+         WHERE organization_id = $1::uuid
+         FOR UPDATE`,
+        [organizationId],
+      )
+      const row = observed.rows[0] || null
+      const exactMatch = input.expectedCurrentState === 'missing'
+        ? row === null && input.expectedCurrentRevision === null
+        : row?.state === input.expectedCurrentState
+          && row.revision === input.expectedCurrentRevision
+      if (!exactMatch) {
+        throw new OperationsRequestError(
+          'OPERATIONS_ACTIVATION_STATE_CONFLICT',
+          'Operations activation changed after this workflow loaded; review its current mode before continuing',
+          409,
+        )
+      }
+    }
     const current = await resolveActivation(client, organizationId, true)
     if (input.state === 'active') {
       const providers = await client.query<QueryResultRow & { integration_type: string }>(

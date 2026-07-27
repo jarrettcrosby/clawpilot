@@ -1,14 +1,20 @@
 import { NextRequest, NextResponse } from 'next/server'
 import {
+  assertCommerceIntakeRuntime,
   executeCommerceIntakeCommand,
   getCommerceIntake,
 } from '@/lib/integrations/commerceIntake'
 import {
   CommerceIntegrationRequestError,
+  getCommerceIntegrationsState,
   sanitizedCommerceIntegrationError,
 } from '@/lib/integrations/commerceIntegrations'
 import { operationsCapabilities } from '@/lib/operations/authorization'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
+import {
+  OperationsRequestError,
+  updateOperationsActivationInPostgres,
+} from '@/lib/persistence/operations'
 import { requireRequestUser } from '@/lib/requestUser'
 import type { AppUser } from '@/lib/users'
 
@@ -38,6 +44,12 @@ function errorResponse(error: unknown) {
       401,
     )
   }
+  if (error instanceof OperationsRequestError) {
+    return json(
+      { ok: false, error: error.message, code: error.code },
+      error.status,
+    )
+  }
   const sanitized = sanitizedCommerceIntegrationError(error)
   return json(
     { ok: false, error: sanitized.message, code: sanitized.code },
@@ -62,6 +74,16 @@ function requireManager(actor: AppUser) {
       'Operations-management permission is required to resolve and promote commerce orders',
       403,
       'COMMERCE_MANAGER_REQUIRED',
+    )
+  }
+}
+
+function requireActivator(actor: AppUser) {
+  if (!operationsCapabilities(actor).canActivate) {
+    throw new CommerceIntegrationRequestError(
+      'Organization-owner or authorized administrator permission is required to change Operations activation',
+      403,
+      'COMMERCE_ACTIVATION_PERMISSION_REQUIRED',
     )
   }
 }
@@ -132,6 +154,86 @@ export async function POST(req: NextRequest) {
   try {
     const user = await actor(req)
     const body = await requestBody(req)
+    if (body.action === 'initialize-shadow') {
+      assertCommerceIntakeRuntime()
+      requireActivator(user)
+      if (body.confirmShadowActivation !== true) {
+        throw new CommerceIntegrationRequestError(
+          'Confirm Shadow activation before enabling the operator intake workflow',
+          400,
+          'COMMERCE_INTAKE_SHADOW_CONFIRMATION_REQUIRED',
+        )
+      }
+      const expectedActivationState = String(
+        body.expectedActivationState || '',
+      ).trim()
+      const expectedActivationRevision =
+        body.expectedActivationRevision === null
+          ? null
+          : Number(body.expectedActivationRevision)
+      if (
+        !['missing', 'disabled', 'read_only'].includes(
+          expectedActivationState,
+        )
+        || (
+          expectedActivationState === 'missing'
+            ? expectedActivationRevision !== null
+            : (
+              !Number.isSafeInteger(expectedActivationRevision)
+              || Number(expectedActivationRevision) < 1
+            )
+        )
+      ) {
+        throw new CommerceIntegrationRequestError(
+          'Reload the workflow before changing Operations activation',
+          409,
+          'COMMERCE_INTAKE_ACTIVATION_STATE_REQUIRED',
+        )
+      }
+      const accountGlobalId = String(body.accountGlobalId || '').trim()
+      const organization = organizationId(user)
+      const integrations = await getCommerceIntegrationsState(organization)
+      const account = integrations.accounts.find(
+        (candidate) => candidate.globalId === accountGlobalId,
+      )
+      if (
+        !account
+        || !account.configured
+        || account.verificationStatus !== 'verified'
+      ) {
+        throw new CommerceIntegrationRequestError(
+          'Verify the selected commerce connection before enabling Shadow intake',
+          409,
+          'COMMERCE_INTAKE_VERIFICATION_REQUIRED',
+        )
+      }
+      const activation = await updateOperationsActivationInPostgres({
+        organizationId: organization,
+        actorEmail: user.email,
+        state: 'shadow',
+        reason: 'Enabled from the commerce intake setup workflow',
+        expectedCurrentState: expectedActivationState as
+          | 'missing'
+          | 'disabled'
+          | 'read_only',
+        expectedCurrentRevision: expectedActivationRevision,
+      })
+      const intake = await getCommerceIntake({
+        organizationId: organization,
+        accountGlobalId,
+      })
+      return json({
+        ok: true,
+        command: {
+          replayed: false,
+          result: {
+            activationState: activation.state,
+            activationRevision: activation.revision,
+          },
+        },
+        intake,
+      })
+    }
     const result = await executeCommerceIntakeCommand({
       organizationId: organizationId(user),
       actorEmail: user.email,
