@@ -2,6 +2,7 @@
 
 import {
   useEffect,
+  useRef,
   useState,
   type FormEvent,
 } from 'react'
@@ -19,7 +20,9 @@ import CircularProgress from '@mui/material/CircularProgress'
 import Divider from '@mui/material/Divider'
 import FormControl from '@mui/material/FormControl'
 import FormControlLabel from '@mui/material/FormControlLabel'
+import IconButton from '@mui/material/IconButton'
 import InputLabel from '@mui/material/InputLabel'
+import InputAdornment from '@mui/material/InputAdornment'
 import MenuItem from '@mui/material/MenuItem'
 import Select from '@mui/material/Select'
 import Stack from '@mui/material/Stack'
@@ -30,6 +33,7 @@ import TableContainer from '@mui/material/TableContainer'
 import TableHead from '@mui/material/TableHead'
 import TableRow from '@mui/material/TableRow'
 import TextField from '@mui/material/TextField'
+import Tooltip from '@mui/material/Tooltip'
 import Typography from '@mui/material/Typography'
 import ExpandMoreRounded from '@mui/icons-material/ExpandMoreRounded'
 import ContentCopyRounded from '@mui/icons-material/ContentCopyRounded'
@@ -39,6 +43,11 @@ import OpenInNewRounded from '@mui/icons-material/OpenInNewRounded'
 import PowerSettingsNewRounded from '@mui/icons-material/PowerSettingsNewRounded'
 import StorefrontRounded from '@mui/icons-material/StorefrontRounded'
 import SyncRounded from '@mui/icons-material/SyncRounded'
+import VisibilityOffRounded from '@mui/icons-material/VisibilityOffRounded'
+import VisibilityRounded from '@mui/icons-material/VisibilityRounded'
+import IntegrationSetupJourney, {
+  type IntegrationSetupStepState,
+} from '@/components/settings/IntegrationSetupJourney'
 
 type CommerceProvider = 'shopify' | 'faire'
 type CommerceEnvironment = 'sandbox' | 'production'
@@ -165,12 +174,28 @@ type CommercePayload = {
   code?: string
   canManage?: boolean
   canActivate?: boolean
+  canRevealCredentials?: boolean
   integrations?: CommerceState
   catalog?: CommerceCatalog
   authorizationUrl?: string
   callbackUrl?: string
   expiresAt?: string
   requestedScopes?: string[]
+  credential?: RevealedCommerceCredential
+}
+
+type RevealedCommerceCredential = {
+  provider: CommerceProvider
+  environment: CommerceEnvironment
+  accountGlobalId: string
+  authMode: string
+  credentialVersion: number
+  revealedAt: string
+  expiresAt: string
+  clientId?: string
+  clientSecret?: string
+  applicationId?: string
+  applicationSecret?: string
 }
 
 type ShopifyOrderPreviewLine = {
@@ -413,6 +438,38 @@ function statusColor(
   return 'default' as const
 }
 
+function connectionSetupState(
+  account: CommerceAccount | undefined,
+): IntegrationSetupStepState {
+  if (!account?.configured) return 'pending'
+  if (account.verificationStatus === 'verified') return 'complete'
+  return 'attention'
+}
+
+function accountConfigurationText(
+  account: CommerceAccount | undefined,
+  key: string,
+) {
+  const value = account?.configuration[key]
+  return typeof value === 'string' && value.trim() ? value.trim() : ''
+}
+
+function setupTimestamp(value: string | null | undefined) {
+  if (!value) return 'Not yet'
+  const timestamp = new Date(value)
+  return Number.isNaN(timestamp.getTime())
+    ? 'Recorded'
+    : timestamp.toLocaleString()
+}
+
+function maskedCommerceCredential(account: CommerceAccount | undefined) {
+  if (!account?.configured) return 'Not stored'
+  const suffix = account.credentialIdentifierLastFour
+    ? ` · ••••${account.credentialIdentifierLastFour}`
+    : ''
+  return `Generation ${account.credentialVersion}${suffix}`
+}
+
 export default function CommerceIntegrationPanel() {
   const [integrations, setIntegrations] = useState<CommerceState>({
     organizationId: '',
@@ -420,10 +477,14 @@ export default function CommerceIntegrationPanel() {
   })
   const [catalog, setCatalog] = useState<CommerceCatalog | null>(null)
   const [canActivate, setCanActivate] = useState(false)
+  const [canRevealCredentials, setCanRevealCredentials] = useState(false)
   const [loading, setLoading] = useState(true)
   const [pendingAction, setPendingAction] = useState('')
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
+  const [revealedCredential, setRevealedCredential] =
+    useState<RevealedCommerceCredential | null>(null)
+  const organizationIdRef = useRef(integrations.organizationId)
   const [shopifyPreviews, setShopifyPreviews] = useState<
     Record<string, ShopifyOrderPreviewState>
   >({})
@@ -444,9 +505,21 @@ export default function CommerceIntegrationPanel() {
   })
 
   function applyPayload(payload: CommercePayload) {
-    if (payload.integrations) setIntegrations(payload.integrations)
+    if (payload.integrations) {
+      if (
+        payload.integrations.organizationId
+          !== organizationIdRef.current
+      ) {
+        organizationIdRef.current = payload.integrations.organizationId
+        setRevealedCredential(null)
+      }
+      setIntegrations(payload.integrations)
+    }
     if (payload.catalog) setCatalog(payload.catalog)
     setCanActivate(payload.canActivate === true)
+    if (typeof payload.canRevealCredentials === 'boolean') {
+      setCanRevealCredentials(payload.canRevealCredentials)
+    }
   }
 
   useEffect(() => {
@@ -498,6 +571,30 @@ export default function CommerceIntegrationPanel() {
     }
   }, [])
 
+  useEffect(() => {
+    if (!revealedCredential) return
+    const clearRevealedCredential = () => setRevealedCredential(null)
+    const clearWhenHidden = () => {
+      if (document.visibilityState !== 'visible') clearRevealedCredential()
+    }
+    const timeout = window.setTimeout(
+      clearRevealedCredential,
+      Math.min(
+        30_000,
+        Math.max(0, Date.parse(revealedCredential.expiresAt) - Date.now()),
+      ),
+    )
+    window.addEventListener('blur', clearRevealedCredential)
+    window.addEventListener('pagehide', clearRevealedCredential)
+    document.addEventListener('visibilitychange', clearWhenHidden)
+    return () => {
+      window.clearTimeout(timeout)
+      window.removeEventListener('blur', clearRevealedCredential)
+      window.removeEventListener('pagehide', clearRevealedCredential)
+      document.removeEventListener('visibilitychange', clearWhenHidden)
+    }
+  }, [revealedCredential])
+
   async function action(
     key: string,
     body: Record<string, unknown>,
@@ -514,7 +611,7 @@ export default function CommerceIntegrationPanel() {
       })
       applyPayload(payload)
       setNotice(successMessage)
-      return true
+      return payload
     } catch (requestError) {
       const actionError = actionableCommerceError(requestError)
       await requestCommerce()
@@ -621,6 +718,7 @@ export default function CommerceIntegrationPanel() {
       'Shopify merchant-owned app connected and its API identity verified. Complete the receipt setup checklist below only when you are ready to enable signed receipt intake.',
     )
     if (saved) {
+      setRevealedCredential(null)
       setShopify((current) => ({
         ...current,
         clientId: '',
@@ -678,6 +776,7 @@ export default function CommerceIntegrationPanel() {
         `Disconnect ${account.displayName}? ClawPilot will remove its encrypted credential and retain durable operational evidence. Revoke or remove provider-side access separately.`,
       )
     ) return
+    setRevealedCredential(null)
     await action(
       `disconnect:${account.globalId}`,
       { action: 'disconnect', accountGlobalId: account.globalId },
@@ -699,6 +798,41 @@ export default function CommerceIntegrationPanel() {
     }
   }
 
+  async function revealCredential(account: CommerceAccount) {
+    if (!account.configured || pendingAction) return
+    const revealOrganizationId = organizationIdRef.current
+    setRevealedCredential(null)
+    if (!window.confirm(
+      `Reveal the current ${providerLabel(account.provider)} application credentials? This action is audited and the values clear automatically.`,
+    )) return
+    const payload = await action(
+      `reveal:${account.globalId}`,
+      {
+        action: 'reveal-credential',
+        accountGlobalId: account.globalId,
+      },
+      `${account.displayName} credentials revealed for 30 seconds.`,
+    )
+    if (
+      payload
+      && payload.credential
+      && organizationIdRef.current === revealOrganizationId
+    ) {
+      setRevealedCredential(payload.credential)
+    }
+  }
+
+  async function copyRevealedCredential(label: string, value: string) {
+    try {
+      await navigator.clipboard.writeText(value)
+      setNotice(`${label} copied.`)
+    } catch {
+      setError(
+        `${label} could not be copied. Select the value and copy it manually.`,
+      )
+    }
+  }
+
   if (loading) {
     return (
       <Stack alignItems="center" sx={{ py: 8 }}>
@@ -706,6 +840,46 @@ export default function CommerceIntegrationPanel() {
       </Stack>
     )
   }
+
+  const shopifyAccount = integrations.accounts.find(
+    (account) => account.provider === 'shopify' && account.configured,
+  ) || integrations.accounts.find((account) => account.provider === 'shopify')
+  const faireAccount = integrations.accounts.find(
+    (account) => account.provider === 'faire' && account.configured,
+  ) || integrations.accounts.find((account) => account.provider === 'faire')
+  const shopifyGrantedScopes = valueStrings(
+    shopifyAccount?.configuration.grantedScopes,
+  )
+  const shopifyMissingScopes = valueStrings(
+    shopifyAccount?.configuration.missingScopes,
+  )
+  const shopifyPreview = shopifyAccount
+    ? shopifyPreviews[shopifyAccount.globalId]
+    : undefined
+  const shopifyDomain = accountConfigurationText(
+    shopifyAccount,
+    'shopDomain',
+  ) || shopify.shopDomain.trim()
+  const shopifyConnectionState = connectionSetupState(shopifyAccount)
+  const shopifyPreviewState: IntegrationSetupStepState = shopifyPreview?.run
+    ? 'complete'
+    : shopifyAccount?.verificationStatus === 'verified'
+      && shopifyGrantedScopes.includes('read_orders')
+      ? 'current'
+      : 'pending'
+  const shopifyReceiptState: IntegrationSetupStepState =
+    shopifyAccount?.status === 'active'
+      ? 'complete'
+      : shopifyAccount?.verificationStatus === 'verified'
+        && (
+          shopifyMissingScopes.length > 0
+          || shopifyAccount.webhookVerificationStatus !== 'verified'
+        )
+        ? 'attention'
+        : shopifyAccount?.verificationStatus === 'verified'
+          ? 'current'
+          : 'pending'
+  const faireConnectionState = connectionSetupState(faireAccount)
 
   return (
     <Stack spacing={3}>
@@ -762,79 +936,172 @@ export default function CommerceIntegrationPanel() {
                   same-organization <code>.myshopify.com</code> store.
                 </Typography>
               </Box>
-              {catalog ? (
-                <Alert severity="info" icon={false}>
-                  <Typography variant="subtitle2" fontWeight={700}>
-                    Before you connect
-                  </Typography>
-                  <Box
-                    component="ol"
-                    sx={{
-                      pl: 2.5,
-                      my: 1,
-                      '& li': { mb: 0.5 },
-                    }}
-                  >
-                    {catalog.onboarding.shopify.requiredBeforeConnect.map(
-                      (step) => (
-                        <Typography component="li" variant="body2" key={step}>
-                          {step}
-                        </Typography>
-                      ),
-                    )}
-                  </Box>
-                  <Typography variant="body2" color="text.secondary">
-                    Use <code>{catalog.onboarding.shopify.defaultAppUrl}</code>{' '}
-                    for an API-only app home, select webhook API version{' '}
-                    <code>{catalog.onboarding.shopify.apiVersion}</code>, and
-                    start with least privilege. The current receipt-proof
-                    profile requires only{' '}
-                    <code>
-                      {catalog.onboarding.shopify.receiptProofScopes.join(', ')}
-                    </code>
-                    . Shopify Admin-created legacy apps and Admin API access
-                    tokens are not supported. Public and custom-distribution
-                    apps require a different OAuth flow and are not supported
-                    by this connection form.
-                  </Typography>
-                  <Stack
-                    direction={{ xs: 'column', sm: 'row' }}
-                    spacing={1}
-                    sx={{ mt: 1.5 }}
-                  >
-                    <Button
-                      href={catalog.onboarding.shopify.developerPortalUrl}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      variant="outlined"
-                      size="small"
-                      endIcon={<OpenInNewRounded />}
-                    >
-                      Open Shopify Dev Dashboard
-                    </Button>
-                    <Button
-                      href={catalog.onboarding.shopify.setupGuideUrl}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      variant="text"
-                      size="small"
-                      endIcon={<OpenInNewRounded />}
-                    >
-                      Shopify setup guide
-                    </Button>
-                    <Button
-                      href={catalog.onboarding.shopify.tokenGuideUrl}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      variant="text"
-                      size="small"
-                      endIcon={<OpenInNewRounded />}
-                    >
-                      Client-credentials guide
-                    </Button>
-                  </Stack>
-                </Alert>
-              ) : null}
+              <IntegrationSetupJourney
+                title="Before you connect · Shopify setup"
+                description="Follow the provider steps in order. Expand this journey later to review the current nonsecret operating facts."
+                steps={[
+                  {
+                    key: 'shopify-app',
+                    label: 'Create, release, and install the app',
+                    state: shopifyAccount?.configured ? 'complete' : 'current',
+                    description:
+                      'Create the API-only app in the Shopify Dev Dashboard, release the required scopes, and install it on a store in the same Shopify organization. The default app home is expected for this server-to-server flow; it is not a ClawPilot sign-in URL.',
+                    facts: [
+                      {
+                        label: 'API-only app home',
+                        value: catalog?.onboarding.shopify.defaultAppUrl
+                          || 'Shopify default app home',
+                        copyable: Boolean(
+                          catalog?.onboarding.shopify.defaultAppUrl,
+                        ),
+                      },
+                      {
+                        label: 'Admin API version',
+                        value: catalog?.onboarding.shopify.apiVersion
+                          || 'Server configured',
+                      },
+                      {
+                        label: 'Store class',
+                        value: shopifyAccount?.environment
+                          || shopify.environment,
+                      },
+                    ],
+                    action: catalog ? (
+                      <Stack
+                        direction={{ xs: 'column', sm: 'row' }}
+                        spacing={1}
+                      >
+                        <Button
+                          href={catalog.onboarding.shopify.developerPortalUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          variant="outlined"
+                          size="small"
+                          endIcon={<OpenInNewRounded />}
+                        >
+                          Open Shopify Dev Dashboard
+                        </Button>
+                        <Button
+                          href={catalog.onboarding.shopify.setupGuideUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          variant="text"
+                          size="small"
+                          endIcon={<OpenInNewRounded />}
+                        >
+                          Shopify setup guide
+                        </Button>
+                        <Button
+                          href={catalog.onboarding.shopify.tokenGuideUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          variant="text"
+                          size="small"
+                          endIcon={<OpenInNewRounded />}
+                        >
+                          Client-credentials guide
+                        </Button>
+                      </Stack>
+                    ) : undefined,
+                  },
+                  {
+                    key: 'shopify-connect',
+                    label: 'Verify and save the store connection',
+                    state: shopifyConnectionState,
+                    description:
+                      'Enter the permanent myshopify.com domain and the installed app client credentials below. ClawPilot exchanges them server-side, verifies shop identity and scopes, and stores only encrypted credentials. Shopify Admin-created legacy apps and Admin API access tokens are not supported.',
+                    facts: [
+                      {
+                        label: 'Shop domain',
+                        value: shopifyDomain || 'Not entered',
+                        copyable: Boolean(shopifyDomain),
+                      },
+                      {
+                        label: 'ClawPilot integration ID',
+                        value: shopifyAccount?.globalId || 'Not allocated',
+                        copyable: Boolean(shopifyAccount?.globalId),
+                      },
+                      {
+                        label: 'Stored credential',
+                        value: maskedCommerceCredential(shopifyAccount),
+                      },
+                      {
+                        label: 'API verified',
+                        value: setupTimestamp(shopifyAccount?.verifiedAt),
+                      },
+                    ],
+                  },
+                  {
+                    key: 'shopify-preview',
+                    label: 'Inspect read-only order fit',
+                    state: shopifyPreviewState,
+                    description:
+                      'After read_orders is granted, fetch the held development preview to see mapping and package-readiness gaps before any canonical import is designed.',
+                    facts: [
+                      {
+                        label: 'Granted scopes',
+                        value: shopifyGrantedScopes.length
+                          ? `${shopifyGrantedScopes.length} provider-reported`
+                          : 'Not verified',
+                      },
+                      {
+                        label: 'Held preview',
+                        value: shopifyPreview?.run
+                          ? `${shopifyPreview.run.ordersStaged} orders · expires ${setupTimestamp(
+                            shopifyPreview.run.expiresAt,
+                          )}`
+                          : 'Not loaded',
+                      },
+                      {
+                        label: 'Canonical orders created',
+                        value: String(
+                          shopifyPreview?.run?.canonicalOrdersCreated || 0,
+                        ),
+                      },
+                      {
+                        label: 'Shopify writes',
+                        value: String(shopifyPreview?.run?.shopifyWrites || 0),
+                      },
+                    ],
+                  },
+                  {
+                    key: 'shopify-receipts',
+                    label: 'Enable signed receipt intake',
+                    state: shopifyReceiptState,
+                    optional: true,
+                    description:
+                      'Receipt intake is optional and separate from the API connection. It requires the receipt-proof scopes and one valid signed allowed-topic delivery; order/customer processing and domain workers remain off.',
+                    facts: [
+                      {
+                        label: 'Receipt intake',
+                        value: shopifyAccount?.status === 'active'
+                          ? 'Enabled'
+                          : 'Disabled',
+                      },
+                      {
+                        label: 'Webhook secret',
+                        value: shopifyAccount
+                          ? humanize(
+                            shopifyAccount.webhookVerificationStatus,
+                          )
+                          : 'Not verified',
+                      },
+                      {
+                        label: 'Signed receipts retained',
+                        value: String(
+                          shopifyAccount?.evidence.webhookReceipts || 0,
+                        ),
+                      },
+                      {
+                        label: 'Domain workers',
+                        value: catalog?.activationBoundary.domainWorkersActivated
+                          ? 'Activated'
+                          : 'Not activated',
+                      },
+                    ],
+                  },
+                ]}
+              />
               <TextField
                 label="Connection name"
                 value={shopify.displayName}
@@ -949,100 +1216,154 @@ export default function CommerceIntegrationPanel() {
                   request.
                 </Typography>
               </Box>
-              {catalog ? (
-                <Alert severity="info" icon={false}>
-                  <Typography variant="subtitle2" fontWeight={700}>
-                    Before you connect
-                  </Typography>
-                  <Box
-                    component="ol"
-                    sx={{
-                      pl: 2.5,
-                      my: 1,
-                      '& li': { mb: 0.5 },
-                    }}
-                  >
-                    {catalog.onboarding.faire.requiredBeforeConnect.map(
-                      (step) => (
-                        <Typography component="li" variant="body2" key={step}>
-                          {step}
-                        </Typography>
-                      ),
-                    )}
-                  </Box>
-                  <Typography variant="body2" color="text.secondary">
-                    ClawPilot never places the Secret ID in the Faire
-                    authorization URL. It encrypts the pending credential,
-                    sends the Application ID and requested permissions to
-                    Faire, then uses the Secret ID only on the server for the
-                    one-use code exchange. Faire documents no preliminary
-                    credential ping: the authorization redirect is the first
-                    provider interaction, and the Secret ID is validated only
-                    after Faire returns an authorization code. Faire separately
-                    documents a single-brand API-key flow but does not publicly
-                    explain whether its &quot;APA token&quot; is the same value
-                    as the OAuth Application ID. Use the values Faire labels
-                    for this OAuth flow. This ClawPilot form cannot accept the
-                    final brand API key produced by the separate flow. If Faire
-                    does not offer authorization for this Custom App, contact{' '}
-                    <code>{catalog.onboarding.faire.supportContact}</code>.
-                    The profile probe needs{' '}
-                    <code>{catalog.onboarding.faire.minimumProbeScope}</code>.
-                    Retailer accounts are ineligible, and Faire publishes no
-                    sandbox or webhook flow for this custom integration.
-                    The default connection-test profile requests only{' '}
-                    <code>READ_BRAND</code>. The explicit distributed-operations
-                    profile requests all ten documented OAuth permissions so
-                    the encrypted connection is ready for the scoped WMS/DOM
-                    capabilities shown below; selecting it does not activate
-                    any domain worker.
-                  </Typography>
-                  <TextField
-                    fullWidth
-                    label="ClawPilot OAuth callback URL"
-                    value={catalog.onboarding.faire.callbackUrl}
-                    helperText="This exact HTTPS URL is sent to Faire for authorization and token exchange. Use it if Faire asks for the app callback or redirect URL."
-                    InputProps={{ readOnly: true }}
-                    sx={{ ...fieldSx, mt: 1.5 }}
-                  />
-                  <Stack
-                    direction={{ xs: 'column', sm: 'row' }}
-                    spacing={1}
-                    sx={{ mt: 1.5 }}
-                  >
-                    <Button
-                      href={catalog.onboarding.faire.developerPortalUrl}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      variant="outlined"
-                      size="small"
-                      endIcon={<OpenInNewRounded />}
-                    >
-                      Open Faire developer portal
-                    </Button>
-                    <Button
-                      href={catalog.onboarding.faire.setupGuideUrl}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      variant="text"
-                      size="small"
-                      endIcon={<OpenInNewRounded />}
-                    >
-                      Faire OAuth guide
-                    </Button>
-                    <Button
-                      href={catalog.onboarding.faire.directTokenGuideUrl}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      variant="text"
-                      size="small"
-                      endIcon={<OpenInNewRounded />}
-                    >
-                      Single-brand guide — not connectable here
-                    </Button>
-                  </Stack>
-                </Alert>
-              ) : null}
+              <IntegrationSetupJourney
+                title="Before you connect · Faire setup"
+                description="Faire exposes more than one provider-side path. This journey identifies the path ClawPilot can complete and the facts an administrator should verify."
+                steps={[
+                  {
+                    key: 'faire-path',
+                    label: 'Choose the Faire connection path',
+                    state: faireAccount?.configured ? 'complete' : 'current',
+                    description:
+                      'This form supports Faire Custom App OAuth using the Application ID and Secret ID. Faire separately documents a single-brand API-key flow. If the brand portal shows Email partner or Generate API key, that is the separate APA-token/final-key path and the generated key is not connectable here.',
+                    facts: [
+                      {
+                        label: 'ClawPilot auth mode',
+                        value: faireAccount?.authMode
+                          || 'Faire Custom App OAuth',
+                      },
+                      {
+                        label: 'Provider environment',
+                        value: 'Faire production · no public sandbox',
+                      },
+                    ],
+                    action: catalog ? (
+                      <Stack
+                        direction={{ xs: 'column', sm: 'row' }}
+                        spacing={1}
+                      >
+                        <Button
+                          href={catalog.onboarding.faire.developerPortalUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          variant="outlined"
+                          size="small"
+                          endIcon={<OpenInNewRounded />}
+                        >
+                          Open Faire developer portal
+                        </Button>
+                        <Button
+                          href={catalog.onboarding.faire.setupGuideUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          variant="text"
+                          size="small"
+                          endIcon={<OpenInNewRounded />}
+                        >
+                          Faire OAuth guide
+                        </Button>
+                        <Button
+                          href={catalog.onboarding.faire.directTokenGuideUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          variant="text"
+                          size="small"
+                          endIcon={<OpenInNewRounded />}
+                        >
+                          Single-brand guide — not connectable here
+                        </Button>
+                      </Stack>
+                    ) : undefined,
+                  },
+                  {
+                    key: 'faire-app',
+                    label: 'Configure the Custom App',
+                    state: faireAccount?.configured ? 'complete' : 'current',
+                    description:
+                      'Copy the Application ID and Secret ID from App Details and Settings. OAuth eligibility only when it accepts the authorization is the provider proof; there is no documented preliminary server ping.',
+                    facts: [
+                      {
+                        label: 'ClawPilot OAuth callback URL',
+                        value: catalog?.onboarding.faire.callbackUrl
+                          || 'Load the hosted callback before continuing',
+                        copyable: Boolean(
+                          catalog?.onboarding.faire.callbackUrl,
+                        ),
+                      },
+                      {
+                        label: 'Permission profile',
+                        value: faire.scopeProfile === 'connection_test'
+                          ? 'Connection test · READ_BRAND'
+                          : 'Distributed operations · 10 permissions',
+                      },
+                      {
+                        label: 'Minimum identity probe',
+                        value: catalog?.onboarding.faire.minimumProbeScope
+                          || 'READ_BRAND',
+                      },
+                      {
+                        label: 'Provider support',
+                        value: catalog
+                          ? catalog.onboarding.faire.supportContact
+                          : 'Faire Developer Support',
+                      },
+                    ],
+                  },
+                  {
+                    key: 'faire-authorize',
+                    label: 'Authorize the intended brand',
+                    state: faireConnectionState,
+                    description:
+                      'Enter the application credentials below, continue to Faire, approve the intended brand, and return through the one-use callback. ClawPilot exchanges the code server-side and verifies the brand profile before encrypted persistence.',
+                    facts: [
+                      {
+                        label: 'Faire brand ID',
+                        value: faireAccount?.externalAccountId || 'Not verified',
+                        copyable: Boolean(faireAccount?.externalAccountId),
+                      },
+                      {
+                        label: 'ClawPilot integration ID',
+                        value: faireAccount?.globalId || 'Not allocated',
+                        copyable: Boolean(faireAccount?.globalId),
+                      },
+                      {
+                        label: 'Stored credential',
+                        value: maskedCommerceCredential(faireAccount),
+                      },
+                      {
+                        label: 'API verified',
+                        value: setupTimestamp(faireAccount?.verifiedAt),
+                      },
+                    ],
+                  },
+                  {
+                    key: 'faire-sync',
+                    label: 'Activate polling and domain processing',
+                    state: 'pending',
+                    optional: true,
+                    description:
+                      'Synchronization is not available in this slice. A verified Faire credential does not activate product, inventory, order, shipment, or review workers.',
+                    facts: [
+                      {
+                        label: 'Synchronization',
+                        value: 'Unavailable',
+                      },
+                      {
+                        label: 'Provider attempts',
+                        value: String(
+                          faireAccount?.evidence.providerAttempts || 0,
+                        ),
+                      },
+                      {
+                        label: 'Domain workers',
+                        value: catalog?.activationBoundary.domainWorkersActivated
+                          ? 'Activated'
+                          : 'Not activated',
+                      },
+                    ],
+                  },
+                ]}
+              />
               <TextField
                 label="Connection name"
                 value={faire.displayName}
@@ -1159,6 +1480,22 @@ export default function CommerceIntegrationPanel() {
                 account.configuration.missingScopes,
               )
               const preview = shopifyPreviews[account.globalId]
+              const revealed = revealedCredential?.accountGlobalId
+                === account.globalId
+                ? revealedCredential
+                : null
+              const revealedIdentifier = account.provider === 'shopify'
+                ? revealed?.clientId
+                : revealed?.applicationId
+              const revealedSecret = account.provider === 'shopify'
+                ? revealed?.clientSecret
+                : revealed?.applicationSecret
+              const revealedIdentifierLabel = account.provider === 'shopify'
+                ? 'Shopify client ID'
+                : 'Faire Application ID'
+              const revealedSecretLabel = account.provider === 'shopify'
+                ? 'Shopify client secret'
+                : 'Faire Secret ID'
               const canPreviewShopifyOrders = account.provider === 'shopify'
                 && account.environment === 'sandbox'
                 && account.configured
@@ -1737,6 +2074,25 @@ export default function CommerceIntegrationPanel() {
                             ? 'Testing…'
                             : 'Test connection'}
                         </Button>
+                        {canRevealCredentials ? (
+                          <Button
+                            variant="outlined"
+                            startIcon={pendingAction
+                              === `reveal:${account.globalId}`
+                              ? <CircularProgress size={16} color="inherit" />
+                              : <VisibilityRounded />}
+                            disabled={
+                              pendingAction !== ''
+                              || !account.configured
+                            }
+                            onClick={() => {
+                              void revealCredential(account)
+                            }}
+                            sx={actionButtonSx}
+                          >
+                            Reveal credentials
+                          </Button>
+                        ) : null}
                         {account.provider === 'shopify'
                           && account.configured
                           && account.status !== 'active' ? (
@@ -1793,6 +2149,113 @@ export default function CommerceIntegrationPanel() {
                           Disconnect credential
                         </Button>
                       </Stack>
+
+                      {revealed
+                        && revealedIdentifier
+                        && revealedSecret ? (
+                        <Alert
+                          severity="warning"
+                          sx={{
+                            borderRadius: '8px',
+                            alignItems: 'flex-start',
+                          }}
+                          action={(
+                            <Tooltip title="Hide credentials">
+                              <IconButton
+                                color="inherit"
+                                size="small"
+                                onClick={() => setRevealedCredential(null)}
+                                aria-label={`Hide ${providerLabel(
+                                  account.provider,
+                                )} credentials`}
+                              >
+                                <VisibilityOffRounded fontSize="small" />
+                              </IconButton>
+                            </Tooltip>
+                          )}
+                        >
+                          <Typography variant="body2" fontWeight={700}>
+                            Visible for 30 seconds
+                          </Typography>
+                          <Typography variant="caption" color="inherit">
+                            Current generation {revealed.credentialVersion} only.
+                            This owning-organization administrator reveal was
+                            recorded in organization activity. Provider access
+                            and refresh tokens are never revealable. Copy only
+                            to a trusted system; operating-system clipboard
+                            contents are outside ClawPilot and do not
+                            automatically clear.
+                          </Typography>
+                          <Box
+                            sx={{
+                              display: 'grid',
+                              gridTemplateColumns: {
+                                xs: '1fr',
+                                sm: '1fr 1fr',
+                              },
+                              gap: 1.5,
+                              mt: 1.5,
+                            }}
+                          >
+                            <TextField
+                              label={revealedIdentifierLabel}
+                              value={revealedIdentifier}
+                              InputProps={{
+                                readOnly: true,
+                                endAdornment: (
+                                  <InputAdornment position="end">
+                                    <Tooltip
+                                      title={`Copy ${revealedIdentifierLabel}`}
+                                    >
+                                      <IconButton
+                                        edge="end"
+                                        onClick={() => {
+                                          void copyRevealedCredential(
+                                            revealedIdentifierLabel,
+                                            revealedIdentifier,
+                                          )
+                                        }}
+                                        aria-label={`Copy ${revealedIdentifierLabel}`}
+                                      >
+                                        <ContentCopyRounded fontSize="small" />
+                                      </IconButton>
+                                    </Tooltip>
+                                  </InputAdornment>
+                                ),
+                              }}
+                              sx={fieldSx}
+                            />
+                            <TextField
+                              label={revealedSecretLabel}
+                              value={revealedSecret}
+                              InputProps={{
+                                readOnly: true,
+                                endAdornment: (
+                                  <InputAdornment position="end">
+                                    <Tooltip
+                                      title={`Copy ${revealedSecretLabel}`}
+                                    >
+                                      <IconButton
+                                        edge="end"
+                                        onClick={() => {
+                                          void copyRevealedCredential(
+                                            revealedSecretLabel,
+                                            revealedSecret,
+                                          )
+                                        }}
+                                        aria-label={`Copy ${revealedSecretLabel}`}
+                                      >
+                                        <ContentCopyRounded fontSize="small" />
+                                      </IconButton>
+                                    </Tooltip>
+                                  </InputAdornment>
+                                ),
+                              }}
+                              sx={fieldSx}
+                            />
+                          </Box>
+                        </Alert>
+                      ) : null}
 
                       <Typography variant="caption" color="text.secondary">
                         Evidence: {account.evidence.webhookReceipts} webhook
@@ -1916,8 +2379,10 @@ export default function CommerceIntegrationPanel() {
         Shopify custom integrations exchange merchant-owned Dev Dashboard app
         credentials for short-lived tokens when needed. Faire Custom Apps use
         an authorization-code exchange and both provider-required OAuth headers
-        after the brand approves access. Encrypted credentials are write-only
-        and are never returned by this page.
+        after the brand approves access. Application credentials are encrypted
+        and masked by default; an authorized owning-organization administrator
+        can request an audited 30-second reveal of the current generation.
+        Provider access and refresh tokens are never returned.
       </Typography>
     </Stack>
   )

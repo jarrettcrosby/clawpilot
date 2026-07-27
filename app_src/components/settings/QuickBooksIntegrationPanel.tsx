@@ -36,6 +36,7 @@ import RestaurantRounded from '@mui/icons-material/RestaurantRounded'
 import SaveRounded from '@mui/icons-material/SaveRounded'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import { formatUserDateTime } from '@/lib/userDateTime'
+import IntegrationSetupJourney from '@/components/settings/IntegrationSetupJourney'
 
 type ConnectionState = {
   configured: boolean
@@ -292,6 +293,122 @@ export default function QuickBooksIntegrationPanel() {
           />
         ) : null}
       </Stack>
+
+      <Box sx={{ mt: 2 }}>
+        <IntegrationSetupJourney
+          description="Bind the selected Maton company, verify catalog access, then opt into the specific accounting projections this organization uses."
+          steps={[
+            {
+              key: 'quickbooks-select',
+              label: 'Select the QuickBooks company in Maton',
+              state: integration.connection.configured
+                ? 'complete'
+                : 'current',
+              description:
+                'QuickBooks authorization is managed through Maton. Select the intended company there before binding it to the active ClawPilot organization.',
+              facts: [
+                {
+                  label: 'Selected company',
+                  value: integration.connection.companyName
+                    || 'No company bound',
+                },
+                {
+                  label: 'Country',
+                  value: integration.connection.country || 'Not reported',
+                },
+              ],
+            },
+            {
+              key: 'quickbooks-bind',
+              label: 'Bind and verify the organization connection',
+              state: integration.connection.configured
+                && integration.connection.status === 'active'
+                ? 'complete'
+                : integration.connection.configured
+                  ? 'attention'
+                  : 'pending',
+              description:
+                'The bind action scopes the selected provider connection to this organization and queues the initial safe catalog refresh.',
+              facts: [
+                {
+                  label: 'Connection status',
+                  value: integration.connection.status || 'Not connected',
+                },
+                {
+                  label: 'Verified',
+                  value: integration.connection.verifiedAt
+                    ? formatUserDateTime(
+                      integration.connection.verifiedAt,
+                      dateTimeSettings,
+                    )
+                    : 'Not yet',
+                },
+              ],
+            },
+            {
+              key: 'quickbooks-catalog',
+              label: 'Refresh and review the catalog',
+              state: integration.connection.lastCatalogSyncedAt
+                ? 'complete'
+                : integration.connection.configured
+                  ? 'current'
+                  : 'pending',
+              description:
+                'Review the returned account and item counts before selecting records for CRM or accounting use.',
+              facts: [
+                {
+                  label: 'Accounts',
+                  value: String(integration.counts.accounts),
+                },
+                {
+                  label: 'Items',
+                  value: String(integration.counts.items),
+                },
+                {
+                  label: 'Latest refresh',
+                  value: lastSync || 'Not completed',
+                },
+                {
+                  label: 'Queue status',
+                  value: integration.sync?.status || 'No active refresh',
+                },
+              ],
+            },
+            {
+              key: 'quickbooks-uses',
+              label: 'Configure downstream accounting uses',
+              state: integration.mappings.length
+                || integration.crmSync.customerSyncEnabled
+                || integration.crmSync.productSyncEnabled
+                ? 'complete'
+                : integration.connection.configured
+                  ? 'current'
+                  : 'pending',
+              optional: true,
+              description:
+                'CRM catalog projection, Toast mappings, and reviewed accounting drafts remain separate opt-in workflows.',
+              facts: [
+                {
+                  label: 'Toast mappings',
+                  value: String(integration.mappings.length),
+                },
+                {
+                  label: 'CRM customer sync',
+                  value: integration.crmSync.customerSyncEnabled
+                    ? 'Enabled'
+                    : 'Disabled',
+                },
+                {
+                  label: 'CRM product sync',
+                  value: integration.crmSync.productSyncEnabled
+                    ? 'Enabled'
+                    : 'Disabled',
+                },
+              ],
+            },
+          ]}
+        />
+      </Box>
 
       <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} mt={2}>
         {!integration.connection.configured ? (

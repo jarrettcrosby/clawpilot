@@ -38,6 +38,7 @@ import VisibilityOffRounded from '@mui/icons-material/VisibilityOffRounded'
 import VisibilityRounded from '@mui/icons-material/VisibilityRounded'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import { formatUserDateTime } from '@/lib/userDateTime'
+import IntegrationSetupJourney from '@/components/settings/IntegrationSetupJourney'
 
 type CarrierProvider = 'ups_rest' | 'fedex_rest' | 'usps_rest'
 type CarrierEnvironment = 'sandbox' | 'production'
@@ -501,6 +502,105 @@ export default function CarrierIntegrationPanel() {
           </span>
         </Tooltip>
       </Stack>
+
+      <Box sx={{ mt: 2 }}>
+        <IntegrationSetupJourney
+          description="Scope the provider lane, verify its credential, bind a billing identity, and activate only after the safe test boundary is ready."
+          steps={[
+            {
+              key: 'carrier-scope',
+              label: 'Choose provider and environment',
+              state: 'complete',
+              description:
+                'Provider and sandbox/production are independent credential lanes. Changing either selection updates every later setup fact.',
+              facts: [
+                { label: 'Provider', value: providerLabel(provider) },
+                {
+                  label: 'Environment',
+                  value: environment === 'sandbox'
+                    ? 'Sandbox / developer'
+                    : 'Production',
+                },
+              ],
+            },
+            {
+              key: 'carrier-credential',
+              label: 'Save and verify provider credentials',
+              state: account?.verificationStatus === 'verified'
+                ? 'complete'
+                : account?.configured
+                  ? 'attention'
+                  : 'current',
+              description:
+                'ClawPilot verifies the provider identity before the credential can be activated. Secret values remain masked unless an authorized audited reveal is requested.',
+              facts: [
+                {
+                  label: 'ClawPilot integration ID',
+                  value: account?.globalId || 'Not allocated',
+                  copyable: Boolean(account?.globalId),
+                },
+                {
+                  label: 'Stored credential',
+                  value: account?.configured
+                    ? `Version ${account.credentialVersion} · client ••••${
+                      account.clientIdLastFour || 'unknown'
+                    }`
+                    : 'Not stored',
+                },
+                {
+                  label: 'Verified',
+                  value: verifiedLabel || 'Not yet',
+                },
+              ],
+            },
+            {
+              key: 'carrier-billing',
+              label: 'Add the carrier billing account',
+              state: activeCarrierAccounts.length
+                ? 'complete'
+                : account?.verificationStatus === 'verified'
+                  ? 'current'
+                  : 'pending',
+              description:
+                'The account number, registered address, sender name, and payer roles are operational identity; they are separate from the API credential.',
+              facts: [
+                {
+                  label: 'Active billing accounts',
+                  value: String(activeCarrierAccounts.length),
+                },
+                {
+                  label: 'Selected billing account',
+                  value: selectedCarrierAccountGlobalId || 'Not selected',
+                  copyable: Boolean(selectedCarrierAccountGlobalId),
+                },
+              ],
+            },
+            {
+              key: 'carrier-activate',
+              label: 'Activate and validate',
+              state: account?.status === 'active'
+                ? 'complete'
+                : account?.verificationStatus === 'verified'
+                  && activeCarrierAccounts.length
+                  ? 'current'
+                  : 'pending',
+              description:
+                'Activation is explicit. Sandbox rating remains read-only and cannot create a shipment, label, pickup, or charge.',
+              facts: [
+                {
+                  label: 'Integration status',
+                  value: account?.status || 'Not connected',
+                },
+                {
+                  label: 'Latest sandbox evidence',
+                  value: rateTest?.evidenceGlobalId || 'No rate test loaded',
+                  copyable: Boolean(rateTest?.evidenceGlobalId),
+                },
+              ],
+            },
+          ]}
+        />
+      </Box>
 
       <Tabs
         value={provider}

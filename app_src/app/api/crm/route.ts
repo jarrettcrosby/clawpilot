@@ -18,6 +18,7 @@ import {
   listCrmRecordsInPostgres,
   readCrmRecordReference,
   readCrmSummaryFromPostgres,
+  isRecoverableCrmProfileReconciliationError,
   stageCrmRecordInPostgres,
   syncAppUserProfileToCrm,
 } from '@/lib/persistence/crm'
@@ -169,7 +170,15 @@ export async function GET(req: NextRequest) {
     const organizationRole = effectiveAuthorizationRole(actor)
     const canOpenSuiteCrm = (organizationRole === 'owner' || organizationRole === 'admin')
       && currentOrganization?.parentId === null
-    await syncAppUserProfileToCrm({ email: actor.email, pipelineId: pipeline.id })
+    try {
+      await syncAppUserProfileToCrm({ email: actor.email, pipelineId: pipeline.id })
+    } catch (error) {
+      if (!isRecoverableCrmProfileReconciliationError(error)) throw error
+      console.error('[crm] profile reconciliation deferred', {
+        pipelineId: pipeline.id,
+        error: error instanceof Error ? error.message : 'unknown error',
+      })
+    }
     await ensurePipelineCrmReferenceLinks(pipeline.id)
     const [records, summary, workspaceHierarchy, matonCredential, pipelineUsers, campaignRecipients] = await Promise.all([
       listCrmRecordsInPostgres({

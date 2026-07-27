@@ -28,6 +28,7 @@ import SaveRounded from '@mui/icons-material/SaveRounded'
 import UploadFileRounded from '@mui/icons-material/UploadFileRounded'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import { formatUserDateTime, type UserDateTimeSettings } from '@/lib/userDateTime'
+import IntegrationSetupJourney from '@/components/settings/IntegrationSetupJourney'
 
 type GoogleIntegrationState = {
   configured: boolean
@@ -353,6 +354,96 @@ export default function GoogleWorkspaceIntegrationPanel() {
           </Button>
         </Stack>
       </Stack>
+
+      <Box sx={{ mt: 2 }}>
+        <IntegrationSetupJourney
+          description="Add the two credential parts, select the operator-owned Shared Drive, and verify the complete workspace boundary."
+          steps={[
+            {
+              key: 'google-api-key',
+              label: 'Save the Google API key',
+              state: integration.apiKeyConfigured ? 'complete' : 'current',
+              description:
+                'The API key supports bounded public API requests. The saved value remains masked in Settings.',
+              facts: [
+                {
+                  label: 'Saved key',
+                  value: integration.apiKeyLastFour
+                    ? `••••${integration.apiKeyLastFour}`
+                    : 'Not stored',
+                },
+              ],
+            },
+            {
+              key: 'google-service-account',
+              label: 'Upload the service account',
+              state: integration.serviceAccountConfigured
+                ? 'complete'
+                : integration.apiKeyConfigured
+                  ? 'current'
+                  : 'pending',
+              description:
+                'Upload the service-account JSON. ClawPilot stores the private credential encrypted and exposes only nonsecret identity facts.',
+              facts: [
+                {
+                  label: 'Service account',
+                  value: integration.serviceAccountEmail || 'Not configured',
+                  copyable: Boolean(integration.serviceAccountEmail),
+                },
+                {
+                  label: 'Google Cloud project',
+                  value: integration.projectId || 'Not configured',
+                  copyable: Boolean(integration.projectId),
+                },
+                {
+                  label: 'Credential version',
+                  value: integration.credentialVersion
+                    ? String(integration.credentialVersion)
+                    : 'Not allocated',
+                },
+              ],
+            },
+            {
+              key: 'google-shared-drive',
+              label: 'Select the writable Shared Drive',
+              state: integration.sharedDriveConfigured
+                ? 'complete'
+                : integration.serviceAccountConfigured
+                  ? 'current'
+                  : 'pending',
+              description:
+                'The selected Shared Drive is the writable operator table boundary. Inherited drive access remains governed by Google.',
+              facts: [
+                {
+                  label: 'Shared Drive',
+                  value: integration.sharedDriveName || 'Not selected',
+                },
+              ],
+            },
+            {
+              key: 'google-verify',
+              label: 'Test the complete connection',
+              state: integration.ready
+                ? 'complete'
+                : integration.configured
+                  ? 'attention'
+                  : 'pending',
+              description:
+                'The final test verifies the service identity and selected drive without exposing credential material.',
+              facts: [
+                {
+                  label: 'Connection state',
+                  value: readinessLabel(integration),
+                },
+                {
+                  label: 'Verified',
+                  value: verifiedAt || 'Not yet',
+                },
+              ],
+            },
+          ]}
+        />
+      </Box>
 
       <Divider sx={{ my: 3, borderColor: 'rgba(255,255,255,0.08)' }} />
 

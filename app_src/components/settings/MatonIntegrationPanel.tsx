@@ -28,6 +28,7 @@ import RefreshRounded from '@mui/icons-material/RefreshRounded'
 import SaveRounded from '@mui/icons-material/SaveRounded'
 import TableChartRounded from '@mui/icons-material/TableChartRounded'
 import type { SvgIconComponent } from '@mui/icons-material'
+import IntegrationSetupJourney from '@/components/settings/IntegrationSetupJourney'
 
 type ApiPayload = {
   ok?: boolean
@@ -498,6 +499,86 @@ export default function MatonIntegrationPanel({
             Disconnect
           </Button>
         </Stack>
+      </Box>
+
+      <Box sx={{ mt: 2 }}>
+        <IntegrationSetupJourney
+          description="Establish the Maton account boundary, save its API key, then authorize only the provider connections ClawPilot should use."
+          steps={[
+            {
+              key: 'maton-account',
+              label: 'Save the Maton account identity',
+              state: savedLoginEmail ? 'complete' : 'current',
+              description:
+                'The login email identifies the operator-owned Maton account. It is not used as a provider credential.',
+              facts: [
+                {
+                  label: 'Maton login',
+                  value: savedLoginEmail || 'Not saved',
+                  copyable: Boolean(savedLoginEmail),
+                },
+                {
+                  label: 'Administration',
+                  value: isOwner ? 'Owner controls available' : 'Read only',
+                },
+              ],
+            },
+            {
+              key: 'maton-key',
+              label: 'Save the Maton API key',
+              state: hasApiKey
+                ? 'complete'
+                : savedLoginEmail
+                  ? 'current'
+                  : 'pending',
+              description:
+                'The key is encrypted and masked by default. ClawPilot uses it only to enumerate or create approved Maton connections.',
+              facts: [
+                {
+                  label: 'Saved key',
+                  value: integration?.keyLastFour
+                    ? `••••${integration.keyLastFour}`
+                    : 'Not stored',
+                },
+                {
+                  label: 'Platform credential fallback',
+                  value: integration?.platformCredentialAvailable
+                    ? 'Available'
+                    : 'Unavailable',
+                },
+              ],
+            },
+            {
+              key: 'maton-connections',
+              label: 'Authorize provider connections',
+              state: integration?.connections.length
+                ? 'complete'
+                : hasApiKey
+                  ? 'current'
+                  : 'pending',
+              description:
+                'Create or refresh the specific third-party connections needed by this organization. Each connection keeps its provider identity and status.',
+              facts: [
+                {
+                  label: 'Available connections',
+                  value: String(integration?.connections.length || 0),
+                },
+                {
+                  label: 'Default connection',
+                  value: integration?.connections.find(
+                    (connection) => connection.isDefault,
+                  )?.label || 'Not selected',
+                },
+                {
+                  label: 'Default connection ID',
+                  value: integration?.connections.find(
+                    (connection) => connection.isDefault,
+                  )?.maskedId || 'Not available',
+                },
+              ],
+            },
+          ]}
+        />
       </Box>
 
       <Divider sx={{ my: 3, borderColor: 'rgba(255,255,255,0.08)' }} />
