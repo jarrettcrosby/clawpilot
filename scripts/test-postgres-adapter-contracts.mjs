@@ -1553,6 +1553,8 @@ assertIncludes(healthRoute, '0135_operations_hybrid_cartonization_recipes.sql', 
 assertIncludes(healthRoute, '0136_operations_cartonization_package_rates.sql', 'hosted cartonization package rate migration health')
 assertIncludes(healthRoute, '0137_operations_cartonization_rate_evidence.sql', 'hosted cartonization rate evidence migration health')
 assertIncludes(healthRoute, '0138_operations_cartonization_rate_evidence_integrity.sql', 'hosted cartonization rate evidence integrity migration health')
+assertIncludes(healthRoute, '0139_operations_fulfilled_line_price_state.sql', 'hosted fulfilled commerce-line price-state migration health')
+assertIncludes(healthRoute, '0140_operations_commerce_packaging_source_constraint.sql', 'hosted commerce packaging-source repair migration health')
 for (const [, alias] of healthRoute.matchAll(/\)\s+AS\s+([a-z0-9_]+)\s*,?/gi)) {
   assert.ok(
     alias.length <= 63,
@@ -1592,6 +1594,20 @@ for (const fragment of [
     commercePackResolutionMigration,
     fragment,
     'commerce pack resolution provenance',
+  )
+}
+const commercePackagingSourceRepairMigration = read(
+  'db/migrations/0140_operations_commerce_packaging_source_constraint.sql',
+)
+for (const fragment of [
+  'operations_commerce_order_candidate_line_packaging_source_check',
+  'DROP CONSTRAINT IF EXISTS commerce_order_lines_packaging_source_valid',
+  "'variant_pack_mapping'",
+]) {
+  assertIncludes(
+    commercePackagingSourceRepairMigration,
+    fragment,
+    'commerce packaging-source generated-constraint repair',
   )
 }
 const hybridCartonizationRecipeMigration = read(

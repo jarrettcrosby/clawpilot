@@ -290,6 +290,8 @@ export async function GET() {
           operations_cartonization_package_rates_migration_applied: boolean
           operations_cartonization_rate_evidence_migration_applied: boolean
           operations_cartonization_rate_evidence_integrity_applied: boolean
+          operations_fulfilled_line_price_state_applied: boolean
+          operations_commerce_packaging_source_repair_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -895,6 +897,16 @@ export async function GET() {
                 FROM schema_migrations
                 WHERE filename = '0138_operations_cartonization_rate_evidence_integrity.sql'
               ) AS operations_cartonization_rate_evidence_integrity_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0139_operations_fulfilled_line_price_state.sql'
+              ) AS operations_fulfilled_line_price_state_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0140_operations_commerce_packaging_source_constraint.sql'
+              ) AS operations_commerce_packaging_source_repair_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -1027,6 +1039,8 @@ export async function GET() {
             && row?.operations_cartonization_package_rates_migration_applied
             && row?.operations_cartonization_rate_evidence_migration_applied
             && row?.operations_cartonization_rate_evidence_integrity_applied
+            && row?.operations_fulfilled_line_price_state_applied
+            && row?.operations_commerce_packaging_source_repair_applied
             && row?.migration_checksums_present
           ),
         }
@@ -1151,6 +1165,8 @@ export async function GET() {
           || !row?.operations_cartonization_package_rates_migration_applied
           || !row?.operations_cartonization_rate_evidence_migration_applied
           || !row?.operations_cartonization_rate_evidence_integrity_applied
+          || !row?.operations_fulfilled_line_price_state_applied
+          || !row?.operations_commerce_packaging_source_repair_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')
