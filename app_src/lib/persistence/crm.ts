@@ -10,6 +10,11 @@ import {
   stableSuiteCrmId,
 } from '@/lib/crm/stableId'
 import { crmDateOnly } from '@/lib/crm/dateOnly.mjs'
+import {
+  DEFAULT_WORKSPACE_CURRENCY_CODE,
+  isIso4217CurrencyCode,
+  normalizeCurrencyCode,
+} from '@/lib/currency'
 import type {
   CrmActivityStatus,
   CrmContact,
@@ -757,6 +762,14 @@ async function enqueueSuiteCrmRecord(
       ? { previousSuiteCrmModule }
       : {}),
     attributes: suiteCrmAttributes(input, referenceCode),
+    ...(input.entity === 'products'
+      ? {
+        currencyCode: normalizeCurrencyCode(
+          input.fields.currency,
+          DEFAULT_WORKSPACE_CURRENCY_CODE,
+        ),
+      }
+      : {}),
     ...(relationships.length > 0 ? { relationships } : {}),
   }
   const operation = moduleTransition && previousSuiteCrmModule
@@ -1075,8 +1088,11 @@ async function stageContact(
 
 async function stageProduct(client: PoolClient, input: StageProductInput, suiteCrmId: string, sourceHash: string) {
   const fields = input.fields
-  const currency = clean(fields.currency).toUpperCase() || 'USD'
-  if (!/^[A-Z]{3}$/.test(currency)) throw new Error('CRM product currency is invalid')
+  const currency = clean(fields.currency).toUpperCase()
+    || DEFAULT_WORKSPACE_CURRENCY_CODE
+  if (!isIso4217CurrencyCode(currency)) {
+    throw new Error('CRM product currency must be a supported ISO 4217 code')
+  }
   const sku = clean(fields.sku)
   if (sku.length > 25) throw new Error('CRM product SKU must be 25 characters or fewer')
   const result = await client.query<{ id: string; suitecrm_id: string; reference_code: string }>(
@@ -4153,6 +4169,17 @@ async function ensurePipelineCatalogProducts(
   return withTransaction(async (client) => {
     let productsChanged = false
     await lockCrmMutation(client, `pipeline-catalog-products:${context.pipelineId}`)
+    const preference = await client.query<{ currency_code: string | null }>(
+      `SELECT currency_code
+       FROM workspace_organization_preferences
+       WHERE organization_id = $1::uuid
+       LIMIT 1`,
+      [context.workspaceOrganizationId],
+    )
+    const organizationCurrencyCode = normalizeCurrencyCode(
+      preference.rows[0]?.currency_code,
+      DEFAULT_WORKSPACE_CURRENCY_CODE,
+    )
     const state = await client.query<{ catalog: unknown }>(
       `SELECT COALESCE(dropdowns.catalog, setting.value) AS catalog
        FROM pipeline_spaces pipeline
@@ -4215,7 +4242,7 @@ async function ensurePipelineCatalogProducts(
         fields: {
           name: candidate.name,
           status: 'Active',
-          currency: 'USD',
+          currency: organizationCurrencyCode,
           active: true,
         },
       })
@@ -4528,6 +4555,7 @@ export async function upsertPipelineCatalogProductInPostgres(input: {
   pipelineId: string
   actorEmail: string
   id?: string | null
+  defaultCurrencyCode?: string
   fields: StageProductInput['fields']
   packaging?: ProductPackagingProfileInput | null
   deferDropdownSync?: boolean
@@ -4555,6 +4583,17 @@ export async function upsertPipelineCatalogProductInPostgres(input: {
     }
     const row = matches.rows[0]
     if (input.id && !row) throw new Error('Pipeline product was not found')
+    const requestedDefaultCurrency = clean(input.defaultCurrencyCode).toUpperCase()
+      || DEFAULT_WORKSPACE_CURRENCY_CODE
+    if (!isIso4217CurrencyCode(requestedDefaultCurrency)) {
+      throw new Error('Pipeline product default currency must be a supported ISO 4217 code')
+    }
+    const currency = clean(input.fields.currency).toUpperCase()
+      || clean(row?.currency).toUpperCase()
+      || requestedDefaultCurrency
+    if (!isIso4217CurrencyCode(currency)) {
+      throw new Error('CRM product currency must be a supported ISO 4217 code')
+    }
     const collision = await client.query(
       `SELECT 1
        FROM crm_products
@@ -4582,7 +4621,10 @@ export async function upsertPipelineCatalogProductInPostgres(input: {
         source: 'clawpilot_pipeline_catalog',
         workspaceOrganizationId: context.workspaceOrganizationId,
       },
-      fields: input.fields,
+      fields: {
+        ...input.fields,
+        currency,
+      },
     })
     const saved = await client.query<Record<string, unknown>>(
       `SELECT * FROM crm_products WHERE pipeline_id = $1::uuid AND id = $2::uuid LIMIT 1`,

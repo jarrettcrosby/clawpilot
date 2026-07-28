@@ -1,6 +1,11 @@
 import type { PoolClient } from 'pg'
 import { recordAuditEvent } from '@/lib/auditWriter'
 import {
+  DEFAULT_WORKSPACE_CURRENCY_CODE,
+  isIso4217CurrencyCode,
+  normalizeCurrencyCode,
+} from '@/lib/currency'
+import {
   DEFAULT_MEASUREMENT_SYSTEM,
   isMeasurementSystem,
   type MeasurementPreferenceSnapshot,
@@ -16,6 +21,7 @@ import {
 type MeasurementPreferenceRow = {
   organization_id: string
   organization_measurement_system: string | null
+  organization_currency_code: string | null
   organization_revision: string | number | null
   organization_preference_present: boolean
   user_measurement_system_override: string | null
@@ -36,6 +42,8 @@ const preferenceProjection = `
   SELECT membership.organization_id::text,
     organization_preference.measurement_system
       AS organization_measurement_system,
+    organization_preference.currency_code
+      AS organization_currency_code,
     organization_preference.revision::text
       AS organization_revision,
     (organization_preference.organization_id IS NOT NULL)
@@ -79,6 +87,18 @@ function requireMeasurementSystem(value: unknown): MeasurementSystem {
   return value
 }
 
+function requireCurrencyCode(value: unknown): string {
+  const normalized = String(value ?? '').trim().toUpperCase()
+  if (!isIso4217CurrencyCode(normalized)) {
+    throw new MeasurementPreferenceError(
+      'Currency must be a supported ISO 4217 code',
+      400,
+      'currency_code_invalid',
+    )
+  }
+  return normalized
+}
+
 function toMeasurementPreferences(
   row: MeasurementPreferenceRow,
 ): MeasurementPreferenceSnapshot {
@@ -97,6 +117,10 @@ function toMeasurementPreferences(
     measurementSystem: userOverride || organizationDefault,
     effectiveSource,
     organizationDefault,
+    organizationCurrencyCode: normalizeCurrencyCode(
+      row.organization_currency_code,
+      DEFAULT_WORKSPACE_CURRENCY_CODE,
+    ),
     organizationRevision: Number.isSafeInteger(revision) && revision >= 1 ? revision : 1,
     userOverride,
   }
@@ -244,13 +268,19 @@ export async function updateOrganizationMeasurementDefault(input: {
       `INSERT INTO workspace_organization_preferences (
          organization_id,
          measurement_system,
+         currency_code,
          revision,
          updated_by,
          created_at,
          updated_at
-       ) VALUES ($1::uuid, $2, 1, $3, now(), now())
+       ) VALUES ($1::uuid, $2, $3, 1, $4, now(), now())
        ON CONFLICT (organization_id) DO NOTHING`,
-      [organizationId, DEFAULT_MEASUREMENT_SYSTEM, input.actor.email],
+      [
+        organizationId,
+        DEFAULT_MEASUREMENT_SYSTEM,
+        DEFAULT_WORKSPACE_CURRENCY_CODE,
+        input.actor.email,
+      ],
     )
 
     const current = await client.query<{
@@ -311,6 +341,136 @@ export async function updateOrganizationMeasurementDefault(input: {
         revision: nextRevision,
       },
       eventKey: `organization-measurement-preference:${organizationId}:${nextRevision}`,
+    }, client)
+
+    return toMeasurementPreferences(await readPreferenceRow(input.actor, client))
+  })
+}
+
+export async function updateOrganizationCurrencyCode(input: {
+  actor: AppUser
+  currencyCode: string
+  expectedRevision: number
+}): Promise<MeasurementPreferenceSnapshot> {
+  const role = effectiveAuthorizationRole(input.actor)
+  if (role !== 'owner' && role !== 'admin') {
+    throw new MeasurementPreferenceError(
+      'Organization admin permission is required',
+      403,
+      'organization_admin_required',
+    )
+  }
+  const currencyCode = requireCurrencyCode(input.currencyCode)
+  if (!Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 1) {
+    throw new MeasurementPreferenceError(
+      'A valid organization preference revision is required',
+      400,
+      'organization_revision_invalid',
+    )
+  }
+
+  return withTransaction(async (client) => {
+    const organizationId = activeOrganizationId(input.actor)
+    const organization = await client.query<{ id: string }>(
+      `SELECT organization.id::text
+       FROM workspace_organizations organization
+       JOIN app_user_organization_memberships membership
+         ON membership.organization_id = organization.id
+        AND membership.user_email = $1
+        AND membership.status = 'active'
+       WHERE organization.id = $2::uuid
+       LIMIT 1
+       FOR UPDATE OF organization`,
+      [input.actor.email, organizationId],
+    )
+    if (!organization.rows[0]) {
+      throw new MeasurementPreferenceError(
+        'Active workspace membership is not available',
+        403,
+        'active_workspace_membership_required',
+      )
+    }
+
+    await client.query(
+      `INSERT INTO workspace_organization_preferences (
+         organization_id,
+         measurement_system,
+         currency_code,
+         revision,
+         updated_by,
+         created_at,
+         updated_at
+       ) VALUES ($1::uuid, $2, $3, 1, $4, now(), now())
+       ON CONFLICT (organization_id) DO NOTHING`,
+      [
+        organizationId,
+        DEFAULT_MEASUREMENT_SYSTEM,
+        DEFAULT_WORKSPACE_CURRENCY_CODE,
+        input.actor.email,
+      ],
+    )
+
+    const current = await client.query<{
+      currency_code: string
+      revision: string | number
+    }>(
+      `SELECT currency_code, revision::text
+       FROM workspace_organization_preferences
+       WHERE organization_id = $1::uuid
+       LIMIT 1
+       FOR UPDATE`,
+      [organizationId],
+    )
+    const currentRevision = Number(current.rows[0]?.revision || 1)
+    if (currentRevision !== input.expectedRevision) {
+      throw new MeasurementPreferenceError(
+        'Organization preferences changed; reload and try again',
+        409,
+        'organization_revision_conflict',
+      )
+    }
+
+    const saved = await client.query<{ revision: string | number }>(
+      `UPDATE workspace_organization_preferences
+       SET currency_code = $2,
+           revision = revision + 1,
+           updated_by = $3,
+           updated_at = now()
+       WHERE organization_id = $1::uuid
+         AND revision = $4
+       RETURNING revision::text`,
+      [
+        organizationId,
+        currencyCode,
+        input.actor.email,
+        input.expectedRevision,
+      ],
+    )
+    if (!saved.rows[0]) {
+      throw new MeasurementPreferenceError(
+        'Organization preferences changed; reload and try again',
+        409,
+        'organization_revision_conflict',
+      )
+    }
+    const nextRevision = Number(saved.rows[0].revision)
+
+    await recordAuditEvent({
+      actor: input.actor.email,
+      eventType: 'organization.currency_preference.updated',
+      aggregateType: 'workspace_organization',
+      aggregateId: organizationId,
+      organizationId,
+      payload: {
+        fields: ['currencyCode'],
+        from: normalizeCurrencyCode(
+          current.rows[0]?.currency_code,
+          DEFAULT_WORKSPACE_CURRENCY_CODE,
+        ),
+        to: currencyCode,
+        revision: nextRevision,
+      },
+      eventKey: `organization-currency-preference:${organizationId}:${nextRevision}`,
     }, client)
 
     return toMeasurementPreferences(await readPreferenceRow(input.actor, client))

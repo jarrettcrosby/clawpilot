@@ -8,7 +8,10 @@ globalThis.__decodeHtmlEntities = decodeHtmlEntities
 const require = createRequire(new URL('../app_src/package.json', import.meta.url))
 const ts = require('typescript')
 
-async function importTypeScript(relativePath, { injectRuntime = false } = {}) {
+async function importTypeScript(
+  relativePath,
+  { injectRuntime = false, injectCurrencyRuntime = false } = {},
+) {
   const url = new URL(relativePath, import.meta.url)
   const source = await readFile(url, 'utf8')
   let output = ts.transpileModule(source, {
@@ -28,6 +31,14 @@ const query = (...args) => globalThis.__suiteCrmInteractionTest.query(...args)
 const decodeHtmlEntities = (value) => globalThis.__decodeHtmlEntities(value)
 ${output}`
   }
+  if (injectCurrencyRuntime) {
+    output = output.replace(/^import[^\n]+\n/gm, '')
+    output = `
+const isIso4217CurrencyCode = (value) => typeof value === 'string'
+  && /^[A-Z]{3}$/.test(value.trim().toUpperCase())
+  && value.trim().toUpperCase() !== 'AAA'
+${output}`
+  }
   const encoded = Buffer.from(output).toString('base64')
   return import(`data:text/javascript;base64,${encoded}`)
 }
@@ -43,7 +54,10 @@ process.env.SUITECRM_BASE_URL = 'https://suitecrm.example.test'
 process.env.SUITECRM_CLIENT_ID = 'client-id'
 process.env.SUITECRM_CLIENT_SECRET = 'client-secret'
 
-const client = await importTypeScript('../app_src/lib/crm/suiteCrmClient.ts')
+const client = await importTypeScript(
+  '../app_src/lib/crm/suiteCrmClient.ts',
+  { injectCurrencyRuntime: true },
+)
 const clientCalls = []
 const fetchImpl = async (input, init) => {
   const url = new URL(String(input))

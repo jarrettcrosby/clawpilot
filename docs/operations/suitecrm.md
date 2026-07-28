@@ -19,7 +19,9 @@ Each Railway environment has a `suitecrm` service, a dedicated MariaDB service, 
 
 The image is built from `services/suitecrm/`. It verifies the official SuiteCRM 8.10.1 release digest, serves `public/` with Apache, runs the legacy scheduler every minute, and continuously restarts the Symfony Messenger worker.
 
-Container boot also idempotently installs the ClawPilot `Global ID` custom field on Accounts, Contacts, AOS Products, Leads, Opportunities, Meetings, Calls, Notes, Campaigns, and Users. The field is named `global_id_c` in SuiteCRM metadata, labeled `Global ID`, and added to native detail and list layouts. Business-record modules are enabled for reporting and unified search; Users retain their administrator-module search boundary. Notes also receive a reportable, audited `Occurred At` DateTime field named `occurred_at_c` on native edit, detail, and list layouts; it stores the interaction's business timestamp separately from SuiteCRM's system creation time.
+Container boot also idempotently installs the ClawPilot `Global ID` custom field on Accounts, Contacts, AOS Products, Leads, Opportunities, Meetings, Calls, Notes, Campaigns, and Users. The field is named `global_id_c` in SuiteCRM metadata, labeled `Global ID`, and added to native detail and list layouts. Business-record modules are available to reporting and unified search; boot fails if any managed module or its Global ID search field remains unavailable. AOS Products is also kept enabled in SuiteCRM's persisted global-search module selection so Product Global ID lookup works without an administrator repair, while other module visibility remains administrator-controlled. Users retain their administrator-module search boundary. Notes also receive a reportable, audited `Occurred At` DateTime field named `occurred_at_c` on native edit, detail, and list layouts; it stores the interaction's business timestamp separately from SuiteCRM's system creation time.
+
+ClawPilot does not project AOS Quotes or AOS Products Quotes. Container boot therefore removes the stock AOS Product **Purchases** subpanel instead of presenting an empty query as though it were canonical order history. A future owned relationship must use canonical Operations order/shipment identities and its own contract before that layout can return.
 
 Every ClawPilot application user owns a permanent `gu#######` identity in Postgres. When an administrator maps that person to a native SuiteCRM User, ClawPilot queues an idempotent `global_id_c` projection through the SuiteCRM outbox. The worker refuses to overwrite a different permanent ID or duplicate one onto a second SuiteCRM User. The person's CRM Contact remains a separate `gc#######` record.
 
@@ -68,9 +70,12 @@ The SuiteCRM volume persists application configuration across deploys. On every 
 
 - `site_url` is set to the exact public HTTPS origin.
 - `trusted_hosts` is replaced with anchored expressions for the public hostname, `suitecrm.railway.internal`, and Railway's `healthcheck.railway.app` probe host.
+- SuiteCRM's reserved base-currency identity `-99` is fixed to USD with the USD name and symbol.
 - unrelated persisted override settings remain unchanged.
 
 The managed block is inserted last so stale installer values cannot override it. Startup fails closed if the existing override is unreadable, has an incomplete managed block, contains non-whitespace after its closing PHP tag, or cannot be replaced with `www-data:www-data` ownership and mode `0640`.
+
+ClawPilot Product projections include SuiteCRM's native `currency_id`. USD resolves to the fixed `-99` base identity. Every non-USD workspace default must first exist as exactly one active native SuiteCRM Currency with an administrator-maintained conversion rate. The workspace-setting command preflights that requirement and fails with an actionable conflict before saving. ClawPilot never creates a SuiteCRM currency, guesses a rate, changes a Product amount, or substitutes the workspace default for an existing Product's record currency.
 
 ## First Install
 

@@ -84,6 +84,55 @@ includes(persistence, [
 ], 'Order reconciliation persistence')
 assert.ok(!persistence.includes('provider_cursor ='), 'Order reconciliation must not persist a provider cursor')
 assert.ok(!persistence.includes("? 'read_all_orders'"), 'Current automatic order reconciliation must not require historical-order scope')
+
+let claimSql = ''
+const claimStartedAt = new Date('2026-07-28T14:15:16.789Z')
+const persistenceModule = loadTypeScriptModule(
+  'app_src/lib/persistence/commerceOrderReconciliation.ts',
+  {
+    mocks: {
+      '@/lib/auditWriter': {
+        async recordAuditEvent() {},
+      },
+      '@/lib/persistence/postgres': {
+        async withTransaction(callback) {
+          return callback({
+            async query(sql) {
+              claimSql = sql
+              return {
+                rows: [{
+                  organization_id:
+                    '11111111-1111-4111-8111-111111111111',
+                  integration_account_id:
+                    '22222222-2222-4222-8222-222222222222',
+                  account_global_id: 'gca0000001',
+                  provider: 'faire',
+                  credential_version: 2,
+                  continuation_run_global_id: null,
+                  last_started_at: claimStartedAt,
+                }],
+              }
+            },
+          })
+        },
+      },
+    },
+  },
+)
+const claimedTargets = await persistenceModule
+  .claimCommerceOrderReconciliationTargetsInPostgres({ limit: 1 })
+assert.match(
+  claimSql,
+  /RETURNING[\s\S]*last_started_at/,
+  'Claim SQL must return the persisted reconciliation lease timestamp',
+)
+assert.equal(claimedTargets.length, 1)
+assert.equal(
+  claimedTargets[0].startedAt,
+  claimStartedAt.toISOString(),
+  'Claim mapping must use last_started_at returned by the sync cursor',
+)
+
 const workerSource = read('app_src/lib/commerceOrderReconciliationWorker.ts')
 assert.ok(
   workerSource.includes('never promotes canonical orders, derives packages or shipments'),

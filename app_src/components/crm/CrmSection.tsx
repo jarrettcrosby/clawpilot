@@ -55,6 +55,7 @@ import RefreshRounded from '@mui/icons-material/RefreshRounded'
 import SearchRounded from '@mui/icons-material/SearchRounded'
 import SyncAltRounded from '@mui/icons-material/SyncAltRounded'
 import UploadFileRounded from '@mui/icons-material/UploadFileRounded'
+import { useMeasurementSystem } from '@/components/measurements/MeasurementSystemProvider'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import { annotateInteractionEventHistory } from '@/lib/crm/interactionHistory.mjs'
 import WorkspaceSelector from '@/components/workspaces/WorkspaceSelector'
@@ -269,6 +270,13 @@ function money(value: unknown, currency = 'USD') {
   }
 }
 
+function productMoney(value: unknown, currency: string) {
+  if (currency) return money(value, currency)
+  return `Currency required · ${(Number(value) || 0).toLocaleString('en-US', {
+    maximumFractionDigits: 2,
+  })}`
+}
+
 function hierarchyDescendants(hierarchy: WorkspaceOrganization[], organizationId: string) {
   const descendants = new Set<string>()
   let changed = true
@@ -323,7 +331,12 @@ function entityForReference(reference: string): CrmEntity | null {
   } as Record<string, CrmEntity>)[prefix] || null
 }
 
-function initialFields(entity: CrmEntity, record: RecordValue | null, userTimeZone: string): Record<string, string> {
+function initialFields(
+  entity: CrmEntity,
+  record: RecordValue | null,
+  userTimeZone: string,
+  defaultCurrencyCode: string,
+): Record<string, string> {
   const source = record || {}
   if (entity === 'organizations') return {
     name: textValue(source, 'name'), priority: textValue(source, 'priority'), accountType: textValue(source, 'accountType'),
@@ -363,7 +376,8 @@ function initialFields(entity: CrmEntity, record: RecordValue | null, userTimeZo
   if (entity === 'products') return {
     name: textValue(source, 'name'), sku: textValue(source, 'sku'), productType: textValue(source, 'productType') || 'Good',
     category: textValue(source, 'category'), status: textValue(source, 'status') || 'Active',
-    price: textValue(source, 'price'), cost: textValue(source, 'cost'), currency: textValue(source, 'currency') || 'USD',
+    price: textValue(source, 'price'), cost: textValue(source, 'cost'),
+    currency: textValue(source, 'currency') || (record ? '' : defaultCurrencyCode),
     url: textValue(source, 'url'), active: textValue(source, 'active') || 'true', description: textValue(source, 'description'),
   }
   if (entity === 'meetings') {
@@ -439,6 +453,16 @@ async function loadCrmOptions(entity: CrmEntity): Promise<RecordValue[]> {
 
 export default function CrmSection() {
   const dateTimeSettings = useUserDateTime()
+  const {
+    organizationCurrencyCode,
+    loading: measurementPreferencesLoading,
+    error: measurementPreferencesError,
+    preferencesWritable,
+    refresh: refreshMeasurementPreferences,
+  } = useMeasurementSystem()
+  const currencyPreferenceReady = !measurementPreferencesLoading
+    && !measurementPreferencesError
+    && preferencesWritable
   const narrowMobile = useMediaQuery('(max-width:599.95px)')
   const shortLandscape = useMediaQuery('(orientation: landscape) and (max-height: 500px) and (max-width: 899.95px)')
   const [entity, setEntity] = useState<CrmEntity>('organizations')
@@ -519,7 +543,12 @@ export default function CrmSection() {
         setEditorEntity(nextEntity)
         setEditorHistory([])
         setEditorRecord(matched)
-        setFields(initialFields(nextEntity, matched, dateTimeSettings.timeZone))
+        setFields(initialFields(
+          nextEntity,
+          matched,
+          dateTimeSettings.timeZone,
+          organizationCurrencyCode,
+        ))
         setUseOrganizationAddress(false)
         if (new URLSearchParams(window.location.search).get('crmAction') === 'compose-email') {
           if (!textValue(matched, 'email')) {
@@ -542,7 +571,17 @@ export default function CrmSection() {
     } finally {
       setLoading(false)
     }
-  }, [dateTimeSettings.timeZone])
+  }, [dateTimeSettings.timeZone, organizationCurrencyCode])
+
+  useEffect(() => {
+    if (
+      currencyPreferenceReady
+      || editorEntity !== 'products'
+      || editorRecord !== null
+    ) return
+    setEditorRecord(undefined)
+    setFields({})
+  }, [currencyPreferenceReady, editorEntity, editorRecord])
 
   useEffect(() => {
     let cancelled = false
@@ -775,10 +814,16 @@ export default function CrmSection() {
 
   function openEditor(record: RecordValue | null) {
     if (!record && !editable) return
+    if (!record && entity === 'products' && !currencyPreferenceReady) return
     setEditorEntity(entity)
     setEditorHistory([])
     setEditorRecord(record)
-    setFields(initialFields(entity, record, dateTimeSettings.timeZone))
+    setFields(initialFields(
+      entity,
+      record,
+      dateTimeSettings.timeZone,
+      organizationCurrencyCode,
+    ))
     setUseOrganizationAddress(false)
     setRelatedContactsLoading(entity === 'organizations' && Boolean(record))
   }
@@ -802,7 +847,12 @@ export default function CrmSection() {
     setEditorHistory((history) => [...history, { entity: editorEntity, record: editorRecord, fields }])
     setEditorEntity('contacts')
     setEditorRecord(record)
-    setFields(initialFields('contacts', record, dateTimeSettings.timeZone))
+    setFields(initialFields(
+      'contacts',
+      record,
+      dateTimeSettings.timeZone,
+      organizationCurrencyCode,
+    ))
     setUseOrganizationAddress(false)
     setRelatedContactsLoading(false)
   }
@@ -817,7 +867,12 @@ export default function CrmSection() {
     setEditorHistory((history) => [...history, { entity: editorEntity, record: editorRecord, fields }])
     setEditorEntity('organizations')
     setEditorRecord(record)
-    setFields(initialFields('organizations', record, dateTimeSettings.timeZone))
+    setFields(initialFields(
+      'organizations',
+      record,
+      dateTimeSettings.timeZone,
+      organizationCurrencyCode,
+    ))
     setUseOrganizationAddress(false)
     setRelatedContactsLoading(true)
   }
@@ -827,7 +882,12 @@ export default function CrmSection() {
     setEditorHistory((history) => [...history, { entity: editorEntity, record: editorRecord, fields }])
     setEditorEntity('opportunities')
     setEditorRecord(record)
-    setFields(initialFields('opportunities', record, dateTimeSettings.timeZone))
+    setFields(initialFields(
+      'opportunities',
+      record,
+      dateTimeSettings.timeZone,
+      organizationCurrencyCode,
+    ))
     setUseOrganizationAddress(false)
     setRelatedContactsLoading(false)
   }
@@ -837,7 +897,12 @@ export default function CrmSection() {
     setEditorHistory((history) => [...history, { entity: editorEntity, record: editorRecord, fields }])
     setEditorEntity('interactions')
     setEditorRecord(record)
-    setFields(initialFields('interactions', record, dateTimeSettings.timeZone))
+    setFields(initialFields(
+      'interactions',
+      record,
+      dateTimeSettings.timeZone,
+      organizationCurrencyCode,
+    ))
     setUseOrganizationAddress(false)
     setRelatedContactsLoading(false)
     setRelatedActivityLoading(false)
@@ -1232,6 +1297,26 @@ export default function CrmSection() {
       <Box sx={{ px: shortLandscape ? 1 : { xs: 2, md: 3 }, pt: shortLandscape ? 0.25 : 1.25, flexShrink: 0 }}>
         {error && <Alert severity="error" onClose={() => setError('')} sx={{ mb: 1 }}>{error}</Alert>}
         {notice && <Alert severity="success" onClose={() => setNotice('')} sx={{ mb: 1 }}>{notice}</Alert>}
+        {entity === 'products' && !currencyPreferenceReady ? (
+          <Alert
+            severity={measurementPreferencesError ? 'warning' : 'info'}
+            sx={{ mb: 1 }}
+            action={!measurementPreferencesLoading ? (
+              <Button
+                color="inherit"
+                size="small"
+                onClick={() => { void refreshMeasurementPreferences() }}
+              >
+                Retry
+              </Button>
+            ) : undefined}
+          >
+            {measurementPreferencesLoading
+              ? 'Loading the organization currency before a new Product can be added.'
+              : measurementPreferencesError
+                || 'Choose an active organization before adding a Product.'}
+          </Alert>
+        ) : null}
         <Stack direction={shortLandscape ? 'row' : 'column'} gap={shortLandscape ? 0.75 : 0} alignItems={shortLandscape ? 'center' : 'stretch'} sx={shortLandscape ? { overflowX: 'auto', WebkitOverflowScrolling: 'touch' } : undefined}>
           <Stack
             direction={shortLandscape ? 'row' : { xs: 'column', sm: 'row' }}
@@ -1269,7 +1354,12 @@ export default function CrmSection() {
                 </>
               )}
               {editable && (
-                <Button variant="contained" startIcon={<AddRounded />} onClick={() => openEditor(null)}>
+                <Button
+                  variant="contained"
+                  startIcon={<AddRounded />}
+                  disabled={entity === 'products' && !currencyPreferenceReady}
+                  onClick={() => openEditor(null)}
+                >
                   Add
                 </Button>
               )}
@@ -1341,8 +1431,10 @@ export default function CrmSection() {
                         >
                           {textValue(record, key)}
                         </Link>
-                      ) : (entity === 'opportunities' && key === 'value') || (entity === 'products' && key === 'price')
-                        ? money(record[key], entity === 'products' ? textValue(record, 'currency') || 'USD' : 'USD')
+                      ) : entity === 'products' && key === 'price'
+                        ? productMoney(record[key], textValue(record, 'currency'))
+                        : entity === 'opportunities' && key === 'value'
+                          ? money(record[key])
                         : displayValue(record, key, dateTimeSettings)}
                     </TableCell>
                   ))}

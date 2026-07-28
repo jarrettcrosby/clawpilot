@@ -350,6 +350,7 @@ export type SuiteCrmOutboxRecord = {
   suiteCrmModule?: SuiteCrmInteractionModule
   previousSuiteCrmModule?: SuiteCrmInteractionModule
   attributes: Record<string, unknown>
+  currencyCode?: string
   relationships?: Array<{
     linkFieldName: 'accounts' | 'contact' | 'contacts' | 'leads' | 'opportunity'
     relatedModuleName: 'Accounts' | 'Contacts' | 'Leads' | 'Opportunities'

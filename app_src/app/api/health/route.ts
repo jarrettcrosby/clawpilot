@@ -278,6 +278,7 @@ export async function GET() {
           operations_shopify_inventory_migration_applied: boolean
           measurement_preferences_migration_applied: boolean
           packaging_material_unit_neutral_names_migration_applied: boolean
+          workspace_currency_preference_migration_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -823,6 +824,11 @@ export async function GET() {
                 FROM schema_migrations
                 WHERE filename = '0126_packaging_material_unit_neutral_names.sql'
               ) AS packaging_material_unit_neutral_names_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0127_workspace_currency_preference.sql'
+              ) AS workspace_currency_preference_migration_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -943,6 +949,7 @@ export async function GET() {
             && row?.operations_shopify_inventory_migration_applied
             && row?.measurement_preferences_migration_applied
             && row?.packaging_material_unit_neutral_names_migration_applied
+            && row?.workspace_currency_preference_migration_applied
             && row?.migration_checksums_present
           ),
         }
@@ -1055,6 +1062,7 @@ export async function GET() {
           || !row?.operations_shopify_inventory_migration_applied
           || !row?.measurement_preferences_migration_applied
           || !row?.packaging_material_unit_neutral_names_migration_applied
+          || !row?.workspace_currency_preference_migration_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')

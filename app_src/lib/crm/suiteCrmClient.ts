@@ -1,4 +1,5 @@
 import type { CrmEntity, SuiteCrmOutboxRecord, SuiteCrmUserIdentityOutboxRecord } from '@/lib/crm/types'
+import { isIso4217CurrencyCode } from '@/lib/currency'
 
 type SuiteCrmRecordModule =
   | 'Accounts'
@@ -178,6 +179,69 @@ export async function testSuiteCrmConnection(fetchImpl: typeof fetch = fetch) {
   return Boolean(response)
 }
 
+export async function resolveSuiteCrmCurrencyId(
+  currencyCode: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<string> {
+  const normalized = String(currencyCode || '').trim().toUpperCase()
+  if (!isIso4217CurrencyCode(normalized)) {
+    throw new Error('SuiteCRM product currency must be a supported ISO 4217 code')
+  }
+  // ClawPilot fixes the SuiteCRM base currency to USD at container boot.
+  // SuiteCRM represents that base currency with its reserved -99 identity.
+  if (normalized === 'USD') return '-99'
+
+  const parameters = new URLSearchParams({
+    'fields[Currencies]': 'iso4217,status,conversion_rate',
+    'filter[iso4217][eq]': normalized,
+    'page[number]': '1',
+    'page[size]': '10',
+  })
+  const response = await request(
+    `/Api/V8/module/Currencies?${parameters}`,
+    { method: 'GET' },
+    fetchImpl,
+  ) as {
+    data?: Array<{ id?: unknown; type?: unknown; attributes?: unknown }>
+  }
+  if (!Array.isArray(response.data)) {
+    throw new Error('SuiteCRM returned an invalid currency collection')
+  }
+  const matches = response.data.flatMap((record) => {
+    const id = String(record?.id || '').trim()
+    const type = String(record?.type || '').trim()
+    const attributes = record?.attributes
+    if (
+      !id
+      || (type !== 'Currency' && type !== 'Currencies')
+      || !attributes
+      || typeof attributes !== 'object'
+      || Array.isArray(attributes)
+    ) return []
+    const values = attributes as Record<string, unknown>
+    const iso4217 = String(values.iso4217 || '').trim().toUpperCase()
+    const status = String(values.status || '').trim().toLowerCase()
+    const conversionRate = Number(values.conversion_rate)
+    return iso4217 === normalized
+      && status === 'active'
+      && Number.isFinite(conversionRate)
+      && conversionRate > 0
+      ? [id]
+      : []
+  })
+  if (matches.length === 0) {
+    throw new Error(
+      `${normalized} is not active in SuiteCRM with a positive conversion rate. Open SuiteCRM Admin > Currencies, enable ${normalized} with an administrator-maintained conversion rate, then retry.`,
+    )
+  }
+  if (matches.length > 1) {
+    throw new Error(
+      `SuiteCRM has multiple active ${normalized} currencies. Keep exactly one active record, then retry.`,
+    )
+  }
+  return matches[0]
+}
+
 export async function findSuiteCrmUser(input: {
   email?: string
   globalId?: string
@@ -340,11 +404,16 @@ export async function upsertSuiteCrmRecord(
     fetchImpl,
     true,
   )
+  const currencyId = record.currencyCode
+    ? await resolveSuiteCrmCurrencyId(record.currencyCode, fetchImpl)
+    : null
   const body = {
     data: {
       type: moduleName,
       id: record.suiteCrmId,
-      attributes: record.attributes,
+      attributes: currencyId
+        ? { ...record.attributes, currency_id: currencyId }
+        : record.attributes,
     },
   }
   const response = await request('/Api/V8/module', {

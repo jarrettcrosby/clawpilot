@@ -5,6 +5,7 @@ export type MeasurementPreferenceSnapshot = {
   measurementSystem: MeasurementSystem
   effectiveSource: MeasurementPreferenceSource
   organizationDefault: MeasurementSystem
+  organizationCurrencyCode: string
   organizationRevision: number
   userOverride: MeasurementSystem | null
 }

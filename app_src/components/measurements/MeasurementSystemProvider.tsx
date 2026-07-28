@@ -11,6 +11,10 @@ import {
   type ReactNode,
 } from 'react'
 import {
+  DEFAULT_WORKSPACE_CURRENCY_CODE,
+  normalizeCurrencyCode,
+} from '@/lib/currency'
+import {
   DEFAULT_MEASUREMENT_SYSTEM,
   normalizeMeasurementSystem,
   type MeasurementPreferenceSnapshot,
@@ -32,6 +36,7 @@ type MeasurementSystemContextValue = MeasurementPreferences & {
   refresh: () => Promise<void>
   setUserOverride: (value: MeasurementSystem | null) => Promise<void>
   setOrganizationDefault: (value: MeasurementSystem) => Promise<void>
+  setOrganizationCurrencyCode: (value: string) => Promise<void>
 }
 
 type PreferencesResponse = {
@@ -45,6 +50,7 @@ const FALLBACK_PREFERENCES: MeasurementPreferences = {
   measurementSystem: DEFAULT_MEASUREMENT_SYSTEM,
   effectiveSource: 'fallback',
   organizationDefault: DEFAULT_MEASUREMENT_SYSTEM,
+  organizationCurrencyCode: DEFAULT_WORKSPACE_CURRENCY_CODE,
   organizationRevision: 1,
   userOverride: null,
   canManageOrganizationDefault: false,
@@ -58,6 +64,7 @@ const MeasurementSystemContext = createContext<MeasurementSystemContextValue>({
   refresh: async () => undefined,
   setUserOverride: async () => undefined,
   setOrganizationDefault: async () => undefined,
+  setOrganizationCurrencyCode: async () => undefined,
 })
 
 class MeasurementPreferenceRequestError extends Error {
@@ -93,6 +100,10 @@ function normalizePreferences(value: unknown): MeasurementPreferences {
     ),
     effectiveSource,
     organizationDefault,
+    organizationCurrencyCode: normalizeCurrencyCode(
+      input.organizationCurrencyCode,
+      DEFAULT_WORKSPACE_CURRENCY_CODE,
+    ),
     organizationRevision: Number.isSafeInteger(revision) && revision >= 1 ? revision : 1,
     userOverride,
     canManageOrganizationDefault: input.canManageOrganizationDefault === true,
@@ -222,6 +233,22 @@ export function MeasurementSystemProvider({
     }
   }, [preferences.organizationRevision, update])
 
+  const setOrganizationCurrencyCode = useCallback(async (value: string) => {
+    try {
+      await update({
+        action: 'set-organization-currency',
+        currencyCode: value,
+        expectedRevision: preferences.organizationRevision,
+      })
+    } catch (caught) {
+      const message = caught instanceof Error
+        ? caught.message
+        : 'Unable to update organization currency'
+      setError(message)
+      throw caught
+    }
+  }, [preferences.organizationRevision, update])
+
   const value = useMemo<MeasurementSystemContextValue>(() => ({
     ...preferences,
     loading,
@@ -230,6 +257,7 @@ export function MeasurementSystemProvider({
     refresh,
     setUserOverride,
     setOrganizationDefault,
+    setOrganizationCurrencyCode,
   }), [
     error,
     loading,
@@ -237,6 +265,7 @@ export function MeasurementSystemProvider({
     preferencesWritable,
     refresh,
     setOrganizationDefault,
+    setOrganizationCurrencyCode,
     setUserOverride,
   ])
 

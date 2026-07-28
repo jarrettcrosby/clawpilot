@@ -17,6 +17,12 @@ import {
   measurementUnits,
   millimetersToDisplayLength,
 } from '../../lib/measurements.ts'
+// @ts-expect-error Node's strip-types test runner requires the .ts extension.
+import {
+  DEFAULT_WORKSPACE_CURRENCY_CODE,
+  isIso4217CurrencyCode,
+  normalizeCurrencyCode,
+} from '../../lib/currency.ts'
 
 function approximately(actual: number, expected: number, epsilon = 1e-9) {
   assert.ok(
@@ -77,4 +83,13 @@ test('conversion helpers reject negative and non-finite values', () => {
   assert.throws(() => displayLengthToMillimeters(-1, 'metric'), RangeError)
   assert.throws(() => displayWeightToGrams(Number.NaN, 'imperial'), RangeError)
   assert.throws(() => displayVolumeToCubicMeters(Number.POSITIVE_INFINITY, 'metric'), RangeError)
+})
+
+test('workspace currency helpers accept supported ISO codes without inventing codes', () => {
+  assert.equal(DEFAULT_WORKSPACE_CURRENCY_CODE, 'USD')
+  assert.equal(isIso4217CurrencyCode('USD'), true)
+  assert.equal(isIso4217CurrencyCode('eur'), true)
+  assert.equal(isIso4217CurrencyCode('AAA'), false)
+  assert.equal(normalizeCurrencyCode(' eur '), 'EUR')
+  assert.equal(normalizeCurrencyCode('not-a-currency'), 'USD')
 })

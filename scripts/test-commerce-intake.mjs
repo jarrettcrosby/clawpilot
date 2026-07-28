@@ -2122,11 +2122,15 @@ const service = loadTypeScriptModule(
         async markCommerceIntakeProviderReadUncertainInPostgres(input) {
           uncertainReads.push(input)
         },
-        async readCommerceIntakeRejectionTargetFromPostgres() {
+        async readCommerceIntakeRejectionTargetFromPostgres(input) {
+          const provider = runtimes.get(input.accountGlobalId)?.provider
+            || 'shopify'
           return {
-            provider: 'shopify',
+            provider,
             resource_type: 'order',
-            external_id: 'gid://shopify/Order/999',
+            external_id: provider === 'faire'
+              ? 'faire-order-rejected-1'
+              : 'gid://shopify/Order/999',
             source_hash: 'e'.repeat(64),
             row_version: 0,
           }
@@ -2492,6 +2496,17 @@ try {
       idempotencyKey: nextKey(),
     },
   })
+  await service.executeCommerceIntakeCommand({
+    organizationId,
+    actorEmail,
+    body: {
+      action: 'retry-rejection',
+      accountGlobalId: faireRuntime.globalId,
+      rejectionGlobalId: 'gcrj0000002',
+      confirmReadOnly: true,
+      idempotencyKey: nextKey(),
+    },
+  })
   const replayedFetch = await service.executeCommerceIntakeCommand({
     organizationId,
     actorEmail,
@@ -2532,7 +2547,7 @@ try {
     faireProducts: 2,
     faireInventory: 3,
     faireOrders: 2,
-    faireOrder: 0,
+    faireOrder: 1,
   })
   assert.equal(normalizedSources.shopify.data.products.nodes.length, 0)
   assert.equal(normalizedSources.shopify.data.orders.nodes.length, 1)
@@ -2560,8 +2575,8 @@ try {
       .available_quantity.quantity,
     -2,
   )
-  assert.equal(providerAttempts.length, 10)
-  assert.equal(providerReservations.length, 11)
+  assert.equal(providerAttempts.length, 11)
+  assert.equal(providerReservations.length, 12)
   assert.ok(
     providerReservations.some((reservation) => (
       reservation.runtime.provider === 'faire'
@@ -2576,9 +2591,9 @@ try {
     )),
     'Shopify provider-attempt evidence must record its actual normalizer',
   )
-  assert.equal(capturedReads.size, 10)
+  assert.equal(capturedReads.size, 11)
   assert.equal(uncertainReads.length, 0)
-  assert.equal(stageAttempts.length, 11)
+  assert.equal(stageAttempts.length, 12)
   for (const attempt of providerAttempts) {
     assert.equal(attempt.action, 'commerce.intake.read')
     assert.equal(attempt.redactedRequest.readOnly, true)
@@ -2587,7 +2602,7 @@ try {
   }
   assert.equal(
     persistenceCommands.filter(({ name }) => name === 'stage-envelope').length,
-    10,
+    11,
   )
   const staged = persistenceCommands.filter(
     ({ name }) => name === 'stage-envelope',
@@ -2609,6 +2624,7 @@ try {
       'fetch-next',
       'refresh',
       'retry-rejection',
+      'retry-rejection',
     ],
   )
   assert.equal(staged[0].input.page.batchNumber, 1)
@@ -2619,6 +2635,12 @@ try {
   assert.equal(staged[3].input.page.resource, 'products')
   assert.equal(staged[8].input.page, null)
   assert.equal(staged[9].input.page, null)
+  assert.equal(staged[10].input.page, null)
+  assert.equal(
+    staged[10].input.envelope.orders[0].identity.value,
+    'faire-order-rejected-1',
+    'Faire exact-order retry must stage the identity read by getFaireOrder',
+  )
   assert.equal(
     automaticProductSweeps.length,
     5,
@@ -2782,7 +2804,7 @@ try {
     faireProducts: 2,
     faireInventory: 3,
     faireOrders: 2,
-    faireOrder: 0,
+    faireOrder: 1,
   }, 'Resolution, validation, and promotion must not call providers')
   const promotion = persistenceCommands.find(({ name }) => name === 'promote')
   assert.match(promotion.input.requestHash, /^[a-f0-9]{64}$/)

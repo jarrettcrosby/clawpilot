@@ -1,8 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { resolveSuiteCrmCurrencyId } from '@/lib/crm/suiteCrmClient'
+import { isIso4217CurrencyCode } from '@/lib/currency'
 import { isMeasurementSystem } from '@/lib/measurements'
 import {
   MeasurementPreferenceError,
   readMeasurementPreferences,
+  updateOrganizationCurrencyCode,
   updateOrganizationMeasurementDefault,
   updateUserMeasurementOverride,
 } from '@/lib/persistence/measurementPreferences'
@@ -181,8 +184,61 @@ export async function PUT(req: NextRequest) {
       }, { headers: NO_STORE_HEADERS })
     }
 
+    if (action === 'set-organization-currency') {
+      assertOnlyFields(body, ['action', 'currencyCode', 'expectedRevision'])
+      if (!canManageOrganizationDefault(actor)) {
+        throw new MeasurementPreferenceError(
+          'Organization admin permission is required',
+          403,
+          'organization_admin_required',
+        )
+      }
+      const currencyCode = String(body.currencyCode || '').trim().toUpperCase()
+      if (!isIso4217CurrencyCode(currencyCode)) {
+        throw new MeasurementPreferenceError(
+          'Currency must be a supported ISO 4217 code',
+          400,
+          'currency_code_invalid',
+        )
+      }
+      const expectedRevision = body.expectedRevision
+      if (
+        typeof expectedRevision !== 'number'
+        || !Number.isSafeInteger(expectedRevision)
+        || expectedRevision < 1
+      ) {
+        throw new MeasurementPreferenceError(
+          'A valid organization preference revision is required',
+          400,
+          'organization_revision_invalid',
+        )
+      }
+      if (process.env.CRM_ENABLED === '1') {
+        try {
+          await resolveSuiteCrmCurrencyId(currencyCode)
+        } catch (error) {
+          throw new MeasurementPreferenceError(
+            error instanceof Error
+              ? error.message
+              : 'SuiteCRM currency configuration could not be verified',
+            409,
+            'suitecrm_currency_configuration_required',
+          )
+        }
+      }
+      const preferences = await updateOrganizationCurrencyCode({
+        actor,
+        currencyCode,
+        expectedRevision,
+      })
+      return NextResponse.json({
+        ok: true,
+        preferences: preferencesResponse(actor, preferences),
+      }, { headers: NO_STORE_HEADERS })
+    }
+
     throw new MeasurementPreferenceError(
-      'Measurement preference action is not supported',
+      'Workspace preference action is not supported',
       400,
       'measurement_preference_action_invalid',
     )

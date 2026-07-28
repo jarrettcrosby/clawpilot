@@ -10,9 +10,13 @@ import MenuItem from '@mui/material/MenuItem'
 import Stack from '@mui/material/Stack'
 import TextField from '@mui/material/TextField'
 import Typography from '@mui/material/Typography'
+import CurrencyExchangeRounded from '@mui/icons-material/CurrencyExchangeRounded'
 import SaveRounded from '@mui/icons-material/SaveRounded'
 import StraightenRounded from '@mui/icons-material/StraightenRounded'
 import { useMeasurementSystem } from '@/components/measurements/MeasurementSystemProvider'
+import {
+  SUPPORTED_ISO_4217_CURRENCY_CODES,
+} from '@/lib/currency'
 import type { MeasurementSystem } from '@/lib/measurements'
 
 type PersonalSelection = MeasurementSystem | 'organization'
@@ -30,6 +34,7 @@ export default function MeasurementPreferencesPanel({
     measurementSystem,
     effectiveSource,
     organizationDefault,
+    organizationCurrencyCode,
     organizationRevision,
     userOverride,
     canManageOrganizationDefault,
@@ -38,15 +43,23 @@ export default function MeasurementPreferencesPanel({
     preferencesWritable,
     setUserOverride,
     setOrganizationDefault,
+    setOrganizationCurrencyCode,
   } = useMeasurementSystem()
-  const [pending, setPending] = useState<'user' | 'organization' | null>(null)
+  const [pending, setPending] = useState<
+    'user' | 'organization-measurement' | 'organization-currency' | null
+  >(null)
   const [notice, setNotice] = useState('')
   const [organizationDraft, setOrganizationDraft] =
     useState<MeasurementSystem>(organizationDefault)
+  const [currencyDraft, setCurrencyDraft] = useState(organizationCurrencyCode)
 
   useEffect(() => {
     setOrganizationDraft(organizationDefault)
   }, [organizationDefault])
+
+  useEffect(() => {
+    setCurrencyDraft(organizationCurrencyCode)
+  }, [organizationCurrencyCode])
 
   async function updateUserPreference(value: PersonalSelection) {
     if (pending) return
@@ -66,7 +79,7 @@ export default function MeasurementPreferencesPanel({
 
   async function updateOrganizationPreference() {
     if (pending || organizationDraft === organizationDefault) return
-    setPending('organization')
+    setPending('organization-measurement')
     setNotice('')
     try {
       await setOrganizationDefault(organizationDraft)
@@ -80,23 +93,40 @@ export default function MeasurementPreferencesPanel({
     }
   }
 
+  async function updateOrganizationCurrency() {
+    if (pending || currencyDraft === organizationCurrencyCode) return
+    setPending('organization-currency')
+    setNotice('')
+    try {
+      await setOrganizationCurrencyCode(currencyDraft)
+      setNotice(
+        `${organizationName || 'The active organization'} now defaults new ClawPilot-entered money to ${currencyDraft}.`,
+      )
+    } catch {
+      // The shared provider exposes the safe server error in this panel.
+    } finally {
+      setPending(null)
+    }
+  }
+
   const personalSelection: PersonalSelection = userOverride || 'organization'
 
   return (
     <Box
       component="section"
-      aria-labelledby="measurement-preferences-title"
+      aria-labelledby="regional-preferences-title"
       sx={{ mt: 3, pt: 2.5, borderTop: '1px solid rgba(255,255,255,0.08)' }}
     >
       <Stack direction="row" spacing={1} alignItems="center" mb={0.5}>
         <StraightenRounded color="primary" fontSize="small" />
-        <Typography id="measurement-preferences-title" variant="subtitle1" fontWeight={700}>
-          Measurement units
+        <Typography id="regional-preferences-title" variant="subtitle1" fontWeight={700}>
+          Regional settings
         </Typography>
       </Stack>
       <Typography variant="body2" color="text.secondary" mb={2}>
-        ClawPilot stores exact canonical measurements for planning and audit evidence,
-        then converts the operator display and entry fields to your selected system.
+        Set organization defaults for money and measurements. ClawPilot keeps
+        exact source currency and canonical measurements on records that own
+        those facts.
       </Typography>
 
       {error ? <Alert severity="error" sx={{ mb: 1.5 }}>{error}</Alert> : null}
@@ -181,7 +211,7 @@ export default function MeasurementPreferencesPanel({
               <Button
                 variant="outlined"
                 startIcon={
-                  pending === 'organization'
+                  pending === 'organization-measurement'
                     ? <CircularProgress size={16} color="inherit" />
                     : <SaveRounded />
                 }
@@ -202,6 +232,96 @@ export default function MeasurementPreferencesPanel({
             <Alert severity="info" variant="outlined">
               The organization default is {systemLabel(organizationDefault)}. An organization
               owner or administrator can change it.
+            </Alert>
+          )}
+        </Box>
+
+        <Divider />
+
+        <Box>
+          <Stack direction="row" spacing={1} alignItems="center" mb={0.75}>
+            <CurrencyExchangeRounded color="primary" fontSize="small" />
+            <Typography variant="subtitle2" fontWeight={700}>
+              Organization currency
+            </Typography>
+          </Stack>
+          <Typography variant="body2" color="text.secondary" mb={1}>
+            The ISO 4217 default is used only for new ClawPilot-entered money
+            that has no record currency. Shopify, Faire, carrier, and imported
+            money keeps its source currency and is never silently converted or
+            relabeled.
+          </Typography>
+          {canManageOrganizationDefault ? (
+            <Alert severity="info" variant="outlined" sx={{ mb: 1 }}>
+              USD uses SuiteCRM&apos;s fixed base currency. Before saving another
+              code, a root-organization ClawPilot owner or administrator must
+              open native CRM from CRM &gt; Access SuiteCRM, then enable exactly
+              one matching ISO currency under Admin &gt; Currencies and maintain
+              its conversion rate.
+            </Alert>
+          ) : null}
+          {!preferencesWritable ? (
+            <Typography variant="body2" color="text.secondary">
+              Organization currency becomes available after entering an active
+              organization.
+            </Typography>
+          ) : canManageOrganizationDefault ? (
+            <Stack
+              direction={{ xs: 'column', sm: 'row' }}
+              spacing={1}
+              alignItems={{ sm: 'flex-start' }}
+            >
+              <TextField
+                select
+                fullWidth
+                size="small"
+                label="Default currency"
+                value={currencyDraft}
+                disabled={loading || Boolean(pending)}
+                onChange={(event) => {
+                  setCurrencyDraft(event.target.value)
+                }}
+                helperText={
+                  currencyDraft === organizationCurrencyCode
+                    ? `Saved currency · revision ${organizationRevision}`
+                    : `Review, then save ${currencyDraft} for ${organizationName || 'the active organization'}.`
+                }
+              >
+                {SUPPORTED_ISO_4217_CURRENCY_CODES.map((currencyCode) => (
+                  <MenuItem key={currencyCode} value={currencyCode}>
+                    {currencyCode}
+                  </MenuItem>
+                ))}
+              </TextField>
+              <Button
+                variant="outlined"
+                startIcon={
+                  pending === 'organization-currency'
+                    ? <CircularProgress size={16} color="inherit" />
+                    : <SaveRounded />
+                }
+                disabled={
+                  loading
+                  || Boolean(pending)
+                  || currencyDraft === organizationCurrencyCode
+                }
+                onClick={() => {
+                  void updateOrganizationCurrency()
+                }}
+                sx={{
+                  minWidth: 150,
+                  minHeight: 40,
+                  flexShrink: 0,
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                Save currency
+              </Button>
+            </Stack>
+          ) : (
+            <Alert severity="info" variant="outlined">
+              The organization currency is {organizationCurrencyCode}. An
+              organization owner or administrator can change it.
             </Alert>
           )}
         </Box>
