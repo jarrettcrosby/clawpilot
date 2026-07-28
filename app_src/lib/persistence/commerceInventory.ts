@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import type { PoolClient, QueryResultRow } from 'pg'
 import { recordAuditEvent } from '@/lib/auditWriter'
 import {
@@ -1708,10 +1708,11 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
       `INSERT INTO operations_domain_events (
          organization_id, aggregate_type, aggregate_id,
          aggregate_global_id, event_type, event_version, payload,
-         actor_email, idempotency_key
+         actor_email, correlation_id, idempotency_key
        ) VALUES (
          $1::uuid, 'operations.commerce_inventory_sync', $2::uuid, $3,
-         'operations.inventory.shopify_reconciled', 1, $4::jsonb, $5, $6
+         'operations.inventory.shopify_reconciled', 1, $4::jsonb,
+         $5, $6::uuid, $7
        )`,
       [
         input.runtime.organizationId,
@@ -1733,6 +1734,7 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
           orderQuantityAdjustment: 0,
         }),
         input.actorEmail,
+        randomUUID(),
         `shopify-inventory:${input.idempotencyKey}`,
       ],
     )

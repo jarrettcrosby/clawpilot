@@ -666,6 +666,20 @@ assert.match(
   inventoryPersistence,
   /projectShopifyInventoryBalance\(\{/,
 )
+assert.match(
+  inventoryPersistence,
+  /product\.reference_code AS product_global_id/,
+  'Inventory projection must use the canonical CRM product reference column',
+)
+assert.ok(
+  !inventoryPersistence.includes('product.global_id'),
+  'CRM products do not expose a global_id column',
+)
+assert.match(
+  inventoryPersistence,
+  /actor_email, correlation_id, idempotency_key/,
+  'Inventory domain events must include the required correlation ID',
+)
 assert.ok(
   !inventoryPersistence.includes('BigInt(')
     && !inventoryPersistence.includes('0n'),
