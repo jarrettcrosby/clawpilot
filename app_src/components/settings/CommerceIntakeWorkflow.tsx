@@ -502,7 +502,7 @@ function catalogSyncDescription(
   provider: CommerceProvider,
 ) {
   if (!sync || sync.status === 'idle') {
-    return 'The initial full-catalog backfill will start automatically after this setting is enabled.'
+    return 'This verified connection authorizes automatic read-only catalog sync. The initial backfill queues when product-read access, the development runtime, and the Operations product target are eligible; no second approval is required.'
   }
   if (sync.status === 'queued') {
     return 'The full product catalog is queued. ClawPilot will follow every provider page automatically; no per-page approval is required.'
@@ -541,7 +541,7 @@ function catalogSyncDescription(
   if (sync.status === 'dead') {
     return `Automatic catalog sync stopped after repeated or permanent connection errors${
       sync.lastErrorCode ? ` (${sync.lastErrorCode})` : ''
-    }. Repair the sales-channel connection, then save this setting again to queue a new backfill.`
+    }. Repair the sales-channel connection. While sync remains resumed, ClawPilot rechecks eligibility and queues a fresh reconciliation when every worker fence passes.`
   }
   return 'Automatic catalog sync is paused. Existing ClawPilot products and provider mappings are unchanged.'
 }
@@ -1148,8 +1148,8 @@ export default function CommerceIntakeWorkflow({
     ? productIntakePolicy.revision
     : 0
   const futureProductBehaviorMessage = automaticProductCreationEnabled
-    ? 'ClawPilot will finish the initial catalog backfill and periodically discover new products. Eligible unmatched products are created and mapped automatically; incomplete or unsafe products remain in review.'
-    : 'New unmatched products will remain in review until an operator resolves them.'
+    ? 'Catalog sync is resumed. When product-read access, the development runtime, and the Operations product target are eligible, ClawPilot reconciles the catalog automatically. Eligible unmatched products are created and mapped; incomplete or unsafe products remain in review.'
+    : 'Catalog sync is paused. Existing products and mappings remain unchanged, and no new provider pages are read until sync is resumed.'
   useEffect(() => {
     if (
       !workbenchOpen
@@ -1891,12 +1891,6 @@ export default function CommerceIntakeWorkflow({
       || enabled === automaticProductCreationEnabled
       || (enabled && (!operatorCommandsAllowed || !connectionReady))
     ) return
-    if (
-      enabled
-      && !window.confirm(
-        `Turn on automatic product sync for ${displayName}? ClawPilot will queue the initial full-catalog backfill, follow every ${providerLabel(provider)} page without additional approval, and periodically check for newly added products. Safe unmatched products create ClawPilot product masters and mappings; incomplete or unsafe products remain in review. This never writes to ${providerLabel(provider)} or changes orders.`,
-      )
-    ) return
     await postCommand(
       'set-product-intake-policy',
       `set-product-intake-policy:${productIntakePolicyRevision}:${
@@ -1908,8 +1902,8 @@ export default function CommerceIntakeWorkflow({
         confirmAutoCreateProducts: enabled,
       },
       enabled
-        ? `Automatic product sync is on for ${displayName}. The initial full-catalog backfill is queued and future product checks will run without per-page approval. ${providerLabel(provider)} and existing orders will not be changed.`
-        : `Automatic product sync is off for ${displayName}. New unmatched products will stay in review. Existing products, orders, and ${providerLabel(provider)} were not changed.`,
+        ? `Catalog sync resumed for ${displayName}. ClawPilot will queue a full reconciliation when product-read access, the development runtime, and the Operations product target are eligible. ${providerLabel(provider)} and existing orders will not be changed.`
+        : `Catalog sync paused for ${displayName}. Existing products, mappings, orders, and ${providerLabel(provider)} were not changed.`,
     )
   }
 
@@ -2398,7 +2392,7 @@ export default function CommerceIntakeWorkflow({
                 <Typography variant="body2" color="text.secondary">
                   {automaticProductCreationEnabled
                     ? `The connected ${providerLabel(provider)} catalog syncs automatically. Use this workspace to monitor progress and resolve only the products or orders that need a decision.`
-                    : `Review ${providerLabel(provider)} data in a dedicated workspace before creating ClawPilot records.`}
+                    : `${providerLabel(provider)} catalog sync is paused. Existing imported records remain available for review.`}
                 </Typography>
               </Box>
               <Button
@@ -2600,8 +2594,8 @@ export default function CommerceIntakeWorkflow({
           </Card>
           <Alert severity="info">
             {automaticProductCreationEnabled
-              ? `Your connected ${providerLabel(provider)} account is the one-time authorization for read-only product synchronization. ClawPilot follows catalog pages and creates safe product records without asking you to approve each page or product.`
-              : `ClawPilot reads ${providerLabel(provider)} only when you start a reviewed import.`}{' '}
+              ? `Your verified ${providerLabel(provider)} connection authorizes automatic read-only product synchronization with no second approval. When product-read access, the development runtime, and the Operations product target are eligible, ClawPilot follows every catalog page and creates safe product records; only exceptions need review.`
+              : `${providerLabel(provider)} product synchronization is paused. Resume it below when you want ClawPilot to continue reading catalog pages.`}{' '}
             It cannot change {providerLabel(provider)}, change an order,
             reserve inventory, or export fulfillment. Credentials and provider
             tokens are never returned here.
@@ -3434,10 +3428,10 @@ export default function CommerceIntakeWorkflow({
                       color="text.secondary"
                       fontWeight={700}
                     >
-                      Product automation
+                      Product catalog
                     </Typography>
                     <Typography variant="subtitle1" fontWeight={700}>
-                      Automatic catalog sync
+                      Product catalog synchronization
                     </Typography>
                   </Box>
                   <Stack direction="row" gap={0.75} flexWrap="wrap">
@@ -3453,8 +3447,10 @@ export default function CommerceIntakeWorkflow({
                           'set-product-intake-policy:',
                         )
                           ? 'Saving…'
-                          : `Automation: ${
-                              automaticProductCreationEnabled ? 'On' : 'Off'
+                          : `Catalog control: ${
+                              automaticProductCreationEnabled
+                                ? 'Resumed'
+                                : 'Paused'
                             }`
                       }
                     />
@@ -3469,7 +3465,7 @@ export default function CommerceIntakeWorkflow({
                       label={
                         automaticProductCreationEnabled
                           ? catalogSyncLabel(productCatalogSync)
-                          : 'Automatic sync off'
+                          : 'Sync paused'
                       }
                     />
                   </Stack>
@@ -3498,23 +3494,26 @@ export default function CommerceIntakeWorkflow({
                       }}
                       inputProps={{
                         'aria-label':
-                          'Keep ClawPilot products synchronized automatically',
+                          'Pause or resume product catalog sync',
                       }}
                     />
                   )}
                   label={(
                     <Box>
                       <Typography fontWeight={700}>
-                        Keep ClawPilot products synchronized automatically
+                        Pause or resume product catalog sync
                       </Typography>
                       <Typography variant="body2" color="text.secondary">
-                        Authorize the sales channel once. ClawPilot then reads
-                        every catalog page, creates safe product masters and
-                        exact mappings, and checks again for additions. Source
-                        changes stay visible as provider evidence and do not
-                        silently overwrite an existing ClawPilot product. It
-                        never writes to {providerLabel(provider)} or changes
-                        an order.
+                        The verified sales-channel connection is the
+                        authorization for automatic read-only catalog sync; no
+                        second approval is required. When product-read access,
+                        the development runtime, and the Operations product
+                        target are eligible, ClawPilot queues a full
+                        reconciliation. Pause stops future provider reads and
+                        automatic creation; resume makes the connection
+                        eligible to queue again. Existing products and mappings
+                        remain unchanged while paused. ClawPilot never writes
+                        to {providerLabel(provider)} or changes an order.
                       </Typography>
                       <Typography
                         variant="caption"
@@ -3612,8 +3611,8 @@ export default function CommerceIntakeWorkflow({
                 && (!operatorCommandsAllowed || !connectionReady) ? (
                   <Typography variant="caption" color="text.secondary">
                     {!connectionReady
-                      ? `Reconnect and verify ${providerLabel(provider)} to enable this policy.`
-                      : 'Set Operations to Shadow or Active to enable this policy.'}
+                      ? `Reconnect and verify ${providerLabel(provider)} before catalog sync can resume.`
+                      : 'Configure the Operations product target in Shadow or Active before resumed catalog sync can run.'}
                     {' '}If the policy is already on, turning it off remains
                     available even when the connection or Operations is later
                     restricted.

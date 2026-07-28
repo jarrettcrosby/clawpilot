@@ -153,6 +153,8 @@ const catalogSyncPersistenceSource = read(
 )
 includes(catalogSyncPersistenceSource, [
   'applyCommerceCatalogSyncPolicyWithClient',
+  'ensureAutomaticCommerceCatalogIntakeWithClient',
+  'automaticCommerceCatalogRuntimeAvailable',
   'queueAutomaticCommerceCatalogSyncsInPostgres',
   'claimCommerceCatalogSyncJobsInPostgres',
   'completeCommerceCatalogSyncPageInPostgres',
@@ -161,6 +163,19 @@ includes(catalogSyncPersistenceSource, [
   "policy.unmatched_action = 'auto_create'",
   'account.commerce_credential_generation',
   "credential.verification_status = 'verified'",
+  'commerceCatalogCredentialSupportsProducts',
+  'PRODUCT_READABLE_CONNECTION_SQL',
+  "account.configuration->'grantedScopes'",
+  "account.configuration->'requestedScopes'",
+  "credential.auth_mode = 'faire_brand_token'",
+  "has('read_products')",
+  "has('READ_PRODUCTS')",
+  'commerce.intake.product_policy.connected_default',
+  'connectionIsAuthorization: true',
+  'productTargetReady: account.product_target_ready',
+  'waitingForProductTarget',
+  "existing?.unmatched_action === 'review'",
+  'COMMERCE_CATALOG_SYNC_FENCE_CHANGED',
   "activation.state IN ('shadow', 'active')",
   'FOR UPDATE OF job SKIP LOCKED',
   "const CATALOG_SYNC_LEASE = '10 minutes'",
@@ -180,6 +195,276 @@ includes(catalogSyncPersistenceSource, [
   'ordersTouched: 0',
   'inventoryTouched: 0',
 ], 'Commerce catalog-sync persistence')
+assert.equal(
+  (
+    catalogSyncPersistenceSource.match(
+      /AND \$\{PRODUCT_READABLE_CONNECTION_SQL\}/g,
+    ) || []
+  ).length,
+  6,
+  'Product-read eligibility must gate policy application, stale-job fencing, '
+    + 'recurring queueing, claiming, and the completion fence',
+)
+const catalogCredentialPolicyModule = loadTypeScriptModule(
+  'app_src/lib/persistence/commerceCatalogSync.ts',
+  {
+    mocks: {
+      '@/lib/auditWriter': {
+        async recordAuditEvent() {},
+      },
+      '@/lib/persistence/postgres': {
+        async query() {
+          throw new Error('Unexpected database query')
+        },
+        async withTransaction() {
+          throw new Error('Unexpected transaction')
+        },
+      },
+    },
+  },
+)
+assert.equal(
+  catalogCredentialPolicyModule.commerceCatalogCredentialSupportsProducts({
+    provider: 'shopify',
+    authMode: 'shopify_client_credentials',
+    configuration: { grantedScopes: ['read_products', 'read_orders'] },
+  }),
+  true,
+)
+assert.equal(
+  catalogCredentialPolicyModule.commerceCatalogCredentialSupportsProducts({
+    provider: 'shopify',
+    authMode: 'shopify_client_credentials',
+    configuration: { grantedScopes: ['read_orders'] },
+  }),
+  false,
+)
+assert.equal(
+  catalogCredentialPolicyModule.commerceCatalogCredentialSupportsProducts({
+    provider: 'faire',
+    authMode: 'faire_brand_token',
+    configuration: {},
+  }),
+  true,
+)
+assert.equal(
+  catalogCredentialPolicyModule.commerceCatalogCredentialSupportsProducts({
+    provider: 'faire',
+    authMode: 'faire_oauth',
+    configuration: { requestedScopes: ['READ_BRAND', 'READ_PRODUCTS'] },
+  }),
+  true,
+)
+assert.equal(
+  catalogCredentialPolicyModule.commerceCatalogCredentialSupportsProducts({
+    provider: 'faire',
+    authMode: 'faire_oauth',
+    configuration: { requestedScopes: ['READ_BRAND'] },
+  }),
+  false,
+)
+const automaticIntakeAudit = []
+function automaticIntakeClient({
+  account,
+  policy = null,
+  queued = 1,
+  cancelled = 0,
+}) {
+  const queries = []
+  return {
+    queries,
+    async query(sql) {
+      queries.push(sql)
+      if (sql.includes('AS product_target_ready')) {
+        return { rows: account ? [account] : [], rowCount: account ? 1 : 0 }
+      }
+      if (sql.includes('SELECT unmatched_action, revision')) {
+        return { rows: policy ? [policy] : [], rowCount: policy ? 1 : 0 }
+      }
+      if (sql.includes(
+        'INSERT INTO operations_commerce_product_intake_policies',
+      )) {
+        return { rows: [], rowCount: 1 }
+      }
+      if (sql.includes('UPDATE operations_commerce_catalog_sync_jobs')) {
+        return { rows: [], rowCount: cancelled }
+      }
+      if (sql.includes('INSERT INTO operations_commerce_catalog_sync_jobs')) {
+        return { rows: [], rowCount: queued }
+      }
+      throw new Error(`Unexpected automatic-intake query: ${sql}`)
+    },
+  }
+}
+const automaticIntakeModule = loadTypeScriptModule(
+  'app_src/lib/persistence/commerceCatalogSync.ts',
+  {
+    mocks: {
+      '@/lib/auditWriter': {
+        async recordAuditEvent(event) {
+          automaticIntakeAudit.push(event)
+        },
+      },
+      '@/lib/persistence/postgres': {
+        async query() {
+          throw new Error('Unexpected database query')
+        },
+        async withTransaction() {
+          throw new Error('Unexpected transaction')
+        },
+      },
+    },
+  },
+)
+const automaticIntakeAccount = {
+  global_id: 'gcia0000001',
+  provider: 'shopify',
+  status: 'disabled',
+  configuration: { grantedScopes: ['read_products'] },
+  commerce_credential_generation: 3,
+  credential_version: 3,
+  verification_status: 'verified',
+  auth_mode: 'shopify_client_credentials',
+  product_target_ready: true,
+}
+const automaticIntakeReadyClient = automaticIntakeClient({
+  account: automaticIntakeAccount,
+})
+const savedBehaviorRuntime = {
+  enabled: process.env.CLAWPILOT_COMMERCE_INTAKE_ENABLED,
+  lane: process.env.CLAWPILOT_ENV,
+}
+process.env.CLAWPILOT_COMMERCE_INTAKE_ENABLED = '1'
+process.env.CLAWPILOT_ENV = 'development'
+const automaticIntakeReady =
+  await automaticIntakeModule.ensureAutomaticCommerceCatalogIntakeWithClient(
+    automaticIntakeReadyClient,
+    {
+      organizationId: '11111111-1111-4111-8111-111111111111',
+      integrationAccountId: '22222222-2222-4222-8222-222222222222',
+      actorEmail: 'operator@example.com',
+    },
+  )
+assert.deepEqual(
+  JSON.parse(JSON.stringify(automaticIntakeReady)),
+  {
+    eligible: true,
+    initialized: true,
+    paused: false,
+    waitingForProductTarget: false,
+    policyRevision: 1,
+    queued: 1,
+    cancelled: 0,
+  },
+  'A verified product-readable connection must initialize and queue automatically',
+)
+assert.equal(automaticIntakeAudit.length, 1)
+const automaticIntakeWaitingClient = automaticIntakeClient({
+  account: {
+    ...automaticIntakeAccount,
+    product_target_ready: false,
+  },
+})
+const automaticIntakeWaiting =
+  await automaticIntakeModule.ensureAutomaticCommerceCatalogIntakeWithClient(
+    automaticIntakeWaitingClient,
+    {
+      organizationId: '11111111-1111-4111-8111-111111111111',
+      integrationAccountId: '22222222-2222-4222-8222-222222222222',
+      actorEmail: 'operator@example.com',
+    },
+  )
+assert.equal(automaticIntakeWaiting.initialized, true)
+assert.equal(automaticIntakeWaiting.waitingForProductTarget, true)
+assert.equal(automaticIntakeWaiting.queued, 0)
+assert.equal(
+  automaticIntakeWaitingClient.queries.some(
+    (sql) => sql.includes(
+      'INSERT INTO operations_commerce_catalog_sync_jobs',
+    ),
+  ),
+  false,
+  'Workspace target readiness must not become another user approval',
+)
+const automaticIntakePausedClient = automaticIntakeClient({
+  account: automaticIntakeAccount,
+  policy: { unmatched_action: 'review', revision: 4 },
+})
+const automaticIntakePaused =
+  await automaticIntakeModule.ensureAutomaticCommerceCatalogIntakeWithClient(
+    automaticIntakePausedClient,
+    {
+      organizationId: '11111111-1111-4111-8111-111111111111',
+      integrationAccountId: '22222222-2222-4222-8222-222222222222',
+      actorEmail: 'operator@example.com',
+    },
+  )
+assert.equal(automaticIntakePaused.paused, true)
+assert.equal(automaticIntakePaused.queued, 0)
+assert.equal(automaticIntakePaused.policyRevision, 4)
+const automaticIntakeScopeLossClient = automaticIntakeClient({
+  account: {
+    ...automaticIntakeAccount,
+    configuration: { grantedScopes: ['read_orders'] },
+  },
+  cancelled: 1,
+})
+const automaticIntakeScopeLoss =
+  await automaticIntakeModule.ensureAutomaticCommerceCatalogIntakeWithClient(
+    automaticIntakeScopeLossClient,
+    {
+      organizationId: '11111111-1111-4111-8111-111111111111',
+      integrationAccountId: '22222222-2222-4222-8222-222222222222',
+      actorEmail: 'operator@example.com',
+    },
+  )
+assert.equal(automaticIntakeScopeLoss.eligible, false)
+assert.equal(automaticIntakeScopeLoss.cancelled, 1)
+assert.equal(
+  automaticIntakeScopeLossClient.queries.some(
+    (sql) => sql.includes('SELECT unmatched_action, revision'),
+  ),
+  false,
+  'Product-scope loss must fence active work before consulting auto policy',
+)
+if (savedBehaviorRuntime.enabled === undefined) {
+  delete process.env.CLAWPILOT_COMMERCE_INTAKE_ENABLED
+} else {
+  process.env.CLAWPILOT_COMMERCE_INTAKE_ENABLED =
+    savedBehaviorRuntime.enabled
+}
+if (savedBehaviorRuntime.lane === undefined) {
+  delete process.env.CLAWPILOT_ENV
+} else {
+  process.env.CLAWPILOT_ENV = savedBehaviorRuntime.lane
+}
+const savedAutomaticCatalogRuntime = {
+  enabled: process.env.CLAWPILOT_COMMERCE_INTAKE_ENABLED,
+  lane: process.env.CLAWPILOT_ENV,
+}
+process.env.CLAWPILOT_COMMERCE_INTAKE_ENABLED = '1'
+process.env.CLAWPILOT_ENV = 'development'
+assert.equal(
+  catalogCredentialPolicyModule.automaticCommerceCatalogRuntimeAvailable(),
+  true,
+)
+process.env.CLAWPILOT_ENV = 'production'
+assert.equal(
+  catalogCredentialPolicyModule.automaticCommerceCatalogRuntimeAvailable(),
+  false,
+  'Connecting in production must not create a dormant development catalog job',
+)
+if (savedAutomaticCatalogRuntime.enabled === undefined) {
+  delete process.env.CLAWPILOT_COMMERCE_INTAKE_ENABLED
+} else {
+  process.env.CLAWPILOT_COMMERCE_INTAKE_ENABLED =
+    savedAutomaticCatalogRuntime.enabled
+}
+if (savedAutomaticCatalogRuntime.lane === undefined) {
+  delete process.env.CLAWPILOT_ENV
+} else {
+  process.env.CLAWPILOT_ENV = savedAutomaticCatalogRuntime.lane
+}
 assert.ok(
   !catalogSyncPersistenceSource.includes('MAX_CATALOG_PAGES'),
   'Successful 50-row catalog pages must continue until provider exhaustion',
@@ -674,6 +959,34 @@ const productCandidateResolverSource = persistenceSource.slice(
   ),
   persistenceSource.indexOf('function automaticProductResolution'),
 )
+const automaticCredentialFenceSource = persistenceSource.slice(
+  persistenceSource.indexOf(
+    'async function assertCurrentAutomaticProductCredentialFence',
+  ),
+  persistenceSource.indexOf('const CANDIDATE_SELECT'),
+)
+includes(automaticCredentialFenceSource, [
+  'JOIN operations_commerce_credentials credential',
+  'account.organization_id = $1::uuid',
+  'account.id = $2::uuid',
+  'account.provider = $3',
+  'FOR UPDATE OF credential',
+  "current.status === 'error'",
+  "current.verification_status !== 'verified'",
+  'current.commerce_credential_generation',
+  '!== input.runtime.credentialVersion',
+  'current.credential_version !== input.runtime.credentialVersion',
+  'commerceCatalogCredentialSupportsProducts',
+  "'COMMERCE_PRODUCT_AUTO_CREATE_DISABLED'",
+], 'Per-candidate automatic product credential and scope fence')
+assert.ok(
+  productCandidateResolverSource.indexOf(
+    'await assertCurrentAutomaticProductCredentialFence(client',
+  ) < productCandidateResolverSource.indexOf(
+    'stageCrmRecordWithClient(client',
+  ),
+  'Automatic product creation must recheck the current credential generation, verification, and product scope inside the product mutation transaction',
+)
 assert.ok(
   productCandidateResolverSource.indexOf(
     'FOR UPDATE OF mapping, product',
@@ -873,8 +1186,9 @@ includes(workflowSource, [
   'confirmProviderWriteOff: true',
 ], 'Commerce intake executable recovery and catalog workflow')
 includes(workflowSource, [
-  'Keep ClawPilot products synchronized automatically',
-  'Authorize the sales channel once. ClawPilot then reads',
+  'Pause or resume product catalog sync',
+  'This verified connection authorizes automatic read-only catalog sync.',
+  'Your verified ${providerLabel(provider)} connection authorizes automatic read-only product synchronization with no second approval.',
   "'set-product-intake-policy'",
   'expectedPolicyRevision: productIntakePolicyRevision',
   "unmatchedAction: enabled ? 'auto_create' : 'review'",
@@ -890,6 +1204,10 @@ includes(workflowSource, [
   '!connectionReady',
   'Reconnect and verify ${providerLabel(provider)}',
 ], 'Durable future-product policy controls')
+assert.ok(
+  !workflowSource.includes('Turn on automatic product sync for ${displayName}?'),
+  'A verified connection must not lead to a second catalog authorization modal',
+)
 const commerceIntegrationPanelSource = read(
   'app_src/components/settings/CommerceIntegrationPanel.tsx',
 )

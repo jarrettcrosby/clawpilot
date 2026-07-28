@@ -29,6 +29,7 @@ import {
 } from '@/lib/persistence/postgres'
 import {
   applyCommerceCatalogSyncPolicyWithClient,
+  commerceCatalogCredentialSupportsProducts,
   readCommerceCatalogSyncStateWithClient,
 } from '@/lib/persistence/commerceCatalogSync'
 
@@ -962,6 +963,73 @@ async function commandStart(
     )
   }
   return { account, requestHash, ...prepared }
+}
+
+async function assertCurrentAutomaticProductCredentialFence(
+  client: PoolClient,
+  input: {
+    account: IntakeAccountRow
+    runtime: CommerceRuntimeCredentialRecord
+  },
+) {
+  const current = (
+    await client.query<{
+      status: 'active' | 'disabled' | 'error'
+      configuration: Record<string, unknown>
+      commerce_credential_generation: number
+      credential_version: number
+      verification_status: 'unverified' | 'verified' | 'failed'
+      auth_mode:
+        | 'shopify_client_credentials'
+        | 'faire_brand_token'
+        | 'faire_oauth'
+    }>(
+      `SELECT
+         account.status,
+         account.configuration,
+         account.commerce_credential_generation,
+         credential.credential_version,
+         credential.verification_status,
+         credential.auth_mode
+       FROM operations_integration_accounts account
+       JOIN operations_commerce_credentials credential
+         ON credential.organization_id = account.organization_id
+        AND credential.integration_account_id = account.id
+       WHERE account.organization_id = $1::uuid
+         AND account.id = $2::uuid
+         AND account.integration_type = 'commerce'
+         AND account.provider = $3
+       LIMIT 1
+       FOR UPDATE OF credential`,
+      [
+        input.account.organization_id,
+        input.account.id,
+        input.runtime.provider,
+      ],
+    )
+  ).rows[0]
+  const productReadable = current
+    ? commerceCatalogCredentialSupportsProducts({
+        provider: input.runtime.provider,
+        authMode: current.auth_mode,
+        configuration: current.configuration,
+      })
+    : false
+  if (
+    !current
+    || current.status === 'error'
+    || current.verification_status !== 'verified'
+    || current.commerce_credential_generation
+      !== input.runtime.credentialVersion
+    || current.credential_version !== input.runtime.credentialVersion
+    || !productReadable
+  ) {
+    intakeError(
+      'COMMERCE_PRODUCT_AUTO_CREATE_DISABLED',
+      'The current verified commerce connection no longer authorizes automatic product creation',
+      409,
+    )
+  }
 }
 
 const CANDIDATE_SELECT = `SELECT
@@ -5956,6 +6024,10 @@ export async function resolveCommerceProductCandidateInPostgres(input: {
     )
     if (started.replayed) return replayPayload(started.receipt)
     if (input.automatic) {
+      await assertCurrentAutomaticProductCredentialFence(client, {
+        account: started.account,
+        runtime: input.runtime,
+      })
       const automaticPolicy = (
         await client.query<ProductIntakePolicyRow>(
           `SELECT policy_version, unmatched_action, revision, updated_at

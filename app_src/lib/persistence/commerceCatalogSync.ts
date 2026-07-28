@@ -7,6 +7,25 @@ const CATALOG_SYNC_POLICY_VERSION = 'commerce-product-intake-policy-v1'
 const CATALOG_RECONCILIATION_INTERVAL = '6 hours'
 const CATALOG_SYNC_LEASE = '10 minutes'
 const WORKER_HEARTBEAT_KEY = 'commerce.catalog.worker.heartbeat'
+const PRODUCT_READABLE_CONNECTION_SQL = `(
+  (
+    account.provider = 'shopify'
+    AND COALESCE(
+      account.configuration->'grantedScopes',
+      '[]'::jsonb
+    ) ? 'read_products'
+  )
+  OR (
+    account.provider = 'faire'
+    AND (
+      credential.auth_mode = 'faire_brand_token'
+      OR COALESCE(
+        account.configuration->'requestedScopes',
+        '[]'::jsonb
+      ) ? 'READ_PRODUCTS'
+    )
+  )
+)`
 
 export type CommerceCatalogSyncJob = {
   id: string
@@ -23,6 +42,16 @@ export type CommerceCatalogSyncJob = {
   attemptCount: number
   maxAttempts: number
   lockToken: string
+}
+
+type AutomaticCatalogIntakeState = {
+  eligible: boolean
+  initialized: boolean
+  paused: boolean
+  waitingForProductTarget: boolean
+  policyRevision: number | null
+  queued: number
+  cancelled: number
 }
 
 type CatalogSyncTotals = {
@@ -67,6 +96,39 @@ const RESTART_ERROR_CODES = new Set([
   'COMMERCE_INTAKE_CONTINUATION_NOT_FOUND',
 ])
 
+async function cancelCommerceCatalogSyncJobsWithClient(
+  client: PoolClient,
+  input: {
+    organizationId: string
+    integrationAccountId: string
+    errorCode: string
+  },
+) {
+  const cancelled = await client.query(
+    `UPDATE operations_commerce_catalog_sync_jobs
+     SET status = CASE
+           WHEN status = 'processing' THEN status
+           ELSE 'cancelled'
+         END,
+         cancel_requested = true,
+         completed_at = CASE
+           WHEN status = 'processing' THEN completed_at
+           ELSE now()
+         END,
+         last_error_code = $3,
+         updated_at = now()
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND status IN ('pending', 'processing', 'failed')`,
+    [
+      input.organizationId,
+      input.integrationAccountId,
+      input.errorCode,
+    ],
+  )
+  return cancelled.rowCount || 0
+}
+
 export async function applyCommerceCatalogSyncPolicyWithClient(
   client: PoolClient,
   input: {
@@ -100,19 +162,68 @@ export async function applyCommerceCatalogSyncPolicyWithClient(
     return { queued: 0, cancelled: cancelled.rowCount || 0 }
   }
 
+  const stale = await client.query(
+    `UPDATE operations_commerce_catalog_sync_jobs
+     SET status = CASE
+           WHEN status = 'processing' THEN status
+           ELSE 'cancelled'
+         END,
+         cancel_requested = true,
+         completed_at = CASE
+           WHEN status = 'processing' THEN completed_at
+           ELSE now()
+         END,
+         last_error_code = 'COMMERCE_CATALOG_SYNC_FENCE_CHANGED',
+         updated_at = now()
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND status IN ('pending', 'processing', 'failed')
+       AND (
+         credential_version <> $3::integer
+         OR policy_revision <> $4::integer
+       )`,
+    [
+      input.organizationId,
+      input.integrationAccountId,
+      input.credentialVersion,
+      input.policyRevision,
+    ],
+  )
   const queued = await client.query(
     `INSERT INTO operations_commerce_catalog_sync_jobs (
        organization_id, integration_account_id, provider,
        credential_version, policy_revision, requested_by
      )
-     SELECT $1::uuid, $2::uuid, $3, $4, $5, $6
-     WHERE NOT EXISTS (
-       SELECT 1
-       FROM operations_commerce_catalog_sync_jobs active
-       WHERE active.organization_id = $1::uuid
-         AND active.integration_account_id = $2::uuid
-         AND active.status IN ('pending', 'processing', 'failed')
-     )
+     SELECT
+       account.organization_id,
+       account.id,
+       account.provider,
+       account.commerce_credential_generation,
+       $5,
+       $6
+     FROM operations_integration_accounts account
+     JOIN operations_commerce_credentials credential
+       ON credential.organization_id = account.organization_id
+      AND credential.integration_account_id = account.id
+     JOIN operations_activation_scopes activation
+       ON activation.organization_id = account.organization_id
+     WHERE account.organization_id = $1::uuid
+       AND account.id = $2::uuid
+       AND account.integration_type = 'commerce'
+       AND account.provider = $3
+       AND account.status <> 'error'
+       AND account.commerce_credential_generation = $4
+       AND credential.credential_version = $4
+       AND credential.verification_status = 'verified'
+       AND activation.state IN ('shadow', 'active')
+       AND ${PRODUCT_READABLE_CONNECTION_SQL}
+       AND NOT EXISTS (
+         SELECT 1
+         FROM operations_commerce_catalog_sync_jobs active
+         WHERE active.organization_id = $1::uuid
+           AND active.integration_account_id = $2::uuid
+           AND active.status IN ('pending', 'processing', 'failed')
+       )
      ON CONFLICT (
        organization_id, integration_account_id
      ) WHERE status IN ('pending', 'processing', 'failed')
@@ -126,11 +237,312 @@ export async function applyCommerceCatalogSyncPolicyWithClient(
       input.actorEmail,
     ],
   )
-  return { queued: queued.rowCount || 0, cancelled: 0 }
+  return {
+    queued: queued.rowCount || 0,
+    cancelled: stale.rowCount || 0,
+  }
+}
+
+function stringArray(value: unknown) {
+  if (!Array.isArray(value)) return []
+  return value.filter((item): item is string => typeof item === 'string')
+}
+
+export function automaticCommerceCatalogRuntimeAvailable() {
+  if (process.env.CLAWPILOT_COMMERCE_INTAKE_ENABLED !== '1') return false
+  const lane = String(
+    process.env.CLAWPILOT_ENV
+    || process.env.RAILWAY_ENVIRONMENT_NAME
+    || process.env.VERCEL_ENV
+    || process.env.NODE_ENV
+    || '',
+  ).trim().toLowerCase()
+  return ['dev', 'development', 'local', 'preview'].includes(lane)
+}
+
+export function commerceCatalogCredentialSupportsProducts(input: {
+  provider: 'shopify' | 'faire'
+  authMode:
+    | 'shopify_client_credentials'
+    | 'faire_brand_token'
+    | 'faire_oauth'
+  configuration: Record<string, unknown>
+}) {
+  if (input.provider === 'shopify') {
+    return new Set(
+      stringArray(input.configuration.grantedScopes),
+    ).has('read_products')
+  }
+  return (
+    input.authMode === 'faire_brand_token'
+    || new Set(
+      stringArray(input.configuration.requestedScopes),
+    ).has('READ_PRODUCTS')
+  )
+}
+
+export async function ensureAutomaticCommerceCatalogIntakeWithClient(
+  client: PoolClient,
+  input: {
+    organizationId: string
+    integrationAccountId: string
+    actorEmail: string | null
+  },
+): Promise<AutomaticCatalogIntakeState> {
+  if (!automaticCommerceCatalogRuntimeAvailable()) {
+    return {
+      eligible: false,
+      initialized: false,
+      paused: false,
+      waitingForProductTarget: false,
+      policyRevision: null,
+      queued: 0,
+      cancelled: 0,
+    }
+  }
+  const account = (
+    await client.query<{
+      global_id: string
+      provider: 'shopify' | 'faire'
+      status: 'active' | 'disabled' | 'error'
+      configuration: Record<string, unknown>
+      commerce_credential_generation: number
+      credential_version: number
+      verification_status: 'unverified' | 'verified' | 'failed'
+      auth_mode:
+        | 'shopify_client_credentials'
+        | 'faire_brand_token'
+        | 'faire_oauth'
+      product_target_ready: boolean
+    }>(
+      `SELECT
+         account.global_id,
+         account.provider,
+         account.status,
+         account.configuration,
+         account.commerce_credential_generation,
+         credential.credential_version,
+         credential.verification_status,
+         credential.auth_mode,
+         EXISTS (
+           SELECT 1
+           FROM operations_activation_scopes activation
+           WHERE activation.organization_id = account.organization_id
+             AND activation.state IN ('shadow', 'active')
+         ) AS product_target_ready
+       FROM operations_integration_accounts account
+       JOIN operations_commerce_credentials credential
+         ON credential.organization_id = account.organization_id
+        AND credential.integration_account_id = account.id
+       WHERE account.organization_id = $1::uuid
+         AND account.id = $2::uuid
+         AND account.integration_type = 'commerce'
+         AND account.provider IN ('shopify', 'faire')
+       LIMIT 1
+       FOR UPDATE OF account, credential`,
+      [input.organizationId, input.integrationAccountId],
+    )
+  ).rows[0]
+  if (
+    !account
+    || account.status === 'error'
+    || account.verification_status !== 'verified'
+    || account.credential_version
+      !== account.commerce_credential_generation
+  ) {
+    const cancelled = account
+      ? await cancelCommerceCatalogSyncJobsWithClient(client, {
+          organizationId: input.organizationId,
+          integrationAccountId: input.integrationAccountId,
+          errorCode: 'COMMERCE_CATALOG_SYNC_CONNECTION_INELIGIBLE',
+        })
+      : 0
+    return {
+      eligible: false,
+      initialized: false,
+      paused: false,
+      waitingForProductTarget: false,
+      policyRevision: null,
+      queued: 0,
+      cancelled,
+    }
+  }
+
+  const productReadable = commerceCatalogCredentialSupportsProducts({
+    provider: account.provider,
+    authMode: account.auth_mode,
+    configuration: account.configuration,
+  })
+  if (!productReadable) {
+    const cancelled = await cancelCommerceCatalogSyncJobsWithClient(client, {
+      organizationId: input.organizationId,
+      integrationAccountId: input.integrationAccountId,
+      errorCode: 'COMMERCE_CATALOG_SYNC_SCOPE_INELIGIBLE',
+    })
+    return {
+      eligible: false,
+      initialized: false,
+      paused: false,
+      waitingForProductTarget: false,
+      policyRevision: null,
+      queued: 0,
+      cancelled,
+    }
+  }
+
+  const existing = (
+    await client.query<{
+      unmatched_action: 'review' | 'auto_create'
+      revision: number
+    }>(
+      `SELECT unmatched_action, revision
+       FROM operations_commerce_product_intake_policies
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+       LIMIT 1
+       FOR UPDATE`,
+      [input.organizationId, input.integrationAccountId],
+    )
+  ).rows[0] || null
+  if (existing?.unmatched_action === 'review') {
+    return {
+      eligible: true,
+      initialized: false,
+      paused: true,
+      waitingForProductTarget: false,
+      policyRevision: Number(existing.revision),
+      queued: 0,
+      cancelled: 0,
+    }
+  }
+
+  let initialized = false
+  let policyRevision = Number(existing?.revision || 0)
+  if (!existing) {
+    policyRevision = 1
+    await client.query(
+      `INSERT INTO operations_commerce_product_intake_policies (
+         organization_id, integration_account_id, policy_version,
+         unmatched_action, revision, created_by, updated_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3, 'auto_create', 1, $4, $4
+       )`,
+      [
+        input.organizationId,
+        input.integrationAccountId,
+        CATALOG_SYNC_POLICY_VERSION,
+        input.actorEmail,
+      ],
+    )
+    initialized = true
+  }
+
+  const catalogSync = account.product_target_ready
+    ? await applyCommerceCatalogSyncPolicyWithClient(
+        client,
+        {
+          organizationId: input.organizationId,
+          integrationAccountId: input.integrationAccountId,
+          provider: account.provider,
+          credentialVersion: account.commerce_credential_generation,
+          policyRevision,
+          unmatchedAction: 'auto_create',
+          actorEmail: input.actorEmail || 'system:commerce-catalog',
+        },
+      )
+    : {
+        queued: 0,
+        cancelled: await cancelCommerceCatalogSyncJobsWithClient(client, {
+          organizationId: input.organizationId,
+          integrationAccountId: input.integrationAccountId,
+          errorCode: 'COMMERCE_CATALOG_SYNC_PRODUCT_TARGET_WAITING',
+        }),
+      }
+  if (initialized) {
+    await recordAuditEvent({
+      actor: input.actorEmail,
+      eventType: 'commerce.intake.product_policy.connected_default',
+      aggregateType: 'operations.integration_account',
+      aggregateId: account.global_id,
+      organizationId: input.organizationId,
+      isSystem: !input.actorEmail,
+      eventKey:
+        `commerce-product-policy:${account.global_id}:connected-default:v${account.commerce_credential_generation}`,
+      payload: {
+        provider: account.provider,
+        policyVersion: CATALOG_SYNC_POLICY_VERSION,
+        unmatchedAction: 'auto_create',
+        revision: policyRevision,
+        connectionIsAuthorization: true,
+        productTargetReady: account.product_target_ready,
+        catalogSyncQueued: catalogSync.queued,
+        providerWrites: 0,
+        ordersTouched: 0,
+        inventoryTouched: 0,
+      },
+    }, client)
+  }
+  return {
+    eligible: true,
+    initialized,
+    paused: false,
+    waitingForProductTarget: !account.product_target_ready,
+    policyRevision,
+    queued: catalogSync.queued,
+    cancelled: catalogSync.cancelled,
+  }
 }
 
 export async function queueAutomaticCommerceCatalogSyncsInPostgres() {
+  if (!automaticCommerceCatalogRuntimeAvailable()) return 0
   return withTransaction(async (client) => {
+    const missingPolicies = await client.query<{
+      organization_id: string
+      integration_account_id: string
+      actor_email: string | null
+    }>(
+      `SELECT
+         account.organization_id::text,
+         account.id::text AS integration_account_id,
+         COALESCE(
+           account.updated_by,
+           account.created_by,
+           credential.updated_by,
+           credential.created_by
+         ) AS actor_email
+       FROM operations_integration_accounts account
+       JOIN operations_commerce_credentials credential
+         ON credential.organization_id = account.organization_id
+        AND credential.integration_account_id = account.id
+       WHERE account.integration_type = 'commerce'
+         AND account.provider IN ('shopify', 'faire')
+         AND account.status <> 'error'
+         AND account.commerce_credential_generation > 0
+         AND credential.credential_version
+           = account.commerce_credential_generation
+         AND credential.verification_status = 'verified'
+         AND ${PRODUCT_READABLE_CONNECTION_SQL}
+         AND NOT EXISTS (
+           SELECT 1
+           FROM operations_commerce_product_intake_policies policy
+           WHERE policy.organization_id = account.organization_id
+             AND policy.integration_account_id = account.id
+         )
+       FOR UPDATE OF account, credential`,
+    )
+    let connectedDefaultQueued = 0
+    for (const missing of missingPolicies.rows) {
+      const ensured = await ensureAutomaticCommerceCatalogIntakeWithClient(
+        client,
+        {
+          organizationId: missing.organization_id,
+          integrationAccountId: missing.integration_account_id,
+          actorEmail: missing.actor_email,
+        },
+      )
+      connectedDefaultQueued += ensured.queued
+    }
+
     await client.query(
       `UPDATE operations_commerce_catalog_sync_jobs job
        SET status = CASE
@@ -171,6 +583,7 @@ export async function queueAutomaticCommerceCatalogSyncsInPostgres() {
                AND credential.credential_version = job.credential_version
                AND credential.verification_status = 'verified'
                AND activation.state IN ('shadow', 'active')
+               AND ${PRODUCT_READABLE_CONNECTION_SQL}
            )
          )`,
       [CATALOG_SYNC_POLICY_VERSION],
@@ -207,6 +620,7 @@ export async function queueAutomaticCommerceCatalogSyncsInPostgres() {
            = account.commerce_credential_generation
          AND credential.verification_status = 'verified'
          AND activation.state IN ('shadow', 'active')
+         AND ${PRODUCT_READABLE_CONNECTION_SQL}
          AND COALESCE(policy.updated_by, policy.created_by) IS NOT NULL
          AND NOT EXISTS (
            SELECT 1
@@ -233,7 +647,7 @@ export async function queueAutomaticCommerceCatalogSyncsInPostgres() {
        DO NOTHING`,
       [CATALOG_SYNC_POLICY_VERSION],
     )
-    return queued.rowCount || 0
+    return connectedDefaultQueued + (queued.rowCount || 0)
   })
 }
 
@@ -298,6 +712,7 @@ export async function claimCommerceCatalogSyncJobsInPostgres(input: {
            AND credential.credential_version = job.credential_version
            AND credential.verification_status = 'verified'
            AND activation.state IN ('shadow', 'active')
+           AND ${PRODUCT_READABLE_CONNECTION_SQL}
          ORDER BY job.available_at, job.created_at, job.id
          FOR UPDATE OF job SKIP LOCKED
          LIMIT $2
@@ -391,6 +806,7 @@ async function currentJobFence(
        AND credential.credential_version = queued.credential_version
        AND credential.verification_status = 'verified'
        AND activation.state IN ('shadow', 'active')
+       AND ${PRODUCT_READABLE_CONNECTION_SQL}
      FOR UPDATE OF queued`,
     [
       job.id,
@@ -758,7 +1174,7 @@ export async function readCommerceCatalogSyncStateWithClient(
             : row.status === 'dead'
               ? 'dead'
               : row.status === 'cancelled'
-                ? 'paused'
+                ? 'idle'
                 : 'idle'
   const nextRunAt = row.unmatched_action === 'review'
     ? null
