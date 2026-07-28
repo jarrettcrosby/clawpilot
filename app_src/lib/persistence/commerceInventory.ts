@@ -799,7 +799,7 @@ async function activeMappings(
     `SELECT mapping.external_inventory_item_id,
             min(mapping.pipeline_id::text) AS pipeline_id,
             min(mapping.product_id::text) AS product_id,
-            min(product.global_id) AS product_global_id,
+            min(product.reference_code) AS product_global_id,
             min(product.name) AS product_name,
             min(product.sku) AS product_sku,
             count(*)::text AS mapping_count
@@ -1832,7 +1832,7 @@ export async function readShopifyInventoryStateFromPostgres(input: {
   const levels = await query<LatestLevelRow>(
     `SELECT level.global_id, level.external_inventory_item_id, level.sku,
             level.tracked, level.mapping_state, level.projection_state,
-            product.global_id AS product_global_id,
+            product.reference_code AS product_global_id,
             product.name AS product_name,
             level.provider_available_quantity::text,
             level.provider_incoming_quantity::text,
