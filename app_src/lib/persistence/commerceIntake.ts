@@ -12,6 +12,12 @@ import {
 import { CommerceIntegrationRequestError } from '@/lib/integrations/commerceIntegrations'
 import { exactProductMappingMutation } from '@/lib/integrations/commerceProductMappingPolicy'
 import { commerceProductDisplayName } from '@/lib/integrations/commerceProductNaming'
+import {
+  normalizeCommerceProductChannelStatus,
+} from '@/lib/integrations/commerceProductLifecycle'
+import {
+  selectCanonicalCommerceProductIdentity,
+} from '@/lib/integrations/commerceCanonicalProductIdentity'
 import type { CommerceRuntimeCredentialRecord } from '@/lib/persistence/commerceIntegrations'
 import {
   commerceCurrencyMinorUnit,
@@ -33,6 +39,10 @@ import {
   commerceCatalogCredentialSupportsProducts,
   readCommerceCatalogSyncStateWithClient,
 } from '@/lib/persistence/commerceCatalogSync'
+import {
+  linkProductChannelStateWithClient,
+  upsertProductChannelStateWithClient,
+} from '@/lib/persistence/productChannelStates'
 
 const POLICY_VERSION = 'commerce-intake-resolution-v1'
 const PRODUCT_INTAKE_POLICY_VERSION = 'commerce-product-intake-policy-v1'
@@ -1969,21 +1979,6 @@ function optionalOrderMoney(
 
 function optionalMoney(field: CommerceDataField<CommerceMoneySet>) {
   return primaryMoney(field)
-}
-
-function providerProductStatus(product: {
-  active: boolean | null
-  lifecycleState: string | null
-}) {
-  const raw = providerStatus(product.lifecycleState)
-  if (product.active === true) return { raw, normalized: 'active' }
-  if (product.active === false) {
-    const value = raw.toLowerCase()
-    if (value.includes('draft')) return { raw, normalized: 'draft' }
-    if (value.includes('archiv')) return { raw, normalized: 'archived' }
-    return { raw, normalized: 'unavailable' }
-  }
-  return { raw, normalized: 'unknown' }
 }
 
 function exactMappingIdentity(line: CommerceNormalizedOrderLine) {
@@ -4120,12 +4115,35 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
     let productVariantsStaged = 0
     let productVariantsPreserved = 0
     for (const product of input.envelope.products) {
-      const status = providerProductStatus(product)
+      const status = normalizeCommerceProductChannelStatus(product)
       for (const variant of product.variants) {
         const incomingSourceRevision = sourceRevision(
           variant.providerUpdatedAt,
           variant.sourceHash,
         )
+        const inventoryItem = availableValue(
+          variant.inventoryItemIdentity,
+        )
+        const mapping = mappingByVariant.get(variant.identity.value)
+        await upsertProductChannelStateWithClient(client, {
+          organizationId: account.organization_id,
+          integrationAccountId: account.id,
+          pipelineId: account.pipeline_id,
+          provider: account.provider,
+          externalProductId: product.identity.value,
+          externalVariantId: variant.identity.value,
+          externalInventoryItemId: inventoryItem?.value ?? null,
+          productId: mapping?.product_id || null,
+          productMappingId: mapping?.id || null,
+          providerStatusRaw: status.raw,
+          normalizedStatus: status.normalized,
+          providerActive: status.providerActive,
+          providerUpdatedAt: variant.providerUpdatedAt,
+          observedAt: input.envelope.observedAt,
+          sourceRevision: incomingSourceRevision,
+          sourceHash: variant.sourceHash,
+          actorEmail: input.actorEmail,
+        })
         const prior = latestProductEvidenceByVariant.get(
           variant.identity.value,
         )
@@ -4156,8 +4174,6 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
           ? retailPrice
           : null
         const packaging = availableValue(variant.packaging)
-        const inventoryItem = availableValue(variant.inventoryItemIdentity)
-        const mapping = mappingByVariant.get(variant.identity.value)
         const productCandidate = await client.query<{ id: string }>(
           `INSERT INTO operations_commerce_product_candidates (
              organization_id, integration_account_id, pipeline_id, run_id,
@@ -5989,6 +6005,85 @@ function replayPayload(receipt: ReceiptRow) {
   }
 }
 
+async function findStableCanonicalProductWithClient(
+  client: PoolClient,
+  input: {
+    pipelineId: string
+    providerSku: string | null
+    barcode: string | null
+  },
+) {
+  const providerSku = input.providerSku?.trim() || null
+  const barcode = input.barcode?.trim() || null
+  if (!providerSku && !barcode) return null
+  await acquireTransactionAdvisoryLock(
+    client,
+    `commerce-catalog-stable-identity:${input.pipelineId}:${
+      commandHash({ providerSku: providerSku?.toLowerCase(), barcode })
+    }`,
+  )
+  const result = await client.query<{
+    id: string
+    reference_code: string
+    sku: string | null
+    barcode: string | null
+  }>(
+    `SELECT
+       product.id::text,
+       product.reference_code,
+       product.sku,
+       NULLIF(
+         btrim(product.source_payload #>> '{providerSnapshot,barcode}'),
+         ''
+       ) AS barcode
+     FROM crm_products AS product
+     WHERE product.pipeline_id = $1::uuid
+       AND COALESCE(
+         lower(product.source_payload->>'archived'),
+         'false'
+       ) NOT IN ('true', '1', 'yes')
+       AND (
+         (
+           $2::text IS NOT NULL
+           AND lower(btrim(product.sku)) = lower(btrim($2))
+         )
+         OR (
+           $3::text IS NOT NULL
+           AND btrim(
+             product.source_payload #>> '{providerSnapshot,barcode}'
+           ) = btrim($3)
+         )
+       )
+     ORDER BY product.id
+     FOR UPDATE`,
+    [input.pipelineId, providerSku, barcode],
+  )
+  const selection = selectCanonicalCommerceProductIdentity({
+    providerSku,
+    barcode,
+    candidates: result.rows.map((row) => ({
+      productId: row.id,
+      productGlobalId: row.reference_code,
+      sku: row.sku,
+      barcode: row.barcode,
+    })),
+  })
+  if (selection.kind === 'ambiguous') {
+    intakeError(
+      'COMMERCE_PRODUCT_CANONICAL_IDENTITY_AMBIGUOUS',
+      'The provider SKU or GTIN matches conflicting catalog products. Review the exact identities before mapping; ClawPilot will not merge by name or pack level.',
+      409,
+    )
+  }
+  if (selection.kind === 'none') return null
+  return {
+    id: selection.candidate.productId,
+    globalId: selection.candidate.productGlobalId,
+    sku: selection.candidate.sku,
+    matchedBy: selection.matchedBy,
+  }
+}
+
 export function automaticLocalProductSku(input: {
   providerSku: string | null
   localSkuOccupied: boolean
@@ -6322,6 +6417,11 @@ export async function resolveCommerceProductCandidateInPostgres(input: {
     }
     let productWasCreated = false
     let automaticLocalSkuOmitted = false
+    let canonicalReuseMethod:
+      | 'stable_sku'
+      | 'stable_barcode'
+      | 'stable_sku_and_barcode'
+      | null = null
     if (preservedAutomaticMapping) {
       product = {
         id: preservedAutomaticMapping.product_id,
@@ -6398,6 +6498,20 @@ export async function resolveCommerceProductCandidateInPostgres(input: {
           sku: existing.sku,
         }
       } else {
+        const canonicalProduct =
+          await findStableCanonicalProductWithClient(client, {
+            pipelineId: candidate.pipeline_id,
+            providerSku: candidate.sku_snapshot,
+            barcode: candidate.barcode_snapshot,
+          })
+        if (canonicalProduct) {
+          product = {
+            id: canonicalProduct.id,
+            globalId: canonicalProduct.globalId,
+            sku: canonicalProduct.sku,
+          }
+          canonicalReuseMethod = canonicalProduct.matchedBy
+        } else {
         const collisionSafeIdentity = Boolean(input.automatic)
           || input.resolution.identityConflictPolicy === 'provider_qualified'
         let localProductSku = input.resolution.sku?.trim() || null
@@ -6490,6 +6604,7 @@ export async function resolveCommerceProductCandidateInPostgres(input: {
           sku: localProductSku,
         }
         productWasCreated = true
+        }
       }
     }
 
@@ -6515,6 +6630,15 @@ export async function resolveCommerceProductCandidateInPostgres(input: {
           actorEmail: input.actorEmail,
           allowReplacement: !input.automatic,
         })
+    await linkProductChannelStateWithClient(client, {
+      organizationId: candidate.organization_id,
+      integrationAccountId: candidate.integration_account_id,
+      pipelineId: candidate.pipeline_id,
+      externalVariantId: candidate.external_variant_id,
+      productId: product.id,
+      productMappingId: mapping.id,
+      actorEmail: input.actorEmail,
+    })
     const updated = await client.query<{
       workflow_state: string
       blocking_codes: string[]
@@ -6573,7 +6697,9 @@ export async function resolveCommerceProductCandidateInPostgres(input: {
         ? 'catalog_product_created_and_mapped'
         : preservedAutomaticMapping
           ? 'catalog_product_existing_mapping_preserved'
-          : 'catalog_product_mapped',
+          : canonicalReuseMethod
+            ? 'catalog_product_reused_by_stable_identity'
+            : 'catalog_product_mapped',
       productId: product.id,
       productMappingId: mapping.id,
       receipt: started.receipt,
@@ -6596,6 +6722,7 @@ export async function resolveCommerceProductCandidateInPostgres(input: {
       automatic: Boolean(input.automatic),
       automaticPolicyRevision: input.automatic?.policyRevision || null,
       automaticLocalSkuOmitted,
+      canonicalReuseMethod,
       providerWrites: 0,
       syncCursorAdvanced: false,
       replayed: false,
@@ -6625,6 +6752,7 @@ export async function resolveCommerceProductCandidateInPostgres(input: {
         automaticPolicyRevision: input.automatic?.policyRevision || null,
         productCreated: productWasCreated,
         automaticLocalSkuOmitted,
+        canonicalReuseMethod,
         existingMappingPreserved: Boolean(preservedAutomaticMapping),
         productGlobalId: product.globalId,
         productMappingGlobalId: mapping.global_id,

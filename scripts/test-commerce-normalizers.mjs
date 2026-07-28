@@ -381,6 +381,29 @@ const fairePageWrapped = faire.normalizeFaireCommerce({
 
 assert.equal(shopifyNormalized.rejections.length, 0)
 assert.equal(faireNormalized.rejections.length, 0)
+for (const lifecycle of ['DRAFT', 'ARCHIVED', 'UNLISTED']) {
+  const source = clone(shopifySource)
+  source.products.nodes[0].status = lifecycle
+  const normalized = shopify.normalizeShopifyCommerce(source, {
+    ...baseContext,
+    externalAccountId: 'gid://shopify/Shop/1',
+  })
+  assert.equal(normalized.products.length, 1)
+  assert.equal(normalized.products[0].lifecycleState, lifecycle)
+  assert.equal(normalized.products[0].active, false)
+}
+for (const lifecycle of ['DRAFT', 'ARCHIVED', 'UNAVAILABLE']) {
+  const source = clone(faireSource)
+  source.products[0].lifecycle_state = lifecycle
+  source.products[0].active = false
+  const normalized = faire.normalizeFaireCommerce(source, {
+    ...baseContext,
+    externalAccountId: 'brand-1',
+  })
+  assert.equal(normalized.products.length, 1)
+  assert.equal(normalized.products[0].lifecycleState, lifecycle)
+  assert.equal(normalized.products[0].active, false)
+}
 for (const normalized of [shopifyNormalized, faireNormalized]) {
   assert.deepEqual(headerMoneyProjection(normalized.orders[0]), {
     state: 'complete',

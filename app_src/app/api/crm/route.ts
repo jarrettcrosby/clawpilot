@@ -28,6 +28,7 @@ import { suiteCrmAdminPortalUrl, suiteCrmAdminUsername } from '@/lib/crm/suiteCr
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import { readMatonCredentialStateFromPostgres } from '@/lib/persistence/matonCredentials'
 import { readMeasurementPreferences } from '@/lib/persistence/measurementPreferences'
+import { operationsCapabilities } from '@/lib/operations/authorization'
 import { requireRequestUser } from '@/lib/requestUser'
 import { effectiveAuthorizationRole, type AppUser } from '@/lib/users'
 import {
@@ -222,6 +223,7 @@ export async function GET(req: NextRequest) {
       pipelineUsers,
       campaignRecipients,
       canManageHierarchy: organizationRole === 'owner' || organizationRole === 'admin',
+      canManageProductIdentities: operationsCapabilities(actor).canManage,
       providerIdentities: {
         googleMail: selectedProviderEmail('google-mail'),
         googleCalendar: selectedProviderEmail('google-calendar'),

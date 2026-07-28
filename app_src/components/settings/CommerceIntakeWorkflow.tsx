@@ -898,6 +898,13 @@ function stateColor(state: CandidateState) {
   return 'warning' as const
 }
 
+function productLifecycleColor(status: string | null | undefined) {
+  if (status === 'active') return 'success' as const
+  if (status === 'unlisted') return 'info' as const
+  if (status === 'unavailable') return 'error' as const
+  return 'warning' as const
+}
+
 function positiveNumber(value: string) {
   const parsed = Number(value)
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null
@@ -4328,6 +4335,16 @@ export default function CommerceIntakeWorkflow({
                               size="small"
                               color={stateColor(candidate.state)}
                               label={candidateStateLabel(candidate.state)}
+                            />
+                            <Chip
+                              size="small"
+                              variant="outlined"
+                              color={productLifecycleColor(
+                                candidate.normalizedStatus,
+                              )}
+                              label={`Source ${
+                                candidate.normalizedStatus || 'unknown'
+                              }`}
                             />
                             <Chip
                               size="small"

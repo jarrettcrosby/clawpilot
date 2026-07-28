@@ -41,6 +41,9 @@ import {
   upsertProductPackagingProfileWithClient,
   type ProductPackagingProfileInput,
 } from '@/lib/persistence/productPackaging'
+import {
+  readProductChannelStatesInPostgres,
+} from '@/lib/persistence/productChannelStates'
 import { splitPipelineProductNames } from '@/lib/pipeline/productNames.mjs'
 import { query, withTransaction } from '@/lib/persistence/postgres'
 import { appPublicUrl } from '@/lib/publicUrl'
@@ -3391,7 +3394,7 @@ function productFromRow(row: Record<string, unknown>): CrmProduct {
     sku: clean(row.sku), productType: clean(row.product_type), category: clean(row.category), status: clean(row.status),
     price: finite(row.price), cost: finite(row.cost), currency: clean(row.currency) || 'USD', url: clean(row.url),
     description: clean(row.description),
-    active: row.active !== false, packaging: null,
+    active: row.active !== false, packaging: null, salesChannels: [],
     syncStatus: row.sync_status as CrmProduct['syncStatus'], syncError: nullable(row.sync_error),
     updatedAt: String(row.updated_at),
   }
@@ -3709,7 +3712,16 @@ export async function listCrmRecordsInPostgres(input: {
        LIMIT $3`,
       [input.pipelineId, search, limit],
     )
-    return result.rows.map(productFromRow)
+    const products = result.rows.map(productFromRow)
+    const salesChannelsByProduct =
+      await readProductChannelStatesInPostgres({
+        pipelineId: input.pipelineId,
+        productIds: products.map((product) => product.id),
+      })
+    return products.map((product) => ({
+      ...product,
+      salesChannels: salesChannelsByProduct.get(product.id) || [],
+    }))
   }
   if (input.entity === 'leads') {
     const result = await query<Record<string, unknown>>(
@@ -4852,10 +4864,26 @@ export async function resolveCrmReferenceCode(referenceValue: unknown): Promise<
   if (!isPostgresStorageEnabled()) return referenceCode
   try {
     const result = await query<{ canonical_code: string }>(
-      `SELECT COALESCE(alias.canonical_code, registry.canonical_code) AS canonical_code
+      `SELECT COALESCE(
+         alias.canonical_code,
+         product_alias.canonical_code,
+         registry.canonical_code
+       ) AS canonical_code
        FROM crm_reference_registry registry
        LEFT JOIN crm_reference_aliases alias
          ON alias.alias_code = registry.reference_code
+       LEFT JOIN LATERAL (
+         SELECT canonical.reference_code AS canonical_code
+         FROM crm_products archived_product
+         JOIN crm_product_identity_aliases product_identity
+           ON product_identity.pipeline_id = archived_product.pipeline_id
+          AND product_identity.alias_product_id = archived_product.id
+         JOIN crm_products canonical
+           ON canonical.pipeline_id = product_identity.pipeline_id
+          AND canonical.id = product_identity.canonical_product_id
+         WHERE archived_product.reference_code = registry.reference_code
+         LIMIT 1
+       ) product_alias ON true
        WHERE registry.reference_code = $1
        LIMIT 1`,
       [referenceCode],

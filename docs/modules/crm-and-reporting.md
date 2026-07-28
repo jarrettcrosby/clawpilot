@@ -51,6 +51,8 @@ Every SuiteCRM business-record module in the table has a native custom field lab
 
 The ClawPilot Products list uses one pipeline-scoped search across Global ID, product name, SKU, product type, category, and URL. Searching for a value such as `gp5915353` therefore resolves the same Product identity in both ClawPilot and SuiteCRM without widening the query outside the selected pipeline.
 
+One sellable inventory-and-pack identity owns one canonical Product. Shopify and Faire listings are read-only entries in that Product's `salesChannels` field, including exact provider variant identity and source lifecycle; they are not separate CRM Products. Each, inner-pack, case, and pallet identities remain separate Products and use a meaningful pack qualifier when their marketing title would otherwise collide. An authorized product editor with Operations-management authority may open **Resolve duplicate sales-channel product identities** to repair records created under the older provider-isolation rule. Exact SKU or GTIN/barcode matches may be reconciled in a reviewed batch. A name-only suggestion requires explicit confirmation of the same sellable identity and pack level. The transaction retains the old Product Global ID as a permanent alias, blocks a duplicate with operational relationships, and never deletes or rewrites historical business records.
+
 The two-letter module prefix is fixed and the seven-digit suffix is randomly allocated. The permanent registries reserve both the full code and the numeric suffix globally across modules, prevent concurrent collisions, and never release either value after deletion or archival. Sequential codes issued before this contract remain permanently reserved and can never be reissued. Their obsolete public short links are disabled and removed from user-visible link results; the immutable registries retain the historical allocation and canonical replacement for audit integrity.
 
 Each CRM record reference code has a stable short link. The redirect enters the authenticated ClawPilot CRM route, which selects a pipeline the user can access before opening the record; canonical organization and Contact codes remain stable when the same identity is projected into another authorized pipeline. User-created links remain visible and manageable only inside the exact organization that owns them.
@@ -75,6 +77,28 @@ The interaction editor requires a controlled interaction type and offers only ac
 Email, Note, LinkedIn, and Campaign interactions project to SuiteCRM Notes and appear under native **History**. The Account remains the Note parent and the primary selected Contact is written to the native Contact field and relationship. The user-entered business timestamp is stored in the native Note `Occurred At` field (`occurred_at_c`); SuiteCRM's system `date_entered` remains the record creation audit timestamp and cannot replace it during reconciliation.
 
 Call interactions project to native SuiteCRM Calls. Unlinked `meeting` and legacy `In Person` interactions project to native Meetings; a `gi` history entry linked to a canonical `gm` Meeting has no separate SuiteCRM projection. Native Call direction is controlled as **Inbound** or **Outbound**. Activity status is controlled as `planned`, `held`, or `not_held`, and duration is a whole number from 1 through 1,440 minutes. New Calls default to 15 minutes and unlinked interaction-shaped Meetings default to 30 minutes. SuiteCRM displays **Planned** Calls and Meetings under **Activities**; **Held** and **Not Held** records appear under **History**. A completed call therefore belongs in History rather than being mislabeled as open work.
+
+## CSV Data Transfer
+
+Pipeline owners and editors can export the selected CRM tab as a tenant-scoped CSV. Organizations, Contacts, Products, Leads, and Opportunities also expose a header-only template and support a two-phase import. Meetings, Interactions, and Campaigns are export-only so a historical data transfer cannot create Calendar events, send communications, queue campaigns, delete records, or archive records.
+
+Every exported existing record carries its permanent Global ID and an opaque record version derived from the current Postgres revision and source hash. The Global ID is the only update identity. A blank Global ID requests a create; ClawPilot never accepts a caller-created Global ID and never silently converts a create into an update from a name, email, or SKU match.
+
+Uploading a CSV creates an expiring, no-write preview. Every row is classified as:
+
+- `create`: a valid new identity with no possible existing or file-local duplicate;
+- `update`: a current pipeline-scoped Global ID with field changes;
+- `unchanged`: a current Global ID whose canonical values are unchanged;
+- `ambiguous`: a duplicate Global ID, duplicate create identity, or possible existing-record collision; or
+- `invalid`: a malformed or stale row, unsupported relationship, unsafe spreadsheet value, or record outside the selected pipeline.
+
+Product previews enforce the same two pipeline-scoped identities as the current Product table: case-insensitive Product name and, when present, case-insensitive SKU. Creates and updates are checked independently against current Products and every other actionable CSV row, and apply repeats those checks inside the transaction so a database uniqueness error is not the first customer-visible result.
+
+Updates show field-level before-and-after values and are not selected automatically. Applying any update requires the operator to confirm that those existing-record changes were reviewed. Only selected `create` and `update` rows can be applied. ClawPilot locks the preview and target records, rechecks `updated_at` plus `source_hash`, rechecks create identities under a pipeline advisory lock, and applies the complete selection in one transaction. A stale record aborts the entire selection with instructions to run preview again. The same transaction stages the SuiteCRM outbox through the normal CRM gateway; preview does not require a live SuiteCRM connection.
+
+CSV transfer uses exact, versioned headers and Global IDs for relationships. Each file is bounded to 1 MB and 500 data rows. A larger export is delivered by the CRM UI as numbered, import-ready CSV segments rather than navigating the browser to a JSON size error. Exports quote every field and harden spreadsheet-formula prefixes. Import rejects an oversized declared multipart request before parsing when the browser supplies `Content-Length`, checks the uploaded file size before reading its text, and repeats the byte and row checks in the parser. Imports also reject formula-capable values after leading whitespace, unsupported control characters, malformed headers, unsupported currency or date values, and cross-pipeline relationships. A downloadable error report identifies the source row, field, safe error code, and message without exposing database IDs or provider credentials. Preview and apply runs are actor-scoped, pipeline-scoped, idempotent, expiring, and audited.
+
+The duplicate sales-channel Product identity action is rendered only when the authenticated actor has the same Operations-management capability enforced by `/api/crm/product-identities`; ordinary CRM edit access alone does not expose a command that will return `403`.
 
 ## Email Association
 
@@ -129,7 +153,7 @@ Meeting time synchronization is bidirectional among the ClawPilot CRM surface, n
 
 Meeting projection also creates SuiteCRM relationship links for the related Account, Contact, Lead, and Opportunity. This is separate from SuiteCRM's parent display field and is required for the native relationship subpanels to contain the associated records.
 
-The active endpoints are `/api/crm`, `/api/crm/actions`, `/api/crm/import`, `/api/crm/workbook`, `/api/crm/outbox/process`, and the authenticated action/inbound-mail worker at `/api/crm/integrations/process`.
+The active endpoints are `/api/crm`, `/api/crm/actions`, `/api/crm/data-transfer`, `/api/crm/product-identities`, `/api/crm/import`, `/api/crm/workbook`, `/api/crm/outbox/process`, and the authenticated action/inbound-mail worker at `/api/crm/integrations/process`.
 
 ## Operations
 

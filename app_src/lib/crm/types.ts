@@ -103,9 +103,42 @@ export type CrmProduct = {
   description: string
   active: boolean
   packaging: ProductPackagingProfile | null
+  salesChannels: ProductSalesChannelState[]
   syncStatus: CrmSyncStatus
   syncError: string | null
   updatedAt: string
+}
+
+export type ProductSalesChannelState = {
+  id: string
+  globalId: string
+  organizationId: string
+  integrationAccountId: string
+  integrationAccountGlobalId: string
+  integrationAccountName: string
+  integrationAccountStatus: 'active' | 'disabled' | 'error'
+  environment: 'mock' | 'sandbox' | 'production'
+  pipelineId: string
+  provider: 'shopify' | 'faire'
+  externalProductId: string
+  externalVariantId: string
+  externalInventoryItemId: string | null
+  productId: string | null
+  productMappingId: string | null
+  productMappingGlobalId: string | null
+  providerStatusRaw: string
+  normalizedStatus:
+    | 'active'
+    | 'draft'
+    | 'archived'
+    | 'unlisted'
+    | 'unavailable'
+    | 'unknown'
+  providerActive: boolean | null
+  providerUpdatedAt: string | null
+  observedAt: string
+  sourceRevision: string
+  rowVersion: number
 }
 
 export type ProductPackagingProfile = {

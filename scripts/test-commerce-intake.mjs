@@ -713,6 +713,7 @@ includes(serviceSource, [
   'listFaireOrders',
   'listFaireProducts',
   'listFaireInventory',
+  'product_status:ACTIVE,ARCHIVED,DRAFT,UNLISTED',
   'SHOPIFY_ORDER_PAGE_SIZE = 25',
   'FAIRE_ORDER_PAGE_SIZE = 50',
   'FAIRE_INVENTORY_SELECTOR_LIMIT = 50',
@@ -1046,6 +1047,12 @@ includes(productCandidateResolverSource, [
 const commerceProductNamingModule = loadTypeScriptModule(
   'app_src/lib/integrations/commerceProductNaming.ts',
 )
+const commerceProductLifecycleModule = loadTypeScriptModule(
+  'app_src/lib/integrations/commerceProductLifecycle.ts',
+)
+const commerceCanonicalProductIdentityModule = loadTypeScriptModule(
+  'app_src/lib/integrations/commerceCanonicalProductIdentity.ts',
+)
 const productIdentityLocks = []
 const automaticProductResolutionModule = loadTypeScriptModule(
   'app_src/lib/persistence/commerceIntake.ts',
@@ -1059,6 +1066,10 @@ const automaticProductResolutionModule = loadTypeScriptModule(
       '@/lib/integrations/commerceProductMappingPolicy': {},
       '@/lib/integrations/commerceProductNaming':
         commerceProductNamingModule,
+      '@/lib/integrations/commerceProductLifecycle':
+        commerceProductLifecycleModule,
+      '@/lib/integrations/commerceCanonicalProductIdentity':
+        commerceCanonicalProductIdentityModule,
       '@/lib/operations/commerceNormalization': {
         commerceCurrencyMinorUnit: () => 2,
       },
@@ -1069,6 +1080,10 @@ const automaticProductResolutionModule = loadTypeScriptModule(
         },
       },
       '@/lib/persistence/commerceCatalogSync': {},
+      '@/lib/persistence/productChannelStates': {
+        async linkProductChannelStateWithClient() {},
+        async upsertProductChannelStateWithClient() {},
+      },
     },
   },
 )
@@ -1546,6 +1561,10 @@ const customerIdentityPersistence = loadTypeScriptModule(
       },
       '@/lib/integrations/commerceProductNaming':
         commerceProductNamingModule,
+      '@/lib/integrations/commerceProductLifecycle':
+        commerceProductLifecycleModule,
+      '@/lib/integrations/commerceCanonicalProductIdentity':
+        commerceCanonicalProductIdentityModule,
       '@/lib/operations/commerceNormalization': {
         commerceCurrencyMinorUnit() { return 2 },
       },
@@ -1553,6 +1572,10 @@ const customerIdentityPersistence = loadTypeScriptModule(
       '@/lib/persistence/commerceCatalogSync': {
         applyCommerceCatalogSyncPolicyWithClient() {},
         readCommerceCatalogSyncStateWithClient() {},
+      },
+      '@/lib/persistence/productChannelStates': {
+        async linkProductChannelStateWithClient() {},
+        async upsertProductChannelStateWithClient() {},
       },
       '@/lib/persistence/postgres': {
         acquireTransactionAdvisoryLock() {},
@@ -1920,7 +1943,7 @@ const service = loadTypeScriptModule(
             )
             assert.match(
               request.variables.query,
-              /^updated_at:<='[^']+'$/,
+              /^updated_at:<='[^']+' AND product_status:ACTIVE,ARCHIVED,DRAFT,UNLISTED$/,
             )
             const secondPage = Boolean(request.variables.after)
             if (secondPage) {

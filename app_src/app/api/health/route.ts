@@ -279,6 +279,10 @@ export async function GET() {
           measurement_preferences_migration_applied: boolean
           packaging_material_unit_neutral_names_migration_applied: boolean
           workspace_currency_preference_migration_applied: boolean
+          operations_pack_hierarchy_migration_applied: boolean
+          crm_data_transfers_migration_applied: boolean
+          operations_product_channel_states_migration_applied: boolean
+          crm_product_identity_aliases_migration_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -829,6 +833,26 @@ export async function GET() {
                 FROM schema_migrations
                 WHERE filename = '0127_workspace_currency_preference.sql'
               ) AS workspace_currency_preference_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0128_operations_pack_hierarchy.sql'
+              ) AS operations_pack_hierarchy_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0129_crm_data_transfers.sql'
+              ) AS crm_data_transfers_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0130_operations_product_channel_states.sql'
+              ) AS operations_product_channel_states_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0131_crm_product_identity_aliases.sql'
+              ) AS crm_product_identity_aliases_migration_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -950,6 +974,10 @@ export async function GET() {
             && row?.measurement_preferences_migration_applied
             && row?.packaging_material_unit_neutral_names_migration_applied
             && row?.workspace_currency_preference_migration_applied
+            && row?.operations_pack_hierarchy_migration_applied
+            && row?.crm_data_transfers_migration_applied
+            && row?.operations_product_channel_states_migration_applied
+            && row?.crm_product_identity_aliases_migration_applied
             && row?.migration_checksums_present
           ),
         }
@@ -1063,6 +1091,10 @@ export async function GET() {
           || !row?.measurement_preferences_migration_applied
           || !row?.packaging_material_unit_neutral_names_migration_applied
           || !row?.workspace_currency_preference_migration_applied
+          || !row?.operations_pack_hierarchy_migration_applied
+          || !row?.crm_data_transfers_migration_applied
+          || !row?.operations_product_channel_states_migration_applied
+          || !row?.crm_product_identity_aliases_migration_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')

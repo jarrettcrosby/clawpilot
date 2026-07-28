@@ -1217,7 +1217,7 @@ async function shopifyProductEnvelope(
       operationName: 'ClawPilotCommerceProductVariants',
       variables: {
         after: page.orderCursor,
-        query: `updated_at:<='${page.windowEnd}'`,
+        query: `updated_at:<='${page.windowEnd}' AND product_status:ACTIVE,ARCHIVED,DRAFT,UNLISTED`,
       },
     },
     { timeoutMs: SHOPIFY_GRAPHQL_TIMEOUT_MS },
