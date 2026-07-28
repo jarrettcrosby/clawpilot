@@ -192,6 +192,8 @@ assertIncludes(persistence, [
   'const inputPlanResultHash = cartonizationRateEvidenceHash(input.planSnapshot)',
   'cartonizationRateEvidenceHash({',
   'CARTONIZATION_RATE_EVIDENCE_IDEMPOTENCY_CONFLICT',
+  'CARTONIZATION_RATE_DESTINATION_INVALID',
+  'The confirmed ship-to address is not carrier-ready',
   'evidence.sealed_at IS NOT NULL',
   'inventory_run.warehouse_id = warehouse.id',
   'recipe.packaging_material_id = $2::uuid',

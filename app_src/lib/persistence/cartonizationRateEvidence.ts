@@ -511,28 +511,40 @@ export async function readCartonizationRateCandidateContext(input: {
     row.source_hash,
     'ship_to',
   )
-  const destination = normalizeCarrierSandboxParty({
-      name: destinationText(decrypted.name, 'recipient name', 120),
-      line1: destinationText(decrypted.line1, 'address line 1', 160),
-      line2: destinationText(
-        decrypted.line2,
-        'address line 2',
-        120,
-        true,
-      ) || null,
-      city: destinationText(decrypted.city, 'city', 100),
-      region: destinationText(decrypted.region, 'region', 16),
-      postalCode: destinationText(
-        decrypted.postalCode,
-        'postal code',
-        20,
-      ),
-      countryCode: destinationText(
-        decrypted.country,
-        'country code',
-        3,
-      ).toUpperCase(),
-  })
+  const destination = (() => {
+    try {
+      return normalizeCarrierSandboxParty({
+        name: destinationText(decrypted.name, 'recipient name', 120),
+        line1: destinationText(decrypted.line1, 'address line 1', 160),
+        line2: destinationText(
+          decrypted.line2,
+          'address line 2',
+          120,
+          true,
+        ) || null,
+        city: destinationText(decrypted.city, 'city', 100),
+        region: destinationText(decrypted.region, 'region', 64),
+        postalCode: destinationText(
+          decrypted.postalCode,
+          'postal code',
+          20,
+        ),
+        countryCode: destinationText(
+          decrypted.country,
+          'country code',
+          3,
+        ).toUpperCase(),
+      })
+    } catch (error) {
+      fail(
+        `The confirmed ship-to address is not carrier-ready: ${
+          error instanceof Error ? error.message : 'invalid address'
+        }`,
+        409,
+        'CARTONIZATION_RATE_DESTINATION_INVALID',
+      )
+    }
+  })()
   return {
     candidateSourceHash: row.source_hash,
     destinationFingerprint: carrierSandboxPartyFingerprint(destination),

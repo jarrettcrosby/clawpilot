@@ -247,6 +247,13 @@ source revision/hash, derives unit weight only from that positive current
 catalog observation, and still requires the saved recipe/material proof before
 it can rate a parcel.
 
+Confirmed US ship-to snapshots may retain a provider-native state or territory
+name for audit display. The carrier sandbox boundary converts recognized names
+such as `Wisconsin` to the canonical postal code (`WI`) before fingerprinting
+and rating. An unknown subdivision now fails with
+`CARTONIZATION_RATE_DESTINATION_INVALID` instead of being reported as a
+generic evidence outage.
+
 ### Packaging Materials Workflow
 
 **Operations > Packaging materials** manages the consumable outbound container catalog separately from product package profiles. Materials are organization-scoped cartons, poly mailers, or padded mailers with canonical millimeter dimensions, explicit dimension basis and evidence, nullable draft tare and maximum weight, nullable draft unit cost/currency, draft/active status, source, and optimistic row version. A draft may retain a partial customer measurement such as a 9 by 12 envelope with unknown depth; the API and UI preserve that missing value as null and display the activation gaps rather than coercing it to zero. Warehouse stock rows can reference only an existing active warehouse and record availability, on-hand quantity, reorder point, and reorder quantity. Activating a material requires verified usable inner dimensions, nonunknown evidence, complete tare/capacity and cost facts; an optimizer candidate additionally requires an available warehouse row with positive on-hand stock.

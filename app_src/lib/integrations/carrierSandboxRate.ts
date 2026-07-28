@@ -220,6 +220,70 @@ const EXTERIOR_INCH_FIELDS = new Set([
   'height',
 ])
 
+const US_REGION_CODES = new Map<string, string>([
+  ['alabama', 'AL'],
+  ['alaska', 'AK'],
+  ['american samoa', 'AS'],
+  ['arizona', 'AZ'],
+  ['arkansas', 'AR'],
+  ['armed forces americas', 'AA'],
+  ['armed forces europe', 'AE'],
+  ['armed forces pacific', 'AP'],
+  ['california', 'CA'],
+  ['colorado', 'CO'],
+  ['connecticut', 'CT'],
+  ['delaware', 'DE'],
+  ['district of columbia', 'DC'],
+  ['florida', 'FL'],
+  ['georgia', 'GA'],
+  ['guam', 'GU'],
+  ['hawaii', 'HI'],
+  ['idaho', 'ID'],
+  ['illinois', 'IL'],
+  ['indiana', 'IN'],
+  ['iowa', 'IA'],
+  ['kansas', 'KS'],
+  ['kentucky', 'KY'],
+  ['louisiana', 'LA'],
+  ['maine', 'ME'],
+  ['maryland', 'MD'],
+  ['massachusetts', 'MA'],
+  ['michigan', 'MI'],
+  ['minnesota', 'MN'],
+  ['mississippi', 'MS'],
+  ['missouri', 'MO'],
+  ['montana', 'MT'],
+  ['nebraska', 'NE'],
+  ['nevada', 'NV'],
+  ['new hampshire', 'NH'],
+  ['new jersey', 'NJ'],
+  ['new mexico', 'NM'],
+  ['new york', 'NY'],
+  ['north carolina', 'NC'],
+  ['north dakota', 'ND'],
+  ['northern mariana islands', 'MP'],
+  ['ohio', 'OH'],
+  ['oklahoma', 'OK'],
+  ['oregon', 'OR'],
+  ['pennsylvania', 'PA'],
+  ['puerto rico', 'PR'],
+  ['rhode island', 'RI'],
+  ['south carolina', 'SC'],
+  ['south dakota', 'SD'],
+  ['tennessee', 'TN'],
+  ['texas', 'TX'],
+  ['united states virgin islands', 'VI'],
+  ['utah', 'UT'],
+  ['vermont', 'VT'],
+  ['virgin islands', 'VI'],
+  ['virginia', 'VA'],
+  ['washington', 'WA'],
+  ['washington dc', 'DC'],
+  ['west virginia', 'WV'],
+  ['wisconsin', 'WI'],
+  ['wyoming', 'WY'],
+])
+
 function partyText(value: unknown, label: string, maximum: number) {
   if (typeof value !== 'string' || /[\u0000-\u001f\u007f]/.test(value)) {
     throw new Error(`Carrier sandbox ${label} must be plain text`)
@@ -271,6 +335,23 @@ function boundedParcelDecimal(
     throw new Error(`Carrier sandbox ${label} supports at most three decimal places`)
   }
   return canonical
+}
+
+function normalizeUsRegion(value: unknown) {
+  const region = partyText(value, 'destination region', 64)
+  if (/^[a-z]{2}$/i.test(region)) return region.toUpperCase()
+  const normalizedName = region
+    .toLowerCase()
+    .replace(/[.,]/g, '')
+    .replace(/\s+/g, ' ')
+  const code = US_REGION_CODES.get(normalizedName)
+  if (!code) {
+    throw new Error(
+      'Carrier sandbox destination region must use a recognized US state '
+      + 'or territory name or its two-letter code',
+    )
+  }
+  return code
 }
 
 export function normalizeCarrierSandboxParcel(
@@ -332,10 +413,6 @@ export function normalizeCarrierSandboxParty(value: unknown): CarrierSandboxPart
   if (line2.length > 120) {
     throw new Error('Carrier sandbox destination line 2 must be 120 characters or fewer')
   }
-  const region = partyText(input.region, 'destination region', 2).toUpperCase()
-  if (!/^[A-Z]{2}$/.test(region)) {
-    throw new Error('Carrier sandbox destination region must use a two-letter US state code')
-  }
   const postalCode = partyText(input.postalCode, 'destination postal code', 10)
   if (!/^\d{5}(?:-\d{4})?$/.test(postalCode)) {
     throw new Error('Carrier sandbox destination postal code must be a five or nine digit US ZIP code')
@@ -344,6 +421,7 @@ export function normalizeCarrierSandboxParty(value: unknown): CarrierSandboxPart
   if (countryCode !== 'US') {
     throw new Error('Carrier sandbox rating currently supports US addresses only')
   }
+  const region = normalizeUsRegion(input.region)
   return {
     name: partyText(input.name, 'destination name', 120),
     line1: partyText(input.line1, 'destination address line 1', 160),

@@ -1274,6 +1274,22 @@ assert.equal(
   }),
   'party fingerprints must use the exact normalized canonical shape',
 )
+assert.equal(
+  sandboxRateModule.normalizeCarrierSandboxParty({
+    ...editableFixture.destination,
+    region: 'Wisconsin',
+  }).region,
+  'WI',
+  'provider-native US state names must normalize to carrier-ready postal codes',
+)
+assert.equal(
+  sandboxRateModule.normalizeCarrierSandboxParty({
+    ...editableFixture.destination,
+    region: 'District of Columbia',
+  }).region,
+  'DC',
+  'long US subdivision names must normalize before the two-letter boundary',
+)
 assert.notEqual(
   destinationFingerprint,
   sandboxRateModule.carrierSandboxPartyFingerprint({
@@ -1305,6 +1321,14 @@ assert.throws(
   }),
   /five or nine digit US ZIP code/,
   'sandbox rating destinations must validate US ZIP codes',
+)
+assert.throws(
+  () => sandboxRateModule.normalizeCarrierSandboxParty({
+    ...editableFixture.destination,
+    region: 'Not a state',
+  }),
+  /recognized US state or territory/,
+  'unknown provider region names must fail with an actionable boundary',
 )
 
 const fedexRate = await sandboxRateModule.requestCarrierSandboxRates({
