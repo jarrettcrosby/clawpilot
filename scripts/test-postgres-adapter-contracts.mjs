@@ -1550,6 +1550,15 @@ assertIncludes(healthRoute, '0132_operations_product_channel_offers.sql', 'hoste
 assertIncludes(healthRoute, '0133_operations_pack_runtime_association.sql', 'hosted pack runtime association migration health')
 assertIncludes(healthRoute, '0134_operations_commerce_pack_resolution.sql', 'hosted commerce pack resolution migration health')
 assertIncludes(healthRoute, '0135_operations_hybrid_cartonization_recipes.sql', 'hosted hybrid cartonization recipe migration health')
+assertIncludes(healthRoute, '0136_operations_cartonization_package_rates.sql', 'hosted cartonization package rate migration health')
+assertIncludes(healthRoute, '0137_operations_cartonization_rate_evidence.sql', 'hosted cartonization rate evidence migration health')
+assertIncludes(healthRoute, '0138_operations_cartonization_rate_evidence_integrity.sql', 'hosted cartonization rate evidence integrity migration health')
+for (const [, alias] of healthRoute.matchAll(/\)\s+AS\s+([a-z0-9_]+)\s*,?/gi)) {
+  assert.ok(
+    alias.length <= 63,
+    `hosted migration health SQL alias exceeds PostgreSQL's 63-byte identifier limit: ${alias}`,
+  )
+}
 const packRuntimeAssociationMigration = read(
   'db/migrations/0133_operations_pack_runtime_association.sql',
 )

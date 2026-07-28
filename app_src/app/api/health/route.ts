@@ -289,7 +289,7 @@ export async function GET() {
           operations_hybrid_cartonization_recipes_migration_applied: boolean
           operations_cartonization_package_rates_migration_applied: boolean
           operations_cartonization_rate_evidence_migration_applied: boolean
-          operations_cartonization_rate_evidence_integrity_migration_applied: boolean
+          operations_cartonization_rate_evidence_integrity_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -894,7 +894,7 @@ export async function GET() {
                 SELECT 1
                 FROM schema_migrations
                 WHERE filename = '0138_operations_cartonization_rate_evidence_integrity.sql'
-              ) AS operations_cartonization_rate_evidence_integrity_migration_applied,
+              ) AS operations_cartonization_rate_evidence_integrity_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -1026,7 +1026,7 @@ export async function GET() {
             && row?.operations_hybrid_cartonization_recipes_migration_applied
             && row?.operations_cartonization_package_rates_migration_applied
             && row?.operations_cartonization_rate_evidence_migration_applied
-            && row?.operations_cartonization_rate_evidence_integrity_migration_applied
+            && row?.operations_cartonization_rate_evidence_integrity_applied
             && row?.migration_checksums_present
           ),
         }
@@ -1150,7 +1150,7 @@ export async function GET() {
           || !row?.operations_hybrid_cartonization_recipes_migration_applied
           || !row?.operations_cartonization_package_rates_migration_applied
           || !row?.operations_cartonization_rate_evidence_migration_applied
-          || !row?.operations_cartonization_rate_evidence_integrity_migration_applied
+          || !row?.operations_cartonization_rate_evidence_integrity_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')
