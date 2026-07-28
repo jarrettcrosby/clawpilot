@@ -317,6 +317,7 @@ type RuntimePackMappingRow = {
   profile_version_is_current: boolean
   profile_lifecycle_state: string
   profile_status: string
+  fit_model: string
   package_level: string
   base_each_quantity: number
   length_mm: number | null
@@ -4196,6 +4197,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
          profile_version.is_current AS profile_version_is_current,
          profile_version.lifecycle_state AS profile_lifecycle_state,
          profile.status AS profile_status,
+         profile_version.fit_model,
          profile.package_level,
          profile_version.base_each_quantity,
          profile_version.length_mm,
@@ -4278,6 +4280,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
           profileVersionIsCurrent: row.profile_version_is_current,
           profileLifecycleState: row.profile_lifecycle_state,
           profileStatus: row.profile_status,
+          fitModel: row.fit_model,
           packageLevel: row.package_level,
           baseEachQuantity: row.base_each_quantity,
           lengthMm: row.length_mm,
@@ -4758,6 +4761,14 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
           return true
         })
         if (
+          line.requiresShipping
+          && packagingState === 'unresolved'
+          && !codes.includes('packaging_required')
+        ) {
+          codes.push('packaging_required')
+          codes.sort()
+        }
+        if (
           quantity.unfulfilled > 0
           && !codes.includes('line_price_required')
         ) {
@@ -4843,6 +4854,8 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
             runtimePack.association?.baseEachQuantity || null,
             mappedPackaging
               ? mappedPackaging.source
+              : runtimePack.reason === 'recipe_required'
+                ? 'variant_pack_mapping'
               : providerPackaging
                 ? 'provider'
                 : 'none',

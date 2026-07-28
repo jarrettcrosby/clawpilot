@@ -215,6 +215,7 @@ assertIncludes(route, [
   'carrierRateReads: 0',
   "(['ups_rest', 'fedex_rest'] as const)",
   'policyVersion: plan.policyVersion',
+  'lineEvidence: read.lineEvidence',
   'writeCartonizationRateEvidenceInPostgres',
   'inventoryWrites: 0',
   'shipmentWrites: 0',

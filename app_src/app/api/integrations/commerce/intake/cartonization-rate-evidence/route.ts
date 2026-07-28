@@ -705,6 +705,7 @@ export async function POST(req: NextRequest) {
         inventory: read.inventory,
         materialEvidence: read.materialEvidence,
         recipeEvidence: read.recipeEvidence,
+        lineEvidence: read.lineEvidence,
       },
     }
     const assumptionSnapshot = {

@@ -89,6 +89,23 @@ export type HybridCartonizationReadResult = {
     inputPackProfileVersionGlobalId: string
     packagingMaterialGlobalId: string
   }>
+  lineEvidence: Array<{
+    lineGlobalId: string
+    productGlobalId: string
+    variantPackMappingGlobalId: string
+    capturedMappingRowVersion: number
+    currentMappingRowVersion: number
+    packProfileVersionGlobalId: string
+    capturedProfileRowVersion: number
+    currentProfileRowVersion: number
+    fitModel: HybridCartonizationLine['profile']['fitModel']
+    packagingState: string
+    packagingSource: string
+    weightSource: 'profile_version' | 'provider_order' | 'provider_catalog'
+    weightGrams: number
+    channelSourceRevision: string
+    channelSourceHash: string
+  }>
   input: HybridCartonizationInput
 }
 
@@ -138,6 +155,7 @@ type CandidateLineRow = {
   packaging_weight_source: string | null
   weight_grams: number | null
   pack_mapping_id: string | null
+  pack_mapping_global_id: string | null
   captured_pack_mapping_row_version: string | null
   current_pack_mapping_row_version: string | null
   pack_mapping_is_current: boolean | null
@@ -177,6 +195,14 @@ type CandidateLineRow = {
   pack_profile_status: string | null
   pack_profile_base_each_quantity: number | null
   current_pack_profile_base_each_quantity: number | null
+  current_pack_profile_length_mm: number | null
+  current_pack_profile_width_mm: number | null
+  current_pack_profile_height_mm: number | null
+  current_pack_profile_dimension_basis:
+    | 'inner'
+    | 'outer'
+    | 'unspecified'
+    | null
   current_pack_profile_gross_weight_grams: number | null
   current_pack_profile_weight_basis: string | null
 }
@@ -769,6 +795,7 @@ async function readCandidateLines(
        line.packaging_weight_source,
        line.weight_grams,
        pack_mapping.id::text AS pack_mapping_id,
+       pack_mapping.global_id AS pack_mapping_global_id,
        line.commerce_variant_pack_mapping_row_version::text
          AS captured_pack_mapping_row_version,
        pack_mapping.row_version::text
@@ -796,6 +823,11 @@ async function readCandidateLines(
        line.pack_profile_base_each_quantity,
        pack_version.base_each_quantity
          AS current_pack_profile_base_each_quantity,
+       pack_version.length_mm AS current_pack_profile_length_mm,
+       pack_version.width_mm AS current_pack_profile_width_mm,
+       pack_version.height_mm AS current_pack_profile_height_mm,
+       pack_version.dimension_basis
+         AS current_pack_profile_dimension_basis,
        pack_version.gross_weight_grams
          AS current_pack_profile_gross_weight_grams,
        pack_version.weight_basis AS current_pack_profile_weight_basis
@@ -858,23 +890,43 @@ function mapCandidateLines(
     productId: string
     packProfileVersionId: string
     line: HybridCartonizationLine
+    evidence: HybridCartonizationReadResult['lineEvidence'][number]
   } => {
     const quantity = exactInteger(
       row.unfulfilled_quantity,
       `${row.global_id} unfulfilled quantity`,
       1,
     )
+    const recipeOnlyAssociation = (
+      row.pack_profile_fit_model === 'approved_recipe_only'
+      && row.packaging_state === 'unresolved'
+      && row.packaging_source === 'variant_pack_mapping'
+      && row.weight_grams === null
+      && row.packaging_weight_source === null
+      && row.current_pack_profile_length_mm === null
+      && row.current_pack_profile_width_mm === null
+      && row.current_pack_profile_height_mm === null
+      && row.current_pack_profile_dimension_basis === 'unspecified'
+    )
     if (
       !row.product_id
       || !row.product_global_id
       || row.mapping_state !== 'resolved'
-      || row.packaging_state !== 'resolved'
+      || (
+        row.packaging_state !== 'resolved'
+        && !recipeOnlyAssociation
+      )
       || row.packaging_source !== 'variant_pack_mapping'
       || !row.pack_mapping_id
+      || !row.pack_mapping_global_id
       || row.captured_pack_mapping_row_version === null
       || row.current_pack_mapping_row_version === null
       || row.pack_mapping_is_current !== true
       || row.pack_mapping_projection_state !== 'current'
+      || !row.pack_mapping_source_revision
+      || !row.pack_mapping_source_hash
+      || !row.channel_source_revision
+      || !row.channel_source_hash
       || !row.pack_profile_version_id
       || !row.pack_profile_version_global_id
       || row.captured_pack_profile_row_version === null
@@ -947,7 +999,9 @@ function mapCandidateLines(
       )
     }
     const unitWeightGrams = exactInteger(
-      row.weight_grams,
+      recipeOnlyAssociation
+        ? row.channel_weight_grams
+        : row.weight_grams,
       `${row.global_id} unit weight`,
       1,
     )
@@ -974,11 +1028,14 @@ function mapCandidateLines(
         'HYBRID_CARTONIZATION_LINE_WEIGHT_REVISION_CONFLICT',
       )
     }
-    if (![
-      'profile_version',
-      'provider_order',
-      'provider_catalog',
-    ].includes(row.packaging_weight_source || '')) {
+    if (
+      !recipeOnlyAssociation
+      && ![
+        'profile_version',
+        'provider_order',
+        'provider_catalog',
+      ].includes(row.packaging_weight_source || '')
+    ) {
       fail(
         `${row.product_title_snapshot} has no exact weight source`,
         422,
@@ -999,6 +1056,12 @@ function mapCandidateLines(
     const title = variant && variant.toLowerCase() !== 'default title'
       ? `${row.product_title_snapshot} · ${variant}`
       : row.product_title_snapshot
+    const weightSource = recipeOnlyAssociation
+      ? 'provider_catalog'
+      : row.packaging_weight_source as
+        | 'profile_version'
+        | 'provider_order'
+        | 'provider_catalog'
     return {
       productId: row.product_id,
       packProfileVersionId: row.pack_profile_version_id,
@@ -1023,6 +1086,23 @@ function mapCandidateLines(
             `${row.global_id} pack-profile confirmation`,
           ),
         },
+      },
+      evidence: {
+        lineGlobalId: row.global_id,
+        productGlobalId: row.product_global_id,
+        variantPackMappingGlobalId: row.pack_mapping_global_id,
+        capturedMappingRowVersion,
+        currentMappingRowVersion,
+        packProfileVersionGlobalId: row.pack_profile_version_global_id,
+        capturedProfileRowVersion,
+        currentProfileRowVersion,
+        fitModel: row.pack_profile_fit_model,
+        packagingState: row.packaging_state,
+        packagingSource: row.packaging_source,
+        weightSource,
+        weightGrams: unitWeightGrams,
+        channelSourceRevision: row.channel_source_revision,
+        channelSourceHash: row.channel_source_hash,
       },
     }
   })
@@ -1484,6 +1564,7 @@ export async function readHybridCartonizationInputFromPostgres(
           recipe.inputPackProfileVersionGlobalId,
         packagingMaterialGlobalId: recipe.packagingMaterialGlobalId,
       })),
+      lineEvidence: lineEvidence.map((entry) => entry.evidence),
       input: {
         mode: input.mode,
         lines: lineEvidence.map((entry) => entry.line),

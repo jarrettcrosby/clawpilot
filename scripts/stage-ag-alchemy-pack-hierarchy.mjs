@@ -486,6 +486,7 @@ export const AG_PRODUCT_PACK_CLASSES = Object.freeze({
         lengthMm: null,
         widthMm: null,
         heightMm: null,
+        fitModel: 'approved_recipe_only',
       }),
       profile({
         profileKey: 'customer-ship-case-1',
@@ -529,6 +530,7 @@ export const AG_PRODUCT_PACK_CLASSES = Object.freeze({
         lengthMm: null,
         widthMm: null,
         heightMm: null,
+        fitModel: 'approved_recipe_only',
       }),
       profile({
         profileKey: 'customer-ship-case-1',
@@ -2205,6 +2207,15 @@ function selfTest() {
     ).assemblyPolicy,
     'never',
   )
+  for (const classKey of ['ten_pound_bulk', 'twenty_pound_bulk']) {
+    const providerSellUnit = AG_PRODUCT_PACK_CLASSES[classKey].profiles.find(
+      (candidate) => candidate.isDefault,
+    )
+    assert.equal(providerSellUnit.fitModel, 'approved_recipe_only')
+    assert.equal(providerSellUnit.lengthMm, null)
+    assert.equal(providerSellUnit.widthMm, null)
+    assert.equal(providerSellUnit.heightMm, null)
+  }
   const assignments = parseAssignments(JSON.stringify({
     six_ounce_bag: ['gp0000001'],
     six_ounce_case_12: ['gp0000002'],

@@ -26,6 +26,7 @@ function mapping(
     profileVersionIsCurrent: true,
     profileLifecycleState: 'customer_confirmed',
     profileStatus: 'draft',
+    fitModel: 'rigid_3d',
     packageLevel: 'case',
     baseEachQuantity: 12,
     lengthMm: 279,
@@ -109,6 +110,49 @@ test('preserves the mapped association but does not invent missing weight', () =
   assert.equal(resolved.packaging, null)
 })
 
+test('retains an exact recipe-only sell-unit association without inventing item geometry', () => {
+  const resolved = resolveCommerceRuntimePack({
+    mapping: mapping({
+      fitModel: 'approved_recipe_only',
+      packageLevel: 'each',
+      baseEachQuantity: 1,
+      lengthMm: null,
+      widthMm: null,
+      heightMm: null,
+      dimensionBasis: 'unspecified',
+      channelWeightGrams: 4_536,
+    }),
+    providerUnitMultiplier: 1,
+    providerPackaging: null,
+  })
+  assert.equal(resolved.reason, 'recipe_required')
+  assert.equal(resolved.association?.mappingGlobalId, 'gcvm0000001')
+  assert.equal(resolved.association?.packageLevel, 'each')
+  assert.equal(resolved.packaging, null)
+})
+
+test('recipe-only association requires exact source-bound catalog weight', () => {
+  const resolved = resolveCommerceRuntimePack({
+    mapping: mapping({
+      fitModel: 'approved_recipe_only',
+      packageLevel: 'each',
+      baseEachQuantity: 1,
+      lengthMm: null,
+      widthMm: null,
+      heightMm: null,
+      dimensionBasis: 'unspecified',
+      grossWeightGrams: 4_536,
+      weightBasis: 'provider',
+      channelWeightGrams: null,
+    }),
+    providerUnitMultiplier: 1,
+    providerPackaging: null,
+  })
+  assert.equal(resolved.reason, 'weight_required')
+  assert.equal(resolved.association?.mappingGlobalId, 'gcvm0000001')
+  assert.equal(resolved.packaging, null)
+})
+
 test('fails closed when provider source evidence has changed', () => {
   const resolved = resolveCommerceRuntimePack({
     mapping: mapping({ channelSourceHash: 'b'.repeat(64) }),
@@ -126,6 +170,13 @@ test('fails closed for non-outer or nonconfirmed pack evidence', () => {
     mapping({ profileLifecycleState: 'draft' }),
     mapping({ profileVersionIsCurrent: false }),
     mapping({ evidenceType: 'unknown' }),
+    mapping({
+      fitModel: 'rigid_3d',
+      dimensionBasis: 'unspecified',
+      lengthMm: null,
+      widthMm: null,
+      heightMm: null,
+    }),
   ]) {
     const resolved = resolveCommerceRuntimePack({
       mapping: candidate,

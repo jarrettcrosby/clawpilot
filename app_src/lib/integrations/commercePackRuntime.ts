@@ -33,6 +33,7 @@ export type CommerceRuntimePackMapping = {
   profileVersionIsCurrent: boolean
   profileLifecycleState: string
   profileStatus: string
+  fitModel: string
   packageLevel: string
   baseEachQuantity: number
   lengthMm: number | null
@@ -73,6 +74,7 @@ export type CommerceRuntimePackResolution = {
     | 'pack_evidence_ineligible'
     | 'pack_quantity_conflict'
     | 'provider_dimensions_conflict'
+    | 'recipe_required'
     | 'weight_required'
     | 'resolved'
 }
@@ -139,6 +141,13 @@ export function resolveCommerceRuntimePack(input: {
         height: mapping.heightMm,
       }
     : null
+  const recipeOnlyAssociation = (
+    mapping.fitModel === 'approved_recipe_only'
+    && mapping.lengthMm === null
+    && mapping.widthMm === null
+    && mapping.heightMm === null
+    && mapping.dimensionBasis === 'unspecified'
+  )
   if (
     !mapping.profileVersionIsCurrent
     || !['customer_confirmed', 'active'].includes(
@@ -148,8 +157,13 @@ export function resolveCommerceRuntimePack(input: {
     || !['customer_confirmed', 'measured', 'provider'].includes(
       mapping.evidenceType,
     )
-    || mapping.dimensionBasis !== 'outer'
-    || !exactDimensions(dimensions)
+    || (
+      !recipeOnlyAssociation
+      && (
+        mapping.dimensionBasis !== 'outer'
+        || !exactDimensions(dimensions)
+      )
+    )
     || !positiveInteger(mapping.baseEachQuantity)
     || !['each', 'inner_pack', 'case', 'pallet'].includes(
       mapping.packageLevel,
@@ -186,12 +200,27 @@ export function resolveCommerceRuntimePack(input: {
   }
   if (
     input.providerPackaging
+    && dimensions
     && !sameDimensions(input.providerPackaging.dimensionsMm, dimensions)
   ) {
     return {
       association,
       packaging: null,
       reason: 'provider_dimensions_conflict',
+    }
+  }
+  if (recipeOnlyAssociation) {
+    if (!positiveInteger(mapping.channelWeightGrams)) {
+      return {
+        association,
+        packaging: null,
+        reason: 'weight_required',
+      }
+    }
+    return {
+      association,
+      packaging: null,
+      reason: 'recipe_required',
     }
   }
   const weight = positiveInteger(mapping.grossWeightGrams)
@@ -217,6 +246,13 @@ export function resolveCommerceRuntimePack(input: {
       association,
       packaging: null,
       reason: 'weight_required',
+    }
+  }
+  if (!dimensions) {
+    return {
+      association: null,
+      packaging: null,
+      reason: 'pack_evidence_ineligible',
     }
   }
   return {
