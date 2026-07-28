@@ -116,8 +116,544 @@ includes(continuationMigration, [
   'Commerce intake continuation batch lineage is invalid',
   'never a durable provider sync cursor',
 ], 'Commerce intake continuation migration')
+const productPolicyMigration = read(
+  'db/migrations/0119_operations_commerce_product_intake_policy.sql',
+)
+includes(productPolicyMigration, [
+  'CREATE TABLE IF NOT EXISTS operations_commerce_product_intake_policies',
+  "'commerce-product-intake-policy-v1'",
+  "CHECK (unmatched_action IN ('review', 'auto_create'))",
+  'revision integer NOT NULL CHECK (revision > 0)',
+  'PRIMARY KEY (organization_id, integration_account_id)',
+  'operations_commerce_product_intake_policy_account_fkey',
+  'DROP INDEX IF EXISTS idx_operations_product_mappings_exact_variant',
+  'AND active = true',
+], 'Commerce product-intake policy migration')
+const catalogSyncMigration = read(
+  'db/migrations/0120_operations_commerce_catalog_sync.sql',
+)
+includes(catalogSyncMigration, [
+  'CREATE TABLE IF NOT EXISTS operations_commerce_catalog_sync_jobs',
+  "status IN (\n      'pending', 'processing', 'failed',",
+  'credential_version integer NOT NULL',
+  'policy_revision integer NOT NULL',
+  'continuation_run_global_id',
+  'read_generation integer NOT NULL DEFAULT 0',
+  'products_unchanged bigint NOT NULL DEFAULT 0',
+  'attempt_count integer NOT NULL DEFAULT 0',
+  'max_attempts integer NOT NULL DEFAULT 8',
+  'idx_operations_commerce_catalog_sync_active_account',
+  "WHERE status IN ('pending', 'processing', 'failed')",
+  'operations_commerce_catalog_sync_lease_valid',
+  'operations_commerce_catalog_sync_completion_valid',
+  "'Product-only Shopify/Faire catalog backfill",
+], 'Commerce catalog-sync migration')
+const catalogSyncPersistenceSource = read(
+  'app_src/lib/persistence/commerceCatalogSync.ts',
+)
+includes(catalogSyncPersistenceSource, [
+  'applyCommerceCatalogSyncPolicyWithClient',
+  'ensureAutomaticCommerceCatalogIntakeWithClient',
+  'automaticCommerceCatalogRuntimeAvailable',
+  'queueAutomaticCommerceCatalogSyncsInPostgres',
+  'claimCommerceCatalogSyncJobsInPostgres',
+  'completeCommerceCatalogSyncPageInPostgres',
+  'failCommerceCatalogSyncJobInPostgres',
+  'readCommerceCatalogSyncStateWithClient',
+  "policy.unmatched_action = 'auto_create'",
+  'account.commerce_credential_generation',
+  "credential.verification_status = 'verified'",
+  'commerceCatalogCredentialSupportsProducts',
+  'PRODUCT_READABLE_CONNECTION_SQL',
+  "account.configuration->'grantedScopes'",
+  "account.configuration->'requestedScopes'",
+  "credential.auth_mode = 'faire_brand_token'",
+  "has('read_products')",
+  "has('READ_PRODUCTS')",
+  'commerce.intake.product_policy.connected_default',
+  'connectionIsAuthorization: true',
+  'productTargetReady: account.product_target_ready',
+  'waitingForProductTarget',
+  "existing?.unmatched_action === 'review'",
+  'COMMERCE_CATALOG_SYNC_FENCE_CHANGED',
+  "activation.state IN ('shadow', 'active')",
+  'FOR UPDATE OF job SKIP LOCKED',
+  "const CATALOG_SYNC_LEASE = '10 minutes'",
+  'attempt_count = 0',
+  'read_generation = read_generation',
+  'products_unchanged = products_unchanged',
+  'power(2, LEAST(attempt_count, 8))',
+  'queued',
+  'running',
+  'retrying',
+  'completed',
+  'paused',
+  'dead',
+  'lastSuccessAt',
+  'nextRunAt',
+  'providerWrites: 0',
+  'ordersTouched: 0',
+  'inventoryTouched: 0',
+], 'Commerce catalog-sync persistence')
+assert.equal(
+  (
+    catalogSyncPersistenceSource.match(
+      /AND \$\{PRODUCT_READABLE_CONNECTION_SQL\}/g,
+    ) || []
+  ).length,
+  6,
+  'Product-read eligibility must gate policy application, stale-job fencing, '
+    + 'recurring queueing, claiming, and the completion fence',
+)
+const catalogCredentialPolicyModule = loadTypeScriptModule(
+  'app_src/lib/persistence/commerceCatalogSync.ts',
+  {
+    mocks: {
+      '@/lib/auditWriter': {
+        async recordAuditEvent() {},
+      },
+      '@/lib/persistence/postgres': {
+        async query() {
+          throw new Error('Unexpected database query')
+        },
+        async withTransaction() {
+          throw new Error('Unexpected transaction')
+        },
+      },
+    },
+  },
+)
+assert.equal(
+  catalogCredentialPolicyModule.commerceCatalogCredentialSupportsProducts({
+    provider: 'shopify',
+    authMode: 'shopify_client_credentials',
+    configuration: { grantedScopes: ['read_products', 'read_orders'] },
+  }),
+  true,
+)
+assert.equal(
+  catalogCredentialPolicyModule.commerceCatalogCredentialSupportsProducts({
+    provider: 'shopify',
+    authMode: 'shopify_client_credentials',
+    configuration: { grantedScopes: ['read_orders'] },
+  }),
+  false,
+)
+assert.equal(
+  catalogCredentialPolicyModule.commerceCatalogCredentialSupportsProducts({
+    provider: 'faire',
+    authMode: 'faire_brand_token',
+    configuration: {},
+  }),
+  true,
+)
+assert.equal(
+  catalogCredentialPolicyModule.commerceCatalogCredentialSupportsProducts({
+    provider: 'faire',
+    authMode: 'faire_oauth',
+    configuration: { requestedScopes: ['READ_BRAND', 'READ_PRODUCTS'] },
+  }),
+  true,
+)
+assert.equal(
+  catalogCredentialPolicyModule.commerceCatalogCredentialSupportsProducts({
+    provider: 'faire',
+    authMode: 'faire_oauth',
+    configuration: { requestedScopes: ['READ_BRAND'] },
+  }),
+  false,
+)
+const automaticIntakeAudit = []
+function automaticIntakeClient({
+  account,
+  policy = null,
+  queued = 1,
+  cancelled = 0,
+}) {
+  const queries = []
+  return {
+    queries,
+    async query(sql) {
+      queries.push(sql)
+      if (sql.includes('AS product_target_ready')) {
+        return { rows: account ? [account] : [], rowCount: account ? 1 : 0 }
+      }
+      if (sql.includes('SELECT unmatched_action, revision')) {
+        return { rows: policy ? [policy] : [], rowCount: policy ? 1 : 0 }
+      }
+      if (sql.includes(
+        'INSERT INTO operations_commerce_product_intake_policies',
+      )) {
+        return { rows: [], rowCount: 1 }
+      }
+      if (sql.includes('UPDATE operations_commerce_catalog_sync_jobs')) {
+        return { rows: [], rowCount: cancelled }
+      }
+      if (sql.includes('INSERT INTO operations_commerce_catalog_sync_jobs')) {
+        return { rows: [], rowCount: queued }
+      }
+      throw new Error(`Unexpected automatic-intake query: ${sql}`)
+    },
+  }
+}
+const automaticIntakeModule = loadTypeScriptModule(
+  'app_src/lib/persistence/commerceCatalogSync.ts',
+  {
+    mocks: {
+      '@/lib/auditWriter': {
+        async recordAuditEvent(event) {
+          automaticIntakeAudit.push(event)
+        },
+      },
+      '@/lib/persistence/postgres': {
+        async query() {
+          throw new Error('Unexpected database query')
+        },
+        async withTransaction() {
+          throw new Error('Unexpected transaction')
+        },
+      },
+    },
+  },
+)
+const automaticIntakeAccount = {
+  global_id: 'gcia0000001',
+  provider: 'shopify',
+  status: 'disabled',
+  configuration: { grantedScopes: ['read_products'] },
+  commerce_credential_generation: 3,
+  credential_version: 3,
+  verification_status: 'verified',
+  auth_mode: 'shopify_client_credentials',
+  product_target_ready: true,
+}
+const automaticIntakeReadyClient = automaticIntakeClient({
+  account: automaticIntakeAccount,
+})
+const savedBehaviorRuntime = {
+  enabled: process.env.CLAWPILOT_COMMERCE_INTAKE_ENABLED,
+  lane: process.env.CLAWPILOT_ENV,
+}
+process.env.CLAWPILOT_COMMERCE_INTAKE_ENABLED = '1'
+process.env.CLAWPILOT_ENV = 'development'
+const automaticIntakeReady =
+  await automaticIntakeModule.ensureAutomaticCommerceCatalogIntakeWithClient(
+    automaticIntakeReadyClient,
+    {
+      organizationId: '11111111-1111-4111-8111-111111111111',
+      integrationAccountId: '22222222-2222-4222-8222-222222222222',
+      actorEmail: 'operator@example.com',
+    },
+  )
+assert.deepEqual(
+  JSON.parse(JSON.stringify(automaticIntakeReady)),
+  {
+    eligible: true,
+    initialized: true,
+    paused: false,
+    waitingForProductTarget: false,
+    policyRevision: 1,
+    queued: 1,
+    cancelled: 0,
+  },
+  'A verified product-readable connection must initialize and queue automatically',
+)
+assert.equal(automaticIntakeAudit.length, 1)
+const automaticIntakeWaitingClient = automaticIntakeClient({
+  account: {
+    ...automaticIntakeAccount,
+    product_target_ready: false,
+  },
+})
+const automaticIntakeWaiting =
+  await automaticIntakeModule.ensureAutomaticCommerceCatalogIntakeWithClient(
+    automaticIntakeWaitingClient,
+    {
+      organizationId: '11111111-1111-4111-8111-111111111111',
+      integrationAccountId: '22222222-2222-4222-8222-222222222222',
+      actorEmail: 'operator@example.com',
+    },
+  )
+assert.equal(automaticIntakeWaiting.initialized, true)
+assert.equal(automaticIntakeWaiting.waitingForProductTarget, true)
+assert.equal(automaticIntakeWaiting.queued, 0)
+assert.equal(
+  automaticIntakeWaitingClient.queries.some(
+    (sql) => sql.includes(
+      'INSERT INTO operations_commerce_catalog_sync_jobs',
+    ),
+  ),
+  false,
+  'Workspace target readiness must not become another user approval',
+)
+const automaticIntakePausedClient = automaticIntakeClient({
+  account: automaticIntakeAccount,
+  policy: { unmatched_action: 'review', revision: 4 },
+})
+const automaticIntakePaused =
+  await automaticIntakeModule.ensureAutomaticCommerceCatalogIntakeWithClient(
+    automaticIntakePausedClient,
+    {
+      organizationId: '11111111-1111-4111-8111-111111111111',
+      integrationAccountId: '22222222-2222-4222-8222-222222222222',
+      actorEmail: 'operator@example.com',
+    },
+  )
+assert.equal(automaticIntakePaused.paused, true)
+assert.equal(automaticIntakePaused.queued, 0)
+assert.equal(automaticIntakePaused.policyRevision, 4)
+const automaticIntakeScopeLossClient = automaticIntakeClient({
+  account: {
+    ...automaticIntakeAccount,
+    configuration: { grantedScopes: ['read_orders'] },
+  },
+  cancelled: 1,
+})
+const automaticIntakeScopeLoss =
+  await automaticIntakeModule.ensureAutomaticCommerceCatalogIntakeWithClient(
+    automaticIntakeScopeLossClient,
+    {
+      organizationId: '11111111-1111-4111-8111-111111111111',
+      integrationAccountId: '22222222-2222-4222-8222-222222222222',
+      actorEmail: 'operator@example.com',
+    },
+  )
+assert.equal(automaticIntakeScopeLoss.eligible, false)
+assert.equal(automaticIntakeScopeLoss.cancelled, 1)
+assert.equal(
+  automaticIntakeScopeLossClient.queries.some(
+    (sql) => sql.includes('SELECT unmatched_action, revision'),
+  ),
+  false,
+  'Product-scope loss must fence active work before consulting auto policy',
+)
+if (savedBehaviorRuntime.enabled === undefined) {
+  delete process.env.CLAWPILOT_COMMERCE_INTAKE_ENABLED
+} else {
+  process.env.CLAWPILOT_COMMERCE_INTAKE_ENABLED =
+    savedBehaviorRuntime.enabled
+}
+if (savedBehaviorRuntime.lane === undefined) {
+  delete process.env.CLAWPILOT_ENV
+} else {
+  process.env.CLAWPILOT_ENV = savedBehaviorRuntime.lane
+}
+const savedAutomaticCatalogRuntime = {
+  enabled: process.env.CLAWPILOT_COMMERCE_INTAKE_ENABLED,
+  lane: process.env.CLAWPILOT_ENV,
+}
+process.env.CLAWPILOT_COMMERCE_INTAKE_ENABLED = '1'
+process.env.CLAWPILOT_ENV = 'development'
+assert.equal(
+  catalogCredentialPolicyModule.automaticCommerceCatalogRuntimeAvailable(),
+  true,
+)
+process.env.CLAWPILOT_ENV = 'production'
+assert.equal(
+  catalogCredentialPolicyModule.automaticCommerceCatalogRuntimeAvailable(),
+  false,
+  'Connecting in production must not create a dormant development catalog job',
+)
+if (savedAutomaticCatalogRuntime.enabled === undefined) {
+  delete process.env.CLAWPILOT_COMMERCE_INTAKE_ENABLED
+} else {
+  process.env.CLAWPILOT_COMMERCE_INTAKE_ENABLED =
+    savedAutomaticCatalogRuntime.enabled
+}
+if (savedAutomaticCatalogRuntime.lane === undefined) {
+  delete process.env.CLAWPILOT_ENV
+} else {
+  process.env.CLAWPILOT_ENV = savedAutomaticCatalogRuntime.lane
+}
+assert.ok(
+  !catalogSyncPersistenceSource.includes('MAX_CATALOG_PAGES'),
+  'Successful 50-row catalog pages must continue until provider exhaustion',
+)
+const catalogSyncWorkerSource = read(
+  'app_src/lib/commerceCatalogSyncWorker.ts',
+)
+includes(catalogSyncWorkerSource, [
+  'executeCommerceCatalogProductPage',
+  'queueAutomaticCommerceCatalogSyncsInPostgres',
+  'claimCommerceCatalogSyncJobsInPostgres',
+  'completeCommerceCatalogSyncPageInPostgres',
+  'failCommerceCatalogSyncJobInPostgres',
+  'if (automatic.failed === true)',
+  'COMMERCE_PRODUCT_AUTO_CREATE_SWEEP_FAILED',
+  'pageCount: job.pageCount',
+  'readGeneration: job.readGeneration',
+  "resource: 'products'",
+  'providerWrites: 0',
+  'ordersTouched: 0',
+  'inventoryTouched: 0',
+], 'Commerce catalog-sync worker')
+const catalogSyncRouteSource = read(
+  'app_src/app/api/integrations/commerce/catalog/process/route.ts',
+)
+includes(catalogSyncRouteSource, [
+  'PIPELINE_OUTBOX_WORKER_SECRET',
+  'timingSafeEqual',
+  'commerceIntakeRuntimeAvailable()',
+  'processCommerceCatalogSyncOutbox',
+  'recordCommerceCatalogWorkerHeartbeatInPostgres',
+], 'Commerce catalog-sync worker route')
+const runtimePollerSource = read('scripts/pipeline-outbox-poller.mjs')
+includes(runtimePollerSource, [
+  'CLAWPILOT_COMMERCE_INTAKE_ENABLED',
+  'commerceCatalogEnabled',
+  "runLoop('commerce-catalog'",
+  '/api/integrations/commerce/catalog/process',
+], 'Conditional commerce catalog poller')
+const proxySource = read('app_src/proxy.ts')
+includes(proxySource, [
+  '/api/integrations/commerce/catalog/process',
+], 'Commerce catalog worker proxy allowlist')
+const catalogWorkerTrace = {
+  pages: [],
+  completions: [],
+  failures: [],
+}
+const catalogWorkerModule = loadTypeScriptModule(
+  'app_src/lib/commerceCatalogSyncWorker.ts',
+  {
+    mocks: {
+      '@/lib/integrations/commerceIntake': {
+        async executeCommerceCatalogProductPage(input) {
+          catalogWorkerTrace.pages.push(input)
+          return {
+            command: {
+              pagination: {
+                providerRowsSeen: 50,
+                hasNextBatch: false,
+                continuationRunGlobalId: null,
+              },
+              automaticProductCreation: {
+                created: 48,
+                mappedExisting: 0,
+                skipped: 2,
+                failed: 0,
+              },
+            },
+            intake: null,
+          }
+        },
+      },
+      '@/lib/persistence/commerceCatalogSync': {
+        async queueAutomaticCommerceCatalogSyncsInPostgres() {
+          return 0
+        },
+        async claimCommerceCatalogSyncJobsInPostgres() {
+          return [{
+            id: '11111111-1111-4111-8111-111111111111',
+            organizationId: '22222222-2222-4222-8222-222222222222',
+            integrationAccountId:
+              '33333333-3333-4333-8333-333333333333',
+            accountGlobalId: 'gcia0000001',
+            provider: 'shopify',
+            credentialVersion: 4,
+            policyRevision: 2,
+            requestedBy: 'operator@example.com',
+            continuationRunGlobalId: null,
+            readGeneration: 0,
+            pageCount: 125,
+            attemptCount: 1,
+            maxAttempts: 8,
+            lockToken: '44444444-4444-4444-8444-444444444444',
+          }]
+        },
+        async completeCommerceCatalogSyncPageInPostgres(input) {
+          catalogWorkerTrace.completions.push(input)
+          return {
+            status: 'succeeded',
+            pageCount: input.job.pageCount + 1,
+            hasNextBatch: false,
+          }
+        },
+        async failCommerceCatalogSyncJobInPostgres(input) {
+          catalogWorkerTrace.failures.push(input)
+          return { dead: false, leaseLost: false }
+        },
+      },
+    },
+  },
+)
+const catalogWorkerResult =
+  await catalogWorkerModule.processCommerceCatalogSyncOutbox({
+    limit: 2,
+    workerId: 'test-worker',
+  })
+assert.equal(catalogWorkerResult.pagesCompleted, 1)
+assert.equal(catalogWorkerResult.jobsCompleted, 1)
+assert.equal(catalogWorkerTrace.failures.length, 0)
+assert.equal(catalogWorkerTrace.pages[0].continuationRunGlobalId, null)
+assert.equal(catalogWorkerTrace.completions[0].totals.providerRecordsSeen, 50)
+assert.equal(catalogWorkerTrace.completions[0].totals.productsCreated, 48)
+assert.equal(catalogWorkerTrace.completions[0].totals.productsSkipped, 2)
+assert.equal(catalogWorkerTrace.completions[0].totals.productsUnchanged, 0)
+assert.equal(
+  catalogWorkerTrace.completions[0].job.pageCount,
+  125,
+  'Successful page count must be independent from retry attempts',
+)
+const mappingPolicy = loadTypeScriptModule(
+  'app_src/lib/integrations/commerceProductMappingPolicy.ts',
+)
+assert.equal(
+  mappingPolicy.exactProductMappingMutation({
+    activeProductId: 'product-a',
+    requestedProductId: 'product-b',
+    allowReplacement: false,
+  }),
+  'preserve',
+  'Automatic catalog intake must preserve an existing operator mapping',
+)
+assert.equal(
+  mappingPolicy.exactProductMappingMutation({
+    activeProductId: 'product-a',
+    requestedProductId: 'product-b',
+    allowReplacement: true,
+  }),
+  'replace',
+  'An explicit operator mapping may rotate the active future binding',
+)
+assert.equal(
+  mappingPolicy.exactProductMappingMutation({
+    activeProductId: 'product-a',
+    requestedProductId: 'product-a',
+    allowReplacement: false,
+  }),
+  'reuse',
+  'Automatic catalog intake may reuse the same active product mapping',
+)
+assert.equal(
+  mappingPolicy.exactProductMappingMutation({
+    activeProductId: null,
+    requestedProductId: 'product-a',
+    allowReplacement: false,
+  }),
+  'create',
+  'Automatic catalog intake may create a mapping only when none exists',
+)
 
 const serviceSource = read('app_src/lib/integrations/commerceIntake.ts')
+const backgroundCatalogPageSource = serviceSource.slice(
+  serviceSource.indexOf(
+    'export async function executeCommerceCatalogProductPage',
+  ),
+)
+includes(backgroundCatalogPageSource, [
+  'executeCommerceIntakeCommandInternal',
+  "includeIntakeState: false",
+  "hydrateProductInventory: false",
+  "'fetch-next-products'",
+  "'fetch-products'",
+], 'O(page) background commerce catalog execution')
+assert.ok(
+  !backgroundCatalogPageSource.includes(
+    'readCommerceIntakeStateFromPostgres({',
+  ),
+  'The background page wrapper must not materialize retained intake state',
+)
 const shopifyQuerySource = serviceSource.slice(
   serviceSource.indexOf('const SHOPIFY_LINE_ITEM_FIELDS'),
   serviceSource.indexOf('type IntakeCommandAction'),
@@ -202,9 +738,19 @@ includes(serviceSource, [
   "commandAction === 'resolve-customer'",
   "commandAction === 'resolve-delivery'",
   "commandAction === 'resolve-package'",
+  "commandAction === 'set-product-intake-policy'",
   "commandAction === 'validate'",
   "commandAction === 'promote'",
   'confirmProviderWriteOff',
+  'withAutomaticProductCreation',
+  'autoCreateCommerceProductsForRunInPostgres',
+  'updateCommerceProductIntakePolicyInPostgres',
+  'SHOPIFY_COMMERCE_NORMALIZER_VERSION',
+  'FAIRE_COMMERCE_NORMALIZER_VERSION',
+  'confirmAutoCreateProducts',
+  'expectedPolicyRevision',
+  'const organizationId = normalizeCommerceOrganizationId(input.organizationId)',
+  'const accountGlobalId = normalizeCommerceAccountGlobalId(',
 ], 'Commerce intake service')
 for (const providerWrite of [
   'moveFaireOrderToProcessing',
@@ -222,6 +768,45 @@ for (const providerWrite of [
 }
 
 const persistenceSource = read('app_src/lib/persistence/commerceIntake.ts')
+includes(persistenceSource, [
+  'latestProductEvidenceByVariant',
+  'candidate.provider = $3',
+  'candidate.external_variant_id = ANY($4::text[])',
+  'run.credential_version = $5::integer',
+  'preserveCommerceProductCandidateEvidence({',
+  'priorSourceRevision: prior.source_revision',
+  'incomingSourceRevision',
+  'priorSourceHash: prior.source_hash',
+  'incomingSourceHash: variant.sourceHash',
+  'priorMappingState: prior.mapping_state',
+  'prior.id,',
+  'productVariantsPreserved += 1',
+  'const recordsStaged = productVariantsStaged + ordersStaged',
+  'external_variant_id = ANY($3::text[])',
+  'COMMERCE_INTAKE_PRODUCT_CANDIDATE_RESPONSE_LIMIT = 500',
+  'LIMIT ${COMMERCE_INTAKE_PRODUCT_CANDIDATE_RESPONSE_LIMIT}',
+  'productCandidateSummary: {',
+  "scope: 'latest_unexpired_per_account_provider_variant'",
+  'unresolvedReturned: returnedUnresolvedProductCandidates',
+  'truncated:',
+  'unresolvedTruncated:',
+], 'Unchanged product evidence deduplication and page-bounded mappings')
+const productCandidateReadSource = persistenceSource.slice(
+  persistenceSource.indexOf(
+    'export async function readCommerceIntakeStateFromPostgres',
+  ),
+  persistenceSource.indexOf(
+    'export async function resolveCommerceProductCandidateInPostgres',
+  ),
+)
+includes(productCandidateReadSource, [
+  "candidate.mapping_state <> 'resolved'",
+  "IN ('held', 'resolving', 'ready')",
+  'LIMIT ${COMMERCE_INTAKE_PRODUCT_CANDIDATE_RESPONSE_LIMIT}',
+  'unresolved: Number(productCandidateSummary.unresolved)',
+  'Number(productCandidateSummary.unresolved)',
+  '> returnedUnresolvedProductCandidates',
+], 'Unresolved-first bounded product candidate response')
 for (const exportName of [
   'captureCommerceIntakeProviderReadInPostgres',
   'confirmCommerceCandidateAddressInPostgres',
@@ -235,6 +820,8 @@ for (const exportName of [
   'reserveCommerceIntakeProviderReadInPostgres',
   'markCommerceIntakeProviderReadUncertainInPostgres',
   'resolveCommerceProductCandidateInPostgres',
+  'updateCommerceProductIntakePolicyInPostgres',
+  'autoCreateCommerceProductsForRunInPostgres',
   'resolveCommerceCandidateCustomerInPostgres',
   'resolveCommerceCandidateDeliveryInPostgres',
   'resolveCommerceCandidatePackageInPostgres',
@@ -253,7 +840,7 @@ const commandResultSource = persistenceSource.slice(
   persistenceSource.indexOf('function commandResult'),
 )
 includes(persistenceSource, [
-  'CASE WHEN $27::text IS NULL THEN NULL ELSE 0 END',
+  'CASE WHEN $29::text IS NULL THEN NULL ELSE 0 END',
 ], 'Nullable presentment-currency staging parameter typing')
 const readIntentPreparationSource = persistenceSource.slice(
   persistenceSource.indexOf(
@@ -353,7 +940,229 @@ includes(persistenceSource, [
   "'commerce.intake.product_candidate.resolved'",
   "'commerce.intake.product_candidate.excluded'",
   'canonical_products_created',
+  'commerce.intake.update_product_policy',
+  'COMMERCE_PRODUCT_INTAKE_POLICY_REVISION_CONFLICT',
+  'COMMERCE_PRODUCT_AUTO_CREATE_CONFIRMATION_REQUIRED',
+  'COMMERCE_PRODUCT_AUTO_CREATE_CONNECTION_REQUIRED',
+  'COMMERCE_PRODUCT_AUTO_CREATE_DISABLED',
+  'candidate.mapping_state = \'unresolved\'',
+  'run.global_id = $3',
+  'deterministicCommandUuid',
+  'commerce_catalog_automatic_creation',
+  'replacedMappingGlobalId',
+  'SET active = false',
+  'preservedAutomaticMapping',
+  'FOR UPDATE OF mapping, product',
+  'allowReplacement: !input.automatic',
+  'COMMERCE_PRODUCT_AUTO_CREATE_MAPPING_CONFLICT',
+  'catalog_product_existing_mapping_preserved',
+  'recordAutomaticProductFailureInPostgres',
+  'commerce.intake.product_candidate.automatic_failed',
+  'next_catalog_reconciliation_or_manual_resolution',
+  'candidate.last_error_code',
+  'lastErrorCode: candidate.last_error_code',
+  'failedByCode',
+  'header_money_state',
+  'header_money_gaps',
+  'order.headerMoney.fulfillmentDemandEligible',
+  "expectedHeaderMoneyState === 'complete'",
+  'shipping === null ? null : bigintString(shipping)',
+  'otherAdjustment === null ? null : bigintString(otherAdjustment)',
+  "fulfillmentDemandUse: 'exact_lines_only'",
+  "accountingUse: candidate.header_money_state === 'complete'",
+  "customerChargeUse: candidate.header_money_state === 'complete'",
 ], 'Commerce intake continuity')
+const productCandidateResolverSource = persistenceSource.slice(
+  persistenceSource.indexOf(
+    'export async function resolveCommerceProductCandidateInPostgres',
+  ),
+  persistenceSource.indexOf('function automaticProductResolution'),
+)
+const automaticCredentialFenceSource = persistenceSource.slice(
+  persistenceSource.indexOf(
+    'async function assertCurrentAutomaticProductCredentialFence',
+  ),
+  persistenceSource.indexOf('const CANDIDATE_SELECT'),
+)
+includes(automaticCredentialFenceSource, [
+  'JOIN operations_commerce_credentials credential',
+  'account.organization_id = $1::uuid',
+  'account.id = $2::uuid',
+  'account.provider = $3',
+  'FOR UPDATE OF credential',
+  "current.status === 'error'",
+  "current.verification_status !== 'verified'",
+  'current.commerce_credential_generation',
+  '!== input.runtime.credentialVersion',
+  'current.credential_version !== input.runtime.credentialVersion',
+  'commerceCatalogCredentialSupportsProducts',
+  "'COMMERCE_PRODUCT_AUTO_CREATE_DISABLED'",
+], 'Per-candidate automatic product credential and scope fence')
+assert.ok(
+  productCandidateResolverSource.indexOf(
+    'await assertCurrentAutomaticProductCredentialFence(client',
+  ) < productCandidateResolverSource.indexOf(
+    'stageCrmRecordWithClient(client',
+  ),
+  'Automatic product creation must recheck the current credential generation, verification, and product scope inside the product mutation transaction',
+)
+assert.ok(
+  productCandidateResolverSource.indexOf(
+    'FOR UPDATE OF mapping, product',
+  ) < productCandidateResolverSource.indexOf(
+    'stageCrmRecordWithClient(client',
+  ),
+  'Automatic product resolution must lock and preserve an active exact mapping before any CRM product can be created',
+)
+includes(productCandidateResolverSource, [
+  'id: preservedAutomaticMapping.product_id',
+  'globalId: preservedAutomaticMapping.product_global_id',
+  'id: preservedAutomaticMapping.id',
+  'global_id: preservedAutomaticMapping.global_id',
+  'allowReplacement: !input.automatic',
+  'if (input.automatic && localProductSku)',
+  'commerce-catalog-local-sku:',
+  'lower(btrim(sku)) = lower(btrim($2))',
+  'automaticLocalProductSku({',
+  'providerSnapshot: {',
+  'productTitle: candidate.product_title_snapshot',
+  'variantTitle: candidate.variant_title_snapshot',
+  'sku: candidate.sku_snapshot',
+  'localCatalog: {',
+  'providerSkuOmittedBecauseDuplicate:',
+  'channelSku: candidate.sku_snapshot || product.sku',
+  'automaticLocalSkuOmitted',
+], 'Automatic exact-mapping preservation')
+const automaticProductResolutionModule = loadTypeScriptModule(
+  'app_src/lib/persistence/commerceIntake.ts',
+  {
+    mocks: {
+      '@/lib/auditWriter': {},
+      '@/lib/integrations/commerceCredentialCrypto': {},
+      '@/lib/integrations/commerceIntegrations': {
+        CommerceIntegrationRequestError: class extends Error {},
+      },
+      '@/lib/integrations/commerceProductMappingPolicy': {},
+      '@/lib/operations/commerceNormalization': {
+        commerceCurrencyMinorUnit: () => 2,
+      },
+      '@/lib/persistence/crm': {},
+      '@/lib/persistence/postgres': {},
+      '@/lib/persistence/commerceCatalogSync': {},
+    },
+  },
+)
+const longAutomaticProduct = {
+  product_title_snapshot: 'A'.repeat(300),
+  variant_title_snapshot: null,
+  sku_snapshot: 'SKU-THAT-IS-LONGER-THAN-TWENTY-FIVE',
+  currency_code: 'usd',
+  price_minor: '1250',
+}
+const boundedAutomaticResolution =
+  automaticProductResolutionModule.automaticProductResolution(
+    longAutomaticProduct,
+  )
+const unchangedProductEvidence = {
+  priorCredentialVersion: 3,
+  currentCredentialVersion: 3,
+  priorSourceRevision: 'source-revision',
+  incomingSourceRevision: 'source-revision',
+  priorSourceHash: 'source-hash',
+  incomingSourceHash: 'source-hash',
+}
+assert.equal(
+  automaticProductResolutionModule.preserveCommerceProductCandidateEvidence({
+    ...unchangedProductEvidence,
+    priorMappingState: 'resolved',
+  }),
+  true,
+  'An unchanged resolved provider variant may reuse its prior candidate evidence',
+)
+assert.equal(
+  automaticProductResolutionModule.preserveCommerceProductCandidateEvidence({
+    ...unchangedProductEvidence,
+    priorMappingState: 'unsupported',
+  }),
+  true,
+  'An unchanged explicitly excluded provider variant must stay excluded',
+)
+assert.equal(
+  automaticProductResolutionModule.preserveCommerceProductCandidateEvidence({
+    ...unchangedProductEvidence,
+    priorMappingState: 'unresolved',
+  }),
+  false,
+  'An unchanged unresolved provider variant must be re-staged for automatic retry',
+)
+assert.equal(
+  automaticProductResolutionModule.automaticLocalProductSku({
+    providerSku: ' DUPLICATE-SKU ',
+    localSkuOccupied: true,
+  }),
+  null,
+  'An occupied local SKU must be omitted from a new automatic product',
+)
+assert.equal(
+  automaticProductResolutionModule.automaticLocalProductSku({
+    providerSku: ' PROVIDER-SKU ',
+    localSkuOccupied: false,
+  }),
+  'PROVIDER-SKU',
+  'An available provider SKU must remain on the automatic local product',
+)
+assert.equal(
+  automaticProductResolutionModule.automaticProductFailureCode({
+    code: '23505',
+  }),
+  'COMMERCE_PRODUCT_AUTO_CREATE_IDENTITY_CONFLICT',
+  'A database uniqueness conflict must become a safe automatic product code',
+)
+assert.equal(
+  automaticProductResolutionModule.automaticProductFailureCode({
+    code: 'COMMERCE_PRODUCT_AUTO_CREATE_MAPPING_CONFLICT',
+  }),
+  'COMMERCE_PRODUCT_AUTO_CREATE_MAPPING_CONFLICT',
+  'An existing safe commerce code must survive automatic failure classification',
+)
+assert.equal(
+  automaticProductResolutionModule.automaticProductFailureCode(
+    new Error('raw database failure must not reach the browser'),
+  ),
+  'COMMERCE_PRODUCT_AUTO_CREATE_FAILED',
+  'An unknown automatic failure must collapse to a safe generic code',
+)
+assert.ok(
+  boundedAutomaticResolution.resolution,
+  'Long provider title and SKU must not block an otherwise exact automatic product',
+)
+assert.equal(boundedAutomaticResolution.resolution.name.length, 255)
+assert.match(
+  boundedAutomaticResolution.resolution.name,
+  / · [a-f0-9]{12}$/,
+)
+assert.equal(
+  boundedAutomaticResolution.resolution.sku,
+  null,
+  'An overlong provider SKU must be omitted from the bounded CRM SKU field',
+)
+assert.equal(boundedAutomaticResolution.resolution.unitPriceMinor, 1250)
+assert.equal(boundedAutomaticResolution.resolution.currency, 'USD')
+assert.equal(
+  automaticProductResolutionModule.automaticProductResolution(
+    longAutomaticProduct,
+  ).resolution.name,
+  boundedAutomaticResolution.resolution.name,
+  'The bounded display name must be deterministic',
+)
+assert.equal(
+  automaticProductResolutionModule.automaticProductResolution({
+    ...longAutomaticProduct,
+    price_minor: null,
+  }).reason,
+  'product_price_invalid',
+  'Automatic creation must still fail closed when exact price is absent',
+)
 const crmPersistenceSource = read('app_src/lib/persistence/crm.ts')
 includes(crmPersistenceSource, [
   'identityKeyOverride?: string',
@@ -455,11 +1264,73 @@ includes(workflowSource, [
   'Match existing product',
   'Create and match product',
   'Reason for skipping',
+  'Create all new products',
+  'Create ready products',
+  'const isPartialCreate = bulkInvalidProductCount > 0',
+  'ready ClawPilot',
+  'left for review',
+  'in review without changing them',
+  'bulkCreatableProductCandidates.length === 0',
+  "'bulk-create-products'",
+  "'bulk-create-product'",
+  'Retry all exact orders',
+  "'bulk-retry-order-money'",
+  "'bulk-retry-rejection'",
   'Download review CSV',
   'Import decisions',
   'parseCommerceProductReviewCsv',
   'confirmProviderWriteOff: true',
 ], 'Commerce intake executable recovery and catalog workflow')
+includes(workflowSource, [
+  'Pause or resume product catalog sync',
+  'This verified connection authorizes automatic read-only catalog sync.',
+  'Your verified ${providerLabel(provider)} connection authorizes automatic read-only product synchronization with no second approval.',
+  "'set-product-intake-policy'",
+  'expectedPolicyRevision: productIntakePolicyRevision',
+  "unmatchedAction: enabled ? 'auto_create' : 'review'",
+  'confirmAutoCreateProducts: enabled',
+  'Revision ${productIntakePolicyRevision}',
+  'Updated ${formatDate(',
+  'exact provider-variant',
+  'candidate.lastErrorCode',
+  'ClawPilot will retry this',
+  'Choose product decision',
+  'automatic identity across Shopify and Faire',
+  'automation never guesses that two source records are',
+  "'COMMERCE_PRODUCT_INTAKE_POLICY_REVISION_CONFLICT'",
+  'payload.command?.productIntake',
+  'productIntake: committedPolicy',
+  '!connectionReady',
+  'Reconnect and verify ${providerLabel(provider)}',
+], 'Durable future-product policy controls')
+assert.ok(
+  !workflowSource.includes('Turn on automatic product sync for ${displayName}?'),
+  'A verified connection must not lead to a second catalog authorization modal',
+)
+const commerceIntegrationPanelSource = read(
+  'app_src/components/settings/CommerceIntegrationPanel.tsx',
+)
+includes(commerceIntegrationPanelSource, [
+  'connectionReady={',
+  "account.verificationStatus === 'verified'",
+], 'Credential-independent product policy access')
+includes(workflowSource, [
+  'automaticProductCreationNotice',
+  'payload.command?.automaticProductCreation',
+  '${created} created',
+  '${skipped} skipped by automation',
+  '${failed} failed',
+  '${remaining} remaining in review',
+  'Products not created remain in review.',
+], 'Automatic product creation execution summary')
+includes(workflowSource, [
+  'ExternalOrderV2 money fields',
+  'Paid-shipping records can stage',
+  'Missing shipping and total remain unavailable',
+  'Header total unavailable',
+  'blocked from',
+  'accounting and customer-charge use',
+], 'Current Faire money retry guidance')
 includes(workflowSource, [
   "requestError.code === 'COMMERCE_INTAKE_READ_RESTART_REQUIRED'",
   "'COMMERCE_INTAKE_CONTINUATION_RESTART_REQUIRED'",
@@ -564,10 +1435,18 @@ const customerIdentityPersistence = loadTypeScriptModule(
       '@/lib/integrations/commerceIntegrations': {
         CommerceIntegrationRequestError: MockCommerceIntegrationRequestError,
       },
+      '@/lib/integrations/commerceProductMappingPolicy': {
+        exactProductMappingMutation:
+          mappingPolicy.exactProductMappingMutation,
+      },
       '@/lib/operations/commerceNormalization': {
         commerceCurrencyMinorUnit() { return 2 },
       },
       '@/lib/persistence/crm': { stageCrmRecordWithClient() {} },
+      '@/lib/persistence/commerceCatalogSync': {
+        applyCommerceCatalogSyncPolicyWithClient() {},
+        readCommerceCatalogSyncStateWithClient() {},
+      },
       '@/lib/persistence/postgres': {
         acquireTransactionAdvisoryLock() {},
         withTransaction() {},
@@ -664,6 +1543,8 @@ const continuations = new Map()
 const readIntents = new Map()
 const invalidContinuations = []
 const stageAttempts = []
+const automaticProductSweeps = []
+const productPolicyUpdates = []
 let failStageOnceForKey = null
 let failReadIntentPreparationForKey = null
 const refreshTargets = new Map([
@@ -750,7 +1631,11 @@ const service = loadTypeScriptModule(
                   })),
             }],
             ...(!listOptions.cursor
-              ? { next_cursor: 'faire-products-page-2' }
+              ? {
+                page: 1,
+                limit: 50,
+                cursor: 'faire-products-page-2',
+              }
               : {}),
           }
         },
@@ -786,6 +1671,8 @@ const service = loadTypeScriptModule(
         },
       },
       '@/lib/integrations/faireCommerceNormalizer': {
+        FAIRE_COMMERCE_NORMALIZER_VERSION:
+          'faire-commerce-normalizer-v3',
         normalizeFaireCommerce(source) {
           normalizedSources.faire = source
           if (source.inventories) {
@@ -805,6 +1692,8 @@ const service = loadTypeScriptModule(
         },
       },
       '@/lib/integrations/shopifyCommerceNormalizer': {
+        SHOPIFY_COMMERCE_NORMALIZER_VERSION:
+          'shopify-commerce-normalizer-v1',
         normalizeShopifyCommerce(source) {
           normalizedSources.shopify = source
           const result = envelope(
@@ -971,7 +1860,37 @@ const service = loadTypeScriptModule(
           return runtimes.get(input.accountGlobalId) || null
         },
       },
+      '@/lib/persistence/commerceOrderReconciliation': {
+        async readCommerceOrderReconciliationStateInPostgres() {
+          return {
+            status: 'idle',
+            recordsSeen: 0,
+            recordsHeld: 0,
+            consecutiveFailures: 0,
+            lastErrorCode: null,
+            lastStartedAt: null,
+            lastCompletedAt: null,
+            resumable: false,
+            providerWrites: 0,
+            canonicalOrderWrites: 0,
+            inventoryWrites: 0,
+          }
+        },
+      },
       '@/lib/persistence/commerceIntake': {
+        async autoCreateCommerceProductsForRunInPostgres(input) {
+          automaticProductSweeps.push(input)
+          return {
+            enabled: true,
+            runGlobalId: input.runGlobalId,
+            attempted: 1,
+            created: 1,
+            failed: 0,
+            remainingUnresolved: 0,
+            providerWrites: 0,
+            syncCursorAdvanced: false,
+          }
+        },
         confirmCommerceCandidateAddressInPostgres:
           persistenceCommand('confirm-address'),
         markCommerceCandidateUnsupportedInPostgres:
@@ -1179,6 +2098,23 @@ const service = loadTypeScriptModule(
           )
           return result
         },
+        async updateCommerceProductIntakePolicyInPostgres(input) {
+          productPolicyUpdates.push(input)
+          return {
+            action: 'set-product-intake-policy',
+            accountGlobalId: input.accountGlobalId,
+            productIntake: {
+              version: 'commerce-product-intake-policy-v1',
+              unmatchedAction: input.unmatchedAction,
+              autoCreateNewProducts:
+                input.unmatchedAction === 'auto_create',
+              revision: input.expectedPolicyRevision + 1,
+            },
+            providerWrites: 0,
+            syncCursorAdvanced: false,
+            replayed: false,
+          }
+        },
         validateCommerceCandidateInPostgres: persistenceCommand('validate'),
       },
     },
@@ -1191,6 +2127,40 @@ const savedEnvironment = {
 }
 process.env.CLAWPILOT_COMMERCE_INTAKE_ENABLED = '1'
 process.env.CLAWPILOT_ENV = 'development'
+
+assert.equal(
+  service.nextFaireCursor(
+    { page: 1, limit: 50, cursor: 'faire-products-page-2' },
+    'Faire products',
+  ),
+  'faire-products-page-2',
+  'Faire External API v2 top-level cursor must drive the next page',
+)
+assert.equal(
+  service.nextFaireCursor(
+    { limit: 50, products: [] },
+    'Faire products',
+  ),
+  null,
+  'A final Faire page without a cursor must exhaust the batch chain',
+)
+assert.throws(
+  () => service.nextFaireCursor(
+    { cursor: 'faire-products-page-2' },
+    'Faire products',
+    'faire-products-page-2',
+  ),
+  (error) => error.code === 'COMMERCE_INTAKE_PAGINATION_INVALID',
+  'Faire pagination must fail closed when the provider repeats the current cursor',
+)
+assert.throws(
+  () => service.nextFaireCursor(
+    { cursor: 'x'.repeat(4_097) },
+    'Faire products',
+  ),
+  (error) => error.code === 'COMMERCE_INTAKE_PAGINATION_INVALID',
+  'Faire pagination must reject an oversized provider cursor',
+)
 
 let keySequence = 0
 function nextKey() {
@@ -1210,6 +2180,20 @@ function commandBody(action, extra = {}) {
 }
 
 try {
+  const disconnectedPolicyState = await service.getCommerceIntake({
+    organizationId,
+    accountGlobalId: 'gcia0000999',
+  })
+  assert.equal(
+    disconnectedPolicyState.accountGlobalId,
+    'gcia0000999',
+    'Policy state must remain readable without a runtime credential so an administrator can disable automation',
+  )
+  assert.equal(
+    providerReads.shopifyToken,
+    0,
+    'Reading credential-independent policy state must not call the provider',
+  )
   const readPreparationFailureKey = nextKey()
   failReadIntentPreparationForKey = readPreparationFailureKey
   const readsBeforePreparationFailure = { ...providerReads }
@@ -1283,6 +2267,7 @@ try {
       idempotencyKey: nextKey(),
     },
   })
+  const shopifyProductsKey = nextKey()
   const firstShopifyProducts = await service.executeCommerceIntakeCommand({
     organizationId,
     actorEmail,
@@ -1290,9 +2275,26 @@ try {
       action: 'fetch-products',
       accountGlobalId: shopifyRuntime.globalId,
       confirmReadOnly: true,
-      idempotencyKey: nextKey(),
+      idempotencyKey: shopifyProductsKey,
     },
   })
+  const replayedShopifyProducts =
+    await service.executeCommerceIntakeCommand({
+      organizationId,
+      actorEmail,
+      body: {
+        action: 'fetch-products',
+        accountGlobalId: shopifyRuntime.globalId,
+        confirmReadOnly: true,
+        idempotencyKey: shopifyProductsKey,
+      },
+    })
+  assert.equal(replayedShopifyProducts.command.replayed, true)
+  assert.equal(
+    replayedShopifyProducts.command.automaticProductCreation.created,
+    1,
+    'A staged product replay must resume the deterministic automatic sweep',
+  )
   await service.executeCommerceIntakeCommand({
     organizationId,
     actorEmail,
@@ -1437,6 +2439,7 @@ try {
   )
   assert.equal(normalizedSources.faire.products.products.length, 0)
   assert.equal(normalizedSources.faire.orders.orders.length, 1)
+  assert.equal(normalizedSources.faire.products.cursor, null)
   assert.equal(normalizedSources.faire.products.next_cursor, null)
   assert.equal(normalizedSources.faire.orders.next_cursor, null)
   assert.equal(hydratedFaireProductSources.length, 2)
@@ -1452,6 +2455,20 @@ try {
   )
   assert.equal(providerAttempts.length, 10)
   assert.equal(providerReservations.length, 11)
+  assert.ok(
+    providerReservations.some((reservation) => (
+      reservation.runtime.provider === 'faire'
+      && reservation.adapterVersion === 'faire-commerce-normalizer-v3'
+    )),
+    'Faire provider-attempt evidence must record the v3 normalizer',
+  )
+  assert.ok(
+    providerReservations.some((reservation) => (
+      reservation.runtime.provider === 'shopify'
+      && reservation.adapterVersion === 'shopify-commerce-normalizer-v1'
+    )),
+    'Shopify provider-attempt evidence must record its actual normalizer',
+  )
   assert.equal(capturedReads.size, 10)
   assert.equal(uncertainReads.length, 0)
   assert.equal(stageAttempts.length, 11)
@@ -1495,6 +2512,62 @@ try {
   assert.equal(staged[3].input.page.resource, 'products')
   assert.equal(staged[8].input.page, null)
   assert.equal(staged[9].input.page, null)
+  assert.equal(
+    automaticProductSweeps.length,
+    5,
+    'Every product stage and product-stage replay must run the automatic policy sweep',
+  )
+  for (const sweep of automaticProductSweeps) {
+    assert.match(sweep.runGlobalId, /^gcir[0-9]{7}$/)
+  }
+  const reviewPolicy = await service.executeCommerceIntakeCommand({
+    organizationId,
+    actorEmail,
+    body: {
+      action: 'set-product-intake-policy',
+      accountGlobalId: 'gcia0000999',
+      unmatchedAction: 'review',
+      expectedPolicyRevision: 0,
+      idempotencyKey: nextKey(),
+    },
+  })
+  assert.equal(
+    reviewPolicy.command.productIntake.unmatchedAction,
+    'review',
+    'Turning automatic creation off must not require a runtime credential',
+  )
+  await assert.rejects(
+    service.executeCommerceIntakeCommand({
+      organizationId,
+      actorEmail,
+      body: {
+        action: 'set-product-intake-policy',
+        accountGlobalId: shopifyRuntime.globalId,
+        unmatchedAction: 'auto_create',
+        expectedPolicyRevision: 0,
+        idempotencyKey: nextKey(),
+      },
+    }),
+    (error) => (
+      error.code === 'COMMERCE_PRODUCT_AUTO_CREATE_CONFIRMATION_REQUIRED'
+    ),
+  )
+  await service.executeCommerceIntakeCommand({
+    organizationId,
+    actorEmail,
+    body: {
+      action: 'set-product-intake-policy',
+      accountGlobalId: shopifyRuntime.globalId,
+      unmatchedAction: 'auto_create',
+      expectedPolicyRevision: 0,
+      confirmAutoCreateProducts: true,
+      idempotencyKey: nextKey(),
+    },
+  })
+  assert.deepEqual(
+    productPolicyUpdates.map((update) => update.unmatchedAction),
+    ['review', 'auto_create'],
+  )
 
   const localCommands = [
     commandBody('exclude-rejection', {

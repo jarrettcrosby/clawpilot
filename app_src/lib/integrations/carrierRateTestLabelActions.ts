@@ -310,6 +310,28 @@ function createFixtureAndVerifyContext(input: {
   return fixture
 }
 
+async function resolveVerifiedLabelRuntime(input: {
+  organizationId: string
+  context: CarrierRateTestCreateContext
+  destination: CarrierSandboxParty
+}) {
+  const runtime = await resolveCarrierSandboxShippingRuntime({
+    organizationId: input.organizationId,
+    provider: input.context.provider,
+    carrierAccountGlobalId: input.context.carrierAccountGlobalId,
+    senderBillingOnly: true,
+  })
+  assertRuntimeMatches({ runtime, expected: input.context })
+  return {
+    runtime,
+    shipmentFixture: createFixtureAndVerifyContext({
+      context: input.context,
+      destination: input.destination,
+      runtime,
+    }),
+  }
+}
+
 export async function createCarrierRateTestLabel(input: {
   organizationId: string
   actorEmail: string
@@ -328,6 +350,15 @@ export async function createCarrierRateTestLabel(input: {
   const destination = normalizeCarrierSandboxParty(input.destination)
   const destinationFingerprint = carrierSandboxPartyFingerprint(destination)
   assertDestinationMatchesRate(context, destinationFingerprint)
+  try {
+    await resolveVerifiedLabelRuntime({
+      organizationId: input.organizationId,
+      context,
+      destination,
+    })
+  } catch (error) {
+    throw carrierActionError(error)
+  }
   const attemptRequestHash = carrierRateTestLabelFingerprint({
     action: 'create',
     rateEvidenceGlobalId: context.rateEvidenceGlobalId,
@@ -357,18 +388,13 @@ export async function createCarrierRateTestLabel(input: {
   let runtime: Awaited<ReturnType<typeof resolveCarrierSandboxShippingRuntime>>
   let shipmentFixture: ReturnType<typeof buildCarrierSandboxRateFixture>
   try {
-    runtime = await resolveCarrierSandboxShippingRuntime({
+    const verified = await resolveVerifiedLabelRuntime({
       organizationId: input.organizationId,
-      provider: context.provider,
-      carrierAccountGlobalId: context.carrierAccountGlobalId,
-      senderBillingOnly: true,
-    })
-    assertRuntimeMatches({ runtime, expected: context })
-    shipmentFixture = createFixtureAndVerifyContext({
       context,
       destination,
-      runtime,
     })
+    runtime = verified.runtime
+    shipmentFixture = verified.shipmentFixture
   } catch (error) {
     await finalizePreparedFailure({
       organizationId: input.organizationId,

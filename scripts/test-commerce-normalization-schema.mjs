@@ -12,6 +12,10 @@ const continuationMigration = readFileSync(resolve(
   process.cwd(),
   'db/migrations/0115_operations_commerce_intake_continuations.sql',
 ), 'utf8')
+const incompleteHeaderMoneyMigration = readFileSync(resolve(
+  process.cwd(),
+  'db/migrations/0122_operations_commerce_incomplete_header_money.sql',
+), 'utf8')
 const operationsPersistence = readFileSync(resolve(
   process.cwd(),
   'app_src/lib/persistence/operations.ts',
@@ -405,5 +409,24 @@ for (const mutation of [
     'Continuation schema must not mutate durable commerce sync cursors',
   )
 }
+
+includesAllIn(incompleteHeaderMoneyMigration, [
+  'header_money_state text NOT NULL',
+  "DEFAULT 'complete'",
+  'header_money_gaps text[] NOT NULL',
+  'ALTER COLUMN shipping_minor DROP NOT NULL',
+  'ALTER COLUMN other_adjustment_minor DROP NOT NULL',
+  'ALTER COLUMN total_minor DROP NOT NULL',
+  "header_money_state IN ('complete', 'operational_incomplete')",
+  "header_money_gaps = '{}'::text[]",
+  "ARRAY['shipping']::text[]",
+  "ARRAY['total']::text[]",
+  "ARRAY['shipping', 'total']::text[]",
+  "('shipping' = ANY(header_money_gaps))",
+  "('total' = ANY(header_money_gaps))",
+  'other_adjustment_minor IS NULL',
+  'total_minor = subtotal_minor',
+  'Commerce order candidate header money evidence is immutable',
+], 'Typed incomplete order header money')
 
 console.log('commerce normalization schema contracts passed')

@@ -10,6 +10,10 @@ import { readAgentDispatchWorkerHeartbeatFromPostgres } from '@/lib/persistence/
 import { readAgentResearchWorkerHeartbeatFromPostgres } from '@/lib/persistence/agentResearch'
 import { readToastWorkerHeartbeatFromPostgres } from '@/lib/persistence/toastIntegrations'
 import { readQuickBooksWorkerHeartbeatFromPostgres } from '@/lib/persistence/quickBooksIntegrations'
+import {
+  readCommerceCatalogWorkerHeartbeatFromPostgres,
+} from '@/lib/persistence/commerceCatalogSync'
+import { commerceIntakeRuntimeAvailable } from '@/lib/integrations/commerceIntake'
 import { effectiveDocumentEmbeddingConfiguration } from '@/lib/documentEmbeddings'
 import { validateShortLinkConfiguration } from '@/lib/shortlinks'
 import { readSuiteCrmWorkerHeartbeat } from '@/lib/persistence/crm'
@@ -72,6 +76,9 @@ export async function GET() {
     let agentResearchWorker: Record<string, unknown> = { status: 'not-owned' }
     let toastWorker: Record<string, unknown> = { status: 'not-owned' }
     let quickBooksWorker: Record<string, unknown> = { status: 'not-owned' }
+    let commerceCatalogWorker: Record<string, unknown> = {
+      status: 'disabled',
+    }
     let integrationQueues: Record<string, unknown> = { status: 'not-configured' }
     let operationsCommands: Record<string, unknown> = { status: 'not-configured' }
     let crm: Record<string, unknown> = { status: 'disabled' }
@@ -260,6 +267,14 @@ export async function GET() {
           operations_shopify_order_preview_migration_applied: boolean
           operations_commerce_normalization_migration_applied: boolean
           operations_commerce_continuations_migration_applied: boolean
+          operations_carrier_rate_test_labels_migration_applied: boolean
+          operations_print_agent_capabilities_migration_applied: boolean
+          operations_carrier_label_artifacts_migration_applied: boolean
+          operations_commerce_product_policy_migration_applied: boolean
+          operations_commerce_catalog_sync_migration_applied: boolean
+          operations_package_contents_migration_applied: boolean
+          operations_commerce_incomplete_header_money_migration_applied: boolean
+          operations_packaging_materials_migration_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -750,6 +765,46 @@ export async function GET() {
                 FROM schema_migrations
                 WHERE filename = '0115_operations_commerce_intake_continuations.sql'
               ) AS operations_commerce_continuations_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0116_operations_carrier_rate_test_labels.sql'
+              ) AS operations_carrier_rate_test_labels_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0117_operations_print_agent_capabilities.sql'
+              ) AS operations_print_agent_capabilities_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0118_operations_carrier_label_output_artifacts.sql'
+              ) AS operations_carrier_label_artifacts_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0119_operations_commerce_product_intake_policy.sql'
+              ) AS operations_commerce_product_policy_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0120_operations_commerce_catalog_sync.sql'
+              ) AS operations_commerce_catalog_sync_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0121_operations_package_contents.sql'
+              ) AS operations_package_contents_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0122_operations_commerce_incomplete_header_money.sql'
+              ) AS operations_commerce_incomplete_header_money_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0123_operations_packaging_materials.sql'
+              ) AS operations_packaging_materials_migration_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -859,6 +914,14 @@ export async function GET() {
             && row?.operations_shopify_order_preview_migration_applied
             && row?.operations_commerce_normalization_migration_applied
             && row?.operations_commerce_continuations_migration_applied
+            && row?.operations_carrier_rate_test_labels_migration_applied
+            && row?.operations_print_agent_capabilities_migration_applied
+            && row?.operations_carrier_label_artifacts_migration_applied
+            && row?.operations_commerce_product_policy_migration_applied
+            && row?.operations_commerce_catalog_sync_migration_applied
+            && row?.operations_package_contents_migration_applied
+            && row?.operations_commerce_incomplete_header_money_migration_applied
+            && row?.operations_packaging_materials_migration_applied
             && row?.migration_checksums_present
           ),
         }
@@ -960,6 +1023,14 @@ export async function GET() {
           || !row?.operations_shopify_order_preview_migration_applied
           || !row?.operations_commerce_normalization_migration_applied
           || !row?.operations_commerce_continuations_migration_applied
+          || !row?.operations_carrier_rate_test_labels_migration_applied
+          || !row?.operations_print_agent_capabilities_migration_applied
+          || !row?.operations_carrier_label_artifacts_migration_applied
+          || !row?.operations_commerce_product_policy_migration_applied
+          || !row?.operations_commerce_catalog_sync_migration_applied
+          || !row?.operations_package_contents_migration_applied
+          || !row?.operations_commerce_incomplete_header_money_migration_applied
+          || !row?.operations_packaging_materials_migration_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')
@@ -1281,6 +1352,108 @@ export async function GET() {
             errors.push('QuickBooks sync worker heartbeat is missing or stale.')
           }
 
+          if (
+            commerceIntakeRuntimeAvailable()
+            && row?.operations_commerce_catalog_sync_migration_applied
+          ) {
+            const commerceHeartbeat =
+              await readCommerceCatalogWorkerHeartbeatFromPostgres()
+            const commerceHeartbeatAt = Date.parse(
+              String(commerceHeartbeat?.checkedAt || ''),
+            )
+            const commercePollMs = Math.max(
+              5_000,
+              Math.min(
+                Number(
+                  process.env.COMMERCE_CATALOG_SYNC_POLL_MS || 10_000,
+                ),
+                300_000,
+              ),
+            )
+            const maxCommerceHeartbeatAgeMs = Math.max(
+              180_000,
+              commercePollMs * 3,
+            )
+            const commerceAgeMs = Number.isFinite(commerceHeartbeatAt)
+              ? checkedAt - commerceHeartbeatAt
+              : null
+            const commerceQueue = (
+              await query<{
+                queued: number
+                retrying: number
+                dead: number
+                stale_processing: number
+                overdue: number
+              }>(
+                `SELECT
+                   count(*) FILTER (
+                     WHERE status = 'pending'
+                   )::integer AS queued,
+                   count(*) FILTER (
+                     WHERE status = 'failed'
+                   )::integer AS retrying,
+                   count(*) FILTER (
+                     WHERE status = 'dead'
+                   )::integer AS dead,
+                   count(*) FILTER (
+                     WHERE status = 'processing'
+                       AND locked_at < now() - interval '10 minutes'
+                   )::integer AS stale_processing,
+                   count(*) FILTER (
+                     WHERE status IN ('pending', 'failed')
+                       AND available_at < now() - interval '5 minutes'
+                   )::integer AS overdue
+                 FROM operations_commerce_catalog_sync_jobs`,
+              )
+            ).rows[0]
+            const dead = Number(commerceQueue?.dead || 0)
+            const stale = Number(
+              commerceQueue?.stale_processing || 0,
+            )
+            const overdue = Number(commerceQueue?.overdue || 0)
+            const healthy = (
+              commerceAgeMs !== null
+              && commerceAgeMs <= maxCommerceHeartbeatAgeMs
+              && dead === 0
+              && stale === 0
+              && overdue === 0
+            )
+            commerceCatalogWorker = {
+              status: healthy ? 'reachable' : 'stale',
+              heartbeatAt: commerceHeartbeat?.checkedAt || null,
+              phase: commerceHeartbeat?.phase || null,
+              ageMs: commerceAgeMs,
+              queued: Number(commerceQueue?.queued || 0),
+              retrying: Number(commerceQueue?.retrying || 0),
+              dead,
+              staleProcessing: stale,
+              overdue,
+            }
+            if (
+              commerceAgeMs === null
+              || commerceAgeMs > maxCommerceHeartbeatAgeMs
+            ) {
+              errors.push(
+                'Commerce catalog worker heartbeat is missing or stale.',
+              )
+            }
+            if (dead > 0) {
+              errors.push(
+                'Commerce catalog queue has terminal failed jobs.',
+              )
+            }
+            if (stale > 0) {
+              errors.push(
+                'Commerce catalog queue has stale processing jobs.',
+              )
+            }
+            if (overdue > 0) {
+              errors.push(
+                'Commerce catalog queue has overdue jobs.',
+              )
+            }
+          }
+
           const knowledgeResult = await query<{
             worker_name: string
             checked_at: string
@@ -1351,6 +1524,7 @@ export async function GET() {
       agentResearchWorker,
       toastWorker,
       quickBooksWorker,
+      commerceCatalogWorker,
       integrationQueues,
       operationsCommands,
       crm,

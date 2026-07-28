@@ -22,17 +22,20 @@ import Dialog from '@mui/material/Dialog'
 import DialogContent from '@mui/material/DialogContent'
 import DialogTitle from '@mui/material/DialogTitle'
 import FormControl from '@mui/material/FormControl'
+import FormControlLabel from '@mui/material/FormControlLabel'
 import FormHelperText from '@mui/material/FormHelperText'
 import IconButton from '@mui/material/IconButton'
 import InputLabel from '@mui/material/InputLabel'
 import MenuItem from '@mui/material/MenuItem'
 import Select from '@mui/material/Select'
 import Stack from '@mui/material/Stack'
+import Switch from '@mui/material/Switch'
 import Tab from '@mui/material/Tab'
 import TablePagination from '@mui/material/TablePagination'
 import Tabs from '@mui/material/Tabs'
 import TextField from '@mui/material/TextField'
 import Typography from '@mui/material/Typography'
+import AddCircleOutlineRounded from '@mui/icons-material/AddCircleOutlineRounded'
 import BlockRounded from '@mui/icons-material/BlockRounded'
 import CheckCircleOutlineRounded from '@mui/icons-material/CheckCircleOutlineRounded'
 import CloudDownloadRounded from '@mui/icons-material/CloudDownloadRounded'
@@ -120,7 +123,14 @@ type IntakeCandidate = {
   normalizedFulfillmentStatus?: string | null
   normalizedReturnStatus?: string | null
   currency?: string | null
+  subtotalMinor?: number | null
   totalMinor?: number | null
+  headerMoney?: {
+    state: 'complete' | 'operational_incomplete'
+    unavailableFields: string[]
+    accountingEligible: boolean
+    customerChargeEligible: boolean
+  }
   requiresShipping: boolean
   sourceUpdatedAt?: string | null
   blockers?: IntakeBlocker[]
@@ -207,6 +217,7 @@ type ProductCandidate = {
   mappingStatus?: string | null
   productGlobalId?: string | null
   productMappingGlobalId?: string | null
+  lastErrorCode?: string | null
   unitMultiplier?: number | null
   currency?: string | null
   priceMinor?: number | null
@@ -218,6 +229,48 @@ type ProductCandidate = {
   sourceUpdatedAt?: string | null
   blockers?: IntakeBlocker[]
   unsupportedReason?: string | null
+}
+
+type ProductIntakePolicy = {
+  version: string
+  unmatchedAction: 'review' | 'auto_create'
+  autoCreateNewProducts: boolean
+  revision: number
+  updatedAt: string | null
+}
+
+type ProductCatalogSync = {
+  status:
+    | 'idle'
+    | 'queued'
+    | 'running'
+    | 'retrying'
+    | 'completed'
+    | 'paused'
+    | 'dead'
+  rawStatus?: string | null
+  activeBacklog?: number
+  pageCount?: number
+  providerRecordsSeen?: number
+  productsCreated?: number
+  productsMapped?: number
+  productsUnchanged?: number
+  productsSkipped?: number
+  productsFailed?: number
+  attemptCount?: number
+  maxAttempts?: number
+  availableAt?: string | null
+  lastErrorCode?: string | null
+  startedAt?: string | null
+  completedAt?: string | null
+  lastSuccessAt?: string | null
+  nextRunAt?: string | null
+  updatedAt?: string | null
+  resource?: 'products'
+  readOnly?: boolean
+  providerWrites?: number
+  ordersTouched?: number
+  inventoryTouched?: number
 }
 
 type CommerceIntake = {
@@ -236,6 +289,8 @@ type CommerceIntake = {
     operatorCommandsAllowed?: boolean
     providerWritesAllowed?: boolean
     syncCursorAdvanceAllowed?: boolean
+    productIntake?: ProductIntakePolicy
+    productCatalogSync?: ProductCatalogSync
   }
   run?: {
     globalId: string
@@ -258,6 +313,16 @@ type CommerceIntake = {
   }
   candidates?: IntakeCandidate[]
   productCandidates?: ProductCandidate[]
+  productCandidateSummary?: {
+    scope: string
+    limit: number
+    total: number
+    unresolved: number
+    returned: number
+    unresolvedReturned: number
+    truncated: boolean
+    unresolvedTruncated: boolean
+  }
   rejections?: Array<{
     globalId: string
     rowVersion: number
@@ -275,6 +340,29 @@ type CommerceIntake = {
     canonicalOrdersCreated?: number
     syncCursorAdvanced?: boolean
   }
+  orderReconciliation?: {
+    status: 'idle' | 'running' | 'succeeded' | 'failed'
+    recordsSeen: number
+    recordsHeld: number
+    consecutiveFailures: number
+    lastErrorCode: string | null
+    lastStartedAt: string | null
+    lastCompletedAt: string | null
+    resumable: boolean
+    providerWrites: 0
+    canonicalOrderWrites: 0
+    inventoryWrites: 0
+  } | null
+}
+
+type AutomaticProductCreationSummary = {
+  enabled?: boolean
+  created?: number
+  mappedExisting?: number
+  skipped?: number
+  failed?: number | boolean
+  remainingUnresolved?: number
+  errorCode?: string
 }
 
 type IntakePayload = {
@@ -285,6 +373,8 @@ type IntakePayload = {
   command?: {
     replayed?: boolean
     result?: unknown
+    automaticProductCreation?: AutomaticProductCreationSummary
+    productIntake?: ProductIntakePolicy
   }
 }
 
@@ -340,11 +430,18 @@ type CommerceIntakeWorkflowProps = {
   provider: CommerceProvider
   displayName: string
   canActivate: boolean
+  connectionReady?: boolean
 }
 
 type WorkbenchTab = 'overview' | 'products' | 'orders' | 'issues'
 type ProductReviewFilter = 'all' | 'needs_decision' | 'matched' | 'skipped'
 type OrderReviewFilter = 'all' | 'needs_review' | 'ready' | 'added' | 'skipped'
+type RejectionGroup = {
+  code: string
+  resourceType: 'order' | 'product'
+  message: string
+  count: number
+}
 
 class IntakeRequestError extends Error {
   constructor(
@@ -395,6 +492,14 @@ function rejectionTitle(code: string) {
   return titles[code] || 'Provider record needs review'
 }
 
+function rejectionGroupKey(group: RejectionGroup) {
+  return [
+    group.resourceType,
+    group.code,
+    group.message,
+  ].join(':')
+}
+
 function candidateStateLabel(state: CandidateState) {
   const labels: Record<CandidateState, string> = {
     held: 'Needs review',
@@ -411,6 +516,137 @@ function formatDate(value?: string | null) {
   if (!value) return 'Not recorded'
   const date = new Date(value)
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString()
+}
+
+function catalogSyncDescription(
+  sync: ProductCatalogSync | undefined,
+  provider: CommerceProvider,
+) {
+  if (!sync || sync.status === 'idle') {
+    return 'This verified connection authorizes automatic read-only catalog sync. The initial backfill queues when product-read access, the development runtime, and the Operations product target are eligible; no second approval is required.'
+  }
+  if (sync.status === 'queued') {
+    return 'The full product catalog is queued. ClawPilot will follow every provider page automatically; no per-page approval is required.'
+  }
+  if (sync.status === 'running') {
+    return `ClawPilot is following the ${providerLabel(provider)} catalog in the background. ${
+      sync.providerRecordsSeen || 0
+    } provider variants have been read across ${
+      sync.pageCount || 0
+    } completed pages.`
+  }
+  if (sync.status === 'retrying') {
+    return `A read-only provider request will retry automatically${
+      sync.nextRunAt ? ` at ${formatDate(sync.nextRunAt)}` : ''
+    }${
+      sync.lastErrorCode ? ` (${sync.lastErrorCode})` : ''
+    }. Products already imported remain available.`
+  }
+  if (sync.status === 'completed') {
+    return `The catalog reconciliation completed after reading ${
+      sync.providerRecordsSeen || 0
+    } provider variants. ${
+      sync.productsCreated || 0
+    } products were created and ${
+      sync.productsMapped || 0
+    } were matched${
+      sync.productsSkipped || sync.productsFailed
+        ? `; ${
+            (sync.productsSkipped || 0) + (sync.productsFailed || 0)
+          } remain available for review`
+        : ''
+    }. The next automatic product check is ${
+      sync.nextRunAt ? formatDate(sync.nextRunAt) : 'scheduled'
+    }.`
+  }
+  if (sync.status === 'dead') {
+    return `Automatic catalog sync stopped after repeated or permanent connection errors${
+      sync.lastErrorCode ? ` (${sync.lastErrorCode})` : ''
+    }. Repair the sales-channel connection. While sync remains resumed, ClawPilot rechecks eligibility and queues a fresh reconciliation when every worker fence passes.`
+  }
+  return 'Automatic catalog sync is paused. Existing ClawPilot products and provider mappings are unchanged.'
+}
+
+function automaticProductCreationNotice(
+  summary?: AutomaticProductCreationSummary,
+) {
+  if (!summary) return ''
+  const count = (value: unknown) => (
+    typeof value === 'number'
+    && Number.isSafeInteger(value)
+    && value >= 0
+      ? value
+      : null
+  )
+  const created = count(summary.created)
+  const mappedExisting = count(summary.mappedExisting)
+  const skipped = count(summary.skipped)
+  const failed = count(summary.failed)
+  const remaining = count(summary.remainingUnresolved)
+  if (summary.failed === true) {
+    return `Automatic product creation could not complete${
+      summary.errorCode ? ` (${summary.errorCode})` : ''
+    }. Review the staged products; rows that were not created remain in review.`
+  }
+  const counts = [
+    created === null ? null : `${created} created`,
+    mappedExisting === null
+      ? null
+      : `${mappedExisting} matched to an existing product`,
+    skipped === null ? null : `${skipped} skipped by automation`,
+    failed === null ? null : `${failed} failed`,
+    remaining === null ? null : `${remaining} remaining in review`,
+  ].filter((value): value is string => Boolean(value))
+  if (counts.length === 0) return ''
+  const prefix = summary.enabled === false
+    ? 'Automatic product creation is off'
+    : 'Automatic product creation'
+  const needsReview = remaining === null
+    ? (skipped || 0) > 0 || (failed || 0) > 0
+    : remaining > 0
+  return `${prefix}: ${counts.join(', ')}.${
+    needsReview
+      ? ' Products not created remain in review.'
+      : ''
+  }`
+}
+
+function catalogSyncHasIssues(sync?: ProductCatalogSync) {
+  return Boolean(
+    sync
+    && ((sync.productsSkipped || 0) > 0 || (sync.productsFailed || 0) > 0),
+  )
+}
+
+function catalogSyncColor(sync?: ProductCatalogSync) {
+  if (sync?.status === 'completed' && !catalogSyncHasIssues(sync)) {
+    return 'success' as const
+  }
+  if (sync?.status === 'dead') return 'error' as const
+  if (
+    sync?.status === 'retrying'
+    || (sync?.status === 'completed' && catalogSyncHasIssues(sync))
+  ) return 'warning' as const
+  if (sync?.status === 'queued' || sync?.status === 'running') {
+    return 'info' as const
+  }
+  return 'default' as const
+}
+
+function catalogSyncLabel(sync?: ProductCatalogSync) {
+  const labels: Record<ProductCatalogSync['status'], string> = {
+    idle: 'Waiting to start',
+    queued: 'Backfill queued',
+    running: 'Catalog syncing',
+    retrying: 'Retry scheduled',
+    completed: 'Catalog current',
+    paused: 'Automatic sync off',
+    dead: 'Connection needs attention',
+  }
+  if (sync?.status === 'completed' && catalogSyncHasIssues(sync)) {
+    return 'Catalog synced — review needed'
+  }
+  return sync?.status ? labels[sync.status] : 'Not started'
 }
 
 function formatMoney(minor?: number | null, currency?: string | null) {
@@ -579,7 +815,14 @@ function initialPackageDraft(line: IntakeLine): PackageDraft {
 
 async function readPayload(response: Response): Promise<IntakePayload> {
   const payload = await response.json().catch(() => ({})) as IntakePayload
-  if (!response.ok || payload.ok !== true || !payload.intake) {
+  const hasAuthoritativePolicyResult = Boolean(
+    payload.command?.productIntake,
+  )
+  if (
+    !response.ok
+    || payload.ok !== true
+    || (!payload.intake && !hasAuthoritativePolicyResult)
+  ) {
     throw new IntakeRequestError(
       payload.error || 'Commerce order intake request failed.',
       payload.code,
@@ -613,6 +856,7 @@ export default function CommerceIntakeWorkflow({
   provider,
   displayName,
   canActivate,
+  connectionReady = true,
 }: CommerceIntakeWorkflowProps) {
   const [intake, setIntake] = useState<CommerceIntake | null>(null)
   const [loading, setLoading] = useState(true)
@@ -633,6 +877,15 @@ export default function CommerceIntakeWorkflow({
   const [csvImportPreview, setCsvImportPreview] =
     useState<CommerceProductReviewImportResult | null>(null)
   const [csvImportFilename, setCsvImportFilename] = useState('')
+  const [bulkProductProgress, setBulkProductProgress] = useState<{
+    completed: number
+    total: number
+  } | null>(null)
+  const [bulkRetryProgress, setBulkRetryProgress] = useState<{
+    completed: number
+    total: number
+    groupKey: string
+  } | null>(null)
   const [error, setError] = useState('')
   const [errorCode, setErrorCode] = useState('')
   const [notice, setNotice] = useState('')
@@ -695,6 +948,8 @@ export default function CommerceIntakeWorkflow({
     setIssuePage(0)
     setCsvImportPreview(null)
     setCsvImportFilename('')
+    setBulkProductProgress(null)
+    setBulkRetryProgress(null)
     retryKeys.current.clear()
     setProductDrafts({})
     setCatalogProductDrafts({})
@@ -749,16 +1004,33 @@ export default function CommerceIntakeWorkflow({
         }),
       })
       const payload = await readPayload(response)
-      setIntake(payload.intake || null)
+      setIntake((current) => {
+        const next = payload.intake || current
+        const committedPolicy = payload.command?.productIntake
+        if (!next || !committedPolicy) return payload.intake || null
+        return {
+          ...next,
+          policy: {
+            ...next.policy,
+            productIntake: committedPolicy,
+          },
+        }
+      })
       if (action === 'resolve-catalog-product') {
         setCsvImportPreview(null)
         setCsvImportFilename('')
       }
       retryKeys.current.delete(retryKey)
+      const commandNotice = payload.command?.replayed
+        ? `${successMessage} The original command result was replayed.`
+        : successMessage
+      const automaticNotice = automaticProductCreationNotice(
+        payload.command?.automaticProductCreation,
+      )
       setNotice(
-        payload.command?.replayed
-          ? `${successMessage} The original command result was replayed.`
-          : successMessage,
+        automaticNotice
+          ? `${commandNotice} ${automaticNotice}`
+          : commandNotice,
       )
     } catch (requestError) {
       if (
@@ -767,6 +1039,8 @@ export default function CommerceIntakeWorkflow({
           requestError.code === 'COMMERCE_INTAKE_READ_RESTART_REQUIRED'
           || requestError.code
             === 'COMMERCE_INTAKE_CONTINUATION_RESTART_REQUIRED'
+          || requestError.code
+            === 'COMMERCE_PRODUCT_INTAKE_POLICY_REVISION_CONFLICT'
         )
       ) {
         retryKeys.current.delete(retryKey)
@@ -802,6 +1076,8 @@ export default function CommerceIntakeWorkflow({
       setUnsupportedReasons({})
       setCsvImportPreview(null)
       setCsvImportFilename('')
+      setBulkProductProgress(null)
+      setBulkRetryProgress(null)
       setNotice('Workflow reloaded from current ClawPilot intake state.')
     } catch (requestError) {
       setError(safeError(requestError))
@@ -879,6 +1155,53 @@ export default function CommerceIntakeWorkflow({
     || (latestPagination?.resource === 'products' ? latestPagination : null)
   const operatorCommandsAllowed =
     intake?.policy?.operatorCommandsAllowed === true
+  const productIntakePolicy = intake?.policy?.productIntake
+  const productCatalogSync = intake?.policy?.productCatalogSync
+  const orderReconciliation = intake?.orderReconciliation
+  const automaticProductCreationEnabled = Boolean(
+    productIntakePolicy?.autoCreateNewProducts
+    && productIntakePolicy.unmatchedAction === 'auto_create',
+  )
+  const productIntakePolicyRevision = (
+    typeof productIntakePolicy?.revision === 'number'
+    && Number.isSafeInteger(productIntakePolicy.revision)
+    && productIntakePolicy.revision >= 0
+  )
+    ? productIntakePolicy.revision
+    : 0
+  const futureProductBehaviorMessage = automaticProductCreationEnabled
+    ? 'Catalog sync is resumed. When product-read access, the development runtime, and the Operations product target are eligible, ClawPilot reconciles the catalog automatically. Eligible unmatched products are created and mapped; incomplete or unsafe products remain in review.'
+    : 'Catalog sync is paused. Existing products and mappings remain unchanged, and no new provider pages are read until sync is resumed.'
+  useEffect(() => {
+    if (
+      !workbenchOpen
+      || !(
+        (
+          productCatalogSync
+          && ['queued', 'running', 'retrying'].includes(
+            productCatalogSync.status,
+          )
+        )
+        || orderReconciliation?.status === 'running'
+      )
+    ) return
+    let requestPending = false
+    const timer = window.setInterval(() => {
+      if (requestPending) return
+      requestPending = true
+      loadIntake()
+        .catch(() => undefined)
+        .finally(() => {
+          requestPending = false
+        })
+    }, 5_000)
+    return () => window.clearInterval(timer)
+  }, [
+    loadIntake,
+    orderReconciliation?.status,
+    productCatalogSync,
+    workbenchOpen,
+  ])
   const activationRecoveryAvailable = canActivate && (
     errorCode === 'COMMERCE_INTAKE_ACTIVATION_REQUIRED'
     || intake?.policy?.activationState === 'disabled'
@@ -964,6 +1287,41 @@ export default function CommerceIntakeWorkflow({
     !terminalStates.has(candidate.state)
     && candidate.mappingStatus !== 'resolved'
   )).length
+  const productCandidateSummary = intake?.productCandidateSummary
+  const totalProductCount = productCandidateSummary?.total
+    ?? productCandidates.length
+  const totalUnresolvedProductCount = productCandidateSummary?.unresolved
+    ?? unresolvedProductCount
+  const productReviewTruncated = Boolean(
+    productCandidateSummary?.truncated,
+  )
+  const unresolvedProductCandidates = productCandidates.filter(
+    (candidate) => (
+      !terminalStates.has(candidate.state)
+      && candidate.mappingStatus !== 'resolved'
+    ),
+  )
+  const bulkNewProductCandidates = unresolvedProductCandidates.filter(
+    (candidate) => !catalogProductDraft(candidate).productGlobalId,
+  )
+  const bulkCreatableProductCandidates = bulkNewProductCandidates.filter(
+    (candidate) => {
+      const draft = catalogProductDraft(candidate)
+      return (
+        Number.isInteger(candidate.rowVersion)
+        && Boolean(draft.name.trim())
+        && validPrice(draft)
+      )
+    },
+  )
+  const bulkInvalidProductCount = (
+    bulkNewProductCandidates.length
+    - bulkCreatableProductCandidates.length
+  )
+  const selectedExistingProductCount = (
+    unresolvedProductCandidates.length
+    - bulkNewProductCandidates.length
+  )
   const filteredProductCandidates = useMemo(() => {
     const query = productSearch.trim().toLocaleLowerCase()
     return productCandidates.filter((candidate) => {
@@ -1048,12 +1406,7 @@ export default function CommerceIntakeWorkflow({
     ].some((value) => String(value || '').toLocaleLowerCase().includes(query)))
   }, [issueSearch, rejections])
   const rejectionGroups = useMemo(() => {
-    const grouped = new Map<string, {
-      code: string
-      resourceType: 'order' | 'product'
-      message: string
-      count: number
-    }>()
+    const grouped = new Map<string, RejectionGroup>()
     for (const rejection of filteredRejections) {
       const key = [
         rejection.resourceType,
@@ -1134,12 +1487,14 @@ export default function CommerceIntakeWorkflow({
         detail: 'Operations must be in Shadow or Active mode before records can be reviewed.',
         tab: 'overview' as WorkbenchTab,
       }
-    : unresolvedProductCount > 0
+    : totalUnresolvedProductCount > 0
       ? {
-          label: `Review ${unresolvedProductCount} ${
-            unresolvedProductCount === 1 ? 'product' : 'products'
+          label: `Review ${totalUnresolvedProductCount} ${
+            totalUnresolvedProductCount === 1 ? 'product' : 'products'
           }`,
-          detail: 'Match, create, or skip each provider product before adding orders.',
+          detail: automaticProductCreationEnabled
+            ? 'Automation handled safe products; resolve only the remaining exceptions.'
+            : 'Match, create, or skip each provider product before adding orders.',
           tab: 'products' as WorkbenchTab,
         }
       : issueRecordCount > 0
@@ -1408,6 +1763,99 @@ export default function CommerceIntakeWorkflow({
     }
   }
 
+  async function retryOrderMoneyRejectionGroup(group: RejectionGroup) {
+    if (
+      pendingAction
+      || !operatorCommandsAllowed
+      || group.resourceType !== 'order'
+      || group.code !== 'COMMERCE_ORDER_MONEY_INCOMPLETE'
+    ) return
+
+    const targets = filteredRejections.filter((rejection) => (
+      rejection.resourceType === group.resourceType
+      && rejection.errorCode === group.code
+      && rejection.safeMessage === group.message
+    ))
+    if (targets.length === 0) return
+    if (
+      !window.confirm(
+        `Retry ${targets.length} exact ${
+          targets.length === 1 ? 'order' : 'orders'
+        } from ${providerLabel(provider)}? ClawPilot will perform provider reads only, make no provider writes, and stop immediately if a retry conflicts or fails.`,
+      )
+    ) return
+
+    let completed = 0
+    let lastIntake: CommerceIntake | null = intake
+    setPendingAction('bulk-retry-order-money')
+    setBulkRetryProgress({
+      completed: 0,
+      total: targets.length,
+      groupKey: rejectionGroupKey(group),
+    })
+    setError('')
+    setErrorCode('')
+    setNotice('')
+
+    try {
+      for (const rejection of targets) {
+        const requestKey = [
+          'bulk-retry-rejection',
+          rejection.globalId,
+          rejection.rowVersion,
+        ].join(':')
+        const retryKey = `${accountGlobalId}:${requestKey}`
+        const stableIdempotencyKey = retryKeys.current.get(retryKey)
+          || idempotencyKey()
+        retryKeys.current.set(retryKey, stableIdempotencyKey)
+
+        const response = await fetch('/api/integrations/commerce/intake', {
+          method: 'POST',
+          cache: 'no-store',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            accountGlobalId,
+            action: 'retry-rejection',
+            idempotencyKey: stableIdempotencyKey,
+            confirmReadOnly: true,
+            rejectionGlobalId: rejection.globalId,
+          }),
+        })
+        const payload = await readPayload(response)
+        lastIntake = payload.intake || lastIntake
+        retryKeys.current.delete(retryKey)
+        completed += 1
+        setBulkRetryProgress({
+          completed,
+          total: targets.length,
+          groupKey: rejectionGroupKey(group),
+        })
+      }
+
+      setIntake(lastIntake)
+      setNotice(
+        `${completed} exact ${
+          completed === 1 ? 'order was' : 'orders were'
+        } read again from ${providerLabel(provider)}. Review the current issue list for any records that still need attention. Provider data was not changed.`,
+      )
+    } catch (requestError) {
+      await loadIntake().catch(() => undefined)
+      setError(
+        `${completed} ${
+          completed === 1 ? 'order was' : 'orders were'
+        } retried before processing stopped. ${safeError(requestError)} The failed rejection keeps its retry identity; review the refreshed issue list before retrying the remainder.`,
+      )
+      setErrorCode(
+        requestError instanceof IntakeRequestError
+          ? requestError.code
+          : '',
+      )
+    } finally {
+      setBulkRetryProgress(null)
+      setPendingAction('')
+    }
+  }
+
   function catalogProductDraft(candidate: ProductCandidate) {
     return catalogProductDrafts[candidate.globalId]
       || initialCatalogProductDraft(candidate)
@@ -1467,6 +1915,137 @@ export default function CommerceIntakeWorkflow({
       },
       `${draft.name.trim()} created and matched to this provider variant.`,
     )
+  }
+
+  async function saveAutomaticProductCreationPolicy(enabled: boolean) {
+    if (
+      pendingAction
+      || enabled === automaticProductCreationEnabled
+      || (enabled && (!operatorCommandsAllowed || !connectionReady))
+    ) return
+    await postCommand(
+      'set-product-intake-policy',
+      `set-product-intake-policy:${productIntakePolicyRevision}:${
+        enabled ? 'auto_create' : 'review'
+      }`,
+      {
+        expectedPolicyRevision: productIntakePolicyRevision,
+        unmatchedAction: enabled ? 'auto_create' : 'review',
+        confirmAutoCreateProducts: enabled,
+      },
+      enabled
+        ? `Catalog sync resumed for ${displayName}. ClawPilot will queue a full reconciliation when product-read access, the development runtime, and the Operations product target are eligible. ${providerLabel(provider)} and existing orders will not be changed.`
+        : `Catalog sync paused for ${displayName}. Existing products, mappings, orders, and ${providerLabel(provider)} were not changed.`,
+    )
+  }
+
+  async function createAllNewCatalogProducts() {
+    if (
+      pendingAction
+      || !operatorCommandsAllowed
+      || bulkCreatableProductCandidates.length === 0
+    ) return
+
+    const targets = bulkCreatableProductCandidates.map((candidate) => ({
+      candidate,
+      draft: { ...catalogProductDraft(candidate) },
+    }))
+    const isPartialCreate = bulkInvalidProductCount > 0
+    const confirmationMessage = isPartialCreate
+      ? `Create and match ${targets.length} ready ClawPilot ${
+          targets.length === 1 ? 'product' : 'products'
+        } using the staged ${providerLabel(provider)} names, SKUs, prices, and currencies, and leave ${bulkInvalidProductCount} ${
+          bulkInvalidProductCount === 1 ? 'incomplete product' : 'incomplete products'
+        } for review? This changes ClawPilot only and does not write to ${providerLabel(provider)}. Each included row is checked against its current version.`
+      : `Create and match ${targets.length} new ClawPilot ${
+          targets.length === 1 ? 'product' : 'products'
+        } using the staged ${providerLabel(provider)} names, SKUs, prices, and currencies? This changes ClawPilot only and does not write to ${providerLabel(provider)}. Each row is checked against its current version.`
+    if (
+      !window.confirm(confirmationMessage)
+    ) return
+
+    let completed = 0
+    let lastIntake: CommerceIntake | null = intake
+    setPendingAction('bulk-create-products')
+    setBulkProductProgress({ completed: 0, total: targets.length })
+    setError('')
+    setErrorCode('')
+    setNotice('')
+    setCsvImportPreview(null)
+    setCsvImportFilename('')
+
+    try {
+      for (const { candidate, draft } of targets) {
+        const requestKey = [
+          'bulk-create-product',
+          candidate.globalId,
+          candidate.rowVersion,
+        ].join(':')
+        const retryKey = `${accountGlobalId}:${requestKey}`
+        const stableIdempotencyKey = retryKeys.current.get(retryKey)
+          || idempotencyKey()
+        retryKeys.current.set(retryKey, stableIdempotencyKey)
+
+        const response = await fetch('/api/integrations/commerce/intake', {
+          method: 'POST',
+          cache: 'no-store',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            accountGlobalId,
+            action: 'resolve-catalog-product',
+            idempotencyKey: stableIdempotencyKey,
+            candidateGlobalId: candidate.globalId,
+            rowVersion: candidate.rowVersion,
+            resolution: {
+              mode: 'create',
+              name: draft.name.trim(),
+              sku: draft.sku.trim(),
+              unitPriceMinor: parseCommerceMoneyMajor(
+                draft.unitPriceMinor,
+                normalizeCurrency(draft.currency),
+              ),
+              currency: normalizeCurrency(draft.currency),
+            },
+          }),
+        })
+        const payload = await readPayload(response)
+        lastIntake = payload.intake || lastIntake
+        retryKeys.current.delete(retryKey)
+        completed += 1
+        setBulkProductProgress({
+          completed,
+          total: targets.length,
+        })
+      }
+
+      setIntake(lastIntake)
+      setNotice(
+        isPartialCreate
+          ? `${completed} ready ClawPilot ${
+              completed === 1 ? 'product was' : 'products were'
+            } created and matched. ClawPilot left ${bulkInvalidProductCount} incomplete ${
+              bulkInvalidProductCount === 1 ? 'product' : 'products'
+            } in review without changing them. Provider data was not changed. ${futureProductBehaviorMessage}`
+          : `${completed} new ClawPilot ${
+              completed === 1 ? 'product was' : 'products were'
+            } created and matched. Provider data was not changed. ${futureProductBehaviorMessage}`,
+      )
+    } catch (requestError) {
+      await loadIntake().catch(() => undefined)
+      setError(
+        `${completed} ${
+          completed === 1 ? 'product was' : 'products were'
+        } created before processing stopped. ${safeError(requestError)} The failed row keeps its retry identity; review the current product list before retrying the remaining products.`,
+      )
+      setErrorCode(
+        requestError instanceof IntakeRequestError
+          ? requestError.code
+          : '',
+      )
+    } finally {
+      setBulkProductProgress(null)
+      setPendingAction('')
+    }
   }
 
   async function excludeCatalogProduct(candidate: ProductCandidate) {
@@ -1843,8 +2422,9 @@ export default function CommerceIntakeWorkflow({
                   Import products and orders
                 </Typography>
                 <Typography variant="body2" color="text.secondary">
-                  Review {providerLabel(provider)} data in a dedicated
-                  workspace before anything becomes a ClawPilot record.
+                  {automaticProductCreationEnabled
+                    ? `The connected ${providerLabel(provider)} catalog syncs automatically. Use this workspace to monitor progress and resolve only the products or orders that need a decision.`
+                    : `${providerLabel(provider)} catalog sync is paused. Existing imported records remain available for review.`}
                 </Typography>
               </Box>
               <Button
@@ -1868,16 +2448,31 @@ export default function CommerceIntakeWorkflow({
               />
               <Chip
                 size="small"
-                label={`${productCandidates.length} products found`}
+                label={`${totalProductCount} products found`}
               />
               <Chip
                 size="small"
-                color={unresolvedProductCount ? 'warning' : 'default'}
-                label={`${unresolvedProductCount} products need a decision`}
+                color={
+                  totalUnresolvedProductCount ? 'warning' : 'default'
+                }
+                label={`${totalUnresolvedProductCount} products need a decision`}
               />
               <Chip
                 size="small"
                 label={`${candidates.length} orders ready for review`}
+              />
+              <Chip
+                size="small"
+                color={
+                  orderReconciliation?.status === 'failed'
+                    ? 'warning'
+                    : orderReconciliation?.status === 'running'
+                      ? 'info'
+                      : 'default'
+                }
+                label={`Order staging ${humanize(
+                  orderReconciliation?.status || 'idle',
+                )}`}
               />
               <Chip
                 size="small"
@@ -1951,7 +2546,7 @@ export default function CommerceIntakeWorkflow({
               id={`commerce-intake-tab-products-${accountGlobalId}`}
               aria-controls={`commerce-intake-panel-products-${accountGlobalId}`}
               value="products"
-              label={`Products (${unresolvedProductCount})`}
+              label={`Products (${totalUnresolvedProductCount})`}
             />
             <Tab
               id={`commerce-intake-tab-orders-${accountGlobalId}`}
@@ -2043,11 +2638,112 @@ export default function CommerceIntakeWorkflow({
             </CardContent>
           </Card>
           <Alert severity="info">
-            ClawPilot can read {providerLabel(provider)} and create records
-            only after your approval. It cannot change {providerLabel(provider)},
-            advance a sync cursor, reserve inventory, or export fulfillment.
-            Credentials and provider tokens are never returned here.
+            {automaticProductCreationEnabled
+              ? `Your verified ${providerLabel(provider)} connection authorizes automatic read-only product synchronization with no second approval. When product-read access, the development runtime, and the Operations product target are eligible, ClawPilot follows every catalog page and creates safe product records; only exceptions need review.`
+              : `${providerLabel(provider)} product synchronization is paused. Resume it below when you want ClawPilot to continue reading catalog pages.`}{' '}
+            It cannot change {providerLabel(provider)}, change an order,
+            reserve inventory, or export fulfillment. Credentials and provider
+            tokens are never returned here.
           </Alert>
+          <Card variant="outlined">
+            <CardContent sx={{ '&:last-child': { pb: 2 } }}>
+              <Stack spacing={1}>
+                <Stack
+                  direction={{ xs: 'column', sm: 'row' }}
+                  justifyContent="space-between"
+                  alignItems={{ sm: 'center' }}
+                  spacing={1}
+                >
+                  <Box>
+                    <Typography variant="subtitle2" fontWeight={700}>
+                      Automatic current-order staging
+                    </Typography>
+                    <Typography variant="body2" color="text.secondary">
+                      {orderReconciliation?.status === 'running'
+                        ? `ClawPilot is reading current ${providerLabel(provider)} orders now.`
+                        : orderReconciliation?.status === 'succeeded'
+                          ? `The latest read-only order check completed${
+                            orderReconciliation.lastCompletedAt
+                              ? ` ${formatDate(
+                                orderReconciliation.lastCompletedAt,
+                              )}`
+                              : ''
+                          }.`
+                          : orderReconciliation?.status === 'failed'
+                            ? `The latest read-only order check failed${
+                              orderReconciliation.lastErrorCode
+                                ? ` (${orderReconciliation.lastErrorCode})`
+                                : ''
+                            }. Review the verified connection and order-read scope, then return here; ClawPilot retries automatically.`
+                            : `ClawPilot is ready to check current ${providerLabel(provider)} orders automatically when the verified order-read scope and Operations Shadow or Active mode are available.`}
+                    </Typography>
+                  </Box>
+                  <Chip
+                    size="small"
+                    color={
+                      orderReconciliation?.status === 'failed'
+                        ? 'warning'
+                        : orderReconciliation?.status === 'running'
+                          ? 'info'
+                          : orderReconciliation?.status === 'succeeded'
+                            ? 'success'
+                            : 'default'
+                    }
+                    label={humanize(orderReconciliation?.status || 'idle')}
+                  />
+                </Stack>
+                <Stack direction="row" gap={0.75} flexWrap="wrap">
+                  <Chip
+                    size="small"
+                    label={`${
+                      orderReconciliation?.recordsSeen || 0
+                    } provider records read`}
+                  />
+                  <Chip
+                    size="small"
+                    label={`${
+                      orderReconciliation?.recordsHeld || 0
+                    } held or rejected for review`}
+                  />
+                  {orderReconciliation?.resumable ? (
+                    <Chip
+                      size="small"
+                      color="info"
+                      label="More pages resume automatically"
+                    />
+                  ) : null}
+                  <Chip
+                    size="small"
+                    label="0 provider writes"
+                  />
+                </Stack>
+                <Typography variant="caption" color="text.secondary">
+                  Staging preserves source order facts for review. It does not
+                  create a ClawPilot order, reserve inventory, select packaging,
+                  create a shipment, or write back to the provider.
+                </Typography>
+                {orderReconciliation?.status === 'failed' ? (
+                  <Stack direction="row" spacing={1}>
+                    <Button
+                      size="small"
+                      variant="outlined"
+                      disabled={Boolean(pendingAction)}
+                      onClick={() => setWorkbenchOpen(false)}
+                    >
+                      Review connection
+                    </Button>
+                    <Button
+                      size="small"
+                      disabled={Boolean(pendingAction)}
+                      onClick={() => void reloadWorkflow()}
+                    >
+                      Reload status
+                    </Button>
+                  </Stack>
+                ) : null}
+              </Stack>
+            </CardContent>
+          </Card>
           {!operatorCommandsAllowed ? (
             <Alert
               severity="warning"
@@ -2129,8 +2825,8 @@ export default function CommerceIntakeWorkflow({
                 value: `${blockerCount} order ${
                   blockerCount === 1 ? 'issue' : 'issues'
                 }`,
-                detail: `${unresolvedProductCount} ${
-                  unresolvedProductCount === 1
+                detail: `${totalUnresolvedProductCount} ${
+                  totalUnresolvedProductCount === 1
                     ? 'product needs a decision'
                     : 'products need decisions'
                 }`,
@@ -2490,7 +3186,7 @@ export default function CommerceIntakeWorkflow({
                 >
                   {rejectionGroups.map((group) => (
                     <Card
-                      key={`${group.resourceType}:${group.code}`}
+                      key={rejectionGroupKey(group)}
                       variant="outlined"
                     >
                       <CardContent sx={{ '&:last-child': { pb: 2 } }}>
@@ -2518,12 +3214,53 @@ export default function CommerceIntakeWorkflow({
                           && group.code
                             === 'COMMERCE_ORDER_MONEY_INCOMPLETE' ? (
                             <Alert severity="info">
-                              These orders use Faire&apos;s current order-money
-                              response, which ClawPilot cannot translate safely
-                              yet. This is a ClawPilot adapter gap, not a
-                              customer-data correction. Retrying will not
-                              change the result until that adapter is updated.
+                              ClawPilot supports Faire&apos;s current
+                              ExternalOrderV2 money fields. Use Retry all exact
+                              orders below to restage these records with the
+                              current adapter. Paid-shipping records can stage
+                              as fulfillment-only candidates when exact
+                              merchandise, discount, and tax evidence exists.
+                              Missing shipping and total remain unavailable and
+                              are never estimated.
                             </Alert>
+                            ) : null}
+                          {group.resourceType === 'order'
+                          && group.code
+                            === 'COMMERCE_ORDER_MONEY_INCOMPLETE' ? (
+                            <Stack
+                              direction={{ xs: 'column', sm: 'row' }}
+                              alignItems={{ sm: 'center' }}
+                              spacing={1}
+                            >
+                              <Button
+                                variant="contained"
+                                startIcon={<RefreshRounded />}
+                                disabled={
+                                  Boolean(pendingAction)
+                                  || !operatorCommandsAllowed
+                                }
+                                onClick={() => {
+                                  void retryOrderMoneyRejectionGroup(group)
+                                }}
+                                sx={actionButtonSx}
+                              >
+                                {pendingAction
+                                  === 'bulk-retry-order-money'
+                                && bulkRetryProgress?.groupKey
+                                  === rejectionGroupKey(group)
+                                  ? `Retrying ${
+                                    bulkRetryProgress.completed
+                                  } of ${bulkRetryProgress.total}…`
+                                  : `Retry all exact orders (${group.count})`}
+                              </Button>
+                              <Typography
+                                variant="caption"
+                                color="text.secondary"
+                              >
+                                Re-reads only this visible matching group.
+                                No provider data is changed.
+                              </Typography>
+                            </Stack>
                             ) : null}
                           <Typography
                             variant="caption"
@@ -2793,6 +3530,374 @@ export default function CommerceIntakeWorkflow({
               />
             </Stack>
           </Stack>
+
+          {productReviewTruncated && productCandidateSummary ? (
+            <Alert
+              severity={
+                productCandidateSummary.unresolvedTruncated
+                  ? 'warning'
+                  : 'info'
+              }
+            >
+              This review window shows {productCandidateSummary.returned} of{' '}
+              {productCandidateSummary.total} current provider variants
+              {productCandidateSummary.unresolved > 0
+                ? `, including ${productCandidateSummary.unresolvedReturned} of ${productCandidateSummary.unresolved} that need a decision`
+                : ''}. Automatic catalog sync processes the complete catalog;
+              search, CSV, and bulk review actions on this screen apply only
+              to the returned window.
+            </Alert>
+          ) : null}
+
+          <Card
+            variant="outlined"
+            sx={{
+              borderColor: automaticProductCreationEnabled
+                ? 'success.main'
+                : 'divider',
+              backgroundColor: automaticProductCreationEnabled
+                ? 'rgba(129,201,149,0.06)'
+                : 'transparent',
+            }}
+          >
+            <CardContent sx={{ '&:last-child': { pb: 2 } }}>
+              <Stack spacing={1.25}>
+                <Stack
+                  direction={{ xs: 'column', md: 'row' }}
+                  justifyContent="space-between"
+                  alignItems={{ md: 'center' }}
+                  spacing={1}
+                >
+                  <Box>
+                    <Typography
+                      variant="overline"
+                      color="text.secondary"
+                      fontWeight={700}
+                    >
+                      Product catalog
+                    </Typography>
+                    <Typography variant="subtitle1" fontWeight={700}>
+                      Product catalog synchronization
+                    </Typography>
+                  </Box>
+                  <Stack direction="row" gap={0.75} flexWrap="wrap">
+                    <Chip
+                      size="small"
+                      color={
+                        automaticProductCreationEnabled
+                          ? 'success'
+                          : 'default'
+                      }
+                      label={
+                        pendingAction.startsWith(
+                          'set-product-intake-policy:',
+                        )
+                          ? 'Saving…'
+                          : `Catalog control: ${
+                              automaticProductCreationEnabled
+                                ? 'Resumed'
+                                : 'Paused'
+                            }`
+                      }
+                    />
+                    <Chip
+                      size="small"
+                      color={
+                        automaticProductCreationEnabled
+                          ? catalogSyncColor(productCatalogSync)
+                          : 'default'
+                      }
+                      variant="outlined"
+                      label={
+                        automaticProductCreationEnabled
+                          ? catalogSyncLabel(productCatalogSync)
+                          : 'Sync paused'
+                      }
+                    />
+                  </Stack>
+                </Stack>
+                <FormControlLabel
+                  sx={{
+                    alignItems: 'flex-start',
+                    m: 0,
+                    gap: 1,
+                  }}
+                  control={(
+                    <Switch
+                      checked={automaticProductCreationEnabled}
+                      disabled={
+                        Boolean(pendingAction)
+                        || (
+                          !automaticProductCreationEnabled
+                          && (
+                            !operatorCommandsAllowed
+                            || !connectionReady
+                          )
+                        )
+                      }
+                      onChange={(_event, checked) => {
+                        void saveAutomaticProductCreationPolicy(checked)
+                      }}
+                      inputProps={{
+                        'aria-label':
+                          'Pause or resume product catalog sync',
+                      }}
+                    />
+                  )}
+                  label={(
+                    <Box>
+                      <Typography fontWeight={700}>
+                        Pause or resume product catalog sync
+                      </Typography>
+                      <Typography variant="body2" color="text.secondary">
+                        The verified sales-channel connection is the
+                        authorization for automatic read-only catalog sync; no
+                        second approval is required. When product-read access,
+                        the development runtime, and the Operations product
+                        target are eligible, ClawPilot queues a full
+                        reconciliation. Pause stops future provider reads and
+                        automatic creation; resume makes the connection
+                        eligible to queue again. Existing products and mappings
+                        remain unchanged while paused. ClawPilot never writes
+                        to {providerLabel(provider)} or changes an order.
+                      </Typography>
+                      <Typography
+                        variant="caption"
+                        color="text.secondary"
+                        display="block"
+                        sx={{ mt: 0.5 }}
+                      >
+                        Each sales channel keeps an exact provider-variant
+                        mapping. Matching SKUs or titles are suggestions, not
+                        automatic identity across Shopify and Faire. Potential
+                        duplicates remain visible for an operator to resolve;
+                        automation never guesses that two source records are
+                        the same product.
+                      </Typography>
+                    </Box>
+                  )}
+                />
+                <Stack direction="row" gap={0.75} flexWrap="wrap">
+                  <Chip
+                    size="small"
+                    variant="outlined"
+                    label={`Revision ${productIntakePolicyRevision}`}
+                  />
+                  <Chip
+                    size="small"
+                    variant="outlined"
+                    label={`Updated ${formatDate(
+                      productIntakePolicy?.updatedAt,
+                    )}`}
+                  />
+                  <Chip
+                    size="small"
+                    variant="outlined"
+                    label={`Policy ${
+                      productIntakePolicy?.version || 'default'
+                    }`}
+                  />
+                </Stack>
+                <Alert
+                  severity={
+                    productCatalogSync?.status === 'dead'
+                      ? 'error'
+                      : (
+                          productCatalogSync?.status === 'retrying'
+                          || (
+                            productCatalogSync?.status === 'completed'
+                            && catalogSyncHasIssues(productCatalogSync)
+                          )
+                        )
+                        ? 'warning'
+                        : automaticProductCreationEnabled
+                          ? 'success'
+                          : 'info'
+                  }
+                >
+                  {automaticProductCreationEnabled
+                    ? catalogSyncDescription(productCatalogSync, provider)
+                    : futureProductBehaviorMessage}
+                </Alert>
+                {automaticProductCreationEnabled && productCatalogSync ? (
+                  <Stack direction="row" gap={0.75} flexWrap="wrap">
+                    <Chip
+                      size="small"
+                      variant="outlined"
+                      label={`${productCatalogSync.pageCount || 0} pages`}
+                    />
+                    <Chip
+                      size="small"
+                      variant="outlined"
+                      label={`${productCatalogSync.providerRecordsSeen || 0} provider variants`}
+                    />
+                    <Chip
+                      size="small"
+                      variant="outlined"
+                      label={`${productCatalogSync.productsCreated || 0} created`}
+                    />
+                    <Chip
+                      size="small"
+                      variant="outlined"
+                      label={`${productCatalogSync.productsMapped || 0} matched`}
+                    />
+                    <Chip
+                      size="small"
+                      variant="outlined"
+                      label={`${productCatalogSync.productsUnchanged || 0} unchanged`}
+                    />
+                    <Chip
+                      size="small"
+                      variant="outlined"
+                      label="0 orders changed"
+                    />
+                  </Stack>
+                ) : null}
+                {!automaticProductCreationEnabled
+                && (!operatorCommandsAllowed || !connectionReady) ? (
+                  <Typography variant="caption" color="text.secondary">
+                    {!connectionReady
+                      ? `Reconnect and verify ${providerLabel(provider)} before catalog sync can resume.`
+                      : 'Configure the Operations product target in Shadow or Active before resumed catalog sync can run.'}
+                    {' '}If the policy is already on, turning it off remains
+                    available even when the connection or Operations is later
+                    restricted.
+                  </Typography>
+                  ) : null}
+              </Stack>
+            </CardContent>
+          </Card>
+
+          {bulkNewProductCandidates.length > 0 ? (
+            <Card
+              variant="outlined"
+              sx={{
+                borderColor: 'primary.main',
+                backgroundColor: 'rgba(168,199,250,0.05)',
+              }}
+            >
+              <CardContent sx={{ '&:last-child': { pb: 2 } }}>
+                <Stack spacing={1.25}>
+                  <Stack
+                    direction={{ xs: 'column', md: 'row' }}
+                    justifyContent="space-between"
+                    alignItems={{ md: 'center' }}
+                    spacing={1.5}
+                  >
+                    <Box>
+                      <Typography variant="subtitle1" fontWeight={700}>
+                        {bulkInvalidProductCount > 0
+                          ? 'Create the ready products in one reviewed action'
+                          : 'Create the unmatched products in one reviewed action'}
+                      </Typography>
+                      <Typography variant="body2" color="text.secondary">
+                        {bulkInvalidProductCount > 0
+                          ? `ClawPilot can create and match ${
+                              bulkCreatableProductCandidates.length
+                            } ready ${
+                              bulkCreatableProductCandidates.length === 1
+                                ? 'product'
+                                : 'products'
+                            } now. The incomplete ${
+                              bulkInvalidProductCount === 1
+                                ? 'row stays'
+                                : 'rows stay'
+                            } in this review for correction.`
+                          : 'ClawPilot will create and match every remaining product using the staged provider name, SKU, price, and currency.'}{' '}
+                        Each included candidate uses its exact row version and
+                        a replay-safe command.
+                      </Typography>
+                    </Box>
+                    <Button
+                      variant="contained"
+                      startIcon={<AddCircleOutlineRounded />}
+                      aria-label={
+                        bulkInvalidProductCount > 0
+                          ? 'Create ready products'
+                          : 'Create all new products'
+                      }
+                      disabled={
+                        Boolean(pendingAction)
+                        || !operatorCommandsAllowed
+                        || bulkCreatableProductCandidates.length === 0
+                      }
+                      onClick={() => {
+                        void createAllNewCatalogProducts()
+                      }}
+                      sx={{
+                        ...actionButtonSx,
+                        flexShrink: 0,
+                        minWidth: { sm: 230 },
+                      }}
+                    >
+                      {pendingAction === 'bulk-create-products'
+                        ? `Creating ${
+                          bulkProductProgress?.completed || 0
+                        } of ${
+                          bulkProductProgress?.total
+                          || bulkCreatableProductCandidates.length
+                        }…`
+                        : bulkInvalidProductCount > 0
+                          ? `Create ready products (${
+                              bulkCreatableProductCandidates.length
+                            })`
+                          : `Create all new products (${
+                              bulkNewProductCandidates.length
+                            })`}
+                    </Button>
+                  </Stack>
+                  <Stack direction="row" gap={0.75} flexWrap="wrap">
+                    <Chip
+                      size="small"
+                      color="info"
+                      label={`${bulkNewProductCandidates.length} ${
+                        bulkNewProductCandidates.length === 1
+                          ? 'new product'
+                          : 'new products'
+                      }`}
+                    />
+                    {bulkInvalidProductCount > 0 ? (
+                      <Chip
+                        size="small"
+                        color="success"
+                        variant="outlined"
+                        label={`${bulkCreatableProductCandidates.length} ready to create`}
+                      />
+                    ) : null}
+                    {selectedExistingProductCount > 0 ? (
+                      <Chip
+                        size="small"
+                        variant="outlined"
+                        label={`${selectedExistingProductCount} selected for existing-product matching`}
+                      />
+                    ) : null}
+                  </Stack>
+                  {bulkInvalidProductCount > 0 ? (
+                    <Alert severity="warning">
+                      {bulkInvalidProductCount}{' '}
+                      {bulkInvalidProductCount === 1
+                        ? 'product needs'
+                        : 'products need'}{' '}
+                      a valid name, price, currency, and current row version
+                      before being created.{' '}
+                      {bulkCreatableProductCandidates.length > 0
+                        ? 'These rows will be left for review and excluded from the ready-products action.'
+                        : 'Correct the create fields in the product cards below before any product can be created.'}
+                    </Alert>
+                  ) : null}
+                  <Typography variant="caption" color="text.secondary">
+                    This action applies only to the products in this current
+                    review and does not change the saved account policy.{' '}
+                    {futureProductBehaviorMessage} Each created product gets
+                    an exact mapping for this {providerLabel(provider)}{' '}
+                    connection. SKU and title are suggestions, not automatic
+                    cross-channel identity. Potential duplicates remain
+                    reviewable instead of being silently combined.
+                  </Typography>
+                </Stack>
+              </CardContent>
+            </Card>
+          ) : null}
 
           {csvImportPreview ? (
             <Card
@@ -3084,6 +4189,15 @@ export default function CommerceIntakeWorkflow({
                             This retained candidate expired. Use the catalog
                             fetch above to stage the provider&apos;s current
                             revision.
+                          </Alert>
+                        ) : candidate.lastErrorCode ? (
+                          <Alert severity="warning">
+                            Automatic creation could not finish (
+                            {candidate.lastErrorCode}). ClawPilot will retry this
+                            current provider revision during the next catalog
+                            reconciliation. You can also open{' '}
+                            <strong>Choose product decision</strong> below to
+                            resolve it now.
                           </Alert>
                         ) : (
                           <Alert severity="warning">
@@ -3485,11 +4599,31 @@ export default function CommerceIntakeWorkflow({
                             />
                             <Chip
                               size="small"
-                              label={formatMoney(
-                                candidate.totalMinor,
-                                candidate.currency,
-                              )}
+                              color={candidate.headerMoney?.state
+                                === 'operational_incomplete'
+                                ? 'warning'
+                                : 'default'}
+                              variant={candidate.headerMoney?.state
+                                === 'operational_incomplete'
+                                ? 'outlined'
+                                : 'filled'}
+                              label={candidate.headerMoney?.unavailableFields
+                                .includes('total')
+                                ? 'Header total unavailable'
+                                : formatMoney(
+                                  candidate.totalMinor,
+                                  candidate.currency,
+                                )}
                             />
+                            {candidate.headerMoney?.unavailableFields
+                              .includes('shipping') ? (
+                              <Chip
+                                size="small"
+                                color="warning"
+                                variant="outlined"
+                                label="Shipping amount unavailable"
+                              />
+                              ) : null}
                             {candidate.providerStatus ? (
                               <Chip
                                 size="small"
@@ -3571,6 +4705,19 @@ export default function CommerceIntakeWorkflow({
                         {unavailableReason ? (
                           <Alert severity="info">{unavailableReason}</Alert>
                         ) : null}
+                        {candidate.headerMoney?.state
+                          === 'operational_incomplete' ? (
+                          <Alert severity="warning">
+                            The provider did not return exact{' '}
+                            {candidate.headerMoney.unavailableFields
+                              .map(humanize)
+                              .join(' and ')}. ClawPilot can create fulfillment
+                            demand only from confirmed remaining quantities and
+                            order-time line prices. This order is blocked from
+                            accounting and customer-charge use; missing
+                            shipping or totals are never estimated.
+                          </Alert>
+                          ) : null}
 
                         {candidate.blockers?.length ? (
                           <Alert severity="warning">

@@ -542,7 +542,7 @@ export default function CommerceIntegrationPanel() {
           const oauthCode = url.searchParams.get('faireOauthCode')
           if (oauthStatus === 'connected') {
             setNotice(
-              'Faire Custom App authorized and its brand identity verified. Automated synchronization remains unavailable until the polling worker is released.',
+              'Faire Custom App connected and verified. This connection authorizes automatic read-only product catalog sync with no second approval. ClawPilot initializes the resumed policy and queues work when product-read access, the development runtime, and the Operations product target are eligible.',
             )
           } else if (oauthStatus === 'error') {
             setError(actionableCommerceError(new CommerceRequestError(
@@ -724,7 +724,7 @@ export default function CommerceIntegrationPanel() {
     const saved = await action(
       'connect-shopify',
       { action: 'connect-shopify', ...shopify },
-      'Shopify merchant-owned app connected and its API identity verified. Complete the receipt setup checklist below only when you are ready to enable signed receipt intake.',
+      'Shopify merchant-owned app connected and verified. This connection authorizes automatic read-only product catalog sync with no second approval. ClawPilot initializes the resumed policy and queues work when product-read access, the development runtime, and the Operations product target are eligible. Signed receipt intake and provider writes remain separate.',
     )
     if (saved) {
       setRevealedCredential(null)
@@ -748,7 +748,7 @@ export default function CommerceIntegrationPanel() {
           accessToken: faire.apiKey,
           confirmLiveAccess: faire.confirmLiveAccess,
         },
-        'Faire generated API key connected and the brand identity was verified with a read-only request. Synchronization remains unavailable until the polling worker is released.',
+        'Faire generated API key connected and verified. This connection authorizes automatic read-only product catalog sync with no second approval. ClawPilot initializes the resumed policy and queues work when product-read access, the development runtime, and the Operations product target are eligible. Order, inventory, fulfillment, and provider-write workflows remain separate.',
       )
       if (saved) {
         setRevealedCredential(null)
@@ -938,12 +938,14 @@ export default function CommerceIntegrationPanel() {
         authorization flow.
       </Alert>
       <Alert severity="warning">
-        A verified connection proves provider identity and encrypted credential
-        storage only. Canonical order import, inventory writes,
-        reconciliation workers, fulfillment export, multi-merchant OAuth, and
-        production domain activation are not enabled. Order and customer
-        webhook topics are rejected until a retention/privacy lifecycle and
-        canonical processor exist.
+        A verified connection authorizes automatic read-only product catalog
+        synchronization with no second approval. ClawPilot initializes the
+        resumed policy and queues work only when product-read access, the
+        development runtime, and the Operations product target are eligible.
+        It may create exact product records and mappings in this workspace but
+        cannot write to Shopify or Faire. Canonical order import, inventory
+        mutation, fulfillment export, multi-merchant OAuth, and production
+        provider writes remain unavailable or separately controlled.
       </Alert>
       {error ? <Alert severity="error">{error}</Alert> : null}
       {notice ? <Alert severity="success">{notice}</Alert> : null}
@@ -1130,7 +1132,7 @@ export default function CommerceIntegrationPanel() {
                         ),
                       },
                       {
-                        label: 'Domain workers',
+                        label: 'Order-domain workers',
                         value: catalog?.activationBoundary.domainWorkersActivated
                           ? 'Activated'
                           : 'Not activated',
@@ -1409,7 +1411,7 @@ export default function CommerceIntegrationPanel() {
                     label: 'Verify the intended brand',
                     state: faireConnectionState,
                     description: faire.authPath === 'brand_api_key'
-                      ? 'Paste the generated API key below. ClawPilot sends one read-only request to Faire’s brand-profile endpoint, verifies the immutable brand identity, encrypts the key, and leaves synchronization disabled.'
+                      ? 'Paste the generated API key below. ClawPilot sends one read-only request to Faire’s brand-profile endpoint, verifies the immutable brand identity, and encrypts the key. That verified connection authorizes automatic product catalog sync; eligible work queues without a second approval.'
                       : 'Enter the application credentials below, continue to Faire, approve the intended brand, and return through the one-use callback. ClawPilot exchanges the code server-side and verifies the brand profile before encrypted persistence.',
                     facts: [
                       {
@@ -1434,15 +1436,19 @@ export default function CommerceIntegrationPanel() {
                   },
                   {
                     key: 'faire-sync',
-                    label: 'Activate polling and domain processing',
-                    state: 'pending',
+                    label: 'Authorize product catalog synchronization',
+                    state: faireAccount?.verificationStatus === 'verified'
+                      ? 'complete'
+                      : 'pending',
                     optional: true,
                     description:
-                      'Synchronization is not available in this slice. A verified Faire credential does not activate product, inventory, order, shipment, or review workers.',
+                      'Verification authorizes automatic read-only product catalog sync. ClawPilot initializes the resumed policy and queues work when product-read access, the development runtime, and the Operations product target are eligible. Order, inventory, shipment, and provider-write workers remain inactive.',
                     facts: [
                       {
-                        label: 'Synchronization',
-                        value: 'Unavailable',
+                        label: 'Product sync authorization',
+                        value: faireAccount?.verificationStatus === 'verified'
+                          ? 'Authorized · eligibility checked automatically'
+                          : 'Waiting for connection',
                       },
                       {
                         label: 'Provider attempts',
@@ -1551,7 +1557,7 @@ export default function CommerceIntegrationPanel() {
                   />
                 )}
                 label={faire.authPath === 'brand_api_key'
-                  ? 'I authorize one read-only Faire brand-profile request to verify this generated API key. No Faire data will be written or synchronized.'
+                  ? 'I authorize one read-only Faire brand-profile request to verify this generated API key. The verification call writes no Faire data; after connection, eligible product-only catalog sync may read automatically.'
                   : 'I authorize the Faire redirect, server-side code exchange, and live production brand-profile verification.'}
               />
               <Button
@@ -1681,13 +1687,17 @@ export default function CommerceIntegrationPanel() {
                             color={account.status === 'active'
                               ? 'success'
                               : 'default'}
-                            label={account.provider === 'shopify'
-                              ? `Receipt intake ${
-                                account.status === 'active'
-                                  ? 'enabled'
-                                  : 'disabled'
-                              }`
-                              : 'Synchronization unavailable'}
+                        label={account.provider === 'shopify'
+                          ? `Receipt intake ${
+                              account.status === 'active'
+                                ? 'enabled'
+                                : 'disabled'
+                            }`
+                          : (
+                              account.verificationStatus === 'verified'
+                                ? 'Product sync authorized'
+                                : 'Product sync needs attention'
+                            )}
                           />
                           {account.configured
                             && account.credentialIdentifierLastFour ? (
@@ -1710,18 +1720,20 @@ export default function CommerceIntegrationPanel() {
                           ? `${providerLabel(account.provider)} API connection established.`
                           : `${providerLabel(account.provider)} API connection needs attention.`}{' '}
                         {account.provider === 'shopify'
-                          ? 'Receipt intake is a separate optional activation step.'
-                          : 'Scheduled Faire polling and inventory synchronization are not active; the development-only operator intake below is separate.'}
+                          ? 'This connection authorizes automatic product catalog sync with no second approval. Eligibility and worker status appear below; the control only pauses or resumes sync. Signed order receipts remain separate.'
+                          : 'This connection authorizes automatic product catalog sync with no second approval. Eligibility and worker status appear below; the control only pauses or resumes sync. Orders and inventory remain separate.'}
                       </Alert>
 
-                      {intakeAvailable
-                        && account.configured
-                        && account.verificationStatus === 'verified' ? (
+                      {intakeAvailable ? (
                         <CommerceIntakeWorkflow
                           accountGlobalId={account.globalId}
                           provider={account.provider}
                           displayName={account.displayName}
                           canActivate={canActivate}
+                          connectionReady={
+                            account.configured
+                            && account.verificationStatus === 'verified'
+                          }
                         />
                       ) : null}
 

@@ -15,6 +15,19 @@ import { acquireTransactionAdvisoryLock, query, withTransaction } from '@/lib/pe
 
 type TimestampValue = string | Date
 
+const AG_ALCHEMY_EPISCS_RATING_DELEGATION =
+  'ag-alchemy-episcs-sandbox-rating-delegation'
+
+export class CarrierIntegrationSourceManagedError extends Error {
+  readonly status = 403
+  readonly code = 'CARRIER_DELEGATION_SOURCE_MANAGED'
+
+  constructor() {
+    super('This sandbox rating delegation is managed by its source organization')
+    this.name = 'CarrierIntegrationSourceManagedError'
+  }
+}
+
 type CarrierConnectionRow = {
   id: string
   global_id: string
@@ -89,6 +102,11 @@ export type CarrierIntegrationAccountState = {
   verifiedAt: string | null
   lastErrorCode: string | null
   updatedAt: string
+  allowedCapabilities: string[]
+  authorizationScope: string | null
+  credentialRevealAllowed: boolean
+  managedBy: string | null
+  senderOriginWarehouseGlobalId: string | null
   carrierAccounts: OperationsCarrierAccountState[]
 }
 
@@ -106,6 +124,7 @@ export type CarrierRuntimeCredentialRecord = {
   status: 'active' | 'disabled' | 'error'
   verificationStatus: 'unverified' | 'verified' | 'failed'
   credentialVersion: number
+  configuration: Record<string, unknown>
   encrypted: EncryptedCarrierCredential
 }
 
@@ -172,6 +191,11 @@ function state(
   row: CarrierConnectionRow,
   carrierAccounts: OperationsCarrierAccountState[],
 ): CarrierIntegrationAccountState {
+  const allowedCapabilities = Array.isArray(row.configuration.allowedCapabilities)
+    ? row.configuration.allowedCapabilities.filter(
+        (value): value is string => typeof value === 'string',
+      )
+    : []
   return {
     globalId: row.global_id,
     provider: row.provider,
@@ -186,6 +210,21 @@ function state(
     verifiedAt: iso(row.verified_at),
     lastErrorCode: row.last_error_code,
     updatedAt: iso(row.updated_at) as string,
+    allowedCapabilities,
+    authorizationScope:
+      typeof row.configuration.authorizationScope === 'string'
+        ? row.configuration.authorizationScope
+        : null,
+    credentialRevealAllowed:
+      row.configuration.credentialRevealAllowed !== false,
+    managedBy:
+      typeof row.configuration.managedBy === 'string'
+        ? row.configuration.managedBy
+        : null,
+    senderOriginWarehouseGlobalId:
+      typeof row.configuration.senderOriginWarehouseGlobalId === 'string'
+        ? row.configuration.senderOriginWarehouseGlobalId
+        : null,
     carrierAccounts,
   }
 }
@@ -304,6 +343,7 @@ export async function readCarrierRuntimeCredentialFromPostgres(input: {
     status: row.status,
     verificationStatus: row.verification_status || 'unverified',
     credentialVersion: row.credential_version,
+    configuration: row.configuration,
     encrypted: {
       ciphertext: row.credential_ciphertext,
       iv: row.credential_iv,
@@ -411,16 +451,61 @@ function carrierAccountPersistenceError(error: unknown): never {
   throw error
 }
 
-async function lockedCarrierConnection(
+function assertUserManagedCarrierConnection(
+  configuration: Record<string, unknown>,
+) {
+  if (
+    configuration.managedBy === AG_ALCHEMY_EPISCS_RATING_DELEGATION
+    || (
+      configuration.authorizationScope === 'sandbox_rating_only'
+      && configuration.credentialRevealAllowed === false
+    )
+  ) {
+    throw new CarrierIntegrationSourceManagedError()
+  }
+}
+
+type LockedCarrierConnection = {
+  id: string
+  global_id: string
+  configuration: Record<string, unknown>
+  credential_configured: boolean
+}
+
+async function lockedUserManagedCarrierConnection(
   client: PoolClient,
   input: Pick<CarrierAccountWriteInput, 'organizationId' | 'provider' | 'environment'>,
+  options: {
+    requireCredential?: boolean
+    allowMissing: true
+  },
+): Promise<LockedCarrierConnection | null>
+async function lockedUserManagedCarrierConnection(
+  client: PoolClient,
+  input: Pick<CarrierAccountWriteInput, 'organizationId' | 'provider' | 'environment'>,
+  options?: {
+    requireCredential?: boolean
+    allowMissing?: false
+  },
+): Promise<LockedCarrierConnection>
+async function lockedUserManagedCarrierConnection(
+  client: PoolClient,
+  input: Pick<CarrierAccountWriteInput, 'organizationId' | 'provider' | 'environment'>,
+  options: {
+    requireCredential?: boolean
+    allowMissing?: boolean
+  } = {},
 ) {
-  const result = await client.query<{ id: string; global_id: string }>(
-    `SELECT account.id::text, account.global_id
+  const requireCredential = options.requireCredential !== false
+  const result = await client.query<LockedCarrierConnection>(
+    `SELECT account.id::text, account.global_id, account.configuration,
+            EXISTS (
+              SELECT 1
+              FROM operations_carrier_credentials credential
+              WHERE credential.organization_id = account.organization_id
+                AND credential.integration_account_id = account.id
+            ) AS credential_configured
      FROM operations_integration_accounts account
-     JOIN operations_carrier_credentials credential
-       ON credential.organization_id = account.organization_id
-      AND credential.integration_account_id = account.id
      WHERE account.organization_id = $1::uuid
        AND account.provider = $2
        AND account.environment = $3
@@ -429,9 +514,15 @@ async function lockedCarrierConnection(
     [input.organizationId, input.provider, input.environment],
   )
   if (!result.rowCount) {
+    if (options.allowMissing) return null
     throw new Error('Carrier credentials must be configured before adding billing accounts')
   }
-  return result.rows[0]
+  const connection = result.rows[0]
+  assertUserManagedCarrierConnection(connection.configuration)
+  if (requireCredential && !connection.credential_configured) {
+    throw new Error('Carrier credentials must be configured before adding billing accounts')
+  }
+  return connection
 }
 
 export async function createCarrierAccountInPostgres(input: CarrierAccountWriteInput) {
@@ -441,7 +532,7 @@ export async function createCarrierAccountInPostgres(input: CarrierAccountWriteI
         client,
         `carrier-account:${input.organizationId}:${input.provider}:${input.environment}`,
       )
-      const connection = await lockedCarrierConnection(client, input)
+      const connection = await lockedUserManagedCarrierConnection(client, input)
       const globalIdResult = await client.query<{ global_id: string }>(
         `SELECT allocate_global_reference('gac') AS global_id`,
       )
@@ -512,6 +603,7 @@ export async function updateCarrierAccountInPostgres(
 ) {
   try {
     await withTransaction(async (client) => {
+      const connection = await lockedUserManagedCarrierConnection(client, input)
       const existing = await client.query<{
         id: string
         global_id: string
@@ -520,16 +612,15 @@ export async function updateCarrierAccountInPostgres(
         `SELECT carrier_account.id::text, carrier_account.global_id,
                 carrier_account.integration_account_id::text
          FROM operations_carrier_accounts carrier_account
-         JOIN operations_integration_accounts connection
-           ON connection.organization_id = carrier_account.organization_id
-          AND connection.id = carrier_account.integration_account_id
          WHERE carrier_account.organization_id = $1::uuid
            AND carrier_account.global_id = $2
-           AND connection.provider = $3
-           AND connection.environment = $4
-           AND connection.integration_type = 'carrier'
+           AND carrier_account.integration_account_id = $3::uuid
          FOR UPDATE OF carrier_account`,
-        [input.organizationId, input.carrierAccountGlobalId, input.provider, input.environment],
+        [
+          input.organizationId,
+          input.carrierAccountGlobalId,
+          connection.id,
+        ],
       )
       if (!existing.rowCount) throw new Error('Carrier account was not found')
       const account = existing.rows[0]
@@ -615,23 +706,18 @@ export async function setCarrierAccountStatusInPostgres(input: {
   actorEmail: string
 }) {
   const updated = await withTransaction(async (client) => {
+    const connection = await lockedUserManagedCarrierConnection(client, input)
     const result = await client.query<{ global_id: string }>(
       `UPDATE operations_carrier_accounts carrier_account
-       SET status = $5, updated_by = $6, updated_at = now()
-       FROM operations_integration_accounts connection
+       SET status = $4, updated_by = $5, updated_at = now()
        WHERE carrier_account.organization_id = $1::uuid
          AND carrier_account.global_id = $2
-         AND connection.organization_id = carrier_account.organization_id
-         AND connection.id = carrier_account.integration_account_id
-         AND connection.provider = $3
-         AND connection.environment = $4
-         AND connection.integration_type = 'carrier'
+         AND carrier_account.integration_account_id = $3::uuid
        RETURNING carrier_account.global_id`,
       [
         input.organizationId,
         input.carrierAccountGlobalId,
-        input.provider,
-        input.environment,
+        connection.id,
         input.status,
         input.actorEmail,
       ],
@@ -660,18 +746,14 @@ export async function deleteCarrierAccountInPostgres(input: {
 }) {
   try {
     await withTransaction(async (client) => {
+      const connection = await lockedUserManagedCarrierConnection(client, input)
       const deleted = await client.query<{ global_id: string }>(
         `DELETE FROM operations_carrier_accounts carrier_account
-         USING operations_integration_accounts connection
          WHERE carrier_account.organization_id = $1::uuid
            AND carrier_account.global_id = $2
-           AND connection.organization_id = carrier_account.organization_id
-           AND connection.id = carrier_account.integration_account_id
-           AND connection.provider = $3
-           AND connection.environment = $4
-           AND connection.integration_type = 'carrier'
+           AND carrier_account.integration_account_id = $3::uuid
          RETURNING carrier_account.global_id`,
-        [input.organizationId, input.carrierAccountGlobalId, input.provider, input.environment],
+        [input.organizationId, input.carrierAccountGlobalId, connection.id],
       )
       if (!deleted.rowCount) throw new Error('Carrier account was not found')
       await client.query(
@@ -770,6 +852,10 @@ export async function writeCarrierCredentialInPostgres(input: {
       client,
       `carrier-credential:${input.organizationId}:${input.provider}:${input.environment}`,
     )
+    await lockedUserManagedCarrierConnection(client, input, {
+      requireCredential: false,
+      allowMissing: true,
+    })
     const accountResult = await client.query<{ id: string; global_id: string }>(
       `INSERT INTO operations_integration_accounts (
          organization_id, provider, integration_type, environment, display_name,
@@ -859,6 +945,7 @@ export async function markCarrierCredentialVerificationInPostgres(input: {
   errorCode: string | null
 }) {
   await withTransaction(async (client) => {
+    await lockedUserManagedCarrierConnection(client, input)
     const result = await client.query<{ global_id: string }>(
       `UPDATE operations_integration_accounts account
        SET status = CASE
@@ -916,6 +1003,9 @@ export async function setCarrierIntegrationEnabledInPostgres(input: {
   actorEmail: string
 }) {
   const result = await withTransaction(async (client) => {
+    const connection = await lockedUserManagedCarrierConnection(client, input, {
+      requireCredential: false,
+    })
     const updated = await client.query<{ global_id: string }>(
       `UPDATE operations_integration_accounts account
        SET status = CASE WHEN $4::boolean THEN 'active' ELSE 'disabled' END,
@@ -925,6 +1015,7 @@ export async function setCarrierIntegrationEnabledInPostgres(input: {
          AND account.provider = $2
          AND account.environment = $3
          AND account.integration_type = 'carrier'
+         AND account.id = $6::uuid
          AND (
            NOT $4::boolean
            OR EXISTS (
@@ -935,7 +1026,14 @@ export async function setCarrierIntegrationEnabledInPostgres(input: {
            )
          )
        RETURNING global_id`,
-      [input.organizationId, input.provider, input.environment, input.enabled, input.actorEmail],
+      [
+        input.organizationId,
+        input.provider,
+        input.environment,
+        input.enabled,
+        input.actorEmail,
+        connection.id,
+      ],
     )
     if (!updated.rowCount) return false
     await auditCarrier(client, {
@@ -958,33 +1056,27 @@ export async function disconnectCarrierCredentialInPostgres(input: {
   actorEmail: string
 }) {
   await withTransaction(async (client) => {
-    const account = await client.query<{ id: string; global_id: string }>(
-      `SELECT id::text, global_id
-       FROM operations_integration_accounts
-       WHERE organization_id = $1::uuid
-         AND provider = $2
-         AND environment = $3
-         AND integration_type = 'carrier'
-       FOR UPDATE`,
-      [input.organizationId, input.provider, input.environment],
-    )
-    if (!account.rowCount) return
+    const account = await lockedUserManagedCarrierConnection(client, input, {
+      requireCredential: false,
+      allowMissing: true,
+    })
+    if (!account) return
     await client.query(
       `DELETE FROM operations_carrier_credentials
        WHERE organization_id = $1::uuid AND integration_account_id = $2::uuid`,
-      [input.organizationId, account.rows[0].id],
+      [input.organizationId, account.id],
     )
     await client.query(
       `UPDATE operations_integration_accounts
        SET status = 'disabled', credential_reference = NULL, updated_by = $3, updated_at = now()
        WHERE organization_id = $1::uuid AND id = $2::uuid`,
-      [input.organizationId, account.rows[0].id, input.actorEmail],
+      [input.organizationId, account.id, input.actorEmail],
     )
     await auditCarrier(client, {
       actorEmail: input.actorEmail,
       organizationId: input.organizationId,
       eventType: 'carrier.credential.disconnected',
-      globalId: account.rows[0].global_id,
+      globalId: account.global_id,
       provider: input.provider,
       environment: input.environment,
     })

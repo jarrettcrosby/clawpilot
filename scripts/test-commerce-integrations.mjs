@@ -151,6 +151,7 @@ includes(persistence, [
   'operations_commerce_webhook_receipts',
   'operations_commerce_provider_attempts',
   'acquireTransactionAdvisoryLock',
+  'ensureAutomaticCommerceCatalogIntakeWithClient',
   "'commerce.credential.connected'",
   "'commerce.credential.rotated'",
   "'commerce.credential.verified'",
@@ -160,6 +161,8 @@ includes(persistence, [
   "'commerce.shopify.scopes_updated'",
   "'commerce.credential.disconnected'",
   "'commerce.credential.revealed'",
+  'productCatalogIntake',
+  'COMMERCE_CATALOG_SYNC_CONNECTION_REMOVED',
   "'commerce.webhook.received'",
   'recordCommerceCredentialRevealInPostgres',
   'payload: { credentialVersion: row.credential_version }',
@@ -536,7 +539,7 @@ includes(panel, [
   'Connect generated API key',
   "action: 'connect-faire-api-key'",
   'One read-only brand-profile request',
-  'No Faire data will be written or synchronized',
+  'The verification call writes no Faire data; after connection, eligible product-only catalog sync may read automatically.',
   'Faire Application ID',
   'Faire Secret ID',
   'Custom App OAuth — if enabled by Faire',
@@ -559,12 +562,12 @@ includes(panel, [
   'Optional signed receipt setup',
   'Copy URL',
   'Least-privilege receipt profile',
-  'Synchronization unavailable',
+  'synchronization with no second approval',
   'type="password"',
   'confirmLiveAccess',
   'Canonical order import',
   'Provider availability is shown separately',
-  'Domain workers activated: no.',
+  'Order-domain workers',
   'Order and customer topics are rejected',
   "clientId: ''",
   "applicationId: ''",
@@ -1210,6 +1213,13 @@ const faireApi = faireClient.createFaireCommerceClient({
         },
       }), { status: 200 })
     }
+    if (requestUrl.includes('/products?')) {
+      return new Response(JSON.stringify({
+        limit: 50,
+        cursor: 'faire-products-next-page',
+        products: [{ id: 'product_123' }],
+      }), { status: 200 })
+    }
     return new Response(JSON.stringify({
       brand_id: 'brand_123',
       name: 'Example Faire Brand',
@@ -1244,6 +1254,26 @@ assert.equal(faireOrder.id, 'order_123')
 assert.equal(
   faireRequests[2].url,
   'https://www.faire.com/external-api/v2/orders/order_123',
+)
+const faireProducts = await faireApi.listProducts({
+  cursor: 'faire-products-current-page',
+  limit: 50,
+})
+assert.equal(faireProducts.products.length, 1)
+assert.equal(
+  faireProducts.cursor,
+  'faire-products-next-page',
+  'Faire list responses must retain the provider continuation cursor',
+)
+assert.equal(
+  faireRequests[3].url,
+  'https://www.faire.com/external-api/v2/products?limit=50&cursor=faire-products-current-page',
+  'The next Faire list request must send the prior response cursor through the cursor query parameter',
+)
+await assert.rejects(
+  faireApi.listProducts({ cursor: 'x'.repeat(4_097) }),
+  (error) => error.code === 'FAIRE_CURSOR_INVALID',
+  'Faire list requests must reject oversized continuation cursors',
 )
 assert.equal('registerWebhook' in faireApi, false)
 assert.equal('writeReturn' in faireApi, false)

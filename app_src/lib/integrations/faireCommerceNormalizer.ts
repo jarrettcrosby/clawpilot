@@ -6,12 +6,12 @@ import {
   COMMERCE_NORMALIZED_VARIANT_VERSION,
   CommerceNormalizationError,
   asCommerceRecord,
-  assertCommerceOrderMoneyComplete,
   availableCommerceField,
   buildCommerceReadinessFacts,
   commerceAddressFromRecord,
   commerceConnectionValues,
   commerceMoneyFromDecimal,
+  commerceOrderHeaderMoneyState,
   commercePackagingFromRecord,
   commerceSourceHash,
   createCommerceExternalIdentity,
@@ -45,7 +45,7 @@ import {
 } from '@/lib/operations/commerceNormalization'
 
 export const FAIRE_COMMERCE_NORMALIZER_VERSION =
-  'faire-commerce-normalizer-v1' as const
+  'faire-commerce-normalizer-v3' as const
 
 type FaireSource = Readonly<Record<string, unknown>>
 
@@ -260,6 +260,20 @@ function moneyFromRecord(
   if (decimal.exists) {
     const valueRecord = asCommerceRecord(decimal.value)
     if (valueRecord) {
+      const minor = firstProperty(valueRecord, [
+        'amount_minor',
+        'amountMinor',
+      ])
+      if (minor.exists) {
+        return faireMoney(
+          minor.value,
+          recordCurrency(
+            valueRecord,
+            recordCurrency(record, options.fallbackCurrency),
+          ),
+          'minor',
+        )
+      }
       const amount = (
         valueRecord.amount
         ?? valueRecord.value
@@ -278,6 +292,130 @@ function moneyFromRecord(
     )
   }
   return unavailableCommerceField()
+}
+
+function exactZeroMoney(
+  currencyValue: unknown,
+): CommerceDataField<CommerceMoneySet> {
+  const currency = normalizeCommerceCurrency(currencyValue)
+  return availableCommerceField(moneySet(Object.freeze({
+    amountMinor: BigInt(0),
+    currency,
+  })))
+}
+
+function exactMoneySum(
+  fields: readonly CommerceDataField<CommerceMoneySet>[],
+): CommerceDataField<CommerceMoneySet> {
+  if (fields.some((field) => field.state !== 'available')) {
+    return unavailableCommerceField()
+  }
+  const available = fields as readonly Extract<
+    CommerceDataField<CommerceMoneySet>,
+    { state: 'available' }
+  >[]
+  const currency = available[0].value.primary.currency
+  if (available.some(({ value }) => value.primary.currency !== currency)) {
+    return unavailableCommerceField('not_supported')
+  }
+  try {
+    return availableCommerceField(moneySet(integerCommerceMinorUnits(
+      available.reduce(
+        (total, { value }) => total + value.primary.amountMinor,
+        BigInt(0),
+      ),
+      currency,
+    )))
+  } catch {
+    return unavailableCommerceField('not_supported')
+  }
+}
+
+function exactOrderTotal(
+  subtotal: CommerceDataField<CommerceMoneySet>,
+  discount: CommerceDataField<CommerceMoneySet>,
+  shipping: CommerceDataField<CommerceMoneySet>,
+  tax: CommerceDataField<CommerceMoneySet>,
+): CommerceDataField<CommerceMoneySet> {
+  const fields = [subtotal, discount, shipping, tax]
+  if (fields.some((field) => field.state !== 'available')) {
+    return unavailableCommerceField()
+  }
+  const available = fields as readonly Extract<
+    CommerceDataField<CommerceMoneySet>,
+    { state: 'available' }
+  >[]
+  const currency = available[0].value.primary.currency
+  if (available.some(({ value }) => value.primary.currency !== currency)) {
+    return unavailableCommerceField('not_supported')
+  }
+  const amountMinor = (
+    available[0].value.primary.amountMinor
+    - available[1].value.primary.amountMinor
+    + available[2].value.primary.amountMinor
+    + available[3].value.primary.amountMinor
+  )
+  if (amountMinor < BigInt(0)) {
+    return unavailableCommerceField('not_supported')
+  }
+  try {
+    return availableCommerceField(moneySet(
+      integerCommerceMinorUnits(amountMinor, currency),
+    ))
+  } catch {
+    return unavailableCommerceField('not_supported')
+  }
+}
+
+function scaledMoney(
+  field: CommerceDataField<CommerceMoneySet>,
+  multiplier: number,
+): CommerceDataField<CommerceMoneySet> {
+  if (field.state !== 'available') return unavailableCommerceField()
+  try {
+    return availableCommerceField(moneySet(integerCommerceMinorUnits(
+      field.value.primary.amountMinor * BigInt(multiplier),
+      field.value.primary.currency,
+    )))
+  } catch {
+    return unavailableCommerceField('not_supported')
+  }
+}
+
+function availableMoneyOr(
+  primary: CommerceDataField<CommerceMoneySet>,
+  fallback: CommerceDataField<CommerceMoneySet>,
+): CommerceDataField<CommerceMoneySet> {
+  return primary.state === 'available' ? primary : fallback
+}
+
+function nestedMoneyCurrency(value: unknown): unknown {
+  const record = asCommerceRecord(value)
+  return (
+    record?.currency
+    ?? record?.currency_code
+    ?? record?.currencyCode
+  )
+}
+
+function orderCurrency(
+  order: Record<string, unknown>,
+  lineRecords: readonly Record<string, unknown>[],
+  fallback: unknown,
+): string {
+  const payout = asCommerceRecord(order.payout_costs)
+  const nestedFallbacks = [
+    order.subtotal,
+    order.total,
+    payout?.subtotal_after_brand_discounts,
+    payout?.total_brand_discounts,
+    payout?.net_tax,
+    ...lineRecords.map((line) => line.price),
+  ]
+  const nestedFallback = nestedFallbacks
+    .map(nestedMoneyCurrency)
+    .find((value) => value !== null && value !== undefined && value !== '')
+  return recordCurrency(order, nestedFallback ?? fallback)
 }
 
 function moneyFromPriceArray(
@@ -330,51 +468,41 @@ function moneyFromPriceArray(
     : unavailableCommerceField('not_supported')
 }
 
-function sumMoneyFields(
-  fields: readonly CommerceDataField<CommerceMoneySet>[],
-): CommerceDataField<CommerceMoneySet> {
-  const available = fields.filter((field): field is Extract<
-    CommerceDataField<CommerceMoneySet>,
-    { state: 'available' }
-  > => field.state === 'available')
-  if (!available.length) return unavailableCommerceField()
-  const currency = available[0].value.primary.currency
-  if (available.some(({ value }) => value.primary.currency !== currency)) {
-    return unavailableCommerceField('not_supported')
-  }
-  return availableCommerceField(moneySet(Object.freeze({
-    amountMinor: available.reduce(
-      (total, { value }) => total + value.primary.amountMinor,
-      BigInt(0),
-    ),
-    currency,
-  })))
-}
-
-function moneyFromCollection(
+function discountMoney(
   value: unknown,
   fallbackCurrency: unknown,
 ): CommerceDataField<CommerceMoneySet> {
-  const values = Array.isArray(value)
-    ? value
-    : value === null || value === undefined
-      ? []
-      : [value]
-  return sumMoneyFields(values.map((item) => {
-    const record = asCommerceRecord(item)
-    if (!record) return unavailableCommerceField<CommerceMoneySet>()
-    return moneyFromRecord(record, {
-      minorKeys: [
-        'amount_cents',
-        'discount_cents',
-        'total_cents',
-        'payout_cents',
-        'maker_cost_cents',
-      ],
-      decimalKeys: ['amount', 'value'],
-      fallbackCurrency,
-    })
-  }))
+  const record = asCommerceRecord(value)
+  if (!record) return unavailableCommerceField()
+  if (record.discount_type === 'NONE') {
+    return exactZeroMoney(fallbackCurrency)
+  }
+  return moneyFromRecord(record, {
+    minorKeys: [
+      'amount_minor',
+      'amount_cents',
+      'discount_amount_cents',
+      'discount_cents',
+    ],
+    decimalKeys: ['discount_amount', 'amount', 'value'],
+    fallbackCurrency,
+  })
+}
+
+function moneyFromDiscountCollection(
+  value: unknown,
+  fallbackCurrency: unknown,
+): CommerceDataField<CommerceMoneySet> {
+  if (value === null || value === undefined) {
+    return unavailableCommerceField()
+  }
+  const values = Array.isArray(value) ? value : [value]
+  if (values.length === 0) {
+    return exactZeroMoney(fallbackCurrency)
+  }
+  return exactMoneySum(values.map((item) => (
+    discountMoney(item, fallbackCurrency)
+  )))
 }
 
 function productVariants(value: Record<string, unknown>): unknown[] {
@@ -407,8 +535,10 @@ function pageHasMore(value: unknown): boolean {
     || asCommerceRecord(page.page_info)
     || asCommerceRecord(page.pageInfo)
   const nextCursor = (
-    page.next_cursor
+    page.cursor
+    ?? page.next_cursor
     ?? page.nextCursor
+    ?? pagination?.cursor
     ?? pagination?.next_cursor
     ?? pagination?.nextCursor
   )
@@ -830,6 +960,22 @@ function lineMoney(
   })
 }
 
+function lineDiscountMoney(
+  line: Record<string, unknown>,
+  currency: string,
+): CommerceDataField<CommerceMoneySet> {
+  const direct = lineMoney(
+    line,
+    currency,
+    ['discount_cents', 'line_discount_cents'],
+    ['discount'],
+  )
+  return availableMoneyOr(
+    direct,
+    moneyFromDiscountCollection(line.discounts, currency),
+  )
+}
+
 function normalizeLine(
   source: unknown,
   currency: string,
@@ -874,6 +1020,36 @@ function normalizeLine(
   ) {
     linePackaging = knownVariant.packaging
   }
+  const unitPrice = lineMoney(
+    line,
+    currency,
+    ['price_cents', 'wholesale_price_cents', 'unit_price_cents'],
+    ['price', 'unit_price'],
+  )
+  const merchandiseSubtotal = scaledMoney(unitPrice, quantity)
+  const computedSubtotal = line.includes_tester === true
+    ? exactMoneySum([
+        merchandiseSubtotal,
+        lineMoney(
+          line,
+          currency,
+          ['tester_price_cents'],
+          ['tester_price'],
+        ),
+      ])
+    : merchandiseSubtotal
+  const lineSubtotal = availableMoneyOr(
+    lineMoney(
+      line,
+      currency,
+      ['subtotal_cents', 'total_cents'],
+      ['subtotal', 'total'],
+    ),
+    computedSubtotal,
+  )
+  if (line.includes_tester === true && lineSubtotal.state !== 'available') {
+    throw new Error('Faire returned an order-line tester without an exact price')
+  }
   return Object.freeze({
     schemaVersion: COMMERCE_NORMALIZED_ORDER_LINE_VERSION,
     identity,
@@ -902,24 +1078,9 @@ function normalizeLine(
     removedOrRefundedQuantity: null,
     unitMultiplier,
     physicalUnitQuantity,
-    unitPrice: lineMoney(
-      line,
-      currency,
-      ['price_cents', 'wholesale_price_cents', 'unit_price_cents'],
-      ['price', 'unit_price'],
-    ),
-    lineSubtotal: lineMoney(
-      line,
-      currency,
-      ['subtotal_cents', 'total_cents'],
-      ['subtotal', 'total'],
-    ),
-    lineDiscount: lineMoney(
-      line,
-      currency,
-      ['discount_cents', 'line_discount_cents'],
-      ['discount'],
-    ),
+    unitPrice,
+    lineSubtotal,
+    lineDiscount: lineDiscountMoney(line, currency),
     lineTax: lineMoney(
       line,
       currency,
@@ -936,11 +1097,9 @@ function lineDiscountTotal(
   lines: readonly Record<string, unknown>[],
   currency: string,
 ) {
-  return sumMoneyFields(lines.map((line) => lineMoney(
-    line,
-    currency,
-    ['discount_cents', 'line_discount_cents'],
-    ['discount'],
+  if (lines.length === 0) return unavailableCommerceField<CommerceMoneySet>()
+  return exactMoneySum(lines.map((line) => (
+    lineDiscountMoney(line, currency)
   )))
 }
 
@@ -957,7 +1116,7 @@ function payoutMoney(
       'maker_cost_cents',
       'amount_cents',
     ],
-    decimalKeys: ['payout', 'amount'],
+    decimalKeys: ['total_payout', 'payout', 'amount'],
     fallbackCurrency: currency,
   })
 }
@@ -974,13 +1133,14 @@ function normalizeOrder(
   const order = asCommerceRecord(source)
   if (!order) throw new Error('Faire returned an invalid order')
   const identity = faireIdentity(order.id ?? order.order_id, 'order')
-  const currency = recordCurrency(order, currencyFallback)
   const lineRecords = commerceConnectionValues(order.items ?? order.order_items)
     .map((line) => {
       const record = asCommerceRecord(line)
       if (!record) throw new Error('Faire returned an invalid order line')
       return record
     })
+  const payout = asCommerceRecord(order.payout_costs)
+  const currency = orderCurrency(order, lineRecords, currencyFallback)
   const lines = lineRecords.map((line) => normalizeLine(
     line,
     currency,
@@ -1020,38 +1180,80 @@ function normalizeOrder(
     ambiguousSkus,
   })
   const retailerId = order.retailer_id ?? asCommerceRecord(order.retailer)?.id
-  const brandDiscount = moneyFromCollection(
+  const brandDiscount = moneyFromDiscountCollection(
     order.brand_discounts,
     currency,
   )
   const lineDiscounts = lineDiscountTotal(lineRecords, currency)
-  const payout = asCommerceRecord(order.payout_costs)
-  const subtotal = moneyFromRecord(order, {
+  const explicitSubtotal = moneyFromRecord(order, {
     minorKeys: ['subtotal_cents', 'items_subtotal_cents'],
     decimalKeys: ['subtotal'],
     fallbackCurrency: currency,
   })
-  const shipping = moneyFromRecord(order, {
+  const explicitShipping = moneyFromRecord(order, {
     minorKeys: ['shipping_cents', 'shipping_cost_cents'],
     decimalKeys: ['shipping', 'shipping_cost'],
     fallbackCurrency: currency,
   })
-  const tax = moneyFromRecord(order, {
+  const explicitTax = moneyFromRecord(order, {
     minorKeys: ['tax_cents', 'vat_cents'],
     decimalKeys: ['tax', 'vat'],
     fallbackCurrency: currency,
   })
-  const discount = moneyFromRecord(order, {
+  const explicitDiscount = moneyFromRecord(order, {
     minorKeys: ['discount_cents', 'total_discount_cents'],
     decimalKeys: ['discount', 'total_discount'],
     fallbackCurrency: currency,
   })
-  const total = moneyFromRecord(order, {
+  const explicitTotal = moneyFromRecord(order, {
     minorKeys: ['total_cents', 'order_total_cents'],
     decimalKeys: ['total', 'order_total'],
     fallbackCurrency: currency,
   })
-  assertCommerceOrderMoneyComplete({
+  const payoutSubtotalAfterDiscounts = payout
+    ? moneyFromRecord(payout, {
+        minorKeys: ['subtotal_after_brand_discounts_cents'],
+        decimalKeys: ['subtotal_after_brand_discounts'],
+        fallbackCurrency: currency,
+      })
+    : unavailableCommerceField<CommerceMoneySet>()
+  const payoutTotalDiscounts = payout
+    ? moneyFromRecord(payout, {
+        minorKeys: ['total_brand_discounts_cents'],
+        decimalKeys: ['total_brand_discounts'],
+        fallbackCurrency: currency,
+      })
+    : unavailableCommerceField<CommerceMoneySet>()
+  const payoutTax = payout
+    ? moneyFromRecord(payout, {
+        minorKeys: ['net_tax_cents'],
+        decimalKeys: ['net_tax'],
+        fallbackCurrency: currency,
+      })
+    : unavailableCommerceField<CommerceMoneySet>()
+  const discount = availableMoneyOr(
+    explicitDiscount,
+    payoutTotalDiscounts,
+  )
+  const subtotal = availableMoneyOr(
+    explicitSubtotal,
+    exactMoneySum([
+      payoutSubtotalAfterDiscounts,
+      payoutTotalDiscounts,
+    ]),
+  )
+  const shipping = availableMoneyOr(
+    explicitShipping,
+    order.is_free_shipping === true
+      ? exactZeroMoney(currency)
+      : unavailableCommerceField<CommerceMoneySet>(),
+  )
+  const tax = availableMoneyOr(explicitTax, payoutTax)
+  const total = availableMoneyOr(
+    explicitTotal,
+    exactOrderTotal(subtotal, discount, shipping, tax),
+  )
+  const headerMoney = commerceOrderHeaderMoneyState({
     currency,
     subtotal,
     shipping,
@@ -1084,6 +1286,7 @@ function normalizeOrder(
     tax,
     discount,
     total,
+    headerMoney,
     party,
     shipTo,
     requestedDeliveryAt,

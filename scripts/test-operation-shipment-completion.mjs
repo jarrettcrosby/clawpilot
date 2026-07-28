@@ -455,6 +455,11 @@ async function verifyShipmentCompletion(databaseUrl) {
       'function',
       'confirmOperationsOrderShipmentFromPostgres must be exported',
     )
+    assert.equal(
+      typeof persistence.generateOperationsPackagePackingSlipInPostgres,
+      'function',
+      'generateOperationsPackagePackingSlipInPostgres must be exported',
+    )
 
     const createFixture = async (scenario) => {
       const fixture = await seedWorkspace(pool, scenario)
@@ -481,6 +486,143 @@ async function verifyShipmentCompletion(databaseUrl) {
       ))
       return fixture
     }
+
+    const packingListFixture = await createFixture('package-packing-list')
+    const packingListOrder = await advanceOrderToPacked(
+      persistence,
+      packingListFixture,
+      'package-packing-list',
+    )
+    const packingListPackage = await pool.query(
+      `SELECT package.global_id,
+              count(content.id)::int AS content_count,
+              sum(content.quantity)::text AS content_quantity
+       FROM operations_orders source_order
+       JOIN operations_fulfillment_plans plan
+         ON plan.organization_id = source_order.organization_id
+        AND plan.order_id = source_order.id
+       JOIN operations_packages package
+         ON package.organization_id = plan.organization_id
+        AND package.plan_id = plan.id
+       LEFT JOIN operations_package_contents content
+         ON content.organization_id = package.organization_id
+        AND content.package_id = package.id
+       WHERE source_order.organization_id = $1::uuid
+         AND source_order.global_id = $2
+       GROUP BY package.id`,
+      [packingListFixture.organizationId, packingListOrder.planned.orderGlobalId],
+    )
+    assert.equal(packingListPackage.rowCount, 1)
+    assert.equal(packingListPackage.rows[0].content_count, 1)
+    assert.equal(packingListPackage.rows[0].content_quantity, '2.000000')
+    const beforePackingList = await orderEvidence(
+      pool,
+      packingListFixture,
+      packingListOrder.planned.orderGlobalId,
+    )
+    const packingListInput = {
+      organizationId: packingListFixture.organizationId,
+      actorEmail: packingListFixture.email,
+      orderGlobalId: packingListOrder.planned.orderGlobalId,
+      packageGlobalId: packingListPackage.rows[0].global_id,
+      expectedRowVersion: packingListOrder.packed.rowVersion,
+      idempotencyKey: `package-packing-list-${randomUUID()}`,
+    }
+    const generatedPackingList = (
+      await persistence.generateOperationsPackagePackingSlipInPostgres(
+        packingListInput,
+      )
+    )
+    assert.equal(generatedPackingList.orderStatus, 'packed')
+    assert.equal(generatedPackingList.rowVersion, packingListOrder.packed.rowVersion)
+    assert.equal(
+      generatedPackingList.packageGlobalId,
+      packingListPackage.rows[0].global_id,
+    )
+    assert.match(generatedPackingList.packingSlipArtifactGlobalId, /^gpf\d{7}$/)
+    assert.equal(
+      generatedPackingList.contentUrl,
+      `/api/operations/artifacts/${generatedPackingList.packingSlipArtifactGlobalId}`,
+    )
+    assert.equal(generatedPackingList.replayed, false)
+    const afterPackingList = await orderEvidence(
+      pool,
+      packingListFixture,
+      packingListOrder.planned.orderGlobalId,
+    )
+    assert.deepEqual(afterPackingList, {
+      ...beforePackingList,
+      packing_slips: beforePackingList.packing_slips + 1,
+      packing_slip_payloads: beforePackingList.packing_slip_payloads + 1,
+    })
+    assert.equal(afterPackingList.status, 'packed')
+    assert.equal(afterPackingList.shipments, 0)
+    assert.equal(afterPackingList.tracking_observations, 0)
+    assert.equal(afterPackingList.fulfillment_exports, 0)
+    assert.equal(afterPackingList.ship_ledger_entries, 0)
+    const packageArtifact = await pool.query(
+      `SELECT artifact.source_package_id IS NOT NULL AS has_package,
+              artifact.source_shipment_id IS NULL AS has_no_shipment,
+              payload.template_version,
+              payload.render_snapshot,
+              payload.payload
+       FROM operations_print_artifacts artifact
+       JOIN operations_print_artifact_payloads payload
+         ON payload.organization_id = artifact.organization_id
+        AND payload.artifact_id = artifact.id
+       WHERE artifact.organization_id = $1::uuid
+         AND artifact.global_id = $2`,
+      [
+        packingListFixture.organizationId,
+        generatedPackingList.packingSlipArtifactGlobalId,
+      ],
+    )
+    assert.equal(packageArtifact.rowCount, 1)
+    assert.equal(packageArtifact.rows[0].has_package, true)
+    assert.equal(packageArtifact.rows[0].has_no_shipment, true)
+    assert.equal(
+      packageArtifact.rows[0].template_version,
+      packingSlip.PACKAGE_PACKING_LIST_TEMPLATE_VERSION,
+    )
+    assert.deepEqual(
+      packageArtifact.rows[0].render_snapshot.lines.map((line) => ({
+        productGlobalId: line.productGlobalId,
+        quantity: line.quantity,
+      })),
+      [{
+        productGlobalId: packingListFixture.product.reference_code,
+        quantity: 2,
+      }],
+    )
+    assert.equal(
+      packageArtifact.rows[0].payload.subarray(0, 4).toString(),
+      '%PDF',
+    )
+    const replayedPackingList = (
+      await persistence.generateOperationsPackagePackingSlipInPostgres(
+        packingListInput,
+      )
+    )
+    assert.equal(replayedPackingList.replayed, true)
+    assert.equal(
+      replayedPackingList.packingSlipArtifactGlobalId,
+      generatedPackingList.packingSlipArtifactGlobalId,
+    )
+    const packageArtifactCount = await pool.query(
+      `SELECT count(*)::int AS count
+       FROM operations_print_artifacts artifact
+       WHERE artifact.organization_id = $1::uuid
+         AND artifact.source_package_id = (
+           SELECT id
+           FROM operations_packages
+           WHERE organization_id = $1::uuid
+             AND global_id = $2
+         )
+         AND artifact.source_shipment_id IS NULL
+         AND artifact.document_type = 'packing_slip'`,
+      [packingListFixture.organizationId, packingListPackage.rows[0].global_id],
+    )
+    assert.equal(packageArtifactCount.rows[0].count, 1)
 
     const successFixture = await createFixture('success')
     const successful = await advanceOrderToPacked(persistence, successFixture, 'success')
@@ -676,6 +818,109 @@ async function main() {
   ]) {
     assert.ok(migration.includes(fragment), `Shipment completion migration is missing ${fragment}`)
   }
+  const packageAllocationMigration = read(
+    'db/migrations/0121_operations_package_contents.sql',
+  )
+  for (const fragment of [
+    'CREATE TABLE IF NOT EXISTS operations_package_contents',
+    'operations_package_contents_package_line_unique',
+    'protect_operations_package_content_write',
+    'ADD COLUMN IF NOT EXISTS source_package_id uuid',
+    'operations_print_artifacts_package_packing_list_unique',
+  ]) {
+    assert.ok(
+      packageAllocationMigration.includes(fragment),
+      `Package packing-list migration is missing ${fragment}`,
+    )
+  }
+  const packingSlip = loadTypeScriptModule(
+    'app_src/lib/operations/packingSlip.ts',
+  )
+  const paginated = packingSlip.renderPackagePackingList({
+    documentStage: 'warehouse_packing',
+    orderGlobalId: 'gor0000001',
+    orderNumber: 'PAGINATION-ACCEPTANCE',
+    customerName: 'Pagination Customer',
+    customerGlobalId: 'ga0000001',
+    fulfillmentPlanGlobalId: 'gfp0000001',
+    warehouseId: randomUUID(),
+    warehouseGlobalId: 'gwh0000001',
+    warehouseName: 'Pagination Warehouse',
+    packageGlobalId: 'gpa0000001',
+    packageNumber: 1,
+    packageCount: 1,
+    shipTo: {
+      name: 'Pagination Customer',
+      line1: '100 Packing Lane',
+      city: 'Hartford',
+      region: 'CT',
+      postalCode: '06103',
+      country: 'US',
+    },
+    lines: Array.from({ length: 31 }, (_, index) => ({
+      productGlobalId: `gp${String(index + 1).padStart(7, '0')}`,
+      productName: `Pagination item ${index + 1}`,
+      channelSku: `PAGE-${index + 1}`,
+      quantity: index + 1,
+    })),
+  })
+  const paginatedSource = paginated.payload.toString('binary')
+  assert.match(
+    paginatedSource,
+    /\/Count 3/,
+    'Thirty-one exact package lines must render across three PDF pages',
+  )
+  assert.ok(
+    paginatedSource.includes('Pagination item 31'),
+    'The final exact package line must not be silently truncated',
+  )
+  assert.ok(
+    paginatedSource.includes('Page 3 of 3'),
+    'The final package packing-list page must be numbered',
+  )
+  const shipmentPackingSlip = packingSlip.renderPackingSlip({
+    orderGlobalId: 'gor0000001',
+    orderNumber: 'SHIPMENT-PAGINATION',
+    customerName: 'Pagination Customer',
+    customerGlobalId: 'ga0000001',
+    shipmentGlobalId: 'gsh0000001',
+    trackingNumber: 'TRACKING-PAGINATION',
+    carrier: 'test',
+    serviceCode: 'ground',
+    shippedAt: '2026-07-27T00:00:00.000Z',
+    shipTo: {
+      name: 'Pagination Customer',
+      line1: '100 Packing Lane',
+      city: 'Hartford',
+      region: 'CT',
+      postalCode: '06103',
+      country: 'US',
+    },
+    lines: Array.from({ length: 31 }, (_, index) => ({
+      productGlobalId: `gp${String(index + 1).padStart(7, '0')}`,
+      productName: `Shipment item ${index + 1}`,
+      channelSku: `SHIP-PAGE-${index + 1}`,
+      quantity: index + 1,
+    })),
+  })
+  const shipmentPackingSource = shipmentPackingSlip.payload.toString('binary')
+  assert.equal(
+    shipmentPackingSlip.templateVersion,
+    'packing-slip-letter-v2',
+  )
+  assert.match(
+    shipmentPackingSource,
+    /\/Count 3/,
+    'Thirty-one shipment lines must render across three PDF pages',
+  )
+  assert.ok(
+    shipmentPackingSource.includes('Shipment item 31'),
+    'The final shipment packing-slip line must not be silently truncated',
+  )
+  assert.ok(
+    shipmentPackingSource.includes('Page 3 of 3'),
+    'The final shipment packing-slip page must be numbered',
+  )
 
   command('docker', ['info'], { timeout: 30_000 })
   const container = `clawpilot-shipment-completion-${process.pid}-${randomUUID().slice(0, 8)}`

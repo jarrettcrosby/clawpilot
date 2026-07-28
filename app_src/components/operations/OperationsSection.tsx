@@ -58,12 +58,14 @@ import type {
   OperationsOrderDetail,
   OperationsOrderListItem,
   OperationsOrderStatus,
+  OperationsPackingSlipCommandResult,
   OperationsSandboxLabelCommandResult,
   OperationsShipmentCommandResult,
   OperationsWorkspace,
 } from '@/lib/operations/types'
 import GlCodingPanel from '@/components/operations/GlCodingPanel'
 import CommerceImportsPanel from '@/components/operations/CommerceImportsPanel'
+import PackagingMaterialsPanel from '@/components/operations/PackagingMaterialsPanel'
 import PrinterConfigurationPanel from '@/components/operations/PrinterConfigurationPanel'
 import ReceivingPanel from '@/components/operations/ReceivingPanel'
 import WarehouseSetupPanel from '@/components/operations/WarehouseSetupPanel'
@@ -79,6 +81,7 @@ type OperationsPayload = {
     | OperationsExceptionUpdateResult
     | OperationsActivationUpdateResult
     | OperationsOrderCommandResult
+    | OperationsPackingSlipCommandResult
     | OperationsSandboxLabelCommandResult
     | OperationsShipmentCommandResult
 }
@@ -89,6 +92,7 @@ export type OperationsView =
   | 'imports'
   | 'receiving'
   | 'warehouses'
+  | 'packaging-materials'
   | 'carrier-invoices'
   | 'gl-coding'
   | 'printing'
@@ -248,9 +252,13 @@ function OrderDetailDrawer({
   onRelease,
   onConfirmPicks,
   onVerifyPack,
+  onGeneratePackingSlip,
+  onPrintPackingSlip,
   onConfirmShipment,
   onCreateSandboxLabel,
   onVoidSandboxLabel,
+  generatingPackingSlipPackageId,
+  printingPackingSlipArtifactId,
 }: {
   order: OperationsOrderDetail | null
   sandboxCarrierAccounts: OperationsWorkspace['shipping']['sandboxCarrierAccounts']
@@ -261,9 +269,13 @@ function OrderDetailDrawer({
   onRelease: () => void
   onConfirmPicks: () => void
   onVerifyPack: () => void
+  onGeneratePackingSlip: (packageGlobalId: string) => void
+  onPrintPackingSlip: (artifactGlobalId: string) => void
   onConfirmShipment: () => void
   onCreateSandboxLabel: () => void
   onVoidSandboxLabel: () => void
+  generatingPackingSlipPackageId: string | null
+  printingPackingSlipArtifactId: string | null
 }) {
   const theme = useTheme()
   const mobile = useMediaQuery(theme.breakpoints.down('md'))
@@ -444,20 +456,172 @@ function OrderDetailDrawer({
             </DetailSection>
 
             <DetailSection title={`Packages (${order.packages.length})`}>
-              {order.packages.length ? <Stack divider={<Divider flexItem />}>
-                {order.packages.map((item) => (
-                  <Box key={item.globalId} sx={{ py: 1.25, display: 'flex', justifyContent: 'space-between', gap: 2 }}>
-                    <Box>
-                      <Stack direction="row" spacing={1} alignItems="center">
-                        <Typography fontWeight={600}>Package {item.packageNumber}</Typography>
-                        <Chip size="small" label={displayStatus(item.status)} color={item.status === 'planned' ? 'default' : 'success'} />
-                      </Stack>
-                      <Typography variant="caption" color="text.secondary">{item.globalId}</Typography>
-                    </Box>
-                    <Box sx={{ textAlign: 'right' }}><Typography>{item.weightGrams} g</Typography><Typography variant="caption" color="text.secondary">{item.dimensionsMm.length} × {item.dimensionsMm.width} × {item.dimensionsMm.height} mm</Typography></Box>
-                  </Box>
-                ))}
-              </Stack> : <Typography variant="body2" color="text.secondary">No package plan has been created.</Typography>}
+              {order.packages.length ? (
+                <Stack spacing={1.5}>
+                  {order.packages.map((item) => {
+                    const artifact = printArtifacts.find(
+                      (candidate) => (
+                        candidate.documentType === 'packing_slip'
+                        && candidate.packageGlobalId === item.globalId
+                        && !candidate.shipmentGlobalId
+                      ),
+                    ) || printArtifacts.find(
+                      (candidate) => (
+                        candidate.documentType === 'packing_slip'
+                        && candidate.packageGlobalId === item.globalId
+                      ),
+                    )
+                    const canGenerate = (
+                      canExecute
+                      && order.status === 'packed'
+                      && ['packed', 'labeled'].includes(item.status)
+                      && item.contents.length > 0
+                    )
+                    const generating = generatingPackingSlipPackageId === item.globalId
+                    const printing = artifact
+                      ? printingPackingSlipArtifactId === artifact.globalId
+                      : false
+                    return (
+                      <Box
+                        key={item.globalId}
+                        sx={{
+                          p: 1.5,
+                          border: '1px solid rgba(255,255,255,0.12)',
+                          borderRadius: '8px',
+                        }}
+                      >
+                        <Stack
+                          direction="row"
+                          justifyContent="space-between"
+                          alignItems="flex-start"
+                          gap={2}
+                        >
+                          <Box>
+                            <Stack direction="row" spacing={1} alignItems="center">
+                              <Typography fontWeight={700}>
+                                Package {item.packageNumber} of {order.packages.length}
+                              </Typography>
+                              <Chip
+                                size="small"
+                                label={displayStatus(item.status)}
+                                color={item.status === 'planned' ? 'default' : 'success'}
+                              />
+                            </Stack>
+                            <Typography variant="caption" color="text.secondary">
+                              {item.globalId}
+                            </Typography>
+                          </Box>
+                          <Box sx={{ textAlign: 'right' }}>
+                            <Typography>{item.weightGrams} g</Typography>
+                            <Typography variant="caption" color="text.secondary">
+                              {item.dimensionsMm.length} × {item.dimensionsMm.width} × {item.dimensionsMm.height} mm
+                            </Typography>
+                          </Box>
+                        </Stack>
+
+                        <Box sx={{ mt: 1.5 }}>
+                          <Typography variant="caption" color="text.secondary">
+                            Exact contents
+                          </Typography>
+                          {item.contents.length > 0 ? (
+                            <Stack divider={<Divider flexItem />}>
+                              {item.contents.map((content) => (
+                                <Box
+                                  key={content.globalId}
+                                  sx={{
+                                    py: 0.75,
+                                    display: 'grid',
+                                    gridTemplateColumns: 'minmax(0, 1fr) auto',
+                                    gap: 1,
+                                  }}
+                                >
+                                  <Box sx={{ minWidth: 0 }}>
+                                    <Typography variant="body2" fontWeight={600}>
+                                      {content.productName}
+                                    </Typography>
+                                    <Typography variant="caption" color="text.secondary">
+                                      {content.productGlobalId} · {content.channelSku || 'No SKU'}
+                                    </Typography>
+                                  </Box>
+                                  <Typography variant="body2" fontWeight={700}>
+                                    {content.quantity}
+                                  </Typography>
+                                </Box>
+                              ))}
+                            </Stack>
+                          ) : (
+                            <Alert severity="warning" sx={{ mt: 0.75 }}>
+                              Exact carton allocation is unavailable. Packing-list generation is blocked so ClawPilot cannot produce an incomplete document.
+                            </Alert>
+                          )}
+                        </Box>
+
+                        <Box sx={{ mt: 1.5 }}>
+                          {artifact ? (
+                            <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1}>
+                              {artifact.contentUrl && (
+                                <Button
+                                  component="a"
+                                  href={artifact.contentUrl}
+                                  download
+                                  size="small"
+                                  variant="outlined"
+                                  startIcon={<OpenInNewRounded />}
+                                >
+                                  Download PDF
+                                </Button>
+                              )}
+                              <Button
+                                size="small"
+                                variant="contained"
+                                startIcon={printing
+                                  ? <CircularProgress size={16} />
+                                  : <PrintRounded />}
+                                disabled={busy || printing || !canExecute || !order.warehouseId}
+                                onClick={() => onPrintPackingSlip(artifact.globalId)}
+                              >
+                                {printing ? 'Queueing' : 'Print packing list'}
+                              </Button>
+                            </Stack>
+                          ) : (
+                            <Tooltip
+                              title={canGenerate
+                                ? 'Create a package-specific PDF without purchasing postage or calling a carrier'
+                                : 'Verify packing and exact package contents before generating this document'}
+                            >
+                              <span>
+                                <Button
+                                  size="small"
+                                  variant="outlined"
+                                  startIcon={generating
+                                    ? <CircularProgress size={16} />
+                                    : <PrintRounded />}
+                                  disabled={busy || generating || !canGenerate}
+                                  onClick={() => onGeneratePackingSlip(item.globalId)}
+                                >
+                                  {generating ? 'Generating' : 'Generate packing list'}
+                                </Button>
+                              </span>
+                            </Tooltip>
+                          )}
+                          <Typography
+                            variant="caption"
+                            color="text.secondary"
+                            display="block"
+                            sx={{ mt: 0.75 }}
+                          >
+                            One document for this physical package only. This action does not rate, purchase, void, or update a carrier.
+                          </Typography>
+                        </Box>
+                      </Box>
+                    )
+                  })}
+                </Stack>
+              ) : (
+                <Typography variant="body2" color="text.secondary">
+                  No package plan has been created.
+                </Typography>
+              )}
             </DetailSection>
 
             <DetailSection title="Carrier rates">
@@ -967,6 +1131,14 @@ export default function OperationsSection({
   const [voidLabelReason, setVoidLabelReason] = useState('Void the sandbox label after validation')
   const [voidLabelIdempotencyKey, setVoidLabelIdempotencyKey] = useState('')
   const [voidingLabel, setVoidingLabel] = useState(false)
+  const [
+    generatingPackingSlipPackageId,
+    setGeneratingPackingSlipPackageId,
+  ] = useState<string | null>(null)
+  const [
+    printingPackingSlipArtifactId,
+    setPrintingPackingSlipArtifactId,
+  ] = useState<string | null>(null)
 
   useEffect(() => {
     setView(initialView)
@@ -1174,6 +1346,92 @@ export default function OperationsSection({
       setError(caught instanceof Error ? caught.message : 'Packages could not be verified')
     } finally {
       setVerifyingPack(false)
+    }
+  }
+
+  const generatePackingSlip = async (packageGlobalId: string) => {
+    if (!detail || generatingPackingSlipPackageId) return
+    setGeneratingPackingSlipPackageId(packageGlobalId)
+    setError('')
+    setNotice('')
+    try {
+      const response = await fetch('/api/operations', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': (
+            `operations-package-packing-list:${detail.globalId}:${packageGlobalId}:${detail.rowVersion}`
+          ),
+        },
+        body: JSON.stringify({
+          action: 'generate-packing-slip',
+          orderGlobalId: detail.globalId,
+          packageGlobalId,
+          expectedRowVersion: detail.rowVersion,
+        }),
+      })
+      const payload = await response.json() as OperationsPayload
+      if (
+        !response.ok
+        || !payload.result
+        || !('packingSlipArtifactGlobalId' in payload.result)
+        || !('packageGlobalId' in payload.result)
+      ) {
+        throw new Error(payload.error || 'Package packing list could not be generated')
+      }
+      const result = payload.result
+      setNotice(
+        `Packing list ${result.packingSlipArtifactGlobalId} was generated for package ${result.packageNumber}. No carrier action was performed.`,
+      )
+      await loadWorkspace(result.orderGlobalId)
+    } catch (caught) {
+      setError(
+        caught instanceof Error
+          ? caught.message
+          : 'Package packing list could not be generated',
+      )
+    } finally {
+      setGeneratingPackingSlipPackageId(null)
+    }
+  }
+
+  const printPackingSlip = async (artifactGlobalId: string) => {
+    if (!detail?.warehouseId || printingPackingSlipArtifactId) return
+    setPrintingPackingSlipArtifactId(artifactGlobalId)
+    setError('')
+    setNotice('')
+    try {
+      const response = await fetch('/api/operations/print-jobs', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': `operations-package-packing-list-print:${artifactGlobalId}`,
+        },
+        body: JSON.stringify({
+          action: 'enqueue-packing-slip-artifact',
+          warehouseId: detail.warehouseId,
+          sourceArtifactGlobalId: artifactGlobalId,
+        }),
+      })
+      const payload = await response.json() as {
+        ok?: boolean
+        error?: string
+        job?: { globalId?: string }
+      }
+      if (!response.ok || !payload.job?.globalId) {
+        throw new Error(payload.error || 'Packing list could not be queued for printing')
+      }
+      setNotice(
+        `Packing list ${artifactGlobalId} was queued as print job ${payload.job.globalId}.`,
+      )
+    } catch (caught) {
+      setError(
+        caught instanceof Error
+          ? caught.message
+          : 'Packing list could not be queued for printing',
+      )
+    } finally {
+      setPrintingPackingSlipArtifactId(null)
     }
   }
 
@@ -1450,6 +1708,8 @@ export default function OperationsSection({
         ? 'Inbound receiving'
       : view === 'warehouses'
         ? 'Warehouse network'
+      : view === 'packaging-materials'
+        ? 'Packaging materials'
       : 'Order Workbench'
   const subheading = view === 'carrier-invoices'
     ? 'Import carrier bills and preserve account, shipment-match, and actual-cost evidence'
@@ -1463,6 +1723,8 @@ export default function OperationsSection({
         ? 'Expected receipts, inspection, directed putaway, and inventory ledger posting'
       : view === 'warehouses'
         ? 'Facilities, inbound staging, storage bins, fulfillment locations, and returns'
+      : view === 'packaging-materials'
+        ? 'Cartons, mailers, warehouse stock, reorder readiness, and optimizer evidence'
       : `Distributed fulfillment${workspace ? ` · CRM: ${workspace.dataPipeline.name}` : ''}`
 
   return (
@@ -1600,6 +1862,7 @@ export default function OperationsSection({
               label={`Receiving${workspace ? ` (${workspace.inboundReceipts?.length || 0})` : ''}`}
             />
             <Tab value="warehouses" icon={<WarehouseRounded fontSize="small" />} iconPosition="start" label="Warehouses" />
+            <Tab value="packaging-materials" icon={<Inventory2Rounded fontSize="small" />} iconPosition="start" label="Packaging materials" />
             <Tab value="carrier-invoices" label="Carrier invoicing" />
             <Tab value="gl-coding" label="Shipment pricing & GL" />
             <Tab value="printing" icon={<PrintRounded fontSize="small" />} iconPosition="start" label="Printing" />
@@ -1666,6 +1929,8 @@ export default function OperationsSection({
             onRefresh={() => loadWorkspace()}
             onNavigate={(next) => setView(next)}
           />
+        ) : view === 'packaging-materials' ? (
+          <PackagingMaterialsPanel />
         ) : view === 'carrier-invoices' ? (
           <GlCodingPanel mode="carrier-invoices" />
         ) : view === 'gl-coding' ? (
@@ -1806,14 +2071,24 @@ export default function OperationsSection({
           || confirmingShipment
           || creatingLabel
           || voidingLabel
+          || Boolean(generatingPackingSlipPackageId)
+          || Boolean(printingPackingSlipArtifactId)
         }
         onClose={closeDrawer}
         onRelease={openRelease}
         onConfirmPicks={openConfirmPicks}
         onVerifyPack={openVerifyPack}
+        onGeneratePackingSlip={(packageGlobalId) => {
+          void generatePackingSlip(packageGlobalId)
+        }}
+        onPrintPackingSlip={(artifactGlobalId) => {
+          void printPackingSlip(artifactGlobalId)
+        }}
         onConfirmShipment={openConfirmShipment}
         onCreateSandboxLabel={openCreateLabel}
         onVoidSandboxLabel={openVoidLabel}
+        generatingPackingSlipPackageId={generatingPackingSlipPackageId}
+        printingPackingSlipArtifactId={printingPackingSlipArtifactId}
       />
       <ExceptionDetailDrawer
         exception={selectedException}

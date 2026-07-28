@@ -11,6 +11,9 @@ import {
   query,
   withTransaction,
 } from '@/lib/persistence/postgres'
+import {
+  ensureAutomaticCommerceCatalogIntakeWithClient,
+} from '@/lib/persistence/commerceCatalogSync'
 
 type TimestampValue = string | Date
 
@@ -813,6 +816,12 @@ export async function writeCommerceCredentialInPostgres(input: {
         [input.organizationId, account.id, resource],
       )
     }
+    const productCatalogIntake =
+      await ensureAutomaticCommerceCatalogIntakeWithClient(client, {
+        organizationId: input.organizationId,
+        integrationAccountId: account.id,
+        actorEmail: input.actorEmail,
+      })
     await auditCommerce(client, {
       actorEmail: input.actorEmail,
       organizationId: input.organizationId,
@@ -826,6 +835,15 @@ export async function writeCommerceCredentialInPostgres(input: {
         credentialVersion,
         externalAccountId: input.externalAccountId,
         authMode: input.authMode,
+        productCatalogIntake: {
+          eligible: productCatalogIntake.eligible,
+          initialized: productCatalogIntake.initialized,
+          paused: productCatalogIntake.paused,
+          waitingForProductTarget:
+            productCatalogIntake.waitingForProductTarget,
+          policyRevision: productCatalogIntake.policyRevision,
+          queued: productCatalogIntake.queued,
+        },
       },
     })
   })
@@ -910,6 +928,29 @@ export async function markCommerceCredentialVerificationInPostgres(input: {
         input.credentialVersion,
       ],
     )
+    const currentAccount = (
+      await client.query<{ id: string }>(
+        `SELECT id::text
+         FROM operations_integration_accounts
+         WHERE organization_id = $1::uuid
+           AND global_id = $2
+           AND integration_type = 'commerce'
+           AND commerce_credential_generation = $3
+         LIMIT 1`,
+        [
+          input.organizationId,
+          input.accountGlobalId,
+          input.credentialVersion,
+        ],
+      )
+    ).rows[0]
+    if (currentAccount) {
+      await ensureAutomaticCommerceCatalogIntakeWithClient(client, {
+        organizationId: input.organizationId,
+        integrationAccountId: currentAccount.id,
+        actorEmail: input.actorEmail,
+      })
+    }
     await auditCommerce(client, {
       actorEmail: input.actorEmail,
       organizationId: input.organizationId,
@@ -1039,6 +1080,24 @@ export async function disconnectCommerceCredentialInPostgres(input: {
         [input.organizationId, row.id],
       )
     }
+    await client.query(
+      `UPDATE operations_commerce_catalog_sync_jobs
+       SET status = CASE
+             WHEN status = 'processing' THEN status
+             ELSE 'cancelled'
+           END,
+           cancel_requested = true,
+           completed_at = CASE
+             WHEN status = 'processing' THEN completed_at
+             ELSE now()
+           END,
+           last_error_code = 'COMMERCE_CATALOG_SYNC_CONNECTION_REMOVED',
+           updated_at = now()
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND status IN ('pending', 'processing', 'failed')`,
+      [input.organizationId, row.id],
+    )
     await client.query(
       `DELETE FROM operations_commerce_credentials
        WHERE organization_id = $1::uuid

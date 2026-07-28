@@ -193,8 +193,19 @@ export function cartonizeSinglePackage(lines: CommerceOrderLineInput[]): Package
     result.width = Math.max(result.width, Math.max(1, integer(line.dimensionsMm.width, 100)))
     result.height += Math.max(1, integer(line.dimensionsMm.height, 100)) * packageQuantity
     result.ids.push(line.externalLineId)
+    result.contents.push({
+      lineExternalId: line.externalLineId,
+      quantity,
+    })
     return result
-  }, { weight: 0, length: 1, width: 1, height: 0, ids: [] as string[] })
+  }, {
+    weight: 0,
+    length: 1,
+    width: 1,
+    height: 0,
+    ids: [] as string[],
+    contents: [] as PackagePlan['contents'],
+  })
 
   return [{
     packageNumber: 1,
@@ -205,6 +216,7 @@ export function cartonizeSinglePackage(lines: CommerceOrderLineInput[]): Package
     },
     weightGrams: Math.ceil(aggregate.weight),
     lineExternalIds: aggregate.ids,
+    contents: aggregate.contents,
   }]
 }
 

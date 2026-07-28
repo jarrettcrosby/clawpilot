@@ -15,9 +15,11 @@ import {
   listFaireProducts,
 } from '@/lib/integrations/faireCommerceClient'
 import {
+  FAIRE_COMMERCE_NORMALIZER_VERSION,
   normalizeFaireCommerce,
 } from '@/lib/integrations/faireCommerceNormalizer'
 import {
+  SHOPIFY_COMMERCE_NORMALIZER_VERSION,
   normalizeShopifyCommerce,
 } from '@/lib/integrations/shopifyCommerceNormalizer'
 import {
@@ -37,6 +39,10 @@ import {
   type CommerceRuntimeCredentialRecord,
 } from '@/lib/persistence/commerceIntegrations'
 import {
+  readCommerceOrderReconciliationStateInPostgres,
+} from '@/lib/persistence/commerceOrderReconciliation'
+import {
+  autoCreateCommerceProductsForRunInPostgres,
   captureCommerceIntakeProviderReadInPostgres,
   confirmCommerceCandidateAddressInPostgres,
   excludeCommerceIntakeRejectionInPostgres,
@@ -56,6 +62,7 @@ import {
   resolveCommerceProductCandidateInPostgres,
   reserveCommerceIntakeProviderReadInPostgres,
   stageCommerceNormalizationEnvelopeInPostgres,
+  updateCommerceProductIntakePolicyInPostgres,
   validateCommerceCandidateInPostgres,
   type CommerceIntakeReadIntentAction,
   type CommerceIntakeReadIntentTarget,
@@ -371,6 +378,7 @@ type IntakeCommandAction =
   | 'resolve-delivery'
   | 'resolve-package'
   | 'resolve-product'
+  | 'set-product-intake-policy'
   | 'validate'
 
 export function commerceIntakeRuntimeAvailable() {
@@ -561,6 +569,7 @@ function action(value: unknown): IntakeCommandAction {
     'resolve-delivery',
     'resolve-package',
     'resolve-product',
+    'set-product-intake-policy',
     'validate',
   ]
   if (!allowed.includes(result)) {
@@ -783,7 +792,11 @@ function faireCollection(value: unknown, key: 'orders' | 'products') {
   return collection.map((entry) => providerRecord(entry, `Faire ${key}`))
 }
 
-function nextFaireCursor(value: unknown, label: string) {
+export function nextFaireCursor(
+  value: unknown,
+  label: string,
+  currentCursor: string | null = null,
+) {
   const page = providerRecord(value, label)
   const paginationValue = page.pagination ?? page.page_info ?? page.pageInfo
   const pagination = (
@@ -794,8 +807,10 @@ function nextFaireCursor(value: unknown, label: string) {
     ? paginationValue as Record<string, unknown>
     : {}
   const raw = (
-    page.next_cursor
+    page.cursor
+    ?? page.next_cursor
     ?? page.nextCursor
+    ?? pagination.cursor
     ?? pagination.next_cursor
     ?? pagination.nextCursor
   )
@@ -812,6 +827,13 @@ function nextFaireCursor(value: unknown, label: string) {
   if (!cursor || cursor.length > 4_096) {
     throw new CommerceIntegrationRequestError(
       `${label} did not provide the next page cursor`,
+      502,
+      'COMMERCE_INTAKE_PAGINATION_INVALID',
+    )
+  }
+  if (currentCursor && cursor === currentCursor) {
+    throw new CommerceIntegrationRequestError(
+      `${label} repeated the current page cursor`,
       502,
       'COMMERCE_INTAKE_PAGINATION_INVALID',
     )
@@ -842,10 +864,12 @@ function completedFairePage(
     hasNextPage: false,
     next_cursor: null,
     nextCursor: null,
+    cursor: null,
     pagination: {
       ...pagination,
       has_more: false,
       hasNextPage: false,
+      cursor: null,
       next_cursor: null,
       nextCursor: null,
     },
@@ -875,8 +899,10 @@ function providerConnectionHasMore(value: unknown) {
     || pagination.has_more === true
     || pagination.hasNextPage === true
     || Boolean(
-      connection.next_cursor
+      connection.cursor
+      ?? connection.next_cursor
       ?? connection.nextCursor
+      ?? pagination.cursor
       ?? pagination.next_cursor
       ?? pagination.nextCursor,
     )
@@ -1031,12 +1057,9 @@ async function shopifyEnvelope(
     clientId: credential.clientId,
     clientSecret: credential.clientSecret,
   })
-  if (
-    !grant.grantedScopes.includes('read_orders')
-    || !grant.grantedScopes.includes('read_all_orders')
-  ) {
+  if (!grant.grantedScopes.includes('read_orders')) {
     throw new CommerceIntegrationRequestError(
-      'Shopify must grant read_orders and read_all_orders for complete operational intake',
+      'Shopify must grant read_orders for current operational intake',
       409,
       'COMMERCE_INTAKE_SCOPE_REQUIRED',
     )
@@ -1054,6 +1077,12 @@ async function shopifyEnvelope(
   }
   const providerCredential = { shopDomain, accessToken: grant.accessToken }
   const includeCustomerIdentity = grant.grantedScopes.includes('read_customers')
+  // `read_orders` grants Shopify's current-order window. Keep unattended
+  // reads explicitly inside that window; historical backfill is separate and
+  // may require `read_all_orders` when introduced as its own workflow.
+  const currentOrderWindow = page.windowStart
+    ? ` updated_at:>='${page.windowStart}'`
+    : ''
   const data = targetExternalOrderId
     ? await shopifyAdminGraphql<Record<string, unknown>>(
         providerCredential,
@@ -1071,7 +1100,7 @@ async function shopifyEnvelope(
           operationName: 'ClawPilotCommerceOrders',
           variables: {
             after: page.orderCursor,
-            query: `test:false status:open updated_at:<='${page.windowEnd}'`,
+            query: `test:false status:open${currentOrderWindow} updated_at:<='${page.windowEnd}'`,
           },
         },
         { timeoutMs: SHOPIFY_GRAPHQL_TIMEOUT_MS },
@@ -1139,6 +1168,7 @@ async function shopifyEnvelope(
 async function shopifyProductEnvelope(
   runtime: CommerceRuntimeCredentialRecord,
   page: OperationalPageRequest,
+  hydrateInventory = true,
 ): Promise<OperationalPageResult> {
   const credential = decryptCommerceCredential(
     runtime.encrypted,
@@ -1181,7 +1211,8 @@ async function shopifyProductEnvelope(
     },
     {
       query: shopifyProductVariantsQuery(
-        grant.grantedScopes.includes('read_inventory'),
+        hydrateInventory
+        && grant.grantedScopes.includes('read_inventory'),
       ),
       operationName: 'ClawPilotCommerceProductVariants',
       variables: {
@@ -1311,7 +1342,7 @@ async function faireEnvelope(
   const orderNodes = faireCollection(providerPage, 'orders')
   const nextOrderCursor = targetExternalOrderId
     ? null
-    : nextFaireCursor(providerPage, 'Faire orders')
+    : nextFaireCursor(providerPage, 'Faire orders', page.orderCursor)
   const bounded = boundedFaireOrders(orderNodes)
   const normalized = envelopeWith(normalizeFaireCommerce({
     brand: { id: runtime.externalAccountId },
@@ -1345,6 +1376,7 @@ async function faireEnvelope(
 async function faireProductEnvelope(
   runtime: CommerceRuntimeCredentialRecord,
   page: OperationalPageRequest,
+  hydrateInventory = true,
 ): Promise<OperationalPageResult> {
   const credential = decryptCommerceCredential(
     runtime.encrypted,
@@ -1382,7 +1414,11 @@ async function faireProductEnvelope(
     limit: FAIRE_PRODUCT_PAGE_SIZE,
   })
   const productNodes = faireCollection(providerPage, 'products')
-  const nextProductCursor = nextFaireCursor(providerPage, 'Faire products')
+  const nextProductCursor = nextFaireCursor(
+    providerPage,
+    'Faire products',
+    page.orderCursor,
+  )
   const bounded = boundedFaireProducts(productNodes)
   const context = normalizationContext(runtime, 'stale')
   const normalizedSource = {
@@ -1396,6 +1432,8 @@ async function faireProductEnvelope(
   }
   const baseNormalized = normalizeFaireCommerce(normalizedSource, context)
   const canReadInventory = (
+    hydrateInventory
+    &&
     credential.authMode === 'faire_oauth'
     && credential.scopes.includes('READ_INVENTORIES')
   )
@@ -1458,11 +1496,20 @@ async function fetchEnvelope(
   runtime: CommerceRuntimeCredentialRecord,
   page: OperationalPageRequest,
   targetExternalOrderId: string | null = null,
+  options: { hydrateProductInventory?: boolean } = {},
 ): Promise<OperationalPageResult> {
   return page.resource === 'products'
     ? runtime.provider === 'shopify'
-      ? shopifyProductEnvelope(runtime, page)
-      : faireProductEnvelope(runtime, page)
+      ? shopifyProductEnvelope(
+          runtime,
+          page,
+          options.hydrateProductInventory !== false,
+        )
+      : faireProductEnvelope(
+          runtime,
+          page,
+          options.hydrateProductInventory !== false,
+        )
     : runtime.provider === 'shopify'
       ? shopifyEnvelope(runtime, page, targetExternalOrderId)
       : faireEnvelope(runtime, page, targetExternalOrderId)
@@ -1473,21 +1520,144 @@ export async function getCommerceIntake(input: {
   accountGlobalId: unknown
 }) {
   assertCommerceIntakeRuntime()
-  const runtime = await runtimeFor(input)
-  return readCommerceIntakeStateFromPostgres({
-    organizationId: runtime.organizationId,
-    accountGlobalId: runtime.globalId,
-  })
+  const organizationId = normalizeCommerceOrganizationId(input.organizationId)
+  const accountGlobalId = normalizeCommerceAccountGlobalId(
+    input.accountGlobalId,
+  )
+  const [intake, orderReconciliation] = await Promise.all([
+    readCommerceIntakeStateFromPostgres({
+      organizationId,
+      accountGlobalId,
+    }),
+    readCommerceOrderReconciliationStateInPostgres({
+      organizationId,
+      accountGlobalId,
+    }),
+  ])
+  return {
+    ...intake,
+    orderReconciliation,
+  }
 }
 
-export async function executeCommerceIntakeCommand(input: {
+async function withAutomaticProductCreation(
+  command: Record<string, unknown>,
+  input: {
+    runtime: CommerceRuntimeCredentialRecord
+    actorEmail: string
+    action: IntakeCommandAction
+  },
+) {
+  if (
+    input.action !== 'fetch-products'
+    && input.action !== 'fetch-next-products'
+  ) return command
+  const runGlobalId = typeof command.runGlobalId === 'string'
+    ? command.runGlobalId
+    : ''
+  if (!RUN_PATTERN.test(runGlobalId)) {
+    return {
+      ...command,
+      automaticProductCreation: {
+        attempted: 0,
+        failed: true,
+        errorCode: 'COMMERCE_PRODUCT_AUTO_CREATE_RUN_REQUIRED',
+        providerWrites: 0,
+        syncCursorAdvanced: false,
+      },
+    }
+  }
+  try {
+    return {
+      ...command,
+      automaticProductCreation:
+        await autoCreateCommerceProductsForRunInPostgres({
+          runtime: input.runtime,
+          actorEmail: input.actorEmail,
+          runGlobalId,
+        }),
+    }
+  } catch {
+    // Staging and its read evidence are already durable. A retry of the same
+    // fetch command re-enters this sweep through the stage-replay path.
+    return {
+      ...command,
+      automaticProductCreation: {
+        attempted: 0,
+        failed: true,
+        errorCode: 'COMMERCE_PRODUCT_AUTO_CREATE_SWEEP_FAILED',
+        providerWrites: 0,
+        syncCursorAdvanced: false,
+      },
+    }
+  }
+}
+
+type ExecuteCommerceIntakeInput = {
   organizationId: unknown
   actorEmail: string
   body: Record<string, unknown>
-}) {
+}
+
+type CommerceIntakeExecutionOptions = {
+  includeIntakeState: boolean
+  hydrateProductInventory: boolean
+}
+
+async function executeCommerceIntakeCommandInternal(
+  input: ExecuteCommerceIntakeInput,
+  options: CommerceIntakeExecutionOptions,
+) {
   assertCommerceIntakeRuntime()
   const commandAction = action(input.body.action)
   const key = idempotencyKey(input.body.idempotencyKey)
+  if (commandAction === 'set-product-intake-policy') {
+    const organizationId = normalizeCommerceOrganizationId(
+      input.organizationId,
+    )
+    const accountGlobalId = normalizeCommerceAccountGlobalId(
+      input.body.accountGlobalId,
+    )
+    const unmatchedAction = text(
+      input.body.unmatchedAction,
+      'Unmatched product action',
+      20,
+    )
+    if (!['review', 'auto_create'].includes(unmatchedAction)) {
+      throw new CommerceIntegrationRequestError(
+        'Unmatched product action must be review or auto-create',
+        400,
+        'COMMERCE_INTAKE_COMMAND_INVALID',
+      )
+    }
+    if (
+      unmatchedAction === 'auto_create'
+      && input.body.confirmAutoCreateProducts !== true
+    ) {
+      throw new CommerceIntegrationRequestError(
+        'Confirm automatic creation of new ClawPilot products',
+        400,
+        'COMMERCE_PRODUCT_AUTO_CREATE_CONFIRMATION_REQUIRED',
+      )
+    }
+    const command = await updateCommerceProductIntakePolicyInPostgres({
+      organizationId,
+      accountGlobalId,
+      actorEmail: input.actorEmail,
+      idempotencyKey: key,
+      expectedPolicyRevision: rowVersion(
+        input.body.expectedPolicyRevision,
+      ),
+      unmatchedAction: unmatchedAction as 'review' | 'auto_create',
+      confirmAutoCreateProducts:
+        input.body.confirmAutoCreateProducts === true,
+    })
+    const intake = await readCommerceIntakeStateFromPostgres({
+      organizationId,
+      accountGlobalId,
+    }).catch(() => null)
+    return { command, intake }
+  }
   const runtime = await runtimeFor({
     organizationId: input.organizationId,
     accountGlobalId: input.body.accountGlobalId,
@@ -1570,12 +1740,22 @@ export async function executeCommerceIntakeCommand(input: {
       target: replayTarget,
     })
     if (replay) {
+      const command = await withAutomaticProductCreation(
+        replay as Record<string, unknown>,
+        {
+          runtime,
+          actorEmail: input.actorEmail,
+          action: commandAction,
+        },
+      )
       return {
-        command: replay,
-        intake: await readCommerceIntakeStateFromPostgres({
-          organizationId: runtime.organizationId,
-          accountGlobalId: runtime.globalId,
-        }),
+        command,
+        intake: options.includeIntakeState
+          ? await readCommerceIntakeStateFromPostgres({
+              organizationId: runtime.organizationId,
+              accountGlobalId: runtime.globalId,
+            })
+          : null,
       }
     }
     const refreshTarget = refreshCandidateGlobalId
@@ -1705,8 +1885,9 @@ export async function executeCommerceIntakeCommand(input: {
       providerWrites: 0,
       syncCursorAdvanced: false,
     }
-    const adapterVersion =
-      `commerce-normalization-${runtime.provider}-v1`
+    const adapterVersion = runtime.provider === 'shopify'
+      ? SHOPIFY_COMMERCE_NORMALIZER_VERSION
+      : FAIRE_COMMERCE_NORMALIZER_VERSION
     const reservation = await reserveCommerceIntakeProviderReadInPostgres({
       ...shared,
       readIntentId,
@@ -1728,6 +1909,9 @@ export async function executeCommerceIntakeCommand(input: {
           runtime,
           page,
           targetExternalOrderId,
+          {
+            hydrateProductInventory: options.hydrateProductInventory,
+          },
         )
         const normalizedVariants = result.envelope.products.reduce(
           (count, product) => count + product.variants.length,
@@ -1789,12 +1973,22 @@ export async function executeCommerceIntakeCommand(input: {
       readIntentId,
       capturedResponseHash: captured.responseHash,
     })
+    const commandWithAutomaticCreation = await withAutomaticProductCreation(
+      command as Record<string, unknown>,
+      {
+        runtime,
+        actorEmail: input.actorEmail,
+        action: commandAction,
+      },
+    )
     return {
-      command,
-      intake: await readCommerceIntakeStateFromPostgres({
-        organizationId: runtime.organizationId,
-        accountGlobalId: runtime.globalId,
-      }),
+      command: commandWithAutomaticCreation,
+      intake: options.includeIntakeState
+        ? await readCommerceIntakeStateFromPostgres({
+            organizationId: runtime.organizationId,
+            accountGlobalId: runtime.globalId,
+          })
+        : null,
     }
   }
 
@@ -2076,4 +2270,75 @@ export async function executeCommerceIntakeCommand(input: {
       accountGlobalId: runtime.globalId,
     }),
   }
+}
+
+export async function executeCommerceIntakeCommand(
+  input: ExecuteCommerceIntakeInput,
+) {
+  return executeCommerceIntakeCommandInternal(input, {
+    includeIntakeState: true,
+    hydrateProductInventory: true,
+  })
+}
+
+export async function executeCommerceCatalogProductPage(input: {
+  organizationId: string
+  accountGlobalId: string
+  actorEmail: string
+  idempotencyKey: string
+  continuationRunGlobalId: string | null
+}) {
+  return executeCommerceIntakeCommandInternal({
+    organizationId: input.organizationId,
+    actorEmail: input.actorEmail,
+    body: {
+      action: input.continuationRunGlobalId
+        ? 'fetch-next-products'
+        : 'fetch-products',
+      accountGlobalId: input.accountGlobalId,
+      idempotencyKey: input.idempotencyKey,
+      confirmReadOnly: true,
+      ...(input.continuationRunGlobalId
+        ? { continuationRunGlobalId: input.continuationRunGlobalId }
+        : {}),
+    },
+  }, {
+    // Background catalog work must remain O(page), not O(retained catalog).
+    // The browser command path still returns the complete intake state.
+    includeIntakeState: false,
+    // Product reconciliation deliberately does not query or stage inventory.
+    hydrateProductInventory: false,
+  })
+}
+
+/**
+ * Worker-only order page execution. This retains the encrypted continuation
+ * contract while avoiding the O(retained intake state) browser response. The
+ * command can only stage held candidates and normalization rejections.
+ */
+export async function executeCommerceOrderPage(input: {
+  organizationId: string
+  accountGlobalId: string
+  actorEmail: string
+  idempotencyKey: string
+  continuationRunGlobalId: string | null
+}) {
+  return executeCommerceIntakeCommandInternal({
+    organizationId: input.organizationId,
+    actorEmail: input.actorEmail,
+    body: {
+      action: input.continuationRunGlobalId ? 'fetch-next' : 'fetch',
+      accountGlobalId: input.accountGlobalId,
+      idempotencyKey: input.idempotencyKey,
+      confirmReadOnly: true,
+      ...(input.continuationRunGlobalId
+        ? { continuationRunGlobalId: input.continuationRunGlobalId }
+        : {}),
+    },
+  }, {
+    // Each provider page is normalized and durably staged independently.
+    // Do not return the retained candidate/rejection state to the poller.
+    includeIntakeState: false,
+    hydrateProductInventory: false,
+  })
 }

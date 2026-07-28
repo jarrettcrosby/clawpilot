@@ -13,6 +13,10 @@ const agentIntervalMs = Math.max(1000, Math.min(Number(process.env.AGENT_DISPATC
 const researchIntervalMs = Math.max(5000, Math.min(Number(process.env.AGENT_RESEARCH_POLL_MS || 10000), 300000))
 const toastIntervalMs = Math.max(5000, Math.min(Number(process.env.TOAST_SYNC_POLL_MS || 15000), 300000))
 const quickBooksIntervalMs = Math.max(5000, Math.min(Number(process.env.QUICKBOOKS_SYNC_POLL_MS || 30000), 300000))
+const commerceCatalogIntervalMs = Math.max(5000, Math.min(Number(process.env.COMMERCE_CATALOG_SYNC_POLL_MS || 10000), 300000))
+const commerceOrderReconciliationIntervalMs = Math.max(5000, Math.min(Number(process.env.COMMERCE_ORDER_RECONCILIATION_POLL_MS || 60000), 300000))
+const commerceCatalogEnabled = String(process.env.CLAWPILOT_COMMERCE_INTAKE_ENABLED || '0') === '1'
+const commerceOrderReconciliationEnabled = commerceCatalogEnabled
 const repositoryIntervalMs = Math.max(1000, Math.min(Number(process.env.REPOSITORY_RUNNER_POLL_MS || 5000), 300000))
 const repositoryRunnerEnabled = String(process.env.CLAWPILOT_REPOSITORY_RUNNER_ENABLED || '0') === '1'
 const crmIntegrationIntervalMs = Math.max(5000, Math.min(Number(process.env.CRM_INTEGRATION_POLL_MS || 30000), 300000))
@@ -67,6 +71,12 @@ await Promise.all([
   runLoop('agent-research', '/api/agents/research/process', 1, researchIntervalMs),
   runLoop('toast-sync', '/api/integrations/toast/process', 4, toastIntervalMs),
   runLoop('quickbooks-sync', '/api/integrations/quickbooks/process', 2, quickBooksIntervalMs),
+  ...(commerceCatalogEnabled
+    ? [runLoop('commerce-catalog', '/api/integrations/commerce/catalog/process', 2, commerceCatalogIntervalMs)]
+    : []),
+  ...(commerceOrderReconciliationEnabled
+    ? [runLoop('commerce-order-reconciliation', '/api/integrations/commerce/orders/process', 1, commerceOrderReconciliationIntervalMs)]
+    : []),
   ...(repositoryRunnerEnabled
     ? [runLoop('repository-runner', '/api/agents/repository-runs/process', 1, repositoryIntervalMs)]
     : []),
