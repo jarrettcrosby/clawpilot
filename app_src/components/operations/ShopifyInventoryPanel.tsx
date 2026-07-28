@@ -24,9 +24,18 @@ import TableHead from '@mui/material/TableHead'
 import TablePagination from '@mui/material/TablePagination'
 import TableRow from '@mui/material/TableRow'
 import TextField from '@mui/material/TextField'
+import ToggleButton from '@mui/material/ToggleButton'
+import ToggleButtonGroup from '@mui/material/ToggleButtonGroup'
 import Typography from '@mui/material/Typography'
 import Inventory2Rounded from '@mui/icons-material/Inventory2Rounded'
 import RefreshRounded from '@mui/icons-material/RefreshRounded'
+import { useMeasurementSystem } from '@/components/measurements/MeasurementSystemProvider'
+import {
+  formatDimensionsMm,
+  formatGrams,
+  formatMillimeters,
+  type MeasurementSystem,
+} from '@/lib/measurements'
 
 const SHOPIFY_INVENTORY_STATES = [
   ['available', 'Available'],
@@ -244,7 +253,10 @@ function formatDate(value: string | null | undefined) {
     : parsed.toLocaleString()
 }
 
-function levelDetails(level: InventoryLevel) {
+function levelDetails(
+  level: InventoryLevel,
+  measurementSystem: MeasurementSystem,
+) {
   const variant = record(level.product.variant)
   const product = record(variant.product)
   const inventoryItem = record(level.product.inventoryItem)
@@ -287,9 +299,11 @@ function levelDetails(level: InventoryLevel) {
       const millimeters = number(evidence.millimeters)
       return millimeters === null
         ? []
-        : [`${owner} ${axis}: ${formatQuantity(millimeters)} mm (${
-          text(evidence.key)
-        })`]
+        : [
+            `${owner} ${axis}: ${
+              formatMillimeters(millimeters, measurementSystem)
+            }; exact ${formatQuantity(millimeters)} mm (${text(evidence.key)})`,
+          ]
     })
   ))
   return {
@@ -376,8 +390,11 @@ function levelDetails(level: InventoryLevel) {
   }
 }
 
-function productFacts(level: InventoryLevel) {
-  const details = levelDetails(level)
+function productFacts(
+  level: InventoryLevel,
+  measurementSystem: MeasurementSystem,
+) {
+  const details = levelDetails(level, measurementSystem)
   const facts = [
     ['Inventory item ID', details.inventoryItemId],
     ['Inventory item legacy ID', details.inventoryItemLegacyId],
@@ -557,9 +574,18 @@ export default function ShopifyInventoryPanel({
   accountGlobalId: string
   displayName: string
 }) {
+  const {
+    measurementSystem,
+    effectiveSource: measurementPreferenceSource,
+    loading: measurementPreferenceLoading,
+    error: measurementPreferenceError,
+    preferencesWritable,
+    setUserOverride,
+  } = useMeasurementSystem()
   const [inventory, setInventory] = useState<InventoryState | null>(null)
   const [loading, setLoading] = useState(true)
   const [syncing, setSyncing] = useState(false)
+  const [measurementPreferenceBusy, setMeasurementPreferenceBusy] = useState(false)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [search, setSearch] = useState('')
@@ -611,7 +637,7 @@ export default function ShopifyInventoryPanel({
     const needle = search.trim().toLowerCase()
     if (!needle) return inventory?.levels || []
     return (inventory?.levels || []).filter((level) => {
-      const details = levelDetails(level)
+      const details = levelDetails(level, measurementSystem)
       return [
         level.productName,
         level.productGlobalId,
@@ -622,12 +648,34 @@ export default function ShopifyInventoryPanel({
         details.vendor,
       ].some((value) => String(value || '').toLowerCase().includes(needle))
     })
-  }, [inventory?.levels, search])
+  }, [inventory?.levels, measurementSystem, search])
 
   const visibleLevels = filteredLevels.slice(
     page * rowsPerPage,
     page * rowsPerPage + rowsPerPage,
   )
+
+  async function changeMeasurementPreference(next: MeasurementSystem | null) {
+    if (
+      !preferencesWritable
+      || !next
+      || next === measurementSystem
+      || measurementPreferenceBusy
+    ) return
+    setMeasurementPreferenceBusy(true)
+    setError('')
+    try {
+      await setUserOverride(next)
+    } catch (caught) {
+      setError(
+        caught instanceof Error
+          ? caught.message
+          : 'Measurement preference could not be updated.',
+      )
+    } finally {
+      setMeasurementPreferenceBusy(false)
+    }
+  }
 
   async function sync() {
     if (syncing) return
@@ -760,17 +808,56 @@ export default function ShopifyInventoryPanel({
                 source-bound inventory in the selected warehouse.
               </Typography>
             </Box>
-            <Button
-              variant="contained"
-              startIcon={syncing
-                ? <CircularProgress size={16} color="inherit" />
-                : <RefreshRounded />}
-              disabled={loading || syncing}
-              onClick={() => { void sync() }}
-              sx={{ minHeight: 40, flexShrink: 0 }}
+            <Stack
+              direction={{ xs: 'column', sm: 'row' }}
+              alignItems={{ sm: 'center' }}
+              spacing={1}
             >
-              {syncing ? 'Syncing inventory…' : 'Sync inventory'}
-            </Button>
+              <Box>
+                <ToggleButtonGroup
+                  exclusive
+                  size="small"
+                  value={measurementSystem}
+                  onChange={(_event, next: MeasurementSystem | null) => {
+                    void changeMeasurementPreference(next)
+                  }}
+                  disabled={
+                    !preferencesWritable
+                    || measurementPreferenceLoading
+                    || measurementPreferenceBusy
+                  }
+                  aria-label="Shopify inventory measurement system"
+                >
+                  <ToggleButton value="imperial">Imperial</ToggleButton>
+                  <ToggleButton value="metric">Metric</ToggleButton>
+                </ToggleButtonGroup>
+                <Typography
+                  variant="caption"
+                  color="text.secondary"
+                  display="block"
+                  sx={{ mt: 0.5, textAlign: { sm: 'right' } }}
+                >
+                  {measurementPreferenceSource === 'user'
+                    ? 'Your display preference'
+                    : measurementPreferenceSource === 'organization'
+                      ? 'Organization default'
+                      : preferencesWritable
+                        ? 'System default'
+                        : 'System default · no active organization'}
+                </Typography>
+              </Box>
+              <Button
+                variant="contained"
+                startIcon={syncing
+                  ? <CircularProgress size={16} color="inherit" />
+                  : <RefreshRounded />}
+                disabled={loading || syncing}
+                onClick={() => { void sync() }}
+                sx={{ minHeight: 40, flexShrink: 0 }}
+              >
+                {syncing ? 'Syncing inventory…' : 'Sync inventory'}
+              </Button>
+            </Stack>
           </Stack>
 
           <Alert severity="info" icon={<Inventory2Rounded />}>
@@ -781,6 +868,9 @@ export default function ShopifyInventoryPanel({
           </Alert>
 
           {error ? <Alert severity="error">{error}</Alert> : null}
+          {measurementPreferenceError ? (
+            <Alert severity="warning">{measurementPreferenceError}</Alert>
+          ) : null}
           {notice ? <Alert severity="success">{notice}</Alert> : null}
           {enrichmentWarnings.map((warning) => (
             <Alert key={warning} severity="warning">
@@ -996,8 +1086,21 @@ export default function ShopifyInventoryPanel({
                   </TableHead>
                   <TableBody>
                     {visibleLevels.map((level) => {
-                      const { details, facts } = productFacts(level)
+                      const { details, facts } = productFacts(
+                        level,
+                        measurementSystem,
+                      )
                       const dimensions = level.providerDimensionsMm
+                      const completeDimensions = dimensions
+                        && typeof dimensions.length === 'number'
+                        && typeof dimensions.width === 'number'
+                        && typeof dimensions.height === 'number'
+                        ? {
+                            lengthMm: dimensions.length,
+                            widthMm: dimensions.width,
+                            heightMm: dimensions.height,
+                          }
+                        : null
                       const dimensionKeys =
                         dimensions?.sourceKeys?.filter(Boolean) || []
                       return (
@@ -1205,11 +1308,22 @@ export default function ShopifyInventoryPanel({
                           <TableCell sx={{ minWidth: 260, verticalAlign: 'top' }}>
                             <Typography variant="body2">
                               {level.providerWeightGrams !== null
-                                ? `${formatQuantity(
+                                ? formatGrams(
                                   level.providerWeightGrams,
-                                )} g`
+                                  measurementSystem,
+                                )
                                 : 'Weight unavailable'}
                             </Typography>
+                            {level.providerWeightGrams !== null ? (
+                              <Typography
+                                variant="caption"
+                                color="text.secondary"
+                                display="block"
+                              >
+                                Exact Shopify evidence (canonical):{' '}
+                                {formatQuantity(level.providerWeightGrams)} g
+                              </Typography>
+                            ) : null}
                             <Typography
                               variant="caption"
                               color={dimensions
@@ -1217,14 +1331,27 @@ export default function ShopifyInventoryPanel({
                                 : 'warning.main'}
                               display="block"
                             >
-                              {dimensions
-                                ? `${dimensions.length} × ${
-                                  dimensions.width
-                                } × ${dimensions.height} mm`
+                              {completeDimensions
+                                ? formatDimensionsMm(
+                                  completeDimensions,
+                                  measurementSystem,
+                                )
                                 : details.partialDimensions.length
                                   ? 'Complete L × W × H is unavailable'
                                   : 'L × W × H unavailable in Shopify'}
                             </Typography>
+                            {completeDimensions ? (
+                              <Typography
+                                variant="caption"
+                                color="text.secondary"
+                                display="block"
+                              >
+                                Exact Shopify evidence (canonical):{' '}
+                                {formatQuantity(completeDimensions.lengthMm)} ×{' '}
+                                {formatQuantity(completeDimensions.widthMm)} ×{' '}
+                                {formatQuantity(completeDimensions.heightMm)} mm
+                              </Typography>
+                            ) : null}
                             {details.partialDimensions.length ? (
                               <Typography
                                 variant="caption"
@@ -1235,7 +1362,7 @@ export default function ShopifyInventoryPanel({
                                 {details.partialDimensions.join(' · ')}
                               </Typography>
                             ) : null}
-                            {dimensions ? (
+                            {completeDimensions ? (
                               <>
                                 <Typography
                                   variant="caption"

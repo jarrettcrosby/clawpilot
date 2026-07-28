@@ -33,6 +33,14 @@ import { BASE_PIPELINE_WORKFLOW } from '@/lib/pipeline/baseTemplate.mjs'
 import PersonAddRounded from '@mui/icons-material/PersonAddRounded'
 import UploadFileRounded from '@mui/icons-material/UploadFileRounded'
 import Inventory2Rounded from '@mui/icons-material/Inventory2Rounded'
+import { useMeasurementSystem } from '@/components/measurements/MeasurementSystemProvider'
+import {
+  formatDimensionsMm,
+  formatGrams,
+  gramsToDisplayWeight,
+  millimetersToDisplayLength,
+  type MeasurementSystem,
+} from '@/lib/measurements'
 
 export type PipelineCatalogPerson = {
   id: string
@@ -89,7 +97,6 @@ type ImportResult = {
 }
 
 type WorkflowField = 'stage' | 'priority' | 'status' | 'source' | 'loss_reason'
-type MeasurementSystem = 'metric' | 'imperial'
 
 const WORKFLOW_FIELDS: Array<{ key: WorkflowField; label: string; helper: string }> = [
   { key: 'stage', label: 'Stages', helper: 'One pipeline lane per line, in display order.' },
@@ -146,13 +153,11 @@ function displayNumber(value: number) {
 
 function packageDisplayValues(packaging: PipelineCatalogProduct['packaging'], system: MeasurementSystem) {
   if (!packaging) return { length: '', width: '', height: '', weight: '' }
-  const dimensionDivisor = system === 'imperial' ? 25.4 : 10
-  const weightDivisor = system === 'imperial' ? 453.59237 : 1_000
   return {
-    length: displayNumber(packaging.lengthMm / dimensionDivisor),
-    width: displayNumber(packaging.widthMm / dimensionDivisor),
-    height: displayNumber(packaging.heightMm / dimensionDivisor),
-    weight: displayNumber(packaging.weightGrams / weightDivisor),
+    length: displayNumber(millimetersToDisplayLength(packaging.lengthMm, system)),
+    width: displayNumber(millimetersToDisplayLength(packaging.widthMm, system)),
+    height: displayNumber(millimetersToDisplayLength(packaging.heightMm, system)),
+    weight: displayNumber(gramsToDisplayWeight(packaging.weightGrams, system)),
   }
 }
 
@@ -169,11 +174,17 @@ function convertDisplayValue(value: string, from: MeasurementSystem, to: Measure
   return displayNumber(canonical / divisor)
 }
 
-function packageSummary(packaging: NonNullable<PipelineCatalogProduct['packaging']>) {
-  const values = packageDisplayValues(packaging, packaging.measurementSystem)
-  const dimensionUnit = packaging.measurementSystem === 'imperial' ? 'in' : 'cm'
-  const weightUnit = packaging.measurementSystem === 'imperial' ? 'lb' : 'kg'
-  return `${values.length} x ${values.width} x ${values.height} ${dimensionUnit} · ${values.weight} ${weightUnit}`
+function packageSummary(
+  packaging: NonNullable<PipelineCatalogProduct['packaging']>,
+  system: MeasurementSystem,
+) {
+  return `${formatDimensionsMm({
+    lengthMm: packaging.lengthMm,
+    widthMm: packaging.widthMm,
+    heightMm: packaging.heightMm,
+  }, system, { maximumFractionDigits: 3 })} · ${
+    formatGrams(packaging.weightGrams, system, { maximumFractionDigits: 3 })
+  }`
 }
 
 function downloadCsvTemplate(kind: 'people' | 'products') {
@@ -197,6 +208,7 @@ export default function PipelineCatalogDialog({
   onClose: () => void
   onCatalogChange?: (catalog: PipelineCatalogSnapshot) => void
 }) {
+  const { measurementSystem } = useMeasurementSystem()
   const fullScreen = useMediaQuery('(max-width:699.95px), (orientation: landscape) and (max-height: 500px)')
   const [tab, setTab] = useState<'people' | 'products' | 'workflow'>('people')
   const [catalog, setCatalog] = useState<PipelineCatalogSnapshot>({ pipelineId: '', canEdit: false, people: [], products: [] })
@@ -462,7 +474,10 @@ export default function PipelineCatalogDialog({
                 startIcon={tab === 'people' ? <PersonAddRounded /> : <Inventory2Rounded />}
                 onClick={() => {
                   if (tab === 'people') { setPerson(EMPTY_PERSON); setPersonEditorOpen(true) }
-                  else { setProduct(EMPTY_PRODUCT); setProductEditorOpen(true) }
+                  else {
+                    setProduct({ ...EMPTY_PRODUCT, measurementSystem })
+                    setProductEditorOpen(true)
+                  }
                 }}
               >
                 Add {tab === 'people' ? 'person' : 'product'}
@@ -527,8 +542,8 @@ export default function PipelineCatalogDialog({
                           packageType: item.packaging?.packageType || 'each',
                           unitOfMeasure: item.packaging?.unitOfMeasure || 'each',
                           unitsPerPackage: String(item.packaging?.unitsPerPackage || 1),
-                          measurementSystem: item.packaging?.measurementSystem || 'metric',
-                          ...packageDisplayValues(item.packaging, item.packaging?.measurementSystem || 'metric'),
+                          measurementSystem,
+                          ...packageDisplayValues(item.packaging, measurementSystem),
                           packagingActive: item.packaging?.active !== false,
                         })
                         setProductEditorOpen(true)
@@ -543,7 +558,7 @@ export default function PipelineCatalogDialog({
                       item.category,
                       item.price ? `${item.currency || 'USD'} ${Number(item.price).toLocaleString()}` : '',
                       item.packaging
-                        ? packageSummary(item.packaging)
+                        ? packageSummary(item.packaging, measurementSystem)
                         : 'Package data not set',
                     ].filter(Boolean).join(' · ')}
                     primaryTypographyProps={{ component: 'div', fontWeight: 600, sx: { pr: 5, overflowWrap: 'anywhere' } }}

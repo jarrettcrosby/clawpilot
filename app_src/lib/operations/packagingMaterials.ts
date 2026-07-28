@@ -115,7 +115,7 @@ export type StarterPackagingMaterial = Omit<
 export const STARTER_PACKAGING_MATERIALS: readonly StarterPackagingMaterial[] = [
   {
     code: 'STARTER-BOX-06X06X04',
-    name: '6 × 6 × 4 in carton',
+    name: 'Compact starter carton',
     materialType: 'carton',
     innerLengthMm: 152,
     innerWidthMm: 152,
@@ -129,7 +129,7 @@ export const STARTER_PACKAGING_MATERIALS: readonly StarterPackagingMaterial[] = 
   },
   {
     code: 'STARTER-BOX-08X06X04',
-    name: '8 × 6 × 4 in carton',
+    name: 'Small starter carton',
     materialType: 'carton',
     innerLengthMm: 203,
     innerWidthMm: 152,
@@ -143,7 +143,7 @@ export const STARTER_PACKAGING_MATERIALS: readonly StarterPackagingMaterial[] = 
   },
   {
     code: 'STARTER-BOX-10X08X06',
-    name: '10 × 8 × 6 in carton',
+    name: 'Medium starter carton',
     materialType: 'carton',
     innerLengthMm: 254,
     innerWidthMm: 203,
@@ -157,7 +157,7 @@ export const STARTER_PACKAGING_MATERIALS: readonly StarterPackagingMaterial[] = 
   },
   {
     code: 'STARTER-BOX-12X10X08',
-    name: '12 × 10 × 8 in carton',
+    name: 'Large starter carton',
     materialType: 'carton',
     innerLengthMm: 305,
     innerWidthMm: 254,
@@ -171,7 +171,7 @@ export const STARTER_PACKAGING_MATERIALS: readonly StarterPackagingMaterial[] = 
   },
   {
     code: 'STARTER-POLY-10X13',
-    name: '10 × 13 in poly mailer',
+    name: 'Starter poly mailer',
     materialType: 'poly_mailer',
     innerLengthMm: 330,
     innerWidthMm: 254,
@@ -185,7 +185,7 @@ export const STARTER_PACKAGING_MATERIALS: readonly StarterPackagingMaterial[] = 
   },
   {
     code: 'STARTER-PADDED-08X12',
-    name: '8.5 × 12 in padded mailer',
+    name: 'Starter padded mailer',
     materialType: 'padded_mailer',
     innerLengthMm: 305,
     innerWidthMm: 216,

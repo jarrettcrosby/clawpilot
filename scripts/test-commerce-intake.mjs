@@ -636,6 +636,10 @@ assert.equal(
 )
 
 const serviceSource = read('app_src/lib/integrations/commerceIntake.ts')
+includes(serviceSource, [
+  "resolution.identityConflictPolicy === 'provider_qualified'",
+  "identityConflictPolicy:",
+], 'Collision-safe explicit product command parsing')
 const backgroundCatalogPageSource = serviceSource.slice(
   serviceSource.indexOf(
     'export async function executeCommerceCatalogProductPage',
@@ -1020,7 +1024,13 @@ includes(productCandidateResolverSource, [
   'id: preservedAutomaticMapping.id',
   'global_id: preservedAutomaticMapping.global_id',
   'allowReplacement: !input.automatic',
-  'if (input.automatic && localProductSku)',
+  "input.resolution.identityConflictPolicy === 'provider_qualified'",
+  'if (collisionSafeIdentity && localProductSku)',
+  'collisionSafeLocalProductDisplayName(client',
+  'commerce-catalog-local-name:',
+  'namingPolicyVersion: \'commerce-product-display-name-v2\'',
+  'identityConflictPolicy: collisionSafeIdentity',
+  'resolvedName: localProductName',
   'commerce-catalog-local-sku:',
   'lower(btrim(sku)) = lower(btrim($2))',
   'automaticLocalProductSku({',
@@ -1033,6 +1043,10 @@ includes(productCandidateResolverSource, [
   'channelSku: candidate.sku_snapshot || product.sku',
   'automaticLocalSkuOmitted',
 ], 'Automatic exact-mapping preservation')
+const commerceProductNamingModule = loadTypeScriptModule(
+  'app_src/lib/integrations/commerceProductNaming.ts',
+)
+const productIdentityLocks = []
 const automaticProductResolutionModule = loadTypeScriptModule(
   'app_src/lib/persistence/commerceIntake.ts',
   {
@@ -1043,11 +1057,17 @@ const automaticProductResolutionModule = loadTypeScriptModule(
         CommerceIntegrationRequestError: class extends Error {},
       },
       '@/lib/integrations/commerceProductMappingPolicy': {},
+      '@/lib/integrations/commerceProductNaming':
+        commerceProductNamingModule,
       '@/lib/operations/commerceNormalization': {
         commerceCurrencyMinorUnit: () => 2,
       },
       '@/lib/persistence/crm': {},
-      '@/lib/persistence/postgres': {},
+      '@/lib/persistence/postgres': {
+        async acquireTransactionAdvisoryLock(_client, key) {
+          productIdentityLocks.push(key)
+        },
+      },
       '@/lib/persistence/commerceCatalogSync': {},
     },
   },
@@ -1111,6 +1131,90 @@ assert.equal(
   'PROVIDER-SKU',
   'An available provider SKU must remain on the automatic local product',
 )
+const collisionNames =
+  automaticProductResolutionModule.automaticProductDisplayNameCandidates({
+    requestedName: 'Apple Crisp 10lb',
+    provider: 'faire',
+    externalVariantId: 'faire-variant-1',
+  })
+assert.equal(collisionNames[0], 'Apple Crisp 10lb')
+assert.equal(collisionNames[1], 'Apple Crisp 10lb · Faire')
+assert.match(
+  collisionNames[2],
+  /^Apple Crisp 10lb · Faire · [a-f0-9]{12}$/,
+)
+assert.equal(new Set(collisionNames).size, 3)
+function collisionNameClient(occupiedNames) {
+  return {
+    async query(sql, parameters) {
+      assert.match(sql, /FROM crm_products/)
+      assert.match(sql, /lower\(name\) = ANY\(\$2::text\[\]\)/)
+      assert.equal(parameters[0], 'pipeline-test-id')
+      assert.deepEqual(
+        JSON.parse(JSON.stringify(parameters[1])),
+        JSON.parse(JSON.stringify(
+          collisionNames.map((name) => name.toLocaleLowerCase('en-US')),
+        )),
+      )
+      return {
+        rows: occupiedNames.map((name) => ({ name })),
+      }
+    },
+  }
+}
+assert.equal(
+  await automaticProductResolutionModule.collisionSafeLocalProductDisplayName(
+    collisionNameClient([]),
+    {
+      pipelineId: 'pipeline-test-id',
+      requestedName: 'Apple Crisp 10lb',
+      provider: 'faire',
+      externalVariantId: 'faire-variant-1',
+    },
+  ),
+  collisionNames[0],
+  'An available canonical name must remain unchanged',
+)
+assert.equal(
+  await automaticProductResolutionModule.collisionSafeLocalProductDisplayName(
+    collisionNameClient([collisionNames[0]]),
+    {
+      pipelineId: 'pipeline-test-id',
+      requestedName: 'Apple Crisp 10lb',
+      provider: 'faire',
+      externalVariantId: 'faire-variant-1',
+    },
+  ),
+  collisionNames[1],
+  'A duplicate canonical name must use the deterministic provider-qualified name',
+)
+assert.equal(
+  await automaticProductResolutionModule.collisionSafeLocalProductDisplayName(
+    collisionNameClient(collisionNames.slice(0, 2)),
+    {
+      pipelineId: 'pipeline-test-id',
+      requestedName: 'Apple Crisp 10lb',
+      provider: 'faire',
+      externalVariantId: 'faire-variant-1',
+    },
+  ),
+  collisionNames[2],
+  'Repeated provider collisions must use the deterministic variant hash',
+)
+assert.deepEqual(
+  productIdentityLocks,
+  Array(3).fill(
+    'commerce-catalog-local-name:pipeline-test-id:apple crisp 10lb',
+  ),
+  'Manual and automatic collision-safe creates must serialize on the same database identity lock',
+)
+const crmProductIdentityMigration = read(
+  'db/migrations/0045_pipeline_people_products_and_dropdown_catalogs.sql',
+)
+includes(crmProductIdentityMigration, [
+  'idx_crm_products_pipeline_name_unique',
+  'ON crm_products (pipeline_id, lower(name))',
+], 'CRM product-name uniqueness')
 assert.equal(
   automaticProductResolutionModule.automaticProductFailureCode({
     code: '23505',
@@ -1273,6 +1377,7 @@ includes(workflowSource, [
   'bulkCreatableProductCandidates.length === 0',
   "'bulk-create-products'",
   "'bulk-create-product'",
+  "identityConflictPolicy: 'provider_qualified'",
   'Retry all exact orders',
   "'bulk-retry-order-money'",
   "'bulk-retry-rejection'",
@@ -1439,6 +1544,8 @@ const customerIdentityPersistence = loadTypeScriptModule(
         exactProductMappingMutation:
           mappingPolicy.exactProductMappingMutation,
       },
+      '@/lib/integrations/commerceProductNaming':
+        commerceProductNamingModule,
       '@/lib/operations/commerceNormalization': {
         commerceCurrencyMinorUnit() { return 2 },
       },

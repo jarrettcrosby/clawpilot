@@ -11,6 +11,7 @@ import {
 } from '@/lib/integrations/commerceCredentialCrypto'
 import { CommerceIntegrationRequestError } from '@/lib/integrations/commerceIntegrations'
 import { exactProductMappingMutation } from '@/lib/integrations/commerceProductMappingPolicy'
+import { commerceProductDisplayName } from '@/lib/integrations/commerceProductNaming'
 import type { CommerceRuntimeCredentialRecord } from '@/lib/persistence/commerceIntegrations'
 import {
   commerceCurrencyMinorUnit,
@@ -6042,6 +6043,7 @@ export async function resolveCommerceProductCandidateInPostgres(input: {
         sku: string | null
         unitPriceMinor: number
         currency: string
+        identityConflictPolicy?: 'provider_qualified'
       }
     | {
         mode: 'exclude'
@@ -6396,8 +6398,19 @@ export async function resolveCommerceProductCandidateInPostgres(input: {
           sku: existing.sku,
         }
       } else {
+        const collisionSafeIdentity = Boolean(input.automatic)
+          || input.resolution.identityConflictPolicy === 'provider_qualified'
         let localProductSku = input.resolution.sku?.trim() || null
-        if (input.automatic && localProductSku) {
+        let localProductName = input.resolution.name.trim()
+        if (collisionSafeIdentity) {
+          localProductName = await collisionSafeLocalProductDisplayName(client, {
+            pipelineId: candidate.pipeline_id,
+            requestedName: localProductName,
+            provider: candidate.provider,
+            externalVariantId: candidate.external_variant_id,
+          })
+        }
+        if (collisionSafeIdentity && localProductSku) {
           await acquireTransactionAdvisoryLock(
             client,
             `commerce-catalog-local-sku:${candidate.pipeline_id}:${
@@ -6440,10 +6453,17 @@ export async function resolveCommerceProductCandidateInPostgres(input: {
             providerSnapshot: {
               productTitle: candidate.product_title_snapshot,
               variantTitle: candidate.variant_title_snapshot,
+              selectedOptions: candidate.normalized_options,
               sku: candidate.sku_snapshot,
               barcode: candidate.barcode_snapshot,
             },
             localCatalog: {
+              requestedName: input.resolution.name.trim(),
+              resolvedName: localProductName,
+              namingPolicyVersion: 'commerce-product-display-name-v2',
+              identityConflictPolicy: collisionSafeIdentity
+                ? 'provider_qualified'
+                : 'reject',
               sku: localProductSku,
               providerSkuOmittedBecauseDuplicate:
                 automaticLocalSkuOmitted,
@@ -6451,7 +6471,7 @@ export async function resolveCommerceProductCandidateInPostgres(input: {
           },
           actorEmail: input.actorEmail,
           fields: {
-            name: input.resolution.name.trim(),
+            name: localProductName,
             sku: localProductSku || undefined,
             price:
               input.resolution.unitPriceMinor / (10 ** decimals),
@@ -6623,14 +6643,82 @@ function boundedAutomaticProductDisplayName(value: string) {
   return `${value.slice(0, 255 - suffix.length).trimEnd()}${suffix}`
 }
 
+export async function collisionSafeLocalProductDisplayName(
+  client: PoolClient,
+  input: {
+    pipelineId: string
+    requestedName: string
+    provider: 'shopify' | 'faire'
+    externalVariantId: string
+  },
+) {
+  const candidates = automaticProductDisplayNameCandidates(input)
+  const requestedName = candidates[0]
+  await acquireTransactionAdvisoryLock(
+    client,
+    `commerce-catalog-local-name:${input.pipelineId}:${
+      requestedName.toLocaleLowerCase('en-US')
+    }`,
+  )
+  const occupied = await client.query<{ name: string }>(
+    `SELECT name
+     FROM crm_products
+     WHERE pipeline_id = $1::uuid
+       AND lower(name) = ANY($2::text[])
+     FOR UPDATE`,
+    [
+      input.pipelineId,
+      candidates.map((name) => name.toLocaleLowerCase('en-US')),
+    ],
+  )
+  const occupiedNames = new Set(occupied.rows.map(
+    (row) => row.name.toLocaleLowerCase('en-US'),
+  ))
+  const available = candidates.find(
+    (name) => !occupiedNames.has(name.toLocaleLowerCase('en-US')),
+  )
+  if (!available) {
+    intakeError(
+      'COMMERCE_INTAKE_PRODUCT_NAME_CONFLICT',
+      'The provider variant needs a unique catalog name; review the existing provider-qualified products before retrying.',
+      409,
+    )
+  }
+  return available
+}
+
+export function automaticProductDisplayNameCandidates(input: {
+  requestedName: string
+  provider: 'shopify' | 'faire'
+  externalVariantId: string
+}) {
+  const requestedName = boundedAutomaticProductDisplayName(
+    input.requestedName.trim(),
+  )
+  const providerLabel = input.provider === 'shopify' ? 'Shopify' : 'Faire'
+  return [
+    requestedName,
+    boundedAutomaticProductDisplayName(
+      `${requestedName} · ${providerLabel}`,
+    ),
+    boundedAutomaticProductDisplayName(
+      `${requestedName} · ${providerLabel} · ${
+        commandHash(input.externalVariantId).slice(0, 12)
+      }`,
+    ),
+  ]
+}
+
 export function automaticProductResolution(
   candidate: ProductCandidateRow,
 ) {
   const title = candidate.product_title_snapshot.trim()
   const variant = candidate.variant_title_snapshot?.trim() || null
-  const rawName = variant && variant !== title
-    ? `${title} · ${variant}`
-    : title
+  const rawName = commerceProductDisplayName({
+    productTitle: title,
+    variantTitle: variant,
+    selectedOptions: candidate.normalized_options,
+  })
   const rawSku = candidate.sku_snapshot?.trim() || null
   const currency = candidate.currency_code?.trim().toUpperCase() || ''
   const unitPriceMinor = safeMinor(candidate.price_minor)
@@ -8784,9 +8872,10 @@ export async function promoteCommerceCandidateInPostgres(input: {
             || line.external_variant_id
             || line.external_product_id
             || line.global_id,
-          line.variant_title_snapshot
-            ? `${line.product_title_snapshot} — ${line.variant_title_snapshot}`
-            : line.product_title_snapshot,
+          commerceProductDisplayName({
+            productTitle: line.product_title_snapshot,
+            variantTitle: line.variant_title_snapshot,
+          }),
           line.unfulfilled_quantity,
           line.resolved_unit_price_minor,
           line.requires_shipping ? line.weight_grams : 0,

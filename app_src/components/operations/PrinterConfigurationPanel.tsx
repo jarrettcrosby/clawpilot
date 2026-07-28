@@ -37,6 +37,12 @@ import RefreshRounded from '@mui/icons-material/RefreshRounded'
 import ReplayRounded from '@mui/icons-material/ReplayRounded'
 import RestartAltRounded from '@mui/icons-material/RestartAltRounded'
 import TokenRounded from '@mui/icons-material/TokenRounded'
+import { useMeasurementSystem } from '@/components/measurements/MeasurementSystemProvider'
+import {
+  formatDimensionsMm,
+  formatGrams,
+  type MeasurementSystem,
+} from '@/lib/measurements'
 import {
   DEFAULT_PRINT_AGENT_CAPABILITIES,
   PRINT_DOCUMENT_TYPES,
@@ -165,21 +171,30 @@ function formatBytes(value: number | null) {
   return `${(value / (1024 * 1024)).toFixed(1)} MB`
 }
 
-function packageSize(job: OperationsPrintJobListItem) {
+function packageSize(
+  job: OperationsPrintJobListItem,
+  measurementSystem: MeasurementSystem,
+) {
   if (
     job.packageLengthMm === null
     || job.packageWidthMm === null
     || job.packageHeightMm === null
   ) return 'Not available'
-  const inches = [job.packageLengthMm, job.packageWidthMm, job.packageHeightMm]
-    .map((value) => (value / 25.4).toFixed(1))
-    .join(' x ')
-  return `${inches} in (${job.packageLengthMm} x ${job.packageWidthMm} x ${job.packageHeightMm} mm)`
+  return formatDimensionsMm({
+    lengthMm: job.packageLengthMm,
+    widthMm: job.packageWidthMm,
+    heightMm: job.packageHeightMm,
+  }, measurementSystem, { maximumFractionDigits: 3 })
 }
 
-function packageWeight(job: OperationsPrintJobListItem) {
+function packageWeight(
+  job: OperationsPrintJobListItem,
+  measurementSystem: MeasurementSystem,
+) {
   if (job.packageWeightGrams === null) return 'Not available'
-  return `${(job.packageWeightGrams / 453.59237).toFixed(2)} lb (${job.packageWeightGrams} g)`
+  return formatGrams(job.packageWeightGrams, measurementSystem, {
+    maximumFractionDigits: 3,
+  })
 }
 
 function destination(job: OperationsPrintJobListItem) {
@@ -353,6 +368,7 @@ function statusColor(status: string): 'default' | 'success' | 'warning' | 'error
 }
 
 export default function PrinterConfigurationPanel() {
+  const { measurementSystem } = useMeasurementSystem()
   const theme = useTheme()
   const mobile = useMediaQuery(theme.breakpoints.down('sm'))
   const [view, setView] = useState<View>('jobs')
@@ -1194,8 +1210,8 @@ export default function PrinterConfigurationPanel() {
                       ? `Package ${selectedJob.packageNumber || '—'} · ${selectedJob.packageGlobalId}`
                       : null}
                   />
-                  <DetailField term="Package dimensions" value={packageSize(selectedJob)} />
-                  <DetailField term="Package weight" value={packageWeight(selectedJob)} />
+                  <DetailField term="Package dimensions" value={packageSize(selectedJob, measurementSystem)} />
+                  <DetailField term="Package weight" value={packageWeight(selectedJob, measurementSystem)} />
                 </Box>
               </Box>
 

@@ -2051,6 +2051,10 @@ async function executeCommerceIntakeCommandInternal(
               sku: optionalText(resolution.sku, 'Product SKU', 25),
               unitPriceMinor: minorAmount(resolution.unitPriceMinor),
               currency: currency(resolution.currency),
+              identityConflictPolicy:
+                resolution.identityConflictPolicy === 'provider_qualified'
+                  ? 'provider_qualified'
+                  : undefined,
             } as const
           : {
               mode: 'exclude',

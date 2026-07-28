@@ -1,6 +1,13 @@
 'use client'
 
-import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react'
+import {
+  FormEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
 import {
   Alert,
   Box,
@@ -18,6 +25,8 @@ import {
   Stack,
   Switch,
   TextField,
+  ToggleButton,
+  ToggleButtonGroup,
   Typography,
 } from '@mui/material'
 import AddRounded from '@mui/icons-material/AddRounded'
@@ -31,6 +40,17 @@ import type {
   PackagingMaterialsWorkspace,
   PackagingMaterialType,
 } from '@/lib/operations/packagingMaterials'
+import { useMeasurementSystem } from '@/components/measurements/MeasurementSystemProvider'
+import {
+  displayLengthToMillimeters,
+  displayWeightToGrams,
+  formatDimensionsMm,
+  formatGrams,
+  gramsToDisplayWeight,
+  measurementUnits,
+  millimetersToDisplayLength,
+  type MeasurementSystem,
+} from '@/lib/measurements'
 
 type Payload = {
   ok?: boolean
@@ -57,6 +77,14 @@ type MaterialForm = {
   currency: string
 }
 
+type MaterialMeasurementForm = {
+  innerLength: string
+  innerWidth: string
+  innerHeight: string
+  tareWeight: string
+  maxWeight: string
+}
+
 type StockForm = {
   warehouseId: string
   isAvailable: boolean
@@ -76,6 +104,14 @@ const emptyMaterial: MaterialForm = {
   maxWeightGrams: '',
   unitCost: '',
   currency: 'USD',
+}
+
+const emptyMaterialMeasurements: MaterialMeasurementForm = {
+  innerLength: '',
+  innerWidth: '',
+  innerHeight: '',
+  tareWeight: '',
+  maxWeight: '',
 }
 
 const emptyStock: StockForm = {
@@ -116,6 +152,64 @@ function money(minor: number | null, currency = 'USD') {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   }).format(minor / 100)
+}
+
+function displayMeasurementValue(value: number) {
+  return String(Number(value.toFixed(3)))
+}
+
+function materialMeasurementForm(
+  material: Pick<
+    PackagingMaterial,
+    'innerDimensionsMm' | 'tareWeightGrams' | 'maxWeightGrams'
+  >,
+  system: MeasurementSystem,
+): MaterialMeasurementForm {
+  return {
+    innerLength: displayMeasurementValue(
+      millimetersToDisplayLength(material.innerDimensionsMm.length, system),
+    ),
+    innerWidth: displayMeasurementValue(
+      millimetersToDisplayLength(material.innerDimensionsMm.width, system),
+    ),
+    innerHeight: displayMeasurementValue(
+      millimetersToDisplayLength(material.innerDimensionsMm.height, system),
+    ),
+    tareWeight: displayMeasurementValue(
+      gramsToDisplayWeight(material.tareWeightGrams, system),
+    ),
+    maxWeight: displayMeasurementValue(
+      gramsToDisplayWeight(material.maxWeightGrams, system),
+    ),
+  }
+}
+
+function measurementFormFromCanonical(
+  material: MaterialForm,
+  system: MeasurementSystem,
+): MaterialMeasurementForm {
+  const length = Number(material.innerLengthMm)
+  const width = Number(material.innerWidthMm)
+  const height = Number(material.innerHeightMm)
+  const tareWeight = Number(material.tareWeightGrams)
+  const maxWeight = Number(material.maxWeightGrams)
+  return {
+    innerLength: material.innerLengthMm && Number.isFinite(length)
+      ? displayMeasurementValue(millimetersToDisplayLength(length, system))
+      : '',
+    innerWidth: material.innerWidthMm && Number.isFinite(width)
+      ? displayMeasurementValue(millimetersToDisplayLength(width, system))
+      : '',
+    innerHeight: material.innerHeightMm && Number.isFinite(height)
+      ? displayMeasurementValue(millimetersToDisplayLength(height, system))
+      : '',
+    tareWeight: material.tareWeightGrams && Number.isFinite(tareWeight)
+      ? displayMeasurementValue(gramsToDisplayWeight(tareWeight, system))
+      : '',
+    maxWeight: material.maxWeightGrams && Number.isFinite(maxWeight)
+      ? displayMeasurementValue(gramsToDisplayWeight(maxWeight, system))
+      : '',
+  }
 }
 
 function materialForm(material: PackagingMaterial): MaterialForm {
@@ -189,6 +283,16 @@ function ReadinessMetric({
 }
 
 export default function PackagingMaterialsPanel() {
+  const {
+    measurementSystem: preferredMeasurementSystem,
+    effectiveSource: measurementPreferenceSource,
+    error: measurementPreferenceError,
+  } = useMeasurementSystem()
+  const [measurementSystem, setMeasurementSystem] = useState<MeasurementSystem>(
+    preferredMeasurementSystem,
+  )
+  const [hasLocalMeasurementOverride, setHasLocalMeasurementOverride] = useState(false)
+  const units = measurementUnits(measurementSystem)
   const [workspace, setWorkspace] = useState<PackagingMaterialsWorkspace | null>(null)
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState(false)
@@ -198,9 +302,14 @@ export default function PackagingMaterialsPanel() {
   const [materialOpen, setMaterialOpen] = useState(false)
   const [editingMaterial, setEditingMaterial] = useState<PackagingMaterial | null>(null)
   const [materialDraft, setMaterialDraft] = useState<MaterialForm>(emptyMaterial)
+  const [materialMeasurementDraft, setMaterialMeasurementDraft] = useState<
+    MaterialMeasurementForm
+  >(emptyMaterialMeasurements)
+  const [materialSubmitted, setMaterialSubmitted] = useState(false)
   const [stockOpen, setStockOpen] = useState(false)
   const [stockMaterial, setStockMaterial] = useState<PackagingMaterial | null>(null)
   const [stockDraft, setStockDraft] = useState<StockForm>(emptyStock)
+  const previousMeasurementSystem = useRef(measurementSystem)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -225,6 +334,20 @@ export default function PackagingMaterialsPanel() {
     void load()
   }, [load])
 
+  useEffect(() => {
+    if (hasLocalMeasurementOverride) return
+    setMeasurementSystem(preferredMeasurementSystem)
+  }, [hasLocalMeasurementOverride, preferredMeasurementSystem])
+
+  useEffect(() => {
+    if (previousMeasurementSystem.current === measurementSystem) return
+    previousMeasurementSystem.current = measurementSystem
+    if (!materialOpen) return
+    setMaterialMeasurementDraft(
+      measurementFormFromCanonical(materialDraft, measurementSystem),
+    )
+  }, [materialDraft, materialOpen, measurementSystem])
+
   const materials = useMemo(() => {
     const needle = search.trim().toLowerCase()
     if (!needle) return workspace?.materials || []
@@ -239,17 +362,120 @@ export default function PackagingMaterialsPanel() {
   const openCreate = () => {
     setEditingMaterial(null)
     setMaterialDraft(emptyMaterial)
+    setMaterialMeasurementDraft(emptyMaterialMeasurements)
+    setMaterialSubmitted(false)
     setMaterialOpen(true)
   }
 
   const openEdit = (material: PackagingMaterial) => {
     setEditingMaterial(material)
     setMaterialDraft(materialForm(material))
+    setMaterialMeasurementDraft(
+      materialMeasurementForm(material, measurementSystem),
+    )
+    setMaterialSubmitted(false)
     setMaterialOpen(true)
   }
 
+  const changeLocalMeasurementSystem = (next: MeasurementSystem | null) => {
+    if (!next || next === measurementSystem) return
+    setHasLocalMeasurementOverride(true)
+    setMeasurementSystem(next)
+  }
+
+  const updateMaterialMeasurement = (
+    field: keyof MaterialMeasurementForm,
+    value: string,
+  ) => {
+    setMaterialMeasurementDraft((current) => ({ ...current, [field]: value }))
+    const numeric = Number(value)
+    const canonicalField = {
+      innerLength: 'innerLengthMm',
+      innerWidth: 'innerWidthMm',
+      innerHeight: 'innerHeightMm',
+      tareWeight: 'tareWeightGrams',
+      maxWeight: 'maxWeightGrams',
+    }[field] as keyof Pick<
+      MaterialForm,
+      | 'innerLengthMm'
+      | 'innerWidthMm'
+      | 'innerHeightMm'
+      | 'tareWeightGrams'
+      | 'maxWeightGrams'
+    >
+    let canonical = ''
+    if (value.trim() && Number.isFinite(numeric) && numeric > 0) {
+      canonical = String(
+        field === 'innerLength' || field === 'innerWidth' || field === 'innerHeight'
+          ? displayLengthToMillimeters(numeric, measurementSystem)
+          : displayWeightToGrams(numeric, measurementSystem),
+      )
+    }
+    setMaterialDraft((current) => ({ ...current, [canonicalField]: canonical }))
+  }
+
+  const materialMeasurementErrors = useMemo(() => {
+    const validate = (
+      displayValue: string,
+      canonicalValue: string,
+      label: string,
+    ) => {
+      const numeric = Number(displayValue)
+      const canonical = Number(canonicalValue)
+      if (!displayValue.trim()) return `${label} is required`
+      if (!Number.isFinite(numeric) || numeric <= 0) {
+        return `${label} must be greater than zero`
+      }
+      if (!Number.isSafeInteger(canonical) || canonical < 1) {
+        return `${label} is below the supported 1 mm or 1 g precision`
+      }
+      return ''
+    }
+    const errors = {
+      innerLength: validate(
+        materialMeasurementDraft.innerLength,
+        materialDraft.innerLengthMm,
+        'Inner length',
+      ),
+      innerWidth: validate(
+        materialMeasurementDraft.innerWidth,
+        materialDraft.innerWidthMm,
+        'Inner width',
+      ),
+      innerHeight: validate(
+        materialMeasurementDraft.innerHeight,
+        materialDraft.innerHeightMm,
+        'Inner height',
+      ),
+      tareWeight: validate(
+        materialMeasurementDraft.tareWeight,
+        materialDraft.tareWeightGrams,
+        'Tare weight',
+      ),
+      maxWeight: validate(
+        materialMeasurementDraft.maxWeight,
+        materialDraft.maxWeightGrams,
+        'Maximum weight',
+      ),
+    }
+    if (
+      !errors.tareWeight
+      && !errors.maxWeight
+      && Number(materialDraft.maxWeightGrams) <= Number(materialDraft.tareWeightGrams)
+    ) {
+      errors.maxWeight = 'Maximum weight must be greater than tare weight'
+    }
+    return errors
+  }, [materialDraft, materialMeasurementDraft])
+
+  const materialMeasurementsValid = Object.values(
+    materialMeasurementErrors,
+  ).every((message) => !message)
+
   const saveMaterial = async (event: FormEvent) => {
     event.preventDefault()
+    setMaterialSubmitted(true)
+    if (!materialMeasurementsValid) return
     setBusy(true)
     setError('')
     setNotice('')
@@ -440,15 +666,53 @@ export default function PackagingMaterialsPanel() {
   return (
     <Box sx={{ px: { xs: 2, md: 3 }, py: 2.5, minWidth: 0 }}>
       <Stack spacing={2.5}>
-        <Box>
-          <Typography variant="h6" fontWeight={750}>Cartons and mailers</Typography>
-          <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-            Maintain the real materials available at each warehouse. Drafts are never
-            offered to cartonization, and availability alone does not fabricate stock.
-          </Typography>
-        </Box>
+        <Stack
+          direction={{ xs: 'column', sm: 'row' }}
+          justifyContent="space-between"
+          alignItems={{ sm: 'flex-start' }}
+          spacing={1.5}
+        >
+          <Box>
+            <Typography variant="h6" fontWeight={750}>Cartons and mailers</Typography>
+            <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
+              Maintain the real materials available at each warehouse. Drafts are never
+              offered to cartonization, and availability alone does not fabricate stock.
+            </Typography>
+          </Box>
+          <Box sx={{ flexShrink: 0 }}>
+            <ToggleButtonGroup
+              exclusive
+              size="small"
+              value={measurementSystem}
+              onChange={(_event, next: MeasurementSystem | null) => {
+                changeLocalMeasurementSystem(next)
+              }}
+              aria-label="Packaging material measurement system"
+            >
+              <ToggleButton value="imperial">Imperial</ToggleButton>
+              <ToggleButton value="metric">Metric</ToggleButton>
+            </ToggleButtonGroup>
+            <Typography
+              variant="caption"
+              color="text.secondary"
+              display="block"
+              sx={{ mt: 0.5, textAlign: { sm: 'right' } }}
+            >
+              {hasLocalMeasurementOverride
+                ? 'Local display only · personal default unchanged'
+                : measurementPreferenceSource === 'user'
+                  ? 'Local display · starts from your preference'
+                  : measurementPreferenceSource === 'organization'
+                    ? 'Local display · starts from organization default'
+                    : 'Local display · starts from system default'}
+            </Typography>
+          </Box>
+        </Stack>
 
         {error && <Alert severity="error" onClose={() => setError('')}>{error}</Alert>}
+        {measurementPreferenceError && (
+          <Alert severity="warning">{measurementPreferenceError}</Alert>
+        )}
         {notice && <Alert severity="success" onClose={() => setNotice('')}>{notice}</Alert>}
         {!loading && workspace && workspace.warehouses.length === 0 && (
           <Alert severity="warning">
@@ -638,17 +902,34 @@ export default function PackagingMaterialsPanel() {
                   <Box>
                     <Typography variant="caption" color="text.secondary">Inner dimensions</Typography>
                     <Typography variant="body2">
+                      {formatDimensionsMm({
+                        lengthMm: material.innerDimensionsMm.length,
+                        widthMm: material.innerDimensionsMm.width,
+                        heightMm: material.innerDimensionsMm.height,
+                      }, measurementSystem)}
+                    </Typography>
+                    <Typography variant="caption" color="text.disabled" display="block">
                       {material.innerDimensionsMm.length} × {material.innerDimensionsMm.width} ×{' '}
-                      {material.innerDimensionsMm.height} mm
+                      {material.innerDimensionsMm.height} mm canonical
                     </Typography>
                   </Box>
                   <Box>
                     <Typography variant="caption" color="text.secondary">Tare</Typography>
-                    <Typography variant="body2">{material.tareWeightGrams} g</Typography>
+                    <Typography variant="body2">
+                      {formatGrams(material.tareWeightGrams, measurementSystem)}
+                    </Typography>
+                    <Typography variant="caption" color="text.disabled" display="block">
+                      {material.tareWeightGrams} g canonical
+                    </Typography>
                   </Box>
                   <Box>
                     <Typography variant="caption" color="text.secondary">Maximum</Typography>
-                    <Typography variant="body2">{material.maxWeightGrams} g</Typography>
+                    <Typography variant="body2">
+                      {formatGrams(material.maxWeightGrams, measurementSystem)}
+                    </Typography>
+                    <Typography variant="caption" color="text.disabled" display="block">
+                      {material.maxWeightGrams} g canonical
+                    </Typography>
                   </Box>
                   <Box>
                     <Typography variant="caption" color="text.secondary">Unit cost</Typography>
@@ -753,10 +1034,38 @@ export default function PackagingMaterialsPanel() {
           <DialogContent dividers>
             <Stack spacing={2}>
               <Alert severity="info">
-                Dimensions are canonical inner millimeters. Enter the supplier&apos;s
-                actual tare, maximum weight, and unit material cost. New records remain
-                drafts until warehouse stock is configured and you activate them.
+                Enter the supplier&apos;s inner dimensions and weights in your selected
+                units. ClawPilot normalizes them to whole millimeters and grams for
+                cartonization. New records remain drafts until warehouse stock is
+                configured and you activate them.
               </Alert>
+              <Stack
+                direction={{ xs: 'column', sm: 'row' }}
+                alignItems={{ sm: 'center' }}
+                justifyContent="space-between"
+                spacing={1}
+              >
+                <Box>
+                  <Typography fontWeight={700}>Physical measurements</Typography>
+                  <Typography variant="caption" color="text.secondary">
+                    Dimensions in {units.length}; weights in {units.weight}. Stored to
+                    the nearest 1 mm and 1 g. This selector changes only this packaging
+                    screen; your saved preference is unchanged.
+                  </Typography>
+                </Box>
+                <ToggleButtonGroup
+                  exclusive
+                  size="small"
+                  value={measurementSystem}
+                  onChange={(_event, next: MeasurementSystem | null) => {
+                    changeLocalMeasurementSystem(next)
+                  }}
+                  aria-label="Material editor measurement system"
+                >
+                  <ToggleButton value="imperial">Imperial</ToggleButton>
+                  <ToggleButton value="metric">Metric</ToggleButton>
+                </ToggleButtonGroup>
+              </Stack>
               <Box
                 sx={{
                   display: 'grid',
@@ -805,57 +1114,96 @@ export default function PackagingMaterialsPanel() {
               >
                 <TextField
                   type="number"
-                  label="Inner length (mm)"
-                  value={materialDraft.innerLengthMm}
-                  onChange={(event) => setMaterialDraft({
-                    ...materialDraft,
-                    innerLengthMm: event.target.value,
-                  })}
-                  inputProps={{ min: 1, step: 1 }}
+                  label={`Inner length (${units.length})`}
+                  value={materialMeasurementDraft.innerLength}
+                  onChange={(event) => updateMaterialMeasurement(
+                    'innerLength',
+                    event.target.value,
+                  )}
+                  inputProps={{
+                    min: measurementSystem === 'imperial' ? 0.001 : 0.1,
+                    step: measurementSystem === 'imperial' ? 0.001 : 0.1,
+                  }}
+                  error={materialSubmitted && Boolean(
+                    materialMeasurementErrors.innerLength,
+                  )}
+                  helperText={materialSubmitted
+                    ? materialMeasurementErrors.innerLength
+                    : 'Supplier inside measurement'}
                   required
                 />
                 <TextField
                   type="number"
-                  label="Inner width (mm)"
-                  value={materialDraft.innerWidthMm}
-                  onChange={(event) => setMaterialDraft({
-                    ...materialDraft,
-                    innerWidthMm: event.target.value,
-                  })}
-                  inputProps={{ min: 1, step: 1 }}
+                  label={`Inner width (${units.length})`}
+                  value={materialMeasurementDraft.innerWidth}
+                  onChange={(event) => updateMaterialMeasurement(
+                    'innerWidth',
+                    event.target.value,
+                  )}
+                  inputProps={{
+                    min: measurementSystem === 'imperial' ? 0.001 : 0.1,
+                    step: measurementSystem === 'imperial' ? 0.001 : 0.1,
+                  }}
+                  error={materialSubmitted && Boolean(
+                    materialMeasurementErrors.innerWidth,
+                  )}
+                  helperText={materialSubmitted
+                    ? materialMeasurementErrors.innerWidth
+                    : 'Supplier inside measurement'}
                   required
                 />
                 <TextField
                   type="number"
-                  label="Inner height (mm)"
-                  value={materialDraft.innerHeightMm}
-                  onChange={(event) => setMaterialDraft({
-                    ...materialDraft,
-                    innerHeightMm: event.target.value,
-                  })}
-                  inputProps={{ min: 1, step: 1 }}
+                  label={`Inner height (${units.length})`}
+                  value={materialMeasurementDraft.innerHeight}
+                  onChange={(event) => updateMaterialMeasurement(
+                    'innerHeight',
+                    event.target.value,
+                  )}
+                  inputProps={{
+                    min: measurementSystem === 'imperial' ? 0.001 : 0.1,
+                    step: measurementSystem === 'imperial' ? 0.001 : 0.1,
+                  }}
+                  error={materialSubmitted && Boolean(
+                    materialMeasurementErrors.innerHeight,
+                  )}
+                  helperText={materialSubmitted
+                    ? materialMeasurementErrors.innerHeight
+                    : 'Supplier inside measurement'}
                   required
                 />
                 <TextField
                   type="number"
-                  label="Tare weight (g)"
-                  value={materialDraft.tareWeightGrams}
-                  onChange={(event) => setMaterialDraft({
-                    ...materialDraft,
-                    tareWeightGrams: event.target.value,
-                  })}
-                  inputProps={{ min: 1, step: 1 }}
+                  label={`Tare weight (${units.weight})`}
+                  value={materialMeasurementDraft.tareWeight}
+                  onChange={(event) => updateMaterialMeasurement(
+                    'tareWeight',
+                    event.target.value,
+                  )}
+                  inputProps={{ min: 0.001, step: 0.001 }}
+                  error={materialSubmitted && Boolean(
+                    materialMeasurementErrors.tareWeight,
+                  )}
+                  helperText={materialSubmitted
+                    ? materialMeasurementErrors.tareWeight
+                    : 'Empty package weight'}
                   required
                 />
                 <TextField
                   type="number"
-                  label="Maximum weight (g)"
-                  value={materialDraft.maxWeightGrams}
-                  onChange={(event) => setMaterialDraft({
-                    ...materialDraft,
-                    maxWeightGrams: event.target.value,
-                  })}
-                  inputProps={{ min: 2, step: 1 }}
+                  label={`Maximum weight (${units.weight})`}
+                  value={materialMeasurementDraft.maxWeight}
+                  onChange={(event) => updateMaterialMeasurement(
+                    'maxWeight',
+                    event.target.value,
+                  )}
+                  inputProps={{ min: 0.001, step: 0.001 }}
+                  error={materialSubmitted && Boolean(
+                    materialMeasurementErrors.maxWeight,
+                  )}
+                  helperText={materialSubmitted
+                    ? materialMeasurementErrors.maxWeight
+                    : 'Safe filled-package limit'}
                   required
                 />
                 <TextField
@@ -888,6 +1236,20 @@ export default function PackagingMaterialsPanel() {
                   required={Boolean(materialDraft.unitCost.trim())}
                 />
               </Box>
+              {materialMeasurementsValid ? (
+                <Alert severity="success" icon={false}>
+                  Canonical optimizer values:{' '}
+                  {materialDraft.innerLengthMm} × {materialDraft.innerWidthMm} ×{' '}
+                  {materialDraft.innerHeightMm} mm · tare{' '}
+                  {materialDraft.tareWeightGrams} g · maximum{' '}
+                  {materialDraft.maxWeightGrams} g.
+                </Alert>
+              ) : (
+                <Typography variant="caption" color="text.secondary">
+                  Complete all five physical measurements to preview the exact canonical
+                  values sent to cartonization.
+                </Typography>
+              )}
             </Stack>
           </DialogContent>
           <DialogActions>

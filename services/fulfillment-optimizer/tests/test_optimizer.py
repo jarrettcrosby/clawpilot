@@ -187,6 +187,50 @@ class FulfillmentSolverTest(unittest.TestCase):
         self.assertEqual(sum(item["quantity"] for item in package["allocations"]), 2)
         self.assertLessEqual(package["totalWeightGrams"], package["maxWeightGrams"])
 
+    def test_single_warehouse_exact_geometry_forces_two_cartons(self) -> None:
+        fixture = fulfillment_fixture()
+        fixture["lines"][0]["unitDimensionsMm"] = {
+            "length": 60,
+            "width": 60,
+            "height": 60,
+        }
+        value = FulfillmentOptimizationInput.model_validate(fixture)
+        payload_hash = canonical_sha256(input_payload(value))
+        options = OptimizerOptions.model_validate({
+            "deadlineMs": 5_000,
+            "maxCandidates": 2,
+        })
+        result = solve_fulfillment(value, options, payload_hash)
+
+        self.assertEqual(result["status"], "optimal")
+        plan = result["selectedPlan"]
+        self.assertEqual(plan["warehouseGlobalIds"], ["gwhs0000001"])
+        self.assertEqual(plan["warehouseCount"], 1)
+        self.assertEqual(plan["shipmentCount"], 2)
+        self.assertEqual(plan["cartonCount"], 2)
+        self.assertEqual(plan["estimatedTotalCostMinor"], 1_570)
+        self.assertEqual(plan["unusedVolumeMm3"], 1_168_000)
+        self.assertEqual(len(plan["packages"]), 2)
+        self.assertEqual(
+            sum(
+                allocation["quantity"]
+                for package in plan["packages"]
+                for allocation in package["allocations"]
+            ),
+            2,
+        )
+        for package in plan["packages"]:
+            self.assertEqual(package["warehouseGlobalId"], "gwhs0000001")
+            self.assertEqual(package["cartonGlobalId"], "gctn0000001")
+            self.assertEqual(package["totalWeightGrams"], 600)
+            self.assertEqual(package["usedVolumeMm3"], 216_000)
+            self.assertEqual(package["unusedVolumeMm3"], 584_000)
+            self.assertEqual(len(package["placements"]), 1)
+            self.assertEqual(
+                sum(item["quantity"] for item in package["allocations"]),
+                1,
+            )
+
     def test_split_policy_fails_closed_then_allows_explicit_split(self) -> None:
         fixture = fulfillment_fixture()
         fixture["lines"].append({

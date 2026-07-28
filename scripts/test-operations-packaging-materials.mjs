@@ -67,6 +67,11 @@ for (const starter of STARTER_PACKAGING_MATERIALS) {
   assert.ok(starter.innerHeightMm > 0)
   assert.ok(starter.tareWeightGrams > 0)
   assert.ok(starter.maxWeightGrams > starter.tareWeightGrams)
+  assert.equal(
+    /\b(?:in|inch|inches|mm|cm)\b/i.test(starter.name),
+    false,
+    'Starter names must remain measurement-system neutral',
+  )
 }
 
 assert.deepEqual(
@@ -117,6 +122,23 @@ for (const fragment of [
   'row_version bigint NOT NULL DEFAULT 0',
 ]) {
   assert.ok(migration.includes(fragment), `Migration missing ${fragment}`)
+}
+
+const unitNeutralMigration = read(
+  'db/migrations/0126_packaging_material_unit_neutral_names.sql',
+)
+for (const fragment of [
+  "material.source = 'starter_assortment'",
+  'material.code = correction.code',
+  'material.name = correction.previous_name',
+  'row_version = material.row_version + 1',
+  "'Compact starter carton'",
+  "'Starter padded mailer'",
+]) {
+  assert.ok(
+    unitNeutralMigration.includes(fragment),
+    `Unit-neutral starter migration missing ${fragment}`,
+  )
 }
 
 const persistence = read('app_src/lib/persistence/packagingMaterials.ts')
@@ -191,6 +213,7 @@ for (const fragment of [
 const predeploy = read('scripts/verify-predeploy.mjs')
 for (const fragment of [
   "'db/migrations/0123_operations_packaging_materials.sql'",
+  "'db/migrations/0126_packaging_material_unit_neutral_names.sql'",
   "'scripts/test-operations-packaging-materials.mjs'",
 ]) {
   assert.ok(predeploy.includes(fragment), `Predeploy gate missing ${fragment}`)

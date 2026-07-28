@@ -338,7 +338,7 @@ function normalizeVariant(
     sku,
     barcode: optionalCommerceText(variant.barcode, 255),
     title: optionalCommerceText(
-      variant.displayName ?? variant.title,
+      variant.title ?? variant.displayName,
       512,
     ),
     selectedOptions: selectedOptions(variant.selectedOptions),

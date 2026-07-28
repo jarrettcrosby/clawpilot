@@ -276,6 +276,8 @@ export async function GET() {
           operations_commerce_incomplete_header_money_migration_applied: boolean
           operations_packaging_materials_migration_applied: boolean
           operations_shopify_inventory_migration_applied: boolean
+          measurement_preferences_migration_applied: boolean
+          packaging_material_unit_neutral_names_migration_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -811,6 +813,16 @@ export async function GET() {
                 FROM schema_migrations
                 WHERE filename = '0124_operations_shopify_inventory.sql'
               ) AS operations_shopify_inventory_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0125_measurement_preferences.sql'
+              ) AS measurement_preferences_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0126_packaging_material_unit_neutral_names.sql'
+              ) AS packaging_material_unit_neutral_names_migration_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -929,6 +941,8 @@ export async function GET() {
             && row?.operations_commerce_incomplete_header_money_migration_applied
             && row?.operations_packaging_materials_migration_applied
             && row?.operations_shopify_inventory_migration_applied
+            && row?.measurement_preferences_migration_applied
+            && row?.packaging_material_unit_neutral_names_migration_applied
             && row?.migration_checksums_present
           ),
         }
@@ -1039,6 +1053,8 @@ export async function GET() {
           || !row?.operations_commerce_incomplete_header_money_migration_applied
           || !row?.operations_packaging_materials_migration_applied
           || !row?.operations_shopify_inventory_migration_applied
+          || !row?.measurement_preferences_migration_applied
+          || !row?.packaging_material_unit_neutral_names_migration_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')
