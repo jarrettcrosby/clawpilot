@@ -773,8 +773,12 @@ includes(persistenceSource, [
   'candidate.provider = $3',
   'candidate.external_variant_id = ANY($4::text[])',
   'run.credential_version = $5::integer',
-  'prior.source_revision === incomingSourceRevision',
-  'prior.source_hash === variant.sourceHash',
+  'preserveCommerceProductCandidateEvidence({',
+  'priorSourceRevision: prior.source_revision',
+  'incomingSourceRevision',
+  'priorSourceHash: prior.source_hash',
+  'incomingSourceHash: variant.sourceHash',
+  'priorMappingState: prior.mapping_state',
   'prior.id,',
   'productVariantsPreserved += 1',
   'const recordsStaged = productVariantsStaged + ordersStaged',
@@ -952,6 +956,12 @@ includes(persistenceSource, [
   'allowReplacement: !input.automatic',
   'COMMERCE_PRODUCT_AUTO_CREATE_MAPPING_CONFLICT',
   'catalog_product_existing_mapping_preserved',
+  'recordAutomaticProductFailureInPostgres',
+  'commerce.intake.product_candidate.automatic_failed',
+  'next_catalog_reconciliation_or_manual_resolution',
+  'candidate.last_error_code',
+  'lastErrorCode: candidate.last_error_code',
+  'failedByCode',
 ], 'Commerce intake continuity')
 const productCandidateResolverSource = persistenceSource.slice(
   persistenceSource.indexOf(
@@ -1001,10 +1011,18 @@ includes(productCandidateResolverSource, [
   'id: preservedAutomaticMapping.id',
   'global_id: preservedAutomaticMapping.global_id',
   'allowReplacement: !input.automatic',
+  'if (input.automatic && localProductSku)',
+  'commerce-catalog-local-sku:',
+  'lower(btrim(sku)) = lower(btrim($2))',
+  'automaticLocalProductSku({',
   'providerSnapshot: {',
   'productTitle: candidate.product_title_snapshot',
   'variantTitle: candidate.variant_title_snapshot',
   'sku: candidate.sku_snapshot',
+  'localCatalog: {',
+  'providerSkuOmittedBecauseDuplicate:',
+  'channelSku: candidate.sku_snapshot || product.sku',
+  'automaticLocalSkuOmitted',
 ], 'Automatic exact-mapping preservation')
 const automaticProductResolutionModule = loadTypeScriptModule(
   'app_src/lib/persistence/commerceIntake.ts',
@@ -1036,6 +1054,75 @@ const boundedAutomaticResolution =
   automaticProductResolutionModule.automaticProductResolution(
     longAutomaticProduct,
   )
+const unchangedProductEvidence = {
+  priorCredentialVersion: 3,
+  currentCredentialVersion: 3,
+  priorSourceRevision: 'source-revision',
+  incomingSourceRevision: 'source-revision',
+  priorSourceHash: 'source-hash',
+  incomingSourceHash: 'source-hash',
+}
+assert.equal(
+  automaticProductResolutionModule.preserveCommerceProductCandidateEvidence({
+    ...unchangedProductEvidence,
+    priorMappingState: 'resolved',
+  }),
+  true,
+  'An unchanged resolved provider variant may reuse its prior candidate evidence',
+)
+assert.equal(
+  automaticProductResolutionModule.preserveCommerceProductCandidateEvidence({
+    ...unchangedProductEvidence,
+    priorMappingState: 'unsupported',
+  }),
+  true,
+  'An unchanged explicitly excluded provider variant must stay excluded',
+)
+assert.equal(
+  automaticProductResolutionModule.preserveCommerceProductCandidateEvidence({
+    ...unchangedProductEvidence,
+    priorMappingState: 'unresolved',
+  }),
+  false,
+  'An unchanged unresolved provider variant must be re-staged for automatic retry',
+)
+assert.equal(
+  automaticProductResolutionModule.automaticLocalProductSku({
+    providerSku: ' DUPLICATE-SKU ',
+    localSkuOccupied: true,
+  }),
+  null,
+  'An occupied local SKU must be omitted from a new automatic product',
+)
+assert.equal(
+  automaticProductResolutionModule.automaticLocalProductSku({
+    providerSku: ' PROVIDER-SKU ',
+    localSkuOccupied: false,
+  }),
+  'PROVIDER-SKU',
+  'An available provider SKU must remain on the automatic local product',
+)
+assert.equal(
+  automaticProductResolutionModule.automaticProductFailureCode({
+    code: '23505',
+  }),
+  'COMMERCE_PRODUCT_AUTO_CREATE_IDENTITY_CONFLICT',
+  'A database uniqueness conflict must become a safe automatic product code',
+)
+assert.equal(
+  automaticProductResolutionModule.automaticProductFailureCode({
+    code: 'COMMERCE_PRODUCT_AUTO_CREATE_MAPPING_CONFLICT',
+  }),
+  'COMMERCE_PRODUCT_AUTO_CREATE_MAPPING_CONFLICT',
+  'An existing safe commerce code must survive automatic failure classification',
+)
+assert.equal(
+  automaticProductResolutionModule.automaticProductFailureCode(
+    new Error('raw database failure must not reach the browser'),
+  ),
+  'COMMERCE_PRODUCT_AUTO_CREATE_FAILED',
+  'An unknown automatic failure must collapse to a safe generic code',
+)
 assert.ok(
   boundedAutomaticResolution.resolution,
   'Long provider title and SKU must not block an otherwise exact automatic product',
@@ -1196,6 +1283,9 @@ includes(workflowSource, [
   'Revision ${productIntakePolicyRevision}',
   'Updated ${formatDate(',
   'exact provider-variant',
+  'candidate.lastErrorCode',
+  'ClawPilot will retry this',
+  'Choose product decision',
   'automatic identity across Shopify and Faire',
   'automation never guesses that two source records are',
   "'COMMERCE_PRODUCT_INTAKE_POLICY_REVISION_CONFLICT'",
@@ -1529,7 +1619,11 @@ const service = loadTypeScriptModule(
                   })),
             }],
             ...(!listOptions.cursor
-              ? { next_cursor: 'faire-products-page-2' }
+              ? {
+                page: 1,
+                limit: 50,
+                cursor: 'faire-products-page-2',
+              }
               : {}),
           }
         },
@@ -2005,6 +2099,40 @@ const savedEnvironment = {
 process.env.CLAWPILOT_COMMERCE_INTAKE_ENABLED = '1'
 process.env.CLAWPILOT_ENV = 'development'
 
+assert.equal(
+  service.nextFaireCursor(
+    { page: 1, limit: 50, cursor: 'faire-products-page-2' },
+    'Faire products',
+  ),
+  'faire-products-page-2',
+  'Faire External API v2 top-level cursor must drive the next page',
+)
+assert.equal(
+  service.nextFaireCursor(
+    { limit: 50, products: [] },
+    'Faire products',
+  ),
+  null,
+  'A final Faire page without a cursor must exhaust the batch chain',
+)
+assert.throws(
+  () => service.nextFaireCursor(
+    { cursor: 'faire-products-page-2' },
+    'Faire products',
+    'faire-products-page-2',
+  ),
+  (error) => error.code === 'COMMERCE_INTAKE_PAGINATION_INVALID',
+  'Faire pagination must fail closed when the provider repeats the current cursor',
+)
+assert.throws(
+  () => service.nextFaireCursor(
+    { cursor: 'x'.repeat(4_097) },
+    'Faire products',
+  ),
+  (error) => error.code === 'COMMERCE_INTAKE_PAGINATION_INVALID',
+  'Faire pagination must reject an oversized provider cursor',
+)
+
 let keySequence = 0
 function nextKey() {
   keySequence += 1
@@ -2282,6 +2410,7 @@ try {
   )
   assert.equal(normalizedSources.faire.products.products.length, 0)
   assert.equal(normalizedSources.faire.orders.orders.length, 1)
+  assert.equal(normalizedSources.faire.products.cursor, null)
   assert.equal(normalizedSources.faire.products.next_cursor, null)
   assert.equal(normalizedSources.faire.orders.next_cursor, null)
   assert.equal(hydratedFaireProductSources.length, 2)

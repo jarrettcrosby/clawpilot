@@ -367,11 +367,11 @@ const fairePageWrapped = faire.normalizeFaireCommerce({
   brand: clone(faireSource.brand),
   products: {
     products: clone(faireSource.products),
-    next_cursor: 'products-page-2',
+    cursor: 'products-page-2',
   },
   orders: {
     orders: clone(faireSource.orders),
-    next_cursor: 'orders-page-2',
+    cursor: 'orders-page-2',
   },
 }, {
   ...baseContext,

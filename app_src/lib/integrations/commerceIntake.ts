@@ -789,7 +789,11 @@ function faireCollection(value: unknown, key: 'orders' | 'products') {
   return collection.map((entry) => providerRecord(entry, `Faire ${key}`))
 }
 
-function nextFaireCursor(value: unknown, label: string) {
+export function nextFaireCursor(
+  value: unknown,
+  label: string,
+  currentCursor: string | null = null,
+) {
   const page = providerRecord(value, label)
   const paginationValue = page.pagination ?? page.page_info ?? page.pageInfo
   const pagination = (
@@ -800,8 +804,10 @@ function nextFaireCursor(value: unknown, label: string) {
     ? paginationValue as Record<string, unknown>
     : {}
   const raw = (
-    page.next_cursor
+    page.cursor
+    ?? page.next_cursor
     ?? page.nextCursor
+    ?? pagination.cursor
     ?? pagination.next_cursor
     ?? pagination.nextCursor
   )
@@ -818,6 +824,13 @@ function nextFaireCursor(value: unknown, label: string) {
   if (!cursor || cursor.length > 4_096) {
     throw new CommerceIntegrationRequestError(
       `${label} did not provide the next page cursor`,
+      502,
+      'COMMERCE_INTAKE_PAGINATION_INVALID',
+    )
+  }
+  if (currentCursor && cursor === currentCursor) {
+    throw new CommerceIntegrationRequestError(
+      `${label} repeated the current page cursor`,
       502,
       'COMMERCE_INTAKE_PAGINATION_INVALID',
     )
@@ -848,10 +861,12 @@ function completedFairePage(
     hasNextPage: false,
     next_cursor: null,
     nextCursor: null,
+    cursor: null,
     pagination: {
       ...pagination,
       has_more: false,
       hasNextPage: false,
+      cursor: null,
       next_cursor: null,
       nextCursor: null,
     },
@@ -881,8 +896,10 @@ function providerConnectionHasMore(value: unknown) {
     || pagination.has_more === true
     || pagination.hasNextPage === true
     || Boolean(
-      connection.next_cursor
+      connection.cursor
+      ?? connection.next_cursor
       ?? connection.nextCursor
+      ?? pagination.cursor
       ?? pagination.next_cursor
       ?? pagination.nextCursor,
     )
@@ -1319,7 +1336,7 @@ async function faireEnvelope(
   const orderNodes = faireCollection(providerPage, 'orders')
   const nextOrderCursor = targetExternalOrderId
     ? null
-    : nextFaireCursor(providerPage, 'Faire orders')
+    : nextFaireCursor(providerPage, 'Faire orders', page.orderCursor)
   const bounded = boundedFaireOrders(orderNodes)
   const normalized = envelopeWith(normalizeFaireCommerce({
     brand: { id: runtime.externalAccountId },
@@ -1391,7 +1408,11 @@ async function faireProductEnvelope(
     limit: FAIRE_PRODUCT_PAGE_SIZE,
   })
   const productNodes = faireCollection(providerPage, 'products')
-  const nextProductCursor = nextFaireCursor(providerPage, 'Faire products')
+  const nextProductCursor = nextFaireCursor(
+    providerPage,
+    'Faire products',
+    page.orderCursor,
+  )
   const bounded = boundedFaireProducts(productNodes)
   const context = normalizationContext(runtime, 'stale')
   const normalizedSource = {

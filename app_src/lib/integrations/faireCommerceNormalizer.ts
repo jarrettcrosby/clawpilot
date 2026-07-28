@@ -535,8 +535,10 @@ function pageHasMore(value: unknown): boolean {
     || asCommerceRecord(page.page_info)
     || asCommerceRecord(page.pageInfo)
   const nextCursor = (
-    page.next_cursor
+    page.cursor
+    ?? page.next_cursor
     ?? page.nextCursor
+    ?? pagination?.cursor
     ?? pagination?.next_cursor
     ?? pagination?.nextCursor
   )

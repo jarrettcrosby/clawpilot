@@ -210,6 +210,7 @@ type ProductCandidate = {
   mappingStatus?: string | null
   productGlobalId?: string | null
   productMappingGlobalId?: string | null
+  lastErrorCode?: string | null
   unitMultiplier?: number | null
   currency?: string | null
   priceMinor?: number | null
@@ -4043,6 +4044,15 @@ export default function CommerceIntakeWorkflow({
                             This retained candidate expired. Use the catalog
                             fetch above to stage the provider&apos;s current
                             revision.
+                          </Alert>
+                        ) : candidate.lastErrorCode ? (
+                          <Alert severity="warning">
+                            Automatic creation could not finish (
+                            {candidate.lastErrorCode}). ClawPilot will retry this
+                            current provider revision during the next catalog
+                            reconciliation. You can also open{' '}
+                            <strong>Choose product decision</strong> below to
+                            resolve it now.
                           </Alert>
                         ) : (
                           <Alert severity="warning">

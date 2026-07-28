@@ -313,6 +313,7 @@ type ProductCandidateRow = {
   product_global_id: string | null
   product_mapping_id: string | null
   product_mapping_global_id: string | null
+  last_error_code: string | null
   blocking_codes: string[]
   unsupported_reason_code: string | null
   unsupported_reason_detail: string | null
@@ -336,6 +337,23 @@ function safeJson(value: unknown) {
   return JSON.stringify(value, (_key, item) => (
     typeof item === 'bigint' ? item.toString() : item
   ))
+}
+
+export function preserveCommerceProductCandidateEvidence(input: {
+  priorCredentialVersion: number
+  currentCredentialVersion: number
+  priorSourceRevision: string
+  incomingSourceRevision: string
+  priorSourceHash: string
+  incomingSourceHash: string
+  priorMappingState: 'unresolved' | 'resolved' | 'unsupported'
+}) {
+  return (
+    input.priorCredentialVersion === input.currentCredentialVersion
+    && input.priorSourceRevision === input.incomingSourceRevision
+    && input.priorSourceHash === input.incomingSourceHash
+    && input.priorMappingState !== 'unresolved'
+  )
 }
 
 function availableValue<T>(field: CommerceDataField<T>): T | null {
@@ -1205,6 +1223,7 @@ const PRODUCT_CANDIDATE_SELECT = `SELECT
   product.reference_code AS product_global_id,
   candidate.product_mapping_id::text,
   mapping.global_id AS product_mapping_global_id,
+  candidate.last_error_code,
   candidate.blocking_codes,
   candidate.unsupported_reason_code,
   candidate.unsupported_reason_detail,
@@ -3851,13 +3870,15 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
             source_revision: string
             source_hash: string
             credential_version: number
+            mapping_state: 'unresolved' | 'resolved' | 'unsupported'
           }>(
             `SELECT DISTINCT ON (candidate.external_variant_id)
                candidate.id::text,
                candidate.external_variant_id,
                candidate.source_revision,
                candidate.source_hash,
-               run.credential_version
+               run.credential_version,
+               candidate.mapping_state
              FROM operations_commerce_product_candidates candidate
              JOIN operations_commerce_intake_runs run
                ON run.organization_id = candidate.organization_id
@@ -4082,12 +4103,15 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
         const prior = latestProductEvidenceByVariant.get(
           variant.identity.value,
         )
-        if (
-          prior
-          && prior.credential_version === account.credential_version
-          && prior.source_revision === incomingSourceRevision
-          && prior.source_hash === variant.sourceHash
-        ) {
+        if (prior && preserveCommerceProductCandidateEvidence({
+          priorCredentialVersion: prior.credential_version,
+          currentCredentialVersion: account.credential_version,
+          priorSourceRevision: prior.source_revision,
+          incomingSourceRevision,
+          priorSourceHash: prior.source_hash,
+          incomingSourceHash: variant.sourceHash,
+          priorMappingState: prior.mapping_state,
+        })) {
           productCandidateByVariant.set(
             variant.identity.value,
             prior.id,
@@ -5738,6 +5762,7 @@ export async function readCommerceIntakeStateFromPostgres(input: {
       mappingStatus: candidate.mapping_state,
       productGlobalId: candidate.product_global_id,
       productMappingGlobalId: candidate.product_mapping_global_id,
+      lastErrorCode: candidate.last_error_code,
       unitMultiplier: safeNumber(candidate.unit_multiplier),
       currency: candidate.currency_code,
       priceMinor: safeMinor(candidate.price_minor),
@@ -5900,6 +5925,38 @@ function replayPayload(receipt: ReceiptRow) {
     ...(receipt.result_payload || {}),
     replayed: true,
   }
+}
+
+export function automaticLocalProductSku(input: {
+  providerSku: string | null
+  localSkuOccupied: boolean
+}) {
+  const providerSku = input.providerSku?.trim() || null
+  return providerSku && !input.localSkuOccupied ? providerSku : null
+}
+
+export function automaticProductFailureCode(error: unknown) {
+  const candidate = (
+    error
+    && typeof error === 'object'
+    && 'code' in error
+  )
+    ? String((error as { code?: unknown }).code || '')
+    : ''
+  if (/^[A-Z][A-Z0-9_]{2,127}$/.test(candidate)) return candidate
+  if (candidate === '23505') {
+    return 'COMMERCE_PRODUCT_AUTO_CREATE_IDENTITY_CONFLICT'
+  }
+  if (candidate === '23514') {
+    return 'COMMERCE_PRODUCT_AUTO_CREATE_VALIDATION_FAILED'
+  }
+  if (candidate === '23503') {
+    return 'COMMERCE_PRODUCT_AUTO_CREATE_REFERENCE_CONFLICT'
+  }
+  if (candidate === '40001' || candidate === '40P01') {
+    return 'COMMERCE_PRODUCT_AUTO_CREATE_RETRYABLE_CONFLICT'
+  }
+  return 'COMMERCE_PRODUCT_AUTO_CREATE_FAILED'
 }
 
 export async function resolveCommerceProductCandidateInPostgres(input: {
@@ -6201,6 +6258,7 @@ export async function resolveCommerceProductCandidateInPostgres(input: {
       sku: string | null
     }
     let productWasCreated = false
+    let automaticLocalSkuOmitted = false
     if (preservedAutomaticMapping) {
       product = {
         id: preservedAutomaticMapping.product_id,
@@ -6277,6 +6335,30 @@ export async function resolveCommerceProductCandidateInPostgres(input: {
           sku: existing.sku,
         }
       } else {
+        let localProductSku = input.resolution.sku?.trim() || null
+        if (input.automatic && localProductSku) {
+          await acquireTransactionAdvisoryLock(
+            client,
+            `commerce-catalog-local-sku:${candidate.pipeline_id}:${
+              localProductSku.toLowerCase()
+            }`,
+          )
+          const occupiedLocalSku = await client.query(
+            `SELECT 1
+             FROM crm_products
+             WHERE pipeline_id = $1::uuid
+               AND sku IS NOT NULL
+               AND lower(btrim(sku)) = lower(btrim($2))
+             LIMIT 1
+             FOR UPDATE`,
+            [candidate.pipeline_id, localProductSku],
+          )
+          automaticLocalSkuOmitted = occupiedLocalSku.rowCount === 1
+          localProductSku = automaticLocalProductSku({
+            providerSku: localProductSku,
+            localSkuOccupied: automaticLocalSkuOmitted,
+          })
+        }
         const staged = await stageCrmRecordWithClient(client, {
           entity: 'products',
           pipelineId: candidate.pipeline_id,
@@ -6300,11 +6382,16 @@ export async function resolveCommerceProductCandidateInPostgres(input: {
               sku: candidate.sku_snapshot,
               barcode: candidate.barcode_snapshot,
             },
+            localCatalog: {
+              sku: localProductSku,
+              providerSkuOmittedBecauseDuplicate:
+                automaticLocalSkuOmitted,
+            },
           },
           actorEmail: input.actorEmail,
           fields: {
             name: input.resolution.name.trim(),
-            sku: input.resolution.sku?.trim() || undefined,
+            sku: localProductSku || undefined,
             price:
               input.resolution.unitPriceMinor / (10 ** decimals),
             currency,
@@ -6319,7 +6406,7 @@ export async function resolveCommerceProductCandidateInPostgres(input: {
         product = {
           id: staged.id,
           globalId: staged.referenceCode,
-          sku: input.resolution.sku?.trim() || null,
+          sku: localProductSku,
         }
         productWasCreated = true
       }
@@ -6427,6 +6514,7 @@ export async function resolveCommerceProductCandidateInPostgres(input: {
       replacedProductMappingGlobalId: mapping.replacedMappingGlobalId,
       automatic: Boolean(input.automatic),
       automaticPolicyRevision: input.automatic?.policyRevision || null,
+      automaticLocalSkuOmitted,
       providerWrites: 0,
       syncCursorAdvanced: false,
       replayed: false,
@@ -6455,6 +6543,7 @@ export async function resolveCommerceProductCandidateInPostgres(input: {
         automaticPolicyVersion: input.automatic?.policyVersion || null,
         automaticPolicyRevision: input.automatic?.policyRevision || null,
         productCreated: productWasCreated,
+        automaticLocalSkuOmitted,
         existingMappingPreserved: Boolean(preservedAutomaticMapping),
         productGlobalId: product.globalId,
         productMappingGlobalId: mapping.global_id,
@@ -6509,6 +6598,83 @@ export function automaticProductResolution(
     },
     reason: null,
   }
+}
+
+async function recordAutomaticProductFailureInPostgres(input: {
+  runtime: CommerceRuntimeCredentialRecord
+  actorEmail: string
+  candidateGlobalId: string
+  candidateRowVersion: number
+  errorCode: string
+}) {
+  return withTransaction(async (client) => {
+    const account = await resolveAccount(client, {
+      organizationId: input.runtime.organizationId,
+      accountGlobalId: input.runtime.globalId,
+    })
+    const failed = await client.query<{
+      global_id: string
+      row_version: string
+    }>(
+      `UPDATE operations_commerce_product_candidates candidate
+       SET last_error_code = $5,
+           row_version = row_version + 1,
+           updated_by = $6,
+           updated_at = now()
+       WHERE candidate.organization_id = $1::uuid
+         AND candidate.integration_account_id = $2::uuid
+         AND candidate.global_id = $3
+         AND candidate.row_version = $4::bigint
+         AND candidate.workflow_state IN ('held', 'resolving')
+         AND candidate.mapping_state = 'unresolved'
+         AND candidate.expires_at > now()
+         AND EXISTS (
+           SELECT 1
+           FROM operations_commerce_intake_runs run
+           WHERE run.organization_id = candidate.organization_id
+             AND run.integration_account_id
+               = candidate.integration_account_id
+             AND run.pipeline_id = candidate.pipeline_id
+             AND run.id = candidate.run_id
+             AND run.credential_version = $7::integer
+             AND run.resource = 'products'
+             AND run.workflow_state <> 'expired'
+             AND run.expires_at > now()
+         )
+       RETURNING candidate.global_id, candidate.row_version::text`,
+      [
+        account.organization_id,
+        account.id,
+        input.candidateGlobalId,
+        input.candidateRowVersion,
+        input.errorCode,
+        input.actorEmail,
+        input.runtime.credentialVersion,
+      ],
+    )
+    const candidate = failed.rows[0]
+    if (!candidate) return false
+    await recordAuditEvent({
+      actor: input.actorEmail,
+      eventType: 'commerce.intake.product_candidate.automatic_failed',
+      aggregateType: 'operations.commerce_product_candidate',
+      aggregateId: candidate.global_id,
+      organizationId: account.organization_id,
+      eventKey:
+        `commerce-product-candidate:${candidate.global_id}:automatic-failed:${
+          input.candidateRowVersion
+        }:${input.errorCode}`,
+      payload: {
+        provider: account.provider,
+        errorCode: input.errorCode,
+        rowVersion: Number(candidate.row_version),
+        retryDisposition: 'next_catalog_reconciliation_or_manual_resolution',
+        providerWrites: 0,
+        syncCursorAdvanced: false,
+      },
+    }, client)
+    return true
+  })
 }
 
 export async function autoCreateCommerceProductsForRunInPostgres(input: {
@@ -6572,6 +6738,7 @@ export async function autoCreateCommerceProductsForRunInPostgres(input: {
   let created = 0
   let mappedExisting = 0
   let failed = 0
+  const failedByCode: Record<string, number> = {}
   let stoppedBecauseDisabled = false
   for (const candidate of selection.candidates) {
     const automatic = automaticProductResolution(candidate)
@@ -6609,6 +6776,8 @@ export async function autoCreateCommerceProductsForRunInPostgres(input: {
       }
     } catch (error) {
       failed += 1
+      const errorCode = automaticProductFailureCode(error)
+      failedByCode[errorCode] = (failedByCode[errorCode] || 0) + 1
       if (
         error instanceof CommerceIntegrationRequestError
         && error.code === 'COMMERCE_PRODUCT_AUTO_CREATE_DISABLED'
@@ -6616,6 +6785,13 @@ export async function autoCreateCommerceProductsForRunInPostgres(input: {
         stoppedBecauseDisabled = true
         break
       }
+      await recordAutomaticProductFailureInPostgres({
+        runtime: input.runtime,
+        actorEmail: input.actorEmail,
+        candidateGlobalId: candidate.global_id,
+        candidateRowVersion: Number(candidate.row_version),
+        errorCode,
+      })
     }
   }
   const remainingUnresolved = await withTransaction(async (client) => {
@@ -6666,6 +6842,7 @@ export async function autoCreateCommerceProductsForRunInPostgres(input: {
     ),
     skippedByReason,
     failed,
+    failedByCode,
     stoppedBecauseDisabled,
     remainingUnresolved,
     providerWrites: 0,

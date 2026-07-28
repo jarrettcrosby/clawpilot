@@ -60,11 +60,17 @@ export type FaireBrandProfile = FaireJsonObject
 export type FaireProduct = FaireJsonObject
 export type FaireOrder = FaireJsonObject
 
-export type FaireProductsPage = FaireJsonObject & {
+export type FaireCursorPage = {
+  page?: number
+  limit?: number
+  cursor?: string | null
+}
+
+export type FaireProductsPage = FaireJsonObject & FaireCursorPage & {
   products: FaireProduct[]
 }
 
-export type FaireOrdersPage = FaireJsonObject & {
+export type FaireOrdersPage = FaireJsonObject & FaireCursorPage & {
   orders: FaireOrder[]
 }
 
