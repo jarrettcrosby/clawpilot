@@ -121,6 +121,19 @@ Migration `0087_operations_carrier_credentials.sql` adds the organization-scoped
 
 Migration `0088_operations_sandbox_rating_and_mock_retirement.sql` adds an append-only `grq` sandbox-rate evidence record. An organization manager may run one UPS CIE or FedEx Sandbox rate request from **Settings > Integrations > Shipping** only when that provider's sandbox credential and selected billing account are active and verified. The selected account's sender identity and registered address are the origin, the operator may edit a validated U.S. destination, and one fixed `Test Product` parcel measures `12 x 10 x 6 in` and weighs `5 lb`. Rating is sender-billed in this bounded flow. The browser receives normalized quotes and the evidence Global ID; durable evidence binds the exact request while omitting credentials, access tokens, account numbers, raw provider bodies, and full address PII.
 
+Migration `0136_operations_cartonization_package_rates.sql` adds a second,
+explicit `cartonization_package_rate` purpose to that append-only evidence
+table. A cartonization caller may replace the fixed diagnostic parcel only with
+the canonical package shape: a plain-text description, exterior length, width,
+and height in inches, and gross weight in pounds. Unexpected fields, implicit
+unit conversion, strings masquerading as numbers, non-positive or out-of-range
+values, and precision beyond three decimal places fail before provider I/O.
+The normalized parcel is passed unchanged to the UPS and FedEx rate adapters
+and is bound into the redacted request hash. Omitting the parcel preserves the
+fixed `sandbox_rate_test` diagnostic. Only that fixed diagnostic purpose may be
+consumed by the sandbox rate-test label workflow; cartonization rate evidence
+cannot create, void, or print a label.
+
 Migration `0117_operations_print_agent_capabilities.sql` closes the delivery
 capability boundary after carrier label creation. A bound printer profile must
 be a subset of the enrolled agent's declared format, media, and document

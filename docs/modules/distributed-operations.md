@@ -15,11 +15,12 @@ app_visible: false
 
 Provide native distributed order management, warehouse execution, carrier shipping, and 3PL billing inside ClawPilot. The module serves 3PL operators, retailers, distributors, manufacturers, and fulfillment operators without creating a second application or duplicating CRM, product, identity, audit, task, document, notification, or accounting masters.
 
-This document remains the **target contract** for the full module. The current development slice includes operations migrations `0081` through `0094`, `0097` through `0101`, `0107` through `0127`, and `0130`; a tenant-scoped order workbench; explicit idempotent warehouse-release, bulk all-ready pick-confirmation, pack-verification, sandbox-label-create, and sandbox-label-void commands for eligible non-archived orders; a durable exception queue; scoped activation controls; canonical CRM catalog projection; provider-customer resolution; team-managed product/package imports; warehouse-scoped Packaging Materials management; organization-scoped direct carrier credential administration; UPS and FedEx sandbox rating with an account-derived origin and editable test destination; a separate rate-selected diagnostic label-create with customer-selected provider-native output, stored-label download/print, and void workflow; immutable provider-source bytes plus an explicit derivative-artifact provenance boundary; append-only redacted provider evidence; carrier-rate delegation; direct multi-account carrier CSV import; selected-batch GL Coding; separate financial review; billed-actual Triangle/Square/Circle settlement evidence; append-only settlement status transitions; capability-aware printer configuration; enrolled local print-agent delivery with controlled reprints, same-warehouse fallback, and agent-declared format/media/document capabilities; shipment- and exact-package-specific PDF packing-list renderers, immutable artifact-payload store, authenticated artifact stream, tracking-observation schema, and commerce-fulfillment export state model; a Shopify/Faire sales-channel control plane; a bounded development-only Shopify held-order preview; leased development-only full-product-catalog reconciliation and current-order staging workers; guarded development-only product-catalog mapping and operational-order workflows with durable pre-call read intents, resource-scoped encrypted continuations, first-class rejection dispositions, and canonical promotion; a bounded, manager-triggered, read-only Shopify inventory reconciliation for one eligible location and warehouse; a strict development-only Shopify cartonization preview; and active-workspace measurement-presentation and product-currency defaults. The deterministic mock flow remains an internal automated-test harness only. Hosted mock generation is disabled and historical mock artifacts are archived. These features prove PostgreSQL authority and application boundaries; they do not establish historical closed-order commerce import, continuous or production provider inventory synchronization, production commerce workers, production carrier mutation, tracking ingestion, commerce-export dispatch, pickup scheduling, accounting export, invoice/AR workflow, payment adapters, or production fulfillment-optimizer activation.
+This document remains the **target contract** for the full module. The current development slice includes operations migrations `0081` through `0094`, `0097` through `0101`, and `0107` through `0137`; a tenant-scoped order workbench; explicit idempotent warehouse-release, bulk all-ready pick-confirmation, pack-verification, sandbox-label-create, and sandbox-label-void commands for eligible non-archived orders; a durable exception queue; scoped activation controls; canonical CRM catalog projection; provider-customer resolution; team-managed product/package imports; warehouse-scoped Packaging Materials management; organization-scoped direct carrier credential administration; UPS and FedEx sandbox rating with an account-derived origin and editable test destination; a separate rate-selected diagnostic label-create with customer-selected provider-native output, stored-label download/print, and void workflow; immutable provider-source bytes plus an explicit derivative-artifact provenance boundary; append-only redacted provider evidence; carrier-rate delegation; direct multi-account carrier CSV import; selected-batch GL Coding; separate financial review; billed-actual Triangle/Square/Circle settlement evidence; append-only settlement status transitions; capability-aware printer configuration; enrolled local print-agent delivery with controlled reprints, same-warehouse fallback, and agent-declared format/media/document capabilities; shipment- and exact-package-specific PDF packing-list renderers, immutable artifact-payload store, authenticated artifact stream, tracking-observation schema, and commerce-fulfillment export state model; a Shopify/Faire sales-channel control plane; a bounded development-only Shopify held-order preview; leased development-only full-product-catalog reconciliation and current-order staging workers; guarded development-only product-catalog mapping and operational-order workflows with durable pre-call read intents, resource-scoped encrypted continuations, first-class rejection dispositions, and canonical promotion; a bounded, manager-triggered, read-only Shopify inventory reconciliation for one eligible location and warehouse; a strict development-only Shopify cartonization preview; a recipe-first, assumption-watermarked sandbox package-and-rate evidence workflow; and active-workspace measurement-presentation and product-currency defaults. The deterministic mock flow remains an internal automated-test harness only. Hosted mock generation is disabled and historical mock artifacts are archived. These features prove PostgreSQL authority and application boundaries; they do not establish historical closed-order commerce import, continuous or production provider inventory synchronization, production commerce workers, production carrier mutation, tracking ingestion, commerce-export dispatch, pickup scheduling, accounting export, invoice/AR workflow, payment adapters, or production fulfillment-optimizer activation.
 
-Migrations `0128` through `0131` extend this slice with the pack hierarchy,
-CRM CSV transfer evidence, durable sales-channel lifecycle projection, and
-guarded canonical Product identity reconciliation described below.
+Migrations `0128` through `0138` extend this slice with the pack hierarchy,
+CRM CSV transfer evidence, durable sales-channel lifecycle and offer
+projection, guarded canonical Product identity reconciliation, and
+database-enforced packaging-dimension evidence described below.
 
 Migration `0126` is the bounded, owner-safe data correction that renames only
 the exact original imperial-named `starter_assortment` records to unit-neutral
@@ -68,6 +69,7 @@ The implemented slice provides:
 - a reusable progressive-disclosure setup journey across Commerce, carrier, Google Workspace, QuickBooks, Toast, and Maton Settings panels, with provider-specific ordered steps and copyable nonsecret operational facts derived only from each panel's existing organization-scoped state;
 - a Faire External API v2 brand client for the fixed production origin, brand/product/order and selector-based inventory reads plus documented processing/cancellation/availability/shipment request translations; Faire is explicitly recorded as production-only and polling-only, with no public webhook, sandbox, retailer custom API, or return-write claim;
 - responsive Orders and Exceptions views with permanent `gor` and `gex` identities, plus stable hash-addressed, horizontally scrollable Orders, Exceptions, Commerce imports, Receiving, Warehouses, Packaging materials, Carrier invoicing, Shipment pricing & GL, and Printing subpanel navigation with touch panning and accessible edge scroll controls on narrow screens; the expanded left-navigation Operations submenu and collapsed flyout expose that same complete submodule set without changing existing permission boundaries. Packaging materials owns organization-scoped cartons, poly mailers, padded mailers, dimensions, tare and maximum weights, unit cost, draft/active state, and per-existing-warehouse availability/on-hand/reorder facts. Its six-item starter assortment is draft-only and cannot become optimizer-eligible until real costs and positive available stock are recorded. Carrier invoicing owns immutable source-file and actual-cost evidence. Shipment pricing & GL owns shipment-to-shipper assignment, retained MUD-price review, variance and settlement review, and GL outputs; shipper-assignment rules do not replace or mutate the independently versioned MUD;
+- incomplete customer-supplied packaging-material drafts that retain only the supplied dimensions, explicit inner/outer/unconfirmed basis, evidence type/reference, and source while leaving unknown depth, tare, maximum weight, cost, currency, and stock null; activation fails closed until verified usable inner dimensions and every operating fact are present. A separate trusted-development, plan-first AG Alchemy command stages the four customer-supplied material drafts and six explicit provider sell-unit pack classes only after an administrator supplies exact `gp` Product Global IDs and an explicit active owner/admin actor. It verifies the Railway environment name and database identity, binds apply to the exact fresh plan fingerprint, projects every assigned Product's current exact channel state to the class's default pack version with retained provider source revision/hash, and fails if that provider evidence is absent. Its title/SKU suggestions are discovery aids only. Guarded apply may replace the six exact untouched synthetic starter drafts and their empty stock placeholders, but fails on partial, active, edited, referenced, or otherwise conflicting starter state. It never activates a material, profile, relationship, or recipe or infers intact-case inventory;
 - audited exception transitions for acknowledge, resolve, dismiss, and reopen, with tenant isolation and retained resolution history;
 - an in-module guide that directs carrier sandbox testing to **Settings > Integrations > Shipping** and identifies deterministic mocks as automated-test-only;
 - disposable PostgreSQL acceptance coverage that applies the full migration chain and validates atomic writes, replay, rollback, append-only evidence, money totals, and cross-workspace isolation.
@@ -82,9 +84,140 @@ An import updates an existing product when its SKU matches case-insensitively or
 
 The current vertical slice intentionally maintains one editable default package profile per product. The schema leaves room for multiple named profiles and facility-specific packaging in a later cartonization slice, but the application must not imply that those choices are available yet.
 
+Migration `0128` and `scripts/stage-ag-alchemy-pack-hierarchy.mjs` add a
+separate evidence-staging boundary behind that existing product editor. The AG
+command can stage customer-confirmed `each`, `inner_pack`, and `case` versions,
+their exact contains relationships, and approved-but-nonactive recipes for
+loose carton packing:
+
+- loose 6 oz bag listings as recipe-only eaches, with an `AG12V2`
+  customer-confirmed range of 12 through 18 and a customer-named 20 lb box
+  maximum of 30 whose minimum remains unknown and therefore unusable until
+  confirmed;
+- explicit prepackaged 6 oz case-of-12 listings as a separate default sell
+  unit in `AG12V2`, represented by its contains relationship and never by an
+  assembly recipe;
+- loose 2 oz bag listings as eaches with a prepackaged case-of-36 relationship
+  in `AG12V2`, without an assembly recipe;
+- explicit prepackaged 2 oz display-carton listings as a separate default sell
+  unit containing 6 bags, plus an assembly-allowed outer shipping box holding
+  up to 6 complete display cartons;
+- one 10 lb bulk unit in `AG12V2`; and
+- one 20 lb bulk unit in the customer-named 20 lb box.
+
+The command does not apply a classification from title or SKU. It prioritizes
+explicit `2 oz Carton` and `6 oz 12pk` discovery suggestions so those listings
+cannot inherit loose-bag dimensions, but apply still requires an explicit,
+nonduplicated `gp` assignment. The assignment is not accepted as evidence by
+itself: each current Shopify/Faire variant must be mapped to the class's
+explicit default sell-unit profile using its durable source revision/hash.
+Net-content names such as `10 lb` and `20 lb` are not treated as gross shipping
+weights.
+
+Migration `0134` connects an exact current Shopify or Faire variant-pack
+mapping to new order candidates without activating the staged Product profile
+or any incomplete packaging material. Automatic resolution accepts only a
+current `customer_confirmed` or `active` pack version with complete **outer**
+dimensions and measured, customer-confirmed, or provider evidence. The mapping
+and current channel-state source revision and hash must still match, and a
+provider-supplied pack multiplier must equal the mapped base-each quantity.
+Candidate lines retain mapping/profile-version Global IDs, row-version fences,
+package level, base-each quantity, and the explicit weight source.
+
+Gross shipping weight is never inferred from Product names or nominal content.
+Resolution uses an explicit pack-version gross weight first, an exact
+provider-order package weight second, or the matching current provider-catalog
+weight third. If weight is absent, pack quantities conflict, or provider
+dimensions conflict with the customer-confirmed pack, the otherwise eligible
+association remains review evidence but the line stays blocked for package
+resolution. Changed or ineligible source evidence is not associated.
+Promotion revalidates every mapping, version, source, dimension,
+weight, and active Product mapping under row locks; a stale fact requires a
+fresh order intake. Manual or compatibility-profile resolution clears mapped
+pack provenance. The optimizer input schema remains unchanged: cartonization
+consumes only the resulting candidate-line dimension and weight snapshot, and
+draft materials still fail closed until verified inner dimensions, tare,
+capacity, cost/currency, and positive warehouse stock make them active.
+
+Migration `0135` makes recipe-driven cartonization explicit. A max-capacity
+recipe records a nullable customer-approved minimum, a normalized content
+compatibility key, and whether fit evidence permits compatible Products to
+share one outbound material. Mixed pooling requires a max-capacity recipe,
+nonexclusive contents, the exact same compatibility key, and timestamped
+customer-confirmed or measured fit evidence. An active max-capacity recipe
+cannot retain an unknown minimum. A profile marked `approved_recipe_only`
+requires timestamped referenced evidence and can never silently fall back to
+geometric fitting.
+
+The pure hybrid planner runs the approved-recipe phase before exposing
+remaining `rigid_3d` or `compressible` lines to the geometric optimizer. Every
+Product in a mixed pool must expose the same material, capacity, applied
+minimum, compatibility key, and current row-version evidence. Stale profiles,
+recipes, or materials block; missing recipe evidence blocks recipe-only
+flexible items. The AG loose 6 oz recipes share
+`ag-alchemy.loose-six-ounce-bags.v1` and may pool flavors, but `AG12V2` retains
+the customer-confirmed 12-unit minimum. A smaller order such as six bags is
+only an assumption-backed **read-only sandbox** option when the caller supplies
+an explicit minimum override with a reason and evidence reference. Production
+planning rejects all such overrides, and the 20 lb box remains blocked until
+its currently unknown minimum is confirmed.
+
+Hybrid output includes policy and algorithm versions, canonical input/result
+hashes, stable package keys and sequence, exact material/profile/recipe row
+versions, customer material dimensions and evidence, recipe minimum/maximum,
+line/Product/title/quantity allocations, and content weight. Rating readiness
+is separate: missing rated outer dimensions or tare weight is returned as a
+package-level blocker rather than invented from inner dimensions. This pure
+planner performs no database, provider, inventory, shipment, rate, label, or
+packing-list write.
+
+Migration `0136` adds a distinct `cartonization_package_rate` purpose to the
+existing UPS and FedEx sandbox adapters. The caller supplies the exact planned
+parcel exterior and gross weight; omitting that parcel preserves the separate
+fixed diagnostic rate test. A cartonization quote cannot enter the diagnostic
+label-create workflow.
+
+Migration `0137` seals a reloadable `gcte` evidence aggregate after every
+planned package has exactly one immutable UPS and one immutable FedEx `grq`
+edge. One repeatable-read transaction binds the exact organization, commerce
+account and candidate revision, active warehouse, latest successful
+account-plus-warehouse inventory run, current variant mapping and pack-profile
+row, selected material row, and every matching current recipe. Each shipping
+line retains an explicit committed-inventory quantity, including zero; the
+assumed total may not exceed provider-committed evidence, and demand may not
+exceed operational availability plus that retained attribution.
+
+The development sandbox proof may use current customer-confirmed profiles and
+recipes plus a draft customer-supplied material. Rated exterior dimensions,
+tare, and any below-minimum recipe quantity require an explicit operator
+acknowledgement and are stored only in the evidence aggregate. The UI
+watermarks that aggregate as **assumption-backed sandbox evidence, not
+executable or actual billed cost** and exposes a direct reload link under
+**Operations > Commerce imports**. It never activates or mutates Product,
+material, recipe, inventory, order, shipment, label, print, or provider
+records; only append-only ClawPilot evidence and carrier-rate request rows are
+written.
+
+Migration `0138` closes three evidence-integrity gaps. Every planned package
+now retains immutable child rows for all contributing approved recipes,
+Products, and input-profile revisions, including mixed-product cartons. The
+header stores the confirmed destination fingerprint, each package stores the
+exact normalized carrier parcel, and each quote stores the linked carrier
+request hash plus a package-rate-context hash. A deferred database check
+requires the linked `grq` destination and parcel to match that saved package
+proof exactly. A durable semantic command reservation is claimed before either
+carrier read: a completed retry reloads the sealed `gcte`, a concurrent retry
+remains pending, and neither path creates additional carrier request rows.
+
 ### Packaging Materials Workflow
 
-**Operations > Packaging materials** manages the consumable outbound container catalog separately from product package profiles. Materials are organization-scoped cartons, poly mailers, or padded mailers with canonical millimeter dimensions, tare and maximum weight, exact unit cost/currency, draft/active status, and optimistic row version. Warehouse stock rows can reference only an existing active warehouse and record availability, on-hand quantity, reorder point, and reorder quantity. Activating a material requires complete physical and cost facts; an optimizer candidate additionally requires an available warehouse row with positive on-hand stock.
+**Operations > Packaging materials** manages the consumable outbound container catalog separately from product package profiles. Materials are organization-scoped cartons, poly mailers, or padded mailers with canonical millimeter dimensions, explicit dimension basis and evidence, nullable draft tare and maximum weight, nullable draft unit cost/currency, draft/active status, source, and optimistic row version. A draft may retain a partial customer measurement such as a 9 by 12 envelope with unknown depth; the API and UI preserve that missing value as null and display the activation gaps rather than coercing it to zero. Warehouse stock rows can reference only an existing active warehouse and record availability, on-hand quantity, reorder point, and reorder quantity. Activating a material requires verified usable inner dimensions, nonunknown evidence, complete tare/capacity and cost facts; an optimizer candidate additionally requires an available warehouse row with positive on-hand stock.
+
+Migration `0133` makes the application evidence rule database-authoritative:
+`customer_confirmed` and `measured` dimensions require both their confirmation
+timestamp and a nonblank evidence reference. When any dimension, basis,
+evidence type, or evidence reference changes, the persistence command refreshes
+the confirming actor and timestamp instead of retaining stale provenance.
 
 The starter command is idempotent and creates only six manageable draft candidates. It never invents landed cost, historical suitability, or stock and therefore cannot make those drafts eligible for cartonization. The readiness summary uses the last 365 days of shipped facts to report sample count, product-dimension gaps, cost gaps, stock gaps, eligible materials, and reorder needs. It is evidence for operator maintenance, not a claim that the assortment is already optimal.
 
@@ -135,7 +268,9 @@ The product lane reads bounded Shopify variant pages or Faire product pages into
 
 Commerce-created CRM names show the provider product title once and append only meaningful variant option values. A selected option is not appended when that complete phrase is already present in the product title at Unicode alphanumeric boundaries; an option found only inside a larger word remains meaningful, and any other color or size options retain provider order. Shopify `Default Title`, Faire `default`, and a Shopify `displayName` that repeats the full product title are not master-product name content. A `Shopify` or `Faire` suffix is a temporary collision state, not the intended product model. One sellable inventory-and-pack identity owns one canonical `gp` Product whose read-only `salesChannels` field contains its exact provider listings. Each, inner-pack, case, and pallet identities remain separate Products; when their marketing title is otherwise identical, the canonical product name carries a meaningful pack qualifier such as `6 oz each` or `case of 12`, never a provider qualifier.
 
-Migration `0131` supplies the guarded **Resolve duplicate sales-channel product identities** workflow for records created under the earlier provider-isolation rule. An exact stable SKU or GTIN/barcode match can be reconciled in a reviewed batch. A name match alone never runs automatically and requires an administrator to confirm that the two rows represent the same sellable product and the same pack level. The canonical row is the record already carrying inventory, order, packaging, or CRM relationships; a duplicate that owns any such operational relationship fails closed. Reconciliation moves only the active provider-variant mapping and channel-state projection to the canonical Product, retains the old `gp` Global ID as a permanent alias, archives the duplicate projection, queues the corresponding SuiteCRM projection changes, and records an audit event. It deletes no Product, rewrites no historical candidate, order, inventory, packaging, or CRM relationship, and sends zero provider writes.
+Migration `0132` keeps each exact sales-channel listing as offer data on that canonical Product instead of flattening provider facts into the CRM master. The durable channel state retains provider product titles, full 512-character variant titles, SKU/barcode, exact wholesale, retail/current, and compare-at minor-unit money with each source currency, taxability, shipping requirement, and provider weight when supplied. The CRM editor presents Shopify selling price as **Current** and its distinct compare-at price as **Compare at**, while Faire retains separate **Wholesale** and **Retail** values and no invented compare-at value. Historical product-candidate money is deliberately not backfilled because those columns have provider-dependent semantics; money remains null until the next verified catalog observation. Reconciliation therefore may choose one canonical identity without relabeling Shopify current price as wholesale, changing either provider currency, or overwriting the editable ClawPilot product price.
+
+Migration `0131` supplies the guarded **Resolve duplicate sales-channel product identities** workflow for records created under the earlier provider-isolation rule. An exact stable SKU or GTIN/barcode match can be reconciled in a reviewed batch. A name match alone never runs automatically and requires an administrator to confirm that the two rows represent the same sellable product and the same pack level. The canonical row is the record already carrying inventory, order, packaging, or CRM relationships; a duplicate that owns any such operational relationship fails closed. Reconciliation moves only the active provider-variant mapping and channel-state projection to the canonical Product, retains the old `gp` Global ID as a permanent alias, archives the duplicate projection, queues the corresponding SuiteCRM projection changes, and records an audit event. Product-list search by that retired Global ID returns the canonical Product, and an authorized deep link resolves the same alias. Reconciliation deletes no Product, rewrites no historical candidate, order, inventory, packaging, or CRM relationship, and sends zero provider writes.
 
 `scripts/reconcile-ag-alchemy-commerce-product-names.mjs` remains the separate bounded development-only repair for display names created under the earlier convention. It is plan-first, checks the compiled Railway project/environment and development database fingerprint, reads the exact creation candidate named in each product source payload, independently locks and fingerprints every active mapping for each target product, and blocks any product that no longer has exactly its one original creation mapping. It also fences the product hash/time and candidate revision, preserves manually changed names, and enforces both the exact execution confirmation and fresh plan fingerprint at the mutation boundary. Apply changes no product, mapping, candidate, inventory, order, package, or provider identity; it queues the renamed product for normal SuiteCRM synchronization, refreshes the pipeline product dropdown, and appends product-level and summary audit evidence as the `system` actor with `is_system = true` and zero provider writes.
 

@@ -18,6 +18,8 @@ type AccountRow = {
 type CandidateRow = {
   order_candidate_id: string
   global_id: string
+  order_number_snapshot: string
+  source_hash: string
   row_version: string
   workflow_state: string
   currency_code: string
@@ -37,6 +39,14 @@ type CandidateLineRow = {
   length_mm: number | null
   width_mm: number | null
   height_mm: number | null
+  packaging_source: string
+  packaging_weight_source: string | null
+  commerce_variant_pack_mapping_global_id: string | null
+  commerce_variant_pack_mapping_row_version: string | null
+  pack_profile_version_global_id: string | null
+  pack_profile_version_row_version: string | null
+  pack_profile_package_level: string | null
+  pack_profile_base_each_quantity: number | null
 }
 
 type WarehouseRow = {
@@ -204,6 +214,8 @@ async function readCandidate(
     `SELECT
        candidate.id::text AS order_candidate_id,
        candidate.global_id,
+       candidate.order_number_snapshot,
+       candidate.source_hash,
        candidate.row_version::text,
        candidate.workflow_state,
        candidate.currency_code,
@@ -267,11 +279,26 @@ async function readCandidateLines(
        line.weight_grams,
        line.length_mm,
        line.width_mm,
-       line.height_mm
+       line.height_mm,
+       line.packaging_source,
+       line.packaging_weight_source,
+       pack_mapping.global_id
+         AS commerce_variant_pack_mapping_global_id,
+       line.commerce_variant_pack_mapping_row_version::text,
+       pack_version.global_id AS pack_profile_version_global_id,
+       line.pack_profile_version_row_version::text,
+       line.pack_profile_package_level,
+       line.pack_profile_base_each_quantity
      FROM operations_commerce_order_candidate_lines line
      LEFT JOIN crm_products product
-       ON product.pipeline_id = line.pipeline_id
+      ON product.pipeline_id = line.pipeline_id
       AND product.id = line.product_id
+     LEFT JOIN operations_commerce_variant_pack_mappings pack_mapping
+       ON pack_mapping.organization_id = line.organization_id
+      AND pack_mapping.id = line.commerce_variant_pack_mapping_id
+     LEFT JOIN operations_product_pack_profile_versions pack_version
+       ON pack_version.organization_id = line.organization_id
+      AND pack_version.id = line.pack_profile_version_id
      WHERE line.organization_id = $1::uuid
        AND line.integration_account_id = $2::uuid
        AND line.order_candidate_id = $3::uuid
@@ -543,6 +570,8 @@ export async function readCartonizationPreviewSnapshotFromPostgres(input: {
       },
       candidate: {
         globalId: candidate.global_id,
+        orderNumber: candidate.order_number_snapshot,
+        sourceHash: candidate.source_hash,
         rowVersion,
         workflowState: candidate.workflow_state as
           CartonizationPreviewSnapshot['candidate']['workflowState'],
@@ -573,6 +602,31 @@ export async function readCartonizationPreviewSnapshotFromPostgres(input: {
                 length: line.length_mm as number,
                 width: line.width_mm as number,
                 height: line.height_mm as number,
+              }
+            : null,
+          packEvidence: (
+            line.commerce_variant_pack_mapping_global_id
+            && line.commerce_variant_pack_mapping_row_version
+            && line.pack_profile_version_global_id
+            && line.pack_profile_version_row_version
+            && line.pack_profile_package_level
+            && line.pack_profile_base_each_quantity
+          )
+            ? {
+                mappingGlobalId:
+                  line.commerce_variant_pack_mapping_global_id,
+                mappingRowVersion: Number(
+                  line.commerce_variant_pack_mapping_row_version,
+                ),
+                profileVersionGlobalId:
+                  line.pack_profile_version_global_id,
+                profileVersionRowVersion: Number(
+                  line.pack_profile_version_row_version,
+                ),
+                packageLevel: line.pack_profile_package_level,
+                baseEachQuantity: line.pack_profile_base_each_quantity,
+                packagingSource: line.packaging_source,
+                weightSource: line.packaging_weight_source,
               }
             : null,
         }

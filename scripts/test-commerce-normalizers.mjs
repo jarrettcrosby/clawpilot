@@ -363,6 +363,41 @@ const faireNormalized = faire.normalizeFaireCommerce(
     apiVersion: 'external-api-v2',
   },
 )
+
+const maximumVariantTitle = 'V'.repeat(512)
+const shopifyMaximumVariantTitleSource = clone(shopifySource)
+shopifyMaximumVariantTitleSource.products.nodes[0].variants.nodes[0].title =
+  maximumVariantTitle
+const shopifyMaximumVariantTitle = shopify.normalizeShopifyCommerce(
+  shopifyMaximumVariantTitleSource,
+  {
+    ...baseContext,
+    externalAccountId: 'gid://shopify/Shop/1',
+  },
+)
+assert.equal(
+  shopifyMaximumVariantTitle.products[0].variants[0].title,
+  maximumVariantTitle,
+  'Shopify variant titles must preserve the full 512-character normalizer bound',
+)
+
+const faireMaximumVariantTitleSource = clone(faireSource)
+faireMaximumVariantTitleSource.products[0].variants[0].name =
+  maximumVariantTitle
+const faireMaximumVariantTitle = faire.normalizeFaireCommerce(
+  faireMaximumVariantTitleSource,
+  {
+    ...baseContext,
+    externalAccountId: 'brand-1',
+    apiVersion: 'external-api-v2',
+  },
+)
+assert.equal(
+  faireMaximumVariantTitle.products[0].variants[0].title,
+  maximumVariantTitle,
+  'Faire variant titles must preserve the full 512-character normalizer bound',
+)
+
 const fairePageWrapped = faire.normalizeFaireCommerce({
   brand: clone(faireSource.brand),
   products: {

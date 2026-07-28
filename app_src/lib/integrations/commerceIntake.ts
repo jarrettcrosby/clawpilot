@@ -1602,6 +1602,7 @@ type ExecuteCommerceIntakeInput = {
 type CommerceIntakeExecutionOptions = {
   includeIntakeState: boolean
   hydrateProductInventory: boolean
+  providerAttemptActorEmail?: string | null
 }
 
 async function executeCommerceIntakeCommandInternal(
@@ -1890,6 +1891,9 @@ async function executeCommerceIntakeCommandInternal(
       : FAIRE_COMMERCE_NORMALIZER_VERSION
     const reservation = await reserveCommerceIntakeProviderReadInPostgres({
       ...shared,
+      providerAttemptActorEmail: options.providerAttemptActorEmail === undefined
+        ? input.actorEmail
+        : options.providerAttemptActorEmail,
       readIntentId,
       adapterVersion,
       redactedRequest,
@@ -2344,5 +2348,8 @@ export async function executeCommerceOrderPage(input: {
     // Do not return the retained candidate/rejection state to the poller.
     includeIntakeState: false,
     hydrateProductInventory: false,
+    // Provider-attempt attribution is nullable for an unattended system read;
+    // never borrow a historical human merely to satisfy optional evidence.
+    providerAttemptActorEmail: null,
   })
 }

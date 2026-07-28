@@ -193,6 +193,7 @@ const LABEL_SELECT = `
     JOIN operations_carrier_rate_requests rate
       ON rate.organization_id = label.organization_id
      AND rate.id = label.rate_request_id
+     AND rate.purpose = 'sandbox_rate_test'
     JOIN operations_carrier_accounts carrier_account
       ON carrier_account.organization_id = label.organization_id
      AND carrier_account.id = label.carrier_account_id
@@ -235,6 +236,7 @@ const ATTEMPT_SELECT = `
     JOIN operations_carrier_rate_requests rate
       ON rate.organization_id = attempt.organization_id
      AND rate.id = attempt.rate_request_id
+     AND rate.purpose = 'sandbox_rate_test'
     LEFT JOIN operations_carrier_rate_test_labels label
       ON label.organization_id = attempt.organization_id
      AND label.id = attempt.label_id`
@@ -483,7 +485,9 @@ export async function readCarrierRateTestCreateContextInPostgres(input: {
          ON carrier_account.organization_id = rate.organization_id
         AND carrier_account.integration_account_id = rate.integration_account_id
         AND carrier_account.id = rate.carrier_account_id
-      WHERE rate.organization_id = $1::uuid AND rate.global_id = $2
+      WHERE rate.organization_id = $1::uuid
+        AND rate.global_id = $2
+        AND rate.purpose = 'sandbox_rate_test'
       LIMIT 1`,
     [input.organizationId, input.rateEvidenceGlobalId],
   )
@@ -790,6 +794,7 @@ export async function finalizeCarrierRateTestLabelCreateInPostgres(input: {
          JOIN operations_carrier_rate_requests rate
            ON rate.organization_id = attempt.organization_id
           AND rate.id = attempt.rate_request_id
+          AND rate.purpose = 'sandbox_rate_test'
          JOIN operations_carrier_accounts carrier_account
            ON carrier_account.organization_id = attempt.organization_id
           AND carrier_account.integration_account_id = attempt.integration_account_id
@@ -1033,7 +1038,9 @@ export async function readCarrierRateTestLabelProviderContextInPostgres(input: {
             created.redacted_request AS create_request
        FROM operations_carrier_rate_test_labels label
        JOIN operations_carrier_rate_requests rate
-         ON rate.organization_id = label.organization_id AND rate.id = label.rate_request_id
+         ON rate.organization_id = label.organization_id
+        AND rate.id = label.rate_request_id
+        AND rate.purpose = 'sandbox_rate_test'
        JOIN operations_integration_accounts integration
          ON integration.organization_id = label.organization_id
         AND integration.id = label.integration_account_id

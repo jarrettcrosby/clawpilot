@@ -3704,6 +3704,16 @@ export async function listCrmRecordsInPostgres(input: {
        WHERE product.pipeline_id = $1::uuid
          AND ${activeCrmRecordSql('product')}
          AND ($2 = '' OR product.reference_code ILIKE '%' || $2 || '%'
+           OR EXISTS (
+             SELECT 1
+             FROM crm_product_identity_aliases product_identity
+             JOIN crm_products alias_product
+               ON alias_product.pipeline_id = product_identity.pipeline_id
+              AND alias_product.id = product_identity.alias_product_id
+             WHERE product_identity.pipeline_id = product.pipeline_id
+               AND product_identity.canonical_product_id = product.id
+               AND alias_product.reference_code ILIKE '%' || $2 || '%'
+           )
            OR product.name ILIKE '%' || $2 || '%' OR product.sku ILIKE '%' || $2 || '%'
            OR product.product_type ILIKE '%' || $2 || '%' OR product.category ILIKE '%' || $2 || '%'
            OR product.url ILIKE '%' || $2 || '%')

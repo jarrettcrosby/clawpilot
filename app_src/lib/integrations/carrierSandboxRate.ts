@@ -15,7 +15,7 @@ export type CarrierSandboxParty = {
   countryCode: 'US'
 }
 
-type CarrierSandboxParcel = {
+export type CarrierSandboxParcel = {
   description: string
   length: number
   width: number
@@ -24,6 +24,20 @@ type CarrierSandboxParcel = {
   weight: number
   weightUnit: 'LB'
 }
+
+export type CarrierSandboxParcelRequest = {
+  description: string
+  exteriorInches: {
+    length: number
+    width: number
+    height: number
+  }
+  grossPounds: number
+}
+
+export type CarrierSandboxRatePurpose =
+  | 'sandbox_rate_test'
+  | 'cartonization_package_rate'
 
 export type CarrierSandboxRateFixture = {
   origin: CarrierSandboxParty
@@ -94,6 +108,7 @@ export type CarrierSandboxRate = {
 export type CarrierSandboxRateResult = {
   provider: 'ups_rest' | 'fedex_rest'
   environment: 'sandbox'
+  purpose: CarrierSandboxRatePurpose
   fixture: CarrierSandboxRateFixture
   destinationFingerprint: string
   rates: CarrierSandboxRate[]
@@ -193,6 +208,18 @@ const PARTY_FIELDS = new Set([
   'countryCode',
 ])
 
+const PARCEL_FIELDS = new Set([
+  'description',
+  'exteriorInches',
+  'grossPounds',
+])
+
+const EXTERIOR_INCH_FIELDS = new Set([
+  'length',
+  'width',
+  'height',
+])
+
 function partyText(value: unknown, label: string, maximum: number) {
   if (typeof value !== 'string' || /[\u0000-\u001f\u007f]/.test(value)) {
     throw new Error(`Carrier sandbox ${label} must be plain text`)
@@ -202,6 +229,84 @@ function partyText(value: unknown, label: string, maximum: number) {
     throw new Error(`Carrier sandbox ${label} must be 1-${maximum} characters`)
   }
   return normalized
+}
+
+function exactObject(
+  value: unknown,
+  expected: ReadonlySet<string>,
+  label: string,
+) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`Carrier sandbox ${label} must be an object`)
+  }
+  const input = value as Record<string, unknown>
+  const unsupported = Object.keys(input).find((field) => !expected.has(field))
+  if (unsupported) {
+    throw new Error(`Carrier sandbox ${label} field is not supported: ${unsupported}`)
+  }
+  const missing = [...expected].find((field) => !(field in input))
+  if (missing) {
+    throw new Error(`Carrier sandbox ${label} field is required: ${missing}`)
+  }
+  return input
+}
+
+function boundedParcelDecimal(
+  value: unknown,
+  label: string,
+  maximum: number,
+) {
+  if (
+    typeof value !== 'number'
+    || !Number.isFinite(value)
+    || value <= 0
+    || value > maximum
+  ) {
+    throw new Error(
+      `Carrier sandbox ${label} must be a positive number no greater than ${maximum}`,
+    )
+  }
+  const canonical = Math.round(value * 1_000) / 1_000
+  if (Math.abs(value - canonical) > Number.EPSILON * Math.max(1, value) * 8) {
+    throw new Error(`Carrier sandbox ${label} supports at most three decimal places`)
+  }
+  return canonical
+}
+
+export function normalizeCarrierSandboxParcel(
+  value: unknown,
+): CarrierSandboxParcel {
+  const input = exactObject(value, PARCEL_FIELDS, 'parcel')
+  const exterior = exactObject(
+    input.exteriorInches,
+    EXTERIOR_INCH_FIELDS,
+    'parcel exterior inches',
+  )
+  return {
+    description: partyText(input.description, 'parcel description', 120),
+    length: boundedParcelDecimal(
+      exterior.length,
+      'parcel exterior length in inches',
+      108,
+    ),
+    width: boundedParcelDecimal(
+      exterior.width,
+      'parcel exterior width in inches',
+      108,
+    ),
+    height: boundedParcelDecimal(
+      exterior.height,
+      'parcel exterior height in inches',
+      108,
+    ),
+    dimensionUnit: 'IN',
+    weight: boundedParcelDecimal(
+      input.grossPounds,
+      'parcel gross weight in pounds',
+      150,
+    ),
+    weightUnit: 'LB',
+  }
 }
 
 export function normalizeCarrierSandboxParty(value: unknown): CarrierSandboxParty {
@@ -283,6 +388,7 @@ export function buildCarrierSandboxRateFixture(input: {
     countryCode: string
   }
   destination?: unknown
+  parcel?: unknown
 }): CarrierSandboxRateFixture {
   return {
     origin: normalizeCarrierSandboxParty({
@@ -297,7 +403,9 @@ export function buildCarrierSandboxRateFixture(input: {
     destination: input.destination === undefined
       ? legacyParty(CARRIER_SANDBOX_RATE_FIXTURE.destination)
       : normalizeCarrierSandboxParty(input.destination),
-    parcel: { ...CARRIER_SANDBOX_RATE_FIXTURE.parcel },
+    parcel: input.parcel === undefined
+      ? { ...CARRIER_SANDBOX_RATE_FIXTURE.parcel }
+      : normalizeCarrierSandboxParcel(input.parcel),
   }
 }
 
@@ -475,11 +583,12 @@ function parseUps(payload: Record<string, unknown>): CarrierSandboxRate[] {
 export function carrierSandboxRateRequestEvidence(
   provider: 'ups_rest' | 'fedex_rest',
   fixture: CarrierSandboxRateFixture = defaultCarrierSandboxRateFixture(),
+  purpose: CarrierSandboxRatePurpose = 'sandbox_rate_test',
 ) {
   const request = {
     provider,
     environment: 'sandbox',
-    purpose: 'sandbox_rate_test',
+    purpose,
     origin: fixture.origin,
     destination: fixture.destination,
     parcel: fixture.parcel,
@@ -489,7 +598,7 @@ export function carrierSandboxRateRequestEvidence(
     redactedRequest: {
       provider,
       environment: 'sandbox',
-      purpose: 'sandbox_rate_test',
+      purpose,
       shipment: {
         originFingerprint: carrierSandboxPartyFingerprint(fixture.origin),
         destinationFingerprint: carrierSandboxPartyFingerprint(fixture.destination),
@@ -513,6 +622,7 @@ export async function requestCarrierSandboxRates(
     fetchImpl?: typeof fetch
     timeoutMs?: number
     fixture?: CarrierSandboxRateFixture
+    purpose?: CarrierSandboxRatePurpose
   } = {},
 ): Promise<{ result: CarrierSandboxRateResult; evidence: CarrierSandboxRateEvidence }> {
   if (input.environment !== 'sandbox') {
@@ -539,6 +649,7 @@ export async function requestCarrierSandboxRates(
 
   const fetchImpl = options.fetchImpl || fetch
   const fixture = options.fixture || defaultCarrierSandboxRateFixture()
+  const purpose = options.purpose || 'sandbox_rate_test'
   const requestedAt = new Date().toISOString()
   const token = await requestCarrierAccessToken(input, { fetchImpl, timeoutMs: options.timeoutMs })
   const body = input.provider === 'fedex_rest'
@@ -582,12 +693,17 @@ export async function requestCarrierSandboxRates(
       throw new CarrierCredentialClientError('The carrier returned no usable sandbox rates', 502, 'CARRIER_SANDBOX_RATE_EMPTY')
     }
     const completedAt = new Date().toISOString()
-    const safeRequest = carrierSandboxRateRequestEvidence(input.provider, fixture)
+    const safeRequest = carrierSandboxRateRequestEvidence(
+      input.provider,
+      fixture,
+      purpose,
+    )
     const safeResponse = { rateCount: rates.length, rates }
     return {
       result: {
         provider: input.provider,
         environment: 'sandbox',
+        purpose,
         fixture,
         destinationFingerprint: carrierSandboxPartyFingerprint(fixture.destination),
         rates,

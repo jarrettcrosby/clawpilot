@@ -283,6 +283,13 @@ export async function GET() {
           crm_data_transfers_migration_applied: boolean
           operations_product_channel_states_migration_applied: boolean
           crm_product_identity_aliases_migration_applied: boolean
+          operations_product_channel_offers_migration_applied: boolean
+          operations_pack_runtime_association_migration_applied: boolean
+          operations_commerce_pack_resolution_migration_applied: boolean
+          operations_hybrid_cartonization_recipes_migration_applied: boolean
+          operations_cartonization_package_rates_migration_applied: boolean
+          operations_cartonization_rate_evidence_migration_applied: boolean
+          operations_cartonization_rate_evidence_integrity_migration_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -853,6 +860,41 @@ export async function GET() {
                 FROM schema_migrations
                 WHERE filename = '0131_crm_product_identity_aliases.sql'
               ) AS crm_product_identity_aliases_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0132_operations_product_channel_offers.sql'
+              ) AS operations_product_channel_offers_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0133_operations_pack_runtime_association.sql'
+              ) AS operations_pack_runtime_association_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0134_operations_commerce_pack_resolution.sql'
+              ) AS operations_commerce_pack_resolution_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0135_operations_hybrid_cartonization_recipes.sql'
+              ) AS operations_hybrid_cartonization_recipes_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0136_operations_cartonization_package_rates.sql'
+              ) AS operations_cartonization_package_rates_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0137_operations_cartonization_rate_evidence.sql'
+              ) AS operations_cartonization_rate_evidence_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0138_operations_cartonization_rate_evidence_integrity.sql'
+              ) AS operations_cartonization_rate_evidence_integrity_migration_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -978,6 +1020,13 @@ export async function GET() {
             && row?.crm_data_transfers_migration_applied
             && row?.operations_product_channel_states_migration_applied
             && row?.crm_product_identity_aliases_migration_applied
+            && row?.operations_product_channel_offers_migration_applied
+            && row?.operations_pack_runtime_association_migration_applied
+            && row?.operations_commerce_pack_resolution_migration_applied
+            && row?.operations_hybrid_cartonization_recipes_migration_applied
+            && row?.operations_cartonization_package_rates_migration_applied
+            && row?.operations_cartonization_rate_evidence_migration_applied
+            && row?.operations_cartonization_rate_evidence_integrity_migration_applied
             && row?.migration_checksums_present
           ),
         }
@@ -1095,6 +1144,13 @@ export async function GET() {
           || !row?.crm_data_transfers_migration_applied
           || !row?.operations_product_channel_states_migration_applied
           || !row?.crm_product_identity_aliases_migration_applied
+          || !row?.operations_product_channel_offers_migration_applied
+          || !row?.operations_pack_runtime_association_migration_applied
+          || !row?.operations_commerce_pack_resolution_migration_applied
+          || !row?.operations_hybrid_cartonization_recipes_migration_applied
+          || !row?.operations_cartonization_package_rates_migration_applied
+          || !row?.operations_cartonization_rate_evidence_migration_applied
+          || !row?.operations_cartonization_rate_evidence_integrity_migration_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')

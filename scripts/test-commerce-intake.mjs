@@ -729,6 +729,9 @@ includes(serviceSource, [
   'markCommerceIntakeProviderReadUncertainInPostgres',
   'readCommerceIntakeRejectionTargetFromPostgres',
   'excludeCommerceIntakeRejectionInPostgres',
+  'providerAttemptActorEmail',
+  'options.providerAttemptActorEmail === undefined',
+  'providerAttemptActorEmail: null',
   'readOnly: true',
   'providerWrites: 0',
   'syncCursorAdvanced: false',
@@ -773,6 +776,56 @@ for (const providerWrite of [
 }
 
 const persistenceSource = read('app_src/lib/persistence/commerceIntake.ts')
+includes(persistenceSource, [
+  'providerAttemptActorEmail: string | null',
+  'input.providerAttemptActorEmail',
+  "SET disposition = 'retried'",
+  'retry_run_id = $2::uuid',
+], 'Successful exact-order retry closes the matching legacy rejection')
+includes(persistenceSource, [
+  'resolveCommerceRuntimePack',
+  'operations_commerce_variant_pack_mappings pack_mapping',
+  'operations_product_pack_profile_versions profile_version',
+  'operations_product_channel_states channel_state',
+  'pack_mapping.source_revision =',
+  'channel_state.source_revision',
+  'pack_mapping.source_hash = channel_state.source_hash',
+  'commerce_variant_pack_mapping_id',
+  'commerce_variant_pack_mapping_row_version',
+  'pack_profile_version_id',
+  'pack_profile_version_row_version',
+  'pack_profile_package_level',
+  'pack_profile_base_each_quantity',
+  'packaging_weight_source',
+  "'variant_pack_mapping'",
+  'COMMERCE_INTAKE_PACK_MAPPING_STALE',
+], 'Exact-source provider pack resolution and promotion fencing')
+const manualPackageResolutionSource = persistenceSource.slice(
+  persistenceSource.indexOf(
+    'export async function resolveCommerceCandidatePackageInPostgres',
+  ),
+  persistenceSource.indexOf(
+    'export async function validateCommerceCandidateInPostgres',
+  ),
+)
+for (const fragment of [
+  'commerce_variant_pack_mapping_id = NULL',
+  'commerce_variant_pack_mapping_row_version = NULL',
+  'pack_profile_version_id = NULL',
+  'pack_profile_version_row_version = NULL',
+  'pack_profile_package_level = NULL',
+  'pack_profile_base_each_quantity = NULL',
+  'packaging_weight_source = NULL',
+]) {
+  assert.ok(
+    manualPackageResolutionSource.includes(fragment),
+    `Manual package resolution must clear mapped provenance: ${fragment}`,
+  )
+}
+includes(continuationMigration, [
+  'candidate.external_order_id = NEW.external_id',
+  'Commerce intake retry run must contain exact target evidence',
+], 'Exact-order rejection closure requires exact retry-run evidence')
 includes(persistenceSource, [
   'latestProductEvidenceByVariant',
   'candidate.provider = $3',
@@ -1053,6 +1106,12 @@ const commerceProductLifecycleModule = loadTypeScriptModule(
 const commerceCanonicalProductIdentityModule = loadTypeScriptModule(
   'app_src/lib/integrations/commerceCanonicalProductIdentity.ts',
 )
+const commerceProductChannelOffersModule = loadTypeScriptModule(
+  'app_src/lib/integrations/commerceProductChannelOffers.ts',
+)
+const commercePackRuntimeModule = loadTypeScriptModule(
+  'app_src/lib/integrations/commercePackRuntime.ts',
+)
 const productIdentityLocks = []
 const automaticProductResolutionModule = loadTypeScriptModule(
   'app_src/lib/persistence/commerceIntake.ts',
@@ -1070,6 +1129,10 @@ const automaticProductResolutionModule = loadTypeScriptModule(
         commerceProductLifecycleModule,
       '@/lib/integrations/commerceCanonicalProductIdentity':
         commerceCanonicalProductIdentityModule,
+      '@/lib/integrations/commerceProductChannelOffers':
+        commerceProductChannelOffersModule,
+      '@/lib/integrations/commercePackRuntime':
+        commercePackRuntimeModule,
       '@/lib/operations/commerceNormalization': {
         commerceCurrencyMinorUnit: () => 2,
       },
@@ -1565,6 +1628,10 @@ const customerIdentityPersistence = loadTypeScriptModule(
         commerceProductLifecycleModule,
       '@/lib/integrations/commerceCanonicalProductIdentity':
         commerceCanonicalProductIdentityModule,
+      '@/lib/integrations/commerceProductChannelOffers':
+        commerceProductChannelOffersModule,
+      '@/lib/integrations/commercePackRuntime':
+        commercePackRuntimeModule,
       '@/lib/operations/commerceNormalization': {
         commerceCurrencyMinorUnit() { return 2 },
       },

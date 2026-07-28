@@ -165,6 +165,11 @@ assert.match(
   'historical Product Global IDs must resolve to the canonical Product',
 )
 assert.match(
+  crmAdapter,
+  /product_identity\.canonical_product_id = product\.id[\s\S]*alias_product\.reference_code ILIKE/,
+  'list search by a retired Product Global ID must return its canonical Product',
+)
+assert.match(
   route,
   /operationsCapabilities\(actor\)\.canManage/,
   'product identity changes require operations-management permission',

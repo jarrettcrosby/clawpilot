@@ -122,6 +122,8 @@ const snapshot = {
   },
   candidate: {
     globalId: 'gcoc0000001',
+    orderNumber: '#6538',
+    sourceHash: 'a'.repeat(64),
     rowVersion: 3,
     workflowState: 'ready',
     currency: 'USD',
@@ -142,6 +144,7 @@ const snapshot = {
       width: 80,
       height: 40,
     },
+    packEvidence: null,
   }],
   activeWarehouses: [{
     globalId: 'gwh0000001',
@@ -640,6 +643,11 @@ for (const fragment of [
   'line.length_mm',
   'line.width_mm',
   'line.height_mm',
+  'line.pack_profile_package_level',
+  'line.commerce_variant_pack_mapping_row_version',
+  'line.pack_profile_version_row_version',
+  'pack_mapping.global_id',
+  'pack_version.global_id',
 ]) {
   assert.ok(
     persistence.includes(fragment),

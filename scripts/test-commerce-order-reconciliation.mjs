@@ -132,7 +132,6 @@ assert.equal(
   claimStartedAt.toISOString(),
   'Claim mapping must use last_started_at returned by the sync cursor',
 )
-
 const workerSource = read('app_src/lib/commerceOrderReconciliationWorker.ts')
 assert.ok(
   workerSource.includes('never promotes canonical orders, derives packages or shipments'),

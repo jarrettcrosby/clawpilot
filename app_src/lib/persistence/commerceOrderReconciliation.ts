@@ -223,7 +223,10 @@ export async function claimCommerceOrderReconciliationTargetsInPostgres(input: {
       [Math.max(1, Math.min(Number(input.limit || 1), 5))],
     )
     return claimed.rows
-      .filter((row) => row.account_global_id && row.provider)
+      .filter((row) => (
+        row.account_global_id
+        && row.provider
+      ))
       .map((row): CommerceOrderReconciliationTarget => ({
         organizationId: row.organization_id,
         integrationAccountId: row.integration_account_id,

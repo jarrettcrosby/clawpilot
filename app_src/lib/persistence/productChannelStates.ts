@@ -15,6 +15,19 @@ export type ProductChannelStateObservation = {
   externalProductId: string
   externalVariantId: string
   externalInventoryItemId: string | null
+  providerProductTitle: string
+  providerVariantTitle: string | null
+  providerSku: string | null
+  providerBarcode: string | null
+  wholesaleCurrencyCode: string | null
+  wholesalePriceMinor: string | null
+  retailCurrencyCode: string | null
+  retailPriceMinor: string | null
+  compareAtCurrencyCode: string | null
+  compareAtPriceMinor: string | null
+  taxable: boolean | null
+  requiresShipping: boolean | null
+  weightGrams: number | null
   productId: string | null
   productMappingId: string | null
   providerStatusRaw: string
@@ -35,13 +48,19 @@ export async function upsertProductChannelStateWithClient(
     `INSERT INTO operations_product_channel_states (
        organization_id, integration_account_id, pipeline_id, provider,
        external_product_id, external_variant_id, external_inventory_item_id,
+       provider_product_title, provider_variant_title, provider_sku,
+       provider_barcode, wholesale_currency_code, wholesale_price_minor,
+       retail_currency_code, retail_price_minor, compare_at_currency_code,
+       compare_at_price_minor, taxable, requires_shipping, weight_grams,
        product_id, product_mapping_id, provider_status_raw,
        normalized_status, provider_active, provider_updated_at, observed_at,
        source_revision, source_hash, created_by, updated_by
      ) VALUES (
        $1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7,
-       $8::uuid, $9::uuid, $10, $11, $12, $13::timestamptz,
-       $14::timestamptz, $15, $16, $17, $17
+       $8, $9, $10, $11, $12, $13::bigint, $14, $15::bigint,
+       $16, $17::bigint, $18, $19, $20, $21::uuid, $22::uuid,
+       $23, $24, $25, $26::timestamptz, $27::timestamptz, $28,
+       $29, $30, $30
      )
      ON CONFLICT (
        organization_id, integration_account_id, external_variant_id
@@ -49,6 +68,19 @@ export async function upsertProductChannelStateWithClient(
        provider = EXCLUDED.provider,
        external_product_id = EXCLUDED.external_product_id,
        external_inventory_item_id = EXCLUDED.external_inventory_item_id,
+       provider_product_title = EXCLUDED.provider_product_title,
+       provider_variant_title = EXCLUDED.provider_variant_title,
+       provider_sku = EXCLUDED.provider_sku,
+       provider_barcode = EXCLUDED.provider_barcode,
+       wholesale_currency_code = EXCLUDED.wholesale_currency_code,
+       wholesale_price_minor = EXCLUDED.wholesale_price_minor,
+       retail_currency_code = EXCLUDED.retail_currency_code,
+       retail_price_minor = EXCLUDED.retail_price_minor,
+       compare_at_currency_code = EXCLUDED.compare_at_currency_code,
+       compare_at_price_minor = EXCLUDED.compare_at_price_minor,
+       taxable = EXCLUDED.taxable,
+       requires_shipping = EXCLUDED.requires_shipping,
+       weight_grams = EXCLUDED.weight_grams,
        provider_status_raw = EXCLUDED.provider_status_raw,
        normalized_status = EXCLUDED.normalized_status,
        provider_active = EXCLUDED.provider_active,
@@ -82,6 +114,19 @@ export async function upsertProductChannelStateWithClient(
       input.externalProductId,
       input.externalVariantId,
       input.externalInventoryItemId,
+      input.providerProductTitle,
+      input.providerVariantTitle,
+      input.providerSku,
+      input.providerBarcode,
+      input.wholesaleCurrencyCode,
+      input.wholesalePriceMinor,
+      input.retailCurrencyCode,
+      input.retailPriceMinor,
+      input.compareAtCurrencyCode,
+      input.compareAtPriceMinor,
+      input.taxable,
+      input.requiresShipping,
+      input.weightGrams,
       input.productId,
       input.productMappingId,
       input.providerStatusRaw,
@@ -153,6 +198,19 @@ export async function readProductChannelStatesInPostgres(input: {
        state.external_product_id,
        state.external_variant_id,
        state.external_inventory_item_id,
+       state.provider_product_title,
+       state.provider_variant_title,
+       state.provider_sku,
+       state.provider_barcode,
+       state.wholesale_currency_code,
+       state.wholesale_price_minor::text,
+       state.retail_currency_code,
+       state.retail_price_minor::text,
+       state.compare_at_currency_code,
+       state.compare_at_price_minor::text,
+       state.taxable,
+       state.requires_shipping,
+       state.weight_grams,
        state.product_id::text,
        state.product_mapping_id::text,
        mapping.global_id AS product_mapping_global_id,
@@ -208,6 +266,42 @@ export async function readProductChannelStatesInPostgres(input: {
       externalInventoryItemId: row.external_inventory_item_id
         ? String(row.external_inventory_item_id)
         : null,
+      providerProductTitle: row.provider_product_title
+        ? String(row.provider_product_title)
+        : '',
+      providerVariantTitle: row.provider_variant_title
+        ? String(row.provider_variant_title)
+        : null,
+      providerSku: row.provider_sku ? String(row.provider_sku) : null,
+      providerBarcode: row.provider_barcode
+        ? String(row.provider_barcode)
+        : null,
+      wholesaleCurrencyCode: row.wholesale_currency_code
+        ? String(row.wholesale_currency_code)
+        : null,
+      wholesalePriceMinor: row.wholesale_price_minor
+        ? String(row.wholesale_price_minor)
+        : null,
+      retailCurrencyCode: row.retail_currency_code
+        ? String(row.retail_currency_code)
+        : null,
+      retailPriceMinor: row.retail_price_minor
+        ? String(row.retail_price_minor)
+        : null,
+      compareAtCurrencyCode: row.compare_at_currency_code
+        ? String(row.compare_at_currency_code)
+        : null,
+      compareAtPriceMinor: row.compare_at_price_minor
+        ? String(row.compare_at_price_minor)
+        : null,
+      taxable: typeof row.taxable === 'boolean' ? row.taxable : null,
+      requiresShipping: typeof row.requires_shipping === 'boolean'
+        ? row.requires_shipping
+        : null,
+      weightGrams: row.weight_grams === null
+        || row.weight_grams === undefined
+        ? null
+        : Number(row.weight_grams),
       productId,
       productMappingId: row.product_mapping_id
         ? String(row.product_mapping_id)

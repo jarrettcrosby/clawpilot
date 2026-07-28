@@ -71,6 +71,8 @@ export type CartonizationPreviewSnapshot = {
   }
   candidate: {
     globalId: string
+    orderNumber: string
+    sourceHash: string
     rowVersion: number
     workflowState:
       | 'held'
@@ -93,6 +95,16 @@ export type CartonizationPreviewSnapshot = {
     productGlobalId: string | null
     weightGrams: number | null
     dimensionsMm: OptimizerDimensionsMm | null
+    packEvidence: {
+      mappingGlobalId: string
+      mappingRowVersion: number
+      profileVersionGlobalId: string
+      profileVersionRowVersion: number
+      packageLevel: string
+      baseEachQuantity: number
+      packagingSource: string
+      weightSource: string | null
+    } | null
   }>
   activeWarehouses: Array<{
     globalId: string
@@ -515,6 +527,10 @@ function optimizerInput(input: {
     inventoryRunGlobalId: input.snapshot.latestInventoryRun?.globalId,
     materialGlobalIds: input.request.materialGlobalIds,
     assumedCommittedByLine: input.request.assumedCommittedByLine,
+    linePackEvidence: input.lines.map((line) => ({
+      lineGlobalId: line.globalId,
+      packEvidence: line.packEvidence,
+    })),
     readAtUtc: input.snapshot.readAtUtc,
   })
   const allowedCartonGlobalIds = input.materials

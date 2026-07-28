@@ -10,6 +10,7 @@ import {
   carrierSandboxRateRequestEvidence,
   requestCarrierSandboxRates,
   type CarrierSandboxRateFixture,
+  type CarrierSandboxRatePurpose,
 } from '@/lib/integrations/carrierSandboxRate'
 import {
   carrierAccountAddressFingerprint,
@@ -44,7 +45,7 @@ import {
   type CarrierRuntimeAccountRecord,
 } from '@/lib/persistence/carrierIntegrations'
 
-const CARRIER_SANDBOX_RATE_ADAPTER_VERSION = 'direct-rest-v2'
+const CARRIER_SANDBOX_RATE_ADAPTER_VERSION = 'direct-rest-v3'
 const AG_ALCHEMY_EPISCS_RATING_DELEGATION =
   'ag-alchemy-episcs-sandbox-rating-delegation'
 const AG_ALCHEMY_RATING_ORIGIN_WAREHOUSE = 'gwh5366613'
@@ -786,9 +787,13 @@ export async function testCarrierSandboxRate(input: {
   environment: unknown
   carrierAccountGlobalId?: unknown
   destination?: unknown
+  parcel?: unknown
   actorEmail: string
 }) {
   const requestedAt = new Date().toISOString()
+  const purpose: CarrierSandboxRatePurpose = input.parcel === undefined
+    ? 'sandbox_rate_test'
+    : 'cartonization_package_rate'
   let runtime: Awaited<ReturnType<typeof storedRuntimeCredential>> | null = null
   let selection: SandboxBillingSelection | null = null
   let fixture: CarrierSandboxRateFixture | null = null
@@ -828,6 +833,7 @@ export async function testCarrierSandboxRate(input: {
       senderName: selection.account.senderName,
       registeredAddress: selection.account.registeredAddress,
       destination: input.destination,
+      parcel: input.parcel,
     })
     const accountNumber = decryptCarrierAccountNumber(
       selection.account.encrypted,
@@ -840,7 +846,7 @@ export async function testCarrierSandboxRate(input: {
       provider: runtime.provider,
       environment: runtime.environment,
       credential: { ...runtime.credential, accountNumber },
-    }, { fixture })
+    }, { fixture, purpose })
     const billingSelectionSnapshot = redactedSandboxRateBillingSelection(selection)
     const evidenceGlobalId = await writeCarrierSandboxRateEvidenceInPostgres({
       organizationId: runtime.organizationId,
@@ -851,6 +857,7 @@ export async function testCarrierSandboxRate(input: {
       billingRelationship: selection.relationship,
       billingSelectionSnapshot,
       provider: runtime.provider,
+      purpose,
       credentialVersion: runtime.credentialVersion,
       adapterVersion: CARRIER_SANDBOX_RATE_ADAPTER_VERSION,
       requestHash: carrierSandboxRateSelectionRequestHash(rate.evidence.requestHash, selection),
@@ -880,7 +887,11 @@ export async function testCarrierSandboxRate(input: {
       && fixture
       && (runtime.provider === 'ups_rest' || runtime.provider === 'fedex_rest')
     ) {
-      const safeRequest = carrierSandboxRateRequestEvidence(runtime.provider, fixture)
+      const safeRequest = carrierSandboxRateRequestEvidence(
+        runtime.provider,
+        fixture,
+        purpose,
+      )
       const billingSelectionSnapshot = redactedSandboxRateBillingSelection(selection)
       try {
         await writeCarrierSandboxRateEvidenceInPostgres({
@@ -892,6 +903,7 @@ export async function testCarrierSandboxRate(input: {
           billingRelationship: selection.relationship,
           billingSelectionSnapshot,
           provider: runtime.provider,
+          purpose,
           credentialVersion: runtime.credentialVersion,
           adapterVersion: CARRIER_SANDBOX_RATE_ADAPTER_VERSION,
           requestHash: carrierSandboxRateSelectionRequestHash(safeRequest.requestHash, selection),

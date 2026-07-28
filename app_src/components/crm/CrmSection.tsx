@@ -279,6 +279,43 @@ function money(value: unknown, currency = 'USD') {
   }
 }
 
+function minorMoney(
+  value: string | null,
+  currency: string | null,
+) {
+  if (value === null || currency === null) return null
+  try {
+    const formatter = new Intl.NumberFormat('en-US', {
+      style: 'currency',
+      currency,
+    })
+    const fractionDigits =
+      formatter.resolvedOptions().maximumFractionDigits ?? 2
+    const minorUnits = BigInt(value)
+    if (
+      minorUnits <= BigInt(Number.MAX_SAFE_INTEGER)
+      && minorUnits >= BigInt(Number.MIN_SAFE_INTEGER)
+    ) {
+      return formatter.format(
+        Number(minorUnits) / (10 ** fractionDigits),
+      )
+    }
+    const zero = BigInt(0)
+    const divisor = BigInt(10) ** BigInt(fractionDigits)
+    const absolute = minorUnits < zero ? -minorUnits : minorUnits
+    const major = absolute / divisor
+    const fraction = (absolute % divisor)
+      .toString()
+      .padStart(fractionDigits, '0')
+    const exact = fractionDigits > 0
+      ? `${major}.${fraction}`
+      : major.toString()
+    return `${minorUnits < zero ? '-' : ''}${currency} ${exact}`
+  } catch {
+    return `${currency} ${value} minor units`
+  }
+}
+
 function productMoney(value: unknown, currency: string) {
   if (currency) return money(value, currency)
   return `Currency required · ${(Number(value) || 0).toLocaleString('en-US', {
@@ -316,6 +353,31 @@ function salesChannelStatusColor(
 
 function providerLabel(provider: ProductSalesChannelState['provider']) {
   return provider === 'shopify' ? 'Shopify' : 'Faire'
+}
+
+function salesChannelOfferSummary(channel: ProductSalesChannelState) {
+  const wholesale = minorMoney(
+    channel.wholesalePriceMinor,
+    channel.wholesaleCurrencyCode,
+  )
+  const retail = minorMoney(
+    channel.retailPriceMinor,
+    channel.retailCurrencyCode,
+  )
+  const compareAt = minorMoney(
+    channel.compareAtPriceMinor,
+    channel.compareAtCurrencyCode,
+  )
+  if (channel.provider === 'shopify') {
+    return [
+      retail ? `Current: ${retail}` : null,
+      compareAt ? `Compare at: ${compareAt}` : null,
+    ].filter(Boolean).join(' · ')
+  }
+  return [
+    wholesale ? `Wholesale: ${wholesale}` : null,
+    retail ? `Retail: ${retail}` : null,
+  ].filter(Boolean).join(' · ')
 }
 
 function hierarchyDescendants(hierarchy: WorkspaceOrganization[], organizationId: string) {
@@ -2250,6 +2312,35 @@ export default function CrmSection() {
                     <Typography variant="body2" sx={{ mt: 0.75 }}>
                       {channel.integrationAccountName} · {channel.environment}
                     </Typography>
+                    <Typography
+                      variant="caption"
+                      color="text.secondary"
+                      display="block"
+                    >
+                      Listing: {channel.providerProductTitle || 'Unavailable'}
+                      {channel.providerVariantTitle
+                        ? ` · ${channel.providerVariantTitle}`
+                        : ''}
+                    </Typography>
+                    <Typography
+                      variant="caption"
+                      color="text.secondary"
+                      display="block"
+                    >
+                      SKU: {channel.providerSku || 'Unavailable'}
+                      {channel.providerBarcode
+                        ? ` · Barcode: ${channel.providerBarcode}`
+                        : ''}
+                    </Typography>
+                    {salesChannelOfferSummary(channel) ? (
+                      <Typography
+                        variant="caption"
+                        color="text.secondary"
+                        display="block"
+                      >
+                        {salesChannelOfferSummary(channel)}
+                      </Typography>
+                    ) : null}
                     <Typography
                       variant="caption"
                       color="text.secondary"

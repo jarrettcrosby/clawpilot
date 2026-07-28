@@ -123,6 +123,19 @@ export type ProductSalesChannelState = {
   externalProductId: string
   externalVariantId: string
   externalInventoryItemId: string | null
+  providerProductTitle: string
+  providerVariantTitle: string | null
+  providerSku: string | null
+  providerBarcode: string | null
+  wholesaleCurrencyCode: string | null
+  wholesalePriceMinor: string | null
+  retailCurrencyCode: string | null
+  retailPriceMinor: string | null
+  compareAtCurrencyCode: string | null
+  compareAtPriceMinor: string | null
+  taxable: boolean | null
+  requiresShipping: boolean | null
+  weightGrams: number | null
   productId: string | null
   productMappingId: string | null
   productMappingGlobalId: string | null

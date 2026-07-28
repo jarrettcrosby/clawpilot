@@ -554,13 +554,21 @@ export async function PATCH(req: NextRequest) {
       return json({ ok: true, canManage: true, integrations })
     }
     if (action === 'test-sandbox-rate') {
-      only(body, ['action', 'provider', 'environment', 'carrierAccountGlobalId', 'destination'])
+      only(body, [
+        'action',
+        'provider',
+        'environment',
+        'carrierAccountGlobalId',
+        'destination',
+        'parcel',
+      ])
       const rateTest = await testCarrierSandboxRate({
         organizationId: organization,
         provider: body.provider,
         environment: body.environment,
         carrierAccountGlobalId: body.carrierAccountGlobalId,
         destination: body.destination,
+        parcel: body.parcel,
         actorEmail: actor.email,
       })
       return json({ ok: true, canManage: true, rateTest })

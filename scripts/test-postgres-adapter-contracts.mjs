@@ -1546,6 +1546,63 @@ assertIncludes(healthRoute, '0128_operations_pack_hierarchy.sql', 'hosted operat
 assertIncludes(healthRoute, '0129_crm_data_transfers.sql', 'hosted CRM data transfer migration health')
 assertIncludes(healthRoute, '0130_operations_product_channel_states.sql', 'hosted product channel state migration health')
 assertIncludes(healthRoute, '0131_crm_product_identity_aliases.sql', 'hosted product identity alias migration health')
+assertIncludes(healthRoute, '0132_operations_product_channel_offers.sql', 'hosted product channel offer migration health')
+assertIncludes(healthRoute, '0133_operations_pack_runtime_association.sql', 'hosted pack runtime association migration health')
+assertIncludes(healthRoute, '0134_operations_commerce_pack_resolution.sql', 'hosted commerce pack resolution migration health')
+assertIncludes(healthRoute, '0135_operations_hybrid_cartonization_recipes.sql', 'hosted hybrid cartonization recipe migration health')
+const packRuntimeAssociationMigration = read(
+  'db/migrations/0133_operations_pack_runtime_association.sql',
+)
+for (const fragment of [
+  'operations_packaging_materials_dimension_evidence_valid',
+  "dimension_evidence_type NOT IN ('customer_confirmed', 'measured')",
+  'dimension_evidence_reference IS NOT NULL',
+  'length(btrim(dimension_evidence_reference)) BETWEEN 1 AND 500',
+]) {
+  assertIncludes(
+    packRuntimeAssociationMigration,
+    fragment,
+    'packaging dimension evidence database authority',
+  )
+}
+const commercePackResolutionMigration = read(
+  'db/migrations/0134_operations_commerce_pack_resolution.sql',
+)
+for (const fragment of [
+  'commerce_variant_pack_mapping_id',
+  'commerce_variant_pack_mapping_row_version',
+  'pack_profile_version_id',
+  'pack_profile_version_row_version',
+  'pack_profile_package_level',
+  'pack_profile_base_each_quantity',
+  'packaging_weight_source',
+  "'variant_pack_mapping'",
+  'commerce_order_lines_pack_mapping_fkey',
+]) {
+  assertIncludes(
+    commercePackResolutionMigration,
+    fragment,
+    'commerce pack resolution provenance',
+  )
+}
+const hybridCartonizationRecipeMigration = read(
+  'db/migrations/0135_operations_hybrid_cartonization_recipes.sql',
+)
+for (const fragment of [
+  'minimum_input_quantity',
+  'content_compatibility_key',
+  'allows_mixed_products',
+  'operations_approved_pack_recipes_mixed_products_valid',
+  'operations_approved_pack_recipes_active_capacity_ready',
+  'operations_product_pack_profile_versions_recipe_only_evidence_valid',
+  "'approved_recipe_only'",
+]) {
+  assertIncludes(
+    hybridCartonizationRecipeMigration,
+    fragment,
+    'hybrid cartonization recipe database authority',
+  )
+}
 assertIncludes(healthRoute, 'readSuiteCrmWorkerHeartbeat', 'hosted SuiteCRM worker health')
 assertIncludes(healthRoute, 'migration_checksums_present', 'hosted migration checksum health')
 assertIncludes(healthRoute, 'queryAgentCredentials', 'shared agent credential store health')
