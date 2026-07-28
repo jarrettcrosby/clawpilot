@@ -22,6 +22,41 @@ function isDefaultVariant(value: string) {
   return normalized === 'default' || normalized === 'default title'
 }
 
+function isUnicodeAlphaNumeric(value: string | undefined) {
+  return Boolean(value && /[\p{L}\p{N}]/u.test(value))
+}
+
+function productTitleContainsOptionPhrase(
+  productTitle: string,
+  optionValue: string,
+) {
+  const titlePoints = Array.from(comparable(productTitle))
+  const optionPoints = Array.from(comparable(optionValue))
+  if (optionPoints.length === 0 || optionPoints.length > titlePoints.length) {
+    return false
+  }
+  for (
+    let start = 0;
+    start <= titlePoints.length - optionPoints.length;
+    start += 1
+  ) {
+    if (!optionPoints.every(
+      (point, offset) => titlePoints[start + offset] === point,
+    )) {
+      continue
+    }
+    const before = titlePoints[start - 1]
+    const after = titlePoints[start + optionPoints.length]
+    if (
+      !isUnicodeAlphaNumeric(before)
+      && !isUnicodeAlphaNumeric(after)
+    ) {
+      return true
+    }
+  }
+  return false
+}
+
 function stripProductTitlePrefix(productTitle: string, variantTitle: string) {
   const comparableProduct = comparable(productTitle)
   const comparableVariant = comparable(variantTitle)
@@ -45,8 +80,14 @@ export function commerceVariantLabel(input: CommerceProductNameInput): string | 
   const distinctOptionValues = optionValues.filter((value, index) => (
     optionValues.findIndex((candidate) => comparable(candidate) === comparable(value)) === index
   ))
+  const unrepresentedOptionValues = distinctOptionValues.filter((value) => (
+    !productTitleContainsOptionPhrase(productTitle, value)
+  ))
+  if (unrepresentedOptionValues.length > 0) {
+    return unrepresentedOptionValues.join(' / ')
+  }
   if (distinctOptionValues.length > 0) {
-    return distinctOptionValues.join(' / ')
+    return null
   }
 
   const variantTitle = compact(input.variantTitle)

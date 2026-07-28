@@ -69,3 +69,71 @@ test('keeps multiple distinct option values in stable provider order', () => {
     'Team Shirt · Green / Small',
   )
 })
+
+test('does not repeat a complete option phrase already represented in the title', () => {
+  const productTitle =
+    'Ag-Alchemy Animal Nutrition Short Sleeve T-Shirt - Kids - Black Ag-Alchemy'
+  assert.equal(
+    commerceProductDisplayName({
+      productTitle,
+      variantTitle: 'Black Ag-Alchemy / Large',
+      selectedOptions: [
+        { name: 'Color', value: 'Black Ag-Alchemy' },
+        { name: 'Size', value: 'Large' },
+      ],
+    }),
+    `${productTitle} · Large`,
+  )
+})
+
+test('does not fall back to a variant title when every selected option is in the title', () => {
+  assert.equal(
+    commerceProductDisplayName({
+      productTitle: 'Black Team Shirt',
+      variantTitle: 'Black',
+      selectedOptions: [{ name: 'Color', value: 'Black' }],
+    }),
+    'Black Team Shirt',
+  )
+})
+
+test('keeps an option that appears only inside a larger alphanumeric token', () => {
+  assert.equal(
+    commerceProductDisplayName({
+      productTitle: 'Redwood Team Shirt',
+      variantTitle: 'Red / Small',
+      selectedOptions: [
+        { name: 'Color', value: 'Red' },
+        { name: 'Size', value: 'Small' },
+      ],
+    }),
+    'Redwood Team Shirt · Red / Small',
+  )
+})
+
+test('normalizes Unicode while enforcing alphanumeric option boundaries', () => {
+  assert.equal(
+    commerceProductDisplayName({
+      productTitle: 'Café Team Shirt',
+      variantTitle: 'fé / Large',
+      selectedOptions: [
+        { name: 'Style', value: 'fé' },
+        { name: 'Size', value: 'Large' },
+      ],
+    }),
+    'Café Team Shirt · fé / Large',
+    'A phrase embedded in the larger Unicode alphanumeric token Café must remain',
+  )
+  assert.equal(
+    commerceProductDisplayName({
+      productTitle: 'Team Shirt - Café',
+      variantTitle: 'Café / Large',
+      selectedOptions: [
+        { name: 'Style', value: 'Café' },
+        { name: 'Size', value: 'Large' },
+      ],
+    }),
+    'Team Shirt - Café · Large',
+    'The canonically equivalent complete Unicode phrase must be suppressed',
+  )
+})

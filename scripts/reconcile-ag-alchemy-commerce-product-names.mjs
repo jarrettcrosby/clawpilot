@@ -96,6 +96,38 @@ function isDefaultVariant(value) {
   return normalized === 'default' || normalized === 'default title'
 }
 
+function isUnicodeAlphaNumeric(value) {
+  return Boolean(value && /[\p{L}\p{N}]/u.test(value))
+}
+
+function productTitleContainsOptionPhrase(productTitle, optionValue) {
+  const titlePoints = Array.from(comparable(productTitle))
+  const optionPoints = Array.from(comparable(optionValue))
+  if (optionPoints.length === 0 || optionPoints.length > titlePoints.length) {
+    return false
+  }
+  for (
+    let start = 0;
+    start <= titlePoints.length - optionPoints.length;
+    start += 1
+  ) {
+    if (!optionPoints.every(
+      (point, offset) => titlePoints[start + offset] === point,
+    )) {
+      continue
+    }
+    const before = titlePoints[start - 1]
+    const after = titlePoints[start + optionPoints.length]
+    if (
+      !isUnicodeAlphaNumeric(before)
+      && !isUnicodeAlphaNumeric(after)
+    ) {
+      return true
+    }
+  }
+  return false
+}
+
 function stripProductTitlePrefix(productTitle, variantTitle) {
   if (!productTitle || variantTitle.length < productTitle.length) {
     return variantTitle
@@ -122,8 +154,14 @@ export function commerceVariantLabel(input) {
       comparable(candidate) === comparable(value)
     )) === index
   ))
+  const unrepresentedOptionValues = distinctOptionValues.filter((value) => (
+    !productTitleContainsOptionPhrase(productTitle, value)
+  ))
+  if (unrepresentedOptionValues.length > 0) {
+    return unrepresentedOptionValues.join(' / ')
+  }
   if (distinctOptionValues.length > 0) {
-    return distinctOptionValues.join(' / ')
+    return null
   }
   const variantTitle = compact(input.variantTitle)
   if (!variantTitle || isDefaultVariant(variantTitle)) return null
@@ -1296,6 +1334,29 @@ export function selfTest() {
     }) !== 'Tea · Team Size'
   ) {
     fail('Product-title prefix boundary self-test failed')
+  }
+  const liveProductTitle =
+    'Ag-Alchemy Animal Nutrition Short Sleeve T-Shirt - Kids - Black Ag-Alchemy'
+  if (
+    commerceProductDisplayName({
+      productTitle: liveProductTitle,
+      variantTitle: 'Black Ag-Alchemy / Large',
+      selectedOptions: [
+        { name: 'Color', value: 'Black Ag-Alchemy' },
+        { name: 'Size', value: 'Large' },
+      ],
+    }) !== `${liveProductTitle} · Large`
+  ) {
+    fail('Product-title represented option self-test failed')
+  }
+  if (
+    commerceProductDisplayName({
+      productTitle: 'Redwood Team Shirt',
+      variantTitle: 'Red',
+      selectedOptions: [{ name: 'Color', value: 'Red' }],
+    }) !== 'Redwood Team Shirt · Red'
+  ) {
+    fail('Product-title option boundary self-test failed')
   }
   if (plan.fingerprint !== buildNamePlan(rows).fingerprint) {
     fail('Product-name plan fingerprint must be deterministic')
