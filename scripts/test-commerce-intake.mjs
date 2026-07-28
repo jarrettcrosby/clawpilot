@@ -148,6 +148,15 @@ includes(catalogSyncMigration, [
   'operations_commerce_catalog_sync_completion_valid',
   "'Product-only Shopify/Faire catalog backfill",
 ], 'Commerce catalog-sync migration')
+const fulfilledLinePriceMigration = read(
+  'db/migrations/0139_operations_fulfilled_line_price_state.sql',
+)
+includes(fulfilledLinePriceMigration, [
+  'DROP CONSTRAINT IF EXISTS commerce_order_lines_price_block_valid',
+  'unfulfilled_quantity = 0',
+  "price_resolution_state <> 'unresolved'",
+  "'line_price_required' = ANY(blocking_codes)",
+], 'Fulfilled commerce-line price-state migration')
 const catalogSyncPersistenceSource = read(
   'app_src/lib/persistence/commerceCatalogSync.ts',
 )
@@ -976,6 +985,8 @@ includes(persistenceSource, [
   "'excluded_no_unfulfilled_quantity'",
   'line.unfulfilled_quantity,',
   "'no_unfulfilled_quantity'",
+  'quantity.unfulfilled > 0',
+  "&& !codes.includes('line_price_required')",
   'PRODUCT_CANDIDATE_SELECT',
   'SELECT DISTINCT ON (selected.external_variant_id)',
   'latest_unexpired_per_account_provider_variant',
