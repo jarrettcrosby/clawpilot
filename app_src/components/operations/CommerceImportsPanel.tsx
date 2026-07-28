@@ -14,6 +14,7 @@ import RefreshRounded from '@mui/icons-material/RefreshRounded'
 import SettingsRounded from '@mui/icons-material/SettingsRounded'
 import StorefrontRounded from '@mui/icons-material/StorefrontRounded'
 import CommerceIntakeWorkflow from '@/components/settings/CommerceIntakeWorkflow'
+import ShopifyInventoryPanel from '@/components/operations/ShopifyInventoryPanel'
 
 type CommerceProvider = 'shopify' | 'faire'
 
@@ -242,6 +243,12 @@ export default function CommerceImportsPanel() {
                 displayName={selectedAccount.displayName}
                 canActivate={payload.canActivate === true}
               />
+              {selectedAccount.provider === 'shopify' ? (
+                <ShopifyInventoryPanel
+                  accountGlobalId={selectedAccount.globalId}
+                  displayName={selectedAccount.displayName}
+                />
+              ) : null}
             </>
           ) : null}
         </>

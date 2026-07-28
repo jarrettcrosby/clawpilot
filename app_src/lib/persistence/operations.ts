@@ -204,6 +204,7 @@ type PositionRow = QueryResultRow & {
   location_id: string
   on_hand_quantity: string
   reserved_quantity: string
+  source_authority: 'clawpilot' | 'shopify'
 }
 type OrderIdentityRow = QueryResultRow & {
   id: string
@@ -1090,7 +1091,9 @@ async function ensureProofConfiguration(
       `SELECT position.id::text, position.global_id,
               position.warehouse_id::text, warehouse.global_id AS warehouse_global_id,
               warehouse.name AS warehouse_name, position.location_id::text,
-              position.on_hand_quantity::text, position.reserved_quantity::text
+              position.on_hand_quantity::text,
+              position.reserved_quantity::text,
+              position.source_authority
        FROM operations_inventory_positions position
        JOIN operations_warehouses warehouse
          ON warehouse.organization_id = position.organization_id AND warehouse.id = position.warehouse_id
@@ -1242,6 +1245,13 @@ async function prepareAndReserveInventory(
     actorEmail: string
   },
 ): Promise<IdRow> {
+  if (input.position.source_authority !== 'clawpilot') {
+    throw new OperationsRequestError(
+      'OPERATIONS_INVENTORY_SOURCE_AUTHORITY_CONFLICT',
+      'Shopify-authoritative inventory is already reserved in Shopify and cannot be reserved a second time by this workflow',
+      409,
+    )
+  }
   let onHand = numberValue(input.position.on_hand_quantity)
   let reserved = numberValue(input.position.reserved_quantity)
   const requestedOpening = Math.max(0, input.openingQuantity)
@@ -1338,6 +1348,13 @@ async function consumeReservedInventory(
     actorEmail: string
   },
 ) {
+  if (input.position.source_authority !== 'clawpilot') {
+    throw new OperationsRequestError(
+      'OPERATIONS_INVENTORY_SOURCE_AUTHORITY_CONFLICT',
+      'Shopify-authoritative inventory cannot be consumed by the local reservation workflow',
+      409,
+    )
+  }
   const lockedResult = await client.query<QueryResultRow & {
     on_hand_quantity: string
     reserved_quantity: string
@@ -8257,6 +8274,7 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
         position_location_id: string
         on_hand_quantity: string
         reserved_quantity: string
+        source_authority: 'clawpilot' | 'shopify'
       }>(
         `SELECT source_line.id::text AS line_id,
                 source_line.global_id AS line_global_id,
@@ -8276,7 +8294,8 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
                 warehouse.name AS position_warehouse_name,
                 position.location_id::text AS position_location_id,
                 position.on_hand_quantity::text,
-                position.reserved_quantity::text
+                position.reserved_quantity::text,
+                position.source_authority
          FROM operations_fulfillment_allocations allocation
          JOIN operations_order_lines source_line
            ON source_line.organization_id = allocation.organization_id
@@ -8373,6 +8392,7 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
             location_id: allocation.position_location_id,
             on_hand_quantity: allocation.on_hand_quantity,
             reserved_quantity: allocation.reserved_quantity,
+            source_authority: allocation.source_authority,
           },
           reservation: {
             id: allocation.reservation_id,
