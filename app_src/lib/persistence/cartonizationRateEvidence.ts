@@ -12,6 +12,8 @@ import {
   withTransaction,
 } from '@/lib/persistence/postgres'
 
+export const MAX_CARTONIZATION_RATE_EVIDENCE_PACKAGES = 64
+
 export type CartonizationRateEvidenceAllocation = {
   lineGlobalId: string
   productGlobalId: string
@@ -973,8 +975,13 @@ export async function writeCartonizationRateEvidenceInPostgres(
   if (!Array.isArray(input.packages) || input.packages.length < 1) {
     fail('Cartonization rate evidence requires at least one package', 400)
   }
-  if (input.packages.length > 8) {
-    fail('Cartonization rate evidence supports at most eight packages', 400)
+  if (input.packages.length > MAX_CARTONIZATION_RATE_EVIDENCE_PACKAGES) {
+    fail(
+      `Cartonization rate evidence supports at most ${
+        MAX_CARTONIZATION_RATE_EVIDENCE_PACKAGES
+      } packages`,
+      400,
+    )
   }
   if (
     !Array.isArray(input.quotes)
@@ -1545,7 +1552,7 @@ export async function writeCartonizationRateEvidenceInPostgres(
           contextForPackage.materialId,
           primaryRecipe?.recipeId || null,
           packageInput.materialRowVersion,
-          primaryRecipe?.recipeRowVersion || null,
+          primaryRecipe?.recipeRowVersion ?? null,
           JSON.stringify(packageInput.innerDimensionsMm),
           JSON.stringify(packageInput.ratedOuterDimensionsMm),
           packageInput.contentWeightGrams,

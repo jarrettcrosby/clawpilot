@@ -293,6 +293,7 @@ export async function GET() {
           operations_fulfilled_line_price_state_applied: boolean
           operations_commerce_packaging_source_repair_applied: boolean
           operations_recipe_pack_association_migration_applied: boolean
+          operations_cartonization_evidence_scale_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -913,6 +914,11 @@ export async function GET() {
                 FROM schema_migrations
                 WHERE filename = '0141_operations_recipe_only_pack_associations.sql'
               ) AS operations_recipe_pack_association_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0142_operations_cartonization_evidence_scale.sql'
+              ) AS operations_cartonization_evidence_scale_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -1048,6 +1054,7 @@ export async function GET() {
             && row?.operations_fulfilled_line_price_state_applied
             && row?.operations_commerce_packaging_source_repair_applied
             && row?.operations_recipe_pack_association_migration_applied
+            && row?.operations_cartonization_evidence_scale_applied
             && row?.migration_checksums_present
           ),
         }
@@ -1175,6 +1182,7 @@ export async function GET() {
           || !row?.operations_fulfilled_line_price_state_applied
           || !row?.operations_commerce_packaging_source_repair_applied
           || !row?.operations_recipe_pack_association_migration_applied
+          || !row?.operations_cartonization_evidence_scale_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')

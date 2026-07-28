@@ -254,6 +254,12 @@ and rating. An unknown subdivision now fails with
 `CARTONIZATION_RATE_DESTINATION_INVALID` instead of being reported as a
 generic evidence outage.
 
+Operators may select at most eight packaging material types for one
+cartonization run, while one saved read-only carrier comparison may retain up
+to 64 resulting physical packages. This distinction lets a high-unit order
+reuse a small controlled material catalog without truncating its actual carton
+plan or its one UPS and one FedEx sandbox result per package.
+
 ### Packaging Materials Workflow
 
 **Operations > Packaging materials** manages the consumable outbound container catalog separately from product package profiles. Materials are organization-scoped cartons, poly mailers, or padded mailers with canonical millimeter dimensions, explicit dimension basis and evidence, nullable draft tare and maximum weight, nullable draft unit cost/currency, draft/active status, source, and optimistic row version. A draft may retain a partial customer measurement such as a 9 by 12 envelope with unknown depth; the API and UI preserve that missing value as null and display the activation gaps rather than coercing it to zero. Warehouse stock rows can reference only an existing active warehouse and record availability, on-hand quantity, reorder point, and reorder quantity. Activating a material requires verified usable inner dimensions, nonunknown evidence, complete tare/capacity and cost facts; an optimizer candidate additionally requires an available warehouse row with positive on-hand stock.

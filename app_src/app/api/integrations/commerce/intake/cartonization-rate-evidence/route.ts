@@ -30,6 +30,7 @@ import {
   CartonizationRateEvidencePersistenceError,
   claimCartonizationRateEvidenceCommandInPostgres,
   failCartonizationRateEvidenceCommandInPostgres,
+  MAX_CARTONIZATION_RATE_EVIDENCE_PACKAGES,
   readCartonizationRateCandidateContext,
   readCartonizationRateEvidenceByGlobalId,
   writeCartonizationRateEvidenceInPostgres,
@@ -550,10 +551,13 @@ export async function POST(req: NextRequest) {
     }
     if (
       plan.recipePackages.length < 1
-      || plan.recipePackages.length > 8
+      || plan.recipePackages.length
+        > MAX_CARTONIZATION_RATE_EVIDENCE_PACKAGES
     ) {
       throw new RateEvidenceRequestError(
-        'The approved-recipe plan must contain between one and eight packages',
+        `The approved-recipe plan must contain between one and ${
+          MAX_CARTONIZATION_RATE_EVIDENCE_PACKAGES
+        } packages`,
         422,
         'CARTONIZATION_RATE_EVIDENCE_PACKAGE_COUNT_INVALID',
       )

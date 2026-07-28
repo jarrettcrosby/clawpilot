@@ -102,6 +102,9 @@ const migration = read(
 const integrityMigration = read(
   'db/migrations/0138_operations_cartonization_rate_evidence_integrity.sql',
 )
+const scaleMigration = read(
+  'db/migrations/0142_operations_cartonization_evidence_scale.sql',
+)
 const persistence = read(
   'app_src/lib/persistence/cartonizationRateEvidence.ts',
 )
@@ -178,9 +181,15 @@ assertIncludes(sealingContract, [
   'BEFORE UPDATE OR DELETE ON operations_cartonization_rate_evidence_packages',
   'BEFORE UPDATE OR DELETE ON operations_cartonization_rate_evidence_quotes',
 ], 'Sealed immutable aggregate')
+assertIncludes(scaleMigration, [
+  'validate_operations_cartonization_rate_evidence_complete()',
+  'package_count NOT BETWEEN 1 AND 64',
+  'one UPS and one FedEx quote per package',
+], 'Scaled physical-package evidence contract')
 
 assertIncludes(persistence, [
   'export function cartonizationRateEvidenceHash',
+  'MAX_CARTONIZATION_RATE_EVIDENCE_PACKAGES = 64',
   'export function cartonizationRateEvidenceRequestHash',
   'const packages = [...input.packages].sort(',
   'export function cartonizationPackageRateContextHash',
@@ -196,6 +205,7 @@ assertIncludes(persistence, [
   'The confirmed ship-to address is not carrier-ready',
   'product.reference_code AS product_global_id',
   'AND product.reference_code = $5',
+  'primaryRecipe?.recipeRowVersion ?? null',
   'evidence.sealed_at IS NOT NULL',
   'inventory_run.warehouse_id = warehouse.id',
   'recipe.packaging_material_id = $2::uuid',
@@ -212,6 +222,11 @@ assert.doesNotMatch(
   persistence,
   /product\.global_id/,
   'Cartonization evidence must use the CRM product reference_code column',
+)
+assert.doesNotMatch(
+  persistence,
+  /primaryRecipe\?\.recipeRowVersion \|\| null/,
+  'A valid zero recipe row version must not be coerced to null',
 )
 
 assertIncludes(route, [
