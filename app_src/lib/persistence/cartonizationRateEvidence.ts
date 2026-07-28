@@ -1308,7 +1308,7 @@ export async function writeCartonizationRateEvidenceInPostgres(
              recipe.recipe_name,
              recipe.row_version::text AS recipe_row_version,
              product.id::text AS product_id,
-             product.global_id AS product_global_id,
+             product.reference_code AS product_global_id,
              profile_version.id::text AS input_profile_version_id,
              profile_version.global_id AS input_profile_version_global_id,
              profile_version.row_version::text
@@ -1326,7 +1326,7 @@ export async function writeCartonizationRateEvidenceInPostgres(
              AND recipe.packaging_material_id = $2::uuid
              AND recipe.global_id = $3
              AND recipe.row_version = $4
-             AND product.global_id = $5
+             AND product.reference_code = $5
              AND profile_version.global_id = $6
              AND profile_version.row_version = $7
            LIMIT 1

@@ -194,6 +194,8 @@ assertIncludes(persistence, [
   'CARTONIZATION_RATE_EVIDENCE_IDEMPOTENCY_CONFLICT',
   'CARTONIZATION_RATE_DESTINATION_INVALID',
   'The confirmed ship-to address is not carrier-ready',
+  'product.reference_code AS product_global_id',
+  'AND product.reference_code = $5',
   'evidence.sealed_at IS NOT NULL',
   'inventory_run.warehouse_id = warehouse.id',
   'recipe.packaging_material_id = $2::uuid',
@@ -205,6 +207,11 @@ assert.doesNotMatch(
   persistence,
   /\bcanonicalHash\(/,
   'The retired hash helper must not remain referenced',
+)
+assert.doesNotMatch(
+  persistence,
+  /product\.global_id/,
+  'Cartonization evidence must use the CRM product reference_code column',
 )
 
 assertIncludes(route, [
