@@ -184,10 +184,12 @@ type CandidateRow = {
   subtotal_minor: string
   discount_minor: string
   brand_discount_minor: string
-  shipping_minor: string
+  shipping_minor: string | null
   tax_minor: string
-  other_adjustment_minor: string
-  total_minor: string
+  other_adjustment_minor: string | null
+  total_minor: string | null
+  header_money_state: 'complete' | 'operational_incomplete'
+  header_money_gaps: string[]
   party_snapshot_state: string
   party_snapshot_ciphertext: Buffer | null
   party_snapshot_iv: Buffer | null
@@ -1084,6 +1086,8 @@ const CANDIDATE_SELECT = `SELECT
   candidate.tax_minor::text,
   candidate.other_adjustment_minor::text,
   candidate.total_minor::text,
+  candidate.header_money_state,
+  candidate.header_money_gaps,
   candidate.party_snapshot_state,
   candidate.party_snapshot_ciphertext,
   candidate.party_snapshot_iv,
@@ -1945,6 +1949,23 @@ function requiredOrderMoney(
   return value.amountMinor
 }
 
+function optionalOrderMoney(
+  order: CommerceNormalizedOrder,
+  field: CommerceDataField<CommerceMoneySet>,
+  label: string,
+) {
+  const value = primaryMoney(field)
+  if (!value) return null
+  if (value.currency !== order.currency) {
+    intakeError(
+      'COMMERCE_NORMALIZATION_MONEY_INCOMPLETE',
+      `${order.orderNumber} has no exact ${label} in ${order.currency}`,
+      422,
+    )
+  }
+  return value.amountMinor
+}
+
 function optionalMoney(field: CommerceDataField<CommerceMoneySet>) {
   return primaryMoney(field)
 }
@@ -2748,7 +2769,11 @@ export async function prepareCommerceIntakeReadIntentInPostgres(input: {
       : 1
     const windowStart = continuation
       ? iso(continuation.window_start)
-      : null
+      : (
+          input.resource === 'orders' && account.provider === 'shopify'
+            ? new Date(now.getTime() - 60 * 24 * 60 * 60 * 1_000).toISOString()
+            : null
+        )
     const windowEnd = continuation
       ? new Date(continuation.window_end).toISOString()
       : now.toISOString()
@@ -4239,10 +4264,33 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
         continue
       }
       const subtotal = requiredOrderMoney(order, order.subtotal, 'subtotal')
-      const shipping = requiredOrderMoney(order, order.shipping, 'shipping')
+      const shipping = optionalOrderMoney(order, order.shipping, 'shipping')
       const tax = requiredOrderMoney(order, order.tax, 'tax')
       const totalDiscount = requiredOrderMoney(order, order.discount, 'discount')
-      const total = requiredOrderMoney(order, order.total, 'total')
+      const total = optionalOrderMoney(order, order.total, 'total')
+      const headerMoneyGaps = [
+        ...(shipping === null ? ['shipping'] : []),
+        ...(total === null ? ['total'] : []),
+      ]
+      const expectedHeaderMoneyState = headerMoneyGaps.length
+        ? 'operational_incomplete'
+        : 'complete'
+      if (
+        !order.headerMoney.fulfillmentDemandEligible
+        || order.headerMoney.state !== expectedHeaderMoneyState
+        || order.headerMoney.unavailableFields.join(',')
+          !== headerMoneyGaps.join(',')
+        || order.headerMoney.accountingEligible
+          !== (expectedHeaderMoneyState === 'complete')
+        || order.headerMoney.customerChargeEligible
+          !== (expectedHeaderMoneyState === 'complete')
+      ) {
+        intakeError(
+          'COMMERCE_NORMALIZATION_MONEY_INCOMPLETE',
+          `${order.orderNumber} has inconsistent header money evidence`,
+          422,
+        )
+      }
       let discount = totalDiscount
       let brandDiscount = BigInt(0)
       if (order.providerFacts.provider === 'faire') {
@@ -4260,12 +4308,14 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
           brandDiscount = providerBrandDiscount.amountMinor
         }
       }
-      const otherAdjustment = total
-        - subtotal
-        + discount
-        + brandDiscount
-        - shipping
-        - tax
+      const otherAdjustment = shipping === null || total === null
+        ? null
+        : total
+          - subtotal
+          + discount
+          + brandDiscount
+          - shipping
+          - tax
       const presentment = [
         presentmentMoney(order.subtotal),
         presentmentMoney(order.discount),
@@ -4325,7 +4375,8 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
            normalized_fulfillment_status, normalized_return_status,
            test_order, requires_shipping, currency_code, subtotal_minor,
            discount_minor, brand_discount_minor, shipping_minor, tax_minor,
-           other_adjustment_minor, total_minor, presentment_currency_code,
+           other_adjustment_minor, total_minor, header_money_state,
+           header_money_gaps, presentment_currency_code,
            presentment_subtotal_minor, presentment_discount_minor,
            presentment_brand_discount_minor, presentment_shipping_minor,
            presentment_tax_minor, presentment_other_adjustment_minor,
@@ -4345,14 +4396,15 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
          ) VALUES (
            $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7, $8,
            $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19,
-           $20, $21, $22, $23, $24, $25, $26, $27, $28, $29,
-           CASE WHEN $27::text IS NULL THEN NULL ELSE 0 END,
-           $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40,
-           $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51,
-           $52::timestamptz, $53::timestamptz, $54::timestamptz,
-           $55::timestamptz, $56::timestamptz, $57::timestamptz,
-           $58, $59, $60, $61, 'held', $62::text[],
-           $63, $63, $64::timestamptz
+           $20, $21, $22, $23, $24, $25, $26, $27, $28::text[],
+           $29, $30, $31,
+           CASE WHEN $29::text IS NULL THEN NULL ELSE 0 END,
+           $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42,
+           $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53,
+           $54::timestamptz, $55::timestamptz, $56::timestamptz,
+           $57::timestamptz, $58::timestamptz, $59::timestamptz,
+           $60, $61, $62, $63, 'held', $64::text[],
+           $65, $65, $66::timestamptz
          )
          RETURNING id::text`,
         [
@@ -4382,10 +4434,12 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
           bigintString(subtotal),
           bigintString(discount),
           bigintString(brandDiscount),
-          bigintString(shipping),
+          shipping === null ? null : bigintString(shipping),
           bigintString(tax),
-          bigintString(otherAdjustment),
-          bigintString(total),
+          otherAdjustment === null ? null : bigintString(otherAdjustment),
+          total === null ? null : bigintString(total),
+          order.headerMoney.state,
+          headerMoneyGaps,
           presentmentCurrency,
           presentmentCurrency ? bigintString(presentment[0]?.amountMinor) : null,
           presentmentCurrency ? bigintString(presentment[1]?.amountMinor) : null,
@@ -5649,6 +5703,13 @@ export async function readCommerceIntakeStateFromPostgres(input: {
         currency: candidate.currency_code,
         subtotalMinor: safeMinor(candidate.subtotal_minor),
         totalMinor: safeMinor(candidate.total_minor),
+        headerMoney: {
+          state: candidate.header_money_state,
+          unavailableFields: candidate.header_money_gaps,
+          accountingEligible: candidate.header_money_state === 'complete',
+          customerChargeEligible:
+            candidate.header_money_state === 'complete',
+        },
         requiresShipping: candidate.requires_shipping,
         sourceUpdatedAt: iso(candidate.provider_updated_at)
           || iso(candidate.observed_at),
@@ -8598,6 +8659,17 @@ export async function promoteCommerceCandidateInPostgres(input: {
             tax: candidate.tax_minor,
             otherAdjustment: candidate.other_adjustment_minor,
             total: candidate.total_minor,
+          },
+          headerMoney: {
+            state: candidate.header_money_state,
+            unavailableFields: candidate.header_money_gaps,
+            fulfillmentDemandUse: 'exact_lines_only',
+            accountingUse: candidate.header_money_state === 'complete'
+              ? 'eligible'
+              : 'blocked',
+            customerChargeUse: candidate.header_money_state === 'complete'
+              ? 'eligible'
+              : 'blocked',
           },
           monetaryReconciliation: {
             policyVersion: 'commerce-money-reconciliation-v1',

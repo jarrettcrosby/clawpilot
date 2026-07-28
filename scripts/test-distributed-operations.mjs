@@ -125,6 +125,21 @@ function verifySourceContracts() {
     packageWorkflowMigration.includes("ALTER COLUMN status SET DEFAULT 'planned'"),
     'Operations package workflow must require explicit pack verification',
   )
+  const packageContentsMigration = read(
+    'db/migrations/0121_operations_package_contents.sql',
+  )
+  for (const fragment of [
+    'CREATE TABLE IF NOT EXISTS operations_package_contents',
+    'operations_package_contents_package_line_unique',
+    'protect_operations_package_content_write',
+    'ADD COLUMN IF NOT EXISTS source_package_id uuid',
+    'operations_print_artifacts_package_packing_list_unique',
+  ]) {
+    assert.ok(
+      packageContentsMigration.includes(fragment),
+      `Package-content allocation migration missing ${fragment}`,
+    )
+  }
 
   const packagingMigration = read('db/migrations/0086_product_packaging_profiles.sql')
   for (const fragment of [
@@ -499,6 +514,11 @@ function verifySourceContracts() {
     "commandType: 'verify_operations_order_pack'",
     "eventType: 'operations.package.packed'",
     "eventType: 'operations.order.pack_verified'",
+    'generateOperationsPackagePackingSlipInPostgres',
+    "commandType: 'generate_operations_package_packing_slip'",
+    "eventType: 'operations.package.packing_list_generated'",
+    'OPERATIONS_PACKAGE_CONTENTS_INCOMPLETE',
+    'source_package_id',
     'readDefaultProductPackagingWithClient',
     'orders.archived_at IS NULL',
     "warehouse.code <> 'MOCK-01'",
@@ -576,6 +596,7 @@ function verifySourceContracts() {
     'releaseOperationsOrderFromPostgres',
     'confirmOperationsOrderPicksFromPostgres',
     'verifyOperationsOrderPackFromPostgres',
+    'generateOperationsPackagePackingSlipInPostgres',
     'createOperationsSandboxLabelInPostgres',
     'voidOperationsSandboxLabelInPostgres',
     'createOperationsWarehouseInPostgres',
@@ -597,6 +618,7 @@ function verifySourceContracts() {
     "action === 'release-order'",
     "action === 'confirm-picks'",
     "action === 'verify-pack'",
+    "action === 'generate-packing-slip'",
     "action === 'create-sandbox-label'",
     "action === 'void-sandbox-label'",
     'Idempotency-Key',
@@ -637,6 +659,20 @@ function verifySourceContracts() {
     operationsSection.includes('<Tab value="warehouses"'),
     'Operations navigation must expose warehouse setup',
   )
+  for (const fragment of [
+    'Exact contents',
+    'Generate packing list',
+    'Download PDF',
+    'Print packing list',
+    "action: 'generate-packing-slip'",
+    "action: 'enqueue-packing-slip-artifact'",
+    'does not rate, purchase, void, or update a carrier',
+  ]) {
+    assert.ok(
+      operationsSection.includes(fragment),
+      `Package packing-list UI missing ${fragment}`,
+    )
+  }
 
   const health = read('app_src/app/api/health/route.ts')
   assert.ok(
@@ -751,6 +787,14 @@ function verifySourceContracts() {
     health.includes('row?.operations_receiving_topology_migration_applied'),
     'Health migration status must include receiving and topology persistence',
   )
+  assert.ok(
+    health.includes("WHERE filename = '0121_operations_package_contents.sql'"),
+    'Health must require package-content allocation persistence',
+  )
+  assert.ok(
+    health.includes('row?.operations_package_contents_migration_applied'),
+    'Health migration status must include package-content allocation persistence',
+  )
 
   const packaging = read('app_src/lib/persistence/productPackaging.ts')
   for (const fragment of [
@@ -804,6 +848,10 @@ function verifySourceContracts() {
   assert.ok(
     predeploy.includes("'db/migrations/0085_operations_package_workflow.sql'"),
     'Predeploy must require the operations package workflow migration',
+  )
+  assert.ok(
+    predeploy.includes("'db/migrations/0121_operations_package_contents.sql'"),
+    'Predeploy must require package-content allocation persistence',
   )
   assert.ok(
     predeploy.includes("'db/migrations/0086_product_packaging_profiles.sql'"),

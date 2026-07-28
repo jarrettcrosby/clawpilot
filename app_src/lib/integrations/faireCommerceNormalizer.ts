@@ -6,12 +6,12 @@ import {
   COMMERCE_NORMALIZED_VARIANT_VERSION,
   CommerceNormalizationError,
   asCommerceRecord,
-  assertCommerceOrderMoneyComplete,
   availableCommerceField,
   buildCommerceReadinessFacts,
   commerceAddressFromRecord,
   commerceConnectionValues,
   commerceMoneyFromDecimal,
+  commerceOrderHeaderMoneyState,
   commercePackagingFromRecord,
   commerceSourceHash,
   createCommerceExternalIdentity,
@@ -45,7 +45,7 @@ import {
 } from '@/lib/operations/commerceNormalization'
 
 export const FAIRE_COMMERCE_NORMALIZER_VERSION =
-  'faire-commerce-normalizer-v2' as const
+  'faire-commerce-normalizer-v3' as const
 
 type FaireSource = Readonly<Record<string, unknown>>
 
@@ -1253,7 +1253,7 @@ function normalizeOrder(
     explicitTotal,
     exactOrderTotal(subtotal, discount, shipping, tax),
   )
-  assertCommerceOrderMoneyComplete({
+  const headerMoney = commerceOrderHeaderMoneyState({
     currency,
     subtotal,
     shipping,
@@ -1286,6 +1286,7 @@ function normalizeOrder(
     tax,
     discount,
     total,
+    headerMoney,
     party,
     shipTo,
     requestedDeliveryAt,

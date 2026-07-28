@@ -50,6 +50,10 @@ import IntegrationSetupJourney from '@/components/settings/IntegrationSetupJourn
 type CarrierProvider = 'ups_rest' | 'fedex_rest' | 'usps_rest'
 type CarrierEnvironment = 'sandbox' | 'production'
 
+const AG_ALCHEMY_EPISCS_RATING_DELEGATION =
+  'ag-alchemy-episcs-sandbox-rating-delegation'
+const AG_ALCHEMY_RATING_ORIGIN_WAREHOUSE = 'gwh5366613'
+
 type CarrierAddress = {
   line1: string
   line2: string | null
@@ -87,6 +91,11 @@ type CarrierAccountState = {
   verifiedAt: string | null
   lastErrorCode: string | null
   updatedAt: string
+  allowedCapabilities: string[]
+  authorizationScope: string | null
+  credentialRevealAllowed: boolean
+  managedBy: string | null
+  senderOriginWarehouseGlobalId: string | null
   carrierAccounts: OperationsCarrierAccount[]
 }
 
@@ -475,6 +484,26 @@ export default function CarrierIntegrationPanel() {
     () => (account?.carrierAccounts || []).filter((entry) => entry.status === 'active'),
     [account?.carrierAccounts],
   )
+  const sourceManagedDelegation = (
+    account?.managedBy === AG_ALCHEMY_EPISCS_RATING_DELEGATION
+    || (
+      account?.authorizationScope === 'sandbox_rating_only'
+      && account.credentialRevealAllowed === false
+    )
+  )
+  const ratingOnlyDelegation = Boolean(
+    sourceManagedDelegation
+    && account
+    && account.managedBy === AG_ALCHEMY_EPISCS_RATING_DELEGATION
+    && account.authorizationScope === 'sandbox_rating_only'
+    && account.credentialRevealAllowed === false
+    && account.senderOriginWarehouseGlobalId
+      === AG_ALCHEMY_RATING_ORIGIN_WAREHOUSE
+    && account.allowedCapabilities.length === 1
+    && account.allowedCapabilities[0] === 'sandbox_rate',
+  )
+  const managedDelegationDrift = sourceManagedDelegation
+    && !ratingOnlyDelegation
   const explicitCarrierAccountGlobalId = selectedCarrierAccounts[key] || ''
   const selectedCarrierAccountGlobalId = activeCarrierAccounts.some(
     (entry) => entry.globalId === explicitCarrierAccountGlobalId,
@@ -570,7 +599,9 @@ export default function CarrierIntegrationPanel() {
         : 2
       : rateTest ? 1 : 0
   const busy = Boolean(pendingAction)
-  const sandboxRateBlocker = !account?.configured
+  const sandboxRateBlocker = managedDelegationDrift
+    ? 'This managed sandbox-rating connection is inconsistent and must be repaired by the platform operator.'
+    : !account?.configured
     ? 'Save and verify provider credentials first.'
     : account.verificationStatus !== 'verified'
       ? 'Verify the provider credentials first.'
@@ -984,7 +1015,13 @@ export default function CarrierIntegrationPanel() {
             {verifiedLabel ? `Verified ${verifiedLabel}` : 'UPS, FedEx, and USPS direct accounts'}
           </Typography>
         </Box>
-        <Tooltip title={account?.configured ? 'Enable or disable this carrier account' : 'Connect credentials first'}>
+        <Tooltip
+          title={sourceManagedDelegation
+            ? 'This rating lane is activated and maintained by EPISCS'
+            : account?.configured
+              ? 'Enable or disable this carrier account'
+              : 'Connect credentials first'}
+        >
           <span>
             <FormControlLabel
               control={(
@@ -997,7 +1034,7 @@ export default function CarrierIntegrationPanel() {
                       enabled ? `${providerLabel(provider)} enabled.` : `${providerLabel(provider)} disabled.`,
                     )
                   }}
-                  disabled={!account?.configured || busy}
+                  disabled={!account?.configured || busy || sourceManagedDelegation}
                 />
               )}
               label={account?.status === 'active' ? 'Active' : account?.status === 'error' ? 'Error' : 'Disabled'}
@@ -1008,9 +1045,53 @@ export default function CarrierIntegrationPanel() {
       </Stack>
 
       <Box sx={{ mt: 2 }}>
-        <IntegrationSetupJourney
-          description="Scope the provider lane, verify its credential, bind a billing identity, and activate only after the safe test boundary is ready."
-          steps={[
+        {ratingOnlyDelegation ? (
+          <IntegrationSetupJourney
+            description="The sandbox rating lane is already provisioned. Confirm the managed sender identity, then run a quote from the AG Alchemy warehouse."
+            steps={[
+              {
+                key: 'carrier-delegation-ready',
+                label: 'Managed rating lane is ready',
+                state: 'complete',
+                description:
+                  'EPISCS owns and verifies the sandbox credential. ClawPilot holds a separately encrypted AG-scoped projection that cannot be revealed or changed here.',
+                facts: [
+                  { label: 'Provider', value: providerLabel(provider) },
+                  {
+                    label: 'ClawPilot integration ID',
+                    value: account?.globalId || 'Not allocated',
+                    copyable: Boolean(account?.globalId),
+                  },
+                  {
+                    label: 'Sender warehouse',
+                    value: account?.senderOriginWarehouseGlobalId || 'Not bound',
+                    copyable: Boolean(account?.senderOriginWarehouseGlobalId),
+                  },
+                  { label: 'Authorized capability', value: 'Sandbox rating only' },
+                ],
+              },
+              {
+                key: 'carrier-delegation-rate',
+                label: 'Run a sandbox rate check',
+                state: rateTest?.provider === provider ? 'complete' : 'current',
+                description:
+                  'Edit the destination and request a quote. This writes redacted ClawPilot evidence only; it cannot create a label, shipment, pickup, manifest, or provider mutation.',
+                facts: [
+                  {
+                    label: 'Latest sandbox evidence',
+                    value: rateTest?.provider === provider
+                      ? rateTest.evidenceGlobalId
+                      : 'No rate test loaded',
+                    copyable: rateTest?.provider === provider,
+                  },
+                ],
+              },
+            ]}
+          />
+        ) : (
+          <IntegrationSetupJourney
+            description="Scope the provider lane, verify its credential, bind a billing identity, and activate only after the safe test boundary is ready."
+            steps={[
             {
               key: 'carrier-scope',
               label: 'Choose provider and environment',
@@ -1102,8 +1183,9 @@ export default function CarrierIntegrationPanel() {
                 },
               ],
             },
-          ]}
-        />
+            ]}
+          />
+        )}
       </Box>
 
       <Tabs
@@ -1155,12 +1237,38 @@ export default function CarrierIntegrationPanel() {
         <ToggleButton value="production">Production</ToggleButton>
       </ToggleButtonGroup>
 
-      {account?.configured ? (
+      {account?.configured && !sourceManagedDelegation ? (
         <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap mb={2}>
           <Chip size="small" icon={<KeyRounded />} label={`Client ending ${account.clientIdLastFour || 'unknown'}`} />
           <Chip size="small" variant="outlined" label={`Credential v${account.credentialVersion}`} />
           <Chip size="small" variant="outlined" label={account.globalId} />
         </Stack>
+      ) : null}
+
+      {ratingOnlyDelegation ? (
+        <Alert severity="info" sx={{ mb: 2, borderRadius: '8px' }}>
+          <Typography variant="body2" fontWeight={700}>
+            EPISCS-managed sandbox rating
+          </Typography>
+          <Typography variant="body2">
+            This connection can request sandbox rates only. Its sender is the AG Alchemy warehouse{' '}
+            {account?.senderOriginWarehouseGlobalId || ''}. Credentials, billing identity, labels, voids,
+            pickups, and manifests remain source-managed and cannot be changed or revealed here.
+          </Typography>
+        </Alert>
+      ) : null}
+
+      {managedDelegationDrift ? (
+        <Alert severity="error" sx={{ mb: 2, borderRadius: '8px' }}>
+          <Typography variant="body2" fontWeight={700}>
+            Managed sandbox rating needs repair
+          </Typography>
+          <Typography variant="body2">
+            The EPISCS-managed connection no longer matches its approved AG Alchemy warehouse,
+            scope, or no-reveal policy. Rating and all carrier-management actions are disabled
+            until the platform operator restores the exact delegated configuration.
+          </Typography>
+        </Alert>
       ) : null}
 
       {environment === 'sandbox' && provider !== 'usps_rest' && sandboxRateBlocker ? (
@@ -1174,14 +1282,16 @@ export default function CarrierIntegrationPanel() {
         </Alert>
       ) : null}
 
-      <Typography variant="subtitle2" fontWeight={700} sx={{ mb: 1 }}>Provider credentials</Typography>
-      <Box component="form" onSubmit={saveCredential}>
+      {!sourceManagedDelegation ? (
+        <>
+          <Typography variant="subtitle2" fontWeight={700} sx={{ mb: 1 }}>Provider credentials</Typography>
+          <Box component="form" onSubmit={saveCredential}>
         <TextField
           fullWidth
           label="Connection name"
           value={form.displayName}
           onChange={(event) => updateForm('displayName', event.target.value)}
-          disabled={busy}
+          disabled={busy || ratingOnlyDelegation}
           sx={{ ...fieldSx, mb: 1.5 }}
           inputProps={{ maxLength: 120 }}
         />
@@ -1191,7 +1301,7 @@ export default function CarrierIntegrationPanel() {
             label="Client ID"
             value={form.clientId}
             onChange={(event) => updateForm('clientId', event.target.value)}
-            disabled={busy}
+            disabled={busy || ratingOnlyDelegation}
             autoComplete="off"
             sx={fieldSx}
           />
@@ -1201,7 +1311,7 @@ export default function CarrierIntegrationPanel() {
             label="Client secret"
             value={form.clientSecret}
             onChange={(event) => updateForm('clientSecret', event.target.value)}
-            disabled={busy}
+            disabled={busy || ratingOnlyDelegation}
             autoComplete="new-password"
             sx={fieldSx}
           />
@@ -1237,7 +1347,7 @@ export default function CarrierIntegrationPanel() {
             type="submit"
             variant="contained"
             startIcon={pendingAction === 'save' ? <CircularProgress size={16} color="inherit" /> : <SaveRounded />}
-            disabled={busy || !form.clientId.trim() || !form.clientSecret.trim()}
+            disabled={busy || ratingOnlyDelegation || !form.clientId.trim() || !form.clientSecret.trim()}
             sx={buttonSx}
           >
             Save and verify
@@ -1255,7 +1365,7 @@ export default function CarrierIntegrationPanel() {
           >
             Test connection
           </Button>
-          {canRevealCredentials ? (
+          {canRevealCredentials && account?.credentialRevealAllowed !== false ? (
             <Button
               variant="outlined"
               startIcon={pendingAction === 'reveal' ? <CircularProgress size={16} color="inherit" /> : <VisibilityRounded />}
@@ -1270,18 +1380,18 @@ export default function CarrierIntegrationPanel() {
             color="error"
             variant="text"
             startIcon={<LinkOffRounded />}
-            disabled={busy || !account?.configured}
+            disabled={busy || ratingOnlyDelegation || !account?.configured}
             onClick={() => setConfirmDisconnect(true)}
             sx={buttonSx}
           >
             Disconnect
           </Button>
         </Stack>
-      </Box>
+          </Box>
 
-      {revealedCredential
-        && revealedCredential.provider === provider
-        && revealedCredential.environment === environment ? (
+          {revealedCredential
+            && revealedCredential.provider === provider
+            && revealedCredential.environment === environment ? (
           <Alert
             severity="warning"
             sx={{ mt: 2, borderRadius: '8px', alignItems: 'flex-start' }}
@@ -1349,10 +1459,10 @@ export default function CarrierIntegrationPanel() {
               />
             </Box>
           </Alert>
-        ) : null}
+            ) : null}
 
-      {account?.configured ? (
-        <Box sx={{ mt: 3, pt: 2, borderTop: '1px solid', borderColor: 'divider' }}>
+          {account?.configured ? (
+            <Box sx={{ mt: 3, pt: 2, borderTop: '1px solid', borderColor: 'divider' }}>
           <Stack
             direction={{ xs: 'column', sm: 'row' }}
             spacing={1}
@@ -1400,7 +1510,7 @@ export default function CarrierIntegrationPanel() {
                     <Switch
                       size="small"
                       checked={entry.status === 'active'}
-                      disabled={busy || entry.status === 'needs_configuration'}
+                      disabled={busy || ratingOnlyDelegation || entry.status === 'needs_configuration'}
                       onChange={(_, enabled) => void patch(
                         `status-${entry.globalId}`,
                         {
@@ -1424,7 +1534,7 @@ export default function CarrierIntegrationPanel() {
                         size="small"
                         startIcon={<EditRounded />}
                         onClick={() => editCarrierAccount(entry)}
-                        disabled={busy}
+                        disabled={busy || ratingOnlyDelegation}
                       >
                         Edit
                       </Button>
@@ -1436,7 +1546,7 @@ export default function CarrierIntegrationPanel() {
                         size="small"
                         color="error"
                         startIcon={<DeleteOutlineRounded />}
-                        disabled={busy}
+                        disabled={busy || ratingOnlyDelegation}
                         onClick={() => {
                           if (!window.confirm(`Delete ${entry.displayName}?`)) return
                           void patch(
@@ -1470,7 +1580,7 @@ export default function CarrierIntegrationPanel() {
                 label="Account name"
                 value={carrierAccountForm.displayName}
                 onChange={(event) => updateCarrierAccountForm('displayName', event.target.value)}
-                disabled={busy}
+                disabled={busy || ratingOnlyDelegation}
                 inputProps={{ maxLength: 120 }}
                 sx={fieldSx}
               />
@@ -1479,7 +1589,7 @@ export default function CarrierIntegrationPanel() {
                 label={editingCarrierAccountGlobalId ? 'New account number (optional)' : 'Account number'}
                 value={carrierAccountForm.accountNumber}
                 onChange={(event) => updateCarrierAccountForm('accountNumber', event.target.value)}
-                disabled={busy}
+                disabled={busy || ratingOnlyDelegation}
                 autoComplete="off"
                 sx={fieldSx}
               />
@@ -1488,7 +1598,7 @@ export default function CarrierIntegrationPanel() {
                 label="Sender name"
                 value={carrierAccountForm.senderName}
                 onChange={(event) => updateCarrierAccountForm('senderName', event.target.value)}
-                disabled={busy}
+                disabled={busy || ratingOnlyDelegation}
                 inputProps={{ maxLength: 120 }}
                 helperText="Used as the shipper name for carrier rating and labels."
                 sx={{ ...fieldSx, gridColumn: { sm: '1 / -1' } }}
@@ -1498,14 +1608,14 @@ export default function CarrierIntegrationPanel() {
                 label="Registered address line 1"
                 value={carrierAccountForm.line1}
                 onChange={(event) => updateCarrierAccountForm('line1', event.target.value)}
-                disabled={busy}
+                disabled={busy || ratingOnlyDelegation}
                 sx={fieldSx}
               />
               <TextField
                 label="Registered address line 2"
                 value={carrierAccountForm.line2}
                 onChange={(event) => updateCarrierAccountForm('line2', event.target.value)}
-                disabled={busy}
+                disabled={busy || ratingOnlyDelegation}
                 sx={fieldSx}
               />
               <TextField
@@ -1513,7 +1623,7 @@ export default function CarrierIntegrationPanel() {
                 label="City"
                 value={carrierAccountForm.city}
                 onChange={(event) => updateCarrierAccountForm('city', event.target.value)}
-                disabled={busy}
+                disabled={busy || ratingOnlyDelegation}
                 sx={fieldSx}
               />
               <TextField
@@ -1521,7 +1631,7 @@ export default function CarrierIntegrationPanel() {
                 label="State / region"
                 value={carrierAccountForm.region}
                 onChange={(event) => updateCarrierAccountForm('region', event.target.value)}
-                disabled={busy}
+                disabled={busy || ratingOnlyDelegation}
                 sx={fieldSx}
               />
               <TextField
@@ -1529,7 +1639,7 @@ export default function CarrierIntegrationPanel() {
                 label="Postal code"
                 value={carrierAccountForm.postalCode}
                 onChange={(event) => updateCarrierAccountForm('postalCode', event.target.value)}
-                disabled={busy}
+                disabled={busy || ratingOnlyDelegation}
                 sx={fieldSx}
               />
               <TextField
@@ -1537,7 +1647,7 @@ export default function CarrierIntegrationPanel() {
                 label="Country code"
                 value={carrierAccountForm.countryCode}
                 onChange={(event) => updateCarrierAccountForm('countryCode', event.target.value.toUpperCase())}
-                disabled={busy}
+                disabled={busy || ratingOnlyDelegation}
                 inputProps={{ maxLength: 2 }}
                 sx={fieldSx}
               />
@@ -1548,7 +1658,7 @@ export default function CarrierIntegrationPanel() {
                   <Switch
                     checked={carrierAccountForm.allowSenderBilling}
                     onChange={(_, value) => updateCarrierAccountForm('allowSenderBilling', value)}
-                    disabled={busy}
+                    disabled={busy || ratingOnlyDelegation}
                   />
                 )}
                 label="Sender"
@@ -1558,7 +1668,7 @@ export default function CarrierIntegrationPanel() {
                   <Switch
                     checked={carrierAccountForm.allowRecipientBilling}
                     onChange={(_, value) => updateCarrierAccountForm('allowRecipientBilling', value)}
-                    disabled={busy}
+                    disabled={busy || ratingOnlyDelegation}
                   />
                 )}
                 label="Recipient"
@@ -1568,7 +1678,7 @@ export default function CarrierIntegrationPanel() {
                   <Switch
                     checked={carrierAccountForm.allowThirdPartyBilling}
                     onChange={(_, value) => updateCarrierAccountForm('allowThirdPartyBilling', value)}
-                    disabled={busy}
+                    disabled={busy || ratingOnlyDelegation}
                   />
                 )}
                 label="Third party"
@@ -1578,32 +1688,71 @@ export default function CarrierIntegrationPanel() {
               type="submit"
               variant="outlined"
               startIcon={<AddRounded />}
-              disabled={busy}
+              disabled={busy || ratingOnlyDelegation}
               sx={buttonSx}
             >
               {editingCarrierAccountGlobalId ? 'Save account' : 'Add account'}
             </Button>
           </Box>
+            </Box>
+          ) : null}
+        </>
+      ) : (
+        <Box sx={{ mb: 2, p: 1.5, border: '1px solid', borderColor: 'divider', borderRadius: '8px' }}>
+          <Typography variant="subtitle2" fontWeight={700}>
+            Managed rating identity
+          </Typography>
+          <Typography variant="caption" color="text.secondary">
+            Read-only operational facts used for the quote. Sensitive credentials and the full billing
+            account number stay hidden.
+          </Typography>
+          <Stack spacing={1} sx={{ mt: 1.25 }}>
+            {activeCarrierAccounts.map((entry) => (
+              <Box key={entry.globalId}>
+                <Stack direction="row" spacing={0.75} alignItems="center" flexWrap="wrap" useFlexGap>
+                  <Typography variant="body2" fontWeight={650}>{entry.displayName}</Typography>
+                  <Chip size="small" variant="outlined" label={`ending ${entry.accountNumberLastFour}`} />
+                  <Chip size="small" variant="outlined" label={entry.globalId} />
+                </Stack>
+                <Typography variant="caption" color="text.secondary" display="block">
+                  Sender: {entry.senderName}
+                </Typography>
+                <Typography variant="caption" color="text.secondary" display="block">
+                  {entry.registeredAddress.line1}, {entry.registeredAddress.city},{' '}
+                  {entry.registeredAddress.region} {entry.registeredAddress.postalCode}
+                </Typography>
+              </Box>
+            ))}
+          </Stack>
         </Box>
-      ) : null}
+      )}
 
       {environment === 'sandbox' && provider !== 'usps_rest' ? (
         <Box sx={{ mt: 2, pt: 2, borderTop: '1px solid', borderColor: 'divider' }}>
-          <Typography variant="subtitle2" fontWeight={700}>Sandbox label test workflow</Typography>
-          <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-            Rate an editable US destination, choose one exact returned service, create a sandbox label,
-            print its stored bytes, and void it when the test is complete.
+          <Typography variant="subtitle2" fontWeight={700}>
+            {sourceManagedDelegation
+              ? ratingOnlyDelegation ? 'Sandbox rate test' : 'Managed sandbox rating'
+              : 'Sandbox label test workflow'}
           </Typography>
-          <Stepper
-            activeStep={labelWorkflowStep}
-            alternativeLabel
-            sx={{ mt: 2, mb: 2, '& .MuiStepLabel-label': { fontSize: '0.75rem' } }}
-          >
-            {['Rate', 'Create label', 'Print stored label', 'Void / close'].map((label) => (
-              <Step key={label}><StepLabel>{label}</StepLabel></Step>
-            ))}
-          </Stepper>
-          {!canExecute ? (
+          <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
+            {sourceManagedDelegation
+              ? ratingOnlyDelegation
+                ? 'Rate an editable US destination from the AG Alchemy warehouse. No carrier mutation follows the quote.'
+                : 'This managed lane is disabled until its exact AG Alchemy rating policy is restored.'
+              : 'Rate an editable US destination, choose one exact returned service, create a sandbox label, print its stored bytes, and void it when the test is complete.'}
+          </Typography>
+          {!sourceManagedDelegation ? (
+            <Stepper
+              activeStep={labelWorkflowStep}
+              alternativeLabel
+              sx={{ mt: 2, mb: 2, '& .MuiStepLabel-label': { fontSize: '0.75rem' } }}
+            >
+              {['Rate', 'Create label', 'Print stored label', 'Void / close'].map((label) => (
+                <Step key={label}><StepLabel>{label}</StepLabel></Step>
+              ))}
+            </Stepper>
+          ) : null}
+          {!sourceManagedDelegation && !canExecute ? (
             <Alert severity="info" sx={{ mb: 2, borderRadius: '8px' }}>
               You can review and run rating diagnostics, but creating, printing, or voiding a label also
               requires warehouse-execution permission.
@@ -1817,6 +1966,8 @@ export default function CarrierIntegrationPanel() {
             </Stack>
           ) : null}
 
+          {!sourceManagedDelegation ? (
+            <>
           <Box sx={{ mt: 3, pt: 2, borderTop: '1px solid', borderColor: 'divider' }}>
             <Typography variant="overline" color="text.disabled">Step 2 · Create label</Typography>
             <Typography variant="subtitle2" fontWeight={700}>Confirm one exact returned rate</Typography>
@@ -2395,6 +2546,8 @@ export default function CarrierIntegrationPanel() {
                   </Stack>
                 )}
               </Box>
+            </>
+          ) : null}
             </>
           ) : null}
         </Box>

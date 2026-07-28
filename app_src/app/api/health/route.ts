@@ -267,8 +267,14 @@ export async function GET() {
           operations_shopify_order_preview_migration_applied: boolean
           operations_commerce_normalization_migration_applied: boolean
           operations_commerce_continuations_migration_applied: boolean
+          operations_carrier_rate_test_labels_migration_applied: boolean
+          operations_print_agent_capabilities_migration_applied: boolean
+          operations_carrier_label_artifacts_migration_applied: boolean
           operations_commerce_product_policy_migration_applied: boolean
           operations_commerce_catalog_sync_migration_applied: boolean
+          operations_package_contents_migration_applied: boolean
+          operations_commerce_incomplete_header_money_migration_applied: boolean
+          operations_packaging_materials_migration_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -762,6 +768,21 @@ export async function GET() {
               EXISTS (
                 SELECT 1
                 FROM schema_migrations
+                WHERE filename = '0116_operations_carrier_rate_test_labels.sql'
+              ) AS operations_carrier_rate_test_labels_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0117_operations_print_agent_capabilities.sql'
+              ) AS operations_print_agent_capabilities_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0118_operations_carrier_label_output_artifacts.sql'
+              ) AS operations_carrier_label_artifacts_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
                 WHERE filename = '0119_operations_commerce_product_intake_policy.sql'
               ) AS operations_commerce_product_policy_migration_applied,
               EXISTS (
@@ -769,6 +790,21 @@ export async function GET() {
                 FROM schema_migrations
                 WHERE filename = '0120_operations_commerce_catalog_sync.sql'
               ) AS operations_commerce_catalog_sync_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0121_operations_package_contents.sql'
+              ) AS operations_package_contents_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0122_operations_commerce_incomplete_header_money.sql'
+              ) AS operations_commerce_incomplete_header_money_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0123_operations_packaging_materials.sql'
+              ) AS operations_packaging_materials_migration_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -878,8 +914,14 @@ export async function GET() {
             && row?.operations_shopify_order_preview_migration_applied
             && row?.operations_commerce_normalization_migration_applied
             && row?.operations_commerce_continuations_migration_applied
+            && row?.operations_carrier_rate_test_labels_migration_applied
+            && row?.operations_print_agent_capabilities_migration_applied
+            && row?.operations_carrier_label_artifacts_migration_applied
             && row?.operations_commerce_product_policy_migration_applied
             && row?.operations_commerce_catalog_sync_migration_applied
+            && row?.operations_package_contents_migration_applied
+            && row?.operations_commerce_incomplete_header_money_migration_applied
+            && row?.operations_packaging_materials_migration_applied
             && row?.migration_checksums_present
           ),
         }
@@ -981,8 +1023,14 @@ export async function GET() {
           || !row?.operations_shopify_order_preview_migration_applied
           || !row?.operations_commerce_normalization_migration_applied
           || !row?.operations_commerce_continuations_migration_applied
+          || !row?.operations_carrier_rate_test_labels_migration_applied
+          || !row?.operations_print_agent_capabilities_migration_applied
+          || !row?.operations_carrier_label_artifacts_migration_applied
           || !row?.operations_commerce_product_policy_migration_applied
           || !row?.operations_commerce_catalog_sync_migration_applied
+          || !row?.operations_package_contents_migration_applied
+          || !row?.operations_commerce_incomplete_header_money_migration_applied
+          || !row?.operations_packaging_materials_migration_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')

@@ -840,7 +840,7 @@ const commandResultSource = persistenceSource.slice(
   persistenceSource.indexOf('function commandResult'),
 )
 includes(persistenceSource, [
-  'CASE WHEN $27::text IS NULL THEN NULL ELSE 0 END',
+  'CASE WHEN $29::text IS NULL THEN NULL ELSE 0 END',
 ], 'Nullable presentment-currency staging parameter typing')
 const readIntentPreparationSource = persistenceSource.slice(
   persistenceSource.indexOf(
@@ -962,6 +962,15 @@ includes(persistenceSource, [
   'candidate.last_error_code',
   'lastErrorCode: candidate.last_error_code',
   'failedByCode',
+  'header_money_state',
+  'header_money_gaps',
+  'order.headerMoney.fulfillmentDemandEligible',
+  "expectedHeaderMoneyState === 'complete'",
+  'shipping === null ? null : bigintString(shipping)',
+  'otherAdjustment === null ? null : bigintString(otherAdjustment)',
+  "fulfillmentDemandUse: 'exact_lines_only'",
+  "accountingUse: candidate.header_money_state === 'complete'",
+  "customerChargeUse: candidate.header_money_state === 'complete'",
 ], 'Commerce intake continuity')
 const productCandidateResolverSource = persistenceSource.slice(
   persistenceSource.indexOf(
@@ -1316,8 +1325,11 @@ includes(workflowSource, [
 ], 'Automatic product creation execution summary')
 includes(workflowSource, [
   'ExternalOrderV2 money fields',
-  'Paid-shipping records remain',
-  'ClawPilot will not estimate it.',
+  'Paid-shipping records can stage',
+  'Missing shipping and total remain unavailable',
+  'Header total unavailable',
+  'blocked from',
+  'accounting and customer-charge use',
 ], 'Current Faire money retry guidance')
 includes(workflowSource, [
   "requestError.code === 'COMMERCE_INTAKE_READ_RESTART_REQUIRED'",
@@ -1660,7 +1672,7 @@ const service = loadTypeScriptModule(
       },
       '@/lib/integrations/faireCommerceNormalizer': {
         FAIRE_COMMERCE_NORMALIZER_VERSION:
-          'faire-commerce-normalizer-v2',
+          'faire-commerce-normalizer-v3',
         normalizeFaireCommerce(source) {
           normalizedSources.faire = source
           if (source.inventories) {
@@ -1846,6 +1858,23 @@ const service = loadTypeScriptModule(
       '@/lib/persistence/commerceIntegrations': {
         async readCommerceRuntimeCredentialFromPostgres(input) {
           return runtimes.get(input.accountGlobalId) || null
+        },
+      },
+      '@/lib/persistence/commerceOrderReconciliation': {
+        async readCommerceOrderReconciliationStateInPostgres() {
+          return {
+            status: 'idle',
+            recordsSeen: 0,
+            recordsHeld: 0,
+            consecutiveFailures: 0,
+            lastErrorCode: null,
+            lastStartedAt: null,
+            lastCompletedAt: null,
+            resumable: false,
+            providerWrites: 0,
+            canonicalOrderWrites: 0,
+            inventoryWrites: 0,
+          }
         },
       },
       '@/lib/persistence/commerceIntake': {
@@ -2429,9 +2458,9 @@ try {
   assert.ok(
     providerReservations.some((reservation) => (
       reservation.runtime.provider === 'faire'
-      && reservation.adapterVersion === 'faire-commerce-normalizer-v2'
+      && reservation.adapterVersion === 'faire-commerce-normalizer-v3'
     )),
-    'Faire provider-attempt evidence must record the v2 normalizer',
+    'Faire provider-attempt evidence must record the v3 normalizer',
   )
   assert.ok(
     providerReservations.some((reservation) => (

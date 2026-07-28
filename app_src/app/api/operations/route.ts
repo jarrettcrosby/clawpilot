@@ -24,6 +24,7 @@ import {
   createOperationsWarehouseInPostgres,
   deleteOperationsLocationInPostgres,
   executeOperationsReplenishmentInPostgres,
+  generateOperationsPackagePackingSlipInPostgres,
   OperationsRequestError,
   readOperationsWorkspaceFromPostgres,
   releaseOperationsOrderFromPostgres,
@@ -48,6 +49,7 @@ const MAX_REQUEST_BYTES = 64 * 1024
 const CUSTOMER_GLOBAL_ID = /^ga\d{7}$/
 const PRODUCT_GLOBAL_ID = /^gp\d{7}$/
 const ORDER_GLOBAL_ID = /^gor\d{7}$/
+const PACKAGE_GLOBAL_ID = /^gpa\d{7}$/
 const EXCEPTION_GLOBAL_ID = /^gex\d{7}$/
 const RATE_GLOBAL_ID = /^grt\d{7}$/
 const CARRIER_ACCOUNT_GLOBAL_ID = /^gac\d{7}$/
@@ -925,6 +927,48 @@ export async function POST(req: NextRequest) {
         orderGlobalId: globalIdValue(body.orderGlobalId, 'Operations order', ORDER_GLOBAL_ID),
         expectedRowVersion: integerValue(body.expectedRowVersion, 'Order version', 0, 2_147_483_647),
         reason: textValue(body.reason, 'Package verification reason', 500),
+        idempotencyKey: idempotencyKeyValue(req),
+      })
+      return json({ ok: true, capabilities, result })
+    }
+    if (action === 'generate-packing-slip') {
+      if (!capabilities.canManage || !capabilities.canExecute) {
+        return json({
+          ok: false,
+          error: 'You do not have permission to generate warehouse packing lists',
+          code: 'OPERATIONS_EXECUTE_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set([
+          'action',
+          'orderGlobalId',
+          'packageGlobalId',
+          'expectedRowVersion',
+        ]),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
+      const result = await generateOperationsPackagePackingSlipInPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        orderGlobalId: globalIdValue(
+          body.orderGlobalId,
+          'Operations order',
+          ORDER_GLOBAL_ID,
+        ),
+        packageGlobalId: globalIdValue(
+          body.packageGlobalId,
+          'Operations package',
+          PACKAGE_GLOBAL_ID,
+        ),
+        expectedRowVersion: integerValue(
+          body.expectedRowVersion,
+          'Order version',
+          0,
+          2_147_483_647,
+        ),
         idempotencyKey: idempotencyKeyValue(req),
       })
       return json({ ok: true, capabilities, result })

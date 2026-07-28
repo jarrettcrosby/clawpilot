@@ -26,6 +26,7 @@ import AccountBalanceRounded from '@mui/icons-material/AccountBalanceRounded'
 import PointOfSaleRounded from '@mui/icons-material/PointOfSaleRounded'
 import LocalShippingRounded from '@mui/icons-material/LocalShippingRounded'
 import ImportExportRounded from '@mui/icons-material/ImportExportRounded'
+import Inventory2Rounded from '@mui/icons-material/Inventory2Rounded'
 import MoveToInboxRounded from '@mui/icons-material/MoveToInboxRounded'
 import PrintRounded from '@mui/icons-material/PrintRounded'
 import ReceiptLongRounded from '@mui/icons-material/ReceiptLongRounded'
@@ -73,6 +74,11 @@ const OPERATIONS_CHILDREN: NavigationChild[] = [
     id: 'operations/warehouses',
     label: 'Warehouses',
     Icon: WarehouseRounded,
+  },
+  {
+    id: 'operations/packaging-materials',
+    label: 'Packaging materials',
+    Icon: Inventory2Rounded,
   },
   {
     id: 'operations/carrier-invoices',

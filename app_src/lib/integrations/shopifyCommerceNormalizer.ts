@@ -6,12 +6,12 @@ import {
   COMMERCE_NORMALIZED_VARIANT_VERSION,
   CommerceNormalizationError,
   asCommerceRecord,
-  assertCommerceOrderMoneyComplete,
   availableCommerceField,
   buildCommerceReadinessFacts,
   commerceAddressFromRecord,
   commerceConnectionValues,
   commerceMoneyFromDecimal,
+  commerceOrderHeaderMoneyState,
   commercePackagingFromRecord,
   commerceSourceHash,
   createCommerceExternalIdentity,
@@ -832,7 +832,7 @@ function normalizeOrder(
   const total = shopifyMoneySet(
     order.currentTotalPriceSet ?? order.originalTotalPriceSet,
   )
-  assertCommerceOrderMoneyComplete({
+  const headerMoney = commerceOrderHeaderMoneyState({
     currency,
     subtotal,
     shipping,
@@ -861,6 +861,7 @@ function normalizeOrder(
     tax,
     discount,
     total,
+    headerMoney,
     party,
     shipTo,
     requestedDeliveryAt: delivery,

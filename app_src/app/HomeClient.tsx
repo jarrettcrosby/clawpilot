@@ -32,6 +32,7 @@ const OPERATIONS_TARGETS: Record<string, OperationsView> = {
   'operations/imports': 'imports',
   'operations/receiving': 'receiving',
   'operations/warehouses': 'warehouses',
+  'operations/packaging-materials': 'packaging-materials',
   'operations/carrier-invoices': 'carrier-invoices',
   'operations/gl-coding': 'gl-coding',
   'operations/printing': 'printing',

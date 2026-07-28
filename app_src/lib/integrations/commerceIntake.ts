@@ -39,6 +39,9 @@ import {
   type CommerceRuntimeCredentialRecord,
 } from '@/lib/persistence/commerceIntegrations'
 import {
+  readCommerceOrderReconciliationStateInPostgres,
+} from '@/lib/persistence/commerceOrderReconciliation'
+import {
   autoCreateCommerceProductsForRunInPostgres,
   captureCommerceIntakeProviderReadInPostgres,
   confirmCommerceCandidateAddressInPostgres,
@@ -1054,12 +1057,9 @@ async function shopifyEnvelope(
     clientId: credential.clientId,
     clientSecret: credential.clientSecret,
   })
-  if (
-    !grant.grantedScopes.includes('read_orders')
-    || !grant.grantedScopes.includes('read_all_orders')
-  ) {
+  if (!grant.grantedScopes.includes('read_orders')) {
     throw new CommerceIntegrationRequestError(
-      'Shopify must grant read_orders and read_all_orders for complete operational intake',
+      'Shopify must grant read_orders for current operational intake',
       409,
       'COMMERCE_INTAKE_SCOPE_REQUIRED',
     )
@@ -1077,6 +1077,12 @@ async function shopifyEnvelope(
   }
   const providerCredential = { shopDomain, accessToken: grant.accessToken }
   const includeCustomerIdentity = grant.grantedScopes.includes('read_customers')
+  // `read_orders` grants Shopify's current-order window. Keep unattended
+  // reads explicitly inside that window; historical backfill is separate and
+  // may require `read_all_orders` when introduced as its own workflow.
+  const currentOrderWindow = page.windowStart
+    ? ` updated_at:>='${page.windowStart}'`
+    : ''
   const data = targetExternalOrderId
     ? await shopifyAdminGraphql<Record<string, unknown>>(
         providerCredential,
@@ -1094,7 +1100,7 @@ async function shopifyEnvelope(
           operationName: 'ClawPilotCommerceOrders',
           variables: {
             after: page.orderCursor,
-            query: `test:false status:open updated_at:<='${page.windowEnd}'`,
+            query: `test:false status:open${currentOrderWindow} updated_at:<='${page.windowEnd}'`,
           },
         },
         { timeoutMs: SHOPIFY_GRAPHQL_TIMEOUT_MS },
@@ -1518,10 +1524,20 @@ export async function getCommerceIntake(input: {
   const accountGlobalId = normalizeCommerceAccountGlobalId(
     input.accountGlobalId,
   )
-  return readCommerceIntakeStateFromPostgres({
-    organizationId,
-    accountGlobalId,
-  })
+  const [intake, orderReconciliation] = await Promise.all([
+    readCommerceIntakeStateFromPostgres({
+      organizationId,
+      accountGlobalId,
+    }),
+    readCommerceOrderReconciliationStateInPostgres({
+      organizationId,
+      accountGlobalId,
+    }),
+  ])
+  return {
+    ...intake,
+    orderReconciliation,
+  }
 }
 
 async function withAutomaticProductCreation(
@@ -2291,6 +2307,38 @@ export async function executeCommerceCatalogProductPage(input: {
     // The browser command path still returns the complete intake state.
     includeIntakeState: false,
     // Product reconciliation deliberately does not query or stage inventory.
+    hydrateProductInventory: false,
+  })
+}
+
+/**
+ * Worker-only order page execution. This retains the encrypted continuation
+ * contract while avoiding the O(retained intake state) browser response. The
+ * command can only stage held candidates and normalization rejections.
+ */
+export async function executeCommerceOrderPage(input: {
+  organizationId: string
+  accountGlobalId: string
+  actorEmail: string
+  idempotencyKey: string
+  continuationRunGlobalId: string | null
+}) {
+  return executeCommerceIntakeCommandInternal({
+    organizationId: input.organizationId,
+    actorEmail: input.actorEmail,
+    body: {
+      action: input.continuationRunGlobalId ? 'fetch-next' : 'fetch',
+      accountGlobalId: input.accountGlobalId,
+      idempotencyKey: input.idempotencyKey,
+      confirmReadOnly: true,
+      ...(input.continuationRunGlobalId
+        ? { continuationRunGlobalId: input.continuationRunGlobalId }
+        : {}),
+    },
+  }, {
+    // Each provider page is normalized and durably staged independently.
+    // Do not return the retained candidate/rejection state to the poller.
+    includeIntakeState: false,
     hydrateProductInventory: false,
   })
 }

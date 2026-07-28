@@ -63,6 +63,17 @@ export type OperationsShipmentCommandResult = {
   printWarning: string | null
 }
 
+export type OperationsPackingSlipCommandResult = {
+  orderGlobalId: string
+  orderStatus: 'packed'
+  rowVersion: number
+  packageGlobalId: string
+  packageNumber: number
+  packingSlipArtifactGlobalId: string
+  contentUrl: string
+  replayed: boolean
+}
+
 export type CommerceCustomerMatchMethod =
   | 'external_id'
   | 'email'
@@ -137,6 +148,10 @@ export type PackagePlan = {
   dimensionsMm: Millimeters
   weightGrams: number
   lineExternalIds: string[]
+  contents: Array<{
+    lineExternalId: string
+    quantity: number
+  }>
 }
 
 export type SmallParcelCarrier = 'UPS' | 'FedEx' | 'USPS' | 'MockCarrier'
@@ -557,6 +572,7 @@ export type OperationsOrderDetail = OperationsOrderListItem & {
   externalOrderId: string
   currency: string
   rowVersion: number
+  warehouseId: string | null
   planStatus: string | null
   waveStatus: string | null
   pickTaskCount: number
@@ -582,6 +598,14 @@ export type OperationsOrderDetail = OperationsOrderListItem & {
     weightGrams: number
     dimensionsMm: Millimeters
     status: string
+    contents: Array<{
+      globalId: string
+      orderLineGlobalId: string
+      productGlobalId: string
+      productName: string
+      channelSku: string
+      quantity: number
+    }>
     latestLabel: {
       globalId: string
       status: 'created' | 'voided' | 'failed'
@@ -642,6 +666,7 @@ export type OperationsOrderDetail = OperationsOrderListItem & {
   }>
   printArtifacts: Array<{
     globalId: string
+    packageGlobalId: string | null
     shipmentGlobalId: string | null
     documentType: 'shipping_label' | 'packing_slip'
     format: 'ZPL' | 'PDF' | 'PNG'

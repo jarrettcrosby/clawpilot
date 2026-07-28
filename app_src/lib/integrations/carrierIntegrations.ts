@@ -24,6 +24,8 @@ import {
   normalizeCarrierEnvironment,
   normalizeCarrierOrganizationId,
   normalizeDirectCarrierProvider,
+  type CarrierEnvironment,
+  type DirectCarrierProvider,
 } from '@/lib/integrations/carrierCredentialCrypto'
 import {
   createCarrierAccountInPostgres,
@@ -43,6 +45,9 @@ import {
 } from '@/lib/persistence/carrierIntegrations'
 
 const CARRIER_SANDBOX_RATE_ADAPTER_VERSION = 'direct-rest-v2'
+const AG_ALCHEMY_EPISCS_RATING_DELEGATION =
+  'ag-alchemy-episcs-sandbox-rating-delegation'
+const AG_ALCHEMY_RATING_ORIGIN_WAREHOUSE = 'gwh5366613'
 
 export class CarrierIntegrationRequestError extends Error {
   readonly status: number
@@ -91,6 +96,22 @@ function billingFlag(value: unknown, defaultValue: boolean) {
 
 function sanitize(error: unknown): CarrierIntegrationRequestError {
   if (error instanceof CarrierIntegrationRequestError) return error
+  if (
+    error
+    && typeof error === 'object'
+    && 'code' in error
+    && error.code === 'CARRIER_DELEGATION_SOURCE_MANAGED'
+    && 'status' in error
+    && error.status === 403
+  ) {
+    return new CarrierIntegrationRequestError(
+      error instanceof Error
+        ? error.message
+        : 'This sandbox rating delegation is managed by its source organization',
+      403,
+      'CARRIER_DELEGATION_SOURCE_MANAGED',
+    )
+  }
   if (error instanceof CarrierCredentialClientError) {
     return new CarrierIntegrationRequestError(error.message, error.status, error.code)
   }
@@ -118,6 +139,34 @@ export function sanitizedCarrierIntegrationError(error: unknown) {
   return sanitize(error)
 }
 
+function isSourceManagedCarrierConfiguration(
+  configuration: Record<string, unknown>,
+) {
+  return (
+    configuration.managedBy === AG_ALCHEMY_EPISCS_RATING_DELEGATION
+    || (
+      configuration.authorizationScope === 'sandbox_rating_only'
+      && configuration.credentialRevealAllowed === false
+    )
+  )
+}
+
+function isExactAgAlchemyRatingDelegation(
+  configuration: Record<string, unknown>,
+) {
+  const capabilities = configuration.allowedCapabilities
+  return (
+    configuration.managedBy === AG_ALCHEMY_EPISCS_RATING_DELEGATION
+    && configuration.authorizationScope === 'sandbox_rating_only'
+    && configuration.credentialRevealAllowed === false
+    && configuration.senderOriginWarehouseGlobalId
+      === AG_ALCHEMY_RATING_ORIGIN_WAREHOUSE
+    && Array.isArray(capabilities)
+    && capabilities.length === 1
+    && capabilities[0] === 'sandbox_rate'
+  )
+}
+
 async function storedRuntimeCredential(input: {
   organizationId: unknown
   provider: unknown
@@ -129,6 +178,7 @@ async function storedRuntimeCredential(input: {
   credentialVersion: number
   status: 'active' | 'disabled' | 'error'
   verified: boolean
+  configuration: Record<string, unknown>
 }> {
   const organizationId = normalizeCarrierOrganizationId(input.organizationId)
   const provider = normalizeDirectCarrierProvider(input.provider)
@@ -152,6 +202,7 @@ async function storedRuntimeCredential(input: {
     integrationAccountId: stored.integrationAccountId,
     integrationGlobalId: stored.globalId,
     credentialVersion: stored.credentialVersion,
+    configuration: stored.configuration,
     provider,
     environment,
     credential: { ...providerCredential, accountNumber: null },
@@ -192,6 +243,16 @@ export async function revealCarrierCredential(input: {
 }) {
   try {
     const runtime = await storedRuntimeCredential(input)
+    if (
+      isSourceManagedCarrierConfiguration(runtime.configuration)
+      || runtime.configuration.credentialRevealAllowed === false
+    ) {
+      throw new CarrierIntegrationRequestError(
+        'This delegated carrier credential is managed by its source organization and cannot be revealed here',
+        403,
+        'CARRIER_CREDENTIAL_REVEAL_NOT_ALLOWED',
+      )
+    }
     await recordCarrierCredentialRevealInPostgres({
       organizationId: runtime.organizationId,
       provider: runtime.provider,
@@ -214,6 +275,56 @@ export async function revealCarrierCredential(input: {
   }
 }
 
+function requiresConfiguredCapability(
+  runtime: Pick<Awaited<ReturnType<typeof storedRuntimeCredential>>, 'configuration'>,
+  capability: 'sandbox_rate' | 'sandbox_label',
+) {
+  const configured = runtime.configuration.allowedCapabilities
+  if (isSourceManagedCarrierConfiguration(runtime.configuration)) {
+    if (
+      capability !== 'sandbox_rate'
+      || !isExactAgAlchemyRatingDelegation(runtime.configuration)
+    ) {
+      throw new CarrierIntegrationRequestError(
+        capability === 'sandbox_rate'
+          ? 'This managed carrier rating connection requires repair'
+          : 'This carrier connection is authorized for sandbox rating only',
+        403,
+        'CARRIER_CAPABILITY_NOT_AUTHORIZED',
+      )
+    }
+    return
+  }
+  if (!Array.isArray(configured)) return
+  if (!configured.includes(capability)) {
+    throw new CarrierIntegrationRequestError(
+      capability === 'sandbox_rate'
+        ? 'This carrier connection is not authorized for sandbox rating'
+        : 'This carrier connection is authorized for sandbox rating only',
+      403,
+      'CARRIER_CAPABILITY_NOT_AUTHORIZED',
+    )
+  }
+}
+
+async function requireUserManagedCarrierConnection(input: {
+  organizationId: string
+  provider: DirectCarrierProvider
+  environment: CarrierEnvironment
+}) {
+  const existing = await readCarrierRuntimeCredentialFromPostgres(input)
+  if (
+    existing
+    && isSourceManagedCarrierConfiguration(existing.configuration)
+  ) {
+    throw new CarrierIntegrationRequestError(
+      'This sandbox rating delegation is managed by its source organization',
+      403,
+      'CARRIER_DELEGATION_SOURCE_MANAGED',
+    )
+  }
+}
+
 export async function updateCarrierCredential(input: {
   organizationId: unknown
   provider: unknown
@@ -227,6 +338,11 @@ export async function updateCarrierCredential(input: {
     const organizationId = normalizeCarrierOrganizationId(input.organizationId)
     const provider = normalizeDirectCarrierProvider(input.provider)
     const environment = normalizeCarrierEnvironment(input.environment)
+    await requireUserManagedCarrierConnection({
+      organizationId,
+      provider,
+      environment,
+    })
     const credential = {
       clientId: normalizeCarrierClientId(input.clientId),
       clientSecret: normalizeCarrierClientSecret(input.clientSecret),
@@ -300,6 +416,7 @@ export async function createCarrierAccount(input: {
 }) {
   try {
     const normalized = carrierAccountWrite(input)
+    await requireUserManagedCarrierConnection(normalized)
     if (!normalized.accountNumber) {
       throw new CarrierIntegrationRequestError('The carrier billing account number is required')
     }
@@ -324,8 +441,10 @@ export async function updateCarrierAccount(input: {
   actorEmail: string
 }) {
   try {
+    const normalized = carrierAccountWrite(input)
+    await requireUserManagedCarrierConnection(normalized)
     return updateCarrierAccountInPostgres({
-      ...carrierAccountWrite(input),
+      ...normalized,
       carrierAccountGlobalId: normalizeCarrierAccountGlobalId(input.carrierAccountGlobalId),
     })
   } catch (error) {
@@ -345,10 +464,14 @@ export async function setCarrierAccountStatus(input: {
     if (input.status !== 'active' && input.status !== 'disabled') {
       throw new CarrierIntegrationRequestError('Carrier account status must be active or disabled')
     }
-    return setCarrierAccountStatusInPostgres({
+    const dimensions = {
       organizationId: normalizeCarrierOrganizationId(input.organizationId),
       provider: normalizeDirectCarrierProvider(input.provider),
       environment: normalizeCarrierEnvironment(input.environment),
+    }
+    await requireUserManagedCarrierConnection(dimensions)
+    return setCarrierAccountStatusInPostgres({
+      ...dimensions,
       carrierAccountGlobalId: normalizeCarrierAccountGlobalId(input.carrierAccountGlobalId),
       status: input.status,
       actorEmail: input.actorEmail,
@@ -366,10 +489,14 @@ export async function deleteCarrierAccount(input: {
   actorEmail: string
 }) {
   try {
-    return deleteCarrierAccountInPostgres({
+    const dimensions = {
       organizationId: normalizeCarrierOrganizationId(input.organizationId),
       provider: normalizeDirectCarrierProvider(input.provider),
       environment: normalizeCarrierEnvironment(input.environment),
+    }
+    await requireUserManagedCarrierConnection(dimensions)
+    return deleteCarrierAccountInPostgres({
+      ...dimensions,
       carrierAccountGlobalId: normalizeCarrierAccountGlobalId(input.carrierAccountGlobalId),
       actorEmail: input.actorEmail,
     })
@@ -388,6 +515,11 @@ export async function testCarrierCredential(input: {
     const organizationId = normalizeCarrierOrganizationId(input.organizationId)
     const provider = normalizeDirectCarrierProvider(input.provider)
     const environment = normalizeCarrierEnvironment(input.environment)
+    await requireUserManagedCarrierConnection({
+      organizationId,
+      provider,
+      environment,
+    })
     const runtime = await storedRuntimeCredential({ organizationId, provider, environment })
     await verifyCarrierCredential({
       provider: runtime.provider,
@@ -403,16 +535,18 @@ export async function testCarrierCredential(input: {
     })
   } catch (error) {
     const sanitized = sanitize(error)
-    try {
-      await markCarrierCredentialVerificationInPostgres({
-        organizationId: normalizeCarrierOrganizationId(input.organizationId),
-        provider: normalizeDirectCarrierProvider(input.provider),
-        environment: normalizeCarrierEnvironment(input.environment),
-        actorEmail: input.actorEmail,
-        errorCode: sanitized.code,
-      })
-    } catch {
-      // Invalid request dimensions cannot identify a stored credential to mark failed.
+    if (sanitized.code !== 'CARRIER_DELEGATION_SOURCE_MANAGED') {
+      try {
+        await markCarrierCredentialVerificationInPostgres({
+          organizationId: normalizeCarrierOrganizationId(input.organizationId),
+          provider: normalizeDirectCarrierProvider(input.provider),
+          environment: normalizeCarrierEnvironment(input.environment),
+          actorEmail: input.actorEmail,
+          errorCode: sanitized.code,
+        })
+      } catch {
+        // Invalid request dimensions cannot identify a stored credential to mark failed.
+      }
     }
     throw sanitized
   }
@@ -593,6 +727,7 @@ export async function resolveCarrierSandboxShippingRuntime(input: {
         'CARRIER_CREDENTIAL_INACTIVE',
       )
     }
+    requiresConfiguredCapability(runtime, 'sandbox_label')
     const selection = await sandboxBillingSelection({
       runtime,
       carrierAccountGlobalId: input.carrierAccountGlobalId,
@@ -683,6 +818,7 @@ export async function testCarrierSandboxRate(input: {
         'CARRIER_CREDENTIAL_INACTIVE',
       )
     }
+    requiresConfiguredCapability(runtime, 'sandbox_rate')
     selection = await sandboxBillingSelection({
       runtime,
       carrierAccountGlobalId: input.carrierAccountGlobalId,
@@ -790,6 +926,11 @@ export async function setCarrierIntegrationEnabled(input: {
     const organizationId = normalizeCarrierOrganizationId(input.organizationId)
     const provider = normalizeDirectCarrierProvider(input.provider)
     const environment = normalizeCarrierEnvironment(input.environment)
+    await requireUserManagedCarrierConnection({
+      organizationId,
+      provider,
+      environment,
+    })
     const enabled = input.enabled === true
     if (enabled) {
       await testCarrierCredential({ organizationId, provider, environment, actorEmail: input.actorEmail })
@@ -821,10 +962,14 @@ export async function disconnectCarrierCredential(input: {
   actorEmail: string
 }) {
   try {
-    return disconnectCarrierCredentialInPostgres({
+    const dimensions = {
       organizationId: normalizeCarrierOrganizationId(input.organizationId),
       provider: normalizeDirectCarrierProvider(input.provider),
       environment: normalizeCarrierEnvironment(input.environment),
+    }
+    await requireUserManagedCarrierConnection(dimensions)
+    return disconnectCarrierCredentialInPostgres({
+      ...dimensions,
       actorEmail: input.actorEmail,
     })
   } catch (error) {

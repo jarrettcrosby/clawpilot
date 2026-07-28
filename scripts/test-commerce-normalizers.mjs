@@ -381,6 +381,15 @@ const fairePageWrapped = faire.normalizeFaireCommerce({
 
 assert.equal(shopifyNormalized.rejections.length, 0)
 assert.equal(faireNormalized.rejections.length, 0)
+for (const normalized of [shopifyNormalized, faireNormalized]) {
+  assert.deepEqual(headerMoneyProjection(normalized.orders[0]), {
+    state: 'complete',
+    unavailableFields: [],
+    fulfillmentDemandEligible: true,
+    accountingEligible: true,
+    customerChargeEligible: true,
+  })
+}
 
 function availableValue(field) {
   assert.equal(field.state, 'available')
@@ -395,6 +404,17 @@ function moneyValue(field) {
   return field.state === 'available'
     ? `${field.value.primary.amountMinor}:${field.value.primary.currency}`
     : field.state
+}
+
+function headerMoneyProjection(order) {
+  return {
+    state: order.headerMoney.state,
+    unavailableFields: [...order.headerMoney.unavailableFields],
+    fulfillmentDemandEligible:
+      order.headerMoney.fulfillmentDemandEligible,
+    accountingEligible: order.headerMoney.accountingEligible,
+    customerChargeEligible: order.headerMoney.customerChargeEligible,
+  }
 }
 
 const faireExternalOrderV2Source = clone(faireSource)
@@ -514,7 +534,17 @@ assert.deepEqual(
 )
 assert.equal(
   faireExternalOrderV2Normalized.normalizerVersion,
-  'faire-commerce-normalizer-v2',
+  'faire-commerce-normalizer-v3',
+)
+assert.deepEqual(
+  headerMoneyProjection(faireExternalOrderV2NormalizedOrder),
+  {
+    state: 'complete',
+    unavailableFields: [],
+    fulfillmentDemandEligible: true,
+    accountingEligible: true,
+    customerChargeEligible: true,
+  },
 )
 
 const faireExternalOrderV2TesterSource = clone(faireExternalOrderV2Source)
@@ -736,6 +766,11 @@ const faireExternalOrderV2PaidShippingSource =
 faireExternalOrderV2PaidShippingSource.orders[0].id = 'order-v2-paid-shipping'
 faireExternalOrderV2PaidShippingSource.orders[0].display_id = 'V2-PAID-SHIPPING'
 faireExternalOrderV2PaidShippingSource.orders[0].is_free_shipping = false
+faireExternalOrderV2PaidShippingSource.orders[0]
+  .payout_costs.shipping_subsidy = {
+    amount_minor: 0,
+    currency: 'USD',
+  }
 const faireExternalOrderV2PaidShipping = faire.normalizeFaireCommerce(
   faireExternalOrderV2PaidShippingSource,
   {
@@ -744,12 +779,36 @@ const faireExternalOrderV2PaidShipping = faire.normalizeFaireCommerce(
     apiVersion: 'external-api-v2',
   },
 )
-assert.equal(faireExternalOrderV2PaidShipping.orders.length, 0)
-assertSafeRejection(faireExternalOrderV2PaidShipping.rejections[0], {
-  resourceType: 'order',
-  errorCode: 'COMMERCE_ORDER_MONEY_INCOMPLETE',
-  externalId: 'order-v2-paid-shipping',
-})
+assert.equal(faireExternalOrderV2PaidShipping.orders.length, 1)
+assert.equal(faireExternalOrderV2PaidShipping.rejections.length, 0)
+const fairePaidShippingOrder = faireExternalOrderV2PaidShipping.orders[0]
+assert.deepEqual(
+  {
+    subtotal: moneyValue(fairePaidShippingOrder.subtotal),
+    discount: moneyValue(fairePaidShippingOrder.discount),
+    shipping: moneyValue(fairePaidShippingOrder.shipping),
+    tax: moneyValue(fairePaidShippingOrder.tax),
+    total: moneyValue(fairePaidShippingOrder.total),
+  },
+  {
+    subtotal: '994:USD',
+    discount: '94:USD',
+    shipping: 'unavailable',
+    tax: '50:USD',
+    total: 'unavailable',
+  },
+  'Faire shipping subsidy is not retailer shipping or an order total',
+)
+assert.deepEqual(
+  headerMoneyProjection(fairePaidShippingOrder),
+  {
+    state: 'operational_incomplete',
+    unavailableFields: ['shipping', 'total'],
+    fulfillmentDemandEligible: true,
+    accountingEligible: false,
+    customerChargeEligible: false,
+  },
+)
 
 function addressProjection(field) {
   const address = availableValue(field)

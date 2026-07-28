@@ -227,6 +227,17 @@ for (const fragment of [
     `Missing carrier rate-test action contract: ${fragment}`,
   )
 }
+const createActionBody = actions.slice(
+  actions.indexOf('export async function createCarrierRateTestLabel'),
+  actions.indexOf('export async function printCarrierRateTestLabel'),
+)
+assert.ok(
+  createActionBody.indexOf('await resolveVerifiedLabelRuntime')
+    < createActionBody.indexOf(
+      'await prepareCarrierRateTestLabelCreateInPostgres',
+    ),
+  'Label capability and shipment context must fail before a prepared attempt is written',
+)
 const printActionBody = actions.slice(
   actions.indexOf('export async function printCarrierRateTestLabel'),
   actions.indexOf('export async function listCarrierRateTestLabels'),
@@ -317,6 +328,18 @@ for (const fragment of [
     carrierUi.includes(fragment),
     `Missing carrier label output UI contract: ${fragment}`,
   )
+}
+
+const health = read('app_src/app/api/health/route.ts')
+for (const fragment of [
+  "WHERE filename = '0116_operations_carrier_rate_test_labels.sql'",
+  'row?.operations_carrier_rate_test_labels_migration_applied',
+  "WHERE filename = '0117_operations_print_agent_capabilities.sql'",
+  'row?.operations_print_agent_capabilities_migration_applied',
+  "WHERE filename = '0118_operations_carrier_label_output_artifacts.sql'",
+  'row?.operations_carrier_label_artifacts_migration_applied',
+]) {
+  assert.ok(health.includes(fragment), `Missing carrier health migration gate: ${fragment}`)
 }
 
 console.log('Carrier rate-test label schema and print contracts passed.')

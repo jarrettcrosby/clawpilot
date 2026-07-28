@@ -210,6 +210,30 @@ export type CommerceNormalizedOrderFacts =
   | ShopifyNormalizedOrderFacts
   | FaireNormalizedOrderFacts
 
+export type CommerceOrderHeaderMoneyField =
+  | 'subtotal'
+  | 'discount'
+  | 'shipping'
+  | 'tax'
+  | 'total'
+
+/**
+ * Provider-neutral safety boundary for order header money.
+ *
+ * `operational_incomplete` is intentionally narrow: exact merchandise,
+ * discount, and tax evidence exists, but a provider did not return exact
+ * shipping and/or header total. Those orders may stage exact fulfillment
+ * demand from confirmed line quantities and prices, but cannot be used for
+ * accounting or customer charges.
+ */
+export type CommerceOrderHeaderMoneyState = Readonly<{
+  state: 'complete' | 'operational_incomplete'
+  unavailableFields: readonly CommerceOrderHeaderMoneyField[]
+  fulfillmentDemandEligible: boolean
+  accountingEligible: boolean
+  customerChargeEligible: boolean
+}>
+
 export type CommerceNormalizedOrderLine = Readonly<{
   schemaVersion: typeof COMMERCE_NORMALIZED_ORDER_LINE_VERSION
   identity: CommerceExternalIdentity
@@ -314,6 +338,7 @@ export type CommerceNormalizedOrder = Readonly<{
   tax: CommerceDataField<CommerceMoneySet>
   discount: CommerceDataField<CommerceMoneySet>
   total: CommerceDataField<CommerceMoneySet>
+  headerMoney: CommerceOrderHeaderMoneyState
   party: CommerceDataField<CommercePartySnapshot>
   shipTo: CommerceDataField<CommerceAddressSnapshot>
   requestedDeliveryAt: CommerceDataField<string>
@@ -754,15 +779,31 @@ export function assertCommerceOrderMoneyComplete(input: Readonly<{
   discount: CommerceDataField<CommerceMoneySet>
   total: CommerceDataField<CommerceMoneySet>
 }>): void {
+  const state = commerceOrderHeaderMoneyState(input)
+  if (state.state !== 'complete') {
+    throw new CommerceNormalizationError(
+      'COMMERCE_ORDER_MONEY_INCOMPLETE',
+      COMMERCE_NORMALIZATION_REJECTION_MESSAGES
+        .COMMERCE_ORDER_MONEY_INCOMPLETE,
+    )
+  }
+}
+
+export function commerceOrderHeaderMoneyState(input: Readonly<{
+  currency: string
+  subtotal: CommerceDataField<CommerceMoneySet>
+  shipping: CommerceDataField<CommerceMoneySet>
+  tax: CommerceDataField<CommerceMoneySet>
+  discount: CommerceDataField<CommerceMoneySet>
+  total: CommerceDataField<CommerceMoneySet>
+}>): CommerceOrderHeaderMoneyState {
   const currency = normalizeCommerceCurrency(input.currency)
-  const fields = [
+  const requiredFields = [
     input.subtotal,
-    input.shipping,
-    input.tax,
     input.discount,
-    input.total,
+    input.tax,
   ]
-  if (fields.some((field) => (
+  if (requiredFields.some((field) => (
     field.state !== 'available'
     || field.value.primary.currency !== currency
   ))) {
@@ -772,6 +813,31 @@ export function assertCommerceOrderMoneyComplete(input: Readonly<{
         .COMMERCE_ORDER_MONEY_INCOMPLETE,
     )
   }
+  const unavailableFields: CommerceOrderHeaderMoneyField[] = []
+  for (const [name, field] of [
+    ['shipping', input.shipping],
+    ['total', input.total],
+  ] as const) {
+    if (field.state !== 'available') {
+      unavailableFields.push(name)
+      continue
+    }
+    if (field.value.primary.currency !== currency) {
+      throw new CommerceNormalizationError(
+        'COMMERCE_ORDER_MONEY_INCOMPLETE',
+        COMMERCE_NORMALIZATION_REJECTION_MESSAGES
+          .COMMERCE_ORDER_MONEY_INCOMPLETE,
+      )
+    }
+  }
+  const complete = unavailableFields.length === 0
+  return Object.freeze({
+    state: complete ? 'complete' : 'operational_incomplete',
+    unavailableFields: Object.freeze(unavailableFields),
+    fulfillmentDemandEligible: true,
+    accountingEligible: complete,
+    customerChargeEligible: complete,
+  })
 }
 
 export function createCommerceExternalIdentity(

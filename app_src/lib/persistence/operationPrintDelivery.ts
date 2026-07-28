@@ -231,6 +231,10 @@ export type EnqueueOperationsPrintJobInput = {
       sourceOrderGlobalId?: string | null
       sourceShipmentGlobalId?: string | null
     }
+    | {
+      type: 'packing_slip_artifact'
+      sourceArtifactGlobalId: string
+    }
 }
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
@@ -1933,6 +1937,108 @@ async function insertArtifact(
     }
   }
 
+  if (input.document.type === 'packing_slip_artifact') {
+    if (!ARTIFACT_GLOBAL_ID.test(input.document.sourceArtifactGlobalId)) {
+      throw new OperationsRequestError(
+        'OPERATIONS_PRINT_ARTIFACT_INVALID',
+        'Packing-list artifact reference is invalid',
+      )
+    }
+    const artifactResult = await client.query<{
+      id: string
+      global_id: string
+      format: Extract<PrintFormat, 'PDF' | 'PNG'>
+      media_size: Extract<PrintMedia, 'letter' | 'a4'>
+      content_sha256: string
+      byte_length: string
+      payload: Buffer | null
+      order_id: string
+      order_global_id: string
+      order_number: string
+      shipment_id: string | null
+      shipment_global_id: string | null
+      tracking_number: string | null
+      warehouse_id: string
+    }>(
+      `SELECT
+         artifact.id::text,
+         artifact.global_id,
+         artifact.format,
+         artifact.media_size,
+         artifact.content_sha256,
+         artifact.byte_length::text,
+         payload.payload,
+         source_order.id::text AS order_id,
+         source_order.global_id AS order_global_id,
+         source_order.order_number,
+         shipment.id::text AS shipment_id,
+         shipment.global_id AS shipment_global_id,
+         shipment.tracking_number,
+         plan.warehouse_id::text
+       FROM operations_print_artifacts artifact
+       JOIN operations_print_artifact_payloads payload
+         ON payload.organization_id = artifact.organization_id
+        AND payload.artifact_id = artifact.id
+       JOIN operations_packages package
+         ON package.organization_id = artifact.organization_id
+        AND package.id = artifact.source_package_id
+       JOIN operations_fulfillment_plans plan
+         ON plan.organization_id = package.organization_id
+        AND plan.id = package.plan_id
+       JOIN operations_orders source_order
+         ON source_order.organization_id = plan.organization_id
+        AND source_order.id = plan.order_id
+        AND source_order.id = artifact.source_order_id
+       LEFT JOIN operations_shipments shipment
+         ON shipment.organization_id = artifact.organization_id
+        AND shipment.id = artifact.source_shipment_id
+       WHERE artifact.organization_id = $1::uuid
+         AND artifact.global_id = $2
+         AND artifact.document_type = 'packing_slip'
+         AND artifact.format IN ('PDF', 'PNG')
+         AND artifact.media_size IN ('letter', 'a4')
+       FOR SHARE OF artifact, payload, package, plan, source_order`,
+      [organizationId, input.document.sourceArtifactGlobalId],
+    )
+    const artifact = artifactResult.rows[0]
+    if (!artifact || artifact.warehouse_id !== input.warehouseId) {
+      throw new OperationsRequestError(
+        'OPERATIONS_PRINT_ARTIFACT_INVALID',
+        'Packing list was not found in the selected warehouse',
+        404,
+      )
+    }
+    const payload = artifact.payload ? Buffer.from(artifact.payload) : null
+    if (
+      !payload
+      || payload.byteLength !== Number(artifact.byte_length)
+      || contentHash(payload) !== artifact.content_sha256
+    ) {
+      throw new OperationsRequestError(
+        'OPERATIONS_PRINT_ARTIFACT_CORRUPT',
+        'Packing-list content failed integrity validation',
+        500,
+      )
+    }
+    return {
+      id: artifact.id,
+      globalId: artifact.global_id,
+      labelId: null,
+      rateTestLabelId: null,
+      type: 'packing_slip' as const,
+      format: artifact.format,
+      media: artifact.media_size,
+      source: {
+        orderId: artifact.order_id,
+        orderGlobalId: artifact.order_global_id,
+        orderNumber: artifact.order_number,
+        shipmentId: artifact.shipment_id,
+        shipmentGlobalId: artifact.shipment_global_id,
+        trackingNumber: artifact.tracking_number,
+      },
+    }
+  }
+
   if (
     !SHA256.test(input.document.contentSha256)
     || !Number.isSafeInteger(input.document.byteLength)
@@ -2157,6 +2263,48 @@ async function assertRateTestLabelCanBeEnqueued(input: {
   )
 }
 
+async function assertPackingSlipArtifactCanBeEnqueued(input: {
+  client: PoolClient
+  organizationId: string
+  artifactGlobalId: string
+}) {
+  await acquireTransactionAdvisoryLock(
+    input.client,
+    `operations:print-packing-slip:${input.organizationId}:${input.artifactGlobalId}`,
+  )
+  const existing = await input.client.query<{
+    global_id: string
+    status: OperationsPrintJobListItem['status']
+  }>(
+    `SELECT job.global_id, job.status
+     FROM operations_print_jobs job
+     JOIN operations_print_artifacts artifact
+       ON artifact.organization_id = job.organization_id
+      AND artifact.id = job.artifact_id
+     WHERE job.organization_id = $1::uuid
+       AND artifact.global_id = $2
+       AND artifact.document_type = 'packing_slip'
+       AND job.reprint_of_job_id IS NULL
+     LIMIT 1
+     FOR SHARE OF job, artifact`,
+    [input.organizationId, input.artifactGlobalId],
+  )
+  if (!existing.rows[0]) return
+  const job = existing.rows[0]
+  const nextStep = job.status === 'delivered'
+    ? 'Use the controlled reprint action and provide a reprint reason.'
+    : job.status === 'failed'
+      ? 'Use the retry action after resolving the printer route.'
+      : job.status === 'cancelled'
+        ? 'Generate a replacement packing list only if the package allocation changes.'
+        : 'Wait for or manage the existing print job.'
+  throw new OperationsRequestError(
+    'OPERATIONS_PRINT_PACKING_SLIP_ALREADY_ENQUEUED',
+    `Packing list already has original print job ${job.global_id} (${job.status}). ${nextStep}`,
+    409,
+  )
+}
+
 export async function enqueueOperationsPrintJobInPostgres(
   input: EnqueueOperationsPrintJobInput,
 ) {
@@ -2224,6 +2372,13 @@ export async function enqueueOperationsPrintJobInPostgres(
       })
     }
     const artifact = await insertArtifact(client, input, organizationId, actorEmail)
+    if (artifact.type === 'packing_slip') {
+      await assertPackingSlipArtifactCanBeEnqueued({
+        client,
+        organizationId,
+        artifactGlobalId: artifact.globalId,
+      })
+    }
     const profiles = await listOperationsPrinterProfilesInPostgres(organizationId, client)
     const route = selectPrinterRoute(profiles, {
       warehouseId: input.warehouseId,

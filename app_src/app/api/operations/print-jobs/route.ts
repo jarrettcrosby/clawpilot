@@ -26,6 +26,7 @@ const JOB_GLOBAL_ID = /^gpj\d{7}$/
 const LABEL_GLOBAL_ID = /^glb\d{7}$/
 const ORDER_GLOBAL_ID = /^gor\d{7}$/
 const SHIPMENT_GLOBAL_ID = /^gsh\d{7}$/
+const ARTIFACT_GLOBAL_ID = /^gpf\d{7}$/
 const SHA256 = /^[a-f0-9]{64}$/
 const ACTION_FIELDS: Record<string, Set<string>> = {
   'enqueue-label': new Set([
@@ -36,6 +37,10 @@ const ACTION_FIELDS: Record<string, Set<string>> = {
     'action', 'warehouseId', 'format', 'media', 'contentSha256',
     'byteLength', 'storageReference', 'sourceOrderGlobalId',
     'sourceShipmentGlobalId', 'preferredPrinterGlobalId', 'maxAttempts',
+  ]),
+  'enqueue-packing-slip-artifact': new Set([
+    'action', 'warehouseId', 'sourceArtifactGlobalId',
+    'preferredPrinterGlobalId', 'maxAttempts',
   ]),
   'retry-job': new Set(['action', 'jobGlobalId', 'reason']),
   'reprint-job': new Set(['action', 'jobGlobalId', 'reason']),
@@ -271,6 +276,25 @@ export async function POST(req: NextRequest) {
           type: 'shipping_label',
           sourceLabelGlobalId,
           media: command.value.media,
+        },
+      }
+    } else if (command.action === 'enqueue-packing-slip-artifact') {
+      const sourceArtifactGlobalId = text(
+        command.value.sourceArtifactGlobalId,
+        'Packing-list artifact',
+        16,
+      )
+      if (!ARTIFACT_GLOBAL_ID.test(sourceArtifactGlobalId)) {
+        fail(
+          'OPERATIONS_PRINT_JOB_REQUEST_INVALID',
+          'Packing-list artifact is invalid',
+        )
+      }
+      enqueue = {
+        ...common,
+        document: {
+          type: 'packing_slip_artifact',
+          sourceArtifactGlobalId,
         },
       }
     } else {

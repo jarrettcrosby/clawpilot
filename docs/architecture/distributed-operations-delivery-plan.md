@@ -112,6 +112,12 @@ This checkpoint posts canonical inventory units only. Case and pallet conversion
 - Deploy OR-Tools behind the optimizer port; validate result hashes and constraints; retain deterministic fallback and candidate/rejection evidence.
 - Add approved split planning, promise-safe multi-warehouse representation, manual override versioning, and margin-erosion attribution.
 
+**Implemented inactive code checkpoint**
+
+- A pinned Python 3.13 / OR-Tools `9.15.6755` CP-SAT service and opt-in TypeScript adapter now implement the bounded immutable v1 computation boundary, exact integer inventory/unit/carton assignment, 3D non-overlap with allowed rotations, explicit warehouse/split limits, lexicographic warehouse/carton/cost/waste objectives, canonical hash echo, exhaustive client-side result validation, and deterministic single-warehouse fallback.
+- A separate material-assortment endpoint can select from supplied boxes/poly mailers using supplied historical demand frequency and precomputed feasible landed costs. It cannot infer demand, rate carriers, activate catalog records, or cartonize an order.
+- The service remains undeployed and disconnected from hosted planning. Persisted input/result snapshots, a real carton catalog, current promise-safe rate facts, health/metrics, operator acceptance, and explicit activation remain required before the Phase 3 exit can be claimed.
+
 **Exit**
 
 - S04-S06, S14-S16, S21, and S24 pass against deterministic fixtures and Postgres.

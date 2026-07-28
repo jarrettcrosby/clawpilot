@@ -123,7 +123,14 @@ type IntakeCandidate = {
   normalizedFulfillmentStatus?: string | null
   normalizedReturnStatus?: string | null
   currency?: string | null
+  subtotalMinor?: number | null
   totalMinor?: number | null
+  headerMoney?: {
+    state: 'complete' | 'operational_incomplete'
+    unavailableFields: string[]
+    accountingEligible: boolean
+    customerChargeEligible: boolean
+  }
   requiresShipping: boolean
   sourceUpdatedAt?: string | null
   blockers?: IntakeBlocker[]
@@ -333,6 +340,19 @@ type CommerceIntake = {
     canonicalOrdersCreated?: number
     syncCursorAdvanced?: boolean
   }
+  orderReconciliation?: {
+    status: 'idle' | 'running' | 'succeeded' | 'failed'
+    recordsSeen: number
+    recordsHeld: number
+    consecutiveFailures: number
+    lastErrorCode: string | null
+    lastStartedAt: string | null
+    lastCompletedAt: string | null
+    resumable: boolean
+    providerWrites: 0
+    canonicalOrderWrites: 0
+    inventoryWrites: 0
+  } | null
 }
 
 type AutomaticProductCreationSummary = {
@@ -1137,6 +1157,7 @@ export default function CommerceIntakeWorkflow({
     intake?.policy?.operatorCommandsAllowed === true
   const productIntakePolicy = intake?.policy?.productIntake
   const productCatalogSync = intake?.policy?.productCatalogSync
+  const orderReconciliation = intake?.orderReconciliation
   const automaticProductCreationEnabled = Boolean(
     productIntakePolicy?.autoCreateNewProducts
     && productIntakePolicy.unmatchedAction === 'auto_create',
@@ -1154,9 +1175,14 @@ export default function CommerceIntakeWorkflow({
   useEffect(() => {
     if (
       !workbenchOpen
-      || !productCatalogSync
-      || !['queued', 'running', 'retrying'].includes(
-        productCatalogSync.status,
+      || !(
+        (
+          productCatalogSync
+          && ['queued', 'running', 'retrying'].includes(
+            productCatalogSync.status,
+          )
+        )
+        || orderReconciliation?.status === 'running'
       )
     ) return
     let requestPending = false
@@ -1170,7 +1196,12 @@ export default function CommerceIntakeWorkflow({
         })
     }, 5_000)
     return () => window.clearInterval(timer)
-  }, [loadIntake, productCatalogSync, workbenchOpen])
+  }, [
+    loadIntake,
+    orderReconciliation?.status,
+    productCatalogSync,
+    workbenchOpen,
+  ])
   const activationRecoveryAvailable = canActivate && (
     errorCode === 'COMMERCE_INTAKE_ACTIVATION_REQUIRED'
     || intake?.policy?.activationState === 'disabled'
@@ -2432,6 +2463,19 @@ export default function CommerceIntakeWorkflow({
               />
               <Chip
                 size="small"
+                color={
+                  orderReconciliation?.status === 'failed'
+                    ? 'warning'
+                    : orderReconciliation?.status === 'running'
+                      ? 'info'
+                      : 'default'
+                }
+                label={`Order staging ${humanize(
+                  orderReconciliation?.status || 'idle',
+                )}`}
+              />
+              <Chip
+                size="small"
                 color={issueRecordCount ? 'warning' : 'default'}
                 label={`${issueRecordCount} ${
                   issueRecordCount === 1 ? 'issue' : 'issues'
@@ -2601,6 +2645,105 @@ export default function CommerceIntakeWorkflow({
             reserve inventory, or export fulfillment. Credentials and provider
             tokens are never returned here.
           </Alert>
+          <Card variant="outlined">
+            <CardContent sx={{ '&:last-child': { pb: 2 } }}>
+              <Stack spacing={1}>
+                <Stack
+                  direction={{ xs: 'column', sm: 'row' }}
+                  justifyContent="space-between"
+                  alignItems={{ sm: 'center' }}
+                  spacing={1}
+                >
+                  <Box>
+                    <Typography variant="subtitle2" fontWeight={700}>
+                      Automatic current-order staging
+                    </Typography>
+                    <Typography variant="body2" color="text.secondary">
+                      {orderReconciliation?.status === 'running'
+                        ? `ClawPilot is reading current ${providerLabel(provider)} orders now.`
+                        : orderReconciliation?.status === 'succeeded'
+                          ? `The latest read-only order check completed${
+                            orderReconciliation.lastCompletedAt
+                              ? ` ${formatDate(
+                                orderReconciliation.lastCompletedAt,
+                              )}`
+                              : ''
+                          }.`
+                          : orderReconciliation?.status === 'failed'
+                            ? `The latest read-only order check failed${
+                              orderReconciliation.lastErrorCode
+                                ? ` (${orderReconciliation.lastErrorCode})`
+                                : ''
+                            }. Review the verified connection and order-read scope, then return here; ClawPilot retries automatically.`
+                            : `ClawPilot is ready to check current ${providerLabel(provider)} orders automatically when the verified order-read scope and Operations Shadow or Active mode are available.`}
+                    </Typography>
+                  </Box>
+                  <Chip
+                    size="small"
+                    color={
+                      orderReconciliation?.status === 'failed'
+                        ? 'warning'
+                        : orderReconciliation?.status === 'running'
+                          ? 'info'
+                          : orderReconciliation?.status === 'succeeded'
+                            ? 'success'
+                            : 'default'
+                    }
+                    label={humanize(orderReconciliation?.status || 'idle')}
+                  />
+                </Stack>
+                <Stack direction="row" gap={0.75} flexWrap="wrap">
+                  <Chip
+                    size="small"
+                    label={`${
+                      orderReconciliation?.recordsSeen || 0
+                    } provider records read`}
+                  />
+                  <Chip
+                    size="small"
+                    label={`${
+                      orderReconciliation?.recordsHeld || 0
+                    } held or rejected for review`}
+                  />
+                  {orderReconciliation?.resumable ? (
+                    <Chip
+                      size="small"
+                      color="info"
+                      label="More pages resume automatically"
+                    />
+                  ) : null}
+                  <Chip
+                    size="small"
+                    label="0 provider writes"
+                  />
+                </Stack>
+                <Typography variant="caption" color="text.secondary">
+                  Staging preserves source order facts for review. It does not
+                  create a ClawPilot order, reserve inventory, select packaging,
+                  create a shipment, or write back to the provider.
+                </Typography>
+                {orderReconciliation?.status === 'failed' ? (
+                  <Stack direction="row" spacing={1}>
+                    <Button
+                      size="small"
+                      variant="outlined"
+                      disabled={Boolean(pendingAction)}
+                      onClick={() => setWorkbenchOpen(false)}
+                    >
+                      Review connection
+                    </Button>
+                    <Button
+                      size="small"
+                      disabled={Boolean(pendingAction)}
+                      onClick={() => void reloadWorkflow()}
+                    >
+                      Reload status
+                    </Button>
+                  </Stack>
+                ) : null}
+              </Stack>
+            </CardContent>
+          </Card>
           {!operatorCommandsAllowed ? (
             <Alert
               severity="warning"
@@ -3074,9 +3217,11 @@ export default function CommerceIntakeWorkflow({
                               ClawPilot supports Faire&apos;s current
                               ExternalOrderV2 money fields. Use Retry all exact
                               orders below to restage these records with the
-                              current adapter. Paid-shipping records remain
-                              blocked when Faire does not provide an exact
-                              shipping charge; ClawPilot will not estimate it.
+                              current adapter. Paid-shipping records can stage
+                              as fulfillment-only candidates when exact
+                              merchandise, discount, and tax evidence exists.
+                              Missing shipping and total remain unavailable and
+                              are never estimated.
                             </Alert>
                             ) : null}
                           {group.resourceType === 'order'
@@ -4454,11 +4599,31 @@ export default function CommerceIntakeWorkflow({
                             />
                             <Chip
                               size="small"
-                              label={formatMoney(
-                                candidate.totalMinor,
-                                candidate.currency,
-                              )}
+                              color={candidate.headerMoney?.state
+                                === 'operational_incomplete'
+                                ? 'warning'
+                                : 'default'}
+                              variant={candidate.headerMoney?.state
+                                === 'operational_incomplete'
+                                ? 'outlined'
+                                : 'filled'}
+                              label={candidate.headerMoney?.unavailableFields
+                                .includes('total')
+                                ? 'Header total unavailable'
+                                : formatMoney(
+                                  candidate.totalMinor,
+                                  candidate.currency,
+                                )}
                             />
+                            {candidate.headerMoney?.unavailableFields
+                              .includes('shipping') ? (
+                              <Chip
+                                size="small"
+                                color="warning"
+                                variant="outlined"
+                                label="Shipping amount unavailable"
+                              />
+                              ) : null}
                             {candidate.providerStatus ? (
                               <Chip
                                 size="small"
@@ -4540,6 +4705,19 @@ export default function CommerceIntakeWorkflow({
                         {unavailableReason ? (
                           <Alert severity="info">{unavailableReason}</Alert>
                         ) : null}
+                        {candidate.headerMoney?.state
+                          === 'operational_incomplete' ? (
+                          <Alert severity="warning">
+                            The provider did not return exact{' '}
+                            {candidate.headerMoney.unavailableFields
+                              .map(humanize)
+                              .join(' and ')}. ClawPilot can create fulfillment
+                            demand only from confirmed remaining quantities and
+                            order-time line prices. This order is blocked from
+                            accounting and customer-charge use; missing
+                            shipping or totals are never estimated.
+                          </Alert>
+                          ) : null}
 
                         {candidate.blockers?.length ? (
                           <Alert severity="warning">

@@ -231,6 +231,11 @@ function verifySourceContracts() {
     'OPERATIONS_PRINT_AGENT_CAPABILITIES_MISMATCH',
     'artifact.format = ANY($5::text[])',
     'runtimeSupportedFormats',
+    "type: 'packing_slip_artifact'",
+    'sourceArtifactGlobalId',
+    'assertPackingSlipArtifactCanBeEnqueued',
+    'OPERATIONS_PRINT_PACKING_SLIP_ALREADY_ENQUEUED',
+    'Packing-list content failed integrity validation',
   ]) {
     assert.ok(
       persistence.includes(fragment),
@@ -262,6 +267,8 @@ function verifySourceContracts() {
     'requireRequestUser',
     'Idempotency-Key',
     'private, no-store',
+    "command.action === 'enqueue-packing-slip-artifact'",
+    "type: 'packing_slip_artifact'",
   ]) {
     assert.ok(operatorRoute.includes(fragment), `Missing print-job route contract: ${fragment}`)
   }
