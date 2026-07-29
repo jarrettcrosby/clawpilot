@@ -267,6 +267,115 @@ export function selectGlCodingRule(
   return { rule: null, evaluation: null }
 }
 
+export type BillingMudDirective = {
+  globalId: string
+  priority: number
+  type:
+    | 'fixed_amount'
+    | 'percent_markup'
+    | 'cost_plus_percent'
+    | 'minimum_charge'
+    | 'maximum_charge'
+  amountMinor: bigint | null
+  basisPoints: number | null
+}
+
+export function calculateBillingMud(
+  carrierBilledActualMinor: bigint,
+  directives: BillingMudDirective[],
+): {
+  carrierBilledActualMinor: bigint
+  mudAdjustmentMinor: bigint
+  contractBilledShippingMinor: bigint
+  appliedDirectiveGlobalIds: string[]
+} {
+  if (carrierBilledActualMinor < BigInt(0)) {
+    throw new Error('BILLING_MUD_ACTUAL_COST_INVALID')
+  }
+  if (directives.length < 1) {
+    throw new Error('BILLING_MUD_DIRECTIVE_REQUIRED')
+  }
+
+  const ordered = [...directives].sort((left, right) => (
+    left.priority - right.priority
+    || left.globalId.localeCompare(right.globalId)
+  ))
+  let additiveMinor = BigInt(0)
+  let minimumMinor: bigint | null = null
+  let maximumMinor: bigint | null = null
+
+  for (const directive of ordered) {
+    if (
+      directive.type === 'fixed_amount'
+      || directive.type === 'minimum_charge'
+      || directive.type === 'maximum_charge'
+    ) {
+      if (
+        directive.amountMinor === null
+        || directive.amountMinor < BigInt(0)
+        || directive.basisPoints !== null
+      ) {
+        throw new Error('BILLING_MUD_DIRECTIVE_INVALID')
+      }
+      if (directive.type === 'fixed_amount') {
+        additiveMinor += directive.amountMinor
+      } else if (directive.type === 'minimum_charge') {
+        minimumMinor = directive.amountMinor
+      } else {
+        maximumMinor = directive.amountMinor
+      }
+      continue
+    }
+
+    if (
+      directive.amountMinor !== null
+      || directive.basisPoints === null
+      || !Number.isSafeInteger(directive.basisPoints)
+      || directive.basisPoints < 0
+      || directive.basisPoints > 100_000
+    ) {
+      throw new Error('BILLING_MUD_DIRECTIVE_INVALID')
+    }
+    additiveMinor += (
+      carrierBilledActualMinor * BigInt(directive.basisPoints)
+      + BigInt(5_000)
+    ) / BigInt(10_000)
+  }
+
+  if (
+    minimumMinor !== null
+    && maximumMinor !== null
+    && minimumMinor > maximumMinor
+  ) {
+    throw new Error('BILLING_MUD_BOUNDS_INVALID')
+  }
+
+  let contractBilledShippingMinor = carrierBilledActualMinor + additiveMinor
+  if (
+    minimumMinor !== null
+    && contractBilledShippingMinor < minimumMinor
+  ) {
+    contractBilledShippingMinor = minimumMinor
+  }
+  if (
+    maximumMinor !== null
+    && contractBilledShippingMinor > maximumMinor
+  ) {
+    contractBilledShippingMinor = maximumMinor
+  }
+  if (contractBilledShippingMinor < carrierBilledActualMinor) {
+    throw new Error('BILLING_MUD_NEGATIVE_MARGIN')
+  }
+
+  return {
+    carrierBilledActualMinor,
+    mudAdjustmentMinor:
+      contractBilledShippingMinor - carrierBilledActualMinor,
+    contractBilledShippingMinor,
+    appliedDirectiveGlobalIds: ordered.map((directive) => directive.globalId),
+  }
+}
+
 function canonicalValue(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonicalValue)
   if (value && typeof value === 'object') {

@@ -133,6 +133,34 @@ type GlCodingSettlement = {
   } | null
 }
 
+type GlCodingMudCalculation = {
+  globalId: string
+  status: 'not_configured' | 'calculated' | 'blocked'
+  blockerCode?: string | null
+  statementGlobalId: string
+  statementVersion: number
+  shipmentGlobalId: string
+  orderGlobalId: string
+  shipperGlobalId: string
+  shipperName: string
+  quoteSnapshotGlobalId: string
+  contractVersionGlobalId?: string | null
+  contractVersionNumber?: number | null
+  commerceOrderCandidateGlobalId?: string | null
+  currency: string
+  checkoutChargeStatus: string
+  customerPaidCheckoutShippingMinor?: string | number | null
+  carrierBilledActualMinor: string | number
+  mudAdjustmentMinor?: string | number | null
+  contractBilledShippingMinor?: string | number | null
+  checkoutToCarrierActualVarianceMinor?: string | number | null
+  checkoutToContractBillVarianceMinor?: string | number | null
+  chargeCount: number
+  directiveSnapshot?: Array<Record<string, unknown>>
+  calculationSnapshot?: Record<string, unknown>
+  createdAt?: string | null
+}
+
 type GlCodingWorkspace = {
   capabilities: GlCodingCapabilities
   batches: GlCodingBatch[]
@@ -141,6 +169,7 @@ type GlCodingWorkspace = {
   rules: GlCodingRule[]
   shippers: GlCodingShipper[]
   settlements: GlCodingSettlement[]
+  mudCalculations: GlCodingMudCalculation[]
 }
 
 type GlCodingPayload = {
@@ -210,6 +239,9 @@ function normalizeWorkspace(input: Partial<GlCodingWorkspace>): GlCodingWorkspac
     rules: Array.isArray(input.rules) ? input.rules : [],
     shippers: Array.isArray(input.shippers) ? input.shippers : [],
     settlements: Array.isArray(input.settlements) ? input.settlements : [],
+    mudCalculations: Array.isArray(input.mudCalculations)
+      ? input.mudCalculations
+      : [],
   }
 }
 
@@ -227,12 +259,14 @@ function statusColor(status: string | null | undefined): 'default' | 'success' |
     || status === 'approved'
     || status === 'paid'
     || status === 'resolved'
+    || status === 'calculated'
   ) return 'success'
   if (status === 'failed' || status === 'rejected' || status === 'voided') return 'error'
   if (
     status === 'needs_review'
     || status === 'ambiguous'
     || status === 'disputed'
+    || status === 'blocked'
   ) return 'warning'
   if (status === 'queued' || status === 'running' || status === 'billed') return 'info'
   return 'default'
@@ -279,6 +313,15 @@ function money(minor: string | number | null | undefined, currency = 'USD') {
 
 function count(value: number | undefined) {
   return Number.isFinite(value) ? value : 0
+}
+
+function varianceMeaning(value: string | number | null | undefined) {
+  const raw = String(value ?? '').trim()
+  if (!/^-?\d+$/.test(raw)) return ''
+  const minor = BigInt(raw)
+  if (minor > BigInt(0)) return 'Customer paid more'
+  if (minor < BigInt(0)) return 'Customer paid less'
+  return 'No variance'
 }
 
 function capabilityAllows(
@@ -776,7 +819,7 @@ export default function GlCodingPanel({
       <Stack spacing={3} divider={<Divider flexItem />}>
         <Alert severity="info">
           {isShipmentPricing
-            ? 'MUD means Markup Directive: the approved, versioned contract rule that produced the customer price. Shipment Pricing & GL links billed carrier charges to shipment and shipper evidence, reviews the retained MUD result, and never silently recalculates or changes the quoted price.'
+            ? 'MUD means Markup Directive. Checkout shipping is a customer-facing pro forma charge, not MUD; ClawPilot classifies it as customer-paid only when the commerce order has complete paid evidence. An approved actual-cost MUD is calculated only after an uploaded carrier bill is matched to the exact shipment, then billed actual, MUD, contract bill, and checkout variance remain separate immutable evidence.'
             : 'Carrier files may include several account numbers. ClawPilot preserves each source file, matches actual charges by provider, account, and tracking evidence, and leaves unsupported rows in review instead of inventing a shipment match.'}
         </Alert>
         <Box component="section">
@@ -1033,6 +1076,190 @@ export default function GlCodingPanel({
             <Typography color="text.secondary">No GL Coding runs have been recorded.</Typography>
           )}
         </Box>
+
+        {isShipmentPricing && (
+          <Box component="section">
+            <Stack direction="row" justifyContent="space-between" alignItems="baseline" gap={2} sx={{ mb: 1.5 }}>
+              <Box>
+                <Typography variant="h6" fontWeight={700}>Billing-time MUD</Typography>
+                <Typography variant="caption" color="text.secondary">
+                  Uploaded carrier bill → exact shipment match → approved actual-cost directive → immutable contract bill.
+                </Typography>
+              </Box>
+              <Typography variant="caption" color="text.secondary">
+                {workspace.mudCalculations.length} results
+              </Typography>
+            </Stack>
+            {workspace.mudCalculations.length ? (
+              <Stack spacing={1.5}>
+                {workspace.mudCalculations.map((calculation) => {
+                  const configured = calculation.status === 'calculated'
+                  const configurationReason = String(
+                    calculation.calculationSnapshot?.configurationReason || '',
+                  )
+                  const checkoutAvailable =
+                    calculation.checkoutChargeStatus === 'customer_paid'
+                  const directives = calculation.directiveSnapshot || []
+                  return (
+                    <Box
+                      key={calculation.globalId}
+                      sx={{
+                        p: 1.5,
+                        border: '1px solid',
+                        borderColor: 'divider',
+                        borderRadius: 2,
+                      }}
+                    >
+                      <Stack direction="row" justifyContent="space-between" alignItems="flex-start" gap={2}>
+                        <Box sx={{ minWidth: 0 }}>
+                          <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
+                            <Typography fontWeight={700}>{calculation.shipmentGlobalId}</Typography>
+                            <Chip
+                              size="small"
+                              label={displayStatus(calculation.status)}
+                              color={statusColor(calculation.status)}
+                            />
+                            <Chip
+                              size="small"
+                              variant="outlined"
+                              label={`${calculation.chargeCount} billed ${calculation.chargeCount === 1 ? 'line' : 'lines'}`}
+                            />
+                          </Stack>
+                          <Typography variant="caption" color="text.secondary" sx={{ overflowWrap: 'anywhere' }}>
+                            {calculation.orderGlobalId}
+                            {' · '}
+                            {calculation.statementGlobalId} v{calculation.statementVersion}
+                            {' · '}
+                            {calculation.shipperName}
+                          </Typography>
+                        </Box>
+                        {calculation.createdAt && (
+                          <Typography variant="caption" color="text.secondary" sx={{ flexShrink: 0 }}>
+                            {formatUserDateTime(calculation.createdAt, dateTime, {
+                              dateStyle: 'medium',
+                              timeStyle: 'short',
+                            })}
+                          </Typography>
+                        )}
+                      </Stack>
+
+                      <Alert
+                        severity={configured ? 'success' : calculation.status === 'blocked' ? 'warning' : 'info'}
+                        sx={{ mt: 1.25 }}
+                      >
+                        {configured
+                          ? 'MUD was calculated from billed actual using the exact approved contract directive version shown below.'
+                          : calculation.status === 'blocked'
+                            ? `MUD was not calculated because the evidence failed closed: ${displayStatus(calculation.blockerCode || configurationReason)}.`
+                            : 'No approved actual-cost MUD directive matched this billed shipment. The carrier actual is preserved, but no MUD or contract bill was created.'}
+                      </Alert>
+
+                      <Box
+                        sx={{
+                          mt: 1.25,
+                          display: 'grid',
+                          gridTemplateColumns: {
+                            xs: 'minmax(0, 1fr)',
+                            sm: 'repeat(2, minmax(0, 1fr))',
+                            lg: 'repeat(3, minmax(0, 1fr))',
+                          },
+                          gap: 1,
+                        }}
+                      >
+                        <Box sx={{ p: 1.25, borderRadius: 1.5, bgcolor: 'action.hover' }}>
+                          <Typography variant="caption" color="text.secondary">Customer-paid checkout shipping</Typography>
+                          <Typography fontWeight={750}>
+                            {checkoutAvailable
+                              ? money(calculation.customerPaidCheckoutShippingMinor, calculation.currency)
+                              : 'Unavailable'}
+                          </Typography>
+                          <Typography variant="caption" color="text.secondary">
+                            {checkoutAvailable
+                              ? 'Captured commerce-order evidence'
+                              : displayStatus(calculation.checkoutChargeStatus)}
+                          </Typography>
+                        </Box>
+                        <Box sx={{ p: 1.25, borderRadius: 1.5, bgcolor: 'action.hover' }}>
+                          <Typography variant="caption" color="text.secondary">Carrier billed actual</Typography>
+                          <Typography fontWeight={750}>
+                            {money(calculation.carrierBilledActualMinor, calculation.currency)}
+                          </Typography>
+                          <Typography variant="caption" color="text.secondary">From uploaded billing CSV</Typography>
+                        </Box>
+                        <Box sx={{ p: 1.25, borderRadius: 1.5, bgcolor: 'action.hover' }}>
+                          <Typography variant="caption" color="text.secondary">MUD adjustment</Typography>
+                          <Typography fontWeight={750}>
+                            {configured
+                              ? money(calculation.mudAdjustmentMinor, calculation.currency)
+                              : 'Not calculated'}
+                          </Typography>
+                          <Typography variant="caption" color="text.secondary">Applied only at billing time</Typography>
+                        </Box>
+                        <Box sx={{ p: 1.25, borderRadius: 1.5, bgcolor: 'action.hover' }}>
+                          <Typography variant="caption" color="text.secondary">Contract-billed shipping</Typography>
+                          <Typography fontWeight={750}>
+                            {configured
+                              ? money(calculation.contractBilledShippingMinor, calculation.currency)
+                              : 'Not created'}
+                          </Typography>
+                          <Typography variant="caption" color="text.secondary">Carrier actual + MUD</Typography>
+                        </Box>
+                        <Box sx={{ p: 1.25, borderRadius: 1.5, bgcolor: 'action.hover' }}>
+                          <Typography variant="caption" color="text.secondary">Checkout vs carrier actual</Typography>
+                          <Typography fontWeight={750}>
+                            {checkoutAvailable
+                              ? money(calculation.checkoutToCarrierActualVarianceMinor, calculation.currency)
+                              : 'Unavailable'}
+                          </Typography>
+                          <Typography variant="caption" color="text.secondary">
+                            {varianceMeaning(calculation.checkoutToCarrierActualVarianceMinor)}
+                          </Typography>
+                        </Box>
+                        <Box sx={{ p: 1.25, borderRadius: 1.5, bgcolor: 'action.hover' }}>
+                          <Typography variant="caption" color="text.secondary">Checkout vs contract bill</Typography>
+                          <Typography fontWeight={750}>
+                            {checkoutAvailable && configured
+                              ? money(calculation.checkoutToContractBillVarianceMinor, calculation.currency)
+                              : 'Unavailable'}
+                          </Typography>
+                          <Typography variant="caption" color="text.secondary">
+                            {varianceMeaning(calculation.checkoutToContractBillVarianceMinor)}
+                          </Typography>
+                        </Box>
+                      </Box>
+
+                      {calculation.checkoutChargeStatus === 'unallocated_multi_shipment' && (
+                        <Alert severity="info" sx={{ mt: 1.25 }}>
+                          Checkout shipping is order-level and this order has multiple shipments. ClawPilot did not invent a per-shipment allocation.
+                        </Alert>
+                      )}
+                      {directives.length > 0 && (
+                        <Stack direction="row" spacing={0.75} flexWrap="wrap" useFlexGap sx={{ mt: 1.25 }}>
+                          {directives.map((directive, index) => (
+                            <Chip
+                              key={`${String(directive.directiveGlobalId || 'directive')}-${index}`}
+                              size="small"
+                              variant="outlined"
+                              label={[
+                                String(directive.directiveGlobalId || 'Directive'),
+                                directive.versionNumber ? `v${String(directive.versionNumber)}` : '',
+                                displayStatus(String(directive.type || '')),
+                              ].filter(Boolean).join(' · ')}
+                            />
+                          ))}
+                        </Stack>
+                      )}
+                    </Box>
+                  )
+                })}
+              </Stack>
+            ) : (
+              <Alert severity="info">
+                No billing-time MUD results yet. Import a carrier billing CSV, run GL Coding, resolve every shipment match and shipper assignment, then approve the run. Unmatched rows never produce a MUD calculation.
+              </Alert>
+            )}
+          </Box>
+        )}
 
         <Box component="section">
           <Stack direction="row" justifyContent="space-between" alignItems="baseline" gap={2} sx={{ mb: 1.5 }}>

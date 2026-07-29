@@ -760,11 +760,11 @@ export default function PackRateReplayPanel() {
                 <Stack direction={{ xs: 'column', sm: 'row' }} gap={2}>
                   <Box>
                     <Typography variant="caption" color="text.secondary">
-                      Captured marketplace estimate
+                      Captured checkout shipping charge
                     </Typography>
                     <Typography variant="body2" fontWeight={600}>
                       {formatMoney(
-                        selectedRun.stages.checkoutQuote.capturedCustomerChargeMinor,
+                        selectedRun.stages.checkoutQuote.capturedCheckoutShippingChargeMinor,
                         selectedRun.stages.checkoutQuote.currency,
                       )}
                     </Typography>
@@ -813,16 +813,20 @@ export default function PackRateReplayPanel() {
               >
                 <Stack direction={{ xs: 'column', sm: 'row' }} flexWrap="wrap" gap={2}>
                   <Box>
-                    <Typography variant="caption" color="text.secondary">Customer charge</Typography>
+                    <Typography variant="caption" color="text.secondary">
+                      Customer checkout shipping charge
+                    </Typography>
                     <Typography variant="body2">
                       {formatMoney(
-                        selectedRun.stages.checkoutQuote.customerChargeMinor,
+                        selectedRun.stages.checkoutQuote.checkoutShippingChargeMinor,
                         selectedRun.stages.checkoutQuote.currency,
                       )}
                     </Typography>
                   </Box>
                   <Box>
-                    <Typography variant="caption" color="text.secondary">Recorded carrier cost</Typography>
+                    <Typography variant="caption" color="text.secondary">
+                      Checkout carrier estimate
+                    </Typography>
                     <Typography variant="body2">
                       {formatMoney(
                         selectedRun.stages.checkoutQuote.selectedCarrierCostMinor,
@@ -831,19 +835,12 @@ export default function PackRateReplayPanel() {
                     </Typography>
                   </Box>
                   <Box>
-                    <Typography variant="caption" color="text.secondary">MUD markup</Typography>
-                    <Typography variant="body2">
-                      {formatMoney(
-                        selectedRun.stages.checkoutQuote.mudMarkupMinor,
-                        selectedRun.stages.checkoutQuote.currency,
-                      )}
+                    <Typography variant="caption" color="text.secondary">
+                      Checkout charge-to-estimate variance
                     </Typography>
-                  </Box>
-                  <Box>
-                    <Typography variant="caption" color="text.secondary">Checkout margin</Typography>
                     <Typography variant="body2" fontWeight={600}>
                       {formatMoney(
-                        selectedRun.stages.checkoutQuote.marginMinor,
+                        selectedRun.stages.checkoutQuote.estimatedShippingVarianceMinor,
                         selectedRun.stages.checkoutQuote.currency,
                       )}
                     </Typography>
@@ -855,6 +852,10 @@ export default function PackRateReplayPanel() {
                     </Typography>
                   </Box>
                 </Stack>
+                <Alert severity="info" sx={{ mt: 1.5 }}>
+                  No carrier invoice has been imported for this replay. Billed
+                  actual and MUD are not calculated at checkout.
+                </Alert>
                 <Divider sx={{ my: 1.5 }} />
                 <Typography variant="subtitle2" sx={{ mb: 0.75 }}>
                   Recorded checkout choices
@@ -963,16 +964,20 @@ export default function PackRateReplayPanel() {
               >
                 <Stack direction={{ xs: 'column', sm: 'row' }} flexWrap="wrap" gap={2}>
                   <Box>
-                    <Typography variant="caption" color="text.secondary">Customer charge</Typography>
+                    <Typography variant="caption" color="text.secondary">
+                      Customer checkout shipping charge
+                    </Typography>
                     <Typography variant="body2">
                       {formatMoney(
-                        selectedRun.stages.fulfillmentExecution.customerChargeMinor,
+                        selectedRun.stages.fulfillmentExecution.checkoutShippingChargeMinor,
                         selectedRun.stages.fulfillmentExecution.currency,
                       )}
                     </Typography>
                   </Box>
                   <Box>
-                    <Typography variant="caption" color="text.secondary">Recorded carrier cost</Typography>
+                    <Typography variant="caption" color="text.secondary">
+                      Pre-label carrier estimate
+                    </Typography>
                     <Typography variant="body2">
                       {formatMoney(
                         selectedRun.stages.fulfillmentExecution.selectedCarrierCostMinor,
@@ -981,10 +986,12 @@ export default function PackRateReplayPanel() {
                     </Typography>
                   </Box>
                   <Box>
-                    <Typography variant="caption" color="text.secondary">Fulfillment margin</Typography>
+                    <Typography variant="caption" color="text.secondary">
+                      Checkout charge-to-pre-label variance
+                    </Typography>
                     <Typography variant="body2" fontWeight={600}>
                       {formatMoney(
-                        selectedRun.stages.fulfillmentExecution.marginMinor,
+                        selectedRun.stages.fulfillmentExecution.estimatedShippingVarianceMinor,
                         selectedRun.stages.fulfillmentExecution.currency,
                       )}
                     </Typography>
@@ -1030,7 +1037,7 @@ export default function PackRateReplayPanel() {
                 title="Checkout-to-fulfillment variance"
                 icon={<LocalShippingRounded fontSize="small" />}
                 status={selectedRun.stages.variance.status}
-                summary="Checkout economics remain immutable while fulfillment cost and realized margin are recorded separately."
+                summary="The checkout shipping charge remains immutable while the pre-label carrier estimate and signed variances are recorded separately."
                 gates={[{
                   code: 'variance_preserved',
                   label: 'Both passes remain independently auditable',
@@ -1040,16 +1047,20 @@ export default function PackRateReplayPanel() {
               >
                 <Stack direction={{ xs: 'column', sm: 'row' }} flexWrap="wrap" gap={2}>
                   <Box>
-                    <Typography variant="caption" color="text.secondary">Checkout customer charge</Typography>
+                    <Typography variant="caption" color="text.secondary">
+                      Customer checkout shipping charge
+                    </Typography>
                     <Typography variant="body2">
                       {formatMoney(
-                        selectedRun.stages.variance.checkoutCustomerChargeMinor,
+                        selectedRun.stages.variance.checkoutShippingChargeMinor,
                         selectedRun.stages.variance.currency,
                       )}
                     </Typography>
                   </Box>
                   <Box>
-                    <Typography variant="caption" color="text.secondary">Checkout carrier cost</Typography>
+                    <Typography variant="caption" color="text.secondary">
+                      Checkout carrier estimate
+                    </Typography>
                     <Typography variant="body2">
                       {formatMoney(
                         selectedRun.stages.variance.checkoutCarrierCostMinor,
@@ -1058,7 +1069,9 @@ export default function PackRateReplayPanel() {
                     </Typography>
                   </Box>
                   <Box>
-                    <Typography variant="caption" color="text.secondary">Fulfillment carrier cost</Typography>
+                    <Typography variant="caption" color="text.secondary">
+                      Pre-label carrier estimate
+                    </Typography>
                     <Typography variant="body2">
                       {formatMoney(
                         selectedRun.stages.variance.fulfillmentCarrierCostMinor,
@@ -1067,19 +1080,23 @@ export default function PackRateReplayPanel() {
                     </Typography>
                   </Box>
                   <Box>
-                    <Typography variant="caption" color="text.secondary">Carrier cost variance</Typography>
+                    <Typography variant="caption" color="text.secondary">
+                      Pre-label rate variance
+                    </Typography>
                     <Typography variant="body2" fontWeight={600}>
                       {formatMoney(
-                        selectedRun.stages.variance.carrierCostVarianceMinor,
+                        selectedRun.stages.variance.preLabelRateVarianceMinor,
                         selectedRun.stages.variance.currency,
                       )}
                     </Typography>
                   </Box>
                   <Box>
-                    <Typography variant="caption" color="text.secondary">Realized margin</Typography>
+                    <Typography variant="caption" color="text.secondary">
+                      Checkout charge-to-pre-label variance
+                    </Typography>
                     <Typography variant="body2" fontWeight={600}>
                       {formatMoney(
-                        selectedRun.stages.variance.realizedMarginMinor,
+                        selectedRun.stages.variance.estimatedShippingVarianceMinor,
                         selectedRun.stages.variance.currency,
                       )}
                     </Typography>
@@ -1097,6 +1114,11 @@ export default function PackRateReplayPanel() {
                     </Typography>
                   </Box>
                 </Stack>
+                <Alert severity="info" sx={{ mt: 1.5 }}>
+                  Carrier billed actual is pending an imported and matched
+                  billing CSV. MUD is evaluated only in that billing workflow
+                  when an effective directive is configured.
+                </Alert>
                 {selectedRun.stages.variance.causes.length > 0 && (
                   <Stack direction="row" flexWrap="wrap" gap={0.75} sx={{ mt: 1.25 }}>
                     {selectedRun.stages.variance.causes.map((reason) => (
@@ -1114,29 +1136,29 @@ export default function PackRateReplayPanel() {
                 title="Marketplace estimate vs post-intake fulfillment"
                 icon={<LocalShippingRounded fontSize="small" />}
                 status="warning"
-                summary="Faire never called ClawPilot at checkout, so there is no checkout carrier-cost or package-plan baseline to compare."
+                summary="Faire never called ClawPilot at checkout, so there is no checkout carrier-estimate or package-plan baseline to compare."
                 gates={[{
                   code: 'faire_variance_boundary',
                   label: 'No fabricated checkout variance',
                   status: 'passed',
-                  detail: 'The captured customer estimate and post-intake carrier cost remain separate facts.',
+                  detail: 'The captured checkout shipping charge and post-intake carrier estimate remain separate facts.',
                 }]}
               >
                 <Stack direction={{ xs: 'column', sm: 'row' }} gap={2}>
                   <Box>
                     <Typography variant="caption" color="text.secondary">
-                      Captured Faire customer estimate
+                      Captured Faire checkout shipping charge
                     </Typography>
                     <Typography variant="body2">
                       {formatMoney(
-                        selectedRun.stages.checkoutQuote.capturedCustomerChargeMinor,
+                        selectedRun.stages.checkoutQuote.capturedCheckoutShippingChargeMinor,
                         selectedRun.stages.checkoutQuote.currency,
                       )}
                     </Typography>
                   </Box>
                   <Box>
                     <Typography variant="caption" color="text.secondary">
-                      Post-intake fulfillment carrier cost
+                      Pre-label carrier estimate
                     </Typography>
                     <Typography variant="body2">
                       {formatMoney(
@@ -1146,6 +1168,10 @@ export default function PackRateReplayPanel() {
                     </Typography>
                   </Box>
                 </Stack>
+                <Alert severity="info" sx={{ mt: 1.5 }}>
+                  Carrier billed actual is pending an imported and matched
+                  billing CSV. No MUD is calculated in this replay.
+                </Alert>
               </StageShell>
             ) : (
               <StageShell

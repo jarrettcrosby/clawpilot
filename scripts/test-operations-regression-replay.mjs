@@ -56,6 +56,9 @@ function loadTypeScriptModule(relativePath, mocks = {}) {
 const migration = read(
   'db/migrations/0145_operations_two_pass_pack_rate_runs.sql',
 )
+const pricingSemanticsMigration = read(
+  'db/migrations/0146_operations_pack_rate_pricing_semantics.sql',
+)
 for (const table of [
   'operations_pack_rate_runs',
   'operations_pack_rate_run_lines',
@@ -88,10 +91,22 @@ for (const invariant of [
 ]) {
   assertIncludes(migration, invariant, 'two-pass pack-rate invariant')
 }
+for (const invariant of [
+  'pricing_semantics_version',
+  'Pack-and-rate replay cannot calculate MUD before carrier billing',
+  'Fulfillment must preserve the recorded checkout shipping charge',
+  'Version 2 records checkout charge and carrier-estimate variance only',
+]) {
+  assertIncludes(
+    pricingSemanticsMigration,
+    invariant,
+    'pack-rate pricing semantics correction',
+  )
+}
 
 const types = read('app_src/lib/operations/regressionReplay.ts')
 for (const contract of [
-  'operations-regression-replay-v1',
+  'operations-regression-replay-v2',
   "'live_callback_recorded'",
   "'faire_checkout_estimate_captured'",
   "'new'",
@@ -197,7 +212,7 @@ const persistenceModule = loadTypeScriptModule(
   {
     '@/lib/operations/regressionReplay': {
       OPERATIONS_REGRESSION_REPLAY_SCHEMA_VERSION:
-        'operations-regression-replay-v1',
+        'operations-regression-replay-v2',
     },
     '@/lib/operations/hybridCartonization': hybridCartonizationModule,
     '@/lib/persistence/config': {
@@ -238,6 +253,11 @@ assert.ok(
       && scenario.customerMode === 'reuse',
   ),
   'catalog must include a multi-package CRM-reuse replay',
+)
+assert.doesNotMatch(
+  persistence,
+  /mudMarkupMinor/,
+  'version-2 replay must not accept or emit a fixture MUD',
 )
 assert.deepEqual(
   Array.from(
@@ -351,10 +371,16 @@ assertIncludes(
   'operations_two_pass_pack_rate_runs_applied',
   'hosted two-pass pack-rate migration health result',
 )
+assertIncludes(
+  healthRoute,
+  '0146_operations_pack_rate_pricing_semantics.sql',
+  'hosted corrected pricing-semantics migration health',
+)
 
 const predeploy = read('scripts/verify-predeploy.mjs')
 for (const requiredPath of [
   'db/migrations/0145_operations_two_pass_pack_rate_runs.sql',
+  'db/migrations/0146_operations_pack_rate_pricing_semantics.sql',
   'app_src/lib/operations/regressionReplay.ts',
   'app_src/lib/persistence/operationsRegressionArtifacts.ts',
   'app_src/lib/persistence/operationsRegressionReplay.ts',

@@ -1217,7 +1217,9 @@ async function shopifyProductEnvelope(
       operationName: 'ClawPilotCommerceProductVariants',
       variables: {
         after: page.orderCursor,
-        query: `updated_at:<='${page.windowEnd}' AND product_status:ACTIVE,ARCHIVED,DRAFT,UNLISTED`,
+        // Shopify's search values are case-sensitive lowercase even though
+        // ProductStatus values in the GraphQL response are uppercase.
+        query: `updated_at:<='${page.windowEnd}' AND product_status:active,archived,draft,unlisted`,
       },
     },
     { timeoutMs: SHOPIFY_GRAPHQL_TIMEOUT_MS },

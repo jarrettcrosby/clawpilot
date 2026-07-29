@@ -30,6 +30,7 @@ const TRUSTED_RAILWAY_DEV_ENVIRONMENT_ID =
   'e4abd95f-825c-4242-b37b-825a92597e98'
 const RECORDED_FACT_VERSION = 'sanitized-development-replay-2026-07-29'
 const CURRENCY = 'USD'
+const PRICING_SEMANTICS_VERSION = 2 as const
 
 type AllocationDefinition = {
   lineKey: string
@@ -50,8 +51,7 @@ type PassDefinition = {
   rates: Array<Omit<OperationsRegressionRateChoice, 'selected' | 'currency' | 'recordedFactVersion'>>
   selectedProvider: OperationsRegressionRateChoice['provider']
   selectedServiceCode: string
-  customerChargeMinor: number
-  mudMarkupMinor: number
+  checkoutShippingChargeMinor: number
 }
 
 type ScenarioDefinition = OperationsRegressionScenario & {
@@ -172,8 +172,7 @@ const scenarioDefinitions: ScenarioDefinition[] = [
       rates: rates(4285),
       selectedProvider: 'ups_rest',
       selectedServiceCode: '03',
-      customerChargeMinor: 5125,
-      mudMarkupMinor: 840,
+      checkoutShippingChargeMinor: 5125,
     },
     fulfillment: {
       packages: [
@@ -185,8 +184,7 @@ const scenarioDefinitions: ScenarioDefinition[] = [
       rates: rates(4510),
       selectedProvider: 'ups_rest',
       selectedServiceCode: '03',
-      customerChargeMinor: 5125,
-      mudMarkupMinor: 840,
+      checkoutShippingChargeMinor: 5125,
     },
   },
   {
@@ -232,8 +230,7 @@ const scenarioDefinitions: ScenarioDefinition[] = [
       rates: rates(2140),
       selectedProvider: 'ups_rest',
       selectedServiceCode: '03',
-      customerChargeMinor: 2640,
-      mudMarkupMinor: 500,
+      checkoutShippingChargeMinor: 2640,
     },
     fulfillment: {
       packages: [
@@ -243,8 +240,7 @@ const scenarioDefinitions: ScenarioDefinition[] = [
       rates: rates(2215),
       selectedProvider: 'ups_rest',
       selectedServiceCode: '03',
-      customerChargeMinor: 2640,
-      mudMarkupMinor: 500,
+      checkoutShippingChargeMinor: 2640,
     },
   },
   {
@@ -283,8 +279,7 @@ const scenarioDefinitions: ScenarioDefinition[] = [
       rates: rates(1575),
       selectedProvider: 'ups_rest',
       selectedServiceCode: '03',
-      customerChargeMinor: 1895,
-      mudMarkupMinor: 320,
+      checkoutShippingChargeMinor: 1895,
     },
   },
   {
@@ -322,8 +317,7 @@ const scenarioDefinitions: ScenarioDefinition[] = [
       rates: rates(1640),
       selectedProvider: 'ups_rest',
       selectedServiceCode: '03',
-      customerChargeMinor: 1980,
-      mudMarkupMinor: 340,
+      checkoutShippingChargeMinor: 1980,
     },
     fulfillment: null,
   },
@@ -481,7 +475,7 @@ type RunInsert = {
   status: 'succeeded' | 'blocked'
   blockerCode: string | null
   pass: PassDefinition | null
-  customerChargeMinor: number | null
+  checkoutShippingChargeMinor: number | null
   inputSnapshot: Record<string, unknown>
   resultSnapshot: Record<string, unknown>
   stageSnapshot: Record<string, unknown>
@@ -739,8 +733,9 @@ async function insertRun(
   const packageCount = input.status === 'succeeded' && input.pass
     ? input.pass.packages.length
     : 0
-  const marginMinor = selected && input.customerChargeMinor !== null
-    ? input.customerChargeMinor - selected.carrierCostMinor
+  const estimatedShippingVarianceMinor =
+    selected && input.checkoutShippingChargeMinor !== null
+      ? input.checkoutShippingChargeMinor - selected.carrierCostMinor
     : null
   const result = await client.query<{
     id: string
@@ -758,13 +753,14 @@ async function insertRun(
        rate_choice_count, currency,
        selected_provider, selected_service_code, selected_service_name,
        selected_carrier_cost_minor, customer_charge_minor, mud_markup_minor,
-       margin_minor, idempotency_key, actor_email, provider_write_count,
+       margin_minor, idempotency_key, actor_email, pricing_semantics_version,
+       provider_write_count,
        postage_purchase_count, label_write_count, expires_at
      ) VALUES (
        $1::uuid, $2, $3, 'sanitized_historical_replay', $4, $5, $6, $7,
        $8::uuid, $9::uuid, $10::uuid, $11, $12, $13, $14, $15, $16, $17,
        $18::jsonb, $19::jsonb, $20::jsonb, $21, $22, $23, $24, $25, $26,
-       $27, $28, $29, $30, $31, $32, $33, 0, 0, 0,
+       $27, $28, $29, NULL, $30, $31, $32, $33, 0, 0, 0,
        CASE WHEN $7 = 'checkout_quote'
          THEN now() + interval '15 minutes'
          ELSE NULL
@@ -802,11 +798,11 @@ async function insertRun(
       selected?.serviceCode || null,
       selected?.serviceName || null,
       selected?.carrierCostMinor ?? null,
-      input.customerChargeMinor,
-      input.pass?.mudMarkupMinor ?? null,
-      marginMinor,
+      input.checkoutShippingChargeMinor,
+      estimatedShippingVarianceMinor,
       input.idempotencyKey,
       input.actorEmail,
+      PRICING_SEMANTICS_VERSION,
     ],
   )
   const row = result.rows[0]
@@ -1261,9 +1257,11 @@ function resultSnapshotForPass(
     optimizerResultHash: facts.optimizerResultHash,
     optimizerPolicyVersion: facts.optimizerPolicyVersion,
     optimizerAlgorithmVersion: facts.optimizerAlgorithmVersion,
-    customerChargeMinor: pass.customerChargeMinor,
-    mudMarkupMinor: pass.mudMarkupMinor,
-    marginMinor: pass.customerChargeMinor - facts.selected.carrierCostMinor,
+    checkoutShippingChargeMinor: pass.checkoutShippingChargeMinor,
+    estimatedShippingVarianceMinor:
+      pass.checkoutShippingChargeMinor - facts.selected.carrierCostMinor,
+    pricingSemanticsVersion: PRICING_SEMANTICS_VERSION,
+    billingReconciliationStatus: 'pending_carrier_invoice',
     currency: CURRENCY,
     recordedFactsOnly: true,
     providerWriteCount: 0,
@@ -1424,11 +1422,11 @@ async function insertVariance(
       input.fulfillment.id,
       fulfillmentFacts.packages.length - checkoutFacts.packages.length,
       checkoutFacts.selected.carrierCostMinor,
-      input.checkoutPass.customerChargeMinor,
+      input.checkoutPass.checkoutShippingChargeMinor,
       fulfillmentFacts.selected.carrierCostMinor,
       fulfillmentFacts.selected.carrierCostMinor
         - checkoutFacts.selected.carrierCostMinor,
-      input.checkoutPass.customerChargeMinor
+      input.checkoutPass.checkoutShippingChargeMinor
         - fulfillmentFacts.selected.carrierCostMinor,
       CURRENCY,
       allocationChanged,
@@ -1511,7 +1509,7 @@ async function createReplayWithClient(
     : {
       kind: 'marketplace_estimate',
       source: 'faire_checkout_estimate_captured',
-      capturedCustomerChargeMinor:
+      capturedCheckoutShippingChargeMinor:
         input.scenario.capturedMarketplaceEstimateMinor,
       currency: CURRENCY,
       allocationHash: null,
@@ -1533,8 +1531,8 @@ async function createReplayWithClient(
     status: 'succeeded',
     blockerCode: null,
     pass: input.scenario.checkout,
-    customerChargeMinor: input.scenario.checkout
-      ? input.scenario.checkout.customerChargeMinor
+    checkoutShippingChargeMinor: input.scenario.checkout
+      ? input.scenario.checkout.checkoutShippingChargeMinor
       : input.scenario.capturedMarketplaceEstimateMinor,
     inputSnapshot: checkoutInputSnapshot,
     resultSnapshot: checkoutResultSnapshot,
@@ -1585,7 +1583,7 @@ async function createReplayWithClient(
       status: 'blocked',
       blockerCode: input.scenario.expectedBlocker,
       pass: null,
-      customerChargeMinor: null,
+      checkoutShippingChargeMinor: null,
       inputSnapshot: {
         checkoutRunGlobalId: checkout.globalId,
         intakeCompleted: true,
@@ -1624,9 +1622,9 @@ async function createReplayWithClient(
       status: 'succeeded',
       blockerCode: null,
       pass: input.scenario.fulfillment,
-      customerChargeMinor: input.scenario.provider === 'faire'
+      checkoutShippingChargeMinor: input.scenario.provider === 'faire'
         ? input.scenario.capturedMarketplaceEstimateMinor
-        : input.scenario.checkout?.customerChargeMinor ?? null,
+        : input.scenario.checkout?.checkoutShippingChargeMinor ?? null,
       inputSnapshot: {
         checkoutRunGlobalId: checkout.globalId,
         intakeCompleted: true,
@@ -1728,6 +1726,7 @@ type StoredRunRow = QueryResultRow & {
   customer_charge_minor: string | null
   mud_markup_minor: string | null
   margin_minor: string | null
+  pricing_semantics_version: 1 | 2
   expires_at: Date | null
   created_at: Date
   provider_write_count: number
@@ -1861,9 +1860,10 @@ async function readPackRateStage(
     selectedRate: selected[0],
     selectedCarrierCostMinor:
       intValue(run.selected_carrier_cost_minor) || 0,
-    customerChargeMinor: intValue(run.customer_charge_minor) || 0,
-    mudMarkupMinor: intValue(run.mud_markup_minor) || 0,
-    marginMinor: intValue(run.margin_minor) || 0,
+    checkoutShippingChargeMinor: intValue(run.customer_charge_minor) || 0,
+    estimatedShippingVarianceMinor: intValue(run.margin_minor) || 0,
+    pricingSemanticsVersion: run.pricing_semantics_version,
+    billingReconciliationStatus: 'pending_carrier_invoice',
     currency: run.currency,
     inputHash: run.input_hash,
     resultHash: run.result_hash,
@@ -1881,7 +1881,7 @@ function marketplaceEstimateStage(
     runGlobalId: run.global_id,
     purpose: 'checkout_quote',
     source: 'faire_checkout_estimate_captured',
-    capturedCustomerChargeMinor: intValue(run.customer_charge_minor),
+    capturedCheckoutShippingChargeMinor: intValue(run.customer_charge_minor),
     currency: run.currency,
     inputHash: run.input_hash,
     resultHash: run.result_hash,
@@ -1909,7 +1909,8 @@ async function readOperationsRegressionRunWithClient(
        run.selected_provider, run.selected_service_code,
        run.selected_service_name, run.selected_carrier_cost_minor::text,
        run.customer_charge_minor::text, run.mud_markup_minor::text,
-       run.margin_minor::text, run.expires_at, run.created_at,
+       run.margin_minor::text, run.pricing_semantics_version,
+       run.expires_at, run.created_at,
        run.provider_write_count, run.postage_purchase_count,
        run.label_write_count
      FROM operations_pack_rate_runs run
@@ -2118,13 +2119,15 @@ async function readOperationsRegressionRunWithClient(
           packageCountDelta: variance.package_count_delta,
           checkoutCarrierCostMinor:
             Number(variance.checkout_carrier_cost_minor),
-          checkoutCustomerChargeMinor:
+          checkoutShippingChargeMinor:
             Number(variance.checkout_customer_charge_minor),
           fulfillmentCarrierCostMinor:
             Number(variance.fulfillment_carrier_cost_minor),
-          carrierCostVarianceMinor:
+          preLabelRateVarianceMinor:
             Number(variance.carrier_cost_variance_minor),
-          realizedMarginMinor: Number(variance.realized_margin_minor),
+          estimatedShippingVarianceMinor:
+            Number(variance.realized_margin_minor),
+          billingReconciliationStatus: 'pending_carrier_invoice',
           currency: variance.currency,
           allocationChanged: variance.allocation_changed,
           materialChanged: variance.material_changed,

@@ -25,6 +25,16 @@ const migrationPath = fileURLToPath(
   ),
 )
 const migrationSql = readFileSync(migrationPath, 'utf8')
+const pricingSemanticsMigrationPath = fileURLToPath(
+  new URL(
+    '../db/migrations/0146_operations_pack_rate_pricing_semantics.sql',
+    import.meta.url,
+  ),
+)
+const pricingSemanticsMigrationSql = readFileSync(
+  pricingSemanticsMigrationPath,
+  'utf8',
+)
 const token = randomUUID().replaceAll('-', '').slice(0, 16)
 const scenarioId = `postgres-acceptance-${token}`
 const replayGroupKey = `operations-postgres-acceptance:${token}`
@@ -200,8 +210,7 @@ async function insertRun(client, input) {
   const selectedRate = input.graph.rates.find((rate) => rate.selected)
   assert.ok(selectedRate, 'run graph must contain one selected rate')
   const isCheckout = input.purpose === 'checkout_quote'
-  const customerChargeMinor = 2350
-  const mudMarkupMinor = 510
+  const checkoutShippingChargeMinor = 2350
   const result = await client.query(
     `INSERT INTO operations_pack_rate_runs (
        organization_id, replay_group_key, scenario_id, source_kind,
@@ -213,15 +222,16 @@ async function insertRun(client, input) {
        rate_choice_count, currency, selected_provider,
        selected_service_code, selected_service_name,
        selected_carrier_cost_minor, customer_charge_minor, mud_markup_minor,
-       margin_minor, idempotency_key, actor_email, provider_write_count,
+       margin_minor, idempotency_key, actor_email, pricing_semantics_version,
+       provider_write_count,
        postage_purchase_count, label_write_count, expires_at
      ) VALUES (
        $1::uuid, $2, $3, 'sanitized_historical_replay', $4, 'shopify',
        'live_callback_recorded', $5, $6::uuid, $7::uuid, $8::uuid, $9,
        'succeeded', NULL, 'postgres-acceptance-policy-v1',
        'postgres-acceptance-algorithm-v1', $10, $11, $12::jsonb, $13::jsonb,
-       $14::jsonb, $15, $16, $17, 'USD', $18, $19, $20, $21, $22, $23,
-       $22::bigint - $21::bigint, $24, $25, 0, 0, 0,
+       $14::jsonb, $15, $16, $17, 'USD', $18, $19, $20, $21, $22, NULL,
+       $22::bigint - $21::bigint, $23, $24, 2, 0, 0, 0,
        CASE WHEN $5 = 'checkout_quote'
          THEN now() + interval '15 minutes'
          ELSE NULL
@@ -250,8 +260,7 @@ async function insertRun(client, input) {
       selectedRate.serviceCode,
       selectedRate.serviceName,
       selectedRate.carrierCostMinor,
-      customerChargeMinor,
-      mudMarkupMinor,
+      checkoutShippingChargeMinor,
       `${input.replayGroupKey}:${input.purpose}`,
       input.actorEmail,
     ],
@@ -531,6 +540,7 @@ async function main() {
     // Applying the idempotent migration here proves a fresh dev database can
     // accept the contract. PostgreSQL rolls the DDL back with all test rows.
     await client.query(migrationSql)
+    await client.query(pricingSemanticsMigrationSql)
 
     const context = await client.query(
       `SELECT
@@ -693,6 +703,12 @@ async function main() {
            WHERE selected_provider = 'ups_rest'
              AND selected_service_code = '03'
          )::integer AS common_service_count,
+         count(*) FILTER (
+           WHERE pricing_semantics_version = 2
+         )::integer AS corrected_pricing_count,
+         count(*) FILTER (
+           WHERE mud_markup_minor IS NOT NULL
+         )::integer AS premature_mud_count,
          sum(provider_write_count)::integer AS provider_write_count,
          sum(postage_purchase_count)::integer AS postage_purchase_count,
          sum(label_write_count)::integer AS label_write_count
@@ -711,6 +727,8 @@ async function main() {
       customer_neutral_checkout_count: 1,
       resolved_fulfillment_count: 1,
       common_service_count: 2,
+      corrected_pricing_count: 2,
+      premature_mud_count: 0,
       provider_write_count: 0,
       postage_purchase_count: 0,
       label_write_count: 0,
@@ -1025,6 +1043,9 @@ async function main() {
       `- migration 0145: transactionally applied (${migrationPreexisting
         ? 'already present before probe'
         : 'fresh-schema path exercised'})`,
+    )
+    console.log(
+      '- migration 0146: transactionally applied with version-2 pricing semantics',
     )
     console.log(
       '- accepted: customer-neutral checkout -> resolved fulfillment, 2 packages, UPS + FedEx rates, 1 selected service, variance, and 2 tracking-bound packing slips',

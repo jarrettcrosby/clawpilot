@@ -49,12 +49,66 @@ function loadGlCoding() {
 }
 
 const {
+  calculateBillingMud,
   evaluateGlCodingRule,
   glCodingChecksum,
   normalizeCarrierTrackingNumber,
   selectGlCodingRule,
   validateGlCodingConditions,
 } = loadGlCoding()
+
+const calculatedMud = calculateBillingMud(1_000n, [
+  {
+    globalId: 'grd1000002',
+    priority: 20,
+    type: 'percent_markup',
+    amountMinor: null,
+    basisPoints: 500,
+  },
+  {
+    globalId: 'grd1000001',
+    priority: 10,
+    type: 'fixed_amount',
+    amountMinor: 100n,
+    basisPoints: null,
+  },
+])
+assert.equal(calculatedMud.carrierBilledActualMinor, 1_000n)
+assert.equal(calculatedMud.mudAdjustmentMinor, 150n)
+assert.equal(calculatedMud.contractBilledShippingMinor, 1_150n)
+assert.equal(calculatedMud.appliedDirectiveGlobalIds[0], 'grd1000001')
+assert.equal(calculatedMud.appliedDirectiveGlobalIds[1], 'grd1000002')
+
+assert.equal(calculateBillingMud(333n, [{
+  globalId: 'grd1000003',
+  priority: 10,
+  type: 'cost_plus_percent',
+  amountMinor: null,
+  basisPoints: 1_250,
+}]).mudAdjustmentMinor, 42n)
+
+assert.equal(calculateBillingMud(1_000n, [{
+  globalId: 'grd1000004',
+  priority: 10,
+  type: 'minimum_charge',
+  amountMinor: 1_250n,
+  basisPoints: null,
+}]).contractBilledShippingMinor, 1_250n)
+
+assert.throws(
+  () => calculateBillingMud(1_000n, [{
+    globalId: 'grd1000005',
+    priority: 10,
+    type: 'maximum_charge',
+    amountMinor: 900n,
+    basisPoints: null,
+  }]),
+  /BILLING_MUD_NEGATIVE_MARGIN/,
+)
+assert.throws(
+  () => calculateBillingMud(1_000n, []),
+  /BILLING_MUD_DIRECTIVE_REQUIRED/,
+)
 
 const facts = {
   provider: 'ups',
@@ -237,9 +291,26 @@ for (const fragment of [
   "'carrier_cost_reimbursement'",
   "'credit'",
   'quoteTimePlatformAndResellerFeesExcluded',
+  'persistApprovedBillingMudCalculations',
+  'if (\n      !item.billing_match_id',
+  "status: 'not_configured' | 'calculated' | 'blocked'",
+  'operations_carrier_billing_mud_calculations',
+  "configurationReason = first.contract_version_id",
+  "'MUD_GRANT_AMBIGUOUS'",
+  'billingTimeMudOnly',
+  'JOIN operations_carrier_rate_directives directive',
+  'directiveCandidateSnapshot',
+  'directiveCandidates: directiveCandidateSnapshot',
+  'child.effective_from <= $6::timestamptz',
 ]) {
   assert.ok(persistence.includes(fragment), `Missing GL Coding persistence contract: ${fragment}`)
 }
+assert.ok(
+  !persistence.includes(
+    'LEFT JOIN operations_carrier_rate_directives directive',
+  ),
+  'Billing-time MUD must count only grants with applicable actual-cost directives',
+)
 assert.ok(
   persistence.indexOf('persistShipmentMatch') !== persistence.indexOf('persistShipperAssignment'),
   'Shipment matching and shipper assignment must remain separate decisions',
@@ -279,6 +350,13 @@ for (const fragment of [
   'Reject run',
   'Settlement ledger',
   'canApproveCarrierSettlement',
+  'Billing-time MUD',
+  'Customer-paid checkout shipping',
+  'Carrier billed actual',
+  'Contract-billed shipping',
+  'Checkout vs carrier actual',
+  'Checkout vs contract bill',
+  'Unmatched rows never produce a MUD calculation',
 ]) {
   assert.ok(panel.includes(fragment), `Missing GL Coding UI contract: ${fragment}`)
 }
@@ -331,6 +409,73 @@ for (const fragment of [
   'GL Coding review settlement must preserve the exact reviewed billed-actual decision',
 ]) {
   assert.ok(reviewMigration.includes(fragment), `Missing GL Coding review contract: ${fragment}`)
+}
+
+const billingMudMigration = read(
+  'db/migrations/0147_operations_carrier_billing_mud.sql',
+)
+const billingMudMigrationSql = compactSql(billingMudMigration)
+for (const fragment of [
+  "'operations.carrier_billing_mud_calculation'",
+  'CREATE TABLE IF NOT EXISTS operations_carrier_billing_mud_calculations',
+  'CREATE TABLE IF NOT EXISTS operations_carrier_billing_mud_calculation_charges',
+  'CREATE TABLE IF NOT EXISTS operations_carrier_billing_mud_calculation_directives',
+  "status IN ('not_configured', 'calculated', 'blocked')",
+  'billing_statement_lineage_key',
+  'billing_statement_version',
+  'customer_paid_checkout_shipping_minor',
+  'carrier_billed_actual_minor',
+  'mud_adjustment_minor',
+  'contract_billed_shipping_minor',
+  'checkout_to_carrier_actual_variance_minor',
+  'checkout_to_contract_bill_variance_minor',
+  'validate_operations_carrier_billing_mud_charge',
+  'validate_operations_carrier_billing_mud_directive',
+  'validate_operations_carrier_billing_mud_complete',
+  'Carrier billing MUD evidence is append-only',
+  'Carrier billing MUD calculation requires an approved GL Coding review',
+  'Carrier billing MUD requires an uploaded CSV statement lineage',
+  'Carrier billing MUD charge requires the exact current shipment match',
+  'applicable approved actual-cost version',
+]) {
+  assert.ok(
+    billingMudMigrationSql.includes(fragment),
+    `Missing billing-time MUD migration contract: ${fragment}`,
+  )
+}
+for (const fragment of [
+  'UNIQUE (network_id, billing_statement_lineage_key, billing_statement_version, shipment_id, currency)',
+  "checkout_charge_status = 'customer_paid'",
+  "status = 'calculated'",
+  'contract_billed_shipping_minor = carrier_billed_actual_minor + mud_adjustment_minor',
+  'evidence_charge_count IS DISTINCT FROM calculation_row.charge_count',
+  'evidence_charge_total IS DISTINCT FROM calculation_row.carrier_billed_actual_minor',
+  'count(DISTINCT evidence.grant_id)::integer',
+  'jsonb_array_length(calculation_row.directive_snapshot)',
+  'calculation_row.directive_snapshot IS DISTINCT FROM expected_directive_snapshot',
+  "calculation_row.calculation_snapshot->>'model' IS DISTINCT FROM 'billing_actual_mud_v1'",
+  'expected_contract_billed_minor := calculation_row.carrier_billed_actual_minor + additive_minor',
+  'calculation_row.contract_billed_shipping_minor IS DISTINCT FROM expected_contract_billed_minor',
+  'calculation_row.mud_adjustment_minor IS DISTINCT FROM expected_mud_adjustment_minor',
+  "calculation_row.calculation_snapshot->>'configurationReason' IS DISTINCT FROM 'MUD_CALCULATED_FROM_BILLED_ACTUAL'",
+  'canonical_operations_billing_jsonb',
+  'calculation_row.input_hash IS DISTINCT FROM expected_input_hash',
+  'calculation_row.calculation_snapshot IS DISTINCT FROM expected_calculation_snapshot',
+  'count(DISTINCT rate_grant.id)::integer',
+  'directive_count <> candidate_directive_count',
+  'expected_directive_snapshot IS DISTINCT FROM expected_candidate_snapshot',
+  'Carrier billing MUD with multiple direct grant paths must be blocked',
+  'child.effective_from <= shipment_timestamp',
+  'child.effective_to > shipment_timestamp',
+  'child.supersedes_assignment_id = assignment.id',
+  'DROP TRIGGER IF EXISTS validate_operations_carrier_billing_mud_parent_complete',
+  'DROP TRIGGER IF EXISTS validate_operations_carrier_billing_mud_charge_complete',
+  'DROP TRIGGER IF EXISTS validate_operations_carrier_billing_mud_directive_complete',
+]) {
+  assert.ok(
+    billingMudMigrationSql.includes(fragment),
+    `Missing hardened billing-time MUD SQL contract: ${fragment}`,
+  )
 }
 
 const settlementLifecycleMigration = read('db/migrations/0097_operations_settlement_lifecycle.sql')

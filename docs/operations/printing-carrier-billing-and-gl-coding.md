@@ -19,7 +19,7 @@ This guide covers three separate but connected controls:
 2. **Carrier billing** retains actual carrier charges and matches them to carrier accounts and shipments.
 3. **GL Coding and settlement** assigns carrier charges to the responsible shipper and calculates the approved Triangle, Square, and Circle economics.
 
-ClawPilot persists organization- and warehouse-scoped printer profiles, capability-aware defaults and fallbacks, enrolled local print agents, fenced claim and acknowledgement attempts, bounded retries and audited reprints, direct carrier CSV imports, carrier-account and billing evidence, selected-batch GL Coding runs, versioned shipper-routing rules, manual orphan assignments, immutable review evidence, billed-actual settlement entries, and append-only settlement lifecycle events. Bounded UPS and FedEx sandbox label create/void is available only for the fixed synthetic shipment and automatically routes a committed label to one durable print job. Production label purchase, production void, pickup, tracking, accounting export, invoicing, and payment-provider adapters remain activation-gated. Browser printing is best effort and is not delivery evidence.
+ClawPilot persists organization- and warehouse-scoped printer profiles, capability-aware defaults and fallbacks, enrolled local print agents, fenced claim and acknowledgement attempts, bounded retries and audited reprints, direct carrier CSV imports, carrier-account and billing evidence, selected-batch GL Coding runs, versioned shipper-routing rules, manual orphan assignments, immutable review evidence, billing-time MUD calculations, billed-actual settlement entries, and append-only settlement lifecycle events. Additive migrations `0146` and `0147` correct replay pricing vocabulary and add the billing-time MUD evidence boundary in development. Bounded UPS and FedEx sandbox label create/void is available only for the fixed synthetic shipment and automatically routes a committed label to one durable print job. Production label purchase, production void, pickup, tracking, production billing automation, accounting export, invoicing, and payment-provider adapters remain activation-gated. Browser printing is best effort and is not delivery evidence.
 
 ## Configure A Printer
 
@@ -92,11 +92,36 @@ For each statement and charge:
 
 The carrier account registered address determines sender, recipient, or third-party payer classification only after the account is authorized.
 
+Uploading a CSV does not by itself establish carrier-billed actual cost. A
+carrier-billed actual is available for pricing and settlement only when the
+imported charges are retained exactly, the current shipment match is
+unambiguous, the shipper assignment is exact, and the GL Coding review is
+approved. Unmatched, ambiguous, superseded, or unapproved evidence remains in
+review and cannot drive MUD.
+
 ## Run GL Coding
 
 Open **Operations > Shipment pricing & GL** and explicitly select the carrier billing batches to process.
 
-A **Markup Directive (MUD)** is the approved, effective-dated contract rule that produced the customer-facing shipment price. The quote retains the exact MUD version and calculated result. GL Coding links billed carrier charges to shipment and shipper evidence and reviews that retained result; it does not silently recalculate, replace, or mutate the quoted MUD price.
+The immutable checkout shipping charge is the pro forma, customer-facing
+amount recorded at checkout. The checkout carrier estimate and the pre-label
+carrier rerate are separate estimate facts. Their signed differences are
+estimated variances until a carrier invoice is imported, exactly matched, and
+approved; none is MUD or carrier-billed actual.
+
+A **Markup Directive (MUD)** in this workflow is an approved, effective-dated
+`actual_cost` contract rule evaluated only against that approved
+carrier-billed actual. It is not calculated during replay, checkout rating, or
+the pre-label rerate. A calculated result retains immutable statement,
+charge, shipment, quote, account, grant, contract, directive, calculation,
+input-hash, and actor provenance. When no applicable directive is configured,
+the result is explicitly `not_configured`; ClawPilot does not infer a markup or
+coerce it to zero. Eligibility is evaluated at the shipment timestamp and
+requires exactly one direct grant to the assigned shipper that actually has
+one or more applicable actual-cost directives. Extra grants with no such
+directive remain `not_configured`; competing eligible grants are `blocked`.
+A future-effective superseding grant or directive does not erase the
+historical version applicable at shipment time.
 
 1. Select a versioned routing-rule set.
 2. Run GL Coding against the selected immutable input snapshot.
@@ -106,6 +131,9 @@ A **Markup Directive (MUD)** is the approved, effective-dated contract rule that
 6. Leave unresolved evidence unresolved when neither a rule nor an operator can support an assignment.
 7. Reprocess under a later rule version by creating superseding assignment evidence. Never rewrite the prior run.
 8. Approve or reject a completed run as a separate financial-control action. Approval snapshots every selected charge, statement, account resolution, account authorization, carrier account, shipper assignment, currency, amount, and GL output.
+9. For each exactly matched approved shipment, evaluate the effective approved
+   `actual_cost` directive. Persist `calculated`, `not_configured`, or
+   `blocked` evidence without changing checkout or quote history.
 
 Shipment matching, shipper assignment, and MUD pricing are independent:
 
@@ -113,6 +141,8 @@ Shipment matching, shipper assignment, and MUD pricing are independent:
 - An unmatched charge may still be assigned to a Circle by a versioned GL rule or a manual decision.
 - Manual or rule assignment must not falsely change the shipment match to `matched`.
 - A shipper-assignment rule identifies the responsible Circle and GL dimensions; it is not a MUD and cannot rewrite the customer-facing price.
+- MUD requires an exact current shipment match; assigning an orphan to a Circle
+  is insufficient.
 
 ## Triangle, Square, And Circle Billing
 
@@ -126,7 +156,14 @@ The economic path is:
 
 Carrier account ownership is separate. Triangle or an authorized Square may own the carrier account. Circle does not gain account ownership from delegated access.
 
-The immutable quote snapshot records expected carrier cost, account owner, path, directive versions, platform fee, reseller fees, and customer charge. The later carrier bill records actual cost. Reconciliation calculates quoted-to-actual variance without rewriting the quote.
+The immutable checkout and quote evidence records the customer-facing shipping
+charge separately from the selected checkout carrier estimate. A pre-label
+rerate records another carrier estimate without rewriting either checkout
+fact. Those comparisons remain estimated. The later exactly matched and
+approved carrier bill records actual cost. Reconciliation compares the
+customer checkout charge with carrier-billed actual without rewriting any
+earlier fact; billing-time MUD is a new append-only calculation based on that
+actual.
 
 Settlement produces append-only entries for:
 
@@ -134,15 +171,22 @@ Settlement produces append-only entries for:
 - carrier-account-owner reimbursement;
 - Triangle platform fee, including an explicit zero;
 - each Square reseller fee;
-- Circle customer charge;
+- immutable Circle checkout shipping-charge evidence and any separately
+  approved contract-billed shipping entry;
 - approved credits, rebills, disputes, reversals, and voids.
 
 For a positive billed-actual carrier charge, approval accrues the carrier-account owner's carrier payable. When the Circle and carrier-account owner are different parties, it also accrues the Circle-to-owner reimbursement. A negative billed amount creates carrier credit evidence. A zero amount remains reviewed evidence and creates no fabricated money movement.
 
-Quoted Triangle and Square fees remain tied to the immutable quote and MUD snapshots. Approving a carrier bill does not generate those quote fees again. The settlement ledger therefore separates:
+Any explicitly supported quote-time fees remain tied to their immutable quote
+evidence. The current `actual_cost` MUD is instead evaluated once at approved
+carrier billing and retains the exact effective directive provenance. The
+settlement ledger therefore separates:
 
-- pro forma carrier cost and quoted contract fees;
+- customer-facing checkout shipping charge;
+- checkout and pre-label carrier estimates plus their estimated variances;
 - billed-actual carrier payable or carrier credit;
+- billing-time MUD adjustment and contract-billed shipping amount, or explicit
+  `not_configured`;
 - Circle reimbursement to the account owner;
 - Triangle platform fee, including an explicit zero;
 - each Square reseller fee;
@@ -164,12 +208,18 @@ The settlement ledger displays the retained GL dimensions produced by the approv
 
 Before enabling real carrier billing, printing, or settlement:
 
-- apply and verify migrations `0089` through `0094` and `0097`;
+- apply and verify migrations `0089` through `0094`, `0097`, `0146`, and
+  `0147`;
 - confirm active-organization isolation and least-privilege capabilities;
 - verify provider-specific CSV parsing with retained source metadata and duplicate checksums;
 - reconcile account, tracking, label, quote, and shipment evidence;
 - prove that manual and rule assignments cannot both be current;
 - prove actual charges do not rewrite quoted charges;
+- prove replay never persists a MUD result and retains checkout and pre-label
+  carrier estimates separately;
+- prove billing-time MUD requires exact current shipment matches plus an
+  approved review and current effective `actual_cost` directive, and returns
+  `not_configured` when no directive applies;
 - enroll and health-check the local print agent;
 - prove print retries cannot repurchase labels;
 - test fallback routing and explicit reprints;

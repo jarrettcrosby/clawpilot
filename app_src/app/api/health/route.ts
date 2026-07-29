@@ -297,6 +297,8 @@ export async function GET() {
           operations_cartonization_shipment_rates_applied: boolean
           operations_cartonization_rate_constraint_repair_applied: boolean
           operations_two_pass_pack_rate_runs_applied: boolean
+          operations_pack_rate_pricing_semantics_applied: boolean
+          operations_carrier_billing_mud_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -937,6 +939,16 @@ export async function GET() {
                 FROM schema_migrations
                 WHERE filename = '0145_operations_two_pass_pack_rate_runs.sql'
               ) AS operations_two_pass_pack_rate_runs_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0146_operations_pack_rate_pricing_semantics.sql'
+              ) AS operations_pack_rate_pricing_semantics_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0147_operations_carrier_billing_mud.sql'
+              ) AS operations_carrier_billing_mud_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -1076,6 +1088,8 @@ export async function GET() {
             && row?.operations_cartonization_shipment_rates_applied
             && row?.operations_cartonization_rate_constraint_repair_applied
             && row?.operations_two_pass_pack_rate_runs_applied
+            && row?.operations_pack_rate_pricing_semantics_applied
+            && row?.operations_carrier_billing_mud_applied
             && row?.migration_checksums_present
           ),
         }
@@ -1207,6 +1221,8 @@ export async function GET() {
           || !row?.operations_cartonization_shipment_rates_applied
           || !row?.operations_cartonization_rate_constraint_repair_applied
           || !row?.operations_two_pass_pack_rate_runs_applied
+          || !row?.operations_pack_rate_pricing_semantics_applied
+          || !row?.operations_carrier_billing_mud_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')

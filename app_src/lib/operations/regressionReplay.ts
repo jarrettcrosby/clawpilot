@@ -1,5 +1,5 @@
 export const OPERATIONS_REGRESSION_REPLAY_SCHEMA_VERSION =
-  'operations-regression-replay-v1' as const
+  'operations-regression-replay-v2' as const
 
 export type OperationsRegressionStageStatus =
   | 'passed'
@@ -76,9 +76,10 @@ export type OperationsRegressionPackRateStage = {
   rateChoices: OperationsRegressionRateChoice[]
   selectedRate: OperationsRegressionRateChoice
   selectedCarrierCostMinor: number
-  customerChargeMinor: number
-  mudMarkupMinor: number
-  marginMinor: number
+  checkoutShippingChargeMinor: number
+  estimatedShippingVarianceMinor: number
+  pricingSemanticsVersion: 1 | 2
+  billingReconciliationStatus: 'pending_carrier_invoice'
   currency: string
   inputHash: string
   resultHash: string
@@ -96,7 +97,7 @@ export type OperationsRegressionMarketplaceEstimateStage = {
   runGlobalId: string
   purpose: 'checkout_quote'
   source: 'faire_checkout_estimate_captured'
-  capturedCustomerChargeMinor: number | null
+  capturedCheckoutShippingChargeMinor: number | null
   currency: string
   inputHash: string
   resultHash: string
@@ -128,10 +129,11 @@ export type OperationsRegressionVarianceStage = {
   changed: boolean
   packageCountDelta: number
   checkoutCarrierCostMinor: number
-  checkoutCustomerChargeMinor: number
+  checkoutShippingChargeMinor: number
   fulfillmentCarrierCostMinor: number
-  carrierCostVarianceMinor: number
-  realizedMarginMinor: number
+  preLabelRateVarianceMinor: number
+  estimatedShippingVarianceMinor: number
+  billingReconciliationStatus: 'pending_carrier_invoice'
   currency: string
   allocationChanged: boolean
   materialChanged: boolean

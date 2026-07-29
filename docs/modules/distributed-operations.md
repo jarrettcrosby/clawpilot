@@ -15,12 +15,18 @@ app_visible: false
 
 Provide native distributed order management, warehouse execution, carrier shipping, and 3PL billing inside ClawPilot. The module serves 3PL operators, retailers, distributors, manufacturers, and fulfillment operators without creating a second application or duplicating CRM, product, identity, audit, task, document, notification, or accounting masters.
 
-This document remains the **target contract** for the full module. The current development slice includes operations migrations `0081` through `0094`, `0097` through `0101`, and `0107` through `0145`; a tenant-scoped order workbench; explicit idempotent warehouse-release, bulk all-ready pick-confirmation, pack-verification, sandbox-label-create, and sandbox-label-void commands for eligible non-archived orders; a durable exception queue; scoped activation controls; canonical CRM catalog projection; provider-customer resolution; team-managed product/package imports; warehouse-scoped Packaging Materials management; organization-scoped direct carrier credential administration; UPS and FedEx sandbox rating with an account-derived origin and editable test destination; a separate rate-selected diagnostic label-create with customer-selected provider-native output, stored-label download/print, and void workflow; immutable provider-source bytes plus an explicit derivative-artifact provenance boundary; append-only redacted provider evidence; carrier-rate delegation; direct multi-account carrier CSV import; selected-batch GL Coding; separate financial review; billed-actual Triangle/Square/Circle settlement evidence; append-only settlement status transitions; capability-aware printer configuration; enrolled local print-agent delivery with controlled reprints, same-warehouse fallback, and agent-declared format/media/document capabilities; shipment- and exact-package-specific PDF packing-list renderers, immutable artifact-payload store, authenticated artifact stream, tracking-observation schema, and commerce-fulfillment export state model; a Shopify/Faire sales-channel control plane; a bounded development-only Shopify held-order preview; leased development-only full-product-catalog reconciliation and current-order staging workers; guarded development-only product-catalog mapping and operational-order workflows with durable pre-call read intents, resource-scoped encrypted continuations, first-class rejection dispositions, and canonical promotion; a bounded, manager-triggered, read-only Shopify inventory reconciliation for one eligible location and warehouse; a strict development-only Shopify cartonization preview; a recipe-first, assumption-watermarked sandbox package-and-rate evidence workflow; an executable development-only two-pass pack-and-rate replay workbench; and active-workspace measurement-presentation and product-currency defaults. The deterministic mock flow remains an internal automated-test harness only. Hosted mock generation is disabled and historical mock artifacts are archived. These features prove PostgreSQL authority and application boundaries; they do not establish historical closed-order commerce import, continuous or production provider inventory synchronization, production commerce workers, production carrier mutation, tracking ingestion, commerce-export dispatch, pickup scheduling, accounting export, invoice/AR workflow, payment adapters, or production fulfillment-optimizer activation.
+This document remains the **target contract** for the full module. The current development slice includes operations migrations `0081` through `0094`, `0097` through `0101`, and `0107` through `0147`; a tenant-scoped order workbench; explicit idempotent warehouse-release, bulk all-ready pick-confirmation, pack-verification, sandbox-label-create, and sandbox-label-void commands for eligible non-archived orders; a durable exception queue; scoped activation controls; canonical CRM catalog projection; provider-customer resolution; team-managed product/package imports; warehouse-scoped Packaging Materials management; organization-scoped direct carrier credential administration; UPS and FedEx sandbox rating with an account-derived origin and editable test destination; a separate rate-selected diagnostic label-create with customer-selected provider-native output, stored-label download/print, and void workflow; immutable provider-source bytes plus an explicit derivative-artifact provenance boundary; append-only redacted provider evidence; carrier-rate delegation; direct multi-account carrier CSV import; selected-batch GL Coding; separate financial review; billed-actual Triangle/Square/Circle settlement evidence; append-only settlement status transitions; capability-aware printer configuration; enrolled local print-agent delivery with controlled reprints, same-warehouse fallback, and agent-declared format/media/document capabilities; shipment- and exact-package-specific PDF packing-list renderers, immutable artifact-payload store, authenticated artifact stream, tracking-observation schema, and commerce-fulfillment export state model; a Shopify/Faire sales-channel control plane; a bounded development-only Shopify held-order preview; leased development-only full-product-catalog reconciliation and current-order staging workers; guarded development-only product-catalog mapping and operational-order workflows with durable pre-call read intents, resource-scoped encrypted continuations, first-class rejection dispositions, and canonical promotion; a bounded, manager-triggered, read-only Shopify inventory reconciliation for one eligible location and warehouse; a strict development-only Shopify cartonization preview; a recipe-first, assumption-watermarked sandbox package-and-rate evidence workflow; an executable development-only two-pass pack-and-rate replay workbench; and active-workspace measurement-presentation and product-currency defaults. The deterministic mock flow remains an internal automated-test harness only. Hosted mock generation is disabled and historical mock artifacts are archived. These features prove PostgreSQL authority and application boundaries; they do not establish historical closed-order commerce import, continuous or production provider inventory synchronization, production commerce workers, production carrier mutation, tracking ingestion, commerce-export dispatch, pickup scheduling, accounting export, invoice/AR workflow, payment adapters, or production fulfillment-optimizer activation.
 
 Migrations `0128` through `0145` extend this slice with the pack hierarchy,
 CRM CSV transfer evidence, durable sales-channel lifecycle and offer
 projection, guarded canonical Product identity reconciliation, and
 database-enforced packaging-dimension evidence described below.
+Additive migrations `0146` and `0147` correct the development pricing
+vocabulary and add append-only billing-time MUD evidence. They preserve legacy
+replay rows, require new replay rows to keep MUD empty, and allow a MUD result
+only after imported carrier-billing evidence has an approved exact shipment
+match and an applicable approved `actual_cost` directive. These migrations are
+development evidence, not production billing activation.
 
 Migration `0126` is the bounded, owner-safe data correction that renames only
 the exact original imperial-named `starter_assortment` records to unit-neutral
@@ -55,7 +61,7 @@ The implemented slice provides:
 - a strict sandbox boundary: Settings diagnostics and order-bound label create/void can never create an `operations_shipments` row, mark an order shipped, consume or release inventory, append a tracking observation, create a commerce-fulfillment export, or render a packing slip; the Settings diagnostic additionally creates no order, package, or fulfillment-plan record;
 - working-tree shipment-completion evidence contracts in `0099`: immutable packing-slip payloads, append-only `gto` tracking observations, and durable `gfe` commerce-fulfillment export intents with explicit `queued`, `processing`, `succeeded`, `failed`, and `unsupported` states;
 - deterministic PDF packing-list renderers with content hash, byte length, safe filename, template version, and immutable render snapshot; an exact package renderer whose durable package-content rows allocate every order-line quantity to one physical package, paginate without line truncation, and support package-specific generate, download, and print without a carrier call; organization-scoped authenticated exact-byte ZPL/PDF/PNG artifact download with safe MIME/extension, SHA-256 validation, and ETag; and local print-agent claims that preserve label text as `utf8` while encoding binary artifacts as `base64`;
-- explicit Triangle, optional Square, and Circle rate-path evidence; address-bound multi-account carrier identities; pro forma quote economics with immutable Markup Directive (MUD) snapshots; direct checksum-bound carrier CSV import; selected-batch shipment GL Coding; versioned shipper-assignment rules; independent shipment matches and shipper assignments; manual orphan assignment; separate run approval; billed-actual reimbursement and payable entries; disputes; references; and append-only settlement transitions;
+- explicit Triangle, optional Square, and Circle rate-path evidence; address-bound multi-account carrier identities; immutable customer-facing checkout shipping-charge evidence kept separate from checkout and pre-label carrier estimates; direct checksum-bound carrier CSV import; selected-batch shipment GL Coding; versioned shipper-assignment rules; independent shipment matches and shipper assignments; manual orphan assignment; separate run approval; exact matched carrier-billed actuals; billing-time MUD evaluation only for an effective approved `actual_cost` directive with immutable provenance, with explicit `not_configured` evidence otherwise; billed-actual reimbursement and payable entries; disputes; references; and append-only settlement transitions;
 - organization- and warehouse-scoped thermal and nonthermal printer profiles with connection mode, supported formats, supported media, supported document types, document defaults, priority, status, same-warehouse fallback selection, enrolled local print agents, fenced claims, bounded retries, and reasoned reprints; a printer bound to an agent must be a subset of that agent's explicit capabilities, and each claim repeats the runtime capabilities so a mismatched worker fails before receiving bytes; browser delivery remains best effort;
 - a print-job operator drill-down with source order, shipment, carrier label, tracking, destination, package measurements, warehouse/station/printer routing, artifact integrity, authenticated exact-artifact download, retry and reprint lineage, safe failure evidence, and every agent/device delivery attempt; live agent heartbeat is reported separately from the printer's last acknowledged document handoff;
 - durable command receipts that bind idempotency key, request hash, actor, correlation, status, exact result payload, attempts, and safe failure evidence;
@@ -66,10 +72,10 @@ The implemented slice provides:
 - a feature-gated, manager-triggered Shopify inventory reconciliation for a configured and verified account with `read_inventory`, `read_locations`, and `read_products`: it durably prepares the provider read, captures the bounded complete response before applying it, maps one eligible Shopify location to the workspace's one active warehouse and selected reserve/storage location, retains all eight requested Shopify quantity states and operational product facts, projects only exact product mappings into Shopify-authoritative Operations balances, and performs no provider write, order mutation, shipment creation, or fulfillment export;
 - a manager-triggered, development-only Shopify cartonization preview that requires the exact current order-candidate revision, one active warehouse, account-bound inventory evidence captured from Shopify within 24 hours, exact product mappings and package measurements, explicit per-line committed-quantity assumptions, and one to eight active, priced, positively stocked packaging materials; inventory-run completion remains separate evidence and cannot make a replayed stale provider capture fresh; it calls only the authenticated OR-Tools service, uses fixed-axis conservative fit, excludes transport and handling costs, and returns a point-in-time in-memory fit/material recommendation with explicit zero database, provider, rate, label, and shipment writes; product-level committed attribution is displayed once and remains ineligible while more than one current inventory position exists; each optimizer package is surfaced as one planned shipment, but the preview cannot accept or persist that split, allocate durable package contents, or generate the future shipment-partitioned packing documents; Faire remains blocked until account-bound inventory reconciliation exists;
 - a canonical **Operations > Commerce imports** submodule at `#operations/imports`, also available from the collapsed-navigation flyout, that selects a configured and verified active-workspace Shopify/Faire account and opens the same Overview/Products/Orders/Issues workbench as the compact Settings launcher; product decision CSV is account/candidate/row-version fenced, while order and issue exports are sanitized and no CSV order import or provider-write path exists;
-- a canonical **Operations > Pack & rate replay** submodule at `#operations/replays` that lets a manager execute and reload sanitized historical scenarios across checkout quote, post-intake CRM resolution, fulfillment rerun, quoted-to-actual variance, recorded label finalization, and tracking-gated package documents. It retains immutable checkout and fulfillment runs, exact line-to-package quantity conservation, all bounded recorded UPS/FedEx whole-shipment choices, one selected service for the complete package set, customer charge and MUD economics, and zero provider, postage, label, inventory, order, or commerce writes. A successful fulfillment run may remain pre-label; finalized replay packages use recorded tracking facts and create one real immutable, downloadable PDF packing-slip artifact whose bytes and render snapshot are database-bound to that package's exact allocation. Shopify scenarios replay a recorded callback fixture without making a live callback, while Faire scenarios begin from a captured marketplace checkout estimate and never claim that Faire called ClawPilot;
+- a canonical **Operations > Pack & rate replay** submodule at `#operations/replays` that lets a manager execute and reload sanitized historical scenarios across checkout quote, post-intake CRM resolution, fulfillment rerun, checkout-to-pre-label estimated variance, recorded label finalization, and tracking-gated package documents. It retains immutable checkout and fulfillment runs, exact line-to-package quantity conservation, all bounded recorded UPS/FedEx whole-shipment choices, one selected service for the complete package set, the unchanged checkout shipping charge, the separate checkout and pre-label carrier estimates, their signed estimated variances, and zero provider, postage, label, inventory, order, or commerce writes. It never calls an estimated replay delta a MUD and cannot establish carrier-billed actual cost. A successful fulfillment run may remain pre-label; finalized replay packages use recorded tracking facts and create one real immutable, downloadable PDF packing-slip artifact whose bytes and render snapshot are database-bound to that package's exact allocation. Shopify scenarios replay a recorded callback fixture without making a live callback, while Faire scenarios begin from a captured marketplace checkout shipping estimate and never claim that Faire called ClawPilot;
 - a reusable progressive-disclosure setup journey across Commerce, carrier, Google Workspace, QuickBooks, Toast, and Maton Settings panels, with provider-specific ordered steps and copyable nonsecret operational facts derived only from each panel's existing organization-scoped state;
 - a Faire External API v2 brand client for the fixed production origin, brand/product/order and selector-based inventory reads plus documented processing/cancellation/availability/shipment request translations; Faire is explicitly recorded as production-only and polling-only, with no public webhook, sandbox, retailer custom API, or return-write claim;
-- responsive Orders and Exceptions views with permanent `gor` and `gex` identities, plus stable hash-addressed, horizontally scrollable Orders, Exceptions, Commerce imports, Receiving, Warehouses, Packaging materials, Carrier invoicing, Shipment pricing & GL, and Printing subpanel navigation with touch panning and accessible edge scroll controls on narrow screens; the expanded left-navigation Operations submenu and collapsed flyout expose that same complete submodule set without changing existing permission boundaries. Packaging materials owns organization-scoped cartons, poly mailers, padded mailers, dimensions, tare and maximum weights, unit cost, draft/active state, and per-existing-warehouse availability/on-hand/reorder facts. Its six-item starter assortment is draft-only and cannot become optimizer-eligible until real costs and positive available stock are recorded. Carrier invoicing owns immutable source-file and actual-cost evidence. Shipment pricing & GL owns shipment-to-shipper assignment, retained MUD-price review, variance and settlement review, and GL outputs; shipper-assignment rules do not replace or mutate the independently versioned MUD;
+- responsive Orders and Exceptions views with permanent `gor` and `gex` identities, plus stable hash-addressed, horizontally scrollable Orders, Exceptions, Commerce imports, Receiving, Warehouses, Packaging materials, Carrier invoicing, Shipment pricing & GL, and Printing subpanel navigation with touch panning and accessible edge scroll controls on narrow screens; the expanded left-navigation Operations submenu and collapsed flyout expose that same complete submodule set without changing existing permission boundaries. Packaging materials owns organization-scoped cartons, poly mailers, padded mailers, dimensions, tare and maximum weights, unit cost, draft/active state, and per-existing-warehouse availability/on-hand/reorder facts. Its six-item starter assortment is draft-only and cannot become optimizer-eligible until real costs and positive available stock are recorded. Carrier invoicing owns immutable source-file evidence; carrier-billed actual exists only after its charges are exactly matched and the GL review is approved. Shipment pricing & GL owns shipment-to-shipper assignment, the separate checkout-charge and carrier-estimate comparisons, approved billing-time MUD calculations, variance and settlement review, and GL outputs; shipper-assignment rules do not replace or mutate an independently versioned MUD directive;
 - incomplete customer-supplied packaging-material drafts that retain only the supplied dimensions, explicit inner/outer/unconfirmed basis, evidence type/reference, and source while leaving unknown depth, tare, maximum weight, cost, currency, and stock null; activation fails closed until verified usable inner dimensions and every operating fact are present. A separate trusted-development, plan-first AG Alchemy command stages the four customer-supplied material drafts and six explicit provider sell-unit pack classes only after an administrator supplies exact `gp` Product Global IDs and an explicit active owner/admin actor. It verifies the Railway environment name and database identity, binds apply to the exact fresh plan fingerprint, projects every assigned Product's current exact channel state to the class's default pack version with retained provider source revision/hash, and fails if that provider evidence is absent. Its title/SKU suggestions are discovery aids only. Guarded apply may replace the six exact untouched or legacy-equivalent synthetic starter drafts and their empty stock placeholders, but fails on partial, active, edited, referenced, or otherwise conflicting starter state. It never activates a material, profile, relationship, or recipe or infers intact-case inventory;
 - audited exception transitions for acknowledge, resolve, dismiss, and reopen, with tenant isolation and retained resolution history;
 - an in-module guide that directs carrier sandbox testing to **Settings > Integrations > Shipping** and identifies deterministic mocks as automated-test-only;
@@ -336,9 +342,38 @@ Shopify quote-to-canonical-order reconciliation, a production checkout
 callback, live carrier pricing, label purchase, or a Faire checkout callback.
 Those remain separate activation gates.
 
+Migration `0146` is an additive correction to that development replay
+boundary. Existing version-1 rows remain immutable legacy fixture evidence.
+New version-2 rows preserve the checkout shipping charge through fulfillment,
+record the checkout carrier estimate and pre-label carrier estimate as
+different facts, and store their signed differences only as **estimated
+variance**. Version-2 replay rows require `mud_markup_minor` to remain null:
+neither estimate is a carrier invoice, realized margin, or a MUD calculation.
+
+Migration `0147` adds the separate append-only carrier-billing MUD boundary.
+Carrier-billed actual exists only after an imported CSV statement and all
+included charges are retained, exactly and currently matched to one shipment,
+assigned to the exact shipper, and included in an approved GL Coding review.
+Only then may ClawPilot calculate MUD from an approved, effective,
+currency-matched, current directive whose calculation basis is `actual_cost`.
+For this slice, current means the terminal applicable version as of the
+shipment timestamp, not the newest version created later. Exactly one direct
+grant to the assigned shipper may contribute applicable actual-cost
+directives; grants without such a directive do not create ambiguity, while
+multiple eligible direct grants fail closed as `blocked`.
+The calculation retains the statement lineage, exact charge set, quote,
+account authorization, grant, contract and directive versions, calculation
+snapshot, input hash, and actor. When no such directive applies, the durable
+result is `not_configured`, not zero and not an inferred replay markup.
+Ambiguous or invalid evidence remains `blocked`. A checkout shipping charge is
+classified as customer-paid only when complete paid canonical commerce
+evidence can allocate it to exactly one nonvoid shipment; otherwise its
+unavailable, not-captured, or multi-shipment state remains explicit.
+
 `npm run test:operations-regression-postgres` is the rollback-only database
 acceptance for this boundary. Against an explicitly supplied development
-Postgres URL, it applies `0145` transactionally, proves valid two-pass,
+Postgres URL, it applies `0145` and additive correction `0146`
+transactionally, proves valid two-pass,
 multi-package, one-service, variance, and tracked-document evidence, asserts
 the lineage, quantity, append-only, and document mismatch rejections, then
 rolls back and confirms from a second connection that no replay, CRM fixture,
@@ -531,13 +566,13 @@ The route handler authenticates and validates transport. The application service
 | --- | --- | --- | --- |
 | Order intake | Canonical order snapshot, source identifiers, validation, holds, edits, cancellations | CRM customer/product IDs, contract version, `order.*` events | CRM customer master, provider order record |
 | Inventory | Pools, eligibility, physical positions, reservations, immutable ledger, reconciled balances | CRM product and inventory-owner IDs, `inventory.*` events | Product master, provider inventory counter |
-| Promise and fulfillment | Promise explanation, candidate plans, selected plan, allocations, overrides, variance | Inventory, facilities, package/rate snapshots, contract policies | Inventory ledger or carrier transaction |
+| Promise and fulfillment | Promise explanation, candidate plans, selected plan, allocations, overrides, estimated variance | Inventory, facilities, package/rate snapshots, contract policies | Inventory ledger, carrier transaction, or carrier-billed actual |
 | Warehouse execution | Waves, pick tasks, scans, short-pick decisions, packs, station work | Plans, locations, Tasks for exception work | Generic project/task lifecycle |
 | Shipping | Carrier rates, package facts, label attempts, labels, print jobs, shipments, tracking observations | Carrier account, documents, `shipment.*` events | Carrier account master or printer transport |
 | Contracts and 3PL billing | Native contract versions, pricing directives, estimated/accrued/final billable facts, credits | CRM customer, operational source, accounting export | CRM customer master, accounting ledger, invoice provider |
 | Exceptions | Operations exception status, severity, source, recommendation, resolution evidence | Projects task link and future Case link | Project task or CRM Case data |
 | Integration control | Operations account metadata, capability/version, external IDs, cursors, receipts, attempts, health | Secret reference and adapter outbox | Plaintext credentials |
-| Reporting | Tenant-scoped order, inventory, service, cost, margin, and exception projections | Immutable facts and versioned snapshots | Source-of-truth mutations |
+| Reporting | Tenant-scoped order, inventory, service, estimated and realized cost/margin, and exception projections | Immutable estimate and approved billing facts plus versioned snapshots | Source-of-truth mutations |
 
 ## Identity, Units, And Time
 
@@ -748,7 +783,13 @@ stateDiagram-v2
   delivered --> [*]
 ```
 
-A package edit before confirmation creates a new package version, voids or supersedes any unshipped label through an idempotent carrier command, re-cartonizes as needed, re-rates, and recalculates estimated charge and margin. A provider timeout produces an unknown outcome until reconciliation proves whether a label exists; retrying with the same provider idempotency key cannot purchase a second label.
+A package edit before confirmation creates a new package version, voids or
+supersedes any unshipped label through an idempotent carrier command,
+re-cartonizes as needed, and records a new pre-label carrier estimate plus
+signed estimated variance without changing the checkout shipping charge. It
+does not create carrier-billed actual or MUD. A provider timeout produces an
+unknown outcome until reconciliation proves whether a label exists; retrying
+with the same provider idempotency key cannot purchase a second label.
 
 ## Event Contract
 
@@ -778,7 +819,7 @@ Event payloads use allowlisted, versioned schemas and Global IDs. They exclude c
 | --- | --- | --- |
 | Order | `order.imported`, `order.validated`, `order.held`, `order.released`, `order.cancelled` | Workbench projection, exception policy, commerce export |
 | Promise and inventory | `promise.calculated`, `inventory.reserved`, `inventory.reservation_failed`, `inventory.released`, `inventory.reconciled` | Availability projection, plan service, alerts |
-| Allocation and plan | `allocation.completed`, `allocation.failed`, `fulfillment.plan_selected`, `fulfillment.plan_overridden` | Warehouse release, margin variance, audit |
+| Allocation and plan | `allocation.completed`, `allocation.failed`, `fulfillment.plan_selected`, `fulfillment.plan_overridden` | Warehouse release, estimated cost variance, audit |
 | Warehouse | `wave.created`, `wave.released`, `pick.started`, `pick.completed`, `pick.short` | Work queues, billable facts, exceptions |
 | Package and shipping | `package.cartonized`, `package.repacked`, `shipment.rated`, `label.created`, `label.voided`, `shipment.dispatched`, `tracking.updated` | Print, carrier reconciliation, commerce export, customer view |
 | Billing and exception | `billable_event.created`, `charge.calculated`, `invoice.ready`, `exception.created`, `exception.resolved`, `print_job.failed` | Billing projection, Tasks bridge, notifications, operations health |
@@ -930,12 +971,17 @@ Hard constraints are filters, not weighted preferences. Feasible plans are ranke
 3. Minimizes warehouse count, preferring one warehouse whenever feasible.
 4. Minimizes shipment and carton count.
 5. Minimizes total fulfillment cost in minor units.
-6. Maximizes contribution margin in minor units.
+6. Maximizes projected contribution margin in minor units using only the
+   immutable checkout charge and supplied carrier-cost estimate.
 7. Balances versioned capacity utilization.
 8. Applies inventory aging and customer preferences.
 9. Breaks any remaining tie by warehouse Global ID, carrier/service code, position Global ID, and package-plan Global ID.
 
-Margin can never compensate for a missed promise or hard-constraint violation. An authorized manual exception creates a new plan version with actor, reason, previous and new plans, violated constraint, financial effect, and audit/event evidence.
+Projected margin can never compensate for a missed promise or hard-constraint
+violation, and it is not carrier-billed actual or MUD. An authorized manual
+exception creates a new plan version with actor, reason, previous and new
+plans, violated constraint, estimated financial effect, and audit/event
+evidence.
 
 ## Deterministic Fallback
 
@@ -947,7 +993,10 @@ The fallback is a pure, versioned function. The same canonical input and fallbac
 4. If no single warehouse is feasible and split fulfillment is forbidden, return `infeasible` with explicit rejected constraints and create the configured exception.
 5. If split fulfillment is explicitly allowed, sort order lines by fewest eligible warehouses, then product Global ID and line Global ID. Assign each line to the feasible warehouse that adds the least promise-safe cost, preferring a warehouse already used; break ties by warehouse Global ID. Stop if the plan exceeds `maxWarehouses`.
 6. Re-cartonize and re-rate the complete proposed split. Reject it if any shipment misses the promise or violates a hard constraint.
-7. Return `feasible` with `method=deterministic_fallback`, algorithm version, solver timeout/error reason, input hash, selected plan, costs, revenue, margin, constraint evidence, and rejected alternatives.
+7. Return `feasible` with `method=deterministic_fallback`, algorithm version,
+   solver timeout/error reason, input hash, selected plan, estimated costs,
+   checkout revenue, projected margin, constraint evidence, and rejected
+   alternatives.
 
 Fallback must not use current time, random values, unordered map iteration, provider calls, or database reads that are absent from the input snapshot. Missing required dimensions follows a versioned conservative package profile or returns manual review; it never silently invents a favorable estimate.
 
@@ -991,7 +1040,12 @@ The adapter reads approved immutable billable facts and credits, produces a vers
 - Migration and operations feature activation state appear in `/api/health`.
 - Queue health exposes pending, failed, dead, stale-processing, oldest due age, throughput, and last success by target.
 - Adapter health exposes verified account, environment, capability version, webhook/reconciliation cursor, last success, safe error code, and circuit state.
-- Metrics cover import latency/deduplication, reservation conflicts, ledger drift, promise attainment, optimizer duration/fallback, split rate, pick/pack performance, carrier/label outcomes, printer failures, shipment exceptions, unbilled facts, and quoted-to-actual margin variance.
+- Metrics cover import latency/deduplication, reservation conflicts, ledger
+  drift, promise attainment, optimizer duration/fallback, split rate, pick/pack
+  performance, carrier/label outcomes, printer failures, shipment exceptions,
+  unbilled facts, checkout-to-estimate variance, and, only after exact approved
+  carrier billing, checkout-to-carrier-actual and
+  checkout-to-contract-bill variance.
 - A scheduled ledger reconciliation compares every materialized bucket to immutable ledger deltas. Any nonzero drift is critical, freezes affected inventory commands, and follows the [runbook](../operations/distributed-operations-runbook.md).
 - Commerce, carrier, tracking, print, and accounting reconciliation detect missed or ambiguous external outcomes without blindly repeating side effects.
 - Shipment-completion reconciliation compares each confirmed shipment with its inventory-consumption evidence, packing-slip artifact and payload, first `confirmed` tracking observation, and commerce export state. Missing `0099` evidence is expected for the legacy mock path and for sandbox labels because neither uses the production completion bundle.

@@ -83,7 +83,7 @@ assert.match(
 
 assert.match(
   shopifyIntake,
-  /product_status:ACTIVE,ARCHIVED,DRAFT,UNLISTED/,
+  /product_status:active,archived,draft,unlisted/,
   'Shopify catalog intake must explicitly include every product lifecycle',
 )
 assert.match(

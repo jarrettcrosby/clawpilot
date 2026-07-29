@@ -1560,6 +1560,8 @@ assertIncludes(healthRoute, '0142_operations_cartonization_evidence_scale.sql', 
 assertIncludes(healthRoute, '0143_operations_cartonization_shipment_rates.sql', 'hosted cartonization shipment-rate migration health')
 assertIncludes(healthRoute, '0144_operations_cartonization_shipment_rate_constraint_repair.sql', 'hosted cartonization shipment-rate constraint repair migration health')
 assertIncludes(healthRoute, '0145_operations_two_pass_pack_rate_runs.sql', 'hosted two-pass pack-rate replay migration health')
+assertIncludes(healthRoute, '0146_operations_pack_rate_pricing_semantics.sql', 'hosted corrected pack-rate pricing semantics migration health')
+assertIncludes(healthRoute, '0147_operations_carrier_billing_mud.sql', 'hosted carrier-billing MUD migration health')
 for (const [, alias] of healthRoute.matchAll(/\)\s+AS\s+([a-z0-9_]+)\s*,?/gi)) {
   assert.ok(
     alias.length <= 63,

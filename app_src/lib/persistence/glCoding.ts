@@ -1,10 +1,12 @@
 import type { PoolClient, QueryResult, QueryResultRow } from 'pg'
 import { recordAuditEvent } from '@/lib/auditWriter'
 import {
+  calculateBillingMud,
   glCodingChecksum,
   normalizeCarrierTrackingNumber,
   selectGlCodingRule,
   validateGlCodingConditions,
+  type BillingMudDirective,
   type GlCodingChargeFacts,
   type GlCodingRuleConditions,
   type GlCodingRuleSnapshot,
@@ -172,6 +174,28 @@ type ReviewableRunItemRow = QueryResultRow & {
   account_owner_party_name: string
   executing_organization_id: string
   coding_outputs: unknown
+  billing_match_id: string | null
+  billing_match_global_id: string | null
+  match_executing_organization_id: string | null
+  shipment_id: string | null
+  shipment_global_id: string | null
+  shipment_order_id: string | null
+  shipment_shipped_at: Date | null
+  quote_snapshot_id: string | null
+  quote_snapshot_global_id: string | null
+  order_global_id: string | null
+  contract_version_id: string | null
+  contract_version_global_id: string | null
+  contract_version_number: number | null
+  statement_version_number: number
+  statement_lineage_key: string
+  commerce_order_candidate_id: string | null
+  commerce_order_candidate_global_id: string | null
+  candidate_currency: string | null
+  candidate_shipping_minor: string | null
+  candidate_payment_status: string | null
+  candidate_header_money_state: string | null
+  active_shipment_count: string | null
 }
 
 type ExistingReviewRow = QueryResultRow & {
@@ -208,6 +232,47 @@ type SettlementRow = QueryResultRow & {
   latest_event_details: unknown
   latest_event_actor: string | null
   latest_event_at: Date | null
+}
+
+type BillingMudDirectiveRow = QueryResultRow & {
+  grant_id: string
+  grant_global_id: string
+  directive_id: string
+  directive_global_id: string
+  directive_version: number
+  directive_priority: number
+  directive_type: BillingMudDirective['type']
+  amount_minor: string | null
+  basis_points: number | null
+  approved_by: string
+}
+
+type BillingMudWorkspaceRow = QueryResultRow & {
+  global_id: string
+  status: 'not_configured' | 'calculated' | 'blocked'
+  blocker_code: string | null
+  statement_global_id: string
+  billing_statement_version: number
+  shipment_global_id: string
+  order_global_id: string
+  shipper_global_id: string
+  shipper_name: string
+  quote_snapshot_global_id: string
+  contract_version_global_id: string | null
+  contract_version_number: number | null
+  commerce_order_candidate_global_id: string | null
+  currency: string
+  checkout_charge_status: string
+  customer_paid_checkout_shipping_minor: string | null
+  carrier_billed_actual_minor: string
+  mud_adjustment_minor: string | null
+  contract_billed_shipping_minor: string | null
+  checkout_to_carrier_actual_variance_minor: string | null
+  checkout_to_contract_bill_variance_minor: string | null
+  charge_count: number
+  directive_snapshot: unknown
+  calculation_snapshot: unknown
+  created_at: Date
 }
 
 export class GlCodingRequestError extends Error {
@@ -828,6 +893,446 @@ async function existingRun(
   return result.rows[0] || null
 }
 
+type ApprovedBillingMudEvidence = {
+  reviewItemId: string
+  item: ReviewableRunItemRow
+}
+
+async function persistApprovedBillingMudCalculations(
+  client: PoolClient,
+  input: {
+    networkId: string
+    reviewId: string
+    reviewGlobalId: string
+    actorEmail: string
+    evidence: ApprovedBillingMudEvidence[]
+  },
+): Promise<number> {
+  const groups = new Map<string, ApprovedBillingMudEvidence[]>()
+  for (const evidence of input.evidence) {
+    const item = evidence.item
+    // An assigned GL row is not enough. Billing-time MUD requires the exact
+    // current carrier-bill-to-shipment match and quote lineage.
+    if (
+      !item.billing_match_id
+      || !item.shipment_id
+      || !item.shipment_order_id
+      || !item.shipment_shipped_at
+      || !item.quote_snapshot_id
+      || !item.match_executing_organization_id
+    ) {
+      continue
+    }
+    const key = [
+      item.statement_lineage_key,
+      item.statement_version_number,
+      item.shipment_id,
+      item.currency,
+    ].join(':')
+    const group = groups.get(key) || []
+    group.push(evidence)
+    groups.set(key, group)
+  }
+
+  let calculationCount = 0
+  for (const evidenceGroup of groups.values()) {
+    const first = evidenceGroup[0].item
+    const shipmentShippedAt = first.shipment_shipped_at
+    if (
+      !first.shipment_id
+      || !first.shipment_order_id
+      || !first.quote_snapshot_id
+      || !first.match_executing_organization_id
+      || !shipmentShippedAt
+    ) {
+      continue
+    }
+    const evidenceIsConsistent = evidenceGroup.every(({ item }) => (
+      item.statement_id === first.statement_id
+      && item.shipment_id === first.shipment_id
+      && item.shipment_order_id === first.shipment_order_id
+      && item.quote_snapshot_id === first.quote_snapshot_id
+      && item.account_authorization_id === first.account_authorization_id
+      && item.carrier_account_id === first.carrier_account_id
+      && item.shipper_party_id === first.shipper_party_id
+      && item.match_executing_organization_id
+        === first.match_executing_organization_id
+    ))
+    if (!evidenceIsConsistent) {
+      // Conflicting exact-match evidence cannot be represented as one
+      // shipment calculation and must be resolved before any MUD is persisted.
+      continue
+    }
+
+    const carrierBilledActualMinor = evidenceGroup.reduce(
+      (sum, { item }) => sum + BigInt(item.amount_minor),
+      BigInt(0),
+    )
+    let checkoutChargeStatus:
+      | 'customer_paid'
+      | 'not_captured'
+      | 'unallocated_multi_shipment'
+      | 'unavailable' = 'unavailable'
+    let commerceOrderCandidateId: string | null = null
+    let customerPaidCheckoutShippingMinor: bigint | null = null
+    const candidateCurrencyMatches = (
+      first.commerce_order_candidate_id
+      && first.candidate_currency === first.currency
+    )
+    if (candidateCurrencyMatches) {
+      commerceOrderCandidateId = first.commerce_order_candidate_id
+      if (
+        first.candidate_header_money_state === 'complete'
+        && first.candidate_payment_status === 'paid'
+        && first.candidate_shipping_minor !== null
+      ) {
+        const shipmentCount = Number(first.active_shipment_count || 0)
+        if (shipmentCount === 1) {
+          checkoutChargeStatus = 'customer_paid'
+          customerPaidCheckoutShippingMinor = BigInt(
+            first.candidate_shipping_minor,
+          )
+        } else if (shipmentCount > 1) {
+          checkoutChargeStatus = 'unallocated_multi_shipment'
+        } else {
+          checkoutChargeStatus = 'unavailable'
+          commerceOrderCandidateId = null
+        }
+      } else {
+        checkoutChargeStatus = 'not_captured'
+      }
+    }
+
+    let status: 'not_configured' | 'calculated' | 'blocked'
+      = 'not_configured'
+    let blockerCode: string | null = null
+    let mudAdjustmentMinor: bigint | null = null
+    let contractBilledShippingMinor: bigint | null = null
+    let directiveRows: BillingMudDirectiveRow[] = []
+    let directiveSnapshot: Array<Record<string, unknown>> = []
+    let directiveCandidateSnapshot: Array<Record<string, unknown>> = []
+    let configurationReason = first.contract_version_id
+      ? 'MUD_ACTUAL_COST_DIRECTIVE_NOT_CONFIGURED'
+      : 'MUD_CONTRACT_NOT_CONFIGURED'
+
+    if (first.contract_version_id) {
+      const applicable = await client.query<BillingMudDirectiveRow>(
+        `SELECT rate_grant.id::text AS grant_id,
+                rate_grant.global_id AS grant_global_id,
+                directive.id::text AS directive_id,
+                directive.global_id AS directive_global_id,
+                directive.version_number AS directive_version,
+                directive.priority AS directive_priority,
+                directive.directive_type,
+                directive.amount_minor::text,
+                directive.basis_points,
+                directive.approved_by
+           FROM operations_carrier_rate_grants rate_grant
+           JOIN operations_carrier_rate_directives directive
+             ON directive.network_id = rate_grant.network_id
+            AND directive.grant_id = rate_grant.id
+            AND directive.calculation_basis = 'actual_cost'
+            AND directive.currency = $4
+            AND directive.contract_version_id = $5::uuid
+            AND directive.status = 'active'
+            AND directive.approved_by IS NOT NULL
+            AND directive.effective_from <= $6::timestamptz
+            AND (
+              directive.effective_to IS NULL
+              OR directive.effective_to > $6::timestamptz
+            )
+            AND NOT EXISTS (
+              SELECT 1
+                FROM operations_carrier_rate_directives child
+               WHERE child.network_id = directive.network_id
+                 AND child.supersedes_directive_id = directive.id
+                 AND child.status = 'active'
+                 AND child.effective_from <= $6::timestamptz
+                 AND (
+                   child.effective_to IS NULL
+                   OR child.effective_to > $6::timestamptz
+                 )
+            )
+          WHERE rate_grant.network_id = $1::uuid
+            AND rate_grant.account_authorization_id = $2::uuid
+            AND rate_grant.grantee_party_id = $3::uuid
+            AND rate_grant.status = 'active'
+            AND rate_grant.allow_rating = true
+            AND rate_grant.effective_from <= $6::timestamptz
+            AND (
+              rate_grant.effective_to IS NULL
+              OR rate_grant.effective_to > $6::timestamptz
+            )
+            AND NOT EXISTS (
+              SELECT 1
+                FROM operations_carrier_rate_grants child
+               WHERE child.network_id = rate_grant.network_id
+                 AND child.supersedes_grant_id = rate_grant.id
+                 AND child.status = 'active'
+                 AND child.allow_rating = true
+                 AND child.effective_from <= $6::timestamptz
+                 AND (
+                   child.effective_to IS NULL
+                   OR child.effective_to > $6::timestamptz
+                 )
+            )
+          ORDER BY rate_grant.global_id, directive.priority, directive.global_id`,
+        [
+          input.networkId,
+          first.account_authorization_id,
+          first.shipper_party_id,
+          first.currency,
+          first.contract_version_id,
+          shipmentShippedAt.toISOString(),
+        ],
+      )
+      const grantIds = new Set(applicable.rows.map((row) => row.grant_id))
+      directiveRows = applicable.rows
+      directiveCandidateSnapshot = directiveRows.map((row) => ({
+        grantGlobalId: row.grant_global_id,
+        directiveGlobalId: row.directive_global_id,
+        versionNumber: row.directive_version,
+        priority: row.directive_priority,
+        type: row.directive_type,
+        amountMinor: row.amount_minor,
+        basisPoints: row.basis_points,
+        calculationBasis: 'actual_cost',
+        approvedBy: row.approved_by,
+        contractVersionGlobalId: first.contract_version_global_id,
+      }))
+      if (grantIds.size > 1) {
+        status = 'blocked'
+        blockerCode = 'MUD_GRANT_AMBIGUOUS'
+        configurationReason = blockerCode
+      } else if (directiveRows.length > 0) {
+        const directives = directiveRows.map((row) => ({
+          globalId: String(row.directive_global_id),
+          priority: Number(row.directive_priority),
+          type: row.directive_type as BillingMudDirective['type'],
+          amountMinor: row.amount_minor === null
+            ? null
+            : BigInt(row.amount_minor),
+          basisPoints: row.basis_points === null
+            ? null
+            : Number(row.basis_points),
+        }))
+        directiveSnapshot = directiveCandidateSnapshot
+        try {
+          const result = calculateBillingMud(
+            carrierBilledActualMinor,
+            directives,
+          )
+          status = 'calculated'
+          mudAdjustmentMinor = result.mudAdjustmentMinor
+          contractBilledShippingMinor =
+            result.contractBilledShippingMinor
+          configurationReason = 'MUD_CALCULATED_FROM_BILLED_ACTUAL'
+        } catch (error) {
+          status = 'blocked'
+          blockerCode = error instanceof Error
+            ? error.message
+            : 'BILLING_MUD_CALCULATION_FAILED'
+          configurationReason = blockerCode
+          directiveRows = []
+          directiveSnapshot = []
+        }
+      }
+    }
+
+    const checkoutToCarrierActualVarianceMinor =
+      customerPaidCheckoutShippingMinor === null
+        ? null
+        : customerPaidCheckoutShippingMinor - carrierBilledActualMinor
+    const checkoutToContractBillVarianceMinor = (
+      customerPaidCheckoutShippingMinor === null
+      || contractBilledShippingMinor === null
+    )
+      ? null
+      : customerPaidCheckoutShippingMinor - contractBilledShippingMinor
+    const chargeSnapshot = [...evidenceGroup]
+      .sort((left, right) => (
+        left.item.charge_global_id.localeCompare(
+          right.item.charge_global_id,
+        )
+      ))
+      .map(({ item }) => ({
+        chargeGlobalId: item.charge_global_id,
+        billingMatchGlobalId: item.billing_match_global_id,
+        amountMinor: item.amount_minor,
+        currency: item.currency,
+      }))
+    const calculationSnapshot = {
+      model: 'billing_actual_mud_v1',
+      configurationReason,
+      reviewGlobalId: input.reviewGlobalId,
+      statementGlobalId: first.statement_global_id,
+      statementVersion: first.statement_version_number,
+      shipmentGlobalId: first.shipment_global_id,
+      orderGlobalId: first.order_global_id,
+      quoteSnapshotGlobalId: first.quote_snapshot_global_id,
+      contractVersionGlobalId: first.contract_version_global_id,
+      shipperPartyGlobalId: first.shipper_party_global_id,
+      directiveCandidates: directiveCandidateSnapshot,
+      checkoutEvidence: {
+        status: checkoutChargeStatus,
+        commerceOrderCandidateGlobalId:
+          commerceOrderCandidateId
+            ? first.commerce_order_candidate_global_id
+            : null,
+        paymentStatus: commerceOrderCandidateId
+          ? first.candidate_payment_status
+          : null,
+        headerMoneyState: commerceOrderCandidateId
+          ? first.candidate_header_money_state
+          : null,
+        activeShipmentCount: Number(first.active_shipment_count || 0),
+        noMultiShipmentAllocationInferred: true,
+      },
+      carrierBillingEvidence: chargeSnapshot,
+      signConvention: {
+        checkoutToCarrierActual:
+          'customer_paid_checkout_shipping_minus_carrier_billed_actual',
+        checkoutToContractBill:
+          'customer_paid_checkout_shipping_minus_contract_billed_shipping',
+      },
+    }
+    const inputHash = glCodingChecksum({
+      networkId: input.networkId,
+      reviewId: input.reviewId,
+      statementLineageKey: first.statement_lineage_key,
+      statementVersion: first.statement_version_number,
+      shipmentId: first.shipment_id,
+      currency: first.currency,
+      carrierBillingEvidence: chargeSnapshot,
+      directiveSnapshot,
+      directiveCandidates: directiveCandidateSnapshot,
+      checkoutEvidence: calculationSnapshot.checkoutEvidence,
+    })
+    const idempotencyKey = [
+      'billing-mud',
+      first.statement_lineage_key,
+      first.statement_version_number,
+      first.shipment_id,
+      first.currency,
+    ].join(':')
+    const calculation = await client.query<DecisionRow>(
+      `INSERT INTO operations_carrier_billing_mud_calculations (
+         network_id, gl_coding_review_id,
+         billing_statement_id, billing_statement_lineage_key,
+         billing_statement_version, executing_organization_id,
+         shipment_id, order_id, shipper_party_id, quote_snapshot_id,
+         account_authorization_id, carrier_account_id,
+         contract_version_id, commerce_order_candidate_id,
+         status, blocker_code, currency, checkout_charge_status,
+         customer_paid_checkout_shipping_minor,
+         carrier_billed_actual_minor, mud_adjustment_minor,
+         contract_billed_shipping_minor,
+         checkout_to_carrier_actual_variance_minor,
+         checkout_to_contract_bill_variance_minor,
+         charge_count, directive_snapshot, calculation_snapshot,
+         input_hash, idempotency_key, actor_email
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, $4, $5,
+         $6::uuid, $7::uuid, $8::uuid, $9::uuid, $10::uuid,
+         $11::uuid, $12::uuid, $13::uuid, $14::uuid,
+         $15, $16, $17, $18, $19::bigint, $20::bigint,
+         $21::bigint, $22::bigint, $23::bigint, $24::bigint,
+         $25, $26::jsonb, $27::jsonb, $28, $29, $30
+       )
+       ON CONFLICT (network_id, idempotency_key) DO NOTHING
+       RETURNING id::text, global_id`,
+      [
+        input.networkId,
+        input.reviewId,
+        first.statement_id,
+        first.statement_lineage_key,
+        first.statement_version_number,
+        first.match_executing_organization_id,
+        first.shipment_id,
+        first.shipment_order_id,
+        first.shipper_party_id,
+        first.quote_snapshot_id,
+        first.account_authorization_id,
+        first.carrier_account_id,
+        first.contract_version_id,
+        commerceOrderCandidateId,
+        status,
+        blockerCode,
+        first.currency,
+        checkoutChargeStatus,
+        customerPaidCheckoutShippingMinor?.toString() || null,
+        carrierBilledActualMinor.toString(),
+        mudAdjustmentMinor?.toString() || null,
+        contractBilledShippingMinor?.toString() || null,
+        checkoutToCarrierActualVarianceMinor?.toString() || null,
+        checkoutToContractBillVarianceMinor?.toString() || null,
+        evidenceGroup.length,
+        JSON.stringify(directiveSnapshot),
+        JSON.stringify(calculationSnapshot),
+        inputHash,
+        idempotencyKey,
+        input.actorEmail,
+      ],
+    )
+    if (!calculation.rows[0]) continue
+
+    for (const evidence of evidenceGroup) {
+      const item = evidence.item
+      await client.query(
+        `INSERT INTO operations_carrier_billing_mud_calculation_charges (
+           network_id, calculation_id, billing_statement_id,
+           billing_charge_id, billing_match_id, shipper_assignment_id,
+           gl_coding_review_item_id, source_charge_amount_minor, currency
+         ) VALUES (
+           $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid,
+           $6::uuid, $7::uuid, $8::bigint, $9
+         )`,
+        [
+          input.networkId,
+          calculation.rows[0].id,
+          item.statement_id,
+          item.charge_id,
+          item.billing_match_id,
+          item.shipper_assignment_id,
+          evidence.reviewItemId,
+          item.amount_minor,
+          item.currency,
+        ],
+      )
+    }
+    if (status === 'calculated') {
+      for (const row of directiveRows) {
+        await client.query(
+          `INSERT INTO
+             operations_carrier_billing_mud_calculation_directives (
+               network_id, calculation_id, account_authorization_id,
+               grant_id, directive_id, directive_version,
+               directive_priority, directive_type, amount_minor,
+               basis_points
+             ) VALUES (
+               $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid,
+               $6, $7, $8, $9::bigint, $10
+             )`,
+          [
+            input.networkId,
+            calculation.rows[0].id,
+            first.account_authorization_id,
+            row.grant_id,
+            row.directive_id,
+            row.directive_version,
+            row.directive_priority,
+            row.directive_type,
+            row.amount_minor,
+            row.basis_points,
+          ],
+        )
+      }
+    }
+    calculationCount += 1
+  }
+  return calculationCount
+}
+
 export async function readGlCodingWorkspaceFromPostgres(input: {
   organizationId: string
   capabilities: CarrierRateNetworkCapabilities
@@ -843,6 +1348,7 @@ export async function readGlCodingWorkspaceFromPostgres(input: {
       rules: [],
       shippers: [],
       settlements: [],
+      mudCalculations: [],
     }
   }
 
@@ -1042,6 +1548,64 @@ export async function readGlCodingWorkspaceFromPostgres(input: {
       LIMIT 200`,
     [network.id],
   )
+  const mudCalculations = await query<BillingMudWorkspaceRow>(
+    `SELECT calculation.global_id, calculation.status,
+            calculation.blocker_code, statement.global_id
+              AS statement_global_id,
+            calculation.billing_statement_version,
+            shipment.global_id AS shipment_global_id,
+            canonical_order.global_id AS order_global_id,
+            shipper.global_id AS shipper_global_id,
+            shipper.display_name AS shipper_name,
+            quote.global_id AS quote_snapshot_global_id,
+            contract_version.global_id AS contract_version_global_id,
+            contract_version.version_number AS contract_version_number,
+            commerce_candidate.global_id
+              AS commerce_order_candidate_global_id,
+            calculation.currency, calculation.checkout_charge_status,
+            calculation.customer_paid_checkout_shipping_minor::text,
+            calculation.carrier_billed_actual_minor::text,
+            calculation.mud_adjustment_minor::text,
+            calculation.contract_billed_shipping_minor::text,
+            calculation.checkout_to_carrier_actual_variance_minor::text,
+            calculation.checkout_to_contract_bill_variance_minor::text,
+            calculation.charge_count, calculation.directive_snapshot,
+            calculation.calculation_snapshot, calculation.created_at
+       FROM operations_carrier_billing_mud_calculations calculation
+       JOIN operations_carrier_billing_statements statement
+         ON statement.network_id = calculation.network_id
+        AND statement.id = calculation.billing_statement_id
+       JOIN operations_shipments shipment
+         ON shipment.organization_id
+              = calculation.executing_organization_id
+        AND shipment.id = calculation.shipment_id
+       JOIN operations_orders canonical_order
+         ON canonical_order.organization_id
+              = calculation.executing_organization_id
+        AND canonical_order.id = calculation.order_id
+       JOIN operations_carrier_rate_parties shipper
+         ON shipper.network_id = calculation.network_id
+        AND shipper.id = calculation.shipper_party_id
+       JOIN operations_carrier_quote_snapshots quote
+         ON quote.network_id = calculation.network_id
+        AND quote.executing_organization_id
+              = calculation.executing_organization_id
+        AND quote.account_authorization_id
+              = calculation.account_authorization_id
+        AND quote.carrier_account_id = calculation.carrier_account_id
+        AND quote.id = calculation.quote_snapshot_id
+       LEFT JOIN operations_contract_versions contract_version
+         ON contract_version.organization_id
+              = calculation.executing_organization_id
+        AND contract_version.id = calculation.contract_version_id
+       LEFT JOIN operations_commerce_order_candidates commerce_candidate
+         ON commerce_candidate.id
+              = calculation.commerce_order_candidate_id
+      WHERE calculation.network_id = $1::uuid
+      ORDER BY calculation.created_at DESC, calculation.id DESC
+      LIMIT 200`,
+    [network.id],
+  )
 
   return {
     capabilities: input.capabilities,
@@ -1149,6 +1713,57 @@ export async function readGlCodingWorkspaceFromPostgres(input: {
         actorEmail: row.latest_event_actor,
         occurredAt: iso(row.latest_event_at),
       } : null,
+    })),
+    mudCalculations: mudCalculations.rows.map((row) => ({
+      globalId: row.global_id,
+      status: row.status,
+      blockerCode: row.blocker_code,
+      statementGlobalId: row.statement_global_id,
+      statementVersion: Number(row.billing_statement_version),
+      shipmentGlobalId: row.shipment_global_id,
+      orderGlobalId: row.order_global_id,
+      shipperGlobalId: row.shipper_global_id,
+      shipperName: row.shipper_name,
+      quoteSnapshotGlobalId: row.quote_snapshot_global_id,
+      contractVersionGlobalId: row.contract_version_global_id,
+      contractVersionNumber: row.contract_version_number === null
+        ? null
+        : Number(row.contract_version_number),
+      commerceOrderCandidateGlobalId:
+        row.commerce_order_candidate_global_id,
+      currency: row.currency,
+      checkoutChargeStatus: row.checkout_charge_status,
+      customerPaidCheckoutShippingMinor:
+        row.customer_paid_checkout_shipping_minor === null
+          ? null
+          : safeMinorUnits(row.customer_paid_checkout_shipping_minor),
+      carrierBilledActualMinor:
+        safeMinorUnits(row.carrier_billed_actual_minor),
+      mudAdjustmentMinor: row.mud_adjustment_minor === null
+        ? null
+        : safeMinorUnits(row.mud_adjustment_minor),
+      contractBilledShippingMinor:
+        row.contract_billed_shipping_minor === null
+          ? null
+          : safeMinorUnits(row.contract_billed_shipping_minor),
+      checkoutToCarrierActualVarianceMinor:
+        row.checkout_to_carrier_actual_variance_minor === null
+          ? null
+          : safeMinorUnits(
+            row.checkout_to_carrier_actual_variance_minor,
+          ),
+      checkoutToContractBillVarianceMinor:
+        row.checkout_to_contract_bill_variance_minor === null
+          ? null
+          : safeMinorUnits(
+            row.checkout_to_contract_bill_variance_minor,
+          ),
+      chargeCount: Number(row.charge_count),
+      directiveSnapshot: Array.isArray(row.directive_snapshot)
+        ? row.directive_snapshot
+        : [],
+      calculationSnapshot: objectValue(row.calculation_snapshot),
+      createdAt: iso(row.created_at),
     })),
   }
 }
@@ -1840,6 +2455,15 @@ export async function reviewGlCodingRunInPostgres(input: {
               charge.global_id AS charge_global_id,
               statement.id::text AS statement_id,
               statement.global_id AS statement_global_id,
+              statement.version_number AS statement_version_number,
+              encode(
+                digest(
+                  statement.billed_account_fingerprint
+                    || ':' || statement.external_statement_id,
+                  'sha256'
+                ),
+                'hex'
+              ) AS statement_lineage_key,
               batch.provider AS batch_provider,
               batch.source_filename,
               charge.amount_minor::text, charge.currency,
@@ -1861,7 +2485,34 @@ export async function reviewGlCodingRunInPostgres(input: {
               COALESCE(
                 shipper.workspace_organization_id,
                 shipper_pipeline.workspace_organization_id
-              )::text AS executing_organization_id
+              )::text AS executing_organization_id,
+              billing_match.id::text AS billing_match_id,
+              billing_match.global_id AS billing_match_global_id,
+              billing_match.executing_organization_id::text
+                AS match_executing_organization_id,
+              shipment.id::text AS shipment_id,
+              shipment.global_id AS shipment_global_id,
+              shipment.order_id::text AS shipment_order_id,
+              shipment.shipped_at AS shipment_shipped_at,
+              billing_match.quote_snapshot_id::text AS quote_snapshot_id,
+              quote_snapshot.global_id AS quote_snapshot_global_id,
+              canonical_order.global_id AS order_global_id,
+              canonical_order.contract_version_id::text
+                AS contract_version_id,
+              contract_version.global_id AS contract_version_global_id,
+              contract_version.version_number AS contract_version_number,
+              commerce_candidate.id::text AS commerce_order_candidate_id,
+              commerce_candidate.global_id
+                AS commerce_order_candidate_global_id,
+              commerce_candidate.currency_code AS candidate_currency,
+              commerce_candidate.shipping_minor::text
+                AS candidate_shipping_minor,
+              commerce_candidate.normalized_payment_status
+                AS candidate_payment_status,
+              commerce_candidate.header_money_state
+                AS candidate_header_money_state,
+              shipment_count.active_shipment_count::text
+                AS active_shipment_count
          FROM operations_gl_coding_run_items item
          JOIN operations_carrier_billing_charges charge
            ON charge.network_id = item.network_id
@@ -1899,6 +2550,49 @@ export async function reviewGlCodingRunInPostgres(input: {
           AND account_owner.workspace_organization_id
             = resolution.account_owner_organization_id
           AND account_owner.role IN ('platform_operator', 'reseller')
+         LEFT JOIN operations_carrier_billing_matches billing_match
+           ON billing_match.network_id = item.network_id
+          AND billing_match.charge_id = item.charge_id
+          AND billing_match.id = item.billing_match_id
+          AND billing_match.decision = 'matched'
+          AND NOT EXISTS (
+            SELECT 1
+              FROM operations_carrier_billing_matches child
+             WHERE child.network_id = billing_match.network_id
+               AND child.charge_id = billing_match.charge_id
+               AND child.supersedes_match_id = billing_match.id
+          )
+         LEFT JOIN operations_shipments shipment
+           ON shipment.organization_id
+                = billing_match.executing_organization_id
+          AND shipment.id = billing_match.shipment_id
+         LEFT JOIN operations_carrier_quote_snapshots quote_snapshot
+           ON quote_snapshot.network_id = billing_match.network_id
+          AND quote_snapshot.executing_organization_id
+                = billing_match.executing_organization_id
+          AND quote_snapshot.account_authorization_id
+                = billing_match.account_authorization_id
+          AND quote_snapshot.carrier_account_id
+                = billing_match.carrier_account_id
+          AND quote_snapshot.id = billing_match.quote_snapshot_id
+         LEFT JOIN operations_orders canonical_order
+           ON canonical_order.organization_id = shipment.organization_id
+          AND canonical_order.id = shipment.order_id
+         LEFT JOIN operations_contract_versions contract_version
+           ON contract_version.organization_id
+                = canonical_order.organization_id
+          AND contract_version.id = canonical_order.contract_version_id
+         LEFT JOIN operations_commerce_order_candidates commerce_candidate
+           ON commerce_candidate.organization_id
+                = canonical_order.organization_id
+          AND commerce_candidate.canonical_order_id = canonical_order.id
+         LEFT JOIN LATERAL (
+           SELECT count(*) AS active_shipment_count
+             FROM operations_shipments sibling
+            WHERE sibling.organization_id = shipment.organization_id
+              AND sibling.order_id = shipment.order_id
+              AND sibling.status <> 'voided'
+         ) shipment_count ON true
         WHERE item.network_id = $1::uuid
           AND item.run_id = $2::uuid
           AND item.result = 'assigned'
@@ -1915,6 +2609,7 @@ export async function reviewGlCodingRunInPostgres(input: {
     }
 
     let settlementCount = 0
+    const approvedBillingMudEvidence: ApprovedBillingMudEvidence[] = []
     for (const item of reviewableItems.rows) {
       const reviewItem = await client.query<DecisionRow>(
         `INSERT INTO operations_gl_coding_review_items (
@@ -1956,6 +2651,10 @@ export async function reviewGlCodingRunInPostgres(input: {
         ],
       )
       const sourceAmount = BigInt(item.amount_minor)
+      approvedBillingMudEvidence.push({
+        reviewItemId: reviewItem.rows[0].id,
+        item,
+      })
       const absoluteAmount = sourceAmount < BigInt(0) ? -sourceAmount : sourceAmount
       const providerIdentity = item.batch_provider
         .toLowerCase()
@@ -2109,6 +2808,14 @@ export async function reviewGlCodingRunInPostgres(input: {
         settlementCount += 1
       }
     }
+    const billingMudCalculationCount =
+      await persistApprovedBillingMudCalculations(client, {
+        networkId: network.id,
+        reviewId: review.id,
+        reviewGlobalId: review.global_id,
+        actorEmail: input.actorEmail,
+        evidence: approvedBillingMudEvidence,
+      })
 
     await recordAuditEvent({
       actor: input.actorEmail,
@@ -2122,8 +2829,10 @@ export async function reviewGlCodingRunInPostgres(input: {
         runGlobalId: run.global_id,
         itemCount: reviewableItems.rows.length,
         settlementCount,
+        billingMudCalculationCount,
         reason: input.reason,
         quoteTimePlatformAndResellerFeesExcluded: true,
+        billingTimeMudOnly: true,
       },
     }, client)
     return reviewResult(

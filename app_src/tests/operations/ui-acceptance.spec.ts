@@ -407,9 +407,10 @@ function replayRateStage(
     rateChoices: rates,
     selectedRate: rates[0],
     selectedCarrierCostMinor: rates[0].carrierCostMinor,
-    customerChargeMinor: 2350,
-    mudMarkupMinor: checkout ? 510 : 355,
-    marginMinor: checkout ? 510 : 355,
+    checkoutShippingChargeMinor: 2350,
+    estimatedShippingVarianceMinor: checkout ? 510 : 355,
+    pricingSemanticsVersion: 2,
+    billingReconciliationStatus: 'pending_carrier_invoice',
     currency: 'USD',
     inputHash: `input-${purpose}`,
     resultHash: `result-${purpose}`,
@@ -454,10 +455,11 @@ const blockedReplayRun: OperationsRegressionRun = {
       changed: true,
       packageCountDelta: 0,
       checkoutCarrierCostMinor: 1840,
-      checkoutCustomerChargeMinor: 2350,
+      checkoutShippingChargeMinor: 2350,
       fulfillmentCarrierCostMinor: 1995,
-      carrierCostVarianceMinor: 155,
-      realizedMarginMinor: 355,
+      preLabelRateVarianceMinor: 155,
+      estimatedShippingVarianceMinor: 355,
+      billingReconciliationStatus: 'pending_carrier_invoice',
       currency: 'USD',
       allocationChanged: false,
       materialChanged: false,
@@ -541,9 +543,10 @@ const faireFulfillmentStage: OperationsRegressionPackRateStage = {
   ...replayRateStage('fulfillment_execution'),
   packageCount: 1,
   packages: [replayPackages[0]],
-  customerChargeMinor: 1895,
-  mudMarkupMinor: 0,
-  marginMinor: -100,
+  checkoutShippingChargeMinor: 1895,
+  estimatedShippingVarianceMinor: -100,
+  pricingSemanticsVersion: 2,
+  billingReconciliationStatus: 'pending_carrier_invoice',
 }
 
 const faireReplayRun: OperationsRegressionRun = {
@@ -565,7 +568,7 @@ const faireReplayRun: OperationsRegressionRun = {
       runGlobalId: 'grr-faire-estimate-001',
       purpose: 'checkout_quote',
       source: 'faire_checkout_estimate_captured',
-      capturedCustomerChargeMinor: 1895,
+      capturedCheckoutShippingChargeMinor: 1895,
       currency: 'USD',
       inputHash: 'input-faire-estimate',
       resultHash: 'result-faire-estimate',
@@ -627,7 +630,7 @@ const faireReplayRun: OperationsRegressionRun = {
 async function installReplayRoutes(page: Page) {
   let runs = [blockedReplayRun, faireReplayRun]
   const walkthrough = (): OperationsRegressionWalkthrough => ({
-    schemaVersion: 'operations-regression-replay-v1',
+    schemaVersion: 'operations-regression-replay-v2',
     generatedAt: '2026-07-28T18:05:00.000Z',
     scenarios: [{
       id: 'shopify-two-pass',
@@ -854,8 +857,10 @@ test('pack and rate replay runs, persists, and reloads two-pass package evidence
     page.getByRole('table', { name: 'Fulfillment Execution recorded carrier rates' }),
   ).toContainText('UPS Ground')
   await expect(page.getByText('Blocked Until Label').first()).toBeVisible()
-  await expect(page.getByText('Checkout customer charge')).toBeVisible()
-  await expect(page.getByText('Fulfillment carrier cost')).toBeVisible()
+  await expect(
+    page.getByText('Customer checkout shipping charge').first(),
+  ).toBeVisible()
+  await expect(page.getByText('Pre-label carrier estimate')).toBeVisible()
   await expect(page.getByText(
     /selected for 2 packages, but recorded label finalization has not proven every package used it/,
   )).toBeVisible()

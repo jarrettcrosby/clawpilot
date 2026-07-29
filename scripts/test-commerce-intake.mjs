@@ -722,7 +722,8 @@ includes(serviceSource, [
   'listFaireOrders',
   'listFaireProducts',
   'listFaireInventory',
-  'product_status:ACTIVE,ARCHIVED,DRAFT,UNLISTED',
+  'product_status:active,archived,draft,unlisted',
+  "Shopify's search values are case-sensitive lowercase",
   'SHOPIFY_ORDER_PAGE_SIZE = 25',
   'FAIRE_ORDER_PAGE_SIZE = 50',
   'FAIRE_INVENTORY_SELECTOR_LIMIT = 50',
@@ -2027,7 +2028,7 @@ const service = loadTypeScriptModule(
             )
             assert.match(
               request.variables.query,
-              /^updated_at:<='[^']+' AND product_status:ACTIVE,ARCHIVED,DRAFT,UNLISTED$/,
+              /^updated_at:<='[^']+' AND product_status:active,archived,draft,unlisted$/,
             )
             const secondPage = Boolean(request.variables.after)
             if (secondPage) {
