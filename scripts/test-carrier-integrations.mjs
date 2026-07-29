@@ -168,6 +168,19 @@ for (const fragment of [
     `Cartonization shipment-rate migration missing ${fragment}`,
   )
 }
+const cartonizationShipmentRateConstraintRepairMigration = read(
+  'db/migrations/0144_operations_cartonization_shipment_rate_constraint_repair.sql',
+)
+for (const fragment of [
+  'operations_cartonization_rate_evidence_quotes',
+  'DROP CONSTRAINT IF EXISTS',
+  'operations_cartonization_rate_evidence_quote_rate_purpose_check',
+]) {
+  assert.ok(
+    cartonizationShipmentRateConstraintRepairMigration.includes(fragment),
+    `Cartonization shipment-rate constraint repair migration missing ${fragment}`,
+  )
+}
 
 const persistence = read('app_src/lib/persistence/carrierIntegrations.ts')
 for (const fragment of [

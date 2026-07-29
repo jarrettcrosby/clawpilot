@@ -108,6 +108,9 @@ const scaleMigration = read(
 const shipmentRateMigration = read(
   'db/migrations/0143_operations_cartonization_shipment_rates.sql',
 )
+const shipmentRateConstraintRepairMigration = read(
+  'db/migrations/0144_operations_cartonization_shipment_rate_constraint_repair.sql',
+)
 const persistence = read(
   'app_src/lib/persistence/cartonizationRateEvidence.ts',
 )
@@ -203,6 +206,10 @@ assertIncludes(shipmentRateMigration, [
   "'multi_package_shipment'",
   'Cartonization evidence cannot mix package and shipment rate purposes',
 ], 'Whole-shipment carrier evidence migration')
+assertIncludes(shipmentRateConstraintRepairMigration, [
+  'DROP CONSTRAINT IF EXISTS',
+  'operations_cartonization_rate_evidence_quote_rate_purpose_check',
+], 'Whole-shipment quote-purpose constraint repair')
 
 assertIncludes(persistence, [
   'export function cartonizationRateEvidenceHash',
