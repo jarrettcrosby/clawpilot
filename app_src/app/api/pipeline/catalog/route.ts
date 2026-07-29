@@ -1,11 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { parse } from 'csv-parse/sync'
+import { isIso4217CurrencyCode } from '@/lib/currency'
 import {
   readPipelineCatalogInPostgres,
   upsertPipelineCatalogPersonInPostgres,
   upsertPipelineCatalogProductInPostgres,
 } from '@/lib/persistence/crm'
 import { isPostgresPipelineStoreEnabled } from '@/lib/persistence/pipeline'
+import { readMeasurementPreferences } from '@/lib/persistence/measurementPreferences'
 import { requireRequestUser } from '@/lib/requestUser'
 import type { AppUser } from '@/lib/users'
 import type { ProductPackagingProfileInput } from '@/lib/persistence/productPackaging'
@@ -132,8 +134,10 @@ function productFields(input: Record<string, unknown>) {
   const name = clean(input.name, 250)
   if (!name) throw new Error('Product name is required')
   const sku = clean(input.sku, 25)
-  const currency = (clean(input.currency, 3) || 'USD').toUpperCase()
-  if (!/^[A-Z]{3}$/.test(currency)) throw new Error('Product currency must be a three-letter code')
+  const currency = clean(input.currency, 3).toUpperCase()
+  if (currency && !isIso4217CurrencyCode(currency)) {
+    throw new Error('Product currency must be a supported ISO 4217 code')
+  }
   const url = clean(input.url, 2_000)
   if (url && !/^https?:\/\//i.test(url)) throw new Error('Product URL must use http or https')
   return {
@@ -230,6 +234,8 @@ export async function POST(req: NextRequest) {
     const actor = await requireRequestUser(req)
     const pipeline = await selectedPipeline(req, actor)
     requireResourceEditor(pipeline)
+    const preferences = await readMeasurementPreferences(actor)
+    const defaultCurrencyCode = preferences.organizationCurrencyCode
 
     const contentType = req.headers.get('content-type') || ''
     if (contentType.includes('multipart/form-data')) {
@@ -279,6 +285,7 @@ export async function POST(req: NextRequest) {
               pipelineId: pipeline.id,
               actorEmail: actor.email,
               deferDropdownSync: true,
+              defaultCurrencyCode,
               packaging,
               fields: productFields({
                 name: safeSpreadsheetValue(row.name, 250),
@@ -328,6 +335,7 @@ export async function POST(req: NextRequest) {
         pipelineId: pipeline.id,
         actorEmail: actor.email,
         id: clean(body.id, 50) || null,
+        defaultCurrencyCode,
         fields: productFields(body),
         packaging: packagingFields(body, 'manual'),
       })

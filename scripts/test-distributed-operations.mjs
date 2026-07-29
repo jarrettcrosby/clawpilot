@@ -523,6 +523,11 @@ function verifySourceContracts() {
     'orders.archived_at IS NULL',
     "warehouse.code <> 'MOCK-01'",
   ]) assert.ok(persistence.includes(fragment), `Operations persistence missing ${fragment}`)
+  assert.match(
+    persistence,
+    /INSERT INTO operations_order_lines[\s\S]*?RETURNING id::text, global_id, external_line_id/,
+    'Proof-order package validation must retain the persisted external line ID',
+  )
   assert.ok(!persistence.includes('console.'), 'Operations persistence must not log tenant data')
 
   const adapters = read('app_src/lib/operations/adapters.ts')

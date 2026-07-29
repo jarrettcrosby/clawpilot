@@ -33,6 +33,18 @@ import { BASE_PIPELINE_WORKFLOW } from '@/lib/pipeline/baseTemplate.mjs'
 import PersonAddRounded from '@mui/icons-material/PersonAddRounded'
 import UploadFileRounded from '@mui/icons-material/UploadFileRounded'
 import Inventory2Rounded from '@mui/icons-material/Inventory2Rounded'
+import { useMeasurementSystem } from '@/components/measurements/MeasurementSystemProvider'
+import {
+  DEFAULT_WORKSPACE_CURRENCY_CODE,
+  SUPPORTED_ISO_4217_CURRENCY_CODES,
+} from '@/lib/currency'
+import {
+  formatDimensionsMm,
+  formatGrams,
+  gramsToDisplayWeight,
+  millimetersToDisplayLength,
+  type MeasurementSystem,
+} from '@/lib/measurements'
 
 export type PipelineCatalogPerson = {
   id: string
@@ -89,7 +101,6 @@ type ImportResult = {
 }
 
 type WorkflowField = 'stage' | 'priority' | 'status' | 'source' | 'loss_reason'
-type MeasurementSystem = 'metric' | 'imperial'
 
 const WORKFLOW_FIELDS: Array<{ key: WorkflowField; label: string; helper: string }> = [
   { key: 'stage', label: 'Stages', helper: 'One pipeline lane per line, in display order.' },
@@ -118,7 +129,7 @@ const EMPTY_PRODUCT = {
   status: 'Active',
   price: '',
   cost: '',
-  currency: 'USD',
+  currency: DEFAULT_WORKSPACE_CURRENCY_CODE,
   url: '',
   description: '',
   active: true,
@@ -146,13 +157,11 @@ function displayNumber(value: number) {
 
 function packageDisplayValues(packaging: PipelineCatalogProduct['packaging'], system: MeasurementSystem) {
   if (!packaging) return { length: '', width: '', height: '', weight: '' }
-  const dimensionDivisor = system === 'imperial' ? 25.4 : 10
-  const weightDivisor = system === 'imperial' ? 453.59237 : 1_000
   return {
-    length: displayNumber(packaging.lengthMm / dimensionDivisor),
-    width: displayNumber(packaging.widthMm / dimensionDivisor),
-    height: displayNumber(packaging.heightMm / dimensionDivisor),
-    weight: displayNumber(packaging.weightGrams / weightDivisor),
+    length: displayNumber(millimetersToDisplayLength(packaging.lengthMm, system)),
+    width: displayNumber(millimetersToDisplayLength(packaging.widthMm, system)),
+    height: displayNumber(millimetersToDisplayLength(packaging.heightMm, system)),
+    weight: displayNumber(gramsToDisplayWeight(packaging.weightGrams, system)),
   }
 }
 
@@ -169,17 +178,26 @@ function convertDisplayValue(value: string, from: MeasurementSystem, to: Measure
   return displayNumber(canonical / divisor)
 }
 
-function packageSummary(packaging: NonNullable<PipelineCatalogProduct['packaging']>) {
-  const values = packageDisplayValues(packaging, packaging.measurementSystem)
-  const dimensionUnit = packaging.measurementSystem === 'imperial' ? 'in' : 'cm'
-  const weightUnit = packaging.measurementSystem === 'imperial' ? 'lb' : 'kg'
-  return `${values.length} x ${values.width} x ${values.height} ${dimensionUnit} · ${values.weight} ${weightUnit}`
+function packageSummary(
+  packaging: NonNullable<PipelineCatalogProduct['packaging']>,
+  system: MeasurementSystem,
+) {
+  return `${formatDimensionsMm({
+    lengthMm: packaging.lengthMm,
+    widthMm: packaging.widthMm,
+    heightMm: packaging.heightMm,
+  }, system, { maximumFractionDigits: 3 })} · ${
+    formatGrams(packaging.weightGrams, system, { maximumFractionDigits: 3 })
+  }`
 }
 
-function downloadCsvTemplate(kind: 'people' | 'products') {
+function downloadCsvTemplate(
+  kind: 'people' | 'products',
+  defaultCurrencyCode = DEFAULT_WORKSPACE_CURRENCY_CODE,
+) {
   const value = kind === 'people'
     ? 'fullName,email,jobTitle,active\nTaylor Morgan,taylor@example.com,Sales Manager,true\n'
-    : 'name,sku,productType,category,status,price,cost,currency,url,description,active,packageName,packageType,unitOfMeasure,unitsPerPackage,measurementSystem,length,width,height,weight,packagingActive\nShipping carton,CARTON-01,Good,Packaging,Active,4.5,1.25,USD,https://example.com/carton,Standard fulfillment carton,true,Default carton,carton,carton,1,imperial,16,12,10,1.5,true\n'
+    : `name,sku,productType,category,status,price,cost,currency,url,description,active,packageName,packageType,unitOfMeasure,unitsPerPackage,measurementSystem,length,width,height,weight,packagingActive\nShipping carton,CARTON-01,Good,Packaging,Active,4.5,1.25,${defaultCurrencyCode},https://example.com/carton,Standard fulfillment carton,true,Default carton,carton,carton,1,imperial,16,12,10,1.5,true\n`
   const url = URL.createObjectURL(new Blob([value], { type: 'text/csv;charset=utf-8' }))
   const anchor = document.createElement('a')
   anchor.href = url
@@ -197,11 +215,25 @@ export default function PipelineCatalogDialog({
   onClose: () => void
   onCatalogChange?: (catalog: PipelineCatalogSnapshot) => void
 }) {
+  const {
+    measurementSystem,
+    organizationCurrencyCode,
+    loading: measurementPreferencesLoading,
+    error: measurementPreferencesError,
+    preferencesWritable,
+    refresh: refreshMeasurementPreferences,
+  } = useMeasurementSystem()
+  const currencyPreferenceReady = !measurementPreferencesLoading
+    && !measurementPreferencesError
+    && preferencesWritable
   const fullScreen = useMediaQuery('(max-width:699.95px), (orientation: landscape) and (max-height: 500px)')
   const [tab, setTab] = useState<'people' | 'products' | 'workflow'>('people')
   const [catalog, setCatalog] = useState<PipelineCatalogSnapshot>({ pipelineId: '', canEdit: false, people: [], products: [] })
   const [person, setPerson] = useState(EMPTY_PERSON)
-  const [product, setProduct] = useState(EMPTY_PRODUCT)
+  const [product, setProduct] = useState(() => ({
+    ...EMPTY_PRODUCT,
+    currency: organizationCurrencyCode,
+  }))
   const [personEditorOpen, setPersonEditorOpen] = useState(false)
   const [productEditorOpen, setProductEditorOpen] = useState(false)
   const [loading, setLoading] = useState(false)
@@ -267,6 +299,15 @@ export default function PipelineCatalogDialog({
     void load()
   }, [load, open])
 
+  useEffect(() => {
+    if (
+      currencyPreferenceReady
+      || !productEditorOpen
+      || product.id
+    ) return
+    setProductEditorOpen(false)
+  }, [currencyPreferenceReady, product.id, productEditorOpen])
+
   const savePerson = async () => {
     if (!person.fullName.trim() || saving) return
     setSaving(true)
@@ -292,7 +333,7 @@ export default function PipelineCatalogDialog({
   }
 
   const saveProduct = async () => {
-    if (!product.name.trim() || saving) return
+    if (!product.name.trim() || saving || (!product.id && !currencyPreferenceReady)) return
     setSaving(true)
     setError('')
     setNotice('')
@@ -314,7 +355,7 @@ export default function PipelineCatalogDialog({
       })
       const payload = await response.json().catch(() => ({}))
       if (!response.ok || payload?.ok === false) throw new Error(payload?.error || 'Unable to save product')
-      setProduct(EMPTY_PRODUCT)
+      setProduct({ ...EMPTY_PRODUCT, currency: organizationCurrencyCode })
       setProductEditorOpen(false)
       setNotice('Product saved and queued for CRM synchronization.')
       await load()
@@ -431,6 +472,26 @@ export default function PipelineCatalogDialog({
       <DialogContent sx={{ p: { xs: 2, sm: 3 }, overflowX: 'hidden' }}>
         {error ? <Alert severity="error" sx={{ mb: 2 }}>{error}</Alert> : null}
         {notice ? <Alert severity="success" sx={{ mb: 2 }}>{notice}</Alert> : null}
+        {tab === 'products' && !currencyPreferenceReady ? (
+          <Alert
+            severity={measurementPreferencesError ? 'warning' : 'info'}
+            sx={{ mb: 2 }}
+            action={!measurementPreferencesLoading ? (
+              <Button
+                color="inherit"
+                size="small"
+                onClick={() => { void refreshMeasurementPreferences() }}
+              >
+                Retry
+              </Button>
+            ) : undefined}
+          >
+            {measurementPreferencesLoading
+              ? 'Loading the organization currency before Product defaults are available.'
+              : measurementPreferencesError
+                || 'Choose an active organization before adding a Product or downloading its template.'}
+          </Alert>
+        ) : null}
         {importResult?.errors?.length ? (
           <Alert severity="warning" sx={{ mb: 2 }}>
             {Number(importResult.failed || importResult.errors.length)} row{Number(importResult.failed || importResult.errors.length) === 1 ? '' : 's'} need review: {importResult.errors.slice(0, 3).map((item) => `row ${item.row || '?'} ${item.error || 'invalid'}`).join('; ')}
@@ -448,7 +509,15 @@ export default function PipelineCatalogDialog({
           {catalog.canEdit && tab !== 'workflow' ? (
             <Stack direction="row" gap={0.5} flexShrink={0}>
               <Tooltip title={`Download ${tab} CSV template`}>
-                <IconButton aria-label={`Download ${tab} CSV template`} onClick={() => downloadCsvTemplate(tab)}><DownloadRounded /></IconButton>
+                <span>
+                  <IconButton
+                    aria-label={`Download ${tab} CSV template`}
+                    disabled={tab === 'products' && !currencyPreferenceReady}
+                    onClick={() => downloadCsvTemplate(tab, organizationCurrencyCode)}
+                  >
+                    <DownloadRounded />
+                  </IconButton>
+                </span>
               </Tooltip>
               <Tooltip title={`Import ${tab} CSV`}>
                 <span>
@@ -460,9 +529,17 @@ export default function PipelineCatalogDialog({
                 variant="outlined"
                 size="small"
                 startIcon={tab === 'people' ? <PersonAddRounded /> : <Inventory2Rounded />}
+                disabled={tab === 'products' && !currencyPreferenceReady}
                 onClick={() => {
                   if (tab === 'people') { setPerson(EMPTY_PERSON); setPersonEditorOpen(true) }
-                  else { setProduct(EMPTY_PRODUCT); setProductEditorOpen(true) }
+                  else {
+                    setProduct({
+                      ...EMPTY_PRODUCT,
+                      currency: organizationCurrencyCode,
+                      measurementSystem,
+                    })
+                    setProductEditorOpen(true)
+                  }
                 }}
               >
                 Add {tab === 'people' ? 'person' : 'product'}
@@ -519,7 +596,7 @@ export default function PipelineCatalogDialog({
                           status: item.status,
                           price: String(item.price || ''),
                           cost: String(item.cost || ''),
-                          currency: item.currency || 'USD',
+                          currency: item.currency,
                           url: item.url,
                           description: item.description,
                           active: item.active,
@@ -527,8 +604,8 @@ export default function PipelineCatalogDialog({
                           packageType: item.packaging?.packageType || 'each',
                           unitOfMeasure: item.packaging?.unitOfMeasure || 'each',
                           unitsPerPackage: String(item.packaging?.unitsPerPackage || 1),
-                          measurementSystem: item.packaging?.measurementSystem || 'metric',
-                          ...packageDisplayValues(item.packaging, item.packaging?.measurementSystem || 'metric'),
+                          measurementSystem,
+                          ...packageDisplayValues(item.packaging, measurementSystem),
                           packagingActive: item.packaging?.active !== false,
                         })
                         setProductEditorOpen(true)
@@ -541,9 +618,13 @@ export default function PipelineCatalogDialog({
                     secondary={[
                       item.sku || item.referenceCode,
                       item.category,
-                      item.price ? `${item.currency || 'USD'} ${Number(item.price).toLocaleString()}` : '',
+                      item.price
+                        ? item.currency
+                          ? `${item.currency} ${Number(item.price).toLocaleString()}`
+                          : `Currency required · ${Number(item.price).toLocaleString()}`
+                        : '',
                       item.packaging
-                        ? packageSummary(item.packaging)
+                        ? packageSummary(item.packaging, measurementSystem)
                         : 'Package data not set',
                     ].filter(Boolean).join(' · ')}
                     primaryTypographyProps={{ component: 'div', fontWeight: 600, sx: { pr: 5, overflowWrap: 'anywhere' } }}
@@ -615,7 +696,12 @@ export default function PipelineCatalogDialog({
               <Stack direction={{ xs: 'column', sm: 'row' }} gap={1.5}>
                 <TextField fullWidth label="Price" inputMode="decimal" value={product.price} onChange={(event) => setProduct({ ...product, price: event.target.value.replace(/[^0-9.-]/g, '') })} />
                 <TextField fullWidth label="Cost" inputMode="decimal" value={product.cost} onChange={(event) => setProduct({ ...product, cost: event.target.value.replace(/[^0-9.-]/g, '') })} />
-                <TextField fullWidth label="Currency" value={product.currency} inputProps={{ maxLength: 3 }} onChange={(event) => setProduct({ ...product, currency: event.target.value.toUpperCase() })} />
+                <TextField select fullWidth label="Currency" value={product.currency} onChange={(event) => setProduct({ ...product, currency: event.target.value })}>
+                  {!product.currency ? <MenuItem value="" disabled>Select currency</MenuItem> : null}
+                  {SUPPORTED_ISO_4217_CURRENCY_CODES.map((currencyCode) => (
+                    <MenuItem key={currencyCode} value={currencyCode}>{currencyCode}</MenuItem>
+                  ))}
+                </TextField>
               </Stack>
               <TextField label="Product URL" type="url" value={product.url} onChange={(event) => setProduct({ ...product, url: event.target.value })} />
               <TextField multiline minRows={3} label="Description" value={product.description} onChange={(event) => setProduct({ ...product, description: event.target.value })} />
@@ -674,7 +760,17 @@ export default function PipelineCatalogDialog({
               </Stack>
               <Stack direction="row" justifyContent="flex-end" gap={1}>
                 <Button onClick={() => setProductEditorOpen(false)} disabled={saving}>Cancel</Button>
-                <Button variant="contained" onClick={() => { void saveProduct() }} disabled={saving || !product.name.trim()}>{saving ? 'Saving…' : 'Save product'}</Button>
+                <Button
+                  variant="contained"
+                  onClick={() => { void saveProduct() }}
+                  disabled={
+                    saving
+                    || !product.name.trim()
+                    || (!product.id && !currencyPreferenceReady)
+                  }
+                >
+                  {saving ? 'Saving…' : 'Save product'}
+                </Button>
               </Stack>
             </Stack>
           </Box>

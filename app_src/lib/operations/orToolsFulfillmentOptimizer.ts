@@ -333,10 +333,11 @@ async function deterministicFallback(
       explanation: [selection.explanation],
     }
   }
+  const warehouseGlobalIds = [warehouseGlobalId]
   const rawPlan = {
-    warehouseGlobalIds: [warehouseGlobalId],
-    warehouseCount: 1,
-    shipmentCount: packages.length,
+    warehouseGlobalIds,
+    warehouseCount: warehouseGlobalIds.length,
+    shipmentCount: warehouseGlobalIds.length,
     cartonCount: packages.length,
     estimatedTotalCostMinor: (
       warehouse.handlingCostMinor

@@ -10,6 +10,11 @@ import {
   stableSuiteCrmId,
 } from '@/lib/crm/stableId'
 import { crmDateOnly } from '@/lib/crm/dateOnly.mjs'
+import {
+  DEFAULT_WORKSPACE_CURRENCY_CODE,
+  isIso4217CurrencyCode,
+  normalizeCurrencyCode,
+} from '@/lib/currency'
 import type {
   CrmActivityStatus,
   CrmContact,
@@ -36,6 +41,9 @@ import {
   upsertProductPackagingProfileWithClient,
   type ProductPackagingProfileInput,
 } from '@/lib/persistence/productPackaging'
+import {
+  readProductChannelStatesInPostgres,
+} from '@/lib/persistence/productChannelStates'
 import { splitPipelineProductNames } from '@/lib/pipeline/productNames.mjs'
 import { query, withTransaction } from '@/lib/persistence/postgres'
 import { appPublicUrl } from '@/lib/publicUrl'
@@ -757,6 +765,14 @@ async function enqueueSuiteCrmRecord(
       ? { previousSuiteCrmModule }
       : {}),
     attributes: suiteCrmAttributes(input, referenceCode),
+    ...(input.entity === 'products'
+      ? {
+        currencyCode: normalizeCurrencyCode(
+          input.fields.currency,
+          DEFAULT_WORKSPACE_CURRENCY_CODE,
+        ),
+      }
+      : {}),
     ...(relationships.length > 0 ? { relationships } : {}),
   }
   const operation = moduleTransition && previousSuiteCrmModule
@@ -1075,8 +1091,11 @@ async function stageContact(
 
 async function stageProduct(client: PoolClient, input: StageProductInput, suiteCrmId: string, sourceHash: string) {
   const fields = input.fields
-  const currency = clean(fields.currency).toUpperCase() || 'USD'
-  if (!/^[A-Z]{3}$/.test(currency)) throw new Error('CRM product currency is invalid')
+  const currency = clean(fields.currency).toUpperCase()
+    || DEFAULT_WORKSPACE_CURRENCY_CODE
+  if (!isIso4217CurrencyCode(currency)) {
+    throw new Error('CRM product currency must be a supported ISO 4217 code')
+  }
   const sku = clean(fields.sku)
   if (sku.length > 25) throw new Error('CRM product SKU must be 25 characters or fewer')
   const result = await client.query<{ id: string; suitecrm_id: string; reference_code: string }>(
@@ -3375,7 +3394,7 @@ function productFromRow(row: Record<string, unknown>): CrmProduct {
     sku: clean(row.sku), productType: clean(row.product_type), category: clean(row.category), status: clean(row.status),
     price: finite(row.price), cost: finite(row.cost), currency: clean(row.currency) || 'USD', url: clean(row.url),
     description: clean(row.description),
-    active: row.active !== false, packaging: null,
+    active: row.active !== false, packaging: null, salesChannels: [],
     syncStatus: row.sync_status as CrmProduct['syncStatus'], syncError: nullable(row.sync_error),
     updatedAt: String(row.updated_at),
   }
@@ -3685,6 +3704,16 @@ export async function listCrmRecordsInPostgres(input: {
        WHERE product.pipeline_id = $1::uuid
          AND ${activeCrmRecordSql('product')}
          AND ($2 = '' OR product.reference_code ILIKE '%' || $2 || '%'
+           OR EXISTS (
+             SELECT 1
+             FROM crm_product_identity_aliases product_identity
+             JOIN crm_products alias_product
+               ON alias_product.pipeline_id = product_identity.pipeline_id
+              AND alias_product.id = product_identity.alias_product_id
+             WHERE product_identity.pipeline_id = product.pipeline_id
+               AND product_identity.canonical_product_id = product.id
+               AND alias_product.reference_code ILIKE '%' || $2 || '%'
+           )
            OR product.name ILIKE '%' || $2 || '%' OR product.sku ILIKE '%' || $2 || '%'
            OR product.product_type ILIKE '%' || $2 || '%' OR product.category ILIKE '%' || $2 || '%'
            OR product.url ILIKE '%' || $2 || '%')
@@ -3693,7 +3722,16 @@ export async function listCrmRecordsInPostgres(input: {
        LIMIT $3`,
       [input.pipelineId, search, limit],
     )
-    return result.rows.map(productFromRow)
+    const products = result.rows.map(productFromRow)
+    const salesChannelsByProduct =
+      await readProductChannelStatesInPostgres({
+        pipelineId: input.pipelineId,
+        productIds: products.map((product) => product.id),
+      })
+    return products.map((product) => ({
+      ...product,
+      salesChannels: salesChannelsByProduct.get(product.id) || [],
+    }))
   }
   if (input.entity === 'leads') {
     const result = await query<Record<string, unknown>>(
@@ -4153,6 +4191,17 @@ async function ensurePipelineCatalogProducts(
   return withTransaction(async (client) => {
     let productsChanged = false
     await lockCrmMutation(client, `pipeline-catalog-products:${context.pipelineId}`)
+    const preference = await client.query<{ currency_code: string | null }>(
+      `SELECT currency_code
+       FROM workspace_organization_preferences
+       WHERE organization_id = $1::uuid
+       LIMIT 1`,
+      [context.workspaceOrganizationId],
+    )
+    const organizationCurrencyCode = normalizeCurrencyCode(
+      preference.rows[0]?.currency_code,
+      DEFAULT_WORKSPACE_CURRENCY_CODE,
+    )
     const state = await client.query<{ catalog: unknown }>(
       `SELECT COALESCE(dropdowns.catalog, setting.value) AS catalog
        FROM pipeline_spaces pipeline
@@ -4215,7 +4264,7 @@ async function ensurePipelineCatalogProducts(
         fields: {
           name: candidate.name,
           status: 'Active',
-          currency: 'USD',
+          currency: organizationCurrencyCode,
           active: true,
         },
       })
@@ -4528,6 +4577,7 @@ export async function upsertPipelineCatalogProductInPostgres(input: {
   pipelineId: string
   actorEmail: string
   id?: string | null
+  defaultCurrencyCode?: string
   fields: StageProductInput['fields']
   packaging?: ProductPackagingProfileInput | null
   deferDropdownSync?: boolean
@@ -4555,6 +4605,17 @@ export async function upsertPipelineCatalogProductInPostgres(input: {
     }
     const row = matches.rows[0]
     if (input.id && !row) throw new Error('Pipeline product was not found')
+    const requestedDefaultCurrency = clean(input.defaultCurrencyCode).toUpperCase()
+      || DEFAULT_WORKSPACE_CURRENCY_CODE
+    if (!isIso4217CurrencyCode(requestedDefaultCurrency)) {
+      throw new Error('Pipeline product default currency must be a supported ISO 4217 code')
+    }
+    const currency = clean(input.fields.currency).toUpperCase()
+      || clean(row?.currency).toUpperCase()
+      || requestedDefaultCurrency
+    if (!isIso4217CurrencyCode(currency)) {
+      throw new Error('CRM product currency must be a supported ISO 4217 code')
+    }
     const collision = await client.query(
       `SELECT 1
        FROM crm_products
@@ -4582,7 +4643,10 @@ export async function upsertPipelineCatalogProductInPostgres(input: {
         source: 'clawpilot_pipeline_catalog',
         workspaceOrganizationId: context.workspaceOrganizationId,
       },
-      fields: input.fields,
+      fields: {
+        ...input.fields,
+        currency,
+      },
     })
     const saved = await client.query<Record<string, unknown>>(
       `SELECT * FROM crm_products WHERE pipeline_id = $1::uuid AND id = $2::uuid LIMIT 1`,
@@ -4810,10 +4874,26 @@ export async function resolveCrmReferenceCode(referenceValue: unknown): Promise<
   if (!isPostgresStorageEnabled()) return referenceCode
   try {
     const result = await query<{ canonical_code: string }>(
-      `SELECT COALESCE(alias.canonical_code, registry.canonical_code) AS canonical_code
+      `SELECT COALESCE(
+         alias.canonical_code,
+         product_alias.canonical_code,
+         registry.canonical_code
+       ) AS canonical_code
        FROM crm_reference_registry registry
        LEFT JOIN crm_reference_aliases alias
          ON alias.alias_code = registry.reference_code
+       LEFT JOIN LATERAL (
+         SELECT canonical.reference_code AS canonical_code
+         FROM crm_products archived_product
+         JOIN crm_product_identity_aliases product_identity
+           ON product_identity.pipeline_id = archived_product.pipeline_id
+          AND product_identity.alias_product_id = archived_product.id
+         JOIN crm_products canonical
+           ON canonical.pipeline_id = product_identity.pipeline_id
+          AND canonical.id = product_identity.canonical_product_id
+         WHERE archived_product.reference_code = registry.reference_code
+         LIMIT 1
+       ) product_alias ON true
        WHERE registry.reference_code = $1
        LIMIT 1`,
       [referenceCode],

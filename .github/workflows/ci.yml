@@ -5,7 +5,12 @@ on:
     branches:
       - main
       - dev
+  # Direct dev/main pushes are authoritative. PR validation is reserved for
+  # feature branches targeting dev so the standing dev -> main promotion PR
+  # does not run the same commit twice.
   pull_request:
+    branches:
+      - dev
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}

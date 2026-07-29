@@ -143,6 +143,12 @@ $trustedHosts = [
 $managed = $startMarker . "\n"
     . '$sugar_config[\'site_url\'] = ' . var_export($publicUrl, true) . ";\n"
     . '$sugar_config[\'trusted_hosts\'] = ' . var_export($trustedHosts, true) . ";\n"
+    // SuiteCRM's reserved currency identity -99 is meaningful only relative
+    // to these fixed base-currency facts. Other ISO currencies must be active
+    // native Currency records; ClawPilot never invents conversion rates.
+    . '$sugar_config[\'default_currency_iso4217\'] = \'USD\';' . "\n"
+    . '$sugar_config[\'default_currency_name\'] = \'US Dollar\';' . "\n"
+    . '$sugar_config[\'default_currency_symbol\'] = \'$\';' . "\n"
     . $endMarker;
 $updated = $prefix . "\n\n" . $managed . "\n?>\n";
 

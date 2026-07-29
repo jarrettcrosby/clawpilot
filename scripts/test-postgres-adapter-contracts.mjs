@@ -719,6 +719,9 @@ assertIncludes(crmAdapter, 'upsertPipelineCatalogProductInPostgres', 'pipeline p
 assertIncludes(crmAdapter, 'This email belongs to a ClawPilot app user and cannot be CRM-only', 'app user and CRM-only identity separation')
 assertIncludes(crmAdapter, 'FROM crm_opportunity_products relationship', 'opportunity product relationship hydration')
 assertIncludes(crmAdapter, "products: 'crm_products'", 'product global-reference mapping')
+assertIncludes(crmAdapter, "product.reference_code ILIKE '%' || $2 || '%'", 'CRM product Global ID search')
+assertIncludes(crmAdapter, "product.name ILIKE '%' || $2 || '%' OR product.sku ILIKE '%' || $2 || '%'", 'CRM product name and SKU search')
+assertIncludes(crmAdapter, "product.product_type ILIKE '%' || $2 || '%' OR product.category ILIKE '%' || $2 || '%'", 'CRM product type and category search')
 
 const rootCrmPunchoutRoute = read('app_src/app/api/crm/punchout/route.ts')
 assertIncludes(rootCrmPunchoutRoute, 'organization.parentId !== null', 'root-only native SuiteCRM punchout')
@@ -1053,6 +1056,16 @@ assertIncludes(suiteCrmClient, 'SuiteCRM employee username must equal the perman
 assertIncludes(suiteCrmClient, 'SuiteCRM user already has a different permanent ClawPilot Global ID', 'SuiteCRM user Global ID overwrite protection')
 assertIncludes(suiteCrmClient, 'ClawPilot user Global ID is already assigned to another SuiteCRM user', 'SuiteCRM user Global ID duplicate protection')
 assertIncludes(suiteCrmClient, "products: 'AOS_Products'", 'SuiteCRM product module mapping')
+assertIncludes(suiteCrmClient, 'resolveSuiteCrmCurrencyId', 'SuiteCRM native currency resolution')
+assertIncludes(suiteCrmClient, "if (normalized === 'USD') return '-99'", 'SuiteCRM fixed USD base-currency identity')
+assertIncludes(suiteCrmClient, '/Api/V8/module/Currencies?', 'SuiteCRM non-USD currency lookup')
+assertIncludes(suiteCrmClient, 'iso4217,status,conversion_rate', 'SuiteCRM currency status and conversion-rate projection')
+assertIncludes(suiteCrmClient, "type !== 'Currency' && type !== 'Currencies'", 'SuiteCRM currency JSON API type validation')
+assertIncludes(suiteCrmClient, "status === 'active'", 'SuiteCRM active currency requirement')
+assertIncludes(suiteCrmClient, 'conversionRate > 0', 'SuiteCRM positive conversion-rate requirement')
+assertIncludes(suiteCrmClient, 'administrator-maintained conversion rate', 'SuiteCRM operator-owned non-USD rate requirement')
+assertIncludes(suiteCrmClient, 'currency_id: currencyId', 'SuiteCRM Product native currency projection')
+assertIncludes(crmAdapter, 'currencyCode: normalizeCurrencyCode', 'CRM Product outbox ISO currency projection')
 assertIncludes(suiteCrmInteractionContactBackfill, "CLAWPILOT_BACKFILL_CONFIRM !== 'interaction-contacts-v1'", 'guarded SuiteCRM interaction contact backfill')
 assertIncludes(suiteCrmInteractionContactBackfill, "linkFieldName: 'contact'", 'SuiteCRM Note contact backfill relationship')
 assertIncludes(suiteCrmInteractionContactBackfill, 'contact_id: row.contact_suitecrm_id', 'SuiteCRM Note contact backfill field')
@@ -1080,11 +1093,12 @@ assertIncludes(suiteCrmClient, 'type !== moduleName && type !== recordType', 'Su
 const suiteCrmGlobalIdBootstrap = read('services/suitecrm/bootstrap-global-id.php')
 assertIncludes(suiteCrmGlobalIdBootstrap, "const CLAWPILOT_GLOBAL_ID_FIELD = 'global_id_c'", 'native SuiteCRM Global ID field')
 assertIncludes(suiteCrmGlobalIdBootstrap, "const CLAWPILOT_NOTE_OCCURRED_AT_FIELD = 'occurred_at_c'", 'native SuiteCRM interaction occurrence field')
+assertIncludes(suiteCrmGlobalIdBootstrap, "const CLAWPILOT_PRODUCT_MODULE = 'AOS_Products'", 'native SuiteCRM Product module')
 assertIncludes(suiteCrmGlobalIdBootstrap, '$field->unified_search = $unifiedSearch ? 1 : 0', 'module-scoped native SuiteCRM Global ID unified search')
 assertIncludes(suiteCrmGlobalIdBootstrap, "ensure_global_id_field('Users', false)", 'native SuiteCRM User Global ID field')
 assertIncludes(suiteCrmGlobalIdBootstrap, "'Meetings'", 'SuiteCRM meeting Global ID field')
 assertIncludes(suiteCrmGlobalIdBootstrap, "'Calls'", 'SuiteCRM Call Global ID field')
-assertIncludes(suiteCrmGlobalIdBootstrap, "'AOS_Products'", 'SuiteCRM product Global ID field')
+assertIncludes(suiteCrmGlobalIdBootstrap, 'CLAWPILOT_PRODUCT_MODULE,', 'SuiteCRM product Global ID field')
 assertIncludes(suiteCrmGlobalIdBootstrap, 'expose_global_id_in_detail_view', 'SuiteCRM Global ID detail layout')
 assertIncludes(suiteCrmGlobalIdBootstrap, 'expose_global_id_in_list_view', 'SuiteCRM Global ID list layout')
 assertIncludes(suiteCrmGlobalIdBootstrap, "expose_global_id_in_search_view($module, 'basic_search')", 'SuiteCRM Global ID basic search layout')
@@ -1093,11 +1107,19 @@ assertIncludes(suiteCrmGlobalIdBootstrap, 'ensure_global_id_search_field', 'Suit
 assertIncludes(suiteCrmGlobalIdBootstrap, "'force_unifiedsearch' => true", 'SuiteCRM immediate unified search inclusion')
 assertIncludes(suiteCrmGlobalIdBootstrap, 'rebuild_and_verify_global_search', 'SuiteCRM Global ID search cache verification')
 assertIncludes(suiteCrmGlobalIdBootstrap, "sugar_cached('modules/unified_search_modules.php')", 'SuiteCRM unified search cache invalidation')
+assertIncludes(suiteCrmGlobalIdBootstrap, 'enable_and_verify_global_search_modules', 'SuiteCRM Product global search enablement')
+assertIncludes(suiteCrmGlobalIdBootstrap, "'unified_search_modules_display'", 'SuiteCRM persisted global search module selection')
+assertIncludes(suiteCrmGlobalIdBootstrap, '\\SuiteCRM\\Search\\SearchModules::getEnabledModules()', 'SuiteCRM enabled search module verification')
+assertIncludes(suiteCrmGlobalIdBootstrap, 'enable_and_verify_global_search_modules([CLAWPILOT_PRODUCT_MODULE])', 'SuiteCRM boot-time Product search contract')
 assertIncludes(suiteCrmGlobalIdBootstrap, 'ensure_note_occurred_at_field', 'SuiteCRM Note occurrence field bootstrap')
+assertIncludes(suiteCrmGlobalIdBootstrap, 'hide_unowned_product_purchases_subpanel', 'SuiteCRM unsupported Product Purchases layout removal')
+assertIncludes(suiteCrmGlobalIdBootstrap, "unset($layout_defs['AOS_Products']['subpanel_setup']['aos_products_purchases'])", 'SuiteCRM Product Purchases subpanel removal')
 
 const suiteCrmEntrypoint = read('services/suitecrm/entrypoint.sh')
 assertIncludes(suiteCrmEntrypoint, 'APP_ENV=prod php bin/console cache:clear --no-warmup', 'strict SuiteCRM application cache clear')
 assertIncludes(suiteCrmEntrypoint, 'APP_ENV=prod php bin/console cache:warmup', 'SuiteCRM application cache warmup')
+assertIncludes(suiteCrmEntrypoint, "default_currency_iso4217\\'] = \\'USD", 'fixed SuiteCRM base ISO currency')
+assertIncludes(suiteCrmEntrypoint, "default_currency_symbol\\'] = \\'$", 'fixed SuiteCRM base currency symbol')
 
 const suiteCrmGlobalIdBackfill = read('scripts/backfill-suitecrm-global-ids.mjs')
 assertIncludes(suiteCrmGlobalIdBackfill, 'global_id_c: row.reference_code', 'existing SuiteCRM Global ID backfill')
@@ -1133,6 +1155,18 @@ assertIncludes(crmPunchoutRoute, "'Cache-Control': 'no-store'", 'native CRM punc
 const crmRoute = read('app_src/app/api/crm/route.ts')
 assertIncludes(crmRoute, 'suiteCrmAdminUsername()', 'admin native CRM username guidance')
 assertIncludes(crmRoute, 'suiteCrmAdminPortalUrl()', 'admin native CRM password-management link')
+
+const crmDataTransferMigration = read('db/migrations/0129_crm_data_transfers.sql')
+const crmDataTransferAdapter = read('app_src/lib/persistence/crmDataTransfers.ts')
+const crmDataTransferRoute = read('app_src/app/api/crm/data-transfer/route.ts')
+assertIncludes(crmDataTransferMigration, 'crm_data_transfer_runs', 'CRM transfer preview run persistence')
+assertIncludes(crmDataTransferMigration, 'crm_data_transfer_rows', 'CRM transfer row classification persistence')
+assertIncludes(crmDataTransferAdapter, 'stageCrmRecordWithClient', 'CRM transfer gateway staging')
+assertIncludes(crmDataTransferAdapter, 'observed_source_hash', 'CRM transfer optimistic source revision')
+assertIncludes(crmDataTransferAdapter, 'FOR UPDATE', 'CRM transfer target locking')
+assertIncludes(crmDataTransferAdapter, 'acquireTransactionAdvisoryLock', 'CRM transfer create serialization')
+assertIncludes(crmDataTransferRoute, 'requireResourceEditor(pipeline)', 'CRM transfer editor authorization')
+assertIncludes(crmDataTransferRoute, 'Meetings, interactions, and campaigns are export-only', 'CRM transfer side-effect boundary')
 
 const crmUi = read('app_src/components/crm/CrmSection.tsx')
 assertIncludes(crmUi, 'SuiteCRM sign in', 'native CRM access dialog')
@@ -1508,6 +1542,111 @@ assertIncludes(healthRoute, '0049_residual_pipeline_catalog_repair.sql', 'hosted
 assertIncludes(healthRoute, '0050_historical_pipeline_catalog_restore.sql', 'hosted historical pipeline catalog migration health')
 assertIncludes(healthRoute, '0051_preserve_configured_pipeline_dropdowns.sql', 'hosted configured pipeline dropdown preservation health')
 assertIncludes(healthRoute, '0052_restore_canonical_dropdown_layout.sql', 'hosted canonical dropdown layout migration health')
+assertIncludes(healthRoute, '0128_operations_pack_hierarchy.sql', 'hosted operations pack hierarchy migration health')
+assertIncludes(healthRoute, '0129_crm_data_transfers.sql', 'hosted CRM data transfer migration health')
+assertIncludes(healthRoute, '0130_operations_product_channel_states.sql', 'hosted product channel state migration health')
+assertIncludes(healthRoute, '0131_crm_product_identity_aliases.sql', 'hosted product identity alias migration health')
+assertIncludes(healthRoute, '0132_operations_product_channel_offers.sql', 'hosted product channel offer migration health')
+assertIncludes(healthRoute, '0133_operations_pack_runtime_association.sql', 'hosted pack runtime association migration health')
+assertIncludes(healthRoute, '0134_operations_commerce_pack_resolution.sql', 'hosted commerce pack resolution migration health')
+assertIncludes(healthRoute, '0135_operations_hybrid_cartonization_recipes.sql', 'hosted hybrid cartonization recipe migration health')
+assertIncludes(healthRoute, '0136_operations_cartonization_package_rates.sql', 'hosted cartonization package rate migration health')
+assertIncludes(healthRoute, '0137_operations_cartonization_rate_evidence.sql', 'hosted cartonization rate evidence migration health')
+assertIncludes(healthRoute, '0138_operations_cartonization_rate_evidence_integrity.sql', 'hosted cartonization rate evidence integrity migration health')
+assertIncludes(healthRoute, '0139_operations_fulfilled_line_price_state.sql', 'hosted fulfilled commerce-line price-state migration health')
+assertIncludes(healthRoute, '0140_operations_commerce_packaging_source_constraint.sql', 'hosted commerce packaging-source repair migration health')
+assertIncludes(healthRoute, '0141_operations_recipe_only_pack_associations.sql', 'hosted recipe-only pack-association migration health')
+assertIncludes(healthRoute, '0142_operations_cartonization_evidence_scale.sql', 'hosted cartonization evidence scale migration health')
+assertIncludes(healthRoute, '0143_operations_cartonization_shipment_rates.sql', 'hosted cartonization shipment-rate migration health')
+assertIncludes(healthRoute, '0144_operations_cartonization_shipment_rate_constraint_repair.sql', 'hosted cartonization shipment-rate constraint repair migration health')
+for (const [, alias] of healthRoute.matchAll(/\)\s+AS\s+([a-z0-9_]+)\s*,?/gi)) {
+  assert.ok(
+    alias.length <= 63,
+    `hosted migration health SQL alias exceeds PostgreSQL's 63-byte identifier limit: ${alias}`,
+  )
+}
+const packRuntimeAssociationMigration = read(
+  'db/migrations/0133_operations_pack_runtime_association.sql',
+)
+for (const fragment of [
+  'operations_packaging_materials_dimension_evidence_valid',
+  "dimension_evidence_type NOT IN ('customer_confirmed', 'measured')",
+  'dimension_evidence_reference IS NOT NULL',
+  'length(btrim(dimension_evidence_reference)) BETWEEN 1 AND 500',
+]) {
+  assertIncludes(
+    packRuntimeAssociationMigration,
+    fragment,
+    'packaging dimension evidence database authority',
+  )
+}
+const commercePackResolutionMigration = read(
+  'db/migrations/0134_operations_commerce_pack_resolution.sql',
+)
+for (const fragment of [
+  'commerce_variant_pack_mapping_id',
+  'commerce_variant_pack_mapping_row_version',
+  'pack_profile_version_id',
+  'pack_profile_version_row_version',
+  'pack_profile_package_level',
+  'pack_profile_base_each_quantity',
+  'packaging_weight_source',
+  "'variant_pack_mapping'",
+  'commerce_order_lines_pack_mapping_fkey',
+]) {
+  assertIncludes(
+    commercePackResolutionMigration,
+    fragment,
+    'commerce pack resolution provenance',
+  )
+}
+const commercePackagingSourceRepairMigration = read(
+  'db/migrations/0140_operations_commerce_packaging_source_constraint.sql',
+)
+for (const fragment of [
+  'operations_commerce_order_candidate_line_packaging_source_check',
+  'DROP CONSTRAINT IF EXISTS commerce_order_lines_packaging_source_valid',
+  "'variant_pack_mapping'",
+]) {
+  assertIncludes(
+    commercePackagingSourceRepairMigration,
+    fragment,
+    'commerce packaging-source generated-constraint repair',
+  )
+}
+const recipeOnlyPackAssociationMigration = read(
+  'db/migrations/0141_operations_recipe_only_pack_associations.sql',
+)
+for (const fragment of [
+  'DROP CONSTRAINT IF EXISTS commerce_order_lines_mapped_pack_source_valid',
+  "packaging_state = 'unresolved'",
+  "packaging_source <> 'variant_pack_mapping'",
+  "'packaging_required' = ANY(blocking_codes)",
+]) {
+  assertIncludes(
+    recipeOnlyPackAssociationMigration,
+    fragment,
+    'recipe-only mapped-pack association database authority',
+  )
+}
+const hybridCartonizationRecipeMigration = read(
+  'db/migrations/0135_operations_hybrid_cartonization_recipes.sql',
+)
+for (const fragment of [
+  'minimum_input_quantity',
+  'content_compatibility_key',
+  'allows_mixed_products',
+  'operations_approved_pack_recipes_mixed_products_valid',
+  'operations_approved_pack_recipes_active_capacity_ready',
+  'operations_product_pack_profile_versions_recipe_only_evidence_valid',
+  "'approved_recipe_only'",
+]) {
+  assertIncludes(
+    hybridCartonizationRecipeMigration,
+    fragment,
+    'hybrid cartonization recipe database authority',
+  )
+}
 assertIncludes(healthRoute, 'readSuiteCrmWorkerHeartbeat', 'hosted SuiteCRM worker health')
 assertIncludes(healthRoute, 'migration_checksums_present', 'hosted migration checksum health')
 assertIncludes(healthRoute, 'queryAgentCredentials', 'shared agent credential store health')

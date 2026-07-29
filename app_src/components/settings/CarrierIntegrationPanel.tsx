@@ -43,7 +43,14 @@ import PrintRounded from '@mui/icons-material/PrintRounded'
 import SaveRounded from '@mui/icons-material/SaveRounded'
 import VisibilityOffRounded from '@mui/icons-material/VisibilityOffRounded'
 import VisibilityRounded from '@mui/icons-material/VisibilityRounded'
+import { useMeasurementSystem } from '@/components/measurements/MeasurementSystemProvider'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
+import {
+  formatDimensionsMm,
+  formatGrams,
+  GRAMS_PER_POUND,
+  MILLIMETERS_PER_INCH,
+} from '@/lib/measurements'
 import { formatUserDateTime } from '@/lib/userDateTime'
 import IntegrationSetupJourney from '@/components/settings/IntegrationSetupJourney'
 
@@ -147,9 +154,9 @@ type CarrierSandboxRateTest = {
       length: number
       width: number
       height: number
-      dimensionUnit: string
+      dimensionUnit: 'IN'
       weight: number
-      weightUnit: string
+      weightUnit: 'LB'
     }
   }
   destinationFingerprint: string
@@ -430,6 +437,7 @@ function errorMessage(error: unknown) {
 
 export default function CarrierIntegrationPanel() {
   const dateTimeSettings = useUserDateTime()
+  const { measurementSystem } = useMeasurementSystem()
   const [provider, setProvider] = useState<CarrierProvider>('ups_rest')
   const [environment, setEnvironment] = useState<CarrierEnvironment>('sandbox')
   const [integrations, setIntegrations] = useState<CarrierIntegrationsState>({ organizationId: '', accounts: [] })
@@ -521,6 +529,25 @@ export default function CarrierIntegrationPanel() {
     && /^[A-Za-z]{2}$/.test(rateDestination.region.trim())
     && /^\d{5}(?:-\d{4})?$/.test(rateDestination.postalCode.trim())
     && rateDestination.countryCode === 'US',
+  )
+  const providerRateParcel = rateTest?.fixture.parcel || {
+    description: 'Test Product',
+    length: 12,
+    width: 10,
+    height: 6,
+    dimensionUnit: 'IN' as const,
+    weight: 5,
+    weightUnit: 'LB' as const,
+  }
+  const selectedUnitRateParcelDimensions = formatDimensionsMm({
+    lengthMm: providerRateParcel.length * MILLIMETERS_PER_INCH,
+    widthMm: providerRateParcel.width * MILLIMETERS_PER_INCH,
+    heightMm: providerRateParcel.height * MILLIMETERS_PER_INCH,
+  }, measurementSystem, { maximumFractionDigits: 2 })
+  const selectedUnitRateParcelWeight = formatGrams(
+    providerRateParcel.weight * GRAMS_PER_POUND,
+    measurementSystem,
+    { maximumFractionDigits: 2 },
   )
   const selectedRate = rateTest?.rates.find((entry) => sandboxRateKey(entry) === selectedRateKey) || null
   const labelOutputProvider = provider === 'fedex_rest' ? 'fedex_rest' : 'ups_rest'
@@ -1856,9 +1883,16 @@ export default function CarrierIntegrationPanel() {
             />
           </Box>
           <Typography variant="body2" color="text.secondary" sx={{ mt: 1.5 }}>
-            Fixed parcel: Test Product, 12 x 10 x 6 IN, 5 LB.
+            Fixed parcel: {providerRateParcel.description} ·{' '}
+            {selectedUnitRateParcelDimensions} · {selectedUnitRateParcelWeight}.
           </Typography>
-          <Typography variant="caption" color="text.disabled">
+          <Typography variant="caption" color="text.disabled" display="block">
+            Provider-native fixture (sent unchanged): {providerRateParcel.length} ×{' '}
+            {providerRateParcel.width} × {providerRateParcel.height}{' '}
+            {providerRateParcel.dimensionUnit} · {providerRateParcel.weight}{' '}
+            {providerRateParcel.weightUnit}.
+          </Typography>
+          <Typography variant="caption" color="text.disabled" display="block">
             Rating returns prices only. No label media, shipment, pickup, manifest, tracking record, print
             job, or carrier charge is created. Enter test data; durable evidence retains address fingerprints,
             not the entered name or street.

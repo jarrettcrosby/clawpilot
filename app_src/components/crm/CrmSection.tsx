@@ -55,10 +55,19 @@ import RefreshRounded from '@mui/icons-material/RefreshRounded'
 import SearchRounded from '@mui/icons-material/SearchRounded'
 import SyncAltRounded from '@mui/icons-material/SyncAltRounded'
 import UploadFileRounded from '@mui/icons-material/UploadFileRounded'
+import DownloadRounded from '@mui/icons-material/DownloadRounded'
+import CallMergeRounded from '@mui/icons-material/CallMergeRounded'
+import CrmDataTransferDialog from '@/components/crm/CrmDataTransferDialog'
+import ProductIdentityDialog from '@/components/crm/ProductIdentityDialog'
+import { useMeasurementSystem } from '@/components/measurements/MeasurementSystemProvider'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import { annotateInteractionEventHistory } from '@/lib/crm/interactionHistory.mjs'
 import WorkspaceSelector from '@/components/workspaces/WorkspaceSelector'
-import type { CrmEntity, CrmSummary } from '@/lib/crm/types'
+import type {
+  CrmEntity,
+  CrmSummary,
+  ProductSalesChannelState,
+} from '@/lib/crm/types'
 import { formatUserDateTime, type UserDateTimeSettings } from '@/lib/userDateTime'
 import { dateTimeLocalValue, zonedDateTimeToIso } from '@/lib/zonedDateTime'
 
@@ -124,6 +133,7 @@ type CrmPayload = {
   pipelineUsers?: CrmPipelineUser[]
   campaignRecipients?: CampaignRecipient[]
   canManageHierarchy?: boolean
+  canManageProductIdentities?: boolean
   suiteCrmPunchoutUrl?: string | null
   suiteCrmUsername?: string | null
   suiteCrmAdminPortalUrl?: string | null
@@ -269,6 +279,107 @@ function money(value: unknown, currency = 'USD') {
   }
 }
 
+function minorMoney(
+  value: string | null,
+  currency: string | null,
+) {
+  if (value === null || currency === null) return null
+  try {
+    const formatter = new Intl.NumberFormat('en-US', {
+      style: 'currency',
+      currency,
+    })
+    const fractionDigits =
+      formatter.resolvedOptions().maximumFractionDigits ?? 2
+    const minorUnits = BigInt(value)
+    if (
+      minorUnits <= BigInt(Number.MAX_SAFE_INTEGER)
+      && minorUnits >= BigInt(Number.MIN_SAFE_INTEGER)
+    ) {
+      return formatter.format(
+        Number(minorUnits) / (10 ** fractionDigits),
+      )
+    }
+    const zero = BigInt(0)
+    const divisor = BigInt(10) ** BigInt(fractionDigits)
+    const absolute = minorUnits < zero ? -minorUnits : minorUnits
+    const major = absolute / divisor
+    const fraction = (absolute % divisor)
+      .toString()
+      .padStart(fractionDigits, '0')
+    const exact = fractionDigits > 0
+      ? `${major}.${fraction}`
+      : major.toString()
+    return `${minorUnits < zero ? '-' : ''}${currency} ${exact}`
+  } catch {
+    return `${currency} ${value} minor units`
+  }
+}
+
+function productMoney(value: unknown, currency: string) {
+  if (currency) return money(value, currency)
+  return `Currency required · ${(Number(value) || 0).toLocaleString('en-US', {
+    maximumFractionDigits: 2,
+  })}`
+}
+
+function productSalesChannels(record: RecordValue) {
+  if (!Array.isArray(record.salesChannels)) return []
+  return record.salesChannels.filter((value): value is ProductSalesChannelState => (
+    Boolean(value)
+    && typeof value === 'object'
+    && ['shopify', 'faire'].includes(
+      String((value as Record<string, unknown>).provider || ''),
+    )
+  ))
+}
+
+function salesChannelStatusLabel(
+  status: ProductSalesChannelState['normalizedStatus'],
+) {
+  if (status === 'active') return 'Source active'
+  return status.slice(0, 1).toUpperCase() + status.slice(1)
+}
+
+function salesChannelStatusColor(
+  status: ProductSalesChannelState['normalizedStatus'],
+) {
+  if (status === 'active') return 'success' as const
+  if (status === 'draft') return 'warning' as const
+  if (status === 'unlisted') return 'info' as const
+  if (status === 'unavailable') return 'error' as const
+  return 'default' as const
+}
+
+function providerLabel(provider: ProductSalesChannelState['provider']) {
+  return provider === 'shopify' ? 'Shopify' : 'Faire'
+}
+
+function salesChannelOfferSummary(channel: ProductSalesChannelState) {
+  const wholesale = minorMoney(
+    channel.wholesalePriceMinor,
+    channel.wholesaleCurrencyCode,
+  )
+  const retail = minorMoney(
+    channel.retailPriceMinor,
+    channel.retailCurrencyCode,
+  )
+  const compareAt = minorMoney(
+    channel.compareAtPriceMinor,
+    channel.compareAtCurrencyCode,
+  )
+  if (channel.provider === 'shopify') {
+    return [
+      retail ? `Current: ${retail}` : null,
+      compareAt ? `Compare at: ${compareAt}` : null,
+    ].filter(Boolean).join(' · ')
+  }
+  return [
+    wholesale ? `Wholesale: ${wholesale}` : null,
+    retail ? `Retail: ${retail}` : null,
+  ].filter(Boolean).join(' · ')
+}
+
 function hierarchyDescendants(hierarchy: WorkspaceOrganization[], organizationId: string) {
   const descendants = new Set<string>()
   let changed = true
@@ -301,7 +412,9 @@ function columns(entity: CrmEntity) {
     ['referenceCode', 'ID'], ['name', 'Opportunity'], ['organization', 'Organization'], ['stage', 'Stage'], ['value', 'Value'],
   ] as const
   if (entity === 'products') return [
-    ['referenceCode', 'ID'], ['name', 'Product'], ['sku', 'SKU'], ['category', 'Category'], ['status', 'Status'], ['price', 'Price'],
+    ['referenceCode', 'ID'], ['name', 'Product'], ['sku', 'SKU'],
+    ['salesChannels', 'Sales channels'], ['status', 'Status'],
+    ['price', 'Price'],
   ] as const
   if (entity === 'meetings') return [
     ['referenceCode', 'ID'], ['subject', 'Meeting'], ['startsAt', 'Starts'], ['status', 'Status'], ['contactName', 'Contact'],
@@ -323,7 +436,12 @@ function entityForReference(reference: string): CrmEntity | null {
   } as Record<string, CrmEntity>)[prefix] || null
 }
 
-function initialFields(entity: CrmEntity, record: RecordValue | null, userTimeZone: string): Record<string, string> {
+function initialFields(
+  entity: CrmEntity,
+  record: RecordValue | null,
+  userTimeZone: string,
+  defaultCurrencyCode: string,
+): Record<string, string> {
   const source = record || {}
   if (entity === 'organizations') return {
     name: textValue(source, 'name'), priority: textValue(source, 'priority'), accountType: textValue(source, 'accountType'),
@@ -363,7 +481,8 @@ function initialFields(entity: CrmEntity, record: RecordValue | null, userTimeZo
   if (entity === 'products') return {
     name: textValue(source, 'name'), sku: textValue(source, 'sku'), productType: textValue(source, 'productType') || 'Good',
     category: textValue(source, 'category'), status: textValue(source, 'status') || 'Active',
-    price: textValue(source, 'price'), cost: textValue(source, 'cost'), currency: textValue(source, 'currency') || 'USD',
+    price: textValue(source, 'price'), cost: textValue(source, 'cost'),
+    currency: textValue(source, 'currency') || (record ? '' : defaultCurrencyCode),
     url: textValue(source, 'url'), active: textValue(source, 'active') || 'true', description: textValue(source, 'description'),
   }
   if (entity === 'meetings') {
@@ -437,8 +556,31 @@ async function loadCrmOptions(entity: CrmEntity): Promise<RecordValue[]> {
   return payload.records || []
 }
 
+function downloadResponseFile(response: Response, blob: Blob, fallbackName: string) {
+  const disposition = response.headers.get('Content-Disposition') || ''
+  const fileName = disposition.match(/filename="([^"]+)"/i)?.[1] || fallbackName
+  const href = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = href
+  link.download = fileName
+  document.body.appendChild(link)
+  link.click()
+  link.remove()
+  window.setTimeout(() => URL.revokeObjectURL(href), 1_000)
+}
+
 export default function CrmSection() {
   const dateTimeSettings = useUserDateTime()
+  const {
+    organizationCurrencyCode,
+    loading: measurementPreferencesLoading,
+    error: measurementPreferencesError,
+    preferencesWritable,
+    refresh: refreshMeasurementPreferences,
+  } = useMeasurementSystem()
+  const currencyPreferenceReady = !measurementPreferencesLoading
+    && !measurementPreferencesError
+    && preferencesWritable
   const narrowMobile = useMediaQuery('(max-width:599.95px)')
   const shortLandscape = useMediaQuery('(orientation: landscape) and (max-height: 500px) and (max-width: 899.95px)')
   const [entity, setEntity] = useState<CrmEntity>('organizations')
@@ -469,6 +611,10 @@ export default function CrmSection() {
   const [pipelineUsers, setPipelineUsers] = useState<CrmPipelineUser[]>([])
   const [workspaceHierarchy, setWorkspaceHierarchy] = useState<WorkspaceOrganization[]>([])
   const [canManageHierarchy, setCanManageHierarchy] = useState(false)
+  const [
+    canManageProductIdentities,
+    setCanManageProductIdentities,
+  ] = useState(false)
   const [suiteCrmPunchoutUrl, setSuiteCrmPunchoutUrl] = useState<string | null>(null)
   const [suiteCrmUsername, setSuiteCrmUsername] = useState<string | null>(null)
   const [suiteCrmAdminPortalUrl, setSuiteCrmAdminPortalUrl] = useState<string | null>(null)
@@ -483,6 +629,9 @@ export default function CrmSection() {
   const [actionFields, setActionFields] = useState<Record<string, string>>({})
   const [lifecycleDialog, setLifecycleDialog] = useState<LifecycleDialog | null>(null)
   const [lifecycleFields, setLifecycleFields] = useState<Record<string, string>>({})
+  const [dataTransferOpen, setDataTransferOpen] = useState(false)
+  const [dataTransferExporting, setDataTransferExporting] = useState(false)
+  const [productIdentityOpen, setProductIdentityOpen] = useState(false)
   const [routeQuery, setRouteQuery] = useState('')
   const [routeReady, setRouteReady] = useState(false)
   const deepLinkOpened = useRef(false)
@@ -503,6 +652,9 @@ export default function CrmSection() {
       setWorkspaceHierarchy(payload.workspaceHierarchy || [])
       setPipelineUsers(payload.pipelineUsers || [])
       setCanManageHierarchy(payload.canManageHierarchy === true)
+      setCanManageProductIdentities(
+        payload.canManageProductIdentities === true,
+      )
       setSuiteCrmPunchoutUrl(payload.suiteCrmPunchoutUrl || null)
       setSuiteCrmUsername(payload.suiteCrmUsername || null)
       setSuiteCrmAdminPortalUrl(payload.suiteCrmAdminPortalUrl || null)
@@ -519,7 +671,12 @@ export default function CrmSection() {
         setEditorEntity(nextEntity)
         setEditorHistory([])
         setEditorRecord(matched)
-        setFields(initialFields(nextEntity, matched, dateTimeSettings.timeZone))
+        setFields(initialFields(
+          nextEntity,
+          matched,
+          dateTimeSettings.timeZone,
+          organizationCurrencyCode,
+        ))
         setUseOrganizationAddress(false)
         if (new URLSearchParams(window.location.search).get('crmAction') === 'compose-email') {
           if (!textValue(matched, 'email')) {
@@ -539,10 +696,71 @@ export default function CrmSection() {
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : 'Unable to load CRM records')
       setRecords([])
+      setCanManageProductIdentities(false)
     } finally {
       setLoading(false)
     }
-  }, [dateTimeSettings.timeZone])
+  }, [dateTimeSettings.timeZone, organizationCurrencyCode])
+
+  const downloadCrmCsvExport = useCallback(async () => {
+    setDataTransferExporting(true)
+    setError('')
+    try {
+      let part = 1
+      let parts = 1
+      do {
+        const response = await fetch(
+          `/api/crm/data-transfer?entity=${encodeURIComponent(entity)}&part=${part}`,
+          { cache: 'no-store' },
+        )
+        if (!response.ok) {
+          const payload = await response.json().catch(() => ({})) as {
+            error?: string
+          }
+          throw new Error(payload.error || 'Unable to export CRM records')
+        }
+        if (part === 1) {
+          const reportedParts = Number(
+            response.headers.get('X-ClawPilot-Export-Parts') || '1',
+          )
+          if (
+            !Number.isSafeInteger(reportedParts)
+            || reportedParts < 1
+            || reportedParts > 100_000
+          ) {
+            throw new Error('CRM export returned an invalid segment count')
+          }
+          parts = reportedParts
+        }
+        const blob = await response.blob()
+        downloadResponseFile(
+          response,
+          blob,
+          `clawpilot-${entity}-part-${part}-of-${parts}.csv`,
+        )
+        part += 1
+      } while (part <= parts)
+      setNotice(parts === 1
+        ? `${ENTITY_LABELS[entity]} exported to CSV.`
+        : `${ENTITY_LABELS[entity]} exported in ${parts} import-ready CSV files.`)
+    } catch (exportError) {
+      setError(exportError instanceof Error
+        ? exportError.message
+        : 'Unable to export CRM records')
+    } finally {
+      setDataTransferExporting(false)
+    }
+  }, [entity])
+
+  useEffect(() => {
+    if (
+      currencyPreferenceReady
+      || editorEntity !== 'products'
+      || editorRecord !== null
+    ) return
+    setEditorRecord(undefined)
+    setFields({})
+  }, [currencyPreferenceReady, editorEntity, editorRecord])
 
   useEffect(() => {
     let cancelled = false
@@ -700,6 +918,14 @@ export default function CrmSection() {
   }, [editorEntity, editorRecord])
 
   const editable = Boolean(pipeline && pipeline.accessRole !== 'viewer' && entity !== 'opportunities')
+  const canTransfer = Boolean(pipeline && pipeline.accessRole !== 'viewer')
+  const canImportCsv = canTransfer && (
+    entity === 'organizations'
+    || entity === 'contacts'
+    || entity === 'products'
+    || entity === 'leads'
+    || entity === 'opportunities'
+  )
   const editorEditable = Boolean(pipeline && pipeline.accessRole !== 'viewer' && editorEntity !== 'opportunities')
   const convertedLead = editorEntity === 'leads'
     && Boolean(editorRecord?.convertedContactId || editorRecord?.convertedOpportunityId)
@@ -775,10 +1001,16 @@ export default function CrmSection() {
 
   function openEditor(record: RecordValue | null) {
     if (!record && !editable) return
+    if (!record && entity === 'products' && !currencyPreferenceReady) return
     setEditorEntity(entity)
     setEditorHistory([])
     setEditorRecord(record)
-    setFields(initialFields(entity, record, dateTimeSettings.timeZone))
+    setFields(initialFields(
+      entity,
+      record,
+      dateTimeSettings.timeZone,
+      organizationCurrencyCode,
+    ))
     setUseOrganizationAddress(false)
     setRelatedContactsLoading(entity === 'organizations' && Boolean(record))
   }
@@ -802,7 +1034,12 @@ export default function CrmSection() {
     setEditorHistory((history) => [...history, { entity: editorEntity, record: editorRecord, fields }])
     setEditorEntity('contacts')
     setEditorRecord(record)
-    setFields(initialFields('contacts', record, dateTimeSettings.timeZone))
+    setFields(initialFields(
+      'contacts',
+      record,
+      dateTimeSettings.timeZone,
+      organizationCurrencyCode,
+    ))
     setUseOrganizationAddress(false)
     setRelatedContactsLoading(false)
   }
@@ -817,7 +1054,12 @@ export default function CrmSection() {
     setEditorHistory((history) => [...history, { entity: editorEntity, record: editorRecord, fields }])
     setEditorEntity('organizations')
     setEditorRecord(record)
-    setFields(initialFields('organizations', record, dateTimeSettings.timeZone))
+    setFields(initialFields(
+      'organizations',
+      record,
+      dateTimeSettings.timeZone,
+      organizationCurrencyCode,
+    ))
     setUseOrganizationAddress(false)
     setRelatedContactsLoading(true)
   }
@@ -827,7 +1069,12 @@ export default function CrmSection() {
     setEditorHistory((history) => [...history, { entity: editorEntity, record: editorRecord, fields }])
     setEditorEntity('opportunities')
     setEditorRecord(record)
-    setFields(initialFields('opportunities', record, dateTimeSettings.timeZone))
+    setFields(initialFields(
+      'opportunities',
+      record,
+      dateTimeSettings.timeZone,
+      organizationCurrencyCode,
+    ))
     setUseOrganizationAddress(false)
     setRelatedContactsLoading(false)
   }
@@ -837,7 +1084,12 @@ export default function CrmSection() {
     setEditorHistory((history) => [...history, { entity: editorEntity, record: editorRecord, fields }])
     setEditorEntity('interactions')
     setEditorRecord(record)
-    setFields(initialFields('interactions', record, dateTimeSettings.timeZone))
+    setFields(initialFields(
+      'interactions',
+      record,
+      dateTimeSettings.timeZone,
+      organizationCurrencyCode,
+    ))
     setUseOrganizationAddress(false)
     setRelatedContactsLoading(false)
     setRelatedActivityLoading(false)
@@ -1232,6 +1484,26 @@ export default function CrmSection() {
       <Box sx={{ px: shortLandscape ? 1 : { xs: 2, md: 3 }, pt: shortLandscape ? 0.25 : 1.25, flexShrink: 0 }}>
         {error && <Alert severity="error" onClose={() => setError('')} sx={{ mb: 1 }}>{error}</Alert>}
         {notice && <Alert severity="success" onClose={() => setNotice('')} sx={{ mb: 1 }}>{notice}</Alert>}
+        {entity === 'products' && !currencyPreferenceReady ? (
+          <Alert
+            severity={measurementPreferencesError ? 'warning' : 'info'}
+            sx={{ mb: 1 }}
+            action={!measurementPreferencesLoading ? (
+              <Button
+                color="inherit"
+                size="small"
+                onClick={() => { void refreshMeasurementPreferences() }}
+              >
+                Retry
+              </Button>
+            ) : undefined}
+          >
+            {measurementPreferencesLoading
+              ? 'Loading the organization currency before a new Product can be added.'
+              : measurementPreferencesError
+                || 'Choose an active organization before adding a Product.'}
+          </Alert>
+        ) : null}
         <Stack direction={shortLandscape ? 'row' : 'column'} gap={shortLandscape ? 0.75 : 0} alignItems={shortLandscape ? 'center' : 'stretch'} sx={shortLandscape ? { overflowX: 'auto', WebkitOverflowScrolling: 'touch' } : undefined}>
           <Stack
             direction={shortLandscape ? 'row' : { xs: 'column', sm: 'row' }}
@@ -1254,6 +1526,43 @@ export default function CrmSection() {
               ))}
             </Tabs>
             <Stack data-testid="crm-record-actions" direction="row" gap={0.75} alignItems="center" sx={{ flexShrink: 0, alignSelf: { xs: 'flex-end', sm: 'auto' } }}>
+              {canTransfer && (
+                <Tooltip title={`Export ${ENTITY_LABELS[entity].toLowerCase()} CSV`}>
+                  <IconButton
+                    aria-label={`Export ${ENTITY_LABELS[entity]} CSV`}
+                    disabled={dataTransferExporting}
+                    onClick={() => { void downloadCrmCsvExport() }}
+                  >
+                    {dataTransferExporting
+                      ? <CircularProgress size={20} />
+                      : <DownloadRounded />}
+                  </IconButton>
+                </Tooltip>
+              )}
+              {canImportCsv && (
+                <Tooltip title={`Import ${ENTITY_LABELS[entity].toLowerCase()} CSV`}>
+                  <IconButton
+                    aria-label={`Import ${ENTITY_LABELS[entity]} CSV`}
+                    disabled={busy}
+                    onClick={() => setDataTransferOpen(true)}
+                  >
+                    <UploadFileRounded />
+                  </IconButton>
+                </Tooltip>
+              )}
+              {entity === 'products'
+                && canTransfer
+                && canManageProductIdentities ? (
+                <Tooltip title="Resolve duplicate sales-channel product identities">
+                  <IconButton
+                    aria-label="Resolve duplicate product identities"
+                    disabled={busy}
+                    onClick={() => setProductIdentityOpen(true)}
+                  >
+                    <CallMergeRounded />
+                  </IconButton>
+                </Tooltip>
+              ) : null}
               {pipeline?.accessRole === 'owner' && (
                 <>
                   <Tooltip title="Import the connected workbook into CRM">
@@ -1269,7 +1578,12 @@ export default function CrmSection() {
                 </>
               )}
               {editable && (
-                <Button variant="contained" startIcon={<AddRounded />} onClick={() => openEditor(null)}>
+                <Button
+                  variant="contained"
+                  startIcon={<AddRounded />}
+                  disabled={entity === 'products' && !currencyPreferenceReady}
+                  onClick={() => openEditor(null)}
+                >
                   Add
                 </Button>
               )}
@@ -1341,8 +1655,42 @@ export default function CrmSection() {
                         >
                           {textValue(record, key)}
                         </Link>
-                      ) : (entity === 'opportunities' && key === 'value') || (entity === 'products' && key === 'price')
-                        ? money(record[key], entity === 'products' ? textValue(record, 'currency') || 'USD' : 'USD')
+                      ) : entity === 'products' && key === 'price'
+                        ? productMoney(record[key], textValue(record, 'currency'))
+                        : entity === 'products' && key === 'salesChannels'
+                          ? (
+                            <Stack
+                              direction="row"
+                              gap={0.5}
+                              flexWrap="wrap"
+                              sx={{ minWidth: 150 }}
+                            >
+                              {productSalesChannels(record).map((channel) => (
+                                <Tooltip
+                                  key={channel.id}
+                                  title={`${channel.integrationAccountName} · Connection ${channel.integrationAccountStatus}`}
+                                >
+                                  <Chip
+                                    size="small"
+                                    variant="outlined"
+                                    color={salesChannelStatusColor(
+                                      channel.normalizedStatus,
+                                    )}
+                                    label={`${providerLabel(channel.provider)} · ${salesChannelStatusLabel(channel.normalizedStatus)}`}
+                                  />
+                                </Tooltip>
+                              ))}
+                              {productSalesChannels(record).length === 0 ? (
+                                <Chip
+                                  size="small"
+                                  variant="outlined"
+                                  label="Local only"
+                                />
+                              ) : null}
+                            </Stack>
+                          )
+                        : entity === 'opportunities' && key === 'value'
+                          ? money(record[key])
                         : displayValue(record, key, dateTimeSettings)}
                     </TableCell>
                   ))}
@@ -1363,6 +1711,27 @@ export default function CrmSection() {
           </Table>
         )}
       </TableContainer>
+
+      <CrmDataTransferDialog
+        open={dataTransferOpen}
+        entity={entity}
+        onClose={() => setDataTransferOpen(false)}
+        onApplied={async (count, warnings) => {
+          const warningText = warnings.length > 0
+            ? ` ${warnings.join(' ')}`
+            : ''
+          setNotice(`${count} CRM record${count === 1 ? '' : 's'} imported and queued for sync.${warningText}`)
+          await load(entity, query, needsReviewOnly)
+        }}
+      />
+
+      <ProductIdentityDialog
+        open={productIdentityOpen}
+        onClose={() => setProductIdentityOpen(false)}
+        onChanged={async () => {
+          await load(entity, query, needsReviewOnly)
+        }}
+      />
 
       <Dialog
         open={suiteCrmAccessOpen}
@@ -1891,6 +2260,121 @@ export default function CrmSection() {
               <Inventory2Rounded color="primary" />
               <Typography variant="subtitle2" fontWeight={700}>Product catalog record</Typography>
             </Stack>
+            {editorRecord ? (
+              <Stack spacing={1}>
+                <Typography variant="subtitle2" fontWeight={700}>
+                  Sales channel presence
+                </Typography>
+                <Alert severity="info">
+                  Provider lifecycle is read-only and separate from this
+                  product&apos;s ClawPilot availability. “Source active” does
+                  not by itself prove storefront publication.
+                </Alert>
+                {productSalesChannels(editorRecord).map((channel) => (
+                  <Box
+                    key={channel.id}
+                    sx={{
+                      border: '1px solid',
+                      borderColor: 'divider',
+                      borderRadius: 1,
+                      p: 1.25,
+                    }}
+                  >
+                    <Stack
+                      direction="row"
+                      gap={0.75}
+                      flexWrap="wrap"
+                      alignItems="center"
+                    >
+                      <Chip
+                        size="small"
+                        label={providerLabel(channel.provider)}
+                      />
+                      <Chip
+                        size="small"
+                        variant="outlined"
+                        color={salesChannelStatusColor(
+                          channel.normalizedStatus,
+                        )}
+                        label={salesChannelStatusLabel(
+                          channel.normalizedStatus,
+                        )}
+                      />
+                      {channel.integrationAccountStatus !== 'active' ? (
+                        <Chip
+                          size="small"
+                          variant="outlined"
+                          color="warning"
+                          label={`Connection ${channel.integrationAccountStatus}`}
+                        />
+                      ) : null}
+                    </Stack>
+                    <Typography variant="body2" sx={{ mt: 0.75 }}>
+                      {channel.integrationAccountName} · {channel.environment}
+                    </Typography>
+                    <Typography
+                      variant="caption"
+                      color="text.secondary"
+                      display="block"
+                    >
+                      Listing: {channel.providerProductTitle || 'Unavailable'}
+                      {channel.providerVariantTitle
+                        ? ` · ${channel.providerVariantTitle}`
+                        : ''}
+                    </Typography>
+                    <Typography
+                      variant="caption"
+                      color="text.secondary"
+                      display="block"
+                    >
+                      SKU: {channel.providerSku || 'Unavailable'}
+                      {channel.providerBarcode
+                        ? ` · Barcode: ${channel.providerBarcode}`
+                        : ''}
+                    </Typography>
+                    {salesChannelOfferSummary(channel) ? (
+                      <Typography
+                        variant="caption"
+                        color="text.secondary"
+                        display="block"
+                      >
+                        {salesChannelOfferSummary(channel)}
+                      </Typography>
+                    ) : null}
+                    <Typography
+                      variant="caption"
+                      color="text.secondary"
+                      display="block"
+                    >
+                      Provider status: {channel.providerStatusRaw} · Variant: {channel.externalVariantId}
+                    </Typography>
+                    <Typography
+                      variant="caption"
+                      color="text.secondary"
+                      display="block"
+                    >
+                      Last observed: {formatUserDateTime(
+                        channel.observedAt,
+                        dateTimeSettings,
+                        {
+                          year: 'numeric',
+                          month: 'short',
+                          day: 'numeric',
+                          hour: 'numeric',
+                          minute: '2-digit',
+                          fallback: 'Unknown',
+                        },
+                      )}
+                    </Typography>
+                  </Box>
+                ))}
+                {productSalesChannels(editorRecord).length === 0 ? (
+                  <Typography variant="body2" color="text.secondary">
+                    No sales-channel variant is mapped to this product.
+                  </Typography>
+                ) : null}
+              </Stack>
+            ) : null}
             <TextField disabled={!recordEditable} label="Product name" value={fields.name || ''} onChange={(event) => setFields({ ...fields, name: event.target.value })} required />
             <Stack direction={{ xs: 'column', sm: 'row' }} gap={2} sx={{ minWidth: 0 }}>
               <TextField fullWidth disabled={!recordEditable} label="SKU" value={fields.sku || ''} inputProps={{ maxLength: 25 }} onChange={(event) => setFields({ ...fields, sku: event.target.value.slice(0, 25) })} helperText="Up to 25 characters" />

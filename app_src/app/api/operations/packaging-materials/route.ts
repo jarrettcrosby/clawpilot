@@ -4,6 +4,9 @@ import {
   operationsCapabilities,
 } from '@/lib/operations/authorization'
 import {
+  PACKAGING_DIMENSION_BASES,
+  PACKAGING_DIMENSION_EVIDENCE_TYPES,
+  PACKAGING_MATERIAL_SOURCES,
   PACKAGING_MATERIAL_STATUSES,
   PACKAGING_MATERIAL_TYPES,
   type PackagingMaterialInput,
@@ -36,11 +39,15 @@ const MATERIAL_FIELDS = new Set([
   'innerLengthMm',
   'innerWidthMm',
   'innerHeightMm',
+  'dimensionBasis',
+  'dimensionEvidenceType',
+  'dimensionEvidenceReference',
   'tareWeightGrams',
   'maxWeightGrams',
   'unitCostMinor',
   'currency',
   'status',
+  'source',
 ])
 const STOCK_FIELDS = new Set([
   'action',
@@ -99,6 +106,11 @@ function textValue(value: unknown, label: string, max: number) {
     fail('PACKAGING_MATERIAL_REQUEST_INVALID', `${label} is invalid`)
   }
   return text
+}
+
+function optionalTextValue(value: unknown, label: string, max: number) {
+  if (value === null || value === undefined || value === '') return null
+  return textValue(value, label, max)
 }
 
 function integerValue(
@@ -171,19 +183,72 @@ function materialInput(value: Record<string, unknown>): PackagingMaterialInput {
   if (!PACKAGING_MATERIAL_STATUSES.includes(status)) {
     fail('PACKAGING_MATERIAL_REQUEST_INVALID', 'Material status is invalid')
   }
-  const tareWeightGrams = integerValue(
+  const innerLengthMm = optionalIntegerValue(
+    value.innerLengthMm,
+    'Package length',
+    1,
+    100_000,
+  )
+  const innerWidthMm = optionalIntegerValue(
+    value.innerWidthMm,
+    'Package width',
+    1,
+    100_000,
+  )
+  const innerHeightMm = optionalIntegerValue(
+    value.innerHeightMm,
+    'Package height',
+    1,
+    100_000,
+  )
+  const dimensionBasis = textValue(
+    value.dimensionBasis || 'unspecified',
+    'Dimension basis',
+    20,
+  ) as PackagingMaterialInput['dimensionBasis']
+  if (!PACKAGING_DIMENSION_BASES.includes(dimensionBasis)) {
+    fail('PACKAGING_MATERIAL_REQUEST_INVALID', 'Dimension basis is invalid')
+  }
+  const dimensionEvidenceType = textValue(
+    value.dimensionEvidenceType || 'unknown',
+    'Dimension evidence type',
+    30,
+  ) as PackagingMaterialInput['dimensionEvidenceType']
+  if (!PACKAGING_DIMENSION_EVIDENCE_TYPES.includes(dimensionEvidenceType)) {
+    fail('PACKAGING_MATERIAL_REQUEST_INVALID', 'Dimension evidence type is invalid')
+  }
+  const dimensionEvidenceReference = optionalTextValue(
+    value.dimensionEvidenceReference,
+    'Dimension evidence reference',
+    500,
+  )
+  if (
+    ['customer_confirmed', 'measured'].includes(dimensionEvidenceType)
+    && dimensionEvidenceReference === null
+  ) {
+    fail(
+      'PACKAGING_MATERIAL_EVIDENCE_REQUIRED',
+      'Describe the customer confirmation or measurement evidence',
+      409,
+    )
+  }
+  const tareWeightGrams = optionalIntegerValue(
     value.tareWeightGrams,
     'Tare weight',
     1,
     100_000_000,
   )
-  const maxWeightGrams = integerValue(
+  const maxWeightGrams = optionalIntegerValue(
     value.maxWeightGrams,
     'Maximum weight',
-    2,
+    1,
     100_000_000,
   )
-  if (maxWeightGrams <= tareWeightGrams) {
+  if (
+    maxWeightGrams !== null
+    && tareWeightGrams !== null
+    && maxWeightGrams <= tareWeightGrams
+  ) {
     fail(
       'PACKAGING_MATERIAL_REQUEST_INVALID',
       'Maximum weight must be greater than tare weight',
@@ -208,35 +273,50 @@ function materialInput(value: Record<string, unknown>): PackagingMaterialInput {
       409,
     )
   }
+  const source = textValue(
+    value.source || 'manual',
+    'Packaging material source',
+    30,
+  ) as PackagingMaterialInput['source']
+  if (!PACKAGING_MATERIAL_SOURCES.includes(source)) {
+    fail('PACKAGING_MATERIAL_REQUEST_INVALID', 'Packaging material source is invalid')
+  }
+  if (
+    status === 'active'
+    && (
+      innerLengthMm === null
+      || innerWidthMm === null
+      || innerHeightMm === null
+      || dimensionBasis !== 'inner'
+      || dimensionEvidenceType === 'unknown'
+      || tareWeightGrams === null
+      || maxWeightGrams === null
+    )
+  ) {
+    fail(
+      'PACKAGING_MATERIAL_PHYSICAL_FACTS_REQUIRED',
+      'Activation requires verified inner dimensions, tare weight, and maximum weight',
+      409,
+    )
+  }
   return {
     globalId,
     expectedRowVersion,
     code,
     name: textValue(value.name, 'Packaging material name', 120),
     materialType,
-    innerLengthMm: integerValue(
-      value.innerLengthMm,
-      'Inner length',
-      1,
-      100_000,
-    ),
-    innerWidthMm: integerValue(
-      value.innerWidthMm,
-      'Inner width',
-      1,
-      100_000,
-    ),
-    innerHeightMm: integerValue(
-      value.innerHeightMm,
-      'Inner height',
-      1,
-      100_000,
-    ),
+    innerLengthMm,
+    innerWidthMm,
+    innerHeightMm,
+    dimensionBasis,
+    dimensionEvidenceType,
+    dimensionEvidenceReference,
     tareWeightGrams,
     maxWeightGrams,
     unitCostMinor,
     currency,
     status,
+    source,
   }
 }
 

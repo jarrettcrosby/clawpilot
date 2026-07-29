@@ -363,6 +363,41 @@ const faireNormalized = faire.normalizeFaireCommerce(
     apiVersion: 'external-api-v2',
   },
 )
+
+const maximumVariantTitle = 'V'.repeat(512)
+const shopifyMaximumVariantTitleSource = clone(shopifySource)
+shopifyMaximumVariantTitleSource.products.nodes[0].variants.nodes[0].title =
+  maximumVariantTitle
+const shopifyMaximumVariantTitle = shopify.normalizeShopifyCommerce(
+  shopifyMaximumVariantTitleSource,
+  {
+    ...baseContext,
+    externalAccountId: 'gid://shopify/Shop/1',
+  },
+)
+assert.equal(
+  shopifyMaximumVariantTitle.products[0].variants[0].title,
+  maximumVariantTitle,
+  'Shopify variant titles must preserve the full 512-character normalizer bound',
+)
+
+const faireMaximumVariantTitleSource = clone(faireSource)
+faireMaximumVariantTitleSource.products[0].variants[0].name =
+  maximumVariantTitle
+const faireMaximumVariantTitle = faire.normalizeFaireCommerce(
+  faireMaximumVariantTitleSource,
+  {
+    ...baseContext,
+    externalAccountId: 'brand-1',
+    apiVersion: 'external-api-v2',
+  },
+)
+assert.equal(
+  faireMaximumVariantTitle.products[0].variants[0].title,
+  maximumVariantTitle,
+  'Faire variant titles must preserve the full 512-character normalizer bound',
+)
+
 const fairePageWrapped = faire.normalizeFaireCommerce({
   brand: clone(faireSource.brand),
   products: {
@@ -381,6 +416,29 @@ const fairePageWrapped = faire.normalizeFaireCommerce({
 
 assert.equal(shopifyNormalized.rejections.length, 0)
 assert.equal(faireNormalized.rejections.length, 0)
+for (const lifecycle of ['DRAFT', 'ARCHIVED', 'UNLISTED']) {
+  const source = clone(shopifySource)
+  source.products.nodes[0].status = lifecycle
+  const normalized = shopify.normalizeShopifyCommerce(source, {
+    ...baseContext,
+    externalAccountId: 'gid://shopify/Shop/1',
+  })
+  assert.equal(normalized.products.length, 1)
+  assert.equal(normalized.products[0].lifecycleState, lifecycle)
+  assert.equal(normalized.products[0].active, false)
+}
+for (const lifecycle of ['DRAFT', 'ARCHIVED', 'UNAVAILABLE']) {
+  const source = clone(faireSource)
+  source.products[0].lifecycle_state = lifecycle
+  source.products[0].active = false
+  const normalized = faire.normalizeFaireCommerce(source, {
+    ...baseContext,
+    externalAccountId: 'brand-1',
+  })
+  assert.equal(normalized.products.length, 1)
+  assert.equal(normalized.products[0].lifecycleState, lifecycle)
+  assert.equal(normalized.products[0].active, false)
+}
 for (const normalized of [shopifyNormalized, faireNormalized]) {
   assert.deepEqual(headerMoneyProjection(normalized.orders[0]), {
     state: 'complete',

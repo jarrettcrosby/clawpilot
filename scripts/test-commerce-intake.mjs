@@ -148,6 +148,15 @@ includes(catalogSyncMigration, [
   'operations_commerce_catalog_sync_completion_valid',
   "'Product-only Shopify/Faire catalog backfill",
 ], 'Commerce catalog-sync migration')
+const fulfilledLinePriceMigration = read(
+  'db/migrations/0139_operations_fulfilled_line_price_state.sql',
+)
+includes(fulfilledLinePriceMigration, [
+  'DROP CONSTRAINT IF EXISTS commerce_order_lines_price_block_valid',
+  'unfulfilled_quantity = 0',
+  "price_resolution_state <> 'unresolved'",
+  "'line_price_required' = ANY(blocking_codes)",
+], 'Fulfilled commerce-line price-state migration')
 const catalogSyncPersistenceSource = read(
   'app_src/lib/persistence/commerceCatalogSync.ts',
 )
@@ -636,6 +645,10 @@ assert.equal(
 )
 
 const serviceSource = read('app_src/lib/integrations/commerceIntake.ts')
+includes(serviceSource, [
+  "resolution.identityConflictPolicy === 'provider_qualified'",
+  "identityConflictPolicy:",
+], 'Collision-safe explicit product command parsing')
 const backgroundCatalogPageSource = serviceSource.slice(
   serviceSource.indexOf(
     'export async function executeCommerceCatalogProductPage',
@@ -709,6 +722,7 @@ includes(serviceSource, [
   'listFaireOrders',
   'listFaireProducts',
   'listFaireInventory',
+  'product_status:ACTIVE,ARCHIVED,DRAFT,UNLISTED',
   'SHOPIFY_ORDER_PAGE_SIZE = 25',
   'FAIRE_ORDER_PAGE_SIZE = 50',
   'FAIRE_INVENTORY_SELECTOR_LIMIT = 50',
@@ -724,6 +738,9 @@ includes(serviceSource, [
   'markCommerceIntakeProviderReadUncertainInPostgres',
   'readCommerceIntakeRejectionTargetFromPostgres',
   'excludeCommerceIntakeRejectionInPostgres',
+  'providerAttemptActorEmail',
+  'options.providerAttemptActorEmail === undefined',
+  'providerAttemptActorEmail: null',
   'readOnly: true',
   'providerWrites: 0',
   'syncCursorAdvanced: false',
@@ -768,6 +785,62 @@ for (const providerWrite of [
 }
 
 const persistenceSource = read('app_src/lib/persistence/commerceIntake.ts')
+includes(persistenceSource, [
+  'providerAttemptActorEmail: string | null',
+  'input.providerAttemptActorEmail',
+  "SET disposition = 'retried'",
+  'retry_run_id = $2::uuid',
+], 'Successful exact-order retry closes the matching legacy rejection')
+includes(persistenceSource, [
+  'resolveCommerceRuntimePack',
+  'operations_commerce_variant_pack_mappings pack_mapping',
+  'operations_product_pack_profile_versions profile_version',
+  'profile_version.fit_model',
+  'operations_product_channel_states channel_state',
+  'pack_mapping.source_revision =',
+  'channel_state.source_revision',
+  'pack_mapping.source_hash = channel_state.source_hash',
+  'commerce_variant_pack_mapping_id',
+  'commerce_variant_pack_mapping_row_version',
+  'pack_profile_version_id',
+  'pack_profile_version_row_version',
+  'pack_profile_package_level',
+  'pack_profile_base_each_quantity',
+  'packaging_weight_source',
+  'fitModel: row.fit_model',
+  'runtimePack.association',
+  "runtimePack.reason === 'recipe_required'",
+  "packagingState === 'unresolved'",
+  "codes.push('packaging_required')",
+  "'variant_pack_mapping'",
+  'COMMERCE_INTAKE_PACK_MAPPING_STALE',
+], 'Exact-source provider pack resolution and promotion fencing')
+const manualPackageResolutionSource = persistenceSource.slice(
+  persistenceSource.indexOf(
+    'export async function resolveCommerceCandidatePackageInPostgres',
+  ),
+  persistenceSource.indexOf(
+    'export async function validateCommerceCandidateInPostgres',
+  ),
+)
+for (const fragment of [
+  'commerce_variant_pack_mapping_id = NULL',
+  'commerce_variant_pack_mapping_row_version = NULL',
+  'pack_profile_version_id = NULL',
+  'pack_profile_version_row_version = NULL',
+  'pack_profile_package_level = NULL',
+  'pack_profile_base_each_quantity = NULL',
+  'packaging_weight_source = NULL',
+]) {
+  assert.ok(
+    manualPackageResolutionSource.includes(fragment),
+    `Manual package resolution must clear mapped provenance: ${fragment}`,
+  )
+}
+includes(continuationMigration, [
+  'candidate.external_order_id = NEW.external_id',
+  'Commerce intake retry run must contain exact target evidence',
+], 'Exact-order rejection closure requires exact retry-run evidence')
 includes(persistenceSource, [
   'latestProductEvidenceByVariant',
   'candidate.provider = $3',
@@ -918,6 +991,8 @@ includes(persistenceSource, [
   "'excluded_no_unfulfilled_quantity'",
   'line.unfulfilled_quantity,',
   "'no_unfulfilled_quantity'",
+  'quantity.unfulfilled > 0',
+  "&& !codes.includes('line_price_required')",
   'PRODUCT_CANDIDATE_SELECT',
   'SELECT DISTINCT ON (selected.external_variant_id)',
   'latest_unexpired_per_account_provider_variant',
@@ -1020,7 +1095,13 @@ includes(productCandidateResolverSource, [
   'id: preservedAutomaticMapping.id',
   'global_id: preservedAutomaticMapping.global_id',
   'allowReplacement: !input.automatic',
-  'if (input.automatic && localProductSku)',
+  "input.resolution.identityConflictPolicy === 'provider_qualified'",
+  'if (collisionSafeIdentity && localProductSku)',
+  'collisionSafeLocalProductDisplayName(client',
+  'commerce-catalog-local-name:',
+  'namingPolicyVersion: \'commerce-product-display-name-v2\'',
+  'identityConflictPolicy: collisionSafeIdentity',
+  'resolvedName: localProductName',
   'commerce-catalog-local-sku:',
   'lower(btrim(sku)) = lower(btrim($2))',
   'automaticLocalProductSku({',
@@ -1033,6 +1114,22 @@ includes(productCandidateResolverSource, [
   'channelSku: candidate.sku_snapshot || product.sku',
   'automaticLocalSkuOmitted',
 ], 'Automatic exact-mapping preservation')
+const commerceProductNamingModule = loadTypeScriptModule(
+  'app_src/lib/integrations/commerceProductNaming.ts',
+)
+const commerceProductLifecycleModule = loadTypeScriptModule(
+  'app_src/lib/integrations/commerceProductLifecycle.ts',
+)
+const commerceCanonicalProductIdentityModule = loadTypeScriptModule(
+  'app_src/lib/integrations/commerceCanonicalProductIdentity.ts',
+)
+const commerceProductChannelOffersModule = loadTypeScriptModule(
+  'app_src/lib/integrations/commerceProductChannelOffers.ts',
+)
+const commercePackRuntimeModule = loadTypeScriptModule(
+  'app_src/lib/integrations/commercePackRuntime.ts',
+)
+const productIdentityLocks = []
 const automaticProductResolutionModule = loadTypeScriptModule(
   'app_src/lib/persistence/commerceIntake.ts',
   {
@@ -1043,12 +1140,30 @@ const automaticProductResolutionModule = loadTypeScriptModule(
         CommerceIntegrationRequestError: class extends Error {},
       },
       '@/lib/integrations/commerceProductMappingPolicy': {},
+      '@/lib/integrations/commerceProductNaming':
+        commerceProductNamingModule,
+      '@/lib/integrations/commerceProductLifecycle':
+        commerceProductLifecycleModule,
+      '@/lib/integrations/commerceCanonicalProductIdentity':
+        commerceCanonicalProductIdentityModule,
+      '@/lib/integrations/commerceProductChannelOffers':
+        commerceProductChannelOffersModule,
+      '@/lib/integrations/commercePackRuntime':
+        commercePackRuntimeModule,
       '@/lib/operations/commerceNormalization': {
         commerceCurrencyMinorUnit: () => 2,
       },
       '@/lib/persistence/crm': {},
-      '@/lib/persistence/postgres': {},
+      '@/lib/persistence/postgres': {
+        async acquireTransactionAdvisoryLock(_client, key) {
+          productIdentityLocks.push(key)
+        },
+      },
       '@/lib/persistence/commerceCatalogSync': {},
+      '@/lib/persistence/productChannelStates': {
+        async linkProductChannelStateWithClient() {},
+        async upsertProductChannelStateWithClient() {},
+      },
     },
   },
 )
@@ -1111,6 +1226,90 @@ assert.equal(
   'PROVIDER-SKU',
   'An available provider SKU must remain on the automatic local product',
 )
+const collisionNames =
+  automaticProductResolutionModule.automaticProductDisplayNameCandidates({
+    requestedName: 'Apple Crisp 10lb',
+    provider: 'faire',
+    externalVariantId: 'faire-variant-1',
+  })
+assert.equal(collisionNames[0], 'Apple Crisp 10lb')
+assert.equal(collisionNames[1], 'Apple Crisp 10lb · Faire')
+assert.match(
+  collisionNames[2],
+  /^Apple Crisp 10lb · Faire · [a-f0-9]{12}$/,
+)
+assert.equal(new Set(collisionNames).size, 3)
+function collisionNameClient(occupiedNames) {
+  return {
+    async query(sql, parameters) {
+      assert.match(sql, /FROM crm_products/)
+      assert.match(sql, /lower\(name\) = ANY\(\$2::text\[\]\)/)
+      assert.equal(parameters[0], 'pipeline-test-id')
+      assert.deepEqual(
+        JSON.parse(JSON.stringify(parameters[1])),
+        JSON.parse(JSON.stringify(
+          collisionNames.map((name) => name.toLocaleLowerCase('en-US')),
+        )),
+      )
+      return {
+        rows: occupiedNames.map((name) => ({ name })),
+      }
+    },
+  }
+}
+assert.equal(
+  await automaticProductResolutionModule.collisionSafeLocalProductDisplayName(
+    collisionNameClient([]),
+    {
+      pipelineId: 'pipeline-test-id',
+      requestedName: 'Apple Crisp 10lb',
+      provider: 'faire',
+      externalVariantId: 'faire-variant-1',
+    },
+  ),
+  collisionNames[0],
+  'An available canonical name must remain unchanged',
+)
+assert.equal(
+  await automaticProductResolutionModule.collisionSafeLocalProductDisplayName(
+    collisionNameClient([collisionNames[0]]),
+    {
+      pipelineId: 'pipeline-test-id',
+      requestedName: 'Apple Crisp 10lb',
+      provider: 'faire',
+      externalVariantId: 'faire-variant-1',
+    },
+  ),
+  collisionNames[1],
+  'A duplicate canonical name must use the deterministic provider-qualified name',
+)
+assert.equal(
+  await automaticProductResolutionModule.collisionSafeLocalProductDisplayName(
+    collisionNameClient(collisionNames.slice(0, 2)),
+    {
+      pipelineId: 'pipeline-test-id',
+      requestedName: 'Apple Crisp 10lb',
+      provider: 'faire',
+      externalVariantId: 'faire-variant-1',
+    },
+  ),
+  collisionNames[2],
+  'Repeated provider collisions must use the deterministic variant hash',
+)
+assert.deepEqual(
+  productIdentityLocks,
+  Array(3).fill(
+    'commerce-catalog-local-name:pipeline-test-id:apple crisp 10lb',
+  ),
+  'Manual and automatic collision-safe creates must serialize on the same database identity lock',
+)
+const crmProductIdentityMigration = read(
+  'db/migrations/0045_pipeline_people_products_and_dropdown_catalogs.sql',
+)
+includes(crmProductIdentityMigration, [
+  'idx_crm_products_pipeline_name_unique',
+  'ON crm_products (pipeline_id, lower(name))',
+], 'CRM product-name uniqueness')
 assert.equal(
   automaticProductResolutionModule.automaticProductFailureCode({
     code: '23505',
@@ -1273,6 +1472,7 @@ includes(workflowSource, [
   'bulkCreatableProductCandidates.length === 0',
   "'bulk-create-products'",
   "'bulk-create-product'",
+  "identityConflictPolicy: 'provider_qualified'",
   'Retry all exact orders',
   "'bulk-retry-order-money'",
   "'bulk-retry-rejection'",
@@ -1439,6 +1639,16 @@ const customerIdentityPersistence = loadTypeScriptModule(
         exactProductMappingMutation:
           mappingPolicy.exactProductMappingMutation,
       },
+      '@/lib/integrations/commerceProductNaming':
+        commerceProductNamingModule,
+      '@/lib/integrations/commerceProductLifecycle':
+        commerceProductLifecycleModule,
+      '@/lib/integrations/commerceCanonicalProductIdentity':
+        commerceCanonicalProductIdentityModule,
+      '@/lib/integrations/commerceProductChannelOffers':
+        commerceProductChannelOffersModule,
+      '@/lib/integrations/commercePackRuntime':
+        commercePackRuntimeModule,
       '@/lib/operations/commerceNormalization': {
         commerceCurrencyMinorUnit() { return 2 },
       },
@@ -1446,6 +1656,10 @@ const customerIdentityPersistence = loadTypeScriptModule(
       '@/lib/persistence/commerceCatalogSync': {
         applyCommerceCatalogSyncPolicyWithClient() {},
         readCommerceCatalogSyncStateWithClient() {},
+      },
+      '@/lib/persistence/productChannelStates': {
+        async linkProductChannelStateWithClient() {},
+        async upsertProductChannelStateWithClient() {},
       },
       '@/lib/persistence/postgres': {
         acquireTransactionAdvisoryLock() {},
@@ -1813,7 +2027,7 @@ const service = loadTypeScriptModule(
             )
             assert.match(
               request.variables.query,
-              /^updated_at:<='[^']+'$/,
+              /^updated_at:<='[^']+' AND product_status:ACTIVE,ARCHIVED,DRAFT,UNLISTED$/,
             )
             const secondPage = Boolean(request.variables.after)
             if (secondPage) {
@@ -2015,11 +2229,15 @@ const service = loadTypeScriptModule(
         async markCommerceIntakeProviderReadUncertainInPostgres(input) {
           uncertainReads.push(input)
         },
-        async readCommerceIntakeRejectionTargetFromPostgres() {
+        async readCommerceIntakeRejectionTargetFromPostgres(input) {
+          const provider = runtimes.get(input.accountGlobalId)?.provider
+            || 'shopify'
           return {
-            provider: 'shopify',
+            provider,
             resource_type: 'order',
-            external_id: 'gid://shopify/Order/999',
+            external_id: provider === 'faire'
+              ? 'faire-order-rejected-1'
+              : 'gid://shopify/Order/999',
             source_hash: 'e'.repeat(64),
             row_version: 0,
           }
@@ -2385,6 +2603,17 @@ try {
       idempotencyKey: nextKey(),
     },
   })
+  await service.executeCommerceIntakeCommand({
+    organizationId,
+    actorEmail,
+    body: {
+      action: 'retry-rejection',
+      accountGlobalId: faireRuntime.globalId,
+      rejectionGlobalId: 'gcrj0000002',
+      confirmReadOnly: true,
+      idempotencyKey: nextKey(),
+    },
+  })
   const replayedFetch = await service.executeCommerceIntakeCommand({
     organizationId,
     actorEmail,
@@ -2425,7 +2654,7 @@ try {
     faireProducts: 2,
     faireInventory: 3,
     faireOrders: 2,
-    faireOrder: 0,
+    faireOrder: 1,
   })
   assert.equal(normalizedSources.shopify.data.products.nodes.length, 0)
   assert.equal(normalizedSources.shopify.data.orders.nodes.length, 1)
@@ -2453,8 +2682,8 @@ try {
       .available_quantity.quantity,
     -2,
   )
-  assert.equal(providerAttempts.length, 10)
-  assert.equal(providerReservations.length, 11)
+  assert.equal(providerAttempts.length, 11)
+  assert.equal(providerReservations.length, 12)
   assert.ok(
     providerReservations.some((reservation) => (
       reservation.runtime.provider === 'faire'
@@ -2469,9 +2698,9 @@ try {
     )),
     'Shopify provider-attempt evidence must record its actual normalizer',
   )
-  assert.equal(capturedReads.size, 10)
+  assert.equal(capturedReads.size, 11)
   assert.equal(uncertainReads.length, 0)
-  assert.equal(stageAttempts.length, 11)
+  assert.equal(stageAttempts.length, 12)
   for (const attempt of providerAttempts) {
     assert.equal(attempt.action, 'commerce.intake.read')
     assert.equal(attempt.redactedRequest.readOnly, true)
@@ -2480,7 +2709,7 @@ try {
   }
   assert.equal(
     persistenceCommands.filter(({ name }) => name === 'stage-envelope').length,
-    10,
+    11,
   )
   const staged = persistenceCommands.filter(
     ({ name }) => name === 'stage-envelope',
@@ -2502,6 +2731,7 @@ try {
       'fetch-next',
       'refresh',
       'retry-rejection',
+      'retry-rejection',
     ],
   )
   assert.equal(staged[0].input.page.batchNumber, 1)
@@ -2512,6 +2742,12 @@ try {
   assert.equal(staged[3].input.page.resource, 'products')
   assert.equal(staged[8].input.page, null)
   assert.equal(staged[9].input.page, null)
+  assert.equal(staged[10].input.page, null)
+  assert.equal(
+    staged[10].input.envelope.orders[0].identity.value,
+    'faire-order-rejected-1',
+    'Faire exact-order retry must stage the identity read by getFaireOrder',
+  )
   assert.equal(
     automaticProductSweeps.length,
     5,
@@ -2675,7 +2911,7 @@ try {
     faireProducts: 2,
     faireInventory: 3,
     faireOrders: 2,
-    faireOrder: 0,
+    faireOrder: 1,
   }, 'Resolution, validation, and promotion must not call providers')
   const promotion = persistenceCommands.find(({ name }) => name === 'promote')
   assert.match(promotion.input.requestHash, /^[a-f0-9]{64}$/)

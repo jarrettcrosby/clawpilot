@@ -8,7 +8,10 @@ globalThis.__decodeHtmlEntities = decodeHtmlEntities
 const require = createRequire(new URL('../app_src/package.json', import.meta.url))
 const ts = require('typescript')
 
-async function importTypeScript(relativePath, { injectRuntime = false } = {}) {
+async function importTypeScript(
+  relativePath,
+  { injectRuntime = false, injectCurrencyRuntime = false } = {},
+) {
   const url = new URL(relativePath, import.meta.url)
   const source = await readFile(url, 'utf8')
   let output = ts.transpileModule(source, {
@@ -28,6 +31,14 @@ const query = (...args) => globalThis.__suiteCrmCallTest.query(...args)
 const decodeHtmlEntities = (value) => globalThis.__decodeHtmlEntities(value)
 ${output}`
   }
+  if (injectCurrencyRuntime) {
+    output = output.replace(/^import[^\n]+\n/gm, '')
+    output = `
+const isIso4217CurrencyCode = (value) => typeof value === 'string'
+  && /^[A-Z]{3}$/.test(value.trim().toUpperCase())
+  && value.trim().toUpperCase() !== 'AAA'
+${output}`
+  }
   const encoded = Buffer.from(output).toString('base64')
   return import(`data:text/javascript;base64,${encoded}`)
 }
@@ -43,7 +54,10 @@ process.env.SUITECRM_BASE_URL = 'https://suitecrm.example.test'
 process.env.SUITECRM_CLIENT_ID = 'client-id'
 process.env.SUITECRM_CLIENT_SECRET = 'client-secret'
 
-const client = await importTypeScript('../app_src/lib/crm/suiteCrmClient.ts')
+const client = await importTypeScript(
+  '../app_src/lib/crm/suiteCrmClient.ts',
+  { injectCurrencyRuntime: true },
+)
 const clientCalls = []
 const fetchImpl = async (input, init) => {
   const url = new URL(String(input))
@@ -60,6 +74,87 @@ const fetchImpl = async (input, init) => {
       }],
       meta: { 'total-pages': '2' },
     })
+  }
+  if (url.pathname === '/Api/V8/module/Currencies') {
+    const currencyCode = url.searchParams.get('filter[iso4217][eq]')
+    if (currencyCode === 'CAD') {
+      return jsonResponse({
+        data: [{
+          id: 'currency-cad',
+          type: 'Currencies',
+          attributes: {
+            iso4217: 'CAD',
+            status: 'Active',
+            conversion_rate: '1.35',
+          },
+        }],
+      })
+    }
+    if (currencyCode === 'GBP') {
+      return jsonResponse({
+        data: [
+          {
+            id: 'currency-gbp-1',
+            type: 'Currencies',
+            attributes: {
+              iso4217: 'GBP',
+              status: 'Active',
+              conversion_rate: '0.77',
+            },
+          },
+          {
+            id: 'currency-gbp-2',
+            type: 'Currencies',
+            attributes: {
+              iso4217: 'GBP',
+              status: 'Active',
+              conversion_rate: '0.78',
+            },
+          },
+        ],
+      })
+    }
+    const invalidCurrencyRecords = {
+      EUR: {
+        id: 'currency-eur',
+        type: 'Currencies',
+        attributes: {
+          iso4217: 'EUR',
+          status: 'Inactive',
+          conversion_rate: '0.92',
+        },
+      },
+      JPY: {
+        id: 'currency-jpy',
+        type: 'Currencies',
+        attributes: { iso4217: 'JPY', status: 'Active' },
+      },
+      CHF: {
+        id: 'currency-chf',
+        type: 'Currencies',
+        attributes: {
+          iso4217: 'CHF',
+          status: 'Active',
+          conversion_rate: '0',
+        },
+      },
+      AUD: {
+        id: 'currency-aud',
+        type: 'Accounts',
+        attributes: {
+          iso4217: 'AUD',
+          status: 'Active',
+          conversion_rate: '1.5',
+        },
+      },
+      NZD: {
+        id: 'currency-nzd',
+        type: 'Currencies',
+        attributes: { iso4217: 'NZD', conversion_rate: '1.6' },
+      },
+    }
+    const invalid = invalidCurrencyRecords[currencyCode]
+    return jsonResponse({ data: invalid ? [invalid] : [] })
   }
   if (init?.method === 'GET') return jsonResponse({}, 404)
   if (url.pathname === '/Api/V8/module' && (init?.method === 'POST' || init?.method === 'PATCH')) {
@@ -111,6 +206,57 @@ await client.upsertSuiteCrmRecord(outboxRecord({
 }), fetchImpl)
 assert.equal(clientCalls.at(-2).url.pathname, '/Api/V8/module/Meetings/interaction-meeting-1')
 assert.equal(JSON.parse(String(clientCalls.at(-1).init.body)).data.type, 'Meetings')
+
+assert.equal(await client.resolveSuiteCrmCurrencyId('USD', fetchImpl), '-99')
+assert.equal(await client.resolveSuiteCrmCurrencyId('cad', fetchImpl), 'currency-cad')
+const currencyLookup = clientCalls.at(-1)
+assert.equal(currencyLookup.url.pathname, '/Api/V8/module/Currencies')
+assert.equal(currencyLookup.url.searchParams.get('filter[iso4217][eq]'), 'CAD')
+assert.equal(
+  currencyLookup.url.searchParams.get('fields[Currencies]'),
+  'iso4217,status,conversion_rate',
+)
+await assert.rejects(
+  client.resolveSuiteCrmCurrencyId('EUR', fetchImpl),
+  /EUR is not active in SuiteCRM with a positive conversion rate/,
+)
+await assert.rejects(
+  client.resolveSuiteCrmCurrencyId('GBP', fetchImpl),
+  /multiple active GBP currencies/,
+)
+await assert.rejects(
+  client.resolveSuiteCrmCurrencyId('AAA', fetchImpl),
+  /supported ISO 4217 code/,
+)
+for (const currencyCode of ['JPY', 'CHF', 'AUD', 'NZD']) {
+  await assert.rejects(
+    client.resolveSuiteCrmCurrencyId(currencyCode, fetchImpl),
+    new RegExp(`${currencyCode} is not active in SuiteCRM with a positive conversion rate`),
+  )
+}
+
+const productAttributes = {
+  global_id_c: 'gp0000001',
+  name: 'Canadian product',
+  price: 12.34,
+  cost: 5.67,
+}
+await client.upsertSuiteCrmRecord({
+  entity: 'products',
+  pipelineId: 'pipeline-1',
+  localId: 'product-1',
+  suiteCrmId: 'product-suitecrm-1',
+  currencyCode: 'CAD',
+  attributes: productAttributes,
+}, fetchImpl)
+const productBody = JSON.parse(String(clientCalls.at(-1).init.body))
+assert.equal(productBody.data.type, 'AOS_Products')
+assert.deepEqual(productBody.data.attributes, {
+  ...productAttributes,
+  currency_id: 'currency-cad',
+})
+assert.equal(productBody.data.attributes.price, 12.34)
+assert.equal(productBody.data.attributes.cost, 5.67)
 
 await client.deleteSuiteCrmRecord(outboxRecord({ suiteCrmModule: 'Calls' }), fetchImpl)
 assert.equal(clientCalls.at(-1).url.pathname, '/Api/V8/module/Calls/call-1')

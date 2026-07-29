@@ -15,10 +15,12 @@ import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
 import Card from '@mui/material/Card'
 import CardContent from '@mui/material/CardContent'
+import Checkbox from '@mui/material/Checkbox'
 import Chip from '@mui/material/Chip'
 import CircularProgress from '@mui/material/CircularProgress'
 import Divider from '@mui/material/Divider'
 import Dialog from '@mui/material/Dialog'
+import DialogActions from '@mui/material/DialogActions'
 import DialogContent from '@mui/material/DialogContent'
 import DialogTitle from '@mui/material/DialogTitle'
 import FormControl from '@mui/material/FormControl'
@@ -26,6 +28,7 @@ import FormControlLabel from '@mui/material/FormControlLabel'
 import FormHelperText from '@mui/material/FormHelperText'
 import IconButton from '@mui/material/IconButton'
 import InputLabel from '@mui/material/InputLabel'
+import ListItemText from '@mui/material/ListItemText'
 import MenuItem from '@mui/material/MenuItem'
 import Select from '@mui/material/Select'
 import Stack from '@mui/material/Stack'
@@ -43,8 +46,10 @@ import CloseRounded from '@mui/icons-material/CloseRounded'
 import ExpandMoreRounded from '@mui/icons-material/ExpandMoreRounded'
 import FileDownloadRounded from '@mui/icons-material/FileDownloadRounded'
 import FileUploadRounded from '@mui/icons-material/FileUploadRounded'
+import Inventory2Rounded from '@mui/icons-material/Inventory2Rounded'
 import PublishRounded from '@mui/icons-material/PublishRounded'
 import RefreshRounded from '@mui/icons-material/RefreshRounded'
+import { useMeasurementSystem } from '@/components/measurements/MeasurementSystemProvider'
 import {
   CommerceIntakeCsvError,
   exportCommerceIssueSummaryCsv,
@@ -56,6 +61,22 @@ import {
   type CommerceProductReviewDecision,
   type CommerceProductReviewImportResult,
 } from '@/lib/integrations/commerceIntakeCsv'
+import { commerceProductDisplayName } from '@/lib/integrations/commerceProductNaming'
+import type {
+  PackagingMaterial,
+  PackagingMaterialsWorkspace,
+} from '@/lib/operations/packagingMaterials'
+import type { CartonizationPreviewResult } from '@/lib/operations/cartonizationPreview'
+import {
+  displayLengthToMillimeters,
+  displayWeightToGrams,
+  formatDimensionsMm,
+  formatGrams,
+  gramsToDisplayWeight,
+  measurementUnits,
+  millimetersToDisplayLength,
+  type MeasurementSystem,
+} from '@/lib/measurements'
 
 type CommerceProvider = 'shopify' | 'faire'
 type CandidateState =
@@ -104,6 +125,12 @@ type IntakeLine = {
   productGlobalId?: string | null
   packageStatus?: string | null
   packageProfileGlobalId?: string | null
+  commerceVariantPackMappingGlobalId?: string | null
+  packProfileVersionGlobalId?: string | null
+  packProfilePackageLevel?: 'each' | 'inner_pack' | 'case' | 'pallet' | null
+  packProfileBaseEachQuantity?: number | null
+  packagingSource?: string | null
+  packagingWeightSource?: string | null
   weightGrams?: number | null
   dimensionsMm?: DimensionsMm | null
 }
@@ -378,6 +405,85 @@ type IntakePayload = {
   }
 }
 
+type CartonizationMaterialsPayload = {
+  ok?: boolean
+  error?: string
+  packagingMaterials?: PackagingMaterialsWorkspace
+}
+
+type CartonizationPreviewPayload = {
+  ok?: boolean
+  error?: string
+  code?: string
+  preview?: CartonizationPreviewResult
+}
+
+type CartonizationRateEvidenceSummary = {
+  globalId: string
+  status: 'succeeded' | 'partial' | 'failed'
+  evidenceMode: 'operational' | 'assumption_backed_sandbox'
+  candidateOrderNumber: string
+  warehouse: {
+    globalId: string
+    name: string
+  }
+  packages: Array<{
+    packageKey: string
+    packagingMaterialName: string
+    ratedOuterDimensionsMm: {
+      length: number
+      width: number
+      height: number
+    }
+    contentWeightGrams: number
+    tareWeightGrams: number
+    ratedGrossWeightGrams: number
+    allocations: Array<{
+      lineGlobalId: string
+      title: string
+      quantity: number
+    }>
+    quotes: Array<{
+      provider: 'ups_rest' | 'fedex_rest'
+      rateEvidenceGlobalId: string
+      status: 'succeeded' | 'failed'
+      shipmentRateContextHash: string | null
+      rateScope: 'single_package' | 'multi_package_shipment'
+      rates: Array<{
+        serviceCode: string
+        serviceName: string
+        amount: string
+        currency: string
+      }>
+    }>
+  }>
+}
+
+type CartonizationRateEvidencePayload = {
+  ok?: boolean
+  error?: string
+  code?: string
+  evidence?: CartonizationRateEvidenceSummary
+}
+
+type ShipmentServiceOption = {
+  provider: 'ups_rest' | 'fedex_rest'
+  serviceCode: string
+  serviceName: string
+  currency: string
+  amount: number
+  packageCount: number
+  rateEvidenceGlobalId: string
+}
+
+type SandboxParcelAssumptionDraft = {
+  measurementSystem: MeasurementSystem
+  length: string
+  width: string
+  height: string
+  tareWeight: string
+}
+
 type ProductDraft = {
   productGlobalId: string
   name: string
@@ -419,7 +525,8 @@ type DeliveryDraft = {
 
 type PackageDraft = {
   packageProfileGlobalId: string
-  weightGrams: string
+  measurementSystem: MeasurementSystem
+  weight: string
   length: string
   width: string
   height: string
@@ -481,6 +588,135 @@ function humanize(value: string) {
   return value
     .replace(/_/g, ' ')
     .replace(/\b\w/g, (letter) => letter.toUpperCase())
+}
+
+function carrierLabel(provider: ShipmentServiceOption['provider']) {
+  return provider === 'ups_rest' ? 'UPS' : 'FedEx'
+}
+
+function formatShipmentRate(amount: number, currency: string) {
+  try {
+    return new Intl.NumberFormat(undefined, {
+      style: 'currency',
+      currency,
+    }).format(amount)
+  } catch {
+    return `${amount.toFixed(2)} ${currency}`
+  }
+}
+
+function isGroundShipmentService(option: ShipmentServiceOption) {
+  return (
+    option.serviceCode === '03'
+    || option.serviceCode === 'FEDEX_GROUND'
+    || option.serviceName.toLowerCase().includes('ground')
+  )
+}
+
+function commonShipmentServiceOptions(
+  packages: CartonizationRateEvidenceSummary['packages'],
+): ShipmentServiceOption[] {
+  if (packages.length === 0) return []
+  const options: ShipmentServiceOption[] = []
+  for (const provider of ['ups_rest', 'fedex_rest'] as const) {
+    const planQuotes = packages.map((item) => item.quotes.find(
+      (quote) => quote.provider === provider,
+    ))
+    if (
+      planQuotes.some((quote) => (
+        quote?.status !== 'succeeded'
+        || quote.rateScope !== 'multi_package_shipment'
+        || !quote.shipmentRateContextHash
+      ))
+      || new Set(
+        planQuotes.map((quote) => quote?.rateEvidenceGlobalId),
+      ).size !== 1
+      || new Set(
+        planQuotes.map((quote) => quote?.shipmentRateContextHash),
+      ).size !== 1
+    ) continue
+    const firstQuote = planQuotes[0]!
+    const candidateKeys = new Set(
+      firstQuote.rates.map((rate) => JSON.stringify([
+        rate.serviceCode,
+        rate.serviceName,
+        rate.currency,
+      ])),
+    )
+    for (const candidateKey of candidateKeys) {
+      const [serviceCode, serviceName, currency] =
+        JSON.parse(candidateKey) as [string, string, string]
+      let amount: number | null = null
+      let complete = true
+      for (const quote of planQuotes) {
+        const matchingRates = quote?.rates.filter((rate) => (
+          rate.serviceCode === serviceCode
+          && rate.serviceName === serviceName
+          && rate.currency === currency
+          && Number.isFinite(Number(rate.amount))
+          && Number(rate.amount) >= 0
+        )) || []
+        if (quote?.status !== 'succeeded' || matchingRates.length !== 1) {
+          complete = false
+          break
+        }
+        const matchingAmount = Number(matchingRates[0].amount)
+        if (amount !== null && matchingAmount !== amount) {
+          complete = false
+          break
+        }
+        amount = matchingAmount
+      }
+      if (complete && amount !== null) {
+        options.push({
+          provider,
+          serviceCode,
+          serviceName,
+          currency,
+          amount,
+          packageCount: packages.length,
+          rateEvidenceGlobalId: firstQuote.rateEvidenceGlobalId,
+        })
+      }
+    }
+  }
+  return options.sort((left, right) => (
+    Number(isGroundShipmentService(right))
+      - Number(isGroundShipmentService(left))
+    || carrierLabel(left.provider).localeCompare(
+      carrierLabel(right.provider),
+    )
+    || left.amount - right.amount
+    || left.serviceName.localeCompare(right.serviceName)
+  ))
+}
+
+function packagingMaterialSummary(
+  material: PackagingMaterial,
+  system: MeasurementSystem,
+) {
+  const dimensions = material.innerDimensionsMm
+  const dimensionsLabel = (
+    dimensions.length !== null
+    && dimensions.width !== null
+    && dimensions.height !== null
+  )
+    ? formatDimensionsMm({
+      lengthMm: dimensions.length,
+      widthMm: dimensions.width,
+      heightMm: dimensions.height,
+    }, system, {
+      maximumFractionDigits: 3,
+    })
+    : 'Incomplete dimensions'
+  const maximumLabel = material.maxWeightGrams === null
+    ? 'Maximum weight not recorded'
+    : `${formatGrams(
+      material.maxWeightGrams,
+      system,
+      { maximumFractionDigits: 3 },
+    )} max`
+  return `${dimensionsLabel} · ${maximumLabel}`
 }
 
 function rejectionTitle(code: string) {
@@ -701,14 +937,21 @@ function validPrice(draft: ProductDraft) {
   }
 }
 
-function dimensionsLabel(dimensions?: DimensionsMm | null) {
+function dimensionsLabel(
+  dimensions: DimensionsMm | null | undefined,
+  system: MeasurementSystem,
+) {
   if (
     !dimensions
     || !dimensions.length
     || !dimensions.width
     || !dimensions.height
   ) return 'dimensions unavailable'
-  return `${dimensions.length} × ${dimensions.width} × ${dimensions.height} mm`
+  return formatDimensionsMm({
+    lengthMm: dimensions.length,
+    widthMm: dimensions.width,
+    heightMm: dimensions.height,
+  }, system, { maximumFractionDigits: 3 })
 }
 
 function initialProductDraft(line: IntakeLine): ProductDraft {
@@ -727,13 +970,13 @@ function initialProductDraft(line: IntakeLine): ProductDraft {
 function initialCatalogProductDraft(
   candidate: ProductCandidate,
 ): CatalogProductDraft {
-  const variant = candidate.variantTitle?.trim()
-  const name = variant && variant !== candidate.productTitle
-    ? `${candidate.productTitle} · ${variant}`
-    : candidate.productTitle
   return {
     productGlobalId: candidate.productGlobalId || '',
-    name,
+    name: commerceProductDisplayName({
+      productTitle: candidate.productTitle,
+      variantTitle: candidate.variantTitle,
+      selectedOptions: candidate.selectedOptions,
+    }),
     sku: candidate.sku || '',
     unitPriceMinor: majorPriceFromMinor(
       candidate.priceMinor,
@@ -797,18 +1040,58 @@ function initialDeliveryDraft(candidate: IntakeCandidate): DeliveryDraft {
   }
 }
 
-function initialPackageDraft(line: IntakeLine): PackageDraft {
+function displayDraftNumber(value: number) {
+  return String(Number(value.toFixed(3)))
+}
+
+function initialPackageDraft(
+  line: IntakeLine,
+  system: MeasurementSystem,
+): PackageDraft {
   return {
     packageProfileGlobalId: line.packageProfileGlobalId || '',
-    weightGrams: line.weightGrams ? String(line.weightGrams) : '',
+    measurementSystem: system,
+    weight: line.weightGrams
+      ? displayDraftNumber(gramsToDisplayWeight(line.weightGrams, system))
+      : '',
     length: line.dimensionsMm?.length
-      ? String(line.dimensionsMm.length)
+      ? displayDraftNumber(millimetersToDisplayLength(line.dimensionsMm.length, system))
       : '',
     width: line.dimensionsMm?.width
-      ? String(line.dimensionsMm.width)
+      ? displayDraftNumber(millimetersToDisplayLength(line.dimensionsMm.width, system))
       : '',
     height: line.dimensionsMm?.height
-      ? String(line.dimensionsMm.height)
+      ? displayDraftNumber(millimetersToDisplayLength(line.dimensionsMm.height, system))
+      : '',
+  }
+}
+
+function initialSandboxParcelAssumption(
+  material: PackagingMaterial | null,
+  system: MeasurementSystem,
+): SandboxParcelAssumptionDraft {
+  const dimensions = material?.innerDimensionsMm
+  return {
+    measurementSystem: system,
+    length: dimensions?.length
+      ? displayDraftNumber(
+          millimetersToDisplayLength(dimensions.length, system),
+        )
+      : '',
+    width: dimensions?.width
+      ? displayDraftNumber(
+          millimetersToDisplayLength(dimensions.width, system),
+        )
+      : '',
+    height: dimensions?.height
+      ? displayDraftNumber(
+          millimetersToDisplayLength(dimensions.height, system),
+        )
+      : '',
+    tareWeight: material?.tareWeightGrams
+      ? displayDraftNumber(
+          gramsToDisplayWeight(material.tareWeightGrams, system),
+        )
       : '',
   }
 }
@@ -846,9 +1129,16 @@ function stateColor(state: CandidateState) {
   return 'warning' as const
 }
 
-function positiveInteger(value: string) {
+function productLifecycleColor(status: string | null | undefined) {
+  if (status === 'active') return 'success' as const
+  if (status === 'unlisted') return 'info' as const
+  if (status === 'unavailable') return 'error' as const
+  return 'warning' as const
+}
+
+function positiveNumber(value: string) {
   const parsed = Number(value)
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : null
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null
 }
 
 export default function CommerceIntakeWorkflow({
@@ -858,6 +1148,7 @@ export default function CommerceIntakeWorkflow({
   canActivate,
   connectionReady = true,
 }: CommerceIntakeWorkflowProps) {
+  const { measurementSystem } = useMeasurementSystem()
   const [intake, setIntake] = useState<CommerceIntake | null>(null)
   const [loading, setLoading] = useState(true)
   const [pendingAction, setPendingAction] = useState('')
@@ -910,6 +1201,41 @@ export default function CommerceIntakeWorkflow({
   const [packageDrafts, setPackageDrafts] = useState<
     Record<string, PackageDraft>
   >({})
+  const [cartonizationCandidate, setCartonizationCandidate] =
+    useState<IntakeCandidate | null>(null)
+  const [cartonizationMaterials, setCartonizationMaterials] =
+    useState<PackagingMaterial[]>([])
+  const [cartonizationWarehouses, setCartonizationWarehouses] =
+    useState<PackagingMaterialsWorkspace['warehouses']>([])
+  const [
+    selectedCartonizationWarehouseGlobalId,
+    setSelectedCartonizationWarehouseGlobalId,
+  ] = useState('')
+  const [
+    selectedCartonizationMaterialGlobalIds,
+    setSelectedCartonizationMaterialGlobalIds,
+  ] = useState<string[]>([])
+  const [assumedCommittedByLine, setAssumedCommittedByLine] =
+    useState<Record<string, string>>({})
+  const [cartonizationPreview, setCartonizationPreview] =
+    useState<CartonizationPreviewResult | null>(null)
+  const [cartonizationRateEvidence, setCartonizationRateEvidence] =
+    useState<CartonizationRateEvidenceSummary | null>(null)
+  const [
+    sandboxParcelAssumptionsByMaterial,
+    setSandboxParcelAssumptionsByMaterial,
+  ] = useState<Record<string, SandboxParcelAssumptionDraft>>({})
+  const [sandboxAssumptionReason, setSandboxAssumptionReason] = useState('')
+  const [
+    allowSandboxMinimumOverride,
+    setAllowSandboxMinimumOverride,
+  ] = useState(false)
+  const [
+    sandboxAssumptionAcknowledged,
+    setSandboxAssumptionAcknowledged,
+  ] = useState(false)
+  const [cartonizationLoading, setCartonizationLoading] = useState(false)
+  const [cartonizationError, setCartonizationError] = useState('')
   const [unsupportedReasons, setUnsupportedReasons] = useState<
     Record<string, string>
   >({})
@@ -958,6 +1284,12 @@ export default function CommerceIntakeWorkflow({
     setAddressDrafts({})
     setDeliveryDrafts({})
     setPackageDrafts({})
+    setCartonizationCandidate(null)
+    setCartonizationMaterials([])
+    setSelectedCartonizationMaterialGlobalIds([])
+    setAssumedCommittedByLine({})
+    setCartonizationPreview(null)
+    setCartonizationError('')
     setUnsupportedReasons({})
     loadIntake(controller.signal)
       .catch((requestError) => {
@@ -1155,6 +1487,27 @@ export default function CommerceIntakeWorkflow({
     || (latestPagination?.resource === 'products' ? latestPagination : null)
   const operatorCommandsAllowed =
     intake?.policy?.operatorCommandsAllowed === true
+  const cartonizationEvidenceSafe = Boolean(
+    cartonizationPreview?.readOnly === true
+    && cartonizationPreview.evidence.databaseWrites === 0
+    && cartonizationPreview.evidence.providerWrites === 0
+    && cartonizationPreview.evidence.rateCalls === 0
+    && cartonizationPreview.evidence.labelCalls === 0
+    && cartonizationPreview.evidence.shipmentWrites === 0,
+  )
+  const selectedCartonizationMaterials =
+    selectedCartonizationMaterialGlobalIds.flatMap((globalId) => {
+      const material = cartonizationMaterials.find(
+        (candidate) => candidate.globalId === globalId,
+      )
+      return material ? [material] : []
+    })
+  const cartonizationShipmentServiceOptions = useMemo(
+    () => commonShipmentServiceOptions(
+      cartonizationRateEvidence?.packages || [],
+    ),
+    [cartonizationRateEvidence?.packages],
+  )
   const productIntakePolicy = intake?.policy?.productIntake
   const productCatalogSync = intake?.policy?.productCatalogSync
   const orderReconciliation = intake?.orderReconciliation
@@ -2005,6 +2358,7 @@ export default function CommerceIntakeWorkflow({
                 normalizeCurrency(draft.currency),
               ),
               currency: normalizeCurrency(draft.currency),
+              identityConflictPolicy: 'provider_qualified',
             },
           }),
         })
@@ -2143,7 +2497,7 @@ export default function CommerceIntakeWorkflow({
 
   function packageDraft(candidate: IntakeCandidate, line: IntakeLine) {
     const key = `${candidate.globalId}:${line.globalId}`
-    return packageDrafts[key] || initialPackageDraft(line)
+    return packageDrafts[key] || initialPackageDraft(line, measurementSystem)
   }
 
   function updatePackageDraft(
@@ -2155,7 +2509,7 @@ export default function CommerceIntakeWorkflow({
     setPackageDrafts((current) => ({
       ...current,
       [key]: {
-        ...(current[key] || initialPackageDraft(line)),
+        ...(current[key] || initialPackageDraft(line, measurementSystem)),
         ...update,
       },
     }))
@@ -2368,10 +2722,27 @@ export default function CommerceIntakeWorkflow({
     line: IntakeLine,
   ) {
     const draft = packageDraft(candidate, line)
-    const weightGrams = positiveInteger(draft.weightGrams)
-    const length = positiveInteger(draft.length)
-    const width = positiveInteger(draft.width)
-    const height = positiveInteger(draft.height)
+    const displayWeight = positiveNumber(draft.weight)
+    const displayLength = positiveNumber(draft.length)
+    const displayWidth = positiveNumber(draft.width)
+    const displayHeight = positiveNumber(draft.height)
+    if (!displayWeight || !displayLength || !displayWidth || !displayHeight) return
+    const weightGrams = displayWeightToGrams(
+      displayWeight,
+      draft.measurementSystem,
+    )
+    const length = displayLengthToMillimeters(
+      displayLength,
+      draft.measurementSystem,
+    )
+    const width = displayLengthToMillimeters(
+      displayWidth,
+      draft.measurementSystem,
+    )
+    const height = displayLengthToMillimeters(
+      displayHeight,
+      draft.measurementSystem,
+    )
     if (!weightGrams || !length || !width || !height) return
     await postCommand(
       'resolve-package',
@@ -2388,6 +2759,377 @@ export default function CommerceIntakeWorkflow({
       },
       `Manual package facts recorded for ${line.title}.`,
     )
+  }
+
+  async function openCartonizationPreview(candidate: IntakeCandidate) {
+    setCartonizationCandidate(candidate)
+    setCartonizationMaterials([])
+    setCartonizationWarehouses([])
+    setSelectedCartonizationWarehouseGlobalId('')
+    setSelectedCartonizationMaterialGlobalIds([])
+    setAssumedCommittedByLine(Object.fromEntries(
+      (candidate.lines || [])
+        .filter((line) => line.requiresShipping && line.quantity > 0)
+        .map((line) => [line.globalId, '0']),
+    ))
+    setCartonizationPreview(null)
+    setCartonizationRateEvidence(null)
+    setAllowSandboxMinimumOverride(false)
+    setSandboxAssumptionAcknowledged(false)
+    setSandboxParcelAssumptionsByMaterial({})
+    setSandboxAssumptionReason('')
+    setCartonizationError('')
+    setCartonizationLoading(true)
+    try {
+      const response = await fetch('/api/operations/packaging-materials', {
+        cache: 'no-store',
+      })
+      const payload = await response.json().catch(() => ({})) as
+        CartonizationMaterialsPayload
+      if (!response.ok || !payload.ok || !payload.packagingMaterials) {
+        throw new Error(payload.error || 'Packaging materials could not be loaded.')
+      }
+      const materials = payload.packagingMaterials.materials
+      const eligible = materials.filter(
+        (material) => material.readiness.eligibleForCartonization,
+      )
+      const completeCustomerMaterial = materials.find((material) => (
+        material.source === 'customer_supplied'
+        && material.innerDimensionsMm.length
+        && material.innerDimensionsMm.width
+        && material.innerDimensionsMm.height
+      ))
+      const ag12v2Material = materials.find((material) => (
+        material.code.trim().toUpperCase() === 'AG12V2'
+        && material.source === 'customer_supplied'
+        && material.innerDimensionsMm.length
+        && material.innerDimensionsMm.width
+        && material.innerDimensionsMm.height
+      ))
+      const recommendedMaterial = (
+        ag12v2Material
+        || completeCustomerMaterial
+        || eligible[0]
+        || null
+      )
+      setCartonizationMaterials(materials)
+      setCartonizationWarehouses(payload.packagingMaterials.warehouses)
+      setSelectedCartonizationWarehouseGlobalId(
+        payload.packagingMaterials.warehouses.find(
+          (warehouse) => warehouse.status === 'active',
+        )?.globalId || '',
+      )
+      setSelectedCartonizationMaterialGlobalIds(
+        recommendedMaterial ? [recommendedMaterial.globalId] : [],
+      )
+      setSandboxParcelAssumptionsByMaterial(
+        recommendedMaterial
+          ? {
+              [recommendedMaterial.globalId]:
+                initialSandboxParcelAssumption(
+                  recommendedMaterial,
+                  measurementSystem,
+                ),
+            }
+          : {},
+      )
+      if (materials.length === 0) {
+        setCartonizationError(
+          'No packaging materials exist yet. Add up to eight cartons or mailers in Operations > Packaging materials.',
+        )
+      } else if (eligible.length === 0 && !completeCustomerMaterial) {
+        setCartonizationError(
+          'No packaging material is optimizer-ready. Complete cost, active status, and warehouse stock in Operations > Packaging materials.',
+        )
+      }
+    } catch (caught) {
+      setCartonizationError(
+        caught instanceof Error
+          ? caught.message
+          : 'Packaging materials could not be loaded.',
+      )
+    } finally {
+      setCartonizationLoading(false)
+    }
+  }
+
+  async function runCartonizationPreview() {
+    const candidate = cartonizationCandidate
+    if (!canActivate || !operatorCommandsAllowed) {
+      setCartonizationError(
+        'Organization manager or administrator permission is required to run a pack-plan preview.',
+      )
+      return
+    }
+    if (
+      !candidate
+      || !Number.isInteger(candidate.rowVersion)
+      || selectedCartonizationMaterialGlobalIds.length < 1
+      || selectedCartonizationMaterialGlobalIds.length > 8
+    ) return
+    const invalidAssumption = (candidate.lines || [])
+      .filter((line) => line.requiresShipping && line.quantity > 0)
+      .find((line) => {
+        const quantity = Number(assumedCommittedByLine[line.globalId] || 0)
+        return (
+          !Number.isSafeInteger(quantity)
+          || quantity < 0
+          || quantity > line.quantity
+        )
+      })
+    if (invalidAssumption) {
+      setCartonizationError(
+        `Committed inventory for ${invalidAssumption.title} must be a whole number from 0 to ${invalidAssumption.quantity}.`,
+      )
+      return
+    }
+    setCartonizationLoading(true)
+    setCartonizationError('')
+    setCartonizationPreview(null)
+    try {
+      const response = await fetch(
+        '/api/integrations/commerce/intake/cartonization-preview',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            accountGlobalId,
+            candidateGlobalId: candidate.globalId,
+            expectedCandidateRowVersion: candidate.rowVersion,
+            materialGlobalIds: selectedCartonizationMaterialGlobalIds,
+            assumedCommittedByLine: (candidate.lines || [])
+              .filter((line) => line.requiresShipping && line.quantity > 0)
+              .flatMap((line) => {
+                const quantity = Number(assumedCommittedByLine[line.globalId] || 0)
+                return Number.isSafeInteger(quantity) && quantity > 0
+                  ? [{ lineGlobalId: line.globalId, quantity }]
+                  : []
+              }),
+          }),
+        },
+      )
+      const payload = await response.json().catch(() => ({})) as
+        CartonizationPreviewPayload
+      if (!response.ok || !payload.ok || !payload.preview) {
+        throw new Error(
+          `${payload.error || 'Cartonization preview failed.'}${
+            payload.code ? ` [${payload.code}]` : ''
+          }`,
+        )
+      }
+      setCartonizationPreview(payload.preview)
+    } catch (caught) {
+      setCartonizationError(
+        caught instanceof Error ? caught.message : 'Cartonization preview failed.',
+      )
+    } finally {
+      setCartonizationLoading(false)
+    }
+  }
+
+  async function createCartonizationRateEvidence() {
+    const candidate = cartonizationCandidate
+    if (!canActivate || !operatorCommandsAllowed) {
+      setCartonizationError(
+        'Organization manager or administrator permission is required to compare carrier rates.',
+      )
+      return
+    }
+    if (!candidate) return
+    if (
+      selectedCartonizationMaterialGlobalIds.length < 1
+      || selectedCartonizationMaterialGlobalIds.length > 8
+      || selectedCartonizationMaterials.length
+        !== selectedCartonizationMaterialGlobalIds.length
+    ) {
+      setCartonizationError(
+        'Select between one and eight available packaging materials for a reloadable carrier comparison.',
+      )
+      return
+    }
+    if (!selectedCartonizationWarehouseGlobalId) {
+      setCartonizationError(
+        'Select the warehouse whose inventory and sender facts should be used.',
+      )
+      return
+    }
+    const selectedMaterialsWithAssumptions: Array<{
+      materialGlobalId: string
+      expectedRowVersion: number
+      sandboxRateAssumptions: {
+        ratedOuterDimensionsMm: {
+          length: number
+          width: number
+          height: number
+        }
+        tareWeightGrams: number
+      }
+    }> = []
+    for (const material of selectedCartonizationMaterials) {
+      const assumption =
+        sandboxParcelAssumptionsByMaterial[material.globalId]
+      const displayLength = positiveNumber(assumption?.length || '')
+      const displayWidth = positiveNumber(assumption?.width || '')
+      const displayHeight = positiveNumber(assumption?.height || '')
+      const displayTare = positiveNumber(assumption?.tareWeight || '')
+      if (
+        !assumption
+        || !displayLength
+        || !displayWidth
+        || !displayHeight
+        || !displayTare
+      ) {
+        setCartonizationError(
+          `Enter positive rated exterior dimensions and a positive sandbox-only tare for ${material.code}.`,
+        )
+        return
+      }
+      const ratedOuterDimensionsMm = {
+        length: displayLengthToMillimeters(
+          displayLength,
+          assumption.measurementSystem,
+        ),
+        width: displayLengthToMillimeters(
+          displayWidth,
+          assumption.measurementSystem,
+        ),
+        height: displayLengthToMillimeters(
+          displayHeight,
+          assumption.measurementSystem,
+        ),
+      }
+      const tareWeightGrams = displayWeightToGrams(
+        displayTare,
+        assumption.measurementSystem,
+      )
+      if (
+        !ratedOuterDimensionsMm.length
+        || !ratedOuterDimensionsMm.width
+        || !ratedOuterDimensionsMm.height
+        || !tareWeightGrams
+      ) {
+        setCartonizationError(
+          `The sandbox rate assumptions for ${material.code} could not be converted to canonical millimeters and grams.`,
+        )
+        return
+      }
+      selectedMaterialsWithAssumptions.push({
+        materialGlobalId: material.globalId,
+        expectedRowVersion: material.rowVersion,
+        sandboxRateAssumptions: {
+          ratedOuterDimensionsMm,
+          tareWeightGrams,
+        },
+      })
+    }
+    const assumptionReason = sandboxAssumptionReason.trim()
+    if (!sandboxAssumptionAcknowledged || assumptionReason.length < 12) {
+      setCartonizationError(
+        'Acknowledge the sandbox-only boundary and enter a short reason for the temporary rating assumptions.',
+      )
+      return
+    }
+    const invalidAssumption = (candidate.lines || [])
+      .filter((line) => line.requiresShipping && line.quantity > 0)
+      .find((line) => {
+        const quantity = Number(assumedCommittedByLine[line.globalId] || 0)
+        return (
+          !Number.isSafeInteger(quantity)
+          || quantity < 0
+          || quantity > line.quantity
+        )
+      })
+    if (invalidAssumption) {
+      setCartonizationError(
+        `Committed inventory for ${invalidAssumption.title} must be a whole number from 0 to ${invalidAssumption.quantity}.`,
+      )
+      return
+    }
+
+    setCartonizationLoading(true)
+    setCartonizationError('')
+    setCartonizationRateEvidence(null)
+    try {
+      const idempotencyKey = [
+        'cartonization-rate',
+        candidate.globalId,
+        candidate.rowVersion,
+        typeof crypto !== 'undefined' && 'randomUUID' in crypto
+          ? crypto.randomUUID()
+          : `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      ].join(':')
+      const response = await fetch(
+        '/api/integrations/commerce/intake/cartonization-rate-evidence',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            accountGlobalId,
+            candidateGlobalId: candidate.globalId,
+            expectedCandidateRowVersion: candidate.rowVersion,
+            warehouseGlobalId: selectedCartonizationWarehouseGlobalId,
+            selectedMaterials: selectedMaterialsWithAssumptions,
+            assumedCommittedQuantities: (candidate.lines || [])
+              .filter((line) => line.requiresShipping && line.quantity > 0)
+              .map((line) => ({
+                lineGlobalId: line.globalId,
+                quantity: Number(assumedCommittedByLine[line.globalId] || 0),
+              })),
+            sandboxAssumptions: {
+              acknowledged: true,
+              reason: assumptionReason,
+              allowUnderMinimum: allowSandboxMinimumOverride,
+              assumedMinimumInputQuantity: allowSandboxMinimumOverride
+                ? 1
+                : null,
+            },
+            idempotencyKey,
+          }),
+        },
+      )
+      const payload = await response.json().catch(() => ({})) as
+        CartonizationRateEvidencePayload
+      if (!response.ok || !payload.ok || !payload.evidence) {
+        throw new Error(
+          `${payload.error || 'Pack and carrier-rate evidence failed.'}${
+            payload.code ? ` [${payload.code}]` : ''
+          }`,
+        )
+      }
+      setCartonizationRateEvidence(payload.evidence)
+    } catch (caught) {
+      setCartonizationError(
+        caught instanceof Error
+          ? caught.message
+          : 'Pack and carrier-rate evidence failed.',
+      )
+    } finally {
+      setCartonizationLoading(false)
+    }
+  }
+
+  function openCartonizationRateEvidence() {
+    if (!cartonizationRateEvidence) return
+    const url = new URL(window.location.href)
+    url.searchParams.set('commerceAccount', accountGlobalId)
+    url.searchParams.set(
+      'cartonizationEvidence',
+      cartonizationRateEvidence.globalId,
+    )
+    url.hash = 'operations/imports'
+    window.location.assign(url.toString())
+  }
+
+  async function copyCartonizationRateEvidenceLink() {
+    if (!cartonizationRateEvidence) return
+    const url = new URL(window.location.href)
+    url.searchParams.set('commerceAccount', accountGlobalId)
+    url.searchParams.set(
+      'cartonizationEvidence',
+      cartonizationRateEvidence.globalId,
+    )
+    url.hash = 'operations/imports'
+    await navigator.clipboard.writeText(url.toString())
   }
 
   if (loading) {
@@ -4065,12 +4807,11 @@ export default function CommerceIntakeWorkflow({
                         >
                           <Box>
                             <Typography fontWeight={700}>
-                              {candidate.productTitle}
-                              {candidate.variantTitle
-                                && candidate.variantTitle
-                                  !== candidate.productTitle
-                                ? ` · ${candidate.variantTitle}`
-                                : ''}
+                              {commerceProductDisplayName({
+                                productTitle: candidate.productTitle,
+                                variantTitle: candidate.variantTitle,
+                                selectedOptions: candidate.selectedOptions,
+                              })}
                             </Typography>
                             <Typography
                               variant="caption"
@@ -4107,6 +4848,16 @@ export default function CommerceIntakeWorkflow({
                               size="small"
                               color={stateColor(candidate.state)}
                               label={candidateStateLabel(candidate.state)}
+                            />
+                            <Chip
+                              size="small"
+                              variant="outlined"
+                              color={productLifecycleColor(
+                                candidate.normalizedStatus,
+                              )}
+                              label={`Source ${
+                                candidate.normalizedStatus || 'unknown'
+                              }`}
                             />
                             <Chip
                               size="small"
@@ -4152,7 +4903,11 @@ export default function CommerceIntakeWorkflow({
                             {Number.isInteger(candidate.weightGrams) ? (
                               <Chip
                                 size="small"
-                                label={`${candidate.weightGrams} g`}
+                                label={formatGrams(
+                                  candidate.weightGrams as number,
+                                  measurementSystem,
+                                  { maximumFractionDigits: 3 },
+                                )}
                               />
                             ) : null}
                           </Stack>
@@ -4765,6 +5520,10 @@ export default function CommerceIntakeWorkflow({
                               {(candidate.lines || []).map((line) => {
                                 const draft = productDraft(candidate, line)
                                 const packaging = packageDraft(candidate, line)
+                                const packagingMeasurementLabels =
+                                  measurementUnits(
+                                    packaging.measurementSystem,
+                                  )
                                 const selectedProduct = productCatalog.find(
                                   (product) => product.globalId
                                     === (draft.productGlobalId
@@ -4773,11 +5532,11 @@ export default function CommerceIntakeWorkflow({
                                 const packageProfiles =
                                   selectedProduct?.packageProfiles || []
                                 const manualPackageValid = [
-                                  packaging.weightGrams,
+                                  packaging.weight,
                                   packaging.length,
                                   packaging.width,
                                   packaging.height,
-                                ].every((value) => positiveInteger(value))
+                                ].every((value) => positiveNumber(value))
                                 return (
                                   <Card
                                     key={line.globalId}
@@ -5027,6 +5786,39 @@ export default function CommerceIntakeWorkflow({
                                           >
                                             Package resolution
                                           </Typography>
+                                          {line
+                                            .commerceVariantPackMappingGlobalId ? (
+                                              <Alert
+                                                severity={
+                                                  line.packageStatus === 'resolved'
+                                                    ? 'success'
+                                                    : 'info'
+                                                }
+                                              >
+                                                {line.packProfilePackageLevel
+                                                  ? `${humanize(
+                                                      line.packProfilePackageLevel,
+                                                    )} pack`
+                                                  : 'Mapped pack'}
+                                                {line
+                                                  .packProfileBaseEachQuantity
+                                                  ? ` · ${
+                                                      line
+                                                        .packProfileBaseEachQuantity
+                                                    } base each`
+                                                  : ''}
+                                                {' · '}
+                                                {
+                                                  line
+                                                    .commerceVariantPackMappingGlobalId
+                                                }
+                                                {line.packagingWeightSource
+                                                  ? ` · weight from ${humanize(
+                                                      line.packagingWeightSource,
+                                                    ).toLowerCase()}`
+                                                  : ' · package resolution still requires review'}
+                                              </Alert>
+                                            ) : null}
                                           {packageProfiles.length ? (
                                             <Stack
                                               direction={{
@@ -5072,9 +5864,15 @@ export default function CommerceIntakeWorkflow({
                                                       >
                                                         {profile.label} ·{' '}
                                                         {profile.weightGrams
-                                                          || '?'} g ·{' '}
+                                                          ? formatGrams(
+                                                              profile.weightGrams,
+                                                              measurementSystem,
+                                                              { maximumFractionDigits: 3 },
+                                                            )
+                                                          : 'weight unavailable'} ·{' '}
                                                         {dimensionsLabel(
                                                           profile.dimensionsMm,
+                                                          measurementSystem,
                                                         )}
                                                       </MenuItem>
                                                     ),
@@ -5119,10 +5917,10 @@ export default function CommerceIntakeWorkflow({
                                             }}
                                           >
                                             {[
-                                              ['weightGrams', 'Weight g'],
-                                              ['length', 'Length mm'],
-                                              ['width', 'Width mm'],
-                                              ['height', 'Height mm'],
+                                              ['weight', `Weight (${packagingMeasurementLabels.weight})`],
+                                              ['length', `Length (${packagingMeasurementLabels.length})`],
+                                              ['width', `Width (${packagingMeasurementLabels.length})`],
+                                              ['height', `Height (${packagingMeasurementLabels.length})`],
                                             ].map(([field, label]) => (
                                               <TextField
                                                 key={field}
@@ -5144,8 +5942,8 @@ export default function CommerceIntakeWorkflow({
                                                   )
                                                 }}
                                                 inputProps={{
-                                                  min: 1,
-                                                  step: 1,
+                                                  min: 0.001,
+                                                  step: 'any',
                                                 }}
                                                 sx={fieldSx}
                                               />
@@ -5168,6 +5966,10 @@ export default function CommerceIntakeWorkflow({
                                               Use manual facts
                                             </Button>
                                           </Box>
+                                          <Typography variant="caption" color="text.secondary">
+                                            Using {packaging.measurementSystem === 'imperial' ? 'Imperial' : 'Metric'} entry units fixed when this line was opened.
+                                            ClawPilot converts these values once to canonical millimeters and grams when saved.
+                                          </Typography>
                                         </Stack>
                                           </>
                                         ) : (
@@ -5626,6 +6428,38 @@ export default function CommerceIntakeWorkflow({
                           >
                             Check order
                           </Button>
+                          {candidate.requiresShipping !== false
+                          && provider === 'shopify' ? (
+                            <Button
+                              variant="outlined"
+                              startIcon={<Inventory2Rounded />}
+                              disabled={
+                                refreshLocked
+                                || Boolean(pendingAction)
+                                || !operatorCommandsAllowed
+                                || !canActivate
+                              }
+                              title={!canActivate
+                                ? 'Organization manager or administrator permission is required to plan packages and compare carrier rates.'
+                                : undefined}
+                              onClick={() => {
+                                void openCartonizationPreview(candidate)
+                              }}
+                              sx={actionButtonSx}
+                            >
+                              Pack & compare rates
+                            </Button>
+                          ) : candidate.requiresShipping !== false ? (
+                            <Button
+                              variant="outlined"
+                              startIcon={<Inventory2Rounded />}
+                              disabled
+                              title="Faire account-bound inventory reconciliation is not implemented yet."
+                              sx={actionButtonSx}
+                            >
+                              Pack preview needs Faire inventory
+                            </Button>
+                          ) : null}
                           <Button
                             variant="contained"
                             color="success"
@@ -5744,6 +6578,1163 @@ export default function CommerceIntakeWorkflow({
           ) : null}
         </Stack>
         </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={Boolean(cartonizationCandidate)}
+        onClose={() => {
+          if (!cartonizationLoading) setCartonizationCandidate(null)
+        }}
+        fullWidth
+        maxWidth="md"
+        aria-labelledby="cartonization-preview-title"
+      >
+        <DialogTitle id="cartonization-preview-title">
+          <Stack direction="row" spacing={1} alignItems="center">
+            <Inventory2Rounded color="primary" />
+            <Box>
+              <Typography variant="h6" fontWeight={700}>
+                Pack and compare carrier rates
+              </Typography>
+              <Typography variant="caption" color="text.secondary">
+                Order {cartonizationCandidate?.orderNumber
+                  || cartonizationCandidate?.externalOrderId}
+              </Typography>
+            </Box>
+          </Stack>
+        </DialogTitle>
+        <DialogContent dividers>
+          <Stack spacing={2}>
+            <Alert severity="info">
+              Start with the exact order, warehouse, inventory snapshot, and
+              customer packaging recipe. You can run a fit-only preview or
+              save a reloadable, read-only comparison of UPS and FedEx sandbox
+              shipment rates covering every resulting package. Neither path
+              buys postage, creates a shipment, prints, or changes inventory.
+            </Alert>
+            {!canActivate ? (
+              <Alert severity="warning">
+                Organization manager or administrator permission is required
+                to run this preview.
+              </Alert>
+            ) : null}
+
+            {cartonizationError ? (
+              <Alert severity="error">{cartonizationError}</Alert>
+            ) : null}
+            {!cartonizationLoading
+            && selectedCartonizationMaterialGlobalIds.length === 0 ? (
+              <Button
+                variant="contained"
+                onClick={() => {
+                  setCartonizationCandidate(null)
+                  setWorkbenchOpen(false)
+                  window.location.hash = '#operations/packaging-materials'
+                }}
+              >
+                Complete packaging material setup
+              </Button>
+            ) : null}
+
+            <Typography variant="overline" color="text.secondary">
+              Step 1 · Select warehouse and packaging materials
+            </Typography>
+            <FormControl fullWidth sx={fieldSx}>
+              <InputLabel>Warehouse</InputLabel>
+              <Select
+                label="Warehouse"
+                value={selectedCartonizationWarehouseGlobalId}
+                disabled={cartonizationLoading}
+                onChange={(event) => {
+                  setSelectedCartonizationWarehouseGlobalId(event.target.value)
+                  setCartonizationPreview(null)
+                  setCartonizationRateEvidence(null)
+                }}
+              >
+                {cartonizationWarehouses
+                  .filter((warehouse) => warehouse.status === 'active')
+                  .map((warehouse) => (
+                    <MenuItem
+                      key={warehouse.globalId}
+                      value={warehouse.globalId}
+                    >
+                      {warehouse.name} · {warehouse.globalId}
+                    </MenuItem>
+                  ))}
+              </Select>
+              <FormHelperText>
+                The selected inventory run and carrier sender account must
+                resolve to this exact active warehouse.
+              </FormHelperText>
+            </FormControl>
+
+            <FormControl fullWidth sx={fieldSx}>
+              <InputLabel>Packaging materials (1–8)</InputLabel>
+              <Select
+                multiple
+                label="Packaging materials (1–8)"
+                value={selectedCartonizationMaterialGlobalIds}
+                disabled={cartonizationLoading}
+                onChange={(event) => {
+                  const value = typeof event.target.value === 'string'
+                    ? event.target.value.split(',')
+                    : event.target.value
+                  const nextGlobalIds = Array.from(new Set(value)).slice(0, 8)
+                  setSelectedCartonizationMaterialGlobalIds(nextGlobalIds)
+                  setCartonizationPreview(null)
+                  setCartonizationRateEvidence(null)
+                  setSandboxParcelAssumptionsByMaterial((current) => (
+                    Object.fromEntries(nextGlobalIds.map((globalId) => {
+                      const material = cartonizationMaterials.find(
+                        (candidate) => candidate.globalId === globalId,
+                      ) || null
+                      return [
+                        globalId,
+                        current[globalId]
+                          || initialSandboxParcelAssumption(
+                            material,
+                            measurementSystem,
+                          ),
+                      ]
+                    }))
+                  ))
+                  setSandboxAssumptionAcknowledged(false)
+                }}
+                renderValue={(selected) => selected.map((globalId) => (
+                  cartonizationMaterials.find((material) => (
+                    material.globalId === globalId
+                  ))?.code || globalId
+                )).join(', ')}
+              >
+                {cartonizationMaterials.map((material) => {
+                  const selected = selectedCartonizationMaterialGlobalIds
+                    .includes(material.globalId)
+                  return (
+                    <MenuItem
+                      key={material.globalId}
+                      value={material.globalId}
+                      disabled={
+                        !selected
+                        && selectedCartonizationMaterialGlobalIds.length >= 8
+                      }
+                    >
+                      <Checkbox checked={selected} />
+                      <ListItemText
+                        primary={`${material.code} · ${material.name}`}
+                        secondary={`${packagingMaterialSummary(
+                          material,
+                          measurementSystem,
+                        )} · ${
+                          material.readiness.eligibleForCartonization
+                            ? 'Optimizer ready'
+                            : material.readiness.missing
+                                .map(humanize)
+                                .join(', ') || humanize(material.status)
+                        }`}
+                      />
+                    </MenuItem>
+                  )
+                })}
+              </Select>
+              <FormHelperText>
+                Draft, uncosted, or out-of-stock materials remain selectable so
+                the fit preview can return the exact corrective blocker.
+                Reloadable rate evidence supports one to eight materials and
+                binds each material to its own exterior dimensions and tare.
+              </FormHelperText>
+            </FormControl>
+
+            <Box component="section" aria-labelledby="committed-inventory-title">
+              <Typography variant="overline" color="text.secondary">
+                Step 2 · Confirm inventory attribution
+              </Typography>
+              <Typography
+                id="committed-inventory-title"
+                variant="subtitle2"
+                fontWeight={700}
+                mb={0.5}
+              >
+                Inventory already committed to this exact order
+              </Typography>
+              <Alert severity="warning" variant="outlined" sx={{ mb: 1 }}>
+                Default is zero. Shopify reports aggregate committed inventory,
+                not which order owns it. Enter only the units you can attribute
+                to this exact order; ClawPilot will never infer that allocation.
+              </Alert>
+              <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} mb={1}>
+                <Button
+                  size="small"
+                  variant="outlined"
+                  disabled={cartonizationLoading}
+                  onClick={() => {
+                    setAssumedCommittedByLine(Object.fromEntries(
+                      (cartonizationCandidate?.lines || [])
+                        .filter((line) => line.requiresShipping && line.quantity > 0)
+                        .map((line) => [line.globalId, '0']),
+                    ))
+                    setCartonizationPreview(null)
+                  }}
+                >
+                  Use ATP only
+                </Button>
+                <Button
+                  size="small"
+                  variant="outlined"
+                  color="warning"
+                  disabled={cartonizationLoading}
+                  onClick={() => {
+                    setAssumedCommittedByLine(Object.fromEntries(
+                      (cartonizationCandidate?.lines || [])
+                        .filter((line) => line.requiresShipping && line.quantity > 0)
+                        .map((line) => [line.globalId, String(line.quantity)]),
+                    ))
+                    setCartonizationPreview(null)
+                  }}
+                >
+                  Assert all remaining units
+                </Button>
+              </Stack>
+              <Stack spacing={1}>
+                {(cartonizationCandidate?.lines || [])
+                  .filter((line) => line.requiresShipping && line.quantity > 0)
+                  .map((line) => (
+                    <TextField
+                      key={line.globalId}
+                      size="small"
+                      type="number"
+                      label={`${line.title} committed units`}
+                      value={assumedCommittedByLine[line.globalId] || '0'}
+                      disabled={cartonizationLoading}
+                      inputProps={{
+                        min: 0,
+                        max: line.quantity,
+                        step: 1,
+                      }}
+                      helperText={`Whole units from 0 to ${line.quantity}; zero uses Shopify ATP only.`}
+                      onChange={(event) => {
+                        setAssumedCommittedByLine((current) => ({
+                          ...current,
+                          [line.globalId]: event.target.value,
+                        }))
+                        setCartonizationPreview(null)
+                      }}
+                    />
+                  ))}
+              </Stack>
+            </Box>
+
+            <Box component="section" aria-labelledby="sandbox-rating-title">
+              <Typography variant="overline" color="text.secondary">
+                Step 3 · Compare UPS and FedEx without shipping
+              </Typography>
+              <Typography
+                id="sandbox-rating-title"
+                variant="subtitle2"
+                fontWeight={700}
+                mb={0.5}
+              >
+                Explicit sandbox parcel assumptions
+              </Typography>
+              <Alert severity="warning" variant="outlined" sx={{ mb: 1.5 }}>
+                These values are used only for this saved sandbox comparison.
+                They do not activate the packaging material or become customer
+                master data. The evidence remains visibly watermarked until
+                tare and rated exterior measurements are verified.
+              </Alert>
+              {selectedCartonizationMaterials.length > 0 ? (
+                <Stack spacing={1.5} mb={1.5}>
+                  <Typography variant="caption" color="text.secondary">
+                    {selectedCartonizationMaterials.length} of 8 materials
+                    selected. Confirm a rated exterior size and temporary tare
+                    for every material before saving the comparison.
+                  </Typography>
+                  {selectedCartonizationMaterials.map((material) => {
+                    const assumption =
+                      sandboxParcelAssumptionsByMaterial[material.globalId]
+                      || initialSandboxParcelAssumption(
+                        material,
+                        measurementSystem,
+                      )
+                    const units = measurementUnits(
+                      assumption.measurementSystem,
+                    )
+                    const headingId =
+                      `sandbox-rate-assumption-${material.globalId}`
+                    return (
+                      <Card
+                        key={material.globalId}
+                        variant="outlined"
+                        component="section"
+                        aria-labelledby={headingId}
+                      >
+                        <CardContent sx={{ '&:last-child': { pb: 2 } }}>
+                          <Typography id={headingId} fontWeight={700}>
+                            {material.code} · {material.name}
+                          </Typography>
+                          <Typography variant="body2" color="text.secondary">
+                            Stored measurement:{' '}
+                            {packagingMaterialSummary(
+                              material,
+                              measurementSystem,
+                            )} · basis {
+                              humanize(material.dimensionBasis)
+                            } · evidence {
+                              humanize(material.dimensionEvidenceType)
+                            }
+                          </Typography>
+                          <Typography
+                            variant="caption"
+                            color="text.secondary"
+                            sx={{
+                              display: 'block',
+                              overflowWrap: 'anywhere',
+                              mb: 1,
+                            }}
+                          >
+                            {material.dimensionEvidenceReference
+                              || 'No evidence reference'}
+                          </Typography>
+                          <Box
+                            sx={{
+                              display: 'grid',
+                              gridTemplateColumns: {
+                                xs: '1fr',
+                                sm: 'repeat(2, minmax(0, 1fr))',
+                                md: 'repeat(4, minmax(0, 1fr))',
+                              },
+                              gap: 1,
+                            }}
+                          >
+                            {([
+                              ['length', 'length'],
+                              ['width', 'width'],
+                              ['height', 'height'],
+                            ] as const).map(([field, label]) => (
+                              <TextField
+                                key={field}
+                                fullWidth
+                                size="small"
+                                type="number"
+                                label={`${material.code} rated exterior ${label} (${units.length})`}
+                                value={assumption[field]}
+                                disabled={cartonizationLoading}
+                                inputProps={{ min: 0, step: 0.001 }}
+                                onChange={(event) => {
+                                  setSandboxParcelAssumptionsByMaterial(
+                                    (current) => ({
+                                      ...current,
+                                      [material.globalId]: {
+                                        ...(current[material.globalId]
+                                          || assumption),
+                                        [field]: event.target.value,
+                                      },
+                                    }),
+                                  )
+                                  setCartonizationRateEvidence(null)
+                                  setSandboxAssumptionAcknowledged(false)
+                                }}
+                              />
+                            ))}
+                            <TextField
+                              fullWidth
+                              size="small"
+                              type="number"
+                              label={`${material.code} sandbox-only tare (${units.weight})`}
+                              value={assumption.tareWeight}
+                              disabled={cartonizationLoading}
+                              inputProps={{ min: 0, step: 0.001 }}
+                              helperText="Temporary rating assumption"
+                              onChange={(event) => {
+                                setSandboxParcelAssumptionsByMaterial(
+                                  (current) => ({
+                                    ...current,
+                                    [material.globalId]: {
+                                      ...(current[material.globalId]
+                                        || assumption),
+                                      tareWeight: event.target.value,
+                                    },
+                                  }),
+                                )
+                                setCartonizationRateEvidence(null)
+                                setSandboxAssumptionAcknowledged(false)
+                              }}
+                            />
+                          </Box>
+                        </CardContent>
+                      </Card>
+                    )
+                  })}
+                </Stack>
+              ) : (
+                <Alert severity="info" sx={{ mb: 1.5 }}>
+                  Select one to eight packaging materials to enter their
+                  sandbox rate assumptions.
+                </Alert>
+              )}
+              <FormControlLabel
+                control={(
+                  <Checkbox
+                    checked={allowSandboxMinimumOverride}
+                    disabled={cartonizationLoading}
+                    onChange={(event) => {
+                      setAllowSandboxMinimumOverride(event.target.checked)
+                      setCartonizationRateEvidence(null)
+                      setSandboxAssumptionAcknowledged(false)
+                    }}
+                  />
+                )}
+                label="For this sandbox proof only, allow a below-minimum customer recipe quantity"
+              />
+              <TextField
+                fullWidth
+                size="small"
+                label="Why these sandbox assumptions are being used"
+                value={sandboxAssumptionReason}
+                disabled={cartonizationLoading}
+                placeholder="Example: Test order is below the approved case minimum; dimensions came from the customer email and tare is test-only."
+                sx={{ mt: 1 }}
+                onChange={(event) => {
+                  setSandboxAssumptionReason(event.target.value)
+                  setCartonizationRateEvidence(null)
+                  setSandboxAssumptionAcknowledged(false)
+                }}
+              />
+              <FormControlLabel
+                sx={{ alignItems: 'flex-start', mt: 1 }}
+                control={(
+                  <Checkbox
+                    checked={sandboxAssumptionAcknowledged}
+                    disabled={cartonizationLoading}
+                    onChange={(event) => {
+                      setSandboxAssumptionAcknowledged(event.target.checked)
+                    }}
+                  />
+                )}
+                label="I understand this is assumption-backed sandbox evidence, not executable shipping cost, postage, or approved packaging master data."
+              />
+            </Box>
+
+            {cartonizationLoading ? (
+              <Stack direction="row" spacing={1} alignItems="center">
+                <CircularProgress size={20} />
+                <Typography variant="body2">
+                  Reading exact revisions and, when requested, obtaining
+                  read-only UPS and FedEx sandbox rates…
+                </Typography>
+              </Stack>
+            ) : null}
+
+            {cartonizationRateEvidence ? (
+              <Box component="section" aria-label="Saved carrier comparison">
+                <Alert severity="warning" sx={{ mb: 1.5 }}>
+                  ASSUMPTION-BACKED SANDBOX EVIDENCE · NOT EXECUTABLE OR
+                  ACTUAL BILLED COST
+                </Alert>
+                <Stack
+                  direction={{ xs: 'column', sm: 'row' }}
+                  justifyContent="space-between"
+                  alignItems={{ sm: 'center' }}
+                  spacing={1}
+                  mb={1}
+                >
+                  <Box>
+                    <Typography variant="subtitle1" fontWeight={700}>
+                      Saved pack and carrier comparison
+                    </Typography>
+                    <Typography
+                      variant="caption"
+                      color="text.secondary"
+                      sx={{ overflowWrap: 'anywhere' }}
+                    >
+                      {cartonizationRateEvidence.globalId} · Order {
+                        cartonizationRateEvidence.candidateOrderNumber
+                      } · {cartonizationRateEvidence.warehouse.name}
+                    </Typography>
+                  </Box>
+                  <Chip
+                    color={
+                      cartonizationRateEvidence.status === 'succeeded'
+                        ? 'success'
+                        : cartonizationRateEvidence.status === 'partial'
+                          ? 'warning'
+                          : 'error'
+                    }
+                    label={humanize(cartonizationRateEvidence.status)}
+                  />
+                </Stack>
+                <Card variant="outlined" sx={{ mb: 1.5 }}>
+                  <CardContent sx={{ '&:last-child': { pb: 2 } }}>
+                    <Typography variant="subtitle1" fontWeight={700}>
+                      Shipment-level service options — one service applies to
+                      all {cartonizationRateEvidence.packages.length} package{
+                        cartonizationRateEvidence.packages.length === 1
+                          ? ''
+                          : 's'
+                      }
+                    </Typography>
+                    <Alert severity="info" variant="outlined" sx={{ my: 1 }}>
+                      Only the options below apply to the shipment. Each amount
+                      is the whole-shipment total returned once by a
+                      multi-package carrier request; repeated package evidence
+                      references are not added together.
+                    </Alert>
+                    {cartonizationShipmentServiceOptions.length > 0 ? (
+                      <Box
+                        component="ul"
+                        aria-label="Valid shipment-level carrier service options"
+                        sx={{
+                          display: 'grid',
+                          gridTemplateColumns: {
+                            xs: '1fr',
+                            sm: 'repeat(2, minmax(0, 1fr))',
+                          },
+                          gap: 1,
+                          listStyle: 'none',
+                          m: 0,
+                          p: 0,
+                        }}
+                      >
+                        {cartonizationShipmentServiceOptions.map((option) => (
+                          <Box
+                            component="li"
+                            key={[
+                              option.provider,
+                              option.serviceCode,
+                              option.serviceName,
+                              option.currency,
+                            ].join(':')}
+                            sx={{
+                              border: '1px solid',
+                              borderColor: 'divider',
+                              borderRadius: 1,
+                              p: 1,
+                            }}
+                          >
+                            <Stack
+                              direction="row"
+                              justifyContent="space-between"
+                              alignItems="flex-start"
+                              spacing={1}
+                            >
+                              <Box>
+                                <Typography fontWeight={700}>
+                                  {carrierLabel(option.provider)} · {
+                                    option.serviceName
+                                  }
+                                </Typography>
+                                <Typography
+                                  variant="caption"
+                                  color="text.secondary"
+                                >
+                                  Service {option.serviceCode} · {
+                                    option.currency
+                                  }
+                                </Typography>
+                              </Box>
+                              <Chip
+                                size="small"
+                                color="success"
+                                label="Shipment option"
+                              />
+                            </Stack>
+                            <Typography variant="h6" fontWeight={700}>
+                              {formatShipmentRate(
+                                option.amount,
+                                option.currency,
+                              )}
+                            </Typography>
+                            <Typography
+                              variant="caption"
+                              color="text.secondary"
+                              display="block"
+                              sx={{
+                                overflowWrap: 'anywhere',
+                                fontFamily: 'monospace',
+                              }}
+                            >
+                              {option.rateEvidenceGlobalId}
+                            </Typography>
+                          </Box>
+                        ))}
+                      </Box>
+                    ) : (
+                      <Alert severity="warning">
+                        No single carrier service and currency was returned by
+                        one multi-package request for every physical package.
+                        This evidence has no shipment-level service option.
+                      </Alert>
+                    )}
+                  </CardContent>
+                </Card>
+                <Stack spacing={1}>
+                  {cartonizationRateEvidence.packages.map((packagePlan) => (
+                    <Card key={packagePlan.packageKey} variant="outlined">
+                      <CardContent sx={{ '&:last-child': { pb: 2 } }}>
+                        <Typography fontWeight={700}>
+                          Package {packagePlan.packageKey} · {
+                            packagePlan.packagingMaterialName
+                          }
+                        </Typography>
+                        <Typography variant="body2" color="text.secondary">
+                          Rated exterior {
+                            formatDimensionsMm({
+                              lengthMm:
+                                packagePlan.ratedOuterDimensionsMm.length,
+                              widthMm:
+                                packagePlan.ratedOuterDimensionsMm.width,
+                              heightMm:
+                                packagePlan.ratedOuterDimensionsMm.height,
+                            }, measurementSystem, {
+                              maximumFractionDigits: 3,
+                            })
+                          } · content {
+                            formatGrams(
+                              packagePlan.contentWeightGrams,
+                              measurementSystem,
+                              { maximumFractionDigits: 3 },
+                            )
+                          } + tare {
+                            formatGrams(
+                              packagePlan.tareWeightGrams,
+                              measurementSystem,
+                              { maximumFractionDigits: 3 },
+                            )
+                          } = rated {
+                            formatGrams(
+                              packagePlan.ratedGrossWeightGrams,
+                              measurementSystem,
+                              { maximumFractionDigits: 3 },
+                            )
+                          }
+                        </Typography>
+                        <Divider sx={{ my: 1 }} />
+                        {packagePlan.allocations.map((allocation) => (
+                          <Typography
+                            key={`${packagePlan.packageKey}:${allocation.lineGlobalId}`}
+                            variant="body2"
+                          >
+                            {allocation.quantity} × {allocation.title}
+                          </Typography>
+                        ))}
+                        <Box sx={{ mt: 1.5 }}>
+                          <Typography
+                            variant="caption"
+                            color="text.secondary"
+                            display="block"
+                          >
+                            Immutable carrier evidence references · supporting
+                            parcel evidence only, not package-level choices
+                          </Typography>
+                          <Stack
+                            component="ul"
+                            direction={{ xs: 'column', sm: 'row' }}
+                            spacing={1}
+                            aria-label={`Carrier evidence references for package ${packagePlan.packageKey}`}
+                            sx={{ listStyle: 'none', m: 0, mt: 0.5, p: 0 }}
+                          >
+                            {packagePlan.quotes.map((quote) => (
+                              <Box
+                                component="li"
+                                key={`${packagePlan.packageKey}:${quote.provider}`}
+                                sx={{
+                                  flex: 1,
+                                  minWidth: 0,
+                                  borderLeft: '3px solid',
+                                  borderColor: quote.status === 'succeeded'
+                                    ? 'success.main'
+                                    : 'error.main',
+                                  pl: 1,
+                                }}
+                              >
+                                <Typography variant="body2" fontWeight={700}>
+                                  {carrierLabel(quote.provider)} · {
+                                    quote.rateScope
+                                      === 'multi_package_shipment'
+                                      ? 'Multi-package shipment reference'
+                                      : 'Legacy single-package rate evidence'
+                                  } · {humanize(quote.status)}
+                                </Typography>
+                                <Typography
+                                  variant="caption"
+                                  color="text.secondary"
+                                  sx={{
+                                    display: 'block',
+                                    overflowWrap: 'anywhere',
+                                    fontFamily: 'monospace',
+                                  }}
+                                >
+                                  {quote.rateEvidenceGlobalId}
+                                </Typography>
+                                {quote.rateScope === 'single_package' ? (
+                                  <Box sx={{ mt: 0.75 }}>
+                                    <Alert severity="warning" variant="outlined">
+                                      Read-only historical package rates. They
+                                      are not summed or offered as shipment
+                                      service options.
+                                    </Alert>
+                                    <Stack
+                                      component="ul"
+                                      spacing={0.5}
+                                      aria-label={`Legacy package rates from ${carrierLabel(quote.provider)}`}
+                                      sx={{
+                                        listStyle: 'none',
+                                        m: 0,
+                                        mt: 0.75,
+                                        p: 0,
+                                      }}
+                                    >
+                                      {quote.rates.map((rate) => (
+                                        <Box
+                                          component="li"
+                                          key={[
+                                            rate.serviceCode,
+                                            rate.serviceName,
+                                            rate.currency,
+                                            rate.amount,
+                                          ].join(':')}
+                                          sx={{
+                                            display: 'flex',
+                                            justifyContent: 'space-between',
+                                            gap: 1,
+                                          }}
+                                        >
+                                          <Typography variant="body2">
+                                            {rate.serviceName} · {
+                                              rate.serviceCode
+                                            }
+                                          </Typography>
+                                          <Typography
+                                            variant="body2"
+                                            fontWeight={700}
+                                          >
+                                            {Number.isFinite(
+                                              Number(rate.amount),
+                                            )
+                                              ? formatShipmentRate(
+                                                  Number(rate.amount),
+                                                  rate.currency,
+                                                )
+                                              : `${rate.amount} ${rate.currency}`}
+                                          </Typography>
+                                        </Box>
+                                      ))}
+                                    </Stack>
+                                  </Box>
+                                ) : null}
+                              </Box>
+                            ))}
+                          </Stack>
+                        </Box>
+                      </CardContent>
+                    </Card>
+                  ))}
+                </Stack>
+                <Stack
+                  direction={{ xs: 'column', sm: 'row' }}
+                  spacing={1}
+                  mt={1.5}
+                >
+                  <Button
+                    variant="contained"
+                    onClick={openCartonizationRateEvidence}
+                  >
+                    Open reloadable evidence
+                  </Button>
+                  <Button
+                    variant="outlined"
+                    onClick={() => {
+                      void copyCartonizationRateEvidenceLink()
+                    }}
+                  >
+                    Copy evidence link
+                  </Button>
+                </Stack>
+              </Box>
+            ) : null}
+
+            {cartonizationPreview ? (
+              <>
+                <Alert
+                  severity={
+                    cartonizationPreview.status === 'ready'
+                      ? 'success'
+                      : cartonizationPreview.status === 'infeasible'
+                        ? 'warning'
+                        : 'info'
+                  }
+                >
+                  {cartonizationPreview.status === 'ready'
+                    ? `Fit and material plan ready at ${cartonizationPreview.warehouse?.name || 'the selected warehouse'}.`
+                    : cartonizationPreview.status === 'infeasible'
+                      ? 'The selected facts are complete, but no selected material fits this order under the fixed-axis preview.'
+                      : 'The preview stopped before optimization because exact required facts are missing.'}
+                </Alert>
+
+                <Card variant="outlined">
+                  <CardContent sx={{ '&:last-child': { pb: 2 } }}>
+                    <Typography variant="subtitle2" fontWeight={700} mb={0.5}>
+                      Point-in-time inventory evidence
+                    </Typography>
+                    <Typography variant="caption" color="text.secondary" display="block">
+                      Sync {cartonizationPreview.inventoryEvidence.syncRunGlobalId
+                        || 'unavailable'} · provider fetched{' '}
+                      {formatDate(
+                        cartonizationPreview.inventoryEvidence.providerFetchedAt,
+                      )}
+                    </Typography>
+                    <Stack spacing={0.5} mt={1}>
+                      {cartonizationPreview.inventoryEvidence.products
+                        .map((product) => (
+                          <Typography
+                            key={product.productGlobalId}
+                            variant="body2"
+                            sx={{ overflowWrap: 'anywhere' }}
+                          >
+                            {product.productGlobalId}: demand{' '}
+                            {product.demandQuantity} · attributed to this order{' '}
+                            {product.assumedCommittedQuantity} · eligible{' '}
+                            {product.eligibleQuantity === null
+                              ? `blocked until exactly one inventory position is resolved (${product.positionCount} found)`
+                              : product.eligibleQuantity}
+                          </Typography>
+                        ))}
+                      {cartonizationPreview.inventoryEvidence.positions
+                        .filter((position) => (
+                          cartonizationPreview.inventoryEvidence.products.some(
+                            (product) => (
+                              product.productGlobalId === position.productGlobalId
+                            ),
+                          )
+                        ))
+                        .map((position) => (
+                          <Typography
+                            key={position.positionGlobalId}
+                            variant="caption"
+                            color="text.secondary"
+                            sx={{ overflowWrap: 'anywhere' }}
+                          >
+                            Position {position.positionGlobalId} · {
+                              position.productGlobalId
+                            } · ATP {position.atpQuantity} · provider committed{' '}
+                            {position.providerCommittedQuantity}
+                          </Typography>
+                        ))}
+                    </Stack>
+                  </CardContent>
+                </Card>
+
+                {!cartonizationEvidenceSafe ? (
+                  <Alert severity="error">
+                    The preview response did not preserve the required read-only
+                    evidence boundary, so no plan is displayed.
+                  </Alert>
+                ) : null}
+
+                {cartonizationPreview.blockers.length > 0 ? (
+                  <Stack spacing={1}>
+                    <Typography variant="subtitle2" fontWeight={700}>
+                      Required corrections
+                    </Typography>
+                    {cartonizationPreview.blockers.map((blocker) => (
+                      <Alert key={`${blocker.code}:${blocker.entityGlobalId || ''}`} severity="warning">
+                        <Typography fontWeight={700}>{blocker.title}</Typography>
+                        <Typography variant="body2">{blocker.detail}</Typography>
+                        <Typography variant="caption" display="block" sx={{ mt: 0.5 }}>
+                          Next action: {blocker.action}
+                        </Typography>
+                        {blocker.entityType === 'line' ? (
+                          <Button
+                            size="small"
+                            sx={{ mt: 1 }}
+                            onClick={() => setCartonizationCandidate(null)}
+                          >
+                            Open this order&apos;s package fields
+                          </Button>
+                        ) : blocker.entityType === 'material' ? (
+                          <Button
+                            size="small"
+                            sx={{ mt: 1 }}
+                            onClick={() => {
+                              setCartonizationCandidate(null)
+                              setWorkbenchOpen(false)
+                              window.location.hash = '#operations/packaging-materials'
+                            }}
+                          >
+                            Fix packaging materials
+                          </Button>
+                        ) : blocker.entityType === 'inventory' ? (
+                          <Button
+                            size="small"
+                            sx={{ mt: 1 }}
+                            onClick={() => {
+                              setCartonizationCandidate(null)
+                              setWorkbenchOpen(false)
+                              window.location.hash = '#operations/shopify-inventory'
+                            }}
+                          >
+                            Open Shopify inventory
+                          </Button>
+                        ) : blocker.entityType === 'warehouse' ? (
+                          <Button
+                            size="small"
+                            sx={{ mt: 1 }}
+                            onClick={() => {
+                              setCartonizationCandidate(null)
+                              setWorkbenchOpen(false)
+                              window.location.hash = '#operations/warehouses'
+                            }}
+                          >
+                            Open warehouses
+                          </Button>
+                        ) : blocker.entityType === 'optimizer' ? (
+                          <Button
+                            size="small"
+                            sx={{ mt: 1 }}
+                            onClick={() => {
+                              void runCartonizationPreview()
+                            }}
+                          >
+                            Retry optimizer
+                          </Button>
+                        ) : (
+                          <Button
+                            size="small"
+                            sx={{ mt: 1 }}
+                            onClick={() => setCartonizationCandidate(null)}
+                          >
+                            Review sales channel
+                          </Button>
+                        )}
+                      </Alert>
+                    ))}
+                  </Stack>
+                ) : null}
+
+                {cartonizationEvidenceSafe
+                && cartonizationPreview.optimizer?.selectedPlan ? (
+                  <Box component="section" aria-label="Optimized carton plan">
+                    <Stack
+                      direction={{ xs: 'column', sm: 'row' }}
+                      justifyContent="space-between"
+                      gap={1}
+                      mb={1}
+                    >
+                      <Box>
+                        <Typography variant="subtitle1" fontWeight={700}>
+                          {cartonizationPreview.optimizer.selectedPlan.cartonCount === 1
+                            ? 'One-shipment, one-package fit and material plan'
+                            : `${cartonizationPreview.optimizer.selectedPlan.shipmentCount}-shipment, ${cartonizationPreview.optimizer.selectedPlan.cartonCount}-package multi-piece fit and material plan`}
+                        </Typography>
+                        <Typography variant="caption" color="text.secondary">
+                          {cartonizationPreview.optimizer.method} · {
+                            cartonizationPreview.optimizer.status
+                          } · {cartonizationPreview.optimizer.durationMs} ms ·
+                          {' '}estimated material-plan cost{' '}
+                          {formatCommerceMoneyMajor(
+                            cartonizationPreview.optimizer.selectedPlan
+                              .estimatedTotalCostMinor,
+                            cartonizationCandidate?.currency || 'USD',
+                          )}
+                        </Typography>
+                      </Box>
+                      <Chip
+                        color="success"
+                        variant="outlined"
+                        label={`${
+                          cartonizationPreview.optimizer.selectedPlan.shipmentCount
+                        } ${
+                          cartonizationPreview.optimizer.selectedPlan.shipmentCount === 1
+                            ? 'shipment'
+                            : 'shipments'
+                        } · ${
+                          cartonizationPreview.optimizer.selectedPlan.cartonCount
+                        } ${
+                          cartonizationPreview.optimizer.selectedPlan.cartonCount === 1
+                            ? 'package'
+                            : 'packages'
+                        }`}
+                      />
+                    </Stack>
+                    <Stack spacing={1}>
+                      {cartonizationPreview.optimizer.selectedPlan.packages.map(
+                        (packagePlan, index) => {
+                          const material = cartonizationMaterials.find(
+                            (candidate) => candidate.globalId === packagePlan.cartonGlobalId,
+                          )
+                          const volume = packagePlan.innerDimensionsMm.length
+                            * packagePlan.innerDimensionsMm.width
+                            * packagePlan.innerDimensionsMm.height
+                          const utilization = volume > 0
+                            ? Math.max(0, Math.min(
+                                100,
+                                (1 - packagePlan.unusedVolumeMm3 / volume) * 100,
+                              ))
+                            : 0
+                          return (
+                            <Card key={packagePlan.packageKey} variant="outlined">
+                              <CardContent sx={{ '&:last-child': { pb: 2 } }}>
+                                <Stack spacing={1}>
+                                  <Stack
+                                    direction={{ xs: 'column', sm: 'row' }}
+                                    justifyContent="space-between"
+                                    gap={1}
+                                  >
+                                    <Box>
+                                      <Typography fontWeight={700}>
+                                        Package {index + 1} · {
+                                          material?.name || packagePlan.cartonGlobalId
+                                        }
+                                      </Typography>
+                                      <Typography variant="caption" color="text.secondary">
+                                        {formatDimensionsMm({
+                                          lengthMm: packagePlan.innerDimensionsMm.length,
+                                          widthMm: packagePlan.innerDimensionsMm.width,
+                                          heightMm: packagePlan.innerDimensionsMm.height,
+                                        }, measurementSystem, {
+                                          maximumFractionDigits: 3,
+                                        })} · {formatGrams(
+                                          packagePlan.totalWeightGrams,
+                                          measurementSystem,
+                                          { maximumFractionDigits: 3 },
+                                        )} packed · {utilization.toFixed(1)}% volume used
+                                      </Typography>
+                                    </Box>
+                                    <Chip
+                                      size="small"
+                                      label={`${packagePlan.allocations.reduce(
+                                        (sum, allocation) => sum + allocation.quantity,
+                                        0,
+                                      )} units`}
+                                    />
+                                  </Stack>
+                                  <Divider />
+                                  {packagePlan.allocations.map((allocation) => {
+                                    const line = cartonizationCandidate?.lines?.find(
+                                      (candidateLine) => (
+                                        candidateLine.globalId === allocation.lineGlobalId
+                                      ),
+                                    )
+                                    return (
+                                      <Typography
+                                        key={`${packagePlan.packageKey}:${allocation.lineGlobalId}`}
+                                        variant="body2"
+                                      >
+                                        {allocation.quantity} × {line?.title
+                                          || allocation.productGlobalId}
+                                      </Typography>
+                                    )
+                                  })}
+                                </Stack>
+                              </CardContent>
+                            </Card>
+                          )
+                        },
+                      )}
+                    </Stack>
+                  </Box>
+                ) : null}
+
+                {cartonizationEvidenceSafe ? (
+                  <>
+                    <Alert severity="success" variant="outlined">
+                      Evidence: {cartonizationPreview.evidence.databaseWrites}
+                      {' '}database writes · {
+                        cartonizationPreview.evidence.providerWrites
+                      } provider writes · {cartonizationPreview.evidence.rateCalls}
+                      {' '}rate calls · {cartonizationPreview.evidence.labelCalls}
+                      {' '}label calls · {
+                        cartonizationPreview.evidence.shipmentWrites
+                      } shipment writes.
+                    </Alert>
+                    <Alert severity="info" variant="outlined">
+                      This diagnostic optimizes fixed-axis physical fit and
+                      packaging-material cost. Transport and handling cost are
+                      excluded; it does not yet accept or persist a pack plan.
+                      Packages from the same warehouse form one multi-piece
+                      shipment. One selected carrier service must apply to every
+                      package in that shipment. When pack-plan acceptance is
+                      implemented, packing documents must remain grouped by
+                      planned shipment.
+                    </Alert>
+                    <Accordion disableGutters>
+                      <AccordionSummary expandIcon={<ExpandMoreRounded />}>
+                        <Typography variant="subtitle2" fontWeight={700}>
+                          Preview evidence
+                        </Typography>
+                      </AccordionSummary>
+                      <AccordionDetails>
+                        <Stack spacing={0.5}>
+                          <Typography variant="caption" sx={{ overflowWrap: 'anywhere' }}>
+                            Candidate revision {cartonizationPreview.candidateRowVersion}
+                          </Typography>
+                          <Typography variant="caption" sx={{ overflowWrap: 'anywhere' }}>
+                            Optimizer input hash{' '}
+                            {cartonizationPreview.optimizer?.inputHash || 'not run'}
+                          </Typography>
+                          <Typography variant="caption">
+                            Rotation policy: fixed axes, conservative
+                          </Typography>
+                          <Typography variant="caption">
+                            Inventory completed{' '}
+                            {formatDate(
+                              cartonizationPreview.inventoryEvidence.completedAt,
+                            )}
+                          </Typography>
+                        </Stack>
+                      </AccordionDetails>
+                    </Accordion>
+                  </>
+                ) : null}
+              </>
+            ) : null}
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button
+            onClick={() => setCartonizationCandidate(null)}
+            disabled={cartonizationLoading}
+          >
+            Close
+          </Button>
+          <Button
+            variant="outlined"
+            startIcon={cartonizationLoading
+              ? <CircularProgress size={16} color="inherit" />
+              : <Inventory2Rounded />}
+            disabled={
+              cartonizationLoading
+              || !canActivate
+              || !operatorCommandsAllowed
+              || selectedCartonizationMaterialGlobalIds.length < 1
+              || selectedCartonizationMaterialGlobalIds.length > 8
+            }
+            onClick={() => {
+              void runCartonizationPreview()
+            }}
+          >
+            Run fit-only preview
+          </Button>
+          <Button
+            variant="contained"
+            startIcon={cartonizationLoading
+              ? <CircularProgress size={16} color="inherit" />
+              : <Inventory2Rounded />}
+            disabled={
+              cartonizationLoading
+              || !canActivate
+              || !operatorCommandsAllowed
+              || selectedCartonizationMaterialGlobalIds.length < 1
+              || selectedCartonizationMaterialGlobalIds.length > 8
+              || !selectedCartonizationWarehouseGlobalId
+              || !sandboxAssumptionAcknowledged
+            }
+            onClick={() => {
+              void createCartonizationRateEvidence()
+            }}
+          >
+            Save & compare UPS + FedEx
+          </Button>
+        </DialogActions>
       </Dialog>
     </>
   )

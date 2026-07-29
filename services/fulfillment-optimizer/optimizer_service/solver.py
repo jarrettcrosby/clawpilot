@@ -632,7 +632,7 @@ class FulfillmentModel:
         raw_plan = {
             "warehouseGlobalIds": sorted(used_warehouses),
             "warehouseCount": len(used_warehouses),
-            "shipmentCount": len(packages),
+            "shipmentCount": len(used_warehouses),
             "cartonCount": len(packages),
             "estimatedTotalCostMinor": total_cost,
             "unusedVolumeMm3": total_unused_volume,

@@ -621,7 +621,7 @@ async function verifyRuntime(connectionString) {
     const fixture = await seedBase(pool)
     const packingCapabilities = {
       supportedFormats: ['PDF'],
-      supportedMedia: ['letter'],
+      supportedMedia: ['letter', 'a4'],
       supportedDocumentTypes: ['packing_slip'],
     }
     const labelCapabilities = {
@@ -631,7 +631,7 @@ async function verifyRuntime(connectionString) {
     }
     const primaryAgentCapabilities = {
       supportedFormats: ['ZPL', 'PDF'],
-      supportedMedia: ['label_4x6', 'letter'],
+      supportedMedia: ['label_4x6', 'letter', 'a4'],
       supportedDocumentTypes: ['shipping_label', 'packing_slip'],
     }
     const primaryEnrollment = await persistence.enrollOperationsPrintAgentInPostgres({

@@ -1,3 +1,7 @@
+// Node's focused strip-types tests need the explicit extension.
+// @ts-expect-error TypeScript extension imports are intentionally used for Node tests.
+import { commerceProductDisplayName } from './commerceProductNaming.ts'
+
 export const COMMERCE_INTAKE_CSV_MAX_BYTES = 1_048_576
 export const COMMERCE_INTAKE_CSV_MAX_DATA_ROWS = 500
 export const COMMERCE_INTAKE_CSV_MAX_MONEY_MINOR = 9_000_000_000_000
@@ -69,6 +73,10 @@ export type CommerceProductReviewCsvCandidate = {
   sku?: string | null
   productTitle: string
   variantTitle?: string | null
+  selectedOptions?: ReadonlyArray<{
+    name?: string | null
+    value?: string | null
+  }> | null
   currency?: string | null
   priceMinor?: number | null
   productGlobalId?: string | null
@@ -367,10 +375,11 @@ export function exportCommerceProductReviewCsv(input: {
       || candidate.priceMinor === undefined
       ? ''
       : exportMoney(candidate.priceMinor, currency)
-    const createName = candidate.variantTitle
-      && candidate.variantTitle.trim() !== candidate.productTitle.trim()
-      ? `${candidate.productTitle} · ${candidate.variantTitle}`
-      : candidate.productTitle
+    const createName = commerceProductDisplayName({
+      productTitle: candidate.productTitle,
+      variantTitle: candidate.variantTitle,
+      selectedOptions: candidate.selectedOptions,
+    })
     return [
       input.accountGlobalId,
       candidate.globalId,

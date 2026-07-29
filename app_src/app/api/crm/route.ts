@@ -6,6 +6,7 @@ import {
   type CrmEntity,
   type SuiteCrmInteractionModule,
 } from '@/lib/crm/types'
+import { isIso4217CurrencyCode } from '@/lib/currency'
 import { enqueueCrmIntegrationAction } from '@/lib/crm/integrationActions'
 import { reconcileCrmBoardProjectionsForPipeline } from '@/lib/crm/boardProjection'
 import {
@@ -26,6 +27,8 @@ import { listWorkspaceOrganizationHierarchy, workspaceOrganizationById } from '@
 import { suiteCrmAdminPortalUrl, suiteCrmAdminUsername } from '@/lib/crm/suiteCrmPublicUrl'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import { readMatonCredentialStateFromPostgres } from '@/lib/persistence/matonCredentials'
+import { readMeasurementPreferences } from '@/lib/persistence/measurementPreferences'
+import { operationsCapabilities } from '@/lib/operations/authorization'
 import { requireRequestUser } from '@/lib/requestUser'
 import { effectiveAuthorizationRole, type AppUser } from '@/lib/users'
 import {
@@ -220,6 +223,7 @@ export async function GET(req: NextRequest) {
       pipelineUsers,
       campaignRecipients,
       canManageHierarchy: organizationRole === 'owner' || organizationRole === 'admin',
+      canManageProductIdentities: operationsCapabilities(actor).canManage,
       providerIdentities: {
         googleMail: selectedProviderEmail('google-mail'),
         googleCalendar: selectedProviderEmail('google-calendar'),
@@ -351,8 +355,23 @@ export async function POST(req: NextRequest) {
       const name = stringValue(fields.name, 250)
       if (!name) throw new Error('Product name is required')
       const sku = stringValue(fields.sku, 25)
-      const currency = (stringValue(fields.currency, 3) || 'USD').toUpperCase()
-      if (!/^[A-Z]{3}$/.test(currency)) throw new Error('Product currency must be a three-letter code')
+      const requestedCurrency = stringValue(fields.currency, 3)
+      const existingCurrency = stringValue(
+        current && 'currency' in current ? current.currency : '',
+        3,
+      )
+      const preferences = !current && !requestedCurrency
+        ? await readMeasurementPreferences(actor)
+        : null
+      const currency = (
+        requestedCurrency
+        || existingCurrency
+        || preferences?.organizationCurrencyCode
+        || ''
+      ).toUpperCase()
+      if (!isIso4217CurrencyCode(currency)) {
+        throw new Error('Product currency must be a supported ISO 4217 code')
+      }
       const url = stringValue(fields.url, 2_000)
       if (url && !/^https?:\/\//i.test(url)) throw new Error('Product URL must use http or https')
       const staged = await stageCrmRecordInPostgres({

@@ -880,7 +880,7 @@ function validateCandidatePlan(
   const unusedVolume = integer(source.unusedVolumeMm3, 'OPTIMIZER_RESULT_UNUSED_VOLUME_INVALID')
   if (
     warehouseCount !== selectedWarehouseIds.length
-    || shipmentCount !== packages.length
+    || shipmentCount !== selectedWarehouseIds.length
     || cartonCount !== packages.length
     || totalCost !== computedCost
     || unusedVolume !== computedUnusedVolume

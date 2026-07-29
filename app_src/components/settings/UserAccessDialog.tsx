@@ -45,6 +45,7 @@ import ViewKanbanRounded from '@mui/icons-material/ViewKanbanRounded'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import { announceUserDateTimeSettings, formatUserDateTime } from '@/lib/userDateTime'
 import IntegrationSettingsPanel from './IntegrationSettingsPanel'
+import MeasurementPreferencesPanel from './MeasurementPreferencesPanel'
 import OrganizationBrandingPanel from './OrganizationBrandingPanel'
 import SessionSecurityPanel from './SessionSecurityPanel'
 
@@ -1130,6 +1131,12 @@ export default function UserAccessDialog({
                     Save profile
                   </Button>
                 </Box>
+                <MeasurementPreferencesPanel
+                  organizationName={
+                    usersPayload?.currentOrganization?.name
+                    || currentUser.organizationName
+                  }
+                />
                 <OrganizationBrandingPanel />
               </>
             ) : (

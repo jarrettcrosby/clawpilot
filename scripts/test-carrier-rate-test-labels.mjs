@@ -180,12 +180,21 @@ for (const fragment of [
   ') AS requested_output_format',
   'attempt.requested_output_format !== input.format',
   'CARRIER_RATE_TEST_LABEL_OUTPUT_MISMATCH',
+  "rate.purpose = 'sandbox_rate_test'",
 ]) {
   assert.ok(
     labelPersistence.includes(fragment),
     `Missing carrier rate-test persistence contract: ${fragment}`,
   )
 }
+assert.ok(
+  labelPersistence.match(/rate\.purpose = 'sandbox_rate_test'/g)?.length >= 5,
+  'Every rate-evidence join in carrierRateTestLabels must reject cartonization-only rate evidence',
+)
+assert.ok(
+  !labelPersistence.includes("'cartonization_package_rate'"),
+  'Carrier rate-test labels must never consume cartonization package-rate evidence',
+)
 const browserSafeProjection = labelPersistence.slice(
   labelPersistence.indexOf('export type CarrierRateTestLabelListItem'),
   labelPersistence.indexOf('export function carrierRateTestLabelFingerprint'),

@@ -43,6 +43,9 @@ function loadDomain() {
 }
 
 const {
+  PACKAGING_DIMENSION_BASES,
+  PACKAGING_DIMENSION_EVIDENCE_TYPES,
+  PACKAGING_MATERIAL_SOURCES,
   PACKAGING_MATERIAL_TYPES,
   STARTER_PACKAGING_MATERIALS,
   packagingMaterialReadiness,
@@ -52,6 +55,12 @@ assert.deepEqual(
   Array.from(PACKAGING_MATERIAL_TYPES),
   ['carton', 'poly_mailer', 'padded_mailer'],
 )
+assert.deepEqual(
+  Array.from(PACKAGING_DIMENSION_BASES),
+  ['inner', 'outer', 'unspecified'],
+)
+assert.ok(PACKAGING_DIMENSION_EVIDENCE_TYPES.includes('customer_confirmed'))
+assert.ok(PACKAGING_MATERIAL_SOURCES.includes('customer_supplied'))
 assert.equal(STARTER_PACKAGING_MATERIALS.length, 6)
 assert.equal(
   new Set(STARTER_PACKAGING_MATERIALS.map((material) => material.code)).size,
@@ -62,11 +71,18 @@ for (const starter of STARTER_PACKAGING_MATERIALS) {
   assert.equal(starter.source, 'starter_assortment')
   assert.equal(starter.unitCostMinor, null)
   assert.equal(starter.currency, null)
+  assert.equal(starter.dimensionBasis, 'inner')
+  assert.equal(starter.dimensionEvidenceType, 'legacy')
   assert.ok(starter.innerLengthMm > 0)
   assert.ok(starter.innerWidthMm > 0)
   assert.ok(starter.innerHeightMm > 0)
   assert.ok(starter.tareWeightGrams > 0)
   assert.ok(starter.maxWeightGrams > starter.tareWeightGrams)
+  assert.equal(
+    /\b(?:in|inch|inches|mm|cm)\b/i.test(starter.name),
+    false,
+    'Starter names must remain measurement-system neutral',
+  )
 }
 
 assert.deepEqual(
@@ -76,6 +92,30 @@ assert.deepEqual(
     stock: [],
   }).missing),
   ['unit_cost', 'warehouse_stock'],
+)
+assert.deepEqual(
+  Array.from(packagingMaterialReadiness({
+    status: 'draft',
+    innerDimensionsMm: {
+      length: 305,
+      width: 229,
+      height: null,
+    },
+    dimensionBasis: 'unspecified',
+    dimensionEvidenceType: 'customer_confirmed',
+    tareWeightGrams: null,
+    maxWeightGrams: null,
+    unitCostMinor: null,
+    stock: [],
+  }).missing),
+  [
+    'dimensions',
+    'dimension_basis',
+    'tare_weight',
+    'max_weight',
+    'unit_cost',
+    'warehouse_stock',
+  ],
 )
 assert.equal(packagingMaterialReadiness({
   status: 'active',
@@ -119,6 +159,54 @@ for (const fragment of [
   assert.ok(migration.includes(fragment), `Migration missing ${fragment}`)
 }
 
+const unitNeutralMigration = read(
+  'db/migrations/0126_packaging_material_unit_neutral_names.sql',
+)
+
+const packHierarchyMigration = read(
+  'db/migrations/0128_operations_pack_hierarchy.sql',
+)
+const packRuntimeAssociationMigration = read(
+  'db/migrations/0133_operations_pack_runtime_association.sql',
+)
+for (const fragment of [
+  'ALTER COLUMN inner_length_mm DROP NOT NULL',
+  "dimension_basis IN ('inner', 'outer', 'unspecified')",
+  "'customer_supplied', 'csv_import'",
+  'Drafts may retain incomplete customer facts',
+  'operations_product_pack_profiles',
+  'operations_product_pack_relationships',
+  'operations_approved_pack_recipes',
+]) {
+  assert.ok(
+    packHierarchyMigration.includes(fragment),
+    `Pack hierarchy migration missing ${fragment}`,
+  )
+}
+for (const fragment of [
+  'operations_packaging_materials_dimension_evidence_valid',
+  "dimension_evidence_type NOT IN ('customer_confirmed', 'measured')",
+  'dimension_evidence_reference IS NOT NULL',
+]) {
+  assert.ok(
+    packRuntimeAssociationMigration.includes(fragment),
+    `Pack runtime association migration missing ${fragment}`,
+  )
+}
+for (const fragment of [
+  "material.source = 'starter_assortment'",
+  'material.code = correction.code',
+  'material.name = correction.previous_name',
+  'row_version = material.row_version + 1',
+  "'Compact starter carton'",
+  "'Starter padded mailer'",
+]) {
+  assert.ok(
+    unitNeutralMigration.includes(fragment),
+    `Unit-neutral starter migration missing ${fragment}`,
+  )
+}
+
 const persistence = read('app_src/lib/persistence/packagingMaterials.ts')
 for (const fragment of [
   'readPackagingMaterialsWorkspaceFromPostgres',
@@ -137,6 +225,12 @@ for (const fragment of [
   'reorder_due_count',
   'CROSS JOIN operations_warehouses warehouse',
   "warehouse.status = 'active'",
+  'dimension_evidence_reference',
+  'dimension_confirmed_at',
+  'dimension_evidence_reference IS DISTINCT FROM $11',
+  'THEN $17',
+  'input.material.dimensionBasis',
+  'input.material.source',
 ]) {
   assert.ok(persistence.includes(fragment), `Persistence missing ${fragment}`)
 }
@@ -156,6 +250,9 @@ for (const fragment of [
   "action === 'create-starter-assortment'",
   'PACKAGING_MATERIAL_MANAGE_REQUIRED',
   'Idempotency-Key header is required',
+  'PACKAGING_MATERIAL_PHYSICAL_FACTS_REQUIRED',
+  'PACKAGING_MATERIAL_EVIDENCE_REQUIRED',
+  'dimensionEvidenceReference',
 ]) {
   assert.ok(route.includes(fragment), `API route missing ${fragment}`)
 }
@@ -170,6 +267,9 @@ for (const fragment of [
   'Products missing dimensions',
   'Warehouse stock gaps',
   'verify against the selected supplier',
+  'Record only the measurements the customer or supplier actually supplied',
+  'You may save an incomplete draft',
+  'Customer-supplied draft',
 ]) {
   assert.ok(panel.includes(fragment), `Packaging materials panel missing ${fragment}`)
 }
@@ -191,9 +291,53 @@ for (const fragment of [
 const predeploy = read('scripts/verify-predeploy.mjs')
 for (const fragment of [
   "'db/migrations/0123_operations_packaging_materials.sql'",
+  "'db/migrations/0126_packaging_material_unit_neutral_names.sql'",
+  "'db/migrations/0133_operations_pack_runtime_association.sql'",
   "'scripts/test-operations-packaging-materials.mjs'",
+  "'scripts/stage-ag-alchemy-pack-hierarchy.mjs'",
 ]) {
   assert.ok(predeploy.includes(fragment), `Predeploy gate missing ${fragment}`)
+}
+
+const agHierarchy = read('scripts/stage-ag-alchemy-pack-hierarchy.mjs')
+for (const fragment of [
+  "code: 'AG12V2'",
+  "code: 'AG-20LB-BOX'",
+  "code: 'AG-2OZ-CARTON-BOX'",
+  "code: 'AG-ENVELOPE-09X12'",
+  'heightMm, null',
+  "six_ounce_bag",
+  "six_ounce_case_12",
+  "two_ounce_bag",
+  "two_ounce_display_carton",
+  "relationship('customer-loose-carton-18', 'customer-each', 18)",
+  "relationship('customer-loose-carton-30', 'customer-each', 30)",
+  "relationship('customer-case-12', 'customer-bag-each', 12)",
+  "relationship('customer-case-36', 'customer-each', 36)",
+  'Exact Product Global ID assignments are required',
+  'title and SKU suggestions are never applied automatically',
+  'operations_commerce_variant_pack_mappings',
+  'operations_product_channel_states',
+  'source_revision',
+  'source_hash',
+  'AG_SYNTHETIC_STARTER_MATERIALS',
+  'Synthetic starter material stock contains operator-maintained facts',
+  'AG Alchemy packaging plan would exceed the eight-material limit',
+  'Apply requires the exact current plan fingerprint from a fresh plan',
+  'The explicit AG pack actor must be an active AG Alchemy owner or administrator',
+  'legacyRecipeOnlyProfileUpgradeAllowed',
+  "lifecycle_state = 'superseded'",
+  "lifecycle_state = 'retired'",
+  'legacyProfileVersionsSuperseded',
+  'legacyRecipeOnlyRepairIsVersioned: true',
+  'materialsRemainDraft: true',
+  'inventoryNotInferred: true',
+  'missingFactsNotInvented: true',
+  'providerWrites: 0',
+  'inventoryWrites: 0',
+  'shipmentWrites: 0',
+]) {
+  assert.ok(agHierarchy.includes(fragment), `AG hierarchy command missing ${fragment}`)
 }
 
 console.log('Operations packaging materials contracts passed')

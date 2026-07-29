@@ -154,6 +154,10 @@ export type CarrierSandboxRateEvidenceInput = {
   billingRelationship: 'sender' | 'recipient' | 'third_party'
   billingSelectionSnapshot: Record<string, unknown>
   provider: DirectCarrierProvider
+  purpose:
+    | 'sandbox_rate_test'
+    | 'cartonization_package_rate'
+    | 'cartonization_shipment_rate'
   credentialVersion: number
   adapterVersion: string
   requestHash: string
@@ -1097,9 +1101,9 @@ export async function writeCarrierSandboxRateEvidenceInPostgres(
          error_code, actor_email, requested_at, completed_at
        ) VALUES (
          $1::uuid, $2::uuid, $3::uuid, $4, 'sandbox',
-         'sandbox_rate_test', $5, $6, $7, $8, $9::jsonb,
-         $10::jsonb, $11::jsonb, $12, $13,
-         $14, $15, $16::timestamptz, $17::timestamptz
+         $5, $6, $7, $8, $9, $10::jsonb,
+         $11::jsonb, $12::jsonb, $13, $14,
+         $15, $16, $17::timestamptz, $18::timestamptz
        )
        RETURNING global_id`,
       [
@@ -1107,6 +1111,7 @@ export async function writeCarrierSandboxRateEvidenceInPostgres(
         input.integrationAccountId,
         input.carrierAccountId,
         input.provider,
+        input.purpose,
         input.adapterVersion,
         input.credentialVersion,
         input.requestHash,
@@ -1127,8 +1132,20 @@ export async function writeCarrierSandboxRateEvidenceInPostgres(
       actorEmail: input.actorEmail,
       organizationId: input.organizationId,
       eventType: input.status === 'succeeded'
-        ? 'carrier.sandbox_rate.succeeded'
-        : 'carrier.sandbox_rate.failed',
+        ? (
+            input.purpose === 'cartonization_shipment_rate'
+              ? 'carrier.cartonization_shipment_rate.succeeded'
+              : input.purpose === 'cartonization_package_rate'
+              ? 'carrier.cartonization_package_rate.succeeded'
+              : 'carrier.sandbox_rate.succeeded'
+          )
+        : (
+            input.purpose === 'cartonization_shipment_rate'
+              ? 'carrier.cartonization_shipment_rate.failed'
+              : input.purpose === 'cartonization_package_rate'
+              ? 'carrier.cartonization_package_rate.failed'
+              : 'carrier.sandbox_rate.failed'
+          ),
       globalId: input.integrationGlobalId,
       provider: input.provider,
       environment: 'sandbox',
@@ -1136,6 +1153,7 @@ export async function writeCarrierSandboxRateEvidenceInPostgres(
         evidenceGlobalId: globalId,
         carrierAccountGlobalId: input.carrierAccountGlobalId,
         billingRelationship: input.billingRelationship,
+        purpose: input.purpose,
         adapterVersion: input.adapterVersion,
         credentialVersion: input.credentialVersion,
         requestHash: input.requestHash,

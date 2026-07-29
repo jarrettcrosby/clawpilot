@@ -103,9 +103,55 @@ export type CrmProduct = {
   description: string
   active: boolean
   packaging: ProductPackagingProfile | null
+  salesChannels: ProductSalesChannelState[]
   syncStatus: CrmSyncStatus
   syncError: string | null
   updatedAt: string
+}
+
+export type ProductSalesChannelState = {
+  id: string
+  globalId: string
+  organizationId: string
+  integrationAccountId: string
+  integrationAccountGlobalId: string
+  integrationAccountName: string
+  integrationAccountStatus: 'active' | 'disabled' | 'error'
+  environment: 'mock' | 'sandbox' | 'production'
+  pipelineId: string
+  provider: 'shopify' | 'faire'
+  externalProductId: string
+  externalVariantId: string
+  externalInventoryItemId: string | null
+  providerProductTitle: string
+  providerVariantTitle: string | null
+  providerSku: string | null
+  providerBarcode: string | null
+  wholesaleCurrencyCode: string | null
+  wholesalePriceMinor: string | null
+  retailCurrencyCode: string | null
+  retailPriceMinor: string | null
+  compareAtCurrencyCode: string | null
+  compareAtPriceMinor: string | null
+  taxable: boolean | null
+  requiresShipping: boolean | null
+  weightGrams: number | null
+  productId: string | null
+  productMappingId: string | null
+  productMappingGlobalId: string | null
+  providerStatusRaw: string
+  normalizedStatus:
+    | 'active'
+    | 'draft'
+    | 'archived'
+    | 'unlisted'
+    | 'unavailable'
+    | 'unknown'
+  providerActive: boolean | null
+  providerUpdatedAt: string | null
+  observedAt: string
+  sourceRevision: string
+  rowVersion: number
 }
 
 export type ProductPackagingProfile = {
@@ -350,6 +396,7 @@ export type SuiteCrmOutboxRecord = {
   suiteCrmModule?: SuiteCrmInteractionModule
   previousSuiteCrmModule?: SuiteCrmInteractionModule
   attributes: Record<string, unknown>
+  currencyCode?: string
   relationships?: Array<{
     linkFieldName: 'accounts' | 'contact' | 'contacts' | 'leads' | 'opportunity'
     relatedModuleName: 'Accounts' | 'Contacts' | 'Leads' | 'Opportunities'

@@ -32,6 +32,17 @@ import HelpOutlineRounded from '@mui/icons-material/HelpOutlineRounded'
 import Inventory2Rounded from '@mui/icons-material/Inventory2Rounded'
 import MoveDownRounded from '@mui/icons-material/MoveDownRounded'
 import WarehouseRounded from '@mui/icons-material/WarehouseRounded'
+import { useMeasurementSystem } from '@/components/measurements/MeasurementSystemProvider'
+import {
+  cubicMetersToDisplayVolume,
+  displayVolumeToCubicMeters,
+  displayWeightToKilograms,
+  formatCubicMeters,
+  formatKilograms,
+  kilogramsToDisplayWeight,
+  measurementUnits,
+  type MeasurementSystem,
+} from '@/lib/measurements'
 import type { OperationsWorkspace } from '@/lib/operations/types'
 
 type Props = {
@@ -49,7 +60,6 @@ type StorageFunction = Location['storageFunction']
 type ProductRule = Location['productRules'][number]
 type ReplenishmentMode = ProductRule['replenishmentMode']
 type ReplenishmentRecommendation = OperationsWorkspace['replenishmentRecommendations'][number]
-type MeasurementSystem = 'imperial' | 'metric'
 
 type WarehouseForm = {
   code: string
@@ -191,9 +201,6 @@ const replenishmentModes: Array<{ value: ReplenishmentMode; label: string; descr
 ]
 
 const defaultZones = ['INBOUND', 'STORAGE', 'FULFILLMENT', 'OUTBOUND', 'RETURNS', 'QUARANTINE']
-const CUBIC_FEET_PER_CUBIC_METER = 35.3146667
-const POUNDS_PER_KILOGRAM = 2.20462262
-
 const initialWarehouse: WarehouseForm = {
   code: '',
   name: '',
@@ -259,7 +266,10 @@ function warehouseForm(item: Warehouse): WarehouseForm {
   }
 }
 
-function locationForm(item: Location): LocationForm {
+function locationForm(
+  item: Location,
+  measurementSystem: MeasurementSystem,
+): LocationForm {
   return {
     code: item.code,
     zone: item.zone,
@@ -269,13 +279,19 @@ function locationForm(item: Location): LocationForm {
     parentLocationGlobalId: item.parentLocationGlobalId || '',
     pickSequence: item.pickSequence,
     active: item.active,
-    measurementSystem: 'imperial',
+    measurementSystem,
     maxVolume: item.maxVolumeCubicMeters === null
       ? ''
-      : (item.maxVolumeCubicMeters * CUBIC_FEET_PER_CUBIC_METER).toFixed(2),
+      : String(Number(cubicMetersToDisplayVolume(
+          item.maxVolumeCubicMeters,
+          measurementSystem,
+        ).toFixed(3))),
     maxWeight: item.maxWeightKg === null
       ? ''
-      : (item.maxWeightKg * POUNDS_PER_KILOGRAM).toFixed(2),
+      : String(Number(kilogramsToDisplayWeight(
+          item.maxWeightKg,
+          measurementSystem,
+        ).toFixed(3))),
     allowMixedProducts: item.allowMixedProducts,
     notes: item.notes || '',
     productRules: item.productRules
@@ -299,14 +315,9 @@ function capacityPercent(used: number, maximum: number | null) {
 }
 
 function displayCapacity(value: number, system: MeasurementSystem, kind: 'volume' | 'weight') {
-  if (kind === 'volume') {
-    return system === 'imperial'
-      ? `${(value * CUBIC_FEET_PER_CUBIC_METER).toLocaleString(undefined, { maximumFractionDigits: 1 })} ft³`
-      : `${value.toLocaleString(undefined, { maximumFractionDigits: 2 })} m³`
-  }
-  return system === 'imperial'
-    ? `${(value * POUNDS_PER_KILOGRAM).toLocaleString(undefined, { maximumFractionDigits: 1 })} lb`
-    : `${value.toLocaleString(undefined, { maximumFractionDigits: 1 })} kg`
+  return kind === 'volume'
+    ? formatCubicMeters(value, system, { maximumFractionDigits: 2 })
+    : formatKilograms(value, system, { maximumFractionDigits: 2 })
 }
 
 function nextPickRouteOrder(item: Warehouse) {
@@ -372,7 +383,13 @@ async function command(body: Record<string, unknown>) {
   return payload
 }
 
-function LocationCapacity({ item }: { item: Location }) {
+function LocationCapacity({
+  item,
+  measurementSystem,
+}: {
+  item: Location
+  measurementSystem: MeasurementSystem
+}) {
   const volumePercent = capacityPercent(item.usedVolumeCubicMeters, item.maxVolumeCubicMeters)
   const weightPercent = capacityPercent(item.usedWeightKg, item.maxWeightKg)
   if (!item.maxVolumeCubicMeters && !item.maxWeightKg) {
@@ -385,7 +402,7 @@ function LocationCapacity({ item }: { item: Location }) {
           <Stack direction="row" justifyContent="space-between">
             <Typography variant="caption">Cubic storage</Typography>
             <Typography variant="caption" color="text.secondary">
-              {displayCapacity(item.usedVolumeCubicMeters, 'imperial', 'volume')} / {displayCapacity(item.maxVolumeCubicMeters, 'imperial', 'volume')}
+              {displayCapacity(item.usedVolumeCubicMeters, measurementSystem, 'volume')} / {displayCapacity(item.maxVolumeCubicMeters, measurementSystem, 'volume')}
             </Typography>
           </Stack>
           <LinearProgress variant="determinate" value={volumePercent} color={volumePercent >= 90 ? 'warning' : 'primary'} />
@@ -396,7 +413,7 @@ function LocationCapacity({ item }: { item: Location }) {
           <Stack direction="row" justifyContent="space-between">
             <Typography variant="caption">Weight</Typography>
             <Typography variant="caption" color="text.secondary">
-              {displayCapacity(item.usedWeightKg, 'imperial', 'weight')} / {displayCapacity(item.maxWeightKg, 'imperial', 'weight')}
+              {displayCapacity(item.usedWeightKg, measurementSystem, 'weight')} / {displayCapacity(item.maxWeightKg, measurementSystem, 'weight')}
             </Typography>
           </Stack>
           <LinearProgress variant="determinate" value={weightPercent} color={weightPercent >= 90 ? 'warning' : 'secondary'} />
@@ -407,6 +424,7 @@ function LocationCapacity({ item }: { item: Location }) {
 }
 
 export default function WarehouseSetupPanel({ workspace, onRefresh, onNavigate }: Props) {
+  const { measurementSystem } = useMeasurementSystem()
   const [warehouseEditor, setWarehouseEditor] = useState<Warehouse | 'new' | null>(null)
   const [locationEditor, setLocationEditor] = useState<{ warehouse: Warehouse; item: Location | null } | null>(null)
   const [setupGuideOpen, setSetupGuideOpen] = useState(false)
@@ -450,8 +468,9 @@ export default function WarehouseSetupPanel({ workspace, onRefresh, onNavigate }
 
   function openLocation(targetWarehouse: Warehouse, item: Location | null = null) {
     setLocationEditor({ warehouse: targetWarehouse, item })
-    setLocation(item ? locationForm(item) : {
+    setLocation(item ? locationForm(item, measurementSystem) : {
       ...initialLocation,
+      measurementSystem,
       pickSequence: nextPickRouteOrder(targetWarehouse),
     })
     setRuleProductGlobalId('')
@@ -533,10 +552,10 @@ export default function WarehouseSetupPanel({ workspace, onRefresh, onNavigate }
         active: location.active,
         maxVolumeCubicMeters: maxVolume === null
           ? null
-          : location.measurementSystem === 'imperial' ? maxVolume / CUBIC_FEET_PER_CUBIC_METER : maxVolume,
+          : displayVolumeToCubicMeters(maxVolume, location.measurementSystem),
         maxWeightKg: maxWeight === null
           ? null
-          : location.measurementSystem === 'imperial' ? maxWeight / POUNDS_PER_KILOGRAM : maxWeight,
+          : displayWeightToKilograms(maxWeight, location.measurementSystem),
         allowMixedProducts: location.allowMixedProducts,
         notes: location.notes || null,
         productRules: location.productRules.map((rule) => ({
@@ -871,7 +890,7 @@ export default function WarehouseSetupPanel({ workspace, onRefresh, onNavigate }
                       </Typography>
                     </Box>
                   </Stack>
-                  <LocationCapacity item={entry} />
+                  <LocationCapacity item={entry} measurementSystem={measurementSystem} />
                   <Stack direction="row" justifyContent="flex-end">
                     <Tooltip title="Edit topology, capacity, and product rules">
                       <span>
@@ -1175,10 +1194,16 @@ export default function WarehouseSetupPanel({ workspace, onRefresh, onNavigate }
                       ...location,
                       measurementSystem: value,
                       maxVolume: location.maxVolume
-                        ? (value === 'imperial' ? volume * CUBIC_FEET_PER_CUBIC_METER : volume / CUBIC_FEET_PER_CUBIC_METER).toFixed(2)
+                        ? String(Number(cubicMetersToDisplayVolume(
+                            displayVolumeToCubicMeters(volume, location.measurementSystem),
+                            value,
+                          ).toFixed(3)))
                         : '',
                       maxWeight: location.maxWeight
-                        ? (value === 'imperial' ? weight * POUNDS_PER_KILOGRAM : weight / POUNDS_PER_KILOGRAM).toFixed(2)
+                        ? String(Number(kilogramsToDisplayWeight(
+                            displayWeightToKilograms(weight, location.measurementSystem),
+                            value,
+                          ).toFixed(3)))
                         : '',
                     })
                   }}
@@ -1190,7 +1215,7 @@ export default function WarehouseSetupPanel({ workspace, onRefresh, onNavigate }
               <Stack direction={{ xs: 'column', sm: 'row' }} gap={1.5}>
                 <TextField
                   type="number"
-                  label={`Maximum cubic storage (${location.measurementSystem === 'imperial' ? 'ft³' : 'm³'})`}
+                  label={`Maximum cubic storage (${measurementUnits(location.measurementSystem).volume})`}
                   value={location.maxVolume}
                   onChange={(e) => setLocation({ ...location, maxVolume: e.target.value })}
                   inputProps={{ min: 0, step: 'any' }}
@@ -1198,7 +1223,7 @@ export default function WarehouseSetupPanel({ workspace, onRefresh, onNavigate }
                 />
                 <TextField
                   type="number"
-                  label={`Maximum weight (${location.measurementSystem === 'imperial' ? 'lb' : 'kg'})`}
+                  label={`Maximum weight (${measurementUnits(location.measurementSystem).weight})`}
                   value={location.maxWeight}
                   onChange={(e) => setLocation({ ...location, maxWeight: e.target.value })}
                   inputProps={{ min: 0, step: 'any' }}

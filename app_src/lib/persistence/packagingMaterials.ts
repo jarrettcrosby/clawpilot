@@ -43,11 +43,16 @@ type MaterialRow = QueryResultRow & {
   code: string
   name: string
   material_type: PackagingMaterial['materialType']
-  inner_length_mm: number
-  inner_width_mm: number
-  inner_height_mm: number
-  tare_weight_grams: number
-  max_weight_grams: number
+  inner_length_mm: number | null
+  inner_width_mm: number | null
+  inner_height_mm: number | null
+  dimension_basis: PackagingMaterial['dimensionBasis']
+  dimension_evidence_type: PackagingMaterial['dimensionEvidenceType']
+  dimension_evidence_reference: string | null
+  dimension_confirmed_at: Date | null
+  dimension_confirmed_by: string | null
+  tare_weight_grams: number | null
+  max_weight_grams: number | null
   unit_cost_minor: string | null
   currency: string | null
   status: PackagingMaterial['status']
@@ -90,8 +95,16 @@ function integer(value: string | number): number {
   return Number.isSafeInteger(parsed) ? parsed : 0
 }
 
+function optionalInteger(value: string | number | null): number | null {
+  return value === null ? null : integer(value)
+}
+
 function iso(value: Date): string {
   return new Date(value).toISOString()
+}
+
+function optionalIso(value: Date | null): string | null {
+  return value === null ? null : iso(value)
 }
 
 function stockFromRow(row: MaterialRow): PackagingMaterialStock | null {
@@ -154,12 +167,17 @@ function materialsFromRows(rows: MaterialRow[]): PackagingMaterial[] {
         name: row.name,
         materialType: row.material_type,
         innerDimensionsMm: {
-          length: integer(row.inner_length_mm),
-          width: integer(row.inner_width_mm),
-          height: integer(row.inner_height_mm),
+          length: optionalInteger(row.inner_length_mm),
+          width: optionalInteger(row.inner_width_mm),
+          height: optionalInteger(row.inner_height_mm),
         },
-        tareWeightGrams: integer(row.tare_weight_grams),
-        maxWeightGrams: integer(row.max_weight_grams),
+        dimensionBasis: row.dimension_basis,
+        dimensionEvidenceType: row.dimension_evidence_type,
+        dimensionEvidenceReference: row.dimension_evidence_reference,
+        dimensionConfirmedAt: optionalIso(row.dimension_confirmed_at),
+        dimensionConfirmedBy: row.dimension_confirmed_by,
+        tareWeightGrams: optionalInteger(row.tare_weight_grams),
+        maxWeightGrams: optionalInteger(row.max_weight_grams),
         unitCostMinor: row.unit_cost_minor === null
           ? null
           : integer(row.unit_cost_minor),
@@ -186,6 +204,11 @@ function materialsFromRows(rows: MaterialRow[]): PackagingMaterial[] {
     )),
     readiness: packagingMaterialReadiness({
       status: material.status,
+      innerDimensionsMm: material.innerDimensionsMm,
+      dimensionBasis: material.dimensionBasis,
+      dimensionEvidenceType: material.dimensionEvidenceType,
+      tareWeightGrams: material.tareWeightGrams,
+      maxWeightGrams: material.maxWeightGrams,
       unitCostMinor: material.unitCostMinor,
       stock: material.stock,
     }),
@@ -199,6 +222,9 @@ async function materialRows(
   const sql = `SELECT material.id::text, material.global_id, material.code,
       material.name, material.material_type, material.inner_length_mm,
       material.inner_width_mm, material.inner_height_mm,
+      material.dimension_basis, material.dimension_evidence_type,
+      material.dimension_evidence_reference, material.dimension_confirmed_at,
+      material.dimension_confirmed_by,
       material.tare_weight_grams, material.max_weight_grams,
       material.unit_cost_minor::text, material.currency, material.status,
       material.source, material.row_version::text, material.updated_at,
@@ -289,6 +315,14 @@ async function readiness(
            AS missing_cost,
          count(*) FILTER (
            WHERE material.status = 'active'
+             AND material.dimension_basis = 'inner'
+             AND material.dimension_evidence_type <> 'unknown'
+             AND material.inner_length_mm IS NOT NULL
+             AND material.inner_width_mm IS NOT NULL
+             AND material.inner_height_mm IS NOT NULL
+             AND material.tare_weight_grams IS NOT NULL
+             AND material.max_weight_grams IS NOT NULL
+             AND material.max_weight_grams > material.tare_weight_grams
              AND material.unit_cost_minor IS NOT NULL
              AND EXISTS (
                SELECT 1
@@ -492,13 +526,45 @@ export async function savePackagingMaterialInPostgres(input: {
                inner_length_mm = $6,
                inner_width_mm = $7,
                inner_height_mm = $8,
-               tare_weight_grams = $9,
-               max_weight_grams = $10,
-               unit_cost_minor = $11,
-               currency = $12,
-               status = $13,
+               dimension_basis = $9,
+               dimension_evidence_type = $10,
+               dimension_evidence_reference = $11,
+               dimension_confirmed_at = CASE
+                 WHEN $10 IN ('customer_confirmed', 'measured')
+                   THEN CASE
+                     WHEN inner_length_mm IS DISTINCT FROM $6
+                       OR inner_width_mm IS DISTINCT FROM $7
+                       OR inner_height_mm IS DISTINCT FROM $8
+                       OR dimension_basis IS DISTINCT FROM $9
+                       OR dimension_evidence_type IS DISTINCT FROM $10
+                       OR dimension_evidence_reference IS DISTINCT FROM $11
+                       THEN now()
+                     ELSE COALESCE(dimension_confirmed_at, now())
+                   END
+                 ELSE NULL
+               END,
+               dimension_confirmed_by = CASE
+                 WHEN $10 IN ('customer_confirmed', 'measured')
+                   THEN CASE
+                     WHEN inner_length_mm IS DISTINCT FROM $6
+                       OR inner_width_mm IS DISTINCT FROM $7
+                       OR inner_height_mm IS DISTINCT FROM $8
+                       OR dimension_basis IS DISTINCT FROM $9
+                       OR dimension_evidence_type IS DISTINCT FROM $10
+                       OR dimension_evidence_reference IS DISTINCT FROM $11
+                       THEN $17
+                     ELSE COALESCE(dimension_confirmed_by, $17)
+                   END
+                 ELSE NULL
+               END,
+               tare_weight_grams = $12,
+               max_weight_grams = $13,
+               unit_cost_minor = $14,
+               currency = $15,
+               status = $16,
+               source = $18,
                row_version = row_version + 1,
-               updated_by = $14,
+               updated_by = $17,
                updated_at = now()
            WHERE organization_id = $1::uuid AND id = $2::uuid
            RETURNING global_id, row_version::text, status`,
@@ -511,12 +577,16 @@ export async function savePackagingMaterialInPostgres(input: {
             input.material.innerLengthMm,
             input.material.innerWidthMm,
             input.material.innerHeightMm,
+            input.material.dimensionBasis,
+            input.material.dimensionEvidenceType,
+            input.material.dimensionEvidenceReference,
             input.material.tareWeightGrams,
             input.material.maxWeightGrams,
             input.material.unitCostMinor,
             input.material.currency,
             input.material.status,
             input.actorEmail,
+            input.material.source,
           ],
         )
         saved = updated.rows[0]
@@ -525,11 +595,18 @@ export async function savePackagingMaterialInPostgres(input: {
           `INSERT INTO operations_packaging_materials (
              organization_id, code, name, material_type,
              inner_length_mm, inner_width_mm, inner_height_mm,
+             dimension_basis, dimension_evidence_type,
+             dimension_evidence_reference, dimension_confirmed_at,
+             dimension_confirmed_by,
              tare_weight_grams, max_weight_grams, unit_cost_minor, currency,
              status, source, created_by, updated_by
            ) VALUES (
-             $1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-             $12, 'manual', $13, $13
+             $1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+             CASE WHEN $9 IN ('customer_confirmed', 'measured')
+               THEN now() ELSE NULL END,
+             CASE WHEN $9 IN ('customer_confirmed', 'measured')
+               THEN $16 ELSE NULL END,
+             $11, $12, $13, $14, $15, $17, $16, $16
            )
            RETURNING id::text, global_id, row_version::text, status`,
           [
@@ -540,12 +617,16 @@ export async function savePackagingMaterialInPostgres(input: {
             input.material.innerLengthMm,
             input.material.innerWidthMm,
             input.material.innerHeightMm,
+            input.material.dimensionBasis,
+            input.material.dimensionEvidenceType,
+            input.material.dimensionEvidenceReference,
             input.material.tareWeightGrams,
             input.material.maxWeightGrams,
             input.material.unitCostMinor,
             input.material.currency,
             input.material.status,
             input.actorEmail,
+            input.material.source,
           ],
         )
         const insertedRow = inserted.rows[0]
@@ -579,11 +660,15 @@ export async function savePackagingMaterialInPostgres(input: {
             width: input.material.innerWidthMm,
             height: input.material.innerHeightMm,
           },
+          dimensionBasis: input.material.dimensionBasis,
+          dimensionEvidenceType: input.material.dimensionEvidenceType,
+          dimensionEvidenceReference: input.material.dimensionEvidenceReference,
           tareWeightGrams: input.material.tareWeightGrams,
           maxWeightGrams: input.material.maxWeightGrams,
           unitCostMinor: input.material.unitCostMinor,
           currency: input.material.currency,
           status: input.material.status,
+          source: input.material.source,
           rowVersion: integer(saved.row_version),
         },
       }, client)
@@ -830,11 +915,13 @@ export async function createStarterPackagingAssortmentInPostgres(input: {
         `INSERT INTO operations_packaging_materials (
            organization_id, code, name, material_type,
            inner_length_mm, inner_width_mm, inner_height_mm,
+           dimension_basis, dimension_evidence_type,
+           dimension_evidence_reference,
            tare_weight_grams, max_weight_grams, unit_cost_minor, currency,
            status, source, created_by, updated_by
          ) VALUES (
-           $1::uuid, $2, $3, $4, $5, $6, $7, $8, $9,
-           NULL, NULL, 'draft', 'starter_assortment', $10, $10
+           $1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+           $11, $12, NULL, NULL, 'draft', 'starter_assortment', $13, $13
          )
          ON CONFLICT (organization_id, code) DO NOTHING`,
         [
@@ -845,6 +932,9 @@ export async function createStarterPackagingAssortmentInPostgres(input: {
           starter.innerLengthMm,
           starter.innerWidthMm,
           starter.innerHeightMm,
+          starter.dimensionBasis,
+          starter.dimensionEvidenceType,
+          starter.dimensionEvidenceReference,
           starter.tareWeightGrams,
           starter.maxWeightGrams,
           input.actorEmail,
@@ -859,11 +949,14 @@ export async function createStarterPackagingAssortmentInPostgres(input: {
       code: string
       name: string
       material_type: PackagingMaterial['materialType']
-      inner_length_mm: number
-      inner_width_mm: number
-      inner_height_mm: number
-      tare_weight_grams: number
-      max_weight_grams: number
+      inner_length_mm: number | null
+      inner_width_mm: number | null
+      inner_height_mm: number | null
+      dimension_basis: PackagingMaterial['dimensionBasis']
+      dimension_evidence_type: PackagingMaterial['dimensionEvidenceType']
+      dimension_evidence_reference: string | null
+      tare_weight_grams: number | null
+      max_weight_grams: number | null
       unit_cost_minor: string | null
       currency: string | null
       status: PackagingMaterial['status']
@@ -871,6 +964,8 @@ export async function createStarterPackagingAssortmentInPostgres(input: {
     }>(
       `SELECT id::text, global_id, code, name, material_type,
               inner_length_mm, inner_width_mm, inner_height_mm,
+              dimension_basis, dimension_evidence_type,
+              dimension_evidence_reference,
               tare_weight_grams, max_weight_grams, unit_cost_minor, currency,
               status, source
        FROM operations_packaging_materials
@@ -908,6 +1003,10 @@ export async function createStarterPackagingAssortmentInPostgres(input: {
         || Number(starterRow.inner_length_mm) !== expected.innerLengthMm
         || Number(starterRow.inner_width_mm) !== expected.innerWidthMm
         || Number(starterRow.inner_height_mm) !== expected.innerHeightMm
+        || starterRow.dimension_basis !== expected.dimensionBasis
+        || starterRow.dimension_evidence_type !== expected.dimensionEvidenceType
+        || starterRow.dimension_evidence_reference
+          !== expected.dimensionEvidenceReference
         || Number(starterRow.tare_weight_grams) !== expected.tareWeightGrams
         || Number(starterRow.max_weight_grams) !== expected.maxWeightGrams
         || starterRow.unit_cost_minor !== null

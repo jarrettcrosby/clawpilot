@@ -16,6 +16,7 @@ const CLAWPILOT_GLOBAL_ID_FIELD = 'global_id_c';
 const CLAWPILOT_GLOBAL_ID_LABEL = 'LBL_GLOBAL_ID';
 const CLAWPILOT_NOTE_OCCURRED_AT_FIELD = 'occurred_at_c';
 const CLAWPILOT_NOTE_OCCURRED_AT_LABEL = 'LBL_OCCURRED_AT';
+const CLAWPILOT_PRODUCT_MODULE = 'AOS_Products';
 
 /** @param mixed $value */
 function layout_contains_field($value, string $fieldName): bool
@@ -288,6 +289,52 @@ function ensure_note_occurred_at_field(): void
     expose_note_occurred_at_in_list_view();
 }
 
+function product_purchases_subpanel_is_hidden(): bool
+{
+    $layout_defs = [];
+    $basePath = 'modules/AOS_Products/metadata/subpaneldefs.php';
+    $compiledPath = 'custom/modules/AOS_Products/Ext/Layoutdefs/layoutdefs.ext.php';
+    if (!is_file($basePath)) {
+        throw new RuntimeException('SuiteCRM AOS Products subpanel metadata is unavailable');
+    }
+    include $basePath;
+    if (is_file($compiledPath)) {
+        include $compiledPath;
+    }
+    return empty($layout_defs['AOS_Products']['subpanel_setup']['aos_products_purchases']);
+}
+
+function hide_unowned_product_purchases_subpanel(): void
+{
+    $directory = 'custom/Extension/modules/AOS_Products/Ext/Layoutdefs';
+    $path = $directory . '/zz_clawpilot_hide_unowned_purchases.php';
+    $definition = <<<'PHP'
+<?php
+// ClawPilot does not project AOS Quotes or AOS Products Quotes. The stock
+// "Purchases" query therefore is not a relationship to canonical Operations
+// orders and must not imply that it is.
+unset($layout_defs['AOS_Products']['subpanel_setup']['aos_products_purchases']);
+PHP;
+    $definition .= "\n";
+
+    mkdir_recursive($directory, true);
+    $current = is_file($path) ? file_get_contents($path) : false;
+    $changed = $current === false || !hash_equals($definition, $current);
+    if ($changed && file_put_contents($path, $definition, LOCK_EX) === false) {
+        throw new RuntimeException('Could not write the ClawPilot AOS Products layout extension');
+    }
+
+    if ($changed || !product_purchases_subpanel_is_hidden()) {
+        require_once 'ModuleInstall/ModuleInstaller.php';
+        $installer = new ModuleInstaller();
+        $installer->silent = true;
+        $installer->rebuild_layoutdefs();
+    }
+    if (!product_purchases_subpanel_is_hidden()) {
+        throw new RuntimeException('Unsupported AOS Products Purchases subpanel is still active');
+    }
+}
+
 /** @param list<string> $modules */
 function rebuild_and_verify_global_search(array $modules): void
 {
@@ -305,10 +352,41 @@ function rebuild_and_verify_global_search(array $modules): void
     }
 }
 
+/** @param list<string> $modules */
+function enable_and_verify_global_search_modules(array $modules): void
+{
+    $display = \SuiteCRM\Search\SearchModules::getUnifiedSearchModulesDisplay();
+    $changed = false;
+    foreach ($modules as $module) {
+        if (($display[$module]['visible'] ?? null) !== true) {
+            $display[$module]['visible'] = true;
+            $changed = true;
+        }
+    }
+
+    if (
+        $changed
+        && !write_array_to_file(
+            'unified_search_modules_display',
+            $display,
+            'custom/modules/unified_search_modules_display.php'
+        )
+    ) {
+        throw new RuntimeException('Could not enable required ClawPilot modules in SuiteCRM global search');
+    }
+
+    $enabled = array_fill_keys(\SuiteCRM\Search\SearchModules::getEnabledModules(), true);
+    foreach ($modules as $module) {
+        if (empty($enabled[$module])) {
+            throw new RuntimeException("{$module} is disabled in SuiteCRM global search");
+        }
+    }
+}
+
 $modules = [
     'Accounts',
     'Contacts',
-    'AOS_Products',
+    CLAWPILOT_PRODUCT_MODULE,
     'Leads',
     'Opportunities',
     'Meetings',
@@ -326,7 +404,9 @@ foreach ($modules as $module) {
 ensure_global_id_field('Users', false);
 
 ensure_note_occurred_at_field();
+hide_unowned_product_purchases_subpanel();
 
 rebuild_and_verify_global_search($modules);
+enable_and_verify_global_search_modules([CLAWPILOT_PRODUCT_MODULE]);
 
-fwrite(STDOUT, "SuiteCRM Global ID fields, layouts, and search metadata are ready\n");
+fwrite(STDOUT, "SuiteCRM Global ID fields, owned layouts, and search metadata are ready\n");

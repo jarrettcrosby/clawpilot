@@ -5,9 +5,31 @@ export const PACKAGING_MATERIAL_TYPES = [
 ] as const
 
 export const PACKAGING_MATERIAL_STATUSES = ['draft', 'active'] as const
+export const PACKAGING_DIMENSION_BASES = [
+  'inner',
+  'outer',
+  'unspecified',
+] as const
+export const PACKAGING_DIMENSION_EVIDENCE_TYPES = [
+  'unknown',
+  'customer_confirmed',
+  'measured',
+  'provider',
+  'legacy',
+] as const
+export const PACKAGING_MATERIAL_SOURCES = [
+  'manual',
+  'starter_assortment',
+  'customer_supplied',
+  'csv_import',
+] as const
 
 export type PackagingMaterialType = typeof PACKAGING_MATERIAL_TYPES[number]
 export type PackagingMaterialStatus = typeof PACKAGING_MATERIAL_STATUSES[number]
+export type PackagingDimensionBasis = typeof PACKAGING_DIMENSION_BASES[number]
+export type PackagingDimensionEvidenceType =
+  typeof PACKAGING_DIMENSION_EVIDENCE_TYPES[number]
+export type PackagingMaterialSource = typeof PACKAGING_MATERIAL_SOURCES[number]
 
 export type PackagingMaterialStock = {
   id: string
@@ -32,22 +54,36 @@ export type PackagingMaterial = {
   name: string
   materialType: PackagingMaterialType
   innerDimensionsMm: {
-    length: number
-    width: number
-    height: number
+    length: number | null
+    width: number | null
+    height: number | null
   }
-  tareWeightGrams: number
-  maxWeightGrams: number
+  dimensionBasis: PackagingDimensionBasis
+  dimensionEvidenceType: PackagingDimensionEvidenceType
+  dimensionEvidenceReference: string | null
+  dimensionConfirmedAt: string | null
+  dimensionConfirmedBy: string | null
+  tareWeightGrams: number | null
+  maxWeightGrams: number | null
   unitCostMinor: number | null
   currency: string | null
   status: PackagingMaterialStatus
-  source: 'manual' | 'starter_assortment'
+  source: PackagingMaterialSource
   rowVersion: number
   updatedAt: string
   stock: PackagingMaterialStock[]
   readiness: {
     eligibleForCartonization: boolean
-    missing: Array<'unit_cost' | 'warehouse_stock' | 'available_stock'>
+    missing: Array<
+      | 'dimensions'
+      | 'dimension_basis'
+      | 'dimension_evidence'
+      | 'tare_weight'
+      | 'max_weight'
+      | 'unit_cost'
+      | 'warehouse_stock'
+      | 'available_stock'
+    >
   }
 }
 
@@ -82,14 +118,18 @@ export type PackagingMaterialInput = {
   code: string
   name: string
   materialType: PackagingMaterialType
-  innerLengthMm: number
-  innerWidthMm: number
-  innerHeightMm: number
-  tareWeightGrams: number
-  maxWeightGrams: number
+  innerLengthMm: number | null
+  innerWidthMm: number | null
+  innerHeightMm: number | null
+  dimensionBasis: PackagingDimensionBasis
+  dimensionEvidenceType: PackagingDimensionEvidenceType
+  dimensionEvidenceReference: string | null
+  tareWeightGrams: number | null
+  maxWeightGrams: number | null
   unitCostMinor: number | null
   currency: string | null
   status: PackagingMaterialStatus
+  source: PackagingMaterialSource
 }
 
 export type PackagingMaterialStockInput = {
@@ -115,11 +155,14 @@ export type StarterPackagingMaterial = Omit<
 export const STARTER_PACKAGING_MATERIALS: readonly StarterPackagingMaterial[] = [
   {
     code: 'STARTER-BOX-06X06X04',
-    name: '6 × 6 × 4 in carton',
+    name: 'Compact starter carton',
     materialType: 'carton',
     innerLengthMm: 152,
     innerWidthMm: 152,
     innerHeightMm: 102,
+    dimensionBasis: 'inner',
+    dimensionEvidenceType: 'legacy',
+    dimensionEvidenceReference: 'ClawPilot starter assortment nominal specification',
     tareWeightGrams: 95,
     maxWeightGrams: 4536,
     unitCostMinor: null,
@@ -129,11 +172,14 @@ export const STARTER_PACKAGING_MATERIALS: readonly StarterPackagingMaterial[] = 
   },
   {
     code: 'STARTER-BOX-08X06X04',
-    name: '8 × 6 × 4 in carton',
+    name: 'Small starter carton',
     materialType: 'carton',
     innerLengthMm: 203,
     innerWidthMm: 152,
     innerHeightMm: 102,
+    dimensionBasis: 'inner',
+    dimensionEvidenceType: 'legacy',
+    dimensionEvidenceReference: 'ClawPilot starter assortment nominal specification',
     tareWeightGrams: 120,
     maxWeightGrams: 6804,
     unitCostMinor: null,
@@ -143,11 +189,14 @@ export const STARTER_PACKAGING_MATERIALS: readonly StarterPackagingMaterial[] = 
   },
   {
     code: 'STARTER-BOX-10X08X06',
-    name: '10 × 8 × 6 in carton',
+    name: 'Medium starter carton',
     materialType: 'carton',
     innerLengthMm: 254,
     innerWidthMm: 203,
     innerHeightMm: 152,
+    dimensionBasis: 'inner',
+    dimensionEvidenceType: 'legacy',
+    dimensionEvidenceReference: 'ClawPilot starter assortment nominal specification',
     tareWeightGrams: 190,
     maxWeightGrams: 11340,
     unitCostMinor: null,
@@ -157,11 +206,14 @@ export const STARTER_PACKAGING_MATERIALS: readonly StarterPackagingMaterial[] = 
   },
   {
     code: 'STARTER-BOX-12X10X08',
-    name: '12 × 10 × 8 in carton',
+    name: 'Large starter carton',
     materialType: 'carton',
     innerLengthMm: 305,
     innerWidthMm: 254,
     innerHeightMm: 203,
+    dimensionBasis: 'inner',
+    dimensionEvidenceType: 'legacy',
+    dimensionEvidenceReference: 'ClawPilot starter assortment nominal specification',
     tareWeightGrams: 285,
     maxWeightGrams: 15876,
     unitCostMinor: null,
@@ -171,11 +223,14 @@ export const STARTER_PACKAGING_MATERIALS: readonly StarterPackagingMaterial[] = 
   },
   {
     code: 'STARTER-POLY-10X13',
-    name: '10 × 13 in poly mailer',
+    name: 'Starter poly mailer',
     materialType: 'poly_mailer',
     innerLengthMm: 330,
     innerWidthMm: 254,
     innerHeightMm: 51,
+    dimensionBasis: 'inner',
+    dimensionEvidenceType: 'legacy',
+    dimensionEvidenceReference: 'ClawPilot starter assortment nominal specification',
     tareWeightGrams: 18,
     maxWeightGrams: 2268,
     unitCostMinor: null,
@@ -185,11 +240,14 @@ export const STARTER_PACKAGING_MATERIALS: readonly StarterPackagingMaterial[] = 
   },
   {
     code: 'STARTER-PADDED-08X12',
-    name: '8.5 × 12 in padded mailer',
+    name: 'Starter padded mailer',
     materialType: 'padded_mailer',
     innerLengthMm: 305,
     innerWidthMm: 216,
     innerHeightMm: 38,
+    dimensionBasis: 'inner',
+    dimensionEvidenceType: 'legacy',
+    dimensionEvidenceReference: 'ClawPilot starter assortment nominal specification',
     tareWeightGrams: 32,
     maxWeightGrams: 1814,
     unitCostMinor: null,
@@ -201,6 +259,15 @@ export const STARTER_PACKAGING_MATERIALS: readonly StarterPackagingMaterial[] = 
 
 export function packagingMaterialReadiness(input: {
   status: PackagingMaterialStatus
+  innerDimensionsMm?: {
+    length: number | null
+    width: number | null
+    height: number | null
+  }
+  dimensionBasis?: PackagingDimensionBasis
+  dimensionEvidenceType?: PackagingDimensionEvidenceType
+  tareWeightGrams?: number | null
+  maxWeightGrams?: number | null
   unitCostMinor: number | null
   stock: Array<{
     warehouseStatus: 'active' | 'inactive'
@@ -209,6 +276,30 @@ export function packagingMaterialReadiness(input: {
   }>
 }): PackagingMaterial['readiness'] {
   const missing: PackagingMaterial['readiness']['missing'] = []
+  if (
+    input.innerDimensionsMm
+    && (
+      input.innerDimensionsMm.length === null
+      || input.innerDimensionsMm.width === null
+      || input.innerDimensionsMm.height === null
+    )
+  ) {
+    missing.push('dimensions')
+  }
+  if (
+    input.dimensionBasis !== undefined
+    && input.dimensionBasis !== 'inner'
+  ) {
+    missing.push('dimension_basis')
+  }
+  if (
+    input.dimensionEvidenceType !== undefined
+    && input.dimensionEvidenceType === 'unknown'
+  ) {
+    missing.push('dimension_evidence')
+  }
+  if (input.tareWeightGrams === null) missing.push('tare_weight')
+  if (input.maxWeightGrams === null) missing.push('max_weight')
   if (input.unitCostMinor === null) missing.push('unit_cost')
   const configuredStock = input.stock.some(
     (item) => item.warehouseStatus === 'active' && item.onHandQuantity !== null,
@@ -225,6 +316,11 @@ export function packagingMaterialReadiness(input: {
   return {
     eligibleForCartonization: (
       input.status === 'active'
+      && !missing.includes('dimensions')
+      && !missing.includes('dimension_basis')
+      && !missing.includes('dimension_evidence')
+      && !missing.includes('tare_weight')
+      && !missing.includes('max_weight')
       && input.unitCostMinor !== null
       && availableStock
     ),

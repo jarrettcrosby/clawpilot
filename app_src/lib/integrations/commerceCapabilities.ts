@@ -209,7 +209,7 @@ export const SHOPIFY_CAPABILITY_SCOPES = {
   product_synchronization: ['read_products'],
   variant_synchronization: ['read_products'],
   catalog_publishing: ['write_products', 'write_publications'],
-  inventory_import: ['read_inventory', 'read_locations'],
+  inventory_import: ['read_inventory', 'read_locations', 'read_products'],
   inventory_export: ['write_inventory', 'read_locations'],
   inventory_transfer_synchronization: ['write_inventory_transfers'],
   inventory_shipment_synchronization: [
@@ -317,7 +317,9 @@ export type ClawPilotCapabilityImplementationState = 'control_plane_implemented'
 
 // Current-state evidence only. "control_plane_implemented" means a safe
 // operator command or connection/receipt boundary exists; it does not imply an
-// unattended domain sync or export worker.
+// unattended domain sync or export worker. Shopify inventory and location
+// synchronization are bounded, manager-triggered, read-only development
+// controls; they are not production activation or provider-write capabilities.
 export const CLAWPILOT_SHOPIFY_CAPABILITY_IMPLEMENTATION = {
   oauth_authentication: 'not_implemented',
   api_authentication: 'control_plane_implemented',
@@ -327,11 +329,11 @@ export const CLAWPILOT_SHOPIFY_CAPABILITY_IMPLEMENTATION = {
   product_synchronization: 'not_implemented',
   variant_synchronization: 'not_implemented',
   catalog_publishing: 'not_implemented',
-  inventory_import: 'not_implemented',
+  inventory_import: 'control_plane_implemented',
   inventory_export: 'not_implemented',
   inventory_transfer_synchronization: 'not_implemented',
   inventory_shipment_synchronization: 'not_implemented',
-  location_synchronization: 'not_implemented',
+  location_synchronization: 'control_plane_implemented',
   location_administration: 'not_implemented',
   customer_synchronization: 'not_implemented',
   customer_export: 'not_implemented',

@@ -14,6 +14,8 @@ import RefreshRounded from '@mui/icons-material/RefreshRounded'
 import SettingsRounded from '@mui/icons-material/SettingsRounded'
 import StorefrontRounded from '@mui/icons-material/StorefrontRounded'
 import CommerceIntakeWorkflow from '@/components/settings/CommerceIntakeWorkflow'
+import ShopifyInventoryPanel from '@/components/operations/ShopifyInventoryPanel'
+import CartonizationRateEvidencePanel from '@/components/operations/CartonizationRateEvidencePanel'
 
 type CommerceProvider = 'shopify' | 'faire'
 
@@ -51,9 +53,26 @@ function humanize(value: string) {
 export default function CommerceImportsPanel() {
   const [payload, setPayload] = useState<CommercePayload | null>(null)
   const [selectedAccountGlobalId, setSelectedAccountGlobalId] = useState('')
+  const [requestedAccountGlobalId, setRequestedAccountGlobalId] = useState('')
+  const [cartonizationEvidenceGlobalId, setCartonizationEvidenceGlobalId] = useState('')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [reloadRevision, setReloadRevision] = useState(0)
+
+  useEffect(() => {
+    const readQuerySelection = () => {
+      const parameters = new URLSearchParams(window.location.search)
+      setRequestedAccountGlobalId(
+        parameters.get('commerceAccount')?.trim() || '',
+      )
+      setCartonizationEvidenceGlobalId(
+        parameters.get('cartonizationEvidence')?.trim() || '',
+      )
+    }
+    readQuerySelection()
+    window.addEventListener('popstate', readQuerySelection)
+    return () => window.removeEventListener('popstate', readQuerySelection)
+  }, [])
 
   useEffect(() => {
     const controller = new AbortController()
@@ -105,7 +124,11 @@ export default function CommerceImportsPanel() {
     (account) => account.globalId === selectedAccountGlobalId,
   )
     ? selectedAccountGlobalId
-    : accounts[0]?.globalId || ''
+    : accounts.some(
+        (account) => account.globalId === requestedAccountGlobalId,
+      )
+      ? requestedAccountGlobalId
+      : accounts[0]?.globalId || ''
 
   const selectedAccount = accounts.find(
     (account) => account.globalId === effectiveSelectedAccountGlobalId,
@@ -235,6 +258,12 @@ export default function CommerceImportsPanel() {
                   variant="outlined"
                 />
               </Stack>
+              {cartonizationEvidenceGlobalId ? (
+                <CartonizationRateEvidencePanel
+                  key={cartonizationEvidenceGlobalId}
+                  evidenceGlobalId={cartonizationEvidenceGlobalId}
+                />
+              ) : null}
               <CommerceIntakeWorkflow
                 key={selectedAccount.globalId}
                 accountGlobalId={selectedAccount.globalId}
@@ -242,6 +271,12 @@ export default function CommerceImportsPanel() {
                 displayName={selectedAccount.displayName}
                 canActivate={payload.canActivate === true}
               />
+              {selectedAccount.provider === 'shopify' ? (
+                <ShopifyInventoryPanel
+                  accountGlobalId={selectedAccount.globalId}
+                  displayName={selectedAccount.displayName}
+                />
+              ) : null}
             </>
           ) : null}
         </>

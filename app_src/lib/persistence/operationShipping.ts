@@ -481,7 +481,7 @@ function assertCreateContext(context: ShippingContext, expectedRowVersion: numbe
   ) {
     throw new OperationsRequestError(
       'OPERATIONS_LABEL_FIXTURE_REQUIRED',
-      'Sandbox labels require the 12 x 10 x 6 inch, 5 pound Test Product fixture',
+      'Sandbox labels require the fixed Test Product parcel from the sandbox test workflow',
       409,
     )
   }

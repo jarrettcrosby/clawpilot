@@ -275,6 +275,27 @@ export async function GET() {
           operations_package_contents_migration_applied: boolean
           operations_commerce_incomplete_header_money_migration_applied: boolean
           operations_packaging_materials_migration_applied: boolean
+          operations_shopify_inventory_migration_applied: boolean
+          measurement_preferences_migration_applied: boolean
+          packaging_material_unit_neutral_names_migration_applied: boolean
+          workspace_currency_preference_migration_applied: boolean
+          operations_pack_hierarchy_migration_applied: boolean
+          crm_data_transfers_migration_applied: boolean
+          operations_product_channel_states_migration_applied: boolean
+          crm_product_identity_aliases_migration_applied: boolean
+          operations_product_channel_offers_migration_applied: boolean
+          operations_pack_runtime_association_migration_applied: boolean
+          operations_commerce_pack_resolution_migration_applied: boolean
+          operations_hybrid_cartonization_recipes_migration_applied: boolean
+          operations_cartonization_package_rates_migration_applied: boolean
+          operations_cartonization_rate_evidence_migration_applied: boolean
+          operations_cartonization_rate_evidence_integrity_applied: boolean
+          operations_fulfilled_line_price_state_applied: boolean
+          operations_commerce_packaging_source_repair_applied: boolean
+          operations_recipe_pack_association_migration_applied: boolean
+          operations_cartonization_evidence_scale_applied: boolean
+          operations_cartonization_shipment_rates_applied: boolean
+          operations_cartonization_rate_constraint_repair_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -805,6 +826,111 @@ export async function GET() {
                 FROM schema_migrations
                 WHERE filename = '0123_operations_packaging_materials.sql'
               ) AS operations_packaging_materials_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0124_operations_shopify_inventory.sql'
+              ) AS operations_shopify_inventory_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0125_measurement_preferences.sql'
+              ) AS measurement_preferences_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0126_packaging_material_unit_neutral_names.sql'
+              ) AS packaging_material_unit_neutral_names_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0127_workspace_currency_preference.sql'
+              ) AS workspace_currency_preference_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0128_operations_pack_hierarchy.sql'
+              ) AS operations_pack_hierarchy_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0129_crm_data_transfers.sql'
+              ) AS crm_data_transfers_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0130_operations_product_channel_states.sql'
+              ) AS operations_product_channel_states_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0131_crm_product_identity_aliases.sql'
+              ) AS crm_product_identity_aliases_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0132_operations_product_channel_offers.sql'
+              ) AS operations_product_channel_offers_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0133_operations_pack_runtime_association.sql'
+              ) AS operations_pack_runtime_association_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0134_operations_commerce_pack_resolution.sql'
+              ) AS operations_commerce_pack_resolution_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0135_operations_hybrid_cartonization_recipes.sql'
+              ) AS operations_hybrid_cartonization_recipes_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0136_operations_cartonization_package_rates.sql'
+              ) AS operations_cartonization_package_rates_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0137_operations_cartonization_rate_evidence.sql'
+              ) AS operations_cartonization_rate_evidence_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0138_operations_cartonization_rate_evidence_integrity.sql'
+              ) AS operations_cartonization_rate_evidence_integrity_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0139_operations_fulfilled_line_price_state.sql'
+              ) AS operations_fulfilled_line_price_state_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0140_operations_commerce_packaging_source_constraint.sql'
+              ) AS operations_commerce_packaging_source_repair_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0141_operations_recipe_only_pack_associations.sql'
+              ) AS operations_recipe_pack_association_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0142_operations_cartonization_evidence_scale.sql'
+              ) AS operations_cartonization_evidence_scale_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0143_operations_cartonization_shipment_rates.sql'
+              ) AS operations_cartonization_shipment_rates_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0144_operations_cartonization_shipment_rate_constraint_repair.sql'
+              ) AS operations_cartonization_rate_constraint_repair_applied,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -922,6 +1048,27 @@ export async function GET() {
             && row?.operations_package_contents_migration_applied
             && row?.operations_commerce_incomplete_header_money_migration_applied
             && row?.operations_packaging_materials_migration_applied
+            && row?.operations_shopify_inventory_migration_applied
+            && row?.measurement_preferences_migration_applied
+            && row?.packaging_material_unit_neutral_names_migration_applied
+            && row?.workspace_currency_preference_migration_applied
+            && row?.operations_pack_hierarchy_migration_applied
+            && row?.crm_data_transfers_migration_applied
+            && row?.operations_product_channel_states_migration_applied
+            && row?.crm_product_identity_aliases_migration_applied
+            && row?.operations_product_channel_offers_migration_applied
+            && row?.operations_pack_runtime_association_migration_applied
+            && row?.operations_commerce_pack_resolution_migration_applied
+            && row?.operations_hybrid_cartonization_recipes_migration_applied
+            && row?.operations_cartonization_package_rates_migration_applied
+            && row?.operations_cartonization_rate_evidence_migration_applied
+            && row?.operations_cartonization_rate_evidence_integrity_applied
+            && row?.operations_fulfilled_line_price_state_applied
+            && row?.operations_commerce_packaging_source_repair_applied
+            && row?.operations_recipe_pack_association_migration_applied
+            && row?.operations_cartonization_evidence_scale_applied
+            && row?.operations_cartonization_shipment_rates_applied
+            && row?.operations_cartonization_rate_constraint_repair_applied
             && row?.migration_checksums_present
           ),
         }
@@ -1031,6 +1178,27 @@ export async function GET() {
           || !row?.operations_package_contents_migration_applied
           || !row?.operations_commerce_incomplete_header_money_migration_applied
           || !row?.operations_packaging_materials_migration_applied
+          || !row?.operations_shopify_inventory_migration_applied
+          || !row?.measurement_preferences_migration_applied
+          || !row?.packaging_material_unit_neutral_names_migration_applied
+          || !row?.workspace_currency_preference_migration_applied
+          || !row?.operations_pack_hierarchy_migration_applied
+          || !row?.crm_data_transfers_migration_applied
+          || !row?.operations_product_channel_states_migration_applied
+          || !row?.crm_product_identity_aliases_migration_applied
+          || !row?.operations_product_channel_offers_migration_applied
+          || !row?.operations_pack_runtime_association_migration_applied
+          || !row?.operations_commerce_pack_resolution_migration_applied
+          || !row?.operations_hybrid_cartonization_recipes_migration_applied
+          || !row?.operations_cartonization_package_rates_migration_applied
+          || !row?.operations_cartonization_rate_evidence_migration_applied
+          || !row?.operations_cartonization_rate_evidence_integrity_applied
+          || !row?.operations_fulfilled_line_price_state_applied
+          || !row?.operations_commerce_packaging_source_repair_applied
+          || !row?.operations_recipe_pack_association_migration_applied
+          || !row?.operations_cartonization_evidence_scale_applied
+          || !row?.operations_cartonization_shipment_rates_applied
+          || !row?.operations_cartonization_rate_constraint_repair_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')

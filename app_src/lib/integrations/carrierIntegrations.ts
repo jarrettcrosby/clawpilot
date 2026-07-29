@@ -7,9 +7,14 @@ import {
 import {
   CARRIER_SANDBOX_RATE_FIXTURE,
   buildCarrierSandboxRateFixture,
+  buildCarrierSandboxShipmentRateFixture,
   carrierSandboxRateRequestEvidence,
+  carrierSandboxShipmentRateRequestEvidence,
   requestCarrierSandboxRates,
+  requestCarrierSandboxShipmentRates,
   type CarrierSandboxRateFixture,
+  type CarrierSandboxRatePurpose,
+  type CarrierSandboxShipmentRateFixture,
 } from '@/lib/integrations/carrierSandboxRate'
 import {
   carrierAccountAddressFingerprint,
@@ -44,7 +49,9 @@ import {
   type CarrierRuntimeAccountRecord,
 } from '@/lib/persistence/carrierIntegrations'
 
-const CARRIER_SANDBOX_RATE_ADAPTER_VERSION = 'direct-rest-v2'
+const CARRIER_SANDBOX_RATE_ADAPTER_VERSION = 'direct-rest-v3'
+const CARRIER_SANDBOX_SHIPMENT_RATE_ADAPTER_VERSION =
+  'direct-rest-multi-package-v1'
 const AG_ALCHEMY_EPISCS_RATING_DELEGATION =
   'ag-alchemy-episcs-sandbox-rating-delegation'
 const AG_ALCHEMY_RATING_ORIGIN_WAREHOUSE = 'gwh5366613'
@@ -786,9 +793,13 @@ export async function testCarrierSandboxRate(input: {
   environment: unknown
   carrierAccountGlobalId?: unknown
   destination?: unknown
+  parcel?: unknown
   actorEmail: string
 }) {
   const requestedAt = new Date().toISOString()
+  const purpose: CarrierSandboxRatePurpose = input.parcel === undefined
+    ? 'sandbox_rate_test'
+    : 'cartonization_package_rate'
   let runtime: Awaited<ReturnType<typeof storedRuntimeCredential>> | null = null
   let selection: SandboxBillingSelection | null = null
   let fixture: CarrierSandboxRateFixture | null = null
@@ -828,6 +839,7 @@ export async function testCarrierSandboxRate(input: {
       senderName: selection.account.senderName,
       registeredAddress: selection.account.registeredAddress,
       destination: input.destination,
+      parcel: input.parcel,
     })
     const accountNumber = decryptCarrierAccountNumber(
       selection.account.encrypted,
@@ -840,7 +852,7 @@ export async function testCarrierSandboxRate(input: {
       provider: runtime.provider,
       environment: runtime.environment,
       credential: { ...runtime.credential, accountNumber },
-    }, { fixture })
+    }, { fixture, purpose })
     const billingSelectionSnapshot = redactedSandboxRateBillingSelection(selection)
     const evidenceGlobalId = await writeCarrierSandboxRateEvidenceInPostgres({
       organizationId: runtime.organizationId,
@@ -851,6 +863,7 @@ export async function testCarrierSandboxRate(input: {
       billingRelationship: selection.relationship,
       billingSelectionSnapshot,
       provider: runtime.provider,
+      purpose,
       credentialVersion: runtime.credentialVersion,
       adapterVersion: CARRIER_SANDBOX_RATE_ADAPTER_VERSION,
       requestHash: carrierSandboxRateSelectionRequestHash(rate.evidence.requestHash, selection),
@@ -880,7 +893,11 @@ export async function testCarrierSandboxRate(input: {
       && fixture
       && (runtime.provider === 'ups_rest' || runtime.provider === 'fedex_rest')
     ) {
-      const safeRequest = carrierSandboxRateRequestEvidence(runtime.provider, fixture)
+      const safeRequest = carrierSandboxRateRequestEvidence(
+        runtime.provider,
+        fixture,
+        purpose,
+      )
       const billingSelectionSnapshot = redactedSandboxRateBillingSelection(selection)
       try {
         await writeCarrierSandboxRateEvidenceInPostgres({
@@ -892,6 +909,7 @@ export async function testCarrierSandboxRate(input: {
           billingRelationship: selection.relationship,
           billingSelectionSnapshot,
           provider: runtime.provider,
+          purpose,
           credentialVersion: runtime.credentialVersion,
           adapterVersion: CARRIER_SANDBOX_RATE_ADAPTER_VERSION,
           requestHash: carrierSandboxRateSelectionRequestHash(safeRequest.requestHash, selection),
@@ -900,6 +918,167 @@ export async function testCarrierSandboxRate(input: {
             billingSelection: billingSelectionSnapshot,
           },
           redactedResponse: { errorCode: sanitized.code },
+          status: 'failed',
+          providerReference: null,
+          errorCode: sanitized.code,
+          actorEmail: input.actorEmail,
+          requestedAt,
+          completedAt: new Date().toISOString(),
+        })
+      } catch {
+        // The original carrier error remains authoritative if evidence storage fails.
+      }
+    }
+    throw sanitized
+  }
+}
+
+export async function testCarrierSandboxShipmentRate(input: {
+  organizationId: unknown
+  provider: unknown
+  environment: unknown
+  carrierAccountGlobalId?: unknown
+  destination: unknown
+  parcels: unknown
+  actorEmail: string
+}) {
+  const requestedAt = new Date().toISOString()
+  const purpose = 'cartonization_shipment_rate' as const
+  let runtime: Awaited<ReturnType<typeof storedRuntimeCredential>> | null = null
+  let selection: SandboxBillingSelection | null = null
+  let fixture: CarrierSandboxShipmentRateFixture | null = null
+  try {
+    const organizationId = normalizeCarrierOrganizationId(
+      input.organizationId,
+    )
+    const provider = normalizeDirectCarrierProvider(input.provider)
+    const environment = normalizeCarrierEnvironment(input.environment)
+    if (environment !== 'sandbox') {
+      throw new CarrierIntegrationRequestError(
+        'Rate testing is limited to carrier sandbox accounts',
+        409,
+        'CARRIER_SANDBOX_REQUIRED',
+      )
+    }
+    if (provider !== 'ups_rest' && provider !== 'fedex_rest') {
+      throw new CarrierIntegrationRequestError(
+        'Sandbox rating is not available for this carrier yet',
+        409,
+        'CARRIER_SANDBOX_RATE_UNSUPPORTED',
+      )
+    }
+    runtime = await storedRuntimeCredential({
+      organizationId,
+      provider,
+      environment,
+    })
+    if (runtime.status !== 'active' || !runtime.verified) {
+      throw new CarrierIntegrationRequestError(
+        'Enable a verified carrier credential before testing a rate',
+        409,
+        'CARRIER_CREDENTIAL_INACTIVE',
+      )
+    }
+    requiresConfiguredCapability(runtime, 'sandbox_rate')
+    selection = await sandboxBillingSelection({
+      runtime,
+      carrierAccountGlobalId: input.carrierAccountGlobalId,
+      senderBillingOnly: true,
+    })
+    fixture = buildCarrierSandboxShipmentRateFixture({
+      senderName: selection.account.senderName,
+      registeredAddress: selection.account.registeredAddress,
+      destination: input.destination,
+      parcels: input.parcels,
+    })
+    const accountNumber = decryptCarrierAccountNumber(
+      selection.account.encrypted,
+      runtime.organizationId,
+      runtime.provider,
+      runtime.environment,
+      selection.account.globalId,
+    )
+    const rate = await requestCarrierSandboxShipmentRates({
+      provider: runtime.provider,
+      environment: runtime.environment,
+      credential: { ...runtime.credential, accountNumber },
+    }, { fixture })
+    const billingSelectionSnapshot =
+      redactedSandboxRateBillingSelection(selection)
+    const evidenceGlobalId = await writeCarrierSandboxRateEvidenceInPostgres({
+      organizationId: runtime.organizationId,
+      integrationAccountId: runtime.integrationAccountId,
+      integrationGlobalId: runtime.integrationGlobalId,
+      carrierAccountId: selection.account.id,
+      carrierAccountGlobalId: selection.account.globalId,
+      billingRelationship: selection.relationship,
+      billingSelectionSnapshot,
+      provider: runtime.provider,
+      purpose,
+      credentialVersion: runtime.credentialVersion,
+      adapterVersion: CARRIER_SANDBOX_SHIPMENT_RATE_ADAPTER_VERSION,
+      requestHash: carrierSandboxRateSelectionRequestHash(
+        rate.evidence.requestHash,
+        selection,
+      ),
+      redactedRequest: {
+        ...rate.evidence.redactedRequest,
+        billingSelection: billingSelectionSnapshot,
+      },
+      redactedResponse: rate.evidence.redactedResponse,
+      status: 'succeeded',
+      providerReference: rate.evidence.providerReference,
+      errorCode: null,
+      actorEmail: input.actorEmail,
+      requestedAt: rate.evidence.requestedAt,
+      completedAt: rate.evidence.completedAt,
+    })
+    return {
+      ...rate.result,
+      carrierAccountGlobalId: selection.account.globalId,
+      billingRelationship: selection.relationship,
+      evidenceGlobalId,
+    }
+  } catch (error) {
+    const sanitized = sanitize(error)
+    if (
+      runtime
+      && selection
+      && fixture
+      && (runtime.provider === 'ups_rest' || runtime.provider === 'fedex_rest')
+    ) {
+      const safeRequest = carrierSandboxShipmentRateRequestEvidence(
+        runtime.provider,
+        fixture,
+      )
+      const billingSelectionSnapshot =
+        redactedSandboxRateBillingSelection(selection)
+      try {
+        await writeCarrierSandboxRateEvidenceInPostgres({
+          organizationId: runtime.organizationId,
+          integrationAccountId: runtime.integrationAccountId,
+          integrationGlobalId: runtime.integrationGlobalId,
+          carrierAccountId: selection.account.id,
+          carrierAccountGlobalId: selection.account.globalId,
+          billingRelationship: selection.relationship,
+          billingSelectionSnapshot,
+          provider: runtime.provider,
+          purpose,
+          credentialVersion: runtime.credentialVersion,
+          adapterVersion: CARRIER_SANDBOX_SHIPMENT_RATE_ADAPTER_VERSION,
+          requestHash: carrierSandboxRateSelectionRequestHash(
+            safeRequest.requestHash,
+            selection,
+          ),
+          redactedRequest: {
+            ...safeRequest.redactedRequest,
+            billingSelection: billingSelectionSnapshot,
+          },
+          redactedResponse: {
+            rateScope: 'multi_package_shipment',
+            packageCount: fixture.parcels.length,
+            errorCode: sanitized.code,
+          },
           status: 'failed',
           providerReference: null,
           errorCode: sanitized.code,

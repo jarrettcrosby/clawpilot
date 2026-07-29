@@ -15,7 +15,17 @@ app_visible: false
 
 Provide native distributed order management, warehouse execution, carrier shipping, and 3PL billing inside ClawPilot. The module serves 3PL operators, retailers, distributors, manufacturers, and fulfillment operators without creating a second application or duplicating CRM, product, identity, audit, task, document, notification, or accounting masters.
 
-This document remains the **target contract** for the full module. The current development slice includes operations migrations `0081` through `0094`, `0097` through `0101`, and `0107` through `0123`; a tenant-scoped order workbench; explicit idempotent warehouse-release, bulk all-ready pick-confirmation, pack-verification, sandbox-label-create, and sandbox-label-void commands for eligible non-archived orders; a durable exception queue; scoped activation controls; canonical CRM catalog projection; provider-customer resolution; team-managed product/package imports; warehouse-scoped Packaging Materials management; organization-scoped direct carrier credential administration; UPS and FedEx sandbox rating with an account-derived origin and editable test destination; a separate rate-selected diagnostic label-create with customer-selected provider-native output, stored-label download/print, and void workflow; immutable provider-source bytes plus an explicit derivative-artifact provenance boundary; append-only redacted provider evidence; carrier-rate delegation; direct multi-account carrier CSV import; selected-batch GL Coding; separate financial review; billed-actual Triangle/Square/Circle settlement evidence; append-only settlement status transitions; capability-aware printer configuration; enrolled local print-agent delivery with controlled reprints, same-warehouse fallback, and agent-declared format/media/document capabilities; shipment- and exact-package-specific PDF packing-list renderers, immutable artifact-payload store, authenticated artifact stream, tracking-observation schema, and commerce-fulfillment export state model; a Shopify/Faire sales-channel control plane; a bounded development-only Shopify held-order preview; leased development-only full-product-catalog reconciliation and current-order staging workers; and guarded development-only product-catalog mapping and operational-order workflows with durable pre-call read intents, resource-scoped encrypted continuations, first-class rejection dispositions, and canonical promotion. The deterministic mock flow remains an internal automated-test harness only. Hosted mock generation is disabled and historical mock artifacts are archived. These features prove PostgreSQL authority and application boundaries; they do not establish historical closed-order commerce import, provider inventory synchronization, production commerce workers, production carrier mutation, tracking ingestion, commerce-export dispatch, pickup scheduling, accounting export, invoice/AR workflow, payment adapters, or a deployed fulfillment optimizer.
+This document remains the **target contract** for the full module. The current development slice includes operations migrations `0081` through `0094`, `0097` through `0101`, and `0107` through `0144`; a tenant-scoped order workbench; explicit idempotent warehouse-release, bulk all-ready pick-confirmation, pack-verification, sandbox-label-create, and sandbox-label-void commands for eligible non-archived orders; a durable exception queue; scoped activation controls; canonical CRM catalog projection; provider-customer resolution; team-managed product/package imports; warehouse-scoped Packaging Materials management; organization-scoped direct carrier credential administration; UPS and FedEx sandbox rating with an account-derived origin and editable test destination; a separate rate-selected diagnostic label-create with customer-selected provider-native output, stored-label download/print, and void workflow; immutable provider-source bytes plus an explicit derivative-artifact provenance boundary; append-only redacted provider evidence; carrier-rate delegation; direct multi-account carrier CSV import; selected-batch GL Coding; separate financial review; billed-actual Triangle/Square/Circle settlement evidence; append-only settlement status transitions; capability-aware printer configuration; enrolled local print-agent delivery with controlled reprints, same-warehouse fallback, and agent-declared format/media/document capabilities; shipment- and exact-package-specific PDF packing-list renderers, immutable artifact-payload store, authenticated artifact stream, tracking-observation schema, and commerce-fulfillment export state model; a Shopify/Faire sales-channel control plane; a bounded development-only Shopify held-order preview; leased development-only full-product-catalog reconciliation and current-order staging workers; guarded development-only product-catalog mapping and operational-order workflows with durable pre-call read intents, resource-scoped encrypted continuations, first-class rejection dispositions, and canonical promotion; a bounded, manager-triggered, read-only Shopify inventory reconciliation for one eligible location and warehouse; a strict development-only Shopify cartonization preview; a recipe-first, assumption-watermarked sandbox package-and-rate evidence workflow; and active-workspace measurement-presentation and product-currency defaults. The deterministic mock flow remains an internal automated-test harness only. Hosted mock generation is disabled and historical mock artifacts are archived. These features prove PostgreSQL authority and application boundaries; they do not establish historical closed-order commerce import, continuous or production provider inventory synchronization, production commerce workers, production carrier mutation, tracking ingestion, commerce-export dispatch, pickup scheduling, accounting export, invoice/AR workflow, payment adapters, or production fulfillment-optimizer activation.
+
+Migrations `0128` through `0144` extend this slice with the pack hierarchy,
+CRM CSV transfer evidence, durable sales-channel lifecycle and offer
+projection, guarded canonical Product identity reconciliation, and
+database-enforced packaging-dimension evidence described below.
+
+Migration `0126` is the bounded, owner-safe data correction that renames only
+the exact original imperial-named `starter_assortment` records to unit-neutral
+labels. It preserves material codes, canonical dimensions and weights, cost,
+stock, status, and every operator-edited name.
 
 ## Current Development Slice
 
@@ -30,6 +40,8 @@ The implemented slice provides:
 - operator-controlled pack verification with exact-version concurrency, released-plan and completed-pick validation, one packed package, retained reservations for shipment consumption, immutable pack-fee evidence, domain event, audit evidence, and replay-safe exact result payloads;
 - a shared CRM product catalog that authorized pipeline editors can maintain individually or import from CSV, with a permanent `gp` product identity, duplicate prevention by SKU or case-insensitive name, per-row validation, and bounded partial-import results;
 - one organization-scoped default package profile per product in this slice, with permanent `gpp` identity, package type, unit of measure, units per package, preferred metric or imperial entry system, dimensions, weight, active state, source, optimistic row version, and audit history; fulfillment planning consumes canonical millimeters and grams from the active profile and records its provenance, while products without a profile retain the explicit conservative fallback;
+- an active-session-scoped measurement presentation preference with an organization default and nullable per-user-per-workspace override; any active member may update only their own override, only an effective owner or administrator may update the organization default, organization writes require an exact optimistic revision, and the response identifies whether the effective system came from the user, organization, or compatibility fallback; a runtime with no active organization uses the compatibility fallback without a persistence request or save attempt;
+- an organization ISO 4217 currency default, initially USD, used only when a new ClawPilot Product or product CSV row has no record currency; existing CRM products and Shopify, Faire, carrier, order, and imported money retain their own currencies, and no preference change converts an amount or relabels a source fact;
 - archived legacy hosted mock proof records with reservations released and immutable ledger, domain-event, audit, billable, and Global ID evidence retained;
 - an exact-scenario development WMS simulator retirement command that releases active reservations with compensating ledger entries, cancels linked execution, dismisses linked open exceptions, archives the 21 synthetic orders, deactivates scenario fixtures, preserves evidence tombstones, and removes retired scenario orders, facilities, pools, products, and customer fixtures from the default Operations workspace; retirement is terminal for the organization-scoped simulator singleton and its order lineage, so no later scenario version can reseed it;
 - a guarded development-only establishment command that retains the existing Suburbia Sandwich Co and Express Parcel International DBA EPISCS workspaces, creates AG Alchemy, LLC as a separate switchable nondefault test workspace, re-establishes the AG Alchemy Shopify credential under that workspace without moving Express evidence, preserves the Express UPS, FedEx, physical Zebra, print-agent, and bound warehouse identities, and retires only the exact synthetic warehouse/mock operating state through compensating facts and tombstones; plus a separate plan-first command that projects exactly one AG warehouse from its sole active Shopify fulfillment/shipping location and refuses zero, multiple, or mismatched origins;
@@ -51,27 +63,261 @@ The implemented slice provides:
 - a Shopify Dev Dashboard client-credentials exchange for an installed same-organization store, with 24-hour access tokens acquired only when needed and never persisted; an Admin GraphQL client pinned to `2026-07`; strict canonical `*.myshopify.com` endpoints; bounded requests/responses; reported-scope inspection; raw-body HMAC verification; a narrowly public account-specific receipt URL; event-ID deduplication; encrypted webhook bodies; durable cursor/retry/dead-letter structures; and an explicit receipt-intake-only activation label;
 - a feature-gated, manager-triggered Shopify held-order preview for a configured and verified `sandbox` store: it reads at most the newest 25 non-test orders, retains only minimized diagnostic fields for no more than 24 hours, compares line SKUs with existing local product mappings and package-profile readiness, and records explicit zero canonical-order, zero Shopify-write, and no-cursor-advance evidence;
 - separate feature-gated Shopify/Faire catalog and operational-order workflows for configured and verified accounts: each provider read first persists a fixed idempotent intent, bounded product pages stage map/create/exclude candidates, bounded nonterminal order pages stage resolve/validate/promote candidates, continuations are encrypted and resource scoped, Shopify pages are time-fenced, Faire order candidates require exact refresh, and every rejection exposes exact order retry or audited exclusion; a leased development-only order worker automatically stages current order pages under the same read/capture/normalize path without canonical promotion, inventory mutation, shipment creation, cursor advance, or provider write;
+- a feature-gated, manager-triggered Shopify inventory reconciliation for a configured and verified account with `read_inventory`, `read_locations`, and `read_products`: it durably prepares the provider read, captures the bounded complete response before applying it, maps one eligible Shopify location to the workspace's one active warehouse and selected reserve/storage location, retains all eight requested Shopify quantity states and operational product facts, projects only exact product mappings into Shopify-authoritative Operations balances, and performs no provider write, order mutation, shipment creation, or fulfillment export;
+- a manager-triggered, development-only Shopify cartonization preview that requires the exact current order-candidate revision, one active warehouse, account-bound inventory evidence captured from Shopify within 24 hours, exact product mappings and package measurements, explicit per-line committed-quantity assumptions, and one to eight active, priced, positively stocked packaging materials; inventory-run completion remains separate evidence and cannot make a replayed stale provider capture fresh; it calls only the authenticated OR-Tools service, uses fixed-axis conservative fit, excludes transport and handling costs, and returns a point-in-time in-memory fit/material recommendation with explicit zero database, provider, rate, label, and shipment writes; product-level committed attribution is displayed once and remains ineligible while more than one current inventory position exists; each optimizer package is surfaced as one planned shipment, but the preview cannot accept or persist that split, allocate durable package contents, or generate the future shipment-partitioned packing documents; Faire remains blocked until account-bound inventory reconciliation exists;
 - a canonical **Operations > Commerce imports** submodule at `#operations/imports`, also available from the collapsed-navigation flyout, that selects a configured and verified active-workspace Shopify/Faire account and opens the same Overview/Products/Orders/Issues workbench as the compact Settings launcher; product decision CSV is account/candidate/row-version fenced, while order and issue exports are sanitized and no CSV order import or provider-write path exists;
 - a reusable progressive-disclosure setup journey across Commerce, carrier, Google Workspace, QuickBooks, Toast, and Maton Settings panels, with provider-specific ordered steps and copyable nonsecret operational facts derived only from each panel's existing organization-scoped state;
 - a Faire External API v2 brand client for the fixed production origin, brand/product/order and selector-based inventory reads plus documented processing/cancellation/availability/shipment request translations; Faire is explicitly recorded as production-only and polling-only, with no public webhook, sandbox, retailer custom API, or return-write claim;
 - responsive Orders and Exceptions views with permanent `gor` and `gex` identities, plus stable hash-addressed, horizontally scrollable Orders, Exceptions, Commerce imports, Receiving, Warehouses, Packaging materials, Carrier invoicing, Shipment pricing & GL, and Printing subpanel navigation with touch panning and accessible edge scroll controls on narrow screens; the expanded left-navigation Operations submenu and collapsed flyout expose that same complete submodule set without changing existing permission boundaries. Packaging materials owns organization-scoped cartons, poly mailers, padded mailers, dimensions, tare and maximum weights, unit cost, draft/active state, and per-existing-warehouse availability/on-hand/reorder facts. Its six-item starter assortment is draft-only and cannot become optimizer-eligible until real costs and positive available stock are recorded. Carrier invoicing owns immutable source-file and actual-cost evidence. Shipment pricing & GL owns shipment-to-shipper assignment, retained MUD-price review, variance and settlement review, and GL outputs; shipper-assignment rules do not replace or mutate the independently versioned MUD;
+- incomplete customer-supplied packaging-material drafts that retain only the supplied dimensions, explicit inner/outer/unconfirmed basis, evidence type/reference, and source while leaving unknown depth, tare, maximum weight, cost, currency, and stock null; activation fails closed until verified usable inner dimensions and every operating fact are present. A separate trusted-development, plan-first AG Alchemy command stages the four customer-supplied material drafts and six explicit provider sell-unit pack classes only after an administrator supplies exact `gp` Product Global IDs and an explicit active owner/admin actor. It verifies the Railway environment name and database identity, binds apply to the exact fresh plan fingerprint, projects every assigned Product's current exact channel state to the class's default pack version with retained provider source revision/hash, and fails if that provider evidence is absent. Its title/SKU suggestions are discovery aids only. Guarded apply may replace the six exact untouched or legacy-equivalent synthetic starter drafts and their empty stock placeholders, but fails on partial, active, edited, referenced, or otherwise conflicting starter state. It never activates a material, profile, relationship, or recipe or infers intact-case inventory;
 - audited exception transitions for acknowledge, resolve, dismiss, and reopen, with tenant isolation and retained resolution history;
 - an in-module guide that directs carrier sandbox testing to **Settings > Integrations > Shipping** and identifies deterministic mocks as automated-test-only;
 - disposable PostgreSQL acceptance coverage that applies the full migration chain and validates atomic writes, replay, rollback, append-only evidence, money totals, and cross-workspace isolation.
 
-Production domain activation remains out of scope until later delivery gates verify provider credentials, processed webhook and polling imports, canonical mappings, provider attempts, reconciliation/replay, complete operational health, recovery commands, and an explicitly approved integration and warehouse cohort. Enabling Shopify signed receipt intake still accepts only its enumerated receipt topics; order and customer webhook topics remain rejected until their retention/privacy lifecycle and canonical processor exist. The separately gated held-order preview can inspect minimized recent order facts while the `sandbox` account remains receipt-disabled, but it does not import an order, create or change a customer, product, or mapping, reserve or export inventory, export a fulfillment, register webhooks, advance a cursor, or authorize any provider write. A verified product-readable Shopify or Faire connection authorizes the distinct development-only catalog worker without a second user approval and initializes its policy as resumed in an eligible runtime. A verified order-readable connection separately authorizes the development-only current-order staging worker when Operations is `shadow` or `active`; that worker follows bounded encrypted pages and creates held candidates or rejections only. Catalog policy initialization does not prove queueing, and neither worker is production enabled. The catalog worker may create ClawPilot product masters and exact mappings but never reads or changes orders or inventory and never writes to the provider. The order worker never creates canonical orders, customers, products, reservations, packages, shipments, inventory changes, or provider writes. Interactive commerce intake may separately promote a manager-reviewed ready order without inventory synchronization, durable provider cursor advancement, or provider write. Sandbox rating and label evidence do not authorize production rating, label creation, pickup scheduling, shipment confirmation, or inventory consumption. `app_documents` is not used as a substitute for logistics artifacts.
+Production domain activation remains out of scope until later delivery gates verify provider credentials, processed webhook and polling imports, canonical mappings, provider attempts, reconciliation/replay, complete operational health, recovery commands, and an explicitly approved integration and warehouse cohort. Enabling Shopify signed receipt intake still accepts only its enumerated receipt topics; order and customer webhook topics remain rejected until their retention/privacy lifecycle and canonical processor exist. The separately gated held-order preview can inspect minimized recent order facts while the `sandbox` account remains receipt-disabled, but it does not import an order, create or change a customer, product, or mapping, reserve or export inventory, export a fulfillment, register webhooks, advance a cursor, or authorize any provider write. A verified product-readable Shopify or Faire connection authorizes the distinct development-only catalog worker without a second user approval and initializes its policy as resumed in an eligible runtime. A verified order-readable connection separately authorizes the development-only current-order staging worker when Operations is `shadow` or `active`; that worker follows bounded encrypted pages and creates held candidates or rejections only. Catalog policy initialization does not prove queueing, and neither worker is production enabled. The catalog worker may create ClawPilot product masters and exact mappings but never reads or changes orders or inventory and never writes to the provider. The order worker never creates canonical orders, customers, products, reservations, packages, shipments, inventory changes, or provider writes. Interactive commerce intake may separately promote a manager-reviewed ready order; promotion itself does not alter provider inventory or deduct order demand from a separately reconciled Shopify-authoritative balance. The manager-triggered Shopify inventory command is an independent read-only development control, not a production or unattended worker. Sandbox rating and label evidence do not authorize production rating, label creation, pickup scheduling, shipment confirmation, or inventory consumption. `app_documents` is not used as a substitute for logistics artifacts.
 
 ### Product And Package Catalog Workflow
 
-The shared catalog is managed from **Pipeline > Configure > Products** because CRM products remain the product authority for both sales and operations. An authorized editor may add or update one product at a time or import a CSV containing at most 500 rows and 1 MB. The product template includes name, SKU, type, category, status, price, cost, currency, URL, description, active state, package name, package type, unit of measure, units per package, measurement system, length, width, height, weight, and package active state. Metric entry uses centimeters and kilograms; imperial entry uses inches and pounds. The service converts both to canonical millimeters and grams for cartonization and carrier adapters while retaining the team's preferred entry system.
+The shared catalog is managed from **Pipeline > Configure > Products** because CRM products remain the product authority for both sales and operations. An authorized editor may add or update one product at a time or import a CSV containing at most 500 rows and 1 MB. The product template includes name, SKU, type, category, status, price, cost, currency, URL, description, active state, package name, package type, unit of measure, units per package, measurement system, length, width, height, weight, and package active state. A new blank Product or truly currency-less CSV row receives the active organization's currency default. When SKU or name matches an existing Product, its record currency wins over that default; an explicit row currency is the only way to change it. Metric entry uses centimeters and kilograms; imperial entry uses inches and pounds. The service converts both to canonical millimeters and grams for cartonization and carrier adapters while retaining the team's preferred entry system.
 
 An import updates an existing product when its SKU matches case-insensitively or, when no SKU resolves it, its name matches case-insensitively. A product name and SKU cannot identify different existing records. Every invalid row is reported without discarding valid rows, and spreadsheet-formula-prefixed text is rejected. Package length, width, height, and weight must be supplied together. Team edits reuse the same product and default package Global IDs, increment the package row version, and append audit evidence instead of creating duplicate catalog records.
 
 The current vertical slice intentionally maintains one editable default package profile per product. The schema leaves room for multiple named profiles and facility-specific packaging in a later cartonization slice, but the application must not imply that those choices are available yet.
 
+Migration `0128` and `scripts/stage-ag-alchemy-pack-hierarchy.mjs` add a
+separate evidence-staging boundary behind that existing product editor. The AG
+command can stage customer-confirmed `each`, `inner_pack`, and `case` versions,
+their exact contains relationships, and approved-but-nonactive recipes for
+loose carton packing:
+
+- loose 6 oz bag listings as recipe-only eaches, with an `AG12V2`
+  customer-confirmed range of 12 through 18 and a customer-named 20 lb box
+  maximum of 30 whose minimum remains unknown and therefore unusable until
+  confirmed;
+- explicit prepackaged 6 oz case-of-12 listings as a separate default sell
+  unit in `AG12V2`, represented by its contains relationship and never by an
+  assembly recipe;
+- loose 2 oz bag listings as eaches with a prepackaged case-of-36 relationship
+  in `AG12V2`, without an assembly recipe;
+- explicit prepackaged 2 oz display-carton listings as a separate default sell
+  unit containing 6 bags, plus an assembly-allowed outer shipping box holding
+  up to 6 complete display cartons;
+- one 10 lb bulk unit in `AG12V2`; and
+- one 20 lb bulk unit in the customer-named 20 lb box.
+
+The command does not apply a classification from title or SKU. It prioritizes
+explicit `2 oz Carton` and `6 oz 12pk` discovery suggestions so those listings
+cannot inherit loose-bag dimensions, but apply still requires an explicit,
+nonduplicated `gp` assignment. The assignment is not accepted as evidence by
+itself: each current Shopify/Faire variant must be mapped to the class's
+explicit default sell-unit profile using its durable source revision/hash.
+Net-content names such as `10 lb` and `20 lb` are not treated as gross shipping
+weights.
+
+Migration `0134` connects an exact current Shopify or Faire variant-pack
+mapping to new order candidates without activating the staged Product profile
+or any incomplete packaging material. Automatic resolution accepts only a
+current `customer_confirmed` or `active` pack version with complete **outer**
+dimensions and measured, customer-confirmed, or provider evidence. The mapping
+and current channel-state source revision and hash must still match, and a
+provider-supplied pack multiplier must equal the mapped base-each quantity.
+Candidate lines retain mapping/profile-version Global IDs, row-version fences,
+package level, base-each quantity, and the explicit weight source.
+
+Gross shipping weight is never inferred from Product names or nominal content.
+Resolution uses an explicit pack-version gross weight first, an exact
+provider-order package weight second, or the matching current provider-catalog
+weight third. If weight is absent, pack quantities conflict, or provider
+dimensions conflict with the customer-confirmed pack, the otherwise eligible
+association remains review evidence but the line stays blocked for package
+resolution. Changed or ineligible source evidence is not associated.
+One narrow recipe-first exception prevents false product measurements: a
+current customer-confirmed provider sell-unit profile marked
+`approved_recipe_only` may intentionally omit item dimensions while retaining
+its exact variant-pack association and current provider-catalog weight. The
+candidate remains unresolved for ordinary package promotion and geometric
+preview. The hybrid planner may consume that association only when a current
+customer-confirmed recipe for the exact captured input-profile revision
+supplies the outbound material and package geometry. This is the supported
+model for 10 lb and 20 lb bulk sell units; ClawPilot does not copy the
+shipping-carton dimensions onto the unmeasured inner product.
+Promotion revalidates every mapping, version, source, dimension,
+weight, and active Product mapping under row locks; a stale fact requires a
+fresh order intake. Manual or compatibility-profile resolution clears mapped
+pack provenance. The optimizer input schema remains unchanged: cartonization
+consumes the ordinary resolved candidate-line dimension and weight snapshot.
+For an association-only recipe input, the same repeatable read instead retains
+the exact mapping/profile revisions and matching channel source revision/hash,
+uses that source-bound catalog weight, and obtains outbound geometry only from
+the current recipe and selected material. Draft materials still fail closed
+until verified inner dimensions, tare, capacity, cost/currency, and positive
+warehouse stock make them active outside the explicit sandbox evidence path.
+
+Migration `0135` makes recipe-driven cartonization explicit. A max-capacity
+recipe records a nullable customer-approved minimum, a normalized content
+compatibility key, and whether fit evidence permits compatible Products to
+share one outbound material. Mixed pooling requires a max-capacity recipe,
+nonexclusive contents, the exact same compatibility key, and timestamped
+customer-confirmed or measured fit evidence. An active max-capacity recipe
+cannot retain an unknown minimum. A profile marked `approved_recipe_only`
+requires timestamped referenced evidence and can never silently fall back to
+geometric fitting.
+
+The pure hybrid planner runs the approved-recipe phase before exposing
+remaining `rigid_3d` or `compressible` lines to the geometric optimizer. Every
+Product in a mixed pool must expose the same material, capacity, applied
+minimum, compatibility key, and current row-version evidence. Stale profiles,
+recipes, or materials block; missing recipe evidence blocks recipe-only
+flexible items. The AG loose 6 oz recipes share
+`ag-alchemy.loose-six-ounce-bags.v1` and may pool flavors, but `AG12V2` retains
+the customer-confirmed 12-unit minimum. A smaller order such as six bags is
+only an assumption-backed **read-only sandbox** option when the caller supplies
+an explicit minimum override with a reason and evidence reference. Production
+planning rejects all such overrides, and the 20 lb box remains blocked until
+its currently unknown minimum is confirmed.
+
+Hybrid output includes policy and algorithm versions, canonical input/result
+hashes, stable package keys and sequence, exact material/profile/recipe row
+versions, customer material dimensions and evidence, recipe minimum/maximum,
+line/Product/title/quantity allocations, and content weight. Rating readiness
+is separate: missing rated outer dimensions or tare weight is returned as a
+package-level blocker rather than invented from inner dimensions. This pure
+planner performs no database, provider, inventory, shipment, rate, label, or
+packing-list write.
+
+Migration `0136` adds a distinct `cartonization_package_rate` purpose to the
+existing UPS and FedEx sandbox adapters. The caller supplies the exact planned
+parcel exterior and gross weight; omitting that parcel preserves the separate
+fixed diagnostic rate test. A cartonization quote cannot enter the diagnostic
+label-create workflow.
+
+Migration `0137` seals a reloadable `gcte` evidence aggregate after every
+planned package has exactly one immutable UPS and one immutable FedEx `grq`
+edge. One repeatable-read transaction binds the exact organization, commerce
+account and candidate revision, active warehouse, latest successful
+account-plus-warehouse inventory run, current variant mapping and pack-profile
+row, selected material row, and every matching current recipe. Each shipping
+line retains an explicit committed-inventory quantity, including zero; the
+assumed total may not exceed provider-committed evidence, and demand may not
+exceed operational availability plus that retained attribution.
+
+The development sandbox proof may use current customer-confirmed profiles and
+recipes plus a draft customer-supplied material. Rated exterior dimensions,
+tare, and any below-minimum recipe quantity require an explicit operator
+acknowledgement and are stored only in the evidence aggregate. The UI
+watermarks that aggregate as **assumption-backed sandbox evidence, not
+executable or actual billed cost** and exposes a direct reload link under
+**Operations > Commerce imports**. It never activates or mutates Product,
+material, recipe, inventory, order, shipment, label, print, or provider
+records; only append-only ClawPilot evidence and carrier-rate request rows are
+written.
+
+For `sandbox_demo` only, mapped `negative_available` inventory evidence may
+retain its exact provider-committed quantity while operational ATP remains
+zero. The operator must still attribute that committed quantity explicitly per
+line, and the assumption cannot exceed provider evidence. Production remains
+fail closed to `projected` inventory evidence only. This exception never turns
+negative availability into ATP and performs no inventory or provider write.
+
+Migration `0138` closes three evidence-integrity gaps. Every planned package
+now retains immutable child rows for all contributing approved recipes,
+Products, and input-profile revisions, including mixed-product cartons. The
+header stores the confirmed destination fingerprint, each package stores the
+exact normalized carrier parcel, and each quote stores the linked carrier
+request hash plus a package-rate-context hash. A deferred database check
+requires the linked `grq` destination and parcel to match that saved package
+proof exactly. A durable semantic command reservation is claimed before either
+carrier read: a completed retry reloads the sealed `gcte`, a concurrent retry
+remains pending, and neither path creates additional carrier request rows.
+
+Migration `0139` keeps fully fulfilled provider lines as source evidence
+without falsely requiring an operator-selected order-time price. The database
+continues to require `line_price_required` whenever an unresolved-price line
+has positive unfulfilled demand; zero-remaining lines remain excluded from
+operational readiness and canonical fulfillment work.
+
+Migration `0140` removes PostgreSQL's truncated legacy four-value
+`packaging_source` check left behind by migration `0134`, then re-establishes
+the named five-value constraint that admits exact `variant_pack_mapping`
+evidence. Hosted migration health now requires both this repair and the
+fulfilled-line price-state repair before reporting current schema.
+
+Migration `0141` makes the recipe-only association state
+database-authoritative. Exact `variant_pack_mapping` evidence may remain
+`unresolved` only with the complete mapping/profile association, null item
+dimensions and weight, and the ordinary `packaging_required` blocker still
+present. Resolved mapped packages continue to require an explicit weight
+source. The runtime admits the unresolved form only for a current
+source-bound `approved_recipe_only` profile whose dimensions are all absent;
+the sandbox hybrid reader retains its mapping/profile row versions and channel
+source revision/hash, derives unit weight only from that positive current
+catalog observation, and still requires the saved recipe/material proof before
+it can rate a parcel.
+
+The AG staging command has one guarded compatibility repair for bulk profiles
+created before the recipe-only rule was introduced. A fresh plan may supersede
+only an untouched version-1, row-version-0, customer-confirmed
+`rigid_3d` profile whose dimensions and weights are all absent and whose other
+facts exactly match the customer-supplied bulk manifest. Apply creates a
+version-2 `approved_recipe_only` profile, retires and recreates the affected
+relationship and recipe against that version, and versions the exact provider
+variant mapping while retaining the current channel source revision and hash.
+The old rows remain as history. Any extra version, changed fact, stale channel
+evidence, or concurrent row-version change blocks the repair. The command
+remains restricted to the trusted development database, exact Product Global
+ID assignment, active AG administrator, and fresh plan fingerprint; it performs
+zero provider, inventory, order, package, shipment, or carrier writes.
+
+Confirmed US ship-to snapshots may retain a provider-native state or territory
+name for audit display. The carrier sandbox boundary converts recognized names
+such as `Wisconsin` to the canonical postal code (`WI`) before fingerprinting
+and rating. An unknown subdivision now fails with
+`CARTONIZATION_RATE_DESTINATION_INVALID` instead of being reported as a
+generic evidence outage.
+
+Operators may select at most eight packaging material types for one
+cartonization run, while one saved read-only carrier comparison may retain up
+to 50 resulting physical packages. This distinction lets a high-unit order
+reuse a small controlled material catalog without truncating its actual carton
+plan while remaining inside the UPS `Shop` one-request package limit shared by
+the UPS/FedEx comparison boundary.
+
+Every selected material in that comparison carries its own explicitly
+acknowledged rated exterior dimensions and sandbox-only tare. Those assumptions
+are normalized, bound to the exact material Global ID and row version, retained
+in the semantic request hash, and rechecked against every resulting package
+before evidence can seal. Cartonization completes first. ClawPilot then sends
+the complete ordered physical-package list in exactly one UPS multi-package
+shipment-rate request and one FedEx multi-piece shipment-rate request. A
+shipment-level option is eligible only when that carrier returned the service
+for the entire package list; one carrier service applies to every package in
+the shipment and package-by-package service splitting is not allowed. The
+optimizer counts one shipment per selected ship-from warehouse, while
+`cartonCount` remains the number of physical packages; AG Alchemy's one
+warehouse therefore produces one potentially multi-package shipment. A future
+multi-warehouse plan must partition packages by ship-from warehouse before
+rating, because each warehouse has a different sender address; ClawPilot then
+sends one shipment-level request per warehouse group to each carrier and never
+combines origins in one request. Each
+physical package retains its own allocation, recipe, normalized parcel, and
+edge to the shared immutable provider request so an administrator can audit the
+two carrier reads without mistaking package evidence for separate rate choices.
+The workflow is read-only at both providers and performs no shipment, label,
+postage, inventory, or sales-channel write.
+Migration `0144` removes the legacy inline single-package quote-purpose check
+left by migration `0137`; the purpose-aware shipment/package constraint from
+`0143` remains authoritative, so whole-shipment quote edges can seal without
+weakening legacy evidence validation.
+
 ### Packaging Materials Workflow
 
-**Operations > Packaging materials** manages the consumable outbound container catalog separately from product package profiles. Materials are organization-scoped cartons, poly mailers, or padded mailers with canonical millimeter dimensions, tare and maximum weight, exact unit cost/currency, draft/active status, and optimistic row version. Warehouse stock rows can reference only an existing active warehouse and record availability, on-hand quantity, reorder point, and reorder quantity. Activating a material requires complete physical and cost facts; an optimizer candidate additionally requires an available warehouse row with positive on-hand stock.
+**Operations > Packaging materials** manages the consumable outbound container catalog separately from product package profiles. Materials are organization-scoped cartons, poly mailers, or padded mailers with canonical millimeter dimensions, explicit dimension basis and evidence, nullable draft tare and maximum weight, nullable draft unit cost/currency, draft/active status, source, and optimistic row version. A draft may retain a partial customer measurement such as a 9 by 12 envelope with unknown depth; the API and UI preserve that missing value as null and display the activation gaps rather than coercing it to zero. Warehouse stock rows can reference only an existing active warehouse and record availability, on-hand quantity, reorder point, and reorder quantity. Activating a material requires verified usable inner dimensions, nonunknown evidence, complete tare/capacity and cost facts; an optimizer candidate additionally requires an available warehouse row with positive on-hand stock.
+
+Migration `0133` makes the application evidence rule database-authoritative:
+`customer_confirmed` and `measured` dimensions require both their confirmation
+timestamp and a nonblank evidence reference. When any dimension, basis,
+evidence type, or evidence reference changes, the persistence command refreshes
+the confirming actor and timestamp instead of retaining stale provenance.
 
 The starter command is idempotent and creates only six manageable draft candidates. It never invents landed cost, historical suitability, or stock and therefore cannot make those drafts eligible for cartonization. The readiness summary uses the last 365 days of shipped facts to report sample count, product-dimension gaps, cost gaps, stock gaps, eligible materials, and reorder needs. It is evidence for operator maintenance, not a claim that the assortment is already optimal.
 
@@ -86,7 +332,7 @@ The `0111` through `0115` control plane, Faire OAuth staging, Shopify diagnostic
 | Account path | Dev Dashboard client ID and secret for one installed same-organization shop; ClawPilot exchanges them for a 24-hour token when needed; multi-merchant OAuth is planned | Organization-supplied Custom App credentials with an OAuth authorization-code flow for one verified brand; a shared multi-brand installation is planned | Candidate identity is verified before encrypted persistence; short-lived Shopify tokens are not persisted; the integration Global ID is permanently bound to that shop/brand in this slice |
 | Environment | Development/test store may be classified as `sandbox`; production store is separate | Production only; no public sandbox | No arbitrary provider host can be supplied |
 | Change intake | Signed webhooks plus scheduled reconciliation are provider-available | Cursor/high-water polling; no public webhooks | Shopify accepts only enumerated non-customer control-plane webhook evidence. Development-gated catalog and current-order workers run from verified read scopes without another authorization when Operations is eligible. Shopify current-order staging stays inside one 60-day time-fenced session; Faire follows a bounded encrypted live cursor and still requires exact-record refresh plus **Check for newer orders** before validation. Production workers remain inactive |
-| Catalog/inventory/orders | GraphQL capabilities are scope-dependent, including protected/restricted scopes | Public brand scopes cover product, inventory, order, shipment, retailer, and review reads/writes as documented | Separate bounded catalog reads stage provider product/variant mapping candidates; separate bounded order reads stage nonterminal orders. The CRM catalog remains authoritative, inventory is not synchronized, closed history is not imported, and no provider write path exists |
+| Catalog/inventory/orders | GraphQL capabilities are scope-dependent, including protected/restricted scopes | Public brand scopes cover product, inventory, order, shipment, retailer, and review reads/writes as documented | Separate bounded catalog reads stage provider product/variant mapping candidates; separate bounded order reads stage nonterminal orders. A distinct development-only command reads and reconciles one complete eligible Shopify location into exact mapped-product balances. The CRM catalog remains authoritative, Faire inventory is not synchronized, closed history is not imported, and no provider write path exists |
 | Returns/refunds | Shopify Return objects require their own read scope; order access alone is insufficient | Order item states may expose return outcomes, but no public return/RMA/refund write contract is claimed | The preview does not request Return objects; no canonical returns or refund worker is implemented |
 | Fulfillment/tracking | Fulfillment Orders and related scopes are resource-assignment-specific | Documented order shipment writes are available | Merchant-managed fulfillment-order access alone does not cover assigned or third-party fulfillment orders; no authorized fulfillment-export dispatcher invokes provider clients |
 
@@ -100,6 +346,16 @@ Migration `0113` adds a separate ephemeral diagnostic boundary in `operations_co
 
 Preview runs and rows cannot be updated and expire no later than 24 hours. One held run may exist per Shopify account, and a successful replacement deletes the earlier run atomically. Expired rows are purged opportunistically when preview or Sales Channels activity occurs; a manager can clear them earlier, and disconnect clears all held runs for that Shopify account. Every preview run is constrained to zero canonical orders and Shopify writes with no sync-cursor advancement. `read_all_orders` only extends Shopify's eligible history beyond the default 60-day order window; it does not expand the newest-25 preview or turn the separate operational workflow into historical import. Missing `read_returns`, `read_assigned_fulfillment_orders`, or `read_third_party_fulfillment_orders` remains visible as return and fulfillment-coverage gaps even when `read_merchant_managed_fulfillment_orders` is granted. The capability catalog reports operator-controlled `order_import` separately and keeps `historical_order_import` not implemented.
 
+### Shopify Inventory Reconciliation
+
+Migration `0124` adds a separate development-only, manager-triggered Shopify inventory boundary. It requires Postgres, the commerce-intake feature gate, a configured and verified Shopify account, the exact `read_inventory`, `read_locations`, and `read_products` grant, one active ClawPilot warehouse, and one uniquely eligible active physical Shopify location. An existing location mapping must still resolve to that same eligible provider location. The command cannot create a warehouse, select an arbitrary provider host, register a webhook, advance an order cursor, or make a Shopify mutation.
+
+The adapter reads every bounded page for the selected location and requests `available`, `incoming`, `committed`, `damaged`, `on_hand`, `quality_control`, `reserved`, and `safety_stock`. Each retained level includes the provider inventory-item identity, SKU, tracking policy, per-state quantity evidence, variant/product identity, barcode, title, vendor, product type and status, inventory policy, customs facts, native weight, and other bounded operational product evidence Shopify supplies. Exact length, width, and height are retained only when a merchant metafield definition unambiguously identifies one axis and uses Shopify's single-value `dimension` type. `list.dimension` definitions are retained as ambiguous evidence but are not selected as a physical axis. Missing or ambiguous dimensions stay visible as gaps; ClawPilot does not infer package dimensions from title, image, weight, or unrelated metafields. Provider product evidence does not replace the editable ClawPilot package profile required for cartonization.
+
+The provider response is durably captured before projection, and a successful run retains its request and snapshot hashes, account and credential generation, selected provider and ClawPilot locations, mapping result, quantities, product evidence, projection disposition, and immutable run identity. Unmapped items, untracked items, negative available-to-promise, protected-state anomalies, and quantity-equation mismatches remain held evidence and do not create a favorable balance. Only an exact account-scoped product mapping can project a position.
+
+Shopify is the source authority for projected positions in this slice. For a consistent level, ClawPilot projects `on hand = available + committed`, `reserved = committed`, and `available = Shopify available`. Imported or staged order demand is not subtracted again because Shopify's committed state already represents allocated demand. Shopify-authoritative positions and ledger rows are fenced from ordinary ClawPilot reservation and adjustment paths; only the reconciliation transaction may replace their balances. This command is a point-in-time read and reconciliation, not continuous synchronization, multi-location allocation, an inventory adjustment/export path, a Faire inventory import, or production activation.
+
 ### Commerce Normalization, Resolution, And Promotion
 
 Migration `0114` replaces the diagnostic-only stopping point with provider-neutral product and order candidates for Shopify and Faire while preserving the existing CRM product and customer masters and the `gor`/`gol` order aggregate. Migration `0115` adds durable provider-read intents prepared before network I/O, resource-scoped immutable-lineage continuations whose cursors are AES-GCM encrypted at rest, and first-class record rejections with explicit dispositions. Provider reads normalize into bounded intake candidates; candidates are not a second product or order master. The real operator workflows are:
@@ -108,7 +364,15 @@ Migration `0114` replaces the diagnostic-only stopping point with provider-neutr
 
 `Fetch operational orders -> Fetch next order batch or Check for newer orders -> Resolve -> Validate -> Promote`
 
-The product lane reads bounded Shopify variant pages or Faire product pages into held mapping candidates. Each candidate preserves supported provider product/variant/inventory-item identities, SKU/barcode, title/vendor/type, selected options, current and compare-at price, taxability and shipping requirement when supplied, available-quantity evidence, and weight. Faire uses V2 `prices`, `options`, and item/case measurements; an OAuth connection with `READ_INVENTORIES` hydrates availability in at most 50 variant IDs per request and 20 requests per bounded batch. Negative Faire availability remains signed provider evidence and `UNTRACKED` remains unknown; neither updates the WMS inventory ledger. An operator must map each candidate to an active CRM product, explicitly create and map a new CRM product, or exclude the candidate with an audit reason. Explicit creation uses an opaque source identity containing the integration account Global ID, provider, and exact provider variant, so another account cannot accidentally reuse the record by SKU or name. The lane does not synchronize inventory, replace the CRM catalog, or run unattended.
+The product lane reads bounded Shopify variant pages or Faire product pages into held mapping candidates. Each candidate preserves supported provider product/variant/inventory-item identities, SKU/barcode, title/vendor/type, selected options, current and compare-at price, taxability and shipping requirement when supplied, available-quantity evidence, and weight. Faire uses V2 `prices`, `options`, and item/case measurements; an OAuth connection with `READ_INVENTORIES` hydrates availability in at most 50 variant IDs per request and 20 requests per bounded batch. Negative Faire availability remains signed provider evidence and `UNTRACKED` remains unknown; neither updates the WMS inventory ledger. A verified connection authorizes the automatic catalog worker. The worker maps a provider variant to an existing active CRM product only when an exact stable SKU or GTIN/barcode resolves uniquely without conflicting evidence; otherwise it creates a provider-scoped product or leaves the candidate in review. Review offers executable **Map existing**, **Create and map**, and audited **Exclude** actions. The lane does not synchronize inventory, replace the CRM catalog, or write to either provider.
+
+Commerce-created CRM names show the provider product title once and append only meaningful variant option values. A selected option is not appended when that complete phrase is already present in the product title at Unicode alphanumeric boundaries; an option found only inside a larger word remains meaningful, and any other color or size options retain provider order. Shopify `Default Title`, Faire `default`, and a Shopify `displayName` that repeats the full product title are not master-product name content. A `Shopify` or `Faire` suffix is a temporary collision state, not the intended product model. One sellable inventory-and-pack identity owns one canonical `gp` Product whose read-only `salesChannels` field contains its exact provider listings. Each, inner-pack, case, and pallet identities remain separate Products; when their marketing title is otherwise identical, the canonical product name carries a meaningful pack qualifier such as `6 oz each` or `case of 12`, never a provider qualifier.
+
+Migration `0132` keeps each exact sales-channel listing as offer data on that canonical Product instead of flattening provider facts into the CRM master. The durable channel state retains provider product titles, full 512-character variant titles, SKU/barcode, exact wholesale, retail/current, and compare-at minor-unit money with each source currency, taxability, shipping requirement, and provider weight when supplied. The CRM editor presents Shopify selling price as **Current** and its distinct compare-at price as **Compare at**, while Faire retains separate **Wholesale** and **Retail** values and no invented compare-at value. Historical product-candidate money is deliberately not backfilled because those columns have provider-dependent semantics; money remains null until the next verified catalog observation. Reconciliation therefore may choose one canonical identity without relabeling Shopify current price as wholesale, changing either provider currency, or overwriting the editable ClawPilot product price.
+
+Migration `0131` supplies the guarded **Resolve duplicate sales-channel product identities** workflow for records created under the earlier provider-isolation rule. An exact stable SKU or GTIN/barcode match can be reconciled in a reviewed batch. A name match alone never runs automatically and requires an administrator to confirm that the two rows represent the same sellable product and the same pack level. The canonical row is the record already carrying inventory, order, packaging, or CRM relationships; a duplicate that owns any such operational relationship fails closed. Reconciliation moves only the active provider-variant mapping and channel-state projection to the canonical Product, retains the old `gp` Global ID as a permanent alias, archives the duplicate projection, queues the corresponding SuiteCRM projection changes, and records an audit event. Product-list search by that retired Global ID returns the canonical Product, and an authorized deep link resolves the same alias. Reconciliation deletes no Product, rewrites no historical candidate, order, inventory, packaging, or CRM relationship, and sends zero provider writes.
+
+`scripts/reconcile-ag-alchemy-commerce-product-names.mjs` remains the separate bounded development-only repair for display names created under the earlier convention. It is plan-first, checks the compiled Railway project/environment and development database fingerprint, reads the exact creation candidate named in each product source payload, independently locks and fingerprints every active mapping for each target product, and blocks any product that no longer has exactly its one original creation mapping. It also fences the product hash/time and candidate revision, preserves manually changed names, and enforces both the exact execution confirmation and fresh plan fingerprint at the mutation boundary. Apply changes no product, mapping, candidate, inventory, order, package, or provider identity; it queues the renamed product for normal SuiteCRM synchronization, refreshes the pipeline product dropdown, and appends product-level and summary audit evidence as the `system` actor with `is_system = true` and zero provider writes.
 
 **Fetch operational orders** starts a new read-only order session and records its start cutoff as `windowEnd`. Shopify requests non-test `status:open` orders at or before that cutoff and then excludes cancelled, closed, and fulfilled records after normalization. Faire's documented list client in this slice supplies a live cursor rather than a request-time cutoff, so each Faire list candidate carries `source_stale` and cannot validate until the operator selects **Refresh** for an exact `/orders/{id}` read. This is day-to-day open-order intake. It does not backfill closed history or import every historical order. Shopify requires `read_orders` plus `read_all_orders` so an old order that remains open is not hidden by Shopify's ordinary recent-order window; that scope does not turn the workflow into historical import.
 
@@ -153,6 +417,10 @@ Provider write-back is structurally disabled for this workflow. Its provider por
 Candidate party and address fields are tenant-scoped protected operational data. Routes require the active organization plus Operations-management permission, responses use `no-store`, audit payloads exclude the protected values, and candidates, read intents, rejections, and continuations become unavailable after the contracted retention interval. Migration `0115` clears encrypted cursor material when an available continuation is consumed, invalidated, or expired, but this slice does not claim a physical purge worker for intake rows. Promotion retains only the order-time snapshot already required by the canonical order. Provider raw bodies are not stored in the candidate tables.
 
 Shopify and Faire normalizers implement the same versioned envelope and semantic fields without erasing provider differences. Shopify keeps separate order, financial, fulfillment, and return states, shop and presentment money, order-time line snapshots, full provider Global IDs, and field-level unavailable/redacted evidence. Faire keeps its brand/retailer distinction, case-sensitive SKU, physical quantity separately from `unit_multiplier`, brand discounts separately from line discounts, payout facts separately from customer payment state, and an absent inventory quantity separately from zero. A provider-specific field that has no safe canonical meaning remains in typed provider evidence or becomes an explicit unsupported condition; it is never guessed.
+
+Migration `0130` makes one CRM/WMS product the canonical product master while projecting its exact provider variants through a read-only `salesChannels` field. A variant may reuse an existing product only when an exact stable SKU or GTIN/barcode resolves to one non-archived product. Multiple matches and same-SKU records with conflicting known barcodes fail closed; names and inferred pack levels never establish identity, so genuinely different each, inner-pack, and case products remain distinct. The durable channel projection retains raw lifecycle, normalized `active`, `draft`, `archived`, `unlisted`, `unavailable`, or `unknown` state, connection status, environment, external identity, and observation time after intake candidates expire and when an account is disabled or in error. It never changes `crm_products.active`. Shopify explicitly requests `ACTIVE`, `ARCHIVED`, `DRAFT`, and `UNLISTED`, and the UI labels `active` only as **Source active**, not published. Faire sends no active/status list filter and preserves every lifecycle the brand API returns. A record missing from one provider response is not inferred to be archived.
+
+Migration `0131` preserves the same canonical model while reconciling historical provider-isolated Products. The UI exposes the workflow only to authorized product editors with Operations-management authority. Every command carries both Products' source hashes and update timestamps, locks both rows and their active mappings, rechecks operational-reference blockers, and records the old Global ID as an alias before changing the projection. Exact identifier matches and administrator-confirmed same-name/same-pack matches use the same server-owned transaction; neither path treats title as durable identity.
 
 This is a development-only implementation behind `CLAWPILOT_COMMERCE_INTAKE_ENABLED=1`; the runtime refuses production. A product-readable verified connection authorizes catalog sync without a second approval and initializes a missing policy as resumed in the eligible runtime. That initialization is distinct from worker queueing: the leased job queues and executes only after the current product-read scope, credential generation, policy revision, and configured `shadow` or `active` Operations product target are eligible. Interactive reads and decisions remain gated by manager authority and `shadow` or `active` organization activation. A verified connection whose organization is missing activation, `disabled`, or `read_only` exposes an authorized **Enable Shadow** command in the intake workflow. That command configures the reviewed Operations target and requires explicit confirmation, organization activation authority, a current verified account, and an exact expected state-and-revision fence (or an exact missing-state sentinel) under the activation lock; it is not a second provider or catalog authorization and cannot override `frozen`, `active`, or a concurrent activation change. These contracts do not claim a successful hosted Shopify or Faire read, catalog mapping, rejection recovery, or order promotion until separate development deployment and browser acceptance evidence is recorded.
 
@@ -243,7 +511,8 @@ The route handler authenticates and validates transport. The application service
 - Quote, return, inventory unit/LPN, lot, serial, receipt, manifest, and any separate fulfillment-order identities must be allocated before those aggregates ship.
 - Cross-module payloads carry Global IDs. Database relationships also carry tenant-scoped UUID foreign keys for integrity.
 - Money uses integer minor units plus ISO 4217 currency. Percentage and quantity calculations use PostgreSQL `numeric`; binary floating point is forbidden for authoritative results.
-- Weight, dimensions, volume, quantity, and UOM are explicit. The first slice normalizes weight to grams and dimensions to millimeters but retains source unit and conversion provenance.
+- An organization currency preference is a default for new ClawPilot-entered Product money, not an exchange-rate engine. Source and record currency always win; the application never converts, relabels, or aggregates mixed currencies under the preference.
+- Weight, dimensions, volume, quantity, and UOM are explicit. Product, package, and shipment dimensions remain canonical integer millimeters and their weights remain canonical integer grams; existing warehouse-capacity volume and weight remain cubic meters and kilograms. Metric or imperial preference changes presentation and entry conversion only and never rewrites canonical facts. User-editable fields and corrective copy must use the effective preference or unit-neutral wording. Canonical optimizer facts and provider/printer source evidence may retain their native units only when clearly labeled as evidence; provider/source unit and conversion provenance remain independent evidence and do not choose a viewer's display system.
 - Canonical timestamps are UTC. Warehouse calendars, cutoffs, and display calculations name an IANA facility timezone.
 - Address, product, contract, inventory, carton, rate, and rule inputs used for a promise or charge are versioned snapshots; later master-data edits do not rewrite history.
 
@@ -611,11 +880,11 @@ The input uses integer minor-unit costs, normalized integer measurements, stable
 
 The current repository includes a disabled-by-default Python 3.13 / Google OR-Tools `9.15.6755` CP-SAT service under `services/fulfillment-optimizer` plus a TypeScript adapter under the same transport-neutral boundary. The service has no database, provider credential, browser session, or domain-write authority. Its authenticated bounded v1 endpoint expands integer line quantities into exact units, constrains those units to eligible inventory positions, approved warehouses, and available carton slots, and proves three-dimensional non-overlap using allowed item rotations. It minimizes warehouse count, shipment/carton count, supplied estimated cost, unused volume, and then stable identifiers as separate lexicographic solves under one deadline. The adapter requires an explicit enable flag, HTTPS URL, bearer secret, and timeout; validates the canonical input-hash echo, every returned reference, position balance, line quantity, weight, volume, rotation, 3D placement, carton availability, split limit, cost, and stable plan totals; and invokes the existing deterministic single-warehouse fallback on service unavailability, timeout, or invalid output.
 
-The input carries an explicit allowed-warehouse set. An organization snapshot containing one allowed warehouse can never produce a second facility or split plan. Generic multi-warehouse planning remains available only when the immutable snapshot names multiple eligible facilities and its split policy explicitly permits them. The future snapshot assembler may project carton candidates only from active packaging materials joined to the selected active warehouse's available, positive on-hand packaging stock; drafts, unavailable stock, and zero-stock rows are ineligible. Cartons, inventory, historical demand, and carrier-derived costs must be supplied as versioned facts; neither implementation invents them.
+The input carries an explicit allowed-warehouse set. An organization snapshot containing one allowed warehouse can never produce a second facility or split plan. Generic multi-warehouse planning remains available only when the immutable snapshot names multiple eligible facilities and its split policy explicitly permits them. The strict development preview projects carton candidates only from active packaging materials joined to the selected active warehouse's available, positive on-hand packaging stock; drafts, unavailable stock, and zero-stock rows are ineligible. A future hosted planner must retain that rule. Cartons, inventory, historical demand, and carrier-derived costs must be supplied as versioned facts; neither implementation invents them.
 
 Packaging-material assortment selection is a separate authenticated v1 operation. It accepts only operator-supplied candidate boxes/poly mailers, versioned historical demand frequency, and precomputed feasible landed-cost/waste edges. Hard coverage is the default, while any lower coverage threshold and maximum material-SKU count must be explicit. It lexicographically minimizes frequency-weighted landed cost, active material count, weighted waste, and stable identifiers. This operation is a design aid for maintaining a manageable warehouse material catalog; it does not cartonize an order, call a carrier, activate a material, or write a catalog.
 
-This code foundation is not connected to hosted order planning and does not imply a deployed optimizer. Activation still requires a real warehouse carton catalog, immutable input/result persistence, service deployment and health, timeout/fallback observability, operator acceptance, and the Phase 3 promotion gates.
+The OR-Tools service itself has a Railway development deployment and health evidence. Its only current application caller is the separately gated working-tree Shopify cartonization preview above, which requires OR-Tools and fails closed rather than accepting a deterministic fallback. This is not hosted order planning or production optimizer activation. There is no accepted-plan command, immutable input/result store, package-allocation write, packing-list execution, transport-rate input, or shipment split in this preview. Hosted activation still requires a real eligible warehouse carton catalog, durable input/result persistence, timeout/failure observability, explicit operator acceptance with exact revisions, and the Phase 3 promotion gates.
 
 ### Objective Contract
 
@@ -695,7 +964,10 @@ The adapter reads approved immutable billable facts and credits, produces a vers
 
 ## Foundation Limitations
 
-Before this contract can become active, implementation must close the blockers in the [integration and gap map](../maps/distributed-operations-integration-gap-map.md), especially fine-grained permissions, canonical commerce receipt/poll processing, leased reconciliation and replay commands, tracking ingestion, commerce-export dispatch, queue/throughput health, quote and optimizer snapshots, split-plan representation, advanced inventory dimensions, billable lifecycle separation, and shared-service adapters. `0111` and `0112` close bounded credential, OAuth-staging, signed-receipt, cursor, and evidence-schema portions. `0113` adds only a disposable Shopify diagnostic preview. `0114` and `0115` close the bounded manager-driven catalog-mapping and operational-order workflow through durable pre-call read intent, resource-scoped pagination, row-versioned rejection disposition, explicit resolution, exact Faire order refresh, canonical-money reconciliation, and promotion. They do not close historical import, provider inventory synchronization, continuous full-catalog reconciliation, unattended receipt/poll workers, returns or full fulfillment-order coverage, durable reconciliation, or production activation.
+Before this contract can become active, implementation must close the blockers in the [integration and gap map](../maps/distributed-operations-integration-gap-map.md), especially fine-grained permissions, canonical commerce receipt/poll processing, leased reconciliation and replay commands, tracking ingestion, commerce-export dispatch, queue/throughput health, quote and optimizer snapshots, split-plan representation, advanced inventory dimensions, billable lifecycle separation, and shared-service adapters. `0111` and `0112` close bounded credential, OAuth-staging, signed-receipt, cursor, and evidence-schema portions. `0113` adds only a disposable Shopify diagnostic preview. `0114` and `0115` close the bounded manager-driven catalog-mapping and operational-order workflow through durable pre-call read intent, resource-scoped pagination, row-versioned rejection disposition, explicit resolution, exact Faire order refresh, canonical-money reconciliation, and promotion. `0124` adds only the bounded manager-triggered development Shopify location mapping, provider capture, all-state inventory evidence, and source-authority projection described above. `0125` adds only the tenant-safe organization/user preference store, optimistic organization-default command, pure conversion/formatting boundary, and application provider; it does not convert stored domain facts or claim every Operations surface has completed its display migration. `0127` adds the organization ISO 4217 default, guarded update and SuiteCRM Product currency projection; it does not invent exchange rates, convert existing amounts, assign currency to currency-less historical records, or change provider-owned money. These migrations do not close historical import, continuous or multi-location provider inventory synchronization, unattended inventory/receipt/poll workers, Faire inventory reconciliation, provider inventory writes, returns or full fulfillment-order coverage, recurring reconciliation and recovery operations, or production activation.
+
+Migration `0126` changes no measurement fact and does not activate any starter
+material; it only removes an imperial-only label from untouched starter rows.
 
 ## Connected Notes
 

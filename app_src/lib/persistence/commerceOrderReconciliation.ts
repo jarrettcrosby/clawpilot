@@ -65,7 +65,7 @@ export async function claimCommerceOrderReconciliationTargetsInPostgres(input: {
       provider: 'shopify' | 'faire'
       credential_version: number
       continuation_run_global_id: string | null
-      started_at: Date
+      last_started_at: Date
     }>(
       `WITH candidates AS (
          SELECT
@@ -223,14 +223,17 @@ export async function claimCommerceOrderReconciliationTargetsInPostgres(input: {
       [Math.max(1, Math.min(Number(input.limit || 1), 5))],
     )
     return claimed.rows
-      .filter((row) => row.account_global_id && row.provider)
+      .filter((row) => (
+        row.account_global_id
+        && row.provider
+      ))
       .map((row): CommerceOrderReconciliationTarget => ({
         organizationId: row.organization_id,
         integrationAccountId: row.integration_account_id,
         accountGlobalId: row.account_global_id,
         provider: row.provider,
         credentialVersion: Number(row.credential_version),
-        startedAt: row.started_at.toISOString(),
+        startedAt: row.last_started_at.toISOString(),
         continuationRunGlobalId: row.continuation_run_global_id || null,
       }))
   })

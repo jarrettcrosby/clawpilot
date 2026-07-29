@@ -69,7 +69,9 @@ import PackagingMaterialsPanel from '@/components/operations/PackagingMaterialsP
 import PrinterConfigurationPanel from '@/components/operations/PrinterConfigurationPanel'
 import ReceivingPanel from '@/components/operations/ReceivingPanel'
 import WarehouseSetupPanel from '@/components/operations/WarehouseSetupPanel'
+import { useMeasurementSystem } from '@/components/measurements/MeasurementSystemProvider'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
+import { formatDimensionsMm, formatGrams } from '@/lib/measurements'
 import { formatUserDateTime } from '@/lib/userDateTime'
 
 type OperationsPayload = {
@@ -280,6 +282,7 @@ function OrderDetailDrawer({
   const theme = useTheme()
   const mobile = useMediaQuery(theme.breakpoints.down('md'))
   const dateTime = useUserDateTime()
+  const { measurementSystem } = useMeasurementSystem()
   const releaseAction = order?.availableActions?.find((item) => item.action === 'release_to_warehouse')
   const confirmPicksAction = order?.availableActions?.find((item) => item.action === 'confirm_picks')
   const verifyPackAction = order?.availableActions?.find((item) => item.action === 'verify_pack')
@@ -512,9 +515,17 @@ function OrderDetailDrawer({
                             </Typography>
                           </Box>
                           <Box sx={{ textAlign: 'right' }}>
-                            <Typography>{item.weightGrams} g</Typography>
+                            <Typography>
+                              {formatGrams(item.weightGrams, measurementSystem, {
+                                maximumFractionDigits: 3,
+                              })}
+                            </Typography>
                             <Typography variant="caption" color="text.secondary">
-                              {item.dimensionsMm.length} × {item.dimensionsMm.width} × {item.dimensionsMm.height} mm
+                              {formatDimensionsMm({
+                                lengthMm: item.dimensionsMm.length,
+                                widthMm: item.dimensionsMm.width,
+                                heightMm: item.dimensionsMm.height,
+                              }, measurementSystem, { maximumFractionDigits: 3 })}
                             </Typography>
                           </Box>
                         </Stack>
