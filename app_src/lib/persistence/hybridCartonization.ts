@@ -43,7 +43,12 @@ export type HybridCartonizationInventoryProductEvidence = {
   assumedCommittedQuantity: number
   effectiveAvailableQuantity: number
   sourceLevelGlobalIds: string[]
+  sourceProjectionStates: HybridCartonizationInventoryProjectionState[]
 }
+
+export type HybridCartonizationInventoryProjectionState =
+  | 'projected'
+  | 'negative_available'
 
 export type HybridCartonizationReadResult = {
   readAt: string
@@ -267,6 +272,7 @@ type InventoryProductRow = {
   operational_available_quantity: string
   provider_committed_quantity: string
   source_level_global_ids: string[]
+  source_projection_states: HybridCartonizationInventoryProjectionState[]
 }
 
 type ReadTimeRow = {
@@ -284,6 +290,7 @@ type InventoryEvaluationPosition = {
   operationalAvailableQuantity: number
   providerCommittedQuantity: number
   sourceLevelGlobalIds: string[]
+  sourceProjectionStates: HybridCartonizationInventoryProjectionState[]
 }
 
 export class HybridCartonizationPersistenceError extends Error {
@@ -602,6 +609,7 @@ export function evaluateHybridCartonizationInventoryAvailability(input: {
       assumedCommittedQuantity: total.assumed,
       effectiveAvailableQuantity,
       sourceLevelGlobalIds: position?.sourceLevelGlobalIds || [],
+      sourceProjectionStates: position?.sourceProjectionStates || [],
     })
   }
   return {
@@ -612,6 +620,14 @@ export function evaluateHybridCartonizationInventoryAvailability(input: {
       left.productGlobalId.localeCompare(right.productGlobalId)
     )),
   }
+}
+
+export function hybridCartonizationInventoryProjectionStates(
+  mode: HybridCartonizationReadRequest['mode'],
+): HybridCartonizationInventoryProjectionState[] {
+  return mode === 'sandbox_demo'
+    ? ['projected', 'negative_available']
+    : ['projected']
 }
 
 async function readAccount(
@@ -1430,7 +1446,11 @@ async function readInventoryProducts(
        sum(level.provider_committed_quantity)::text
          AS provider_committed_quantity,
        array_agg(level.global_id ORDER BY level.global_id)
-         AS source_level_global_ids
+         AS source_level_global_ids,
+       array_agg(
+         DISTINCT level.projection_state
+         ORDER BY level.projection_state
+       ) AS source_projection_states
      FROM operations_commerce_inventory_levels level
      JOIN crm_products product
        ON product.pipeline_id = level.pipeline_id
@@ -1440,10 +1460,16 @@ async function readInventoryProducts(
        AND level.warehouse_id = $3::uuid
        AND level.sync_run_id = $4::uuid
        AND level.mapping_state = 'mapped'
-       AND level.projection_state = 'projected'
+       AND level.projection_state = ANY($5::text[])
      GROUP BY level.product_id, product.reference_code
      ORDER BY product.reference_code`,
-    [input.organizationId, account.id, warehouse.id, inventoryRun.id],
+    [
+      input.organizationId,
+      account.id,
+      warehouse.id,
+      inventoryRun.id,
+      hybridCartonizationInventoryProjectionStates(input.mode),
+    ],
   )
   return result.rows.map((row): InventoryEvaluationPosition => ({
     productGlobalId: row.product_global_id,
@@ -1456,6 +1482,7 @@ async function readInventoryProducts(
       `${row.product_global_id} provider committed quantity`,
     ),
     sourceLevelGlobalIds: row.source_level_global_ids,
+    sourceProjectionStates: row.source_projection_states,
   }))
 }
 

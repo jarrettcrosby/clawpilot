@@ -53,8 +53,22 @@ vm.runInNewContext(output, {
 const {
   HybridCartonizationPersistenceError,
   evaluateHybridCartonizationInventoryAvailability,
+  hybridCartonizationInventoryProjectionStates,
   normalizeHybridCartonizationReadRequest,
 } = module.exports
+
+assert.deepEqual(
+  JSON.parse(JSON.stringify(
+    hybridCartonizationInventoryProjectionStates('production'),
+  )),
+  ['projected'],
+)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(
+    hybridCartonizationInventoryProjectionStates('sandbox_demo'),
+  )),
+  ['projected', 'negative_available'],
+)
 
 const validRequest = {
   organizationId: '00000000-0000-4000-8000-000000000001',
@@ -119,6 +133,7 @@ const inventory = evaluateHybridCartonizationInventoryAvailability({
     operationalAvailableQuantity: 1,
     providerCommittedQuantity: 2,
     sourceLevelGlobalIds: ['giil0000001'],
+    sourceProjectionStates: ['projected'],
   }],
   assumedCommittedQuantities:
     validRequest.assumedCommittedQuantities,
@@ -133,6 +148,42 @@ assert.deepEqual(
     assumedCommittedQuantity: 2,
     effectiveAvailableQuantity: 3,
     sourceLevelGlobalIds: ['giil0000001'],
+    sourceProjectionStates: ['projected'],
+  },
+)
+
+const negativeAvailableCommittedEvidence =
+  evaluateHybridCartonizationInventoryAvailability({
+    lines: [{
+      lineGlobalId: 'gcol0000001',
+      productGlobalId: 'gp0000001',
+      requiredQuantity: 2,
+    }],
+    positions: [{
+      productGlobalId: 'gp0000001',
+      operationalAvailableQuantity: 0,
+      providerCommittedQuantity: 2,
+      sourceLevelGlobalIds: ['giil0000001'],
+      sourceProjectionStates: ['negative_available'],
+    }],
+    assumedCommittedQuantities: [{
+      lineGlobalId: 'gcol0000001',
+      quantity: 2,
+    }],
+  })
+assert.deepEqual(
+  JSON.parse(JSON.stringify(
+    negativeAvailableCommittedEvidence.products[0],
+  )),
+  {
+    productGlobalId: 'gp0000001',
+    requiredQuantity: 2,
+    operationalAvailableQuantity: 0,
+    providerCommittedQuantity: 2,
+    assumedCommittedQuantity: 2,
+    effectiveAvailableQuantity: 2,
+    sourceLevelGlobalIds: ['giil0000001'],
+    sourceProjectionStates: ['negative_available'],
   },
 )
 assert.throws(
@@ -147,6 +198,7 @@ assert.throws(
       operationalAvailableQuantity: 0,
       providerCommittedQuantity: 1,
       sourceLevelGlobalIds: ['giil0000001'],
+      sourceProjectionStates: ['projected'],
     }],
     assumedCommittedQuantities: [{
       lineGlobalId: 'gcol0000001',
@@ -171,6 +223,7 @@ assert.throws(
       operationalAvailableQuantity: 1,
       providerCommittedQuantity: 0,
       sourceLevelGlobalIds: ['giil0000001'],
+      sourceProjectionStates: ['projected'],
     }],
     assumedCommittedQuantities: [{
       lineGlobalId: 'gcol0000001',
@@ -206,7 +259,8 @@ for (const contract of [
   'recipe.input_pack_profile_version_id',
   'recipe.packaging_material_id = ANY($3::uuid[])',
   'recipe.is_current = true',
-  "level.projection_state = 'projected'",
+  'level.projection_state = ANY($5::text[])',
+  'hybridCartonizationInventoryProjectionStates(input.mode)',
 ]) {
   assert.ok(source.includes(contract), `Missing persistence contract: ${contract}`)
 }

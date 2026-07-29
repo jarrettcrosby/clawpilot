@@ -212,6 +212,13 @@ material, recipe, inventory, order, shipment, label, print, or provider
 records; only append-only ClawPilot evidence and carrier-rate request rows are
 written.
 
+For `sandbox_demo` only, mapped `negative_available` inventory evidence may
+retain its exact provider-committed quantity while operational ATP remains
+zero. The operator must still attribute that committed quantity explicitly per
+line, and the assumption cannot exceed provider evidence. Production remains
+fail closed to `projected` inventory evidence only. This exception never turns
+negative availability into ATP and performs no inventory or provider write.
+
 Migration `0138` closes three evidence-integrity gaps. Every planned package
 now retains immutable child rows for all contributing approved recipes,
 Products, and input-profile revisions, including mixed-product cartons. The

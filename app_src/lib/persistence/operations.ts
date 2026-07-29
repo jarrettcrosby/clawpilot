@@ -77,6 +77,7 @@ type ProductRow = QueryResultRow & {
   price: string
 }
 type IdRow = QueryResultRow & { id: string; global_id: string }
+type OrderLineIdentityRow = IdRow & { external_line_id: string }
 type WarehouseRow = QueryResultRow & {
   id: string
   global_id: string
@@ -5750,7 +5751,7 @@ export async function runMockOperationsProofFromPostgres(input: {
     })
 
     const fulfillmentLines: Array<{
-      orderLine: IdRow
+      orderLine: OrderLineIdentityRow
       product: ProductRow
       position: PositionRow
       quantity: number
@@ -5763,13 +5764,13 @@ export async function runMockOperationsProofFromPostgres(input: {
       if (!product) throw new Error('OPERATIONS_PRODUCT_RESOLUTION_MISSING')
       const position = configuration.positions.get(product.id)
       if (!position) throw new Error('OPERATIONS_INVENTORY_POSITION_MISSING')
-      const orderLineResult = await client.query<IdRow>(
+      const orderLineResult = await client.query<OrderLineIdentityRow>(
         `INSERT INTO operations_order_lines (
            organization_id, order_id, pipeline_id, product_id, external_line_id,
            channel_sku, description, quantity, unit_price_minor, weight_grams, dimensions_mm
          ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5,
            $6, $7, $8, $9, $10, $11::jsonb)
-         RETURNING id::text, global_id`,
+         RETURNING id::text, global_id, external_line_id`,
         [
           organizationId,
           order.id,
