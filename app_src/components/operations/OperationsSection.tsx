@@ -45,6 +45,7 @@ import PrintRounded from '@mui/icons-material/PrintRounded'
 import RefreshRounded from '@mui/icons-material/RefreshRounded'
 import ReplayRounded from '@mui/icons-material/ReplayRounded'
 import SearchRounded from '@mui/icons-material/SearchRounded'
+import ScienceRounded from '@mui/icons-material/ScienceRounded'
 import TaskAltRounded from '@mui/icons-material/TaskAltRounded'
 import WarningAmberRounded from '@mui/icons-material/WarningAmberRounded'
 import WarehouseRounded from '@mui/icons-material/WarehouseRounded'
@@ -67,6 +68,7 @@ import GlCodingPanel from '@/components/operations/GlCodingPanel'
 import CommerceImportsPanel from '@/components/operations/CommerceImportsPanel'
 import PackagingMaterialsPanel from '@/components/operations/PackagingMaterialsPanel'
 import PrinterConfigurationPanel from '@/components/operations/PrinterConfigurationPanel'
+import PackRateReplayPanel from '@/components/operations/PackRateReplayPanel'
 import ReceivingPanel from '@/components/operations/ReceivingPanel'
 import WarehouseSetupPanel from '@/components/operations/WarehouseSetupPanel'
 import { useMeasurementSystem } from '@/components/measurements/MeasurementSystemProvider'
@@ -95,6 +97,7 @@ export type OperationsView =
   | 'receiving'
   | 'warehouses'
   | 'packaging-materials'
+  | 'replays'
   | 'carrier-invoices'
   | 'gl-coding'
   | 'printing'
@@ -1721,6 +1724,8 @@ export default function OperationsSection({
         ? 'Warehouse network'
       : view === 'packaging-materials'
         ? 'Packaging materials'
+      : view === 'replays'
+        ? 'Pack & rate replay'
       : 'Order Workbench'
   const subheading = view === 'carrier-invoices'
     ? 'Import carrier bills and preserve account, shipment-match, and actual-cost evidence'
@@ -1736,6 +1741,8 @@ export default function OperationsSection({
         ? 'Facilities, inbound staging, storage bins, fulfillment locations, and returns'
       : view === 'packaging-materials'
         ? 'Cartons, mailers, warehouse stock, reorder readiness, and optimizer evidence'
+      : view === 'replays'
+        ? 'Replay historical orders through checkout estimation and fulfillment execution using recorded carrier responses'
       : `Distributed fulfillment${workspace ? ` · CRM: ${workspace.dataPipeline.name}` : ''}`
 
   return (
@@ -1874,6 +1881,7 @@ export default function OperationsSection({
             />
             <Tab value="warehouses" icon={<WarehouseRounded fontSize="small" />} iconPosition="start" label="Warehouses" />
             <Tab value="packaging-materials" icon={<Inventory2Rounded fontSize="small" />} iconPosition="start" label="Packaging materials" />
+            <Tab value="replays" icon={<ScienceRounded fontSize="small" />} iconPosition="start" label="Pack & rate replay" />
             <Tab value="carrier-invoices" label="Carrier invoicing" />
             <Tab value="gl-coding" label="Shipment pricing & GL" />
             <Tab value="printing" icon={<PrintRounded fontSize="small" />} iconPosition="start" label="Printing" />
@@ -1942,6 +1950,8 @@ export default function OperationsSection({
           />
         ) : view === 'packaging-materials' ? (
           <PackagingMaterialsPanel />
+        ) : view === 'replays' ? (
+          <PackRateReplayPanel />
         ) : view === 'carrier-invoices' ? (
           <GlCodingPanel mode="carrier-invoices" />
         ) : view === 'gl-coding' ? (

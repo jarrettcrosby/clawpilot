@@ -30,6 +30,7 @@ import Inventory2Rounded from '@mui/icons-material/Inventory2Rounded'
 import MoveToInboxRounded from '@mui/icons-material/MoveToInboxRounded'
 import PrintRounded from '@mui/icons-material/PrintRounded'
 import ReceiptLongRounded from '@mui/icons-material/ReceiptLongRounded'
+import ScienceRounded from '@mui/icons-material/ScienceRounded'
 import SpaceDashboardRounded from '@mui/icons-material/SpaceDashboardRounded'
 import WarningAmberRounded from '@mui/icons-material/WarningAmberRounded'
 import WarehouseRounded from '@mui/icons-material/WarehouseRounded'
@@ -79,6 +80,11 @@ const OPERATIONS_CHILDREN: NavigationChild[] = [
     id: 'operations/packaging-materials',
     label: 'Packaging materials',
     Icon: Inventory2Rounded,
+  },
+  {
+    id: 'operations/replays',
+    label: 'Pack & rate replay',
+    Icon: ScienceRounded,
   },
   {
     id: 'operations/carrier-invoices',
