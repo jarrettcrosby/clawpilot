@@ -105,6 +105,9 @@ const integrityMigration = read(
 const scaleMigration = read(
   'db/migrations/0142_operations_cartonization_evidence_scale.sql',
 )
+const shipmentRateMigration = read(
+  'db/migrations/0143_operations_cartonization_shipment_rates.sql',
+)
 const persistence = read(
   'app_src/lib/persistence/cartonizationRateEvidence.ts',
 )
@@ -185,14 +188,42 @@ assertIncludes(scaleMigration, [
   'validate_operations_cartonization_rate_evidence_complete()',
   'package_count NOT BETWEEN 1 AND 64',
   'one UPS and one FedEx quote per package',
-], 'Scaled physical-package evidence contract')
+], 'Legacy scaled physical-package evidence contract')
+assertIncludes(shipmentRateMigration, [
+  "'cartonization_shipment_rate'",
+  "SET DEFAULT 'cartonization_shipment_rate'",
+  'package_count NOT BETWEEN 1 AND 50',
+  'jsonb_agg(',
+  'ORDER BY package.package_sequence, package.package_key',
+  "rate.redacted_request #> '{shipment,parcels}'",
+  'IS DISTINCT FROM ordered_parcels',
+  'count(DISTINCT (\n        quote.provider, quote.carrier_rate_request_id',
+  'count(DISTINCT quote.carrier_rate_request_id) <> 1',
+  'count(DISTINCT quote.package_rate_context_hash) <> 1',
+  "'multi_package_shipment'",
+  'Cartonization evidence cannot mix package and shipment rate purposes',
+], 'Whole-shipment carrier evidence migration')
 
 assertIncludes(persistence, [
   'export function cartonizationRateEvidenceHash',
-  'MAX_CARTONIZATION_RATE_EVIDENCE_PACKAGES = 64',
+  'MAX_CARTONIZATION_RATE_EVIDENCE_PACKAGES = 50',
+  'CartonizationRateEvidenceMaterialRateAssumption',
+  'assertCartonizationRateEvidenceMaterialAssumptions',
+  'materialRateAssumptions',
+  'CARTONIZATION_RATE_EVIDENCE_MATERIAL_ASSUMPTION_MISMATCH',
+  'rateContextsByEvidence',
   'export function cartonizationRateEvidenceRequestHash',
   'const packages = [...input.packages].sort(',
   'export function cartonizationPackageRateContextHash',
+  'export function cartonizationShipmentRateContextHash',
+  "carrierRatePurpose: 'cartonization_shipment_rate'",
+  "AND purpose = 'cartonization_shipment_rate'",
+  'const orderedShipmentParcels = [...input.packages]',
+  'rateEvidenceByProvider',
+  'one whole-shipment carrier result for every package',
+  "rateScope !== 'multi_package_shipment'",
+  "rateScope: 'multi_package_shipment'",
+  "shipmentRates",
   'claimCartonizationRateEvidenceCommandInPostgres',
   'failCartonizationRateEvidenceCommandInPostgres',
   'semantic_request_hash',
@@ -231,13 +262,25 @@ assert.doesNotMatch(
 
 assertIncludes(route, [
   'export async function POST(req: NextRequest)',
+  'MAX_SELECTED_MATERIALS = 8',
+  'selected.length < 1',
+  'selected.length > MAX_SELECTED_MATERIALS',
+  'sandboxRateAssumptions',
+  'materialRateAssumptions(request)',
+  'rateAssumptionsByMaterial',
   'readHybridCartonizationInputFromPostgres',
   'readCartonizationRateCandidateContext',
   'planHybridCartonization',
   'claimCartonizationRateEvidenceCommandInPostgres',
   'semanticRequestHash',
+  'const orderedParcels = [...packageInputs]',
+  'left.packageSequence - right.packageSequence',
+  "const providers = ['ups_rest', 'fedex_rest'] as const",
+  'testCarrierSandboxShipmentRate',
+  'parcels: orderedParcels',
+  'shipmentRateEvidenceByProvider',
+  'carrierQuoteEdges: quotes.length',
   'carrierRateReads: 0',
-  "(['ups_rest', 'fedex_rest'] as const)",
   'policyVersion: plan.policyVersion',
   'lineEvidence: read.lineEvidence',
   'writeCartonizationRateEvidenceInPostgres',
@@ -247,6 +290,11 @@ assertIncludes(route, [
   'postagePurchases: 0',
   'providerWrites: 0',
 ], 'Executable package-and-rate workflow')
+assert.doesNotMatch(
+  route,
+  /CARTONIZATION_RATE_EVIDENCE_ONE_MATERIAL_REQUIRED/,
+  'Carrier evidence must not retain the retired one-material restriction',
+)
 
 assertIncludes(integrityMigration, [
   'operations_cartonization_rate_evidence_package_recipes',
@@ -277,8 +325,10 @@ assert.doesNotMatch(
 )
 
 const {
+  assertCartonizationRateEvidenceMaterialAssumptions,
   cartonizationRateEvidenceHash,
   cartonizationRateEvidenceRequestHash,
+  cartonizationShipmentRateContextHash,
   CartonizationRateEvidencePersistenceError,
 } = loadPersistence()
 
@@ -355,6 +405,20 @@ const packages = [packageOne, packageTwo].map((value) => ({
   ...value,
   packageHash: cartonizationRateEvidenceHash(value),
 }))
+const materialRateAssumptions = [
+  {
+    materialGlobalId: 'gmat0000001',
+    expectedRowVersion: 2,
+    ratedOuterDimensionsMm: packageOne.ratedOuterDimensionsMm,
+    tareWeightGrams: packageOne.tareWeightGrams,
+  },
+  {
+    materialGlobalId: 'gmat0000002',
+    expectedRowVersion: 2,
+    ratedOuterDimensionsMm: packageTwo.ratedOuterDimensionsMm,
+    tareWeightGrams: packageTwo.tareWeightGrams,
+  },
+]
 const quotes = packages.flatMap((item) => ([
   {
     packageKey: item.packageKey,
@@ -381,13 +445,67 @@ const request = {
   planInputHash: 'a'.repeat(64),
   planResultHash: cartonizationRateEvidenceHash(planSnapshot),
   planSnapshot,
-  assumptionSnapshot: {},
+  assumptionSnapshot: { materialRateAssumptions },
   status: 'succeeded',
   idempotencyKey: 'cartonization-demo-1',
   actorEmail: 'operator@example.com',
+  materialRateAssumptions,
   packages,
   quotes,
 }
+assert.doesNotThrow(
+  () => assertCartonizationRateEvidenceMaterialAssumptions(request),
+  'Every package must match its retained per-material rating assumptions',
+)
+assert.equal(
+  quotes.length,
+  4,
+  'Two physical packages must retain one UPS and one FedEx quote edge each',
+)
+assert.equal(
+  new Set(quotes.map((quote) => quote.rateEvidenceGlobalId)).size,
+  2,
+  'Every package edge must share exactly one immutable shipment read per provider',
+)
+assert.doesNotMatch(
+  quoteTable,
+  /UNIQUE\s*\([^)]*carrier_rate_request_id/,
+  'One immutable whole-shipment read must support every package edge',
+)
+const orderedContextParcels = [
+  packages[0].carrierParcel,
+  { ...packages[1].carrierParcel, weight: 3.25 },
+]
+const shipmentContextHash = cartonizationShipmentRateContextHash({
+  provider: 'ups_rest',
+  destinationFingerprint: request.destinationFingerprint,
+  parcels: orderedContextParcels,
+})
+assert.notEqual(
+  shipmentContextHash,
+  cartonizationShipmentRateContextHash({
+    provider: 'ups_rest',
+    destinationFingerprint: request.destinationFingerprint,
+    parcels: [...orderedContextParcels].reverse(),
+  }),
+  'Whole-shipment context hashing must preserve physical package order',
+)
+assert.throws(
+  () => assertCartonizationRateEvidenceMaterialAssumptions({
+    ...request,
+    packages: packages.map((item, index) => (
+      index === 0
+        ? { ...item, tareWeightGrams: item.tareWeightGrams + 1 }
+        : item
+    )),
+  }),
+  (error) => (
+    error instanceof CartonizationRateEvidencePersistenceError
+    && error.code
+      === 'CARTONIZATION_RATE_EVIDENCE_MATERIAL_ASSUMPTION_MISMATCH'
+  ),
+  'A package cannot drift from its selected material tare assumption',
+)
 const requestHash = cartonizationRateEvidenceRequestHash(request)
 assert.equal(
   requestHash,
@@ -395,10 +513,11 @@ assert.equal(
     ...request,
     actorEmail: 'retrying-operator@example.com',
     idempotencyKey: 'another-command-key',
+    materialRateAssumptions: [...materialRateAssumptions].reverse(),
     packages: [...packages].reverse(),
     quotes: [...quotes].reverse(),
   }),
-  'Semantic request hashing must ignore actor, command key, and edge ordering',
+  'Semantic request hashing must ignore actor, command key, material order, and edge ordering',
 )
 assert.notEqual(
   requestHash,
@@ -411,6 +530,23 @@ assert.notEqual(
     )),
   }),
   'Semantic request hashing must change when retained package evidence changes',
+)
+assert.notEqual(
+  requestHash,
+  cartonizationRateEvidenceRequestHash({
+    ...request,
+    materialRateAssumptions: materialRateAssumptions.map(
+      (assumption, index) => (
+        index === 0
+          ? {
+              ...assumption,
+              tareWeightGrams: assumption.tareWeightGrams + 1,
+            }
+          : assumption
+      ),
+    ),
+  }),
+  'Semantic request hashing must change when a material rate assumption changes',
 )
 
 console.log('cartonization rate evidence contract tests passed')

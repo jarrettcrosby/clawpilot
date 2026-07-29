@@ -3,7 +3,7 @@ import {
   CarrierIntegrationRequestError,
   getCarrierIntegrationsState,
   sanitizedCarrierIntegrationError,
-  testCarrierSandboxRate,
+  testCarrierSandboxShipmentRate,
 } from '@/lib/integrations/carrierIntegrations'
 import {
   normalizeCarrierSandboxParcel,
@@ -34,6 +34,7 @@ import {
   readCartonizationRateCandidateContext,
   readCartonizationRateEvidenceByGlobalId,
   writeCartonizationRateEvidenceInPostgres,
+  type CartonizationRateEvidenceMaterialRateAssumption,
   type CartonizationRateEvidencePackageInput,
   type CartonizationRateEvidenceQuoteInput,
 } from '@/lib/persistence/cartonizationRateEvidence'
@@ -50,6 +51,7 @@ export const maxDuration = 60
 
 const EVIDENCE_GLOBAL_ID = /^gcte[0-9]{7}$/
 const MAX_REQUEST_BYTES = 32 * 1024
+const MAX_SELECTED_MATERIALS = 8
 const MILLIMETERS_PER_INCH = 25.4
 const GRAMS_PER_POUND = 453.59237
 
@@ -61,6 +63,14 @@ type NormalizedRateEvidenceRequest = {
   selectedMaterials: Array<{
     materialGlobalId: string
     expectedRowVersion: number
+    sandboxRateAssumptions: {
+      ratedOuterDimensionsMm: {
+        length: number
+        width: number
+        height: number
+      }
+      tareWeightGrams: number
+    }
   }>
   assumedCommittedQuantities: Array<{
     lineGlobalId: string
@@ -69,12 +79,6 @@ type NormalizedRateEvidenceRequest = {
   sandboxAssumptions: {
     acknowledged: true
     reason: string
-    ratedOuterDimensionsMm: {
-      length: number
-      width: number
-      height: number
-    }
-    tareWeightGrams: number
     allowUnderMinimum: boolean
     assumedMinimumInputQuantity: number | null
   }
@@ -191,24 +195,73 @@ async function requestBody(req: NextRequest) {
 function normalizeRequest(value: unknown): NormalizedRateEvidenceRequest {
   const input = record(value, 'Request body')
   const selected = input.selectedMaterials
-  if (!Array.isArray(selected) || selected.length !== 1) {
+  if (
+    !Array.isArray(selected)
+    || selected.length < 1
+    || selected.length > MAX_SELECTED_MATERIALS
+  ) {
     requestError(
-      'Select exactly one packaging material for a carrier comparison',
-      'CARTONIZATION_RATE_EVIDENCE_ONE_MATERIAL_REQUIRED',
+      `Select between one and ${MAX_SELECTED_MATERIALS} packaging materials for a carrier comparison`,
+      'CARTONIZATION_RATE_EVIDENCE_MATERIAL_COUNT_INVALID',
     )
   }
+  const materialGlobalIds = new Set<string>()
   const selectedMaterials = selected.map((entry, index) => {
     const item = record(entry, `Selected material ${index + 1}`)
+    const materialGlobalId = exactReference(
+      item.materialGlobalId,
+      /^gmat[0-9]{7}$/,
+      `Selected material ${index + 1} Global ID`,
+    )
+    if (materialGlobalIds.has(materialGlobalId)) {
+      requestError(
+        'Selected packaging materials must be unique',
+        'CARTONIZATION_RATE_EVIDENCE_MATERIAL_DUPLICATE',
+      )
+    }
+    materialGlobalIds.add(materialGlobalId)
+    const rateAssumptions = record(
+      item.sandboxRateAssumptions,
+      `${materialGlobalId} sandbox rate assumptions`,
+    )
+    const dimensions = record(
+      rateAssumptions.ratedOuterDimensionsMm,
+      `${materialGlobalId} rated exterior dimensions`,
+    )
     return {
-      materialGlobalId: exactReference(
-        item.materialGlobalId,
-        /^gmat[0-9]{7}$/,
-        `Selected material ${index + 1} Global ID`,
-      ),
+      materialGlobalId,
       expectedRowVersion: exactInteger(
         item.expectedRowVersion,
-        `Selected material ${index + 1} row version`,
+        `${materialGlobalId} row version`,
       ),
+      sandboxRateAssumptions: {
+        ratedOuterDimensionsMm: {
+          length: exactInteger(
+            dimensions.length,
+            `${materialGlobalId} rated exterior length`,
+            1,
+            2_743,
+          ),
+          width: exactInteger(
+            dimensions.width,
+            `${materialGlobalId} rated exterior width`,
+            1,
+            2_743,
+          ),
+          height: exactInteger(
+            dimensions.height,
+            `${materialGlobalId} rated exterior height`,
+            1,
+            2_743,
+          ),
+        },
+        tareWeightGrams: exactInteger(
+          rateAssumptions.tareWeightGrams,
+          `${materialGlobalId} sandbox tare weight`,
+          1,
+          68_038,
+        ),
+      },
     }
   })
   if (!Array.isArray(input.assumedCommittedQuantities)) {
@@ -242,10 +295,6 @@ function normalizeRequest(value: unknown): NormalizedRateEvidenceRequest {
       'CARTONIZATION_RATE_EVIDENCE_ACKNOWLEDGEMENT_REQUIRED',
     )
   }
-  const dimensions = record(
-    assumptions.ratedOuterDimensionsMm,
-    'Rated exterior dimensions',
-  )
   const allowUnderMinimum = assumptions.allowUnderMinimum === true
   const assumedMinimumInputQuantity = allowUnderMinimum
     ? exactInteger(
@@ -284,32 +333,6 @@ function normalizeRequest(value: unknown): NormalizedRateEvidenceRequest {
         'Sandbox assumption reason',
         12,
         500,
-      ),
-      ratedOuterDimensionsMm: {
-        length: exactInteger(
-          dimensions.length,
-          'Rated exterior length',
-          1,
-          2_743,
-        ),
-        width: exactInteger(
-          dimensions.width,
-          'Rated exterior width',
-          1,
-          2_743,
-        ),
-        height: exactInteger(
-          dimensions.height,
-          'Rated exterior height',
-          1,
-          2_743,
-        ),
-      },
-      tareWeightGrams: exactInteger(
-        assumptions.tareWeightGrams,
-        'Sandbox tare weight',
-        1,
-        68_038,
       ),
       allowUnderMinimum,
       assumedMinimumInputQuantity,
@@ -430,6 +453,23 @@ function roundCarrierDecimal(value: number) {
   return Math.round(value * 1_000) / 1_000
 }
 
+function materialRateAssumptions(
+  request: NormalizedRateEvidenceRequest,
+): CartonizationRateEvidenceMaterialRateAssumption[] {
+  return request.selectedMaterials
+    .map((material) => ({
+      materialGlobalId: material.materialGlobalId,
+      expectedRowVersion: material.expectedRowVersion,
+      ratedOuterDimensionsMm:
+        material.sandboxRateAssumptions.ratedOuterDimensionsMm,
+      tareWeightGrams:
+        material.sandboxRateAssumptions.tareWeightGrams,
+    }))
+    .sort((left, right) => (
+      left.materialGlobalId.localeCompare(right.materialGlobalId)
+    ))
+}
+
 function minimumOverrides(
   request: NormalizedRateEvidenceRequest,
   input: Awaited<
@@ -490,6 +530,14 @@ export async function POST(req: NextRequest) {
     assertCommerceIntakeRuntime()
     const organizationId = activeOperationsOrganizationId(actor)
     const request = normalizeRequest(await requestBody(req))
+    const selectedMaterialRateAssumptions =
+      materialRateAssumptions(request)
+    const rateAssumptionsByMaterial = new Map(
+      selectedMaterialRateAssumptions.map((assumption) => [
+        assumption.materialGlobalId,
+        assumption,
+      ]),
+    )
     const read = await readHybridCartonizationInputFromPostgres({
       organizationId,
       accountGlobalId: request.accountGlobalId,
@@ -498,7 +546,10 @@ export async function POST(req: NextRequest) {
         request.expectedCandidateRowVersion,
       warehouseGlobalId: request.warehouseGlobalId,
       mode: 'sandbox_demo',
-      selectedMaterials: request.selectedMaterials,
+      selectedMaterials: request.selectedMaterials.map((material) => ({
+        materialGlobalId: material.materialGlobalId,
+        expectedRowVersion: material.expectedRowVersion,
+      })),
       assumedCommittedQuantities:
         request.assumedCommittedQuantities,
     })
@@ -520,12 +571,24 @@ export async function POST(req: NextRequest) {
     const assumptions = request.sandboxAssumptions
     const plan = planHybridCartonization({
       ...read.input,
-      materials: read.input.materials.map((material) => ({
-        ...material,
-        ratedOuterDimensionsMm:
-          assumptions.ratedOuterDimensionsMm,
-        tareWeightGrams: assumptions.tareWeightGrams,
-      })),
+      materials: read.input.materials.map((material) => {
+        const rateAssumption = rateAssumptionsByMaterial.get(
+          material.materialGlobalId,
+        )
+        if (!rateAssumption) {
+          throw new RateEvidenceRequestError(
+            `${material.materialGlobalId} is missing its sandbox rate assumptions`,
+            400,
+            'CARTONIZATION_RATE_EVIDENCE_MATERIAL_ASSUMPTIONS_MISSING',
+          )
+        }
+        return {
+          ...material,
+          ratedOuterDimensionsMm:
+            rateAssumption.ratedOuterDimensionsMm,
+          tareWeightGrams: rateAssumption.tareWeightGrams,
+        }
+      }),
       minimumInputOverrides: minimumOverrides(
         request,
         read.input,
@@ -579,6 +642,10 @@ export async function POST(req: NextRequest) {
     }
 
     const carrierState = await getCarrierIntegrationsState(organizationId)
+    const carrierAccountGlobalIds = new Map<
+      'ups_rest' | 'fedex_rest',
+      string
+    >()
     for (const provider of ['ups_rest', 'fedex_rest'] as const) {
       const connection = carrierState.accounts.find((account) => (
         account.provider === provider
@@ -604,6 +671,22 @@ export async function POST(req: NextRequest) {
           'CARTONIZATION_RATE_EVIDENCE_ORIGIN_MISMATCH',
         )
       }
+      const senderAccounts = connection.carrierAccounts.filter(
+        (account) => (
+          account.status === 'active'
+          && account.allowSenderBilling
+        ),
+      )
+      if (senderAccounts.length !== 1) {
+        throw new RateEvidenceRequestError(
+          `Exactly one active sender-billing ${
+            provider === 'ups_rest' ? 'UPS' : 'FedEx'
+          } sandbox account is required`,
+          422,
+          'CARTONIZATION_RATE_EVIDENCE_CARRIER_ACCOUNT_REQUIRED',
+        )
+      }
+      carrierAccountGlobalIds.set(provider, senderAccounts[0].globalId)
     }
 
     const packageInputs: CartonizationRateEvidencePackageInput[] =
@@ -619,6 +702,27 @@ export async function POST(req: NextRequest) {
             `Package ${packagePlan.packageKey} is not rate ready`,
             422,
             'CARTONIZATION_RATE_EVIDENCE_PARCEL_FACTS_REQUIRED',
+          )
+        }
+        const rateAssumption = rateAssumptionsByMaterial.get(
+          packagePlan.packagingMaterialGlobalId,
+        )
+        if (
+          !rateAssumption
+          || rateAssumption.expectedRowVersion
+            !== packagePlan.packagingMaterialRowVersion
+          || rateAssumption.tareWeightGrams !== tareWeight
+          || rateAssumption.ratedOuterDimensionsMm.length
+            !== ratedOuter.length
+          || rateAssumption.ratedOuterDimensionsMm.width
+            !== ratedOuter.width
+          || rateAssumption.ratedOuterDimensionsMm.height
+            !== ratedOuter.height
+        ) {
+          throw new RateEvidenceRequestError(
+            `Package ${packagePlan.packageKey} lost its selected material assumptions`,
+            500,
+            'CARTONIZATION_RATE_EVIDENCE_MATERIAL_ASSUMPTION_MISMATCH',
           )
         }
         const recipes = [...new Map(
@@ -717,9 +821,7 @@ export async function POST(req: NextRequest) {
         'ASSUMPTION-BACKED SANDBOX EVIDENCE - NOT EXECUTABLE OR ACTUAL BILLED COST',
       acknowledged: true,
       reason: assumptions.reason,
-      ratedOuterDimensionsMm:
-        assumptions.ratedOuterDimensionsMm,
-      tareWeightGrams: assumptions.tareWeightGrams,
+      materialRateAssumptions: selectedMaterialRateAssumptions,
       allowUnderMinimum: assumptions.allowUnderMinimum,
       assumedMinimumInputQuantity:
         assumptions.assumedMinimumInputQuantity,
@@ -749,6 +851,7 @@ export async function POST(req: NextRequest) {
       planResultHash: cartonizationRateEvidenceHash(planSnapshot),
       planSnapshot,
       assumptionSnapshot,
+      materialRateAssumptions: selectedMaterialRateAssumptions,
       packages: packageInputs,
     }
     const semanticRequestHash =
@@ -806,13 +909,12 @@ export async function POST(req: NextRequest) {
       semanticRequestHash,
     }
 
-    const rateResults: Array<{
-      packageKey: string
-      provider: 'ups_rest' | 'fedex_rest'
-      rateEvidenceGlobalId: string
-    }> = []
-    for (const packageInput of packageInputs) {
-      const parcel = {
+    const orderedParcels = [...packageInputs]
+      .sort((left, right) => (
+        left.packageSequence - right.packageSequence
+        || left.packageKey.localeCompare(right.packageKey)
+      ))
+      .map((packageInput) => ({
         description: packageInput.carrierParcel.description,
         exteriorInches: {
           length: packageInput.carrierParcel.length,
@@ -820,39 +922,63 @@ export async function POST(req: NextRequest) {
           height: packageInput.carrierParcel.height,
         },
         grossPounds: packageInput.carrierParcel.weight,
-      }
-      const providerResults = await Promise.all(
-        (['ups_rest', 'fedex_rest'] as const).map(async (provider) => {
-          const result = await testCarrierSandboxRate({
-            organizationId,
-            provider,
-            environment: 'sandbox',
-            destination: destination.destination,
-            parcel,
-            actorEmail: actor.email,
-          })
-          if (!result.evidenceGlobalId) {
-            throw new CarrierIntegrationRequestError(
-              'Carrier rate evidence was not persisted',
-              503,
-              'CARTONIZATION_RATE_EVIDENCE_CARRIER_WRITE_MISSING',
-            )
-          }
-          return {
-            packageKey: packageInput.packageKey,
-            provider,
-            rateEvidenceGlobalId: result.evidenceGlobalId,
-          }
-        }),
-      )
-      rateResults.push(...providerResults)
-    }
-
+      }))
+    const providers = ['ups_rest', 'fedex_rest'] as const
+    const rateResults = await Promise.all(
+      providers.map(async (provider) => {
+        const carrierAccountGlobalId =
+          carrierAccountGlobalIds.get(provider)
+        if (!carrierAccountGlobalId) {
+          throw new RateEvidenceRequestError(
+            `${provider} lost its selected sender-billing account`,
+            500,
+            'CARTONIZATION_RATE_EVIDENCE_CARRIER_ACCOUNT_REQUIRED',
+          )
+        }
+        const result = await testCarrierSandboxShipmentRate({
+          organizationId,
+          provider,
+          environment: 'sandbox',
+          carrierAccountGlobalId,
+          destination: destination.destination,
+          parcels: orderedParcels,
+          actorEmail: actor.email,
+        })
+        if (!result.evidenceGlobalId) {
+          throw new CarrierIntegrationRequestError(
+            'Carrier shipment-rate evidence was not persisted',
+            503,
+            'CARTONIZATION_RATE_EVIDENCE_CARRIER_WRITE_MISSING',
+          )
+        }
+        return {
+          provider,
+          rateEvidenceGlobalId: result.evidenceGlobalId,
+        }
+      }),
+    )
+    const shipmentRateEvidenceByProvider = new Map(
+      rateResults.map((result) => [
+        result.provider,
+        result.rateEvidenceGlobalId,
+      ]),
+    )
     const quotes: CartonizationRateEvidenceQuoteInput[] =
-      rateResults.map((result) => ({
-        packageKey: result.packageKey,
-        provider: result.provider,
-        rateEvidenceGlobalId: result.rateEvidenceGlobalId,
+      packageInputs.flatMap((packageInput) => providers.map((provider) => {
+        const rateEvidenceGlobalId =
+          shipmentRateEvidenceByProvider.get(provider)
+        if (!rateEvidenceGlobalId) {
+          throw new CarrierIntegrationRequestError(
+            'Shipment-rate evidence was not retained for both carriers',
+            503,
+            'CARTONIZATION_RATE_EVIDENCE_CARRIER_WRITE_MISSING',
+          )
+        }
+        return {
+          packageKey: packageInput.packageKey,
+          provider,
+          rateEvidenceGlobalId,
+        }
       }))
     const evidence = await writeCartonizationRateEvidenceInPostgres({
       organizationId,
@@ -869,6 +995,7 @@ export async function POST(req: NextRequest) {
       planResultHash: cartonizationRateEvidenceHash(planSnapshot),
       planSnapshot,
       assumptionSnapshot,
+      materialRateAssumptions: selectedMaterialRateAssumptions,
       status: 'succeeded',
       idempotencyKey: request.idempotencyKey,
       actorEmail: actor.email,
@@ -886,7 +1013,8 @@ export async function POST(req: NextRequest) {
         labelCalls: 0,
         postagePurchases: 0,
         providerWrites: 0,
-        carrierRateReads: quotes.length,
+        carrierRateReads: rateResults.length,
+        carrierQuoteEdges: quotes.length,
       },
     })
   } catch (error) {

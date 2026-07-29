@@ -9,7 +9,7 @@ const requireFromApp = createRequire(
 )
 const { Pool } = requireFromApp('pg')
 
-export const SCRIPT_VERSION = 'ag-alchemy-pack-hierarchy-v3'
+export const SCRIPT_VERSION = 'ag-alchemy-pack-hierarchy-v4'
 export const TRUSTED_RAILWAY_PROJECT_ID =
   'b5169ebd-8166-4b96-9a81-7cc8adaa9270'
 export const TRUSTED_RAILWAY_DEVELOPMENT_ENVIRONMENT_ID =
@@ -977,6 +977,58 @@ function valuesCompatible(existing, expected, nullableKeys = []) {
   return true
 }
 
+export function legacyRecipeOnlyProfileUpgradeAllowed(
+  existing,
+  candidate,
+  history,
+) {
+  return Boolean(
+    existing
+    && candidate
+    && Number(history?.versionCount) === 1
+    && Number(history?.maximumVersionNumber) === 1
+    && Number(existing.version_number) === 1
+    && Number(existing.row_version) === 0
+    && existing.is_current === true
+    && existing.lifecycle_state === 'customer_confirmed'
+    && Number(existing.base_each_quantity) === 1
+    && existing.unit_of_measure === 'each'
+    && existing.length_mm === null
+    && existing.width_mm === null
+    && existing.height_mm === null
+    && existing.dimension_basis === 'unspecified'
+    && existing.gross_weight_grams === null
+    && existing.weight_basis === 'unspecified'
+    && existing.fit_model === 'rigid_3d'
+    && existing.ships_as_own_package === false
+    && existing.assembly_policy === 'never'
+    && existing.evidence_type === 'customer_confirmed'
+    && existing.evidence_reference === candidate.evidenceReference
+    && existing.confirmed_at !== null
+    && existing.source === 'customer_supplied'
+    && candidate.baseEachQuantity === 1
+    && candidate.lengthMm === null
+    && candidate.widthMm === null
+    && candidate.heightMm === null
+    && candidate.dimensionBasis === 'unspecified'
+    && candidate.grossWeightGrams === null
+    && candidate.weightBasis === 'unspecified'
+    && candidate.fitModel === 'approved_recipe_only'
+    && candidate.shipsAsOwnPackage === false
+    && candidate.assemblyPolicy === 'never'
+    && candidate.evidenceType === 'customer_confirmed'
+    && candidate.source === 'customer_supplied'
+  )
+}
+
+function versionEndpointMatches(rowId, stagedProfile) {
+  return rowId === stagedProfile.version.id
+    || (
+      stagedProfile.repair
+      && rowId === stagedProfile.repair.previousVersionId
+    )
+}
+
 export function providerPackMappingMatches(existing, expected) {
   return Boolean(
     existing
@@ -1382,22 +1434,27 @@ async function stageProfile(client, target, product, candidate) {
   }
 
   const versions = await client.query(
-    `SELECT id::text, global_id, lifecycle_state, base_each_quantity,
-            unit_of_measure, length_mm, width_mm, height_mm, dimension_basis,
-            gross_weight_grams, weight_basis, fit_model,
-            ships_as_own_package, assembly_policy, evidence_type, source
+    `SELECT id::text, global_id, version_number, lifecycle_state,
+            base_each_quantity, unit_of_measure, length_mm, width_mm,
+            height_mm, dimension_basis, gross_weight_grams, weight_basis,
+            fit_model, ships_as_own_package, assembly_policy, evidence_type,
+            evidence_reference, confirmed_at, source, is_current,
+            row_version::text
      FROM operations_product_pack_profile_versions
      WHERE organization_id = $1::uuid
        AND profile_id = $2::uuid
-       AND is_current = true
+     ORDER BY version_number, id
      FOR UPDATE`,
     [target.organization.id, profileRow.id],
   )
-  if (versions.rowCount > 1) {
+  const currentVersions = versions.rows.filter((row) => row.is_current)
+  if (currentVersions.length > 1) {
     fail(`${product.reference_code} profile ${candidate.profileKey} has multiple current versions`)
   }
-  if (versions.rowCount === 1) {
-    const version = versions.rows[0]
+  let versionNumber = 1
+  let repair = null
+  if (currentVersions.length === 1) {
+    const version = currentVersions[0]
     const compatible = valuesCompatible(version, {
       base_each_quantity: candidate.baseEachQuantity,
       unit_of_measure: 'each',
@@ -1419,16 +1476,64 @@ async function stageProfile(client, target, product, candidate) {
       'gross_weight_grams',
       'weight_basis',
     ])
-    if (!compatible || version.lifecycle_state !== 'customer_confirmed') {
+    if (compatible && version.lifecycle_state === 'customer_confirmed') {
+      return {
+        profile: profileRow,
+        version,
+        disposition: profileDisposition === 'created' ? 'created' : 'reused',
+        repair: null,
+      }
+    }
+    const history = {
+      versionCount: versions.rows.length,
+      maximumVersionNumber: Math.max(
+        ...versions.rows.map((row) => Number(row.version_number)),
+      ),
+    }
+    if (!legacyRecipeOnlyProfileUpgradeAllowed(version, candidate, history)) {
       fail(
         `${product.reference_code} profile ${candidate.profileKey} has conflicting current facts`,
       )
     }
-    return {
-      profile: profileRow,
-      version,
-      disposition: profileDisposition === 'created' ? 'created' : 'reused',
+    const superseded = await client.query(
+      `UPDATE operations_product_pack_profile_versions
+       SET lifecycle_state = 'superseded',
+           is_current = false,
+           effective_to = GREATEST(
+             now(), effective_from + interval '1 microsecond'
+           ),
+           row_version = row_version + 1
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid
+         AND row_version = $3::bigint
+         AND is_current = true
+         AND lifecycle_state = 'customer_confirmed'
+         AND fit_model = 'rigid_3d'
+       RETURNING id::text, global_id`,
+      [
+        target.organization.id,
+        version.id,
+        version.row_version,
+      ],
+    )
+    if (superseded.rowCount !== 1) {
+      fail(
+        `${product.reference_code} legacy pack profile changed during repair`,
+      )
     }
+    versionNumber = Number(version.version_number) + 1
+    repair = {
+      previousVersionId: version.id,
+      previousVersionGlobalId: version.global_id,
+      previousVersionNumber: Number(version.version_number),
+      previousRowVersion: Number(version.row_version),
+      previousFitModel: version.fit_model,
+      replacementVersionNumber: versionNumber,
+    }
+  } else if (versions.rowCount > 0) {
+    fail(
+      `${product.reference_code} profile ${candidate.profileKey} has history but no current version`,
+    )
   }
 
   const version = await client.query(
@@ -1440,17 +1545,19 @@ async function stageProfile(client, target, product, candidate) {
        assembly_policy, evidence_type, evidence_reference,
        confirmed_at, confirmed_by, source, is_current, created_by
      ) VALUES (
-       $1::uuid, $2::uuid, $3::uuid, $4::uuid, 1,
-       'customer_confirmed', $5, 'each', $6, $7, $8, $9,
-       $10, $11, $12, $13, $14, 'customer_confirmed', $15,
-       now(), $16, 'customer_supplied', true, $16
+       $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5,
+       'customer_confirmed', $6, 'each', $7, $8, $9, $10,
+       $11, $12, $13, $14, $15, 'customer_confirmed', $16,
+       now(), $17, 'customer_supplied', true, $17
      )
-     RETURNING id::text, global_id, lifecycle_state`,
+     RETURNING id::text, global_id, version_number, lifecycle_state,
+               row_version::text`,
     [
       target.organization.id,
       target.pipeline.id,
       product.id,
       profileRow.id,
+      versionNumber,
       candidate.baseEachQuantity,
       candidate.lengthMm,
       candidate.widthMm,
@@ -1468,7 +1575,8 @@ async function stageProfile(client, target, product, candidate) {
   return {
     profile: profileRow,
     version: version.rows[0],
-    disposition: 'created',
+    disposition: repair ? 'versioned' : 'created',
+    repair,
   }
 }
 
@@ -1484,7 +1592,8 @@ async function stageProviderPackMapping(
             external_product_id,
             default_pack_profile_version_id::text,
             provider_lifecycle_state, projection_state,
-            source_revision, source_hash, provider_updated_at::text
+            source_revision, source_hash, provider_updated_at::text,
+            row_version::text
      FROM operations_commerce_variant_pack_mappings
      WHERE organization_id = $1::uuid
        AND integration_account_id = $2::uuid
@@ -1509,10 +1618,19 @@ async function stageProviderPackMapping(
   }
   if (existing.rowCount === 1) {
     const row = existing.rows[0]
-    if (
-      row.product_id !== product.id
-      || row.default_pack_profile_version_id !== sellUnitProfile.version.id
-    ) {
+    if (row.product_id !== product.id) {
+      fail(
+        `${product.reference_code} provider variant has a conflicting pack mapping`,
+      )
+    }
+    const exactProfile = row.default_pack_profile_version_id
+      === sellUnitProfile.version.id
+    const repairedProfile = Boolean(
+      sellUnitProfile.repair
+      && row.default_pack_profile_version_id
+        === sellUnitProfile.repair.previousVersionId,
+    )
+    if (!exactProfile && !repairedProfile) {
       fail(
         `${product.reference_code} provider variant has a conflicting pack mapping`,
       )
@@ -1520,7 +1638,18 @@ async function stageProviderPackMapping(
     if (providerPackMappingMatches(row, expected)) {
       return { ...row, disposition: 'reused' }
     }
-    await client.query(
+    if (
+      repairedProfile
+      && !providerPackMappingMatches(row, {
+        ...expected,
+        profileVersionId: sellUnitProfile.repair.previousVersionId,
+      })
+    ) {
+      fail(
+        `${product.reference_code} legacy pack mapping does not match current channel evidence`,
+      )
+    }
+    const superseded = await client.query(
       `UPDATE operations_commerce_variant_pack_mappings
        SET projection_state = 'stale',
            is_current = false,
@@ -1531,9 +1660,22 @@ async function stageProviderPackMapping(
            updated_by = $3,
            updated_at = now()
        WHERE organization_id = $1::uuid
-         AND id = $2::uuid`,
-      [target.organization.id, row.id, target.actorEmail],
+         AND id = $2::uuid
+         AND row_version = $4::bigint
+         AND is_current = true
+       RETURNING id`,
+      [
+        target.organization.id,
+        row.id,
+        target.actorEmail,
+        row.row_version,
+      ],
     )
+    if (superseded.rowCount !== 1) {
+      fail(
+        `${product.reference_code} provider pack mapping changed during staging`,
+      )
+    }
   }
   const inserted = await client.query(
     `INSERT INTO operations_commerce_variant_pack_mappings (
@@ -1568,6 +1710,12 @@ async function stageProviderPackMapping(
   return {
     ...inserted.rows[0],
     disposition: existing.rowCount === 1 ? 'versioned' : 'created',
+    replacedMapping: existing.rowCount === 1
+      ? {
+          previousMappingGlobalId: existing.rows[0].global_id,
+          previousMappingRowVersion: Number(existing.rows[0].row_version),
+        }
+      : null,
   }
 }
 
@@ -1581,26 +1729,85 @@ async function stageRelationship(
   const parent = profiles.get(candidate.parentProfileKey)
   const child = profiles.get(candidate.childProfileKey)
   const existing = await client.query(
-    `SELECT id::text, global_id, contained_quantity, lifecycle_state, source
-     FROM operations_product_pack_relationships
-     WHERE organization_id = $1::uuid
-       AND parent_profile_version_id = $2::uuid
-       AND child_profile_version_id = $3::uuid
-       AND is_current = true
-     FOR UPDATE`,
-    [target.organization.id, parent.version.id, child.version.id],
+    `SELECT relationship.id::text, relationship.global_id,
+            relationship.parent_profile_version_id::text,
+            relationship.child_profile_version_id::text,
+            relationship.contained_quantity, relationship.evidence_type,
+            relationship.evidence_reference, relationship.lifecycle_state,
+            relationship.source, relationship.row_version::text
+     FROM operations_product_pack_relationships relationship
+     JOIN operations_product_pack_profile_versions parent_version
+       ON parent_version.organization_id = relationship.organization_id
+      AND parent_version.id = relationship.parent_profile_version_id
+     JOIN operations_product_pack_profile_versions child_version
+       ON child_version.organization_id = relationship.organization_id
+      AND child_version.id = relationship.child_profile_version_id
+     WHERE relationship.organization_id = $1::uuid
+       AND relationship.product_id = $2::uuid
+       AND parent_version.profile_id = $3::uuid
+       AND child_version.profile_id = $4::uuid
+       AND relationship.is_current = true
+     FOR UPDATE OF relationship`,
+    [
+      target.organization.id,
+      product.id,
+      parent.profile.id,
+      child.profile.id,
+    ],
   )
   if (existing.rowCount > 1) fail('Pack relationship is duplicated')
+  let replacedRelationship = null
   if (existing.rowCount === 1) {
     const row = existing.rows[0]
     if (
       Number(row.contained_quantity) !== candidate.containedQuantity
+      || row.evidence_type !== candidate.evidenceType
+      || row.evidence_reference !== candidate.evidenceReference
       || row.lifecycle_state !== 'customer_confirmed'
       || row.source !== 'customer_supplied'
+      || !versionEndpointMatches(
+        row.parent_profile_version_id,
+        parent,
+      )
+      || !versionEndpointMatches(
+        row.child_profile_version_id,
+        child,
+      )
     ) {
       fail(`${product.reference_code} has a conflicting pack relationship`)
     }
-    return { ...row, disposition: 'reused' }
+    const exactEndpoints = (
+      row.parent_profile_version_id === parent.version.id
+      && row.child_profile_version_id === child.version.id
+    )
+    if (exactEndpoints) return { ...row, disposition: 'reused' }
+    const retired = await client.query(
+      `UPDATE operations_product_pack_relationships
+       SET lifecycle_state = 'retired',
+           is_current = false,
+           effective_to = GREATEST(
+             now(), effective_from + interval '1 microsecond'
+           ),
+           row_version = row_version + 1
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid
+         AND row_version = $3::bigint
+         AND is_current = true
+         AND lifecycle_state = 'customer_confirmed'
+       RETURNING id`,
+      [
+        target.organization.id,
+        row.id,
+        row.row_version,
+      ],
+    )
+    if (retired.rowCount !== 1) {
+      fail(`${product.reference_code} pack relationship changed during repair`)
+    }
+    replacedRelationship = {
+      previousRelationshipGlobalId: row.global_id,
+      previousRelationshipRowVersion: Number(row.row_version),
+    }
   }
   const inserted = await client.query(
     `INSERT INTO operations_product_pack_relationships (
@@ -1625,7 +1832,11 @@ async function stageRelationship(
       target.actorEmail,
     ],
   )
-  return { ...inserted.rows[0], disposition: 'created' }
+  return {
+    ...inserted.rows[0],
+    disposition: replacedRelationship ? 'versioned' : 'created',
+    replacedRelationship,
+  }
 }
 
 async function stageRecipe(
@@ -1640,14 +1851,16 @@ async function stageRecipe(
   const output = profiles.get(candidate.outputProfileKey)
   const material = materials.get(candidate.packagingMaterialCode)
   const existing = await client.query(
-    `SELECT id::text, global_id, recipe_name, input_pack_profile_version_id::text,
+    `SELECT id::text, global_id, version_number, recipe_name,
+            input_pack_profile_version_id::text,
             output_pack_profile_version_id::text, packaging_material_id::text,
             input_quantity, output_quantity, packaging_material_quantity,
             recipe_type, fulfillment_policy, remainder_policy,
             inventory_evidence_requirement, assembly_policy,
             exclusive_contents, minimum_input_quantity,
             content_compatibility_key, allows_mixed_products,
-            lifecycle_state, source
+            lifecycle_state, fit_evidence_type, fit_evidence_reference,
+            confirmed_at, source, row_version::text
      FROM operations_approved_pack_recipes
      WHERE organization_id = $1::uuid
        AND product_id = $2::uuid
@@ -1657,12 +1870,12 @@ async function stageRecipe(
     [target.organization.id, product.id, candidate.recipeKey],
   )
   if (existing.rowCount > 1) fail(`${candidate.recipeKey} is duplicated`)
+  let versionNumber = 1
+  let replacedRecipe = null
   if (existing.rowCount === 1) {
     const row = existing.rows[0]
-    const compatible = valuesCompatible(row, {
+    const semanticFactsCompatible = valuesCompatible(row, {
       recipe_name: candidate.recipeName,
-      input_pack_profile_version_id: input.version.id,
-      output_pack_profile_version_id: output.version.id,
       packaging_material_id: material.id,
       input_quantity: candidate.inputQuantity,
       output_quantity: candidate.outputQuantity,
@@ -1679,12 +1892,62 @@ async function stageRecipe(
       source: candidate.source,
     })
     if (
-      !compatible
+      !semanticFactsCompatible
       || row.lifecycle_state !== 'customer_confirmed'
+      || row.fit_evidence_type !== candidate.fitEvidenceType
+      || row.fit_evidence_reference !== candidate.fitEvidenceReference
+      || row.confirmed_at === null
+      || !versionEndpointMatches(
+        row.input_pack_profile_version_id,
+        input,
+      )
+      || !versionEndpointMatches(
+        row.output_pack_profile_version_id,
+        output,
+      )
     ) {
       fail(`${product.reference_code} recipe ${candidate.recipeKey} conflicts`)
     }
-    return { ...row, disposition: 'reused' }
+    const exactEndpoints = (
+      row.input_pack_profile_version_id === input.version.id
+      && row.output_pack_profile_version_id === output.version.id
+    )
+    if (exactEndpoints) return { ...row, disposition: 'reused' }
+    const retired = await client.query(
+      `UPDATE operations_approved_pack_recipes
+       SET lifecycle_state = 'retired',
+           is_current = false,
+           effective_to = GREATEST(
+             now(), effective_from + interval '1 microsecond'
+           ),
+           row_version = row_version + 1,
+           updated_by = $4,
+           updated_at = now()
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid
+         AND row_version = $3::bigint
+         AND is_current = true
+         AND lifecycle_state = 'customer_confirmed'
+       RETURNING id`,
+      [
+        target.organization.id,
+        row.id,
+        row.row_version,
+        target.actorEmail,
+      ],
+    )
+    if (retired.rowCount !== 1) {
+      fail(
+        `${product.reference_code} recipe ${candidate.recipeKey} changed during repair`,
+      )
+    }
+    versionNumber = Number(row.version_number) + 1
+    replacedRecipe = {
+      previousRecipeGlobalId: row.global_id,
+      previousRecipeVersionNumber: Number(row.version_number),
+      previousRecipeRowVersion: Number(row.row_version),
+      replacementRecipeVersionNumber: versionNumber,
+    }
   }
   const inserted = await client.query(
     `INSERT INTO operations_approved_pack_recipes (
@@ -1699,19 +1962,21 @@ async function stageRecipe(
        lifecycle_state, fit_evidence_type, fit_evidence_reference,
        confirmed_at, confirmed_by, source, is_current, created_by, updated_by
      ) VALUES (
-       $1::uuid, $2::uuid, $3::uuid, $4, $5, 1, $6::uuid, $7::uuid,
-       $8::uuid, $9, $10, $11, $12, $13, $14, $15, $16, $17,
-       $18, $19, $20,
-       'customer_confirmed', 'customer_confirmed', $21, now(), $22,
-       'customer_supplied', true, $22, $22
+       $1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7::uuid, $8::uuid,
+       $9::uuid, $10, $11, $12, $13, $14, $15, $16, $17, $18,
+       $19, $20, $21,
+       'customer_confirmed', 'customer_confirmed', $22, now(), $23,
+       'customer_supplied', true, $23, $23
      )
-     RETURNING id::text, global_id, lifecycle_state`,
+     RETURNING id::text, global_id, version_number, lifecycle_state,
+               row_version::text`,
     [
       target.organization.id,
       target.pipeline.id,
       product.id,
       candidate.recipeKey,
       candidate.recipeName,
+      versionNumber,
       input.version.id,
       output.version.id,
       material.id,
@@ -1731,7 +1996,11 @@ async function stageRecipe(
       target.actorEmail,
     ],
   )
-  return { ...inserted.rows[0], disposition: 'created' }
+  return {
+    ...inserted.rows[0],
+    disposition: replacedRecipe ? 'versioned' : 'created',
+    replacedRecipe,
+  }
 }
 
 async function stageHierarchy(
@@ -1775,13 +2044,16 @@ async function stageHierarchy(
       materialsUpdated: 0,
       materialsReused: 0,
       profilesCreated: 0,
+      profilesVersioned: 0,
       profilesReused: 0,
       providerMappingsCreated: 0,
       providerMappingsVersioned: 0,
       providerMappingsReused: 0,
       relationshipsCreated: 0,
+      relationshipsVersioned: 0,
       relationshipsReused: 0,
       recipesCreated: 0,
+      recipesVersioned: 0,
       recipesReused: 0,
     }
     for (const material of AG_PACKAGING_MATERIAL_DRAFTS) {
@@ -1800,14 +2072,31 @@ async function stageHierarchy(
       const product = products.get(assignment.productGlobalId)
       const packClass = AG_PRODUCT_PACK_CLASSES[assignment.classKey]
       const profiles = new Map()
+      const profileRepairs = []
       for (const candidate of packClass.profiles) {
         const row = await stageProfile(client, target, product, candidate)
         profiles.set(candidate.profileKey, row)
-        dispositions[
-          row.disposition === 'created'
-            ? 'profilesCreated'
-            : 'profilesReused'
-        ] += 1
+        const dispositionKey = {
+          created: 'profilesCreated',
+          versioned: 'profilesVersioned',
+          reused: 'profilesReused',
+        }[row.disposition]
+        dispositions[dispositionKey] += 1
+        if (row.repair) {
+          profileRepairs.push({
+            profileKey: candidate.profileKey,
+            previousVersionGlobalId:
+              row.repair.previousVersionGlobalId,
+            previousVersionNumber:
+              row.repair.previousVersionNumber,
+            previousRowVersion:
+              row.repair.previousRowVersion,
+            previousFitModel:
+              row.repair.previousFitModel,
+            replacementVersionNumber:
+              row.repair.replacementVersionNumber,
+          })
+        }
       }
       const sellUnitProfile = profiles.get(
         packClass.providerSellUnitProfileKey,
@@ -1830,6 +2119,7 @@ async function stageHierarchy(
           sourceRevision: channelState.source_revision,
           sourceHash: channelState.source_hash,
           disposition: row.disposition,
+          replacedMapping: row.replacedMapping || null,
         })
         const dispositionKey = {
           created: 'providerMappingsCreated',
@@ -1838,6 +2128,7 @@ async function stageHierarchy(
         }[row.disposition]
         dispositions[dispositionKey] += 1
       }
+      const relationshipResults = []
       for (const candidate of packClass.relationships) {
         const row = await stageRelationship(
           client,
@@ -1846,12 +2137,21 @@ async function stageHierarchy(
           candidate,
           profiles,
         )
-        dispositions[
-          row.disposition === 'created'
-            ? 'relationshipsCreated'
-            : 'relationshipsReused'
-        ] += 1
+        const dispositionKey = {
+          created: 'relationshipsCreated',
+          versioned: 'relationshipsVersioned',
+          reused: 'relationshipsReused',
+        }[row.disposition]
+        dispositions[dispositionKey] += 1
+        relationshipResults.push({
+          parentProfileKey: candidate.parentProfileKey,
+          childProfileKey: candidate.childProfileKey,
+          containedQuantity: candidate.containedQuantity,
+          disposition: row.disposition,
+          replacedRelationship: row.replacedRelationship || null,
+        })
       }
+      const recipeResults = []
       for (const candidate of packClass.recipes) {
         const row = await stageRecipe(
           client,
@@ -1861,11 +2161,17 @@ async function stageHierarchy(
           profiles,
           materialRows,
         )
-        dispositions[
-          row.disposition === 'created'
-            ? 'recipesCreated'
-            : 'recipesReused'
-        ] += 1
+        const dispositionKey = {
+          created: 'recipesCreated',
+          versioned: 'recipesVersioned',
+          reused: 'recipesReused',
+        }[row.disposition]
+        dispositions[dispositionKey] += 1
+        recipeResults.push({
+          recipeKey: candidate.recipeKey,
+          disposition: row.disposition,
+          replacedRecipe: row.replacedRecipe || null,
+        })
       }
       productResults.push({
         productGlobalId: product.reference_code,
@@ -1877,6 +2183,9 @@ async function stageHierarchy(
         profileCount: packClass.profiles.length,
         relationshipCount: packClass.relationships.length,
         recipeCount: packClass.recipes.length,
+        profileRepairs,
+        relationshipResults,
+        recipeResults,
       })
     }
 
@@ -1944,7 +2253,15 @@ async function stageHierarchy(
             dispositions.providerMappingsCreated
             + dispositions.providerMappingsVersioned
             + dispositions.providerMappingsReused,
+          legacyProfileVersionsSuperseded: dispositions.profilesVersioned,
+          legacyRelationshipsRetired: dispositions.relationshipsVersioned,
+          legacyRecipesRetired: dispositions.recipesVersioned,
           activationState: 'draft_only',
+          externalWrites: {
+            provider: 0,
+            inventory: 0,
+            shipment: 0,
+          },
           omittedFacts: [
             'envelope_depth',
             'tare_weight',
@@ -1955,7 +2272,7 @@ async function stageHierarchy(
             'intact_case_inventory',
           ],
         }),
-        `operations:ag-pack-hierarchy:${planFingerprint}:v2`,
+        `operations:ag-pack-hierarchy:${planFingerprint}:v4`,
         TARGET_ORGANIZATION_NAME,
         target.organization.id,
       ],
@@ -2066,8 +2383,12 @@ export async function run({
         relationshipsRemainNonActive: true,
         recipesRemainNonActive: true,
         providerMappingsUseCurrentChannelEvidence: true,
+        legacyRecipeOnlyRepairIsVersioned: true,
         inventoryNotInferred: true,
         missingFactsNotInvented: true,
+        providerWrites: 0,
+        inventoryWrites: 0,
+        shipmentWrites: 0,
       },
       ...result,
     }
@@ -2216,6 +2537,66 @@ function selfTest() {
     assert.equal(providerSellUnit.widthMm, null)
     assert.equal(providerSellUnit.heightMm, null)
   }
+  const bulkSellUnit = AG_PRODUCT_PACK_CLASSES.ten_pound_bulk.profiles.find(
+    (candidate) => candidate.isDefault,
+  )
+  const legacyBulkVersion = {
+    version_number: 1,
+    row_version: '0',
+    is_current: true,
+    lifecycle_state: 'customer_confirmed',
+    base_each_quantity: 1,
+    unit_of_measure: 'each',
+    length_mm: null,
+    width_mm: null,
+    height_mm: null,
+    dimension_basis: 'unspecified',
+    gross_weight_grams: null,
+    weight_basis: 'unspecified',
+    fit_model: 'rigid_3d',
+    ships_as_own_package: false,
+    assembly_policy: 'never',
+    evidence_type: 'customer_confirmed',
+    evidence_reference: CUSTOMER_EVIDENCE_REFERENCE,
+    confirmed_at: '2026-07-28T00:00:00.000Z',
+    source: 'customer_supplied',
+  }
+  const singleLegacyVersion = {
+    versionCount: 1,
+    maximumVersionNumber: 1,
+  }
+  assert.equal(
+    legacyRecipeOnlyProfileUpgradeAllowed(
+      legacyBulkVersion,
+      bulkSellUnit,
+      singleLegacyVersion,
+    ),
+    true,
+  )
+  assert.equal(
+    legacyRecipeOnlyProfileUpgradeAllowed(
+      { ...legacyBulkVersion, row_version: '1' },
+      bulkSellUnit,
+      singleLegacyVersion,
+    ),
+    false,
+  )
+  assert.equal(
+    legacyRecipeOnlyProfileUpgradeAllowed(
+      legacyBulkVersion,
+      bulkSellUnit,
+      { versionCount: 2, maximumVersionNumber: 2 },
+    ),
+    false,
+  )
+  assert.equal(
+    legacyRecipeOnlyProfileUpgradeAllowed(
+      { ...legacyBulkVersion, length_mm: 1 },
+      bulkSellUnit,
+      singleLegacyVersion,
+    ),
+    false,
+  )
   const assignments = parseAssignments(JSON.stringify({
     six_ounce_bag: ['gp0000001'],
     six_ounce_case_12: ['gp0000002'],

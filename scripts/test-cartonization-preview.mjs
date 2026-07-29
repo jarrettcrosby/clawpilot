@@ -707,8 +707,8 @@ const workflow = read(
 )
 for (const fragment of [
   'selectedPlan.shipmentCount',
-  'Each planned package is one shipment.',
-  'packing documents must be',
+  'Packages from the same warehouse form one multi-piece',
+  'packing documents must remain grouped',
   'inventoryEvidence.products',
   'blocked until exactly one inventory position is resolved',
 ]) {

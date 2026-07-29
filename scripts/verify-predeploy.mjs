@@ -251,6 +251,8 @@ for (const requiredPath of [
   'db/migrations/0139_operations_fulfilled_line_price_state.sql',
   'db/migrations/0140_operations_commerce_packaging_source_constraint.sql',
   'db/migrations/0141_operations_recipe_only_pack_associations.sql',
+  'db/migrations/0142_operations_cartonization_evidence_scale.sql',
+  'db/migrations/0143_operations_cartonization_shipment_rates.sql',
   'app_src/lib/integrations/commercePackRuntime.ts',
   'app_src/lib/operations/hybridCartonization.ts',
   'app_src/tests/operations/hybrid-cartonization.test.mts',

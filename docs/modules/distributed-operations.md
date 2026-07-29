@@ -15,9 +15,9 @@ app_visible: false
 
 Provide native distributed order management, warehouse execution, carrier shipping, and 3PL billing inside ClawPilot. The module serves 3PL operators, retailers, distributors, manufacturers, and fulfillment operators without creating a second application or duplicating CRM, product, identity, audit, task, document, notification, or accounting masters.
 
-This document remains the **target contract** for the full module. The current development slice includes operations migrations `0081` through `0094`, `0097` through `0101`, and `0107` through `0141`; a tenant-scoped order workbench; explicit idempotent warehouse-release, bulk all-ready pick-confirmation, pack-verification, sandbox-label-create, and sandbox-label-void commands for eligible non-archived orders; a durable exception queue; scoped activation controls; canonical CRM catalog projection; provider-customer resolution; team-managed product/package imports; warehouse-scoped Packaging Materials management; organization-scoped direct carrier credential administration; UPS and FedEx sandbox rating with an account-derived origin and editable test destination; a separate rate-selected diagnostic label-create with customer-selected provider-native output, stored-label download/print, and void workflow; immutable provider-source bytes plus an explicit derivative-artifact provenance boundary; append-only redacted provider evidence; carrier-rate delegation; direct multi-account carrier CSV import; selected-batch GL Coding; separate financial review; billed-actual Triangle/Square/Circle settlement evidence; append-only settlement status transitions; capability-aware printer configuration; enrolled local print-agent delivery with controlled reprints, same-warehouse fallback, and agent-declared format/media/document capabilities; shipment- and exact-package-specific PDF packing-list renderers, immutable artifact-payload store, authenticated artifact stream, tracking-observation schema, and commerce-fulfillment export state model; a Shopify/Faire sales-channel control plane; a bounded development-only Shopify held-order preview; leased development-only full-product-catalog reconciliation and current-order staging workers; guarded development-only product-catalog mapping and operational-order workflows with durable pre-call read intents, resource-scoped encrypted continuations, first-class rejection dispositions, and canonical promotion; a bounded, manager-triggered, read-only Shopify inventory reconciliation for one eligible location and warehouse; a strict development-only Shopify cartonization preview; a recipe-first, assumption-watermarked sandbox package-and-rate evidence workflow; and active-workspace measurement-presentation and product-currency defaults. The deterministic mock flow remains an internal automated-test harness only. Hosted mock generation is disabled and historical mock artifacts are archived. These features prove PostgreSQL authority and application boundaries; they do not establish historical closed-order commerce import, continuous or production provider inventory synchronization, production commerce workers, production carrier mutation, tracking ingestion, commerce-export dispatch, pickup scheduling, accounting export, invoice/AR workflow, payment adapters, or production fulfillment-optimizer activation.
+This document remains the **target contract** for the full module. The current development slice includes operations migrations `0081` through `0094`, `0097` through `0101`, and `0107` through `0143`; a tenant-scoped order workbench; explicit idempotent warehouse-release, bulk all-ready pick-confirmation, pack-verification, sandbox-label-create, and sandbox-label-void commands for eligible non-archived orders; a durable exception queue; scoped activation controls; canonical CRM catalog projection; provider-customer resolution; team-managed product/package imports; warehouse-scoped Packaging Materials management; organization-scoped direct carrier credential administration; UPS and FedEx sandbox rating with an account-derived origin and editable test destination; a separate rate-selected diagnostic label-create with customer-selected provider-native output, stored-label download/print, and void workflow; immutable provider-source bytes plus an explicit derivative-artifact provenance boundary; append-only redacted provider evidence; carrier-rate delegation; direct multi-account carrier CSV import; selected-batch GL Coding; separate financial review; billed-actual Triangle/Square/Circle settlement evidence; append-only settlement status transitions; capability-aware printer configuration; enrolled local print-agent delivery with controlled reprints, same-warehouse fallback, and agent-declared format/media/document capabilities; shipment- and exact-package-specific PDF packing-list renderers, immutable artifact-payload store, authenticated artifact stream, tracking-observation schema, and commerce-fulfillment export state model; a Shopify/Faire sales-channel control plane; a bounded development-only Shopify held-order preview; leased development-only full-product-catalog reconciliation and current-order staging workers; guarded development-only product-catalog mapping and operational-order workflows with durable pre-call read intents, resource-scoped encrypted continuations, first-class rejection dispositions, and canonical promotion; a bounded, manager-triggered, read-only Shopify inventory reconciliation for one eligible location and warehouse; a strict development-only Shopify cartonization preview; a recipe-first, assumption-watermarked sandbox package-and-rate evidence workflow; and active-workspace measurement-presentation and product-currency defaults. The deterministic mock flow remains an internal automated-test harness only. Hosted mock generation is disabled and historical mock artifacts are archived. These features prove PostgreSQL authority and application boundaries; they do not establish historical closed-order commerce import, continuous or production provider inventory synchronization, production commerce workers, production carrier mutation, tracking ingestion, commerce-export dispatch, pickup scheduling, accounting export, invoice/AR workflow, payment adapters, or production fulfillment-optimizer activation.
 
-Migrations `0128` through `0141` extend this slice with the pack hierarchy,
+Migrations `0128` through `0143` extend this slice with the pack hierarchy,
 CRM CSV transfer evidence, durable sales-channel lifecycle and offer
 projection, guarded canonical Product identity reconciliation, and
 database-enforced packaging-dimension evidence described below.
@@ -247,6 +247,20 @@ source revision/hash, derives unit weight only from that positive current
 catalog observation, and still requires the saved recipe/material proof before
 it can rate a parcel.
 
+The AG staging command has one guarded compatibility repair for bulk profiles
+created before the recipe-only rule was introduced. A fresh plan may supersede
+only an untouched version-1, row-version-0, customer-confirmed
+`rigid_3d` profile whose dimensions and weights are all absent and whose other
+facts exactly match the customer-supplied bulk manifest. Apply creates a
+version-2 `approved_recipe_only` profile, retires and recreates the affected
+relationship and recipe against that version, and versions the exact provider
+variant mapping while retaining the current channel source revision and hash.
+The old rows remain as history. Any extra version, changed fact, stale channel
+evidence, or concurrent row-version change blocks the repair. The command
+remains restricted to the trusted development database, exact Product Global
+ID assignment, active AG administrator, and fresh plan fingerprint; it performs
+zero provider, inventory, order, package, shipment, or carrier writes.
+
 Confirmed US ship-to snapshots may retain a provider-native state or territory
 name for audit display. The carrier sandbox boundary converts recognized names
 such as `Wisconsin` to the canonical postal code (`WI`) before fingerprinting
@@ -256,9 +270,33 @@ generic evidence outage.
 
 Operators may select at most eight packaging material types for one
 cartonization run, while one saved read-only carrier comparison may retain up
-to 64 resulting physical packages. This distinction lets a high-unit order
+to 50 resulting physical packages. This distinction lets a high-unit order
 reuse a small controlled material catalog without truncating its actual carton
-plan or its one UPS and one FedEx sandbox result per package.
+plan while remaining inside the UPS `Shop` one-request package limit shared by
+the UPS/FedEx comparison boundary.
+
+Every selected material in that comparison carries its own explicitly
+acknowledged rated exterior dimensions and sandbox-only tare. Those assumptions
+are normalized, bound to the exact material Global ID and row version, retained
+in the semantic request hash, and rechecked against every resulting package
+before evidence can seal. Cartonization completes first. ClawPilot then sends
+the complete ordered physical-package list in exactly one UPS multi-package
+shipment-rate request and one FedEx multi-piece shipment-rate request. A
+shipment-level option is eligible only when that carrier returned the service
+for the entire package list; one carrier service applies to every package in
+the shipment and package-by-package service splitting is not allowed. The
+optimizer counts one shipment per selected ship-from warehouse, while
+`cartonCount` remains the number of physical packages; AG Alchemy's one
+warehouse therefore produces one potentially multi-package shipment. A future
+multi-warehouse plan must partition packages by ship-from warehouse before
+rating, because each warehouse has a different sender address; ClawPilot then
+sends one shipment-level request per warehouse group to each carrier and never
+combines origins in one request. Each
+physical package retains its own allocation, recipe, normalized parcel, and
+edge to the shared immutable provider request so an administrator can audit the
+two carrier reads without mistaking package evidence for separate rate choices.
+The workflow is read-only at both providers and performs no shipment, label,
+postage, inventory, or sales-channel write.
 
 ### Packaging Materials Workflow
 

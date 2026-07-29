@@ -154,6 +154,20 @@ for (const fragment of [
     `Cartonization package-rate migration missing ${fragment}`,
   )
 }
+const cartonizationShipmentRateMigration = read(
+  'db/migrations/0143_operations_cartonization_shipment_rates.sql',
+)
+for (const fragment of [
+  "'cartonization_shipment_rate'",
+  "SET DEFAULT 'cartonization_shipment_rate'",
+  'package_count NOT BETWEEN 1 AND 50',
+  "rate.redacted_request #> '{shipment,parcels}'",
+]) {
+  assert.ok(
+    cartonizationShipmentRateMigration.includes(fragment),
+    `Cartonization shipment-rate migration missing ${fragment}`,
+  )
+}
 
 const persistence = read('app_src/lib/persistence/carrierIntegrations.ts')
 for (const fragment of [
@@ -177,6 +191,8 @@ for (const fragment of [
   "'carrier.sandbox_rate.failed'",
   "'carrier.cartonization_package_rate.succeeded'",
   "'carrier.cartonization_package_rate.failed'",
+  "'carrier.cartonization_shipment_rate.succeeded'",
+  "'carrier.cartonization_shipment_rate.failed'",
   'input.purpose',
   'carrier-credential:',
   "$1::uuid, $2, 'carrier', $3, $4, 'disabled'",
@@ -223,8 +239,10 @@ for (const fragment of [
   'await verifyCarrierCredential({ provider, environment, credential })',
   'encryptCarrierCredential(credential, organizationId, provider, environment)',
   'testCarrierSandboxRate',
+  'testCarrierSandboxShipmentRate',
   "environment !== 'sandbox'",
   'requestCarrierSandboxRates',
+  'requestCarrierSandboxShipmentRates',
   'writeCarrierSandboxRateEvidenceInPostgres',
   'Carrier integration request failed',
   'createCarrierAccount',
@@ -242,9 +260,11 @@ for (const fragment of [
   'senderName: selection.account.senderName',
   'senderBillingOnly: true',
   'buildCarrierSandboxRateFixture',
+  'buildCarrierSandboxShipmentRateFixture',
   'destination: input.destination',
   'parcel: input.parcel',
   "'cartonization_package_rate'",
+  "'cartonization_shipment_rate'",
   'redactedSandboxRateBillingSelection',
   'requiresConfiguredCapability',
   'isSourceManagedCarrierConfiguration',
@@ -1231,6 +1251,78 @@ assert.deepEqual(JSON.parse(JSON.stringify(cartonizationFixture.parcel)), {
   weight: 2.498,
   weightUnit: 'LB',
 })
+const secondCartonizationParcel = {
+  description: '20lb optimized carton',
+  exteriorInches: {
+    length: 17,
+    width: 11,
+    height: 7,
+  },
+  grossPounds: 20.75,
+}
+const shipmentFixture =
+  sandboxRateModule.buildCarrierSandboxShipmentRateFixture({
+    senderName: 'Jegs Test Sender',
+    registeredAddress: carrierAccountAddress,
+    destination: editableDestination,
+    parcels: [cartonizationParcel, secondCartonizationParcel],
+  })
+assert.deepEqual(
+  JSON.parse(JSON.stringify(shipmentFixture.parcels)),
+  [
+    JSON.parse(JSON.stringify(cartonizationFixture.parcel)),
+    {
+      description: '20lb optimized carton',
+      length: 17,
+      width: 11,
+      height: 7,
+      dimensionUnit: 'IN',
+      weight: 20.75,
+      weightUnit: 'LB',
+    },
+  ],
+  'Multi-package fixtures must retain caller package order',
+)
+assert.equal(
+  sandboxRateModule.MAX_CARRIER_SANDBOX_SHIPMENT_PACKAGES,
+  50,
+  'The whole-shipment bound must match the UPS Shop 50-package limit',
+)
+assert.equal(
+  sandboxRateModule.carrierSandboxShipmentResponseLimitBytes(1),
+  128 * 1024,
+  'A one-package request must preserve the legacy response-size cap',
+)
+assert.ok(
+  sandboxRateModule.carrierSandboxShipmentResponseLimitBytes(27)
+    > 128 * 1024,
+  'A 27-package response must receive a bounded proportional response cap',
+)
+assert.ok(
+  sandboxRateModule.carrierSandboxShipmentResponseLimitBytes(50)
+    <= 2 * 1024 * 1024,
+  'The proportional response cap must retain a hard ceiling',
+)
+assert.equal(
+  sandboxRateModule.buildCarrierSandboxShipmentRateFixture({
+    senderName: 'Jegs Test Sender',
+    registeredAddress: carrierAccountAddress,
+    destination: editableDestination,
+    parcels: Array.from({ length: 50 }, () => cartonizationParcel),
+  }).parcels.length,
+  50,
+  'The UPS Shop boundary must accept exactly 50 ordered packages',
+)
+assert.throws(
+  () => sandboxRateModule.buildCarrierSandboxShipmentRateFixture({
+    senderName: 'Jegs Test Sender',
+    registeredAddress: carrierAccountAddress,
+    destination: editableDestination,
+    parcels: Array.from({ length: 51 }, () => cartonizationParcel),
+  }),
+  /requires 1-50 ordered packages/,
+  'Whole-shipment rating must fail closed above the UPS Shop limit',
+)
 assert.equal(
   sandboxRateModule.carrierSandboxRateRequestEvidence(
     'ups_rest',
@@ -1491,7 +1583,136 @@ assert.equal(
   'cartonization_package_rate',
 )
 
-for (const value of [fedexRate, upsRate]) {
+const fedexShipmentRate =
+  await sandboxRateModule.requestCarrierSandboxShipmentRates({
+    provider: 'fedex_rest',
+    environment: 'sandbox',
+    credential,
+  }, {
+    fixture: shipmentFixture,
+    fetchImpl: async (url, init) => {
+      rateRequests.push({ url: String(url), init })
+      return new Response(JSON.stringify({
+        padding: 'x'.repeat(135 * 1024),
+        output: {
+          rateReplyDetails: [{
+            serviceType: 'FEDEX_GROUND',
+            serviceName: 'FedEx Ground',
+            ratedShipmentDetails: [{
+              rateType: 'ACCOUNT',
+              totalNetCharge: 31.47,
+              currency: 'USD',
+            }],
+          }],
+        },
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    },
+  })
+const fedexShipmentRequest = JSON.parse(rateRequests[2].init.body)
+assert.equal(
+  fedexShipmentRequest.requestedShipment.totalPackageCount,
+  2,
+)
+assert.equal(
+  fedexShipmentRequest.requestedShipment.requestedPackageLineItems.length,
+  2,
+  'FedEx MPS must send one line item per physical package',
+)
+assert.deepEqual(
+  fedexShipmentRequest.requestedShipment.requestedPackageLineItems.map(
+    (item) => ({
+      sequenceNumber: item.sequenceNumber,
+      groupPackageCount: item.groupPackageCount,
+      description: item.itemDescription,
+    }),
+  ),
+  [
+    {
+      sequenceNumber: 1,
+      groupPackageCount: 1,
+      description: 'AG12V2 optimized carton',
+    },
+    {
+      sequenceNumber: 2,
+      groupPackageCount: 1,
+      description: '20lb optimized carton',
+    },
+  ],
+  'FedEx MPS line items must preserve cartonization package order without grouping',
+)
+assert.equal(fedexShipmentRate.result.packageCount, 2)
+assert.equal(fedexShipmentRate.result.rates[0].amount, '31.47')
+assert.equal(
+  fedexShipmentRate.evidence.redactedResponse.rateScope,
+  'multi_package_shipment',
+)
+assert.equal(fedexShipmentRate.evidence.redactedResponse.packageCount, 2)
+
+const upsShipmentRate =
+  await sandboxRateModule.requestCarrierSandboxShipmentRates({
+    provider: 'ups_rest',
+    environment: 'sandbox',
+    credential,
+  }, {
+    fixture: shipmentFixture,
+    fetchImpl: async (url, init) => {
+      rateRequests.push({ url: String(url), init })
+      return new Response(JSON.stringify({
+        RateResponse: {
+          RatedShipment: [{
+            Service: { Code: '03' },
+            NegotiatedRateCharges: {
+              TotalCharge: {
+                MonetaryValue: '29.15',
+                CurrencyCode: 'USD',
+              },
+            },
+          }],
+        },
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    },
+  })
+const upsShipmentRequest = JSON.parse(rateRequests[3].init.body)
+assert.equal(upsShipmentRequest.RateRequest.Request.RequestOption, 'Shop')
+assert.equal(upsShipmentRequest.RateRequest.Shipment.NumOfPieces, '2')
+assert.equal(
+  upsShipmentRequest.RateRequest.Shipment.Package.length,
+  2,
+  'UPS Shop must receive one ordered Package entry per physical package',
+)
+assert.deepEqual(
+  upsShipmentRequest.RateRequest.Shipment.Package.map(
+    (item) => item.Description,
+  ),
+  ['AG12V2 optimized carton', '20lb optimized carton'],
+)
+assert.equal(upsShipmentRate.result.rates[0].amount, '29.15')
+for (const value of [
+  fedexShipmentRate.evidence.redactedRequest,
+  upsShipmentRate.evidence.redactedRequest,
+]) {
+  assert.equal(value.purpose, 'cartonization_shipment_rate')
+  assert.equal(value.shipment.rateScope, 'multi_package_shipment')
+  assert.equal(value.shipment.packageCount, 2)
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(value.shipment.parcels)),
+    JSON.parse(JSON.stringify(shipmentFixture.parcels)),
+  )
+  assert.equal(value.shipment.parcel, undefined)
+}
+
+for (const value of [
+  fedexRate,
+  upsRate,
+  fedexShipmentRate,
+  upsShipmentRate,
+]) {
   const serialized = JSON.stringify(value)
   assert.ok(!serialized.includes(credential.accountNumber), 'Rate result/evidence must redact account numbers')
   assert.ok(!serialized.includes(credential.clientId), 'Rate result/evidence must redact client IDs')
@@ -1531,6 +1752,19 @@ assert.notEqual(
     destination: { ...cartonizationFixture.destination, postalCode: '43215' },
   }, 'cartonization_package_rate').requestHash,
   'the provider request hash must bind the exact normalized destination',
+)
+
+await assert.rejects(
+  sandboxRateModule.requestCarrierSandboxRates({
+    provider: 'ups_rest',
+    environment: 'sandbox',
+    credential,
+  }, {
+    fixture: cartonizationFixture,
+    purpose: 'cartonization_shipment_rate',
+  }),
+  (error) => error.code === 'CARRIER_SHIPMENT_RATE_PATH_REQUIRED',
+  'The legacy single-parcel path must reject whole-shipment purpose reuse',
 )
 
 await assert.rejects(

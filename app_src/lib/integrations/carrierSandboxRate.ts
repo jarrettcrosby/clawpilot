@@ -38,11 +38,20 @@ export type CarrierSandboxParcelRequest = {
 export type CarrierSandboxRatePurpose =
   | 'sandbox_rate_test'
   | 'cartonization_package_rate'
+  | 'cartonization_shipment_rate'
 
 export type CarrierSandboxRateFixture = {
   origin: CarrierSandboxParty
   destination: CarrierSandboxParty
   parcel: CarrierSandboxParcel
+}
+
+export const MAX_CARRIER_SANDBOX_SHIPMENT_PACKAGES = 50
+
+export type CarrierSandboxShipmentRateFixture = {
+  origin: CarrierSandboxParty
+  destination: CarrierSandboxParty
+  parcels: CarrierSandboxParcel[]
 }
 
 type LegacyCarrierSandboxRateFixture = {
@@ -110,6 +119,19 @@ export type CarrierSandboxRateResult = {
   environment: 'sandbox'
   purpose: CarrierSandboxRatePurpose
   fixture: CarrierSandboxRateFixture
+  destinationFingerprint: string
+  rates: CarrierSandboxRate[]
+  testedAt: string
+  evidenceGlobalId?: string
+}
+
+export type CarrierSandboxShipmentRateResult = {
+  provider: 'ups_rest' | 'fedex_rest'
+  environment: 'sandbox'
+  purpose: 'cartonization_shipment_rate'
+  rateScope: 'multi_package_shipment'
+  fixture: CarrierSandboxShipmentRateFixture
+  packageCount: number
   destinationFingerprint: string
   rates: CarrierSandboxRate[]
   testedAt: string
@@ -487,6 +509,45 @@ export function buildCarrierSandboxRateFixture(input: {
   }
 }
 
+export function buildCarrierSandboxShipmentRateFixture(input: {
+  senderName: string
+  registeredAddress: {
+    line1: string
+    line2: string | null
+    city: string
+    region: string
+    postalCode: string
+    countryCode: string
+  }
+  destination: unknown
+  parcels: unknown
+}): CarrierSandboxShipmentRateFixture {
+  if (
+    !Array.isArray(input.parcels)
+    || input.parcels.length < 1
+    || input.parcels.length > MAX_CARRIER_SANDBOX_SHIPMENT_PACKAGES
+  ) {
+    throw new Error(
+      `Carrier sandbox shipment rating requires 1-${
+        MAX_CARRIER_SANDBOX_SHIPMENT_PACKAGES
+      } ordered packages`,
+    )
+  }
+  return {
+    origin: normalizeCarrierSandboxParty({
+      name: input.senderName,
+      line1: input.registeredAddress.line1,
+      line2: input.registeredAddress.line2,
+      city: input.registeredAddress.city,
+      region: input.registeredAddress.region,
+      postalCode: input.registeredAddress.postalCode,
+      countryCode: input.registeredAddress.countryCode,
+    }),
+    destination: normalizeCarrierSandboxParty(input.destination),
+    parcels: input.parcels.map(normalizeCarrierSandboxParcel),
+  }
+}
+
 function defaultCarrierSandboxRateFixture(): CarrierSandboxRateFixture {
   return {
     origin: legacyParty(CARRIER_SANDBOX_RATE_FIXTURE.origin),
@@ -517,7 +578,10 @@ function providerError(status: number) {
   )
 }
 
-function fedexRequest(accountNumber: string, fixture: CarrierSandboxRateFixture) {
+function fedexRequest(
+  accountNumber: string,
+  fixture: CarrierSandboxShipmentRateFixture,
+) {
   return {
     accountNumber: { value: accountNumber },
     rateRequestControlParameters: { returnTransitTimes: true },
@@ -547,14 +611,17 @@ function fedexRequest(accountNumber: string, fixture: CarrierSandboxRateFixture)
       pickupType: 'DROPOFF_AT_FEDEX_LOCATION',
       rateRequestType: ['ACCOUNT', 'LIST'],
       packagingType: 'YOUR_PACKAGING',
-      requestedPackageLineItems: [{
-        itemDescription: fixture.parcel.description,
-        weight: { units: fixture.parcel.weightUnit, value: fixture.parcel.weight },
+      totalPackageCount: fixture.parcels.length,
+      requestedPackageLineItems: fixture.parcels.map((parcel, index) => ({
+        sequenceNumber: index + 1,
+        groupPackageCount: 1,
+        itemDescription: parcel.description,
+        weight: { units: parcel.weightUnit, value: parcel.weight },
         dimensions: {
-          length: fixture.parcel.length, width: fixture.parcel.width, height: fixture.parcel.height,
-          units: fixture.parcel.dimensionUnit,
+          length: parcel.length, width: parcel.width, height: parcel.height,
+          units: parcel.dimensionUnit,
         },
-      }],
+      })),
     },
   }
 }
@@ -572,7 +639,10 @@ function upsParty(address: CarrierSandboxParty) {
   }
 }
 
-function upsRequest(accountNumber: string, fixture: CarrierSandboxRateFixture) {
+function upsRequest(
+  accountNumber: string,
+  fixture: CarrierSandboxShipmentRateFixture,
+) {
   return {
     RateRequest: {
       Request: {
@@ -586,19 +656,19 @@ function upsRequest(accountNumber: string, fixture: CarrierSandboxRateFixture) {
         PaymentDetails: {
           ShipmentCharge: [{ Type: '01', BillShipper: { AccountNumber: accountNumber } }],
         },
-        NumOfPieces: '1',
-        Package: [{
+        NumOfPieces: String(fixture.parcels.length),
+        Package: fixture.parcels.map((parcel) => ({
           PackagingType: { Code: '02', Description: 'Customer supplied package' },
-          Description: fixture.parcel.description,
+          Description: parcel.description,
           Dimensions: {
-            UnitOfMeasurement: { Code: fixture.parcel.dimensionUnit },
-            Length: String(fixture.parcel.length), Width: String(fixture.parcel.width), Height: String(fixture.parcel.height),
+            UnitOfMeasurement: { Code: parcel.dimensionUnit },
+            Length: String(parcel.length), Width: String(parcel.width), Height: String(parcel.height),
           },
           PackageWeight: {
             UnitOfMeasurement: { Code: 'LBS' },
-            Weight: String(fixture.parcel.weight),
+            Weight: String(parcel.weight),
           },
-        }],
+        })),
         ShipmentRatingOptions: { NegotiatedRatesIndicator: '' },
       },
     },
@@ -694,15 +764,80 @@ export function carrierSandboxRateRequestEvidence(
   }
 }
 
-export async function requestCarrierSandboxRates(
+export function carrierSandboxShipmentRateRequestEvidence(
+  provider: 'ups_rest' | 'fedex_rest',
+  fixture: CarrierSandboxShipmentRateFixture,
+) {
+  const purpose = 'cartonization_shipment_rate' as const
+  const request = {
+    provider,
+    environment: 'sandbox',
+    purpose,
+    origin: fixture.origin,
+    destination: fixture.destination,
+    parcels: fixture.parcels,
+  }
+  return {
+    requestHash: hash(request),
+    redactedRequest: {
+      provider,
+      environment: 'sandbox',
+      purpose,
+      shipment: {
+        rateScope: 'multi_package_shipment',
+        packageCount: fixture.parcels.length,
+        originFingerprint: carrierSandboxPartyFingerprint(fixture.origin),
+        destinationFingerprint:
+          carrierSandboxPartyFingerprint(fixture.destination),
+        origin: {
+          region: fixture.origin.region,
+          countryCode: fixture.origin.countryCode,
+        },
+        destination: {
+          region: fixture.destination.region,
+          countryCode: fixture.destination.countryCode,
+        },
+        parcels: fixture.parcels,
+      },
+    },
+  }
+}
+
+const SINGLE_PARCEL_RATE_RESPONSE_LIMIT_BYTES = 128 * 1024
+const MULTI_PACKAGE_RATE_RESPONSE_BYTES_PER_ADDITIONAL_PACKAGE = 32 * 1024
+const MULTI_PACKAGE_RATE_RESPONSE_HARD_LIMIT_BYTES = 2 * 1024 * 1024
+
+type SandboxRateRuntimeCredential = CarrierRuntimeCredential & {
+  provider: 'ups_rest' | 'fedex_rest'
+  environment: 'sandbox'
+}
+
+export function carrierSandboxShipmentResponseLimitBytes(
+  packageCount: number,
+) {
+  if (
+    !Number.isInteger(packageCount)
+    || packageCount < 1
+    || packageCount > MAX_CARRIER_SANDBOX_SHIPMENT_PACKAGES
+  ) {
+    throw new Error(
+      `Carrier sandbox shipment response sizing requires 1-${
+        MAX_CARRIER_SANDBOX_SHIPMENT_PACKAGES
+      } packages`,
+    )
+  }
+  return Math.min(
+    MULTI_PACKAGE_RATE_RESPONSE_HARD_LIMIT_BYTES,
+    SINGLE_PARCEL_RATE_RESPONSE_LIMIT_BYTES
+      + (
+        packageCount - 1
+      ) * MULTI_PACKAGE_RATE_RESPONSE_BYTES_PER_ADDITIONAL_PACKAGE,
+  )
+}
+
+function assertCarrierSandboxRateCredential(
   input: CarrierRuntimeCredential,
-  options: {
-    fetchImpl?: typeof fetch
-    timeoutMs?: number
-    fixture?: CarrierSandboxRateFixture
-    purpose?: CarrierSandboxRatePurpose
-  } = {},
-): Promise<{ result: CarrierSandboxRateResult; evidence: CarrierSandboxRateEvidence }> {
+): asserts input is SandboxRateRuntimeCredential {
   if (input.environment !== 'sandbox') {
     throw new CarrierCredentialClientError(
       'Rate testing is limited to carrier sandbox accounts',
@@ -724,21 +859,41 @@ export async function requestCarrierSandboxRates(
       'CARRIER_ACCOUNT_REQUIRED',
     )
   }
+}
 
-  const fetchImpl = options.fetchImpl || fetch
-  const fixture = options.fixture || defaultCarrierSandboxRateFixture()
-  const purpose = options.purpose || 'sandbox_rate_test'
+async function executeCarrierSandboxRateRequest(
+  input: SandboxRateRuntimeCredential,
+  options: {
+    fetchImpl: typeof fetch
+    timeoutMs?: number
+    fixture: CarrierSandboxShipmentRateFixture
+    purpose: CarrierSandboxRatePurpose
+    responseLimitBytes: number
+    safeRequest: {
+      requestHash: string
+      redactedRequest: Record<string, unknown>
+    }
+    safeResponseContext?: Record<string, unknown>
+  },
+): Promise<{
+  rates: CarrierSandboxRate[]
+  testedAt: string
+  evidence: CarrierSandboxRateEvidence
+}> {
   const requestedAt = new Date().toISOString()
-  const token = await requestCarrierAccessToken(input, { fetchImpl, timeoutMs: options.timeoutMs })
+  const token = await requestCarrierAccessToken(input, {
+    fetchImpl: options.fetchImpl,
+    timeoutMs: options.timeoutMs,
+  })
   const body = input.provider === 'fedex_rest'
-    ? fedexRequest(input.credential.accountNumber, fixture)
-    : upsRequest(input.credential.accountNumber, fixture)
+    ? fedexRequest(input.credential.accountNumber!, options.fixture)
+    : upsRequest(input.credential.accountNumber!, options.fixture)
   const transactionId = randomUUID()
   const controller = new AbortController()
   const timeoutMs = Math.max(1_000, Math.min(options.timeoutMs || 12_000, 15_000))
   const timeout = setTimeout(() => controller.abort(), timeoutMs)
   try {
-    const response = await fetchImpl(RATE_ENDPOINTS[input.provider], {
+    const response = await options.fetchImpl(RATE_ENDPOINTS[input.provider], {
       method: 'POST',
       headers: {
         Accept: 'application/json',
@@ -753,11 +908,14 @@ export async function requestCarrierSandboxRates(
     })
     if (!response.ok) throw providerError(response.status)
     const contentLength = Number(response.headers.get('content-length') || 0)
-    if (Number.isFinite(contentLength) && contentLength > 128 * 1024) {
+    if (
+      Number.isFinite(contentLength)
+      && contentLength > options.responseLimitBytes
+    ) {
       throw new CarrierCredentialClientError('The carrier returned an invalid rate response', 502, 'CARRIER_PROVIDER_RESPONSE_INVALID')
     }
     const raw = await response.text()
-    if (Buffer.byteLength(raw, 'utf8') > 128 * 1024) {
+    if (Buffer.byteLength(raw, 'utf8') > options.responseLimitBytes) {
       throw new CarrierCredentialClientError('The carrier returned an invalid rate response', 502, 'CARRIER_PROVIDER_RESPONSE_INVALID')
     }
     let payload: Record<string, unknown>
@@ -771,25 +929,17 @@ export async function requestCarrierSandboxRates(
       throw new CarrierCredentialClientError('The carrier returned no usable sandbox rates', 502, 'CARRIER_SANDBOX_RATE_EMPTY')
     }
     const completedAt = new Date().toISOString()
-    const safeRequest = carrierSandboxRateRequestEvidence(
-      input.provider,
-      fixture,
-      purpose,
-    )
-    const safeResponse = { rateCount: rates.length, rates }
+    const safeResponse = {
+      ...(options.safeResponseContext || {}),
+      rateCount: rates.length,
+      rates,
+    }
     return {
-      result: {
-        provider: input.provider,
-        environment: 'sandbox',
-        purpose,
-        fixture,
-        destinationFingerprint: carrierSandboxPartyFingerprint(fixture.destination),
-        rates,
-        testedAt: completedAt,
-      },
+      rates,
+      testedAt: completedAt,
       evidence: {
-        requestHash: safeRequest.requestHash,
-        redactedRequest: safeRequest.redactedRequest,
+        requestHash: options.safeRequest.requestHash,
+        redactedRequest: options.safeRequest.redactedRequest,
         redactedResponse: safeResponse,
         providerReference: response.headers.get('transaction-id') || response.headers.get('x-customer-transaction-id'),
         requestedAt,
@@ -808,5 +958,128 @@ export async function requestCarrierSandboxRates(
     )
   } finally {
     clearTimeout(timeout)
+  }
+}
+
+export async function requestCarrierSandboxRates(
+  input: CarrierRuntimeCredential,
+  options: {
+    fetchImpl?: typeof fetch
+    timeoutMs?: number
+    fixture?: CarrierSandboxRateFixture
+    purpose?: CarrierSandboxRatePurpose
+  } = {},
+): Promise<{
+  result: CarrierSandboxRateResult
+  evidence: CarrierSandboxRateEvidence
+}> {
+  assertCarrierSandboxRateCredential(input)
+  const fixture = options.fixture || defaultCarrierSandboxRateFixture()
+  const purpose = options.purpose || 'sandbox_rate_test'
+  if (purpose === 'cartonization_shipment_rate') {
+    throw new CarrierCredentialClientError(
+      'Whole-shipment rating requires the multi-package request path',
+      409,
+      'CARRIER_SHIPMENT_RATE_PATH_REQUIRED',
+    )
+  }
+  const shipmentFixture: CarrierSandboxShipmentRateFixture = {
+    origin: fixture.origin,
+    destination: fixture.destination,
+    parcels: [fixture.parcel],
+  }
+  const request = carrierSandboxRateRequestEvidence(
+    input.provider as 'ups_rest' | 'fedex_rest',
+    fixture,
+    purpose,
+  )
+  const response = await executeCarrierSandboxRateRequest(input, {
+    fetchImpl: options.fetchImpl || fetch,
+    timeoutMs: options.timeoutMs,
+    fixture: shipmentFixture,
+    purpose,
+    responseLimitBytes: SINGLE_PARCEL_RATE_RESPONSE_LIMIT_BYTES,
+    safeRequest: request,
+  })
+  return {
+    result: {
+      provider: input.provider as 'ups_rest' | 'fedex_rest',
+      environment: 'sandbox',
+      purpose,
+      fixture,
+      destinationFingerprint:
+        carrierSandboxPartyFingerprint(fixture.destination),
+      rates: response.rates,
+      testedAt: response.testedAt,
+    },
+    evidence: response.evidence,
+  }
+}
+
+export async function requestCarrierSandboxShipmentRates(
+  input: CarrierRuntimeCredential,
+  options: {
+    fetchImpl?: typeof fetch
+    timeoutMs?: number
+    fixture: CarrierSandboxShipmentRateFixture
+  },
+): Promise<{
+  result: CarrierSandboxShipmentRateResult
+  evidence: CarrierSandboxRateEvidence
+}> {
+  assertCarrierSandboxRateCredential(input)
+  if (
+    !Array.isArray(options.fixture.parcels)
+    || options.fixture.parcels.length < 1
+    || options.fixture.parcels.length
+      > MAX_CARRIER_SANDBOX_SHIPMENT_PACKAGES
+  ) {
+    throw new CarrierCredentialClientError(
+      `A shipment rate request supports 1-${
+        MAX_CARRIER_SANDBOX_SHIPMENT_PACKAGES
+      } packages`,
+      409,
+      'CARRIER_SHIPMENT_PACKAGE_COUNT_INVALID',
+    )
+  }
+  const fixture: CarrierSandboxShipmentRateFixture = {
+    origin: normalizeCarrierSandboxParty(options.fixture.origin),
+    destination: normalizeCarrierSandboxParty(options.fixture.destination),
+    parcels: options.fixture.parcels.map((parcel) => ({
+      ...parcel,
+    })),
+  }
+  const safeRequest = carrierSandboxShipmentRateRequestEvidence(
+    input.provider as 'ups_rest' | 'fedex_rest',
+    fixture,
+  )
+  const response = await executeCarrierSandboxRateRequest(input, {
+    fetchImpl: options.fetchImpl || fetch,
+    timeoutMs: options.timeoutMs,
+    fixture,
+    purpose: 'cartonization_shipment_rate',
+    responseLimitBytes: carrierSandboxShipmentResponseLimitBytes(
+      fixture.parcels.length,
+    ),
+    safeRequest,
+    safeResponseContext: {
+      rateScope: 'multi_package_shipment',
+      packageCount: fixture.parcels.length,
+    },
+  })
+  return {
+    result: {
+      provider: input.provider as 'ups_rest' | 'fedex_rest',
+      environment: 'sandbox',
+      purpose: 'cartonization_shipment_rate',
+      rateScope: 'multi_package_shipment',
+      fixture,
+      packageCount: fixture.parcels.length,
+      destinationFingerprint:
+        carrierSandboxPartyFingerprint(fixture.destination),
+      rates: response.rates,
+      testedAt: response.testedAt,
+    },
+    evidence: response.evidence,
   }
 }

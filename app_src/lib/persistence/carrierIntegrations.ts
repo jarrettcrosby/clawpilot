@@ -154,7 +154,10 @@ export type CarrierSandboxRateEvidenceInput = {
   billingRelationship: 'sender' | 'recipient' | 'third_party'
   billingSelectionSnapshot: Record<string, unknown>
   provider: DirectCarrierProvider
-  purpose: 'sandbox_rate_test' | 'cartonization_package_rate'
+  purpose:
+    | 'sandbox_rate_test'
+    | 'cartonization_package_rate'
+    | 'cartonization_shipment_rate'
   credentialVersion: number
   adapterVersion: string
   requestHash: string
@@ -1130,12 +1133,16 @@ export async function writeCarrierSandboxRateEvidenceInPostgres(
       organizationId: input.organizationId,
       eventType: input.status === 'succeeded'
         ? (
-            input.purpose === 'cartonization_package_rate'
+            input.purpose === 'cartonization_shipment_rate'
+              ? 'carrier.cartonization_shipment_rate.succeeded'
+              : input.purpose === 'cartonization_package_rate'
               ? 'carrier.cartonization_package_rate.succeeded'
               : 'carrier.sandbox_rate.succeeded'
           )
         : (
-            input.purpose === 'cartonization_package_rate'
+            input.purpose === 'cartonization_shipment_rate'
+              ? 'carrier.cartonization_shipment_rate.failed'
+              : input.purpose === 'cartonization_package_rate'
               ? 'carrier.cartonization_package_rate.failed'
               : 'carrier.sandbox_rate.failed'
           ),

@@ -325,9 +325,17 @@ for (const fragment of [
   'AG Alchemy packaging plan would exceed the eight-material limit',
   'Apply requires the exact current plan fingerprint from a fresh plan',
   'The explicit AG pack actor must be an active AG Alchemy owner or administrator',
+  'legacyRecipeOnlyProfileUpgradeAllowed',
+  "lifecycle_state = 'superseded'",
+  "lifecycle_state = 'retired'",
+  'legacyProfileVersionsSuperseded',
+  'legacyRecipeOnlyRepairIsVersioned: true',
   'materialsRemainDraft: true',
   'inventoryNotInferred: true',
   'missingFactsNotInvented: true',
+  'providerWrites: 0',
+  'inventoryWrites: 0',
+  'shipmentWrites: 0',
 ]) {
   assert.ok(agHierarchy.includes(fragment), `AG hierarchy command missing ${fragment}`)
 }

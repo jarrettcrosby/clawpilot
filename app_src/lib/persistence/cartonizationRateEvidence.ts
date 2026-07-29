@@ -12,7 +12,10 @@ import {
   withTransaction,
 } from '@/lib/persistence/postgres'
 
-export const MAX_CARTONIZATION_RATE_EVIDENCE_PACKAGES = 64
+// UPS Rating Shop accepts at most 50 package containers in one request.
+// Cartonization comparisons are whole-shipment requests and must not split or
+// sum independent package rates, so the shared evidence bound is 50.
+export const MAX_CARTONIZATION_RATE_EVIDENCE_PACKAGES = 50
 
 export type CartonizationRateEvidenceAllocation = {
   lineGlobalId: string
@@ -29,6 +32,19 @@ export type CartonizationRateEvidenceRecipeInput = {
   inputProfileVersionRowVersion: number
 }
 
+export type CartonizationRateEvidenceDimensionsMm = {
+  length: number
+  width: number
+  height: number
+}
+
+export type CartonizationRateEvidenceMaterialRateAssumption = {
+  materialGlobalId: string
+  expectedRowVersion: number
+  ratedOuterDimensionsMm: CartonizationRateEvidenceDimensionsMm
+  tareWeightGrams: number
+}
+
 export type CartonizationRateEvidencePackageInput = {
   packageKey: string
   packageSequence: number
@@ -36,16 +52,8 @@ export type CartonizationRateEvidencePackageInput = {
   packagingMaterialGlobalId: string
   materialRowVersion: number
   recipes: CartonizationRateEvidenceRecipeInput[]
-  innerDimensionsMm: {
-    length: number
-    width: number
-    height: number
-  }
-  ratedOuterDimensionsMm: {
-    length: number
-    width: number
-    height: number
-  }
+  innerDimensionsMm: CartonizationRateEvidenceDimensionsMm
+  ratedOuterDimensionsMm: CartonizationRateEvidenceDimensionsMm
   contentWeightGrams: number
   tareWeightGrams: number
   ratedGrossWeightGrams: number
@@ -80,6 +88,8 @@ export type CartonizationRateEvidenceWriteInput = {
   idempotencyKey: string
   actorEmail: string
   semanticRequestHash: string
+  materialRateAssumptions:
+    CartonizationRateEvidenceMaterialRateAssumption[]
   packages: CartonizationRateEvidencePackageInput[]
   quotes: CartonizationRateEvidenceQuoteInput[]
 }
@@ -158,6 +168,8 @@ type EvidenceQuoteRow = {
   carrier_request_hash: string
   package_rate_context_hash: string
   redacted_response: {
+    rateScope?: 'multi_package_shipment'
+    packageCount?: number
     rateCount?: number
     rates?: Array<{
       serviceCode: string
@@ -198,6 +210,27 @@ export type CartonizationRateEvidence = {
   idempotencyKey: string
   actorEmail: string | null
   createdAt: string
+  shipmentRates: Array<{
+    provider: 'ups_rest' | 'fedex_rest'
+    rateEvidenceGlobalId: string
+    status: 'succeeded' | 'failed'
+    errorCode: string | null
+    carrierRequestHash: string
+    shipmentRateContextHash: string
+    packageCount: number
+    packageKeys: string[]
+    rates: Array<{
+      serviceCode: string
+      serviceName: string
+      amount: string
+      currency: string
+      rateType: string | null
+      transitDays: number | null
+      deliveryDate: string | null
+    }>
+    requestedAt: string
+    completedAt: string
+  }>
   packages: Array<{
     packageKey: string
     packageSequence: number
@@ -240,6 +273,8 @@ export type CartonizationRateEvidence = {
       errorCode: string | null
       carrierRequestHash: string
       packageRateContextHash: string
+      shipmentRateContextHash: string | null
+      rateScope: 'single_package' | 'multi_package_shipment'
       rates: Array<{
         serviceCode: string
         serviceName: string
@@ -349,6 +384,113 @@ export function cartonizationRateEvidenceHash(value: unknown) {
     .digest('hex')
 }
 
+function exactMaterialRateDimensions(
+  value: CartonizationRateEvidenceDimensionsMm,
+) {
+  return (
+    Number.isSafeInteger(value?.length)
+    && value.length > 0
+    && Number.isSafeInteger(value?.width)
+    && value.width > 0
+    && Number.isSafeInteger(value?.height)
+    && value.height > 0
+  )
+}
+
+function sameMaterialRateDimensions(
+  left: CartonizationRateEvidenceDimensionsMm,
+  right: CartonizationRateEvidenceDimensionsMm,
+) {
+  return (
+    left.length === right.length
+    && left.width === right.width
+    && left.height === right.height
+  )
+}
+
+export function assertCartonizationRateEvidenceMaterialAssumptions(
+  input: Pick<
+    CartonizationRateEvidenceWriteInput,
+    'materialRateAssumptions' | 'assumptionSnapshot' | 'packages'
+  >,
+) {
+  if (
+    !Array.isArray(input.materialRateAssumptions)
+    || input.materialRateAssumptions.length < 1
+    || input.materialRateAssumptions.length > 8
+  ) {
+    fail(
+      'Cartonization rate evidence requires assumptions for one to eight packaging materials',
+      400,
+      'CARTONIZATION_RATE_EVIDENCE_MATERIAL_ASSUMPTIONS_INVALID',
+    )
+  }
+  const assumptionsByMaterial = new Map<
+    string,
+    CartonizationRateEvidenceMaterialRateAssumption
+  >()
+  for (const assumption of input.materialRateAssumptions) {
+    if (
+      !/^gmat[0-9]{7}$/.test(assumption?.materialGlobalId || '')
+      || !Number.isSafeInteger(assumption?.expectedRowVersion)
+      || assumption.expectedRowVersion < 0
+      || !exactMaterialRateDimensions(
+        assumption?.ratedOuterDimensionsMm,
+      )
+      || !Number.isSafeInteger(assumption?.tareWeightGrams)
+      || assumption.tareWeightGrams <= 0
+      || assumptionsByMaterial.has(assumption.materialGlobalId)
+    ) {
+      fail(
+        'Cartonization material rate assumptions must be unique and exact',
+        400,
+        'CARTONIZATION_RATE_EVIDENCE_MATERIAL_ASSUMPTIONS_INVALID',
+      )
+    }
+    assumptionsByMaterial.set(assumption.materialGlobalId, assumption)
+  }
+  const canonicalAssumptions = [...assumptionsByMaterial.values()].sort(
+    (left, right) => (
+      left.materialGlobalId.localeCompare(right.materialGlobalId)
+    ),
+  )
+  const retainedAssumptions =
+    input.assumptionSnapshot.materialRateAssumptions
+  if (
+    !Array.isArray(retainedAssumptions)
+    || cartonizationRateEvidenceHash(retainedAssumptions)
+      !== cartonizationRateEvidenceHash(canonicalAssumptions)
+  ) {
+    fail(
+      'The retained material assumptions do not match the rating request',
+      400,
+      'CARTONIZATION_RATE_EVIDENCE_MATERIAL_ASSUMPTIONS_INVALID',
+    )
+  }
+  for (const packageInput of input.packages) {
+    const assumption = assumptionsByMaterial.get(
+      packageInput.packagingMaterialGlobalId,
+    )
+    if (
+      !assumption
+      || assumption.expectedRowVersion
+        !== packageInput.materialRowVersion
+      || !sameMaterialRateDimensions(
+        assumption.ratedOuterDimensionsMm,
+        packageInput.ratedOuterDimensionsMm,
+      )
+      || assumption.tareWeightGrams
+        !== packageInput.tareWeightGrams
+    ) {
+      fail(
+        `${packageInput.packageKey} does not match its selected material assumptions`,
+        400,
+        'CARTONIZATION_RATE_EVIDENCE_MATERIAL_ASSUMPTION_MISMATCH',
+      )
+    }
+  }
+}
+
 export function cartonizationRateEvidenceRequestHash(
   input: Omit<
     CartonizationRateEvidenceWriteInput,
@@ -362,6 +504,11 @@ export function cartonizationRateEvidenceRequestHash(
       || left.packageKey.localeCompare(right.packageKey)
     ),
   )
+  const materialRateAssumptions = [...input.materialRateAssumptions].sort(
+    (left, right) => (
+      left.materialGlobalId.localeCompare(right.materialGlobalId)
+    ),
+  )
   return cartonizationRateEvidenceHash({
     organizationId: input.organizationId,
     accountGlobalId: input.accountGlobalId,
@@ -371,12 +518,15 @@ export function cartonizationRateEvidenceRequestHash(
     warehouseGlobalId: input.warehouseGlobalId,
     inventorySyncRunGlobalId: input.inventorySyncRunGlobalId,
     evidenceMode: input.evidenceMode,
+    rateScope: 'multi_package_shipment',
+    carrierRatePurpose: 'cartonization_shipment_rate',
     policyVersion: input.policyVersion,
     algorithmVersion: input.algorithmVersion,
     planInputHash: input.planInputHash,
     planResultHash: input.planResultHash,
     planSnapshot: input.planSnapshot,
     assumptionSnapshot: input.assumptionSnapshot,
+    materialRateAssumptions,
     packages,
   })
 }
@@ -392,6 +542,20 @@ export function cartonizationPackageRateContextHash(input: {
     purpose: 'cartonization_package_rate',
     destinationFingerprint: input.destinationFingerprint,
     parcel: input.parcel,
+  })
+}
+
+export function cartonizationShipmentRateContextHash(input: {
+  provider: 'ups_rest' | 'fedex_rest'
+  destinationFingerprint: string
+  parcels: CarrierSandboxParcel[]
+}) {
+  return cartonizationRateEvidenceHash({
+    version: 'cartonization-shipment-rate-context-v1',
+    provider: input.provider,
+    purpose: 'cartonization_shipment_rate',
+    destinationFingerprint: input.destinationFingerprint,
+    parcels: input.parcels,
   })
 }
 
@@ -578,6 +742,43 @@ function mapEvidence(
     current.push(recipe)
     recipesByPackage.set(recipe.package_key, current)
   }
+  const shipmentRates = (
+    ['ups_rest', 'fedex_rest'] as const
+  ).flatMap((provider) => {
+    const providerQuotes = quoteRows.filter(
+      (quote) => quote.provider === provider,
+    )
+    const first = providerQuotes[0]
+    if (
+      !first
+      || first.redacted_response?.rateScope
+        !== 'multi_package_shipment'
+      || providerQuotes.some((quote) => (
+        quote.rate_evidence_global_id
+          !== first.rate_evidence_global_id
+        || quote.package_rate_context_hash
+          !== first.package_rate_context_hash
+      ))
+    ) {
+      return []
+    }
+    return [{
+      provider,
+      rateEvidenceGlobalId: first.rate_evidence_global_id,
+      status: first.quote_status,
+      errorCode: first.error_code,
+      carrierRequestHash: first.carrier_request_hash,
+      shipmentRateContextHash: first.package_rate_context_hash,
+      packageCount: first.redacted_response.packageCount
+        || providerQuotes.length,
+      packageKeys: packageRows.map((row) => row.package_key),
+      rates: Array.isArray(first.redacted_response?.rates)
+        ? first.redacted_response.rates
+        : [],
+      requestedAt: timestamp(first.requested_at),
+      completedAt: timestamp(first.completed_at),
+    }]
+  })
   return {
     globalId: header.global_id,
     accountGlobalId: header.account_global_id,
@@ -606,6 +807,7 @@ function mapEvidence(
     idempotencyKey: header.idempotency_key,
     actorEmail: header.actor_email,
     createdAt: timestamp(header.created_at),
+    shipmentRates,
     packages: packageRows.map((row) => {
       const packageRecipes = (recipesByPackage.get(row.package_key) || [])
         .map((recipe) => ({
@@ -662,6 +864,16 @@ function mapEvidence(
         errorCode: quote.error_code,
         carrierRequestHash: quote.carrier_request_hash,
         packageRateContextHash: quote.package_rate_context_hash,
+        shipmentRateContextHash:
+          quote.redacted_response?.rateScope
+            === 'multi_package_shipment'
+            ? quote.package_rate_context_hash
+            : null,
+        rateScope:
+          quote.redacted_response?.rateScope
+            === 'multi_package_shipment'
+            ? 'multi_package_shipment'
+            : 'single_package',
         rates: Array.isArray(quote.redacted_response?.rates)
           ? quote.redacted_response.rates
           : [],
@@ -992,6 +1204,7 @@ export async function writeCartonizationRateEvidenceInPostgres(
       400,
     )
   }
+  assertCartonizationRateEvidenceMaterialAssumptions(input)
   const inputPlanResultHash = cartonizationRateEvidenceHash(input.planSnapshot)
   if (inputPlanResultHash !== input.planResultHash) {
     fail('Plan result hash does not match the exact plan snapshot', 400)
@@ -1388,6 +1601,25 @@ export async function writeCartonizationRateEvidenceInPostgres(
       carrierRequestHash: string
       packageRateContextHash: string
     }>()
+    type ResolvedCarrierRateEvidence = {
+      id: string
+      status: 'succeeded' | 'failed'
+      error_code: string | null
+      request_hash: string
+      redacted_request: Record<string, unknown>
+    }
+    const rateContextsByEvidence =
+      new Map<string, ResolvedCarrierRateEvidence>()
+    const orderedShipmentParcels = [...input.packages]
+      .sort((left, right) => (
+        left.packageSequence - right.packageSequence
+        || left.packageKey.localeCompare(right.packageKey)
+      ))
+      .map((packageInput) => packageInput.carrierParcel)
+    const rateEvidenceByProvider = new Map<
+      'ups_rest' | 'fedex_rest',
+      string
+    >()
     for (const quote of input.quotes) {
       const key = `${quote.packageKey}:${quote.provider}`
       if (quoteContexts.has(key)) {
@@ -1396,29 +1628,44 @@ export async function writeCartonizationRateEvidenceInPostgres(
       if (!packageContexts.has(quote.packageKey)) {
         fail(`Quote ${key} references an unknown package`, 400)
       }
-      const result = await client.query<{
-        id: string
-        status: 'succeeded' | 'failed'
-        error_code: string | null
-        request_hash: string
-        redacted_request: Record<string, unknown>
-      }>(
-        `SELECT
-           id::text, status, error_code, request_hash, redacted_request
-         FROM operations_carrier_rate_requests
-         WHERE organization_id = $1::uuid
-           AND global_id = $2
-           AND provider = $3
-           AND purpose = 'cartonization_package_rate'
-         LIMIT 1
-         FOR SHARE`,
-        [
-          input.organizationId,
-          quote.rateEvidenceGlobalId,
-          quote.provider,
-        ],
+      const retainedEvidence = rateEvidenceByProvider.get(quote.provider)
+      if (
+        retainedEvidence
+        && retainedEvidence !== quote.rateEvidenceGlobalId
+      ) {
+        fail(
+          `${quote.provider} must use one whole-shipment carrier result for every package`,
+          409,
+          'CARTONIZATION_RATE_EVIDENCE_QUOTE_CONTEXT_MISMATCH',
+        )
+      }
+      rateEvidenceByProvider.set(
+        quote.provider,
+        quote.rateEvidenceGlobalId,
       )
-      const rate = result.rows[0]
+      const rateEvidenceKey =
+        `${quote.provider}:${quote.rateEvidenceGlobalId}`
+      let rate = rateContextsByEvidence.get(rateEvidenceKey)
+      if (!rate) {
+        const result = await client.query<ResolvedCarrierRateEvidence>(
+          `SELECT
+             id::text, status, error_code, request_hash, redacted_request
+           FROM operations_carrier_rate_requests
+           WHERE organization_id = $1::uuid
+             AND global_id = $2
+             AND provider = $3
+             AND purpose = 'cartonization_shipment_rate'
+           LIMIT 1
+           FOR SHARE`,
+          [
+            input.organizationId,
+            quote.rateEvidenceGlobalId,
+            quote.provider,
+          ],
+        )
+        rate = result.rows[0]
+        if (rate) rateContextsByEvidence.set(rateEvidenceKey, rate)
+      }
       if (!rate) {
         fail(
           `Quote evidence ${quote.rateEvidenceGlobalId} is unavailable for this cartonization proof`,
@@ -1426,9 +1673,6 @@ export async function writeCartonizationRateEvidenceInPostgres(
           'CARTONIZATION_RATE_EVIDENCE_QUOTE_INVALID',
         )
       }
-      const packageInput = input.packages.find(
-        (item) => item.packageKey === quote.packageKey,
-      )!
       const shipment = rate.redacted_request?.shipment
       if (!shipment || typeof shipment !== 'object' || Array.isArray(shipment)) {
         fail(
@@ -1439,12 +1683,15 @@ export async function writeCartonizationRateEvidenceInPostgres(
       }
       const exactShipment = shipment as Record<string, unknown>
       if (
-        exactShipment.destinationFingerprint !== input.destinationFingerprint
-        || cartonizationRateEvidenceHash(exactShipment.parcel)
-          !== cartonizationRateEvidenceHash(packageInput.carrierParcel)
+        exactShipment.rateScope !== 'multi_package_shipment'
+        || exactShipment.packageCount !== orderedShipmentParcels.length
+        || exactShipment.destinationFingerprint
+          !== input.destinationFingerprint
+        || cartonizationRateEvidenceHash(exactShipment.parcels)
+          !== cartonizationRateEvidenceHash(orderedShipmentParcels)
       ) {
         fail(
-          `Quote evidence ${quote.rateEvidenceGlobalId} does not match ${quote.packageKey}`,
+          `Quote evidence ${quote.rateEvidenceGlobalId} does not match the ordered whole shipment`,
           409,
           'CARTONIZATION_RATE_EVIDENCE_QUOTE_CONTEXT_MISMATCH',
         )
@@ -1455,19 +1702,20 @@ export async function writeCartonizationRateEvidenceInPostgres(
         status: rate.status,
         errorCode: rate.error_code,
         carrierRequestHash: rate.request_hash,
-        packageRateContextHash: cartonizationPackageRateContextHash({
+        packageRateContextHash: cartonizationShipmentRateContextHash({
           provider: quote.provider,
           destinationFingerprint: input.destinationFingerprint,
-          parcel: packageInput.carrierParcel,
+          parcels: orderedShipmentParcels,
         }),
       })
     }
-    const failedQuoteCount = [...quoteContexts.values()].filter(
-      (quote) => quote.status === 'failed',
+    const carrierReads = [...rateContextsByEvidence.values()]
+    const failedCarrierReadCount = carrierReads.filter(
+      (rate) => rate.status === 'failed',
     ).length
-    const expectedStatus = failedQuoteCount === 0
+    const expectedStatus = failedCarrierReadCount === 0
       ? 'succeeded'
-      : failedQuoteCount === quoteContexts.size
+      : failedCarrierReadCount === carrierReads.length
         ? 'failed'
         : 'partial'
     if (input.status !== expectedStatus) {
@@ -1603,11 +1851,12 @@ export async function writeCartonizationRateEvidenceInPostgres(
       await client.query(
         `INSERT INTO operations_cartonization_rate_evidence_quotes (
            organization_id, evidence_id, package_key, provider,
-           carrier_rate_request_id,
+           rate_purpose, carrier_rate_request_id,
            quote_status, error_code, carrier_request_hash,
            package_rate_context_hash
          ) VALUES (
-           $1::uuid, $2::uuid, $3, $4, $5::uuid, $6, $7, $8, $9
+           $1::uuid, $2::uuid, $3, $4,
+           'cartonization_shipment_rate', $5::uuid, $6, $7, $8, $9
          )`,
         [
           input.organizationId,

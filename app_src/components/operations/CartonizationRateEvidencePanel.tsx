@@ -10,12 +10,6 @@ import {
   Divider,
   Paper,
   Stack,
-  Table,
-  TableBody,
-  TableCell,
-  TableContainer,
-  TableHead,
-  TableRow,
   Typography,
 } from '@mui/material'
 import RefreshRounded from '@mui/icons-material/RefreshRounded'
@@ -47,6 +41,8 @@ type EvidenceQuote = {
   errorCode: string | null
   carrierRequestHash: string
   packageRateContextHash: string
+  shipmentRateContextHash: string | null
+  rateScope: 'single_package' | 'multi_package_shipment'
   rates: EvidenceRate[]
   requestedAt: string
   completedAt: string
@@ -142,6 +138,16 @@ type AssumptionLine = {
   value: string
 }
 
+type PlanLevelServiceTotal = {
+  provider: EvidenceQuote['provider']
+  serviceCode: string
+  serviceName: string
+  currency: string
+  amount: number
+  packageCount: number
+  rateEvidenceGlobalId: string
+}
+
 const referenceSx = {
   fontFamily: 'monospace',
   overflowWrap: 'anywhere',
@@ -168,17 +174,107 @@ function formatTimestamp(value: string) {
   }).format(new Date(timestamp))
 }
 
-function formatRate(rate: EvidenceRate) {
-  const amount = Number(rate.amount)
-  if (!Number.isFinite(amount)) return `${rate.amount} ${rate.currency}`
+function formatMoney(amount: number, currency: string) {
   try {
     return new Intl.NumberFormat('en-US', {
       style: 'currency',
-      currency: rate.currency,
+      currency,
     }).format(amount)
   } catch {
-    return `${rate.amount} ${rate.currency}`
+    return `${amount.toFixed(2)} ${currency}`
   }
+}
+
+function formatEvidenceRate(rate: EvidenceRate) {
+  const amount = Number(rate.amount)
+  return Number.isFinite(amount)
+    ? formatMoney(amount, rate.currency)
+    : `${rate.amount} ${rate.currency}`
+}
+
+function isGroundService(total: PlanLevelServiceTotal) {
+  return (
+    total.serviceCode === '03'
+    || total.serviceCode === 'FEDEX_GROUND'
+    || total.serviceName.toLowerCase().includes('ground')
+  )
+}
+
+function commonPlanServiceTotals(
+  packages: EvidencePackage[],
+): PlanLevelServiceTotal[] {
+  if (packages.length === 0) return []
+  const totals: PlanLevelServiceTotal[] = []
+  for (const provider of ['ups_rest', 'fedex_rest'] as const) {
+    const planQuotes = packages.map((item) => item.quotes.find(
+      (quote) => quote.provider === provider,
+    ))
+    if (
+      planQuotes.some((quote) => (
+        quote?.status !== 'succeeded'
+        || quote.rateScope !== 'multi_package_shipment'
+        || !quote.shipmentRateContextHash
+      ))
+      || new Set(
+        planQuotes.map((quote) => quote?.rateEvidenceGlobalId),
+      ).size !== 1
+      || new Set(
+        planQuotes.map((quote) => quote?.shipmentRateContextHash),
+      ).size !== 1
+    ) continue
+    const firstQuote = planQuotes[0]!
+    const candidateKeys = new Set(
+      firstQuote.rates.map((rate) => JSON.stringify([
+        rate.serviceCode,
+        rate.serviceName,
+        rate.currency,
+      ])),
+    )
+    for (const candidateKey of candidateKeys) {
+      const [serviceCode, serviceName, currency] =
+        JSON.parse(candidateKey) as [string, string, string]
+      let amount: number | null = null
+      let complete = true
+      for (const quote of planQuotes) {
+        const matchingRates = quote?.rates.filter((rate) => (
+          rate.serviceCode === serviceCode
+          && rate.serviceName === serviceName
+          && rate.currency === currency
+          && Number.isFinite(Number(rate.amount))
+          && Number(rate.amount) >= 0
+        )) || []
+        if (quote?.status !== 'succeeded' || matchingRates.length !== 1) {
+          complete = false
+          break
+        }
+        const matchingAmount = Number(matchingRates[0].amount)
+        if (amount !== null && matchingAmount !== amount) {
+          complete = false
+          break
+        }
+        amount = matchingAmount
+      }
+      if (complete && amount !== null) {
+        totals.push({
+          provider,
+          serviceCode,
+          serviceName,
+          currency,
+          amount,
+          packageCount: packages.length,
+          rateEvidenceGlobalId: firstQuote.rateEvidenceGlobalId,
+        })
+      }
+    }
+  }
+  return totals.sort((left, right) => (
+    Number(isGroundService(right)) - Number(isGroundService(left))
+    || providerLabel(left.provider).localeCompare(
+      providerLabel(right.provider),
+    )
+    || left.amount - right.amount
+    || left.serviceName.localeCompare(right.serviceName)
+  ))
 }
 
 function sentenceLabel(value: string) {
@@ -313,6 +409,18 @@ export default function CartonizationRateEvidencePanel({
     () => assumptionLines(evidence?.assumptionSnapshot || {}),
     [evidence?.assumptionSnapshot],
   )
+  const rateSummary = useMemo(() => {
+    const packages = evidence?.packages || []
+    const quotes = packages.flatMap((item) => item.quotes)
+    return {
+      physicalPackages: packages.length,
+      quoteEdges: quotes.length,
+      carrierRequests: new Set(
+        quotes.map((quote) => quote.rateEvidenceGlobalId),
+      ).size,
+      commonServiceTotals: commonPlanServiceTotals(packages),
+    }
+  }, [evidence?.packages])
 
   return (
     <Paper
@@ -512,6 +620,133 @@ export default function CartonizationRateEvidencePanel({
               </Box>
             ) : null}
 
+            <Paper
+              component="section"
+              aria-label="Physical plan carrier summary"
+              variant="outlined"
+              sx={{ p: 1.5 }}
+            >
+              <Typography fontWeight={800}>
+                Shipment-level service options — one service applies to all{' '}
+                {rateSummary.physicalPackages} package{
+                  rateSummary.physicalPackages === 1 ? '' : 's'
+                }
+              </Typography>
+              <Alert severity="info" variant="outlined" sx={{ mt: 1 }}>
+                These are the only valid service choices for this shipment.
+                Each option is one carrier service and currency returned by the
+                same multi-package rate request for every physical package.
+                A service missing from any package is excluded.
+              </Alert>
+              <Stack
+                direction={{ xs: 'column', sm: 'row' }}
+                spacing={1}
+                sx={{ my: 1 }}
+              >
+                <Chip
+                  variant="outlined"
+                  label={`${rateSummary.physicalPackages} physical packages`}
+                />
+                <Chip
+                  variant="outlined"
+                  label={`${rateSummary.quoteEdges} supporting quote bindings`}
+                />
+                <Chip
+                  variant="outlined"
+                  label={`${rateSummary.carrierRequests} carrier requests`}
+                />
+              </Stack>
+              {rateSummary.commonServiceTotals.length > 0 ? (
+                <Box
+                  component="ul"
+                  aria-label="Valid shipment-level carrier service choices"
+                  sx={{
+                    display: 'grid',
+                    gridTemplateColumns: {
+                      xs: '1fr',
+                      sm: 'repeat(2, minmax(0, 1fr))',
+                    },
+                    gap: 1,
+                    listStyle: 'none',
+                    m: 0,
+                    p: 0,
+                  }}
+                >
+                  {rateSummary.commonServiceTotals.map((total) => (
+                    <Box
+                      component="li"
+                      key={[
+                        total.provider,
+                        total.serviceCode,
+                        total.serviceName,
+                        total.currency,
+                      ].join(':')}
+                      sx={{
+                        p: 1.25,
+                        borderRadius: 1,
+                        border: '1px solid',
+                        borderColor: 'divider',
+                      }}
+                    >
+                      <Stack
+                        direction="row"
+                        justifyContent="space-between"
+                        alignItems="flex-start"
+                        gap={1}
+                      >
+                        <Box>
+                          <Typography fontWeight={800}>
+                            {providerLabel(total.provider)} · {
+                              total.serviceName
+                            }
+                          </Typography>
+                          <Typography variant="caption" color="text.secondary">
+                            Service {total.serviceCode} · {total.currency}
+                          </Typography>
+                        </Box>
+                        <Chip
+                          size="small"
+                          color="success"
+                          label="Shipment choice"
+                        />
+                      </Stack>
+                      <Typography variant="h6" fontWeight={800}>
+                        {formatMoney(total.amount, total.currency)}
+                      </Typography>
+                      <Typography variant="caption" color="text.secondary">
+                        One total for all {total.packageCount} packages
+                      </Typography>
+                      <Typography
+                        variant="caption"
+                        color="text.secondary"
+                        display="block"
+                        sx={referenceSx}
+                      >
+                        {total.rateEvidenceGlobalId}
+                      </Typography>
+                    </Box>
+                  ))}
+                </Box>
+              ) : (
+                <Alert severity="warning">
+                  No single carrier service and currency was returned by one
+                  multi-package request for every physical package. There is
+                  no shipment-level service choice in this evidence.
+                </Alert>
+              )}
+            </Paper>
+
+            <Box>
+              <Typography variant="subtitle1" fontWeight={800}>
+                Physical package allocation and parcel evidence
+              </Typography>
+              <Typography variant="body2" color="text.secondary">
+                The package rows below support the carton plan and exact carrier
+                request. Their referenced rates are non-selectable evidence;
+                service selection applies to the shipment as a whole above.
+              </Typography>
+            </Box>
+
             <Stack spacing={2}>
               {evidence.packages.map((item) => (
                 <Paper
@@ -694,88 +929,117 @@ export default function CartonizationRateEvidencePanel({
 
                     <Box>
                       <Typography variant="subtitle2" fontWeight={800} gutterBottom>
-                        UPS and FedEx sandbox quote matrix
+                        Immutable carrier evidence references
                       </Typography>
-                      <TableContainer component={Paper} variant="outlined">
-                        <Table size="small" aria-label={`Carrier rates for package ${item.packageSequence}`}>
-                          <TableHead>
-                            <TableRow>
-                              <TableCell>Carrier</TableCell>
-                              <TableCell>Service</TableCell>
-                              <TableCell align="right">Rate</TableCell>
-                              <TableCell>Transit</TableCell>
-                              <TableCell>Rate evidence</TableCell>
-                            </TableRow>
-                          </TableHead>
-                          <TableBody>
-                            {item.quotes.flatMap((quote) => {
-                              if (
-                                quote.status === 'failed'
-                                || quote.rates.length === 0
-                              ) {
-                                return [(
-                                  <TableRow key={`${quote.provider}:failed`}>
-                                    <TableCell>
-                                      {providerLabel(quote.provider)}
-                                    </TableCell>
-                                    <TableCell colSpan={3}>
-                                      <Chip
-                                        size="small"
-                                        color="error"
-                                        label={quote.errorCode
-                                          ? `Failed: ${quote.errorCode}`
-                                          : 'No rates returned'}
-                                      />
-                                    </TableCell>
-                                    <TableCell sx={referenceSx}>
-                                      {quote.rateEvidenceGlobalId}
-                                    </TableCell>
-                                  </TableRow>
-                                )]
-                              }
-                              return quote.rates.map((rate) => (
-                                <TableRow
-                                  key={`${quote.provider}:${rate.serviceCode}:${rate.amount}:${rate.rateType || ''}`}
-                                >
-                                  <TableCell>
-                                    {providerLabel(quote.provider)}
-                                  </TableCell>
-                                  <TableCell>
-                                    <Typography variant="body2" fontWeight={650}>
-                                      {rate.serviceName}
-                                    </Typography>
-                                    <Typography variant="caption" color="text.secondary">
-                                      {rate.serviceCode}
-                                      {rate.rateType ? ` · ${rate.rateType}` : ''}
-                                    </Typography>
-                                  </TableCell>
-                                  <TableCell align="right">
-                                    {formatRate(rate)}
-                                  </TableCell>
-                                  <TableCell>
-                                    {rate.transitDays === null
-                                      ? 'Not supplied'
-                                      : `${rate.transitDays} day${rate.transitDays === 1 ? '' : 's'}`}
-                                    {rate.deliveryDate
-                                      ? ` · ${rate.deliveryDate}`
-                                      : ''}
-                                  </TableCell>
-                                  <TableCell sx={referenceSx}>
-                                    {quote.rateEvidenceGlobalId}
-                                  </TableCell>
-                                </TableRow>
-                              ))
-                            })}
-                            {item.quotes.length === 0 ? (
-                              <TableRow>
-                                <TableCell colSpan={5}>
-                                  No carrier quote evidence is attached.
-                                </TableCell>
-                              </TableRow>
-                            ) : null}
-                          </TableBody>
-                        </Table>
-                      </TableContainer>
+                      <Typography variant="body2" color="text.secondary">
+                        Multi-package references prove this parcel was included
+                        in the shipment request. Older single-package rates
+                        remain visible only as read-only historical evidence.
+                      </Typography>
+                      {item.quotes.length > 0 ? (
+                        <Stack
+                          component="ul"
+                          spacing={0.75}
+                          aria-label={`Carrier evidence references for package ${item.packageSequence}`}
+                          sx={{ listStyle: 'none', m: 0, mt: 1, p: 0 }}
+                        >
+                          {item.quotes.map((quote) => (
+                            <Box
+                              component="li"
+                              key={`${quote.provider}:${quote.rateEvidenceGlobalId}`}
+                              sx={{
+                                p: 1,
+                                border: '1px solid',
+                                borderColor: 'divider',
+                                borderRadius: 1,
+                              }}
+                            >
+                              <Stack
+                                direction={{ xs: 'column', sm: 'row' }}
+                                justifyContent="space-between"
+                                alignItems={{ xs: 'flex-start', sm: 'center' }}
+                                gap={0.75}
+                              >
+                                <Typography fontWeight={700}>
+                                  {providerLabel(quote.provider)}
+                                </Typography>
+                                <Chip
+                                  size="small"
+                                  color={quote.status === 'succeeded'
+                                    ? 'success'
+                                    : 'error'}
+                                  label={quote.status === 'succeeded'
+                                    ? quote.rateScope
+                                      === 'multi_package_shipment'
+                                      ? 'Referenced by multi-package shipment'
+                                      : 'Legacy single-package evidence'
+                                    : quote.errorCode
+                                      ? `Failed: ${quote.errorCode}`
+                                      : 'Failed'}
+                                />
+                              </Stack>
+                              <Typography variant="body2" sx={referenceSx}>
+                                {quote.rateEvidenceGlobalId}
+                              </Typography>
+                              <Typography
+                                variant="caption"
+                                color="text.secondary"
+                                sx={referenceSx}
+                              >
+                                Request {quote.carrierRequestHash} · package
+                                context {quote.packageRateContextHash}
+                              </Typography>
+                              {quote.rateScope === 'single_package' ? (
+                                <Box sx={{ mt: 1 }}>
+                                  <Alert severity="warning" variant="outlined">
+                                    Read-only legacy package rates. These values
+                                    are not summed, are not shipment-level
+                                    options, and cannot be selected separately.
+                                  </Alert>
+                                  <Stack
+                                    component="ul"
+                                    spacing={0.5}
+                                    aria-label={`Legacy package rates from ${providerLabel(quote.provider)}`}
+                                    sx={{ listStyle: 'none', m: 0, mt: 0.75, p: 0 }}
+                                  >
+                                    {quote.rates.map((rate) => (
+                                      <Box
+                                        component="li"
+                                        key={[
+                                          rate.serviceCode,
+                                          rate.serviceName,
+                                          rate.currency,
+                                          rate.amount,
+                                          rate.rateType || '',
+                                        ].join(':')}
+                                        sx={{
+                                          display: 'flex',
+                                          justifyContent: 'space-between',
+                                          gap: 1,
+                                        }}
+                                      >
+                                        <Typography variant="body2">
+                                          {rate.serviceName} · {
+                                            rate.serviceCode
+                                          }
+                                        </Typography>
+                                        <Typography variant="body2" fontWeight={700}>
+                                          {formatEvidenceRate(rate)}
+                                        </Typography>
+                                      </Box>
+                                    ))}
+                                  </Stack>
+                                </Box>
+                              ) : null}
+                            </Box>
+                          ))}
+                        </Stack>
+                      ) : (
+                        <Alert severity="warning" sx={{ mt: 1 }}>
+                          No carrier evidence reference is attached to this
+                          package.
+                        </Alert>
+                      )}
                     </Box>
                   </Stack>
                 </Paper>

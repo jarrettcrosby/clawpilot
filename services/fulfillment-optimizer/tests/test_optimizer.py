@@ -206,7 +206,7 @@ class FulfillmentSolverTest(unittest.TestCase):
         plan = result["selectedPlan"]
         self.assertEqual(plan["warehouseGlobalIds"], ["gwhs0000001"])
         self.assertEqual(plan["warehouseCount"], 1)
-        self.assertEqual(plan["shipmentCount"], 2)
+        self.assertEqual(plan["shipmentCount"], 1)
         self.assertEqual(plan["cartonCount"], 2)
         self.assertEqual(plan["estimatedTotalCostMinor"], 1_570)
         self.assertEqual(plan["unusedVolumeMm3"], 1_168_000)
@@ -290,6 +290,7 @@ class FulfillmentSolverTest(unittest.TestCase):
             split["selectedPlan"]["warehouseGlobalIds"],
             ["gwhs0000001", "gwhs0000002"],
         )
+        self.assertEqual(split["selectedPlan"]["shipmentCount"], 2)
 
 
 class AssortmentSolverTest(unittest.TestCase):
