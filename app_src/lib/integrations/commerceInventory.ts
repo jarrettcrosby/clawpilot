@@ -9,6 +9,10 @@ import {
   sanitizedCommerceIntegrationError,
 } from '@/lib/integrations/commerceIntegrations'
 import {
+  hasEffectiveShopifyScope,
+  type ShopifyAccessScope,
+} from '@/lib/integrations/commerceCapabilities'
+import {
   normalizeShopifyShopDomain,
   probeShopifyConnection,
   requestShopifyAccessToken,
@@ -41,7 +45,7 @@ const REQUIRED_SCOPES = Object.freeze([
   'read_inventory',
   'read_locations',
   'read_products',
-])
+] as const satisfies readonly ShopifyAccessScope[])
 
 function inventoryError(error: unknown): CommerceIntegrationRequestError {
   if (error instanceof CommerceIntegrationRequestError) return error
@@ -249,8 +253,9 @@ function requestHash(
 function missingScopes(
   grantedScopes: readonly string[],
 ): string[] {
-  const granted = new Set(grantedScopes)
-  return REQUIRED_SCOPES.filter((scope) => !granted.has(scope))
+  return REQUIRED_SCOPES.filter(
+    (scope) => !hasEffectiveShopifyScope(grantedScopes, scope),
+  )
 }
 
 function failureState(error: unknown): 'failed' | 'unknown' {

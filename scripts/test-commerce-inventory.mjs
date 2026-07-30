@@ -700,6 +700,11 @@ assert.match(
   inventoryOrchestration,
   /location\.shipsInventory[\s\S]+location\.fulfillsOnlineOrders[\s\S]+!location\.isFulfillmentService/,
 )
+assert.match(
+  inventoryOrchestration,
+  /hasEffectiveShopifyScope\(grantedScopes, scope\)/,
+  'Inventory scope checks must honor Shopify write-scope implied read access',
+)
 const operationsPersistence = read(
   'app_src/lib/persistence/operations.ts',
 )

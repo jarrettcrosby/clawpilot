@@ -642,6 +642,11 @@ Preview runs and rows cannot be updated and expire no later than 24 hours. One h
 ### Shopify Inventory Reconciliation
 
 Migration `0124` adds a separate development-only, manager-triggered Shopify inventory boundary. It requires Postgres, the commerce-intake feature gate, a configured and verified Shopify account, the exact `read_inventory`, `read_locations`, and `read_products` grant, one active ClawPilot warehouse, and one uniquely eligible active physical Shopify location. An existing location mapping must still resolve to that same eligible provider location. The command cannot create a warehouse, select an arbitrary provider host, register a webhook, advance an order cursor, or make a Shopify mutation.
+The inventory command uses the shared Shopify effective-scope projection:
+provider-reported `write_inventory` and `write_products` satisfy their paired
+read requirements, while `read_locations` remains independently required.
+Both the token grant and live installation probe must still satisfy that
+effective set before any inventory evidence is captured.
 
 The adapter reads every bounded page for the selected location and requests `available`, `incoming`, `committed`, `damaged`, `on_hand`, `quality_control`, `reserved`, and `safety_stock`. Each retained level includes the provider inventory-item identity, SKU, tracking policy, per-state quantity evidence, variant/product identity, barcode, title, vendor, product type and status, inventory policy, customs facts, native weight, and other bounded operational product evidence Shopify supplies. Exact length, width, and height are retained only when a merchant metafield definition unambiguously identifies one axis and uses Shopify's single-value `dimension` type. `list.dimension` definitions are retained as ambiguous evidence but are not selected as a physical axis. Missing or ambiguous dimensions stay visible as gaps; ClawPilot does not infer package dimensions from title, image, weight, or unrelated metafields. Provider product evidence does not replace the editable ClawPilot package profile required for cartonization.
 
