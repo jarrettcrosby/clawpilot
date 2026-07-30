@@ -114,6 +114,63 @@ export type CarrierSandboxRate = {
   deliveryDate: string | null
 }
 
+const EXACT_RATE_AMOUNT = /^(?:0|[1-9][0-9]{0,12})(?:\.[0-9]{1,2})?$/
+
+function exactRateAmountMinor(value: string) {
+  if (!EXACT_RATE_AMOUNT.test(value)) return null
+  const [whole, fraction = ''] = value.split('.')
+  return BigInt(`${whole}${fraction.padEnd(2, '0')}`)
+}
+
+function compareDuplicateServiceRates(
+  left: CarrierSandboxRate,
+  right: CarrierSandboxRate,
+) {
+  const leftMinor = exactRateAmountMinor(left.amount)
+  const rightMinor = exactRateAmountMinor(right.amount)
+  if (leftMinor === null && rightMinor !== null) return 1
+  if (leftMinor !== null && rightMinor === null) return -1
+  if (leftMinor !== null && rightMinor !== null && leftMinor !== rightMinor) {
+    return leftMinor < rightMinor ? -1 : 1
+  }
+  return (
+    (left.deliveryDate || '9999-12-31')
+      .localeCompare(right.deliveryDate || '9999-12-31')
+    || (left.transitDays ?? 366) - (right.transitDays ?? 366)
+    || left.serviceName.localeCompare(right.serviceName)
+    || (left.rateType || '').localeCompare(right.rateType || '')
+  )
+}
+
+/**
+ * FedEx can return more than one rateReplyDetails row for the same service
+ * code. Shopify requires a unique service code, so collapse exact-currency
+ * duplicates to the lowest usable account rate before the strict checkout
+ * response boundary. A cross-currency duplicate remains visible and will fail
+ * closed in the checkout normalizer.
+ */
+function collapseFedexDuplicateServices(
+  rates: CarrierSandboxRate[],
+) {
+  const selected = new Map<string, CarrierSandboxRate>()
+  const passthrough: CarrierSandboxRate[] = []
+  for (const rate of rates) {
+    const current = selected.get(rate.serviceCode)
+    if (!current) {
+      selected.set(rate.serviceCode, rate)
+      continue
+    }
+    if (current.currency !== rate.currency) {
+      passthrough.push(rate)
+      continue
+    }
+    if (compareDuplicateServiceRates(rate, current) < 0) {
+      selected.set(rate.serviceCode, rate)
+    }
+  }
+  return [...selected.values(), ...passthrough]
+}
+
 export type CarrierSandboxRateResult = {
   provider: 'ups_rest' | 'fedex_rest'
   environment: 'sandbox'
@@ -677,7 +734,7 @@ function upsRequest(
 
 function parseFedex(payload: Record<string, unknown>): CarrierSandboxRate[] {
   const output = record(payload.output)
-  return list(output.rateReplyDetails).flatMap((rawDetail) => {
+  const rates = list(output.rateReplyDetails).flatMap((rawDetail) => {
     const detail = record(rawDetail)
     const rated = list(detail.ratedShipmentDetails).map(record)
     const preferred = rated.find((item) => text(item.rateType).includes('ACCOUNT')) || rated[0]
@@ -699,6 +756,7 @@ function parseFedex(payload: Record<string, unknown>): CarrierSandboxRate[] {
       deliveryDate: normalizeDate(dateDetail.dayFormat || operational.deliveryDate),
     }]
   })
+  return collapseFedexDuplicateServices(rates)
 }
 
 function parseUps(payload: Record<string, unknown>): CarrierSandboxRate[] {

@@ -5,6 +5,7 @@ import {
   fingerprintShopifyCarrierServiceRateRequest,
   parseShopifyCarrierServiceRateRequest,
   readShopifyCarrierServiceRateRequest,
+  shopifyCarrierServiceRequestMatchesTestAllowlist,
   SHOPIFY_CARRIER_SERVICE_MAX_REQUEST_BYTES,
   ShopifyCarrierServiceProtocolError,
 } from '../../lib/integrations/shopifyCarrierServiceProtocol.ts'
@@ -131,10 +132,11 @@ test('keeps a zero-dollar cart shippable and eligible for rating', () => {
   )
 })
 
-test('fingerprint is canonical across object keys, line order, and contact changes', () => {
+test('fingerprint is canonical across line order and ephemeral contact changes', () => {
   const first = fixture()
   const second = fixture()
   second.rate.items.reverse()
+  second.rate.destination.name = 'A different checkout recipient'
   second.rate.destination.email = 'different@example.com'
   second.rate.destination.phone = '212-555-9999'
   second.rate.customer.email = 'other@example.com'
@@ -153,12 +155,70 @@ test('fingerprint is canonical across object keys, line order, and contact chang
   assert.match(firstFingerprint, /^[a-f0-9]{64}$/)
   assert.equal(firstFingerprint.includes('Jarrett'), false)
 
+  second.rate.customer.id = 207119552
+  assert.notEqual(
+    firstFingerprint,
+    fingerprintShopifyCarrierServiceRateRequest(
+      parseShopifyCarrierServiceRateRequest(second),
+    ),
+  )
+  second.rate.customer.id = 207119551
   second.rate.items[0]!.quantity = 3
   assert.notEqual(
     firstFingerprint,
     fingerprintShopifyCarrierServiceRateRequest(
       parseShopifyCarrierServiceRateRequest(second),
     ),
+  )
+})
+
+test('Shadow test allowlist requires the exact customer and every shippable variant', () => {
+  const request = parseShopifyCarrierServiceRateRequest(fixture())
+  const allowlist = {
+    customerIds: new Set(['207119551']),
+    variantIds: new Set(['258644705304', '258644705305']),
+  }
+  assert.equal(
+    shopifyCarrierServiceRequestMatchesTestAllowlist(request, allowlist),
+    true,
+  )
+  assert.equal(
+    shopifyCarrierServiceRequestMatchesTestAllowlist(request, {
+      ...allowlist,
+      customerIds: new Set(['2071195510']),
+    }),
+    false,
+  )
+  assert.equal(
+    shopifyCarrierServiceRequestMatchesTestAllowlist(request, {
+      ...allowlist,
+      variantIds: new Set(['258644705304']),
+    }),
+    false,
+  )
+
+  const noCustomer = fixture()
+  ;(noCustomer.rate.destination as Record<string, unknown>).email = null
+  ;(noCustomer.rate as { customer: unknown }).customer = null
+  assert.equal(
+    shopifyCarrierServiceRequestMatchesTestAllowlist(
+      parseShopifyCarrierServiceRateRequest(noCustomer),
+      allowlist,
+    ),
+    false,
+  )
+
+  const nonShippableForeignVariant = fixture()
+  nonShippableForeignVariant.rate.items[1]!.requires_shipping = false
+  assert.equal(
+    shopifyCarrierServiceRequestMatchesTestAllowlist(
+      parseShopifyCarrierServiceRateRequest(nonShippableForeignVariant),
+      {
+        customerIds: new Set(['207119551']),
+        variantIds: new Set(['258644705304']),
+      },
+    ),
+    true,
   )
 })
 

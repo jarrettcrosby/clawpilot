@@ -1617,6 +1617,14 @@ const fedexShipmentRate =
               totalNetCharge: 31.47,
               currency: 'USD',
             }],
+          }, {
+            serviceType: 'FEDEX_GROUND',
+            serviceName: 'FedEx Ground duplicate commitment',
+            ratedShipmentDetails: [{
+              rateType: 'ACCOUNT',
+              totalNetCharge: 29.84,
+              currency: 'USD',
+            }],
           }],
         },
       }), {
@@ -1658,7 +1666,16 @@ assert.deepEqual(
   'FedEx MPS line items must preserve cartonization package order without grouping',
 )
 assert.equal(fedexShipmentRate.result.packageCount, 2)
-assert.equal(fedexShipmentRate.result.rates[0].amount, '31.47')
+assert.equal(
+  fedexShipmentRate.result.rates.length,
+  1,
+  'FedEx duplicate service commitments must collapse to one Shopify-safe service',
+)
+assert.equal(
+  fedexShipmentRate.result.rates[0].amount,
+  '29.84',
+  'FedEx duplicate service commitments must retain the lowest account rate',
+)
 assert.equal(
   fedexShipmentRate.evidence.redactedResponse.rateScope,
   'multi_package_shipment',

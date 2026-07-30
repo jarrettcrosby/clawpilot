@@ -3,6 +3,7 @@ import {
   buildShopifyCarrierServiceRateResponse,
   fingerprintShopifyCarrierServiceRateRequest,
   readShopifyCarrierServiceRateRequest,
+  shopifyCarrierServiceRequestMatchesTestAllowlist,
   stableShopifyCarrierServiceCode,
   type ShopifyCarrierServiceRateResponse,
   type ShopifyCarrierServiceRateRequest,
@@ -48,6 +49,7 @@ const CALLBACK_LEASE_SECONDS = 20
 const MAX_PERSISTED_LINE_QUANTITY = 100_000
 const MAX_PERSISTED_UNIT_WEIGHT_GRAMS = 1_000_000
 const EMPTY_RATE_RESPONSE: ShopifyCarrierServiceRateResponse = { rates: [] }
+const SHOPIFY_NUMERIC_ID = /^[1-9][0-9]{0,19}$/
 
 export const SHOPIFY_CARRIER_SERVICE_CALLBACK_ACTOR =
   'system:shopify-carrier-service'
@@ -137,6 +139,69 @@ function sandboxCheckoutAccountIsReady(
       && carrier.credentialVersion > 0
     ))
   )
+}
+
+type ShadowCheckoutGuard =
+  | { allowed: false; customerLabel: null }
+  | { allowed: true; customerLabel: string | null }
+
+function configuredIdentifierSet(
+  environmentName: string,
+): ReadonlySet<string> | null {
+  const raw = String(process.env[environmentName] || '').trim()
+  if (!raw) return null
+  const identifiers = raw.split(',').map((entry) => entry.trim())
+  if (
+    identifiers.length < 1
+    || identifiers.some((identifier) => !SHOPIFY_NUMERIC_ID.test(identifier))
+  ) {
+    return null
+  }
+  return new Set(identifiers)
+}
+
+function configuredShadowCustomerLabel(): string | null {
+  const label = String(
+    process.env.SHOPIFY_CHECKOUT_SHADOW_CUSTOMER_LABEL || '',
+  )
+    .normalize('NFKC')
+    .replace(/\s+/g, ' ')
+    .trim()
+  return (
+    label
+    && label.length <= 80
+    && !/[\u0000-\u001f\u007f]/.test(label)
+  )
+    ? label
+    : null
+}
+
+function shadowCheckoutRequestGuard(
+  account: ShopifyCheckoutRatingAccount,
+  request: ShopifyCarrierServiceRateRequest,
+): ShadowCheckoutGuard {
+  if (account.activationState !== 'shadow') {
+    return { allowed: true, customerLabel: null }
+  }
+  const customerIds = configuredIdentifierSet(
+    'SHOPIFY_CHECKOUT_SHADOW_ALLOWED_CUSTOMER_IDS',
+  )
+  const variantIds = configuredIdentifierSet(
+    'SHOPIFY_CHECKOUT_SHADOW_ALLOWED_VARIANT_IDS',
+  )
+  const customerLabel = configuredShadowCustomerLabel()
+  if (
+    !customerIds
+    || !variantIds
+    || !customerLabel
+    || !shopifyCarrierServiceRequestMatchesTestAllowlist(request, {
+      customerIds,
+      variantIds,
+    })
+  ) {
+    return { allowed: false, customerLabel: null }
+  }
+  return { allowed: true, customerLabel }
 }
 
 function checkoutExecutionFenceHash(
@@ -395,10 +460,28 @@ function resultFromTypedReceipt(
   account: ShopifyCheckoutRatingAccount,
   context: ShopifyCheckoutContextResult,
   receipt: ShopifyCheckoutRateReceipt | null,
+  shadowCustomerLabel: string | null = null,
 ): CallbackResult {
   const response = responseFromTypedReceipt(account, context, receipt)
+  const liveResponse = (
+    response
+    && account.environment === 'sandbox'
+    && account.activationState === 'shadow'
+    && shadowCustomerLabel
+  )
+    ? {
+        rates: response.rates.map((rate) => {
+          return {
+            ...rate,
+            service_name: (
+              `ClawPilot Test · ${rate.service_name} · ${shadowCustomerLabel}`
+            ).slice(0, 255),
+          }
+        }),
+      }
+    : response
   return receipt?.status === 'succeeded' && response
-    ? authenticatedResult(response, 200)
+    ? authenticatedResult(liveResponse!, 200)
     : authenticatedResult(EMPTY_RATE_RESPONSE, 503)
 }
 
@@ -560,6 +643,10 @@ export async function executeShopifyCarrierServiceCallback(input: {
       }),
       workController.signal,
     )
+    const shadowGuard = shadowCheckoutRequestGuard(account, request)
+    if (!shadowGuard.allowed) {
+      return authenticatedResult(EMPTY_RATE_RESPONSE, 200)
+    }
     const requestFingerprint = persistedRequestFingerprint(
       fingerprintShopifyCarrierServiceRateRequest(request),
     )
@@ -605,7 +692,12 @@ export async function executeShopifyCarrierServiceCallback(input: {
         workController.signal,
       )
     if (cached) {
-      return resultFromTypedReceipt(account, context, cached)
+      return resultFromTypedReceipt(
+        account,
+        context,
+        cached,
+        shadowGuard.customerLabel,
+      )
     }
     requireCallbackTime(
       successPersistenceDeadlineAt,
@@ -668,7 +760,12 @@ export async function executeShopifyCarrierServiceCallback(input: {
       workController.signal,
     )
     if (claim.kind !== 'claimed') {
-      return resultFromTypedReceipt(account, context, claim.receipt)
+      return resultFromTypedReceipt(
+        account,
+        context,
+        claim.receipt,
+        shadowGuard.customerLabel,
+      )
     }
     claimed = {
       organizationId: account.organizationId,
@@ -922,7 +1019,12 @@ export async function executeShopifyCarrierServiceCallback(input: {
       }),
       workController.signal,
     )
-    return resultFromTypedReceipt(account, context, completed)
+    return resultFromTypedReceipt(
+      account,
+      context,
+      completed,
+      shadowGuard.customerLabel,
+    )
     } catch (error) {
       if (claimed && Date.now() < failurePersistenceDeadlineAt) {
         await failClaim(

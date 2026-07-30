@@ -108,9 +108,9 @@ includes(callback, [
   'credentialVersion: carrier.credentialVersion',
   'executionFenceHash,',
   'idempotencyKey,',
-  'resultFromTypedReceipt(account, context, cached)',
-  'resultFromTypedReceipt(account, context, claim.receipt)',
-  'resultFromTypedReceipt(account, context, completed)',
+  'cached,\n        shadowGuard.customerLabel,',
+  'claim.receipt,\n        shadowGuard.customerLabel,',
+  'completed,\n      shadowGuard.customerLabel,',
 ], 'Callback sandbox and execution cache fences')
 
 const typedResponse = section(

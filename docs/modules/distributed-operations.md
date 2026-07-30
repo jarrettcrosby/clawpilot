@@ -546,6 +546,12 @@ strict UPS and FedEx shipment-rate adapters. Both carriers receive the same
 ordered array containing only description, exterior dimensions, and gross
 weight; an internal planning field must never cause an otherwise ready quote
 to fail provider validation.
+FedEx may return more than one commitment row for the same service code. When
+those duplicates use the same currency, the sandbox adapter deterministically
+retains the lowest exact account charge, then delivery date, transit time,
+service name, and rate type as tie breakers so Shopify receives one stable
+service code. A same-service cross-currency conflict is not coerced and still
+fails closed at the checkout response boundary.
 Carrier rate evidence keeps its optional `actor_email` foreign key only when
 the actor resolves to a real ClawPilot user. Automated Shopify callbacks retain
 `actor_email = NULL` while the audit event records the explicit
@@ -578,6 +584,29 @@ The active commerce-fulfillment continuation uses
 The previously supplied Gmail alias is superseded and must not appear in
 fixtures, provider reconciliation, CRM evidence, screenshots, or acceptance
 records.
+The hosted Shadow callback resolves that operator-supplied email to exactly
+one immutable numeric Shopify customer ID outside the latency-sensitive
+callback. Runtime authorization never trusts callback contact text: Shopify
+does not guarantee destination name or email for an API-created
+CarrierService, so names, email addresses, phone numbers, fax numbers, and
+company names remain discarded before normalized request, fingerprint,
+receipt, or carrier evidence construction. The callback requires the exact
+configured customer ID and requires every shippable line to use an explicitly
+configured Test Product variant. Missing configuration, a missing or different
+customer ID, or any other shippable variant returns authenticated HTTP 200
+with no rates before request fingerprinting, context reads, receipt
+persistence, cartonization, or carrier calls. A server-configured test alias
+may decorate only the ephemeral Shadow `service_name` as
+`ClawPilot Test · <service> · <alias>` for operator proof; the stable
+`service_code` and durable response remain customer-neutral.
+Shopify's successful CarrierService cache does not include customer identity.
+Therefore callback gating is necessary but not the sole strict-isolation
+control: the Test Product must remain in a dedicated test-only shipping
+surface, and a Shopify Delivery Customization must hide ClawPilot test options
+unless the authenticated buyer GID is the configured test customer before
+this proof can remain enabled for an extended period. Until that provider-side
+guard is accepted, the live proof is a bounded operator test rather than a
+generally enabled production-store rate.
 The operator-triggered Shopify checkout acceptance uses one deliberately
 zero-priced but shippable test product. A zero merchandise subtotal is valid
 and must not suppress, zero, or otherwise change ClawPilot shipping-rate

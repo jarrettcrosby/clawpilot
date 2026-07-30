@@ -99,6 +99,11 @@ export type ShopifyCarrierServiceRateResponse = {
   }>
 }
 
+export type ShopifyCarrierServiceTestAllowlist = {
+  customerIds: ReadonlySet<string>
+  variantIds: ReadonlySet<string>
+}
+
 export class ShopifyCarrierServiceProtocolError extends Error {
   readonly code: string
   readonly path: string
@@ -539,6 +544,23 @@ export function parseShopifyCarrierServiceRateRequest(
     orderTotals: normalizeOrderTotals(rate.order_totals),
     customer: normalizeCustomer(rate.customer),
   }
+}
+
+/**
+ * Limits a hosted Shadow checkout proof to an immutable Shopify customer ID
+ * and an explicit set of test variants. Shopify's CarrierService request does
+ * not reliably provide contact names or email addresses, so neither is used as
+ * an authorization boundary.
+ */
+export function shopifyCarrierServiceRequestMatchesTestAllowlist(
+  request: ShopifyCarrierServiceRateRequest,
+  allowlist: ShopifyCarrierServiceTestAllowlist,
+): boolean {
+  const customerId = request.customer?.id
+  if (!customerId || !allowlist.customerIds.has(customerId)) return false
+  const shippableItems = request.items.filter((item) => item.requiresShipping)
+  return shippableItems.length > 0
+    && shippableItems.every((item) => allowlist.variantIds.has(item.variantId))
 }
 
 /**

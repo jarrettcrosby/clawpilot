@@ -32,6 +32,11 @@ const checkoutPersistence = read(
 for (const required of [
   'readShopifyCarrierServiceRateRequest(input.request, {',
   'allowShadowSimulation: false',
+  'SHOPIFY_CHECKOUT_SHADOW_ALLOWED_CUSTOMER_IDS',
+  'SHOPIFY_CHECKOUT_SHADOW_ALLOWED_VARIANT_IDS',
+  'SHOPIFY_CHECKOUT_SHADOW_CUSTOMER_LABEL',
+  'shopifyCarrierServiceRequestMatchesTestAllowlist(request, {',
+  'ClawPilot Test · ${rate.service_name} · ${shadowCustomerLabel}',
   'persistedRequestFingerprint(',
   'shopifyCheckoutDestinationFingerprint(',
   'carrierSandboxPartyFingerprint(destination)',
@@ -100,6 +105,38 @@ assert.ok(
   callback.indexOf('if (!lines.length)')
     < callback.indexOf('claimShopifyCheckoutRateReceiptInPostgres({'),
   'zero shippable lines must exit before receipt persistence',
+)
+const authenticatedExecution = callback.slice(
+  callback.indexOf('const authenticatedExecution'),
+)
+const shadowGuard = authenticatedExecution.indexOf(
+  'const shadowGuard = shadowCheckoutRequestGuard(account, request)',
+)
+assert.ok(
+  shadowGuard >= 0
+    && shadowGuard < authenticatedExecution.indexOf(
+      'persistedRequestFingerprint(',
+    )
+    && shadowGuard < authenticatedExecution.indexOf(
+      'readShopifyCheckoutContextFromPostgres({',
+    )
+    && shadowGuard < authenticatedExecution.indexOf(
+      'claimShopifyCheckoutRateReceiptInPostgres({',
+    )
+    && shadowGuard < authenticatedExecution.indexOf(
+      'planShopifyCheckoutPackages(context.input)',
+    )
+    && shadowGuard < authenticatedExecution.indexOf(
+      'rateCheckoutShipment({',
+    ),
+  'Shadow customer and variant allowlist must run before fingerprints, persistence, cartonization, or carrier calls',
+)
+assert.ok(
+  authenticatedExecution.includes(
+    'if (!shadowGuard.allowed) {\n'
+      + '      return authenticatedResult(EMPTY_RATE_RESPONSE, 200)',
+  ),
+  'a denied Shadow test request must return authenticated HTTP 200 empty rates',
 )
 assert.ok(
   callback.indexOf('readShopifyCheckoutContextFromPostgres({')
