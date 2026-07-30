@@ -935,7 +935,7 @@ export default function ShopifyCarrierServiceSetupPanel({
           {notice}
         </Alert>
       ) : null}
-      {!setup?.canActivate ? (
+      {setup && !setup.canActivate ? (
         <Alert severity="info">
           Owner or authorized administrator permission is required to view the
           callback URL or change registration state.

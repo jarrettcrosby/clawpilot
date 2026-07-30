@@ -401,6 +401,7 @@ assert.ok(
 requireAll(setupPanel, [
   'facts: setup?.callbackUrl ? [{',
   "label: 'Callback URL'",
+  'setup && !setup.canActivate',
   'Owner or authorized administrator permission is required to view the',
   'callback URL or change registration state.',
 ], 'callback URL panel boundary')

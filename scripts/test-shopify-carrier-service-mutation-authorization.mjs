@@ -208,6 +208,21 @@ assert.doesNotMatch(
 )
 assert.doesNotMatch(
   persistenceSource,
+  /\bauthorization\./,
+  'Authorization persistence SQL must not use PostgreSQL reserved alias authorization',
+)
+assert.doesNotMatch(
+  persistenceSource,
+  /FOR UPDATE OF authorization\b/,
+  'Authorization persistence locks must use the non-reserved SQL alias',
+)
+assert.match(
+  persistenceSource,
+  /operations_shopify_carrier_service_mutation_authorizations\s+authorized_mutation/,
+  'Authorization persistence must use a PostgreSQL-safe table alias',
+)
+assert.doesNotMatch(
+  persistenceSource,
   /(?:merchandise|subtotal|unitPrice|productPrice|cartTotal)/,
   'CarrierService registration must not depend on merchandise price',
 )

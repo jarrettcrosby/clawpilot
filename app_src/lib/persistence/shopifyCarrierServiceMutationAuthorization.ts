@@ -188,43 +188,43 @@ const ERROR_CODE = /^[A-Z][A-Z0-9_]{1,127}$/
 
 const AUTHORIZATION_SELECT = `
   SELECT
-    authorization.id::text,
-    authorization.global_id,
-    authorization.organization_id::text,
-    authorization.integration_account_id::text,
+    authorized_mutation.id::text,
+    authorized_mutation.global_id,
+    authorized_mutation.organization_id::text,
+    authorized_mutation.integration_account_id::text,
     account.global_id AS account_global_id,
-    authorization.config_id::text,
+    authorized_mutation.config_id::text,
     config.global_id AS config_global_id,
-    authorization.simulation_effect_id::text,
+    authorized_mutation.simulation_effect_id::text,
     simulation.global_id AS simulation_effect_global_id,
-    authorization.operation,
-    authorization.account_environment,
-    authorization.credential_generation,
-    authorization.config_row_version::text,
-    authorization.activation_state,
-    authorization.activation_revision,
-    authorization.simulation_activation_revision,
-    authorization.provider_write_activation_revision,
-    authorization.aggregate_hash,
-    authorization.request_hash,
-    authorization.expected_service_gid,
-    authorization.confirmation_hash,
-    authorization.confirmation_statement_version,
-    authorization.idempotency_key,
+    authorized_mutation.operation,
+    authorized_mutation.account_environment,
+    authorized_mutation.credential_generation,
+    authorized_mutation.config_row_version::text,
+    authorized_mutation.activation_state,
+    authorized_mutation.activation_revision,
+    authorized_mutation.simulation_activation_revision,
+    authorized_mutation.provider_write_activation_revision,
+    authorized_mutation.aggregate_hash,
+    authorized_mutation.request_hash,
+    authorized_mutation.expected_service_gid,
+    authorized_mutation.confirmation_hash,
+    authorized_mutation.confirmation_statement_version,
+    authorized_mutation.idempotency_key,
     CASE
-      WHEN authorization.provider_write_activation_revision IS NULL
-        THEN authorization.authorization_fence_hash
+      WHEN authorized_mutation.provider_write_activation_revision IS NULL
+        THEN authorized_mutation.authorization_fence_hash
       ELSE
         operations_shopify_cs_active_authorization_fence_hash(
-          authorization.authorization_fence_hash,
-          authorization.simulation_activation_revision,
-          authorization.provider_write_activation_revision
+          authorized_mutation.authorization_fence_hash,
+          authorized_mutation.simulation_activation_revision,
+          authorized_mutation.provider_write_activation_revision
         )
     END AS authorization_fence_hash,
-    authorization.authorized_by,
-    authorization.authorized_role,
-    authorization.authorized_at,
-    authorization.expires_at,
+    authorized_mutation.authorized_by,
+    authorized_mutation.authorized_role,
+    authorized_mutation.authorized_at,
+    authorized_mutation.expires_at,
     attempt.id::text AS attempt_id,
     attempt.global_id AS attempt_global_id,
     attempt.lease_token::text,
@@ -245,19 +245,19 @@ const AUTHORIZATION_SELECT = `
     resolution.resolution_hash,
     resolution.resolved_at
   FROM operations_shopify_carrier_service_mutation_authorizations
-    authorization
+    authorized_mutation
   JOIN operations_integration_accounts account
-    ON account.organization_id = authorization.organization_id
-   AND account.id = authorization.integration_account_id
+    ON account.organization_id = authorized_mutation.organization_id
+   AND account.id = authorized_mutation.integration_account_id
   JOIN operations_shopify_carrier_service_configs config
-    ON config.organization_id = authorization.organization_id
-   AND config.id = authorization.config_id
+    ON config.organization_id = authorized_mutation.organization_id
+   AND config.id = authorized_mutation.config_id
   JOIN operations_commerce_external_effect_intents simulation
-    ON simulation.organization_id = authorization.organization_id
-   AND simulation.id = authorization.simulation_effect_id
+    ON simulation.organization_id = authorized_mutation.organization_id
+   AND simulation.id = authorized_mutation.simulation_effect_id
   LEFT JOIN operations_shopify_carrier_service_mutation_attempts attempt
-    ON attempt.organization_id = authorization.organization_id
-   AND attempt.authorization_id = authorization.id
+    ON attempt.organization_id = authorized_mutation.organization_id
+   AND attempt.authorization_id = authorized_mutation.id
   LEFT JOIN operations_shopify_carrier_service_mutation_outcomes outcome
     ON outcome.organization_id = attempt.organization_id
    AND outcome.attempt_id = attempt.id
@@ -465,9 +465,9 @@ async function readAuthorizationWithClient(
   },
 ) {
   const sql = `${AUTHORIZATION_SELECT}
-    WHERE authorization.organization_id = $1::uuid
-      AND authorization.global_id = $2
-    ${input.forUpdate ? 'FOR UPDATE OF authorization' : ''}`
+    WHERE authorized_mutation.organization_id = $1::uuid
+      AND authorized_mutation.global_id = $2
+    ${input.forUpdate ? 'FOR UPDATE OF authorized_mutation' : ''}`
   const result = client
     ? await client.query<AuthorizationRow>(sql, [
         input.organizationId,
@@ -844,28 +844,28 @@ export async function authorizeShopifyCarrierServiceMutationInPostgres(
     let globalId = inserted.rows[0]?.global_id
     if (!globalId) {
       const replay = await client.query<{ global_id: string }>(
-        `SELECT authorization.global_id
+        `SELECT authorized_mutation.global_id
          FROM operations_shopify_carrier_service_mutation_authorizations
-           authorization
-         WHERE authorization.organization_id = $1::uuid
-           AND authorization.integration_account_id = $2::uuid
-           AND authorization.operation = $3
-           AND authorization.idempotency_key = $4
-           AND authorization.config_id = $5::uuid
-           AND authorization.simulation_effect_id = $6::uuid
-           AND authorization.account_environment = $7
-           AND authorization.credential_generation = $8
-           AND authorization.config_row_version = $9::bigint
-           AND authorization.activation_revision = $10
-           AND authorization.simulation_activation_revision = $11
-           AND authorization.provider_write_activation_revision = $12
-           AND authorization.aggregate_hash = $13
-           AND authorization.request_hash = $14
-           AND authorization.expected_service_gid IS NOT DISTINCT FROM $15
-           AND authorization.confirmation_hash = $16
-           AND authorization.confirmation_statement_version = $17
-           AND authorization.authorized_by = $18
-           AND authorization.authorized_role = $19`,
+           authorized_mutation
+         WHERE authorized_mutation.organization_id = $1::uuid
+           AND authorized_mutation.integration_account_id = $2::uuid
+           AND authorized_mutation.operation = $3
+           AND authorized_mutation.idempotency_key = $4
+           AND authorized_mutation.config_id = $5::uuid
+           AND authorized_mutation.simulation_effect_id = $6::uuid
+           AND authorized_mutation.account_environment = $7
+           AND authorized_mutation.credential_generation = $8
+           AND authorized_mutation.config_row_version = $9::bigint
+           AND authorized_mutation.activation_revision = $10
+           AND authorized_mutation.simulation_activation_revision = $11
+           AND authorized_mutation.provider_write_activation_revision = $12
+           AND authorized_mutation.aggregate_hash = $13
+           AND authorized_mutation.request_hash = $14
+           AND authorized_mutation.expected_service_gid IS NOT DISTINCT FROM $15
+           AND authorized_mutation.confirmation_hash = $16
+           AND authorized_mutation.confirmation_statement_version = $17
+           AND authorized_mutation.authorized_by = $18
+           AND authorized_mutation.authorized_role = $19`,
         [
           input.organizationId,
           facts.rows[0].integration_account_id,
@@ -1202,17 +1202,17 @@ export async function finalizeShopifyCarrierServiceMutationInPostgres(
       `SELECT
          attempt.id::text,
          attempt.lease_token::text,
-         authorization.global_id AS authorization_global_id,
+         authorized_mutation.global_id AS authorization_global_id,
          account.global_id AS account_global_id,
          resolution.global_id AS resolution_global_id
        FROM operations_shopify_carrier_service_mutation_attempts attempt
        JOIN operations_shopify_carrier_service_mutation_authorizations
-         authorization
-         ON authorization.organization_id = attempt.organization_id
-        AND authorization.id = attempt.authorization_id
+         authorized_mutation
+         ON authorized_mutation.organization_id = attempt.organization_id
+        AND authorized_mutation.id = attempt.authorization_id
        JOIN operations_integration_accounts account
-         ON account.organization_id = authorization.organization_id
-        AND account.id = authorization.integration_account_id
+         ON account.organization_id = authorized_mutation.organization_id
+        AND account.id = authorized_mutation.integration_account_id
        LEFT JOIN operations_shopify_carrier_service_mutation_resolutions
          resolution
          ON resolution.organization_id = attempt.organization_id
@@ -1449,19 +1449,19 @@ export async function resolveShopifyCarrierServiceMutationInPostgres(
     }>(
       `SELECT
          attempt.id::text,
-         authorization.global_id AS authorization_global_id,
+         authorized_mutation.global_id AS authorization_global_id,
          account.global_id AS account_global_id,
          attempt.lease_expires_at,
          outcome.outcome,
          resolution.global_id AS resolution_global_id
        FROM operations_shopify_carrier_service_mutation_attempts attempt
        JOIN operations_shopify_carrier_service_mutation_authorizations
-         authorization
-         ON authorization.organization_id = attempt.organization_id
-        AND authorization.id = attempt.authorization_id
+         authorized_mutation
+         ON authorized_mutation.organization_id = attempt.organization_id
+        AND authorized_mutation.id = attempt.authorization_id
        JOIN operations_integration_accounts account
-         ON account.organization_id = authorization.organization_id
-        AND account.id = authorization.integration_account_id
+         ON account.organization_id = authorized_mutation.organization_id
+        AND account.id = authorized_mutation.integration_account_id
        LEFT JOIN operations_shopify_carrier_service_mutation_outcomes outcome
          ON outcome.organization_id = attempt.organization_id
         AND outcome.attempt_id = attempt.id
@@ -1655,10 +1655,10 @@ export async function finalizeShopifyCarrierServiceConfigMutationInPostgres(
          config.row_version::text,
          config.registration_state,
          config.service_gid,
-         authorization.id::text AS authorization_id,
-         authorization.global_id AS authorization_global_id,
-         authorization.operation,
-         authorization.provider_write_activation_revision,
+         authorized_mutation.id::text AS authorization_id,
+         authorized_mutation.global_id AS authorization_global_id,
+         authorized_mutation.operation,
+         authorized_mutation.provider_write_activation_revision,
          attempt.id::text AS attempt_id,
          outcome.id::text AS outcome_id,
          outcome.global_id AS outcome_global_id,
@@ -1677,15 +1677,15 @@ export async function finalizeShopifyCarrierServiceConfigMutationInPostgres(
          link.to_service_gid AS link_to_service_gid
        FROM operations_shopify_carrier_service_mutation_attempts attempt
        JOIN operations_shopify_carrier_service_mutation_authorizations
-         authorization
-         ON authorization.organization_id = attempt.organization_id
-        AND authorization.id = attempt.authorization_id
+         authorized_mutation
+         ON authorized_mutation.organization_id = attempt.organization_id
+        AND authorized_mutation.id = attempt.authorization_id
        JOIN operations_integration_accounts account
-         ON account.organization_id = authorization.organization_id
-        AND account.id = authorization.integration_account_id
+         ON account.organization_id = authorized_mutation.organization_id
+        AND account.id = authorized_mutation.integration_account_id
        JOIN operations_shopify_carrier_service_configs config
-         ON config.organization_id = authorization.organization_id
-        AND config.id = authorization.config_id
+         ON config.organization_id = authorized_mutation.organization_id
+        AND config.id = authorized_mutation.config_id
        LEFT JOIN operations_shopify_carrier_service_mutation_outcomes outcome
          ON outcome.organization_id = attempt.organization_id
         AND outcome.attempt_id = attempt.id
@@ -1956,9 +1956,9 @@ export async function readShopifyCarrierServiceMutationAuthorizationsFromPostgre
   }
   const result = await query<AuthorizationRow>(
     `${AUTHORIZATION_SELECT}
-     WHERE authorization.organization_id = $1::uuid
+     WHERE authorized_mutation.organization_id = $1::uuid
        AND account.global_id = $2
-     ORDER BY authorization.authorized_at DESC, authorization.id DESC
+     ORDER BY authorized_mutation.authorized_at DESC, authorized_mutation.id DESC
      LIMIT $3`,
     [input.organizationId, input.accountGlobalId, input.limit],
   )

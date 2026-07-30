@@ -498,6 +498,11 @@ request/response bindings, reusable exact receipt matching, current-issue
 index shape, and redacted recovery evidence, then rolls back. A second
 connection must prove that neither schema objects nor migration-history rows
 were retained.
+The authenticated setup read must also succeed when an account has no
+CarrierService mutation history. Its persistence queries use the
+PostgreSQL-safe `authorized_mutation` alias; setup-load failure is reported as
+an error and must never be rendered as a false owner/administrator-permission
+denial.
 
 The active commerce-fulfillment continuation uses
 `Jarrett+warehouse@episcs.com` as the sole test-customer identity.
