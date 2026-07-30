@@ -546,6 +546,11 @@ strict UPS and FedEx shipment-rate adapters. Both carriers receive the same
 ordered array containing only description, exterior dimensions, and gross
 weight; an internal planning field must never cause an otherwise ready quote
 to fail provider validation.
+Carrier rate evidence keeps its optional `actor_email` foreign key only when
+the actor resolves to a real ClawPilot user. Automated Shopify callbacks retain
+`actor_email = NULL` while the audit event records the explicit
+`system:shopify-carrier-service` actor. A system callback must not lose an
+otherwise valid UPS or FedEx result merely because it has no app-user row.
 
 `npm run test:shopify-carrier-service-postgres` is the rollback-only database
 acceptance for migrations `0148` through `0158`. It requires the explicitly

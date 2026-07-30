@@ -200,6 +200,7 @@ for (const fragment of [
   'payload: { credentialVersion: row.credential_version }',
   'writeCarrierSandboxRateEvidenceInPostgres',
   'operations_carrier_rate_requests',
+  "WHEN $16 = 'system:shopify-carrier-service' THEN NULL",
   "'carrier.sandbox_rate.succeeded'",
   "'carrier.sandbox_rate.failed'",
   "'carrier.cartonization_package_rate.succeeded'",

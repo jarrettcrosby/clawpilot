@@ -1103,7 +1103,12 @@ export async function writeCarrierSandboxRateEvidenceInPostgres(
          $1::uuid, $2::uuid, $3::uuid, $4, 'sandbox',
          $5, $6, $7, $8, $9, $10::jsonb,
          $11::jsonb, $12::jsonb, $13, $14,
-         $15, $16, $17::timestamptz, $18::timestamptz
+         $15,
+         CASE
+           WHEN $16 = 'system:shopify-carrier-service' THEN NULL
+           ELSE $16
+         END,
+         $17::timestamptz, $18::timestamptz
        )
        RETURNING global_id`,
       [
