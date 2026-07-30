@@ -1297,6 +1297,72 @@ assert.deepEqual(
   ],
   'Multi-package fixtures must retain caller package order',
 )
+const rateOnlyDestination = {
+  name: null,
+  line1: null,
+  line2: null,
+  city: null,
+  region: null,
+  postalCode: '06103',
+  countryCode: 'us',
+}
+const rateOnlyShipmentFixture =
+  sandboxRateModule.buildCarrierSandboxShipmentRateFixture({
+    senderName: 'Jegs Test Sender',
+    registeredAddress: carrierAccountAddress,
+    destination: rateOnlyDestination,
+    parcels: [cartonizationParcel],
+  })
+assert.deepEqual(
+  JSON.parse(JSON.stringify(rateOnlyShipmentFixture.destination)),
+  {
+    name: null,
+    line1: null,
+    line2: null,
+    city: null,
+    region: null,
+    postalCode: '06103',
+    countryCode: 'US',
+  },
+  'rate-only destinations must preserve unavailable optional fields as null',
+)
+const rateOnlyDestinationFingerprint =
+  sandboxRateModule.carrierSandboxRateDestinationFingerprint(
+    rateOnlyShipmentFixture.destination,
+  )
+assert.match(rateOnlyDestinationFingerprint, /^[a-f0-9]{64}$/)
+assert.notEqual(
+  rateOnlyDestinationFingerprint,
+  sandboxRateModule.carrierSandboxRateDestinationFingerprint({
+    ...rateOnlyShipmentFixture.destination,
+    region: 'Connecticut',
+  }),
+  'carrier evidence must distinguish a ZIP-only request from a state-supplied request',
+)
+assert.throws(
+  () => sandboxRateModule.normalizeCarrierSandboxRateDestination({
+    ...rateOnlyDestination,
+    postalCode: null,
+  }),
+  /five or nine digit US ZIP code|must be plain text/,
+  'rate-only destinations must fail closed without a valid ZIP',
+)
+assert.throws(
+  () => sandboxRateModule.normalizeCarrierSandboxRateDestination({
+    ...rateOnlyDestination,
+    region: 'Not a state',
+  }),
+  /recognized US state or territory/,
+  'rate-only destinations must validate a state when Shopify supplies one',
+)
+assert.throws(
+  () => sandboxRateModule.normalizeCarrierSandboxRateDestination({
+    ...rateOnlyDestination,
+    line2: 'Suite 2',
+  }),
+  /line 2 requires address line 1/,
+  'rate-only destinations must reject an orphan second address line',
+)
 assert.equal(
   sandboxRateModule.MAX_CARRIER_SANDBOX_SHIPMENT_PACKAGES,
   50,
@@ -1724,6 +1790,88 @@ assert.deepEqual(
   ['AG12V2 optimized carton', '20lb optimized carton'],
 )
 assert.equal(upsShipmentRate.result.rates[0].amount, '29.15')
+
+const fedexRateOnly =
+  await sandboxRateModule.requestCarrierSandboxShipmentRates({
+    provider: 'fedex_rest',
+    environment: 'sandbox',
+    credential,
+  }, {
+    fixture: rateOnlyShipmentFixture,
+    fetchImpl: async (url, init) => {
+      rateRequests.push({ url: String(url), init })
+      return new Response(JSON.stringify({
+        output: {
+          rateReplyDetails: [{
+            serviceType: 'FEDEX_GROUND',
+            serviceName: 'FedEx Ground',
+            ratedShipmentDetails: [{
+              rateType: 'ACCOUNT',
+              totalNetCharge: 14.72,
+              currency: 'USD',
+            }],
+          }],
+        },
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    },
+  })
+const fedexRateOnlyRequest = JSON.parse(rateRequests[4].init.body)
+const fedexRateOnlyAddress =
+  fedexRateOnlyRequest.requestedShipment.recipient.address
+assert.equal('streetLines' in fedexRateOnlyAddress, false)
+assert.equal('city' in fedexRateOnlyAddress, false)
+assert.deepEqual(fedexRateOnlyAddress, {
+  postalCode: '06103',
+  countryCode: 'US',
+})
+assert.equal(
+  fedexRateOnly.result.destinationFingerprint,
+  rateOnlyDestinationFingerprint,
+)
+
+const upsRateOnly =
+  await sandboxRateModule.requestCarrierSandboxShipmentRates({
+    provider: 'ups_rest',
+    environment: 'sandbox',
+    credential,
+  }, {
+    fixture: rateOnlyShipmentFixture,
+    fetchImpl: async (url, init) => {
+      rateRequests.push({ url: String(url), init })
+      return new Response(JSON.stringify({
+        RateResponse: {
+          RatedShipment: [{
+            Service: { Code: '03' },
+            NegotiatedRateCharges: {
+              TotalCharge: {
+                MonetaryValue: '15.25',
+                CurrencyCode: 'USD',
+              },
+            },
+          }],
+        },
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    },
+  })
+const upsRateOnlyRequest = JSON.parse(rateRequests[5].init.body)
+const upsRateOnlyShipTo = upsRateOnlyRequest.RateRequest.Shipment.ShipTo
+assert.equal('Name' in upsRateOnlyShipTo, false)
+assert.equal('AddressLine' in upsRateOnlyShipTo.Address, false)
+assert.equal('City' in upsRateOnlyShipTo.Address, false)
+assert.deepEqual(upsRateOnlyShipTo.Address, {
+  PostalCode: '06103',
+  CountryCode: 'US',
+})
+assert.equal(
+  upsRateOnly.result.destinationFingerprint,
+  rateOnlyDestinationFingerprint,
+)
 for (const value of [
   fedexShipmentRate.evidence.redactedRequest,
   upsShipmentRate.evidence.redactedRequest,
@@ -1743,6 +1891,8 @@ for (const value of [
   upsRate,
   fedexShipmentRate,
   upsShipmentRate,
+  fedexRateOnly,
+  upsRateOnly,
 ]) {
   const serialized = JSON.stringify(value)
   assert.ok(!serialized.includes(credential.accountNumber), 'Rate result/evidence must redact account numbers')

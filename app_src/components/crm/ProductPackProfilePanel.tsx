@@ -134,7 +134,7 @@ type ProductPackPayload = {
 type ProfileForm = {
   kind: 'each' | 'case'
   lifecycleState: 'draft' | 'active'
-  weightBasis: 'measured' | 'provider' | 'customer_stated'
+  weightBasis: 'measured' | 'provider' | 'customer_stated' | 'derived'
   profileKey: string
   profileName: string
   baseEachQuantity: string
@@ -143,6 +143,16 @@ type ProfileForm = {
   height: string
   grossWeight: string
   evidenceReference: string
+}
+
+type ProfileEvidenceMetadata = {
+  evidenceType:
+    | 'unknown'
+    | 'customer_confirmed'
+    | 'measured'
+    | 'provider'
+    | 'derived'
+  source: 'manual' | 'provider_sync' | 'customer_supplied'
 }
 
 const API_PATH = '/api/operations/product-pack-profiles'
@@ -199,6 +209,43 @@ function profileDefaults(productName: string): ProfileForm {
     height: '',
     grossWeight: '',
     evidenceReference: '',
+  }
+}
+
+function profileEvidenceMetadata(
+  weightBasis: ProfileForm['weightBasis'],
+  hasEvidenceReference: boolean,
+): ProfileEvidenceMetadata {
+  if (weightBasis === 'provider') {
+    return {
+      evidenceType: 'provider',
+      source: 'provider_sync',
+    }
+  }
+  const source = weightBasis === 'customer_stated'
+    ? 'customer_supplied'
+    : 'manual'
+  if (!hasEvidenceReference) {
+    return {
+      evidenceType: 'unknown',
+      source,
+    }
+  }
+  if (weightBasis === 'customer_stated') {
+    return {
+      evidenceType: 'customer_confirmed',
+      source,
+    }
+  }
+  if (weightBasis === 'derived') {
+    return {
+      evidenceType: 'derived',
+      source,
+    }
+  }
+  return {
+    evidenceType: 'measured',
+    source,
   }
 }
 
@@ -361,6 +408,11 @@ export default function ProductPackProfilePanel({
       const manualGrossWeight = form.grossWeight.trim()
         ? positiveNumber(form.grossWeight, 'Gross weight')
         : null
+      const evidenceReference = form.evidenceReference.trim()
+      const evidenceMetadata = profileEvidenceMetadata(
+        form.weightBasis,
+        Boolean(evidenceReference),
+      )
       if (
         form.weightBasis === 'provider'
         && (
@@ -379,7 +431,7 @@ export default function ProductPackProfilePanel({
         && manualGrossWeight === null
       ) {
         throw new Error(
-          'Active profiles require a measured or customer-confirmed gross shipping weight',
+          'Active profiles require a measured, derived, or customer-confirmed gross shipping weight',
         )
       }
       const baseEachQuantity = Number(form.baseEachQuantity)
@@ -388,7 +440,7 @@ export default function ProductPackProfilePanel({
       }
       if (
         form.lifecycleState === 'active'
-        && !form.evidenceReference.trim()
+        && !evidenceReference
       ) {
         throw new Error(
           'Active profiles require dimension and gross-weight evidence',
@@ -441,17 +493,9 @@ export default function ProductPackProfilePanel({
         assemblyPolicy: form.kind === 'case'
           ? 'allow_from_child'
           : 'never',
-        evidenceType: providerWeight !== null
-          ? 'provider'
-          : form.evidenceReference.trim()
-            ? form.weightBasis === 'measured'
-              ? 'measured'
-              : 'customer_confirmed'
-            : 'unknown',
-        evidenceReference: form.evidenceReference.trim() || null,
-        source: providerWeight !== null
-          ? 'provider_sync'
-          : 'customer_supplied',
+        evidenceType: evidenceMetadata.evidenceType,
+        evidenceReference: evidenceReference || null,
+        source: evidenceMetadata.source,
         providerWeightEvidence: providerWeightState && providerWeight !== null
           ? {
               channelStateGlobalId: providerWeightState.globalId,
@@ -959,6 +1003,9 @@ export default function ProductPackProfilePanel({
         >
           <MenuItem value="measured">Measured on a scale</MenuItem>
           <MenuItem value="customer_stated">Customer-confirmed gross</MenuItem>
+          <MenuItem value="derived">
+            Derived from evidenced components
+          </MenuItem>
           <MenuItem value="provider">Sales-channel shipping weight</MenuItem>
         </TextField>
         {form.weightBasis === 'provider' ? (
@@ -1035,7 +1082,9 @@ export default function ProductPackProfilePanel({
           helperText={
             form.weightBasis === 'provider'
               ? 'Read from the retained sales-channel revision.'
-              : 'Use packaged gross shipping weight, not net contents.'
+              : form.weightBasis === 'derived'
+                ? 'Enter the calculated sellable-pack gross weight and cite every component below. Exclude the selected outbound carton or shipping-material tare; ClawPilot adds that separately.'
+                : 'Use packaged gross shipping weight, not net contents.'
           }
         />
       </Stack>
@@ -1051,7 +1100,9 @@ export default function ProductPackProfilePanel({
           evidenceReference: event.target.value,
         }))}
         helperText={
-          form.lifecycleState === 'active'
+          form.weightBasis === 'derived'
+            ? 'Derived weights require an auditable sellable-pack calculation. A nominal net-content value alone is not sufficient, and outbound shipping-material tare must not be included.'
+            : form.lifecycleState === 'active'
             ? 'Active profiles require exact source evidence; nominal net contents are not gross shipping weight.'
             : 'Draft preserves incomplete dimensions without making them eligible for rating.'
         }

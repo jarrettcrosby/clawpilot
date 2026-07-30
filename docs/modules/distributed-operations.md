@@ -290,6 +290,15 @@ weight third. If weight is absent, pack quantities conflict, or provider
 dimensions conflict with the customer-confirmed pack, the otherwise eligible
 association remains review evidence but the line stays blocked for package
 resolution. Changed or ineligible source evidence is not associated.
+An active pack profile may also retain a `derived` gross weight when the
+operator cites every evidenced component weight, the exact quantity, and the
+auditable calculation. The management surface stores that basis as
+`derived`/`manual`; it does not relabel the result as measured,
+customer-confirmed, or provider-supplied. For example, an exact development
+pack of thirty variants whose retained provider weight is 170 g may record
+`30 × 170 g = 5,100 g` as the content gross weight while the selected shipping
+material retains its own separate tare. A nominal `6 oz` Product title alone
+can never support that calculation.
 One narrow recipe-first exception prevents false product measurements: a
 current customer-confirmed provider sell-unit profile marked
 `approved_recipe_only` may intentionally omit item dimensions while retaining
@@ -334,6 +343,14 @@ only an assumption-backed **read-only sandbox** option when the caller supplies
 an explicit minimum override with a reason and evidence reference. Production
 planning rejects all such overrides, and the 20 lb box remains blocked until
 its currently unknown minimum is confirmed.
+That unknown loose-pick minimum does not authorize a one-through-thirty
+capacity rule. A bounded Shadow checkout demonstration may instead use an
+exact thirty-unit pack rule because the customer explicitly confirmed that
+thirty 6 oz bags fit the named 17 × 11 × 7 carton. Quantities other than that
+exact pack remain blocked until the customer confirms the loose-pick minimum.
+Any development material used for that proof must remain separately named and
+must identify assumed tare, cost, stock, and nominal inner/outer reuse rather
+than altering the customer draft.
 
 Hybrid output includes policy and algorithm versions, canonical input/result
 hashes, stable package keys and sequence, exact material/profile/recipe row
@@ -749,6 +766,27 @@ leading-zero identifier fails closed. Missing-customer discovery callbacks
 remain authenticated HTTP 200 with no rates. Protocol failures may log only a
 schema-owned path; arbitrary property keys collapse to the known properties
 root, and no provider message, payload value, or raw body enters the log.
+Shopify can invoke an authenticated CarrierService while checkout has supplied
+only a rate-grade US destination. The callback therefore requires country and
+a valid postal code, but it does not require or fabricate a state/province,
+street, recipient name, or city. Checkout rating deliberately reduces both
+ZIP-only and subsequently enriched Shopify callbacks to the same country and
+postal-code rate zone. Its versioned request fingerprint and the quote-only
+UPS and FedEx destination therefore omit all optional recipient-address fields,
+which makes progressive callbacks reuse one immutable receipt rather than
+creating ambiguous evidence. The complete registered warehouse origin,
+product lines, customer gate, currency, locale, and order totals remain in the
+request fence. Label creation, fulfillment, and address validation retain
+their full-address contracts and rerate with the execution address. Checkout
+and later order intake share a customer-neutral
+`shopify-rate-zone-fingerprint-v2` over country and postal code, so a partial
+checkout callback can reconcile to the later complete order without retaining
+plaintext destination data.
+Street, city, or recipient changes inside the same rate zone do not make that
+hash authoritative by themselves: exact line quantities, time window,
+currency, selected stable service code, and customer-paid amount remain
+mandatory match predicates, and zero or multiple candidates still fail
+closed. Pre-v2 development receipts are not coerced into a v2 match.
 Shopify's successful CarrierService cache does not include customer identity.
 Therefore callback gating is necessary but not the sole strict-isolation
 control: the Test Product must remain in a dedicated test-only shipping

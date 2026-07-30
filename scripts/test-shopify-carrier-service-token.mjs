@@ -54,6 +54,7 @@ vm.runInNewContext(output, sandbox, { filename: path })
 const {
   shopifyCarrierServiceCallbackToken,
   shopifyCarrierServiceCallbackTokenMatches,
+  shopifyCheckoutDestinationFingerprint,
 } = module.exports
 
 const identity = {
@@ -93,5 +94,44 @@ assert.notEqual(
 )
 assert.equal(token.includes('11111111'), false)
 assert.equal(token.includes('gia0000001'), false)
+
+const partialDestinationFingerprint = shopifyCheckoutDestinationFingerprint({
+  countryCode: 'us',
+  postalCode: ' 06103 ',
+  provinceCode: null,
+  city: null,
+  address1: null,
+  address2: null,
+})
+assert.match(partialDestinationFingerprint, /^[a-f0-9]{64}$/)
+assert.equal(
+  shopifyCheckoutDestinationFingerprint({
+    countryCode: 'US',
+    postalCode: '06103',
+    provinceCode: 'CA',
+    city: 'Hartford',
+    address1: '1 Test Street',
+    address2: 'Suite 2',
+  }),
+  partialDestinationFingerprint,
+  'the checkout callback and later complete order must share one rate-zone fingerprint',
+)
+assert.notEqual(
+  shopifyCheckoutDestinationFingerprint({
+    countryCode: 'US',
+    postalCode: '06104',
+    provinceCode: 'CT',
+  }),
+  partialDestinationFingerprint,
+  'a different ZIP must not reconcile to the same checkout destination',
+)
+assert.throws(
+  () => shopifyCheckoutDestinationFingerprint({
+    countryCode: 'US',
+    postalCode: null,
+  }),
+  /requires country and postal code/,
+  'a rate-zone fingerprint must fail closed without the ZIP',
+)
 
 console.log('Shopify CarrierService callback-token tests passed')

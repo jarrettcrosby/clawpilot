@@ -17,11 +17,11 @@ export type CheckoutRateCarrierParcel = Omit<
 >
 
 export type CheckoutRateDestination = {
-  name: string
-  line1: string
+  name: string | null
+  line1: string | null
   line2: string | null
-  city: string
-  region: string
+  city: string | null
+  region: string | null
   postalCode: string
   countryCode: 'US'
 }

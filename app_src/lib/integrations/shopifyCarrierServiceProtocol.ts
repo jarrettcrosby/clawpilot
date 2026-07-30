@@ -13,7 +13,7 @@ const MAX_RATE_AMOUNT_MINOR = BigInt(9_000_000_000_000_000)
 const MAX_PROPERTY_NODES = 256
 const MAX_PROPERTY_DEPTH = 5
 export const SHOPIFY_CARRIER_SERVICE_FINGERPRINT_VERSION =
-  'shopify-carrier-service-rate-v1'
+  'shopify-carrier-service-rate-v2'
 
 const CURRENCY_PATTERN = /^[A-Z]{3}$/
 const COUNTRY_PATTERN = /^[A-Z]{2}$/
@@ -723,6 +723,17 @@ function canonicalAddress(address: ShopifyCarrierServiceAddress) {
   }
 }
 
+function canonicalDestinationRateZone(
+  address: ShopifyCarrierServiceAddress,
+) {
+  const canonicalText = (value: string | null) =>
+    value === null ? null : value.toLowerCase()
+  return {
+    countryCode: address.countryCode,
+    postalCode: canonicalText(address.postalCode),
+  }
+}
+
 function canonicalItem(item: ShopifyCarrierServiceItem) {
   return {
     productId: item.productId,
@@ -749,7 +760,7 @@ export function fingerprintShopifyCarrierServiceRateRequest(
   const canonical = {
     version: SHOPIFY_CARRIER_SERVICE_FINGERPRINT_VERSION,
     origin: canonicalAddress(request.origin),
-    destination: canonicalAddress(request.destination),
+    destination: canonicalDestinationRateZone(request.destination),
     items,
     currency: request.currency,
     locale: request.locale,

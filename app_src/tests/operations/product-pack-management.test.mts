@@ -198,6 +198,22 @@ test('provider weight requires an exact channel-state revision', () => {
   )
 })
 
+test('derived gross weight preserves its calculation evidence', () => {
+  const profile = activeEachProfile({
+    grossWeightGrams: 220,
+    weightBasis: 'derived',
+    evidenceType: 'derived',
+    evidenceReference:
+      '170 g measured contents plus 50 g evidenced inner retail packaging; outbound carton excluded',
+    source: 'manual',
+    providerWeightEvidence: null,
+  })
+  assert.equal(
+    validateProductPackProfileVersionInput(profile),
+    profile,
+  )
+})
+
 test('active exact-case recipes preserve one-case semantics', () => {
   const recipe = activeExactCaseRecipe()
   assert.equal(validateApprovedPackRecipeInput(recipe), recipe)

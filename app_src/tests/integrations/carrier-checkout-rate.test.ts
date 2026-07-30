@@ -139,6 +139,34 @@ test('rates the complete package set exactly once per required carrier', async (
   )
 })
 
+test('passes a ZIP-only rate destination to each carrier adapter', async () => {
+  const rateOnlyDestination = {
+    name: null,
+    line1: null,
+    line2: null,
+    city: null,
+    region: null,
+    postalCode: '06103',
+    countryCode: 'US' as const,
+  }
+  const seen: unknown[] = []
+  await rateCheckoutShipment({
+    destination: rateOnlyDestination,
+    parcels,
+    carriers,
+    currency: 'USD',
+    deadlineAt: Date.now() + 5_000,
+    invoke: async (selection, request) => {
+      seen.push(request.destination)
+      return result(selection, '42.85')
+    },
+  })
+  assert.deepEqual(seen, [
+    rateOnlyDestination,
+    rateOnlyDestination,
+  ])
+})
+
 test('fails the entire quote when a required carrier fails', async () => {
   await assert.rejects(
     rateCheckoutShipment({

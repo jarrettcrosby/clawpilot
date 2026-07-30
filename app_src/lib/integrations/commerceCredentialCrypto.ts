@@ -268,9 +268,11 @@ function normalizedCheckoutDestinationPart(
 }
 
 /**
- * Produces the customer-neutral destination identity shared by the live
- * CarrierService callback and the later Shopify order-intake record. The
- * plaintext address is never retained at the checkout boundary.
+ * Produces the customer-neutral rate-zone identity shared by the live
+ * CarrierService callback and the later Shopify order-intake record. Shopify
+ * can withhold state, street, and city during checkout rating, so those fields
+ * must not influence reconciliation with the later complete order. Plaintext
+ * destination data is never retained at the checkout boundary.
  */
 export function shopifyCheckoutDestinationFingerprint(input: {
   countryCode?: unknown
@@ -281,7 +283,7 @@ export function shopifyCheckoutDestinationFingerprint(input: {
   address2?: unknown
 }) {
   const canonical = {
-    version: 'shopify-destination-fingerprint-v1',
+    version: 'shopify-rate-zone-fingerprint-v2',
     countryCode: normalizedCheckoutDestinationPart(
       input.countryCode,
       'upper',
@@ -290,20 +292,14 @@ export function shopifyCheckoutDestinationFingerprint(input: {
       input.postalCode,
       'upper',
     ),
-    provinceCode:
-      normalizedCheckoutDestinationPart(input.provinceCode, 'upper') || null,
-    city: normalizedCheckoutDestinationPart(input.city, 'lower') || null,
-    address1:
-      normalizedCheckoutDestinationPart(input.address1, 'lower') || null,
-    address2:
-      normalizedCheckoutDestinationPart(input.address2, 'lower') || null,
   }
   if (
     !canonical.countryCode
     || !canonical.postalCode
   ) {
     throw new Error(
-      'Shopify checkout destination fingerprint requires country and postal code',
+      'Shopify checkout destination fingerprint requires country '
+      + 'and postal code',
     )
   }
   return crypto

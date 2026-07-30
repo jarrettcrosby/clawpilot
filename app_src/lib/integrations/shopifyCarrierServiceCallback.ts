@@ -14,7 +14,9 @@ import {
   type CheckoutRateProviderResult,
 } from '@/lib/integrations/carrierCheckoutRate'
 import { testCarrierSandboxShipmentRate } from '@/lib/integrations/carrierIntegrations'
-import { carrierSandboxPartyFingerprint } from '@/lib/integrations/carrierSandboxRate'
+import {
+  carrierSandboxRateDestinationFingerprint,
+} from '@/lib/integrations/carrierSandboxRate'
 import {
   planShopifyCheckoutPackages,
   shopifyProductGid,
@@ -345,22 +347,18 @@ function checkoutDestination(
       'Checkout destination country is not supported',
     )
   }
-  if (
-    !request.destination.address1
-    || !request.destination.city
-    || !request.destination.provinceCode
-  ) {
+  if (!request.destination.postalCode) {
     throw checkoutFailureError(
       'SHOPIFY_CHECKOUT_DESTINATION_NOT_READY',
       'Checkout destination is not rate-ready',
     )
   }
   return {
-    name: 'Shopify checkout',
-    line1: request.destination.address1,
-    line2: request.destination.address2,
-    city: request.destination.city,
-    region: request.destination.provinceCode,
+    name: null,
+    line1: null,
+    line2: null,
+    city: null,
+    region: null,
     postalCode: request.destination.postalCode,
     countryCode: 'US',
   }
@@ -838,7 +836,7 @@ export async function executeShopifyCarrierServiceCallback(input: {
     checkpoint = 'destination_valid'
     attemptedStage = 'carrier_destination_fingerprint'
     const carrierDestinationHash =
-      carrierSandboxPartyFingerprint(destination)
+      carrierSandboxRateDestinationFingerprint(destination)
     checkpoint = 'carrier_destination_fingerprinted'
     attemptedStage = 'checkout_context'
     const context = await awaitCallbackWork(

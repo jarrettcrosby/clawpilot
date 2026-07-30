@@ -7,6 +7,7 @@ import {
   readShopifyCarrierServiceRateRequest,
   safeShopifyCarrierServiceProtocolErrorPath,
   shopifyCarrierServiceRequestMatchesTestAllowlist,
+  SHOPIFY_CARRIER_SERVICE_FINGERPRINT_VERSION,
   SHOPIFY_CARRIER_SERVICE_MAX_REQUEST_BYTES,
   ShopifyCarrierServiceProtocolError,
 } from '../../lib/integrations/shopifyCarrierServiceProtocol.ts'
@@ -170,6 +171,64 @@ test('fingerprint is canonical across line order and ephemeral contact changes',
     fingerprintShopifyCarrierServiceRateRequest(
       parseShopifyCarrierServiceRateRequest(second),
     ),
+  )
+})
+
+test('fingerprint coalesces progressive address enrichment within one rate zone', () => {
+  const zipOnly = fixture()
+  Object.assign(zipOnly.rate.destination, {
+    province: null,
+    city: null,
+    address1: null,
+    address2: null,
+  })
+  const fullAddress = fixture()
+
+  assert.equal(
+    SHOPIFY_CARRIER_SERVICE_FINGERPRINT_VERSION,
+    'shopify-carrier-service-rate-v2',
+  )
+  const zipOnlyFingerprint = fingerprintShopifyCarrierServiceRateRequest(
+    parseShopifyCarrierServiceRateRequest(zipOnly),
+  )
+  const fullAddressFingerprint = fingerprintShopifyCarrierServiceRateRequest(
+    parseShopifyCarrierServiceRateRequest(fullAddress),
+  )
+
+  assert.equal(
+    zipOnlyFingerprint,
+    fullAddressFingerprint,
+    'ZIP-only and enriched callbacks must reuse one receipt',
+  )
+
+  const differentZip = fixture()
+  differentZip.rate.destination.postal_code = '06104'
+  assert.notEqual(
+    zipOnlyFingerprint,
+    fingerprintShopifyCarrierServiceRateRequest(
+      parseShopifyCarrierServiceRateRequest(differentZip),
+    ),
+    'a different destination rate zone must retain independent evidence',
+  )
+
+  const differentCountry = fixture()
+  differentCountry.rate.destination.country = 'CA'
+  assert.notEqual(
+    zipOnlyFingerprint,
+    fingerprintShopifyCarrierServiceRateRequest(
+      parseShopifyCarrierServiceRateRequest(differentCountry),
+    ),
+    'a different destination country must retain independent evidence',
+  )
+
+  const differentOrigin = fixture()
+  differentOrigin.rate.origin.postal_code = '02533'
+  assert.notEqual(
+    zipOnlyFingerprint,
+    fingerprintShopifyCarrierServiceRateRequest(
+      parseShopifyCarrierServiceRateRequest(differentOrigin),
+    ),
+    'origin changes must remain independently fenced',
   )
 })
 

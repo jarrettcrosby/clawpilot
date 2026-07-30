@@ -81,7 +81,7 @@ for (const required of [
   '...(protocolPath ? { protocolPath } : {})',
   'persistedRequestFingerprint(',
   'shopifyCheckoutDestinationFingerprint(',
-  'carrierSandboxPartyFingerprint(destination)',
+  'carrierSandboxRateDestinationFingerprint(destination)',
   'carrierDestinationFingerprint: carrierDestinationHash',
   'readShopifyCheckoutContextFromPostgres({',
   'inventorySnapshotHash: context.inventorySnapshotHash',
@@ -144,6 +144,25 @@ assert.equal(
   callback.includes('rawPayload'),
   false,
   'callback failure logs must not include raw provider payloads',
+)
+assert.ok(
+  callback.includes('name: null')
+    && callback.includes('line1: null')
+    && callback.includes('line2: null')
+    && callback.includes('city: null')
+    && callback.includes('region: null')
+    && callback.includes('!request.destination.postalCode'),
+  'Shopify progressive callbacks must share one ZIP-only carrier destination fence',
+)
+assert.equal(
+  callback.includes('!request.destination.provinceCode'),
+  false,
+  'Shopify ZIP-only rate discovery must not be rejected for an omitted province',
+)
+assert.equal(
+  callback.includes("name: 'Shopify checkout'"),
+  false,
+  'the callback must not fabricate a carrier destination name',
 )
 
 for (const required of [
