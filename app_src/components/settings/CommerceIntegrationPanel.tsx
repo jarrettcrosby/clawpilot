@@ -77,6 +77,7 @@ type CommerceAccount = {
   externalAccountId: string | null
   displayName: string
   status: 'active' | 'disabled' | 'error'
+  receiptIntakeEnabled: boolean
   configured: boolean
   credentialVersion: number
   authMode: string | null
@@ -904,7 +905,7 @@ export default function CommerceIntegrationPanel() {
       ? 'current'
       : 'pending'
   const shopifyReceiptState: IntegrationSetupStepState =
-    shopifyAccount?.status === 'active'
+    shopifyAccount?.receiptIntakeEnabled
       ? 'complete'
       : shopifyAccount?.verificationStatus === 'verified'
         && (
@@ -1115,7 +1116,7 @@ export default function CommerceIntegrationPanel() {
                     facts: [
                       {
                         label: 'New signed receipts',
-                        value: shopifyAccount?.status === 'active'
+                        value: shopifyAccount?.receiptIntakeEnabled
                           ? 'Queued for intake'
                           : 'Held as evidence',
                       },
@@ -1636,7 +1637,7 @@ export default function CommerceIntegrationPanel() {
                 && account.verificationStatus === 'verified'
                 && grantedScopes.includes('read_orders')
               const activationBlockers = account.provider === 'shopify'
-                && account.status !== 'active'
+                && !account.receiptIntakeEnabled
                 ? [
                     ...(!canActivate
                       ? ['Owner or operations-administrator access is required.']
@@ -1686,12 +1687,18 @@ export default function CommerceIntegrationPanel() {
                           ) : null}
                           <Chip
                             size="small"
-                            color={account.status === 'active'
-                              ? 'success'
-                              : 'default'}
+                            color={
+                              account.provider === 'shopify'
+                                ? account.receiptIntakeEnabled
+                                  ? 'success'
+                                  : 'default'
+                                : account.verificationStatus === 'verified'
+                                  ? 'success'
+                                  : 'default'
+                            }
                             label={account.provider === 'shopify'
                               ? `Signed receipts · ${
-                                  account.status === 'active'
+                                  account.receiptIntakeEnabled
                                     ? 'queued'
                                     : 'held'
                                 }`
@@ -2265,7 +2272,7 @@ export default function CommerceIntegrationPanel() {
                         ) : null}
                         {account.provider === 'shopify'
                           && account.configured
-                          && account.status !== 'active' ? (
+                          && !account.receiptIntakeEnabled ? (
                             <Button
                               variant="contained"
                               startIcon={<PowerSettingsNewRounded />}
@@ -2290,7 +2297,7 @@ export default function CommerceIntegrationPanel() {
                             </Button>
                           ) : null}
                         {account.provider === 'shopify'
-                          && account.status === 'active' ? (
+                          && account.receiptIntakeEnabled ? (
                           <Button
                             variant="outlined"
                             color="warning"

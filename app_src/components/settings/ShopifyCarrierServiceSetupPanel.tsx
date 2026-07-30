@@ -42,6 +42,7 @@ type ShopifyCarrierServiceSetup = {
     configRowVersion: number
     environment: 'sandbox' | 'production'
     status: 'active' | 'disabled' | 'error'
+    receiptIntakeEnabled: boolean
     configured: boolean
     credentialVersion: number
     verificationStatus: 'unverified' | 'verified' | 'failed'
@@ -219,20 +220,42 @@ function materialReady(
   material: ShopifyCarrierServiceSetup['reference']['materials'][number],
   warehouseGlobalId: string,
 ) {
+  return materialReadinessIssues(material, warehouseGlobalId).length === 0
+}
+
+function materialReadinessIssues(
+  material: ShopifyCarrierServiceSetup['reference']['materials'][number],
+  warehouseGlobalId: string,
+) {
   const dimensions = material.ratedOuterDimensionsMm
   const stock = material.stock.find(
     (candidate) => candidate.warehouseGlobalId === warehouseGlobalId,
   )
-  return material.status === 'active'
-    && dimensions.length !== null
-    && dimensions.width !== null
-    && dimensions.height !== null
-    && Boolean(material.ratedOuterDimensionEvidenceType)
-    && Boolean(material.ratedOuterDimensionEvidenceReference)
-    && material.tareWeightGrams !== null
-    && material.maxWeightGrams !== null
-    && stock?.available === true
-    && (stock.onHandQuantity || 0) > 0
+  const issues: string[] = []
+
+  if (material.status !== 'active') issues.push('activate material')
+  if (
+    dimensions.length === null
+    || dimensions.width === null
+    || dimensions.height === null
+  ) {
+    issues.push('add outside dimensions')
+  }
+  if (
+    !material.ratedOuterDimensionEvidenceType
+    || !material.ratedOuterDimensionEvidenceReference
+  ) {
+    issues.push('add dimension evidence')
+  }
+  if (material.tareWeightGrams === null) issues.push('add tare weight')
+  if (material.maxWeightGrams === null) issues.push('add maximum weight')
+  if (!warehouseGlobalId) {
+    issues.push('select a ship-from warehouse')
+  } else if (stock?.available !== true || (stock.onHandQuantity || 0) <= 0) {
+    issues.push('add available stock at this warehouse')
+  }
+
+  return issues
 }
 
 function providerLabel(provider: Provider) {
@@ -355,7 +378,7 @@ export default function ShopifyCarrierServiceSetupPanel({
   const scopeReady = accountScopes.includes('write_shipping')
   const connectionReady = setup?.account.configured === true
     && setup.account.verificationStatus === 'verified'
-    && setup.account.status === 'active'
+    && setup.account.status !== 'error'
     && scopeReady
   const eligibleMaterials = useMemo(
     () => (setup?.reference.materials || []).filter(
@@ -503,7 +526,11 @@ export default function ShopifyCarrierServiceSetupPanel({
         </Typography>
         <Stack sx={{ mt: 0.5 }}>
           {(setup?.reference.materials || []).map((material) => {
-            const ready = materialReady(material, warehouseGlobalId)
+            const readinessIssues = materialReadinessIssues(
+              material,
+              warehouseGlobalId,
+            )
+            const ready = readinessIssues.length === 0
             return (
               <FormControlLabel
                 key={material.globalId}
@@ -522,7 +549,7 @@ export default function ShopifyCarrierServiceSetupPanel({
                   />
                 )}
                 label={`${material.code} · ${material.name}${
-                  ready ? '' : ' — complete outside dimensions and stock'
+                  ready ? ' — ready' : ` — needs ${readinessIssues.join(', ')}`
                 }`}
               />
             )
@@ -580,7 +607,7 @@ export default function ShopifyCarrierServiceSetupPanel({
       key: 'credential',
       label: 'Verify connection and checkout scope',
       description:
-        'The installed Shopify app must be active, verified, and grant write_shipping. The callback itself remains read, compute, rate, and persist only.',
+        'The installed Shopify app credential must be configured, verified, non-error, and grant write_shipping. Optional signed receipt intake is a separate control and is not required for CarrierService setup. The callback itself remains read, compute, rate, and persist only.',
       state: stepState(
         Boolean(connectionReady),
         true,
@@ -598,6 +625,12 @@ export default function ShopifyCarrierServiceSetupPanel({
         {
           label: 'write_shipping',
           value: scopeReady ? 'Granted' : 'Missing',
+        },
+        {
+          label: 'Signed receipt intake (optional)',
+          value: setup?.account.receiptIntakeEnabled
+            ? 'Queued'
+            : 'Held',
         },
       ],
     },
@@ -664,10 +697,10 @@ export default function ShopifyCarrierServiceSetupPanel({
     {
       key: 'register',
       label: registered
-        ? 'Authorize exact removal in Active'
-        : 'Authorize exact registration in Active',
+        ? 'Authorize exact resource removal'
+        : 'Authorize exact resource registration',
       description:
-        'After the exact Shadow simulation, switch Operations to Active. An owner or authorized administrator grants one short-lived, single-use provider mutation for only this configuration row and Active revision.',
+        'Keep global Operations in Shadow. After the exact zero-write simulation, an owner or authorized administrator may grant one short-lived, single-use Shopify provider mutation for only this CarrierService configuration row and exact Shadow revision.',
       state: stepState(
         false,
         Boolean(simulated),
@@ -682,10 +715,10 @@ export default function ShopifyCarrierServiceSetupPanel({
         <Stack spacing={1}>
           <Alert severity="warning">
             Current Operations mode:{' '}
-            {setup?.reference.activation.state || 'unknown'}. Shadow makes
-            zero Shopify calls. Provider credentials remain encrypted and no
-            network call can begin until the exact Active authorization is
-            durably claimed.
+            {setup?.reference.activation.state || 'unknown'}. Keep it in
+            Shadow. Provider credentials remain encrypted and no Shopify
+            network call can begin until the exact resource-scoped,
+            single-use authorization is durably claimed.
           </Alert>
           {reconciliationRequired ? (
             <Alert severity="error">
@@ -768,7 +801,7 @@ export default function ShopifyCarrierServiceSetupPanel({
                 control={(
                   <Checkbox
                     checked={confirmWrite}
-                    disabled={Boolean(busy)}
+                    disabled={!setup?.canActivate || Boolean(busy)}
                     onChange={(event) => {
                       setConfirmWrite(event.target.checked)
                     }}
@@ -781,8 +814,9 @@ export default function ShopifyCarrierServiceSetupPanel({
                 color="warning"
                 disabled={
                   !exactShadowSimulation
-                  || setup?.reference.activation.state !== 'active'
+                  || setup?.reference.activation.state !== 'shadow'
                   || setup?.account.environment !== 'sandbox'
+                  || !setup?.canActivate
                   || !confirmWrite
                   || Boolean(recoveryRequired)
                   || Boolean(mutationInFlight)
@@ -795,7 +829,7 @@ export default function ShopifyCarrierServiceSetupPanel({
                     confirmationRequestId:
                       globalThis.crypto.randomUUID(),
                   },
-                  'Shopify confirmed the sandbox CarrierService registration under the exact Active revision.',
+                  'Shopify confirmed the sandbox CarrierService registration under the exact Shadow revision and one-time resource authorization.',
                 )}
               >
                 {busy === 'register'
@@ -809,7 +843,7 @@ export default function ShopifyCarrierServiceSetupPanel({
                 control={(
                   <Checkbox
                     checked={confirmRemove}
-                    disabled={Boolean(busy)}
+                    disabled={!setup?.canActivate || Boolean(busy)}
                     onChange={(event) => {
                       setConfirmRemove(event.target.checked)
                     }}
@@ -824,7 +858,8 @@ export default function ShopifyCarrierServiceSetupPanel({
                 color="error"
                 disabled={
                   !exactShadowSimulation
-                  || setup?.reference.activation.state !== 'active'
+                  || setup?.reference.activation.state !== 'shadow'
+                  || !setup?.canActivate
                   || !confirmRemove
                   || Boolean(recoveryRequired)
                   || Boolean(mutationInFlight)
@@ -839,7 +874,7 @@ export default function ShopifyCarrierServiceSetupPanel({
                     confirmationRequestId:
                       globalThis.crypto.randomUUID(),
                   },
-                  'Shopify confirmed exact CarrierService removal under the Active revision.',
+                  'Shopify confirmed exact CarrierService removal under the Shadow revision and one-time resource authorization.',
                 )}
               >
                 {busy === 'unregister'

@@ -105,6 +105,9 @@ const migration = read(
 const activeMigration = read(
   'db/migrations/0156_operations_shopify_carrier_service_active_authorization.sql',
 )
+const receiptAuthorityMigration = read(
+  'db/migrations/0159_operations_shopify_receipt_and_carrier_authority.sql',
+)
 const persistenceSource = read(
   'app_src/lib/persistence/shopifyCarrierServiceMutationAuthorization.ts',
 )
@@ -186,7 +189,11 @@ for (const pattern of [
   /CREATE OR REPLACE FUNCTION\s+([a-z0-9_]+)/gi,
   /CREATE TRIGGER\s+([a-z0-9_]+)/gi,
 ]) {
-  for (const source of [migration, activeMigration]) {
+  for (const source of [
+    migration,
+    activeMigration,
+    receiptAuthorityMigration,
+  ]) {
     for (const match of source.matchAll(pattern)) {
       assert.ok(
         Buffer.byteLength(match[1], 'utf8') <= 63,
@@ -271,26 +278,33 @@ includes(activeMigration, [
   'effect_provider_write_count IS DISTINCT FROM 0',
   'authorization_provider_write_activation_revision IS NULL',
   'Legacy Shadow grants remain audit-only and unclaimable',
-], 'Active CarrierService authorization migration')
-const activeAttemptTrigger = activeMigration.slice(
-  activeMigration.indexOf(
+], 'Historical Active CarrierService authorization migration')
+includes(receiptAuthorityMigration, [
+  'receipt_intake_enabled boolean NOT NULL DEFAULT false',
+  "current_activation_state IS DISTINCT FROM 'shadow'",
+  "account_status IS DISTINCT FROM 'active'",
+  "account_status IS DISTINCT FROM 'disabled'",
+  'resource-scoped Shadow authorization expired or became stale before claim',
+], 'Current resource-scoped CarrierService authorization migration')
+const activeAttemptTrigger = receiptAuthorityMigration.slice(
+  receiptAuthorityMigration.indexOf(
     'CREATE OR REPLACE FUNCTION\n  protect_ops_shopify_cs_mut_attempt()',
   ),
-  activeMigration.indexOf(
+  receiptAuthorityMigration.indexOf(
     'CREATE OR REPLACE FUNCTION\n  protect_ops_shopify_cs_config_mut_link()',
   ),
 )
 includes(activeAttemptTrigger, [
-  "current_activation_state IS DISTINCT FROM 'active'",
+  "current_activation_state IS DISTINCT FROM 'shadow'",
   'authorization_provider_write_activation_revision',
   'current_activation_revision IS DISTINCT FROM',
-  'Active authorization expired or became stale before claim',
-], 'Pre-call Active authorization claim fence')
-const configMutationLinkTrigger = activeMigration.slice(
-  activeMigration.indexOf(
+  'resource-scoped Shadow authorization expired or became stale before claim',
+], 'Pre-call resource-scoped authorization claim fence')
+const configMutationLinkTrigger = receiptAuthorityMigration.slice(
+  receiptAuthorityMigration.indexOf(
     'CREATE OR REPLACE FUNCTION\n  protect_ops_shopify_cs_config_mut_link()',
   ),
-  activeMigration.indexOf(
+  receiptAuthorityMigration.indexOf(
     'CREATE OR REPLACE FUNCTION\n  operations_shopify_cs_config_has_exact_finalization_link',
   ),
 )
@@ -299,22 +313,18 @@ includes(configMutationLinkTrigger, [
   'exact applied reconciliation evidence',
   'config_row_version IS DISTINCT FROM NEW.from_row_version',
   'auth_provider_write_activation_revision IS NULL',
-  'local-only finalization',
-  'verified credential generation before any',
-  'rotate the credential',
-  'must not strand an',
 ], 'Post-provider local-only configuration finalization')
 assert.doesNotMatch(
   configMutationLinkTrigger,
   /current_activation_(?:state|revision)|activation\.state|activation\.revision|account_generation|credential_status|operations_commerce_credentials/,
   'Post-provider local-only finalization must not depend on mutable organization activation or credential state',
 )
-const exactFinalizationLink = activeMigration.slice(
-  activeMigration.indexOf(
+const exactFinalizationLink = receiptAuthorityMigration.slice(
+  receiptAuthorityMigration.indexOf(
     'CREATE OR REPLACE FUNCTION\n  operations_shopify_cs_config_has_exact_finalization_link',
   ),
-  activeMigration.indexOf(
-    '-- Replace the inherited validator',
+  receiptAuthorityMigration.indexOf(
+    '-- Ordinary config writes still bind',
   ),
 )
 includes(exactFinalizationLink, [
@@ -328,12 +338,12 @@ includes(exactFinalizationLink, [
   "authorized_mutation.operation = 'create'",
   "authorized_mutation.operation = 'delete'",
 ], 'Exact local-finalization link predicate')
-const configWriteValidator = activeMigration.slice(
-  activeMigration.indexOf(
+const configWriteValidator = receiptAuthorityMigration.slice(
+  receiptAuthorityMigration.indexOf(
     'CREATE OR REPLACE FUNCTION\n  validate_operations_shopify_carrier_service_config()',
   ),
-  activeMigration.indexOf(
-    '-- Callback readiness remains a live fail-closed predicate',
+  receiptAuthorityMigration.indexOf(
+    'COMMENT ON TABLE',
   ),
 )
 includes(configWriteValidator, [
@@ -343,7 +353,7 @@ includes(configWriteValidator, [
   'IF NOT exact_finalization_link_exists',
   'account_generation IS DISTINCT FROM NEW.credential_generation',
   'activation_revision IS DISTINCT FROM NEW.activation_revision',
-  'requires exact Active one-time mutation evidence',
+  'requires exact resource-scoped one-time mutation evidence',
 ], 'Config write exact-finalization exemption')
 const callbackReadyValidator = activeMigration.slice(
   activeMigration.indexOf(

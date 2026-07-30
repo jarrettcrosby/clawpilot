@@ -31,6 +31,9 @@ const mutationMigration = read(
 const activeMutationMigration = read(
   'db/migrations/0156_operations_shopify_carrier_service_active_authorization.sql',
 )
+const receiptAuthorityMigration = read(
+  'db/migrations/0159_operations_shopify_receipt_and_carrier_authority.sql',
+)
 const externalEffectsPersistence = read(
   'app_src/lib/persistence/commerceExternalEffects.ts',
 )
@@ -151,19 +154,19 @@ requireAll(providerMutation, [
   'body.confirmProviderWrite !== true',
   "'SHOPIFY_CARRIER_SERVICE_PROVIDER_WRITE_CONFIRMATION_REQUIRED'",
   "action === 'register' ? 'create' : 'delete'",
-  "current.reference.activation.state !== 'active'",
+  "current.reference.activation.state !== 'shadow'",
   'current.reference.activation.revision === null',
-  "'SHOPIFY_CARRIER_SERVICE_SHADOW_PROVIDER_WRITE_BLOCKED'",
+  "'SHOPIFY_CARRIER_SERVICE_RESOURCE_AUTHORIZATION_REQUIRES_SHADOW'",
   '!current.shadowSimulation',
   'current.shadowSimulation.configRowVersion',
   "'SHOPIFY_CARRIER_SERVICE_SHADOW_EVIDENCE_REQUIRED'",
   'body.confirmProductionProviderWrite !== true',
-  'executeActiveCarrierServiceMutation({',
+  'executeResourceScopedCarrierServiceMutation({',
   'confirmationRequestId(',
 ], 'revision-fenced register and unregister actions')
 
 const activeExecutorStart = setupRoute.indexOf(
-  'async function executeActiveCarrierServiceMutation(',
+  'async function executeResourceScopedCarrierServiceMutation(',
 )
 const activeExecutorEnd = setupRoute.indexOf(
   'async function recoverOneTimeCarrierServiceMutation(',
@@ -171,7 +174,7 @@ const activeExecutorEnd = setupRoute.indexOf(
 )
 assert.ok(
   activeExecutorStart >= 0 && activeExecutorEnd > activeExecutorStart,
-  'setup API is missing the exact Active mutation executor',
+  'setup API is missing the exact resource-scoped mutation executor',
 )
 const activeExecutor = setupRoute.slice(
   activeExecutorStart,
@@ -192,7 +195,7 @@ requireAll(activeExecutor, [
   'claimShopifyCarrierServiceMutationInPostgres({',
   'executeAuthorizedShopifyCarrierServiceMutation({',
   'finalizeShopifyCarrierServiceConfigMutationInPostgres({',
-], 'exact Active mutation executor')
+], 'exact resource-scoped mutation executor')
 requireAll(setupPanel, [
   'state: stepState(',
   'false,',
@@ -221,9 +224,9 @@ requireAll(setupPanel, [
   'Simulate registration in Shadow',
   'Simulate exact removal in Shadow',
   'zero credential decryption, zero Shopify network calls, and zero provider writes',
-  'Authorize exact registration in Active',
-  'Authorize exact removal in Active',
-  'single-use provider mutation',
+  'Authorize exact resource registration',
+  'Authorize exact resource removal',
+  'single-use Shopify provider mutation',
   'confirmWrite',
   'confirmRemove',
   "run(\n                  'register'",
@@ -231,7 +234,7 @@ requireAll(setupPanel, [
   'confirmProviderWrite: true',
   'confirmProductionProviderWrite:',
   'globalThis.crypto.randomUUID()',
-], 'Shadow then Active provider mutation workflow')
+], 'Shadow plus resource-scoped provider mutation workflow')
 requireAll(setupPanel, [
   "authorization.status === 'claimed'",
   "authorization.status === 'unknown'",
@@ -264,7 +267,7 @@ requireAll(setupRoute, [
   'readCommerceExternalEffectByIdempotencyFromPostgres({',
   'oneTimeProviderMutationConfirmationRequired: true',
   'globalOperationsModeChangedForRegistration: false',
-], 'zero-write Shadow evidence and exact Active provider route')
+], 'zero-write Shadow evidence and exact resource-scoped provider route')
 requireAll(externalEffectsPersistence, [
   'readCommerceExternalEffectByIdempotencyFromPostgres',
   'intent.organization_id = $1::uuid',
@@ -299,7 +302,6 @@ requireAll(mutationMigration, [
 requireAll(activeMutationMigration, [
   'simulation_activation_revision integer',
   'provider_write_activation_revision integer',
-  "current_activation_state IS DISTINCT FROM 'active'",
   'NEW.provider_write_activation_revision',
   "effect_mode IS DISTINCT FROM 'shadow'",
   "effect_state IS DISTINCT FROM 'simulated'",
@@ -309,7 +311,15 @@ requireAll(activeMutationMigration, [
   'authorization_provider_write_activation_revision IS NULL',
   'auth_provider_write_activation_revision IS NULL',
   'Legacy Shadow grants remain audit-only and unclaimable',
-], 'database-enforced Shadow simulation and Active one-time write')
+], 'legacy database-enforced Shadow simulation and one-time write schema')
+requireAll(receiptAuthorityMigration, [
+  'receipt_intake_enabled boolean NOT NULL DEFAULT false',
+  "current_activation_state IS DISTINCT FROM 'shadow'",
+  "account_status IS DISTINCT FROM 'active'",
+  "account_status IS DISTINCT FROM 'disabled'",
+  'NEW.provider_write_activation_revision',
+  'operations_shopify_carrier_service_config_is_ready(',
+], 'receipt-independent resource-scoped CarrierService authority')
 const configMutationLinkTrigger = activeMutationMigration.slice(
   activeMutationMigration.indexOf(
     'CREATE OR REPLACE FUNCTION\n  protect_ops_shopify_cs_config_mut_link()',
@@ -332,16 +342,16 @@ requireAll(activeMutationMigration, [
   'AND NOT exact_finalization_link_exists',
 ], 'exact local-finalization validator and callback-readiness exemption')
 requireAll(distributedOperationsContract, [
-  'The Active revision is a pre-call write fence, not a',
+  'is a pre-call write fence',
   'post-call local-finalization dependency',
-  'current credential state changed after Shopify applied',
-  'credential generation bound into the',
-  'cannot authorize another provider call or',
-  'single-consumption attempt is the provider-authority',
-  'Callback readiness remains a',
+  'grant is bound to the current verified credential generation',
+  'credential state drifts',
+  'cannot authorize another',
+  'single-consumption attempt is the',
+  'Callback readiness remains a separate live',
 ], 'Distributed Operations activation-drift contract')
 requireAll(userIntegrationsContract, [
-  'The Active revision and verified credential generation are rechecked before the provider call',
+  'resource-scoped Shadow revision and verified credential generation are rechecked before the provider call',
   'single-consumption attempt is the provider-authority cutoff',
   'cannot cancel the consumed attempt or permit another provider call',
   'Callback readiness remains a separate live predicate',
@@ -358,8 +368,8 @@ requireAll(setupPanel, [
   'Run zero-write simulation',
   'Authorize and register once',
   'Authorize and remove once',
-  'Shadow makes',
-  'zero Shopify calls',
+  'Shadow records immutable terminal evidence',
+  'zero Shopify network calls',
   'Do not retry.',
   'Open Packaging Materials',
   'Create a cart for Jarrett+warehouse@episcs.com.',

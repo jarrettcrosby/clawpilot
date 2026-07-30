@@ -19,20 +19,16 @@ const REQUIRED_APPLIED_MIGRATIONS = [
   '0149_operations_shopify_checkout_rating.sql',
   '0150_operations_shopify_carrier_service_mutation_authorization.sql',
   '0151_operations_product_pack_management_hardening.sql',
+  '0156_operations_shopify_carrier_service_active_authorization.sql',
+  '0157_operations_shopify_checkout_receipt_reuse.sql',
+  '0158_operations_commerce_current_issue_index.sql',
 ]
 const TARGET_MIGRATION =
-  '0156_operations_shopify_carrier_service_active_authorization.sql'
-const RECEIPT_REUSE_MIGRATION =
-  '0157_operations_shopify_checkout_receipt_reuse.sql'
-const CURRENT_ISSUE_INDEX_MIGRATION =
-  '0158_operations_commerce_current_issue_index.sql'
+  '0159_operations_shopify_receipt_and_carrier_authority.sql'
 const TRACKED_MIGRATIONS = [
   ...REQUIRED_APPLIED_MIGRATIONS,
   TARGET_MIGRATION,
-  RECEIPT_REUSE_MIGRATION,
-  CURRENT_ISSUE_INDEX_MIGRATION,
 ]
-const LEGACY_PROBE_GLOBAL_ID = 'gsca9999999'
 const EXPECTED_RELATIONS = [
   'operations_commerce_external_effect_aggregate_fences',
   'operations_commerce_external_effect_intents',
@@ -196,6 +192,7 @@ async function activeAuthorizationObjectState(client) {
       'protect_ops_shopify_cs_config_mut_link',
       'protect_ops_shopify_cs_mut_attempt',
       'protect_ops_shopify_cs_mut_authorization',
+      'validate_operations_commerce_variant_pack_mapping',
       'validate_operations_shopify_carrier_service_config',
       'validate_operations_shopify_carrier_service_config_ready',
     ]],
@@ -208,100 +205,68 @@ async function activeAuthorizationObjectState(client) {
   }
 }
 
+async function receiptIntakeColumnState(client) {
+  const result = await client.query(
+    `SELECT column_name, data_type, is_nullable, column_default
+     FROM information_schema.columns
+     WHERE table_schema = 'public'
+       AND table_name = 'operations_integration_accounts'
+       AND column_name = 'receipt_intake_enabled'`,
+  )
+  return result.rows
+}
+
 async function authorizationDataState(client) {
   const result = await client.query(
-    `SELECT count(*)::text AS row_count,
-       count(*) FILTER (
-         WHERE global_id = $1
-       )::text AS legacy_probe_count
+    `SELECT count(*)::text AS row_count
      FROM operations_shopify_carrier_service_mutation_authorizations`,
-    [LEGACY_PROBE_GLOBAL_ID],
   )
   return result.rows[0]
 }
 
-async function assertActiveAuthorizationUpgrade(client) {
+async function assertReceiptAndCarrierAuthorityUpgrade(client) {
   await client.query('BEGIN')
   try {
     await client.query(`SET LOCAL statement_timeout = '120s'`)
     await client.query(`SET LOCAL lock_timeout = '15s'`)
-    const foreignKeys = await client.query(
-      `SELECT constraint_name
-       FROM information_schema.table_constraints
-       WHERE table_schema = 'public'
-         AND table_name =
-           'operations_shopify_carrier_service_mutation_authorizations'
-         AND constraint_type = 'FOREIGN KEY'`,
-    )
-    await client.query(
-      `DROP TRIGGER IF EXISTS
-         protect_ops_shopify_cs_mut_auth_write
-       ON operations_shopify_carrier_service_mutation_authorizations`,
-    )
-    for (const row of foreignKeys.rows) {
-      await client.query(
-        `ALTER TABLE
-           operations_shopify_carrier_service_mutation_authorizations
-         DROP CONSTRAINT ${quoteIdentifier(row.constraint_name)}`,
-      )
-    }
-    await client.query(
-      `INSERT INTO
-         operations_shopify_carrier_service_mutation_authorizations (
-           global_id, organization_id, integration_account_id, config_id,
-           simulation_effect_id, operation, account_environment,
-           credential_generation, config_row_version, activation_state,
-           activation_revision, aggregate_hash, request_hash,
-           expected_service_gid, confirmation_hash,
-           confirmation_statement_version, idempotency_key,
-           authorized_by, authorized_role, expires_at
-         ) VALUES (
-           $1,
-           '10000000-0000-4000-8000-000000000001'::uuid,
-           '10000000-0000-4000-8000-000000000002'::uuid,
-           '10000000-0000-4000-8000-000000000003'::uuid,
-           '10000000-0000-4000-8000-000000000004'::uuid,
-           'create', 'sandbox', 1, 0, 'shadow', 7,
-           repeat('a', 64), repeat('b', 64), NULL, repeat('c', 64),
-           'shopify-carrier-service-sandbox-provider-write-v1',
-           'legacy-upgrade-test', 'legacy@example.test', 'owner',
-           now() + interval '2 minutes'
-         )`,
-      [LEGACY_PROBE_GLOBAL_ID],
+    const legacyAccountState = await client.query(
+      `SELECT id::text, provider, integration_type, status
+       FROM operations_integration_accounts
+       ORDER BY id`,
     )
 
     await client.query(migrationSql(TARGET_MIGRATION))
-    await client.query(migrationSql(RECEIPT_REUSE_MIGRATION))
-    await client.query(migrationSql(CURRENT_ISSUE_INDEX_MIGRATION))
-    const upgraded = await client.query(
-      `SELECT
-         activation_revision,
-         simulation_activation_revision,
-         provider_write_activation_revision
-       FROM operations_shopify_carrier_service_mutation_authorizations
-       WHERE global_id = $1`,
-      [LEGACY_PROBE_GLOBAL_ID],
+
+    assert.deepEqual(
+      await receiptIntakeColumnState(client),
+      [{
+        column_name: 'receipt_intake_enabled',
+        data_type: 'boolean',
+        is_nullable: 'NO',
+        column_default: 'false',
+      }],
+      'signed receipt intake must be an independent fail-closed boolean',
     )
-    assert.deepEqual(upgraded.rows[0], {
-      activation_revision: 7,
-      simulation_activation_revision: 7,
-      provider_write_activation_revision: null,
-    })
-    const trigger = await client.query(
-      `SELECT 1
-       FROM pg_trigger trigger
-       JOIN pg_class relation ON relation.oid = trigger.tgrelid
-       WHERE relation.relname =
-         'operations_shopify_carrier_service_mutation_authorizations'
-         AND trigger.tgname =
-           'protect_ops_shopify_cs_mut_auth_write'
-         AND NOT trigger.tgisinternal`,
+    const upgradedAccountState = await client.query(
+      `SELECT id::text, receipt_intake_enabled
+       FROM operations_integration_accounts
+       ORDER BY id`,
     )
-    assert.equal(
-      trigger.rows.length,
-      1,
-      'active authorization upgrade did not restore append-only trigger',
+    const expectedReceiptState = new Map(
+      legacyAccountState.rows.map((row) => [
+        row.id,
+        row.provider === 'shopify'
+          && row.integration_type === 'commerce'
+          && row.status === 'active',
+      ]),
     )
+    assert.ok(
+      upgradedAccountState.rows.every((row) => (
+        row.receipt_intake_enabled === expectedReceiptState.get(row.id)
+      )),
+      '0159 must seed receipt intake only for legacy active Shopify commerce accounts',
+    )
+
     const activeState = await activeAuthorizationObjectState(client)
     assert.deepEqual(
       activeState.columns,
@@ -317,7 +282,7 @@ async function assertActiveAuthorizationUpgrade(client) {
           is_nullable: 'NO',
         },
       ],
-      'active authorization revision columns are incomplete',
+      'resource-scoped authorization revision columns are incomplete',
     )
     assert.deepEqual(
       activeState.constraints.map((row) => row.conname),
@@ -325,28 +290,77 @@ async function assertActiveAuthorizationUpgrade(client) {
         'ops_shopify_cs_mut_auth_sim_revision_valid',
         'ops_shopify_cs_mut_auth_write_revision_valid',
       ],
-      'active authorization revision constraints are incomplete',
+      'resource-scoped authorization constraints are incomplete',
     )
-    assert.ok(
-      activeState.functions.some((row) => (
-        row.proname
-          === 'operations_shopify_cs_active_authorization_fence_hash'
-      )),
-      'active authorization fence function is missing',
+    assert.equal(
+      activeState.triggers.length,
+      1,
+      'append-only CarrierService authorization trigger is missing',
     )
+
     const attemptFence = activeState.functions.find(
       (row) => row.proname === 'protect_ops_shopify_cs_mut_attempt',
     )?.definition || ''
     assert.match(
       attemptFence,
-      /current_activation_state IS DISTINCT FROM 'active'/,
-      'provider-call claim must retain the current Active-state fence',
+      /account_provider IS DISTINCT FROM 'shopify'/,
+      'provider-call claim must recheck the Shopify account',
+    )
+    assert.match(
+      attemptFence,
+      /account_status IS DISTINCT FROM 'active'[\s\S]+account_status IS DISTINCT FROM 'disabled'/,
+      'provider-call claim must accept only active or disabled Shopify accounts',
+    )
+    assert.match(
+      attemptFence,
+      /credential_status IS DISTINCT FROM 'verified'/,
+      'provider-call claim must retain verified credential fencing',
+    )
+    assert.match(
+      attemptFence,
+      /current_activation_state IS DISTINCT FROM 'shadow'/,
+      'provider-call claim must retain the current Shadow-state fence',
     )
     assert.match(
       attemptFence,
       /current_activation_revision IS DISTINCT FROM\s+authorization_provider_write_activation_revision/,
-      'provider-call claim must retain the exact Active-revision fence',
+      'provider-call claim must retain the exact resource-scoped Shadow revision',
     )
+    assert.match(
+      attemptFence,
+      /authorization_expires_at <= now\(\)/,
+      'provider-call claim must reject an expired one-time grant',
+    )
+
+    const authorizationFence = activeState.functions.find(
+      (row) => row.proname === 'protect_ops_shopify_cs_mut_authorization',
+    )?.definition || ''
+    assert.match(
+      authorizationFence,
+      /operations_shopify_carrier_service_actor_can_authorize/,
+      'authorization must retain the owner/admin actor fence',
+    )
+    assert.match(
+      authorizationFence,
+      /account_status IS DISTINCT FROM 'active'[\s\S]+account_status IS DISTINCT FROM 'disabled'/,
+      'authorization must accept only active or disabled Shopify accounts',
+    )
+    assert.match(
+      authorizationFence,
+      /current_activation_state IS DISTINCT FROM 'shadow'/,
+      'authorization must keep global Operations in Shadow',
+    )
+    assert.match(
+      authorizationFence,
+      /effect_provider_write_count IS DISTINCT FROM 0/,
+      'authorization must retain exact zero-write Shadow simulation evidence',
+    )
+    assert.match(
+      authorizationFence,
+      /prior\.provider_write_activation_revision IS NOT NULL/,
+      'authorization must retain the one-exact-mutation fence',
+    )
+
     const localFinalizer = activeState.functions.find(
       (row) => row.proname === 'protect_ops_shopify_cs_config_mut_link',
     )?.definition || ''
@@ -357,14 +371,20 @@ async function assertActiveAuthorizationUpgrade(client) {
     )
     assert.match(
       localFinalizer,
+      /outcome_provider_write_count IS DISTINCT FROM 1/,
+      'local finalization must bind one exact provider write',
+    )
+    assert.match(
+      localFinalizer,
       /config_row_version IS DISTINCT FROM NEW\.from_row_version/,
       'local finalization must retain the exact configuration row fence',
     )
     assert.doesNotMatch(
       localFinalizer,
-      /current_activation_(?:state|revision)|activation\.state|activation\.revision|account_generation|credential_status|operations_commerce_credentials/,
-      'post-provider local finalization must survive organization activation and credential drift',
+      /receipt_intake_enabled|current_activation_(?:state|revision)|activation\.state|activation\.revision|account_generation|credential_status|operations_commerce_credentials/,
+      'post-provider local finalization must survive later mutable-state drift',
     )
+
     const exactFinalization = activeState.functions.find(
       (row) => row.proname
         === 'operations_shopify_cs_config_has_exact_finalization_link',
@@ -372,13 +392,14 @@ async function assertActiveAuthorizationUpgrade(client) {
     assert.match(
       exactFinalization,
       /authorized_mutation\.provider_write_activation_revision =\s+requested_to_activation_revision/,
-      'local finalization must bind the stored provider-write revision',
+      'local finalization must bind the stored resource-scoped revision',
     )
     assert.match(
       exactFinalization,
       /authorized_mutation\.credential_generation =\s+requested_credential_generation/,
       'local finalization must retain the authorization credential generation',
     )
+
     const configWriteValidator = activeState.functions.find(
       (row) => row.proname
         === 'validate_operations_shopify_carrier_service_config',
@@ -393,6 +414,7 @@ async function assertActiveAuthorizationUpgrade(client) {
       /IF NOT exact_finalization_link_exists[\s\S]+account_generation IS DISTINCT FROM NEW\.credential_generation[\s\S]+activation_revision IS DISTINCT FROM NEW\.activation_revision/,
       'ordinary config writes must retain mutable credential and activation fences',
     )
+
     const readyWriteValidator = activeState.functions.find(
       (row) => row.proname
         === 'validate_operations_shopify_carrier_service_config_ready',
@@ -402,64 +424,62 @@ async function assertActiveAuthorizationUpgrade(client) {
       /operations_shopify_carrier_service_config_is_ready[\s\S]+AND NOT exact_finalization_link_exists/,
       'deferred callback-ready validation must exempt only exact local finalization',
     )
+
     const callbackReadyPredicate = activeState.functions.find(
       (row) => row.proname
         === 'operations_shopify_carrier_service_config_is_ready',
     )?.definition || ''
     assert.match(
       callbackReadyPredicate,
+      /account\.status <> 'error'/,
+      'runtime callback readiness must reject error accounts',
+    )
+    assert.doesNotMatch(
+      callbackReadyPredicate,
+      /receipt_intake_enabled|(?:^|\s)account\.status = 'active'/m,
+      'runtime callback readiness must be independent of receipt intake and generic active status',
+    )
+    assert.match(
+      callbackReadyPredicate,
       /activation\.revision = config\.activation_revision/,
-      'runtime callback readiness must remain fail-closed on Active revision drift',
+      'runtime callback readiness must reject activation revision drift',
+    )
+    assert.match(
+      callbackReadyPredicate,
+      /material\.row_version\s+= selected\.packaging_material_row_version/,
+      'runtime callback readiness must reject material revision drift',
     )
 
-    await client.query('SAVEPOINT legacy_claim_probe')
-    let legacyClaimRejected = false
-    try {
-      await client.query(
-        `INSERT INTO
-           operations_shopify_carrier_service_mutation_attempts (
-             organization_id, authorization_id, worker_id,
-             adapter_version, lease_token, lease_expires_at
-           )
-         SELECT
-           organization_id, id, 'legacy-upgrade-probe',
-           'legacy-upgrade-probe-v1',
-           gen_random_uuid(), now() + interval '30 seconds'
-         FROM operations_shopify_carrier_service_mutation_authorizations
-         WHERE global_id = $1`,
-        [LEGACY_PROBE_GLOBAL_ID],
-      )
-    } catch (error) {
-      legacyClaimRejected = /Active authorization expired or became stale/
-        .test(String(error.message || ''))
-    }
-    await client.query('ROLLBACK TO SAVEPOINT legacy_claim_probe')
-    await client.query('RELEASE SAVEPOINT legacy_claim_probe')
-    assert.equal(
-      legacyClaimRejected,
-      true,
-      'upgraded legacy Shadow authorization was claimable',
+    const checkoutMappingValidator = activeState.functions.find(
+      (row) => row.proname
+        === 'validate_operations_commerce_variant_pack_mapping',
+    )?.definition || ''
+    assert.match(
+      checkoutMappingValidator,
+      /account_status <> 'active'[\s\S]+account_status <> 'disabled'/,
+      'checkout mapping must accept verified non-error active or disabled accounts',
+    )
+    assert.match(
+      checkoutMappingValidator,
+      /config\.registration_state = 'registered'[\s\S]+operations_shopify_carrier_service_config_is_ready/,
+      'checkout mapping must retain the registered-ready CarrierService fence',
+    )
+    assert.match(
+      checkoutMappingValidator,
+      /NEW\.source_revision IS DISTINCT FROM channel_state\.source_revision[\s\S]+NEW\.source_hash IS DISTINCT FROM channel_state\.source_hash/,
+      'checkout mapping must retain exact channel-state evidence',
+    )
+    assert.match(
+      checkoutMappingValidator,
+      /version_gross_weight_grams[\s\S]+IS DISTINCT FROM channel_state\.weight_grams/,
+      'checkout mapping must retain exact provider-to-pack weight evidence',
+    )
+    assert.match(
+      checkoutMappingValidator,
+      /profile_package_level = 'case'[\s\S]+version_ships_as_own_package = true[\s\S]+operations_approved_pack_recipes recipe[\s\S]+operations_shopify_carrier_service_config_materials selected/,
+      'checkout mapping must retain the self-package or selected-recipe fence',
     )
 
-    await client.query('SAVEPOINT legacy_append_only_probe')
-    let appendOnlyRejected = false
-    try {
-      await client.query(
-        `UPDATE operations_shopify_carrier_service_mutation_authorizations
-         SET provider_write_activation_revision = 8
-         WHERE global_id = $1`,
-        [LEGACY_PROBE_GLOBAL_ID],
-      )
-    } catch {
-      appendOnlyRejected = true
-    }
-    await client.query('ROLLBACK TO SAVEPOINT legacy_append_only_probe')
-    await client.query('RELEASE SAVEPOINT legacy_append_only_probe')
-    assert.equal(
-      appendOnlyRejected,
-      true,
-      'upgraded legacy authorization was not append-only',
-    )
     await assertNewIdentifiersFitPostgres(client)
     await assertRequiredDatabaseGuards(client)
     await assertCachedReceiptReuseSchema(client)
@@ -851,6 +871,7 @@ async function main() {
   let beforeRelations
   let beforeMigrations
   let beforeActiveObjects
+  let beforeReceiptIntakeColumn
   let beforeAuthorizationData
   try {
     assert.equal(
@@ -863,39 +884,30 @@ async function main() {
     assert.deepEqual(
       beforeMigrations,
       REQUIRED_APPLIED_MIGRATIONS,
-      'rollback-only acceptance requires 0148-0151 applied and must stop once 0156 or 0157 is permanently applied',
+      'rollback-only acceptance requires 0148-0158 applied and must stop once 0159 is permanently applied',
     )
     assert.ok(
       Object.values(beforeRelations).every((value) => value !== null),
-      'rollback-only acceptance requires the existing 0148-0151 Shopify schema',
+      'rollback-only acceptance requires the existing 0148-0158 Shopify schema',
     )
     beforeActiveObjects = await activeAuthorizationObjectState(client)
+    beforeReceiptIntakeColumn = await receiptIntakeColumnState(client)
     assert.deepEqual(
-      beforeActiveObjects.columns,
+      beforeReceiptIntakeColumn,
       [],
-      'rollback-only acceptance must run before 0156 columns exist',
+      'rollback-only acceptance must run before the 0159 receipt switch exists',
     )
     assert.deepEqual(
-      beforeActiveObjects.constraints,
-      [],
-      'rollback-only acceptance must run before 0156 constraints exist',
-    )
-    assert.equal(
-      beforeActiveObjects.functions.some((row) => (
-        row.proname
-          === 'operations_shopify_cs_active_authorization_fence_hash'
-      )),
-      false,
-      'rollback-only acceptance must run before the 0156 fence function exists',
+      beforeActiveObjects.columns.map((row) => row.column_name),
+      [
+        'provider_write_activation_revision',
+        'simulation_activation_revision',
+      ],
+      'rollback-only acceptance requires the existing 0156 revision fences',
     )
     beforeAuthorizationData = await authorizationDataState(client)
-    assert.equal(
-      beforeAuthorizationData.legacy_probe_count,
-      '0',
-      'reserved legacy upgrade probe already exists',
-    )
 
-    await assertActiveAuthorizationUpgrade(client)
+    await assertReceiptAndCarrierAuthorityUpgrade(client)
   } finally {
     client.release()
   }
@@ -922,6 +934,11 @@ async function main() {
       'rollback left active-authorization schema residue',
     )
     assert.deepEqual(
+      await receiptIntakeColumnState(verification),
+      beforeReceiptIntakeColumn,
+      'rollback left the 0159 receipt-intake column behind',
+    )
+    assert.deepEqual(
       await authorizationDataState(verification),
       beforeAuthorizationData,
       'rollback left active-authorization data residue',
@@ -936,11 +953,7 @@ async function main() {
     acceptance: 'rollback-only-postgres',
     databaseFingerprint: TRUSTED_DATABASE_FINGERPRINT,
     requiredAppliedMigrations: REQUIRED_APPLIED_MIGRATIONS,
-    targetMigrations: [
-      TARGET_MIGRATION,
-      RECEIPT_REUSE_MIGRATION,
-      CURRENT_ISSUE_INDEX_MIGRATION,
-    ],
+    targetMigrations: [TARGET_MIGRATION],
     retainedSchemaOrData: false,
   }, null, 2))
 }

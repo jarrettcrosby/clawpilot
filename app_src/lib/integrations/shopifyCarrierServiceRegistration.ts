@@ -636,7 +636,7 @@ function assertAuthorizedRuntimeMatches(
     || runtime.provider !== 'shopify'
     || runtime.environment !== authorization.accountEnvironment
     || !SHOPIFY_SHOP_GID_PATTERN.test(runtime.externalAccountId)
-    || runtime.status !== 'active'
+    || !['active', 'disabled'].includes(runtime.status)
     || runtime.verificationStatus !== 'verified'
     || runtime.credentialVersion !== authorization.credentialGeneration
     || runtime.authMode !== 'shopify_client_credentials'
@@ -1513,7 +1513,8 @@ async function finalizeAuthorizedFailure(input: {
 
 /**
  * Execute the sole Shopify provider mutation authorized by a consumed,
- * revision-fenced Active grant. The caller must claim the authorization
+ * revision-fenced, resource-scoped Active grant. Global Operations remains
+ * Shadow. The caller must claim the authorization
  * before invoking this function; credential decryption and every provider
  * network call happen strictly after that durable single-consumption record.
  */
@@ -1536,7 +1537,7 @@ export async function executeAuthorizedShopifyCarrierServiceMutation(
   if (mutation.operation === 'update') {
     registrationError(
       'SHOPIFY_CARRIER_SERVICE_AUTHORIZATION_OPERATION_INVALID',
-      'One-time Active authorization only supports registration or removal',
+      'One-time resource-scoped authorization only supports registration or removal',
       400,
       false,
       authorization.attempt.globalId,

@@ -156,8 +156,8 @@ includes(persistence, [
   "'commerce.credential.rotated'",
   "'commerce.credential.verified'",
   "'commerce.credential.verification_failed'",
-  "'commerce.integration.enabled'",
-  "'commerce.integration.disabled'",
+  "'commerce.receipt_intake.queued'",
+  "'commerce.receipt_intake.held'",
   "'commerce.shopify.scopes_updated'",
   "'commerce.credential.disconnected'",
   "'commerce.credential.revealed'",
@@ -166,9 +166,9 @@ includes(persistence, [
   "'commerce.webhook.received'",
   'recordCommerceCredentialRevealInPostgres',
   'payload: { credentialVersion: row.credential_version }',
-  'disableIntegration?: boolean',
-  "reason: 'shopify_scope_profile_incomplete'",
-  'scopeProfileIncomplete',
+  'holdReceiptIntake?: boolean',
+  "reason: 'shopify_receipt_scope_profile_incomplete'",
+  'receiptProofScopeIncomplete',
   'payload_hash',
   'Shopify reused a webhook event ID with a different payload',
   'account.commerce_credential_generation = $6',
@@ -177,12 +177,11 @@ includes(persistence, [
   'commerce_credential_generation = $3',
   'credential.credential_version = $3',
   'credential.credential_version =\n                 account.commerce_credential_generation',
-  "account.configuration->>'scopeProfile' IN (",
-  "'receipt_evidence_v1',",
-  "'distributed_operations_v1'",
-  "account.configuration->'missingScopes' = '[]'::jsonb",
+  'account.receipt_intake_enabled',
+  "'read_products'",
+  "'read_inventory'",
   'FOR UPDATE OF account, credential',
-  "effectiveStatus === 'active' ? 'queued' : 'held'",
+  "receiptIntakeEnabled ? 'queued' : 'held'",
   'Shopify webhook credential generation changed before receipt commit',
   'createFaireOAuthInstallationInPostgres',
   'purgeExpiredFaireOAuthInstallationsInPostgres',
@@ -205,15 +204,16 @@ const commerceEnablePersistence = persistence.slice(
 )
 includes(commerceEnablePersistence, [
   "credential.webhook_verification_status = 'verified'",
-  "account.configuration->>'scopeProfile' IN (",
-  "'receipt_evidence_v1',",
-  "'distributed_operations_v1'",
-  "account.configuration->'missingScopes' = '[]'::jsonb",
-], 'Shopify integration enable readiness')
+  'SET receipt_intake_enabled = $3::boolean',
+  "'read_products'",
+  "'write_products'",
+  "'read_inventory'",
+  "'write_inventory'",
+], 'Shopify receipt-intake readiness')
 assert.doesNotMatch(
   commerceEnablePersistence,
-  /scopeProfile' =\s*'receipt_evidence_v1'/,
-  'Shopify enablement must not reject the distributed Operations scope profile',
+  /SET\s+status\s*=/,
+  'Shopify receipt-intake policy must not change generic connection status',
 )
 assert.ok(
   !/console\.(?:log|error|warn)/.test(persistence),
@@ -295,10 +295,12 @@ includes(service, [
   "'shopify_client_credentials'",
   'await requestShopifyAccessToken',
   'SHOPIFY_DISTRIBUTED_OPERATIONS_SCOPES',
+  'SHOPIFY_RECEIPT_PROOF_SCOPES',
   'auditShopifyScopeRequirements',
   'auditShopifyScopeUpdatePayload',
   "scopeProfile: 'distributed_operations_v1'",
   'SHOPIFY_SCOPE_PROFILE_INCOMPLETE',
+  'missingShopifyReceiptProofScopes',
   "runtime.status === 'error'",
   'verifyShopifyWebhookHmac',
   'encryptCommerceWebhookPayload',
@@ -311,6 +313,33 @@ includes(service, [
   'recordCommerceCredentialRevealInPostgres',
   'expiresAt: new Date(revealedAt.getTime() + 30_000).toISOString()',
 ], 'Commerce service')
+const testConnectionSource = service.slice(
+  service.indexOf('export async function testCommerceConnection'),
+  service.indexOf('export async function setCommerceIntegrationEnabled'),
+)
+includes(testConnectionSource, [
+  'missingShopifyReceiptProofScopes(',
+  'verified.configuration.grantedScopes',
+], 'Shopify verification receipt-scope isolation')
+assert.doesNotMatch(
+  testConnectionSource,
+  /verified\.configuration\.missingScopes[\s\S]{0,160}\.length/,
+  'connection verification must not hold receipts for unrelated missing scopes',
+)
+const receiptEnableSource = service.slice(
+  service.indexOf('export async function setCommerceIntegrationEnabled'),
+  service.indexOf('export async function disconnectCommerceIntegration'),
+)
+includes(receiptEnableSource, [
+  'missingShopifyReceiptProofScopes(',
+  'refreshed.configuration.grantedScopes',
+  'Shopify app is missing signed-receipt scopes:',
+], 'Shopify receipt enablement exact-scope gate')
+assert.doesNotMatch(
+  receiptEnableSource,
+  /configuration\.missingScopes/,
+  'receipt enablement must not require the broader Distributed Operations profile',
+)
 const faireOauthStartSource = service.slice(
   service.indexOf('export async function startFaireOAuthCommerce'),
   service.indexOf('export async function purgeExpiredFaireOAuthCommerce'),

@@ -354,6 +354,9 @@ function claimedAuthorization(mutation, overrides = {}) {
     accountEnvironment: environment,
     credentialGeneration: 7,
     activationState: 'shadow',
+    activationRevision: 9,
+    simulationActivationRevision: 9,
+    providerWriteActivationRevision: 9,
     requestHash: authorizedRequestHash(mutation),
     expectedServiceGid:
       mutation.operation === 'delete' ? mutation.id : null,
@@ -787,7 +790,9 @@ for (const mutation of [
 {
   const mutation = command().mutation
   const authorization = claimedAuthorization(mutation)
-  const { calls, deps } = authorizedDependencies(authorization)
+  const { calls, deps } = authorizedDependencies(authorization, {
+    runtime: runtime({ status: 'disabled' }),
+  })
   const result =
     await registration.executeAuthorizedShopifyCarrierServiceMutation(
       { authorization, mutation },
@@ -799,7 +804,7 @@ for (const mutation of [
   assert.deepEqual(
     calls.map(([name]) => name),
     ['runtime', 'decrypt', 'token', 'create', 'authorized-finalize'],
-    'the 0150 claim must already exist before any credential or provider work',
+    'the resource-scoped claim must permit a verified receipt-held connection before any credential or provider work',
   )
   const finalized = calls.at(-1)[1]
   assert.equal(finalized.outcome, 'succeeded')
@@ -809,6 +814,32 @@ for (const mutation of [
     finalized.leaseToken,
     '77777777-7777-4777-8777-777777777777',
   )
+}
+
+{
+  const mutation = command().mutation
+  const authorization = claimedAuthorization(mutation)
+  const { calls, deps } = authorizedDependencies(authorization, {
+    runtime: runtime({ status: 'error' }),
+  })
+  await assert.rejects(
+    () =>
+      registration.executeAuthorizedShopifyCarrierServiceMutation(
+        { authorization, mutation },
+        deps,
+      ),
+    (error) =>
+      error
+        instanceof registration.ShopifyCarrierServiceRegistrationError
+      && error.code ===
+        'SHOPIFY_CARRIER_SERVICE_AUTHORIZED_RUNTIME_STALE',
+  )
+  assert.deepEqual(
+    calls.map(([name]) => name),
+    ['runtime', 'authorized-finalize'],
+    'an errored connection must fail before credential decryption or provider I/O',
+  )
+  assert.equal(calls.at(-1)[1].providerWriteCount, 0)
 }
 
 {

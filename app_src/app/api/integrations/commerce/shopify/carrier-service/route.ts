@@ -622,12 +622,12 @@ function requireActivator(canActivate: boolean) {
   }
 }
 
-async function executeActiveCarrierServiceMutation(input: {
+async function executeResourceScopedCarrierServiceMutation(input: {
   organizationId: string
   accountGlobalId: string
   accountEnvironment: 'sandbox' | 'production'
   config: PublicShopifyCarrierServiceConfig
-  activeActivationRevision: number
+  resourceAuthorizationRevision: number
   operation: ShopifyCarrierServiceMutationOperation
   simulation: {
     globalId: string
@@ -716,7 +716,7 @@ async function executeActiveCarrierServiceMutation(input: {
       simulationActivationRevision:
         input.simulation.activationRevision,
       providerWriteActivationRevision:
-        input.activeActivationRevision,
+        input.resourceAuthorizationRevision,
       aggregateHash: configAggregateHash(input.config),
       requestHash: currentRequestHash,
       expectedServiceGid: input.operation === 'delete'
@@ -1141,12 +1141,12 @@ export async function POST(req: NextRequest) {
       const operation: ShopifyCarrierServiceMutationOperation =
         action === 'register' ? 'create' : 'delete'
       if (
-        current.reference.activation.state !== 'active'
+        current.reference.activation.state !== 'shadow'
         || current.reference.activation.revision === null
       ) {
         fail(
-          'SHOPIFY_CARRIER_SERVICE_SHADOW_PROVIDER_WRITE_BLOCKED',
-          'CarrierService create and delete require the exact current Operations Active revision; Shadow remains zero-write',
+          'SHOPIFY_CARRIER_SERVICE_RESOURCE_AUTHORIZATION_REQUIRES_SHADOW',
+          'The one-time CarrierService write requires the exact current Shadow revision and does not activate unrelated Operations writes',
           409,
         )
       }
@@ -1182,12 +1182,12 @@ export async function POST(req: NextRequest) {
           400,
         )
       }
-      await executeActiveCarrierServiceMutation({
+      await executeResourceScopedCarrierServiceMutation({
         organizationId: context.organizationId,
         accountGlobalId: accountId,
         accountEnvironment: current.account.environment,
         config: current.config,
-        activeActivationRevision:
+        resourceAuthorizationRevision:
           current.reference.activation.revision,
         operation,
         simulation: current.shadowSimulation,

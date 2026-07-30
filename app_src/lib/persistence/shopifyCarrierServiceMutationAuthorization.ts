@@ -642,7 +642,7 @@ export async function authorizeShopifyCarrierServiceMutationInPostgres(
     ),
     providerWriteActivationRevision: integer(
       rawInput.providerWriteActivationRevision,
-      'Active provider-write activation revision',
+      'Resource-scoped provider-write revision',
       1,
       Number.MAX_SAFE_INTEGER,
     ),
@@ -932,7 +932,8 @@ export async function authorizeShopifyCarrierServiceMutationInPostgres(
             input.configActivationRevision,
           simulationActivationRevision:
             input.simulationActivationRevision,
-          providerWriteMode: 'active',
+          providerWriteMode: 'resource_scoped_active',
+          globalOperationsMode: 'shadow',
           providerWriteActivationRevision:
             input.providerWriteActivationRevision,
           aggregateHash: input.aggregateHash,
@@ -1569,8 +1570,9 @@ export async function resolveShopifyCarrierServiceMutationInPostgres(
 /**
  * Link immutable succeeded or confirmed-applied provider evidence to the exact
  * unchanged CarrierService configuration. This transaction is local-only.
- * Active revision and verified credential-generation fences were enforced
- * before the attempt was inserted; a later organization-activation change or
+ * The resource-scoped Shadow revision and verified credential-generation
+ * fences were enforced before the attempt was inserted; a later
+ * organization-activation change or
  * credential rotation/verification change must not strand provider state that
  * Shopify already applied.
  */

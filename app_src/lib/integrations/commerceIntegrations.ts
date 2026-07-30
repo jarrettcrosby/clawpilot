@@ -30,6 +30,7 @@ import {
   SHOPIFY_ADMIN_API_VERSION,
   SHOPIFY_CONTROL_PLANE_WEBHOOK_TOPICS,
   SHOPIFY_DISTRIBUTED_OPERATIONS_SCOPES,
+  SHOPIFY_RECEIPT_PROOF_SCOPES,
 } from '@/lib/integrations/commerceCapabilities'
 import {
   normalizeShopifyShopDomain,
@@ -84,6 +85,17 @@ const MAX_WEBHOOK_BYTES = 512 * 1024
 const SHOPIFY_CONTROL_PLANE_WEBHOOK_TOPIC_SET = new Set<string>(
   SHOPIFY_CONTROL_PLANE_WEBHOOK_TOPICS,
 )
+
+function missingShopifyReceiptProofScopes(grantedScopes: unknown) {
+  const granted = Array.isArray(grantedScopes)
+    ? grantedScopes.filter(
+      (scope): scope is string => typeof scope === 'string',
+    )
+    : []
+  return SHOPIFY_RECEIPT_PROOF_SCOPES.filter(
+    (scope) => !hasEffectiveShopifyScope(granted, scope),
+  )
+}
 
 export class CommerceIntegrationRequestError extends Error {
   readonly status: number
@@ -1221,9 +1233,10 @@ export async function testCommerceConnection(input: {
       actorEmail: input.actorEmail,
       errorCode: null,
       configuration: verified.configuration,
-      disableIntegration: runtime.provider === 'shopify'
-        && Array.isArray(verified.configuration.missingScopes)
-        && verified.configuration.missingScopes.length > 0,
+      holdReceiptIntake: runtime.provider === 'shopify'
+        && missingShopifyReceiptProofScopes(
+          verified.configuration.grantedScopes,
+        ).length > 0,
     })
   } catch (error) {
     const sanitized = sanitize(error)
@@ -1294,16 +1307,12 @@ export async function setCommerceIntegrationEnabled(input: {
         organizationId: runtime.organizationId,
         accountGlobalId: runtime.globalId,
       })
-      const missingScopes = Array.isArray(
-        refreshed.configuration.missingScopes,
+      const missingReceiptScopes = missingShopifyReceiptProofScopes(
+        refreshed.configuration.grantedScopes,
       )
-        ? refreshed.configuration.missingScopes.filter(
-          (scope): scope is string => typeof scope === 'string',
-        )
-        : []
-      if (missingScopes.length) {
+      if (missingReceiptScopes.length) {
         throw new CommerceIntegrationRequestError(
-          `Shopify app is missing Distributed Operations scopes: ${missingScopes.join(', ')}`,
+          `Shopify app is missing signed-receipt scopes: ${missingReceiptScopes.join(', ')}`,
           409,
           'SHOPIFY_SCOPE_PROFILE_INCOMPLETE',
         )
