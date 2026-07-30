@@ -317,6 +317,8 @@ includes(persistenceSource, [
   "AND integration.environment = 'sandbox'",
   'config.registration_state = \'registered\'',
   'config.registration_state = \'shadow_simulated\'',
+  "account.configuration ->> 'accountName'",
+  'AS store_display_name',
 ], 'Checkout persistence exports and guards')
 
 const {

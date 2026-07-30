@@ -37,6 +37,9 @@ import {
   type ShopifyCheckoutContextLine,
   type ShopifyCheckoutContextResult,
 } from '@/lib/persistence/shopifyCheckoutContext'
+import {
+  waitForShopifyCheckoutReceiptCompletion,
+} from '@/lib/integrations/shopifyCheckoutReceiptWait'
 
 const ACCOUNT_GLOBAL_ID = /^gia[0-9]{7}$/
 const CALLBACK_TOKEN = /^[A-Za-z0-9_-]{43}$/
@@ -444,9 +447,13 @@ function responseFromTypedReceipt(
     return {
       carrierCode,
       serviceLevelCode: offer.serviceCode,
-      serviceName: offer.serviceName,
-      description:
-        `ClawPilot sandbox ${receipt.packages.length}-package shipment`,
+      serviceName: (
+        `${account.storeDisplayName} · ${offer.serviceName}`
+      ).slice(0, 255),
+      description: (
+        `${account.storeDisplayName} · `
+        + `${receipt.packages.length}-package shipment`
+      ).slice(0, 255),
       amountMinor: offer.customerChargeMinor,
       currency: offer.currency,
       minDeliveryDate: deliveryTimestamp(offer.minDeliveryDate),
@@ -474,7 +481,7 @@ function resultFromTypedReceipt(
           return {
             ...rate,
             service_name: (
-              `ClawPilot Test · ${rate.service_name} · ${shadowCustomerLabel}`
+              `${rate.service_name} · ${shadowCustomerLabel}`
             ).slice(0, 255),
           }
         }),
@@ -679,16 +686,17 @@ export async function executeShopifyCarrierServiceCallback(input: {
       inventorySnapshotHash: context.inventorySnapshotHash,
       executionFenceHash,
     })
+    const cacheLookup = {
+      organizationId: account.organizationId,
+      accountGlobalId: account.accountGlobalId,
+      requestFingerprint,
+      inventorySnapshotHash: context.inventorySnapshotHash,
+      idempotencyKey,
+    }
     requireCallbackTime(workDeadlineAt, workController.signal)
     const cached =
       await awaitCallbackWork(
-        readCachedShopifyCheckoutRateReceiptInPostgres({
-          organizationId: account.organizationId,
-          accountGlobalId: account.accountGlobalId,
-          requestFingerprint,
-          inventorySnapshotHash: context.inventorySnapshotHash,
-          idempotencyKey,
-        }),
+        readCachedShopifyCheckoutRateReceiptInPostgres(cacheLookup),
         workController.signal,
       )
     if (cached) {
@@ -759,6 +767,23 @@ export async function executeShopifyCarrierServiceCallback(input: {
       }),
       workController.signal,
     )
+    if (claim.kind === 'in_progress') {
+      const completed =
+        await waitForShopifyCheckoutReceiptCompletion({
+          signal: workController.signal,
+          deadlineAt: workDeadlineAt,
+          read: () => awaitCallbackWork(
+            readCachedShopifyCheckoutRateReceiptInPostgres(cacheLookup),
+            workController.signal,
+          ),
+        })
+      return resultFromTypedReceipt(
+        account,
+        context,
+        completed,
+        shadowGuard.customerLabel,
+      )
+    }
     if (claim.kind !== 'claimed') {
       return resultFromTypedReceipt(
         account,

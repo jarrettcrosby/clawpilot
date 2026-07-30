@@ -467,11 +467,16 @@ Migration `0145` adds the append-only development replay boundary rather than
 activating a live checkout or fulfillment path. Checkout quotes remain
 customer-neutral and expiring. A Shopify replay executes the current
 `planHybridCartonization` policy at checkout and again at fulfillment; the
+two executions are independent immutable runs and are not required to produce
+the same package count, materials, or line allocation. Checkout rates the
+cart's current physical plan; fulfillment re-cartonizes the then-current
+warehouse facts and records every package, allocation, carrier-cost, and
+service variance from the checkout predecessor without rewriting it. The
 bounded approved-recipe fixtures fail closed if the current optimizer no
-longer produces their exact package oracle. Faire has no ClawPilot checkout
-callback: its first stage retains only the captured marketplace customer
-estimate, with zero ClawPilot packages or UPS/FedEx choices, and the first
-ClawPilot cartonization and carrier comparison occurs after order intake. CRM
+longer produces their run-specific exact package oracle. Faire has no ClawPilot
+checkout callback: its first stage retains only the captured marketplace
+customer estimate, with zero ClawPilot packages or UPS/FedEx choices, and the
+first ClawPilot cartonization and carrier comparison occurs after order intake. CRM
 resolution occurs only after that customer-neutral intake boundary; one
 created or reused CRM organization is required before a successful fulfillment
 rerun, while an ambiguous match persists as an expected blocker with no
@@ -586,6 +591,20 @@ fails closed by 9.25 seconds, preserving explicit persistence and cancellation
 buffers inside Shopify's 10-second low-volume CarrierService ceiling. Shopify's
 documented 5- and 3-second high-volume ceilings remain a separate performance
 gate; this sandbox proof does not claim readiness at those request rates.
+Shopify may submit the same normalized checkout request more than once while
+the first callback is still processing. Exactly matching duplicates coalesce
+only on the full execution fence: organization, commerce account, request
+fingerprint, inventory snapshot hash, configuration and activation revision,
+packaging and stock revisions, carrier credential generations, and
+idempotency key. The receipt lease owner alone cartonizes, calls UPS and FedEx,
+and completes or fails the receipt. A follower waits within the same bounded
+callback deadline for that exact durable receipt to become terminal and then
+replays its typed package and offer evidence; it must not run a second
+cartonization, invoke either carrier, reclaim or fail the owner's lease, or
+create another receipt/package/offer lineage. A changed customer, product,
+quantity, destination, inventory, configuration, activation, package fact, or
+credential generation cannot join that in-flight result. Deadline or request
+abort remains fail-closed and never changes the owner receipt.
 
 `npm run test:shopify-carrier-service-postgres` is the rollback-only database
 acceptance for migration `0164` before permanent development application. It
@@ -623,7 +642,10 @@ customer ID, or any other shippable variant returns authenticated HTTP 200
 with no rates before request fingerprinting, context reads, receipt
 persistence, cartonization, or carrier calls. A server-configured test alias
 may decorate only the ephemeral Shadow `service_name` as
-`ClawPilot Test · <service> · <alias>` for operator proof; the stable
+`<store entity> · <service> · <alias>` for operator proof. Every callback
+response uses the persisted provider-verified store entity name rather than
+the ClawPilot or Shopify platform name; the optional alias remains restricted
+to the isolated Shadow test customer. The stable
 `service_code` and durable response remain customer-neutral.
 Shopify's successful CarrierService cache does not include customer identity.
 Therefore callback gating is necessary but not the sole strict-isolation

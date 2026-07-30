@@ -36,14 +36,17 @@ for (const required of [
   'SHOPIFY_CHECKOUT_SHADOW_ALLOWED_VARIANT_IDS',
   'SHOPIFY_CHECKOUT_SHADOW_CUSTOMER_LABEL',
   'shopifyCarrierServiceRequestMatchesTestAllowlist(request, {',
-  'ClawPilot Test · ${rate.service_name} · ${shadowCustomerLabel}',
+  '`${account.storeDisplayName} · ${offer.serviceName}`',
+  '`${account.storeDisplayName} · `',
+  '`${rate.service_name} · ${shadowCustomerLabel}`',
   'persistedRequestFingerprint(',
   'shopifyCheckoutDestinationFingerprint(',
   'carrierSandboxPartyFingerprint(destination)',
   'carrierDestinationFingerprint: carrierDestinationHash',
   'readShopifyCheckoutContextFromPostgres({',
   'inventorySnapshotHash: context.inventorySnapshotHash',
-  'readCachedShopifyCheckoutRateReceiptInPostgres({',
+  'readCachedShopifyCheckoutRateReceiptInPostgres(cacheLookup)',
+  'waitForShopifyCheckoutReceiptCompletion({',
   'claimShopifyCheckoutRateReceiptInPostgres({',
   'expectedConfigRowVersion: account.configRowVersion',
   'expectedActivationState: account.activationState',
@@ -140,8 +143,27 @@ assert.ok(
 )
 assert.ok(
   callback.indexOf('readShopifyCheckoutContextFromPostgres({')
-    < callback.indexOf('readCachedShopifyCheckoutRateReceiptInPostgres({'),
+    < callback.indexOf(
+      'readCachedShopifyCheckoutRateReceiptInPostgres(cacheLookup)',
+    ),
   'inventory evidence must fence cache lookup',
+)
+assert.ok(
+  callback.indexOf("if (claim.kind === 'in_progress')")
+    < callback.indexOf('planShopifyCheckoutPackages(context.input)'),
+  'an in-progress duplicate must wait for the durable receipt before cartonization or carrier calls',
+)
+const inProgressBranch = callback.slice(
+  callback.indexOf("if (claim.kind === 'in_progress')"),
+  callback.indexOf("if (claim.kind !== 'claimed')"),
+)
+assert.ok(
+  inProgressBranch.includes(
+    'readCachedShopifyCheckoutRateReceiptInPostgres(cacheLookup)',
+  )
+    && inProgressBranch.includes('deadlineAt: workDeadlineAt')
+    && inProgressBranch.includes('signal: workController.signal'),
+  'duplicate checkout coalescing must poll the fenced terminal receipt within the callback deadline',
 )
 for (const forbidden of [
   'createCommerceProduct',
