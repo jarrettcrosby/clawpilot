@@ -13,7 +13,13 @@ import {
   verifyShopifyCarrierServiceMutationForReconciliation,
   type ShopifyCarrierServiceRegistrationMutation,
 } from '@/lib/integrations/shopifyCarrierServiceRegistration'
-import { CommerceIntegrationRequestError } from '@/lib/integrations/commerceIntegrations'
+import {
+  shopifyStoreEntityCarrierServiceName,
+} from '@/lib/integrations/shopifyCarrierServiceBranding'
+import {
+  CommerceIntegrationRequestError,
+  testCommerceConnection,
+} from '@/lib/integrations/commerceIntegrations'
 import { HYBRID_CARTONIZATION_ALGORITHM_VERSION } from '@/lib/operations/hybridCartonization'
 import {
   activeOperationsOrganizationId,
@@ -32,6 +38,7 @@ import {
   readShopifyCarrierServiceConfigFromPostgres,
   shopifyCheckoutRatingHash,
   ShopifyCheckoutRatingPersistenceError,
+  updateShopifyCarrierServiceBrandNameOverrideInPostgres,
   upsertShopifyCarrierServiceConfigInPostgres,
   type ShopifyCarrierServiceConfig,
   type ShopifyCheckoutCarrierProvider,
@@ -40,6 +47,7 @@ import {
   authorizeShopifyCarrierServiceMutationInPostgres,
   claimShopifyCarrierServiceMutationInPostgres,
   finalizeShopifyCarrierServiceConfigMutationInPostgres,
+  finalizeShopifyCarrierServiceNameAlignmentInPostgres,
   readShopifyCarrierServiceMutationAuthorizationFromPostgres,
   readShopifyCarrierServiceMutationAuthorizationsFromPostgres,
   resolveShopifyCarrierServiceMutationInPostgres,
@@ -284,6 +292,7 @@ function publicMutationAuthorization(
     globalId: authorization.globalId,
     configGlobalId: authorization.configGlobalId,
     operation: authorization.operation,
+    requestHash: authorization.requestHash,
     accountEnvironment: authorization.accountEnvironment,
     configRowVersion: authorization.configRowVersion,
     status: authorization.status,
@@ -331,6 +340,8 @@ function publicCarrierServiceConfig(
     accountStatus: config.accountStatus,
     warehouseGlobalId: config.warehouseGlobalId,
     warehouseName: config.warehouseName,
+    checkoutBrandNameOverride: config.checkoutBrandNameOverride,
+    registeredServiceName: config.registeredServiceName,
     serviceGid: config.serviceGid,
     registrationState: config.registrationState,
     credentialGeneration: config.credentialGeneration,
@@ -402,13 +413,34 @@ function mutationAuthorizationGlobalId(value: unknown) {
   return normalized
 }
 
+function checkoutBrandNameOverride(value: unknown): string | null {
+  if (value === null) return null
+  if (typeof value !== 'string') {
+    fail(
+      'SHOPIFY_CARRIER_SERVICE_NAME_OVERRIDE_INVALID',
+      'The optional checkout name must be text or null',
+    )
+  }
+  const trimmed = value.trim()
+  if (!trimmed) return null
+  const normalized = shopifyStoreEntityCarrierServiceName(trimmed)
+  if (normalized.length > 120) {
+    fail(
+      'SHOPIFY_CARRIER_SERVICE_NAME_OVERRIDE_INVALID',
+      'The optional checkout name must be 120 characters or fewer',
+    )
+  }
+  return normalized
+}
+
 function shadowSimulationIdempotencyKey(input: {
   config: PublicShopifyCarrierServiceConfig
   operation: ShopifyCarrierServiceMutationOperation
+  requestHash: string
 }) {
   return `shopify-carrier-service:shadow-${input.operation}:${
     input.config.globalId
-  }:${input.config.rowVersion}`
+  }:${input.config.rowVersion}:${input.requestHash}`
 }
 
 async function exactShadowSimulation(input: {
@@ -416,6 +448,7 @@ async function exactShadowSimulation(input: {
   accountGlobalId: string
   config: PublicShopifyCarrierServiceConfig
   operation: ShopifyCarrierServiceMutationOperation
+  requestHash: string
 }) {
   const aggregateHash = configAggregateHash(input.config)
   const action = `shopify.carrier_service.${input.operation}`
@@ -427,6 +460,7 @@ async function exactShadowSimulation(input: {
       idempotencyKey: shadowSimulationIdempotencyKey({
         config: input.config,
         operation: input.operation,
+        requestHash: input.requestHash,
       }),
     })
   return effect
@@ -443,6 +477,7 @@ async function exactShadowSimulation(input: {
     && effect.aggregateId === input.config.globalId
     && effect.aggregateRevision === input.config.rowVersion
     && effect.aggregateHash === aggregateHash
+    && effect.requestHash === input.requestHash
     )
     ? effect
     : null
@@ -461,19 +496,57 @@ function mutationActorRole(
   return role
 }
 
+function storeEntityNamePreference(input: {
+  providerStoreEntityName: unknown
+  providerVerifiedAt?: unknown
+  checkoutBrandNameOverride?: string | null
+}) {
+  const providerStoreEntityName =
+    shopifyStoreEntityCarrierServiceName(
+      input.providerStoreEntityName,
+    )
+  const overrideName = input.checkoutBrandNameOverride
+    ? shopifyStoreEntityCarrierServiceName(
+        input.checkoutBrandNameOverride,
+      )
+    : null
+  return {
+    providerStoreEntityName,
+    overrideName,
+    effectiveName: overrideName || providerStoreEntityName,
+    providerVerifiedAt:
+      typeof input.providerVerifiedAt === 'string'
+        ? input.providerVerifiedAt
+        : null,
+    source: overrideName
+      ? 'administrator_override' as const
+      : 'provider_verified_shop_name' as const,
+  }
+}
+
 function carrierServiceMutation(input: {
   operation: ShopifyCarrierServiceMutationOperation
   organizationId: string
   accountGlobalId: string
   config: PublicShopifyCarrierServiceConfig
+  storeEntityName: unknown
 }): ShopifyCarrierServiceRegistrationMutation {
-  if (input.operation === 'delete') {
+  if (input.operation !== 'create') {
     if (!input.config.serviceGid) {
       fail(
         'SHOPIFY_CARRIER_SERVICE_PROVIDER_REFERENCE_REQUIRED',
         'The exact registered Shopify CarrierService identity is required',
         409,
       )
+    }
+    if (input.operation === 'update') {
+      return {
+        operation: 'update',
+        id: input.config.serviceGid,
+        name: shopifyStoreEntityCarrierServiceName(
+          input.storeEntityName,
+        ),
+      }
     }
     return {
       operation: 'delete',
@@ -488,7 +561,7 @@ function carrierServiceMutation(input: {
   })
   return {
     operation: 'create',
-    name: 'ClawPilot calculated shipping',
+    name: shopifyStoreEntityCarrierServiceName(input.storeEntityName),
     callbackUrl: callbackUrl(input.accountGlobalId, token),
     active: true,
     supportsServiceDiscovery: false,
@@ -543,6 +616,12 @@ async function setupState(input: {
     publicCallbackUrl = callbackUrl(input.accountGlobalId, token)
   }
   const publicConfig = publicCarrierServiceConfig(config)
+  const namePreference = storeEntityNamePreference({
+    providerStoreEntityName: account.configuration.accountName,
+    providerVerifiedAt: account.configuration.lastVerifiedAt,
+    checkoutBrandNameOverride:
+      publicConfig?.checkoutBrandNameOverride,
+  })
   const operation: ShopifyCarrierServiceMutationOperation | null =
     publicConfig?.registrationState === 'registered'
       && publicConfig.serviceGid
@@ -551,17 +630,84 @@ async function setupState(input: {
         && !publicConfig.serviceGid
         ? 'create'
         : null
-  const simulation = publicConfig && operation
+  const operationRequestHash = publicConfig && operation
+    ? shopifyCarrierServiceRegistrationRequestHash(
+        carrierServiceMutation({
+          operation,
+          organizationId: input.organizationId,
+          accountGlobalId: input.accountGlobalId,
+          config: publicConfig,
+          storeEntityName: namePreference.effectiveName,
+        }),
+      )
+    : null
+  const simulation = publicConfig && operation && operationRequestHash
     ? await exactShadowSimulation({
         organizationId: input.organizationId,
         accountGlobalId: input.accountGlobalId,
         config: publicConfig,
         operation,
+        requestHash: operationRequestHash,
       })
     : null
+  let nameAlignment: {
+    desiredName: string
+    appliedName: string | null
+    aligned: boolean
+    serviceGid: string
+    simulation: null | {
+      globalId: string
+      operation: 'update'
+      activationRevision: number
+      configRowVersion: number
+      requestHash: string
+      completedAt: string | null
+    }
+  } | null = null
+  if (
+    publicConfig?.registrationState === 'registered'
+    && publicConfig.serviceGid
+  ) {
+    const desiredName = namePreference.effectiveName
+    const nameMutation = carrierServiceMutation({
+      operation: 'update',
+      organizationId: input.organizationId,
+      accountGlobalId: input.accountGlobalId,
+      config: publicConfig,
+      storeEntityName: desiredName,
+    })
+    const requestHash =
+      shopifyCarrierServiceRegistrationRequestHash(nameMutation)
+    const alignmentSimulation = await exactShadowSimulation({
+      organizationId: input.organizationId,
+      accountGlobalId: input.accountGlobalId,
+      config: publicConfig,
+      operation: 'update',
+      requestHash,
+    })
+    nameAlignment = {
+      desiredName,
+      appliedName: publicConfig.registeredServiceName,
+      aligned: publicConfig.registeredServiceName === desiredName,
+      serviceGid: publicConfig.serviceGid,
+      simulation: alignmentSimulation
+        ? {
+            globalId: alignmentSimulation.globalId,
+            operation: 'update',
+            activationRevision:
+              alignmentSimulation.activationRevision,
+            configRowVersion:
+              alignmentSimulation.aggregateRevision,
+            requestHash: alignmentSimulation.requestHash,
+            completedAt: alignmentSimulation.completedAt,
+          }
+        : null,
+    }
+  }
   return {
     account,
     config: publicConfig,
+    namePreference,
     shadowSimulation: simulation
       ? {
           globalId: simulation.globalId,
@@ -572,6 +718,7 @@ async function setupState(input: {
           completedAt: simulation.completedAt,
         }
       : null,
+    nameAlignment,
     reference,
     mutationAuthorizations: mutationAuthorizations.map(
       publicMutationAuthorization,
@@ -626,6 +773,7 @@ async function executeResourceScopedCarrierServiceMutation(input: {
   organizationId: string
   accountGlobalId: string
   accountEnvironment: 'sandbox' | 'production'
+  storeEntityName: unknown
   config: PublicShopifyCarrierServiceConfig
   resourceAuthorizationRevision: number
   operation: ShopifyCarrierServiceMutationOperation
@@ -659,7 +807,7 @@ async function executeResourceScopedCarrierServiceMutation(input: {
       )
     )
     || (
-      input.operation === 'delete'
+      input.operation !== 'create'
       && (
         input.config.registrationState !== 'registered'
         || !input.config.serviceGid
@@ -677,6 +825,7 @@ async function executeResourceScopedCarrierServiceMutation(input: {
     organizationId: input.organizationId,
     accountGlobalId: input.accountGlobalId,
     config: input.config,
+    storeEntityName: input.storeEntityName,
   })
   const currentRequestHash =
     shopifyCarrierServiceRegistrationRequestHash(mutation)
@@ -719,9 +868,9 @@ async function executeResourceScopedCarrierServiceMutation(input: {
         input.resourceAuthorizationRevision,
       aggregateHash: configAggregateHash(input.config),
       requestHash: currentRequestHash,
-      expectedServiceGid: input.operation === 'delete'
-        ? input.config.serviceGid
-        : null,
+      expectedServiceGid: input.operation === 'create'
+        ? null
+        : input.config.serviceGid,
       confirmationHash,
       confirmationStatementVersion,
       idempotencyKey:
@@ -757,6 +906,17 @@ async function executeResourceScopedCarrierServiceMutation(input: {
       500,
     )
   }
+  if (input.operation === 'update') {
+    return finalizeShopifyCarrierServiceNameAlignmentInPostgres({
+      organizationId: input.organizationId,
+      accountGlobalId: input.accountGlobalId,
+      expectedConfigRowVersion: input.config.rowVersion,
+      attemptGlobalId: claimed.attempt.globalId,
+      evidenceGlobalId: outcomeGlobalId,
+      actorEmail: input.actorEmail,
+      actorRole: input.actorRole,
+    })
+  }
   return finalizeShopifyCarrierServiceConfigMutationInPostgres({
     organizationId: input.organizationId,
     accountGlobalId: input.accountGlobalId,
@@ -771,6 +931,7 @@ async function executeResourceScopedCarrierServiceMutation(input: {
 async function recoverOneTimeCarrierServiceMutation(input: {
   organizationId: string
   accountGlobalId: string
+  storeEntityName: unknown
   config: PublicShopifyCarrierServiceConfig
   authorizationGlobalId: string
   confirmReconciliation: boolean
@@ -801,6 +962,17 @@ async function recoverOneTimeCarrierServiceMutation(input: {
         ? authorization.resolution.globalId
         : null
   if (appliedEvidenceGlobalId) {
+    if (authorization.operation === 'update') {
+      return finalizeShopifyCarrierServiceNameAlignmentInPostgres({
+        organizationId: input.organizationId,
+        accountGlobalId: input.accountGlobalId,
+        expectedConfigRowVersion: authorization.configRowVersion,
+        attemptGlobalId: authorization.attempt.globalId,
+        evidenceGlobalId: appliedEvidenceGlobalId,
+        actorEmail: input.actorEmail,
+        actorRole: input.actorRole,
+      })
+    }
     return finalizeShopifyCarrierServiceConfigMutationInPostgres({
       organizationId: input.organizationId,
       accountGlobalId: input.accountGlobalId,
@@ -827,6 +999,7 @@ async function recoverOneTimeCarrierServiceMutation(input: {
     organizationId: input.organizationId,
     accountGlobalId: input.accountGlobalId,
     config: input.config,
+    storeEntityName: input.storeEntityName,
   })
   const verification =
     await verifyShopifyCarrierServiceMutationForReconciliation({
@@ -873,6 +1046,17 @@ async function recoverOneTimeCarrierServiceMutation(input: {
       providerStateConfirmedNotApplied: true,
     }
   }
+  if (authorization.operation === 'update') {
+    return finalizeShopifyCarrierServiceNameAlignmentInPostgres({
+      organizationId: input.organizationId,
+      accountGlobalId: input.accountGlobalId,
+      expectedConfigRowVersion: authorization.configRowVersion,
+      attemptGlobalId: authorization.attempt.globalId,
+      evidenceGlobalId: resolved.resolution.globalId,
+      actorEmail: input.actorEmail,
+      actorRole: input.actorRole,
+    })
+  }
   return finalizeShopifyCarrierServiceConfigMutationInPostgres({
     organizationId: input.organizationId,
     accountGlobalId: input.accountGlobalId,
@@ -909,11 +1093,23 @@ export async function POST(req: NextRequest) {
     const body = await requestBody(req)
     const action = String(body.action || '').trim()
     const accountId = accountGlobalId(body.accountGlobalId)
-    const current = await setupState({
+    let current = await setupState({
       organizationId: context.organizationId,
       accountGlobalId: accountId,
       canActivate: context.capabilities.canActivate,
     })
+    const refreshShopifyIdentity = async () => {
+      await testCommerceConnection({
+        organizationId: context.organizationId,
+        accountGlobalId: accountId,
+        actorEmail: context.actor.email,
+      })
+      current = await setupState({
+        organizationId: context.organizationId,
+        accountGlobalId: accountId,
+        canActivate: context.capabilities.canActivate,
+      })
+    }
 
     if (action === 'save-config') {
       requireActivator(context.capabilities.canActivate)
@@ -1014,8 +1210,68 @@ export async function POST(req: NextRequest) {
         algorithmVersion: HYBRID_CARTONIZATION_ALGORITHM_VERSION,
         actorEmail: context.actor.email,
       })
+    } else if (action === 'save-name-preference') {
+      requireActivator(context.capabilities.canActivate)
+      await refreshShopifyIdentity()
+      if (!current.config) {
+        fail(
+          'SHOPIFY_CARRIER_SERVICE_CONFIG_REQUIRED',
+          'Save the Shopify checkout-rating configuration before changing its customer-facing name',
+          409,
+        )
+      }
+      const unsafeMutation = current.mutationAuthorizations.find(
+        (authorization) => (
+          authorization.reconciliationRequired
+          || (
+            Boolean(authorization.attempt)
+            && !authorization.outcome
+            && !authorization.resolution
+          )
+          || authorization.outcome?.state === 'unknown'
+          || (
+            authorization.configRowVersion
+              === current.config?.rowVersion
+            && (
+              authorization.status === 'succeeded'
+              || authorization.status === 'confirmed_applied'
+            )
+            && (
+              (
+                authorization.operation === 'create'
+                && current.config?.registrationState !== 'registered'
+              )
+              || (
+                authorization.operation === 'delete'
+                && current.config?.registrationState !== 'disabled'
+              )
+              || (
+                authorization.operation === 'update'
+                && current.nameAlignment?.aligned !== true
+              )
+            )
+          )
+        ),
+      )
+      if (unsafeMutation) {
+        fail(
+          'SHOPIFY_CARRIER_SERVICE_NAME_CHANGE_BLOCKED',
+          'Resolve the in-flight or uncertain CarrierService mutation before changing its customer-facing name',
+          409,
+        )
+      }
+      await updateShopifyCarrierServiceBrandNameOverrideInPostgres({
+        organizationId: context.organizationId,
+        accountGlobalId: accountId,
+        expectedRowVersion: current.config.rowVersion,
+        checkoutBrandNameOverride: checkoutBrandNameOverride(
+          body.checkoutBrandNameOverride,
+        ),
+        actorEmail: context.actor.email,
+      })
     } else if (action === 'simulate-registration') {
       requireActivator(context.capabilities.canActivate)
+      await refreshShopifyIdentity()
       if (
         !current.config
         || current.reference.activation.state !== 'shadow'
@@ -1058,7 +1314,10 @@ export async function POST(req: NextRequest) {
         organizationId: context.organizationId,
         accountGlobalId: accountId,
         config: current.config,
+        storeEntityName: current.namePreference.effectiveName,
       })
+      const requestHash =
+        shopifyCarrierServiceRegistrationRequestHash(mutation)
       await executeShopifyCarrierServiceRegistration({
         organizationId: context.organizationId,
         accountGlobalId: accountId,
@@ -1071,6 +1330,7 @@ export async function POST(req: NextRequest) {
         idempotencyKey: shadowSimulationIdempotencyKey({
           config: current.config,
           operation,
+          requestHash,
         }),
         mutation,
         actorEmail: context.actor.email,
@@ -1112,18 +1372,114 @@ export async function POST(req: NextRequest) {
           idempotencyKey: shadowSimulationIdempotencyKey({
             config: exactConfig,
             operation,
+            requestHash,
           }),
           mutation: carrierServiceMutation({
             operation,
             organizationId: context.organizationId,
             accountGlobalId: accountId,
             config: exactConfig,
+            storeEntityName: current.namePreference.effectiveName,
           }),
           actorEmail: context.actor.email,
         })
       }
+    } else if (action === 'simulate-name-alignment') {
+      requireActivator(context.capabilities.canActivate)
+      await refreshShopifyIdentity()
+      if (
+        !current.config
+        || !current.nameAlignment
+        || current.config.registrationState !== 'registered'
+        || current.reference.activation.state !== 'shadow'
+        || current.reference.activation.revision === null
+      ) {
+        fail(
+          'SHOPIFY_CARRIER_SERVICE_NAME_SIMULATION_STALE',
+          'The exact registered CarrierService and current Shadow revision are required before name alignment can be simulated',
+          409,
+        )
+      }
+      const mutation = carrierServiceMutation({
+        operation: 'update',
+        organizationId: context.organizationId,
+        accountGlobalId: accountId,
+        config: current.config,
+        storeEntityName: current.namePreference.effectiveName,
+      })
+      const requestHash =
+        shopifyCarrierServiceRegistrationRequestHash(mutation)
+      await executeShopifyCarrierServiceRegistration({
+        organizationId: context.organizationId,
+        accountGlobalId: accountId,
+        mode: 'shadow',
+        credentialGeneration: current.config.credentialGeneration,
+        activationRevision: current.reference.activation.revision,
+        aggregateId: current.config.globalId,
+        aggregateRevision: current.config.rowVersion,
+        aggregateHash: configAggregateHash(current.config),
+        idempotencyKey: shadowSimulationIdempotencyKey({
+          config: current.config,
+          operation: 'update',
+          requestHash,
+        }),
+        mutation,
+        actorEmail: context.actor.email,
+      })
+    } else if (action === 'align-registration-name') {
+      requireActivator(context.capabilities.canActivate)
+      await refreshShopifyIdentity()
+      if (body.confirmProviderWrite !== true) {
+        fail(
+          'SHOPIFY_CARRIER_SERVICE_PROVIDER_WRITE_CONFIRMATION_REQUIRED',
+          'Confirm the exact one-time Shopify CarrierService name update',
+          400,
+        )
+      }
+      if (
+        !current.config
+        || !current.nameAlignment?.simulation
+        || current.config.registrationState !== 'registered'
+        || current.reference.activation.state !== 'shadow'
+        || current.reference.activation.revision === null
+      ) {
+        fail(
+          'SHOPIFY_CARRIER_SERVICE_NAME_SHADOW_EVIDENCE_REQUIRED',
+          'Run the exact zero-write name-alignment simulation in Shadow before changing Shopify',
+          409,
+        )
+      }
+      if (
+        current.account.environment === 'production'
+        && body.confirmProductionProviderWrite !== true
+      ) {
+        fail(
+          'SHOPIFY_CARRIER_SERVICE_PRODUCTION_CONFIRMATION_REQUIRED',
+          'Production confirmation is required: this updates the live Shopify CarrierService name',
+          400,
+        )
+      }
+      await executeResourceScopedCarrierServiceMutation({
+        organizationId: context.organizationId,
+        accountGlobalId: accountId,
+        accountEnvironment: current.account.environment,
+        storeEntityName: current.namePreference.effectiveName,
+        config: current.config,
+        resourceAuthorizationRevision:
+          current.reference.activation.revision,
+        operation: 'update',
+        simulation: current.nameAlignment.simulation,
+        confirmationRequestId: confirmationRequestId(
+          body.confirmationRequestId,
+        ),
+        actorEmail: context.actor.email,
+        actorRole: mutationActorRole(
+          effectiveAuthorizationRole(context.actor),
+        ),
+      })
     } else if (action === 'register' || action === 'unregister') {
       requireActivator(context.capabilities.canActivate)
+      await refreshShopifyIdentity()
       if (body.confirmProviderWrite !== true) {
         fail(
           'SHOPIFY_CARRIER_SERVICE_PROVIDER_WRITE_CONFIRMATION_REQUIRED',
@@ -1186,6 +1542,7 @@ export async function POST(req: NextRequest) {
         organizationId: context.organizationId,
         accountGlobalId: accountId,
         accountEnvironment: current.account.environment,
+        storeEntityName: current.namePreference.effectiveName,
         config: current.config,
         resourceAuthorizationRevision:
           current.reference.activation.revision,
@@ -1218,6 +1575,7 @@ export async function POST(req: NextRequest) {
       await recoverOneTimeCarrierServiceMutation({
         organizationId: context.organizationId,
         accountGlobalId: accountId,
+        storeEntityName: current.namePreference.effectiveName,
         config: current.config,
         authorizationGlobalId: mutationAuthorizationGlobalId(
           body.authorizationGlobalId,

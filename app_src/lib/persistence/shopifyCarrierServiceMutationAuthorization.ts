@@ -11,7 +11,10 @@ import {
   withTransaction,
 } from '@/lib/persistence/postgres'
 
-export type ShopifyCarrierServiceMutationOperation = 'create' | 'delete'
+export type ShopifyCarrierServiceMutationOperation =
+  | 'create'
+  | 'update'
+  | 'delete'
 export type ShopifyCarrierServiceMutationEnvironment =
   | 'sandbox'
   | 'production'
@@ -306,6 +309,26 @@ function text(value: unknown, label: string, minimum: number, maximum: number) {
     fail(
       'SHOPIFY_CARRIER_SERVICE_MUTATION_INPUT_INVALID',
       `${label} is invalid`,
+      400,
+    )
+  }
+  return normalized
+}
+
+function registeredServiceName(value: unknown) {
+  if (value === null || value === undefined) return null
+  const normalized = String(value)
+    .normalize('NFKC')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (
+    normalized.length < 1
+    || normalized.length > 255
+    || /[\u0000-\u001f\u007f]/.test(normalized)
+  ) {
+    fail(
+      'SHOPIFY_CARRIER_SERVICE_REGISTERED_NAME_INVALID',
+      'Applied Shopify CarrierService name must be 1-255 characters',
       400,
     )
   }
@@ -692,10 +715,10 @@ export async function authorizeShopifyCarrierServiceMutationInPostgres(
       300,
     ),
   }
-  if (!['create', 'delete'].includes(input.operation)) {
+  if (!['create', 'update', 'delete'].includes(input.operation)) {
     fail(
       'SHOPIFY_CARRIER_SERVICE_MUTATION_OPERATION_INVALID',
-      'Only Shopify CarrierService create or delete can be authorized',
+      'Only Shopify CarrierService create, name update, or delete can be authorized',
       400,
     )
   }
@@ -749,7 +772,10 @@ export async function authorizeShopifyCarrierServiceMutationInPostgres(
   }
   if (
     (input.operation === 'create' && input.expectedServiceGid)
-    || (input.operation === 'delete' && !input.expectedServiceGid)
+    || (
+      input.operation !== 'create'
+      && !input.expectedServiceGid
+    )
   ) {
     fail(
       'SHOPIFY_CARRIER_SERVICE_MUTATION_SERVICE_FENCE_INVALID',
@@ -758,9 +784,33 @@ export async function authorizeShopifyCarrierServiceMutationInPostgres(
     )
   }
   return withTransaction(async (client) => {
+    const configIdentity = await client.query<{ id: string }>(
+      `SELECT config.id::text
+       FROM operations_integration_accounts account
+       JOIN operations_shopify_carrier_service_configs config
+         ON config.organization_id = account.organization_id
+        AND config.integration_account_id = account.id
+       WHERE account.organization_id = $1::uuid
+         AND account.global_id = $2
+         AND config.global_id = $3`,
+      [
+        input.organizationId,
+        input.accountGlobalId,
+        input.configGlobalId,
+      ],
+    )
+    if (!configIdentity.rows[0]) {
+      fail(
+        'SHOPIFY_CARRIER_SERVICE_MUTATION_FENCE_NOT_FOUND',
+        'Exact Shopify account or configuration was not found',
+        404,
+      )
+    }
     await acquireTransactionAdvisoryLock(
       client,
-      `shopify-carrier-service-authorization:${input.organizationId}:${input.configGlobalId}`,
+      `shopify-carrier-service-authorization:${input.organizationId}:${
+        configIdentity.rows[0].id
+      }`,
     )
     const facts = await client.query<{
       integration_account_id: string
@@ -992,6 +1042,29 @@ export async function claimShopifyCarrierServiceMutationInPostgres(
     ),
   }
   return withTransaction(async (client) => {
+    const authorizationIdentity = await client.query<{
+      config_id: string
+    }>(
+      `SELECT authorized_mutation.config_id::text
+       FROM operations_shopify_carrier_service_mutation_authorizations
+         authorized_mutation
+       WHERE authorized_mutation.organization_id = $1::uuid
+         AND authorized_mutation.global_id = $2`,
+      [input.organizationId, input.authorizationGlobalId],
+    )
+    if (!authorizationIdentity.rows[0]) {
+      fail(
+        'SHOPIFY_CARRIER_SERVICE_MUTATION_AUTHORIZATION_NOT_FOUND',
+        'Shopify CarrierService mutation authorization was not found',
+        404,
+      )
+    }
+    await acquireTransactionAdvisoryLock(
+      client,
+      `shopify-carrier-service-authorization:${input.organizationId}:${
+        authorizationIdentity.rows[0].config_id
+      }`,
+    )
     await acquireTransactionAdvisoryLock(
       client,
       `shopify-carrier-service-mutation-claim:${input.organizationId}:${input.authorizationGlobalId}`,
@@ -1568,6 +1641,321 @@ export async function resolveShopifyCarrierServiceMutationInPostgres(
 }
 
 /**
+ * Persist the name Shopify actually applied from immutable authorized
+ * simulation and provider evidence. This transaction is local-only. A later
+ * shop-name refresh may make desired and applied names differ; callback
+ * readiness then fails closed until a new exact alignment is authorized.
+ */
+export async function finalizeShopifyCarrierServiceNameAlignmentInPostgres(
+  rawInput: {
+    organizationId: string
+    accountGlobalId: string
+    expectedConfigRowVersion: number
+    attemptGlobalId: string
+    evidenceGlobalId: string
+    actorEmail: string
+    actorRole: ShopifyCarrierServiceMutationActorRole
+  },
+) {
+  const input = {
+    organizationId: identifier(
+      rawInput.organizationId,
+      UUID,
+      'Organization ID',
+    ),
+    accountGlobalId: identifier(
+      rawInput.accountGlobalId,
+      ACCOUNT_GLOBAL_ID,
+      'Shopify account Global ID',
+    ),
+    expectedConfigRowVersion: integer(
+      rawInput.expectedConfigRowVersion,
+      'Configuration row version',
+      0,
+      Number.MAX_SAFE_INTEGER,
+    ),
+    attemptGlobalId: identifier(
+      rawInput.attemptGlobalId,
+      ATTEMPT_GLOBAL_ID,
+      'Mutation attempt Global ID',
+    ),
+    evidenceGlobalId: identifier(
+      rawInput.evidenceGlobalId,
+      /^(?:gsco|gscr)[0-9]{7}$/,
+      'Applied mutation evidence Global ID',
+    ),
+    actorEmail: actorEmail(rawInput.actorEmail),
+    actorRole: actorRole(rawInput.actorRole),
+  }
+  return withTransaction(async (client) => {
+    const identity = await client.query<{ id: string }>(
+      `SELECT config.id::text
+       FROM operations_integration_accounts account
+       JOIN operations_shopify_carrier_service_configs config
+         ON config.organization_id = account.organization_id
+        AND config.integration_account_id = account.id
+       WHERE account.organization_id = $1::uuid
+         AND account.global_id = $2`,
+      [input.organizationId, input.accountGlobalId],
+    )
+    if (!identity.rows[0]) {
+      fail(
+        'SHOPIFY_CARRIER_SERVICE_NAME_CONFIG_NOT_FOUND',
+        'Shopify CarrierService configuration was not found',
+        404,
+      )
+    }
+    await acquireTransactionAdvisoryLock(
+      client,
+      `shopify-carrier-service-authorization:${input.organizationId}:${
+        identity.rows[0].id
+      }`,
+    )
+    const facts = await client.query<{
+      config_id: string
+      config_global_id: string
+      row_version: string
+      registration_state: string
+      service_gid: string | null
+      registered_service_name: string | null
+      desired_service_name: string | null
+      authorization_global_id: string
+      operation: ShopifyCarrierServiceMutationOperation
+      authorization_config_row_version: string
+      expected_service_gid: string | null
+      attempt_id: string
+      simulation_mutation: Record<string, unknown> | null
+      outcome_global_id: string | null
+      outcome: ShopifyCarrierServiceMutationOutcomeState | null
+      outcome_provider_reference: string | null
+      outcome_provider_write_count: number | null
+      resolution_global_id: string | null
+      resolution_disposition:
+        | ShopifyCarrierServiceMutationResolutionDisposition
+        | null
+      resolution_provider_reference: string | null
+      actor_can_finalize: boolean
+    }>(
+      `SELECT
+         config.id::text AS config_id,
+         config.global_id AS config_global_id,
+         config.row_version::text,
+         config.registration_state,
+         config.service_gid,
+         config.registered_service_name,
+         COALESCE(
+           NULLIF(
+             regexp_replace(
+               btrim(config.checkout_brand_name_override),
+               '[[:space:]]+', ' ', 'g'
+             ),
+             ''
+           ),
+           NULLIF(
+             regexp_replace(
+               btrim(account.configuration ->> 'accountName'),
+               '[[:space:]]+', ' ', 'g'
+             ),
+             ''
+           )
+         ) AS desired_service_name,
+         authorized_mutation.global_id AS authorization_global_id,
+         authorized_mutation.operation,
+         authorized_mutation.config_row_version::text
+           AS authorization_config_row_version,
+         authorized_mutation.expected_service_gid,
+         attempt.id::text AS attempt_id,
+         simulation.redacted_request -> 'mutation'
+           AS simulation_mutation,
+         outcome.global_id AS outcome_global_id,
+         outcome.outcome,
+         outcome.provider_reference AS outcome_provider_reference,
+         outcome.provider_write_count AS outcome_provider_write_count,
+         resolution.global_id AS resolution_global_id,
+         resolution.disposition AS resolution_disposition,
+         resolution.provider_reference AS resolution_provider_reference,
+         operations_shopify_carrier_service_actor_can_authorize(
+           $1::uuid, $4, $5
+         ) AS actor_can_finalize
+       FROM operations_shopify_carrier_service_mutation_attempts attempt
+       JOIN operations_shopify_carrier_service_mutation_authorizations
+         authorized_mutation
+         ON authorized_mutation.organization_id = attempt.organization_id
+        AND authorized_mutation.id = attempt.authorization_id
+       JOIN operations_integration_accounts account
+         ON account.organization_id = authorized_mutation.organization_id
+        AND account.id = authorized_mutation.integration_account_id
+       JOIN operations_shopify_carrier_service_configs config
+         ON config.organization_id = authorized_mutation.organization_id
+        AND config.id = authorized_mutation.config_id
+       JOIN operations_commerce_external_effect_intents simulation
+         ON simulation.organization_id = authorized_mutation.organization_id
+        AND simulation.id = authorized_mutation.simulation_effect_id
+       LEFT JOIN operations_shopify_carrier_service_mutation_outcomes outcome
+         ON outcome.organization_id = attempt.organization_id
+        AND outcome.attempt_id = attempt.id
+       LEFT JOIN operations_shopify_carrier_service_mutation_resolutions
+         resolution
+         ON resolution.organization_id = attempt.organization_id
+        AND resolution.attempt_id = attempt.id
+       WHERE attempt.organization_id = $1::uuid
+         AND attempt.global_id = $2
+         AND account.global_id = $3
+       FOR UPDATE OF config`,
+      [
+        input.organizationId,
+        input.attemptGlobalId,
+        input.accountGlobalId,
+        input.actorEmail,
+        input.actorRole,
+      ],
+    )
+    const row = facts.rows[0]
+    if (!row) {
+      fail(
+        'SHOPIFY_CARRIER_SERVICE_NAME_ATTEMPT_NOT_FOUND',
+        'Exact Shopify CarrierService name-update attempt was not found',
+        404,
+      )
+    }
+    if (!row.actor_can_finalize) {
+      fail(
+        'SHOPIFY_CARRIER_SERVICE_NAME_FINALIZER_FORBIDDEN',
+        'An active owner or authorized administrator is required',
+        403,
+      )
+    }
+    const desiredName = registeredServiceName(row.desired_service_name)
+    const mutation = row.simulation_mutation
+    const appliedName = registeredServiceName(mutation?.serviceName)
+    if (
+      !appliedName
+      || row.operation !== 'update'
+      || row.registration_state !== 'registered'
+      || !row.service_gid
+      || row.expected_service_gid !== row.service_gid
+      || Number(row.authorization_config_row_version)
+        !== input.expectedConfigRowVersion
+      || !mutation
+      || Array.isArray(mutation)
+      || Object.keys(mutation).length !== 3
+      || mutation.operation !== 'update'
+      || mutation.carrierServiceId !== row.service_gid
+      || mutation.serviceName !== appliedName
+    ) {
+      fail(
+        'SHOPIFY_CARRIER_SERVICE_NAME_FINALIZATION_STALE',
+        'Applied provider evidence does not match the exact authorized CarrierService name update',
+      )
+    }
+    const usingOutcome = OUTCOME_GLOBAL_ID.test(input.evidenceGlobalId)
+    const evidenceMatches = usingOutcome
+      ? (
+          row.outcome_global_id === input.evidenceGlobalId
+          && row.outcome === 'succeeded'
+          && row.outcome_provider_write_count === 1
+          && row.outcome_provider_reference === row.service_gid
+        )
+      : (
+          RESOLUTION_GLOBAL_ID.test(input.evidenceGlobalId)
+          && row.resolution_global_id === input.evidenceGlobalId
+          && row.resolution_disposition === 'confirmed_applied'
+          && row.resolution_provider_reference === row.service_gid
+        )
+    if (!evidenceMatches) {
+      fail(
+        'SHOPIFY_CARRIER_SERVICE_NAME_APPLIED_EVIDENCE_REQUIRED',
+        'Name alignment requires exact succeeded or confirmed-applied provider evidence',
+      )
+    }
+    if (
+      Number(row.row_version) === input.expectedConfigRowVersion + 1
+      && row.registered_service_name === appliedName
+    ) {
+      return {
+        configGlobalId: row.config_global_id,
+        authorizationGlobalId: row.authorization_global_id,
+        attemptGlobalId: input.attemptGlobalId,
+        evidenceGlobalId: input.evidenceGlobalId,
+        operation: 'update' as const,
+        registrationState: 'registered' as const,
+        serviceGid: row.service_gid,
+        registeredServiceName: row.registered_service_name,
+        rowVersion: Number(row.row_version),
+        alreadyApplied: true,
+      }
+    }
+    if (Number(row.row_version) !== input.expectedConfigRowVersion) {
+      fail(
+        'SHOPIFY_CARRIER_SERVICE_NAME_CONFIG_STALE',
+        'CarrierService configuration changed before name finalization',
+      )
+    }
+    const updated = await client.query<{
+      global_id: string
+      row_version: string
+    }>(
+      `UPDATE operations_shopify_carrier_service_configs
+       SET registered_service_name = $3,
+           row_version = row_version + 1,
+           updated_by = $4,
+           updated_at = now()
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid
+         AND row_version = $5::bigint
+       RETURNING global_id, row_version::text`,
+      [
+        input.organizationId,
+        row.config_id,
+        appliedName,
+        input.actorEmail,
+        input.expectedConfigRowVersion,
+      ],
+    )
+    if (!updated.rows[0]) {
+      fail(
+        'SHOPIFY_CARRIER_SERVICE_NAME_CONFIG_STALE',
+        'CarrierService configuration changed during name finalization',
+      )
+    }
+    await recordAuditEvent({
+      actor: input.actorEmail,
+      eventType: 'operations.shopify_carrier_service.name_aligned',
+      aggregateType: 'operations.shopify_carrier_service_config',
+      aggregateId: row.config_global_id,
+      subject: input.accountGlobalId,
+      organizationId: input.organizationId,
+      eventKey:
+        `operations:shopify-carrier-service:${row.config_global_id}:name-version:${updated.rows[0].row_version}`,
+      payload: {
+        accountGlobalId: input.accountGlobalId,
+        authorizationGlobalId: row.authorization_global_id,
+        attemptGlobalId: input.attemptGlobalId,
+        evidenceGlobalId: input.evidenceGlobalId,
+        serviceGid: row.service_gid,
+        priorRegisteredServiceName: row.registered_service_name,
+        registeredServiceName: appliedName,
+        desiredServiceNameAtFinalization: desiredName,
+        fromRowVersion: input.expectedConfigRowVersion,
+        rowVersion: Number(updated.rows[0].row_version),
+      },
+    }, client)
+    return {
+      configGlobalId: updated.rows[0].global_id,
+      authorizationGlobalId: row.authorization_global_id,
+      attemptGlobalId: input.attemptGlobalId,
+      evidenceGlobalId: input.evidenceGlobalId,
+      operation: 'update' as const,
+      registrationState: 'registered' as const,
+      serviceGid: row.service_gid,
+      registeredServiceName: appliedName,
+      rowVersion: Number(updated.rows[0].row_version),
+      alreadyApplied: false,
+    }
+  })
+}
+
+/**
  * Link immutable succeeded or confirmed-applied provider evidence to the exact
  * unchanged CarrierService configuration. This transaction is local-only.
  * The resource-scoped Shadow revision and verified credential-generation
@@ -1628,6 +2016,7 @@ export async function finalizeShopifyCarrierServiceConfigMutationInPostgres(
       row_version: string
       registration_state: string
       service_gid: string | null
+      registered_service_name: string | null
       authorization_id: string
       authorization_global_id: string
       operation: ShopifyCarrierServiceMutationOperation
@@ -1637,6 +2026,7 @@ export async function finalizeShopifyCarrierServiceConfigMutationInPostgres(
       outcome_global_id: string | null
       outcome: ShopifyCarrierServiceMutationOutcomeState | null
       outcome_provider_reference: string | null
+      outcome_provider_write_count: number | null
       resolution_id: string | null
       resolution_global_id: string | null
       resolution_disposition:
@@ -1650,6 +2040,7 @@ export async function finalizeShopifyCarrierServiceConfigMutationInPostgres(
       link_to_row_version: string | null
       link_to_registration_state: string | null
       link_to_service_gid: string | null
+      simulation_mutation: Record<string, unknown> | null
     }>(
       `SELECT
          config.id::text AS config_id,
@@ -1657,6 +2048,7 @@ export async function finalizeShopifyCarrierServiceConfigMutationInPostgres(
          config.row_version::text,
          config.registration_state,
          config.service_gid,
+         config.registered_service_name,
          authorized_mutation.id::text AS authorization_id,
          authorized_mutation.global_id AS authorization_global_id,
          authorized_mutation.operation,
@@ -1666,6 +2058,7 @@ export async function finalizeShopifyCarrierServiceConfigMutationInPostgres(
          outcome.global_id AS outcome_global_id,
          outcome.outcome,
          outcome.provider_reference AS outcome_provider_reference,
+         outcome.provider_write_count AS outcome_provider_write_count,
          resolution.id::text AS resolution_id,
          resolution.global_id AS resolution_global_id,
          resolution.disposition AS resolution_disposition,
@@ -1676,7 +2069,9 @@ export async function finalizeShopifyCarrierServiceConfigMutationInPostgres(
          link.from_row_version::text AS link_from_row_version,
          link.to_row_version::text AS link_to_row_version,
          link.to_registration_state AS link_to_registration_state,
-         link.to_service_gid AS link_to_service_gid
+         link.to_service_gid AS link_to_service_gid,
+         simulation.redacted_request -> 'mutation'
+           AS simulation_mutation
        FROM operations_shopify_carrier_service_mutation_attempts attempt
        JOIN operations_shopify_carrier_service_mutation_authorizations
          authorized_mutation
@@ -1688,6 +2083,9 @@ export async function finalizeShopifyCarrierServiceConfigMutationInPostgres(
        JOIN operations_shopify_carrier_service_configs config
          ON config.organization_id = authorized_mutation.organization_id
         AND config.id = authorized_mutation.config_id
+       JOIN operations_commerce_external_effect_intents simulation
+         ON simulation.organization_id = authorized_mutation.organization_id
+        AND simulation.id = authorized_mutation.simulation_effect_id
        LEFT JOIN operations_shopify_carrier_service_mutation_outcomes outcome
          ON outcome.organization_id = attempt.organization_id
         AND outcome.attempt_id = attempt.id
@@ -1717,6 +2115,30 @@ export async function finalizeShopifyCarrierServiceConfigMutationInPostgres(
         404,
       )
     }
+    if (row.operation === 'update') {
+      fail(
+        'SHOPIFY_CARRIER_SERVICE_NAME_FINALIZER_REQUIRED',
+        'CarrierService name updates require the exact applied-name finalizer',
+      )
+    }
+    const expectedRegisteredServiceName = row.operation === 'create'
+      ? registeredServiceName(row.simulation_mutation?.serviceName)
+      : null
+    if (
+      (row.operation === 'create'
+        && (
+          !expectedRegisteredServiceName
+          || !row.simulation_mutation
+          || row.simulation_mutation.operation !== 'create'
+          || row.simulation_mutation.serviceName
+            !== expectedRegisteredServiceName
+        ))
+    ) {
+      fail(
+        'SHOPIFY_CARRIER_SERVICE_REGISTERED_NAME_MISMATCH',
+        'Provider-state finalization does not match the exact effective registered name',
+      )
+    }
     const usingOutcome = OUTCOME_GLOBAL_ID.test(input.evidenceGlobalId)
     if (row.link_global_id) {
       const linkedEvidenceMatches = usingOutcome
@@ -1735,6 +2157,15 @@ export async function finalizeShopifyCarrierServiceConfigMutationInPostgres(
         !linkedEvidenceMatches
         || Number(row.link_from_row_version)
           !== input.expectedConfigRowVersion
+        || (
+          row.operation === 'create'
+          && row.registered_service_name
+            !== expectedRegisteredServiceName
+        )
+        || (
+          row.operation === 'delete'
+          && row.registered_service_name !== null
+        )
       ) {
         fail(
           'SHOPIFY_CARRIER_SERVICE_MUTATION_CONFIG_LINK_CONFLICT',
@@ -1750,6 +2181,7 @@ export async function finalizeShopifyCarrierServiceConfigMutationInPostgres(
         operation: row.operation,
         registrationState: row.link_to_registration_state,
         serviceGid: row.link_to_service_gid,
+        registeredServiceName: row.registered_service_name,
         rowVersion: Number(row.link_to_row_version),
       }
     }
@@ -1769,6 +2201,7 @@ export async function finalizeShopifyCarrierServiceConfigMutationInPostgres(
       ? (
           row.outcome_global_id === input.evidenceGlobalId
           && row.outcome === 'succeeded'
+          && row.outcome_provider_write_count === 1
         )
       : (
           RESOLUTION_GLOBAL_ID.test(input.evidenceGlobalId)
@@ -1789,6 +2222,9 @@ export async function finalizeShopifyCarrierServiceConfigMutationInPostgres(
       : 'disabled'
     const targetServiceGid = row.operation === 'create'
       ? providerReference
+      : null
+    const targetRegisteredServiceName = row.operation === 'create'
+      ? expectedRegisteredServiceName
       : null
     if (
       !providerReference
@@ -1847,20 +2283,22 @@ export async function finalizeShopifyCarrierServiceConfigMutationInPostgres(
       `UPDATE operations_shopify_carrier_service_configs
        SET registration_state = $3,
            service_gid = $4,
+           registered_service_name = $5,
            last_error_code = NULL,
-           activation_revision = $5,
+           activation_revision = $6,
            row_version = row_version + 1,
-           updated_by = $6,
+           updated_by = $7,
            updated_at = now()
        WHERE organization_id = $1::uuid
          AND id = $2::uuid
-         AND row_version = $7::bigint
+         AND row_version = $8::bigint
        RETURNING global_id, row_version::text`,
       [
         input.organizationId,
         row.config_id,
         targetState,
         targetServiceGid,
+        targetRegisteredServiceName,
         row.provider_write_activation_revision,
         input.actorEmail,
         input.expectedConfigRowVersion,
@@ -1891,6 +2329,7 @@ export async function finalizeShopifyCarrierServiceConfigMutationInPostgres(
         operation: row.operation,
         registrationState: targetState,
         serviceGid: targetServiceGid,
+        registeredServiceName: targetRegisteredServiceName,
         providerWriteActivationRevision:
           row.provider_write_activation_revision,
         fromRowVersion: input.expectedConfigRowVersion,
@@ -1906,6 +2345,7 @@ export async function finalizeShopifyCarrierServiceConfigMutationInPostgres(
       operation: row.operation,
       registrationState: targetState,
       serviceGid: targetServiceGid,
+      registeredServiceName: targetRegisteredServiceName,
       rowVersion: Number(updated.rows[0].row_version),
     }
   })

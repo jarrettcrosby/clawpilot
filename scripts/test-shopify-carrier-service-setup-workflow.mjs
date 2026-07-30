@@ -22,6 +22,12 @@ const commercePanel = read(
 const setupPersistence = read(
   'app_src/lib/persistence/shopifyCarrierServiceSetup.ts',
 )
+const commerceIntegrations = read(
+  'app_src/lib/integrations/commerceIntegrations.ts',
+)
+const shopifyCommerceClient = read(
+  'app_src/lib/integrations/shopifyCommerceClient.ts',
+)
 const checkoutMigration = read(
   'db/migrations/0149_operations_shopify_checkout_rating.sql',
 )
@@ -33,6 +39,9 @@ const activeMutationMigration = read(
 )
 const receiptAuthorityMigration = read(
   'db/migrations/0159_operations_shopify_receipt_and_carrier_authority.sql',
+)
+const nameAlignmentMigration = read(
+  'db/migrations/0166_shopify_carrier_service_name_alignment.sql',
 )
 const externalEffectsPersistence = read(
   'app_src/lib/persistence/commerceExternalEffects.ts',
@@ -64,6 +73,15 @@ function actionBranch(action, nextAction) {
   return setupRoute.slice(start, end)
 }
 
+function requireOrder(source, before, after, surface) {
+  const beforeIndex = source.indexOf(before)
+  const afterIndex = source.indexOf(after)
+  assert.ok(
+    beforeIndex >= 0 && afterIndex > beforeIndex,
+    `${surface} must place ${before} before ${after}`,
+  )
+}
+
 requireAll(setupRoute, [
   'const MAX_REQUEST_BYTES = 32 * 1024',
   'const actor = await requireRequestUser(req)',
@@ -81,8 +99,11 @@ assert.equal(
 )
 
 const actions = [
-  ['save-config', 'simulate-registration'],
-  ['simulate-registration', 'register'],
+  ['save-config', 'save-name-preference'],
+  ['save-name-preference', 'simulate-registration'],
+  ['simulate-registration', 'simulate-name-alignment'],
+  ['simulate-name-alignment', 'align-registration-name'],
+  ['align-registration-name', 'register'],
   ['recover-mutation', null],
 ]
 for (const [action, nextAction] of actions) {
@@ -105,7 +126,10 @@ const providerMutation = setupRoute.slice(
 )
 for (const action of [
   'save-config',
+  'save-name-preference',
   'simulate-registration',
+  'simulate-name-alignment',
+  'align-registration-name',
   'recover-mutation',
 ]) {
   assert.ok(
@@ -114,7 +138,7 @@ for (const action of [
   )
 }
 
-const saveConfig = actionBranch('save-config', 'simulate-registration')
+const saveConfig = actionBranch('save-config', 'save-name-preference')
 requireAll(saveConfig, [
   'requireActivator(context.capabilities.canActivate)',
   'upsertShopifyCarrierServiceConfigInPostgres({',
@@ -122,8 +146,37 @@ requireAll(saveConfig, [
   'actorEmail: context.actor.email',
 ], 'save-config action')
 
-const simulation = actionBranch('simulate-registration', 'register')
+const saveNamePreference = actionBranch(
+  'save-name-preference',
+  'simulate-registration',
+)
+requireAll(saveNamePreference, [
+  'requireActivator(context.capabilities.canActivate)',
+  'await refreshShopifyIdentity()',
+  "'SHOPIFY_CARRIER_SERVICE_CONFIG_REQUIRED'",
+  'authorization.reconciliationRequired',
+  'authorization.outcome?.state === \'unknown\'',
+  "'SHOPIFY_CARRIER_SERVICE_NAME_CHANGE_BLOCKED'",
+  'updateShopifyCarrierServiceBrandNameOverrideInPostgres({',
+  'expectedRowVersion: current.config.rowVersion',
+  'checkoutBrandNameOverride:',
+  'checkoutBrandNameOverride(',
+  'body.checkoutBrandNameOverride',
+  'actorEmail: context.actor.email',
+], 'audited checkout-name preference action')
+requireOrder(
+  saveNamePreference,
+  'await refreshShopifyIdentity()',
+  'updateShopifyCarrierServiceBrandNameOverrideInPostgres({',
+  'save-name-preference identity refresh',
+)
+
+const simulation = actionBranch(
+  'simulate-registration',
+  'simulate-name-alignment',
+)
 requireAll(simulation, [
+  'await refreshShopifyIdentity()',
   "current.reference.activation.state !== 'shadow'",
   'current.reference.activation.revision === null',
   "current.config.registrationState === 'registered'",
@@ -140,6 +193,20 @@ requireAll(simulation, [
   "registrationState: 'shadow_simulated'",
   'const exactConfig = publicCarrierServiceConfig(finalized)',
 ], 'simulate-registration action')
+requireOrder(
+  simulation,
+  'await refreshShopifyIdentity()',
+  'carrierServiceMutation({',
+  'simulate-registration identity refresh',
+)
+requireAll(simulation, [
+  'shopifyCarrierServiceRegistrationRequestHash(mutation)',
+  'requestHash,',
+], 'request-hash-fenced create/delete Shadow simulation')
+assert.ok(
+  (simulation.match(/requestHash,/g) || []).length >= 2,
+  'both initial and post-finalization registration simulations must carry the exact request hash',
+)
 assert.ok(
   (
     simulation.match(
@@ -149,8 +216,70 @@ assert.ok(
   'create simulation must retain exact zero-write evidence for the final configuration row',
 )
 
+const nameSimulation = actionBranch(
+  'simulate-name-alignment',
+  'align-registration-name',
+)
+requireAll(nameSimulation, [
+  'requireActivator(context.capabilities.canActivate)',
+  'await refreshShopifyIdentity()',
+  '!current.nameAlignment',
+  "current.config.registrationState !== 'registered'",
+  "current.reference.activation.state !== 'shadow'",
+  "'SHOPIFY_CARRIER_SERVICE_NAME_SIMULATION_STALE'",
+  "operation: 'update'",
+  'storeEntityName: current.namePreference.effectiveName',
+  'shopifyCarrierServiceRegistrationRequestHash(mutation)',
+  "mode: 'shadow'",
+  "operation: 'update'",
+  'requestHash,',
+], 'exact zero-write name-alignment simulation')
+requireOrder(
+  nameSimulation,
+  'await refreshShopifyIdentity()',
+  'carrierServiceMutation({',
+  'simulate-name-alignment identity refresh',
+)
+assert.ok(
+  nameSimulation.indexOf(
+    'shopifyCarrierServiceRegistrationRequestHash(mutation)',
+  ) < nameSimulation.indexOf(
+    'executeShopifyCarrierServiceRegistration({',
+  ),
+  'the name-alignment request hash must be fixed before Shadow evidence is recorded',
+)
+
+const alignName = actionBranch(
+  'align-registration-name',
+  'register',
+)
+requireAll(alignName, [
+  'requireActivator(context.capabilities.canActivate)',
+  'await refreshShopifyIdentity()',
+  'body.confirmProviderWrite !== true',
+  "'SHOPIFY_CARRIER_SERVICE_PROVIDER_WRITE_CONFIRMATION_REQUIRED'",
+  '!current.nameAlignment?.simulation',
+  "current.config.registrationState !== 'registered'",
+  "current.reference.activation.state !== 'shadow'",
+  "'SHOPIFY_CARRIER_SERVICE_NAME_SHADOW_EVIDENCE_REQUIRED'",
+  'body.confirmProductionProviderWrite !== true',
+  "'SHOPIFY_CARRIER_SERVICE_PRODUCTION_CONFIRMATION_REQUIRED'",
+  'executeResourceScopedCarrierServiceMutation({',
+  'storeEntityName: current.namePreference.effectiveName',
+  "operation: 'update'",
+  'simulation: current.nameAlignment.simulation',
+  'confirmationRequestId(',
+], 'confirmed in-place name-only update action')
+requireOrder(
+  alignName,
+  'await refreshShopifyIdentity()',
+  'executeResourceScopedCarrierServiceMutation({',
+  'align-registration-name identity refresh',
+)
+
 requireAll(providerMutation, [
   "action === 'register' || action === 'unregister'",
+  'await refreshShopifyIdentity()',
   'body.confirmProviderWrite !== true',
   "'SHOPIFY_CARRIER_SERVICE_PROVIDER_WRITE_CONFIRMATION_REQUIRED'",
   "action === 'register' ? 'create' : 'delete'",
@@ -164,6 +293,107 @@ requireAll(providerMutation, [
   'executeResourceScopedCarrierServiceMutation({',
   'confirmationRequestId(',
 ], 'revision-fenced register and unregister actions')
+requireOrder(
+  providerMutation,
+  'await refreshShopifyIdentity()',
+  'executeResourceScopedCarrierServiceMutation({',
+  'register/unregister identity refresh',
+)
+
+const refreshIdentityStart = setupRoute.indexOf(
+  'const refreshShopifyIdentity = async () => {',
+)
+const refreshIdentityEnd = setupRoute.indexOf(
+  '\n    }\n\n    if (action ===',
+  refreshIdentityStart,
+)
+assert.ok(
+  refreshIdentityStart >= 0 && refreshIdentityEnd > refreshIdentityStart,
+  'setup API is missing the fresh Shopify identity helper',
+)
+const refreshIdentity = setupRoute.slice(
+  refreshIdentityStart,
+  refreshIdentityEnd,
+)
+requireAll(refreshIdentity, [
+  'testCommerceConnection({',
+  'organizationId: context.organizationId',
+  'accountGlobalId: accountId',
+  'actorEmail: context.actor.email',
+  'current = await setupState({',
+], 'read-only Shopify identity refresh')
+requireOrder(
+  refreshIdentity,
+  'testCommerceConnection({',
+  'current = await setupState({',
+  'identity refresh then state reload',
+)
+requireAll(commerceIntegrations, [
+  'const probe = await probeShopifyConnection({',
+  'accountName: probe.shopName',
+  'lastVerifiedAt: new Date().toISOString()',
+  'if (probe.shopId !== runtime.externalAccountId)',
+], 'verified Shopify identity refresh implementation')
+const connectionProbeQuery = shopifyCommerceClient.slice(
+  shopifyCommerceClient.indexOf(
+    'const SHOPIFY_CONNECTION_PROBE_QUERY =',
+  ),
+  shopifyCommerceClient.indexOf(
+    'function probeShopName(',
+  ),
+)
+requireAll(connectionProbeQuery, [
+  'query ClawPilotShopifyConnectionProbe',
+  'shop {',
+  'id',
+  'myshopifyDomain',
+  'name',
+  'currentAppInstallation',
+], 'read-only Shopify connection probe')
+assert.doesNotMatch(
+  connectionProbeQuery,
+  /\bmutation\b/,
+  'identity refresh must not perform a Shopify provider mutation',
+)
+
+const shadowKeyStart = setupRoute.indexOf(
+  'function shadowSimulationIdempotencyKey(',
+)
+const shadowKeyEnd = setupRoute.indexOf(
+  'async function exactShadowSimulation(',
+  shadowKeyStart,
+)
+const shadowKey = setupRoute.slice(shadowKeyStart, shadowKeyEnd)
+requireAll(shadowKey, [
+  'requestHash: string',
+  ':${input.config.rowVersion}:${input.requestHash}',
+], 'request-hash-fenced Shadow idempotency key')
+assert.doesNotMatch(
+  shadowKey,
+  /requestHash\?:/,
+  'all create/update/delete Shadow idempotency keys require a request hash',
+)
+const exactShadowStart = shadowKeyEnd
+const exactShadowEnd = setupRoute.indexOf(
+  'function mutationActorRole(',
+  exactShadowStart,
+)
+const exactShadow = setupRoute.slice(exactShadowStart, exactShadowEnd)
+requireAll(exactShadow, [
+  'requestHash: string',
+  'requestHash: input.requestHash',
+  'effect.requestHash === input.requestHash',
+], 'request-hash-fenced exact Shadow lookup')
+assert.doesNotMatch(
+  exactShadow,
+  /input\.requestHash === undefined/,
+  'exact Shadow lookup must never accept an unfenced legacy simulation',
+)
+requireAll(setupRoute, [
+  'const operationRequestHash = publicConfig && operation',
+  'shopifyCarrierServiceRegistrationRequestHash(',
+  'requestHash: operationRequestHash',
+], 'request-hash-fenced create/delete setup-state lookup')
 
 const activeExecutorStart = setupRoute.indexOf(
   'async function executeResourceScopedCarrierServiceMutation(',
@@ -194,8 +424,28 @@ requireAll(activeExecutor, [
   'expiresInSeconds: 120',
   'claimShopifyCarrierServiceMutationInPostgres({',
   'executeAuthorizedShopifyCarrierServiceMutation({',
+  "if (input.operation === 'update')",
+  'finalizeShopifyCarrierServiceNameAlignmentInPostgres({',
+  'evidenceGlobalId: outcomeGlobalId',
   'finalizeShopifyCarrierServiceConfigMutationInPostgres({',
 ], 'exact resource-scoped mutation executor')
+const updateFinalization = activeExecutor.slice(
+  activeExecutor.indexOf("if (input.operation === 'update')"),
+  activeExecutor.indexOf(
+    'return finalizeShopifyCarrierServiceConfigMutationInPostgres({',
+  ),
+)
+requireAll(updateFinalization, [
+  'return finalizeShopifyCarrierServiceNameAlignmentInPostgres({',
+  'expectedConfigRowVersion: input.config.rowVersion',
+  'attemptGlobalId: claimed.attempt.globalId',
+  'evidenceGlobalId: outcomeGlobalId',
+], 'dedicated applied-name finalization')
+assert.doesNotMatch(
+  updateFinalization,
+  /finalizeShopifyCarrierServiceConfigMutationInPostgres/,
+  'name-only update evidence must use the applied-name finalizer without changing create/delete configuration identity',
+)
 requireAll(setupPanel, [
   'state: stepState(',
   'false,',
@@ -209,6 +459,10 @@ for (const [before, after] of [
   [
     'claimShopifyCarrierServiceMutationInPostgres({',
     'executeAuthorizedShopifyCarrierServiceMutation({',
+  ],
+  [
+    'executeAuthorizedShopifyCarrierServiceMutation({',
+    'finalizeShopifyCarrierServiceNameAlignmentInPostgres({',
   ],
   [
     'executeAuthorizedShopifyCarrierServiceMutation({',
@@ -235,6 +489,126 @@ requireAll(setupPanel, [
   'confirmProductionProviderWrite:',
   'globalThis.crypto.randomUUID()',
 ], 'Shadow plus resource-scoped provider mutation workflow')
+requireAll(setupPanel, [
+  'registeredServiceName: string | null',
+  'appliedName: string | null',
+  'aligned: boolean',
+  'Optional administrator checkout name',
+  'Leave blank to use the verified Shopify store name',
+  'Clearing a saved override restores that default.',
+  "'save-name-preference'",
+  'checkoutBrandNameOverride:',
+  'Restore verified Shopify name',
+  'Saving invalidates any prior exact simulation.',
+  'Source · administrator override',
+  'Source · verified Shopify store',
+  "'simulate-name-alignment'",
+  "'align-registration-name'",
+  'confirmationRequestId:',
+  'globalThis.crypto.randomUUID()',
+  'CarrierService ID, callback URL, active state, and Shopify',
+  'shipping-profile assignments remain unchanged.',
+  '...(setup?.config ? [{',
+  "key: 'carrier-service-name'",
+  'inputProps={{ maxLength: 120 }}',
+  'Provider-confirmed applied name',
+  "value: nameAlignment?.appliedName || 'Not yet confirmed'",
+], 'verified-store default and administrator override workflow')
+requireOrder(
+  setupPanel,
+  "key: 'bindings'",
+  "key: 'carrier-service-name'",
+  'pre-registration naming preference step',
+)
+requireOrder(
+  setupPanel,
+  "key: 'carrier-service-name'",
+  "key: 'shadow'",
+  'naming preference before provider simulation',
+)
+const nameAlignmentCompletionStart = setupPanel.indexOf(
+  'const nameAlignmentComplete = Boolean(',
+)
+const nameAlignmentCompletionEnd = setupPanel.indexOf(
+  'const expectedSimulationOperation',
+  nameAlignmentCompletionStart,
+)
+assert.ok(
+  nameAlignmentCompletionStart >= 0
+    && nameAlignmentCompletionEnd > nameAlignmentCompletionStart,
+  'setup panel is missing the provider-applied name completion predicate',
+)
+const nameAlignmentCompletion = setupPanel.slice(
+  nameAlignmentCompletionStart,
+  nameAlignmentCompletionEnd,
+)
+requireAll(nameAlignmentCompletion, [
+  'nameAlignment?.aligned && !namePreferenceChanged',
+], 'provider-applied name completion predicate')
+assert.doesNotMatch(
+  nameAlignmentCompletion,
+  /nameAlignmentAuthorization/,
+  'authorization evidence alone must not mark name alignment complete',
+)
+requireAll(setupRoute, [
+  'checkoutBrandNameOverride: config.checkoutBrandNameOverride',
+  'registeredServiceName: config.registeredServiceName',
+  'function storeEntityNamePreference(',
+  'providerStoreEntityName: account.configuration.accountName',
+  'overrideName || providerStoreEntityName',
+  "'administrator_override' as const",
+  "'provider_verified_shop_name' as const",
+  'const desiredName = namePreference.effectiveName',
+  'appliedName: publicConfig.registeredServiceName',
+  'aligned: publicConfig.registeredServiceName === desiredName',
+  'shopifyCarrierServiceRegistrationRequestHash(nameMutation)',
+  "operation: 'update'",
+  'requestHash: alignmentSimulation.requestHash',
+  'finalizeShopifyCarrierServiceNameAlignmentInPostgres({',
+], 'effective checkout-name preference and request-hash fence')
+assert.ok(
+  (
+    setupRoute.match(
+      /finalizeShopifyCarrierServiceNameAlignmentInPostgres\(\{/g,
+    ) || []
+  ).length >= 3,
+  'active execution, recovery, and reconciliation must all use the applied-name finalizer',
+)
+const overrideNormalizer = setupRoute.slice(
+  setupRoute.indexOf('function checkoutBrandNameOverride('),
+  setupRoute.indexOf('function shadowSimulationIdempotencyKey('),
+)
+requireAll(overrideNormalizer, [
+  'if (value === null) return null',
+  "typeof value !== 'string'",
+  "'SHOPIFY_CARRIER_SERVICE_NAME_OVERRIDE_INVALID'",
+  'The optional checkout name must be text or null',
+  'if (!trimmed) return null',
+  'if (normalized.length > 120)',
+], 'strict checkout-name override parser')
+assert.doesNotMatch(
+  overrideNormalizer,
+  /\bString\s*\(\s*value\s*\)/,
+  'non-string non-null override input must be rejected instead of coerced',
+)
+const updateMutation = setupRoute.slice(
+  setupRoute.indexOf("if (input.operation === 'update')", setupRoute.indexOf(
+    'function carrierServiceMutation(',
+  )),
+  setupRoute.indexOf("return {\n      operation: 'delete'", setupRoute.indexOf(
+    'function carrierServiceMutation(',
+  )),
+)
+requireAll(updateMutation, [
+  "operation: 'update'",
+  'id: input.config.serviceGid',
+  'name: shopifyStoreEntityCarrierServiceName(',
+], 'exact existing-GID name-only mutation')
+assert.doesNotMatch(
+  updateMutation,
+  /\b(?:callbackUrl|active|supportsServiceDiscovery)\s*:/,
+  'name alignment must not mutate callback, active state, or discovery state',
+)
 requireAll(setupPanel, [
   'configRowVersion: number',
   'authorization.configRowVersion === setup?.config?.rowVersion',
@@ -322,6 +696,19 @@ requireAll(receiptAuthorityMigration, [
   'NEW.provider_write_activation_revision',
   'operations_shopify_carrier_service_config_is_ready(',
 ], 'receipt-independent resource-scoped CarrierService authority')
+requireAll(nameAlignmentMigration, [
+  'checkout_brand_name_override text',
+  'operations_shopify_carrier_service_configs_brand_name_valid',
+  "operation IN ('create', 'update', 'delete')",
+  "operation IN ('update', 'delete')",
+  'protect_ops_shopify_cs_name_update_authorization()',
+  "config_state IS DISTINCT FROM 'registered'",
+  'config_service_gid IS DISTINCT FROM NEW.expected_service_gid',
+  "simulated_mutation->>'operation' IS DISTINCT FROM 'update'",
+  "simulated_mutation->>'carrierServiceId' IS DISTINCT FROM",
+  "simulated_mutation->>'serviceName' IS DISTINCT FROM",
+  'WHEN (NEW.operation = \'update\')',
+], 'name-only CarrierService update schema')
 const configMutationLinkTrigger = activeMutationMigration.slice(
   activeMutationMigration.indexOf(
     'CREATE OR REPLACE FUNCTION\n  protect_ops_shopify_cs_config_mut_link()',

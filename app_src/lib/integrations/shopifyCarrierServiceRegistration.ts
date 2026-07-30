@@ -663,7 +663,9 @@ export type ShopifyCarrierServiceMutationVerificationResult = {
  * Create is reconciled by exhaustively enumerating the provider collection:
  * exactly one matching configuration confirms application, while a complete
  * enumeration with no match confirms that the create did not apply.
- * Delete is confirmed applied only when the exact former GID is absent.
+ * A name-only update is confirmed applied only when the exact GID returns the
+ * exact desired name. Delete is confirmed applied only when the exact former
+ * GID is absent.
  */
 export async function verifyShopifyCarrierServiceMutationForReconciliation(
   input: {
@@ -683,8 +685,7 @@ export async function verifyShopifyCarrierServiceMutationForReconciliation(
   const requestHash =
     shopifyCarrierServiceRegistrationRequestHash(mutation)
   if (
-    mutation.operation === 'update'
-    || !authorization.attempt
+    !authorization.attempt
     || authorization.resolution
     || !authorization.reconciliationRequired
     || authorization.operation !== mutation.operation
@@ -694,13 +695,13 @@ export async function verifyShopifyCarrierServiceMutationForReconciliation(
       && authorization.expectedServiceGid !== null
     )
     || (
-      mutation.operation === 'delete'
+      mutation.operation !== 'create'
       && authorization.expectedServiceGid !== mutation.id
     )
   ) {
     registrationError(
       'SHOPIFY_CARRIER_SERVICE_RECONCILIATION_STATE_INVALID',
-      'Only an uncertain consumed create or delete mutation can be verified',
+      'Only an uncertain consumed create, name update, or delete mutation can be verified',
       409,
       false,
       authorization.attempt?.globalId || authorization.globalId,
@@ -862,6 +863,36 @@ export async function verifyShopifyCarrierServiceMutationForReconciliation(
     )
   }
 
+  if (mutation.operation === 'update') {
+    if (observed?.id !== mutation.id || observed.name !== mutation.name) {
+      registrationError(
+        'SHOPIFY_CARRIER_SERVICE_RECONCILIATION_INCONCLUSIVE',
+        'Shopify did not return the exact desired CarrierService name; the update remains uncertain and cannot be retried',
+        409,
+        false,
+        authorization.attempt.globalId,
+      )
+    }
+    const resolutionEvidence = {
+      provider: 'shopify',
+      operation: 'update',
+      verification: 'admin_graphql_exact_carrier_service',
+      providerResult: 'exact_service_name_match',
+      providerReferenceSha256:
+        createHash('sha256').update(mutation.id).digest('hex'),
+      serviceName: mutation.name,
+    }
+    assertRedactedCommerceExternalEffectEvidence(
+      resolutionEvidence,
+      'CarrierService reconciliation evidence',
+    )
+    return {
+      disposition: 'confirmed_applied',
+      providerReference: mutation.id,
+      resolutionEvidence,
+    }
+  }
+
   const resolutionEvidence = {
     provider: 'shopify',
     operation: 'delete',
@@ -956,17 +987,15 @@ function unknownProviderOutcome(error: unknown) {
 function explicitProviderMutationRejection(error: unknown) {
   return error instanceof ShopifyCarrierServiceClientError
     && error.userErrors.length > 0
-    && /^SHOPIFY_CARRIER_SERVICE_(?:CREATE|DELETE)_REJECTED$/.test(
+    && /^SHOPIFY_CARRIER_SERVICE_(?:CREATE|UPDATE|DELETE)_REJECTED$/.test(
       error.code,
     )
 }
 
 function assertExactAuthorizedProviderResult(input: {
-  mutation: Exclude<
-    ShopifyCarrierServiceRegistrationMutation,
-    { operation: 'update' }
-  >
+  mutation: ShopifyCarrierServiceRegistrationMutation
   result: ShopifyCarrierService | string
+  priorService?: ShopifyCarrierService | null
 }) {
   if (input.mutation.operation === 'delete') {
     if (
@@ -976,6 +1005,26 @@ function assertExactAuthorizedProviderResult(input: {
       registrationError(
         'SHOPIFY_CARRIER_SERVICE_PROVIDER_RESPONSE_MISMATCH',
         'Shopify returned a different CarrierService than the exact authorized removal',
+        502,
+      )
+    }
+    return
+  }
+  if (input.mutation.operation === 'update') {
+    if (
+      typeof input.result === 'string'
+      || input.result.id !== input.mutation.id
+      || input.result.name !== input.mutation.name
+      || !input.priorService
+      || input.priorService.id !== input.mutation.id
+      || input.result.callbackUrl !== input.priorService.callbackUrl
+      || input.result.active !== input.priorService.active
+      || input.result.supportsServiceDiscovery
+        !== input.priorService.supportsServiceDiscovery
+    ) {
+      registrationError(
+        'SHOPIFY_CARRIER_SERVICE_PROVIDER_RESPONSE_MISMATCH',
+        'Shopify did not return the exact authorized name-only CarrierService update',
         502,
       )
     }
@@ -1423,12 +1472,12 @@ export async function executeShopifyCarrierServiceRegistration(
 
 export type AuthorizedShopifyCarrierServiceMutationResult = {
   authorization: ShopifyCarrierServiceMutationAuthorization
-  operation: 'create' | 'delete'
+  operation: 'create' | 'update' | 'delete'
   providerReference: string
 }
 
 function authorizedFailureEvidence(input: {
-  operation: 'create' | 'delete'
+  operation: 'create' | 'update' | 'delete'
   stage: string
   outcome: 'failed' | 'unknown'
   errorCode: string
@@ -1534,10 +1583,18 @@ export async function executeAuthorizedShopifyCarrierServiceMutation(
     ...overrides,
   }
   const mutation = normalizeMutation(input.mutation)
-  if (mutation.operation === 'update') {
+  if (
+    mutation.operation === 'update'
+    && (
+      mutation.name === undefined
+      || mutation.callbackUrl !== undefined
+      || mutation.active !== undefined
+      || mutation.supportsServiceDiscovery !== undefined
+    )
+  ) {
     registrationError(
       'SHOPIFY_CARRIER_SERVICE_AUTHORIZATION_OPERATION_INVALID',
-      'One-time resource-scoped authorization only supports registration or removal',
+      'One-time CarrierService update authorization supports the exact provider-verified name only',
       400,
       false,
       authorization.attempt.globalId,
@@ -1556,7 +1613,7 @@ export async function executeAuthorizedShopifyCarrierServiceMutation(
       && authorization.expectedServiceGid !== null
     )
     || (
-      mutation.operation === 'delete'
+      mutation.operation !== 'create'
       && authorization.expectedServiceGid !== mutation.id
     )
   ) {
@@ -1654,6 +1711,33 @@ export async function executeAuthorizedShopifyCarrierServiceMutation(
     })
   }
 
+  let priorService: ShopifyCarrierService | null = null
+  if (mutation.operation === 'update') {
+    try {
+      priorService = await dependencies.queryCarrierService(
+        runtimeCredential,
+        mutation.id,
+        { timeoutMs: 10_000 },
+      )
+      if (!priorService || priorService.id !== mutation.id) {
+        registrationError(
+          'SHOPIFY_CARRIER_SERVICE_PROVIDER_PRECONDITION_FAILED',
+          'The exact Shopify CarrierService could not be read before its name-only update',
+          409,
+        )
+      }
+    } catch (error) {
+      return finalizeAuthorizedFailure({
+        authorization,
+        dependencies,
+        error,
+        stage: 'provider_precondition',
+        providerMutationAttempted: false,
+        finalizedBy,
+      })
+    }
+  }
+
   let providerResult: ShopifyCarrierService | string
   try {
     providerResult = await performProviderMutation({
@@ -1679,6 +1763,7 @@ export async function executeAuthorizedShopifyCarrierServiceMutation(
     assertExactAuthorizedProviderResult({
       mutation,
       result: providerResult,
+      priorService,
     })
     providerReference = typeof providerResult === 'string'
       ? providerResult

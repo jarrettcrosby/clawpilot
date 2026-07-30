@@ -8,6 +8,9 @@ const read = (relative) => fs.readFileSync(path.join(root, relative), 'utf8')
 const callback = read(
   'app_src/lib/integrations/shopifyCarrierServiceCallback.ts',
 )
+const branding = read(
+  'app_src/lib/integrations/shopifyCarrierServiceBranding.ts',
+)
 const context = read(
   'app_src/lib/persistence/shopifyCheckoutContext.ts',
 )
@@ -36,13 +39,14 @@ for (const required of [
   'SHOPIFY_CHECKOUT_SHADOW_ALLOWED_VARIANT_IDS',
   'SHOPIFY_CHECKOUT_SHADOW_CUSTOMER_LABEL',
   'shopifyCarrierServiceRequestMatchesTestAllowlist(request, {',
-  'shopifyStoreEntityRateName({',
   'buildShopifyStoreEntityRateResponse({',
   'storeEntityName: account.storeEntityName',
   "protocolVersion: 'shopify-carrier-service-response-v2'",
   'shopifyCheckoutRatingHash(resultSnapshot) !== receipt.resultHash',
   'shopifyCheckoutRatingHash(resultSnapshot.response)',
-  'shadowCustomerAlias: shadowCustomerLabel',
+  "console.warn('[shopify checkout rating] callback failed'",
+  "stage: checkoutFailureStage(input.error, input.claimed)",
+  'reasonCode: errorCode(input.error)',
   'persistedRequestFingerprint(',
   'shopifyCheckoutDestinationFingerprint(',
   'carrierSandboxPartyFingerprint(destination)',
@@ -79,6 +83,26 @@ for (const required of [
     `callback is missing required contract: ${required}`,
   )
 }
+
+for (const required of [
+  'SHOPIFY_CARRIER_DISPLAY_NAMES',
+  "ups: 'UPS'",
+  "fedex: 'FedEx'",
+  'RATE_NAME_SEPARATOR',
+  'carrierDisplayName',
+  'providerServiceName',
+]) {
+  assert.ok(
+    branding.includes(required),
+    `rate branding is missing store, carrier, and service contract: ${required}`,
+  )
+}
+
+assert.equal(
+  callback.includes('shadowCustomerAlias:'),
+  false,
+  'customer identity must not alter a Shopify CarrierService rate name',
+)
 
 for (const required of [
   'withShopifyCheckoutDeadlineTransaction',

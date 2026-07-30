@@ -322,7 +322,13 @@ function authorizedRequestHash(mutation) {
         operation: 'delete',
         carrierServiceId: mutation.id,
       }
-    : {
+    : mutation.operation === 'update'
+      ? {
+          operation: 'update',
+          carrierServiceId: mutation.id,
+          serviceName: mutation.name,
+        }
+      : {
         operation: 'create',
         serviceName: mutation.name,
         callback: {
@@ -359,7 +365,7 @@ function claimedAuthorization(mutation, overrides = {}) {
     providerWriteActivationRevision: 9,
     requestHash: authorizedRequestHash(mutation),
     expectedServiceGid:
-      mutation.operation === 'delete' ? mutation.id : null,
+      mutation.operation === 'create' ? null : mutation.id,
     status: 'claimed',
     attempt: {
       globalId: 'gscm0000001',
@@ -543,6 +549,37 @@ function authorizedDependencies(authorization, options = {}) {
   assert.equal(
     JSON.stringify(prepare.redactedRequest).includes(callback),
     false,
+  )
+}
+
+{
+  const mutation = {
+    operation: 'update',
+    id: serviceId,
+    name: 'Pro Bakery Bites',
+  }
+  const { calls, deps } = dependencies()
+  const result =
+    await registration.executeShopifyCarrierServiceRegistration(
+      command({
+        mode: 'shadow',
+        idempotencyKey: 'carrier-service-shadow-name-update-revision-12',
+        mutation,
+      }),
+      deps,
+    )
+  assert.equal(result.effect.state, 'simulated')
+  assert.equal(result.effect.providerWriteCount, 0)
+  assert.deepEqual(calls.map(([name]) => name), ['prepare'])
+  const redactedMutation = calls[0][1].redactedRequest.mutation
+  assert.equal(
+    JSON.stringify(redactedMutation),
+    JSON.stringify({
+      operation: 'update',
+      carrierServiceId: serviceId,
+      serviceName: 'Pro Bakery Bites',
+    }),
+    'Shadow name alignment must retain exact existing-GID/name-only evidence',
   )
 }
 
@@ -897,6 +934,131 @@ for (const mutation of [
 }
 
 {
+  const mutation = {
+    operation: 'update',
+    id: serviceId,
+    name: 'Pro Bakery Bites',
+  }
+  const authorization = claimedAuthorization(mutation, {
+    accountEnvironment: 'production',
+  })
+  const priorService = {
+    id: serviceId,
+    name: 'Legacy checkout name',
+    callbackUrl: 'https://dev.example.com/exact-existing-callback',
+    active: false,
+    supportsServiceDiscovery: true,
+  }
+  const { calls, deps } = authorizedDependencies(authorization, {
+    runtime: runtime({ environment: 'production' }),
+    queryResult: priorService,
+  })
+  let observedProviderResult = null
+  deps.updateCarrierService = async (
+    credential,
+    providerInput,
+    requestOptions,
+  ) => {
+    calls.push(['update', credential, providerInput, requestOptions])
+    observedProviderResult = {
+      ...priorService,
+      name: providerInput.name,
+    }
+    return observedProviderResult
+  }
+  const result =
+    await registration.executeAuthorizedShopifyCarrierServiceMutation(
+      { authorization, mutation },
+      deps,
+    )
+  assert.equal(result.operation, 'update')
+  assert.equal(result.providerReference, serviceId)
+  assert.deepEqual(
+    calls.map(([name]) => name),
+    [
+      'runtime',
+      'decrypt',
+      'token',
+      'query',
+      'update',
+      'authorized-finalize',
+    ],
+    'the exact existing CarrierService must be queried and renamed in place',
+  )
+  const providerRead = calls.find(([name]) => name === 'query')
+  assert.equal(providerRead[2], serviceId)
+  const providerInput = calls.find(([name]) => name === 'update')[2]
+  assert.equal(providerInput.id, serviceId)
+  assert.equal(providerInput.name, 'Pro Bakery Bites')
+  assert.equal(
+    JSON.stringify(Object.keys(providerInput).sort()),
+    JSON.stringify(['id', 'name']),
+    'the provider update must contain only the exact existing GID and desired name',
+  )
+  assert.equal(
+    observedProviderResult.callbackUrl,
+    priorService.callbackUrl,
+  )
+  assert.equal(observedProviderResult.active, priorService.active)
+  assert.equal(
+    observedProviderResult.supportsServiceDiscovery,
+    priorService.supportsServiceDiscovery,
+  )
+  const finalized = calls.at(-1)[1]
+  assert.equal(finalized.outcome, 'succeeded')
+  assert.equal(finalized.providerReference, serviceId)
+  assert.equal(finalized.providerWriteCount, 1)
+}
+
+for (const mutation of [
+  {
+    operation: 'update',
+    id: serviceId,
+    callbackUrl: callback,
+  },
+  {
+    operation: 'update',
+    id: serviceId,
+    active: false,
+  },
+  {
+    operation: 'update',
+    id: serviceId,
+    supportsServiceDiscovery: true,
+  },
+  {
+    operation: 'update',
+    id: serviceId,
+    name: 'Pro Bakery Bites',
+    callbackUrl: callback,
+  },
+]) {
+  const authorization = claimedAuthorization({
+    operation: 'update',
+    id: serviceId,
+    name: 'Pro Bakery Bites',
+  })
+  const { calls, deps } = authorizedDependencies(authorization)
+  await assert.rejects(
+    () =>
+      registration.executeAuthorizedShopifyCarrierServiceMutation(
+        { authorization, mutation },
+        deps,
+      ),
+    (error) =>
+      error
+        instanceof registration.ShopifyCarrierServiceRegistrationError
+      && error.code ===
+        'SHOPIFY_CARRIER_SERVICE_AUTHORIZATION_OPERATION_INVALID',
+  )
+  assert.deepEqual(
+    calls,
+    [],
+    'callback, active, and discovery fields must be rejected before credential or provider work',
+  )
+}
+
+{
   const mutation = command().mutation
   const authorization = claimedAuthorization(mutation)
   const { calls, deps } = authorizedDependencies(authorization, {
@@ -920,6 +1082,49 @@ for (const mutation of [
     'authorization/runtime environment mismatch must fail before decrypt',
   )
   assert.equal(calls.at(-1)[1].providerWriteCount, 0)
+}
+
+{
+  const mutation = {
+    operation: 'update',
+    id: serviceId,
+    name: 'Pro Bakery Bites',
+  }
+  const authorization = claimedAuthorization(mutation)
+  const { calls, deps } = authorizedDependencies(authorization)
+  deps.updateCarrierService = async (
+    credential,
+    providerInput,
+    requestOptions,
+  ) => {
+    calls.push(['update', credential, providerInput, requestOptions])
+    return {
+      id: serviceId,
+      name: 'Different merchant name',
+      callbackUrl: callback,
+      active: true,
+      supportsServiceDiscovery: false,
+    }
+  }
+  await assert.rejects(
+    () =>
+      registration.executeAuthorizedShopifyCarrierServiceMutation(
+        { authorization, mutation },
+        deps,
+      ),
+    (error) =>
+      error
+        instanceof registration.ShopifyCarrierServiceRegistrationError
+      && error.code ===
+        'SHOPIFY_CARRIER_SERVICE_PROVIDER_RESPONSE_MISMATCH',
+  )
+  const finalized = calls.at(-1)[1]
+  assert.equal(finalized.outcome, 'unknown')
+  assert.equal(finalized.providerWriteCount, null)
+  assert.equal(
+    finalized.redactedResult.stage,
+    'provider_response_verification',
+  )
 }
 
 {
@@ -1146,6 +1351,69 @@ for (const mutation of [
         instanceof registration.ShopifyCarrierServiceRegistrationError
       && error.code
         === 'SHOPIFY_CARRIER_SERVICE_RECONCILIATION_AMBIGUOUS',
+  )
+}
+
+{
+  const mutation = {
+    operation: 'update',
+    id: serviceId,
+    name: 'Pro Bakery Bites',
+  }
+  const authorization = claimedAuthorization(mutation, {
+    status: 'unknown',
+    reconciliationRequired: true,
+    outcome: {
+      globalId: 'gsco0000001',
+      state: 'unknown',
+      providerReference: null,
+      providerWriteCount: null,
+    },
+  })
+  const exact = authorizedDependencies(authorization, {
+    queryResult: {
+      id: serviceId,
+      name: mutation.name,
+      callbackUrl: callback,
+      active: true,
+      supportsServiceDiscovery: false,
+    },
+  })
+  const applied =
+    await registration
+      .verifyShopifyCarrierServiceMutationForReconciliation(
+        { authorization, mutation },
+        exact.deps,
+      )
+  assert.equal(applied.disposition, 'confirmed_applied')
+  assert.equal(applied.providerReference, serviceId)
+  assert.deepEqual(
+    exact.calls.map(([name]) => name),
+    ['runtime', 'decrypt', 'token', 'query'],
+  )
+
+  const mismatch = authorizedDependencies(authorization, {
+    queryResult: {
+      id: serviceId,
+      name: 'Different merchant name',
+      callbackUrl: callback,
+      active: true,
+      supportsServiceDiscovery: false,
+    },
+  })
+  await assert.rejects(
+    () =>
+      registration
+        .verifyShopifyCarrierServiceMutationForReconciliation(
+          { authorization, mutation },
+          mismatch.deps,
+        ),
+    (error) =>
+      error
+        instanceof registration.ShopifyCarrierServiceRegistrationError
+      && error.code ===
+        'SHOPIFY_CARRIER_SERVICE_RECONCILIATION_INCONCLUSIVE'
+      && error.retryable === false,
   )
 }
 

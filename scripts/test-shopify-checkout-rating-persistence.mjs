@@ -93,6 +93,9 @@ const packHardeningMigration = read(
 const offerParcelEvidenceMigration = read(
   'db/migrations/0164_shopify_checkout_offer_parcel_evidence.sql',
 )
+const nameAlignmentMigration = read(
+  'db/migrations/0166_shopify_carrier_service_name_alignment.sql',
+)
 const persistenceSource = read(
   'app_src/lib/persistence/shopifyCheckoutRating.ts',
 )
@@ -193,6 +196,16 @@ includes(configSchema, [
   "activation.state = 'shadow'",
   'Registering a Shopify CarrierService requires Active Operations',
 ], 'Shopify CarrierService configuration')
+includes(nameAlignmentMigration, [
+  'checkout_brand_name_override text',
+  'registered_service_name text',
+  'operations_shopify_carrier_service_configs_brand_name_valid',
+  'length(btrim(checkout_brand_name_override)) BETWEEN 1 AND 120',
+  "checkout_brand_name_override !~ '[[:cntrl:]]'",
+  'length(btrim(registered_service_name)) BETWEEN 1 AND 255',
+  "registered_service_name !~ '[[:cntrl:]]'",
+  'Provider-confirmed name currently applied to the exact registered Shopify CarrierService',
+], 'Optional audited checkout-name override schema')
 
 const receiptSchema = section(
   migration,
@@ -289,6 +302,7 @@ includes(persistenceSource, [
   'shopifyCheckoutRatingHash',
   'shopifyCheckoutPackagePlanHash',
   'readShopifyCarrierServiceConfigFromPostgres',
+  'updateShopifyCarrierServiceBrandNameOverrideInPostgres',
   'upsertShopifyCarrierServiceConfigInPostgres',
   'finalizeShopifyCarrierServiceRegistrationInPostgres',
   'lookupShopifyCheckoutRatingAccountByGlobalIdInPostgres',
@@ -306,6 +320,23 @@ includes(persistenceSource, [
   'SHOPIFY_CHECKOUT_MARKUP_NOT_ALLOWED',
   'SHOPIFY_CHECKOUT_CONTEXT_STALE',
   'config.rowVersion !== input.expectedConfigRowVersion',
+  'config.checkout_brand_name_override',
+  'checkoutBrandNameOverride: row.checkout_brand_name_override',
+  'config.registered_service_name',
+  'registeredServiceName: row.registered_service_name',
+  'current.checkoutBrandNameOverride',
+  '=== input.checkoutBrandNameOverride',
+  'SET checkout_brand_name_override = $3',
+  'row_version = row_version + 1',
+  "'operations.shopify_carrier_service.brand_name_changed'",
+  "effectiveNameSource:",
+  "'provider_verified_shop_name'",
+  "'administrator_override'",
+  "'SHOPIFY_CHECKOUT_BRAND_NAME_AUTHORIZATION_ACTIVE'",
+  'authorized_mutation.config_row_version = $3::bigint',
+  "outcome.outcome = 'failed'",
+  'outcome.provider_write_count = 0',
+  "resolution.disposition = 'confirmed_not_applied'",
   'activation.state !== input.expectedActivationState',
   'activation.revision !== input.expectedActivationRevision',
   "receipt.status IN ('succeeded', 'failed')",
@@ -321,28 +352,82 @@ includes(persistenceSource, [
   'AS store_entity_name',
 ], 'Checkout persistence exports and guards')
 
+const configProjection = section(
+  persistenceSource,
+  'const CONFIG_SELECT = `SELECT',
+  'async function readConfigChildren(',
+  'CarrierService config projection',
+)
+includes(configProjection, [
+  'config.checkout_brand_name_override',
+  'config.registered_service_name',
+  "config.registration_state = 'shadow_simulated'",
+  "config.registration_state = 'registered'",
+  'config.registered_service_name IS NOT DISTINCT FROM',
+  "btrim(config.checkout_brand_name_override)",
+  "account.configuration ->> 'accountName'",
+], 'applied-vs-desired CarrierService config readiness')
+
+const overrideUpdate = section(
+  persistenceSource,
+  'export async function updateShopifyCarrierServiceBrandNameOverrideInPostgres',
+  'export async function upsertShopifyCarrierServiceConfigInPostgres',
+  'checkout-name override update',
+)
+includes(overrideUpdate, [
+  'shopify-carrier-service-authorization:',
+  'shopify-carrier-service-config:',
+  'current.rowVersion !== input.expectedRowVersion',
+  'current.checkoutBrandNameOverride',
+  '=== input.checkoutBrandNameOverride',
+  'operations_shopify_carrier_service_mutation_authorizations',
+  'authorized_mutation.config_row_version = $3::bigint',
+  "outcome.outcome = 'failed'",
+  'outcome.provider_write_count = 0',
+  "resolution.disposition = 'confirmed_not_applied'",
+  "'SHOPIFY_CHECKOUT_BRAND_NAME_AUTHORIZATION_ACTIVE'",
+  'SET checkout_brand_name_override = $3',
+  'row_version = row_version + 1',
+  'priorOverride: current.checkoutBrandNameOverride',
+  'newOverride: input.checkoutBrandNameOverride',
+], 'serialized row-fenced checkout-name override update')
+assert.ok(
+  overrideUpdate.indexOf('shopify-carrier-service-authorization:')
+    < overrideUpdate.indexOf('readConfigWithClient(client, input)'),
+  'override writes must obtain the provider-authorization lock before reading the fenced config row',
+)
+
 const callbackAccountLookup = persistenceSource.slice(
   persistenceSource.indexOf(
     'lookupShopifyCheckoutRatingAccountByGlobalIdInPostgres',
   ),
   persistenceSource.indexOf('const RECEIPT_SELECT'),
 )
-assert.ok(
-  callbackAccountLookup.includes(
-    "NULLIF(\n         btrim(account.configuration ->> 'accountName'),",
-  )
-    && callbackAccountLookup.includes(') IS NOT NULL'),
-  'checkout callback readiness must require the provider-verified store entity',
-)
+includes(callbackAccountLookup, [
+  'CASE',
+  "WHEN config.registration_state = 'registered'",
+  'THEN config.registered_service_name',
+  'ELSE COALESCE(',
+  'btrim(config.checkout_brand_name_override)',
+  "account.configuration ->> 'accountName'",
+  'END AS store_entity_name',
+  "config.registration_state = 'registered'",
+  'config.registered_service_name IS NOT DISTINCT FROM',
+  '$3::boolean = true',
+  "config.registration_state = 'shadow_simulated'",
+], 'callback applied-name authority')
 assert.equal(
   callbackAccountLookup.includes('account.display_name'),
   false,
   'checkout rate branding must not fall back to an editable connection label',
 )
-assert.equal(
-  callbackAccountLookup.includes('COALESCE('),
-  false,
-  'checkout rate branding must not fall back from provider store identity',
+assert.ok(
+  callbackAccountLookup.indexOf(
+    'THEN config.registered_service_name',
+  ) < callbackAccountLookup.indexOf(
+    'ELSE COALESCE(',
+  ),
+  'registered callbacks must use provider-applied name evidence before any desired-name fallback',
 )
 
 const {

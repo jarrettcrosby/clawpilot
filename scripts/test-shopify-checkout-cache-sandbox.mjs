@@ -109,10 +109,15 @@ includes(callback, [
   'cartonizationInputHash: shopifyCheckoutRatingHash(context.input)',
   'executionFenceHash,',
   'idempotencyKey,',
-  'cached,\n        shadowGuard.customerLabel,',
-  'claim.receipt,\n        shadowGuard.customerLabel,',
-  'completed,\n      shadowGuard.customerLabel,',
+  'cached,\n      )',
+  'claim.receipt,\n      )',
+  'completed,\n      )',
 ], 'Callback sandbox and execution cache fences')
+assert.equal(
+  callback.includes('shadowGuard.customerLabel'),
+  false,
+  'Ephemeral customer labels must not alter cached Shopify rate names',
+)
 
 const typedResponse = section(
   callback,

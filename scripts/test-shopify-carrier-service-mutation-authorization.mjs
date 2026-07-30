@@ -108,6 +108,9 @@ const activeMigration = read(
 const receiptAuthorityMigration = read(
   'db/migrations/0159_operations_shopify_receipt_and_carrier_authority.sql',
 )
+const nameAlignmentMigration = read(
+  'db/migrations/0166_shopify_carrier_service_name_alignment.sql',
+)
 const persistenceSource = read(
   'app_src/lib/persistence/shopifyCarrierServiceMutationAuthorization.ts',
 )
@@ -165,6 +168,45 @@ includes(migration, [
   'provider state transition requires exact one-time mutation evidence',
 ], 'One-time CarrierService authorization schema')
 
+includes(nameAlignmentMigration, [
+  'checkout_brand_name_override text',
+  'registered_service_name text',
+  'operations_shopify_carrier_service_configs_brand_name_valid',
+  'length(btrim(checkout_brand_name_override)) BETWEEN 1 AND 120',
+  'length(btrim(registered_service_name)) BETWEEN 1 AND 255',
+  "registered_service_name !~ '[[:cntrl:]]'",
+  'Provider-confirmed name currently applied to the exact registered Shopify CarrierService',
+  "operation IN ('create', 'update', 'delete')",
+  "operation IN ('update', 'delete')",
+  "'^gid://shopify/DeliveryCarrierService/[0-9]+$'",
+  'protect_ops_shopify_cs_name_update_authorization()',
+  "config.registration_state",
+  'config.service_gid',
+  "config.checkout_brand_name_override",
+  "account.configuration->>'accountName'",
+  "config_state IS DISTINCT FROM 'registered'",
+  'config_service_gid IS DISTINCT FROM NEW.expected_service_gid',
+  'jsonb_object_keys(simulated_mutation)',
+  ') <> 3',
+  "simulated_mutation->>'operation' IS DISTINCT FROM 'update'",
+  "simulated_mutation->>'carrierServiceId' IS DISTINCT FROM",
+  "simulated_mutation->>'serviceName' IS DISTINCT FROM",
+  "WHEN (NEW.operation = 'update')",
+  'protect_ops_shopify_cs_brand_override_update()',
+  'shopify-carrier-service-authorization:',
+  'authorized_mutation.config_row_version = OLD.row_version',
+  "outcome.outcome = 'failed'",
+  'outcome.provider_write_count = 0',
+  "resolution.disposition = 'confirmed_not_applied'",
+  'Shopify CarrierService name cannot change while current-row provider authorization may still apply',
+  'BEFORE UPDATE OF checkout_brand_name_override',
+], 'Name-only CarrierService update authorization schema')
+assert.doesNotMatch(
+  nameAlignmentMigration,
+  /simulated_mutation->>'(?:callbackUrl|active|supportsServiceDiscovery)'/,
+  'name-update authorization must accept only the exact three-field update mutation',
+)
+
 const resolutionTrigger = migration.slice(
   migration.indexOf(
     'CREATE OR REPLACE FUNCTION\n  protect_ops_shopify_cs_mut_resolution()',
@@ -193,6 +235,7 @@ for (const pattern of [
     migration,
     activeMigration,
     receiptAuthorityMigration,
+    nameAlignmentMigration,
   ]) {
     for (const match of source.matchAll(pattern)) {
       assert.ok(
@@ -262,7 +305,82 @@ includes(persistenceSource, [
   'SHOPIFY_CARRIER_SERVICE_LEGACY_SHADOW_AUTHORIZATION_DISABLED',
   'This transaction is local-only.',
   'credential rotation/verification change must not strand provider',
+  "| 'update'",
+  "['create', 'update', 'delete'].includes(input.operation)",
+  'Only Shopify CarrierService create, name update, or delete can be authorized',
+  "input.operation !== 'create'",
+  'SHOPIFY_CARRIER_SERVICE_MUTATION_SERVICE_FENCE_INVALID',
+  'finalizeShopifyCarrierServiceNameAlignmentInPostgres',
+  'registered_service_name',
+  'SHOPIFY_CARRIER_SERVICE_NAME_FINALIZER_REQUIRED',
+  'SHOPIFY_CARRIER_SERVICE_REGISTERED_NAME_MISMATCH',
 ], 'Authorization persistence')
+
+const nameFinalizer = persistenceSource.slice(
+  persistenceSource.indexOf(
+    'export async function finalizeShopifyCarrierServiceNameAlignmentInPostgres',
+  ),
+  persistenceSource.indexOf(
+    'export async function finalizeShopifyCarrierServiceConfigMutationInPostgres',
+  ),
+)
+includes(nameFinalizer, [
+  'expectedConfigRowVersion: number',
+  'attemptGlobalId: string',
+  'evidenceGlobalId: string',
+  'shopify-carrier-service-authorization:',
+  'config.registered_service_name',
+  "simulation.redacted_request -> 'mutation'",
+  'const appliedName = registeredServiceName(mutation?.serviceName)',
+  "row.operation !== 'update'",
+  "row.registration_state !== 'registered'",
+  'row.expected_service_gid !== row.service_gid',
+  'Number(row.authorization_config_row_version)',
+  '!== input.expectedConfigRowVersion',
+  'Object.keys(mutation).length !== 3',
+  "mutation.operation !== 'update'",
+  'mutation.carrierServiceId !== row.service_gid',
+  'mutation.serviceName !== appliedName',
+  "row.outcome === 'succeeded'",
+  'row.outcome_provider_write_count === 1',
+  'row.outcome_provider_reference === row.service_gid',
+  "row.resolution_disposition === 'confirmed_applied'",
+  'row.resolution_provider_reference === row.service_gid',
+  'row.registered_service_name === appliedName',
+  'alreadyApplied: true',
+  'SET registered_service_name = $3',
+  'row_version = row_version + 1',
+  "'operations.shopify_carrier_service.name_aligned'",
+  'registeredServiceName: appliedName',
+], 'exact idempotent applied-name finalizer')
+assert.doesNotMatch(
+  nameFinalizer,
+  /\b(?:fetch|createCarrierService|updateCarrierService|deleteCarrierService)\b/,
+  'applied-name finalization must remain local-only',
+)
+
+const configMutationFinalizer = persistenceSource.slice(
+  persistenceSource.indexOf(
+    'export async function finalizeShopifyCarrierServiceConfigMutationInPostgres',
+  ),
+  persistenceSource.indexOf(
+    'export async function readShopifyCarrierServiceMutationAuthorizationFromPostgres',
+  ),
+)
+includes(configMutationFinalizer, [
+  "if (row.operation === 'update')",
+  "'SHOPIFY_CARRIER_SERVICE_NAME_FINALIZER_REQUIRED'",
+  "row.operation === 'create'",
+  'registeredServiceName(row.simulation_mutation?.serviceName)',
+  "row.simulation_mutation.operation !== 'create'",
+  'row.simulation_mutation.serviceName',
+  '!== expectedRegisteredServiceName',
+  "row.operation === 'delete'",
+  'row.registered_service_name !== null',
+  'const targetRegisteredServiceName = row.operation === \'create\'',
+  'registered_service_name = $5',
+  'registeredServiceName: targetRegisteredServiceName',
+], 'create/delete applied-name derivation and clearing')
 
 includes(activeMigration, [
   'simulation_activation_revision integer',
@@ -506,6 +624,71 @@ assert.notEqual(
       'shopify-carrier-service-sandbox-provider-write-v1',
   }),
   'Create confirmation must not authorize delete',
+)
+assert.notEqual(
+  sandboxHash,
+  persistence.shopifyCarrierServiceMutationConfirmationHash({
+    accountGlobalId,
+    configGlobalId,
+    configRowVersion: 7,
+    operation: 'update',
+    environment: 'sandbox',
+    requestHash,
+    actorEmail,
+    statementVersion:
+      'shopify-carrier-service-sandbox-provider-write-v1',
+  }),
+  'Create confirmation must not authorize a name update',
+)
+assert.notEqual(
+  persistence.shopifyCarrierServiceMutationConfirmationHash({
+    accountGlobalId,
+    configGlobalId,
+    configRowVersion: 7,
+    operation: 'update',
+    environment: 'sandbox',
+    requestHash,
+    actorEmail,
+    statementVersion:
+      'shopify-carrier-service-sandbox-provider-write-v1',
+  }),
+  persistence.shopifyCarrierServiceMutationConfirmationHash({
+    accountGlobalId,
+    configGlobalId,
+    configRowVersion: 8,
+    operation: 'update',
+    environment: 'sandbox',
+    requestHash,
+    actorEmail,
+    statementVersion:
+      'shopify-carrier-service-sandbox-provider-write-v1',
+  }),
+  'Name-update confirmation must be fenced to the exact config row version',
+)
+assert.notEqual(
+  persistence.shopifyCarrierServiceMutationConfirmationHash({
+    accountGlobalId,
+    configGlobalId,
+    configRowVersion: 7,
+    operation: 'update',
+    environment: 'sandbox',
+    requestHash,
+    actorEmail,
+    statementVersion:
+      'shopify-carrier-service-sandbox-provider-write-v1',
+  }),
+  persistence.shopifyCarrierServiceMutationConfirmationHash({
+    accountGlobalId,
+    configGlobalId,
+    configRowVersion: 7,
+    operation: 'update',
+    environment: 'sandbox',
+    requestHash: 'b'.repeat(64),
+    actorEmail,
+    statementVersion:
+      'shopify-carrier-service-sandbox-provider-write-v1',
+  }),
+  'Name-update confirmation must be fenced to the exact simulated request hash',
 )
 
 const resolutionEvidenceHash = hash({

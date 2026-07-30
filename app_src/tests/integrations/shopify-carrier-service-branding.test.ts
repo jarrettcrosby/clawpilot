@@ -4,17 +4,35 @@ import test from 'node:test'
 import {
   buildShopifyStoreEntityRateResponse,
   normalizeShopifyStoreEntityName,
+  shopifyStoreEntityCarrierServiceName,
   shopifyStoreEntityRateDescription,
   shopifyStoreEntityRateName,
 } from '../../lib/integrations/shopifyCarrierServiceBranding.ts'
 
-test('uses the verified store entity ahead of the provider service', () => {
+test('uses the store entity, carrier, and normalized service at checkout', () => {
   assert.equal(
     shopifyStoreEntityRateName({
       storeEntityName: 'Pro Bakery Bites',
+      carrierCode: 'ups',
       providerServiceName: 'UPS Ground',
     }),
-    'Pro Bakery Bites · UPS Ground',
+    'Pro Bakery Bites · UPS · Ground',
+  )
+  assert.equal(
+    shopifyStoreEntityRateName({
+      storeEntityName: 'Pro Bakery Bites',
+      carrierCode: 'ups',
+      providerServiceName: 'UPS® Ground',
+    }),
+    'Pro Bakery Bites · UPS · Ground',
+  )
+  assert.equal(
+    shopifyStoreEntityRateName({
+      storeEntityName: 'Pro Bakery Bites',
+      carrierCode: 'fedex',
+      providerServiceName: 'FedEx Ground',
+    }),
+    'Pro Bakery Bites · FedEx · Ground',
   )
   assert.equal(
     shopifyStoreEntityRateDescription({
@@ -25,20 +43,20 @@ test('uses the verified store entity ahead of the provider service', () => {
   )
 })
 
-test('retains store, service, and test alias at the Shopify boundary', () => {
+test('retains store, carrier, and service at the Shopify boundary', () => {
   const providerServiceName = 'S'.repeat(160)
-  const shadowCustomerAlias = 'A'.repeat(80)
   const value = shopifyStoreEntityRateName({
     storeEntityName: 'Store '.repeat(42),
+    carrierCode: 'ups',
     providerServiceName,
-    shadowCustomerAlias,
   })
 
   assert.equal(value.length, 255)
   assert.match(value, /^Store/)
   assert.ok(value.endsWith(
-    ` · ${providerServiceName} · ${shadowCustomerAlias}`,
+    ` · UPS · ${providerServiceName}`,
   ))
+  assert.doesNotMatch(value, /Warehouse Warehouse/)
 })
 
 test('normalizes provider store whitespace and rejects missing identity', () => {
@@ -49,6 +67,17 @@ test('normalizes provider store whitespace and rejects missing identity', () => 
   assert.throws(
     () => normalizeShopifyStoreEntityName(''),
     /store entity name is missing or invalid/,
+  )
+})
+
+test('brands the registered CarrierService with the verified store entity', () => {
+  assert.equal(
+    shopifyStoreEntityCarrierServiceName('  Pro   Bakery Bites  '),
+    'Pro Bakery Bites',
+  )
+  assert.doesNotMatch(
+    shopifyStoreEntityCarrierServiceName('Pro Bakery Bites'),
+    /clawpilot|shopify/i,
   )
 })
 
@@ -90,8 +119,15 @@ test('canonicalizes initial and reloaded offer order to the same response', () =
   assert.deepEqual(
     initial.response.rates.map((rate) => rate.service_name),
     [
-      'Pro Bakery Bites · UPS Ground',
-      'Pro Bakery Bites · FedEx Ground',
+      'Pro Bakery Bites · UPS · Ground',
+      'Pro Bakery Bites · FedEx · Ground',
+    ],
+  )
+  assert.deepEqual(
+    initial.response.rates.map((rate) => rate.service_code),
+    [
+      'clawpilot:ups:ground',
+      'clawpilot:fedex:ground',
     ],
   )
   assert.equal(JSON.stringify(initial.response).includes('Warehouse'), false)
@@ -103,12 +139,11 @@ test('never splits a Unicode code point at the Shopify text limit', () => {
     '🐾'.repeat(255),
   )
   const value = shopifyStoreEntityRateName({
-    storeEntityName: `${'A'.repeat(241)}🐾`,
+    storeEntityName: `${'A'.repeat(238)}🐾`,
+    carrierCode: 'ups',
     providerServiceName: 'UPS Ground',
   })
 
-  assert.ok(value.length <= 255)
-  assert.ok(value.endsWith(' · UPS Ground'))
-  assert.equal(value.includes('\ud83d'), false)
-  assert.equal(value.includes('\udc3e'), false)
+  assert.equal(value.length, 255)
+  assert.ok(value.endsWith('🐾 · UPS · Ground'))
 })

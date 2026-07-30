@@ -1,11 +1,10 @@
 // Node's focused strip-types tests need the explicit extension.
 // @ts-expect-error TypeScript extension imports are intentional for Node tests.
-import { buildShopifyCarrierServiceRateResponse, stableShopifyCarrierServiceCode, type ShopifyCarrierServiceRateResponse } from './shopifyCarrierServiceProtocol.ts'
+import { buildShopifyCarrierServiceRateResponse, type ShopifyCarrierServiceRateResponse } from './shopifyCarrierServiceProtocol.ts'
 
 const SHOPIFY_RATE_TEXT_LIMIT = 255
 const SHOPIFY_STORE_ENTITY_LIMIT = 255
 const SHOPIFY_PROVIDER_SERVICE_LIMIT = 160
-const SHOPIFY_SHADOW_ALIAS_LIMIT = 80
 const RATE_NAME_SEPARATOR = ' · '
 
 export type ShopifyStoreEntityRateOffer = {
@@ -16,6 +15,22 @@ export type ShopifyStoreEntityRateOffer = {
   currency: string
   minDeliveryDate: string | null
   maxDeliveryDate: string | null
+}
+
+const SHOPIFY_CARRIER_DISPLAY_NAMES: Record<
+  ShopifyStoreEntityRateOffer['carrierCode'],
+  string
+> = {
+  ups: 'UPS',
+  fedex: 'FedEx',
+}
+
+const SHOPIFY_PROVIDER_PREFIX_PATTERNS: Record<
+  ShopifyStoreEntityRateOffer['carrierCode'],
+  RegExp
+> = {
+  ups: /^UPS(?:®)?(?=\s|$)/iu,
+  fedex: /^FedEx(?=\s|$)/iu,
 }
 
 function exceedsCodePointLimit(value: string, maximum: number) {
@@ -58,6 +73,16 @@ export function normalizeShopifyStoreEntityName(value: unknown) {
   )
 }
 
+/**
+ * Shopify renders the CarrierService resource name in merchant shipping
+ * settings and can expose it to customers. Keep that provider-owned resource
+ * branded by the verified store entity; ClawPilot remains an internal adapter
+ * identity and must not leak into the merchant-facing label.
+ */
+export function shopifyStoreEntityCarrierServiceName(value: unknown) {
+  return normalizeShopifyStoreEntityName(value)
+}
+
 function sliceWithoutSplittingCodePoint(value: string, codeUnitBudget: number) {
   let result = ''
   for (const codePoint of value) {
@@ -67,35 +92,41 @@ function sliceWithoutSplittingCodePoint(value: string, codeUnitBudget: number) {
   return result
 }
 
-export function shopifyStoreEntityRateName(input: {
-  storeEntityName: unknown
+function normalizeProviderServiceName(input: {
+  carrierCode: ShopifyStoreEntityRateOffer['carrierCode']
   providerServiceName: unknown
-  shadowCustomerAlias?: unknown
 }) {
-  const storeEntityName = normalizeShopifyStoreEntityName(
-    input.storeEntityName,
-  )
   const providerServiceName = normalizedComponent(
     input.providerServiceName,
     'Provider service name',
     SHOPIFY_PROVIDER_SERVICE_LIMIT,
   )
-  const shadowCustomerAlias = input.shadowCustomerAlias === undefined
-    || input.shadowCustomerAlias === null
-    ? null
-    : normalizedComponent(
-        input.shadowCustomerAlias,
-        'Shadow customer alias',
-        SHOPIFY_SHADOW_ALIAS_LIMIT,
-      )
-  const retainedSuffix = shadowCustomerAlias
-    ? (
-        RATE_NAME_SEPARATOR
-        + providerServiceName
-        + RATE_NAME_SEPARATOR
-        + shadowCustomerAlias
-      )
-    : RATE_NAME_SEPARATOR + providerServiceName
+  const serviceName = providerServiceName
+    .replace(SHOPIFY_PROVIDER_PREFIX_PATTERNS[input.carrierCode], '')
+    .trim()
+  return normalizedComponent(
+    serviceName,
+    'Provider service name',
+    SHOPIFY_PROVIDER_SERVICE_LIMIT,
+  )
+}
+
+export function shopifyStoreEntityRateName(input: {
+  storeEntityName: unknown
+  carrierCode: ShopifyStoreEntityRateOffer['carrierCode']
+  providerServiceName: unknown
+}) {
+  const storeEntityName = normalizeShopifyStoreEntityName(
+    input.storeEntityName,
+  )
+  const carrierDisplayName = SHOPIFY_CARRIER_DISPLAY_NAMES[input.carrierCode]
+  const providerServiceName = normalizeProviderServiceName(input)
+  const retainedSuffix = (
+    RATE_NAME_SEPARATOR
+    + carrierDisplayName
+    + RATE_NAME_SEPARATOR
+    + providerServiceName
+  )
   const storeBudget = SHOPIFY_RATE_TEXT_LIMIT - retainedSuffix.length
   if (storeBudget < 1) {
     throw new Error('Shopify rate name cannot retain every required component')
@@ -140,7 +171,6 @@ export function buildShopifyStoreEntityRateResponse(input: {
   offers: readonly ShopifyStoreEntityRateOffer[]
 }): {
   response: ShopifyCarrierServiceRateResponse
-  providerServiceNameByCode: ReadonlyMap<string, string>
 } {
   const storeEntityName = normalizeShopifyStoreEntityName(
     input.storeEntityName,
@@ -156,6 +186,7 @@ export function buildShopifyStoreEntityRateResponse(input: {
       serviceLevelCode: offer.serviceLevelCode,
       serviceName: shopifyStoreEntityRateName({
         storeEntityName,
+        carrierCode: offer.carrierCode,
         providerServiceName: offer.providerServiceName,
       }),
       description: shopifyStoreEntityRateDescription({
@@ -168,14 +199,5 @@ export function buildShopifyStoreEntityRateResponse(input: {
       maxDeliveryDate: offer.maxDeliveryDate,
     })),
   )
-  return {
-    response,
-    providerServiceNameByCode: new Map(sorted.map((offer) => [
-      stableShopifyCarrierServiceCode(
-        offer.carrierCode,
-        offer.serviceLevelCode,
-      ),
-      offer.providerServiceName,
-    ])),
-  }
+  return { response }
 }

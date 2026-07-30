@@ -275,6 +275,7 @@ for (const requiredPath of [
   'db/migrations/0163_shopify_variant_catalog_refresh_recovery.sql',
   'db/migrations/0164_shopify_checkout_offer_parcel_evidence.sql',
   'db/migrations/0165_shopify_store_entity_readiness.sql',
+  'db/migrations/0166_shopify_carrier_service_name_alignment.sql',
   'app_src/app/api/crm/products/[productId]/images/route.ts',
   'app_src/app/api/crm/products/[productId]/images/[assetId]/route.ts',
   'app_src/app/api/crm/products/[productId]/shopify-product-image/route.ts',

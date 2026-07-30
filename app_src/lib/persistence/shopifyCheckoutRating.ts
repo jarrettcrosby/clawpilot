@@ -88,6 +88,8 @@ export type ShopifyCarrierServiceConfig = {
   warehouseId: string
   warehouseGlobalId: string
   warehouseName: string
+  checkoutBrandNameOverride: string | null
+  registeredServiceName: string | null
   serviceGid: string | null
   registrationState: ShopifyCarrierServiceRegistrationState
   credentialGeneration: number
@@ -503,6 +505,8 @@ type ConfigRow = QueryResultRow & {
   warehouse_id: string
   warehouse_global_id: string
   warehouse_name: string
+  checkout_brand_name_override: string | null
+  registered_service_name: string | null
   service_gid: string | null
   registration_state: ShopifyCarrierServiceRegistrationState
   credential_generation: number
@@ -1393,6 +1397,8 @@ const CONFIG_SELECT = `SELECT
     config.warehouse_id::text,
     warehouse.global_id AS warehouse_global_id,
     warehouse.name AS warehouse_name,
+    config.checkout_brand_name_override,
+    config.registered_service_name,
     config.service_gid,
     config.registration_state,
     config.credential_generation,
@@ -1407,8 +1413,33 @@ const CONFIG_SELECT = `SELECT
     config.algorithm_version,
     config.last_error_code,
     config.row_version::text,
-    operations_shopify_carrier_service_config_is_ready(
-      config.organization_id, config.id
+    (
+      operations_shopify_carrier_service_config_is_ready(
+        config.organization_id, config.id
+      )
+      AND (
+        config.registration_state = 'shadow_simulated'
+        OR (
+          config.registration_state = 'registered'
+          AND config.registered_service_name IS NOT DISTINCT FROM
+            COALESCE(
+              NULLIF(
+                regexp_replace(
+                  btrim(config.checkout_brand_name_override),
+                  '[[:space:]]+', ' ', 'g'
+                ),
+                ''
+              ),
+              NULLIF(
+                regexp_replace(
+                  btrim(account.configuration ->> 'accountName'),
+                  '[[:space:]]+', ' ', 'g'
+                ),
+                ''
+              )
+            )
+        )
+      )
     ) AS ready,
     config.created_at,
     config.updated_at
@@ -1534,6 +1565,8 @@ async function readConfigWithClient(
     warehouseId: row.warehouse_id,
     warehouseGlobalId: row.warehouse_global_id,
     warehouseName: row.warehouse_name,
+    checkoutBrandNameOverride: row.checkout_brand_name_override,
+    registeredServiceName: row.registered_service_name,
     serviceGid: row.service_gid,
     registrationState: row.registration_state,
     credentialGeneration: row.credential_generation,
@@ -1572,6 +1605,201 @@ export async function readShopifyCarrierServiceConfigFromPostgres(input: {
       ACCOUNT_GLOBAL_ID,
       'Shopify account Global ID',
     ),
+  })
+}
+
+function checkoutBrandNameOverride(value: unknown) {
+  if (value === null || value === undefined || String(value).trim() === '') {
+    return null
+  }
+  const normalized = String(value)
+    .normalize('NFKC')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (
+    normalized.length < 1
+    || normalized.length > 120
+    || /[\u0000-\u001f\u007f]/.test(normalized)
+  ) {
+    fail(
+      'SHOPIFY_CHECKOUT_BRAND_NAME_INVALID',
+      'Customer-facing store name must be 1-120 characters',
+    )
+  }
+  return normalized
+}
+
+export async function updateShopifyCarrierServiceBrandNameOverrideInPostgres(
+  rawInput: {
+    organizationId: string
+    accountGlobalId: string
+    expectedRowVersion: number
+    checkoutBrandNameOverride?: string | null
+    actorEmail: string
+  },
+) {
+  const input = {
+    organizationId: matchValue(
+      rawInput.organizationId,
+      UUID,
+      'Organization ID',
+    ),
+    accountGlobalId: matchValue(
+      rawInput.accountGlobalId,
+      ACCOUNT_GLOBAL_ID,
+      'Shopify account Global ID',
+    ),
+    expectedRowVersion: integer(
+      rawInput.expectedRowVersion,
+      'Configuration row version',
+      0,
+      Number.MAX_SAFE_INTEGER,
+    ),
+    checkoutBrandNameOverride: checkoutBrandNameOverride(
+      rawInput.checkoutBrandNameOverride,
+    ),
+    actorEmail: textValue(rawInput.actorEmail, 'Actor email', 320),
+  }
+  return withTransaction(async (client) => {
+    const identity = await client.query<{ id: string }>(
+      `SELECT config.id::text
+       FROM operations_shopify_carrier_service_configs config
+       JOIN operations_integration_accounts account
+         ON account.organization_id = config.organization_id
+        AND account.id = config.integration_account_id
+       WHERE config.organization_id = $1::uuid
+         AND account.global_id = $2`,
+      [input.organizationId, input.accountGlobalId],
+    )
+    if (!identity.rows[0]) {
+      fail(
+        'SHOPIFY_CHECKOUT_CONFIG_NOT_FOUND',
+        'CarrierService configuration was not found',
+        404,
+      )
+    }
+    await acquireTransactionAdvisoryLock(
+      client,
+      `shopify-carrier-service-authorization:${input.organizationId}:${
+        identity.rows[0].id
+      }`,
+    )
+    await acquireTransactionAdvisoryLock(
+      client,
+      `shopify-carrier-service-config:${input.organizationId}:${input.accountGlobalId}`,
+    )
+    const current = await readConfigWithClient(client, input)
+    if (!current) {
+      fail(
+        'SHOPIFY_CHECKOUT_CONFIG_NOT_FOUND',
+        'CarrierService configuration was not found',
+        404,
+      )
+    }
+    if (current.rowVersion !== input.expectedRowVersion) {
+      fail(
+        'SHOPIFY_CHECKOUT_CONFIG_VERSION_CONFLICT',
+        'CarrierService configuration changed. Refresh and try again.',
+        409,
+      )
+    }
+    if (
+      current.checkoutBrandNameOverride
+      === input.checkoutBrandNameOverride
+    ) {
+      return current
+    }
+    const unsafeAuthorization = await client.query<{ global_id: string }>(
+      `SELECT authorized_mutation.global_id
+       FROM operations_shopify_carrier_service_mutation_authorizations
+         authorized_mutation
+       LEFT JOIN operations_shopify_carrier_service_mutation_attempts attempt
+         ON attempt.organization_id = authorized_mutation.organization_id
+        AND attempt.authorization_id = authorized_mutation.id
+       LEFT JOIN operations_shopify_carrier_service_mutation_outcomes outcome
+         ON outcome.organization_id = attempt.organization_id
+        AND outcome.attempt_id = attempt.id
+       LEFT JOIN operations_shopify_carrier_service_mutation_resolutions
+         resolution
+         ON resolution.organization_id = attempt.organization_id
+        AND resolution.attempt_id = attempt.id
+       WHERE authorized_mutation.organization_id = $1::uuid
+         AND authorized_mutation.config_id = $2::uuid
+         AND authorized_mutation.config_row_version = $3::bigint
+         AND (
+           (
+             outcome.outcome = 'failed'
+             AND outcome.provider_write_count = 0
+           )
+           OR resolution.disposition = 'confirmed_not_applied'
+           OR (
+             attempt.id IS NULL
+             AND authorized_mutation.expires_at <= now()
+           )
+         ) IS NOT TRUE
+       LIMIT 1`,
+      [input.organizationId, current.id, current.rowVersion],
+    )
+    if (unsafeAuthorization.rows[0]) {
+      fail(
+        'SHOPIFY_CHECKOUT_BRAND_NAME_AUTHORIZATION_ACTIVE',
+        'Resolve the current CarrierService provider authorization before changing its customer-facing name',
+        409,
+      )
+    }
+    const updated = await client.query<{
+      global_id: string
+      row_version: string
+    }>(
+      `UPDATE operations_shopify_carrier_service_configs
+       SET checkout_brand_name_override = $3,
+           row_version = row_version + 1,
+           updated_by = $4,
+           updated_at = now()
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid
+         AND row_version = $5
+       RETURNING global_id, row_version::text`,
+      [
+        input.organizationId,
+        current.id,
+        input.checkoutBrandNameOverride,
+        input.actorEmail,
+        input.expectedRowVersion,
+      ],
+    )
+    if (!updated.rows[0]) {
+      fail(
+        'SHOPIFY_CHECKOUT_CONFIG_VERSION_CONFLICT',
+        'CarrierService configuration changed. Refresh and try again.',
+        409,
+      )
+    }
+    await recordAuditEvent({
+      actor: input.actorEmail,
+      eventType: 'operations.shopify_carrier_service.brand_name_changed',
+      aggregateType: 'operations.shopify_carrier_service_config',
+      aggregateId: updated.rows[0].global_id,
+      subject: input.accountGlobalId,
+      organizationId: input.organizationId,
+      eventKey:
+        `operations:shopify-carrier-service:${
+          updated.rows[0].global_id
+        }:brand-name-version:${updated.rows[0].row_version}`,
+      payload: {
+        accountGlobalId: input.accountGlobalId,
+        priorOverride: current.checkoutBrandNameOverride,
+        newOverride: input.checkoutBrandNameOverride,
+        overrideConfigured:
+          input.checkoutBrandNameOverride !== null,
+        effectiveNameSource:
+          input.checkoutBrandNameOverride === null
+            ? 'provider_verified_shop_name'
+            : 'administrator_override',
+        rowVersion: Number(updated.rows[0].row_version),
+      },
+    }, client)
+    return readConfigWithClient(client, input)
   })
 }
 
@@ -1716,6 +1944,7 @@ export async function upsertShopifyCarrierServiceConfigInPostgres(
            SET warehouse_id = $3::uuid,
                registration_state = 'unconfigured',
                service_gid = NULL,
+               registered_service_name = NULL,
                credential_generation = $4,
                activation_revision = $5,
                callback_token_version = $6,
@@ -2110,6 +2339,7 @@ export async function finalizeShopifyCarrierServiceRegistrationInPostgres(
       `UPDATE operations_shopify_carrier_service_configs
        SET registration_state = $3,
            service_gid = $4,
+           registered_service_name = NULL,
            last_error_code = $5,
            activation_revision = $6,
            row_version = row_version + 1,
@@ -2185,10 +2415,26 @@ export async function lookupShopifyCheckoutRatingAccountByGlobalIdInPostgres(
        config.organization_id::text,
        config.integration_account_id::text,
        account.global_id AS account_global_id,
-       NULLIF(
-         btrim(account.configuration ->> 'accountName'),
-         ''
-       ) AS store_entity_name,
+       CASE
+         WHEN config.registration_state = 'registered'
+           THEN config.registered_service_name
+         ELSE COALESCE(
+           NULLIF(
+             regexp_replace(
+               btrim(config.checkout_brand_name_override),
+               '[[:space:]]+', ' ', 'g'
+             ),
+             ''
+           ),
+           NULLIF(
+             regexp_replace(
+               btrim(account.configuration ->> 'accountName'),
+               '[[:space:]]+', ' ', 'g'
+             ),
+             ''
+           )
+         )
+       END AS store_entity_name,
        account.environment,
        account.external_account_id,
        config.registration_state,
@@ -2224,12 +2470,43 @@ export async function lookupShopifyCheckoutRatingAccountByGlobalIdInPostgres(
      WHERE account.global_id = $1
        AND config.callback_token_hash = $2
        AND account.environment = 'sandbox'
-       AND NULLIF(
-         btrim(account.configuration ->> 'accountName'),
-         ''
+       AND COALESCE(
+         NULLIF(
+           regexp_replace(
+             btrim(config.checkout_brand_name_override),
+             '[[:space:]]+', ' ', 'g'
+           ),
+           ''
+         ),
+         NULLIF(
+           regexp_replace(
+             btrim(account.configuration ->> 'accountName'),
+             '[[:space:]]+', ' ', 'g'
+           ),
+           ''
+         )
        ) IS NOT NULL
        AND (
-         config.registration_state = 'registered'
+         (
+           config.registration_state = 'registered'
+           AND config.registered_service_name IS NOT DISTINCT FROM
+             COALESCE(
+               NULLIF(
+                 regexp_replace(
+                   btrim(config.checkout_brand_name_override),
+                   '[[:space:]]+', ' ', 'g'
+                 ),
+                 ''
+               ),
+               NULLIF(
+                 regexp_replace(
+                   btrim(account.configuration ->> 'accountName'),
+                   '[[:space:]]+', ' ', 'g'
+                 ),
+                 ''
+               )
+             )
+         )
          OR (
            $3::boolean = true
            AND config.registration_state = 'shadow_simulated'

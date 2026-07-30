@@ -43,7 +43,6 @@ import {
 import {
   buildShopifyStoreEntityRateResponse,
   normalizeShopifyStoreEntityName,
-  shopifyStoreEntityRateName,
   type ShopifyStoreEntityRateOffer,
 } from '@/lib/integrations/shopifyCarrierServiceBranding'
 
@@ -356,8 +355,6 @@ function stableShippableLines(
 
 type TypedReceiptResponse = {
   response: ShopifyCarrierServiceRateResponse
-  storeEntityName: string
-  providerServiceNameByCode: ReadonlyMap<string, string>
 }
 
 function responseFromTypedReceipt(
@@ -512,8 +509,6 @@ function responseFromTypedReceipt(
   }
   return {
     response: resultSnapshot.response as ShopifyCarrierServiceRateResponse,
-    storeEntityName,
-    providerServiceNameByCode: rebuilt.providerServiceNameByCode,
   }
 }
 
@@ -521,38 +516,41 @@ function resultFromTypedReceipt(
   account: ShopifyCheckoutRatingAccount,
   context: ShopifyCheckoutContextResult,
   receipt: ShopifyCheckoutRateReceipt | null,
-  shadowCustomerLabel: string | null = null,
 ): CallbackResult {
   const replay = responseFromTypedReceipt(account, context, receipt)
-  const liveResponse = (
-    replay
-    && account.environment === 'sandbox'
-    && account.activationState === 'shadow'
-    && shadowCustomerLabel
-  )
-    ? {
-        rates: replay.response.rates.map((rate) => {
-          const providerServiceName =
-            replay.providerServiceNameByCode.get(rate.service_code)
-          if (!providerServiceName) {
-            throw new Error(
-              'Shopify checkout service name evidence is incomplete',
-            )
-          }
-          return {
-            ...rate,
-            service_name: shopifyStoreEntityRateName({
-              storeEntityName: replay.storeEntityName,
-              providerServiceName,
-              shadowCustomerAlias: shadowCustomerLabel,
-            }),
-          }
-        }),
-      }
-    : replay?.response
   return receipt?.status === 'succeeded' && replay
-    ? authenticatedResult(liveResponse!, 200)
+    ? authenticatedResult(replay.response, 200)
     : authenticatedResult(EMPTY_RATE_RESPONSE, 503)
+}
+
+function checkoutFailureStage(
+  error: unknown,
+  claimed: boolean,
+) {
+  const message = error instanceof Error ? error.message : ''
+  if (
+    !claimed
+    && message === 'Shopify callback origin does not match the warehouse'
+  ) {
+    return 'warehouse_origin'
+  }
+  if (!claimed && message.includes('checkout context')) {
+    return 'checkout_context'
+  }
+  return claimed ? 'post_claim' : 'pre_claim'
+}
+
+function recordCheckoutFailure(input: {
+  accountGlobalId: string
+  error: unknown
+  claimed: boolean
+}) {
+  console.warn('[shopify checkout rating] callback failed', {
+    accountGlobalId: input.accountGlobalId,
+    stage: checkoutFailureStage(input.error, input.claimed),
+    reasonCode: errorCode(input.error),
+    receiptClaimed: input.claimed,
+  })
 }
 
 function deliveryTimestamp(value: string | null) {
@@ -767,7 +765,6 @@ export async function executeShopifyCarrierServiceCallback(input: {
         account,
         context,
         cached,
-        shadowGuard.customerLabel,
       )
     }
     requireCallbackTime(
@@ -844,7 +841,6 @@ export async function executeShopifyCarrierServiceCallback(input: {
         account,
         context,
         completed,
-        shadowGuard.customerLabel,
       )
     }
     if (claim.kind !== 'claimed') {
@@ -852,7 +848,6 @@ export async function executeShopifyCarrierServiceCallback(input: {
         account,
         context,
         claim.receipt,
-        shadowGuard.customerLabel,
       )
     }
     claimed = {
@@ -1114,9 +1109,13 @@ export async function executeShopifyCarrierServiceCallback(input: {
       account,
       context,
       completed,
-      shadowGuard.customerLabel,
     )
     } catch (error) {
+      recordCheckoutFailure({
+        accountGlobalId: account.accountGlobalId,
+        error,
+        claimed: Boolean(claimed),
+      })
       if (claimed && Date.now() < failurePersistenceDeadlineAt) {
         await failClaim(
           claimed,

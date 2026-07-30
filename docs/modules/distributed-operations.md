@@ -15,7 +15,7 @@ app_visible: false
 
 Provide native distributed order management, warehouse execution, carrier shipping, and 3PL billing inside ClawPilot. The module serves 3PL operators, retailers, distributors, manufacturers, and fulfillment operators without creating a second application or duplicating CRM, product, identity, audit, task, document, notification, or accounting masters.
 
-This document remains the **target contract** for the full module. The current development slice includes operations migrations `0081` through `0094`, `0097` through `0101`, and `0107` through `0165`; a tenant-scoped order workbench; explicit idempotent warehouse-release, bulk all-ready pick-confirmation, pack-verification, sandbox-label-create, and sandbox-label-void commands for eligible non-archived orders; a durable exception queue; scoped activation controls; canonical CRM catalog projection; provider-customer resolution; team-managed product/package imports; warehouse-scoped Packaging Materials management; versioned Product each/case profiles and separately evidenced exact-case and loose-each recipes; retained Shopify/Faire channel taxonomy; immutable CRM Product image assets; an exact resource-scoped Shadow Shopify image-publish command; organization-scoped direct carrier credential administration; UPS and FedEx sandbox rating with an account-derived origin and editable test destination; a separate rate-selected diagnostic label-create with customer-selected provider-native output, stored-label download/print, and void workflow; immutable provider-source bytes plus an explicit derivative-artifact provenance boundary; append-only redacted provider evidence; carrier-rate delegation; direct multi-account carrier CSV import; selected-batch GL Coding; separate financial review; billed-actual Triangle/Square/Circle settlement evidence; append-only settlement status transitions; capability-aware printer configuration; enrolled local print-agent delivery with controlled reprints, same-warehouse fallback, and agent-declared format/media/document capabilities; shipment- and exact-package-specific PDF packing-list renderers, immutable artifact-payload store, authenticated artifact stream, tracking-observation schema, and commerce-fulfillment export state model; a Shopify/Faire sales-channel control plane; a bounded development-only Shopify held-order preview; leased development-only full-product-catalog reconciliation and current-order staging workers; guarded development-only product-catalog mapping and operational-order workflows with durable pre-call read intents, resource-scoped encrypted continuations, first-class rejection dispositions, and canonical promotion; a bounded, manager-triggered, read-only Shopify inventory reconciliation for one eligible location and warehouse; a strict development-only Shopify cartonization preview; a recipe-first, assumption-watermarked sandbox package-and-rate evidence workflow; an executable development-only two-pass pack-and-rate replay workbench; and active-workspace measurement-presentation and product-currency defaults. The deterministic mock flow remains an internal automated-test harness only. Hosted mock generation is disabled and historical mock artifacts are archived. These features prove PostgreSQL authority and application boundaries; they do not establish historical closed-order commerce import, continuous or production provider inventory synchronization, production commerce workers, production carrier mutation, tracking ingestion, commerce-export dispatch, pickup scheduling, accounting export, invoice/AR workflow, payment adapters, or production fulfillment-optimizer activation.
+This document remains the **target contract** for the full module. The current development slice includes operations migrations `0081` through `0094`, `0097` through `0101`, and `0107` through `0166`; a tenant-scoped order workbench; explicit idempotent warehouse-release, bulk all-ready pick-confirmation, pack-verification, sandbox-label-create, and sandbox-label-void commands for eligible non-archived orders; a durable exception queue; scoped activation controls; canonical CRM catalog projection; provider-customer resolution; team-managed product/package imports; warehouse-scoped Packaging Materials management; versioned Product each/case profiles and separately evidenced exact-case and loose-each recipes; retained Shopify/Faire channel taxonomy; immutable CRM Product image assets; an exact resource-scoped Shadow Shopify image-publish command; organization-scoped direct carrier credential administration; UPS and FedEx sandbox rating with an account-derived origin and editable test destination; a separate rate-selected diagnostic label-create with customer-selected provider-native output, stored-label download/print, and void workflow; immutable provider-source bytes plus an explicit derivative-artifact provenance boundary; append-only redacted provider evidence; carrier-rate delegation; direct multi-account carrier CSV import; selected-batch GL Coding; separate financial review; billed-actual Triangle/Square/Circle settlement evidence; append-only settlement status transitions; capability-aware printer configuration; enrolled local print-agent delivery with controlled reprints, same-warehouse fallback, and agent-declared format/media/document capabilities; shipment- and exact-package-specific PDF packing-list renderers, immutable artifact-payload store, authenticated artifact stream, tracking-observation schema, and commerce-fulfillment export state model; a Shopify/Faire sales-channel control plane; a bounded development-only Shopify held-order preview; leased development-only full-product-catalog reconciliation and current-order staging workers; guarded development-only product-catalog mapping and operational-order workflows with durable pre-call read intents, resource-scoped encrypted continuations, first-class rejection dispositions, and canonical promotion; a bounded, manager-triggered, read-only Shopify inventory reconciliation for one eligible location and warehouse; a strict development-only Shopify cartonization preview; a recipe-first, assumption-watermarked sandbox package-and-rate evidence workflow; an executable development-only two-pass pack-and-rate replay workbench; and active-workspace measurement-presentation and product-currency defaults. The deterministic mock flow remains an internal automated-test harness only. Hosted mock generation is disabled and historical mock artifacts are archived. These features prove PostgreSQL authority and application boundaries; they do not establish historical closed-order commerce import, continuous or production provider inventory synchronization, production commerce workers, production carrier mutation, tracking ingestion, commerce-export dispatch, pickup scheduling, accounting export, invoice/AR workflow, payment adapters, or production fulfillment-optimizer activation.
 
 Migrations `0128` through `0145` extend this slice with the pack hierarchy,
 CRM CSV transfer evidence, durable sales-channel lifecycle and offer
@@ -66,6 +66,38 @@ predicate recalculated from the current verified credential generation,
 configuration revision, Shadow activation revision, warehouse, packaging
 stock, and carrier facts; it never depends on the signed-receipt queue/hold
 switch.
+
+Migration `0166` extends that same single-consumption authority to the
+customer-facing CarrierService name. Before a name preference is saved, a
+create or update is simulated, or its exact provider mutation is authorized,
+ClawPilot performs a read-only Shopify identity refresh. The server-derived
+desired name defaults to the normalized `shop.name` returned by that refresh.
+After checkout-rating configuration exists, an owner or authorized
+administrator may save a separately audited optional override before the
+initial registration or later alignment. The override is not
+provider-verified identity; clearing it restores the refreshed provider
+default, and changing it advances the configuration revision.
+
+The desired name and provider-confirmed applied name are separate facts. Every
+create and name-update Shadow simulation is bound to the exact mutation
+request hash, configuration row, activation revision, and credential
+generation. Initial registration creates the CarrierService with the exact
+desired name and stores Shopify's confirmed result as
+`registered_service_name`. A later alignment may update only the `name` of the
+exact existing CarrierService GID in place. The callback URL, active state,
+service-discovery state, CarrierService identity, and Shopify
+shipping-profile assignments remain unchanged. A successful update requires
+Shopify to return the same GID and exact desired name before
+`registered_service_name` advances. An uncertain update is reconciled by
+reading that exact GID; only an exact name match confirms application, while
+any mismatch remains inconclusive and is never blindly retried.
+
+A registered CarrierService is callback-ready only when its
+provider-confirmed `registered_service_name` exactly matches the currently
+derived desired name. Changing or clearing an override, or refreshing a
+changed Shopify `shop.name`, therefore fails closed until the exact in-place
+alignment succeeds or is confirmed applied. Checkout never advertises a
+desired name that Shopify has not confirmed on the registered resource.
 
 The setup projection evaluates mutation recovery only against the current
 CarrierService configuration row version. A succeeded or confirmed-applied
@@ -320,14 +352,18 @@ amount, currency, response-rate hash, and stable Shopify service code. The
 repair does not trust diagnostic result JSON, loosen quote-to-order
 reconciliation, broaden the Shadow customer/Product gate, or activate a
 production checkout path.
-Migration `0165` makes the provider-verified Shopify store entity name part of
-the same canonical CarrierService readiness predicate used by setup,
-registration, checkout mapping, and the public callback. A missing, blank,
-oversized, or control-character entity fails closed. Neither the Shopify
-platform name nor an editable connection label or external identifier can
-substitute for the provider store entity. The provider probe applies the same
-NFKC and whitespace normalization before persistence and the 255-code-unit
-bound that callback branding applies before responding.
+Migration `0165` makes the provider-verified Shopify store entity name the
+default identity input to the same canonical CarrierService readiness
+predicate used by setup, registration, checkout mapping, and the public
+callback. A missing, blank, oversized, or control-character entity fails
+closed. Neither the Shopify platform label, editable connection label, nor
+external identifier can substitute for Shopify's read-only `shop.name`
+result. The provider probe applies the same NFKC and whitespace normalization
+before persistence and the 255-code-unit bound that callback branding applies
+before responding. Migration `0166` then requires a registered configuration
+to retain provider-confirmed `registered_service_name` evidence equal to the
+current desired name, whether that desired name comes from refreshed
+`shop.name` or an audited owner/administrator override.
 An exact-case recipe and a loose-each max-capacity recipe are independent
 evidence. For the 6 oz test path, an operator may retain exact 12 as the case
 path and separately activate a customer-confirmed 1-through-12 loose-pick
@@ -657,18 +693,25 @@ configured customer ID and requires every shippable line to use an explicitly
 configured Test Product variant. Missing configuration, a missing or different
 customer ID, or any other shippable variant returns authenticated HTTP 200
 with no rates before request fingerprinting, context reads, receipt
-persistence, cartonization, or carrier calls. A server-configured test alias
-may decorate only the ephemeral Shadow `service_name` as
-`<store entity> · <service> · <alias>` for operator proof. Every callback
-response uses the persisted provider-verified store entity name rather than
-the ClawPilot or Shopify platform name or an editable connection label. The
-callback is not rate-ready without that provider-verified store entity. The
-entity name and exact customer-neutral branded response are immutable receipt
-evidence and cached duplicates replay that evidence rather than rebuilding a
-name from current connection data. Component-aware truncation must retain a
-nonempty entity, carrier service, and (when present) Shadow test alias. The
-optional alias remains restricted to the isolated Shadow test customer. The
-stable `service_code` and durable response remain customer-neutral.
+persistence, cartonization, or carrier calls. A server-configured test label
+is an allowlist-readiness and audit fact only; it never alters the returned
+rate name. Every callback response uses
+`<store entity> · <carrier> · <service>` from the provider-confirmed
+`registered_service_name` and normalized carrier response rather than the
+ClawPilot or Shopify platform name, a customer alias, or an editable
+connection label. A registered callback is not rate-ready when that applied
+name is missing or differs from the current desired name derived from
+refreshed Shopify `shop.name` or the audited override. The applied entity name
+and exact customer-neutral branded response are immutable receipt evidence,
+and cached duplicates replay that evidence rather than rebuilding a name from
+current connection data. Component-aware truncation must retain a nonempty
+entity, explicit carrier name, and service name. Carrier-prefix normalization
+prevents values such as `UPS · UPS Ground`; the canonical form is
+`Pro Bakery Bites · UPS · Ground` (and equivalently for FedEx). The stable
+`service_code` and durable response remain customer-neutral. Failures before
+receipt claim emit only a structured stage and safe reason code with the
+account Global ID; callback tokens, request bodies, addresses, and customer
+facts are never logged.
 Shopify's successful CarrierService cache does not include customer identity.
 Therefore callback gating is necessary but not the sole strict-isolation
 control: the Test Product must remain in a dedicated test-only shipping
@@ -699,8 +742,8 @@ boundary each provider actually documents. Operations `shadow` may perform
 real provider reads, local planning and rating, persistence, variance
 analysis, print preparation, and immutable outbound-intent simulation, but it
 remains ineligible for provider mutation without a narrowly reviewed,
-single-use resource grant. CarrierService create or exact delete is executable
-only after the reviewed Shadow simulation is bound to the current
+single-use resource grant. CarrierService create, name-only update, or exact
+delete is executable only after the reviewed Shadow simulation is bound to the current
 revision-fenced Shadow state and a short-lived exact-operation grant is
 consumed. Global Operations remains `shadow`; broad provider scopes alone
 never make a write executable.

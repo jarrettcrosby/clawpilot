@@ -13,6 +13,7 @@ import InputLabel from '@mui/material/InputLabel'
 import MenuItem from '@mui/material/MenuItem'
 import Select from '@mui/material/Select'
 import Stack from '@mui/material/Stack'
+import TextField from '@mui/material/TextField'
 import Typography from '@mui/material/Typography'
 import IntegrationSetupJourney, {
   type IntegrationSetupStep,
@@ -62,6 +63,8 @@ type ShopifyCarrierServiceSetup = {
     callbackTokenVersion: number
     rowVersion: number
     ready: boolean
+    checkoutBrandNameOverride: string | null
+    registeredServiceName: string | null
     warehouseGlobalId: string
     materials: Array<{
       materialGlobalId: string
@@ -80,10 +83,34 @@ type ShopifyCarrierServiceSetup = {
     requestHash: string
     completedAt: string | null
   } | null
+  nameAlignment: {
+    serviceGid: string
+    desiredName: string
+    appliedName: string | null
+    aligned: boolean
+    simulation: {
+      globalId: string
+      operation: 'update'
+      activationRevision: number
+      configRowVersion: number
+      requestHash: string
+      completedAt: string | null
+    } | null
+  } | null
+  namePreference: {
+    providerStoreEntityName: string
+    overrideName: string | null
+    effectiveName: string
+    providerVerifiedAt: string | null
+    source:
+      | 'administrator_override'
+      | 'provider_verified_shop_name'
+  }
   mutationAuthorizations: Array<{
     globalId: string
     configRowVersion: number
-    operation: 'create' | 'delete'
+    operation: 'create' | 'update' | 'delete'
+    requestHash: string
     accountEnvironment: 'sandbox' | 'production'
     status:
       | 'authorized'
@@ -277,7 +304,12 @@ export default function ShopifyCarrierServiceSetupPanel({
   const [carrierAccounts, setCarrierAccounts] = useState<
     Record<Provider, string>
   >({ ups_rest: '', fedex_rest: '' })
+  const [
+    checkoutBrandNameOverride,
+    setCheckoutBrandNameOverride,
+  ] = useState('')
   const [confirmWrite, setConfirmWrite] = useState(false)
+  const [confirmNameAlignment, setConfirmNameAlignment] = useState(false)
   const [confirmRemove, setConfirmRemove] = useState(false)
   const [confirmRecovery, setConfirmRecovery] = useState(false)
 
@@ -302,6 +334,7 @@ export default function ShopifyCarrierServiceSetupPanel({
         (carrier) => carrier.provider === 'fedex_rest',
       )?.carrierAccountGlobalId || '',
     })
+    setCheckoutBrandNameOverride(next.namePreference.overrideName || '')
   }, [])
 
   const load = useCallback(async () => {
@@ -362,6 +395,7 @@ export default function ShopifyCarrierServiceSetupPanel({
       applySetup(payload.setup)
       setNotice(success)
       setConfirmWrite(false)
+      setConfirmNameAlignment(false)
       setConfirmRemove(false)
       setConfirmRecovery(false)
     } catch (caught) {
@@ -409,6 +443,28 @@ export default function ShopifyCarrierServiceSetupPanel({
     && carrierAccounts.fedex_rest
   )
   const registered = setup?.config?.registrationState === 'registered'
+  const nameAlignment = registered ? setup?.nameAlignment || null : null
+  const savedCheckoutBrandNameOverride =
+    setup?.namePreference.overrideName || ''
+  const normalizedCheckoutBrandNameOverride =
+    checkoutBrandNameOverride.trim()
+  const namePreferenceChanged =
+    normalizedCheckoutBrandNameOverride !== savedCheckoutBrandNameOverride
+  const nameAlignmentSimulation = nameAlignment?.simulation || null
+  const nameAlignmentAuthorization = setup?.mutationAuthorizations.find(
+    (authorization) => (
+      authorization.operation === 'update'
+      && authorization.configRowVersion === setup?.config?.rowVersion
+      && authorization.requestHash === nameAlignment?.simulation?.requestHash
+      && (
+        authorization.status === 'succeeded'
+        || authorization.status === 'confirmed_applied'
+      )
+    ),
+  ) || null
+  const nameAlignmentComplete = Boolean(
+    nameAlignment?.aligned && !namePreferenceChanged,
+  )
   const expectedSimulationOperation = registered ? 'delete' : 'create'
   const exactShadowSimulation = setup?.shadowSimulation?.operation
     === expectedSimulationOperation
@@ -436,6 +492,10 @@ export default function ShopifyCarrierServiceSetupPanel({
         || (
           authorization.operation === 'delete'
           && setup?.config?.registrationState !== 'disabled'
+        )
+        || (
+          authorization.operation === 'update'
+          && setup?.nameAlignment?.aligned !== true
         )
       )
     ),
@@ -648,6 +708,244 @@ export default function ShopifyCarrierServiceSetupPanel({
       ),
       action: configAction,
     },
+    ...(setup?.config ? [{
+      key: 'carrier-service-name',
+      label: registered
+        ? 'Align the Shopify shipping-option name'
+        : 'Confirm the Shopify shipping-option name',
+      description: registered
+        ? 'Use the verified Shopify store entity name by default, or save an optional administrator override. A changed name is applied in place to the exact registered Shopify resource.'
+        : 'New CarrierServices use the verified Shopify store entity name by default. An owner or administrator may save an optional customer-facing override before the first registration.',
+      state: registered
+        ? stepState(
+            nameAlignmentComplete,
+            Boolean(nameAlignment && !nameAlignmentComplete),
+            Boolean(!nameAlignment),
+          )
+        : stepState(!namePreferenceChanged, true),
+      facts: [
+        ...(registered ? [{
+          label: 'Registered CarrierService',
+          value: nameAlignment?.serviceGid
+            || setup?.config?.serviceGid
+            || 'Unavailable',
+        }] : []),
+        {
+          label: registered ? 'Desired Shopify name' : 'Registration name',
+          value: nameAlignment?.desiredName
+            || setup?.namePreference.effectiveName
+            || 'Unavailable',
+        },
+        ...(registered ? [{
+          label: 'Provider-confirmed applied name',
+          value: nameAlignment?.appliedName || 'Not yet confirmed',
+        }] : []),
+        ...(nameAlignmentSimulation ? [{
+          label: 'Name-alignment simulation',
+          value: nameAlignmentSimulation.globalId,
+        }] : []),
+        ...(nameAlignmentAuthorization ? [{
+          label: 'Applied evidence',
+          value: nameAlignmentAuthorization.globalId,
+        }] : []),
+      ],
+      action: (
+        <Stack spacing={1}>
+          {registered ? (
+            <Alert severity="info">
+              The CarrierService ID, callback URL, active state, and Shopify
+              shipping-profile assignments remain unchanged. This action
+              changes only the merchant-facing CarrierService name.
+            </Alert>
+          ) : (
+            <Alert severity="info">
+              The verified Shopify store entity name is the default. Saving
+              an override here changes only the future customer-facing
+              CarrierService name.
+            </Alert>
+          )}
+          <TextField
+            size="small"
+            fullWidth
+            label="Optional administrator checkout name"
+            value={checkoutBrandNameOverride}
+            inputProps={{ maxLength: 120 }}
+            placeholder={setup?.namePreference.providerStoreEntityName || ''}
+            disabled={
+              !setup?.canActivate
+              || Boolean(recoveryRequired)
+              || Boolean(mutationInFlight)
+              || Boolean(busy)
+            }
+            helperText={
+              `Leave blank to use the verified Shopify store name: ${
+                setup?.namePreference.providerStoreEntityName || 'Unavailable'
+              }. Clearing a saved override restores that default.`
+            }
+            onChange={(event) => {
+              setCheckoutBrandNameOverride(event.target.value)
+            }}
+          />
+          <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1}>
+            <Button
+              variant="outlined"
+              disabled={
+                !setup?.canActivate
+                || !namePreferenceChanged
+                || Boolean(recoveryRequired)
+                || Boolean(mutationInFlight)
+                || Boolean(busy)
+              }
+              onClick={() => void run(
+                'save-name-preference',
+                {
+                  checkoutBrandNameOverride:
+                    normalizedCheckoutBrandNameOverride || null,
+                },
+                registered
+                  ? 'The checkout name preference was saved. Registered checkout callbacks are paused until a fresh exact name-alignment simulation is applied.'
+                  : 'The checkout name preference was saved. A fresh exact registration simulation will use this name.',
+              )}
+            >
+              {busy === 'save-name-preference'
+                ? 'Saving checkout name…'
+                : normalizedCheckoutBrandNameOverride
+                  ? 'Save checkout-name override'
+                  : 'Restore verified Shopify name'}
+            </Button>
+          </Stack>
+          {namePreferenceChanged ? (
+            <Alert severity="warning">
+              Save this preference before simulating or applying the Shopify
+              CarrierService. Saving invalidates any prior exact simulation.
+            </Alert>
+          ) : null}
+          <Stack direction="row" spacing={0.75} flexWrap="wrap">
+            <Chip
+              size="small"
+              variant="outlined"
+              label={`Default · ${
+                setup?.namePreference.providerStoreEntityName || 'Unavailable'
+              }`}
+            />
+            <Chip
+              size="small"
+              color="primary"
+              variant="outlined"
+              label={`Effective · ${
+                setup?.namePreference.effectiveName || 'Unavailable'
+              }`}
+            />
+            <Chip
+              size="small"
+              variant="outlined"
+              label={setup?.namePreference.source
+                === 'administrator_override'
+                ? 'Source · administrator override'
+                : 'Source · verified Shopify store'}
+            />
+            {setup?.namePreference.providerVerifiedAt ? (
+              <Chip
+                size="small"
+                variant="outlined"
+                label={`Shopify verified · ${
+                  new Date(
+                    setup.namePreference.providerVerifiedAt,
+                  ).toLocaleString()
+                }`}
+              />
+            ) : null}
+          </Stack>
+          {registered && !nameAlignmentComplete ? (
+            <Alert severity="warning">
+              Checkout callbacks are fail-closed while the desired name and
+              Shopify&apos;s provider-confirmed applied name differ. Run the
+              exact Shadow simulation and one-time in-place alignment below.
+            </Alert>
+          ) : null}
+          {registered
+          && !nameAlignmentSimulation
+          && !nameAlignmentComplete ? (
+            <Button
+              variant="outlined"
+              disabled={
+                !nameAlignment
+                || namePreferenceChanged
+                || setup?.reference.activation.state !== 'shadow'
+                || !setup?.canActivate
+                || Boolean(recoveryRequired)
+                || Boolean(mutationInFlight)
+                || Boolean(busy)
+              }
+              onClick={() => void run(
+                'simulate-name-alignment',
+                {},
+                'The exact CarrierService name alignment was simulated in Shadow with zero Shopify writes.',
+              )}
+            >
+              {busy === 'simulate-name-alignment'
+                ? 'Simulating name alignment…'
+                : 'Simulate exact name alignment'}
+            </Button>
+          ) : null}
+          {registered
+          && nameAlignmentSimulation
+          && !nameAlignmentComplete ? (
+            <>
+              <FormControlLabel
+                control={(
+                  <Checkbox
+                    checked={confirmNameAlignment}
+                    disabled={!setup?.canActivate || Boolean(busy)}
+                    onChange={(event) => {
+                      setConfirmNameAlignment(event.target.checked)
+                    }}
+                  />
+                )}
+                label={`I authorize one in-place Shopify CarrierService name update to “${
+                  nameAlignment?.desiredName || 'the verified store name'
+                }”.`}
+              />
+              <Button
+                variant="contained"
+                color="warning"
+                disabled={
+                  !nameAlignment
+                  || namePreferenceChanged
+                  || setup?.reference.activation.state !== 'shadow'
+                  || !setup?.canActivate
+                  || !confirmNameAlignment
+                  || Boolean(recoveryRequired)
+                  || Boolean(mutationInFlight)
+                  || Boolean(busy)
+                }
+                onClick={() => void run(
+                  'align-registration-name',
+                  {
+                    confirmProviderWrite: true,
+                    confirmProductionProviderWrite:
+                      setup?.account.environment === 'production',
+                    confirmationRequestId:
+                      globalThis.crypto.randomUUID(),
+                  },
+                  'Shopify confirmed the in-place CarrierService name alignment. Its ID, callback, active state, and shipping-profile assignments were preserved.',
+                )}
+              >
+                {busy === 'align-registration-name'
+                  ? 'Aligning name once…'
+                  : 'Authorize and align name once'}
+              </Button>
+            </>
+          ) : null}
+          {registered && nameAlignmentComplete ? (
+            <Alert severity="success">
+              Shopify&apos;s provider-confirmed applied name matches the
+              current default or administrator override.
+            </Alert>
+          ) : null}
+        </Stack>
+      ),
+    } satisfies IntegrationSetupStep] : []),
     {
       key: 'shadow',
       label: registered
@@ -679,6 +977,7 @@ export default function ShopifyCarrierServiceSetupPanel({
               && setup.account.environment !== 'sandbox'
             )
             || setup.reference.activation.state !== 'shadow'
+            || namePreferenceChanged
             || Boolean(busy)
             || Boolean(simulated)
           }
@@ -818,6 +1117,7 @@ export default function ShopifyCarrierServiceSetupPanel({
                   !exactShadowSimulation
                   || setup?.reference.activation.state !== 'shadow'
                   || setup?.account.environment !== 'sandbox'
+                  || namePreferenceChanged
                   || !setup?.canActivate
                   || !confirmWrite
                   || Boolean(recoveryRequired)
