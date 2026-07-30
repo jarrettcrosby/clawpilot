@@ -74,11 +74,54 @@ type CallbackResult =
       response: ShopifyCarrierServiceRateResponse
     }
 
+type CheckoutFailureStage =
+  | 'request_parse'
+  | 'shadow_guard'
+  | 'request_fingerprint'
+  | 'warehouse_origin'
+  | 'checkout_lines'
+  | 'destination_fingerprint'
+  | 'checkout_destination'
+  | 'carrier_destination_fingerprint'
+  | 'checkout_context'
+  | 'execution_fence'
+  | 'receipt_cache'
+  | 'receipt_claim'
+  | 'post_claim'
+
+type CheckoutFailureCheckpoint =
+  | 'account_ready'
+  | 'request_parsed'
+  | 'shadow_authorized'
+  | 'fingerprinted'
+  | 'origin_valid'
+  | 'lines_valid'
+  | 'destination_fingerprinted'
+  | 'destination_valid'
+  | 'carrier_destination_fingerprinted'
+  | 'context_loaded'
+  | 'execution_fenced'
+  | 'cache_read'
+  | 'claim_attempted'
+  | 'receipt_claimed'
+
 function authenticatedResult(
   response: ShopifyCarrierServiceRateResponse,
   httpStatus: 200 | 503 | 504,
 ): CallbackResult {
   return { authenticated: true, httpStatus, response }
+}
+
+function checkoutFailureError(
+  code: string,
+  message: string,
+  cause?: unknown,
+) {
+  const error = cause === undefined
+    ? new Error(message)
+    : new Error(message, { cause })
+  Object.assign(error, { code })
+  return error
 }
 
 function failedHttpStatus(error: unknown): 503 | 504 {
@@ -98,7 +141,10 @@ function callbackFingerprintKey(): Buffer {
     || '',
   )
   if (secret.length < 32) {
-    throw new Error('Shopify callback fingerprinting is not configured')
+    throw checkoutFailureError(
+      'SHOPIFY_CHECKOUT_FINGERPRINT_CONFIG_MISSING',
+      'Shopify callback fingerprinting is not configured',
+    )
   }
   return createHash('sha256').update(secret).digest()
 }
@@ -293,13 +339,21 @@ function configuredWarehouseOriginMatches(
 function checkoutDestination(
   request: ShopifyCarrierServiceRateRequest,
 ): CheckoutRateDestination {
+  if (request.destination.countryCode !== 'US') {
+    throw checkoutFailureError(
+      'SHOPIFY_CHECKOUT_DESTINATION_COUNTRY_UNSUPPORTED',
+      'Checkout destination country is not supported',
+    )
+  }
   if (
-    request.destination.countryCode !== 'US'
-    || !request.destination.address1
+    !request.destination.address1
     || !request.destination.city
     || !request.destination.provinceCode
   ) {
-    throw new Error('Checkout destination is not rate-ready')
+    throw checkoutFailureError(
+      'SHOPIFY_CHECKOUT_DESTINATION_NOT_READY',
+      'Checkout destination is not rate-ready',
+    )
   }
   return {
     name: 'Shopify checkout',
@@ -335,12 +389,23 @@ function stableShippableLines(
       propertiesFingerprint: right.propertiesFingerprint,
     })))
   return items.map((item, index) => {
-    if (
-      item.quantity > MAX_PERSISTED_LINE_QUANTITY
-      || item.grams < 1
-      || item.grams > MAX_PERSISTED_UNIT_WEIGHT_GRAMS
-    ) {
-      throw new Error('Checkout line exceeds the durable rating limits')
+    if (item.quantity > MAX_PERSISTED_LINE_QUANTITY) {
+      throw checkoutFailureError(
+        'SHOPIFY_CHECKOUT_LINE_QUANTITY_UNSUPPORTED',
+        'Checkout line quantity exceeds the durable rating limit',
+      )
+    }
+    if (item.grams < 1) {
+      throw checkoutFailureError(
+        'SHOPIFY_CHECKOUT_LINE_WEIGHT_REQUIRED',
+        'Checkout line requires a positive unit weight',
+      )
+    }
+    if (item.grams > MAX_PERSISTED_UNIT_WEIGHT_GRAMS) {
+      throw checkoutFailureError(
+        'SHOPIFY_CHECKOUT_LINE_WEIGHT_UNSUPPORTED',
+        'Checkout line weight exceeds the durable rating limit',
+      )
     }
     return {
       lineKey: `shopify-line-${String(index + 1).padStart(3, '0')}`,
@@ -527,32 +592,50 @@ function resultFromTypedReceipt(
 function checkoutFailureStage(
   error: unknown,
   claimed: boolean,
+  attemptedStage: CheckoutFailureStage,
 ) {
   if (!claimed && safeShopifyCarrierServiceProtocolErrorPath(error)) {
     return 'protocol'
   }
-  const message = error instanceof Error ? error.message : ''
-  if (
-    !claimed
-    && message === 'Shopify callback origin does not match the warehouse'
-  ) {
-    return 'warehouse_origin'
+  return claimed ? 'post_claim' : attemptedStage
+}
+
+function fallbackReasonCode(stage: CheckoutFailureStage) {
+  const suffix = stage.toUpperCase()
+  return `SHOPIFY_CHECKOUT_${suffix}_FAILED`
+}
+
+function classifyCheckoutFailure(
+  error: unknown,
+  claimed: boolean,
+  attemptedStage: CheckoutFailureStage,
+) {
+  if (claimed || errorCode(error) !== 'SHOPIFY_CHECKOUT_RATE_FAILED') {
+    return error
   }
-  if (!claimed && message.includes('checkout context')) {
-    return 'checkout_context'
-  }
-  return claimed ? 'post_claim' : 'pre_claim'
+  return checkoutFailureError(
+    fallbackReasonCode(attemptedStage),
+    'Shopify checkout pre-claim fence failed',
+    error,
+  )
 }
 
 function recordCheckoutFailure(input: {
   accountGlobalId: string
   error: unknown
   claimed: boolean
+  attemptedStage: CheckoutFailureStage
+  checkpoint: CheckoutFailureCheckpoint
 }) {
   const protocolPath = safeShopifyCarrierServiceProtocolErrorPath(input.error)
   console.warn('[shopify checkout rating] callback failed', {
     accountGlobalId: input.accountGlobalId,
-    stage: checkoutFailureStage(input.error, input.claimed),
+    stage: checkoutFailureStage(
+      input.error,
+      input.claimed,
+      input.attemptedStage,
+    ),
+    checkpoint: input.checkpoint,
     reasonCode: errorCode(input.error),
     receiptClaimed: input.claimed,
     ...(protocolPath ? { protocolPath } : {}),
@@ -710,6 +793,8 @@ export async function executeShopifyCarrierServiceCallback(input: {
       receiptGlobalId: string
       leaseToken: string
     } | null = null
+    let attemptedStage: CheckoutFailureStage = 'request_parse'
+    let checkpoint: CheckoutFailureCheckpoint = 'account_ready'
     try {
     const request = await awaitCallbackWork(
       readShopifyCarrierServiceRateRequest(input.request, {
@@ -717,26 +802,45 @@ export async function executeShopifyCarrierServiceCallback(input: {
       }),
       workController.signal,
     )
+    checkpoint = 'request_parsed'
+    attemptedStage = 'shadow_guard'
     const shadowGuard = shadowCheckoutRequestGuard(account, request)
     if (!shadowGuard.allowed) {
       return authenticatedResult(EMPTY_RATE_RESPONSE, 200)
     }
+    checkpoint = 'shadow_authorized'
+    attemptedStage = 'request_fingerprint'
     const requestFingerprint = persistedRequestFingerprint(
       fingerprintShopifyCarrierServiceRateRequest(request),
     )
+    checkpoint = 'fingerprinted'
+    attemptedStage = 'warehouse_origin'
     if (!configuredWarehouseOriginMatches(request, account.warehouseAddress)) {
-      throw new Error('Shopify callback origin does not match the warehouse')
+      throw checkoutFailureError(
+        'SHOPIFY_CHECKOUT_WAREHOUSE_ORIGIN_MISMATCH',
+        'Shopify callback origin does not match the warehouse',
+      )
     }
+    checkpoint = 'origin_valid'
+    attemptedStage = 'checkout_lines'
     const lines = stableShippableLines(request)
     if (!lines.length) {
       return authenticatedResult(EMPTY_RATE_RESPONSE, 200)
     }
+    checkpoint = 'lines_valid'
+    attemptedStage = 'destination_fingerprint'
     const destinationHash = shopifyCheckoutDestinationFingerprint(
       request.destination,
     )
+    checkpoint = 'destination_fingerprinted'
+    attemptedStage = 'checkout_destination'
     const destination = checkoutDestination(request)
+    checkpoint = 'destination_valid'
+    attemptedStage = 'carrier_destination_fingerprint'
     const carrierDestinationHash =
       carrierSandboxPartyFingerprint(destination)
+    checkpoint = 'carrier_destination_fingerprinted'
+    attemptedStage = 'checkout_context'
     const context = await awaitCallbackWork(
       readShopifyCheckoutContextFromPostgres({
         account,
@@ -744,6 +848,8 @@ export async function executeShopifyCarrierServiceCallback(input: {
       }),
       workController.signal,
     )
+    checkpoint = 'context_loaded'
+    attemptedStage = 'execution_fence'
     const executionFenceHash = checkoutExecutionFenceHash(account, context)
     const idempotencyKey = fencedIdempotencyKey({
       requestFingerprint,
@@ -753,6 +859,7 @@ export async function executeShopifyCarrierServiceCallback(input: {
       inventorySnapshotHash: context.inventorySnapshotHash,
       executionFenceHash,
     })
+    checkpoint = 'execution_fenced'
     const cacheLookup = {
       organizationId: account.organizationId,
       accountGlobalId: account.accountGlobalId,
@@ -760,12 +867,14 @@ export async function executeShopifyCarrierServiceCallback(input: {
       inventorySnapshotHash: context.inventorySnapshotHash,
       idempotencyKey,
     }
+    attemptedStage = 'receipt_cache'
     requireCallbackTime(workDeadlineAt, workController.signal)
     const cached =
       await awaitCallbackWork(
         readCachedShopifyCheckoutRateReceiptInPostgres(cacheLookup),
         workController.signal,
       )
+    checkpoint = 'cache_read'
     if (cached) {
       return resultFromTypedReceipt(
         account,
@@ -777,6 +886,8 @@ export async function executeShopifyCarrierServiceCallback(input: {
       successPersistenceDeadlineAt,
       workController.signal,
     )
+    attemptedStage = 'receipt_claim'
+    checkpoint = 'claim_attempted'
     const claim = await awaitCallbackWork(
       claimShopifyCheckoutRateReceiptInPostgres({
         organizationId: account.organizationId,
@@ -861,6 +972,8 @@ export async function executeShopifyCarrierServiceCallback(input: {
       receiptGlobalId: claim.receipt.globalId,
       leaseToken: claim.leaseToken,
     }
+    checkpoint = 'receipt_claimed'
+    attemptedStage = 'post_claim'
     requireCallbackTime(workDeadlineAt, workController.signal)
     const { plan, parcels } = planShopifyCheckoutPackages(context.input)
     const materialLimits = new Map(context.materials.map(
@@ -1117,21 +1230,28 @@ export async function executeShopifyCarrierServiceCallback(input: {
       completed,
     )
     } catch (error) {
+      const classifiedError = classifyCheckoutFailure(
+        error,
+        Boolean(claimed),
+        attemptedStage,
+      )
       recordCheckoutFailure({
         accountGlobalId: account.accountGlobalId,
-        error,
+        error: classifiedError,
         claimed: Boolean(claimed),
+        attemptedStage,
+        checkpoint,
       })
       if (claimed && Date.now() < failurePersistenceDeadlineAt) {
         await failClaim(
           claimed,
-          errorCode(error),
+          errorCode(classifiedError),
           failurePersistenceDeadlineAt,
         )
       }
       return authenticatedResult(
         EMPTY_RATE_RESPONSE,
-        failedHttpStatus(error),
+        failedHttpStatus(classifiedError),
       )
     }
   })()

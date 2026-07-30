@@ -736,9 +736,12 @@ entity, explicit carrier name, and service name. Carrier-prefix normalization
 prevents values such as `UPS · UPS Ground`; the canonical form is
 `Pro Bakery Bites · UPS · Ground` (and equivalently for FedEx). The stable
 `service_code` and durable response remain customer-neutral. Failures before
-receipt claim emit only a structured stage and safe reason code with the
-account Global ID; callback tokens, request bodies, addresses, and customer
-facts are never logged. Shopify decimal identifiers and exact
+receipt claim emit only a structured stage, the last static no-data execution
+checkpoint, and a safe reason code with the account Global ID. The checkpoint
+identifies only a code-owned boundary such as request parsing, line validation,
+context loading, or receipt claim; it never includes payload values. Callback
+tokens, request bodies, addresses, and customer facts are never logged.
+Shopify decimal identifiers and exact
 `gid://shopify/Customer/<decimal>`, `gid://shopify/Product/<decimal>`, and
 `gid://shopify/ProductVariant/<decimal>` resource GIDs normalize to the same
 bounded decimal evidence. A wrong-resource GID, malformed value, or
