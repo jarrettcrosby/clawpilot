@@ -78,6 +78,7 @@ export type ShopifyProductWritebackInput = {
   productGid: unknown
   patch: ShopifyProductWritebackPatch
   productMediaAuthorizationId?: unknown
+  productMediaDeliveryGrantId?: unknown
   actorEmail?: string | null
   workerId?: string
 }
@@ -95,6 +96,7 @@ type NormalizedShopifyProductWritebackInput = {
   productGid: string
   patch: ShopifyProductWritebackPatch
   productMediaAuthorizationId: string | null
+  productMediaDeliveryGrantId: string | null
   actorEmail: string | null
   workerId: string
   action: 'shopify.product.update'
@@ -442,11 +444,13 @@ function normalizeInput(
   const productMediaAuthorizationId = input.productMediaAuthorizationId
     ? String(input.productMediaAuthorizationId).trim().toLowerCase()
     : null
+  const productMediaDeliveryGrantId = input.productMediaDeliveryGrantId
+    ? String(input.productMediaDeliveryGrantId).trim().toLowerCase()
+    : null
   if (
-    productMediaAuthorizationId
+    productMediaDeliveryGrantId
     && (
-      !UUID_PATTERN.test(productMediaAuthorizationId)
-      || input.mode !== 'active'
+      !UUID_PATTERN.test(productMediaDeliveryGrantId)
       || !patch.image
       || Object.keys(patch).length !== 1
     )
@@ -454,6 +458,29 @@ function normalizeInput(
     writebackError(
       'SHOPIFY_PRODUCT_MEDIA_AUTHORITY_INVALID',
       'Exact Shopify Product-image authority can authorize only one Active image append',
+    )
+  }
+  if (
+    productMediaAuthorizationId
+    && (
+      !UUID_PATTERN.test(productMediaAuthorizationId)
+      || !productMediaDeliveryGrantId
+      || input.mode !== 'active'
+    )
+  ) {
+    writebackError(
+      'SHOPIFY_PRODUCT_MEDIA_AUTHORITY_INVALID',
+      'Exact Shopify Product-image authority requires one Active image append and its delivery grant',
+    )
+  }
+  if (
+    input.mode === 'active'
+    && patch.image
+    && !productMediaAuthorizationId
+  ) {
+    writebackError(
+      'SHOPIFY_PRODUCT_MEDIA_AUTHORITY_REQUIRED',
+      'A Shopify Product-image provider write requires exact resource authority',
     )
   }
   const aggregateHash = String(input.aggregateHash || '')
@@ -496,8 +523,13 @@ function normalizeInput(
     accountGlobalId,
     productGid,
     patch: redactedPatch(patch),
-    ...(productMediaAuthorizationId
-      ? { productMediaAuthorizationId }
+    ...(productMediaDeliveryGrantId
+      ? {
+          deliveryGrantId: productMediaDeliveryGrantId,
+          ...(productMediaAuthorizationId
+            ? { productMediaAuthorizationId }
+            : {}),
+        }
       : {}),
   }
   assertRedactedCommerceExternalEffectEvidence(
@@ -517,6 +549,7 @@ function normalizeInput(
     productGid,
     patch,
     productMediaAuthorizationId,
+    productMediaDeliveryGrantId,
     actorEmail: input.actorEmail || null,
     workerId,
     action: 'shopify.product.update',

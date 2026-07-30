@@ -81,15 +81,43 @@ function loadProjectionModule() {
             return Buffer.from(JSON.stringify(payload)).toString('base64url')
               + '.test-signature'
           },
+          verifyShopifyProductMediaToken(token, _secret, now) {
+            const [payloadPart] = String(token).split('.')
+            const payload = JSON.parse(
+              Buffer.from(payloadPart, 'base64url').toString('utf8'),
+            )
+            if (payload.exp <= now) {
+              throw new ProjectionError(
+                'SHOPIFY_PRODUCT_MEDIA_TOKEN_EXPIRED',
+                'expired',
+                404,
+              )
+            }
+            return payload
+          },
+          assertShopifyProductMediaTokenIsDeliverable(payload) {
+            if (payload.m !== 'active') {
+              throw new ProjectionError(
+                'SHOPIFY_PRODUCT_MEDIA_TOKEN_NOT_DELIVERABLE',
+                'not deliverable',
+                404,
+              )
+            }
+          },
         }
       }
       if (
         specifier ===
         '@/lib/persistence/shopifyProductMediaProjection'
       ) {
-        return { prepareShopifyProductMediaProjectionInPostgres() {
-          throw new Error('default persistence must be overridden')
-        } }
+        return {
+          prepareShopifyProductMediaProjectionInPostgres() {
+            throw new Error('default persistence must be overridden')
+          },
+          bindShopifyProductMediaDeliverySourceInPostgres() {
+            throw new Error('default binding must be overridden')
+          },
+        }
       }
       return nodeRequire(specifier)
     },
@@ -103,17 +131,50 @@ const productId = '22222222-2222-4222-8222-222222222222'
 const imageAssetId = '33333333-3333-4333-8333-333333333333'
 const channelStateGlobalId = 'gpcs0000001'
 const nowEpoch = 1_785_400_000
+const shadowSimulationEffectGlobalId = 'gcef0000009'
 
 function grant(mode = 'active', overrides = {}) {
   const productGid =
     overrides.productGid || 'gid://shopify/Product/123456789'
+  const externalVariantId = overrides.externalVariantId
+    || 'gid://shopify/ProductVariant/987654321'
+  const selectedProductId = overrides.productId || productId
+  const selectedChannelStateGlobalId =
+    overrides.channelStateGlobalId || channelStateGlobalId
   const selectedImageAssetId =
     overrides.imageAssetId || imageAssetId
+  const productReferenceCode =
+    overrides.productReferenceCode || 'gp0000001'
+  const channelStateRowVersion =
+    overrides.channelStateRowVersion || 8
+  const channelSourceRevision = overrides.channelSourceRevision
+    || '2026-07-30T00:00:00.000Z'
+  const channelSourceHash =
+    overrides.channelSourceHash || 'b'.repeat(64)
+  const assetRevision = overrides.assetRevision || 2
+  const assetRowVersion = overrides.assetRowVersion || 3
+  const assetContentSha256 =
+    overrides.assetContentSha256 || 'c'.repeat(64)
+  const simulationEffect = mode === 'active'
+    ? (overrides.resourceAuthorization
+        ?.shadowSimulationEffectGlobalId
+      || shadowSimulationEffectGlobalId)
+    : null
   const idempotencyKey = `shopify-product-image:${
     createHash('sha256').update(JSON.stringify({
       account: 'gia0000001',
       product: productGid,
+      variant: externalVariantId,
+      productReference: productReferenceCode,
+      channelState: selectedChannelStateGlobalId,
+      channelRowVersion: channelStateRowVersion,
+      channelSourceRevision,
+      channelSourceHash,
       asset: selectedImageAssetId,
+      assetRevision,
+      assetRowVersion,
+      assetContentSha256,
+      shadowSimulationEffect: simulationEffect,
       mode,
     }), 'utf8').digest('hex')
   }`
@@ -124,25 +185,28 @@ function grant(mode = 'active', overrides = {}) {
       '55555555-5555-4555-8555-555555555555',
     integrationAccountGlobalId: 'gia0000001',
     pipelineId: '66666666-6666-4666-8666-666666666666',
-    productId,
+    productId: selectedProductId,
     channelStateId: '77777777-7777-4777-8777-777777777777',
-    imageAssetId,
+    imageAssetId: selectedImageAssetId,
     idempotencyKey,
     productWriteAuthorizationId: mode === 'active'
       ? '99999999-9999-4999-8999-999999999999'
       : null,
     mode,
     publicOrigin: 'https://clawpilot.example.com',
-    productReferenceCode: 'gp0000001',
+    productReferenceCode,
     productSourceHash: 'a'.repeat(64),
     productGid,
-    channelStateGlobalId,
-    channelStateRowVersion: 8,
-    channelSourceRevision: '2026-07-30T00:00:00.000Z',
-    channelSourceHash: 'b'.repeat(64),
-    assetRevision: 2,
-    assetRowVersion: 3,
-    assetContentSha256: 'c'.repeat(64),
+    channelStateGlobalId: selectedChannelStateGlobalId,
+    channelStateRowVersion,
+    channelSourceRevision,
+    channelSourceHash,
+    externalVariantId,
+    channelNormalizedStatus: 'active',
+    channelProviderActive: true,
+    assetRevision,
+    assetRowVersion,
+    assetContentSha256,
     assetMimeType: 'image/png',
     assetByteLength: 1_024,
     assetPixelWidth: 1_200,
@@ -155,6 +219,17 @@ function grant(mode = 'active', overrides = {}) {
     issuedAtEpoch: nowEpoch,
     expiresAtEpoch: nowEpoch + (mode === 'active' ? 900 : 60),
     createdBy: 'admin@example.com',
+    resourceAuthorization: mode === 'active'
+      ? {
+          id: '99999999-9999-4999-8999-999999999999',
+          shadowSimulationEffectGlobalId: simulationEffect,
+          providerWriteActivationRevision: 4,
+          authorizedAtEpoch: nowEpoch,
+          expiresAtEpoch: nowEpoch + 300,
+          confirmationStatementVersion:
+            'shopify-product-image-shadow-provider-write-v1',
+        }
+      : null,
     ...overrides,
   }
 }
@@ -200,12 +275,28 @@ function effectFor(input, mode = 'active') {
 }
 
 function command(overrides = {}) {
+  const executeProviderWrite =
+    overrides.executeProviderWrite ?? true
   return {
     organizationId,
     productId,
     channelStateGlobalId,
     imageAssetId,
-    executeProviderWrite: true,
+    executeProviderWrite,
+    expectedProductReferenceCode:
+      overrides.expectedProductReferenceCode || 'gp0000001',
+    expectedChannelStateRowVersion:
+      overrides.expectedChannelStateRowVersion || 8,
+    expectedChannelSourceRevision:
+      overrides.expectedChannelSourceRevision
+      || '2026-07-30T00:00:00.000Z',
+    expectedAssetRevision: overrides.expectedAssetRevision || 2,
+    expectedAssetRowVersion: overrides.expectedAssetRowVersion || 3,
+    expectedAssetContentSha256:
+      overrides.expectedAssetContentSha256 || 'c'.repeat(64),
+    shadowSimulationEffectGlobalId: executeProviderWrite
+      ? shadowSimulationEffectGlobalId
+      : null,
     publicOrigin: 'https://clawpilot.example.com',
     actorEmail: 'admin@example.com',
     // These adversarial browser values must be ignored because they are not
@@ -223,6 +314,8 @@ function command(overrides = {}) {
 let prepared = 0
 let writes = []
 let preparedInputs = []
+let boundSources = []
+let executionOrder = []
 
 function dependencies(selectedGrant) {
   return {
@@ -233,6 +326,14 @@ function dependencies(selectedGrant) {
         integrationAccountGlobalId:
           selectedGrant.integrationAccountGlobalId,
         productGid: selectedGrant.productGid,
+        externalVariantId: selectedGrant.externalVariantId,
+        productReferenceCode: selectedGrant.productReferenceCode,
+        channelStateRowVersion: selectedGrant.channelStateRowVersion,
+        channelSourceRevision: selectedGrant.channelSourceRevision,
+        channelSourceHash: selectedGrant.channelSourceHash,
+        assetRevision: selectedGrant.assetRevision,
+        assetRowVersion: selectedGrant.assetRowVersion,
+        assetContentSha256: selectedGrant.assetContentSha256,
       }
     },
     async prepareProjection(input) {
@@ -245,13 +346,21 @@ function dependencies(selectedGrant) {
           'channelStateGlobalId',
           'expectedIntegrationAccountGlobalId',
           'expectedMode',
+          'expectedExternalVariantId',
           'expectedProductGid',
+          'expectedProductReferenceCode',
+          'expectedChannelStateRowVersion',
+          'expectedChannelSourceRevision',
+          'expectedAssetRevision',
+          'expectedAssetRowVersion',
+          'expectedAssetContentSha256',
           'idempotencyKey',
           'imageAssetId',
           'organizationId',
           'productId',
           'publicOrigin',
-        ],
+          'shadowSimulationEffectGlobalId',
+        ].sort(),
       )
       if (input.expectedMode !== selectedGrant.mode) {
         throw new ProjectionError(
@@ -262,7 +371,22 @@ function dependencies(selectedGrant) {
       }
       return selectedGrant
     },
+    async bindDeliverySource(input) {
+      executionOrder.push('bind')
+      boundSources.push(input)
+      return {
+        authorizationId: input.authorizationId,
+        deliveryGrantId: input.deliveryGrantId,
+        sourceUrlSha256: createHash('sha256')
+          .update(input.originalSource, 'utf8')
+          .digest('hex'),
+        sourceOrigin: new URL(input.originalSource).origin,
+        sourceHost: new URL(input.originalSource).hostname,
+        signedTokenSha256: 'f'.repeat(64),
+      }
+    },
     async executeWriteback(input) {
+      executionOrder.push('write')
       writes.push(input)
       return {
         effect: effectFor(input, selectedGrant.mode),
@@ -286,6 +410,8 @@ function dependencies(selectedGrant) {
 prepared = 0
 writes = []
 preparedInputs = []
+boundSources = []
+executionOrder = []
 const active = grant()
 const activeResult = await projection.executeShopifyProductImagePublish(
   command(),
@@ -293,6 +419,28 @@ const activeResult = await projection.executeShopifyProductImagePublish(
 )
 assert.equal(prepared, 1)
 assert.equal(writes.length, 1)
+assert.equal(boundSources.length, 1)
+assert.deepEqual(executionOrder, ['bind', 'write'])
+assert.equal(
+  boundSources[0].authorizationId,
+  active.resourceAuthorization.id,
+)
+assert.equal(boundSources[0].deliveryGrantId, active.id)
+assert.equal(
+  boundSources[0].originalSource,
+  writes[0].patch.image.originalSource,
+)
+assert.equal(boundSources[0].verifiedToken.g, active.id)
+assert.equal(boundSources[0].verifiedToken.o, active.organizationId)
+assert.equal(boundSources[0].verifiedToken.p, active.productId)
+assert.equal(boundSources[0].verifiedToken.a, active.imageAssetId)
+assert.equal(
+  boundSources[0].verifiedToken.h,
+  active.assetContentSha256,
+)
+assert.equal(boundSources[0].verifiedToken.m, 'active')
+assert.equal(boundSources[0].verifiedToken.iat, nowEpoch)
+assert.equal(boundSources[0].verifiedToken.exp, nowEpoch + 900)
 assert.equal(writes[0].accountGlobalId, active.integrationAccountGlobalId)
 assert.equal(writes[0].productGid, active.productGid)
 assert.equal(writes[0].credentialGeneration, active.credentialGeneration)
@@ -302,8 +450,9 @@ assert.equal(writes[0].mode, 'active')
 assert.equal(writes[0].idempotencyKey, active.idempotencyKey)
 assert.equal(
   writes[0].productMediaAuthorizationId,
-  active.productWriteAuthorizationId,
+  active.resourceAuthorization.id,
 )
+assert.equal(writes[0].productMediaDeliveryGrantId, active.id)
 assert.notEqual(
   writes[0].idempotencyKey,
   command().idempotencyKey,
@@ -332,6 +481,98 @@ assert.equal(
   activeResult.mediaPublication.nextAction,
   'await_media_ready',
 )
+
+prepared = 0
+writes = []
+boundSources = []
+executionOrder = []
+await assert.rejects(
+  projection.executeShopifyProductImagePublish(command(), {
+    ...dependencies(active),
+    async bindDeliverySource() {
+      executionOrder.push('bind')
+      throw new ProjectionError(
+        'SHOPIFY_PRODUCT_MEDIA_SOURCE_BINDING_CONFLICT',
+        'source mismatch',
+        409,
+      )
+    },
+  }),
+  (error) =>
+    error instanceof ProjectionError
+    && error.code ===
+      'SHOPIFY_PRODUCT_MEDIA_SOURCE_BINDING_CONFLICT',
+)
+assert.deepEqual(executionOrder, ['bind'])
+assert.equal(writes.length, 0)
+
+for (const changedSelection of [
+  {
+    label: 'asset',
+    command: {
+      imageAssetId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    },
+  },
+  {
+    label: 'Product',
+    command: {
+      productId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+    },
+  },
+  {
+    label: 'channel state',
+    command: {
+      channelStateGlobalId: 'gpcs0000002',
+    },
+  },
+]) {
+  prepared = 0
+  writes = []
+  await assert.rejects(
+    projection.executeShopifyProductImagePublish(
+      command(changedSelection.command),
+      dependencies(active),
+    ),
+    (error) =>
+      error instanceof ProjectionError
+      && error.code === 'SHOPIFY_PRODUCT_MEDIA_SELECTION_MISMATCH',
+    `${changedSelection.label} must not reuse an exact resource grant`,
+  )
+  assert.equal(
+    writes.length,
+    0,
+    `${changedSelection.label} grant reuse must make zero writes`,
+  )
+}
+
+prepared = 0
+writes = []
+await assert.rejects(
+  projection.executeShopifyProductImagePublish(command(), {
+    ...dependencies(active),
+    async resolveProviderIdentity() {
+      return {
+        integrationAccountGlobalId:
+          active.integrationAccountGlobalId,
+        productGid: 'gid://shopify/Product/222222222',
+        externalVariantId:
+          'gid://shopify/ProductVariant/333333333',
+        productReferenceCode: active.productReferenceCode,
+        channelStateRowVersion: active.channelStateRowVersion,
+        channelSourceRevision: active.channelSourceRevision,
+        channelSourceHash: active.channelSourceHash,
+        assetRevision: active.assetRevision,
+        assetRowVersion: active.assetRowVersion,
+        assetContentSha256: active.assetContentSha256,
+      }
+    },
+  }),
+  (error) =>
+    error instanceof ProjectionError
+    && error.code === 'SHOPIFY_PRODUCT_MEDIA_SELECTION_MISMATCH',
+  'a different Shopify parent listing must not reuse an exact grant',
+)
+assert.equal(writes.length, 0)
 
 const reconciliationContext = {
   deliveryGrantId: active.id,
@@ -478,13 +719,19 @@ assert.equal(writes.length, 0)
 prepared = 0
 writes = []
 preparedInputs = []
+boundSources = []
+executionOrder = []
 const shadow = grant('shadow')
 const shadowResult = await projection.executeShopifyProductImagePublish(
   command({ executeProviderWrite: false }),
   dependencies(shadow),
 )
 assert.equal(writes.length, 1)
+assert.equal(boundSources.length, 0)
+assert.deepEqual(executionOrder, ['write'])
 assert.equal(writes[0].mode, 'shadow')
+assert.equal(writes[0].productMediaDeliveryGrantId, shadow.id)
+assert.equal(writes[0].productMediaAuthorizationId, null)
 assert.equal(shadowResult.externalEffect.state, 'simulated')
 assert.equal(shadowResult.externalEffect.providerWriteCount, 0)
 assert.equal(shadowResult.providerMutation.accepted, false)
@@ -494,62 +741,32 @@ assert.equal(
   'shadow_simulation',
 )
 
-// Shopify mutates media at the parent Product level. Two local variant
-// Products mapped to the same Shopify Product must therefore enter persistence
-// with the same provider Product GID even though their local selections and
-// asset-scoped command identities differ. The persistence source assertion
-// below proves that this provider identity, not the local Product UUID, is the
-// advisory-lock and unresolved-effect scope.
+// Shopify mutates media at the parent Product level. A second ClawPilot
+// Product mapped to that same parent must fail before grant preparation.
 prepared = 0
 writes = []
 preparedInputs = []
-const siblingProductId =
-  'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
-const siblingImageAssetId =
-  'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
-const siblingChannelStateGlobalId = 'gpcs0000002'
-const parentProductGid = 'gid://shopify/Product/123456789'
-const firstVariant = grant('shadow', { productGid: parentProductGid })
-const siblingVariant = grant('shadow', {
-  productId: siblingProductId,
-  imageAssetId: siblingImageAssetId,
-  channelStateGlobalId: siblingChannelStateGlobalId,
-  productGid: parentProductGid,
-})
-await projection.executeShopifyProductImagePublish(
-  command({ executeProviderWrite: false }),
-  dependencies(firstVariant),
+await assert.rejects(
+  projection.executeShopifyProductImagePublish(
+    command({ executeProviderWrite: false }),
+    {
+      ...dependencies(shadow),
+      async resolveProviderIdentity() {
+        throw new ProjectionError(
+          'SHOPIFY_PRODUCT_MEDIA_PARENT_PRODUCT_AMBIGUOUS',
+          'same Shopify parent maps to another Product',
+          409,
+        )
+      },
+    },
+  ),
+  (error) =>
+    error instanceof ProjectionError
+    && error.code ===
+      'SHOPIFY_PRODUCT_MEDIA_PARENT_PRODUCT_AMBIGUOUS',
 )
-await projection.executeShopifyProductImagePublish(
-  command({
-    productId: siblingProductId,
-    imageAssetId: siblingImageAssetId,
-    channelStateGlobalId: siblingChannelStateGlobalId,
-    executeProviderWrite: false,
-  }),
-  dependencies(siblingVariant),
-)
-assert.equal(preparedInputs.length, 2)
-assert.notEqual(
-  preparedInputs[0].productId,
-  preparedInputs[1].productId,
-)
-assert.equal(
-  preparedInputs[0].expectedProductGid,
-  preparedInputs[1].expectedProductGid,
-)
-assert.equal(
-  preparedInputs[0].expectedProductGid,
-  parentProductGid,
-)
-assert.notEqual(
-  preparedInputs[0].idempotencyKey,
-  preparedInputs[1].idempotencyKey,
-)
-assert.equal(
-  writes.every((input) => input.mode === 'shadow'),
-  true,
-)
+assert.equal(prepared, 0)
+assert.equal(writes.length, 0)
 
 prepared = 0
 writes = []
@@ -568,16 +785,20 @@ assert.equal(writes.length, 0)
 
 prepared = 0
 writes = []
+const nearExpiryAuthorizationGrant = grant()
+nearExpiryAuthorizationGrant.resourceAuthorization = {
+  ...nearExpiryAuthorizationGrant.resourceAuthorization,
+  expiresAtEpoch: nowEpoch + 119,
+}
 await assert.rejects(
   projection.executeShopifyProductImagePublish(
     command(),
-    dependencies(grant('active', {
-      expiresAtEpoch: nowEpoch + 119,
-    })),
+    dependencies(nearExpiryAuthorizationGrant),
   ),
   (error) =>
     error instanceof ProjectionError
-    && error.code === 'SHOPIFY_PRODUCT_MEDIA_GRANT_EXPIRED',
+    && error.code ===
+      'SHOPIFY_PRODUCT_MEDIA_AUTHORIZATION_EXPIRED',
 )
 assert.equal(
   writes.length,
@@ -654,6 +875,7 @@ const publicRoute = readFileSync(resolve(
   'app_src/app/api/integrations/commerce/shopify/product-media/[token]/route.ts',
 ), 'utf8')
 assert.match(publicRoute, /assertShopifyProductMediaTokenIsDeliverable/)
+assert.match(publicRoute, /signedToken: token/)
 assert.match(publicRoute, /'Cache-Control': 'private, no-store/)
 assert.match(publicRoute, /Do not log signed URLs/)
 assert.doesNotMatch(publicRoute, /console\./)
@@ -678,6 +900,12 @@ for (const fence of [
   'media_grant.product_gid = $3',
   'media_grant.expires_at > to_timestamp($8)',
   'image_asset.content_sha256',
+  'const ACTIVE_DELIVERY_TTL_SECONDS = 15 * 60',
+  'const AUTHORIZATION_TTL_SECONDS = 5 * 60',
+  'operations_shopify_product_media_source_bindings',
+  'source_url_sha256',
+  'signed_token_sha256',
+  'source_binding.signed_token_sha256 = $9',
 ]) {
   assert.equal(
     persistence.includes(fence),
@@ -726,6 +954,54 @@ assert.match(
 assert.match(
   authorityMigration,
   /AND NOT exact_product_media_authority/,
+)
+
+const shadowAuthorityMigration = readFileSync(resolve(
+  root,
+  'db/migrations/0160_operations_shopify_product_media_shadow_authority.sql',
+), 'utf8')
+for (const fence of [
+  'simulation_effect_id',
+  'provider_write_activation_revision',
+  'shopify-product-image-shadow-provider-write-v1',
+  "activation.state = 'shadow'",
+  "active_grant.desired_mode = 'active'",
+  "shadow_grant.desired_mode = 'shadow'",
+  "simulation.state = 'simulated'",
+  'simulation.provider_write_count = 0',
+  "effect.state IN ('claimed', 'succeeded', 'unknown')",
+  'effect.provider_attempt_id IS NOT NULL',
+  'operations_shopify_product_media_source_bindings',
+  'source_binding.source_url_sha256',
+  'source_binding.source_host',
+  "interval '5 minutes'",
+  'token_issued_at_epoch + (15 * 60)',
+]) {
+  assert.equal(
+    shadowAuthorityMigration.includes(fence),
+    true,
+    `0160 missing exact Shadow authority fence ${fence}`,
+  )
+}
+assert.match(
+  shadowAuthorityMigration,
+  /BEFORE INSERT OR UPDATE OR DELETE[\s\S]*protect_operations_shopify_product_media_delivery_grant/,
+)
+assert.match(
+  shadowAuthorityMigration,
+  /external_product_id = NEW\.external_product_id[\s\S]*product_id IS DISTINCT FROM NEW\.product_id/,
+)
+assert.match(
+  shadowAuthorityMigration,
+  /external_product_id = active_grant\.product_gid[\s\S]*product_id IS DISTINCT FROM active_grant\.product_id/,
+)
+assert.match(
+  shadowAuthorityMigration,
+  /NEW\.desired_mode = 'active'[\s\S]*request_contains_product_media[\s\S]*NOT exact_product_media_authority/,
+)
+assert.match(
+  shadowAuthorityMigration,
+  /CREATE UNIQUE INDEX IF NOT EXISTS[\s\S]*idx_ops_shopify_media_auth_simulation_effect/,
 )
 
 console.log('shopify product media projection tests passed')

@@ -2422,7 +2422,10 @@ export default function CrmSection() {
                   productId={textValue(editorRecord, 'id')}
                   canManage={canManageHierarchy}
                   shopifyChannels={productSalesChannels(editorRecord).filter(
-                    (channel) => channel.provider === 'shopify',
+                    (channel) =>
+                      channel.provider === 'shopify'
+                      && channel.normalizedStatus === 'active'
+                      && channel.providerActive === true,
                   )}
                 />
               </>

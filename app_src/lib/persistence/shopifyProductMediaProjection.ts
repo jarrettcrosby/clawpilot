@@ -16,6 +16,9 @@ import {
   type ShopifyProductMediaProjectionGrant,
   type ShopifyProductMediaProjectionMode,
 } from '@/lib/integrations/shopifyProductMediaProjectionTypes'
+import type {
+  ShopifyProductMediaTokenPayload,
+} from '@/lib/integrations/shopifyProductMediaTokens'
 import { commerceExternalEffectHash } from '@/lib/persistence/commerceExternalEffects'
 import {
   acquireTransactionAdvisoryLock,
@@ -28,9 +31,17 @@ const PRODUCT_REFERENCE_PATTERN = /^gp[0-9]{7}$/
 const ACCOUNT_GLOBAL_PATTERN = /^gia[0-9]{7}$/
 const CHANNEL_GLOBAL_PATTERN = /^gpcs[0-9]{7}$/
 const PRODUCT_GID_PATTERN = /^gid:\/\/shopify\/Product\/[1-9][0-9]*$/
+const VARIANT_GID_PATTERN =
+  /^gid:\/\/shopify\/ProductVariant\/[1-9][0-9]*$/
 const SHA256_PATTERN = /^[0-9a-f]{64}$/
-const ACTIVE_TTL_SECONDS = 15 * 60
+const EFFECT_GLOBAL_PATTERN = /^gcef[0-9]{7}$/
+const ACTIVE_DELIVERY_TTL_SECONDS = 15 * 60
+const AUTHORIZATION_TTL_SECONDS = 5 * 60
 const SHADOW_TTL_SECONDS = 60
+const PUBLIC_MEDIA_PATH =
+  '/api/integrations/commerce/shopify/product-media/'
+const RESOURCE_AUTHORIZATION_CONFIRMATION =
+  'shopify-product-image-shadow-provider-write-v1' as const
 
 type GrantRow = QueryResultRow & {
   id: string
@@ -52,6 +63,9 @@ type GrantRow = QueryResultRow & {
   channel_state_row_version: string | number
   channel_source_revision: string
   channel_source_hash: string
+  external_variant_id: string
+  channel_normalized_status: string
+  channel_provider_active: boolean
   asset_revision: string | number
   asset_row_version: string | number
   asset_content_sha256: string
@@ -67,6 +81,11 @@ type GrantRow = QueryResultRow & {
   issued_at_epoch: string | number
   expires_at_epoch: string | number
   created_by: string
+  shadow_simulation_effect_global_id: string | null
+  provider_write_activation_revision: number | null
+  authorized_at_epoch: string | number | null
+  authorization_expires_at_epoch: string | number | null
+  confirmation_statement_version: string | null
 }
 
 type SelectionRow = QueryResultRow & {
@@ -90,6 +109,9 @@ type SelectionRow = QueryResultRow & {
   channel_source_revision: string
   channel_source_hash: string
   external_product_id: string
+  external_variant_id: string
+  normalized_status: string
+  provider_active: boolean
   image_asset_id: string
   asset_revision: string | number
   asset_row_version: string | number
@@ -132,6 +154,22 @@ type ReconciliationRow = QueryResultRow & {
   latest_media_status: string | null
   latest_media_errors: unknown
   latest_observed_at: string | Date | null
+}
+
+type SourceBindingRow = QueryResultRow & {
+  authorization_id: string
+  delivery_grant_id: string
+  source_url_sha256: string
+  source_origin: string
+  source_host: string
+  signed_token_sha256: string
+  token_product_id: string
+  token_image_asset_id: string
+  token_asset_content_sha256: string
+  token_mode: string
+  token_issued_at_epoch: string | number
+  token_expires_at_epoch: string | number
+  bound_by: string
 }
 
 export type ShopifyProductMediaReconciliationContext = {
@@ -273,6 +311,9 @@ const GRANT_PROJECTION = `
     media_grant.channel_state_row_version::text,
     media_grant.channel_source_revision,
     media_grant.channel_source_hash,
+    media_grant.external_variant_id,
+    media_grant.channel_normalized_status,
+    media_grant.channel_provider_active,
     media_grant.asset_revision::text,
     media_grant.asset_row_version::text,
     media_grant.asset_content_sha256,
@@ -289,7 +330,45 @@ const GRANT_PROJECTION = `
       AS issued_at_epoch,
     floor(extract(epoch FROM media_grant.expires_at))::text
       AS expires_at_epoch,
-    media_grant.created_by
+    media_grant.created_by,
+    (
+      SELECT simulation.global_id
+      FROM operations_shopify_product_media_write_authorizations auth
+      JOIN operations_commerce_external_effect_intents simulation
+        ON simulation.organization_id = auth.organization_id
+       AND simulation.id = auth.simulation_effect_id
+      WHERE auth.organization_id = media_grant.organization_id
+        AND auth.delivery_grant_id = media_grant.id
+      LIMIT 1
+    ) AS shadow_simulation_effect_global_id,
+    (
+      SELECT auth.provider_write_activation_revision
+      FROM operations_shopify_product_media_write_authorizations auth
+      WHERE auth.organization_id = media_grant.organization_id
+        AND auth.delivery_grant_id = media_grant.id
+      LIMIT 1
+    ) AS provider_write_activation_revision,
+    (
+      SELECT floor(extract(epoch FROM auth.authorized_at))::text
+      FROM operations_shopify_product_media_write_authorizations auth
+      WHERE auth.organization_id = media_grant.organization_id
+        AND auth.delivery_grant_id = media_grant.id
+      LIMIT 1
+    ) AS authorized_at_epoch,
+    (
+      SELECT floor(extract(epoch FROM auth.expires_at))::text
+      FROM operations_shopify_product_media_write_authorizations auth
+      WHERE auth.organization_id = media_grant.organization_id
+        AND auth.delivery_grant_id = media_grant.id
+      LIMIT 1
+    ) AS authorization_expires_at_epoch,
+    (
+      SELECT auth.confirmation_statement_version
+      FROM operations_shopify_product_media_write_authorizations auth
+      WHERE auth.organization_id = media_grant.organization_id
+        AND auth.delivery_grant_id = media_grant.id
+      LIMIT 1
+    ) AS confirmation_statement_version
   FROM operations_shopify_product_media_delivery_grants media_grant
 `
 
@@ -333,6 +412,9 @@ function toGrant(row: GrantRow): ShopifyProductMediaProjectionGrant {
     || !CHANNEL_GLOBAL_PATTERN.test(row.channel_state_global_id)
     || !row.channel_source_revision
     || !SHA256_PATTERN.test(row.channel_source_hash)
+    || !VARIANT_GID_PATTERN.test(row.external_variant_id)
+    || row.channel_normalized_status !== 'active'
+    || row.channel_provider_active !== true
     || !SHA256_PATTERN.test(row.asset_content_sha256)
     || !CRM_PRODUCT_IMAGE_MIME_TYPES.includes(
       row.asset_mime_type as CrmProductImageMimeType,
@@ -359,8 +441,31 @@ function toGrant(row: GrantRow): ShopifyProductMediaProjectionGrant {
       && !UUID_PATTERN.test(row.product_write_authorization_id || '')
     )
     || (
+      mode === 'active'
+      && (
+        !EFFECT_GLOBAL_PATTERN.test(
+          row.shadow_simulation_effect_global_id || '',
+        )
+        || !Number.isSafeInteger(
+          row.provider_write_activation_revision,
+        )
+        || Number(row.provider_write_activation_revision) < 1
+        || row.authorized_at_epoch === null
+        || row.authorization_expires_at_epoch === null
+        || row.confirmation_statement_version
+          !== RESOURCE_AUTHORIZATION_CONFIRMATION
+      )
+    )
+    || (
       mode === 'shadow'
-      && row.product_write_authorization_id !== null
+      && (
+        row.product_write_authorization_id !== null
+        || row.shadow_simulation_effect_global_id !== null
+        || row.provider_write_activation_revision !== null
+        || row.authorized_at_epoch !== null
+        || row.authorization_expires_at_epoch !== null
+        || row.confirmation_statement_version !== null
+      )
     )
   ) {
     fail(
@@ -372,7 +477,7 @@ function toGrant(row: GrantRow): ShopifyProductMediaProjectionGrant {
   const issuedAtEpoch = integer(row.issued_at_epoch, 'issue time', 1)
   const expiresAtEpoch = integer(row.expires_at_epoch, 'expiry time', 1)
   const maximumTtl = mode === 'active'
-    ? ACTIVE_TTL_SECONDS
+    ? ACTIVE_DELIVERY_TTL_SECONDS
     : SHADOW_TTL_SECONDS
   if (
     expiresAtEpoch <= issuedAtEpoch
@@ -381,6 +486,49 @@ function toGrant(row: GrantRow): ShopifyProductMediaProjectionGrant {
     fail(
       'SHOPIFY_PRODUCT_MEDIA_EVIDENCE_CORRUPT',
       'Stored Shopify product media expiry evidence is invalid',
+      500,
+    )
+  }
+  const resourceAuthorization = mode === 'active'
+    ? {
+        id: row.product_write_authorization_id!,
+        shadowSimulationEffectGlobalId:
+          row.shadow_simulation_effect_global_id!,
+        providerWriteActivationRevision: integer(
+          row.provider_write_activation_revision!,
+          'provider-write activation revision',
+          1,
+        ),
+        authorizedAtEpoch: integer(
+          row.authorized_at_epoch!,
+          'authorization issue time',
+          1,
+        ),
+        expiresAtEpoch: integer(
+          row.authorization_expires_at_epoch!,
+          'authorization expiry time',
+          1,
+        ),
+        confirmationStatementVersion:
+          RESOURCE_AUTHORIZATION_CONFIRMATION,
+      }
+    : null
+  if (
+    resourceAuthorization
+    && (
+      resourceAuthorization.expiresAtEpoch
+        <= resourceAuthorization.authorizedAtEpoch
+      || resourceAuthorization.expiresAtEpoch
+        - resourceAuthorization.authorizedAtEpoch
+        > AUTHORIZATION_TTL_SECONDS
+      || resourceAuthorization.expiresAtEpoch > expiresAtEpoch
+      || resourceAuthorization.providerWriteActivationRevision
+        !== row.activation_revision
+    )
+  ) {
+    fail(
+      'SHOPIFY_PRODUCT_MEDIA_EVIDENCE_CORRUPT',
+      'Stored Shopify product media resource authority is invalid',
       500,
     )
   }
@@ -408,6 +556,9 @@ function toGrant(row: GrantRow): ShopifyProductMediaProjectionGrant {
     ),
     channelSourceRevision: row.channel_source_revision,
     channelSourceHash: row.channel_source_hash,
+    externalVariantId: row.external_variant_id,
+    channelNormalizedStatus: 'active',
+    channelProviderActive: true,
     assetRevision: integer(row.asset_revision, 'asset revision', 1),
     assetRowVersion: integer(row.asset_row_version, 'asset row revision', 1),
     assetContentSha256: row.asset_content_sha256,
@@ -427,13 +578,17 @@ function toGrant(row: GrantRow): ShopifyProductMediaProjectionGrant {
     issuedAtEpoch,
     expiresAtEpoch,
     createdBy: row.created_by,
+    resourceAuthorization,
   }
 }
 
 function aggregateSnapshot(
   input: Omit<
     ShopifyProductMediaProjectionGrant,
-    'aggregateHash' | 'createdBy' | 'productWriteAuthorizationId'
+    | 'aggregateHash'
+    | 'createdBy'
+    | 'productWriteAuthorizationId'
+    | 'resourceAuthorization'
   >,
 ) {
   return {
@@ -449,6 +604,9 @@ function aggregateSnapshot(
     channelStateRowVersion: input.channelStateRowVersion,
     channelSourceRevision: input.channelSourceRevision,
     channelSourceHash: input.channelSourceHash,
+    externalVariantId: input.externalVariantId,
+    channelNormalizedStatus: input.channelNormalizedStatus,
+    channelProviderActive: input.channelProviderActive,
     productGid: input.productGid,
     imageAssetId: input.imageAssetId,
     assetRevision: input.assetRevision,
@@ -477,6 +635,13 @@ function assertReplaySelection(
     channelStateGlobalId: string
     imageAssetId: string
     expectedMode: ShopifyProductMediaProjectionMode
+    expectedProductReferenceCode: string
+    expectedChannelStateRowVersion: number
+    expectedChannelSourceRevision: string
+    expectedAssetRevision: number
+    expectedAssetRowVersion: number
+    expectedAssetContentSha256: string
+    shadowSimulationEffectGlobalId: string | null
   },
 ) {
   if (
@@ -484,6 +649,21 @@ function assertReplaySelection(
     || grant.channelStateGlobalId !== input.channelStateGlobalId
     || grant.imageAssetId !== input.imageAssetId
     || grant.mode !== input.expectedMode
+    || grant.productReferenceCode
+      !== input.expectedProductReferenceCode
+    || grant.channelStateRowVersion
+      !== input.expectedChannelStateRowVersion
+    || grant.channelSourceRevision
+      !== input.expectedChannelSourceRevision
+    || grant.assetRevision !== input.expectedAssetRevision
+    || grant.assetRowVersion !== input.expectedAssetRowVersion
+    || grant.assetContentSha256
+      !== input.expectedAssetContentSha256
+    || (
+      input.expectedMode === 'active'
+      && grant.resourceAuthorization?.shadowSimulationEffectGlobalId
+        !== input.shadowSimulationEffectGlobalId
+    )
   ) {
     fail(
       'SHOPIFY_PRODUCT_MEDIA_IDEMPOTENCY_CONFLICT',
@@ -509,6 +689,187 @@ async function readExistingGrant(
     [input.organizationId, input.idempotencyKey],
   )
   return result.rows[0] ? toGrant(result.rows[0]) : null
+}
+
+/**
+ * Persist the immutable, hash-only relationship between the exact signed
+ * delivery URL and the active resource authorization before an external
+ * effect can be prepared. The caller must pass the payload returned by the
+ * server-side HMAC verifier for the token embedded in originalSource.
+ */
+export async function bindShopifyProductMediaDeliverySourceInPostgres(input: {
+  organizationId: string
+  integrationAccountId: string
+  authorizationId: string
+  deliveryGrantId: string
+  originalSource: string
+  verifiedToken: ShopifyProductMediaTokenPayload & { m: 'active' }
+  actorEmail: string
+}) {
+  let source: URL
+  try {
+    source = new URL(input.originalSource)
+  } catch {
+    fail(
+      'SHOPIFY_PRODUCT_MEDIA_SOURCE_INVALID',
+      'The signed Shopify product media source is invalid',
+      500,
+    )
+  }
+  const token = source.pathname.startsWith(PUBLIC_MEDIA_PATH)
+    ? source.pathname.slice(PUBLIC_MEDIA_PATH.length)
+    : ''
+  if (
+    source.protocol !== 'https:'
+    || source.username
+    || source.password
+    || source.search
+    || source.hash
+    || source.href !== input.originalSource
+    || source.pathname !== `${PUBLIC_MEDIA_PATH}${token}`
+    || !/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(token)
+    || token.length > 2_048
+    || source.origin.length > 2_048
+    || source.hostname.length > 255
+    || !UUID_PATTERN.test(input.organizationId)
+    || !UUID_PATTERN.test(input.integrationAccountId)
+    || !UUID_PATTERN.test(input.authorizationId)
+    || !UUID_PATTERN.test(input.deliveryGrantId)
+    || input.verifiedToken.m !== 'active'
+  ) {
+    fail(
+      'SHOPIFY_PRODUCT_MEDIA_SOURCE_INVALID',
+      'The signed Shopify product media source is invalid',
+      500,
+    )
+  }
+  const sourceUrlSha256 = createHash('sha256')
+    .update(input.originalSource, 'utf8')
+    .digest('hex')
+  const signedTokenSha256 = createHash('sha256')
+    .update(token, 'utf8')
+    .digest('hex')
+  const expected = {
+    authorizationId: input.authorizationId,
+    deliveryGrantId: input.deliveryGrantId,
+    sourceUrlSha256,
+    sourceOrigin: source.origin,
+    sourceHost: source.hostname.toLowerCase(),
+    signedTokenSha256,
+    tokenProductId: input.verifiedToken.p,
+    tokenImageAssetId: input.verifiedToken.a,
+    tokenAssetContentSha256: input.verifiedToken.h,
+    tokenMode: input.verifiedToken.m,
+    tokenIssuedAtEpoch: input.verifiedToken.iat,
+    tokenExpiresAtEpoch: input.verifiedToken.exp,
+    boundBy: input.actorEmail,
+  }
+  return withTransaction(async (client) => {
+    await client.query(
+      `INSERT INTO
+         operations_shopify_product_media_source_bindings (
+           organization_id,
+           integration_account_id,
+           authorization_id,
+           delivery_grant_id,
+           source_url_sha256,
+           source_origin,
+           source_host,
+           signed_token_sha256,
+           token_product_id,
+           token_image_asset_id,
+           token_asset_content_sha256,
+           token_mode,
+           token_issued_at_epoch,
+           token_expires_at_epoch,
+           bound_by
+         )
+       VALUES (
+         $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7, $8,
+         $9::uuid, $10::uuid, $11, $12, $13::bigint, $14::bigint, $15
+       )
+       ON CONFLICT (organization_id, authorization_id) DO NOTHING`,
+      [
+        input.organizationId,
+        input.integrationAccountId,
+        expected.authorizationId,
+        expected.deliveryGrantId,
+        expected.sourceUrlSha256,
+        expected.sourceOrigin,
+        expected.sourceHost,
+        expected.signedTokenSha256,
+        expected.tokenProductId,
+        expected.tokenImageAssetId,
+        expected.tokenAssetContentSha256,
+        expected.tokenMode,
+        expected.tokenIssuedAtEpoch,
+        expected.tokenExpiresAtEpoch,
+        expected.boundBy,
+      ],
+    )
+    const result = await client.query<SourceBindingRow>(
+      `SELECT
+         authorization_id::text,
+         delivery_grant_id::text,
+         source_url_sha256,
+         source_origin,
+         source_host,
+         signed_token_sha256,
+         token_product_id::text,
+         token_image_asset_id::text,
+         token_asset_content_sha256,
+         token_mode,
+         token_issued_at_epoch::text,
+         token_expires_at_epoch::text,
+         bound_by
+       FROM operations_shopify_product_media_source_bindings
+       WHERE organization_id = $1::uuid
+         AND authorization_id = $2::uuid
+       LIMIT 1
+       FOR SHARE`,
+      [input.organizationId, input.authorizationId],
+    )
+    const row = result.rows[0]
+    if (
+      !row
+      || row.authorization_id !== expected.authorizationId
+      || row.delivery_grant_id !== expected.deliveryGrantId
+      || row.source_url_sha256 !== expected.sourceUrlSha256
+      || row.source_origin !== expected.sourceOrigin
+      || row.source_host !== expected.sourceHost
+      || row.signed_token_sha256 !== expected.signedTokenSha256
+      || row.token_product_id !== expected.tokenProductId
+      || row.token_image_asset_id !== expected.tokenImageAssetId
+      || row.token_asset_content_sha256
+        !== expected.tokenAssetContentSha256
+      || row.token_mode !== expected.tokenMode
+      || integer(
+        row.token_issued_at_epoch,
+        'signed source issue time',
+        1,
+      ) !== expected.tokenIssuedAtEpoch
+      || integer(
+        row.token_expires_at_epoch,
+        'signed source expiry time',
+        1,
+      ) !== expected.tokenExpiresAtEpoch
+      || row.bound_by !== expected.boundBy
+    ) {
+      fail(
+        'SHOPIFY_PRODUCT_MEDIA_SOURCE_BINDING_CONFLICT',
+        'The signed Shopify product media source is already bound to different authority',
+        409,
+      )
+    }
+    return {
+      authorizationId: row.authorization_id,
+      deliveryGrantId: row.delivery_grant_id,
+      sourceUrlSha256: row.source_url_sha256,
+      sourceOrigin: row.source_origin,
+      sourceHost: row.source_host,
+      signedTokenSha256: row.signed_token_sha256,
+    }
+  })
 }
 
 async function assertNoUnresolvedActiveImagePublish(
@@ -586,14 +947,51 @@ export async function resolveShopifyProductMediaProviderIdentityInPostgres(
 ): Promise<{
   integrationAccountGlobalId: string
   productGid: string
+  externalVariantId: string
+  productReferenceCode: string
+  channelStateRowVersion: number
+  channelSourceRevision: string
+  channelSourceHash: string
+  assetRevision: number
+  assetRowVersion: number
+  assetContentSha256: string
 }> {
   const result = await withTransaction(async (client) => client.query<{
     integration_account_global_id: string
     product_gid: string
+    external_variant_id: string
+    product_reference_code: string
+    channel_state_row_version: string | number
+    channel_source_revision: string
+    channel_source_hash: string
+    asset_revision: string | number
+    asset_row_version: string | number
+    asset_content_sha256: string
+    conflicting_product_count: string | number
   }>(
     `SELECT
        account.global_id AS integration_account_global_id,
-       channel_state.external_product_id AS product_gid
+       channel_state.external_product_id AS product_gid,
+       channel_state.external_variant_id,
+       product.reference_code AS product_reference_code,
+       channel_state.row_version::text AS channel_state_row_version,
+       channel_state.source_revision AS channel_source_revision,
+       channel_state.source_hash AS channel_source_hash,
+       image_asset.asset_revision::text,
+       image_asset.row_version::text AS asset_row_version,
+       image_asset.content_sha256 AS asset_content_sha256,
+       (
+         SELECT count(*)
+         FROM operations_product_channel_states sibling
+         WHERE sibling.organization_id = channel_state.organization_id
+           AND sibling.integration_account_id =
+                 channel_state.integration_account_id
+           AND sibling.provider = 'shopify'
+           AND sibling.external_product_id =
+                 channel_state.external_product_id
+           AND sibling.product_id IS NOT NULL
+           AND sibling.product_id <> channel_state.product_id
+       )::text AS conflicting_product_count
      FROM operations_product_channel_states channel_state
      JOIN operations_integration_accounts account
        ON account.organization_id = channel_state.organization_id
@@ -626,6 +1024,8 @@ export async function resolveShopifyProductMediaProviderIdentityInPostgres(
        AND product.id = $2::uuid
        AND channel_state.global_id = $3
        AND channel_state.provider = 'shopify'
+       AND channel_state.normalized_status = 'active'
+       AND channel_state.provider_active = true
        AND account.integration_type = 'commerce'
        AND account.provider = 'shopify'
      LIMIT 1`,
@@ -641,6 +1041,7 @@ export async function resolveShopifyProductMediaProviderIdentityInPostgres(
     !row
     || !ACCOUNT_GLOBAL_PATTERN.test(row.integration_account_global_id)
     || !PRODUCT_GID_PATTERN.test(row.product_gid)
+    || !VARIANT_GID_PATTERN.test(row.external_variant_id)
   ) {
     fail(
       'SHOPIFY_PRODUCT_MEDIA_SELECTION_NOT_FOUND',
@@ -648,9 +1049,34 @@ export async function resolveShopifyProductMediaProviderIdentityInPostgres(
       404,
     )
   }
+  if (integer(
+    row.conflicting_product_count,
+    'Shopify parent Product mapping count',
+  ) !== 0) {
+    fail(
+      'SHOPIFY_PRODUCT_MEDIA_PARENT_PRODUCT_AMBIGUOUS',
+      'This Shopify parent Product is mapped to more than one ClawPilot Product; no image authority was issued',
+      409,
+    )
+  }
   return {
     integrationAccountGlobalId: row.integration_account_global_id,
     productGid: row.product_gid,
+    externalVariantId: row.external_variant_id,
+    productReferenceCode: row.product_reference_code,
+    channelStateRowVersion: integer(
+      row.channel_state_row_version,
+      'channel revision',
+    ),
+    channelSourceRevision: row.channel_source_revision,
+    channelSourceHash: row.channel_source_hash,
+    assetRevision: integer(row.asset_revision, 'asset revision', 1),
+    assetRowVersion: integer(
+      row.asset_row_version,
+      'asset row revision',
+      1,
+    ),
+    assetContentSha256: row.asset_content_sha256,
   }
 }
 
@@ -662,7 +1088,15 @@ export async function prepareShopifyProductMediaProjectionInPostgres(input: {
   idempotencyKey: string
   expectedIntegrationAccountGlobalId: string
   expectedProductGid: string
+  expectedExternalVariantId: string
   expectedMode: ShopifyProductMediaProjectionMode
+  expectedProductReferenceCode: string
+  expectedChannelStateRowVersion: number
+  expectedChannelSourceRevision: string
+  expectedAssetRevision: number
+  expectedAssetRowVersion: number
+  expectedAssetContentSha256: string
+  shadowSimulationEffectGlobalId: string | null
   publicOrigin: string
   actorEmail: string
 }): Promise<ShopifyProductMediaProjectionGrant> {
@@ -710,6 +1144,9 @@ export async function prepareShopifyProductMediaProjectionInPostgres(input: {
          channel_state.source_revision AS channel_source_revision,
          channel_state.source_hash AS channel_source_hash,
          channel_state.external_product_id,
+         channel_state.external_variant_id,
+         channel_state.normalized_status,
+         channel_state.provider_active,
          image_asset.id::text AS image_asset_id,
          image_asset.asset_revision::text,
          image_asset.row_version::text AS asset_row_version,
@@ -767,6 +1204,8 @@ export async function prepareShopifyProductMediaProjectionInPostgres(input: {
          AND product.id = $2::uuid
          AND channel_state.global_id = $3
          AND channel_state.provider = 'shopify'
+         AND channel_state.normalized_status = 'active'
+         AND channel_state.provider_active = true
          AND account.integration_type = 'commerce'
          AND account.provider = 'shopify'
        LIMIT 1
@@ -798,18 +1237,15 @@ export async function prepareShopifyProductMediaProjectionInPostgres(input: {
       || row.integration_account_global_id
         !== input.expectedIntegrationAccountGlobalId
       || row.external_product_id !== input.expectedProductGid
+      || row.external_variant_id !== input.expectedExternalVariantId
+      || !VARIANT_GID_PATTERN.test(row.external_variant_id)
       || row.credential_generation < 1
       || row.credential_version !== row.credential_generation
       || row.credential_verification_status !== 'verified'
-      || !['shadow', 'active'].includes(row.activation_state)
-      || (
-        row.activation_state === 'active'
-        && row.integration_account_status === 'error'
-      )
-      || (
-        row.activation_state === 'shadow'
-        && row.integration_account_status === 'error'
-      )
+      || row.activation_state !== 'shadow'
+      || row.integration_account_status === 'error'
+      || row.normalized_status !== 'active'
+      || row.provider_active !== true
     ) {
       fail(
         'SHOPIFY_PRODUCT_MEDIA_CONNECTION_NOT_READY',
@@ -817,13 +1253,70 @@ export async function prepareShopifyProductMediaProjectionInPostgres(input: {
         409,
       )
     }
-    const mode = row.activation_state as ShopifyProductMediaProjectionMode
-    if (mode !== input.expectedMode) {
+    const mode = input.expectedMode
+    if (
+      row.product_reference_code !== input.expectedProductReferenceCode
+      || integer(row.channel_state_row_version, 'channel revision')
+        !== input.expectedChannelStateRowVersion
+      || row.channel_source_revision
+        !== input.expectedChannelSourceRevision
+      || integer(row.asset_revision, 'asset revision', 1)
+        !== input.expectedAssetRevision
+      || integer(row.asset_row_version, 'asset row revision', 1)
+        !== input.expectedAssetRowVersion
+      || row.asset_content_sha256
+        !== input.expectedAssetContentSha256
+    ) {
       fail(
-        'SHOPIFY_PRODUCT_MEDIA_MODE_CONFIRMATION_MISMATCH',
-        mode === 'active'
-          ? 'Confirm the exact Active provider write before publishing the product image'
-          : 'Shadow mode cannot accept an Active provider-write confirmation',
+        'SHOPIFY_PRODUCT_MEDIA_SELECTION_STALE',
+        'The selected Product, listing, or image revision changed after review',
+        409,
+      )
+    }
+    const conflictingProduct = await client.query<{ id: string }>(
+      `SELECT sibling.id::text
+       FROM operations_product_channel_states sibling
+       WHERE sibling.organization_id = $1::uuid
+         AND sibling.integration_account_id = $2::uuid
+         AND sibling.provider = 'shopify'
+         AND sibling.external_product_id = $3
+         AND sibling.product_id IS NOT NULL
+         AND sibling.product_id <> $4::uuid
+       LIMIT 1
+       FOR SHARE OF sibling`,
+      [
+        row.organization_id,
+        row.integration_account_id,
+        row.external_product_id,
+        row.product_id,
+      ],
+    )
+    if (conflictingProduct.rows[0]) {
+      fail(
+        'SHOPIFY_PRODUCT_MEDIA_PARENT_PRODUCT_AMBIGUOUS',
+        'This Shopify parent Product is mapped to more than one ClawPilot Product; no image authority was issued',
+        409,
+      )
+    }
+    if (
+      mode === 'active'
+      && !EFFECT_GLOBAL_PATTERN.test(
+        input.shadowSimulationEffectGlobalId || '',
+      )
+    ) {
+      fail(
+        'SHOPIFY_PRODUCT_MEDIA_SHADOW_SIMULATION_REQUIRED',
+        'Run the exact zero-write Shadow simulation before authorizing this one Product image revision',
+        409,
+      )
+    }
+    if (
+      mode === 'shadow'
+      && input.shadowSimulationEffectGlobalId !== null
+    ) {
+      fail(
+        'SHOPIFY_PRODUCT_MEDIA_SHADOW_SIMULATION_INVALID',
+        'A Shadow simulation cannot consume another simulation',
         409,
       )
     }
@@ -837,7 +1330,9 @@ export async function prepareShopifyProductMediaProjectionInPostgres(input: {
     }
     const issuedAtEpoch = integer(row.issued_at_epoch, 'issue time', 1)
     const expiresAtEpoch = issuedAtEpoch + (
-      mode === 'active' ? ACTIVE_TTL_SECONDS : SHADOW_TTL_SECONDS
+      mode === 'active'
+        ? ACTIVE_DELIVERY_TTL_SECONDS
+        : SHADOW_TTL_SECONDS
     )
     const grantWithoutHash = {
       id: randomUUID(),
@@ -861,6 +1356,9 @@ export async function prepareShopifyProductMediaProjectionInPostgres(input: {
       ),
       channelSourceRevision: row.channel_source_revision,
       channelSourceHash: row.channel_source_hash,
+      externalVariantId: row.external_variant_id,
+      channelNormalizedStatus: 'active' as const,
+      channelProviderActive: true as const,
       assetRevision: integer(row.asset_revision, 'asset revision', 1),
       assetRowVersion: integer(
         row.asset_row_version,
@@ -893,17 +1391,19 @@ export async function prepareShopifyProductMediaProjectionInPostgres(input: {
          channel_state_id, image_asset_id, idempotency_key, desired_mode,
          public_origin, product_reference_code, product_source_hash,
          product_gid, channel_state_global_id, channel_state_row_version,
-         channel_source_revision, channel_source_hash, asset_revision,
-         asset_row_version, asset_content_sha256, asset_mime_type,
-         asset_byte_length, asset_pixel_width, asset_pixel_height,
-         asset_alt_text, credential_generation, activation_revision,
-         aggregate_revision, aggregate_hash, issued_at, expires_at, created_by
+         channel_source_revision, channel_source_hash, external_variant_id,
+         channel_normalized_status, channel_provider_active,
+         asset_revision, asset_row_version, asset_content_sha256,
+         asset_mime_type, asset_byte_length, asset_pixel_width,
+         asset_pixel_height, asset_alt_text, credential_generation,
+         activation_revision, aggregate_revision, aggregate_hash, issued_at,
+         expires_at, created_by
        ) VALUES (
          $1::uuid, $2::uuid, $3::uuid, $4, $5::uuid, $6::uuid,
          $7::uuid, $8::uuid, $9, $10, $11, $12, $13, $14, $15, $16::bigint,
-         $17, $18, $19::bigint, $20::bigint, $21, $22, $23, $24, $25,
-         $26, $27, $28, $29::bigint, $30, to_timestamp($31),
-         to_timestamp($32), $33
+         $17, $18, $19, $20, $21, $22::bigint, $23::bigint, $24, $25,
+         $26, $27, $28, $29, $30, $31, $32::bigint, $33,
+         to_timestamp($34), to_timestamp($35), $36
        )
        RETURNING
          id::text,
@@ -925,6 +1425,9 @@ export async function prepareShopifyProductMediaProjectionInPostgres(input: {
          channel_state_row_version::text,
          channel_source_revision,
          channel_source_hash,
+         external_variant_id,
+         channel_normalized_status,
+         channel_provider_active,
          asset_revision::text,
          asset_row_version::text,
          asset_content_sha256,
@@ -939,7 +1442,12 @@ export async function prepareShopifyProductMediaProjectionInPostgres(input: {
          aggregate_hash,
          floor(extract(epoch FROM issued_at))::text AS issued_at_epoch,
          floor(extract(epoch FROM expires_at))::text AS expires_at_epoch,
-         created_by`,
+         created_by,
+         NULL::text AS shadow_simulation_effect_global_id,
+         NULL::integer AS provider_write_activation_revision,
+         NULL::text AS authorized_at_epoch,
+         NULL::text AS authorization_expires_at_epoch,
+         NULL::text AS confirmation_statement_version`,
       [
         grantWithoutHash.id,
         grantWithoutHash.organizationId,
@@ -959,6 +1467,9 @@ export async function prepareShopifyProductMediaProjectionInPostgres(input: {
         grantWithoutHash.channelStateRowVersion,
         grantWithoutHash.channelSourceRevision,
         grantWithoutHash.channelSourceHash,
+        grantWithoutHash.externalVariantId,
+        grantWithoutHash.channelNormalizedStatus,
+        grantWithoutHash.channelProviderActive,
         grantWithoutHash.assetRevision,
         grantWithoutHash.assetRowVersion,
         grantWithoutHash.assetContentSha256,
@@ -983,7 +1494,6 @@ export async function prepareShopifyProductMediaProjectionInPostgres(input: {
         500,
       )
     }
-    let productWriteAuthorizationId: string | null = null
     if (mode === 'active') {
       const authorization = await client.query<{ id: string }>(
         `INSERT INTO
@@ -991,6 +1501,9 @@ export async function prepareShopifyProductMediaProjectionInPostgres(input: {
              organization_id,
              integration_account_id,
              delivery_grant_id,
+             simulation_effect_id,
+             provider_write_activation_revision,
+             confirmation_statement_version,
              authorized_by,
              authorized_role,
              expires_at
@@ -999,12 +1512,47 @@ export async function prepareShopifyProductMediaProjectionInPostgres(input: {
            $1::uuid,
            $2::uuid,
            $3::uuid,
+           simulation.id,
+           $4::integer,
+           $5,
            membership.user_email,
            membership.role,
-           to_timestamp($4)
+           to_timestamp($6)
          FROM app_user_organization_memberships membership
+         JOIN operations_commerce_external_effect_intents simulation
+           ON simulation.organization_id = membership.organization_id
+          AND simulation.global_id = $7
+          AND simulation.integration_account_id = $2::uuid
+          AND simulation.provider = 'shopify'
+          AND simulation.action = 'shopify.product.update'
+          AND simulation.desired_mode = 'shadow'
+          AND simulation.state = 'simulated'
+          AND simulation.provider_write_count = 0
+         JOIN operations_shopify_product_media_delivery_grants
+           shadow_grant
+           ON shadow_grant.organization_id = simulation.organization_id
+          AND shadow_grant.integration_account_id =
+                simulation.integration_account_id
+          AND shadow_grant.idempotency_key = simulation.idempotency_key
+          AND shadow_grant.desired_mode = 'shadow'
+          AND shadow_grant.product_id = $8::uuid
+          AND shadow_grant.channel_state_id = $9::uuid
+          AND shadow_grant.image_asset_id = $10::uuid
+          AND shadow_grant.product_reference_code = $11
+          AND shadow_grant.product_source_hash = $12
+          AND shadow_grant.product_gid = $13
+          AND shadow_grant.external_variant_id = $14
+          AND shadow_grant.channel_state_global_id = $15
+          AND shadow_grant.channel_state_row_version = $16::bigint
+          AND shadow_grant.channel_source_revision = $17
+          AND shadow_grant.channel_source_hash = $18
+          AND shadow_grant.asset_revision = $19::bigint
+          AND shadow_grant.asset_row_version = $20::bigint
+          AND shadow_grant.asset_content_sha256 = $21
+          AND shadow_grant.credential_generation = $22
+          AND shadow_grant.activation_revision = $4
          WHERE membership.organization_id = $1::uuid
-           AND membership.user_email = $5
+           AND membership.user_email = $23
            AND membership.status = 'active'
            AND membership.role IN ('owner', 'admin')
          RETURNING id::text`,
@@ -1012,23 +1560,52 @@ export async function prepareShopifyProductMediaProjectionInPostgres(input: {
           grantWithoutHash.organizationId,
           grantWithoutHash.integrationAccountId,
           grantWithoutHash.id,
-          grantWithoutHash.expiresAtEpoch,
+          grantWithoutHash.activationRevision,
+          RESOURCE_AUTHORIZATION_CONFIRMATION,
+          Math.min(
+            grantWithoutHash.expiresAtEpoch,
+            grantWithoutHash.issuedAtEpoch
+              + AUTHORIZATION_TTL_SECONDS,
+          ),
+          input.shadowSimulationEffectGlobalId,
+          grantWithoutHash.productId,
+          grantWithoutHash.channelStateId,
+          grantWithoutHash.imageAssetId,
+          grantWithoutHash.productReferenceCode,
+          grantWithoutHash.productSourceHash,
+          grantWithoutHash.productGid,
+          grantWithoutHash.externalVariantId,
+          grantWithoutHash.channelStateGlobalId,
+          grantWithoutHash.channelStateRowVersion,
+          grantWithoutHash.channelSourceRevision,
+          grantWithoutHash.channelSourceHash,
+          grantWithoutHash.assetRevision,
+          grantWithoutHash.assetRowVersion,
+          grantWithoutHash.assetContentSha256,
+          grantWithoutHash.credentialGeneration,
           input.actorEmail,
         ],
       )
-      productWriteAuthorizationId = authorization.rows[0]?.id || null
-      if (!productWriteAuthorizationId) {
+      if (!authorization.rows[0]?.id) {
         fail(
           'SHOPIFY_PRODUCT_MEDIA_AUTHORITY_SAVE_FAILED',
-          'Exact Shopify Product-image write authority could not be saved',
+          'The exact prior Shadow simulation could not authorize this one Product, listing, and image revision',
           403,
         )
       }
     }
-    return toGrant({
-      ...inserted.rows[0],
-      product_write_authorization_id: productWriteAuthorizationId,
+    const stored = await readExistingGrant(client, {
+      organizationId: grantWithoutHash.organizationId,
+      idempotencyKey: grantWithoutHash.idempotencyKey,
     })
+    if (!stored) {
+      fail(
+        'SHOPIFY_PRODUCT_MEDIA_GRANT_READ_FAILED',
+        'Shopify product media delivery evidence could not be reloaded',
+        500,
+      )
+    }
+    return stored
   })
 }
 
@@ -1326,7 +1903,21 @@ export async function readShopifyProductMediaDeliveryAssetInPostgres(input: {
   issuedAtEpoch: number
   expiresAtEpoch: number
   nowEpoch: number
+  signedToken: string
 }): Promise<ShopifyProductMediaDeliveryAsset> {
+  if (
+    input.signedToken.length > 2_048
+    || !/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(input.signedToken)
+  ) {
+    fail(
+      'SHOPIFY_PRODUCT_MEDIA_ASSET_UNAVAILABLE',
+      'Shopify product media is unavailable',
+      404,
+    )
+  }
+  const signedTokenSha256 = createHash('sha256')
+    .update(input.signedToken, 'utf8')
+    .digest('hex')
   return withTransaction(async (client) => {
     const result = await client.query<DeliveryRow>(
       `SELECT
@@ -1344,6 +1935,21 @@ export async function readShopifyProductMediaDeliveryAssetInPostgres(input: {
          image_asset.content_sha256 AS stored_content_sha256,
          image_asset.byte_length AS stored_byte_length
        FROM operations_shopify_product_media_delivery_grants media_grant
+       JOIN operations_shopify_product_media_write_authorizations auth
+         ON auth.organization_id = media_grant.organization_id
+        AND auth.delivery_grant_id = media_grant.id
+       JOIN operations_shopify_product_media_source_bindings source_binding
+         ON source_binding.organization_id = auth.organization_id
+        AND source_binding.integration_account_id =
+              auth.integration_account_id
+        AND source_binding.authorization_id = auth.id
+        AND source_binding.delivery_grant_id = media_grant.id
+       JOIN operations_commerce_external_effect_intents effect
+         ON effect.organization_id = auth.organization_id
+        AND effect.integration_account_id = auth.integration_account_id
+        AND effect.shopify_product_media_authorization_id = auth.id
+        AND effect.idempotency_key = media_grant.idempotency_key
+        AND effect.state IN ('claimed', 'succeeded', 'unknown')
        JOIN crm_product_image_assets image_asset
          ON image_asset.organization_id = media_grant.organization_id
         AND image_asset.pipeline_id = media_grant.pipeline_id
@@ -1355,9 +1961,20 @@ export async function readShopifyProductMediaDeliveryAssetInPostgres(input: {
          AND media_grant.image_asset_id = $4::uuid
          AND media_grant.asset_content_sha256 = $5
          AND media_grant.desired_mode = 'active'
+         AND operations_shopify_product_media_delivery_is_authorized(
+               media_grant.organization_id,
+               media_grant.id
+             )
          AND floor(extract(epoch FROM media_grant.issued_at)) = $6
          AND floor(extract(epoch FROM media_grant.expires_at)) = $7
          AND media_grant.expires_at > to_timestamp($8)
+         AND source_binding.signed_token_sha256 = $9
+         AND source_binding.token_product_id = $3::uuid
+         AND source_binding.token_image_asset_id = $4::uuid
+         AND source_binding.token_asset_content_sha256 = $5
+         AND source_binding.token_mode = 'active'
+         AND source_binding.token_issued_at_epoch = $6
+         AND source_binding.token_expires_at_epoch = $7
        LIMIT 1
        FOR SHARE OF media_grant, image_asset`,
       [
@@ -1369,6 +1986,7 @@ export async function readShopifyProductMediaDeliveryAssetInPostgres(input: {
         input.issuedAtEpoch,
         input.expiresAtEpoch,
         input.nowEpoch,
+        signedTokenSha256,
       ],
     )
     const row = result.rows[0]

@@ -70,6 +70,7 @@ type ShopifyProductImageProjection = {
   channelStateGlobalId: string
   imageAssetId: string
   imageAssetRevision: number
+  imageContentSha256: string
   mode: 'shadow' | 'active'
   replayed: boolean
   providerMutation: {
@@ -222,6 +223,9 @@ export default function ProductImagePanel({
         throw new Error(payload.error || 'Product images did not load')
       }
       setState(nextState)
+      setProjection(null)
+      setReconciliation(null)
+      setActivePublishConfirmed(false)
     } catch (loadError) {
       setState(null)
       setError(
@@ -273,6 +277,38 @@ export default function ProductImagePanel({
       assets.find((asset) => asset.isPrimary)?.id || assets[0]?.id || '',
     )
   }, [selectedShopifyAsset, state?.assets])
+
+  const selectedChannelEvidence = shopifyChannels.find(
+    (channel) => channel.globalId === selectedShopifyChannel,
+  ) || null
+  const selectedAssetEvidence = state?.assets.find(
+    (asset) => asset.id === selectedShopifyAsset,
+  ) || null
+  const exactShadowSimulation = projection?.mode === 'shadow'
+    && projection.productReferenceCode === state?.product.referenceCode
+    && projection.channelStateGlobalId
+      === selectedChannelEvidence?.globalId
+    && projection.imageAssetId === selectedAssetEvidence?.id
+    && projection.imageAssetRevision
+      === selectedAssetEvidence?.assetRevision
+    && projection.imageContentSha256
+      === selectedAssetEvidence?.contentSha256
+    && projection.externalEffect.state === 'simulated'
+    && projection.externalEffect.providerWriteCount === 0
+    ? projection
+    : null
+
+  useEffect(() => {
+    setProjection(null)
+    setReconciliation(null)
+    setActivePublishConfirmed(false)
+  }, [
+    selectedChannelEvidence?.rowVersion,
+    selectedChannelEvidence?.sourceRevision,
+    selectedAssetEvidence?.assetRevision,
+    selectedAssetEvidence?.rowVersion,
+    selectedAssetEvidence?.contentSha256,
+  ])
 
   const chooseFile = (event: ChangeEvent<HTMLInputElement>) => {
     setError('')
@@ -382,6 +418,9 @@ export default function ProductImagePanel({
         throw new Error(payload.error || 'Product image was not uploaded')
       }
       setState(nextState)
+      setProjection(null)
+      setReconciliation(null)
+      setActivePublishConfirmed(false)
       setSelectedFile(null)
       setAltText('')
       setSetPrimary(false)
@@ -428,6 +467,9 @@ export default function ProductImagePanel({
         throw new Error(payload.error || 'Primary product image was not changed')
       }
       setState(nextState)
+      setProjection(null)
+      setReconciliation(null)
+      setActivePublishConfirmed(false)
       setNotice(`Image revision ${asset.assetRevision} is now primary.`)
     } catch (primaryError) {
       setError(
@@ -445,8 +487,19 @@ export default function ProductImagePanel({
       setError('Choose an exact Shopify listing and image revision.')
       return
     }
-    if (executeProviderWrite && !activePublishConfirmed) {
-      setError('Confirm the Active Shopify write before publishing.')
+    const selectedChannel = selectedChannelEvidence
+    const selectedAsset = selectedAssetEvidence
+    if (!selectedChannel || !selectedAsset || !state?.product) {
+      setError('Refresh and choose an exact Shopify listing and image revision.')
+      return
+    }
+    if (
+      executeProviderWrite
+      && (!activePublishConfirmed || !exactShadowSimulation)
+    ) {
+      setError(
+        'Run the exact zero-write Shadow simulation, then confirm this one Product, listing, and image revision.',
+      )
       return
     }
     setProjecting(true)
@@ -468,6 +521,17 @@ export default function ProductImagePanel({
             assetId: selectedShopifyAsset,
             channelStateGlobalId: selectedShopifyChannel,
             executeProviderWrite,
+            expectedProductReferenceCode: state.product.referenceCode,
+            expectedChannelStateRowVersion: selectedChannel.rowVersion,
+            expectedChannelSourceRevision:
+              selectedChannel.sourceRevision,
+            expectedAssetRevision: selectedAsset.assetRevision,
+            expectedAssetRowVersion: selectedAsset.rowVersion,
+            expectedAssetContentSha256:
+              selectedAsset.contentSha256,
+            shadowSimulationEffectGlobalId: executeProviderWrite
+              ? exactShadowSimulation!.externalEffect.globalId
+              : null,
           }),
         },
       )
@@ -836,9 +900,10 @@ export default function ProductImagePanel({
             </Stack>
 
             <Alert severity="warning">
-              Active publishes the selected image to the exact Shopify Product.
-              It is a real provider write and can only succeed when the
-              Operations activation scope is Active.
+              One-resource authorization publishes only the selected ClawPilot
+              Product, exact Shopify listing, and exact primary image revision.
+              Operations stays globally Shadow. This authority cannot be used
+              for another Product, listing, image, category, or bulk update.
             </Alert>
             <FormControlLabel
               control={(
@@ -847,10 +912,13 @@ export default function ProductImagePanel({
                   onChange={(event) => setActivePublishConfirmed(
                     event.target.checked,
                   )}
-                  disabled={projecting}
+                  disabled={
+                    projecting
+                    || !exactShadowSimulation
+                  }
                 />
               )}
-              label="I confirm this exact Active Shopify image write"
+              label="I authorize one provider write for this exact Product, listing, and image revision only"
             />
             <Button
               color="warning"
@@ -859,12 +927,15 @@ export default function ProductImagePanel({
               disabled={
                 projecting
                 || !activePublishConfirmed
+                || !exactShadowSimulation
                 || !selectedShopifyChannel
                 || !selectedShopifyAsset
               }
               sx={{ alignSelf: 'flex-start' }}
             >
-              {projecting ? 'Publishing…' : 'Publish in Active'}
+              {projecting
+                ? 'Publishing exact image…'
+                : 'Publish this exact image once'}
             </Button>
 
             {projection ? (
@@ -873,7 +944,7 @@ export default function ProductImagePanel({
               >
                 {projection.mode === 'shadow'
                   ? 'Shadow simulation'
-                  : 'Active provider command'}
+                  : 'One-resource provider command'}
                 {' · '}
                 {projection.externalEffect.state}
                 {' · '}

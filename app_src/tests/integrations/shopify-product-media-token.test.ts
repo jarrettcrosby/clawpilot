@@ -121,6 +121,16 @@ test('fails closed on payload, signature, path, extra-field, and expiry tamperin
       'SHOPIFY_PRODUCT_MEDIA_TOKEN_EXPIRED',
     ),
   )
+  assert.throws(
+    () => signShopifyProductMediaToken({
+      ...payload,
+      exp: payload.iat + 901,
+    }, secret),
+    (error: unknown) => hasCode(
+      error,
+      'SHOPIFY_PRODUCT_MEDIA_TOKEN_INVALID',
+    ),
+  )
 })
 
 test('shadow evidence tokens are bounded and never publicly deliverable', () => {

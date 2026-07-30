@@ -58,18 +58,37 @@ test('CRM Product editor integrates the responsive image panel', () => {
   assert.match(panel, /direction=\{\{ xs: 'column', sm: 'row' \}\}/)
 })
 
-test('Shopify publishing is an exact Shadow or explicitly confirmed Active command', () => {
+test('Shopify publishing stays Shadow and requires one exact resource authorization', () => {
   assert.match(panel, /data-testid="crm-shopify-image-publishing"/)
   assert.match(panel, /\/shopify-product-image/)
   assert.match(panel, /action: 'publish-product-image'/)
   assert.match(panel, /channelStateGlobalId: selectedShopifyChannel/)
   assert.match(panel, /assetId: selectedShopifyAsset/)
   assert.match(panel, /executeProviderWrite/)
+  assert.match(panel, /expectedProductReferenceCode/)
+  assert.match(panel, /expectedChannelStateRowVersion/)
+  assert.match(panel, /expectedChannelSourceRevision/)
+  assert.match(panel, /expectedAssetRevision/)
+  assert.match(panel, /expectedAssetRowVersion/)
+  assert.match(panel, /expectedAssetContentSha256/)
+  assert.match(panel, /shadowSimulationEffectGlobalId/)
   assert.doesNotMatch(panel, /idempotencyKey/)
   assert.match(panel, /Shopify received zero writes/)
-  assert.match(panel, /I confirm this exact Active Shopify image write/)
+  assert.match(
+    panel,
+    /I authorize one provider write for this exact Product, listing, and image revision only/,
+  )
+  assert.match(panel, /Operations stays globally Shadow/)
+  assert.match(
+    panel,
+    /another Product, listing, image, category, or bulk update/,
+  )
+  assert.match(panel, /setProjection\(null\)/)
+  assert.match(panel, /setActivePublishConfirmed\(false\)/)
   assert.match(panel, /Publishing adds media to Shopify/)
   assert.match(panel, /separate reorder completes/)
   assert.match(panel, /featured position not changed/)
+  assert.doesNotMatch(panel, /Publish in Active/)
+  assert.doesNotMatch(panel, /activation scope is Active/)
   assert.doesNotMatch(panel, /Shopify primary image (?:published|updated|complete)/i)
 })

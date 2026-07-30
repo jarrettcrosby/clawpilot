@@ -55,6 +55,7 @@ export async function GET(
       issuedAtEpoch: payload.iat,
       expiresAtEpoch: payload.exp,
       nowEpoch,
+      signedToken: token,
     })
     return new NextResponse(Buffer.from(asset.bytes), {
       status: 200,

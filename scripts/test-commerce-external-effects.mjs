@@ -84,6 +84,9 @@ const migration = read(
 const mediaAuthorityMigration = read(
   'db/migrations/0155_shopify_product_media_authority_and_reconciliation.sql',
 )
+const shadowMediaAuthorityMigration = read(
+  'db/migrations/0160_operations_shopify_product_media_shadow_authority.sql',
+)
 const persistence = read(
   'app_src/lib/persistence/commerceExternalEffects.ts',
 )
@@ -118,6 +121,18 @@ includes(mediaAuthorityMigration, [
   'activation_state IS DISTINCT FROM NEW.desired_mode',
   'activation_revision IS DISTINCT FROM NEW.activation_revision',
 ], 'Exact Shopify product-media authority exception')
+includes(shadowMediaAuthorityMigration, [
+  'operations_shopify_product_media_source_bindings',
+  'source_url_sha256',
+  'signed_token_sha256',
+  "token_mode text NOT NULL CHECK (token_mode = 'active')",
+  "expires_at <= authorized_at + interval '5 minutes'",
+  'token_issued_at_epoch + (15 * 60)',
+  "->'patch'->'media'->>'originalSourceSha256'",
+  'source_binding.source_url_sha256',
+  "->'patch'->'media'->>'sourceHost'",
+  'source_binding.source_host',
+], 'Exact Shopify product-media signed-source binding')
 
 const fenceProtection = section(
   migration,
@@ -228,6 +243,11 @@ includes(persistence, [
   'input.redactedResult.providerWrites !== input.providerWriteCount',
   'const providerWriteCount = input.providerWriteCount',
   'claim_lease_expired_reconciliation_required',
+  'operations_shopify_product_media_source_bindings source_binding',
+  "->'patch'->'media'->>'originalSourceSha256'",
+  'source_binding.source_url_sha256',
+  "->'patch'->'media'->>'sourceHost'",
+  'source_binding.source_host',
 ], 'External-effect persistence')
 
 const rowMapper = section(

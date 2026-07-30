@@ -20,6 +20,9 @@ export type ShopifyProductMediaProjectionGrant = {
   channelStateRowVersion: number
   channelSourceRevision: string
   channelSourceHash: string
+  externalVariantId: string
+  channelNormalizedStatus: 'active'
+  channelProviderActive: true
   assetRevision: number
   assetRowVersion: number
   assetContentSha256: string
@@ -35,6 +38,15 @@ export type ShopifyProductMediaProjectionGrant = {
   issuedAtEpoch: number
   expiresAtEpoch: number
   createdBy: string
+  resourceAuthorization: null | {
+    id: string
+    shadowSimulationEffectGlobalId: string
+    providerWriteActivationRevision: number
+    authorizedAtEpoch: number
+    expiresAtEpoch: number
+    confirmationStatementVersion:
+      'shopify-product-image-shadow-provider-write-v1'
+  }
 }
 
 export type ShopifyProductMediaDeliveryAsset = {

@@ -534,8 +534,11 @@ function assertCurrentAccountFence(
     account.provider !== input.provider
     || (
       input.desiredMode === 'active'
-      && account.status !== 'active'
-      && !exactProductMediaAuthority
+      && (
+        exactProductMediaAuthority
+          ? account.status === 'error'
+          : account.status !== 'active'
+      )
     )
     || (
       input.desiredMode === 'shadow'
@@ -551,7 +554,9 @@ function assertCurrentAccountFence(
     )
   }
   if (
-    account.activation_state !== input.desiredMode
+    account.activation_state !== (
+      exactProductMediaAuthority ? 'shadow' : input.desiredMode
+    )
     || account.activation_revision !== input.activationRevision
   ) {
     externalEffectError(
@@ -575,6 +580,7 @@ async function exactShopifyProductMediaAuthorityIsCurrent(
     aggregateRevision: number
     aggregateHash: string
     idempotencyKey: string
+    redactedRequest: Record<string, unknown>
     shopifyProductMediaAuthorizationId?: string | null
     actorEmail?: string | null
   },
@@ -598,11 +604,57 @@ async function exactShopifyProductMediaAuthorityIsCurrent(
        JOIN operations_shopify_product_media_delivery_grants media_grant
          ON media_grant.organization_id = auth.organization_id
         AND media_grant.id = auth.delivery_grant_id
+       JOIN operations_shopify_product_media_source_bindings
+         source_binding
+         ON source_binding.organization_id = auth.organization_id
+        AND source_binding.integration_account_id =
+              auth.integration_account_id
+        AND source_binding.authorization_id = auth.id
+        AND source_binding.delivery_grant_id = media_grant.id
+       JOIN operations_integration_accounts media_account
+         ON media_account.organization_id = auth.organization_id
+        AND media_account.id = auth.integration_account_id
+       JOIN operations_commerce_credentials media_credential
+         ON media_credential.organization_id = media_account.organization_id
+        AND media_credential.integration_account_id = media_account.id
+       JOIN operations_activation_scopes media_activation
+         ON media_activation.organization_id = media_account.organization_id
+       JOIN crm_products media_product
+         ON media_product.pipeline_id = media_grant.pipeline_id
+        AND media_product.id = media_grant.product_id
+       JOIN operations_product_channel_states media_channel
+         ON media_channel.organization_id = media_grant.organization_id
+        AND media_channel.integration_account_id =
+              media_grant.integration_account_id
+        AND media_channel.id = media_grant.channel_state_id
+       JOIN operations_product_mappings media_mapping
+         ON media_mapping.organization_id = media_channel.organization_id
+        AND media_mapping.integration_account_id =
+              media_channel.integration_account_id
+        AND media_mapping.pipeline_id = media_channel.pipeline_id
+        AND media_mapping.id = media_channel.product_mapping_id
+       JOIN crm_product_image_assets media_asset
+         ON media_asset.organization_id = media_grant.organization_id
+        AND media_asset.pipeline_id = media_grant.pipeline_id
+        AND media_asset.product_id = media_grant.product_id
+        AND media_asset.id = media_grant.image_asset_id
+       JOIN operations_commerce_external_effect_intents simulation
+         ON simulation.organization_id = auth.organization_id
+        AND simulation.id = auth.simulation_effect_id
+       JOIN operations_shopify_product_media_delivery_grants
+         simulation_grant
+         ON simulation_grant.organization_id = simulation.organization_id
+        AND simulation_grant.integration_account_id =
+              simulation.integration_account_id
+        AND simulation_grant.idempotency_key = simulation.idempotency_key
        WHERE auth.organization_id = $1::uuid
          AND auth.id = $2::uuid
          AND auth.integration_account_id = $3::uuid
          AND auth.authorized_by = $4
          AND auth.expires_at > clock_timestamp()
+         AND auth.provider_write_activation_revision = $6
+         AND auth.confirmation_statement_version =
+               'shopify-product-image-shadow-provider-write-v1'
          AND media_grant.desired_mode = 'active'
          AND media_grant.credential_generation = $5
          AND media_grant.activation_revision = $6
@@ -610,6 +662,98 @@ async function exactShopifyProductMediaAuthorityIsCurrent(
          AND media_grant.aggregate_revision = $8::bigint
          AND media_grant.aggregate_hash = $9
          AND media_grant.idempotency_key = $10
+         AND $11::jsonb->>'productMediaAuthorizationId' =
+               auth.id::text
+         AND $11::jsonb->>'deliveryGrantId' =
+               media_grant.id::text
+         AND $11::jsonb
+               ->'patch'->'media'->>'originalSourceSha256' =
+               source_binding.source_url_sha256
+         AND $11::jsonb
+               ->'patch'->'media'->>'sourceHost' =
+               source_binding.source_host
+         AND media_grant.external_variant_id =
+               media_channel.external_variant_id
+         AND media_grant.channel_normalized_status = 'active'
+         AND media_grant.channel_provider_active = true
+         AND media_account.integration_type = 'commerce'
+         AND media_account.provider = 'shopify'
+         AND media_account.status IN ('active', 'disabled')
+         AND media_account.commerce_credential_generation = $5
+         AND media_credential.credential_version = $5
+         AND media_credential.verification_status = 'verified'
+         AND media_activation.state = 'shadow'
+         AND media_activation.revision = $6
+         AND media_product.reference_code =
+               media_grant.product_reference_code
+         AND media_product.source_hash = media_grant.product_source_hash
+         AND media_channel.product_id = media_grant.product_id
+         AND media_channel.global_id =
+               media_grant.channel_state_global_id
+         AND media_channel.external_product_id = media_grant.product_gid
+         AND media_channel.external_variant_id =
+               media_grant.external_variant_id
+         AND media_channel.row_version =
+               media_grant.channel_state_row_version
+         AND media_channel.source_revision =
+               media_grant.channel_source_revision
+         AND media_channel.source_hash =
+               media_grant.channel_source_hash
+         AND media_channel.normalized_status = 'active'
+         AND media_channel.provider_active = true
+         AND media_mapping.product_id = media_grant.product_id
+         AND media_mapping.external_product_id = media_grant.product_gid
+         AND media_mapping.external_variant_id =
+               media_grant.external_variant_id
+         AND media_mapping.active = true
+         AND media_asset.asset_revision = media_grant.asset_revision
+         AND media_asset.row_version = media_grant.asset_row_version
+         AND media_asset.content_sha256 =
+               media_grant.asset_content_sha256
+         AND media_asset.is_primary = true
+         AND simulation.provider = 'shopify'
+         AND simulation.action = 'shopify.product.update'
+         AND simulation.desired_mode = 'shadow'
+         AND simulation.state = 'simulated'
+         AND simulation.provider_write_count = 0
+         AND simulation_grant.desired_mode = 'shadow'
+         AND simulation_grant.product_id = media_grant.product_id
+         AND simulation_grant.channel_state_id =
+               media_grant.channel_state_id
+         AND simulation_grant.image_asset_id = media_grant.image_asset_id
+         AND simulation_grant.product_reference_code =
+               media_grant.product_reference_code
+         AND simulation_grant.product_source_hash =
+               media_grant.product_source_hash
+         AND simulation_grant.product_gid = media_grant.product_gid
+         AND simulation_grant.external_variant_id =
+               media_grant.external_variant_id
+         AND simulation_grant.channel_state_row_version =
+               media_grant.channel_state_row_version
+         AND simulation_grant.channel_source_revision =
+               media_grant.channel_source_revision
+         AND simulation_grant.channel_source_hash =
+               media_grant.channel_source_hash
+         AND simulation_grant.asset_revision = media_grant.asset_revision
+         AND simulation_grant.asset_row_version =
+               media_grant.asset_row_version
+         AND simulation_grant.asset_content_sha256 =
+               media_grant.asset_content_sha256
+         AND simulation_grant.credential_generation =
+               media_grant.credential_generation
+         AND simulation_grant.activation_revision =
+               media_grant.activation_revision
+         AND NOT EXISTS (
+           SELECT 1
+           FROM operations_product_channel_states sibling
+           WHERE sibling.organization_id = media_grant.organization_id
+             AND sibling.integration_account_id =
+                   media_grant.integration_account_id
+             AND sibling.provider = 'shopify'
+             AND sibling.external_product_id = media_grant.product_gid
+             AND sibling.product_id IS NOT NULL
+             AND sibling.product_id <> media_grant.product_id
+         )
      ) AS authorized`,
     [
       input.organizationId,
@@ -622,6 +766,7 @@ async function exactShopifyProductMediaAuthorityIsCurrent(
       input.aggregateRevision,
       input.aggregateHash,
       input.idempotencyKey,
+      JSON.stringify(input.redactedRequest),
     ],
   )
   if (result.rows[0]?.authorized !== true) {
@@ -921,35 +1066,153 @@ export async function prepareCommerceExternalEffectInPostgres(input: {
   })
 }
 
+function exactProductMediaClaimAuthoritySql(alias: string) {
+  return `EXISTS (
+    SELECT 1
+    FROM operations_shopify_product_media_write_authorizations auth
+    JOIN operations_shopify_product_media_delivery_grants media_grant
+      ON media_grant.organization_id = auth.organization_id
+     AND media_grant.id = auth.delivery_grant_id
+    JOIN operations_shopify_product_media_source_bindings source_binding
+      ON source_binding.organization_id = auth.organization_id
+     AND source_binding.integration_account_id =
+           auth.integration_account_id
+     AND source_binding.authorization_id = auth.id
+     AND source_binding.delivery_grant_id = media_grant.id
+    JOIN crm_products media_product
+      ON media_product.pipeline_id = media_grant.pipeline_id
+     AND media_product.id = media_grant.product_id
+    JOIN operations_product_channel_states media_channel
+      ON media_channel.organization_id = media_grant.organization_id
+     AND media_channel.integration_account_id =
+           media_grant.integration_account_id
+     AND media_channel.id = media_grant.channel_state_id
+    JOIN operations_product_mappings media_mapping
+      ON media_mapping.organization_id = media_channel.organization_id
+     AND media_mapping.integration_account_id =
+           media_channel.integration_account_id
+     AND media_mapping.pipeline_id = media_channel.pipeline_id
+     AND media_mapping.id = media_channel.product_mapping_id
+    JOIN crm_product_image_assets media_asset
+      ON media_asset.organization_id = media_grant.organization_id
+     AND media_asset.pipeline_id = media_grant.pipeline_id
+     AND media_asset.product_id = media_grant.product_id
+     AND media_asset.id = media_grant.image_asset_id
+    JOIN operations_commerce_external_effect_intents simulation
+      ON simulation.organization_id = auth.organization_id
+     AND simulation.id = auth.simulation_effect_id
+    JOIN operations_shopify_product_media_delivery_grants simulation_grant
+      ON simulation_grant.organization_id = simulation.organization_id
+     AND simulation_grant.integration_account_id =
+           simulation.integration_account_id
+     AND simulation_grant.idempotency_key = simulation.idempotency_key
+    WHERE auth.organization_id = ${alias}.organization_id
+      AND auth.id = ${alias}.shopify_product_media_authorization_id
+      AND auth.integration_account_id = ${alias}.integration_account_id
+      AND auth.expires_at > clock_timestamp()
+      AND auth.provider_write_activation_revision =
+            ${alias}.activation_revision
+      AND auth.confirmation_statement_version =
+            'shopify-product-image-shadow-provider-write-v1'
+      AND media_grant.desired_mode = 'active'
+      AND media_grant.credential_generation =
+            ${alias}.credential_generation
+      AND media_grant.activation_revision = ${alias}.activation_revision
+      AND media_grant.product_reference_code = ${alias}.aggregate_id
+      AND media_grant.aggregate_revision = ${alias}.aggregate_revision
+      AND media_grant.aggregate_hash = ${alias}.aggregate_hash
+      AND media_grant.idempotency_key = ${alias}.idempotency_key
+      AND ${alias}.redacted_request->>'productMediaAuthorizationId' =
+            auth.id::text
+      AND ${alias}.redacted_request->>'deliveryGrantId' =
+            media_grant.id::text
+      AND ${alias}.redacted_request
+            ->'patch'->'media'->>'originalSourceSha256' =
+            source_binding.source_url_sha256
+      AND ${alias}.redacted_request
+            ->'patch'->'media'->>'sourceHost' =
+            source_binding.source_host
+      AND media_grant.channel_normalized_status = 'active'
+      AND media_grant.channel_provider_active = true
+      AND media_product.reference_code =
+            media_grant.product_reference_code
+      AND media_product.source_hash = media_grant.product_source_hash
+      AND media_channel.product_id = media_grant.product_id
+      AND media_channel.global_id = media_grant.channel_state_global_id
+      AND media_channel.external_product_id = media_grant.product_gid
+      AND media_channel.external_variant_id =
+            media_grant.external_variant_id
+      AND media_channel.row_version = media_grant.channel_state_row_version
+      AND media_channel.source_revision =
+            media_grant.channel_source_revision
+      AND media_channel.source_hash = media_grant.channel_source_hash
+      AND media_channel.normalized_status = 'active'
+      AND media_channel.provider_active = true
+      AND media_mapping.product_id = media_grant.product_id
+      AND media_mapping.external_product_id = media_grant.product_gid
+      AND media_mapping.external_variant_id =
+            media_grant.external_variant_id
+      AND media_mapping.active = true
+      AND media_asset.asset_revision = media_grant.asset_revision
+      AND media_asset.row_version = media_grant.asset_row_version
+      AND media_asset.content_sha256 = media_grant.asset_content_sha256
+      AND media_asset.is_primary = true
+      AND simulation.provider = 'shopify'
+      AND simulation.action = 'shopify.product.update'
+      AND simulation.desired_mode = 'shadow'
+      AND simulation.state = 'simulated'
+      AND simulation.provider_write_count = 0
+      AND simulation_grant.desired_mode = 'shadow'
+      AND simulation_grant.product_id = media_grant.product_id
+      AND simulation_grant.channel_state_id = media_grant.channel_state_id
+      AND simulation_grant.image_asset_id = media_grant.image_asset_id
+      AND simulation_grant.product_reference_code =
+            media_grant.product_reference_code
+      AND simulation_grant.product_source_hash =
+            media_grant.product_source_hash
+      AND simulation_grant.product_gid = media_grant.product_gid
+      AND simulation_grant.external_variant_id =
+            media_grant.external_variant_id
+      AND simulation_grant.channel_state_row_version =
+            media_grant.channel_state_row_version
+      AND simulation_grant.channel_source_revision =
+            media_grant.channel_source_revision
+      AND simulation_grant.channel_source_hash =
+            media_grant.channel_source_hash
+      AND simulation_grant.asset_revision = media_grant.asset_revision
+      AND simulation_grant.asset_row_version =
+            media_grant.asset_row_version
+      AND simulation_grant.asset_content_sha256 =
+            media_grant.asset_content_sha256
+      AND simulation_grant.credential_generation =
+            media_grant.credential_generation
+      AND simulation_grant.activation_revision =
+            media_grant.activation_revision
+      AND NOT EXISTS (
+        SELECT 1
+        FROM operations_product_channel_states sibling
+        WHERE sibling.organization_id = media_grant.organization_id
+          AND sibling.integration_account_id =
+                media_grant.integration_account_id
+          AND sibling.provider = 'shopify'
+          AND sibling.external_product_id = media_grant.product_gid
+          AND sibling.product_id IS NOT NULL
+          AND sibling.product_id <> media_grant.product_id
+      )
+  )`
+}
+
 function claimabilitySql(alias = 'intent') {
+  const exactProductMediaAuthority =
+    exactProductMediaClaimAuthoritySql(alias)
   return `(
     ${alias}.state = 'pending'
     AND ${alias}.desired_mode = 'active'
     AND (
       account.status = 'active'
-      OR EXISTS (
-        SELECT 1
-        FROM operations_shopify_product_media_write_authorizations auth
-        JOIN operations_shopify_product_media_delivery_grants media_grant
-          ON media_grant.organization_id = auth.organization_id
-         AND media_grant.id = auth.delivery_grant_id
-        WHERE auth.organization_id = ${alias}.organization_id
-          AND auth.id =
-                ${alias}.shopify_product_media_authorization_id
-          AND auth.integration_account_id =
-                ${alias}.integration_account_id
-          AND auth.expires_at > clock_timestamp()
-          AND media_grant.desired_mode = 'active'
-          AND media_grant.credential_generation =
-                ${alias}.credential_generation
-          AND media_grant.activation_revision =
-                ${alias}.activation_revision
-          AND media_grant.product_reference_code =
-                ${alias}.aggregate_id
-          AND media_grant.aggregate_revision =
-                ${alias}.aggregate_revision
-          AND media_grant.aggregate_hash = ${alias}.aggregate_hash
-          AND media_grant.idempotency_key = ${alias}.idempotency_key
+      OR (
+        account.status = 'disabled'
+        AND ${exactProductMediaAuthority}
       )
     )
     AND account.integration_type = 'commerce'
@@ -958,7 +1221,13 @@ function claimabilitySql(alias = 'intent') {
       ${alias}.credential_generation
     AND credential.credential_version = ${alias}.credential_generation
     AND credential.verification_status = 'verified'
-    AND activation.state = 'active'
+    AND (
+      activation.state = 'active'
+      OR (
+        activation.state = 'shadow'
+        AND ${exactProductMediaAuthority}
+      )
+    )
     AND activation.revision = ${alias}.activation_revision
     AND fence.aggregate_revision = ${alias}.aggregate_revision
     AND fence.aggregate_hash = ${alias}.aggregate_hash

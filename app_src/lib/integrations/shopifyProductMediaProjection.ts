@@ -11,10 +11,14 @@ import {
   type ShopifyProductMediaProjectionGrant,
 } from '@/lib/integrations/shopifyProductMediaProjectionTypes'
 import {
+  assertShopifyProductMediaTokenIsDeliverable,
   resolveShopifyProductMediaSigningSecret,
   signShopifyProductMediaToken,
+  verifyShopifyProductMediaToken,
+  type ShopifyProductMediaTokenPayload,
 } from '@/lib/integrations/shopifyProductMediaTokens'
 import {
+  bindShopifyProductMediaDeliverySourceInPostgres,
   prepareShopifyProductMediaProjectionInPostgres,
   readShopifyProductMediaReconciliationContextInPostgres,
   recordShopifyProductMediaStatusObservationInPostgres,
@@ -25,6 +29,9 @@ import {
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 const CHANNEL_GLOBAL_PATTERN = /^gpcs[0-9]{7}$/
+const PRODUCT_REFERENCE_PATTERN = /^gp[0-9]{7}$/
+const EFFECT_GLOBAL_PATTERN = /^gcef[0-9]{7}$/
+const SHA256_PATTERN = /^[0-9a-f]{64}$/
 const SAFE_IDENTIFIER_PATTERN = /^[\x20-\x7e]+$/
 const PUBLIC_MEDIA_PATH =
   '/api/integrations/commerce/shopify/product-media/'
@@ -75,6 +82,8 @@ export type ShopifyProductImagePublishResult = {
 export type ShopifyProductMediaProjectionDependencies = {
   prepareProjection:
     typeof prepareShopifyProductMediaProjectionInPostgres
+  bindDeliverySource:
+    typeof bindShopifyProductMediaDeliverySourceInPostgres
   resolveProviderIdentity:
     typeof resolveShopifyProductMediaProviderIdentityInPostgres
   executeWriteback: typeof executeShopifyProductWriteback
@@ -104,6 +113,8 @@ ShopifyProductMediaReconciliationDependencies = {
 
 const DEFAULT_DEPENDENCIES: ShopifyProductMediaProjectionDependencies = {
   prepareProjection: prepareShopifyProductMediaProjectionInPostgres,
+  bindDeliverySource:
+    bindShopifyProductMediaDeliverySourceInPostgres,
   resolveProviderIdentity:
     resolveShopifyProductMediaProviderIdentityInPostgres,
   executeWriteback: executeShopifyProductWriteback,
@@ -142,14 +153,35 @@ function channelStateGlobalId(value: unknown) {
 function publishIdempotencyKey(input: {
   integrationAccountGlobalId: string
   productGid: string
+  externalVariantId: string
+  productReferenceCode: string
+  channelStateGlobalId: string
+  channelStateRowVersion: number
+  channelSourceRevision: string
+  channelSourceHash: string
   imageAssetId: string
+  assetRevision: number
+  assetRowVersion: number
+  assetContentSha256: string
+  shadowSimulationEffectGlobalId: string | null
   executeProviderWrite: boolean
 }) {
   const digest = createHash('sha256')
     .update(JSON.stringify({
       account: input.integrationAccountGlobalId,
       product: input.productGid,
+      variant: input.externalVariantId,
+      productReference: input.productReferenceCode,
+      channelState: input.channelStateGlobalId,
+      channelRowVersion: input.channelStateRowVersion,
+      channelSourceRevision: input.channelSourceRevision,
+      channelSourceHash: input.channelSourceHash,
       asset: input.imageAssetId,
+      assetRevision: input.assetRevision,
+      assetRowVersion: input.assetRowVersion,
+      assetContentSha256: input.assetContentSha256,
+      shadowSimulationEffect:
+        input.shadowSimulationEffectGlobalId,
       mode: input.executeProviderWrite ? 'active' : 'shadow',
     }), 'utf8')
     .digest('hex')
@@ -211,11 +243,12 @@ function assertPublicForActive(url: URL) {
   }
 }
 
-function deliveryUrl(
+function deliverySource(
   grant: ShopifyProductMediaProjectionGrant,
   secret: Uint8Array,
+  nowEpoch: number,
 ) {
-  const token = signShopifyProductMediaToken({
+  const expected: ShopifyProductMediaTokenPayload = {
     v: 1,
     g: grant.id,
     o: grant.organizationId,
@@ -225,8 +258,38 @@ function deliveryUrl(
     m: grant.mode,
     iat: grant.issuedAtEpoch,
     exp: grant.expiresAtEpoch,
-  }, secret)
-  return `${grant.publicOrigin}${PUBLIC_MEDIA_PATH}${token}`
+  }
+  const token = signShopifyProductMediaToken(expected, secret)
+  const verifiedToken = verifyShopifyProductMediaToken(
+    token,
+    secret,
+    nowEpoch,
+  )
+  if (
+    verifiedToken.v !== expected.v
+    || verifiedToken.g !== expected.g
+    || verifiedToken.o !== expected.o
+    || verifiedToken.p !== expected.p
+    || verifiedToken.a !== expected.a
+    || verifiedToken.h !== expected.h
+    || verifiedToken.m !== expected.m
+    || verifiedToken.iat !== expected.iat
+    || verifiedToken.exp !== expected.exp
+  ) {
+    fail(
+      'SHOPIFY_PRODUCT_MEDIA_SIGNED_SOURCE_MISMATCH',
+      'The signed Shopify product media source does not match its exact delivery grant',
+      500,
+    )
+  }
+  if (grant.mode === 'active') {
+    assertShopifyProductMediaTokenIsDeliverable(verifiedToken)
+  }
+  return {
+    originalSource:
+      `${grant.publicOrigin}${PUBLIC_MEDIA_PATH}${token}`,
+    verifiedToken,
+  }
 }
 
 function publicResult(
@@ -277,7 +340,9 @@ function publicResult(
  * Resolve all provider identities, revisions, credential fences, hashes, and
  * media facts server-side. The browser supplies only exact local selections,
  * while the server derives the replay-stable idempotency key and requires the
- * explicit Active-write confirmation flag.
+ * explicit one-resource provider-write confirmation flag. Operations remains
+ * globally Shadow; a provider write is possible only after the exact
+ * zero-write Shadow simulation is rebound to a short-lived one-use authority.
  */
 export async function executeShopifyProductImagePublish(
   rawInput: {
@@ -286,6 +351,13 @@ export async function executeShopifyProductImagePublish(
     channelStateGlobalId: unknown
     imageAssetId: unknown
     executeProviderWrite: unknown
+    expectedProductReferenceCode: unknown
+    expectedChannelStateRowVersion: unknown
+    expectedChannelSourceRevision: unknown
+    expectedAssetRevision: unknown
+    expectedAssetRowVersion: unknown
+    expectedAssetContentSha256: unknown
+    shadowSimulationEffectGlobalId: unknown
     publicOrigin: unknown
     actorEmail: string
   },
@@ -305,8 +377,63 @@ export async function executeShopifyProductImagePublish(
     ),
     imageAssetId: uuid(rawInput.imageAssetId, 'Product image'),
     executeProviderWrite: rawInput.executeProviderWrite,
+    expectedProductReferenceCode: String(
+      rawInput.expectedProductReferenceCode || '',
+    ).trim().toLowerCase(),
+    expectedChannelStateRowVersion: Number(
+      rawInput.expectedChannelStateRowVersion,
+    ),
+    expectedChannelSourceRevision: String(
+      rawInput.expectedChannelSourceRevision || '',
+    ).trim(),
+    expectedAssetRevision: Number(rawInput.expectedAssetRevision),
+    expectedAssetRowVersion: Number(rawInput.expectedAssetRowVersion),
+    expectedAssetContentSha256: String(
+      rawInput.expectedAssetContentSha256 || '',
+    ).trim().toLowerCase(),
+    shadowSimulationEffectGlobalId:
+      rawInput.shadowSimulationEffectGlobalId === null
+        || rawInput.shadowSimulationEffectGlobalId === undefined
+        ? null
+        : String(rawInput.shadowSimulationEffectGlobalId)
+          .trim()
+          .toLowerCase(),
     publicOrigin: normalizePublicOrigin(rawInput.publicOrigin),
     actorEmail: rawInput.actorEmail,
+  }
+  if (
+    !PRODUCT_REFERENCE_PATTERN.test(
+      localSelection.expectedProductReferenceCode,
+    )
+    || !Number.isSafeInteger(
+      localSelection.expectedChannelStateRowVersion,
+    )
+    || localSelection.expectedChannelStateRowVersion < 0
+    || !localSelection.expectedChannelSourceRevision
+    || localSelection.expectedChannelSourceRevision.length > 2_048
+    || !Number.isSafeInteger(localSelection.expectedAssetRevision)
+    || localSelection.expectedAssetRevision < 1
+    || !Number.isSafeInteger(localSelection.expectedAssetRowVersion)
+    || localSelection.expectedAssetRowVersion < 1
+    || !SHA256_PATTERN.test(
+      localSelection.expectedAssetContentSha256,
+    )
+    || (
+      localSelection.executeProviderWrite
+      && !EFFECT_GLOBAL_PATTERN.test(
+        localSelection.shadowSimulationEffectGlobalId || '',
+      )
+    )
+    || (
+      !localSelection.executeProviderWrite
+      && localSelection.shadowSimulationEffectGlobalId !== null
+    )
+  ) {
+    fail(
+      'SHOPIFY_PRODUCT_MEDIA_SELECTION_INVALID',
+      'The exact Product, listing, image revision, and Shadow simulation evidence are required',
+      409,
+    )
   }
   const dependencies = {
     ...DEFAULT_DEPENDENCIES,
@@ -318,12 +445,35 @@ export async function executeShopifyProductImagePublish(
     channelStateGlobalId: localSelection.channelStateGlobalId,
     imageAssetId: localSelection.imageAssetId,
   })
+  if (
+    providerIdentity.productReferenceCode
+      !== localSelection.expectedProductReferenceCode
+    || providerIdentity.channelStateRowVersion
+      !== localSelection.expectedChannelStateRowVersion
+    || providerIdentity.channelSourceRevision
+      !== localSelection.expectedChannelSourceRevision
+    || providerIdentity.assetRevision
+      !== localSelection.expectedAssetRevision
+    || providerIdentity.assetRowVersion
+      !== localSelection.expectedAssetRowVersion
+    || providerIdentity.assetContentSha256
+      !== localSelection.expectedAssetContentSha256
+  ) {
+    fail(
+      'SHOPIFY_PRODUCT_MEDIA_SELECTION_STALE',
+      'The selected Product, Shopify listing, or image revision changed after review',
+      409,
+    )
+  }
   const input = {
     ...localSelection,
     ...providerIdentity,
     idempotencyKey: publishIdempotencyKey({
       ...providerIdentity,
       imageAssetId: localSelection.imageAssetId,
+      channelStateGlobalId: localSelection.channelStateGlobalId,
+      shadowSimulationEffectGlobalId:
+        localSelection.shadowSimulationEffectGlobalId,
       executeProviderWrite: localSelection.executeProviderWrite,
     }),
   }
@@ -338,7 +488,20 @@ export async function executeShopifyProductImagePublish(
     expectedIntegrationAccountGlobalId:
       input.integrationAccountGlobalId,
     expectedProductGid: input.productGid,
+    expectedExternalVariantId: input.externalVariantId,
     expectedMode: input.executeProviderWrite ? 'active' : 'shadow',
+    expectedProductReferenceCode:
+      input.expectedProductReferenceCode,
+    expectedChannelStateRowVersion:
+      input.expectedChannelStateRowVersion,
+    expectedChannelSourceRevision:
+      input.expectedChannelSourceRevision,
+    expectedAssetRevision: input.expectedAssetRevision,
+    expectedAssetRowVersion: input.expectedAssetRowVersion,
+    expectedAssetContentSha256:
+      input.expectedAssetContentSha256,
+    shadowSimulationEffectGlobalId:
+      input.shadowSimulationEffectGlobalId,
     publicOrigin: input.publicOrigin.origin,
     actorEmail: input.actorEmail,
   })
@@ -351,6 +514,17 @@ export async function executeShopifyProductImagePublish(
     || grant.integrationAccountGlobalId
       !== input.integrationAccountGlobalId
     || grant.productGid !== input.productGid
+    || grant.externalVariantId !== input.externalVariantId
+    || grant.productReferenceCode
+      !== input.expectedProductReferenceCode
+    || grant.channelStateRowVersion
+      !== input.expectedChannelStateRowVersion
+    || grant.channelSourceRevision
+      !== input.expectedChannelSourceRevision
+    || grant.assetRevision !== input.expectedAssetRevision
+    || grant.assetRowVersion !== input.expectedAssetRowVersion
+    || grant.assetContentSha256
+      !== input.expectedAssetContentSha256
   ) {
     fail(
       'SHOPIFY_PRODUCT_MEDIA_SELECTION_MISMATCH',
@@ -365,8 +539,24 @@ export async function executeShopifyProductImagePublish(
     fail(
       'SHOPIFY_PRODUCT_MEDIA_MODE_CONFIRMATION_MISMATCH',
       grant.mode === 'active'
-        ? 'Confirm the exact Active provider write before projecting product media'
-        : 'Shadow mode cannot accept an Active provider-write confirmation',
+        ? 'Confirm the exact one-Product, one-listing, one-image provider write'
+        : 'The one-resource provider write requires its exact prior Shadow simulation',
+      409,
+    )
+  }
+  if (
+    grant.mode === 'active'
+    && (
+      !grant.resourceAuthorization
+      || grant.resourceAuthorization.shadowSimulationEffectGlobalId
+        !== input.shadowSimulationEffectGlobalId
+      || grant.resourceAuthorization.providerWriteActivationRevision
+        !== grant.activationRevision
+    )
+  ) {
+    fail(
+      'SHOPIFY_PRODUCT_MEDIA_AUTHORITY_MISMATCH',
+      'The one-resource Shopify image authority does not match this exact Shadow simulation',
       409,
     )
   }
@@ -378,17 +568,42 @@ export async function executeShopifyProductImagePublish(
     !Number.isSafeInteger(nowEpoch)
     || nowEpoch < grant.issuedAtEpoch
     || nowEpoch >= grant.expiresAtEpoch
-    || (
-      grant.mode === 'active'
-      && nowEpoch
-        >= grant.expiresAtEpoch - ACTIVE_EXECUTION_SAFETY_SECONDS
-    )
   ) {
     fail(
       'SHOPIFY_PRODUCT_MEDIA_GRANT_EXPIRED',
       'The short-lived Shopify product media grant expired before execution',
       409,
     )
+  }
+  if (
+    grant.mode === 'active'
+    && (
+      !grant.resourceAuthorization
+      || nowEpoch
+        >= grant.resourceAuthorization.expiresAtEpoch
+          - ACTIVE_EXECUTION_SAFETY_SECONDS
+    )
+  ) {
+    fail(
+      'SHOPIFY_PRODUCT_MEDIA_AUTHORIZATION_EXPIRED',
+      'The five-minute Shopify product image authorization expired before execution',
+      409,
+    )
+  }
+  const source = deliverySource(grant, secret, nowEpoch)
+  if (grant.mode === 'active') {
+    assertShopifyProductMediaTokenIsDeliverable(
+      source.verifiedToken,
+    )
+    await dependencies.bindDeliverySource({
+      organizationId: grant.organizationId,
+      integrationAccountId: grant.integrationAccountId,
+      authorizationId: grant.resourceAuthorization!.id,
+      deliveryGrantId: grant.id,
+      originalSource: source.originalSource,
+      verifiedToken: source.verifiedToken,
+      actorEmail: input.actorEmail,
+    })
   }
   const result = await dependencies.executeWriteback({
     organizationId: grant.organizationId,
@@ -403,12 +618,14 @@ export async function executeShopifyProductImagePublish(
     productGid: grant.productGid,
     patch: {
       image: {
-        originalSource: deliveryUrl(grant, secret),
+        originalSource: source.originalSource,
         alt: grant.assetAltText,
       },
     },
     productMediaAuthorizationId:
-      grant.productWriteAuthorizationId,
+      grant.resourceAuthorization?.id || null,
+    productMediaDeliveryGrantId:
+      grant.id,
     actorEmail: input.actorEmail,
     workerId: 'shopify-product-image-publish',
   })

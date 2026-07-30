@@ -248,6 +248,13 @@ export async function POST(
       'assetId',
       'channelStateGlobalId',
       'executeProviderWrite',
+      'expectedProductReferenceCode',
+      'expectedChannelStateRowVersion',
+      'expectedChannelSourceRevision',
+      'expectedAssetRevision',
+      'expectedAssetRowVersion',
+      'expectedAssetContentSha256',
+      'shadowSimulationEffectGlobalId',
     ]
     if (
       Object.keys(body).some((field) => !publishAllowed.includes(field))
@@ -270,6 +277,18 @@ export async function POST(
       channelStateGlobalId: body.channelStateGlobalId,
       imageAssetId: body.assetId,
       executeProviderWrite: body.executeProviderWrite,
+      expectedProductReferenceCode:
+        body.expectedProductReferenceCode,
+      expectedChannelStateRowVersion:
+        body.expectedChannelStateRowVersion,
+      expectedChannelSourceRevision:
+        body.expectedChannelSourceRevision,
+      expectedAssetRevision: body.expectedAssetRevision,
+      expectedAssetRowVersion: body.expectedAssetRowVersion,
+      expectedAssetContentSha256:
+        body.expectedAssetContentSha256,
+      shadowSimulationEffectGlobalId:
+        body.shadowSimulationEffectGlobalId,
       publicOrigin: shopifyProductMediaPublicOrigin(req.nextUrl.origin),
       actorEmail: actor.email,
     })

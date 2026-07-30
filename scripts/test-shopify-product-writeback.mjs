@@ -183,6 +183,14 @@ const categoryGid =
   'gid://shopify/TaxonomyCategory/aa-1-10'
 const imageUrl =
   'https://assets.example.com/products/test-treat.png?signature=private-image-token'
+const imagePatch = {
+  title: 'EPISCS Test Dog Treats',
+  categoryGid,
+  image: {
+    originalSource: imageUrl,
+    alt: 'EPISCS test dog treat bag',
+  },
+}
 
 function command(overrides = {}) {
   return {
@@ -199,10 +207,6 @@ function command(overrides = {}) {
     patch: {
       title: 'EPISCS Test Dog Treats',
       categoryGid,
-      image: {
-        originalSource: imageUrl,
-        alt: 'EPISCS test dog treat bag',
-      },
     },
     actorEmail: 'admin@example.com',
     workerId: 'focused-product-writeback-test',
@@ -370,9 +374,14 @@ function dependencies(overrides = {}) {
         grantedScopes: ['write_products'],
       }
     },
-    async mutateProduct() {
+    async mutateProduct(_credential, input) {
       calls.mutate += 1
-      return providerResult()
+      return providerResult(input.patch.image
+        ? {}
+        : {
+            mediaRequested: false,
+            media: null,
+          })
     },
     async finalizeExternalEffect(input) {
       calls.finalize.push(input)
@@ -396,6 +405,19 @@ async function expectCode(action, code) {
     assert.equal(error.code, code)
     return true
   })
+}
+
+{
+  const { deps, calls } = dependencies()
+  await expectCode(
+    () => writeback.executeShopifyProductWriteback(
+      command({ patch: imagePatch }),
+      deps,
+    ),
+    'SHOPIFY_PRODUCT_MEDIA_AUTHORITY_REQUIRED',
+  )
+  assert.equal(calls.prepare, 0)
+  assert.equal(calls.mutate, 0)
 }
 
 {
@@ -505,7 +527,10 @@ async function expectCode(action, code) {
     async mutateProduct(credential, input, options) {
       calls.mutate += 1
       observedMutation = { credential, input, options }
-      return providerResult()
+      return providerResult({
+        mediaRequested: false,
+        media: null,
+      })
     },
   })
   const result = await writeback.executeShopifyProductWriteback(
@@ -516,24 +541,12 @@ async function expectCode(action, code) {
   assert.equal(result.effect.providerReference, productGid)
   assert.equal(result.effect.providerWriteCount, 1)
   assert.equal(result.providerMutationAccepted, true)
-  assert.equal(
-    result.media.mediaImageGid,
-    'gid://shopify/MediaImage/987654321',
-  )
-  assert.equal(result.media.status, 'PROCESSING')
-  assert.equal(result.media.ready, false)
+  assert.equal(result.media, null)
   assert.equal(observedMutation.input.productGid, productGid)
   assert.equal(observedMutation.input.patch.categoryGid, categoryGid)
-  assert.equal(observedMutation.input.patch.image.originalSource, imageUrl)
+  assert.equal(observedMutation.input.patch.image, undefined)
   assert.equal(calls.finalize[0].redactedResult.providerWrites, 1)
-  assert.equal(
-    calls.finalize[0].redactedResult.media.id,
-    'gid://shopify/MediaImage/987654321',
-  )
-  assert.equal(
-    calls.finalize[0].redactedResult.media.status,
-    'PROCESSING',
-  )
+  assert.equal(calls.finalize[0].redactedResult.media, null)
   assert.equal(
     calls.finalize[0].redactedResult.providerMutationAccepted,
     true,
@@ -686,7 +699,7 @@ async function expectCode(action, code) {
     },
     {
       productGid,
-      patch: command().patch,
+      patch: imagePatch,
     },
     { timeoutMs: 10_000 },
   )
@@ -754,7 +767,7 @@ async function expectCode(action, code) {
     },
     {
       productGid,
-      patch: command().patch,
+      patch: imagePatch,
     },
   )
   assert.equal(result.media.status, 'FAILED')
@@ -795,6 +808,8 @@ async function expectCode(action, code) {
 {
   const exactAuthorizationId =
     '99999999-9999-4999-8999-999999999999'
+  const exactDeliveryGrantId =
+    'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
   const { deps, calls } = dependencies()
   let preparedInput
   const defaultPrepare = deps.prepareExternalEffect
@@ -815,6 +830,7 @@ async function expectCode(action, code) {
         },
       },
       productMediaAuthorizationId: exactAuthorizationId,
+      productMediaDeliveryGrantId: exactDeliveryGrantId,
     }),
     deps,
   )
@@ -826,6 +842,10 @@ async function expectCode(action, code) {
   assert.equal(
     preparedInput.redactedRequest.productMediaAuthorizationId,
     exactAuthorizationId,
+  )
+  assert.equal(
+    preparedInput.redactedRequest.deliveryGrantId,
+    exactDeliveryGrantId,
   )
   assert.equal(calls.mutate, 1)
 }
