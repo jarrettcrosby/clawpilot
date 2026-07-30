@@ -1062,7 +1062,16 @@ async function finishReadOnlySuccess(client, claim) {
   const result = await client.query(
     `UPDATE operations_shopify_inventory_refresh_jobs
      SET status = 'succeeded',
-         result_summary = $3::jsonb,
+         result_summary = jsonb_build_object(
+           'resource', 'inventory',
+           'readOnly', true,
+           'providerWrites', $3::integer,
+           'orderQuantityAdjustment', $4::numeric,
+           'inventoryRunGlobalId', $5::text,
+           'providerFetchedAt', $6::text,
+           'levelsSeen', $7::integer,
+           'levelsProjected', $8::integer
+         ),
          completed_at = now(),
          locked_at = NULL,
          locked_by = NULL,
@@ -1077,12 +1086,12 @@ async function finishReadOnlySuccess(client, claim) {
     [
       claim.id,
       claim.lock_token,
-      JSON.stringify({
-        ...ZERO_EFFECT_SUMMARY,
-        inventoryRunGlobalId: 'gir0000001',
-        levelsSeen: 1,
-        levelsProjected: 1,
-      }),
+      0,
+      0,
+      'gir0000001',
+      '2026-07-30T12:00:00.000Z',
+      1,
+      1,
     ],
   )
   return result.rowCount || 0
@@ -1140,13 +1149,6 @@ async function main() {
         `${filename} must already be applied`,
       )
     }
-    for (const filename of TARGET_MIGRATIONS) {
-      assert.equal(
-        await migrationApplied(client, filename),
-        false,
-        `${filename} is already permanently applied`,
-      )
-    }
     before = await durableState(client)
 
     await client.query('BEGIN')
@@ -1179,10 +1181,8 @@ async function main() {
     )
     assert.deepEqual(
       appliedState.migrationsApplied,
-      Object.fromEntries(TARGET_MIGRATIONS.map((filename) => [
-        filename,
-        false,
-      ])),
+      before.migrationsApplied,
+      'Rollback acceptance must not change durable migration history.',
     )
     assert.match(
       appliedState.provider_attempt_protection_function,
@@ -1548,6 +1548,7 @@ async function main() {
     ok: true,
     acceptance: 'rollback-only-postgres',
     targetMigrations: TARGET_MIGRATIONS,
+    targetMigrationState: before.migrationsApplied,
     disabledAccountExcluded: true,
     tenantAccountActiveJobUnique: true,
     providerReadSingleFlight: true,

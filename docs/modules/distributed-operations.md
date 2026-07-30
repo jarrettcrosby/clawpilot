@@ -988,6 +988,10 @@ caller's proposed key. It uses a nullable system actor, captures provider
 evidence before projection, retries bounded transient failures, dead-letters
 terminal failures, and reports worker-loop liveness separately from
 stale-account, retry, lease, overdue, and dead-job operational degradation.
+Job completion requires the exact succeeded inventory-run evidence and builds
+its zero-effect result summary from explicitly typed durable fields. A
+completed provider read and projection therefore cannot be left retrying
+because PostgreSQL cannot infer a polymorphic JSON parameter type.
 Only a missing or stale loop heartbeat makes the global health endpoint
 unavailable; tenant/account queue failures remain visible warnings. Every result asserts `providerWrites = 0` and
 `orderQuantityAdjustment = 0`; the manager-triggered **Sync inventory** command

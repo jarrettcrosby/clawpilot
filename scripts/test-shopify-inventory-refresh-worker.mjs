@@ -116,6 +116,7 @@ includes(persistence, [
   'readShopifyInventoryRefreshWorkerHeartbeatFromPostgres',
   'renewShopifyInventoryRefreshJobLeaseInPostgres',
   'job.lease_expires_at > now()',
+  "'inventoryRunGlobalId', $5::text",
   'providerWrites: 0',
   'orderQuantityAdjustment: 0',
 ], 'Shopify inventory refresh persistence')

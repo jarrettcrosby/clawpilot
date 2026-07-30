@@ -530,7 +530,7 @@ export async function completeShopifyInventoryRefreshJobInPostgres(input: {
              'readOnly', true,
              'providerWrites', $3::integer,
              'orderQuantityAdjustment', $4::numeric,
-             'inventoryRunGlobalId', $5,
+             'inventoryRunGlobalId', $5::text,
              'providerFetchedAt', $6::text,
              'levelsSeen', $7::integer,
              'levelsProjected', $8::integer
