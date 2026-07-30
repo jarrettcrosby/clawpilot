@@ -236,6 +236,8 @@ requireAll(setupPanel, [
   'globalThis.crypto.randomUUID()',
 ], 'Shadow plus resource-scoped provider mutation workflow')
 requireAll(setupPanel, [
+  'configRowVersion: number',
+  'authorization.configRowVersion === setup?.config?.rowVersion',
   "authorization.status === 'claimed'",
   "authorization.status === 'unknown'",
   'authorization.attempt?.leaseExpiresAt',

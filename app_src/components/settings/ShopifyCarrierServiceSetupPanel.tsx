@@ -82,6 +82,7 @@ type ShopifyCarrierServiceSetup = {
   } | null
   mutationAuthorizations: Array<{
     globalId: string
+    configRowVersion: number
     operation: 'create' | 'delete'
     accountEnvironment: 'sandbox' | 'production'
     status:
@@ -422,7 +423,8 @@ export default function ShopifyCarrierServiceSetupPanel({
   ) || null
   const localRecoveryRequired = setup?.mutationAuthorizations.find(
     (authorization) => (
-      (
+      authorization.configRowVersion === setup?.config?.rowVersion
+      && (
         authorization.status === 'succeeded'
         || authorization.status === 'confirmed_applied'
       )

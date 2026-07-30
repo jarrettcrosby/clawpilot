@@ -67,6 +67,16 @@ configuration revision, Shadow activation revision, warehouse, packaging
 stock, and carrier facts; it never depends on the signed-receipt queue/hold
 switch.
 
+The setup projection evaluates mutation recovery only against the current
+CarrierService configuration row version. A succeeded or confirmed-applied
+authorization can require local-only recovery only while its recorded
+configuration row version still equals the current row version and the
+expected registered or disabled transition is absent. Once that transition
+advances the configuration row, the immutable historical authorization remains
+visible as audit evidence but cannot block simulation or authorization of a
+later exact operation. This revision fence prevents a completed delete from
+being misclassified as an uncommitted recovery after a newer create simulation.
+
 Migration `0160` applies the same resource-scoped Shadow authority pattern to
 Shopify Product image publishing. The operator must first run an exact
 zero-write Shadow simulation, then an owner or administrator may issue one
