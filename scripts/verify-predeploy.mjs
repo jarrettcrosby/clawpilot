@@ -271,6 +271,8 @@ for (const requiredPath of [
   'db/migrations/0159_operations_shopify_receipt_and_carrier_authority.sql',
   'db/migrations/0160_operations_shopify_product_media_shadow_authority.sql',
   'db/migrations/0161_shopify_product_media_unknown_reconciliation.sql',
+  'db/migrations/0162_operations_shopify_checkout_mapping_account_status.sql',
+  'db/migrations/0163_shopify_variant_catalog_refresh_recovery.sql',
   'app_src/app/api/crm/products/[productId]/images/route.ts',
   'app_src/app/api/crm/products/[productId]/images/[assetId]/route.ts',
   'app_src/app/api/crm/products/[productId]/shopify-product-image/route.ts',

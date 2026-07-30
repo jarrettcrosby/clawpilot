@@ -21,6 +21,8 @@ const TARGET_MIGRATION =
   '0160_operations_shopify_product_media_shadow_authority.sql'
 const RECOVERY_MIGRATION =
   '0161_shopify_product_media_unknown_reconciliation.sql'
+const VARIANT_MAPPING_REPAIR_MIGRATION =
+  '0163_shopify_variant_catalog_refresh_recovery.sql'
 const TARGET_PRODUCT_REFERENCE = 'gp4513844'
 const TARGET_ACCOUNT_GLOBAL_ID = 'gia9286799'
 const TARGET_CHANNEL_GLOBAL_ID = 'gpcs2196232'
@@ -121,6 +123,7 @@ async function migrationState(client) {
       REQUIRED_APPLIED_MIGRATION,
       TARGET_MIGRATION,
       RECOVERY_MIGRATION,
+      VARIANT_MAPPING_REPAIR_MIGRATION,
     ]],
   )
   return result.rows.map((row) => row.filename)
@@ -938,9 +941,10 @@ async function claimEffect(
   return claimed.rows[0]
 }
 
-async function assertSecondProductSameParentRejected(
+async function assertVariantSplitAllowedButMediaAmbiguityRejected(
   client,
   target,
+  image,
   runId,
 ) {
   const syntheticProduct = await client.query(
@@ -982,35 +986,61 @@ async function assertSecondProductSameParentRejected(
       target.actor_email,
     ],
   )
+  const channel = await client.query(
+    `INSERT INTO operations_product_channel_states (
+       organization_id, integration_account_id, pipeline_id, provider,
+       external_product_id, external_variant_id, product_id,
+       product_mapping_id, provider_status_raw, normalized_status,
+       provider_active, observed_at, source_revision, source_hash,
+       created_by, updated_by
+     ) VALUES (
+       $1::uuid, $2::uuid, $3::uuid, 'shopify',
+       $4, $5, $6::uuid, $7::uuid, 'ACTIVE', 'active',
+       true, clock_timestamp(), $8, $9, $10, $10
+     )
+     RETURNING id::text`,
+    [
+      target.organization_id,
+      target.integration_account_id,
+      target.pipeline_id,
+      target.product_gid,
+      alternateVariant,
+      syntheticProduct.rows[0].id,
+      mapping.rows[0].id,
+      `rollback-only:${runId}`,
+      sha256(Buffer.from(`channel:${runId}`, 'utf8')),
+      target.actor_email,
+    ],
+  )
+  assert.equal(
+    channel.rows.length,
+    1,
+    'a distinct Shopify variant must remain mappable to its own Product',
+  )
+
+  const ambiguousRevision = await nextAggregateRevision(client, target)
+  const ambiguousHash = sha256(
+    Buffer.from(`ambiguous-parent:${runId}`, 'utf8'),
+  )
+  await advanceFence(
+    client,
+    target,
+    ambiguousRevision,
+    ambiguousHash,
+  )
   await expectDatabaseRejection(
     client,
-    'second ClawPilot Product mapped to the same Shopify parent',
-    () => client.query(
-      `INSERT INTO operations_product_channel_states (
-         organization_id, integration_account_id, pipeline_id, provider,
-         external_product_id, external_variant_id, product_id,
-         product_mapping_id, provider_status_raw, normalized_status,
-         provider_active, observed_at, source_revision, source_hash,
-         created_by, updated_by
-       ) VALUES (
-         $1::uuid, $2::uuid, $3::uuid, 'shopify',
-         $4, $5, $6::uuid, $7::uuid, 'ACTIVE', 'active',
-         true, clock_timestamp(), $8, $9, $10, $10
-       )`,
-      [
-        target.organization_id,
-        target.integration_account_id,
-        target.pipeline_id,
-        target.product_gid,
-        alternateVariant,
-        syntheticProduct.rows[0].id,
-        mapping.rows[0].id,
-        `rollback-only:${runId}`,
-        sha256(Buffer.from(`channel:${runId}`, 'utf8')),
-        target.actor_email,
-      ],
-    ),
-    /cannot map to a second ClawPilot Product|parent Product GID/i,
+    'ambiguous Shopify parent Product image authority',
+    () => insertGrant(client, target, image, {
+      id: randomUUID(),
+      idempotencyKey: `pg-ambiguous-parent:${runId}`,
+      mode: 'shadow',
+      aggregateRevision: ambiguousRevision,
+      aggregateHash: ambiguousHash,
+      issuedAtEpoch: Number(target.now_epoch),
+      expiresAtEpoch: Number(target.now_epoch) + 60,
+    }),
+    /Product-image authority is ambiguous|parent Product GID/i,
   )
 }
 
@@ -1730,7 +1760,12 @@ async function runAuthorityAcceptance(client) {
     'exact claimed authority must enable only its bound media bytes',
   )
 
-  await assertSecondProductSameParentRejected(client, target, runId)
+  await assertVariantSplitAllowedButMediaAmbiguityRejected(
+    client,
+    target,
+    image,
+    runId,
+  )
 
   return {
     targetProduct: target.product_reference_code,
@@ -1742,7 +1777,8 @@ async function runAuthorityAcceptance(client) {
     driftRejected: true,
     alternateSourceHashRejected: true,
     alternateSourceHostRejected: true,
-    secondProductSameParentRejected: true,
+    variantSplitChannelMappingAllowed: true,
+    ambiguousParentMediaAuthorityRejected: true,
     expiredAuthorityRejected: true,
     legacyAuthorityRejected: true,
     providerCalls: 0,
@@ -1772,6 +1808,9 @@ async function main() {
     beforeData = await dataState(client)
     const targetApplied = beforeMigrations.includes(TARGET_MIGRATION)
     const recoveryApplied = beforeMigrations.includes(RECOVERY_MIGRATION)
+    const variantMappingRepairApplied = beforeMigrations.includes(
+      VARIANT_MAPPING_REPAIR_MIGRATION,
+    )
     targetPreviouslyApplied = targetApplied
     const sourceBindingExists = beforeObjects.relations.some(
       (row) => (
@@ -1797,6 +1836,17 @@ async function main() {
       recoveryApplied,
       '0161 migration history and unknown-outcome schema disagree',
     )
+    const broadParentMappingGuardExists = beforeObjects.functions.some(
+      (row) => (
+        row.proname ===
+          'protect_operations_shopify_parent_product_mapping'
+      ),
+    )
+    assert.equal(
+      broadParentMappingGuardExists,
+      targetApplied && !variantMappingRepairApplied,
+      '0163 migration history and broad parent-mapping guard disagree',
+    )
 
     await client.query('BEGIN')
     try {
@@ -1804,6 +1854,7 @@ async function main() {
       await client.query(`SET LOCAL lock_timeout = '15s'`)
       await client.query(migrationSql())
       await client.query(migrationSql(RECOVERY_MIGRATION))
+      await client.query(migrationSql(VARIANT_MAPPING_REPAIR_MIGRATION))
       executedTargetInsideTransaction = true
       const upgradedObjects = await objectState(client)
       assert.ok(
@@ -1818,14 +1869,15 @@ async function main() {
       )
       assert.equal(
         upgradedObjects.functions.length,
-        8,
-        '0160/0161 exact Product-image authority functions are incomplete',
+        7,
+        '0160/0161/0163 exact Product-image authority functions are incomplete',
       )
-      acceptance = await runAuthorityAcceptance(client)
-      acceptance.unknownReconciliation =
+      const unknownReconciliation =
         await runUnknownReconciliationAcceptance(client, {
           ...(await selectExactTarget(client)),
         })
+      acceptance = await runAuthorityAcceptance(client)
+      acceptance.unknownReconciliation = unknownReconciliation
     } finally {
       await client.query('ROLLBACK')
     }
@@ -1867,6 +1919,7 @@ async function main() {
     requiredAppliedMigration: REQUIRED_APPLIED_MIGRATION,
     targetMigration: TARGET_MIGRATION,
     recoveryMigration: RECOVERY_MIGRATION,
+    variantMappingRepairMigration: VARIANT_MAPPING_REPAIR_MIGRATION,
     targetPreviouslyApplied,
     executedTargetInsideTransaction,
     ...acceptance,

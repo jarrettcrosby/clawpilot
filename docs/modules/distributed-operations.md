@@ -15,7 +15,7 @@ app_visible: false
 
 Provide native distributed order management, warehouse execution, carrier shipping, and 3PL billing inside ClawPilot. The module serves 3PL operators, retailers, distributors, manufacturers, and fulfillment operators without creating a second application or duplicating CRM, product, identity, audit, task, document, notification, or accounting masters.
 
-This document remains the **target contract** for the full module. The current development slice includes operations migrations `0081` through `0094`, `0097` through `0101`, and `0107` through `0162`; a tenant-scoped order workbench; explicit idempotent warehouse-release, bulk all-ready pick-confirmation, pack-verification, sandbox-label-create, and sandbox-label-void commands for eligible non-archived orders; a durable exception queue; scoped activation controls; canonical CRM catalog projection; provider-customer resolution; team-managed product/package imports; warehouse-scoped Packaging Materials management; versioned Product each/case profiles and separately evidenced exact-case and loose-each recipes; retained Shopify/Faire channel taxonomy; immutable CRM Product image assets; an exact resource-scoped Shadow Shopify image-publish command; organization-scoped direct carrier credential administration; UPS and FedEx sandbox rating with an account-derived origin and editable test destination; a separate rate-selected diagnostic label-create with customer-selected provider-native output, stored-label download/print, and void workflow; immutable provider-source bytes plus an explicit derivative-artifact provenance boundary; append-only redacted provider evidence; carrier-rate delegation; direct multi-account carrier CSV import; selected-batch GL Coding; separate financial review; billed-actual Triangle/Square/Circle settlement evidence; append-only settlement status transitions; capability-aware printer configuration; enrolled local print-agent delivery with controlled reprints, same-warehouse fallback, and agent-declared format/media/document capabilities; shipment- and exact-package-specific PDF packing-list renderers, immutable artifact-payload store, authenticated artifact stream, tracking-observation schema, and commerce-fulfillment export state model; a Shopify/Faire sales-channel control plane; a bounded development-only Shopify held-order preview; leased development-only full-product-catalog reconciliation and current-order staging workers; guarded development-only product-catalog mapping and operational-order workflows with durable pre-call read intents, resource-scoped encrypted continuations, first-class rejection dispositions, and canonical promotion; a bounded, manager-triggered, read-only Shopify inventory reconciliation for one eligible location and warehouse; a strict development-only Shopify cartonization preview; a recipe-first, assumption-watermarked sandbox package-and-rate evidence workflow; an executable development-only two-pass pack-and-rate replay workbench; and active-workspace measurement-presentation and product-currency defaults. The deterministic mock flow remains an internal automated-test harness only. Hosted mock generation is disabled and historical mock artifacts are archived. These features prove PostgreSQL authority and application boundaries; they do not establish historical closed-order commerce import, continuous or production provider inventory synchronization, production commerce workers, production carrier mutation, tracking ingestion, commerce-export dispatch, pickup scheduling, accounting export, invoice/AR workflow, payment adapters, or production fulfillment-optimizer activation.
+This document remains the **target contract** for the full module. The current development slice includes operations migrations `0081` through `0094`, `0097` through `0101`, and `0107` through `0163`; a tenant-scoped order workbench; explicit idempotent warehouse-release, bulk all-ready pick-confirmation, pack-verification, sandbox-label-create, and sandbox-label-void commands for eligible non-archived orders; a durable exception queue; scoped activation controls; canonical CRM catalog projection; provider-customer resolution; team-managed product/package imports; warehouse-scoped Packaging Materials management; versioned Product each/case profiles and separately evidenced exact-case and loose-each recipes; retained Shopify/Faire channel taxonomy; immutable CRM Product image assets; an exact resource-scoped Shadow Shopify image-publish command; organization-scoped direct carrier credential administration; UPS and FedEx sandbox rating with an account-derived origin and editable test destination; a separate rate-selected diagnostic label-create with customer-selected provider-native output, stored-label download/print, and void workflow; immutable provider-source bytes plus an explicit derivative-artifact provenance boundary; append-only redacted provider evidence; carrier-rate delegation; direct multi-account carrier CSV import; selected-batch GL Coding; separate financial review; billed-actual Triangle/Square/Circle settlement evidence; append-only settlement status transitions; capability-aware printer configuration; enrolled local print-agent delivery with controlled reprints, same-warehouse fallback, and agent-declared format/media/document capabilities; shipment- and exact-package-specific PDF packing-list renderers, immutable artifact-payload store, authenticated artifact stream, tracking-observation schema, and commerce-fulfillment export state model; a Shopify/Faire sales-channel control plane; a bounded development-only Shopify held-order preview; leased development-only full-product-catalog reconciliation and current-order staging workers; guarded development-only product-catalog mapping and operational-order workflows with durable pre-call read intents, resource-scoped encrypted continuations, first-class rejection dispositions, and canonical promotion; a bounded, manager-triggered, read-only Shopify inventory reconciliation for one eligible location and warehouse; a strict development-only Shopify cartonization preview; a recipe-first, assumption-watermarked sandbox package-and-rate evidence workflow; an executable development-only two-pass pack-and-rate replay workbench; and active-workspace measurement-presentation and product-currency defaults. The deterministic mock flow remains an internal automated-test harness only. Hosted mock generation is disabled and historical mock artifacts are archived. These features prove PostgreSQL authority and application boundaries; they do not establish historical closed-order commerce import, continuous or production provider inventory synchronization, production commerce workers, production carrier mutation, tracking ingestion, commerce-export dispatch, pickup scheduling, accounting export, invoice/AR workflow, payment adapters, or production fulfillment-optimizer activation.
 
 Migrations `0128` through `0145` extend this slice with the pack hierarchy,
 CRM CSV transfer evidence, durable sales-channel lifecycle and offer
@@ -90,9 +90,14 @@ to serve the same verified image bytes during Shopify's bounded 15-minute
 asynchronous fetch window; a hash-only source binding ties that exact URL to
 the authorization, grant, Product, and image revision before effect
 preparation.
-If one Shopify parent Product GID maps to a second ClawPilot Product, grant
-preparation, authorization, and effect claim all fail closed. Global
-Operations remains `shadow`; there is no generic Active Product-image path.
+Shopify ProductVariant GIDs are the sellable-item boundary, so sibling
+variants beneath one Shopify parent Product may map to separate ClawPilot
+Products for catalog, inventory, order, and pack workflows. Product-image
+publication is a narrower parent-level projection. If that parent Product GID
+maps to more than one ClawPilot Product, its grant preparation, authorization,
+and effect claim all fail closed before a provider call while catalog
+observation remains available. Global Operations remains `shadow`; there is
+no generic Active Product-image path.
 Authenticated image upload and publication commands also recognize the
 configured ClawPilot HTTPS public origin and an unambiguous proxy-routed
 origin when a hosted platform terminates TLS ahead of the application.
@@ -296,6 +301,13 @@ Migration `0162` corrects the original `0151` trigger and command fence to
 enforce that same `active`-or-`disabled` account rule. It changes no signed
 receipt setting and grants no provider write; verified credentials and every
 other exact checkout predicate still fail closed.
+Migration `0163` removes the broad Shopify parent-Product mapping trigger that
+incorrectly rejected a catalog refresh when sibling ProductVariants mapped to
+different sellable ClawPilot Products. Purpose-specific Product-image prepare,
+grant, claim, and effect guards retain the parent-level ambiguity fence. The
+migration narrowly requeues recent dead Shopify catalog jobs that carry the
+retired trigger's `P0001` result and exhibit that exact sibling-variant
+condition, while retaining the prior terminal error in the job summary.
 An exact-case recipe and a loose-each max-capacity recipe are independent
 evidence. For the 6 oz test path, an operator may retain exact 12 as the case
 path and separately activate a customer-confirmed 1-through-12 loose-pick
@@ -823,9 +835,10 @@ image, video, or model remains closed for administrator investigation until a
 future baseline-aware recovery contract can distinguish the attempted append
 from unrelated media. Positive observations retain the newest media identity,
 content type, and status for that investigation.
-The parent-Product lock and database constraint reject any state where one
-Shopify parent Product GID maps to a second ClawPilot Product. Optional
-signed-receipt queue status is not product-write authority.
+The Product-image parent lock and its purpose-specific grant, authorization,
+and effect constraints reject ambiguous parent-level image authority without
+forbidding legitimate variant-level Product mappings. Optional signed-receipt
+queue status is not product-write authority.
 
 Shopify media creation is asynchronous. A successful mutation means Shopify
 accepted the media request; it does not mean the image is ready or featured.

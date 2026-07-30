@@ -8,10 +8,12 @@ const [
   migration,
   offerMigration,
   taxonomyMigration,
+  variantRefreshRecoveryMigration,
   intake,
   shopifyIntake,
   faireClient,
   persistence,
+  shopifyMediaPersistence,
   crmPersistence,
   crmTypes,
   crmUi,
@@ -20,10 +22,12 @@ const [
   read('db/migrations/0130_operations_product_channel_states.sql'),
   read('db/migrations/0132_operations_product_channel_offers.sql'),
   read('db/migrations/0152_operations_product_channel_taxonomy.sql'),
+  read('db/migrations/0163_shopify_variant_catalog_refresh_recovery.sql'),
   read('app_src/lib/persistence/commerceIntake.ts'),
   read('app_src/lib/integrations/commerceIntake.ts'),
   read('app_src/lib/integrations/faireCommerceClient.ts'),
   read('app_src/lib/persistence/productChannelStates.ts'),
+  read('app_src/lib/persistence/shopifyProductMediaProjection.ts'),
   read('app_src/lib/persistence/crm.ts'),
   read('app_src/lib/crm/types.ts'),
   read('app_src/components/crm/CrmSection.tsx'),
@@ -82,6 +86,37 @@ assert.match(
 assert.match(
   taxonomyMigration,
   /Commerce product candidate provider taxonomy is immutable/,
+)
+assert.match(
+  variantRefreshRecoveryMigration,
+  /DROP TRIGGER IF EXISTS[\s\S]*protect_operations_shopify_parent_product_mapping_write/,
+)
+assert.match(
+  variantRefreshRecoveryMigration,
+  /DROP FUNCTION IF EXISTS[\s\S]*protect_operations_shopify_parent_product_mapping/,
+)
+assert.match(
+  variantRefreshRecoveryMigration,
+  /job\.status = 'dead'[\s\S]*job\.provider = 'shopify'[\s\S]*job\.last_error_code = 'P0001'/,
+)
+assert.match(
+  variantRefreshRecoveryMigration,
+  /HAVING count\(DISTINCT state\.product_id\) > 1/,
+)
+assert.match(
+  variantRefreshRecoveryMigration,
+  /recoveredPriorErrorCode[\s\S]*P0001/,
+  'catalog recovery must retain the prior terminal error as evidence',
+)
+assert.match(
+  shopifyMediaPersistence,
+  /conflicting_product_count[\s\S]*more than one ClawPilot Product; no image authority was issued/,
+  'parent-scoped Shopify image preparation must remain fail-closed',
+)
+assert.match(
+  shopifyMediaPersistence,
+  /FROM operations_product_channel_states sibling[\s\S]*sibling\.product_id <> \$4::uuid/,
+  'image authority must retain its purpose-specific sibling ambiguity fence',
 )
 
 assert.match(intake, /upsertProductChannelStateWithClient/)
