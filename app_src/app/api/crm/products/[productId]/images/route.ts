@@ -3,7 +3,11 @@ import {
   CRM_PRODUCT_IMAGE_MAX_BYTES,
   CrmProductImageAssetError,
 } from '@/lib/crm/productImageAssets'
+import {
+  isBrowserSameOriginRequest,
+} from '@/lib/browserSameOrigin'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
+import { appPublicUrl } from '@/lib/publicUrl'
 import {
   listCrmProductImageAssetsInPostgres,
   setPrimaryCrmProductImageAssetInPostgres,
@@ -39,21 +43,11 @@ function fail(code: string, message: string, status = 400): never {
 }
 
 function assertSameOrigin(req: NextRequest) {
-  const origin = String(req.headers.get('origin') || '').trim()
-  let normalizedOrigin: string
-  try {
-    normalizedOrigin = new URL(origin).origin
-  } catch {
-    fail(
-      'CRM_PRODUCT_IMAGE_SAME_ORIGIN_REQUIRED',
-      'Product image changes require a same-origin browser request',
-      403,
-    )
-  }
-  if (
-    normalizedOrigin !== req.nextUrl.origin
-    || req.headers.get('sec-fetch-site') === 'cross-site'
-  ) {
+  if (!isBrowserSameOriginRequest({
+    headers: req.headers,
+    requestOrigin: req.nextUrl.origin,
+    trustedOrigins: [appPublicUrl()],
+  })) {
     fail(
       'CRM_PRODUCT_IMAGE_SAME_ORIGIN_REQUIRED',
       'Product image changes require a same-origin browser request',

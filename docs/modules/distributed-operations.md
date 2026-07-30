@@ -83,6 +83,13 @@ preparation.
 If one Shopify parent Product GID maps to a second ClawPilot Product, grant
 preparation, authorization, and effect claim all fail closed. Global
 Operations remains `shadow`; there is no generic Active Product-image path.
+Authenticated image upload and publication commands also recognize the
+configured ClawPilot HTTPS public origin and an unambiguous proxy-routed
+origin when a hosted platform terminates TLS ahead of the application.
+Missing origins, unrelated origins, ambiguous forwarding headers, and browser
+requests marked `cross-site` still fail closed.
+The same configured public origin is used for the exact signed Shopify media
+delivery URL; an internal bind address is never projected to Shopify.
 
 Migration `0157` treats a Shopify CarrierService receipt as reusable immutable
 rate evidence because Shopify may cache one exact callback response across

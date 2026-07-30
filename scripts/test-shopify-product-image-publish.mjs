@@ -844,6 +844,12 @@ const managerRoute = readFileSync(resolve(
   'app_src/app/api/crm/products/[productId]/shopify-product-image/route.ts',
 ), 'utf8')
 assert.match(managerRoute, /assertSameOrigin\(req\)/)
+assert.match(managerRoute, /isBrowserSameOriginRequest/)
+assert.match(managerRoute, /appPublicUrl\(\)/)
+assert.match(
+  managerRoute,
+  /shopifyProductMediaPublicOrigin\(appPublicUrl\(\)\)/,
+)
 assert.match(managerRoute, /effectiveAuthorizationRole/)
 assert.match(managerRoute, /manageOperations/)
 assert.match(managerRoute, /executeProviderWrite/)

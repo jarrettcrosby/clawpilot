@@ -117,6 +117,8 @@ for (const contract of [
   'expectedRowVersion',
   'setPrimaryCrmProductImageAssetInPostgres',
   'assertSameOrigin(req)',
+  'isBrowserSameOriginRequest',
+  'appPublicUrl()',
   "'Cache-Control': 'private, no-store, max-age=0'",
 ]) {
   assert.ok(route.includes(contract), `route must include ${contract}`)

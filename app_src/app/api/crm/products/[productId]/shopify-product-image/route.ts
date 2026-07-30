@@ -1,5 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server'
 import {
+  isBrowserSameOriginRequest,
+} from '@/lib/browserSameOrigin'
+import { appPublicUrl } from '@/lib/publicUrl'
+import {
   executeShopifyProductImagePublish,
   reconcileShopifyProductImagePublish,
   shopifyProductMediaPublicOrigin,
@@ -147,21 +151,11 @@ async function boundedJson(req: NextRequest) {
 }
 
 function assertSameOrigin(req: NextRequest) {
-  const origin = String(req.headers.get('origin') || '').trim()
-  let normalized: string
-  try {
-    normalized = new URL(origin).origin
-  } catch {
-    fail(
-      'SHOPIFY_PRODUCT_MEDIA_SAME_ORIGIN_REQUIRED',
-      'Shopify product media commands require a same-origin browser request',
-      403,
-    )
-  }
-  if (
-    normalized !== req.nextUrl.origin
-    || req.headers.get('sec-fetch-site') === 'cross-site'
-  ) {
+  if (!isBrowserSameOriginRequest({
+    headers: req.headers,
+    requestOrigin: req.nextUrl.origin,
+    trustedOrigins: [appPublicUrl()],
+  })) {
     fail(
       'SHOPIFY_PRODUCT_MEDIA_SAME_ORIGIN_REQUIRED',
       'Shopify product media commands require a same-origin browser request',
@@ -289,7 +283,7 @@ export async function POST(
         body.expectedAssetContentSha256,
       shadowSimulationEffectGlobalId:
         body.shadowSimulationEffectGlobalId,
-      publicOrigin: shopifyProductMediaPublicOrigin(req.nextUrl.origin),
+      publicOrigin: shopifyProductMediaPublicOrigin(appPublicUrl()),
       actorEmail: actor.email,
     })
     return json({ ok: true, publication: result })
