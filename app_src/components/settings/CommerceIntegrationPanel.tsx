@@ -49,6 +49,8 @@ import IntegrationSetupJourney, {
   type IntegrationSetupStepState,
 } from '@/components/settings/IntegrationSetupJourney'
 import CommerceIntakeWorkflow from '@/components/settings/CommerceIntakeWorkflow'
+import ShopifyCarrierServiceSetupPanel
+  from '@/components/settings/ShopifyCarrierServiceSetupPanel'
 
 type CommerceProvider = 'shopify' | 'faire'
 type CommerceEnvironment = 'sandbox' | 'production'
@@ -1105,17 +1107,17 @@ export default function CommerceIntegrationPanel() {
                   },
                   {
                     key: 'shopify-receipts',
-                    label: 'Enable signed receipt intake',
+                    label: 'Choose signed receipt handling',
                     state: shopifyReceiptState,
                     optional: true,
                     description:
-                      'Receipt intake is optional and separate from the API connection. It requires the receipt-proof scopes and one valid signed allowed-topic delivery; order/customer processing and domain workers remain off.',
+                      'Signed receipt intake is optional and separate from the API connection. Queueing requires the receipt-proof scopes and one valid signed allowed-topic delivery. Held receipts remain retained as evidence; order/customer processing and domain workers remain off.',
                     facts: [
                       {
-                        label: 'Receipt intake',
+                        label: 'New signed receipts',
                         value: shopifyAccount?.status === 'active'
-                          ? 'Enabled'
-                          : 'Disabled',
+                          ? 'Queued for intake'
+                          : 'Held as evidence',
                       },
                       {
                         label: 'Webhook secret',
@@ -1687,17 +1689,17 @@ export default function CommerceIntegrationPanel() {
                             color={account.status === 'active'
                               ? 'success'
                               : 'default'}
-                        label={account.provider === 'shopify'
-                          ? `Receipt intake ${
-                              account.status === 'active'
-                                ? 'enabled'
-                                : 'disabled'
-                            }`
-                          : (
-                              account.verificationStatus === 'verified'
-                                ? 'Product sync authorized'
-                                : 'Product sync needs attention'
-                            )}
+                            label={account.provider === 'shopify'
+                              ? `Signed receipts · ${
+                                  account.status === 'active'
+                                    ? 'queued'
+                                    : 'held'
+                                }`
+                              : (
+                                  account.verificationStatus === 'verified'
+                                    ? 'Product sync authorized'
+                                    : 'Product sync needs attention'
+                                )}
                           />
                           {account.configured
                             && account.credentialIdentifierLastFour ? (
@@ -1720,7 +1722,7 @@ export default function CommerceIntegrationPanel() {
                           ? `${providerLabel(account.provider)} API connection established.`
                           : `${providerLabel(account.provider)} API connection needs attention.`}{' '}
                         {account.provider === 'shopify'
-                          ? 'This connection authorizes automatic product catalog sync with no second approval. Eligibility and worker status appear below; the control only pauses or resumes sync. Signed order receipts remain separate.'
+                          ? 'This connection authorizes automatic product catalog sync with no second approval. The signed receipt control below only chooses whether new verified webhook receipts are queued for intake or retained as held evidence. It does not change the API credential, product-catalog authorization, Operations activation, or provider-write authority.'
                           : 'This connection authorizes automatic product catalog sync with no second approval. Eligibility and worker status appear below; the control only pauses or resumes sync. Orders and inventory remain separate.'}
                       </Alert>
 
@@ -1734,6 +1736,13 @@ export default function CommerceIntegrationPanel() {
                             account.configured
                             && account.verificationStatus === 'verified'
                           }
+                        />
+                      ) : null}
+
+                      {account.provider === 'shopify' ? (
+                        <ShopifyCarrierServiceSetupPanel
+                          accountGlobalId={account.globalId}
+                          displayName={account.displayName}
                         />
                       ) : null}
 
@@ -2184,7 +2193,7 @@ export default function CommerceIntegrationPanel() {
                       {activationBlockers.length ? (
                         <Alert severity="info">
                           <Typography variant="body2" fontWeight={700}>
-                            Receipt intake is not ready to enable
+                            Signed receipts cannot be queued yet
                           </Typography>
                           <Box component="ul" sx={{ pl: 2.5, my: 0.5 }}>
                             {activationBlockers.map((blocker) => (
@@ -2269,18 +2278,19 @@ export default function CommerceIntegrationPanel() {
                               onClick={() => action(
                                 `enable:${account.globalId}`,
                                 {
-                                  action: 'set-enabled',
+                                  action: 'set-receipt-intake',
                                   accountGlobalId: account.globalId,
                                   enabled: true,
                                 },
-                                `${account.displayName} signed receipt intake enabled.`,
+                                `${account.displayName} will queue new signed receipts for intake.`,
                               )}
                               sx={actionButtonSx}
                             >
-                              Enable receipt intake
+                              Queue signed receipts
                             </Button>
                           ) : null}
-                        {account.status === 'active' ? (
+                        {account.provider === 'shopify'
+                          && account.status === 'active' ? (
                           <Button
                             variant="outlined"
                             color="warning"
@@ -2288,15 +2298,15 @@ export default function CommerceIntegrationPanel() {
                             onClick={() => action(
                               `disable:${account.globalId}`,
                               {
-                                action: 'set-enabled',
+                                action: 'set-receipt-intake',
                                 accountGlobalId: account.globalId,
                                 enabled: false,
                               },
-                              `${account.displayName} disabled.`,
+                              `${account.displayName} will retain new signed receipts as held evidence.`,
                             )}
                             sx={actionButtonSx}
                           >
-                            Disable
+                            Hold signed receipts
                           </Button>
                         ) : null}
                         <Button

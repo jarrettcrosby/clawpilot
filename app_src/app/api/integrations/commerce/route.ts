@@ -103,7 +103,7 @@ function requireManager(actor: AppUser) {
 function requireActivator(actor: AppUser) {
   if (!operationsCapabilities(actor).canActivate) {
     throw new CommerceIntegrationRequestError(
-      'Owner or operations-administrator access is required to enable receipt intake',
+      'Owner or operations-administrator access is required to queue signed receipts for intake',
       403,
       'COMMERCE_ACTIVATOR_REQUIRED',
     )
@@ -419,7 +419,10 @@ export async function PATCH(req: NextRequest) {
       })
     }
 
-    if (action === 'set-enabled') {
+    if (
+      action === 'set-receipt-intake'
+      || action === 'set-enabled'
+    ) {
       only(body, ['action', 'accountGlobalId', 'enabled'])
       if (body.enabled === true) requireActivator(actor)
       const integrations = await setCommerceIntegrationEnabled({

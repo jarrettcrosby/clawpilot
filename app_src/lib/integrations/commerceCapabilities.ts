@@ -317,17 +317,19 @@ export type ClawPilotCapabilityImplementationState = 'control_plane_implemented'
 
 // Current-state evidence only. "control_plane_implemented" means a safe
 // operator command or connection/receipt boundary exists; it does not imply an
-// unattended domain sync or export worker. Shopify inventory and location
-// synchronization are bounded, manager-triggered, read-only development
-// controls; they are not production activation or provider-write capabilities.
+// No implementation state below is production-activation evidence. Product
+// and variant synchronization are bounded read-only development workers;
+// inventory and location synchronization remain manager-triggered controls;
+// checkout rating is a customer-neutral CarrierService control plane whose
+// live provider acceptance is tracked separately.
 export const CLAWPILOT_SHOPIFY_CAPABILITY_IMPLEMENTATION = {
   oauth_authentication: 'not_implemented',
   api_authentication: 'control_plane_implemented',
   webhook_registration: 'not_implemented',
   webhook_verification: 'control_plane_implemented',
   webhook_idempotency: 'control_plane_implemented',
-  product_synchronization: 'not_implemented',
-  variant_synchronization: 'not_implemented',
+  product_synchronization: 'control_plane_implemented',
+  variant_synchronization: 'control_plane_implemented',
   catalog_publishing: 'not_implemented',
   inventory_import: 'control_plane_implemented',
   inventory_export: 'not_implemented',
@@ -350,7 +352,7 @@ export const CLAWPILOT_SHOPIFY_CAPABILITY_IMPLEMENTATION = {
   third_party_fulfillment_orchestration: 'not_implemented',
   fulfillment_service: 'not_implemented',
   tracking_export: 'not_implemented',
-  shipping_rate_callbacks: 'not_implemented',
+  shipping_rate_callbacks: 'control_plane_implemented',
   return_import: 'not_implemented',
   return_export: 'not_implemented',
   market_context: 'not_implemented',
@@ -402,17 +404,18 @@ export const FAIRE_CAPABILITY_SCOPES = {
   tracking_export: ['WRITE_ORDERS', 'READ_SHIPMENTS'],
 } as const satisfies Partial<Record<CommerceCapability, readonly string[]>>
 
-// The typed Faire client exposes the provider protocol surface, but none of
-// those methods may mutate canonical operations state until a reviewed worker
-// and mapping workflow is delivered. This mirrors the Shopify evidence rule.
+// Faire product and variant synchronization use the bounded read-only
+// development catalog worker and reviewed mapping workflow. Other typed client
+// methods remain provider-surface evidence only until their own executable
+// worker and reconciliation boundary exists.
 export const CLAWPILOT_FAIRE_CAPABILITY_IMPLEMENTATION = {
   oauth_authentication: 'control_plane_implemented',
   api_authentication: 'control_plane_implemented',
   webhook_registration: 'not_implemented',
   webhook_verification: 'not_implemented',
   webhook_idempotency: 'not_implemented',
-  product_synchronization: 'not_implemented',
-  variant_synchronization: 'not_implemented',
+  product_synchronization: 'control_plane_implemented',
+  variant_synchronization: 'control_plane_implemented',
   catalog_publishing: 'not_implemented',
   inventory_import: 'not_implemented',
   inventory_export: 'not_implemented',

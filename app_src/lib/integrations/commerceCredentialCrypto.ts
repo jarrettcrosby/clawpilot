@@ -99,6 +99,14 @@ export function normalizeCommerceAccountGlobalId(value: unknown) {
   return globalId
 }
 
+function normalizeCommerceCredentialGeneration(value: unknown) {
+  const generation = Number(value)
+  if (!Number.isSafeInteger(generation) || generation < 1) {
+    throw new Error('A valid commerce credential generation is required')
+  }
+  return generation
+}
+
 export function normalizeCommerceAuthMode(
   value: unknown,
   providerValue: unknown,
@@ -244,6 +252,124 @@ function encryptionKey() {
     throw new Error('Commerce credential encryption is not configured')
   }
   return crypto.createHash('sha256').update(secret).digest()
+}
+
+function normalizedCheckoutDestinationPart(
+  value: unknown,
+  casing: 'lower' | 'upper',
+) {
+  const normalized = String(value || '')
+    .normalize('NFKC')
+    .replace(/\s+/g, ' ')
+    .trim()
+  return casing === 'upper'
+    ? normalized.toUpperCase()
+    : normalized.toLowerCase()
+}
+
+/**
+ * Produces the customer-neutral destination identity shared by the live
+ * CarrierService callback and the later Shopify order-intake record. The
+ * plaintext address is never retained at the checkout boundary.
+ */
+export function shopifyCheckoutDestinationFingerprint(input: {
+  countryCode?: unknown
+  postalCode?: unknown
+  provinceCode?: unknown
+  city?: unknown
+  address1?: unknown
+  address2?: unknown
+}) {
+  const canonical = {
+    version: 'shopify-destination-fingerprint-v1',
+    countryCode: normalizedCheckoutDestinationPart(
+      input.countryCode,
+      'upper',
+    ),
+    postalCode: normalizedCheckoutDestinationPart(
+      input.postalCode,
+      'upper',
+    ),
+    provinceCode:
+      normalizedCheckoutDestinationPart(input.provinceCode, 'upper') || null,
+    city: normalizedCheckoutDestinationPart(input.city, 'lower') || null,
+    address1:
+      normalizedCheckoutDestinationPart(input.address1, 'lower') || null,
+    address2:
+      normalizedCheckoutDestinationPart(input.address2, 'lower') || null,
+  }
+  if (
+    !canonical.countryCode
+    || !canonical.postalCode
+  ) {
+    throw new Error(
+      'Shopify checkout destination fingerprint requires country and postal code',
+    )
+  }
+  return crypto
+    .createHmac('sha256', encryptionKey())
+    .update(JSON.stringify(canonical), 'utf8')
+    .digest('hex')
+}
+
+/**
+ * Shopify CarrierService callbacks do not include a Shopify signature. Keep
+ * the account-specific callback URL unguessable instead. The token is derived
+ * from the current credential generation, so rotating the app credential
+ * invalidates the prior callback URL without retaining another plaintext
+ * secret in Postgres.
+ */
+export function shopifyCarrierServiceCallbackToken(input: {
+  organizationId: unknown
+  accountGlobalId: unknown
+  credentialGeneration: unknown
+  callbackTokenVersion: unknown
+}) {
+  const organizationId = normalizeCommerceOrganizationId(
+    input.organizationId,
+  )
+  const accountGlobalId = normalizeCommerceAccountGlobalId(
+    input.accountGlobalId,
+  )
+  const credentialGeneration = normalizeCommerceCredentialGeneration(
+    input.credentialGeneration,
+  )
+  const callbackTokenVersion = normalizeCommerceCredentialGeneration(
+    input.callbackTokenVersion,
+  )
+  return crypto
+    .createHmac('sha256', encryptionKey())
+    .update(
+      [
+        'clawpilot',
+        'shopify',
+        'carrier-service-callback',
+        'v1',
+        organizationId,
+        accountGlobalId,
+        credentialGeneration,
+        callbackTokenVersion,
+      ].join(':'),
+    )
+    .digest('base64url')
+}
+
+export function shopifyCarrierServiceCallbackTokenMatches(
+  input: {
+    organizationId: unknown
+    accountGlobalId: unknown
+    credentialGeneration: unknown
+    callbackTokenVersion: unknown
+  },
+  tokenValue: unknown,
+) {
+  const supplied = String(tokenValue || '').trim()
+  if (!/^[A-Za-z0-9_-]{43}$/.test(supplied)) return false
+  const expected = shopifyCarrierServiceCallbackToken(input)
+  return crypto.timingSafeEqual(
+    Buffer.from(supplied, 'ascii'),
+    Buffer.from(expected, 'ascii'),
+  )
 }
 
 function credentialAuthenticatedData(

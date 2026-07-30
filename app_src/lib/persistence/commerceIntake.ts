@@ -8,6 +8,7 @@ import {
   encryptCommerceCandidateSnapshot,
   encryptCommerceIntakeReadResult,
   encryptCommerceIntakeContinuation,
+  shopifyCheckoutDestinationFingerprint,
 } from '@/lib/integrations/commerceCredentialCrypto'
 import { CommerceIntegrationRequestError } from '@/lib/integrations/commerceIntegrations'
 import { exactProductMappingMutation } from '@/lib/integrations/commerceProductMappingPolicy'
@@ -4582,6 +4583,27 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
             'ship_to',
           )
         : null
+      const checkoutDestinationFingerprint = (
+        order.providerFacts.provider === 'shopify'
+        && address
+        && [
+          address.postalCode,
+          address.countryCode || address.country,
+        ].every((value) => typeof value === 'string' && value.trim())
+      )
+        ? shopifyCheckoutDestinationFingerprint({
+            countryCode: address.countryCode || address.country,
+            postalCode: address.postalCode,
+            provinceCode: address.regionCode || address.region,
+            city: address.city,
+            address1: address.line1,
+            address2: address.line2,
+          })
+        : null
+      const checkoutShippingServiceCode =
+        order.providerFacts.provider === 'shopify'
+          ? order.providerFacts.shippingService?.code || null
+          : null
       const requestedDelivery = fieldText(order.requestedDeliveryAt)
       const payout = order.providerFacts.provider === 'faire'
         ? optionalMoney(order.providerFacts.payoutAmount)
@@ -4618,7 +4640,9 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
            provider_processed_at, provider_updated_at, provider_cancelled_at,
            provider_closed_at, observed_at, source_revision, source_hash,
            provider_api_version, normalizer_version, workflow_state,
-           blocking_codes, created_by, updated_by, expires_at
+           blocking_codes, created_by, updated_by, expires_at,
+           checkout_destination_fingerprint,
+           checkout_shipping_service_code
          ) VALUES (
            $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7, $8,
            $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19,
@@ -4630,7 +4654,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
            $54::timestamptz, $55::timestamptz, $56::timestamptz,
            $57::timestamptz, $58::timestamptz, $59::timestamptz,
            $60, $61, $62, $63, 'held', $64::text[],
-           $65, $65, $66::timestamptz
+           $65, $65, $66::timestamptz, $67, $68
          )
          RETURNING id::text`,
         [
@@ -4712,6 +4736,8 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
           initialCodes,
           input.actorEmail,
           input.envelope.retentionExpiresAt,
+          checkoutDestinationFingerprint,
+          checkoutShippingServiceCode,
         ],
       )
       const candidateId = candidateResult.rows[0].id

@@ -39,6 +39,11 @@ const MATERIAL_FIELDS = new Set([
   'innerLengthMm',
   'innerWidthMm',
   'innerHeightMm',
+  'ratedOuterLengthMm',
+  'ratedOuterWidthMm',
+  'ratedOuterHeightMm',
+  'ratedOuterDimensionEvidenceType',
+  'ratedOuterDimensionEvidenceReference',
   'dimensionBasis',
   'dimensionEvidenceType',
   'dimensionEvidenceReference',
@@ -201,6 +206,91 @@ function materialInput(value: Record<string, unknown>): PackagingMaterialInput {
     1,
     100_000,
   )
+  const ratedOuterLengthMm = optionalIntegerValue(
+    value.ratedOuterLengthMm,
+    'Rated outer package length',
+    1,
+    100_000,
+  )
+  const ratedOuterWidthMm = optionalIntegerValue(
+    value.ratedOuterWidthMm,
+    'Rated outer package width',
+    1,
+    100_000,
+  )
+  const ratedOuterHeightMm = optionalIntegerValue(
+    value.ratedOuterHeightMm,
+    'Rated outer package height',
+    1,
+    100_000,
+  )
+  const ratedOuterEvidenceValue = value
+    .ratedOuterDimensionEvidenceType === null
+    || value.ratedOuterDimensionEvidenceType === undefined
+    || value.ratedOuterDimensionEvidenceType === ''
+    ? null
+    : textValue(
+      value.ratedOuterDimensionEvidenceType,
+      'Rated outer dimension evidence type',
+      30,
+    )
+  if (
+    ratedOuterEvidenceValue !== null
+    && (
+      ratedOuterEvidenceValue === 'unknown'
+      || !PACKAGING_DIMENSION_EVIDENCE_TYPES.includes(
+        ratedOuterEvidenceValue as typeof PACKAGING_DIMENSION_EVIDENCE_TYPES[number],
+      )
+    )
+  ) {
+    fail(
+      'PACKAGING_MATERIAL_REQUEST_INVALID',
+      'Rated outer dimension evidence type is invalid',
+    )
+  }
+  const ratedOuterDimensionEvidenceType =
+    ratedOuterEvidenceValue as PackagingMaterialInput[
+      'ratedOuterDimensionEvidenceType'
+    ]
+  const ratedOuterDimensionEvidenceReference = optionalTextValue(
+    value.ratedOuterDimensionEvidenceReference,
+    'Rated outer dimension evidence reference',
+    500,
+  )
+  const outerDimensions = [
+    ratedOuterLengthMm,
+    ratedOuterWidthMm,
+    ratedOuterHeightMm,
+  ]
+  const hasAnyOuterDimension = outerDimensions.some(
+    (dimension) => dimension !== null,
+  )
+  const hasAllOuterDimensions = outerDimensions.every(
+    (dimension) => dimension !== null,
+  )
+  if (
+    hasAnyOuterDimension !== hasAllOuterDimensions
+    || (
+      hasAllOuterDimensions
+      && (
+        ratedOuterDimensionEvidenceType === null
+        || ratedOuterDimensionEvidenceReference === null
+      )
+    )
+    || (
+      !hasAnyOuterDimension
+      && (
+        ratedOuterDimensionEvidenceType !== null
+        || ratedOuterDimensionEvidenceReference !== null
+      )
+    )
+  ) {
+    fail(
+      'PACKAGING_MATERIAL_RATED_OUTER_FACTS_REQUIRED',
+      'Rated outer dimensions require length, width, height, evidence type, and evidence reference together',
+      409,
+    )
+  }
   const dimensionBasis = textValue(
     value.dimensionBasis || 'unspecified',
     'Dimension basis',
@@ -308,6 +398,11 @@ function materialInput(value: Record<string, unknown>): PackagingMaterialInput {
     innerLengthMm,
     innerWidthMm,
     innerHeightMm,
+    ratedOuterLengthMm,
+    ratedOuterWidthMm,
+    ratedOuterHeightMm,
+    ratedOuterDimensionEvidenceType,
+    ratedOuterDimensionEvidenceReference,
     dimensionBasis,
     dimensionEvidenceType,
     dimensionEvidenceReference,

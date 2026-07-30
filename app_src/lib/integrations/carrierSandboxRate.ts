@@ -866,6 +866,7 @@ async function executeCarrierSandboxRateRequest(
   options: {
     fetchImpl: typeof fetch
     timeoutMs?: number
+    signal?: AbortSignal
     fixture: CarrierSandboxShipmentRateFixture
     purpose: CarrierSandboxRatePurpose
     responseLimitBytes: number
@@ -884,12 +885,16 @@ async function executeCarrierSandboxRateRequest(
   const token = await requestCarrierAccessToken(input, {
     fetchImpl: options.fetchImpl,
     timeoutMs: options.timeoutMs,
+    signal: options.signal,
   })
   const body = input.provider === 'fedex_rest'
     ? fedexRequest(input.credential.accountNumber!, options.fixture)
     : upsRequest(input.credential.accountNumber!, options.fixture)
   const transactionId = randomUUID()
   const controller = new AbortController()
+  const abortFromCaller = () => controller.abort()
+  if (options.signal?.aborted) controller.abort()
+  else options.signal?.addEventListener('abort', abortFromCaller, { once: true })
   const timeoutMs = Math.max(1_000, Math.min(options.timeoutMs || 12_000, 15_000))
   const timeout = setTimeout(() => controller.abort(), timeoutMs)
   try {
@@ -958,6 +963,7 @@ async function executeCarrierSandboxRateRequest(
     )
   } finally {
     clearTimeout(timeout)
+    options.signal?.removeEventListener('abort', abortFromCaller)
   }
 }
 
@@ -966,6 +972,7 @@ export async function requestCarrierSandboxRates(
   options: {
     fetchImpl?: typeof fetch
     timeoutMs?: number
+    signal?: AbortSignal
     fixture?: CarrierSandboxRateFixture
     purpose?: CarrierSandboxRatePurpose
   } = {},
@@ -996,6 +1003,7 @@ export async function requestCarrierSandboxRates(
   const response = await executeCarrierSandboxRateRequest(input, {
     fetchImpl: options.fetchImpl || fetch,
     timeoutMs: options.timeoutMs,
+    signal: options.signal,
     fixture: shipmentFixture,
     purpose,
     responseLimitBytes: SINGLE_PARCEL_RATE_RESPONSE_LIMIT_BYTES,
@@ -1021,6 +1029,7 @@ export async function requestCarrierSandboxShipmentRates(
   options: {
     fetchImpl?: typeof fetch
     timeoutMs?: number
+    signal?: AbortSignal
     fixture: CarrierSandboxShipmentRateFixture
   },
 ): Promise<{
@@ -1056,6 +1065,7 @@ export async function requestCarrierSandboxShipmentRates(
   const response = await executeCarrierSandboxRateRequest(input, {
     fetchImpl: options.fetchImpl || fetch,
     timeoutMs: options.timeoutMs,
+    signal: options.signal,
     fixture,
     purpose: 'cartonization_shipment_rate',
     responseLimitBytes: carrierSandboxShipmentResponseLimitBytes(

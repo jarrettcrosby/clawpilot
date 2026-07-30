@@ -381,6 +381,7 @@ includes(adminRoute, [
   "action === 'connect-faire-api-key'",
   "action === 'start-faire-oauth'",
   "action === 'test-connection'",
+  "action === 'set-receipt-intake'",
   "action === 'set-enabled'",
   "action === 'disconnect'",
   "action === 'reveal-credential'",
@@ -562,6 +563,11 @@ includes(panel, [
   'Optional signed receipt setup',
   'Copy URL',
   'Least-privilege receipt profile',
+  "action: 'set-receipt-intake'",
+  'Queue signed receipts',
+  'Hold signed receipts',
+  'Queued for intake',
+  'Held as evidence',
   'synchronization with no second approval',
   'type="password"',
   'confirmLiveAccess',
@@ -730,7 +736,22 @@ assert.equal(
   'control_plane_implemented',
 )
 assert.equal(
+  capabilities.CLAWPILOT_SHOPIFY_CAPABILITY_IMPLEMENTATION
+    .product_synchronization,
+  'control_plane_implemented',
+)
+assert.equal(
+  capabilities.CLAWPILOT_SHOPIFY_CAPABILITY_IMPLEMENTATION
+    .shipping_rate_callbacks,
+  'control_plane_implemented',
+)
+assert.equal(
   capabilities.CLAWPILOT_FAIRE_CAPABILITY_IMPLEMENTATION.order_import,
+  'control_plane_implemented',
+)
+assert.equal(
+  capabilities.CLAWPILOT_FAIRE_CAPABILITY_IMPLEMENTATION
+    .product_synchronization,
   'control_plane_implemented',
 )
 assert.equal(

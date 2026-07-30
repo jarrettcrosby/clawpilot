@@ -118,11 +118,18 @@ function responseError(status: number) {
 
 export async function requestCarrierAccessToken(
   input: CarrierRuntimeCredential,
-  options: { fetchImpl?: typeof fetch; timeoutMs?: number } = {},
+  options: {
+    fetchImpl?: typeof fetch
+    timeoutMs?: number
+    signal?: AbortSignal
+  } = {},
 ): Promise<CarrierAccessToken> {
   const fetchImpl = options.fetchImpl || fetch
   const timeoutMs = Math.max(1_000, Math.min(options.timeoutMs || 8_000, 15_000))
   const controller = new AbortController()
+  const abortFromCaller = () => controller.abort()
+  if (options.signal?.aborted) controller.abort()
+  else options.signal?.addEventListener('abort', abortFromCaller, { once: true })
   const timeout = setTimeout(() => controller.abort(), timeoutMs)
   try {
     const request = requestFor(input)
@@ -182,12 +189,17 @@ export async function requestCarrierAccessToken(
     )
   } finally {
     clearTimeout(timeout)
+    options.signal?.removeEventListener('abort', abortFromCaller)
   }
 }
 
 export async function verifyCarrierCredential(
   input: CarrierRuntimeCredential,
-  options: { fetchImpl?: typeof fetch; timeoutMs?: number } = {},
+  options: {
+    fetchImpl?: typeof fetch
+    timeoutMs?: number
+    signal?: AbortSignal
+  } = {},
 ): Promise<CarrierCredentialVerification> {
   const token = await requestCarrierAccessToken(input, options)
   return {

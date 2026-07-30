@@ -941,6 +941,8 @@ export async function testCarrierSandboxShipmentRate(input: {
   destination: unknown
   parcels: unknown
   actorEmail: string
+  timeoutMs?: number
+  signal?: AbortSignal
 }) {
   const requestedAt = new Date().toISOString()
   const purpose = 'cartonization_shipment_rate' as const
@@ -1002,7 +1004,11 @@ export async function testCarrierSandboxShipmentRate(input: {
       provider: runtime.provider,
       environment: runtime.environment,
       credential: { ...runtime.credential, accountNumber },
-    }, { fixture })
+    }, {
+      fixture,
+      timeoutMs: input.timeoutMs,
+      signal: input.signal,
+    })
     const billingSelectionSnapshot =
       redactedSandboxRateBillingSelection(selection)
     const evidenceGlobalId = await writeCarrierSandboxRateEvidenceInPostgres({
