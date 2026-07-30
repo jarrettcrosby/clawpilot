@@ -63,7 +63,10 @@ function result(
 }
 
 test('rates the complete package set exactly once per required carrier', async () => {
-  const calls: Array<{ provider: string; packageKeys: string[] }> = []
+  const calls: Array<{
+    provider: string
+    parcels: Array<Record<string, unknown>>
+  }> = []
   const response = await rateCheckoutShipment({
     destination,
     parcels,
@@ -73,7 +76,7 @@ test('rates the complete package set exactly once per required carrier', async (
     invoke: async (selection, request) => {
       calls.push({
         provider: selection.provider,
-        packageKeys: request.parcels.map(({ packageKey }) => packageKey),
+        parcels: request.parcels,
       })
       return result(
         selection,
@@ -84,9 +87,44 @@ test('rates the complete package set exactly once per required carrier', async (
 
   assert.deepEqual(calls.sort((left, right) =>
     left.provider.localeCompare(right.provider)), [
-    { provider: 'fedex_rest', packageKeys: ['package-1', 'package-2'] },
-    { provider: 'ups_rest', packageKeys: ['package-1', 'package-2'] },
+    {
+      provider: 'fedex_rest',
+      parcels: [
+        {
+          description: 'AG12V2',
+          exteriorInches: { length: 11, width: 9, height: 7 },
+          grossPounds: 5.25,
+        },
+        {
+          description: '20lb Box',
+          exteriorInches: { length: 17, width: 11, height: 7 },
+          grossPounds: 20.5,
+        },
+      ],
+    },
+    {
+      provider: 'ups_rest',
+      parcels: [
+        {
+          description: 'AG12V2',
+          exteriorInches: { length: 11, width: 9, height: 7 },
+          grossPounds: 5.25,
+        },
+        {
+          description: '20lb Box',
+          exteriorInches: { length: 17, width: 11, height: 7 },
+          grossPounds: 20.5,
+        },
+      ],
+    },
   ])
+  assert.equal(
+    calls.some(({ parcels: sent }) => (
+      sent.some((parcel) => 'packageKey' in parcel)
+    )),
+    false,
+    'internal package keys must not cross the strict carrier parcel boundary',
+  )
   assert.equal(response.packageCount, 2)
   assert.equal(response.offers.length, 2)
   assert.deepEqual(

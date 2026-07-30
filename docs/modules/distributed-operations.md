@@ -540,6 +540,12 @@ activation, policy, request, and inventory evidence. A cached Shopify response
 is rebuilt one-to-one from immutable typed package and offer rows after those
 facts are revalidated; arbitrary result JSON is retained only as redacted
 diagnostic evidence and is never response authority.
+The checkout orchestrator retains each internal package key for allocation and
+receipt lineage, but strips that ClawPilot-only identifier before invoking the
+strict UPS and FedEx shipment-rate adapters. Both carriers receive the same
+ordered array containing only description, exterior dimensions, and gross
+weight; an internal planning field must never cause an otherwise ready quote
+to fail provider validation.
 
 `npm run test:shopify-carrier-service-postgres` is the rollback-only database
 acceptance for migrations `0148` through `0158`. It requires the explicitly

@@ -11,6 +11,11 @@ export type CheckoutRateParcel = {
   grossPounds: number
 }
 
+export type CheckoutRateCarrierParcel = Omit<
+  CheckoutRateParcel,
+  'packageKey'
+>
+
 export type CheckoutRateDestination = {
   name: string
   line1: string
@@ -290,7 +295,7 @@ export async function rateCheckoutShipment(input: {
     selection: CheckoutRateCarrierSelection,
     request: {
       destination: CheckoutRateDestination
-      parcels: CheckoutRateParcel[]
+      parcels: CheckoutRateCarrierParcel[]
       signal: AbortSignal
     },
   ) => Promise<CheckoutRateProviderResult>
@@ -328,6 +333,13 @@ export async function rateCheckoutShipment(input: {
   }
 
   const parcels = normalizeParcels(input.parcels)
+  const carrierParcels: CheckoutRateCarrierParcel[] = parcels.map(
+    (parcel) => ({
+      description: parcel.description,
+      exteriorInches: { ...parcel.exteriorInches },
+      grossPounds: parcel.grossPounds,
+    }),
+  )
   const carriers = normalizeCarriers(input.carriers)
   const controller = new AbortController()
   let timer: ReturnType<typeof setTimeout> | null = null
@@ -366,7 +378,7 @@ export async function rateCheckoutShipment(input: {
       try {
         result = await input.invoke(selection, {
           destination: input.destination,
-          parcels,
+          parcels: carrierParcels,
           signal: controller.signal,
         })
       } catch (error) {
