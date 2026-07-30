@@ -82,7 +82,7 @@ for (const required of [
 }
 assert.match(
   callback,
-  /CALLBACK_CARRIER_DEADLINE_MS = 6_500[\s\S]*CALLBACK_SUCCESS_PERSISTENCE_DEADLINE_MS = 7_500[\s\S]*CALLBACK_WORK_ABORT_MS = 8_000[\s\S]*CALLBACK_FAILURE_PERSISTENCE_DEADLINE_MS = 8_500[\s\S]*CALLBACK_RESPONSE_TIMEOUT_MS = 9_000/,
+  /CALLBACK_CARRIER_DEADLINE_MS = 8_000[\s\S]*CALLBACK_SUCCESS_PERSISTENCE_DEADLINE_MS = 8_400[\s\S]*CALLBACK_WORK_ABORT_MS = 8_700[\s\S]*CALLBACK_FAILURE_PERSISTENCE_DEADLINE_MS = 8_950[\s\S]*CALLBACK_RESPONSE_TIMEOUT_MS = 9_250/,
   'carrier, success, cancellation, failure, and response deadlines must retain cleanup buffers',
 )
 const responseTimeout = callback.slice(

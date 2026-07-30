@@ -551,6 +551,11 @@ the actor resolves to a real ClawPilot user. Automated Shopify callbacks retain
 `actor_email = NULL` while the audit event records the explicit
 `system:shopify-carrier-service` actor. A system callback must not lose an
 otherwise valid UPS or FedEx result merely because it has no app-user row.
+The callback reserves 8 seconds for the paired carrier calls and returns or
+fails closed by 9.25 seconds, preserving explicit persistence and cancellation
+buffers inside Shopify's 10-second low-volume CarrierService ceiling. Shopify's
+documented 5- and 3-second high-volume ceilings remain a separate performance
+gate; this sandbox proof does not claim readiness at those request rates.
 
 `npm run test:shopify-carrier-service-postgres` is the rollback-only database
 acceptance for migrations `0148` through `0158`. It requires the explicitly
