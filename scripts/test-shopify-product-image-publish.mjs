@@ -63,7 +63,7 @@ function loadProjectionModule() {
           SHOPIFY_PRODUCT_MEDIA_ABSENCE_QUERY_CONTRACT:
             'shopify-graphql-2026-07-product-media-absence-v1',
           SHOPIFY_PRODUCT_WRITEBACK_ADAPTER_VERSION:
-            'shopify-graphql-2026-07-product-update-v2',
+            'shopify-graphql-2026-07-product-update-v3',
           executeShopifyProductMediaAbsenceRead() {
             throw new Error('default absence read must be overridden')
           },
@@ -189,7 +189,7 @@ function grant(mode = 'active', overrides = {}) {
     : null
   const idempotencyKey = `shopify-product-image:${
     createHash('sha256').update(JSON.stringify({
-      adapterVersion: 'shopify-graphql-2026-07-product-update-v2',
+      adapterVersion: 'shopify-graphql-2026-07-product-update-v3',
       account: 'gia0000001',
       product: productGid,
       variant: externalVariantId,

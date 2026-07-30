@@ -175,7 +175,7 @@ function loadWritebackModule() {
 const writeback = loadWritebackModule()
 assert.equal(
   writeback.SHOPIFY_PRODUCT_WRITEBACK_ADAPTER_VERSION,
-  'shopify-graphql-2026-07-product-update-v2',
+  'shopify-graphql-2026-07-product-update-v3',
 )
 const organizationId = '11111111-1111-4111-8111-111111111111'
 const accountGlobalId = 'gia0000001'
@@ -739,6 +739,13 @@ async function expectCode(action, code) {
     observed.input.query,
     /mediaErrors \{/,
   )
+  const productUpdateUserErrors = observed.input.query.match(
+    /userErrors\s*\{([^}]*)\}/,
+  )
+  assert.ok(productUpdateUserErrors)
+  assert.match(productUpdateUserErrors[1], /\bfield\b/)
+  assert.match(productUpdateUserErrors[1], /\bmessage\b/)
+  assert.doesNotMatch(productUpdateUserErrors[1], /\bcode\b/)
 }
 
 {
@@ -790,7 +797,6 @@ async function expectCode(action, code) {
       userErrors: [{
         field: ['product', 'title'],
         message: 'Title is invalid',
-        code: 'INVALID',
       }],
     },
   })

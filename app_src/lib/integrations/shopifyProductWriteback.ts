@@ -50,7 +50,7 @@ const ACTIVE_TERMINAL_STATES = new Set([
 export const SHOPIFY_PRODUCT_WRITEBACK_API_VERSION = '2026-07'
 export const SHOPIFY_PRODUCT_WRITEBACK_REQUIRED_SCOPE = 'write_products'
 export const SHOPIFY_PRODUCT_WRITEBACK_ADAPTER_VERSION =
-  'shopify-graphql-2026-07-product-update-v2'
+  'shopify-graphql-2026-07-product-update-v3'
 export const SHOPIFY_PRODUCT_WRITEBACK_AGGREGATE_TYPE =
   'shopify_product_projection'
 export const SHOPIFY_PRODUCT_MEDIA_ABSENCE_QUERY_CONTRACT =
@@ -743,7 +743,6 @@ const SHOPIFY_PRODUCT_UPDATE_MUTATION =
       userErrors {
         field
         message
-        code
       }
     }
   }`
