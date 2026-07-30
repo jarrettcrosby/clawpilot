@@ -2281,6 +2281,15 @@ async function verifyPostgresAcceptance(databaseUrl) {
         '@/lib/persistence/postgres': postgres,
       },
     })
+    const shopifyCheckoutRating = loadTypeScriptModule(
+      'app_src/lib/persistence/shopifyCheckoutRating.ts',
+      {
+        mocks: {
+          '@/lib/auditWriter': auditWriter,
+          '@/lib/persistence/postgres': postgres,
+        },
+      },
+    )
     const persistence = loadTypeScriptModule('app_src/lib/persistence/operations.ts', {
       mocks: {
         '@/lib/auditWriter': auditWriter,
@@ -2300,6 +2309,7 @@ async function verifyPostgresAcceptance(databaseUrl) {
         },
         '@/lib/persistence/postgres': postgres,
         '@/lib/persistence/productPackaging': productPackaging,
+        '@/lib/persistence/shopifyCheckoutRating': shopifyCheckoutRating,
       },
     })
     const primary = await seedWorkspace(pool, 'primary')
