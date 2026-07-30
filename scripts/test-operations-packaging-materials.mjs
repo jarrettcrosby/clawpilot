@@ -227,8 +227,8 @@ for (const fragment of [
   "warehouse.status = 'active'",
   'dimension_evidence_reference',
   'dimension_confirmed_at',
-  'dimension_evidence_reference IS DISTINCT FROM $11',
-  'THEN $17',
+  'dimension_evidence_reference IS DISTINCT FROM $16',
+  'THEN $22',
   'input.material.dimensionBasis',
   'input.material.source',
 ]) {
