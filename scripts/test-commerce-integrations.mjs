@@ -1061,6 +1061,23 @@ const shopifyClient = loadTypeScriptModule(
   {
     mocks: {
       '@/lib/integrations/commerceCapabilities': capabilities,
+      '@/lib/integrations/shopifyCarrierServiceBranding': {
+        normalizeShopifyStoreEntityName(value) {
+          if (typeof value !== 'string') throw new Error('invalid')
+          const normalized = value
+            .normalize('NFKC')
+            .replace(/\s+/g, ' ')
+            .trim()
+          if (
+            normalized.length < 1
+            || [...normalized].length > 255
+            || /[\u0000-\u001f\u007f]/.test(normalized)
+          ) {
+            throw new Error('invalid')
+          }
+          return normalized
+        },
+      },
     },
   },
 )
@@ -1202,6 +1219,7 @@ const shopifyProbe = await shopifyClient.probeShopifyConnection(
   },
 )
 assert.equal(shopifyProbe.shopId, externalAccountId)
+assert.equal(shopifyProbe.shopName, 'Example Store')
 assert.deepEqual(
   JSON.parse(JSON.stringify(shopifyProbe.grantedScopes)),
   ['read_orders', 'read_products'],
@@ -1213,6 +1231,36 @@ assert.match(
 assert.equal(
   shopifyRequests[0].init.headers['X-Shopify-Access-Token'],
   issuedAccessToken,
+)
+await assert.rejects(
+  shopifyClient.probeShopifyConnection(
+    {
+      shopDomain: 'example-store.myshopify.com',
+      accessToken: issuedAccessToken,
+    },
+    {
+      fetchImpl: async () => new Response(JSON.stringify({
+        data: {
+          shop: {
+            id: externalAccountId,
+            myshopifyDomain: 'example-store.myshopify.com',
+            name: 'ﬃ'.repeat(86),
+          },
+          currentAppInstallation: {
+            accessScopes: [
+              { handle: 'read_orders' },
+              { handle: 'read_products' },
+            ],
+          },
+        },
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    },
+  ),
+  (error) => error?.code === 'SHOPIFY_PROBE_INVALID',
+  'Provider identity must be NFKC-normalized before the 255-character bound.',
 )
 
 const faireClient = loadTypeScriptModule(

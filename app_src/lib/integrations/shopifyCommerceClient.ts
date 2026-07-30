@@ -1,5 +1,8 @@
 import crypto from 'crypto'
 import { SHOPIFY_ADMIN_API_VERSION } from '@/lib/integrations/commerceCapabilities'
+import {
+  normalizeShopifyStoreEntityName,
+} from '@/lib/integrations/shopifyCarrierServiceBranding'
 
 const MAX_QUERY_BYTES = 64 * 1024
 const MAX_VARIABLE_BYTES = 256 * 1024
@@ -540,25 +543,15 @@ const SHOPIFY_CONNECTION_PROBE_QUERY = `query ClawPilotShopifyConnectionProbe {
 }`
 
 function probeShopName(value: unknown): string {
-  if (typeof value !== 'string') {
+  try {
+    return normalizeShopifyStoreEntityName(value)
+  } catch {
     throw new ShopifyCommerceClientError(
       'Shopify returned invalid store identity data',
       502,
       'SHOPIFY_PROBE_INVALID',
     )
   }
-  const name = value
-    .replace(/[\u0000-\u001f\u007f]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-  if (!name || name.length > 255) {
-    throw new ShopifyCommerceClientError(
-      'Shopify returned invalid store identity data',
-      502,
-      'SHOPIFY_PROBE_INVALID',
-    )
-  }
-  return name
 }
 
 function probeGrantedScopes(value: unknown): string[] {

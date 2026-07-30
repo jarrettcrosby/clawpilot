@@ -99,13 +99,14 @@ includes(persistence, [
 
 includes(callback, [
   "version: 'shopify-checkout-idempotency-v2'",
-  "version: 'shopify-checkout-execution-fence-v1'",
+  "version: 'shopify-checkout-execution-fence-v2'",
   "account.environment !== 'sandbox'",
   "carrier.environment === 'sandbox'",
   'materialRowVersion: material.rowVersion',
   'stockRowVersion: material.stockRowVersion',
   'stockOnHandQuantity: material.stockOnHandQuantity',
   'credentialVersion: carrier.credentialVersion',
+  'cartonizationInputHash: shopifyCheckoutRatingHash(context.input)',
   'executionFenceHash,',
   'idempotencyKey,',
   'cached,\n        shadowGuard.customerLabel,',
@@ -128,12 +129,22 @@ includes(typedResponse, [
   'offer.packageCount !== receipt.packages.length',
   'offer.packagePlanHash !== receipt.packagePlanHash',
   'offer.shopifyServiceCode !== stableCode',
-  'buildShopifyCarrierServiceRateResponse(quotes)',
+  'buildShopifyStoreEntityRateResponse({',
+  'shopifyCheckoutRatingHash(resultSnapshot) !== receipt.resultHash',
+  'shopifyCheckoutRatingHash(resultSnapshot.response)',
+  'shopifyCheckoutRatingHash(expectedResponse)',
 ], 'Typed cached response reconstruction')
 assert.equal(
-  typedResponse.includes('resultSnapshot'),
+  typedResponse.includes(
+    'response: resultSnapshot.response as ShopifyCarrierServiceRateResponse',
+  ),
+  true,
+  'cached Shopify responses may replay only the hash-bound typed response',
+)
+assert.equal(
+  typedResponse.includes('return resultSnapshot.response'),
   false,
-  'cached Shopify responses must not use arbitrary result JSON',
+  'cached Shopify responses must not bypass typed reconstruction',
 )
 
 includes(contract, [
@@ -141,7 +152,7 @@ includes(contract, [
   'packaging-material and packaging-stock revisions',
   'carrier-credential generations',
   'immutable typed package and offer rows',
-  'arbitrary result JSON',
+  'hash-bound customer-neutral response',
 ], 'Distributed Operations cache and sandbox contract')
 
 console.log('Shopify checkout sandbox and cache fences passed.')

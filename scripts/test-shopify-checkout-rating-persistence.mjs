@@ -318,8 +318,32 @@ includes(persistenceSource, [
   'config.registration_state = \'registered\'',
   'config.registration_state = \'shadow_simulated\'',
   "account.configuration ->> 'accountName'",
-  'AS store_display_name',
+  'AS store_entity_name',
 ], 'Checkout persistence exports and guards')
+
+const callbackAccountLookup = persistenceSource.slice(
+  persistenceSource.indexOf(
+    'lookupShopifyCheckoutRatingAccountByGlobalIdInPostgres',
+  ),
+  persistenceSource.indexOf('const RECEIPT_SELECT'),
+)
+assert.ok(
+  callbackAccountLookup.includes(
+    "NULLIF(\n         btrim(account.configuration ->> 'accountName'),",
+  )
+    && callbackAccountLookup.includes(') IS NOT NULL'),
+  'checkout callback readiness must require the provider-verified store entity',
+)
+assert.equal(
+  callbackAccountLookup.includes('account.display_name'),
+  false,
+  'checkout rate branding must not fall back to an editable connection label',
+)
+assert.equal(
+  callbackAccountLookup.includes('COALESCE('),
+  false,
+  'checkout rate branding must not fall back from provider store identity',
+)
 
 const {
   ShopifyCheckoutRatingPersistenceError,

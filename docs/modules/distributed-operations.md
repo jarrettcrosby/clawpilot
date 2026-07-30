@@ -15,7 +15,7 @@ app_visible: false
 
 Provide native distributed order management, warehouse execution, carrier shipping, and 3PL billing inside ClawPilot. The module serves 3PL operators, retailers, distributors, manufacturers, and fulfillment operators without creating a second application or duplicating CRM, product, identity, audit, task, document, notification, or accounting masters.
 
-This document remains the **target contract** for the full module. The current development slice includes operations migrations `0081` through `0094`, `0097` through `0101`, and `0107` through `0164`; a tenant-scoped order workbench; explicit idempotent warehouse-release, bulk all-ready pick-confirmation, pack-verification, sandbox-label-create, and sandbox-label-void commands for eligible non-archived orders; a durable exception queue; scoped activation controls; canonical CRM catalog projection; provider-customer resolution; team-managed product/package imports; warehouse-scoped Packaging Materials management; versioned Product each/case profiles and separately evidenced exact-case and loose-each recipes; retained Shopify/Faire channel taxonomy; immutable CRM Product image assets; an exact resource-scoped Shadow Shopify image-publish command; organization-scoped direct carrier credential administration; UPS and FedEx sandbox rating with an account-derived origin and editable test destination; a separate rate-selected diagnostic label-create with customer-selected provider-native output, stored-label download/print, and void workflow; immutable provider-source bytes plus an explicit derivative-artifact provenance boundary; append-only redacted provider evidence; carrier-rate delegation; direct multi-account carrier CSV import; selected-batch GL Coding; separate financial review; billed-actual Triangle/Square/Circle settlement evidence; append-only settlement status transitions; capability-aware printer configuration; enrolled local print-agent delivery with controlled reprints, same-warehouse fallback, and agent-declared format/media/document capabilities; shipment- and exact-package-specific PDF packing-list renderers, immutable artifact-payload store, authenticated artifact stream, tracking-observation schema, and commerce-fulfillment export state model; a Shopify/Faire sales-channel control plane; a bounded development-only Shopify held-order preview; leased development-only full-product-catalog reconciliation and current-order staging workers; guarded development-only product-catalog mapping and operational-order workflows with durable pre-call read intents, resource-scoped encrypted continuations, first-class rejection dispositions, and canonical promotion; a bounded, manager-triggered, read-only Shopify inventory reconciliation for one eligible location and warehouse; a strict development-only Shopify cartonization preview; a recipe-first, assumption-watermarked sandbox package-and-rate evidence workflow; an executable development-only two-pass pack-and-rate replay workbench; and active-workspace measurement-presentation and product-currency defaults. The deterministic mock flow remains an internal automated-test harness only. Hosted mock generation is disabled and historical mock artifacts are archived. These features prove PostgreSQL authority and application boundaries; they do not establish historical closed-order commerce import, continuous or production provider inventory synchronization, production commerce workers, production carrier mutation, tracking ingestion, commerce-export dispatch, pickup scheduling, accounting export, invoice/AR workflow, payment adapters, or production fulfillment-optimizer activation.
+This document remains the **target contract** for the full module. The current development slice includes operations migrations `0081` through `0094`, `0097` through `0101`, and `0107` through `0165`; a tenant-scoped order workbench; explicit idempotent warehouse-release, bulk all-ready pick-confirmation, pack-verification, sandbox-label-create, and sandbox-label-void commands for eligible non-archived orders; a durable exception queue; scoped activation controls; canonical CRM catalog projection; provider-customer resolution; team-managed product/package imports; warehouse-scoped Packaging Materials management; versioned Product each/case profiles and separately evidenced exact-case and loose-each recipes; retained Shopify/Faire channel taxonomy; immutable CRM Product image assets; an exact resource-scoped Shadow Shopify image-publish command; organization-scoped direct carrier credential administration; UPS and FedEx sandbox rating with an account-derived origin and editable test destination; a separate rate-selected diagnostic label-create with customer-selected provider-native output, stored-label download/print, and void workflow; immutable provider-source bytes plus an explicit derivative-artifact provenance boundary; append-only redacted provider evidence; carrier-rate delegation; direct multi-account carrier CSV import; selected-batch GL Coding; separate financial review; billed-actual Triangle/Square/Circle settlement evidence; append-only settlement status transitions; capability-aware printer configuration; enrolled local print-agent delivery with controlled reprints, same-warehouse fallback, and agent-declared format/media/document capabilities; shipment- and exact-package-specific PDF packing-list renderers, immutable artifact-payload store, authenticated artifact stream, tracking-observation schema, and commerce-fulfillment export state model; a Shopify/Faire sales-channel control plane; a bounded development-only Shopify held-order preview; leased development-only full-product-catalog reconciliation and current-order staging workers; guarded development-only product-catalog mapping and operational-order workflows with durable pre-call read intents, resource-scoped encrypted continuations, first-class rejection dispositions, and canonical promotion; a bounded, manager-triggered, read-only Shopify inventory reconciliation for one eligible location and warehouse; a strict development-only Shopify cartonization preview; a recipe-first, assumption-watermarked sandbox package-and-rate evidence workflow; an executable development-only two-pass pack-and-rate replay workbench; and active-workspace measurement-presentation and product-currency defaults. The deterministic mock flow remains an internal automated-test harness only. Hosted mock generation is disabled and historical mock artifacts are archived. These features prove PostgreSQL authority and application boundaries; they do not establish historical closed-order commerce import, continuous or production provider inventory synchronization, production commerce workers, production carrier mutation, tracking ingestion, commerce-export dispatch, pickup scheduling, accounting export, invoice/AR workflow, payment adapters, or production fulfillment-optimizer activation.
 
 Migrations `0128` through `0145` extend this slice with the pack hierarchy,
 CRM CSV transfer evidence, durable sales-channel lifecycle and offer
@@ -320,6 +320,14 @@ amount, currency, response-rate hash, and stable Shopify service code. The
 repair does not trust diagnostic result JSON, loosen quote-to-order
 reconciliation, broaden the Shadow customer/Product gate, or activate a
 production checkout path.
+Migration `0165` makes the provider-verified Shopify store entity name part of
+the same canonical CarrierService readiness predicate used by setup,
+registration, checkout mapping, and the public callback. A missing, blank,
+oversized, or control-character entity fails closed. Neither the Shopify
+platform name nor an editable connection label or external identifier can
+substitute for the provider store entity. The provider probe applies the same
+NFKC and whitespace normalization before persistence and the 255-code-unit
+bound that callback branding applies before responding.
 An exact-case recipe and a loose-each max-capacity recipe are independent
 evidence. For the 6 oz test path, an operator may retain exact 12 as the case
 path and separately activate a customer-confirmed 1-through-12 loose-pick
@@ -567,8 +575,10 @@ current packaging-material and packaging-stock revisions and quantities plus
 the current carrier-credential generations, in addition to configuration,
 activation, policy, request, and inventory evidence. A cached Shopify response
 is rebuilt one-to-one from immutable typed package and offer rows after those
-facts are revalidated; arbitrary result JSON is retained only as redacted
-diagnostic evidence and is never response authority.
+facts are revalidated. The rebuild must exactly match the receipt's
+hash-bound customer-neutral response before those stored response facts can be
+replayed;
+unverified or arbitrary result JSON is never response authority.
 The checkout orchestrator retains each internal package key for allocation and
 receipt lineage, but strips that ClawPilot-only identifier before invoking the
 strict UPS and FedEx shipment-rate adapters. Both carriers receive the same
@@ -595,8 +605,9 @@ Shopify may submit the same normalized checkout request more than once while
 the first callback is still processing. Exactly matching duplicates coalesce
 only on the full execution fence: organization, commerce account, request
 fingerprint, inventory snapshot hash, configuration and activation revision,
-packaging and stock revisions, carrier credential generations, and
-idempotency key. The receipt lease owner alone cartonizes, calls UPS and FedEx,
+the complete normalized cartonization input, packaging and stock revisions,
+carrier credential generations, and idempotency key. The receipt lease owner
+alone cartonizes, calls UPS and FedEx,
 and completes or fails the receipt. A follower waits within the same bounded
 callback deadline for that exact durable receipt to become terminal and then
 replays its typed package and offer evidence; it must not run a second
@@ -607,7 +618,8 @@ credential generation cannot join that in-flight result. Deadline or request
 abort remains fail-closed and never changes the owner receipt.
 
 `npm run test:shopify-carrier-service-postgres` is the rollback-only database
-acceptance for migration `0164` before permanent development application. It
+acceptance for migrations `0164` and `0165` before permanent development
+application. The `0164` acceptance
 requires the explicitly trusted Railway development database fingerprint,
 applies the parcel-evidence correction inside one transaction, projects both
 an approved-recipe carton and a self-packaged case into the exact provider
@@ -618,6 +630,11 @@ carrier amount must still fail closed.
 The transaction then rolls back, and a second connection must prove that no
 schema, migration-history, receipt, package, allocation, or offer residue was
 retained.
+The `0165` acceptance applies the shared readiness replacement in a separate
+rollback-only transaction. It proves the current verified store entity retains
+readiness, missing, oversized, and control-character identities fail closed,
+and restoring the provider value restores readiness. A second connection must
+prove the original function and integration configuration were fully restored.
 The authenticated setup read must also succeed when an account has no
 CarrierService mutation history. Its persistence queries use the
 PostgreSQL-safe `authorized_mutation` alias; setup-load failure is reported as
@@ -644,9 +661,14 @@ persistence, cartonization, or carrier calls. A server-configured test alias
 may decorate only the ephemeral Shadow `service_name` as
 `<store entity> · <service> · <alias>` for operator proof. Every callback
 response uses the persisted provider-verified store entity name rather than
-the ClawPilot or Shopify platform name; the optional alias remains restricted
-to the isolated Shadow test customer. The stable
-`service_code` and durable response remain customer-neutral.
+the ClawPilot or Shopify platform name or an editable connection label. The
+callback is not rate-ready without that provider-verified store entity. The
+entity name and exact customer-neutral branded response are immutable receipt
+evidence and cached duplicates replay that evidence rather than rebuilding a
+name from current connection data. Component-aware truncation must retain a
+nonempty entity, carrier service, and (when present) Shadow test alias. The
+optional alias remains restricted to the isolated Shadow test customer. The
+stable `service_code` and durable response remain customer-neutral.
 Shopify's successful CarrierService cache does not include customer identity.
 Therefore callback gating is necessary but not the sole strict-isolation
 control: the Test Product must remain in a dedicated test-only shipping

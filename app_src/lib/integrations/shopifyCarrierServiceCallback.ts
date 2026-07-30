@@ -1,6 +1,5 @@
 import { createHash, createHmac } from 'node:crypto'
 import {
-  buildShopifyCarrierServiceRateResponse,
   fingerprintShopifyCarrierServiceRateRequest,
   readShopifyCarrierServiceRateRequest,
   shopifyCarrierServiceRequestMatchesTestAllowlist,
@@ -28,6 +27,7 @@ import {
   lookupShopifyCheckoutRatingAccountByGlobalIdInPostgres,
   readCachedShopifyCheckoutRateReceiptInPostgres,
   shopifyCheckoutPackagePlanHash,
+  shopifyCheckoutRatingHash,
   type ShopifyCheckoutPackageInput,
   type ShopifyCheckoutRateReceipt,
   type ShopifyCheckoutRatingAccount,
@@ -40,6 +40,12 @@ import {
 import {
   waitForShopifyCheckoutReceiptCompletion,
 } from '@/lib/integrations/shopifyCheckoutReceiptWait'
+import {
+  buildShopifyStoreEntityRateResponse,
+  normalizeShopifyStoreEntityName,
+  shopifyStoreEntityRateName,
+  type ShopifyStoreEntityRateOffer,
+} from '@/lib/integrations/shopifyCarrierServiceBranding'
 
 const ACCOUNT_GLOBAL_ID = /^gia[0-9]{7}$/
 const CALLBACK_TOKEN = /^[A-Za-z0-9_-]{43}$/
@@ -129,6 +135,11 @@ function sandboxCheckoutAccountIsReady(
   ) {
     return false
   }
+  try {
+    normalizeShopifyStoreEntityName(account.storeEntityName)
+  } catch {
+    return false
+  }
   const providers = new Set(account.carriers.map((carrier) => carrier.provider))
   return (
     providers.size === 2
@@ -213,8 +224,12 @@ function checkoutExecutionFenceHash(
 ) {
   return createHash('sha256')
     .update(JSON.stringify({
-      version: 'shopify-checkout-execution-fence-v1',
+      version: 'shopify-checkout-execution-fence-v2',
       accountEnvironment: account.environment,
+      storeEntityName: normalizeShopifyStoreEntityName(
+        account.storeEntityName,
+      ),
+      cartonizationInputHash: shopifyCheckoutRatingHash(context.input),
       materials: [...context.materials]
         .sort((left, right) => (
           left.materialGlobalId.localeCompare(right.materialGlobalId)
@@ -339,13 +354,19 @@ function stableShippableLines(
   })
 }
 
+type TypedReceiptResponse = {
+  response: ShopifyCarrierServiceRateResponse
+  storeEntityName: string
+  providerServiceNameByCode: ReadonlyMap<string, string>
+}
+
 function responseFromTypedReceipt(
   account: ShopifyCheckoutRatingAccount,
   context: ShopifyCheckoutContextResult,
   receipt: ShopifyCheckoutRateReceipt | null,
-): ShopifyCarrierServiceRateResponse | null {
+): TypedReceiptResponse | null {
   if (!receipt) return null
-  if (receipt.status === 'failed') return EMPTY_RATE_RESPONSE
+  if (receipt.status === 'failed') return null
   if (
     receipt.status !== 'succeeded'
     || !receipt.packagePlanHash
@@ -356,6 +377,26 @@ function responseFromTypedReceipt(
   ) {
     return null
   }
+  const resultSnapshot = receipt.resultSnapshot
+  if (
+    !receipt.resultHash
+    || !resultSnapshot
+    || resultSnapshot.protocolVersion
+      !== 'shopify-carrier-service-response-v2'
+    || shopifyCheckoutRatingHash(resultSnapshot) !== receipt.resultHash
+    || resultSnapshot.packagePlanHash !== receipt.packagePlanHash
+    || resultSnapshot.inventorySnapshotHash
+      !== receipt.inventorySnapshotHash
+    || resultSnapshot.packageCount !== receipt.packages.length
+    || resultSnapshot.rateScope !== 'multi_package_shipment'
+  ) {
+    throw new Error(
+      'Shopify checkout result evidence failed immutable replay validation',
+    )
+  }
+  const storeEntityName = normalizeShopifyStoreEntityName(
+    resultSnapshot.storeEntityName,
+  )
   const materialByGlobalId = new Map(context.materials.map(
     (material) => [material.materialGlobalId, material],
   ))
@@ -421,46 +462,59 @@ function responseFromTypedReceipt(
     account.carriers.map((carrier) => [carrier.provider, carrier]),
   )
   const serviceCodes = new Set<string>()
-  const quotes = receipt.offers.map((offer) => {
-    const carrier = carrierByProvider.get(offer.provider)
-    const carrierCode = offer.provider === 'ups_rest' ? 'ups' : 'fedex'
-    const stableCode = stableShopifyCarrierServiceCode(
-      carrierCode,
-      offer.serviceCode,
-    )
-    if (
-      !carrier
-      || carrier.environment !== 'sandbox'
-      || carrier.carrierAccountGlobalId !== offer.carrierAccountGlobalId
-      || carrier.credentialVersion !== offer.credentialVersion
-      || offer.packageCount !== receipt.packages.length
-      || offer.packagePlanHash !== receipt.packagePlanHash
-      || offer.currency !== receipt.currency
-      || offer.shopifyServiceCode !== stableCode
-      || serviceCodes.has(stableCode)
-    ) {
-      throw new Error(
-        'Typed Shopify checkout offer evidence failed replay validation',
+  const typedOffers: ShopifyStoreEntityRateOffer[] =
+    receipt.offers.map((offer) => {
+      const carrier = carrierByProvider.get(offer.provider)
+      const carrierCode = offer.provider === 'ups_rest' ? 'ups' : 'fedex'
+      const stableCode = stableShopifyCarrierServiceCode(
+        carrierCode,
+        offer.serviceCode,
       )
-    }
-    serviceCodes.add(stableCode)
-    return {
-      carrierCode,
-      serviceLevelCode: offer.serviceCode,
-      serviceName: (
-        `${account.storeDisplayName} · ${offer.serviceName}`
-      ).slice(0, 255),
-      description: (
-        `${account.storeDisplayName} · `
-        + `${receipt.packages.length}-package shipment`
-      ).slice(0, 255),
-      amountMinor: offer.customerChargeMinor,
-      currency: offer.currency,
-      minDeliveryDate: deliveryTimestamp(offer.minDeliveryDate),
-      maxDeliveryDate: deliveryTimestamp(offer.maxDeliveryDate),
-    }
+      if (
+        !carrier
+        || carrier.environment !== 'sandbox'
+        || carrier.carrierAccountGlobalId !== offer.carrierAccountGlobalId
+        || carrier.credentialVersion !== offer.credentialVersion
+        || offer.packageCount !== receipt.packages.length
+        || offer.packagePlanHash !== receipt.packagePlanHash
+        || offer.currency !== receipt.currency
+        || offer.shopifyServiceCode !== stableCode
+        || serviceCodes.has(stableCode)
+      ) {
+        throw new Error(
+          'Typed Shopify checkout offer evidence failed replay validation',
+        )
+      }
+      serviceCodes.add(stableCode)
+      return {
+        carrierCode,
+        serviceLevelCode: offer.serviceCode,
+        providerServiceName: offer.serviceName,
+        amountMinor: offer.customerChargeMinor,
+        currency: offer.currency,
+        minDeliveryDate: deliveryTimestamp(offer.minDeliveryDate),
+        maxDeliveryDate: deliveryTimestamp(offer.maxDeliveryDate),
+      }
+    })
+  const rebuilt = buildShopifyStoreEntityRateResponse({
+    storeEntityName,
+    packageCount: receipt.packages.length,
+    offers: typedOffers,
   })
-  return buildShopifyCarrierServiceRateResponse(quotes)
+  const expectedResponse = rebuilt.response
+  if (
+    shopifyCheckoutRatingHash(resultSnapshot.response)
+      !== shopifyCheckoutRatingHash(expectedResponse)
+  ) {
+    throw new Error(
+      'Shopify checkout response does not match typed receipt evidence',
+    )
+  }
+  return {
+    response: resultSnapshot.response as ShopifyCarrierServiceRateResponse,
+    storeEntityName,
+    providerServiceNameByCode: rebuilt.providerServiceNameByCode,
+  }
 }
 
 function resultFromTypedReceipt(
@@ -469,25 +523,34 @@ function resultFromTypedReceipt(
   receipt: ShopifyCheckoutRateReceipt | null,
   shadowCustomerLabel: string | null = null,
 ): CallbackResult {
-  const response = responseFromTypedReceipt(account, context, receipt)
+  const replay = responseFromTypedReceipt(account, context, receipt)
   const liveResponse = (
-    response
+    replay
     && account.environment === 'sandbox'
     && account.activationState === 'shadow'
     && shadowCustomerLabel
   )
     ? {
-        rates: response.rates.map((rate) => {
+        rates: replay.response.rates.map((rate) => {
+          const providerServiceName =
+            replay.providerServiceNameByCode.get(rate.service_code)
+          if (!providerServiceName) {
+            throw new Error(
+              'Shopify checkout service name evidence is incomplete',
+            )
+          }
           return {
             ...rate,
-            service_name: (
-              `${rate.service_name} · ${shadowCustomerLabel}`
-            ).slice(0, 255),
+            service_name: shopifyStoreEntityRateName({
+              storeEntityName: replay.storeEntityName,
+              providerServiceName,
+              shadowCustomerAlias: shadowCustomerLabel,
+            }),
           }
         }),
       }
-    : response
-  return receipt?.status === 'succeeded' && response
+    : replay?.response
+  return receipt?.status === 'succeeded' && replay
     ? authenticatedResult(liveResponse!, 200)
     : authenticatedResult(EMPTY_RATE_RESPONSE, 503)
 }
@@ -882,19 +945,19 @@ export async function executeShopifyCarrierServiceCallback(input: {
       successPersistenceDeadlineAt,
       workController.signal,
     )
-    const response = buildShopifyCarrierServiceRateResponse(
-      rated.offers.map((offer) => ({
+    const { response } = buildShopifyStoreEntityRateResponse({
+      storeEntityName: account.storeEntityName,
+      packageCount: rated.packageCount,
+      offers: rated.offers.map((offer) => ({
         carrierCode: offer.carrierCode,
         serviceLevelCode: offer.serviceLevelCode,
-        serviceName: offer.serviceName,
-        description:
-          `ClawPilot sandbox ${rated.packageCount}-package shipment`,
+        providerServiceName: offer.serviceName,
         amountMinor: offer.amountMinor,
         currency: offer.currency,
         minDeliveryDate: deliveryTimestamp(offer.deliveryDate),
         maxDeliveryDate: deliveryTimestamp(offer.deliveryDate),
       })),
-    )
+    })
     const recipePackages: ShopifyCheckoutPackageInput[] =
       plan.recipePackages.map((recipePackage) => {
         const ratedOuterDimensionsMm =
@@ -1033,7 +1096,10 @@ export async function executeShopifyCarrierServiceCallback(input: {
           },
         })),
         resultSnapshot: {
-          protocolVersion: 'shopify-carrier-service-response-v1',
+          protocolVersion: 'shopify-carrier-service-response-v2',
+          storeEntityName: normalizeShopifyStoreEntityName(
+            account.storeEntityName,
+          ),
           response,
           packagePlanHash,
           inventorySnapshotHash: context.inventorySnapshotHash,

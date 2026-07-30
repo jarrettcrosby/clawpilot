@@ -148,7 +148,7 @@ export type ShopifyCheckoutRatingAccount = {
   organizationId: string
   integrationAccountId: string
   accountGlobalId: string
-  storeDisplayName: string
+  storeEntityName: string
   environment: 'mock' | 'sandbox' | 'production'
   externalAccountId: string
   registrationState: 'shadow_simulated' | 'registered'
@@ -559,7 +559,7 @@ type CallbackAccountRow = QueryResultRow & {
   organization_id: string
   integration_account_id: string
   account_global_id: string
-  store_display_name: string
+  store_entity_name: string
   environment: 'mock' | 'sandbox' | 'production'
   external_account_id: string
   registration_state: 'shadow_simulated' | 'registered'
@@ -2185,11 +2185,10 @@ export async function lookupShopifyCheckoutRatingAccountByGlobalIdInPostgres(
        config.organization_id::text,
        config.integration_account_id::text,
        account.global_id AS account_global_id,
-       COALESCE(
-         NULLIF(btrim(account.configuration ->> 'accountName'), ''),
-         NULLIF(btrim(account.display_name), ''),
-         account.external_account_id
-       ) AS store_display_name,
+       NULLIF(
+         btrim(account.configuration ->> 'accountName'),
+         ''
+       ) AS store_entity_name,
        account.environment,
        account.external_account_id,
        config.registration_state,
@@ -2225,6 +2224,10 @@ export async function lookupShopifyCheckoutRatingAccountByGlobalIdInPostgres(
      WHERE account.global_id = $1
        AND config.callback_token_hash = $2
        AND account.environment = 'sandbox'
+       AND NULLIF(
+         btrim(account.configuration ->> 'accountName'),
+         ''
+       ) IS NOT NULL
        AND (
          config.registration_state = 'registered'
          OR (
@@ -2252,7 +2255,11 @@ export async function lookupShopifyCheckoutRatingAccountByGlobalIdInPostgres(
     organizationId: row.organization_id,
     integrationAccountId: row.integration_account_id,
     accountGlobalId: row.account_global_id,
-    storeDisplayName: row.store_display_name,
+    storeEntityName: textValue(
+      row.store_entity_name,
+      'Provider-verified Shopify store entity name',
+      255,
+    ),
     environment: row.environment,
     externalAccountId: row.external_account_id,
     registrationState: row.registration_state,
