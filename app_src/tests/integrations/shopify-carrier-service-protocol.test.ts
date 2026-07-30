@@ -5,6 +5,7 @@ import {
   fingerprintShopifyCarrierServiceRateRequest,
   parseShopifyCarrierServiceRateRequest,
   readShopifyCarrierServiceRateRequest,
+  safeShopifyCarrierServiceProtocolErrorPath,
   shopifyCarrierServiceRequestMatchesTestAllowlist,
   SHOPIFY_CARRIER_SERVICE_MAX_REQUEST_BYTES,
   ShopifyCarrierServiceProtocolError,
@@ -172,7 +173,7 @@ test('fingerprint is canonical across line order and ephemeral contact changes',
   )
 })
 
-test('Shadow test allowlist requires the exact customer and every shippable variant', () => {
+test('Shadow test allowlist requires the exact customer and every shippable test variant', () => {
   const request = parseShopifyCarrierServiceRateRequest(fixture())
   const allowlist = {
     customerIds: new Set(['207119551']),
@@ -219,6 +220,125 @@ test('Shadow test allowlist requires the exact customer and every shippable vari
       },
     ),
     true,
+  )
+})
+
+test('accepts Shopify official payload shape without customer or order totals', () => {
+  const officialShape = fixture()
+  delete (officialShape.rate as Partial<typeof officialShape.rate>).customer
+  delete (officialShape.rate as Partial<typeof officialShape.rate>).order_totals
+
+  const request = parseShopifyCarrierServiceRateRequest(officialShape)
+
+  assert.equal(request.customer, null)
+  assert.equal(request.orderTotals, null)
+  assert.equal(
+    shopifyCarrierServiceRequestMatchesTestAllowlist(request, {
+      customerIds: new Set(['207119551']),
+      variantIds: new Set(['258644705304', '258644705305']),
+    }),
+    false,
+  )
+})
+
+test('Shadow test allowlist accepts exact resource GIDs and denies mixed variants or customer mismatch', () => {
+  const allowlist = {
+    customerIds: new Set(['207119551']),
+    variantIds: new Set(['258644705304']),
+  }
+  const exactVariant = fixture()
+  exactVariant.rate.items = [exactVariant.rate.items[0]!]
+  exactVariant.rate.customer.id =
+    'gid://shopify/Customer/207119551' as unknown as number
+  exactVariant.rate.items[0]!.product_id =
+    'gid://shopify/Product/48447225880' as unknown as number
+  exactVariant.rate.items[0]!.variant_id =
+    'gid://shopify/ProductVariant/258644705304' as unknown as number
+  const normalized = parseShopifyCarrierServiceRateRequest(exactVariant)
+  assert.equal(normalized.customer?.id, '207119551')
+  assert.equal(normalized.items[0]?.productId, '48447225880')
+  assert.equal(normalized.items[0]?.variantId, '258644705304')
+  assert.equal(
+    shopifyCarrierServiceRequestMatchesTestAllowlist(
+      normalized,
+      allowlist,
+    ),
+    true,
+  )
+
+  const mixedVariants = fixture()
+  assert.equal(
+    shopifyCarrierServiceRequestMatchesTestAllowlist(
+      parseShopifyCarrierServiceRateRequest(mixedVariants),
+      allowlist,
+    ),
+    false,
+  )
+
+  exactVariant.rate.customer.id = 'gid://shopify/Customer/207119552' as unknown as number
+  assert.equal(
+    shopifyCarrierServiceRequestMatchesTestAllowlist(
+      parseShopifyCarrierServiceRateRequest(exactVariant),
+      allowlist,
+    ),
+    false,
+  )
+})
+
+test('rejects wrong-resource and malformed identifiers at a safe schema path', () => {
+  const wrongResourceGid = fixture()
+  wrongResourceGid.rate.items[0]!.variant_id =
+    'gid://shopify/Product/258644705304' as unknown as number
+
+  let failure: unknown
+  try {
+    parseShopifyCarrierServiceRateRequest(wrongResourceGid)
+  } catch (error) {
+    failure = error
+  }
+
+  assert.ok(failure instanceof ShopifyCarrierServiceProtocolError)
+  assert.equal(failure.code, 'SHOPIFY_CARRIER_IDENTIFIER_INVALID')
+  assert.equal(
+    safeShopifyCarrierServiceProtocolErrorPath(failure),
+    '$.rate.items[0].variant_id',
+  )
+
+  const wrongCustomerGid = fixture()
+  wrongCustomerGid.rate.customer.id =
+    'gid://shopify/Product/207119551' as unknown as number
+  assert.throws(
+    () => parseShopifyCarrierServiceRateRequest(wrongCustomerGid),
+    (error: unknown) =>
+      error instanceof ShopifyCarrierServiceProtocolError
+      && error.code === 'SHOPIFY_CARRIER_IDENTIFIER_INVALID'
+      && safeShopifyCarrierServiceProtocolErrorPath(error)
+        === '$.rate.customer.id',
+  )
+
+  const leadingZero = fixture()
+  leadingZero.rate.items[0]!.product_id = '048447225880' as unknown as number
+  assert.throws(
+    () => parseShopifyCarrierServiceRateRequest(leadingZero),
+    (error: unknown) =>
+      error instanceof ShopifyCarrierServiceProtocolError
+      && error.code === 'SHOPIFY_CARRIER_IDENTIFIER_INVALID'
+      && safeShopifyCarrierServiceProtocolErrorPath(error)
+        === '$.rate.items[0].product_id',
+  )
+
+  const unsafePropertyPath = new ShopifyCarrierServiceProtocolError(
+    'redacted',
+    'SHOPIFY_CARRIER_PROPERTIES_INVALID',
+    '$.rate.items[0].properties.customer_email',
+  )
+  assert.equal(
+    safeShopifyCarrierServiceProtocolErrorPath(unsafePropertyPath),
+    '$.rate.items[0].properties',
+  )
+  assert.equal(
+    safeShopifyCarrierServiceProtocolErrorPath(new Error('not protocol')),
+    null,
   )
 })
 

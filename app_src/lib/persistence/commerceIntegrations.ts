@@ -703,7 +703,7 @@ export async function writeCommerceCredentialInPostgres(input: {
          external_account_id, display_name, status, configuration,
          commerce_credential_generation, created_by, updated_by
        ) VALUES (
-         $1::uuid, $2, 'commerce', $3, $4, $5, 'disabled', $6::jsonb,
+         $1::uuid, $2, 'commerce', $3, $4, $5, 'active', $6::jsonb,
          1, $7, $7
        )
        ON CONFLICT (organization_id, integration_type, provider, environment)
@@ -713,7 +713,7 @@ export async function writeCommerceCredentialInPostgres(input: {
            EXCLUDED.external_account_id
          ),
          display_name = EXCLUDED.display_name,
-         status = 'disabled',
+         status = 'active',
          receipt_intake_enabled = false,
          configuration = EXCLUDED.configuration,
          commerce_credential_generation =
@@ -873,8 +873,7 @@ export async function markCommerceCredentialVerificationInPostgres(input: {
       `UPDATE operations_integration_accounts account
        SET status = CASE
              WHEN $3::text IS NOT NULL THEN 'error'
-             WHEN account.status = 'error' THEN 'disabled'
-             ELSE account.status
+             ELSE 'active'
            END,
            receipt_intake_enabled = CASE
              WHEN $3::text IS NOT NULL OR $7::boolean THEN false

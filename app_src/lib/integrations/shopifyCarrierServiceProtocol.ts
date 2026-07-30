@@ -120,6 +120,33 @@ export class ShopifyCarrierServiceProtocolError extends Error {
   }
 }
 
+const SAFE_PROTOCOL_ERROR_PATHS = [
+  /^\$$/,
+  /^\$\.rate$/,
+  /^\$\.rate\.(?:currency|locale|items|order_totals|customer)$/,
+  /^\$\.rate\.(?:origin|destination)(?:\.(?:country|postal_code|province|city|address1|address2))?$/,
+  /^\$\.rate\.items\[[0-9]{1,3}\](?:\.(?:name|sku|quantity|grams|price|requires_shipping|taxable|product_id|variant_id|properties))?$/,
+  /^\$\.rate\.order_totals\.(?:subtotal_price|total_price|discount_amount)$/,
+  /^\$\.rate\.customer\.(?:id|tags)(?:\[[0-9]{1,3}\])?$/,
+]
+const SAFE_ITEM_PROPERTIES_ROOT =
+  /^(\$\.rate\.items\[[0-9]{1,3}\]\.properties)(?:\.|\[).*$/
+
+/**
+ * Returns only a schema-owned path suitable for operational logging.
+ * Arbitrary line-property keys are collapsed to the known properties root so
+ * customer-provided names or values cannot enter logs.
+ */
+export function safeShopifyCarrierServiceProtocolErrorPath(
+  error: unknown,
+): string | null {
+  if (!(error instanceof ShopifyCarrierServiceProtocolError)) return null
+  if (SAFE_PROTOCOL_ERROR_PATHS.some((pattern) => pattern.test(error.path))) {
+    return error.path
+  }
+  return error.path.match(SAFE_ITEM_PROPERTIES_ROOT)?.[1] || '$'
+}
+
 function protocolError(path: string, message: string, code: string): never {
   throw new ShopifyCarrierServiceProtocolError(message, code, path)
 }
@@ -221,7 +248,13 @@ function exactInteger(
   return parsed
 }
 
-function decimalIdentifier(value: unknown, path: string): string {
+type ShopifyIdentifierResource = 'Customer' | 'Product' | 'ProductVariant'
+
+function decimalIdentifier(
+  value: unknown,
+  path: string,
+  resource: ShopifyIdentifierResource,
+): string {
   let normalized: string
   if (typeof value === 'number') {
     if (!Number.isSafeInteger(value) || value <= 0) {
@@ -233,7 +266,10 @@ function decimalIdentifier(value: unknown, path: string): string {
     }
     normalized = String(value)
   } else if (typeof value === 'string') {
-    normalized = value
+    const resourceGid = value.match(
+      new RegExp(`^gid://shopify/${resource}/([1-9][0-9]{0,19})$`),
+    )
+    normalized = resourceGid?.[1] || value
   } else {
     protocolError(
       path,
@@ -394,8 +430,16 @@ function normalizeItem(
     )
   }
   return {
-    productId: decimalIdentifier(item.product_id, `${path}.product_id`),
-    variantId: decimalIdentifier(item.variant_id, `${path}.variant_id`),
+    productId: decimalIdentifier(
+      item.product_id,
+      `${path}.product_id`,
+      'Product',
+    ),
+    variantId: decimalIdentifier(
+      item.variant_id,
+      `${path}.variant_id`,
+      'ProductVariant',
+    ),
     name: cleanText(item.name, `${path}.name`, 255),
     sku: item.sku === undefined || item.sku === null
       ? ''
@@ -459,7 +503,7 @@ function normalizeCustomer(value: unknown): ShopifyCarrierServiceCustomer | null
   const customer = record(value, '$.rate.customer')
   const id = customer.id === undefined || customer.id === null
     ? null
-    : decimalIdentifier(customer.id, '$.rate.customer.id')
+    : decimalIdentifier(customer.id, '$.rate.customer.id', 'Customer')
   if (!Array.isArray(customer.tags) || customer.tags.length > 100) {
     protocolError(
       '$.rate.customer.tags',
@@ -548,9 +592,10 @@ export function parseShopifyCarrierServiceRateRequest(
 
 /**
  * Limits a hosted Shadow checkout proof to an immutable Shopify customer ID
- * and an explicit set of test variants. Shopify's CarrierService request does
- * not reliably provide contact names or email addresses, so neither is used as
- * an authorization boundary.
+ * and an explicit set of test variants. Shopify may omit the customer object
+ * from discovery callbacks, but those requests remain ineligible for Shadow
+ * rates. Contact names, tags, and email addresses are never authorization
+ * boundaries.
  */
 export function shopifyCarrierServiceRequestMatchesTestAllowlist(
   request: ShopifyCarrierServiceRateRequest,

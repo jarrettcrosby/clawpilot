@@ -628,6 +628,11 @@ function verifySourceContracts() {
     "action === 'void-sandbox-label'",
     'Idempotency-Key',
     "action === 'update-exception'",
+    "action === 'prepare-commerce-active-authorization'",
+    "action === 'activate-commerce-with-authorization'",
+    'expectedCurrentState',
+    'expectedCurrentRevision',
+    'COMMERCE_ACTIVE_AUTHORIZATION_REQUIRED',
     "action === 'update-activation'",
   ]) assert.ok(route.includes(fragment), `Operations route missing ${fragment}`)
   assert.ok(!/clientSecret|accessToken|privateKey/i.test(route), 'Operations route must not handle credentials')
@@ -676,6 +681,23 @@ function verifySourceContracts() {
     assert.ok(
       operationsSection.includes(fragment),
       `Package packing-list UI missing ${fragment}`,
+    )
+  }
+  for (const fragment of [
+    "action: 'prepare-commerce-active-authorization'",
+    "action: 'activate-commerce-with-authorization'",
+    'expectedActivationState',
+    'expectedActivationRevision',
+    'confirmActiveProviderWrites: true',
+    'expectedCurrentState',
+    'expectedCurrentRevision',
+    'Prepare exact review',
+    'I authorize ClawPilot to move Operations from Shadow to Active for exactly the reviewed accounts and provider-write capabilities.',
+    'commerce-active-transition-v1',
+  ]) {
+    assert.ok(
+      operationsSection.includes(fragment),
+      `Commerce Active authorization UI missing ${fragment}`,
     )
   }
 
@@ -989,6 +1011,13 @@ async function verifyRouteBehavior() {
       this.status = status
     }
   }
+  class CommerceActiveTransitionPersistenceError extends Error {
+    constructor(code, message, status = 409) {
+      super(message)
+      this.code = code
+      this.status = status
+    }
+  }
   const calls = {
     reads: [],
     proofs: [],
@@ -999,6 +1028,9 @@ async function verifyRouteBehavior() {
     labelVoids: [],
     exceptions: [],
     activations: [],
+    activePreparations: [],
+    activeAuthorizations: [],
+    activeTransitions: [],
   }
   const route = loadTypeScriptModule('app_src/app/api/operations/route.ts', {
     mocks: {
@@ -1020,6 +1052,79 @@ async function verifyRouteBehavior() {
         },
       },
       '@/lib/persistence/config': { isPostgresStorageEnabled: () => true },
+      '@/lib/persistence/commerceActiveTransitionAuthorization': {
+        CommerceActiveTransitionPersistenceError,
+        prepareCommerceActiveTransitionInPostgres: async (input) => {
+          calls.activePreparations.push(input)
+          return {
+            preparationGlobalId: 'gcap1234567',
+            cohortHash: 'a'.repeat(64),
+            expectedActivationState: 'shadow',
+            expectedActivationRevision: input.expectedActivationRevision,
+            targetActivationState: 'active',
+            targetActivationRevision: input.expectedActivationRevision + 1,
+            accounts: input.selectedAccounts.map((account, index) => ({
+              accountId: randomUUID(),
+              accountGlobalId: account.accountGlobalId,
+              provider: index === 0 ? 'shopify' : 'faire',
+              environment: index === 0 ? 'sandbox' : 'production',
+              externalAccountId: index === 0
+                ? 'proof-store.myshopify.com'
+                : 'b_proof_brand',
+              credentialGeneration: 2,
+              authMode: index === 0
+                ? 'shopify_client_credentials'
+                : 'faire_brand_token',
+              priorAccountStatus: 'active',
+              targetAccountStatus: 'active',
+              grantedScopes: index === 0
+                ? ['write_products', 'write_publications']
+                : ['WRITE_PRODUCTS'],
+              grantedScopeDigest: 'b'.repeat(64),
+              writeCapabilities: account.capabilities,
+              capabilityDigest: 'c'.repeat(64),
+            })),
+            preparedBy: input.actorEmail,
+            preparedRole: 'owner',
+            preparedAt: '2026-07-30T12:00:00.000Z',
+            replayed: false,
+          }
+        },
+        authorizeCommerceActiveTransitionInPostgres: async (input) => {
+          calls.activeAuthorizations.push(input)
+          return {
+            authorizationGlobalId: 'gcaa1234567',
+            preparationGlobalId: input.preparationGlobalId,
+            cohortHash: input.expectedCohortHash,
+            confirmationStatementVersion: 'commerce-active-transition-v1',
+            authorizedBy: input.actorEmail,
+            authorizedRole: 'owner',
+            authorizedAt: '2026-07-30T12:01:00.000Z',
+            expiresAt: '2026-07-30T12:06:00.000Z',
+            replayed: false,
+          }
+        },
+        consumeCommerceActiveTransitionAuthorizationInPostgres: async (input) => {
+          calls.activeTransitions.push(input)
+          return {
+            transitionGlobalId: 'gcat1234567',
+            preparationGlobalId: 'gcap1234567',
+            authorizationGlobalId: input.authorizationGlobalId,
+            cohortHash: input.expectedCohortHash,
+            fromActivationState: 'shadow',
+            fromActivationRevision: 4,
+            state: 'active',
+            revision: 5,
+            accountCount: 1,
+            capabilityCount: 1,
+            reason: input.reason,
+            activatedBy: input.actorEmail,
+            activatedRole: 'owner',
+            activatedAt: '2026-07-30T12:01:01.000Z',
+            replayed: false,
+          }
+        },
+      },
       '@/lib/persistence/operations': {
         OperationsRequestError,
         readOperationsWorkspaceFromPostgres: async (input) => {
@@ -1064,6 +1169,13 @@ async function verifyRouteBehavior() {
           }
         },
         updateOperationsActivationInPostgres: async (input) => {
+          if (input.expectedCurrentRevision === 99) {
+            throw new OperationsRequestError(
+              'OPERATIONS_ACTIVATION_CONFLICT',
+              'Operations activation changed before the requested transition',
+              409,
+            )
+          }
           calls.activations.push(input)
           return {
             state: input.state,
@@ -1471,7 +1583,13 @@ async function verifyRouteBehavior() {
 
   const validActivation = await route.POST(request('http://localhost/api/operations', {
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ action: 'update-activation', state: 'read_only', reason: 'Provider reconciliation only' }),
+    body: JSON.stringify({
+      action: 'update-activation',
+      state: 'read_only',
+      reason: 'Provider reconciliation only',
+      expectedCurrentState: 'shadow',
+      expectedCurrentRevision: 4,
+    }),
   }))
   assert.equal(validActivation.status, 200)
   assert.equal(calls.activations.length, 1)
@@ -1480,7 +1598,40 @@ async function verifyRouteBehavior() {
     actorEmail: actor.email,
     state: 'read_only',
     reason: 'Provider reconciliation only',
+    expectedCurrentState: 'shadow',
+    expectedCurrentRevision: 4,
   })
+
+  const staleActivation = await route.POST(request('http://localhost/api/operations', {
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      action: 'update-activation',
+      state: 'frozen',
+      reason: 'Freeze stale transition',
+      expectedCurrentState: 'shadow',
+      expectedCurrentRevision: 99,
+    }),
+  }))
+  assert.equal(staleActivation.status, 409)
+  assert.equal((await payload(staleActivation)).code, 'OPERATIONS_ACTIVATION_CONFLICT')
+  assert.equal(calls.activations.length, 1)
+
+  const directActiveActivation = await route.POST(request('http://localhost/api/operations', {
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      action: 'update-activation',
+      state: 'active',
+      reason: 'Attempt to bypass reviewed authorization',
+      expectedCurrentState: 'shadow',
+      expectedCurrentRevision: 4,
+    }),
+  }))
+  assert.equal(directActiveActivation.status, 409)
+  assert.equal(
+    (await payload(directActiveActivation)).code,
+    'COMMERCE_ACTIVE_AUTHORIZATION_REQUIRED',
+  )
+  assert.equal(calls.activations.length, 1)
 
   const deniedActivation = await route.POST(request('http://localhost/api/operations', {
     actor: { ...actor, capabilities: { canView: true, canManage: true, canExecute: true, canActivate: false } },
@@ -1489,6 +1640,169 @@ async function verifyRouteBehavior() {
   }))
   assert.equal(deniedActivation.status, 403)
   assert.equal((await payload(deniedActivation)).code, 'OPERATIONS_ACTIVATION_REQUIRED')
+
+  const deniedActivePreparation = await route.POST(request('http://localhost/api/operations', {
+    actor: {
+      ...actor,
+      capabilities: {
+        canView: true,
+        canManage: true,
+        canExecute: true,
+        canActivate: false,
+      },
+    },
+    headers: {
+      'Content-Type': 'application/json',
+      'Idempotency-Key': 'commerce-active-prepare-denied-1',
+    },
+    body: JSON.stringify({
+      action: 'prepare-commerce-active-authorization',
+      expectedActivationState: 'shadow',
+      expectedActivationRevision: 4,
+      selectedAccounts: [{
+        accountGlobalId: 'gia1234567',
+        capabilities: ['catalog_publishing'],
+      }],
+    }),
+  }))
+  assert.equal(deniedActivePreparation.status, 403)
+  assert.equal(
+    (await payload(deniedActivePreparation)).code,
+    'OPERATIONS_ACTIVATION_REQUIRED',
+  )
+  assert.equal(calls.activePreparations.length, 0)
+
+  const validActivePreparation = await route.POST(request('http://localhost/api/operations', {
+    headers: {
+      'Content-Type': 'application/json',
+      'Idempotency-Key': 'commerce-active-prepare-route-1',
+    },
+    body: JSON.stringify({
+      action: 'prepare-commerce-active-authorization',
+      expectedActivationState: 'shadow',
+      expectedActivationRevision: 4,
+      selectedAccounts: [{
+        accountGlobalId: 'gia1234567',
+        capabilities: ['catalog_publishing'],
+      }],
+    }),
+  }))
+  assert.equal(validActivePreparation.status, 201)
+  assert.equal(calls.activePreparations.length, 1)
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(calls.activePreparations[0])),
+    {
+      organizationId: actor.organizationId,
+      actorEmail: actor.email,
+      expectedActivationState: 'shadow',
+      expectedActivationRevision: 4,
+      selectedAccounts: [{
+        accountGlobalId: 'gia1234567',
+        capabilities: ['catalog_publishing'],
+      }],
+      idempotencyKey: 'commerce-active-prepare-route-1',
+    },
+  )
+  const preparedPayload = await payload(validActivePreparation)
+  assert.equal(preparedPayload.result.preparationGlobalId, 'gcap1234567')
+  assert.equal(preparedPayload.result.accounts[0].accountId, undefined)
+  assert.equal(preparedPayload.result.accounts[0].credentialGeneration, 2)
+
+  const activeWithoutConfirmation = await route.POST(request('http://localhost/api/operations', {
+    headers: {
+      'Content-Type': 'application/json',
+      'Idempotency-Key': 'commerce-active-consume-route-1',
+    },
+    body: JSON.stringify({
+      action: 'activate-commerce-with-authorization',
+      preparationGlobalId: 'gcap1234567',
+      expectedCohortHash: 'a'.repeat(64),
+      confirmActiveProviderWrites: false,
+      reason: 'Explicit provider-write approval',
+    }),
+  }))
+  assert.equal(activeWithoutConfirmation.status, 400)
+  assert.equal(
+    (await payload(activeWithoutConfirmation)).code,
+    'COMMERCE_ACTIVE_CONFIRMATION_REQUIRED',
+  )
+  assert.equal(calls.activeAuthorizations.length, 0)
+  assert.equal(calls.activeTransitions.length, 0)
+
+  const validActiveTransition = await route.POST(request('http://localhost/api/operations', {
+    headers: {
+      'Content-Type': 'application/json',
+      'Idempotency-Key': 'commerce-active-consume-route-1',
+    },
+    body: JSON.stringify({
+      action: 'activate-commerce-with-authorization',
+      preparationGlobalId: 'gcap1234567',
+      expectedCohortHash: 'a'.repeat(64),
+      confirmActiveProviderWrites: true,
+      reason: 'Explicit provider-write approval',
+    }),
+  }))
+  assert.equal(validActiveTransition.status, 200)
+  assert.equal(calls.activeAuthorizations.length, 1)
+  assert.equal(calls.activeTransitions.length, 1)
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(calls.activeAuthorizations[0])),
+    {
+      organizationId: actor.organizationId,
+      actorEmail: actor.email,
+      preparationGlobalId: 'gcap1234567',
+      expectedCohortHash: 'a'.repeat(64),
+      idempotencyKey: 'commerce-active-consume-route-1',
+    },
+  )
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(calls.activeTransitions[0])),
+    {
+      organizationId: actor.organizationId,
+      actorEmail: actor.email,
+      authorizationGlobalId: 'gcaa1234567',
+      expectedCohortHash: 'a'.repeat(64),
+      idempotencyKey: 'commerce-active-consume-route-1',
+      reason: 'Explicit provider-write approval',
+    },
+  )
+  const transitionPayload = await payload(validActiveTransition)
+  assert.equal(
+    transitionPayload.result.authorization.confirmationStatementVersion,
+    'commerce-active-transition-v1',
+  )
+  assert.equal(transitionPayload.result.transition.state, 'active')
+  assert.equal(transitionPayload.result.transition.revision, 5)
+
+  const deniedActiveTransition = await route.POST(request('http://localhost/api/operations', {
+    actor: {
+      ...actor,
+      capabilities: {
+        canView: true,
+        canManage: true,
+        canExecute: true,
+        canActivate: false,
+      },
+    },
+    headers: {
+      'Content-Type': 'application/json',
+      'Idempotency-Key': 'commerce-active-consume-denied-1',
+    },
+    body: JSON.stringify({
+      action: 'activate-commerce-with-authorization',
+      preparationGlobalId: 'gcap1234567',
+      expectedCohortHash: 'a'.repeat(64),
+      confirmActiveProviderWrites: true,
+      reason: 'Unauthorized provider-write approval',
+    }),
+  }))
+  assert.equal(deniedActiveTransition.status, 403)
+  assert.equal(
+    (await payload(deniedActiveTransition)).code,
+    'OPERATIONS_ACTIVATION_REQUIRED',
+  )
+  assert.equal(calls.activeAuthorizations.length, 1)
+  assert.equal(calls.activeTransitions.length, 1)
 
   const invalidProduct = await route.POST(request('http://localhost/api/operations', {
     headers: { 'Content-Type': 'application/json' },

@@ -47,6 +47,8 @@ for (const required of [
   "console.warn('[shopify checkout rating] callback failed'",
   "stage: checkoutFailureStage(input.error, input.claimed)",
   'reasonCode: errorCode(input.error)',
+  'safeShopifyCarrierServiceProtocolErrorPath(input.error)',
+  '...(protocolPath ? { protocolPath } : {})',
   'persistedRequestFingerprint(',
   'shopifyCheckoutDestinationFingerprint(',
   'carrierSandboxPartyFingerprint(destination)',
@@ -102,6 +104,16 @@ assert.equal(
   callback.includes('shadowCustomerAlias:'),
   false,
   'customer identity must not alter a Shopify CarrierService rate name',
+)
+assert.equal(
+  callback.includes('error.message,'),
+  false,
+  'callback failure logs must not include provider messages or payload values',
+)
+assert.equal(
+  callback.includes('rawPayload'),
+  false,
+  'callback failure logs must not include raw provider payloads',
 )
 
 for (const required of [

@@ -1292,7 +1292,7 @@ export async function setCommerceIntegrationEnabled(input: {
     const runtime = await storedRuntime(input)
     if (input.enabled && runtime.provider === 'faire') {
       throw new CommerceIntegrationRequestError(
-        'Faire runtime polling is not implemented; the verified connection must remain disabled',
+        'Faire does not use Shopify signed-receipt intake; its verified provider-read connection remains active independently',
         409,
         'FAIRE_RUNTIME_NOT_IMPLEMENTED',
       )

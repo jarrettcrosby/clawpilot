@@ -5,6 +5,7 @@ import {
   Alert,
   Box,
   Button,
+  Checkbox,
   Chip,
   CircularProgress,
   Dialog,
@@ -13,6 +14,7 @@ import {
   DialogTitle,
   Divider,
   Drawer,
+  FormControlLabel,
   IconButton,
   InputAdornment,
   MenuItem,
@@ -50,8 +52,11 @@ import TaskAltRounded from '@mui/icons-material/TaskAltRounded'
 import WarningAmberRounded from '@mui/icons-material/WarningAmberRounded'
 import WarehouseRounded from '@mui/icons-material/WarehouseRounded'
 import type {
+  CommerceActiveWriteCapability,
   OperationsActivationState,
   OperationsActivationUpdateResult,
+  OperationsCommerceActivePreparationResult,
+  OperationsCommerceActiveTransitionResult,
   OperationsExceptionListItem,
   OperationsExceptionStatus,
   OperationsExceptionUpdateResult,
@@ -84,6 +89,8 @@ type OperationsPayload = {
   result?:
     | OperationsExceptionUpdateResult
     | OperationsActivationUpdateResult
+    | OperationsCommerceActivePreparationResult
+    | OperationsCommerceActiveTransitionResult
     | OperationsOrderCommandResult
     | OperationsPackingSlipCommandResult
     | OperationsSandboxLabelCommandResult
@@ -133,6 +140,69 @@ const ACTIVATION_OPTIONS: Array<{ value: OperationsActivationState; label: strin
   { value: 'active', label: 'Active' },
   { value: 'frozen', label: 'Frozen' },
 ]
+
+type CommerceActiveAccountOption = {
+  accountGlobalId: string
+  displayName: string
+  provider: 'shopify' | 'faire'
+  environment: 'sandbox' | 'production'
+  eligibleCapabilities: CommerceActiveWriteCapability[]
+}
+
+type CommerceActiveCatalogPayload = {
+  ok?: boolean
+  error?: string
+  integrations?: {
+    accounts?: Array<{
+      globalId: string
+      displayName: string
+      provider: 'shopify' | 'faire'
+      environment: 'sandbox' | 'production'
+      status: 'active' | 'disabled' | 'error'
+      configured: boolean
+      verificationStatus: 'unverified' | 'verified' | 'failed'
+      configuration: Record<string, unknown>
+    }>
+  }
+  catalog?: {
+    providers?: Partial<Record<
+      'shopify' | 'faire',
+      { capabilityScopes?: Record<string, readonly string[]> }
+    >>
+  }
+}
+
+const COMMERCE_ACTIVE_WRITE_CAPABILITIES: Record<
+  'shopify' | 'faire',
+  readonly CommerceActiveWriteCapability[]
+> = {
+  shopify: [
+    'catalog_publishing',
+    'inventory_export',
+    'inventory_transfer_synchronization',
+    'inventory_shipment_synchronization',
+    'location_administration',
+    'customer_export',
+    'order_creation',
+    'order_update',
+    'order_edit',
+    'draft_order_synchronization',
+    'refund_export',
+    'fulfillment_export',
+    'third_party_fulfillment_orchestration',
+    'fulfillment_service',
+    'tracking_export',
+    'shipping_rate_callbacks',
+    'return_export',
+  ],
+  faire: [
+    'catalog_publishing',
+    'inventory_export',
+    'order_update',
+    'fulfillment_export',
+    'tracking_export',
+  ],
+}
 
 const OperationsTabScrollButton = forwardRef<HTMLButtonElement, TabScrollButtonProps>(
   function OperationsTabScrollButton({ direction, disabled, onClick, ...props }, ref) {
@@ -189,6 +259,53 @@ const controlSx = {
 
 function displayStatus(status: string) {
   return status.replace(/[_.-]+/g, ' ').replace(/\b\w/g, (character) => character.toUpperCase())
+}
+
+function stringValues(value: unknown) {
+  return Array.isArray(value)
+    ? value.filter((entry): entry is string => typeof entry === 'string')
+    : []
+}
+
+function commerceActiveAccountOptions(
+  payload: CommerceActiveCatalogPayload,
+): CommerceActiveAccountOption[] {
+  const accounts = payload.integrations?.accounts || []
+  const providers = payload.catalog?.providers || {}
+
+  return accounts.flatMap((account) => {
+    if (
+      !account.configured
+      || account.verificationStatus !== 'verified'
+      || !['active', 'disabled'].includes(account.status)
+    ) {
+      return []
+    }
+    const grantedScopes = new Set(stringValues(account.configuration.grantedScopes))
+    const capabilityScopes = providers[account.provider]?.capabilityScopes || {}
+    const eligibleCapabilities = COMMERCE_ACTIVE_WRITE_CAPABILITIES[
+      account.provider
+    ].filter((capability) => {
+      const requiredScopes = capabilityScopes[capability]
+      return Boolean(
+        requiredScopes?.length
+        && requiredScopes.every((scope) => grantedScopes.has(scope)),
+      )
+    })
+    if (eligibleCapabilities.length === 0) return []
+
+    return [{
+      accountGlobalId: account.globalId,
+      displayName: account.displayName,
+      provider: account.provider,
+      environment: account.environment,
+      eligibleCapabilities,
+    }]
+  }).sort((left, right) => (
+    left.provider.localeCompare(right.provider)
+    || left.displayName.localeCompare(right.displayName)
+    || left.accountGlobalId.localeCompare(right.accountGlobalId)
+  ))
 }
 
 function providerForCarrier(carrier: string): 'ups_rest' | 'fedex_rest' | null {
@@ -1118,6 +1235,28 @@ export default function OperationsSection({
   const [updatingException, setUpdatingException] = useState(false)
   const [guideOpen, setGuideOpen] = useState(false)
   const [updatingActivation, setUpdatingActivation] = useState(false)
+  const [commerceActiveOpen, setCommerceActiveOpen] = useState(false)
+  const [commerceActivePending, setCommerceActivePending] = useState<
+    '' | 'loading' | 'preparing' | 'activating'
+  >('')
+  const [commerceActiveError, setCommerceActiveError] = useState('')
+  const [commerceActiveAccounts, setCommerceActiveAccounts] = useState<
+    CommerceActiveAccountOption[]
+  >([])
+  const [
+    commerceActiveSelections,
+    setCommerceActiveSelections,
+  ] = useState<Record<string, CommerceActiveWriteCapability[]>>({})
+  const [
+    commerceActivePreparation,
+    setCommerceActivePreparation,
+  ] = useState<OperationsCommerceActivePreparationResult | null>(null)
+  const [commerceActiveConfirmed, setCommerceActiveConfirmed] = useState(false)
+  const [commerceActiveReason, setCommerceActiveReason] = useState(
+    'Activate the reviewed Shopify and Faire provider-write cohort',
+  )
+  const [commerceActivePrepareKey, setCommerceActivePrepareKey] = useState('')
+  const [commerceActiveActivateKey, setCommerceActiveActivateKey] = useState('')
   const [releaseOpen, setReleaseOpen] = useState(false)
   const [releaseReason, setReleaseReason] = useState('Release the reviewed plan to warehouse execution')
   const [releaseIdempotencyKey, setReleaseIdempotencyKey] = useState('')
@@ -1663,7 +1802,197 @@ export default function OperationsSection({
     }
   }
 
-  const updateActivation = async (state: OperationsActivationState) => {
+  const commerceActiveIdempotencyKey = (phase: 'prepare' | 'activate') => (
+    `operations-commerce-active-${phase}:${window.crypto.randomUUID()}`
+  )
+
+  const closeCommerceActive = () => {
+    if (
+      commerceActivePending === 'preparing'
+      || commerceActivePending === 'activating'
+    ) return
+    setCommerceActiveOpen(false)
+  }
+
+  const openCommerceActiveWorkflow = async () => {
+    if (!workspace || workspace.activation.state !== 'shadow') {
+      setError('Operations must be in Shadow before provider writes can be activated.')
+      return
+    }
+    setCommerceActiveOpen(true)
+    setCommerceActivePending('loading')
+    setCommerceActiveError('')
+    setCommerceActiveAccounts([])
+    setCommerceActiveSelections({})
+    setCommerceActivePreparation(null)
+    setCommerceActiveConfirmed(false)
+    setCommerceActivePrepareKey(commerceActiveIdempotencyKey('prepare'))
+    setCommerceActiveActivateKey(commerceActiveIdempotencyKey('activate'))
+    try {
+      const response = await fetch('/api/integrations/commerce', {
+        cache: 'no-store',
+      })
+      const payload = await response.json() as CommerceActiveCatalogPayload
+      if (!response.ok || !payload.integrations || !payload.catalog) {
+        throw new Error(payload.error || 'Commerce integration accounts are unavailable')
+      }
+      const accounts = commerceActiveAccountOptions(payload)
+      if (accounts.length === 0) {
+        throw new Error(
+          'No verified Shopify or Faire account has a complete provider-write scope cohort.',
+        )
+      }
+      setCommerceActiveAccounts(accounts)
+      setCommerceActiveSelections(Object.fromEntries(
+        accounts.map((account) => [
+          account.accountGlobalId,
+          [...account.eligibleCapabilities],
+        ]),
+      ))
+    } catch (caught) {
+      setCommerceActiveError(
+        caught instanceof Error
+          ? caught.message
+          : 'Commerce integration accounts are unavailable',
+      )
+    } finally {
+      setCommerceActivePending('')
+    }
+  }
+
+  const editCommerceActiveSelection = (
+    accountGlobalId: string,
+    capability: CommerceActiveWriteCapability,
+    selected: boolean,
+  ) => {
+    setCommerceActiveSelections((current) => {
+      const capabilities = current[accountGlobalId] || []
+      return {
+        ...current,
+        [accountGlobalId]: selected
+          ? [...new Set([...capabilities, capability])].sort()
+          : capabilities.filter((entry) => entry !== capability),
+      }
+    })
+    setCommerceActivePreparation(null)
+    setCommerceActiveConfirmed(false)
+    setCommerceActiveError('')
+    setCommerceActivePrepareKey(commerceActiveIdempotencyKey('prepare'))
+    setCommerceActiveActivateKey(commerceActiveIdempotencyKey('activate'))
+  }
+
+  const returnToCommerceActiveSelection = () => {
+    setCommerceActivePreparation(null)
+    setCommerceActiveConfirmed(false)
+    setCommerceActiveError('')
+    setCommerceActivePrepareKey(commerceActiveIdempotencyKey('prepare'))
+    setCommerceActiveActivateKey(commerceActiveIdempotencyKey('activate'))
+  }
+
+  const prepareCommerceActive = async () => {
+    if (!workspace || workspace.activation.state !== 'shadow') {
+      setCommerceActiveError(
+        'Operations activation changed. Return to Shadow and restart this review.',
+      )
+      return
+    }
+    const selectedAccounts = commerceActiveAccounts.flatMap((account) => {
+      const capabilities = commerceActiveSelections[account.accountGlobalId] || []
+      return capabilities.length > 0
+        ? [{ accountGlobalId: account.accountGlobalId, capabilities }]
+        : []
+    })
+    if (selectedAccounts.length === 0) {
+      setCommerceActiveError(
+        'Select at least one provider-write capability before preparing the review.',
+      )
+      return
+    }
+    setCommerceActivePending('preparing')
+    setCommerceActiveError('')
+    try {
+      const response = await fetch('/api/operations', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': commerceActivePrepareKey,
+        },
+        body: JSON.stringify({
+          action: 'prepare-commerce-active-authorization',
+          expectedActivationState: workspace.activation.state,
+          expectedActivationRevision: workspace.activation.revision,
+          selectedAccounts,
+        }),
+      })
+      const payload = await response.json() as OperationsPayload
+      if (
+        !response.ok
+        || !payload.result
+        || !('preparationGlobalId' in payload.result)
+      ) {
+        throw new Error(payload.error || 'Active provider-write review could not be prepared')
+      }
+      setCommerceActivePreparation(payload.result)
+      setCommerceActiveConfirmed(false)
+    } catch (caught) {
+      setCommerceActiveError(
+        caught instanceof Error
+          ? caught.message
+          : 'Active provider-write review could not be prepared',
+      )
+    } finally {
+      setCommerceActivePending('')
+    }
+  }
+
+  const activateCommerce = async () => {
+    if (!commerceActivePreparation || !commerceActiveConfirmed) return
+    setCommerceActivePending('activating')
+    setUpdatingActivation(true)
+    setCommerceActiveError('')
+    setError('')
+    try {
+      const response = await fetch('/api/operations', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': commerceActiveActivateKey,
+        },
+        body: JSON.stringify({
+          action: 'activate-commerce-with-authorization',
+          preparationGlobalId: commerceActivePreparation.preparationGlobalId,
+          expectedCohortHash: commerceActivePreparation.cohortHash,
+          confirmActiveProviderWrites: true,
+          reason: commerceActiveReason.trim(),
+        }),
+      })
+      const payload = await response.json() as OperationsPayload
+      if (
+        !response.ok
+        || !payload.result
+        || !('transition' in payload.result)
+      ) {
+        throw new Error(payload.error || 'Operations provider writes could not be activated')
+      }
+      const result = payload.result
+      setCommerceActiveOpen(false)
+      setNotice(
+        `Operations is Active at revision ${result.transition.revision}. Authorization ${result.authorization.authorizationGlobalId} and transition ${result.transition.transitionGlobalId} preserve the exact reviewed provider-write cohort.`,
+      )
+      await loadWorkspace(selectedGlobalId)
+    } catch (caught) {
+      setCommerceActiveError(
+        caught instanceof Error
+          ? caught.message
+          : 'Operations provider writes could not be activated',
+      )
+    } finally {
+      setCommerceActivePending('')
+      setUpdatingActivation(false)
+    }
+  }
+
+  const updateActivation = async (state: Exclude<OperationsActivationState, 'active'>) => {
     if (!workspace || state === workspace.activation.state) return
     setUpdatingActivation(true)
     setError('')
@@ -1675,6 +2004,8 @@ export default function OperationsSection({
           action: 'update-activation',
           state,
           reason: `Changed from ${workspace.activation.state} in the Operations workbench`,
+          expectedCurrentState: workspace.activation.state,
+          expectedCurrentRevision: workspace.activation.revision,
         }),
       })
       const payload = await response.json() as OperationsPayload
@@ -1689,6 +2020,21 @@ export default function OperationsSection({
     }
   }
 
+  const requestActivationChange = (state: OperationsActivationState) => {
+    if (!workspace || state === workspace.activation.state) return
+    if (state === 'active') {
+      void openCommerceActiveWorkflow()
+      return
+    }
+    void updateActivation(state)
+  }
+
+  const commerceActiveSelectedAccountCount = Object.values(
+    commerceActiveSelections,
+  ).filter((entries) => entries.length > 0).length
+  const commerceActiveSelectedCapabilityCount = Object.values(
+    commerceActiveSelections,
+  ).reduce((total, entries) => total + entries.length, 0)
   const capabilities = workspace?.capabilities
   const detail = workspace?.selectedOrder?.globalId === selectedGlobalId ? workspace.selectedOrder : null
   const detailSelectedRate = detail?.rates.find((rate) => rate.selected) || null
@@ -1770,13 +2116,25 @@ export default function OperationsSection({
                   select
                   size="small"
                   value={workspace.activation.state}
-                  onChange={(event) => void updateActivation(event.target.value as OperationsActivationState)}
+                  onChange={(event) => requestActivationChange(
+                    event.target.value as OperationsActivationState,
+                  )}
                   disabled={updatingActivation}
                   inputProps={{ 'aria-label': 'Operations activation mode' }}
                   sx={{ ...controlSx, minWidth: 118 }}
                 >
                   {ACTIVATION_OPTIONS.map((option) => (
-                    <MenuItem key={option.value} value={option.value}>{option.label}</MenuItem>
+                    <MenuItem
+                      key={option.value}
+                      value={option.value}
+                      disabled={
+                        option.value === 'active'
+                        && workspace.activation.state !== 'shadow'
+                        && workspace.activation.state !== 'active'
+                      }
+                    >
+                      {option.label}
+                    </MenuItem>
                   ))}
                 </TextField>
               </Tooltip>
@@ -2121,6 +2479,301 @@ export default function OperationsSection({
         onOpenOrder={openExceptionOrder}
       />
       <OperationsGuide open={guideOpen} onClose={() => setGuideOpen(false)} />
+
+      <Dialog
+        open={commerceActiveOpen}
+        onClose={closeCommerceActive}
+        fullWidth
+        maxWidth="md"
+      >
+        <DialogTitle>Activate commerce provider writes</DialogTitle>
+        <DialogContent dividers>
+          <Stack spacing={2}>
+            <Alert severity="warning">
+              Active mode permits the exact reviewed Shopify and Faire accounts to perform the
+              selected provider writes. Operations remains in Shadow until you complete the
+              separate authorization step.
+            </Alert>
+            {commerceActiveError && (
+              <Alert severity="error">{commerceActiveError}</Alert>
+            )}
+            {commerceActivePending === 'loading' ? (
+              <Stack direction="row" spacing={1.5} alignItems="center" sx={{ py: 4 }}>
+                <CircularProgress size={22} />
+                <Typography>Loading verified commerce accounts and provider scopes…</Typography>
+              </Stack>
+            ) : !commerceActivePreparation ? (
+              <>
+                <Box>
+                  <Typography fontWeight={700}>1. Select the exact write cohort</Typography>
+                  <Typography variant="body2" color="text.secondary">
+                    Only verified accounts and capabilities covered by their provider-reported
+                    scopes are available. Clear every capability for an account to exclude it.
+                  </Typography>
+                </Box>
+                {commerceActiveAccounts.map((account) => (
+                  <Box
+                    key={account.accountGlobalId}
+                    sx={{
+                      border: '1px solid',
+                      borderColor: 'divider',
+                      borderRadius: 1.5,
+                      p: 2,
+                    }}
+                  >
+                    <Stack
+                      direction={{ xs: 'column', sm: 'row' }}
+                      justifyContent="space-between"
+                      gap={0.5}
+                    >
+                      <Box>
+                        <Typography fontWeight={700}>{account.displayName}</Typography>
+                        <Typography variant="body2" color="text.secondary">
+                          {displayStatus(account.provider)} · {displayStatus(account.environment)}
+                        </Typography>
+                      </Box>
+                      <Typography variant="caption" color="#A8C7FA">
+                        {account.accountGlobalId}
+                      </Typography>
+                    </Stack>
+                    <Box
+                      sx={{
+                        mt: 1,
+                        display: 'grid',
+                        gridTemplateColumns: {
+                          xs: '1fr',
+                          sm: 'repeat(2, minmax(0, 1fr))',
+                        },
+                        columnGap: 2,
+                      }}
+                    >
+                      {account.eligibleCapabilities.map((capability) => (
+                        <FormControlLabel
+                          key={capability}
+                          control={(
+                            <Checkbox
+                              checked={
+                                commerceActiveSelections[
+                                  account.accountGlobalId
+                                ]?.includes(capability) || false
+                              }
+                              onChange={(event) => editCommerceActiveSelection(
+                                account.accountGlobalId,
+                                capability,
+                                event.target.checked,
+                              )}
+                            />
+                          )}
+                          label={displayStatus(capability)}
+                        />
+                      ))}
+                    </Box>
+                  </Box>
+                ))}
+                <Alert severity="info">
+                  Preparing this review performs no credential decryption, provider request, or
+                  provider write. It records the exact accounts, credential generations, granted
+                  scopes, capabilities, Shadow revision, and cohort hash for your review.
+                </Alert>
+                <Typography variant="body2" color="text.secondary">
+                  Selected: {commerceActiveSelectedAccountCount} account
+                  {commerceActiveSelectedAccountCount === 1 ? '' : 's'} ·{' '}
+                  {commerceActiveSelectedCapabilityCount} provider-write capabilit
+                  {commerceActiveSelectedCapabilityCount === 1 ? 'y' : 'ies'}
+                </Typography>
+              </>
+            ) : (
+              <>
+                <Box>
+                  <Typography fontWeight={700}>2. Review and explicitly authorize</Typography>
+                  <Typography variant="body2" color="text.secondary">
+                    This immutable preparation is the only cohort that the server will activate.
+                    Any account, credential, scope, capability, or Shadow-revision drift fails
+                    closed.
+                  </Typography>
+                </Box>
+                <Box
+                  sx={{
+                    border: '1px solid',
+                    borderColor: 'divider',
+                    borderRadius: 1.5,
+                    p: 2,
+                  }}
+                >
+                  <Stack spacing={0.75}>
+                    <Typography variant="body2">
+                      Preparation: <Box component="span" color="#A8C7FA">
+                        {commerceActivePreparation.preparationGlobalId}
+                      </Box>
+                    </Typography>
+                    <Typography variant="body2">
+                      Activation: Shadow revision{' '}
+                      {commerceActivePreparation.expectedActivationRevision} → Active revision{' '}
+                      {commerceActivePreparation.targetActivationRevision}
+                    </Typography>
+                    <Typography variant="body2" sx={{ overflowWrap: 'anywhere' }}>
+                      Cohort SHA-256: {commerceActivePreparation.cohortHash}
+                    </Typography>
+                    <Typography variant="caption" color="text.secondary">
+                      Prepared by {commerceActivePreparation.preparedBy} ({commerceActivePreparation.preparedRole})
+                      {' '}at {formatUserDateTime(
+                        commerceActivePreparation.preparedAt,
+                        dateTime,
+                        {
+                          year: 'numeric',
+                          month: 'short',
+                          day: 'numeric',
+                          hour: 'numeric',
+                          minute: '2-digit',
+                          fallback: commerceActivePreparation.preparedAt,
+                        },
+                      )}
+                    </Typography>
+                  </Stack>
+                </Box>
+                {commerceActivePreparation.accounts.map((account) => (
+                  <Box
+                    key={account.accountGlobalId}
+                    sx={{
+                      border: '1px solid',
+                      borderColor: 'divider',
+                      borderRadius: 1.5,
+                      p: 2,
+                    }}
+                  >
+                    <Stack
+                      direction={{ xs: 'column', sm: 'row' }}
+                      justifyContent="space-between"
+                      gap={0.5}
+                    >
+                      <Typography fontWeight={700}>
+                        {displayStatus(account.provider)} · {account.accountGlobalId}
+                      </Typography>
+                      <Chip
+                        size="small"
+                        label={displayStatus(account.environment)}
+                        variant="outlined"
+                      />
+                    </Stack>
+                    <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
+                      Provider identity {account.externalAccountId} · credential generation{' '}
+                      {account.credentialGeneration} · {displayStatus(account.authMode)}
+                    </Typography>
+                    <Typography variant="body2" sx={{ mt: 1 }}>
+                      Provider-write capabilities
+                    </Typography>
+                    <Stack direction="row" gap={0.75} flexWrap="wrap" useFlexGap sx={{ mt: 0.5 }}>
+                      {account.writeCapabilities.map((capability) => (
+                        <Chip
+                          key={capability}
+                          size="small"
+                          color="warning"
+                          variant="outlined"
+                          label={displayStatus(capability)}
+                        />
+                      ))}
+                    </Stack>
+                    <Typography variant="body2" sx={{ mt: 1 }}>
+                      Provider-reported granted scopes
+                    </Typography>
+                    <Stack direction="row" gap={0.75} flexWrap="wrap" useFlexGap sx={{ mt: 0.5 }}>
+                      {account.grantedScopes.map((scope) => (
+                        <Chip key={scope} size="small" label={scope} />
+                      ))}
+                    </Stack>
+                  </Box>
+                ))}
+                <TextField
+                  required
+                  multiline
+                  minRows={2}
+                  label="Activation reason"
+                  value={commerceActiveReason}
+                  onChange={(event) => setCommerceActiveReason(event.target.value)}
+                  inputProps={{ maxLength: 500 }}
+                  helperText={`${commerceActiveReason.trim().length}/500 · Recorded with the immutable transition`}
+                />
+                <FormControlLabel
+                  sx={{ alignItems: 'flex-start' }}
+                  control={(
+                    <Checkbox
+                      checked={commerceActiveConfirmed}
+                      onChange={(event) => setCommerceActiveConfirmed(event.target.checked)}
+                    />
+                  )}
+                  label="I authorize ClawPilot to move Operations from Shadow to Active for exactly the reviewed accounts and provider-write capabilities."
+                />
+                <Alert severity="error">
+                  Authorizing creates a five-minute, single-use{' '}
+                  <strong>commerce-active-transition-v1</strong> authorization and immediately
+                  consumes it under the same locked transition. A stale or changed cohort is not
+                  activated.
+                </Alert>
+              </>
+            )}
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          {commerceActivePreparation && (
+            <Button
+              onClick={returnToCommerceActiveSelection}
+              disabled={commerceActivePending === 'activating'}
+            >
+              Back
+            </Button>
+          )}
+          <Box sx={{ flex: 1 }} />
+          <Button
+            onClick={closeCommerceActive}
+            disabled={
+              commerceActivePending === 'preparing'
+              || commerceActivePending === 'activating'
+            }
+          >
+            Cancel
+          </Button>
+          {!commerceActivePreparation ? (
+            <Button
+              variant="contained"
+              onClick={() => void prepareCommerceActive()}
+              disabled={
+                Boolean(commerceActivePending)
+                || commerceActiveSelectedAccountCount === 0
+                || commerceActiveSelectedCapabilityCount === 0
+              }
+              startIcon={
+                commerceActivePending === 'preparing'
+                  ? <CircularProgress size={16} />
+                  : <ScienceRounded />
+              }
+            >
+              {commerceActivePending === 'preparing'
+                ? 'Preparing review'
+                : 'Prepare exact review'}
+            </Button>
+          ) : (
+            <Button
+              variant="contained"
+              color="error"
+              onClick={() => void activateCommerce()}
+              disabled={
+                commerceActivePending === 'activating'
+                || !commerceActiveConfirmed
+                || !commerceActiveReason.trim()
+              }
+              startIcon={
+                commerceActivePending === 'activating'
+                  ? <CircularProgress size={16} />
+                  : <WarningAmberRounded />
+              }
+            >
+              {commerceActivePending === 'activating'
+                ? 'Authorizing and activating'
+                : 'Authorize and activate'}
+            </Button>
+          )}
+        </DialogActions>
+      </Dialog>
 
       <Dialog open={releaseOpen} onClose={closeRelease} fullWidth maxWidth="sm">
         <Box component="form" onSubmit={releaseOrder}>

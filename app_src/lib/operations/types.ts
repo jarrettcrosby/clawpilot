@@ -20,6 +20,25 @@ export type OperationsExceptionStatus = 'open' | 'acknowledged' | 'resolved' | '
 
 export type OperationsActivationState = 'disabled' | 'shadow' | 'read_only' | 'active' | 'frozen'
 
+export type CommerceActiveWriteCapability =
+  | 'catalog_publishing'
+  | 'inventory_export'
+  | 'inventory_transfer_synchronization'
+  | 'inventory_shipment_synchronization'
+  | 'location_administration'
+  | 'customer_export'
+  | 'order_creation'
+  | 'order_update'
+  | 'order_edit'
+  | 'draft_order_synchronization'
+  | 'refund_export'
+  | 'fulfillment_export'
+  | 'third_party_fulfillment_orchestration'
+  | 'fulfillment_service'
+  | 'tracking_export'
+  | 'shipping_rate_callbacks'
+  | 'return_export'
+
 export type OperationsOrderAction =
   | 'release_to_warehouse'
   | 'confirm_picks'
@@ -972,4 +991,62 @@ export type OperationsExceptionUpdateResult = {
 
 export type OperationsActivationUpdateResult = OperationsWorkspace['activation'] & {
   dataPipeline: OperationsWorkspace['dataPipeline']
+}
+
+export type OperationsCommerceActivePreparationResult = {
+  preparationGlobalId: string
+  cohortHash: string
+  expectedActivationState: 'shadow'
+  expectedActivationRevision: number
+  targetActivationState: 'active'
+  targetActivationRevision: number
+  accounts: Array<{
+    accountGlobalId: string
+    provider: 'shopify' | 'faire'
+    environment: 'sandbox' | 'production'
+    externalAccountId: string
+    credentialGeneration: number
+    authMode: string
+    priorAccountStatus: 'active' | 'disabled'
+    targetAccountStatus: 'active'
+    grantedScopes: string[]
+    grantedScopeDigest: string
+    writeCapabilities: CommerceActiveWriteCapability[]
+    capabilityDigest: string
+  }>
+  preparedBy: string
+  preparedRole: 'owner' | 'admin'
+  preparedAt: string
+  replayed: boolean
+}
+
+export type OperationsCommerceActiveTransitionResult = {
+  authorization: {
+    authorizationGlobalId: string
+    preparationGlobalId: string
+    cohortHash: string
+    confirmationStatementVersion: 'commerce-active-transition-v1'
+    authorizedBy: string
+    authorizedRole: 'owner' | 'admin'
+    authorizedAt: string
+    expiresAt: string
+    replayed: boolean
+  }
+  transition: {
+    transitionGlobalId: string
+    preparationGlobalId: string
+    authorizationGlobalId: string
+    cohortHash: string
+    fromActivationState: 'shadow'
+    fromActivationRevision: number
+    state: 'active'
+    revision: number
+    accountCount: number
+    capabilityCount: number
+    reason: string | null
+    activatedBy: string
+    activatedRole: 'owner' | 'admin'
+    activatedAt: string
+    replayed: boolean
+  }
 }

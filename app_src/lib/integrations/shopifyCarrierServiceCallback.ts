@@ -2,6 +2,7 @@ import { createHash, createHmac } from 'node:crypto'
 import {
   fingerprintShopifyCarrierServiceRateRequest,
   readShopifyCarrierServiceRateRequest,
+  safeShopifyCarrierServiceProtocolErrorPath,
   shopifyCarrierServiceRequestMatchesTestAllowlist,
   stableShopifyCarrierServiceCode,
   type ShopifyCarrierServiceRateResponse,
@@ -527,6 +528,9 @@ function checkoutFailureStage(
   error: unknown,
   claimed: boolean,
 ) {
+  if (!claimed && safeShopifyCarrierServiceProtocolErrorPath(error)) {
+    return 'protocol'
+  }
   const message = error instanceof Error ? error.message : ''
   if (
     !claimed
@@ -545,11 +549,13 @@ function recordCheckoutFailure(input: {
   error: unknown
   claimed: boolean
 }) {
+  const protocolPath = safeShopifyCarrierServiceProtocolErrorPath(input.error)
   console.warn('[shopify checkout rating] callback failed', {
     accountGlobalId: input.accountGlobalId,
     stage: checkoutFailureStage(input.error, input.claimed),
     reasonCode: errorCode(input.error),
     receiptClaimed: input.claimed,
+    ...(protocolPath ? { protocolPath } : {}),
   })
 }
 

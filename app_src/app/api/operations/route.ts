@@ -16,6 +16,12 @@ import type {
 } from '@/lib/operations/types'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import {
+  authorizeCommerceActiveTransitionInPostgres,
+  CommerceActiveTransitionPersistenceError,
+  consumeCommerceActiveTransitionAuthorizationInPostgres,
+  prepareCommerceActiveTransitionInPostgres,
+} from '@/lib/persistence/commerceActiveTransitionAuthorization'
+import {
   confirmOperationsOrderShipmentFromPostgres,
   confirmOperationsOrderPicksFromPostgres,
   completeOperationsInboundReceiptInPostgres,
@@ -59,6 +65,9 @@ const LOCATION_GLOBAL_ID = /^gwl\d{7}$/
 const INVENTORY_POOL_GLOBAL_ID = /^gip\d{7}$/
 const RECEIPT_GLOBAL_ID = /^grc\d{7}$/
 const RECEIPT_LINE_GLOBAL_ID = /^grcl\d{7}$/
+const INTEGRATION_ACCOUNT_GLOBAL_ID = /^gia\d{7}$/
+const COMMERCE_ACTIVE_PREPARATION_GLOBAL_ID = /^gcap\d{7}$/
+const SHA256 = /^[a-f0-9]{64}$/
 const ORDER_STATUSES = new Set<OperationsOrderStatus>([
   'imported', 'validated', 'held', 'promised', 'reserved', 'planned',
   'released', 'picking', 'packed', 'shipped', 'cancelled', 'exception',
@@ -285,6 +294,73 @@ function carrierCutoffsValue(value: unknown): Record<string, string> {
   return result
 }
 
+function commerceActiveSelectedAccountsValue(value: unknown) {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 8) {
+    requestError(
+      'COMMERCE_ACTIVE_COHORT_INVALID',
+      'Select between one and eight commerce accounts',
+    )
+  }
+  const seen = new Set<string>()
+  return value.map((entry, index) => {
+    const selected = record(
+      entry,
+      'COMMERCE_ACTIVE_COHORT_INVALID',
+      `Commerce account ${index + 1}`,
+    )
+    assertFields(
+      selected,
+      new Set(['accountGlobalId', 'capabilities']),
+      'COMMERCE_ACTIVE_COHORT_INVALID',
+      `Commerce account ${index + 1}`,
+    )
+    const accountGlobalId = globalIdValue(
+      selected.accountGlobalId,
+      `Commerce account ${index + 1}`,
+      INTEGRATION_ACCOUNT_GLOBAL_ID,
+    )
+    if (seen.has(accountGlobalId)) {
+      requestError(
+        'COMMERCE_ACTIVE_ACCOUNT_DUPLICATE',
+        'A commerce account can appear only once in an Active cohort',
+      )
+    }
+    seen.add(accountGlobalId)
+    if (
+      !Array.isArray(selected.capabilities)
+      || selected.capabilities.length < 1
+      || selected.capabilities.length > 32
+    ) {
+      requestError(
+        'COMMERCE_ACTIVE_CAPABILITIES_INVALID',
+        `Select at least one write capability for ${accountGlobalId}`,
+      )
+    }
+    const capabilities = selected.capabilities.map((capability) => {
+      const normalized = String(capability || '').trim()
+      if (!/^[a-z][a-z0-9_]{0,127}$/.test(normalized)) {
+        requestError(
+          'COMMERCE_ACTIVE_CAPABILITIES_INVALID',
+          `Selected write capabilities for ${accountGlobalId} are invalid`,
+        )
+      }
+      return normalized
+    })
+    return {
+      accountGlobalId,
+      capabilities: [...new Set(capabilities)].sort(),
+    }
+  })
+}
+
+function sha256Value(value: unknown, label: string) {
+  const normalized = String(value || '').trim()
+  if (!SHA256.test(normalized)) {
+    requestError('COMMERCE_ACTIVE_COHORT_INVALID', `${label} is invalid`)
+  }
+  return normalized
+}
+
 function locationStorageFunctionValue(
   value: unknown,
   locationType: OperationsWorkspace['warehouses'][number]['locations'][number]['locationType'],
@@ -492,6 +568,9 @@ function errorResponse(error: unknown) {
     return json({ ok: false, error: 'Select an active organization first', code: error.message }, 409)
   }
   if (error instanceof OperationsRequestError) {
+    return json({ ok: false, error: error.message, code: error.code }, error.status)
+  }
+  if (error instanceof CommerceActiveTransitionPersistenceError) {
     return json({ ok: false, error: error.message, code: error.code }, error.status)
   }
   const code = error instanceof Error && /^OPERATIONS_[A-Z_]+$/.test(error.message)
@@ -1096,6 +1175,133 @@ export async function POST(req: NextRequest) {
       })
       return json({ ok: true, capabilities, result })
     }
+    if (action === 'prepare-commerce-active-authorization') {
+      if (!capabilities.canActivate) {
+        return json({
+          ok: false,
+          error: 'Only an organization owner or authorized administrator may prepare Operations Active mode',
+          code: 'OPERATIONS_ACTIVATION_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set([
+          'action',
+          'expectedActivationState',
+          'expectedActivationRevision',
+          'selectedAccounts',
+        ]),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
+      if (textValue(body.expectedActivationState, 'Expected activation state', 20) !== 'shadow') {
+        requestError(
+          'COMMERCE_ACTIVE_SHADOW_REQUIRED',
+          'Return Operations to Shadow before preparing Active provider writes',
+          409,
+        )
+      }
+      const prepared = await prepareCommerceActiveTransitionInPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        expectedActivationState: 'shadow',
+        expectedActivationRevision: integerValue(
+          body.expectedActivationRevision,
+          'Expected activation revision',
+          1,
+          2_147_483_647,
+        ),
+        selectedAccounts: commerceActiveSelectedAccountsValue(
+          body.selectedAccounts,
+        ),
+        idempotencyKey: idempotencyKeyValue(req),
+      })
+      const result = {
+        ...prepared,
+        accounts: prepared.accounts.map((account) => ({
+          accountGlobalId: account.accountGlobalId,
+          provider: account.provider,
+          environment: account.environment,
+          externalAccountId: account.externalAccountId,
+          credentialGeneration: account.credentialGeneration,
+          authMode: account.authMode,
+          priorAccountStatus: account.priorAccountStatus,
+          targetAccountStatus: account.targetAccountStatus,
+          grantedScopes: account.grantedScopes,
+          grantedScopeDigest: account.grantedScopeDigest,
+          writeCapabilities: account.writeCapabilities,
+          capabilityDigest: account.capabilityDigest,
+        })),
+      }
+      return json(
+        { ok: true, capabilities, result },
+        prepared.replayed ? 200 : 201,
+      )
+    }
+    if (action === 'activate-commerce-with-authorization') {
+      if (!capabilities.canActivate) {
+        return json({
+          ok: false,
+          error: 'Only an organization owner or authorized administrator may activate Operations provider writes',
+          code: 'OPERATIONS_ACTIVATION_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set([
+          'action',
+          'preparationGlobalId',
+          'expectedCohortHash',
+          'confirmActiveProviderWrites',
+          'reason',
+        ]),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
+      if (body.confirmActiveProviderWrites !== true) {
+        requestError(
+          'COMMERCE_ACTIVE_CONFIRMATION_REQUIRED',
+          'Confirm the exact reviewed commerce accounts and provider-write capabilities before activating',
+        )
+      }
+      const preparationGlobalId = globalIdValue(
+        body.preparationGlobalId,
+        'Commerce Active preparation',
+        COMMERCE_ACTIVE_PREPARATION_GLOBAL_ID,
+      )
+      const expectedCohortHash = sha256Value(
+        body.expectedCohortHash,
+        'Expected commerce cohort hash',
+      )
+      const idempotencyKey = idempotencyKeyValue(req)
+      const authorization =
+        await authorizeCommerceActiveTransitionInPostgres({
+          organizationId: activeOperationsOrganizationId(actor),
+          actorEmail: actor.email,
+          preparationGlobalId,
+          expectedCohortHash,
+          idempotencyKey,
+        })
+      const transition =
+        await consumeCommerceActiveTransitionAuthorizationInPostgres({
+          organizationId: activeOperationsOrganizationId(actor),
+          actorEmail: actor.email,
+          authorizationGlobalId: authorization.authorizationGlobalId,
+          expectedCohortHash,
+          idempotencyKey,
+          reason: textValue(
+            body.reason,
+            'Activation reason',
+            500,
+            false,
+          ) || null,
+        })
+      return json({
+        ok: true,
+        capabilities,
+        result: { authorization, transition },
+      })
+    }
     if (action === 'update-activation') {
       if (!capabilities.canActivate) {
         return json({
@@ -1104,16 +1310,52 @@ export async function POST(req: NextRequest) {
           code: 'OPERATIONS_ACTIVATION_REQUIRED',
         }, 403)
       }
-      assertFields(body, new Set(['action', 'state', 'reason']), 'OPERATIONS_REQUEST_INVALID', 'Operations command')
+      assertFields(
+        body,
+        new Set([
+          'action',
+          'state',
+          'reason',
+          'expectedCurrentState',
+          'expectedCurrentRevision',
+        ]),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
       const state = textValue(body.state, 'Activation state', 20) as OperationsActivationState
       if (!ACTIVATION_STATES.has(state)) {
         requestError('OPERATIONS_ACTIVATION_STATE_INVALID', 'Operations activation state is invalid')
+      }
+      if (state === 'active') {
+        requestError(
+          'COMMERCE_ACTIVE_AUTHORIZATION_REQUIRED',
+          'Prepare and explicitly authorize the exact commerce provider-write cohort before activating Operations',
+          409,
+        )
+      }
+      const expectedCurrentState = textValue(
+        body.expectedCurrentState,
+        'Expected current activation state',
+        20,
+      ) as OperationsActivationState
+      if (!ACTIVATION_STATES.has(expectedCurrentState)) {
+        requestError(
+          'OPERATIONS_ACTIVATION_STATE_INVALID',
+          'Expected current activation state is invalid',
+        )
       }
       const result = await updateOperationsActivationInPostgres({
         organizationId: activeOperationsOrganizationId(actor),
         actorEmail: actor.email,
         state,
         reason: textValue(body.reason, 'Activation reason', 500, false) || null,
+        expectedCurrentState,
+        expectedCurrentRevision: integerValue(
+          body.expectedCurrentRevision,
+          'Expected current activation revision',
+          1,
+          2_147_483_647,
+        ),
       })
       return json({ ok: true, capabilities, result })
     }
