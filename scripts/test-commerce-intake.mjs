@@ -106,6 +106,9 @@ includes(migration, [
 const continuationMigration = read(
   'db/migrations/0115_operations_commerce_intake_continuations.sql',
 )
+const currentIssueIndexMigration = read(
+  'db/migrations/0158_operations_commerce_current_issue_index.sql',
+)
 includes(continuationMigration, [
   'CREATE TABLE IF NOT EXISTS operations_commerce_intake_continuations',
   "cursor_state IN (\n      'available', 'consumed', 'exhausted'",
@@ -776,6 +779,7 @@ includes(serviceSource, [
   "commandAction === 'set-product-intake-policy'",
   "commandAction === 'validate'",
   "commandAction === 'promote'",
+  "commandAction === 'reconcile-checkout-rate'",
   'confirmProviderWriteOff',
   'withAutomaticProductCreation',
   'autoCreateCommerceProductsForRunInPostgres',
@@ -898,11 +902,35 @@ includes(productCandidateReadSource, [
   'Number(productCandidateSummary.unresolved)',
   '> returnedUnresolvedProductCandidates',
 ], 'Unresolved-first bounded product candidate response')
+includes(productCandidateReadSource, [
+  'WITH latest_rejections AS',
+  'SELECT DISTINCT ON (resource_type, external_id)',
+  "WHERE disposition = 'open'",
+  'count(*) OVER()::text AS total_count',
+  'rejectionSummary: {',
+  "scope: 'latest_open_per_account_resource_external_identity'",
+  'Number(openRejections.rows[0]?.total_count || 0)',
+], 'Current provider-identity rejection projection and uncapped count')
+includes(currentIssueIndexMigration, [
+  'commerce_intake_rejections_current_identity_idx',
+  'organization_id',
+  'integration_account_id',
+  'resource_type',
+  'external_id',
+  'created_at DESC',
+  'id DESC',
+], 'Current provider-identity rejection index')
+assert.doesNotMatch(
+  currentIssueIndexMigration,
+  /\bINCLUDE\s*\(/i,
+  'Current provider-identity rejection index must not retain wide payloads',
+)
 for (const exportName of [
   'captureCommerceIntakeProviderReadInPostgres',
   'confirmCommerceCandidateAddressInPostgres',
   'markCommerceCandidateUnsupportedInPostgres',
   'promoteCommerceCandidateInPostgres',
+  'reconcilePromotedCommerceCandidateCheckoutRateInPostgres',
   'readCommerceIntakeStateFromPostgres',
   'readCommerceIntakeContinuationFromPostgres',
   'readCommerceIntakeRefreshTargetFromPostgres',
@@ -927,6 +955,18 @@ for (const exportName of [
     `Commerce intake persistence must export ${exportName}`,
   )
 }
+const checkoutReconciliationCommandSource = persistenceSource.slice(
+  persistenceSource.indexOf(
+    'reconcilePromotedCommerceCandidateCheckoutRateInPostgres',
+  ),
+)
+includes(checkoutReconciliationCommandSource, [
+  "'commerce.intake.reconcile_checkout_rate'",
+  'candidateRowVersion: input.candidateRowVersion',
+  'if (started.replayed) return replayPayload(started.receipt)',
+  'await completeReceipt(',
+  'reconciliation.globalId',
+], 'Checkout-rate recovery command receipt and replay contract')
 const commandResultSource = persistenceSource.slice(
   persistenceSource.indexOf('function commandResult'),
 )
@@ -942,6 +982,9 @@ const readIntentPreparationSource = persistenceSource.slice(
 includes(readIntentPreparationSource, [
   "now() + interval '30 days'",
 ], 'Database-clock commerce read-intent retention')
+includes(persistenceSource, [
+  'windowEnd: input.page.windowEnd',
+], 'Truthful intake pagination window projection')
 assert.doesNotMatch(
   readIntentPreparationSource,
   /now\.getTime\(\)\s*\+\s*30\s*\*\s*24\s*\*\s*60\s*\*\s*60/,
@@ -1181,6 +1224,11 @@ const automaticProductResolutionModule = loadTypeScriptModule(
       '@/lib/persistence/productChannelStates': {
         async linkProductChannelStateWithClient() {},
         async upsertProductChannelStateWithClient() {},
+      },
+      '@/lib/persistence/shopifyCheckoutRating': {
+        async reconcileShopifyCheckoutRateForOrderCandidateWithClient() {},
+        shopifyCheckoutRateLineageIsRequired() { return false },
+        shopifyCheckoutRateOutcomeAllowsFulfillment() { return true },
       },
     },
   },
@@ -1442,6 +1490,12 @@ includes(workflowSource, [
   'Every staged',
   'href="#operations"',
 ], 'Commerce intake activation recovery')
+includes(workflowSource, [
+  'const totalRejectionCount = rejectionSummary?.total ?? rejections.length',
+  'Export loaded issues CSV',
+  'current provider rejections',
+  'CSV export apply to the loaded subset',
+], 'Truthful truncated provider-issue presentation')
 const intakeRouteSource = read(
   'app_src/app/api/integrations/commerce/intake/route.ts',
 )
@@ -1498,6 +1552,8 @@ includes(workflowSource, [
   'Import decisions',
   'parseCommerceProductReviewCsv',
   'confirmProviderWriteOff: true',
+  "'reconcile-checkout-rate'",
+  'Match checkout quote',
 ], 'Commerce intake executable recovery and catalog workflow')
 includes(workflowSource, [
   'Pause or resume product catalog sync',
@@ -1679,6 +1735,11 @@ const customerIdentityPersistence = loadTypeScriptModule(
       '@/lib/persistence/productChannelStates': {
         async linkProductChannelStateWithClient() {},
         async upsertProductChannelStateWithClient() {},
+      },
+      '@/lib/persistence/shopifyCheckoutRating': {
+        async reconcileShopifyCheckoutRateForOrderCandidateWithClient() {},
+        shopifyCheckoutRateLineageIsRequired() { return false },
+        shopifyCheckoutRateOutcomeAllowsFulfillment() { return true },
       },
       '@/lib/persistence/postgres': {
         acquireTransactionAdvisoryLock() {},
@@ -2145,6 +2206,8 @@ const service = loadTypeScriptModule(
         excludeCommerceIntakeRejectionInPostgres:
           persistenceCommand('exclude-rejection'),
         promoteCommerceCandidateInPostgres: persistenceCommand('promote'),
+        reconcilePromotedCommerceCandidateCheckoutRateInPostgres:
+          persistenceCommand('reconcile-checkout-rate'),
         async readCommerceIntakeStateFromPostgres(input) {
           stateReads.push(input)
           return { accountGlobalId: input.accountGlobalId, candidates: [] }
@@ -2913,6 +2976,7 @@ try {
       reason: 'The source state cannot be promoted safely',
     }),
     commandBody('promote', { confirmProviderWriteOff: true }),
+    commandBody('reconcile-checkout-rate'),
   ]
   for (const body of localCommands) {
     await service.executeCommerceIntakeCommand({
@@ -2934,6 +2998,7 @@ try {
     'validate',
     'mark-unsupported',
     'promote',
+    'reconcile-checkout-rate',
   ]) {
     assert.ok(calledNames.includes(expected), `Command path missing ${expected}`)
   }

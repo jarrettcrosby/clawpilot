@@ -49,6 +49,8 @@ type AuthorizationRow = QueryResultRow & {
   config_row_version: string | number
   activation_state: 'shadow'
   activation_revision: number
+  simulation_activation_revision: number
+  provider_write_activation_revision: number | null
   aggregate_hash: string
   request_hash: string
   expected_service_gid: string | null
@@ -99,6 +101,8 @@ export type ShopifyCarrierServiceMutationAuthorization = {
   configRowVersion: number
   activationState: 'shadow'
   activationRevision: number
+  simulationActivationRevision: number
+  providerWriteActivationRevision: number | null
   aggregateHash: string
   requestHash: string
   expectedServiceGid: string | null
@@ -199,13 +203,24 @@ const AUTHORIZATION_SELECT = `
     authorization.config_row_version::text,
     authorization.activation_state,
     authorization.activation_revision,
+    authorization.simulation_activation_revision,
+    authorization.provider_write_activation_revision,
     authorization.aggregate_hash,
     authorization.request_hash,
     authorization.expected_service_gid,
     authorization.confirmation_hash,
     authorization.confirmation_statement_version,
     authorization.idempotency_key,
-    authorization.authorization_fence_hash,
+    CASE
+      WHEN authorization.provider_write_activation_revision IS NULL
+        THEN authorization.authorization_fence_hash
+      ELSE
+        operations_shopify_cs_active_authorization_fence_hash(
+          authorization.authorization_fence_hash,
+          authorization.simulation_activation_revision,
+          authorization.provider_write_activation_revision
+        )
+    END AS authorization_fence_hash,
     authorization.authorized_by,
     authorization.authorized_role,
     authorization.authorized_at,
@@ -411,6 +426,10 @@ function authorization(row: AuthorizationRow) {
     configRowVersion: Number(row.config_row_version),
     activationState: row.activation_state,
     activationRevision: row.activation_revision,
+    simulationActivationRevision:
+      row.simulation_activation_revision,
+    providerWriteActivationRevision:
+      row.provider_write_activation_revision,
     aggregateHash: row.aggregate_hash,
     requestHash: row.request_hash,
     expectedServiceGid: row.expected_service_gid,
@@ -560,7 +579,9 @@ export async function authorizeShopifyCarrierServiceMutationInPostgres(
     operation: ShopifyCarrierServiceMutationOperation
     accountEnvironment: ShopifyCarrierServiceMutationEnvironment
     credentialGeneration: number
-    activationRevision: number
+    configActivationRevision: number
+    simulationActivationRevision: number
+    providerWriteActivationRevision: number
     aggregateHash: string
     requestHash: string
     expectedServiceGid?: string | null
@@ -607,9 +628,21 @@ export async function authorizeShopifyCarrierServiceMutationInPostgres(
       1,
       Number.MAX_SAFE_INTEGER,
     ),
-    activationRevision: integer(
-      rawInput.activationRevision,
-      'Activation revision',
+    configActivationRevision: integer(
+      rawInput.configActivationRevision,
+      'Configuration activation revision',
+      1,
+      Number.MAX_SAFE_INTEGER,
+    ),
+    simulationActivationRevision: integer(
+      rawInput.simulationActivationRevision,
+      'Shadow simulation activation revision',
+      1,
+      Number.MAX_SAFE_INTEGER,
+    ),
+    providerWriteActivationRevision: integer(
+      rawInput.providerWriteActivationRevision,
+      'Active provider-write activation revision',
       1,
       Number.MAX_SAFE_INTEGER,
     ),
@@ -770,14 +803,15 @@ export async function authorizeShopifyCarrierServiceMutationInPostgres(
            organization_id, integration_account_id, config_id,
            simulation_effect_id, operation, account_environment,
            credential_generation, config_row_version, activation_state,
-           activation_revision, aggregate_hash, request_hash,
+           activation_revision, simulation_activation_revision,
+           provider_write_activation_revision, aggregate_hash, request_hash,
            expected_service_gid, confirmation_hash,
            confirmation_statement_version, idempotency_key,
            authorized_by, authorized_role, expires_at
          ) VALUES (
            $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7,
            $8::bigint, 'shadow', $9, $10, $11, $12, $13, $14, $15,
-           $16, $17, now() + ($18::text || ' seconds')::interval
+           $16, $17, $18, $19, now() + ($20::text || ' seconds')::interval
          )
          ON CONFLICT (
            organization_id, integration_account_id, operation,
@@ -793,7 +827,9 @@ export async function authorizeShopifyCarrierServiceMutationInPostgres(
         input.accountEnvironment,
         input.credentialGeneration,
         input.expectedConfigRowVersion,
-        input.activationRevision,
+        input.configActivationRevision,
+        input.simulationActivationRevision,
+        input.providerWriteActivationRevision,
         input.aggregateHash,
         input.requestHash,
         input.expectedServiceGid,
@@ -821,13 +857,15 @@ export async function authorizeShopifyCarrierServiceMutationInPostgres(
            AND authorization.credential_generation = $8
            AND authorization.config_row_version = $9::bigint
            AND authorization.activation_revision = $10
-           AND authorization.aggregate_hash = $11
-           AND authorization.request_hash = $12
-           AND authorization.expected_service_gid IS NOT DISTINCT FROM $13
-           AND authorization.confirmation_hash = $14
-           AND authorization.confirmation_statement_version = $15
-           AND authorization.authorized_by = $16
-           AND authorization.authorized_role = $17`,
+           AND authorization.simulation_activation_revision = $11
+           AND authorization.provider_write_activation_revision = $12
+           AND authorization.aggregate_hash = $13
+           AND authorization.request_hash = $14
+           AND authorization.expected_service_gid IS NOT DISTINCT FROM $15
+           AND authorization.confirmation_hash = $16
+           AND authorization.confirmation_statement_version = $17
+           AND authorization.authorized_by = $18
+           AND authorization.authorized_role = $19`,
         [
           input.organizationId,
           facts.rows[0].integration_account_id,
@@ -838,7 +876,9 @@ export async function authorizeShopifyCarrierServiceMutationInPostgres(
           input.accountEnvironment,
           input.credentialGeneration,
           input.expectedConfigRowVersion,
-          input.activationRevision,
+          input.configActivationRevision,
+          input.simulationActivationRevision,
+          input.providerWriteActivationRevision,
           input.aggregateHash,
           input.requestHash,
           input.expectedServiceGid,
@@ -887,8 +927,14 @@ export async function authorizeShopifyCarrierServiceMutationInPostgres(
           operation: input.operation,
           accountEnvironment: input.accountEnvironment,
           credentialGeneration: input.credentialGeneration,
-          activationState: 'shadow',
-          activationRevision: input.activationRevision,
+          simulationMode: 'shadow',
+          configActivationRevision:
+            input.configActivationRevision,
+          simulationActivationRevision:
+            input.simulationActivationRevision,
+          providerWriteMode: 'active',
+          providerWriteActivationRevision:
+            input.providerWriteActivationRevision,
           aggregateHash: input.aggregateHash,
           requestHash: input.requestHash,
           confirmationHash: input.confirmationHash,
@@ -968,6 +1014,12 @@ export async function claimShopifyCarrierServiceMutationInPostgres(
       fail(
         'SHOPIFY_CARRIER_SERVICE_MUTATION_AUTHORIZATION_FENCE_STALE',
         'Shopify CarrierService mutation authorization fence changed',
+      )
+    }
+    if (current.providerWriteActivationRevision === null) {
+      fail(
+        'SHOPIFY_CARRIER_SERVICE_LEGACY_SHADOW_AUTHORIZATION_DISABLED',
+        'Legacy Shadow provider-write authorizations are audit-only and cannot be claimed',
       )
     }
     if (current.attempt) {
@@ -1514,6 +1566,14 @@ export async function resolveShopifyCarrierServiceMutationInPostgres(
   })
 }
 
+/**
+ * Link immutable succeeded or confirmed-applied provider evidence to the exact
+ * unchanged CarrierService configuration. This transaction is local-only.
+ * Active revision and verified credential-generation fences were enforced
+ * before the attempt was inserted; a later organization-activation change or
+ * credential rotation/verification change must not strand provider state that
+ * Shopify already applied.
+ */
 export async function finalizeShopifyCarrierServiceConfigMutationInPostgres(
   rawInput: {
     organizationId: string
@@ -1569,6 +1629,7 @@ export async function finalizeShopifyCarrierServiceConfigMutationInPostgres(
       authorization_id: string
       authorization_global_id: string
       operation: ShopifyCarrierServiceMutationOperation
+      provider_write_activation_revision: number | null
       attempt_id: string
       outcome_id: string | null
       outcome_global_id: string | null
@@ -1597,6 +1658,7 @@ export async function finalizeShopifyCarrierServiceConfigMutationInPostgres(
          authorization.id::text AS authorization_id,
          authorization.global_id AS authorization_global_id,
          authorization.operation,
+         authorization.provider_write_activation_revision,
          attempt.id::text AS attempt_id,
          outcome.id::text AS outcome_id,
          outcome.global_id AS outcome_global_id,
@@ -1695,6 +1757,12 @@ export async function finalizeShopifyCarrierServiceConfigMutationInPostgres(
         'CarrierService configuration changed before provider-state finalization',
       )
     }
+    if (row.provider_write_activation_revision === null) {
+      fail(
+        'SHOPIFY_CARRIER_SERVICE_LEGACY_SHADOW_AUTHORIZATION_DISABLED',
+        'Legacy Shadow provider-write evidence cannot change the current CarrierService configuration',
+      )
+    }
     const evidenceMatches = usingOutcome
       ? (
           row.outcome_global_id === input.evidenceGlobalId
@@ -1778,18 +1846,20 @@ export async function finalizeShopifyCarrierServiceConfigMutationInPostgres(
        SET registration_state = $3,
            service_gid = $4,
            last_error_code = NULL,
+           activation_revision = $5,
            row_version = row_version + 1,
-           updated_by = $5,
+           updated_by = $6,
            updated_at = now()
        WHERE organization_id = $1::uuid
          AND id = $2::uuid
-         AND row_version = $6::bigint
+         AND row_version = $7::bigint
        RETURNING global_id, row_version::text`,
       [
         input.organizationId,
         row.config_id,
         targetState,
         targetServiceGid,
+        row.provider_write_activation_revision,
         input.actorEmail,
         input.expectedConfigRowVersion,
       ],
@@ -1819,6 +1889,8 @@ export async function finalizeShopifyCarrierServiceConfigMutationInPostgres(
         operation: row.operation,
         registrationState: targetState,
         serviceGid: targetServiceGid,
+        providerWriteActivationRevision:
+          row.provider_write_activation_revision,
         fromRowVersion: input.expectedConfigRowVersion,
         rowVersion: Number(updated.rows[0].row_version),
       },

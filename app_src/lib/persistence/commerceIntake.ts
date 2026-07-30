@@ -51,6 +51,12 @@ import {
   linkProductChannelStateWithClient,
   upsertProductChannelStateWithClient,
 } from '@/lib/persistence/productChannelStates'
+import {
+  reconcileShopifyCheckoutRateForOrderCandidateWithClient,
+  shopifyCheckoutRateLineageIsRequired,
+  shopifyCheckoutRateOutcomeAllowsFulfillment,
+  type ShopifyCheckoutRateReconciliationOutcome,
+} from '@/lib/persistence/shopifyCheckoutRating'
 
 const POLICY_VERSION = 'commerce-intake-resolution-v1'
 const PRODUCT_INTAKE_POLICY_VERSION = 'commerce-product-intake-policy-v1'
@@ -204,6 +210,7 @@ type CandidateRow = {
   discount_minor: string
   brand_discount_minor: string
   shipping_minor: string | null
+  checkout_shipping_service_code: string | null
   tax_minor: string
   other_adjustment_minor: string | null
   total_minor: string | null
@@ -231,6 +238,11 @@ type CandidateRow = {
   unsupported_reason_detail: string | null
   canonical_order_id: string | null
   canonical_order_global_id: string | null
+  checkout_rate_reconciliation_global_id: string | null
+  checkout_rate_receipt_global_id: string | null
+  checkout_rate_reconciliation_outcome:
+    | ShopifyCheckoutRateReconciliationOutcome
+    | null
   customer_global_id: string | null
   row_version: string
   observed_at: string | Date
@@ -1152,6 +1164,7 @@ const CANDIDATE_SELECT = `SELECT
   candidate.discount_minor::text,
   candidate.brand_discount_minor::text,
   candidate.shipping_minor::text,
+  candidate.checkout_shipping_service_code,
   candidate.tax_minor::text,
   candidate.other_adjustment_minor::text,
   candidate.total_minor::text,
@@ -1179,6 +1192,11 @@ const CANDIDATE_SELECT = `SELECT
   candidate.unsupported_reason_detail,
   candidate.canonical_order_id::text,
   canonical_order.global_id AS canonical_order_global_id,
+  checkout_reconciliation.global_id
+    AS checkout_rate_reconciliation_global_id,
+  checkout_receipt.global_id AS checkout_rate_receipt_global_id,
+  checkout_reconciliation.outcome
+    AS checkout_rate_reconciliation_outcome,
   customer.reference_code AS customer_global_id,
   candidate.row_version::text,
   candidate.observed_at,
@@ -1192,6 +1210,13 @@ JOIN operations_commerce_intake_runs run
 LEFT JOIN operations_orders canonical_order
   ON canonical_order.organization_id = candidate.organization_id
  AND canonical_order.id = candidate.canonical_order_id
+LEFT JOIN operations_shopify_checkout_rate_current_reconciliations
+    checkout_reconciliation
+  ON checkout_reconciliation.organization_id = candidate.organization_id
+ AND checkout_reconciliation.order_candidate_id = candidate.id
+LEFT JOIN operations_shopify_checkout_rate_receipts checkout_receipt
+  ON checkout_receipt.organization_id = checkout_reconciliation.organization_id
+ AND checkout_receipt.id = checkout_reconciliation.receipt_id
 LEFT JOIN crm_organizations customer
   ON customer.pipeline_id = candidate.pipeline_id
  AND customer.id = candidate.customer_id`
@@ -5029,6 +5054,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
       state: 'available' | 'exhausted'
       providerRowsSeen: number
       eligibleOrdersSeen: number
+      windowEnd: string
     } | null = null
     if (input.page) {
       let previousRunId: string | null = null
@@ -5220,6 +5246,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
         state: continuationState,
         providerRowsSeen: input.page.providerRowsSeen,
         eligibleOrdersSeen: input.page.eligibleOrdersSeen,
+        windowEnd: input.page.windowEnd,
       }
     }
     const stagedIntent = await client.query(
@@ -5970,13 +5997,22 @@ export async function readCommerceIntakeStateFromPostgres(input: {
       source_hash: string
       error_code: string
       safe_message: string
+      total_count: string
     }>(
-      `SELECT global_id, row_version::text, resource_type, external_id,
-              source_hash, error_code, safe_message
-       FROM operations_commerce_intake_rejections
-       WHERE organization_id = $1::uuid
-         AND integration_account_id = $2::uuid
-         AND disposition = 'open'
+      `WITH latest_rejections AS (
+         SELECT DISTINCT ON (resource_type, external_id)
+           global_id, row_version, resource_type, external_id, source_hash,
+           error_code, safe_message, disposition, expires_at, created_at, id
+         FROM operations_commerce_intake_rejections
+         WHERE organization_id = $1::uuid
+           AND integration_account_id = $2::uuid
+         ORDER BY resource_type, external_id, created_at DESC, id DESC
+       )
+       SELECT global_id, row_version::text, resource_type, external_id,
+              source_hash, error_code, safe_message,
+              count(*) OVER()::text AS total_count
+       FROM latest_rejections
+       WHERE disposition = 'open'
          AND expires_at > now()
        ORDER BY created_at DESC, id DESC
        LIMIT 500`,
@@ -6153,6 +6189,28 @@ export async function readCommerceIntakeStateFromPostgres(input: {
           blockers: dynamicLineBlockingCodes(line).map(blocker),
         })),
         canonicalOrderGlobalId: candidate.canonical_order_global_id,
+        checkoutRateReconciliation: candidate.provider === 'shopify'
+          ? {
+              globalId:
+                candidate.checkout_rate_reconciliation_global_id,
+              receiptGlobalId: candidate.checkout_rate_receipt_global_id,
+              outcome: shopifyCheckoutRateLineageIsRequired(
+                candidate.checkout_shipping_service_code,
+              )
+                ? candidate.checkout_rate_reconciliation_outcome
+                : 'not_applicable',
+              lineageRequired: shopifyCheckoutRateLineageIsRequired(
+                candidate.checkout_shipping_service_code,
+              ),
+              fulfillmentEligible:
+                !shopifyCheckoutRateLineageIsRequired(
+                  candidate.checkout_shipping_service_code,
+                )
+                || shopifyCheckoutRateOutcomeAllowsFulfillment(
+                  candidate.checkout_rate_reconciliation_outcome,
+                ),
+            }
+          : null,
         unsupportedReason: candidate.unsupported_reason_detail
           || candidate.unsupported_reason_code,
       }
@@ -6310,6 +6368,15 @@ export async function readCommerceIntakeStateFromPostgres(input: {
         unresolvedTruncated:
           Number(productCandidateSummary.unresolved)
           > returnedUnresolvedProductCandidates,
+      },
+      rejectionSummary: {
+        scope: 'latest_open_per_account_resource_external_identity',
+        limit: 500,
+        total: Number(openRejections.rows[0]?.total_count || 0),
+        returned: openRejections.rows.length,
+        truncated:
+          Number(openRejections.rows[0]?.total_count || 0)
+          > openRejections.rows.length,
       },
       rejections: openRejections.rows.map((rejection) => ({
         globalId: rejection.global_id,
@@ -9639,6 +9706,22 @@ export async function promoteCommerceCandidateInPostgres(input: {
     candidate.canonical_order_id = order.id
     candidate.canonical_order_global_id = order.global_id
     candidate.row_version = updatedCandidate.rows[0].row_version
+    const checkoutRateLineageRequired = candidate.provider === 'shopify'
+      && shopifyCheckoutRateLineageIsRequired(
+        candidate.checkout_shipping_service_code,
+      )
+    const checkoutRateReconciliation = checkoutRateLineageRequired
+      ? await reconcileShopifyCheckoutRateForOrderCandidateWithClient(
+          client,
+          {
+            organizationId: candidate.organization_id,
+            orderCandidateGlobalId: candidate.global_id,
+            idempotencyKey:
+              `${candidate.global_id}:checkout-rate-reconciliation`,
+            actorEmail: input.actorEmail,
+          },
+        )
+      : null
     await refreshRunCounts(client, candidate, input.actorEmail)
     await recordDecision(client, {
       candidate,
@@ -9667,6 +9750,18 @@ export async function promoteCommerceCandidateInPostgres(input: {
         provider: candidate.provider,
         externalOrderId: candidate.external_order_id,
         canonicalOrderGlobalId: order.global_id,
+        checkoutRateReconciliationGlobalId:
+          checkoutRateReconciliation?.globalId || null,
+        checkoutRateReconciliationOutcome:
+          candidate.provider === 'shopify'
+            ? checkoutRateReconciliation?.outcome || 'not_applicable'
+            : null,
+        checkoutRateLineageRequired,
+        checkoutRateFulfillmentEligible:
+          !checkoutRateLineageRequired
+          || shopifyCheckoutRateOutcomeAllowsFulfillment(
+            checkoutRateReconciliation?.outcome,
+          ),
         lineCount: promotedLines.length,
         providerWrites: 0,
         syncCursorAdvanced: false,
@@ -9681,6 +9776,21 @@ export async function promoteCommerceCandidateInPostgres(input: {
         canonicalLineGlobalIds: promotedLines.map(
           (line) => line.canonicalLineGlobalId,
         ),
+        checkoutRateReconciliation: candidate.provider === 'shopify'
+          ? {
+              globalId: checkoutRateReconciliation?.globalId || null,
+              receiptGlobalId:
+                checkoutRateReconciliation?.receiptGlobalId || null,
+              outcome:
+                checkoutRateReconciliation?.outcome || 'not_applicable',
+              lineageRequired: checkoutRateLineageRequired,
+              fulfillmentEligible:
+                !checkoutRateLineageRequired
+                || shopifyCheckoutRateOutcomeAllowsFulfillment(
+                  checkoutRateReconciliation?.outcome,
+                ),
+            }
+          : null,
         inventoryWrites: 0,
         reservationWrites: 0,
         fulfillmentWrites: 0,
@@ -9691,6 +9801,120 @@ export async function promoteCommerceCandidateInPostgres(input: {
       client,
       started.receipt.id,
       order.global_id,
+      result,
+    )
+    return result
+  })
+}
+
+export async function
+reconcilePromotedCommerceCandidateCheckoutRateInPostgres(input: {
+  runtime: CommerceRuntimeCredentialRecord
+  actorEmail: string
+  idempotencyKey: string
+  candidateGlobalId: string
+  candidateRowVersion: number
+}) {
+  return withTransaction(async (client) => {
+    const started = await commandStart(
+      client,
+      input,
+      'commerce.intake.reconcile_checkout_rate',
+      {
+        policyVersion: POLICY_VERSION,
+        candidateRowVersion: input.candidateRowVersion,
+        recoveryPolicyVersion:
+          'shopify-cached-receipt-reuse-reconciliation-v1',
+      },
+    )
+    if (started.replayed) return replayPayload(started.receipt)
+    const candidateResult = await client.query<{
+      row_version: string
+      provider: string
+      workflow_state: string
+      canonical_order_id: string | null
+      checkout_shipping_service_code: string | null
+    }>(
+      `SELECT
+         candidate.row_version::text,
+         candidate.provider,
+         candidate.workflow_state,
+         candidate.canonical_order_id::text,
+         candidate.checkout_shipping_service_code
+       FROM operations_commerce_order_candidates candidate
+       JOIN operations_integration_accounts account
+         ON account.organization_id = candidate.organization_id
+        AND account.id = candidate.integration_account_id
+       WHERE candidate.organization_id = $1::uuid
+         AND account.global_id = $2
+         AND candidate.global_id = $3
+       FOR UPDATE OF candidate`,
+      [
+        input.runtime.organizationId,
+        input.runtime.globalId,
+        input.candidateGlobalId,
+      ],
+    )
+    const candidate = candidateResult.rows[0]
+    if (!candidate) {
+      intakeError(
+        'COMMERCE_INTAKE_CANDIDATE_NOT_FOUND',
+        'The selected order candidate is unavailable for this connection',
+        404,
+      )
+    }
+    if (Number(candidate.row_version) !== input.candidateRowVersion) {
+      intakeError(
+        'COMMERCE_INTAKE_ROW_VERSION_CONFLICT',
+        'The order changed after it was opened. Reload before matching its checkout quote',
+        409,
+      )
+    }
+    if (
+      candidate.provider !== 'shopify'
+      || candidate.workflow_state !== 'promoted'
+      || !candidate.canonical_order_id
+      || !shopifyCheckoutRateLineageIsRequired(
+        candidate.checkout_shipping_service_code,
+      )
+    ) {
+      intakeError(
+        'COMMERCE_INTAKE_CHECKOUT_RECONCILIATION_NOT_APPLICABLE',
+        'A promoted Shopify order using a ClawPilot shipping service is required',
+        409,
+      )
+    }
+    const reconciliation =
+      await reconcileShopifyCheckoutRateForOrderCandidateWithClient(
+        client,
+        {
+          organizationId: input.runtime.organizationId,
+          orderCandidateGlobalId: input.candidateGlobalId,
+          idempotencyKey:
+            `${input.candidateGlobalId}:checkout-rate-reconciliation`,
+          actorEmail: input.actorEmail,
+        },
+      )
+    const result = {
+      replayed: false,
+      action: 'reconcile-checkout-rate',
+      candidateGlobalId: input.candidateGlobalId,
+      checkoutRateReconciliation: {
+        globalId: reconciliation.globalId,
+        receiptGlobalId: reconciliation.receiptGlobalId,
+        outcome: reconciliation.outcome,
+        fulfillmentEligible:
+          shopifyCheckoutRateOutcomeAllowsFulfillment(
+            reconciliation.outcome,
+          ),
+      },
+      providerWrites: 0,
+      syncCursorAdvanced: false,
+    }
+    await completeReceipt(
+      client,
+      started.receipt.id,
+      reconciliation.globalId,
       result,
     )
     return result

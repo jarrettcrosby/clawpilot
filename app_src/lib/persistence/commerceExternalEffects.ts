@@ -1438,3 +1438,48 @@ export async function readCommerceExternalEffectsStateFromPostgres(input: {
   )
   return result.rows.map(externalEffect)
 }
+
+export async function readCommerceExternalEffectByIdempotencyFromPostgres(
+  input: {
+    organizationId: string
+    accountGlobalId: string
+    action: string
+    idempotencyKey: string
+  },
+) {
+  validateIdentifier(input.organizationId, 'Organization identifier', 64)
+  validateIdentifier(
+    input.accountGlobalId,
+    'Integration account Global ID',
+    32,
+  )
+  if (!CODE.test(input.action)) {
+    externalEffectError(
+      'COMMERCE_EXTERNAL_EFFECT_CODE_INVALID',
+      'External-effect action must use a stable code',
+      400,
+    )
+  }
+  validateIdentifier(input.idempotencyKey, 'Idempotency key', 255)
+  const result = await query<ExternalEffectRow>(
+    `${EXTERNAL_EFFECT_SELECT},
+       false AS claimable,
+       NULL::text AS stale_reason
+     FROM operations_commerce_external_effect_intents intent
+     JOIN operations_integration_accounts account
+       ON account.organization_id = intent.organization_id
+      AND account.id = intent.integration_account_id
+     WHERE intent.organization_id = $1::uuid
+       AND account.global_id = $2
+       AND intent.action = $3
+       AND intent.idempotency_key = $4
+     LIMIT 1`,
+    [
+      input.organizationId,
+      input.accountGlobalId,
+      input.action,
+      input.idempotencyKey,
+    ],
+  )
+  return result.rows[0] ? externalEffect(result.rows[0]) : null
+}

@@ -8,6 +8,7 @@ import {
   executeAuthorizedShopifyCarrierServiceMutation,
   executeShopifyCarrierServiceRegistration,
   SHOPIFY_CARRIER_SERVICE_REGISTRATION_ADAPTER_VERSION,
+  shopifyCarrierServiceRegistrationRequestHash,
   ShopifyCarrierServiceRegistrationError,
   verifyShopifyCarrierServiceMutationForReconciliation,
   type ShopifyCarrierServiceRegistrationMutation,
@@ -21,6 +22,7 @@ import {
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import {
   commerceExternalEffectHash,
+  readCommerceExternalEffectByIdempotencyFromPostgres,
 } from '@/lib/persistence/commerceExternalEffects'
 import {
   readCommerceIntegrationsStateFromPostgres,
@@ -400,6 +402,52 @@ function mutationAuthorizationGlobalId(value: unknown) {
   return normalized
 }
 
+function shadowSimulationIdempotencyKey(input: {
+  config: PublicShopifyCarrierServiceConfig
+  operation: ShopifyCarrierServiceMutationOperation
+}) {
+  return `shopify-carrier-service:shadow-${input.operation}:${
+    input.config.globalId
+  }:${input.config.rowVersion}`
+}
+
+async function exactShadowSimulation(input: {
+  organizationId: string
+  accountGlobalId: string
+  config: PublicShopifyCarrierServiceConfig
+  operation: ShopifyCarrierServiceMutationOperation
+}) {
+  const aggregateHash = configAggregateHash(input.config)
+  const action = `shopify.carrier_service.${input.operation}`
+  const effect =
+    await readCommerceExternalEffectByIdempotencyFromPostgres({
+      organizationId: input.organizationId,
+      accountGlobalId: input.accountGlobalId,
+      action,
+      idempotencyKey: shadowSimulationIdempotencyKey({
+        config: input.config,
+        operation: input.operation,
+      }),
+    })
+  return effect
+    && (
+    effect.provider === 'shopify'
+    && effect.action === action
+    && effect.desiredMode === 'shadow'
+    && effect.state === 'simulated'
+    && effect.providerWriteCount === 0
+    && effect.credentialGeneration
+      === input.config.credentialGeneration
+    && effect.aggregateType
+      === 'shopify_carrier_service_configuration'
+    && effect.aggregateId === input.config.globalId
+    && effect.aggregateRevision === input.config.rowVersion
+    && effect.aggregateHash === aggregateHash
+    )
+    ? effect
+    : null
+}
+
 function mutationActorRole(
   role: ReturnType<typeof effectiveAuthorizationRole>,
 ): ShopifyCarrierServiceMutationActorRole {
@@ -465,7 +513,11 @@ async function setupState(input: {
       404,
     )
   }
-  const [config, reference, mutationAuthorizations] = await Promise.all([
+  const [
+    config,
+    reference,
+    mutationAuthorizations,
+  ] = await Promise.all([
     readShopifyCarrierServiceConfigFromPostgres({
       organizationId: input.organizationId,
       accountGlobalId: input.accountGlobalId,
@@ -490,9 +542,36 @@ async function setupState(input: {
     })
     publicCallbackUrl = callbackUrl(input.accountGlobalId, token)
   }
+  const publicConfig = publicCarrierServiceConfig(config)
+  const operation: ShopifyCarrierServiceMutationOperation | null =
+    publicConfig?.registrationState === 'registered'
+      && publicConfig.serviceGid
+      ? 'delete'
+      : publicConfig?.registrationState === 'shadow_simulated'
+        && !publicConfig.serviceGid
+        ? 'create'
+        : null
+  const simulation = publicConfig && operation
+    ? await exactShadowSimulation({
+        organizationId: input.organizationId,
+        accountGlobalId: input.accountGlobalId,
+        config: publicConfig,
+        operation,
+      })
+    : null
   return {
     account,
-    config: publicCarrierServiceConfig(config),
+    config: publicConfig,
+    shadowSimulation: simulation
+      ? {
+          globalId: simulation.globalId,
+          operation,
+          activationRevision: simulation.activationRevision,
+          configRowVersion: simulation.aggregateRevision,
+          requestHash: simulation.requestHash,
+          completedAt: simulation.completedAt,
+        }
+      : null,
     reference,
     mutationAuthorizations: mutationAuthorizations.map(
       publicMutationAuthorization,
@@ -543,14 +622,19 @@ function requireActivator(canActivate: boolean) {
   }
 }
 
-async function executeOneTimeCarrierServiceMutation(input: {
+async function executeActiveCarrierServiceMutation(input: {
   organizationId: string
   accountGlobalId: string
   accountEnvironment: 'sandbox' | 'production'
   config: PublicShopifyCarrierServiceConfig
-  activationState: string
-  activationRevision: number | null
+  activeActivationRevision: number
   operation: ShopifyCarrierServiceMutationOperation
+  simulation: {
+    globalId: string
+    activationRevision: number
+    configRowVersion: number
+    requestHash: string
+  }
   confirmationRequestId: string
   actorEmail: string
   actorRole: ShopifyCarrierServiceMutationActorRole
@@ -566,9 +650,7 @@ async function executeOneTimeCarrierServiceMutation(input: {
     )
   }
   if (
-    input.activationState !== 'shadow'
-    || input.activationRevision === null
-    || input.activationRevision !== input.config.activationRevision
+    input.simulation.configRowVersion !== input.config.rowVersion
     || (
       input.operation === 'create'
       && (
@@ -585,8 +667,8 @@ async function executeOneTimeCarrierServiceMutation(input: {
     )
   ) {
     fail(
-      'SHOPIFY_CARRIER_SERVICE_SHADOW_CONFIG_REQUIRED',
-      'The exact current configuration must remain in Operations Shadow',
+      'SHOPIFY_CARRIER_SERVICE_ACTIVE_CONFIG_STALE',
+      'The exact configuration changed after its zero-write Shadow simulation',
       409,
     )
   }
@@ -596,35 +678,13 @@ async function executeOneTimeCarrierServiceMutation(input: {
     accountGlobalId: input.accountGlobalId,
     config: input.config,
   })
-  const aggregateHash = configAggregateHash(input.config)
-  const simulation = await executeShopifyCarrierServiceRegistration({
-    organizationId: input.organizationId,
-    accountGlobalId: input.accountGlobalId,
-    mode: 'shadow',
-    credentialGeneration: input.config.credentialGeneration,
-    activationRevision: input.config.activationRevision,
-    aggregateId: input.config.globalId,
-    aggregateRevision: input.config.rowVersion,
-    aggregateHash,
-    idempotencyKey: input.operation === 'create'
-      ? `shopify-carrier-service:shadow:${input.config.globalId}:${
-        input.config.rowVersion
-      }`
-      : `shopify-carrier-service:shadow-delete:${
-        input.config.globalId
-      }:${input.config.rowVersion}`,
-    mutation,
-    actorEmail: input.actorEmail,
-  })
-  if (
-    simulation.effect.state !== 'simulated'
-    || simulation.effect.providerWriteCount !== 0
-    || simulation.effect.desiredMode !== 'shadow'
-  ) {
+  const currentRequestHash =
+    shopifyCarrierServiceRegistrationRequestHash(mutation)
+  if (currentRequestHash !== input.simulation.requestHash) {
     fail(
-      'SHOPIFY_CARRIER_SERVICE_SHADOW_EVIDENCE_INVALID',
-      'Exact zero-write Shadow simulation evidence is required',
-      500,
+      'SHOPIFY_CARRIER_SERVICE_ACTIVE_REQUEST_STALE',
+      'The exact Shopify CarrierService request changed after its zero-write Shadow simulation',
+      409,
     )
   }
   const confirmationStatementVersion =
@@ -638,7 +698,7 @@ async function executeOneTimeCarrierServiceMutation(input: {
       configRowVersion: input.config.rowVersion,
       operation: input.operation,
       environment: input.accountEnvironment,
-      requestHash: simulation.effect.requestHash,
+      requestHash: currentRequestHash,
       actorEmail: input.actorEmail,
       statementVersion: confirmationStatementVersion,
     })
@@ -648,20 +708,24 @@ async function executeOneTimeCarrierServiceMutation(input: {
       accountGlobalId: input.accountGlobalId,
       configGlobalId: input.config.globalId,
       expectedConfigRowVersion: input.config.rowVersion,
-      simulationEffectGlobalId: simulation.effect.globalId,
+      simulationEffectGlobalId: input.simulation.globalId,
       operation: input.operation,
       accountEnvironment: input.accountEnvironment,
       credentialGeneration: input.config.credentialGeneration,
-      activationRevision: input.config.activationRevision,
-      aggregateHash,
-      requestHash: simulation.effect.requestHash,
+      configActivationRevision: input.config.activationRevision,
+      simulationActivationRevision:
+        input.simulation.activationRevision,
+      providerWriteActivationRevision:
+        input.activeActivationRevision,
+      aggregateHash: configAggregateHash(input.config),
+      requestHash: currentRequestHash,
       expectedServiceGid: input.operation === 'delete'
         ? input.config.serviceGid
         : null,
       confirmationHash,
       confirmationStatementVersion,
       idempotencyKey:
-        `shopify-cs-auth:${input.config.globalId}:${
+        `shopify-cs-active-auth:${input.config.globalId}:${
           input.config.rowVersion
         }:${input.confirmationRequestId}`,
       actorEmail: input.actorEmail,
@@ -952,7 +1016,26 @@ export async function POST(req: NextRequest) {
       })
     } else if (action === 'simulate-registration') {
       requireActivator(context.capabilities.canActivate)
-      if (current.account.environment !== 'sandbox') {
+      if (
+        !current.config
+        || current.reference.activation.state !== 'shadow'
+        || current.reference.activation.revision === null
+      ) {
+        fail(
+          'SHOPIFY_CARRIER_SERVICE_SIMULATION_STALE',
+          'Save a configuration and set Operations to Shadow before simulating',
+          409,
+        )
+      }
+      const operation: ShopifyCarrierServiceMutationOperation =
+        current.config.registrationState === 'registered'
+          && current.config.serviceGid
+          ? 'delete'
+          : 'create'
+      if (
+        operation === 'create'
+        && current.account.environment !== 'sandbox'
+      ) {
         fail(
           'SHOPIFY_CARRIER_SERVICE_PRODUCTION_CREATE_BLOCKED',
           'New Shopify CarrierService simulation and registration are sandbox-only',
@@ -960,9 +1043,8 @@ export async function POST(req: NextRequest) {
         )
       }
       if (
-        !current.config
-        || current.reference.activation.state !== 'shadow'
-        || current.reference.activation.revision
+        operation === 'create'
+        && current.reference.activation.revision
           !== current.config.activationRevision
       ) {
         fail(
@@ -971,54 +1053,75 @@ export async function POST(req: NextRequest) {
           409,
         )
       }
-      if (
-        current.config.registrationState === 'registered'
-        || current.config.serviceGid !== null
-      ) {
-        fail(
-          'SHOPIFY_CARRIER_SERVICE_EXACT_DELETE_REQUIRED',
-          'Remove the exact registered Shopify CarrierService before running another Shadow simulation',
-          409,
-        )
-      }
-      const token = shopifyCarrierServiceCallbackToken({
+      const mutation = carrierServiceMutation({
+        operation,
         organizationId: context.organizationId,
         accountGlobalId: accountId,
-        credentialGeneration: current.config.credentialGeneration,
-        callbackTokenVersion: current.config.callbackTokenVersion,
+        config: current.config,
       })
       await executeShopifyCarrierServiceRegistration({
         organizationId: context.organizationId,
         accountGlobalId: accountId,
         mode: 'shadow',
         credentialGeneration: current.config.credentialGeneration,
-        activationRevision: current.config.activationRevision,
+        activationRevision: current.reference.activation.revision,
         aggregateId: current.config.globalId,
         aggregateRevision: current.config.rowVersion,
         aggregateHash: configAggregateHash(current.config),
-        idempotencyKey:
-          `shopify-carrier-service:shadow:${current.config.globalId}:${
-            current.config.rowVersion
-          }`,
-        mutation: {
-          operation: 'create',
-          name: 'ClawPilot calculated shipping',
-          callbackUrl: callbackUrl(accountId, token),
-          active: true,
-          supportsServiceDiscovery: false,
-        },
+        idempotencyKey: shadowSimulationIdempotencyKey({
+          config: current.config,
+          operation,
+        }),
+        mutation,
         actorEmail: context.actor.email,
       })
-      await finalizeShopifyCarrierServiceRegistrationInPostgres({
-        organizationId: context.organizationId,
-        accountGlobalId: accountId,
-        expectedRowVersion: current.config.rowVersion,
-        activationRevision: current.config.activationRevision,
-        registrationState: 'shadow_simulated',
-        serviceGid: null,
-        lastErrorCode: null,
-        actorEmail: context.actor.email,
-      })
+      if (
+        operation === 'create'
+        && current.config.registrationState !== 'shadow_simulated'
+      ) {
+        const finalized =
+          await finalizeShopifyCarrierServiceRegistrationInPostgres({
+            organizationId: context.organizationId,
+            accountGlobalId: accountId,
+            expectedRowVersion: current.config.rowVersion,
+            activationRevision:
+              current.reference.activation.revision,
+            registrationState: 'shadow_simulated',
+            serviceGid: null,
+            lastErrorCode: null,
+            actorEmail: context.actor.email,
+          })
+        const exactConfig = publicCarrierServiceConfig(finalized)
+        if (!exactConfig) {
+          fail(
+            'SHOPIFY_CARRIER_SERVICE_SIMULATION_FINALIZE_FAILED',
+            'The exact Shadow-simulated configuration was not found',
+            500,
+          )
+        }
+        await executeShopifyCarrierServiceRegistration({
+          organizationId: context.organizationId,
+          accountGlobalId: accountId,
+          mode: 'shadow',
+          credentialGeneration: exactConfig.credentialGeneration,
+          activationRevision:
+            current.reference.activation.revision,
+          aggregateId: exactConfig.globalId,
+          aggregateRevision: exactConfig.rowVersion,
+          aggregateHash: configAggregateHash(exactConfig),
+          idempotencyKey: shadowSimulationIdempotencyKey({
+            config: exactConfig,
+            operation,
+          }),
+          mutation: carrierServiceMutation({
+            operation,
+            organizationId: context.organizationId,
+            accountGlobalId: accountId,
+            config: exactConfig,
+          }),
+          actorEmail: context.actor.email,
+        })
+      }
     } else if (action === 'register' || action === 'unregister') {
       requireActivator(context.capabilities.canActivate)
       if (body.confirmProviderWrite !== true) {
@@ -1032,6 +1135,30 @@ export async function POST(req: NextRequest) {
         fail(
           'SHOPIFY_CARRIER_SERVICE_CONFIG_REQUIRED',
           'Save and simulate the exact Shopify callback configuration first',
+          409,
+        )
+      }
+      const operation: ShopifyCarrierServiceMutationOperation =
+        action === 'register' ? 'create' : 'delete'
+      if (
+        current.reference.activation.state !== 'active'
+        || current.reference.activation.revision === null
+      ) {
+        fail(
+          'SHOPIFY_CARRIER_SERVICE_SHADOW_PROVIDER_WRITE_BLOCKED',
+          'CarrierService create and delete require the exact current Operations Active revision; Shadow remains zero-write',
+          409,
+        )
+      }
+      if (
+        !current.shadowSimulation
+        || current.shadowSimulation.operation !== operation
+        || current.shadowSimulation.configRowVersion
+          !== current.config.rowVersion
+      ) {
+        fail(
+          'SHOPIFY_CARRIER_SERVICE_SHADOW_EVIDENCE_REQUIRED',
+          'Return Operations to Shadow and run the exact zero-write simulation before activating this provider change',
           409,
         )
       }
@@ -1055,14 +1182,15 @@ export async function POST(req: NextRequest) {
           400,
         )
       }
-      await executeOneTimeCarrierServiceMutation({
+      await executeActiveCarrierServiceMutation({
         organizationId: context.organizationId,
         accountGlobalId: accountId,
         accountEnvironment: current.account.environment,
         config: current.config,
-        activationState: current.reference.activation.state,
-        activationRevision: current.reference.activation.revision,
-        operation: action === 'register' ? 'create' : 'delete',
+        activeActivationRevision:
+          current.reference.activation.revision,
+        operation,
+        simulation: current.shadowSimulation,
         confirmationRequestId: confirmationRequestId(
           body.confirmationRequestId,
         ),

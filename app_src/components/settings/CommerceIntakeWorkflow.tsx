@@ -178,6 +178,19 @@ type IntakeCandidate = {
   } | null
   lines?: IntakeLine[]
   canonicalOrderGlobalId?: string | null
+  checkoutRateReconciliation?: {
+    globalId?: string | null
+    receiptGlobalId?: string | null
+    outcome?:
+      | 'matched'
+      | 'ambiguous'
+      | 'rejected'
+      | 'expired'
+      | 'not_applicable'
+      | null
+    lineageRequired?: boolean
+    fulfillmentEligible?: boolean
+  } | null
   unsupportedReason?: string | null
 }
 
@@ -358,6 +371,13 @@ type CommerceIntake = {
     unresolvedReturned: number
     truncated: boolean
     unresolvedTruncated: boolean
+  }
+  rejectionSummary?: {
+    scope: string
+    limit: number
+    total: number
+    returned: number
+    truncated: boolean
   }
   rejections?: Array<{
     globalId: string
@@ -1644,7 +1664,11 @@ export default function CommerceIntakeWorkflow({
   const candidatesWithBlockers = candidates.filter(
     (candidate) => (candidate.blockers?.length || 0) > 0,
   )
-  const issueRecordCount = rejections.length + candidatesWithBlockers.length
+  const rejectionSummary = intake?.rejectionSummary
+  const totalRejectionCount = rejectionSummary?.total ?? rejections.length
+  const rejectionReviewTruncated = Boolean(rejectionSummary?.truncated)
+  const issueRecordCount =
+    totalRejectionCount + candidatesWithBlockers.length
   const unresolvedProductCount = productCandidates.filter((candidate) => (
     !terminalStates.has(candidate.state)
     && candidate.mappingStatus !== 'resolved'
@@ -3857,7 +3881,9 @@ export default function CommerceIntakeWorkflow({
                     onClick={downloadIssueSummaryCsv}
                     sx={actionButtonSx}
                   >
-                    Export provider issues CSV
+                    {rejectionReviewTruncated
+                      ? 'Export loaded issues CSV'
+                      : 'Export provider issues CSV'}
                   </Button>
                   <TextField
                     label="Search issues"
@@ -3870,6 +3896,14 @@ export default function CommerceIntakeWorkflow({
                   />
                 </Stack>
               </Stack>
+              {rejectionReviewTruncated ? (
+                <Alert severity="info">
+                  Showing the newest {rejectionSummary?.returned ?? 0} of{' '}
+                  {totalRejectionCount} current provider rejections. The issue
+                  total includes every current provider identity; search,
+                  recovery actions, and CSV export apply to the loaded subset.
+                </Alert>
+              ) : null}
               {candidateBlockerGroups.length ? (
                 <Box
                   sx={{
@@ -5478,6 +5512,40 @@ export default function CommerceIntakeWorkflow({
                             {' '}was created.
                           </Alert>
                         ) : null}
+                        {candidate.checkoutRateReconciliation ? (
+                          <Alert
+                            severity={
+                              candidate.checkoutRateReconciliation
+                                .lineageRequired === false
+                                ? 'info'
+                                : candidate.checkoutRateReconciliation
+                                .fulfillmentEligible
+                                ? 'success'
+                                : 'warning'
+                            }
+                          >
+                            Shopify checkout quote{' '}
+                            {candidate.checkoutRateReconciliation.outcome
+                              ? humanize(
+                                  candidate.checkoutRateReconciliation.outcome,
+                                )
+                              : 'Pending'}
+                            {candidate.checkoutRateReconciliation
+                              .receiptGlobalId
+                              ? ` · receipt ${
+                                  candidate.checkoutRateReconciliation
+                                    .receiptGlobalId
+                                }`
+                              : ''}
+                            {candidate.checkoutRateReconciliation
+                              .lineageRequired === false
+                              ? '. The selected Shopify shipping method does not require ClawPilot quote lineage.'
+                              : !candidate.checkoutRateReconciliation
+                                  .fulfillmentEligible
+                                ? '. Warehouse release remains blocked until the immutable checkout quote lineage is matched.'
+                                : '. Fulfillment lineage is verified.'}
+                          </Alert>
+                        ) : null}
                         {candidate.unsupportedReason ? (
                           <Alert severity="warning">
                             Unsupported: {candidate.unsupportedReason}
@@ -6433,6 +6501,37 @@ export default function CommerceIntakeWorkflow({
                           >
                             Refresh
                           </Button>
+                          {provider === 'shopify'
+                          && candidate.state === 'promoted'
+                          && candidate.checkoutRateReconciliation
+                            ?.lineageRequired
+                          && !candidate.checkoutRateReconciliation
+                            .globalId ? (
+                            <Button
+                              variant="outlined"
+                              startIcon={<CheckCircleOutlineRounded />}
+                              disabled={
+                                Boolean(pendingAction)
+                                || !operatorCommandsAllowed
+                              }
+                              onClick={() => {
+                                void postCommand(
+                                  'reconcile-checkout-rate',
+                                  `reconcile-checkout-rate:${
+                                    candidate.globalId
+                                  }`,
+                                  {
+                                    candidateGlobalId: candidate.globalId,
+                                    rowVersion: candidate.rowVersion,
+                                  },
+                                  'Shopify checkout quote matching completed. Review the immutable result before warehouse release.',
+                                )
+                              }}
+                              sx={actionButtonSx}
+                            >
+                              Match checkout quote
+                            </Button>
+                          ) : null}
                           <Button
                             variant="outlined"
                             startIcon={<CheckCircleOutlineRounded />}

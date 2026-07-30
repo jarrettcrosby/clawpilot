@@ -443,6 +443,18 @@ function redactedMutation(
   }
 }
 
+export function shopifyCarrierServiceRegistrationRequestHash(
+  mutation: ShopifyCarrierServiceRegistrationMutation,
+) {
+  const normalized = normalizeMutation(mutation)
+  return commerceExternalEffectHash({
+    provider: 'shopify',
+    apiVersion: SHOPIFY_CARRIER_SERVICE_API_VERSION,
+    requiredScope: SHOPIFY_CARRIER_SERVICE_REQUIRED_SCOPE,
+    mutation: redactedMutation(normalized),
+  })
+}
+
 function normalizeInput(
   input: ShopifyCarrierServiceRegistrationInput,
 ): NormalizedRegistrationInput {
@@ -668,12 +680,8 @@ export async function verifyShopifyCarrierServiceMutationForReconciliation(
     ...overrides,
   }
   const mutation = normalizeMutation(input.mutation)
-  const requestHash = commerceExternalEffectHash({
-    provider: 'shopify',
-    apiVersion: SHOPIFY_CARRIER_SERVICE_API_VERSION,
-    requiredScope: SHOPIFY_CARRIER_SERVICE_REQUIRED_SCOPE,
-    mutation: redactedMutation(mutation),
-  })
+  const requestHash =
+    shopifyCarrierServiceRegistrationRequestHash(mutation)
   if (
     mutation.operation === 'update'
     || !authorization.attempt
@@ -1504,10 +1512,10 @@ async function finalizeAuthorizedFailure(input: {
 }
 
 /**
- * Execute the sole Shopify provider mutation authorized by a consumed 0150
- * grant. The caller must claim the authorization before invoking this
- * function; credential decryption and every provider network call happen
- * strictly after that durable single-consumption record.
+ * Execute the sole Shopify provider mutation authorized by a consumed,
+ * revision-fenced Active grant. The caller must claim the authorization
+ * before invoking this function; credential decryption and every provider
+ * network call happen strictly after that durable single-consumption record.
  */
 export async function executeAuthorizedShopifyCarrierServiceMutation(
   input: {
@@ -1528,22 +1536,18 @@ export async function executeAuthorizedShopifyCarrierServiceMutation(
   if (mutation.operation === 'update') {
     registrationError(
       'SHOPIFY_CARRIER_SERVICE_AUTHORIZATION_OPERATION_INVALID',
-      'One-time Shadow authorization only supports registration or removal',
+      'One-time Active authorization only supports registration or removal',
       400,
       false,
       authorization.attempt.globalId,
     )
   }
-  const redactedRequest = {
-    provider: 'shopify',
-    apiVersion: SHOPIFY_CARRIER_SERVICE_API_VERSION,
-    requiredScope: SHOPIFY_CARRIER_SERVICE_REQUIRED_SCOPE,
-    mutation: redactedMutation(mutation),
-  }
-  const requestHash = commerceExternalEffectHash(redactedRequest)
+  const requestHash =
+    shopifyCarrierServiceRegistrationRequestHash(mutation)
   if (
     authorization.status !== 'claimed'
     || authorization.activationState !== 'shadow'
+    || authorization.providerWriteActivationRevision === null
     || authorization.operation !== mutation.operation
     || authorization.requestHash !== requestHash
     || (

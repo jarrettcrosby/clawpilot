@@ -71,6 +71,14 @@ type ShopifyCarrierServiceSetup = {
       carrierAccountGlobalId: string
     }>
   } | null
+  shadowSimulation: {
+    globalId: string
+    operation: 'create' | 'delete'
+    activationRevision: number
+    configRowVersion: number
+    requestHash: string
+    completedAt: string | null
+  } | null
   mutationAuthorizations: Array<{
     globalId: string
     operation: 'create' | 'delete'
@@ -376,9 +384,13 @@ export default function ShopifyCarrierServiceSetupPanel({
     && carrierAccounts.ups_rest
     && carrierAccounts.fedex_rest
   )
-  const simulated = setup?.config?.registrationState === 'shadow_simulated'
-    || setup?.config?.registrationState === 'registered'
   const registered = setup?.config?.registrationState === 'registered'
+  const expectedSimulationOperation = registered ? 'delete' : 'create'
+  const exactShadowSimulation = setup?.shadowSimulation?.operation
+    === expectedSimulationOperation
+    ? setup.shadowSimulation
+    : null
+  const simulated = Boolean(exactShadowSimulation)
   const shadowRegistered = registered
     && setup?.reference.activation.state === 'shadow'
     && setup.config?.ready === true
@@ -603,23 +615,34 @@ export default function ShopifyCarrierServiceSetupPanel({
     },
     {
       key: 'shadow',
-      label: 'Simulate registration in Shadow',
+      label: registered
+        ? 'Simulate exact removal in Shadow'
+        : 'Simulate registration in Shadow',
       description:
-        'For a sandbox store, Shadow records immutable terminal evidence with zero credential decryption, zero Shopify network calls, and zero provider writes.',
+        'Shadow records immutable terminal evidence for this exact configuration row with zero credential decryption, zero Shopify network calls, and zero provider writes.',
       state: stepState(
         Boolean(simulated),
         Boolean(setup?.config && !simulated),
       ),
-      facts: [{
-        label: 'Operations mode',
-        value: setup?.reference.activation.state || 'Unavailable',
-      }],
+      facts: [
+        {
+          label: 'Operations mode',
+          value: setup?.reference.activation.state || 'Unavailable',
+        },
+        ...(exactShadowSimulation ? [{
+          label: 'Simulation evidence',
+          value: exactShadowSimulation.globalId,
+        }] : []),
+      ],
       action: (
         <Button
           variant="outlined"
           disabled={
             !setup?.config
-            || setup.account.environment !== 'sandbox'
+            || (
+              !registered
+              && setup.account.environment !== 'sandbox'
+            )
             || setup.reference.activation.state !== 'shadow'
             || Boolean(busy)
             || Boolean(simulated)
@@ -627,23 +650,27 @@ export default function ShopifyCarrierServiceSetupPanel({
           onClick={() => void run(
             'simulate-registration',
             {},
-            'Shadow registration simulation completed with zero provider writes.',
+            `Shadow ${registered ? 'removal' : 'registration'} simulation completed with zero provider writes.`,
           )}
         >
           {busy === 'simulate-registration'
             ? 'Simulating…'
-            : 'Run zero-write simulation'}
+            : registered
+              ? 'Simulate exact removal'
+              : 'Run zero-write simulation'}
         </Button>
       ),
     },
     {
       key: 'register',
-      label: 'Authorize one exact Shopify change',
+      label: registered
+        ? 'Authorize exact removal in Active'
+        : 'Authorize exact registration in Active',
       description:
-        'Operations stays in Shadow. An owner or authorized administrator grants one short-lived, single-use CarrierService create or delete; no product, order, inventory, fulfillment, label, or tracking write is authorized.',
+        'After the exact Shadow simulation, switch Operations to Active. An owner or authorized administrator grants one short-lived, single-use provider mutation for only this configuration row and Active revision.',
       state: stepState(
-        Boolean(registered),
-        Boolean(simulated && !registered),
+        false,
+        Boolean(simulated),
         Boolean(recoveryRequired),
       ),
       facts: setup?.callbackUrl ? [{
@@ -653,10 +680,12 @@ export default function ShopifyCarrierServiceSetupPanel({
       }] : [],
       action: (
         <Stack spacing={1}>
-          <Alert severity="info">
-            Operations remains {setup?.reference.activation.state || 'unknown'}.
-            The authorization expires in two minutes and is consumed in the
-            database before credentials are decrypted or Shopify is called.
+          <Alert severity="warning">
+            Current Operations mode:{' '}
+            {setup?.reference.activation.state || 'unknown'}. Shadow makes
+            zero Shopify calls. Provider credentials remain encrypted and no
+            network call can begin until the exact Active authorization is
+            durably claimed.
           </Alert>
           {reconciliationRequired ? (
             <Alert severity="error">
@@ -727,30 +756,32 @@ export default function ShopifyCarrierServiceSetupPanel({
               </Button>
             </Stack>
           ) : null}
-          {!registered && setup?.account.environment === 'production' ? (
-            <Alert severity="warning">
-              New CarrierService registration is sandbox-only in this release.
-              Production remains read-only except for exact removal and
-              reconciliation of an already registered service.
-            </Alert>
-          ) : null}
           {!registered ? (
             <>
+              {setup?.account.environment === 'production' ? (
+                <Alert severity="warning">
+                  New CarrierService registration is sandbox-only in this
+                  development slice.
+                </Alert>
+              ) : null}
               <FormControlLabel
                 control={(
                   <Checkbox
                     checked={confirmWrite}
-                    onChange={(event) => setConfirmWrite(event.target.checked)}
+                    disabled={Boolean(busy)}
+                    onChange={(event) => {
+                      setConfirmWrite(event.target.checked)
+                    }}
                   />
                 )}
-                label="I authorize exactly one sandbox Shopify CarrierService registration for this configuration revision."
+                label="I authorize exactly one sandbox Shopify CarrierService registration for this simulated configuration revision."
               />
               <Button
                 variant="contained"
                 color="warning"
                 disabled={
-                  !simulated
-                  || setup?.reference.activation.state !== 'shadow'
+                  !exactShadowSimulation
+                  || setup?.reference.activation.state !== 'active'
                   || setup?.account.environment !== 'sandbox'
                   || !confirmWrite
                   || Boolean(recoveryRequired)
@@ -764,7 +795,7 @@ export default function ShopifyCarrierServiceSetupPanel({
                     confirmationRequestId:
                       globalThis.crypto.randomUUID(),
                   },
-                  'Shopify confirmed the sandbox CarrierService registration; Operations remained in Shadow.',
+                  'Shopify confirmed the sandbox CarrierService registration under the exact Active revision.',
                 )}
               >
                 {busy === 'register'
@@ -778,18 +809,22 @@ export default function ShopifyCarrierServiceSetupPanel({
                 control={(
                   <Checkbox
                     checked={confirmRemove}
-                    onChange={(event) => setConfirmRemove(event.target.checked)}
+                    disabled={Boolean(busy)}
+                    onChange={(event) => {
+                      setConfirmRemove(event.target.checked)
+                    }}
                   />
                 )}
                 label={setup?.account.environment === 'production'
-                  ? 'I understand this removes the live production Shopify CarrierService exactly once.'
+                  ? 'I understand this removes the exact live production Shopify CarrierService once.'
                   : 'I authorize removal of this exact sandbox Shopify CarrierService once.'}
               />
               <Button
                 variant="outlined"
                 color="error"
                 disabled={
-                  setup?.reference.activation.state !== 'shadow'
+                  !exactShadowSimulation
+                  || setup?.reference.activation.state !== 'active'
                   || !confirmRemove
                   || Boolean(recoveryRequired)
                   || Boolean(mutationInFlight)
@@ -804,7 +839,7 @@ export default function ShopifyCarrierServiceSetupPanel({
                     confirmationRequestId:
                       globalThis.crypto.randomUUID(),
                   },
-                  'Shopify confirmed CarrierService removal; Operations remained in Shadow.',
+                  'Shopify confirmed exact CarrierService removal under the Active revision.',
                 )}
               >
                 {busy === 'unregister'

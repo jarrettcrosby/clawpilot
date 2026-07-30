@@ -428,6 +428,7 @@ export type ShopifyCheckoutRateReceiptClaim =
 
 export type ShopifyCheckoutRateReconciliation = {
   globalId: string
+  supersedesReconciliationGlobalId: string | null
   accountGlobalId: string
   orderCandidateGlobalId: string
   receiptGlobalId: string | null
@@ -447,7 +448,7 @@ export type ShopifyCheckoutRateReconciliation = {
   selectedOfferHash: string | null
   selectedCustomerChargeMinor: number | null
   selectedCurrency: string | null
-  outcome: 'matched' | 'ambiguous' | 'rejected' | 'expired'
+  outcome: ShopifyCheckoutRateReconciliationOutcome
   matchMethod: string
   candidateCount: number
   matchEvidence: Record<string, unknown>
@@ -455,6 +456,39 @@ export type ShopifyCheckoutRateReconciliation = {
   providerWriteCount: 0
   createdBy: string | null
   createdAt: string
+}
+
+export type ShopifyCheckoutRateReconciliationOutcome =
+  | 'matched'
+  | 'ambiguous'
+  | 'rejected'
+  | 'expired'
+
+export function classifyShopifyCheckoutRateReconciliationOutcome(input: {
+  exactCandidateCount: number
+  potentialCandidateCount: number
+}): ShopifyCheckoutRateReconciliationOutcome {
+  if (
+    !Number.isSafeInteger(input.exactCandidateCount)
+    || input.exactCandidateCount < 0
+    || !Number.isSafeInteger(input.potentialCandidateCount)
+    || input.potentialCandidateCount < input.exactCandidateCount
+  ) {
+    throw new ShopifyCheckoutRatingPersistenceError(
+      'SHOPIFY_CHECKOUT_RECONCILIATION_COUNTS_INVALID',
+      'Shopify checkout reconciliation candidate counts are invalid',
+      500,
+    )
+  }
+  if (input.exactCandidateCount === 1) return 'matched'
+  if (input.exactCandidateCount > 1) return 'ambiguous'
+  return input.potentialCandidateCount > 0 ? 'expired' : 'rejected'
+}
+
+export function shopifyCheckoutRateOutcomeAllowsFulfillment(
+  outcome: ShopifyCheckoutRateReconciliationOutcome | null | undefined,
+) {
+  return outcome === 'matched'
 }
 
 type ConfigRow = QueryResultRow & {
@@ -609,6 +643,13 @@ const SHOPIFY_RATE_SERVICE_CODE =
   /^clawpilot:(ups|fedex):[A-Za-z0-9][A-Za-z0-9._-]{0,56}$/
 const SHOPIFY_SERVICE_GID =
   /^gid:\/\/shopify\/DeliveryCarrierService\/[0-9]+$/
+
+export function shopifyCheckoutRateLineageIsRequired(
+  serviceCode: string | null | undefined,
+) {
+  return typeof serviceCode === 'string'
+    && SHOPIFY_RATE_SERVICE_CODE.test(serviceCode.trim())
+}
 
 const CUSTOMER_OR_SECRET_KEYS = new Set([
   'authorization',
@@ -3904,6 +3945,7 @@ export async function readCachedShopifyCheckoutRateReceiptInPostgres(
 
 type ReconciliationRow = QueryResultRow & {
   global_id: string
+  supersedes_reconciliation_global_id: string | null
   account_global_id: string
   order_candidate_global_id: string
   receipt_global_id: string | null
@@ -3935,6 +3977,9 @@ type ReconciliationRow = QueryResultRow & {
 
 const RECONCILIATION_SELECT = `SELECT
     reconciliation.global_id,
+    reconciliation.match_evidence
+      ->> 'supersedesReconciliationGlobalId'
+      AS supersedes_reconciliation_global_id,
     account.global_id AS account_global_id,
     candidate.global_id AS order_candidate_global_id,
     receipt.global_id AS receipt_global_id,
@@ -3983,11 +4028,18 @@ const RECONCILIATION_SELECT = `SELECT
    AND rate_evidence.id
      = reconciliation.selected_carrier_rate_request_id`
 
+const CURRENT_RECONCILIATION_SELECT = RECONCILIATION_SELECT.replace(
+  'FROM operations_shopify_checkout_rate_reconciliations reconciliation',
+  'FROM operations_shopify_checkout_rate_current_reconciliations reconciliation',
+)
+
 function reconciliationFromRow(
   row: ReconciliationRow,
 ): ShopifyCheckoutRateReconciliation {
   return {
     globalId: row.global_id,
+    supersedesReconciliationGlobalId:
+      row.supersedes_reconciliation_global_id || null,
     accountGlobalId: row.account_global_id,
     orderCandidateGlobalId: row.order_candidate_global_id,
     receiptGlobalId: row.receipt_global_id,
@@ -4025,14 +4077,17 @@ function reconciliationFromRow(
   }
 }
 
-export async function
-reconcileShopifyCheckoutRateForOrderCandidateInPostgres(rawInput: {
+type ReconcileShopifyCheckoutRateForOrderCandidateInput = {
   organizationId: string
   orderCandidateGlobalId: string
   idempotencyKey: string
   actorEmail: string
-}): Promise<ShopifyCheckoutRateReconciliation> {
-  const input = {
+}
+
+function normalizeReconcileShopifyCheckoutRateForOrderCandidateInput(
+  rawInput: ReconcileShopifyCheckoutRateForOrderCandidateInput,
+) {
+  return {
     organizationId: matchValue(
       rawInput.organizationId,
       UUID,
@@ -4050,13 +4105,22 @@ reconcileShopifyCheckoutRateForOrderCandidateInPostgres(rawInput: {
     ),
     actorEmail: textValue(rawInput.actorEmail, 'Actor email', 320),
   }
-  return withTransaction(async (client) => {
-    await acquireTransactionAdvisoryLock(
-      client,
-      `shopify-checkout-reconciliation:${input.organizationId}:${input.orderCandidateGlobalId}`,
-    )
-    const existing = await client.query<ReconciliationRow>(
-      `${RECONCILIATION_SELECT}
+}
+
+export async function
+reconcileShopifyCheckoutRateForOrderCandidateWithClient(
+  client: PoolClient,
+  rawInput: ReconcileShopifyCheckoutRateForOrderCandidateInput,
+): Promise<ShopifyCheckoutRateReconciliation> {
+  const input = {
+    ...normalizeReconcileShopifyCheckoutRateForOrderCandidateInput(rawInput),
+  }
+  await acquireTransactionAdvisoryLock(
+    client,
+    `shopify-checkout-reconciliation:${input.organizationId}:${input.orderCandidateGlobalId}`,
+  )
+  const existing = await client.query<ReconciliationRow>(
+      `${CURRENT_RECONCILIATION_SELECT}
        WHERE reconciliation.organization_id = $1::uuid
          AND candidate.global_id = $2
        LIMIT 1`,
@@ -4173,14 +4237,10 @@ reconcileShopifyCheckoutRateForOrderCandidateInPostgres(rawInput: {
     const selected = exactCandidateCount === 1
       ? exactMatches.rows[0]
       : null
-    const outcome: ShopifyCheckoutRateReconciliation['outcome'] =
-      selected
-        ? 'matched'
-        : exactCandidateCount > 1
-          ? 'ambiguous'
-          : potentialCandidateCount > 0
-            ? 'expired'
-            : 'rejected'
+    const outcome = classifyShopifyCheckoutRateReconciliationOutcome({
+      exactCandidateCount,
+      potentialCandidateCount,
+    })
     const evidence = {
       version: 'shopify-exact-rate-reconciliation-v1',
       orderCandidateGlobalId: input.orderCandidateGlobalId,
@@ -4266,8 +4326,16 @@ reconcileShopifyCheckoutRateForOrderCandidateInPostgres(rawInput: {
         `operations:shopify-checkout-reconciliation:${input.orderCandidateGlobalId}`,
       payload: evidence,
     }, client)
-    return reconciliation
-  })
+  return reconciliation
+}
+
+export async function
+reconcileShopifyCheckoutRateForOrderCandidateInPostgres(
+  rawInput: ReconcileShopifyCheckoutRateForOrderCandidateInput,
+): Promise<ShopifyCheckoutRateReconciliation> {
+  return withTransaction((client) => (
+    reconcileShopifyCheckoutRateForOrderCandidateWithClient(client, rawInput)
+  ))
 }
 
 export async function readShopifyCheckoutRateReconciliationsInPostgres(
@@ -4291,7 +4359,7 @@ export async function readShopifyCheckoutRateReconciliationsInPostgres(
     limit: integer(rawInput.limit ?? 50, 'Result limit', 1, 100),
   }
   const result = await query<ReconciliationRow>(
-    `${RECONCILIATION_SELECT}
+    `${CURRENT_RECONCILIATION_SELECT}
      WHERE reconciliation.organization_id = $1::uuid
        AND receipt.global_id = $2
      ORDER BY reconciliation.created_at DESC, reconciliation.id

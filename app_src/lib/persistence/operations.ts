@@ -61,6 +61,11 @@ import {
   query,
   withTransaction,
 } from '@/lib/persistence/postgres'
+import {
+  shopifyCheckoutRateLineageIsRequired,
+  shopifyCheckoutRateOutcomeAllowsFulfillment,
+  type ShopifyCheckoutRateReconciliationOutcome,
+} from '@/lib/persistence/shopifyCheckoutRating'
 
 type PipelineRow = QueryResultRow & { id: string; name: string; owner_email: string }
 type CustomerRow = QueryResultRow & { id: string; reference_code: string; name: string }
@@ -6663,8 +6668,11 @@ export async function releaseOperationsOrderFromPostgres(input: {
         )
       }
 
-      const orderResult = await client.query<OrderIdentityRow>(
-        `SELECT id::text, global_id, status, row_version::text
+      const orderResult = await client.query<OrderIdentityRow & {
+        source_provider: string
+      }>(
+        `SELECT id::text, global_id, status, row_version::text,
+                source_provider
          FROM operations_orders
          WHERE organization_id = $1::uuid AND global_id = $2
          FOR UPDATE`,
@@ -6687,6 +6695,54 @@ export async function releaseOperationsOrderFromPostgres(input: {
           `Order cannot be released from ${order.status}`,
           409,
         )
+      }
+      if (order.source_provider === 'shopify') {
+        const reconciliationResult = await client.query<{
+          checkout_shipping_service_code: string | null
+          outcome: ShopifyCheckoutRateReconciliationOutcome | null
+        }>(
+          `SELECT candidate.checkout_shipping_service_code,
+                  reconciliation.outcome
+           FROM operations_commerce_order_candidates candidate
+           LEFT JOIN
+               operations_shopify_checkout_rate_current_reconciliations
+               reconciliation
+             ON reconciliation.organization_id = candidate.organization_id
+            AND reconciliation.order_candidate_id = candidate.id
+           WHERE candidate.organization_id = $1::uuid
+             AND candidate.canonical_order_id = $2::uuid
+             AND candidate.provider = 'shopify'
+             AND candidate.workflow_state = 'promoted'
+           ORDER BY candidate.promoted_at DESC, candidate.id DESC`,
+          [organizationId, order.id],
+        )
+        const requiredLineage = reconciliationResult.rows.filter((row) => (
+          shopifyCheckoutRateLineageIsRequired(
+            row.checkout_shipping_service_code,
+          )
+        ))
+        const reconciliationOutcome = requiredLineage.length === 1
+          ? requiredLineage[0].outcome
+          : null
+        if (
+          requiredLineage.length > 0
+          && (
+            requiredLineage.length !== 1
+            || !shopifyCheckoutRateOutcomeAllowsFulfillment(
+              reconciliationOutcome,
+            )
+          )
+        ) {
+          throw new OperationsRequestError(
+            'OPERATIONS_SHOPIFY_CHECKOUT_RATE_RECONCILIATION_REQUIRED',
+            requiredLineage.length > 1
+              ? 'Multiple ClawPilot checkout-rate lineage records exist; resolve the ambiguity before releasing warehouse work'
+              : reconciliationOutcome
+              ? `Shopify checkout-rate reconciliation is ${reconciliationOutcome}; resolve the immutable quote lineage before releasing warehouse work`
+              : 'Shopify checkout-rate reconciliation is missing; reconcile the immutable quote lineage before releasing warehouse work',
+            409,
+          )
+        }
       }
 
       const planResult = await client.query<QueryResultRow & {

@@ -84,6 +84,11 @@ includes(persistence, [
 ], 'Order reconciliation persistence')
 assert.ok(!persistence.includes('provider_cursor ='), 'Order reconciliation must not persist a provider cursor')
 assert.ok(!persistence.includes("? 'read_all_orders'"), 'Current automatic order reconciliation must not require historical-order scope')
+assert.ok(
+  !persistence.includes('faire_updated_at_min')
+    && !persistence.includes('high_watermark ='),
+  'Faire automatic reconciliation must not use an unsafe live-cursor incremental checkpoint',
+)
 
 let claimSql = ''
 const claimStartedAt = new Date('2026-07-28T14:15:16.789Z')
@@ -145,6 +150,11 @@ includes(intakeSource, [
   'hydrateProductInventory: false',
 ], 'Order-page execution path')
 assert.ok(
+  !intakeSource.includes('updatedAtMin: page.windowStart')
+    && !intakeSource.includes('initialWindowStart'),
+  'Fresh Faire automatic polls must start as full current-order scans',
+)
+assert.ok(
   intakeSource.includes('Shopify must grant read_orders for current operational intake'),
   'Current order reads must require only read_orders',
 )
@@ -162,6 +172,10 @@ const worker = loadTypeScriptModule('app_src/lib/commerceOrderReconciliationWork
       commerceIntakeRuntimeAvailable: () => true,
       async executeCommerceOrderPage(input) {
         assert.equal(input.actorEmail, 'system:commerce-order-reconciliation')
+        assert.ok(
+          !Object.prototype.hasOwnProperty.call(input, 'initialWindowStart'),
+          'Faire polling must not inject an unsafe incremental lower bound',
+        )
         if (page === 0) {
           assert.equal(input.continuationRunGlobalId, null)
           page += 1
@@ -175,6 +189,7 @@ const worker = loadTypeScriptModule('app_src/lib/commerceOrderReconciliationWork
                 providerRowsSeen: 4,
                 hasNextBatch: true,
                 continuationRunGlobalId: 'gcir0000001',
+                windowEnd: '2026-07-27T12:00:01.000Z',
               },
             },
           }
@@ -187,7 +202,11 @@ const worker = loadTypeScriptModule('app_src/lib/commerceOrderReconciliationWork
             syncCursorAdvanced: false,
             ordersStaged: 2,
             recordsRejected: 0,
-            pagination: { providerRowsSeen: 2, hasNextBatch: false },
+            pagination: {
+              providerRowsSeen: 2,
+              hasNextBatch: false,
+              windowEnd: '2026-07-27T12:00:01.000Z',
+            },
           },
         }
       },
@@ -199,7 +218,7 @@ const worker = loadTypeScriptModule('app_src/lib/commerceOrderReconciliationWork
           organizationId: '11111111-1111-4111-8111-111111111111',
           integrationAccountId: '22222222-2222-4222-8222-222222222222',
           accountGlobalId: 'gca0000001',
-          provider: 'shopify',
+          provider: 'faire',
           credentialVersion: 1,
           startedAt: '2026-07-27T12:00:00.000Z',
           continuationRunGlobalId: null,

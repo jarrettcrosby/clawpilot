@@ -84,11 +84,20 @@ function loadPersistence() {
 const migration = read(
   'db/migrations/0149_operations_shopify_checkout_rating.sql',
 )
+const receiptReuseMigration = read(
+  'db/migrations/0157_operations_shopify_checkout_receipt_reuse.sql',
+)
 const packHardeningMigration = read(
   'db/migrations/0151_operations_product_pack_management_hardening.sql',
 )
 const persistenceSource = read(
   'app_src/lib/persistence/shopifyCheckoutRating.ts',
+)
+const commerceIntakeSource = read(
+  'app_src/lib/persistence/commerceIntake.ts',
+)
+const operationsSource = read(
+  'app_src/lib/persistence/operations.ts',
 )
 const persistence = loadPersistence()
 
@@ -263,6 +272,7 @@ includes(persistenceSource, [
   'completeShopifyCheckoutRateReceiptInPostgres',
   'failShopifyCheckoutRateReceiptInPostgres',
   'readCachedShopifyCheckoutRateReceiptInPostgres',
+  'reconcileShopifyCheckoutRateForOrderCandidateWithClient',
   'reconcileShopifyCheckoutRateForOrderCandidateInPostgres',
   'readShopifyCheckoutRateReconciliationsInPostgres',
   'shopifyCheckoutLineQuantityFingerprint',
@@ -289,10 +299,352 @@ const {
   ShopifyCheckoutRatingPersistenceError,
   normalizeShopifyCarrierServiceConfigInput,
   normalizeShopifyCheckoutReceiptClaimInput,
+  classifyShopifyCheckoutRateReconciliationOutcome,
+  reconcileShopifyCheckoutRateForOrderCandidateWithClient,
+  shopifyCheckoutRateLineageIsRequired,
+  shopifyCheckoutRateOutcomeAllowsFulfillment,
   shopifyCheckoutPackagePlanHash,
   shopifyCheckoutLineQuantityFingerprint,
   shopifyCheckoutRatingHash,
 } = persistence
+
+assert.equal(
+  classifyShopifyCheckoutRateReconciliationOutcome({
+    exactCandidateCount: 1,
+    potentialCandidateCount: 1,
+  }),
+  'matched',
+)
+assert.equal(
+  classifyShopifyCheckoutRateReconciliationOutcome({
+    exactCandidateCount: 2,
+    potentialCandidateCount: 2,
+  }),
+  'ambiguous',
+)
+assert.equal(
+  classifyShopifyCheckoutRateReconciliationOutcome({
+    exactCandidateCount: 0,
+    potentialCandidateCount: 1,
+  }),
+  'expired',
+)
+assert.equal(
+  classifyShopifyCheckoutRateReconciliationOutcome({
+    exactCandidateCount: 0,
+    potentialCandidateCount: 0,
+  }),
+  'rejected',
+)
+assert.equal(shopifyCheckoutRateOutcomeAllowsFulfillment('matched'), true)
+for (const outcome of ['ambiguous', 'expired', 'rejected', null]) {
+  assert.equal(
+    shopifyCheckoutRateOutcomeAllowsFulfillment(outcome),
+    false,
+    `${outcome || 'missing'} checkout lineage must fail closed`,
+  )
+}
+assert.throws(
+  () => classifyShopifyCheckoutRateReconciliationOutcome({
+    exactCandidateCount: 2,
+    potentialCandidateCount: 1,
+  }),
+  (error) => (
+    error instanceof ShopifyCheckoutRatingPersistenceError
+    && error.code === 'SHOPIFY_CHECKOUT_RECONCILIATION_COUNTS_INVALID'
+  ),
+)
+for (const serviceCode of [
+  'clawpilot:ups:ground',
+  'clawpilot:fedex:fedex_ground',
+]) {
+  assert.equal(
+    shopifyCheckoutRateLineageIsRequired(serviceCode),
+    true,
+    `${serviceCode} must require immutable ClawPilot quote lineage`,
+  )
+}
+for (const serviceCode of [
+  null,
+  '',
+  'shopify:standard',
+  'free_shipping',
+  'clawpilot:usps:priority',
+]) {
+  assert.equal(
+    shopifyCheckoutRateLineageIsRequired(serviceCode),
+    false,
+    `${serviceCode || 'missing'} must remain outside ClawPilot quote lineage`,
+  )
+}
+
+async function reconcileWithFakeTransaction({
+  exactCandidateCount,
+  potentialCandidateCount,
+}) {
+  const organizationId = '00000000-0000-4000-8000-000000000001'
+  const integrationAccountId =
+    '00000000-0000-4000-8000-000000000002'
+  const candidateId = '00000000-0000-4000-8000-000000000003'
+  const orderId = '00000000-0000-4000-8000-000000000004'
+  const exactMatches = Array.from(
+    { length: exactCandidateCount },
+    (_unused, index) => ({
+      receipt_id:
+        `00000000-0000-4000-8000-${String(index + 5).padStart(12, '0')}`,
+      receipt_global_id: `gsqr${String(index + 1).padStart(7, '0')}`,
+      offer_carrier_provider: index % 2 ? 'fedex_rest' : 'ups_rest',
+      offer_carrier_account_id:
+        `00000000-0000-4000-8000-${String(index + 20).padStart(12, '0')}`,
+      offer_carrier_rate_request_id:
+        `00000000-0000-4000-8000-${String(index + 30).padStart(12, '0')}`,
+      offer_service_code: index % 2 ? 'fedex_ground' : 'ground',
+      offer_shopify_service_code: index % 2
+        ? 'clawpilot:fedex:fedex_ground'
+        : 'clawpilot:ups:ground',
+      offer_hash: String(index + 1).repeat(64).slice(0, 64),
+      offer_customer_charge_minor: '1299',
+      offer_currency: 'USD',
+    }),
+  )
+  const expectedOutcome =
+    classifyShopifyCheckoutRateReconciliationOutcome({
+      exactCandidateCount,
+      potentialCandidateCount,
+    })
+  const selected = exactCandidateCount === 1 ? exactMatches[0] : null
+  const insertedRow = {
+    global_id: 'gsqc0000001',
+    supersedes_reconciliation_global_id: null,
+    account_global_id: 'gia0000001',
+    order_candidate_global_id: 'gcoc0000001',
+    receipt_global_id: selected?.receipt_global_id || null,
+    order_global_id: 'gor0000001',
+    source_external_order_id: 'shopify-order-1',
+    source_order_created_at: '2026-07-30T12:00:00.000Z',
+    source_line_quantity_fingerprint: 'a'.repeat(64),
+    source_destination_fingerprint: 'b'.repeat(64),
+    source_currency: 'USD',
+    source_shipping_charge_minor: '1299',
+    source_shopify_service_code: 'clawpilot:ups:ground',
+    candidate_set_hash: 'c'.repeat(64),
+    selected_carrier_account_global_id: selected
+      ? 'gac0000001'
+      : null,
+    selected_rate_evidence_global_id: selected ? 'grq0000001' : null,
+    selected_carrier_provider:
+      selected?.offer_carrier_provider || null,
+    selected_service_code: selected?.offer_service_code || null,
+    selected_offer_hash: selected?.offer_hash || null,
+    selected_customer_charge_minor:
+      selected?.offer_customer_charge_minor || null,
+    selected_currency: selected?.offer_currency || null,
+    outcome: expectedOutcome,
+    match_method: 'shopify_exact_rate_v1',
+    candidate_count: exactCandidateCount,
+    match_evidence: { providerWrites: 0 },
+    idempotency_key: 'gcoc0000001:checkout-rate-reconciliation',
+    provider_write_count: 0,
+    created_by: 'operator@example.test',
+    created_at: '2026-07-30T12:00:01.000Z',
+  }
+  const responses = [
+    { rows: [] },
+    {
+      rows: [{
+        id: candidateId,
+        integration_account_id: integrationAccountId,
+        account_global_id: 'gia0000001',
+        canonical_order_id: orderId,
+        order_global_id: 'gor0000001',
+        external_order_id: 'shopify-order-1',
+        provider_created_at: '2026-07-30T12:00:00.000Z',
+        line_quantity_fingerprint: 'a'.repeat(64),
+        checkout_destination_fingerprint: 'b'.repeat(64),
+        currency_code: 'USD',
+        shipping_minor: '1299',
+        checkout_shipping_service_code: 'clawpilot:ups:ground',
+        workflow_state: 'promoted',
+        provider: 'shopify',
+        subtotal_minor: '0',
+      }],
+    },
+    { rows: exactMatches, rowCount: exactMatches.length },
+    { rows: [{ candidate_count: potentialCandidateCount }] },
+    { rows: [insertedRow] },
+  ]
+  const queries = []
+  const client = {
+    async query(sql, values) {
+      queries.push({ sql, values })
+      const response = responses.shift()
+      assert.ok(response, 'unexpected reconciliation query')
+      return response
+    },
+  }
+  const reconciliation =
+    await reconcileShopifyCheckoutRateForOrderCandidateWithClient(
+      client,
+      {
+        organizationId,
+        orderCandidateGlobalId: 'gcoc0000001',
+        idempotencyKey:
+          'gcoc0000001:checkout-rate-reconciliation',
+        actorEmail: 'operator@example.test',
+      },
+    )
+  assert.equal(reconciliation.outcome, expectedOutcome)
+  assert.equal(reconciliation.providerWriteCount, 0)
+  assert.equal(reconciliation.supersedesReconciliationGlobalId, null)
+  assert.equal(queries.length, 5)
+  assert.match(
+    queries[0].sql,
+    /operations_shopify_checkout_rate_current_reconciliations/,
+  )
+  assert.match(
+    queries[4].sql,
+    /INSERT INTO operations_shopify_checkout_rate_reconciliations/,
+  )
+  assert.equal(queries[4].values[20], expectedOutcome)
+  assert.equal(responses.length, 0)
+}
+
+await reconcileWithFakeTransaction({
+  exactCandidateCount: 1,
+  potentialCandidateCount: 1,
+})
+await reconcileWithFakeTransaction({
+  exactCandidateCount: 2,
+  potentialCandidateCount: 2,
+})
+await reconcileWithFakeTransaction({
+  exactCandidateCount: 0,
+  potentialCandidateCount: 1,
+})
+await reconcileWithFakeTransaction({
+  exactCandidateCount: 0,
+  potentialCandidateCount: 0,
+})
+
+{
+  const queries = []
+  const client = {
+    async query(sql) {
+      queries.push(sql)
+      return {
+        rows: [{
+          global_id: 'gsqc0000002',
+          supersedes_reconciliation_global_id: 'gsqc0000001',
+          account_global_id: 'gia0000001',
+          order_candidate_global_id: 'gcoc0000001',
+          receipt_global_id: 'gsqr0000001',
+          order_global_id: 'gor0000001',
+          source_external_order_id: 'shopify-order-1',
+          source_order_created_at: '2026-07-30T12:00:00.000Z',
+          source_line_quantity_fingerprint: 'a'.repeat(64),
+          source_destination_fingerprint: 'b'.repeat(64),
+          source_currency: 'USD',
+          source_shipping_charge_minor: '1299',
+          source_shopify_service_code: 'clawpilot:ups:ground',
+          candidate_set_hash: 'c'.repeat(64),
+          selected_carrier_account_global_id: 'gac0000001',
+          selected_rate_evidence_global_id: 'grq0000001',
+          selected_carrier_provider: 'ups_rest',
+          selected_service_code: 'ground',
+          selected_offer_hash: 'd'.repeat(64),
+          selected_customer_charge_minor: '1299',
+          selected_currency: 'USD',
+          outcome: 'matched',
+          match_method: 'shopify_exact_rate_v1',
+          candidate_count: 1,
+          match_evidence: {
+            version:
+              'shopify-exact-rate-reconciliation-v2-cached-reuse',
+            supersedesReconciliationGlobalId: 'gsqc0000001',
+            providerWrites: 0,
+          },
+          idempotency_key:
+            'gcoc0000001:checkout-rate-reconciliation',
+          provider_write_count: 0,
+          created_by: 'operator@example.test',
+          created_at: '2026-07-30T12:05:00.000Z',
+        }],
+      }
+    },
+  }
+  const replayed =
+    await reconcileShopifyCheckoutRateForOrderCandidateWithClient(
+      client,
+      {
+        organizationId: '00000000-0000-4000-8000-000000000001',
+        orderCandidateGlobalId: 'gcoc0000001',
+        idempotencyKey:
+          'gcoc0000001:checkout-rate-reconciliation',
+        actorEmail: 'operator@example.test',
+      },
+    )
+  assert.equal(replayed.outcome, 'matched')
+  assert.equal(
+    replayed.supersedesReconciliationGlobalId,
+    'gsqc0000001',
+  )
+  assert.equal(queries.length, 1)
+  assert.match(
+    queries[0],
+    /operations_shopify_checkout_rate_current_reconciliations/,
+  )
+}
+
+const promotionSource = section(
+  commerceIntakeSource,
+  'export async function promoteCommerceCandidateInPostgres',
+  null,
+  'Commerce order promotion',
+)
+includes(promotionSource, [
+  'reconcileShopifyCheckoutRateForOrderCandidateWithClient',
+  'checkoutRateReconciliationGlobalId',
+  'checkoutRateReconciliationOutcome',
+  'checkoutRateLineageRequired',
+  'checkoutRateFulfillmentEligible',
+  "'not_applicable'",
+  'checkoutRateReconciliation:',
+], 'Atomic Shopify checkout reconciliation during promotion')
+assert.ok(
+  promotionSource.indexOf(
+    'reconcileShopifyCheckoutRateForOrderCandidateWithClient',
+  ) < promotionSource.lastIndexOf('completeReceipt('),
+  'Shopify checkout reconciliation must complete before promotion commits',
+)
+includes(commerceIntakeSource, [
+  'checkout_rate_reconciliation_global_id',
+  'checkout_rate_receipt_global_id',
+  'checkout_rate_reconciliation_outcome',
+  'operations_shopify_checkout_rate_current_reconciliations',
+  'fulfillmentEligible:',
+], 'Checkout reconciliation intake projection')
+includes(commerceIntakeSource, [
+  'reconcilePromotedCommerceCandidateCheckoutRateInPostgres',
+  'A promoted Shopify order using a ClawPilot shipping service is required',
+  'FOR UPDATE OF candidate',
+  '`${input.candidateGlobalId}:checkout-rate-reconciliation`',
+], 'Executable missing checkout reconciliation recovery')
+
+const releaseSource = section(
+  operationsSource,
+  'export async function releaseOperationsOrderFromPostgres',
+  'export async function confirmOperationsOrderPicksFromPostgres',
+  'Operations warehouse release',
+)
+includes(releaseSource, [
+  "order.source_provider === 'shopify'",
+  'operations_commerce_order_candidates',
+  'operations_shopify_checkout_rate_current_reconciliations',
+  'shopifyCheckoutRateLineageIsRequired',
+  'shopifyCheckoutRateOutcomeAllowsFulfillment',
+  'requiredLineage.length > 0',
+  'OPERATIONS_SHOPIFY_CHECKOUT_RATE_RECONCILIATION_REQUIRED',
+], 'Shopify fulfillment lineage release guard')
 
 const policySnapshot = {
   algorithm: 'hybrid-v2',
@@ -582,26 +934,47 @@ assert.doesNotMatch(
   /subtotal_minor|unit_price_minor|total_minor/,
   'A zero-value product must not affect exact shipping-quote reconciliation',
 )
-includes(
-  section(
-    migration,
-    'CREATE OR REPLACE FUNCTION\n  operations_shopify_checkout_rate_match_candidates',
-    'CREATE OR REPLACE FUNCTION\n  protect_operations_shopify_checkout_rate_reconciliation',
-    'Exact Shopify quote-to-order candidate matcher',
-  ),
-  [
-    "date_trunc('second', receipt.created_at)",
-    'NOT EXISTS (',
-    'FROM operations_shopify_checkout_rate_reconciliations prior',
-    'prior.receipt_id = receipt.id',
-    "prior.outcome = 'matched'",
-  ],
-  'Previously linked Shopify receipt exclusion',
+const receiptReuseMatcher = section(
+  receiptReuseMigration,
+  'CREATE OR REPLACE FUNCTION\n  operations_shopify_checkout_rate_match_candidates',
+  'CREATE OR REPLACE FUNCTION\n  protect_ops_shopify_rate_recon_supersession',
+  'Shopify cached-receipt matcher',
 )
+includes(receiptReuseMigration, [
+  'DROP INDEX IF EXISTS',
+  'op_shopify_rate_reconciliations_receipt_match_unique',
+  'op_shopify_rate_reconciliations_receipt_match_idx',
+  'operations_shopify_checkout_rate_reconciliation_supersessions',
+  'protect_ops_shopify_rate_recon_supersession',
+  'operations_shopify_checkout_rate_current_reconciliations',
+  "'pre_0157_cached_receipt_exclusivity'",
+  "original.outcome IN ('rejected', 'expired')",
+  'recoverable.exact_candidate_count = 1',
+  'ON CONFLICT (organization_id, original_reconciliation_id) DO NOTHING',
+  'One immutable receipt may support multiple orders',
+], 'Shopify cached receipt reuse')
+includes(receiptReuseMatcher, [
+  "date_trunc('second', receipt.created_at)",
+  'candidate.checkout_destination_fingerprint',
+  'operations_shopify_checkout_order_line_quantity_fingerprint',
+  'offer.shopify_service_code',
+  'offer.customer_charge_minor = candidate.shipping_minor',
+], 'Shopify cached receipt exact facts')
+assert.doesNotMatch(
+  receiptReuseMatcher,
+  /operations_shopify_checkout_rate_reconciliations prior|prior\.receipt_id|NOT EXISTS/,
+  'A cached Shopify receipt must not be consumed by the first matching order',
+)
+includes(persistenceSource, [
+  'supersedesReconciliationGlobalId',
+  'CURRENT_RECONCILIATION_SELECT',
+  'operations_shopify_checkout_rate_current_reconciliations',
+], 'Current Shopify reconciliation projection')
 
 for (const path of [
   'db/migrations/0148_operations_commerce_external_effects.sql',
   'db/migrations/0149_operations_shopify_checkout_rating.sql',
+  'db/migrations/0157_operations_shopify_checkout_receipt_reuse.sql',
 ]) {
   const overlength = [
     ...new Set(

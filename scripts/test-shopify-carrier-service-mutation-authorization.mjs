@@ -102,6 +102,9 @@ function loadPersistence() {
 const migration = read(
   'db/migrations/0150_operations_shopify_carrier_service_mutation_authorization.sql',
 )
+const activeMigration = read(
+  'db/migrations/0156_operations_shopify_carrier_service_active_authorization.sql',
+)
 const persistenceSource = read(
   'app_src/lib/persistence/shopifyCarrierServiceMutationAuthorization.ts',
 )
@@ -183,11 +186,13 @@ for (const pattern of [
   /CREATE OR REPLACE FUNCTION\s+([a-z0-9_]+)/gi,
   /CREATE TRIGGER\s+([a-z0-9_]+)/gi,
 ]) {
-  for (const match of migration.matchAll(pattern)) {
-    assert.ok(
-      Buffer.byteLength(match[1], 'utf8') <= 63,
-      `PostgreSQL identifier exceeds 63 bytes: ${match[1]}`,
-    )
+  for (const source of [migration, activeMigration]) {
+    for (const match of source.matchAll(pattern)) {
+      assert.ok(
+        Buffer.byteLength(match[1], 'utf8') <= 63,
+        `PostgreSQL identifier exceeds 63 bytes: ${match[1]}`,
+      )
+    }
   }
 }
 
@@ -229,7 +234,129 @@ includes(persistenceSource, [
   'redacted_evidence, resolution_hash',
   'JSON.stringify(input.resolutionEvidence)',
   "(!outcome || outcome.state === 'unknown')",
+  'configActivationRevision',
+  'simulationActivationRevision',
+  'providerWriteActivationRevision',
+  'SHOPIFY_CARRIER_SERVICE_LEGACY_SHADOW_AUTHORIZATION_DISABLED',
+  'This transaction is local-only.',
+  'credential rotation/verification change must not strand provider',
 ], 'Authorization persistence')
+
+includes(activeMigration, [
+  'simulation_activation_revision integer',
+  'provider_write_activation_revision integer',
+  'operations_shopify_cs_active_authorization_fence_hash',
+  'DROP TRIGGER IF EXISTS',
+  'protect_ops_shopify_cs_mut_auth_write',
+  'UPDATE operations_shopify_carrier_service_mutation_authorizations',
+  'SET simulation_activation_revision = activation_revision',
+  "current_activation_state IS DISTINCT FROM 'active'",
+  'NEW.provider_write_activation_revision',
+  "effect_mode IS DISTINCT FROM 'shadow'",
+  'effect_provider_write_count IS DISTINCT FROM 0',
+  'authorization_provider_write_activation_revision IS NULL',
+  'Legacy Shadow grants remain audit-only and unclaimable',
+], 'Active CarrierService authorization migration')
+const activeAttemptTrigger = activeMigration.slice(
+  activeMigration.indexOf(
+    'CREATE OR REPLACE FUNCTION\n  protect_ops_shopify_cs_mut_attempt()',
+  ),
+  activeMigration.indexOf(
+    'CREATE OR REPLACE FUNCTION\n  protect_ops_shopify_cs_config_mut_link()',
+  ),
+)
+includes(activeAttemptTrigger, [
+  "current_activation_state IS DISTINCT FROM 'active'",
+  'authorization_provider_write_activation_revision',
+  'current_activation_revision IS DISTINCT FROM',
+  'Active authorization expired or became stale before claim',
+], 'Pre-call Active authorization claim fence')
+const configMutationLinkTrigger = activeMigration.slice(
+  activeMigration.indexOf(
+    'CREATE OR REPLACE FUNCTION\n  protect_ops_shopify_cs_config_mut_link()',
+  ),
+  activeMigration.indexOf(
+    'CREATE OR REPLACE FUNCTION\n  operations_shopify_cs_config_has_exact_finalization_link',
+  ),
+)
+includes(configMutationLinkTrigger, [
+  'exact succeeded provider evidence',
+  'exact applied reconciliation evidence',
+  'config_row_version IS DISTINCT FROM NEW.from_row_version',
+  'auth_provider_write_activation_revision IS NULL',
+  'local-only finalization',
+  'verified credential generation before any',
+  'rotate the credential',
+  'must not strand an',
+], 'Post-provider local-only configuration finalization')
+assert.doesNotMatch(
+  configMutationLinkTrigger,
+  /current_activation_(?:state|revision)|activation\.state|activation\.revision|account_generation|credential_status|operations_commerce_credentials/,
+  'Post-provider local-only finalization must not depend on mutable organization activation or credential state',
+)
+const exactFinalizationLink = activeMigration.slice(
+  activeMigration.indexOf(
+    'CREATE OR REPLACE FUNCTION\n  operations_shopify_cs_config_has_exact_finalization_link',
+  ),
+  activeMigration.indexOf(
+    '-- Replace the inherited validator',
+  ),
+)
+includes(exactFinalizationLink, [
+  'authorized_mutation.config_row_version = requested_from_row_version',
+  'authorized_mutation.activation_revision =',
+  'requested_from_activation_revision',
+  'authorized_mutation.provider_write_activation_revision =',
+  'requested_to_activation_revision',
+  'authorized_mutation.credential_generation =',
+  'requested_credential_generation',
+  "authorized_mutation.operation = 'create'",
+  "authorized_mutation.operation = 'delete'",
+], 'Exact local-finalization link predicate')
+const configWriteValidator = activeMigration.slice(
+  activeMigration.indexOf(
+    'CREATE OR REPLACE FUNCTION\n  validate_operations_shopify_carrier_service_config()',
+  ),
+  activeMigration.indexOf(
+    '-- Callback readiness remains a live fail-closed predicate',
+  ),
+)
+includes(configWriteValidator, [
+  'operations_shopify_cs_config_has_exact_finalization_link(',
+  'OLD.activation_revision',
+  'NEW.activation_revision',
+  'IF NOT exact_finalization_link_exists',
+  'account_generation IS DISTINCT FROM NEW.credential_generation',
+  'activation_revision IS DISTINCT FROM NEW.activation_revision',
+  'requires exact Active one-time mutation evidence',
+], 'Config write exact-finalization exemption')
+const callbackReadyValidator = activeMigration.slice(
+  activeMigration.indexOf(
+    'CREATE OR REPLACE FUNCTION\n  validate_operations_shopify_carrier_service_config_ready()',
+  ),
+  activeMigration.indexOf(
+    'CREATE TRIGGER\n  protect_ops_shopify_cs_mut_auth_write',
+  ),
+)
+includes(callbackReadyValidator, [
+  'operations_shopify_cs_config_has_exact_finalization_link(',
+  'operations_shopify_carrier_service_config_is_ready(',
+  'AND NOT exact_finalization_link_exists',
+  'configuration is not callback-ready',
+], 'Callback-readiness exact-finalization exemption')
+assert.ok(
+  activeMigration.indexOf(
+    'DROP TRIGGER IF EXISTS\n  protect_ops_shopify_cs_mut_auth_write',
+  ) < activeMigration.indexOf(
+    'UPDATE operations_shopify_carrier_service_mutation_authorizations',
+  )
+  && activeMigration.lastIndexOf(
+    'CREATE TRIGGER\n  protect_ops_shopify_cs_mut_auth_write',
+  ) > activeMigration.indexOf(
+    'UPDATE operations_shopify_carrier_service_mutation_authorizations',
+  ),
+  'legacy authorization backfill must run only while the append-only trigger is transactionally replaced',
+)
 
 includes(setupPersistenceSource, [
   'SHOPIFY_CHECKOUT_SCOPED_MUTATION_FINALIZER_REQUIRED',
@@ -254,7 +381,7 @@ assert.doesNotMatch(
 
 const publicMapper = setupRouteSource.slice(
   setupRouteSource.indexOf('function publicMutationAuthorization('),
-  setupRouteSource.indexOf('function confirmationRequestId('),
+  setupRouteSource.indexOf('function mutationAuthorizationGlobalId('),
 )
 assert.doesNotMatch(
   publicMapper,
@@ -374,5 +501,5 @@ const resolutionHash =
 assert.match(resolutionHash, /^[a-f0-9]{64}$/)
 
 console.log(
-  'Shopify CarrierService one-time mutation authorization contract passed.',
+  'Shopify CarrierService Shadow-to-Active authorization contract passed.',
 )

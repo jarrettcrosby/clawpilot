@@ -54,6 +54,7 @@ import {
   markCommerceIntakeContinuationInvalidInPostgres,
   prepareCommerceIntakeReadIntentInPostgres,
   promoteCommerceCandidateInPostgres,
+  reconcilePromotedCommerceCandidateCheckoutRateInPostgres,
   readCommerceIntakeRejectionTargetFromPostgres,
   readCommerceIntakeRefreshTargetFromPostgres,
   readCommerceIntakeStateFromPostgres,
@@ -379,6 +380,7 @@ type IntakeCommandAction =
   | 'fetch-products'
   | 'mark-unsupported'
   | 'promote'
+  | 'reconcile-checkout-rate'
   | 'refresh'
   | 'retry-rejection'
   | 'resolve-catalog-product'
@@ -570,6 +572,7 @@ function action(value: unknown): IntakeCommandAction {
     'fetch-products',
     'mark-unsupported',
     'promote',
+    'reconcile-checkout-rate',
     'refresh',
     'retry-rejection',
     'resolve-catalog-product',
@@ -2293,6 +2296,13 @@ async function executeCommerceIntakeCommandInternal(
         providerWrites: 0,
       }),
     })
+  } else if (commandAction === 'reconcile-checkout-rate') {
+    command =
+      await reconcilePromotedCommerceCandidateCheckoutRateInPostgres({
+        ...shared,
+        candidateGlobalId,
+        candidateRowVersion: version,
+      })
   }
 
   return {
