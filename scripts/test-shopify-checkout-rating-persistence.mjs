@@ -90,6 +90,9 @@ const receiptReuseMigration = read(
 const packHardeningMigration = read(
   'db/migrations/0151_operations_product_pack_management_hardening.sql',
 )
+const offerParcelEvidenceMigration = read(
+  'db/migrations/0164_shopify_checkout_offer_parcel_evidence.sql',
+)
 const persistenceSource = read(
   'app_src/lib/persistence/shopifyCheckoutRating.ts',
 )
@@ -119,6 +122,27 @@ includes(packHardeningMigration, [
   'NEW.quantity <> 1',
   'Shopify checkout self-package receipt evidence is incomplete',
 ], 'Self-package checkout receipt hardening')
+includes(offerParcelEvidenceMigration, [
+  'operations_shopify_checkout_carrier_request_parcel_snapshot',
+  "WHEN 'self_package'",
+  "'ClawPilot sealed case '",
+  "WHEN 'approved_recipe'",
+  "'ClawPilot carton '",
+  "'dimensionUnit', 'IN'",
+  "'weightUnit', 'LB'",
+  'operations_shopify_checkout_carrier_parcels_match',
+  "jsonb_typeof(provider_parcels) = 'array'",
+  'package.planning_method',
+  'ORDER BY package.package_sequence, package.package_key',
+  'protect_operations_shopify_checkout_rate_receipt_offer',
+  "rate_evidence.redacted_request #> '{shipment,parcels}'",
+  'operations_shopify_checkout_carrier_rate_matches',
+], 'Checkout offer carrier parcel evidence')
+assert.doesNotMatch(
+  offerParcelEvidenceMigration,
+  /package\.carrier_parcel_snapshot/,
+  'Provider parcel evidence must not compare against the internal package-key snapshot',
+)
 
 const configSchema = section(
   migration,
